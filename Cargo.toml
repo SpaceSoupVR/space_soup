@@ -1,0 +1,45 @@
+[package]
+name        = "space_soup"
+version     = "5.0.8"
+edition     = "2021"
+license     = "BSD-3-Clause"
+repository  = "https://github.com/ramp-stack/wgpu_canvas.git"
+description = "A 3D WGPU renderer API with OpenXR support"
+readme      = "README.md"
+keywords    = ["wgpu", "3d", "cuboid", "openxr", "quest"]
+categories  = ["graphics", "rendering", "game-development"]
+
+[lib]
+name       = "space_soup"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+wgpu        = { version = "25.0.0", optional = true }
+bytemuck    = { version = "1.21.0", optional = true, features = ["derive"] }
+glam        = { version = "0.29", features = ["serde"] }
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+gltf        = "1.4"
+anyhow      = "1.0"
+image       = { package = "image", version = "0.25.5" }
+fontdue     = "0.9.3"
+lazy_static = "1.5.0"
+log         = "0.4"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+env_logger = "0.11"
+pollster   = "0.3"
+winit      = "0.30"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+ndk-glue       = { version = "0.7" }
+ndk            = { version = "0.7" }
+openxr         = { version = "0.18", features = ["loaded"] }
+ash            = { version = "0.38", default-features = false, features = ["linked"] }
+
+[features]
+default  = ["canvas", "renderer"]
+canvas   = ["renderer"]
+renderer = ["dep:wgpu", "dep:bytemuck"]
+voxelize = []

@@ -1,0 +1,557 @@
+================================================================================
+ SPACE_SOUP — 3D RENDERER API OVERVIEW
+================================================================================
+
+space_soup is a Rust crate (crate name "space_soup", lib name "space_soup")
+that provides a small 3D rendering engine built on wgpu, with optional
+OpenXR/Vulkan support for VR headsets (Quest), a desktop mirror window, a
+voxelizer for turning GLTF models into cuboids, and a ported 2D UI system
+that can be drawn either as a screen-space overlay or as a 3D world-space
+panel.
+
+Crate version: 5.0.8
+Repository:    https://github.com/ramp-stack/wgpu_canvas.git
+
+--------------------------------------------------------------------------------
+ CARGO.TOML — Build configuration
+--------------------------------------------------------------------------------
+Defines the crate, its dependencies, and feature flags.
+
+Key dependencies:
+  - wgpu (optional, behind "renderer" feature) — the GPU API abstraction
+    used for all rendering (desktop + XR).
+  - bytemuck (optional) — lets Rust structs be safely cast to raw GPU
+    buffer bytes (Pod/Zeroable).
+  - glam — vector/matrix math (Vec3, Mat4, Quat).
+  - serde / serde_json — serialization, used by Cuboid and by the GLB
+    exporter's JSON chunk.
+  - gltf — parsing/loading GLTF/GLB 3D model files.
+  - anyhow — ergonomic error handling (Result<T> with context).
+  - image, fontdue, lazy_static — used by the 2D UI / text rendering layer
+    (ui2d), referenced by panel.rs.
+  - winit, pollster (desktop only) — windowing and blocking-on-async glue
+    for the desktop mirror window (canvas.rs).
+  - openxr, ash, ndk, android_logger (android only) — VR headset support
+    via OpenXR with a Vulkan backend.
+
+Feature flags:
+  - "renderer" (default) — enables wgpu/bytemuck, i.e. the actual GPU
+    rendering code (renderer module).
+  - "canvas" (default) — enables the desktop mirror window, depends on
+    "renderer".
+  - "voxelize" — enables the GLTF-to-cuboid voxelizer module.
+
+--------------------------------------------------------------------------------
+ lib.rs — Crate root / module wiring
+--------------------------------------------------------------------------------
+The top-level entry point that declares and re-exports the crate's modules:
+
+  - renderer        — always present; the core 3D rendering code.
+  - ui2d             — 2D UI system (screen overlays + world panels' content),
+                        gated behind the "renderer" feature.
+  - voxelize         — GLTF→cuboid voxelizer, gated behind "voxelize" feature.
+  - canvas           — desktop windowing (winit + wgpu surface), only on
+                        non-Android targets.
+  - xr               — Android/OpenXR-specific modules (context, vulkan,
+                        headset, controllers, hands), only on Android.
+
+Re-exports for convenience: `Renderer`, `Cuboid`, `CuboidStyle`, `Color3` from
+the renderer module, and `Canvas` on desktop, or the XR types
+(`XrContext`, `VkContext`, `Headset`, `Controllers`, `ControllerState`,
+`HandTrackers`, `HandJoint`) on Android.
+
+This file's job is purely organizational: it doesn't contain logic itself,
+just decides which modules compile for which target and what's part of the
+public API surface.
+
+--------------------------------------------------------------------------------
+ renderer/mod.rs — Renderer module root & top-level Renderer struct
+--------------------------------------------------------------------------------
+This is the heart of the rendering system. It:
+
+1. Declares the renderer's sub-modules: camera, cuboid, pipeline, uniforms,
+   mesh, mesh_pipeline, panel, and (Android only) xr_renderer.
+
+2. Defines `Color3(u8, u8, u8, u8)` — a simple sRGB RGBA color with a
+   `to_linear()` helper that converts sRGB channel values to linear color
+   space (needed because GPU shading math should happen in linear space,
+   while colors are usually authored in sRGB).
+
+3. Defines `MeshInstance<'a>` — pairs a loaded `GltfMesh` with its
+   per-instance `ModelUniform`, letting the same loaded mesh geometry be
+   placed multiple times cheaply (geometry/texture shared via reference,
+   only the transform differs).
+
+4. Defines the `Renderer` struct itself, which owns:
+     - the wgpu `Device`/`Queue`
+     - three render pipelines: solid cuboids, wireframe cuboids, and
+       textured meshes (`mesh_pipeline`)
+     - a camera uniform buffer
+     - a depth texture/view
+     - current viewport width/height
+
+   Renderer responsibilities:
+     - `from_device(...)` — construct a Renderer from an already-created
+       wgpu device/queue/surface format (used by both the desktop Canvas
+       and the XR renderer).
+     - `resize(...)` — recreate the depth buffer when the window/surface
+       size changes.
+     - `render(...)` — back-compat path: render cuboids only.
+     - `render_with_meshes(...)` — render cuboids + textured GltfMesh
+       instances in one pass.
+     - `render_with_panels(...)` — render cuboids + meshes + world-space
+       UI panels (WorldPanel) together. Panels reuse the mesh pipeline's
+       texture/model bind group layouts, so no extra pipeline is needed —
+       a panel's offscreen 2D content is drawn into a texture, then that
+       texture is shown on a 3D quad exactly like a textured mesh.
+     - `render_internal(...)` — the actual implementation shared by the
+       above three: builds vertex/index buffers for cuboids (solid +
+       wire), per-mesh-instance buffers, per-panel quad buffers, then runs
+       one render pass that draws solids, then wireframes, then all
+       textured draws (meshes + panels) using the mesh pipeline.
+     - `make_depth(...)` — helper to allocate a Depth32Float texture.
+
+   Design note in the doc comment: screen-space 2D overlays live in
+   `ui2d::Overlay` and are composed separately by the host application
+   after calling render — this module only handles the 3D scene.
+
+--------------------------------------------------------------------------------
+ renderer/camera.rs — View/projection matrix math
+--------------------------------------------------------------------------------
+Defines the `Camera` struct: position (Vec3), rotation (Quat), vertical
+field of view, aspect ratio, near/far clip planes.
+
+  - `new(aspect)` — default camera at (0, 1.6, 5) facing forward (roughly
+    eye height, a few meters back), 60° vertical FOV.
+  - `view()` — builds the view matrix as the inverse of the camera's
+    world transform (rotation + translation).
+  - `projection()` — standard right-handed perspective projection
+    (`Mat4::perspective_rh`).
+  - `xr_view(pose)` (Android only) — builds a view matrix directly from
+    an OpenXR pose (position + orientation quaternion), used per-eye.
+  - `xr_projection(fov, near, far)` (Android only) — builds an
+    asymmetric/off-axis projection matrix from an OpenXR FOV struct
+    (separate left/right/up/down angles), which headsets need because
+    each eye's frustum isn't symmetric like a typical desktop camera.
+
+--------------------------------------------------------------------------------
+ renderer/cuboid.rs — Cuboid type & CPU-side mesh generation
+--------------------------------------------------------------------------------
+Defines the basic renderable primitive of this engine: the box ("cuboid").
+
+  - `CuboidStyle` enum: Solid, Wireframe, or SolidAndWire.
+  - `Cuboid` struct: position, half_size, rotation (quaternion), fill
+    color, wireframe color, style, and a unique stable `id` (assigned via
+    an atomic counter `new_id()`) so external tools/editors can track a
+    specific cuboid across frames even as the list is rebuilt.
+  - Constructors: `solid(...)`, `wireframe(...)`, `solid_and_wire(...)`.
+  - `model_matrix()` — builds this cuboid's world transform
+    (scale = half_size*2, since the unit cube geometry is -0.5..0.5).
+  - `aabb()` — axis-aligned bounding box (ignores rotation, i.e. treats
+    the cuboid as unrotated for bounding purposes — a simplification).
+  - `ray_intersect(...)` — slab-method ray/AABB intersection test, e.g.
+    for mouse/controller picking.
+  - Manual `Serialize`/`Deserialize` impls for `Color3` (stored as a
+    plain 4-tuple of u8).
+
+Vertex layouts:
+  - `SolidVertex { position, normal, color }` — used by the solid-fill
+    pipeline; includes a normal for lighting.
+  - `WireVertex { position, color }` — used by the wireframe pipeline; no
+    lighting needed for lines.
+  Both implement `bytemuck::Pod`/`Zeroable` so they can be cast directly
+  to GPU buffer bytes, and expose a wgpu `VertexBufferLayout`.
+
+Geometry constants:
+  - `CORNERS` — the 8 corners of a unit cube centered at the origin.
+  - `FACES` — 6 faces, each as 4 corner indices + a face normal.
+  - `EDGES` — 12 edges as corner index pairs, for wireframe rendering.
+
+Mesh builders (CPU-side, called every frame in `render_internal`):
+  - `build_solid_mesh(cuboids)` — for every cuboid not in pure-Wireframe
+    style, bakes its world-space position into actual vertex positions
+    (i.e., the cuboid's transform is "baked" on the CPU rather than sent
+    to the GPU as a separate uniform — unlike GltfMesh, which keeps its
+    model matrix on the GPU). Applies simple per-face directional
+    lighting (dot product with a fixed light direction) baked into the
+    vertex color. Returns flat vertex + index buffers for all cuboids at
+    once.
+  - `build_wire_mesh(cuboids)` — same idea for cuboids in Wireframe or
+    SolidAndWire style, building line-list vertices/indices for cube
+    edges.
+
+This "bake everything into one big buffer per frame" approach trades some
+CPU work for pipeline simplicity — there's no per-cuboid GPU uniform or
+draw call, just one draw call for all solids and one for all wires.
+
+--------------------------------------------------------------------------------
+ renderer/pipeline.rs — Cuboid wgpu pipelines (solid + wireframe)
+--------------------------------------------------------------------------------
+Defines two `RenderPipeline` wrappers:
+
+  - `SolidPipeline` — triangle-list pipeline, back-face culled, alpha
+    blended, depth-tested (writes depth) against a Depth32Float buffer.
+    Uses an embedded WGSL shader (`SOLID_SHADER`) that just transforms
+    position by the camera's view-projection matrix and passes the
+    (already lit, see cuboid.rs) vertex color straight through.
+  - `WirePipeline` — line-list pipeline, no culling, alpha blended,
+    depth-tested for visibility but does NOT write depth (so wireframes
+    don't occlude other wireframes oddly) and uses LessEqual depth
+    comparison. The vertex shader nudges the clip-space Z slightly toward
+    the camera (`p.z -= 0.0001 * p.w`) — a small "depth bias" trick to
+    prevent wireframe edges from z-fighting with the solid faces they
+    outline.
+
+Both pipelines take a `uniform_layout` (the camera view-projection bind
+group layout, shared globally) and build their own pipeline layout +
+shader module + render pipeline from it.
+
+--------------------------------------------------------------------------------
+ renderer/uniforms.rs — Camera uniform buffer
+--------------------------------------------------------------------------------
+Defines `Uniforms { view_proj: [[f32;4];4] }` (Pod/Zeroable) and
+`UniformBuffer`, which owns:
+  - the actual wgpu `Buffer` holding the view-projection matrix,
+  - the `BindGroupLayout` describing a single uniform buffer bound to the
+    vertex stage (group 0, binding 0),
+  - the `BindGroup` tying the layout to the buffer.
+
+`upload(queue, view_proj)` writes a new view-projection matrix into the
+buffer each frame — this is the one piece of per-frame GPU state shared
+by every pipeline (solid, wire, mesh) via bind group 0.
+
+--------------------------------------------------------------------------------
+ renderer/mesh.rs — Loaded textured GLTF meshes (GltfMesh)
+--------------------------------------------------------------------------------
+Unlike cuboid.rs (simple boxes) and voxelize.rs (mesh → boxes), this file
+loads and renders a GLTF/GLB mesh's *original* geometry and texture,
+unmodified.
+
+  - `MeshVertex { position, normal, uv }` (Pod/Zeroable) — standard
+    textured-lit vertex layout.
+  - `MeshPrimitive { vertices, indices, texture }` — one drawable chunk
+    of geometry plus its diffuse texture (shared via `Arc` so multiple
+    instances of the same mesh don't re-upload the texture).
+  - `LoadedTexture { texture, view, bind_group }` — the GPU-side texture
+    resources for one primitive.
+  - `GltfMesh { primitives, position, rotation, scale }` — a full loaded
+    asset (possibly multiple primitives/materials) plus a transform that
+    callers mutate each frame, mirroring how `Cuboid` exposes
+    position/rotation so the same animation/attachment code can drive
+    either kind of object.
+      - `model_matrix()` — builds the world transform from
+        scale/rotation/position.
+      - `load(device, queue, layout, path)` — the main entry point: opens
+        a GLTF/GLB file via the `gltf` crate, walks the scene graph
+        (`collect_node`, recursive, applying parent*local transforms),
+        and for every primitive reads positions/normals/UVs/indices,
+        applies the node's world transform to positions/normals, and
+        looks up/creates its texture.
+
+  - `collect_node(...)` — recursively visits the GLTF node hierarchy,
+    accumulating world transforms, and appends one `MeshPrimitive` per
+    mesh primitive found.
+  - `load_primitive_texture(...)` — if the primitive's material has a
+    base color texture, uploads it; otherwise bakes the material's flat
+    `base_color_factor` into a 1×1 texture so the same textured shader
+    path works either way (no special "untextured" rendering branch
+    needed).
+  - `upload_texture_rgba(...)` — normalizes whatever pixel format GLTF
+    gave it (RGBA8, RGB8, R8/greyscale, or an unsupported format that
+    falls back to flat gray) into RGBA8 before uploading.
+  - `upload_solid_texture(...)` / `create_texture_from_rgba(...)` — shared
+    helper that allocates an `Rgba8UnormSrgb` wgpu texture, writes pixel
+    data to it, creates a linear-filtering repeat sampler, and builds the
+    texture bind group matching `MeshPipeline`'s texture layout.
+
+--------------------------------------------------------------------------------
+ renderer/mesh_pipeline.rs — Textured mesh wgpu pipeline
+--------------------------------------------------------------------------------
+Defines `MeshPipeline`, the render pipeline used for both `GltfMesh`
+instances and `WorldPanel` quads (since panels are just textured quads
+under the hood).
+
+  - Two bind group layouts:
+      - `texture_layout` (group 2) — texture + sampler, fragment-stage
+        only.
+      - `model_layout` (group 1) — a per-instance model-matrix uniform,
+        vertex-stage only. This is the key architectural difference from
+        cuboids: meshes/panels keep their transform on the GPU as a
+        uniform rather than baking it into vertex positions on the CPU,
+        because the same loaded geometry may be cheaply repositioned
+        many times (vs. cuboids, which are typically generated fresh
+        each frame anyway).
+  - `pipeline` — triangle-list, back-face culled, alpha blended, depth
+    tested+written, using an embedded WGSL shader (`MESH_SHADER`) that:
+      vertex stage: transforms position by model matrix then camera
+      view-projection; transforms normal by the model matrix (ignoring
+      translation) and passes UV through.
+      fragment stage: samples the texture, applies a simple
+      half-Lambert-style directional light (`dot(normal,light)*0.6+0.4`)
+      multiplied into the texture's RGB, alpha passed through (supports
+      texture transparency).
+  - `create_model_uniform(device)` — allocates a 64-byte (mat4x4) uniform
+    buffer + matching bind group, returned as a `ModelUniform`.
+  - `ModelUniform { buffer, bind_group }` with `upload(queue, model)` to
+    write a new model matrix — called once per mesh instance per frame
+    before drawing.
+
+--------------------------------------------------------------------------------
+ renderer/panel.rs — WorldPanel (3D-positioned 2D UI surface)
+--------------------------------------------------------------------------------
+A `WorldPanel` is a flat UI surface placed at an arbitrary 3D
+position/rotation in the scene — e.g. a floating VR menu — built by:
+  1. Rendering 2D UI content (via the existing `ui2d::Ui2dRenderer`,
+     `Atlas`, `Area`/`Item` types) into an offscreen texture.
+  2. Displaying that texture on a simple textured quad using the *same*
+     mesh pipeline `GltfMesh` instances use (same texture bind group
+     layout), so no new GPU pipeline has to be created for panels.
+
+Key pieces:
+  - `quad_geometry(width_m, height_m)` — builds a 4-vertex/6-index unit
+    quad of the given physical size (meters), centered at the panel's
+    local origin, facing +Z — the same facing convention as GltfMesh.
+  - `WorldPanel` fields: position/rotation, panel size in meters
+    (independent from its pixel resolution — e.g. render at 512×512px,
+    display at any physical size), the offscreen texture/view/bind
+    group/sampler, an embedded `Ui2dRenderer` + `Atlas` for drawing 2D
+    content, cached quad vertices/indices, a `ModelUniform` for placing
+    the quad in 3D, pixel dimensions, and a `dirty` flag.
+  - `new(...)` — allocates the offscreen render-target texture (matching
+    the *surface* format, not necessarily sRGB the same way meshes are),
+    a clamp-to-edge linear sampler, the texture bind group (using the
+    passed-in `MeshPipeline`'s texture layout — this is why
+    `Renderer::create_panel` exists, to hand panels the right pipeline
+    reference), a model uniform, and a fresh `Ui2dRenderer`.
+  - `upload_model(queue)` / `model_matrix()` — same per-frame transform
+    upload pattern as `GltfMesh`/`ModelUniform`.
+  - `mark_dirty()` / `is_dirty()` — lets callers force a re-render of the
+    panel's 2D content (e.g. after a button click); panels that don't
+    change don't redraw their offscreen texture every frame, just their
+    3D position.
+  - `bind_group()`, `vertices()`, `indices()` — exposed so `Renderer`
+    can draw the panel through the generic mesh draw path.
+  - `draw(device, queue, items)` — the actual 2D render: if not dirty,
+    no-ops; otherwise calls `Ui2dRenderer::prepare(...)` with the given
+    `(Area, Item)` list, then runs a render pass that clears the
+    offscreen texture to transparent and renders the 2D content into it.
+    Note this method ONLY updates the panel's offscreen texture — actually
+    drawing the panel's quad into the main 3D scene happens via
+    `Renderer::render_with_panels`.
+
+--------------------------------------------------------------------------------
+ renderer/xr_renderer.rs — OpenXR/Vulkan XR rendering (Android only)
+--------------------------------------------------------------------------------
+Stereo (two-eye) equivalent of `renderer/mod.rs`'s `Renderer`, wired into
+an OpenXR session's Vulkan swapchain instead of a window surface.
+
+  - `EyeTarget` — wraps one eye's wgpu texture view, imported from a raw
+    Vulkan swapchain image.
+  - `XrRenderer` fields: the OpenXR swapchain, viewport width/height, the
+    wgpu device/queue (built from the existing Vulkan instance/device via
+    `build_wgpu_from_vulkan`), the same three pipelines as the desktop
+    Renderer (solid/wire/mesh), the camera uniform buffer, a depth view,
+    and a list of per-swapchain-image, per-eye render targets
+    (`eye_targets`).
+  - `new(vk, xr_ctx, session)` — queries the headset's recommended eye
+    resolution, creates an OpenXR swapchain (`Rgba8Srgb`, stereo —
+    `array_size: 2`), wraps each swapchain image as a wgpu texture for
+    each eye (`import_vk_image_as_wgpu`), builds the wgpu device/pipelines
+    sharing the existing Vulkan device, and allocates one shared depth
+    buffer (reused across eyes/images).
+  - `device()`/`queue()`/`mesh_texture_layout()`/`create_model_uniform()`
+    — accessors mirroring the desktop `Renderer`'s API so app code can
+    treat both renderers similarly when loading `GltfMesh` assets.
+  - `render_frame(...)` — back-compat cuboids-only path.
+  - `render_frame_with_meshes(...)` — the main per-frame entry point:
+      1. Acquires/waits on the next swapchain image.
+      2. Locates both eye views/poses for the given XR time + stage space.
+      3. Builds the cuboid solid/wire vertex+index buffers once (shared
+         across both eyes — only the camera matrix differs per eye).
+      4. Builds mesh draw call data once (vertex/index buffers + bind
+         groups per primitive), likewise shared across eyes.
+      5. For each eye: uploads that eye's view*projection matrix, runs a
+         render pass into that eye's texture view (solid → wire → mesh
+         draws, same order as the desktop renderer), and submits.
+      6. Polls the device, releases the swapchain image, and returns the
+         `CompositionLayerProjectionView`s OpenXR needs to composite the
+         frame.
+  - `build_wgpu_from_vulkan(vk)` (unsafe) — bridges an existing raw
+    Vulkan instance/device (created for OpenXR) into a wgpu
+    Device/Queue via wgpu's Vulkan hal backend, so wgpu and OpenXR share
+    the same underlying Vulkan objects instead of needing two separate
+    graphics contexts.
+  - `import_vk_image_as_wgpu(...)` (unsafe) — wraps one raw
+    `vk::Image` from the OpenXR swapchain as a wgpu `Texture` (via
+    `hal::Device::texture_from_raw`), so wgpu render passes can target it
+    directly.
+
+--------------------------------------------------------------------------------
+ voxelize.rs — GLTF → Cuboid voxelizer (feature = "voxelize")
+--------------------------------------------------------------------------------
+Converts an arbitrary textured/vertex-colored GLTF/GLB model into a list
+of axis-aligned colored cuboids ("voxels"), and/or writes that voxelized
+result back out as a new GLB made of literal box meshes. This is the
+inverse of mesh.rs's approach: mesh.rs keeps the original geometry,
+voxelize.rs throws it away and approximates the shape with boxes.
+
+Public API:
+  - `gltf_to_cuboid_glb(input, output, voxel_size)` — load, voxelize, AND
+    write the result as a new GLB file; returns the cuboid list too.
+  - `gltf_to_cuboids(input, voxel_size)` — load + voxelize only, no file
+    output (e.g. to hand the cuboids straight to the live `Renderer`).
+  - `cuboids_to_glb(cuboids, output)` — skip voxelization, just export an
+    already-built cuboid list as a GLB of boxes.
+
+Import stage (`import_gltf`, `collect_node`):
+  - Walks the GLTF scene graph (same recursive parent*local transform
+    pattern as mesh.rs's `collect_node`), but instead of building
+    GPU-ready vertex buffers, it builds a flat `Vec<Triangle>` where each
+    `Triangle` is 3 world-space `Vec3` positions + an averaged RGBA color
+    (vertex colors if present, else falling back to the material's flat
+    `base_color_factor`).
+  - `avg_color4(...)` — averages a triangle's 3 vertex colors into one
+    flat color per triangle (the voxelizer colors each voxel by a single
+    color, not per-vertex).
+
+Voxelization (`voxelize`, `ray_tri_y`):
+  - Computes the world-space bounding box of all triangles, padded by
+    half a voxel on each side, then derives a grid resolution
+    (`nx × ny × nz`) from `voxel_size`.
+  - For every (x, z) column in the grid, casts a vertical ray (along Y)
+    through the whole triangle soup (`ray_tri_y` — a 2D point-in-triangle
+    test projected onto the XZ plane, then solving for the hit Y via
+    barycentric interpolation) and collects all Y-axis crossings.
+  - Sorts crossings by height and treats them in entry/exit pairs (i.e.
+    assumes a closed/watertight-ish mesh: ray enters the volume at hit 0,
+    exits at hit 1, enters again at hit 2, etc.) — for each entry/exit
+    pair, fills every Y-grid-cell between them with a solid cuboid voxel,
+    colored using the entry triangle's color.
+  - `linear_to_srgb_u8(...)` — converts a linear color channel value to
+    an 8-bit sRGB value for storage in `Color3` (GLTF colors are linear;
+    `Color3` stores sRGB-encoded bytes, mirroring `Color3::to_linear`'s
+    inverse operation elsewhere in the renderer).
+  - Logs grid size and resulting cuboid count via the `log` crate.
+
+GLB export (`export_glb`, `box_corners`):
+  - Hand-builds a minimal valid GLB (binary GLTF) file containing one
+    mesh node per cuboid, each a literal 8-vertex/36-index indexed box,
+    with `POSITION` and `COLOR_0` (VEC3/VEC4 float) vertex attributes and
+    16-bit indices.
+  - Manually packs a single binary buffer (`bin`) containing, back to
+    back for every cuboid: 8 position vertices, 8 color vertices, then
+    36 index entries (with padding to keep each index block 4-byte
+    aligned, since GLB buffer views/accessors require alignment).
+  - Builds the GLTF JSON document (`accessors`, `bufferViews`, `meshes`,
+    `nodes`, `scenes`, `buffers`) describing that binary layout using
+    `serde_json::json!`.
+  - Writes the actual GLB binary container by hand: a 12-byte header
+    (`glTF`, version 2, total length), then a JSON chunk (padded to 4
+    bytes with ASCII spaces, type tag `0x4E4F534A` = "JSON" in
+    little-endian), then a BIN chunk (padded with zero bytes, type tag
+    `0x004E4942` = "BIN\0").
+  - `box_corners(center, half)` — the 8 world-space corners of one
+    cuboid, in the same corner ordering used by the index winding in
+    `export_glb`'s `faces` table (which differs slightly in convention
+    from `cuboid.rs`'s `CORNERS`/`FACES`, since this is a separate,
+    independent mesh-building codepath written directly against raw
+    GLB bytes rather than wgpu vertex buffers).
+
+--------------------------------------------------------------------------------
+ canvas.rs — Desktop mirror window (winit + wgpu + head-pose streaming)
+--------------------------------------------------------------------------------
+A desktop application shell — opens a regular OS window (via `winit`),
+creates a wgpu surface for it, and renders either a static scene or a
+live-driven scene, while also receiving real-time head-pose data
+streamed from a Quest headset over TCP. Used as a "mirror" so a developer
+can watch what the VR headset sees from a desktop monitor.
+
+  - `HeadPose { position, rotation }` — defaults to (0, 1.6, 0), identity
+    rotation (standing eye height, looking forward).
+  - `SceneSource` enum — where per-frame cuboids come from:
+      - `Static(Vec<Cuboid>)` — a fixed list set once at construction.
+      - `Engine { last_time, frame_fn }` — a boxed closure
+        `FnMut(dt_seconds, head_position, head_rotation) -> Vec<Cuboid>`
+        invoked every frame, intended to be backed by a
+        `space_soup_engine::GameRuntime` so the desktop mirror runs the
+        *same* live game logic as the headset rather than a stale
+        snapshot.
+  - `Canvas` struct — owns the optional `Renderer`/`Surface`/
+    `SurfaceConfiguration` (created lazily in `resumed`), the wgpu
+    `Instance`, the `Camera`, the `SceneSource`, the `winit::Window`, and
+    a shared `Arc<Mutex<HeadPose>>` updated by a background thread.
+  - `new()` — convenience constructor using a small built-in
+    `default_scene()` (a red solid cube, a green wireframe cube, a blue
+    solid+wire cube, and a gray ground plane).
+  - `new_with_scene(cuboids)` — static scene constructor.
+  - `new_with_engine(frame_fn)` — live-engine constructor.
+  - `new_internal(scene)` — shared setup: spawns a background thread that
+    binds a `TcpListener` on `127.0.0.1:7777` and, for each connecting
+    client (the Quest headset), reads fixed 28-byte pose packets in a
+    loop (3 floats position + 4 floats quaternion, all little-endian) and
+    stores the latest pose into the shared `Arc<Mutex<HeadPose>>`. If the
+    port can't be bound, head tracking is silently disabled (logged as a
+    warning) rather than crashing the app.
+  - `run(self)` — starts the winit event loop, handing control to this
+    `Canvas` as the `ApplicationHandler`.
+  - `redraw(&mut self)` — per-frame logic: reads the latest head pose
+    into the camera, resolves the current frame's cuboids (clone the
+    static list, or call the engine's `frame_fn` with computed delta
+    time and the current head pose), acquires the next surface texture,
+    and calls `renderer.render(...)`.
+
+`ApplicationHandler` impl (winit's app lifecycle trait):
+  - `resumed(...)` — runs once the window/event loop actually starts:
+    creates the OS window, creates a wgpu surface for it (using an
+    `unsafe transmute` to extend its lifetime to `'static`, a common wgpu
+    pattern when the window is kept alive elsewhere via `Arc`), requests
+    a high-performance GPU adapter + device, configures the surface
+    (FIFO present mode = vsync), and builds the `Renderer`.
+  - `window_event(...)` — handles `CloseRequested` (exit the app),
+    `Resized` (reconfigure the surface + renderer's depth buffer + camera
+    aspect ratio), and `RedrawRequested` (call `redraw`).
+  - `about_to_wait(...)` — requests another redraw, creating a continuous
+    render loop (rather than only redrawing on OS-triggered repaint
+    events).
+
+`default_scene()` — the small hard-coded demo scene described above,
+useful for quickly testing the renderer without wiring up a real game.
+
+================================================================================
+ ARCHITECTURE SUMMARY
+================================================================================
+
+Three kinds of renderable content, three corresponding pipelines, all
+sharing one camera uniform (group 0):
+
+  1. Cuboids (cuboid.rs + pipeline.rs)
+     - CPU-baked transforms, lighting baked into vertex color.
+     - Solid pipeline (filled triangles) + wire pipeline (line list).
+     - Rebuilt into fresh vertex/index buffers every single frame from
+       whatever `&[Cuboid]` slice is passed in — simple, no per-object
+       GPU state, but means every cuboid is "immediate mode."
+
+  2. Textured meshes (mesh.rs + mesh_pipeline.rs)
+     - GPU-resident geometry + texture, loaded once from a GLTF/GLB file
+       via `GltfMesh::load`.
+     - Per-instance GPU model-matrix uniform (`ModelUniform`), so the
+       same loaded mesh can be placed many times cheaply, and its
+       transform updates without re-uploading geometry.
+
+  3. World-space UI panels (panel.rs)
+     - A `WorldPanel` is, from the 3D renderer's perspective, just
+       another textured quad using the mesh pipeline.
+     - Its texture's *contents* come from rendering 2D UI (`ui2d`) into
+       an offscreen render target, decoupling "what the panel shows" from
+       "where the panel sits in 3D".
+
+Two render backends share all of the above:
+  - Desktop: `canvas.rs` (winit window) → `renderer/mod.rs`'s `Renderer`.
+  - VR/Android: `renderer/xr_renderer.rs`'s `XrRenderer`, driving an
+    OpenXR/Vulkan swapchain, reusing the exact same pipeline types
+    (`SolidPipeline`, `WirePipeline`, `MeshPipeline`) by sharing the
+    underlying Vulkan device with wgpu.
+
+One offline tool, `voxelize.rs`, converts arbitrary GLTF models into
+cuboid lists (and/or a "boxified" GLB), bridging "real" mesh content
+into the cuboid-based half of the renderer.

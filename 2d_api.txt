@@ -1,0 +1,477 @@
+================================================================================
+ UI2D — 2D RENDERING SUBSYSTEM OVERVIEW
+================================================================================
+
+`ui2d` is space_soup's 2D rendering layer, ported from the upstream
+"wgpu_canvas" project. It draws flat shapes (ellipses, rectangles,
+rounded rectangles), images, and text, all expressed as a flat list of
+`Item`s placed at an `Area` (an offset plus optional clip bounds), into
+any wgpu render pass.
+
+It has two consumers within space_soup:
+  - `renderer::panel::WorldPanel` — renders ui2d content into an
+    offscreen texture that's then displayed on a 3D quad (a floating
+    VR menu).
+  - `ui2d::Overlay` — renders ui2d content directly into the
+    screen/eye view, on top of the already-drawn 3D scene
+    (screen-space HUD/UI).
+
+Both consumers are built on the same lower-level pieces described below:
+shape math → vertex layouts → per-shape-type renderers (color, image) →
+atlas (GPU resource caching) → the combined `Renderer` → the
+higher-level `Overlay`/`WorldPanel` wrappers. Text is treated as a
+special case of "image" — each glyph is rasterized to a bitmap and drawn
+through the same image rendering path used for textures.
+
+--------------------------------------------------------------------------------
+ ui2d/mod.rs — Module root & shared core types
+--------------------------------------------------------------------------------
+Declares the submodules (`shape`, `text`, `renderer`, `overlay`) and
+re-exports the public API: `ShapeType` (aliased from `shape::Shape`),
+`Font`/`Text`/`Span`/`Align`/`Character` (from `text`), `Ui2dRenderer`/
+`Atlas` (from `renderer`), `Overlay`, and `RgbaImage` (re-exported from
+the `image` crate).
+
+Core data types defined here:
+
+  - `Color(u8, u8, u8, u8)` — plain sRGB RGBA color, `Default`/`Hash`/
+    `Ord`-able so it can be used as part of cache keys.
+  - `Shape { shape: ShapeType, color: Color }` — a flat-colored shape to
+    draw (no texture).
+  - `Image { shape: ShapeType, image: Arc<RgbaImage>, color: Option<Color> }`
+    — a textured shape; `color` optionally tints it. Has a manual `Debug`
+    impl since `RgbaImage` itself isn't meaningfully printable.
+  - `Item` enum — the three things this system can draw: `Shape(Shape)`,
+    `Image(Image)`, or `Text(Text)`. This is the type callers build lists
+    of (`Vec<(Area, Item)>`) and hand to a renderer or `Overlay`.
+  - `Area { offset: (f32,f32), bounds: Option<(f32,f32,f32,f32)> }` — where
+    on screen/panel an item is placed (`offset`) and an optional clip
+    rectangle (`bounds`) used for scissoring (e.g. clipping text inside a
+    scrollable box).
+
+--------------------------------------------------------------------------------
+ ui2d/shape.rs — Shape geometry math
+--------------------------------------------------------------------------------
+Pure math, no GPU code. Defines `Shape`, the geometric description of
+one of three primitive kinds:
+
+  - `Ellipse(stroke, (w, h), angle_degrees)`
+  - `Rectangle(stroke, (w, h), angle_degrees)`
+  - `RoundedRectangle(stroke, (w, h), angle_degrees, corner_radius)`
+
+  `stroke` is 0 for a filled shape, or a positive width for an outline
+  (an outline-only ellipse/rect/etc — the actual stroke-vs-fill decision
+  happens in the WGSL shaders, not in this file; this just carries the
+  stroke width along).
+
+Methods:
+  - `stroke()` / `angle()` / `wh()` — trivial accessors per variant.
+  - `size()` — computes the *axis-aligned bounding box* of the shape
+    after rotation by `angle()`. For an ellipse this projects the two
+    radii through the rotation; for a rectangle/rounded-rectangle it
+    projects the half-width/half-height through `cos`/`sin` of the
+    angle. This bounding box is what the renderer actually allocates
+    screen-space room for, since a rotated shape's "footprint" is larger
+    than its unrotated width/height.
+  - `positions(offset)` — computes the 4 corner positions of the shape's
+    *bounding quad* (not the shape's own corners) in local space, rotated
+    around the shape's center, then shifted so the quad's top-left aligns
+    back to `offset` (since after rotation the unrotated top-left corner
+    is no longer the bounding box's top-left). This is the quad that
+    `ShapeVertex::new` later transforms into clip space; the actual
+    ellipse/rounded-rect masking happens per-pixel in the fragment shader
+    using the `uv`/`size`/`stroke` values baked into each vertex.
+
+--------------------------------------------------------------------------------
+ ui2d/text.rs — Font loading, glyph layout, span/text types
+--------------------------------------------------------------------------------
+Wraps `fontdue` (a pure-Rust font rasterizer) and implements text layout
+(line wrapping, baseline positioning) independent of any GPU code.
+
+  - `Font(FontdueFont)` — thin wrapper; `new(bytes)` parses TTF/OTF bytes
+    via `fontdue::Font::from_bytes`. `rasterize(c, px)` renders one glyph
+    at a given pixel size, returning fontdue's `(Metrics, Vec<u8>)`
+    (coverage bitmap). `Deref`s to the inner `FontdueFont` so callers
+    (and `Text::new`) can call fontdue methods like `metrics()` and
+    `horizontal_line_metrics()` directly.
+  - `Align` enum — `Left`/`Center`/`Right` (default `Left`). Carried on a
+    `Span` but not yet shown being consumed by the layout code in `new`
+    (alignment is presumably applied by a caller adjusting `offset`, or
+    is a hook for future use).
+  - `Span` — one styled run of text: string, `Arc<Font>`, font size,
+    color, alignment. Built via `Span::new(...)`, chainable
+    `.with_align(...)`.
+  - `Character` — one laid-out glyph instance, stored as a 7-field tuple
+    struct (documented as positionally load-bearing, since
+    `atlas.rs::TextAtlas::get` indexes into it as `ch.0`..`ch.6`):
+    char, `(x, y, w, h)` quad position/ink-box size, font, color, two
+    reserved/unused f32 fields kept for layout parity, and font_size.
+  - `Text` — a laid-out block: `lines: Vec<(y, (width, height), Vec<Character>)>`
+    plus overall `width`.
+      - `new(spans, max_width)` — the layout engine. Walks each span's
+        characters, advancing a pen position (`cursor_x`/`cursor_y`),
+        wrapping to a new line when `cursor_x + advance > max_width`,
+        and on explicit `\n` characters. Line height is the largest
+        `font_size * 1.2` seen on that line.
+
+        **Important fix documented in this file's header comment**: each
+        glyph's quad position is computed from that glyph's own
+        rasterization bounds (`xmin`, `ymin`, `height`) and the font's
+        descent metric — `x = cursor_x + bounds.xmin`,
+        `y = cursor_y + line_height + descent - bounds.ymin - bounds.height`
+        — rather than naively placing every glyph at `(cursor_x, cursor_y)`.
+        Previously this made small low glyphs (like `.`) float near the
+        top of the line instead of sitting on the baseline, and skipped
+        left-bearing adjustment, letting narrow glyphs visually overlap.
+
+        A documented caveat: if a single line mixes spans of different
+        font sizes, earlier glyphs are positioned using the line height
+        known *at that time*, not retroactively corrected once a later,
+        larger span is seen on the same line — not an issue currently
+        since every call site in this codebase uses one span per `Text`.
+      - `lines()` / `width()` / `height()` — accessors; `height()` sums
+        the last line's y+height across all lines via a max-fold.
+
+--------------------------------------------------------------------------------
+ ui2d/renderer/vertex.rs — GPU vertex layouts for shapes/colors/images
+--------------------------------------------------------------------------------
+Ported unchanged from wgpu_canvas. Defines the `Vertex` trait and the
+concrete vertex structs used by every shape/image/text draw call.
+
+  - `trait Vertex` — requires `attributes() -> Vec<VertexFormat>` and
+    provides a default `layout()` that auto-computes byte offsets for
+    each attribute (interleaved tightly, no padding) and leaks a
+    `Vec<VertexAttribute>` into a `'static` slice (a deliberate one-time
+    leak, since pipeline creation needs a `'static` layout and this only
+    happens once per pipeline, not per frame).
+
+  - `ShapeVertex { uv, position, size, bounds, z_index, stroke }` — the
+    base vertex for any flat shape:
+      - `transform_point(width, height, p)` — converts a pixel-space
+        point into wgpu clip space (-1..1), flipping Y (screen Y grows
+        downward, clip space Y grows upward).
+      - `transform(...)` — applies that to all 4 corners of a quad.
+      - `new(width, height, z, area, shape)` — the main constructor:
+        gets the shape's bounding-quad corners via `shape.positions(...)`,
+        transforms them to clip space, computes `bounds` (the `Area`'s
+        clip rectangle, also transformed to clip space, defaulting to the
+        full viewport), encodes `z` (a draw-order index) as a normalized
+        `z_index` float, and returns 4 vertices with per-corner `uv`
+        coordinates matching the shape's own (un-rotated) size — `uv` is
+        what the fragment shader uses to test "am I inside the
+        ellipse/rounded-rect" independent of the bounding quad's rotation.
+
+  - `RoundedRectangleVertex { shape: ShapeVertex, corner_radius }` —
+    wraps `ShapeVertex` and tacks on a corner radius attribute.
+
+  - `ColorVertex<V> { shape: V, color: [f32;4] }` — generic over the
+    underlying shape vertex type; `new(shape, color)` converts the sRGB
+    `Color` byte channels to linear float via the sRGB→linear formula
+    (same transfer function used elsewhere in the renderer, e.g.
+    `Color3::to_linear` in the 3D side) before baking it into the vertex.
+
+  - `ImageVertex<V> { color: ColorVertex<V>, texture: [f32;2] }` — adds
+    UV texture coordinates on top of `ColorVertex`. `new(shape, image,
+    size, color)` computes "letterboxed" UVs: it compares the
+    image's aspect ratio to the target draw size and insets either the
+    U or V range so the image is shown without distortion (like
+    `object-fit: contain` in CSS) rather than being stretched to fill the
+    quad.
+
+--------------------------------------------------------------------------------
+ ui2d/renderer/color.rs — Flat-color shape rendering
+--------------------------------------------------------------------------------
+Ported unchanged from wgpu_canvas. Draws shapes with no texture
+(`Item::Shape`).
+
+  - `ColorRenderer` — owns three `GenericColorRenderer`s, one each for
+    ellipse, rectangle, and rounded-rectangle (different WGSL shaders per
+    shape, since the per-pixel mask test differs).
+      - `new(...)` — loads `shaders/color/{ellipse,rectangle,rounded_rectangle}.wgsl`
+        via `include_wgsl!` and builds each sub-renderer.
+      - `prepare(device, queue, width, height, items)` — buckets the
+        incoming `(z, area, shape, color)` tuples by shape variant and
+        forwards each bucket to its sub-renderer.
+      - `render(pass)` — draws all three sub-renderers in turn (ellipses,
+        then rectangles, then rounded rectangles — note: NOT sorted by
+        `z_index` at the draw-call level; z-ordering between different
+        shape *types* relies entirely on the `z_index` value tested in
+        the fragment shader, not on draw order).
+
+  - `GenericColorRenderer` — the actual pipeline + dynamic buffers for
+    one shape kind:
+      - `new(...)` — builds a render pipeline with no bind group layouts
+        (flat color needs no textures/uniforms — color is baked directly
+        into vertex data), alpha-blended, against the given depth/
+        multisample state.
+      - `prepare(device, queue, vertices)` — takes `Vec<[V;4]>` (one
+        quad's 4 vertices per shape instance), flattens them into one
+        big vertex buffer, and generates `[0,1,2,1,2,3]`-style triangle
+        indices per quad (a quad = 2 triangles sharing a diagonal).
+      - `render(pass)` — sets the pipeline + buffers and issues one
+        `draw_indexed` covering everything prepared this frame.
+
+--------------------------------------------------------------------------------
+ ui2d/renderer/image.rs — Textured shape rendering (images + text glyphs)
+--------------------------------------------------------------------------------
+Ported from wgpu_canvas, with one documented addition: a second sampler
+specifically for text.
+
+  - `ImageRenderer` — owns:
+      - one shared `bind_group_layout` (texture + sampler, fragment-only)
+      - a linear `sampler` for photographic images
+      - a nearest-filter `text_sampler` for glyph bitmaps — added so text
+        renders pixel-exact rather than blurred by linear interpolation
+        at small sizes
+      - three `GenericImageRenderer`s (ellipse/rectangle/rounded-rectangle),
+        mirroring `ColorRenderer`'s structure but for textured shapes.
+
+    `prepare(...)` takes `(z, area, shape, image_key, color, is_text)`
+    tuples, picks `text_sampler` vs `sampler` per item based on the
+    `is_text` flag, fetches (or creates, via `ImageAtlas::get`) that
+    image's GPU bind group, buckets by shape type, and forwards to each
+    sub-renderer.
+
+  - `GenericImageRenderer` — like `GenericColorRenderer` but keyed by
+    *texture bind group* rather than drawing everything in one indexed
+    call, since different items may use different textures:
+      - `indices: HashMap<Arc<BindGroup>, Vec<(u32,u32)>>` — for each
+        distinct bind group, the list of (start,end) index ranges in the
+        shared index buffer that use it.
+      - `render(pass)` — for each bind group, binds it once then issues
+        one `draw_indexed` per index range using it (so items sharing a
+        texture are still drawn as separate sub-ranges, e.g. to preserve
+        per-item z-ordering encoded into the vertex data, while still
+        reusing one bound texture across consecutive draws of the same
+        image/glyph).
+
+    **Documented fix in this file's header comment**: the fragment
+    target previously used `(*texture_format).into()`, wgpu's default
+    `ColorTargetState` conversion, which sets `blend: None`. With no
+    blend state every textured quad was an opaque overwrite — alpha was
+    never used to mask anything, so every glyph (and any transparent
+    image) rendered as a solid block instead of being alpha-composited.
+    Fixed by explicitly setting `blend: Some(BlendState::ALPHA_BLENDING)`,
+    matching what `color.rs` already did for flat shapes.
+
+--------------------------------------------------------------------------------
+ ui2d/renderer/atlas.rs — GPU resource caching (images + rasterized text)
+--------------------------------------------------------------------------------
+Caches expensive-to-recreate GPU/CPU resources across frames so repeated
+draws of the same image or glyph don't re-upload or re-rasterize.
+
+  - `Atlas { image: ImageAtlas, text: TextAtlas }` — the combined cache
+    handed around by the higher-level `Renderer`. `trim()` calls trim on
+    both sub-caches.
+
+  - `ImageAtlas(Vec<(Arc<RgbaImage>, Arc<BindGroup>)>)` — a flat
+    association list (not a HashMap, since `RgbaImage` doesn't implement
+    `Hash`/`Eq` usefully here; lookup is via `Arc::ptr_eq`, i.e. "same
+    image instance", not "same pixel content"):
+      - `trim()` — drops entries whose image `Arc` has no other owners
+        left (`strong_count() <= 1`), i.e. garbage-collects images no
+        longer referenced anywhere else.
+      - `get(...)` — looks up an existing bind group by pointer identity;
+        on miss, creates a new `Rgba8UnormSrgb` texture, uploads the
+        image's pixels via `write_texture`, builds a texture+sampler bind
+        group, caches it, and returns it.
+
+  - `TextAtlas { fonts: Vec<(Arc<Font>, ImageMap)> }` where
+    `ImageMap = HashMap<(char, font_size_bits, scale_factor_bits), Option<Arc<RgbaImage>>>`
+    — caches *rasterized glyph bitmaps* per (font, char, font_size,
+    scale_factor) combination. `scale_factor` is folded into the key
+    specifically so the same glyph rendered at a different display DPI
+    gets rasterized fresh rather than reusing a wrongly-sized bitmap.
+      - `trim()` — same strong-count-based GC, but per-font.
+      - `clear()` — drops everything; meant to be called when
+        `scale_factor` changes globally, since all existing
+        rasterizations were baked at the old DPI.
+      - `get_font(font)` — finds-or-inserts a font's glyph map by
+        pointer identity.
+      - `get_image(font, c, font_size, scale_factor)` — the actual
+        rasterize-and-cache step: calls `font.rasterize(c, font_size *
+        scale_factor)` (rasterizing at *physical* pixel size, not logical),
+        then applies a contrast curve to the coverage alpha
+        (`t.powf(0.6)`) — documented as compensating for fontdue having no
+        hinting, where coverage-based anti-aliasing at small sizes fades
+        gradually and looks soft/gray; steepening the curve pushes
+        partial-coverage pixels toward fully transparent/opaque faster,
+        producing crisper-looking text without altering glyph shape or
+        position. Builds an RGBA bitmap (black RGB + the adjusted
+        coverage as alpha), and caches `None` for fully-empty glyphs
+        (e.g. space) so they're skipped without re-rasterizing every
+        time.
+      - `get(text, scale_factor)` — the layout→bitmap bridge consumed by
+        the top-level `Renderer::prepare`: walks every glyph (`Character`)
+        in a laid-out `Text`, rasterizes/caches each one, and returns
+        `(offset, ShapeType::Rectangle, bitmap, color)` tuples ready to
+        feed into the image rendering path — i.e. **text is rendered as a
+        sequence of small rectangular images**, not as its own shape
+        type.
+
+        **Documented correctness note**: the rectangle's *size* passed
+        to the renderer must be the rasterized bitmap's own pixel
+        dimensions divided back down by `scale_factor` (`img.width() /
+        scale_factor`), NOT the layout-time ink-box bounds computed by
+        `Text::new` at logical font size. Those two only match when
+        `scale_factor == 1.0`; otherwise using the logical bound as the
+        quad size previously caused glyphs to render as solid blocks
+        instead of letterforms, since the quad size and the bitmap's
+        actual content size disagreed.
+
+--------------------------------------------------------------------------------
+ ui2d/renderer/buffer.rs — DynamicBuffer (auto-growing GPU buffer)
+--------------------------------------------------------------------------------
+Ported unchanged from wgpu_canvas. A wgpu buffer wrapper that
+transparently grows (reallocates) when written content exceeds its
+current capacity, used for every vertex/index buffer in this subsystem
+(shape, color, image renderers all use it instead of raw `wgpu::Buffer`).
+
+  - `DynamicBuffer::new(device, descriptor)` — starts at a fixed 4096-byte
+    buffer.
+  - `write_buffer(device, queue, contents)` — pads `contents` to a
+    multiple of 4 bytes (wgpu buffer-write alignment requirement), then
+    either `queue.write_buffer`s in place if the existing buffer is large
+    enough, or allocates a new, larger buffer (rounded up to the next
+    power of two and aligned to `COPY_BUFFER_ALIGNMENT` via
+    `next_copy_buffer_size`) mapped at creation, copies the data in
+    directly, and unmaps it.
+  - Implements `AsRef<Buffer>` so callers can `.slice(..)` it like a
+    normal wgpu buffer.
+
+--------------------------------------------------------------------------------
+ ui2d/renderer/mod.rs — Combined Renderer (color + image + text dispatch)
+--------------------------------------------------------------------------------
+The single entry point that turns a flat `Vec<(Area, Item)>` into drawn
+pixels, by internally splitting work between `ColorRenderer` and
+`ImageRenderer`.
+
+  - `Renderer { color_renderer: ColorRenderer, image_renderer: ImageRenderer }`
+      - `new(...)` — constructs both sub-renderers with the same
+        texture format / multisample / depth-stencil config.
+      - `prepare(device, queue, width, height, scale_factor, atlas, items)`
+        — the main per-frame dispatch: iterates `items` with their index
+        as a z-order key (`z = i as u16`, i.e. **z-ordering is simply
+        the order items appear in the input list** — later items draw on
+        top), and routes each:
+          - `Item::Shape` → into the `colors` bucket for `ColorRenderer`.
+          - `Item::Image` → into the `images` bucket for `ImageRenderer`,
+            tagged `is_text = false`.
+          - `Item::Text` → calls `atlas.text.get(text, scale_factor)` to
+            rasterize/fetch every glyph as a bitmap, then pushes one
+            image-bucket entry per glyph, with that glyph's own local
+            offset added to the item's `Area` offset (rounded to whole
+            pixels — avoids sub-pixel blurring) and `is_text = true`.
+        Forwards the two buckets to `color_renderer.prepare(...)` and
+        `image_renderer.prepare(..., &mut atlas.image, ...)`
+        respectively.
+      - `render(pass)` — draws `color_renderer` then `image_renderer` (so
+        all flat-color shapes draw before all images/text, *regardless*
+        of their relative z_index — only `z_index` baked into the vertex
+        affects ordering *within* each renderer's own depth test, not
+        across the color/image split; this only matters when depth
+        testing is enabled, e.g. inside a 3D `WorldPanel` versus a 2D-only
+        `Overlay`).
+
+  Re-exports `Atlas` from `atlas.rs` as the type callers must hold and
+  pass into `prepare`.
+
+--------------------------------------------------------------------------------
+ ui2d/overlay.rs — Screen-space 2D overlay (HUD on top of the 3D scene)
+--------------------------------------------------------------------------------
+A ready-to-use wrapper for the common "draw 2D UI on top of the 3D
+scene, in screen space" case — as opposed to `renderer::panel::WorldPanel`,
+which draws 2D UI onto a texture that's then placed in 3D space.
+
+  - `Overlay { atlas, renderer, width, height, scale_factor, items }`
+      - `new(device, texture_format, width, height, scale_factor)` —
+        builds its own private `Atlas` and `Ui2dRenderer`, using
+        `MultisampleState::default()` and `depth_stencil: None` — the doc
+        comment explains this is appropriate because the overlay draws
+        *after* the 3D pass into the already-resolved swapchain/eye view,
+        so it doesn't need to match the 3D pipeline's MSAA or depth
+        configuration.
+      - `resize(width, height)` — update stored viewport size (e.g. on
+        window resize).
+      - `set_scale_factor(scale_factor)` — updates DPI scale; if it
+        actually changed, calls `atlas.trim()` since glyphs rasterized at
+        the old DPI are now stale (note: this calls `trim()`, which only
+        evicts entries with no other strong references — for a full
+        proper reset matching the doc comment on `TextAtlas::clear()`,
+        compare against that method, which unconditionally clears
+        everything).
+      - `set_items(items)` — stages the list of `(Area, Item)` to draw
+        this frame; call before `render`.
+      - `render(device, queue, encoder, view)` — no-ops if there's
+        nothing staged; otherwise takes the staged items, calls
+        `renderer.prepare(...)`, opens a render pass on `view` with
+        `LoadOp::Load` (preserves whatever the 3D pass already drew
+        instead of clearing it) and no depth attachment, and calls
+        `renderer.render(...)` into that pass. Intended to be called
+        right after the 3D `render`/`render_with_meshes` call, either
+        reusing the same command encoder or a new one targeting the same
+        view.
+
+================================================================================
+ ARCHITECTURE SUMMARY
+================================================================================
+
+Layering, bottom to top:
+
+  1. shape.rs — pure geometry: given a shape description + rotation,
+     compute its bounding quad's 4 corners and overall bounding size.
+     No GPU types at all.
+
+  2. text.rs — pure layout: given styled text spans + a wrap width,
+     compute per-glyph positions on baselines across wrapped lines. Also
+     no GPU types (uses fontdue for metrics/rasterization, but layout
+     itself is just floats).
+
+  3. renderer/vertex.rs — turns shape.rs's geometry into actual GPU
+     vertex structs (`ShapeVertex`/`RoundedRectangleVertex`/
+     `ColorVertex`/`ImageVertex`), including the pixel→clip-space
+     transform and sRGB→linear color conversion.
+
+  4. renderer/color.rs and renderer/image.rs — two parallel rendering
+     paths, each with its own wgpu pipelines (one per shape kind:
+     ellipse/rectangle/rounded-rect):
+        - color.rs: flat-colored shapes, color baked directly into
+          vertices, no textures/bind groups needed.
+        - image.rs: textured shapes — used both for real `Image` items
+          AND for every text glyph (glyphs are just small rectangular
+          images under the hood). Has two samplers (linear for photos,
+          nearest for crisp pixel-exact glyphs).
+
+  5. renderer/atlas.rs — caches the GPU-side cost both paths would
+     otherwise repeat every frame: image bind groups (`ImageAtlas`, keyed
+     by image identity) and rasterized glyph bitmaps (`TextAtlas`, keyed
+     by font+char+size+DPI).
+
+  6. renderer/buffer.rs — the auto-growing vertex/index buffer
+     (`DynamicBuffer`) all of the above use instead of manually managing
+     buffer (re)allocation.
+
+  7. renderer/mod.rs's `Renderer` — the single public entry point tying
+     it together: takes a flat `Vec<(Area, Item)>`, splits `Item::Shape`
+     into the color path, `Item::Image`/`Item::Text` (after rasterizing
+     text via the atlas) into the image path, and draws both.
+
+  8. Two top-level consumers wrap that `Renderer` for different
+     placement strategies:
+        - overlay.rs's `Overlay` — screen-space, drawn directly onto the
+          window/eye view after the 3D scene, loading (not clearing) the
+          existing color attachment.
+        - renderer::panel::WorldPanel (in the 3D renderer module) — draws
+          into an offscreen texture instead, which is then displayed on a
+          3D quad positioned anywhere in the scene.
+
+Two correctness fixes are called out explicitly in code comments and are
+worth knowing about if debugging visuals:
+  - Alpha blending must be explicit (`BlendState::ALPHA_BLENDING`) in
+    image.rs's pipeline — the wgpu default conversion sets `blend: None`,
+    which previously made every textured quad (including all text) an
+    opaque block.
+  - Glyph quad sizing in atlas.rs must use the *rasterized bitmap's*
+    pixel dimensions (descaled by `scale_factor`), not the *layout-time*
+    logical-size ink bounds from text.rs — these only agree when
+    `scale_factor == 1.0`.
