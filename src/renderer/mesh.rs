@@ -3,6 +3,7 @@ use glam::{Vec3, Mat4, Quat};
 use std::path::Path;
 use std::sync::Arc;
 use anyhow::{Result, Context};
+use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -25,10 +26,17 @@ impl MeshVertex {
     }
 }
 
+/// `vertex_buffer`/`index_buffer` are built once, here, at load time, and
+/// reused every frame thereafter — this geometry never changes after
+/// load, so re-uploading it every frame (the old behavior, via
+/// `device.create_buffer_init` inside `render_internal`) was pure wasted
+/// CPU+GPU work, the dominant cost in scenes with several mesh objects.
 pub struct MeshPrimitive {
     pub vertices: Vec<MeshVertex>,
     pub indices:  Vec<u32>,
     pub texture:  Arc<LoadedTexture>,
+    pub vertex_buffer: wgpu::Buffer,
+    pub index_buffer:  wgpu::Buffer,
 }
 
 pub struct LoadedTexture {
@@ -135,7 +143,21 @@ fn collect_node(
 
             let texture = load_primitive_texture(&prim, images, device, queue, layout);
 
-            out.push(MeshPrimitive { vertices, indices, texture: Arc::new(texture) });
+            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh_vb"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh_ib"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+
+            out.push(MeshPrimitive {
+                vertices, indices, texture: Arc::new(texture),
+                vertex_buffer, index_buffer,
+            });
         }
     }
 

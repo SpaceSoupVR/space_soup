@@ -88,6 +88,31 @@ impl Cuboid {
             None
         }
     }
+
+    /// A cheap snapshot of every field that affects this cuboid's *baked*
+    /// vertex output. Used by `Renderer`'s per-id cache to detect whether
+    /// a cuboid actually needs its vertices regenerated this frame, or
+    /// whether last frame's baked vertices are still valid as-is.
+    pub fn snapshot(&self) -> CuboidSnapshot {
+        CuboidSnapshot {
+            position: self.position,
+            half_size: self.half_size,
+            rotation: self.rotation,
+            color: self.color,
+            wire_color: self.wire_color,
+            style: self.style,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CuboidSnapshot {
+    pub position:   Vec3,
+    pub half_size:  Vec3,
+    pub rotation:   glam::Quat,
+    pub color:      Color3,
+    pub wire_color: Color3,
+    pub style:      CuboidStyle,
 }
 
 fn new_id() -> u64 {
@@ -172,54 +197,85 @@ const EDGES: [[usize; 2]; 12] = [
     [0,4],[1,5],[2,6],[3,7],
 ];
 
+/// Bakes one cuboid's solid-style vertices/indices, at index offset 0 —
+/// caller (`Renderer`'s per-id cache) re-bases indices when splicing this
+/// into the combined frame buffer. Returns `None` for pure-Wireframe
+/// cuboids (nothing to bake on the solid side).
+pub fn build_solid_mesh_one(c: &Cuboid) -> Option<(Vec<SolidVertex>, Vec<u32>)> {
+    if matches!(c.style, CuboidStyle::Wireframe) { return None; }
+
+    let mut verts: Vec<SolidVertex> = Vec::with_capacity(24);
+    let mut indices: Vec<u32> = Vec::with_capacity(36);
+
+    let model = c.model_matrix();
+    let color = c.color.to_linear();
+    let light = Vec3::new(0.5, 1.0, 0.8).normalize();
+
+    for (corners, normal) in &FACES {
+        let face_base = verts.len() as u32;
+        let n = Vec3::from(*normal);
+        let diffuse = (n.dot(light) * 0.5 + 0.5).max(0.2);
+        let shaded = [color[0]*diffuse, color[1]*diffuse, color[2]*diffuse, color[3]];
+
+        for &ci in corners {
+            let world = model.transform_point3(Vec3::from(CORNERS[ci]));
+            verts.push(SolidVertex { position: world.into(), normal: *normal, color: shaded });
+        }
+        indices.extend_from_slice(&[
+            face_base, face_base+1, face_base+2,
+            face_base, face_base+2, face_base+3,
+        ]);
+    }
+    Some((verts, indices))
+}
+
+/// Same idea as `build_solid_mesh_one`, for the wire pipeline. Returns
+/// `None` for pure-Solid cuboids.
+pub fn build_wire_mesh_one(c: &Cuboid) -> Option<(Vec<WireVertex>, Vec<u32>)> {
+    if matches!(c.style, CuboidStyle::Solid) { return None; }
+
+    let mut verts: Vec<WireVertex> = Vec::with_capacity(8);
+    let mut indices: Vec<u32> = Vec::with_capacity(24);
+
+    let model = c.model_matrix();
+    let color = c.wire_color.to_linear();
+
+    for edge in &EDGES {
+        let base = verts.len() as u32;
+        for &ci in edge {
+            let world = model.transform_point3(Vec3::from(CORNERS[ci]));
+            verts.push(WireVertex { position: world.into(), color });
+        }
+        indices.push(base);
+        indices.push(base + 1);
+    }
+    Some((verts, indices))
+}
+
+/// Unchanged bulk versions, kept for any external callers (e.g. desktop
+/// `canvas.rs`'s `default_scene`, or `voxelize.rs` consumers) that still
+/// want one-shot "bake everything" semantics without the per-id cache.
 pub fn build_solid_mesh(cuboids: &[Cuboid]) -> (Vec<SolidVertex>, Vec<u32>) {
-    let mut verts:   Vec<SolidVertex> = Vec::new();
-    let mut indices: Vec<u32>         = Vec::new();
-
+    let mut verts: Vec<SolidVertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
     for c in cuboids {
-        if matches!(c.style, CuboidStyle::Wireframe) { continue; }
-
-        let model = c.model_matrix();
-        let color = c.color.to_linear();
-        let light = Vec3::new(0.5, 1.0, 0.8).normalize();
-
-        for (corners, normal) in &FACES {
-            let face_base = verts.len() as u32;
-            let n         = Vec3::from(*normal);
-            let diffuse   = (n.dot(light) * 0.5 + 0.5).max(0.2);
-            let shaded    = [color[0]*diffuse, color[1]*diffuse, color[2]*diffuse, color[3]];
-
-            for &ci in corners {
-                let world = model.transform_point3(Vec3::from(CORNERS[ci]));
-                verts.push(SolidVertex { position: world.into(), normal: *normal, color: shaded });
-            }
-            indices.extend_from_slice(&[
-                face_base, face_base+1, face_base+2,
-                face_base, face_base+2, face_base+3,
-            ]);
+        if let Some((v, i)) = build_solid_mesh_one(c) {
+            let base = verts.len() as u32;
+            verts.extend(v);
+            indices.extend(i.into_iter().map(|x| x + base));
         }
     }
     (verts, indices)
 }
 
 pub fn build_wire_mesh(cuboids: &[Cuboid]) -> (Vec<WireVertex>, Vec<u32>) {
-    let mut verts:   Vec<WireVertex> = Vec::new();
-    let mut indices: Vec<u32>        = Vec::new();
-
+    let mut verts: Vec<WireVertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
     for c in cuboids {
-        if matches!(c.style, CuboidStyle::Solid) { continue; }
-
-        let model = c.model_matrix();
-        let color = c.wire_color.to_linear();
-
-        for edge in &EDGES {
+        if let Some((v, i)) = build_wire_mesh_one(c) {
             let base = verts.len() as u32;
-            for &ci in edge {
-                let world = model.transform_point3(Vec3::from(CORNERS[ci]));
-                verts.push(WireVertex { position: world.into(), color });
-            }
-            indices.push(base);
-            indices.push(base + 1);
+            verts.extend(v);
+            indices.extend(i.into_iter().map(|x| x + base));
         }
     }
     (verts, indices)

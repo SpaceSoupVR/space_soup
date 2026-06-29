@@ -9,12 +9,15 @@ pub mod panel;
 #[cfg(target_os = "android")]
 pub mod xr_renderer;
 
+use std::collections::HashMap;
 use wgpu::*;
 use wgpu::util::DeviceExt;
 pub use cuboid::{Cuboid, CuboidStyle};
 pub use camera::Camera;
 pub use mesh::GltfMesh;
 pub use panel::WorldPanel;
+
+use cuboid::{CuboidSnapshot, SolidVertex, WireVertex, build_solid_mesh_one, build_wire_mesh_one};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color3(pub u8, pub u8, pub u8, pub u8);
@@ -38,6 +41,15 @@ pub struct MeshInstance<'a> {
     pub model: &'a mesh_pipeline::ModelUniform,
 }
 
+/// Cached baked vertices/indices for one cuboid id, plus the snapshot they
+/// were baked from — if a cuboid's snapshot is unchanged from last frame,
+/// these are reused as-is instead of recomputing the bake.
+struct CuboidCacheEntry {
+    snapshot:     CuboidSnapshot,
+    solid:        Option<(Vec<SolidVertex>, Vec<u32>)>,
+    wire:         Option<(Vec<WireVertex>, Vec<u32>)>,
+}
+
 pub struct Renderer {
     pub device:          Device,
     pub queue:           Queue,
@@ -49,6 +61,7 @@ pub struct Renderer {
     depth_view:          TextureView,
     pub width:           u32,
     pub height:          u32,
+    cuboid_cache:        HashMap<u64, CuboidCacheEntry>,
 }
 
 impl Renderer {
@@ -71,6 +84,7 @@ impl Renderer {
             uniform_buf,
             depth_texture, depth_view,
             width, height,
+            cuboid_cache: HashMap::new(),
         }
     }
 
@@ -137,6 +151,58 @@ impl Renderer {
         self.render_internal(target_view, camera, cuboids, meshes, panels);
     }
 
+    /// Rebuilds (or reuses, per-id) baked solid+wire vertex/index data for
+    /// the current cuboid list, then splices everything into one combined
+    /// buffer per pipeline — same final output as the old "rebuild
+    /// everything every frame" approach, but a cuboid whose snapshot
+    /// hasn't changed since last frame skips re-baking its vertices.
+    /// Entries for ids no longer present in `cuboids` are dropped so the
+    /// cache doesn't grow unboundedly across scene changes.
+    fn bake_cuboids(&mut self, cuboids: &[Cuboid]) -> ((Vec<SolidVertex>, Vec<u32>), (Vec<WireVertex>, Vec<u32>)) {
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(cuboids.len());
+
+        let mut solid_verts: Vec<SolidVertex> = Vec::new();
+        let mut solid_indices: Vec<u32> = Vec::new();
+        let mut wire_verts: Vec<WireVertex> = Vec::new();
+        let mut wire_indices: Vec<u32> = Vec::new();
+
+        for c in cuboids {
+            seen.insert(c.id);
+            let snapshot = c.snapshot();
+
+            let needs_rebuild = match self.cuboid_cache.get(&c.id) {
+                Some(entry) => entry.snapshot != snapshot,
+                None => true,
+            };
+
+            if needs_rebuild {
+                let entry = CuboidCacheEntry {
+                    snapshot,
+                    solid: build_solid_mesh_one(c),
+                    wire:  build_wire_mesh_one(c),
+                };
+                self.cuboid_cache.insert(c.id, entry);
+            }
+
+            let entry = self.cuboid_cache.get(&c.id).expect("just inserted or already present");
+
+            if let Some((v, i)) = &entry.solid {
+                let base = solid_verts.len() as u32;
+                solid_verts.extend_from_slice(v);
+                solid_indices.extend(i.iter().map(|x| x + base));
+            }
+            if let Some((v, i)) = &entry.wire {
+                let base = wire_verts.len() as u32;
+                wire_verts.extend_from_slice(v);
+                wire_indices.extend(i.iter().map(|x| x + base));
+            }
+        }
+
+        self.cuboid_cache.retain(|id, _| seen.contains(id));
+
+        ((solid_verts, solid_indices), (wire_verts, wire_indices))
+    }
+
     fn render_internal(
         &mut self,
         target_view: &TextureView,
@@ -148,8 +214,7 @@ impl Renderer {
         let vp = camera.projection() * camera.view();
         self.uniform_buf.upload(&self.queue, vp);
 
-        let (solid_verts, solid_indices) = cuboid::build_solid_mesh(cuboids);
-        let (wire_verts,  wire_indices)  = cuboid::build_wire_mesh(cuboids);
+        let ((solid_verts, solid_indices), (wire_verts, wire_indices)) = self.bake_cuboids(cuboids);
 
         let solid_vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
             label:    Some("solid_vb"),
@@ -172,33 +237,12 @@ impl Renderer {
             usage:    BufferUsages::INDEX,
         });
 
-        let mut draws: Vec<(Buffer, Buffer, u32, &BindGroup, &BindGroup)> = Vec::new();
-
-        for instance in meshes {
-            instance.model.upload(&self.queue, instance.mesh.model_matrix());
-
-            for prim in &instance.mesh.primitives {
-                let vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
-                    label: Some("mesh_vb"),
-                    contents: bytemuck::cast_slice(&prim.vertices),
-                    usage: BufferUsages::VERTEX,
-                });
-                let ib = self.device.create_buffer_init(&util::BufferInitDescriptor {
-                    label: Some("mesh_ib"),
-                    contents: bytemuck::cast_slice(&prim.indices),
-                    usage: BufferUsages::INDEX,
-                });
-                draws.push((
-                    vb, ib, prim.indices.len() as u32,
-                    &instance.model.bind_group,
-                    &prim.texture.bind_group,
-                ));
-            }
-        }
-
+        // Owned buffers built fresh this frame (panel quads only now —
+        // mesh primitives use their own persistent buffers). Kept alive
+        // here so `draws`' borrows into them stay valid through the pass.
+        let mut panel_buffers: Vec<(Buffer, Buffer)> = Vec::with_capacity(panels.len());
         for panel in panels {
             panel.upload_model(&self.queue);
-
             let vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
                 label: Some("panel_vb"),
                 contents: bytemuck::cast_slice(panel.vertices()),
@@ -209,6 +253,24 @@ impl Renderer {
                 contents: bytemuck::cast_slice(panel.indices()),
                 usage: BufferUsages::INDEX,
             });
+            panel_buffers.push((vb, ib));
+        }
+
+        let mut draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup)> = Vec::new();
+
+        for instance in meshes {
+            instance.model.upload(&self.queue, instance.mesh.model_matrix());
+
+            for prim in &instance.mesh.primitives {
+                draws.push((
+                    &prim.vertex_buffer, &prim.index_buffer, prim.indices.len() as u32,
+                    &instance.model.bind_group,
+                    &prim.texture.bind_group,
+                ));
+            }
+        }
+
+        for (panel, (vb, ib)) in panels.iter().zip(panel_buffers.iter()) {
             draws.push((
                 vb, ib, panel.indices().len() as u32,
                 &panel.model.bind_group,
