@@ -14,7 +14,20 @@ impl XrContext {
         let entry = unsafe { xr::Entry::load()? };
 
         #[cfg(target_os = "android")]
-        entry.initialize_android_loader()?;
+        {
+            // xrInitializeLoaderKHR must be called before any other OpenXR call on
+            // Android. It is NOT idempotent: if called twice in the same process
+            // (Android hot-restart reuses the process) it returns
+            // XR_ERROR_INITIALIZATION_FAILED. Treat that specific return as "already
+            // done" and continue — the loader is ready from the first call.
+            match entry.initialize_android_loader() {
+                Ok(()) => info!("xr: android loader initialized"),
+                Err(e) if e.to_string().contains("initialization of object") => {
+                    info!("xr: android loader already initialized (hot-restart) — continuing");
+                }
+                Err(e) => return Err(Box::new(e)),
+            }
+        }
 
         let available_exts = entry.enumerate_extensions()?;
 

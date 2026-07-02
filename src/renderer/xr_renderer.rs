@@ -7,7 +7,7 @@ use crate::renderer::{
     camera::Camera,
     cuboid::{Cuboid, build_solid_mesh, build_wire_mesh},
     pipeline::{SolidPipeline, WirePipeline},
-    mesh_pipeline::MeshPipeline,
+    mesh_pipeline::{MeshPipeline, SkinnedMeshPipeline},
     uniforms::UniformBuffer,
     MeshInstance,
 };
@@ -19,17 +19,18 @@ struct EyeTarget {
 }
 
 pub struct XrRenderer {
-    pub swapchain:   xr::Swapchain<xr::Vulkan>,
-    pub width:       u32,
-    pub height:      u32,
-    wgpu_device:     wgpu::Device,
-    wgpu_queue:      wgpu::Queue,
-    solid_pipeline:  SolidPipeline,
-    wire_pipeline:   WirePipeline,
-    mesh_pipeline:   MeshPipeline,
-    uniform_buf:     UniformBuffer,
-    depth_view:      wgpu::TextureView,
-    eye_targets:     Vec<[EyeTarget; 2]>,
+    pub swapchain:          xr::Swapchain<xr::Vulkan>,
+    pub width:              u32,
+    pub height:             u32,
+    wgpu_device:            wgpu::Device,
+    wgpu_queue:             wgpu::Queue,
+    solid_pipeline:         SolidPipeline,
+    wire_pipeline:          WirePipeline,
+    mesh_pipeline:          MeshPipeline,
+    skinned_mesh_pipeline:  SkinnedMeshPipeline,
+    uniform_buf:            UniformBuffer,
+    depth_view:             wgpu::TextureView,
+    eye_targets:            Vec<[EyeTarget; 2]>,
 }
 
 impl XrRenderer {
@@ -70,10 +71,11 @@ impl XrRenderer {
 
         let (wgpu_device, wgpu_queue) = unsafe { build_wgpu_from_vulkan(vk)? };
 
-        let uniform_buf    = UniformBuffer::new(&wgpu_device);
-        let solid_pipeline = SolidPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
-        let wire_pipeline  = WirePipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
-        let mesh_pipeline  = MeshPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let uniform_buf           = UniformBuffer::new(&wgpu_device);
+        let solid_pipeline        = SolidPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let wire_pipeline         = WirePipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let mesh_pipeline         = MeshPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let skinned_mesh_pipeline = SkinnedMeshPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
 
         let depth_tex = wgpu_device.create_texture(&wgpu::TextureDescriptor {
             label:           Some("xr_depth"),
@@ -111,7 +113,7 @@ impl XrRenderer {
         Ok(Self {
             swapchain, width, height,
             wgpu_device, wgpu_queue,
-            solid_pipeline, wire_pipeline, mesh_pipeline,
+            solid_pipeline, wire_pipeline, mesh_pipeline, skinned_mesh_pipeline,
             uniform_buf, depth_view,
             eye_targets,
         })
@@ -120,8 +122,12 @@ impl XrRenderer {
     pub fn device(&self) -> &wgpu::Device { &self.wgpu_device }
     pub fn queue(&self) -> &wgpu::Queue { &self.wgpu_queue }
     pub fn mesh_texture_layout(&self) -> &wgpu::BindGroupLayout { &self.mesh_pipeline.texture_layout }
+    pub fn skin_joint_layout(&self) -> &wgpu::BindGroupLayout { &self.skinned_mesh_pipeline.skin_joint_layout }
     pub fn create_model_uniform(&self) -> crate::renderer::mesh_pipeline::ModelUniform {
         self.mesh_pipeline.create_model_uniform(&self.wgpu_device)
+    }
+    pub fn create_skinned_model_uniform(&self) -> crate::renderer::mesh_pipeline::ModelUniform {
+        self.skinned_mesh_pipeline.create_model_uniform(&self.wgpu_device)
     }
 
     pub fn render_frame(
@@ -169,25 +175,43 @@ impl XrRenderer {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        let mut mesh_draws: Vec<(wgpu::Buffer, wgpu::Buffer, u32, &wgpu::BindGroup, &wgpu::BindGroup)> = Vec::new();
+        // (model_bg, tex_bg, vb, ib, index_count)
+        type MeshDraw<'a> = (&'a wgpu::BindGroup, &'a wgpu::BindGroup,
+                             &'a wgpu::Buffer, &'a wgpu::Buffer, u32);
+        // (model_bg, tex_bg, joint_bg, vb, ib, index_count)
+        type SkinnedDraw<'a> = (&'a wgpu::BindGroup, &'a wgpu::BindGroup,
+                                &'a wgpu::BindGroup,
+                                &'a wgpu::Buffer, &'a wgpu::Buffer, u32);
+
+        let mut mesh_draws: Vec<MeshDraw> = Vec::new();
+        let mut skinned_draws: Vec<SkinnedDraw> = Vec::new();
+
         for instance in meshes {
             instance.model.upload(&self.wgpu_queue, instance.mesh.model_matrix());
-            for prim in &instance.mesh.primitives {
-                let vb = self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh_vb"),
-                    contents: bytemuck::cast_slice(&prim.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                let ib = self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh_ib"),
-                    contents: bytemuck::cast_slice(&prim.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-                mesh_draws.push((
-                    vb, ib, prim.indices.len() as u32,
-                    &instance.model.bind_group,
-                    &prim.texture.bind_group,
-                ));
+
+            if let Some(skin) = &instance.mesh.skin {
+                if let Some(joint_bg) = &skin.joint_bind_group {
+                    for prim in &skin.primitives {
+                        skinned_draws.push((
+                            &instance.model.bind_group,
+                            &prim.texture.bind_group,
+                            joint_bg,
+                            &prim.vertex_buffer,
+                            &prim.index_buffer,
+                            prim.index_count,
+                        ));
+                    }
+                }
+            } else {
+                for prim in &instance.mesh.primitives {
+                    mesh_draws.push((
+                        &instance.model.bind_group,
+                        &prim.texture.bind_group,
+                        &prim.vertex_buffer,
+                        &prim.index_buffer,
+                        prim.indices.len() as u32,
+                    ));
+                }
             }
         }
 
@@ -243,9 +267,21 @@ impl XrRenderer {
                 if !mesh_draws.is_empty() {
                     pass.set_pipeline(&self.mesh_pipeline.pipeline);
                     pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                    for (vb, ib, count, model_bg, tex_bg) in &mesh_draws {
+                    for (model_bg, tex_bg, vb, ib, count) in &mesh_draws {
                         pass.set_bind_group(1, *model_bg, &[]);
                         pass.set_bind_group(2, *tex_bg, &[]);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                }
+                if !skinned_draws.is_empty() {
+                    pass.set_pipeline(&self.skinned_mesh_pipeline.pipeline);
+                    pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                    for (model_bg, tex_bg, joint_bg, vb, ib, count) in &skinned_draws {
+                        pass.set_bind_group(1, *model_bg, &[]);
+                        pass.set_bind_group(2, *tex_bg, &[]);
+                        pass.set_bind_group(3, *joint_bg, &[]);
                         pass.set_vertex_buffer(0, vb.slice(..));
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..*count, 0, 0..1);
@@ -325,7 +361,10 @@ unsafe fn build_wgpu_from_vulkan(
         open_device,
         &wgpu::DeviceDescriptor {
             required_features: wgpu::Features::empty(),
-            required_limits:   wgpu::Limits::downlevel_defaults(),
+            required_limits:   wgpu::Limits {
+                max_texture_dimension_2d: 4096,
+                ..wgpu::Limits::downlevel_defaults()
+            },
             ..Default::default()
         },
     )?;
