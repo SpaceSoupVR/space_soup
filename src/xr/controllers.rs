@@ -12,6 +12,10 @@ pub struct ControllerState {
     pub r_stick:       xr::Vector2f,
     pub l_stick_click: bool,
     pub r_stick_click: bool,
+    /// Capacitive touch — true when the thumb is resting on the thumbstick,
+    /// even without deflecting or clicking it. Used to curl the in-game thumb.
+    pub l_stick_touch: bool,
+    pub r_stick_touch: bool,
     pub btn_a:         bool,
     pub btn_b:         bool,
     pub btn_x:         bool,
@@ -33,6 +37,8 @@ pub struct Controllers {
     right_thumbstick:       xr::Action<xr::Vector2f>,
     left_thumbstick_click:  xr::Action<bool>,
     right_thumbstick_click: xr::Action<bool>,
+    left_thumbstick_touch:  xr::Action<bool>,
+    right_thumbstick_touch: xr::Action<bool>,
     a_button:               xr::Action<bool>,
     b_button:               xr::Action<bool>,
     x_button:               xr::Action<bool>,
@@ -65,6 +71,8 @@ impl Controllers {
         let right_thumbstick:       xr::Action<xr::Vector2f> = action_set.create_action("right_thumbstick",       "Right Thumbstick",       &[])?;
         let left_thumbstick_click:  xr::Action<bool>         = action_set.create_action("left_thumbstick_click",  "Left Thumbstick Click",  &[])?;
         let right_thumbstick_click: xr::Action<bool>         = action_set.create_action("right_thumbstick_click", "Right Thumbstick Click", &[])?;
+        let left_thumbstick_touch:  xr::Action<bool>         = action_set.create_action("left_thumbstick_touch",  "Left Thumbstick Touch",  &[])?;
+        let right_thumbstick_touch: xr::Action<bool>         = action_set.create_action("right_thumbstick_touch", "Right Thumbstick Touch", &[])?;
         let a_button:               xr::Action<bool>         = action_set.create_action("a_button",               "A Button",               &[])?;
         let b_button:               xr::Action<bool>         = action_set.create_action("b_button",               "B Button",               &[])?;
         let x_button:               xr::Action<bool>         = action_set.create_action("x_button",               "X Button",               &[])?;
@@ -85,6 +93,8 @@ impl Controllers {
             xr::Binding::new(&right_thumbstick,       instance.string_to_path("/user/hand/right/input/thumbstick")?),
             xr::Binding::new(&left_thumbstick_click,  instance.string_to_path("/user/hand/left/input/thumbstick/click")?),
             xr::Binding::new(&right_thumbstick_click, instance.string_to_path("/user/hand/right/input/thumbstick/click")?),
+            xr::Binding::new(&left_thumbstick_touch,  instance.string_to_path("/user/hand/left/input/thumbstick/touch")?),
+            xr::Binding::new(&right_thumbstick_touch, instance.string_to_path("/user/hand/right/input/thumbstick/touch")?),
             xr::Binding::new(&a_button,               instance.string_to_path("/user/hand/right/input/a/click")?),
             xr::Binding::new(&b_button,               instance.string_to_path("/user/hand/right/input/b/click")?),
             xr::Binding::new(&x_button,               instance.string_to_path("/user/hand/left/input/x/click")?),
@@ -106,6 +116,7 @@ impl Controllers {
             l_stick: xr::Vector2f { x: 0.0, y: 0.0 },
             r_stick: xr::Vector2f { x: 0.0, y: 0.0 },
             l_stick_click: false, r_stick_click: false,
+            l_stick_touch: false, r_stick_touch: false,
             btn_a: false, btn_b: false,
             btn_x: false, btn_y: false, btn_menu: false,
             l_grip_pose: None, r_grip_pose: None,
@@ -118,6 +129,7 @@ impl Controllers {
             left_squeeze, right_squeeze,
             left_thumbstick, right_thumbstick,
             left_thumbstick_click, right_thumbstick_click,
+            left_thumbstick_touch, right_thumbstick_touch,
             a_button, b_button, x_button, y_button, menu_button,
             left_grip_space, right_grip_space,
             left_aim_space, right_aim_space,
@@ -141,6 +153,8 @@ impl Controllers {
         self.state.r_stick       = self.right_thumbstick.state(session, xr::Path::NULL)?.current_state;
         self.state.l_stick_click = self.left_thumbstick_click.state(session, xr::Path::NULL)?.current_state;
         self.state.r_stick_click = self.right_thumbstick_click.state(session, xr::Path::NULL)?.current_state;
+        self.state.l_stick_touch = self.left_thumbstick_touch.state(session, xr::Path::NULL)?.current_state;
+        self.state.r_stick_touch = self.right_thumbstick_touch.state(session, xr::Path::NULL)?.current_state;
         self.state.btn_a         = self.a_button.state(session, xr::Path::NULL)?.current_state;
         self.state.btn_b         = self.b_button.state(session, xr::Path::NULL)?.current_state;
         self.state.btn_x         = self.x_button.state(session, xr::Path::NULL)?.current_state;
@@ -167,10 +181,10 @@ impl Controllers {
     pub fn log(&self) {
         let s = &self.state;
         info!("── Controllers ──────────────────────────────────────");
-        info!("  L trigger={:.2} squeeze={:.2} stick=({:.2},{:.2}) click={}",
-            s.l_trigger, s.l_squeeze, s.l_stick.x, s.l_stick.y, s.l_stick_click);
-        info!("  R trigger={:.2} squeeze={:.2} stick=({:.2},{:.2}) click={}",
-            s.r_trigger, s.r_squeeze, s.r_stick.x, s.r_stick.y, s.r_stick_click);
+        info!("  L trigger={:.2} squeeze={:.2} stick=({:.2},{:.2}) click={} touch={}",
+            s.l_trigger, s.l_squeeze, s.l_stick.x, s.l_stick.y, s.l_stick_click, s.l_stick_touch);
+        info!("  R trigger={:.2} squeeze={:.2} stick=({:.2},{:.2}) click={} touch={}",
+            s.r_trigger, s.r_squeeze, s.r_stick.x, s.r_stick.y, s.r_stick_click, s.r_stick_touch);
         info!("  Buttons: A={} B={} X={} Y={} Menu={}",
             s.btn_a, s.btn_b, s.btn_x, s.btn_y, s.btn_menu);
         if let Some(p) = s.l_grip_pose {
