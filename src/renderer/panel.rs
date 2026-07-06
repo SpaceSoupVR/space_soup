@@ -1,19 +1,35 @@
-use wgpu::{Device, Queue, TextureFormat, Texture, TextureView, BindGroup, Sampler};
-use glam::{Vec3, Quat, Mat4};
+use glam::{Mat4, Quat, Vec3};
+use wgpu::{BindGroup, Device, Queue, Sampler, Texture, TextureFormat, TextureView};
 
-use crate::ui2d::{Area, Item, Atlas, Ui2dRenderer};
 use crate::renderer::mesh::MeshVertex;
-use crate::renderer::mesh_pipeline::{ModelUniform, MeshPipeline};
+use crate::renderer::mesh_pipeline::{MeshPipeline, ModelUniform};
+use crate::ui2d::{Area, Atlas, Item, Ui2dRenderer};
 
 fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Vec<u32>) {
-    let hw = width_m  * 0.5;
+    let hw = width_m * 0.5;
     let hh = height_m * 0.5;
 
     let verts = vec![
-        MeshVertex { position: [-hw, -hh, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 1.0] },
-        MeshVertex { position: [ hw, -hh, 0.0], normal: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
-        MeshVertex { position: [ hw,  hh, 0.0], normal: [0.0, 0.0, 1.0], uv: [1.0, 0.0] },
-        MeshVertex { position: [-hw,  hh, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
+        MeshVertex {
+            position: [-hw, -hh, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 1.0],
+        },
+        MeshVertex {
+            position: [hw, -hh, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [1.0, 1.0],
+        },
+        MeshVertex {
+            position: [hw, hh, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [1.0, 0.0],
+        },
+        MeshVertex {
+            position: [-hw, hh, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 0.0],
+        },
     ];
     let indices = vec![0, 1, 2, 0, 2, 3];
     (verts, indices)
@@ -23,43 +39,46 @@ pub struct WorldPanel {
     pub position: Vec3,
     pub rotation: Quat,
 
-    pub width_m:  f32,
+    pub width_m: f32,
     pub height_m: f32,
 
-    texture:     Texture,
-    view:        TextureView,
-    bind_group:  BindGroup,
-    sampler:     Sampler,
+    texture: Texture,
+    view: TextureView,
+    bind_group: BindGroup,
+    sampler: Sampler,
 
     ui_renderer: Ui2dRenderer,
-    atlas:       Atlas,
+    atlas: Atlas,
 
     quad_vertices: Vec<MeshVertex>,
-    quad_indices:  Vec<u32>,
+    quad_indices: Vec<u32>,
 
     pub model: ModelUniform,
 
-    width_px:  u32,
+    width_px: u32,
     height_px: u32,
 
     dirty: bool,
 }
 
 impl WorldPanel {
-
     pub fn new(
-        device:              &Device,
-        _queue:                &Queue,
-        texture_format:       TextureFormat,
-        mesh_pipeline:        &MeshPipeline,
-        width_px:             u32,
-        height_px:            u32,
-        width_m:              f32,
-        height_m:             f32,
+        device: &Device,
+        _queue: &Queue,
+        texture_format: TextureFormat,
+        mesh_pipeline: &MeshPipeline,
+        width_px: u32,
+        height_px: u32,
+        width_m: f32,
+        height_m: f32,
     ) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("world_panel_texture"),
-            size: wgpu::Extent3d { width: width_px, height: height_px, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: width_px,
+                height: height_px,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -83,15 +102,24 @@ impl WorldPanel {
             label: Some("world_panel_bind_group"),
             layout: &mesh_pipeline.texture_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
             ],
         });
 
         let model = mesh_pipeline.create_model_uniform(device);
 
         let ui_renderer = Ui2dRenderer::new(
-            device, &texture_format, wgpu::MultisampleState::default(), None,
+            device,
+            &texture_format,
+            wgpu::MultisampleState::default(),
+            None,
         );
 
         let (quad_vertices, quad_indices) = quad_geometry(width_m, height_m);
@@ -99,13 +127,19 @@ impl WorldPanel {
         Self {
             position: Vec3::ZERO,
             rotation: Quat::IDENTITY,
-            width_m, height_m,
-            texture, view, bind_group, sampler,
+            width_m,
+            height_m,
+            texture,
+            view,
+            bind_group,
+            sampler,
             ui_renderer,
             atlas: Atlas::default(),
-            quad_vertices, quad_indices,
+            quad_vertices,
+            quad_indices,
             model,
-            width_px, height_px,
+            width_px,
+            height_px,
             dirty: true,
         }
     }
@@ -139,12 +173,16 @@ impl WorldPanel {
     }
 
     pub fn draw(&mut self, device: &Device, queue: &Queue, items: Vec<(Area, Item)>) {
-        if !self.dirty { return; }
+        if !self.dirty {
+            return;
+        }
         self.dirty = false;
 
         self.ui_renderer.prepare(
-            device, queue,
-            self.width_px as f32, self.height_px as f32,
+            device,
+            queue,
+            self.width_px as f32,
+            self.height_px as f32,
             1.0,
             &mut self.atlas,
             items,
@@ -161,7 +199,12 @@ impl WorldPanel {
                     view: &self.view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

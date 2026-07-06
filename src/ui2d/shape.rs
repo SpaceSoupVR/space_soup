@@ -41,7 +41,7 @@ impl Shape {
                 let rx2 = rx * rx;
                 let ry2 = ry * ry;
 
-                let bb_width  = 2.0 * (rx2 * cos * cos + ry2 * sin * sin).sqrt();
+                let bb_width = 2.0 * (rx2 * cos * cos + ry2 * sin * sin).sqrt();
                 let bb_height = 2.0 * (rx2 * sin * sin + ry2 * cos * cos).sqrt();
 
                 (bb_width, bb_height)
@@ -70,10 +70,7 @@ impl Shape {
         let rotate = |px: f32, py: f32| -> [f32; 2] {
             let dx = px - cx;
             let dy = py - cy;
-            [
-                cx + dx * cos - dy * sin,
-                cy + dx * sin + dy * cos,
-            ]
+            [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos]
         };
 
         let mut positions = [

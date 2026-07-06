@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
+pub mod overlay;
+pub mod renderer;
 pub mod shape;
 pub mod text;
-pub mod renderer;
-pub mod overlay;
 
-pub use shape::Shape as ShapeType;
-pub use text::{Font, Text, Span, Align, Character};
-pub use renderer::{Renderer as Ui2dRenderer, Atlas};
 pub use overlay::Overlay;
+pub use renderer::{Atlas, Renderer as Ui2dRenderer};
+pub use shape::Shape as ShapeType;
+pub use text::{Align, Character, Font, Span, Text};
 
 pub use image::RgbaImage;
 

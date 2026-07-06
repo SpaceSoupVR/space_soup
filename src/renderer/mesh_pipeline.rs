@@ -1,16 +1,16 @@
-use wgpu::*;
 use super::mesh::{MeshVertex, SkinnedMeshVertex};
+use wgpu::*;
 
 pub struct MeshPipeline {
-    pub pipeline:      RenderPipeline,
+    pub pipeline: RenderPipeline,
     pub texture_layout: BindGroupLayout,
-    pub model_layout:   BindGroupLayout,
+    pub model_layout: BindGroupLayout,
 }
 
 impl MeshPipeline {
     pub fn new(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label:  Some("mesh_shader"),
+            label: Some("mesh_shader"),
             source: ShaderSource::Wgsl(MESH_SHADER.into()),
         });
 
@@ -21,9 +21,9 @@ impl MeshPipeline {
                     binding: 0,
                     visibility: ShaderStages::FRAGMENT,
                     ty: BindingType::Texture {
-                        sample_type:    TextureSampleType::Float { filterable: true },
+                        sample_type: TextureSampleType::Float { filterable: true },
                         view_dimension: TextureViewDimension::D2,
-                        multisampled:   false,
+                        multisampled: false,
                     },
                     count: None,
                 },
@@ -94,13 +94,17 @@ impl MeshPipeline {
             cache: None,
         });
 
-        Self { pipeline, texture_layout, model_layout }
+        Self {
+            pipeline,
+            texture_layout,
+            model_layout,
+        }
     }
 
     pub fn create_model_uniform(&self, device: &Device) -> ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("mesh_model_uniform"),
-            size: 64, // mat4x4<f32>
+            size: 64,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -119,27 +123,31 @@ impl MeshPipeline {
 }
 
 pub struct ModelUniform {
-    pub buffer:     Buffer,
+    pub buffer: Buffer,
     pub bind_group: BindGroup,
 }
 
 impl ModelUniform {
     pub fn upload(&self, queue: &Queue, model: glam::Mat4) {
-        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&model.to_cols_array()));
+        queue.write_buffer(
+            &self.buffer,
+            0,
+            bytemuck::cast_slice(&model.to_cols_array()),
+        );
     }
 }
 
 pub struct SkinnedMeshPipeline {
-    pub pipeline:        RenderPipeline,
-    pub texture_layout:  BindGroupLayout,
-    pub model_layout:    BindGroupLayout,
+    pub pipeline: RenderPipeline,
+    pub texture_layout: BindGroupLayout,
+    pub model_layout: BindGroupLayout,
     pub skin_joint_layout: BindGroupLayout,
 }
 
 impl SkinnedMeshPipeline {
     pub fn new(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label:  Some("skinned_mesh_shader"),
+            label: Some("skinned_mesh_shader"),
             source: ShaderSource::Wgsl(SKINNED_MESH_SHADER.into()),
         });
 
@@ -147,15 +155,20 @@ impl SkinnedMeshPipeline {
             label: Some("skinned_mesh_texture_bgl"),
             entries: &[
                 BindGroupLayoutEntry {
-                    binding: 0, visibility: ShaderStages::FRAGMENT,
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
                     ty: BindingType::Texture {
                         sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2, multisampled: false,
-                    }, count: None,
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
                 BindGroupLayoutEntry {
-                    binding: 1, visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering), count: None,
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
                 },
             ],
         });
@@ -163,28 +176,39 @@ impl SkinnedMeshPipeline {
         let model_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("skinned_mesh_model_bgl"),
             entries: &[BindGroupLayoutEntry {
-                binding: 0, visibility: ShaderStages::VERTEX,
+                binding: 0,
+                visibility: ShaderStages::VERTEX,
                 ty: BindingType::Buffer {
                     ty: BufferBindingType::Uniform,
-                    has_dynamic_offset: false, min_binding_size: None,
-                }, count: None,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
             }],
         });
 
         let skin_joint_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("skin_joint_bgl"),
             entries: &[BindGroupLayoutEntry {
-                binding: 0, visibility: ShaderStages::VERTEX,
+                binding: 0,
+                visibility: ShaderStages::VERTEX,
                 ty: BindingType::Buffer {
                     ty: BufferBindingType::Uniform,
-                    has_dynamic_offset: false, min_binding_size: None,
-                }, count: None,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
             }],
         });
 
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("skinned_mesh_layout"),
-            bind_group_layouts: &[camera_layout, &model_layout, &texture_layout, &skin_joint_layout],
+            bind_group_layouts: &[
+                camera_layout,
+                &model_layout,
+                &texture_layout,
+                &skin_joint_layout,
+            ],
             push_constant_ranges: &[],
         });
 
@@ -209,7 +233,7 @@ impl SkinnedMeshPipeline {
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
-                cull_mode: None, // hand mesh may have both-sided faces
+                cull_mode: None,
                 front_face: FrontFace::Ccw,
                 polygon_mode: PolygonMode::Fill,
                 ..Default::default()
@@ -226,7 +250,12 @@ impl SkinnedMeshPipeline {
             cache: None,
         });
 
-        Self { pipeline, texture_layout, model_layout, skin_joint_layout }
+        Self {
+            pipeline,
+            texture_layout,
+            model_layout,
+            skin_joint_layout,
+        }
     }
 
     pub fn create_model_uniform(&self, device: &Device) -> ModelUniform {
@@ -239,7 +268,10 @@ impl SkinnedMeshPipeline {
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("skinned_mesh_model_bg"),
             layout: &self.model_layout,
-            entries: &[BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
         });
         ModelUniform { buffer, bind_group }
     }
@@ -277,7 +309,6 @@ fn vs_main(v: VIn) -> VOut {
     let p = vec4<f32>(v.position, 1.0);
     let n = vec4<f32>(v.normal, 0.0);
 
-    // Blend joint transforms weighted by the 4 influences
     let skinned_p =
         (joints.mats[v.joint_ids.x] * p) * v.joint_weights.x +
         (joints.mats[v.joint_ids.y] * p) * v.joint_weights.y +
@@ -290,7 +321,6 @@ fn vs_main(v: VIn) -> VOut {
         (joints.mats[v.joint_ids.z] * n) * v.joint_weights.z +
         (joints.mats[v.joint_ids.w] * n) * v.joint_weights.w;
 
-    // model_u.model carries the locomotion inverse transform
     let world_pos = model_u.model * skinned_p;
     var out: VOut;
     out.clip   = camera.view_proj * world_pos;

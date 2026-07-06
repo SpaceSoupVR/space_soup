@@ -1,16 +1,13 @@
-//! Vulkan instance, physical device, and logical device (created via OpenXR).
-//! Uses ash 0.38 API.
-
 use ash::vk::{self, Handle};
 use log::info;
 
 use crate::xr::context::XrContext;
 
 pub struct VkContext {
-    pub instance:           ash::Instance,
-    pub physical_device:    vk::PhysicalDevice,
-    pub device:             ash::Device,
-    pub queue:              vk::Queue,
+    pub instance: ash::Instance,
+    pub physical_device: vk::PhysicalDevice,
+    pub device: ash::Device,
+    pub queue: vk::Queue,
     pub queue_family_index: u32,
 }
 
@@ -28,19 +25,21 @@ impl VkContext {
                 p_application_info: &app_info,
                 ..Default::default()
             };
-            let raw = xr.instance.create_vulkan_instance(
-                xr.system,
-                std::mem::transmute(vk_entry.static_fn().get_instance_proc_addr),
-                &ci as *const _ as *const _,
-            )?.map_err(vk::Result::from_raw)?;
+            let raw = xr
+                .instance
+                .create_vulkan_instance(
+                    xr.system,
+                    std::mem::transmute(vk_entry.static_fn().get_instance_proc_addr),
+                    &ci as *const _ as *const _,
+                )?
+                .map_err(vk::Result::from_raw)?;
             ash::Instance::load(vk_entry.static_fn(), vk::Instance::from_raw(raw as _))
         };
 
         let physical_device = vk::PhysicalDevice::from_raw(unsafe {
-            xr.instance.vulkan_graphics_device(
-                xr.system,
-                vk_instance.handle().as_raw() as _,
-            )? as _
+            xr.instance
+                .vulkan_graphics_device(xr.system, vk_instance.handle().as_raw() as _)?
+                as _
         });
 
         let queue_family_index = unsafe {
@@ -49,7 +48,9 @@ impl VkContext {
                 .into_iter()
                 .enumerate()
                 .find_map(|(i, p)| {
-                    p.queue_flags.contains(vk::QueueFlags::GRAPHICS).then_some(i as u32)
+                    p.queue_flags
+                        .contains(vk::QueueFlags::GRAPHICS)
+                        .then_some(i as u32)
                 })
                 .ok_or("No graphics queue family")?
         };
@@ -63,17 +64,20 @@ impl VkContext {
         };
         let device_ci = vk::DeviceCreateInfo {
             queue_create_info_count: 1,
-            p_queue_create_infos:    &queue_info,
+            p_queue_create_infos: &queue_info,
             ..Default::default()
         };
 
         let device = unsafe {
-            let raw = xr.instance.create_vulkan_device(
-                xr.system,
-                std::mem::transmute(vk_entry.static_fn().get_instance_proc_addr),
-                physical_device.as_raw() as _,
-                &device_ci as *const _ as *const _,
-            )?.map_err(vk::Result::from_raw)?;
+            let raw = xr
+                .instance
+                .create_vulkan_device(
+                    xr.system,
+                    std::mem::transmute(vk_entry.static_fn().get_instance_proc_addr),
+                    physical_device.as_raw() as _,
+                    &device_ci as *const _ as *const _,
+                )?
+                .map_err(vk::Result::from_raw)?;
             ash::Device::load(vk_instance.fp_v1_0(), vk::Device::from_raw(raw as _))
         };
 

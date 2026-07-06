@@ -1,11 +1,9 @@
-//! OpenXR instance and system initialization.
-
 use log::info;
 use openxr as xr;
 
 pub struct XrContext {
-    pub instance:          xr::Instance,
-    pub system:            xr::SystemId,
+    pub instance: xr::Instance,
+    pub system: xr::SystemId,
     pub has_hand_tracking: bool,
 }
 
@@ -15,11 +13,6 @@ impl XrContext {
 
         #[cfg(target_os = "android")]
         {
-            // xrInitializeLoaderKHR must be called before any other OpenXR call on
-            // Android. It is NOT idempotent: if called twice in the same process
-            // (Android hot-restart reuses the process) it returns
-            // XR_ERROR_INITIALIZATION_FAILED. Treat that specific return as "already
-            // done" and continue — the loader is ready from the first call.
             match entry.initialize_android_loader() {
                 Ok(()) => info!("xr: android loader initialized"),
                 Err(e) if e.to_string().contains("initialization of object") => {
@@ -34,7 +27,9 @@ impl XrContext {
         let mut exts = xr::ExtensionSet::default();
         exts.khr_vulkan_enable2 = true;
         #[cfg(target_os = "android")]
-        { exts.khr_android_create_instance = true; }
+        {
+            exts.khr_android_create_instance = true;
+        }
 
         let has_hand_tracking = available_exts.ext_hand_tracking;
         if has_hand_tracking {
@@ -46,8 +41,8 @@ impl XrContext {
             &xr::ApplicationInfo {
                 application_name: "space_soup",
                 application_version: 1,
-                engine_name:         "space_soup",
-                engine_version:      1,
+                engine_name: "space_soup",
+                engine_version: 1,
             },
             &exts,
             &[],
@@ -57,8 +52,12 @@ impl XrContext {
         info!("Runtime: {} v{}", props.runtime_name, props.runtime_version);
 
         let system = instance.system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)?;
-        let _reqs  = instance.graphics_requirements::<xr::Vulkan>(system)?;
+        let _reqs = instance.graphics_requirements::<xr::Vulkan>(system)?;
 
-        Ok(Self { instance, system, has_hand_tracking })
+        Ok(Self {
+            instance,
+            system,
+            has_hand_tracking,
+        })
     }
 }

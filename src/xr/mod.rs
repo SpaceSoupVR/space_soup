@@ -1,13 +1,11 @@
-//! OpenXR/Android subsystem — instance, Vulkan device, session, controllers, hands.
-
 pub mod context;
-pub mod vulkan;
-pub mod headset;
 pub mod controllers;
 pub mod hands;
+pub mod headset;
+pub mod vulkan;
 
 pub use context::XrContext;
-pub use vulkan::VkContext;
+pub use controllers::{ControllerState, Controllers};
+pub use hands::{HandJoint, HandTrackers};
 pub use headset::Headset;
-pub use controllers::{Controllers, ControllerState};
-pub use hands::{HandTrackers, HandJoint};
+pub use vulkan::VkContext;

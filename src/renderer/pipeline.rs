@@ -1,56 +1,60 @@
-use wgpu::*;
 use super::cuboid::{SolidVertex, WireVertex};
+use wgpu::*;
 
-pub struct SolidPipeline { pub pipeline: RenderPipeline }
-pub struct WirePipeline  { pub pipeline: RenderPipeline }
+pub struct SolidPipeline {
+    pub pipeline: RenderPipeline,
+}
+pub struct WirePipeline {
+    pub pipeline: RenderPipeline,
+}
 
 impl SolidPipeline {
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label:  Some("solid_shader"),
+            label: Some("solid_shader"),
             source: ShaderSource::Wgsl(SOLID_SHADER.into()),
         });
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label:                Some("solid_layout"),
-            bind_group_layouts:   &[uniform_layout],
+            label: Some("solid_layout"),
+            bind_group_layouts: &[uniform_layout],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label:  Some("solid_pipeline"),
+            label: Some("solid_pipeline"),
             layout: Some(&layout),
             vertex: VertexState {
-                module:              &shader,
-                entry_point:         Some("vs_main"),
+                module: &shader,
+                entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                buffers:             &[SolidVertex::layout()],
+                buffers: &[SolidVertex::layout()],
             },
             fragment: Some(FragmentState {
-                module:              &shader,
-                entry_point:         Some("fs_main"),
+                module: &shader,
+                entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend:      Some(BlendState::ALPHA_BLENDING),
+                    blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
             }),
             primitive: PrimitiveState {
-                topology:     PrimitiveTopology::TriangleList,
-                cull_mode:    Some(Face::Back),
-                front_face:   FrontFace::Ccw,
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: Some(Face::Back),
+                front_face: FrontFace::Ccw,
                 polygon_mode: PolygonMode::Fill,
                 ..Default::default()
             },
             depth_stencil: Some(DepthStencilState {
-                format:              TextureFormat::Depth32Float,
+                format: TextureFormat::Depth32Float,
                 depth_write_enabled: true,
-                depth_compare:       CompareFunction::Less,
-                stencil:             StencilState::default(),
-                bias:                DepthBiasState::default(),
+                depth_compare: CompareFunction::Less,
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState::default(),
-            multiview:   None,
-            cache:       None,
+            multiview: None,
+            cache: None,
         });
         Self { pipeline }
     }
@@ -59,49 +63,49 @@ impl SolidPipeline {
 impl WirePipeline {
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label:  Some("wire_shader"),
+            label: Some("wire_shader"),
             source: ShaderSource::Wgsl(WIRE_SHADER.into()),
         });
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label:                Some("wire_layout"),
-            bind_group_layouts:   &[uniform_layout],
+            label: Some("wire_layout"),
+            bind_group_layouts: &[uniform_layout],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label:  Some("wire_pipeline"),
+            label: Some("wire_pipeline"),
             layout: Some(&layout),
             vertex: VertexState {
-                module:              &shader,
-                entry_point:         Some("vs_main"),
+                module: &shader,
+                entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                buffers:             &[WireVertex::layout()],
+                buffers: &[WireVertex::layout()],
             },
             fragment: Some(FragmentState {
-                module:              &shader,
-                entry_point:         Some("fs_main"),
+                module: &shader,
+                entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend:      Some(BlendState::ALPHA_BLENDING),
+                    blend: Some(BlendState::ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
             }),
             primitive: PrimitiveState {
-                topology:     PrimitiveTopology::LineList,
-                cull_mode:    None,
+                topology: PrimitiveTopology::LineList,
+                cull_mode: None,
                 polygon_mode: PolygonMode::Fill,
                 ..Default::default()
             },
             depth_stencil: Some(DepthStencilState {
-                format:              TextureFormat::Depth32Float,
+                format: TextureFormat::Depth32Float,
                 depth_write_enabled: false,
-                depth_compare:       CompareFunction::LessEqual,
-                stencil:             StencilState::default(),
-                bias:                DepthBiasState::default(),
+                depth_compare: CompareFunction::LessEqual,
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState::default(),
-            multiview:   None,
-            cache:       None,
+            multiview: None,
+            cache: None,
         });
         Self { pipeline }
     }

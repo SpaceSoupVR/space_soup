@@ -1,6 +1,6 @@
-use std::sync::Arc;
-use std::ops::Deref;
 use fontdue::Font as FontdueFont;
+use std::ops::Deref;
+use std::sync::Arc;
 
 use crate::ui2d::Color;
 
@@ -10,8 +10,7 @@ pub struct Font(pub(crate) FontdueFont);
 impl Font {
     pub fn new(bytes: &[u8]) -> Self {
         let settings = fontdue::FontSettings::default();
-        let font = FontdueFont::from_bytes(bytes, settings)
-            .expect("failed to parse font bytes");
+        let font = FontdueFont::from_bytes(bytes, settings).expect("failed to parse font bytes");
         Self(font)
     }
 
@@ -22,27 +21,26 @@ impl Font {
 
 impl Deref for Font {
     type Target = FontdueFont;
-    fn deref(&self) -> &Self::Target { &self.0 }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Align {
+    #[default]
     Left,
     Center,
     Right,
 }
 
-impl Default for Align {
-    fn default() -> Self { Align::Left }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Span {
-    pub text:      String,
-    pub font:      Arc<Font>,
+    pub text: String,
+    pub font: Arc<Font>,
     pub font_size: f32,
-    pub color:     Color,
-    pub align:     Align,
+    pub color: Color,
+    pub align: Align,
 }
 
 impl PartialEq for Font {
@@ -109,13 +107,19 @@ impl Text {
 
         for span in &spans {
             line_height = line_height.max(span.font_size * 1.2);
-            let descent = span.font.horizontal_line_metrics(span.font_size)
+            let descent = span
+                .font
+                .horizontal_line_metrics(span.font_size)
                 .map(|lm| lm.descent)
                 .unwrap_or(0.0);
 
             for c in span.text.chars() {
                 if c == '\n' {
-                    lines.push((cursor_y, (cursor_x, line_height), std::mem::take(&mut line_chars)));
+                    lines.push((
+                        cursor_y,
+                        (cursor_x, line_height),
+                        std::mem::take(&mut line_chars),
+                    ));
                     content_width = content_width.max(cursor_x);
                     cursor_x = 0.0;
                     cursor_y += line_height;
@@ -128,7 +132,11 @@ impl Text {
                 let bounds = metrics.bounds;
 
                 if cursor_x + advance > max_width && cursor_x > 0.0 {
-                    lines.push((cursor_y, (cursor_x, line_height), std::mem::take(&mut line_chars)));
+                    lines.push((
+                        cursor_y,
+                        (cursor_x, line_height),
+                        std::mem::take(&mut line_chars),
+                    ));
                     content_width = content_width.max(cursor_x);
                     cursor_x = 0.0;
                     cursor_y += line_height;
@@ -156,7 +164,10 @@ impl Text {
             lines.push((cursor_y, (cursor_x, line_height.max(1.0)), line_chars));
         }
 
-        Self { lines, width: content_width }
+        Self {
+            lines,
+            width: content_width,
+        }
     }
 
     pub fn lines(&self) -> &[(f32, (f32, f32), Vec<Character>)] {
@@ -168,6 +179,9 @@ impl Text {
     }
 
     pub fn height(&self) -> f32 {
-        self.lines.iter().map(|(y, (_, h), _)| y + h).fold(0.0, f32::max)
+        self.lines
+            .iter()
+            .map(|(y, (_, h), _)| y + h)
+            .fold(0.0, f32::max)
     }
 }
