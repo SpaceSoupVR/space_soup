@@ -1,56 +1,104 @@
-use wgpu::{PipelineCompilationOptions, RenderPipelineDescriptor, PipelineLayoutDescriptor, DepthStencilState, MultisampleState, RenderPipeline, PrimitiveState, FragmentState, TextureFormat, BufferUsages, IndexFormat, VertexState, RenderPass, Device, Queue, VertexBufferLayout, ShaderModule};
-use super::buffer::{DynamicBufferDescriptor, DynamicBuffer};
+use super::buffer::{DynamicBuffer, DynamicBufferDescriptor};
+use wgpu::{
+    BufferUsages, DepthStencilState, Device, FragmentState, IndexFormat, MultisampleState,
+    PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, Queue, RenderPass,
+    RenderPipeline, RenderPipelineDescriptor, ShaderModule, TextureFormat, VertexBufferLayout,
+    VertexState,
+};
 
+use super::vertex::{ColorVertex, RoundedRectangleVertex, ShapeVertex, Vertex};
 use crate::ui2d::{Area, Color, ShapeType};
-use super::vertex::{Vertex, ShapeVertex, RoundedRectangleVertex, ColorVertex};
 
 pub struct ColorRenderer {
-    ellipse_renderer:           GenericColorRenderer,
-    rectangle_renderer:         GenericColorRenderer,
+    ellipse_renderer: GenericColorRenderer,
+    rectangle_renderer: GenericColorRenderer,
     rounded_rectangle_renderer: GenericColorRenderer,
 }
 
 impl ColorRenderer {
     pub fn new(
-        device:         &Device,
+        device: &Device,
         texture_format: &TextureFormat,
-        multisample:    MultisampleState,
-        depth_stencil:  Option<DepthStencilState>,
+        multisample: MultisampleState,
+        depth_stencil: Option<DepthStencilState>,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/color/ellipse.wgsl"));
-        let ellipse_renderer = GenericColorRenderer::new(device, texture_format, multisample, depth_stencil.clone(), shader, ColorVertex::<ShapeVertex>::layout());
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/color/rectangle.wgsl"));
-        let rectangle_renderer = GenericColorRenderer::new(device, texture_format, multisample, depth_stencil.clone(), shader, ColorVertex::<ShapeVertex>::layout());
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/color/rounded_rectangle.wgsl"));
-        let rounded_rectangle_renderer = GenericColorRenderer::new(device, texture_format, multisample, depth_stencil.clone(), shader, ColorVertex::<RoundedRectangleVertex>::layout());
-        ColorRenderer { ellipse_renderer, rectangle_renderer, rounded_rectangle_renderer }
+        let ellipse_renderer = GenericColorRenderer::new(
+            device,
+            texture_format,
+            multisample,
+            depth_stencil.clone(),
+            shader,
+            ColorVertex::<ShapeVertex>::layout(),
+        );
+        let shader =
+            device.create_shader_module(wgpu::include_wgsl!("shaders/color/rectangle.wgsl"));
+        let rectangle_renderer = GenericColorRenderer::new(
+            device,
+            texture_format,
+            multisample,
+            depth_stencil.clone(),
+            shader,
+            ColorVertex::<ShapeVertex>::layout(),
+        );
+        let shader = device
+            .create_shader_module(wgpu::include_wgsl!("shaders/color/rounded_rectangle.wgsl"));
+        let rounded_rectangle_renderer = GenericColorRenderer::new(
+            device,
+            texture_format,
+            multisample,
+            depth_stencil.clone(),
+            shader,
+            ColorVertex::<RoundedRectangleVertex>::layout(),
+        );
+        ColorRenderer {
+            ellipse_renderer,
+            rectangle_renderer,
+            rounded_rectangle_renderer,
+        }
     }
 
     pub fn prepare(
         &mut self,
         device: &Device,
-        queue:  &Queue,
-        width:  f32,
+        queue: &Queue,
+        width: f32,
         height: f32,
-        items:  Vec<(u16, Area, ShapeType, Color)>,
+        items: Vec<(u16, Area, ShapeType, Color)>,
     ) {
         let (ellipses, rects, rounded_rects) = items.into_iter().fold(
             (vec![], vec![], vec![]),
             |mut a, (z, area, shape, color)| {
                 match shape {
-                    ShapeType::Ellipse(_, _, _) =>
-                        a.0.push(ColorVertex::new(ShapeVertex::new(width, height, z, area, shape), color)),
-                    ShapeType::Rectangle(_, _, _) =>
-                        a.1.push(ColorVertex::new(ShapeVertex::new(width, height, z, area, shape), color)),
-                    ShapeType::RoundedRectangle(_, _, _, corner_radius) =>
-                        a.2.push(ColorVertex::new(RoundedRectangleVertex::new(width, height, z, area, shape, corner_radius), color)),
+                    ShapeType::Ellipse(_, _, _) => a.0.push(ColorVertex::new(
+                        ShapeVertex::new(width, height, z, area, shape),
+                        color,
+                    )),
+                    ShapeType::Rectangle(_, _, _) => a.1.push(ColorVertex::new(
+                        ShapeVertex::new(width, height, z, area, shape),
+                        color,
+                    )),
+                    ShapeType::RoundedRectangle(_, _, _, corner_radius) => {
+                        a.2.push(ColorVertex::new(
+                            RoundedRectangleVertex::new(
+                                width,
+                                height,
+                                z,
+                                area,
+                                shape,
+                                corner_radius,
+                            ),
+                            color,
+                        ))
+                    }
                 }
                 a
             },
         );
         self.ellipse_renderer.prepare(device, queue, ellipses);
         self.rectangle_renderer.prepare(device, queue, rects);
-        self.rounded_rectangle_renderer.prepare(device, queue, rounded_rects);
+        self.rounded_rectangle_renderer
+            .prepare(device, queue, rounded_rects);
     }
 
     pub fn render(&self, render_pass: &mut RenderPass<'_>) {
@@ -62,24 +110,24 @@ impl ColorRenderer {
 
 pub struct GenericColorRenderer {
     render_pipeline: RenderPipeline,
-    vertex_buffer:   DynamicBuffer,
-    index_buffer:    DynamicBuffer,
-    indices:         u32,
+    vertex_buffer: DynamicBuffer,
+    index_buffer: DynamicBuffer,
+    indices: u32,
 }
 
 impl GenericColorRenderer {
     pub fn new(
-        device:         &Device,
+        device: &Device,
         texture_format: &TextureFormat,
-        multisample:    MultisampleState,
-        depth_stencil:  Option<DepthStencilState>,
-        shader:         ShaderModule,
-        vertex_layout:  VertexBufferLayout,
+        multisample: MultisampleState,
+        depth_stencil: Option<DepthStencilState>,
+        shader: ShaderModule,
+        vertex_layout: VertexBufferLayout,
     ) -> Self {
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor::default());
 
         let render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label:  None,
+            label: None,
             layout: Some(&pipeline_layout),
             vertex: VertexState {
                 module: &shader,
@@ -104,30 +152,50 @@ impl GenericColorRenderer {
             cache: None,
         });
 
-        let vertex_buffer = DynamicBuffer::new(device, &DynamicBufferDescriptor {
-            label: None,
-            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
-        });
+        let vertex_buffer = DynamicBuffer::new(
+            device,
+            &DynamicBufferDescriptor {
+                label: None,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            },
+        );
 
-        let index_buffer = DynamicBuffer::new(device, &DynamicBufferDescriptor {
-            label: None,
-            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
-        });
+        let index_buffer = DynamicBuffer::new(
+            device,
+            &DynamicBufferDescriptor {
+                label: None,
+                usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            },
+        );
 
-        GenericColorRenderer { render_pipeline, vertex_buffer, index_buffer, indices: 0 }
+        GenericColorRenderer {
+            render_pipeline,
+            vertex_buffer,
+            index_buffer,
+            indices: 0,
+        }
     }
 
-    pub fn prepare<V: bytemuck::Pod>(&mut self, device: &Device, queue: &Queue, vertices: Vec<[V; 4]>) {
-        let (vertices, indices) = vertices.into_iter().fold((vec![], vec![]), |mut a, vertices| {
-            let l = a.0.len() as u16;
-            a.0.extend(vertices);
-            a.1.extend([l, l + 1, l + 2, l + 1, l + 2, l + 3]);
-            a
-        });
+    pub fn prepare<V: bytemuck::Pod>(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        vertices: Vec<[V; 4]>,
+    ) {
+        let (vertices, indices) = vertices
+            .into_iter()
+            .fold((vec![], vec![]), |mut a, vertices| {
+                let l = a.0.len() as u16;
+                a.0.extend(vertices);
+                a.1.extend([l, l + 1, l + 2, l + 1, l + 2, l + 3]);
+                a
+            });
 
         self.indices = indices.len() as u32;
-        self.vertex_buffer.write_buffer(device, queue, bytemuck::cast_slice(&vertices));
-        self.index_buffer.write_buffer(device, queue, bytemuck::cast_slice(&indices));
+        self.vertex_buffer
+            .write_buffer(device, queue, bytemuck::cast_slice(&vertices));
+        self.index_buffer
+            .write_buffer(device, queue, bytemuck::cast_slice(&indices));
     }
 
     pub fn render(&self, render_pass: &mut RenderPass<'_>) {

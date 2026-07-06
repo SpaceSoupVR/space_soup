@@ -1,4 +1,6 @@
-use wgpu::{COPY_BUFFER_ALIGNMENT, BufferDescriptor, BufferAddress, BufferUsages, Buffer, Device, Queue};
+use wgpu::{
+    Buffer, BufferAddress, BufferDescriptor, BufferUsages, Device, Queue, COPY_BUFFER_ALIGNMENT,
+};
 
 pub struct DynamicBufferDescriptor<'a> {
     pub label: Option<&'a str>,
@@ -7,8 +9,8 @@ pub struct DynamicBufferDescriptor<'a> {
 
 pub struct DynamicBuffer {
     buffer: Buffer,
-    size:   BufferAddress,
-    label:  Option<String>,
+    size: BufferAddress,
+    label: Option<String>,
 }
 
 impl DynamicBuffer {
@@ -44,7 +46,8 @@ impl DynamicBuffer {
                 usage: self.buffer.usage(),
                 mapped_at_creation: true,
             });
-            self.buffer.slice(..).get_mapped_range_mut()[..contents.len()].copy_from_slice(contents);
+            self.buffer.slice(..).get_mapped_range_mut()[..contents.len()]
+                .copy_from_slice(contents);
             self.buffer.unmap();
             self.size = size;
         }

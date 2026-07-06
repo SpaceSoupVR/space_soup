@@ -9,48 +9,54 @@ pub struct Uniforms {
 }
 
 pub struct UniformBuffer {
-    pub buffer:     Buffer,
-    pub layout:     BindGroupLayout,
+    pub buffer: Buffer,
+    pub layout: BindGroupLayout,
     pub bind_group: BindGroup,
 }
 
 impl UniformBuffer {
     pub fn new(device: &Device) -> Self {
         let buffer = device.create_buffer(&BufferDescriptor {
-            label:              Some("uniform_buf"),
-            size:               std::mem::size_of::<Uniforms>() as u64,
-            usage:              BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            label: Some("uniform_buf"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label:   Some("uniform_bgl"),
+            label: Some("uniform_bgl"),
             entries: &[BindGroupLayoutEntry {
-                binding:    0,
+                binding: 0,
                 visibility: ShaderStages::VERTEX,
                 ty: BindingType::Buffer {
-                    ty:                 BufferBindingType::Uniform,
+                    ty: BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size:   None,
+                    min_binding_size: None,
                 },
                 count: None,
             }],
         });
 
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label:   Some("uniform_bg"),
-            layout:  &layout,
+            label: Some("uniform_bg"),
+            layout: &layout,
             entries: &[BindGroupEntry {
-                binding:  0,
+                binding: 0,
                 resource: buffer.as_entire_binding(),
             }],
         });
 
-        Self { buffer, layout, bind_group }
+        Self {
+            buffer,
+            layout,
+            bind_group,
+        }
     }
 
     pub fn upload(&self, queue: &Queue, view_proj: Mat4) {
-        let u = Uniforms { view_proj: view_proj.to_cols_array_2d() };
+        let u = Uniforms {
+            view_proj: view_proj.to_cols_array_2d(),
+        };
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&u));
     }
 }

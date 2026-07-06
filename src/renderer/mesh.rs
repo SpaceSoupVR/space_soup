@@ -1,17 +1,17 @@
+use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
-use glam::{Vec3, Mat4, Quat};
+use glam::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use anyhow::{Result, Context};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct MeshVertex {
     pub position: [f32; 3],
-    pub normal:   [f32; 3],
-    pub uv:       [f32; 2],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
 }
 
 impl MeshVertex {
@@ -21,21 +21,19 @@ impl MeshVertex {
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
-            step_mode:    wgpu::VertexStepMode::Vertex,
-            attributes:   &Self::ATTRIBS,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
         }
     }
 }
 
-/// Vertex format for GPU-skinned meshes — position/normal/uv plus 4 bone
-/// influences (indices + weights) per vertex.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct SkinnedMeshVertex {
-    pub position:      [f32; 3],
-    pub normal:        [f32; 3],
-    pub uv:            [f32; 2],
-    pub joint_ids:     [u32; 4],
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+    pub joint_ids: [u32; 4],
     pub joint_weights: [f32; 4],
 }
 
@@ -51,22 +49,20 @@ impl SkinnedMeshVertex {
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
-            step_mode:    wgpu::VertexStepMode::Vertex,
-            attributes:   &Self::ATTRIBS,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
         }
     }
 }
 
-/// One primitive from a skinned mesh — geometry uploaded to GPU once at load.
 #[derive(Clone)]
 pub struct SkinnedMeshPrimitive {
-    pub index_count:   u32,
-    pub texture:       Arc<LoadedTexture>,
+    pub index_count: u32,
+    pub texture: Arc<LoadedTexture>,
     pub vertex_buffer: wgpu::Buffer,
-    pub index_buffer:  wgpu::Buffer,
+    pub index_buffer: wgpu::Buffer,
 }
 
-/// Maximum joints supported in a single skin uniform buffer (both hands = 52).
 pub const MAX_SKIN_JOINTS: usize = 64;
 
 #[derive(Clone)]
@@ -75,29 +71,22 @@ pub struct GltfAnimationPose {
     pub joint_transforms: Vec<Option<(Vec3, Quat, Vec3)>>,
 }
 
-/// Skeleton attached to a `GltfMesh`. Holds GPU joint matrix buffer and
-/// joint name list so quest_app can map OpenXR hand joints to GLTF joints.
 #[derive(Clone)]
 pub struct GltfSkin {
-    /// Name of each joint node in GLTF skin order.
-    pub joint_names:      Vec<String>,
-    /// Inverse bind-pose matrices, one per joint (same order as joint_names).
-    pub inv_bind_mats:    Vec<Mat4>,
-    pub joint_parents:    Vec<Option<usize>>,
+    pub joint_names: Vec<String>,
+
+    pub inv_bind_mats: Vec<Mat4>,
+    pub joint_parents: Vec<Option<usize>>,
     pub joint_local_bind: Vec<(Vec3, Quat, Vec3)>,
-    pub animations:       Vec<GltfAnimationPose>,
-    /// GPU uniform buffer: `array<mat4x4<f32>, MAX_SKIN_JOINTS>`.
-    /// Each slot holds `world_joint[i] * inv_bind[i]`, written each frame.
-    pub joint_buffer:     wgpu::Buffer,
-    /// Bind group for the joint buffer (group 3 in the skinned pipeline).
-    /// Populated by `GltfMesh::create_skin_bind_group()` after load.
+    pub animations: Vec<GltfAnimationPose>,
+
+    pub joint_buffer: wgpu::Buffer,
+
     pub joint_bind_group: Option<wgpu::BindGroup>,
-    pub primitives:       Vec<SkinnedMeshPrimitive>,
+    pub primitives: Vec<SkinnedMeshPrimitive>,
 }
 
 impl GltfSkin {
-    /// Upload skinned joint matrices: caller passes `world_joint[i] * inv_bind[i]`
-    /// for each joint in GLTF skin order.
     pub fn update_joint_matrices(&self, queue: &wgpu::Queue, skinned_mats: &[Mat4]) {
         let mut buf = [[0f32; 16]; MAX_SKIN_JOINTS];
         for (i, mat) in skinned_mats.iter().enumerate().take(MAX_SKIN_JOINTS) {
@@ -106,18 +95,26 @@ impl GltfSkin {
         queue.write_buffer(&self.joint_buffer, 0, bytemuck::cast_slice(&buf));
     }
 
-    pub fn blended_local_pose(&self, from: usize, to: usize, blend: impl Fn(usize) -> f32) -> Vec<(Vec3, Quat, Vec3)> {
+    pub fn blended_local_pose(
+        &self,
+        from: usize,
+        to: usize,
+        blend: impl Fn(usize) -> f32,
+    ) -> Vec<(Vec3, Quat, Vec3)> {
         let get = |clip: usize, ji: usize| -> (Vec3, Quat, Vec3) {
-            self.animations.get(clip)
+            self.animations
+                .get(clip)
                 .and_then(|a| a.joint_transforms.get(ji).copied().flatten())
                 .unwrap_or(self.joint_local_bind[ji])
         };
-        (0..self.joint_names.len()).map(|ji| {
-            let (ft, fr, fs) = get(from, ji);
-            let (tt, tr, ts) = get(to, ji);
-            let b = blend(ji).clamp(0.0, 1.0);
-            (ft.lerp(tt, b), fr.slerp(tr, b), fs.lerp(ts, b))
-        }).collect()
+        (0..self.joint_names.len())
+            .map(|ji| {
+                let (ft, fr, fs) = get(from, ji);
+                let (tt, tr, ts) = get(to, ji);
+                let b = blend(ji).clamp(0.0, 1.0);
+                (ft.lerp(tt, b), fr.slerp(tr, b), fs.lerp(ts, b))
+            })
+            .collect()
     }
 
     pub fn generic_joint_name(name: &str) -> &str {
@@ -141,34 +138,29 @@ impl GltfSkin {
     }
 }
 
-/// `vertex_buffer`/`index_buffer` are built once, here, at load time, and
-/// reused every frame thereafter — this geometry never changes after
-/// load, so re-uploading it every frame (the old behavior, via
-/// `device.create_buffer_init` inside `render_internal`) was pure wasted
-/// CPU+GPU work, the dominant cost in scenes with several mesh objects.
 #[derive(Clone)]
 pub struct MeshPrimitive {
     pub vertices: Vec<MeshVertex>,
-    pub indices:  Vec<u32>,
-    pub texture:  Arc<LoadedTexture>,
+    pub indices: Vec<u32>,
+    pub texture: Arc<LoadedTexture>,
     pub vertex_buffer: wgpu::Buffer,
-    pub index_buffer:  wgpu::Buffer,
+    pub index_buffer: wgpu::Buffer,
 }
 
 pub struct LoadedTexture {
-    pub texture:    wgpu::Texture,
-    pub view:       wgpu::TextureView,
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
     pub bind_group: wgpu::BindGroup,
 }
 
 #[derive(Clone)]
 pub struct GltfMesh {
-    pub primitives:      Vec<MeshPrimitive>,
-    /// Present when the GLTF file has a skin (skeletal hand mesh, etc.).
-    pub skin:            Option<GltfSkin>,
-    pub position:        Vec3,
-    pub rotation:        Quat,
-    pub scale:           Vec3,
+    pub primitives: Vec<MeshPrimitive>,
+
+    pub skin: Option<GltfSkin>,
+    pub position: Vec3,
+    pub rotation: Quat,
+    pub scale: Vec3,
     pub bounding_radius: f32,
 }
 
@@ -177,15 +169,22 @@ impl GltfMesh {
         Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.position)
     }
 
-    pub fn is_skinned(&self) -> bool { self.skin.is_some() }
-
-    pub fn joint_names(&self) -> &[String] {
-        self.skin.as_ref().map(|s| s.joint_names.as_slice()).unwrap_or(&[])
+    pub fn is_skinned(&self) -> bool {
+        self.skin.is_some()
     }
 
-    /// Call once after load, passing the skinned pipeline's joint bind group layout.
-    /// Creates the GPU bind group used during rendering.
-    pub fn create_skin_bind_group(&mut self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout) {
+    pub fn joint_names(&self) -> &[String] {
+        self.skin
+            .as_ref()
+            .map(|s| s.joint_names.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn create_skin_bind_group(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+    ) {
         if let Some(skin) = &mut self.skin {
             skin.joint_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("skin_joints_bg"),
@@ -198,38 +197,29 @@ impl GltfMesh {
         }
     }
 
-    /// Upload skinned joint matrices for this frame.
-    /// `skinned_mats[i]` = world_joint_transform[i] * inv_bind_mat[i]
     pub fn update_joint_matrices(&self, queue: &wgpu::Queue, skinned_mats: &[Mat4]) {
         if let Some(skin) = &self.skin {
             skin.update_joint_matrices(queue, skinned_mats);
         }
     }
 
-    /// Clone this mesh for a new independently-posed instance (e.g. the same skinned GLB
-    /// reused for both hands). Plain `.clone()` shares this mesh's `wgpu::Buffer` handles —
-    /// fine for the vertex/index/texture buffers (immutable after load), but wrong for a
-    /// skin's `joint_buffer`, which is rewritten every frame: two instances sharing it would
-    /// both render whichever instance uploaded its pose last. This gives the clone its own
-    /// joint buffer (and a fresh, as-yet-unpopulated bind group — call
-    /// `create_skin_bind_group` on it same as a freshly loaded mesh).
     pub fn clone_with_independent_skin(&self, device: &wgpu::Device) -> Self {
         let mut m = self.clone();
         if let Some(skin) = &self.skin {
             m.skin = Some(GltfSkin {
-                joint_names:      skin.joint_names.clone(),
-                inv_bind_mats:    skin.inv_bind_mats.clone(),
-                joint_parents:    skin.joint_parents.clone(),
+                joint_names: skin.joint_names.clone(),
+                inv_bind_mats: skin.inv_bind_mats.clone(),
+                joint_parents: skin.joint_parents.clone(),
                 joint_local_bind: skin.joint_local_bind.clone(),
-                animations:       skin.animations.clone(),
-                joint_buffer:     device.create_buffer(&wgpu::BufferDescriptor {
+                animations: skin.animations.clone(),
+                joint_buffer: device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("skin_joint_buf"),
                     size: (MAX_SKIN_JOINTS * 64) as u64,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }),
                 joint_bind_group: None,
-                primitives:       skin.primitives.clone(),
+                primitives: skin.primitives.clone(),
             });
         }
         m
@@ -237,17 +227,18 @@ impl GltfMesh {
 
     pub fn load(
         device: &wgpu::Device,
-        queue:  &wgpu::Queue,
+        queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,
-        path:   &Path,
+        path: &Path,
     ) -> Result<Self> {
-        let (doc, buffers, images) = gltf::import(path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
+        let (doc, buffers, images) =
+            gltf::import(path).with_context(|| format!("failed to open {}", path.display()))?;
 
         let mut skin_opt: Option<GltfSkin> = None;
         for skin in doc.skins() {
             let joint_nodes: Vec<gltf::Node> = skin.joints().collect();
-            let joint_names: Vec<String> = joint_nodes.iter()
+            let joint_names: Vec<String> = joint_nodes
+                .iter()
                 .map(|j| j.name().unwrap_or("").to_string())
                 .collect();
 
@@ -256,17 +247,20 @@ impl GltfMesh {
                 let view = acc.view().context("skin ibm: no buffer view")?;
                 let buf_data: &[u8] = &buffers[view.buffer().index()];
                 let start = view.offset() + acc.offset();
-                let stride = view.stride().unwrap_or(64); // 4x4 f32 = 64 bytes
-                (0..acc.count()).map(|i| {
-                    let off = start + i * stride;
-                    let arr: [f32; 16] = bytemuck::pod_read_unaligned(&buf_data[off..off + 64]);
-                    Mat4::from_cols_array(&arr)
-                }).collect()
+                let stride = view.stride().unwrap_or(64);
+                (0..acc.count())
+                    .map(|i| {
+                        let off = start + i * stride;
+                        let arr: [f32; 16] = bytemuck::pod_read_unaligned(&buf_data[off..off + 64]);
+                        Mat4::from_cols_array(&arr)
+                    })
+                    .collect()
             } else {
                 vec![Mat4::IDENTITY; joint_count]
             };
 
-            let node_index_to_joint: HashMap<usize, usize> = joint_nodes.iter()
+            let node_index_to_joint: HashMap<usize, usize> = joint_nodes
+                .iter()
                 .enumerate()
                 .map(|(ji, node)| (node.index(), ji))
                 .collect();
@@ -276,61 +270,86 @@ impl GltfMesh {
                     parent_of_node.insert(child.index(), node.index());
                 }
             }
-            let joint_parents: Vec<Option<usize>> = joint_nodes.iter()
+            let joint_parents: Vec<Option<usize>> = joint_nodes
+                .iter()
                 .map(|node| {
-                    parent_of_node.get(&node.index())
+                    parent_of_node
+                        .get(&node.index())
                         .and_then(|pidx| node_index_to_joint.get(pidx).copied())
                 })
                 .collect();
-            let joint_local_bind: Vec<(Vec3, Quat, Vec3)> = joint_nodes.iter()
+            let joint_local_bind: Vec<(Vec3, Quat, Vec3)> = joint_nodes
+                .iter()
                 .map(|node| {
                     let (t, r, s) = node.transform().decomposed();
                     (Vec3::from(t), Quat::from_array(r), Vec3::from(s))
                 })
                 .collect();
 
-            let animations: Vec<GltfAnimationPose> = doc.animations().map(|anim| {
-                let mut partial: Vec<Option<(Option<Vec3>, Option<Quat>, Option<Vec3>)>> =
-                    vec![None; joint_count];
-                for channel in anim.channels() {
-                    let Some(&ji) = node_index_to_joint.get(&channel.target().node().index()) else { continue };
-                    let reader = channel.reader(|b| Some(&buffers[b.index()]));
-                    let entry = partial[ji].get_or_insert((None, None, None));
-                    match reader.read_outputs() {
-                        Some(gltf::animation::util::ReadOutputs::Translations(mut t)) => {
-                            if let Some(v) = t.next() { entry.0 = Some(Vec3::from(v)); }
-                        }
-                        Some(gltf::animation::util::ReadOutputs::Rotations(r)) => {
-                            if let Some(v) = r.into_f32().next() {
-                                entry.1 = Some(Quat::from_xyzw(v[0], v[1], v[2], v[3]));
+            let animations: Vec<GltfAnimationPose> = doc
+                .animations()
+                .map(|anim| {
+                    let mut partial: Vec<Option<(Option<Vec3>, Option<Quat>, Option<Vec3>)>> =
+                        vec![None; joint_count];
+                    for channel in anim.channels() {
+                        let Some(&ji) = node_index_to_joint.get(&channel.target().node().index())
+                        else {
+                            continue;
+                        };
+                        let reader = channel.reader(|b| Some(&buffers[b.index()]));
+                        let entry = partial[ji].get_or_insert((None, None, None));
+                        match reader.read_outputs() {
+                            Some(gltf::animation::util::ReadOutputs::Translations(mut t)) => {
+                                if let Some(v) = t.next() {
+                                    entry.0 = Some(Vec3::from(v));
+                                }
                             }
+                            Some(gltf::animation::util::ReadOutputs::Rotations(r)) => {
+                                if let Some(v) = r.into_f32().next() {
+                                    entry.1 = Some(Quat::from_xyzw(v[0], v[1], v[2], v[3]));
+                                }
+                            }
+                            Some(gltf::animation::util::ReadOutputs::Scales(mut s)) => {
+                                if let Some(v) = s.next() {
+                                    entry.2 = Some(Vec3::from(v));
+                                }
+                            }
+                            _ => {}
                         }
-                        Some(gltf::animation::util::ReadOutputs::Scales(mut s)) => {
-                            if let Some(v) = s.next() { entry.2 = Some(Vec3::from(v)); }
-                        }
-                        _ => {}
                     }
-                }
-                let joint_transforms = partial.into_iter().enumerate()
-                    .map(|(ji, entry)| entry.map(|(t, r, s)| (
-                        t.unwrap_or(joint_local_bind[ji].0),
-                        r.unwrap_or(joint_local_bind[ji].1),
-                        s.unwrap_or(joint_local_bind[ji].2),
-                    )))
-                    .collect();
-                GltfAnimationPose { name: anim.name().unwrap_or("").to_string(), joint_transforms }
-            }).collect();
+                    let joint_transforms = partial
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ji, entry)| {
+                            entry.map(|(t, r, s)| {
+                                (
+                                    t.unwrap_or(joint_local_bind[ji].0),
+                                    r.unwrap_or(joint_local_bind[ji].1),
+                                    s.unwrap_or(joint_local_bind[ji].2),
+                                )
+                            })
+                        })
+                        .collect();
+                    GltfAnimationPose {
+                        name: anim.name().unwrap_or("").to_string(),
+                        joint_transforms,
+                    }
+                })
+                .collect();
 
             log::info!(
                 "GltfMesh: skin has {} joints: {:?}, animation clips: {:?}",
-                joint_count, &joint_names,
-                animations.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                joint_count,
+                &joint_names,
+                animations
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>(),
             );
 
-            // Joint buffer: array<mat4x4<f32>, MAX_SKIN_JOINTS>
             let joint_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("skin_joint_buf"),
-                size: (MAX_SKIN_JOINTS * 64) as u64, // 64 joints * 16 floats * 4 bytes
+                size: (MAX_SKIN_JOINTS * 64) as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -342,23 +361,27 @@ impl GltfMesh {
                 joint_local_bind,
                 animations,
                 joint_buffer,
-                joint_bind_group: None, // populated by create_skin_bind_group()
+                joint_bind_group: None,
                 primitives: Vec::new(),
             });
-            break; // only handle first skin
+            break;
         }
 
         let is_skinned = skin_opt.is_some();
 
-        // --- collect primitives ---
         let mut static_prims: Vec<MeshPrimitive> = Vec::new();
         let mut skinned_prims: Vec<SkinnedMeshPrimitive> = Vec::new();
 
         for scene in doc.scenes() {
             for node in scene.nodes() {
                 collect_node(
-                    &node, Mat4::IDENTITY, &buffers, &images,
-                    device, queue, layout,
+                    &node,
+                    Mat4::IDENTITY,
+                    &buffers,
+                    &images,
+                    device,
+                    queue,
+                    layout,
                     is_skinned,
                     &mut static_prims,
                     &mut skinned_prims,
@@ -372,10 +395,13 @@ impl GltfMesh {
 
         log::info!(
             "GltfMesh: loaded {} static + {} skinned primitives from {}",
-            static_prims.len(), skinned_prims.len(), path.display(),
+            static_prims.len(),
+            skinned_prims.len(),
+            path.display(),
         );
 
-        let bounding_radius = static_prims.iter()
+        let bounding_radius = static_prims
+            .iter()
             .flat_map(|p| p.vertices.iter())
             .map(|v| Vec3::from(v.position).length())
             .fold(0.0_f32, f32::max);
@@ -389,27 +415,19 @@ impl GltfMesh {
             skin: skin_opt,
             position: Vec3::ZERO,
             rotation: Quat::IDENTITY,
-            scale:    Vec3::ONE,
+            scale: Vec3::ONE,
             bounding_radius,
         })
     }
 
-    /// Loads a GLTF file's geometry in its authored bind pose, ignoring any skin entirely —
-    /// every node (including ones with a skin) is walked through the *static* path in
-    /// `collect_node`, which bakes each node's full ancestor transform chain into its
-    /// vertices. For a renderer with no skinned-mesh pipeline (the desktop editor), this is
-    /// the only way to display a skinned asset like `hand.glb` at all; it's also a useful
-    /// diagnostic on its own, since it renders through the already-trusted static path and so
-    /// isolates whether an asset's raw geometry/proportions are correct independent of any
-    /// runtime joint-skinning math.
     pub fn load_static_bind_pose(
         device: &wgpu::Device,
-        queue:  &wgpu::Queue,
+        queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,
-        path:   &Path,
+        path: &Path,
     ) -> Result<Self> {
-        let (doc, buffers, images) = gltf::import(path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
+        let (doc, buffers, images) =
+            gltf::import(path).with_context(|| format!("failed to open {}", path.display()))?;
 
         let mut static_prims: Vec<MeshPrimitive> = Vec::new();
         let mut skinned_prims: Vec<SkinnedMeshPrimitive> = Vec::new();
@@ -417,8 +435,13 @@ impl GltfMesh {
         for scene in doc.scenes() {
             for node in scene.nodes() {
                 collect_node(
-                    &node, Mat4::IDENTITY, &buffers, &images,
-                    device, queue, layout,
+                    &node,
+                    Mat4::IDENTITY,
+                    &buffers,
+                    &images,
+                    device,
+                    queue,
+                    layout,
                     false,
                     &mut static_prims,
                     &mut skinned_prims,
@@ -432,10 +455,12 @@ impl GltfMesh {
 
         log::info!(
             "GltfMesh: loaded {} static primitives (bind pose, skin ignored) from {}",
-            static_prims.len(), path.display(),
+            static_prims.len(),
+            path.display(),
         );
 
-        let bounding_radius = static_prims.iter()
+        let bounding_radius = static_prims
+            .iter()
             .flat_map(|p| p.vertices.iter())
             .map(|v| Vec3::from(v.position).length())
             .fold(0.0_f32, f32::max);
@@ -445,7 +470,7 @@ impl GltfMesh {
             skin: None,
             position: Vec3::ZERO,
             rotation: Quat::IDENTITY,
-            scale:    Vec3::ONE,
+            scale: Vec3::ONE,
             bounding_radius,
         })
     }
@@ -453,16 +478,16 @@ impl GltfMesh {
 
 #[allow(clippy::too_many_arguments)]
 fn collect_node(
-    node:          &gltf::Node,
-    parent:        Mat4,
-    buffers:       &[gltf::buffer::Data],
-    images:        &[gltf::image::Data],
-    device:        &wgpu::Device,
-    queue:         &wgpu::Queue,
-    layout:        &wgpu::BindGroupLayout,
-    skinned:       bool,
-    static_out:    &mut Vec<MeshPrimitive>,
-    skinned_out:   &mut Vec<SkinnedMeshPrimitive>,
+    node: &gltf::Node,
+    parent: Mat4,
+    buffers: &[gltf::buffer::Data],
+    images: &[gltf::image::Data],
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    skinned: bool,
+    static_out: &mut Vec<MeshPrimitive>,
+    skinned_out: &mut Vec<SkinnedMeshPrimitive>,
 ) {
     let local = Mat4::from_cols_array_2d(&node.transform().matrix());
     let world = parent * local;
@@ -471,30 +496,29 @@ fn collect_node(
         for prim in mesh.primitives() {
             let reader = prim.reader(|buf| Some(&buffers[buf.index()]));
 
-            // Skinned meshes are placed entirely by `world[joint] * inverse_bind_matrix` at
-            // render time (see quest_app's per-frame skinning), computed against the raw,
-            // un-transformed accessor data — the exporter's ancestor chain (e.g. Sketchfab's
-            // wrapping "Sketchfab_model" node, which carries its own rotation + scale to fix
-            // up axis conventions) is not part of that bind space. Baking it into positions/
-            // normals here as well would apply it a second time, on top of the per-joint
-            // transform, distorting the mesh. Static (unskinned) meshes have no other source
-            // of placement, so they still need it baked in.
             let positions: Vec<Vec3> = match reader.read_positions() {
-                Some(p) => if skinned {
-                    p.map(Vec3::from).collect()
-                } else {
-                    p.map(|v| world.transform_point3(Vec3::from(v))).collect()
-                },
+                Some(p) => {
+                    if skinned {
+                        p.map(Vec3::from).collect()
+                    } else {
+                        p.map(|v| world.transform_point3(Vec3::from(v))).collect()
+                    }
+                }
                 None => continue,
             };
-            if positions.is_empty() { continue; }
+            if positions.is_empty() {
+                continue;
+            }
 
             let normals: Vec<Vec3> = match reader.read_normals() {
-                Some(n) => if skinned {
-                    n.map(|v| Vec3::from(v).normalize_or_zero()).collect()
-                } else {
-                    n.map(|v| world.transform_vector3(Vec3::from(v)).normalize_or_zero()).collect()
-                },
+                Some(n) => {
+                    if skinned {
+                        n.map(|v| Vec3::from(v).normalize_or_zero()).collect()
+                    } else {
+                        n.map(|v| world.transform_vector3(Vec3::from(v)).normalize_or_zero())
+                            .collect()
+                    }
+                }
                 None => vec![Vec3::Y; positions.len()],
             };
 
@@ -512,39 +536,40 @@ fn collect_node(
             let texture = Arc::new(texture);
 
             if skinned {
-                // Read joint influences — GLTF JOINTS_0 is u8 or u16
                 let joint_ids: Vec<[u32; 4]> = match reader.read_joints(0) {
-                    Some(gltf::mesh::util::ReadJoints::U8(it)) =>
-                        it.map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32]).collect(),
-                    Some(gltf::mesh::util::ReadJoints::U16(it)) =>
-                        it.map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32]).collect(),
+                    Some(gltf::mesh::util::ReadJoints::U8(it)) => it
+                        .map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
+                        .collect(),
+                    Some(gltf::mesh::util::ReadJoints::U16(it)) => it
+                        .map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
+                        .collect(),
                     None => vec![[0, 0, 0, 0]; positions.len()],
                 };
 
                 let weights: Vec<[f32; 4]> = match reader.read_weights(0) {
                     Some(w) => w.into_f32().collect(),
-                    None    => vec![[1.0, 0.0, 0.0, 0.0]; positions.len()],
+                    None => vec![[1.0, 0.0, 0.0, 0.0]; positions.len()],
                 };
 
                 let vertices: Vec<SkinnedMeshVertex> = (0..positions.len())
                     .map(|i| SkinnedMeshVertex {
-                        position:      positions[i].into(),
-                        normal:        normals.get(i).copied().unwrap_or(Vec3::Y).into(),
-                        uv:            uvs.get(i).copied().unwrap_or([0.0, 0.0]),
-                        joint_ids:     joint_ids.get(i).copied().unwrap_or([0; 4]),
+                        position: positions[i].into(),
+                        normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
+                        uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                        joint_ids: joint_ids.get(i).copied().unwrap_or([0; 4]),
                         joint_weights: weights.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]),
                     })
                     .collect();
 
                 let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label:    Some("skinned_mesh_vb"),
+                    label: Some("skinned_mesh_vb"),
                     contents: bytemuck::cast_slice(&vertices),
-                    usage:    wgpu::BufferUsages::VERTEX,
+                    usage: wgpu::BufferUsages::VERTEX,
                 });
                 let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label:    Some("skinned_mesh_ib"),
+                    label: Some("skinned_mesh_ib"),
                     contents: bytemuck::cast_slice(&indices),
-                    usage:    wgpu::BufferUsages::INDEX,
+                    usage: wgpu::BufferUsages::INDEX,
                 });
                 skinned_out.push(SkinnedMeshPrimitive {
                     index_count: indices.len() as u32,
@@ -556,40 +581,53 @@ fn collect_node(
                 let vertices: Vec<MeshVertex> = (0..positions.len())
                     .map(|i| MeshVertex {
                         position: positions[i].into(),
-                        normal:   normals.get(i).copied().unwrap_or(Vec3::Y).into(),
-                        uv:       uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                        normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
+                        uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                     })
                     .collect();
 
                 let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label:    Some("mesh_vb"),
+                    label: Some("mesh_vb"),
                     contents: bytemuck::cast_slice(&vertices),
-                    usage:    wgpu::BufferUsages::VERTEX,
+                    usage: wgpu::BufferUsages::VERTEX,
                 });
                 let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label:    Some("mesh_ib"),
+                    label: Some("mesh_ib"),
                     contents: bytemuck::cast_slice(&indices),
-                    usage:    wgpu::BufferUsages::INDEX,
+                    usage: wgpu::BufferUsages::INDEX,
                 });
                 static_out.push(MeshPrimitive {
-                    vertices, indices, texture,
-                    vertex_buffer, index_buffer,
+                    vertices,
+                    indices,
+                    texture,
+                    vertex_buffer,
+                    index_buffer,
                 });
             }
         }
     }
 
     for child in node.children() {
-        collect_node(&child, world, buffers, images, device, queue, layout,
-                     skinned, static_out, skinned_out);
+        collect_node(
+            &child,
+            world,
+            buffers,
+            images,
+            device,
+            queue,
+            layout,
+            skinned,
+            static_out,
+            skinned_out,
+        );
     }
 }
 
 fn load_primitive_texture(
-    prim:   &gltf::Primitive,
+    prim: &gltf::Primitive,
     images: &[gltf::image::Data],
     device: &wgpu::Device,
-    queue:  &wgpu::Queue,
+    queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
 ) -> LoadedTexture {
     let pbr = prim.material().pbr_metallic_roughness();
@@ -611,9 +649,9 @@ fn load_primitive_texture(
 
 fn upload_texture_rgba(
     device: &wgpu::Device,
-    queue:  &wgpu::Queue,
+    queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
-    image:  &gltf::image::Data,
+    image: &gltf::image::Data,
 ) -> LoadedTexture {
     use gltf::image::Format;
 
@@ -636,7 +674,10 @@ fn upload_texture_rgba(
             out
         }
         _ => {
-            log::warn!("Unsupported glTF image format {:?}, using gray fallback", image.format);
+            log::warn!(
+                "Unsupported glTF image format {:?}, using gray fallback",
+                image.format
+            );
             vec![180u8; (width * height * 4) as usize]
         }
     };
@@ -646,32 +687,36 @@ fn upload_texture_rgba(
 
 fn upload_solid_texture(
     device: &wgpu::Device,
-    queue:  &wgpu::Queue,
+    queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
-    rgba:   [u8; 4],
+    rgba: [u8; 4],
 ) -> LoadedTexture {
     create_texture_from_rgba(device, queue, layout, &rgba, 1, 1)
 }
 
 fn create_texture_from_rgba(
     device: &wgpu::Device,
-    queue:  &wgpu::Queue,
+    queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
-    rgba:   &[u8],
-    width:  u32,
+    rgba: &[u8],
+    width: u32,
     height: u32,
 ) -> LoadedTexture {
-    let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
 
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label:           Some("gltf_texture"),
+        label: Some("gltf_texture"),
         size,
         mip_level_count: 1,
-        sample_count:    1,
-        dimension:       wgpu::TextureDimension::D2,
-        format:          wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats:    &[],
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
     });
 
     queue.write_texture(
@@ -707,10 +752,20 @@ fn create_texture_from_rgba(
         label: Some("gltf_texture_bg"),
         layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
         ],
     });
 
-    LoadedTexture { texture, view, bind_group }
+    LoadedTexture {
+        texture,
+        view,
+        bind_group,
+    }
 }

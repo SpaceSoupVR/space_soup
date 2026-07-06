@@ -1,23 +1,17 @@
-//! Voxelize a GLTF/GLB model into cuboids, export as a new GLB made of boxes.
-
-use glam::{Vec3, Mat4};
-use anyhow::{Result, Context};
-use std::path::Path;
+use anyhow::{Context, Result};
+use glam::{Mat4, Vec3};
 use std::io::Write;
+use std::path::Path;
 
-use crate::renderer::{Cuboid, Color3};
+use crate::renderer::{Color3, Cuboid};
 
 struct Triangle {
-    v:     [Vec3; 3],
+    v: [Vec3; 3],
     color: [f32; 4],
 }
 
-pub fn gltf_to_cuboid_glb(
-    input:      &Path,
-    output:     &Path,
-    voxel_size: f32,
-) -> Result<Vec<Cuboid>> {
-    let tris    = import_gltf(input)?;
+pub fn gltf_to_cuboid_glb(input: &Path, output: &Path, voxel_size: f32) -> Result<Vec<Cuboid>> {
+    let tris = import_gltf(input)?;
     let cuboids = voxelize(&tris, voxel_size);
     export_glb(&cuboids, output)?;
     log::info!(
@@ -38,8 +32,8 @@ pub fn cuboids_to_glb(cuboids: &[Cuboid], output: &Path) -> Result<()> {
 }
 
 fn import_gltf(path: &Path) -> Result<Vec<Triangle>> {
-    let (doc, buffers, _images) = gltf::import(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
+    let (doc, buffers, _images) =
+        gltf::import(path).with_context(|| format!("failed to open {}", path.display()))?;
 
     let mut tris = Vec::new();
 
@@ -54,10 +48,10 @@ fn import_gltf(path: &Path) -> Result<Vec<Triangle>> {
 }
 
 fn collect_node(
-    node:    &gltf::Node,
-    parent:  Mat4,
+    node: &gltf::Node,
+    parent: Mat4,
     buffers: &[gltf::buffer::Data],
-    out:     &mut Vec<Triangle>,
+    out: &mut Vec<Triangle>,
 ) {
     let local = Mat4::from_cols_array_2d(&node.transform().matrix());
     let world = parent * local;
@@ -67,37 +61,25 @@ fn collect_node(
             let reader = prim.reader(|buf| Some(&buffers[buf.index()]));
 
             let positions: Vec<Vec3> = match reader.read_positions() {
-                Some(it) => it
-                    .map(|p| world.transform_point3(Vec3::from(p)))
-                    .collect(),
+                Some(it) => it.map(|p| world.transform_point3(Vec3::from(p))).collect(),
                 None => continue,
             };
 
-            let base = prim
-                .material()
-                .pbr_metallic_roughness()
-                .base_color_factor();
+            let base = prim.material().pbr_metallic_roughness().base_color_factor();
 
             let colors: Vec<[f32; 4]> = match reader.read_colors(0) {
                 Some(c) => c.into_rgba_f32().collect(),
-                None    => vec![base; positions.len()],
+                None => vec![base; positions.len()],
             };
 
             let indices: Vec<u32> = match reader.read_indices() {
                 Some(it) => it.into_u32().collect(),
-                None     => (0..positions.len() as u32).collect(),
+                None => (0..positions.len() as u32).collect(),
             };
 
             for chunk in indices.chunks_exact(3) {
-                let (i0, i1, i2) = (
-                    chunk[0] as usize,
-                    chunk[1] as usize,
-                    chunk[2] as usize,
-                );
-                if i0 >= positions.len()
-                    || i1 >= positions.len()
-                    || i2 >= positions.len()
-                {
+                let (i0, i1, i2) = (chunk[0] as usize, chunk[1] as usize, chunk[2] as usize);
+                if i0 >= positions.len() || i1 >= positions.len() || i2 >= positions.len() {
                     continue;
                 }
                 let color = avg_color4(colors[i0], colors[i1], colors[i2]);
@@ -133,7 +115,9 @@ fn linear_to_srgb_u8(v: f32) -> u8 {
 }
 
 fn voxelize(tris: &[Triangle], voxel_size: f32) -> Vec<Cuboid> {
-    if tris.is_empty() { return Vec::new(); }
+    if tris.is_empty() {
+        return Vec::new();
+    }
 
     let mut min = Vec3::splat(f32::MAX);
     let mut max = Vec3::splat(f32::MIN);
@@ -160,22 +144,22 @@ fn voxelize(tris: &[Triangle], voxel_size: f32) -> Vec<Cuboid> {
             let cx = min.x + (xi as f32 + 0.5) * voxel_size;
             let cz = min.z + (zi as f32 + 0.5) * voxel_size;
 
-            let mut hits: Vec<(f32, [f32; 4])> = tris
-                .iter()
-                .filter_map(|t| ray_tri_y(cx, cz, t))
-                .collect();
+            let mut hits: Vec<(f32, [f32; 4])> =
+                tris.iter().filter_map(|t| ray_tri_y(cx, cz, t)).collect();
 
-            if hits.is_empty() { continue; }
+            if hits.is_empty() {
+                continue;
+            }
             hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
             let mut i = 0;
             while i + 1 < hits.len() {
                 let y_enter = hits[i].0;
-                let y_exit  = hits[i + 1].0;
-                let color   = hits[i].1;
+                let y_exit = hits[i + 1].0;
+                let color = hits[i].1;
 
                 let yi_start = ((y_enter - min.y) / voxel_size).floor() as usize;
-                let yi_end   = ((y_exit  - min.y) / voxel_size).ceil()  as usize;
+                let yi_end = ((y_exit - min.y) / voxel_size).ceil() as usize;
 
                 for yi in yi_start..=yi_end.min(ny - 1) {
                     let cy = min.y + (yi as f32 + 0.5) * voxel_size;
@@ -199,18 +183,25 @@ fn voxelize(tris: &[Triangle], voxel_size: f32) -> Vec<Cuboid> {
 fn ray_tri_y(rx: f32, rz: f32, t: &Triangle) -> Option<(f32, [f32; 4])> {
     let [v0, v1, v2] = t.v;
 
-    let d0x = v1.x - v0.x; let d0z = v1.z - v0.z;
-    let d1x = v2.x - v0.x; let d1z = v2.z - v0.z;
-    let dx  = rx   - v0.x; let dz  = rz   - v0.z;
+    let d0x = v1.x - v0.x;
+    let d0z = v1.z - v0.z;
+    let d1x = v2.x - v0.x;
+    let d1z = v2.z - v0.z;
+    let dx = rx - v0.x;
+    let dz = rz - v0.z;
 
     let denom = d0x * d1z - d0z * d1x;
-    if denom.abs() < 1e-10 { return None; }
+    if denom.abs() < 1e-10 {
+        return None;
+    }
 
     let inv = 1.0 / denom;
-    let u   = (dx * d1z - dz * d1x) * inv;
-    let v   = (d0x * dz - d0z * dx) * inv;
+    let u = (dx * d1z - dz * d1x) * inv;
+    let v = (d0x * dz - d0z * dx) * inv;
 
-    if u < 0.0 || v < 0.0 || u + v > 1.0 { return None; }
+    if u < 0.0 || v < 0.0 || u + v > 1.0 {
+        return None;
+    }
 
     let y = v0.y + u * (v1.y - v0.y) + v * (v2.y - v0.y);
     Some((y, t.color))
@@ -226,7 +217,11 @@ fn export_glb(cuboids: &[Cuboid], path: &Path) -> Result<()> {
     let col_stride = 8 * 16usize;
     let idx_stride = 36 * 2usize;
 
-    let idx_pad = if (idx_stride % 4) != 0 { 4 - (idx_stride % 4) } else { 0 };
+    let idx_pad = if (idx_stride % 4) != 0 {
+        4 - (idx_stride % 4)
+    } else {
+        0
+    };
 
     let mut bin: Vec<u8> = Vec::with_capacity(n * (pos_stride + col_stride + idx_stride + idx_pad));
 
@@ -258,12 +253,12 @@ fn export_glb(cuboids: &[Cuboid], path: &Path) -> Result<()> {
     for i in 0..n {
         let base = (i * 8) as u16;
         let faces: [[u16; 6]; 6] = [
-            [0,1,2, 0,2,3],
-            [5,4,7, 5,7,6],
-            [4,0,3, 4,3,7],
-            [1,5,6, 1,6,2],
-            [3,2,6, 3,6,7],
-            [4,5,1, 4,1,0],
+            [0, 1, 2, 0, 2, 3],
+            [5, 4, 7, 5, 7, 6],
+            [4, 0, 3, 4, 3, 7],
+            [1, 5, 6, 1, 6, 2],
+            [3, 2, 6, 3, 6, 7],
+            [4, 5, 1, 4, 1, 0],
         ];
         for face in &faces {
             for &idx in face {
@@ -275,13 +270,15 @@ fn export_glb(cuboids: &[Cuboid], path: &Path) -> Result<()> {
         }
     }
 
-    while bin.len() % 4 != 0 { bin.push(0u8); }
+    while bin.len() % 4 != 0 {
+        bin.push(0u8);
+    }
     let bin_len = bin.len() as u32;
 
-    let mut accessors    = Vec::new();
-    let mut buffer_views  = Vec::new();
-    let mut meshes       = Vec::new();
-    let mut nodes        = Vec::new();
+    let mut accessors = Vec::new();
+    let mut buffer_views = Vec::new();
+    let mut meshes = Vec::new();
+    let mut nodes = Vec::new();
 
     for i in 0..n {
         let pos_bv = i * 3;
@@ -348,16 +345,20 @@ fn export_glb(cuboids: &[Cuboid], path: &Path) -> Result<()> {
         "buffers": [{ "byteLength": bin_len }]
     });
 
-    let json_str   = gltf_json.to_string();
+    let json_str = gltf_json.to_string();
     let json_bytes = json_str.as_bytes();
-    let json_len   = json_bytes.len() as u32;
-    let json_pad   = if json_len % 4 != 0 { 4 - json_len % 4 } else { 0 };
+    let json_len = json_bytes.len() as u32;
+    let json_pad = if json_len % 4 != 0 {
+        4 - json_len % 4
+    } else {
+        0
+    };
     let json_chunk_len = json_len + json_pad;
 
     let total_len = 12 + 8 + json_chunk_len + 8 + bin_len;
 
-    let mut file = std::fs::File::create(path)
-        .with_context(|| format!("cannot create {}", path.display()))?;
+    let mut file =
+        std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
 
     file.write_all(b"glTF")?;
     file.write_all(&2u32.to_le_bytes())?;
@@ -366,7 +367,9 @@ fn export_glb(cuboids: &[Cuboid], path: &Path) -> Result<()> {
     file.write_all(&json_chunk_len.to_le_bytes())?;
     file.write_all(&0x4E4F534Au32.to_le_bytes())?;
     file.write_all(json_bytes)?;
-    for _ in 0..json_pad { file.write_all(&[0x20])?; }
+    for _ in 0..json_pad {
+        file.write_all(&[0x20])?;
+    }
 
     file.write_all(&bin_len.to_le_bytes())?;
     file.write_all(&0x004E4942u32.to_le_bytes())?;

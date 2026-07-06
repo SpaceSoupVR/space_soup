@@ -1,31 +1,38 @@
-use wgpu::{PipelineCompilationOptions, BindGroupLayoutDescriptor, RenderPipelineDescriptor, PipelineLayoutDescriptor, TextureViewDimension, BindGroupLayoutEntry, DepthStencilState, TextureSampleType, MultisampleState, BindGroupLayout, RenderPipeline, PrimitiveState, FragmentState, TextureFormat, ShaderStages, BufferUsages, IndexFormat, VertexState, BindingType, RenderPass, Device, Queue, VertexBufferLayout, ShaderModule, Sampler, SamplerBindingType, BindGroup};
+use wgpu::{
+    BindGroup, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
+    BufferUsages, DepthStencilState, Device, FragmentState, IndexFormat, MultisampleState,
+    PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, Queue, RenderPass,
+    RenderPipeline, RenderPipelineDescriptor, Sampler, SamplerBindingType, ShaderModule,
+    ShaderStages, TextureFormat, TextureSampleType, TextureViewDimension, VertexBufferLayout,
+    VertexState,
+};
 
-use super::buffer::{DynamicBufferDescriptor, DynamicBuffer};
+use super::buffer::{DynamicBuffer, DynamicBufferDescriptor};
 
+use crate::ui2d::{Area, Color, RgbaImage, ShapeType};
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::ui2d::{Area, Color, ShapeType, RgbaImage};
 
 use super::atlas::ImageAtlas;
-use super::vertex::{Vertex, ImageVertex, ShapeVertex, RoundedRectangleVertex};
+use super::vertex::{ImageVertex, RoundedRectangleVertex, ShapeVertex, Vertex};
 
 type ArcImage = Arc<RgbaImage>;
 
 pub struct ImageRenderer {
-    bind_group_layout:          BindGroupLayout,
-    sampler:                    Sampler,
-    pub text_sampler:           Sampler,
-    ellipse_renderer:           GenericImageRenderer,
-    rectangle_renderer:         GenericImageRenderer,
+    bind_group_layout: BindGroupLayout,
+    sampler: Sampler,
+    pub text_sampler: Sampler,
+    ellipse_renderer: GenericImageRenderer,
+    rectangle_renderer: GenericImageRenderer,
     rounded_rectangle_renderer: GenericImageRenderer,
 }
 
 impl ImageRenderer {
     pub fn new(
-        device:         &Device,
+        device: &Device,
         texture_format: &TextureFormat,
-        multisample:    MultisampleState,
-        depth_stencil:  Option<DepthStencilState>,
+        multisample: MultisampleState,
+        depth_stencil: Option<DepthStencilState>,
     ) -> Self {
         let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: None,
@@ -70,11 +77,37 @@ impl ImageRenderer {
         });
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/image/ellipse.wgsl"));
-        let ellipse_renderer = GenericImageRenderer::new(device, texture_format, multisample, depth_stencil.clone(), &bind_group_layout, shader, ImageVertex::<ShapeVertex>::layout());
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/image/rectangle.wgsl"));
-        let rectangle_renderer = GenericImageRenderer::new(device, texture_format, multisample, depth_stencil.clone(), &bind_group_layout, shader, ImageVertex::<ShapeVertex>::layout());
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/image/rounded_rectangle.wgsl"));
-        let rounded_rectangle_renderer = GenericImageRenderer::new(device, texture_format, multisample, depth_stencil.clone(), &bind_group_layout, shader, ImageVertex::<RoundedRectangleVertex>::layout());
+        let ellipse_renderer = GenericImageRenderer::new(
+            device,
+            texture_format,
+            multisample,
+            depth_stencil.clone(),
+            &bind_group_layout,
+            shader,
+            ImageVertex::<ShapeVertex>::layout(),
+        );
+        let shader =
+            device.create_shader_module(wgpu::include_wgsl!("shaders/image/rectangle.wgsl"));
+        let rectangle_renderer = GenericImageRenderer::new(
+            device,
+            texture_format,
+            multisample,
+            depth_stencil.clone(),
+            &bind_group_layout,
+            shader,
+            ImageVertex::<ShapeVertex>::layout(),
+        );
+        let shader = device
+            .create_shader_module(wgpu::include_wgsl!("shaders/image/rounded_rectangle.wgsl"));
+        let rounded_rectangle_renderer = GenericImageRenderer::new(
+            device,
+            texture_format,
+            multisample,
+            depth_stencil.clone(),
+            &bind_group_layout,
+            shader,
+            ImageVertex::<RoundedRectangleVertex>::layout(),
+        );
 
         ImageRenderer {
             bind_group_layout,
@@ -89,8 +122,8 @@ impl ImageRenderer {
     pub fn prepare(
         &mut self,
         device: &Device,
-        queue:  &Queue,
-        width:  f32,
+        queue: &Queue,
+        width: f32,
         height: f32,
         image_atlas: &mut ImageAtlas,
         items: Vec<(u16, Area, ShapeType, ArcImage, Option<Color>, bool)>,
@@ -98,22 +131,55 @@ impl ImageRenderer {
         let (ellipses, rects, rounded_rects) = items.into_iter().fold(
             (vec![], vec![], vec![]),
             |mut a, (z, area, shape, key, color, is_text)| {
-                let sampler = if is_text { &self.text_sampler } else { &self.sampler };
+                let sampler = if is_text {
+                    &self.text_sampler
+                } else {
+                    &self.sampler
+                };
                 let image = image_atlas.get(queue, device, &self.bind_group_layout, sampler, &key);
                 match shape {
-                    ShapeType::Ellipse(_, size, _) =>
-                        a.0.push((ImageVertex::new(ShapeVertex::new(width, height, z, area, shape), &key, size, color), image)),
-                    ShapeType::Rectangle(_, size, _) =>
-                        a.1.push((ImageVertex::new(ShapeVertex::new(width, height, z, area, shape), &key, size, color), image)),
-                    ShapeType::RoundedRectangle(_, size, _, corner_radius) =>
-                        a.2.push((ImageVertex::new(RoundedRectangleVertex::new(width, height, z, area, shape, corner_radius), &key, size, color), image)),
+                    ShapeType::Ellipse(_, size, _) => a.0.push((
+                        ImageVertex::new(
+                            ShapeVertex::new(width, height, z, area, shape),
+                            &key,
+                            size,
+                            color,
+                        ),
+                        image,
+                    )),
+                    ShapeType::Rectangle(_, size, _) => a.1.push((
+                        ImageVertex::new(
+                            ShapeVertex::new(width, height, z, area, shape),
+                            &key,
+                            size,
+                            color,
+                        ),
+                        image,
+                    )),
+                    ShapeType::RoundedRectangle(_, size, _, corner_radius) => a.2.push((
+                        ImageVertex::new(
+                            RoundedRectangleVertex::new(
+                                width,
+                                height,
+                                z,
+                                area,
+                                shape,
+                                corner_radius,
+                            ),
+                            &key,
+                            size,
+                            color,
+                        ),
+                        image,
+                    )),
                 }
                 a
             },
         );
         self.ellipse_renderer.prepare(device, queue, ellipses);
         self.rectangle_renderer.prepare(device, queue, rects);
-        self.rounded_rectangle_renderer.prepare(device, queue, rounded_rects);
+        self.rounded_rectangle_renderer
+            .prepare(device, queue, rounded_rects);
     }
 
     pub fn render(&self, render_pass: &mut RenderPass<'_>) {
@@ -125,20 +191,20 @@ impl ImageRenderer {
 
 pub struct GenericImageRenderer {
     render_pipeline: RenderPipeline,
-    vertex_buffer:   DynamicBuffer,
-    index_buffer:    DynamicBuffer,
-    indices:         HashMap<Arc<BindGroup>, Vec<(u32, u32)>>,
+    vertex_buffer: DynamicBuffer,
+    index_buffer: DynamicBuffer,
+    indices: HashMap<Arc<BindGroup>, Vec<(u32, u32)>>,
 }
 
 impl GenericImageRenderer {
     pub fn new(
-        device:            &Device,
-        texture_format:    &TextureFormat,
-        multisample:       MultisampleState,
-        depth_stencil:     Option<DepthStencilState>,
+        device: &Device,
+        texture_format: &TextureFormat,
+        multisample: MultisampleState,
+        depth_stencil: Option<DepthStencilState>,
         bind_group_layout: &BindGroupLayout,
-        shader:            ShaderModule,
-        vertex_layout:     VertexBufferLayout,
+        shader: ShaderModule,
+        vertex_layout: VertexBufferLayout,
     ) -> Self {
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: None,
@@ -172,29 +238,44 @@ impl GenericImageRenderer {
             cache: None,
         });
 
-        let vertex_buffer = DynamicBuffer::new(device, &DynamicBufferDescriptor {
-            label: None,
-            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
-        });
+        let vertex_buffer = DynamicBuffer::new(
+            device,
+            &DynamicBufferDescriptor {
+                label: None,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            },
+        );
 
-        let index_buffer = DynamicBuffer::new(device, &DynamicBufferDescriptor {
-            label: None,
-            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
-        });
+        let index_buffer = DynamicBuffer::new(
+            device,
+            &DynamicBufferDescriptor {
+                label: None,
+                usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            },
+        );
 
-        GenericImageRenderer { render_pipeline, vertex_buffer, index_buffer, indices: HashMap::new() }
+        GenericImageRenderer {
+            render_pipeline,
+            vertex_buffer,
+            index_buffer,
+            indices: HashMap::new(),
+        }
     }
 
     pub fn prepare<V: bytemuck::Pod>(
         &mut self,
         device: &Device,
-        queue:  &Queue,
+        queue: &Queue,
         image_vertices: Vec<([V; 4], Arc<BindGroup>)>,
     ) {
         self.indices.clear();
 
         let (vertices, indices, indices_buffer) = image_vertices.into_iter().fold(
-            (vec![], vec![], HashMap::<Arc<BindGroup>, Vec<(u32, u32)>>::new()),
+            (
+                vec![],
+                vec![],
+                HashMap::<Arc<BindGroup>, Vec<(u32, u32)>>::new(),
+            ),
             |mut a, (vertices, image)| {
                 let start = a.1.len();
 
@@ -205,15 +286,19 @@ impl GenericImageRenderer {
                 let index = (start as u32, a.1.len() as u32);
                 match a.2.get_mut(&image) {
                     Some(indices) => indices.push(index),
-                    None => { a.2.insert(image, vec![index]); }
+                    None => {
+                        a.2.insert(image, vec![index]);
+                    }
                 }
                 a
             },
         );
 
         self.indices = indices_buffer;
-        self.vertex_buffer.write_buffer(device, queue, bytemuck::cast_slice(&vertices));
-        self.index_buffer.write_buffer(device, queue, bytemuck::cast_slice(&indices));
+        self.vertex_buffer
+            .write_buffer(device, queue, bytemuck::cast_slice(&vertices));
+        self.index_buffer
+            .write_buffer(device, queue, bytemuck::cast_slice(&indices));
     }
 
     pub fn render(&self, render_pass: &mut RenderPass<'_>) {

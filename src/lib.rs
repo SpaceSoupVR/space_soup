@@ -12,7 +12,7 @@ pub mod canvas;
 #[cfg(target_os = "android")]
 pub mod xr;
 
-pub use renderer::{Renderer, Cuboid, CuboidStyle, Color3};
+pub use renderer::{Color3, Cuboid, CuboidStyle, Renderer};
 
 #[cfg(not(target_os = "android"))]
 pub use canvas::Canvas;
@@ -20,8 +20,8 @@ pub use canvas::Canvas;
 #[cfg(target_os = "android")]
 pub use xr::{
     context::XrContext,
-    vulkan::VkContext,
+    controllers::{ControllerState, Controllers},
+    hands::{HandJoint, HandTrackers},
     headset::Headset,
-    controllers::{Controllers, ControllerState},
-    hands::{HandTrackers, HandJoint},
+    vulkan::VkContext,
 };

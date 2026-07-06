@@ -1,7 +1,7 @@
+use super::Color3;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use serde::{Serialize, Deserialize};
-use super::Color3;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum CuboidStyle {
@@ -12,55 +12,54 @@ pub enum CuboidStyle {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cuboid {
-    pub position:   Vec3,
-    pub half_size:  Vec3,
-    pub rotation:   glam::Quat,
-    pub color:      Color3,
+    pub position: Vec3,
+    pub half_size: Vec3,
+    pub rotation: glam::Quat,
+    pub color: Color3,
     pub wire_color: Color3,
-    pub style:      CuboidStyle,
-    pub id:         u64,
+    pub style: CuboidStyle,
+    pub id: u64,
 }
 
 impl Cuboid {
     pub fn solid(position: Vec3, half_size: Vec3, color: Color3) -> Self {
         Self {
-            position, half_size,
-            rotation:   glam::Quat::IDENTITY,
+            position,
+            half_size,
+            rotation: glam::Quat::IDENTITY,
             color,
             wire_color: Color3(0, 0, 0, 255),
-            style:      CuboidStyle::Solid,
-            id:         new_id(),
+            style: CuboidStyle::Solid,
+            id: new_id(),
         }
     }
 
     pub fn wireframe(position: Vec3, half_size: Vec3, color: Color3) -> Self {
         Self {
-            position, half_size,
-            rotation:   glam::Quat::IDENTITY,
-            color:      Color3(0, 0, 0, 0),
+            position,
+            half_size,
+            rotation: glam::Quat::IDENTITY,
+            color: Color3(0, 0, 0, 0),
             wire_color: color,
-            style:      CuboidStyle::Wireframe,
-            id:         new_id(),
+            style: CuboidStyle::Wireframe,
+            id: new_id(),
         }
     }
 
     pub fn solid_and_wire(position: Vec3, half_size: Vec3, fill: Color3, wire: Color3) -> Self {
         Self {
-            position, half_size,
-            rotation:   glam::Quat::IDENTITY,
-            color:      fill,
+            position,
+            half_size,
+            rotation: glam::Quat::IDENTITY,
+            color: fill,
             wire_color: wire,
-            style:      CuboidStyle::SolidAndWire,
-            id:         new_id(),
+            style: CuboidStyle::SolidAndWire,
+            id: new_id(),
         }
     }
 
     pub fn model_matrix(&self) -> Mat4 {
-        Mat4::from_scale_rotation_translation(
-            self.half_size * 2.0,
-            self.rotation,
-            self.position,
-        )
+        Mat4::from_scale_rotation_translation(self.half_size * 2.0, self.rotation, self.position)
     }
 
     pub fn aabb(&self) -> (Vec3, Vec3) {
@@ -80,7 +79,7 @@ impl Cuboid {
         let tmax = t1.max(t2);
 
         let t_enter = tmin.x.max(tmin.y).max(tmin.z);
-        let t_exit  = tmax.x.min(tmax.y).min(tmax.z);
+        let t_exit = tmax.x.min(tmax.y).min(tmax.z);
 
         if t_enter <= t_exit && t_exit > 0.0 {
             Some(t_enter.max(0.0))
@@ -89,10 +88,6 @@ impl Cuboid {
         }
     }
 
-    /// A cheap snapshot of every field that affects this cuboid's *baked*
-    /// vertex output. Used by `Renderer`'s per-id cache to detect whether
-    /// a cuboid actually needs its vertices regenerated this frame, or
-    /// whether last frame's baked vertices are still valid as-is.
     pub fn snapshot(&self) -> CuboidSnapshot {
         CuboidSnapshot {
             position: self.position,
@@ -107,12 +102,12 @@ impl Cuboid {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CuboidSnapshot {
-    pub position:   Vec3,
-    pub half_size:  Vec3,
-    pub rotation:   glam::Quat,
-    pub color:      Color3,
+    pub position: Vec3,
+    pub half_size: Vec3,
+    pub rotation: glam::Quat,
+    pub color: Color3,
     pub wire_color: Color3,
-    pub style:      CuboidStyle,
+    pub style: CuboidStyle,
 }
 
 fn new_id() -> u64 {
@@ -138,15 +133,15 @@ impl<'de> Deserialize<'de> for Color3 {
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct SolidVertex {
     pub position: [f32; 3],
-    pub normal:   [f32; 3],
-    pub color:    [f32; 4],
+    pub normal: [f32; 3],
+    pub color: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct WireVertex {
     pub position: [f32; 3],
-    pub color:    [f32; 4],
+    pub color: [f32; 4],
 }
 
 impl SolidVertex {
@@ -156,8 +151,8 @@ impl SolidVertex {
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
-            step_mode:    wgpu::VertexStepMode::Vertex,
-            attributes:   &Self::ATTRIBS,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
         }
     }
 }
@@ -169,40 +164,51 @@ impl WireVertex {
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
-            step_mode:    wgpu::VertexStepMode::Vertex,
-            attributes:   &Self::ATTRIBS,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
         }
     }
 }
 
 const CORNERS: [[f32; 3]; 8] = [
-    [-0.5, -0.5, -0.5], [ 0.5, -0.5, -0.5],
-    [ 0.5,  0.5, -0.5], [-0.5,  0.5, -0.5],
-    [-0.5, -0.5,  0.5], [ 0.5, -0.5,  0.5],
-    [ 0.5,  0.5,  0.5], [-0.5,  0.5,  0.5],
+    [-0.5, -0.5, -0.5],
+    [0.5, -0.5, -0.5],
+    [0.5, 0.5, -0.5],
+    [-0.5, 0.5, -0.5],
+    [-0.5, -0.5, 0.5],
+    [0.5, -0.5, 0.5],
+    [0.5, 0.5, 0.5],
+    [-0.5, 0.5, 0.5],
 ];
 
 const FACES: [([usize; 4], [f32; 3]); 6] = [
-    ([0, 1, 2, 3],  [ 0.0,  0.0, -1.0]),
-    ([5, 4, 7, 6],  [ 0.0,  0.0,  1.0]),
-    ([4, 0, 3, 7],  [-1.0,  0.0,  0.0]),
-    ([1, 5, 6, 2],  [ 1.0,  0.0,  0.0]),
-    ([3, 2, 6, 7],  [ 0.0,  1.0,  0.0]),
-    ([4, 5, 1, 0],  [ 0.0, -1.0,  0.0]),
+    ([0, 1, 2, 3], [0.0, 0.0, -1.0]),
+    ([5, 4, 7, 6], [0.0, 0.0, 1.0]),
+    ([4, 0, 3, 7], [-1.0, 0.0, 0.0]),
+    ([1, 5, 6, 2], [1.0, 0.0, 0.0]),
+    ([3, 2, 6, 7], [0.0, 1.0, 0.0]),
+    ([4, 5, 1, 0], [0.0, -1.0, 0.0]),
 ];
 
 const EDGES: [[usize; 2]; 12] = [
-    [0,1],[1,2],[2,3],[3,0],
-    [4,5],[5,6],[6,7],[7,4],
-    [0,4],[1,5],[2,6],[3,7],
+    [0, 1],
+    [1, 2],
+    [2, 3],
+    [3, 0],
+    [4, 5],
+    [5, 6],
+    [6, 7],
+    [7, 4],
+    [0, 4],
+    [1, 5],
+    [2, 6],
+    [3, 7],
 ];
 
-/// Bakes one cuboid's solid-style vertices/indices, at index offset 0 —
-/// caller (`Renderer`'s per-id cache) re-bases indices when splicing this
-/// into the combined frame buffer. Returns `None` for pure-Wireframe
-/// cuboids (nothing to bake on the solid side).
 pub fn build_solid_mesh_one(c: &Cuboid) -> Option<(Vec<SolidVertex>, Vec<u32>)> {
-    if matches!(c.style, CuboidStyle::Wireframe) { return None; }
+    if matches!(c.style, CuboidStyle::Wireframe) {
+        return None;
+    }
 
     let mut verts: Vec<SolidVertex> = Vec::with_capacity(24);
     let mut indices: Vec<u32> = Vec::with_capacity(36);
@@ -215,24 +221,37 @@ pub fn build_solid_mesh_one(c: &Cuboid) -> Option<(Vec<SolidVertex>, Vec<u32>)> 
         let face_base = verts.len() as u32;
         let n = Vec3::from(*normal);
         let diffuse = (n.dot(light) * 0.5 + 0.5).max(0.2);
-        let shaded = [color[0]*diffuse, color[1]*diffuse, color[2]*diffuse, color[3]];
+        let shaded = [
+            color[0] * diffuse,
+            color[1] * diffuse,
+            color[2] * diffuse,
+            color[3],
+        ];
 
         for &ci in corners {
             let world = model.transform_point3(Vec3::from(CORNERS[ci]));
-            verts.push(SolidVertex { position: world.into(), normal: *normal, color: shaded });
+            verts.push(SolidVertex {
+                position: world.into(),
+                normal: *normal,
+                color: shaded,
+            });
         }
         indices.extend_from_slice(&[
-            face_base, face_base+1, face_base+2,
-            face_base, face_base+2, face_base+3,
+            face_base,
+            face_base + 1,
+            face_base + 2,
+            face_base,
+            face_base + 2,
+            face_base + 3,
         ]);
     }
     Some((verts, indices))
 }
 
-/// Same idea as `build_solid_mesh_one`, for the wire pipeline. Returns
-/// `None` for pure-Solid cuboids.
 pub fn build_wire_mesh_one(c: &Cuboid) -> Option<(Vec<WireVertex>, Vec<u32>)> {
-    if matches!(c.style, CuboidStyle::Solid) { return None; }
+    if matches!(c.style, CuboidStyle::Solid) {
+        return None;
+    }
 
     let mut verts: Vec<WireVertex> = Vec::with_capacity(8);
     let mut indices: Vec<u32> = Vec::with_capacity(24);
@@ -244,7 +263,10 @@ pub fn build_wire_mesh_one(c: &Cuboid) -> Option<(Vec<WireVertex>, Vec<u32>)> {
         let base = verts.len() as u32;
         for &ci in edge {
             let world = model.transform_point3(Vec3::from(CORNERS[ci]));
-            verts.push(WireVertex { position: world.into(), color });
+            verts.push(WireVertex {
+                position: world.into(),
+                color,
+            });
         }
         indices.push(base);
         indices.push(base + 1);
@@ -252,9 +274,6 @@ pub fn build_wire_mesh_one(c: &Cuboid) -> Option<(Vec<WireVertex>, Vec<u32>)> {
     Some((verts, indices))
 }
 
-/// Unchanged bulk versions, kept for any external callers (e.g. desktop
-/// `canvas.rs`'s `default_scene`, or `voxelize.rs` consumers) that still
-/// want one-shot "bake everything" semantics without the per-id cache.
 pub fn build_solid_mesh(cuboids: &[Cuboid]) -> (Vec<SolidVertex>, Vec<u32>) {
     let mut verts: Vec<SolidVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
