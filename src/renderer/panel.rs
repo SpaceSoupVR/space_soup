@@ -5,7 +5,7 @@ use crate::renderer::mesh::MeshVertex;
 use crate::renderer::mesh_pipeline::{MeshPipeline, ModelUniform};
 use crate::ui2d::{Area, Atlas, Item, Ui2dRenderer};
 
-fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Vec<u32>) {
+pub(crate) fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Vec<u32>) {
     let hw = width_m * 0.5;
     let hh = height_m * 0.5;
 

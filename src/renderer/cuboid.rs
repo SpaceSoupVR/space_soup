@@ -215,25 +215,19 @@ pub fn build_solid_mesh_one(c: &Cuboid) -> Option<(Vec<SolidVertex>, Vec<u32>)> 
 
     let model = c.model_matrix();
     let color = c.color.to_linear();
-    let light = Vec3::new(0.5, 1.0, 0.8).normalize();
 
     for (corners, normal) in &FACES {
         let face_base = verts.len() as u32;
-        let n = Vec3::from(*normal);
-        let diffuse = (n.dot(light) * 0.5 + 0.5).max(0.2);
-        let shaded = [
-            color[0] * diffuse,
-            color[1] * diffuse,
-            color[2] * diffuse,
-            color[3],
-        ];
+        // Real per-fragment lighting needs a world-space normal, not the raw
+        // object-space face normal — rotate it along with the cuboid.
+        let world_normal = c.rotation * Vec3::from(*normal);
 
         for &ci in corners {
             let world = model.transform_point3(Vec3::from(CORNERS[ci]));
             verts.push(SolidVertex {
                 position: world.into(),
-                normal: *normal,
-                color: shaded,
+                normal: world_normal.into(),
+                color,
             });
         }
         indices.extend_from_slice(&[
