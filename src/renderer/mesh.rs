@@ -694,7 +694,7 @@ fn upload_solid_texture(
     create_texture_from_rgba(device, queue, layout, &rgba, 1, 1)
 }
 
-fn create_texture_from_rgba(
+pub(crate) fn create_texture_from_rgba(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,

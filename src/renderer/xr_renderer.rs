@@ -5,6 +5,7 @@ use openxr as xr;
 use crate::renderer::{
     camera::Camera,
     cuboid::{build_solid_mesh, build_wire_mesh, Cuboid},
+    lights::{Light, LightsUniform},
     mesh_pipeline::{MeshPipeline, SkinnedMeshPipeline},
     pipeline::{SolidPipeline, WirePipeline},
     uniforms::UniformBuffer,
@@ -29,6 +30,7 @@ pub struct XrRenderer {
     mesh_pipeline: MeshPipeline,
     skinned_mesh_pipeline: SkinnedMeshPipeline,
     uniform_buf: UniformBuffer,
+    lights_uniform: LightsUniform,
     depth_view: wgpu::TextureView,
     eye_targets: Vec<[EyeTarget; 2]>,
 }
@@ -72,7 +74,8 @@ impl XrRenderer {
 
         let (wgpu_device, wgpu_queue) = unsafe { build_wgpu_from_vulkan(vk)? };
 
-        let uniform_buf = UniformBuffer::new(&wgpu_device);
+        let lights_uniform = LightsUniform::new(&wgpu_device);
+        let uniform_buf = UniformBuffer::new(&wgpu_device, &lights_uniform);
         let solid_pipeline = SolidPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let wire_pipeline = WirePipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let mesh_pipeline = MeshPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
@@ -127,6 +130,7 @@ impl XrRenderer {
             mesh_pipeline,
             skinned_mesh_pipeline,
             uniform_buf,
+            lights_uniform,
             depth_view,
             eye_targets,
         })
@@ -160,7 +164,7 @@ impl XrRenderer {
         cuboids: &[Cuboid],
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
-        self.render_frame_with_meshes(session, stage, time, cuboids, &[])
+        self.render_frame_with_meshes(session, stage, time, cuboids, &[], &[])
     }
 
     pub fn render_frame_with_meshes(
@@ -170,10 +174,12 @@ impl XrRenderer {
         time: xr::Time,
         cuboids: &[Cuboid],
         meshes: &[MeshInstance],
+        lights: &[Light],
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
         let image_index = self.swapchain.acquire_image()? as usize;
         self.swapchain.wait_image(xr::Duration::INFINITE)?;
+        self.lights_uniform.upload(&self.wgpu_queue, lights);
 
         let (_, eye_views) =
             session.locate_views(xr::ViewConfigurationType::PRIMARY_STEREO, time, stage)?;

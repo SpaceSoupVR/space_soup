@@ -1,4 +1,5 @@
 use super::cuboid::{SolidVertex, WireVertex};
+use super::lights::wgsl_lights_block;
 use wgpu::*;
 
 pub struct SolidPipeline {
@@ -12,7 +13,7 @@ impl SolidPipeline {
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("solid_shader"),
-            source: ShaderSource::Wgsl(SOLID_SHADER.into()),
+            source: ShaderSource::Wgsl(solid_shader().into()),
         });
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("solid_layout"),
@@ -111,18 +112,40 @@ impl WirePipeline {
     }
 }
 
-const SOLID_SHADER: &str = r#"
-struct Uniforms { view_proj: mat4x4<f32> }
+fn solid_shader() -> String {
+    format!(
+        r#"
+struct Uniforms {{ view_proj: mat4x4<f32> }}
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
-struct VIn  { @location(0) pos: vec3<f32>, @location(1) norm: vec3<f32>, @location(2) col: vec4<f32> }
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) col: vec4<f32> }
+{lights_block}
 
-@vertex fn vs_main(v: VIn) -> VOut {
-    return VOut(u.view_proj * vec4<f32>(v.pos, 1.0), v.col);
+struct VIn  {{ @location(0) pos: vec3<f32>, @location(1) norm: vec3<f32>, @location(2) col: vec4<f32> }}
+struct VOut {{
+    @builtin(position) clip: vec4<f32>,
+    @location(0) col: vec4<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) world_pos: vec3<f32>,
+}}
+
+@vertex fn vs_main(v: VIn) -> VOut {{
+    var out: VOut;
+    out.clip      = u.view_proj * vec4<f32>(v.pos, 1.0);
+    out.col       = v.col;
+    out.normal    = v.norm;
+    out.world_pos = v.pos;
+    return out;
+}}
+
+@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
+    let n = normalize(in.normal);
+    let lit = shade(in.world_pos, n);
+    return vec4<f32>(in.col.rgb * lit, in.col.a);
+}}
+"#,
+        lights_block = wgsl_lights_block(0, 1)
+    )
 }
-@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> { return in.col; }
-"#;
 
 const WIRE_SHADER: &str = r#"
 struct Uniforms { view_proj: mat4x4<f32> }

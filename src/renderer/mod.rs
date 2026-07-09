@@ -1,5 +1,7 @@
 pub mod camera;
 pub mod cuboid;
+pub mod icon;
+pub mod lights;
 pub mod mesh;
 pub mod mesh_pipeline;
 pub mod panel;
@@ -11,6 +13,8 @@ pub mod xr_renderer;
 
 pub use camera::Camera;
 pub use cuboid::{Cuboid, CuboidStyle};
+pub use icon::{billboard_rotation, IconAssets, IconKind};
+pub use lights::{Light, LightKind};
 pub use mesh::GltfMesh;
 pub use panel::WorldPanel;
 use std::collections::HashMap;
@@ -18,6 +22,7 @@ use wgpu::util::DeviceExt;
 use wgpu::*;
 
 use cuboid::{build_solid_mesh_one, build_wire_mesh_one, CuboidSnapshot, SolidVertex, WireVertex};
+use lights::LightsUniform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color3(pub u8, pub u8, pub u8, pub u8);
@@ -61,6 +66,7 @@ pub struct Renderer {
     mesh_pipeline: mesh_pipeline::MeshPipeline,
     skinned_mesh_pipeline: mesh_pipeline::SkinnedMeshPipeline,
     uniform_buf: uniforms::UniformBuffer,
+    lights_uniform: LightsUniform,
     depth_texture: Texture,
     depth_view: TextureView,
     pub width: u32,
@@ -76,7 +82,8 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Self {
-        let uniform_buf = uniforms::UniformBuffer::new(&device);
+        let lights_uniform = LightsUniform::new(&device);
+        let uniform_buf = uniforms::UniformBuffer::new(&device, &lights_uniform);
         let solid_pipeline = pipeline::SolidPipeline::new(&device, format, &uniform_buf.layout);
         let wire_pipeline = pipeline::WirePipeline::new(&device, format, &uniform_buf.layout);
         let mesh_pipeline = mesh_pipeline::MeshPipeline::new(&device, format, &uniform_buf.layout);
@@ -92,6 +99,7 @@ impl Renderer {
             mesh_pipeline,
             skinned_mesh_pipeline,
             uniform_buf,
+            lights_uniform,
             depth_texture,
             depth_view,
             width,
@@ -123,6 +131,10 @@ impl Renderer {
     /// mesh before it can be drawn.
     pub fn skin_joint_layout(&self) -> &BindGroupLayout {
         &self.skinned_mesh_pipeline.skin_joint_layout
+    }
+
+    pub fn create_icon_assets(&self) -> icon::IconAssets {
+        icon::IconAssets::new(&self.device, &self.queue, &self.mesh_pipeline.texture_layout)
     }
 
     pub fn create_panel(
@@ -163,7 +175,18 @@ impl Renderer {
         cuboids: &[Cuboid],
         meshes: &[MeshInstance],
     ) {
-        self.render_internal(target_view, camera, cuboids, meshes, &[]);
+        self.render_with_lights(target_view, camera, cuboids, meshes, &[]);
+    }
+
+    pub fn render_with_lights(
+        &mut self,
+        target_view: &TextureView,
+        camera: &Camera,
+        cuboids: &[Cuboid],
+        meshes: &[MeshInstance],
+        lights: &[lights::Light],
+    ) {
+        self.render_internal(target_view, camera, cuboids, meshes, &[], lights);
     }
 
     pub fn render_with_panels(
@@ -173,8 +196,9 @@ impl Renderer {
         cuboids: &[Cuboid],
         meshes: &[MeshInstance],
         panels: &[&WorldPanel],
+        lights: &[lights::Light],
     ) {
-        self.render_internal(target_view, camera, cuboids, meshes, panels);
+        self.render_internal(target_view, camera, cuboids, meshes, panels, lights);
     }
 
     fn bake_cuboids(
@@ -236,9 +260,11 @@ impl Renderer {
         cuboids: &[Cuboid],
         meshes: &[MeshInstance],
         panels: &[&WorldPanel],
+        lights: &[lights::Light],
     ) {
         let vp = camera.projection() * camera.view();
         self.uniform_buf.upload(&self.queue, vp);
+        self.lights_uniform.upload(&self.queue, lights);
 
         let ((solid_verts, solid_indices), (wire_verts, wire_indices)) = self.bake_cuboids(cuboids);
 
