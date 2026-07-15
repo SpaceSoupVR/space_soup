@@ -278,11 +278,51 @@ impl GltfMesh {
                         .and_then(|pidx| node_index_to_joint.get(pidx).copied())
                 })
                 .collect();
+
+            // A joint whose scene-graph parent isn't itself a joint (e.g. a
+            // Blender/Mixamo-style "Armature" wrapper node sitting above the
+            // actual skeleton root) has its parent's transform silently
+            // dropped by `hierarchical_transforms`, which only ever walks
+            // joint-to-joint relationships and treats a joint with no joint
+            // parent as if it had no ancestor transform at all. That wrapper
+            // commonly carries exactly the unit-scale correction the rig
+            // needs (e.g. centimeters -> meters), so skipping it produces a
+            // skeleton that's off by whatever that scale was — bake every
+            // non-joint ancestor's transform into that root joint's own
+            // bind transform instead, so it's accounted for exactly once.
+            let all_nodes: Vec<gltf::Node> = doc.nodes().collect();
             let joint_local_bind: Vec<(Vec3, Quat, Vec3)> = joint_nodes
                 .iter()
-                .map(|node| {
+                .enumerate()
+                .map(|(ji, node)| {
                     let (t, r, s) = node.transform().decomposed();
-                    (Vec3::from(t), Quat::from_array(r), Vec3::from(s))
+                    let mut local = Mat4::from_scale_rotation_translation(
+                        Vec3::from(s),
+                        Quat::from_array(r),
+                        Vec3::from(t),
+                    );
+
+                    if joint_parents[ji].is_none() {
+                        let mut ancestor_idx = parent_of_node.get(&node.index()).copied();
+                        let mut ancestor_mat = Mat4::IDENTITY;
+                        while let Some(idx) = ancestor_idx {
+                            if node_index_to_joint.contains_key(&idx) {
+                                break;
+                            }
+                            let (at, ar, asc) = all_nodes[idx].transform().decomposed();
+                            let anc_local = Mat4::from_scale_rotation_translation(
+                                Vec3::from(asc),
+                                Quat::from_array(ar),
+                                Vec3::from(at),
+                            );
+                            ancestor_mat = anc_local * ancestor_mat;
+                            ancestor_idx = parent_of_node.get(&idx).copied();
+                        }
+                        local = ancestor_mat * local;
+                    }
+
+                    let (s2, r2, t2) = local.to_scale_rotation_translation();
+                    (t2, r2, s2)
                 })
                 .collect();
 
@@ -630,11 +670,20 @@ fn load_primitive_texture(
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
 ) -> LoadedTexture {
-    let pbr = prim.material().pbr_metallic_roughness();
+    let material = prim.material();
+    let pbr = material.pbr_metallic_roughness();
+    // Every mesh draws through one blend-enabled pipeline (see
+    // mesh_pipeline.rs), so a material's alpha always affects the render
+    // regardless of the glTF spec's alphaMode. Per spec, Opaque materials
+    // must ignore alpha entirely — exporters routinely leave stray alpha
+    // data in a texture (packed channels, editor artifacts) even when the
+    // material is Opaque, which otherwise silently renders solid geometry
+    // as see-through. Only an explicit Blend material's alpha is real.
+    let force_opaque = material.alpha_mode() != gltf::material::AlphaMode::Blend;
 
     if let Some(info) = pbr.base_color_texture() {
         let image = &images[info.texture().source().index()];
-        return upload_texture_rgba(device, queue, layout, image);
+        return upload_texture_rgba(device, queue, layout, image, force_opaque);
     }
 
     let c = pbr.base_color_factor();
@@ -642,7 +691,7 @@ fn load_primitive_texture(
         (c[0] * 255.0) as u8,
         (c[1] * 255.0) as u8,
         (c[2] * 255.0) as u8,
-        (c[3] * 255.0) as u8,
+        if force_opaque { 255 } else { (c[3] * 255.0) as u8 },
     ];
     upload_solid_texture(device, queue, layout, rgba)
 }
@@ -652,13 +701,22 @@ fn upload_texture_rgba(
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
     image: &gltf::image::Data,
+    force_opaque: bool,
 ) -> LoadedTexture {
     use gltf::image::Format;
 
     let (width, height) = (image.width, image.height);
 
     let rgba: Vec<u8> = match image.format {
-        Format::R8G8B8A8 => image.pixels.clone(),
+        Format::R8G8B8A8 => {
+            if force_opaque {
+                let mut out = image.pixels.clone();
+                out.chunks_exact_mut(4).for_each(|px| px[3] = 255);
+                out
+            } else {
+                image.pixels.clone()
+            }
+        }
         Format::R8G8B8 => {
             let mut out = Vec::with_capacity((width * height * 4) as usize);
             for px in image.pixels.chunks_exact(3) {
@@ -678,7 +736,7 @@ fn upload_texture_rgba(
                 "Unsupported glTF image format {:?}, using gray fallback",
                 image.format
             );
-            vec![180u8; (width * height * 4) as usize]
+            [180u8, 180, 180, 255].repeat((width * height) as usize)
         }
     };
 

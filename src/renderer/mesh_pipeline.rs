@@ -10,6 +10,22 @@ pub struct MeshPipeline {
 
 impl MeshPipeline {
     pub fn new(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
+        Self::new_with_front_face(device, format, camera_layout, FrontFace::Ccw)
+    }
+
+    /// See `SolidPipeline::new_mirror` — a reflected camera flips winding
+    /// order, so rendering into the mirror's offscreen texture needs this
+    /// variant instead, or textured meshes would cull inside-out there.
+    pub fn new_mirror(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
+        Self::new_with_front_face(device, format, camera_layout, FrontFace::Cw)
+    }
+
+    fn new_with_front_face(
+        device: &Device,
+        format: TextureFormat,
+        camera_layout: &BindGroupLayout,
+        front_face: FrontFace,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("mesh_shader"),
             source: ShaderSource::Wgsl(mesh_shader().into()),
@@ -79,7 +95,7 @@ impl MeshPipeline {
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
                 cull_mode: Some(Face::Back),
-                front_face: FrontFace::Ccw,
+                front_face,
                 polygon_mode: PolygonMode::Fill,
                 ..Default::default()
             },
