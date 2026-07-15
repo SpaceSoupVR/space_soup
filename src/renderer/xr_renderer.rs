@@ -6,7 +6,8 @@ use crate::renderer::{
     camera::Camera,
     cuboid::{build_solid_mesh, build_wire_mesh, Cuboid},
     lights::{Light, LightsUniform},
-    mesh_pipeline::{MeshPipeline, SkinnedMeshPipeline},
+    mesh_pipeline::{MeshPipeline, ModelUniform, SkinnedMeshPipeline},
+    mirror::{self, MirrorPipeline, MirrorSurface, MirrorTarget},
     pipeline::{SolidPipeline, WirePipeline},
     uniforms::UniformBuffer,
     MeshInstance,
@@ -19,6 +20,54 @@ struct EyeTarget {
     view: wgpu::TextureView,
 }
 
+type MeshDraw<'a> = (
+    &'a wgpu::BindGroup,
+    &'a wgpu::BindGroup,
+    &'a wgpu::Buffer,
+    &'a wgpu::Buffer,
+    u32,
+);
+
+type SkinnedDraw<'a> = (
+    &'a wgpu::BindGroup,
+    &'a wgpu::BindGroup,
+    &'a wgpu::BindGroup,
+    &'a wgpu::Buffer,
+    &'a wgpu::Buffer,
+    u32,
+);
+
+fn push_mesh_draws<'a>(
+    instance: &'a MeshInstance,
+    mesh_draws: &mut Vec<MeshDraw<'a>>,
+    skinned_draws: &mut Vec<SkinnedDraw<'a>>,
+) {
+    if let Some(skin) = &instance.mesh.skin {
+        if let Some(joint_bg) = &skin.joint_bind_group {
+            for prim in &skin.primitives {
+                skinned_draws.push((
+                    &instance.model.bind_group,
+                    &prim.texture.bind_group,
+                    joint_bg,
+                    &prim.vertex_buffer,
+                    &prim.index_buffer,
+                    prim.index_count,
+                ));
+            }
+        }
+    } else {
+        for prim in &instance.mesh.primitives {
+            mesh_draws.push((
+                &instance.model.bind_group,
+                &prim.texture.bind_group,
+                &prim.vertex_buffer,
+                &prim.index_buffer,
+                prim.indices.len() as u32,
+            ));
+        }
+    }
+}
+
 pub struct XrRenderer {
     pub swapchain: xr::Swapchain<xr::Vulkan>,
     pub width: u32,
@@ -29,6 +78,14 @@ pub struct XrRenderer {
     wire_pipeline: WirePipeline,
     mesh_pipeline: MeshPipeline,
     skinned_mesh_pipeline: SkinnedMeshPipeline,
+    // Mirror-variant pipelines (flipped winding — see MeshPipeline::new_mirror)
+    // used only when rendering into the mirror's own offscreen texture.
+    mirror_solid_pipeline: SolidPipeline,
+    mirror_mesh_pipeline: MeshPipeline,
+    mirror_pipeline: MirrorPipeline,
+    mirror_targets: [MirrorTarget; 2],
+    mirror_model_uniform: ModelUniform,
+    mirror_reflected_vp_uniform: ModelUniform,
     uniform_buf: UniformBuffer,
     lights_uniform: LightsUniform,
     depth_view: wgpu::TextureView,
@@ -81,6 +138,15 @@ impl XrRenderer {
         let mesh_pipeline = MeshPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let skinned_mesh_pipeline =
             SkinnedMeshPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let mirror_solid_pipeline =
+            SolidPipeline::new_mirror(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let mirror_mesh_pipeline =
+            MeshPipeline::new_mirror(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let mirror_pipeline = MirrorPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let mirror_targets: [MirrorTarget; 2] =
+            std::array::from_fn(|_| mirror_pipeline.create_target(&wgpu_device, wgpu_format, width, height));
+        let mirror_model_uniform = mirror_pipeline.create_model_uniform(&wgpu_device);
+        let mirror_reflected_vp_uniform = mirror_pipeline.create_reflected_vp_uniform(&wgpu_device);
 
         let depth_tex = wgpu_device.create_texture(&wgpu::TextureDescriptor {
             label: Some("xr_depth"),
@@ -129,6 +195,12 @@ impl XrRenderer {
             wire_pipeline,
             mesh_pipeline,
             skinned_mesh_pipeline,
+            mirror_solid_pipeline,
+            mirror_mesh_pipeline,
+            mirror_pipeline,
+            mirror_targets,
+            mirror_model_uniform,
+            mirror_reflected_vp_uniform,
             uniform_buf,
             lights_uniform,
             depth_view,
@@ -164,7 +236,7 @@ impl XrRenderer {
         cuboids: &[Cuboid],
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
-        self.render_frame_with_meshes(session, stage, time, cuboids, &[], &[])
+        self.render_frame_with_meshes(session, stage, time, cuboids, &[], &[], &[], None)
     }
 
     pub fn render_frame_with_meshes(
@@ -174,7 +246,9 @@ impl XrRenderer {
         time: xr::Time,
         cuboids: &[Cuboid],
         meshes: &[MeshInstance],
+        mirror_only_meshes: &[MeshInstance],
         lights: &[Light],
+        mirror: Option<MirrorSurface>,
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
         let image_index = self.swapchain.acquire_image()? as usize;
@@ -216,61 +290,152 @@ impl XrRenderer {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-        type MeshDraw<'a> = (
-            &'a wgpu::BindGroup,
-            &'a wgpu::BindGroup,
-            &'a wgpu::Buffer,
-            &'a wgpu::Buffer,
-            u32,
-        );
-
-        type SkinnedDraw<'a> = (
-            &'a wgpu::BindGroup,
-            &'a wgpu::BindGroup,
-            &'a wgpu::BindGroup,
-            &'a wgpu::Buffer,
-            &'a wgpu::Buffer,
-            u32,
-        );
-
         let mut mesh_draws: Vec<MeshDraw> = Vec::new();
         let mut skinned_draws: Vec<SkinnedDraw> = Vec::new();
-
         for instance in meshes {
             instance
                 .model
                 .upload(&self.wgpu_queue, instance.mesh.model_matrix());
-
-            if let Some(skin) = &instance.mesh.skin {
-                if let Some(joint_bg) = &skin.joint_bind_group {
-                    for prim in &skin.primitives {
-                        skinned_draws.push((
-                            &instance.model.bind_group,
-                            &prim.texture.bind_group,
-                            joint_bg,
-                            &prim.vertex_buffer,
-                            &prim.index_buffer,
-                            prim.index_count,
-                        ));
-                    }
-                }
-            } else {
-                for prim in &instance.mesh.primitives {
-                    mesh_draws.push((
-                        &instance.model.bind_group,
-                        &prim.texture.bind_group,
-                        &prim.vertex_buffer,
-                        &prim.index_buffer,
-                        prim.indices.len() as u32,
-                    ));
-                }
-            }
+            push_mesh_draws(instance, &mut mesh_draws, &mut skinned_draws);
         }
+
+        // Extra content that only shows up in the mirror's reflection, not
+        // the direct view — the local player's own avatar body, so you
+        // don't see your own untracked torso/legs hanging in your face, but
+        // it's still there for a mirror (or another player) to actually see.
+        let mut mirror_only_mesh_draws: Vec<MeshDraw> = Vec::new();
+        let mut mirror_only_skinned_draws: Vec<SkinnedDraw> = Vec::new();
+        for instance in mirror_only_meshes {
+            instance
+                .model
+                .upload(&self.wgpu_queue, instance.mesh.model_matrix());
+            push_mesh_draws(instance, &mut mirror_only_mesh_draws, &mut mirror_only_skinned_draws);
+        }
+
+        // Mirror quad geometry/model matrix don't depend on the eye — built
+        // once here, reused for both eyes' main-pass draw below.
+        let mirror_quad = mirror.map(|m| {
+            let (verts, idx) = mirror::build_mirror_quad(m.half_size.x, m.half_size.y);
+            let vb = self
+                .wgpu_device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mirror_quad_vb"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let ib = self
+                .wgpu_device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mirror_quad_ib"),
+                    contents: bytemuck::cast_slice(&idx),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            let model = glam::Mat4::from_rotation_translation(m.rotation, m.position);
+            self.mirror_model_uniform.upload(&self.wgpu_queue, model);
+            (vb, ib, idx.len() as u32)
+        });
 
         for eye in 0..2usize {
             let ev = &eye_views[eye];
             let view = Camera::xr_view(ev.pose);
             let proj = Camera::xr_projection(ev.fov, 0.01, 1000.0);
+
+            // --- Mirror pass: render the whole scene again from the
+            // reflected viewpoint into this eye's offscreen mirror texture,
+            // *before* the main pass overwrites the shared camera uniform
+            // with the real (unreflected) view-projection it needs.
+            if let Some(m) = &mirror {
+                let reflect = mirror::reflection_matrix(m.position, m.normal());
+                let mirror_view = view * reflect;
+
+                // Bend the near clip plane to exactly coincide with the
+                // mirror surface (Lengyel's oblique near-plane clipping),
+                // so anything on the wrong side — between the reflected
+                // camera and the mirror — structurally can't render into
+                // it, regardless of what geometry happens to be nearby.
+                let world_plane = mirror::world_plane_equation(m.position, m.normal());
+                let eye_plane = mirror::plane_to_eye_space(mirror_view.inverse(), world_plane);
+                let mirror_proj = mirror::oblique_near_clip(proj, eye_plane);
+                let mirror_view_proj = mirror_proj * mirror_view;
+
+                self.uniform_buf.upload(&self.wgpu_queue, mirror_view_proj);
+                // Same matrix, stashed for the mirror quad's own vertex
+                // shader to use later in this eye's main pass — that's what
+                // makes the reflection UV pixel-accurate instead of an
+                // approximation from this quad's real-camera screen position.
+                self.mirror_reflected_vp_uniform.upload(&self.wgpu_queue, mirror_view_proj);
+
+                let mut encoder = self.wgpu_device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: Some("mirror_eye") },
+                );
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("mirror_pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &self.mirror_targets[eye].color_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.02,
+                                    g: 0.02,
+                                    b: 0.05,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.mirror_targets[eye].depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+
+                    if !solid_verts.is_empty() {
+                        pass.set_pipeline(&self.mirror_solid_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_vertex_buffer(0, solid_vb.slice(..));
+                        pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..solid_idx.len() as u32, 0, 0..1);
+                    }
+                    let all_mesh_draws = mesh_draws.iter().chain(mirror_only_mesh_draws.iter());
+                    let all_skinned_draws =
+                        skinned_draws.iter().chain(mirror_only_skinned_draws.iter());
+
+                    if !mesh_draws.is_empty() || !mirror_only_mesh_draws.is_empty() {
+                        pass.set_pipeline(&self.mirror_mesh_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        for (model_bg, tex_bg, vb, ib, count) in all_mesh_draws {
+                            pass.set_bind_group(1, *model_bg, &[]);
+                            pass.set_bind_group(2, *tex_bg, &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
+                    }
+                    if !skinned_draws.is_empty() || !mirror_only_skinned_draws.is_empty() {
+                        pass.set_pipeline(&self.skinned_mesh_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in all_skinned_draws {
+                            pass.set_bind_group(1, *model_bg, &[]);
+                            pass.set_bind_group(2, *tex_bg, &[]);
+                            pass.set_bind_group(3, *joint_bg, &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
+                    }
+                    // Wireframe boxes deliberately excluded from the mirror
+                    // reflection — thin unlit lines add little and this
+                    // keeps the extra pass cheaper.
+                }
+                self.wgpu_queue.submit(Some(encoder.finish()));
+            }
+
             self.uniform_buf.upload(&self.wgpu_queue, proj * view);
 
             let color_view = &self.eye_targets[image_index][eye].view;
@@ -341,6 +506,16 @@ impl XrRenderer {
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..*count, 0, 0..1);
                     }
+                }
+                if let Some((vb, ib, count)) = &mirror_quad {
+                    pass.set_pipeline(&self.mirror_pipeline.pipeline);
+                    pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                    pass.set_bind_group(1, &self.mirror_model_uniform.bind_group, &[]);
+                    pass.set_bind_group(2, &self.mirror_targets[eye].texture_bind_group, &[]);
+                    pass.set_bind_group(3, &self.mirror_reflected_vp_uniform.bind_group, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
                 }
             }
 

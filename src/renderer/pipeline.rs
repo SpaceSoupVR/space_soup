@@ -11,6 +11,25 @@ pub struct WirePipeline {
 
 impl SolidPipeline {
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
+        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Ccw)
+    }
+
+    /// A planar mirror's reflected view matrix flips handedness (that's
+    /// what a reflection *is*), which reverses the apparent winding order
+    /// of every triangle from that camera's point of view — rendering the
+    /// mirror's contents with the normal pipeline would cull exactly the
+    /// wrong faces (front faces disappear, back faces show). This variant
+    /// exists solely for rendering into the mirror's offscreen texture.
+    pub fn new_mirror(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
+        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Cw)
+    }
+
+    fn new_with_front_face(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        front_face: FrontFace,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("solid_shader"),
             source: ShaderSource::Wgsl(solid_shader().into()),
@@ -42,7 +61,7 @@ impl SolidPipeline {
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
                 cull_mode: Some(Face::Back),
-                front_face: FrontFace::Ccw,
+                front_face,
                 polygon_mode: PolygonMode::Fill,
                 ..Default::default()
             },
