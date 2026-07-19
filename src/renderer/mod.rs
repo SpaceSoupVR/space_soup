@@ -6,6 +6,7 @@ pub mod mesh;
 pub mod mesh_pipeline;
 pub mod mirror;
 pub mod panel;
+pub mod particle;
 pub mod pipeline;
 pub mod uniforms;
 
@@ -19,6 +20,7 @@ pub use lights::{Light, LightKind};
 pub use mesh::GltfMesh;
 pub use mirror::MirrorSurface;
 pub use panel::WorldPanel;
+pub use particle::{Beam, Particle, ParticlePipeline, ParticleVertex};
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 use wgpu::*;
@@ -322,7 +324,7 @@ impl Renderer {
                         skinned_draws.push((
                             &prim.vertex_buffer,
                             &prim.index_buffer,
-                            prim.index_count,
+                            prim.indices.len() as u32,
                             &instance.model.bind_group,
                             &prim.texture.bind_group,
                             joint_bg,

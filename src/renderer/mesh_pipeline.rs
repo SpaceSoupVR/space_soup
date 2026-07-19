@@ -1,5 +1,5 @@
 use super::lights::wgsl_lights_block;
-use super::mesh::{MeshVertex, SkinnedMeshVertex};
+use super::mesh::{MeshVertex, SkinnedMeshVertex, MAX_SKIN_JOINTS};
 use wgpu::*;
 
 pub struct MeshPipeline {
@@ -306,7 +306,7 @@ struct ModelUniform {{ model: mat4x4<f32> }}
 @group(2) @binding(0) var tex: texture_2d<f32>;
 @group(2) @binding(1) var samp: sampler;
 
-struct JointMatrices {{ mats: array<mat4x4<f32>, 64> }}
+struct JointMatrices {{ mats: array<mat4x4<f32>, {max_skin_joints}> }}
 @group(3) @binding(0) var<uniform> joints: JointMatrices;
 
 {lights_block}
@@ -360,7 +360,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     return vec4<f32>(tex_color.rgb * lit, tex_color.a);
 }}
 "#,
-        lights_block = wgsl_lights_block(0, 1)
+        lights_block = wgsl_lights_block(0, 1),
+        max_skin_joints = MAX_SKIN_JOINTS
     )
 }
 

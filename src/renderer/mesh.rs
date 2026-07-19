@@ -57,13 +57,69 @@ impl SkinnedMeshVertex {
 
 #[derive(Clone)]
 pub struct SkinnedMeshPrimitive {
-    pub index_count: u32,
+    pub vertices: Vec<SkinnedMeshVertex>,
+    pub indices: Vec<u32>,
     pub texture: Arc<LoadedTexture>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
 }
 
-pub const MAX_SKIN_JOINTS: usize = 64;
+impl SkinnedMeshPrimitive {
+    /// This primitive's `indices`/`vertex_buffer` with any triangle dropped
+    /// whose *dominant* (highest-weight) joint influence, for any of its 3
+    /// vertices, falls in `excluded_joints` — e.g. for hiding a VR avatar's
+    /// own head from its first-person view. Reuses the existing vertex
+    /// buffer (only which triangles get drawn changes, not vertex data) and
+    /// builds a fresh, smaller index buffer. Returns `None` if every
+    /// triangle got excluded (e.g. a primitive that's entirely hair or eyes)
+    /// — a zero-length index buffer is still a *valid* wgpu resource, but
+    /// `wgpu::Buffer::slice` panics on one at draw time, so callers should
+    /// drop the primitive outright rather than try to draw nothing.
+    fn excluding_joints(&self, device: &wgpu::Device, excluded_joints: &[usize]) -> Option<Self> {
+        let dominant_joint = |vi: u32| -> u32 {
+            let v = &self.vertices[vi as usize];
+            let mut best = 0;
+            for i in 1..4 {
+                if v.joint_weights[i] > v.joint_weights[best] {
+                    best = i;
+                }
+            }
+            v.joint_ids[best]
+        };
+        let indices: Vec<u32> = self
+            .indices
+            .chunks_exact(3)
+            .filter(|tri| {
+                !tri.iter()
+                    .any(|&vi| excluded_joints.contains(&(dominant_joint(vi) as usize)))
+            })
+            .flatten()
+            .copied()
+            .collect();
+        if indices.is_empty() {
+            return None;
+        }
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("skinned_mesh_ib_excluding_joints"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        Some(Self {
+            vertices: self.vertices.clone(),
+            index_buffer,
+            indices,
+            texture: self.texture.clone(),
+            vertex_buffer: self.vertex_buffer.clone(),
+        })
+    }
+}
+
+// 64 was too tight for models/boy/boy.glb (78 joints: ~50 core skeleton +
+// hair/eye/secondary-motion bones bundled into the same skin) — joints past
+// the cap silently never get uploaded, so the shader reads a stale/clamped
+// matrix for their vertices. Sized with headroom above that, not exactly to
+// it, so the next asset with a few more accessory bones doesn't retrip this.
+pub const MAX_SKIN_JOINTS: usize = 96;
 
 #[derive(Clone)]
 pub struct GltfAnimationPose {
@@ -150,6 +206,12 @@ pub struct MeshPrimitive {
 pub struct LoadedTexture {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
+    // Never read directly after construction — kept alive here because
+    // `bind_group` references it (see `create_texture_from_rgba`). Dropping
+    // this while `bind_group` still exists left the bind group referencing
+    // a destroyed sampler, which is exactly the "BindGroup ... is invalid"
+    // wgpu validation error seen at every draw call using this texture.
+    _sampler: wgpu::Sampler,
     pub bind_group: wgpu::BindGroup,
 }
 
@@ -221,6 +283,29 @@ impl GltfMesh {
                 joint_bind_group: None,
                 primitives: skin.primitives.clone(),
             });
+        }
+        m
+    }
+
+    /// Like `clone_with_independent_skin`, but additionally drops any
+    /// triangle whose dominant joint influence (for any of its 3 vertices)
+    /// is in `excluded_joints` — e.g. hiding a VR avatar's own head from its
+    /// first-person view by omitting head/hair/eye geometry outright, rather
+    /// than a shader or joint-transform trick (which don't fully hide
+    /// vertices that blend some weight onto a neighboring, non-excluded
+    /// joint for smooth deformation at the seam).
+    pub fn clone_with_independent_skin_excluding_joints(
+        &self,
+        device: &wgpu::Device,
+        excluded_joints: &[usize],
+    ) -> Self {
+        let mut m = self.clone_with_independent_skin(device);
+        if let Some(skin) = &mut m.skin {
+            skin.primitives = skin
+                .primitives
+                .iter()
+                .filter_map(|prim| prim.excluding_joints(device, excluded_joints))
+                .collect();
         }
         m
     }
@@ -448,6 +533,24 @@ impl GltfMesh {
 
         if let Some(skin) = &mut skin_opt {
             skin.primitives = skinned_prims;
+            // Nothing drives update_joint_matrices for a mesh unless some
+            // other system (avatar/hand rigging) explicitly does so every
+            // frame — a plain decorative skinned object dropped into a
+            // scene otherwise never gets one, leaving this GPU buffer at
+            // whatever create_buffer initialized it to (effectively zero
+            // matrices). The vertex shader's weighted joint sum then
+            // collapses every vertex to the origin, rendering nothing at
+            // all. Seed it with the bind pose so a skinned mesh renders
+            // correctly by default; anything that does drive it per-frame
+            // overwrites this immediately, so this is a pure fallback.
+            let bind_transforms = skin.hierarchical_transforms(&skin.joint_local_bind);
+            let bind_pose_mats: Vec<Mat4> = skin
+                .inv_bind_mats
+                .iter()
+                .enumerate()
+                .map(|(ji, inv_bind)| bind_transforms[ji] * *inv_bind)
+                .collect();
+            skin.update_joint_matrices(queue, &bind_pose_mats);
         }
 
         Ok(Self {
@@ -612,7 +715,8 @@ fn collect_node(
                     usage: wgpu::BufferUsages::INDEX,
                 });
                 skinned_out.push(SkinnedMeshPrimitive {
-                    index_count: indices.len() as u32,
+                    vertices,
+                    indices,
                     texture,
                     vertex_buffer,
                     index_buffer,
@@ -824,6 +928,7 @@ pub(crate) fn create_texture_from_rgba(
     LoadedTexture {
         texture,
         view,
+        _sampler: sampler,
         bind_group,
     }
 }
