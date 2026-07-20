@@ -308,6 +308,8 @@ impl Renderer {
         }
 
         let mut draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup)> = Vec::new();
+        let mut double_sided_draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup)> =
+            Vec::new();
         let mut skinned_draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> =
             Vec::new();
 
@@ -331,7 +333,12 @@ impl Renderer {
                 }
             } else {
                 for prim in &instance.mesh.primitives {
-                    draws.push((
+                    let target = if prim.double_sided {
+                        &mut double_sided_draws
+                    } else {
+                        &mut draws
+                    };
+                    target.push((
                         &prim.vertex_buffer,
                         &prim.index_buffer,
                         prim.indices.len() as u32,
@@ -405,6 +412,18 @@ impl Renderer {
                 pass.set_pipeline(&self.mesh_pipeline.pipeline);
                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                 for (vb, ib, count, model_bg, tex_bg) in &draws {
+                    pass.set_bind_group(1, *model_bg, &[]);
+                    pass.set_bind_group(2, *tex_bg, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
+            }
+
+            if !double_sided_draws.is_empty() {
+                pass.set_pipeline(&self.mesh_pipeline.pipeline_double_sided);
+                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                for (vb, ib, count, model_bg, tex_bg) in &double_sided_draws {
                     pass.set_bind_group(1, *model_bg, &[]);
                     pass.set_bind_group(2, *tex_bg, &[]);
                     pass.set_vertex_buffer(0, vb.slice(..));

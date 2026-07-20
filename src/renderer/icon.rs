@@ -82,6 +82,7 @@ fn build_icon_mesh(
             texture,
             vertex_buffer,
             index_buffer,
+            double_sided: false,
         }],
         skin: None,
         position: Vec3::ZERO,

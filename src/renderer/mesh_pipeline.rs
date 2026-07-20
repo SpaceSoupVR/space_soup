@@ -4,6 +4,9 @@ use wgpu::*;
 
 pub struct MeshPipeline {
     pub pipeline: RenderPipeline,
+    /// Same as `pipeline` but with backface culling off, for `doubleSided`
+    /// materials.
+    pub pipeline_double_sided: RenderPipeline,
     pub texture_layout: BindGroupLayout,
     pub model_layout: BindGroupLayout,
 }
@@ -73,46 +76,54 @@ impl MeshPipeline {
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("mesh_pipeline"),
-            layout: Some(&layout),
-            vertex: VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[MeshVertex::layout()],
-            },
-            fragment: Some(FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState {
-                    format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            primitive: PrimitiveState {
-                topology: PrimitiveTopology::TriangleList,
-                cull_mode: Some(Face::Back),
-                front_face,
-                polygon_mode: PolygonMode::Fill,
-                ..Default::default()
-            },
-            depth_stencil: Some(DepthStencilState {
-                format: TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: CompareFunction::Less,
-                stencil: StencilState::default(),
-                bias: DepthBiasState::default(),
-            }),
-            multisample: MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let build = |label: &str, cull_mode: Option<Face>| {
+            device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    buffers: &[MeshVertex::layout()],
+                },
+                fragment: Some(FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    targets: &[Some(ColorTargetState {
+                        format,
+                        blend: Some(BlendState::ALPHA_BLENDING),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    cull_mode,
+                    front_face,
+                    polygon_mode: PolygonMode::Fill,
+                    ..Default::default()
+                },
+                depth_stencil: Some(DepthStencilState {
+                    format: TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: CompareFunction::Less,
+                    stencil: StencilState::default(),
+                    bias: DepthBiasState::default(),
+                }),
+                multisample: MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+
+        let pipeline = build("mesh_pipeline", Some(Face::Back));
+        // Backface culling would erase `doubleSided` materials whose geometry is
+        // viewed from the inside (see `MeshPrimitive::double_sided`).
+        let pipeline_double_sided = build("mesh_pipeline_double_sided", None);
 
         Self {
             pipeline,
+            pipeline_double_sided,
             texture_layout,
             model_layout,
         }
@@ -382,6 +393,7 @@ struct VIn {{
     @location(0) position: vec3<f32>,
     @location(1) normal:   vec3<f32>,
     @location(2) uv:       vec2<f32>,
+    @location(3) unlit:    f32,
 }}
 
 struct VOut {{
@@ -389,6 +401,7 @@ struct VOut {{
     @location(0) normal: vec3<f32>,
     @location(1) uv:     vec2<f32>,
     @location(2) world_pos: vec3<f32>,
+    @location(3) @interpolate(flat) unlit: f32,
 }}
 
 @vertex
@@ -399,14 +412,19 @@ fn vs_main(v: VIn) -> VOut {{
     out.normal    = (model_u.model * vec4<f32>(v.normal, 0.0)).xyz;
     out.uv        = v.uv;
     out.world_pos = world_pos.xyz;
+    out.unlit     = v.unlit;
     return out;
 }}
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
+    let tex_color = textureSample(tex, samp, in.uv);
+    // A self-illuminated material carries its lighting in the texture already.
+    if (in.unlit > 0.5) {{
+        return tex_color;
+    }}
     let n = normalize(in.normal);
     let lit = shade(in.world_pos, n);
-    let tex_color = textureSample(tex, samp, in.uv);
     return vec4<f32>(tex_color.rgb * lit, tex_color.a);
 }}
 "#,

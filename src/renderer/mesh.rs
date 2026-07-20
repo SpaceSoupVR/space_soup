@@ -12,11 +12,16 @@ pub struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    /// 1.0 when the material is self-illuminated and must not be multiplied by
+    /// scene lighting — a baked backdrop already has its lighting in the
+    /// texture, so shading it again only darkens it. Carried per-vertex because
+    /// it varies per material, and primitives own their vertex buffers.
+    pub unlit: f32,
 }
 
 impl MeshVertex {
-    pub const ATTRIBS: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2];
+    pub const ATTRIBS: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32];
 
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -145,6 +150,11 @@ pub struct MeshPrimitive {
     pub texture: Arc<LoadedTexture>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
+    /// glTF `doubleSided`: the material is meant to be seen from both sides, so
+    /// this primitive draws through the no-cull pipeline. Sky domes and other
+    /// enclosing shells are authored with outward normals but viewed from
+    /// inside, where every face is a backface and culling erases them.
+    pub double_sided: bool,
 }
 
 pub struct LoadedTexture {
@@ -574,6 +584,8 @@ fn collect_node(
 
             let texture = load_primitive_texture(&prim, images, device, queue, layout);
             let texture = Arc::new(texture);
+            let double_sided = prim.material().double_sided();
+            let unlit = if material_is_unlit(&prim) { 1.0 } else { 0.0 };
 
             if skinned {
                 let joint_ids: Vec<[u32; 4]> = match reader.read_joints(0) {
@@ -623,6 +635,7 @@ fn collect_node(
                         position: positions[i].into(),
                         normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
                         uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                        unlit,
                     })
                     .collect();
 
@@ -642,6 +655,7 @@ fn collect_node(
                     texture,
                     vertex_buffer,
                     index_buffer,
+                    double_sided,
                 });
             }
         }
@@ -663,6 +677,18 @@ fn collect_node(
     }
 }
 
+/// True when `load_primitive_texture` takes its color from the emissive
+/// channel: the material lights itself, so `shade()` must not be applied on top
+/// or the baked image renders darker than authored.
+fn material_is_unlit(prim: &gltf::Primitive) -> bool {
+    let material = prim.material();
+    material
+        .pbr_metallic_roughness()
+        .base_color_texture()
+        .is_none()
+        && material.emissive_texture().is_some()
+}
+
 fn load_primitive_texture(
     prim: &gltf::Primitive,
     images: &[gltf::image::Data],
@@ -682,6 +708,14 @@ fn load_primitive_texture(
     let force_opaque = material.alpha_mode() != gltf::material::AlphaMode::Blend;
 
     if let Some(info) = pbr.base_color_texture() {
+        let image = &images[info.texture().source().index()];
+        return upload_texture_rgba(device, queue, layout, image, force_opaque);
+    }
+
+    // Baked/unlit assets (skyboxes, Sketchfab exports) carry their only image
+    // in the emissive channel and leave base color black, which would
+    // otherwise render the whole mesh solid black.
+    if let Some(info) = material.emissive_texture() {
         let image = &images[info.texture().source().index()];
         return upload_texture_rgba(device, queue, layout, image, force_opaque);
     }

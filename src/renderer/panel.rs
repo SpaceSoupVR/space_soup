@@ -14,21 +14,25 @@ pub(crate) fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Ve
             position: [-hw, -hh, 0.0],
             normal: [0.0, 0.0, 1.0],
             uv: [0.0, 1.0],
+            unlit: 0.0,
         },
         MeshVertex {
             position: [hw, -hh, 0.0],
             normal: [0.0, 0.0, 1.0],
             uv: [1.0, 1.0],
+            unlit: 0.0,
         },
         MeshVertex {
             position: [hw, hh, 0.0],
             normal: [0.0, 0.0, 1.0],
             uv: [1.0, 0.0],
+            unlit: 0.0,
         },
         MeshVertex {
             position: [-hw, hh, 0.0],
             normal: [0.0, 0.0, 1.0],
             uv: [0.0, 0.0],
+            unlit: 0.0,
         },
     ];
     let indices = vec![0, 1, 2, 0, 2, 3];

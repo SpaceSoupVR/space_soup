@@ -40,6 +40,7 @@ type SkinnedDraw<'a> = (
 fn push_mesh_draws<'a>(
     instance: &'a MeshInstance,
     mesh_draws: &mut Vec<MeshDraw<'a>>,
+    double_sided_draws: &mut Vec<MeshDraw<'a>>,
     skinned_draws: &mut Vec<SkinnedDraw<'a>>,
 ) {
     if let Some(skin) = &instance.mesh.skin {
@@ -57,7 +58,12 @@ fn push_mesh_draws<'a>(
         }
     } else {
         for prim in &instance.mesh.primitives {
-            mesh_draws.push((
+            let target = if prim.double_sided {
+                &mut *double_sided_draws
+            } else {
+                &mut *mesh_draws
+            };
+            target.push((
                 &instance.model.bind_group,
                 &prim.texture.bind_group,
                 &prim.vertex_buffer,
@@ -291,12 +297,18 @@ impl XrRenderer {
             });
 
         let mut mesh_draws: Vec<MeshDraw> = Vec::new();
+        let mut double_sided_draws: Vec<MeshDraw> = Vec::new();
         let mut skinned_draws: Vec<SkinnedDraw> = Vec::new();
         for instance in meshes {
             instance
                 .model
                 .upload(&self.wgpu_queue, instance.mesh.model_matrix());
-            push_mesh_draws(instance, &mut mesh_draws, &mut skinned_draws);
+            push_mesh_draws(
+                instance,
+                &mut mesh_draws,
+                &mut double_sided_draws,
+                &mut skinned_draws,
+            );
         }
 
         // Extra content that only shows up in the mirror's reflection, not
@@ -304,12 +316,18 @@ impl XrRenderer {
         // don't see your own untracked torso/legs hanging in your face, but
         // it's still there for a mirror (or another player) to actually see.
         let mut mirror_only_mesh_draws: Vec<MeshDraw> = Vec::new();
+        let mut mirror_only_double_sided_draws: Vec<MeshDraw> = Vec::new();
         let mut mirror_only_skinned_draws: Vec<SkinnedDraw> = Vec::new();
         for instance in mirror_only_meshes {
             instance
                 .model
                 .upload(&self.wgpu_queue, instance.mesh.model_matrix());
-            push_mesh_draws(instance, &mut mirror_only_mesh_draws, &mut mirror_only_skinned_draws);
+            push_mesh_draws(
+                instance,
+                &mut mirror_only_mesh_draws,
+                &mut mirror_only_double_sided_draws,
+                &mut mirror_only_skinned_draws,
+            );
         }
 
         // Mirror quad geometry/model matrix don't depend on the eye — built
@@ -403,8 +421,23 @@ impl XrRenderer {
                         pass.draw_indexed(0..solid_idx.len() as u32, 0, 0..1);
                     }
                     let all_mesh_draws = mesh_draws.iter().chain(mirror_only_mesh_draws.iter());
+                    let all_double_sided_draws = double_sided_draws
+                        .iter()
+                        .chain(mirror_only_double_sided_draws.iter());
                     let all_skinned_draws =
                         skinned_draws.iter().chain(mirror_only_skinned_draws.iter());
+
+                    if !double_sided_draws.is_empty() || !mirror_only_double_sided_draws.is_empty() {
+                        pass.set_pipeline(&self.mirror_mesh_pipeline.pipeline_double_sided);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        for (model_bg, tex_bg, vb, ib, count) in all_double_sided_draws {
+                            pass.set_bind_group(1, *model_bg, &[]);
+                            pass.set_bind_group(2, *tex_bg, &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
+                    }
 
                     if !mesh_draws.is_empty() || !mirror_only_mesh_draws.is_empty() {
                         pass.set_pipeline(&self.mirror_mesh_pipeline.pipeline);
@@ -488,6 +521,17 @@ impl XrRenderer {
                     pass.set_pipeline(&self.mesh_pipeline.pipeline);
                     pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                     for (model_bg, tex_bg, vb, ib, count) in &mesh_draws {
+                        pass.set_bind_group(1, *model_bg, &[]);
+                        pass.set_bind_group(2, *tex_bg, &[]);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                }
+                if !double_sided_draws.is_empty() {
+                    pass.set_pipeline(&self.mesh_pipeline.pipeline_double_sided);
+                    pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                    for (model_bg, tex_bg, vb, ib, count) in &double_sided_draws {
                         pass.set_bind_group(1, *model_bg, &[]);
                         pass.set_bind_group(2, *tex_bg, &[]);
                         pass.set_vertex_buffer(0, vb.slice(..));
