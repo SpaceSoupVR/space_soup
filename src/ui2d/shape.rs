@@ -107,3 +107,4 @@ impl Shape {
         positions
     }
 }
+

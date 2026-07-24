@@ -13,9 +13,6 @@ impl MeshPipeline {
         Self::new_with_front_face(device, format, camera_layout, FrontFace::Ccw)
     }
 
-    /// See `SolidPipeline::new_mirror` — a reflected camera flips winding
-    /// order, so rendering into the mirror's offscreen texture needs this
-    /// variant instead, or textured meshes would cull inside-out there.
     pub fn new_mirror(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
         Self::new_with_front_face(device, format, camera_layout, FrontFace::Cw)
     }
@@ -414,3 +411,4 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         lights_block = wgsl_lights_block(0, 1)
     )
 }
+

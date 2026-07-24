@@ -1,9 +1,3 @@
-//! Shared rendering for two otherwise-unrelated effects — particle
-//! billboards and laser beams — that happen to want the exact same thing:
-//! simple, unlit, alpha-blended, depth-write-disabled quads with a soft
-//! radial falloff. One pipeline, one vertex type, one draw call per frame,
-//! same "list of structs -> one flat buffer -> one draw call" shape
-//! `cuboid.rs`'s `build_solid_mesh`/`build_wire_mesh` already use.
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
@@ -11,16 +5,12 @@ use wgpu::*;
 
 use super::Color3;
 
-/// One particle instance for this frame — a camera-facing quad centered at
-/// `position`, `size` wide/tall, colored/faded by `color`.
 pub struct Particle {
     pub position: Vec3,
     pub size: f32,
     pub color: Color3,
 }
 
-/// A laser beam for this frame, from `start` (the emitter) to `end` (wherever
-/// the server's PhysX raycast said it terminates).
 pub struct Beam {
     pub start: Vec3,
     pub end: Vec3,
@@ -33,10 +23,6 @@ pub struct Beam {
 pub struct ParticleVertex {
     pub position: [f32; 3],
     pub color: [f32; 4],
-    /// Local quad-space coordinate, `(±1, ±1)` at the corners — the fragment
-    /// shader turns `length(uv)` into a soft radial falloff. A beam quad
-    /// only varies `uv.x` across its width and holds `uv.y` at 0, so the
-    /// exact same falloff formula gives a soft-edged strip instead of a dot.
     pub uv: [f32; 2],
 }
 
@@ -53,9 +39,6 @@ impl ParticleVertex {
     }
 }
 
-/// One particle's camera-facing quad — corners offset from `p.position`
-/// along the camera's own right/up basis vectors, not the particle's own
-/// rotation (there isn't one), so it always faces the viewer.
 pub fn build_particle_quad_one(
     p: &Particle,
     cam_right: Vec3,
@@ -80,10 +63,6 @@ pub fn build_particle_quad_one(
     (verts, vec![0, 1, 2, 0, 2, 3])
 }
 
-/// A beam's quad — width axis perpendicular to both the beam direction and
-/// the view direction, so it presents its full width toward the camera
-/// regardless of viewing angle. `uv.y` is 0 for every vertex (no along-beam
-/// falloff — solid brightness down the whole length), only `uv.x` varies.
 pub fn build_beam_quad_one(b: &Beam, view_dir: Vec3) -> (Vec<ParticleVertex>, Vec<u32>) {
     let axis = b.end - b.start;
     let width_axis = axis
@@ -109,9 +88,6 @@ pub fn build_beam_quad_one(b: &Beam, view_dir: Vec3) -> (Vec<ParticleVertex>, Ve
     (verts, vec![0, 1, 2, 0, 2, 3])
 }
 
-/// Concatenates every particle's and every beam's quad into one flat buffer,
-/// rebasing indices — exactly `build_solid_mesh`'s shape, just merging two
-/// source kinds instead of one.
 pub fn build_particle_mesh(
     particles: &[Particle],
     beams: &[Beam],
@@ -221,3 +197,4 @@ struct VOut {
 "#
     .to_string()
 }
+

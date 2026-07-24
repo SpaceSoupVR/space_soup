@@ -7,9 +7,6 @@ use wgpu::{BindGroupLayout, Device, Queue};
 use super::mesh::{create_texture_from_rgba, GltfMesh, MeshPrimitive};
 use super::panel::quad_geometry;
 
-/// Editor-only gizmo marker drawn over non-visual objects (lights, sound
-/// sources) so they're pickable/visible in the viewport despite having no
-/// mesh or solid cuboid of their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconKind {
     Light,
@@ -32,8 +29,6 @@ impl IconAssets {
         }
     }
 
-    /// Cheap clone — the GPU vertex/index/texture handles are shared; the
-    /// caller sets `.position`/`.rotation` on the returned value per instance.
     pub fn mesh_for(&self, kind: IconKind) -> GltfMesh {
         match kind {
             IconKind::Light => self.light.clone(),
@@ -42,8 +37,6 @@ impl IconAssets {
     }
 }
 
-/// Faces the icon toward the camera by matching its orientation exactly —
-/// simple and stable for a small marker, no gimbal issues to worry about.
 pub fn billboard_rotation(camera_rotation: Quat) -> Quat {
     camera_rotation
 }
@@ -163,3 +156,4 @@ fn draw_speaker() -> Vec<u8> {
     }
     buf
 }
+

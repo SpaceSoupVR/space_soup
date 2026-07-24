@@ -163,11 +163,6 @@ fn voxelize(tris: &[Triangle], voxel_size: f32) -> Vec<Cuboid> {
 
                 for yi in yi_start..=yi_end.min(ny - 1) {
                     let cy = min.y + (yi as f32 + 0.5) * voxel_size;
-                    // Voxel cuboids are solid geometry, not glass — force
-                    // opaque regardless of the source mesh's own alpha
-                    // (cutout/blend materials, e.g. foliage textures, are
-                    // common in source GLTFs and otherwise silently produce
-                    // see-through blocks).
                     let c = Color3(
                         linear_to_srgb_u8(color[0]),
                         linear_to_srgb_u8(color[1]),
@@ -397,3 +392,4 @@ fn box_corners(center: Vec3, half: Vec3) -> [Vec3; 8] {
         Vec3::new(p.x - h.x, p.y + h.y, p.z + h.z),
     ]
 }
+

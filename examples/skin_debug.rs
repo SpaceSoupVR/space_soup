@@ -85,7 +85,6 @@ fn main() {
             }
         }
 
-        // Replicate hierarchical_transforms + bind_head_height exactly.
         let mut hier: Vec<Mat4> = vec![Mat4::IDENTITY; joint_names.len()];
         for ji in 0..joint_names.len() {
             let (t, r, s) = joint_local_bind[ji];
@@ -121,3 +120,4 @@ fn main() {
         }
     }
 }
+

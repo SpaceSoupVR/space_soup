@@ -79,8 +79,6 @@ pub struct XrRenderer {
     wire_pipeline: WirePipeline,
     mesh_pipeline: MeshPipeline,
     skinned_mesh_pipeline: SkinnedMeshPipeline,
-    // Mirror-variant pipelines (flipped winding — see MeshPipeline::new_mirror)
-    // used only when rendering into the mirror's own offscreen texture.
     mirror_solid_pipeline: SolidPipeline,
     mirror_mesh_pipeline: MeshPipeline,
     mirror_pipeline: MirrorPipeline,
@@ -222,14 +220,6 @@ impl XrRenderer {
     pub fn mesh_texture_layout(&self) -> &wgpu::BindGroupLayout {
         &self.mesh_pipeline.texture_layout
     }
-    /// `SkinnedMeshPipeline` owns its own, separate texture bind group
-    /// layout (`skinned_mesh_texture_bgl`) from `MeshPipeline`'s
-    /// (`mesh_texture_bgl`) — wgpu treats bind group layouts as distinct by
-    /// identity, not by matching structure/contents, so a texture bind
-    /// group built against the wrong one is invalid for a skinned draw even
-    /// though the two layouts declare identical bindings. Skinned meshes
-    /// (e.g. the avatar) must load their textures against *this* layout,
-    /// not `mesh_texture_layout()`.
     pub fn skinned_mesh_texture_layout(&self) -> &wgpu::BindGroupLayout {
         &self.skinned_mesh_pipeline.texture_layout
     }
@@ -277,12 +267,6 @@ impl XrRenderer {
         let (_, eye_views) =
             session.locate_views(xr::ViewConfigurationType::PRIMARY_STEREO, time, stage)?;
 
-        // Shared camera-facing basis for every particle/beam quad this
-        // frame, computed once from the first eye's orientation rather than
-        // per-eye — the ~63mm IPD offset between eyes is imperceptible at
-        // typical particle-viewing distance, and this matches the existing
-        // "build once outside the eye loop" pattern solid/wire verts below
-        // already use.
         let head_rot = {
             let o = eye_views[0].pose.orientation;
             glam::Quat::from_xyzw(o.x, o.y, o.z, o.w)
@@ -348,10 +332,6 @@ impl XrRenderer {
             push_mesh_draws(instance, &mut mesh_draws, &mut skinned_draws);
         }
 
-        // Extra content that only shows up in the mirror's reflection, not
-        // the direct view — the local player's own avatar body, so you
-        // don't see your own untracked torso/legs hanging in your face, but
-        // it's still there for a mirror (or another player) to actually see.
         let mut mirror_only_mesh_draws: Vec<MeshDraw> = Vec::new();
         let mut mirror_only_skinned_draws: Vec<SkinnedDraw> = Vec::new();
         for instance in mirror_only_meshes {
@@ -361,8 +341,6 @@ impl XrRenderer {
             push_mesh_draws(instance, &mut mirror_only_mesh_draws, &mut mirror_only_skinned_draws);
         }
 
-        // Mirror quad geometry/model matrix don't depend on the eye — built
-        // once here, reused for both eyes' main-pass draw below.
         let mirror_quad = mirror.map(|m| {
             let (verts, idx) = mirror::build_mirror_quad(m.half_size.x, m.half_size.y);
             let vb = self
@@ -389,32 +367,16 @@ impl XrRenderer {
             let view = Camera::xr_view(ev.pose);
             let proj = Camera::xr_projection(ev.fov, 0.01, 1000.0);
 
-            // --- Mirror pass: render the whole scene again from the
-            // reflected viewpoint into this eye's offscreen mirror texture,
-            // *before* the main pass overwrites the shared camera uniform
-            // with the real (unreflected) view-projection it needs.
             if let Some(m) = &mirror {
                 let reflect = mirror::reflection_matrix(m.position, m.normal());
                 let mirror_view = view * reflect;
 
-                // Bend the near clip plane to exactly coincide with the
-                // mirror surface (Lengyel's oblique near-plane clipping),
-                // so anything on the wrong side — between the reflected
-                // camera and the mirror — structurally can't render into
-                // it, regardless of what geometry happens to be nearby.
                 let world_plane = mirror::world_plane_equation(m.position, m.normal());
                 let eye_plane = mirror::plane_to_eye_space(mirror_view.inverse(), world_plane);
                 let mirror_proj = mirror::oblique_near_clip(proj, eye_plane);
-                // gl_to_wgpu_ndc last, never before oblique_near_clip — see
-                // its doc comment for why the clip plane math still needs
-                // the original OpenGL-convention matrix as input.
                 let mirror_view_proj = Camera::gl_to_wgpu_ndc(mirror_proj) * mirror_view;
 
                 self.uniform_buf.upload(&self.wgpu_queue, mirror_view_proj);
-                // Same matrix, stashed for the mirror quad's own vertex
-                // shader to use later in this eye's main pass — that's what
-                // makes the reflection UV pixel-accurate instead of an
-                // approximation from this quad's real-camera screen position.
                 self.mirror_reflected_vp_uniform.upload(&self.wgpu_queue, mirror_view_proj);
 
                 let mut encoder = self.wgpu_device.create_command_encoder(
@@ -481,10 +443,6 @@ impl XrRenderer {
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
                     }
-                    // Wireframe boxes, particles, and laser beams are all
-                    // deliberately excluded from the mirror reflection — thin
-                    // unlit lines/soft alpha quads add little and this keeps
-                    // the extra pass cheaper.
                 }
                 self.wgpu_queue.submit(Some(encoder.finish()));
             }
@@ -647,9 +605,6 @@ unsafe fn build_wgpu_from_vulkan(
     let wgpu_instance = wgpu::Instance::from_hal::<hvk::Api>(shared_instance);
     let wgpu_adapter = wgpu_instance.create_adapter_from_hal(exposed);
 
-    // Use the adapter's actual max texture size rather than the downlevel
-    // default (4096) — Quest GPUs support much larger textures, and clamping
-    // to 4096 silently breaks any asset with a texture just over that size.
     let adapter_limits = wgpu_adapter.limits();
     let (device, queue) = wgpu_adapter.create_device_from_hal(
         open_device,
@@ -714,3 +669,4 @@ unsafe fn import_vk_image_as_wgpu(
         },
     )
 }
+

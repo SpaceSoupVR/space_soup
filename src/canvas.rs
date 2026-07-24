@@ -277,3 +277,4 @@ fn default_scene() -> Vec<Cuboid> {
         ),
     ]
 }
+

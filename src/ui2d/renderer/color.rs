@@ -205,3 +205,4 @@ impl GenericColorRenderer {
         render_pass.draw_indexed(0..self.indices, 0, 0..1);
     }
 }
+

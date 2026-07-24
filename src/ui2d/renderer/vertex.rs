@@ -262,3 +262,4 @@ impl<V: Vertex> ImageVertex<V> {
         ]
     }
 }
+

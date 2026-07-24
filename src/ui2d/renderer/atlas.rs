@@ -125,10 +125,6 @@ impl TextAtlas {
             .collect();
     }
 
-    pub fn clear(&mut self) {
-        self.fonts.clear();
-    }
-
     fn get_font(&mut self, font: &Arc<Font>) -> &mut ImageMap {
         let position = self
             .fonts
@@ -252,3 +248,4 @@ fn box_downsample(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: u
     }
     out
 }
+

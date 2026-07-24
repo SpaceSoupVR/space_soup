@@ -174,3 +174,4 @@ struct VOut { @builtin(position) clip: vec4<f32>, @location(0) col: vec4<f32> }
 }
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> { return in.col; }
 "#;
+

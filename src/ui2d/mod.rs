@@ -50,3 +50,4 @@ pub struct Area {
     pub offset: (f32, f32),
     pub bounds: Option<(f32, f32, f32, f32)>,
 }
+

@@ -10,10 +10,6 @@ pub struct Uniforms {
     pub view_proj: [[f32; 4]; 4],
 }
 
-/// Camera and lights share one bind group (binding 0 = camera, binding 1 =
-/// lights) rather than each getting their own group — wgpu's default
-/// `max_bind_groups` limit of 4 leaves no headroom for a 5th group once the
-/// skinned mesh pipeline's model/texture/joint groups are accounted for.
 pub struct UniformBuffer {
     pub buffer: Buffer,
     pub layout: BindGroupLayout,
@@ -84,3 +80,4 @@ impl UniformBuffer {
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&u));
     }
 }
+

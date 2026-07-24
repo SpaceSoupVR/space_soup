@@ -218,8 +218,6 @@ pub fn build_solid_mesh_one(c: &Cuboid) -> Option<(Vec<SolidVertex>, Vec<u32>)> 
 
     for (corners, normal) in &FACES {
         let face_base = verts.len() as u32;
-        // Real per-fragment lighting needs a world-space normal, not the raw
-        // object-space face normal — rotate it along with the cuboid.
         let world_normal = c.rotation * Vec3::from(*normal);
 
         for &ci in corners {
@@ -293,3 +291,4 @@ pub fn build_wire_mesh(cuboids: &[Cuboid]) -> (Vec<WireVertex>, Vec<u32>) {
     }
     (verts, indices)
 }
+

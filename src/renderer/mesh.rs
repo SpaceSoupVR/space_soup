@@ -53,6 +53,16 @@ impl SkinnedMeshVertex {
             attributes: &Self::ATTRIBS,
         }
     }
+
+    pub fn dominant_joint(&self) -> usize {
+        let mut best = 0;
+        for i in 1..4 {
+            if self.joint_weights[i] > self.joint_weights[best] {
+                best = i;
+            }
+        }
+        self.joint_ids[best] as usize
+    }
 }
 
 #[derive(Clone)]
@@ -65,33 +75,13 @@ pub struct SkinnedMeshPrimitive {
 }
 
 impl SkinnedMeshPrimitive {
-    /// This primitive's `indices`/`vertex_buffer` with any triangle dropped
-    /// whose *dominant* (highest-weight) joint influence, for any of its 3
-    /// vertices, falls in `excluded_joints` — e.g. for hiding a VR avatar's
-    /// own head from its first-person view. Reuses the existing vertex
-    /// buffer (only which triangles get drawn changes, not vertex data) and
-    /// builds a fresh, smaller index buffer. Returns `None` if every
-    /// triangle got excluded (e.g. a primitive that's entirely hair or eyes)
-    /// — a zero-length index buffer is still a *valid* wgpu resource, but
-    /// `wgpu::Buffer::slice` panics on one at draw time, so callers should
-    /// drop the primitive outright rather than try to draw nothing.
     fn excluding_joints(&self, device: &wgpu::Device, excluded_joints: &[usize]) -> Option<Self> {
-        let dominant_joint = |vi: u32| -> u32 {
-            let v = &self.vertices[vi as usize];
-            let mut best = 0;
-            for i in 1..4 {
-                if v.joint_weights[i] > v.joint_weights[best] {
-                    best = i;
-                }
-            }
-            v.joint_ids[best]
-        };
         let indices: Vec<u32> = self
             .indices
             .chunks_exact(3)
             .filter(|tri| {
                 !tri.iter()
-                    .any(|&vi| excluded_joints.contains(&(dominant_joint(vi) as usize)))
+                    .any(|&vi| excluded_joints.contains(&self.vertices[vi as usize].dominant_joint()))
             })
             .flatten()
             .copied()
@@ -114,11 +104,6 @@ impl SkinnedMeshPrimitive {
     }
 }
 
-// 64 was too tight for models/boy/boy.glb (78 joints: ~50 core skeleton +
-// hair/eye/secondary-motion bones bundled into the same skin) — joints past
-// the cap silently never get uploaded, so the shader reads a stale/clamped
-// matrix for their vertices. Sized with headroom above that, not exactly to
-// it, so the next asset with a few more accessory bones doesn't retrip this.
 pub const MAX_SKIN_JOINTS: usize = 96;
 
 #[derive(Clone)]
@@ -206,11 +191,6 @@ pub struct MeshPrimitive {
 pub struct LoadedTexture {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
-    // Never read directly after construction — kept alive here because
-    // `bind_group` references it (see `create_texture_from_rgba`). Dropping
-    // this while `bind_group` still exists left the bind group referencing
-    // a destroyed sampler, which is exactly the "BindGroup ... is invalid"
-    // wgpu validation error seen at every draw call using this texture.
     _sampler: wgpu::Sampler,
     pub bind_group: wgpu::BindGroup,
 }
@@ -287,13 +267,6 @@ impl GltfMesh {
         m
     }
 
-    /// Like `clone_with_independent_skin`, but additionally drops any
-    /// triangle whose dominant joint influence (for any of its 3 vertices)
-    /// is in `excluded_joints` — e.g. hiding a VR avatar's own head from its
-    /// first-person view by omitting head/hair/eye geometry outright, rather
-    /// than a shader or joint-transform trick (which don't fully hide
-    /// vertices that blend some weight onto a neighboring, non-excluded
-    /// joint for smooth deformation at the seam).
     pub fn clone_with_independent_skin_excluding_joints(
         &self,
         device: &wgpu::Device,
@@ -319,100 +292,114 @@ impl GltfMesh {
         let (doc, buffers, images) =
             gltf::import(path).with_context(|| format!("failed to open {}", path.display()))?;
 
-        let mut skin_opt: Option<GltfSkin> = None;
+        let all_nodes: Vec<gltf::Node> = doc.nodes().collect();
+        let mut parent_of_node: HashMap<usize, usize> = HashMap::new();
+        for node in doc.nodes() {
+            for child in node.children() {
+                parent_of_node.insert(child.index(), node.index());
+            }
+        }
+
+        let mut joint_names: Vec<String> = Vec::new();
+        let mut inv_bind_mats: Vec<Mat4> = Vec::new();
+        let mut joint_parents: Vec<Option<usize>> = Vec::new();
+        let mut joint_local_bind: Vec<(Vec3, Quat, Vec3)> = Vec::new();
+        let mut node_index_to_joint: HashMap<usize, usize> = HashMap::new();
+
         for skin in doc.skins() {
             let joint_nodes: Vec<gltf::Node> = skin.joints().collect();
-            let joint_names: Vec<String> = joint_nodes
-                .iter()
-                .map(|j| j.name().unwrap_or("").to_string())
-                .collect();
+            let start = joint_names.len();
+            joint_names.extend(joint_nodes.iter().map(|j| j.name().unwrap_or("").to_string()));
+            for (ji, node) in joint_nodes.iter().enumerate() {
+                node_index_to_joint.insert(node.index(), start + ji);
+            }
 
-            let joint_count = joint_names.len();
-            let inv_bind_mats: Vec<Mat4> = if let Some(acc) = skin.inverse_bind_matrices() {
+            let skin_inv_binds: Vec<Mat4> = if let Some(acc) = skin.inverse_bind_matrices() {
                 let view = acc.view().context("skin ibm: no buffer view")?;
                 let buf_data: &[u8] = &buffers[view.buffer().index()];
-                let start = view.offset() + acc.offset();
+                let bstart = view.offset() + acc.offset();
                 let stride = view.stride().unwrap_or(64);
                 (0..acc.count())
                     .map(|i| {
-                        let off = start + i * stride;
+                        let off = bstart + i * stride;
                         let arr: [f32; 16] = bytemuck::pod_read_unaligned(&buf_data[off..off + 64]);
                         Mat4::from_cols_array(&arr)
                     })
                     .collect()
             } else {
-                vec![Mat4::IDENTITY; joint_count]
+                vec![Mat4::IDENTITY; joint_nodes.len()]
             };
+            inv_bind_mats.extend(skin_inv_binds);
 
-            let node_index_to_joint: HashMap<usize, usize> = joint_nodes
-                .iter()
-                .enumerate()
-                .map(|(ji, node)| (node.index(), ji))
-                .collect();
-            let mut parent_of_node: HashMap<usize, usize> = HashMap::new();
-            for node in doc.nodes() {
-                for child in node.children() {
-                    parent_of_node.insert(child.index(), node.index());
+            for node in &joint_nodes {
+                let (parent_joint, t, r, s) =
+                    ancestor_joint_and_baked_local(node, &all_nodes, &parent_of_node, &node_index_to_joint);
+                joint_parents.push(parent_joint);
+                joint_local_bind.push((t, r, s));
+            }
+            break;
+        }
+
+        let mut orphan_target_nodes: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for anim in doc.animations() {
+            for channel in anim.channels() {
+                let node_idx = channel.target().node().index();
+                if !node_index_to_joint.contains_key(&node_idx) {
+                    orphan_target_nodes.insert(node_idx);
                 }
             }
-            let joint_parents: Vec<Option<usize>> = joint_nodes
-                .iter()
-                .map(|node| {
-                    parent_of_node
-                        .get(&node.index())
-                        .and_then(|pidx| node_index_to_joint.get(pidx).copied())
-                })
-                .collect();
+        }
 
-            // A joint whose scene-graph parent isn't itself a joint (e.g. a
-            // Blender/Mixamo-style "Armature" wrapper node sitting above the
-            // actual skeleton root) has its parent's transform silently
-            // dropped by `hierarchical_transforms`, which only ever walks
-            // joint-to-joint relationships and treats a joint with no joint
-            // parent as if it had no ancestor transform at all. That wrapper
-            // commonly carries exactly the unit-scale correction the rig
-            // needs (e.g. centimeters -> meters), so skipping it produces a
-            // skeleton that's off by whatever that scale was — bake every
-            // non-joint ancestor's transform into that root joint's own
-            // bind transform instead, so it's accounted for exactly once.
-            let all_nodes: Vec<gltf::Node> = doc.nodes().collect();
-            let joint_local_bind: Vec<(Vec3, Quat, Vec3)> = joint_nodes
-                .iter()
-                .enumerate()
-                .map(|(ji, node)| {
-                    let (t, r, s) = node.transform().decomposed();
-                    let mut local = Mat4::from_scale_rotation_translation(
-                        Vec3::from(s),
-                        Quat::from_array(r),
-                        Vec3::from(t),
-                    );
-
-                    if joint_parents[ji].is_none() {
-                        let mut ancestor_idx = parent_of_node.get(&node.index()).copied();
-                        let mut ancestor_mat = Mat4::IDENTITY;
-                        while let Some(idx) = ancestor_idx {
-                            if node_index_to_joint.contains_key(&idx) {
-                                break;
-                            }
-                            let (at, ar, asc) = all_nodes[idx].transform().decomposed();
-                            let anc_local = Mat4::from_scale_rotation_translation(
-                                Vec3::from(asc),
-                                Quat::from_array(ar),
-                                Vec3::from(at),
-                            );
-                            ancestor_mat = anc_local * ancestor_mat;
-                            ancestor_idx = parent_of_node.get(&idx).copied();
-                        }
-                        local = ancestor_mat * local;
+        if !orphan_target_nodes.is_empty() {
+            let mut synthetic_nodes = orphan_target_nodes.clone();
+            for node in &all_nodes {
+                if node.mesh().is_none() || node.skin().is_some() {
+                    continue;
+                }
+                let mut idx = Some(node.index());
+                let mut covered = false;
+                while let Some(i) = idx {
+                    if node_index_to_joint.contains_key(&i) || synthetic_nodes.contains(&i) {
+                        covered = true;
+                        break;
                     }
+                    idx = parent_of_node.get(&i).copied();
+                }
+                if !covered {
+                    synthetic_nodes.insert(node.index());
+                }
+            }
 
-                    let (s2, r2, t2) = local.to_scale_rotation_translation();
-                    (t2, r2, s2)
-                })
-                .collect();
+            for &node_idx in &synthetic_nodes {
+                let node = &all_nodes[node_idx];
+                let ji = joint_names.len();
+                joint_names.push(node.name().unwrap_or("").to_string());
+                inv_bind_mats.push(Mat4::IDENTITY);
+                node_index_to_joint.insert(node_idx, ji);
+            }
+            for &node_idx in &synthetic_nodes {
+                let node = &all_nodes[node_idx];
+                let (parent_joint, t, r, s) =
+                    ancestor_joint_and_baked_local(node, &all_nodes, &parent_of_node, &node_index_to_joint);
+                joint_parents.push(parent_joint);
+                joint_local_bind.push((t, r, s));
+            }
 
-            let animations: Vec<GltfAnimationPose> = doc
-                .animations()
+            if joint_names.len() > MAX_SKIN_JOINTS {
+                log::warn!(
+                    "GltfMesh: {} has {} joints (real + synthetic), exceeding MAX_SKIN_JOINTS={} -- extra joints will not animate correctly",
+                    path.display(),
+                    joint_names.len(),
+                    MAX_SKIN_JOINTS,
+                );
+            }
+        }
+
+        let joint_count = joint_names.len();
+        let animations: Vec<GltfAnimationPose> = if joint_count == 0 {
+            Vec::new()
+        } else {
+            doc.animations()
                 .map(|anim| {
                     let mut partial: Vec<Option<(Option<Vec3>, Option<Quat>, Option<Vec3>)>> =
                         vec![None; joint_count];
@@ -460,39 +447,8 @@ impl GltfMesh {
                         joint_transforms,
                     }
                 })
-                .collect();
-
-            log::info!(
-                "GltfMesh: skin has {} joints: {:?}, animation clips: {:?}",
-                joint_count,
-                &joint_names,
-                animations
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .collect::<Vec<_>>(),
-            );
-
-            let joint_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("skin_joint_buf"),
-                size: (MAX_SKIN_JOINTS * 64) as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            skin_opt = Some(GltfSkin {
-                joint_names,
-                inv_bind_mats,
-                joint_parents,
-                joint_local_bind,
-                animations,
-                joint_buffer,
-                joint_bind_group: None,
-                primitives: Vec::new(),
-            });
-            break;
-        }
-
-        let is_skinned = skin_opt.is_some();
+                .collect()
+        };
 
         let mut static_prims: Vec<MeshPrimitive> = Vec::new();
         let mut skinned_prims: Vec<SkinnedMeshPrimitive> = Vec::new();
@@ -502,12 +458,14 @@ impl GltfMesh {
                 collect_node(
                     &node,
                     Mat4::IDENTITY,
+                    None,
                     &buffers,
                     &images,
                     device,
                     queue,
                     layout,
-                    is_skinned,
+                    false,
+                    &node_index_to_joint,
                     &mut static_prims,
                     &mut skinned_prims,
                 );
@@ -519,30 +477,37 @@ impl GltfMesh {
         }
 
         log::info!(
-            "GltfMesh: loaded {} static + {} skinned primitives from {}",
+            "GltfMesh: loaded {} static + {} skinned primitives from {} ({} joints: {:?})",
             static_prims.len(),
             skinned_prims.len(),
             path.display(),
+            joint_count,
+            &joint_names,
         );
 
-        let bounding_radius = static_prims
-            .iter()
-            .flat_map(|p| p.vertices.iter())
-            .map(|v| Vec3::from(v.position).length())
-            .fold(0.0_f32, f32::max);
+        let mut skin_opt: Option<GltfSkin> = if joint_count == 0 {
+            None
+        } else {
+            let joint_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("skin_joint_buf"),
+                size: (MAX_SKIN_JOINTS * 64) as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            Some(GltfSkin {
+                joint_names,
+                inv_bind_mats,
+                joint_parents,
+                joint_local_bind,
+                animations,
+                joint_buffer,
+                joint_bind_group: None,
+                primitives: Vec::new(),
+            })
+        };
 
-        if let Some(skin) = &mut skin_opt {
+        let bounding_radius = if let Some(skin) = &mut skin_opt {
             skin.primitives = skinned_prims;
-            // Nothing drives update_joint_matrices for a mesh unless some
-            // other system (avatar/hand rigging) explicitly does so every
-            // frame — a plain decorative skinned object dropped into a
-            // scene otherwise never gets one, leaving this GPU buffer at
-            // whatever create_buffer initialized it to (effectively zero
-            // matrices). The vertex shader's weighted joint sum then
-            // collapses every vertex to the origin, rendering nothing at
-            // all. Seed it with the bind pose so a skinned mesh renders
-            // correctly by default; anything that does drive it per-frame
-            // overwrites this immediately, so this is a pure fallback.
             let bind_transforms = skin.hierarchical_transforms(&skin.joint_local_bind);
             let bind_pose_mats: Vec<Mat4> = skin
                 .inv_bind_mats
@@ -551,7 +516,32 @@ impl GltfMesh {
                 .map(|(ji, inv_bind)| bind_transforms[ji] * *inv_bind)
                 .collect();
             skin.update_joint_matrices(queue, &bind_pose_mats);
-        }
+
+            let skinned_radius = skin
+                .primitives
+                .iter()
+                .flat_map(|p| p.vertices.iter())
+                .map(|v| {
+                    let world = bind_pose_mats
+                        .get(v.dominant_joint())
+                        .copied()
+                        .unwrap_or(Mat4::IDENTITY);
+                    world.transform_point3(Vec3::from(v.position)).length()
+                })
+                .fold(0.0_f32, f32::max);
+            let static_radius = static_prims
+                .iter()
+                .flat_map(|p| p.vertices.iter())
+                .map(|v| Vec3::from(v.position).length())
+                .fold(0.0_f32, f32::max);
+            skinned_radius.max(static_radius)
+        } else {
+            static_prims
+                .iter()
+                .flat_map(|p| p.vertices.iter())
+                .map(|v| Vec3::from(v.position).length())
+                .fold(0.0_f32, f32::max)
+        };
 
         Ok(Self {
             primitives: static_prims,
@@ -574,18 +564,21 @@ impl GltfMesh {
 
         let mut static_prims: Vec<MeshPrimitive> = Vec::new();
         let mut skinned_prims: Vec<SkinnedMeshPrimitive> = Vec::new();
+        let empty_node_to_joint = HashMap::new();
 
         for scene in doc.scenes() {
             for node in scene.nodes() {
                 collect_node(
                     &node,
                     Mat4::IDENTITY,
+                    None,
                     &buffers,
                     &images,
                     device,
                     queue,
                     layout,
-                    false,
+                    true,
+                    &empty_node_to_joint,
                     &mut static_prims,
                     &mut skinned_prims,
                 );
@@ -619,21 +612,65 @@ impl GltfMesh {
     }
 }
 
+fn ancestor_joint_and_baked_local(
+    node: &gltf::Node,
+    all_nodes: &[gltf::Node],
+    parent_of_node: &HashMap<usize, usize>,
+    joint_of_node: &HashMap<usize, usize>,
+) -> (Option<usize>, Vec3, Quat, Vec3) {
+    let (t, r, s) = node.transform().decomposed();
+    let mut local =
+        Mat4::from_scale_rotation_translation(Vec3::from(s), Quat::from_array(r), Vec3::from(t));
+
+    let parent_joint = parent_of_node
+        .get(&node.index())
+        .and_then(|pidx| joint_of_node.get(pidx).copied());
+
+    if parent_joint.is_none() {
+        let mut ancestor_idx = parent_of_node.get(&node.index()).copied();
+        let mut ancestor_mat = Mat4::IDENTITY;
+        while let Some(idx) = ancestor_idx {
+            if joint_of_node.contains_key(&idx) {
+                break;
+            }
+            let (at, ar, asc) = all_nodes[idx].transform().decomposed();
+            let anc_local = Mat4::from_scale_rotation_translation(
+                Vec3::from(asc),
+                Quat::from_array(ar),
+                Vec3::from(at),
+            );
+            ancestor_mat = anc_local * ancestor_mat;
+            ancestor_idx = parent_of_node.get(&idx).copied();
+        }
+        local = ancestor_mat * local;
+    }
+
+    let (s2, r2, t2) = local.to_scale_rotation_translation();
+    (parent_joint, t2, r2, s2)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_node(
     node: &gltf::Node,
     parent: Mat4,
+    current_joint: Option<usize>,
     buffers: &[gltf::buffer::Data],
     images: &[gltf::image::Data],
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
-    skinned: bool,
+    force_static: bool,
+    node_to_joint: &HashMap<usize, usize>,
     static_out: &mut Vec<MeshPrimitive>,
     skinned_out: &mut Vec<SkinnedMeshPrimitive>,
 ) {
     let local = Mat4::from_cols_array_2d(&node.transform().matrix());
     let world = parent * local;
+
+    let this_joint = if force_static { None } else { node_to_joint.get(&node.index()).copied() };
+    let real_skin = !force_static && node.skin().is_some();
+    let synthetic_joint = if real_skin { None } else { this_joint.or(current_joint) };
+    let bake = !(real_skin || synthetic_joint.is_some());
 
     if let Some(mesh) = node.mesh() {
         for prim in mesh.primitives() {
@@ -641,10 +678,10 @@ fn collect_node(
 
             let positions: Vec<Vec3> = match reader.read_positions() {
                 Some(p) => {
-                    if skinned {
-                        p.map(Vec3::from).collect()
-                    } else {
+                    if bake {
                         p.map(|v| world.transform_point3(Vec3::from(v))).collect()
+                    } else {
+                        p.map(Vec3::from).collect()
                     }
                 }
                 None => continue,
@@ -655,11 +692,11 @@ fn collect_node(
 
             let normals: Vec<Vec3> = match reader.read_normals() {
                 Some(n) => {
-                    if skinned {
-                        n.map(|v| Vec3::from(v).normalize_or_zero()).collect()
-                    } else {
+                    if bake {
                         n.map(|v| world.transform_vector3(Vec3::from(v)).normalize_or_zero())
                             .collect()
+                    } else {
+                        n.map(|v| Vec3::from(v).normalize_or_zero()).collect()
                     }
                 }
                 None => vec![Vec3::Y; positions.len()],
@@ -678,50 +715,7 @@ fn collect_node(
             let texture = load_primitive_texture(&prim, images, device, queue, layout);
             let texture = Arc::new(texture);
 
-            if skinned {
-                let joint_ids: Vec<[u32; 4]> = match reader.read_joints(0) {
-                    Some(gltf::mesh::util::ReadJoints::U8(it)) => it
-                        .map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
-                        .collect(),
-                    Some(gltf::mesh::util::ReadJoints::U16(it)) => it
-                        .map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
-                        .collect(),
-                    None => vec![[0, 0, 0, 0]; positions.len()],
-                };
-
-                let weights: Vec<[f32; 4]> = match reader.read_weights(0) {
-                    Some(w) => w.into_f32().collect(),
-                    None => vec![[1.0, 0.0, 0.0, 0.0]; positions.len()],
-                };
-
-                let vertices: Vec<SkinnedMeshVertex> = (0..positions.len())
-                    .map(|i| SkinnedMeshVertex {
-                        position: positions[i].into(),
-                        normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
-                        uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
-                        joint_ids: joint_ids.get(i).copied().unwrap_or([0; 4]),
-                        joint_weights: weights.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]),
-                    })
-                    .collect();
-
-                let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("skinned_mesh_vb"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("skinned_mesh_ib"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-                skinned_out.push(SkinnedMeshPrimitive {
-                    vertices,
-                    indices,
-                    texture,
-                    vertex_buffer,
-                    index_buffer,
-                });
-            } else {
+            if bake {
                 let vertices: Vec<MeshVertex> = (0..positions.len())
                     .map(|i| MeshVertex {
                         position: positions[i].into(),
@@ -747,20 +741,74 @@ fn collect_node(
                     vertex_buffer,
                     index_buffer,
                 });
+            } else {
+                let (joint_ids, joint_weights): (Vec<[u32; 4]>, Vec<[f32; 4]>) = if real_skin {
+                    let joint_ids = match reader.read_joints(0) {
+                        Some(gltf::mesh::util::ReadJoints::U8(it)) => it
+                            .map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
+                            .collect(),
+                        Some(gltf::mesh::util::ReadJoints::U16(it)) => it
+                            .map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
+                            .collect(),
+                        None => vec![[0, 0, 0, 0]; positions.len()],
+                    };
+                    let joint_weights = match reader.read_weights(0) {
+                        Some(w) => w.into_f32().collect(),
+                        None => vec![[1.0, 0.0, 0.0, 0.0]; positions.len()],
+                    };
+                    (joint_ids, joint_weights)
+                } else {
+                    let ji = synthetic_joint.unwrap_or(0) as u32;
+                    (
+                        vec![[ji, 0, 0, 0]; positions.len()],
+                        vec![[1.0, 0.0, 0.0, 0.0]; positions.len()],
+                    )
+                };
+
+                let vertices: Vec<SkinnedMeshVertex> = (0..positions.len())
+                    .map(|i| SkinnedMeshVertex {
+                        position: positions[i].into(),
+                        normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
+                        uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                        joint_ids: joint_ids.get(i).copied().unwrap_or([0; 4]),
+                        joint_weights: joint_weights.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]),
+                    })
+                    .collect();
+
+                let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("skinned_mesh_vb"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("skinned_mesh_ib"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                skinned_out.push(SkinnedMeshPrimitive {
+                    vertices,
+                    indices,
+                    texture,
+                    vertex_buffer,
+                    index_buffer,
+                });
             }
         }
     }
 
+    let child_parent = if this_joint.is_some() { Mat4::IDENTITY } else { world };
     for child in node.children() {
         collect_node(
             &child,
-            world,
+            child_parent,
+            synthetic_joint,
             buffers,
             images,
             device,
             queue,
             layout,
-            skinned,
+            force_static,
+            node_to_joint,
             static_out,
             skinned_out,
         );
@@ -776,13 +824,6 @@ fn load_primitive_texture(
 ) -> LoadedTexture {
     let material = prim.material();
     let pbr = material.pbr_metallic_roughness();
-    // Every mesh draws through one blend-enabled pipeline (see
-    // mesh_pipeline.rs), so a material's alpha always affects the render
-    // regardless of the glTF spec's alphaMode. Per spec, Opaque materials
-    // must ignore alpha entirely — exporters routinely leave stray alpha
-    // data in a texture (packed channels, editor artifacts) even when the
-    // material is Opaque, which otherwise silently renders solid geometry
-    // as see-through. Only an explicit Blend material's alpha is real.
     let force_opaque = material.alpha_mode() != gltf::material::AlphaMode::Blend;
 
     if let Some(info) = pbr.base_color_texture() {
@@ -932,3 +973,186 @@ pub(crate) fn create_texture_from_rgba(
         bind_group,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    }
+
+    #[test]
+    fn ancestor_bake_handles_m4a1_wrapper_chain() {
+        let path = workspace_root().join("game/models/m4a1.glb");
+        let (doc, _buffers, _images) = gltf::import(&path).expect("m4a1.glb should load");
+
+        let all_nodes: Vec<gltf::Node> = doc.nodes().collect();
+        let mut parent_of_node: HashMap<usize, usize> = HashMap::new();
+        for node in doc.nodes() {
+            for child in node.children() {
+                parent_of_node.insert(child.index(), node.index());
+            }
+        }
+
+        let charging_handle = doc
+            .nodes()
+            .find(|n| n.name() == Some("m4a1 charging handle_10"))
+            .expect("m4a1.glb should have a node named 'm4a1 charging handle_10'");
+
+        let joint_of_node: HashMap<usize, usize> = HashMap::new();
+        let (parent_joint, t2, r2, s2) = ancestor_joint_and_baked_local(
+            &charging_handle,
+            &all_nodes,
+            &parent_of_node,
+            &joint_of_node,
+        );
+        assert_eq!(parent_joint, None, "no ancestor of this node is itself a joint");
+
+        let (t, r, s) = charging_handle.transform().decomposed();
+        let mut expected =
+            Mat4::from_scale_rotation_translation(Vec3::from(s), Quat::from_array(r), Vec3::from(t));
+        let mut idx = parent_of_node.get(&charging_handle.index()).copied();
+        let mut acc = Mat4::IDENTITY;
+        while let Some(i) = idx {
+            let (at, ar, asc) = all_nodes[i].transform().decomposed();
+            acc = Mat4::from_scale_rotation_translation(Vec3::from(asc), Quat::from_array(ar), Vec3::from(at)) * acc;
+            idx = parent_of_node.get(&i).copied();
+        }
+        expected = acc * expected;
+        let (es, er, et) = expected.to_scale_rotation_translation();
+        assert!(et.distance(t2) < 1e-4, "expected translation {et:?}, got {t2:?}");
+        assert!(es.distance(s2) < 1e-4, "expected scale {es:?}, got {s2:?}");
+        assert!(er.angle_between(r2) < 1e-3, "expected rotation {er:?}, got {r2:?}");
+    }
+
+    #[test]
+    fn m4a1_orphan_node_promotion_end_to_end() {
+        let Some((device, queue, layout)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+
+        let original_path = workspace_root().join("game/models/m4a1.glb");
+
+        let baseline = GltfMesh::load(&device, &queue, &layout, &original_path)
+            .expect("baseline m4a1.glb should load");
+        assert!(baseline.skin.is_none(), "file with no orphan animations must stay unskinned");
+        assert!(!baseline.primitives.is_empty(), "baseline should have static primitives");
+        assert!(baseline.bounding_radius > 0.0);
+
+        let test_path = std::env::temp_dir().join(format!("m4a1_test_{}.glb", std::process::id()));
+        std::fs::copy(&original_path, &test_path).expect("copy fixture");
+
+        let script_dir = workspace_root().join("scene_editor_web");
+        let py = format!(
+            "import sys; sys.path.insert(0, {script_dir:?}); from gltf_animation import write_joint_animation_clip; \
+             from pathlib import Path; \
+             write_joint_animation_clip(Path({test_path:?}), 'charging_handle_pull', {{'m4a1 charging handle_10': [ \
+             {{'t': 0.0, 'position': [0,0,0], 'rotation': [0,0,0,1], 'scale': [1,1,1]}}, \
+             {{'t': 0.3, 'position': [0,0,-0.05], 'rotation': [0,0,0,1], 'scale': [1,1,1]}}]}})",
+        );
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(&py)
+            .status()
+            .expect("run python3 to write the test clip");
+        assert!(status.success(), "write_joint_animation_clip failed");
+
+        let animated = GltfMesh::load(&device, &queue, &layout, &test_path).expect("animated m4a1 should load");
+        std::fs::remove_file(&test_path).ok();
+        let bin_glob = test_path.with_file_name(format!(
+            "{}_anim_charging_handle_pull.bin",
+            test_path.file_stem().unwrap().to_string_lossy()
+        ));
+        std::fs::remove_file(&bin_glob).ok();
+
+        assert!(animated.primitives.is_empty(), "all geometry must be routed through the skin pipeline once any node is promoted");
+        let skin = animated.skin.expect("orphan animation should produce a skin");
+        assert!(skin.joint_names.len() >= 19, "expected at least the 19 named m4a1 parts as joints, got {}", skin.joint_names.len());
+        assert!(!skin.primitives.is_empty(), "no geometry should be silently dropped");
+        assert!(animated.bounding_radius > 0.0, "bounding_radius must not regress to 0 for a fully-skinned mesh");
+
+        let ji = skin
+            .joint_names
+            .iter()
+            .position(|n| n == "m4a1 charging handle_10")
+            .expect("charging handle should be a joint");
+        let pose = &skin.animations[0];
+        assert_eq!(pose.name, "charging_handle_pull");
+        let (t, _r, _s) = pose.joint_transforms[ji].expect("charging handle should have a sampled pose");
+        assert!(t.distance(Vec3::ZERO) < 1e-4, "expected first-keyframe position ~0, got {t:?}");
+
+        let filler_count = pose.joint_transforms.iter().filter(|p| p.is_none()).count();
+        assert!(filler_count >= 18, "every other joint should be an inert filler with no animation entry, got {filler_count} inert of {}", skin.joint_names.len());
+    }
+
+    fn headless_gpu() -> Option<(wgpu::Device, wgpu::Queue, wgpu::BindGroupLayout)> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .ok()?;
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("test_mesh_texture_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        Some((device, queue, layout))
+    }
+
+    #[test]
+    fn real_skinned_fixtures_still_load_correctly() {
+        let Some((device, queue, layout)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        let root = workspace_root();
+        for rel in [
+            "game/models/left_hand.glb",
+            "game/models/right_hand.glb",
+            "game/models/boy/boy.glb",
+            "game/models/ar15/870022.gltf",
+        ] {
+            let path = root.join(rel);
+            let mesh = GltfMesh::load(&device, &queue, &layout, &path)
+                .unwrap_or_else(|e| panic!("{rel} should still load: {e}"));
+            let skin = mesh.skin.as_ref().unwrap_or_else(|| panic!("{rel} should be skinned"));
+            assert!(!skin.joint_names.is_empty(), "{rel}: expected real joints");
+            assert!(!skin.primitives.is_empty(), "{rel}: expected skinned primitives, none dropped");
+            assert!(mesh.primitives.is_empty(), "{rel}: fully-skinned fixture should have zero static primitives");
+            assert!(mesh.bounding_radius > 0.0, "{rel}: bounding_radius should not be zero");
+            println!(
+                "{rel}: {} joints, {} skinned primitives, radius {:.3}",
+                skin.joint_names.len(),
+                skin.primitives.len(),
+                mesh.bounding_radius
+            );
+        }
+    }
+}
+

@@ -4,8 +4,6 @@ use wgpu::*;
 
 use super::Color3;
 
-/// Matches the fixed-size `array<Light, MAX_LIGHTS>` declared in the mesh/solid
-/// fragment shaders — keep these in sync.
 pub const MAX_LIGHTS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,13 +12,9 @@ pub enum LightKind {
     Spot,
 }
 
-/// A light to be drawn this frame, in whatever world space `cuboids`/`meshes`
-/// are already in for this call — the renderer has no opinion on game logic,
-/// it just shades with what it's handed.
 #[derive(Debug, Clone, Copy)]
 pub struct Light {
     pub position: Vec3,
-    /// Aim direction for `Spot` lights; ignored for `Point`.
     pub direction: Vec3,
     pub kind: LightKind,
     pub color: Color3,
@@ -35,23 +29,16 @@ struct GpuLight {
     position: [f32; 4],
     direction: [f32; 4],
     color_intensity: [f32; 4],
-    /// x = range, y = cos(outer half-angle), z = kind (0 = point, 1 = spot), w unused.
     params: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct GpuLights {
-    /// x = active light count; yzw pad the field to the array's 16-byte stride.
     count: [u32; 4],
     lights: [GpuLight; MAX_LIGHTS],
 }
 
-/// Owns just the GPU buffer — the bind group itself lives alongside the
-/// camera uniform in `uniforms::UniformBuffer` (one shared group, two
-/// bindings), since wgpu's default `max_bind_groups` limit of 4 leaves no
-/// room for lights as their own group once model/texture/joint groups are
-/// already spoken for on the skinned mesh pipeline.
 pub struct LightsUniform {
     buffer: Buffer,
 }
@@ -96,10 +83,6 @@ impl LightsUniform {
     }
 }
 
-/// WGSL shared by every fragment shader that samples the lights uniform.
-/// `group_index`/`binding_index` must match wherever the pipeline binds the
-/// lights buffer (see `uniforms::UniformBuffer`, which shares one bind group
-/// between the camera and lights uniforms).
 pub fn wgsl_lights_block(group_index: u32, binding_index: u32) -> String {
     format!(
         r#"
@@ -147,3 +130,4 @@ fn shade(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
 "#
     )
 }
+

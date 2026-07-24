@@ -124,15 +124,10 @@ impl Renderer {
         self.mesh_pipeline.create_model_uniform(&self.device)
     }
 
-    /// Skinned meshes use their own pipeline/layouts (see `SkinnedMeshPipeline`), so a
-    /// `ModelUniform` created here is **not** interchangeable with `create_model_uniform()`'s —
-    /// use this one for any `GltfMesh` that has a `skin`.
     pub fn create_skinned_model_uniform(&self) -> mesh_pipeline::ModelUniform {
         self.skinned_mesh_pipeline.create_model_uniform(&self.device)
     }
 
-    /// Bind group layout needed to call `GltfMesh::create_skin_bind_group` on a loaded skinned
-    /// mesh before it can be drawn.
     pub fn skin_joint_layout(&self) -> &BindGroupLayout {
         &self.skinned_mesh_pipeline.skin_joint_layout
     }
@@ -451,3 +446,4 @@ impl Renderer {
         (tex, view)
     }
 }
+

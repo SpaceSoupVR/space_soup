@@ -185,3 +185,4 @@ impl Text {
             .fold(0.0, f32::max)
     }
 }
+
