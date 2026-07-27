@@ -134,7 +134,13 @@ impl WirePipeline {
 fn solid_shader() -> String {
     format!(
         r#"
-struct Uniforms {{ view_proj: mat4x4<f32> }}
+struct Uniforms {{
+    view_proj: mat4x4<f32>,
+    sun_view_proj: mat4x4<f32>,
+    spot_view_proj: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+    shadow_params: vec4<f32>,
+}}
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
 {lights_block}
@@ -158,7 +164,8 @@ struct VOut {{
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
-    let lit = shade(in.world_pos, n);
+    let view_dir = normalize(u.camera_pos.xyz - in.world_pos);
+    let lit = shade(in.world_pos, n, view_dir, u.sun_view_proj, u.spot_view_proj, u.shadow_params);
     return vec4<f32>(in.col.rgb * lit, in.col.a);
 }}
 "#,

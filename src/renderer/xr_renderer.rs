@@ -9,7 +9,8 @@ use crate::renderer::{
     mesh_pipeline::{MeshPipeline, ModelUniform, SkinnedMeshPipeline},
     mirror::{self, MirrorPipeline, MirrorSurface, MirrorTarget},
     pipeline::{SolidPipeline, WirePipeline},
-    uniforms::UniformBuffer,
+    shadow::ShadowMap,
+    uniforms::{ShadowUpload, UniformBuffer},
     MeshInstance,
 };
 use crate::xr::{VkContext, XrContext};
@@ -88,6 +89,10 @@ pub struct XrRenderer {
     mirror_reflected_vp_uniform: ModelUniform,
     uniform_buf: UniformBuffer,
     lights_uniform: LightsUniform,
+    // Owns the shadow depth texture the shared uniform bind group references.
+    // The XR shadow *pass* is a follow-up — sun shadows are disabled here
+    // (sun_params = 0), so the texture is bound but never sampled yet.
+    _shadow_map: ShadowMap,
     depth_view: wgpu::TextureView,
     eye_targets: Vec<[EyeTarget; 2]>,
 }
@@ -132,7 +137,14 @@ impl XrRenderer {
         let (wgpu_device, wgpu_queue) = unsafe { build_wgpu_from_vulkan(vk)? };
 
         let lights_uniform = LightsUniform::new(&wgpu_device);
-        let uniform_buf = UniformBuffer::new(&wgpu_device, &lights_uniform);
+        let shadow_map = ShadowMap::new(&wgpu_device);
+        let uniform_buf = UniformBuffer::new(
+            &wgpu_device,
+            &lights_uniform,
+            shadow_map.sun_depth_view(),
+            shadow_map.spot_depth_view(),
+            shadow_map.sampler(),
+        );
         let solid_pipeline = SolidPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let wire_pipeline = WirePipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let mesh_pipeline = MeshPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
@@ -203,6 +215,7 @@ impl XrRenderer {
             mirror_reflected_vp_uniform,
             uniform_buf,
             lights_uniform,
+            _shadow_map: shadow_map,
             depth_view,
             eye_targets,
         })
@@ -339,6 +352,8 @@ impl XrRenderer {
             let ev = &eye_views[eye];
             let view = Camera::xr_view(ev.pose);
             let proj = Camera::xr_projection(ev.fov, 0.01, 1000.0);
+            let eye_pos =
+                glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
 
             // --- Mirror pass: render the whole scene again from the
             // reflected viewpoint into this eye's offscreen mirror texture,
@@ -358,7 +373,12 @@ impl XrRenderer {
                 let mirror_proj = mirror::oblique_near_clip(proj, eye_plane);
                 let mirror_view_proj = mirror_proj * mirror_view;
 
-                self.uniform_buf.upload(&self.wgpu_queue, mirror_view_proj);
+                self.uniform_buf.upload(
+                    &self.wgpu_queue,
+                    mirror_view_proj,
+                    eye_pos,
+                    &ShadowUpload::disabled(),
+                );
                 // Same matrix, stashed for the mirror quad's own vertex
                 // shader to use later in this eye's main pass — that's what
                 // makes the reflection UV pixel-accurate instead of an
@@ -436,7 +456,12 @@ impl XrRenderer {
                 self.wgpu_queue.submit(Some(encoder.finish()));
             }
 
-            self.uniform_buf.upload(&self.wgpu_queue, proj * view);
+            self.uniform_buf.upload(
+                &self.wgpu_queue,
+                proj * view,
+                eye_pos,
+                &ShadowUpload::disabled(),
+            );
 
             let color_view = &self.eye_targets[image_index][eye].view;
             let mut encoder = self

@@ -5,8 +5,10 @@ pub mod lights;
 pub mod mesh;
 pub mod mesh_pipeline;
 pub mod mirror;
+pub mod offscreen;
 pub mod panel;
 pub mod pipeline;
+pub mod shadow;
 pub mod uniforms;
 
 #[cfg(target_os = "android")]
@@ -69,6 +71,7 @@ pub struct Renderer {
     skinned_mesh_pipeline: mesh_pipeline::SkinnedMeshPipeline,
     uniform_buf: uniforms::UniformBuffer,
     lights_uniform: LightsUniform,
+    shadow_map: shadow::ShadowMap,
     depth_texture: Texture,
     depth_view: TextureView,
     pub width: u32,
@@ -85,7 +88,14 @@ impl Renderer {
         height: u32,
     ) -> Self {
         let lights_uniform = LightsUniform::new(&device);
-        let uniform_buf = uniforms::UniformBuffer::new(&device, &lights_uniform);
+        let shadow_map = shadow::ShadowMap::new(&device);
+        let uniform_buf = uniforms::UniformBuffer::new(
+            &device,
+            &lights_uniform,
+            shadow_map.sun_depth_view(),
+            shadow_map.spot_depth_view(),
+            shadow_map.sampler(),
+        );
         let solid_pipeline = pipeline::SolidPipeline::new(&device, format, &uniform_buf.layout);
         let wire_pipeline = pipeline::WirePipeline::new(&device, format, &uniform_buf.layout);
         let mesh_pipeline = mesh_pipeline::MeshPipeline::new(&device, format, &uniform_buf.layout);
@@ -102,6 +112,7 @@ impl Renderer {
             skinned_mesh_pipeline,
             uniform_buf,
             lights_uniform,
+            shadow_map,
             depth_texture,
             depth_view,
             width,
@@ -265,7 +276,6 @@ impl Renderer {
         lights: &[lights::Light],
     ) {
         let vp = camera.projection() * camera.view();
-        self.uniform_buf.upload(&self.queue, vp);
         self.lights_uniform.upload(&self.queue, lights);
 
         let ((solid_verts, solid_indices), (wire_verts, wire_indices)) = self.bake_cuboids(cuboids);
@@ -352,11 +362,77 @@ impl Renderer {
             ));
         }
 
+        // --- Shadows: the directional light gets an orthographic sun shadow
+        // framed around the scene bounds; the first spot light is treated as
+        // the shadow-casting flashlight and gets a perspective shadow. Both
+        // fold their depth textures into the shared camera/lights group.
+        let (center, radius) = scene_bounds(&solid_verts, meshes);
+        let sun = lights.iter().find(|l| l.kind == LightKind::Directional);
+        let sun_vp = sun
+            .map(|l| shadow::directional_light_matrix(l.direction, center, radius))
+            .unwrap_or(glam::Mat4::IDENTITY);
+
+        let flashlight = lights
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.kind == LightKind::Spot);
+        let (spot_vp, flashlight_index) = match flashlight {
+            Some((idx, l)) => (
+                shadow::spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range),
+                idx as u32,
+            ),
+            None => (glam::Mat4::IDENTITY, 0),
+        };
+
+        let shadow_upload = uniforms::ShadowUpload {
+            sun_view_proj: sun_vp,
+            spot_view_proj: spot_vp,
+            sun_enabled: sun.is_some(),
+            spot_enabled: flashlight.is_some(),
+            flashlight_index,
+        };
+        self.uniform_buf
+            .upload(&self.queue, vp, camera.position, &shadow_upload);
+
+        // Mesh casters for the shadow passes reuse the main pass's model bind
+        // groups (skinned meshes are a follow-up); solid cuboids cast too.
+        let shadow_mesh_draws: Vec<shadow::ShadowMeshDraw> = draws
+            .iter()
+            .map(|(vb, ib, count, model_bg, _tex_bg)| (*vb, *ib, *count, *model_bg))
+            .collect();
+        let solid_shadow = if !solid_verts.is_empty() {
+            Some((&solid_vb, &solid_ib, solid_indices.len() as u32))
+        } else {
+            None
+        };
+
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+
+        // Depth-only shadow passes, recorded before the main pass samples them.
+        if shadow_upload.sun_enabled {
+            self.shadow_map
+                .upload_light(&self.queue, shadow::ShadowKind::Sun, sun_vp);
+            self.shadow_map.record(
+                &mut encoder,
+                shadow::ShadowKind::Sun,
+                solid_shadow,
+                &shadow_mesh_draws,
+            );
+        }
+        if shadow_upload.spot_enabled {
+            self.shadow_map
+                .upload_light(&self.queue, shadow::ShadowKind::Spot, spot_vp);
+            self.shadow_map.record(
+                &mut encoder,
+                shadow::ShadowKind::Spot,
+                solid_shadow,
+                &shadow_mesh_draws,
+            );
+        }
 
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -447,5 +523,220 @@ impl Renderer {
         });
         let view = tex.create_view(&TextureViewDescriptor::default());
         (tex, view)
+    }
+}
+
+/// World-space bounding sphere (center, radius) of the shadow-casting content,
+/// used to frame the sun's orthographic shadow box. Falls back to a sensible
+/// default when there is nothing to bound.
+fn scene_bounds(solid_verts: &[SolidVertex], meshes: &[MeshInstance]) -> (glam::Vec3, f32) {
+    let mut min = glam::Vec3::splat(f32::INFINITY);
+    let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
+    let mut any = false;
+    for v in solid_verts {
+        let p = glam::Vec3::from(v.position);
+        min = min.min(p);
+        max = max.max(p);
+        any = true;
+    }
+    for m in meshes {
+        let t = m.mesh.model_matrix().to_scale_rotation_translation().2;
+        min = min.min(t);
+        max = max.max(t);
+        any = true;
+    }
+    if !any {
+        return (glam::Vec3::ZERO, 20.0);
+    }
+    let center = (min + max) * 0.5;
+    let radius = (max - center).length().max(5.0);
+    (center, radius)
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod gpu_smoke {
+    use super::*;
+    use glam::{Quat, Vec3};
+
+    const DIM: u32 = 256;
+
+    /// Requests a headless device, or returns None (no adapter) so tests skip
+    /// gracefully in an environment without a GPU.
+    fn headless_device() -> Option<(Device, Queue)> {
+        let instance = Instance::new(&InstanceDescriptor::default());
+        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        pollster::block_on(adapter.request_device(&DeviceDescriptor {
+            required_features: Features::empty(),
+            required_limits: Limits::default(),
+            ..Default::default()
+        }))
+        .ok()
+    }
+
+    /// Builds every render pipeline on a real adapter, which forces naga to
+    /// validate all WGSL shader strings — they are compiled at pipeline
+    /// creation time, not by `cargo build`, so this is the only pure-Rust way
+    /// to catch a shader error. A validation error scope makes any failure
+    /// deterministic.
+    #[test]
+    fn shaders_and_pipelines_compile_on_gpu() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU adapter; skipping shader validation");
+            return;
+        };
+        let probe = device.clone();
+        probe.push_error_scope(ErrorFilter::Validation);
+        let _renderer = Renderer::from_device(device, queue, TextureFormat::Rgba8UnormSrgb, DIM, DIM);
+        if let Some(err) = pollster::block_on(probe.pop_error_scope()) {
+            panic!("shader/pipeline validation failed: {err:?}");
+        }
+    }
+
+    fn grey_cuboid(id: u64, pos: Vec3, half: Vec3) -> Cuboid {
+        Cuboid {
+            position: pos,
+            half_size: half,
+            rotation: Quat::IDENTITY,
+            color: Color3(200, 200, 200, 255),
+            wire_color: Color3(0, 0, 0, 255),
+            style: CuboidStyle::Solid,
+            id,
+        }
+    }
+
+    /// Renders `cuboids` under `lights` from a top-down camera and returns
+    /// (total luminance, count of "shadowed floor" pixels). A shadowed-floor
+    /// pixel is mid-brightness: darker than the fully-lit (clamped) floor but
+    /// clearly brighter than the dark background — i.e. floor lit by ambient
+    /// only. That count is a direct measure of shadow area, unconfounded by an
+    /// occluder's own (bright) pixels.
+    fn render_stats(renderer: &mut Renderer, cuboids: &[Cuboid], lights: &[Light]) -> (u64, u64) {
+        let mut cam = Camera::new(1.0);
+        cam.position = Vec3::new(8.0, 10.0, 8.0);
+        cam.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, (Vec3::ZERO - cam.position).normalize());
+        cam.far = 100.0;
+
+        let color = renderer.device.create_texture(&TextureDescriptor {
+            label: Some("readback_color"),
+            size: Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = color.create_view(&TextureViewDescriptor::default());
+        renderer.render_with_lights(&view, &cam, cuboids, &[], lights);
+
+        // DIM*4 = 1024 bytes/row, already a multiple of 256 (no padding needed).
+        let bpr = DIM * 4;
+        let buffer = renderer.device.create_buffer(&BufferDescriptor {
+            label: Some("readback_buf"),
+            size: (bpr * DIM) as u64,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = renderer
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor { label: Some("readback") });
+        enc.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture: &color,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(DIM),
+                },
+            },
+            Extent3d { width: DIM, height: DIM, depth_or_array_layers: 1 },
+        );
+        renderer.queue.submit(Some(enc.finish()));
+
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = renderer.device.poll(PollType::Wait);
+        rx.recv().unwrap().expect("map readback buffer");
+
+        let data = slice.get_mapped_range();
+        let mut total: u64 = 0;
+        let mut mid: u64 = 0;
+        for px in data.chunks_exact(4) {
+            // Rec. 601 luma; enough to compare "lit" vs "shadowed" brightness.
+            let lum = (px[0] as u64 * 299 + px[1] as u64 * 587 + px[2] as u64 * 114) / 1000;
+            total += lum;
+            // Background clears to ~42, ambient-only floor ~160, fully-lit floor
+            // clamps near 255. The [90, 215] band captures shadowed floor.
+            if (90..=215).contains(&lum) {
+                mid += 1;
+            }
+        }
+        drop(data);
+        buffer.unmap();
+        (total, mid)
+    }
+
+    /// End-to-end proof that the spot (flashlight) shadow actually darkens the
+    /// scene: an angled spot light over a floor, with vs without a wide bar
+    /// occluder. The bar casts a shadow, so the frame must be measurably
+    /// darker than the same scene with no occluder. Also exercises the real
+    /// shadow passes + main pass (which `shaders_and_pipelines_compile_on_gpu`
+    /// does not — that only builds pipelines).
+    #[test]
+    fn spot_shadow_darkens_the_scene() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU adapter; skipping spot-shadow render test");
+            return;
+        };
+        let mut renderer =
+            Renderer::from_device(device, queue, TextureFormat::Rgba8UnormSrgb, DIM, DIM);
+
+        // A strong spot at (5,5,0), 45deg above +X, aimed at the floor center.
+        // It must dominate the floor's lighting (ambient is a flat 0.6), so
+        // intensity is high to overcome the 1/dist^2 falloff. A post standing
+        // at the origin casts its shadow toward -X (offset from the post, not
+        // hidden under it), onto floor the top-down camera sees. The post's own
+        // pixels are tiny; the offset shadow strip is large, so total frame
+        // luminance drops clearly when the post is present.
+        let light_pos = Vec3::new(5.0, 5.0, 0.0);
+        let light = Light {
+            position: light_pos,
+            direction: (Vec3::ZERO - light_pos).normalize(),
+            kind: LightKind::Spot,
+            color: Color3(255, 255, 255, 255),
+            intensity: 250.0,
+            range: 50.0,
+            cone_angle_deg: 120.0,
+        };
+        let floor = || grey_cuboid(1, Vec3::new(0.0, 0.0, 0.0), Vec3::new(5.0, 0.1, 5.0));
+        let post = grey_cuboid(2, Vec3::new(0.0, 1.5, 0.0), Vec3::new(0.5, 1.5, 0.5));
+
+        let (lit_total, lit_mid) = render_stats(&mut renderer, &[floor()], &[light]);
+        let (shadow_total, shadow_mid) = render_stats(&mut renderer, &[floor(), post], &[light]);
+
+        // The occluder's shadow both lowers total brightness and converts a
+        // population of fully-lit floor pixels into ambient-only (mid) ones.
+        assert!(
+            shadow_total < lit_total,
+            "spot shadow should darken the frame: with post={shadow_total} vs without={lit_total}"
+        );
+        assert!(
+            shadow_mid > lit_mid + 300,
+            "spot shadow should add shadowed-floor pixels: with post={shadow_mid} vs without={lit_mid}"
+        );
     }
 }

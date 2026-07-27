@@ -297,7 +297,13 @@ impl SkinnedMeshPipeline {
 fn skinned_mesh_shader() -> String {
     format!(
         r#"
-struct CameraUniform {{ view_proj: mat4x4<f32> }}
+struct CameraUniform {{
+    view_proj: mat4x4<f32>,
+    sun_view_proj: mat4x4<f32>,
+    spot_view_proj: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+    shadow_params: vec4<f32>,
+}}
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
 struct ModelUniform {{ model: mat4x4<f32> }}
@@ -355,7 +361,8 @@ fn vs_main(v: VIn) -> VOut {{
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
-    let lit = shade(in.world_pos, n);
+    let view_dir = normalize(camera.camera_pos.xyz - in.world_pos);
+    let lit = shade(in.world_pos, n, view_dir, camera.sun_view_proj, camera.spot_view_proj, camera.shadow_params);
     let tex_color = textureSample(tex, samp, in.uv);
     return vec4<f32>(tex_color.rgb * lit, tex_color.a);
 }}
@@ -367,7 +374,13 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
 fn mesh_shader() -> String {
     format!(
         r#"
-struct CameraUniform {{ view_proj: mat4x4<f32> }}
+struct CameraUniform {{
+    view_proj: mat4x4<f32>,
+    sun_view_proj: mat4x4<f32>,
+    spot_view_proj: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+    shadow_params: vec4<f32>,
+}}
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
 struct ModelUniform {{ model: mat4x4<f32> }}
@@ -405,7 +418,8 @@ fn vs_main(v: VIn) -> VOut {{
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
-    let lit = shade(in.world_pos, n);
+    let view_dir = normalize(camera.camera_pos.xyz - in.world_pos);
+    let lit = shade(in.world_pos, n, view_dir, camera.sun_view_proj, camera.spot_view_proj, camera.shadow_params);
     let tex_color = textureSample(tex, samp, in.uv);
     return vec4<f32>(tex_color.rgb * lit, tex_color.a);
 }}

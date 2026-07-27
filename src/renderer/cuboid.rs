@@ -230,13 +230,17 @@ pub fn build_solid_mesh_one(c: &Cuboid) -> Option<(Vec<SolidVertex>, Vec<u32>)> 
                 color,
             });
         }
+        // CCW outward winding so `front_face: Ccw` + back-face culling keeps
+        // the outward-facing faces (with their correct outward normals). The
+        // quad corners are listed clockwise as seen from outside, so the
+        // triangles are reversed here to wind counter-clockwise.
         indices.extend_from_slice(&[
             face_base,
+            face_base + 2,
             face_base + 1,
-            face_base + 2,
             face_base,
-            face_base + 2,
             face_base + 3,
+            face_base + 2,
         ]);
     }
     Some((verts, indices))

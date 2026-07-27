@@ -12,6 +12,9 @@ pub const MAX_LIGHTS: usize = 8;
 pub enum LightKind {
     Point,
     Spot,
+    /// Infinitely-distant parallel light (sun). `position`/`range` are ignored;
+    /// the beam travels along `direction`, so there is no distance attenuation.
+    Directional,
 }
 
 /// A light to be drawn this frame, in whatever world space `cuboids`/`meshes`
@@ -80,16 +83,18 @@ impl LightsUniform {
         for (slot, l) in gpu.lights.iter_mut().zip(lights.iter().take(MAX_LIGHTS)) {
             let color = l.color.to_linear();
             let cos_outer = (l.cone_angle_deg.to_radians() * 0.5).cos();
+            // Kind tag packed into params.z — must match the branch constants
+            // in `wgsl_lights_block`: 0 = point, 1 = spot, 2 = directional.
+            let kind = match l.kind {
+                LightKind::Point => 0.0,
+                LightKind::Spot => 1.0,
+                LightKind::Directional => 2.0,
+            };
             *slot = GpuLight {
                 position: [l.position.x, l.position.y, l.position.z, 0.0],
                 direction: [l.direction.x, l.direction.y, l.direction.z, 0.0],
                 color_intensity: [color[0], color[1], color[2], l.intensity],
-                params: [
-                    l.range,
-                    cos_outer,
-                    if l.kind == LightKind::Spot { 1.0 } else { 0.0 },
-                    0.0,
-                ],
+                params: [l.range, cos_outer, kind, 0.0],
             };
         }
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&gpu));
@@ -101,6 +106,9 @@ impl LightsUniform {
 /// lights buffer (see `uniforms::UniformBuffer`, which shares one bind group
 /// between the camera and lights uniforms).
 pub fn wgsl_lights_block(group_index: u32, binding_index: u32) -> String {
+    let shadow_tex_binding = binding_index + 1;
+    let shadow_samp_binding = binding_index + 2;
+    let spot_tex_binding = binding_index + 3;
     format!(
         r#"
 struct Light {{
@@ -114,33 +122,126 @@ struct Lights {{
     lights: array<Light, {MAX_LIGHTS}>,
 }}
 @group({group_index}) @binding({binding_index}) var<uniform> lights: Lights;
+@group({group_index}) @binding({shadow_tex_binding}) var sun_shadow_tex: texture_depth_2d;
+@group({group_index}) @binding({shadow_samp_binding}) var shadow_samp: sampler_comparison;
+@group({group_index}) @binding({spot_tex_binding}) var spot_shadow_tex: texture_depth_2d;
 
 const AMBIENT: f32 = 0.6;
+const SPEC_STRENGTH: f32 = 0.35;
+const SHININESS: f32 = 32.0;
 
-fn light_contribution(l: Light, world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
-    let to_light = l.position.xyz - world_pos;
-    let dist = length(to_light);
-    let l_dir = to_light / max(dist, 0.0001);
-    let ndotl = max(dot(n, l_dir), 0.0);
-
-    let d_over_r = dist / max(l.params.x, 0.0001);
-    let window = clamp(1.0 - pow(d_over_r, 4.0), 0.0, 1.0);
-    var atten = (window * window) / (dist * dist + 1.0);
-
-    if (l.params.z > 0.5) {{
-        let cos_outer = l.params.y;
-        let cos_angle = dot(-l_dir, l.direction.xyz);
-        let cone = clamp((cos_angle - cos_outer) / max(1.0 - cos_outer, 0.0001), 0.0, 1.0);
-        atten = atten * cone * cone * (3.0 - 2.0 * cone);
+// Projects `world_pos` into a light's clip space and returns
+// (uv.x, uv.y, biased_depth, valid) — `valid` is 0 when the point falls
+// outside the shadow frustum (then the caller treats it as fully lit).
+fn shadow_coords(world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> vec4<f32> {{
+    let lp = light_view_proj * vec4<f32>(world_pos, 1.0);
+    let ndc = lp.xyz / lp.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    var valid = 1.0;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0 || ndc.z < 0.0) {{
+        valid = 0.0;
     }}
-
-    return l.color_intensity.rgb * l.color_intensity.a * ndotl * atten;
+    let bias = 0.0015;
+    return vec4<f32>(uv.x, uv.y, ndc.z - bias, valid);
 }}
 
-fn shade(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
+// 3x3 hardware-PCF against the sun depth map (1 = lit, 0 = shadowed).
+// `textureSampleCompareLevel` (not Compare) takes no implicit derivatives, so
+// it is legal to call after the per-fragment early-out for uniform control flow.
+fn sun_shadow(world_pos: vec3<f32>, sun_view_proj: mat4x4<f32>) -> f32 {{
+    let c = shadow_coords(world_pos, sun_view_proj);
+    if (c.w < 0.5) {{ return 1.0; }}
+    let texel = 1.0 / vec2<f32>(textureDimensions(sun_shadow_tex));
+    var sum = 0.0;
+    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
+        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
+            let off = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum = sum + textureSampleCompareLevel(sun_shadow_tex, shadow_samp, c.xy + off, c.z);
+        }}
+    }}
+    return sum / 9.0;
+}}
+
+// 3x3 hardware-PCF against the spot/flashlight depth map.
+fn spot_shadow(world_pos: vec3<f32>, spot_view_proj: mat4x4<f32>) -> f32 {{
+    let c = shadow_coords(world_pos, spot_view_proj);
+    if (c.w < 0.5) {{ return 1.0; }}
+    let texel = 1.0 / vec2<f32>(textureDimensions(spot_shadow_tex));
+    var sum = 0.0;
+    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
+        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
+            let off = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum = sum + textureSampleCompareLevel(spot_shadow_tex, shadow_samp, c.xy + off, c.z);
+        }}
+    }}
+    return sum / 9.0;
+}}
+
+fn light_contribution(l: Light, world_pos: vec3<f32>, n: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {{
+    // params.z tags the light kind: 0 = point, 1 = spot, 2 = directional.
+    let kind = l.params.z;
+
+    var l_dir: vec3<f32>;
+    var atten: f32;
+    if (kind > 1.5) {{
+        // Directional (sun): parallel rays travel along l.direction, so the
+        // surface-to-light vector is its negation and there is no falloff.
+        l_dir = normalize(-l.direction.xyz);
+        atten = 1.0;
+    }} else {{
+        let to_light = l.position.xyz - world_pos;
+        let dist = length(to_light);
+        l_dir = to_light / max(dist, 0.0001);
+
+        let d_over_r = dist / max(l.params.x, 0.0001);
+        let window = clamp(1.0 - pow(d_over_r, 4.0), 0.0, 1.0);
+        atten = (window * window) / (dist * dist + 1.0);
+
+        if (kind > 0.5) {{
+            // Spot cone (kind == 1).
+            let cos_outer = l.params.y;
+            let cos_angle = dot(-l_dir, l.direction.xyz);
+            let cone = clamp((cos_angle - cos_outer) / max(1.0 - cos_outer, 0.0001), 0.0, 1.0);
+            atten = atten * cone * cone * (3.0 - 2.0 * cone);
+        }}
+    }}
+
+    let ndotl = max(dot(n, l_dir), 0.0);
+    let radiance = l.color_intensity.rgb * l.color_intensity.a;
+    var out = radiance * ndotl * atten;
+
+    // Blinn-Phong specular, gated so back-facing fragments get no highlight.
+    if (ndotl > 0.0) {{
+        let h = normalize(l_dir + view_dir);
+        let spec = pow(max(dot(n, h), 0.0), SHININESS) * SPEC_STRENGTH;
+        out = out + radiance * spec * atten;
+    }}
+    return out;
+}}
+
+fn shade(
+    world_pos: vec3<f32>,
+    n: vec3<f32>,
+    view_dir: vec3<f32>,
+    sun_view_proj: mat4x4<f32>,
+    spot_view_proj: mat4x4<f32>,
+    shadow_params: vec4<f32>,
+) -> vec3<f32> {{
+    // shadow_params: x = sun enabled, y = spot enabled, z = flashlight index.
+    let flash_idx = u32(shadow_params.z);
     var lit = vec3<f32>(AMBIENT, AMBIENT, AMBIENT);
     for (var i: u32 = 0u; i < lights.count.x; i = i + 1u) {{
-        lit = lit + light_contribution(lights.lights[i], world_pos, n);
+        let l = lights.lights[i];
+        var c = light_contribution(l, world_pos, n, view_dir);
+        // The directional sun casts the orthographic shadow.
+        if (l.params.z > 1.5 && shadow_params.x > 0.5) {{
+            c = c * sun_shadow(world_pos, sun_view_proj);
+        }}
+        // The flashlight spot light casts the perspective shadow.
+        if (shadow_params.y > 0.5 && i == flash_idx) {{
+            c = c * spot_shadow(world_pos, spot_view_proj);
+        }}
+        lit = lit + c;
     }}
     return lit;
 }}
