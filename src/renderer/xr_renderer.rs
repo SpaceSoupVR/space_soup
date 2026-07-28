@@ -4,16 +4,19 @@ use openxr as xr;
 
 use crate::renderer::{
     camera::Camera,
-    cuboid::{build_solid_mesh, build_wire_mesh, Cuboid},
+    cuboid::{build_solid_mesh_with_ranges, build_wire_mesh, Cuboid},
     lights::{Light, LightsUniform},
+    mesh::{create_texture_from_rgba, LoadedTexture},
     mesh_pipeline::{MeshPipeline, ModelUniform, SkinnedMeshPipeline},
     mirror::{self, MirrorPipeline, MirrorSurface, MirrorTarget},
     particle::{self, Beam, Particle, ParticlePipeline},
     pipeline::{SolidPipeline, WirePipeline},
+    ssr::{SceneTarget, SsrCameraUniform, SsrPipelines},
     uniforms::UniformBuffer,
     MeshInstance,
 };
 use crate::xr::{VkContext, XrContext};
+use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
 struct EyeTarget {
@@ -22,6 +25,7 @@ struct EyeTarget {
 }
 
 type MeshDraw<'a> = (
+    &'a wgpu::BindGroup,
     &'a wgpu::BindGroup,
     &'a wgpu::BindGroup,
     &'a wgpu::Buffer,
@@ -40,6 +44,7 @@ type SkinnedDraw<'a> = (
 
 fn push_mesh_draws<'a>(
     instance: &'a MeshInstance,
+    lightmap_bg: &'a wgpu::BindGroup,
     mesh_draws: &mut Vec<MeshDraw<'a>>,
     skinned_draws: &mut Vec<SkinnedDraw<'a>>,
 ) {
@@ -61,6 +66,7 @@ fn push_mesh_draws<'a>(
             mesh_draws.push((
                 &instance.model.bind_group,
                 &prim.texture.bind_group,
+                lightmap_bg,
                 &prim.vertex_buffer,
                 &prim.index_buffer,
                 prim.indices.len() as u32,
@@ -85,11 +91,19 @@ pub struct XrRenderer {
     mirror_targets: [MirrorTarget; 2],
     mirror_model_uniform: ModelUniform,
     mirror_reflected_vp_uniform: ModelUniform,
+    ssr_pipelines: SsrPipelines,
+    ssr_solid_pipeline: SolidPipeline,
+    scene_targets: [SceneTarget; 2],
+    ssr_camera_uniform: SsrCameraUniform,
     particle_pipeline: ParticlePipeline,
     uniform_buf: UniformBuffer,
     lights_uniform: LightsUniform,
     depth_view: wgpu::TextureView,
     eye_targets: Vec<[EyeTarget; 2]>,
+    cuboid_lightmaps: HashMap<String, LoadedTexture>,
+    default_cuboid_lightmap: LoadedTexture,
+    mesh_lightmaps: HashMap<String, LoadedTexture>,
+    default_mesh_lightmap: LoadedTexture,
 }
 
 impl XrRenderer {
@@ -147,6 +161,18 @@ impl XrRenderer {
             std::array::from_fn(|_| mirror_pipeline.create_target(&wgpu_device, wgpu_format, width, height));
         let mirror_model_uniform = mirror_pipeline.create_model_uniform(&wgpu_device);
         let mirror_reflected_vp_uniform = mirror_pipeline.create_reflected_vp_uniform(&wgpu_device);
+        let ssr_pipelines = SsrPipelines::new(&wgpu_device, wgpu_format);
+        let ssr_solid_pipeline = SolidPipeline::new_ssr(
+            &wgpu_device,
+            wgpu_format,
+            &uniform_buf.layout,
+            ssr_pipelines.camera_layout(),
+            ssr_pipelines.scene_texture_layout(),
+        );
+        let scene_targets: [SceneTarget; 2] = std::array::from_fn(|_| {
+            ssr_pipelines.create_scene_target(&wgpu_device, wgpu_format, width, height)
+        });
+        let ssr_camera_uniform = ssr_pipelines.create_camera_uniform(&wgpu_device);
         let particle_pipeline =
             ParticlePipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
 
@@ -187,6 +213,24 @@ impl XrRenderer {
             eye_targets.push(targets);
         }
 
+        let white_pixel = [255u8, 255, 255, 255];
+        let default_cuboid_lightmap = create_texture_from_rgba(
+            &wgpu_device,
+            &wgpu_queue,
+            &solid_pipeline.lightmap_layout,
+            &white_pixel,
+            1,
+            1,
+        );
+        let default_mesh_lightmap = create_texture_from_rgba(
+            &wgpu_device,
+            &wgpu_queue,
+            &mesh_pipeline.lightmap_layout,
+            &white_pixel,
+            1,
+            1,
+        );
+
         Ok(Self {
             swapchain,
             width,
@@ -203,12 +247,60 @@ impl XrRenderer {
             mirror_targets,
             mirror_model_uniform,
             mirror_reflected_vp_uniform,
+            ssr_pipelines,
+            ssr_solid_pipeline,
+            scene_targets,
+            ssr_camera_uniform,
             particle_pipeline,
             uniform_buf,
             lights_uniform,
             depth_view,
             eye_targets,
+            cuboid_lightmaps: HashMap::new(),
+            default_cuboid_lightmap,
+            mesh_lightmaps: HashMap::new(),
+            default_mesh_lightmap,
         })
+    }
+
+    /// Uploads (or replaces) the baked lightmap texture for a cuboid object,
+    /// keyed by its stable scene-object string id (`Cuboid::lightmap_key`).
+    pub fn set_cuboid_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
+        let tex = create_texture_from_rgba(
+            &self.wgpu_device,
+            &self.wgpu_queue,
+            &self.solid_pipeline.lightmap_layout,
+            rgba,
+            width,
+            height,
+        );
+        self.cuboid_lightmaps.insert(key.to_string(), tex);
+    }
+
+    /// Uploads (or replaces) the baked lightmap texture for a mesh object,
+    /// keyed by its stable scene-object string id (`MeshInstance::lightmap_key`).
+    pub fn set_mesh_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
+        let tex = create_texture_from_rgba(
+            &self.wgpu_device,
+            &self.wgpu_queue,
+            &self.mesh_pipeline.lightmap_layout,
+            rgba,
+            width,
+            height,
+        );
+        self.mesh_lightmaps.insert(key.to_string(), tex);
+    }
+
+    fn cuboid_lightmap_bg(&self, key: Option<&str>) -> &wgpu::BindGroup {
+        key.and_then(|k| self.cuboid_lightmaps.get(k))
+            .map(|t| &t.bind_group)
+            .unwrap_or(&self.default_cuboid_lightmap.bind_group)
+    }
+
+    fn mesh_lightmap_bg(&self, key: Option<&str>) -> &wgpu::BindGroup {
+        key.and_then(|k| self.mesh_lightmaps.get(k))
+            .map(|t| &t.bind_group)
+            .unwrap_or(&self.default_mesh_lightmap.bind_group)
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -275,7 +367,7 @@ impl XrRenderer {
         let cam_up = head_rot * glam::Vec3::Y;
         let view_dir = head_rot * glam::Vec3::NEG_Z;
 
-        let (solid_verts, solid_idx) = build_solid_mesh(cuboids);
+        let (solid_verts, solid_idx, solid_ranges) = build_solid_mesh_with_ranges(cuboids);
         let (wire_verts, wire_idx) = build_wire_mesh(cuboids);
         let (particle_verts, particle_idx) =
             particle::build_particle_mesh(particles, beams, cam_right, cam_up, view_dir);
@@ -329,7 +421,8 @@ impl XrRenderer {
             instance
                 .model
                 .upload(&self.wgpu_queue, instance.mesh.model_matrix());
-            push_mesh_draws(instance, &mut mesh_draws, &mut skinned_draws);
+            let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
+            push_mesh_draws(instance, lightmap_bg, &mut mesh_draws, &mut skinned_draws);
         }
 
         let mut mirror_only_mesh_draws: Vec<MeshDraw> = Vec::new();
@@ -338,7 +431,8 @@ impl XrRenderer {
             instance
                 .model
                 .upload(&self.wgpu_queue, instance.mesh.model_matrix());
-            push_mesh_draws(instance, &mut mirror_only_mesh_draws, &mut mirror_only_skinned_draws);
+            let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
+            push_mesh_draws(instance, lightmap_bg, &mut mirror_only_mesh_draws, &mut mirror_only_skinned_draws);
         }
 
         let mirror_quad = mirror.map(|m| {
@@ -414,7 +508,10 @@ impl XrRenderer {
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_vertex_buffer(0, solid_vb.slice(..));
                         pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..solid_idx.len() as u32, 0, 0..1);
+                        for (lightmap_key, index_start, count, _reflectivity) in &solid_ranges {
+                            pass.set_bind_group(1, self.cuboid_lightmap_bg(lightmap_key.as_deref()), &[]);
+                            pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
+                        }
                     }
                     let all_mesh_draws = mesh_draws.iter().chain(mirror_only_mesh_draws.iter());
                     let all_skinned_draws =
@@ -423,9 +520,10 @@ impl XrRenderer {
                     if !mesh_draws.is_empty() || !mirror_only_mesh_draws.is_empty() {
                         pass.set_pipeline(&self.mirror_mesh_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for (model_bg, tex_bg, vb, ib, count) in all_mesh_draws {
+                        for (model_bg, tex_bg, lightmap_bg, vb, ib, count) in all_mesh_draws {
                             pass.set_bind_group(1, *model_bg, &[]);
                             pass.set_bind_group(2, *tex_bg, &[]);
+                            pass.set_bind_group(3, *lightmap_bg, &[]);
                             pass.set_vertex_buffer(0, vb.slice(..));
                             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                             pass.draw_indexed(0..*count, 0, 0..1);
@@ -447,7 +545,99 @@ impl XrRenderer {
                 self.wgpu_queue.submit(Some(encoder.finish()));
             }
 
-            self.uniform_buf.upload(&self.wgpu_queue, Camera::gl_to_wgpu_ndc(proj) * view);
+            let eye_view_proj = Camera::gl_to_wgpu_ndc(proj) * view;
+            self.uniform_buf.upload(&self.wgpu_queue, eye_view_proj);
+            let cam_pos = glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
+            self.ssr_camera_uniform.upload(&self.wgpu_queue, eye_view_proj, cam_pos);
+
+            // Opaque scene, rendered once into an offscreen per-eye buffer
+            // with the same (non-reflected) camera as the swapchain image --
+            // the swapchain pass below blits this in as its base image
+            // (instead of redrawing every opaque object a second time) and
+            // the SSR redraw pass ray-marches it to approximate reflective
+            // cuboids seeing the rest of the scene. See `ssr.rs`.
+            {
+                let mut encoder = self.wgpu_device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: Some("ssr_scene") },
+                );
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("ssr_scene_pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &self.scene_targets[eye].color_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.02,
+                                    g: 0.02,
+                                    b: 0.05,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.scene_targets[eye].depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+
+                    if !solid_verts.is_empty() {
+                        pass.set_pipeline(&self.solid_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_vertex_buffer(0, solid_vb.slice(..));
+                        pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                        for (lightmap_key, index_start, count, _reflectivity) in &solid_ranges {
+                            pass.set_bind_group(1, self.cuboid_lightmap_bg(lightmap_key.as_deref()), &[]);
+                            pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
+                        }
+                    }
+                    if !wire_verts.is_empty() {
+                        pass.set_pipeline(&self.wire_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_vertex_buffer(0, wire_vb.slice(..));
+                        pass.set_index_buffer(wire_ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..wire_idx.len() as u32, 0, 0..1);
+                    }
+                    if !mesh_draws.is_empty() {
+                        pass.set_pipeline(&self.mesh_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        for (model_bg, tex_bg, lightmap_bg, vb, ib, count) in &mesh_draws {
+                            pass.set_bind_group(1, *model_bg, &[]);
+                            pass.set_bind_group(2, *tex_bg, &[]);
+                            pass.set_bind_group(3, *lightmap_bg, &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
+                    }
+                    if !skinned_draws.is_empty() {
+                        pass.set_pipeline(&self.skinned_mesh_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in &skinned_draws {
+                            pass.set_bind_group(1, *model_bg, &[]);
+                            pass.set_bind_group(2, *tex_bg, &[]);
+                            pass.set_bind_group(3, *joint_bg, &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
+                    }
+                    if !particle_verts.is_empty() {
+                        pass.set_pipeline(&self.particle_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_vertex_buffer(0, particle_vb.slice(..));
+                        pass.set_index_buffer(particle_ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..particle_idx.len() as u32, 0, 0..1);
+                    }
+                }
+                self.wgpu_queue.submit(Some(encoder.finish()));
+            }
 
             let color_view = &self.eye_targets[image_index][eye].view;
             let mut encoder = self
@@ -481,50 +671,31 @@ impl XrRenderer {
                     ..Default::default()
                 });
 
-                if !solid_verts.is_empty() {
-                    pass.set_pipeline(&self.solid_pipeline.pipeline);
+                // Blit the opaque scene into the swapchain image -- also
+                // writes `self.depth_view` (via `@builtin(frag_depth)`,
+                // sampled from `scene_targets[eye]`'s own depth) to match,
+                // so the reflective redraw and mirror quad below get correct
+                // occlusion without re-rendering the opaque scene again.
+                pass.set_pipeline(&self.ssr_pipelines.blit_pipeline);
+                pass.set_bind_group(0, &self.scene_targets[eye].bind_group, &[]);
+                pass.draw(0..3, 0..1);
+
+                if solid_ranges.iter().any(|(_, _, _, r)| *r > 0.0) {
+                    pass.set_pipeline(&self.ssr_solid_pipeline.pipeline);
                     pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                    pass.set_bind_group(2, &self.ssr_camera_uniform.bind_group, &[]);
+                    pass.set_bind_group(3, &self.scene_targets[eye].bind_group, &[]);
                     pass.set_vertex_buffer(0, solid_vb.slice(..));
                     pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..solid_idx.len() as u32, 0, 0..1);
-                }
-                if !wire_verts.is_empty() {
-                    pass.set_pipeline(&self.wire_pipeline.pipeline);
-                    pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                    pass.set_vertex_buffer(0, wire_vb.slice(..));
-                    pass.set_index_buffer(wire_ib.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..wire_idx.len() as u32, 0, 0..1);
-                }
-                if !mesh_draws.is_empty() {
-                    pass.set_pipeline(&self.mesh_pipeline.pipeline);
-                    pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                    for (model_bg, tex_bg, vb, ib, count) in &mesh_draws {
-                        pass.set_bind_group(1, *model_bg, &[]);
-                        pass.set_bind_group(2, *tex_bg, &[]);
-                        pass.set_vertex_buffer(0, vb.slice(..));
-                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..*count, 0, 0..1);
+                    for (lightmap_key, index_start, count, reflectivity) in &solid_ranges {
+                        if *reflectivity <= 0.0 {
+                            continue;
+                        }
+                        pass.set_bind_group(1, self.cuboid_lightmap_bg(lightmap_key.as_deref()), &[]);
+                        pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
                     }
                 }
-                if !skinned_draws.is_empty() {
-                    pass.set_pipeline(&self.skinned_mesh_pipeline.pipeline);
-                    pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                    for (model_bg, tex_bg, joint_bg, vb, ib, count) in &skinned_draws {
-                        pass.set_bind_group(1, *model_bg, &[]);
-                        pass.set_bind_group(2, *tex_bg, &[]);
-                        pass.set_bind_group(3, *joint_bg, &[]);
-                        pass.set_vertex_buffer(0, vb.slice(..));
-                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..*count, 0, 0..1);
-                    }
-                }
-                if !particle_verts.is_empty() {
-                    pass.set_pipeline(&self.particle_pipeline.pipeline);
-                    pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                    pass.set_vertex_buffer(0, particle_vb.slice(..));
-                    pass.set_index_buffer(particle_ib.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..particle_idx.len() as u32, 0, 0..1);
-                }
+
                 if let Some((vb, ib, count)) = &mirror_quad {
                     pass.set_pipeline(&self.mirror_pipeline.pipeline);
                     pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);

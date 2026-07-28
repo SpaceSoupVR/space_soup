@@ -12,11 +12,16 @@ pub struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    /// TEXCOORD_1, when the source GLB has one -- sampled against a baked
+    /// lightmap texture (see mesh_pipeline.rs's lightmap bind group). Zeroed
+    /// for meshes without a real second UV set; harmless, since those objects
+    /// only ever get a flat single-texel fallback bake (see lightmap_bake.py).
+    pub uv2: [f32; 2],
 }
 
 impl MeshVertex {
-    pub const ATTRIBS: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2];
+    pub const ATTRIBS: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2];
 
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -707,6 +712,15 @@ fn collect_node(
                 None => vec![[0.0, 0.0]; positions.len()],
             };
 
+            // TEXCOORD_1, when the GLB has one -- the lightmap UV set (see
+            // MeshVertex::uv2). Zero-filled otherwise; harmless, since a mesh
+            // without a real second UV channel only ever gets a flat
+            // single-texel fallback bake anyway (see lightmap_bake.py).
+            let uv2s: Vec<[f32; 2]> = match reader.read_tex_coords(1) {
+                Some(uv) => uv.into_f32().collect(),
+                None => vec![[0.0, 0.0]; positions.len()],
+            };
+
             let indices: Vec<u32> = match reader.read_indices() {
                 Some(i) => i.into_u32().collect(),
                 None => (0..positions.len() as u32).collect(),
@@ -721,6 +735,7 @@ fn collect_node(
                         position: positions[i].into(),
                         normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
                         uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                        uv2: uv2s.get(i).copied().unwrap_or([0.0, 0.0]),
                     })
                     .collect();
 
@@ -897,7 +912,7 @@ fn upload_solid_texture(
     create_texture_from_rgba(device, queue, layout, &rgba, 1, 1)
 }
 
-pub(crate) fn create_texture_from_rgba(
+pub fn create_texture_from_rgba(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,

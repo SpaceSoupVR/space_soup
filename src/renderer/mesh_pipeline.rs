@@ -1,11 +1,13 @@
 use super::lights::wgsl_lights_block;
 use super::mesh::{MeshVertex, SkinnedMeshVertex, MAX_SKIN_JOINTS};
+use super::pipeline::lightmap_bind_group_layout;
 use wgpu::*;
 
 pub struct MeshPipeline {
     pub pipeline: RenderPipeline,
     pub texture_layout: BindGroupLayout,
     pub model_layout: BindGroupLayout,
+    pub lightmap_layout: BindGroupLayout,
 }
 
 impl MeshPipeline {
@@ -64,9 +66,11 @@ impl MeshPipeline {
             }],
         });
 
+        let lightmap_layout = lightmap_bind_group_layout(device);
+
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("mesh_layout"),
-            bind_group_layouts: &[camera_layout, &model_layout, &texture_layout],
+            bind_group_layouts: &[camera_layout, &model_layout, &texture_layout, &lightmap_layout],
             push_constant_ranges: &[],
         });
 
@@ -112,6 +116,7 @@ impl MeshPipeline {
             pipeline,
             texture_layout,
             model_layout,
+            lightmap_layout,
         }
     }
 
@@ -374,12 +379,16 @@ struct ModelUniform {{ model: mat4x4<f32> }}
 @group(2) @binding(0) var tex: texture_2d<f32>;
 @group(2) @binding(1) var samp: sampler;
 
+@group(3) @binding(0) var lm_tex: texture_2d<f32>;
+@group(3) @binding(1) var lm_samp: sampler;
+
 {lights_block}
 
 struct VIn {{
     @location(0) position: vec3<f32>,
     @location(1) normal:   vec3<f32>,
     @location(2) uv:       vec2<f32>,
+    @location(3) uv2:      vec2<f32>,
 }}
 
 struct VOut {{
@@ -387,6 +396,7 @@ struct VOut {{
     @location(0) normal: vec3<f32>,
     @location(1) uv:     vec2<f32>,
     @location(2) world_pos: vec3<f32>,
+    @location(3) uv2:    vec2<f32>,
 }}
 
 @vertex
@@ -397,6 +407,7 @@ fn vs_main(v: VIn) -> VOut {{
     out.normal    = (model_u.model * vec4<f32>(v.normal, 0.0)).xyz;
     out.uv        = v.uv;
     out.world_pos = world_pos.xyz;
+    out.uv2       = v.uv2;
     return out;
 }}
 
@@ -405,7 +416,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
     let lit = shade(in.world_pos, n);
     let tex_color = textureSample(tex, samp, in.uv);
-    return vec4<f32>(tex_color.rgb * lit, tex_color.a);
+    let lightmap = textureSample(lm_tex, lm_samp, in.uv2).rgb;
+    return vec4<f32>(tex_color.rgb * lit * lightmap, tex_color.a);
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1)

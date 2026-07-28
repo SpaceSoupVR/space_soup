@@ -8,6 +8,7 @@ pub mod mirror;
 pub mod panel;
 pub mod particle;
 pub mod pipeline;
+pub mod ssr;
 pub mod uniforms;
 
 #[cfg(target_os = "android")]
@@ -27,6 +28,7 @@ use wgpu::*;
 
 use cuboid::{build_solid_mesh_one, build_wire_mesh_one, CuboidSnapshot, SolidVertex, WireVertex};
 use lights::LightsUniform;
+use mesh::{create_texture_from_rgba, LoadedTexture};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color3(pub u8, pub u8, pub u8, pub u8);
@@ -54,6 +56,10 @@ impl Color3 {
 pub struct MeshInstance<'a> {
     pub mesh: &'a GltfMesh,
     pub model: &'a mesh_pipeline::ModelUniform,
+    /// Scene object's stable string id -- looked up against
+    /// `Renderer::mesh_lightmaps` for a baked lightmap texture, falling back
+    /// to `default_mesh_lightmap` (1x1 white) when `None` or not yet baked.
+    pub lightmap_key: Option<&'a str>,
 }
 
 struct CuboidCacheEntry {
@@ -76,6 +82,10 @@ pub struct Renderer {
     pub width: u32,
     pub height: u32,
     cuboid_cache: HashMap<u64, CuboidCacheEntry>,
+    cuboid_lightmaps: HashMap<String, LoadedTexture>,
+    default_cuboid_lightmap: LoadedTexture,
+    mesh_lightmaps: HashMap<String, LoadedTexture>,
+    default_mesh_lightmap: LoadedTexture,
 }
 
 impl Renderer {
@@ -94,6 +104,11 @@ impl Renderer {
         let skinned_mesh_pipeline =
             mesh_pipeline::SkinnedMeshPipeline::new(&device, format, &uniform_buf.layout);
         let (depth_texture, depth_view) = Self::make_depth(&device, width, height);
+        let white_pixel = [255u8, 255, 255, 255];
+        let default_cuboid_lightmap =
+            create_texture_from_rgba(&device, &queue, &solid_pipeline.lightmap_layout, &white_pixel, 1, 1);
+        let default_mesh_lightmap =
+            create_texture_from_rgba(&device, &queue, &mesh_pipeline.lightmap_layout, &white_pixel, 1, 1);
 
         Self {
             device,
@@ -109,7 +124,25 @@ impl Renderer {
             width,
             height,
             cuboid_cache: HashMap::new(),
+            cuboid_lightmaps: HashMap::new(),
+            default_cuboid_lightmap,
+            mesh_lightmaps: HashMap::new(),
+            default_mesh_lightmap,
         }
+    }
+
+    /// Uploads (or replaces) the baked lightmap texture for a cuboid object,
+    /// keyed by its stable scene-object string id (`Cuboid::lightmap_key`).
+    pub fn set_cuboid_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
+        let tex = create_texture_from_rgba(&self.device, &self.queue, &self.solid_pipeline.lightmap_layout, rgba, width, height);
+        self.cuboid_lightmaps.insert(key.to_string(), tex);
+    }
+
+    /// Uploads (or replaces) the baked lightmap texture for a mesh object,
+    /// keyed by its stable scene-object string id (`MeshInstance::lightmap_key`).
+    pub fn set_mesh_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
+        let tex = create_texture_from_rgba(&self.device, &self.queue, &self.mesh_pipeline.lightmap_layout, rgba, width, height);
+        self.mesh_lightmaps.insert(key.to_string(), tex);
     }
 
     pub fn mesh_texture_layout(&self) -> &BindGroupLayout {
@@ -200,15 +233,24 @@ impl Renderer {
         self.render_internal(target_view, camera, cuboids, meshes, panels, lights);
     }
 
+    #[allow(clippy::type_complexity)]
     fn bake_cuboids(
         &mut self,
         cuboids: &[Cuboid],
-    ) -> ((Vec<SolidVertex>, Vec<u32>), (Vec<WireVertex>, Vec<u32>)) {
+    ) -> (
+        (Vec<SolidVertex>, Vec<u32>, Vec<(Option<String>, u32, u32)>),
+        (Vec<WireVertex>, Vec<u32>),
+    ) {
         let mut seen: std::collections::HashSet<u64> =
             std::collections::HashSet::with_capacity(cuboids.len());
 
         let mut solid_verts: Vec<SolidVertex> = Vec::new();
         let mut solid_indices: Vec<u32> = Vec::new();
+        // (lightmap_key, index_start, count) per cuboid, in the shared
+        // solid_indices buffer -- lets render_internal issue one draw_indexed
+        // per cuboid with its own lightmap bind group bound, while still only
+        // uploading a single combined vertex/index buffer per frame.
+        let mut solid_ranges: Vec<(Option<String>, u32, u32)> = Vec::new();
         let mut wire_verts: Vec<WireVertex> = Vec::new();
         let mut wire_indices: Vec<u32> = Vec::new();
 
@@ -237,8 +279,10 @@ impl Renderer {
 
             if let Some((v, i)) = &entry.solid {
                 let base = solid_verts.len() as u32;
+                let index_start = solid_indices.len() as u32;
                 solid_verts.extend_from_slice(v);
                 solid_indices.extend(i.iter().map(|x| x + base));
+                solid_ranges.push((c.lightmap_key.clone(), index_start, i.len() as u32));
             }
             if let Some((v, i)) = &entry.wire {
                 let base = wire_verts.len() as u32;
@@ -249,7 +293,10 @@ impl Renderer {
 
         self.cuboid_cache.retain(|id, _| seen.contains(id));
 
-        ((solid_verts, solid_indices), (wire_verts, wire_indices))
+        (
+            (solid_verts, solid_indices, solid_ranges),
+            (wire_verts, wire_indices),
+        )
     }
 
     fn render_internal(
@@ -265,7 +312,8 @@ impl Renderer {
         self.uniform_buf.upload(&self.queue, vp);
         self.lights_uniform.upload(&self.queue, lights);
 
-        let ((solid_verts, solid_indices), (wire_verts, wire_indices)) = self.bake_cuboids(cuboids);
+        let ((solid_verts, solid_indices, solid_ranges), (wire_verts, wire_indices)) =
+            self.bake_cuboids(cuboids);
 
         let solid_vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("solid_vb"),
@@ -304,7 +352,7 @@ impl Renderer {
             panel_buffers.push((vb, ib));
         }
 
-        let mut draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup)> = Vec::new();
+        let mut draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> = Vec::new();
         let mut skinned_draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> =
             Vec::new();
 
@@ -327,6 +375,11 @@ impl Renderer {
                     }
                 }
             } else {
+                let lightmap_bg = instance
+                    .lightmap_key
+                    .and_then(|k| self.mesh_lightmaps.get(k))
+                    .map(|t| &t.bind_group)
+                    .unwrap_or(&self.default_mesh_lightmap.bind_group);
                 for prim in &instance.mesh.primitives {
                     draws.push((
                         &prim.vertex_buffer,
@@ -334,6 +387,7 @@ impl Renderer {
                         prim.indices.len() as u32,
                         &instance.model.bind_group,
                         &prim.texture.bind_group,
+                        lightmap_bg,
                     ));
                 }
             }
@@ -346,6 +400,7 @@ impl Renderer {
                 panel.indices().len() as u32,
                 &panel.model.bind_group,
                 panel.bind_group(),
+                &self.default_mesh_lightmap.bind_group,
             ));
         }
 
@@ -387,7 +442,15 @@ impl Renderer {
                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                 pass.set_vertex_buffer(0, solid_vb.slice(..));
                 pass.set_index_buffer(solid_ib.slice(..), IndexFormat::Uint32);
-                pass.draw_indexed(0..solid_indices.len() as u32, 0, 0..1);
+                for (lightmap_key, index_start, count) in &solid_ranges {
+                    let lightmap_bg = lightmap_key
+                        .as_deref()
+                        .and_then(|k| self.cuboid_lightmaps.get(k))
+                        .map(|t| &t.bind_group)
+                        .unwrap_or(&self.default_cuboid_lightmap.bind_group);
+                    pass.set_bind_group(1, lightmap_bg, &[]);
+                    pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
+                }
             }
 
             if !wire_verts.is_empty() {
@@ -401,9 +464,10 @@ impl Renderer {
             if !draws.is_empty() {
                 pass.set_pipeline(&self.mesh_pipeline.pipeline);
                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                for (vb, ib, count, model_bg, tex_bg) in &draws {
+                for (vb, ib, count, model_bg, tex_bg, lightmap_bg) in &draws {
                     pass.set_bind_group(1, *model_bg, &[]);
                     pass.set_bind_group(2, *tex_bg, &[]);
+                    pass.set_bind_group(3, *lightmap_bg, &[]);
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(0..*count, 0, 0..1);
