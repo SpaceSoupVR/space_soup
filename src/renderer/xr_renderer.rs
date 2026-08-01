@@ -123,8 +123,76 @@ pub struct XrRenderer {
     default_cuboid_lightmap: LoadedTexture,
     mesh_lightmaps: HashMap<String, LoadedTexture>,
     default_mesh_lightmap: LoadedTexture,
-    ui_font: Arc<Ui2dFont>,
-    ui_panel_instances: HashMap<String, WorldPanel>,
+    frame_stats: FrameStats,
+}
+
+struct FrameStats {
+    window: u64,
+    count: u64,
+    last_frame: Option<std::time::Instant>,
+    cpu_ms_sum: f64,
+    gpu_ms_sum: f64,
+    period_ms_sum: f64,
+    period_samples: u64,
+    cpu_ms_max: f64,
+    gpu_ms_max: f64,
+}
+
+impl FrameStats {
+    fn new(window: u64) -> Self {
+        Self {
+            window,
+            count: 0,
+            last_frame: None,
+            cpu_ms_sum: 0.0,
+            gpu_ms_sum: 0.0,
+            period_ms_sum: 0.0,
+            period_samples: 0,
+            cpu_ms_max: 0.0,
+            gpu_ms_max: 0.0,
+        }
+    }
+
+    fn record(&mut self, cpu: std::time::Duration, gpu: std::time::Duration, now: std::time::Instant) {
+        let cpu_ms = cpu.as_secs_f64() * 1000.0;
+        let gpu_ms = gpu.as_secs_f64() * 1000.0;
+        self.cpu_ms_sum += cpu_ms;
+        self.gpu_ms_sum += gpu_ms;
+        self.cpu_ms_max = self.cpu_ms_max.max(cpu_ms);
+        self.gpu_ms_max = self.gpu_ms_max.max(gpu_ms);
+        if let Some(prev) = self.last_frame {
+            self.period_ms_sum += (now - prev).as_secs_f64() * 1000.0;
+            self.period_samples += 1;
+        }
+        self.last_frame = Some(now);
+        self.count += 1;
+
+        if self.count % self.window == 0 {
+            let n = self.window as f64;
+            let avg_period = if self.period_samples > 0 {
+                self.period_ms_sum / self.period_samples as f64
+            } else {
+                0.0
+            };
+            let fps = if avg_period > 0.0 { 1000.0 / avg_period } else { 0.0 };
+            info!(
+                "PERF: cpu_avg={:.2}ms cpu_max={:.2}ms | gpu_avg={:.2}ms gpu_max={:.2}ms | frame={:.2}ms (~{:.1}fps) over {} frames",
+                self.cpu_ms_sum / n,
+                self.cpu_ms_max,
+                self.gpu_ms_sum / n,
+                self.gpu_ms_max,
+                avg_period,
+                fps,
+                self.window,
+            );
+            self.cpu_ms_sum = 0.0;
+            self.gpu_ms_sum = 0.0;
+            self.period_ms_sum = 0.0;
+            self.period_samples = 0;
+            self.cpu_ms_max = 0.0;
+            self.gpu_ms_max = 0.0;
+        }
+    }
 }
 
 impl XrRenderer {
@@ -282,66 +350,8 @@ impl XrRenderer {
             default_cuboid_lightmap,
             mesh_lightmaps: HashMap::new(),
             default_mesh_lightmap,
-            ui_font: Arc::new(Ui2dFont::new(ui_font_bytes)),
-            ui_panel_instances: HashMap::new(),
+            frame_stats: FrameStats::new(120),
         })
-    }
-
-    fn sync_ui_panels(&mut self, panels: &[UiPanelRenderData]) {
-        const PIXELS_PER_METER: f32 = 700.0;
-        const TEXT_MARGIN_PX: f32 = 24.0;
-        const FONT_SIZE_PX: f32 = 48.0;
-
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for data in panels {
-            seen.insert(data.id.clone());
-
-            let width_px = ((data.width_m * PIXELS_PER_METER).round() as u32).clamp(1, 2048);
-            let height_px = ((data.height_m * PIXELS_PER_METER).round() as u32).clamp(1, 2048);
-
-            if !self.ui_panel_instances.contains_key(&data.id) {
-                let panel = WorldPanel::new(
-                    &self.wgpu_device,
-                    &self.wgpu_queue,
-                    wgpu::TextureFormat::Rgba8UnormSrgb,
-                    &self.mesh_pipeline,
-                    width_px,
-                    height_px,
-                    data.width_m,
-                    data.height_m,
-                );
-                self.ui_panel_instances.insert(data.id.clone(), panel);
-            }
-            let panel = self.ui_panel_instances.get_mut(&data.id).unwrap();
-            panel.position = data.position;
-            panel.rotation = data.rotation;
-            panel.upload_model(&self.wgpu_queue);
-
-            let items = vec![
-                (
-                    Area { offset: (0.0, 0.0), bounds: None },
-                    Item::Shape(ShapeItem {
-                        shape: ShapeType::Rectangle(0.0, (width_px as f32, height_px as f32), 0.0),
-                        color: ui_color(data.background_color),
-                    }),
-                ),
-                (
-                    Area { offset: (TEXT_MARGIN_PX, TEXT_MARGIN_PX), bounds: None },
-                    Item::Text(Text::new(
-                        vec![Span::new(
-                            data.text.clone(),
-                            self.ui_font.clone(),
-                            FONT_SIZE_PX,
-                            ui_color(data.text_color),
-                        )],
-                        (width_px as f32 - TEXT_MARGIN_PX * 2.0).max(1.0),
-                    )),
-                ),
-            ];
-            panel.mark_dirty();
-            panel.draw(&self.wgpu_device, &self.wgpu_queue, items);
-        }
-        self.ui_panel_instances.retain(|id, _| seen.contains(id));
     }
 
     pub fn set_cuboid_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
@@ -434,6 +444,7 @@ impl XrRenderer {
 
         let image_index = self.swapchain.acquire_image()? as usize;
         self.swapchain.wait_image(xr::Duration::INFINITE)?;
+        let cpu_start = std::time::Instant::now();
         self.lights_uniform.upload(&self.wgpu_queue, lights);
 
         let (_, eye_views) =
@@ -569,7 +580,7 @@ impl XrRenderer {
         for eye in 0..2usize {
             let ev = &eye_views[eye];
             let view = Camera::xr_view(ev.pose);
-            let proj = Camera::xr_projection(ev.fov, 0.01, 1000.0);
+            let proj = Camera::xr_projection(ev.fov, 0.03, 1000.0);
 
             if let Some(m) = &mirror {
                 let reflect = mirror::reflection_matrix(m.position, m.normal());
@@ -810,7 +821,11 @@ impl XrRenderer {
             self.wgpu_queue.submit(Some(encoder.finish()));
         }
 
+        let cpu_time = cpu_start.elapsed();
+        let gpu_wait_start = std::time::Instant::now();
         self.wgpu_device.poll(wgpu::PollType::Wait);
+        let gpu_time = gpu_wait_start.elapsed();
+        self.frame_stats.record(cpu_time, gpu_time, std::time::Instant::now());
         self.swapchain.release_image()?;
 
         let proj_views = eye_views
