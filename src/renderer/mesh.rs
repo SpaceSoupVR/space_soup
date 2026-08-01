@@ -12,10 +12,6 @@ pub struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
-    /// TEXCOORD_1, when the source GLB has one -- sampled against a baked
-    /// lightmap texture (see mesh_pipeline.rs's lightmap bind group). Zeroed
-    /// for meshes without a real second UV set; harmless, since those objects
-    /// only ever get a flat single-texel fallback bake (see lightmap_bake.py).
     pub uv2: [f32; 2],
 }
 
@@ -168,6 +164,57 @@ impl GltfSkin {
             .or_else(|| name.rsplit_once("_l_"))
             .map(|(_, suffix)| suffix)
             .unwrap_or(name)
+    }
+
+    pub fn skin_matrices_blended(&self, clip: usize, blend: f32) -> Vec<Mat4> {
+        self.skin_matrices_blended_multi(&[(clip, blend)])
+    }
+
+    pub fn skin_matrices_blended_multi(&self, targets: &[(usize, f32)]) -> Vec<Mat4> {
+        let local: Vec<(Vec3, Quat, Vec3)> = (0..self.joint_names.len())
+            .map(|ji| {
+                let bind = self.joint_local_bind[ji];
+                for &(clip, blend) in targets {
+                    let Some(target) = self
+                        .animations
+                        .get(clip)
+                        .and_then(|a| a.joint_transforms.get(ji).copied().flatten())
+                    else {
+                        continue;
+                    };
+                    let b = blend.clamp(0.0, 1.0);
+                    return (bind.0.lerp(target.0, b), bind.1.slerp(target.1, b), bind.2.lerp(target.2, b));
+                }
+                bind
+            })
+            .collect();
+        let world = self.hierarchical_transforms(&local);
+        self.inv_bind_mats
+            .iter()
+            .enumerate()
+            .map(|(ji, inv_bind)| world[ji] * *inv_bind)
+            .collect()
+    }
+
+    pub fn animation_index(&self, name: &str) -> Option<usize> {
+        self.animations.iter().position(|a| a.name == name)
+    }
+
+    pub fn pull_geometry(&self, clip: usize) -> Option<(Vec3, Vec3, f32)> {
+        let rest = self.hierarchical_transforms(&self.joint_local_bind);
+        let posed_local = self.blended_local_pose(usize::MAX, clip, |_| 1.0);
+        let posed = self.hierarchical_transforms(&posed_local);
+        let mut best: Option<(usize, f32)> = None;
+        for ji in 0..self.joint_names.len() {
+            let d = (posed[ji].w_axis.truncate() - rest[ji].w_axis.truncate()).length();
+            if d > best.map(|(_, bd)| bd).unwrap_or(1e-4) {
+                best = Some((ji, d));
+            }
+        }
+        let (ji, travel) = best?;
+        let rest_p = rest[ji].w_axis.truncate();
+        let posed_p = posed[ji].w_axis.truncate();
+        Some((rest_p, (posed_p - rest_p) / travel, travel))
     }
 
     pub fn hierarchical_transforms(&self, local: &[(Vec3, Quat, Vec3)]) -> Vec<Mat4> {
@@ -416,18 +463,18 @@ impl GltfMesh {
                         let reader = channel.reader(|b| Some(&buffers[b.index()]));
                         let entry = partial[ji].get_or_insert((None, None, None));
                         match reader.read_outputs() {
-                            Some(gltf::animation::util::ReadOutputs::Translations(mut t)) => {
-                                if let Some(v) = t.next() {
+                            Some(gltf::animation::util::ReadOutputs::Translations(t)) => {
+                                if let Some(v) = t.last() {
                                     entry.0 = Some(Vec3::from(v));
                                 }
                             }
                             Some(gltf::animation::util::ReadOutputs::Rotations(r)) => {
-                                if let Some(v) = r.into_f32().next() {
+                                if let Some(v) = r.into_f32().last() {
                                     entry.1 = Some(Quat::from_xyzw(v[0], v[1], v[2], v[3]));
                                 }
                             }
-                            Some(gltf::animation::util::ReadOutputs::Scales(mut s)) => {
-                                if let Some(v) = s.next() {
+                            Some(gltf::animation::util::ReadOutputs::Scales(s)) => {
+                                if let Some(v) = s.last() {
                                     entry.2 = Some(Vec3::from(v));
                                 }
                             }
@@ -712,10 +759,6 @@ fn collect_node(
                 None => vec![[0.0, 0.0]; positions.len()],
             };
 
-            // TEXCOORD_1, when the GLB has one -- the lightmap UV set (see
-            // MeshVertex::uv2). Zero-filled otherwise; harmless, since a mesh
-            // without a real second UV channel only ever gets a flat
-            // single-texel fallback bake anyway (see lightmap_bake.py).
             let uv2s: Vec<[f32; 2]> = match reader.read_tex_coords(1) {
                 Some(uv) => uv.into_f32().collect(),
                 None => vec![[0.0, 0.0]; positions.len()],
@@ -1096,7 +1139,19 @@ mod tests {
         let pose = &skin.animations[0];
         assert_eq!(pose.name, "charging_handle_pull");
         let (t, _r, _s) = pose.joint_transforms[ji].expect("charging handle should have a sampled pose");
-        assert!(t.distance(Vec3::ZERO) < 1e-4, "expected first-keyframe position ~0, got {t:?}");
+        assert!(
+            t.distance(Vec3::new(0.0, 0.0, -0.05)) < 1e-4,
+            "expected end-keyframe (pulled) position (0,0,-0.05), got {t:?}"
+        );
+
+        let at_rest = skin.skin_matrices_blended(0, 0.0);
+        let at_full = skin.skin_matrices_blended(0, 1.0);
+        let rest_off = at_rest[ji].w_axis.truncate();
+        let full_off = at_full[ji].w_axis.truncate();
+        assert!(
+            full_off.distance(rest_off) > 0.01,
+            "full blend should move the charging handle joint away from rest ({rest_off:?} -> {full_off:?})"
+        );
 
         let filler_count = pose.joint_transforms.iter().filter(|p| p.is_none()).count();
         assert!(filler_count >= 18, "every other joint should be an inert filler with no animation entry, got {filler_count} inert of {}", skin.joint_names.len());
