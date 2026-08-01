@@ -9,15 +9,30 @@ use crate::renderer::{
     mesh::{create_texture_from_rgba, LoadedTexture},
     mesh_pipeline::{MeshPipeline, ModelUniform, SkinnedMeshPipeline},
     mirror::{self, MirrorPipeline, MirrorSurface, MirrorTarget},
+    panel::WorldPanel,
     particle::{self, Beam, Particle, ParticlePipeline},
     pipeline::{SolidPipeline, WirePipeline},
     ssr::{SceneTarget, SsrCameraUniform, SsrPipelines},
     uniforms::UniformBuffer,
-    MeshInstance,
+    Color3, MeshInstance,
 };
+use crate::ui2d::{Area, Color as UiColor, Font as Ui2dFont, Item, Shape as ShapeItem, ShapeType, Span, Text};
 use crate::xr::{VkContext, XrContext};
+use glam::{Quat, Vec3};
 use std::collections::HashMap;
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
+
+pub struct UiPanelRenderData {
+    pub id: String,
+    pub position: Vec3,
+    pub rotation: Quat,
+    pub width_m: f32,
+    pub height_m: f32,
+    pub background_color: Color3,
+    pub text: String,
+    pub text_color: Color3,
+}
 
 struct EyeTarget {
     _texture: wgpu::Texture,
@@ -41,6 +56,10 @@ type SkinnedDraw<'a> = (
     &'a wgpu::Buffer,
     u32,
 );
+
+fn ui_color(c: Color3) -> UiColor {
+    UiColor(c.0, c.1, c.2, c.3)
+}
 
 fn push_mesh_draws<'a>(
     instance: &'a MeshInstance,
@@ -104,6 +123,8 @@ pub struct XrRenderer {
     default_cuboid_lightmap: LoadedTexture,
     mesh_lightmaps: HashMap<String, LoadedTexture>,
     default_mesh_lightmap: LoadedTexture,
+    ui_font: Arc<Ui2dFont>,
+    ui_panel_instances: HashMap<String, WorldPanel>,
 }
 
 impl XrRenderer {
@@ -111,6 +132,7 @@ impl XrRenderer {
         vk: &VkContext,
         xr_ctx: &XrContext,
         session: &xr::Session<xr::Vulkan>,
+        ui_font_bytes: &[u8],
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let view_configs = xr_ctx.instance.enumerate_view_configuration_views(
             xr_ctx.system,
@@ -260,11 +282,68 @@ impl XrRenderer {
             default_cuboid_lightmap,
             mesh_lightmaps: HashMap::new(),
             default_mesh_lightmap,
+            ui_font: Arc::new(Ui2dFont::new(ui_font_bytes)),
+            ui_panel_instances: HashMap::new(),
         })
     }
 
-    /// Uploads (or replaces) the baked lightmap texture for a cuboid object,
-    /// keyed by its stable scene-object string id (`Cuboid::lightmap_key`).
+    fn sync_ui_panels(&mut self, panels: &[UiPanelRenderData]) {
+        const PIXELS_PER_METER: f32 = 700.0;
+        const TEXT_MARGIN_PX: f32 = 24.0;
+        const FONT_SIZE_PX: f32 = 48.0;
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for data in panels {
+            seen.insert(data.id.clone());
+
+            let width_px = ((data.width_m * PIXELS_PER_METER).round() as u32).clamp(1, 2048);
+            let height_px = ((data.height_m * PIXELS_PER_METER).round() as u32).clamp(1, 2048);
+
+            if !self.ui_panel_instances.contains_key(&data.id) {
+                let panel = WorldPanel::new(
+                    &self.wgpu_device,
+                    &self.wgpu_queue,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                    &self.mesh_pipeline,
+                    width_px,
+                    height_px,
+                    data.width_m,
+                    data.height_m,
+                );
+                self.ui_panel_instances.insert(data.id.clone(), panel);
+            }
+            let panel = self.ui_panel_instances.get_mut(&data.id).unwrap();
+            panel.position = data.position;
+            panel.rotation = data.rotation;
+            panel.upload_model(&self.wgpu_queue);
+
+            let items = vec![
+                (
+                    Area { offset: (0.0, 0.0), bounds: None },
+                    Item::Shape(ShapeItem {
+                        shape: ShapeType::Rectangle(0.0, (width_px as f32, height_px as f32), 0.0),
+                        color: ui_color(data.background_color),
+                    }),
+                ),
+                (
+                    Area { offset: (TEXT_MARGIN_PX, TEXT_MARGIN_PX), bounds: None },
+                    Item::Text(Text::new(
+                        vec![Span::new(
+                            data.text.clone(),
+                            self.ui_font.clone(),
+                            FONT_SIZE_PX,
+                            ui_color(data.text_color),
+                        )],
+                        (width_px as f32 - TEXT_MARGIN_PX * 2.0).max(1.0),
+                    )),
+                ),
+            ];
+            panel.mark_dirty();
+            panel.draw(&self.wgpu_device, &self.wgpu_queue, items);
+        }
+        self.ui_panel_instances.retain(|id, _| seen.contains(id));
+    }
+
     pub fn set_cuboid_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
         let tex = create_texture_from_rgba(
             &self.wgpu_device,
@@ -277,8 +356,6 @@ impl XrRenderer {
         self.cuboid_lightmaps.insert(key.to_string(), tex);
     }
 
-    /// Uploads (or replaces) the baked lightmap texture for a mesh object,
-    /// keyed by its stable scene-object string id (`MeshInstance::lightmap_key`).
     pub fn set_mesh_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
         let tex = create_texture_from_rgba(
             &self.wgpu_device,
@@ -334,7 +411,7 @@ impl XrRenderer {
         cuboids: &[Cuboid],
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
-        self.render_frame_with_meshes(session, stage, time, cuboids, &[], &[], &[], &[], &[], None)
+        self.render_frame_with_meshes(session, stage, time, cuboids, &[], &[], &[], &[], &[], None, &[])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -350,8 +427,11 @@ impl XrRenderer {
         particles: &[Particle],
         beams: &[Beam],
         mirror: Option<MirrorSurface>,
+        ui_panels: &[UiPanelRenderData],
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
+        self.sync_ui_panels(ui_panels);
+
         let image_index = self.swapchain.acquire_image()? as usize;
         self.swapchain.wait_image(xr::Duration::INFINITE)?;
         self.lights_uniform.upload(&self.wgpu_queue, lights);
@@ -423,6 +503,36 @@ impl XrRenderer {
                 .upload(&self.wgpu_queue, instance.mesh.model_matrix());
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(instance, lightmap_bg, &mut mesh_draws, &mut skinned_draws);
+        }
+
+        let ui_panel_list: Vec<&WorldPanel> = self.ui_panel_instances.values().collect();
+        let mut ui_panel_buffers: Vec<(wgpu::Buffer, wgpu::Buffer)> = Vec::with_capacity(ui_panel_list.len());
+        for panel in &ui_panel_list {
+            let vb = self
+                .wgpu_device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("ui_panel_vb"),
+                    contents: bytemuck::cast_slice(panel.vertices()),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let ib = self
+                .wgpu_device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("ui_panel_ib"),
+                    contents: bytemuck::cast_slice(panel.indices()),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            ui_panel_buffers.push((vb, ib));
+        }
+        for (panel, (vb, ib)) in ui_panel_list.iter().zip(ui_panel_buffers.iter()) {
+            mesh_draws.push((
+                &panel.model.bind_group,
+                panel.bind_group(),
+                &self.default_mesh_lightmap.bind_group,
+                vb,
+                ib,
+                panel.indices().len() as u32,
+            ));
         }
 
         let mut mirror_only_mesh_draws: Vec<MeshDraw> = Vec::new();
@@ -550,12 +660,6 @@ impl XrRenderer {
             let cam_pos = glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
             self.ssr_camera_uniform.upload(&self.wgpu_queue, eye_view_proj, cam_pos);
 
-            // Opaque scene, rendered once into an offscreen per-eye buffer
-            // with the same (non-reflected) camera as the swapchain image --
-            // the swapchain pass below blits this in as its base image
-            // (instead of redrawing every opaque object a second time) and
-            // the SSR redraw pass ray-marches it to approximate reflective
-            // cuboids seeing the rest of the scene. See `ssr.rs`.
             {
                 let mut encoder = self.wgpu_device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor { label: Some("ssr_scene") },
@@ -671,11 +775,6 @@ impl XrRenderer {
                     ..Default::default()
                 });
 
-                // Blit the opaque scene into the swapchain image -- also
-                // writes `self.depth_view` (via `@builtin(frag_depth)`,
-                // sampled from `scene_targets[eye]`'s own depth) to match,
-                // so the reflective redraw and mirror quad below get correct
-                // occlusion without re-rendering the opaque scene again.
                 pass.set_pipeline(&self.ssr_pipelines.blit_pipeline);
                 pass.set_bind_group(0, &self.scene_targets[eye].bind_group, &[]);
                 pass.draw(0..3, 0..1);

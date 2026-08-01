@@ -9,7 +9,7 @@ pub mod voxelize;
 #[cfg(target_os = "android")]
 pub mod xr;
 
-pub use renderer::{Color3, Cuboid, CuboidStyle, Renderer};
+pub use renderer::{Color3, Cuboid, CuboidShape, CuboidStyle, Renderer};
 
 #[cfg(target_os = "android")]
 pub use xr::{

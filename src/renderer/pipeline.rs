@@ -3,10 +3,6 @@ use super::lights::wgsl_lights_block;
 use super::ssr::wgsl_ssr_block;
 use wgpu::*;
 
-/// Shared 2-entry {texture, sampler} layout for the lightmap slot added to the
-/// solid/mesh/skinned-mesh pipelines -- same shape as the pre-existing
-/// mesh/skinned-mesh base-color texture_layout, factored out since this one is
-/// created fresh at three new call sites in this change.
 pub fn lightmap_bind_group_layout(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("lightmap_bgl"),
@@ -107,13 +103,6 @@ impl SolidPipeline {
         }
     }
 
-    /// Redraws reflective-only cuboid ranges on top of the SSR blit (see
-    /// `ssr.rs`), blending in a screen-space-reflected color for fragments
-    /// with `reflectivity > 0`. Reuses `SolidVertex`/its own vertex+index
-    /// buffer -- only the pipeline (and which ranges get drawn with it)
-    /// differs from the plain `solid_pipeline`. `LessEqual` (not `Less`)
-    /// since this redraws the same geometry the SSR blit's depth already
-    /// contains -- ties are expected, not just possible.
     pub fn new_ssr(
         device: &Device,
         format: TextureFormat,
@@ -343,10 +332,6 @@ mod tests {
     use crate::renderer::ssr::SsrPipelines;
     use crate::renderer::uniforms::UniformBuffer;
 
-    /// See `ssr.rs`'s equivalent test -- `cargo check` never runs WGSL
-    /// through naga, so `solid_ssr_shader()`'s ray-march code (the riskiest
-    /// shader in this change, with two extra bind groups spliced in) needs a
-    /// real device to catch a shader bug at all before an on-headset run.
     fn headless_gpu() -> Option<(Device, Queue)> {
         let instance = Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {

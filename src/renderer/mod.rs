@@ -15,7 +15,7 @@ pub mod uniforms;
 pub mod xr_renderer;
 
 pub use camera::Camera;
-pub use cuboid::{Cuboid, CuboidStyle};
+pub use cuboid::{Cuboid, CuboidShape, CuboidStyle};
 pub use icon::{billboard_rotation, IconAssets, IconKind};
 pub use lights::{Light, LightKind};
 pub use mesh::GltfMesh;
@@ -56,9 +56,6 @@ impl Color3 {
 pub struct MeshInstance<'a> {
     pub mesh: &'a GltfMesh,
     pub model: &'a mesh_pipeline::ModelUniform,
-    /// Scene object's stable string id -- looked up against
-    /// `Renderer::mesh_lightmaps` for a baked lightmap texture, falling back
-    /// to `default_mesh_lightmap` (1x1 white) when `None` or not yet baked.
     pub lightmap_key: Option<&'a str>,
 }
 
@@ -131,15 +128,11 @@ impl Renderer {
         }
     }
 
-    /// Uploads (or replaces) the baked lightmap texture for a cuboid object,
-    /// keyed by its stable scene-object string id (`Cuboid::lightmap_key`).
     pub fn set_cuboid_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
         let tex = create_texture_from_rgba(&self.device, &self.queue, &self.solid_pipeline.lightmap_layout, rgba, width, height);
         self.cuboid_lightmaps.insert(key.to_string(), tex);
     }
 
-    /// Uploads (or replaces) the baked lightmap texture for a mesh object,
-    /// keyed by its stable scene-object string id (`MeshInstance::lightmap_key`).
     pub fn set_mesh_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
         let tex = create_texture_from_rgba(&self.device, &self.queue, &self.mesh_pipeline.lightmap_layout, rgba, width, height);
         self.mesh_lightmaps.insert(key.to_string(), tex);
@@ -246,10 +239,6 @@ impl Renderer {
 
         let mut solid_verts: Vec<SolidVertex> = Vec::new();
         let mut solid_indices: Vec<u32> = Vec::new();
-        // (lightmap_key, index_start, count) per cuboid, in the shared
-        // solid_indices buffer -- lets render_internal issue one draw_indexed
-        // per cuboid with its own lightmap bind group bound, while still only
-        // uploading a single combined vertex/index buffer per frame.
         let mut solid_ranges: Vec<(Option<String>, u32, u32)> = Vec::new();
         let mut wire_verts: Vec<WireVertex> = Vec::new();
         let mut wire_indices: Vec<u32> = Vec::new();

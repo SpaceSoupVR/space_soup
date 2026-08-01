@@ -1,10 +1,5 @@
 use wgpu::*;
 
-/// Per-eye offscreen copy of the opaque scene (rendered with the same,
-/// non-reflected camera as the swapchain image) that the SSR pass ray-marches
-/// against and the blit pass copies into the swapchain image. Depth is
-/// `TEXTURE_BINDING` (unlike `mirror::MirrorTarget`'s) since the SSR shader
-/// needs to sample it, not just the color.
 pub struct SceneTarget {
     _color_texture: Texture,
     pub color_view: TextureView,
@@ -13,11 +8,6 @@ pub struct SceneTarget {
     pub bind_group: BindGroup,
 }
 
-/// `view_proj` (same matrix already uploaded to the shared camera uniform
-/// each eye) plus `camera_pos`, duplicated here because the shared camera
-/// uniform (`uniforms.rs`) is `ShaderStages::VERTEX`-only and shared by
-/// pipelines this change shouldn't touch -- the SSR fragment shader needs
-/// both to build and reproject the reflection ray.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct SsrCameraUniformData {
@@ -134,11 +124,6 @@ impl SsrPipelines {
                 polygon_mode: PolygonMode::Fill,
                 ..Default::default()
             },
-            // Always-pass + write: this is the first draw in a freshly
-            // cleared pass, and it writes the real per-pixel depth (via
-            // `@builtin(frag_depth)`, sampled from the scene depth texture)
-            // so later draws in the same pass (mirror quad, SSR redraw) get
-            // correct occlusion against it.
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
                 depth_write_enabled: true,
@@ -262,15 +247,6 @@ fn fs_main(@builtin(position) coord: vec4<f32>) -> FOut {
     .to_string()
 }
 
-/// Spliced into `pipeline.rs`'s SSR fragment shader the same way
-/// `lights::wgsl_lights_block` is spliced into `solid_shader()` -- ray-marches
-/// in world space (reprojecting each step through `ssr_camera.view_proj`,
-/// the same matrix used to render the sampled `scene_color`/`scene_depth`,
-/// so no inverse/depth-reconstruction is needed) along the fragment's own
-/// reflection vector, sampling `group_index`'s scene textures for a hit.
-/// Falls back to the passed-in base color (never black) on a miss, and fades
-/// out near the screen edge and at grazing reflection angles to hide the
-/// hard screen-space cutoff.
 pub fn wgsl_ssr_block(camera_group: u32, scene_group: u32) -> String {
     format!(
         r#"
@@ -352,12 +328,6 @@ fn ssr_reflect(world_pos: vec3<f32>, world_normal: vec3<f32>, base_color: vec3<f
 mod tests {
     use super::*;
 
-    /// `cargo check` type-checks WGSL string literals as plain `&str` --  it
-    /// never runs them through naga, so a shader syntax error only surfaces
-    /// when a real `Device` actually compiles it. This builds the blit
-    /// pipeline (and, in `pipeline.rs`, `SolidPipeline::new_ssr`) against a
-    /// real headless adapter to catch that class of bug without a Quest
-    /// headset. Skips gracefully if no adapter is available (e.g. CI).
     fn headless_gpu() -> Option<(Device, Queue)> {
         let instance = Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
@@ -386,8 +356,5 @@ mod tests {
         let _target = pipelines.create_scene_target(&device, format, 64, 64);
         let camera_uniform = pipelines.create_camera_uniform(&device);
         camera_uniform.upload(&queue, glam::Mat4::IDENTITY, glam::Vec3::ZERO);
-        // Reaching this point means the blit shader compiled and every
-        // pipeline/bind-group layout was accepted by a real device -- the
-        // actual assertion is "this didn't panic".
     }
 }

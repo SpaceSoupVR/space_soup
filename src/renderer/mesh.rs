@@ -12,10 +12,6 @@ pub struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
-    /// TEXCOORD_1, when the source GLB has one -- sampled against a baked
-    /// lightmap texture (see mesh_pipeline.rs's lightmap bind group). Zeroed
-    /// for meshes without a real second UV set; harmless, since those objects
-    /// only ever get a flat single-texel fallback bake (see lightmap_bake.py).
     pub uv2: [f32; 2],
 }
 
@@ -712,10 +708,6 @@ fn collect_node(
                 None => vec![[0.0, 0.0]; positions.len()],
             };
 
-            // TEXCOORD_1, when the GLB has one -- the lightmap UV set (see
-            // MeshVertex::uv2). Zero-filled otherwise; harmless, since a mesh
-            // without a real second UV channel only ever gets a flat
-            // single-texel fallback bake anyway (see lightmap_bake.py).
             let uv2s: Vec<[f32; 2]> = match reader.read_tex_coords(1) {
                 Some(uv) => uv.into_f32().collect(),
                 None => vec![[0.0, 0.0]; positions.len()],
