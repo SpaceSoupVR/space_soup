@@ -9,30 +9,15 @@ use crate::renderer::{
     mesh::{create_texture_from_rgba, LoadedTexture},
     mesh_pipeline::{MeshPipeline, ModelUniform, SkinnedMeshPipeline},
     mirror::{self, MirrorPipeline, MirrorSurface, MirrorTarget},
-    panel::WorldPanel,
     particle::{self, Beam, Particle, ParticlePipeline},
     pipeline::{SolidPipeline, WirePipeline},
     ssr::{SceneTarget, SsrCameraUniform, SsrPipelines},
     uniforms::UniformBuffer,
-    Color3, MeshInstance,
+    MeshInstance,
 };
-use crate::ui2d::{Area, Color as UiColor, Font as Ui2dFont, Item, Shape as ShapeItem, ShapeType, Span, Text};
 use crate::xr::{VkContext, XrContext};
-use glam::{Quat, Vec3};
 use std::collections::HashMap;
-use std::sync::Arc;
 use wgpu::util::DeviceExt;
-
-pub struct UiPanelRenderData {
-    pub id: String,
-    pub position: Vec3,
-    pub rotation: Quat,
-    pub width_m: f32,
-    pub height_m: f32,
-    pub background_color: Color3,
-    pub text: String,
-    pub text_color: Color3,
-}
 
 struct EyeTarget {
     _texture: wgpu::Texture,
@@ -56,10 +41,6 @@ type SkinnedDraw<'a> = (
     &'a wgpu::Buffer,
     u32,
 );
-
-fn ui_color(c: Color3) -> UiColor {
-    UiColor(c.0, c.1, c.2, c.3)
-}
 
 fn push_mesh_draws<'a>(
     instance: &'a MeshInstance,
@@ -200,7 +181,6 @@ impl XrRenderer {
         vk: &VkContext,
         xr_ctx: &XrContext,
         session: &xr::Session<xr::Vulkan>,
-        ui_font_bytes: &[u8],
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let view_configs = xr_ctx.instance.enumerate_view_configuration_views(
             xr_ctx.system,
@@ -421,7 +401,7 @@ impl XrRenderer {
         cuboids: &[Cuboid],
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
-        self.render_frame_with_meshes(session, stage, time, cuboids, &[], &[], &[], &[], &[], None, &[])
+        self.render_frame_with_meshes(session, stage, time, cuboids, &[], &[], &[], &[], &[], None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -437,11 +417,8 @@ impl XrRenderer {
         particles: &[Particle],
         beams: &[Beam],
         mirror: Option<MirrorSurface>,
-        ui_panels: &[UiPanelRenderData],
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
-        self.sync_ui_panels(ui_panels);
-
         let image_index = self.swapchain.acquire_image()? as usize;
         self.swapchain.wait_image(xr::Duration::INFINITE)?;
         let cpu_start = std::time::Instant::now();
@@ -514,36 +491,6 @@ impl XrRenderer {
                 .upload(&self.wgpu_queue, instance.mesh.model_matrix());
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(instance, lightmap_bg, &mut mesh_draws, &mut skinned_draws);
-        }
-
-        let ui_panel_list: Vec<&WorldPanel> = self.ui_panel_instances.values().collect();
-        let mut ui_panel_buffers: Vec<(wgpu::Buffer, wgpu::Buffer)> = Vec::with_capacity(ui_panel_list.len());
-        for panel in &ui_panel_list {
-            let vb = self
-                .wgpu_device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("ui_panel_vb"),
-                    contents: bytemuck::cast_slice(panel.vertices()),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            let ib = self
-                .wgpu_device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("ui_panel_ib"),
-                    contents: bytemuck::cast_slice(panel.indices()),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-            ui_panel_buffers.push((vb, ib));
-        }
-        for (panel, (vb, ib)) in ui_panel_list.iter().zip(ui_panel_buffers.iter()) {
-            mesh_draws.push((
-                &panel.model.bind_group,
-                panel.bind_group(),
-                &self.default_mesh_lightmap.bind_group,
-                vb,
-                ib,
-                panel.indices().len() as u32,
-            ));
         }
 
         let mut mirror_only_mesh_draws: Vec<MeshDraw> = Vec::new();
