@@ -22,6 +22,16 @@ use wgpu::util::DeviceExt;
 
 struct EyeTarget {
     _texture: wgpu::Texture,
+    /// One eye's layer, for the per-eye passes.
+    view: wgpu::TextureView,
+}
+
+/// Both swapchain layers as a single D2Array attachment — what a multiview pass
+/// renders into. Prepared here so collapsing the eye loop (C3 step 3) is a
+/// change to the pass body alone, not to resource setup.
+struct StereoTarget {
+    _texture: wgpu::Texture,
+    #[allow(dead_code)]
     view: wgpu::TextureView,
 }
 
@@ -76,6 +86,14 @@ fn push_mesh_draws<'a>(
     }
 }
 
+/// Upper bound on a scope render target.
+///
+/// The size actually used is derived per frame from how many pixels the ocular
+/// covers ([`scope::scope_target_size`]); this only caps a lens that fills the
+/// view. Once `OpticDef::quality` is plumbed through to the renderer this should
+/// come from the authored tier instead of being a single constant.
+const SCOPE_TARGET_MAX: u32 = 1024;
+
 pub struct XrRenderer {
     pub swapchain: xr::Swapchain<xr::Vulkan>,
     pub width: u32,
@@ -99,10 +117,20 @@ pub struct XrRenderer {
     particle_pipeline: ParticlePipeline,
     uniform_buf: UniformBuffer,
     lights_uniform: LightsUniform,
-    depth_view: wgpu::TextureView,
+    /// Per-eye depth slices, for passes still running once per eye.
+    depth_eye_views: [wgpu::TextureView; 2],
+    /// Both layers as one attachment, for the multiview eye pass. Unused
+    /// until the eye loop collapses (C3 step 3).
+    #[allow(dead_code)]
+    depth_stereo_view: wgpu::TextureView,
     eye_targets: Vec<[EyeTarget; 2]>,
+    /// Multiview attachments, one per swapchain image. Unused until the
+    /// eye loop collapses (C3 step 3).
+    #[allow(dead_code)]
+    eye_stereo_targets: Vec<StereoTarget>,
     scope_targets: Vec<ScopeTarget>,
     scope_composite: ScopeCompositePipeline,
+    scope_mip_blit: scope::MipBlit,
     scope_vp_uniform: UniformBuffer,
     cuboid_lightmaps: HashMap<String, LoadedTexture>,
     default_cuboid_lightmap: LoadedTexture,
@@ -237,8 +265,16 @@ impl XrRenderer {
         let mirror_reflected_vp_uniform = mirror_pipeline.create_reflected_vp_uniform(&wgpu_device);
         let scope_composite =
             ScopeCompositePipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let scope_mip_blit = scope::MipBlit::new(&wgpu_device, wgpu_format);
         let scope_targets: Vec<ScopeTarget> = (0..2)
-            .map(|_| scope_composite.create_target(&wgpu_device, wgpu_format, 768))
+            .map(|_| {
+                scope_composite.create_target(
+                    &wgpu_device,
+                    wgpu_format,
+                    SCOPE_TARGET_MAX,
+                    &scope_mip_blit,
+                )
+            })
             .collect();
         let scope_vp_uniform = UniformBuffer::new(&wgpu_device, &lights_uniform);
         let ssr_pipelines = SsrPipelines::new(&wgpu_device, wgpu_format);
@@ -256,12 +292,15 @@ impl XrRenderer {
         let particle_pipeline =
             ParticlePipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
 
+        // Two layers: a multiview pass writes both eyes' depth in one go, and
+        // each layer is still individually viewable for the per-eye passes that
+        // have not been collapsed yet.
         let depth_tex = wgpu_device.create_texture(&wgpu::TextureDescriptor {
             label: Some("xr_depth"),
             size: wgpu::Extent3d {
                 width,
                 height,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: 2,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -270,9 +309,27 @@ impl XrRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // Per-eye depth slices, for the passes still running once per eye.
+        let depth_eye_views: [wgpu::TextureView; 2] = std::array::from_fn(|eye| {
+            depth_tex.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("xr_depth_eye"),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: eye as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
+        // Both layers as one attachment, for the multiview eye pass.
+        let depth_stereo_view = depth_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("xr_depth_stereo"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            base_array_layer: 0,
+            array_layer_count: Some(2),
+            ..Default::default()
+        });
 
         let mut eye_targets: Vec<[EyeTarget; 2]> = Vec::new();
+        let mut eye_stereo_targets: Vec<StereoTarget> = Vec::new();
         for &raw_image in &raw_images {
             let targets = std::array::from_fn(|eye| {
                 let wgpu_tex = unsafe {
@@ -291,6 +348,22 @@ impl XrRenderer {
                 }
             });
             eye_targets.push(targets);
+
+            let stereo_tex = unsafe {
+                import_vk_image_as_wgpu(&wgpu_device, raw_image, wgpu_format, width, height, 2)
+            };
+            let stereo_view = stereo_tex.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("eye_stereo"),
+                format: Some(wgpu_format),
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                base_array_layer: 0,
+                array_layer_count: Some(2),
+                ..Default::default()
+            });
+            eye_stereo_targets.push(StereoTarget {
+                _texture: stereo_tex,
+                view: stereo_view,
+            });
         }
 
         let white_pixel = [255u8, 255, 255, 255];
@@ -329,6 +402,7 @@ impl XrRenderer {
             mirror_reflected_vp_uniform,
             scope_targets,
             scope_composite,
+            scope_mip_blit,
             scope_vp_uniform,
             ssr_pipelines,
             ssr_solid_pipeline,
@@ -337,8 +411,10 @@ impl XrRenderer {
             particle_pipeline,
             uniform_buf,
             lights_uniform,
-            depth_view,
+            depth_eye_views,
+            depth_stereo_view,
             eye_targets,
+            eye_stereo_targets,
             cuboid_lightmaps: HashMap::new(),
             default_cuboid_lightmap,
             mesh_lightmaps: HashMap::new(),
@@ -460,6 +536,43 @@ impl XrRenderer {
         let cam_right = head_rot * glam::Vec3::X;
         let cam_up = head_rot * glam::Vec3::Y;
         let view_dir = head_rot * glam::Vec3::NEG_Z;
+
+        // Size each scope target to the lens as it actually appears on screen.
+        // A fixed constant is both wasteful and the source of the shimmer: a 768
+        // target composited onto a ~200px ocular disc is a 3-5x minification.
+        // Sizes are powers of two and change only when the eye moves a long way
+        // relative to the lens, so reallocation is rare.
+        //
+        // This runs here, before the draw lists are built, because those hold
+        // immutable borrows of self (lightmap bind groups) for the rest of the
+        // frame — resizing any later cannot borrow self mutably.
+        {
+            let eye_p = eye_views[0].pose.position;
+            let eye_pos = glam::Vec3::new(eye_p.x, eye_p.y, eye_p.z);
+            let fov = eye_views[0].fov;
+            let vertical_fov = (fov.angle_up - fov.angle_down).abs();
+            for i in 0..scopes.len().min(self.scope_targets.len()) {
+                let sr = &scopes[i];
+                let want = scope::scope_target_size(
+                    sr.ocular_radius_m,
+                    eye_pos.distance(sr.ocular),
+                    self.height,
+                    vertical_fov,
+                    SCOPE_TARGET_MAX,
+                    1.0,
+                );
+                if self.scope_targets[i].size != want {
+                    let format = self.scope_targets[i].color.format();
+                    let resized = self.scope_composite.create_target(
+                        &self.wgpu_device,
+                        format,
+                        want,
+                        &self.scope_mip_blit,
+                    );
+                    self.scope_targets[i] = resized;
+                }
+            }
+        }
 
         let (solid_verts, solid_idx, solid_ranges) = build_solid_mesh_with_ranges(cuboids);
         let (wire_verts, wire_idx) = build_wire_mesh(cuboids);
@@ -627,6 +740,14 @@ impl XrRenderer {
                     }
                 }
             }
+
+            // Build the mip chain while the world image is still fresh. The
+            // composite minifies this target onto an ocular disc several times
+            // smaller, so without a chain it undersamples and crawls under head
+            // motion. Must be inside the same encoder, after the pass is
+            // dropped and before submit.
+            self.scope_targets[i].generate_mips(&mut encoder, &self.scope_mip_blit);
+
             self.wgpu_queue.submit(Some(encoder.finish()));
         }
 
@@ -861,7 +982,7 @@ impl XrRenderer {
                         },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.depth_view,
+                        view: &self.depth_eye_views[eye],
                         depth_ops: Some(wgpu::Operations {
                             load: wgpu::LoadOp::Clear(1.0),
                             store: wgpu::StoreOp::Store,
@@ -974,11 +1095,16 @@ unsafe fn build_wgpu_from_vulkan(
         .expose_adapter(vk.physical_device)
         .ok_or("wgpu: failed to expose physical device")?;
 
+    // MULTIVIEW must be declared on both halves of the adoption: here, so the
+    // hal device knows the capability was enabled on the VkDevice (see
+    // xr::vulkan, which sets PhysicalDeviceMultiviewFeatures), and again in the
+    // DeviceDescriptor below. Declaring it in only one place fails at device
+    // creation rather than at pipeline creation, which is at least loud.
     let open_device = exposed.adapter.device_from_raw(
         vk.device.clone(),
         None,
         &[],
-        wgpu::Features::empty(),
+        wgpu::Features::MULTIVIEW,
         &wgpu::MemoryHints::default(),
         vk.queue_family_index,
         0,
@@ -991,7 +1117,7 @@ unsafe fn build_wgpu_from_vulkan(
     let (device, queue) = wgpu_adapter.create_device_from_hal(
         open_device,
         &wgpu::DeviceDescriptor {
-            required_features: wgpu::Features::empty(),
+            required_features: wgpu::Features::MULTIVIEW,
             required_limits: wgpu::Limits {
                 max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d,
                 ..wgpu::Limits::downlevel_defaults()

@@ -62,11 +62,20 @@ impl VkContext {
             p_queue_priorities: queue_priorities.as_ptr(),
             ..Default::default()
         };
-        let device_ci = vk::DeviceCreateInfo {
-            queue_create_info_count: 1,
-            p_queue_create_infos: &queue_info,
-            ..Default::default()
-        };
+        let queue_infos = [queue_info];
+
+        // Multiview is core in Vulkan 1.1 (requested above), so it needs no
+        // extension — but it is off unless the feature is enabled here. Without
+        // it, wgpu cannot expose Features::MULTIVIEW and every single-pass
+        // stereo pipeline fails at creation.
+        //
+        // `multiview_features` must outlive the create call: DeviceCreateInfo
+        // holds a raw p_next pointer into it.
+        let mut multiview_features =
+            vk::PhysicalDeviceMultiviewFeatures::default().multiview(true);
+        let device_ci = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_infos)
+            .push_next(&mut multiview_features);
 
         let device = unsafe {
             let raw = xr

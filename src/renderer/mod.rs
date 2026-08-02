@@ -501,3 +501,263 @@ impl Renderer {
     }
 }
 
+
+#[cfg(test)]
+mod multiview_capability_tests {
+    //! C3 (single-pass stereo) gate.
+    //!
+    //! Multiview is a *device* capability before it is a rendering technique:
+    //! the VkDevice must enable `PhysicalDeviceMultiviewFeatures` (see
+    //! `crate::xr::vulkan`), wgpu must be told about it on both halves of the
+    //! hal adoption, and only then can a pipeline declare `multiview`.
+    //!
+    //! Like every WGSL/pipeline property in wgpu, that declaration is validated
+    //! at **pipeline creation**, not at `cargo build` — so a clean compile
+    //! proves nothing. These tests build a real multiview pipeline inside a
+    //! validation error scope, which is the only way to find out before the
+    //! headset does.
+
+    fn multiview_device() -> Option<(wgpu::Device, wgpu::Queue, bool)> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        let supported = adapter.features().contains(wgpu::Features::MULTIVIEW);
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: if supported {
+                wgpu::Features::MULTIVIEW
+            } else {
+                wgpu::Features::empty()
+            },
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .ok()?;
+        Some((device, queue, supported))
+    }
+
+    /// Reports whether this machine can validate C3 locally at all. Never fails:
+    /// a desktop adapter without multiview is a fact about the test machine, not
+    /// a defect in the renderer. Quest's Adreno does support it.
+    #[test]
+    fn report_whether_this_adapter_can_validate_multiview() {
+        let Some((_d, _q, supported)) = multiview_device() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        if supported {
+            eprintln!("multiview: SUPPORTED on this adapter — C3 pipelines are locally verifiable");
+        } else {
+            eprintln!(
+                "multiview: NOT supported on this adapter — C3 pipeline validation can only \
+                 happen on device. Shader and uniform restructuring is still testable here."
+            );
+        }
+    }
+
+    /// A multiview pipeline plus a `@builtin(view_index)` shader must survive
+    /// naga validation and pipeline creation. This is the shape every C3
+    /// pipeline takes, so if it builds, the approach is sound.
+    #[test]
+    fn a_two_view_pipeline_with_view_index_builds_on_a_real_device() {
+        let Some((device, _queue, supported)) = multiview_device() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        if !supported {
+            eprintln!("skipping: adapter lacks MULTIVIEW (expected on some desktop GPUs)");
+            return;
+        }
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("multiview_probe"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+// Per-eye matrices indexed by view. This is exactly how the real pipelines
+// will pick their eye: one draw, two views, no CPU-side loop.
+struct Eyes { view_proj: array<mat4x4<f32>, 2>, };
+@group(0) @binding(0) var<uniform> eyes: Eyes;
+
+@vertex
+fn vs(
+    @location(0) pos: vec3<f32>,
+    @builtin(view_index) view: i32,
+) -> @builtin(position) vec4<f32> {
+    return eyes.view_proj[view] * vec4<f32>(pos, 1.0);
+}
+
+@fragment
+fn fs() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+}
+"#
+                .into(),
+            ),
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("multiview_probe_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    }],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: std::num::NonZeroU32::new(2),
+            cache: None,
+        });
+        let err = pollster::block_on(device.pop_error_scope());
+        assert!(err.is_none(), "multiview pipeline failed validation: {err:?}");
+    }
+
+    /// The real `SolidPipeline` must build in BOTH variants: single-view for the
+    /// offscreen passes (scope world view, mirror reflection, which render into
+    /// single-layer targets) and multiview for the eye pass. They share a bind
+    /// group layout because the camera uniform is always `array<mat4x4, 2>` —
+    /// single-view shaders read slot 0, multiview indexes by `view_index`.
+    #[test]
+    fn the_solid_pipeline_builds_single_view_and_multiview() {
+        use crate::renderer::lights::LightsUniform;
+        use crate::renderer::pipeline::SolidPipeline;
+        use crate::renderer::uniforms::UniformBuffer;
+
+        let Some((device, _queue, supported)) = multiview_device() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let lights = LightsUniform::new(&device);
+        let uniforms = UniformBuffer::new(&device, &lights);
+
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _single = SolidPipeline::new(&device, format, &uniforms.layout);
+        let err = pollster::block_on(device.pop_error_scope());
+        assert!(err.is_none(), "single-view solid pipeline failed: {err:?}");
+
+        if !supported {
+            eprintln!("skipping multiview half: adapter lacks MULTIVIEW");
+            return;
+        }
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _stereo = SolidPipeline::new_multiview(&device, format, &uniforms.layout);
+        let err = pollster::block_on(device.pop_error_scope());
+        assert!(err.is_none(), "multiview solid pipeline failed: {err:?}");
+    }
+
+    /// Every pipeline the eye pass draws with must have a working multiview
+    /// variant, or the pass cannot be collapsed to one draw per object.
+    ///
+    /// This builds them all under a validation scope, which is the only place
+    /// multiview is actually checked — a clean `cargo build` says nothing about
+    /// whether `@builtin(view_index)` survived naga or whether the pipeline is
+    /// legal against a 2-layer attachment.
+    #[test]
+    fn every_eye_pass_pipeline_has_a_valid_multiview_variant() {
+        use crate::renderer::lights::LightsUniform;
+        use crate::renderer::mesh_pipeline::{MeshPipeline, SkinnedMeshPipeline};
+        use crate::renderer::particle::ParticlePipeline;
+        use crate::renderer::pipeline::{SolidPipeline, WirePipeline};
+        use crate::renderer::uniforms::UniformBuffer;
+
+        let Some((device, _queue, supported)) = multiview_device() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        if !supported {
+            eprintln!("skipping: adapter lacks MULTIVIEW");
+            return;
+        }
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let lights = LightsUniform::new(&device);
+        let u = UniformBuffer::new(&device, &lights);
+
+        // One scope per pipeline so a failure names the culprit.
+        macro_rules! check {
+            ($label:literal, $build:expr) => {{
+                device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let _p = $build;
+                let err = pollster::block_on(device.pop_error_scope());
+                assert!(err.is_none(), concat!($label, " multiview variant failed: {:?}"), err);
+            }};
+        }
+
+        check!("solid", SolidPipeline::new_multiview(&device, format, &u.layout));
+        check!("wire", WirePipeline::new_multiview(&device, format, &u.layout));
+        check!("mesh", MeshPipeline::new_multiview(&device, format, &u.layout));
+        check!("skinned", SkinnedMeshPipeline::new_multiview(&device, format, &u.layout));
+        check!("particle", ParticlePipeline::new_multiview(&device, format, &u.layout));
+    }
+
+    /// The offscreen passes must stay single-view: the scope world view and the
+    /// mirror reflection render into single-layer targets, where a multiview
+    /// pipeline is invalid. They share the camera uniform layout with the
+    /// stereo variants because it is always `array<mat4x4, 2>`.
+    #[test]
+    fn offscreen_pipelines_remain_single_view() {
+        use crate::renderer::lights::LightsUniform;
+        use crate::renderer::mesh_pipeline::MeshPipeline;
+        use crate::renderer::pipeline::SolidPipeline;
+        use crate::renderer::uniforms::UniformBuffer;
+
+        let Some((device, _queue, _supported)) = multiview_device() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let lights = LightsUniform::new(&device);
+        let u = UniformBuffer::new(&device, &lights);
+
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _solid = SolidPipeline::new(&device, format, &u.layout);
+        let _mirror_solid = SolidPipeline::new_mirror(&device, format, &u.layout);
+        let _mesh = MeshPipeline::new(&device, format, &u.layout);
+        let _mirror_mesh = MeshPipeline::new_mirror(&device, format, &u.layout);
+        let err = pollster::block_on(device.pop_error_scope());
+        assert!(err.is_none(), "single-view offscreen pipelines failed: {err:?}");
+    }
+}

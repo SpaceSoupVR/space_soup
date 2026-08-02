@@ -119,10 +119,29 @@ pub struct ParticlePipeline {
 }
 
 impl ParticlePipeline {
+    /// Single-view, for offscreen passes into single-layer targets.
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
+        Self::new_with_views(device, format, uniform_layout, 1)
+    }
+
+    /// Single-pass stereo, for the eye pass against a 2-layer attachment.
+    pub fn new_multiview(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+    ) -> Self {
+        Self::new_with_views(device, format, uniform_layout, 2)
+    }
+
+    fn new_with_views(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        views: u32,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("particle_shader"),
-            source: ShaderSource::Wgsl(particle_shader().into()),
+            source: ShaderSource::Wgsl(particle_shader(views).into()),
         });
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("particle_layout"),
@@ -163,38 +182,40 @@ impl ParticlePipeline {
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState::default(),
-            multiview: None,
+            multiview: std::num::NonZeroU32::new(views).filter(|v| v.get() > 1),
             cache: None,
         });
         Self { pipeline }
     }
 }
 
-fn particle_shader() -> String {
-    r#"
-struct Uniforms { view_proj: mat4x4<f32> }
-@group(0) @binding(0) var<uniform> u: Uniforms;
-
-struct VIn  { @location(0) pos: vec3<f32>, @location(1) col: vec4<f32>, @location(2) uv: vec2<f32> }
-struct VOut {
+fn particle_shader(views: u32) -> String {
+    let camera_block = super::uniforms::camera_uniform_wgsl(0, 0);
+    let view_param = super::uniforms::view_index_param(views);
+    let view_proj = super::uniforms::view_proj_expr(views);
+    format!(
+        r#"
+{camera_block}
+struct VIn  {{ @location(0) pos: vec3<f32>, @location(1) col: vec4<f32>, @location(2) uv: vec2<f32> }}
+struct VOut {{
     @builtin(position) clip: vec4<f32>,
     @location(0) col: vec4<f32>,
     @location(1) uv: vec2<f32>,
-}
+}}
 
-@vertex fn vs_main(v: VIn) -> VOut {
+@vertex fn vs_main(v: VIn{view_param}) -> VOut {{
     var out: VOut;
-    out.clip = u.view_proj * vec4<f32>(v.pos, 1.0);
+    out.clip = {view_proj} * vec4<f32>(v.pos, 1.0);
     out.col = v.col;
     out.uv = v.uv;
     return out;
-}
+}}
 
-@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {
+@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let fall = clamp(1.0 - length(in.uv), 0.0, 1.0);
     return vec4<f32>(in.col.rgb, in.col.a * fall * fall);
-}
+}}
 "#
-    .to_string()
+    )
 }
 

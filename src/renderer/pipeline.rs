@@ -36,12 +36,24 @@ pub struct WirePipeline {
 }
 
 impl SolidPipeline {
+    /// Single-view. Used by the offscreen passes (scope world view, mirror
+    /// reflection) which render into single-layer targets.
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
-        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Ccw)
+        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Ccw, 1)
+    }
+
+    /// Single-pass stereo, for the eye pass. Only valid against a 2-layer
+    /// attachment; pointing it at a single-layer target is a validation error.
+    pub fn new_multiview(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+    ) -> Self {
+        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Ccw, 2)
     }
 
     pub fn new_mirror(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
-        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Cw)
+        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Cw, 1)
     }
 
     fn new_with_front_face(
@@ -49,10 +61,11 @@ impl SolidPipeline {
         format: TextureFormat,
         uniform_layout: &BindGroupLayout,
         front_face: FrontFace,
+        views: u32,
     ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("solid_shader"),
-            source: ShaderSource::Wgsl(solid_shader().into()),
+            source: ShaderSource::Wgsl(solid_shader(views).into()),
         });
         let lightmap_layout = lightmap_bind_group_layout(device);
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -94,7 +107,7 @@ impl SolidPipeline {
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState::default(),
-            multiview: None,
+            multiview: std::num::NonZeroU32::new(views).filter(|v| v.get() > 1),
             cache: None,
         });
         Self {
@@ -165,10 +178,29 @@ impl SolidPipeline {
 }
 
 impl WirePipeline {
+    /// Single-view, for offscreen passes into single-layer targets.
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
+        Self::new_with_views(device, format, uniform_layout, 1)
+    }
+
+    /// Single-pass stereo, for the eye pass against a 2-layer attachment.
+    pub fn new_multiview(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+    ) -> Self {
+        Self::new_with_views(device, format, uniform_layout, 2)
+    }
+
+    fn new_with_views(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        views: u32,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("wire_shader"),
-            source: ShaderSource::Wgsl(WIRE_SHADER.into()),
+            source: ShaderSource::Wgsl(wire_shader(views).into()),
         });
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("wire_layout"),
@@ -208,19 +240,20 @@ impl WirePipeline {
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState::default(),
-            multiview: None,
+            multiview: std::num::NonZeroU32::new(views).filter(|v| v.get() > 1),
             cache: None,
         });
         Self { pipeline }
     }
 }
 
-fn solid_shader() -> String {
+fn solid_shader(views: u32) -> String {
+    let camera_block = super::uniforms::camera_uniform_wgsl(0, 0);
+    let view_param = super::uniforms::view_index_param(views);
+    let view_proj = super::uniforms::view_proj_expr(views);
     format!(
         r#"
-struct Uniforms {{ view_proj: mat4x4<f32> }}
-@group(0) @binding(0) var<uniform> u: Uniforms;
-
+{camera_block}
 @group(1) @binding(0) var lm_tex: texture_2d<f32>;
 @group(1) @binding(1) var lm_samp: sampler;
 
@@ -235,9 +268,9 @@ struct VOut {{
     @location(3) uv2: vec2<f32>,
 }}
 
-@vertex fn vs_main(v: VIn) -> VOut {{
+@vertex fn vs_main(v: VIn{view_param}) -> VOut {{
     var out: VOut;
-    out.clip      = u.view_proj * vec4<f32>(v.pos, 1.0);
+    out.clip      = {view_proj} * vec4<f32>(v.pos, 1.0);
     out.col       = v.col;
     out.normal    = v.norm;
     out.world_pos = v.pos;
@@ -310,20 +343,25 @@ struct VOut {{
     )
 }
 
-const WIRE_SHADER: &str = r#"
-struct Uniforms { view_proj: mat4x4<f32> }
-@group(0) @binding(0) var<uniform> u: Uniforms;
+fn wire_shader(views: u32) -> String {
+    let camera_block = super::uniforms::camera_uniform_wgsl(0, 0);
+    let view_param = super::uniforms::view_index_param(views);
+    let view_proj = super::uniforms::view_proj_expr(views);
+    format!(
+        r#"
+{camera_block}
+struct VIn  {{ @location(0) pos: vec3<f32>, @location(1) col: vec4<f32> }}
+struct VOut {{ @builtin(position) clip: vec4<f32>, @location(0) col: vec4<f32> }}
 
-struct VIn  { @location(0) pos: vec3<f32>, @location(1) col: vec4<f32> }
-struct VOut { @builtin(position) clip: vec4<f32>, @location(0) col: vec4<f32> }
-
-@vertex fn vs_main(v: VIn) -> VOut {
-    var p = u.view_proj * vec4<f32>(v.pos, 1.0);
+@vertex fn vs_main(v: VIn{view_param}) -> VOut {{
+    var p = {view_proj} * vec4<f32>(v.pos, 1.0);
     p.z -= 0.0001 * p.w;
     return VOut(p, v.col);
+}}
+@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{ return in.col; }}
+"#
+    )
 }
-@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> { return in.col; }
-"#;
 
 #[cfg(test)]
 mod tests {

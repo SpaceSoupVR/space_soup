@@ -23,6 +23,69 @@
 
 use glam::{Mat4, Vec3};
 
+/// Smallest scope target worth rendering. Below this the sight picture is mush
+/// regardless of filtering.
+pub const MIN_SCOPE_TARGET: u32 = 128;
+
+/// Mip levels for a square texture of `size` — `floor(log2(size)) + 1`.
+pub fn mip_level_count_for(size: u32) -> u32 {
+    32 - size.max(1).leading_zeros()
+}
+
+/// Diameter, in screen pixels, that the ocular lens covers for an eye at
+/// `eye_to_ocular_m`.
+///
+/// A viewport `viewport_height_px` tall spans `vertical_fov_rad`, so one radian
+/// is `viewport_height_px / vertical_fov_rad` pixels, and the lens subtends
+/// `2 * atan(r / d)` radians.
+pub fn ocular_screen_diameter_px(
+    ocular_radius_m: f32,
+    eye_to_ocular_m: f32,
+    viewport_height_px: u32,
+    vertical_fov_rad: f32,
+) -> f32 {
+    if eye_to_ocular_m <= 1e-4 || vertical_fov_rad <= 1e-4 {
+        return 0.0;
+    }
+    let subtended = 2.0 * (ocular_radius_m.max(0.0) / eye_to_ocular_m).atan();
+    subtended / vertical_fov_rad * viewport_height_px as f32
+}
+
+/// Resolution to render the scope at, derived from how big the lens actually is
+/// on screen.
+///
+/// A fixed tier constant is the wrong shape for this. The ocular covers on the
+/// order of 150–250 px, so a fixed 768² target is both ~15× more pixels than
+/// needed **and** the direct cause of aliasing: compositing 768² down onto a
+/// 200 px disc is a 3–5× minification, which samples a handful of texels where
+/// it should be averaging a few dozen. Matching the target to the disc removes
+/// the waste and the shimmer at the same time.
+///
+/// `supersample` above 1.0 renders larger and lets the mip chain average back
+/// down — real SSAA, which unlike MSAA also anti-aliases shading, and which is
+/// unusually cheap here because collimation means one render serves both eyes.
+///
+/// Rounded up to a power of two so the mip chain is exact, and clamped so a lens
+/// filling the view cannot blow past the quality tier's budget.
+pub fn scope_target_size(
+    ocular_radius_m: f32,
+    eye_to_ocular_m: f32,
+    viewport_height_px: u32,
+    vertical_fov_rad: f32,
+    tier_max: u32,
+    supersample: f32,
+) -> u32 {
+    let disc = ocular_screen_diameter_px(
+        ocular_radius_m,
+        eye_to_ocular_m,
+        viewport_height_px,
+        vertical_fov_rad,
+    );
+    let wanted = (disc * supersample.max(1.0)).ceil().max(1.0);
+    let pow2 = (wanted as u32).next_power_of_two();
+    pow2.clamp(MIN_SCOPE_TARGET, tier_max.max(MIN_SCOPE_TARGET))
+}
+
 /// A virtual camera looking down an optic's axis.
 ///
 /// `fov_y` is the optic's **true** (world) field of view, i.e. apparent field
@@ -168,7 +231,7 @@ pub fn build_lens_quad(render: &ScopeRender, world_up: Vec3) -> [[f32; 3]; 6] {
 }
 
 #[cfg(feature = "renderer")]
-pub use gpu::{ScopeCompositePipeline, ScopeParams, ScopeTarget};
+pub use gpu::{MipBlit, ScopeCompositePipeline, ScopeParams, ScopeTarget};
 
 #[cfg(feature = "renderer")]
 mod gpu {
@@ -181,23 +244,180 @@ mod gpu {
     /// sampled by the per-eye composite.
     pub struct ScopeTarget {
         pub color: Texture,
+        /// Mip 0 only — the world pass renders here.
         pub color_view: TextureView,
         pub depth: Texture,
         pub depth_view: TextureView,
         pub sampler: Sampler,
+        /// Samples the whole chain; this is what the composite binds.
         pub texture_bind_group: wgpu::BindGroup,
         pub size: u32,
+        pub mip_levels: u32,
+        /// One render-attachment view per level, `mip_views[i]` = level i.
+        pub mip_views: Vec<TextureView>,
+        /// `mip_src_bind_groups[i]` samples level i, to render level i + 1.
+        pub mip_src_bind_groups: Vec<wgpu::BindGroup>,
+    }
+
+    impl ScopeTarget {
+        /// Fill mips 1..n by successive halving.
+        ///
+        /// Must run after the world pass and before the composite, every frame
+        /// the scope is drawn — the chain is stale otherwise, and a stale chain
+        /// looks like a smeared sight picture rather than an obvious bug.
+        pub fn generate_mips(&self, encoder: &mut wgpu::CommandEncoder, blit: &MipBlit) {
+            for level in 1..self.mip_levels as usize {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scope_mip_blit"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.mip_views[level],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&blit.pipeline);
+                pass.set_bind_group(0, &self.mip_src_bind_groups[level - 1], &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+    }
+
+    /// Downsample pass used to build the scope target's mip chain.
+    ///
+    /// wgpu has no `generate_mipmaps`, so this is an explicit blit: a fullscreen
+    /// triangle sampling level N-1 with a linear filter into level N. Bilinear
+    /// on an exact 2:1 reduction averages the right four texels, which is all a
+    /// box filter needs.
+    pub struct MipBlit {
+        pub pipeline: wgpu::RenderPipeline,
+        pub layout: wgpu::BindGroupLayout,
+        pub sampler: Sampler,
+    }
+
+    impl MipBlit {
+        pub fn new(device: &Device, format: TextureFormat) -> Self {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("scope_mip_blit_shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+// Fullscreen triangle: no vertex buffer, no index buffer.
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> VsOut {
+    var out: VsOut;
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    out.uv = vec2<f32>(x, y);
+    out.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    return out;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(src, samp, in.uv);
+}
+"#
+                    .into(),
+                ),
+            });
+
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("scope_mip_blit_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("scope_mip_blit_pl"),
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("scope_mip_blit_pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("scope_mip_blit_sampler"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+
+            Self { pipeline, layout, sampler }
+        }
     }
 
     impl ScopeCompositePipeline {
         /// Square target: an optic's field is circular, so a square keeps the
         /// angular sampling isotropic and the mask cheap.
-        pub fn create_target(&self, device: &Device, format: TextureFormat, size: u32) -> ScopeTarget {
+        pub fn create_target(
+            &self,
+            device: &Device,
+            format: TextureFormat,
+            size: u32,
+            mip_blit: &MipBlit,
+        ) -> ScopeTarget {
             let size = size.max(16);
+            let mip_levels = super::mip_level_count_for(size);
             let color = device.create_texture(&TextureDescriptor {
                 label: Some("scope_color"),
                 size: Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-                mip_level_count: 1,
+                mip_level_count: mip_levels,
                 sample_count: 1,
                 dimension: TextureDimension::D2,
                 format,
@@ -225,16 +445,61 @@ mod gpu {
                 address_mode_w: wgpu::AddressMode::ClampToEdge,
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
+                // Trilinear. This is the fix for scope shimmer: the composite
+                // minifies the target onto an ocular disc a few times smaller,
+                // and bilinear-without-mips samples four texels where it needs
+                // to average dozens. That undersampling crawls under head
+                // motion and reads as "the scope is aliased".
+                mipmap_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             });
-            let color_view = color.create_view(&TextureViewDescriptor::default());
+            // Sampling view spans the whole chain; the render attachment is mip 0.
+            let sample_view = color.create_view(&TextureViewDescriptor::default());
+            let mip_views: Vec<TextureView> = (0..mip_levels)
+                .map(|level| {
+                    color.create_view(&TextureViewDescriptor {
+                        label: Some("scope_mip"),
+                        base_mip_level: level,
+                        mip_level_count: Some(1),
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            let mip_src_bind_groups: Vec<wgpu::BindGroup> = (0..mip_levels as usize)
+                .map(|level| {
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("scope_mip_src"),
+                        layout: &mip_blit.layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&mip_views[level]),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&mip_blit.sampler),
+                            },
+                        ],
+                    })
+                })
+                .collect();
+            // Separate mip-0 view for the world pass to render into. wgpu views
+            // are not Clone, and the same level can be viewed more than once.
+            let color_view = color.create_view(&TextureViewDescriptor {
+                label: Some("scope_color_mip0"),
+                base_mip_level: 0,
+                mip_level_count: Some(1),
+                ..Default::default()
+            });
             let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("scope_texture_bg"),
                 layout: &self.texture_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&color_view),
+                        // The whole chain, not mip 0 — binding a single level
+                        // would make mipmap_filter a no-op and undo the fix.
+                        resource: wgpu::BindingResource::TextureView(&sample_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -250,6 +515,9 @@ mod gpu {
                 sampler,
                 texture_bind_group,
                 size,
+                mip_levels,
+                mip_views,
+                mip_src_bind_groups,
             }
         }
 
@@ -503,6 +771,80 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 #[cfg(test)]
+mod target_sizing_tests {
+    use super::*;
+
+    // Quest-3-ish: ~1000 px tall per eye over a ~96 deg vertical field.
+    const VP_H: u32 = 1000;
+    const EYE_FOV: f32 = 96.0_f32 * std::f32::consts::PI / 180.0;
+    // A typical scope ocular and a cheek-weld eye relief.
+    const OCULAR_R: f32 = 0.017;
+    const RELIEF: f32 = 0.095;
+
+    #[test]
+    fn mip_counts_follow_log2() {
+        assert_eq!(mip_level_count_for(1), 1);
+        assert_eq!(mip_level_count_for(2), 2);
+        assert_eq!(mip_level_count_for(128), 8);
+        assert_eq!(mip_level_count_for(768), 10);
+        assert_eq!(mip_level_count_for(1024), 11);
+    }
+
+    #[test]
+    fn a_real_scope_ocular_covers_a_couple_hundred_pixels() {
+        let d = ocular_screen_diameter_px(OCULAR_R, RELIEF, VP_H, EYE_FOV);
+        assert!(
+            (150.0..280.0).contains(&d),
+            "expected a 150-280px disc for a real scope, got {d:.0}px"
+        );
+    }
+
+    /// The whole point of the change: a fixed 768 target was several times
+    /// larger than the disc it composites onto, which is what caused the
+    /// undersampling in the first place.
+    #[test]
+    fn the_target_is_sized_to_the_disc_not_to_a_fixed_tier_constant() {
+        let size = scope_target_size(OCULAR_R, RELIEF, VP_H, EYE_FOV, 1024, 1.0);
+        let disc = ocular_screen_diameter_px(OCULAR_R, RELIEF, VP_H, EYE_FOV);
+        assert!(size < 768, "should be far below the old fixed 768, got {size}");
+        assert!(size as f32 >= disc, "must not be smaller than the disc it fills");
+    }
+
+    #[test]
+    fn a_lens_further_from_the_eye_needs_a_smaller_target() {
+        let near = scope_target_size(OCULAR_R, 0.05, VP_H, EYE_FOV, 1024, 1.0);
+        let far = scope_target_size(OCULAR_R, 0.30, VP_H, EYE_FOV, 1024, 1.0);
+        assert!(far <= near, "a smaller on-screen disc must not cost more, {far} vs {near}");
+    }
+
+    #[test]
+    fn supersampling_raises_the_target_and_the_tier_still_caps_it() {
+        let base = scope_target_size(OCULAR_R, RELIEF, VP_H, EYE_FOV, 1024, 1.0);
+        let ss = scope_target_size(OCULAR_R, RELIEF, VP_H, EYE_FOV, 1024, 2.0);
+        assert!(ss > base, "2x supersample should render larger, {ss} vs {base}");
+        // A lens filling the view must not blow past the tier budget.
+        let huge = scope_target_size(1.0, 0.02, VP_H, EYE_FOV, 512, 4.0);
+        assert_eq!(huge, 512);
+    }
+
+    #[test]
+    fn sizes_are_powers_of_two_so_the_mip_chain_is_exact() {
+        for relief in [0.03_f32, 0.05, 0.095, 0.2, 0.4] {
+            let s = scope_target_size(OCULAR_R, relief, VP_H, EYE_FOV, 1024, 1.0);
+            assert!(s.is_power_of_two(), "{s} is not a power of two");
+            assert!(s >= MIN_SCOPE_TARGET);
+        }
+    }
+
+    #[test]
+    fn degenerate_inputs_fall_back_to_the_floor_rather_than_dividing_by_zero() {
+        assert_eq!(ocular_screen_diameter_px(0.017, 0.0, VP_H, EYE_FOV), 0.0);
+        assert_eq!(ocular_screen_diameter_px(0.017, RELIEF, VP_H, 0.0), 0.0);
+        assert_eq!(scope_target_size(0.0, 0.0, 0, 0.0, 1024, 1.0), MIN_SCOPE_TARGET);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -682,7 +1024,8 @@ mod gpu_tests {
     /// scope projection, not the lighting stack.
     fn covered_pixels(device: &wgpu::Device, queue: &wgpu::Queue, view_proj: Mat4) -> u32 {
         let composite = ScopeCompositePipeline::new(device, FORMAT, &test_camera_layout(device));
-        let target = composite.create_target(device, FORMAT, TARGET);
+        let mip_blit = MipBlit::new(device, FORMAT);
+        let target = composite.create_target(device, FORMAT, TARGET, &mip_blit);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scope_test_shader"),
@@ -918,9 +1261,187 @@ fn fs() -> @location(0) vec4<f32> {
             return;
         };
         let composite = ScopeCompositePipeline::new(&device, FORMAT, &test_camera_layout(&device));
-        let t = composite.create_target(&device, FORMAT, 768);
+        let mip_blit = MipBlit::new(&device, FORMAT);
+        let t = composite.create_target(&device, FORMAT, 768, &mip_blit);
         assert_eq!(t.size, 768);
         assert_eq!(t.color.width(), t.color.height(), "square keeps angular sampling isotropic");
         assert_eq!(t.depth.width(), 768);
+    }
+
+    #[test]
+    fn a_scope_target_carries_a_full_mip_chain() {
+        let Some((device, _queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        let composite = ScopeCompositePipeline::new(&device, FORMAT, &test_camera_layout(&device));
+        let mip_blit = MipBlit::new(&device, FORMAT);
+        let t = composite.create_target(&device, FORMAT, 256, &mip_blit);
+
+        assert_eq!(t.mip_levels, 9, "256 -> 9 levels");
+        assert_eq!(t.color.mip_level_count(), 9, "the texture itself must carry them");
+        assert_eq!(t.mip_views.len(), 9, "one render-attachment view per level");
+        assert_eq!(t.mip_src_bind_groups.len(), 9);
+    }
+
+    /// Paints a 1-texel checkerboard into mip 0, builds the chain, and reads
+    /// back levels 0 and 1.
+    fn checkerboard_mip_variances(size: u32) -> Option<(f64, f64, f64)> {
+        let (device, queue) = headless_gpu()?;
+        let composite = ScopeCompositePipeline::new(&device, FORMAT, &test_camera_layout(&device));
+        let mip_blit = MipBlit::new(&device, FORMAT);
+        let target = composite.create_target(&device, FORMAT, size, &mip_blit);
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("checker"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    return vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let c = (u32(pos.x) + u32(pos.y)) % 2u;
+    let v = f32(c);
+    return vec4<f32>(v, v, v, 1.0);
+}
+"#
+                .into(),
+            ),
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("checker_pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("checker_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.draw(0..3, 0..1);
+        }
+        target.generate_mips(&mut encoder, &mip_blit);
+
+        // Levels 0 and 1 only: both have 256-byte-aligned rows at size 128.
+        let read = |level: u32, enc: &mut wgpu::CommandEncoder| {
+            let dim = size >> level;
+            let bpr = dim * 4;
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("checker_readback"),
+                size: (bpr * dim) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &target.color,
+                    mip_level: level,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bpr),
+                        rows_per_image: Some(dim),
+                    },
+                },
+                wgpu::Extent3d { width: dim, height: dim, depth_or_array_layers: 1 },
+            );
+            buf
+        };
+        let b0 = read(0, &mut encoder);
+        let b1 = read(1, &mut encoder);
+        queue.submit(Some(encoder.finish()));
+
+        let stats = |buf: &wgpu::Buffer| -> (f64, f64) {
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::Wait);
+            let data = buf.slice(..).get_mapped_range();
+            let reds: Vec<f64> = data.chunks_exact(4).map(|p| p[0] as f64).collect();
+            let mean = reds.iter().sum::<f64>() / reds.len() as f64;
+            let var = reds.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / reds.len() as f64;
+            drop(data);
+            buf.unmap();
+            (mean, var)
+        };
+        let (_m0, v0) = stats(&b0);
+        let (m1, v1) = stats(&b1);
+        Some((v0, v1, m1))
+    }
+
+    /// **The C2 shimmer test.**
+    ///
+    /// The scope target is composited onto an ocular disc several times smaller
+    /// than itself. With a single mip level that minification point-samples a
+    /// handful of texels out of dozens, which crawls under head motion and reads
+    /// as aliasing — the defect MSAA was originally proposed to fix and would
+    /// not have fixed, because MSAA acts inside the target rather than on how
+    /// the target is sampled down.
+    ///
+    /// A 1-texel checkerboard is the worst case: maximum variance at level 0.
+    /// If the chain is built correctly, level 1 averages each 2x2 block to mid
+    /// grey — variance collapses and the mean lands near 50%. That is exactly
+    /// the data a minifying sample will now read instead of point-sampled edges.
+    #[test]
+    fn the_mip_chain_averages_away_the_minification_aliasing() {
+        let Some((v0, v1, m1)) = checkerboard_mip_variances(TARGET) else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+
+        assert!(v0 > 1000.0, "level 0 checkerboard should have huge variance, got {v0:.1}");
+        assert!(
+            v1 < v0 / 50.0,
+            "level 1 must average the checkerboard away: variance {v1:.1} vs {v0:.1}"
+        );
+        assert!(
+            (m1 - 127.5).abs() < 20.0,
+            "each 2x2 checker block should average to mid grey, got {m1:.1}"
+        );
     }
 }

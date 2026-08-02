@@ -11,12 +11,22 @@ pub struct MeshPipeline {
 }
 
 impl MeshPipeline {
+    /// Single-view, for offscreen passes rendering into single-layer targets.
     pub fn new(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
-        Self::new_with_front_face(device, format, camera_layout, FrontFace::Ccw)
+        Self::new_with_front_face(device, format, camera_layout, FrontFace::Ccw, 1)
+    }
+
+    /// Single-pass stereo, for the eye pass against a 2-layer attachment.
+    pub fn new_multiview(
+        device: &Device,
+        format: TextureFormat,
+        camera_layout: &BindGroupLayout,
+    ) -> Self {
+        Self::new_with_front_face(device, format, camera_layout, FrontFace::Ccw, 2)
     }
 
     pub fn new_mirror(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
-        Self::new_with_front_face(device, format, camera_layout, FrontFace::Cw)
+        Self::new_with_front_face(device, format, camera_layout, FrontFace::Cw, 1)
     }
 
     fn new_with_front_face(
@@ -24,10 +34,11 @@ impl MeshPipeline {
         format: TextureFormat,
         camera_layout: &BindGroupLayout,
         front_face: FrontFace,
+        views: u32,
     ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("mesh_shader"),
-            source: ShaderSource::Wgsl(mesh_shader().into()),
+            source: ShaderSource::Wgsl(mesh_shader(views).into()),
         });
 
         let texture_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -108,7 +119,7 @@ impl MeshPipeline {
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState::default(),
-            multiview: None,
+            multiview: std::num::NonZeroU32::new(views).filter(|v| v.get() > 1),
             cache: None,
         });
 
@@ -165,9 +176,27 @@ pub struct SkinnedMeshPipeline {
 
 impl SkinnedMeshPipeline {
     pub fn new(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
+        Self::new_with_views(device, format, camera_layout, 1)
+    }
+
+    /// Single-pass stereo, for the eye pass against a 2-layer attachment.
+    pub fn new_multiview(
+        device: &Device,
+        format: TextureFormat,
+        camera_layout: &BindGroupLayout,
+    ) -> Self {
+        Self::new_with_views(device, format, camera_layout, 2)
+    }
+
+    fn new_with_views(
+        device: &Device,
+        format: TextureFormat,
+        camera_layout: &BindGroupLayout,
+        views: u32,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("skinned_mesh_shader"),
-            source: ShaderSource::Wgsl(skinned_mesh_shader().into()),
+            source: ShaderSource::Wgsl(skinned_mesh_shader(views).into()),
         });
 
         let texture_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -265,7 +294,7 @@ impl SkinnedMeshPipeline {
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState::default(),
-            multiview: None,
+            multiview: std::num::NonZeroU32::new(views).filter(|v| v.get() > 1),
             cache: None,
         });
 
@@ -296,11 +325,13 @@ impl SkinnedMeshPipeline {
     }
 }
 
-fn skinned_mesh_shader() -> String {
+fn skinned_mesh_shader(views: u32) -> String {
+    let camera_block = super::uniforms::camera_uniform_wgsl(0, 0);
+    let view_param = super::uniforms::view_index_param(views);
+    let view_proj = super::uniforms::view_proj_expr(views);
     format!(
         r#"
-struct CameraUniform {{ view_proj: mat4x4<f32> }}
-@group(0) @binding(0) var<uniform> camera: CameraUniform;
+{camera_block}
 
 struct ModelUniform {{ model: mat4x4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
@@ -329,7 +360,7 @@ struct VOut {{
 }}
 
 @vertex
-fn vs_main(v: VIn) -> VOut {{
+fn vs_main(v: VIn{view_param}) -> VOut {{
     let p = vec4<f32>(v.position, 1.0);
     let n = vec4<f32>(v.normal, 0.0);
 
@@ -347,7 +378,7 @@ fn vs_main(v: VIn) -> VOut {{
 
     let world_pos = model_u.model * skinned_p;
     var out: VOut;
-    out.clip      = camera.view_proj * world_pos;
+    out.clip      = {view_proj} * world_pos;
     out.normal    = (model_u.model * skinned_n).xyz;
     out.uv        = v.uv;
     out.world_pos = world_pos.xyz;
@@ -367,11 +398,13 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     )
 }
 
-fn mesh_shader() -> String {
+fn mesh_shader(views: u32) -> String {
+    let camera_block = super::uniforms::camera_uniform_wgsl(0, 0);
+    let view_param = super::uniforms::view_index_param(views);
+    let view_proj = super::uniforms::view_proj_expr(views);
     format!(
         r#"
-struct CameraUniform {{ view_proj: mat4x4<f32> }}
-@group(0) @binding(0) var<uniform> camera: CameraUniform;
+{camera_block}
 
 struct ModelUniform {{ model: mat4x4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
@@ -400,10 +433,10 @@ struct VOut {{
 }}
 
 @vertex
-fn vs_main(v: VIn) -> VOut {{
+fn vs_main(v: VIn{view_param}) -> VOut {{
     let world_pos = model_u.model * vec4<f32>(v.position, 1.0);
     var out: VOut;
-    out.clip      = camera.view_proj * world_pos;
+    out.clip      = {view_proj} * world_pos;
     out.normal    = (model_u.model * vec4<f32>(v.normal, 0.0)).xyz;
     out.uv        = v.uv;
     out.world_pos = world_pos.xyz;
