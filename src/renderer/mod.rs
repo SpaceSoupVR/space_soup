@@ -6,6 +6,7 @@ pub mod mesh;
 pub mod mesh_pipeline;
 pub mod mirror;
 pub mod panel;
+pub mod scope;
 pub mod particle;
 pub mod pipeline;
 pub mod ssr;

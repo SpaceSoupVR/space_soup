@@ -11,6 +11,7 @@ use crate::renderer::{
     mirror::{self, MirrorPipeline, MirrorSurface, MirrorTarget},
     particle::{self, Beam, Particle, ParticlePipeline},
     pipeline::{SolidPipeline, WirePipeline},
+    scope::{self, ScopeCompositePipeline, ScopeParams, ScopeRender, ScopeTarget},
     ssr::{SceneTarget, SsrCameraUniform, SsrPipelines},
     uniforms::UniformBuffer,
     MeshInstance,
@@ -100,6 +101,9 @@ pub struct XrRenderer {
     lights_uniform: LightsUniform,
     depth_view: wgpu::TextureView,
     eye_targets: Vec<[EyeTarget; 2]>,
+    scope_targets: Vec<ScopeTarget>,
+    scope_composite: ScopeCompositePipeline,
+    scope_vp_uniform: UniformBuffer,
     cuboid_lightmaps: HashMap<String, LoadedTexture>,
     default_cuboid_lightmap: LoadedTexture,
     mesh_lightmaps: HashMap<String, LoadedTexture>,
@@ -231,6 +235,12 @@ impl XrRenderer {
             std::array::from_fn(|_| mirror_pipeline.create_target(&wgpu_device, wgpu_format, width, height));
         let mirror_model_uniform = mirror_pipeline.create_model_uniform(&wgpu_device);
         let mirror_reflected_vp_uniform = mirror_pipeline.create_reflected_vp_uniform(&wgpu_device);
+        let scope_composite =
+            ScopeCompositePipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let scope_targets: Vec<ScopeTarget> = (0..2)
+            .map(|_| scope_composite.create_target(&wgpu_device, wgpu_format, 768))
+            .collect();
+        let scope_vp_uniform = UniformBuffer::new(&wgpu_device, &lights_uniform);
         let ssr_pipelines = SsrPipelines::new(&wgpu_device, wgpu_format);
         let ssr_solid_pipeline = SolidPipeline::new_ssr(
             &wgpu_device,
@@ -317,6 +327,9 @@ impl XrRenderer {
             mirror_targets,
             mirror_model_uniform,
             mirror_reflected_vp_uniform,
+            scope_targets,
+            scope_composite,
+            scope_vp_uniform,
             ssr_pipelines,
             ssr_solid_pipeline,
             scene_targets,
@@ -401,7 +414,19 @@ impl XrRenderer {
         cuboids: &[Cuboid],
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
-        self.render_frame_with_meshes(session, stage, time, cuboids, &[], &[], &[], &[], &[], None)
+        self.render_frame_with_meshes(
+            session,
+            stage,
+            time,
+            cuboids,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -417,6 +442,7 @@ impl XrRenderer {
         particles: &[Particle],
         beams: &[Beam],
         mirror: Option<MirrorSurface>,
+        scopes: &[ScopeRender],
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
         let image_index = self.swapchain.acquire_image()? as usize;
@@ -523,6 +549,118 @@ impl XrRenderer {
             self.mirror_model_uniform.upload(&self.wgpu_queue, model);
             (vb, ib, idx.len() as u32)
         });
+
+        for (i, sr) in scopes.iter().take(self.scope_targets.len()).enumerate() {
+            let vp = scope::scope_view_proj(
+                sr.objective,
+                sr.axis,
+                glam::Vec3::Y,
+                sr.true_fov_y_rad,
+                0.05,
+                1000.0,
+            );
+            let vp = Camera::gl_to_wgpu_ndc(vp);
+            self.scope_vp_uniform.upload(&self.wgpu_queue, vp);
+
+            let mut encoder = self
+                .wgpu_device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scope") });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scope_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.scope_targets[i].color_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.02,
+                                g: 0.02,
+                                b: 0.05,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.scope_targets[i].depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+
+                if !solid_verts.is_empty() {
+                    pass.set_pipeline(&self.solid_pipeline.pipeline);
+                    pass.set_bind_group(0, &self.scope_vp_uniform.bind_group, &[]);
+                    pass.set_vertex_buffer(0, solid_vb.slice(..));
+                    pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                    for (lightmap_key, index_start, count, _r) in &solid_ranges {
+                        pass.set_bind_group(1, self.cuboid_lightmap_bg(lightmap_key.as_deref()), &[]);
+                        pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
+                    }
+                }
+                if !mesh_draws.is_empty() {
+                    pass.set_pipeline(&self.mesh_pipeline.pipeline);
+                    pass.set_bind_group(0, &self.scope_vp_uniform.bind_group, &[]);
+                    for (model_bg, tex_bg, lightmap_bg, vb, ib, count) in &mesh_draws {
+                        pass.set_bind_group(1, *model_bg, &[]);
+                        pass.set_bind_group(2, *tex_bg, &[]);
+                        pass.set_bind_group(3, *lightmap_bg, &[]);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                }
+                if !skinned_draws.is_empty() {
+                    pass.set_pipeline(&self.skinned_mesh_pipeline.pipeline);
+                    pass.set_bind_group(0, &self.scope_vp_uniform.bind_group, &[]);
+                    for (model_bg, tex_bg, joint_bg, vb, ib, count) in &skinned_draws {
+                        pass.set_bind_group(1, *model_bg, &[]);
+                        pass.set_bind_group(2, *tex_bg, &[]);
+                        pass.set_bind_group(3, *joint_bg, &[]);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                }
+            }
+            self.wgpu_queue.submit(Some(encoder.finish()));
+        }
+
+        let mut scope_lens_draws: Vec<(wgpu::Buffer, [wgpu::BindGroup; 2], usize)> = Vec::new();
+        for (i, sr) in scopes.iter().take(self.scope_targets.len()).enumerate() {
+            if sr.occupancy.iter().all(|o| *o <= 0.0) {
+                continue;
+            }
+            let quad = scope::build_lens_quad(sr, glam::Vec3::Y);
+            let vb = self
+                .wgpu_device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("scope_lens_quad"),
+                    contents: bytemuck::cast_slice(&quad),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let (right, up, fwd) = scope::scope_basis(sr.axis, glam::Vec3::Y);
+            let half_t = (sr.true_fov_y_rad.max(1e-3) * 0.5).tan();
+            let bind_groups: [wgpu::BindGroup; 2] = std::array::from_fn(|eye| {
+                let p = eye_views[eye].pose.position;
+                let params = ScopeParams {
+                    eye: [p.x, p.y, p.z, 0.0],
+                    right: [right.x, right.y, right.z, 0.0],
+                    up: [up.x, up.y, up.z, 0.0],
+                    forward: [fwd.x, fwd.y, fwd.z, 0.0],
+                    center: [sr.ocular.x, sr.ocular.y, sr.ocular.z, sr.ocular_radius_m],
+                    params: [sr.magnification, half_t, sr.occupancy[eye], 0.06],
+                    offset_dir: [sr.offset_dir[eye][0], sr.offset_dir[eye][1], 0.0, 0.0],
+                };
+                self.scope_composite
+                    .create_params_bind_group(&self.wgpu_device, &params)
+            });
+            scope_lens_draws.push((vb, bind_groups, i));
+        }
 
         for eye in 0..2usize {
             let ev = &eye_views[eye];
@@ -762,6 +900,18 @@ impl XrRenderer {
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..*count, 0, 0..1);
+                }
+
+                for (vb, bind_group, i) in &scope_lens_draws {
+                    if scopes[*i].occupancy[eye] <= 0.0 {
+                        continue;
+                    }
+                    pass.set_pipeline(&self.scope_composite.pipeline);
+                    pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                    pass.set_bind_group(1, &self.scope_targets[*i].texture_bind_group, &[]);
+                    pass.set_bind_group(2, &bind_group[eye], &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.draw(0..6, 0..1);
                 }
             }
 
