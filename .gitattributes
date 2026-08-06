@@ -1,0 +1,46 @@
+# Cross-platform line-ending policy.
+#
+# Most of this team is on macOS/Linux; a couple of us are on Windows with
+# core.autocrlf=true. Without this file, a Windows checkout can commit CRLF into
+# files the rest of the team then cannot run. That already happened:
+# quest_app/run.sh was stored with 126 CRLF lines, which fails on macOS with
+# "bad interpreter: /bin/bash^M" - the deploy script simply would not start.
+#
+# Text is stored LF in the repository no matter what the working tree looks like.
+* text=auto eol=lf
+
+# Shell scripts are LF, always. A CRLF shebang is fatal on macOS/Linux.
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# Windows-only scripts keep CRLF - PowerShell 5.1 is happier with it, and these
+# are never executed on macOS/Linux.
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Binary assets: never apply EOL conversion. Git's NUL-byte heuristic usually
+# classifies these correctly, but a .glb or an animation sidecar .bin silently
+# mangled by a line-ending rewrite is unrecoverable and would not be obvious
+# until a model failed to load on device. State it rather than infer it.
+*.glb   binary
+*.bin   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.webp  binary
+*.ttf   binary
+*.otf   binary
+*.wav   binary
+*.ogg   binary
+*.mp3   binary
+*.wasm  binary
+*.so    binary
+*.dll   binary
+*.exe   binary
+*.apk   binary
+*.keystore binary
+
+# .gltf is JSON, but it is generated - leave its bytes alone rather than
+# normalising a file no human edits.
+*.gltf  -text
