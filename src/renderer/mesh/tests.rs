@@ -188,3 +188,87 @@
             );
         }
     }
+
+    use crate::renderer::mesh::skin::{blend_joint_local, GltfAnimationPose, IDLE_BLEND};
+
+    // ── Multi-clip blending ──────────────────────────────────────────────────
+    //
+    // Pure pose math, so no GPU: blend_joint_local is deliberately free-standing
+    // for exactly this reason.
+
+    fn pose(name: &str, entries: Vec<(usize, Vec3)>, joints: usize) -> GltfAnimationPose {
+        let mut joint_transforms = vec![None; joints];
+        for (ji, t) in entries {
+            joint_transforms[ji] = Some((t, Quat::IDENTITY, Vec3::ONE));
+        }
+        GltfAnimationPose { name: name.to_string(), joint_transforms }
+    }
+
+    /// bolt = joint 0, charging handle = joint 1, trigger = joint 2.
+    fn two_clips_sharing_the_bolt() -> (Vec<(Vec3, Quat, Vec3)>, Vec<GltfAnimationPose>) {
+        let bind = vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE); 3];
+        let animations = vec![
+            // clip 0: charging_handle -- moves the bolt AND the handle
+            pose("charging_handle", vec![(0, Vec3::new(-1.0, 0.0, 0.0)), (1, Vec3::new(-2.0, 0.0, 0.0))], 3),
+            // clip 1: fire_cycle -- moves the bolt only, a different distance
+            pose("fire_cycle", vec![(0, Vec3::new(-0.5, 0.0, 0.0))], 3),
+        ];
+        (bind, animations)
+    }
+
+    #[test]
+    fn an_idle_clip_does_not_shadow_an_active_one_sharing_a_joint() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        // charging_handle is listed first and is fully idle; fire_cycle is driving.
+        let local = blend_joint_local(&bind, &anims, &[(0, 0.0), (1, 1.0)]);
+        assert_eq!(
+            local[0].0,
+            Vec3::new(-0.5, 0.0, 0.0),
+            "the bolt should follow the active fire_cycle, not be pinned at rest by an idle charging_handle"
+        );
+    }
+
+    #[test]
+    fn the_higher_priority_clip_still_wins_when_both_are_active() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(0, 1.0), (1, 1.0)]);
+        assert_eq!(local[0].0, Vec3::new(-1.0, 0.0, 0.0), "first active clip in priority order owns the joint");
+    }
+
+    #[test]
+    fn a_joint_only_one_clip_drives_is_unaffected_by_priority() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        // The handle is only in clip 0, so it moves even though clip 1 is louder.
+        let local = blend_joint_local(&bind, &anims, &[(0, 1.0), (1, 1.0)]);
+        assert_eq!(local[1].0, Vec3::new(-2.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn every_clip_idle_leaves_the_whole_skeleton_at_bind() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(0, 0.0), (1, 0.0)]);
+        assert_eq!(local, bind);
+    }
+
+    #[test]
+    fn a_joint_no_clip_drives_stays_at_bind() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(0, 1.0), (1, 1.0)]);
+        assert_eq!(local[2].0, Vec3::ZERO, "the trigger is in neither clip");
+    }
+
+    #[test]
+    fn a_partial_blend_interpolates_from_bind() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(1, 0.5)]);
+        assert!((local[0].0.x - -0.25).abs() < 1e-6, "got {:?}", local[0].0);
+    }
+
+    // Guards the threshold itself: a blend just above IDLE_BLEND must still count,
+    // or a slow pull would drop frames near the start of its travel.
+    #[test]
+    fn a_blend_just_above_the_idle_threshold_counts() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(1, IDLE_BLEND * 2.0)]);
+        assert!(local[0].0.x < 0.0, "a small but real blend must move the joint, got {:?}", local[0].0);
+    }

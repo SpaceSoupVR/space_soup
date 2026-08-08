@@ -52,6 +52,60 @@ pub struct GltfAnimationPose {
     pub joint_transforms: Vec<Option<(Vec3, Quat, Vec3)>>,
 }
 
+/// A blend at or below this contributes nothing, so the clip is not holding the
+/// joint and must not shadow a later one. Well above f32 noise on a controller
+/// axis, well below any blend a player could mean.
+pub const IDLE_BLEND: f32 = 1e-4;
+
+/// Pose every joint from several clips at once, in local space.
+///
+/// Highest-priority ACTIVE clip wins each joint: `targets` arrives in priority
+/// order (the scene's `part_animations` order), and the first clip that both
+/// drives this joint and is actually blended in takes it.
+///
+/// The idle check is the load-bearing part. Without it a clip claimed its joints
+/// at *any* blend, including 0.0 -- returning `lerp(bind, target, 0)`, the bind
+/// pose -- and returned early, so no later clip was ever consulted. A part
+/// appearing in two clips was therefore pinned at rest by whichever clip came
+/// first in the array, permanently and with nothing logged: add a `fire_cycle`
+/// that moves the bolt while `charging_handle` already does, and the bolt simply
+/// never moves. Authoring one part into several clips is normal and supported --
+/// different actions need different combinations of the same parts -- so a clip
+/// that is not contributing has to step aside.
+///
+/// Free-standing rather than a method because it is pure math over pose data;
+/// GltfSkin owns a wgpu::Buffer, and requiring a GPU to test a lerp is how this
+/// went unnoticed.
+pub fn blend_joint_local(
+    joint_local_bind: &[(Vec3, Quat, Vec3)],
+    animations: &[GltfAnimationPose],
+    targets: &[(usize, f32)],
+) -> Vec<(Vec3, Quat, Vec3)> {
+    (0..joint_local_bind.len())
+        .map(|ji| {
+            let bind = joint_local_bind[ji];
+            for &(clip, blend) in targets {
+                let b = blend.clamp(0.0, 1.0);
+                if b <= IDLE_BLEND {
+                    continue;
+                }
+                let Some(target) = animations
+                    .get(clip)
+                    .and_then(|a| a.joint_transforms.get(ji).copied().flatten())
+                else {
+                    continue;
+                };
+                return (
+                    bind.0.lerp(target.0, b),
+                    bind.1.slerp(target.1, b),
+                    bind.2.lerp(target.2, b),
+                );
+            }
+            bind
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct GltfSkin {
     pub joint_names: Vec<String>,
@@ -110,23 +164,7 @@ impl GltfSkin {
     }
 
     pub fn skin_matrices_blended_multi(&self, targets: &[(usize, f32)]) -> Vec<Mat4> {
-        let local: Vec<(Vec3, Quat, Vec3)> = (0..self.joint_names.len())
-            .map(|ji| {
-                let bind = self.joint_local_bind[ji];
-                for &(clip, blend) in targets {
-                    let Some(target) = self
-                        .animations
-                        .get(clip)
-                        .and_then(|a| a.joint_transforms.get(ji).copied().flatten())
-                    else {
-                        continue;
-                    };
-                    let b = blend.clamp(0.0, 1.0);
-                    return (bind.0.lerp(target.0, b), bind.1.slerp(target.1, b), bind.2.lerp(target.2, b));
-                }
-                bind
-            })
-            .collect();
+        let local = blend_joint_local(&self.joint_local_bind, &self.animations, targets);
         let world = self.hierarchical_transforms(&local);
         self.inv_bind_mats
             .iter()
