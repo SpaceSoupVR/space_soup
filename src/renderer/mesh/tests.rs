@@ -48,25 +48,82 @@
         assert!(er.angle_between(r2) < 1e-3, "expected rotation {er:?}, got {r2:?}");
     }
 
+    /// A Python 3 that actually runs.
+    ///
+    /// The fixture work here goes through scene_editor_web/gltf_animation.py, so
+    /// this test needs an interpreter. `python3` is not on PATH on a stock
+    /// Windows box -- the name resolves to a Microsoft Store stub that prints an
+    /// advert and exits non-zero -- so try `python` too, and verify it really
+    /// runs rather than trusting the name. Skips like the GPU check above when
+    /// there is none, because a missing dev tool is not a renderer regression.
+    fn python_bin() -> Option<&'static str> {
+        for candidate in ["python3", "python"] {
+            let ok = std::process::Command::new(candidate)
+                .args(["-c", "import json,struct,pathlib"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     #[test]
     fn m4a1_orphan_node_promotion_end_to_end() {
         let Some((device, queue, layout)) = headless_gpu() else {
             eprintln!("skipping: no GPU adapter available in this environment");
             return;
         };
+        let Some(python) = python_bin() else {
+            eprintln!("skipping: no working python3/python on PATH to build the fixture");
+            return;
+        };
 
         let original_path = workspace_root().join("game/models/m4a1.glb");
+        let script_dir = workspace_root().join("scene_editor_web");
 
-        let baseline = GltfMesh::load(&device, &queue, &layout, &original_path)
+        // Work on a private copy, and strip whatever clips the shared asset
+        // currently carries so the "before" half of this test is controlled here.
+        //
+        // This used to assert that game/models/m4a1.glb itself had no orphan
+        // animations. That was true when written and stopped being true the moment
+        // an animator saved a real clip into it, which turned this red for reasons
+        // that have nothing to do with node promotion. A renderer test must not
+        // depend on the current contents of a hand-edited shared model.
+        let work_dir = std::env::temp_dir().join(format!("m4a1_fixture_{}", std::process::id()));
+        std::fs::create_dir_all(&work_dir).expect("create fixture dir");
+        let test_path = work_dir.join("m4a1.glb");
+        std::fs::copy(&original_path, &test_path).expect("copy fixture");
+        // The clips reference external _anim_*.bin buffers, so the copy needs them
+        // too or stripping (and loading) hits a missing file.
+        for entry in std::fs::read_dir(original_path.parent().unwrap()).expect("read models dir").flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("m4a1_anim_") && name.ends_with(".bin") {
+                std::fs::copy(entry.path(), work_dir.join(&name)).ok();
+            }
+        }
+
+        let strip = format!(
+            "import sys; sys.path.insert(0, {script_dir:?}); \
+             from gltf_animation import read_joint_animation_clips, delete_joint_animation_clip; \
+             from pathlib import Path; p = Path({test_path:?}); \
+             [delete_joint_animation_clip(p, c['name']) for c in read_joint_animation_clips(p)]",
+        );
+        let status = std::process::Command::new(python)
+            .arg("-c")
+            .arg(&strip)
+            .status()
+            .expect("run python3 to strip existing clips");
+        assert!(status.success(), "stripping existing clips failed");
+
+        let baseline = GltfMesh::load(&device, &queue, &layout, &test_path)
             .expect("baseline m4a1.glb should load");
         assert!(baseline.skin.is_none(), "file with no orphan animations must stay unskinned");
         assert!(!baseline.primitives.is_empty(), "baseline should have static primitives");
         assert!(baseline.bounding_radius > 0.0);
 
-        let test_path = std::env::temp_dir().join(format!("m4a1_test_{}.glb", std::process::id()));
-        std::fs::copy(&original_path, &test_path).expect("copy fixture");
-
-        let script_dir = workspace_root().join("scene_editor_web");
         let py = format!(
             "import sys; sys.path.insert(0, {script_dir:?}); from gltf_animation import write_joint_animation_clip; \
              from pathlib import Path; \
@@ -74,7 +131,7 @@
              {{'t': 0.0, 'position': [0,0,0], 'rotation': [0,0,0,1], 'scale': [1,1,1]}}, \
              {{'t': 0.3, 'position': [0,0,-0.05], 'rotation': [0,0,0,1], 'scale': [1,1,1]}}]}})",
         );
-        let status = std::process::Command::new("python3")
+        let status = std::process::Command::new(python)
             .arg("-c")
             .arg(&py)
             .status()
@@ -82,12 +139,7 @@
         assert!(status.success(), "write_joint_animation_clip failed");
 
         let animated = GltfMesh::load(&device, &queue, &layout, &test_path).expect("animated m4a1 should load");
-        std::fs::remove_file(&test_path).ok();
-        let bin_glob = test_path.with_file_name(format!(
-            "{}_anim_charging_handle_pull.bin",
-            test_path.file_stem().unwrap().to_string_lossy()
-        ));
-        std::fs::remove_file(&bin_glob).ok();
+        std::fs::remove_dir_all(&work_dir).ok();
 
         assert!(animated.primitives.is_empty(), "all geometry must be routed through the skin pipeline once any node is promoted");
         let skin = animated.skin.expect("orphan animation should produce a skin");
