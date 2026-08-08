@@ -57,6 +57,19 @@ pub struct GltfAnimationPose {
 /// axis, well below any blend a player could mean.
 pub const IDLE_BLEND: f32 = 1e-4;
 
+/// How a clip combines with the ones before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipBlendMode {
+    /// Takes the joint outright. The first active Override clip wins it, and
+    /// later Override clips on that joint are ignored.
+    #[default]
+    Override,
+    /// Adds its displacement from the bind pose on top of whatever the Override
+    /// layer produced. This is what lets recoil ride a cycling bolt: the cycle
+    /// says where the bolt is, recoil nudges it from there.
+    Additive,
+}
+
 /// Pose every joint from several clips at once, in local space.
 ///
 /// Highest-priority ACTIVE clip wins each joint: `targets` arrives in priority
@@ -76,32 +89,64 @@ pub const IDLE_BLEND: f32 = 1e-4;
 /// Free-standing rather than a method because it is pure math over pose data;
 /// GltfSkin owns a wgpu::Buffer, and requiring a GPU to test a lerp is how this
 /// went unnoticed.
+///
+/// Clips are applied in two passes: the Override layer decides where a joint is,
+/// then Additive layers nudge it from there. See ClipBlendMode.
 pub fn blend_joint_local(
     joint_local_bind: &[(Vec3, Quat, Vec3)],
     animations: &[GltfAnimationPose],
-    targets: &[(usize, f32)],
+    targets: &[(usize, f32, ClipBlendMode)],
 ) -> Vec<(Vec3, Quat, Vec3)> {
     (0..joint_local_bind.len())
         .map(|ji| {
             let bind = joint_local_bind[ji];
-            for &(clip, blend) in targets {
-                let b = blend.clamp(0.0, 1.0);
-                if b <= IDLE_BLEND {
-                    continue;
-                }
-                let Some(target) = animations
+            let target_for = |clip: usize| {
+                animations
                     .get(clip)
                     .and_then(|a| a.joint_transforms.get(ji).copied().flatten())
-                else {
+            };
+
+            // Base layer: the first active Override clip that drives this joint.
+            let mut pose = bind;
+            for &(clip, blend, mode) in targets {
+                let b = blend.clamp(0.0, 1.0);
+                if b <= IDLE_BLEND || mode != ClipBlendMode::Override {
                     continue;
-                };
-                return (
+                }
+                let Some(target) = target_for(clip) else { continue };
+                pose = (
                     bind.0.lerp(target.0, b),
                     bind.1.slerp(target.1, b),
                     bind.2.lerp(target.2, b),
                 );
+                break;
             }
-            bind
+
+            // Additive layers accumulate their offset FROM BIND on top of that.
+            // Offsets rather than absolute poses, so two additive clips compose
+            // instead of the last one erasing the others -- and so an additive
+            // clip means the same thing regardless of what the base is doing.
+            for &(clip, blend, mode) in targets {
+                let b = blend.clamp(0.0, 1.0);
+                if b <= IDLE_BLEND || mode != ClipBlendMode::Additive {
+                    continue;
+                }
+                let Some(target) = target_for(clip) else { continue };
+                pose.0 += (target.0 - bind.0) * b;
+                // Rotation composes rather than adds: the delta from bind, scaled
+                // by the blend, applied to what we have.
+                let delta = target.1 * bind.1.inverse();
+                pose.1 = Quat::IDENTITY.slerp(delta, b) * pose.1;
+                // Scale is a ratio, so it multiplies. A bind scale component of 0
+                // has no meaningful ratio, so that axis is left alone.
+                for i in 0..3 {
+                    if bind.2[i].abs() > f32::EPSILON {
+                        let ratio = target.2[i] / bind.2[i];
+                        pose.2[i] *= 1.0 + (ratio - 1.0) * b;
+                    }
+                }
+            }
+            pose
         })
         .collect()
 }
@@ -160,10 +205,10 @@ impl GltfSkin {
     }
 
     pub fn skin_matrices_blended(&self, clip: usize, blend: f32) -> Vec<Mat4> {
-        self.skin_matrices_blended_multi(&[(clip, blend)])
+        self.skin_matrices_blended_multi(&[(clip, blend, ClipBlendMode::Override)])
     }
 
-    pub fn skin_matrices_blended_multi(&self, targets: &[(usize, f32)]) -> Vec<Mat4> {
+    pub fn skin_matrices_blended_multi(&self, targets: &[(usize, f32, ClipBlendMode)]) -> Vec<Mat4> {
         let local = blend_joint_local(&self.joint_local_bind, &self.animations, targets);
         let world = self.hierarchical_transforms(&local);
         self.inv_bind_mats

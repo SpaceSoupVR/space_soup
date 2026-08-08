@@ -241,7 +241,7 @@
         }
     }
 
-    use crate::renderer::mesh::skin::{blend_joint_local, GltfAnimationPose, IDLE_BLEND};
+    use crate::renderer::mesh::skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, IDLE_BLEND};
 
     // ── Multi-clip blending ──────────────────────────────────────────────────
     //
@@ -272,7 +272,7 @@
     fn an_idle_clip_does_not_shadow_an_active_one_sharing_a_joint() {
         let (bind, anims) = two_clips_sharing_the_bolt();
         // charging_handle is listed first and is fully idle; fire_cycle is driving.
-        let local = blend_joint_local(&bind, &anims, &[(0, 0.0), (1, 1.0)]);
+        let local = blend_joint_local(&bind, &anims, &[(0, 0.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Override)]);
         assert_eq!(
             local[0].0,
             Vec3::new(-0.5, 0.0, 0.0),
@@ -283,7 +283,7 @@
     #[test]
     fn the_higher_priority_clip_still_wins_when_both_are_active() {
         let (bind, anims) = two_clips_sharing_the_bolt();
-        let local = blend_joint_local(&bind, &anims, &[(0, 1.0), (1, 1.0)]);
+        let local = blend_joint_local(&bind, &anims, &[(0, 1.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Override)]);
         assert_eq!(local[0].0, Vec3::new(-1.0, 0.0, 0.0), "first active clip in priority order owns the joint");
     }
 
@@ -291,28 +291,28 @@
     fn a_joint_only_one_clip_drives_is_unaffected_by_priority() {
         let (bind, anims) = two_clips_sharing_the_bolt();
         // The handle is only in clip 0, so it moves even though clip 1 is louder.
-        let local = blend_joint_local(&bind, &anims, &[(0, 1.0), (1, 1.0)]);
+        let local = blend_joint_local(&bind, &anims, &[(0, 1.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Override)]);
         assert_eq!(local[1].0, Vec3::new(-2.0, 0.0, 0.0));
     }
 
     #[test]
     fn every_clip_idle_leaves_the_whole_skeleton_at_bind() {
         let (bind, anims) = two_clips_sharing_the_bolt();
-        let local = blend_joint_local(&bind, &anims, &[(0, 0.0), (1, 0.0)]);
+        let local = blend_joint_local(&bind, &anims, &[(0, 0.0, ClipBlendMode::Override), (1, 0.0, ClipBlendMode::Override)]);
         assert_eq!(local, bind);
     }
 
     #[test]
     fn a_joint_no_clip_drives_stays_at_bind() {
         let (bind, anims) = two_clips_sharing_the_bolt();
-        let local = blend_joint_local(&bind, &anims, &[(0, 1.0), (1, 1.0)]);
+        let local = blend_joint_local(&bind, &anims, &[(0, 1.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Override)]);
         assert_eq!(local[2].0, Vec3::ZERO, "the trigger is in neither clip");
     }
 
     #[test]
     fn a_partial_blend_interpolates_from_bind() {
         let (bind, anims) = two_clips_sharing_the_bolt();
-        let local = blend_joint_local(&bind, &anims, &[(1, 0.5)]);
+        let local = blend_joint_local(&bind, &anims, &[(1, 0.5, ClipBlendMode::Override)]);
         assert!((local[0].0.x - -0.25).abs() < 1e-6, "got {:?}", local[0].0);
     }
 
@@ -321,6 +321,108 @@
     #[test]
     fn a_blend_just_above_the_idle_threshold_counts() {
         let (bind, anims) = two_clips_sharing_the_bolt();
-        let local = blend_joint_local(&bind, &anims, &[(1, IDLE_BLEND * 2.0)]);
+        let local = blend_joint_local(&bind, &anims, &[(1, IDLE_BLEND * 2.0, ClipBlendMode::Override)]);
         assert!(local[0].0.x < 0.0, "a small but real blend must move the joint, got {:?}", local[0].0);
+    }
+
+    // ── Additive layering ────────────────────────────────────────────────────
+    //
+    // The case this exists for: recoil riding a cycling bolt. The Override layer
+    // says where the bolt is; recoil nudges it from there.
+
+    #[test]
+    fn an_additive_clip_adds_to_the_override_layer() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        // clip 0 puts the bolt at -1.0; clip 1 additively offsets by -0.5.
+        let local = blend_joint_local(
+            &bind, &anims,
+            &[(0, 1.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Additive)],
+        );
+        assert!((local[0].0.x - -1.5).abs() < 1e-6, "got {:?}", local[0].0);
+    }
+
+    #[test]
+    fn an_additive_clip_scales_its_offset_by_its_own_blend() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(
+            &bind, &anims,
+            &[(0, 1.0, ClipBlendMode::Override), (1, 0.5, ClipBlendMode::Additive)],
+        );
+        assert!((local[0].0.x - -1.25).abs() < 1e-6, "got {:?}", local[0].0);
+    }
+
+    // Without an Override layer an additive clip still works, offsetting bind --
+    // so a recoil clip is meaningful on its own, not only on top of something.
+    #[test]
+    fn an_additive_clip_works_with_no_override_layer() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(1, 1.0, ClipBlendMode::Additive)]);
+        assert!((local[0].0.x - -0.5).abs() < 1e-6, "got {:?}", local[0].0);
+    }
+
+    // Two additive clips must compose. Storing absolute poses instead of offsets
+    // would make the last one erase the first.
+    #[test]
+    fn two_additive_clips_compose_rather_than_replace() {
+        let bind = vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE); 3];
+        let anims = vec![
+            pose("a", vec![(0, Vec3::new(-1.0, 0.0, 0.0))], 3),
+            pose("b", vec![(0, Vec3::new(0.0, -2.0, 0.0))], 3),
+        ];
+        let local = blend_joint_local(
+            &bind, &anims,
+            &[(0, 1.0, ClipBlendMode::Additive), (1, 1.0, ClipBlendMode::Additive)],
+        );
+        assert!((local[0].0.x - -1.0).abs() < 1e-6);
+        assert!((local[0].0.y - -2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_idle_additive_clip_contributes_nothing() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let with_idle = blend_joint_local(
+            &bind, &anims,
+            &[(0, 1.0, ClipBlendMode::Override), (1, 0.0, ClipBlendMode::Additive)],
+        );
+        let without = blend_joint_local(&bind, &anims, &[(0, 1.0, ClipBlendMode::Override)]);
+        assert_eq!(with_idle[0].0, without[0].0);
+    }
+
+    // Every existing clip is Override, so the default must reproduce exactly what
+    // the runtime did before layering existed.
+    #[test]
+    fn override_is_the_default_and_behaves_as_before() {
+        assert_eq!(ClipBlendMode::default(), ClipBlendMode::Override);
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(
+            &bind, &anims,
+            &[(0, 1.0, ClipBlendMode::default()), (1, 1.0, ClipBlendMode::default())],
+        );
+        assert_eq!(local[0].0, Vec3::new(-1.0, 0.0, 0.0), "first active Override still wins outright");
+    }
+
+    #[test]
+    fn additive_rotation_composes_from_the_bind_delta() {
+        let bind = vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE); 1];
+        let quarter = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let anims = vec![GltfAnimationPose {
+            name: "twist".into(),
+            joint_transforms: vec![Some((Vec3::ZERO, quarter, Vec3::ONE))],
+        }];
+        let half = blend_joint_local(&bind, &anims, &[(0, 0.5, ClipBlendMode::Additive)]);
+        let expected = Quat::IDENTITY.slerp(quarter, 0.5);
+        assert!(half[0].1.angle_between(expected) < 1e-4);
+    }
+
+    #[test]
+    fn additive_scale_multiplies_rather_than_adds() {
+        let bind = vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE); 1];
+        let anims = vec![GltfAnimationPose {
+            name: "grow".into(),
+            joint_transforms: vec![Some((Vec3::ZERO, Quat::IDENTITY, Vec3::splat(2.0)))],
+        }];
+        let full = blend_joint_local(&bind, &anims, &[(0, 1.0, ClipBlendMode::Additive)]);
+        assert!((full[0].2.x - 2.0).abs() < 1e-6, "got {:?}", full[0].2);
+        let half = blend_joint_local(&bind, &anims, &[(0, 0.5, ClipBlendMode::Additive)]);
+        assert!((half[0].2.x - 1.5).abs() < 1e-6, "got {:?}", half[0].2);
     }
