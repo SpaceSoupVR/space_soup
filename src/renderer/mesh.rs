@@ -8,7 +8,7 @@ mod skin;
 mod texture;
 mod vertex;
 
-pub use skin::{GltfAnimationPose, GltfSkin, SkinnedMeshPrimitive, MAX_SKIN_JOINTS};
+pub use skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, GltfSkin, SkinnedMeshPrimitive, MAX_SKIN_JOINTS};
 pub use texture::{create_texture_from_rgba, LoadedTexture};
 pub use vertex::{MeshPrimitive, MeshVertex, SkinnedMeshVertex};
 
