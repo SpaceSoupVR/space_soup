@@ -48,25 +48,82 @@
         assert!(er.angle_between(r2) < 1e-3, "expected rotation {er:?}, got {r2:?}");
     }
 
+    /// A Python 3 that actually runs.
+    ///
+    /// The fixture work here goes through scene_editor_web/gltf_animation.py, so
+    /// this test needs an interpreter. `python3` is not on PATH on a stock
+    /// Windows box -- the name resolves to a Microsoft Store stub that prints an
+    /// advert and exits non-zero -- so try `python` too, and verify it really
+    /// runs rather than trusting the name. Skips like the GPU check above when
+    /// there is none, because a missing dev tool is not a renderer regression.
+    fn python_bin() -> Option<&'static str> {
+        for candidate in ["python3", "python"] {
+            let ok = std::process::Command::new(candidate)
+                .args(["-c", "import json,struct,pathlib"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     #[test]
     fn m4a1_orphan_node_promotion_end_to_end() {
         let Some((device, queue, layout)) = headless_gpu() else {
             eprintln!("skipping: no GPU adapter available in this environment");
             return;
         };
+        let Some(python) = python_bin() else {
+            eprintln!("skipping: no working python3/python on PATH to build the fixture");
+            return;
+        };
 
         let original_path = workspace_root().join("game/models/m4a1.glb");
+        let script_dir = workspace_root().join("scene_editor_web");
 
-        let baseline = GltfMesh::load(&device, &queue, &layout, &original_path)
+        // Work on a private copy, and strip whatever clips the shared asset
+        // currently carries so the "before" half of this test is controlled here.
+        //
+        // This used to assert that game/models/m4a1.glb itself had no orphan
+        // animations. That was true when written and stopped being true the moment
+        // an animator saved a real clip into it, which turned this red for reasons
+        // that have nothing to do with node promotion. A renderer test must not
+        // depend on the current contents of a hand-edited shared model.
+        let work_dir = std::env::temp_dir().join(format!("m4a1_fixture_{}", std::process::id()));
+        std::fs::create_dir_all(&work_dir).expect("create fixture dir");
+        let test_path = work_dir.join("m4a1.glb");
+        std::fs::copy(&original_path, &test_path).expect("copy fixture");
+        // The clips reference external _anim_*.bin buffers, so the copy needs them
+        // too or stripping (and loading) hits a missing file.
+        for entry in std::fs::read_dir(original_path.parent().unwrap()).expect("read models dir").flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("m4a1_anim_") && name.ends_with(".bin") {
+                std::fs::copy(entry.path(), work_dir.join(&name)).ok();
+            }
+        }
+
+        let strip = format!(
+            "import sys; sys.path.insert(0, {script_dir:?}); \
+             from gltf_animation import read_joint_animation_clips, delete_joint_animation_clip; \
+             from pathlib import Path; p = Path({test_path:?}); \
+             [delete_joint_animation_clip(p, c['name']) for c in read_joint_animation_clips(p)]",
+        );
+        let status = std::process::Command::new(python)
+            .arg("-c")
+            .arg(&strip)
+            .status()
+            .expect("run python3 to strip existing clips");
+        assert!(status.success(), "stripping existing clips failed");
+
+        let baseline = GltfMesh::load(&device, &queue, &layout, &test_path)
             .expect("baseline m4a1.glb should load");
         assert!(baseline.skin.is_none(), "file with no orphan animations must stay unskinned");
         assert!(!baseline.primitives.is_empty(), "baseline should have static primitives");
         assert!(baseline.bounding_radius > 0.0);
 
-        let test_path = std::env::temp_dir().join(format!("m4a1_test_{}.glb", std::process::id()));
-        std::fs::copy(&original_path, &test_path).expect("copy fixture");
-
-        let script_dir = workspace_root().join("scene_editor_web");
         let py = format!(
             "import sys; sys.path.insert(0, {script_dir:?}); from gltf_animation import write_joint_animation_clip; \
              from pathlib import Path; \
@@ -74,7 +131,7 @@
              {{'t': 0.0, 'position': [0,0,0], 'rotation': [0,0,0,1], 'scale': [1,1,1]}}, \
              {{'t': 0.3, 'position': [0,0,-0.05], 'rotation': [0,0,0,1], 'scale': [1,1,1]}}]}})",
         );
-        let status = std::process::Command::new("python3")
+        let status = std::process::Command::new(python)
             .arg("-c")
             .arg(&py)
             .status()
@@ -82,12 +139,7 @@
         assert!(status.success(), "write_joint_animation_clip failed");
 
         let animated = GltfMesh::load(&device, &queue, &layout, &test_path).expect("animated m4a1 should load");
-        std::fs::remove_file(&test_path).ok();
-        let bin_glob = test_path.with_file_name(format!(
-            "{}_anim_charging_handle_pull.bin",
-            test_path.file_stem().unwrap().to_string_lossy()
-        ));
-        std::fs::remove_file(&bin_glob).ok();
+        std::fs::remove_dir_all(&work_dir).ok();
 
         assert!(animated.primitives.is_empty(), "all geometry must be routed through the skin pipeline once any node is promoted");
         let skin = animated.skin.expect("orphan animation should produce a skin");
@@ -187,4 +239,190 @@
                 mesh.bounding_radius
             );
         }
+    }
+
+    use crate::renderer::mesh::skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, IDLE_BLEND};
+
+    // ── Multi-clip blending ──────────────────────────────────────────────────
+    //
+    // Pure pose math, so no GPU: blend_joint_local is deliberately free-standing
+    // for exactly this reason.
+
+    fn pose(name: &str, entries: Vec<(usize, Vec3)>, joints: usize) -> GltfAnimationPose {
+        let mut joint_transforms = vec![None; joints];
+        for (ji, t) in entries {
+            joint_transforms[ji] = Some((t, Quat::IDENTITY, Vec3::ONE));
+        }
+        GltfAnimationPose { name: name.to_string(), joint_transforms }
+    }
+
+    /// bolt = joint 0, charging handle = joint 1, trigger = joint 2.
+    fn two_clips_sharing_the_bolt() -> (Vec<(Vec3, Quat, Vec3)>, Vec<GltfAnimationPose>) {
+        let bind = vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE); 3];
+        let animations = vec![
+            // clip 0: charging_handle -- moves the bolt AND the handle
+            pose("charging_handle", vec![(0, Vec3::new(-1.0, 0.0, 0.0)), (1, Vec3::new(-2.0, 0.0, 0.0))], 3),
+            // clip 1: fire_cycle -- moves the bolt only, a different distance
+            pose("fire_cycle", vec![(0, Vec3::new(-0.5, 0.0, 0.0))], 3),
+        ];
+        (bind, animations)
+    }
+
+    #[test]
+    fn an_idle_clip_does_not_shadow_an_active_one_sharing_a_joint() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        // charging_handle is listed first and is fully idle; fire_cycle is driving.
+        let local = blend_joint_local(&bind, &anims, &[(0, 0.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Override)]);
+        assert_eq!(
+            local[0].0,
+            Vec3::new(-0.5, 0.0, 0.0),
+            "the bolt should follow the active fire_cycle, not be pinned at rest by an idle charging_handle"
+        );
+    }
+
+    #[test]
+    fn the_higher_priority_clip_still_wins_when_both_are_active() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(0, 1.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Override)]);
+        assert_eq!(local[0].0, Vec3::new(-1.0, 0.0, 0.0), "first active clip in priority order owns the joint");
+    }
+
+    #[test]
+    fn a_joint_only_one_clip_drives_is_unaffected_by_priority() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        // The handle is only in clip 0, so it moves even though clip 1 is louder.
+        let local = blend_joint_local(&bind, &anims, &[(0, 1.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Override)]);
+        assert_eq!(local[1].0, Vec3::new(-2.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn every_clip_idle_leaves_the_whole_skeleton_at_bind() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(0, 0.0, ClipBlendMode::Override), (1, 0.0, ClipBlendMode::Override)]);
+        assert_eq!(local, bind);
+    }
+
+    #[test]
+    fn a_joint_no_clip_drives_stays_at_bind() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(0, 1.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Override)]);
+        assert_eq!(local[2].0, Vec3::ZERO, "the trigger is in neither clip");
+    }
+
+    #[test]
+    fn a_partial_blend_interpolates_from_bind() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(1, 0.5, ClipBlendMode::Override)]);
+        assert!((local[0].0.x - -0.25).abs() < 1e-6, "got {:?}", local[0].0);
+    }
+
+    // Guards the threshold itself: a blend just above IDLE_BLEND must still count,
+    // or a slow pull would drop frames near the start of its travel.
+    #[test]
+    fn a_blend_just_above_the_idle_threshold_counts() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(1, IDLE_BLEND * 2.0, ClipBlendMode::Override)]);
+        assert!(local[0].0.x < 0.0, "a small but real blend must move the joint, got {:?}", local[0].0);
+    }
+
+    // ── Additive layering ────────────────────────────────────────────────────
+    //
+    // The case this exists for: recoil riding a cycling bolt. The Override layer
+    // says where the bolt is; recoil nudges it from there.
+
+    #[test]
+    fn an_additive_clip_adds_to_the_override_layer() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        // clip 0 puts the bolt at -1.0; clip 1 additively offsets by -0.5.
+        let local = blend_joint_local(
+            &bind, &anims,
+            &[(0, 1.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Additive)],
+        );
+        assert!((local[0].0.x - -1.5).abs() < 1e-6, "got {:?}", local[0].0);
+    }
+
+    #[test]
+    fn an_additive_clip_scales_its_offset_by_its_own_blend() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(
+            &bind, &anims,
+            &[(0, 1.0, ClipBlendMode::Override), (1, 0.5, ClipBlendMode::Additive)],
+        );
+        assert!((local[0].0.x - -1.25).abs() < 1e-6, "got {:?}", local[0].0);
+    }
+
+    // Without an Override layer an additive clip still works, offsetting bind --
+    // so a recoil clip is meaningful on its own, not only on top of something.
+    #[test]
+    fn an_additive_clip_works_with_no_override_layer() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(&bind, &anims, &[(1, 1.0, ClipBlendMode::Additive)]);
+        assert!((local[0].0.x - -0.5).abs() < 1e-6, "got {:?}", local[0].0);
+    }
+
+    // Two additive clips must compose. Storing absolute poses instead of offsets
+    // would make the last one erase the first.
+    #[test]
+    fn two_additive_clips_compose_rather_than_replace() {
+        let bind = vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE); 3];
+        let anims = vec![
+            pose("a", vec![(0, Vec3::new(-1.0, 0.0, 0.0))], 3),
+            pose("b", vec![(0, Vec3::new(0.0, -2.0, 0.0))], 3),
+        ];
+        let local = blend_joint_local(
+            &bind, &anims,
+            &[(0, 1.0, ClipBlendMode::Additive), (1, 1.0, ClipBlendMode::Additive)],
+        );
+        assert!((local[0].0.x - -1.0).abs() < 1e-6);
+        assert!((local[0].0.y - -2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_idle_additive_clip_contributes_nothing() {
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let with_idle = blend_joint_local(
+            &bind, &anims,
+            &[(0, 1.0, ClipBlendMode::Override), (1, 0.0, ClipBlendMode::Additive)],
+        );
+        let without = blend_joint_local(&bind, &anims, &[(0, 1.0, ClipBlendMode::Override)]);
+        assert_eq!(with_idle[0].0, without[0].0);
+    }
+
+    // Every existing clip is Override, so the default must reproduce exactly what
+    // the runtime did before layering existed.
+    #[test]
+    fn override_is_the_default_and_behaves_as_before() {
+        assert_eq!(ClipBlendMode::default(), ClipBlendMode::Override);
+        let (bind, anims) = two_clips_sharing_the_bolt();
+        let local = blend_joint_local(
+            &bind, &anims,
+            &[(0, 1.0, ClipBlendMode::default()), (1, 1.0, ClipBlendMode::default())],
+        );
+        assert_eq!(local[0].0, Vec3::new(-1.0, 0.0, 0.0), "first active Override still wins outright");
+    }
+
+    #[test]
+    fn additive_rotation_composes_from_the_bind_delta() {
+        let bind = vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE); 1];
+        let quarter = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let anims = vec![GltfAnimationPose {
+            name: "twist".into(),
+            joint_transforms: vec![Some((Vec3::ZERO, quarter, Vec3::ONE))],
+        }];
+        let half = blend_joint_local(&bind, &anims, &[(0, 0.5, ClipBlendMode::Additive)]);
+        let expected = Quat::IDENTITY.slerp(quarter, 0.5);
+        assert!(half[0].1.angle_between(expected) < 1e-4);
+    }
+
+    #[test]
+    fn additive_scale_multiplies_rather_than_adds() {
+        let bind = vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE); 1];
+        let anims = vec![GltfAnimationPose {
+            name: "grow".into(),
+            joint_transforms: vec![Some((Vec3::ZERO, Quat::IDENTITY, Vec3::splat(2.0)))],
+        }];
+        let full = blend_joint_local(&bind, &anims, &[(0, 1.0, ClipBlendMode::Additive)]);
+        assert!((full[0].2.x - 2.0).abs() < 1e-6, "got {:?}", full[0].2);
+        let half = blend_joint_local(&bind, &anims, &[(0, 0.5, ClipBlendMode::Additive)]);
+        assert!((half[0].2.x - 1.5).abs() < 1e-6, "got {:?}", half[0].2);
     }
