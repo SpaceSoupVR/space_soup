@@ -61,7 +61,13 @@ pub struct TerrainMaterialUniform {
     /// Degrees past which biplanar sampling kicks in. Below this the shader
     /// takes one planar sample.
     pub biplanar_start_deg: f32,
-    pub _pad: f32,
+    /// Non-zero when the bound splat map carries authored weights.
+    ///
+    /// A flag rather than a sentinel resolution or an all-zero texel: the
+    /// shader must know whether to trust the map BEFORE it reads it, and a
+    /// "weights that happen to look unauthored" rule would make a legitimately
+    /// black-painted texel indistinguishable from no map at all.
+    pub use_splat: f32,
 }
 
 impl Default for TerrainMaterialUniform {
@@ -75,7 +81,7 @@ impl Default for TerrainMaterialUniform {
             macro_repeat: 140.0,
             macro_strength: 0.35,
             biplanar_start_deg: 18.0,
-            _pad: 0.0,
+            use_splat: 0.0,
         }
     }
 }
@@ -182,6 +188,20 @@ pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
                 },
                 count: None,
             },
+            // Authored blend weights over the terrain footprint. Always bound,
+            // even when unauthored: an optional binding would mean two bind
+            // group layouts and therefore two pipelines, and a 1x1 placeholder
+            // costs one texel.
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -192,8 +212,8 @@ fn terrain_shader() -> String {
 struct Uniforms {{ view_proj: mat4x4<f32> }}
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
-@group(1) @binding(0) var splat_tex: texture_2d_array<f32>;
-@group(1) @binding(1) var splat_samp: sampler;
+@group(1) @binding(0) var layer_tex: texture_2d_array<f32>;
+@group(1) @binding(1) var layer_samp: sampler;
 @group(1) @binding(2) var macro_tex: texture_2d<f32>;
 
 struct Material {{
@@ -205,9 +225,10 @@ struct Material {{
     macro_repeat: f32,
     macro_strength: f32,
     biplanar_start_deg: f32,
-    pad: f32,
+    use_splat: f32,
 }}
 @group(1) @binding(3) var<uniform> mat: Material;
+@group(1) @binding(4) var splat_tex: texture_2d<f32>;
 
 {lights_block}
 
@@ -217,6 +238,10 @@ struct VOut {{
     @location(0) col: vec4<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) world_pos: vec3<f32>,
+    // Normalised position over the terrain footprint, carried in the slot the
+    // cuboid path uses for lightmap coordinates. Terrain is lit dynamically and
+    // has no lightmap, so that slot was sitting at (0,0) doing nothing.
+    @location(3) uv: vec2<f32>,
 }}
 
 @vertex fn vs_main(v: VIn) -> VOut {{
@@ -225,6 +250,7 @@ struct VOut {{
     out.col       = v.col;
     out.normal    = v.norm;
     out.world_pos = v.pos;
+    out.uv        = v.uv2;
     return out;
 }}
 
@@ -232,7 +258,7 @@ struct VOut {{
 // the path most pixels take.
 fn sample_planar(layer: i32, world: vec3<f32>, repeat: f32) -> vec3<f32> {{
     let uv = world.xz / max(repeat, 0.001);
-    return textureSample(splat_tex, splat_samp, uv, layer).rgb;
+    return textureSample(layer_tex, layer_samp, uv, layer).rgb;
 }}
 
 // Biplanar: the two strongest axes, weighted by the normal. Two samples rather
@@ -260,8 +286,8 @@ fn sample_biplanar(layer: i32, world: vec3<f32>, n: vec3<f32>, repeat: f32) -> v
         uv_minor = select(world.zy / r, world.xz / r, a.x < a.y);
     }}
 
-    let c_major = textureSample(splat_tex, splat_samp, uv_major, layer).rgb;
-    let c_minor = textureSample(splat_tex, splat_samp, uv_minor, layer).rgb;
+    let c_major = textureSample(layer_tex, layer_samp, uv_major, layer).rgb;
+    let c_minor = textureSample(layer_tex, layer_samp, uv_minor, layer).rgb;
     let w = ma / max(ma + me, 0.001);
     return mix(c_minor, c_major, w);
 }}
@@ -274,30 +300,54 @@ fn layer_colour(layer: i32, world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> v
     return sample_biplanar(layer, world, n, repeat);
 }}
 
+// Blend weights for the four layers, authored or derived.
+//
+// One vec4 either way, so the fragment stage below has a single code path. The
+// procedural branch reproduces the old mix chain exactly -- a weighted sum and
+// a chain of mixes are the same arithmetic -- so turning authoring on and off
+// is a change of WEIGHTS and never a change of shading model.
+fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
+    // Authored. Normalised by its own sum rather than trusted: the editor keeps
+    // the four bytes summing to 255, but a hand-made or half-written file has
+    // no such guarantee and unnormalised weights would blow out or black out
+    // the ground rather than looking slightly wrong.
+    let authored_raw = textureSample(splat_tex, layer_samp, uv);
+    let total = authored_raw.r + authored_raw.g + authored_raw.b + authored_raw.a;
+    let authored = authored_raw / max(total, 0.001);
+
+    // Derived from slope, with the optional height band on top.
+    let rock_w = smoothstep(mat.slope_start_deg, mat.slope_end_deg, slope_deg);
+    var derived = vec4<f32>(1.0 - rock_w, rock_w, 0.0, 0.0);
+    if (mat.height_end > mat.height_start) {{
+        let high_w = smoothstep(mat.height_start, mat.height_end, world_y);
+        derived = vec4<f32>(derived.x * (1.0 - high_w), derived.y * (1.0 - high_w), high_w, 0.0);
+    }}
+
+    // select, not an if: both sides are already computed and branching here
+    // would put textureSample under non-uniform control flow.
+    return select(derived, authored, mat.use_splat > 0.5);
+}}
+
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
 
     // Slope straight from the normal: no derivative, no extra sampling.
     let slope_deg = degrees(acos(clamp(n.y, -1.0, 1.0)));
 
-    let ground = layer_colour(0, in.world_pos, n, slope_deg);
-    let rock   = layer_colour(1, in.world_pos, n, slope_deg);
+    let w = layer_weights(in.uv, in.world_pos.y, slope_deg);
 
-    let rock_w = smoothstep(mat.slope_start_deg, mat.slope_end_deg, slope_deg);
-    var albedo = mix(ground, rock, rock_w);
-
-    // Optional height band, off by default -- start pushed beyond any real
-    // terrain, so smoothstep returns 0 and the layer costs one sample it does
-    // not use rather than a shader variant.
-    if (mat.height_end > mat.height_start) {{
-        let high = layer_colour(2, in.world_pos, n, slope_deg);
-        let high_w = smoothstep(mat.height_start, mat.height_end, in.world_pos.y);
-        albedo = mix(albedo, high, high_w);
-    }}
+    // All four layers, unconditionally. A weight-zero layer still costs its
+    // samples, which is the price of keeping every textureSample in uniform
+    // control flow -- skipping them per fragment is exactly the non-uniform
+    // branch WGSL forbids around sampling.
+    var albedo = layer_colour(0, in.world_pos, n, slope_deg) * w.x;
+    albedo = albedo + layer_colour(1, in.world_pos, n, slope_deg) * w.y;
+    albedo = albedo + layer_colour(2, in.world_pos, n, slope_deg) * w.z;
+    albedo = albedo + layer_colour(3, in.world_pos, n, slope_deg) * w.w;
 
     // Macro variation: one low-frequency sample, centred on 1 so it darkens and
     // lightens rather than only darkening.
-    let m = textureSample(macro_tex, splat_samp, in.world_pos.xz / max(mat.macro_repeat, 0.001)).r;
+    let m = textureSample(macro_tex, layer_samp, in.world_pos.xz / max(mat.macro_repeat, 0.001)).r;
     albedo = albedo * (1.0 + (m - 0.5) * 2.0 * mat.macro_strength);
 
     // Vertex colour survives as a tint, so the editor can still mark up ground
@@ -338,68 +388,6 @@ mod tests {
         .ok()
     }
 
-    /// Two solid-colour layers, so a rendered pixel says which layer won.
-    /// Layer 0 is pure red (flat ground), layer 1 pure blue (rock).
-    fn splat_array(device: &Device, queue: &Queue) -> TextureView {
-        let texture = device.create_texture(&TextureDescriptor {
-            label: Some("test_splat"),
-            size: Extent3d { width: 1, height: 1, depth_or_array_layers: 4 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let colours: [[u8; 4]; 4] = [
-            [255, 0, 0, 255],   // 0: ground
-            [0, 0, 255, 255],   // 1: rock
-            [0, 255, 0, 255],   // 2: high ground
-            [255, 255, 255, 255],
-        ];
-        for (layer, colour) in colours.iter().enumerate() {
-            queue.write_texture(
-                TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: Origin3d { x: 0, y: 0, z: layer as u32 },
-                    aspect: TextureAspect::All,
-                },
-                colour,
-                TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
-                Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            );
-        }
-        texture.create_view(&TextureViewDescriptor {
-            dimension: Some(TextureViewDimension::D2Array),
-            ..Default::default()
-        })
-    }
-
-    /// Flat 0.5 grey, so macro variation is neutral and cannot confuse the
-    /// colour assertions.
-    fn neutral_macro(device: &Device, queue: &Queue) -> TextureView {
-        let texture = device.create_texture(&TextureDescriptor {
-            label: Some("test_macro"),
-            size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All,
-            },
-            &[128u8, 128, 128, 255],
-            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
-            Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-        );
-        texture.create_view(&Default::default())
-    }
-
     fn vertex(pos: [f32; 3], normal: [f32; 3]) -> SolidVertex {
         SolidVertex {
             position: pos,
@@ -412,8 +400,23 @@ mod tests {
 
     /// Renders one full-screen quad with the given normal and returns its
     /// centre pixel.
-    fn render_quad_with_normal(normal: [f32; 3]) -> Option<[u8; 4]> {
-        render_quad(normal, false)
+    /// Which layer colours the material carries. The test palette is four
+    /// primaries so a readback names the winning layer unambiguously; the
+    /// fallback palette is the shipping one, whose colours are deliberately
+    /// close together and cannot.
+    #[derive(Copy, Clone)]
+    enum Palette {
+        Test,
+        Fallback,
+    }
+
+    pub fn render_quad_with_normal(normal: [f32; 3]) -> Option<[u8; 4]> {
+        render_quad(normal, Palette::Test, None)
+    }
+
+    /// Same geometry, with authored weights bound.
+    pub fn render_quad_with_splat(normal: [f32; 3], splat: &TerrainImage) -> Option<[u8; 4]> {
+        render_quad(normal, Palette::Test, Some(splat))
     }
 
     /// Same geometry, but bound through the shipping `TerrainMaterial::fallback`
@@ -423,10 +426,14 @@ mod tests {
     /// dimension and the non-sRGB macro format all live in `TerrainMaterial`
     /// and are exactly where a binding mistake would hide.
     pub fn render_quad_with_fallback_material(normal: [f32; 3]) -> Option<[u8; 4]> {
-        render_quad(normal, true)
+        render_quad(normal, Palette::Fallback, None)
     }
 
-    fn render_quad(normal: [f32; 3], real_material: bool) -> Option<[u8; 4]> {
+    fn render_quad(
+        normal: [f32; 3],
+        palette: Palette,
+        splat: Option<&TerrainImage>,
+    ) -> Option<[u8; 4]> {
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
 
@@ -450,31 +457,28 @@ mod tests {
 
         let pipeline = TerrainPipeline::new(&device, format, &uniforms.layout);
 
-        let material = TerrainMaterialUniform::default();
-        let material_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test_material"),
-            contents: bytemuck::bytes_of(&material),
-            usage: BufferUsages::UNIFORM,
-        });
-        let sampler = device.create_sampler(&SamplerDescriptor {
-            mag_filter: FilterMode::Linear,
-            min_filter: FilterMode::Linear,
-            address_mode_u: AddressMode::Repeat,
-            address_mode_v: AddressMode::Repeat,
-            ..Default::default()
-        });
-        let bind = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("test_material_bind"),
-            layout: &pipeline.material_layout,
-            entries: &[
-                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&splat_array(&device, &queue)) },
-                BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&sampler) },
-                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&neutral_macro(&device, &queue)) },
-                BindGroupEntry { binding: 3, resource: material_buf.as_entire_binding() },
-            ],
-        });
+        // Built through TerrainMaterial, not a hand-assembled bind group.
+        // The hand-built version drifted the moment the layout gained a
+        // binding, and worse, it meant every render test proved things about
+        // test code rather than about the code the renderer calls.
+        let solid = |rgb: [u8; 4]| TerrainImage { width: 1, height: 1, rgba: rgb.to_vec() };
+        let test_layers = [
+            solid([255, 0, 0, 255]),   // 0 ground -> red
+            solid([0, 0, 255, 255]),   // 1 rock   -> blue
+            solid([0, 255, 0, 255]),   // 2 high   -> green
+            solid([255, 255, 255, 255]), // 3 spare -> white
+        ];
+        let neutral = solid([128, 128, 128, 255]);
 
-        let fallback = TerrainMaterial::fallback(&device, &queue, &pipeline.material_layout);
+        let material = match palette {
+            Palette::Test => TerrainMaterial::new(
+                &device, &queue, &pipeline.material_layout,
+                &test_layers, &neutral, splat, TerrainMaterialUniform::default(),
+            ),
+            Palette::Fallback => {
+                TerrainMaterial::fallback(&device, &queue, &pipeline.material_layout)
+            }
+        };
 
         // A quad filling clip space, carrying the normal under test. The vertex
         // stage multiplies by view_proj, which defaults to identity here, so
@@ -543,7 +547,7 @@ mod tests {
             });
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &uniforms.bind_group, &[]);
-            pass.set_bind_group(1, if real_material { &fallback.bind_group } else { &bind }, &[]);
+            pass.set_bind_group(1, &material.bind_group, &[]);
             pass.set_vertex_buffer(0, vb.slice(..));
             pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
             pass.draw_indexed(0..3, 0, 0..1);
@@ -628,6 +632,10 @@ impl TerrainMaterial {
         layout: &BindGroupLayout,
         layers: &[TerrainImage],
         macro_image: &TerrainImage,
+        // Authored blend weights, or None to leave the shader on its slope- and
+        // height-driven blend. None still binds a texture -- see the layout --
+        // and clears `use_splat` so nothing reads it.
+        splat: Option<&TerrainImage>,
         settings: TerrainMaterialUniform,
     ) -> Self {
         assert!(!layers.is_empty(), "terrain material needs at least one layer");
@@ -706,6 +714,50 @@ impl TerrainMaterial {
             ..Default::default()
         });
 
+        // RGBA8 unorm, NOT sRGB: these are blend weights, and sRGB-decoding
+        // them would bend a 50/50 blend away from the middle -- the same reason
+        // the macro texture is linear.
+        let splat_image = splat.unwrap_or(&NO_SPLAT);
+        let splat_tex = device.create_texture(&TextureDescriptor {
+            label: Some("terrain_splat"),
+            size: Extent3d {
+                width: splat_image.width,
+                height: splat_image.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &splat_tex,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            &splat_image.rgba,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * splat_image.width),
+                rows_per_image: Some(splat_image.height),
+            },
+            Extent3d {
+                width: splat_image.width,
+                height: splat_image.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // The flag is derived here rather than left to the caller: a material
+        // built with a map that the shader then ignores, or without one that it
+        // then reads, are both silent and both look like a shader bug.
+        let mut settings = settings;
+        settings.use_splat = if splat.is_some() { 1.0 } else { 0.0 };
+
         let uniform = device.create_buffer(&BufferDescriptor {
             label: Some("terrain_material_uniform"),
             size: std::mem::size_of::<TerrainMaterialUniform>() as u64,
@@ -735,6 +787,12 @@ impl TerrainMaterial {
                     ),
                 },
                 BindGroupEntry { binding: 3, resource: uniform.as_entire_binding() },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: BindingResource::TextureView(
+                        &splat_tex.create_view(&TextureViewDescriptor::default()),
+                    ),
+                },
             ],
         });
 
@@ -750,6 +808,21 @@ impl TerrainMaterial {
     /// The colours are the ones the previous flat-shaded terrain used, so
     /// turning this on changes shading but not palette.
     pub fn fallback(device: &Device, queue: &Queue, layout: &BindGroupLayout) -> Self {
+        Self::fallback_with_splat(device, queue, layout, None)
+    }
+
+    /// The fallback palette, with authored blend weights applied to it.
+    ///
+    /// This is the state a level reaches first: someone has painted WHERE each
+    /// material goes long before an artist has produced what each material
+    /// looks like. Showing painted regions in flat colour is the honest render
+    /// of that, and it matches what the editor previews.
+    pub fn fallback_with_splat(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        splat: Option<&TerrainImage>,
+    ) -> Self {
         let solid = |rgb: [u8; 3]| TerrainImage {
             width: 1,
             height: 1,
@@ -768,6 +841,7 @@ impl TerrainMaterial {
             // Neutral macro: 0.5 is the no-op point for the shader's
             // (macro * 2) modulation, so an unauthored macro changes nothing.
             &solid([128, 128, 128]),
+            splat,
             TerrainMaterialUniform::default(),
         )
     }
@@ -829,11 +903,122 @@ mod material_tests {
             &device, &queue, &layout,
             std::slice::from_ref(&one),
             &one,
+            None,
             TerrainMaterialUniform::default(),
         );
         assert!(
             pollster::block_on(device.pop_error_scope()).is_none(),
             "a single-layer terrain material must still bind validly",
         );
+    }
+}
+
+/// The 1x1 stand-in bound when a scene authors no splat map.
+///
+/// Its contents are never read -- `use_splat` is 0 -- but something has to
+/// satisfy the binding, and a shared constant is cheaper than each caller
+/// inventing one.
+static NO_SPLAT: std::sync::LazyLock<TerrainImage> = std::sync::LazyLock::new(|| TerrainImage {
+    width: 1,
+    height: 1,
+    rgba: vec![255, 0, 0, 0],
+});
+
+#[cfg(test)]
+mod authored_splat_tests {
+    use super::tests::*;
+    use super::*;
+
+    fn splat(rgba: [u8; 4]) -> TerrainImage {
+        TerrainImage { width: 1, height: 1, rgba: rgba.to_vec() }
+    }
+
+    const FLAT: [f32; 3] = [0.0, 1.0, 0.0];
+    const CLIFF: [f32; 3] = [1.0, 0.05, 0.0];
+
+    /// The point of the whole feature: what an author painted wins over what
+    /// the slope rule would have chosen. Flat ground takes layer 0 (red) by
+    /// slope, so a map demanding layer 1 must come back blue.
+    #[test]
+    fn authored_weights_override_the_slope_blend() {
+        let Some(unauthored) = render_quad_with_normal(FLAT) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        assert!(unauthored[0] > unauthored[2], "flat ground should be red without a map: {unauthored:?}");
+
+        let painted = render_quad_with_splat(FLAT, &splat([0, 255, 0, 0])).unwrap();
+        assert!(
+            painted[2] > painted[0],
+            "a map demanding layer 1 must beat the slope rule on flat ground: {painted:?}",
+        );
+    }
+
+    /// And the other direction, so the test cannot pass by the map simply
+    /// being ignored in one particular case.
+    #[test]
+    fn authored_weights_override_a_cliff_too() {
+        let Some(unauthored) = render_quad_with_normal(CLIFF) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        assert!(unauthored[2] > unauthored[0], "a cliff should be blue without a map: {unauthored:?}");
+
+        let painted = render_quad_with_splat(CLIFF, &splat([255, 0, 0, 0])).unwrap();
+        assert!(
+            painted[0] > painted[2],
+            "a map demanding layer 0 must beat the slope rule on a cliff: {painted:?}",
+        );
+    }
+
+    /// A blend, not a winner-takes-all. Half layer 0 (red) and half layer 2
+    /// (green) must show both channels -- if the shader picked a dominant layer
+    /// instead of summing weights, one of these would be zero.
+    #[test]
+    fn a_mixed_texel_blends_rather_than_picking_a_winner() {
+        let Some(mixed) = render_quad_with_splat(FLAT, &splat([128, 0, 128, 0])) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        assert!(mixed[0] > 30, "layer 0 (red) should contribute: {mixed:?}");
+        assert!(mixed[1] > 30, "layer 2 (green) should contribute: {mixed:?}");
+        assert!(mixed[2] < mixed[0], "layer 1 (blue) was not painted: {mixed:?}");
+    }
+
+    /// Weights that do not sum to full are normalised rather than trusted. The
+    /// editor keeps them summing to 255, but a hand-made or half-written file
+    /// has no such guarantee, and unnormalised weights would blow out or black
+    /// out the ground instead of merely looking slightly wrong.
+    #[test]
+    fn unnormalised_weights_are_normalised_not_amplified() {
+        // Both of these mean "half layer 0, half layer 2" once normalised, but
+        // one sums to 255 and the other to 510.
+        let Some(normal_sum) = render_quad_with_splat(FLAT, &splat([128, 0, 128, 0])) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let double_sum = render_quad_with_splat(FLAT, &splat([255, 0, 255, 0])).unwrap();
+
+        for channel in 0..3 {
+            let delta = normal_sum[channel].abs_diff(double_sum[channel]);
+            assert!(
+                delta <= 4,
+                "weights summing to 510 must shade like weights summing to 255 \
+                 (channel {channel}: {normal_sum:?} vs {double_sum:?})",
+            );
+        }
+    }
+
+    /// An all-zero texel cannot divide by zero and black out the ground.
+    #[test]
+    fn an_empty_texel_does_not_produce_a_divide_by_zero() {
+        let Some(px) = render_quad_with_splat(FLAT, &splat([0, 0, 0, 0])) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        assert_eq!(px[3], 255, "terrain must stay opaque: {px:?}");
+        for channel in 0..3 {
+            assert!(px[channel] < 250, "an empty texel must not blow out: {px:?}");
+        }
     }
 }

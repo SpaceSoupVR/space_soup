@@ -355,5 +355,24 @@ impl XrRenderer {
     }
 
 
+    /// Apply a scene's authored splat map, or `None` to fall back to the
+    /// slope- and height-driven blend.
+    ///
+    /// Rebuilds the material rather than writing into the existing texture:
+    /// the map's resolution is per-scene, so a scene change can need a
+    /// different texture entirely, and rebuilding once per scene load is not
+    /// worth the branch to avoid.
+    pub fn set_terrain_splat(
+        &mut self,
+        splat: Option<&crate::renderer::terrain_pipeline::TerrainImage>,
+    ) {
+        self.terrain_material = crate::renderer::terrain_pipeline::TerrainMaterial::fallback_with_splat(
+            &self.wgpu_device,
+            &self.wgpu_queue,
+            &self.terrain_pipeline.material_layout,
+            splat,
+        );
+    }
+
     pub fn cleanup(&self) {}
 }
