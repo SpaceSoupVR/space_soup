@@ -3,7 +3,7 @@ use wgpu::util::DeviceExt;
 
 use crate::renderer::{
     camera::Camera,
-    cuboid::{build_solid_mesh_with_ranges, build_wire_mesh, Cuboid},
+    cuboid::{build_solid_mesh_with_ranges, build_wire_mesh, Cuboid, SolidVertex},
     lights::Light,
     mirror::{self, MirrorSurface},
     particle::{self, Beam, Particle},
@@ -72,7 +72,9 @@ impl XrRenderer {
         cuboids: &[Cuboid],
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
-        self.render_frame_with_meshes(session, stage, time, cuboids, &[], &[], &[], &[], &[], None)
+        self.render_frame_with_meshes(
+            session, stage, time, cuboids, &[], &[], &[], &[], &[], None, None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -87,6 +89,11 @@ impl XrRenderer {
         lights: &[Light],
         particles: &[Particle],
         beams: &[Beam],
+        // Static ground geometry, already in SolidVertex form. Rides the cuboid
+        // solid pipeline rather than getting one of its own: it wants exactly
+        // the same shading, shadowing and depth behaviour, and a second pipeline
+        // would be a second place for those to drift.
+        terrain: Option<(&[SolidVertex], &[u32])>,
         mirror: Option<MirrorSurface>,
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
@@ -106,7 +113,21 @@ impl XrRenderer {
         let cam_up = head_rot * glam::Vec3::Y;
         let view_dir = head_rot * glam::Vec3::NEG_Z;
 
-        let (solid_verts, solid_idx, solid_ranges) = build_solid_mesh_with_ranges(cuboids);
+        let (mut solid_verts, mut solid_idx, mut solid_ranges) =
+            build_solid_mesh_with_ranges(cuboids);
+
+        // Terrain appends as one more range. No lightmap key (it is lit
+        // dynamically) and no reflectivity, so it takes the plain solid path.
+        if let Some((terrain_verts, terrain_idx)) = terrain {
+            if !terrain_verts.is_empty() && !terrain_idx.is_empty() {
+                let base = solid_verts.len() as u32;
+                let index_start = solid_idx.len() as u32;
+                solid_verts.extend_from_slice(terrain_verts);
+                solid_idx.extend(terrain_idx.iter().map(|i| i + base));
+                solid_ranges.push((None, index_start, terrain_idx.len() as u32, 0.0));
+            }
+        }
+        let (solid_verts, solid_idx, solid_ranges) = (solid_verts, solid_idx, solid_ranges);
         let (wire_verts, wire_idx) = build_wire_mesh(cuboids);
         let (particle_verts, particle_idx) =
             particle::build_particle_mesh(particles, beams, cam_right, cam_up, view_dir);
