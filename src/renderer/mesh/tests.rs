@@ -56,10 +56,33 @@
     /// advert and exits non-zero -- so try `python` too, and verify it really
     /// runs rather than trusting the name. Skips like the GPU check above when
     /// there is none, because a missing dev tool is not a renderer regression.
-    fn python_bin() -> Option<&'static str> {
-        for candidate in ["python3", "python"] {
-            let ok = std::process::Command::new(candidate)
-                .args(["-c", "import json,struct,pathlib"])
+    fn python_bin() -> Option<String> {
+        // Probe with the import this test actually performs, not with stdlib
+        // modules every interpreter has. The old probe asked for
+        // `json,struct,pathlib`, which macOS's system Python 3.9 passes happily
+        // -- and then the test failed inside gltf_animation.py, so a version
+        // mismatch surfaced as "stripping existing clips failed" rather than as
+        // a skip. A probe that does not ask for what the test needs turns an
+        // unmet prerequisite into a red test.
+        //
+        // The project venv comes first because that is the interpreter the web
+        // editor itself runs under, so it is the one whose behaviour matters.
+        let script_dir = workspace_root().join("scene_editor_web");
+        let venv = workspace_root().join("scene_editor_web/venv/bin/python");
+        let probe = format!(
+            "import sys; sys.path.insert(0, {script_dir:?}); import gltf_animation"
+        );
+
+        let mut candidates: Vec<String> = Vec::new();
+        if venv.is_file() {
+            candidates.push(venv.to_string_lossy().into_owned());
+        }
+        candidates.push("python3".to_string());
+        candidates.push("python".to_string());
+
+        for candidate in candidates {
+            let ok = std::process::Command::new(&candidate)
+                .args(["-c", &probe])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
@@ -111,7 +134,7 @@
              from pathlib import Path; p = Path({test_path:?}); \
              [delete_joint_animation_clip(p, c['name']) for c in read_joint_animation_clips(p)]",
         );
-        let status = std::process::Command::new(python)
+        let status = std::process::Command::new(&python)
             .arg("-c")
             .arg(&strip)
             .status()
@@ -131,7 +154,7 @@
              {{'t': 0.0, 'position': [0,0,0], 'rotation': [0,0,0,1], 'scale': [1,1,1]}}, \
              {{'t': 0.3, 'position': [0,0,-0.05], 'rotation': [0,0,0,1], 'scale': [1,1,1]}}]}})",
         );
-        let status = std::process::Command::new(python)
+        let status = std::process::Command::new(&python)
             .arg("-c")
             .arg(&py)
             .status()
