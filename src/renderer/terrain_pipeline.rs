@@ -1,0 +1,839 @@
+//! Ground shading: splat materials, biplanar on slopes, macro variation.
+//!
+//! Terrain was appended to the cuboid solid pass, and the commit that did it
+//! argued against giving it a pipeline of its own -- "a second place for
+//! shading to drift". That was the right call while terrain was flat vertex
+//! colour and is the wrong one now: terrain needs a material array and a
+//! sampler that no cuboid will ever use, and forcing that into the solid
+//! pipeline means every cuboid in the scene carries a binding it does not want.
+//!
+//! The drift concern is answered directly rather than ignored: this shares
+//! `wgsl_lights_block` with the solid pipeline, so lighting, shadowing and
+//! attenuation are literally the same code. What differs is only how albedo is
+//! obtained, which is the thing that genuinely differs.
+//!
+//! Three techniques, chosen for a tile-based mobile GPU rendering stereo:
+//!
+//!  - SPLAT: up to four tiling materials in a texture array, blended by slope
+//!    and height. This is what makes ground read as ground rather than as a
+//!    coloured mesh.
+//!
+//!  - BIPLANAR rather than triplanar. A heightfield has no natural UVs, and
+//!    planar UVs stretch badly on exactly the cliffs you sculpt for cover.
+//!    Triplanar fixes that with three samples per material; biplanar drops the
+//!    axis contributing least and uses two, for a difference nobody can see.
+//!    Flat ground skips it entirely and takes a single planar sample, and most
+//!    of a map is flat, so most pixels pay the cheap path.
+//!
+//!  - MACRO VARIATION: one low-frequency sample multiplied over the result.
+//!    A single tiling texture over 500 metres repeats visibly from any ridge.
+//!    Stochastic/hex tiling solves that properly at three samples plus a
+//!    histogram transform, which is not affordable here -- and stochastic
+//!    blending that is not temporally stable shimmers under head motion, which
+//!    is far more noticeable in stereo than on a monitor. One extra sample
+//!    removes the repetition you actually notice.
+
+use wgpu::*;
+
+use super::cuboid::SolidVertex;
+use super::lights::wgsl_lights_block;
+
+/// Per-scene terrain material settings, matching the WGSL uniform.
+///
+/// `repeat` values are in metres per tile: a 4m stone tile and a 12m grass tile
+/// read very differently, and having one global scale is what makes every
+/// terrain in an engine look like the same terrain.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TerrainMaterialUniform {
+    /// Metres per tile for each of the four splat layers.
+    pub repeat: [f32; 4],
+    /// Slope in degrees at which layer 1 (rock) fully replaces layer 0 (ground).
+    pub slope_start_deg: f32,
+    pub slope_end_deg: f32,
+    /// World Y band over which layer 2 (high ground) fades in.
+    pub height_start: f32,
+    pub height_end: f32,
+    /// Metres per tile of the macro variation texture, and how strongly it
+    /// modulates. Zero strength disables it without a shader variant.
+    pub macro_repeat: f32,
+    pub macro_strength: f32,
+    /// Degrees past which biplanar sampling kicks in. Below this the shader
+    /// takes one planar sample.
+    pub biplanar_start_deg: f32,
+    pub _pad: f32,
+}
+
+impl Default for TerrainMaterialUniform {
+    fn default() -> Self {
+        Self {
+            repeat: [8.0, 4.0, 10.0, 6.0],
+            slope_start_deg: 22.0,
+            slope_end_deg: 40.0,
+            height_start: 1e9, // off by default: most scenes have no height band
+            height_end: 1e9,
+            macro_repeat: 140.0,
+            macro_strength: 0.35,
+            biplanar_start_deg: 18.0,
+            _pad: 0.0,
+        }
+    }
+}
+
+pub struct TerrainPipeline {
+    pub pipeline: RenderPipeline,
+    pub material_layout: BindGroupLayout,
+}
+
+impl TerrainPipeline {
+    pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("terrain_shader"),
+            source: ShaderSource::Wgsl(terrain_shader().into()),
+        });
+        let material_layout = material_bind_group_layout(device);
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("terrain_layout"),
+            bind_group_layouts: &[uniform_layout, &material_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("terrain_pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                // Same vertex format as the solid pass, so the geometry path is
+                // untouched: terrain still arrives as SolidVertex.
+                buffers: &[SolidVertex::layout()],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: Some(Face::Back),
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: CompareFunction::Less,
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        Self { pipeline, material_layout }
+    }
+}
+
+pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
+    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("terrain_material_layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn terrain_shader() -> String {
+    format!(
+        r#"
+struct Uniforms {{ view_proj: mat4x4<f32> }}
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+@group(1) @binding(0) var splat_tex: texture_2d_array<f32>;
+@group(1) @binding(1) var splat_samp: sampler;
+@group(1) @binding(2) var macro_tex: texture_2d<f32>;
+
+struct Material {{
+    repeat: vec4<f32>,
+    slope_start_deg: f32,
+    slope_end_deg: f32,
+    height_start: f32,
+    height_end: f32,
+    macro_repeat: f32,
+    macro_strength: f32,
+    biplanar_start_deg: f32,
+    pad: f32,
+}}
+@group(1) @binding(3) var<uniform> mat: Material;
+
+{lights_block}
+
+struct VIn  {{ @location(0) pos: vec3<f32>, @location(1) norm: vec3<f32>, @location(2) col: vec4<f32>, @location(3) uv2: vec2<f32> }}
+struct VOut {{
+    @builtin(position) clip: vec4<f32>,
+    @location(0) col: vec4<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) world_pos: vec3<f32>,
+}}
+
+@vertex fn vs_main(v: VIn) -> VOut {{
+    var out: VOut;
+    out.clip      = u.view_proj * vec4<f32>(v.pos, 1.0);
+    out.col       = v.col;
+    out.normal    = v.norm;
+    out.world_pos = v.pos;
+    return out;
+}}
+
+// One splat layer, sampled planar from above. Ground is mostly flat, so this is
+// the path most pixels take.
+fn sample_planar(layer: i32, world: vec3<f32>, repeat: f32) -> vec3<f32> {{
+    let uv = world.xz / max(repeat, 0.001);
+    return textureSample(splat_tex, splat_samp, uv, layer).rgb;
+}}
+
+// Biplanar: the two strongest axes, weighted by the normal. Two samples rather
+// than triplanar's three -- the third axis contributes least by construction,
+// and dropping it is invisible while being a third cheaper.
+fn sample_biplanar(layer: i32, world: vec3<f32>, n: vec3<f32>, repeat: f32) -> vec3<f32> {{
+    let r = max(repeat, 0.001);
+    let a = abs(n);
+
+    // Rank the axes so we can take the top two without branching per pixel.
+    let ma = max(a.x, max(a.y, a.z));
+    let mi = min(a.x, min(a.y, a.z));
+    let me = a.x + a.y + a.z - ma - mi;
+
+    var uv_major: vec2<f32>;
+    var uv_minor: vec2<f32>;
+    if (a.y == ma) {{
+        uv_major = world.xz / r;
+        uv_minor = select(world.xy / r, world.zy / r, a.x >= a.z);
+    }} else if (a.x == ma) {{
+        uv_major = world.zy / r;
+        uv_minor = select(world.xy / r, world.xz / r, a.z < a.y);
+    }} else {{
+        uv_major = world.xy / r;
+        uv_minor = select(world.zy / r, world.xz / r, a.x < a.y);
+    }}
+
+    let c_major = textureSample(splat_tex, splat_samp, uv_major, layer).rgb;
+    let c_minor = textureSample(splat_tex, splat_samp, uv_minor, layer).rgb;
+    let w = ma / max(ma + me, 0.001);
+    return mix(c_minor, c_major, w);
+}}
+
+fn layer_colour(layer: i32, world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> vec3<f32> {{
+    let repeat = mat.repeat[layer];
+    if (slope_deg < mat.biplanar_start_deg) {{
+        return sample_planar(layer, world, repeat);
+    }}
+    return sample_biplanar(layer, world, n, repeat);
+}}
+
+@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
+    let n = normalize(in.normal);
+
+    // Slope straight from the normal: no derivative, no extra sampling.
+    let slope_deg = degrees(acos(clamp(n.y, -1.0, 1.0)));
+
+    let ground = layer_colour(0, in.world_pos, n, slope_deg);
+    let rock   = layer_colour(1, in.world_pos, n, slope_deg);
+
+    let rock_w = smoothstep(mat.slope_start_deg, mat.slope_end_deg, slope_deg);
+    var albedo = mix(ground, rock, rock_w);
+
+    // Optional height band, off by default -- start pushed beyond any real
+    // terrain, so smoothstep returns 0 and the layer costs one sample it does
+    // not use rather than a shader variant.
+    if (mat.height_end > mat.height_start) {{
+        let high = layer_colour(2, in.world_pos, n, slope_deg);
+        let high_w = smoothstep(mat.height_start, mat.height_end, in.world_pos.y);
+        albedo = mix(albedo, high, high_w);
+    }}
+
+    // Macro variation: one low-frequency sample, centred on 1 so it darkens and
+    // lightens rather than only darkening.
+    let m = textureSample(macro_tex, splat_samp, in.world_pos.xz / max(mat.macro_repeat, 0.001)).r;
+    albedo = albedo * (1.0 + (m - 0.5) * 2.0 * mat.macro_strength);
+
+    // Vertex colour survives as a tint, so the editor can still mark up ground
+    // per-vertex without a second pipeline.
+    let lit = shade(in.world_pos, n);
+    return vec4<f32>(albedo * in.col.rgb * lit, 1.0);
+}}
+"#,
+        lights_block = wgsl_lights_block(0, 1)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::renderer::cuboid::SolidVertex;
+    use crate::renderer::lights::LightsUniform;
+    use crate::renderer::uniforms::UniformBuffer;
+    use wgpu::util::DeviceExt;
+
+    /// The pipeline is only validated when it is CREATED, and correctness only
+    /// when something is drawn. A test that builds a pipeline proves the WGSL
+    /// parses; it says nothing about whether the shading responds to slope.
+    /// So this renders and reads the pixels back.
+    pub fn headless_gpu() -> Option<(Device, Queue)> {
+        let instance = Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        pollster::block_on(adapter.request_device(&DeviceDescriptor {
+            required_features: Features::empty(),
+            required_limits: Limits::default(),
+            ..Default::default()
+        }))
+        .ok()
+    }
+
+    /// Two solid-colour layers, so a rendered pixel says which layer won.
+    /// Layer 0 is pure red (flat ground), layer 1 pure blue (rock).
+    fn splat_array(device: &Device, queue: &Queue) -> TextureView {
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("test_splat"),
+            size: Extent3d { width: 1, height: 1, depth_or_array_layers: 4 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let colours: [[u8; 4]; 4] = [
+            [255, 0, 0, 255],   // 0: ground
+            [0, 0, 255, 255],   // 1: rock
+            [0, 255, 0, 255],   // 2: high ground
+            [255, 255, 255, 255],
+        ];
+        for (layer, colour) in colours.iter().enumerate() {
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: Origin3d { x: 0, y: 0, z: layer as u32 },
+                    aspect: TextureAspect::All,
+                },
+                colour,
+                TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+                Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            );
+        }
+        texture.create_view(&TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D2Array),
+            ..Default::default()
+        })
+    }
+
+    /// Flat 0.5 grey, so macro variation is neutral and cannot confuse the
+    /// colour assertions.
+    fn neutral_macro(device: &Device, queue: &Queue) -> TextureView {
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("test_macro"),
+            size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All,
+            },
+            &[128u8, 128, 128, 255],
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        texture.create_view(&Default::default())
+    }
+
+    fn vertex(pos: [f32; 3], normal: [f32; 3]) -> SolidVertex {
+        SolidVertex {
+            position: pos,
+            normal,
+            color: [1.0, 1.0, 1.0, 1.0],
+            uv2: [0.0, 0.0],
+            reflectivity: 0.0,
+        }
+    }
+
+    /// Renders one full-screen quad with the given normal and returns its
+    /// centre pixel.
+    fn render_quad_with_normal(normal: [f32; 3]) -> Option<[u8; 4]> {
+        render_quad(normal, false)
+    }
+
+    /// Same geometry, but bound through the shipping `TerrainMaterial::fallback`
+    /// rather than a bind group assembled here. Worth its own path because the
+    /// hand-built test material proves the SHADER and proves nothing about the
+    /// code the renderer will actually call -- layer padding, the D2Array view
+    /// dimension and the non-sRGB macro format all live in `TerrainMaterial`
+    /// and are exactly where a binding mistake would hide.
+    pub fn render_quad_with_fallback_material(normal: [f32; 3]) -> Option<[u8; 4]> {
+        render_quad(normal, true)
+    }
+
+    fn render_quad(normal: [f32; 3], real_material: bool) -> Option<[u8; 4]> {
+        let (device, queue) = headless_gpu()?;
+        let format = TextureFormat::Rgba8Unorm;
+
+        let lights = LightsUniform::new(&device);
+        let uniforms = UniformBuffer::new(&device, &lights);
+
+        // Both uniform buffers are created UNINITIALISED. Without writing them
+        // view_proj is garbage -- the triangle lands somewhere arbitrary and the
+        // readback is just clear colour -- and the light count is undefined.
+        // Identity view_proj means the vertex positions ARE clip coordinates,
+        // and an empty light list leaves the shader's AMBIENT term, which is all
+        // this test wants: it is asserting the splat blend, not the light rig.
+        queue.write_buffer(
+            &uniforms.buffer,
+            0,
+            bytemuck::bytes_of(&crate::renderer::uniforms::Uniforms {
+                view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            }),
+        );
+        lights.upload(&queue, &[]);
+
+        let pipeline = TerrainPipeline::new(&device, format, &uniforms.layout);
+
+        let material = TerrainMaterialUniform::default();
+        let material_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test_material"),
+            contents: bytemuck::bytes_of(&material),
+            usage: BufferUsages::UNIFORM,
+        });
+        let sampler = device.create_sampler(&SamplerDescriptor {
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            address_mode_u: AddressMode::Repeat,
+            address_mode_v: AddressMode::Repeat,
+            ..Default::default()
+        });
+        let bind = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("test_material_bind"),
+            layout: &pipeline.material_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&splat_array(&device, &queue)) },
+                BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&sampler) },
+                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&neutral_macro(&device, &queue)) },
+                BindGroupEntry { binding: 3, resource: material_buf.as_entire_binding() },
+            ],
+        });
+
+        let fallback = TerrainMaterial::fallback(&device, &queue, &pipeline.material_layout);
+
+        // A quad filling clip space, carrying the normal under test. The vertex
+        // stage multiplies by view_proj, which defaults to identity here, so
+        // positions ARE clip coordinates.
+        let verts = [
+            vertex([-1.0, -1.0, 0.5], normal),
+            vertex([3.0, -1.0, 0.5], normal),
+            vertex([-1.0, 3.0, 0.5], normal),
+        ];
+        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test_vb"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: BufferUsages::VERTEX,
+        });
+        let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test_ib"),
+            contents: bytemuck::cast_slice(&[0u32, 1, 2]),
+            usage: BufferUsages::INDEX,
+        });
+
+        const SIZE: u32 = 8;
+        let target = device.create_texture(&TextureDescriptor {
+            label: Some("test_target"),
+            size: Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: TextureDimension::D2,
+            format,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = device.create_texture(&TextureDescriptor {
+            label: Some("test_depth"),
+            size: Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Depth32Float,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+
+        let readback = device.create_buffer(&BufferDescriptor {
+            label: Some("test_readback"),
+            size: (256 * SIZE) as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("test_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &target_view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(Operations { load: LoadOp::Clear(1.0), store: StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_bind_group(0, &uniforms.bind_group, &[]);
+            pass.set_bind_group(1, if real_material { &fallback.bind_group } else { &bind }, &[]);
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+            pass.draw_indexed(0..3, 0, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture: &target, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All,
+            },
+            TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(SIZE) },
+            },
+            Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(MapMode::Read, |_| {});
+        device.poll(PollType::Wait).ok();
+        let data = slice.get_mapped_range();
+        let centre = (SIZE / 2) as usize * 256 + (SIZE / 2) as usize * 4;
+        Some([data[centre], data[centre + 1], data[centre + 2], data[centre + 3]])
+    }
+
+    #[test]
+    fn flat_ground_shades_from_the_ground_layer() {
+        let Some(px) = render_quad_with_normal([0.0, 1.0, 0.0]) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        // Layer 0 is red. Lighting scales it, so assert the CHANNEL BALANCE
+        // rather than an exact value -- an absolute assert would be a test of
+        // the light rig rather than of the splat blend.
+        assert!(px[0] > px[2], "flat ground should take the ground layer (red), got {px:?}");
+    }
+
+    #[test]
+    fn a_cliff_shades_from_the_rock_layer() {
+        // Normal pointing sideways: 90 degrees of slope, well past slope_end.
+        let Some(px) = render_quad_with_normal([1.0, 0.0, 0.0]) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        assert!(px[2] > px[0], "a cliff should take the rock layer (blue), got {px:?}");
+    }
+
+    #[test]
+    fn the_slope_blend_is_gradual_rather_than_a_hard_switch() {
+        // Halfway through the 22..40 degree band, both layers should contribute
+        // -- a hard switch reads as a visible seam right across a hillside.
+        let a = 31.0_f32.to_radians();
+        let Some(px) = render_quad_with_normal([a.sin(), a.cos(), 0.0]) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        assert!(px[0] > 8, "ground layer vanished mid-blend: {px:?}");
+        assert!(px[2] > 8, "rock layer absent mid-blend: {px:?}");
+    }
+}
+
+/// The textures and settings one terrain draws with.
+///
+/// Built separately from the pipeline because the pipeline is per-device and
+/// this is per-scene: two levels want different ground, and rebuilding a
+/// pipeline to change a texture would be absurd.
+pub struct TerrainMaterial {
+    pub bind_group: BindGroup,
+    pub uniform: Buffer,
+}
+
+impl TerrainMaterial {
+    /// Build from four RGBA8 layer images plus a macro image.
+    ///
+    /// Every layer must be the same size -- they go into one D2Array, which is
+    /// what lets the shader index a layer by splat weight without a branch per
+    /// layer. `layers` shorter than 4 is padded by repeating the last one, so a
+    /// scene that only authors ground and rock still binds a complete array
+    /// rather than failing validation.
+    pub fn new(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        layers: &[TerrainImage],
+        macro_image: &TerrainImage,
+        settings: TerrainMaterialUniform,
+    ) -> Self {
+        assert!(!layers.is_empty(), "terrain material needs at least one layer");
+        let (w, h) = (layers[0].width, layers[0].height);
+        assert!(
+            layers.iter().all(|l| l.width == w && l.height == h),
+            "all terrain layers must share one size to live in a D2Array",
+        );
+
+        let array = device.create_texture(&TextureDescriptor {
+            label: Some("terrain_layers"),
+            size: Extent3d { width: w, height: h, depth_or_array_layers: 4 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for slot in 0..4 {
+            let src = layers.get(slot).unwrap_or_else(|| layers.last().unwrap());
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &array,
+                    mip_level: 0,
+                    origin: Origin3d { x: 0, y: 0, z: slot as u32 },
+                    aspect: TextureAspect::All,
+                },
+                &src.rgba,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * w),
+                    rows_per_image: Some(h),
+                },
+                Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        }
+
+        let macro_tex = device.create_texture(&TextureDescriptor {
+            label: Some("terrain_macro"),
+            size: Extent3d { width: macro_image.width, height: macro_image.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            // NOT sRGB: this is a modulation factor, not a colour. Decoding it
+            // through sRGB would bend the neutral point away from 0.5 and tint
+            // the whole terrain.
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &macro_tex,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            &macro_image.rgba,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * macro_image.width),
+                rows_per_image: Some(macro_image.height),
+            },
+            Extent3d { width: macro_image.width, height: macro_image.height, depth_or_array_layers: 1 },
+        );
+
+        let sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("terrain_sampler"),
+            address_mode_u: AddressMode::Repeat,
+            address_mode_v: AddressMode::Repeat,
+            address_mode_w: AddressMode::Repeat,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let uniform = device.create_buffer(&BufferDescriptor {
+            label: Some("terrain_material_uniform"),
+            size: std::mem::size_of::<TerrainMaterialUniform>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&settings));
+
+        let bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("terrain_material"),
+            layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(
+                        &array.create_view(&TextureViewDescriptor {
+                            dimension: Some(TextureViewDimension::D2Array),
+                            ..Default::default()
+                        }),
+                    ),
+                },
+                BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&sampler) },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::TextureView(
+                        &macro_tex.create_view(&TextureViewDescriptor::default()),
+                    ),
+                },
+                BindGroupEntry { binding: 3, resource: uniform.as_entire_binding() },
+            ],
+        });
+
+        Self { bind_group, uniform }
+    }
+
+    /// A material with no authored textures: flat colours per layer.
+    ///
+    /// This exists so terrain can go through the real pipeline from day one. A
+    /// renderer path that only works once an artist has produced four tiling
+    /// textures stays unwired and therefore unverified for as long as that
+    /// takes, and the wiring bugs all surface later, at once, blamed on the art.
+    /// The colours are the ones the previous flat-shaded terrain used, so
+    /// turning this on changes shading but not palette.
+    pub fn fallback(device: &Device, queue: &Queue, layout: &BindGroupLayout) -> Self {
+        let solid = |rgb: [u8; 3]| TerrainImage {
+            width: 1,
+            height: 1,
+            rgba: vec![rgb[0], rgb[1], rgb[2], 255],
+        };
+        Self::new(
+            device,
+            queue,
+            layout,
+            &[
+                solid([86, 112, 62]),  // 0 ground
+                solid([104, 100, 94]), // 1 rock
+                solid([132, 128, 120]), // 2 high ground
+                solid([92, 84, 70]),   // 3 spare
+            ],
+            // Neutral macro: 0.5 is the no-op point for the shader's
+            // (macro * 2) modulation, so an unauthored macro changes nothing.
+            &solid([128, 128, 128]),
+            TerrainMaterialUniform::default(),
+        )
+    }
+
+    /// Update the settings without rebuilding textures or the bind group.
+    pub fn set_settings(&self, queue: &Queue, settings: TerrainMaterialUniform) {
+        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&settings));
+    }
+}
+
+/// A decoded RGBA8 image destined for the terrain material.
+pub struct TerrainImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+#[cfg(test)]
+mod material_tests {
+    use super::tests::*;
+    use super::*;
+
+    /// The fallback material must produce the SAME layer selection as the
+    /// hand-built test material: flat ground takes layer 0, a cliff takes layer
+    /// 1. Colours differ (the fallback ships real terrain colours, the test
+    /// material ships primaries), so this asserts on which layer won, via the
+    /// channel that separates them, rather than on exact bytes.
+    #[test]
+    fn the_fallback_material_selects_layers_the_same_way() {
+        let Some(flat) = render_quad_with_fallback_material([0.0, 1.0, 0.0]) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let cliff = render_quad_with_fallback_material([1.0, 0.05, 0.0]).unwrap();
+
+        // Ground (86,112,62) is green-dominant; rock (104,100,94) is near-grey.
+        let greenness = |p: [u8; 4]| p[1] as i32 - p[2] as i32;
+        assert!(
+            greenness(flat) > greenness(cliff) + 8,
+            "flat ground should read greener than a cliff: flat {flat:?} cliff {cliff:?}",
+        );
+        assert!(flat[3] == 255 && cliff[3] == 255, "terrain must be opaque");
+    }
+
+    /// A material built with fewer than four layers still binds a complete
+    /// D2Array. Without the padding this is a validation error at bind-group
+    /// creation, which is the kind of thing that only shows up on the scene
+    /// that happens to author two layers.
+    #[test]
+    fn a_short_layer_list_pads_to_a_full_array() {
+        let Some((device, queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let layout = material_bind_group_layout(&device);
+        let one = TerrainImage { width: 1, height: 1, rgba: vec![10, 20, 30, 255] };
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _m = TerrainMaterial::new(
+            &device, &queue, &layout,
+            std::slice::from_ref(&one),
+            &one,
+            TerrainMaterialUniform::default(),
+        );
+        assert!(
+            pollster::block_on(device.pop_error_scope()).is_none(),
+            "a single-layer terrain material must still bind validly",
+        );
+    }
+}

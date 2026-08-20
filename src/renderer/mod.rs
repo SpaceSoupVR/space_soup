@@ -10,6 +10,7 @@ pub mod panel;
 pub mod particle;
 pub mod pipeline;
 pub mod ssr;
+pub mod terrain_pipeline;
 pub mod uniforms;
 
 #[cfg(target_os = "android")]
