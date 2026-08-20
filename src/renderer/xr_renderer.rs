@@ -30,6 +30,11 @@ pub struct XrRenderer {
     wgpu_device: wgpu::Device,
     wgpu_queue: wgpu::Queue,
     solid_pipeline: SolidPipeline,
+    terrain_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
+    // The material is per-scene, but it is built here with the fallback so
+    // terrain renders through the real pipeline before any textures exist.
+    // Replaced via `set_terrain_material` when a scene authors its own.
+    terrain_material: crate::renderer::terrain_pipeline::TerrainMaterial,
     wire_pipeline: WirePipeline,
     mesh_pipeline: MeshPipeline,
     skinned_mesh_pipeline: SkinnedMeshPipeline,
@@ -166,6 +171,12 @@ impl XrRenderer {
         let lights_uniform = LightsUniform::new(&wgpu_device);
         let uniform_buf = UniformBuffer::new(&wgpu_device, &lights_uniform);
         let solid_pipeline = SolidPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let terrain_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new(
+            &wgpu_device, wgpu_format, &uniform_buf.layout,
+        );
+        let terrain_material = crate::renderer::terrain_pipeline::TerrainMaterial::fallback(
+            &wgpu_device, &wgpu_queue, &terrain_pipeline.material_layout,
+        );
         let wire_pipeline = WirePipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let mesh_pipeline = MeshPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let skinned_mesh_pipeline =
@@ -256,6 +267,8 @@ impl XrRenderer {
             wgpu_device,
             wgpu_queue,
             solid_pipeline,
+            terrain_pipeline,
+            terrain_material,
             wire_pipeline,
             mesh_pipeline,
             skinned_mesh_pipeline,

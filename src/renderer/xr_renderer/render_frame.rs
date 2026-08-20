@@ -116,8 +116,20 @@ impl XrRenderer {
         let (mut solid_verts, mut solid_idx, mut solid_ranges) =
             build_solid_mesh_with_ranges(cuboids);
 
-        // Terrain appends as one more range. No lightmap key (it is lit
-        // dynamically) and no reflectivity, so it takes the plain solid path.
+        // Terrain appends into the SAME buffers as the cuboids -- the terrain
+        // pipeline takes SolidVertex too, so one vertex buffer serves both and
+        // the geometry path is unchanged.
+        //
+        // It is recorded twice on purpose. It stays in `solid_ranges` so the
+        // mirror and SSR passes keep drawing it (a reflection that omits the
+        // ground is far worse than one that shades it flatly), and it is ALSO
+        // recorded in `terrain_range` so the main eye pass can skip it there and
+        // redraw it through TerrainPipeline. The consequence is deliberate and
+        // worth naming: terrain is splat-shaded when looked at directly and
+        // flat-shaded in reflections. Unifying that means teaching the mirror
+        // and SSR pipelines the terrain material, which is a bigger change than
+        // this one and buys much less.
+        let mut terrain_range: Option<(u32, u32)> = None;
         if let Some((terrain_verts, terrain_idx)) = terrain {
             if !terrain_verts.is_empty() && !terrain_idx.is_empty() {
                 let base = solid_verts.len() as u32;
@@ -125,6 +137,7 @@ impl XrRenderer {
                 solid_verts.extend_from_slice(terrain_verts);
                 solid_idx.extend(terrain_idx.iter().map(|i| i + base));
                 solid_ranges.push((None, index_start, terrain_idx.len() as u32, 0.0));
+                terrain_range = Some((index_start, terrain_idx.len() as u32));
             }
         }
         let (solid_verts, solid_idx, solid_ranges) = (solid_verts, solid_idx, solid_ranges);
@@ -347,9 +360,22 @@ impl XrRenderer {
                         pass.set_vertex_buffer(0, solid_vb.slice(..));
                         pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
                         for (lightmap_key, index_start, count, _reflectivity) in &solid_ranges {
+                            // Terrain is in this list for the reflection passes;
+                            // here it gets its own pipeline instead.
+                            if terrain_range == Some((*index_start, *count)) {
+                                continue;
+                            }
                             pass.set_bind_group(1, self.cuboid_lightmap_bg(lightmap_key.as_deref()), &[]);
                             pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
                         }
+                    }
+                    if let Some((index_start, count)) = terrain_range {
+                        pass.set_pipeline(&self.terrain_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                        pass.set_vertex_buffer(0, solid_vb.slice(..));
+                        pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(index_start..index_start + count, 0, 0..1);
                     }
                     if !wire_verts.is_empty() {
                         pass.set_pipeline(&self.wire_pipeline.pipeline);
