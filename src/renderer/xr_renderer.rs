@@ -37,6 +37,7 @@ pub struct XrRenderer {
     terrain_material: crate::renderer::terrain_pipeline::TerrainMaterial,
     /// Layer textures and splat map are kept so either can be replaced alone.
     terrain_layers: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
+    terrain_normals: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
     terrain_splat: Option<crate::renderer::terrain_pipeline::TerrainImage>,
     wire_pipeline: WirePipeline,
     mesh_pipeline: MeshPipeline,
@@ -273,6 +274,7 @@ impl XrRenderer {
             terrain_pipeline,
             terrain_material,
             terrain_layers: vec![None, None, None, None],
+            terrain_normals: vec![None, None, None, None],
             terrain_splat: None,
             wire_pipeline,
             mesh_pipeline,
@@ -383,8 +385,10 @@ impl XrRenderer {
     pub fn set_terrain_layers(
         &mut self,
         layers: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
+        normals: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
     ) {
         self.terrain_layers = layers;
+        self.terrain_normals = normals;
         self.rebuild_terrain_material();
     }
 
@@ -401,6 +405,7 @@ impl XrRenderer {
             &self.wgpu_queue,
             &self.terrain_pipeline.material_layout,
             &self.terrain_layers,
+            &self.terrain_normals,
             self.terrain_splat.as_ref(),
         );
     }

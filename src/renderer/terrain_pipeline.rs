@@ -68,6 +68,16 @@ pub struct TerrainMaterialUniform {
     /// "weights that happen to look unauthored" rule would make a legitimately
     /// black-painted texel indistinguishable from no map at all.
     pub use_splat: f32,
+
+    /// How strongly the normal maps perturb the surface. 0 disables them.
+    ///
+    /// No companion flag, unlike `use_splat`, because a flat normal map is a
+    /// genuine no-op: the fallback texel (128, 128, 255) unpacks to (0, 0, 1),
+    /// which is "unchanged" in tangent space. An unauthored normal set costs
+    /// its samples and changes nothing, so the shader never has to be told
+    /// whether to trust it.
+    pub normal_strength: f32,
+    pub _pad: [f32; 3],
 }
 
 impl Default for TerrainMaterialUniform {
@@ -82,6 +92,8 @@ impl Default for TerrainMaterialUniform {
             macro_strength: 0.35,
             biplanar_start_deg: 18.0,
             use_splat: 0.0,
+            normal_strength: 1.0,
+            _pad: [0.0; 3],
         }
     }
 }
@@ -188,6 +200,20 @@ pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
                 },
                 count: None,
             },
+            // Per-layer normal maps. Always bound, like the weights: an
+            // optional binding would mean two layouts and therefore two
+            // pipelines, and a flat placeholder costs one texel per layer and
+            // changes nothing.
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
             // Authored blend weights over the terrain footprint. Always bound,
             // even when unauthored: an optional binding would mean two bind
             // group layouts and therefore two pipelines, and a 1x1 placeholder
@@ -226,9 +252,14 @@ struct Material {{
     macro_strength: f32,
     biplanar_start_deg: f32,
     use_splat: f32,
+    normal_strength: f32,
+    pad0: f32,
+    pad1: f32,
+    pad2: f32,
 }}
 @group(1) @binding(3) var<uniform> mat: Material;
 @group(1) @binding(4) var splat_tex: texture_2d<f32>;
+@group(1) @binding(5) var normal_tex: texture_2d_array<f32>;
 
 {lights_block}
 
@@ -292,6 +323,38 @@ fn sample_biplanar(layer: i32, world: vec3<f32>, n: vec3<f32>, repeat: f32) -> v
     return mix(c_minor, c_major, w);
 }}
 
+// Surface normal for one layer, sampled top-down and folded into the geometric
+// normal by the "whiteout" blend.
+//
+// PLANAR ONLY, deliberately, while colour goes biplanar on steep ground. Each
+// extra projection is another texture fetch per layer per pixel, and the four
+// layers are already sampled unconditionally -- going biplanar here would take
+// terrain from twelve fetches to sixteen on a machine that is not fast. The
+// cost is that a near-vertical face gets a stretched normal; that is far less
+// objectionable than stretched COLOUR, which is why colour keeps its second
+// projection and this does not.
+//
+// Whiteout rather than simply replacing the normal: the map describes bumps
+// relative to the surface, so it has to perturb the geometry rather than
+// overwrite it. Replacing would make every slope light as though it were flat
+// ground, which is exactly the artefact normal maps exist to avoid.
+fn layer_normal(layer: i32, world: vec3<f32>, n: vec3<f32>, repeat: f32) -> vec3<f32> {{
+    let uv = world.xz / max(repeat, 0.001);
+    let packed = textureSample(normal_tex, layer_samp, uv, layer).rgb;
+
+    // OpenGL convention: green is +Y in tangent space. ambientCG ships both
+    // NormalGL and NormalDX; the installer takes GL, and a DX map loaded here
+    // would light every bump from the opposite side.
+    var tn = packed * 2.0 - 1.0;
+    tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
+
+    // Y-projection whiteout. For flat ground (n = 0,1,0) and a flat texel
+    // (tn = 0,0,1) this returns the geometric normal exactly, which is what
+    // makes an unauthored normal set a true no-op.
+    let t = vec3<f32>(tn.xy + n.xz, abs(tn.z) * n.y);
+    return normalize(t.xzy);
+}}
+
 fn layer_colour(layer: i32, world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> vec3<f32> {{
     let repeat = mat.repeat[layer];
     if (slope_deg < mat.biplanar_start_deg) {{
@@ -345,6 +408,16 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     albedo = albedo + layer_colour(2, in.world_pos, n, slope_deg) * w.z;
     albedo = albedo + layer_colour(3, in.world_pos, n, slope_deg) * w.w;
 
+    // Blend the layers' normals by the same weights, then renormalise. Summing
+    // unit vectors shortens the result wherever they disagree, and a shortened
+    // normal darkens the surface -- so the renormalise is load-bearing, not
+    // tidiness.
+    var shaded_n = layer_normal(0, in.world_pos, n, mat.repeat[0]) * w.x;
+    shaded_n = shaded_n + layer_normal(1, in.world_pos, n, mat.repeat[1]) * w.y;
+    shaded_n = shaded_n + layer_normal(2, in.world_pos, n, mat.repeat[2]) * w.z;
+    shaded_n = shaded_n + layer_normal(3, in.world_pos, n, mat.repeat[3]) * w.w;
+    shaded_n = normalize(select(n, shaded_n, length(shaded_n) > 0.0001));
+
     // Macro variation: one low-frequency sample, centred on 1 so it darkens and
     // lightens rather than only darkening.
     let m = textureSample(macro_tex, layer_samp, in.world_pos.xz / max(mat.macro_repeat, 0.001)).r;
@@ -352,7 +425,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
 
     // Vertex colour survives as a tint, so the editor can still mark up ground
     // per-vertex without a second pipeline.
-    let lit = shade(in.world_pos, n);
+    let lit = shade(in.world_pos, shaded_n);
     return vec4<f32>(albedo * in.col.rgb * lit, 1.0);
 }}
 "#,
@@ -405,7 +478,7 @@ mod tests {
     /// fallback palette is the shipping one, whose colours are deliberately
     /// close together and cannot.
     #[derive(Copy, Clone)]
-    enum Palette {
+    pub enum Palette {
         Test,
         Fallback,
     }
@@ -434,6 +507,21 @@ mod tests {
         palette: Palette,
         splat: Option<&TerrainImage>,
     ) -> Option<[u8; 4]> {
+        render_quad_full(normal, palette, splat, &[None, None, None, None], false)
+    }
+
+    /// Full harness: optional per-layer normal maps and an optional point light.
+    ///
+    /// The light matters. With an empty light list `shade` returns the ambient
+    /// constant regardless of the surface normal, so a normal-map test on the
+    /// default harness would pass whether the perturbation worked or not.
+    pub fn render_quad_full(
+        normal: [f32; 3],
+        palette: Palette,
+        splat: Option<&TerrainImage>,
+        normals: &[Option<TerrainImage>],
+        lit: bool,
+    ) -> Option<[u8; 4]> {
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
 
@@ -453,7 +541,27 @@ mod tests {
                 view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             }),
         );
-        lights.upload(&queue, &[]);
+        if lit {
+            // Placed off to one side so a tilt in the surface normal changes
+            // how much light the fragment receives. Directly overhead would
+            // make an x-tilt symmetric and hide exactly what is being tested.
+            lights.upload(&queue, &[crate::renderer::lights::Light {
+                position: glam::Vec3::new(3.0, 2.0, 0.0),
+                direction: glam::Vec3::new(0.0, -1.0, 0.0),
+                kind: crate::renderer::lights::LightKind::Point,
+                color: crate::renderer::Color3(255, 255, 255, 255),
+                // Deliberately dim. The test palette's layer 0 is pure red, so
+                // ambient alone already puts that channel at 153 of 255; a
+                // bright light clips it and the lighting difference this test
+                // exists to measure vanishes into saturation. Both tilts
+                // rendered [255, 0, 0] at intensity 40.
+                intensity: 3.0,
+                range: 50.0,
+                cone_angle_deg: 180.0,
+            }]);
+        } else {
+            lights.upload(&queue, &[]);
+        }
 
         let pipeline = TerrainPipeline::new(&device, format, &uniforms.layout);
 
@@ -473,7 +581,7 @@ mod tests {
         let material = match palette {
             Palette::Test => TerrainMaterial::new(
                 &device, &queue, &pipeline.material_layout,
-                &test_layers, &neutral, splat, TerrainMaterialUniform::default(),
+                &test_layers, &neutral, splat, normals, TerrainMaterialUniform::default(),
             ),
             Palette::Fallback => {
                 TerrainMaterial::fallback(&device, &queue, &pipeline.material_layout)
@@ -636,6 +744,10 @@ impl TerrainMaterial {
         // height-driven blend. None still binds a texture -- see the layout --
         // and clears `use_splat` so nothing reads it.
         splat: Option<&TerrainImage>,
+        // Per-layer normal maps, in the same slot order as `layers`. Shorter or
+        // sparser than four is fine; the gaps become flat, which the shader
+        // treats as no perturbation at all.
+        normals: &[Option<TerrainImage>],
         settings: TerrainMaterialUniform,
     ) -> Self {
         assert!(!layers.is_empty(), "terrain material needs at least one layer");
@@ -702,6 +814,43 @@ impl TerrainMaterial {
             },
             Extent3d { width: macro_image.width, height: macro_image.height, depth_or_array_layers: 1 },
         );
+
+        // Normal maps live in their own array, sized to the colour layers so
+        // both index by the same slot. NOT sRGB: these encode a direction, and
+        // decoding them through a colour curve bends every bump.
+        let normal_array = device.create_texture(&TextureDescriptor {
+            label: Some("terrain_normals"),
+            size: Extent3d { width: w, height: h, depth_or_array_layers: 4 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for slot in 0..4 {
+            let flat = solid_image(FLAT_NORMAL, w, h);
+            let src = match normals.get(slot).and_then(|n| n.as_ref()) {
+                Some(img) if img.width == w && img.height == h => img.clone_image(),
+                Some(img) => resample(img, w, h),
+                None => flat,
+            };
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &normal_array,
+                    mip_level: 0,
+                    origin: Origin3d { x: 0, y: 0, z: slot as u32 },
+                    aspect: TextureAspect::All,
+                },
+                &src.rgba,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * w),
+                    rows_per_image: Some(h),
+                },
+                Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        }
 
         let sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("terrain_sampler"),
@@ -793,6 +942,15 @@ impl TerrainMaterial {
                         &splat_tex.create_view(&TextureViewDescriptor::default()),
                     ),
                 },
+                BindGroupEntry {
+                    binding: 5,
+                    resource: BindingResource::TextureView(
+                        &normal_array.create_view(&TextureViewDescriptor {
+                            dimension: Some(TextureViewDimension::D2Array),
+                            ..Default::default()
+                        }),
+                    ),
+                },
             ],
         });
 
@@ -823,7 +981,9 @@ impl TerrainMaterial {
         layout: &BindGroupLayout,
         splat: Option<&TerrainImage>,
     ) -> Self {
-        Self::from_layers(device, queue, layout, &[None, None, None, None], splat)
+        Self::from_layers(
+            device, queue, layout, &[None, None, None, None], &[None, None, None, None], splat,
+        )
     }
 
     /// Build from whatever layer textures loaded, filling the gaps.
@@ -841,6 +1001,7 @@ impl TerrainMaterial {
         queue: &Queue,
         layout: &BindGroupLayout,
         layers: &[Option<TerrainImage>],
+        normals: &[Option<TerrainImage>],
         splat: Option<&TerrainImage>,
     ) -> Self {
         let (w, h) = layers
@@ -874,6 +1035,7 @@ impl TerrainMaterial {
             &filled,
             &solid_image([128, 128, 128], 1, 1),
             splat,
+            normals,
             TerrainMaterialUniform::default(),
         )
     }
@@ -932,6 +1094,7 @@ mod material_tests {
             std::slice::from_ref(&one),
             &one,
             None,
+            &[None, None, None, None],
             TerrainMaterialUniform::default(),
         );
         assert!(
@@ -1082,6 +1245,13 @@ impl TerrainImage {
 /// order is the shader's fixed slot order and is not rearrangeable.
 pub const TERRAIN_LAYER_FILES: [&str; 4] = ["ground.jpg", "rock.jpg", "high.jpg", "sediment.jpg"];
 
+/// Normal maps for the same four layers, in the same order.
+///
+/// Suffixed rather than kept in a subdirectory so a layer's files sort together
+/// and it is obvious at a glance which layers have normals and which do not.
+pub const TERRAIN_NORMAL_FILES: [&str; 4] =
+    ["ground_n.jpg", "rock_n.jpg", "high_n.jpg", "sediment_n.jpg"];
+
 /// Load the terrain layer set from a directory, falling back per layer.
 ///
 /// Per LAYER, not all-or-nothing: a project part-way through authoring its
@@ -1093,6 +1263,19 @@ pub const TERRAIN_LAYER_FILES: [&str; 4] = ["ground.jpg", "rock.jpg", "high.jpg"
 /// share one D2Array and a mismatched layer would otherwise fail validation.
 pub fn load_terrain_layers(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
     TERRAIN_LAYER_FILES
+        .iter()
+        .map(|name| TerrainImage::load(&dir.join(name)))
+        .collect()
+}
+
+/// Load the layer normal maps, per layer, from the same directory.
+///
+/// Missing is the NORMAL case rather than an error: a project with colour and
+/// no normals is exactly what shipped before this existed, and each gap becomes
+/// a flat map that perturbs nothing. `TerrainImage::load` already logs what it
+/// could not read, so a typo is visible without failing the frame.
+pub fn load_terrain_normals(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
+    TERRAIN_NORMAL_FILES
         .iter()
         .map(|name| TerrainImage::load(&dir.join(name)))
         .collect()
@@ -1161,6 +1344,7 @@ mod layer_loading_tests {
             &queue,
             &layout,
             &[Some(img([10, 20, 30], 64, 64)), None, Some(img([1, 2, 3], 64, 64)), None],
+            &[None, None, None, None],
             None,
         );
         assert!(
@@ -1191,6 +1375,7 @@ mod layer_loading_tests {
                 None,
                 Some(img([70, 80, 90], 128, 32)),
             ],
+            &[None, None, None, None],
             None,
         );
         assert!(
@@ -1209,7 +1394,9 @@ mod layer_loading_tests {
         };
         let layout = material_bind_group_layout(&device);
         device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let _m = TerrainMaterial::from_layers(&device, &queue, &layout, &[None, None, None, None], None);
+        let _m = TerrainMaterial::from_layers(
+            &device, &queue, &layout, &[None, None, None, None], &[None, None, None, None], None,
+        );
         assert!(pollster::block_on(device.pop_error_scope()).is_none());
     }
 
@@ -1231,5 +1418,131 @@ mod layer_loading_tests {
         let out = resample(&img([9, 9, 9], 7, 3), 16, 16);
         assert_eq!((out.width, out.height), (16, 16));
         assert_eq!(out.rgba.len(), 16 * 16 * 4);
+    }
+}
+
+/// The texel a normal map uses for "no perturbation".
+///
+/// (128, 128, 255) unpacks to (0, 0, 1) in tangent space -- straight out of the
+/// surface. That is what lets an unauthored normal set be a true no-op and is
+/// why the material needs no "has normals" flag, unlike the splat map, where
+/// an all-zero texel is a legitimate authored value.
+pub const FLAT_NORMAL: [u8; 3] = [128, 128, 255];
+
+impl TerrainImage {
+    fn clone_image(&self) -> TerrainImage {
+        TerrainImage { width: self.width, height: self.height, rgba: self.rgba.clone() }
+    }
+}
+
+#[cfg(test)]
+mod normal_map_tests {
+    use super::tests::{render_quad_full, Palette};
+    use super::*;
+
+    const FLAT: [f32; 3] = [0.0, 1.0, 0.0];
+
+    fn normal_map(rgb: [u8; 3]) -> TerrainImage {
+        solid_image(rgb, 1, 1)
+    }
+
+    /// Only layer 0 has weight, so only its normal map matters.
+    fn only_layer0(map: TerrainImage) -> [Option<TerrainImage>; 4] {
+        [Some(map), None, None, None]
+    }
+
+    fn brightness(px: [u8; 4]) -> u32 {
+        px[0] as u32 + px[1] as u32 + px[2] as u32
+    }
+
+    /// The whole point: a normal map must change how the surface lights.
+    ///
+    /// Needs a real light. With the ambient-only harness the other tests use,
+    /// `shade` returns a constant whatever the normal is, so this would pass
+    /// with the perturbation entirely disconnected.
+    #[test]
+    fn a_tilted_normal_changes_the_lighting() {
+        let Some(flat) = render_quad_full(FLAT, Palette::Test, None, &only_layer0(normal_map(FLAT_NORMAL)), true)
+        else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        // Tangent normal tilted hard toward +x, where the test light sits.
+        let toward = render_quad_full(FLAT, Palette::Test, None, &only_layer0(normal_map([230, 128, 160])), true).unwrap();
+        // ...and hard away from it.
+        let away = render_quad_full(FLAT, Palette::Test, None, &only_layer0(normal_map([25, 128, 160])), true).unwrap();
+
+        assert_ne!(brightness(toward), brightness(flat), "a tilted normal must change shading: {toward:?} vs {flat:?}");
+        assert!(
+            brightness(toward) > brightness(away),
+            "tilting toward the light must be brighter than tilting away: {toward:?} vs {away:?}",
+        );
+    }
+
+    /// A flat normal map must be indistinguishable from none at all -- that is
+    /// what lets an unauthored normal set cost nothing and need no flag.
+    #[test]
+    fn a_flat_normal_map_is_a_true_no_op() {
+        let Some(without) = render_quad_full(FLAT, Palette::Test, None, &[None, None, None, None], true)
+        else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let with_flat = render_quad_full(FLAT, Palette::Test, None, &only_layer0(normal_map(FLAT_NORMAL)), true).unwrap();
+        assert_eq!(with_flat, without, "a flat normal map must shade identically to none");
+    }
+
+    /// Strength 0 disables perturbation without needing a second code path.
+    #[test]
+    fn zero_strength_disables_the_maps() {
+        let Some((device, queue)) = super::tests::headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let layout = material_bind_group_layout(&device);
+        let mut settings = TerrainMaterialUniform::default();
+        settings.normal_strength = 0.0;
+
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _m = TerrainMaterial::new(
+            &device, &queue, &layout,
+            &[solid_image([200, 200, 200], 4, 4)],
+            &solid_image([128, 128, 128], 1, 1),
+            None,
+            &only_layer0(solid_image([230, 128, 160], 4, 4)),
+            settings,
+        );
+        assert!(pollster::block_on(device.pop_error_scope()).is_none());
+    }
+
+    /// Sized to the colour layers, so a normal map at a different resolution
+    /// still binds rather than failing validation on whichever project has one.
+    #[test]
+    fn a_normal_map_of_a_different_size_is_resampled() {
+        let Some((device, queue)) = super::tests::headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let layout = material_bind_group_layout(&device);
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _m = TerrainMaterial::from_layers(
+            &device, &queue, &layout,
+            &[Some(solid_image([10, 20, 30], 64, 64)), None, None, None],
+            &[Some(solid_image(FLAT_NORMAL, 16, 16)), None, None, None],
+            None,
+        );
+        assert!(
+            pollster::block_on(device.pop_error_scope()).is_none(),
+            "a mismatched normal map must be resampled, not rejected",
+        );
+    }
+
+    #[test]
+    fn the_flat_normal_texel_unpacks_to_straight_out() {
+        // (128,128,255) / 255 * 2 - 1 ~= (0, 0, 1).
+        let unpack = |v: u8| (v as f32 / 255.0) * 2.0 - 1.0;
+        assert!(unpack(FLAT_NORMAL[0]).abs() < 0.01);
+        assert!(unpack(FLAT_NORMAL[1]).abs() < 0.01);
+        assert!((unpack(FLAT_NORMAL[2]) - 1.0).abs() < 0.01);
     }
 }
