@@ -35,6 +35,9 @@ pub struct XrRenderer {
     // terrain renders through the real pipeline before any textures exist.
     // Replaced via `set_terrain_material` when a scene authors its own.
     terrain_material: crate::renderer::terrain_pipeline::TerrainMaterial,
+    /// Layer textures and splat map are kept so either can be replaced alone.
+    terrain_layers: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
+    terrain_splat: Option<crate::renderer::terrain_pipeline::TerrainImage>,
     wire_pipeline: WirePipeline,
     mesh_pipeline: MeshPipeline,
     skinned_mesh_pipeline: SkinnedMeshPipeline,
@@ -269,6 +272,8 @@ impl XrRenderer {
             solid_pipeline,
             terrain_pipeline,
             terrain_material,
+            terrain_layers: vec![None, None, None, None],
+            terrain_splat: None,
             wire_pipeline,
             mesh_pipeline,
             skinned_mesh_pipeline,
@@ -366,11 +371,37 @@ impl XrRenderer {
         &mut self,
         splat: Option<&crate::renderer::terrain_pipeline::TerrainImage>,
     ) {
-        self.terrain_material = crate::renderer::terrain_pipeline::TerrainMaterial::fallback_with_splat(
+        self.terrain_splat = splat.map(|s| crate::renderer::terrain_pipeline::TerrainImage {
+            width: s.width,
+            height: s.height,
+            rgba: s.rgba.clone(),
+        });
+        self.rebuild_terrain_material();
+    }
+
+    /// Apply the scene's layer textures, filling any that did not load.
+    pub fn set_terrain_layers(
+        &mut self,
+        layers: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
+    ) {
+        self.terrain_layers = layers;
+        self.rebuild_terrain_material();
+    }
+
+    /// Rebuild from whatever layer textures and splat map are currently held.
+    ///
+    /// Both arrive independently -- layers once per scene load, the splat map
+    /// whenever the scene changes -- and the material needs both at once.
+    /// Keeping each and rebuilding means whichever arrives second does not
+    /// discard the first, which is exactly what a setter that took only its own
+    /// half would do.
+    fn rebuild_terrain_material(&mut self) {
+        self.terrain_material = crate::renderer::terrain_pipeline::TerrainMaterial::from_layers(
             &self.wgpu_device,
             &self.wgpu_queue,
             &self.terrain_pipeline.material_layout,
-            splat,
+            &self.terrain_layers,
+            self.terrain_splat.as_ref(),
         );
     }
 

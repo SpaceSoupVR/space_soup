@@ -823,33 +823,61 @@ impl TerrainMaterial {
         layout: &BindGroupLayout,
         splat: Option<&TerrainImage>,
     ) -> Self {
-        let solid = |rgb: [u8; 3]| TerrainImage {
-            width: 1,
-            height: 1,
-            rgba: vec![rgb[0], rgb[1], rgb[2], 255],
-        };
+        Self::from_layers(device, queue, layout, &[None, None, None, None], splat)
+    }
+
+    /// Build from whatever layer textures loaded, filling the gaps.
+    ///
+    /// Per LAYER rather than all-or-nothing: a project part-way through
+    /// authoring its materials should see the layers it has rather than lose
+    /// all four because one file is missing.
+    ///
+    /// Gaps become solid images at the SAME SIZE as the loaded layers, not 1x1.
+    /// The four share one D2Array, so a mismatched layer is a validation
+    /// failure rather than a smaller texture -- and that failure would appear
+    /// only on the project that happens to be missing one file.
+    pub fn from_layers(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        layers: &[Option<TerrainImage>],
+        splat: Option<&TerrainImage>,
+    ) -> Self {
+        let (w, h) = layers
+            .iter()
+            .flatten()
+            .map(|l| (l.width, l.height))
+            .next()
+            .unwrap_or((1, 1));
+
+        let filled: Vec<TerrainImage> = FALLBACK_LAYER_COLOURS
+            .iter()
+            .enumerate()
+            .map(|(i, rgb)| match layers.get(i).and_then(|l| l.as_ref()) {
+                // Already the right size by construction when it is the one the
+                // size came from; resampled otherwise so a set of mixed-size
+                // files still binds.
+                Some(img) if img.width == w && img.height == h => TerrainImage {
+                    width: img.width,
+                    height: img.height,
+                    rgba: img.rgba.clone(),
+                },
+                Some(img) => resample(img, w, h),
+                None => solid_image(*rgb, w, h),
+            })
+            .collect();
+
         Self::new(
             device,
             queue,
             layout,
-            &[
-                solid([86, 112, 62]),  // 0 ground
-                solid([104, 100, 94]), // 1 rock
-                solid([132, 128, 120]), // 2 high ground
-                solid([92, 84, 70]),   // 3 spare
-            ],
-            // Neutral macro: 0.5 is the no-op point for the shader's
-            // (macro * 2) modulation, so an unauthored macro changes nothing.
-            &solid([128, 128, 128]),
+            &filled,
+            &solid_image([128, 128, 128], 1, 1),
             splat,
             TerrainMaterialUniform::default(),
         )
     }
 
-    /// Update the settings without rebuilding textures or the bind group.
-    pub fn set_settings(&self, queue: &Queue, settings: TerrainMaterialUniform) {
-        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&settings));
-    }
 }
 
 /// A decoded RGBA8 image destined for the terrain material.
@@ -1020,5 +1048,188 @@ mod authored_splat_tests {
         for channel in 0..3 {
             assert!(px[channel] < 250, "an empty texel must not blow out: {px:?}");
         }
+    }
+}
+
+impl TerrainImage {
+    /// Decode an image file into the RGBA8 a terrain layer needs.
+    ///
+    /// Returns `None` rather than failing the frame when the file is missing or
+    /// unreadable: terrain that renders in flat fallback colours is diagnosable
+    /// from the log, and a client that refuses to start because one texture is
+    /// absent is not. That is the same call `terrain_render::load` makes about
+    /// missing ground.
+    pub fn load(path: &std::path::Path) -> Option<Self> {
+        let decoded = match ::image::open(path) {
+            Ok(d) => d.to_rgba8(),
+            Err(e) => {
+                log::warn!("terrain texture {}: {e}", path.display());
+                return None;
+            }
+        };
+        Some(Self {
+            width: decoded.width(),
+            height: decoded.height(),
+            rgba: decoded.into_raw(),
+        })
+    }
+}
+
+/// The four layer textures a terrain material wants, by role.
+///
+/// Named by ROLE rather than by what they depict, matching the files on disk,
+/// so replacing what "rock" looks like is a file swap and touches no code. The
+/// order is the shader's fixed slot order and is not rearrangeable.
+pub const TERRAIN_LAYER_FILES: [&str; 4] = ["ground.jpg", "rock.jpg", "high.jpg", "sediment.jpg"];
+
+/// Load the terrain layer set from a directory, falling back per layer.
+///
+/// Per LAYER, not all-or-nothing: a project part-way through authoring its
+/// materials should see the layers it has, not lose all four because one is
+/// missing. Each gap keeps that layer's flat colour, which is exactly what the
+/// whole terrain looked like before any textures existed.
+///
+/// Sizes are normalised to the first successfully loaded layer, because they
+/// share one D2Array and a mismatched layer would otherwise fail validation.
+pub fn load_terrain_layers(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
+    TERRAIN_LAYER_FILES
+        .iter()
+        .map(|name| TerrainImage::load(&dir.join(name)))
+        .collect()
+}
+
+/// Flat colours a layer falls back to when it has no texture.
+///
+/// The palette the terrain used before any textures existed, so a project with
+/// no material art renders exactly as it always did rather than as black.
+pub const FALLBACK_LAYER_COLOURS: [[u8; 3]; 4] = [
+    [86, 112, 62],   // 0 ground
+    [104, 100, 94],  // 1 rock
+    [132, 128, 120], // 2 high ground
+    [92, 84, 70],    // 3 sediment
+];
+
+fn solid_image(rgb: [u8; 3], width: u32, height: u32) -> TerrainImage {
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for _ in 0..(width * height) {
+        rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+    }
+    TerrainImage { width, height, rgba }
+}
+
+/// Nearest-neighbour resample onto a different size.
+///
+/// Only ever runs on a mismatched layer set, which is an authoring mistake
+/// rather than a shipping configuration -- so this exists to keep such a
+/// project RUNNING and legible, not to look good. Anything better would be
+/// effort spent on a case the SOURCES.md tells authors to avoid.
+fn resample(src: &TerrainImage, width: u32, height: u32) -> TerrainImage {
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        let sy = (y as u64 * src.height as u64 / height.max(1) as u64) as u32;
+        for x in 0..width {
+            let sx = (x as u64 * src.width as u64 / width.max(1) as u64) as u32;
+            let at = ((sy.min(src.height - 1) * src.width + sx.min(src.width - 1)) * 4) as usize;
+            rgba.extend_from_slice(&src.rgba[at..at + 4]);
+        }
+    }
+    TerrainImage { width, height, rgba }
+}
+
+#[cfg(test)]
+mod layer_loading_tests {
+    use super::tests::headless_gpu;
+    use super::*;
+
+    fn img(rgb: [u8; 3], w: u32, h: u32) -> TerrainImage {
+        solid_image(rgb, w, h)
+    }
+
+    /// A project part-way through authoring its materials must see the layers
+    /// it HAS, not lose all four because one file is missing.
+    #[test]
+    fn a_missing_layer_falls_back_without_taking_the_others_with_it() {
+        let Some((device, queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let layout = material_bind_group_layout(&device);
+
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _m = TerrainMaterial::from_layers(
+            &device,
+            &queue,
+            &layout,
+            &[Some(img([10, 20, 30], 64, 64)), None, Some(img([1, 2, 3], 64, 64)), None],
+            None,
+        );
+        assert!(
+            pollster::block_on(device.pop_error_scope()).is_none(),
+            "a partial layer set must still bind validly",
+        );
+    }
+
+    /// The four share one D2Array, so a mismatched layer is a validation
+    /// failure rather than a smaller texture -- and it would only appear on the
+    /// project that happens to have mixed sizes.
+    #[test]
+    fn mixed_sizes_are_normalised_rather_than_failing_validation() {
+        let Some((device, queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let layout = material_bind_group_layout(&device);
+
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _m = TerrainMaterial::from_layers(
+            &device,
+            &queue,
+            &layout,
+            &[
+                Some(img([10, 20, 30], 64, 64)),
+                Some(img([40, 50, 60], 16, 16)),
+                None,
+                Some(img([70, 80, 90], 128, 32)),
+            ],
+            None,
+        );
+        assert!(
+            pollster::block_on(device.pop_error_scope()).is_none(),
+            "mixed layer sizes must be normalised, not rejected",
+        );
+    }
+
+    /// With nothing loaded the material must be exactly what it was before
+    /// textures existed, so a project with no art is unchanged.
+    #[test]
+    fn no_layers_at_all_is_the_old_flat_palette() {
+        let Some((device, queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let layout = material_bind_group_layout(&device);
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _m = TerrainMaterial::from_layers(&device, &queue, &layout, &[None, None, None, None], None);
+        assert!(pollster::block_on(device.pop_error_scope()).is_none());
+    }
+
+    #[test]
+    fn a_missing_file_reports_none_rather_than_failing() {
+        assert!(TerrainImage::load(std::path::Path::new("/nonexistent/ground.jpg")).is_none());
+    }
+
+    /// Role-named files, in the shader's fixed slot order.
+    #[test]
+    fn the_layer_file_names_match_the_shader_slots() {
+        assert_eq!(TERRAIN_LAYER_FILES.len(), FALLBACK_LAYER_COLOURS.len());
+        assert_eq!(TERRAIN_LAYER_FILES[0], "ground.jpg");
+        assert_eq!(TERRAIN_LAYER_FILES[1], "rock.jpg");
+    }
+
+    #[test]
+    fn resampling_preserves_the_requested_size() {
+        let out = resample(&img([9, 9, 9], 7, 3), 16, 16);
+        assert_eq!((out.width, out.height), (16, 16));
+        assert_eq!(out.rgba.len(), 16 * 16 * 4);
     }
 }
