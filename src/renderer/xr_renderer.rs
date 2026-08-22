@@ -39,6 +39,9 @@ pub struct XrRenderer {
     terrain_layers: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
     terrain_normals: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
     terrain_splat: Option<crate::renderer::terrain_pipeline::TerrainImage>,
+    /// How the layers tile, from the project's `settings.json`. Held alongside
+    /// the textures for the same reason they are: it arrives independently.
+    terrain_settings: crate::renderer::terrain_pipeline::TerrainMaterialUniform,
     wire_pipeline: WirePipeline,
     mesh_pipeline: MeshPipeline,
     skinned_mesh_pipeline: SkinnedMeshPipeline,
@@ -276,6 +279,7 @@ impl XrRenderer {
             terrain_layers: vec![None, None, None, None],
             terrain_normals: vec![None, None, None, None],
             terrain_splat: None,
+            terrain_settings: Default::default(),
             wire_pipeline,
             mesh_pipeline,
             skinned_mesh_pipeline,
@@ -392,6 +396,21 @@ impl XrRenderer {
         self.rebuild_terrain_material();
     }
 
+    /// Apply the project's terrain material settings -- tile sizes and normal
+    /// strength.
+    ///
+    /// Its own setter rather than an argument to `set_terrain_layers`, because
+    /// the settings can change without the textures changing: retiling gravel
+    /// from 4m to 2m is the commonest thing anyone does to terrain art, and it
+    /// should not mean re-uploading four textures.
+    pub fn set_terrain_settings(
+        &mut self,
+        settings: crate::renderer::terrain_pipeline::TerrainMaterialUniform,
+    ) {
+        self.terrain_settings = settings;
+        self.rebuild_terrain_material();
+    }
+
     /// Rebuild from whatever layer textures and splat map are currently held.
     ///
     /// Both arrive independently -- layers once per scene load, the splat map
@@ -400,14 +419,16 @@ impl XrRenderer {
     /// discard the first, which is exactly what a setter that took only its own
     /// half would do.
     fn rebuild_terrain_material(&mut self) {
-        self.terrain_material = crate::renderer::terrain_pipeline::TerrainMaterial::from_layers(
-            &self.wgpu_device,
-            &self.wgpu_queue,
-            &self.terrain_pipeline.material_layout,
-            &self.terrain_layers,
-            &self.terrain_normals,
-            self.terrain_splat.as_ref(),
-        );
+        self.terrain_material =
+            crate::renderer::terrain_pipeline::TerrainMaterial::from_layers_with(
+                &self.wgpu_device,
+                &self.wgpu_queue,
+                &self.terrain_pipeline.material_layout,
+                &self.terrain_layers,
+                &self.terrain_normals,
+                self.terrain_splat.as_ref(),
+                self.terrain_settings,
+            );
     }
 
     pub fn cleanup(&self) {}

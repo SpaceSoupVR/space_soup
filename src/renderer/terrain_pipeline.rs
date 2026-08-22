@@ -1004,6 +1004,31 @@ impl TerrainMaterial {
         normals: &[Option<TerrainImage>],
         splat: Option<&TerrainImage>,
     ) -> Self {
+        Self::from_layers_with(
+            device,
+            queue,
+            layout,
+            layers,
+            normals,
+            splat,
+            TerrainMaterialUniform::default(),
+        )
+    }
+
+    /// The same, with the project's authored material settings.
+    ///
+    /// Split from `from_layers` rather than replacing it because the defaults
+    /// are the right answer for every caller that has no project on disk to
+    /// read from -- the fallback material and the pipeline's own tests.
+    pub fn from_layers_with(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        layers: &[Option<TerrainImage>],
+        normals: &[Option<TerrainImage>],
+        splat: Option<&TerrainImage>,
+        settings: TerrainMaterialUniform,
+    ) -> Self {
         let (w, h) = layers
             .iter()
             .flatten()
@@ -1036,7 +1061,7 @@ impl TerrainMaterial {
             &solid_image([128, 128, 128], 1, 1),
             splat,
             normals,
-            TerrainMaterialUniform::default(),
+            settings,
         )
     }
 
@@ -1268,6 +1293,63 @@ pub fn load_terrain_layers(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
         .collect()
 }
 
+/// The project's terrain material settings, from `settings.json` beside the
+/// layer textures.
+///
+/// WHY A FILE RATHER THAN A CONSTANT
+///
+/// `repeat` -- metres per tile, per layer -- is the control that decides whether
+/// ground reads as gravel or as noise, and it is judged by eye against the art
+/// that is actually installed. Baking it into the binary means the person who
+/// can see the problem cannot fix it, and the person who can fix it has to
+/// rebuild the engine to try a number.
+///
+/// Beside the textures, not in the scene: which four materials a project uses
+/// and how big they tile is one art decision for the whole game, exactly like
+/// the layer files themselves. Copying it into every scene would mean changing
+/// "how big is our gravel" in twenty places.
+///
+/// ABSENT IS THE NORMAL CASE. Every project that predates this file has none,
+/// and every key is independent, so a file naming only `repeat` leaves the rest
+/// at their defaults rather than zeroing them. A malformed file logs and yields
+/// the defaults: unreadable settings must not cost a project its terrain.
+pub fn load_terrain_settings(dir: &std::path::Path) -> TerrainMaterialUniform {
+    let mut out = TerrainMaterialUniform::default();
+    let path = dir.join(TERRAIN_SETTINGS_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return out,
+    };
+    let raw: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("{}: {e} -- using default terrain settings", path.display());
+            return out;
+        }
+    };
+    if let Some(values) = raw.get("repeat").and_then(|r| r.as_array()) {
+        for (i, slot) in out.repeat.iter_mut().enumerate() {
+            if let Some(v) = values.get(i).and_then(|v| v.as_f64()) {
+                // Clamped, not rejected: a zero here divides by zero in the
+                // shader, and one bad number should cost that layer its scale
+                // rather than the project its ground.
+                *slot = (v as f32).max(MIN_REPEAT);
+            }
+        }
+    }
+    if let Some(v) = raw.get("normal_strength").and_then(|v| v.as_f64()) {
+        out.normal_strength = (v as f32).clamp(0.0, 4.0);
+    }
+    out
+}
+
+/// Per-project terrain material settings, beside the layer textures.
+pub const TERRAIN_SETTINGS_FILE: &str = "settings.json";
+
+/// Smallest tile size in metres. Below this a tile is smaller than a texel of
+/// anything and the ground reads as noise; at zero the shader divides by zero.
+pub const MIN_REPEAT: f32 = 0.05;
+
 /// Load the layer normal maps, per layer, from the same directory.
 ///
 /// Missing is the NORMAL case rather than an error: a project with colour and
@@ -1411,6 +1493,84 @@ mod layer_loading_tests {
         assert_eq!(TERRAIN_LAYER_FILES.len(), FALLBACK_LAYER_COLOURS.len());
         assert_eq!(TERRAIN_LAYER_FILES[0], "ground.jpg");
         assert_eq!(TERRAIN_LAYER_FILES[1], "rock.jpg");
+    }
+
+    /// A scratch directory holding exactly the `settings.json` given.
+    fn settings_dir(label: &str, body: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("terrain_settings_{label}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = body {
+            std::fs::write(dir.join(TERRAIN_SETTINGS_FILE), text).unwrap();
+        }
+        dir
+    }
+
+    /// No file is the state every project was in before this existed, and it
+    /// must render exactly as it did then.
+    #[test]
+    fn absent_settings_are_the_built_in_defaults() {
+        let dir = settings_dir("absent", None);
+        let loaded = load_terrain_settings(&dir);
+        assert_eq!(loaded.repeat, TerrainMaterialUniform::default().repeat);
+        assert_eq!(loaded.normal_strength, 1.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The point of the file: the editor's tile sizes reach the headset.
+    #[test]
+    fn repeat_comes_from_the_file() {
+        let dir = settings_dir("repeat", Some(r#"{"repeat": [2.0, 3.5, 12.0, 6.0]}"#));
+        assert_eq!(load_terrain_settings(&dir).repeat, [2.0, 3.5, 12.0, 6.0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every key independent. A file that sets only `repeat` must not zero the
+    /// normal maps -- which is what a `serde` struct with `Default::default()`
+    /// per FIELD would do only if every field carried its own default, and what
+    /// a plain deserialize would get wrong silently.
+    #[test]
+    fn an_unmentioned_key_keeps_its_default() {
+        let dir = settings_dir("partial", Some(r#"{"repeat": [1.0, 1.0, 1.0, 1.0]}"#));
+        let loaded = load_terrain_settings(&dir);
+        assert_eq!(loaded.repeat, [1.0; 4]);
+        assert_eq!(loaded.normal_strength, 1.0);
+        assert_eq!(loaded.slope_start_deg, TerrainMaterialUniform::default().slope_start_deg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A short array is a hand-edit, not a reason to lose the other layers.
+    #[test]
+    fn a_short_repeat_array_only_sets_what_it_names() {
+        let dir = settings_dir("short", Some(r#"{"repeat": [2.0]}"#));
+        let loaded = load_terrain_settings(&dir);
+        let default = TerrainMaterialUniform::default().repeat;
+        assert_eq!(loaded.repeat, [2.0, default[1], default[2], default[3]]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Zero would divide by zero in the shader. Clamped rather than rejected:
+    /// one bad number costs that layer its scale, not the project its ground.
+    #[test]
+    fn a_zero_tile_size_is_clamped_not_taken() {
+        let dir = settings_dir("zero", Some(r#"{"repeat": [0.0, -4.0, 10.0, 6.0]}"#));
+        let loaded = load_terrain_settings(&dir);
+        assert_eq!(loaded.repeat[0], MIN_REPEAT);
+        assert_eq!(loaded.repeat[1], MIN_REPEAT);
+        assert_eq!(loaded.repeat[2], 10.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unreadable settings must not cost a project its terrain.
+    #[test]
+    fn malformed_settings_fall_back_rather_than_failing() {
+        let dir = settings_dir("broken", Some("{ this is not json"));
+        assert_eq!(
+            load_terrain_settings(&dir).repeat,
+            TerrainMaterialUniform::default().repeat,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
