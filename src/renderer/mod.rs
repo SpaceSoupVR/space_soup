@@ -1,3 +1,4 @@
+pub mod brush_pipeline;
 pub mod camera;
 pub mod cuboid;
 mod desktop_renderer;

@@ -2,6 +2,7 @@ use openxr as xr;
 use wgpu::util::DeviceExt;
 
 use crate::renderer::{
+    brush_pipeline::BrushVertex,
     camera::Camera,
     cuboid::{build_solid_mesh_with_ranges, build_wire_mesh, Cuboid, SolidVertex},
     lights::Light,
@@ -95,11 +96,16 @@ impl XrRenderer {
         // would be a second place for those to drift.
         terrain: Option<(&[SolidVertex], &[u32])>,
         // Level geometry the client meshed from brushes, already in the same
-        // player-local space as the cuboids. Unlike terrain it gets NO second
-        // pass: a brush wants exactly the shading a cuboid gets, so it rides
-        // the solid pipeline everywhere -- eye, mirror and SSR -- and there is
-        // nothing to keep in step.
-        brushes: Option<(&[SolidVertex], &[u32])>,
+        // player-local space as the cuboids, and carrying a material per vertex.
+        // Its own pipeline and its own buffer: a brush vertex is not a solid
+        // vertex any more, because a wall's material and tangent frame have
+        // nowhere to live in one.
+        //
+        // Drawn textured in the eye pass AND in the mirror pass, which is one
+        // better than terrain manages -- terrain is splat-shaded when looked at
+        // and flat in reflections. SSR skips brushes for the same reason it
+        // skips flat cuboids: that pass only runs for reflective ranges.
+        brushes: Option<(&[BrushVertex], &[u32])>,
         mirror: Option<MirrorSurface>,
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
@@ -146,18 +152,29 @@ impl XrRenderer {
                 terrain_range = Some((index_start, terrain_idx.len() as u32));
             }
         }
-        if let Some((brush_verts, brush_idx)) = brushes {
-            if !brush_verts.is_empty() && !brush_idx.is_empty() {
-                let base = solid_verts.len() as u32;
-                let index_start = solid_idx.len() as u32;
-                solid_verts.extend_from_slice(brush_verts);
-                solid_idx.extend(brush_idx.iter().map(|i| i + base));
-                // No lightmap key: brushes are lit dynamically, and the default
-                // white lightmap is what an absent key binds.
-                solid_ranges.push((None, index_start, brush_idx.len() as u32, 0.0));
-            }
-        }
         let (solid_verts, solid_idx, solid_ranges) = (solid_verts, solid_idx, solid_ranges);
+
+        // Empty when the scene has no brushes, or when every one of them has
+        // been shot away -- both are ordinary, and both mean no draw rather
+        // than a zero-length one.
+        let brush_geometry = brushes.filter(|(v, i)| !v.is_empty() && !i.is_empty());
+        let brush_buffers = brush_geometry.map(|(v, i)| {
+            (
+                self.wgpu_device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("brush_vb"),
+                        contents: bytemuck::cast_slice(v),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+                self.wgpu_device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("brush_ib"),
+                        contents: bytemuck::cast_slice(i),
+                        usage: wgpu::BufferUsages::INDEX,
+                    }),
+                i.len() as u32,
+            )
+        });
         let (wire_verts, wire_idx) = build_wire_mesh(cuboids);
         let (particle_verts, particle_idx) =
             particle::build_particle_mesh(particles, beams, cam_right, cam_up, view_dir);
@@ -303,6 +320,19 @@ impl XrRenderer {
                             pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
                         }
                     }
+                    if let Some((vb, ib, count)) = &brush_buffers {
+                        // The mirror variant, because a reflected world reverses
+                        // every winding -- the same reason the solid pipeline
+                        // has one. Textured here too: a room whose walls are
+                        // concrete in front of the mirror and flat grey inside
+                        // it is worse than no mirror.
+                        pass.set_pipeline(&self.brush_mirror_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
                     let all_mesh_draws = mesh_draws.iter().chain(mirror_only_mesh_draws.iter());
                     let all_skinned_draws =
                         skinned_draws.iter().chain(mirror_only_skinned_draws.iter());
@@ -393,6 +423,17 @@ impl XrRenderer {
                         pass.set_vertex_buffer(0, solid_vb.slice(..));
                         pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(index_start..index_start + count, 0, 0..1);
+                    }
+                    if let Some((vb, ib, count)) = &brush_buffers {
+                        // One draw for the whole level, however many materials
+                        // it uses: the material is a vertex attribute and every
+                        // colour map is a layer of one array.
+                        pass.set_pipeline(&self.brush_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*count, 0, 0..1);
                     }
                     if !wire_verts.is_empty() {
                         pass.set_pipeline(&self.wire_pipeline.pipeline);

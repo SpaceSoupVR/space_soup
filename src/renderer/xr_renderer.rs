@@ -30,6 +30,9 @@ pub struct XrRenderer {
     wgpu_device: wgpu::Device,
     wgpu_queue: wgpu::Queue,
     solid_pipeline: SolidPipeline,
+    brush_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    brush_mirror_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    brush_materials: crate::renderer::brush_pipeline::BrushMaterials,
     terrain_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
     // The material is per-scene, but it is built here with the fallback so
     // terrain renders through the real pipeline before any textures exist.
@@ -178,6 +181,17 @@ impl XrRenderer {
         let lights_uniform = LightsUniform::new(&wgpu_device);
         let uniform_buf = UniformBuffer::new(&wgpu_device, &lights_uniform);
         let solid_pipeline = SolidPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let brush_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new(
+            &wgpu_device, wgpu_format, &uniform_buf.layout,
+        );
+        let brush_mirror_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_mirror(
+            &wgpu_device, wgpu_format, &uniform_buf.layout,
+        );
+        // White until a scene loads its materials, so an untextured level draws
+        // in its authored colours rather than in nothing.
+        let brush_materials = crate::renderer::brush_pipeline::BrushMaterials::fallback(
+            &wgpu_device, &wgpu_queue, &brush_pipeline.material_layout,
+        );
         let terrain_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new(
             &wgpu_device, wgpu_format, &uniform_buf.layout,
         );
@@ -274,6 +288,9 @@ impl XrRenderer {
             wgpu_device,
             wgpu_queue,
             solid_pipeline,
+            brush_pipeline,
+            brush_mirror_pipeline,
+            brush_materials,
             terrain_pipeline,
             terrain_material,
             terrain_layers: vec![None, None, None, None],
@@ -383,6 +400,46 @@ impl XrRenderer {
             rgba: s.rgba.clone(),
         });
         self.rebuild_terrain_material();
+    }
+
+    /// Apply the materials a scene's brushes use.
+    ///
+    /// Per SCENE, unlike the terrain layers, which are one art decision for the
+    /// whole project. A level's walls are its own: a warehouse and a bunker
+    /// share nothing, and the array holds only what the scene in front of you
+    /// actually references.
+    pub fn set_brush_materials(
+        &mut self,
+        colours: &[crate::renderer::terrain_pipeline::TerrainImage],
+        normals: &[Option<crate::renderer::terrain_pipeline::TerrainImage>],
+    ) {
+        let colours: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>> = colours
+            .iter()
+            .map(|c| {
+                Some(crate::renderer::terrain_pipeline::TerrainImage {
+                    width: c.width,
+                    height: c.height,
+                    rgba: c.rgba.clone(),
+                })
+            })
+            .collect();
+        let normals: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>> = normals
+            .iter()
+            .map(|n| {
+                n.as_ref().map(|n| crate::renderer::terrain_pipeline::TerrainImage {
+                    width: n.width,
+                    height: n.height,
+                    rgba: n.rgba.clone(),
+                })
+            })
+            .collect();
+        self.brush_materials = crate::renderer::brush_pipeline::BrushMaterials::new(
+            &self.wgpu_device,
+            &self.wgpu_queue,
+            &self.brush_pipeline.material_layout,
+            &colours,
+            &normals,
+        );
     }
 
     /// Apply the scene's layer textures, filling any that did not load.
