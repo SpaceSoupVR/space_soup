@@ -73,7 +73,7 @@ impl XrRenderer {
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
         self.render_frame_with_meshes(
-            session, stage, time, cuboids, &[], &[], &[], &[], &[], None, None,
+            session, stage, time, cuboids, &[], &[], &[], &[], &[], None, None, None,
         )
     }
 
@@ -94,6 +94,12 @@ impl XrRenderer {
         // the same shading, shadowing and depth behaviour, and a second pipeline
         // would be a second place for those to drift.
         terrain: Option<(&[SolidVertex], &[u32])>,
+        // Level geometry the client meshed from brushes, already in the same
+        // player-local space as the cuboids. Unlike terrain it gets NO second
+        // pass: a brush wants exactly the shading a cuboid gets, so it rides
+        // the solid pipeline everywhere -- eye, mirror and SSR -- and there is
+        // nothing to keep in step.
+        brushes: Option<(&[SolidVertex], &[u32])>,
         mirror: Option<MirrorSurface>,
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
@@ -138,6 +144,17 @@ impl XrRenderer {
                 solid_idx.extend(terrain_idx.iter().map(|i| i + base));
                 solid_ranges.push((None, index_start, terrain_idx.len() as u32, 0.0));
                 terrain_range = Some((index_start, terrain_idx.len() as u32));
+            }
+        }
+        if let Some((brush_verts, brush_idx)) = brushes {
+            if !brush_verts.is_empty() && !brush_idx.is_empty() {
+                let base = solid_verts.len() as u32;
+                let index_start = solid_idx.len() as u32;
+                solid_verts.extend_from_slice(brush_verts);
+                solid_idx.extend(brush_idx.iter().map(|i| i + base));
+                // No lightmap key: brushes are lit dynamically, and the default
+                // white lightmap is what an absent key binds.
+                solid_ranges.push((None, index_start, brush_idx.len() as u32, 0.0));
             }
         }
         let (solid_verts, solid_idx, solid_ranges) = (solid_verts, solid_idx, solid_ranges);
