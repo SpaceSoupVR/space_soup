@@ -434,7 +434,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::renderer::cuboid::SolidVertex;
     use crate::renderer::lights::LightsUniform;
@@ -1067,7 +1067,12 @@ impl TerrainMaterial {
 
 }
 
-/// A decoded RGBA8 image destined for the terrain material.
+/// A decoded RGBA8 image destined for a texture array.
+///
+/// Named for terrain because that is what first needed it; brush materials load
+/// through the same type rather than through a copy of it. A second decode-and-
+/// resample path is exactly the shape of duplication this codebase has been
+/// bitten by before -- one copy gets fixed and the other keeps the bug.
 pub struct TerrainImage {
     pub width: u32,
     pub height: u32,
@@ -1374,7 +1379,7 @@ pub const FALLBACK_LAYER_COLOURS: [[u8; 3]; 4] = [
     [92, 84, 70],    // 3 sediment
 ];
 
-fn solid_image(rgb: [u8; 3], width: u32, height: u32) -> TerrainImage {
+pub(crate) fn solid_image(rgb: [u8; 3], width: u32, height: u32) -> TerrainImage {
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
     for _ in 0..(width * height) {
         rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
@@ -1388,7 +1393,7 @@ fn solid_image(rgb: [u8; 3], width: u32, height: u32) -> TerrainImage {
 /// rather than a shipping configuration -- so this exists to keep such a
 /// project RUNNING and legible, not to look good. Anything better would be
 /// effort spent on a case the SOURCES.md tells authors to avoid.
-fn resample(src: &TerrainImage, width: u32, height: u32) -> TerrainImage {
+pub(crate) fn resample(src: &TerrainImage, width: u32, height: u32) -> TerrainImage {
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height {
         let sy = (y as u64 * src.height as u64 / height.max(1) as u64) as u32;
