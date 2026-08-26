@@ -280,7 +280,18 @@ impl BrushMaterials {
 
 impl BrushPipeline {
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
-        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Ccw)
+        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Ccw, 1)
+    }
+
+    /// See `pipeline::SolidPipeline::new_multisampled` -- a pipeline's sample
+    /// count must match the pass it runs in, so a 4x eye pass needs its own.
+    pub fn new_multisampled(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
+        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Ccw, samples)
     }
 
     /// The mirror pass draws a reflected world, which reverses every winding.
@@ -289,7 +300,7 @@ impl BrushPipeline {
         format: TextureFormat,
         uniform_layout: &BindGroupLayout,
     ) -> Self {
-        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Cw)
+        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Cw, 1)
     }
 
     fn new_with_front_face(
@@ -297,6 +308,7 @@ impl BrushPipeline {
         format: TextureFormat,
         uniform_layout: &BindGroupLayout,
         front_face: FrontFace,
+        samples: u32,
     ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("brush_shader"),
@@ -341,7 +353,7 @@ impl BrushPipeline {
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
-            multisample: MultisampleState::default(),
+            multisample: MultisampleState { count: samples, ..Default::default() },
             multiview: None,
             cache: None,
         });
@@ -352,8 +364,9 @@ impl BrushPipeline {
 fn brush_shader() -> String {
     format!(
         r#"
-struct Uniforms {{ view_proj: mat4x4<f32> }}
-@group(0) @binding(0) var<uniform> u: Uniforms;
+// Group 0 -- the camera, the lights and both shadow maps -- is declared by
+// `wgsl_lights_block` below, so there is one description of that layout rather
+// than one per shader.
 
 @group(1) @binding(0) var mat_color: texture_2d_array<f32>;
 @group(1) @binding(1) var mat_normal: texture_2d_array<f32>;
@@ -383,7 +396,7 @@ struct VOut {{
 
 @vertex fn vs_main(v: VIn) -> VOut {{
     var out: VOut;
-    out.clip      = u.view_proj * vec4<f32>(v.pos, 1.0);
+    out.clip      = camera.view_proj * vec4<f32>(v.pos, 1.0);
     out.normal    = v.norm;
     out.tangent   = v.tangent;
     out.world_pos = v.pos;
@@ -419,7 +432,8 @@ mod tests {
     use crate::renderer::lights::{Light, LightKind, LightsUniform};
     use crate::renderer::Color3;
     use crate::renderer::terrain_pipeline::tests::headless_gpu;
-    use crate::renderer::uniforms::UniformBuffer;
+    use crate::renderer::uniforms::test_support::{scene_uniforms, TEST_EYE};
+    use crate::renderer::uniforms::ShadowUpload;
     use wgpu::util::DeviceExt;
 
     /// A flat image of one colour, standing in for a material's colour map.
@@ -483,8 +497,9 @@ mod tests {
         } else {
             lights.upload(&queue, &[]);
         }
-        let uniforms = UniformBuffer::new(&device, &lights);
-        uniforms.upload(&queue, glam::Mat4::IDENTITY);
+        let (_shadows, uniforms) =
+            scene_uniforms(&device, &lights);
+        uniforms.upload(&queue, glam::Mat4::IDENTITY, TEST_EYE, &ShadowUpload::disabled());
 
         let pipeline = BrushPipeline::new(&device, format, &uniforms.layout);
         let materials =

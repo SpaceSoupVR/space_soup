@@ -12,11 +12,21 @@ pub struct MeshPipeline {
 
 impl MeshPipeline {
     pub fn new(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
-        Self::new_with_front_face(device, format, camera_layout, FrontFace::Ccw)
+        Self::new_with_front_face(device, format, camera_layout, FrontFace::Ccw, 1)
+    }
+
+    /// See `pipeline::SolidPipeline::new_multisampled`.
+    pub fn new_multisampled(
+        device: &Device,
+        format: TextureFormat,
+        camera_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
+        Self::new_with_front_face(device, format, camera_layout, FrontFace::Ccw, samples)
     }
 
     pub fn new_mirror(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
-        Self::new_with_front_face(device, format, camera_layout, FrontFace::Cw)
+        Self::new_with_front_face(device, format, camera_layout, FrontFace::Cw, 1)
     }
 
     fn new_with_front_face(
@@ -24,6 +34,7 @@ impl MeshPipeline {
         format: TextureFormat,
         camera_layout: &BindGroupLayout,
         front_face: FrontFace,
+        samples: u32,
     ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("mesh_shader"),
@@ -107,7 +118,7 @@ impl MeshPipeline {
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
-            multisample: MultisampleState::default(),
+            multisample: MultisampleState { count: samples, ..Default::default() },
             multiview: None,
             cache: None,
         });
@@ -165,6 +176,16 @@ pub struct SkinnedMeshPipeline {
 
 impl SkinnedMeshPipeline {
     pub fn new(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
+        Self::new_multisampled(device, format, camera_layout, 1)
+    }
+
+    /// See `pipeline::SolidPipeline::new_multisampled`.
+    pub fn new_multisampled(
+        device: &Device,
+        format: TextureFormat,
+        camera_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("skinned_mesh_shader"),
             source: ShaderSource::Wgsl(skinned_mesh_shader().into()),
@@ -264,7 +285,7 @@ impl SkinnedMeshPipeline {
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
-            multisample: MultisampleState::default(),
+            multisample: MultisampleState { count: samples, ..Default::default() },
             multiview: None,
             cache: None,
         });
@@ -299,8 +320,9 @@ impl SkinnedMeshPipeline {
 fn skinned_mesh_shader() -> String {
     format!(
         r#"
-struct CameraUniform {{ view_proj: mat4x4<f32> }}
-@group(0) @binding(0) var<uniform> camera: CameraUniform;
+// Group 0 -- the camera, the lights and both shadow maps -- is declared by
+// `wgsl_lights_block` below, so there is one description of that layout rather
+// than one per shader.
 
 struct ModelUniform {{ model: mat4x4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
@@ -370,8 +392,9 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
 fn mesh_shader() -> String {
     format!(
         r#"
-struct CameraUniform {{ view_proj: mat4x4<f32> }}
-@group(0) @binding(0) var<uniform> camera: CameraUniform;
+// Group 0 -- the camera, the lights and both shadow maps -- is declared by
+// `wgsl_lights_block` below, so there is one description of that layout rather
+// than one per shader.
 
 struct ModelUniform {{ model: mat4x4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;

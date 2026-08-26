@@ -5,6 +5,8 @@ use wgpu::*;
 use super::cuboid::{build_solid_mesh_one, build_wire_mesh_one, CuboidSnapshot, SolidVertex, WireVertex};
 use super::lights::LightsUniform;
 use super::mesh::{create_texture_from_rgba, LoadedTexture};
+use super::shadow::{self, ShadowKind, ShadowMap};
+use super::uniforms::ShadowUpload;
 use super::{icon, lights, mesh_pipeline, pipeline, uniforms};
 use super::{Camera, Cuboid, MeshInstance, WorldPanel};
 
@@ -23,6 +25,15 @@ pub struct Renderer {
     skinned_mesh_pipeline: mesh_pipeline::SkinnedMeshPipeline,
     uniform_buf: uniforms::UniformBuffer,
     lights_uniform: LightsUniform,
+    shadow_map: ShadowMap,
+    /// How wide a slice of the world the sun's shadow covers, in metres.
+    ///
+    /// One orthographic box rather than cascades: a single map stretched over a
+    /// whole level gives shadows too coarse to read, so this is deliberately a
+    /// box that FOLLOWS THE CAMERA and covers the near field well. Distant
+    /// geometry falls outside it and is treated as lit, which is a far better
+    /// failure than a hard line across the ground where the map ran out.
+    sun_shadow_radius: f32,
     depth_texture: Texture,
     depth_view: TextureView,
     pub width: u32,
@@ -43,7 +54,15 @@ impl Renderer {
         height: u32,
     ) -> Self {
         let lights_uniform = LightsUniform::new(&device);
-        let uniform_buf = uniforms::UniformBuffer::new(&device, &lights_uniform);
+        // Before the uniform buffer, which binds this one's depth textures.
+        let shadow_map = ShadowMap::new(&device);
+        let uniform_buf = uniforms::UniformBuffer::new(
+            &device,
+            &lights_uniform,
+            shadow_map.sun_depth_view(),
+            shadow_map.spot_depth_view(),
+            shadow_map.sampler(),
+        );
         let solid_pipeline = pipeline::SolidPipeline::new(&device, format, &uniform_buf.layout);
         let wire_pipeline = pipeline::WirePipeline::new(&device, format, &uniform_buf.layout);
         let mesh_pipeline = mesh_pipeline::MeshPipeline::new(&device, format, &uniform_buf.layout);
@@ -65,6 +84,8 @@ impl Renderer {
             skinned_mesh_pipeline,
             uniform_buf,
             lights_uniform,
+            shadow_map,
+            sun_shadow_radius: 40.0,
             depth_texture,
             depth_view,
             width,
@@ -247,8 +268,38 @@ impl Renderer {
         lights: &[lights::Light],
     ) {
         let vp = camera.projection() * camera.view();
-        self.uniform_buf.upload(&self.queue, vp);
         self.lights_uniform.upload(&self.queue, lights);
+
+        // Which light casts which map. The FIRST directional light is the sun
+        // and the first spot is the flashlight, rather than a flag on the light:
+        // a scene with two suns is not a thing, and a second shadow-casting spot
+        // would need a second depth texture and a second pass to go with it.
+        let sun = lights.iter().find(|l| l.kind == lights::LightKind::Directional);
+        let spot_index = lights.iter().position(|l| l.kind == lights::LightKind::Spot);
+
+        // The box follows the camera so its resolution is spent where the
+        // viewer is, and is pushed forward a little rather than centred on the
+        // eye -- half of a camera-centred box is always behind you.
+        let focus = camera.position + camera.forward() * (self.sun_shadow_radius * 0.5);
+        let sun_view_proj = sun
+            .map(|l| shadow::directional_light_matrix(l.direction, focus, self.sun_shadow_radius))
+            .unwrap_or(glam::Mat4::IDENTITY);
+        let spot_view_proj = spot_index
+            .map(|i| {
+                let l = &lights[i];
+                shadow::spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range)
+            })
+            .unwrap_or(glam::Mat4::IDENTITY);
+
+        let shadow = ShadowUpload {
+            sun_view_proj,
+            spot_view_proj,
+            sun_enabled: sun.is_some(),
+            spot_enabled: spot_index.is_some(),
+            flashlight_index: spot_index.unwrap_or(0) as u32,
+        };
+        self.uniform_buf
+            .upload(&self.queue, vp, camera.position, &shadow);
 
         let ((solid_verts, solid_indices, solid_ranges), (wire_verts, wire_indices)) =
             self.bake_cuboids(cuboids);
@@ -291,6 +342,10 @@ impl Renderer {
         }
 
         let mut draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> = Vec::new();
+        // Casters, gathered from the meshes ONLY. Panels are appended to
+        // `draws` further down and must not be in here: a floating UI panel
+        // casting a shadow across the floor is not a thing anyone wants.
+        let mut shadow_draws: Vec<shadow::ShadowMeshDraw> = Vec::new();
         let mut skinned_draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> =
             Vec::new();
 
@@ -327,6 +382,15 @@ impl Renderer {
                         &prim.texture.bind_group,
                         lightmap_bg,
                     ));
+                    // The ordinary vertex buffer, even for a layered mesh: the
+                    // depth pass reads position and nothing else, so a baked
+                    // cave casts through this path with no pipeline of its own.
+                    shadow_draws.push((
+                        &prim.vertex_buffer,
+                        &prim.index_buffer,
+                        prim.indices.len() as u32,
+                        &instance.model.bind_group,
+                    ));
                 }
             }
         }
@@ -347,6 +411,25 @@ impl Renderer {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+
+        // Depth-only passes first, so the colour pass below samples a map built
+        // from THIS frame. Recorded into the same encoder rather than submitted
+        // separately: within one encoder wgpu orders the passes for us, and a
+        // second submit would only add a synchronisation point.
+        let solid_caster = (!solid_indices.is_empty())
+            .then_some((&solid_vb, &solid_ib, solid_indices.len() as u32));
+        if shadow.sun_enabled {
+            self.shadow_map
+                .upload_light(&self.queue, ShadowKind::Sun, shadow.sun_view_proj);
+            self.shadow_map
+                .record(&mut encoder, ShadowKind::Sun, solid_caster, None, &shadow_draws);
+        }
+        if shadow.spot_enabled {
+            self.shadow_map
+                .upload_light(&self.queue, ShadowKind::Spot, shadow.spot_view_proj);
+            self.shadow_map
+                .record(&mut encoder, ShadowKind::Spot, solid_caster, None, &shadow_draws);
+        }
 
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {

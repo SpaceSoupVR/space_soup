@@ -2,6 +2,7 @@ use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 
 use super::texture::LoadedTexture;
+use crate::renderer::layered_mesh_pipeline::LayeredVertex;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -63,6 +64,18 @@ impl SkinnedMeshVertex {
     }
 }
 
+/// The same triangles, as vertices the layered-mesh pipeline can draw.
+///
+/// Alongside the textured form rather than instead of it. The index buffer is
+/// shared -- it is the same mesh -- and keeping the ordinary vertices means a
+/// build without the layered path, or a pass that has no material array to hand,
+/// still has something to draw.
+#[derive(Clone)]
+pub struct LayeredPrimitive {
+    pub vertices: Vec<LayeredVertex>,
+    pub vertex_buffer: wgpu::Buffer,
+}
+
 #[derive(Clone)]
 pub struct MeshPrimitive {
     pub vertices: Vec<MeshVertex>,
@@ -70,4 +83,8 @@ pub struct MeshPrimitive {
     pub texture: Arc<LoadedTexture>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
+    /// Present when the file asked for layered shading AND carried the weights
+    /// to do it with. Both, because a mesh that asks and does not supply would
+    /// otherwise render as a single flat layer with no clue why.
+    pub layered: Option<LayeredPrimitive>,
 }

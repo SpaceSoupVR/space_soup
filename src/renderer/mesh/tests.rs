@@ -196,7 +196,74 @@
         assert!(filler_count >= 18, "every other joint should be an inert filler with no animation entry, got {filler_count} inert of {}", skin.joint_names.len());
     }
 
-    fn headless_gpu() -> Option<(wgpu::Device, wgpu::Queue, wgpu::BindGroupLayout)> {
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    /// The fixtures are written by the EDITOR'S OWN glb writer, not by anything
+    /// here. A fixture hand-built in Rust would prove that Rust reads what Rust
+    /// writes, which is not the risk -- the risk is the two languages disagreeing
+    /// about the file. Regenerate with `caveGlb.js`'s `buildCaveGlb` if the
+    /// writer changes; a fixture that stopped matching is the news.
+    #[test]
+    fn a_cave_bake_loads_its_per_vertex_layer_weights() {
+        let Some((device, queue, layout)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        let mesh = GltfMesh::load(&device, &queue, &layout, &fixture("layered_cave.glb"))
+            .expect("the editor's cave glb should load");
+        let prim = &mesh.primitives[0];
+
+        let layered = prim
+            .layered
+            .as_ref()
+            .expect("a mesh marked `shading: layered` should carry layered vertices");
+        assert_eq!(layered.vertices.len(), prim.vertices.len());
+
+        // A different layer wins at each corner, so this fails if the weights
+        // are read but land on the wrong vertices -- which a "some weights are
+        // present" assertion would not notice.
+        assert_eq!(layered.vertices[0].weights, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(layered.vertices[1].weights, [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(layered.vertices[2].weights, [0.0, 0.0, 0.5, 0.5]);
+
+        // Same geometry as the textured form, since it is the same mesh.
+        for i in 0..3 {
+            assert_eq!(layered.vertices[i].position, prim.vertices[i].position);
+            assert_eq!(layered.vertices[i].normal, prim.vertices[i].normal);
+        }
+    }
+
+    #[test]
+    fn a_model_with_vertex_colours_but_no_marker_is_not_layered() {
+        // The same file with `extras` removed. Vertex colours alone must NOT
+        // opt a model in: an artist's vertex-coloured prop would otherwise
+        // render as cave rock, textured from the terrain's material array.
+        let Some((device, queue, layout)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        let mesh = GltfMesh::load(&device, &queue, &layout, &fixture("unmarked_cave.glb"))
+            .expect("the unmarked glb should load");
+        assert!(
+            mesh.primitives[0].layered.is_none(),
+            "an unmarked model opted itself into layered shading",
+        );
+    }
+
+    #[test]
+    fn an_ordinary_textured_model_is_not_layered() {
+        let Some((device, queue, layout)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        let mesh = GltfMesh::load(&device, &queue, &layout, &workspace_root().join("game/models/m4a1.glb"))
+            .expect("m4a1.glb should load");
+        assert!(mesh.primitives.iter().all(|p| p.layered.is_none()));
+    }
+
+    pub(crate) fn headless_gpu() -> Option<(wgpu::Device, wgpu::Queue, wgpu::BindGroupLayout)> {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),

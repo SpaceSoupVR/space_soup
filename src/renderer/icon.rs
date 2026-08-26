@@ -70,6 +70,7 @@ fn build_icon_mesh(
 
     GltfMesh {
         primitives: vec![MeshPrimitive {
+            layered: None,
             vertices,
             indices,
             texture,

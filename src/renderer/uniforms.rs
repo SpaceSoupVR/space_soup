@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 use wgpu::*;
 
 use super::lights::LightsUniform;
@@ -8,8 +8,47 @@ use super::lights::LightsUniform;
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct Uniforms {
     pub view_proj: [[f32; 4]; 4],
+    /// Sun (directional) light-space view-projection, for the sun shadow map.
+    pub sun_view_proj: [[f32; 4]; 4],
+    /// Spot/flashlight light-space view-projection, for the spot shadow map.
+    pub spot_view_proj: [[f32; 4]; 4],
+    /// World-space camera position (xyz); w unused. Drives specular.
+    pub camera_pos: [f32; 4],
+    /// x = sun shadow enabled (1/0), y = spot shadow enabled (1/0),
+    /// z = flashlight light index (as f32, valid when y > 0.5), w reserved.
+    pub shadow_params: [f32; 4],
 }
 
+/// Per-frame shadow inputs, bundled to keep `upload` call sites readable.
+pub struct ShadowUpload {
+    pub sun_view_proj: Mat4,
+    pub spot_view_proj: Mat4,
+    pub sun_enabled: bool,
+    pub spot_enabled: bool,
+    /// Index into the lights array of the shadow-casting flashlight spot light.
+    pub flashlight_index: u32,
+}
+
+impl ShadowUpload {
+    /// No shadows (identity matrices, both disabled) — used by paths that don't
+    /// render a shadow pass yet (e.g. the XR renderer).
+    pub fn disabled() -> Self {
+        Self {
+            sun_view_proj: Mat4::IDENTITY,
+            spot_view_proj: Mat4::IDENTITY,
+            sun_enabled: false,
+            spot_enabled: false,
+            flashlight_index: 0,
+        }
+    }
+}
+
+/// Camera, lights, and both shadow maps share one bind group — wgpu's default
+/// `max_bind_groups` limit of 4 leaves no room for extra groups once the
+/// skinned mesh pipeline's model/texture/joint groups are accounted for.
+/// Bindings: 0 = camera uniforms (vertex + fragment), 1 = lights (fragment),
+/// 2 = sun shadow depth texture, 3 = shadow comparison sampler,
+/// 4 = spot shadow depth texture.
 pub struct UniformBuffer {
     pub buffer: Buffer,
     pub layout: BindGroupLayout,
@@ -17,7 +56,13 @@ pub struct UniformBuffer {
 }
 
 impl UniformBuffer {
-    pub fn new(device: &Device, lights: &LightsUniform) -> Self {
+    pub fn new(
+        device: &Device,
+        lights: &LightsUniform,
+        sun_shadow_view: &TextureView,
+        spot_shadow_view: &TextureView,
+        shadow_sampler: &Sampler,
+    ) -> Self {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("uniform_buf"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -30,7 +75,7 @@ impl UniformBuffer {
             entries: &[
                 BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: ShaderStages::VERTEX,
+                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -45,6 +90,32 @@ impl UniformBuffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Depth,
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Comparison),
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Depth,
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
                 },
@@ -63,6 +134,18 @@ impl UniformBuffer {
                     binding: 1,
                     resource: lights.buffer().as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::TextureView(sun_shadow_view),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::Sampler(shadow_sampler),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: BindingResource::TextureView(spot_shadow_view),
+                },
             ],
         });
 
@@ -73,11 +156,53 @@ impl UniformBuffer {
         }
     }
 
-    pub fn upload(&self, queue: &Queue, view_proj: Mat4) {
+    pub fn upload(&self, queue: &Queue, view_proj: Mat4, camera_pos: Vec3, shadow: &ShadowUpload) {
         let u = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
+            sun_view_proj: shadow.sun_view_proj.to_cols_array_2d(),
+            spot_view_proj: shadow.spot_view_proj.to_cols_array_2d(),
+            camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 1.0],
+            shadow_params: [
+                if shadow.sun_enabled { 1.0 } else { 0.0 },
+                if shadow.spot_enabled { 1.0 } else { 0.0 },
+                shadow.flashlight_index as f32,
+                0.0,
+            ],
         };
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&u));
     }
 }
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::renderer::shadow::ShadowMap;
+
+    /// Where the eye sits in a render test.
+    ///
+    /// Straight out in front of the quad every harness here draws, so a
+    /// specular highlight lands symmetrically and cannot be mistaken for one
+    /// material winning over another. Only specular reads it.
+    pub const TEST_EYE: glam::Vec3 = glam::Vec3::new(0.0, 0.0, 5.0);
+
+    /// Group 0 for a render test, wired exactly as the renderer wires it.
+    ///
+    /// A real `ShadowMap`, only tiny: the shadow textures have to exist and be
+    /// bound with the right sample types or nothing validates, and building a
+    /// stand-in here would mean the tests stopped noticing when the real layout
+    /// changed. 64 squared costs nothing and proves the same thing.
+    ///
+    /// The `ShadowMap` comes back with the buffer because it owns the textures
+    /// the bind group points at; dropping it would leave the group dangling.
+    pub fn scene_uniforms(device: &Device, lights: &LightsUniform) -> (ShadowMap, UniformBuffer) {
+        let shadows = ShadowMap::with_dimension(device, 64);
+        let uniforms = UniformBuffer::new(
+            device,
+            lights,
+            shadows.sun_depth_view(),
+            shadows.spot_depth_view(),
+            shadows.sampler(),
+        );
+        (shadows, uniforms)
+    }
+}
