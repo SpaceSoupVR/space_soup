@@ -11,11 +11,20 @@ use crate::renderer::{
     MeshInstance,
 };
 
-use super::XrRenderer;
+use super::{ShadowQuality, XrRenderer};
 
 type MeshDraw<'a> = (
     &'a wgpu::BindGroup,
     &'a wgpu::BindGroup,
+    &'a wgpu::BindGroup,
+    &'a wgpu::Buffer,
+    &'a wgpu::Buffer,
+    u32,
+);
+
+/// A layered draw needs no texture bind group: every layered mesh in a scene
+/// shares the one terrain material array, which is bound once for the batch.
+type LayeredDraw<'a> = (
     &'a wgpu::BindGroup,
     &'a wgpu::Buffer,
     &'a wgpu::Buffer,
@@ -36,6 +45,7 @@ fn push_mesh_draws<'a>(
     lightmap_bg: &'a wgpu::BindGroup,
     mesh_draws: &mut Vec<MeshDraw<'a>>,
     skinned_draws: &mut Vec<SkinnedDraw<'a>>,
+    layered_draws: &mut Vec<LayeredDraw<'a>>,
 ) {
     if let Some(skin) = &instance.mesh.skin {
         if let Some(joint_bg) = &skin.joint_bind_group {
@@ -52,6 +62,18 @@ fn push_mesh_draws<'a>(
         }
     } else {
         for prim in &instance.mesh.primitives {
+            // One or the other, never both: drawing a cave through the mesh
+            // pipeline as well would put untextured geometry in exactly the
+            // same place, z-fighting with itself.
+            if let Some(layered) = &prim.layered {
+                layered_draws.push((
+                    &instance.model.bind_group,
+                    &layered.vertex_buffer,
+                    &prim.index_buffer,
+                    prim.indices.len() as u32,
+                ));
+                continue;
+            }
             mesh_draws.push((
                 &instance.model.bind_group,
                 &prim.texture.bind_group,
@@ -224,22 +246,46 @@ impl XrRenderer {
 
         let mut mesh_draws: Vec<MeshDraw> = Vec::new();
         let mut skinned_draws: Vec<SkinnedDraw> = Vec::new();
+        let mut layered_draws: Vec<LayeredDraw> = Vec::new();
+        // Depth-pass casters. The ordinary vertex buffer even for a layered
+        // mesh -- a depth pass reads position and nothing else, so a baked cave
+        // casts here with no pipeline of its own.
+        let mut shadow_casters: Vec<crate::renderer::shadow::ShadowMeshDraw> = Vec::new();
         for instance in meshes {
             instance
                 .model
                 .upload(&self.wgpu_queue, instance.mesh.model_matrix());
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
-            push_mesh_draws(instance, lightmap_bg, &mut mesh_draws, &mut skinned_draws);
+            push_mesh_draws(
+                instance, lightmap_bg, &mut mesh_draws, &mut skinned_draws, &mut layered_draws,
+            );
+            if instance.mesh.skin.is_none() {
+                for prim in &instance.mesh.primitives {
+                    shadow_casters.push((
+                        &prim.vertex_buffer,
+                        &prim.index_buffer,
+                        prim.indices.len() as u32,
+                        &instance.model.bind_group,
+                    ));
+                }
+            }
         }
 
         let mut mirror_only_mesh_draws: Vec<MeshDraw> = Vec::new();
         let mut mirror_only_skinned_draws: Vec<SkinnedDraw> = Vec::new();
+        let mut mirror_only_layered_draws: Vec<LayeredDraw> = Vec::new();
         for instance in mirror_only_meshes {
             instance
                 .model
                 .upload(&self.wgpu_queue, instance.mesh.model_matrix());
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
-            push_mesh_draws(instance, lightmap_bg, &mut mirror_only_mesh_draws, &mut mirror_only_skinned_draws);
+            push_mesh_draws(
+                instance,
+                lightmap_bg,
+                &mut mirror_only_mesh_draws,
+                &mut mirror_only_skinned_draws,
+                &mut mirror_only_layered_draws,
+            );
         }
 
         let mirror_quad = mirror.map(|m| {
@@ -263,6 +309,106 @@ impl XrRenderer {
             (vb, ib, idx.len() as u32)
         });
 
+        // SHADOWS: once per frame, not once per eye.
+        //
+        // A shadow map is built in the LIGHT's space, so it is identical for
+        // both eyes -- rendering it inside the loop below would double the most
+        // expensive pass in the frame for a bit-identical second copy.
+        let head = glam::Vec3::new(
+            eye_views[0].pose.position.x,
+            eye_views[0].pose.position.y,
+            eye_views[0].pose.position.z,
+        );
+        let want_sun = self.shadow_quality != ShadowQuality::Off;
+        let want_spot = self.shadow_quality == ShadowQuality::SunAndSpot;
+
+        let sun = want_sun
+            .then(|| lights.iter().find(|l| l.kind == crate::renderer::LightKind::Directional))
+            .flatten();
+        let spot_index = want_spot
+            .then(|| lights.iter().position(|l| l.kind == crate::renderer::LightKind::Spot))
+            .flatten();
+
+        // The box follows the head and is pushed forward, so its limited
+        // resolution is spent on what the player is looking at. Half of a
+        // head-centred box would always be behind them.
+        let forward = (glam::Quat::from_xyzw(
+            eye_views[0].pose.orientation.x,
+            eye_views[0].pose.orientation.y,
+            eye_views[0].pose.orientation.z,
+            eye_views[0].pose.orientation.w,
+        ) * glam::Vec3::NEG_Z)
+            .normalize_or_zero();
+        let sun_radius = 30.0_f32;
+        let focus = head + forward * (sun_radius * 0.5);
+
+        let shadow = crate::renderer::uniforms::ShadowUpload {
+            sun_view_proj: sun
+                .map(|l| {
+                    crate::renderer::shadow::directional_light_matrix(l.direction, focus, sun_radius)
+                })
+                .unwrap_or(glam::Mat4::IDENTITY),
+            spot_view_proj: spot_index
+                .map(|i| {
+                    let l = &lights[i];
+                    crate::renderer::shadow::spot_light_matrix(
+                        l.position, l.direction, l.cone_angle_deg, l.range,
+                    )
+                })
+                .unwrap_or(glam::Mat4::IDENTITY),
+            sun_enabled: sun.is_some(),
+            spot_enabled: spot_index.is_some(),
+            flashlight_index: spot_index.unwrap_or(0) as u32,
+        };
+
+        if shadow.sun_enabled || shadow.spot_enabled {
+            let solid_caster = (!solid_idx.is_empty())
+                .then_some((&solid_vb, &solid_ib, solid_idx.len() as u32));
+            let brush_caster = brush_buffers
+                .as_ref()
+                .map(|(vb, ib, count)| (vb, ib, *count));
+            let mut encoder = self
+                .wgpu_device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("shadow_encoder"),
+                });
+            if shadow.sun_enabled {
+                self.shadow_map.upload_light(
+                    &self.wgpu_queue,
+                    crate::renderer::shadow::ShadowKind::Sun,
+                    shadow.sun_view_proj,
+                );
+                self.shadow_map.record(
+                    &mut encoder,
+                    crate::renderer::shadow::ShadowKind::Sun,
+                    solid_caster,
+                    brush_caster,
+                    &shadow_casters,
+                );
+            }
+            if shadow.spot_enabled {
+                self.shadow_map.upload_light(
+                    &self.wgpu_queue,
+                    crate::renderer::shadow::ShadowKind::Spot,
+                    shadow.spot_view_proj,
+                );
+                self.shadow_map.record(
+                    &mut encoder,
+                    crate::renderer::shadow::ShadowKind::Spot,
+                    solid_caster,
+                    brush_caster,
+                    &shadow_casters,
+                );
+            }
+            self.wgpu_queue.submit(Some(encoder.finish()));
+        }
+
+        // Whether the eye pass will composite anything that has to depth-test
+        // against the world. Only these two read the scene depth, and only they
+        // make a multisampled depth buffer worth storing.
+        let needs_scene_depth = mirror_quad.is_some()
+            || solid_ranges.iter().any(|(_, _, _, r)| *r > 0.0);
+
         for eye in 0..2usize {
             let ev = &eye_views[eye];
             let view = Camera::xr_view(ev.pose);
@@ -277,7 +423,11 @@ impl XrRenderer {
                 let mirror_proj = mirror::oblique_near_clip(proj, eye_plane);
                 let mirror_view_proj = Camera::gl_to_wgpu_ndc(mirror_proj) * mirror_view;
 
-                self.uniform_buf.upload(&self.wgpu_queue, mirror_view_proj);
+                // The reflected eye, so specular highlights land where the
+                // reflection says they should rather than where the real eye is.
+                let mirror_eye = mirror_view.inverse().transform_point3(glam::Vec3::ZERO);
+                self.uniform_buf
+                    .upload(&self.wgpu_queue, mirror_view_proj, mirror_eye, &shadow);
                 self.mirror_reflected_vp_uniform.upload(&self.wgpu_queue, mirror_view_proj);
 
                 let mut encoder = self.wgpu_device.create_command_encoder(
@@ -333,6 +483,25 @@ impl XrRenderer {
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..*count, 0, 0..1);
                     }
+                    if !layered_draws.is_empty() || !mirror_only_layered_draws.is_empty() {
+                        // Mirror variant, because a reflected world reverses
+                        // every winding. It matters more here than elsewhere:
+                        // this shader flips the normal on a back face, so the
+                        // wrong front-face rule inverts the lighting of every
+                        // cave surface in the reflection rather than merely
+                        // culling the wrong side.
+                        pass.set_pipeline(&self.layered_mesh_mirror_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                        for (model_bg, vb, ib, count) in
+                            layered_draws.iter().chain(mirror_only_layered_draws.iter())
+                        {
+                            pass.set_bind_group(2, *model_bg, &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
+                    }
                     let all_mesh_draws = mesh_draws.iter().chain(mirror_only_mesh_draws.iter());
                     let all_skinned_draws =
                         skinned_draws.iter().chain(mirror_only_skinned_draws.iter());
@@ -350,7 +519,9 @@ impl XrRenderer {
                         }
                     }
                     if !skinned_draws.is_empty() || !mirror_only_skinned_draws.is_empty() {
-                        pass.set_pipeline(&self.skinned_mesh_pipeline.pipeline);
+                        // The 1x twin: this pass renders into a single-sampled
+                        // mirror target.
+                        pass.set_pipeline(&self.skinned_mesh_mirror_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         for (model_bg, tex_bg, joint_bg, vb, ib, count) in all_skinned_draws {
                             pass.set_bind_group(1, *model_bg, &[]);
@@ -366,8 +537,9 @@ impl XrRenderer {
             }
 
             let eye_view_proj = Camera::gl_to_wgpu_ndc(proj) * view;
-            self.uniform_buf.upload(&self.wgpu_queue, eye_view_proj);
             let cam_pos = glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
+            self.uniform_buf
+                .upload(&self.wgpu_queue, eye_view_proj, cam_pos, &shadow);
             self.ssr_camera_uniform.upload(&self.wgpu_queue, eye_view_proj, cam_pos);
 
             {
@@ -375,11 +547,43 @@ impl XrRenderer {
                     &wgpu::CommandEncoderDescriptor { label: Some("ssr_scene") },
                 );
                 {
+                    // MULTISAMPLING, AND THE TWO STORE OPS THAT DECIDE ITS COST.
+                    //
+                    // Colour: when the target is multisampled the pass draws
+                    // into the MSAA attachment and RESOLVES into the ordinary
+                    // one. `StoreOp::Discard` on the multisampled side still
+                    // performs the resolve -- it discards the samples, which is
+                    // exactly what we want: on a tile GPU they never leave tile
+                    // memory and only the resolved image is written out.
+                    //
+                    // Depth: cannot be resolved, so a multisampled pass that
+                    // has to KEEP its depth pays four times the write. The only
+                    // thing that reads it is the blit's `frag_depth`, which
+                    // exists so reflective solids and the mirror quad composite
+                    // correctly in the eye pass. When the frame has neither --
+                    // which is every scene shipped so far -- the depth is
+                    // discarded and the expensive half of MSAA never happens.
+                    let target = &self.scene_targets[eye];
+                    let (color_view, resolve_target, color_store) =
+                        match target.msaa_color_view.as_ref() {
+                            Some(msaa) => (
+                                msaa,
+                                Some(&target.color_view),
+                                wgpu::StoreOp::Discard,
+                            ),
+                            None => (&target.color_view, None, wgpu::StoreOp::Store),
+                        };
+                    let depth_store = if needs_scene_depth {
+                        wgpu::StoreOp::Store
+                    } else {
+                        wgpu::StoreOp::Discard
+                    };
+
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("ssr_scene_pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &self.scene_targets[eye].color_view,
-                            resolve_target: None,
+                            view: color_view,
+                            resolve_target,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color {
                                     r: 0.02,
@@ -387,14 +591,14 @@ impl XrRenderer {
                                     b: 0.05,
                                     a: 1.0,
                                 }),
-                                store: wgpu::StoreOp::Store,
+                                store: color_store,
                             },
                         })],
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                            view: &self.scene_targets[eye].depth_view,
+                            view: &target.depth_view,
                             depth_ops: Some(wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(1.0),
-                                store: wgpu::StoreOp::Store,
+                                store: depth_store,
                             }),
                             stencil_ops: None,
                         }),
@@ -434,6 +638,20 @@ impl XrRenderer {
                         pass.set_vertex_buffer(0, vb.slice(..));
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                    if !layered_draws.is_empty() {
+                        // One material bind for the batch: every cave in a scene
+                        // blends the same four terrain layers, so the only thing
+                        // that changes between draws is the model matrix.
+                        pass.set_pipeline(&self.layered_mesh_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                        for (model_bg, vb, ib, count) in &layered_draws {
+                            pass.set_bind_group(2, *model_bg, &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
                     }
                     if !wire_verts.is_empty() {
                         pass.set_pipeline(&self.wire_pipeline.pipeline);

@@ -120,6 +120,17 @@ pub struct ParticlePipeline {
 
 impl ParticlePipeline {
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
+        Self::new_multisampled(device, format, uniform_layout, 1)
+    }
+
+    /// See `pipeline::SolidPipeline::new_multisampled` -- a pipeline's sample
+    /// count must match the pass it runs in, so a 4x eye pass needs its own.
+    pub fn new_multisampled(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("particle_shader"),
             source: ShaderSource::Wgsl(particle_shader().into()),
@@ -162,7 +173,7 @@ impl ParticlePipeline {
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
-            multisample: MultisampleState::default(),
+            multisample: MultisampleState { count: samples, ..Default::default() },
             multiview: None,
             cache: None,
         });

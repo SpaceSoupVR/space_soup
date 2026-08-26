@@ -5,7 +5,8 @@ use wgpu::util::DeviceExt;
 
 use super::skin::SkinnedMeshPrimitive;
 use super::texture::load_primitive_texture;
-use super::vertex::{MeshPrimitive, MeshVertex, SkinnedMeshVertex};
+use super::vertex::{LayeredPrimitive, MeshPrimitive, MeshVertex, SkinnedMeshVertex};
+use crate::renderer::layered_mesh_pipeline::LayeredVertex;
 
 pub(crate) fn ancestor_joint_and_baked_local(
     node: &gltf::Node,
@@ -115,6 +116,16 @@ pub(crate) fn collect_node(
             let texture = load_primitive_texture(&prim, images, device, queue, layout);
             let texture = Arc::new(texture);
 
+            // Layer weights, when the file both asks for layered shading and
+            // carries them. Read here rather than in the `bake` arm below
+            // because the reader borrows the primitive, and a cave is always
+            // static anyway -- nothing has ever rigged one.
+            let layered_weights: Option<Vec<[f32; 4]>> = if wants_layered_shading(&mesh) {
+                reader.read_colors(0).map(|c| c.into_rgba_f32().collect())
+            } else {
+                None
+            };
+
             if bake {
                 let vertices: Vec<MeshVertex> = (0..positions.len())
                     .map(|i| MeshVertex {
@@ -135,12 +146,34 @@ pub(crate) fn collect_node(
                     contents: bytemuck::cast_slice(&indices),
                     usage: wgpu::BufferUsages::INDEX,
                 });
+                let layered = layered_weights.map(|weights| {
+                    let lv: Vec<LayeredVertex> = (0..positions.len())
+                        .map(|i| LayeredVertex {
+                            position: positions[i].into(),
+                            normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
+                            // A vertex past the end of a short COLOR_0 gets
+                            // layer 0 rather than nothing: the shader reads
+                            // all-zero weights as layer 0 too, so the two
+                            // agree instead of one of them rendering black.
+                            weights: weights.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]),
+                        })
+                        .collect();
+                    let vertex_buffer =
+                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("layered_mesh_vb"),
+                            contents: bytemuck::cast_slice(&lv),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                    LayeredPrimitive { vertices: lv, vertex_buffer }
+                });
+
                 static_out.push(MeshPrimitive {
                     vertices,
                     indices,
                     texture,
                     vertex_buffer,
                     index_buffer,
+                    layered,
                 });
             } else {
                 let (joint_ids, joint_weights): (Vec<[u32; 4]>, Vec<[f32; 4]>) = if real_skin {
@@ -214,4 +247,27 @@ pub(crate) fn collect_node(
             skinned_out,
         );
     }
+}
+
+/// Whether a mesh asked to be shaded from its per-vertex layer weights.
+///
+/// Declared by the FILE, in `extras`, rather than by the scene object that
+/// happens to reference it. A cave bake is a cave bake wherever it is placed,
+/// and putting the flag in the scene would mean carrying it through the engine
+/// schema, the wire protocol and the client to say something the mesh already
+/// knows.
+///
+/// Not inferred from "has COLOR_0 and no baseColorTexture", which would silently
+/// render an artist's vertex-coloured model as cave rock.
+fn wants_layered_shading(mesh: &gltf::Mesh) -> bool {
+    let Some(raw) = mesh.extras().as_ref() else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.get()) else {
+        return false;
+    };
+    v.get("space_soup")
+        .and_then(|s| s.get("shading"))
+        .and_then(|s| s.as_str())
+        == Some("layered")
 }

@@ -37,6 +37,7 @@ use wgpu::*;
 
 use super::cuboid::SolidVertex;
 use super::lights::wgsl_lights_block;
+use super::material_wgsl::{wgsl_biplanar_block, wgsl_whiteout_block};
 
 /// Per-scene terrain material settings, matching the WGSL uniform.
 ///
@@ -105,6 +106,17 @@ pub struct TerrainPipeline {
 
 impl TerrainPipeline {
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
+        Self::new_multisampled(device, format, uniform_layout, 1)
+    }
+
+    /// See `pipeline::SolidPipeline::new_multisampled` -- a pipeline's sample
+    /// count must match the pass it runs in, so a 4x eye pass needs its own.
+    pub fn new_multisampled(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("terrain_shader"),
             source: ShaderSource::Wgsl(terrain_shader().into()),
@@ -151,7 +163,7 @@ impl TerrainPipeline {
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
-            multisample: MultisampleState::default(),
+            multisample: MultisampleState { count: samples, ..Default::default() },
             multiview: None,
             cache: None,
         });
@@ -235,8 +247,9 @@ pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
 fn terrain_shader() -> String {
     format!(
         r#"
-struct Uniforms {{ view_proj: mat4x4<f32> }}
-@group(0) @binding(0) var<uniform> u: Uniforms;
+// Group 0 -- the camera, the lights and both shadow maps -- is declared by
+// `wgsl_lights_block` below, so there is one description of that layout rather
+// than one per shader.
 
 @group(1) @binding(0) var layer_tex: texture_2d_array<f32>;
 @group(1) @binding(1) var layer_samp: sampler;
@@ -262,6 +275,8 @@ struct Material {{
 @group(1) @binding(5) var normal_tex: texture_2d_array<f32>;
 
 {lights_block}
+{biplanar_block}
+{whiteout_block}
 
 struct VIn  {{ @location(0) pos: vec3<f32>, @location(1) norm: vec3<f32>, @location(2) col: vec4<f32>, @location(3) uv2: vec2<f32> }}
 struct VOut {{
@@ -277,7 +292,7 @@ struct VOut {{
 
 @vertex fn vs_main(v: VIn) -> VOut {{
     var out: VOut;
-    out.clip      = u.view_proj * vec4<f32>(v.pos, 1.0);
+    out.clip      = camera.view_proj * vec4<f32>(v.pos, 1.0);
     out.col       = v.col;
     out.normal    = v.norm;
     out.world_pos = v.pos;
@@ -295,32 +310,15 @@ fn sample_planar(layer: i32, world: vec3<f32>, repeat: f32) -> vec3<f32> {{
 // Biplanar: the two strongest axes, weighted by the normal. Two samples rather
 // than triplanar's three -- the third axis contributes least by construction,
 // and dropping it is invisible while being a third cheaper.
+//
+// The axis choice itself lives in `material_wgsl`, because the cave shader needs
+// exactly the same projection and a second copy of it would be a second thing to
+// get wrong. What stays here is the sampling, which differs.
 fn sample_biplanar(layer: i32, world: vec3<f32>, n: vec3<f32>, repeat: f32) -> vec3<f32> {{
-    let r = max(repeat, 0.001);
-    let a = abs(n);
-
-    // Rank the axes so we can take the top two without branching per pixel.
-    let ma = max(a.x, max(a.y, a.z));
-    let mi = min(a.x, min(a.y, a.z));
-    let me = a.x + a.y + a.z - ma - mi;
-
-    var uv_major: vec2<f32>;
-    var uv_minor: vec2<f32>;
-    if (a.y == ma) {{
-        uv_major = world.xz / r;
-        uv_minor = select(world.xy / r, world.zy / r, a.x >= a.z);
-    }} else if (a.x == ma) {{
-        uv_major = world.zy / r;
-        uv_minor = select(world.xy / r, world.xz / r, a.z < a.y);
-    }} else {{
-        uv_major = world.xy / r;
-        uv_minor = select(world.zy / r, world.xz / r, a.x < a.y);
-    }}
-
-    let c_major = textureSample(layer_tex, layer_samp, uv_major, layer).rgb;
-    let c_minor = textureSample(layer_tex, layer_samp, uv_minor, layer).rgb;
-    let w = ma / max(ma + me, 0.001);
-    return mix(c_minor, c_major, w);
+    let b = biplanar_axes(world, n, repeat);
+    let c_major = textureSample(layer_tex, layer_samp, b.uv_major, layer).rgb;
+    let c_minor = textureSample(layer_tex, layer_samp, b.uv_minor, layer).rgb;
+    return mix(c_minor, c_major, b.w);
 }}
 
 // Surface normal for one layer, sampled top-down and folded into the geometric
@@ -348,11 +346,10 @@ fn layer_normal(layer: i32, world: vec3<f32>, n: vec3<f32>, repeat: f32) -> vec3
     var tn = packed * 2.0 - 1.0;
     tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
 
-    // Y-projection whiteout. For flat ground (n = 0,1,0) and a flat texel
-    // (tn = 0,0,1) this returns the geometric normal exactly, which is what
-    // makes an unauthored normal set a true no-op.
-    let t = vec3<f32>(tn.xy + n.xz, abs(tn.z) * n.y);
-    return normalize(t.xzy);
+    // Axis 1 is the y projection, which is the only one this samples. For flat
+    // ground (n = 0,1,0) and a flat texel (tn = 0,0,1) it returns the geometric
+    // normal exactly, which is what makes an unauthored normal set a no-op.
+    return normalize(whiteout(1u, tn, n));
 }}
 
 fn layer_colour(layer: i32, world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> vec3<f32> {{
@@ -429,7 +426,9 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     return vec4<f32>(albedo * in.col.rgb * lit, 1.0);
 }}
 "#,
-        lights_block = wgsl_lights_block(0, 1)
+        lights_block = wgsl_lights_block(0, 1),
+        biplanar_block = wgsl_biplanar_block(),
+        whiteout_block = wgsl_whiteout_block(),
     )
 }
 
@@ -438,7 +437,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::renderer::cuboid::SolidVertex;
     use crate::renderer::lights::LightsUniform;
-    use crate::renderer::uniforms::UniformBuffer;
     use wgpu::util::DeviceExt;
 
     /// The pipeline is only validated when it is CREATED, and correctness only
@@ -526,7 +524,8 @@ pub(crate) mod tests {
         let format = TextureFormat::Rgba8Unorm;
 
         let lights = LightsUniform::new(&device);
-        let uniforms = UniformBuffer::new(&device, &lights);
+        let (_shadows, uniforms) =
+            crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
 
         // Both uniform buffers are created UNINITIALISED. Without writing them
         // view_proj is garbage -- the triangle lands somewhere arbitrary and the
@@ -534,12 +533,15 @@ pub(crate) mod tests {
         // Identity view_proj means the vertex positions ARE clip coordinates,
         // and an empty light list leaves the shader's AMBIENT term, which is all
         // this test wants: it is asserting the splat blend, not the light rig.
-        queue.write_buffer(
-            &uniforms.buffer,
-            0,
-            bytemuck::bytes_of(&crate::renderer::uniforms::Uniforms {
-                view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
-            }),
+        uniforms.upload(
+            &queue,
+            glam::Mat4::IDENTITY,
+            // The eye. Only specular reads it, and these tests assert the splat
+            // blend -- so it goes straight out in front of the quad, where a
+            // highlight lands symmetrically and cannot be mistaken for one of
+            // the layers winning.
+            glam::Vec3::new(0.0, 0.0, 5.0),
+            &crate::renderer::uniforms::ShadowUpload::disabled(),
         );
         if lit {
             // Placed off to one side so a tilt in the surface normal changes

@@ -23,6 +23,74 @@ struct EyeTarget {
     view: wgpu::TextureView,
 }
 
+/// How much of the frame budget goes on shadows.
+///
+/// An explicit knob rather than something inferred from the scene, because this
+/// is the single biggest thing a level can spend on the headset and whoever is
+/// tuning a map needs to be able to turn it down without editing their lights.
+///
+/// Each level costs a FULL EXTRA PASS over every caster in the scene. The sun's
+/// map is built in light space and so is rendered once per frame for both eyes;
+/// adding the flashlight doubles that, and it is a perspective map that has to
+/// be rebuilt whenever the hand moves, which is every frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowQuality {
+    /// No depth passes at all. Everything is lit unshadowed, as it was before
+    /// shadows existed -- which is a real option for an indoor level lit
+    /// entirely by point lights that never cast anyway.
+    Off,
+    /// The sun only. The default: outdoor shadows are what sells a place as a
+    /// place, and one pass per frame buys all of them.
+    SunOnly,
+    /// The sun and the shadow-casting spot light. Two passes.
+    SunAndSpot,
+}
+
+/// How many samples the scene pass takes per pixel.
+///
+/// WHY THIS IS WORTH IT ON A HEADSET SPECIFICALLY
+///
+/// A tile GPU keeps the multisampled buffer in on-chip tile memory and resolves
+/// it there, so the write out to main memory is the same size it always was.
+/// The cost is tile memory and a little raster work, not bandwidth -- which is
+/// the opposite of a desktop GPU, where 4x MSAA means a framebuffer four times
+/// the size and four times the write traffic.
+///
+/// And aliasing is worth more to fix here than on a monitor: a shimmering edge
+/// two metres from your face, moving with your head, is far more noticeable in
+/// stereo than the same edge on a screen you are sitting still in front of.
+///
+/// THE ONE PLACE IT IS NOT CHEAP
+///
+/// Colour resolves and is discarded. DEPTH cannot resolve -- wgpu has no depth
+/// resolve, and neither does the hardware in any portable way -- so if anything
+/// downstream reads scene depth, the multisampled depth buffer has to be
+/// STORED, at four times the size. `render_frame` therefore discards it unless
+/// the frame actually has a reflective surface or a mirror in it, which is the
+/// only thing that reads it. No shipped scene does.
+/// NO 2x OPTION, deliberately.
+///
+/// WebGPU guarantees only 1 and 4 samples for a colour format; 2x needs the
+/// optional `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`, and without it pipeline
+/// creation fails outright. It was offered here until a headless test built
+/// every pipeline at 2x and the driver said so in as many words. An option that
+/// works on the machine you develop on and refuses to start on some headsets is
+/// worse than not having it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsaaLevel {
+    Off,
+    X4,
+}
+
+impl MsaaLevel {
+    pub fn samples(self) -> u32 {
+        match self {
+            MsaaLevel::Off => 1,
+            MsaaLevel::X4 => 4,
+        }
+    }
+}
+
 pub struct XrRenderer {
     pub swapchain: xr::Swapchain<xr::Vulkan>,
     pub width: u32,
@@ -34,6 +102,17 @@ pub struct XrRenderer {
     brush_mirror_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     brush_materials: crate::renderer::brush_pipeline::BrushMaterials,
     terrain_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
+    // Caves and anything else baked from a voxel sculpt. Shares the terrain's
+    // material bind group -- see layered_mesh_pipeline for why that is the
+    // point rather than a shortcut.
+    shadow_map: crate::renderer::shadow::ShadowMap,
+    /// How much shadow work this headset does per frame. See `ShadowQuality`.
+    pub shadow_quality: ShadowQuality,
+    /// Fixed at construction, because every pipeline is built against it.
+    /// Changing it means rebuilding the renderer, which is why it is read-only.
+    msaa: MsaaLevel,
+    layered_mesh_pipeline: crate::renderer::layered_mesh_pipeline::LayeredMeshPipeline,
+    layered_mesh_mirror_pipeline: crate::renderer::layered_mesh_pipeline::LayeredMeshPipeline,
     // The material is per-scene, but it is built here with the fallback so
     // terrain renders through the real pipeline before any textures exist.
     // Replaced via `set_terrain_material` when a scene authors its own.
@@ -47,6 +126,7 @@ pub struct XrRenderer {
     terrain_settings: crate::renderer::terrain_pipeline::TerrainMaterialUniform,
     wire_pipeline: WirePipeline,
     mesh_pipeline: MeshPipeline,
+    skinned_mesh_mirror_pipeline: SkinnedMeshPipeline,
     skinned_mesh_pipeline: SkinnedMeshPipeline,
     mirror_solid_pipeline: SolidPipeline,
     mirror_mesh_pipeline: MeshPipeline,
@@ -145,6 +225,17 @@ impl XrRenderer {
         xr_ctx: &XrContext,
         session: &xr::Session<xr::Vulkan>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // 4x by default. On a tile GPU this is the cheapest quality the engine
+        // buys anywhere, and stereo is where aliasing hurts most.
+        Self::new_with_msaa(vk, xr_ctx, session, MsaaLevel::X4)
+    }
+
+    pub fn new_with_msaa(
+        vk: &VkContext,
+        xr_ctx: &XrContext,
+        session: &xr::Session<xr::Vulkan>,
+        msaa: MsaaLevel,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let view_configs = xr_ctx.instance.enumerate_view_configuration_views(
             xr_ctx.system,
             xr::ViewConfigurationType::PRIMARY_STEREO,
@@ -179,10 +270,27 @@ impl XrRenderer {
         let (wgpu_device, wgpu_queue) = unsafe { vulkan_interop::build_wgpu_from_vulkan(vk)? };
 
         let lights_uniform = LightsUniform::new(&wgpu_device);
-        let uniform_buf = UniformBuffer::new(&wgpu_device, &lights_uniform);
-        let solid_pipeline = SolidPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
-        let brush_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new(
-            &wgpu_device, wgpu_format, &uniform_buf.layout,
+        // Before the uniform buffer, whose bind group points at these textures.
+        // Quarter the desktop resolution -- see shadow::QUEST_SHADOW_DIM.
+        let shadow_map = crate::renderer::shadow::ShadowMap::with_dimension(
+            &wgpu_device,
+            crate::renderer::shadow::QUEST_SHADOW_DIM,
+        );
+        let uniform_buf = UniformBuffer::new(
+            &wgpu_device,
+            &lights_uniform,
+            shadow_map.sun_depth_view(),
+            shadow_map.spot_depth_view(),
+            shadow_map.sampler(),
+        );
+        // The scene pass is multisampled; the mirror and eye passes are not. Each
+        // pipeline is built for the pass it runs in -- wgpu will not let one
+        // pipeline serve two different sample counts.
+        let samples = msaa.samples();
+        let solid_pipeline =
+            SolidPipeline::new_multisampled(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
+        let brush_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_multisampled(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, samples,
         );
         let brush_mirror_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_mirror(
             &wgpu_device, wgpu_format, &uniform_buf.layout,
@@ -192,15 +300,35 @@ impl XrRenderer {
         let brush_materials = crate::renderer::brush_pipeline::BrushMaterials::fallback(
             &wgpu_device, &wgpu_queue, &brush_pipeline.material_layout,
         );
-        let terrain_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new(
-            &wgpu_device, wgpu_format, &uniform_buf.layout,
+        let terrain_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new_multisampled(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, samples,
         );
         let terrain_material = crate::renderer::terrain_pipeline::TerrainMaterial::fallback(
             &wgpu_device, &wgpu_queue, &terrain_pipeline.material_layout,
         );
-        let wire_pipeline = WirePipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
-        let mesh_pipeline = MeshPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let layered_mesh_pipeline =
+            crate::renderer::layered_mesh_pipeline::LayeredMeshPipeline::new_multisampled(
+                &wgpu_device,
+                wgpu_format,
+                &uniform_buf.layout,
+                &terrain_pipeline.material_layout,
+                samples,
+            );
+        let layered_mesh_mirror_pipeline =
+            crate::renderer::layered_mesh_pipeline::LayeredMeshPipeline::new_mirror(
+                &wgpu_device, wgpu_format, &uniform_buf.layout, &terrain_pipeline.material_layout,
+            );
+        let wire_pipeline =
+            WirePipeline::new_multisampled(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
+        let mesh_pipeline =
+            MeshPipeline::new_multisampled(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
         let skinned_mesh_pipeline =
+            SkinnedMeshPipeline::new_multisampled(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
+        // The mirror pass renders into a single-sampled target, so the skinned
+        // pipeline needs a 1x twin. Every other pipeline used there already had
+        // a separate mirror variant for its winding; this one did not, because
+        // it does not cull.
+        let skinned_mesh_mirror_pipeline =
             SkinnedMeshPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let mirror_solid_pipeline =
             SolidPipeline::new_mirror(&wgpu_device, wgpu_format, &uniform_buf.layout);
@@ -211,20 +339,27 @@ impl XrRenderer {
             std::array::from_fn(|_| mirror_pipeline.create_target(&wgpu_device, wgpu_format, width, height));
         let mirror_model_uniform = mirror_pipeline.create_model_uniform(&wgpu_device);
         let mirror_reflected_vp_uniform = mirror_pipeline.create_reflected_vp_uniform(&wgpu_device);
-        let ssr_pipelines = SsrPipelines::new(&wgpu_device, wgpu_format);
+        // The blit and the reflective solids read the scene DEPTH, which is
+        // multisampled whenever the scene pass is, so they have to be built
+        // knowing that.
+        let ssr_pipelines =
+            SsrPipelines::new_with_depth_samples(&wgpu_device, wgpu_format, samples);
         let ssr_solid_pipeline = SolidPipeline::new_ssr(
             &wgpu_device,
             wgpu_format,
             &uniform_buf.layout,
             ssr_pipelines.camera_layout(),
             ssr_pipelines.scene_texture_layout(),
+            samples > 1,
         );
         let scene_targets: [SceneTarget; 2] = std::array::from_fn(|_| {
-            ssr_pipelines.create_scene_target(&wgpu_device, wgpu_format, width, height)
+            ssr_pipelines
+                .create_scene_target_multisampled(&wgpu_device, wgpu_format, width, height, samples)
         });
         let ssr_camera_uniform = ssr_pipelines.create_camera_uniform(&wgpu_device);
-        let particle_pipeline =
-            ParticlePipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        let particle_pipeline = ParticlePipeline::new_multisampled(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, samples,
+        );
 
         let depth_tex = wgpu_device.create_texture(&wgpu::TextureDescriptor {
             label: Some("xr_depth"),
@@ -292,6 +427,12 @@ impl XrRenderer {
             brush_mirror_pipeline,
             brush_materials,
             terrain_pipeline,
+            shadow_map,
+            shadow_quality: ShadowQuality::SunOnly,
+            msaa,
+            skinned_mesh_mirror_pipeline,
+            layered_mesh_pipeline,
+            layered_mesh_mirror_pipeline,
             terrain_material,
             terrain_layers: vec![None, None, None, None],
             terrain_normals: vec![None, None, None, None],

@@ -2,10 +2,19 @@ use wgpu::*;
 
 pub struct SceneTarget {
     _color_texture: Texture,
+    /// The RESOLVED colour, single-sampled and sampleable. What the blit reads.
     pub color_view: TextureView,
     _depth_texture: Texture,
+    /// Depth at the pass's own sample count. Read by SSR with `textureLoad`,
+    /// which is why it cannot simply be discarded when multisampling.
     pub depth_view: TextureView,
     pub bind_group: BindGroup,
+    /// The multisampled colour the scene pass actually draws into, when
+    /// `samples > 1`. It resolves into `color_view` and is never stored, so on
+    /// a tile GPU it lives and dies in tile memory.
+    pub msaa_color_view: Option<TextureView>,
+    _msaa_color_texture: Option<Texture>,
+    pub samples: u32,
 }
 
 #[repr(C)]
@@ -39,6 +48,18 @@ pub struct SsrPipelines {
 
 impl SsrPipelines {
     pub fn new(device: &Device, format: TextureFormat) -> Self {
+        Self::new_with_depth_samples(device, format, 1)
+    }
+
+    /// `depth_samples` must match the scene target's depth texture.
+    ///
+    /// It exists because wgpu can resolve a colour attachment and cannot
+    /// resolve a depth one: multisampling the scene pass leaves the depth
+    /// multisampled, and every shader that reads it has to say so -- in the
+    /// bind group layout AND in the WGSL type. A mismatch here fails pipeline
+    /// creation rather than rendering wrongly, which is the good outcome.
+    pub fn new_with_depth_samples(device: &Device, format: TextureFormat, depth_samples: u32) -> Self {
+        let ms_depth = depth_samples > 1;
         let scene_texture_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("ssr_scene_texture_bgl"),
             entries: &[
@@ -58,7 +79,7 @@ impl SsrPipelines {
                     ty: BindingType::Texture {
                         sample_type: TextureSampleType::Depth,
                         view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
+                        multisampled: ms_depth,
                     },
                     count: None,
                 },
@@ -91,7 +112,7 @@ impl SsrPipelines {
 
         let blit_shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("ssr_blit_shader"),
-            source: ShaderSource::Wgsl(blit_shader().into()),
+            source: ShaderSource::Wgsl(blit_shader(ms_depth).into()),
         });
         let blit_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("ssr_blit_layout"),
@@ -145,6 +166,23 @@ impl SsrPipelines {
     }
 
     pub fn create_scene_target(&self, device: &Device, format: TextureFormat, width: u32, height: u32) -> SceneTarget {
+        self.create_scene_target_multisampled(device, format, width, height, 1)
+    }
+
+    /// The scene target, optionally multisampled.
+    ///
+    /// Colour exists twice when `samples > 1`: the multisampled attachment the
+    /// pass draws into, and the resolved single-sampled texture everything
+    /// downstream reads. Depth exists once, at the pass's sample count, because
+    /// wgpu can resolve colour and cannot resolve depth -- and SSR reads it.
+    pub fn create_scene_target_multisampled(
+        &self,
+        device: &Device,
+        format: TextureFormat,
+        width: u32,
+        height: u32,
+        samples: u32,
+    ) -> SceneTarget {
         let color_texture = device.create_texture(&TextureDescriptor {
             label: Some("ssr_scene_color"),
             size: Extent3d { width, height, depth_or_array_layers: 1 },
@@ -161,7 +199,7 @@ impl SsrPipelines {
             label: Some("ssr_scene_depth"),
             size: Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: samples,
             dimension: TextureDimension::D2,
             format: TextureFormat::Depth32Float,
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
@@ -178,12 +216,33 @@ impl SsrPipelines {
             ],
         });
 
+        let msaa_color_texture = (samples > 1).then(|| {
+            device.create_texture(&TextureDescriptor {
+                label: Some("ssr_scene_color_msaa"),
+                size: Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: TextureDimension::D2,
+                format,
+                // NO texture binding: nothing samples it, which is what lets a
+                // tile GPU keep it on chip and never write it out.
+                usage: TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+        });
+        let msaa_color_view = msaa_color_texture
+            .as_ref()
+            .map(|t| t.create_view(&TextureViewDescriptor::default()));
+
         SceneTarget {
             _color_texture: color_texture,
             color_view,
             _depth_texture: depth_texture,
             depth_view,
             bind_group,
+            msaa_color_view,
+            _msaa_color_texture: msaa_color_texture,
+            samples,
         }
     }
 
@@ -215,39 +274,60 @@ impl SsrPipelines {
     }
 }
 
-fn blit_shader() -> String {
-    r#"
+/// The blit that copies the resolved scene into the eye buffer.
+///
+/// It also writes `frag_depth` from the scene's depth, so the reflective solids
+/// and the mirror quad drawn after it in the same pass depth-test against the
+/// world. That read is the only reason a multisampled scene pass has to STORE
+/// its depth rather than discard it -- see `XrRenderer`'s note on the cost.
+///
+/// Sample 0 of the multisampled depth, not an average: depth is not a quantity
+/// you average. Averaging across a silhouette would place the composited
+/// geometry at a distance where nothing is.
+fn blit_shader(ms_depth: bool) -> String {
+    let depth_ty = if ms_depth {
+        "texture_depth_multisampled_2d"
+    } else {
+        "texture_depth_2d"
+    };
+    format!(
+        r#"
 @group(0) @binding(0) var scene_color: texture_2d<f32>;
-@group(0) @binding(1) var scene_depth: texture_depth_2d;
+@group(0) @binding(1) var scene_depth: {depth_ty};
 
 @vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {{
     var pos = array<vec2<f32>, 3>(
         vec2<f32>(-1.0, -1.0),
         vec2<f32>(3.0, -1.0),
         vec2<f32>(-1.0, 3.0),
     );
     return vec4<f32>(pos[vi], 0.0, 1.0);
-}
+}}
 
-struct FOut {
+struct FOut {{
     @location(0) color: vec4<f32>,
     @builtin(frag_depth) depth: f32,
-}
+}}
 
 @fragment
-fn fs_main(@builtin(position) coord: vec4<f32>) -> FOut {
+fn fs_main(@builtin(position) coord: vec4<f32>) -> FOut {{
     let px = vec2<i32>(coord.xy);
     var out: FOut;
     out.color = textureLoad(scene_color, px, 0);
     out.depth = textureLoad(scene_depth, px, 0);
     return out;
-}
+}}
 "#
-    .to_string()
+    )
 }
 
-pub fn wgsl_ssr_block(camera_group: u32, scene_group: u32) -> String {
+pub fn wgsl_ssr_block(camera_group: u32, scene_group: u32, ms_depth: bool) -> String {
+    let depth_ty = if ms_depth {
+        "texture_depth_multisampled_2d"
+    } else {
+        "texture_depth_2d"
+    };
     format!(
         r#"
 struct SsrCamera {{
@@ -257,7 +337,7 @@ struct SsrCamera {{
 @group({camera_group}) @binding(0) var<uniform> ssr_camera: SsrCamera;
 
 @group({scene_group}) @binding(0) var ssr_scene_color: texture_2d<f32>;
-@group({scene_group}) @binding(1) var ssr_scene_depth: texture_depth_2d;
+@group({scene_group}) @binding(1) var ssr_scene_depth: {depth_ty};
 
 const SSR_STEPS: u32 = 20u;
 const SSR_STEP_SIZE: f32 = 0.12;
