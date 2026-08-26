@@ -309,6 +309,11 @@ impl XrRenderer {
             (vb, ib, idx.len() as u32)
         });
 
+        // The sky's ambient, projected when the scene was loaded rather than
+        // now -- see XrRenderer::set_sky.
+        let sky_upload =
+            crate::renderer::uniforms::SkyUpload::from(&self.sky.irradiance);
+
         // SHADOWS: once per frame, not once per eye.
         //
         // A shadow map is built in the LIGHT's space, so it is identical for
@@ -426,8 +431,9 @@ impl XrRenderer {
                 // The reflected eye, so specular highlights land where the
                 // reflection says they should rather than where the real eye is.
                 let mirror_eye = mirror_view.inverse().transform_point3(glam::Vec3::ZERO);
-                self.uniform_buf
-                    .upload(&self.wgpu_queue, mirror_view_proj, mirror_eye, &shadow);
+                self.uniform_buf.upload_with_sky(
+                    &self.wgpu_queue, mirror_view_proj, mirror_eye, &shadow, &sky_upload,
+                );
                 self.mirror_reflected_vp_uniform.upload(&self.wgpu_queue, mirror_view_proj);
 
                 let mut encoder = self.wgpu_device.create_command_encoder(
@@ -532,14 +538,26 @@ impl XrRenderer {
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
                     }
+                    // The sky in the reflection too. A mirror showing a black
+                    // void where the sky is looks worse than no mirror, and the
+                    // ray is reconstructed from whatever view_proj was uploaded
+                    // -- which for this pass is the reflected one, so it needs
+                    // no special case beyond the 1x pipeline.
+                    {
+                        pass.set_pipeline(&self.sky_mirror_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.sky.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
                 }
                 self.wgpu_queue.submit(Some(encoder.finish()));
             }
 
             let eye_view_proj = Camera::gl_to_wgpu_ndc(proj) * view;
             let cam_pos = glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
-            self.uniform_buf
-                .upload(&self.wgpu_queue, eye_view_proj, cam_pos, &shadow);
+            self.uniform_buf.upload_with_sky(
+                &self.wgpu_queue, eye_view_proj, cam_pos, &shadow, &sky_upload,
+            );
             self.ssr_camera_uniform.upload(&self.wgpu_queue, eye_view_proj, cam_pos);
 
             {
@@ -683,6 +701,20 @@ impl XrRenderer {
                             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
+                    }
+                    // THE SKY, after every opaque and before anything blended.
+                    //
+                    // It sits at the far plane and writes no depth, so early-Z
+                    // rejects every pixel the level already covered -- drawing
+                    // it first would shade all of them and throw the work away,
+                    // which on a fill-limited tile GPU is the whole cost of the
+                    // pass for nothing. Before the particles because those are
+                    // blended and have to land on top of it.
+                    {
+                        pass.set_pipeline(&self.sky_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.sky.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
                     }
                     if !particle_verts.is_empty() {
                         pass.set_pipeline(&self.particle_pipeline.pipeline);

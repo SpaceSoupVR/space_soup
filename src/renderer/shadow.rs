@@ -519,7 +519,7 @@ mod render_tests {
     use crate::renderer::cuboid::SolidVertex;
     use crate::renderer::lights::{Light, LightKind, LightsUniform};
     use crate::renderer::pipeline::{lightmap_bind_group_layout, SolidPipeline};
-    use crate::renderer::uniforms::{ShadowUpload, UniformBuffer};
+    use crate::renderer::uniforms::{ShadowUpload, SkyUpload, UniformBuffer};
     use crate::renderer::Color3;
     use wgpu::util::DeviceExt;
 
@@ -580,6 +580,14 @@ mod render_tests {
         /// reason with a very convincing-looking number.
         eye_offset: glam::Vec3,
         shadows_on: bool,
+        /// The receiving quad's surface normal.
+        ///
+        /// Fixed pointing up until the sky arrived. The sky's ambient depends on
+        /// which way a surface faces -- that being the whole difference between
+        /// nine coefficients and one -- so it has to be a variable now.
+        normal: [f32; 3],
+        /// The sky's ambient. Defaults to the flat term the engine always had.
+        sky: SkyUpload,
     }
 
     /// Renders a lit quad filling the view and returns its centre pixel.
@@ -618,11 +626,12 @@ mod render_tests {
         // WORLD position -- which is what the shadow lookup and the lights use
         // -- rides on the model translation the view_proj cancels out.
         let world = scene.receiver_at;
-        uniforms.upload(
+        uniforms.upload_with_sky(
             &queue,
             glam::Mat4::from_translation(-world),
             world + scene.eye_offset,
             &upload,
+            &scene.sky,
         );
 
         let pipeline = SolidPipeline::new(&device, format, &uniforms.layout);
@@ -635,7 +644,7 @@ mod render_tests {
             1,
         );
 
-        let n = [0.0, 1.0, 0.0];
+        let n = scene.normal;
         // z = 0 so the quad's world position is exactly `receiver_at`, for the
         // same reason SIZE is odd.
         let quad: Vec<SolidVertex> = [
@@ -801,6 +810,8 @@ mod render_tests {
             receiver_at: Vec3::ZERO,
             eye_offset: Vec3::new(0.0, 5.0, 0.0),
             shadows_on: true,
+            normal: [0.0, 1.0, 0.0],
+            sky: SkyUpload::none(),
         }
     }
 
@@ -941,6 +952,124 @@ mod render_tests {
                  predicts {expected:.4}",
             );
         }
+    }
+
+    #[test]
+    fn the_skys_ambient_follows_the_surface_normal() {
+        // WHAT NINE COEFFICIENTS BUY OVER ONE. The old ambient was a constant:
+        // every surface received the same grey whichever way it faced, which is
+        // why an unlit blockout reads as flat. A sky bright on one side must now
+        // light the surfaces facing it more than those facing away, with no
+        // light in the scene at all.
+        let bright_half = {
+            let mut pano = crate::renderer::sky::Panorama::solid([0.0, 0.0, 0.0], 64, 32);
+            for y in 0..32 {
+                for x in 0..32 {
+                    let i = ((y * 64 + x) * 3) as usize;
+                    pano.rgb[i] = 3.0;
+                    pano.rgb[i + 1] = 3.0;
+                    pano.rgb[i + 2] = 3.0;
+                }
+            }
+            SkyUpload::from(&crate::renderer::sky::project_irradiance(&pano, 0.0, 1.0))
+        };
+
+        let toward = shot!(Scene {
+            lights: vec![],
+            normal: [-1.0, 0.0, 0.0],
+            sky: bright_half.clone(),
+            ..base()
+        });
+        let away = shot!(Scene {
+            lights: vec![],
+            normal: [1.0, 0.0, 0.0],
+            sky: bright_half,
+            ..base()
+        });
+        assert!(
+            toward[0] as i32 - away[0] as i32 > 20,
+            "the ambient did not follow the normal: facing the bright half gave \
+             {toward:?}, facing away gave {away:?}",
+        );
+    }
+
+    #[test]
+    fn the_shader_evaluates_the_same_irradiance_the_cpu_does() {
+        // THE CROSS-IMPLEMENTATION PIN, and the reason it exists: the
+        // coefficients are projected in Rust and evaluated in WGSL, and those
+        // are two separate transcriptions of the same nine constants. Every
+        // other test here predicts the shader's output using the Rust side, so
+        // if the two drift, they all keep passing and the headset renders
+        // something else.
+        //
+        // Deliberately breaking the shader's l=1 band from 2/3 to 1.0 changed
+        // nothing in this file until this test existed -- the directional test
+        // below only asks which side is brighter, which a scaled band survives.
+        let pano = {
+            let mut p = crate::renderer::sky::Panorama::solid([0.05, 0.05, 0.05], 64, 32);
+            // A bright quadrant, so bands 1 and 2 both carry real weight rather
+            // than the constant term dominating and hiding a drift in them.
+            for y in 4..20 {
+                for x in 8..28 {
+                    let i = ((y * 64 + x) * 3) as usize;
+                    p.rgb[i] = 0.9;
+                    p.rgb[i + 1] = 0.7;
+                    p.rgb[i + 2] = 0.4;
+                }
+            }
+            p
+        };
+        let irr = crate::renderer::sky::project_irradiance(&pano, 0.0, 1.0);
+        let sky = SkyUpload::from(&irr);
+
+        for normal in [
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.5, 0.5, -0.7],
+        ] {
+            let px = shot!(Scene {
+                lights: vec![],
+                normal,
+                sky: sky.clone(),
+                ..base()
+            });
+            let want = irr.evaluate(normal);
+            for c in 0..3 {
+                // The target is linear Rgba8Unorm, so the byte IS the value.
+                let got = px[c] as f32 / 255.0;
+                assert!(
+                    (got - want[c]).abs() < 0.012,
+                    "normal {normal:?} channel {c}: the shader rendered {got:.4} \
+                     and the CPU predicts {:.4}",
+                    want[c],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_scene_with_no_sky_is_lit_exactly_as_before() {
+        // The compatibility claim, at the pixel. `SkyUpload::none()` has to
+        // evaluate to the old flat constant in every direction, or adding this
+        // feature silently re-lights every level that does not use one.
+        let up = shot!(Scene { lights: vec![], normal: [0.0, 1.0, 0.0], ..base() });
+        let side = shot!(Scene { lights: vec![], normal: [1.0, 0.0, 0.0], ..base() });
+        let down = shot!(Scene { lights: vec![], normal: [0.0, -1.0, 0.0], ..base() });
+        for (a, b) in [(up, side), (up, down)] {
+            for c in 0..3 {
+                assert!(
+                    (a[c] as i32 - b[c] as i32).abs() <= 1,
+                    "flat ambient is no longer flat: {a:?} vs {b:?}",
+                );
+            }
+        }
+        let ambient = (crate::renderer::sky::AMBIENT * 255.0).round() as i32;
+        assert!(
+            (up[0] as i32 - ambient).abs() <= 2,
+            "ambient came out {} rather than {ambient}",
+            up[0],
+        );
     }
 
     #[test]
