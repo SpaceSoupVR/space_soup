@@ -8,6 +8,11 @@ use super::lights::LightsUniform;
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct Uniforms {
     pub view_proj: [[f32; 4]; 4],
+    /// The inverse, so the sky pass can turn a pixel back into a view ray.
+    ///
+    /// Inverted on the CPU once per eye rather than in the shader: a 4x4
+    /// inverse per fragment is absurd, and the sky is a full-screen pass.
+    pub inv_view_proj: [[f32; 4]; 4],
     /// Sun (directional) light-space view-projection, for the sun shadow map.
     pub sun_view_proj: [[f32; 4]; 4],
     /// Spot/flashlight light-space view-projection, for the spot shadow map.
@@ -17,6 +22,41 @@ pub struct Uniforms {
     /// x = sun shadow enabled (1/0), y = spot shadow enabled (1/0),
     /// z = flashlight light index (as f32, valid when y > 0.5), w reserved.
     pub shadow_params: [f32; 4],
+    /// x = sky intensity. yzw reserved.
+    pub sky_params: [f32; 4],
+    /// Nine RGB spherical-harmonic coefficients of the sky's irradiance.
+    ///
+    /// `vec4` per coefficient because std140 rounds an array element up to 16
+    /// bytes anyway -- packing them as vec3 would be the same size and would
+    /// need the shader to index a padded array by hand.
+    ///
+    /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`:
+    /// bytemuck checks size and alignment, not names, and a mismatch surfaces
+    /// as `invalid field accessor` pointing at the WGSL line that reads it.
+    pub sky_sh: [[f32; 4]; 9],
+}
+
+/// Per-frame sky inputs.
+#[derive(Clone)]
+pub struct SkyUpload {
+    pub intensity: f32,
+    pub sh: [[f32; 4]; 9],
+}
+
+impl SkyUpload {
+    /// A scene with no sky: the flat ambient the engine always had, expressed
+    /// as a constant-band SH so there is one lighting path rather than a branch.
+    pub fn none() -> Self {
+        Self::from(&crate::renderer::sky::SkyIrradiance::flat(crate::renderer::sky::AMBIENT))
+    }
+
+    pub fn from(irr: &crate::renderer::sky::SkyIrradiance) -> Self {
+        let mut sh = [[0.0f32; 4]; 9];
+        for i in 0..9 {
+            sh[i] = [irr.sh[i][0], irr.sh[i][1], irr.sh[i][2], 0.0];
+        }
+        Self { intensity: 1.0, sh }
+    }
 }
 
 /// Per-frame shadow inputs, bundled to keep `upload` call sites readable.
@@ -157,8 +197,20 @@ impl UniformBuffer {
     }
 
     pub fn upload(&self, queue: &Queue, view_proj: Mat4, camera_pos: Vec3, shadow: &ShadowUpload) {
+        self.upload_with_sky(queue, view_proj, camera_pos, shadow, &SkyUpload::none());
+    }
+
+    pub fn upload_with_sky(
+        &self,
+        queue: &Queue,
+        view_proj: Mat4,
+        camera_pos: Vec3,
+        shadow: &ShadowUpload,
+        sky: &SkyUpload,
+    ) {
         let u = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             sun_view_proj: shadow.sun_view_proj.to_cols_array_2d(),
             spot_view_proj: shadow.spot_view_proj.to_cols_array_2d(),
             camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 1.0],
@@ -168,6 +220,8 @@ impl UniformBuffer {
                 shadow.flashlight_index as f32,
                 0.0,
             ],
+            sky_params: [sky.intensity, 0.0, 0.0, 0.0],
+            sky_sh: sky.sh,
         };
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&u));
     }

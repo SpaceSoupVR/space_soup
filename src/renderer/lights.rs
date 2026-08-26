@@ -131,11 +131,16 @@ pub fn wgsl_lights_block(group_index: u32, binding_index: u32) -> String {
         r#"
 struct Camera {{
     view_proj: mat4x4<f32>,
+    inv_view_proj: mat4x4<f32>,
     sun_view_proj: mat4x4<f32>,
     spot_view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,
     // x = sun shadow on, y = spot shadow on, z = which light is the flashlight.
     shadow_params: vec4<f32>,
+    // x = sky intensity.
+    sky_params: vec4<f32>,
+    // Nine RGB irradiance coefficients. Must match `uniforms::Uniforms`.
+    sky_sh: array<vec4<f32>, 9>,
 }}
 @group({group_index}) @binding(0) var<uniform> camera: Camera;
 
@@ -155,6 +160,49 @@ struct Lights {{
 @group({group_index}) @binding({spot_tex}) var spot_shadow_tex: texture_depth_2d;
 
 const AMBIENT: f32 = 0.6;
+
+// Where a world direction lands in the sky panorama. Pinned to the editor's
+// mapping by measurement -- see sky.rs.
+fn sky_uv(d: vec3<f32>) -> vec2<f32> {{
+    let n = normalize(d);
+    let u = (atan2(n.x, n.z) + 3.14159265) / 6.28318531;
+    let v = acos(clamp(n.y, -1.0, 1.0)) / 3.14159265;
+    return vec2<f32>(u, v);
+}}
+
+// Ambient from the sky, in the direction the surface faces.
+//
+// The same arithmetic as `SkyIrradiance::evaluate` in sky.rs, which is what
+// lets the projection be tested without a GPU and the shader be trusted to
+// agree with it. A scene with no sky uploads a constant-band SH that evaluates
+// to exactly AMBIENT everywhere, so this replaces the old flat term without
+// changing what a level without a sky looks like.
+fn sky_irradiance(n: vec3<f32>) -> vec3<f32> {{
+    let x = n.x; let y = n.y; let z = n.z;
+    var b = array<f32, 9>(
+        0.282095,
+        0.488603 * y,
+        0.488603 * z,
+        0.488603 * x,
+        1.092548 * x * y,
+        1.092548 * y * z,
+        0.315392 * (3.0 * z * z - 1.0),
+        1.092548 * x * z,
+        0.546274 * (x * x - y * y),
+    );
+    // The cosine lobe's coefficients, already divided by pi -- see
+    // SkyIrradiance::evaluate in sky.rs, which this mirrors exactly.
+    var a = array<f32, 9>(
+        1.0,
+        0.6666667, 0.6666667, 0.6666667,
+        0.25, 0.25, 0.25, 0.25, 0.25,
+    );
+    var e = vec3<f32>(0.0);
+    for (var i: i32 = 0; i < 9; i = i + 1) {{
+        e = e + camera.sky_sh[i].rgb * b[i] * a[i];
+    }}
+    return max(e, vec3<f32>(0.0));
+}}
 const SPEC_STRENGTH: f32 = 0.35;
 const SHININESS: f32 = 32.0;
 
@@ -240,7 +288,7 @@ fn light_contribution(l: Light, world_pos: vec3<f32>, n: vec3<f32>, view_dir: ve
 fn shade(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
     let view_dir = normalize(camera.camera_pos.xyz - world_pos);
     let flash_idx = u32(camera.shadow_params.z);
-    var lit = vec3<f32>(AMBIENT, AMBIENT, AMBIENT);
+    var lit = sky_irradiance(n);
     for (var i: u32 = 0u; i < lights.count.x; i = i + 1u) {{
         let l = lights.lights[i];
         var c = light_contribution(l, world_pos, n, view_dir);

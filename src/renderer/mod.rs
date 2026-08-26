@@ -13,6 +13,7 @@ pub mod panel;
 pub mod particle;
 pub mod pipeline;
 pub mod shadow;
+pub mod sky;
 pub mod ssr;
 pub mod terrain_pipeline;
 pub mod uniforms;

@@ -106,6 +106,10 @@ pub struct XrRenderer {
     // material bind group -- see layered_mesh_pipeline for why that is the
     // point rather than a shortcut.
     shadow_map: crate::renderer::shadow::ShadowMap,
+    /// The panorama behind the level, and the ambient inside it.
+    sky_pipeline: crate::renderer::sky::SkyPipeline,
+    sky_mirror_pipeline: crate::renderer::sky::SkyPipeline,
+    sky: crate::renderer::sky::Sky,
     /// How much shadow work this headset does per frame. See `ShadowQuality`.
     pub shadow_quality: ShadowQuality,
     /// Fixed at construction, because every pipeline is built against it.
@@ -306,6 +310,24 @@ impl XrRenderer {
         let terrain_material = crate::renderer::terrain_pipeline::TerrainMaterial::fallback(
             &wgpu_device, &wgpu_queue, &terrain_pipeline.material_layout,
         );
+        let sky_pipeline = crate::renderer::sky::SkyPipeline::new(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, samples,
+        );
+        // The mirror pass renders into a single-sampled target.
+        let sky_mirror_pipeline = crate::renderer::sky::SkyPipeline::new(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, 1,
+        );
+        // No sky until a scene names one. Always BOUND, like terrain's
+        // placeholder layers -- an optional binding would mean two layouts and
+        // therefore two pipelines, and this is one texel plus a constant-band
+        // SH that evaluates to exactly the ambient the engine always had.
+        let sky = crate::renderer::sky::Sky::none(
+            &wgpu_device,
+            &wgpu_queue,
+            &sky_pipeline.layout,
+            crate::renderer::sky::AMBIENT,
+        );
+
         let layered_mesh_pipeline =
             crate::renderer::layered_mesh_pipeline::LayeredMeshPipeline::new_multisampled(
                 &wgpu_device,
@@ -428,6 +450,9 @@ impl XrRenderer {
             brush_materials,
             terrain_pipeline,
             shadow_map,
+            sky_pipeline,
+            sky_mirror_pipeline,
+            sky,
             shadow_quality: ShadowQuality::SunOnly,
             msaa,
             skinned_mesh_mirror_pipeline,
@@ -531,6 +556,36 @@ impl XrRenderer {
     /// the map's resolution is per-scene, so a scene change can need a
     /// different texture entirely, and rebuilding once per scene load is not
     /// worth the branch to avoid.
+    /// Replace the scene's sky, or clear it.
+    ///
+    /// Projecting the irradiance walks every texel of the panorama, so this is
+    /// a scene-change operation and emphatically not a per-frame one. At 1024 x
+    /// 512 that is half a million texels times nine basis functions -- tens of
+    /// milliseconds, which is fine once and impossible sixty times a second.
+    pub fn set_sky(
+        &mut self,
+        pano: Option<&crate::renderer::sky::Panorama>,
+        rotation_deg: f32,
+        intensity: f32,
+    ) {
+        self.sky = match pano {
+            Some(p) => crate::renderer::sky::Sky::new(
+                &self.wgpu_device,
+                &self.wgpu_queue,
+                &self.sky_pipeline.layout,
+                p,
+                rotation_deg,
+                intensity,
+            ),
+            None => crate::renderer::sky::Sky::none(
+                &self.wgpu_device,
+                &self.wgpu_queue,
+                &self.sky_pipeline.layout,
+                crate::renderer::sky::AMBIENT,
+            ),
+        };
+    }
+
     pub fn set_terrain_splat(
         &mut self,
         splat: Option<&crate::renderer::terrain_pipeline::TerrainImage>,
