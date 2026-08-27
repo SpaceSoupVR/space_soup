@@ -147,6 +147,9 @@ pub struct XrRenderer {
     lights_uniform: LightsUniform,
     depth_view: wgpu::TextureView,
     eye_targets: Vec<[EyeTarget; 2]>,
+    default_brush_lightmap: LoadedTexture,
+    /// The level's brushes share ONE atlas, because they share one draw call.
+    brush_lightmap: Option<LoadedTexture>,
     cuboid_lightmaps: HashMap<String, LoadedTexture>,
     default_cuboid_lightmap: LoadedTexture,
     mesh_lightmaps: HashMap<String, LoadedTexture>,
@@ -429,6 +432,14 @@ impl XrRenderer {
             1,
             1,
         );
+        // Brushes add their lightmap rather than multiplying it, so their
+        // neutral value is BLACK where a mesh's is white. Binding the wrong one
+        // is a full stop of extra brightness on every unbaked brush.
+        let default_brush_lightmap = crate::renderer::brush_pipeline::default_brush_lightmap(
+            &wgpu_device,
+            &wgpu_queue,
+            &brush_pipeline.lightmap_layout,
+        );
         let default_mesh_lightmap = create_texture_from_rgba(
             &wgpu_device,
             &wgpu_queue,
@@ -481,6 +492,8 @@ impl XrRenderer {
             lights_uniform,
             depth_view,
             eye_targets,
+            default_brush_lightmap,
+            brush_lightmap: None,
             cuboid_lightmaps: HashMap::new(),
             default_cuboid_lightmap,
             mesh_lightmaps: HashMap::new(),
@@ -499,6 +512,25 @@ impl XrRenderer {
             height,
         );
         self.cuboid_lightmaps.insert(key.to_string(), tex);
+    }
+
+    /// Install the level-wide baked lighting for brushes.
+    pub fn set_brush_lightmap(&mut self, rgba: &[u8], width: u32, height: u32) {
+        self.brush_lightmap = Some(create_texture_from_rgba(
+            &self.wgpu_device,
+            &self.wgpu_queue,
+            &self.brush_pipeline.lightmap_layout,
+            rgba,
+            width,
+            height,
+        ));
+    }
+
+    fn brush_lightmap_bg(&self) -> &wgpu::BindGroup {
+        self.brush_lightmap
+            .as_ref()
+            .map(|t| &t.bind_group)
+            .unwrap_or(&self.default_brush_lightmap.bind_group)
     }
 
     pub fn set_mesh_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
