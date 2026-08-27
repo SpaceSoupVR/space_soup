@@ -48,11 +48,19 @@ pub struct BrushVertex {
     /// which is the whole appearance for a face whose material is missing or
     /// unassigned -- that case binds a white layer, so the tint is all there is.
     pub tint: [f32; 4],
+    /// Lightmap coordinate, 0..1 over this brush object's own baked atlas.
+    ///
+    /// A SECOND uv set. `uv` above is in tiles and deliberately shared between
+    /// faces so brickwork lines up across a corner; lighting needs one unshared
+    /// patch per face, or two walls sample each other's shadows. The layout is
+    /// decided by space_soup_engine::brush_lightmap, which the baker uses too.
+    pub uv2: [f32; 2],
 }
 
 impl BrushVertex {
-    pub const ATTRIBS: [VertexAttribute; 6] = vertex_attr_array![
-        0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Uint32, 5 => Float32x4
+    pub const ATTRIBS: [VertexAttribute; 7] = vertex_attr_array![
+        0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Uint32, 5 => Float32x4,
+        6 => Float32x2
     ];
 
     pub fn layout() -> VertexBufferLayout<'static> {
@@ -75,6 +83,24 @@ pub const MAX_BRUSH_MATERIALS: usize = 24;
 pub struct BrushPipeline {
     pub pipeline: RenderPipeline,
     pub material_layout: BindGroupLayout,
+    /// Layout for group 2, a brush object's baked lighting.
+    pub lightmap_layout: BindGroupLayout,
+}
+
+/// The neutral lightmap for a brush that has not been baked.
+///
+/// BLACK, and that is not a detail. A brush lightmap is ADDED to the shaded
+/// result rather than multiplied into it, so zero is the value that changes
+/// nothing -- the way white is for the mesh pipeline, which multiplies. Binding
+/// the wrong neutral is a full stop of extra brightness on every surface of
+/// every unbaked brush, which looks like a broken shader rather than a wrong
+/// constant.
+pub fn default_brush_lightmap(
+    device: &Device,
+    queue: &Queue,
+    layout: &BindGroupLayout,
+) -> crate::renderer::mesh::LoadedTexture {
+    crate::renderer::mesh::create_texture_from_rgba(device, queue, layout, &[0u8, 0, 0, 255], 1, 1)
 }
 
 /// Colour and normal maps for every material a scene's brushes use.
@@ -315,9 +341,12 @@ impl BrushPipeline {
             source: ShaderSource::Wgsl(brush_shader().into()),
         });
         let material_layout = brush_material_bind_group_layout(device);
+        // Shared with the mesh and cuboid pipelines: a lightmap is a lightmap,
+        // and three layouts that must stay identical is three chances to drift.
+        let lightmap_layout = super::pipeline::lightmap_bind_group_layout(device);
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("brush_layout"),
-            bind_group_layouts: &[uniform_layout, &material_layout],
+            bind_group_layouts: &[uniform_layout, &material_layout, &lightmap_layout],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -357,7 +386,7 @@ impl BrushPipeline {
             multiview: None,
             cache: None,
         });
-        Self { pipeline, material_layout }
+        Self { pipeline, material_layout, lightmap_layout }
     }
 }
 
@@ -367,6 +396,9 @@ fn brush_shader() -> String {
 // Group 0 -- the camera, the lights and both shadow maps -- is declared by
 // `wgsl_lights_block` below, so there is one description of that layout rather
 // than one per shader.
+
+@group(2) @binding(0) var lm_tex: texture_2d<f32>;
+@group(2) @binding(1) var lm_samp: sampler;
 
 @group(1) @binding(0) var mat_color: texture_2d_array<f32>;
 @group(1) @binding(1) var mat_normal: texture_2d_array<f32>;
@@ -381,6 +413,7 @@ struct VIn {{
     @location(3) uv: vec2<f32>,
     @location(4) material: u32,
     @location(5) tint: vec4<f32>,
+    @location(6) uv2: vec2<f32>,
 }}
 struct VOut {{
     @builtin(position) clip: vec4<f32>,
@@ -392,6 +425,7 @@ struct VOut {{
     // across a triangle that spans two materials would sample layer 1.5.
     @location(4) @interpolate(flat) material: u32,
     @location(5) tint: vec4<f32>,
+    @location(6) uv2: vec2<f32>,
 }}
 
 @vertex fn vs_main(v: VIn) -> VOut {{
@@ -401,6 +435,7 @@ struct VOut {{
     out.tangent   = v.tangent;
     out.world_pos = v.pos;
     out.uv        = v.uv;
+    out.uv2       = v.uv2;
     out.material  = v.material;
     out.tint      = v.tint;
     return out;
@@ -417,7 +452,24 @@ struct VOut {{
     let tn = textureSample(mat_normal, mat_samp, in.uv, i32(in.material)).xyz * 2.0 - 1.0;
     let n = normalize(t * tn.x + b * tn.y + n_geom * tn.z);
 
-    let lit = shade(in.world_pos, n);
+    // ADDED, not multiplied.
+    //
+    // The mesh pipeline multiplies its lightmap in, and multiplying cannot ADD
+    // light: a wall the lamp never reaches directly sits at the ambient floor
+    // and no amount of bounce can lift it, which is most of a real interior.
+    // Bounced light is light and belongs in the sum.
+    //
+    // Adding is only correct because a light is either baked or realtime and
+    // never both -- see LightMode. `shade` sees only the realtime ones, the
+    // texture carries only the baked ones, and the ambient term belongs solely
+    // to `shade`, which varies it by the direction the surface faces.
+    //
+    // An unbaked brush binds a BLACK texture, so this collapses to exactly the
+    // old behaviour. Black is the neutral value for a sum the way white is for
+    // a product, and binding the wrong one is a full stop of extra brightness
+    // on every surface.
+    let baked = textureSample(lm_tex, lm_samp, in.uv2).rgb;
+    let lit = shade(in.world_pos, n) + baked;
     let c = albedo.rgb * in.tint.rgb * lit;
     return vec4<f32>(c, albedo.a * in.tint.a);
 }}
@@ -514,6 +566,10 @@ mod tests {
             uv,
             material,
             tint,
+            // These tests are about the MATERIAL path, so every vertex samples
+            // the same lightmap texel and the harness binds a black one --
+            // additively neutral, so it changes none of their measurements.
+            uv2: [0.5, 0.5],
         };
         let verts = [
             v([-1.0, -1.0, 0.0], [0.0, 0.0]),
@@ -565,6 +621,8 @@ mod tests {
 
         let mut encoder = device.create_command_encoder(&Default::default());
         {
+        let lightmap = default_brush_lightmap(&device, &queue, &pipeline.lightmap_layout);
+
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("brush_test_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
@@ -583,6 +641,9 @@ mod tests {
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &uniforms.bind_group, &[]);
             pass.set_bind_group(1, &materials.bind_group, &[]);
+            // Black: additively neutral, so these material tests measure the
+            // material path and nothing else.
+            pass.set_bind_group(2, &lightmap.bind_group, &[]);
             pass.set_vertex_buffer(0, vb.slice(..));
             pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
             pass.draw_indexed(0..3, 0, 0..1);
