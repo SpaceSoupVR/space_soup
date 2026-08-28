@@ -38,7 +38,12 @@ struct GpuLight {
     position: [f32; 4],
     direction: [f32; 4],
     color_intensity: [f32; 4],
-    /// x = range, y = cos(outer half-angle), z = kind (0 = point, 1 = spot), w unused.
+    /// x = range, y = cos(outer half-angle), z = kind (0 = point, 1 = spot),
+    /// w = which spot shadow layer this light casts into, or -1 for none.
+    ///
+    /// On the LIGHT rather than in the camera uniform, because it is a property
+    /// of the light. The camera used to carry a single "flashlight index",
+    /// which by construction could only ever name one shadow-casting spot.
     params: [f32; 4],
 }
 
@@ -76,6 +81,21 @@ impl LightsUniform {
     }
 
     pub fn upload(&self, queue: &Queue, lights: &[Light]) {
+        self.upload_with_shadow_layers(queue, lights, &[]);
+    }
+
+    /// The same, telling each light which spot shadow layer it casts into.
+    ///
+    /// `spot_layers` lists light indices in layer order: the light at
+    /// `spot_layers[0]` uses layer 0, and so on. A light not in the list gets
+    /// -1 and is shaded unshadowed -- the honest failure for a level with more
+    /// lamps than the shadow budget, since it still lights the room.
+    pub fn upload_with_shadow_layers(
+        &self,
+        queue: &Queue,
+        lights: &[Light],
+        spot_layers: &[usize],
+    ) {
         let mut gpu = GpuLights {
             count: [lights.len().min(MAX_LIGHTS) as u32, 0, 0, 0],
             lights: [GpuLight::zeroed(); MAX_LIGHTS],
@@ -94,8 +114,13 @@ impl LightsUniform {
                 position: [l.position.x, l.position.y, l.position.z, 0.0],
                 direction: [l.direction.x, l.direction.y, l.direction.z, 0.0],
                 color_intensity: [color[0], color[1], color[2], l.intensity],
-                params: [l.range, cos_outer, kind, 0.0],
+                params: [l.range, cos_outer, kind, -1.0],
             };
+        }
+        for (layer, &light_index) in spot_layers.iter().enumerate() {
+            if let Some(slot) = gpu.lights.get_mut(light_index) {
+                slot.params[3] = layer as f32;
+            }
         }
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&gpu));
     }
@@ -127,13 +152,14 @@ pub fn wgsl_lights_block(group_index: u32, binding_index: u32) -> String {
     let shadow_tex = binding_index + 1;
     let shadow_samp = binding_index + 2;
     let spot_tex = binding_index + 3;
+    let max_spot_shadows = super::shadow::MAX_SPOT_SHADOWS;
     format!(
         r#"
 struct Camera {{
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     sun_view_proj: mat4x4<f32>,
-    spot_view_proj: mat4x4<f32>,
+    spot_view_proj: array<mat4x4<f32>, {max_spot_shadows}>,
     camera_pos: vec4<f32>,
     // x = sun shadow on, y = spot shadow on, z = which light is the flashlight.
     shadow_params: vec4<f32>,
@@ -157,7 +183,10 @@ struct Lights {{
 @group({group_index}) @binding({binding_index}) var<uniform> lights: Lights;
 @group({group_index}) @binding({shadow_tex}) var sun_shadow_tex: texture_depth_2d;
 @group({group_index}) @binding({shadow_samp}) var shadow_samp: sampler_comparison;
-@group({group_index}) @binding({spot_tex}) var spot_shadow_tex: texture_depth_2d;
+// An ARRAY, one layer per shadow-casting spot. A level has more than one lamp,
+// and the single map this replaced meant the first spot in the scene silently
+// claimed it while the rest lit without shadows.
+@group({group_index}) @binding({spot_tex}) var spot_shadow_tex: texture_depth_2d_array;
 
 const AMBIENT: f32 = 0.6;
 
@@ -241,6 +270,20 @@ fn pcf(tex: texture_depth_2d, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>
     return sum / 9.0;
 }}
 
+fn pcf_layer(tex: texture_depth_2d_array, layer: i32, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
+    let c = shadow_coords(world_pos, light_view_proj);
+    if (c.w < 0.5) {{ return 1.0; }}
+    let texel = 1.0 / vec2<f32>(textureDimensions(tex));
+    var sum = 0.0;
+    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
+        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
+            let off = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum = sum + textureSampleCompareLevel(tex, shadow_samp, c.xy + off, layer, c.z);
+        }}
+    }}
+    return sum / 9.0;
+}}
+
 fn light_contribution(l: Light, world_pos: vec3<f32>, n: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {{
     // params.z tags the kind: 0 point, 1 spot, 2 directional.
     let kind = l.params.z;
@@ -298,8 +341,12 @@ fn shade(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
         if (l.params.z > 1.5 && camera.shadow_params.x > 0.5) {{
             c = c * pcf(sun_shadow_tex, world_pos, camera.sun_view_proj);
         }}
-        if (camera.shadow_params.y > 0.5 && i == flash_idx) {{
-            c = c * pcf(spot_shadow_tex, world_pos, camera.spot_view_proj);
+        // params.w is this light's own shadow layer, or -1 when it did not get
+        // one. Asking the LIGHT beats the old "is this the flashlight index"
+        // test, which by construction could only ever be true for one lamp.
+        let layer = i32(l.params.w);
+        if (layer >= 0 && f32(layer) < camera.shadow_params.y) {{
+            c = c * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
         }}
         lit = lit + c;
     }}

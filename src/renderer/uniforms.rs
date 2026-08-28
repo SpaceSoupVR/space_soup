@@ -1,4 +1,5 @@
 use bytemuck::{Pod, Zeroable};
+use super::shadow::MAX_SPOT_SHADOWS;
 use glam::{Mat4, Vec3};
 use wgpu::*;
 
@@ -15,12 +16,21 @@ pub struct Uniforms {
     pub inv_view_proj: [[f32; 4]; 4],
     /// Sun (directional) light-space view-projection, for the sun shadow map.
     pub sun_view_proj: [[f32; 4]; 4],
-    /// Spot/flashlight light-space view-projection, for the spot shadow map.
-    pub spot_view_proj: [[f32; 4]; 4],
+    /// One light-space view-projection per shadow-casting spot.
+    ///
+    /// An ARRAY because a level has more than one lamp. It used to be a single
+    /// matrix and the first spot in the scene silently claimed it, so a room
+    /// with two identical fixtures had one casting a shadow and one not -- which
+    /// reads as a broken light rather than an exhausted budget.
+    pub spot_view_proj: [[[f32; 4]; 4]; MAX_SPOT_SHADOWS],
     /// World-space camera position (xyz); w unused. Drives specular.
     pub camera_pos: [f32; 4],
-    /// x = sun shadow enabled (1/0), y = spot shadow enabled (1/0),
-    /// z = flashlight light index (as f32, valid when y > 0.5), w reserved.
+    /// x = sun shadow enabled (1/0), y = how many spot shadow layers are live,
+    /// z = reserved, w reserved.
+    ///
+    /// Which light uses which layer is carried on the LIGHT (`params.w`) rather
+    /// than here, because it is a property of the light and not of the camera --
+    /// and the previous single "flashlight index" could only ever name one.
     pub shadow_params: [f32; 4],
     /// x = sky intensity. yzw reserved.
     pub sky_params: [f32; 4],
@@ -62,11 +72,15 @@ impl SkyUpload {
 /// Per-frame shadow inputs, bundled to keep `upload` call sites readable.
 pub struct ShadowUpload {
     pub sun_view_proj: Mat4,
-    pub spot_view_proj: Mat4,
+    /// One per shadow-casting spot, in shadow-layer order.
+    pub spot_view_proj: [Mat4; MAX_SPOT_SHADOWS],
     pub sun_enabled: bool,
-    pub spot_enabled: bool,
-    /// Index into the lights array of the shadow-casting flashlight spot light.
-    pub flashlight_index: u32,
+    /// How many spot shadow layers this frame actually filled.
+    ///
+    /// Replaces a bool plus a single "flashlight index": with an array of
+    /// layers, WHICH light uses WHICH layer belongs on the light, and the
+    /// camera only needs to know how many are live.
+    pub spot_count: u32,
 }
 
 impl ShadowUpload {
@@ -75,10 +89,9 @@ impl ShadowUpload {
     pub fn disabled() -> Self {
         Self {
             sun_view_proj: Mat4::IDENTITY,
-            spot_view_proj: Mat4::IDENTITY,
+            spot_view_proj: [Mat4::IDENTITY; MAX_SPOT_SHADOWS],
             sun_enabled: false,
-            spot_enabled: false,
-            flashlight_index: 0,
+            spot_count: 0,
         }
     }
 }
@@ -154,7 +167,14 @@ impl UniformBuffer {
                     visibility: ShaderStages::FRAGMENT,
                     ty: BindingType::Texture {
                         sample_type: TextureSampleType::Depth,
-                        view_dimension: TextureViewDimension::D2,
+                        // D2Array: one texture, one layer per shadow-casting
+                        // spot, sampled by index. Must match the
+                        // `texture_depth_2d_array` the shader declares, or
+                        // pipeline creation fails -- which is the good outcome,
+                        // since the alternative is reading the wrong lamp's
+                        // depth and drawing a shadow from a light that is not
+                        // there.
+                        view_dimension: TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -212,12 +232,12 @@ impl UniformBuffer {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             sun_view_proj: shadow.sun_view_proj.to_cols_array_2d(),
-            spot_view_proj: shadow.spot_view_proj.to_cols_array_2d(),
+            spot_view_proj: std::array::from_fn(|i| shadow.spot_view_proj[i].to_cols_array_2d()),
             camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 1.0],
             shadow_params: [
                 if shadow.sun_enabled { 1.0 } else { 0.0 },
-                if shadow.spot_enabled { 1.0 } else { 0.0 },
-                shadow.flashlight_index as f32,
+                shadow.spot_count as f32,
+                0.0,
                 0.0,
             ],
             sky_params: [sky.intensity, 0.0, 0.0, 0.0],

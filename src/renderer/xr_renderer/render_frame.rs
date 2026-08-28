@@ -134,7 +134,6 @@ impl XrRenderer {
         let image_index = self.swapchain.acquire_image()? as usize;
         self.swapchain.wait_image(xr::Duration::INFINITE)?;
         let cpu_start = std::time::Instant::now();
-        self.lights_uniform.upload(&self.wgpu_queue, lights);
 
         let (_, eye_views) =
             session.locate_views(xr::ViewConfigurationType::PRIMARY_STEREO, time, stage)?;
@@ -330,9 +329,20 @@ impl XrRenderer {
         let sun = want_sun
             .then(|| lights.iter().find(|l| l.kind == crate::renderer::LightKind::Directional))
             .flatten();
-        let spot_index = want_spot
-            .then(|| lights.iter().position(|l| l.kind == crate::renderer::LightKind::Spot))
-            .flatten();
+        // Spots take shadow layers in scene order until the budget runs out.
+        // It used to be just the first one, so a room with two matching lamps
+        // had one casting a shadow and one not.
+        let spot_indices: Vec<usize> = if want_spot {
+            lights
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.kind == crate::renderer::LightKind::Spot)
+                .map(|(i, _)| i)
+                .take(crate::renderer::shadow::MAX_SPOT_SHADOWS)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // The box follows the head and is pushed forward, so its limited
         // resolution is spent on what the player is looking at. Half of a
@@ -347,26 +357,33 @@ impl XrRenderer {
         let sun_radius = 30.0_f32;
         let focus = head + forward * (sun_radius * 0.5);
 
+        // Uploaded HERE rather than earlier in the frame, because each light has
+        // to be told which shadow layer it casts into -- and that is not known
+        // until the spots have been assigned layers just above.
+        self.lights_uniform
+            .upload_with_shadow_layers(&self.wgpu_queue, lights, &spot_indices);
+
         let shadow = crate::renderer::uniforms::ShadowUpload {
             sun_view_proj: sun
                 .map(|l| {
                     crate::renderer::shadow::directional_light_matrix(l.direction, focus, sun_radius)
                 })
                 .unwrap_or(glam::Mat4::IDENTITY),
-            spot_view_proj: spot_index
-                .map(|i| {
+            spot_view_proj: {
+                let mut m = [glam::Mat4::IDENTITY; crate::renderer::shadow::MAX_SPOT_SHADOWS];
+                for (layer, &i) in spot_indices.iter().enumerate() {
                     let l = &lights[i];
-                    crate::renderer::shadow::spot_light_matrix(
+                    m[layer] = crate::renderer::shadow::spot_light_matrix(
                         l.position, l.direction, l.cone_angle_deg, l.range,
-                    )
-                })
-                .unwrap_or(glam::Mat4::IDENTITY),
+                    );
+                }
+                m
+            },
             sun_enabled: sun.is_some(),
-            spot_enabled: spot_index.is_some(),
-            flashlight_index: spot_index.unwrap_or(0) as u32,
+            spot_count: spot_indices.len() as u32,
         };
 
-        if shadow.sun_enabled || shadow.spot_enabled {
+        if shadow.sun_enabled || shadow.spot_count > 0 {
             let solid_caster = (!solid_idx.is_empty())
                 .then_some((&solid_vb, &solid_ib, solid_idx.len() as u32));
             let brush_caster = brush_buffers
@@ -391,15 +408,18 @@ impl XrRenderer {
                     &shadow_casters,
                 );
             }
-            if shadow.spot_enabled {
+            // One depth pass per shadow-casting spot. This is the cost, and it
+            // is why MAX_SPOT_SHADOWS is a budget rather than "however many the
+            // level has" -- on a tile-based GPU each pass is expensive.
+            for layer in 0..shadow.spot_count as usize {
                 self.shadow_map.upload_light(
                     &self.wgpu_queue,
-                    crate::renderer::shadow::ShadowKind::Spot,
-                    shadow.spot_view_proj,
+                    crate::renderer::shadow::ShadowKind::Spot(layer),
+                    shadow.spot_view_proj[layer],
                 );
                 self.shadow_map.record(
                     &mut encoder,
-                    crate::renderer::shadow::ShadowKind::Spot,
+                    crate::renderer::shadow::ShadowKind::Spot(layer),
                     solid_caster,
                     brush_caster,
                     &shadow_casters,

@@ -268,14 +268,20 @@ impl Renderer {
         lights: &[lights::Light],
     ) {
         let vp = camera.projection() * camera.view();
-        self.lights_uniform.upload(&self.queue, lights);
 
-        // Which light casts which map. The FIRST directional light is the sun
-        // and the first spot is the flashlight, rather than a flag on the light:
-        // a scene with two suns is not a thing, and a second shadow-casting spot
-        // would need a second depth texture and a second pass to go with it.
+        // Which light casts which map. The first directional light is the sun,
+        // because a scene with two suns is not a thing. Spots take shadow layers
+        // in scene order until the budget runs out -- it used to be just the
+        // first one, so a room with two matching lamps had one casting a shadow
+        // and one not, which reads as a broken light rather than a full budget.
         let sun = lights.iter().find(|l| l.kind == lights::LightKind::Directional);
-        let spot_index = lights.iter().position(|l| l.kind == lights::LightKind::Spot);
+        let spot_indices: Vec<usize> = lights
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.kind == lights::LightKind::Spot)
+            .map(|(i, _)| i)
+            .take(shadow::MAX_SPOT_SHADOWS)
+            .collect();
 
         // The box follows the camera so its resolution is spent where the
         // viewer is, and is pushed forward a little rather than centred on the
@@ -284,19 +290,22 @@ impl Renderer {
         let sun_view_proj = sun
             .map(|l| shadow::directional_light_matrix(l.direction, focus, self.sun_shadow_radius))
             .unwrap_or(glam::Mat4::IDENTITY);
-        let spot_view_proj = spot_index
-            .map(|i| {
-                let l = &lights[i];
-                shadow::spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range)
-            })
-            .unwrap_or(glam::Mat4::IDENTITY);
+        let mut spot_view_proj = [glam::Mat4::IDENTITY; shadow::MAX_SPOT_SHADOWS];
+        for (layer, &i) in spot_indices.iter().enumerate() {
+            let l = &lights[i];
+            spot_view_proj[layer] =
+                shadow::spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range);
+        }
+        // Each shadow-casting light is told ITS layer, so the shader does not
+        // have to guess which one a given light belongs to.
+        self.lights_uniform
+            .upload_with_shadow_layers(&self.queue, lights, &spot_indices);
 
         let shadow = ShadowUpload {
             sun_view_proj,
             spot_view_proj,
             sun_enabled: sun.is_some(),
-            spot_enabled: spot_index.is_some(),
-            flashlight_index: spot_index.unwrap_or(0) as u32,
+            spot_count: spot_indices.len() as u32,
         };
         self.uniform_buf
             .upload(&self.queue, vp, camera.position, &shadow);
@@ -424,11 +433,21 @@ impl Renderer {
             self.shadow_map
                 .record(&mut encoder, ShadowKind::Sun, solid_caster, None, &shadow_draws);
         }
-        if shadow.spot_enabled {
-            self.shadow_map
-                .upload_light(&self.queue, ShadowKind::Spot, shadow.spot_view_proj);
-            self.shadow_map
-                .record(&mut encoder, ShadowKind::Spot, solid_caster, None, &shadow_draws);
+        // One depth pass per shadow-casting spot. This is where the cost lives,
+        // which is why MAX_SPOT_SHADOWS is a budget rather than "all of them".
+        for layer in 0..shadow.spot_count as usize {
+            self.shadow_map.upload_light(
+                &self.queue,
+                ShadowKind::Spot(layer),
+                shadow.spot_view_proj[layer],
+            );
+            self.shadow_map.record(
+                &mut encoder,
+                ShadowKind::Spot(layer),
+                solid_caster,
+                None,
+                &shadow_draws,
+            );
         }
 
         {
