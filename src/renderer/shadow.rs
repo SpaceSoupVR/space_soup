@@ -50,11 +50,25 @@ pub const SHADOW_DIM: u32 = 2048;
 /// actually reads cover from, hold up.
 pub const QUEST_SHADOW_DIM: u32 = 1024;
 
+/// How many spot lights can cast a real-time shadow at once.
+///
+/// A BUDGET, chosen rather than inherited. It was one, which is not a decision
+/// anybody made -- the code took the first spot in the scene and the rest lit
+/// without shadows, so a room with two matching lamps had one casting and one
+/// not. Four covers a lit interior; each layer costs `dim * dim` of
+/// Depth32Float, so at the Quest's 1024 that is 4MB apiece.
+///
+/// Lights beyond the budget still light the scene; they just do not occlude.
+/// That is the honest failure -- a missing shadow rather than a missing light --
+/// and the editor says which lights are affected.
+pub const MAX_SPOT_SHADOWS: usize = 4;
+
 /// Which shadow slot a pass/upload targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShadowKind {
     Sun,
-    Spot,
+    /// One of the spot layers, by index.
+    Spot(usize),
 }
 
 /// Builds the sun's light-space view-projection: an orthographic box aimed
@@ -128,9 +142,44 @@ struct ShadowSlot {
 
 impl ShadowSlot {
     fn new(device: &Device, light_layout: &BindGroupLayout, label: &str, dim: u32) -> Self {
+        Self::new_layered(device, light_layout, label, dim, 1, 0)
+    }
+
+    /// A slot that renders into one layer of an existing array texture.
+    fn from_texture(
+        device: &Device,
+        light_layout: &BindGroupLayout,
+        texture: &Texture,
+        layer: u32,
+    ) -> Self {
+        let depth_view = texture.create_view(&TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D2),
+            base_array_layer: layer,
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
+        let (light_buffer, light_bind_group) = Self::light_uniform(device, light_layout);
+        Self { _depth_texture: texture.clone(), depth_view, light_buffer, light_bind_group }
+    }
+
+    /// One layer of a shared array texture, or a standalone map when `layers`
+    /// is 1.
+    ///
+    /// An ARRAY TEXTURE rather than an array of bindings. Binding several
+    /// textures to one slot needs the TEXTURE_BINDING_ARRAY feature, which is
+    /// not something to rely on for a headset; a depth_2d_array sampled by
+    /// layer index is core WebGPU and works everywhere.
+    fn new_layered(
+        device: &Device,
+        light_layout: &BindGroupLayout,
+        label: &str,
+        dim: u32,
+        layers: u32,
+        layer: u32,
+    ) -> Self {
         let depth_texture = device.create_texture(&TextureDescriptor {
             label: Some(label),
-            size: Extent3d { width: dim, height: dim, depth_or_array_layers: 1 },
+            size: Extent3d { width: dim, height: dim, depth_or_array_layers: layers },
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
@@ -138,7 +187,26 @@ impl ShadowSlot {
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
+        // A single-layer view, which is what a render pass attaches to. The
+        // array view used for sampling is built separately, from the same
+        // texture.
+        let depth_view = depth_texture.create_view(&TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D2),
+            base_array_layer: layer,
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
+        let (light_buffer, light_bind_group) = Self::light_uniform(device, light_layout);
+        Self {
+            _depth_texture: depth_texture,
+            depth_view,
+            light_buffer,
+            light_bind_group,
+        }
+    }
+
+    /// The per-slot light matrix buffer and its bind group.
+    fn light_uniform(device: &Device, light_layout: &BindGroupLayout) -> (Buffer, BindGroup) {
         let light_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("shadow_light_matrix"),
             size: std::mem::size_of::<LightMatrix>() as u64,
@@ -153,18 +221,20 @@ impl ShadowSlot {
                 resource: light_buffer.as_entire_binding(),
             }],
         });
-        Self {
-            _depth_texture: depth_texture,
-            depth_view,
-            light_buffer,
-            light_bind_group,
-        }
+        (light_buffer, light_bind_group)
     }
 }
 
 pub struct ShadowMap {
     sun: ShadowSlot,
-    spot: ShadowSlot,
+    /// One slot per shadow-casting spot. Separate textures rather than one
+    /// atlas: an atlas needs every sample to offset and clamp into its own
+    /// tile, and a single wrong clamp reads a neighbour's depth, which looks
+    /// like a shadow from a light that is not there.
+    spots: [ShadowSlot; MAX_SPOT_SHADOWS],
+    _spot_texture: Texture,
+    /// The whole spot array, as the shader samples it.
+    spot_array_view: TextureView,
     sampler: Sampler,
     solid_pipeline: RenderPipeline,
     mesh_pipeline: RenderPipeline,
@@ -332,11 +402,38 @@ impl ShadowMap {
         });
 
         let sun = ShadowSlot::new(device, &light_layout, "sun_shadow_depth", dim);
+        // ONE texture with MAX_SPOT_SHADOWS layers, not N textures. The shader
+        // samples it as a depth_2d_array by layer index, which is core WebGPU;
+        // binding N separate textures to one slot would need an extension the
+        // headset may not have.
+        let spot_texture = device.create_texture(&TextureDescriptor {
+            label: Some("spot_shadow_depth_array"),
+            size: Extent3d {
+                width: dim,
+                height: dim,
+                depth_or_array_layers: MAX_SPOT_SHADOWS as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Depth32Float,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let spot_array_view = spot_texture.create_view(&TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let spots = std::array::from_fn(|i| {
+            ShadowSlot::from_texture(device, &light_layout, &spot_texture, i as u32)
+        });
         let spot = ShadowSlot::new(device, &light_layout, "spot_shadow_depth", dim);
 
         Self {
             sun,
-            spot,
+            spots,
+            _spot_texture: spot_texture,
+            spot_array_view,
             sampler,
             solid_pipeline,
             mesh_pipeline,
@@ -348,8 +445,9 @@ impl ShadowMap {
         &self.sun.depth_view
     }
 
+    /// The spot shadow array, as the shading pass samples it.
     pub fn spot_depth_view(&self) -> &TextureView {
-        &self.spot.depth_view
+        &self.spot_array_view
     }
 
     pub fn sampler(&self) -> &Sampler {
@@ -359,7 +457,7 @@ impl ShadowMap {
     fn slot(&self, kind: ShadowKind) -> &ShadowSlot {
         match kind {
             ShadowKind::Sun => &self.sun,
-            ShadowKind::Spot => &self.spot,
+            ShadowKind::Spot(i) => &self.spots[i.min(MAX_SPOT_SHADOWS - 1)],
         }
     }
 
@@ -608,18 +706,37 @@ mod render_tests {
             shadow_map.spot_depth_view(),
             shadow_map.sampler(),
         );
-        lights_uniform.upload(&queue, &scene.lights);
+        // Spots claim shadow layers in scene order, exactly as both renderers
+        // do -- so a test with two spots exercises two layers rather than one.
+        let spot_indices: Vec<usize> = if scene.shadows_on {
+            scene
+                .lights
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.kind == LightKind::Spot)
+                .map(|(i, _)| i)
+                .take(MAX_SPOT_SHADOWS)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        lights_uniform.upload_with_shadow_layers(&queue, &scene.lights, &spot_indices);
 
         let sun = scene.lights.iter().find(|l| l.kind == LightKind::Directional);
         let sun_view_proj = sun
             .map(|l| directional_light_matrix(l.direction, Vec3::ZERO, 20.0))
             .unwrap_or(Mat4::IDENTITY);
+        let mut spot_view_proj = [Mat4::IDENTITY; MAX_SPOT_SHADOWS];
+        for (layer, &i) in spot_indices.iter().enumerate() {
+            let l = &scene.lights[i];
+            spot_view_proj[layer] =
+                spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range);
+        }
         let upload = ShadowUpload {
             sun_view_proj,
-            spot_view_proj: Mat4::IDENTITY,
+            spot_view_proj,
             sun_enabled: scene.shadows_on && sun.is_some(),
-            spot_enabled: false,
-            flashlight_index: 0,
+            spot_count: spot_indices.len() as u32,
         };
 
         // The receiver, as clip-space coordinates that fill the target. Its
@@ -722,6 +839,18 @@ mod render_tests {
                 .map(|(vb, ib, count)| (vb, ib, *count));
             shadow_map.record(&mut encoder, ShadowKind::Sun, solid, None, &[]);
         }
+        // One depth pass per spot layer, matching both renderers.
+        for layer in 0..upload.spot_count as usize {
+            shadow_map.upload_light(
+                &queue,
+                ShadowKind::Spot(layer),
+                upload.spot_view_proj[layer],
+            );
+            let solid = caster_bufs
+                .as_ref()
+                .map(|(vb, ib, count)| (vb, ib, *count));
+            shadow_map.record(&mut encoder, ShadowKind::Spot(layer), solid, None, &[]);
+        }
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("recv_pass"),
@@ -813,6 +942,76 @@ mod render_tests {
             normal: [0.0, 1.0, 0.0],
             sky: SkyUpload::none(),
         }
+    }
+
+    /// A spot above the receiver, aimed straight down.
+    fn spot_above(x: f32, intensity: f32) -> Light {
+        Light {
+            position: Vec3::new(x, 6.0, 0.0),
+            direction: Vec3::NEG_Y,
+            kind: LightKind::Spot,
+            color: Color3(255, 255, 255, 255),
+            intensity,
+            range: 30.0,
+            cone_angle_deg: 120.0,
+        }
+    }
+
+    #[test]
+    fn a_spot_light_casts_a_shadow() {
+        // The baseline the second-spot test is measured against. If this did
+        // not hold, the two-spot result would prove nothing.
+        let lit = shot!(Scene { lights: vec![spot_above(0.0, 4.0)], ..base() });
+        let shaded = shot!(Scene {
+            lights: vec![spot_above(0.0, 4.0)],
+            caster: Some(ground(3.0, 8.0)),
+            ..base()
+        });
+        assert!(
+            (lit[0] as i32) - (shaded[0] as i32) > 8,
+            "a spot cast no shadow: {lit:?} lit vs {shaded:?} with a caster between",
+        );
+    }
+
+    #[test]
+    fn a_second_spot_light_also_casts_a_shadow() {
+        // THE POINT OF THE SHADOW ARRAY. There used to be one spot depth map,
+        // claimed by the first spot in the scene, so a room with two matching
+        // lamps had one casting a shadow and one not -- which reads as a broken
+        // light rather than an exhausted budget.
+        //
+        // The first light here is deliberately dark, so anything measured comes
+        // from the SECOND one. With a single shared map the second light gets no
+        // shadow at all and the caster makes no difference.
+        let dim = spot_above(-4.0, 0.0);
+        let lit = shot!(Scene { lights: vec![dim.clone(), spot_above(0.0, 4.0)], ..base() });
+        let shaded = shot!(Scene {
+            lights: vec![dim, spot_above(0.0, 4.0)],
+            caster: Some(ground(3.0, 8.0)),
+            ..base()
+        });
+        assert!(
+            (lit[0] as i32) - (shaded[0] as i32) > 8,
+            "the SECOND spot cast no shadow: {lit:?} lit vs {shaded:?} with a caster between",
+        );
+    }
+
+    #[test]
+    fn a_spot_beyond_the_budget_still_lights_without_shadowing() {
+        // The honest failure past MAX_SPOT_SHADOWS: a missing shadow, never a
+        // missing light. A level that silently dropped its overflow lamps would
+        // go dark in patches, which is far worse than an unshadowed one.
+        let mut lights: Vec<Light> = (0..MAX_SPOT_SHADOWS + 1)
+            .map(|i| spot_above(-8.0 + i as f32, 0.0))
+            .collect();
+        *lights.last_mut().unwrap() = spot_above(0.0, 4.0);
+
+        let with_extra = shot!(Scene { lights: lights.clone(), ..base() });
+        let alone = shot!(Scene { lights: vec![spot_above(0.0, 4.0)], ..base() });
+        assert!(
+            (with_extra[0] as i32 - alone[0] as i32).abs() < 6,
+            "the light past the shadow budget stopped lighting: {with_extra:?} vs {alone:?}",
+        );
     }
 
     #[test]
