@@ -285,6 +285,22 @@ fn pcf_layer(tex: texture_depth_2d_array, layer: i32, world_pos: vec3<f32>, ligh
 }}
 
 fn light_contribution(l: Light, world_pos: vec3<f32>, n: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {{
+    return light_contribution_rough(l, world_pos, n, view_dir, SHININESS, SPEC_STRENGTH);
+}}
+
+// The same, with the highlight's tightness and strength supplied by the caller.
+//
+// Split out rather than adding parameters to `light_contribution`, because that
+// one is called by the mesh, cuboid and terrain shaders too and none of them
+// have a roughness map to pass. They keep the constants they always used.
+fn light_contribution_rough(
+    l: Light,
+    world_pos: vec3<f32>,
+    n: vec3<f32>,
+    view_dir: vec3<f32>,
+    shininess: f32,
+    spec_strength: f32,
+) -> vec3<f32> {{
     // params.z tags the kind: 0 point, 1 spot, 2 directional.
     let kind = l.params.z;
 
@@ -322,10 +338,51 @@ fn light_contribution(l: Light, world_pos: vec3<f32>, n: vec3<f32>, view_dir: ve
     // far side and rims every object with light coming from behind it.
     if (ndotl > 0.0) {{
         let h = normalize(l_dir + view_dir);
-        let spec = pow(max(dot(n, h), 0.0), SHININESS) * SPEC_STRENGTH;
+        let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;
         out = out + radiance * spec * atten;
     }}
     return out;
+}}
+
+// Shading that knows what the surface is MADE OF.
+//
+// `roughness` 0 is a mirror-smooth surface and 1 is fully matte; `ao` is the
+// material's own baked contact shadow, 1 meaning unoccluded. Both come from a
+// material's maps, and without them every surface in the level shades
+// identically -- polished concrete lights exactly like rough brick, which no
+// amount of work on the lights can distinguish.
+//
+// AO scales the AMBIENT term only. It is a statement about how much of the sky
+// a crevice can see, not about whether a lamp is pointed at it, and multiplying
+// direct light by it would darken surfaces a light is shining straight onto.
+fn shade_material(world_pos: vec3<f32>, n: vec3<f32>, roughness: f32, ao: f32) -> vec3<f32> {{
+    let view_dir = normalize(camera.camera_pos.xyz - world_pos);
+    let r = clamp(roughness, 0.04, 1.0);
+    // Blinn-Phong has an exponent where a PBR model has a roughness, so the two
+    // are bridged by the usual mapping: alpha = r^2, exponent = 2/alpha^2 - 2.
+    // Exact enough for a preview and monotonic, which is what matters -- a
+    // rougher material must never come out shinier.
+    let alpha = r * r;
+    let shininess = clamp(2.0 / (alpha * alpha) - 2.0, 1.0, 2048.0);
+    // Rough surfaces spread the same energy over a wider lobe, so the peak is
+    // dimmer. Without this, raising roughness only widens the highlight and a
+    // matte wall still has a bright spot on it.
+    let spec_strength = SPEC_STRENGTH * (1.0 - r);
+
+    var lit = sky_irradiance(n) * clamp(ao, 0.0, 1.0);
+    for (var i: u32 = 0u; i < lights.count.x; i = i + 1u) {{
+        let l = lights.lights[i];
+        var c = light_contribution_rough(l, world_pos, n, view_dir, shininess, spec_strength);
+        if (l.params.z > 1.5 && camera.shadow_params.x > 0.5) {{
+            c = c * pcf(sun_shadow_tex, world_pos, camera.sun_view_proj);
+        }}
+        let layer = i32(l.params.w);
+        if (layer >= 0 && f32(layer) < camera.shadow_params.y) {{
+            c = c * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
+        }}
+        lit = lit + c;
+    }}
+    return lit;
 }}
 
 fn shade(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{

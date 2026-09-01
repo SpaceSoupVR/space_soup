@@ -640,7 +640,22 @@ impl XrRenderer {
         &mut self,
         colours: &[crate::renderer::terrain_pipeline::TerrainImage],
         normals: &[Option<crate::renderer::terrain_pipeline::TerrainImage>],
+        roughs: &[Option<crate::renderer::terrain_pipeline::TerrainImage>],
+        aos: &[Option<crate::renderer::terrain_pipeline::TerrainImage>],
     ) {
+        let clone_opt = |v: &[Option<crate::renderer::terrain_pipeline::TerrainImage>]| {
+            v.iter()
+                .map(|o| {
+                    o.as_ref().map(|i| crate::renderer::terrain_pipeline::TerrainImage {
+                        width: i.width,
+                        height: i.height,
+                        rgba: i.rgba.clone(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let roughs = clone_opt(roughs);
+        let aos = clone_opt(aos);
         let colours: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>> = colours
             .iter()
             .map(|c| {
@@ -667,6 +682,8 @@ impl XrRenderer {
             &self.brush_pipeline.material_layout,
             &colours,
             &normals,
+            &roughs,
+            &aos,
         );
     }
 
