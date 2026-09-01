@@ -138,6 +138,31 @@ pub fn brush_material_bind_group_layout(device: &Device) -> BindGroupLayout {
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
+            // Roughness, then ambient occlusion. Separate arrays rather than
+            // channels of one packed map: the material library stores them as
+            // the separate greyscale files ambientCG ships, and packing them
+            // here would mean a second representation to keep in step with the
+            // editor, which samples the same two files.
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -156,6 +181,8 @@ impl BrushMaterials {
         layout: &BindGroupLayout,
         colours: &[Option<TerrainImage>],
         normals: &[Option<TerrainImage>],
+        roughs: &[Option<TerrainImage>],
+        aos: &[Option<TerrainImage>],
     ) -> Self {
         // Sized from the first real map rather than from a constant, so a
         // project of 2K materials is not downsampled to someone's guess.
@@ -188,6 +215,19 @@ impl BrushMaterials {
             [128, 128, 255],
             w,
             h,
+        );
+
+        // Fully rough and fully unoccluded where a material has no map, which
+        // is exactly what the surface looked like before either existed. Not
+        // sRGB: both are measurements, not colours, and decoding them through
+        // the sRGB curve would skew every value toward the dark end.
+        let rough_tex = Self::array_texture(
+            device, queue, "brush_rough_array", TextureFormat::Rgba8Unorm,
+            roughs, [255, 255, 255], w, h,
+        );
+        let ao_tex = Self::array_texture(
+            device, queue, "brush_ao_array", TextureFormat::Rgba8Unorm,
+            aos, [255, 255, 255], w, h,
         );
 
         let sampler = device.create_sampler(&SamplerDescriptor {
@@ -230,6 +270,24 @@ impl BrushMaterials {
                     binding: 2,
                     resource: BindingResource::Sampler(&sampler),
                 },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::TextureView(&rough_tex.create_view(
+                        &TextureViewDescriptor {
+                            dimension: Some(TextureViewDimension::D2Array),
+                            ..Default::default()
+                        },
+                    )),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: BindingResource::TextureView(&ao_tex.create_view(
+                        &TextureViewDescriptor {
+                            dimension: Some(TextureViewDimension::D2Array),
+                            ..Default::default()
+                        },
+                    )),
+                },
             ],
         });
 
@@ -242,7 +300,7 @@ impl BrushMaterials {
     /// pipeline layouts and two shaders that have to agree, which is a bigger
     /// thing to keep right than one white texture.
     pub fn fallback(device: &Device, queue: &Queue, layout: &BindGroupLayout) -> Self {
-        Self::new(device, queue, layout, &[], &[])
+        Self::new(device, queue, layout, &[], &[], &[], &[])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -403,6 +461,8 @@ fn brush_shader() -> String {
 @group(1) @binding(0) var mat_color: texture_2d_array<f32>;
 @group(1) @binding(1) var mat_normal: texture_2d_array<f32>;
 @group(1) @binding(2) var mat_samp: sampler;
+@group(1) @binding(3) var mat_rough: texture_2d_array<f32>;
+@group(1) @binding(4) var mat_ao: texture_2d_array<f32>;
 
 {lights_block}
 
@@ -468,8 +528,15 @@ struct VOut {{
     // old behaviour. Black is the neutral value for a sum the way white is for
     // a product, and binding the wrong one is a full stop of extra brightness
     // on every surface.
+    // The material's own roughness and occlusion, so a polished surface and a
+    // matte one do not light identically. A material with no map gets white in
+    // both arrays, which is fully rough and fully unoccluded -- exactly how
+    // every brush looked before these existed.
+    let rough = textureSample(mat_rough, mat_samp, in.uv, i32(in.material)).r;
+    let ao = textureSample(mat_ao, mat_samp, in.uv, i32(in.material)).r;
+
     let baked = textureSample(lm_tex, lm_samp, in.uv2).rgb;
-    let lit = shade(in.world_pos, n) + baked;
+    let lit = shade_material(in.world_pos, n, rough, ao) + baked;
     let c = albedo.rgb * in.tint.rgb * lit;
     return vec4<f32>(c, albedo.a * in.tint.a);
 }}
@@ -525,6 +592,41 @@ mod tests {
         uv_scale: f32,
         lit: bool,
     ) -> Option<[u8; 4]> {
+        render_brush_material(
+            material, colours, normals, &[], &[], tint, uv_scale, lit, SIDE_LIGHT,
+        )
+    }
+
+    /// Off to one side, so a normal tilted along u faces it differently from a
+    /// flat one. What the normal-map tests need.
+    const SIDE_LIGHT: glam::Vec3 = glam::Vec3::new(4.0, 0.0, 2.0);
+
+    /// Straight down the view axis, so the half-vector lands on the normal and
+    /// the specular highlight is at its peak.
+    ///
+    /// What the ROUGHNESS tests need. With the side light both a mirror and a
+    /// matte surface come out with no highlight at all -- the matte one because
+    /// its strength is zero, the mirror because its lobe is a pinpoint the
+    /// sample misses -- so the two are identical and the test proves nothing.
+    const HEAD_ON_LIGHT: glam::Vec3 = glam::Vec3::new(0.0, 0.0, 4.0);
+
+    /// The same, with roughness and ambient-occlusion arrays supplied.
+    ///
+    /// Empty slices fill with white -- fully rough, fully unoccluded -- which is
+    /// what every surface looked like before either map existed, so the older
+    /// tests measure exactly what they always did.
+    #[allow(clippy::too_many_arguments)]
+    fn render_brush_material(
+        material: u32,
+        colours: &[Option<TerrainImage>],
+        normals: &[Option<TerrainImage>],
+        roughs: &[Option<TerrainImage>],
+        aos: &[Option<TerrainImage>],
+        tint: [f32; 4],
+        uv_scale: f32,
+        lit: bool,
+        light_pos: glam::Vec3,
+    ) -> Option<[u8; 4]> {
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
 
@@ -537,7 +639,7 @@ mod tests {
             lights.upload(
                 &queue,
                 &[Light {
-                    position: glam::Vec3::new(4.0, 0.0, 2.0),
+                    position: light_pos,
                     direction: glam::Vec3::new(-1.0, 0.0, 0.0),
                     kind: LightKind::Point,
                     color: Color3(255, 255, 255, 255),
@@ -555,7 +657,13 @@ mod tests {
 
         let pipeline = BrushPipeline::new(&device, format, &uniforms.layout);
         let materials =
-            BrushMaterials::new(&device, &queue, &pipeline.material_layout, colours, normals);
+            // These tests are about the COLOUR and NORMAL path, so both new
+            // arrays are left empty: they fill with white, which is fully rough
+            // and fully unoccluded -- the shading every one of them was written
+            // against.
+            BrushMaterials::new(
+                &device, &queue, &pipeline.material_layout, colours, normals, roughs, aos,
+            );
 
         // A triangle covering the viewport in clip space, facing +z, with the
         // face's u axis along +x -- the frame a wall brush actually produces.
@@ -739,6 +847,85 @@ mod tests {
         assert_eq!(
             with_fallback, flat_map,
             "no normal map must shade identically to an explicitly flat one"
+        );
+    }
+
+    #[test]
+    fn roughness_changes_the_specular_highlight() {
+        // THE POINT of the roughness map. Without it every surface in a level
+        // shades identically -- polished concrete lights exactly like rough
+        // brick -- and no work on the lighting can tell them apart.
+        //
+        // A smooth surface concentrates the same energy into a tighter,
+        // brighter highlight, so head on it must out-shine a matte one.
+        let Some(matte) = render_brush_material(
+            0, &palette(), &[None], &[Some(flat([255, 255, 255], 4))], &[], [1.0; 4], 1.0, true,
+            HEAD_ON_LIGHT,
+        ) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let glossy = render_brush_material(
+            0, &palette(), &[None], &[Some(flat([20, 20, 20], 4))], &[], [1.0; 4], 1.0, true,
+            HEAD_ON_LIGHT,
+        )
+        .unwrap();
+        assert_ne!(
+            matte, glossy,
+            "roughness is bound but never reaches the shading: {matte:?} vs {glossy:?}",
+        );
+        assert!(
+            glossy[0] > matte[0],
+            "a smooth surface should out-shine a matte one head on: {glossy:?} vs {matte:?}",
+        );
+    }
+
+    #[test]
+    fn a_missing_roughness_map_shades_fully_matte() {
+        // The fallback has to be the OLD behaviour exactly, or adding this
+        // feature relights every level already built. An absent array fills
+        // with white, which is roughness 1.
+        let Some(absent) = render_brush_material(
+            0, &palette(), &[None], &[], &[], [1.0; 4], 1.0, true, HEAD_ON_LIGHT,
+        ) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let explicit_matte = render_brush_material(
+            0, &palette(), &[None], &[Some(flat([255, 255, 255], 4))], &[], [1.0; 4], 1.0, true,
+            HEAD_ON_LIGHT,
+        )
+        .unwrap();
+        assert_eq!(
+            absent, explicit_matte,
+            "no roughness map must shade as fully rough: {absent:?} vs {explicit_matte:?}",
+        );
+    }
+
+    #[test]
+    fn ambient_occlusion_darkens_without_wiping_out_direct_light() {
+        // AO says how much of the SKY a crevice can see. Applying it to direct
+        // light as well would darken a surface a lamp is shining straight onto,
+        // which is a different effect and a wrong one.
+        let Some(open) = render_brush_material(
+            0, &palette(), &[None], &[], &[Some(flat([255, 255, 255], 4))], [1.0; 4], 1.0, true,
+            HEAD_ON_LIGHT,
+        ) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let occluded = render_brush_material(
+            0, &palette(), &[None], &[], &[Some(flat([0, 0, 0], 4))], [1.0; 4], 1.0, true,
+            HEAD_ON_LIGHT,
+        )
+        .unwrap();
+        assert!(
+            occluded[0] < open[0],
+            "ambient occlusion darkened nothing: {occluded:?} vs {open:?}",
+        );
+        assert!(
+            occluded[0] > 0,
+            "AO wiped out the direct light too, not just the ambient: {occluded:?}",
         );
     }
 
