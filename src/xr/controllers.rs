@@ -13,6 +13,15 @@ pub struct ControllerState {
 
     pub l_stick_touch: bool,
     pub r_stick_touch: bool,
+    // Capacitive touch, not click -- true as soon as a finger rests on the
+    // surface, well before it's pressed. Lets the thumb curl track a thumb
+    // resting on the trigger or a face button, not just the thumbstick.
+    pub l_trigger_touch: bool,
+    pub r_trigger_touch: bool,
+    // Touch's face buttons are one per hand (X/Y left, A/B right) -- this is
+    // "is the thumb resting on this hand's face button", not any specific button.
+    pub l_face_touch: bool,
+    pub r_face_touch: bool,
     pub btn_a: bool,
     pub btn_b: bool,
     pub btn_x: bool,
@@ -36,6 +45,10 @@ pub struct Controllers {
     right_thumbstick_click: xr::Action<bool>,
     left_thumbstick_touch: xr::Action<bool>,
     right_thumbstick_touch: xr::Action<bool>,
+    left_trigger_touch: xr::Action<bool>,
+    right_trigger_touch: xr::Action<bool>,
+    left_face_touch: xr::Action<bool>,
+    right_face_touch: xr::Action<bool>,
     a_button: xr::Action<bool>,
     b_button: xr::Action<bool>,
     x_button: xr::Action<bool>,
@@ -84,6 +97,14 @@ impl Controllers {
             action_set.create_action("left_thumbstick_touch", "Left Thumbstick Touch", &[])?;
         let right_thumbstick_touch: xr::Action<bool> =
             action_set.create_action("right_thumbstick_touch", "Right Thumbstick Touch", &[])?;
+        let left_trigger_touch: xr::Action<bool> =
+            action_set.create_action("left_trigger_touch", "Left Trigger Touch", &[])?;
+        let right_trigger_touch: xr::Action<bool> =
+            action_set.create_action("right_trigger_touch", "Right Trigger Touch", &[])?;
+        let left_face_touch: xr::Action<bool> =
+            action_set.create_action("left_face_touch", "Left Face Button Touch", &[])?;
+        let right_face_touch: xr::Action<bool> =
+            action_set.create_action("right_face_touch", "Right Face Button Touch", &[])?;
         let a_button: xr::Action<bool> = action_set.create_action("a_button", "A Button", &[])?;
         let b_button: xr::Action<bool> = action_set.create_action("b_button", "B Button", &[])?;
         let x_button: xr::Action<bool> = action_set.create_action("x_button", "X Button", &[])?;
@@ -152,6 +173,22 @@ impl Controllers {
                     instance.string_to_path("/user/hand/right/input/thumbstick/touch")?,
                 ),
                 xr::Binding::new(
+                    &left_trigger_touch,
+                    instance.string_to_path("/user/hand/left/input/trigger/touch")?,
+                ),
+                xr::Binding::new(
+                    &right_trigger_touch,
+                    instance.string_to_path("/user/hand/right/input/trigger/touch")?,
+                ),
+                xr::Binding::new(
+                    &left_face_touch,
+                    instance.string_to_path("/user/hand/left/input/x/touch")?,
+                ),
+                xr::Binding::new(
+                    &right_face_touch,
+                    instance.string_to_path("/user/hand/right/input/a/touch")?,
+                ),
+                xr::Binding::new(
                     &a_button,
                     instance.string_to_path("/user/hand/right/input/a/click")?,
                 ),
@@ -193,6 +230,10 @@ impl Controllers {
             r_stick_click: false,
             l_stick_touch: false,
             r_stick_touch: false,
+            l_trigger_touch: false,
+            r_trigger_touch: false,
+            l_face_touch: false,
+            r_face_touch: false,
             btn_a: false,
             btn_b: false,
             btn_x: false,
@@ -216,6 +257,10 @@ impl Controllers {
             right_thumbstick_click,
             left_thumbstick_touch,
             right_thumbstick_touch,
+            left_trigger_touch,
+            right_trigger_touch,
+            left_face_touch,
+            right_face_touch,
             a_button,
             b_button,
             x_button,
@@ -277,6 +322,22 @@ impl Controllers {
             .right_thumbstick_touch
             .state(session, xr::Path::NULL)?
             .current_state;
+        self.state.l_trigger_touch = self
+            .left_trigger_touch
+            .state(session, xr::Path::NULL)?
+            .current_state;
+        self.state.r_trigger_touch = self
+            .right_trigger_touch
+            .state(session, xr::Path::NULL)?
+            .current_state;
+        self.state.l_face_touch = self
+            .left_face_touch
+            .state(session, xr::Path::NULL)?
+            .current_state;
+        self.state.r_face_touch = self
+            .right_face_touch
+            .state(session, xr::Path::NULL)?
+            .current_state;
         self.state.btn_a = self.a_button.state(session, xr::Path::NULL)?.current_state;
         self.state.btn_b = self.b_button.state(session, xr::Path::NULL)?.current_state;
         self.state.btn_x = self.x_button.state(session, xr::Path::NULL)?.current_state;
@@ -315,12 +376,14 @@ impl Controllers {
         let s = &self.state;
         info!("── Controllers ──────────────────────────────────────");
         info!(
-            "  L trigger={:.2} squeeze={:.2} stick=({:.2},{:.2}) click={} touch={}",
-            s.l_trigger, s.l_squeeze, s.l_stick.x, s.l_stick.y, s.l_stick_click, s.l_stick_touch
+            "  L trigger={:.2}(touch={}) squeeze={:.2} stick=({:.2},{:.2}) click={} touch={} face_touch={}",
+            s.l_trigger, s.l_trigger_touch, s.l_squeeze, s.l_stick.x, s.l_stick.y, s.l_stick_click,
+            s.l_stick_touch, s.l_face_touch
         );
         info!(
-            "  R trigger={:.2} squeeze={:.2} stick=({:.2},{:.2}) click={} touch={}",
-            s.r_trigger, s.r_squeeze, s.r_stick.x, s.r_stick.y, s.r_stick_click, s.r_stick_touch
+            "  R trigger={:.2}(touch={}) squeeze={:.2} stick=({:.2},{:.2}) click={} touch={} face_touch={}",
+            s.r_trigger, s.r_trigger_touch, s.r_squeeze, s.r_stick.x, s.r_stick.y, s.r_stick_click,
+            s.r_stick_touch, s.r_face_touch
         );
         info!(
             "  Buttons: A={} B={} X={} Y={} Menu={}",
