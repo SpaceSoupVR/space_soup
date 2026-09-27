@@ -760,6 +760,7 @@ mod tests {
             lights.upload(
                 &queue,
                 &[Light {
+                    mask_channel: None,
                     position: glam::Vec3::new(0.0, 0.0, 4.0),
                     direction: glam::Vec3::NEG_Z,
                     kind: LightKind::Point,

@@ -475,6 +475,15 @@ impl XrRenderer {
             }
             None => lights,
         };
+        // `Levers::stationary_lights` off leaves the stationary lamps out --
+        // measurement only: their light is in no lightmap.
+        let without_stationary: Vec<Light>;
+        let lights: &[Light] = if fx.stationary_lights {
+            lights
+        } else {
+            without_stationary = lights.iter().copied().filter(|l| l.mask_channel.is_none()).collect();
+            &without_stationary
+        };
         let ranked_idx = crate::renderer::lights::rank_for_budget_indices(
             lights,
             crate::renderer::lights::MAX_LIGHTS,
@@ -506,6 +515,10 @@ impl XrRenderer {
                 .iter()
                 .copied()
                 .filter(|&src| source_lights[src].kind == crate::renderer::LightKind::Spot)
+                // A STATIONARY lamp's shadows are baked into its mask channel;
+                // a shadow map slot spent on it would draw the same shadow a
+                // second time, every frame.
+                .filter(|&src| source_lights[src].mask_channel.is_none())
                 .map(|src| (src, crate::renderer::lights::influence_score(&source_lights[src])))
                 .collect();
             let chosen = crate::renderer::lights::spot_shadow_slots(
