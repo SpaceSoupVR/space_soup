@@ -1406,6 +1406,12 @@ fn brush_shader() -> String {
 /// `the_sun_mask_range_matches_the_renderer` holds the two together.
 pub const SUN_MASK_DISTANCE_TEXELS: f32 = 4.0;
 
+/// How far a STATIONARY lamp's mask distance reaches, in mask texels.
+/// `space_soup_engine::brush_lightmap::STATIONARY_MASK_DISTANCE_TEXELS` must
+/// equal it, and the baker's `the_stationary_mask_range_matches_the_renderer`
+/// holds the two together.
+pub const STATIONARY_MASK_DISTANCE_TEXELS: f32 = 4.0;
+
 fn brush_shader_with(ssr: bool) -> String {
     brush_shader_variant(ssr, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG)
 }
@@ -1710,6 +1716,18 @@ struct VOut {{
     let sun_d = (sun_mask.r - 0.5) * (2.0 * SUN_MASK_DISTANCE_TEXELS);
     let sun_w = max(max(sun_mask.b * SUN_MASK_DISTANCE_TEXELS, 0.5 * fwidth(sun_d)), 0.02);
     receiver_sun_mask = select(-1.0, smoothstep(-sun_w, sun_w, sun_d), sun_mask.g > 0.5);
+    // THE STATIONARY LAMPS' SHADOWS, rebuilt as the sun's is: one signed
+    // distance per channel, four lamps a layer, the edge put back at zero at
+    // any magnification and never narrower than a pixel. The neutral mask an
+    // unbaked level carries reads fully lit. See `stationary_visibility`.
+    let st_a = textureSample(lm_stationary, lm_sun_samp, lm_uv, 0);
+    let st_b = textureSample(lm_stationary, lm_sun_samp, lm_uv, 1);
+    let st_da = (st_a - vec4<f32>(0.5)) * (2.0 * STATIONARY_MASK_DISTANCE_TEXELS);
+    let st_db = (st_b - vec4<f32>(0.5)) * (2.0 * STATIONARY_MASK_DISTANCE_TEXELS);
+    let st_wa = max(0.5 * fwidth(st_da), vec4<f32>(0.02));
+    let st_wb = max(0.5 * fwidth(st_db), vec4<f32>(0.02));
+    stationary_vis_a = smoothstep(-st_wa, st_wa, st_da);
+    stationary_vis_b = smoothstep(-st_wb, st_wb, st_db);
     // The baked lamps are in this atlas. See `receiver_skips_baked`.
     receiver_skips_baked = true;
     // The albedo goes IN rather than being multiplied over the result: a
@@ -1774,6 +1792,10 @@ struct VOut {{
 // How far the sun mask's signed distance reaches, in mask texels. See
 // `SUN_MASK_DISTANCE_TEXELS`.
 const SUN_MASK_DISTANCE_TEXELS: f32 = {sun_mask_range:?};
+// The stationary lamps' shadow masks, and their distance range. See
+// `STATIONARY_MASK_DISTANCE_TEXELS`.
+@group(2) @binding(5) var lm_stationary: texture_2d_array<f32>;
+const STATIONARY_MASK_DISTANCE_TEXELS: f32 = {stationary_range:?};
 
 @group(1) @binding(0) var mat_color: texture_2d_array<f32>;
 @group(1) @binding(1) var mat_normal: texture_2d_array<f32>;
@@ -1905,6 +1927,7 @@ struct VOut {{
         lights_block = wgsl_lights_block(0, 1),
         ssr_block = ssr_block,
         sun_mask_range = SUN_MASK_DISTANCE_TEXELS,
+        stationary_range = STATIONARY_MASK_DISTANCE_TEXELS,
         lighting = lighting,
         centroid = if BRUSH_CENTROID_VARYINGS {
             "@interpolate(perspective, centroid) "
@@ -2228,6 +2251,7 @@ mod tests {
             lights.upload_frame(
                 &queue,
                 &[Light {
+                    mask_channel: None,
                     position: glam::Vec3::ZERO,
                     direction: glam::Vec3::new(0.0, 0.0, -1.0),
                     kind: LightKind::Directional,
@@ -2248,6 +2272,7 @@ mod tests {
             lights.upload(
                 &queue,
                 &[Light {
+                    mask_channel: None,
                     position: light_pos,
                     direction: glam::Vec3::new(-1.0, 0.0, 0.0),
                     kind: LightKind::Point,

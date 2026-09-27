@@ -1535,6 +1535,7 @@ mod render_tests {
 
     fn sun() -> Light {
         Light {
+            mask_channel: None,
             position: Vec3::ZERO,
             // Straight down. `direction` is the way the light TRAVELS.
             direction: Vec3::NEG_Y,
@@ -1582,6 +1583,7 @@ mod render_tests {
     /// A spot above the receiver, aimed straight down.
     fn spot_above(x: f32, intensity: f32) -> Light {
         Light {
+            mask_channel: None,
             position: Vec3::new(x, 6.0, 0.0),
             direction: Vec3::NEG_Y,
             kind: LightKind::Spot,
@@ -1804,6 +1806,7 @@ mod render_tests {
         let at = |intensity: f32, distance: f32| {
             shade_receiver(Scene {
                 lights: vec![Light {
+                    mask_channel: None,
                     position: Vec3::new(0.0, distance, 0.0),
                     direction: Vec3::NEG_Y,
                     kind: LightKind::Point,
@@ -2058,6 +2061,7 @@ mod render_tests {
     /// object's origin, aimed straight down.
     fn hall_spot_1() -> Light {
         Light {
+            mask_channel: None,
             position: Vec3::new(0.0, 3.1 - 1.18, -4.5),
             direction: Vec3::NEG_Y,
             kind: LightKind::Spot,

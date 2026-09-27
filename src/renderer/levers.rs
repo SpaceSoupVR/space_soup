@@ -54,6 +54,9 @@ pub struct Levers {
     pub sun_dynamic: bool,
     /// The live light loop, the sky's sun included. Baked light and probes stay.
     pub direct_lights: bool,
+    /// The STATIONARY lamps -- shaded live, shadowed from their baked masks.
+    /// MEASUREMENT: off, their light is in no lightmap, so it is simply gone.
+    pub stationary_lights: bool,
     /// Eye adaptation. Off: exposure is pinned at the scene's post setting.
     pub eye_adaptation: bool,
     /// Screen-space reflections. `None` leaves the in-headset switch alone.
@@ -81,6 +84,7 @@ impl Default for Levers {
             shadows: true,
             sun_dynamic: true,
             direct_lights: true,
+            stationary_lights: true,
             eye_adaptation: true,
             ssr: None,
             multiview: None,
@@ -116,6 +120,7 @@ impl Levers {
             Phase::NoDirectLights => l.direct_lights = false,
             Phase::NoProbeTrace => l.probe_trace = false,
             Phase::NoProxies => l.reflection_proxies = false,
+            Phase::NoStationary => l.stationary_lights = false,
         }
         l
     }
@@ -138,6 +143,7 @@ impl Levers {
         flag("shadows", self.shadows, d.shadows);
         flag("sun_dynamic", self.sun_dynamic, d.sun_dynamic);
         flag("direct_lights", self.direct_lights, d.direct_lights);
+        flag("stationary", self.stationary_lights, d.stationary_lights);
         flag("eye_adaptation", self.eye_adaptation, d.eye_adaptation);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);

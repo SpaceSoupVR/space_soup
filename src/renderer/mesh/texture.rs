@@ -5,8 +5,9 @@ pub struct LoadedTexture {
     pub bind_group: wgpu::BindGroup,
     /// Held only so the bind group's view stays valid. Never sampled from Rust.
     _direction: Option<wgpu::Texture>,
-    /// The brush sun mask and its sampler, held for the same reason.
-    _sun_mask: Option<(wgpu::Texture, wgpu::Sampler)>,
+    /// The brush sun mask, its sampler and the stationary lamps' masks, held
+    /// for the same reason.
+    _sun_mask: Option<(wgpu::Texture, wgpu::Sampler, wgpu::Texture)>,
 }
 
 pub(crate) fn load_primitive_texture(
@@ -251,6 +252,16 @@ pub const SUN_MASK_MIP_LEVELS: u32 = 5;
 /// no mask, or a mesh, which never has one, is lit.
 pub const NEUTRAL_SUN_MASK: [u8; 4] = [0, 0, 0, 0];
 
+/// The neutral stationary-lamp mask texel: every channel at the far LIT end of
+/// its distance range, so a level baked before stationary lamps -- or a lamp
+/// with no channel -- is simply unshadowed by it. One shading path, no branch.
+pub const NEUTRAL_STATIONARY_MASK: [u8; 4] = [255, 255, 255, 255];
+
+/// Mip levels on the stationary masks, as on the sun mask: distances average
+/// into distances, so a far surface reads a smaller, still-straight edge
+/// rather than aliasing across a texel grid finer than its pixels.
+pub const STATIONARY_MASK_MIP_LEVELS: u32 = 4;
+
 /// The levels an image this size can actually supply, never more than asked.
 ///
 /// A 1x1 neutral direction map cannot produce three levels, and asking wgpu
@@ -418,6 +429,25 @@ pub fn create_lightmap_texture_with_sun(
     direction: Option<(&[u8], u32, u32)>,
     sun_mask: Option<(&[u8], u32, u32)>,
 ) -> LoadedTexture {
+    create_lightmap_texture_full(device, queue, layout, light, width, height, direction, sun_mask, None)
+}
+
+/// `create_lightmap_texture_with_sun`, with the STATIONARY lamps' shadow masks:
+/// one RGBA8 image per four lamps, all the same size, at `STATIONARY_MASK_SCALE`
+/// times the lightmap's density on its charts. `None` binds the neutral mask,
+/// under which every stationary lamp is unshadowed.
+#[allow(clippy::too_many_arguments)]
+pub fn create_lightmap_texture_full(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    light: LightmapLight,
+    width: u32,
+    height: u32,
+    direction: Option<(&[u8], u32, u32)>,
+    sun_mask: Option<(&[u8], u32, u32)>,
+    stationary: Option<(&[&[u8]], u32, u32)>,
+) -> LoadedTexture {
     // The texture ONLY -- deliberately not `create_texture_from_rgba`, which
     // also builds a two-binding bind group. Handing it this three-binding
     // layout makes wgpu reject the group for having the wrong number of
@@ -485,6 +515,9 @@ pub fn create_lightmap_texture_with_sun(
         lod_max_clamp: (SUN_MASK_MIP_LEVELS - 1) as f32,
         ..Default::default()
     });
+    let neutral: [&[u8]; 1] = [&NEUTRAL_STATIONARY_MASK];
+    let (st_layers, st_w, st_h) = stationary.unwrap_or((&neutral, 1, 1));
+    let (st_tex, st_view) = upload_rgba8_array_mipped(device, queue, st_layers, st_w, st_h, "lightmap_stationary");
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("lightmap_bg"),
         layout,
@@ -509,6 +542,10 @@ pub fn create_lightmap_texture_with_sun(
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(&sun_sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&st_view),
+            },
         ],
     });
     LoadedTexture {
@@ -517,7 +554,7 @@ pub fn create_lightmap_texture_with_sun(
         _sampler: sampler,
         bind_group,
         _direction: Some(dir_tex),
-        _sun_mask: Some((sun_tex, sun_sampler)),
+        _sun_mask: Some((sun_tex, sun_sampler, st_tex)),
     }
 }
 
@@ -594,6 +631,56 @@ fn upload_linear_f16_mipped(
 /// Upload an RGBA image's red and green channels as a mipped `Rg8Unorm`.
 ///
 /// The chain is averaged linearly: both channels are fractions, not colour.
+/// RGBA8 images as the layers of one mipped 2D array. Every layer must be
+/// `width` x `height`; mips are generated per layer on the CPU.
+fn upload_rgba8_array_mipped(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layers: &[&[u8]],
+    width: u32,
+    height: u32,
+    label: &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    use crate::renderer::terrain_pipeline::mip_chain_linear;
+    let levels = mip_levels_for(width, height, STATIONARY_MASK_MIP_LEVELS);
+    let count = layers.len().max(1) as u32;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: count },
+        mip_level_count: levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (layer, rgba) in layers.iter().enumerate() {
+        for (level, (data, lw, lh)) in mip_chain_linear(rgba, width, height, levels).iter().enumerate() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * lw),
+                    rows_per_image: Some(*lh),
+                },
+                wgpu::Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
+            );
+        }
+    }
+    // ALWAYS an array view, even of one layer: the layout says so.
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    (texture, view)
+}
+
 fn upload_rg8_mipped(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

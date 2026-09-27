@@ -10,7 +10,7 @@ mod vertex;
 
 pub use skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, GltfSkin, SkinnedMeshPrimitive, MAX_SKIN_JOINTS};
 pub use texture::{
-    create_lightmap_texture, create_lightmap_texture_with_sun, create_mesh_material_texture, LightmapLight,
+    create_lightmap_texture, create_lightmap_texture_full, create_lightmap_texture_with_sun, create_mesh_material_texture, LightmapLight,
     create_texture_from_rgba, LoadedTexture,
     LIGHTMAP_MIP_LEVELS, NEUTRAL_BOUNCE_DIRECTION, NEUTRAL_SUN_MASK, SUN_MASK_MIP_LEVELS,
 };

@@ -836,6 +836,7 @@ pub(crate) mod tests {
             // how much light the fragment receives. Directly overhead would
             // make an x-tilt symmetric and hide exactly what is being tested.
             lights.upload(&queue, &[crate::renderer::lights::Light {
+                mask_channel: None,
                 position: glam::Vec3::new(3.0, 2.0, 0.0),
                 direction: glam::Vec3::new(0.0, -1.0, 0.0),
                 kind: crate::renderer::lights::LightKind::Point,

@@ -1022,6 +1022,11 @@ impl XrRenderer {
     /// `sun_mask` is the baked sky-sun visibility (RGBA, red = visible
     /// fraction, green = baked), at `SUN_MASK_SCALE` times this atlas's density.
     /// `None` shades the brushes' sun from the level's static shadow map.
+    /// `stationary` is the stationary lamps' shadow masks, one RGBA image per
+    /// four lamps, all `stationary_size`, at `STATIONARY_MASK_SCALE` times
+    /// this atlas's density; empty binds the neutral mask, under which every
+    /// stationary lamp is unshadowed.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_brush_lightmap(
         &mut self,
         light: crate::renderer::mesh::LightmapLight,
@@ -1029,8 +1034,10 @@ impl XrRenderer {
         height: u32,
         direction: Option<(&[u8], u32, u32)>,
         sun_mask: Option<(&[u8], u32, u32)>,
+        stationary: &[&[u8]],
+        stationary_size: (u32, u32),
     ) {
-        self.brush_lightmap = Some(crate::renderer::mesh::create_lightmap_texture_with_sun(
+        self.brush_lightmap = Some(crate::renderer::mesh::create_lightmap_texture_full(
             &self.wgpu_device,
             &self.wgpu_queue,
             &self.brush_pipeline.lightmap_layout,
@@ -1039,6 +1046,7 @@ impl XrRenderer {
             height,
             direction,
             sun_mask,
+            (!stationary.is_empty()).then_some((stationary, stationary_size.0, stationary_size.1)),
         ));
     }
 

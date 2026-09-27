@@ -60,6 +60,21 @@ pub fn lightmap_bind_group_layout(device: &Device) -> BindGroupLayout {
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
+            // The STATIONARY LAMPS' baked shadows: one RGBA layer per four
+            // lamps, a signed distance per channel, on the brush charts at
+            // `STATIONARY_MASK_SCALE` times the lightmap's density. Declared on
+            // every lightmap for the one-layout reason above; only the brush
+            // shader samples it, through the sun mask's sampler.
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }

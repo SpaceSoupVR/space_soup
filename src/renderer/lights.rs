@@ -343,6 +343,7 @@ pub fn sky_sun_light(
         (e * 255.0).round() as u8
     };
     Some(Light {
+        mask_channel: None,
         position: Vec3::ZERO,
         // The way the light TRAVELS -- away from the sun.
         direction: world_to_player * -Vec3::from(sun.direction),
@@ -458,6 +459,11 @@ pub struct Light {
     /// Full angle of the bright core. Zero means the beam fades from the axis
     /// to the rim with no edge, which is what a spot did before this existed.
     pub inner_cone_angle_deg: f32,
+    /// A STATIONARY lamp's channel of the level's baked shadow masks: its
+    /// direct light is shaded here every frame, its shadows come from the
+    /// bake. `None` for every other light. See `stationary_visibility` in the
+    /// lights block and `space_soup_engine::stationary`.
+    pub mask_channel: Option<u8>,
 }
 
 #[repr(C)]
@@ -588,9 +594,16 @@ fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_bake
                 LightKind::Directional => 2.0,
             };
             let baked = sun_is_baked && l.kind == LightKind::Directional;
-            // position.w = 1 marks the sky's sun -- see `sun_visibility`.
+            // position.w = 1 marks the sky's sun -- see `sun_visibility`; 2 + c
+            // a stationary lamp shadowed by mask channel c -- see
+            // `stationary_visibility`.
+            let marker = match l.mask_channel {
+                Some(c) => 2.0 + c as f32,
+                None if baked => 1.0,
+                None => 0.0,
+            };
             *slot = GpuLight {
-                position: [l.position.x, l.position.y, l.position.z, if baked { 1.0 } else { 0.0 }],
+                position: [l.position.x, l.position.y, l.position.z, marker],
                 direction: [l.direction.x, l.direction.y, l.direction.z, cos_inner],
                 color_intensity: [color[0], color[1], color[2], l.intensity],
                 params: [l.range, cos_outer, kind, -1.0],
@@ -872,6 +885,26 @@ const LAMP_RADIUS: f32 = 0.05;
 // staircase of lightmap texels -- and everything else leaves it at -1 and is
 // shadowed by the level's static sun map instead. See `sun_visibility`.
 var<private> receiver_sun_mask: f32 = -1.0;
+
+// THE STATIONARY LAMPS' BAKED SHADOWS at this receiver: the visibility of the
+// lamp owning mask channel c is `stationary_vis_a[c]` for c < 4, else
+// `stationary_vis_b[c - 4]`. Set by receivers that carry the masks -- the
+// brushes, from their atlas; 1, unshadowed, everywhere else. See
+// `stationary_visibility`.
+var<private> stationary_vis_a: vec4<f32> = vec4<f32>(1.0);
+var<private> stationary_vis_b: vec4<f32> = vec4<f32>(1.0);
+
+// How much of lamp `l` the LEVEL lets through to this receiver: its channel of
+// the baked mask when it is a stationary lamp (`position.w` = 2 + channel),
+// else 1 -- a live lamp is shadowed by the shadow map, if it has a slot.
+fn stationary_visibility(l: Light) -> f32 {{
+    if (l.position.w < 1.5) {{
+        return 1.0;
+    }}
+    let c = i32(l.position.w - 1.5);
+    let v = select(stationary_vis_b, stationary_vis_a, c < 4);
+    return v[c & 3];
+}}
 // Whether this fragment's surface carries the BAKED lights in its lightmap.
 // The light list is ordered live first, baked after -- `lights.count.y` is
 // where the baked tail starts -- and a lightmapped surface stops there: its
@@ -1358,7 +1391,7 @@ fn light_debug(world_pos: vec3<f32>, n: vec3<f32>) -> vec2<f32> {{
         if (l.params.z > 1.5) {{ continue; }}
         let c = light_contribution_split(l, world_pos, n, view_dir, 32.0, 0.2);
         let lum = dot(c.diffuse, vec3<f32>(0.2126, 0.7152, 0.0722));
-        var shadow = 1.0;
+        var shadow = stationary_visibility(l);
         let layer = i32(l.params.w);
         if (layer >= 0 && f32(layer) < camera.shadow_params.y) {{
             shadow = shadow * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
@@ -2629,7 +2662,7 @@ fn shade_material_env(
         // ONE shadow factor for both halves: a surface in shadow receives no
         // light at all, and a highlight that survives its own shadow is the
         // classic tell of a renderer that shadows only the diffuse term.
-        var shadow = 1.0;
+        var shadow = stationary_visibility(l);
         if (l.params.z > 1.5) {{
             shadow = sun_visibility(l, world_pos);
         }}
@@ -2685,6 +2718,7 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
         if (l.params.z > 1.5) {{
             c = c * sun_visibility(l, world_pos);
         }}
+        c = c * stationary_visibility(l);
         // params.w is this light's own shadow layer, or -1 when it did not get
         // one. Asking the LIGHT beats the old "is this the flashlight index"
         // test, which by construction could only ever be true for one lamp.
@@ -2807,6 +2841,7 @@ mod budget_tests {
 
     fn light(kind: LightKind, pos: Vec3, intensity: f32) -> Light {
         Light {
+            mask_channel: None,
             position: pos,
             direction: Vec3::NEG_Z,
             kind,
@@ -3971,6 +4006,7 @@ mod baked_light_split_tests {
 
     fn point(x: f32, i: f32) -> Light {
         Light {
+            mask_channel: None,
             position: Vec3::new(x, 1.0, 0.0),
             direction: Vec3::NEG_Y,
             kind: LightKind::Point,

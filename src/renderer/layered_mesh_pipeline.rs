@@ -518,6 +518,7 @@ mod tests {
         uniforms.upload(&queue, glam::Mat4::IDENTITY, TEST_EYE, &ShadowUpload::disabled());
         if shot.lit {
             lights.upload(&queue, &[Light {
+                mask_channel: None,
                 position: glam::Vec3::from(shot.light_at),
                 direction: glam::Vec3::new(0.0, -1.0, 0.0),
                 kind: LightKind::Point,

@@ -69,10 +69,13 @@ pub enum Phase {
     /// No proxies in the trace: reflections pass through the pillar and the
     /// lamps. The cost of what stands inside rooms.
     NoProxies,
+    /// No stationary lamps: the cost of shading them live with their baked
+    /// shadow masks. Their light is in no lightmap, so the room goes dark.
+    NoStationary,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 11] = [
+    pub const ALL: [Phase; 12] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -84,6 +87,7 @@ impl Phase {
         Phase::NoDirectLights,
         Phase::NoProbeTrace,
         Phase::NoProxies,
+        Phase::NoStationary,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -118,6 +122,7 @@ impl Phase {
             Phase::NoDirectLights => "no_direct_lights",
             Phase::NoProbeTrace => "no_probe_trace",
             Phase::NoProxies => "no_proxies",
+            Phase::NoStationary => "no_stationary",
         }
     }
 }
