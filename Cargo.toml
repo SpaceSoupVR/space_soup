@@ -14,23 +14,28 @@ name       = "space_soup"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-wgpu        = { version = "25.0.0", optional = true }
+# The sky model, shared with the baker so the two cannot drift. Tiny and
+# renderer-agnostic by design -- see the crate docs.
+space_soup_sky = { path = "../space_soup_sky" }
+wgpu        = { version = "30.0.1", optional = true }
 bytemuck    = { version = "1.21.0", optional = true, features = ["derive"] }
 glam        = { version = "0.29", features = ["serde"] }
 serde       = { version = "1.0", features = ["derive"] }
 serde_json  = "1.0"
 # `extras` is off by default and turns `Extras` from a Void into the raw JSON.
 # A cave bake declares its own shading there -- see mesh/node.rs.
-gltf        = { version = "1.4", features = ["extras"] }
+gltf        = { version = "1.4", features = ["extras", "KHR_materials_transmission"] }
 anyhow      = "1.0"
 image       = { package = "image", version = "0.25.5" }
 fontdue     = "0.9.3"
 lazy_static = "1.5.0"
 log         = "0.4"
+# BOTH TARGETS. The XR renderer is Android-only and needs it to read a wgpu
+# error scope at startup -- see the stereo pipeline guard in `xr_renderer`.
+pollster    = "0.3"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 env_logger = "0.11"
-pollster   = "0.3"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.14"

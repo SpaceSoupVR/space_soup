@@ -9,10 +9,38 @@ mod texture;
 mod vertex;
 
 pub use skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, GltfSkin, SkinnedMeshPrimitive, MAX_SKIN_JOINTS};
-pub use texture::{create_texture_from_rgba, LoadedTexture};
+pub use texture::{
+    create_lightmap_texture, create_lightmap_texture_with_sun, create_mesh_material_texture, LightmapLight,
+    create_texture_from_rgba, LoadedTexture,
+    LIGHTMAP_MIP_LEVELS, NEUTRAL_BOUNCE_DIRECTION, NEUTRAL_SUN_MASK, SUN_MASK_MIP_LEVELS,
+};
 pub use vertex::{MeshPrimitive, MeshVertex, SkinnedMeshVertex};
 
 use node::{ancestor_joint_and_baked_local, collect_node};
+
+/// A second UV set for a mesh's baked lighting, supplied by the caller.
+///
+/// WHY THE CALLER AND NOT THIS CRATE
+///
+/// Deciding where a triangle's lighting lives in an atlas is a decision the
+/// BAKER has to make identically, and the baker is not in this crate -- this
+/// one is a standalone renderer and does not know what a scene is. So the
+/// layout lives with the game engine that owns both ends of it, exactly as the
+/// brush atlas already does, and what arrives here is only the answer: three
+/// uv2 per triangle. Nothing in this file knows what a chart is.
+///
+/// `None`, or a primitive with no entry, is the ordinary case: the mesh keeps
+/// whatever uv2 it was authored with and binds whatever lightmap it was given.
+#[derive(Debug, Default, Clone)]
+pub struct MeshLightmapUv {
+    /// Keyed by (glTF node index, primitive index within that node's mesh).
+    ///
+    /// Each value holds one uv2 per triangle CORNER, in the primitive's own
+    /// index order -- so its length is the primitive's index count. Keyed by
+    /// node index rather than by traversal order because that is a property of
+    /// the file, and the producer of this map walked the document separately.
+    pub per_primitive: HashMap<(usize, usize), Vec<[f32; 2]>>,
+}
 
 #[derive(Clone)]
 pub struct GltfMesh {
@@ -81,6 +109,7 @@ impl GltfMesh {
                 }),
                 joint_bind_group: None,
                 primitives: skin.primitives.clone(),
+                bind_stature: skin.bind_stature,
             });
         }
         m
@@ -91,13 +120,72 @@ impl GltfMesh {
         device: &wgpu::Device,
         excluded_joints: &[usize],
     ) -> Self {
+        self.clone_with_independent_skin_excluding(device, excluded_joints, Vec3::Y, None)
+    }
+
+    /// As above, and additionally dropping everything above `cutoff_height`.
+    ///
+    /// The cutoff is what removes the wearer's own neck. Joint exclusion alone
+    /// cannot: neck vertices are typically weighted mostly to Chest or Spine,
+    /// which have to stay because they are the torso the wearer looks down at.
+    /// See `SkinnedMeshPrimitive::excluding_joints_and_above`.
+    pub fn clone_with_independent_skin_excluding(
+        &self,
+        device: &wgpu::Device,
+        excluded_joints: &[usize],
+        up: Vec3,
+        cutoff_height: Option<f32>,
+    ) -> Self {
         let mut m = self.clone_with_independent_skin(device);
         if let Some(skin) = &mut m.skin {
+            // Bind-pose positions, so the cutoff is a fixed height on the model
+            // and does not swing about as the head turns.
+            let bind_transforms = skin.hierarchical_transforms(&skin.joint_local_bind);
+            let bind_pose_mats: Vec<Mat4> = skin
+                .inv_bind_mats
+                .iter()
+                .enumerate()
+                .map(|(ji, inv_bind)| bind_transforms[ji] * *inv_bind)
+                .collect();
+            let before: usize = skin.primitives.iter().map(|p| p.indices.len()).sum();
             skin.primitives = skin
                 .primitives
                 .iter()
-                .filter_map(|prim| prim.excluding_joints(device, excluded_joints))
+                .filter_map(|prim| {
+                    let bind_positions: Vec<Vec3> = prim
+                        .vertices
+                        .iter()
+                        .map(|v| {
+                            bind_pose_mats
+                                .get(v.dominant_joint())
+                                .copied()
+                                .unwrap_or(Mat4::IDENTITY)
+                                .transform_point3(Vec3::from(v.position))
+                        })
+                        .collect();
+                    prim.excluding_joints_and_above(
+                        device,
+                        excluded_joints,
+                        &bind_positions,
+                        up,
+                        cutoff_height,
+                    )
+                })
                 .collect();
+            let after: usize = skin.primitives.iter().map(|p| p.indices.len()).sum();
+            // The one number that distinguishes "the cull is wrong" from "the
+            // cull did nothing". Every previous theory about the wearer's own
+            // body was argued from the geometry rather than measured, and each
+            // was wrong in a way this line would have shown immediately.
+            log::info!(
+                "AVATARCULL joints={:?} cutoff={:?} along {:?}: {} -> {} indices ({} tris removed)",
+                excluded_joints.len(),
+                cutoff_height,
+                up,
+                before,
+                after,
+                (before - after) / 3,
+            );
         }
         m
     }
@@ -107,6 +195,24 @@ impl GltfMesh {
         queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,
         path: &Path,
+    ) -> Result<Self> {
+        Self::load_with_lightmap_uv(device, queue, layout, path, None)
+    }
+
+    /// As [`Self::load`], with a caller-supplied lightmap UV set.
+    ///
+    /// A primitive that has an entry in `lightmap_uv` is DE-INDEXED: adjacent
+    /// triangles land in unrelated parts of the atlas, so a vertex shared
+    /// between them has no single uv2 -- every edge is a chart seam. That costs
+    /// three vertices per triangle instead of roughly one, which is why the
+    /// caller decides which meshes are worth it rather than this crate deciding
+    /// for every mesh it ever loads.
+    pub fn load_with_lightmap_uv(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        path: &Path,
+        lightmap: Option<&MeshLightmapUv>,
     ) -> Result<Self> {
         let (doc, buffers, images) =
             gltf::import(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -285,6 +391,7 @@ impl GltfMesh {
                     layout,
                     false,
                     &node_index_to_joint,
+                    lightmap,
                     &mut static_prims,
                     &mut skinned_prims,
                 );
@@ -322,6 +429,9 @@ impl GltfMesh {
                 joint_buffer,
                 joint_bind_group: None,
                 primitives: Vec::new(),
+                // Filled in by the bind-pose vertex walk below, which cannot
+                // run until the primitives are attached.
+                bind_stature: 0.0,
             })
         };
 
@@ -336,6 +446,10 @@ impl GltfMesh {
                 .collect();
             skin.update_joint_matrices(queue, &bind_pose_mats);
 
+            // One walk, two answers: the radius the culler wants and the
+            // stature the first-person eye placement wants.
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
             let skinned_radius = skin
                 .primitives
                 .iter()
@@ -345,9 +459,17 @@ impl GltfMesh {
                         .get(v.dominant_joint())
                         .copied()
                         .unwrap_or(Mat4::IDENTITY);
-                    world.transform_point3(Vec3::from(v.position)).length()
+                    let p = world.transform_point3(Vec3::from(v.position));
+                    // Along the MODEL's up axis, which for a glTF skin is +Y by
+                    // specification -- a Z-up authoring tool has to bake its own
+                    // correction into the export, so the file is always Y-up by
+                    // the time it reaches here.
+                    lo = lo.min(p.y);
+                    hi = hi.max(p.y);
+                    p.length()
                 })
                 .fold(0.0_f32, f32::max);
+            skin.bind_stature = if hi > lo { hi - lo } else { 0.0 };
             let static_radius = static_prims
                 .iter()
                 .flat_map(|p| p.vertices.iter())
@@ -398,6 +520,7 @@ impl GltfMesh {
                     layout,
                     true,
                     &empty_node_to_joint,
+                    None,
                     &mut static_prims,
                     &mut skinned_prims,
                 );

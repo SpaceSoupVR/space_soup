@@ -126,19 +126,41 @@ impl ParticlePipeline {
     /// See `pipeline::SolidPipeline::new_multisampled` -- a pipeline's sample
     /// count must match the pass it runs in, so a 4x eye pass needs its own.
     pub fn new_multisampled(
+
         device: &Device,
         format: TextureFormat,
         uniform_layout: &BindGroupLayout,
         samples: u32,
     ) -> Self {
+        Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Mono)
+    }
+
+    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
+    pub fn new_multisampled_stereo(
+
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
+        Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Stereo)
+    }
+
+    fn new_with_view(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("particle_shader"),
-            source: ShaderSource::Wgsl(particle_shader().into()),
+            source: ShaderSource::Wgsl(view.shader(particle_shader()).into()),
         });
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("particle_layout"),
-            bind_group_layouts: &[uniform_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(uniform_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("particle_pipeline"),
@@ -147,7 +169,7 @@ impl ParticlePipeline {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[ParticleVertex::layout()],
+                buffers: &[Some(ParticleVertex::layout())],
             },
             fragment: Some(FragmentState {
                 module: &shader,
@@ -168,13 +190,13 @@ impl ParticlePipeline {
             },
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: CompareFunction::Less,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::Less),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
-            multiview: None,
+            multiview_mask: view.mask(),
             cache: None,
         });
         Self { pipeline }

@@ -5,6 +5,15 @@ pub struct XrContext {
     pub instance: xr::Instance,
     pub system: xr::SystemId,
     pub has_hand_tracking: bool,
+    /// Whether `XR_FB_composition_layer_settings` is available AND was asked
+    /// for. Both halves, because chaining the struct onto a projection layer
+    /// when the runtime does not know the extension is not a no-op -- the
+    /// runtime is entitled to reject the whole layer over an unrecognised
+    /// `next`, which loses the frame rather than the sharpening.
+    pub has_layer_settings: bool,
+    /// Whether `XR_META_performance_metrics` was available and enabled. See
+    /// `perf_metrics`.
+    pub has_performance_metrics: bool,
 }
 
 impl XrContext {
@@ -37,6 +46,29 @@ impl XrContext {
             info!("Hand tracking extension available");
         }
 
+        // MQSR. Only asked for when the policy actually wants it, so the
+        // extension is not enabled on a build that would chain nothing --
+        // see `renderer::layer_settings`.
+        let wants_sharpening =
+            crate::renderer::layer_settings::XR_SHARPENING.wants_layer_settings();
+        let has_layer_settings = available_exts.fb_composition_layer_settings && wants_sharpening;
+        if has_layer_settings {
+            exts.fb_composition_layer_settings = true;
+            info!(
+                "Composition layer settings available -- requesting {:?} sharpening",
+                crate::renderer::layer_settings::XR_SHARPENING
+            );
+        } else if wants_sharpening {
+            info!("Composition layer settings NOT available -- no compositor sharpening");
+        }
+
+        // The runtime's own frame counters, for the `XRPERF` log line. See
+        // `perf_metrics`. Asked for only where the runtime lists it.
+        let has_performance_metrics = available_exts.meta_performance_metrics;
+        if has_performance_metrics {
+            exts.meta_performance_metrics = true;
+        }
+
         let instance = entry.create_instance(
             &xr::ApplicationInfo {
                 application_name: "space_soup",
@@ -58,6 +90,8 @@ impl XrContext {
             instance,
             system,
             has_hand_tracking,
+            has_layer_settings,
+            has_performance_metrics,
         })
     }
 }

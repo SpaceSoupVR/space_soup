@@ -15,24 +15,32 @@ pub(crate) fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Ve
             normal: [0.0, 0.0, 1.0],
             uv: [0.0, 1.0],
             uv2: [0.0, 1.0],
+            // A UI panel does not glow.
+            emissive: MeshVertex::NO_EMISSIVE,
         },
         MeshVertex {
             position: [hw, -hh, 0.0],
             normal: [0.0, 0.0, 1.0],
             uv: [1.0, 1.0],
             uv2: [1.0, 1.0],
+            // A UI panel does not glow.
+            emissive: MeshVertex::NO_EMISSIVE,
         },
         MeshVertex {
             position: [hw, hh, 0.0],
             normal: [0.0, 0.0, 1.0],
             uv: [1.0, 0.0],
             uv2: [1.0, 0.0],
+            // A UI panel does not glow.
+            emissive: MeshVertex::NO_EMISSIVE,
         },
         MeshVertex {
             position: [-hw, hh, 0.0],
             normal: [0.0, 0.0, 1.0],
             uv: [0.0, 0.0],
             uv2: [0.0, 0.0],
+            // A UI panel does not glow.
+            emissive: MeshVertex::NO_EMISSIVE,
         },
     ];
     let indices = vec![0, 1, 2, 0, 2, 3];
@@ -98,7 +106,7 @@ impl WorldPanel {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
@@ -201,6 +209,7 @@ impl WorldPanel {
                 label: Some("world_panel_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {

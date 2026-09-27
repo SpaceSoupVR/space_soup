@@ -6,6 +6,8 @@ pub mod ui2d;
 #[cfg(feature = "voxelize")]
 pub mod voxelize;
 
+pub mod perf_metrics_log;
+
 #[cfg(target_os = "android")]
 pub mod xr;
 

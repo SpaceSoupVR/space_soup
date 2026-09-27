@@ -112,20 +112,42 @@ impl TerrainPipeline {
     /// See `pipeline::SolidPipeline::new_multisampled` -- a pipeline's sample
     /// count must match the pass it runs in, so a 4x eye pass needs its own.
     pub fn new_multisampled(
+
         device: &Device,
         format: TextureFormat,
         uniform_layout: &BindGroupLayout,
         samples: u32,
     ) -> Self {
+        Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Mono)
+    }
+
+    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
+    pub fn new_multisampled_stereo(
+
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
+        Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Stereo)
+    }
+
+    fn new_with_view(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("terrain_shader"),
-            source: ShaderSource::Wgsl(terrain_shader().into()),
+            source: ShaderSource::Wgsl(view.shader(terrain_shader()).into()),
         });
         let material_layout = material_bind_group_layout(device);
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("terrain_layout"),
-            bind_group_layouts: &[uniform_layout, &material_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(uniform_layout), Some(&material_layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -137,7 +159,7 @@ impl TerrainPipeline {
                 compilation_options: PipelineCompilationOptions::default(),
                 // Same vertex format as the solid pass, so the geometry path is
                 // untouched: terrain still arrives as SolidVertex.
-                buffers: &[SolidVertex::layout()],
+                buffers: &[Some(SolidVertex::layout())],
             },
             fragment: Some(FragmentState {
                 module: &shader,
@@ -158,13 +180,13 @@ impl TerrainPipeline {
             },
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
-            multiview: None,
+            multiview_mask: view.mask(),
             cache: None,
         });
 
@@ -226,6 +248,45 @@ pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
                 },
                 count: None,
             },
+            // Baked sky visibility over the footprint. Always bound; an unbaked
+            // terrain gets a 1x1 WHITE texel, which is "sees the whole sky" and
+            // reproduces the old shading exactly. White is the neutral here
+            // because this value is MULTIPLIED -- the opposite of the brush
+            // lightmap's additive RGB, whose neutral is black.
+            BindGroupLayoutEntry {
+                binding: 6,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // Per-layer roughness and ambient occlusion, giving terrain the
+            // same material set brush surfaces have. Always bound: a layer
+            // with no map gets a solid neutral, so this is one pipeline rather
+            // than two, for the same reason the normal array is.
+            BindGroupLayoutEntry {
+                binding: 7,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 8,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
             // Authored blend weights over the terrain footprint. Always bound,
             // even when unauthored: an optional binding would mean two bind
             // group layouts and therefore two pipelines, and a 1x1 placeholder
@@ -273,6 +334,21 @@ struct Material {{
 @group(1) @binding(3) var<uniform> mat: Material;
 @group(1) @binding(4) var splat_tex: texture_2d<f32>;
 @group(1) @binding(5) var normal_tex: texture_2d_array<f32>;
+@group(1) @binding(7) var rough_tex: texture_2d_array<f32>;
+@group(1) @binding(8) var ao_tex: texture_2d_array<f32>;
+// Baked sky visibility over the terrain footprint, in R. 1 = open sky, 0 =
+// sealed. Sampled by the same normalised footprint uv the splat map uses, so it
+// needs no new vertex attribute.
+//
+// WHY TERRAIN NEEDS ITS OWN
+//
+// Brushes carry sky visibility in their lightmap's alpha, but terrain has no
+// lightmap and no chart layout to put one in -- it is a heightfield sampled by
+// world position. Without this the ground took the full open-sky term
+// everywhere, so the floor INSIDE a sealed room lit exactly as brightly as the
+// field outside it, and no amount of shadow-map work could change that: the
+// term being wrong was the ambient, not the direct light.
+@group(1) @binding(6) var sky_occ_tex: texture_2d<f32>;
 
 {lights_block}
 {biplanar_block}
@@ -284,6 +360,10 @@ struct VOut {{
     @location(0) col: vec4<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) world_pos: vec3<f32>,
+    // The same point before the player-frame transform. Texture projection and
+    // the height blend are properties of the GROUND, not of where the player is
+    // standing, so they read this and never `world_pos`.
+    @location(4) tex_pos: vec3<f32>,
     // Normalised position over the terrain footprint, carried in the slot the
     // cuboid path uses for lightmap coordinates. Terrain is lit dynamically and
     // has no lightmap, so that slot was sitting at (0,0) doing nothing.
@@ -292,10 +372,11 @@ struct VOut {{
 
 @vertex fn vs_main(v: VIn) -> VOut {{
     var out: VOut;
-    out.clip      = camera.view_proj * vec4<f32>(v.pos, 1.0);
+    out.clip      = cam_view_proj() * vec4<f32>(v.pos, 1.0);
     out.col       = v.col;
     out.normal    = v.norm;
     out.world_pos = v.pos;
+    out.tex_pos   = to_world_space(v.pos);
     out.uv        = v.uv2;
     return out;
 }}
@@ -360,6 +441,120 @@ fn layer_colour(layer: i32, world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> v
     return sample_biplanar(layer, world, n, repeat);
 }}
 
+// Everything a layer needs to sample itself, computed ONCE per fragment.
+//
+// The point is the derivatives. `textureSample` picks its own mip level from
+// implicit derivatives, which is why it may only be called in uniform control
+// flow -- and that requirement is what forced all four layers to be sampled
+// whether or not they contributed. `textureSampleGrad` takes the gradients as
+// arguments and carries no such restriction, so a layer with no weight can be
+// skipped entirely.
+//
+// The gradients are taken here, before any branch, and every projection scales
+// as 1/repeat -- so a per-layer repeat is a divide, never another derivative.
+struct SampleFrame {{
+    planar_uv: vec2<f32>,
+    planar_ddx: vec2<f32>,
+    planar_ddy: vec2<f32>,
+    major_uv: vec2<f32>,
+    major_ddx: vec2<f32>,
+    major_ddy: vec2<f32>,
+    minor_uv: vec2<f32>,
+    minor_ddx: vec2<f32>,
+    minor_ddy: vec2<f32>,
+    blend: f32,
+    biplanar: f32,
+}}
+
+fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> SampleFrame {{
+    var f: SampleFrame;
+    f.planar_uv  = world.xz;
+    f.planar_ddx = dpdx(world.xz);
+    f.planar_ddy = dpdy(world.xz);
+
+    // At unit repeat, so each layer divides rather than recomputing.
+    let b = biplanar_axes(world, n, 1.0);
+    f.major_uv  = b.uv_major;
+    f.major_ddx = dpdx(b.uv_major);
+    f.major_ddy = dpdy(b.uv_major);
+    f.minor_uv  = b.uv_minor;
+    f.minor_ddx = dpdx(b.uv_minor);
+    f.minor_ddy = dpdy(b.uv_minor);
+    f.blend     = b.w;
+    f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);
+    return f;
+}}
+
+fn layer_colour_at(layer: i32, f: SampleFrame) -> vec3<f32> {{
+    let r = max(mat.repeat[layer], 0.001);
+    if (f.biplanar < 0.5) {{
+        return textureSampleGrad(
+            layer_tex, layer_samp, f.planar_uv / r, layer,
+            f.planar_ddx / r, f.planar_ddy / r,
+        ).rgb;
+    }}
+    let c_major = textureSampleGrad(
+        layer_tex, layer_samp, f.major_uv / r, layer, f.major_ddx / r, f.major_ddy / r,
+    ).rgb;
+    let c_minor = textureSampleGrad(
+        layer_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r,
+    ).rgb;
+    return mix(c_minor, c_major, f.blend);
+}}
+
+// Roughness and occlusion for one layer, sampled with the same frame and
+// gradients the normal uses so all four maps agree about which mip they are on.
+//
+// Planar only: both are low-frequency compared with colour, and a biplanar pair
+// for each would double the fetches on a fill-bound frame to move a value that
+// barely changes across the blend.
+fn layer_rough_at(layer: i32, f: SampleFrame) -> f32 {{
+    let r = max(mat.repeat[layer], 0.001);
+    return textureSampleGrad(
+        rough_tex, layer_samp, f.planar_uv / r, layer, f.planar_ddx / r, f.planar_ddy / r,
+    ).r;
+}}
+
+fn layer_ao_at(layer: i32, f: SampleFrame) -> f32 {{
+    let r = max(mat.repeat[layer], 0.001);
+    return textureSampleGrad(
+        ao_tex, layer_samp, f.planar_uv / r, layer, f.planar_ddx / r, f.planar_ddy / r,
+    ).r;
+}}
+
+fn layer_normal_at(layer: i32, n: vec3<f32>, f: SampleFrame) -> vec3<f32> {{
+    let r = max(mat.repeat[layer], 0.001);
+    let packed = textureSampleGrad(
+        normal_tex, layer_samp, f.planar_uv / r, layer, f.planar_ddx / r, f.planar_ddy / r,
+    ).rgb;
+
+    // Identical to `layer_normal` above, which stays for the planar path used
+    // elsewhere: OpenGL green-up convention, strength applied to the tangent
+    // axes only, folded into the geometry by the whiteout blend rather than
+    // replacing it.
+    //
+    // RETURNED UNNORMALISED, AND THAT IS THE WHOLE CHANGE.
+    //
+    // Mipping a normal map averages its normals, and where they disagreed the
+    // average is SHORT. That shortness is a measurement of how much detail the
+    // mip threw away -- and `normalize()` discards exactly that measurement
+    // while restoring full strength, so a distant bumpy surface keeps shading
+    // as though every bump were still resolvable. In a headset, where head
+    // tracking moves the sampling point every frame, that is shimmer.
+    //
+    // The caller renormalises for the shading normal and reads the length as
+    // variance. Nothing is lost by handing both back.
+    var tn = packed * 2.0 - 1.0;
+    tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
+    return whiteout(1u, tn, n);
+}}
+
+// Below this a layer changes the result by less than one 8-bit step, so
+// sampling it buys nothing but bandwidth. Not renormalised afterwards:
+// rescaling the surviving weights would move the shading further than the
+// omission does.
+const WEIGHT_EPS: f32 = 0.004;
+
 // Blend weights for the four layers, authored or derived.
 //
 // One vec4 either way, so the fragment stage below has a single code path. The
@@ -389,44 +584,134 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
 }}
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
+    // See `pixel_footprint` in the lights block: taken here, in uniform
+    // control flow, so the light loop can keep a spot's edge a pixel wide.
+    //
+    // The GEOMETRIC MEAN of the two screen axes, not their sum: seen at a
+    // grazing angle one axis stretches to metres while the other stays a
+    // pixel, and the sum let that stretch widen a spot's pool across the floor.
+    pixel_footprint = sqrt(length(dpdx(in.world_pos)) * length(dpdy(in.world_pos)));
     let n = normalize(in.normal);
 
     // Slope straight from the normal: no derivative, no extra sampling.
     let slope_deg = degrees(acos(clamp(n.y, -1.0, 1.0)));
 
-    let w = layer_weights(in.uv, in.world_pos.y, slope_deg);
+    let w = layer_weights(in.uv, in.tex_pos.y, slope_deg);
 
-    // All four layers, unconditionally. A weight-zero layer still costs its
-    // samples, which is the price of keeping every textureSample in uniform
-    // control flow -- skipping them per fragment is exactly the non-uniform
-    // branch WGSL forbids around sampling.
-    var albedo = layer_colour(0, in.world_pos, n, slope_deg) * w.x;
-    albedo = albedo + layer_colour(1, in.world_pos, n, slope_deg) * w.y;
-    albedo = albedo + layer_colour(2, in.world_pos, n, slope_deg) * w.z;
-    albedo = albedo + layer_colour(3, in.world_pos, n, slope_deg) * w.w;
+    // Only the layers that contribute. Terrain is fill-bound, not geometry
+    // bound -- quartering the triangle count moved the frame time by nothing,
+    // while removing the ground entirely gave back 13 ms of a 13.9 ms budget --
+    // and most fragments are one or two layers, not four.
+    let f = sample_frame(in.tex_pos, n, slope_deg);
+    var albedo = vec3<f32>(0.0);
+    if (w.x > WEIGHT_EPS) {{ albedo = albedo + layer_colour_at(0, f) * w.x; }}
+    if (w.y > WEIGHT_EPS) {{ albedo = albedo + layer_colour_at(1, f) * w.y; }}
+    if (w.z > WEIGHT_EPS) {{ albedo = albedo + layer_colour_at(2, f) * w.z; }}
+    if (w.w > WEIGHT_EPS) {{ albedo = albedo + layer_colour_at(3, f) * w.w; }}
 
     // Blend the layers' normals by the same weights, then renormalise. Summing
     // unit vectors shortens the result wherever they disagree, and a shortened
     // normal darkens the surface -- so the renormalise is load-bearing, not
     // tidiness.
-    var shaded_n = layer_normal(0, in.world_pos, n, mat.repeat[0]) * w.x;
-    shaded_n = shaded_n + layer_normal(1, in.world_pos, n, mat.repeat[1]) * w.y;
-    shaded_n = shaded_n + layer_normal(2, in.world_pos, n, mat.repeat[2]) * w.z;
-    shaded_n = shaded_n + layer_normal(3, in.world_pos, n, mat.repeat[3]) * w.w;
+    var shaded_n = vec3<f32>(0.0);
+    if (w.x > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(0, n, f) * w.x; }}
+    if (w.y > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(1, n, f) * w.y; }}
+    if (w.z > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(2, n, f) * w.z; }}
+    if (w.w > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(3, n, f) * w.w; }}
+
+    // HOW MUCH DETAIL WAS AVERAGED AWAY, read before renormalising.
+    //
+    // Two things shortened this vector and both mean the same thing: the mip
+    // chain averaging disagreeing normals inside one layer, and the weighted
+    // blend of layers that disagree with each other. Either way a short result
+    // says "the surface under this pixel is rougher than any single normal
+    // here admits", and a wider highlight is the honest response.
+    //
+    // sigma2 = (1 - len)/len is the Toksvig variance; the factor scales the
+    // specular exponent. Clamped at both ends: len can exceed 1 slightly where
+    // normal_strength pushes past unit length, and a degenerate near-zero
+    // blend must not divide by ~0.
+    // ROUGHNESS AND OCCLUSION FROM THE MAPS, blended by the same weights the
+    // colour and normal use so a splat boundary moves all four together.
+    //
+    // The normal's lost variation is ALREADY IN these mips -- baked in by
+    // `roughness_chain_with_normal_variance` at load, per level, exactly as
+    // brush materials get it. Adding a runtime term for it here as well would
+    // count the same variance twice and over-roughen distant ground.
+    var rough_map = 0.0;
+    var ao_map = 0.0;
+    if (w.x > WEIGHT_EPS) {{ rough_map = rough_map + layer_rough_at(0, f) * w.x; ao_map = ao_map + layer_ao_at(0, f) * w.x; }}
+    if (w.y > WEIGHT_EPS) {{ rough_map = rough_map + layer_rough_at(1, f) * w.y; ao_map = ao_map + layer_ao_at(1, f) * w.y; }}
+    if (w.z > WEIGHT_EPS) {{ rough_map = rough_map + layer_rough_at(2, f) * w.z; ao_map = ao_map + layer_ao_at(2, f) * w.z; }}
+    if (w.w > WEIGHT_EPS) {{ rough_map = rough_map + layer_rough_at(3, f) * w.w; ao_map = ao_map + layer_ao_at(3, f) * w.w; }}
+
     shaded_n = normalize(select(n, shaded_n, length(shaded_n) > 0.0001));
+
+    // What the MIPS could not see: the geometric normal's own variation across
+    // this pixel, and the grazing-angle case where anisotropic filtering
+    // fetches a sharper roughness mip than the isotropic level. Taken here, at
+    // the top level of the entry point, because a derivative is only legal in
+    // uniform control flow.
+    let rough = specular_aa_roughness(clamp(rough_map, 0.0, 1.0), dpdx(shaded_n), dpdy(shaded_n));
 
     // Macro variation: one low-frequency sample, centred on 1 so it darkens and
     // lightens rather than only darkening.
-    let m = textureSample(macro_tex, layer_samp, in.world_pos.xz / max(mat.macro_repeat, 0.001)).r;
+    let m = textureSample(macro_tex, layer_samp, in.tex_pos.xz / max(mat.macro_repeat, 0.001)).r;
     albedo = albedo * (1.0 + (m - 0.5) * 2.0 * mat.macro_strength);
 
     // Vertex colour survives as a tint, so the editor can still mark up ground
     // per-vertex without a second pipeline.
-    let lit = shade(in.world_pos, shaded_n);
-    return vec4<f32>(albedo * in.col.rgb * lit, 1.0);
+    // The ambient term is scaled by baked sky visibility BEFORE the lights are
+    // added, which is what `shade_with_sky` does and `shade` cannot.
+    let ground_map = textureSample(sky_occ_tex, layer_samp, in.uv);
+    let sky_vis = ground_map.r;
+    // THE SKY SUN'S SHADOW, baked beside the sky visibility when alpha is 0:
+    // a signed distance to the edge in texels (green) and the sun's penumbra
+    // (blue), rebuilt exactly as the brushes rebuild theirs. The live static
+    // map drew the walls' shadows on the grass with blocky edges (headset,
+    // 2026-09-25). An older map is greyscale with alpha 1 and leaves the
+    // ground on that live map, as before.
+    let ground_sun_d = (ground_map.g - 0.5) * (2.0 * {sun_range:?});
+    let ground_sun_w = max(max(ground_map.b * {sun_range:?}, 0.5 * fwidth(ground_sun_d)), 0.02);
+    receiver_sun_mask = select(-1.0, smoothstep(-ground_sun_w, ground_sun_w, ground_sun_d), ground_map.a < 0.5);
+    // THE SAME SHADING PATH THE BRUSHES USE, and the albedo goes IN rather
+    // than being multiplied over the result.
+    //
+    // Terrain used to call `shade_with_sky` and multiply its albedo over the
+    // answer. That is the exact bug this renderer already fixed for brushes:
+    // a dielectric's highlight is not tinted by its diffuse colour, and
+    // multiplying a 0.3-albedo ground over the lit result made every highlight
+    // on it about three times too dim. Ground was a second-class material with
+    // no Fresnel, no energy conservation, no probe reflection and no specular
+    // occlusion, and it looked it next to marble.
+    //
+    // WHAT IS STILL MISSING, deliberately, until terrain ships the maps
+    // brushes do: `ao` is 1.0 and the baked bounce is zero, because terrain has
+    // neither an AO map nor a directional bounce bake -- it carries only a
+    // scalar sky-occlusion, which is passed as `sky_vis` exactly as before.
+    // Roughness is a constant widened by the normal's own variance rather than
+    // a map. Each of those is a texture array away from parity.
+    let lit = shade_material_env(
+        in.world_pos,
+        shaded_n,
+        rough,
+        clamp(ao_map, 0.0, 1.0),
+        sky_vis,
+        vec3<f32>(0.0),
+        vec4<f32>(0.5, 0.5, 0.5, 0.0),
+        albedo,
+        // No face to stand on: ground is one continuous surface, so the
+        // fragment's own position is the honest point to choose a probe from.
+        in.world_pos,
+        // The INTERPOLATED surface normal, before the layer normal maps
+        // perturbed it -- the ground's own shape, which is what Fresnel wants.
+        n,
+    );
+    return vec4<f32>(tonemap(in.col.rgb * lit), 1.0);
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
+        sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
         biplanar_block = wgsl_biplanar_block(),
         whiteout_block = wgsl_whiteout_block(),
     )
@@ -446,6 +731,7 @@ pub(crate) mod tests {
     pub fn headless_gpu() -> Option<(Device, Queue)> {
         let instance = Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            apply_limit_buckets: false,
             power_preference: PowerPreference::default(),
             compatible_surface: None,
             force_fallback_adapter: false,
@@ -482,12 +768,12 @@ pub(crate) mod tests {
     }
 
     pub fn render_quad_with_normal(normal: [f32; 3]) -> Option<[u8; 4]> {
-        render_quad(normal, Palette::Test, None)
+        render_quad(normal, Palette::Test, None, None)
     }
 
     /// Same geometry, with authored weights bound.
     pub fn render_quad_with_splat(normal: [f32; 3], splat: &TerrainImage) -> Option<[u8; 4]> {
-        render_quad(normal, Palette::Test, Some(splat))
+        render_quad(normal, Palette::Test, Some(splat), None)
     }
 
     /// Same geometry, but bound through the shipping `TerrainMaterial::fallback`
@@ -497,15 +783,16 @@ pub(crate) mod tests {
     /// dimension and the non-sRGB macro format all live in `TerrainMaterial`
     /// and are exactly where a binding mistake would hide.
     pub fn render_quad_with_fallback_material(normal: [f32; 3]) -> Option<[u8; 4]> {
-        render_quad(normal, Palette::Fallback, None)
+        render_quad(normal, Palette::Fallback, None, None)
     }
 
     fn render_quad(
         normal: [f32; 3],
         palette: Palette,
         splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
     ) -> Option<[u8; 4]> {
-        render_quad_full(normal, palette, splat, &[None, None, None, None], false)
+        render_quad_full(normal, palette, splat, sky_occlusion, &[None, None, None, None], false)
     }
 
     /// Full harness: optional per-layer normal maps and an optional point light.
@@ -517,6 +804,7 @@ pub(crate) mod tests {
         normal: [f32; 3],
         palette: Palette,
         splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
         normals: &[Option<TerrainImage>],
         lit: bool,
     ) -> Option<[u8; 4]> {
@@ -560,6 +848,7 @@ pub(crate) mod tests {
                 intensity: 3.0,
                 range: 50.0,
                 cone_angle_deg: 180.0,
+                inner_cone_angle_deg: 0.0,
             }]);
         } else {
             lights.upload(&queue, &[]);
@@ -583,7 +872,8 @@ pub(crate) mod tests {
         let material = match palette {
             Palette::Test => TerrainMaterial::new(
                 &device, &queue, &pipeline.material_layout,
-                &test_layers, &neutral, splat, normals, TerrainMaterialUniform::default(),
+                &test_layers, &neutral, splat, sky_occlusion, normals,
+                &[], &[], TerrainMaterialUniform::default(),
             ),
             Palette::Fallback => {
                 TerrainMaterial::fallback(&device, &queue, &pipeline.material_layout)
@@ -644,6 +934,7 @@ pub(crate) mod tests {
                 label: Some("test_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &target_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store },
                 })],
@@ -653,6 +944,7 @@ pub(crate) mod tests {
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
+                multiview_mask: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&pipeline.pipeline);
@@ -676,13 +968,186 @@ pub(crate) mod tests {
 
         let slice = readback.slice(..);
         slice.map_async(MapMode::Read, |_| {});
-        device.poll(PollType::Wait).ok();
-        let data = slice.get_mapped_range();
+        device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+        let data = slice.get_mapped_range().unwrap();
         let centre = (SIZE / 2) as usize * 256 + (SIZE / 2) as usize * 4;
         Some([data[centre], data[centre + 1], data[centre + 2], data[centre + 3]])
     }
 
     #[test]
+    /// The optimisation itself, pinned in the source.
+    ///
+    /// Its effect is a frame time, which no unit test can see, and its absence
+    /// is invisible: reverting to unconditional sampling renders exactly the
+    /// same picture, only slower. So the guard is that the branches and the
+    /// explicit-gradient sampling are still there.
+    ///
+    /// Measured cause: removing the ground took the frame from 24 ms to 11 ms
+    /// of a 13.9 ms budget, while quartering the triangle count changed nothing
+    /// -- terrain is fill-bound, and four layers sampled whether or not they
+    /// contribute is where that fill goes.
+    #[test]
+    fn weightless_layers_are_skipped_rather_than_sampled() {
+        let src = super::terrain_shader();
+        assert!(
+            src.contains("textureSampleGrad"),
+            "explicit gradients are what make a per-fragment branch legal at all",
+        );
+        for w in ["w.x > WEIGHT_EPS", "w.y > WEIGHT_EPS", "w.z > WEIGHT_EPS", "w.w > WEIGHT_EPS"] {
+            assert!(src.contains(w), "missing the skip for {w}");
+        }
+    }
+
+    #[test]
+    fn the_gradients_are_taken_outside_every_branch() {
+        // The reason this is legal. `textureSample` chooses its mip from
+        // implicit derivatives and is only valid in uniform control flow --
+        // which is exactly what forced all four layers to be sampled. Taking a
+        // derivative INSIDE a branch reintroduces that problem while looking
+        // like it had been solved, so every dpdx/dpdy must live in the one
+        // function that runs before any branching.
+        //
+        // ONE DELIBERATE EXCEPTION, at the top level of `fs_main`: the
+        // specular-antialiasing term takes `dpdx(shaded_n)`. That is not
+        // inside a branch -- the layer blends have reconverged by then -- and
+        // naga's own uniformity analysis accepts it, which
+        // `every_scene_shader_survives_the_multiview_transform` exercises on
+        // this very shader. The brush path does the same thing for the same
+        // reason. The rule being enforced is "no derivative INSIDE a branch",
+        // and counting them per function is how that is approximated cheaply.
+        let src = super::terrain_shader();
+        let frame = src
+            .split("fn sample_frame")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("sample_frame present");
+        let entry = src
+            .split("@fragment")
+            .nth(1)
+            .expect("fragment entry present");
+        let allowed = |tok: &str| frame.matches(tok).count() + entry.matches(tok).count();
+        assert_eq!(
+            src.matches("dpdx(").count(),
+            allowed("dpdx("),
+            "a derivative escaped both sample_frame and the fragment entry",
+        );
+        assert_eq!(src.matches("dpdy(").count(), allowed("dpdy("));
+        // And the entry's own use must be exactly the specular-AA one, not a
+        // second sampling gradient that has quietly moved out of the frame.
+        // TWO named pairs are allowed at the top of the entry, both before any
+        // branch: the specular-AA one above, and the pixel footprint the light
+        // loop uses to keep a spot's edge a pixel wide (`pixel_footprint`).
+        // Anything beyond those is a sampling gradient that escaped the frame.
+        let footprint = "pixel_footprint = sqrt(length(dpdx(in.world_pos)) * length(dpdy(in.world_pos)));";
+        let extra = usize::from(entry.contains(footprint));
+        assert!(
+            entry.matches("dpdx(").count() <= 1 + extra && entry.matches("dpdy(").count() <= 1 + extra,
+            "more than the two named derivative pairs in the fragment entry; \
+             sampling gradients belong in sample_frame",
+        );
+    }
+
+    #[test]
+    fn baked_sky_occlusion_darkens_the_terrain() {
+        // The ground inside a sealed room used to light exactly as brightly as
+        // the field outside it, because `shade` had no occlusion term at all --
+        // only the BRUSH shader did. No amount of shadow-map work could fix
+        // that: the term that was wrong was the ambient, not the direct light.
+        //
+        // This test also compiles the terrain pipeline, which is the only thing
+        // that validates its WGSL: a bad field accessor in that shader builds
+        // clean and dies at pipeline creation on the device.
+        let sealed = TerrainImage { width: 1, height: 1, rgba: vec![0, 0, 0, 255] };
+        let Some(open) = render_quad([0.0, 1.0, 0.0], Palette::Test, None, None) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let dark = render_quad([0.0, 1.0, 0.0], Palette::Test, None, Some(&sealed)).unwrap();
+        assert!(
+            dark[0] < open[0],
+            "zero sky visibility must darken the ground: {dark:?} vs open {open:?}",
+        );
+    }
+
+    #[test]
+    fn unbaked_terrain_shades_exactly_as_it_did_before() {
+        // The neutral is WHITE here, not black: this value is MULTIPLIED into
+        // the ambient term, the opposite of the brush lightmap's additive RGB.
+        // Binding the wrong neutral would put every unbaked terrain in the game
+        // into permanent night, which reads as a broken shader.
+        let full = TerrainImage { width: 1, height: 1, rgba: vec![255, 255, 255, 255] };
+        let Some(absent) = render_quad([0.0, 1.0, 0.0], Palette::Test, None, None) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let explicit = render_quad([0.0, 1.0, 0.0], Palette::Test, None, Some(&full)).unwrap();
+        assert_eq!(
+            absent, explicit,
+            "no occlusion map must shade identically to a fully-open one: \
+             {absent:?} vs {explicit:?}",
+        );
+    }
+
+    #[test]
+    fn a_mip_chain_runs_all_the_way_down_to_one_texel() {
+        // Stopping early leaves the hardware clamped to the smallest level
+        // present, which brings the shimmer back at exactly the distances mips
+        // exist to fix.
+        assert_eq!(mip_levels_for(1024, 1024), 11);
+        assert_eq!(mip_levels_for(1, 1), 1);
+        assert_eq!(mip_levels_for(256, 64), 9, "levels follow the LONGER side");
+
+        let levels = mip_levels_for(8, 8);
+        let chain = mip_chain(&[128u8; 8 * 8 * 4], 8, 8, levels);
+        assert_eq!(chain.len() as u32, levels);
+        assert_eq!((chain[0].1, chain[0].2), (8, 8));
+        assert_eq!(chain.last().unwrap().1, 1, "chain must reach 1x1");
+        for (data, w, h) in &chain {
+            assert_eq!(data.len(), (w * h * 4) as usize, "level {w}x{h} is the wrong size");
+        }
+    }
+
+    #[test]
+    fn mips_are_averaged_in_linear_space_not_srgb() {
+        // Averaging sRGB BYTES directly is the classic "distant ground goes
+        // muddy" bug: the encoding is not linear in intensity, so the mean of
+        // two encoded values is darker than the encoding of their mean. Black
+        // and white must average to mid GREY -- sRGB 188, not sRGB 128.
+        let mut px = vec![0u8; 2 * 2 * 4];
+        for i in 0..4 {
+            let v = if i % 2 == 0 { 0u8 } else { 255u8 };
+            for c in 0..3 {
+                px[i * 4 + c] = v;
+            }
+            px[i * 4 + 3] = 255;
+        }
+        let chain = mip_chain(&px, 2, 2, 2);
+        let r = chain[1].0[0];
+        assert!(
+            (185..=191).contains(&r),
+            "black+white must average to sRGB ~188 (linear 0.5), got {r} -- \
+             {} suggests the average was taken on the encoded bytes",
+            if r < 140 { "which" } else { "this" },
+        );
+        assert_eq!(chain[1].0[3], 255, "alpha is already linear and must not be transferred");
+    }
+
+    #[test]
+    fn a_flat_colour_survives_every_mip_level() {
+        // A round-trip check on the transfer functions: a uniform image cannot
+        // change under a box filter, so any drift here is the sRGB conversion
+        // being lossy in a direction that would tint every distant surface.
+        let chain = mip_chain(&[200u8; 16 * 16 * 4], 16, 16, mip_levels_for(16, 16));
+        for (data, w, h) in &chain {
+            for (i, b) in data.iter().enumerate() {
+                assert!(
+                    b.abs_diff(200) <= 1,
+                    "level {w}x{h} byte {i} drifted to {b} from 200",
+                );
+            }
+        }
+    }
+
     fn flat_ground_shades_from_the_ground_layer() {
         let Some(px) = render_quad_with_normal([0.0, 1.0, 0.0]) else {
             eprintln!("skipping: no GPU adapter available");
@@ -728,6 +1193,190 @@ pub struct TerrainMaterial {
     pub uniform: Buffer,
 }
 
+/// Mip levels for a texture of this size: down to 1x1, as the spec requires.
+///
+/// A chain that stops early leaves the smallest levels missing, and the
+/// hardware clamps to the last one present -- which brings the aliasing back at
+/// exactly the distances mips existed to fix.
+pub fn mip_levels_for(w: u32, h: u32) -> u32 {
+    32 - w.max(h).max(1).leading_zeros()
+}
+
+/// A box-filtered mip chain for one RGBA8 image, smallest-last.
+///
+/// Box filtering on the CPU rather than a blit pipeline: this runs once at
+/// load, and a render pass per level per layer would need its own pipeline,
+/// bind groups and a non-sRGB view of an sRGB texture. The quality difference
+/// at these sizes is not visible on a headset; the difference in moving parts
+/// is considerable.
+///
+/// Averaged in LINEAR space, not sRGB. Averaging sRGB bytes directly darkens
+/// every mip -- the classic "distant ground goes muddy" artefact -- because the
+/// encoding is not linear in intensity and the mean of two encoded values is
+/// not the encoding of their mean.
+/// The same box-filtered chain for data that is NOT colour.
+///
+/// Normal, roughness and occlusion maps are measurements, not colours. Putting
+/// them through the sRGB transfer bends every value toward the dark end -- for
+/// a normal map that tilts every bump, which this renderer has shipped once
+/// already and does not intend to again.
+/// Roughness for a layer that has no map, as an 8-bit value.
+///
+/// Matte, because dirt, gravel and grass are. A layer that disagrees ships a
+/// roughness map and stops using this.
+pub const DEFAULT_TERRAIN_ROUGHNESS: u8 = 200;
+
+/// The most extra roughness-squared a normal's lost variation may add.
+const TERRAIN_NORMAL_VARIANCE_CLAMP: f32 = 0.18;
+
+/// A roughness mip chain that carries the variation the NORMAL map lost when it
+/// was mipped -- the same treatment brush materials get.
+///
+/// Mipping a normal map averages its normals, and shading is not linear in the
+/// normal: the lighting of an averaged normal is not the average of the
+/// lighting. The LENGTH of the averaged (unnormalised) normal records how much
+/// they disagreed, and that converts into variance, and variance is roughness.
+///
+/// `sigma2 = (1 - |Na|) / |Na|`, combined as `r' = sqrt(r^2 + min(2*sigma2, k))`.
+/// ROUGHNESS VALUES DO NOT ADD -- they combine in variance space, which is why
+/// this squares before summing and takes the root after.
+///
+/// Level 0 is untouched: nothing has been averaged there, so nothing was lost,
+/// and ground seen underfoot keeps exactly the roughness its map specifies.
+pub fn roughness_chain_with_normal_variance(
+    rough: &[u8],
+    normal: &[u8],
+    w: u32,
+    h: u32,
+    levels: u32,
+) -> Vec<(Vec<u8>, u32, u32)> {
+    let mut chain = mip_chain_linear(rough, w, h, levels);
+
+    // The normal halved repeatedly in FLOAT, kept UNNORMALISED -- the
+    // shortening is the whole measurement, and doing it in f32 rather than
+    // re-reading 8-bit mips avoids quantising twice.
+    let mut vecs: Vec<[f32; 3]> = (0..(w * h) as usize)
+        .map(|i| {
+            [
+                normal[i * 4] as f32 / 255.0 * 2.0 - 1.0,
+                normal[i * 4 + 1] as f32 / 255.0 * 2.0 - 1.0,
+                normal[i * 4 + 2] as f32 / 255.0 * 2.0 - 1.0,
+            ]
+        })
+        .collect();
+    let (mut cw, mut ch) = (w, h);
+
+    for level in 1..chain.len() {
+        let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
+        let mut next = vec![[0.0f32; 3]; (nw * nh) as usize];
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut acc = [0.0f32; 3];
+                for (dx, dy) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+                    let sx = (x * 2 + dx).min(cw - 1);
+                    let sy = (y * 2 + dy).min(ch - 1);
+                    let v = vecs[(sy * cw + sx) as usize];
+                    acc[0] += v[0];
+                    acc[1] += v[1];
+                    acc[2] += v[2];
+                }
+                next[(y * nw + x) as usize] = [acc[0] / 4.0, acc[1] / 4.0, acc[2] / 4.0];
+            }
+        }
+        vecs = next;
+        cw = nw;
+        ch = nh;
+
+        let (data, lw, lh) = &mut chain[level];
+        if *lw != cw || *lh != ch {
+            // The two chains fell out of step; stop rather than write variance
+            // into the wrong texels.
+            break;
+        }
+        for i in 0..(cw * ch) as usize {
+            let v = vecs[i];
+            let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            let sigma2 = if len > 1e-4 { (1.0 - len) / len } else { 1.0 };
+            let kernel = (2.0 * sigma2).min(TERRAIN_NORMAL_VARIANCE_CLAMP);
+            let base = data[i * 4] as f32 / 255.0;
+            let filtered = (base * base + kernel).clamp(0.0, 1.0).sqrt();
+            let byte = (filtered * 255.0).round().clamp(0.0, 255.0) as u8;
+            data[i * 4] = byte;
+            data[i * 4 + 1] = byte;
+            data[i * 4 + 2] = byte;
+        }
+    }
+    chain
+}
+
+pub fn mip_chain_linear(rgba: &[u8], w: u32, h: u32, levels: u32) -> Vec<(Vec<u8>, u32, u32)> {
+    let mut out = vec![(rgba.to_vec(), w, h)];
+    for _ in 1..levels {
+        let (src, sw, sh) = out.last().unwrap();
+        let (dw, dh) = ((sw / 2).max(1), (sh / 2).max(1));
+        let mut dst = vec![0u8; (dw * dh * 4) as usize];
+        for y in 0..dh {
+            for x in 0..dw {
+                for c in 0..4 {
+                    let fetch = |sx: u32, sy: u32| -> f32 {
+                        let i = ((sy.min(sh - 1) * sw + sx.min(sw - 1)) * 4 + c) as usize;
+                        src[i] as f32 / 255.0
+                    };
+                    let (x0, y0) = (x * 2, y * 2);
+                    let avg = (fetch(x0, y0) + fetch(x0 + 1, y0) + fetch(x0, y0 + 1)
+                        + fetch(x0 + 1, y0 + 1))
+                        * 0.25;
+                    dst[((y * dw + x) * 4 + c) as usize] =
+                        (avg.clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+            }
+        }
+        out.push((dst, dw, dh));
+    }
+    out
+}
+
+pub fn mip_chain(rgba: &[u8], w: u32, h: u32, levels: u32) -> Vec<(Vec<u8>, u32, u32)> {
+    fn to_linear(c: u8) -> f32 {
+        let s = c as f32 / 255.0;
+        if s <= 0.040_45 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    }
+    fn to_srgb(l: f32) -> u8 {
+        let s = if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
+        (s.clamp(0.0, 1.0) * 255.0).round() as u8
+    }
+
+    let mut out = vec![(rgba.to_vec(), w, h)];
+    for _ in 1..levels {
+        let (src, sw, sh) = out.last().unwrap();
+        let (dw, dh) = ((sw / 2).max(1), (sh / 2).max(1));
+        let mut dst = vec![0u8; (dw * dh * 4) as usize];
+        for y in 0..dh {
+            for x in 0..dw {
+                for c in 0..4 {
+                    // Alpha is linear already and must NOT go through the sRGB
+                    // transfer; only the colour channels do.
+                    let fetch = |sx: u32, sy: u32| -> f32 {
+                        let i = ((sy.min(sh - 1) * sw + sx.min(sw - 1)) * 4 + c) as usize;
+                        if c == 3 { src[i] as f32 / 255.0 } else { to_linear(src[i]) }
+                    };
+                    let (x0, y0) = (x * 2, y * 2);
+                    let avg = (fetch(x0, y0) + fetch(x0 + 1, y0) + fetch(x0, y0 + 1)
+                        + fetch(x0 + 1, y0 + 1))
+                        * 0.25;
+                    dst[((y * dw + x) * 4 + c) as usize] = if c == 3 {
+                        (avg.clamp(0.0, 1.0) * 255.0).round() as u8
+                    } else {
+                        to_srgb(avg)
+                    };
+                }
+            }
+        }
+        out.push((dst, dw, dh));
+    }
+    out
+}
+
 impl TerrainMaterial {
     /// Build from four RGBA8 layer images plus a macro image.
     ///
@@ -746,10 +1395,16 @@ impl TerrainMaterial {
         // height-driven blend. None still binds a texture -- see the layout --
         // and clears `use_splat` so nothing reads it.
         splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
         // Per-layer normal maps, in the same slot order as `layers`. Shorter or
         // sparser than four is fine; the gaps become flat, which the shader
         // treats as no perturbation at all.
         normals: &[Option<TerrainImage>],
+        // Per-layer roughness and occlusion, same slot order. Gaps take the
+        // neutral value for each -- `DEFAULT_TERRAIN_ROUGHNESS` and white --
+        // so a project that has not authored them behaves as it always did.
+        rough: &[Option<TerrainImage>],
+        ao: &[Option<TerrainImage>],
         settings: TerrainMaterialUniform,
     ) -> Self {
         assert!(!layers.is_empty(), "terrain material needs at least one layer");
@@ -759,10 +1414,26 @@ impl TerrainMaterial {
             "all terrain layers must share one size to live in a D2Array",
         );
 
+        // MIPMAPPED, and this is not a nicety.
+        //
+        // Ground is the one surface in the level that is always viewed at a
+        // grazing angle running to the horizon, so a screen pixel a few metres
+        // out covers many texels. With a single mip level the hardware picks
+        // one of them, and which one changes as the head moves: the grass
+        // crawls and sparkles. The sampler already asked for
+        // `mipmap_filter: Linear` -- it just had nothing to filter between,
+        // which is a silent no-op rather than an error.
+        //
+        // It is worth being precise about why this surfaced now: the layer
+        // tiling used to be 8 m, and at that scale the ground was blurry enough
+        // to hide the aliasing. Setting it to the material's authored 2 m
+        // quadrupled the spatial frequency and made a pre-existing bug visible.
+        // The tiling is right; the missing mips were always wrong.
+        let mip_level_count = mip_levels_for(w, h);
         let array = device.create_texture(&TextureDescriptor {
             label: Some("terrain_layers"),
             size: Extent3d { width: w, height: h, depth_or_array_layers: 4 },
-            mip_level_count: 1,
+            mip_level_count,
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: TextureFormat::Rgba8UnormSrgb,
@@ -771,21 +1442,24 @@ impl TerrainMaterial {
         });
         for slot in 0..4 {
             let src = layers.get(slot).unwrap_or_else(|| layers.last().unwrap());
-            queue.write_texture(
-                TexelCopyTextureInfo {
-                    texture: &array,
-                    mip_level: 0,
-                    origin: Origin3d { x: 0, y: 0, z: slot as u32 },
-                    aspect: TextureAspect::All,
-                },
-                &src.rgba,
-                TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * w),
-                    rows_per_image: Some(h),
-                },
-                Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            );
+            let chain = mip_chain(&src.rgba, w, h, mip_level_count);
+            for (level, (data, lw, lh)) in chain.iter().enumerate() {
+                queue.write_texture(
+                    TexelCopyTextureInfo {
+                        texture: &array,
+                        mip_level: level as u32,
+                        origin: Origin3d { x: 0, y: 0, z: slot as u32 },
+                        aspect: TextureAspect::All,
+                    },
+                    data,
+                    TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * lw),
+                        rows_per_image: Some(*lh),
+                    },
+                    Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
+                );
+            }
         }
 
         let macro_tex = device.create_texture(&TextureDescriptor {
@@ -820,10 +1494,25 @@ impl TerrainMaterial {
         // Normal maps live in their own array, sized to the colour layers so
         // both index by the same slot. NOT sRGB: these encode a direction, and
         // decoding them through a colour curve bends every bump.
+        // MIPPED, and that was the bug.
+        //
+        // The colour array above has had a mip chain all along; this one was
+        // created with `mip_level_count: 1` while the shared sampler asks for
+        // `mipmap_filter: Linear` and 8x anisotropy -- both silent no-ops
+        // against a single level. So every distant pixel POINT-SAMPLED a
+        // full-resolution normal map, the shading normal changed randomly from
+        // pixel to pixel, and head tracking moved that around every frame.
+        // That is the terrain shimmer, and it is why brush surfaces -- whose
+        // normals are mipped -- never had it (headset, 2026-09-22).
+        //
+        // It also silently defeated the Toksvig term added just before this:
+        // that measures how short the AVERAGED normal is, and with no mip
+        // chain nothing is ever averaged, so the variance it read was always
+        // zero. The method was right and had nothing to measure.
         let normal_array = device.create_texture(&TextureDescriptor {
             label: Some("terrain_normals"),
             size: Extent3d { width: w, height: h, depth_or_array_layers: 4 },
-            mip_level_count: 1,
+            mip_level_count,
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: TextureFormat::Rgba8Unorm,
@@ -837,21 +1526,106 @@ impl TerrainMaterial {
                 Some(img) => resample(img, w, h),
                 None => flat,
             };
-            queue.write_texture(
-                TexelCopyTextureInfo {
-                    texture: &normal_array,
-                    mip_level: 0,
-                    origin: Origin3d { x: 0, y: 0, z: slot as u32 },
-                    aspect: TextureAspect::All,
-                },
-                &src.rgba,
-                TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * w),
-                    rows_per_image: Some(h),
-                },
-                Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            );
+            // LINEAR, not sRGB: a normal is a direction.
+            let chain = mip_chain_linear(&src.rgba, w, h, mip_level_count);
+            for (level, (data, lw, lh)) in chain.iter().enumerate() {
+                queue.write_texture(
+                    TexelCopyTextureInfo {
+                        texture: &normal_array,
+                        mip_level: level as u32,
+                        origin: Origin3d { x: 0, y: 0, z: slot as u32 },
+                        aspect: TextureAspect::All,
+                    },
+                    data,
+                    TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * lw),
+                        rows_per_image: Some(*lh),
+                    },
+                    Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
+                );
+            }
+        }
+
+        // ROUGHNESS AND OCCLUSION, mipped and linear like the normal array.
+        //
+        // Both are measurements rather than colours, so neither goes through
+        // the sRGB transfer, and both need a mip chain for the same reason the
+        // normals did: a distant pixel that point-samples a full-resolution
+        // map gets a different answer every frame as the head moves.
+        //
+        // The roughness chain also folds in the NORMAL'S lost variation, which
+        // is the same treatment brush materials get -- mipping a normal map
+        // averages its normals, and the shortness of that average measures how
+        // much detail the level threw away. Putting it back as roughness is
+        // what keeps a highlight from popping in and out at distance.
+        let mut rough_arr = Vec::with_capacity(4);
+        let mut ao_arr = Vec::with_capacity(4);
+        for slot in 0..4 {
+            let pick = |src: &[Option<TerrainImage>], fallback: u8| -> TerrainImage {
+                match src.get(slot).and_then(|x| x.as_ref()) {
+                    Some(img) if img.width == w && img.height == h => img.clone_image(),
+                    Some(img) => resample(img, w, h),
+                    None => solid_image([fallback; 3], w, h),
+                }
+            };
+            rough_arr.push(pick(rough, DEFAULT_TERRAIN_ROUGHNESS));
+            ao_arr.push(pick(ao, 255));
+        }
+
+        let data_array = |label: &str| {
+            device.create_texture(&TextureDescriptor {
+                label: Some(label),
+                size: Extent3d { width: w, height: h, depth_or_array_layers: 4 },
+                mip_level_count,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8Unorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let rough_array = data_array("terrain_rough");
+        let ao_array = data_array("terrain_ao");
+
+        for slot in 0..4 {
+            let normal_src = match normals.get(slot).and_then(|n| n.as_ref()) {
+                Some(img) if img.width == w && img.height == h => img.clone_image(),
+                Some(img) => resample(img, w, h),
+                None => solid_image(FLAT_NORMAL, w, h),
+            };
+            let chains = [
+                (
+                    &rough_array,
+                    roughness_chain_with_normal_variance(
+                        &rough_arr[slot].rgba,
+                        &normal_src.rgba,
+                        w,
+                        h,
+                        mip_level_count,
+                    ),
+                ),
+                (&ao_array, mip_chain_linear(&ao_arr[slot].rgba, w, h, mip_level_count)),
+            ];
+            for (tex, chain) in chains {
+                for (level, (data, lw, lh)) in chain.iter().enumerate() {
+                    queue.write_texture(
+                        TexelCopyTextureInfo {
+                            texture: tex,
+                            mip_level: level as u32,
+                            origin: Origin3d { x: 0, y: 0, z: slot as u32 },
+                            aspect: TextureAspect::All,
+                        },
+                        data,
+                        TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(4 * lw),
+                            rows_per_image: Some(*lh),
+                        },
+                        Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
+                    );
+                }
+            }
         }
 
         let sampler = device.create_sampler(&SamplerDescriptor {
@@ -861,7 +1635,13 @@ impl TerrainMaterial {
             address_mode_w: AddressMode::Repeat,
             mag_filter: FilterMode::Linear,
             min_filter: FilterMode::Linear,
-            mipmap_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::Linear,
+            // Ground is seen almost entirely at grazing angles, which is the
+            // exact case trilinear filtering handles worst: it picks a mip for
+            // the SHORT axis of the footprint and so over-blurs along the long
+            // one. 8x is the usual sweet spot and is cheap on a tile GPU
+            // compared with the fill it saves by not needing a sharper mip.
+            anisotropy_clamp: 8,
             ..Default::default()
         });
 
@@ -899,6 +1679,46 @@ impl TerrainMaterial {
             Extent3d {
                 width: splat_image.width,
                 height: splat_image.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Sky visibility over the footprint. WHITE when unbaked: this value is
+        // multiplied into the ambient term, so 1.0 is the neutral that
+        // reproduces the shading terrain had before the map existed.
+        let occ_image = sky_occlusion.unwrap_or(&FULL_SKY);
+        let sky_occ_tex = device.create_texture(&TextureDescriptor {
+            label: Some("terrain_sky_occlusion"),
+            size: Extent3d {
+                width: occ_image.width,
+                height: occ_image.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            // NOT sRGB: a visibility fraction, not a colour. Decoding it would
+            // bend every value and darken the ground non-linearly.
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &sky_occ_tex,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            &occ_image.rgba,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * occ_image.width),
+                rows_per_image: Some(occ_image.height),
+            },
+            Extent3d {
+                width: occ_image.width,
+                height: occ_image.height,
                 depth_or_array_layers: 1,
             },
         );
@@ -953,6 +1773,30 @@ impl TerrainMaterial {
                         }),
                     ),
                 },
+                BindGroupEntry {
+                    binding: 6,
+                    resource: BindingResource::TextureView(
+                        &sky_occ_tex.create_view(&TextureViewDescriptor::default()),
+                    ),
+                },
+                BindGroupEntry {
+                    binding: 7,
+                    resource: BindingResource::TextureView(
+                        &rough_array.create_view(&TextureViewDescriptor {
+                            dimension: Some(TextureViewDimension::D2Array),
+                            ..Default::default()
+                        }),
+                    ),
+                },
+                BindGroupEntry {
+                    binding: 8,
+                    resource: BindingResource::TextureView(
+                        &ao_array.create_view(&TextureViewDescriptor {
+                            dimension: Some(TextureViewDimension::D2Array),
+                            ..Default::default()
+                        }),
+                    ),
+                },
             ],
         });
 
@@ -968,7 +1812,7 @@ impl TerrainMaterial {
     /// The colours are the ones the previous flat-shaded terrain used, so
     /// turning this on changes shading but not palette.
     pub fn fallback(device: &Device, queue: &Queue, layout: &BindGroupLayout) -> Self {
-        Self::fallback_with_splat(device, queue, layout, None)
+        Self::fallback_with_splat(device, queue, layout, None, None)
     }
 
     /// The fallback palette, with authored blend weights applied to it.
@@ -982,9 +1826,11 @@ impl TerrainMaterial {
         queue: &Queue,
         layout: &BindGroupLayout,
         splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
     ) -> Self {
         Self::from_layers(
             device, queue, layout, &[None, None, None, None], &[None, None, None, None], splat,
+            sky_occlusion,
         )
     }
 
@@ -1005,6 +1851,7 @@ impl TerrainMaterial {
         layers: &[Option<TerrainImage>],
         normals: &[Option<TerrainImage>],
         splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
     ) -> Self {
         Self::from_layers_with(
             device,
@@ -1012,7 +1859,13 @@ impl TerrainMaterial {
             layout,
             layers,
             normals,
+            // This convenience form predates roughness and occlusion maps and
+            // keeps its old shape: both fall back to their neutral, so callers
+            // that have not been updated behave exactly as they did.
+            &[],
+            &[],
             splat,
+            sky_occlusion,
             TerrainMaterialUniform::default(),
         )
     }
@@ -1028,7 +1881,10 @@ impl TerrainMaterial {
         layout: &BindGroupLayout,
         layers: &[Option<TerrainImage>],
         normals: &[Option<TerrainImage>],
+        rough: &[Option<TerrainImage>],
+        ao: &[Option<TerrainImage>],
         splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
         settings: TerrainMaterialUniform,
     ) -> Self {
         let (w, h) = layers
@@ -1062,7 +1918,10 @@ impl TerrainMaterial {
             &filled,
             &solid_image([128, 128, 128], 1, 1),
             splat,
+            sky_occlusion,
             normals,
+            rough,
+            ao,
             settings,
         )
     }
@@ -1100,9 +1959,16 @@ mod material_tests {
         let cliff = render_quad_with_fallback_material([1.0, 0.05, 0.0]).unwrap();
 
         // Ground (86,112,62) is green-dominant; rock (104,100,94) is near-grey.
+        //
+        // The margin is smaller than it looks it should be because this quad
+        // renders dark, and a tone curve compresses hardest at the bottom --
+        // ACES puts 18% grey at 0.106. The ORDERING this test cares about is
+        // untouched; only the absolute byte gap shrank, so the threshold is
+        // stated against the range the pixels actually occupy rather than the
+        // untonemapped one it was first calibrated in.
         let greenness = |p: [u8; 4]| p[1] as i32 - p[2] as i32;
         assert!(
-            greenness(flat) > greenness(cliff) + 8,
+            greenness(flat) > greenness(cliff) + 4 && greenness(flat) > 4,
             "flat ground should read greener than a cliff: flat {flat:?} cliff {cliff:?}",
         );
         assert!(flat[3] == 255 && cliff[3] == 255, "terrain must be opaque");
@@ -1120,17 +1986,20 @@ mod material_tests {
         };
         let layout = material_bind_group_layout(&device);
         let one = TerrainImage { width: 1, height: 1, rgba: vec![10, 20, 30, 255] };
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let err_scope_1 = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let _m = TerrainMaterial::new(
             &device, &queue, &layout,
             std::slice::from_ref(&one),
             &one,
             None,
+            None,
             &[None, None, None, None],
+            &[],
+            &[],
             TerrainMaterialUniform::default(),
         );
         assert!(
-            pollster::block_on(device.pop_error_scope()).is_none(),
+            pollster::block_on(err_scope_1.pop()).is_none(),
             "a single-layer terrain material must still bind validly",
         );
     }
@@ -1145,6 +2014,18 @@ static NO_SPLAT: std::sync::LazyLock<TerrainImage> = std::sync::LazyLock::new(||
     width: 1,
     height: 1,
     rgba: vec![255, 0, 0, 0],
+});
+
+/// The 1x1 stand-in bound when a scene has no baked terrain occlusion.
+///
+/// WHITE, and unlike `NO_SPLAT` its contents ARE read: sky visibility is
+/// multiplied into the ambient term, so 1.0 means "sees the whole sky" and
+/// reproduces exactly the shading terrain had before this map existed. Black
+/// here would put every terrain in the game in permanent night.
+static FULL_SKY: std::sync::LazyLock<TerrainImage> = std::sync::LazyLock::new(|| TerrainImage {
+    width: 1,
+    height: 1,
+    rgba: vec![255, 255, 255, 255],
 });
 
 #[cfg(test)]
@@ -1284,6 +2165,18 @@ pub const TERRAIN_LAYER_FILES: [&str; 4] = ["ground.jpg", "rock.jpg", "high.jpg"
 pub const TERRAIN_NORMAL_FILES: [&str; 4] =
     ["ground_n.jpg", "rock_n.jpg", "high_n.jpg", "sediment_n.jpg"];
 
+/// Roughness maps for the same four layers, in the same order.
+///
+/// Ground is not one gloss. Wet rock, dry gravel and grass differ, and a single
+/// constant made every layer the same material under a different picture --
+/// which is what a terrain looks like next to a brush surface that has a map.
+pub const TERRAIN_ROUGH_FILES: [&str; 4] =
+    ["ground_r.jpg", "rock_r.jpg", "high_r.jpg", "sediment_r.jpg"];
+
+/// Ambient occlusion for the same four layers, in the same order.
+pub const TERRAIN_AO_FILES: [&str; 4] =
+    ["ground_ao.jpg", "rock_ao.jpg", "high_ao.jpg", "sediment_ao.jpg"];
+
 /// Load the terrain layer set from a directory, falling back per layer.
 ///
 /// Per LAYER, not all-or-nothing: a project part-way through authoring its
@@ -1295,6 +2188,29 @@ pub const TERRAIN_NORMAL_FILES: [&str; 4] =
 /// share one D2Array and a mismatched layer would otherwise fail validation.
 pub fn load_terrain_layers(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
     TERRAIN_LAYER_FILES
+        .iter()
+        .map(|name| TerrainImage::load(&dir.join(name)))
+        .collect()
+}
+
+/// Load the four roughness maps, per layer, falling back to none.
+///
+/// A missing map is ordinary and not an error: that layer takes
+/// `DEFAULT_TERRAIN_ROUGHNESS`, which is what every layer used before these
+/// existed, so a project that has not authored them looks exactly as it did.
+pub fn load_terrain_rough(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
+    TERRAIN_ROUGH_FILES
+        .iter()
+        .map(|name| TerrainImage::load(&dir.join(name)))
+        .collect()
+}
+
+/// Load the four occlusion maps, per layer, falling back to none.
+///
+/// A missing map means fully unoccluded -- white -- which is the neutral value
+/// for something that MULTIPLIES, and is how terrain behaved before.
+pub fn load_terrain_ao(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
+    TERRAIN_AO_FILES
         .iter()
         .map(|name| TerrainImage::load(&dir.join(name)))
         .collect()
@@ -1427,7 +2343,7 @@ mod layer_loading_tests {
         };
         let layout = material_bind_group_layout(&device);
 
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let err_scope_2 = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let _m = TerrainMaterial::from_layers(
             &device,
             &queue,
@@ -1435,9 +2351,10 @@ mod layer_loading_tests {
             &[Some(img([10, 20, 30], 64, 64)), None, Some(img([1, 2, 3], 64, 64)), None],
             &[None, None, None, None],
             None,
+            None,
         );
         assert!(
-            pollster::block_on(device.pop_error_scope()).is_none(),
+            pollster::block_on(err_scope_2.pop()).is_none(),
             "a partial layer set must still bind validly",
         );
     }
@@ -1453,7 +2370,7 @@ mod layer_loading_tests {
         };
         let layout = material_bind_group_layout(&device);
 
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let err_scope_3 = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let _m = TerrainMaterial::from_layers(
             &device,
             &queue,
@@ -1466,9 +2383,10 @@ mod layer_loading_tests {
             ],
             &[None, None, None, None],
             None,
+            None,
         );
         assert!(
-            pollster::block_on(device.pop_error_scope()).is_none(),
+            pollster::block_on(err_scope_3.pop()).is_none(),
             "mixed layer sizes must be normalised, not rejected",
         );
     }
@@ -1482,11 +2400,11 @@ mod layer_loading_tests {
             return;
         };
         let layout = material_bind_group_layout(&device);
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let err_scope_4 = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let _m = TerrainMaterial::from_layers(
-            &device, &queue, &layout, &[None, None, None, None], &[None, None, None, None], None,
+            &device, &queue, &layout, &[None, None, None, None], &[None, None, None, None], None, None,
         );
-        assert!(pollster::block_on(device.pop_error_scope()).is_none());
+        assert!(pollster::block_on(err_scope_4.pop()).is_none());
     }
 
     #[test]
@@ -1629,15 +2547,15 @@ mod normal_map_tests {
     /// with the perturbation entirely disconnected.
     #[test]
     fn a_tilted_normal_changes_the_lighting() {
-        let Some(flat) = render_quad_full(FLAT, Palette::Test, None, &only_layer0(normal_map(FLAT_NORMAL)), true)
+        let Some(flat) = render_quad_full(FLAT, Palette::Test, None, None, &only_layer0(normal_map(FLAT_NORMAL)), true)
         else {
             eprintln!("skipping: no GPU adapter available");
             return;
         };
         // Tangent normal tilted hard toward +x, where the test light sits.
-        let toward = render_quad_full(FLAT, Palette::Test, None, &only_layer0(normal_map([230, 128, 160])), true).unwrap();
+        let toward = render_quad_full(FLAT, Palette::Test, None, None, &only_layer0(normal_map([230, 128, 160])), true).unwrap();
         // ...and hard away from it.
-        let away = render_quad_full(FLAT, Palette::Test, None, &only_layer0(normal_map([25, 128, 160])), true).unwrap();
+        let away = render_quad_full(FLAT, Palette::Test, None, None, &only_layer0(normal_map([25, 128, 160])), true).unwrap();
 
         assert_ne!(brightness(toward), brightness(flat), "a tilted normal must change shading: {toward:?} vs {flat:?}");
         assert!(
@@ -1650,12 +2568,12 @@ mod normal_map_tests {
     /// what lets an unauthored normal set cost nothing and need no flag.
     #[test]
     fn a_flat_normal_map_is_a_true_no_op() {
-        let Some(without) = render_quad_full(FLAT, Palette::Test, None, &[None, None, None, None], true)
+        let Some(without) = render_quad_full(FLAT, Palette::Test, None, None, &[None, None, None, None], true)
         else {
             eprintln!("skipping: no GPU adapter available");
             return;
         };
-        let with_flat = render_quad_full(FLAT, Palette::Test, None, &only_layer0(normal_map(FLAT_NORMAL)), true).unwrap();
+        let with_flat = render_quad_full(FLAT, Palette::Test, None, None, &only_layer0(normal_map(FLAT_NORMAL)), true).unwrap();
         assert_eq!(with_flat, without, "a flat normal map must shade identically to none");
     }
 
@@ -1670,16 +2588,19 @@ mod normal_map_tests {
         let mut settings = TerrainMaterialUniform::default();
         settings.normal_strength = 0.0;
 
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let err_scope_5 = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let _m = TerrainMaterial::new(
             &device, &queue, &layout,
             &[solid_image([200, 200, 200], 4, 4)],
             &solid_image([128, 128, 128], 1, 1),
             None,
+            None,
             &only_layer0(solid_image([230, 128, 160], 4, 4)),
+            &[],
+            &[],
             settings,
         );
-        assert!(pollster::block_on(device.pop_error_scope()).is_none());
+        assert!(pollster::block_on(err_scope_5.pop()).is_none());
     }
 
     /// Sized to the colour layers, so a normal map at a different resolution
@@ -1691,15 +2612,16 @@ mod normal_map_tests {
             return;
         };
         let layout = material_bind_group_layout(&device);
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let err_scope_6 = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let _m = TerrainMaterial::from_layers(
             &device, &queue, &layout,
             &[Some(solid_image([10, 20, 30], 64, 64)), None, None, None],
             &[Some(solid_image(FLAT_NORMAL, 16, 16)), None, None, None],
             None,
+            None,
         );
         assert!(
-            pollster::block_on(device.pop_error_scope()).is_none(),
+            pollster::block_on(err_scope_6.pop()).is_none(),
             "a mismatched normal map must be resampled, not rejected",
         );
     }
@@ -1711,5 +2633,179 @@ mod normal_map_tests {
         assert!(unpack(FLAT_NORMAL[0]).abs() < 0.01);
         assert!(unpack(FLAT_NORMAL[1]).abs() < 0.01);
         assert!((unpack(FLAT_NORMAL[2]) - 1.0).abs() < 0.01);
+    }
+}
+
+// Scene shader sources, for `multiview::every_scene_shader_survives_the_multiview_transform`.
+// Test-only: the gate has to see exactly the text each pipeline is built from,
+// and nothing on a development machine can build a multiview pipeline to check.
+#[cfg(test)]
+pub fn terrain_shader_src() -> String {
+    terrain_shader()
+}
+
+#[cfg(test)]
+mod terrain_material_parity_tests {
+    /// Terrain shades through the SAME path as brushes, with the albedo passed
+    /// IN rather than multiplied over the answer.
+    ///
+    /// The old form -- `shade_with_sky(...)` then `albedo * col * lit` -- is the
+    /// exact bug this renderer already fixed for brushes: a dielectric's
+    /// highlight is not tinted by its diffuse colour, and multiplying a
+    /// low-albedo ground over the lit result made every highlight on it far too
+    /// dim. Ground had no Fresnel, no energy conservation, no probe reflection
+    /// and no specular occlusion, and it read as a second-class material next
+    /// to marble.
+    #[test]
+    fn terrain_uses_the_material_path_with_albedo_passed_in() {
+        let src = super::terrain_shader_src();
+        assert!(
+            src.contains("let lit = shade_material_env("),
+            "terrain no longer shades through the material path",
+        );
+        assert!(
+            !src.contains("shade_with_sky(in.world_pos"),
+            "terrain went back to the sky-only path",
+        );
+        assert!(
+            src.contains("tonemap(in.col.rgb * lit)"),
+            "the albedo is being multiplied over the lit result again; it must \
+             go INTO the shading so highlights are not tinted by it",
+        );
+        assert!(
+            !src.contains("tonemap(albedo * in.col.rgb * lit)"),
+            "the old multiply-over form is back",
+        );
+    }
+
+    /// The normal's lost variation goes into ROUGHNESS, the same place the
+    /// brush bake puts it -- not into a bespoke specular-exponent tweak.
+    #[test]
+    fn the_normal_variance_lands_in_roughness() {
+        let src = super::terrain_shader_src();
+        // The normal's lost variation now lives in the BAKED roughness mips --
+        // `roughness_chain_with_normal_variance` folds it in per level at load,
+        // exactly as brush materials get it. It must NOT also be added at
+        // runtime, or the same variance is counted twice and distant ground
+        // goes flat.
+        assert!(
+            src.contains("layer_rough_at(0, f)"),
+            "terrain no longer samples a roughness map",
+        );
+        assert!(
+            src.contains("layer_ao_at(0, f)"),
+            "terrain no longer samples an occlusion map",
+        );
+        assert!(
+            !src.contains("min(2.0 * sigma2"),
+            "the runtime variance term is back alongside the baked mips; that \
+             counts the same measurement twice",
+        );
+        // What the bake cannot see -- geometric normal variation and the
+        // grazing-angle anisotropy gap -- is still handled at runtime.
+        assert!(
+            src.contains("specular_aa_roughness(clamp(rough_map, 0.0, 1.0), dpdx(shaded_n), dpdy(shaded_n))"),
+            "the geometric specular-AA term is gone; the bake alone cannot see \
+             curvature or the anisotropy gap",
+        );
+    }
+}
+
+#[cfg(test)]
+mod terrain_mip_tests {
+    /// EVERY TERRAIN ARRAY THAT IS SAMPLED BY A SHRINKING FOOTPRINT NEEDS MIPS.
+    ///
+    /// The normal array shipped with `mip_level_count: 1` while the shared
+    /// sampler asked for `mipmap_filter: Linear` and 8x anisotropy -- both
+    /// silent no-ops against one level. Distant pixels point-sampled a
+    /// full-resolution normal map, so the shading normal changed randomly
+    /// pixel to pixel and head tracking moved it every frame. Brush normals
+    /// were mipped all along, which is why only terrain shimmered.
+    ///
+    /// Asserted on the SOURCE because the texture is built on a device this
+    /// test does not have. Crude, and it would have caught the bug.
+    #[test]
+    fn the_normal_array_is_created_with_a_mip_chain() {
+        let src = include_str!("terrain_pipeline.rs");
+        let i = src.find(r#"label: Some("terrain_normals")"#).expect("normal array is gone");
+        let window = &src[i..i + 400];
+        assert!(
+            window.contains("mip_level_count,"),
+            "terrain_normals is back to a single mip level; distant ground will \
+             point-sample full-resolution normals and shimmer",
+        );
+        assert!(
+            !window.contains("mip_level_count: 1"),
+            "terrain_normals explicitly requests one mip level",
+        );
+    }
+
+    /// Roughness and occlusion need mips for the same reason the normal does,
+    /// and must be LINEAR for the same reason: they are measurements.
+    #[test]
+    fn the_data_arrays_are_mipped_and_linear() {
+        let src = include_str!("terrain_pipeline.rs");
+        let i = src.find("let data_array = |label: &str|").expect("data arrays are gone");
+        let window = &src[i..i + 600];
+        assert!(
+            window.contains("mip_level_count,") && !window.contains("mip_level_count: 1"),
+            "the roughness/occlusion arrays lost their mip chain",
+        );
+        assert!(
+            window.contains("TextureFormat::Rgba8Unorm") && !window.contains("Rgba8UnormSrgb"),
+            "a measurement array is being created as sRGB",
+        );
+        // The roughness chain must be the variance-baking one, not a plain
+        // box filter -- that is what carries the normal's lost detail.
+        assert!(
+            src.contains("roughness_chain_with_normal_variance(")
+                && src.contains("mip_chain_linear(&ao_arr[slot].rgba"),
+            "roughness is no longer baked with the normal's variance, or AO is \
+             no longer a plain linear chain",
+        );
+    }
+
+    /// Every layer ships the full material set, so terrain is not a
+    /// second-class surface next to a brush.
+    #[test]
+    fn every_layer_has_a_roughness_and_occlusion_file_name() {
+        assert_eq!(super::TERRAIN_ROUGH_FILES.len(), super::TERRAIN_LAYER_FILES.len());
+        assert_eq!(super::TERRAIN_AO_FILES.len(), super::TERRAIN_LAYER_FILES.len());
+        for (i, colour) in super::TERRAIN_LAYER_FILES.iter().enumerate() {
+            let stem = colour.trim_end_matches(".jpg");
+            assert_eq!(super::TERRAIN_ROUGH_FILES[i], format!("{stem}_r.jpg"));
+            assert_eq!(super::TERRAIN_AO_FILES[i], format!("{stem}_ao.jpg"));
+        }
+    }
+
+    /// A normal map mipped through the sRGB curve tilts every bump toward the
+    /// surface. The chain for it must be the linear one.
+    #[test]
+    fn the_normal_chain_is_built_linear() {
+        let src = include_str!("terrain_pipeline.rs");
+        let i = src.find(r#"label: Some("terrain_normals")"#).expect("normal array is gone");
+        let window = &src[i..i + 1600];
+        assert!(
+            window.contains("mip_chain_linear(&src.rgba, w, h, mip_level_count)"),
+            "the normal mip chain is not the linear one",
+        );
+    }
+
+    /// The linear chain must not apply any transfer curve: a mid-grey in is a
+    /// mid-grey out at every level.
+    #[test]
+    fn the_linear_chain_preserves_a_flat_value() {
+        let px = vec![128u8; 8 * 8 * 4];
+        let chain = super::mip_chain_linear(&px, 8, 8, super::mip_levels_for(8, 8));
+        assert!(chain.len() > 1, "no chain was built");
+        for (data, w, h) in &chain {
+            assert_eq!(data.len(), (w * h * 4) as usize);
+            for b in data {
+                assert!(
+                    (*b as i32 - 128).abs() <= 1,
+                    "a flat 128 became {b}; the linear chain is bending values",
+                );
+            }
+        }
     }
 }
