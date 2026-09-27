@@ -489,8 +489,9 @@ struct GpuLight {
 struct GpuLights {
     /// x = active light count; y = how many of them, from the front, are LIVE
     /// (the rest are baked into the level's lightmaps and shaded only by
-    /// surfaces without one -- see `receiver_skips_baked`); zw pad the field
-    /// to the array's 16-byte stride.
+    /// surfaces without one -- see `receiver_skips_baked`); z = 1 turns the
+    /// shader's light culling OFF, to measure it (see `light_culling` in the
+    /// shader); w pads the field to the array's 16-byte stride.
     count: [u32; 4],
     lights: [GpuLight; MAX_LIGHTS],
 }
@@ -502,6 +503,11 @@ struct GpuLights {
 /// already spoken for on the skinned mesh pipeline.
 pub struct LightsUniform {
     buffer: Buffer,
+    /// Whether the shader may skip a lamp that cannot reach a pixel before any
+    /// of its maths. Lossless; off only to measure what it saves (the
+    /// `light_culling` lever). A `Cell` so the frame can set it while its draw
+    /// lists still borrow the renderer.
+    culling: std::cell::Cell<bool>,
 }
 
 impl LightsUniform {
@@ -513,7 +519,12 @@ impl LightsUniform {
             mapped_at_creation: false,
         });
 
-        Self { buffer }
+        Self { buffer, culling: std::cell::Cell::new(true) }
+    }
+
+    /// See `culling`. Takes effect with the next upload.
+    pub fn set_culling(&self, on: bool) {
+        self.culling.set(on);
     }
 
     pub fn buffer(&self) -> &Buffer {
@@ -564,17 +575,17 @@ impl LightsUniform {
         spot_layers: &[usize],
         sun_is_baked: bool,
     ) {
-        let gpu = pack_lights(lights, live, spot_layers, sun_is_baked);
+        let gpu = pack_lights(lights, live, spot_layers, sun_is_baked, self.culling.get());
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&gpu));
     }
 }
 
 /// The GPU's copy of a frame's lights. See `GpuLights::count`.
-fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_baked: bool) -> GpuLights {
+fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_baked: bool, culling: bool) -> GpuLights {
     {
         let count = lights.len().min(MAX_LIGHTS);
         let mut gpu = GpuLights {
-            count: [count as u32, live.min(count) as u32, 0, 0],
+            count: [count as u32, live.min(count) as u32, u32::from(!culling), 0],
             lights: [GpuLight::zeroed(); MAX_LIGHTS],
         };
         for (slot, l) in gpu.lights.iter_mut().zip(lights.iter().take(MAX_LIGHTS)) {
@@ -898,12 +909,22 @@ var<private> stationary_vis_b: vec4<f32> = vec4<f32>(1.0);
 // the baked mask when it is a stationary lamp (`position.w` = 2 + channel),
 // else 1 -- a live lamp is shadowed by the shadow map, if it has a slot.
 fn stationary_visibility(l: Light) -> f32 {{
-    if (l.position.w < 1.5) {{
+    return stationary_visibility_of(l.position.w);
+}}
+// The same, from the light's `position.w` alone: what the light loop reads
+// before it loads the rest of the light.
+fn stationary_visibility_of(marker: f32) -> f32 {{
+    if (marker < 1.5) {{
         return 1.0;
     }}
-    let c = i32(l.position.w - 1.5);
+    let c = i32(marker - 1.5);
     let v = select(stationary_vis_b, stationary_vis_a, c < 4);
     return v[c & 3];
+}}
+// Whether the light loop may skip a lamp that cannot reach this pixel before
+// doing any of its maths. See `GpuLights::count`; off only to measure it.
+fn light_culling() -> bool {{
+    return lights.count.z == 0u;
 }}
 // Whether this fragment's surface carries the BAKED lights in its lightmap.
 // The light list is ordered live first, baked after -- `lights.count.y` is
@@ -2642,6 +2663,28 @@ fn shade_material_env(
     // Weighted as the return line weights diffuse light.
     dbg_baked = bounce * albedo * (1.0 - fresnel);
     for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
+        // A LAMP THAT CANNOT REACH THIS PIXEL IS SKIPPED BEFORE ANY OF ITS
+        // MATHS: past its range, where the window is exactly zero, or a
+        // stationary lamp its baked mask says is hidden from here -- behind a
+        // wall, in another room -- where the visibility is exactly zero. Both
+        // multiply the whole contribution, so skipping changes no pixel. In a
+        // level of several rooms it is the common case: most lamps are behind
+        // a wall from most pixels, and each one skipped is a light's worth of
+        // lighting the fill-bound frame no longer pays for.
+        let marker = lights.lights[i].position.w;
+        let seen = stationary_visibility_of(marker);
+        if (light_culling()) {{
+            if (seen <= 0.0) {{
+                continue;
+            }}
+            if (lights.lights[i].params.z < 1.5) {{
+                let to_light = lights.lights[i].position.xyz - world_pos;
+                let reach = lights.lights[i].params.x;
+                if (dot(to_light, to_light) >= reach * reach) {{
+                    continue;
+                }}
+            }}
+        }}
         let l = lights.lights[i];
         let c = light_contribution_split(l, world_pos, n, view_dir, shininess, spec_strength);
         // NOTHING ARRIVES, SO THERE IS NOTHING TO SHADOW.
@@ -2662,7 +2705,7 @@ fn shade_material_env(
         // ONE shadow factor for both halves: a surface in shadow receives no
         // light at all, and a highlight that survives its own shadow is the
         // classic tell of a renderer that shadows only the diffuse term.
-        var shadow = stationary_visibility(l);
+        var shadow = seen;
         if (l.params.z > 1.5) {{
             shadow = sun_visibility(l, world_pos);
         }}
@@ -4035,11 +4078,11 @@ mod baked_light_split_tests {
     #[test]
     fn the_upload_says_where_the_baked_tail_starts() {
         let lights: Vec<Light> = (0..5).map(|i| point(i as f32, 1.0)).collect();
-        let gpu = pack_lights(&lights, 2, &[], false);
+        let gpu = pack_lights(&lights, 2, &[], false, true);
         assert_eq!(gpu.count[0], 5);
         assert_eq!(gpu.count[1], 2);
         // A plain upload is all live.
-        let gpu = pack_lights(&lights, 5, &[], false);
+        let gpu = pack_lights(&lights, 5, &[], false, true);
         assert_eq!(gpu.count[1], 5);
     }
 

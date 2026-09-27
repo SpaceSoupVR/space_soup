@@ -59,6 +59,10 @@ pub struct Levers {
     pub stationary_lights: bool,
     /// Eye adaptation. Off: exposure is pinned at the scene's post setting.
     pub eye_adaptation: bool,
+    /// The light loop skips a lamp that cannot reach the pixel -- past its
+    /// range, or behind a wall by its baked mask -- before any of its maths.
+    /// Lossless: off changes no pixel, only what the frame costs.
+    pub light_culling: bool,
     /// Screen-space reflections. `None` leaves the in-headset switch alone.
     pub ssr: Option<bool>,
     /// Both eyes in one multiview scene pass. `None` leaves it as set.
@@ -86,6 +90,7 @@ impl Default for Levers {
             direct_lights: true,
             stationary_lights: true,
             eye_adaptation: true,
+            light_culling: true,
             ssr: None,
             multiview: None,
             half_viewport: false,
@@ -121,6 +126,7 @@ impl Levers {
             Phase::NoProbeTrace => l.probe_trace = false,
             Phase::NoProxies => l.reflection_proxies = false,
             Phase::NoStationary => l.stationary_lights = false,
+            Phase::NoLightCulling => l.light_culling = false,
         }
         l
     }
@@ -145,6 +151,7 @@ impl Levers {
         flag("direct_lights", self.direct_lights, d.direct_lights);
         flag("stationary", self.stationary_lights, d.stationary_lights);
         flag("eye_adaptation", self.eye_adaptation, d.eye_adaptation);
+        flag("light_culling", self.light_culling, d.light_culling);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
         flag("ab_cycle", self.ab_cycle, d.ab_cycle);
