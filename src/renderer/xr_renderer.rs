@@ -1023,7 +1023,7 @@ impl XrRenderer {
     /// fraction, green = baked), at `SUN_MASK_SCALE` times this atlas's density.
     /// `None` shades the brushes' sun from the level's static shadow map.
     /// `stationary` is the stationary lamps' shadow masks, one RGBA image per
-    /// four lamps, all `stationary_size`, at `STATIONARY_MASK_SCALE` times
+    /// two lamps, all `stationary_size`, at `STATIONARY_MASK_SCALE` times
     /// this atlas's density; empty binds the neutral mask, under which every
     /// stationary lamp is unshadowed.
     #[allow(clippy::too_many_arguments)]

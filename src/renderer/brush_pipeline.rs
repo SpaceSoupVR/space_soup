@@ -1406,7 +1406,8 @@ fn brush_shader() -> String {
 /// `the_sun_mask_range_matches_the_renderer` holds the two together.
 pub const SUN_MASK_DISTANCE_TEXELS: f32 = 4.0;
 
-/// How far a STATIONARY lamp's mask distance reaches, in mask texels.
+/// How far a STATIONARY lamp's mask distance reaches, in mask texels, and its
+/// penumbra: each lamp's pair of bytes decodes as the sun mask's red and blue.
 /// `space_soup_engine::brush_lightmap::STATIONARY_MASK_DISTANCE_TEXELS` must
 /// equal it, and the baker's `the_stationary_mask_range_matches_the_renderer`
 /// holds the two together.
@@ -1709,23 +1710,46 @@ struct VOut {{
     // edge came out as a staircase of 3-6 cm steps across the doorway's sun
     // patch (headset, 2026-09-25). Distances interpolate into a straight line,
     // so the edge is rebuilt at 0 at any magnification. Its width is the
-    // sun's own penumbra (blue, from how far the shadow's caster is) or one
+    // sun's own penumbra (from how far the shadow's caster is) or one
     // screen pixel, whichever is wider -- sharp where the caster is close,
     // soft where it is far, and never aliased. An older coverage mask reads
     // as distance 0 at half coverage, so it still works, only harder-edged.
+    //
+    // Green carries the rest (see `mesh::pack_sun_mask_texel`): under a half,
+    // no bake; from a half up, baked, with the penumbra's half-width across
+    // the upper half.
     let sun_d = (sun_mask.r - 0.5) * (2.0 * SUN_MASK_DISTANCE_TEXELS);
-    let sun_w = max(max(sun_mask.b * SUN_MASK_DISTANCE_TEXELS, 0.5 * fwidth(sun_d)), 0.02);
-    receiver_sun_mask = select(-1.0, smoothstep(-sun_w, sun_w, sun_d), sun_mask.g > 0.5);
-    // THE STATIONARY LAMPS' SHADOWS, rebuilt as the sun's is: one signed
-    // distance per channel, four lamps a layer, the edge put back at zero at
-    // any magnification and never narrower than a pixel. The neutral mask an
+    let sun_pen = max(sun_mask.g - 0.5, 0.0) * (2.0 * SUN_MASK_DISTANCE_TEXELS);
+    let sun_w = max(max(sun_pen, 0.5 * fwidth(sun_d)), 0.02);
+    receiver_sun_mask = select(-1.0, smoothstep(-sun_w, sun_w, sun_d), sun_mask.g > 0.25);
+    // THE STATIONARY LAMPS' SHADOWS, rebuilt as the sun's is: per lamp a
+    // signed distance and the bulb's penumbra, two lamps a layer (red and
+    // green, blue and alpha), the edge put back at zero at any magnification
+    // and never narrower than a pixel. Away from a sharp edge the baker stores
+    // a lamp's visibility as a distance this smoothstep gives back exactly, so
+    // soft shadows and the faint bands of thin things come through the same
+    // code. Layers a level does not have are not fetched; the neutral mask an
     // unbaked level carries reads fully lit. See `stationary_visibility`.
-    let st_a = textureSample(lm_stationary, lm_sun_samp, lm_uv, 0);
-    let st_b = textureSample(lm_stationary, lm_sun_samp, lm_uv, 1);
-    let st_da = (st_a - vec4<f32>(0.5)) * (2.0 * STATIONARY_MASK_DISTANCE_TEXELS);
-    let st_db = (st_b - vec4<f32>(0.5)) * (2.0 * STATIONARY_MASK_DISTANCE_TEXELS);
-    let st_wa = max(0.5 * fwidth(st_da), vec4<f32>(0.02));
-    let st_wb = max(0.5 * fwidth(st_db), vec4<f32>(0.02));
+    let st_layers = textureNumLayers(lm_stationary);
+    let st_0 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 0);
+    var st_1 = vec4<f32>(1.0);
+    var st_2 = vec4<f32>(1.0);
+    var st_3 = vec4<f32>(1.0);
+    if (st_layers > 1u) {
+        st_1 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 1);
+    }
+    if (st_layers > 2u) {
+        st_2 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 2);
+    }
+    if (st_layers > 3u) {
+        st_3 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 3);
+    }
+    let st_da = (vec4<f32>(st_0.r, st_0.b, st_1.r, st_1.b) - vec4<f32>(0.5)) * (2.0 * STATIONARY_MASK_DISTANCE_TEXELS);
+    let st_db = (vec4<f32>(st_2.r, st_2.b, st_3.r, st_3.b) - vec4<f32>(0.5)) * (2.0 * STATIONARY_MASK_DISTANCE_TEXELS);
+    let st_pa = vec4<f32>(st_0.g, st_0.a, st_1.g, st_1.a) * STATIONARY_MASK_DISTANCE_TEXELS;
+    let st_pb = vec4<f32>(st_2.g, st_2.a, st_3.g, st_3.a) * STATIONARY_MASK_DISTANCE_TEXELS;
+    let st_wa = max(max(st_pa, 0.5 * fwidth(st_da)), vec4<f32>(0.02));
+    let st_wb = max(max(st_pb, 0.5 * fwidth(st_db)), vec4<f32>(0.02));
     stationary_vis_a = smoothstep(-st_wa, st_wa, st_da);
     stationary_vis_b = smoothstep(-st_wb, st_wb, st_db);
     // The baked lamps are in this atlas. See `receiver_skips_baked`.
