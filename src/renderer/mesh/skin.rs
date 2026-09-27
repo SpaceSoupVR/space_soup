@@ -15,13 +15,48 @@ pub struct SkinnedMeshPrimitive {
 }
 
 impl SkinnedMeshPrimitive {
-    pub(crate) fn excluding_joints(&self, device: &wgpu::Device, excluded_joints: &[usize]) -> Option<Self> {
+    /// Drop triangles belonging to `excluded_joints`, or sitting above
+    /// `cutoff_height` in the bind pose.
+    ///
+    /// WHY A HEIGHT CUTOFF AND NOT JUST JOINTS
+    ///
+    /// Joint exclusion drops a triangle when a vertex's DOMINANT joint is in
+    /// the set. That cannot remove the top of the neck, because those vertices
+    /// are often weighted mostly to Chest or Spine -- joints that must stay,
+    /// since they carry the torso the wearer is supposed to see when they look
+    /// down. So hiding Head, its descendants and Neck still leaves an open tube
+    /// of neck geometry whose rim sits near eye level, and the wearer looks
+    /// straight into the inside of their own throat.
+    ///
+    /// No set of joints fixes that; the geometry simply is not partitioned the
+    /// way the joints are. A plane is. Everything above the collar goes,
+    /// whatever it happens to be weighted to.
+    ///
+    /// `bind_positions` are the vertices already through their bind-pose joint
+    /// matrices, so the cutoff is a height on the MODEL, in model units, and
+    /// does not move when the head turns.
+    pub(crate) fn excluding_joints_and_above(
+        &self,
+        device: &wgpu::Device,
+        excluded_joints: &[usize],
+        bind_positions: &[Vec3],
+        up: Vec3,
+        cutoff_height: Option<f32>,
+    ) -> Option<Self> {
+        let above = |vi: u32| match cutoff_height {
+            Some(c) => bind_positions
+                .get(vi as usize)
+                .is_some_and(|p| p.dot(up) > c),
+            None => false,
+        };
         let indices: Vec<u32> = self
             .indices
             .chunks_exact(3)
             .filter(|tri| {
-                !tri.iter()
-                    .any(|&vi| excluded_joints.contains(&self.vertices[vi as usize].dominant_joint()))
+                !tri.iter().any(|&vi| {
+                    excluded_joints.contains(&self.vertices[vi as usize].dominant_joint())
+                        || above(vi)
+                })
             })
             .flatten()
             .copied()
@@ -164,6 +199,20 @@ pub struct GltfSkin {
 
     pub joint_bind_group: Option<wgpu::BindGroup>,
     pub primitives: Vec<SkinnedMeshPrimitive>,
+
+    /// Total height of the skinned mesh in its bind pose, in model units.
+    ///
+    /// The character's STATURE -- sole to crown -- and the only measurement on
+    /// a humanoid rig that means the same thing on every model. Joint positions
+    /// do not: "Head" sits at the skull base on one rig and mid-skull on
+    /// another, and a rig may carry no eye joints at all, so anything derived
+    /// from a single joint is a guess about that rig's conventions.
+    ///
+    /// Exists so the first-person eye position can be placed anthropometrically
+    /// when the rig does not say where the eyes are. Measured along the model's
+    /// own up axis at load, from the same bind-pose vertex walk that produces
+    /// `bounding_radius`, so it costs nothing extra.
+    pub bind_stature: f32,
 }
 
 impl GltfSkin {

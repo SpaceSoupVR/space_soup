@@ -133,7 +133,7 @@ impl GenericColorRenderer {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[vertex_layout],
+                buffers: &[Some(vertex_layout)],
             },
             fragment: Some(FragmentState {
                 module: &shader,
@@ -148,7 +148,7 @@ impl GenericColorRenderer {
             primitive: PrimitiveState::default(),
             depth_stencil,
             multisample,
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 

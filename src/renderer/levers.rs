@@ -1,0 +1,260 @@
+//! RUNTIME LEVERS: switch a renderer feature off -- or force one on -- on the
+//! headset, while it runs, to see what it costs and what it does.
+//!
+//! # Why a file and not a build
+//!
+//! Every question of the form "is it the trace or the portals that costs the
+//! millisecond?" or "does the seam go away without the probe blend?" used to
+//! cost a build and a deploy per answer. A lever answers it in the time it
+//! takes to push a few bytes:
+//!
+//! ```text
+//! adb -s 2G0YC5ZG7706YV shell "echo '{\"probe_trace\": false}' > \
+//!     /sdcard/Android/data/com.example.questapp/files/levers.json"
+//! ```
+//!
+//! The app polls the file about once a second and hands every change to the
+//! renderer, and each `PERF` line names the levers it was measured under, so a
+//! number is never read against the wrong configuration. Delete the file (or
+//! write `{}`) to go back to the shipped state.
+//!
+//! # One set of switches for people and for the A/B schedule
+//!
+//! `perf_ab` cycles the same switches on its own: each phase is these levers
+//! with exactly one more thing off. So a lever and a phase can never disagree
+//! about what "no portals" means, and every feature added here is measurable by
+//! the schedule for free.
+//!
+//! Unknown names are an ERROR, not ignored: a lever misspelt in the middle of a
+//! headset session would otherwise measure nothing and look like a finding.
+
+use serde::Deserialize;
+
+/// Every switchable feature. The default is the shipped renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Levers {
+    /// Reflection probes at all. Off: surfaces reflect the sky's harmonics.
+    pub probes: bool,
+    /// The exact reflection trace (rooms, doorways, proxies). Off: smooth
+    /// surfaces fall back to the box projection.
+    pub probe_trace: bool,
+    /// What stands inside rooms -- the pillar, the lamps -- in the trace. Off:
+    /// reflections pass through them to the walls.
+    pub reflection_proxies: bool,
+    /// The two-photograph blend across a room's cells. Off: every resident
+    /// probe is its own room, so no fragment reads two.
+    pub probe_blend: bool,
+    /// Doorway portals: the blend across an opening, and the trace crossing
+    /// into the next room.
+    pub portals: bool,
+    /// Every shadow pass and every shadow tap. Lights still shine, unshadowed.
+    pub shadows: bool,
+    /// The moving-objects sun map. The static map and the baked mask stay.
+    pub sun_dynamic: bool,
+    /// The live light loop, the sky's sun included. Baked light and probes stay.
+    pub direct_lights: bool,
+    /// Eye adaptation. Off: exposure is pinned at the scene's post setting.
+    pub eye_adaptation: bool,
+    /// Screen-space reflections. `None` leaves the in-headset switch alone.
+    pub ssr: Option<bool>,
+    /// Both eyes in one multiview scene pass. `None` leaves it as set.
+    pub multiview: Option<bool>,
+    /// MEASUREMENT ONLY -- the scene pass shades a quarter of the pixels. If
+    /// the scene cost drops toward a quarter, the frame is fill-bound.
+    pub half_viewport: bool,
+    /// MEASUREMENT ONLY -- straight to the swapchain: no offscreen copy, no eye
+    /// pass. Reflections that need the copy break.
+    pub direct_path: bool,
+    /// Cycle `perf_ab`'s phases, one per `PERF` window, on top of these levers.
+    pub ab_cycle: bool,
+}
+
+impl Default for Levers {
+    fn default() -> Self {
+        Self {
+            probes: true,
+            probe_trace: true,
+            reflection_proxies: true,
+            probe_blend: true,
+            portals: true,
+            shadows: true,
+            sun_dynamic: true,
+            direct_lights: true,
+            eye_adaptation: true,
+            ssr: None,
+            multiview: None,
+            half_viewport: false,
+            direct_path: false,
+            ab_cycle: false,
+        }
+    }
+}
+
+impl Levers {
+    /// Parse a lever file. `{}` -- or an empty file -- is the shipped state.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        if text.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        serde_json::from_str(text).map_err(|e| e.to_string())
+    }
+
+    /// These levers with the `perf_ab` phase's one extra switch applied.
+    pub fn with_phase(self, phase: crate::renderer::perf_ab::Phase) -> Self {
+        use crate::renderer::perf_ab::Phase;
+        let mut l = self;
+        match phase {
+            Phase::Baseline => {}
+            Phase::HalfViewport => l.half_viewport = true,
+            Phase::DirectPath => l.direct_path = true,
+            Phase::NoProbes => l.probes = false,
+            Phase::NoShadows => l.shadows = false,
+            Phase::NoSunDynamic => l.sun_dynamic = false,
+            Phase::NoProbeBlend => l.probe_blend = false,
+            Phase::NoPortals => l.portals = false,
+            Phase::NoDirectLights => l.direct_lights = false,
+            Phase::NoProbeTrace => l.probe_trace = false,
+            Phase::NoProxies => l.reflection_proxies = false,
+        }
+        l
+    }
+
+    /// What differs from the shipped state, for the `PERF` line: `-` when
+    /// nothing does.
+    pub fn summary(&self) -> String {
+        let d = Self::default();
+        let mut out: Vec<String> = Vec::new();
+        let mut flag = |name: &str, on: bool, default: bool| {
+            if on != default {
+                out.push(if on { name.to_string() } else { format!("no_{name}") });
+            }
+        };
+        flag("probes", self.probes, d.probes);
+        flag("probe_trace", self.probe_trace, d.probe_trace);
+        flag("proxies", self.reflection_proxies, d.reflection_proxies);
+        flag("probe_blend", self.probe_blend, d.probe_blend);
+        flag("portals", self.portals, d.portals);
+        flag("shadows", self.shadows, d.shadows);
+        flag("sun_dynamic", self.sun_dynamic, d.sun_dynamic);
+        flag("direct_lights", self.direct_lights, d.direct_lights);
+        flag("eye_adaptation", self.eye_adaptation, d.eye_adaptation);
+        flag("half_viewport", self.half_viewport, d.half_viewport);
+        flag("direct_path", self.direct_path, d.direct_path);
+        flag("ab_cycle", self.ab_cycle, d.ab_cycle);
+        if let Some(on) = self.ssr {
+            out.push(format!("ssr={}", if on { "on" } else { "off" }));
+        }
+        if let Some(on) = self.multiview {
+            out.push(format!("multiview={}", if on { "on" } else { "off" }));
+        }
+        if out.is_empty() {
+            "-".to_string()
+        } else {
+            out.join(",")
+        }
+    }
+}
+
+/// A lever file, re-read when it changes.
+pub struct LeverFile {
+    path: std::path::PathBuf,
+    /// The modification time and length last read; `None` before the first
+    /// read and while the file does not exist.
+    seen: Option<(std::time::SystemTime, u64)>,
+}
+
+impl LeverFile {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into(), seen: None }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// `Some` when the file changed since the last call: the levers it now
+    /// holds, or why it could not be read. A file that disappears reads as the
+    /// shipped state, so deleting it undoes every lever.
+    pub fn poll(&mut self) -> Option<Result<Levers, String>> {
+        match std::fs::metadata(&self.path) {
+            Ok(m) => {
+                let stamp = (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len());
+                if self.seen == Some(stamp) {
+                    return None;
+                }
+                self.seen = Some(stamp);
+                Some(std::fs::read_to_string(&self.path).map_err(|e| e.to_string()).and_then(|t| Levers::parse(&t)))
+            }
+            Err(_) => {
+                if self.seen.take().is_some() {
+                    Some(Ok(Levers::default()))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::renderer::perf_ab::Phase;
+
+    #[test]
+    fn an_empty_file_is_the_shipped_renderer() {
+        assert_eq!(Levers::parse("").unwrap(), Levers::default());
+        assert_eq!(Levers::parse("{}").unwrap(), Levers::default());
+        assert_eq!(Levers::default().summary(), "-");
+    }
+
+    #[test]
+    fn a_lever_changes_only_itself() {
+        let l = Levers::parse(r#"{"probe_trace": false, "ssr": true}"#).unwrap();
+        assert!(!l.probe_trace && l.ssr == Some(true));
+        assert_eq!(Levers { probe_trace: true, ssr: None, ..l }, Levers::default());
+        assert_eq!(l.summary(), "no_probe_trace,ssr=on");
+    }
+
+    /// A misspelt lever measures nothing and would look like a finding.
+    #[test]
+    fn an_unknown_lever_is_an_error() {
+        assert!(Levers::parse(r#"{"probe_tarce": false}"#).is_err());
+    }
+
+    /// Each phase is the levers with exactly one more thing switched, so the
+    /// schedule and a person flipping the same lever measure the same thing.
+    #[test]
+    fn each_phase_is_one_lever() {
+        for p in Phase::ALL {
+            let l = Levers::default().with_phase(p);
+            let changed = l.summary();
+            if p == Phase::Baseline {
+                assert_eq!(changed, "-");
+            } else {
+                assert!(!changed.contains(','), "{p:?} switched more than one lever: {changed}");
+                assert_ne!(changed, "-", "{p:?} switched nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn the_file_is_reread_when_it_changes_and_forgotten_when_deleted() {
+        let dir = std::env::temp_dir().join(format!("levers_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("levers.json");
+        let _ = std::fs::remove_file(&path);
+        let mut f = LeverFile::new(&path);
+        assert!(f.poll().is_none(), "no file, nothing to report");
+        std::fs::write(&path, r#"{"portals": false}"#).unwrap();
+        assert_eq!(f.poll().unwrap().unwrap().portals, false);
+        assert!(f.poll().is_none(), "unchanged, nothing to report");
+        std::fs::write(&path, r#"{"portals": false, "shadows": false}"#).unwrap();
+        let l = f.poll().unwrap().unwrap();
+        assert!(!l.portals && !l.shadows);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(f.poll().unwrap().unwrap(), Levers::default(), "deleting the file undoes every lever");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

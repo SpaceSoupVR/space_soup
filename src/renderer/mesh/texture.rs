@@ -3,6 +3,10 @@ pub struct LoadedTexture {
     pub view: wgpu::TextureView,
     _sampler: wgpu::Sampler,
     pub bind_group: wgpu::BindGroup,
+    /// Held only so the bind group's view stays valid. Never sampled from Rust.
+    _direction: Option<wgpu::Texture>,
+    /// The brush sun mask and its sampler, held for the same reason.
+    _sun_mask: Option<(wgpu::Texture, wgpu::Sampler)>,
 }
 
 pub(crate) fn load_primitive_texture(
@@ -14,34 +18,78 @@ pub(crate) fn load_primitive_texture(
 ) -> LoadedTexture {
     let material = prim.material();
     let pbr = material.pbr_metallic_roughness();
-    let force_opaque = material.alpha_mode() != gltf::material::AlphaMode::Blend;
+    // GLASS IS NOT OPAQUE, even when it forgets to say so.
+    //
+    // glTF's `KHR_materials_transmission` is how a modern asset describes clear
+    // glass, and it does NOT set `alphaMode: BLEND` -- transmission is a
+    // separate mechanism from alpha coverage, so a transmissive material is
+    // formally opaque and this test called it opaque.
+    //
+    // The result was a lamp whose bulb never appeared to glow. The hanging
+    // fixture in this project is two primitives: a housing that carries the
+    // emissive, and a glass envelope around the bulb with a transmission factor
+    // of 1.0. Drawn opaque, that envelope is a grey dome sitting directly in
+    // front of the only part that glows -- so the emissive was rendering
+    // correctly the whole time and nothing could see it.
+    //
+    // Approximated as ALPHA rather than as refraction: this renderer has no
+    // transmission path, and clear glass that is simply see-through is far
+    // closer to right than clear glass painted grey.
+    let transmission = material
+        .transmission()
+        .map(|t| t.transmission_factor())
+        .unwrap_or(0.0);
+    let force_opaque =
+        material.alpha_mode() != gltf::material::AlphaMode::Blend && transmission <= 0.0;
 
-    if let Some(info) = pbr.base_color_texture() {
-        let image = &images[info.texture().source().index()];
-        return upload_texture_rgba(device, queue, layout, image, force_opaque);
-    }
+    let base = match pbr.base_color_texture() {
+        Some(info) => decode_image(&images[info.texture().source().index()], force_opaque),
+        None => {
+            let c = pbr.base_color_factor();
+            (
+                vec![
+                    (c[0] * 255.0) as u8,
+                    (c[1] * 255.0) as u8,
+                    (c[2] * 255.0) as u8,
+                    if force_opaque {
+                        255
+                    } else {
+                        // What the surface still BLOCKS. A transmission of 1.0
+                        // is clear glass and blocks nothing.
+                        (c[3] * (1.0 - transmission) * 255.0) as u8
+                    },
+                ],
+                1,
+                1,
+            )
+        }
+    };
 
-    let c = pbr.base_color_factor();
-    let rgba = [
-        (c[0] * 255.0) as u8,
-        (c[1] * 255.0) as u8,
-        (c[2] * 255.0) as u8,
-        if force_opaque { 255 } else { (c[3] * 255.0) as u8 },
-    ];
-    upload_solid_texture(device, queue, layout, rgba)
+    // THE EMISSIVE MASK, and it is not optional in practice.
+    //
+    // glTF defines emission as `emissiveFactor * emissiveTexture`, and real
+    // fixtures use the texture to say WHICH PART glows. Poly Haven's
+    // hanging_industrial_lamp is one material covering the whole lamp, with
+    // emissiveFactor [1,1,1] and a texture that is black everywhere except the
+    // bulb. Honouring only the factor makes the entire housing glow white --
+    // the factor alone is not "how much this material emits", it is a tint on a
+    // mask that has to be sampled.
+    //
+    // A material with no emissive texture gets a WHITE 1x1, so the factor is
+    // multiplied by one and a material that emits uniformly still works. Black
+    // would silence every such material, and the factor would do nothing.
+    let emissive = match material.emissive_texture() {
+        Some(info) => decode_image(&images[info.texture().source().index()], true),
+        None => (vec![255u8, 255, 255, 255], 1, 1),
+    };
+
+    create_mesh_material_texture(device, queue, layout, &base, &emissive)
 }
 
-fn upload_texture_rgba(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    layout: &wgpu::BindGroupLayout,
-    image: &gltf::image::Data,
-    force_opaque: bool,
-) -> LoadedTexture {
+/// Decode a glTF image to RGBA8, returning `(pixels, width, height)`.
+fn decode_image(image: &gltf::image::Data, force_opaque: bool) -> (Vec<u8>, u32, u32) {
     use gltf::image::Format;
-
     let (width, height) = (image.width, image.height);
-
     let rgba: Vec<u8> = match image.format {
         Format::R8G8B8A8 => {
             if force_opaque {
@@ -67,24 +115,526 @@ fn upload_texture_rgba(
             out
         }
         _ => {
-            log::warn!(
-                "Unsupported glTF image format {:?}, using gray fallback",
-                image.format
-            );
-            [180u8, 180, 180, 255].repeat((width * height) as usize)
+            log::warn!("Unsupported glTF image format {:?}, using gray fallback", image.format);
+            ([180u8, 180, 180, 255].repeat((width * height) as usize), width, height).0
         }
     };
-
-    create_texture_from_rgba(device, queue, layout, &rgba, width, height)
+    (rgba, width, height)
 }
 
-fn upload_solid_texture(
+
+/// A mesh material's bind group: base colour, sampler, and the emissive mask.
+///
+/// Both textures live in ONE bind group because both belong to one material and
+/// are created together, so the `Arc<LoadedTexture>` primitives share stays
+/// consistent. It also has to be one group: mobile GPUs guarantee only four,
+/// and the mesh pipeline already uses all four (camera, model, texture,
+/// lightmap).
+pub fn create_mesh_material_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
-    rgba: [u8; 4],
+    base: &(Vec<u8>, u32, u32),
+    emissive: &(Vec<u8>, u32, u32),
 ) -> LoadedTexture {
-    create_texture_from_rgba(device, queue, layout, &rgba, 1, 1)
+    let make = |label: &str, px: &(Vec<u8>, u32, u32)| {
+        let size = wgpu::Extent3d { width: px.1, height: px.2, depth_or_array_layers: 1 };
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &px.0,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * px.1),
+                rows_per_image: Some(px.2),
+            },
+            size,
+        );
+        tex
+    };
+
+    let base_tex = make("gltf_base_color", base);
+    let emissive_tex = make("gltf_emissive", emissive);
+    let view = base_tex.create_view(&Default::default());
+    let emissive_view = emissive_tex.create_view(&Default::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gltf_material_bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&emissive_view),
+            },
+        ],
+    });
+    LoadedTexture { texture: base_tex, view, _sampler: sampler, bind_group, _direction: None, _sun_mask: None }
+}
+
+/// Upload RGBA bytes as a 2D texture and return it with a default view.
+///
+/// Split out of `create_texture_from_rgba` so a caller can build its own bind
+/// group. The two are not interchangeable: that function also creates a
+/// TWO-binding group, and passing it a layout with more entries fails
+/// validation at bind group creation.
+/// How many mip levels a lightmap gets.
+///
+/// # The lightmap had the bug the material textures already had
+///
+/// It was uploaded with `mip_level_count: 1` while the shared sampler asked for
+/// `mipmap_filter: Linear` -- a filter with one level to choose from, which is
+/// a silent no-op. That is the same defect, in the same renderer, that the
+/// brush material textures were found to have: see `MipChain`'s note, which
+/// calls it "ordinary minification aliasing" and records that it reads as a
+/// reflection artefact and is not one.
+///
+/// On the lightmap it reads as a LIGHTING artefact and is not one either. A
+/// distant pixel covers dozens of atlas texels and samples one, so the baked
+/// term flickers with head motion. It is invisible across most of a room,
+/// because minification aliasing can only be seen where the signal it is
+/// sampling has a gradient -- and a baked lightmap is nearly flat over a plain
+/// wall. Where it is steep is around an opening to the sky, which is why the
+/// artefact was reported on "the side the sky light would be hitting from"
+/// (user, 2026-09-22) and nowhere else.
+///
+/// # WHY THREE AND NOT THE WHOLE CHAIN
+///
+/// The atlas packs many charts, and a coarse mip averages across whatever sits
+/// next to a chart in the atlas rather than what sits next to it on the wall.
+/// The gutter is what buys the room to filter: bilinear at level L reaches
+/// about 2^L base texels past an edge, so L is safe while `2^L <= GUTTER`.
+/// With `brush_lightmap::GUTTER` at 4 that is L <= 2, so three levels. The two
+/// constants must move together and are pinned to each other by
+/// `quest_app::brush_render::the_lightmap_mip_depth_fits_the_gutter`.
+///
+/// Three levels is not a compromise here -- it covers a 4x linear
+/// minification, and past that `lod_max_clamp` holds the sample at level 2
+/// rather than letting it walk into a neighbouring chart.
+pub const LIGHTMAP_MIP_LEVELS: u32 = 3;
+
+/// Mip levels of the brush SUN MASK.
+///
+/// The same rule as `LIGHTMAP_MIP_LEVELS` -- level L is safe while
+/// `2^L <= gutter` -- applied to the mask's own gutter, which is
+/// `GUTTER * SUN_MASK_SCALE` = 16 texels, so L <= 4: five levels. Two more than
+/// the lightmap because the mask is four times finer: the same surface at the
+/// same distance asks for a level two deeper, and a mask held at the
+/// lightmap's level 2 would alias exactly as the lightmap did before it had
+/// mips. Pinned against the engine constants by
+/// `quest_app::brush_render::the_sun_mask_mip_depth_fits_its_gutter`.
+pub const SUN_MASK_MIP_LEVELS: u32 = 5;
+
+/// The neutral sun-mask texel: green 0 says "not baked", so the shader shades
+/// the sun from the level's static map instead -- how a brush from a bake with
+/// no mask, or a mesh, which never has one, is lit.
+pub const NEUTRAL_SUN_MASK: [u8; 4] = [0, 0, 0, 0];
+
+/// The levels an image this size can actually supply, never more than asked.
+///
+/// A 1x1 neutral direction map cannot produce three levels, and asking wgpu
+/// for more than `floor(log2(max(w, h))) + 1` is a validation error rather than
+/// a silently smaller texture.
+fn mip_levels_for(width: u32, height: u32, wanted: u32) -> u32 {
+    let possible = 32 - width.max(height).max(1).leading_zeros();
+    wanted.min(possible).max(1)
+}
+
+/// Upload an image and its mip chain.
+///
+/// `srgb` picks how the chain is averaged, and it is not cosmetic: averaging
+/// sRGB bytes directly darkens every level (a black-and-white checkerboard
+/// averages to byte 128, which is 22% grey rather than 50%), so a wall would
+/// visibly dim with distance. Alpha never goes through the transfer either
+/// way -- on this lightmap it carries SKY VISIBILITY, which is a linear
+/// scalar, not colour.
+fn upload_rgba_texture_mipped(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    label: &str,
+    srgb: bool,
+    wanted_levels: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    use crate::renderer::terrain_pipeline::{mip_chain, mip_chain_linear};
+
+    let levels = mip_levels_for(width, height, wanted_levels);
+    let chain = if srgb {
+        mip_chain(rgba, width, height, levels)
+    } else {
+        mip_chain_linear(rgba, width, height, levels)
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (level, (data, lw, lh)) in chain.iter().enumerate() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * lw),
+                rows_per_image: Some(*lh),
+            },
+            wgpu::Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
+        );
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn upload_rgba_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        size,
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// The neutral bounce-direction texel.
+///
+/// 128 decodes through `v * 2 - 1` to zero and the alpha says "no
+/// directionality", so a lightmap with no direction map shades exactly as it
+/// did before directional bounce existed. A NEUTRAL VALUE rather than a branch,
+/// for the same reason the sky uploads a flat constant-band SH when a scene has
+/// no panorama: one shading path, and every pre-existing test keeps its
+/// original pixel values.
+pub const NEUTRAL_BOUNCE_DIRECTION: [u8; 4] = [128, 128, 128, 0];
+
+/// A baked lightmap and its companion bounce-direction map, as one bind group.
+///
+/// The direction map is LINEAR (`Rgba8Unorm`) while the lightmap is sRGB. They
+/// are different kinds of data in the same bind group: one is colour and wants
+/// the transfer curve, the other is a unit vector and an unsigned scalar, and
+/// putting a vector through an sRGB decode bends every direction towards the
+/// surface -- the same mistake as an sRGB normal map, which this renderer has
+/// made once already.
+pub fn create_lightmap_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    direction: Option<(&[u8], u32, u32)>,
+) -> LoadedTexture {
+    create_lightmap_texture_with_sun(
+        device, queue, layout, LightmapLight::Srgb8(rgba), width, height, direction, None,
+    )
+}
+
+/// The light a lightmap carries, as the bake stored it.
+#[derive(Clone, Copy)]
+pub enum LightmapLight<'a> {
+    /// Tightly packed RGBA8, RGB sRGB-encoded -- the 8-bit maps, and every
+    /// bake from before the 16-bit format.
+    Srgb8(&'a [u8]),
+    /// Tightly packed RGBA as f32: RGB LINEAR light in the engine's units,
+    /// unclipped, A a 0..1 fraction. Uploaded as half floats. See
+    /// `space_soup_engine::lightmaps::BRUSH_LIGHTMAP_RANGE` for why light
+    /// needs more than 8 bits.
+    Linear(&'a [f32]),
+}
+
+/// `create_lightmap_texture`, with the brush sun-visibility mask as RGBA
+/// (red = visibility, green = baked). Stored as two channels, `Rg8Unorm`: at
+/// four times the lightmap's density a mask is the largest image in a level's
+/// bake, and the two bytes it does not use would double it.
+#[allow(clippy::too_many_arguments)]
+pub fn create_lightmap_texture_with_sun(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    light: LightmapLight,
+    width: u32,
+    height: u32,
+    direction: Option<(&[u8], u32, u32)>,
+    sun_mask: Option<(&[u8], u32, u32)>,
+) -> LoadedTexture {
+    // The texture ONLY -- deliberately not `create_texture_from_rgba`, which
+    // also builds a two-binding bind group. Handing it this three-binding
+    // layout makes wgpu reject the group for having the wrong number of
+    // entries, which is how this was caught rather than shipped.
+    let (base_texture, base_view) = match light {
+        LightmapLight::Srgb8(rgba) => upload_rgba_texture_mipped(
+            device,
+            queue,
+            rgba,
+            width,
+            height,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "lightmap",
+            true,
+            LIGHTMAP_MIP_LEVELS,
+        ),
+        LightmapLight::Linear(texels) => upload_linear_f16_mipped(device, queue, texels, width, height, "lightmap_hdr"),
+    };
+    let (dir_rgba, dir_w, dir_h) =
+        direction.unwrap_or((&NEUTRAL_BOUNCE_DIRECTION, 1, 1));
+    // MIPPED TOO, and LINEAR rather than sRGB: this is a unit vector and an
+    // unsigned scalar, not colour, so it must be averaged exactly as stored.
+    // It shares `lightmap_sampler` with the base map, so leaving it at one
+    // level would put the two halves of the same lookup on different filters.
+    let (dir_tex, dir_view) = upload_rgba_texture_mipped(
+        device,
+        queue,
+        dir_rgba,
+        dir_w,
+        dir_h,
+        wgpu::TextureFormat::Rgba8Unorm,
+        "lightmap_direction",
+        false,
+        LIGHTMAP_MIP_LEVELS,
+    );
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("lightmap_sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        // HOLD THE SAMPLE AT THE COARSEST LEVEL THE GUTTER PAYS FOR.
+        //
+        // Without this, a surface far enough away asks for a level that does
+        // not exist, the sample clamps to the smallest one there IS, and that
+        // level's texels average across whatever the atlas packed next to this
+        // chart -- which is a neighbouring wall, not a neighbouring pixel.
+        // `LIGHTMAP_MIP_LEVELS` says why the ceiling is where it is.
+        lod_max_clamp: (LIGHTMAP_MIP_LEVELS - 1) as f32,
+        ..Default::default()
+    });
+    let (sun_rgba, sun_w, sun_h) = sun_mask.unwrap_or((&NEUTRAL_SUN_MASK, 1, 1));
+    let (sun_tex, sun_view) = upload_rg8_mipped(device, queue, sun_rgba, sun_w, sun_h, "lightmap_sun_mask");
+    // Its own sampler only for the deeper mip clamp -- see `SUN_MASK_MIP_LEVELS`.
+    let sun_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("lightmap_sun_sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        lod_max_clamp: (SUN_MASK_MIP_LEVELS - 1) as f32,
+        ..Default::default()
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lightmap_bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&base_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&dir_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&sun_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(&sun_sampler),
+            },
+        ],
+    });
+    LoadedTexture {
+        texture: base_texture,
+        view: base_view,
+        _sampler: sampler,
+        bind_group,
+        _direction: Some(dir_tex),
+        _sun_mask: Some((sun_tex, sun_sampler)),
+    }
+}
+
+/// Upload linear RGBA f32 light as a mipped `Rgba16Float`.
+///
+/// Half floats hold the engine's light units from a dark room's 0.001 to far
+/// past anything a lamp bakes, at a tenth of a percent -- the precision the
+/// 8-bit sRGB form lost exactly where eye adaptation lifts a room back up.
+/// The chain is averaged in linear light, as light must be. Filterable on
+/// every GPU this renderer targets; a texel costs 8 bytes against 4.
+fn upload_linear_f16_mipped(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texels: &[f32],
+    width: u32,
+    height: u32,
+    label: &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let levels = mip_levels_for(width, height, LIGHTMAP_MIP_LEVELS);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut level: Vec<f32> = texels.to_vec();
+    let (mut lw, mut lh) = (width, height);
+    for mip in 0..levels {
+        let half: Vec<u8> = level
+            .iter()
+            .flat_map(|v| crate::renderer::sky::f32_to_f16(*v).to_le_bytes())
+            .collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: mip,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &half,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8 * lw), rows_per_image: Some(lh) },
+            wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 },
+        );
+        if mip + 1 == levels {
+            break;
+        }
+        // 2x2 box, clamped at an odd edge.
+        let (dw, dh) = ((lw / 2).max(1), (lh / 2).max(1));
+        let mut next = vec![0f32; (dw * dh * 4) as usize];
+        for y in 0..dh {
+            for x in 0..dw {
+                for c in 0..4 {
+                    let mut sum = 0.0;
+                    for (sx, sy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        let (px, py) = ((2 * x + sx).min(lw - 1), (2 * y + sy).min(lh - 1));
+                        sum += level[((py * lw + px) * 4 + c) as usize];
+                    }
+                    next[((y * dw + x) * 4 + c) as usize] = sum * 0.25;
+                }
+            }
+        }
+        level = next;
+        lw = dw;
+        lh = dh;
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// Upload an RGBA image's red and green channels as a mipped `Rg8Unorm`.
+///
+/// The chain is averaged linearly: both channels are fractions, not colour.
+fn upload_rg8_mipped(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    label: &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    use crate::renderer::terrain_pipeline::mip_chain_linear;
+    let levels = mip_levels_for(width, height, SUN_MASK_MIP_LEVELS);
+    let chain = mip_chain_linear(rgba, width, height, levels);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rg8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (level, (data, lw, lh)) in chain.iter().enumerate() {
+        let rg: Vec<u8> = data.chunks_exact(4).flat_map(|p| [p[0], p[1]]).collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rg,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(2 * lw),
+                rows_per_image: Some(*lh),
+            },
+            wgpu::Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
+        );
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 pub fn create_texture_from_rgba(
@@ -137,7 +687,7 @@ pub fn create_texture_from_rgba(
         address_mode_w: wgpu::AddressMode::Repeat,
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
         ..Default::default()
     });
 
@@ -161,5 +711,115 @@ pub fn create_texture_from_rgba(
         view,
         _sampler: sampler,
         bind_group,
+        _direction: None,
+        _sun_mask: None,
+    }
+}
+
+#[cfg(test)]
+mod transmission_tests {
+    /// What `load_primitive_texture` decides about opacity, in isolation.
+    ///
+    /// The decision is the whole bug: a transmissive material is formally
+    /// OPAQUE in glTF -- transmission and alpha coverage are separate
+    /// mechanisms -- so a test of `alpha_mode` alone says the glass is opaque
+    /// and is perfectly correct while the lamp's bulb stays invisible behind it.
+    fn blocks_light(alpha_mode_is_blend: bool, transmission: f32, base_alpha: f32) -> f32 {
+        let force_opaque = !alpha_mode_is_blend && transmission <= 0.0;
+        if force_opaque { 1.0 } else { base_alpha * (1.0 - transmission) }
+    }
+
+    #[test]
+    fn clear_glass_blocks_nothing() {
+        // The lamp's envelope: transmission 1.0, no alphaMode. It must not
+        // stand in front of the bulb.
+        assert_eq!(blocks_light(false, 1.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn an_ordinary_opaque_material_is_untouched() {
+        // Everything without transmission keeps the old behaviour exactly --
+        // this must not quietly make the whole project translucent.
+        assert_eq!(blocks_light(false, 0.0, 1.0), 1.0);
+        assert_eq!(blocks_light(false, 0.0, 0.25), 1.0, "alpha is ignored when opaque");
+    }
+
+    #[test]
+    fn partial_transmission_partly_blocks() {
+        assert!((blocks_light(false, 0.4, 1.0) - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_blended_material_still_uses_its_own_alpha() {
+        assert!((blocks_light(true, 0.0, 0.3) - 0.3).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod lightmap_mip_tests {
+    use super::*;
+
+    /// The defect this whole change exists to remove: a texture with one level
+    /// under a sampler asking for `Linear` mipmap filtering, which silently
+    /// does nothing and leaves the baked term aliasing at distance.
+    #[test]
+    fn a_lightmap_is_uploaded_with_the_levels_its_sampler_asks_for() {
+        let Some((device, queue)) =
+            crate::renderer::terrain_pipeline::tests::headless_gpu()
+        else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let layout = crate::renderer::pipeline::lightmap_bind_group_layout(&device);
+        let rgba = vec![200u8; 64 * 64 * 4];
+        let lm = create_lightmap_texture(&device, &queue, &layout, &rgba, 64, 64, None);
+        assert_eq!(
+            lm.texture.mip_level_count(),
+            LIGHTMAP_MIP_LEVELS,
+            "the lightmap is back to a single level while `lightmap_sampler` \
+             still asks for Linear mipmap filtering -- which is a silent no-op \
+             and is exactly the bug the material textures had",
+        );
+    }
+
+    /// A 1x1 neutral direction map cannot supply three levels, and asking wgpu
+    /// for more than an image can give is a validation error, not a smaller
+    /// texture.
+    #[test]
+    fn an_image_is_never_asked_for_more_levels_than_it_has() {
+        assert_eq!(mip_levels_for(1, 1, LIGHTMAP_MIP_LEVELS), 1);
+        assert_eq!(mip_levels_for(2, 1, LIGHTMAP_MIP_LEVELS), 2);
+        assert_eq!(mip_levels_for(4, 4, LIGHTMAP_MIP_LEVELS), 3);
+        assert_eq!(mip_levels_for(1024, 1024, LIGHTMAP_MIP_LEVELS), 3);
+    }
+
+    /// THE LIGHTMAP IS sRGB AND ITS ALPHA IS NOT.
+    ///
+    /// Averaging sRGB bytes directly darkens every level -- a black-and-white
+    /// checkerboard averages to byte 128, which is 22% grey rather than 50% --
+    /// so a wall would visibly dim with distance. Alpha carries SKY VISIBILITY
+    /// here, a linear scalar, and must be averaged as stored. One chain, two
+    /// rules, and getting either backwards is invisible until it ships.
+    #[test]
+    fn the_chain_averages_colour_in_light_and_alpha_as_stored() {
+        use crate::renderer::terrain_pipeline::mip_chain;
+        // 2x2: two black texels and two white ones, alpha 0 and 255 likewise.
+        let rgba: Vec<u8> = vec![
+            0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0,
+        ];
+        let chain = mip_chain(&rgba, 2, 2, 2);
+        let (level1, w, h) = &chain[1];
+        assert_eq!((*w, *h), (1, 1));
+        let grey = level1[0];
+        assert!(
+            (186..=190).contains(&grey),
+            "half black and half white should average to mid GREY (sRGB ~188), \
+             not to byte 128 which is 22% of the light: got {grey}",
+        );
+        assert_eq!(
+            level1[3], 128,
+            "alpha is a linear scalar and must average to 128, not through the \
+             sRGB transfer",
+        );
     }
 }

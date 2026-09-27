@@ -111,8 +111,8 @@ impl MirrorPipeline {
 
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("mirror_layout"),
-            bind_group_layouts: &[camera_layout, &model_layout, &texture_layout, &reflected_vp_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(camera_layout), Some(&model_layout), Some(&texture_layout), Some(&reflected_vp_layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -122,7 +122,7 @@ impl MirrorPipeline {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[MirrorVertex::layout()],
+                buffers: &[Some(MirrorVertex::layout())],
             },
             fragment: Some(FragmentState {
                 module: &shader,
@@ -143,13 +143,13 @@ impl MirrorPipeline {
             },
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -175,7 +175,11 @@ impl MirrorPipeline {
     pub fn create_model_uniform(&self, device: &Device) -> ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("mirror_model_uniform"),
-            size: 64,
+            // 80, not 64: ModelUniform carries a mat4 AND a params vec4 whose
+            // x is sky visibility. Every buffer bound to it must be the same
+            // size, or `upload` overruns whichever one was left behind -- which
+            // is a validation error at the first frame, not at build time.
+            size: 80,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -193,7 +197,11 @@ impl MirrorPipeline {
     pub fn create_reflected_vp_uniform(&self, device: &Device) -> ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("mirror_reflected_vp_uniform"),
-            size: 64,
+            // 80, not 64: ModelUniform carries a mat4 AND a params vec4 whose
+            // x is sky visibility. Every buffer bound to it must be the same
+            // size, or `upload` overruns whichever one was left behind -- which
+            // is a validation error at the first frame, not at build time.
+            size: 80,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -268,7 +276,12 @@ impl MirrorPipeline {
 
 fn mirror_shader() -> String {
     r#"
-struct CameraUniform { view_proj: mat4x4<f32> }
+// The FIRST 64 bytes of the shared scene uniform, which is an array of two
+// eye matrices. Declared as the array rather than as a lone mat4x4 so the slot
+// being read is written down: this pass is single-view and per-eye, and it
+// wants whichever eye is currently being drawn -- which the caller puts in
+// slot 0.
+struct CameraUniform { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
 struct ModelUniform { model: mat4x4<f32> }
@@ -290,7 +303,7 @@ struct VOut {
 fn vs_main(v: VIn) -> VOut {
     var out: VOut;
     let world_pos = model_u.model * vec4<f32>(v.position, 1.0);
-    out.clip = camera.view_proj * world_pos;
+    out.clip = camera.view_proj[0] * world_pos;
     out.clip.z -= 0.0001 * out.clip.w;
     out.reflected_clip = reflected.view_proj * world_pos;
     return out;

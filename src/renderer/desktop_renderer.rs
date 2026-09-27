@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use crate::renderer::mesh::create_lightmap_texture;
 use wgpu::util::DeviceExt;
 use wgpu::*;
 
@@ -60,6 +61,7 @@ impl Renderer {
             &device,
             &lights_uniform,
             shadow_map.sun_depth_view(),
+            shadow_map.sun_dynamic_depth_view(),
             shadow_map.spot_depth_view(),
             shadow_map.sampler(),
         );
@@ -71,9 +73,16 @@ impl Renderer {
         let (depth_texture, depth_view) = Self::make_depth(&device, width, height);
         let white_pixel = [255u8, 255, 255, 255];
         let default_cuboid_lightmap =
-            create_texture_from_rgba(&device, &queue, &solid_pipeline.lightmap_layout, &white_pixel, 1, 1);
-        let default_mesh_lightmap =
-            create_texture_from_rgba(&device, &queue, &mesh_pipeline.lightmap_layout, &white_pixel, 1, 1);
+            create_lightmap_texture(&device, &queue, &solid_pipeline.lightmap_layout, &white_pixel, 1, 1, None);
+        // BLACK, not white: a mesh ADDS its lightmap now, like a brush, so its
+        // neutral is zero. The alpha stays opaque because that channel carries
+        // sky visibility and is multiplied -- the two neutrals sit at opposite
+        // ends of the range in the same texel.
+        let default_mesh_lightmap = crate::renderer::brush_pipeline::default_brush_lightmap(
+            &device,
+            &queue,
+            &mesh_pipeline.lightmap_layout,
+        );
 
         Self {
             device,
@@ -99,12 +108,12 @@ impl Renderer {
     }
 
     pub fn set_cuboid_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
-        let tex = create_texture_from_rgba(&self.device, &self.queue, &self.solid_pipeline.lightmap_layout, rgba, width, height);
+        let tex = create_lightmap_texture(&self.device, &self.queue, &self.solid_pipeline.lightmap_layout, rgba, width, height, None);
         self.cuboid_lightmaps.insert(key.to_string(), tex);
     }
 
     pub fn set_mesh_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
-        let tex = create_texture_from_rgba(&self.device, &self.queue, &self.mesh_pipeline.lightmap_layout, rgba, width, height);
+        let tex = create_lightmap_texture(&self.device, &self.queue, &self.mesh_pipeline.lightmap_layout, rgba, width, height, None);
         self.mesh_lightmaps.insert(key.to_string(), tex);
     }
 
@@ -274,6 +283,13 @@ impl Renderer {
         // in scene order until the budget runs out -- it used to be just the
         // first one, so a room with two matching lamps had one casting a shadow
         // and one not, which reads as a broken light rather than a full budget.
+        //
+        // Trimmed to the budget by INFLUENCE first, and here rather than later:
+        // the spot indices below point INTO this list, so reordering after they
+        // are chosen would aim each spot at another light's shadow map.
+        let ranked = lights::rank_for_budget(lights, lights::MAX_LIGHTS);
+        let lights: &[lights::Light] = &ranked;
+
         let sun = lights.iter().find(|l| l.kind == lights::LightKind::Directional);
         let spot_indices: Vec<usize> = lights
             .iter()
@@ -306,6 +322,8 @@ impl Renderer {
             spot_view_proj,
             sun_enabled: sun.is_some(),
             spot_count: spot_indices.len() as u32,
+            sun_dynamic_view_proj: glam::Mat4::IDENTITY,
+            sun_dynamic_enabled: false,
         };
         self.uniform_buf
             .upload(&self.queue, vp, camera.position, &shadow);
@@ -357,6 +375,10 @@ impl Renderer {
         let mut shadow_draws: Vec<shadow::ShadowMeshDraw> = Vec::new();
         let mut skinned_draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> =
             Vec::new();
+        // The same primitives as casters. A character is the one caster whose
+        // silhouette changes every frame, and the first missing shadow anyone
+        // notices -- you can hold your own hand up in front of a lamp.
+        let mut skinned_shadow_draws: Vec<shadow::ShadowSkinnedDraw> = Vec::new();
 
         for instance in meshes {
             instance
@@ -372,6 +394,13 @@ impl Renderer {
                             prim.indices.len() as u32,
                             &instance.model.bind_group,
                             &prim.texture.bind_group,
+                            joint_bg,
+                        ));
+                        skinned_shadow_draws.push((
+                            &prim.vertex_buffer,
+                            &prim.index_buffer,
+                            prim.indices.len() as u32,
+                            &instance.model.bind_group,
                             joint_bg,
                         ));
                     }
@@ -431,7 +460,18 @@ impl Renderer {
             self.shadow_map
                 .upload_light(&self.queue, ShadowKind::Sun, shadow.sun_view_proj);
             self.shadow_map
-                .record(&mut encoder, ShadowKind::Sun, solid_caster, None, &shadow_draws);
+                .record(
+                    &mut encoder,
+                    ShadowKind::Sun,
+                    solid_caster,
+                    None,
+                    &shadow_draws,
+                    &skinned_shadow_draws,
+                    // The desktop preview does not chunk its terrain, so it
+                    // draws whole. Correct, just not culled.
+                    &[],
+                    shadow.sun_view_proj,
+                );
         }
         // One depth pass per shadow-casting spot. This is where the cost lives,
         // which is why MAX_SPOT_SHADOWS is a budget rather than "all of them".
@@ -447,6 +487,9 @@ impl Renderer {
                 solid_caster,
                 None,
                 &shadow_draws,
+                &skinned_shadow_draws,
+                &[],
+                shadow.spot_view_proj[layer],
             );
         }
 
@@ -455,6 +498,7 @@ impl Renderer {
                 label: Some("3d_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: target_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Clear(wgpu::Color {

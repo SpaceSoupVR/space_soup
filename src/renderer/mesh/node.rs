@@ -57,6 +57,10 @@ pub(crate) fn collect_node(
     layout: &wgpu::BindGroupLayout,
     force_static: bool,
     node_to_joint: &HashMap<usize, usize>,
+    // The caller-supplied lightmap UV set. `None` means the mesh keeps
+    // whatever uv2 it was authored with, which for almost every asset is none
+    // at all -- and a 1x1 lightmap does not care where it is sampled.
+    lightmap: Option<&super::MeshLightmapUv>,
     static_out: &mut Vec<MeshPrimitive>,
     skinned_out: &mut Vec<SkinnedMeshPrimitive>,
 ) {
@@ -126,15 +130,86 @@ pub(crate) fn collect_node(
                 None
             };
 
+            // The material's emissive colour, as the ARTIST authored it.
+            //
+            // This is what makes a lamp read correctly: the bulb's material is
+            // emissive and the housing's is not, so switching the light on lights
+            // the bulb rather than the whole fixture. An asset with no emissive
+            // material is unaffected -- glTF's default emissiveFactor is black.
+            //
+            // KHR_materials_emissive_strength is folded in here rather than
+            // stored separately: it is a multiplier on the same colour, and
+            // keeping them apart would mean carrying a second per-vertex value
+            // to say something the first one can already express.
+            let emissive = {
+                let m = prim.material();
+                let f = m.emissive_factor();
+                // KHR_materials_emissive_strength is not exposed by this gltf
+                // version, so the factor is taken as authored. An asset that
+                // needs a brighter bulb than 1.0 says so through the light's
+                // own intensity, which drives this per object anyway.
+                let strength = 1.0f32;
+                MeshVertex::pack_emissive([f[0] * strength, f[1] * strength, f[2] * strength])
+            };
+
             if bake {
-                let vertices: Vec<MeshVertex> = (0..positions.len())
-                    .map(|i| MeshVertex {
-                        position: positions[i].into(),
-                        normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
-                        uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
-                        uv2: uv2s.get(i).copied().unwrap_or([0.0, 0.0]),
-                    })
-                    .collect();
+                // A LIGHTMAPPED MESH IS DE-INDEXED.
+                //
+                // Adjacent triangles land in unrelated parts of the atlas, so a
+                // vertex shared between them has no single uv2 -- every edge is
+                // a chart seam. Splitting is what an unwrapper does at a seam;
+                // here it is every corner, which for a prop costs three
+                // vertices per triangle instead of roughly one.
+                //
+                // The GENERATED uv2 wins over any the asset happens to carry.
+                // The baker cannot read an artist's second UV set -- it derives
+                // the layout from the geometry -- so honouring an authored one
+                // here would mean the renderer sampling a chart the baker never
+                // wrote to, which is a black model rather than an error.
+                // Which source vertex each split corner came from, so any
+                // other per-vertex stream can be split the same way. Empty when
+                // the mesh was not split.
+                let mut split_corners: Vec<usize> = Vec::new();
+                let split = lightmap
+                    .and_then(|lm| lm.per_primitive.get(&(node.index(), prim.index())))
+                    // One uv2 per index, or the map is describing different
+                    // geometry from the one loaded here -- a stale bake, a
+                    // re-exported asset -- and using it would scatter this
+                    // mesh's lighting. Falling back is the safe answer and
+                    // shows up as a flat model rather than a shredded one.
+                    .filter(|corner_uv| corner_uv.len() == indices.len())
+                    .map(|corner_uv| {
+                        let mut v = Vec::with_capacity(indices.len());
+                        let mut from = Vec::with_capacity(indices.len());
+                        for (c, &idx) in indices.iter().enumerate() {
+                            let i = idx as usize;
+                            from.push(i);
+                            v.push(MeshVertex {
+                                position: positions.get(i).copied().unwrap_or(Vec3::ZERO).into(),
+                                normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
+                                uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                                uv2: corner_uv[c],
+                                emissive,
+                            });
+                        }
+                        split_corners = from;
+                        v
+                    });
+                let indices: Vec<u32> = match &split {
+                    Some(v) => (0..v.len() as u32).collect(),
+                    None => indices,
+                };
+                let vertices: Vec<MeshVertex> = split.unwrap_or_else(|| {
+                    (0..positions.len())
+                        .map(|i| MeshVertex {
+                            position: positions[i].into(),
+                            normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
+                            uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                            uv2: uv2s.get(i).copied().unwrap_or([0.0, 0.0]),
+                            emissive,
+                        })
+                        .collect()
+                });
 
                 let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("mesh_vb"),
@@ -147,9 +222,21 @@ pub(crate) fn collect_node(
                     usage: wgpu::BufferUsages::INDEX,
                 });
                 let layered = layered_weights.map(|weights| {
-                    let lv: Vec<LayeredVertex> = (0..positions.len())
-                        .map(|i| LayeredVertex {
-                            position: positions[i].into(),
+                    // The layered buffer is drawn with the SAME index buffer as
+                    // the shaded one, so it has to be split wherever that was.
+                    // Leaving it indexed by the original vertex count while the
+                    // indices count corners reads far off the end of it -- and
+                    // the failure is silent garbage on the GPU rather than a
+                    // bounds check.
+                    let source: Vec<usize> = if split_corners.is_empty() {
+                        (0..positions.len()).collect()
+                    } else {
+                        split_corners.clone()
+                    };
+                    let lv: Vec<LayeredVertex> = source
+                        .iter()
+                        .map(|&i| LayeredVertex {
+                            position: positions.get(i).copied().unwrap_or(Vec3::ZERO).into(),
                             normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
                             // A vertex past the end of a short COLOR_0 gets
                             // layer 0 rather than nothing: the shader reads
@@ -167,6 +254,18 @@ pub(crate) fn collect_node(
                     LayeredPrimitive { vertices: lv, vertex_buffer }
                 });
 
+                // See `MeshPrimitive::casts_shadow`. Half, because that is the
+                // honest rounding of a continuous transmission onto a binary
+                // shadow map: a surface that lets more light through than it
+                // stops is better modelled as not stopping it. A material with
+                // no transmission -- which is nearly all of them -- is
+                // unaffected and casts exactly as it always did.
+                let casts_shadow = casts_shadow(
+                    prim.material()
+                        .transmission()
+                        .map(|t| t.transmission_factor())
+                        .unwrap_or(0.0),
+                );
                 static_out.push(MeshPrimitive {
                     vertices,
                     indices,
@@ -174,6 +273,7 @@ pub(crate) fn collect_node(
                     vertex_buffer,
                     index_buffer,
                     layered,
+                    casts_shadow,
                 });
             } else {
                 let (joint_ids, joint_weights): (Vec<[u32; 4]>, Vec<[f32; 4]>) = if real_skin {
@@ -243,10 +343,25 @@ pub(crate) fn collect_node(
             layout,
             force_static,
             node_to_joint,
+            lightmap,
             static_out,
             skinned_out,
         );
     }
+}
+
+/// Whether a surface transmitting `transmission` of the light belongs in a
+/// shadow map. See `MeshPrimitive::casts_shadow`.
+///
+/// Half, because that is the honest rounding of a continuous transmission onto
+/// a BINARY shadow map: a surface that lets more light through than it stops is
+/// better modelled as not stopping it. A material with no transmission -- which
+/// is nearly all of them -- is unaffected and casts exactly as it always did.
+///
+/// Its own function so the threshold can be tested without a glTF fixture, and
+/// so there is one place to change if translucent shadows ever arrive.
+pub(crate) fn casts_shadow(transmission: f32) -> bool {
+    transmission <= 0.5
 }
 
 /// Whether a mesh asked to be shaded from its per-vertex layer weights.
@@ -270,4 +385,38 @@ fn wants_layered_shading(mesh: &gltf::Mesh) -> bool {
         .and_then(|s| s.get("shading"))
         .and_then(|s| s.as_str())
         == Some("layered")
+}
+
+
+#[cfg(test)]
+mod shadow_caster_tests {
+    use super::casts_shadow;
+
+    /// The hanging lamp's envelope: `KHR_materials_transmission` 1.0, invisible
+    /// to the eye, and as a shadow caster it sealed its own bulb in -- measured
+    /// at 100% of the bulb's downward light blocked, against 2% for the opaque
+    /// housing around it. Both rooms in `test_room` rendered black because of
+    /// it, and the lamp still glowed, which made it read as a lighting problem
+    /// rather than a shadow one.
+    #[test]
+    fn clear_glass_does_not_cast_a_shadow() {
+        assert!(!casts_shadow(1.0));
+    }
+
+    /// Everything else is unchanged. glTF's default transmission is 0, so this
+    /// is every material in every asset that has never heard of the extension.
+    #[test]
+    fn an_ordinary_material_casts_exactly_as_before() {
+        assert!(casts_shadow(0.0));
+        assert!(casts_shadow(0.1));
+    }
+
+    /// A binary shadow map has to round, and it rounds at the halfway point:
+    /// a surface stopping most of the light still casts.
+    #[test]
+    fn partial_transmission_rounds_to_the_nearer_answer() {
+        assert!(casts_shadow(0.4), "blocks 60% of the light -- it casts");
+        assert!(!casts_shadow(0.6), "blocks 40% of the light -- it does not");
+        assert!(casts_shadow(0.5), "exactly half stays a caster, so the default side is the safe one");
+    }
 }

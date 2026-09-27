@@ -78,6 +78,7 @@ impl Overlay {
             label: Some("ui2d_overlay_pass"),
             color_attachments: &[Some(RenderPassColorAttachment {
                 view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: Operations {
                     load: LoadOp::Load,

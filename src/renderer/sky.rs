@@ -39,6 +39,19 @@
 //! somewhere other than the visible sun, and a level lit from the wrong side
 //! looks like a lighting bug rather than a mapping one.
 
+//! Sky panorama loading and the environment it lights the scene with.
+//!
+//! The MODEL -- the panorama, the harmonics, and the projection between them --
+//! now lives in `space_soup_sky` so the baker evaluates exactly the same sky
+//! this shader does. Two implementations of one physical quantity is how a
+//! baked reflection ended up brighter than the surface it reflected.
+
+pub use space_soup_sky::{
+    decode_radiance, project_irradiance, sky_lighting, uv_to_direction, Panorama, SkyIrradiance,
+    SkySun,
+};
+
+
 use anyhow::{bail, Result};
 use wgpu::*;
 
@@ -47,157 +60,10 @@ use super::lights::wgsl_lights_block;
 /// The flat ambient a scene without a sky gets, matching the shader constant.
 pub const AMBIENT: f32 = 0.6;
 
-/// A decoded equirectangular panorama, linear and unclamped.
-#[derive(Clone)]
-pub struct Panorama {
-    pub width: u32,
-    pub height: u32,
-    /// Row-major RGB triples, top row first.
-    pub rgb: Vec<f32>,
-}
 
-impl Panorama {
-    pub fn texel(&self, x: u32, y: u32) -> [f32; 3] {
-        let i = ((y * self.width + x) * 3) as usize;
-        [self.rgb[i], self.rgb[i + 1], self.rgb[i + 2]]
-    }
 
-    /// A flat panorama of one colour, for tests and for a scene with no sky.
-    pub fn solid(rgb: [f32; 3], width: u32, height: u32) -> Self {
-        let mut v = Vec::with_capacity((width * height * 3) as usize);
-        for _ in 0..(width * height) {
-            v.extend_from_slice(&rgb);
-        }
-        Self { width, height, rgb: v }
-    }
-}
 
-/// Decode a Radiance `.hdr` (RGBE) file.
-///
-/// Hand-written rather than pulled from a crate for the same reason the cave's
-/// glTF writer is: it is a short, completely specified format, and the one thing
-/// a library would protect against is the adaptive-RLE scanline encoding, which
-/// is thirty lines and is right below.
-pub fn decode_radiance(bytes: &[u8]) -> Result<Panorama> {
-    // Header: text lines, a blank line, then the resolution.
-    let Some(sep) = bytes.windows(2).position(|w| w == b"\n\n") else {
-        bail!("not a Radiance file: no blank line after the header");
-    };
-    let mut pos = sep + 2;
-    let Some(nl) = bytes[pos..].iter().position(|&b| b == b'\n') else {
-        bail!("truncated before the resolution line");
-    };
-    let res = std::str::from_utf8(&bytes[pos..pos + nl])?;
-    let parts: Vec<&str> = res.split_whitespace().collect();
-    // Only the overwhelmingly common orientation. A file in any other is
-    // rejected rather than silently loaded upside down or mirrored, which is
-    // the kind of wrong that gets blamed on the artist.
-    if parts.len() != 4 || parts[0] != "-Y" || parts[2] != "+X" {
-        bail!("unsupported Radiance orientation {res:?}; expected `-Y h +X w`");
-    }
-    let height: u32 = parts[1].parse()?;
-    let width: u32 = parts[3].parse()?;
-    pos += nl + 1;
 
-    let mut rgb = vec![0.0f32; (width * height * 3) as usize];
-    let mut scan = vec![0u8; (width * 4) as usize];
-
-    for y in 0..height {
-        read_scanline(bytes, &mut pos, width, &mut scan)?;
-        for x in 0..width {
-            let i = (x * 4) as usize;
-            let (r, g, b, e) = (scan[i], scan[i + 1], scan[i + 2], scan[i + 3]);
-            let out = ((y * width + x) * 3) as usize;
-            if e == 0 {
-                continue; // already zero
-            }
-            // RGBE: a shared exponent biased by 128, with the mantissa a byte.
-            let f = libm_exp2(e as i32 - 136);
-            rgb[out] = r as f32 * f;
-            rgb[out + 1] = g as f32 * f;
-            rgb[out + 2] = b as f32 * f;
-        }
-    }
-    Ok(Panorama { width, height, rgb })
-}
-
-/// `2^n` for the RGBE exponent, without pulling in a maths crate.
-fn libm_exp2(n: i32) -> f32 {
-    // The exponent range a byte can produce is far inside f32's, so a shift on
-    // the bit pattern is exact and avoids `powi`'s repeated multiplication.
-    if n < -126 {
-        return 0.0;
-    }
-    if n > 127 {
-        return f32::INFINITY;
-    }
-    f32::from_bits(((n + 127) as u32) << 23)
-}
-
-fn read_scanline(bytes: &[u8], pos: &mut usize, width: u32, out: &mut [u8]) -> Result<()> {
-    let p = *pos;
-    let adaptive = width >= 8
-        && width <= 0x7fff
-        && bytes.len() > p + 4
-        && bytes[p] == 2
-        && bytes[p + 1] == 2
-        && ((bytes[p + 2] as u32) << 8 | bytes[p + 3] as u32) == width;
-
-    if !adaptive {
-        // Flat RGBE, four bytes per pixel.
-        let n = (width * 4) as usize;
-        if bytes.len() < p + n {
-            bail!("truncated scanline");
-        }
-        out[..n].copy_from_slice(&bytes[p..p + n]);
-        *pos = p + n;
-        return Ok(());
-    }
-
-    // Adaptive RLE: each of the four channels is run-length encoded separately
-    // across the whole scanline, which is why the bytes are de-interleaved here
-    // and written back into the interleaved buffer by stride.
-    let mut q = p + 4;
-    for ch in 0..4usize {
-        let mut x = 0u32;
-        while x < width {
-            if q >= bytes.len() {
-                bail!("truncated RLE scanline");
-            }
-            let n = bytes[q];
-            q += 1;
-            if n > 128 {
-                // A run: one value repeated n-128 times.
-                if q >= bytes.len() {
-                    bail!("truncated RLE run");
-                }
-                let val = bytes[q];
-                q += 1;
-                for _ in 0..(n - 128) {
-                    if x >= width {
-                        bail!("RLE run overruns the scanline");
-                    }
-                    out[(x * 4) as usize + ch] = val;
-                    x += 1;
-                }
-            } else {
-                if n == 0 {
-                    bail!("zero-length RLE literal");
-                }
-                for _ in 0..n {
-                    if q >= bytes.len() || x >= width {
-                        bail!("RLE literal overruns the scanline");
-                    }
-                    out[(x * 4) as usize + ch] = bytes[q];
-                    q += 1;
-                    x += 1;
-                }
-            }
-        }
-    }
-    *pos = q;
-    Ok(())
-}
 
 /// Where a world direction lands in an equirectangular panorama.
 ///
@@ -214,135 +80,10 @@ pub fn direction_to_uv(d: [f32; 3]) -> [f32; 2] {
     [u, v]
 }
 
-/// The inverse: the direction a texel centre looks along.
-pub fn uv_to_direction(u: f32, v: f32) -> [f32; 3] {
-    let phi = u * 2.0 * std::f32::consts::PI - std::f32::consts::PI;
-    let theta = v * std::f32::consts::PI;
-    let s = theta.sin();
-    [s * phi.sin(), theta.cos(), s * phi.cos()]
-}
 
-/// Nine RGB spherical-harmonic coefficients of a sky's irradiance.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct SkyIrradiance {
-    /// L00, L1-1, L10, L11, L2-2, L2-1, L20, L21, L22 -- already convolved with
-    /// the cosine lobe, so the shader only evaluates the basis.
-    pub sh: [[f32; 3]; 9],
-}
 
-impl SkyIrradiance {
-    /// What a scene with no sky gets: the flat ambient the engine always had.
-    ///
-    /// Expressed as an SH rather than special-cased in the shader, so there is
-    /// one lighting path and "no sky" is a value rather than a branch. Only the
-    /// constant band is non-zero, which evaluates to exactly `AMBIENT` in every
-    /// direction -- so a level without a sky renders precisely as it did.
-    pub fn flat(ambient: f32) -> Self {
-        // evaluate() multiplies band 0 by Y00 = 0.282095 and by A0 = 1.
-        let l0 = ambient / 0.282_095;
-        let mut sh = [[0.0; 3]; 9];
-        sh[0] = [l0, l0, l0];
-        Self { sh }
-    }
 
-    /// Irradiance arriving at a surface with this normal, as the shader computes
-    /// it. Present in Rust so the projection can be tested without a GPU.
-    pub fn evaluate(&self, n: [f32; 3]) -> [f32; 3] {
-        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);
-        let (x, y, z) = (n[0] / len, n[1] / len, n[2] / len);
-        let b = sh_basis(x, y, z);
-        // The cosine lobe's convolution coefficients, ALREADY DIVIDED BY PI.
-        //
-        // Ramamoorthi's are pi, 2pi/3 and pi/4, and they give irradiance E. What
-        // an ambient term wants is the radiance a white Lambertian surface
-        // reflects, which is E/pi -- so the division is folded in here rather
-        // than applied afterwards.
-        //
-        // The widely quoted 0.886227 / 1.023328 / 0.858086 are these constants
-        // ALREADY MULTIPLIED BY the basis normalisation, for use in a form that
-        // does not evaluate Y_lm separately. Using them here as well as the
-        // basis counts the constants twice, which is exactly the bug the
-        // uniform-sky test caught: a flat 0.5 sky came back as 0.141.
-        const A: [f32; 9] = [
-            1.0,                                    // l = 0
-            2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0,        // l = 1
-            0.25, 0.25, 0.25, 0.25, 0.25,           // l = 2
-        ];
-        let mut out = [0.0f32; 3];
-        for i in 0..9 {
-            for c in 0..3 {
-                out[c] += self.sh[i][c] * b[i] * A[i];
-            }
-        }
-        for c in 0..3 {
-            out[c] = out[c].max(0.0);
-        }
-        out
-    }
-}
 
-/// The real spherical-harmonic basis up to l = 2.
-fn sh_basis(x: f32, y: f32, z: f32) -> [f32; 9] {
-    [
-        0.282_095,
-        0.488_603 * y,
-        0.488_603 * z,
-        0.488_603 * x,
-        1.092_548 * x * y,
-        1.092_548 * y * z,
-        0.315_392 * (3.0 * z * z - 1.0),
-        1.092_548 * x * z,
-        0.546_274 * (x * x - y * y),
-    ]
-}
-
-/// Project a panorama onto the irradiance basis.
-///
-/// Each texel is weighted by its solid angle -- `sin(theta)` -- which is not
-/// optional: an equirectangular image devotes as many texels to the pole as to
-/// the equator, and summing them evenly makes whatever is overhead dominate the
-/// result by a factor of about pi/2.
-pub fn project_irradiance(pano: &Panorama, rotation_deg: f32, intensity: f32) -> SkyIrradiance {
-    let mut sh = [[0.0f64; 3]; 9];
-    let mut weight = 0.0f64;
-    let rot = rotation_deg.to_radians();
-    let (rc, rs) = (rot.cos(), rot.sin());
-
-    for y in 0..pano.height {
-        let v = (y as f32 + 0.5) / pano.height as f32;
-        let theta = v * std::f32::consts::PI;
-        let sin_theta = theta.sin();
-        if sin_theta <= 0.0 {
-            continue;
-        }
-        for x in 0..pano.width {
-            let u = (x as f32 + 0.5) / pano.width as f32;
-            let d = uv_to_direction(u, v);
-            // The scene's own rotation of the sky, applied to the DIRECTION so
-            // the lighting turns with the picture rather than away from it.
-            let d = [rc * d[0] + rs * d[2], d[1], -rs * d[0] + rc * d[2]];
-            let b = sh_basis(d[0], d[1], d[2]);
-            let t = pano.texel(x, y);
-            let w = sin_theta as f64;
-            weight += w;
-            for i in 0..9 {
-                for c in 0..3 {
-                    sh[i][c] += (t[c] * intensity) as f64 * b[i] as f64 * w;
-                }
-            }
-        }
-    }
-
-    // Normalise to the sphere's solid angle.
-    let scale = if weight > 0.0 { 4.0 * std::f64::consts::PI / weight } else { 0.0 };
-    let mut out = SkyIrradiance::default();
-    for i in 0..9 {
-        for c in 0..3 {
-            out.sh[i][c] = (sh[i][c] * scale) as f32;
-        }
-    }
-    out
-}
 
 /// Half-precision, for the panorama texture.
 ///
@@ -370,7 +111,18 @@ pub fn f32_to_f16(v: f32) -> u16 {
 /// The panorama on the GPU, plus the coefficients projected from it.
 pub struct Sky {
     pub bind_group: BindGroup,
+    /// The ambient, WITHOUT the sun when the sky has one -- see `sun`.
     pub irradiance: SkyIrradiance,
+    /// The sky's sun, taken out of `irradiance` by `space_soup_sky::sky_lighting`
+    /// and handed back as one directional light, in WORLD space.
+    ///
+    /// Left in the harmonics, half this sky's light was a glow over the whole
+    /// sun-facing hemisphere: no shadow, no sunlit patch through a door, and
+    /// a surface facing away from it lit by the harmonics' ringing. The baker
+    /// splits the sky with the same function and bakes this sun into the
+    /// level's lightmaps, so the renderer shades it only on what has none.
+    /// The panorama the player SEES keeps its sun; only the lighting moves.
+    pub sun: Option<SkySun>,
     _texture: Texture,
     _sampler: Sampler,
 }
@@ -463,6 +215,7 @@ impl Sky {
             ..Default::default()
         });
 
+        let (irradiance, sun) = sky_lighting(pano, rotation_deg, intensity);
         let view = texture.create_view(&TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("sky_bg"),
@@ -475,7 +228,8 @@ impl Sky {
 
         Self {
             bind_group,
-            irradiance: project_irradiance(pano, rotation_deg, intensity),
+            irradiance,
+            sun,
             _texture: texture,
             _sampler: sampler,
         }
@@ -496,6 +250,7 @@ impl Sky {
             1.0,
         );
         s.irradiance = SkyIrradiance::flat(ambient);
+        s.sun = None;
         s
     }
 }
@@ -507,20 +262,42 @@ pub struct SkyPipeline {
 
 impl SkyPipeline {
     pub fn new(
+
         device: &Device,
         format: TextureFormat,
         uniform_layout: &BindGroupLayout,
         samples: u32,
     ) -> Self {
+        Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Mono)
+    }
+
+    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
+    pub fn new_stereo(
+
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
+        Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Stereo)
+    }
+
+    fn new_with_view(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("sky_shader"),
-            source: ShaderSource::Wgsl(sky_shader().into()),
+            source: ShaderSource::Wgsl(view.shader(sky_shader()).into()),
         });
         let layout = sky_bind_group_layout(device);
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("sky_layout"),
-            bind_group_layouts: &[uniform_layout, &layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(uniform_layout), Some(&layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -560,19 +337,36 @@ impl SkyPipeline {
                 // it FIRST would shade every one of those pixels and then throw
                 // the work away, which on a fill-limited tile GPU is the whole
                 // cost of the pass for nothing.
-                depth_write_enabled: false,
-                depth_compare: CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::LessEqual),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
-            multiview: None,
+            multiview_mask: view.mask(),
             cache: None,
         });
 
         Self { pipeline, layout }
     }
 }
+
+/// Paint the sky SOLID MAGENTA, to find gaps in level geometry.
+///
+/// The seams along the front ceiling/wall junctions of test_room are dotted
+/// specks 5x brighter than the dark interior on either side of them (35/39/31
+/// against 7/6/4, normal view, 2026-09-22) -- brighter than anything lighting
+/// that corner. Either the sky is showing through pixel-sized gaps where the
+/// geometry does not quite meet, or something in the shading (the reflection
+/// probe, which photographed the bright doorway) is lighting those pixels.
+///
+/// The probe is baked offline and cannot turn magenta; the sky can. So a
+/// magenta speck on the junction is a HOLE, and a bright non-magenta one is
+/// shading. One look decides which of two very different fixes is needed.
+///
+/// Must be `false` in anything shipped; `the_crack_diagnostic_is_off` asserts
+/// it.
+pub const SKY_CRACK_DEBUG: bool = false;
 
 fn sky_shader() -> String {
     format!(
@@ -609,27 +403,37 @@ struct VOut {{
     // view_proj. Two points on the ray rather than one, because the near point
     // is where the eye is and the difference is the direction -- which is what
     // makes this correct for an off-centre projection, and every headset's is.
-    let near = camera.inv_view_proj * vec4<f32>(in.ndc, 0.0, 1.0);
-    let far  = camera.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
+    let near = cam_inv_view_proj() * vec4<f32>(in.ndc, 0.0, 1.0);
+    let far  = cam_inv_view_proj() * vec4<f32>(in.ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w - near.xyz / near.w);
 
     let uv = sky_uv(dir);
     let radiance = textureSample(sky_tex, sky_samp, uv).rgb * camera.sky_params.x;
 
-    // Reinhard, then the sRGB target does the rest. A panorama carries values
-    // well above one and this pass has no tonemapping stage in front of it, so
-    // without this a bright sky clips to flat white and a dim one reads black.
-    let mapped = radiance / (radiance + vec3<f32>(1.0));
-    return vec4<f32>(mapped, 1.0);
+    // The shared curve, the same one every lit surface uses. This pass used to
+    // run its own local Reinhard because nothing downstream tone mapped -- which
+    // meant the sky and the geometry in front of it disagreed about how
+    // highlights roll off, and the seam showed at the horizon.
+    {sky_tail}
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
+        sky_tail = if SKY_CRACK_DEBUG {
+            "return vec4<f32>(1.0, 0.0, 1.0, 1.0);"
+        } else {
+            "return vec4<f32>(tonemap(radiance), 1.0);"
+        },
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_crack_diagnostic_is_off() {
+        assert!(!SKY_CRACK_DEBUG, "SKY_CRACK_DEBUG is on: the sky is painted magenta");
+    }
 
     fn workspace_root() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -1007,6 +811,7 @@ mod render_tests {
                 label: Some("sky_test_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &target_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: Operations { load: LoadOp::Clear(Color::GREEN), store: StoreOp::Store },
                 })],
@@ -1016,6 +821,7 @@ mod render_tests {
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
+                multiview_mask: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&pipeline.pipeline);
@@ -1044,8 +850,8 @@ mod render_tests {
 
         let slice = readback.slice(..);
         slice.map_async(MapMode::Read, |_| {});
-        device.poll(PollType::Wait).ok();
-        let data = slice.get_mapped_range();
+        device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+        let data = slice.get_mapped_range().unwrap();
         let at = (SIZE / 2) as usize * 256 + (SIZE / 2) as usize * 4;
         Some([data[at], data[at + 1], data[at + 2], data[at + 3]])
     }
@@ -1071,7 +877,16 @@ mod render_tests {
         // a level is lit from somewhere other than where its sun is drawn --
         // which reads as a lighting bug and is a mapping bug.
         let pano = split_panorama();
-        for dir in [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]] {
+        // Nudged off the axes on purpose. [0,0,1] lands on u=0.5 and [0,0,-1]
+        // on the u=0/1 wrap -- both exactly on a boundary of this two-colour
+        // fixture, where the sampler returns a 50/50 blend and "which channel
+        // dominates" has no defined answer. That went unnoticed for as long as
+        // the sky used a per-channel Reinhard, which maps an even red/blue
+        // blend to exactly equal bytes so the comparison came out false and the
+        // assertion passed by coincidence. ACES mixes channels, the tie broke,
+        // and the accident surfaced. These offsets put every sample about three
+        // texels inside a region.
+        for dir in [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.3, 0.0, 1.0], [0.3, 0.0, -1.0]] {
             let px = shot!(look(dir, &pano));
             let uv = direction_to_uv(dir);
             let expected = pano.texel(
@@ -1089,14 +904,25 @@ mod render_tests {
 
     #[test]
     fn the_sky_is_tonemapped_rather_than_clipped() {
-        // The panorama carries 3.0. Reinhard puts that at 0.75, so the channel
-        // should land near 191 -- not at 255, which is what a missing tonemap
-        // (or an 8-bit upload) would give, and which would look identical on a
-        // bright sky while destroying every cloud in a dim one.
+        // The panorama carries pure red at 3.0, and ACES mixes channels: the
+        // green and blue that come back are made entirely by the colour
+        // matrices. That is a stronger signature than the red channel, which
+        // saturates for a fully-saturated primary this bright and so looks the
+        // same tone mapped as clipped.
+        //
+        // A hard clamp leaves G and B at exactly 0. The old local Reinhard,
+        // being per-channel, also left them at 0 and put red at ~191. Only a
+        // matrix-based curve puts light in the other two, so this now pins
+        // WHICH curve is running and not merely that one is.
         let px = shot!(look([-1.0, 0.0, 0.0], &split_panorama()));
+        assert!(px[0] > 240, "red should be near the top of the range, got {px:?}");
         assert!(
-            px[0] > 170 && px[0] < 215,
-            "expected the Reinhard value for radiance 3 (~191), got {px:?}",
+            px[1] > 14 && px[1] < 32,
+            "expected the ACES cross-channel green (~22), got {px:?}",
+        );
+        assert!(
+            px[2] > 1 && px[2] < 14,
+            "expected the ACES cross-channel blue (~6), got {px:?}",
         );
     }
 
@@ -1160,6 +986,7 @@ mod render_tests {
                 label: Some("occluded_sky"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &tv,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: Operations { load: LoadOp::Clear(Color::GREEN), store: StoreOp::Store },
                 })],
@@ -1171,6 +998,7 @@ mod render_tests {
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
+                multiview_mask: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&pipeline.pipeline);
@@ -1193,8 +1021,8 @@ mod render_tests {
         queue.submit(Some(encoder.finish()));
         let slice = readback.slice(..);
         slice.map_async(MapMode::Read, |_| {});
-        device.poll(PollType::Wait).ok();
-        let data = slice.get_mapped_range();
+        device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+        let data = slice.get_mapped_range().unwrap();
         let at = (SIZE / 2) as usize * 256 + (SIZE / 2) as usize * 4;
         let px = [data[at], data[at + 1], data[at + 2], data[at + 3]];
         assert!(
@@ -1214,11 +1042,19 @@ mod render_tests {
         let lights = LightsUniform::new(&device);
         let (_shadows, uniforms) =
             crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
-        device.push_error_scope(ErrorFilter::Validation);
+        let err_scope_1 = device.push_error_scope(ErrorFilter::Validation);
         let _one = SkyPipeline::new(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 1);
         let _four = SkyPipeline::new(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4);
-        if let Some(e) = pollster::block_on(device.pop_error_scope()) {
+        if let Some(e) = pollster::block_on(err_scope_1.pop()) {
             panic!("the sky pipeline failed validation: {e}");
         }
     }
+}
+
+// Scene shader sources, for `multiview::every_scene_shader_survives_the_multiview_transform`.
+// Test-only: the gate has to see exactly the text each pipeline is built from,
+// and nothing on a development machine can build a multiview pipeline to check.
+#[cfg(test)]
+pub fn sky_shader_src() -> String {
+    sky_shader()
 }

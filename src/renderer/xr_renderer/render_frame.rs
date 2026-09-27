@@ -13,6 +13,7 @@ use crate::renderer::{
 
 use super::{ShadowQuality, XrRenderer};
 
+
 type MeshDraw<'a> = (
     &'a wgpu::BindGroup,
     &'a wgpu::BindGroup,
@@ -96,7 +97,7 @@ impl XrRenderer {
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
         self.render_frame_with_meshes(
-            session, stage, time, cuboids, &[], &[], &[], &[], &[], None, None, None,
+            session, stage, time, cuboids, &[], &[], &[], &[], &[], None, &[], None, None,
         )
     }
 
@@ -117,6 +118,11 @@ impl XrRenderer {
         // the same shading, shadowing and depth behaviour, and a second pipeline
         // would be a second place for those to drift.
         terrain: Option<(&[SolidVertex], &[u32])>,
+        // Spatially-coherent runs of `terrain`'s index buffer, with bounds, so
+        // each shadow pass can draw only the ground its light actually reaches.
+        // Empty means "not partitioned", and the whole terrain is drawn -- an
+        // unculled caster is slow, a missing one is a bug.
+        terrain_chunks: &[crate::renderer::shadow::CasterChunk],
         // Level geometry the client meshed from brushes, already in the same
         // player-local space as the cuboids, and carrying a material per vertex.
         // Its own pipeline and its own buffer: a brush vertex is not a solid
@@ -135,8 +141,30 @@ impl XrRenderer {
         self.swapchain.wait_image(xr::Duration::INFINITE)?;
         let cpu_start = std::time::Instant::now();
 
-        let (_, eye_views) =
+        // TRACKING MAY NOT BE READY YET, AND THAT IS NOT AN ERROR.
+        //
+        // `locate_views` reports through its FLAGS whether the poses it hands
+        // back mean anything. Those were discarded, so on a cold start -- before
+        // tracking settles, or with the headset off the head -- the renderer
+        // drew with garbage poses and `xrEndFrame` refused them with
+        // `XR_ERROR_POSE_INVALID`. That propagated all the way out of the frame
+        // loop and the app EXITED.
+        //
+        // So the symptom was "it never loads": launching from the library died
+        // during startup, while a launch a few seconds after a deploy survived
+        // because tracking had settled by then (2026-09-19).
+        //
+        // An unlocated frame is an ordinary event. Return no views, and the
+        // caller submits no layer for this frame -- which OpenXR allows, and
+        // which the compositor covers with the previous frame.
+        let (view_flags, eye_views) =
             session.locate_views(xr::ViewConfigurationType::PRIMARY_STEREO, time, stage)?;
+        let located = view_flags.contains(xr::ViewStateFlags::ORIENTATION_VALID)
+            && view_flags.contains(xr::ViewStateFlags::POSITION_VALID);
+        if !located {
+            self.swapchain.release_image()?;
+            return Ok(Vec::new());
+        }
 
         let head_rot = {
             let o = eye_views[0].pose.orientation;
@@ -173,6 +201,20 @@ impl XrRenderer {
                 terrain_range = Some((index_start, terrain_idx.len() as u32));
             }
         }
+        // Terrain indices were rebased into the shared solid buffer, so the
+        // chunk offsets have to move with them. Using the raw offsets here
+        // would draw whatever happened to sit at that position in the combined
+        // buffer -- cuboids, or nothing.
+        let solid_chunks: Vec<crate::renderer::shadow::CasterChunk> = match terrain_range {
+            Some((index_start, _)) => terrain_chunks
+                .iter()
+                .map(|c| crate::renderer::shadow::CasterChunk {
+                    first_index: c.first_index + index_start,
+                    ..*c
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         let (solid_verts, solid_idx, solid_ranges) = (solid_verts, solid_idx, solid_ranges);
 
         // Empty when the scene has no brushes, or when every one of them has
@@ -251,15 +293,28 @@ impl XrRenderer {
         // casts here with no pipeline of its own.
         let mut shadow_casters: Vec<crate::renderer::shadow::ShadowMeshDraw> = Vec::new();
         for instance in meshes {
-            instance
-                .model
-                .upload(&self.wgpu_queue, instance.mesh.model_matrix());
+            // Back into WORLD space to sample the occlusion map. Mesh positions
+            // are in the player's frame -- the inverse of the same
+            // `yaw_inv * (world - offset)` every other bit of geometry gets --
+            // and the baked map is indexed by world footprint, so sampling it
+            // with a player-frame position would make an avatar's brightness
+            // depend on where the player happened to be standing.
+            let world = glam::Quat::from_rotation_y(self.player.yaw)
+                * instance.mesh.position
+                + self.player.offset;
+            let sky_vis = self.sky_visibility_at(world.x, world.z);
+            instance.model.upload_full(
+                &self.wgpu_queue,
+                instance.mesh.model_matrix(),
+                sky_vis,
+                instance.emissive_drive,
+            );
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(
                 instance, lightmap_bg, &mut mesh_draws, &mut skinned_draws, &mut layered_draws,
             );
             if instance.mesh.skin.is_none() {
-                for prim in &instance.mesh.primitives {
+                for prim in instance.mesh.primitives.iter().filter(|p| p.casts_shadow) {
                     shadow_casters.push((
                         &prim.vertex_buffer,
                         &prim.index_buffer,
@@ -271,6 +326,17 @@ impl XrRenderer {
         }
 
         let mut mirror_only_mesh_draws: Vec<MeshDraw> = Vec::new();
+        // Skinned casters, from the primitives the lit pass already gathered.
+        // Derived rather than collected separately so a character can never be
+        // drawn in one pass and missing from the other -- which would look like
+        // a shadow that belongs to nobody.
+        let mut skinned_casters: Vec<crate::renderer::shadow::ShadowSkinnedDraw> = skinned_draws
+            .iter()
+            .map(|(model_bg, _tex, joint_bg, vb, ib, count)| {
+                (*vb, *ib, *count, *model_bg, *joint_bg)
+            })
+            .collect();
+
         let mut mirror_only_skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut mirror_only_layered_draws: Vec<LayeredDraw> = Vec::new();
         for instance in mirror_only_meshes {
@@ -285,7 +351,27 @@ impl XrRenderer {
                 &mut mirror_only_skinned_draws,
                 &mut mirror_only_layered_draws,
             );
+            // HIDDEN FROM ITS OWNER, NOT FROM THE SUN. A mirror-only mesh is
+            // the player's own head: left out of their view so they do not see
+            // the inside of it, but it is still there, and it still casts. Left
+            // out of the casters, the player's shadow had no head (headset,
+            // 2026-09-23).
+            if instance.mesh.skin.is_none() {
+                for prim in instance.mesh.primitives.iter().filter(|p| p.casts_shadow) {
+                    shadow_casters.push((
+                        &prim.vertex_buffer,
+                        &prim.index_buffer,
+                        prim.indices.len() as u32,
+                        &instance.model.bind_group,
+                    ));
+                }
+            }
         }
+        skinned_casters.extend(
+            mirror_only_skinned_draws
+                .iter()
+                .map(|(model_bg, _tex, joint_bg, vb, ib, count)| (*vb, *ib, *count, *model_bg, *joint_bg)),
+        );
 
         let mirror_quad = mirror.map(|m| {
             let (verts, idx) = mirror::build_mirror_quad(m.half_size.x, m.half_size.y);
@@ -323,22 +409,117 @@ impl XrRenderer {
             eye_views[0].pose.position.y,
             eye_views[0].pose.position.z,
         );
-        let want_sun = self.shadow_quality != ShadowQuality::Off;
-        let want_spot = self.shadow_quality == ShadowQuality::SunAndSpot;
+
+        // EYE ADAPTATION: meter what the player is looking at, from the probe
+        // of the room they stand in, and ease the exposure toward it. The
+        // head and gaze go back to WORLD space, where the probes were baked.
+        let post = {
+            let now = std::time::Instant::now();
+            let dt = self
+                .last_frame_at
+                .replace(Some(now))
+                .map(|t| now.duration_since(t).as_secs_f32().min(0.25))
+                .unwrap_or(0.0);
+            let yaw = glam::Quat::from_rotation_y(self.player.yaw);
+            let o = eye_views[0].pose.orientation;
+            let gaze = yaw * (glam::Quat::from_xyzw(o.x, o.y, o.z, o.w) * glam::Vec3::NEG_Z);
+            let head_world = yaw * head + self.player.offset;
+            let mut eye = self.eye.borrow_mut();
+            let metered = eye.meter(head_world, gaze);
+            let auto = eye.update(metered, dt);
+            if self.shadow_diag_frames.get() % 120 == 0 {
+                log::info!("EXPOSURE meter {metered:.4} -> x{auto:.2} (auto {})", self.auto_exposure);
+            }
+            crate::renderer::uniforms::PostUpload {
+                exposure: self.post.exposure * if self.auto_exposure { auto } else { 1.0 },
+                ..self.post
+            }
+        };
+        // The `perf_ab` NoShadows phase switches both off for its window.
+        // The A/B schedule, compiled in (`perf_ab::ENABLED`) or asked for from
+        // the headset (`Levers::ab_cycle`). Baseline otherwise.
+        let ab_phase = if crate::renderer::perf_ab::ENABLED || self.levers.ab_cycle {
+            crate::renderer::perf_ab::Phase::cycle_phase(self.perf_windows)
+        } else {
+            crate::renderer::perf_ab::Phase::Baseline
+        };
+        // EVERYTHING THIS FRAME SWITCHES: the lever file, with the schedule's
+        // one extra switch on top. See `levers`. Every feature below reads
+        // this, never the phase, so a lever and a phase cannot disagree.
+        let fx = self.levers.with_phase(ab_phase);
+        let no_shadow_phase = !fx.shadows;
+        let want_sun = self.shadow_quality != ShadowQuality::Off && !no_shadow_phase;
+        let want_spot = self.shadow_quality == ShadowQuality::SunAndSpot && !no_shadow_phase;
+
+        // Trim to the budget by INFLUENCE before anything else looks at the
+        // list. Once, and here, because the shadow layers below are indices
+        // INTO this list -- reordering after they are chosen would point each
+        // spot at another light's shadow map.
+        // THE SKY'S SUN, joined to the frame's lights unless the scene brought
+        // its own. See `Sky::sun` and `lights::sky_sun_light`: it is a MIXED
+        // light -- baked into the brushes, shaded live on everything else.
+        let player_to_world = glam::Mat4::from_rotation_translation(
+            glam::Quat::from_rotation_y(self.player.yaw),
+            self.player.offset,
+        );
+        let sky_sun = crate::renderer::lights::sky_sun_light(
+            self.sky.sun.as_ref(),
+            lights,
+            glam::Quat::from_rotation_y(self.player.yaw).inverse(),
+        );
+        let with_sky_sun: Vec<Light>;
+        let lights: &[Light] = match sky_sun {
+            Some(sun) => {
+                with_sky_sun = lights.iter().copied().chain(std::iter::once(sun)).collect();
+                &with_sky_sun
+            }
+            None => lights,
+        };
+        let ranked_idx = crate::renderer::lights::rank_for_budget_indices(
+            lights,
+            crate::renderer::lights::MAX_LIGHTS,
+        );
+        let source_lights = lights;
+        let ranked: Vec<Light> = ranked_idx.iter().map(|&i| source_lights[i]).collect();
+        let lights: &[Light] = if !fx.direct_lights { &[] } else { &ranked };
 
         let sun = want_sun
             .then(|| lights.iter().find(|l| l.kind == crate::renderer::LightKind::Directional))
             .flatten();
-        // Spots take shadow layers in scene order until the budget runs out.
-        // It used to be just the first one, so a room with two matching lamps
-        // had one casting a shadow and one not.
-        let spot_indices: Vec<usize> = if want_spot {
-            lights
+        // Spots take shadow layers in the same influence order. It used to be
+        // scene order, so which of two identical lamps cast a shadow came down
+        // to which was authored first.
+        //
+        // HELD FROM FRAME TO FRAME, not re-chosen. Influence is measured from
+        // the PLAYER, so simply taking the best four every frame means the set
+        // changes as they walk -- and with more spots in a room than slots,
+        // shadows appear and disappear with movement. On the headset that read
+        // as one side of the avatar's hand unshadowed when it should not have
+        // been, and the wall spotlight in the back corner casting none
+        // (2026-09-18). Each frame's choice was individually right; the defect
+        // only existed ACROSS frames. See `lights::spot_shadow_slots`.
+        //
+        // The incumbents are named by their index in the list the CALLER handed
+        // in, which is the only name that survives the ranking above.
+        let spot_indices: Vec<usize> = if want_spot && !lights.is_empty() {
+            let spot_scores: Vec<(usize, f32)> = ranked_idx
                 .iter()
-                .enumerate()
-                .filter(|(_, l)| l.kind == crate::renderer::LightKind::Spot)
-                .map(|(i, _)| i)
-                .take(crate::renderer::shadow::MAX_SPOT_SHADOWS)
+                .copied()
+                .filter(|&src| source_lights[src].kind == crate::renderer::LightKind::Spot)
+                .map(|src| (src, crate::renderer::lights::influence_score(&source_lights[src])))
+                .collect();
+            let chosen = crate::renderer::lights::spot_shadow_slots(
+                &spot_scores,
+                &self.shadow_spot_incumbents.borrow(),
+                crate::renderer::shadow::MAX_SPOT_SHADOWS,
+                crate::renderer::lights::SHADOW_SLOT_MARGIN,
+            );
+            self.shadow_spot_incumbents.borrow_mut().clone_from(&chosen);
+            // Back to positions in the RANKED list, which is what the uniform
+            // and the shadow layers are indexed by.
+            chosen
+                .iter()
+                .filter_map(|&src| ranked_idx.iter().position(|&r| r == src))
                 .collect()
         } else {
             Vec::new()
@@ -360,15 +541,75 @@ impl XrRenderer {
         // Uploaded HERE rather than earlier in the frame, because each light has
         // to be told which shadow layer it casts into -- and that is not known
         // until the spots have been assigned layers just above.
-        self.lights_uniform
-            .upload_with_shadow_layers(&self.wgpu_queue, lights, &spot_indices);
+        // The baked lamps ride behind the live ones for the surfaces that
+        // have no lightmap. See `lights::append_baked`. Dropped with the live
+        // ones when `perf_ab` measures a frame without direct light.
+        let frame_lights = if !fx.direct_lights {
+            Vec::new()
+        } else {
+            crate::renderer::lights::append_baked(lights, &self.baked_lights, crate::renderer::lights::MAX_LIGHTS)
+        };
+        self.lights_uniform.upload_frame_split(
+            &self.wgpu_queue,
+            &frame_lights,
+            lights.len(),
+            &spot_indices,
+            sky_sun.is_some(),
+        );
+
+        // THE SKY SUN'S SHADOW IS DRAWN ONCE, not every frame.
+        //
+        // Nothing it shadows by moves: the sun is fixed and so is the level.
+        // So the map is built in WORLD space over the level's bounds and only
+        // redrawn when the geometry changes, and each frame merely re-expresses
+        // it in the player's frame -- the render space is the world moved by
+        // the rig, and `player_to_world` undoes exactly that. The head-following
+        // box this replaces for the sky sun redrew every brush every frame and
+        // spent half its resolution behind the player.
+        //
+        // Static casters only -- the level and the ground. A moving object
+        // does not cast the sun's shadow yet; the baked level never shows it
+        // anyway, because the sun on brushes comes from the lightmap.
+        let static_sun = sun.filter(|_| sky_sun.is_some()).map(|l| {
+            let world_dir = glam::Quat::from_rotation_y(self.player.yaw) * l.direction;
+            let signature = (
+                brushes.map(|(v, i)| (v.len(), i.len())).unwrap_or((0, 0)),
+                terrain.map(|(v, i)| (v.len(), i.len())).unwrap_or((0, 0)),
+                world_dir.to_array().map(f32::to_bits),
+            );
+            let mut cache = self.static_sun_shadow.borrow_mut();
+            let stale = cache.as_ref().is_none_or(|c| c.signature != signature);
+            if stale {
+                let world_view_proj = crate::renderer::lights::static_sun_matrix(
+                    world_dir,
+                    brushes.map(|(v, _)| v.iter().map(|b| b.position)),
+                    terrain.map(|(v, _)| v.iter().map(|t| t.position)),
+                    player_to_world,
+                );
+                *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj });
+            }
+            (cache.as_ref().unwrap().world_view_proj * player_to_world, stale)
+        });
+        // The moving-objects sun map: a small box under the player's head,
+        // built in WORLD space and snapped to its own texel grid there, then
+        // carried into the player's frame like the static map. Snapping in the
+        // player's frame instead would re-grid the map every time they walked
+        // or turned, and every moving shadow edge would crawl.
+        let dynamic_sun = static_sun.and(sun).filter(|_| fx.sun_dynamic).map(|l| {
+            let world_dir = glam::Quat::from_rotation_y(self.player.yaw) * l.direction;
+            let head_world = player_to_world.transform_point3(head);
+            crate::renderer::lights::dynamic_sun_matrix(world_dir, head_world) * player_to_world
+        });
 
         let shadow = crate::renderer::uniforms::ShadowUpload {
-            sun_view_proj: sun
-                .map(|l| {
-                    crate::renderer::shadow::directional_light_matrix(l.direction, focus, sun_radius)
-                })
-                .unwrap_or(glam::Mat4::IDENTITY),
+            sun_view_proj: match static_sun {
+                Some((m, _)) => m,
+                None => sun
+                    .map(|l| {
+                        crate::renderer::shadow::directional_light_matrix(l.direction, focus, sun_radius)
+                    })
+                    .unwrap_or(glam::Mat4::IDENTITY),
+            },
             spot_view_proj: {
                 let mut m = [glam::Mat4::IDENTITY; crate::renderer::shadow::MAX_SPOT_SHADOWS];
                 for (layer, &i) in spot_indices.iter().enumerate() {
@@ -381,48 +622,155 @@ impl XrRenderer {
             },
             sun_enabled: sun.is_some(),
             spot_count: spot_indices.len() as u32,
+            sun_dynamic_view_proj: dynamic_sun.unwrap_or(glam::Mat4::IDENTITY),
+            sun_dynamic_enabled: dynamic_sun.is_some(),
         };
 
-        if shadow.sun_enabled || shadow.spot_count > 0 {
+        // A static sun map is recorded only when it went stale.
+        let record_sun = shadow.sun_enabled && static_sun.is_none_or(|(_, stale)| stale);
+        if record_sun || shadow.sun_dynamic_enabled || shadow.spot_count > 0 {
             let solid_caster = (!solid_idx.is_empty())
                 .then_some((&solid_vb, &solid_ib, solid_idx.len() as u32));
             let brush_caster = brush_buffers
                 .as_ref()
                 .map(|(vb, ib, count)| (vb, ib, *count));
+            // A missing shadow has four separate causes -- no pass ran, the
+            // caster was not in the list, the list was empty, or the depth
+            // landed somewhere else -- and they are indistinguishable by
+            // looking at the wall. This separates the first three.
+            let mut drawn = 0u32;
+            self.shadow_diag_frames.set(self.shadow_diag_frames.get() + 1);
+            let diag = self.shadow_diag_frames.get() % 120 == 0;
+            // WHICH spots hold the four slots, reported the moment the set
+            // changes rather than on the 120-frame cadence.
+            //
+            // `test_room` has five lights and `MAX_SPOT_SHADOWS` is four, so
+            // one light is always without a shadow and which one can change as
+            // the player moves. A periodic log cannot distinguish "stable" from
+            // "swapping between samples", and a swap is exactly the thing worth
+            // knowing about: it makes a shadow appear and disappear wholesale.
+            // Logging only on CHANGE means silence is itself the measurement.
+            {
+                let mut last = self.shadow_slot_log.borrow_mut();
+                if *last != spot_indices {
+                    log::info!(
+                        "SHADOWSLOTS changed: {:?} -> {:?} (of {} lights, {} slots)",
+                        *last,
+                        spot_indices,
+                        source_lights.len(),
+                        crate::renderer::shadow::MAX_SPOT_SHADOWS,
+                    );
+                    last.clone_from(&spot_indices);
+                }
+            }
+            if diag {
+                log::info!(
+                    "SHADOWDIAG sun={} spots={} solid_idx={} brush_idx={} rigid_casters={} skinned_casters={}",
+                    shadow.sun_enabled,
+                    shadow.spot_count,
+                    solid_caster.map(|(_, _, n)| n).unwrap_or(0),
+                    brush_caster.map(|(_, _, n)| n).unwrap_or(0),
+                    shadow_casters.len(),
+                    skinned_casters.len(),
+                );
+            }
             let mut encoder = self
                 .wgpu_device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("shadow_encoder"),
                 });
-            if shadow.sun_enabled {
+            if record_sun {
+                // The ground only, for a static map: the solid buffer also
+                // holds cuboids, which can move. `record` draws only the
+                // terrain chunks when it is given any, so without them the
+                // buffer is left out rather than frozen into the map.
+                let solid_caster = if static_sun.is_some() && solid_chunks.is_empty() {
+                    None
+                } else {
+                    solid_caster
+                };
+                let no_meshes: [crate::renderer::shadow::ShadowMeshDraw; 0] = [];
+                let no_skinned: [crate::renderer::shadow::ShadowSkinnedDraw; 0] = [];
+                let (mesh_casters, skinned) = if static_sun.is_some() {
+                    (&no_meshes[..], &no_skinned[..])
+                } else {
+                    (&shadow_casters[..], &skinned_casters[..])
+                };
                 self.shadow_map.upload_light(
                     &self.wgpu_queue,
                     crate::renderer::shadow::ShadowKind::Sun,
                     shadow.sun_view_proj,
                 );
-                self.shadow_map.record(
+                drawn += self.shadow_map.record(
                     &mut encoder,
                     crate::renderer::shadow::ShadowKind::Sun,
                     solid_caster,
                     brush_caster,
+                    mesh_casters,
+                    skinned,
+                    &solid_chunks,
+                    shadow.sun_view_proj,
+                );
+                if static_sun.is_some() {
+                    log::info!("SUNSHADOW static map recorded ({drawn} indices)");
+                }
+            }
+            // The sun's shadow of MOVING things, every frame, into its own
+            // small map. Meshes and skinned characters only: the level is in
+            // the brushes' baked mask and in the static map already.
+            if shadow.sun_dynamic_enabled {
+                self.shadow_map.upload_light(
+                    &self.wgpu_queue,
+                    crate::renderer::shadow::ShadowKind::SunDynamic,
+                    shadow.sun_dynamic_view_proj,
+                );
+                drawn += self.shadow_map.record(
+                    &mut encoder,
+                    crate::renderer::shadow::ShadowKind::SunDynamic,
+                    None,
+                    None,
                     &shadow_casters,
+                    &skinned_casters,
+                    &[],
+                    shadow.sun_dynamic_view_proj,
                 );
             }
-            // One depth pass per shadow-casting spot. This is the cost, and it
-            // is why MAX_SPOT_SHADOWS is a budget rather than "however many the
-            // level has" -- on a tile-based GPU each pass is expensive.
+            // ONE pass for every spot, filling its own tile of the shared
+            // atlas. This used to be a pass each, and that was the cost: on a
+            // tile GPU a pass is a tile load/store cycle whatever is in it, and
+            // culling 95.5% of the caster geometry gave back only 1.8 ms of the
+            // 3.2 ms three spots cost.
             for layer in 0..shadow.spot_count as usize {
                 self.shadow_map.upload_light(
                     &self.wgpu_queue,
                     crate::renderer::shadow::ShadowKind::Spot(layer),
                     shadow.spot_view_proj[layer],
                 );
-                self.shadow_map.record(
+            }
+            if shadow.spot_count > 0 {
+                drawn += self.shadow_map.record_spots(
                     &mut encoder,
-                    crate::renderer::shadow::ShadowKind::Spot(layer),
+                    shadow.spot_count as usize,
+                    &shadow.spot_view_proj,
                     solid_caster,
                     brush_caster,
                     &shadow_casters,
+                    &skinned_casters,
+                    &solid_chunks,
+                );
+            }
+            if diag {
+                // The number that says whether culling is doing anything: the
+                // baseline is every caster redrawn once per pass, and `drawn`
+                // is what actually reached a depth buffer.
+                // Spots are now ONE pass between them, not one each.
+                let passes = u32::from(shadow.spot_count > 0) + u32::from(record_sun);
+                let uncalled = (solid_caster.map(|(_, _, n)| n).unwrap_or(0)
+                    + brush_caster.map(|(_, _, n)| n).unwrap_or(0))
+                    * passes;
+                log::info!(
+                    "SHADOWDIAG culled: drew {drawn} of {uncalled} indices over {passes} pass(es), {} chunks",
+                    solid_chunks.len(),
                 );
             }
             self.wgpu_queue.submit(Some(encoder.finish()));
@@ -431,8 +779,45 @@ impl XrRenderer {
         // Whether the eye pass will composite anything that has to depth-test
         // against the world. Only these two read the scene depth, and only they
         // make a multisampled depth buffer worth storing.
-        let needs_scene_depth = mirror_quad.is_some()
-            || solid_ranges.iter().any(|(_, _, _, r)| *r > 0.0);
+        // A reflective BRUSH needs the offscreen copy for the same reason a
+        // reflective cuboid does: it samples the finished scene. Gated on the
+        // materials actually being smooth, so a level built from rock and grass
+        // keeps the cheaper straight-to-swapchain path -- measured at about
+        // 0.9 ms.
+        let reflective_brushes = self.brush_materials.reflective && brush_geometry.is_some();
+        // The A/B schedule. `Baseline` whenever `perf_ab::ENABLED` is off.
+        // THROUGH the policy, so the renderer cannot drift from what
+        // `scene_pass_plan`'s tests pin. With screen-space reflections off on
+        // the headset, a reflective material no longer forces the offscreen
+        // copy; only a planar mirror still does.
+        let needs_scene_depth = crate::renderer::scene_pass_plan::needs_scene_readback(
+            mirror_quad.is_some(),
+            reflective_brushes || solid_ranges.iter().any(|(_, _, _, r)| *r > 0.0),
+            // The runtime switch, not the constant: the constant is only the
+            // default it starts from. See `set_screen_space_reflections`.
+            self.screen_space_reflections,
+        );
+        // Forcing the direct path is the ONE override of this decision, and it
+        // goes through the same value the scene and eye passes both read, so
+        // they cannot disagree about it even while it is being overridden.
+        let needs_scene_depth = needs_scene_depth && !fx.direct_path;
+        // ONE decision, read by both the scene pass and the eye pass.
+        //
+        // They have to agree. If the scene pass draws straight into the
+        // swapchain and the eye pass still runs, its first act is to blit the
+        // offscreen texture -- now a frame stale and never written this frame --
+        // over the top of everything just rendered. That is a black or frozen
+        // eye, and it is the kind of drift a later edit to one site introduces
+        // silently. Deriving both from the same value is what makes it
+        // unrepresentable.
+        let plan = crate::renderer::scene_pass_plan::ScenePassPlan::for_frame(needs_scene_depth);
+
+        // ONCE PER FRAME, not per eye: takes in whatever probes the stream's
+        // worker finished, and opens the frame in which layers the eyes use
+        // cannot be evicted. See `probe_stream::LayerPool`.
+        if let Some(stream) = self.probe_stream.borrow_mut().as_mut() {
+            stream.begin_frame();
+        }
 
         for eye in 0..2usize {
             let ev = &eye_views[eye];
@@ -451,8 +836,9 @@ impl XrRenderer {
                 // The reflected eye, so specular highlights land where the
                 // reflection says they should rather than where the real eye is.
                 let mirror_eye = mirror_view.inverse().transform_point3(glam::Vec3::ZERO);
-                self.uniform_buf.upload_with_sky(
+                self.uniform_buf.upload_scene(
                     &self.wgpu_queue, mirror_view_proj, mirror_eye, &shadow, &sky_upload,
+                    &post, &self.player,
                 );
                 self.mirror_reflected_vp_uniform.upload(&self.wgpu_queue, mirror_view_proj);
 
@@ -464,6 +850,7 @@ impl XrRenderer {
                         label: Some("mirror_pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &self.mirror_targets[eye].color_view,
+                            depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -576,16 +963,137 @@ impl XrRenderer {
 
             let eye_view_proj = Camera::gl_to_wgpu_ndc(proj) * view;
             let cam_pos = glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
-            self.uniform_buf.upload_with_sky(
-                &self.wgpu_queue, eye_view_proj, cam_pos, &shadow, &sky_upload,
-            );
+            // BOTH EYES' CAMERAS. A stereo scene pass cannot re-upload the
+            // uniform between eyes -- it draws them in one go -- so both have
+            // to be resident and the shader picks its own with
+            // `@builtin(view_index)`. Index 0 is the left eye, matching the
+            // OpenXR view array, the swapchain's layer order and the order
+            // `view_index` counts in.
+            let both_view_proj: [glam::Mat4; 2] = std::array::from_fn(|i| {
+                let v = &eye_views[i];
+                Camera::gl_to_wgpu_ndc(Camera::xr_projection(v.fov, 0.03, 1000.0))
+                    * Camera::xr_view(v.pose)
+            });
+            let both_cam_pos: [glam::Vec3; 2] = std::array::from_fn(|i| {
+                let p = eye_views[i].pose.position;
+                glam::Vec3::new(p.x, p.y, p.z)
+            });
+
+            // WHICH PROBES OCCUPY THE SHADER'S SLOTS THIS FRAME.
+            //
+            // The cube array holds every probe the level baked; the loop can
+            // only afford `MAX_PROBES` of them. Which ones matter depends on
+            // where the player is standing, so it is decided here rather than
+            // at load.
+            //
+            // IN WORLD SPACE, because probe boxes are. Everything else in this
+            // frame is in the PLAYER's frame -- `yaw_inv * (world - offset)` --
+            // so both the camera and its frustum have to be lifted back out of
+            // it before they can be compared against a box that was baked
+            // against walls that do not move. Comparing the two frames directly
+            // is the bug that made probe boxes slide as the player walked.
+            let resident = if self.probe_volumes.is_empty() {
+                None
+            } else {
+                let yaw = glam::Quat::from_rotation_y(self.player.yaw);
+                let player_world = yaw * cam_pos + self.player.offset;
+                let world_to_player = glam::Mat4::from_quat(yaw.inverse())
+                    * glam::Mat4::from_translation(-self.player.offset);
+                let planes = crate::renderer::shadow::frustum_planes(eye_view_proj * world_to_player);
+                let mut upload = crate::renderer::uniforms::select_resident_probes(
+                    &self.probe_volumes,
+                    player_world,
+                    |min, max| crate::renderer::shadow::aabb_in_frustum(&planes, min, max),
+                );
+                // Residency names PROBES; brightness and room follow the probe,
+                // and only then does the stream turn each into a cube layer.
+                upload.fill_brightness(&self.probe_brightness);
+                upload.fill_volumes(&self.probe_rooms);
+                // The doorways around the player, nearest first, that open
+                // onto a room with a photograph in this frame.
+                upload.set_portals(&self.probe_portals, player_world, &upload.volumes());
+                // And what stands in those rooms, for the reflection trace.
+                upload.set_proxies(&self.probe_proxies, player_world, &upload.volumes());
+                // perf_ab: every slot its own room (no two-photograph blend), or
+                // no doorways. Measurement only; see `perf_ab::Phase`.
+                if !fx.probe_blend {
+                    for slot in 0..upload.count as usize {
+                        upload.set_volume(slot, 1_000_000 + slot as u32);
+                    }
+                }
+                if !fx.portals {
+                    upload.portal_count = 0;
+                }
+                upload.no_trace = !fx.probe_trace;
+                if !fx.reflection_proxies {
+                    upload.proxy_count = 0;
+                }
+                Some(upload)
+            };
+            let resident = match (resident, self.probe_stream.borrow_mut().as_mut()) {
+                (Some(mut upload), Some(stream)) => {
+                    stream.resolve(&self.wgpu_queue, &mut upload);
+                    Some(upload)
+                }
+                (resident, _) => resident,
+            };
+
+            let no_probes = crate::renderer::uniforms::ProbeUpload::default();
+            // A STEREO SCENE PASS NEEDS BOTH CAMERAS RESIDENT AT ONCE; every
+            // other pass in the frame is per eye and wants this eye's. They
+            // cannot share one upload, so the stereo one is written here, the
+            // scene pass is submitted on its own below, and the per-eye upload
+            // follows it. See the note at that submit.
+            let stereo = self.multiview_scene && self.stereo_pipelines.is_some();
+            // WHAT THIS PASS CAN SEE, for terrain chunk culling further down.
+            //
+            // BOTH eyes when the pass is stereo. A multiview pass draws the two
+            // eyes together, so culling against one eye's frustum would drop
+            // geometry the other eye can see -- a hole in one eye only, which
+            // is both horrible to look at and easy to miss on a monitor.
+            //
+            // Player frame, deliberately without the `world_to_player` the
+            // probe residency test above needs: a chunk's bounds were built
+            // from the same vertices the draw uses, so both are already in the
+            // frame the view matrix expects. The probe boxes are the odd ones
+            // out, being baked in world space.
+            let mut terrain_drawn = 0u32;
+            let mut terrain_culled = 0u32;
+            let cull_planes: Vec<[glam::Vec4; 6]> = if stereo {
+                both_view_proj
+                    .iter()
+                    .map(|vp| crate::renderer::shadow::frustum_planes(*vp))
+                    .collect()
+            } else {
+                vec![crate::renderer::shadow::frustum_planes(eye_view_proj)]
+            };
+            let probes_arg =
+                if !fx.probes { Some(&no_probes) } else { resident.as_ref() };
+            if stereo && eye == 0 {
+                self.uniform_buf.upload_scene_stereo(
+                    &self.wgpu_queue, both_view_proj, both_cam_pos, &shadow, &sky_upload,
+                    &post, &self.player, probes_arg,
+                );
+            } else {
+                self.uniform_buf.upload_scene_with_probes(
+                    &self.wgpu_queue, eye_view_proj, cam_pos, &shadow, &sky_upload, &post,
+                    &self.player,
+                    // `Some(empty)`, not `None`: `None` means "use the level's
+                    // probes", which would leave them on and label it off.
+                    probes_arg,
+                );
+            }
             self.ssr_camera_uniform.upload(&self.wgpu_queue, eye_view_proj, cam_pos);
 
             {
                 let mut encoder = self.wgpu_device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor { label: Some("ssr_scene") },
                 );
-                {
+                // ONCE PER FRAME WHEN STEREO, not once per eye. The pass
+                // covers both layers, so running it again on the second eye
+                // would draw the whole scene twice into the same attachment --
+                // which is the cost this exists to remove.
+                if !stereo || eye == 0 {
                     // MULTISAMPLING, AND THE TWO STORE OPS THAT DECIDE ITS COST.
                     //
                     // Colour: when the target is multisampled the pass draws
@@ -602,16 +1110,87 @@ impl XrRenderer {
                     // correctly in the eye pass. When the frame has neither --
                     // which is every scene shipped so far -- the depth is
                     // discarded and the expensive half of MSAA never happens.
+                    // WHICH FAMILY OF PIPELINES THIS PASS DRAWS WITH, and
+                    // therefore whether it covers one eye or both. False unless
+                    // the switch is on AND the device built the stereo set, so
+                    // a machine without MULTIVIEW can never reach that path.
                     let target = &self.scene_targets[eye];
-                    let (color_view, resolve_target, color_store) =
-                        match target.msaa_color_view.as_ref() {
+                    // STRAIGHT INTO THE SWAPCHAIN when nothing will read the
+                    // scene back.
+                    //
+                    // The offscreen copy exists so reflective solids and the
+                    // mirror quad can SAMPLE the rendered scene. Nothing else
+                    // wants it -- and no shipped level has either -- so for
+                    // every scene we actually run, the eye pass that followed
+                    // was a full-screen blit of a texture we had just finished
+                    // drawing.
+                    //
+                    // On a tile GPU that is not a small waste. It is a
+                    // full-resolution store out of tile memory, then a second
+                    // render pass that loads all of it back and writes it
+                    // again, per eye, per frame -- and a render pass is the
+                    // expensive unit here, which this renderer has already
+                    // measured once: collapsing three shadow passes into one
+                    // atlas pass returned far more than culling 95% of the
+                    // geometry did.
+                    //
+                    // It is also what stands between us and foveated
+                    // rendering. FFR attaches a fragment density map to the
+                    // SWAPCHAIN image; shading into a private texture and
+                    // blitting means the density map only ever covers the
+                    // blit, and the pass doing the actual work is untouched.
+                    // Drawing the scene into the swapchain directly is what
+                    // makes FFR apply to the shading it is supposed to cheapen.
+                    //
+                    // Same format, same size, same sample count, so this is a
+                    // change of destination and not of pipelines.
+                    let swap_view = &self.eye_targets[image_index][eye].view;
+                    // THE LAYERED VIEWS WHEN STEREO. `D2Array` over both eyes
+                    // is what makes this a multiview pass at all -- wgpu infers
+                    // the view count from the attachment, so an ordinary
+                    // per-eye view here would draw one eye with pipelines built
+                    // for two and be refused.
+                    //
+                    // The stereo path never writes straight to the swapchain:
+                    // that is one layer of the OpenXR image and the eye pass
+                    // blits each eye across afterwards.
+                    let stereo_views = stereo
+                        .then(|| self.stereo_scene.as_ref())
+                        .flatten();
+                    let (color_view, resolve_target, color_store) = if let Some(st) = stereo_views {
+                        match st.array_msaa_color_view.as_ref() {
                             Some(msaa) => (
+                                msaa,
+                                Some(&st.array_color_view),
+                                wgpu::StoreOp::Discard,
+                            ),
+                            None => (&st.array_color_view, None, wgpu::StoreOp::Store),
+                        }
+                    } else {
+                        match (target.msaa_color_view.as_ref(), plan.samples_scene_back()) {
+                            // Multisampled: the resolve goes wherever the
+                            // finished image is wanted. The samples never leave
+                            // tile memory either way.
+                            (Some(msaa), true) => (
                                 msaa,
                                 Some(&target.color_view),
                                 wgpu::StoreOp::Discard,
                             ),
-                            None => (&target.color_view, None, wgpu::StoreOp::Store),
-                        };
+                            (Some(msaa), false) => (
+                                msaa,
+                                Some(swap_view),
+                                wgpu::StoreOp::Discard,
+                            ),
+                            (None, true) => (&target.color_view, None, wgpu::StoreOp::Store),
+                            (None, false) => (swap_view, None, wgpu::StoreOp::Store),
+                        }
+                    };
+                    // The depth attachment has to match: layered when the
+                    // colour is, or the pass has two different view counts.
+                    let scene_depth_view = match stereo_views {
+                        Some(st) => &st.array_depth_view,
+                        None => &target.depth_view,
+                    };
                     let depth_store = if needs_scene_depth {
                         wgpu::StoreOp::Store
                     } else {
@@ -620,8 +1199,18 @@ impl XrRenderer {
 
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("ssr_scene_pass"),
+                        // Both layers when stereo. wgpu checks this against the
+                        // attachment: a mask that is not `(1 << layers) - 1` is
+                        // a SELECTIVE multiview pass and needs a feature we do
+                        // not have. See `multiview::STEREO_VIEW_MASK`.
+                        multiview_mask: if stereo {
+                            crate::renderer::multiview::STEREO_VIEW_MASK
+                        } else {
+                            None
+                        },
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: color_view,
+                            depth_slice: None,
                             resolve_target,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -634,18 +1223,24 @@ impl XrRenderer {
                             },
                         })],
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                            view: &target.depth_view,
+                            view: scene_depth_view,
                             depth_ops: Some(wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(1.0),
                                 store: depth_store,
                             }),
                             stencil_ops: None,
                         }),
+                        // Slot per EYE: both eyes run this, and one shared pair would report only the second.
+                        timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(eye * 2)),
                         ..Default::default()
                     });
 
+                    if fx.half_viewport {
+                        pass.set_viewport(0.0, 0.0, (self.width / 2) as f32, (self.height / 2) as f32, 0.0, 1.0);
+                    }
+
                     if !solid_verts.is_empty() {
-                        pass.set_pipeline(&self.solid_pipeline.pipeline);
+                        pass.set_pipeline(self.sp_solid(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_vertex_buffer(0, solid_vb.slice(..));
                         pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -660,30 +1255,86 @@ impl XrRenderer {
                         }
                     }
                     if let Some((index_start, count)) = terrain_range {
-                        pass.set_pipeline(&self.terrain_pipeline.pipeline);
+                        pass.set_pipeline(self.sp_terrain(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
                         pass.set_vertex_buffer(0, solid_vb.slice(..));
                         pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(index_start..index_start + count, 0, 0..1);
+                        // PER CHUNK, so ground behind the player is not walked
+                        // through the binning pass. `chunk_indices` reorders
+                        // every triangle into buckets and the ranges partition
+                        // the whole index buffer, so drawing the visible
+                        // chunks draws exactly what one range draw did minus
+                        // what nothing can see.
+                        //
+                        // HONEST EXPECTATION: this frame is FILL bound, and
+                        // off-screen geometry already produces no fragments --
+                        // the GPU clips it. What this saves is vertex work and
+                        // tile binning, which is real on a tile GPU and is not
+                        // the bottleneck. The shadow pass measured culling
+                        // 95.5% of casters returning only 1.8 of 3.2 ms, so
+                        // the prior here is "small", and `TERRAINCULL` below
+                        // reports the number instead of anyone assuming one.
+                        if solid_chunks.is_empty() {
+                            pass.draw_indexed(index_start..index_start + count, 0, 0..1);
+                        } else {
+                            for c in &solid_chunks {
+                                // THE TESTED HELPER, not a second copy of the
+                                // rule. An inline `any` here would be the
+                                // shipped behaviour while the tests exercised
+                                // something else that merely looked the same.
+                                if crate::renderer::shadow::chunk_seen(c, &cull_planes) {
+                                    pass.draw_indexed(
+                                        c.first_index..c.first_index + c.index_count,
+                                        0,
+                                        0..1,
+                                    );
+                                    terrain_drawn += c.index_count;
+                                } else {
+                                    terrain_culled += c.index_count;
+                                }
+                            }
+                        }
+                        if self.shadow_diag_frames.get() % 120 == 0 {
+                            let total = terrain_drawn + terrain_culled;
+                            let pct = if total > 0 {
+                                100.0 * terrain_culled as f32 / total as f32
+                            } else {
+                                0.0
+                            };
+                            log::info!(
+                                "TERRAINCULL: drew {terrain_drawn} of {total} indices \
+                                 ({pct:.1}% culled) over {} chunks, {} frustum(s)",
+                                solid_chunks.len(),
+                                cull_planes.len(),
+                            );
+                        }
                     }
                     if let Some((vb, ib, count)) = &brush_buffers {
                         // One draw for the whole level, however many materials
                         // it uses: the material is a vertex attribute and every
                         // colour map is a layer of one array.
-                        pass.set_pipeline(&self.brush_pipeline.pipeline);
+                        pass.set_pipeline(self.sp_brush(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
                         pass.set_bind_group(2, self.brush_lightmap_bg(), &[]);
                         pass.set_vertex_buffer(0, vb.slice(..));
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..*count, 0, 0..1);
+                        // SEAL THE CRACKS, right after the front faces so depth
+                        // rejects the back faces everywhere except the holes.
+                        // The same buffers stay bound. See `SEAL_BRUSH_CRACKS`.
+                        if crate::renderer::brush_pipeline::SEAL_BRUSH_CRACKS {
+                            pass.set_pipeline(self.sp_brush_seal(stereo));
+                            pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
                     }
                     if !layered_draws.is_empty() {
                         // One material bind for the batch: every cave in a scene
                         // blends the same four terrain layers, so the only thing
                         // that changes between draws is the model matrix.
-                        pass.set_pipeline(&self.layered_mesh_pipeline.pipeline);
+                        pass.set_pipeline(self.sp_layered(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
                         for (model_bg, vb, ib, count) in &layered_draws {
@@ -693,15 +1344,35 @@ impl XrRenderer {
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
                     }
+                    // WATER LAST of the world geometry, and that ordering is
+                    // the whole reason it looks right: it is transparent and
+                    // does not write depth, so everything it is meant to be seen
+                    // THROUGH -- the lake bed, the ground, a sunken crate -- has
+                    // to already be in the buffer. Drawn before them it would
+                    // blend against the sky and the bed would punch straight
+                    // through it.
+                    if !self.water_bodies.is_empty() {
+                        pass.set_pipeline(self.sp_water(stereo));
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        for body in &self.water_bodies {
+                            pass.set_bind_group(1, &body.bind_group, &[]);
+                            pass.set_vertex_buffer(0, body.vertex_buffer.slice(..));
+                            pass.set_index_buffer(
+                                body.index_buffer.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            pass.draw_indexed(0..body.index_count, 0, 0..1);
+                        }
+                    }
                     if !wire_verts.is_empty() {
-                        pass.set_pipeline(&self.wire_pipeline.pipeline);
+                        pass.set_pipeline(self.sp_wire(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_vertex_buffer(0, wire_vb.slice(..));
                         pass.set_index_buffer(wire_ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..wire_idx.len() as u32, 0, 0..1);
                     }
                     if !mesh_draws.is_empty() {
-                        pass.set_pipeline(&self.mesh_pipeline.pipeline);
+                        pass.set_pipeline(self.sp_mesh(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         for (model_bg, tex_bg, lightmap_bg, vb, ib, count) in &mesh_draws {
                             pass.set_bind_group(1, *model_bg, &[]);
@@ -713,7 +1384,7 @@ impl XrRenderer {
                         }
                     }
                     if !skinned_draws.is_empty() {
-                        pass.set_pipeline(&self.skinned_mesh_pipeline.pipeline);
+                        pass.set_pipeline(self.sp_skinned(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         for (model_bg, tex_bg, joint_bg, vb, ib, count) in &skinned_draws {
                             pass.set_bind_group(1, *model_bg, &[]);
@@ -733,22 +1404,172 @@ impl XrRenderer {
                     // pass for nothing. Before the particles because those are
                     // blended and have to land on top of it.
                     {
-                        pass.set_pipeline(&self.sky_pipeline.pipeline);
+                        pass.set_pipeline(self.sp_sky(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.sky.bind_group, &[]);
                         pass.draw(0..3, 0..1);
                     }
                     if !particle_verts.is_empty() {
-                        pass.set_pipeline(&self.particle_pipeline.pipeline);
+                        pass.set_pipeline(self.sp_particle(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_vertex_buffer(0, particle_vb.slice(..));
                         pass.set_index_buffer(particle_ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..particle_idx.len() as u32, 0, 0..1);
                     }
                 }
+                // THE STEREO SCENE PASS LANDS ON ITS OWN.
+                //
+                // It drew both eyes from a uniform holding both cameras, and
+                // everything after it in this frame -- the reflective draws,
+                // the mirror -- is per eye and reads slot 0. Writing the
+                // per-eye uniform before this pass has been SUBMITTED would
+                // replace the cameras it is about to draw with, because a
+                // buffer write lands relative to submits and not to where it
+                // sits in the source.
+                //
+                // So: submit, start a fresh encoder, and only then upload this
+                // eye's own camera. One extra submit a frame, and the ordering
+                // stops being something to remember.
+                if stereo && eye == 0 {
+                    self.wgpu_queue.submit(Some(encoder.finish()));
+                    encoder = self.wgpu_device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor { label: Some("ssr_eye_after_stereo") },
+                    );
+                    self.uniform_buf.upload_scene_with_probes(
+                        &self.wgpu_queue, eye_view_proj, cam_pos, &shadow, &sky_upload,
+                        &post, &self.player, probes_arg,
+                    );
+                }
+                // THE MIP CHAIN, in this encoder, after the pass that filled
+                // mip 0 and before the submit. Anywhere else and a rough
+                // reflection shows the previous frame's world -- which is far
+                // harder to spot as wrong than a missing reflection would be.
+                //
+                // Only when something is going to read it: on the direct path
+                // nothing samples the scene, and downsampling it would be four
+                // full-screen passes producing nothing.
+                if plan.samples_scene_back() {
+                    // The depth copy FIRST: the march, the blit and the mip
+                    // chain all read the single-sampled one, and it is written
+                    // here rather than sampled multisampled per load. See
+                    // `SceneTarget::resolved_depth_view`.
+                    // ONE SLOT ACROSS BOTH, because on a tile GPU the gaps
+                    // between nine small passes are part of what they cost.
+                    let prep = 4 + eye;
+                    self.ssr_pipelines.resolve_depth(
+                        &mut encoder,
+                        &self.scene_targets[eye],
+                        self.pass_timers.as_ref().and_then(|t| t.span_start(prep)),
+                    );
+                    // The min-depth pyramid above it, for the march to descend.
+                    self.ssr_pipelines.build_hi_z(
+                        &mut encoder,
+                        &self.scene_targets[eye],
+                        self.pass_timers.as_ref().and_then(|t| t.span_end(prep)),
+                    );
+                    self.ssr_pipelines.generate_mips(&mut encoder, &self.scene_targets[eye]);
+
+                // THE REFLECTION TRACE AND ITS RESOLVE.
+                //
+                // The same reflective geometry the eye pass draws, marched into
+                // a buffer instead of blended straight onto the surface, and
+                // then filtered ACROSS pixels. That filter is the only place
+                // the hit/miss cliff can be removed: a fragment can see its own
+                // ray and nothing else, and the comb along every silhouette is
+                // confident hits sitting next to rays that correctly found
+                // nothing. Confirmed on the headset 2026-09-18 -- orange
+                // against greyscale with a ragged stepped edge.
+                //
+                // Its own depth attachment, cleared, holding only reflective
+                // geometry. A reflective surface hidden behind a wall may write
+                // here and that is harmless: the composite draws the same
+                // geometry against the real depth buffer and never samples
+                // where it wrote.
+                // BRUSHES ONLY. Reflective SOLIDS still march inline -- the
+                // composite swaps the brush pipeline and nothing else -- so
+                // entering this for a solid-only scene would trace an empty
+                // buffer and filter it for nothing.
+                if self.buffered_reflections && reflective_brushes {
+                    let target = &self.reflection_targets[eye];
+                    // ONE SLOT COVERING BOTH the trace and the resolve, so what
+                    // the buffered path costs is a single number against the
+                    // inline path's march. Slots 6 and 7; appended, never
+                    // inserted, because the others are addressed by index.
+                    //
+                    // ATTACHED TO THE PASS, not called beside it. These RETURN
+                    // the timestamp writes; calling them as bare statements set
+                    // the slot's "written" bit and recorded nothing, so it
+                    // reported a confident 0.00 ms -- which is exactly what a
+                    // pass that never ran would report (2026-09-18).
+                    let refl_slot = 6 + eye;
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("ssr_reflection_trace"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &target.trace_view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    // TRANSPARENT is confidence ZERO, which is
+                                    // "nothing found here" -- the value the
+                                    // resolve treats as a gap to fill. Clearing
+                                    // to anything opaque would have every pixel
+                                    // the geometry misses claim a confident
+                                    // black reflection.
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: Some(
+                                wgpu::RenderPassDepthStencilAttachment {
+                                    view: &target.depth_view,
+                                    depth_ops: Some(wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(1.0),
+                                        // STORED, not discarded: the resolve
+                                        // reads it back as a depth test so it
+                                        // runs only on reflective pixels. That
+                                        // costs one depth store and saves a
+                                        // 25-tap filter across the whole frame.
+                                        store: wgpu::StoreOp::Store,
+                                    }),
+                                    stencil_ops: None,
+                                },
+                            ),
+                            timestamp_writes: self
+                                .pass_timers
+                                .as_ref()
+                                .and_then(|t| t.span_start(refl_slot)),
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        if let Some((vb, ib, count)) = &brush_buffers {
+                            if reflective_brushes {
+                                pass.set_pipeline(&self.brush_ssr_trace_pipeline.pipeline);
+                                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                                pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
+                                pass.set_bind_group(2, self.brush_lightmap_bg(), &[]);
+                                pass.set_bind_group(3, &self.scene_targets[eye].bind_group, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
+                        }
+                    }
+                    self.ssr_pipelines.resolve_reflections(
+                        &mut encoder,
+                        target,
+                        self.pass_timers.as_ref().and_then(|t| t.span_end(refl_slot)),
+                    );
+                }
+                }
                 self.wgpu_queue.submit(Some(encoder.finish()));
             }
 
+            // The scene has already been drawn straight into this image
+            // unless something needs to sample it back. See the scene pass.
+            if !plan.runs_eye_pass() {
+                continue;
+            }
             let color_view = &self.eye_targets[image_index][eye].view;
             let mut encoder = self
                 .wgpu_device
@@ -759,6 +1580,7 @@ impl XrRenderer {
                     label: Some("eye_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: color_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -778,11 +1600,16 @@ impl XrRenderer {
                         }),
                         stencil_ops: None,
                     }),
+                    // Its own slot, so the blit-plus-SSR cost is separable from the scene draw.
+                    timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(eye * 2 + 1)),
                     ..Default::default()
                 });
 
                 pass.set_pipeline(&self.ssr_pipelines.blit_pipeline);
-                pass.set_bind_group(0, &self.scene_targets[eye].bind_group, &[]);
+                // Its OWN bind group: the blit primes the depth everything
+                // after it tests against, and reads the scene pass's depth
+                // directly rather than the march's copy. See `blit_bind_group`.
+                pass.set_bind_group(0, &self.scene_targets[eye].blit_bind_group, &[]);
                 pass.draw(0..3, 0..1);
 
                 if solid_ranges.iter().any(|(_, _, _, r)| *r > 0.0) {
@@ -801,6 +1628,40 @@ impl XrRenderer {
                     }
                 }
 
+                // REFLECTIVE BRUSHES, over the blit.
+                //
+                // Drawn a second time rather than reflecting in the scene pass,
+                // because a pass cannot sample the attachment it is writing.
+                // The first draw is what lands in the buffer this one reads.
+                if reflective_brushes {
+                    if let Some((vb, ib, count)) = &brush_buffers {
+                        // THE COMPOSITE reads the filtered reflection; the
+                        // inline path marches here as it always has. The
+                        // diagnostics stay on the inline path deliberately --
+                        // the false colour is about where a RAY went, and the
+                        // composite has no ray.
+                        let buffered = self.buffered_reflections
+                            && self.debug_view == crate::renderer::brush_pipeline::DebugView::Off;
+                        pass.set_pipeline(match self.debug_view {
+                            _ if buffered => &self.brush_ssr_composite_pipeline.pipeline,
+                            crate::renderer::brush_pipeline::DebugView::Off => &self.brush_ssr_pipeline.pipeline,
+                            crate::renderer::brush_pipeline::DebugView::Sources => &self.brush_ssr_sources_pipeline.pipeline,
+                            crate::renderer::brush_pipeline::DebugView::Ssr => &self.brush_ssr_debug_pipeline.pipeline,
+                        });
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
+                        pass.set_bind_group(2, self.brush_lightmap_bg(), &[]);
+                        pass.set_bind_group(3, if buffered {
+                            &self.reflection_composite_bg[eye]
+                        } else {
+                            &self.scene_targets[eye].bind_group
+                        }, &[]);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                }
+
                 if let Some((vb, ib, count)) = &mirror_quad {
                     pass.set_pipeline(&self.mirror_pipeline.pipeline);
                     pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
@@ -816,11 +1677,50 @@ impl XrRenderer {
             self.wgpu_queue.submit(Some(encoder.finish()));
         }
 
+        // Resolve the pass timers in their own submission, AFTER every pass
+        // this frame has been submitted -- a resolve recorded earlier reads the
+        // queries before they are written and reports the previous frame.
+        if let Some(timers) = &self.pass_timers {
+            let mut encoder = self
+                .wgpu_device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pass_timer_resolve"),
+                });
+            timers.resolve(&mut encoder);
+            self.wgpu_queue.submit(Some(encoder.finish()));
+        }
+
         let cpu_time = cpu_start.elapsed();
         let gpu_wait_start = std::time::Instant::now();
-        self.wgpu_device.poll(wgpu::PollType::Wait);
+        self.wgpu_device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         let gpu_time = gpu_wait_start.elapsed();
-        self.frame_stats.record(cpu_time, gpu_time, std::time::Instant::now());
+        let logged = self.frame_stats.record(cpu_time, gpu_time, std::time::Instant::now());
+        // ONLY on the frames `PERF` prints. `read` maps a buffer and polls,
+        // which stalls the render thread; doing that every frame would make the
+        // instrument change the thing it is measuring.
+        if logged {
+            // Labelled with the phase these frames ran under. The window just
+            // logged was ALL one phase, because the phase only advances here.
+            let ab = if crate::renderer::perf_ab::ENABLED || self.levers.ab_cycle { ab_phase.label() } else { "-" };
+            // And with the levers in force, so a window measured with a
+            // feature switched off from the headset is never read as shipped.
+            let levers = self.levers.summary();
+            // Labelled with the SSR state too, so a window measured while the
+            // switch was flipped mid-session is never read as the other state.
+            let ssr = if self.screen_space_reflections { "on" } else { "off" };
+            match self.pass_timers.as_ref().and_then(|t| t.read(&self.wgpu_device)) {
+                Some(breakdown) => log::info!(
+                    "{} [ab={ab} ssr={ssr} levers={levers}]",
+                    crate::renderer::pass_timers::format_breakdown(&breakdown)
+                ),
+                None => log::info!("PASS: unavailable [ab={ab} ssr={ssr} levers={levers}]"),
+            }
+            // The runtime's view of the same window. See `xr::perf_metrics`.
+            if let Some(metrics) = &self.perf_metrics {
+                log::info!("{} [ab={ab} ssr={ssr} levers={levers}]", crate::perf_metrics_log::format_line(&metrics.sample()));
+            }
+            self.perf_windows += 1;
+        }
         self.swapchain.release_image()?;
 
         let proj_views = eye_views

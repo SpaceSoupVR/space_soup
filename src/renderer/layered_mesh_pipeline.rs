@@ -87,11 +87,25 @@ impl LayeredMeshPipeline {
         uniform_layout: &BindGroupLayout,
         material_layout: &BindGroupLayout,
     ) -> Self {
-        Self::new_with_front_face(device, format, uniform_layout, material_layout, FrontFace::Ccw, 1)
+        Self::new_with_front_face(device, format, uniform_layout, material_layout, FrontFace::Ccw, 1, crate::renderer::multiview::ViewMode::Mono)
     }
 
     /// See `pipeline::SolidPipeline::new_multisampled` -- a pipeline's sample
     /// count must match the pass it runs in, so a 4x eye pass needs its own.
+    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
+    pub fn new_multisampled_stereo(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        material_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
+        Self::new_with_front_face(
+            device, format, uniform_layout, material_layout, FrontFace::Ccw, samples,
+            crate::renderer::multiview::ViewMode::Stereo,
+        )
+    }
+
     pub fn new_multisampled(
         device: &Device,
         format: TextureFormat,
@@ -101,6 +115,7 @@ impl LayeredMeshPipeline {
     ) -> Self {
         Self::new_with_front_face(
             device, format, uniform_layout, material_layout, FrontFace::Ccw, samples,
+            crate::renderer::multiview::ViewMode::Mono,
         )
     }
 
@@ -110,7 +125,7 @@ impl LayeredMeshPipeline {
         uniform_layout: &BindGroupLayout,
         material_layout: &BindGroupLayout,
     ) -> Self {
-        Self::new_with_front_face(device, format, uniform_layout, material_layout, FrontFace::Cw, 1)
+        Self::new_with_front_face(device, format, uniform_layout, material_layout, FrontFace::Cw, 1, crate::renderer::multiview::ViewMode::Mono)
     }
 
     fn new_with_front_face(
@@ -120,10 +135,11 @@ impl LayeredMeshPipeline {
         material_layout: &BindGroupLayout,
         front_face: FrontFace,
         samples: u32,
-    ) -> Self {
+        view: crate::renderer::multiview::ViewMode,
+) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("layered_mesh_shader"),
-            source: ShaderSource::Wgsl(layered_mesh_shader().into()),
+            source: ShaderSource::Wgsl(view.shader(layered_mesh_shader()).into()),
         });
 
         // Structurally identical to the mesh pipeline's model layout, which is
@@ -146,8 +162,8 @@ impl LayeredMeshPipeline {
 
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("layered_mesh_layout"),
-            bind_group_layouts: &[uniform_layout, material_layout, &model_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(uniform_layout), Some(material_layout), Some(&model_layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -157,7 +173,7 @@ impl LayeredMeshPipeline {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[LayeredVertex::layout()],
+                buffers: &[Some(LayeredVertex::layout())],
             },
             fragment: Some(FragmentState {
                 module: &shader,
@@ -182,13 +198,13 @@ impl LayeredMeshPipeline {
             },
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
-            multiview: None,
+            multiview_mask: view.mask(),
             cache: None,
         });
 
@@ -198,7 +214,11 @@ impl LayeredMeshPipeline {
     pub fn create_model_uniform(&self, device: &Device) -> super::mesh_pipeline::ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("layered_mesh_model_uniform"),
-            size: 64,
+            // 80, not 64: ModelUniform carries a mat4 AND a params vec4 whose
+            // x is sky visibility. Every buffer bound to it must be the same
+            // size, or `upload` overruns whichever one was left behind -- which
+            // is a validation error at the first frame, not at build time.
+            size: 80,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -269,7 +289,7 @@ struct VOut {{
 @vertex fn vs_main(v: VIn) -> VOut {{
     let world = model_u.model * vec4<f32>(v.pos, 1.0);
     var out: VOut;
-    out.clip      = camera.view_proj * world;
+    out.clip      = cam_view_proj() * world;
     out.normal    = (model_u.model * vec4<f32>(v.norm, 0.0)).xyz;
     out.world_pos = world.xyz;
     out.weights   = v.weights;
@@ -382,7 +402,7 @@ fn repeat_of(layer: i32) -> f32 {{
     let albedo = albedo_raw * (1.0 + (m - 0.5) * 2.0 * mat.macro_strength);
 
     let lit = shade(in.world_pos, shaded_n);
-    return vec4<f32>(albedo * lit, 1.0);
+    return vec4<f32>(tonemap(albedo * lit), 1.0);
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
@@ -508,6 +528,7 @@ mod tests {
                 intensity: 3.0,
                 range: 50.0,
                 cone_angle_deg: 180.0,
+                inner_cone_angle_deg: 0.0,
             }]);
         } else {
             lights.upload(&queue, &[]);
@@ -523,7 +544,10 @@ mod tests {
             &shot.layers,
             &solid([128, 128, 128, 255]),
             None,
+            None,
             &shot.normals,
+            &[],
+            &[],
             shot.settings,
         );
 
@@ -598,6 +622,7 @@ mod tests {
                 label: Some("layered_test_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &target_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store },
                 })],
@@ -607,6 +632,7 @@ mod tests {
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
+                multiview_mask: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&pipeline.pipeline);
@@ -638,8 +664,8 @@ mod tests {
 
         let slice = readback.slice(..);
         slice.map_async(MapMode::Read, |_| {});
-        device.poll(PollType::Wait).ok();
-        let data = slice.get_mapped_range();
+        device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+        let data = slice.get_mapped_range().unwrap();
         let at = (SIZE / 2) as usize * 256 + (SIZE / 2) as usize * 4;
         Some([data[at], data[at + 1], data[at + 2], data[at + 3]])
     }
@@ -894,7 +920,10 @@ mod tests {
             ],
             &solid([128, 128, 128, 255]),
             None,
+            None,
             &[None, None, None, None],
+            &[],
+            &[],
             TerrainMaterialUniform { macro_strength: 0.0, ..Default::default() },
         );
         let model = pipeline.create_model_uniform(&device);
@@ -949,6 +978,7 @@ mod tests {
                 label: Some("e2e_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &target_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store },
                 })],
@@ -958,6 +988,7 @@ mod tests {
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
+                multiview_mask: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&pipeline.pipeline);
@@ -989,8 +1020,8 @@ mod tests {
 
         let slice = readback.slice(..);
         slice.map_async(MapMode::Read, |_| {});
-        device.poll(PollType::Wait).ok();
-        let data = slice.get_mapped_range();
+        device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+        let data = slice.get_mapped_range().unwrap();
         let mut out = Vec::with_capacity((size * size) as usize);
         for y in 0..size as usize {
             for x in 0..size as usize {
@@ -1061,15 +1092,23 @@ mod tests {
             scene_uniforms(&device, &lights);
         let material_layout = material_bind_group_layout(&device);
 
-        device.push_error_scope(ErrorFilter::Validation);
+        let err_scope_1 = device.push_error_scope(ErrorFilter::Validation);
         let _a = LayeredMeshPipeline::new(
             &device, TextureFormat::Rgba8Unorm, &uniforms.layout, &material_layout,
         );
         let _b = LayeredMeshPipeline::new_mirror(
             &device, TextureFormat::Rgba8Unorm, &uniforms.layout, &material_layout,
         );
-        if let Some(err) = pollster::block_on(device.pop_error_scope()) {
+        if let Some(err) = pollster::block_on(err_scope_1.pop()) {
             panic!("layered mesh pipeline failed validation: {err}");
         }
     }
+}
+
+// Scene shader sources, for `multiview::every_scene_shader_survives_the_multiview_transform`.
+// Test-only: the gate has to see exactly the text each pipeline is built from,
+// and nothing on a development machine can build a multiview pipeline to check.
+#[cfg(test)]
+pub fn layered_mesh_shader_src() -> String {
+    layered_mesh_shader()
 }

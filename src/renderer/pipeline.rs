@@ -23,6 +23,43 @@ pub fn lightmap_bind_group_layout(device: &Device) -> BindGroupLayout {
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
+            // The bounce DIRECTION map, sharing the lightmap's layout texel for
+            // texel. Declared for every lightmap consumer, not only brushes:
+            // wgpu deduplicates structurally identical bind group layouts, and
+            // this renderer has already been bitten once by two layouts that
+            // looked interchangeable and quietly stopped being so -- the avatar
+            // stopped casting shadows and nothing errored. One layout, one
+            // shape, and shaders that do not want the map simply never sample
+            // it.
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // The brush SUN MASK and its sampler, on every lightmap for the
+            // same one-layout reason as the direction map above. Only the brush
+            // shader samples them; see `create_lightmap_texture_with_sun`.
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
@@ -37,7 +74,10 @@ pub struct WirePipeline {
 
 impl SolidPipeline {
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
-        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Ccw, 1)
+        Self::new_with_front_face(
+            device, format, uniform_layout, FrontFace::Ccw, 1,
+            crate::renderer::multiview::ViewMode::Mono,
+        )
     }
 
     /// Same pipeline, built for a multisampled target.
@@ -53,11 +93,30 @@ impl SolidPipeline {
         uniform_layout: &BindGroupLayout,
         samples: u32,
     ) -> Self {
-        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Ccw, samples)
+        Self::new_with_front_face(
+            device, format, uniform_layout, FrontFace::Ccw, samples,
+            crate::renderer::multiview::ViewMode::Mono,
+        )
+    }
+
+    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
+    pub fn new_multisampled_stereo(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
+        Self::new_with_front_face(
+            device, format, uniform_layout, FrontFace::Ccw, samples,
+            crate::renderer::multiview::ViewMode::Stereo,
+        )
     }
 
     pub fn new_mirror(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
-        Self::new_with_front_face(device, format, uniform_layout, FrontFace::Cw, 1)
+        Self::new_with_front_face(
+            device, format, uniform_layout, FrontFace::Cw, 1,
+            crate::renderer::multiview::ViewMode::Mono,
+        )
     }
 
     fn new_with_front_face(
@@ -66,16 +125,17 @@ impl SolidPipeline {
         uniform_layout: &BindGroupLayout,
         front_face: FrontFace,
         samples: u32,
+        view: crate::renderer::multiview::ViewMode,
     ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("solid_shader"),
-            source: ShaderSource::Wgsl(solid_shader().into()),
+            source: ShaderSource::Wgsl(view.shader(solid_shader()).into()),
         });
         let lightmap_layout = lightmap_bind_group_layout(device);
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("solid_layout"),
-            bind_group_layouts: &[uniform_layout, &lightmap_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(uniform_layout), Some(&lightmap_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("solid_pipeline"),
@@ -84,7 +144,7 @@ impl SolidPipeline {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[SolidVertex::layout()],
+                buffers: &[Some(SolidVertex::layout())],
             },
             fragment: Some(FragmentState {
                 module: &shader,
@@ -105,13 +165,13 @@ impl SolidPipeline {
             },
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
-            multiview: None,
+            multiview_mask: view.mask(),
             cache: None,
         });
         Self {
@@ -130,17 +190,16 @@ impl SolidPipeline {
         ssr_scene_layout: &BindGroupLayout,
         // Must match the scene target's depth sample count -- see
         // `ssr::SsrPipelines::new_with_depth_samples`.
-        ms_scene_depth: bool,
     ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("solid_ssr_shader"),
-            source: ShaderSource::Wgsl(solid_ssr_shader(ms_scene_depth).into()),
+            source: ShaderSource::Wgsl(solid_ssr_shader().into()),
         });
         let lightmap_layout = lightmap_bind_group_layout(device);
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("solid_ssr_layout"),
-            bind_group_layouts: &[uniform_layout, &lightmap_layout, ssr_camera_layout, ssr_scene_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(uniform_layout), Some(&lightmap_layout), Some(ssr_camera_layout), Some(ssr_scene_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("solid_ssr_pipeline"),
@@ -149,7 +208,7 @@ impl SolidPipeline {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[SolidVertex::layout()],
+                buffers: &[Some(SolidVertex::layout())],
             },
             fragment: Some(FragmentState {
                 module: &shader,
@@ -170,13 +229,13 @@ impl SolidPipeline {
             },
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: CompareFunction::LessEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::LessEqual),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         Self {
@@ -193,19 +252,41 @@ impl WirePipeline {
 
     /// See `SolidPipeline::new_multisampled`.
     pub fn new_multisampled(
+
         device: &Device,
         format: TextureFormat,
         uniform_layout: &BindGroupLayout,
         samples: u32,
     ) -> Self {
+        Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Mono)
+    }
+
+    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
+    pub fn new_multisampled_stereo(
+
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
+        Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Stereo)
+    }
+
+    fn new_with_view(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("wire_shader"),
-            source: ShaderSource::Wgsl(WIRE_SHADER.into()),
+            source: ShaderSource::Wgsl(view.shader(WIRE_SHADER.to_string()).into()),
         });
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("wire_layout"),
-            bind_group_layouts: &[uniform_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(uniform_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("wire_pipeline"),
@@ -214,7 +295,7 @@ impl WirePipeline {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[WireVertex::layout()],
+                buffers: &[Some(WireVertex::layout())],
             },
             fragment: Some(FragmentState {
                 module: &shader,
@@ -234,13 +315,13 @@ impl WirePipeline {
             },
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::LessEqual),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
-            multiview: None,
+            multiview_mask: view.mask(),
             cache: None,
         });
         Self { pipeline }
@@ -270,7 +351,7 @@ struct VOut {{
 
 @vertex fn vs_main(v: VIn) -> VOut {{
     var out: VOut;
-    out.clip      = camera.view_proj * vec4<f32>(v.pos, 1.0);
+    out.clip      = cam_view_proj() * vec4<f32>(v.pos, 1.0);
     out.col       = v.col;
     out.normal    = v.norm;
     out.world_pos = v.pos;
@@ -280,6 +361,8 @@ struct VOut {{
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
+    // The baked lamps are in this lightmap. See `receiver_skips_baked`.
+    receiver_skips_baked = true;
     let lit = shade(in.world_pos, n);
     let lightmap = textureSample(lm_tex, lm_samp, in.uv2).rgb;
     return vec4<f32>(in.col.rgb * lit * lightmap, in.col.a);
@@ -289,7 +372,7 @@ struct VOut {{
     )
 }
 
-fn solid_ssr_shader(ms_scene_depth: bool) -> String {
+fn solid_ssr_shader() -> String {
     format!(
         r#"
 // Group 0 -- the camera, the lights and both shadow maps -- is declared by
@@ -321,7 +404,7 @@ struct VOut {{
 
 @vertex fn vs_main(v: VIn) -> VOut {{
     var out: VOut;
-    out.clip         = camera.view_proj * vec4<f32>(v.pos, 1.0);
+    out.clip         = cam_view_proj() * vec4<f32>(v.pos, 1.0);
     out.col          = v.col;
     out.normal       = v.norm;
     out.world_pos    = v.pos;
@@ -332,15 +415,19 @@ struct VOut {{
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
+    // The baked lamps are in this lightmap. See `receiver_skips_baked`.
+    receiver_skips_baked = true;
     let lit = shade(in.world_pos, n);
     let lightmap = textureSample(lm_tex, lm_samp, in.uv2).rgb;
     let base = in.col.rgb * lit * lightmap;
-    let reflected = ssr_reflect(in.world_pos, n, base, in.reflectivity);
+    // A cuboid has no roughness map, so it reflects sharply and falls back to
+    // its own colour -- the behaviour it had before the chain existed.
+    let reflected = ssr_reflect(in.world_pos, n, base, in.reflectivity, 0.0);
     return vec4<f32>(reflected, in.col.a);
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
-        ssr_block = wgsl_ssr_block(2, 3, ms_scene_depth)
+        ssr_block = wgsl_ssr_block(2, 3)
     )
 }
 
@@ -352,14 +439,26 @@ struct VOut {{
 // one. (It did, once. Nothing on this machine built the wire pipeline on a real
 // device, so it went unnoticed until a test did.)
 const WIRE_SHADER: &str = r#"
-struct Uniforms { view_proj: mat4x4<f32> }
+// ONE MATRIX PER EYE, like every other scene shader, even though this one
+// carries no lights block. It used to declare a single `mat4x4` and read the
+// front of the buffer, which is the left eye's -- correct while both slots hold
+// the same matrix, and the RIGHT EYE DRAWN WITH THE LEFT EYE'S PROJECTION the
+// moment a multiview pass gives them different ones. In std140 an array of
+// mat4x4 is laid out as consecutive mat4x4, so slot 0 is the same bytes this
+// read before and the single-view path is unchanged.
+struct Uniforms { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> u: Uniforms;
+// DECLARED HERE because this shader carries no lights block, which is where
+// every other scene shader gets it. 0 is the left eye, which is what a
+// single-view pass wants; `as_multiview` assigns the real one per view and
+// leaves this declaration alone.
+var<private> view_slot: i32 = 0;
 
 struct VIn  { @location(0) pos: vec3<f32>, @location(1) col: vec4<f32> }
 struct VOut { @builtin(position) clip: vec4<f32>, @location(0) col: vec4<f32> }
 
 @vertex fn vs_main(v: VIn) -> VOut {
-    var p = u.view_proj * vec4<f32>(v.pos, 1.0);
+    var p = u.view_proj[view_slot] * vec4<f32>(v.pos, 1.0);
     p.z -= 0.0001 * p.w;
     return VOut(p, v.col);
 }
@@ -367,7 +466,7 @@ struct VOut { @builtin(position) clip: vec4<f32>, @location(0) col: vec4<f32> }
 "#;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::renderer::lights::LightsUniform;
     use crate::renderer::ssr::SsrPipelines;
@@ -375,6 +474,7 @@ mod tests {
     pub(crate) fn headless_gpu() -> Option<(Device, Queue)> {
         let instance = Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            apply_limit_buckets: false,
             power_preference: PowerPreference::default(),
             compatible_surface: None,
             force_fallback_adapter: false,
@@ -407,7 +507,6 @@ mod tests {
             &uniform_buf.layout,
             ssr_pipelines.camera_layout(),
             ssr_pipelines.scene_texture_layout(),
-            false,
         );
     }
 
@@ -431,7 +530,7 @@ mod tests {
         // 4 only. WebGPU guarantees [1, 4] for a colour format and nothing
         // else -- 2x needs an optional adapter feature, which is why
         // `MsaaLevel` does not offer it. This test is where that was found.
-        device.push_error_scope(ErrorFilter::Validation);
+        let err_scope_1 = device.push_error_scope(ErrorFilter::Validation);
         for samples in [4u32] {
             let _solid = SolidPipeline::new_multisampled(&device, format, &u.layout, samples);
             let _wire = WirePipeline::new_multisampled(&device, format, &u.layout, samples);
@@ -461,17 +560,18 @@ mod tests {
             let ssr = SsrPipelines::new_with_depth_samples(&device, format, samples);
             let _target =
                 ssr.create_scene_target_multisampled(&device, format, 16, 16, samples);
+            // Single-sampled whatever the scene pass runs at: everything that
+            // reads depth now reads the resolved copy.
             let _ssr_solid = SolidPipeline::new_ssr(
                 &device,
                 format,
                 &u.layout,
                 ssr.camera_layout(),
                 ssr.scene_texture_layout(),
-                true,
             );
         }
         let _ = &queue;
-        if let Some(err) = pollster::block_on(device.pop_error_scope()) {
+        if let Some(err) = pollster::block_on(err_scope_1.pop()) {
             panic!("a multisampled pipeline failed validation: {err}");
         }
     }
@@ -510,13 +610,14 @@ mod msaa_tests {
         lights.upload(&queue, &[]);
 
         let pipeline = SolidPipeline::new_multisampled(&device, format, &u.layout, samples);
-        let white = crate::renderer::mesh::create_texture_from_rgba(
+        let white = crate::renderer::mesh::create_lightmap_texture(
             &device,
             &queue,
             &lightmap_bind_group_layout(&device),
             &[255u8, 255, 255, 255],
             1,
             1,
+            None,
         );
 
         // A triangle with one edge at a shallow angle -- the case where a
@@ -595,6 +696,7 @@ mod msaa_tests {
                 label: Some("msaa_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view,
+                    depth_slice: None,
                     resolve_target,
                     ops: Operations { load: LoadOp::Clear(Color::BLACK), store },
                 })],
@@ -604,6 +706,7 @@ mod msaa_tests {
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
+                multiview_mask: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&pipeline.pipeline);
@@ -634,8 +737,8 @@ mod msaa_tests {
 
         let slice = readback.slice(..);
         slice.map_async(MapMode::Read, |_| {});
-        device.poll(PollType::Wait).ok();
-        let data = slice.get_mapped_range();
+        device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+        let data = slice.get_mapped_range().unwrap();
         let mut out = Vec::with_capacity((SIZE * SIZE) as usize);
         for y in 0..SIZE as usize {
             for x in 0..SIZE as usize {
@@ -744,3 +847,18 @@ mod msaa_tests {
     }
 }
 
+// Scene shader sources, for `multiview::every_scene_shader_survives_the_multiview_transform`.
+// Test-only: the gate has to see exactly the text each pipeline is built from,
+// and nothing on a development machine can build a multiview pipeline to check.
+#[cfg(test)]
+pub fn solid_shader_src() -> String {
+    solid_shader()
+}
+#[cfg(test)]
+pub fn solid_ssr_shader_src() -> String {
+    solid_ssr_shader()
+}
+#[cfg(test)]
+pub fn wire_shader_src() -> String {
+    WIRE_SHADER.to_string()
+}
