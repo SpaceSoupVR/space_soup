@@ -433,7 +433,7 @@ pub fn create_lightmap_texture_with_sun(
 }
 
 /// `create_lightmap_texture_with_sun`, with the STATIONARY lamps' shadow masks:
-/// one RGBA8 image per four lamps, all the same size, at `STATIONARY_MASK_SCALE`
+/// one RGBA8 image per two lamps, all the same size, at `STATIONARY_MASK_SCALE`
 /// times the lightmap's density on its charts. `None` binds the neutral mask,
 /// under which every stationary lamp is unshadowed.
 #[allow(clippy::too_many_arguments)]
@@ -681,6 +681,18 @@ fn upload_rgba8_array_mipped(
     (texture, view)
 }
 
+/// A sun-mask texel as the GPU holds it: two channels, to halve the mask's
+/// memory. Red is the baker's signed distance as it stands. Green folds the
+/// baker's other two channels into one: under a half, not baked (the neutral
+/// mask); from a half up, baked, with the sun's penumbra half-width -- the
+/// baker's blue -- across the upper half. The brush shader reads it back that
+/// way. The upload used to keep red and green and drop blue, so the penumbra
+/// the baker measured never reached the shader and every sun shadow was drawn
+/// razor sharp.
+pub(crate) fn pack_sun_mask_texel(p: &[u8]) -> [u8; 2] {
+    [p[0], if p[1] >= 128 { 128 + p[2] / 2 } else { 0 }]
+}
+
 fn upload_rg8_mipped(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -703,7 +715,7 @@ fn upload_rg8_mipped(
         view_formats: &[],
     });
     for (level, (data, lw, lh)) in chain.iter().enumerate() {
-        let rg: Vec<u8> = data.chunks_exact(4).flat_map(|p| [p[0], p[1]]).collect();
+        let rg: Vec<u8> = data.chunks_exact(4).flat_map(pack_sun_mask_texel).collect();
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -839,6 +851,30 @@ mod transmission_tests {
     #[test]
     fn a_blended_material_still_uses_its_own_alpha() {
         assert!((blocks_light(true, 0.0, 0.3) - 0.3).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod sun_mask_packing_tests {
+    use super::*;
+
+    /// The baker writes the sun's penumbra in BLUE, and the GPU holds two
+    /// channels. It must arrive -- it used to be dropped -- and decode, as
+    /// the brush shader decodes green, to what the baker wrote.
+    #[test]
+    fn the_sun_penumbra_survives_the_two_channel_upload() {
+        let range = crate::renderer::brush_pipeline::SUN_MASK_DISTANCE_TEXELS;
+        for blue in [0u8, 1, 64, 128, 200, 255] {
+            let [r, g] = pack_sun_mask_texel(&[77, 255, blue, 255]);
+            assert_eq!(r, 77, "the distance must pass through untouched");
+            let g = g as f32 / 255.0;
+            assert!(g > 0.25, "a baked texel read as unbaked");
+            let decoded = (g - 0.5).max(0.0) * 2.0 * range;
+            let written = blue as f32 / 255.0 * range;
+            assert!((decoded - written).abs() < 0.04, "blue {blue}: baked {written}, the shader reads {decoded}");
+        }
+        let [_, g] = pack_sun_mask_texel(&NEUTRAL_SUN_MASK);
+        assert!((g as f32 / 255.0) < 0.25, "the neutral mask read as baked");
     }
 }
 
