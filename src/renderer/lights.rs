@@ -1583,7 +1583,19 @@ fn probe_environment(
     // THE ARRAY LAYER, not the loop slot, is what a cube is read from: the
     // array holds every probe the level baked, the loop walks only the ones
     // resident near the player. See `ProbeUpload::boxes`.
-    let hit = probe_trace(world_pos, d, best_room, roughness);
+    // A SURFACE IN A DOORWAY -- the threshold, a jamb, the lintel -- lies in
+    // no room, and the only box that contains it is the outdoor volume's,
+    // which surrounds the whole level. Traced from there, its reflection met
+    // open sky: the marble strip where the hall meets the hallway reflected
+    // nothing at all (headset, 2026-09-27 19:09). A face inside a doorway's
+    // carve that no room claims is traced from the doorway, which is what
+    // `probe_trace` does with a room of -1.
+    var trace_room = best_room;
+    if (probe_portal_holding(volume_world) >= 0 && (best < 0 || probe_seen_distance(best, d) < 0.0)) {{
+        trace_room = -1.0;
+    }}
+    probe_eye_distance = distance(cam_pos(), frag_pos);
+    let hit = probe_trace(world_pos, d, trace_room, roughness);
     if (hit.found) {{
         var col = probe_hit_colour(hit.pos, hit.room, hit.other, roughness, hit.t);
         if (hit.escaped) {{
@@ -1607,6 +1619,24 @@ fn probe_environment(
                     }}
                     col = mix(col, beyond, hit.rim);
                 }}
+            }}
+        }}
+        // ACROSS A SOLID PROXY'S OUTLINE, the footprint's two parts: the
+        // proxy, and what lies past it, by how much of the footprint the
+        // proxy covers. See `probe_proxy_hit`.
+        if (hit.edge >= 0) {{
+            if (hit.edge_hit) {{
+                let past = probe_trace_skipping(world_pos, d, trace_room, roughness, hit.edge);
+                if (past.found) {{
+                    var beyond = probe_hit_colour(past.pos, past.room, past.other, roughness, past.t);
+                    if (past.escaped) {{
+                        beyond = probe_escape_colour(past.pos, d, past.room, past.other, past.portal, dir, probe_lod);
+                    }}
+                    col = mix(beyond, col, hit.edge_cover);
+                }}
+            }} else {{
+                let proxy_col = probe_hit_colour(hit.edge_pos, hit.edge_room, -1.0, roughness, hit.edge_t);
+                col = mix(col, proxy_col, hit.edge_cover);
             }}
         }}
         return col;
@@ -1700,6 +1730,31 @@ struct ProbeHit {{
     rim_pos: vec3<f32>,
     rim_room: f32,
     rim_t: f32,
+    // A SOLID PROXY'S OUTLINE INSIDE THE FOOTPRINT, the first one the ray
+    // passed: which proxy (-1 for none), how much of the footprint it covers
+    // there (0..1), whether this ray hit it, and where its outline is along
+    // the ray. See `probe_proxy_hit` and `probe_environment`.
+    edge: i32,
+    edge_cover: f32,
+    edge_hit: bool,
+    edge_pos: vec3<f32>,
+    edge_room: f32,
+    edge_t: f32,
+}}
+
+// How far the eye is from the surface being shaded, for the footprint of a
+// reflection. Set by `probe_environment` before it traces.
+var<private> probe_eye_distance: f32 = 1.0;
+
+// What `probe_proxy_hit` found: the nearest entry (3.4e38 for none) and which
+// proxy it was, and the first SOLID proxy whose outline the ray passes within
+// its footprint of -- see `ProbeHit::edge`.
+struct ProbeProxyHit {{
+    t: f32,
+    index: i32,
+    edge: i32,
+    edge_cover: f32,
+    edge_t: f32,
 }}
 
 // THE REFLECTION LOBE'S WIDTH, as the tangent of its half-angle at half
@@ -1857,11 +1912,17 @@ fn probe_quat_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {{
 // something standing in `room` -- a pillar, a lamp; 3.4e38 where nothing is.
 // See `ProbeProxy`. A ray starting on or inside a proxy (the proxy's own
 // surface reflecting) leaves it rather than hitting it.
-fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32) -> f32 {{
+fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip: i32, lobe: f32) -> ProbeProxyHit {{
+    var out: ProbeProxyHit;
+    out.t = 3.4e38;
+    out.index = -1;
+    out.edge = -1;
+    out.edge_cover = 0.0;
+    out.edge_t = 0.0;
     var best = 3.4e38;
     let n = i32(camera.proxy_params.x);
     for (var i = 0; i < n; i = i + 1) {{
-        if (camera.probe_proxies[i * 3].w != room) {{
+        if (camera.probe_proxies[i * 3].w != room || i == skip) {{
             continue;
         }}
         let q = camera.probe_proxies[i * 3 + 2];
@@ -1872,8 +1933,44 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32) -> f
         let inv = 1.0 / select(vec3<f32>(1e-9), ld, abs(ld) > vec3<f32>(1e-9));
         let a = (-half - lo) * inv;
         let b = (half - lo) * inv;
-        let near = max(max(min(a.x, b.x), min(a.y, b.y)), min(a.z, b.z));
-        let far = min(min(max(a.x, b.x), max(a.y, b.y)), max(a.z, b.z));
+        let lows = min(a, b);
+        let highs = max(a, b);
+        let near = max(max(lows.x, lows.y), lows.z);
+        let far = min(min(highs.x, highs.y), highs.z);
+        // HOW NEAR THE OUTLINE, for a solid proxy -- a brush piece, the pillar.
+        // `far - near` is how long the ray spends inside the box, and turned
+        // sideways across the edge where the entering and leaving faces meet
+        // it is how far inside the outline the ray passes (negative: how far
+        // outside). One ray per pixel makes that outline a hard step that
+        // crawls as the head moves -- the column's edge rippling in the back
+        // wall's reflection (headset, 2026-09-27) -- so within the footprint
+        // (a pixel's width there, or the lobe's, whichever is wider) it is
+        // blended instead. The first such outline along the ray is kept.
+        if (camera.probe_proxies[i * 3 + 1].w < 0.5 && out.edge < 0) {{
+            var ax_in = 2;
+            if (lows.x >= lows.y && lows.x >= lows.z) {{
+                ax_in = 0;
+            }} else if (lows.y >= lows.z) {{
+                ax_in = 1;
+            }}
+            var ax_out = 2;
+            if (highs.x <= highs.y && highs.x <= highs.z) {{
+                ax_out = 0;
+            }} else if (highs.y <= highs.z) {{
+                ax_out = 1;
+            }}
+            let da = abs(ld[ax_in]);
+            let db = abs(ld[ax_out]);
+            let across = select(da * db / max(sqrt(da * da + db * db), 1e-6), 1.0, ax_in == ax_out);
+            let inside = (far - near) * across;
+            let t_edge = max(0.5 * (near + far), t0);
+            let footprint = max(t_edge * lobe, pixel_footprint * (1.0 + t_edge / max(probe_eye_distance, 0.05)));
+            if (abs(inside) < footprint && t_edge > t0 && t_edge < t1 && far > t0 + 1e-3) {{
+                out.edge = i;
+                out.edge_cover = smoothstep(-footprint, footprint, inside);
+                out.edge_t = t_edge;
+            }}
+        }}
         // `far` past the origin: the ray is headed into the box, or starts in
         // it. A ray starting ON a proxy's surface and leaving it has `far` at
         // the origin, and is the proxy's own reflection, not a hit.
@@ -1887,12 +1984,18 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32) -> f
                 // end of the hall in a line along the junction (offline_frame,
                 // 2026-09-27).
                 best = t_in;
+                out.index = i;
             }} else {{
-                best = min(best, probe_proxy_surface(o, d, t_in, min(far, t1), room, camera.probe_proxies[i * 3].xyz));
+                let t_surface = probe_proxy_surface(o, d, t_in, min(far, t1), room, camera.probe_proxies[i * 3].xyz);
+                if (t_surface < best) {{
+                    best = t_surface;
+                    out.index = i;
+                }}
             }}
         }}
     }}
-    return best;
+    out.t = best;
+    return out;
 }}
 
 // WHERE INSIDE A MODEL'S BOX the model itself is, between `t_in` and `t_out`;
@@ -2005,6 +2108,12 @@ fn probe_portal_holding(p: vec3<f32>) -> i32 {{
 // Rough surfaces skip it: their lobe is too wide for one hit point to mean
 // anything, and the box projection is the better average.
 fn probe_trace(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness: f32) -> ProbeHit {{
+    return probe_trace_skipping(world_pos, d, room, roughness, -1);
+}}
+
+// `probe_trace`, as though proxy `skip` were not there: the far side of an
+// outline the lobe straddles. See `ProbeHit::edge`.
+fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness: f32, skip: i32) -> ProbeHit {{
     var hit: ProbeHit;
     hit.pos = vec3<f32>(0.0);
     hit.room = -1.0;
@@ -2018,6 +2127,12 @@ fn probe_trace(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness: f32) ->
     hit.rim_pos = vec3<f32>(0.0);
     hit.rim_room = -1.0;
     hit.rim_t = 0.0;
+    hit.edge = -1;
+    hit.edge_cover = 0.0;
+    hit.edge_hit = false;
+    hit.edge_pos = vec3<f32>(0.0);
+    hit.edge_room = -1.0;
+    hit.edge_t = 0.0;
     let lobe = probe_lobe_tan(roughness);
     // `portal_params.y`: switched off by `perf_ab` measuring it.
     if (roughness > PROBE_TRACE_MAX_ROUGHNESS || camera.portal_params.y > 0.5) {{
@@ -2107,7 +2222,16 @@ fn probe_trace(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness: f32) ->
             t_exit = far.y;
         }}
         t_exit = t0 + t_exit;
-        let t_obj = probe_proxy_hit(o, d, cur, t0, t_exit);
+        let proxy = probe_proxy_hit(o, d, cur, t0, t_exit, skip, lobe);
+        let t_obj = proxy.t;
+        if (hit.edge < 0 && proxy.edge >= 0) {{
+            hit.edge = proxy.edge;
+            hit.edge_cover = proxy.edge_cover;
+            hit.edge_hit = t_obj < t_exit && proxy.index == proxy.edge;
+            hit.edge_pos = o + d * proxy.edge_t;
+            hit.edge_room = cur;
+            hit.edge_t = proxy.edge_t;
+        }}
         if (t_obj < t_exit) {{
             hit.pos = o + d * t_obj;
             hit.room = cur;
@@ -2191,11 +2315,57 @@ fn probe_trace(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness: f32) ->
     return hit;
 }}
 
-// How far past a doorway what a reflection sees out there is taken to be:
-// terrain and trees metres to tens of metres off. Sets only the parallax
-// between the photograph's capture point and the ray; the sky is at infinity
-// either way.
+// How far past a doorway what a reflection sees out there is taken to be when
+// nothing nearer is found: the sky, and ground past the photograph's depth.
+// Sets only the parallax between the photograph's capture point and the ray;
+// the sky is at infinity either way.
 const PROBE_ESCAPE_DISTANCE: f32 = 30.0;
+// Steps the escape march takes, doubling from half a metre: out to 32 m.
+const PROBE_ESCAPE_STEPS: i32 = 7;
+const PROBE_ESCAPE_BISECTIONS: i32 = 3;
+
+// WHERE A RAY THAT LEFT THE ROOMS MEETS THE OUTDOORS, from what photograph
+// `slot` saw through the opening. Marched outward from the doorway's outer
+// face `e` in doubling steps until the ray passes behind the photographed
+// surface -- the ground, the hill -- then bisected onto it.
+//
+// It used to be a fixed 30 m. The marble ceiling's reflection of the front
+// door looks DOWN through it at grass a few metres outside, and read the
+// photograph toward a point 30 m on and 13 m underground; the floor's looks up
+// at the hill, and read it past the hill (headset, 2026-09-27: the door
+// reflections showed neither terrain nor sky). Sky never stops the march,
+// which then lands at `PROBE_ESCAPE_DISTANCE` as before.
+fn probe_escape_hit(e: vec3<f32>, d: vec3<f32>, slot: i32) -> vec3<f32> {{
+    let c = camera.probe_boxes[slot * 3].xyz;
+    var t_lo = 0.0;
+    var t_hi = PROBE_ESCAPE_DISTANCE;
+    var t = 0.5;
+    var met = false;
+    for (var k = 0; k < PROBE_ESCAPE_STEPS; k = k + 1) {{
+        let v = e + d * t - c;
+        let seen = probe_seen_distance(slot, v);
+        if (seen >= 0.0 && seen < length(v)) {{
+            t_hi = t;
+            met = true;
+            break;
+        }}
+        t_lo = t;
+        t = t * 2.0;
+    }}
+    if (met) {{
+        for (var k = 0; k < PROBE_ESCAPE_BISECTIONS; k = k + 1) {{
+            let tm = 0.5 * (t_lo + t_hi);
+            let v = e + d * tm - c;
+            let seen = probe_seen_distance(slot, v);
+            if (seen >= 0.0 && seen < length(v)) {{
+                t_hi = tm;
+            }} else {{
+                t_lo = tm;
+            }}
+        }}
+    }}
+    return e + d * t_hi;
+}}
 
 // THE COLOUR OF A REFLECTION THAT LEFT THE ROOMS through doorway `p` at `e`,
 // heading `d`: what is out there is far, so it is read by direction, from a
@@ -2242,13 +2412,20 @@ fn probe_escape_colour(e: vec3<f32>, d: vec3<f32>, room: f32, other: f32, p: i32
         }}
     }}
     if (best >= 0) {{
+        let c = camera.probe_boxes[best * 3].xyz;
         return textureSampleLevel(
-            probe_cube, probe_samp, far_point - camera.probe_boxes[best * 3].xyz, i32(camera.probe_boxes[best * 3].w), lod
+            probe_cube, probe_samp, probe_escape_hit(e, d, best) - c, i32(camera.probe_boxes[best * 3].w), lod
         );
+    }}
+    // The outdoor photograph has no depth to march. A ray heading down meets
+    // the ground near the building at about the doorway's own floor level.
+    var t_out = PROBE_ESCAPE_DISTANCE;
+    if (d.y < -1e-4) {{
+        t_out = clamp((plo.y - e.y) / d.y, 0.0, PROBE_ESCAPE_DISTANCE);
     }}
     let oslot = probe_room_slot(other);
     let out = textureSampleLevel(
-        probe_cube, probe_samp, far_point - camera.probe_boxes[oslot * 3].xyz, i32(camera.probe_boxes[oslot * 3].w), lod
+        probe_cube, probe_samp, e + d * t_out - camera.probe_boxes[oslot * 3].xyz, i32(camera.probe_boxes[oslot * 3].w), lod
     );
     let a = clamp(out.a, 0.0, 1.0);
     return vec4<f32>(out.rgb * a + environment_radiance(sky_dir) * (1.0 - a), 1.0);
@@ -4337,6 +4514,11 @@ mod probe_trace_gpu_tests {
         /// How much of the lobe passes through a doorway's rim, -1 for none.
         rim: f32,
         rim_went_through: bool,
+        /// A solid proxy's outline within the footprint: its index or -1, how
+        /// much of the footprint it covers, and whether the ray hit it.
+        edge: i32,
+        edge_cover: f32,
+        edge_hit: bool,
     }
 
     /// Trace each `(origin, room, dir, roughness)` through `probe_trace`.
@@ -4404,9 +4586,10 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let o = rays[id.x * 2u];
     let d = rays[id.x * 2u + 1u];
     let h = probe_trace(o.xyz, normalize(d.xyz), o.w, d.w);
-    hits[id.x * 3u] = vec4<f32>(h.pos, select(0.0, 1.0, h.found));
-    hits[id.x * 3u + 1u] = vec4<f32>(h.room, h.other, select(0.0, 1.0, h.escaped), f32(h.portal));
-    hits[id.x * 3u + 2u] = vec4<f32>(h.rim, select(0.0, 1.0, h.rim_went_through), h.t, h.rim_t);
+    hits[id.x * 4u] = vec4<f32>(h.pos, select(0.0, 1.0, h.found));
+    hits[id.x * 4u + 1u] = vec4<f32>(h.room, h.other, select(0.0, 1.0, h.escaped), f32(h.portal));
+    hits[id.x * 4u + 2u] = vec4<f32>(h.rim, select(0.0, 1.0, h.rim_went_through), h.t, h.rim_t);
+    hits[id.x * 4u + 3u] = vec4<f32>(f32(h.edge), h.edge_cover, select(0.0, 1.0, h.edge_hit), h.edge_t);
 }
 "#
         );
@@ -4436,7 +4619,7 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
             contents: bytemuck::cast_slice(&packed),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let size = (rays.len() * 3 * 16) as u64;
+        let size = (rays.len() * 4 * 16) as u64;
         let hit_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hits"),
             size,
@@ -4495,7 +4678,7 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         let data: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().ok()?).to_vec();
         Some(
-            data.chunks(3)
+            data.chunks(4)
                 .map(|c| Hit {
                     pos: Vec3::new(c[0][0], c[0][1], c[0][2]),
                     found: c[0][3] > 0.5,
@@ -4504,6 +4687,9 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
                     escaped: c[1][2] > 0.5,
                     rim: c[2][0],
                     rim_went_through: c[2][1] > 0.5,
+                    edge: c[3][0].round() as i32,
+                    edge_cover: c[3][1],
+                    edge_hit: c[3][2] > 0.5,
                 })
                 .collect(),
         )
@@ -4604,5 +4790,36 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
         assert!(h[1].room == 1.0, "inside the door the ray goes on into the hallway: room {}", h[1].room);
         assert!(h[2].rim < 0.0, "marble softened a doorway's rim: {}", h[2].rim);
         assert!(h[3].rim < 0.0, "a plain wall has no rim: {}", h[3].rim);
+    }
+
+    /// THE PILLAR'S OUTLINE IN A REFLECTION IS BLENDED, NOT STEPPED.
+    ///
+    /// One ray per pixel decides hit or miss at the pillar's edge, so the
+    /// edge crawls as the head moves -- the column rippling in the back wall's
+    /// reflection (headset, 2026-09-27). Within the footprint the trace
+    /// reports the outline and how much of the footprint the pillar covers:
+    /// under half just outside the edge, over half just inside, and nothing at
+    /// all for a ray well clear of it or a mirror whose footprint is a point.
+    #[test]
+    fn a_reflection_blends_across_the_pillars_outline() {
+        let from = Vec3::new(-2.0, 1.0, -4.0);
+        // Seen from here the pillar's left outline is its BACK-left corner,
+        // x = -0.45, z = -7.45: a ray aimed beside its front corner still
+        // clips its left face further on.
+        let outside = Vec3::new(-0.52, 1.0, -7.45);
+        let inside = Vec3::new(-0.38, 1.0, -7.45);
+        let Some(h) = trace(&[
+            (from, 0.0, toward(from, outside), 0.2),
+            (from, 0.0, toward(from, inside), 0.2),
+            (from, 0.0, toward(from, Vec3::new(-2.0, 1.0, -15.7)), 0.2),
+            (from, 0.0, toward(from, outside), 0.0),
+        ]) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        assert!(h[0].edge >= 0 && !h[0].edge_hit && (0.01..0.5).contains(&h[0].edge_cover), "just outside: edge {} hit {} cover {}", h[0].edge, h[0].edge_hit, h[0].edge_cover);
+        assert!(h[1].edge >= 0 && h[1].edge_hit && (0.5..0.99).contains(&h[1].edge_cover), "just inside: edge {} hit {} cover {}", h[1].edge, h[1].edge_hit, h[1].edge_cover);
+        assert!(h[2].edge < 0, "a ray well clear of the pillar reported its outline: {}", h[2].edge);
+        assert!(h[3].edge < 0, "a mirror with no footprint blended the outline: {} cover {}", h[3].edge, h[3].edge_cover);
     }
 }
