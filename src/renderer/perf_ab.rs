@@ -72,10 +72,14 @@ pub enum Phase {
     /// No stationary lamps: the cost of shading them live with their baked
     /// shadow masks. Their light is in no lightmap, so the room goes dark.
     NoStationary,
+    /// No light culling: every lamp's maths on every pixel, reachable or not.
+    /// What skipping lamps that cannot reach a pixel saves; the picture is
+    /// identical.
+    NoLightCulling,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 12] = [
+    pub const ALL: [Phase; 13] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -88,6 +92,7 @@ impl Phase {
         Phase::NoProbeTrace,
         Phase::NoProxies,
         Phase::NoStationary,
+        Phase::NoLightCulling,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -123,6 +128,7 @@ impl Phase {
             Phase::NoProbeTrace => "no_probe_trace",
             Phase::NoProxies => "no_proxies",
             Phase::NoStationary => "no_stationary",
+            Phase::NoLightCulling => "no_light_culling",
         }
     }
 }
