@@ -1584,11 +1584,32 @@ fn probe_environment(
     // array holds every probe the level baked, the loop walks only the ones
     // resident near the player. See `ProbeUpload::boxes`.
     let hit = probe_trace(world_pos, d, best_room, roughness);
-    if (hit.escaped) {{
-        return probe_escape_colour(hit.pos, d, hit.room, hit.other, hit.portal, dir, probe_lod);
-    }}
     if (hit.found) {{
-        return probe_hit_colour(hit.pos, hit.room, hit.other, probe_lod);
+        var col = probe_hit_colour(hit.pos, hit.room, hit.other, roughness, hit.t);
+        if (hit.escaped) {{
+            col = probe_escape_colour(hit.pos, d, hit.room, hit.other, hit.portal, dir, probe_lod);
+        }}
+        // ACROSS A DOORWAY'S RIM, the lobe's two parts: what the ray found,
+        // and the other side of the rim, weighted by how much of the lobe
+        // passes through the opening. See `probe_rim_at`.
+        if (hit.rim >= 0.0) {{
+            if (hit.rim_went_through) {{
+                let wall = probe_hit_colour(hit.rim_pos, hit.rim_room, -1.0, roughness, hit.rim_t);
+                col = mix(wall, col, hit.rim);
+            }} else {{
+                // Traced again from just inside the opening: whatever the
+                // doorway shows there, the next room or outdoors.
+                let alt = probe_trace(hit.rim_pos, d, -1.0, roughness);
+                if (alt.found) {{
+                    var beyond = probe_hit_colour(alt.pos, alt.room, alt.other, roughness, hit.rim_t + alt.t);
+                    if (alt.escaped) {{
+                        beyond = probe_escape_colour(alt.pos, d, alt.room, alt.other, alt.portal, dir, probe_lod);
+                    }}
+                    col = mix(col, beyond, hit.rim);
+                }}
+            }}
+        }}
+        return col;
     }}
     // NOT an early return when nothing contains this surface: a doorway's own
     // jambs and threshold sit in the wall, inside no room, and the portal pass
@@ -1634,12 +1655,16 @@ fn probe_environment(
     return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);
 }}
 
-// Up to where the SHIMMER correction takes marble: `specular_aa_roughness`
-// widens 0.048 to about 0.43 on a distant floor seen at a grazing angle, and
-// at 0.3 exactly those pixels fell back to the box projection -- which from
-// the probe behind the pillar showed the corner lamp's pool straight through
-// the pillar (headset, 2026-09-26).
-const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.5;
+// As far as the probe is used at all: `shade_material_env` fades it into the
+// lightmap's hemisphere by 0.75. A cut-off below that is a hard edge across
+// any material whose roughness map straddles it -- the hallway rock spans
+// 0.33-0.59 -- and every pixel past it fell back to the box projection, which
+// ignores what stands in the room: at 0.3 the probe behind the pillar showed
+// the corner lamp's pool straight through the pillar on distant marble that
+// `specular_aa_roughness` had widened to 0.43 (headset, 2026-09-26). Rough
+// reflections are soft because the lobe is wide, which the trace now models
+// itself (`probe_rim_at`, `probe_hit_lod`), not because they are untraced.
+const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.75;
 // How many rooms one reflection may cross: its own and two doorways on.
 const PROBE_TRACE_ROOMS: i32 = 3;
 // Samples a ray takes inside a model's box looking for the model. See
@@ -1662,6 +1687,129 @@ struct ProbeHit {{
     // outdoor volume, which has no walls to hit. See `probe_escape_colour`.
     escaped: bool,
     portal: i32,
+    // How far along the ray the hit is, for the blur. See `probe_hit_lod`.
+    t: f32,
+    // A DOORWAY'S RIM INSIDE THE LOBE, the first one the ray met: how much of
+    // the lobe passes through the opening (0..1), or -1 for none. `rim_pos` is
+    // on the far side of the rim from where this ray went -- just inside the
+    // opening when it hit the wall, on the wall just outside when it went
+    // through -- in room `rim_room`, `rim_t` along the ray. See
+    // `probe_rim_at` and `probe_environment`.
+    rim: f32,
+    rim_went_through: bool,
+    rim_pos: vec3<f32>,
+    rim_room: f32,
+    rim_t: f32,
+}}
+
+// THE REFLECTION LOBE'S WIDTH, as the tangent of its half-angle at half
+// maximum: GGX's half-vector falls to half its peak at about 0.64 alpha, and
+// the reflection turns twice as far. `alpha` is roughness squared. At the
+// marble's 0.048 that is a third of a centimetre per metre -- a mirror; at
+// the hallway rock's 0.43, a quarter of the distance -- a doorway five metres
+// off smears across more than its own width.
+const PROBE_LOBE_SPREAD: f32 = 1.3;
+fn probe_lobe_tan(roughness: f32) -> f32 {{
+    return PROBE_LOBE_SPREAD * roughness * roughness;
+}}
+
+// The narrowest lobe, in metres where it meets a wall, worth softening a
+// doorway's rim for: a centimetre is under a pixel wherever it is seen.
+const PROBE_RIM_MIN_SPREAD: f32 = 0.01;
+// How far past a rim the other side is looked up from, so the lookup lands
+// clearly on that side: inside the opening, or on the wall beside it.
+const PROBE_RIM_STEP: f32 = 0.02;
+
+struct ProbeRim {{
+    portal: i32,
+    through: f32,
+}}
+
+// A DOORWAY'S RIM WITHIN THE LOBE. A ray leaving room `room` through the wall
+// at `e` (its `axis` face) carries a lobe `spread` metres across there, and
+// where a doorway's rim passes within that, part of the lobe goes through the
+// opening and part meets the wall -- the reflection of the doorway should be
+// as soft as the surface is rough. One ray decides it all or nothing, which on
+// the hallway's rock (roughness 0.43) drew the far doorway as a hard-edged
+// strip down the floor (headset, 2026-09-27 01:48).
+//
+// Returns that doorway and how much of the lobe -- a disc on the wall --
+// falls inside the opening, as the product of a smooth coverage across each
+// of its two sides. `portal` -1 when no rim is that near: the one ray is then
+// the whole answer.
+fn probe_rim_at(e: vec3<f32>, room: f32, axis: i32, spread: f32) -> ProbeRim {{
+    var out: ProbeRim;
+    out.portal = -1;
+    out.through = 0.0;
+    let n = i32(camera.portal_params.x);
+    for (var p = 0; p < n; p = p + 1) {{
+        if (i32(camera.probe_portals[p * 3].w) != axis) {{
+            continue;
+        }}
+        let low = camera.probe_portals[p * 3 + 1].w;
+        let high = camera.probe_portals[p * 3 + 2].x;
+        if (low != room && high != room) {{
+            continue;
+        }}
+        let plo = camera.probe_portals[p * 3].xyz;
+        let phi = camera.probe_portals[p * 3 + 1].xyz;
+        if (e[axis] < plo[axis] - 1e-3 || e[axis] > phi[axis] + 1e-3) {{
+            continue;
+        }}
+        // How far inside the opening, across each of its two sides.
+        let a = (axis + 1) % 3;
+        let b = (axis + 2) % 3;
+        let in_a = min(e[a] - plo[a], phi[a] - e[a]);
+        let in_b = min(e[b] - plo[b], phi[b] - e[b]);
+        let nearest = min(in_a, in_b);
+        if (nearest < -spread || nearest > spread) {{
+            continue;
+        }}
+        out.portal = p;
+        out.through = smoothstep(-spread, spread, in_a) * smoothstep(-spread, spread, in_b);
+        return out;
+    }}
+    return out;
+}}
+
+// The point just across doorway `p`'s rim from `e`: inside the opening when
+// `into` (the ray met the wall), else on the wall just outside it (the ray
+// went through) -- past the NEAREST side, which is the rim the lobe spans.
+fn probe_rim_point(e: vec3<f32>, p: i32, axis: i32, into: bool) -> vec3<f32> {{
+    let plo = camera.probe_portals[p * 3].xyz;
+    let phi = camera.probe_portals[p * 3 + 1].xyz;
+    var q = e;
+    let a = (axis + 1) % 3;
+    let b = (axis + 2) % 3;
+    if (into) {{
+        q[a] = clamp(e[a], plo[a] + PROBE_RIM_STEP, phi[a] - PROBE_RIM_STEP);
+        q[b] = clamp(e[b], plo[b] + PROBE_RIM_STEP, phi[b] - PROBE_RIM_STEP);
+        return q;
+    }}
+    let in_a = min(e[a] - plo[a], phi[a] - e[a]);
+    let in_b = min(e[b] - plo[b], phi[b] - e[b]);
+    if (in_a <= in_b) {{
+        q[a] = select(phi[a] + PROBE_RIM_STEP, plo[a] - PROBE_RIM_STEP, e[a] - plo[a] < phi[a] - e[a]);
+    }} else {{
+        q[b] = select(phi[b] + PROBE_RIM_STEP, plo[b] - PROBE_RIM_STEP, e[b] - plo[b] < phi[b] - e[b]);
+    }}
+    return q;
+}}
+
+// THE BLUR AT A TRACED HIT, as the probe at `from` must be read to show it.
+//
+// A reflection's lobe spreads with distance: `t` metres along the ray it
+// covers a disc `t * probe_lobe_tan(roughness)` across, so a rough floor
+// reflects the foot of a wall sharply and its top softly -- the contact
+// hardening every glossy reflection has. A photograph taken `t_probe` from
+// the hit sees that disc under a smaller or larger angle than the surface
+// does, and its prefiltered levels are laid out by angle: level `n` is the
+// lobe of roughness `n / PROBE_ROUGHNESS_MIPS`. So the level is the
+// roughness whose lobe, from the photograph, covers the same disc:
+// `r * sqrt(t / t_probe)`, since the lobe grows as roughness squared.
+fn probe_hit_lod(roughness: f32, t: f32, t_probe: f32) -> f32 {{
+    let r = roughness * sqrt(max(t, 0.0) / max(t_probe, 0.05));
+    return clamp(r * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);
 }}
 
 // How far from photograph `slot`'s capture point, along `v` (any length), the
@@ -1864,6 +2012,13 @@ fn probe_trace(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness: f32) ->
     hit.found = false;
     hit.escaped = false;
     hit.portal = -1;
+    hit.t = 0.0;
+    hit.rim = -1.0;
+    hit.rim_went_through = false;
+    hit.rim_pos = vec3<f32>(0.0);
+    hit.rim_room = -1.0;
+    hit.rim_t = 0.0;
+    let lobe = probe_lobe_tan(roughness);
     // `portal_params.y`: switched off by `perf_ab` measuring it.
     if (roughness > PROBE_TRACE_MAX_ROUGHNESS || camera.portal_params.y > 0.5) {{
         return hit;
@@ -1914,6 +2069,7 @@ fn probe_trace(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness: f32) ->
             hit.room = low;
             hit.other = high;
             hit.found = true;
+            hit.t = t_side;
             return hit;
         }}
         if (escapes) {{
@@ -1923,6 +2079,7 @@ fn probe_trace(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness: f32) ->
             hit.portal = p;
             hit.escaped = true;
             hit.found = true;
+            hit.t = t_enter;
             return hit;
         }}
         cur = next;
@@ -1955,15 +2112,29 @@ fn probe_trace(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness: f32) ->
             hit.pos = o + d * t_obj;
             hit.room = cur;
             hit.found = true;
+            hit.t = t_obj;
             return hit;
         }}
         let e = o + d * t_exit;
         let p = probe_portal_at(e, cur, axis);
+        // The first doorway rim within the lobe, whichever side of it this
+        // ray lands on. See `probe_rim_at`.
+        if (hit.rim < 0.0 && t_exit * lobe > PROBE_RIM_MIN_SPREAD) {{
+            let rim = probe_rim_at(e, cur, axis, t_exit * lobe);
+            if (rim.portal >= 0) {{
+                hit.rim = rim.through;
+                hit.rim_went_through = p >= 0;
+                hit.rim_pos = probe_rim_point(e, rim.portal, axis, p < 0);
+                hit.rim_room = cur;
+                hit.rim_t = t_exit;
+            }}
+        }}
         if (p < 0) {{
             // The room's own wall, floor or ceiling.
             hit.pos = e;
             hit.room = cur;
             hit.found = true;
+            hit.t = t_exit;
             return hit;
         }}
         let low = camera.probe_portals[p * 3 + 1].w;
@@ -2001,6 +2172,7 @@ fn probe_trace(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness: f32) ->
             hit.room = cur;
             hit.other = other;
             hit.found = true;
+            hit.t = t_side;
             return hit;
         }}
         if (escapes) {{
@@ -2010,6 +2182,7 @@ fn probe_trace(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness: f32) ->
             hit.portal = p;
             hit.escaped = true;
             hit.found = true;
+            hit.t = t_enter;
             return hit;
         }}
         cur = other;
@@ -2094,7 +2267,7 @@ fn probe_escape_colour(e: vec3<f32>, d: vec3<f32>, room: f32, other: f32, p: i32
 //
 // Each is read from its OWN capture point toward the hit, which is what makes
 // the reflection parallax-correct everywhere rather than on a box.
-fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, lod: f32) -> vec4<f32> {{
+fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32) -> vec4<f32> {{
     var s0 = -1;
     var s1 = -1;
     var d0 = 3.4e38;
@@ -2131,12 +2304,16 @@ fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, lod: f32) -> vec4<f32> 
         w0 = select(1.0, 0.0, s1 >= 0 && abs(c1) < abs(c0));
         w1 = 1.0 - w0;
     }}
+    // Each photograph read at the blur the hit's distance calls for, from its
+    // own distance to the hit. See `probe_hit_lod`.
     var col = textureSampleLevel(
-        probe_cube, probe_samp, h - camera.probe_boxes[s0 * 3].xyz, i32(camera.probe_boxes[s0 * 3].w), lod
+        probe_cube, probe_samp, h - camera.probe_boxes[s0 * 3].xyz, i32(camera.probe_boxes[s0 * 3].w),
+        probe_hit_lod(roughness, t, sqrt(d0))
     ) * w0;
     if (w1 > 0.0) {{
         col += textureSampleLevel(
-            probe_cube, probe_samp, h - camera.probe_boxes[s1 * 3].xyz, i32(camera.probe_boxes[s1 * 3].w), lod
+            probe_cube, probe_samp, h - camera.probe_boxes[s1 * 3].xyz, i32(camera.probe_boxes[s1 * 3].w),
+            probe_hit_lod(roughness, t, sqrt(d1))
         ) * w1;
     }}
     return col / (w0 + w1);
@@ -3566,7 +3743,8 @@ mod probe_blend_tests {
         // Its own parallax, or -- where the trace hit -- the same point seen
         // from its own capture point. Either way, never the near one's.
         assert!(code.contains("let far_dir = probe_parallax_direction(world_pos, d, second);"));
-        assert!(code.contains("h - camera.probe_boxes[s1 * 3].xyz, i32(camera.probe_boxes[s1 * 3].w), lod"));
+        assert!(code.contains("h - camera.probe_boxes[s1 * 3].xyz, i32(camera.probe_boxes[s1 * 3].w),"));
+        assert!(code.contains("probe_hit_lod(roughness, t, sqrt(d1))"), "the far photograph's blur is not its own");
         assert!(
             code.contains("probe_cube, probe_samp, far_dir, i32(camera.probe_boxes[second * 3].w), probe_lod"),
             "the far photograph is read along the near one's direction again",
@@ -4156,6 +4334,9 @@ mod probe_trace_gpu_tests {
         room: f32,
         other: f32,
         escaped: bool,
+        /// How much of the lobe passes through a doorway's rim, -1 for none.
+        rim: f32,
+        rim_went_through: bool,
     }
 
     /// Trace each `(origin, room, dir, roughness)` through `probe_trace`.
@@ -4223,8 +4404,9 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let o = rays[id.x * 2u];
     let d = rays[id.x * 2u + 1u];
     let h = probe_trace(o.xyz, normalize(d.xyz), o.w, d.w);
-    hits[id.x * 2u] = vec4<f32>(h.pos, select(0.0, 1.0, h.found));
-    hits[id.x * 2u + 1u] = vec4<f32>(h.room, h.other, select(0.0, 1.0, h.escaped), f32(h.portal));
+    hits[id.x * 3u] = vec4<f32>(h.pos, select(0.0, 1.0, h.found));
+    hits[id.x * 3u + 1u] = vec4<f32>(h.room, h.other, select(0.0, 1.0, h.escaped), f32(h.portal));
+    hits[id.x * 3u + 2u] = vec4<f32>(h.rim, select(0.0, 1.0, h.rim_went_through), h.t, h.rim_t);
 }
 "#
         );
@@ -4254,7 +4436,7 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
             contents: bytemuck::cast_slice(&packed),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let size = (rays.len() * 2 * 16) as u64;
+        let size = (rays.len() * 3 * 16) as u64;
         let hit_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hits"),
             size,
@@ -4313,13 +4495,15 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         let data: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().ok()?).to_vec();
         Some(
-            data.chunks(2)
+            data.chunks(3)
                 .map(|c| Hit {
                     pos: Vec3::new(c[0][0], c[0][1], c[0][2]),
                     found: c[0][3] > 0.5,
                     room: c[1][0],
                     other: c[1][1],
                     escaped: c[1][2] > 0.5,
+                    rim: c[2][0],
+                    rim_went_through: c[2][1] > 0.5,
                 })
                 .collect(),
         )
@@ -4388,5 +4572,37 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let out_face = floor_f + d8 * ((4.0 - floor_f.z) / d8.z);
         assert!(h[8].escaped && near(h[8].pos, out_face) && h[8].room == 0.0 && h[8].other == 2.0, "front door escape: {:?} esc {}", h[8].pos, h[8].escaped);
         assert!(h[9].found && !h[9].escaped && near(h[9].pos, front_jamb), "front door jamb: {:?} esc {}", h[9].pos, h[9].escaped);
+    }
+
+    /// A ROUGH REFLECTION OF A DOORWAY IS AS SOFT AS THE SURFACE.
+    ///
+    /// A floor at the hallway rock's roughness (0.43) reflects the hall's wall
+    /// 2.5 m away through a lobe about 0.6 m across there. Aimed 10 cm beside
+    /// the doorway, the ray itself meets the wall -- but a good part of its
+    /// lobe passes through the opening, and the trace must say how much, and
+    /// from which side, for the colour to blend. Aimed 10 cm INSIDE the
+    /// opening, the ray goes through and the wall beside it takes its share.
+    /// At the marble's 0.048 the lobe is under a centimetre: one ray is the
+    /// whole answer, as it was, and a plain wall has no rim at all.
+    #[test]
+    fn a_rough_reflection_blends_across_a_doorways_rim() {
+        let floor = Vec3::new(0.5, 0.0, -1.5);
+        let beside = Vec3::new(2.7, 1.0, -2.1);
+        let inside = Vec3::new(2.7, 1.0, -2.3);
+        let Some(h) = trace(&[
+            (floor, 0.0, toward(floor, beside), 0.43),
+            (floor, 0.0, toward(floor, inside), 0.43),
+            (floor, 0.0, toward(floor, beside), 0.048),
+            (floor, 0.0, toward(floor, Vec3::new(2.7, 1.0, 1.0)), 0.43),
+        ]) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        assert!(h[0].found && near(h[0].pos, beside), "the ray itself should still meet the wall: {:?}", h[0].pos);
+        assert!(!h[0].rim_went_through && (0.2..0.6).contains(&h[0].rim), "beside the door: rim {} through {}", h[0].rim, h[0].rim_went_through);
+        assert!(h[1].rim_went_through && (0.5..0.95).contains(&h[1].rim), "inside the door: rim {} through {}", h[1].rim, h[1].rim_went_through);
+        assert!(h[1].room == 1.0, "inside the door the ray goes on into the hallway: room {}", h[1].room);
+        assert!(h[2].rim < 0.0, "marble softened a doorway's rim: {}", h[2].rim);
+        assert!(h[3].rim < 0.0, "a plain wall has no rim: {}", h[3].rim);
     }
 }
