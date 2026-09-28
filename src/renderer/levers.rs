@@ -75,6 +75,15 @@ pub struct Levers {
     /// Brush reflections from the half-resolution probe pass rather than
     /// traced per pixel. See `brush_pipeline::probe_pass`. Mono scene passes.
     pub half_res_reflections: bool,
+    /// The brushes' depth drawn first in the scene pass, so nothing hidden
+    /// behind a wall or under a floor is shaded. See
+    /// `BrushPipeline::new_depth_prepass`. Lossless: off changes no pixel.
+    pub depth_prepass: bool,
+    /// MEASUREMENT: block on the GPU at the end of every frame, as the
+    /// renderer used to. Its wait is then exactly the GPU's time, which is
+    /// what the A/B schedule attributes costs with; shipped, the CPU prepares
+    /// the next frame while the GPU draws this one.
+    pub gpu_sync: bool,
     /// Screen-space reflections. `None` leaves the in-headset switch alone.
     pub ssr: Option<bool>,
     /// Both eyes in one multiview scene pass. `None` leaves it as set.
@@ -108,6 +117,8 @@ impl Default for Levers {
             eye_adaptation: true,
             light_culling: true,
             half_res_reflections: true,
+            depth_prepass: true,
+            gpu_sync: false,
             ssr: None,
             multiview: None,
             half_viewport: false,
@@ -150,6 +161,7 @@ impl Levers {
             Phase::NoStationary => l.stationary_lights = false,
             Phase::NoLightCulling => l.light_culling = false,
             Phase::FullResReflections => l.half_res_reflections = false,
+            Phase::NoDepthPrepass => l.depth_prepass = false,
         }
         l
     }
@@ -176,6 +188,8 @@ impl Levers {
         flag("eye_adaptation", self.eye_adaptation, d.eye_adaptation);
         flag("light_culling", self.light_culling, d.light_culling);
         flag("half_res_reflections", self.half_res_reflections, d.half_res_reflections);
+        flag("depth_prepass", self.depth_prepass, d.depth_prepass);
+        flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
         flag("ab_cycle", self.ab_cycle, d.ab_cycle);

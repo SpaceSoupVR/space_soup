@@ -1351,6 +1351,83 @@ impl BrushPipeline {
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
                 depth_write_enabled: Some(true),
+                // LessEqual, not Less: after the depth prepass the nearest
+                // brush's depth is already in the buffer, and its own shading
+                // must pass on EQUAL. Without a prepass the two differ only
+                // for coplanar brush faces. See `new_depth_prepass`.
+                depth_compare: Some(CompareFunction::LessEqual),
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState { count: samples, ..Default::default() },
+            multiview_mask: view.mask(),
+            cache: None,
+        });
+        Self { pipeline, material_layout, lightmap_layout }
+    }
+
+    /// THE DEPTH PREPASS: the level's brushes drawn first in the scene pass,
+    /// writing only depth, so everything drawn after -- the brushes' own
+    /// shading at LessEqual, the terrain, meshes -- is shaded only where it is
+    /// the nearest surface.
+    ///
+    /// Why: the first headset benchmark (2026-09-27) counted 17-34 M
+    /// fragments shaded a frame for 3.6 M pixels, and the hardware's
+    /// low-resolution depth rejected almost none -- the terrain is drawn
+    /// before the walls and floors that hide it, and one draw of the whole
+    /// level has no order. The frame is fragment-bound, so every hidden
+    /// fragment shaded is time.
+    ///
+    /// The brushes' own vertex stage with an `@invariant` position, so both
+    /// draws put a brush at the same depth to the bit. Its fragment stage does
+    /// nothing and writes no colour; only groups 0 and 1 (camera, material
+    /// proportions) are bound.
+    pub fn new_depth_prepass(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+    ) -> Self {
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("brush_depth_prepass"),
+            source: ShaderSource::Wgsl(
+                view.shader(brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Trace))
+                    .into(),
+            ),
+        });
+        let material_layout = brush_material_bind_group_layout(device);
+        let lightmap_layout = super::pipeline::lightmap_bind_group_layout(device);
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("brush_depth_prepass_layout"),
+            bind_group_layouts: &[Some(uniform_layout), Some(&material_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("brush_depth_prepass"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(BrushVertex::layout())],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_depth"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::empty() })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: Some(Face::Back),
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
                 depth_compare: Some(CompareFunction::Less),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
@@ -2201,7 +2278,11 @@ struct VIn {{
     @location(9) face_half_extent: vec2<f32>,
 }}
 struct VOut {{
-    @builtin(position) clip: vec4<f32>,
+    // INVARIANT: computed identically in every pipeline built from this
+    // vertex stage -- the depth prepass and the shading passes must put each
+    // brush at the same depth to the bit, or LessEqual fails where they
+    // differ in the last place and the surface flickers away.
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) tangent: vec4<f32>,
     // NOT centroid. Centroid interpolation stopped MSAA edge pixels being
@@ -2261,6 +2342,13 @@ struct VOut {{
     out.material  = v.material;
     out.tint      = v.tint;
 {edge_vs}    return out;
+}}
+
+// THE DEPTH PREPASS's fragment stage: nothing, with every colour write
+// masked. It exists only because a pass with a colour attachment takes a
+// pipeline with a matching colour target. See `BrushPipeline::new_depth_prepass`.
+@fragment fn fs_depth() -> @location(0) vec4<f32> {{
+    return vec4<f32>(0.0);
 }}
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{

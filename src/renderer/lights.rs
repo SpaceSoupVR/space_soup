@@ -3111,6 +3111,13 @@ fn shade_material_env(
                 if (dot(to_light, to_light) >= reach * reach) {{
                     continue;
                 }}
+            }} else if (receiver_sun_mask == 0.0) {{
+                // THE SKY'S SUN WHERE ITS BAKED MASK HIDES IT COMPLETELY --
+                // indoors, most of the level. `sun_visibility` returns exactly
+                // that 0 without sampling anything, so the whole contribution
+                // it would multiply is skipped instead of computed. A receiver
+                // with no mask carries -1 and is shaded as before.
+                continue;
             }}
         }}
         let l = lights.lights[i];
