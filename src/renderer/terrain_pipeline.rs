@@ -142,7 +142,9 @@ impl TerrainPipeline {
         // Audited: see `shader_checks`.
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("terrain_shader"),
-            source: ShaderSource::Wgsl(view.shader(terrain_shader()).into()),
+            source: ShaderSource::Wgsl(
+                crate::renderer::shader_precision::for_device(device, view.shader(terrain_shader())).into(),
+            ),
         });
         let material_layout = material_bind_group_layout(device);
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
