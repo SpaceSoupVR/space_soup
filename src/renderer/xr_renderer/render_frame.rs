@@ -164,6 +164,9 @@ impl XrRenderer {
         if located && eye_views.len() >= 2 {
             self.last_fov = Some([eye_views[0].fov, eye_views[1].fov]);
         }
+        // Where the headset really is, for the compositor when the head is
+        // pinned: see `proj_views` below.
+        let tracked_poses: Option<Vec<xr::Posef>> = located.then(|| eye_views.iter().map(|v| v.pose).collect());
         // A PINNED HEAD (a benchmark viewpoint, see `bench`) draws whether or
         // not the runtime could locate the views: the poses are replaced, and
         // a headset on a desk can lose tracking in a dark room. It still needs
@@ -1872,12 +1875,22 @@ impl XrRenderer {
         }
         self.swapchain.release_image()?;
 
+        // PINNED, the frame is handed to the compositor as if drawn from where
+        // the headset really is. Given the pinned pose, the compositor
+        // reprojects the image to the real head -- which, on a desk, is
+        // nowhere near the viewpoint -- and a screenshot comes back tilted,
+        // with black corners where no image was (bench, 2026-09-27). What
+        // the frame costs is the same either way.
+        let submit_pose = |i: usize, ev: &xr::View| match (&self.pinned_head, &tracked_poses) {
+            (Some(_), Some(tracked)) => tracked.get(i).copied().unwrap_or(ev.pose),
+            _ => ev.pose,
+        };
         let proj_views = eye_views
             .iter()
             .enumerate()
             .map(|(i, ev)| {
                 xr::CompositionLayerProjectionView::new()
-                    .pose(ev.pose)
+                    .pose(submit_pose(i, ev))
                     .fov(ev.fov)
                     .sub_image(
                         xr::SwapchainSubImage::new()
