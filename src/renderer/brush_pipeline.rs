@@ -2695,9 +2695,12 @@ struct VOut {{
         lights_block = crate::renderer::lights::wgsl_lights_block_with(
             0,
             1,
-            probe == BrushProbe::Read,
-            pass_like,
-            probe == BrushProbe::PassDeferred,
+            crate::renderer::lights::LightsBlockOptions {
+                probe_from_pass: probe == BrushProbe::Read,
+                probe_face_always: pass_like,
+                defer_secondary: probe == BrushProbe::PassDeferred,
+                cull_range_first: false,
+            },
         ),
         ssr_block = ssr_block,
         sun_mask_range = SUN_MASK_DISTANCE_TEXELS,
