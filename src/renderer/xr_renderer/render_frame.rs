@@ -1123,23 +1123,36 @@ impl XrRenderer {
             self.ssr_camera_uniform.upload(&self.wgpu_queue, eye_view_proj, cam_pos);
             // THE BRUSHES' REFLECTIONS AT HALF RESOLUTION, in their own pass
             // before the scene pass reads them. See `brush_pipeline::probe_pass`.
-            // Mono passes only; the diagnostic views keep the per-pixel shader,
-            // which is the only one that paints them.
+            // The diagnostic views keep the per-pixel shader, which is the only
+            // one that paints them. A stereo scene pass needs the two-eye pass,
+            // which the device may have refused (`StereoProbePass`).
             let probe_pass = fx.half_res_reflections
                 && fx.probes
-                && !stereo
+                && (!stereo || self.stereo_probe.is_some())
                 && self.debug_view == crate::renderer::brush_pipeline::DebugView::Off
                 && brush_buffers.is_some();
+            // Its pipelines and target: this eye's, or both eyes' at once.
+            let (probe_pipeline, probe_reader, probe_target) = match (&self.stereo_probe, stereo) {
+                (Some(sp), true) => (&sp.pass, &sp.reader, &sp.target),
+                _ => (&self.brush_probe_pass_pipeline, &self.brush_probe_reader_pipeline, &self.probe_pass_targets[eye]),
+            };
 
             {
                 let mut encoder = self.wgpu_device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor { label: Some("ssr_scene") },
                 );
-                if probe_pass {
+                // Once a frame when stereo, like the scene pass it feeds.
+                if probe_pass && (!stereo || eye == 0) {
                     if let Some((vb, ib, count)) = &brush_buffers {
-                        let t = &self.probe_pass_targets[eye];
+                        let t = probe_target;
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("probe_pass"),
+                            // Both layers when stereo; see the scene pass.
+                            multiview_mask: if stereo {
+                                crate::renderer::multiview::STEREO_VIEW_MASK
+                            } else {
+                                None
+                            },
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                 view: &t.color_view,
                                 depth_slice: None,
@@ -1164,7 +1177,7 @@ impl XrRenderer {
                             timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(8 + eye)),
                             ..Default::default()
                         });
-                        pass.set_pipeline(&self.brush_probe_pass_pipeline.pipeline);
+                        pass.set_pipeline(&probe_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
                         pass.set_bind_group(2, self.brush_lightmap_bg(), &[]);
@@ -1399,8 +1412,8 @@ impl XrRenderer {
                         // it uses: the material is a vertex attribute and every
                         // colour map is a layer of one array.
                         if probe_pass {
-                            pass.set_pipeline(&self.brush_probe_reader_pipeline.pipeline);
-                            pass.set_bind_group(3, &self.probe_pass_targets[eye].bind_group, &[]);
+                            pass.set_pipeline(&probe_reader.pipeline);
+                            pass.set_bind_group(3, &probe_target.bind_group, &[]);
                         } else {
                             pass.set_pipeline(self.sp_brush(stereo));
                         }
