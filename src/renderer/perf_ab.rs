@@ -82,10 +82,13 @@ pub enum Phase {
     /// No brush depth prepass: hidden surfaces are shaded again. What the
     /// prepass saves.
     NoDepthPrepass,
+    /// The terrain drawn in full from inside a closed room again. What
+    /// doorway culling (`portal_cull`) saves.
+    NoPortalCulling,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 15] = [
+    pub const ALL: [Phase; 16] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -101,6 +104,7 @@ impl Phase {
         Phase::NoLightCulling,
         Phase::FullResReflections,
         Phase::NoDepthPrepass,
+        Phase::NoPortalCulling,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -139,6 +143,7 @@ impl Phase {
             Phase::NoLightCulling => "no_light_culling",
             Phase::FullResReflections => "full_res_reflections",
             Phase::NoDepthPrepass => "no_depth_prepass",
+            Phase::NoPortalCulling => "no_portal_culling",
         }
     }
 }
