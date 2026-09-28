@@ -211,6 +211,10 @@ pub struct XrRenderer {
     brush_probe_pass_deferred_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     probe_fixups: crate::renderer::probe_fixup::ProbeFixups,
     probe_fixup_targets: [wgpu::BindGroup; 2],
+    /// THE GROUND in the probe pass and reading it back. See
+    /// `TerrainPipeline::new_probe_pass`; the lever `terrain_probe_pass`.
+    terrain_probe_pass_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
+    terrain_probe_reader_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
     /// The same for the multiview scene pass. `None` without multiview, or if
     /// the device refused these pipelines. See `StereoProbePass`.
     stereo_probe: Option<StereoProbePass>,
@@ -720,6 +724,16 @@ impl XrRenderer {
             crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass_deferred(&wgpu_device, &uniform_buf.layout, &probe_fixups);
         let probe_fixup_targets: [wgpu::BindGroup; 2] =
             std::array::from_fn(|eye| probe_fixups.target_bind_group(&wgpu_device, &probe_pass_targets[eye]));
+        let terrain_probe_pass_pipeline =
+            crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass(&wgpu_device, &uniform_buf.layout, &probe_fixups);
+        let terrain_probe_reader_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_reader(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
+        );
+        if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::renderer::brush_pipeline::BrushPipeline::log_deferred_register_cuts(
+                &wgpu_device, &uniform_buf.layout, &probe_fixups,
+            );
+        }
         let brush_depth_prepass = crate::renderer::brush_pipeline::BrushPipeline::new_depth_prepass(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, crate::renderer::multiview::ViewMode::Mono,
         );
@@ -1081,6 +1095,8 @@ impl XrRenderer {
             brush_probe_pass_deferred_pipeline,
             probe_fixups,
             probe_fixup_targets,
+            terrain_probe_pass_pipeline,
+            terrain_probe_reader_pipeline,
             stereo_probe,
             brush_depth_prepass,
             stereo_depth_prepass,

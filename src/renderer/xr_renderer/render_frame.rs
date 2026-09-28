@@ -1162,6 +1162,19 @@ impl XrRenderer {
                 );
                 self.cull_rooms.iter().any(|r| r.closed && lo.cmplt(r.max).all() && r.min.cmplt(hi).all())
             };
+            // WHETHER A TERRAIN CHUNK IS DRAWN this eye: in the view, and, from
+            // inside a closed room, seen through a doorway. One rule for the
+            // scene pass and the probe pass, which must draw the same ground.
+            let terrain_chunk_visible = |c: &crate::renderer::shadow::CasterChunk| {
+                // THE TESTED HELPER, not a second copy of the rule. An inline
+                // `any` here would be the shipped behaviour while the tests
+                // exercised something else that merely looked the same.
+                let through_a_doorway = match &outdoor_frusta {
+                    None => true,
+                    Some(f) => crate::renderer::shadow::chunk_seen(c, f) || in_closed_room(c),
+                };
+                crate::renderer::shadow::chunk_seen(c, &cull_planes) && through_a_doorway
+            };
             let probes_arg =
                 if !fx.probes { Some(&no_probes) } else { resident.as_ref() };
             if stereo && eye == 0 {
@@ -1197,6 +1210,10 @@ impl XrRenderer {
             // ITS SECONDARY LOOKUPS DEFERRED to a compute pass over just the
             // texels that need them, in the single-eye pass. See `probe_fixup`.
             let deferred_lookups = fx.deferred_reflection_lookups && !stereo;
+            // THE GROUND'S REFLECTION IN THE PROBE PASS TOO, read back in the
+            // scene pass as the brushes' is. See `TerrainPipeline::new_probe_pass`.
+            let terrain_in_probe_pass =
+                probe_pass && deferred_lookups && fx.terrain_probe_pass && terrain_range.is_some();
             let probe_pipeline = if deferred_lookups { &self.brush_probe_pass_deferred_pipeline } else { probe_pipeline };
 
             {
@@ -1252,6 +1269,21 @@ impl XrRenderer {
                         pass.set_vertex_buffer(0, vb.slice(..));
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..*count, 0, 0..1);
+                        if let (true, Some((index_start, count))) = (terrain_in_probe_pass, terrain_range) {
+                            pass.set_pipeline(&self.terrain_probe_pass_pipeline.pipeline);
+                            pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                            pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                            pass.set_bind_group(3, self.probe_fixups.pass_bind_group(), &[]);
+                            pass.set_vertex_buffer(0, solid_vb.slice(..));
+                            pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                            if solid_chunks.is_empty() {
+                                pass.draw_indexed(index_start..index_start + count, 0, 0..1);
+                            } else {
+                                for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c)) {
+                                    pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                }
+                            }
+                        }
                         drop(pass);
                         if deferred_lookups {
                             self.probe_fixups.dispatch(&mut encoder, &self.uniform_buf.bind_group, &self.probe_fixup_targets[eye]);
@@ -1444,7 +1476,12 @@ impl XrRenderer {
                         }
                     }
                     if let Some((index_start, count)) = terrain_range {
-                        pass.set_pipeline(self.sp_terrain(stereo));
+                        if terrain_in_probe_pass {
+                            pass.set_pipeline(&self.terrain_probe_reader_pipeline.pipeline);
+                            pass.set_bind_group(3, &probe_target.bind_group, &[]);
+                        } else {
+                            pass.set_pipeline(self.sp_terrain(stereo));
+                        }
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
                         pass.set_vertex_buffer(0, solid_vb.slice(..));
@@ -1468,15 +1505,7 @@ impl XrRenderer {
                             pass.draw_indexed(index_start..index_start + count, 0, 0..1);
                         } else {
                             for c in &solid_chunks {
-                                // THE TESTED HELPER, not a second copy of the
-                                // rule. An inline `any` here would be the
-                                // shipped behaviour while the tests exercised
-                                // something else that merely looked the same.
-                                let through_a_doorway = match &outdoor_frusta {
-                                    None => true,
-                                    Some(f) => crate::renderer::shadow::chunk_seen(c, f) || in_closed_room(c),
-                                };
-                                if crate::renderer::shadow::chunk_seen(c, &cull_planes) && through_a_doorway {
+                                if terrain_chunk_visible(c) {
                                     pass.draw_indexed(
                                         c.first_index..c.first_index + c.index_count,
                                         0,

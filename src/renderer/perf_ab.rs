@@ -89,10 +89,14 @@ pub enum Phase {
     /// leaving them to `probe_fixup`. What deferring them saves; the picture
     /// is identical.
     InlineReflectionLookups,
+    /// The ground tracing its probe reflection per pixel in the scene pass
+    /// again, instead of in the half-resolution probe pass. What moving it
+    /// there saves.
+    TerrainPerPixelReflections,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 17] = [
+    pub const ALL: [Phase; 18] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -110,6 +114,7 @@ impl Phase {
         Phase::NoDepthPrepass,
         Phase::NoPortalCulling,
         Phase::InlineReflectionLookups,
+        Phase::TerrainPerPixelReflections,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -150,6 +155,7 @@ impl Phase {
             Phase::NoDepthPrepass => "no_depth_prepass",
             Phase::NoPortalCulling => "no_portal_culling",
             Phase::InlineReflectionLookups => "inline_reflection_lookups",
+            Phase::TerrainPerPixelReflections => "terrain_per_pixel_reflections",
         }
     }
 }

@@ -1419,6 +1419,44 @@ impl BrushPipeline {
         }
     }
 
+    /// MEASUREMENT ONLY: `log_probe_pass_register_cuts` for the probe pass
+    /// that defers its secondary lookups -- the one that ships.
+    pub fn log_deferred_register_cuts(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+    ) {
+        let base = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
+        for (label, edits) in DEFERRED_REGISTER_CUTS {
+            let mut src = base.clone();
+            let mut missing = None;
+            for (from, to) in edits.iter() {
+                if !src.contains(from) {
+                    missing = Some(*from);
+                    break;
+                }
+                src = src.replacen(from, to, 1);
+            }
+            match missing {
+                Some(from) => log::warn!("register cut {label}: `{from}` is not in the shader"),
+                None => {
+                    let _ = Self::from_source(
+                        device,
+                        probe_pass::FORMAT,
+                        uniform_layout,
+                        FrontFace::Ccw,
+                        1,
+                        None,
+                        crate::renderer::multiview::ViewMode::Mono,
+                        Some(fixups.pass_layout()),
+                        label,
+                        src,
+                    );
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn from_source(
         device: &Device,
@@ -1752,6 +1790,28 @@ fn brush_shader_with(ssr: bool) -> String {
 ///
 /// Mono scene passes only for now; a stereo pass keeps tracing per pixel.
 /// `Levers::half_res_reflections` switches it off to measure it.
+/// MEASUREMENT ONLY: the DEFERRING probe pass (the one that ships) with one
+/// part cut out at a time -- see `BrushPipeline::log_deferred_register_cuts`.
+const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
+    ("def_cut_none", &[]),
+    ("def_cut_rim_detect", &[("        if (hit.rim < 0.0 && t_exit * lobe > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
+    ("def_cut_edge_detect", &[("        if (hit.edge_code < 0 && proxy.edge >= 0) {", "        if (false) {")]),
+    (
+        "def_cut_both_detect",
+        &[
+            ("        if (hit.rim < 0.0 && t_exit * lobe > PROBE_RIM_MIN_SPREAD) {", "        if (false) {"),
+            ("        if (hit.edge_code < 0 && proxy.edge >= 0) {", "        if (false) {"),
+        ],
+    ),
+    (
+        "def_cut_record",
+        &[("            slot = probe_fixup_begin(hit, world_pos, d, dir, roughness, probe_lod, trace_room);", "            slot = -1;")],
+    ),
+    ("def_cut_proxy_surface", &[("    if (s0 < 0) {\n        return 3.4e38;\n    }", "    if (true) {\n        return 3.4e38;\n    }")]),
+    ("def_cut_escape_colour", &[("    if (h.escaped) {\n        col = probe_escape_colour(", "    if (false) {\n        col = probe_escape_colour(")]),
+    ("def_cut_untraced", &[("    return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);", "    return own;")]),
+];
+
 /// MEASUREMENT ONLY: the scene pass's brush shader (the one reading the probe
 /// pass) with one part cut out at a time -- see
 /// `BrushPipeline::log_scene_register_cuts`. Text edits of the generated WGSL;
@@ -1979,7 +2039,7 @@ pub mod probe_pass {
     return probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);"#;
 
     /// Group 3 and the read, appended to the scene pass's brush shader.
-    pub(super) const READER_WGSL: &str = r#"
+    pub(crate) const READER_WGSL: &str = r#"
 @group(3) @binding(0) var probe_pass_tex: texture_2d_array<f32>;
 @group(3) @binding(1) var probe_pass_depth: texture_depth_2d_array;
 @group(3) @binding(2) var probe_pass_linear: sampler;
@@ -4431,6 +4491,24 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
     /// generated shader -- a cut that no longer applies would report the
     /// uncut shader under its name -- and the result is valid WGSL. See
     /// `BrushPipeline::log_probe_pass_register_cuts`.
+    #[test]
+    fn every_deferred_register_cut_applies_and_validates() {
+        use wgpu::naga;
+        let base = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
+        for (label, edits) in DEFERRED_REGISTER_CUTS {
+            let mut src = base.clone();
+            for (from, to) in edits.iter() {
+                assert!(src.contains(from), "{label}: `{from}` is not in the deferring probe pass");
+                src = src.replacen(from, to, 1);
+            }
+            let module = naga::front::wgsl::parse_str(&src)
+                .unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+    }
+
     #[test]
     fn every_scene_register_cut_applies_and_validates() {
         use wgpu::naga;
