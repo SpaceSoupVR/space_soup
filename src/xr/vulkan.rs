@@ -62,6 +62,33 @@ pub struct VkContext {
 /// exactly what this device has (the fork's patch to wgpu-hal).
 const ENABLE_ROBUST_ACCESS: bool = false;
 
+/// The Android system property that makes every pipeline report the driver's
+/// statistics for its shaders -- registers, instruction counts -- to the log,
+/// as `PIPESTATS` lines (the SpaceSoupVR wgpu fork's `wgpu-hal`). Off unless
+/// set; read once, when the device is created:
+///
+/// ```text
+/// adb -s <quest> shell setprop debug.spacesoup.pipestats 1
+/// ```
+///
+/// Measurement only: how many registers a shader holds decides how many waves
+/// of it a GPU core keeps in flight, and no other tool on this headset says.
+const PIPELINE_STATISTICS_PROPERTY: &std::ffi::CStr = c"debug.spacesoup.pipestats";
+
+/// An Android system property's value; empty when unset.
+fn system_property(name: &std::ffi::CStr) -> String {
+    extern "C" {
+        fn __system_property_get(name: *const std::ffi::c_char, value: *mut std::ffi::c_char) -> std::ffi::c_int;
+    }
+    // PROP_VALUE_MAX.
+    let mut value = [0 as std::ffi::c_char; 92];
+    let n = unsafe { __system_property_get(name.as_ptr(), value.as_mut_ptr()) };
+    if n <= 0 {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(value.as_ptr()) }.to_string_lossy().into_owned()
+}
+
 impl VkContext {
     pub fn new(xr: &XrContext) -> Result<Self, Box<dyn std::error::Error>> {
         let vk_entry = ash::Entry::linked();
@@ -222,6 +249,24 @@ impl VkContext {
                 .unwrap_or(false)
         };
         let f16_supported = f16_extension_available && f16_query.shader_float16 == vk::TRUE;
+        // PIPELINE STATISTICS, when asked for. See `PIPELINE_STATISTICS_PROPERTY`.
+        let statistics_extension_available = unsafe {
+            vk_instance
+                .enumerate_device_extension_properties(physical_device)
+                .map(|exts| {
+                    exts.iter().any(|e| {
+                        std::ffi::CStr::from_ptr(e.extension_name.as_ptr()).to_bytes()
+                            == b"VK_KHR_pipeline_executable_properties"
+                    })
+                })
+                .unwrap_or(false)
+        };
+        let capture_statistics =
+            statistics_extension_available && system_property(PIPELINE_STATISTICS_PROPERTY) == "1";
+        if capture_statistics {
+            info!("vulkan: pipeline statistics ON -- every pipeline logs PIPESTATS");
+        }
+        crate::renderer::shader_checks::PIPELINE_STATISTICS.store(capture_statistics, std::sync::atomic::Ordering::Relaxed);
         info!(
             "vulkan: shaderFloat16 {}",
             if f16_supported { "supported -- enabling" } else { "NOT supported" },
@@ -232,6 +277,9 @@ impl VkContext {
         }
         if robust_access {
             enabled_extensions.push(ash::ext::robustness2::NAME);
+        }
+        if capture_statistics {
+            enabled_extensions.push(ash::khr::pipeline_executable_properties::NAME);
         }
         let extensions: Vec<*const std::ffi::c_char> = enabled_extensions.iter().map(|e| e.as_ptr()).collect();
 
@@ -255,12 +303,21 @@ impl VkContext {
                 multiview_enable.p_next = &mut robustness2_enable as *mut _ as *mut std::ffi::c_void;
             }
         }
+        // Pipeline statistics, when asked for, at the head of the chain.
+        let mut statistics_enable = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
+            .pipeline_executable_info(true);
+        statistics_enable.p_next = &mut multiview_enable as *mut _ as *mut std::ffi::c_void;
+        let chain: *mut std::ffi::c_void = if capture_statistics {
+            &mut statistics_enable as *mut _ as *mut std::ffi::c_void
+        } else {
+            &mut multiview_enable as *mut _ as *mut std::ffi::c_void
+        };
         // `robustBufferAccess2` requires the core `robustBufferAccess` too.
         let core_features = vk::PhysicalDeviceFeatures::default().robust_buffer_access(robust_access);
         let device_ci = vk::DeviceCreateInfo {
             queue_create_info_count: 1,
             p_queue_create_infos: &queue_info,
-            p_next: &mut multiview_enable as *mut _ as *mut std::ffi::c_void,
+            p_next: chain,
             enabled_extension_count: extensions.len() as u32,
             pp_enabled_extension_names: if extensions.is_empty() { std::ptr::null() } else { extensions.as_ptr() },
             p_enabled_features: &core_features,

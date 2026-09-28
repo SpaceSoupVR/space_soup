@@ -689,6 +689,9 @@ impl XrRenderer {
         let brush_probe_pass_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass(
             &wgpu_device, &uniform_buf.layout, crate::renderer::multiview::ViewMode::Mono,
         );
+        if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::renderer::brush_pipeline::BrushPipeline::log_probe_pass_register_cuts(&wgpu_device, &uniform_buf.layout);
+        }
         let brush_probe_reader_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_multisampled_probe_reader(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
             crate::renderer::multiview::ViewMode::Mono,
