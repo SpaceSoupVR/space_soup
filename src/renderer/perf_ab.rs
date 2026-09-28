@@ -85,10 +85,14 @@ pub enum Phase {
     /// The terrain drawn in full from inside a closed room again. What
     /// doorway culling (`portal_cull`) saves.
     NoPortalCulling,
+    /// The probe pass making its secondary lookups itself again, instead of
+    /// leaving them to `probe_fixup`. What deferring them saves; the picture
+    /// is identical.
+    InlineReflectionLookups,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 16] = [
+    pub const ALL: [Phase; 17] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -105,6 +109,7 @@ impl Phase {
         Phase::FullResReflections,
         Phase::NoDepthPrepass,
         Phase::NoPortalCulling,
+        Phase::InlineReflectionLookups,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -144,6 +149,7 @@ impl Phase {
             Phase::FullResReflections => "full_res_reflections",
             Phase::NoDepthPrepass => "no_depth_prepass",
             Phase::NoPortalCulling => "no_portal_culling",
+            Phase::InlineReflectionLookups => "inline_reflection_lookups",
         }
     }
 }

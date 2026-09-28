@@ -1262,6 +1262,30 @@ impl BrushPipeline {
         Self::new_variant(device, probe_pass::FORMAT, uniform_layout, FrontFace::Ccw, 1, false, None, view, BrushProbe::Pass, None)
     }
 
+    /// THE SINGLE-EYE PROBE PASS THAT SHIPS: as [`Self::new_probe_pass`], with
+    /// the secondary lookups left to `fixups` (`probe_fixup`). Its fragments
+    /// write the record list, so their depth test is forced EARLY where the
+    /// device allows it: a shader with side effects is otherwise tested after
+    /// it runs, and every hidden fragment would be shaded.
+    pub fn new_probe_pass_deferred(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+    ) -> Self {
+        Self::new_variant(
+            device,
+            probe_pass::FORMAT,
+            uniform_layout,
+            FrontFace::Ccw,
+            1,
+            false,
+            None,
+            crate::renderer::multiview::ViewMode::Mono,
+            BrushProbe::PassDeferred,
+            Some(fixups.pass_layout()),
+        )
+    }
+
     /// The scene pass's opaque brush, reading its probe reflection from that
     /// pass through group 3 (`probe_pass::bind_group_layout`) instead of
     /// tracing it per pixel.
@@ -1300,12 +1324,17 @@ impl BrushPipeline {
         probe: BrushProbe,
         probe_layout: Option<&BindGroupLayout>,
     ) -> Self {
-        let source = brush_shader_probe(false, sources, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, probe);
+        let mut source = brush_shader_probe(false, sources, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, probe);
+        if probe == BrushProbe::PassDeferred && device.features().contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
+            assert!(source.contains(FS_MAIN), "the fragment entry point moved");
+            source = source.replacen(FS_MAIN, "@fragment @early_depth_test(force) fn fs_main(", 1);
+        }
         // Named by what it does, so a GPU profile or `PIPESTATS` line says
-        // which of the three it is.
+        // which of them it is.
         let label = match probe {
             BrushProbe::Trace => "brush_pipeline",
             BrushProbe::Pass => "brush_probe_pass",
+            BrushProbe::PassDeferred => "brush_probe_pass_deferred",
             BrushProbe::Read => "brush_pipeline_read",
         };
         Self::from_source(device, format, uniform_layout, front_face, samples, blend, view, probe_layout, label, source)
@@ -1687,11 +1716,11 @@ fn brush_shader_with(ssr: bool) -> String {
 /// generated WGSL. They change what the shader computes; nothing draws with them.
 const PROBE_PASS_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("cut_none", &[]),
-    ("cut_edge_lookup", &[("        if (hit.edge >= 0) {\n", "        if (false) {\n")]),
-    ("cut_rim_lookup", &[("        if (hit.rim >= 0.0) {\n", "        if (false) {\n")]),
+    ("cut_edge_lookup", &[("    if (hit.edge_code >= 0) {\n", "    if (false) {\n")]),
+    ("cut_rim_lookup", &[("    if (hit.rim >= 0.0) {\n", "    if (false) {\n")]),
     (
         "cut_both_lookups",
-        &[("        if (hit.edge >= 0) {\n", "        if (false) {\n"), ("        if (hit.rim >= 0.0) {\n", "        if (false) {\n")],
+        &[("    if (hit.edge_code >= 0) {\n", "    if (false) {\n"), ("    if (hit.rim >= 0.0) {\n", "    if (false) {\n")],
     ),
     ("cut_edge_detect", &[("        if (camera.probe_proxies[i * 3 + 1].w < 0.5 && out.edge < 0) {", "        if (false) {")]),
     ("cut_rim_detect", &[("        if (hit.rim < 0.0 && t_exit * lobe > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
@@ -1766,7 +1795,7 @@ pub mod probe_pass {
         pub fn new(device: &Device, layout: &BindGroupLayout, eye_width: u32, eye_height: u32, layers: u32) -> Self {
             let (width, height) = (eye_width.div_ceil(2).max(1), eye_height.div_ceil(2).max(1));
             let layers = layers.max(1);
-            let make = |label: &str, format: TextureFormat| {
+            let make = |label: &str, format: TextureFormat, extra: TextureUsages| {
                 device.create_texture(&TextureDescriptor {
                     label: Some(label),
                     size: Extent3d { width, height, depth_or_array_layers: layers },
@@ -1774,12 +1803,18 @@ pub mod probe_pass {
                     sample_count: 1,
                     dimension: TextureDimension::D2,
                     format,
-                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING | extra,
                     view_formats: &[],
                 })
             };
-            let color = make("probe_pass_color", FORMAT);
-            let depth = make("probe_pass_depth", TextureFormat::Depth32Float);
+            // Storage as well, for one eye: `probe_fixup` writes the texels
+            // whose secondary lookups the pass deferred.
+            let color = make(
+                "probe_pass_color",
+                FORMAT,
+                if layers == 1 { TextureUsages::STORAGE_BINDING } else { TextureUsages::empty() },
+            );
+            let depth = make("probe_pass_depth", TextureFormat::Depth32Float, TextureUsages::empty());
             // Rendered into as a plain 2D view for one eye, as the array for
             // two (a multiview pass takes its view count from it); read as
             // the array either way.
@@ -1940,12 +1975,22 @@ pub enum BrushProbe {
     /// The half-resolution probe pass itself: shades nothing, writes only the
     /// probe reflection. See `probe_pass`.
     Pass,
+    /// The same pass, leaving each traced hit's secondary lookups to
+    /// `probe_fixup` (group 3: the record list). What ships in the single-eye
+    /// pass. See `lights::PROBE_SECONDARY_DEFERRED`.
+    PassDeferred,
     /// The scene pass's brush, reading that pass instead of tracing.
     Read,
 }
 
+/// How the brush shader's fragment entry point begins -- where an attribute on
+/// it goes. See `BrushPipeline::new_probe_pass_deferred`.
+const FS_MAIN: &str = "@fragment fn fs_main(";
+
 /// `brush_shader_modes`, with the probe reflection's source. See `BrushProbe`.
 fn brush_shader_probe(ssr: bool, sources: bool, ssr_debug: bool, path: SsrPath, probe: BrushProbe) -> String {
+    // Both forms of the probe pass share everything but the deferral.
+    let pass_like = matches!(probe, BrushProbe::Pass | BrushProbe::PassDeferred);
     let trace = path == SsrPath::Trace;
     let composite = path == SsrPath::Composite;
     let ssr_block = match (ssr, path) {
@@ -2296,6 +2341,12 @@ struct VOut {{
     let lighting: String = match probe {
         BrushProbe::Trace => lighting.to_string(),
         BrushProbe::Pass => probe_pass::PASS_LIGHTING.to_string(),
+        // The same, telling a deferred lookup's record which texel it is.
+        BrushProbe::PassDeferred => {
+            let given = "    probe_face_given = in.probe_face;\n";
+            assert!(probe_pass::PASS_LIGHTING.contains(given), "the probe pass no longer hands in its face");
+            probe_pass::PASS_LIGHTING.replacen(given, &format!("{given}    probe_fragment = in.clip;\n"), 1)
+        }
         BrushProbe::Read => {
             let marker = "    probe_volume_pos = vec4<f32>(in.face_centre, 1.0);\n    let lit = shade_material_env(";
             assert!(
@@ -2473,7 +2524,13 @@ struct VOut {{
 {lighting}{tail}
 }}
 "#,
-        lights_block = crate::renderer::lights::wgsl_lights_block_with(0, 1, probe == BrushProbe::Read, probe == BrushProbe::Pass),
+        lights_block = crate::renderer::lights::wgsl_lights_block_with(
+            0,
+            1,
+            probe == BrushProbe::Read,
+            pass_like,
+            probe == BrushProbe::PassDeferred,
+        ),
         ssr_block = ssr_block,
         sun_mask_range = SUN_MASK_DISTANCE_TEXELS,
         stationary_range = STATIONARY_MASK_DISTANCE_TEXELS,
@@ -2489,17 +2546,17 @@ struct VOut {{
         // THE PROBE PASS CHOOSES ITS ROOM PER FACE, in the vertex stage. See
         // `probe_face_room`: the box tests against every resident probe were
         // made per pixel for a result that is the same across the face.
-        probe_face_varying = if probe == BrushProbe::Pass {
+        probe_face_varying = if pass_like {
             "    // FLAT: the face's room. See `probe_face_room`.\n    @location(10) @interpolate(flat) probe_face: vec4<f32>,\n"
         } else {
             ""
         },
-        probe_face_vs = if probe == BrushProbe::Pass {
+        probe_face_vs = if pass_like {
             "    out.probe_face = probe_face_room(v.face_centre);\n"
         } else {
             ""
         },
-        tail = if probe == BrushProbe::Pass {
+        tail = if pass_like {
             String::new()
         } else if BRUSH_EDGE_DEBUG {
             edge_debug.to_string()
@@ -2522,10 +2579,9 @@ struct VOut {{
             ssr_apply
         }
     );
-    if probe == BrushProbe::Read {
-        format!("{src}{}", probe_pass::READER_WGSL)
-    } else {
-        src
+    match probe {
+        BrushProbe::Read => format!("{src}{}", probe_pass::READER_WGSL),
+        _ => src,
     }
 }
 
@@ -4310,8 +4366,18 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         // no development machine has -- see the naga check below.
         let _stereo = probe_pass::Target::new(&device, &layout, 1445, 1546, 2);
         assert_eq!((target.width, target.height), (723, 773));
+        // The pass that ships, which defers its secondary lookups, and the
+        // compute pass that makes them, writing into that target.
+        let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, target.width * target.height);
+        let _deferred = BrushPipeline::new_probe_pass_deferred(&device, &uniforms.layout, &fixups);
+        let _fixup_target = fixups.target_bind_group(&device, &target);
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "the probe pass pipelines failed to build: {err:?}");
+        let deferred_src = brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::PassDeferred);
+        assert!(deferred_src.contains("const PROBE_SECONDARY_DEFERRED: bool = true;"));
+        assert!(deferred_src.contains("probe_fragment = in.clip;") && deferred_src.contains("atomicAdd(&probe_fixups.count"));
+        assert!(brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Pass)
+            .contains("const PROBE_SECONDARY_DEFERRED: bool = false;"));
     }
 
     /// The debug pipelines must build on a real device, or pressing the button

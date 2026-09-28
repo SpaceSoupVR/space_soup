@@ -665,7 +665,7 @@ pub fn append_baked(live: &[Light], baked: &[Light], max: usize) -> Vec<Light> {
 /// anything added here.
 
 pub fn wgsl_lights_block(group_index: u32, binding_index: u32) -> String {
-    wgsl_lights_block_with(group_index, binding_index, false, false)
+    wgsl_lights_block_with(group_index, binding_index, false, false, false)
 }
 
 /// `wgsl_lights_block`, where `probe_from_pass` makes `shade_material_env`
@@ -675,7 +675,15 @@ pub fn wgsl_lights_block(group_index: u32, binding_index: u32) -> String {
 /// every caller of `probe_environment` has set `probe_face_given` -- true of the
 /// probe pass, whose vertex stage chooses each face's room -- so the searches
 /// that serve callers without one are compiled out. See `PROBE_FACE_ALWAYS_GIVEN`.
-pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, probe_from_pass: bool, probe_face_always: bool) -> String {
+/// `defer_secondary` makes `probe_environment` leave a traced hit's secondary
+/// lookups to `probe_fixup` instead of making them. See `PROBE_SECONDARY_DEFERRED`.
+pub fn wgsl_lights_block_with(
+    group_index: u32,
+    binding_index: u32,
+    probe_from_pass: bool,
+    probe_face_always: bool,
+    defer_secondary: bool,
+) -> String {
     let shadow_tex = binding_index + 1;
     let shadow_samp = binding_index + 2;
     let spot_tex = binding_index + 3;
@@ -703,6 +711,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, probe_from_p
     let portal_fade = PROBE_PORTAL_FADE;
     let portal_side_fade = PROBE_PORTAL_SIDE_FADE;
     let precision_aliases = crate::renderer::shader_precision::F32_ALIASES;
+    let probe_fixup_wgsl = crate::renderer::probe_fixup::lights_block_wgsl(defer_secondary);
     format!(
         r#"
 // HALF-PRECISION ALIASES: `f32` unless `shader_precision::for_device` rewrites
@@ -1025,6 +1034,20 @@ const PROBE_ENV_FROM_PASS: bool = {probe_from_pass};
 // that shader carries none of the searches for callers that do not -- nor the
 // registers their inputs held through the trace. See `probe_environment`.
 const PROBE_FACE_ALWAYS_GIVEN: bool = {probe_face_always};
+// WHETHER A TRACED HIT'S SECONDARY LOOKUPS -- across a doorway's rim, across a
+// solid proxy's outline; see `probe_secondary` -- ARE LEFT TO `probe_fixup`.
+// A constant, so the probe pass that defers them carries none of their code
+// or registers: with them it held 26 registers a pixel and kept 37% of its
+// waves in flight, without them 18 and 62% (`PIPESTATS`, 2026-09-28), for
+// lookups that fewer than one pixel in ten ever makes. The pixel's primary
+// reflection is returned as usual, and everything the lookups need is recorded
+// for `probe_fixup` (`probe_fixup_begin` and `_finish`) -- the ray's part the
+// moment the trace ends, so it is not carried through the colour lookup.
+const PROBE_SECONDARY_DEFERRED: bool = {defer_secondary};
+// The fragment whose reflection this is -- its position builtin, set by the
+// probe pass before it shades -- for the record of a deferred lookup.
+var<private> probe_fragment: vec4<f32> = vec4<f32>(0.0);
+{probe_fixup_wgsl}
 // The half-resolution pass's answer for this pixel -- the probe radiance,
 // already normalised, and its coverage -- set by the brush shader before it
 // shades. Only read when `PROBE_ENV_FROM_PASS`.
@@ -1700,6 +1723,69 @@ fn probe_choose_in_room(room: f32, select_world: vec3<f32>) -> ProbeChoice {{
     return c;
 }}
 
+// A TRACED HIT'S SECONDARY LOOKUPS, from its colour `primary`: across a
+// doorway's rim, and across a solid proxy's outline, each a colour at a point
+// already known or a second trace. Made in `probe_environment`, or, where the
+// probe pass defers them (`PROBE_SECONDARY_DEFERRED`), in `probe_fixup` from
+// what the pass recorded -- the same function, so the same answer.
+fn probe_secondary(
+    hit: ProbeHit,
+    primary: vec4<f32>,
+    world_pos: vec3<f32>,
+    d: vec3<f32>,
+    dir: vec3<f32>,
+    roughness: f32,
+    probe_lod: f32,
+    trace_room: f32,
+) -> vec4<f32> {{
+    var col = primary;
+    // ACROSS A DOORWAY'S RIM, the lobe's two parts: what the ray found,
+    // and the other side of the rim, weighted by how much of the lobe
+    // passes through the opening. See `probe_rim_at`.
+    if (hit.rim >= 0.0) {{
+        // The wall beside the opening where the ray went through it: a
+        // point already known. Else traced again from just inside the
+        // opening: whatever the doorway shows there, the next room or
+        // outdoors.
+        let rim_pos = probe_hit_rim_point(hit, d);
+        let went_through = probe_hit_rim_went_through(hit);
+        var side = probe_point_hit(rim_pos, probe_hit_rim_room(hit), hit.rim_t);
+        if (!went_through) {{
+            side = probe_trace(rim_pos, d, -1.0, roughness);
+            side.t = hit.rim_t + side.t;
+        }}
+        if (side.found) {{
+            let x = probe_traced_colour(side, d, roughness, dir, probe_lod);
+            if (went_through) {{
+                col = mix(x, col, hit.rim);
+            }} else {{
+                col = mix(col, x, hit.rim);
+            }}
+        }}
+    }}
+    // ACROSS A SOLID PROXY'S OUTLINE, the footprint's two parts: the
+    // proxy, and what lies past it, by how much of the footprint the
+    // proxy covers. See `probe_proxy_hit`.
+    if (hit.edge_code >= 0) {{
+        // What lies past the proxy, where the ray hit it: traced again as
+        // though it were not there. Else the proxy itself, at its outline.
+        let edge_hit = probe_hit_edge_hit(hit);
+        var side = probe_point_hit(hit.origin + d * hit.edge_t, probe_hit_edge_room(hit), hit.edge_t);
+        if (edge_hit) {{
+            side = probe_trace_skipping(world_pos, d, trace_room, roughness, probe_hit_edge(hit));
+        }}
+        if (side.found) {{
+            let x = probe_traced_colour(side, d, roughness, dir, probe_lod);
+            if (edge_hit) {{
+                col = mix(x, col, hit.edge_cover);
+            }} else {{
+                col = mix(col, x, hit.edge_cover);
+            }}
+        }}
+    }}
+    return col;
+}}
+
 fn probe_environment(
     frag_pos: vec3<f32>,
     dir: vec3<f32>,
@@ -1795,49 +1881,20 @@ fn probe_environment(
     // `probe_traced_colour`.
     let hit = probe_trace(world_pos, d, trace_room, roughness);
     if (hit.found) {{
-        var col = probe_traced_colour(hit, d, roughness, dir, probe_lod);
-        // ACROSS A DOORWAY'S RIM, the lobe's two parts: what the ray found,
-        // and the other side of the rim, weighted by how much of the lobe
-        // passes through the opening. See `probe_rim_at`.
-        if (hit.rim >= 0.0) {{
-            // The wall beside the opening where the ray went through it: a
-            // point already known. Else traced again from just inside the
-            // opening: whatever the doorway shows there, the next room or
-            // outdoors.
-            var side = probe_point_hit(hit.rim_pos, hit.rim_room, hit.rim_t);
-            if (!hit.rim_went_through) {{
-                side = probe_trace(hit.rim_pos, d, -1.0, roughness);
-                side.t = hit.rim_t + side.t;
-            }}
-            if (side.found) {{
-                let x = probe_traced_colour(side, d, roughness, dir, probe_lod);
-                if (hit.rim_went_through) {{
-                    col = mix(x, col, hit.rim);
-                }} else {{
-                    col = mix(col, x, hit.rim);
-                }}
-            }}
+        let secondary = hit.rim >= 0.0 || hit.edge_code >= 0;
+        var slot = -1;
+        if (PROBE_SECONDARY_DEFERRED && secondary) {{
+            slot = probe_fixup_begin(hit, world_pos, d, dir, roughness, probe_lod, trace_room);
         }}
-        // ACROSS A SOLID PROXY'S OUTLINE, the footprint's two parts: the
-        // proxy, and what lies past it, by how much of the footprint the
-        // proxy covers. See `probe_proxy_hit`.
-        if (hit.edge >= 0) {{
-            // What lies past the proxy, where the ray hit it: traced again as
-            // though it were not there. Else the proxy itself, at its outline.
-            var side = probe_point_hit(hit.edge_pos, hit.edge_room, hit.edge_t);
-            if (hit.edge_hit) {{
-                side = probe_trace_skipping(world_pos, d, trace_room, roughness, hit.edge);
-            }}
-            if (side.found) {{
-                let x = probe_traced_colour(side, d, roughness, dir, probe_lod);
-                if (hit.edge_hit) {{
-                    col = mix(x, col, hit.edge_cover);
-                }} else {{
-                    col = mix(col, x, hit.edge_cover);
-                }}
-            }}
+        let col = probe_traced_colour(hit, d, roughness, dir, probe_lod);
+        if (!secondary) {{
+            return col;
         }}
-        return col;
+        if (PROBE_SECONDARY_DEFERRED) {{
+            probe_fixup_finish(slot, col);
+            return col;
+        }}
+        return probe_secondary(hit, col, world_pos, d, dir, roughness, probe_lod, trace_room);
     }}
     let choice = probe_choose(select_world, volume_world);
     let best = choice.best;
@@ -1923,27 +1980,55 @@ struct ProbeHit {{
     portal: i32,
     // How far along the ray the hit is, for the blur. See `probe_hit_lod`.
     t: f32,
+    // WHERE THE TRACE STARTED, held inside its first room or doorway: the rim
+    // and outline points below lie on the ray from here, `rim_t` and `edge_t`
+    // along it, and are worked out from that when they are needed.
+    origin: vec3<f32>,
     // A DOORWAY'S RIM INSIDE THE LOBE, the first one the ray met: how much of
-    // the lobe passes through the opening (0..1), or -1 for none. `rim_pos` is
-    // on the far side of the rim from where this ray went -- just inside the
-    // opening when it hit the wall, on the wall just outside when it went
-    // through -- in room `rim_room`, `rim_t` along the ray. See
-    // `probe_rim_at` and `probe_environment`.
+    // the lobe passes through the opening (0..1), or -1 for none; `rim_t`
+    // along the ray. The rest is packed in `rim_code`: whether the ray went
+    // through the opening (bit 0), the axis crossed (bits 1-2), the doorway
+    // (bits 3-7) and the room the rim was met from, plus one (bits 8-). The
+    // other side of the rim is `probe_hit_rim_point`: just inside the opening
+    // when the ray hit the wall, on the wall just outside when it went
+    // through. See `probe_rim_at` and `probe_secondary`.
+    //
+    // PACKED, and the points not carried, because this rides through every
+    // hop of the trace in a pass whose occupancy is set by its register peak:
+    // 15 values, now 6 (and the origin, which the trace holds anyway).
     rim: f32,
-    rim_went_through: bool,
-    rim_pos: vec3<f32>,
-    rim_room: f32,
     rim_t: f32,
+    rim_code: i32,
     // A SOLID PROXY'S OUTLINE INSIDE THE FOOTPRINT, the first one the ray
-    // passed: which proxy (-1 for none), how much of the footprint it covers
-    // there (0..1), whether this ray hit it, and where its outline is along
-    // the ray. See `probe_proxy_hit` and `probe_environment`.
-    edge: i32,
+    // passed: how much of the footprint it covers there (0..1) and where it is
+    // along the ray; `edge_code` -1 for none, else whether this ray hit it
+    // (bit 0), which proxy (bits 1-5) and its room plus one (bits 6-). See
+    // `probe_proxy_hit`, `probe_hit_edge` and `probe_secondary`.
     edge_cover: f32,
-    edge_hit: bool,
-    edge_pos: vec3<f32>,
-    edge_room: f32,
     edge_t: f32,
+    edge_code: i32,
+}}
+
+// The packed fields of a `ProbeHit`, unpacked. See `rim_code` and `edge_code`.
+fn probe_hit_rim_went_through(h: ProbeHit) -> bool {{
+    return (h.rim_code & 1) != 0;
+}}
+fn probe_hit_rim_room(h: ProbeHit) -> f32 {{
+    return f32((h.rim_code >> 8u) - 1);
+}}
+// The other side of the rim: see `probe_rim_point`.
+fn probe_hit_rim_point(h: ProbeHit, d: vec3<f32>) -> vec3<f32> {{
+    return probe_rim_point(h.origin + d * h.rim_t, (h.rim_code >> 3u) & 31, (h.rim_code >> 1u) & 3, (h.rim_code & 1) == 0);
+}}
+// The proxy whose outline the ray passed, or -1.
+fn probe_hit_edge(h: ProbeHit) -> i32 {{
+    return select(-1, (h.edge_code >> 1u) & 31, h.edge_code >= 0);
+}}
+fn probe_hit_edge_hit(h: ProbeHit) -> bool {{
+    return h.edge_code >= 0 && (h.edge_code & 1) != 0;
+}}
+fn probe_hit_edge_room(h: ProbeHit) -> f32 {{
+    return f32((h.edge_code >> 6u) - 1);
 }}
 
 // How far the eye is from the surface being shaded, for the footprint of a
@@ -2359,17 +2444,13 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
     hit.escaped = false;
     hit.portal = -1;
     hit.t = 0.0;
+    hit.origin = world_pos;
     hit.rim = -1.0;
-    hit.rim_went_through = false;
-    hit.rim_pos = vec3<f32>(0.0);
-    hit.rim_room = -1.0;
     hit.rim_t = 0.0;
-    hit.edge = -1;
+    hit.rim_code = -1;
     hit.edge_cover = 0.0;
-    hit.edge_hit = false;
-    hit.edge_pos = vec3<f32>(0.0);
-    hit.edge_room = -1.0;
     hit.edge_t = 0.0;
+    hit.edge_code = -1;
     let lobe = probe_lobe_tan(roughness);
     // `portal_params.y`: switched off by `perf_ab` measuring it.
     if (roughness > PROBE_TRACE_MAX_ROUGHNESS || camera.portal_params.y > 0.5) {{
@@ -2385,7 +2466,6 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
     // where no photograph saw it, and took another probe's colour: a one-pixel
     // line along every junction (offline_frame, 2026-09-27). Held into the box
     // once, and every point below measured from the held origin.
-    var o = world_pos;
     var in_room = cur >= 0.0;
     if (!in_room) {{
         // A SURFACE IN A DOORWAY -- a jamb, the threshold, the lintel -- stands
@@ -2403,8 +2483,8 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
         let phi = camera.probe_portals[p * 3 + 1].xyz;
         let low = camera.probe_portals[p * 3 + 1].w;
         let high = camera.probe_portals[p * 3 + 2].x;
-        o = clamp(world_pos, plo, phi);
-        var side = select(vec3<f32>(3.4e38), max((phi - o) * inv, (plo - o) * inv), moving);
+        hit.origin = clamp(world_pos, plo, phi);
+        var side = select(vec3<f32>(3.4e38), max((phi - hit.origin) * inv, (plo - hit.origin) * inv), moving);
         side[axis] = 3.4e38;
         let t_side = min(min(side.x, side.y), side.z);
         let next = select(low, high, d[axis] > 0.0);
@@ -2415,9 +2495,9 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
         let wall_far = select(camera.probe_portals[p * 3 + 2].y, camera.probe_portals[p * 3 + 2].z, d[axis] > 0.0);
         let escapes = probe_seen_distance(nslot, d) < 0.0;
         let face = select(camera.probe_boxes[nslot * 3 + 2].xyz, camera.probe_boxes[nslot * 3 + 1].xyz, d > vec3<f32>(0.0));
-        let t_enter = select(max((face[axis] - o[axis]) * inv[axis], 0.0), max((wall_far - o[axis]) * inv[axis], 0.0), escapes);
+        let t_enter = select(max((face[axis] - hit.origin[axis]) * inv[axis], 0.0), max((wall_far - hit.origin[axis]) * inv[axis], 0.0), escapes);
         if (t_side < t_enter) {{
-            hit.pos = o + d * t_side;
+            hit.pos = hit.origin + d * t_side;
             hit.room = low;
             hit.other = high;
             hit.found = true;
@@ -2425,7 +2505,7 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
             return hit;
         }}
         if (escapes) {{
-            hit.pos = o + d * t_enter;
+            hit.pos = hit.origin + d * t_enter;
             hit.room = select(high, low, next == high);
             hit.other = next;
             hit.portal = p;
@@ -2445,9 +2525,9 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
         let lo = camera.probe_boxes[slot * 3 + 1].xyz;
         let hi = camera.probe_boxes[slot * 3 + 2].xyz;
         if (hop == 0 && in_room) {{
-            o = clamp(world_pos, lo, hi);
+            hit.origin = clamp(world_pos, lo, hi);
         }}
-        let start = clamp(o + d * t0, lo, hi);
+        let start = clamp(hit.origin + d * t0, lo, hi);
         let far = select(vec3<f32>(3.4e38), max((hi - start) * inv, (lo - start) * inv), moving);
         var axis = 2;
         var t_exit = far.z;
@@ -2459,24 +2539,21 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
             t_exit = far.y;
         }}
         t_exit = t0 + t_exit;
-        let proxy = probe_proxy_hit(o, d, cur, t0, t_exit, skip, lobe);
+        let proxy = probe_proxy_hit(hit.origin, d, cur, t0, t_exit, skip, lobe);
         let t_obj = proxy.t;
-        if (hit.edge < 0 && proxy.edge >= 0) {{
-            hit.edge = proxy.edge;
+        if (hit.edge_code < 0 && proxy.edge >= 0) {{
             hit.edge_cover = proxy.edge_cover;
-            hit.edge_hit = t_obj < t_exit && proxy.index == proxy.edge;
-            hit.edge_pos = o + d * proxy.edge_t;
-            hit.edge_room = cur;
             hit.edge_t = proxy.edge_t;
+            hit.edge_code = ((i32(cur) + 1) << 6u) | (proxy.edge << 1u) | select(0, 1, t_obj < t_exit && proxy.index == proxy.edge);
         }}
         if (t_obj < t_exit) {{
-            hit.pos = o + d * t_obj;
+            hit.pos = hit.origin + d * t_obj;
             hit.room = cur;
             hit.found = true;
             hit.t = t_obj;
             return hit;
         }}
-        let e = o + d * t_exit;
+        let e = hit.origin + d * t_exit;
         let p = probe_portal_at(e, cur, axis);
         // The first doorway rim within the lobe, whichever side of it this
         // ray lands on. See `probe_rim_at`.
@@ -2484,10 +2561,8 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
             let rim = probe_rim_at(e, cur, axis, t_exit * lobe);
             if (rim.portal >= 0) {{
                 hit.rim = rim.through;
-                hit.rim_went_through = p >= 0;
-                hit.rim_pos = probe_rim_point(e, rim.portal, axis, p < 0);
-                hit.rim_room = cur;
                 hit.rim_t = t_exit;
+                hit.rim_code = ((i32(cur) + 1) << 8u) | (rim.portal << 3u) | (axis << 1u) | select(0, 1, p >= 0);
             }}
         }}
         if (p < 0) {{
@@ -2524,12 +2599,12 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
         let wall_far = select(camera.probe_portals[p * 3 + 2].y, camera.probe_portals[p * 3 + 2].z, d[axis] > 0.0);
         let face = select(camera.probe_boxes[oslot * 3 + 2].xyz, camera.probe_boxes[oslot * 3 + 1].xyz, d > vec3<f32>(0.0));
         let t_enter = select(
-            max((face[axis] - o[axis]) * inv[axis], t_exit),
-            max((wall_far - o[axis]) * inv[axis], t_exit),
+            max((face[axis] - hit.origin[axis]) * inv[axis], t_exit),
+            max((wall_far - hit.origin[axis]) * inv[axis], t_exit),
             escapes
         );
         if (t_side < t_enter) {{
-            hit.pos = o + d * t_side;
+            hit.pos = hit.origin + d * t_side;
             hit.room = cur;
             hit.other = other;
             hit.found = true;
@@ -2537,7 +2612,7 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
             return hit;
         }}
         if (escapes) {{
-            hit.pos = o + d * t_enter;
+            hit.pos = hit.origin + d * t_enter;
             hit.room = cur;
             hit.other = other;
             hit.portal = p;
@@ -2764,7 +2839,8 @@ fn probe_point_hit(pos: vec3<f32>, room: f32, t: f32) -> ProbeHit {{
     h.portal = -1;
     h.t = t;
     h.rim = -1.0;
-    h.edge = -1;
+    h.rim_code = -1;
+    h.edge_code = -1;
     return h;
 }}
 
@@ -4986,8 +5062,8 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let h = probe_trace(o.xyz, normalize(d.xyz), o.w, d.w);
     hits[id.x * 4u] = vec4<f32>(h.pos, select(0.0, 1.0, h.found));
     hits[id.x * 4u + 1u] = vec4<f32>(h.room, h.other, select(0.0, 1.0, h.escaped), f32(h.portal));
-    hits[id.x * 4u + 2u] = vec4<f32>(h.rim, select(0.0, 1.0, h.rim_went_through), h.t, h.rim_t);
-    hits[id.x * 4u + 3u] = vec4<f32>(f32(h.edge), h.edge_cover, select(0.0, 1.0, h.edge_hit), h.edge_t);
+    hits[id.x * 4u + 2u] = vec4<f32>(h.rim, select(0.0, 1.0, probe_hit_rim_went_through(h)), h.t, h.rim_t);
+    hits[id.x * 4u + 3u] = vec4<f32>(f32(probe_hit_edge(h)), h.edge_cover, select(0.0, 1.0, probe_hit_edge_hit(h)), h.edge_t);
 }
 "#
         );

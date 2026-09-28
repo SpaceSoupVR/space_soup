@@ -320,10 +320,12 @@ impl UniformBuffer {
 
         let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("uniform_bgl"),
+            // COMPUTE as well: `probe_fixup` makes the probe pass's deferred
+            // lookups in a compute pass, with this whole block.
             entries: &[
                 BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -333,7 +335,7 @@ impl UniformBuffer {
                 },
                 BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -343,7 +345,7 @@ impl UniformBuffer {
                 },
                 BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Texture {
                         sample_type: TextureSampleType::Depth,
                         view_dimension: TextureViewDimension::D2,
@@ -353,13 +355,13 @@ impl UniformBuffer {
                 },
                 BindGroupLayoutEntry {
                     binding: 3,
-                    visibility: ShaderStages::FRAGMENT,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Sampler(SamplerBindingType::Comparison),
                     count: None,
                 },
                 BindGroupLayoutEntry {
                     binding: 4,
-                    visibility: ShaderStages::FRAGMENT,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Texture {
                         sample_type: TextureSampleType::Depth,
                         // D2, not D2Array: the spots share ONE atlas texture and
@@ -379,7 +381,7 @@ impl UniformBuffer {
                 },
                 BindGroupLayoutEntry {
                     binding: 5,
-                    visibility: ShaderStages::FRAGMENT,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Texture {
                         sample_type: TextureSampleType::Float { filterable: true },
                         // A CUBE ARRAY, so a level's rooms each get their own
@@ -394,7 +396,7 @@ impl UniformBuffer {
                 },
                 BindGroupLayoutEntry {
                     binding: 6,
-                    visibility: ShaderStages::FRAGMENT,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     // Filtering, not comparison: this is colour, not depth.
                     ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
@@ -403,7 +405,7 @@ impl UniformBuffer {
                 // `shadow::SUN_DYNAMIC_DIM`.
                 BindGroupLayoutEntry {
                     binding: 7,
-                    visibility: ShaderStages::FRAGMENT,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Texture {
                         sample_type: TextureSampleType::Depth,
                         view_dimension: TextureViewDimension::D2,
@@ -415,7 +417,7 @@ impl UniformBuffer {
                 // `probe_depth_descriptor`.
                 BindGroupLayoutEntry {
                     binding: 8,
-                    visibility: ShaderStages::FRAGMENT,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Texture {
                         sample_type: TextureSampleType::Float { filterable: true },
                         view_dimension: TextureViewDimension::CubeArray,
@@ -428,7 +430,7 @@ impl UniformBuffer {
                 // which is nowhere.
                 BindGroupLayoutEntry {
                     binding: 9,
-                    visibility: ShaderStages::FRAGMENT,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
                 },

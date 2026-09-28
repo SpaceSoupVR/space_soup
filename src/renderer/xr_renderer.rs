@@ -204,6 +204,13 @@ pub struct XrRenderer {
     brush_probe_pass_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     brush_probe_reader_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     probe_pass_targets: [crate::renderer::brush_pipeline::probe_pass::Target; 2],
+    /// The single-eye probe pass that ships: its secondary lookups left to
+    /// `probe_fixups`, which writes them into each eye's target through
+    /// `probe_fixup_targets`. See `probe_fixup`; the lever
+    /// `deferred_reflection_lookups`.
+    brush_probe_pass_deferred_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    probe_fixups: crate::renderer::probe_fixup::ProbeFixups,
+    probe_fixup_targets: [wgpu::BindGroup; 2],
     /// The same for the multiview scene pass. `None` without multiview, or if
     /// the device refused these pipelines. See `StereoProbePass`.
     stereo_probe: Option<StereoProbePass>,
@@ -699,6 +706,15 @@ impl XrRenderer {
         let probe_pass_targets: [crate::renderer::brush_pipeline::probe_pass::Target; 2] = std::array::from_fn(|_| {
             crate::renderer::brush_pipeline::probe_pass::Target::new(&wgpu_device, &probe_pass_layout, width, height, 1)
         });
+        let probe_fixups = crate::renderer::probe_fixup::ProbeFixups::new(
+            &wgpu_device,
+            &uniform_buf.layout,
+            probe_pass_targets[0].width * probe_pass_targets[0].height,
+        );
+        let brush_probe_pass_deferred_pipeline =
+            crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass_deferred(&wgpu_device, &uniform_buf.layout, &probe_fixups);
+        let probe_fixup_targets: [wgpu::BindGroup; 2] =
+            std::array::from_fn(|eye| probe_fixups.target_bind_group(&wgpu_device, &probe_pass_targets[eye]));
         let brush_depth_prepass = crate::renderer::brush_pipeline::BrushPipeline::new_depth_prepass(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, crate::renderer::multiview::ViewMode::Mono,
         );
@@ -1057,6 +1073,9 @@ impl XrRenderer {
             brush_probe_pass_pipeline,
             brush_probe_reader_pipeline,
             probe_pass_targets,
+            brush_probe_pass_deferred_pipeline,
+            probe_fixups,
+            probe_fixup_targets,
             stereo_probe,
             brush_depth_prepass,
             stereo_depth_prepass,

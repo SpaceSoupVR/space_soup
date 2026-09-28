@@ -1194,6 +1194,10 @@ impl XrRenderer {
                 (Some(sp), true) => (&sp.pass, &sp.reader, &sp.target),
                 _ => (&self.brush_probe_pass_pipeline, &self.brush_probe_reader_pipeline, &self.probe_pass_targets[eye]),
             };
+            // ITS SECONDARY LOOKUPS DEFERRED to a compute pass over just the
+            // texels that need them, in the single-eye pass. See `probe_fixup`.
+            let deferred_lookups = fx.deferred_reflection_lookups && !stereo;
+            let probe_pipeline = if deferred_lookups { &self.brush_probe_pass_deferred_pipeline } else { probe_pipeline };
 
             {
                 let mut encoder = self.wgpu_device.create_command_encoder(
@@ -1202,6 +1206,9 @@ impl XrRenderer {
                 // Once a frame when stereo, like the scene pass it feeds.
                 if probe_pass && (!stereo || eye == 0) {
                     if let Some((vb, ib, count)) = &brush_buffers {
+                        if deferred_lookups {
+                            self.probe_fixups.clear(&mut encoder);
+                        }
                         let t = probe_target;
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("probe_pass"),
@@ -1239,9 +1246,16 @@ impl XrRenderer {
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
                         pass.set_bind_group(2, self.brush_lightmap_bg(), &[]);
+                        if deferred_lookups {
+                            pass.set_bind_group(3, self.probe_fixups.pass_bind_group(), &[]);
+                        }
                         pass.set_vertex_buffer(0, vb.slice(..));
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..*count, 0, 0..1);
+                        drop(pass);
+                        if deferred_lookups {
+                            self.probe_fixups.dispatch(&mut encoder, &self.uniform_buf.bind_group, &self.probe_fixup_targets[eye]);
+                        }
                     }
                 }
                 // ONCE PER FRAME WHEN STEREO, not once per eye. The pass
