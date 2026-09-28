@@ -102,3 +102,11 @@ mod tests {
         assert!(c.int_div_checks);
     }
 }
+
+/// Whether the device reports each pipeline's shader statistics (the
+/// `PIPESTATS` log lines): set by `xr::vulkan::VkContext::new` when
+/// `debug.spacesoup.pipestats` is `1` and the driver has
+/// `VK_KHR_pipeline_executable_properties`. Measurement builds of extra
+/// pipelines -- `BrushPipeline::log_probe_pass_register_cuts` -- run only then.
+pub static PIPELINE_STATISTICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+

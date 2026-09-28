@@ -665,14 +665,17 @@ pub fn append_baked(live: &[Light], baked: &[Light], max: usize) -> Vec<Light> {
 /// anything added here.
 
 pub fn wgsl_lights_block(group_index: u32, binding_index: u32) -> String {
-    wgsl_lights_block_with(group_index, binding_index, false)
+    wgsl_lights_block_with(group_index, binding_index, false, false)
 }
 
 /// `wgsl_lights_block`, where `probe_from_pass` makes `shade_material_env`
 /// take its probe reflection from `probe_env_given` -- the half-resolution
 /// probe pass's answer, set by the brush shader -- instead of tracing it per
-/// pixel. See `brush_pipeline::probe_pass`.
-pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, probe_from_pass: bool) -> String {
+/// pixel. See `brush_pipeline::probe_pass`. `probe_face_always` promises that
+/// every caller of `probe_environment` has set `probe_face_given` -- true of the
+/// probe pass, whose vertex stage chooses each face's room -- so the searches
+/// that serve callers without one are compiled out. See `PROBE_FACE_ALWAYS_GIVEN`.
+pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, probe_from_pass: bool, probe_face_always: bool) -> String {
     let shadow_tex = binding_index + 1;
     let shadow_samp = binding_index + 2;
     let spot_tex = binding_index + 3;
@@ -1017,6 +1020,11 @@ var<private> probe_brightness: f32 = 0.0;
 // constant, so a shader that reads it carries none of the trace: the branch in
 // `shade_material_env` folds away, and the trace's registers with it.
 const PROBE_ENV_FROM_PASS: bool = {probe_from_pass};
+// WHETHER EVERY CALLER OF `probe_environment` HANDS IN ITS FACE'S ROOM
+// (`probe_face_given`), as the half-resolution probe pass does. A constant, so
+// that shader carries none of the searches for callers that do not -- nor the
+// registers their inputs held through the trace. See `probe_environment`.
+const PROBE_FACE_ALWAYS_GIVEN: bool = {probe_face_always};
 // The half-resolution pass's answer for this pixel -- the probe radiance,
 // already normalised, and its coverage -- set by the brush shader before it
 // shades. Only read when `PROBE_ENV_FROM_PASS`.
@@ -1556,38 +1564,22 @@ fn probe_face_room(face_pos: vec3<f32>) -> vec4<f32> {{
     return vec4<f32>(best_room, held, doorway, 1.0);
 }}
 
-fn probe_environment(
-    frag_pos: vec3<f32>,
-    dir: vec3<f32>,
-    roughness: f32,
-    // WHERE TO STAND WHEN CHOOSING THE PROBE, which is not where the fragment
-    // is. For a brush this is the centre of the face, flat-interpolated, so
-    // every fragment of a wall picks the same probe and no seam can open
-    // between neighbouring pixels. Callers with nothing better pass the
-    // fragment position and get exactly the old behaviour.
-    //
-    // The PARALLAX below still uses `frag_pos`: where the reflected ray leaves
-    // from is genuinely per-pixel, and using the face centre for it would flatten
-    // the reflection across the whole face.
-    select_pos: vec3<f32>,
-) -> vec4<f32> {{
-    // INTO WORLD SPACE FIRST.
-    //
-    // Geometry reaches this shader in the PLAYER's frame -- `yaw_inv * (world -
-    // offset)` -- and lighting stays there because the lights are uploaded the
-    // same way. A probe cannot: its box and its cubemap were baked in world
-    // space, against walls that do not move.
-    //
-    // Comparing a player-frame position against a world-space box means the box
-    // slides as the player walks, so the reflection drifts across the wall and
-    // stays visible where the room should have ended. That is what it did.
-    let world_pos = to_world_space(frag_pos);
-    // Selection happens in world space too -- the box it is tested against was
-    // baked there. Same transform, different point.
-    let select_world = to_world_space(select_pos);
-    let volume_world = select(select_world, to_world_space(probe_volume_pos.xyz), probe_volume_pos.w > 0.5);
-    let world_dir = to_world_direction(dir);
-    probe_brightness = 0.0;
+// WHICH PHOTOGRAPHS a surface at `select_world` takes where its reflection is
+// not traced, and which ROOM it is in when its face does not say. Made only
+// where something needs it; see `probe_environment`.
+struct ProbeChoice {{
+    // The nearest photograph and the runner-up it blends with, -1 for none,
+    // and their SQUARED distances from the surface.
+    best: i32,
+    second: i32,
+    best_dist: f32,
+    second_dist: f32,
+    // The room they photograph: the face's own when given, else the tightest
+    // box holding `volume_world`.
+    room: f32,
+}}
+
+fn probe_choose(select_world: vec3<f32>, volume_world: vec3<f32>) -> ProbeChoice {{
     let count = i32(camera.probe_params.x);
     // NEAREST CAPTURE POINT, then smallest box.
     //
@@ -1605,34 +1597,23 @@ fn probe_environment(
     var best_dist = 1e30;
     var best_room = -1.0;
     // The RUNNER-UP, so the change from one cell to the next is a blend rather
-    // than a switch. See the mix at the end of this function.
+    // than a switch. See the mix at the end of `probe_environment`.
     var second = -1;
     var second_dist = 1e30;
     // THE ROOM IS A PROPERTY OF THE FACE, so a caller whose vertex stage has
     // already chosen it -- `probe_face_room`, once a vertex instead of once a
     // pixel -- hands it in through `probe_face_given`, and only the choice of
     // photograph WITHIN that room, which does depend on the pixel, is made
-    // here. The same comparisons as the full loop below, over the same slots
-    // in the same order: its first slot of the chosen room resets exactly as
-    // `tighter` does, and the rest compete as `same_room_but_nearer` does.
-    let face_given = probe_face_given.w > 0.5;
-    if (face_given) {{
-        if (probe_face_given.y > 0.5) {{
-            best_room = probe_face_given.x;
-            for (var i = probe_room_slot(best_room); i >= 0; i = probe_slot_next(i)) {{
-                let to_centre = camera.probe_boxes[i * 3].xyz - select_world;
-                let dist = dot(to_centre, to_centre);
-                if (dist < best_dist) {{
-                    second = best;
-                    second_dist = best_dist;
-                    best_dist = dist;
-                    best = i;
-                }} else if (dist < second_dist) {{
-                    second = i;
-                    second_dist = dist;
-                }}
-            }}
-        }}
+    // here. See `probe_choose_in_room`.
+    let face_given = PROBE_FACE_ALWAYS_GIVEN || probe_face_given.w > 0.5;
+    var c: ProbeChoice;
+    c.best = -1;
+    c.second = -1;
+    c.best_dist = 1e30;
+    c.second_dist = 1e30;
+    c.room = -1.0;
+    if (face_given && probe_face_given.y > 0.5) {{
+        c = probe_choose_in_room(probe_face_given.x, select_world);
     }}
     for (var i = 0; i < count && !face_given; i = i + 1) {{
         let lo = camera.probe_boxes[i * 3 + 1].xyz;
@@ -1682,6 +1663,84 @@ fn probe_environment(
         }}
     }}
 
+    if (!face_given) {{
+        c.best = best;
+        c.second = second;
+        c.best_dist = best_dist;
+        c.second_dist = second_dist;
+        c.room = best_room;
+    }}
+    return c;
+}}
+
+// The nearest two of `room`'s photographs to `select_world`: `probe_choose`
+// for a face whose room is given. The same comparisons as its full loop, over
+// the same slots in the same order: the room's first slot resets exactly as
+// `tighter` does there, and the rest compete as `same_room_but_nearer` does.
+fn probe_choose_in_room(room: f32, select_world: vec3<f32>) -> ProbeChoice {{
+    var c: ProbeChoice;
+    c.best = -1;
+    c.second = -1;
+    c.best_dist = 1e30;
+    c.second_dist = 1e30;
+    c.room = room;
+    for (var i = probe_room_slot(room); i >= 0; i = probe_slot_next(i)) {{
+        let to_centre = camera.probe_boxes[i * 3].xyz - select_world;
+        let dist = dot(to_centre, to_centre);
+        if (dist < c.best_dist) {{
+            c.second = c.best;
+            c.second_dist = c.best_dist;
+            c.best_dist = dist;
+            c.best = i;
+        }} else if (dist < c.second_dist) {{
+            c.second = i;
+            c.second_dist = dist;
+        }}
+    }}
+    return c;
+}}
+
+fn probe_environment(
+    frag_pos: vec3<f32>,
+    dir: vec3<f32>,
+    roughness: f32,
+    // WHERE TO STAND WHEN CHOOSING THE PROBE, which is not where the fragment
+    // is. For a brush this is the centre of the face, flat-interpolated, so
+    // every fragment of a wall picks the same probe and no seam can open
+    // between neighbouring pixels. Callers with nothing better pass the
+    // fragment position and get exactly the old behaviour.
+    //
+    // The PARALLAX below still uses `frag_pos`: where the reflected ray leaves
+    // from is genuinely per-pixel, and using the face centre for it would flatten
+    // the reflection across the whole face.
+    select_pos: vec3<f32>,
+) -> vec4<f32> {{
+    // INTO WORLD SPACE FIRST.
+    //
+    // Geometry reaches this shader in the PLAYER's frame -- `yaw_inv * (world -
+    // offset)` -- and lighting stays there because the lights are uploaded the
+    // same way. A probe cannot: its box and its cubemap were baked in world
+    // space, against walls that do not move.
+    //
+    // Comparing a player-frame position against a world-space box means the box
+    // slides as the player walks, so the reflection drifts across the wall and
+    // stays visible where the room should have ended. That is what it did.
+    let world_pos = to_world_space(frag_pos);
+    // Selection happens in world space too -- the box it is tested against was
+    // baked there. Same transform, different point.
+    let select_world = to_world_space(select_pos);
+    let volume_world = select(select_world, to_world_space(probe_volume_pos.xyz), probe_volume_pos.w > 0.5);
+    let world_dir = to_world_direction(dir);
+    probe_brightness = 0.0;
+    let face_given = PROBE_FACE_ALWAYS_GIVEN || probe_face_given.w > 0.5;
+    // Whether a doorway's carve holds the face: also the face's, so also given.
+    var in_doorway = false;
+    if (face_given) {{
+        in_doorway = probe_face_given.z > 0.5;
+    }} else {{
+        in_doorway = probe_portal_holding(volume_world) >= 0;
+    }}
+
     let d = normalize(world_dir);
     let probe_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);
     // TRACED: see `probe_trace` -- exact against the rooms, their doorways and
@@ -1707,41 +1766,55 @@ fn probe_environment(
     // nothing at all (headset, 2026-09-27 19:09). A face inside a doorway's
     // carve that no room claims is traced from the doorway, which is what
     // `probe_trace` does with a room of -1.
-    var trace_room = best_room;
-    // Whether a doorway's carve holds the face: also the face's, so also given.
-    var in_doorway = false;
-    if (face_given) {{
-        in_doorway = probe_face_given.z > 0.5;
-    }} else {{
-        in_doorway = probe_portal_holding(volume_world) >= 0;
+    //
+    // THE TRACE NEEDS ONLY THE ROOM, which a given face carries. The
+    // photographs are chosen before it only where it cannot start without
+    // them -- no room given, or a face in a doorway -- and then only to find
+    // the room; they are chosen (again) after it, where it found nothing.
+    // Chosen once, first, on every pixel, the choice was carried unused
+    // through the whole trace in registers the probe pass is short of (36%
+    // wave occupancy, 2026-09-28). The same choice either way: see
+    // `probe_choose`.
+    var trace_room = -1.0;
+    if (face_given && probe_face_given.y > 0.5) {{
+        trace_room = probe_face_given.x;
     }}
-    if (in_doorway && (best < 0 || probe_seen_distance(best, d) < 0.0)) {{
-        trace_room = -1.0;
+    if (!face_given || in_doorway) {{
+        let early = probe_choose(select_world, volume_world);
+        trace_room = early.room;
+        if (in_doorway && (early.best < 0 || probe_seen_distance(early.best, d) < 0.0)) {{
+            trace_room = -1.0;
+        }}
     }}
     probe_eye_distance = distance(cam_pos(), frag_pos);
+    // ONE COLOUR LOOKUP A HIT, never two. A hit that left the rooms is
+    // coloured from what lies out there, and only that: the photographs of
+    // the doorway it left through were read as well, and thrown away, on
+    // every such pixel -- two depth and two colour reads each time, three
+    // times over with the rim and outline lookups below. See
+    // `probe_traced_colour`.
     let hit = probe_trace(world_pos, d, trace_room, roughness);
     if (hit.found) {{
-        var col = probe_hit_colour(hit.pos, hit.room, hit.other, roughness, hit.t);
-        if (hit.escaped) {{
-            col = probe_escape_colour(hit.pos, d, hit.room, hit.other, hit.portal, dir, probe_lod);
-        }}
+        var col = probe_traced_colour(hit, d, roughness, dir, probe_lod);
         // ACROSS A DOORWAY'S RIM, the lobe's two parts: what the ray found,
         // and the other side of the rim, weighted by how much of the lobe
         // passes through the opening. See `probe_rim_at`.
         if (hit.rim >= 0.0) {{
-            if (hit.rim_went_through) {{
-                let wall = probe_hit_colour(hit.rim_pos, hit.rim_room, -1.0, roughness, hit.rim_t);
-                col = mix(wall, col, hit.rim);
-            }} else {{
-                // Traced again from just inside the opening: whatever the
-                // doorway shows there, the next room or outdoors.
-                let alt = probe_trace(hit.rim_pos, d, -1.0, roughness);
-                if (alt.found) {{
-                    var beyond = probe_hit_colour(alt.pos, alt.room, alt.other, roughness, hit.rim_t + alt.t);
-                    if (alt.escaped) {{
-                        beyond = probe_escape_colour(alt.pos, d, alt.room, alt.other, alt.portal, dir, probe_lod);
-                    }}
-                    col = mix(col, beyond, hit.rim);
+            // The wall beside the opening where the ray went through it: a
+            // point already known. Else traced again from just inside the
+            // opening: whatever the doorway shows there, the next room or
+            // outdoors.
+            var side = probe_point_hit(hit.rim_pos, hit.rim_room, hit.rim_t);
+            if (!hit.rim_went_through) {{
+                side = probe_trace(hit.rim_pos, d, -1.0, roughness);
+                side.t = hit.rim_t + side.t;
+            }}
+            if (side.found) {{
+                let x = probe_traced_colour(side, d, roughness, dir, probe_lod);
+                if (hit.rim_went_through) {{
+                    col = mix(x, col, hit.rim);
+                }} else {{
+                    col = mix(col, x, hit.rim);
                 }}
             }}
         }}
@@ -1749,22 +1822,29 @@ fn probe_environment(
         // proxy, and what lies past it, by how much of the footprint the
         // proxy covers. See `probe_proxy_hit`.
         if (hit.edge >= 0) {{
+            // What lies past the proxy, where the ray hit it: traced again as
+            // though it were not there. Else the proxy itself, at its outline.
+            var side = probe_point_hit(hit.edge_pos, hit.edge_room, hit.edge_t);
             if (hit.edge_hit) {{
-                let past = probe_trace_skipping(world_pos, d, trace_room, roughness, hit.edge);
-                if (past.found) {{
-                    var beyond = probe_hit_colour(past.pos, past.room, past.other, roughness, past.t);
-                    if (past.escaped) {{
-                        beyond = probe_escape_colour(past.pos, d, past.room, past.other, past.portal, dir, probe_lod);
-                    }}
-                    col = mix(beyond, col, hit.edge_cover);
+                side = probe_trace_skipping(world_pos, d, trace_room, roughness, hit.edge);
+            }}
+            if (side.found) {{
+                let x = probe_traced_colour(side, d, roughness, dir, probe_lod);
+                if (hit.edge_hit) {{
+                    col = mix(x, col, hit.edge_cover);
+                }} else {{
+                    col = mix(col, x, hit.edge_cover);
                 }}
-            }} else {{
-                let proxy_col = probe_hit_colour(hit.edge_pos, hit.edge_room, -1.0, roughness, hit.edge_t);
-                col = mix(col, proxy_col, hit.edge_cover);
             }}
         }}
         return col;
     }}
+    let choice = probe_choose(select_world, volume_world);
+    let best = choice.best;
+    let second = choice.second;
+    let best_dist = choice.best_dist;
+    let second_dist = choice.second_dist;
+    let best_room = choice.room;
     // NOT an early return when nothing contains this surface: a doorway's own
     // jambs and threshold sit in the wall, inside no room, and the portal pass
     // below is what gives them a photograph.
@@ -2658,6 +2738,36 @@ fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32)
     return col / (w0 + w1);
 }}
 
+// THE COLOUR OF A TRACED HIT: where the ray left the rooms, what lies out
+// there (`probe_escape_colour`); else the photographs of its room that saw it
+// (`probe_hit_colour`). One or the other, never both. One exit: a helper with
+// early returns, inlined into a loop, measured slower on the headset.
+fn probe_traced_colour(h: ProbeHit, d: vec3<f32>, roughness: f32, sky_dir: vec3<f32>, lod: f32) -> vec4<f32> {{
+    var col: vec4<f32>;
+    if (h.escaped) {{
+        col = probe_escape_colour(h.pos, d, h.room, h.other, h.portal, sky_dir, lod);
+    }} else {{
+        col = probe_hit_colour(h.pos, h.room, h.other, roughness, h.t);
+    }}
+    return col;
+}}
+
+// A hit at a point already known -- the wall beside a doorway's rim, a solid
+// proxy's outline -- in `room`, `t` along the ray, on no doorway.
+fn probe_point_hit(pos: vec3<f32>, room: f32, t: f32) -> ProbeHit {{
+    var h: ProbeHit;
+    h.pos = pos;
+    h.room = room;
+    h.other = -1.0;
+    h.found = true;
+    h.escaped = false;
+    h.portal = -1;
+    h.t = t;
+    h.rim = -1.0;
+    h.edge = -1;
+    return h;
+}}
+
 // THE DIRECTION TO LOOK UP PROBE `slot` IN for a reflection leaving `world_pos`
 // along `d`: the reflected ray is run out to the probe's box and the cube is
 // read towards that hit FROM THE PROBE'S OWN CAPTURE POINT. Per slot, because
@@ -2883,7 +2993,10 @@ fn probe_env_for_pass(
     let r = clamp(roughness, 0.04, 1.0);
     let env_n = normalize(mix(n, geom_n, smoothstep(0.1, 0.4, r)));
     let refl = reflect(-view_dir, env_n);
-    let probe = probe_environment(world_pos, refl, roughness, probe_select_pos);
+    // THE LIGHT AT THIS PIXEL FIRST, then the reflection: one number carried
+    // through the trace instead of the normal, the baked light and the
+    // occlusion it is made from -- eight registers, in a pass that is short
+    // of them (see `probe_choose`).
     let occ = clamp(ao, 0.0, 1.0) * clamp(sky_vis, 0.0, 1.0);
     // The sky only where some reaches: `occ` is exactly 0 across most of an
     // interior, and there the nine-term sum was computed to be multiplied by it.
@@ -2892,6 +3005,7 @@ fn probe_env_for_pass(
         sky_here = sky_irradiance(n) * occ;
     }}
     let ambient_here = dot(env + sky_here, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let probe = probe_environment(world_pos, refl, roughness, probe_select_pos);
     let probe_scale = select(
         1.0,
         clamp(ambient_here / max(probe_brightness, 1e-4), PROBE_NORMALISATION_FLOOR, 1.0),

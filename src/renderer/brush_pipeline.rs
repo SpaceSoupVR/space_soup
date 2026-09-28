@@ -1300,18 +1300,72 @@ impl BrushPipeline {
         probe: BrushProbe,
         probe_layout: Option<&BindGroupLayout>,
     ) -> Self {
+        let source = brush_shader_probe(false, sources, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, probe);
+        // Named by what it does, so a GPU profile or `PIPESTATS` line says
+        // which of the three it is.
+        let label = match probe {
+            BrushProbe::Trace => "brush_pipeline",
+            BrushProbe::Pass => "brush_probe_pass",
+            BrushProbe::Read => "brush_pipeline_read",
+        };
+        Self::from_source(device, format, uniform_layout, front_face, samples, blend, view, probe_layout, label, source)
+    }
+
+    /// MEASUREMENT ONLY: the probe pass's shader with one part of it cut out
+    /// at a time (`PROBE_PASS_REGISTER_CUTS`), each built as a pipeline of its
+    /// own that nothing draws with, so the driver reports each one's
+    /// registers (`PIPESTATS`; see `shader_checks::PIPELINE_STATISTICS`). The
+    /// pass's occupancy is set by its register PEAK, and where the count
+    /// drops is where the peak was.
+    pub fn log_probe_pass_register_cuts(device: &Device, uniform_layout: &BindGroupLayout) {
+        let base = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Pass);
+        for (label, edits) in PROBE_PASS_REGISTER_CUTS {
+            let mut src = base.clone();
+            let mut missing = None;
+            for (from, to) in edits.iter() {
+                if !src.contains(from) {
+                    missing = Some(*from);
+                    break;
+                }
+                src = src.replacen(from, to, 1);
+            }
+            match missing {
+                Some(from) => log::warn!("register cut {label}: `{from}` is not in the shader"),
+                None => {
+                    let _ = Self::from_source(
+                        device,
+                        probe_pass::FORMAT,
+                        uniform_layout,
+                        FrontFace::Ccw,
+                        1,
+                        None,
+                        crate::renderer::multiview::ViewMode::Mono,
+                        None,
+                        label,
+                        src,
+                    );
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_source(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        front_face: FrontFace,
+        samples: u32,
+        blend: Option<BlendState>,
+        view: crate::renderer::multiview::ViewMode,
+        probe_layout: Option<&BindGroupLayout>,
+        label: &str,
+        source: String,
+    ) -> Self {
         // Audited: see `shader_checks`.
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("brush_shader"),
-            source: ShaderSource::Wgsl(
-                crate::renderer::shader_precision::for_device(
-                    device,
-                    view.shader(brush_shader_probe(
-                        false, sources, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, probe,
-                    )),
-                )
-                .into(),
-            ),
+            source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, view.shader(source)).into()),
         });
         let material_layout = brush_material_bind_group_layout(device);
         // Shared with the mesh and cuboid pipelines: a lightmap is a lightmap,
@@ -1327,7 +1381,7 @@ impl BrushPipeline {
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("brush_pipeline"),
+            label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -1628,6 +1682,27 @@ fn brush_shader_with(ssr: bool) -> String {
 ///
 /// Mono scene passes only for now; a stereo pass keeps tracing per pixel.
 /// `Levers::half_res_reflections` switches it off to measure it.
+/// MEASUREMENT ONLY: what `BrushPipeline::log_probe_pass_register_cuts` cuts
+/// out of the probe pass's shader, one pipeline each -- text edits of the
+/// generated WGSL. They change what the shader computes; nothing draws with them.
+const PROBE_PASS_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
+    ("cut_none", &[]),
+    ("cut_edge_lookup", &[("        if (hit.edge >= 0) {\n", "        if (false) {\n")]),
+    ("cut_rim_lookup", &[("        if (hit.rim >= 0.0) {\n", "        if (false) {\n")]),
+    (
+        "cut_both_lookups",
+        &[("        if (hit.edge >= 0) {\n", "        if (false) {\n"), ("        if (hit.rim >= 0.0) {\n", "        if (false) {\n")],
+    ),
+    ("cut_edge_detect", &[("        if (camera.probe_proxies[i * 3 + 1].w < 0.5 && out.edge < 0) {", "        if (false) {")]),
+    ("cut_rim_detect", &[("        if (hit.rim < 0.0 && t_exit * lobe > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
+    ("cut_proxies", &[("    for (var i = probe_room_proxy(room); i >= 0; i = probe_proxy_next(i)) {", "    for (var i = -1; i >= 0; i = probe_proxy_next(i)) {")]),
+    ("cut_proxy_surface", &[("    if (s0 < 0) {\n        return 3.4e38;\n    }", "    if (true) {\n        return 3.4e38;\n    }")]),
+    ("cut_escape_colour", &[("    if (h.escaped) {\n        col = probe_escape_colour(", "    if (false) {\n        col = probe_escape_colour(")]),
+    ("cut_untraced", &[("    return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);", "    return own;")]),
+    ("cut_one_hop", &[("const PROBE_TRACE_ROOMS: i32 = 3;", "const PROBE_TRACE_ROOMS: i32 = 1;")]),
+    ("cut_trace", &[("    if (roughness > PROBE_TRACE_MAX_ROUGHNESS || camera.portal_params.y > 0.5) {", "    if (true) {")]),
+];
+
 pub mod probe_pass {
     use wgpu::{
         AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
@@ -2398,7 +2473,7 @@ struct VOut {{
 {lighting}{tail}
 }}
 "#,
-        lights_block = crate::renderer::lights::wgsl_lights_block_with(0, 1, probe == BrushProbe::Read),
+        lights_block = crate::renderer::lights::wgsl_lights_block_with(0, 1, probe == BrushProbe::Read, probe == BrushProbe::Pass),
         ssr_block = ssr_block,
         sun_mask_range = SUN_MASK_DISTANCE_TEXELS,
         stationary_range = STATIONARY_MASK_DISTANCE_TEXELS,
@@ -4186,6 +4261,28 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         // each step on the per-texel path.
         assert!(edges > 60 && edges < (W * H / 4) as usize, "{edges} edge pixels");
         eprintln!("upsample: worst difference {worst:.5} over {} pixels, {edges} on an edge", W * H);
+    }
+
+    /// Every measurement cut of the probe pass still finds its text in the
+    /// generated shader -- a cut that no longer applies would report the
+    /// uncut shader under its name -- and the result is valid WGSL. See
+    /// `BrushPipeline::log_probe_pass_register_cuts`.
+    #[test]
+    fn every_probe_pass_register_cut_applies_and_validates() {
+        use wgpu::naga;
+        let base = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Pass);
+        for (label, edits) in PROBE_PASS_REGISTER_CUTS {
+            let mut src = base.clone();
+            for (from, to) in edits.iter() {
+                assert!(src.contains(from), "{label}: `{from}` is not in the probe pass shader");
+                src = src.replacen(from, to, 1);
+            }
+            let module = naga::front::wgsl::parse_str(&src)
+                .unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
     }
 
     /// THE HALF-RESOLUTION PROBE PASS AND THE BRUSH THAT READS IT build on a
