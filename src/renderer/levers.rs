@@ -27,11 +27,20 @@
 //!
 //! Unknown names are an ERROR, not ignored: a lever misspelt in the middle of a
 //! headset session would otherwise measure nothing and look like a finding.
+//!
+//! # A viewpoint is a lever too
+//!
+//! `bench` pins the camera to a named place (see `bench`), so the same file
+//! that switches a feature off also says where the frame is measured from. A
+//! host script walks the views and the A/B schedule with the headset on a
+//! desk: `quest_app/bench.py`.
 
 use serde::Deserialize;
 
 /// Every switchable feature. The default is the shipped renderer.
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+///
+/// `Clone`, not `Copy`: the bench viewpoint carries its name.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Levers {
     /// Reflection probes at all. Off: surfaces reflect the sky's harmonics.
@@ -78,6 +87,10 @@ pub struct Levers {
     pub direct_path: bool,
     /// Cycle `perf_ab`'s phases, one per `PERF` window, on top of these levers.
     pub ab_cycle: bool,
+    /// MEASUREMENT: the camera pinned to a named viewpoint instead of the
+    /// head. The app moves the rig and the renderer pins the tracked head;
+    /// see `bench`.
+    pub bench: Option<crate::renderer::bench::BenchPose>,
 }
 
 impl Default for Levers {
@@ -100,6 +113,7 @@ impl Default for Levers {
             half_viewport: false,
             direct_path: false,
             ab_cycle: false,
+            bench: None,
         }
     }
 }
@@ -110,7 +124,11 @@ impl Levers {
         if text.trim().is_empty() {
             return Ok(Self::default());
         }
-        serde_json::from_str(text).map_err(|e| e.to_string())
+        let levers: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        if let Some(problem) = levers.bench.as_ref().and_then(|b| b.problem()) {
+            return Err(problem);
+        }
+        Ok(levers)
     }
 
     /// These levers with the `perf_ab` phase's one extra switch applied.
@@ -166,6 +184,9 @@ impl Levers {
         }
         if let Some(on) = self.multiview {
             out.push(format!("multiview={}", if on { "on" } else { "off" }));
+        }
+        if let Some(b) = &self.bench {
+            out.push(format!("bench={}", b.name));
         }
         if out.is_empty() {
             "-".to_string()
@@ -232,7 +253,7 @@ mod tests {
     fn a_lever_changes_only_itself() {
         let l = Levers::parse(r#"{"probe_trace": false, "ssr": true}"#).unwrap();
         assert!(!l.probe_trace && l.ssr == Some(true));
-        assert_eq!(Levers { probe_trace: true, ssr: None, ..l }, Levers::default());
+        assert_eq!(Levers { probe_trace: true, ssr: None, ..l.clone() }, Levers::default());
         assert_eq!(l.summary(), "no_probe_trace,ssr=on");
     }
 
@@ -240,6 +261,30 @@ mod tests {
     #[test]
     fn an_unknown_lever_is_an_error() {
         assert!(Levers::parse(r#"{"probe_tarce": false}"#).is_err());
+    }
+
+    /// The viewpoint rides in the same file and is named on every line.
+    #[test]
+    fn a_bench_view_is_read_and_named() {
+        let l = Levers::parse(r#"{"bench": {"name": "hall_back", "eye": [-1.3, 1.6, -14.5], "at": [0.4, 2.4, 3.7]}, "ab_cycle": true}"#)
+            .unwrap();
+        let b = l.bench.as_ref().unwrap();
+        assert_eq!((b.name.as_str(), b.eye, b.at), ("hall_back", [-1.3, 1.6, -14.5], [0.4, 2.4, 3.7]));
+        assert_eq!(l.summary(), "ab_cycle,bench=hall_back");
+    }
+
+    /// A view that cannot be pinned -- a misspelt field, a name that would
+    /// split the summary, no direction -- is refused like a misspelt lever.
+    #[test]
+    fn a_bench_view_that_cannot_be_used_is_an_error() {
+        for bad in [
+            r#"{"bench": {"name": "a", "eye": [0, 1, 0], "look_at": [0, 1, -1]}}"#,
+            r#"{"bench": {"name": "a,b", "eye": [0, 1, 0], "at": [0, 1, -1]}}"#,
+            r#"{"bench": {"name": "a", "eye": [0, 1, 0], "at": [0, 1, 0]}}"#,
+            r#"{"bench": {"name": "a", "eye": [0, 1], "at": [0, 1, -1]}}"#,
+        ] {
+            assert!(Levers::parse(bad).is_err(), "accepted {bad}");
+        }
     }
 
     /// Each phase is the levers with exactly one more thing switched, so the

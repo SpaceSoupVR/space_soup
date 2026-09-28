@@ -26,6 +26,7 @@ pub mod uniforms;
 pub mod probe_prefilter;
 pub mod multiview;
 pub mod pass_timers;
+pub mod bench;
 pub mod levers;
 pub mod perf_ab;
 pub mod scene_pass_plan;

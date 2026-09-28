@@ -319,12 +319,32 @@ pub struct XrRenderer {
     /// slot per pass kind would silently report only whichever eye was
     /// submitted last.
     pass_timers: Option<crate::renderer::pass_timers::PassTimers>,
-    /// How many `PERF` windows have been logged, which selects the
-    /// `perf_ab::Phase` for the frames of the next one.
+    /// How many `PERF` windows have been logged since the levers last
+    /// changed, which selects the `perf_ab::Phase` for the frames of the next
+    /// one. Restarted with the levers, so every viewpoint's schedule starts at
+    /// its baseline.
     perf_windows: u64,
+    /// Every window since start, warm-ups included: the results file's index.
+    perf_window_index: u64,
+    /// The next window straddles a change of levers, so it measures neither
+    /// configuration: logged as `warmup` and left out of the schedule.
+    perf_warmup: bool,
     /// The runtime's counters, logged beside `PERF`. `None` without the
     /// extension. See `xr::perf_metrics`.
     perf_metrics: Option<crate::xr::PerfMetrics>,
+    /// Those counters summed over the window's measured frames.
+    perf_metric_window: crate::perf_metrics_log::WindowMeans,
+    /// Where each window is also written, one JSON line apiece: the host
+    /// script's copy, which no ring buffer can drop. See `perf_record`.
+    perf_log: Option<crate::perf_record::PerfLog>,
+    /// When the renderer was made, for the results file's clock.
+    started_at: std::time::Instant,
+    /// The tracked head, pinned: position and orientation in stage space. The
+    /// eyes are moved onto it after they are located. See `bench`.
+    pinned_head: Option<(glam::Vec3, glam::Quat)>,
+    /// Each eye's field of view the last time the runtime located the views,
+    /// for a pinned frame the runtime could not locate.
+    last_fov: Option<[xr::Fovf; 2]>,
     /// The level's Baked lamps, in the player's frame, for surfaces with no
     /// lightmap to carry them. See `lights::append_baked`.
     baked_lights: Vec<crate::renderer::lights::Light>,
@@ -380,8 +400,33 @@ pub struct XrRenderer {
     shadow_diag_frames: std::cell::Cell<u64>,
 }
 
+/// One `PERF` window's numbers, handed back on the frame that closes it.
+struct WindowStats {
+    frames: u64,
+    cpu_avg: f64,
+    cpu_max: f64,
+    gpu_avg: f64,
+    gpu_max: f64,
+    frame_ms: f64,
+    fps: f64,
+}
+
+/// What `FrameStats::record` made of a frame.
+struct FrameOutcome {
+    /// It counted toward the window's averages (it was not settling).
+    measured: bool,
+    /// It closed the window, which was logged.
+    closed: Option<WindowStats>,
+}
+
 struct FrameStats {
     window: u64,
+    /// The leading frames of every window left out of its averages. A phase
+    /// or a lever switches on a window boundary, and the frames right after
+    /// the switch pay for it -- a shadow map redrawn, probes uploaded -- which
+    /// belongs to neither configuration.
+    settle: u64,
+    /// Frames into the current window.
     count: u64,
     last_frame: Option<std::time::Instant>,
     cpu_ms_sum: f64,
@@ -393,9 +438,10 @@ struct FrameStats {
 }
 
 impl FrameStats {
-    fn new(window: u64) -> Self {
+    fn new(window: u64, settle: u64) -> Self {
         Self {
             window,
+            settle: settle.min(window.saturating_sub(1)),
             count: 0,
             last_frame: None,
             cpu_ms_sum: 0.0,
@@ -407,55 +453,70 @@ impl FrameStats {
         }
     }
 
-    /// True on the frames that just logged, so a caller can hang its own
-    /// once-per-window reporting off the same beat instead of keeping a second
-    /// counter that drifts from this one.
+    /// Starts the window again, dropping what the current one had: the frames
+    /// so far ran under something that no longer holds.
+    fn restart(&mut self) {
+        let (window, settle) = (self.window, self.settle);
+        *self = Self::new(window, settle);
+    }
+
+    /// The window closes on its `window`-th frame, which is when a caller
+    /// hangs its own once-per-window reporting off the same beat instead of
+    /// keeping a second counter that drifts from this one.
     fn record(
         &mut self,
         cpu: std::time::Duration,
         gpu: std::time::Duration,
         now: std::time::Instant,
-    ) -> bool {
-        let cpu_ms = cpu.as_secs_f64() * 1000.0;
-        let gpu_ms = gpu.as_secs_f64() * 1000.0;
-        self.cpu_ms_sum += cpu_ms;
-        self.gpu_ms_sum += gpu_ms;
-        self.cpu_ms_max = self.cpu_ms_max.max(cpu_ms);
-        self.gpu_ms_max = self.gpu_ms_max.max(gpu_ms);
-        if let Some(prev) = self.last_frame {
-            self.period_ms_sum += (now - prev).as_secs_f64() * 1000.0;
-            self.period_samples += 1;
+    ) -> FrameOutcome {
+        self.count += 1;
+        let measured = self.count > self.settle;
+        if measured {
+            let cpu_ms = cpu.as_secs_f64() * 1000.0;
+            let gpu_ms = gpu.as_secs_f64() * 1000.0;
+            self.cpu_ms_sum += cpu_ms;
+            self.gpu_ms_sum += gpu_ms;
+            self.cpu_ms_max = self.cpu_ms_max.max(cpu_ms);
+            self.gpu_ms_max = self.gpu_ms_max.max(gpu_ms);
+            if let Some(prev) = self.last_frame {
+                self.period_ms_sum += (now - prev).as_secs_f64() * 1000.0;
+                self.period_samples += 1;
+            }
         }
         self.last_frame = Some(now);
-        self.count += 1;
-
-        let logged = self.count % self.window == 0;
-        if logged {
-            let n = self.window as f64;
-            let avg_period = if self.period_samples > 0 {
-                self.period_ms_sum / self.period_samples as f64
-            } else {
-                0.0
-            };
-            let fps = if avg_period > 0.0 { 1000.0 / avg_period } else { 0.0 };
-            info!(
-                "PERF: cpu_avg={:.2}ms cpu_max={:.2}ms | gpu_avg={:.2}ms gpu_max={:.2}ms | frame={:.2}ms (~{:.1}fps) over {} frames",
-                self.cpu_ms_sum / n,
-                self.cpu_ms_max,
-                self.gpu_ms_sum / n,
-                self.gpu_ms_max,
-                avg_period,
-                fps,
-                self.window,
-            );
-            self.cpu_ms_sum = 0.0;
-            self.gpu_ms_sum = 0.0;
-            self.period_ms_sum = 0.0;
-            self.period_samples = 0;
-            self.cpu_ms_max = 0.0;
-            self.gpu_ms_max = 0.0;
+        if self.count < self.window {
+            return FrameOutcome { measured, closed: None };
         }
-        logged
+
+        let frames = self.window - self.settle;
+        let n = frames as f64;
+        let avg_period = if self.period_samples > 0 {
+            self.period_ms_sum / self.period_samples as f64
+        } else {
+            0.0
+        };
+        let fps = if avg_period > 0.0 { 1000.0 / avg_period } else { 0.0 };
+        let stats = WindowStats {
+            frames,
+            cpu_avg: self.cpu_ms_sum / n,
+            cpu_max: self.cpu_ms_max,
+            gpu_avg: self.gpu_ms_sum / n,
+            gpu_max: self.gpu_ms_max,
+            frame_ms: avg_period,
+            fps,
+        };
+        info!(
+            "PERF: cpu_avg={:.2}ms cpu_max={:.2}ms | gpu_avg={:.2}ms gpu_max={:.2}ms | frame={:.2}ms (~{:.1}fps) over {} frames",
+            stats.cpu_avg, stats.cpu_max, stats.gpu_avg, stats.gpu_max, stats.frame_ms, stats.fps, stats.frames,
+        );
+        self.count = 0;
+        self.cpu_ms_sum = 0.0;
+        self.gpu_ms_sum = 0.0;
+        self.period_ms_sum = 0.0;
+        self.period_samples = 0;
+        self.cpu_ms_max = 0.0;
+        self.gpu_ms_max = 0.0;
+        FrameOutcome { measured, closed: Some(stats) }
     }
 }
 
@@ -547,7 +608,7 @@ impl XrRenderer {
                 // APPENDED, not inserted: the existing slots are addressed by
                 // index from the passes themselves, so a new label in the
                 // middle would silently retime them.
-                &["scene_l", "eye_l", "scene_r", "eye_r", "prep_l", "prep_r", "refl_l", "refl_r"],
+                &["scene_l", "eye_l", "scene_r", "eye_r", "prep_l", "prep_r", "refl_l", "refl_r", "probe_l", "probe_r"],
                 period,
             )
         });
@@ -994,10 +1055,19 @@ impl XrRenderer {
             )),
             auto_exposure: true,
             last_frame_at: std::cell::Cell::new(None),
-            frame_stats: FrameStats::new(120),
+            // 120 frames a window, the first 8 of each left to settle.
+            frame_stats: FrameStats::new(120, 8),
             pass_timers,
             perf_windows: 0,
+            perf_window_index: 0,
+            // The first window pays for startup: streaming, pipeline caches.
+            perf_warmup: true,
             perf_metrics: crate::xr::PerfMetrics::new(&xr_ctx.instance, session),
+            perf_metric_window: Default::default(),
+            perf_log: None,
+            started_at: std::time::Instant::now(),
+            pinned_head: None,
+            last_fov: None,
             baked_lights: Vec::new(),
             shadow_spot_incumbents: std::cell::RefCell::new(Vec::new()),
             shadow_slot_log: std::cell::RefCell::new(Vec::new()),
@@ -1402,6 +1472,14 @@ impl XrRenderer {
     /// the file names them, so a lever file that says nothing about SSR leaves
     /// the in-headset switch alone.
     pub fn set_levers(&mut self, levers: crate::renderer::levers::Levers) {
+        // A window that straddles the change measures neither side of it:
+        // start the window, and the schedule, again from the baseline.
+        if levers != self.levers {
+            self.frame_stats.restart();
+            self.perf_metric_window.clear();
+            self.perf_windows = 0;
+            self.perf_warmup = true;
+        }
         if let Some(on) = levers.ssr {
             self.set_screen_space_reflections(on);
         }
@@ -1416,7 +1494,21 @@ impl XrRenderer {
     }
 
     pub fn levers(&self) -> crate::renderer::levers::Levers {
-        self.levers
+        self.levers.clone()
+    }
+
+    /// Pin the tracked head -- stage space, from `bench::BenchRig` -- or give
+    /// it back to the headset with `None`. Per frame, beside
+    /// `set_player_frame`, whose offset and yaw the pin is paired with.
+    pub fn set_pinned_head(&mut self, head: Option<(glam::Vec3, glam::Quat)>) {
+        self.pinned_head = head;
+    }
+
+    /// Also write every `PERF` window to `path` as a JSON line. See
+    /// `perf_record`.
+    pub fn set_perf_log(&mut self, path: std::path::PathBuf) {
+        info!("perf log: every PERF window is also written to {}", path.display());
+        self.perf_log = Some(crate::perf_record::PerfLog::new(path));
     }
 
     pub fn set_multiview_scene(&mut self, on: bool) -> bool {
