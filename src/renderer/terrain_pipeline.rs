@@ -139,22 +139,86 @@ impl TerrainPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
+        Self::build(device, format, uniform_layout, samples, view, TerrainRole::Scene, None)
+    }
+
+    /// THE GROUND IN THE SCENE PASS, reading its probe reflection from the
+    /// half-resolution probe pass (group 3, `probe_pass::bind_group_layout`)
+    /// instead of tracing it per pixel -- as the brushes do. Single eye.
+    pub fn new_probe_reader(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+    ) -> Self {
+        Self::build(
+            device,
+            format,
+            uniform_layout,
+            samples,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::Read,
+            Some(probe_layout),
+        )
+    }
+
+    /// THE GROUND IN THE HALF-RESOLUTION PROBE PASS: its probe reflection and
+    /// nothing else, with the secondary lookups left to `fixups`, exactly as the
+    /// brushes' pass does. See `brush_pipeline::probe_pass` and `probe_fixup`.
+    pub fn new_probe_pass(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+    ) -> Self {
+        Self::build(
+            device,
+            crate::renderer::brush_pipeline::probe_pass::FORMAT,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::ProbePass,
+            Some(fixups.pass_layout()),
+        )
+    }
+
+    fn build(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        role: TerrainRole,
+        group3: Option<&BindGroupLayout>,
+    ) -> Self {
+        let mut source = terrain_shader_for(role);
+        if role == TerrainRole::ProbePass && device.features().contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
+            // It writes the fix-up list: see `BrushPipeline::new_probe_pass_deferred`.
+            source = source.replacen("@fragment fn fs_main(", "@fragment @early_depth_test(force) fn fs_main(", 1);
+        }
         // Audited: see `shader_checks`.
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("terrain_shader"),
-            source: ShaderSource::Wgsl(
-                crate::renderer::shader_precision::for_device(device, view.shader(terrain_shader())).into(),
-            ),
+            source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, view.shader(source)).into()),
         });
         let material_layout = material_bind_group_layout(device);
+        let mut layouts = vec![Some(uniform_layout), Some(&material_layout)];
+        if let Some(l) = group3 {
+            layouts.push(None);
+            layouts.push(Some(l));
+        }
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("terrain_layout"),
-            bind_group_layouts: &[Some(uniform_layout), Some(&material_layout)],
+            bind_group_layouts: &layouts,
             immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("terrain_pipeline"),
+            label: Some(match role {
+                TerrainRole::Scene => "terrain_pipeline",
+                TerrainRole::Read => "terrain_pipeline_read",
+                TerrainRole::ProbePass => "terrain_probe_pass",
+            }),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -170,7 +234,8 @@ impl TerrainPipeline {
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    // The probe pass stores a reflection, not a colour to blend.
+                    blend: if role == TerrainRole::ProbePass { None } else { Some(BlendState::ALPHA_BLENDING) },
                     write_mask: ColorWrites::ALL,
                 })],
             }),
@@ -194,6 +259,62 @@ impl TerrainPipeline {
         });
 
         Self { pipeline, material_layout }
+    }
+}
+
+/// WHAT A TERRAIN SHADER IS FOR. See `TerrainPipeline::new_probe_reader` and
+/// `new_probe_pass`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TerrainRole {
+    /// Shades the ground, tracing its probe reflection per pixel. What
+    /// shipped, and still what a stereo pass and full-resolution reflections
+    /// draw with.
+    Scene,
+    /// Shades the ground, reading its probe reflection from the probe pass.
+    Read,
+    /// Writes the ground's probe reflection into the probe pass, deferring its
+    /// secondary lookups to `probe_fixup`.
+    ProbePass,
+}
+
+/// The terrain shader for `role`: `terrain_shader`, with its reflection read
+/// from the probe pass or its fragment stage cut down to the reflection alone.
+pub fn terrain_shader_for(role: TerrainRole) -> String {
+    let src = terrain_shader();
+    if role == TerrainRole::Scene {
+        return src;
+    }
+    let plain_lights = wgsl_lights_block(0, 1);
+    assert!(src.contains(&plain_lights), "the terrain shader no longer embeds the lights block as generated");
+    let shade = "    let lit = shade_material_env(\n";
+    assert!(src.contains(shade), "the terrain shader no longer shades through `shade_material_env`");
+    match role {
+        TerrainRole::Scene => unreachable!(),
+        TerrainRole::Read => {
+            let read_lights = crate::renderer::lights::wgsl_lights_block_with(0, 1, true, false, false);
+            let src = src.replacen(&plain_lights, &read_lights, 1).replacen(
+                shade,
+                &format!(
+                    "    // From the half-resolution probe pass, as the brushes read it. See\n    // `brush_pipeline::probe_pass`.\n    let probe_pass_tolerance = max(4.0 * fwidth(in.clip.z), 1e-6);\n    probe_env_given = probe_pass_upsample(in.clip.xy, in.clip.z, probe_pass_tolerance);\n{shade}"
+                ),
+                1,
+            );
+            format!("{src}{}", crate::renderer::brush_pipeline::probe_pass::READER_WGSL)
+        }
+        TerrainRole::ProbePass => {
+            let pass_lights = crate::renderer::lights::wgsl_lights_block_with(0, 1, false, false, true);
+            let src = src.replacen(&plain_lights, &pass_lights, 1);
+            let start = src.find(shade).expect("checked above");
+            let end = start + src[start..].find("\n}\n").expect("the fragment stage ends");
+            // The reflection for the pass to store, from the same inputs the
+            // shading below hands `shade_material_env`: no baked bounce, the
+            // ground's own position to choose from, its shape for Fresnel.
+            format!(
+                "{}    probe_fragment = in.clip;\n    return probe_env_for_pass(\n        in.world_pos, shaded_n, rough, clamp(ao_map, 0.0, 1.0), sky_vis, vec3<f32>(0.0), in.world_pos, n,\n    );{}",
+                &src[..start],
+                &src[end..],
+            )
+        }
     }
 }
 
@@ -1030,6 +1151,38 @@ pub(crate) mod tests {
     /// of a 13.9 ms budget, while quartering the triangle count changed nothing
     /// -- terrain is fill-bound, and four layers sampled whether or not they
     /// contribute is where that fill goes.
+    /// The ground's two probe-pass shaders -- the one reading the pass and the
+    /// one writing it -- are valid WGSL and build on a real device with the
+    /// layouts they are drawn with. See `TerrainRole`.
+    #[test]
+    fn the_probe_pass_terrain_shaders_validate_and_build() {
+        use wgpu::naga;
+        for role in [TerrainRole::Read, TerrainRole::ProbePass] {
+            let src = terrain_shader_for(role);
+            let module = naga::front::wgsl::parse_str(&src)
+                .unwrap_or_else(|e| panic!("{role:?}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{role:?}: {e:?}"));
+        }
+        assert!(terrain_shader_for(TerrainRole::Read).contains("const PROBE_ENV_FROM_PASS: bool = true;"));
+        let pass = terrain_shader_for(TerrainRole::ProbePass);
+        assert!(pass.contains("const PROBE_SECONDARY_DEFERRED: bool = true;") && pass.contains("return probe_env_for_pass("));
+        let Some((device, _queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let lights = LightsUniform::new(&device);
+        let (_shadows, uniforms) = crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let probe_layout = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(&device);
+        let _read = TerrainPipeline::new_probe_reader(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &probe_layout);
+        let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, 1024);
+        let _pass = TerrainPipeline::new_probe_pass(&device, &uniforms.layout, &fixups);
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "the terrain probe pipelines failed to build: {err:?}");
+    }
+
     #[test]
     fn weightless_layers_are_skipped_rather_than_sampled() {
         let src = super::terrain_shader();
