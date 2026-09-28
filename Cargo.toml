@@ -49,3 +49,21 @@ default  = ["canvas", "renderer"]
 canvas   = ["renderer"]
 renderer = ["dep:wgpu", "dep:bytemuck"]
 voxelize = []
+
+# THE SPACESOUPVR FORK OF wgpu 30.0.1 (github.com/SpaceSoupVR/wgpu, branch
+# `spacesoup/v30.0.1`), cloned beside this repo as `../wgpu`. Every crate from
+# that repo is patched together: patching naga alone would pull in a second
+# copy of `naga-types`. What the fork changes is in its SPACESOUP.md; first,
+# naga declares the 16-bit STORAGE capabilities only for buffers that hold a
+# 16-bit type, so `f16` arithmetic works on Adreno (gpuweb#5006).
+[patch.crates-io]
+naga = { path = "../wgpu/naga" }
+naga-types = { path = "../wgpu/naga-types" }
+wgpu = { path = "../wgpu/wgpu" }
+wgpu-core = { path = "../wgpu/wgpu-core" }
+wgpu-hal = { path = "../wgpu/wgpu-hal" }
+wgpu-types = { path = "../wgpu/wgpu-types" }
+wgpu-naga-bridge = { path = "../wgpu/wgpu-naga-bridge" }
+wgpu-core-deps-apple = { path = "../wgpu/wgpu-core/platform-deps/apple" }
+wgpu-core-deps-emscripten = { path = "../wgpu/wgpu-core/platform-deps/emscripten" }
+wgpu-core-deps-windows-linux-android = { path = "../wgpu/wgpu-core/platform-deps/windows-linux-android" }

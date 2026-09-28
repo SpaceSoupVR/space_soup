@@ -30,6 +30,7 @@ pub mod bench;
 pub mod levers;
 pub mod perf_ab;
 pub mod scene_pass_plan;
+pub mod shader_checks;
 
 #[cfg(target_os = "android")]
 pub mod xr_renderer;
