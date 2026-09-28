@@ -321,6 +321,10 @@ pub struct XrRenderer {
     probe_rooms: Vec<u32>,
     /// The doorways between rooms, from the bake. See `ProbeUpload::set_portals`.
     probe_portals: Vec<crate::renderer::uniforms::ProbePortal>,
+    /// The rooms, by the numbers the doorways use, with which of them are
+    /// closed, for culling what lies outside the building. See `portal_cull`
+    /// and `set_closed_rooms`.
+    cull_rooms: Vec<crate::renderer::portal_cull::CullRoom>,
     /// What stands inside the rooms, for the reflection trace. See
     /// `ProbeUpload::set_proxies`.
     probe_proxies: Vec<crate::renderer::uniforms::ProbeProxy>,
@@ -1123,6 +1127,7 @@ impl XrRenderer {
             probe_brightness: Vec::new(),
             probe_rooms: Vec::new(),
             probe_portals: Vec::new(),
+            cull_rooms: Vec::new(),
             probe_proxies: Vec::new(),
             levers: crate::renderer::levers::Levers::default(),
             probe_stream: std::cell::RefCell::new(None),
@@ -1538,6 +1543,27 @@ impl XrRenderer {
     /// space, named by the same volumes as the probes. The reflection trace
     /// stops at them; the rooms' own boxes are its walls. Set with the probes,
     /// and again whenever the scene changes.
+    /// Which rooms are CLOSED -- walled all round but their doorways -- by the
+    /// numbers the probes and doorways use. After `set_reflection_probes*`,
+    /// whose room boxes it takes. From inside one, the terrain is drawn only
+    /// where a doorway shows it. See `portal_cull`.
+    pub fn set_closed_rooms(&mut self, closed: &[u32]) {
+        let mut rooms: Vec<crate::renderer::portal_cull::CullRoom> = Vec::new();
+        for (probe, (_, _, min, max)) in self.probe_volumes.iter().enumerate() {
+            let Some(&id) = self.probe_rooms.get(probe) else { continue };
+            if !rooms.iter().any(|r| r.id == id) {
+                rooms.push(crate::renderer::portal_cull::CullRoom { id, min: *min, max: *max, closed: closed.contains(&id) });
+            }
+        }
+        log::info!(
+            "doorway culling: {} of {} rooms closed ({:?})",
+            rooms.iter().filter(|r| r.closed).count(),
+            rooms.len(),
+            rooms.iter().filter(|r| r.closed).map(|r| r.id).collect::<Vec<_>>(),
+        );
+        self.cull_rooms = rooms;
+    }
+
     pub fn set_reflection_proxies(&mut self, proxies: Vec<crate::renderer::uniforms::ProbeProxy>) {
         self.probe_proxies = proxies;
     }

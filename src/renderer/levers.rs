@@ -79,6 +79,10 @@ pub struct Levers {
     /// behind a wall or under a floor is shaded. See
     /// `BrushPipeline::new_depth_prepass`. Lossless: off changes no pixel.
     pub depth_prepass: bool,
+    /// From inside a closed room, whatever lies outside the building -- the
+    /// terrain -- is drawn only where a doorway shows it. See `portal_cull`.
+    /// Lossless for a closed room: off changes no pixel.
+    pub portal_culling: bool,
     /// MEASUREMENT: block on the GPU at the end of every frame, as the
     /// renderer used to. Its wait is then exactly the GPU's time, which is
     /// what the A/B schedule attributes costs with; shipped, the CPU prepares
@@ -118,6 +122,7 @@ impl Default for Levers {
             light_culling: true,
             half_res_reflections: true,
             depth_prepass: true,
+            portal_culling: true,
             gpu_sync: false,
             ssr: None,
             multiview: None,
@@ -162,6 +167,7 @@ impl Levers {
             Phase::NoLightCulling => l.light_culling = false,
             Phase::FullResReflections => l.half_res_reflections = false,
             Phase::NoDepthPrepass => l.depth_prepass = false,
+            Phase::NoPortalCulling => l.portal_culling = false,
         }
         l
     }
@@ -189,6 +195,7 @@ impl Levers {
         flag("light_culling", self.light_culling, d.light_culling);
         flag("half_res_reflections", self.half_res_reflections, d.half_res_reflections);
         flag("depth_prepass", self.depth_prepass, d.depth_prepass);
+        flag("portal_culling", self.portal_culling, d.portal_culling);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);

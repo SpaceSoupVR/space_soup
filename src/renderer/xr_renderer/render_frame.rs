@@ -1107,6 +1107,61 @@ impl XrRenderer {
             } else {
                 vec![crate::renderer::shadow::frustum_planes(eye_view_proj)]
             };
+            // DOORWAY CULLING of what lies outside the building. From inside a
+            // closed room the terrain is visible only through doorways, so it
+            // is drawn only where one of these frusta -- the view narrowed to a
+            // doorway, walked on through closed rooms -- reaches it. `None`
+            // (no culling) unless EVERY eye this pass draws is inside a closed
+            // room. See `portal_cull`.
+            let outdoor_frusta: Option<Vec<[glam::Vec4; 6]>> = if fx.portal_culling && !self.cull_rooms.is_empty() {
+                let yaw = glam::Quat::from_rotation_y(self.player.yaw);
+                let world_to_player =
+                    glam::Mat4::from_quat(yaw.inverse()) * glam::Mat4::from_translation(-self.player.offset);
+                let eyes: Vec<(glam::Vec3, glam::Mat4)> = if stereo {
+                    both_cam_pos.iter().copied().zip(both_view_proj.iter().copied()).collect()
+                } else {
+                    vec![(cam_pos, eye_view_proj)]
+                };
+                let mut all = Some(Vec::new());
+                for (pos, vp) in eyes {
+                    let eye_world = yaw * pos + self.player.offset;
+                    match crate::renderer::portal_cull::outdoor_frusta(
+                        eye_world,
+                        vp * world_to_player,
+                        vp,
+                        &self.cull_rooms,
+                        &self.probe_portals,
+                    ) {
+                        Some(f) => {
+                            if let Some(a) = all.as_mut() {
+                                a.extend(f);
+                            }
+                        }
+                        None => all = None,
+                    }
+                }
+                all
+            } else {
+                None
+            };
+            // A chunk standing INSIDE a closed room (ground a room was carved
+            // into) is seen from within it, not through a doorway: always drawn.
+            let player_to_world = glam::Mat4::from_translation(self.player.offset)
+                * glam::Mat4::from_quat(glam::Quat::from_rotation_y(self.player.yaw));
+            let in_closed_room = |c: &crate::renderer::shadow::CasterChunk| {
+                let corners = (0..8).map(|i| {
+                    player_to_world.transform_point3(glam::Vec3::new(
+                        if i & 1 == 0 { c.min.x } else { c.max.x },
+                        if i & 2 == 0 { c.min.y } else { c.max.y },
+                        if i & 4 == 0 { c.min.z } else { c.max.z },
+                    ))
+                });
+                let (lo, hi) = corners.fold(
+                    (glam::Vec3::splat(f32::INFINITY), glam::Vec3::splat(f32::NEG_INFINITY)),
+                    |(lo, hi), p| (lo.min(p), hi.max(p)),
+                );
+                self.cull_rooms.iter().any(|r| r.closed && lo.cmplt(r.max).all() && r.min.cmplt(hi).all())
+            };
             let probes_arg =
                 if !fx.probes { Some(&no_probes) } else { resident.as_ref() };
             if stereo && eye == 0 {
@@ -1403,7 +1458,11 @@ impl XrRenderer {
                                 // rule. An inline `any` here would be the
                                 // shipped behaviour while the tests exercised
                                 // something else that merely looked the same.
-                                if crate::renderer::shadow::chunk_seen(c, &cull_planes) {
+                                let through_a_doorway = match &outdoor_frusta {
+                                    None => true,
+                                    Some(f) => crate::renderer::shadow::chunk_seen(c, f) || in_closed_room(c),
+                                };
+                                if crate::renderer::shadow::chunk_seen(c, &cull_planes) && through_a_doorway {
                                     pass.draw_indexed(
                                         c.first_index..c.first_index + c.index_count,
                                         0,
