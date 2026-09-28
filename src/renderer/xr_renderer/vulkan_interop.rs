@@ -79,6 +79,15 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
     if multisample_array {
         features |= wgpu::Features::MULTISAMPLE_ARRAY;
     }
+    // EARLY FRAGMENT TESTS on demand: SPIR-V's `EarlyFragmentTests`, core
+    // Vulkan, needs nothing enabled. The probe pass that defers its lookups
+    // writes a storage buffer, and a fragment shader with side effects is
+    // otherwise depth-tested AFTER it runs -- every hidden fragment shaded in
+    // full. See `BrushPipeline::new_probe_pass_deferred`. Asked of the adapter,
+    // on the same contract as the rest.
+    if exposed.features.contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
+        features |= wgpu::Features::SHADER_EARLY_DEPTH_TEST;
+    }
     log::info!(
         "wgpu: shader f16 {}",
         if vk.shader_f16 { "yes (arithmetic only)" } else { "NO" },

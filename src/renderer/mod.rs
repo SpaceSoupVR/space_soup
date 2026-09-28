@@ -33,6 +33,7 @@ pub mod scene_pass_plan;
 pub mod shader_checks;
 pub mod portal_cull;
 pub mod shader_precision;
+pub mod probe_fixup;
 
 #[cfg(target_os = "android")]
 pub mod xr_renderer;

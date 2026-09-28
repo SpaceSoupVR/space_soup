@@ -83,6 +83,10 @@ pub struct Levers {
     /// terrain -- is drawn only where a doorway shows it. See `portal_cull`.
     /// Lossless for a closed room: off changes no pixel.
     pub portal_culling: bool,
+    /// The single-eye probe pass leaves a traced hit's secondary lookups to
+    /// a compute pass over just the texels that need them. See
+    /// `probe_fixup`. Lossless: off changes no pixel.
+    pub deferred_reflection_lookups: bool,
     /// MEASUREMENT: block on the GPU at the end of every frame, as the
     /// renderer used to. Its wait is then exactly the GPU's time, which is
     /// what the A/B schedule attributes costs with; shipped, the CPU prepares
@@ -123,6 +127,7 @@ impl Default for Levers {
             half_res_reflections: true,
             depth_prepass: true,
             portal_culling: true,
+            deferred_reflection_lookups: true,
             gpu_sync: false,
             ssr: None,
             multiview: None,
@@ -168,6 +173,7 @@ impl Levers {
             Phase::FullResReflections => l.half_res_reflections = false,
             Phase::NoDepthPrepass => l.depth_prepass = false,
             Phase::NoPortalCulling => l.portal_culling = false,
+            Phase::InlineReflectionLookups => l.deferred_reflection_lookups = false,
         }
         l
     }
@@ -196,6 +202,7 @@ impl Levers {
         flag("half_res_reflections", self.half_res_reflections, d.half_res_reflections);
         flag("depth_prepass", self.depth_prepass, d.depth_prepass);
         flag("portal_culling", self.portal_culling, d.portal_culling);
+        flag("deferred_lookups", self.deferred_reflection_lookups, d.deferred_reflection_lookups);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
