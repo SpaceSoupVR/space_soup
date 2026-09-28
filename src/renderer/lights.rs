@@ -2069,9 +2069,6 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip
     out.edge_cover = 0.0;
     out.edge_t = 0.0;
     var best = 3.4e38;
-    // The slab test's reciprocal direction for every UNROTATED proxy, whose
-    // frame's direction is `d` itself: three divisions once, not per proxy.
-    let inv_d = 1.0 / select(vec3<f32>(1e-9), d, abs(d) > vec3<f32>(1e-9));
     // What stands in this room only, in order. See `probe_room_proxy`.
     for (var i = probe_room_proxy(room); i >= 0; i = probe_proxy_next(i)) {{
         if (i == skip) {{
@@ -2085,14 +2082,17 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip
         let q = camera.probe_proxies[i * 3 + 2];
         var lo = o - camera.probe_proxies[i * 3].xyz;
         var ld = d;
-        var inv = inv_d;
         if (any(q != vec4<f32>(0.0, 0.0, 0.0, 1.0))) {{
             let qi = vec4<f32>(-q.xyz, q.w);
             lo = probe_quat_rotate(qi, lo);
             ld = probe_quat_rotate(qi, ld);
-            inv = 1.0 / select(vec3<f32>(1e-9), ld, abs(ld) > vec3<f32>(1e-9));
         }}
+        // Per proxy, NOT hoisted out of the loop for the unrotated ones: the
+        // probe pass is register-bound (36% occupancy), and a reciprocal kept
+        // live across the whole loop made it 0.4 ms slower on the headset
+        // (2026-09-28) -- three divisions a proxy are cheaper than a register.
         let half = camera.probe_proxies[i * 3 + 1].xyz;
+        let inv = 1.0 / select(vec3<f32>(1e-9), ld, abs(ld) > vec3<f32>(1e-9));
         let a = (-half - lo) * inv;
         let b = (half - lo) * inv;
         let lows = min(a, b);
@@ -2966,11 +2966,65 @@ fn shade_material_env(
     // By SQUARED distance, and one square root after the loop: the nearest
     // lamp is the same either way, and a root per lamp per pixel was paid to
     // compare numbers whose order the root does not change.
+    //
+    // AND WHICH LAMPS CAN REACH THIS PIXEL AT ALL, in the same pass: bit `i`
+    // of `reaching` is lamp `i`, tested exactly as the lighting loop used to
+    // test it on a second walk over every lamp -- its baked visibility, its
+    // range, its cone, the sun's mask. The lighting loop below then visits
+    // only those, in the same order. See the comment there.
     var light_dist_sq = 1e18;
+    var reaching = 0u;
+    let culling = light_culling();
     for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
-        if (lights.lights[i].params.z > 1.5) {{ continue; }}
+        let kind = lights.lights[i].params.z;
         let to_lamp = lights.lights[i].position.xyz - world_pos;
-        light_dist_sq = min(light_dist_sq, dot(to_lamp, to_lamp));
+        let dist_sq = dot(to_lamp, to_lamp);
+        if (kind <= 1.5) {{
+            light_dist_sq = min(light_dist_sq, dist_sq);
+        }}
+        if (culling) {{
+            // Hidden from here by its baked mask: exactly zero light.
+            if (stationary_visibility_of(lights.lights[i].position.w) <= 0.0) {{
+                continue;
+            }}
+            if (kind < 1.5) {{
+                // Past its range, where the window is exactly zero.
+                let reach = lights.lights[i].params.x;
+                if (dist_sq >= reach * reach) {{
+                    continue;
+                }}
+                // OUTSIDE A SPOT'S CONE BY MORE THAN ITS SOFT EDGE CAN REACH.
+                // `spot_cone` widens the authored band for antialiasing, but
+                // never past SPOT_EDGE_MAX_WIDEN times it, which moves the
+                // cone's zero at most one authored band outward -- so wherever
+                // the angle's cosine is below `cos_outer - authored` (less a
+                // hair for rounding) the cone is exactly 0, and so is all the
+                // maths it multiplies. `cos = along / dist`, compared squared,
+                // with the signs, so no root is taken.
+                if (kind > 0.5) {{
+                    let cos_outer = lights.lights[i].params.y;
+                    let authored = max(lights.lights[i].direction.w - cos_outer, 0.0001);
+                    let zero_below = cos_outer - authored * (0.5 * (SPOT_EDGE_MAX_WIDEN - 1.0)) - 1e-4;
+                    let along = -dot(to_lamp, lights.lights[i].direction.xyz);
+                    let bound_sq = zero_below * zero_below * max(dist_sq, 1e-8);
+                    let outside = select(
+                        along < 0.0 && along * along >= bound_sq,
+                        along <= 0.0 || along * along <= bound_sq,
+                        zero_below >= 0.0,
+                    );
+                    if (outside) {{
+                        continue;
+                    }}
+                }}
+            }} else if (receiver_sun_mask == 0.0) {{
+                // THE SKY'S SUN WHERE ITS BAKED MASK HIDES IT COMPLETELY --
+                // indoors, most of the level. `sun_visibility` returns exactly
+                // that 0 without sampling anything. A receiver with no mask
+                // carries -1 and is shaded as before.
+                continue;
+            }}
+        }}
+        reaching = reaching | (1u << i);
     }}
     let light_dist = sqrt(light_dist_sq);
     let alpha = r * r;
@@ -3233,54 +3287,23 @@ fn shade_material_env(
     // BAKED: the lightmap's bounce, before any runtime light is added.
     // Weighted as the return line weights diffuse light.
     dbg_baked = bounce * albedo * (1.0 - fresnel);
-    for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
-        // A LAMP THAT CANNOT REACH THIS PIXEL IS SKIPPED BEFORE ANY OF ITS
-        // MATHS: past its range, where the window is exactly zero, or a
-        // stationary lamp its baked mask says is hidden from here -- behind a
-        // wall, in another room -- where the visibility is exactly zero. Both
-        // multiply the whole contribution, so skipping changes no pixel. In a
-        // level of several rooms it is the common case: most lamps are behind
-        // a wall from most pixels, and each one skipped is a light's worth of
-        // lighting the fill-bound frame no longer pays for.
-        let marker = lights.lights[i].position.w;
-        let seen = stationary_visibility_of(marker);
-        if (light_culling()) {{
-            if (seen <= 0.0) {{
-                continue;
-            }}
-            if (lights.lights[i].params.z < 1.5) {{
-                let to_light = lights.lights[i].position.xyz - world_pos;
-                let reach = lights.lights[i].params.x;
-                let dist_sq = dot(to_light, to_light);
-                if (dist_sq >= reach * reach) {{
-                    continue;
-                }}
-                // OUTSIDE A SPOT'S CONE BY MORE THAN ITS SOFT EDGE CAN REACH.
-                // `spot_cone` widens the authored band for antialiasing, but
-                // never past SPOT_EDGE_MAX_WIDEN times it, which moves the
-                // cone's zero at most one authored band outward -- so wherever
-                // the angle's cosine is below `cos_outer - authored` (less a
-                // hair for rounding) the cone is exactly 0, and so is all the
-                // attenuation and highlight maths it multiplies. Compared as
-                // `cos * dist`, the way `light_contribution_split` divides.
-                if (lights.lights[i].params.z > 0.5) {{
-                    let cos_outer = lights.lights[i].params.y;
-                    let authored = max(lights.lights[i].direction.w - cos_outer, 0.0001);
-                    let zero_below = cos_outer - authored * (0.5 * (SPOT_EDGE_MAX_WIDEN - 1.0)) - 1e-4;
-                    let along = -dot(to_light, lights.lights[i].direction.xyz);
-                    if (along <= zero_below * max(sqrt(dist_sq), 0.0001)) {{
-                        continue;
-                    }}
-                }}
-            }} else if (receiver_sun_mask == 0.0) {{
-                // THE SKY'S SUN WHERE ITS BAKED MASK HIDES IT COMPLETELY --
-                // indoors, most of the level. `sun_visibility` returns exactly
-                // that 0 without sampling anything, so the whole contribution
-                // it would multiply is skipped instead of computed. A receiver
-                // with no mask carries -1 and is shaded as before.
-                continue;
-            }}
+    // A LAMP THAT CANNOT REACH THIS PIXEL IS SKIPPED BEFORE ANY OF ITS MATHS:
+    // past its range, outside its cone, or a stationary lamp its baked mask
+    // says is hidden from here -- behind a wall, in another room. Each makes
+    // the whole contribution exactly zero, so skipping changes no pixel. In a
+    // level of several rooms it is the common case: most lamps are behind a
+    // wall from most pixels. The tests were made in the nearest-lamp pass
+    // above (`reaching`), which walks every lamp anyway; this loop visits only
+    // the lamps that passed, lowest first -- the same lamps, summed in the
+    // same order, as when it walked them all and tested each here.
+    var todo = reaching;
+    loop {{
+        if (todo == 0u) {{
+            break;
         }}
+        let i = countTrailingZeros(todo);
+        todo = todo & (todo - 1u);
+        let seen = stationary_visibility_of(lights.lights[i].position.w);
         let l = lights.lights[i];
         let c = light_contribution_split(l, world_pos, n, view_dir, shininess, spec_strength);
         // NOTHING ARRIVES, SO THERE IS NOTHING TO SHADOW.
@@ -4695,7 +4718,11 @@ mod baked_light_split_tests {
     fn lightmapped_surfaces_skip_the_baked_tail_and_nothing_else_does() {
         let code = wgsl_lights_block(0, 1);
         assert!(!code.contains("i < lights.count.x;"), "a light loop walks the baked tail");
-        assert_eq!(code.matches("i < live_light_count();").count(), 4);
+        // Three walks bounded by the live count. The fourth, the lighting in
+        // `shade_material_env`, walks the `reaching` bits that its nearest-lamp
+        // pass -- one of the three -- set, so it honours the split too.
+        assert_eq!(code.matches("i < live_light_count();").count(), 3);
+        assert!(code.contains("reaching = reaching | (1u << i);") && code.contains("var todo = reaching;"));
         let brush = crate::renderer::brush_pipeline::brush_shader_src();
         assert!(brush.contains("receiver_skips_baked = true;"), "brushes carry baked lamps in their atlas");
         let terrain = crate::renderer::terrain_pipeline::terrain_shader_src();
