@@ -32,7 +32,35 @@ pub struct VkContext {
     /// `timestamp_period` is the scale: raw ticks mean nothing without it, and
     /// it is not 1.0 on Adreno.
     pub timestamp_period_ns: Option<f32>,
+    /// Whether `shaderFloat16` was ENABLED (`VK_KHR_shader_float16_int8`):
+    /// `f16` ARITHMETIC in shaders. Same contract as `multiview` -- claimed to
+    /// wgpu as `Features::SHADER_F16` only when this is true.
+    ///
+    /// Arithmetic only. Adreno has no 16-bit uniform access
+    /// (`uniformAndStorageBuffer16BitAccess`, gpuweb#5006), so every buffer
+    /// stays 32-bit, and the SpaceSoupVR naga fork declares the 16-bit storage
+    /// capabilities only for buffers that really hold a 16-bit type.
+    pub shader_f16: bool,
+    /// Whether ROBUST ACCESS is enabled: `robustBufferAccess`, and
+    /// `robustBufferAccess2` + `robustImageAccess2` (`VK_EXT_robustness2`).
+    /// Off: see `ENABLE_ROBUST_ACCESS`.
+    pub robust_access: bool,
+    /// The device extensions enabled here -- handed to wgpu's
+    /// `device_from_raw`, which (in the SpaceSoupVR fork) trusts robust access
+    /// only when its extension is among them.
+    pub enabled_extensions: Vec<&'static std::ffi::CStr>,
 }
+
+/// Whether to switch on the device's robust buffer and image access.
+///
+/// OFF, MEASURED (Quest 3, 2026-09-28): on, it cost 0.2-1.7 ms of GPU a
+/// frame across the six benchmark views -- the hallway 1.73 ms. The shaders'
+/// own index clamps protect against the same out-of-range reads far more
+/// cheaply, and they are only compiled in when wgpu knows robust access is
+/// OFF: stock wgpu-hal assumed it was on for any device that SUPPORTS it,
+/// which is why `device_from_raw` is told, through `enabled_extensions`,
+/// exactly what this device has (the fork's patch to wgpu-hal).
+const ENABLE_ROBUST_ACCESS: bool = false;
 
 impl VkContext {
     pub fn new(xr: &XrContext) -> Result<Self, Box<dyn std::error::Error>> {
@@ -92,12 +120,52 @@ impl VkContext {
         // available and enabled are different things, and the failure mode for
         // confusing them is a pipeline that builds and then renders one eye.
         let mut multiview_query = vk::PhysicalDeviceMultiviewFeatures::default();
-        let mut features2 =
-            vk::PhysicalDeviceFeatures2::default().push_next(&mut multiview_query);
+        let mut f16_query = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+        let mut robustness2_query = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+        let mut image_robustness_query = vk::PhysicalDeviceImageRobustnessFeatures::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut multiview_query)
+            .push_next(&mut f16_query)
+            .push_next(&mut robustness2_query)
+            .push_next(&mut image_robustness_query);
         unsafe {
             vk_instance.get_physical_device_features2(physical_device, &mut features2);
         }
+        let robust_buffer_access_supported = features2.features.robust_buffer_access == vk::TRUE;
+        let robustness2_extension_available = unsafe {
+            vk_instance
+                .enumerate_device_extension_properties(physical_device)
+                .map(|exts| {
+                    exts.iter().any(|e| {
+                        std::ffi::CStr::from_ptr(e.extension_name.as_ptr()).to_bytes() == b"VK_EXT_robustness2"
+                    })
+                })
+                .unwrap_or(false)
+        };
+        let robust_access = ENABLE_ROBUST_ACCESS
+            && robust_buffer_access_supported
+            && robustness2_extension_available
+            && robustness2_query.robust_buffer_access2 == vk::TRUE
+            && robustness2_query.robust_image_access2 == vk::TRUE;
         let multiview_supported = multiview_query.multiview == vk::TRUE;
+        // ROBUST ACCESS, recorded: wgpu-hal decides from what the PHYSICAL
+        // device supports whether naga's shaders clamp their own buffer and
+        // image-load indices, on the assumption that it enabled the matching
+        // robustness features itself -- which it does for a device it creates,
+        // and which this device (built here, handed over by `device_from_raw`)
+        // does not. Logged so the headset says which of them it has.
+        info!(
+            "vulkan: robustBufferAccess {}, robustBufferAccess2 {}, robustImageAccess2 {}, robustImageAccess {} -- {}",
+            robust_buffer_access_supported,
+            robustness2_query.robust_buffer_access2 == vk::TRUE,
+            robustness2_query.robust_image_access2 == vk::TRUE,
+            image_robustness_query.robust_image_access == vk::TRUE,
+            if robust_access {
+                "ENABLING robust access"
+            } else {
+                "robust access off (the shaders' own bounds checks are the guard)"
+            },
+        );
         info!(
             "vulkan: multiview {}",
             if multiview_supported { "supported -- enabling" } else { "NOT supported" },
@@ -138,16 +206,64 @@ impl VkContext {
             if mesh_shader_supported { "SUPPORTED" } else { "not supported" },
         );
 
+        // HALF-PRECISION ARITHMETIC: asked, then enabled, like multiview. The
+        // extension is core in Vulkan 1.2, but this device is created at 1.1,
+        // so it is named explicitly. The OpenXR runtime adds its own extensions
+        // to the list when it creates the device.
+        let f16_extension_available = unsafe {
+            vk_instance
+                .enumerate_device_extension_properties(physical_device)
+                .map(|exts| {
+                    exts.iter().any(|e| {
+                        std::ffi::CStr::from_ptr(e.extension_name.as_ptr()).to_bytes()
+                            == b"VK_KHR_shader_float16_int8"
+                    })
+                })
+                .unwrap_or(false)
+        };
+        let f16_supported = f16_extension_available && f16_query.shader_float16 == vk::TRUE;
+        info!(
+            "vulkan: shaderFloat16 {}",
+            if f16_supported { "supported -- enabling" } else { "NOT supported" },
+        );
+        let mut enabled_extensions: Vec<&'static std::ffi::CStr> = Vec::new();
+        if f16_supported {
+            enabled_extensions.push(ash::khr::shader_float16_int8::NAME);
+        }
+        if robust_access {
+            enabled_extensions.push(ash::ext::robustness2::NAME);
+        }
+        let extensions: Vec<*const std::ffi::c_char> = enabled_extensions.iter().map(|e| e.as_ptr()).collect();
+
+        // The feature chain: multiview, then f16, then robustness2, each
+        // enabled only where supported. (A multiview struct with multiview
+        // off is harmless.)
+        let mut robustness2_enable = vk::PhysicalDeviceRobustness2FeaturesEXT::default()
+            .robust_buffer_access2(true)
+            .robust_image_access2(true);
+        let mut f16_enable = vk::PhysicalDeviceShaderFloat16Int8Features::default()
+            .shader_float16(true);
         let mut multiview_enable = vk::PhysicalDeviceMultiviewFeatures::default()
             .multiview(multiview_supported);
+        if robust_access {
+            f16_enable.p_next = &mut robustness2_enable as *mut _ as *mut std::ffi::c_void;
+        }
+        if f16_supported || robust_access {
+            multiview_enable.p_next = &mut f16_enable as *mut _ as *mut std::ffi::c_void;
+            if !f16_supported {
+                // f16 off: skip its struct, keep robustness2 in the chain.
+                multiview_enable.p_next = &mut robustness2_enable as *mut _ as *mut std::ffi::c_void;
+            }
+        }
+        // `robustBufferAccess2` requires the core `robustBufferAccess` too.
+        let core_features = vk::PhysicalDeviceFeatures::default().robust_buffer_access(robust_access);
         let device_ci = vk::DeviceCreateInfo {
             queue_create_info_count: 1,
             p_queue_create_infos: &queue_info,
-            p_next: if multiview_supported {
-                &mut multiview_enable as *mut _ as *mut std::ffi::c_void
-            } else {
-                std::ptr::null_mut()
-            },
+            p_next: &mut multiview_enable as *mut _ as *mut std::ffi::c_void,
+            enabled_extension_count: extensions.len() as u32,
+            pp_enabled_extension_names: if extensions.is_empty() { std::ptr::null() } else { extensions.as_ptr() },
+            p_enabled_features: &core_features,
             ..Default::default()
         };
 
@@ -195,6 +311,9 @@ impl VkContext {
 
         Ok(Self {
             multiview: multiview_supported,
+            shader_f16: f16_supported,
+            robust_access,
+            enabled_extensions,
             timestamp_period_ns,
             instance: vk_instance,
             physical_device,

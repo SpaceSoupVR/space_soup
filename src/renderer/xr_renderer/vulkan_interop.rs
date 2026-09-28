@@ -47,6 +47,14 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
     if vk.timestamp_period_ns.is_some() {
         features |= wgpu::Features::TIMESTAMP_QUERY;
     }
+    // HALF-PRECISION ARITHMETIC, on the same contract: `VkContext` enabled
+    // `shaderFloat16` itself, or this is not claimed. Stock wgpu would also
+    // want 16-bit uniform access for it, which Adreno lacks; our naga fork
+    // asks for that only where a buffer holds a 16-bit type, and no buffer
+    // here does. See `VkContext::shader_f16`.
+    if vk.shader_f16 {
+        features |= wgpu::Features::SHADER_F16;
+    }
     // MULTISAMPLE_ARRAY: the feature that makes MULTIVIEW USABLE HERE AT ALL.
     //
     // WebGPU forbids a texture that is both multisampled and layered -- wgpu
@@ -71,6 +79,10 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
     if multisample_array {
         features |= wgpu::Features::MULTISAMPLE_ARRAY;
     }
+    log::info!(
+        "wgpu: shader f16 {}",
+        if vk.shader_f16 { "yes (arithmetic only)" } else { "NO" },
+    );
     log::info!(
         "wgpu: multiview {}, multisampled arrays {} -- stereo scene pass {}",
         if vk.multiview { "yes" } else { "NO" },
@@ -138,7 +150,11 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
     let open_device = exposed.adapter.device_from_raw(
         vk.device.clone(),
         None,
-        &[],
+        // WHAT THIS DEVICE REALLY HAS. The SpaceSoupVR fork's wgpu-hal trusts
+        // robust access only when its extension is listed here; stock wgpu-hal
+        // trusted the physical device's support, and compiled every shader
+        // without its bounds checks on a device with robust access off.
+        &vk.enabled_extensions,
         features,
         &limits,
         &wgpu::MemoryHints::default(),

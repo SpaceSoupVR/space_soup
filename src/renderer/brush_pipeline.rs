@@ -1300,7 +1300,8 @@ impl BrushPipeline {
         probe: BrushProbe,
         probe_layout: Option<&BindGroupLayout>,
     ) -> Self {
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
+        // Audited: see `shader_checks`.
+        let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("brush_shader"),
             source: ShaderSource::Wgsl(
                 view.shader(brush_shader_probe(
@@ -1389,7 +1390,8 @@ impl BrushPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
+        // Audited: see `shader_checks`.
+        let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("brush_depth_prepass"),
             source: ShaderSource::Wgsl(
                 view.shader(brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Trace))
