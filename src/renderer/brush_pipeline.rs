@@ -199,6 +199,8 @@ pub struct BrushMaterials {
     /// brush face. A level built entirely from rock and grass should pay
     /// neither, and keeps the cheaper straight-to-swapchain path.
     pub reflective: bool,
+    /// `material_uv_scales`, bound at 6.
+    _uv_scales: wgpu::Buffer,
 }
 
 /// Roughness below which a material is worth reflecting the scene in.
@@ -646,8 +648,40 @@ pub fn brush_material_bind_group_layout(device: &Device) -> BindGroupLayout {
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
+            // Each material's own proportions, for the vertex stage. See
+            // `material_uv_scales`.
+            BindGroupLayoutEntry {
+                binding: 6,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     })
+}
+
+/// EVERY MATERIAL AT ITS OWN PROPORTIONS, one scale a layer for the brush
+/// UVs: `u` as authored, `v` times the colour map's width over its height.
+///
+/// A face's UVs are in square tiles (`BrushFace::scale`), and a layer spans
+/// one tile whatever its shape, so a 1024x512 map -- Rock063, Bricks075A --
+/// drew every stone twice as tall as it is. With `v` scaled, the tile keeps
+/// its authored width and is as tall as the map says: nothing stretches. The
+/// texture array's own square layers do not matter to this; they change how
+/// many texels a layer has, not what shape it depicts. Missing maps are
+/// square.
+pub fn material_uv_scales(colours: &[Option<TerrainImage>]) -> [[f32; 4]; MAX_BRUSH_MATERIALS] {
+    let mut out = [[1.0, 1.0, 0.0, 0.0]; MAX_BRUSH_MATERIALS];
+    for (slot, img) in out.iter_mut().zip(colours) {
+        if let Some(img) = img.as_ref().filter(|i| i.width > 0 && i.height > 0) {
+            slot[1] = img.width as f32 / img.height as f32;
+        }
+    }
+    out
 }
 
 impl BrushMaterials {
@@ -777,6 +811,14 @@ impl BrushMaterials {
             ..Default::default()
         });
 
+        let uv_scales = wgpu::util::DeviceExt::create_buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("brush_material_uv_scales"),
+                contents: bytemuck::cast_slice(&material_uv_scales(colours)),
+                usage: wgpu::BufferUsages::UNIFORM,
+            },
+        );
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("brush_materials"),
             layout,
@@ -825,13 +867,14 @@ impl BrushMaterials {
                     binding: 5,
                     resource: BindingResource::Sampler(&rough_sampler),
                 },
+                BindGroupEntry { binding: 6, resource: uv_scales.as_entire_binding() },
             ],
         });
 
         // Decided once, here, rather than per frame: the maps do not change
         // between bakes and this walks every texel of every roughness map.
         let reflective = roughs.iter().any(|r| roughness_is_reflective(r.as_ref()));
-        Self { bind_group, reflective }
+        Self { bind_group, reflective, _uv_scales: uv_scales }
     }
 
     /// A material array with nothing in it, for a scene that has no brushes.
@@ -2040,14 +2083,7 @@ struct VOut {{
     if (st_layers > 3u) {
         st_3 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 3);
     }
-    let st_da = (vec4<f32>(st_0.r, st_0.b, st_1.r, st_1.b) - vec4<f32>(0.5)) * (2.0 * STATIONARY_MASK_DISTANCE_TEXELS);
-    let st_db = (vec4<f32>(st_2.r, st_2.b, st_3.r, st_3.b) - vec4<f32>(0.5)) * (2.0 * STATIONARY_MASK_DISTANCE_TEXELS);
-    let st_pa = vec4<f32>(st_0.g, st_0.a, st_1.g, st_1.a) * STATIONARY_MASK_DISTANCE_TEXELS;
-    let st_pb = vec4<f32>(st_2.g, st_2.a, st_3.g, st_3.a) * STATIONARY_MASK_DISTANCE_TEXELS;
-    let st_wa = max(max(st_pa, 0.5 * fwidth(st_da)), vec4<f32>(0.02));
-    let st_wb = max(max(st_pb, 0.5 * fwidth(st_db)), vec4<f32>(0.02));
-    stationary_vis_a = smoothstep(-st_wa, st_wa, st_da);
-    stationary_vis_b = smoothstep(-st_wb, st_wb, st_db);
+    set_stationary_masks(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
     // The baked lamps are in this atlas. See `receiver_skips_baked`.
     receiver_skips_baked = true;
     // The albedo goes IN rather than being multiplied over the result: a
@@ -2145,6 +2181,9 @@ const STATIONARY_MASK_DISTANCE_TEXELS: f32 = {stationary_range:?};
 // Trilinear, so the roughness mip that carries the normal's variance is
 // the one actually fetched. See `brush_rough_sampler`.
 @group(1) @binding(5) var mat_rough_samp: sampler;
+// Each material's proportions: `u` as authored, `v` times its colour map's
+// width over height. See `material_uv_scales`.
+@group(1) @binding(6) var<uniform> mat_uv_scale: array<vec4<f32>, {max_materials}>;
 
 {lights_block}
 {ssr_block}
@@ -2216,7 +2255,8 @@ struct VOut {{
     out.face_centre = v.face_centre;
     out.uv2_rect  = v.uv2_rect;
     out.face_half_extent = v.face_half_extent;
-    out.uv        = v.uv;
+    // At the material's own proportions, so no map is stretched to its tile.
+    out.uv        = v.uv * mat_uv_scale[min(v.material, {max_materials}u - 1u)].xy;
     out.uv2       = v.uv2;
     out.material  = v.material;
     out.tint      = v.tint;
@@ -2268,6 +2308,7 @@ struct VOut {{
         ssr_block = ssr_block,
         sun_mask_range = SUN_MASK_DISTANCE_TEXELS,
         stationary_range = STATIONARY_MASK_DISTANCE_TEXELS,
+        max_materials = MAX_BRUSH_MATERIALS,
         lighting = lighting,
         centroid = if BRUSH_CENTROID_VARYINGS {
             "@interpolate(perspective, centroid) "
@@ -2370,6 +2411,42 @@ mod tests {
         render_brush_material(
             material, colours, normals, &[], &[], tint, uv_scale, lit, SIDE_LIGHT,
         )
+    }
+
+    /// A 2:1 MATERIAL KEEPS ITS PROPORTIONS (tracker 2.3): its tile is as wide
+    /// as authored and half as tall, so up a face it repeats twice as often as
+    /// a square one. Read at v = 0.4 of an authored tile, a square map is in
+    /// its top half; a 2:1 map is already at 0.8 of its own height, in its
+    /// bottom half. Before, every 1024x512 map -- the hallway rock, the
+    /// bricks -- drew every stone twice as tall as it is.
+    #[test]
+    fn a_two_to_one_material_is_not_stretched_to_its_tile() {
+        // Top half red, bottom half blue.
+        let halves = |w: u32, h: u32| TerrainImage {
+            width: w,
+            height: h,
+            rgba: (0..h)
+                .flat_map(|y| (0..w).flat_map(move |_| if y < h / 2 { [255, 0, 0, 255] } else { [0, 0, 255, 255] }))
+                .collect(),
+        };
+        let Some(square) = render_brush(0, &[Some(halves(4, 4))], &[None], [1.0; 4], 0.8, false) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let wide = render_brush(0, &[Some(halves(4, 2))], &[None], [1.0; 4], 0.8, false).unwrap();
+        assert!(square[0] > square[2] + 20, "a square map at v = 0.4 is in its red top half: {square:?}");
+        assert!(wide[2] > wide[0] + 20, "a 2:1 map at v = 0.4 of a tile is in its blue bottom half: {wide:?}");
+    }
+
+    #[test]
+    fn a_materials_uv_scale_is_its_width_over_its_height() {
+        let img = |w, h| Some(TerrainImage { width: w, height: h, rgba: vec![0; (w * h * 4) as usize] });
+        let scales = material_uv_scales(&[img(1024, 512), img(1024, 1024), None, img(512, 1024)]);
+        assert_eq!(scales[0][..2], [1.0, 2.0]);
+        assert_eq!(scales[1][..2], [1.0, 1.0]);
+        assert_eq!(scales[2][..2], [1.0, 1.0], "a missing map is square");
+        assert_eq!(scales[3][..2], [1.0, 0.5]);
+        assert_eq!(scales[MAX_BRUSH_MATERIALS - 1][..2], [1.0, 1.0], "past the list, square");
     }
 
     /// Off to one side, so a normal tilted along u faces it differently from a

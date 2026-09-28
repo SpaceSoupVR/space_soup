@@ -908,10 +908,29 @@ var<private> receiver_sun_mask: f32 = -1.0;
 // THE STATIONARY LAMPS' BAKED SHADOWS at this receiver: the visibility of the
 // lamp owning mask channel c is `stationary_vis_a[c]` for c < 4, else
 // `stationary_vis_b[c - 4]`. Set by receivers that carry the masks -- the
-// brushes, from their atlas; 1, unshadowed, everywhere else. See
+// brushes from their atlas, the ground from its own map -- through
+// `set_stationary_masks`; 1, unshadowed, everywhere else. See
 // `stationary_visibility`.
 var<private> stationary_vis_a: vec4<f32> = vec4<f32>(1.0);
 var<private> stationary_vis_b: vec4<f32> = vec4<f32>(1.0);
+
+// THE STATIONARY LAMPS' SHADOWS, rebuilt from their masks as the sun's is: per
+// lamp a signed distance and the bulb's penumbra, two lamps a layer (red and
+// green, blue and alpha), over +-`range` texels -- the edge put back at zero
+// at any magnification and never narrower than a pixel. Away from a sharp
+// edge the baker stores a lamp's visibility as a distance this smoothstep
+// gives back exactly. A layer the receiver does not have is passed as 1s,
+// which reads fully lit. Call from uniform control flow: it takes `fwidth`.
+fn set_stationary_masks(st_0: vec4<f32>, st_1: vec4<f32>, st_2: vec4<f32>, st_3: vec4<f32>, range: f32) {{
+    let st_da = (vec4<f32>(st_0.r, st_0.b, st_1.r, st_1.b) - vec4<f32>(0.5)) * (2.0 * range);
+    let st_db = (vec4<f32>(st_2.r, st_2.b, st_3.r, st_3.b) - vec4<f32>(0.5)) * (2.0 * range);
+    let st_pa = vec4<f32>(st_0.g, st_0.a, st_1.g, st_1.a) * range;
+    let st_pb = vec4<f32>(st_2.g, st_2.a, st_3.g, st_3.a) * range;
+    let st_wa = max(max(st_pa, 0.5 * fwidth(st_da)), vec4<f32>(0.02));
+    let st_wb = max(max(st_pb, 0.5 * fwidth(st_db)), vec4<f32>(0.02));
+    stationary_vis_a = smoothstep(-st_wa, st_wa, st_da);
+    stationary_vis_b = smoothstep(-st_wb, st_wb, st_db);
+}}
 
 // How much of lamp `l` the LEVEL lets through to this receiver: its channel of
 // the baked mask when it is a stationary lamp (`position.w` = 2 + channel),

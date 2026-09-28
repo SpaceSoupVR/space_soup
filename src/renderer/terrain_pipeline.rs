@@ -258,7 +258,7 @@ pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Texture {
                     sample_type: TextureSampleType::Float { filterable: true },
-                    view_dimension: TextureViewDimension::D2,
+                    view_dimension: TextureViewDimension::D2Array,
                     multisampled: false,
                 },
                 count: None,
@@ -348,7 +348,9 @@ struct Material {{
 // everywhere, so the floor INSIDE a sealed room lit exactly as brightly as the
 // field outside it, and no amount of shadow-map work could change that: the
 // term being wrong was the ambient, not the direct light.
-@group(1) @binding(6) var sky_occ_tex: texture_2d<f32>;
+// Layer 0 the ground's own map; after it the stationary lamps' masks, two
+// lamps a layer. See `TerrainMaterial::new`.
+@group(1) @binding(6) var sky_occ_tex: texture_2d_array<f32>;
 
 {lights_block}
 {biplanar_block}
@@ -663,7 +665,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // per-vertex without a second pipeline.
     // The ambient term is scaled by baked sky visibility BEFORE the lights are
     // added, which is what `shade_with_sky` does and `shade` cannot.
-    let ground_map = textureSample(sky_occ_tex, layer_samp, in.uv);
+    let ground_map = textureSample(sky_occ_tex, layer_samp, in.uv, 0);
     let sky_vis = ground_map.r;
     // THE SKY SUN'S SHADOW, baked beside the sky visibility when alpha is 0:
     // a signed distance to the edge in texels (green) and the sun's penumbra
@@ -674,6 +676,29 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     let ground_sun_d = (ground_map.g - 0.5) * (2.0 * {sun_range:?});
     let ground_sun_w = max(max(ground_map.b * {sun_range:?}, 0.5 * fwidth(ground_sun_d)), 0.02);
     receiver_sun_mask = select(-1.0, smoothstep(-ground_sun_w, ground_sun_w, ground_sun_d), ground_map.a < 0.5);
+    // THE STATIONARY LAMPS' SHADOWS ON THE GROUND, in the layers after the
+    // ground map, in the brushes' format and channels. Without them every
+    // lamp lit the grass straight through the walls -- the hallway's sconces
+    // lit the ground outside the hallway (headset, 2026-09-24). A map with no
+    // mask layers reads fully lit, as the ground always was.
+    let st_layers = textureNumLayers(sky_occ_tex) - 1u;
+    var st_0 = vec4<f32>(1.0);
+    var st_1 = vec4<f32>(1.0);
+    var st_2 = vec4<f32>(1.0);
+    var st_3 = vec4<f32>(1.0);
+    if (st_layers > 0u) {{
+        st_0 = textureSample(sky_occ_tex, layer_samp, in.uv, 1);
+    }}
+    if (st_layers > 1u) {{
+        st_1 = textureSample(sky_occ_tex, layer_samp, in.uv, 2);
+    }}
+    if (st_layers > 2u) {{
+        st_2 = textureSample(sky_occ_tex, layer_samp, in.uv, 3);
+    }}
+    if (st_layers > 3u) {{
+        st_3 = textureSample(sky_occ_tex, layer_samp, in.uv, 4);
+    }}
+    set_stationary_masks(st_0, st_1, st_2, st_3, {stationary_range:?});
     // THE SAME SHADING PATH THE BRUSHES USE, and the albedo goes IN rather
     // than being multiplied over the result.
     //
@@ -712,6 +737,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
 "#,
         lights_block = wgsl_lights_block(0, 1),
         sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
+        stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
         biplanar_block = wgsl_biplanar_block(),
         whiteout_block = wgsl_whiteout_block(),
     )
@@ -808,6 +834,20 @@ pub(crate) mod tests {
         normals: &[Option<TerrainImage>],
         lit: bool,
     ) -> Option<[u8; 4]> {
+        render_quad_lit_by(normal, palette, splat, sky_occlusion, normals, lit.then_some(None))
+    }
+
+    /// `render_quad_full`'s light, as a STATIONARY lamp reading mask channel
+    /// `channel` when `Some(Some(channel))`.
+    pub fn render_quad_lit_by(
+        normal: [f32; 3],
+        palette: Palette,
+        splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
+        normals: &[Option<TerrainImage>],
+        light: Option<Option<u8>>,
+    ) -> Option<[u8; 4]> {
+        let lit = light.is_some();
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
 
@@ -836,7 +876,7 @@ pub(crate) mod tests {
             // how much light the fragment receives. Directly overhead would
             // make an x-tilt symmetric and hide exactly what is being tested.
             lights.upload(&queue, &[crate::renderer::lights::Light {
-                mask_channel: None,
+                mask_channel: light.flatten(),
                 position: glam::Vec3::new(3.0, 2.0, 0.0),
                 direction: glam::Vec3::new(0.0, -1.0, 0.0),
                 kind: crate::renderer::lights::LightKind::Point,
@@ -1687,13 +1727,18 @@ impl TerrainMaterial {
         // Sky visibility over the footprint. WHITE when unbaked: this value is
         // multiplied into the ambient term, so 1.0 is the neutral that
         // reproduces the shading terrain had before the map existed.
+        //
+        // AN ARRAY: layer 0 is the ground's own map, and any further layers
+        // the image's bytes carry -- whole images of the same size, back to
+        // back -- are the stationary lamps' masks (`with_stationary_masks`).
         let occ_image = sky_occlusion.unwrap_or(&FULL_SKY);
+        let occ_layers = (occ_image.rgba.len() / (4 * occ_image.width as usize * occ_image.height as usize).max(1)).max(1) as u32;
         let sky_occ_tex = device.create_texture(&TextureDescriptor {
             label: Some("terrain_sky_occlusion"),
             size: Extent3d {
                 width: occ_image.width,
                 height: occ_image.height,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: occ_layers,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -1711,7 +1756,7 @@ impl TerrainMaterial {
                 origin: Origin3d::ZERO,
                 aspect: TextureAspect::All,
             },
-            &occ_image.rgba,
+            &occ_image.rgba[..(4 * occ_image.width * occ_image.height * occ_layers) as usize],
             TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * occ_image.width),
@@ -1720,7 +1765,7 @@ impl TerrainMaterial {
             Extent3d {
                 width: occ_image.width,
                 height: occ_image.height,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: occ_layers,
             },
         );
 
@@ -1776,9 +1821,10 @@ impl TerrainMaterial {
                 },
                 BindGroupEntry {
                     binding: 6,
-                    resource: BindingResource::TextureView(
-                        &sky_occ_tex.create_view(&TextureViewDescriptor::default()),
-                    ),
+                    resource: BindingResource::TextureView(&sky_occ_tex.create_view(&TextureViewDescriptor {
+                        dimension: Some(TextureViewDimension::D2Array),
+                        ..Default::default()
+                    })),
                 },
                 BindGroupEntry {
                     binding: 7,
@@ -1941,9 +1987,55 @@ pub struct TerrainImage {
     pub rgba: Vec<u8>,
 }
 
+impl TerrainImage {
+    /// The ground's own map with the stationary lamps' masks after it, as the
+    /// layers of one array -- see `TerrainMaterial::new`. `None` when a mask
+    /// is not the map's size (a bake from before they shared its grid): the
+    /// lamps then light the ground unshadowed, as they always had.
+    pub fn with_stationary_masks(&self, masks: &[TerrainImage]) -> Option<TerrainImage> {
+        if masks.iter().any(|m| m.width != self.width || m.height != self.height || m.rgba.len() != self.rgba.len()) {
+            return None;
+        }
+        let mut rgba = self.rgba.clone();
+        for m in masks {
+            rgba.extend_from_slice(&m.rgba);
+        }
+        Some(TerrainImage { width: self.width, height: self.height, rgba })
+    }
+}
+
 #[cfg(test)]
 mod material_tests {
     use super::tests::*;
+
+    /// A STATIONARY LAMP ON THE GROUND TAKES ITS SHADOW FROM THE MASK LAYER
+    /// after the ground map: channel 0 fully shadowed leaves the ground as dark
+    /// as with no lamp at all, fully lit as bright as an unmasked lamp. Before
+    /// the masks, the ground took every lamp through the walls.
+    #[test]
+    fn a_stationary_lamp_on_the_ground_reads_its_mask() {
+        let map = super::TerrainImage { width: 1, height: 1, rgba: vec![255, 128, 0, 255] };
+        let mask = |d: u8| super::TerrainImage { width: 1, height: 1, rgba: vec![d, 0, 255, 255] };
+        let layered = |d: u8| map.with_stationary_masks(&[mask(d)]).unwrap();
+        // Flat ground, facing the harness's lamp up and to one side.
+        let up = [0.0, 1.0, 0.0];
+        let render = |sky: &super::TerrainImage, light: Option<Option<u8>>| {
+            render_quad_lit_by(up, Palette::Test, None, Some(sky), &[None, None, None, None], light)
+        };
+        let Some(dark) = render(&map, None) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let lamp = render(&map, Some(None)).unwrap();
+        let shadowed = render(&layered(0), Some(Some(0))).unwrap();
+        let lit = render(&layered(255), Some(Some(0))).unwrap();
+        assert!(lamp[0] > dark[0] + 10, "the test lamp does not light the ground: {lamp:?} vs {dark:?}");
+        assert_eq!(shadowed, dark, "a lamp its mask hides still lit the ground");
+        assert_eq!(lit, lamp, "a lamp its mask shows is not the unmasked lamp");
+        // And a map with no mask layers is the ground as it always was.
+        let other_channel = render(&layered(0), Some(Some(1))).unwrap();
+        assert_eq!(other_channel, lamp, "a lamp on another channel read this one's shadow");
+    }
     use super::*;
 
     /// The fallback material must produce the SAME layer selection as the

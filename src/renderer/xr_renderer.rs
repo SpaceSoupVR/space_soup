@@ -241,6 +241,10 @@ pub struct XrRenderer {
     /// that has not been baked. `None` binds white -- full sky -- which is the
     /// shading terrain had before this existed.
     terrain_sky_occlusion: Option<crate::renderer::terrain_pipeline::TerrainImage>,
+    /// The stationary lamps' shadows on the ground, two lamps a layer, on the
+    /// ground map's grid. Bound after it as layers of one array; see
+    /// `TerrainImage::with_stationary_masks`.
+    terrain_stationary: Vec<crate::renderer::terrain_pipeline::TerrainImage>,
     /// World x/z bounds the occlusion map spans, needed to turn a world
     /// position back into a texel. Kept beside the image because one is
     /// meaningless without the other.
@@ -1051,6 +1055,7 @@ impl XrRenderer {
             terrain_ao: vec![None, None, None, None],
             terrain_splat: None,
             terrain_sky_occlusion: None,
+            terrain_stationary: Vec::new(),
             terrain_footprint: None,
             terrain_settings: Default::default(),
             wire_pipeline,
@@ -1689,6 +1694,14 @@ impl XrRenderer {
         img.rgba.get(i).map(|r| *r as f32 / 255.0).unwrap_or(1.0)
     }
 
+    /// The stationary lamps' shadow masks on the ground, in layer order, two
+    /// lamps a layer as on the brushes. Empty: the lamps light the ground
+    /// unshadowed.
+    pub fn set_terrain_stationary_masks(&mut self, masks: Vec<crate::renderer::terrain_pipeline::TerrainImage>) {
+        self.terrain_stationary = masks;
+        self.rebuild_terrain_material();
+    }
+
     /// The world-space x/z extent the terrain occlusion map covers.
     pub fn set_terrain_footprint(&mut self, min: glam::Vec3, max: glam::Vec3) {
         self.terrain_footprint = Some((min, max));
@@ -1907,6 +1920,23 @@ impl XrRenderer {
     /// discard the first, which is exactly what a setter that took only its own
     /// half would do.
     fn rebuild_terrain_material(&mut self) {
+        // The ground map with the lamps' masks after it, when they fit it.
+        let ground = match (&self.terrain_sky_occlusion, self.terrain_stationary.is_empty()) {
+            (Some(map), false) => Some(map.with_stationary_masks(&self.terrain_stationary).unwrap_or_else(|| {
+                log::warn!(
+                    "terrain: {} stationary mask layer(s) do not match the {}x{} ground map; lamps light the ground unshadowed",
+                    self.terrain_stationary.len(),
+                    map.width,
+                    map.height
+                );
+                crate::renderer::terrain_pipeline::TerrainImage { width: map.width, height: map.height, rgba: map.rgba.clone() }
+            })),
+            (map, _) => map.as_ref().map(|m| crate::renderer::terrain_pipeline::TerrainImage {
+                width: m.width,
+                height: m.height,
+                rgba: m.rgba.clone(),
+            }),
+        };
         self.terrain_material =
             crate::renderer::terrain_pipeline::TerrainMaterial::from_layers_with(
                 &self.wgpu_device,
@@ -1917,7 +1947,7 @@ impl XrRenderer {
                 &self.terrain_rough,
                 &self.terrain_ao,
                 self.terrain_splat.as_ref(),
-                self.terrain_sky_occlusion.as_ref(),
+                ground.as_ref(),
                 self.terrain_settings,
             );
     }
