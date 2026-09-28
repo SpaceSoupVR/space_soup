@@ -323,8 +323,8 @@ impl StereoSceneTextures {
                 dimension: TextureDimension::D2,
                 format,
                 // See the per-eye texture: nothing samples it, so a tile GPU
-                // never has to write it out.
-                usage: TextureUsages::RENDER_ATTACHMENT,
+                // never has to write it out, or even back it with memory.
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TRANSIENT_ATTACHMENT,
                 view_formats: &[],
             })
         });
@@ -1221,7 +1221,15 @@ impl SsrPipelines {
                 format,
                 // NO texture binding: nothing samples it, which is what lets a
                 // tile GPU keep it on chip and never write it out.
-                usage: TextureUsages::RENDER_ATTACHMENT,
+                //
+                // TRANSIENT as well: the samples live only in tile memory
+                // (cleared on load, discarded on store, resolved on the way
+                // out), so the texture needs no memory behind it at all --
+                // Vulkan's lazily allocated memory, Metal's memoryless. Two
+                // eyes of 4x colour at this size is ~70 MB the headset no
+                // longer allocates. wgpu enforces the contract: a pass that
+                // loaded or stored these samples would be refused.
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TRANSIENT_ATTACHMENT,
                 view_formats: &[],
             })
         });
@@ -2456,6 +2464,89 @@ mod depth_resolve_tests {
              {DEPTH}; the copy is not copying, so every ray measures the scene \
              as infinitely far away and nothing is ever hit",
         );
+    }
+
+    /// THE MULTISAMPLED SCENE COLOUR IS TRANSIENT: cleared, drawn, resolved
+    /// and discarded, it never needs memory behind it -- and the resolve still
+    /// carries the picture out. A pass that tried to keep the samples is
+    /// refused, which is what makes the promise to the driver safe to make.
+    #[test]
+    fn the_multisampled_scene_colour_resolves_without_ever_being_stored() {
+        let Some((device, queue)) = crate::renderer::pipeline::tests::headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        // 64 texels of 4 bytes: a row is the 256 bytes a copy must align to.
+        const SIZE: u32 = 64;
+        let ssr = SsrPipelines::new_with_depth_samples(&device, TextureFormat::Rgba8UnormSrgb, 4);
+        let target = ssr.create_scene_target_multisampled(&device, TextureFormat::Rgba8UnormSrgb, SIZE, SIZE, 4);
+        let msaa = target.msaa_color_view.as_ref().expect("a 4x target has multisampled colour");
+        // Resolved into a texture of the test's own, which it can copy out.
+        let resolved = device.create_texture(&TextureDescriptor {
+            label: Some("transient_resolve"),
+            size: Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let resolved_view = resolved.create_view(&TextureViewDescriptor::default());
+        let pass = |store: StoreOp| {
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: None });
+            drop(encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("transient_scene_colour"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: msaa,
+                    depth_slice: None,
+                    resolve_target: Some(&resolved_view),
+                    ops: Operations { load: LoadOp::Clear(Color { r: 1.0, g: 0.0, b: 1.0, a: 1.0 }), store },
+                })],
+                ..Default::default()
+            }));
+            encoder
+        };
+
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = pass(StoreOp::Discard);
+        let bytes = SIZE * 4;
+        let readback = device.create_buffer(&BufferDescriptor {
+            label: Some("transient_readback"),
+            size: u64::from(bytes * SIZE),
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture: &resolved,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bytes), rows_per_image: Some(SIZE) },
+            },
+            Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(encoder.finish()));
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "clear, resolve and discard was refused: {err:?}");
+        readback.slice(..).map_async(MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let data = readback.slice(..).get_mapped_range().unwrap();
+        let middle = ((SIZE / 2 * SIZE + SIZE / 2) * 4) as usize;
+        assert_eq!(&data[middle..middle + 4], &[255, 0, 255, 255], "the resolve did not carry the picture out");
+        drop(data);
+        readback.unmap();
+
+        // Keeping the samples breaks the promise, and is refused rather than
+        // silently written to memory that was never there.
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        queue.submit(Some(pass(StoreOp::Store).finish()));
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_some(), "storing a transient attachment was accepted");
     }
 
     /// And nothing that marches may be typed against a multisampled depth

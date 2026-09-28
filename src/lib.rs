@@ -7,6 +7,7 @@ pub mod ui2d;
 pub mod voxelize;
 
 pub mod perf_metrics_log;
+pub mod perf_record;
 
 #[cfg(target_os = "android")]
 pub mod xr;

@@ -157,13 +157,36 @@ impl XrRenderer {
         // An unlocated frame is an ordinary event. Return no views, and the
         // caller submits no layer for this frame -- which OpenXR allows, and
         // which the compositor covers with the previous frame.
-        let (view_flags, eye_views) =
+        let (view_flags, mut eye_views) =
             session.locate_views(xr::ViewConfigurationType::PRIMARY_STEREO, time, stage)?;
         let located = view_flags.contains(xr::ViewStateFlags::ORIENTATION_VALID)
             && view_flags.contains(xr::ViewStateFlags::POSITION_VALID);
-        if !located {
-            self.swapchain.release_image()?;
-            return Ok(Vec::new());
+        if located && eye_views.len() >= 2 {
+            self.last_fov = Some([eye_views[0].fov, eye_views[1].fov]);
+        }
+        // A PINNED HEAD (a benchmark viewpoint, see `bench`) draws whether or
+        // not the runtime could locate the views: the poses are replaced, and
+        // a headset on a desk can lose tracking in a dark room. It still needs
+        // each eye's field of view, so it waits for one located frame.
+        match (self.pinned_head, self.last_fov) {
+            (Some((position, rotation)), Some(fov)) if eye_views.len() >= 2 => {
+                let rig = crate::renderer::bench::BenchRig {
+                    offset: glam::Vec3::ZERO,
+                    yaw: 0.0,
+                    head_position: position,
+                    head_rotation: rotation,
+                };
+                crate::renderer::bench::pin_xr_views(&mut eye_views, located, &rig);
+                if !located {
+                    eye_views[0].fov = fov[0];
+                    eye_views[1].fov = fov[1];
+                }
+            }
+            _ if located => {}
+            _ => {
+                self.swapchain.release_image()?;
+                return Ok(Vec::new());
+            }
         }
 
         let head_rot = {
@@ -446,7 +469,7 @@ impl XrRenderer {
         // EVERYTHING THIS FRAME SWITCHES: the lever file, with the schedule's
         // one extra switch on top. See `levers`. Every feature below reads
         // this, never the phase, so a lever and a phase cannot disagree.
-        let fx = self.levers.with_phase(ab_phase);
+        let fx = self.levers.clone().with_phase(ab_phase);
         let no_shadow_phase = !fx.shadows;
         let want_sun = self.shadow_quality != ShadowQuality::Off && !no_shadow_phase;
         let want_spot = self.shadow_quality == ShadowQuality::SunAndSpot && !no_shadow_phase;
@@ -1136,6 +1159,9 @@ impl XrRenderer {
                                 }),
                                 stencil_ops: None,
                             }),
+                            // Its own slots, `probe_l`/`probe_r`, after the
+                            // eight the other passes address by index.
+                            timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(8 + eye)),
                             ..Default::default()
                         });
                         pass.set_pipeline(&self.brush_probe_pass_pipeline.pipeline);
@@ -1757,32 +1783,79 @@ impl XrRenderer {
         let gpu_wait_start = std::time::Instant::now();
         self.wgpu_device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         let gpu_time = gpu_wait_start.elapsed();
-        let logged = self.frame_stats.record(cpu_time, gpu_time, std::time::Instant::now());
+        let outcome = self.frame_stats.record(cpu_time, gpu_time, std::time::Instant::now());
+        // The runtime's counters, every measured frame, so the window carries
+        // their average rather than the one frame that closed it.
+        if outcome.measured {
+            if let Some(metrics) = &self.perf_metrics {
+                self.perf_metric_window.add(&metrics.sample());
+            }
+        }
         // ONLY on the frames `PERF` prints. `read` maps a buffer and polls,
         // which stalls the render thread; doing that every frame would make the
         // instrument change the thing it is measuring.
-        if logged {
+        if let Some(stats) = outcome.closed {
+            let cycling = crate::renderer::perf_ab::ENABLED || self.levers.ab_cycle;
             // Labelled with the phase these frames ran under. The window just
-            // logged was ALL one phase, because the phase only advances here.
-            let ab = if crate::renderer::perf_ab::ENABLED || self.levers.ab_cycle { ab_phase.label() } else { "-" };
+            // logged was ALL one phase, because the phase only advances here --
+            // or `warmup`, when it straddled a change of levers.
+            let ab = if self.perf_warmup {
+                "warmup"
+            } else if cycling {
+                ab_phase.label()
+            } else {
+                "-"
+            };
             // And with the levers in force, so a window measured with a
             // feature switched off from the headset is never read as shipped.
             let levers = self.levers.summary();
             // Labelled with the SSR state too, so a window measured while the
             // switch was flipped mid-session is never read as the other state.
             let ssr = if self.screen_space_reflections { "on" } else { "off" };
-            match self.pass_timers.as_ref().and_then(|t| t.read(&self.wgpu_device)) {
+            let breakdown = self.pass_timers.as_ref().and_then(|t| t.read(&self.wgpu_device));
+            match &breakdown {
                 Some(breakdown) => log::info!(
                     "{} [ab={ab} ssr={ssr} levers={levers}]",
-                    crate::renderer::pass_timers::format_breakdown(&breakdown)
+                    crate::renderer::pass_timers::format_breakdown(breakdown)
                 ),
                 None => log::info!("PASS: unavailable [ab={ab} ssr={ssr} levers={levers}]"),
             }
             // The runtime's view of the same window. See `xr::perf_metrics`.
-            if let Some(metrics) = &self.perf_metrics {
-                log::info!("{} [ab={ab} ssr={ssr} levers={levers}]", crate::perf_metrics_log::format_line(&metrics.sample()));
+            let counters = self.perf_metric_window.take();
+            if self.perf_metrics.is_some() {
+                log::info!("{} [ab={ab} ssr={ssr} levers={levers}]", crate::perf_metrics_log::format_line(&counters));
             }
-            self.perf_windows += 1;
+            if let Some(log) = &self.perf_log {
+                let cycle_len = crate::renderer::perf_ab::Phase::ALL.len() as u64;
+                let record = crate::perf_record::WindowRecord {
+                    window: self.perf_window_index,
+                    t: self.started_at.elapsed().as_secs_f64(),
+                    phase: ab.to_string(),
+                    cycle_pass: if cycling { self.perf_windows / cycle_len } else { self.perf_windows },
+                    cycle_len: if cycling { cycle_len } else { 1 },
+                    warmup: self.perf_warmup,
+                    levers: levers.clone(),
+                    bench: self.levers.bench.as_ref().map(|b| b.name.clone()),
+                    ssr: self.screen_space_reflections,
+                    multiview: self.multiview_scene,
+                    frames: stats.frames,
+                    cpu_avg: stats.cpu_avg,
+                    cpu_max: stats.cpu_max,
+                    gpu_avg: stats.gpu_avg,
+                    gpu_max: stats.gpu_max,
+                    frame_ms: stats.frame_ms,
+                    fps: stats.fps,
+                    pass: breakdown.iter().flatten().map(|t| (t.label.clone(), t.ms)).collect(),
+                    xr: counters.iter().map(|c| (c.short.clone(), c.value)).collect(),
+                };
+                log.write(record.to_line());
+            }
+            self.perf_window_index += 1;
+            if self.perf_warmup {
+                self.perf_warmup = false;
+            } else {
+                self.perf_windows += 1;
+            }
         }
         self.swapchain.release_image()?;
 
