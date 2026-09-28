@@ -36,7 +36,6 @@
 use wgpu::*;
 
 use super::cuboid::SolidVertex;
-use super::lights::wgsl_lights_block;
 use super::material_wgsl::{wgsl_biplanar_block, wgsl_whiteout_block};
 
 /// Per-scene terrain material settings, matching the WGSL uniform.
@@ -262,6 +261,17 @@ impl TerrainPipeline {
     }
 }
 
+/// The lights block as the ground takes it: with `options`, testing each
+/// lamp's range before its baked mask -- out of range is what the building's
+/// lamps are from nearly all the ground. See `CULL_RANGE_FIRST`.
+fn terrain_lights_block(options: crate::renderer::lights::LightsBlockOptions) -> String {
+    crate::renderer::lights::wgsl_lights_block_with(
+        0,
+        1,
+        crate::renderer::lights::LightsBlockOptions { cull_range_first: true, ..options },
+    )
+}
+
 /// WHAT A TERRAIN SHADER IS FOR. See `TerrainPipeline::new_probe_reader` and
 /// `new_probe_pass`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -284,14 +294,17 @@ pub fn terrain_shader_for(role: TerrainRole) -> String {
     if role == TerrainRole::Scene {
         return src;
     }
-    let plain_lights = wgsl_lights_block(0, 1);
+    let plain_lights = terrain_lights_block(crate::renderer::lights::LightsBlockOptions::default());
     assert!(src.contains(&plain_lights), "the terrain shader no longer embeds the lights block as generated");
     let shade = "    let lit = shade_material_env(\n";
     assert!(src.contains(shade), "the terrain shader no longer shades through `shade_material_env`");
     match role {
         TerrainRole::Scene => unreachable!(),
         TerrainRole::Read => {
-            let read_lights = crate::renderer::lights::wgsl_lights_block_with(0, 1, true, false, false);
+            let read_lights = terrain_lights_block(crate::renderer::lights::LightsBlockOptions {
+                probe_from_pass: true,
+                ..Default::default()
+            });
             let src = src.replacen(&plain_lights, &read_lights, 1).replacen(
                 shade,
                 &format!(
@@ -302,7 +315,10 @@ pub fn terrain_shader_for(role: TerrainRole) -> String {
             format!("{src}{}", crate::renderer::brush_pipeline::probe_pass::READER_WGSL)
         }
         TerrainRole::ProbePass => {
-            let pass_lights = crate::renderer::lights::wgsl_lights_block_with(0, 1, false, false, true);
+            let pass_lights = terrain_lights_block(crate::renderer::lights::LightsBlockOptions {
+                defer_secondary: true,
+                ..Default::default()
+            });
             let src = src.replacen(&plain_lights, &pass_lights, 1);
             let start = src.find(shade).expect("checked above");
             let end = start + src[start..].find("\n}\n").expect("the fragment stage ends");
@@ -859,7 +875,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     return vec4<f32>(tonemap(in.col.rgb * lit), 1.0);
 }}
 "#,
-        lights_block = wgsl_lights_block(0, 1),
+        lights_block = terrain_lights_block(crate::renderer::lights::LightsBlockOptions::default()),
         sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
         stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
         biplanar_block = wgsl_biplanar_block(),

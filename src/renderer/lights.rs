@@ -665,25 +665,31 @@ pub fn append_baked(live: &[Light], baked: &[Light], max: usize) -> Vec<Light> {
 /// anything added here.
 
 pub fn wgsl_lights_block(group_index: u32, binding_index: u32) -> String {
-    wgsl_lights_block_with(group_index, binding_index, false, false, false)
+    wgsl_lights_block_with(group_index, binding_index, LightsBlockOptions::default())
 }
 
-/// `wgsl_lights_block`, where `probe_from_pass` makes `shade_material_env`
-/// take its probe reflection from `probe_env_given` -- the half-resolution
-/// probe pass's answer, set by the brush shader -- instead of tracing it per
-/// pixel. See `brush_pipeline::probe_pass`. `probe_face_always` promises that
-/// every caller of `probe_environment` has set `probe_face_given` -- true of the
-/// probe pass, whose vertex stage chooses each face's room -- so the searches
-/// that serve callers without one are compiled out. See `PROBE_FACE_ALWAYS_GIVEN`.
-/// `defer_secondary` makes `probe_environment` leave a traced hit's secondary
-/// lookups to `probe_fixup` instead of making them. See `PROBE_SECONDARY_DEFERRED`.
-pub fn wgsl_lights_block_with(
-    group_index: u32,
-    binding_index: u32,
-    probe_from_pass: bool,
-    probe_face_always: bool,
-    defer_secondary: bool,
-) -> String {
+/// What a shader asks of the lights block beyond the default. See
+/// `wgsl_lights_block_with`.
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub struct LightsBlockOptions {
+    /// `shade_material_env` takes its probe reflection from `probe_env_given`
+    /// -- the half-resolution probe pass's answer -- instead of tracing it.
+    /// See `PROBE_ENV_FROM_PASS`.
+    pub probe_from_pass: bool,
+    /// Every caller of `probe_environment` sets `probe_face_given`. See
+    /// `PROBE_FACE_ALWAYS_GIVEN`.
+    pub probe_face_always: bool,
+    /// `probe_environment` leaves a traced hit's secondary lookups to
+    /// `probe_fixup`. See `PROBE_SECONDARY_DEFERRED`.
+    pub defer_secondary: bool,
+    /// The lamp pre-pass tests a lamp's range before its baked mask. See
+    /// `CULL_RANGE_FIRST`.
+    pub cull_range_first: bool,
+}
+
+/// `wgsl_lights_block`, with `options`. See `LightsBlockOptions`.
+pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: LightsBlockOptions) -> String {
+    let LightsBlockOptions { probe_from_pass, probe_face_always, defer_secondary, cull_range_first } = options;
     let shadow_tex = binding_index + 1;
     let shadow_samp = binding_index + 2;
     let spot_tex = binding_index + 3;
@@ -1044,6 +1050,12 @@ const PROBE_FACE_ALWAYS_GIVEN: bool = {probe_face_always};
 // for `probe_fixup` (`probe_fixup_begin` and `_finish`) -- the ray's part the
 // moment the trace ends, so it is not carried through the colour lookup.
 const PROBE_SECONDARY_DEFERRED: bool = {defer_secondary};
+// WHETHER THE LAMP PRE-PASS TESTS A LAMP'S RANGE BEFORE ITS BAKED MASK: three
+// instructions before a dozen, the better order where most lamps are out of
+// range -- the ground outdoors, far from the building's lamps (-0.3 to
+// -0.6 ms a frame, 2026-09-28). The brushes keep the mask first, the order
+// they were measured in. The same lamps are kept either way.
+const CULL_RANGE_FIRST: bool = {cull_range_first};
 // The fragment whose reflection this is -- its position builtin, set by the
 // probe pass before it shades -- for the record of a deferred lookup.
 var<private> probe_fragment: vec4<f32> = vec4<f32>(0.0);
@@ -3437,14 +3449,18 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
             light_dist_sq = min(light_dist_sq, dist_sq);
         }}
         if (culling) {{
+            // Past its range, where the window is exactly zero: here or below,
+            // by `CULL_RANGE_FIRST`.
+            if (CULL_RANGE_FIRST && kind < 1.5 && dist_sq >= lights.lights[i].params.x * lights.lights[i].params.x) {{
+                continue;
+            }}
             // Hidden from here by its baked mask: exactly zero light.
             if (stationary_visibility_of(lights.lights[i].position.w) <= 0.0) {{
                 continue;
             }}
             if (kind < 1.5) {{
-                // Past its range, where the window is exactly zero.
                 let reach = lights.lights[i].params.x;
-                if (dist_sq >= reach * reach) {{
+                if (!CULL_RANGE_FIRST && dist_sq >= reach * reach) {{
                     continue;
                 }}
                 // OUTSIDE A SPOT'S CONE BY MORE THAN ITS SOFT EDGE CAN REACH.
