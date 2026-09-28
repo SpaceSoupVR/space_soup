@@ -665,6 +665,14 @@ pub fn append_baked(live: &[Light], baked: &[Light], max: usize) -> Vec<Light> {
 /// anything added here.
 
 pub fn wgsl_lights_block(group_index: u32, binding_index: u32) -> String {
+    wgsl_lights_block_with(group_index, binding_index, false)
+}
+
+/// `wgsl_lights_block`, where `probe_from_pass` makes `shade_material_env`
+/// take its probe reflection from `probe_env_given` -- the half-resolution
+/// probe pass's answer, set by the brush shader -- instead of tracing it per
+/// pixel. See `brush_pipeline::probe_pass`.
+pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, probe_from_pass: bool) -> String {
     let shadow_tex = binding_index + 1;
     let shadow_samp = binding_index + 2;
     let spot_tex = binding_index + 3;
@@ -979,6 +987,15 @@ fn spot_cone(cos_angle: f32, cos_outer: f32, cos_inner: f32, dist: f32) -> f32 {
 // `probe_environment` for `shade_material_env` to normalise against. Zero means
 // unknown, and an unknown probe is used as it is. See `PROBE_NORMALISATION`.
 var<private> probe_brightness: f32 = 0.0;
+// WHETHER THIS SHADER READS ITS PROBE REFLECTION FROM THE HALF-RESOLUTION
+// PASS rather than tracing it per pixel. See `brush_pipeline::probe_pass`. A
+// constant, so a shader that reads it carries none of the trace: the branch in
+// `shade_material_env` folds away, and the trace's registers with it.
+const PROBE_ENV_FROM_PASS: bool = {probe_from_pass};
+// The half-resolution pass's answer for this pixel -- the probe radiance,
+// already normalised, and its coverage -- set by the brush shader before it
+// shades. Only read when `PROBE_ENV_FROM_PASS`.
+var<private> probe_env_given: vec4<f32> = vec4<f32>(0.0);
 // WHERE TO STAND WHEN ASKING WHICH ROOM, set by a caller that knows better than
 // the pixel (`w` = 1). A brush sets its face centre: a face belongs to one room,
 // and an MSAA edge sample extrapolated along a grazing surface can land well
@@ -2705,6 +2722,38 @@ fn environment_radiance(dir: vec3<f32>) -> vec3<f32> {{
     return mix(ground, sky, smoothstep(-0.15, 0.15, dir.y));
 }}
 
+// THE PROBE REFLECTION FOR THE HALF-RESOLUTION PASS TO STORE: exactly what
+// `shade_material_env` reads from `probe_environment` for this surface, with
+// its brightness normalisation already applied -- the pass has the lightmap
+// that needs -- and premultiplied by its coverage, so the brush shader can
+// filter it across texels. Same arguments as `shade_material_env`, minus what
+// only the lights need. See `brush_pipeline::probe_pass`.
+fn probe_env_for_pass(
+    world_pos: vec3<f32>,
+    n: vec3<f32>,
+    roughness: f32,
+    ao: f32,
+    sky_vis: f32,
+    env: vec3<f32>,
+    probe_select_pos: vec3<f32>,
+    geom_n: vec3<f32>,
+) -> vec4<f32> {{
+    let view_dir = normalize(cam_pos() - world_pos);
+    let r = clamp(roughness, 0.04, 1.0);
+    let env_n = normalize(mix(n, geom_n, smoothstep(0.1, 0.4, r)));
+    let refl = reflect(-view_dir, env_n);
+    let probe = probe_environment(world_pos, refl, roughness, probe_select_pos);
+    let occ = clamp(ao, 0.0, 1.0) * clamp(sky_vis, 0.0, 1.0);
+    let ambient_here = dot(env + sky_irradiance(n) * occ, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let probe_scale = select(
+        1.0,
+        clamp(ambient_here / max(probe_brightness, 1e-4), PROBE_NORMALISATION_FLOOR, 1.0),
+        PROBE_NORMALISATION && probe_brightness > 0.0,
+    );
+    let a = clamp(probe.a, 0.0, 1.0);
+    return vec4<f32>(probe.rgb * probe_scale * a, a);
+}}
+
 fn shade_material_env(
     world_pos: vec3<f32>,
     n: vec3<f32>,
@@ -2867,7 +2916,13 @@ fn shade_material_env(
     // The sky keeps its `occ`: a surface sealed inside a room cannot reflect a
     // sky it cannot see. The probe does NOT, because what it captured is
     // already the light that got there.
-    let probe = probe_environment(world_pos, refl, roughness, probe_select_pos);
+    // From the half-resolution pass when this shader was built to read it;
+    // `probe_brightness` then stays 0, because the pass has normalised it
+    // already. See `probe_env_for_pass`.
+    var probe = probe_env_given;
+    if (!PROBE_ENV_FROM_PASS) {{
+        probe = probe_environment(world_pos, refl, roughness, probe_select_pos);
+    }}
     let sky_reflection = environment_radiance(refl) * occ;
     // SPECULAR OCCLUSION.
     //

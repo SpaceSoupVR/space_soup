@@ -1098,11 +1098,55 @@ impl XrRenderer {
                 );
             }
             self.ssr_camera_uniform.upload(&self.wgpu_queue, eye_view_proj, cam_pos);
+            // THE BRUSHES' REFLECTIONS AT HALF RESOLUTION, in their own pass
+            // before the scene pass reads them. See `brush_pipeline::probe_pass`.
+            // Mono passes only; the diagnostic views keep the per-pixel shader,
+            // which is the only one that paints them.
+            let probe_pass = fx.half_res_reflections
+                && fx.probes
+                && !stereo
+                && self.debug_view == crate::renderer::brush_pipeline::DebugView::Off
+                && brush_buffers.is_some();
 
             {
                 let mut encoder = self.wgpu_device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor { label: Some("ssr_scene") },
                 );
+                if probe_pass {
+                    if let Some((vb, ib, count)) = &brush_buffers {
+                        let t = &self.probe_pass_targets[eye];
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("probe_pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &t.color_view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            // Kept: the scene pass reads it to match its pixels
+                            // to this pass's texels by depth.
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: &t.depth_view,
+                                depth_ops: Some(wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(1.0),
+                                    store: wgpu::StoreOp::Store,
+                                }),
+                                stencil_ops: None,
+                            }),
+                            ..Default::default()
+                        });
+                        pass.set_pipeline(&self.brush_probe_pass_pipeline.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
+                        pass.set_bind_group(2, self.brush_lightmap_bg(), &[]);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                }
                 // ONCE PER FRAME WHEN STEREO, not once per eye. The pass
                 // covers both layers, so running it again on the second eye
                 // would draw the whole scene twice into the same attachment --
@@ -1328,7 +1372,12 @@ impl XrRenderer {
                         // One draw for the whole level, however many materials
                         // it uses: the material is a vertex attribute and every
                         // colour map is a layer of one array.
-                        pass.set_pipeline(self.sp_brush(stereo));
+                        if probe_pass {
+                            pass.set_pipeline(&self.brush_probe_reader_pipeline.pipeline);
+                            pass.set_bind_group(3, &self.probe_pass_targets[eye].bind_group, &[]);
+                        } else {
+                            pass.set_pipeline(self.sp_brush(stereo));
+                        }
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
                         pass.set_bind_group(2, self.brush_lightmap_bg(), &[]);
