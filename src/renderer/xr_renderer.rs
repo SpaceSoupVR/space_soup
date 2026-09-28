@@ -207,6 +207,12 @@ pub struct XrRenderer {
     /// The same for the multiview scene pass. `None` without multiview, or if
     /// the device refused these pipelines. See `StereoProbePass`.
     stereo_probe: Option<StereoProbePass>,
+    /// The brushes' depth, drawn first in the scene pass. See
+    /// `BrushPipeline::new_depth_prepass`; the lever `depth_prepass`.
+    brush_depth_prepass: crate::renderer::brush_pipeline::BrushPipeline,
+    /// The same for the multiview scene pass, in its own error scope like
+    /// `stereo_probe`: refused, stereo simply runs without a prepass.
+    stereo_depth_prepass: Option<crate::renderer::brush_pipeline::BrushPipeline>,
     brush_mirror_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     brush_materials: crate::renderer::brush_pipeline::BrushMaterials,
     terrain_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
@@ -686,6 +692,10 @@ impl XrRenderer {
         let probe_pass_targets: [crate::renderer::brush_pipeline::probe_pass::Target; 2] = std::array::from_fn(|_| {
             crate::renderer::brush_pipeline::probe_pass::Target::new(&wgpu_device, &probe_pass_layout, width, height, 1)
         });
+        let brush_depth_prepass = crate::renderer::brush_pipeline::BrushPipeline::new_depth_prepass(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, samples, crate::renderer::multiview::ViewMode::Mono,
+        );
+
         // White until a scene loads its materials, so an untextured level draws
         // in its authored colours rather than in nothing.
         let brush_materials = crate::renderer::brush_pipeline::BrushMaterials::fallback(
@@ -910,6 +920,21 @@ impl XrRenderer {
         } else {
             None
         };
+        let stereo_depth_prepass = if can_multiview {
+            let scope = wgpu_device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let built = crate::renderer::brush_pipeline::BrushPipeline::new_depth_prepass(
+                &wgpu_device, wgpu_format, &uniform_buf.layout, samples, crate::renderer::multiview::ViewMode::Stereo,
+            );
+            match pollster::block_on(scope.pop()) {
+                Some(e) => {
+                    error!("renderer: stereo depth prepass REFUSED, stereo draws without one -- {e}");
+                    None
+                }
+                None => Some(built),
+            }
+        } else {
+            None
+        };
 
         let (stereo_scene, scene_targets): (Option<StereoSceneTextures>, [SceneTarget; 2]) =
             if can_multiview {
@@ -1026,6 +1051,8 @@ impl XrRenderer {
             brush_probe_reader_pipeline,
             probe_pass_targets,
             stereo_probe,
+            brush_depth_prepass,
+            stereo_depth_prepass,
             brush_mirror_pipeline,
             water_pipeline,
             water_bodies: Vec::new(),

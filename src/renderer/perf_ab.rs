@@ -79,10 +79,13 @@ pub enum Phase {
     /// Reflections traced per pixel in the scene pass again, instead of by the
     /// half-resolution probe pass. What that pass saves.
     FullResReflections,
+    /// No brush depth prepass: hidden surfaces are shaded again. What the
+    /// prepass saves.
+    NoDepthPrepass,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 14] = [
+    pub const ALL: [Phase; 15] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -97,6 +100,7 @@ impl Phase {
         Phase::NoStationary,
         Phase::NoLightCulling,
         Phase::FullResReflections,
+        Phase::NoDepthPrepass,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -134,6 +138,7 @@ impl Phase {
             Phase::NoStationary => "no_stationary",
             Phase::NoLightCulling => "no_light_culling",
             Phase::FullResReflections => "full_res_reflections",
+            Phase::NoDepthPrepass => "no_depth_prepass",
         }
     }
 }

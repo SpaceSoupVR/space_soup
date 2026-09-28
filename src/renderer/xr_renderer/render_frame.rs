@@ -1339,6 +1339,26 @@ impl XrRenderer {
                         pass.set_viewport(0.0, 0.0, (self.width / 2) as f32, (self.height / 2) as f32, 0.0, 1.0);
                     }
 
+                    // THE BRUSHES' DEPTH FIRST, so nothing behind a wall or
+                    // under a floor is shaded by what follows -- the terrain,
+                    // meshes, and the brushes' own shading at LessEqual. See
+                    // `BrushPipeline::new_depth_prepass`. Not under the
+                    // diagnostic views, which draw brushes with pipelines of
+                    // their own.
+                    let prepass = if stereo { self.stereo_depth_prepass.as_ref() } else { Some(&self.brush_depth_prepass) };
+                    if let (true, Some(prepass), Some((vb, ib, count))) = (
+                        fx.depth_prepass && self.debug_view == crate::renderer::brush_pipeline::DebugView::Off,
+                        prepass,
+                        &brush_buffers,
+                    ) {
+                        pass.set_pipeline(&prepass.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+
                     if !solid_verts.is_empty() {
                         pass.set_pipeline(self.sp_solid(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
@@ -1797,7 +1817,21 @@ impl XrRenderer {
 
         let cpu_time = cpu_start.elapsed();
         let gpu_wait_start = std::time::Instant::now();
-        self.wgpu_device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        // NO WAIT FOR THE GPU, unless measuring. Blocking here until the
+        // frame finished drawing left the GPU idle while the CPU prepared the
+        // next one: the first headset benchmark measured frames ~3 ms longer
+        // than the GPU's own time (2026-09-28), which alone would keep a
+        // 12 ms GPU frame from 72 Hz. Nothing read back needs it -- the pass
+        // timers wait for themselves, once a window -- and the runtime waits
+        // for the queue before it composites. `gpu_sync` restores the wait,
+        // whose length is then exactly the GPU's time: the A/B schedule's
+        // measure.
+        let wait = if self.levers.gpu_sync {
+            wgpu::PollType::Wait { submission_index: None, timeout: None }
+        } else {
+            wgpu::PollType::Poll
+        };
+        let _ = self.wgpu_device.poll(wait);
         let gpu_time = gpu_wait_start.elapsed();
         let outcome = self.frame_stats.record(cpu_time, gpu_time, std::time::Instant::now());
         // The runtime's counters, every measured frame, so the window carries
