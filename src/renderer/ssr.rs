@@ -121,6 +121,27 @@ pub struct SceneTarget {
     pub samples: u32,
 }
 
+/// What a multisampled scene colour texture of `layers` layers is created for.
+///
+/// Always a render attachment and nothing else: nothing samples it, so a tile
+/// GPU never writes it out. TRANSIENT as well when it is ONE layer -- the
+/// samples live only in tile memory (cleared on load, discarded on store,
+/// resolved on the way out), so it needs no memory behind it at all.
+///
+/// Never for the two-layer multiview texture: wgpu 30 refuses a transient
+/// texture with more than one layer ("Transient texture layer count (2) must
+/// be 1"). Making it transient invalidated the texture, and with it every
+/// per-eye view taken from it, so the headset drew nothing at all at 72 fps
+/// (2026-09-27 23:20). No development machine could see it: none has
+/// multiview, so none ever creates that texture.
+pub fn msaa_colour_usage(layers: u32) -> TextureUsages {
+    if layers == 1 {
+        TextureUsages::RENDER_ATTACHMENT | TextureUsages::TRANSIENT_ATTACHMENT
+    } else {
+        TextureUsages::RENDER_ATTACHMENT
+    }
+}
+
 /// The colour and depth a STEREO scene pass shares between the two eyes.
 ///
 /// A multiview pass draws both eyes in one go, into the LAYERS of a single
@@ -323,8 +344,9 @@ impl StereoSceneTextures {
                 dimension: TextureDimension::D2,
                 format,
                 // See the per-eye texture: nothing samples it, so a tile GPU
-                // never has to write it out, or even back it with memory.
-                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TRANSIENT_ATTACHMENT,
+                // never has to write it out. NOT transient: it has a layer per
+                // eye -- see `msaa_colour_usage`.
+                usage: msaa_colour_usage(layers),
                 view_formats: &[],
             })
         });
@@ -1222,14 +1244,8 @@ impl SsrPipelines {
                 // NO texture binding: nothing samples it, which is what lets a
                 // tile GPU keep it on chip and never write it out.
                 //
-                // TRANSIENT as well: the samples live only in tile memory
-                // (cleared on load, discarded on store, resolved on the way
-                // out), so the texture needs no memory behind it at all --
-                // Vulkan's lazily allocated memory, Metal's memoryless. Two
-                // eyes of 4x colour at this size is ~70 MB the headset no
-                // longer allocates. wgpu enforces the contract: a pass that
-                // loaded or stored these samples would be refused.
-                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TRANSIENT_ATTACHMENT,
+                // TRANSIENT as well, being one layer: see `msaa_colour_usage`.
+                usage: msaa_colour_usage(1),
                 view_formats: &[],
             })
         });
@@ -2464,6 +2480,16 @@ mod depth_resolve_tests {
              {DEPTH}; the copy is not copying, so every ray measures the scene \
              as infinitely far away and nothing is ever hit",
         );
+    }
+
+    /// wgpu's rule, checked as data because no development machine can create
+    /// the multiview texture it bit: a transient texture has exactly one layer.
+    #[test]
+    fn only_a_one_layer_msaa_colour_is_transient() {
+        assert!(super::msaa_colour_usage(1).contains(TextureUsages::TRANSIENT_ATTACHMENT));
+        for layers in [2, crate::renderer::multiview::STEREO_VIEWS] {
+            assert_eq!(super::msaa_colour_usage(layers), TextureUsages::RENDER_ATTACHMENT, "{layers} layers");
+        }
     }
 
     /// THE MULTISAMPLED SCENE COLOUR IS TRANSIENT: cleared, drawn, resolved
