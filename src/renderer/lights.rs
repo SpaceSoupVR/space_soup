@@ -3091,7 +3091,30 @@ fn probe_env_for_pass(
     return vec4<f32>(probe.rgb * probe_scale * a, a);
 }}
 
-fn shade_material_env(
+// WHAT THE LAMP HALF OF `shade_material_env` NEEDS FROM ITS ENVIRONMENT HALF.
+//
+// Two halves so a caller can do something between them: the brush shader
+// samples its stationary lamps' masks there. Eight visibilities computed
+// before the environment work were carried, unused, through all of it, and
+// that is where the scene shader held its register peak -- 21 registers, 50%
+// occupancy, where 19 is the next step (`PIPESTATS`, 2026-09-28). The same
+// arithmetic, in the same order, as the one function it was.
+struct MaterialEnvPart {{
+    diffuse: vec3<f32>,
+    specular: vec3<f32>,
+    // The bounce, shaped by its direction; and that direction and its
+    // coherence for the gloss the lamp half adds -- `has_dir` false where the
+    // baked light has no direction.
+    bounce: vec3<f32>,
+    bounce_dir: vec3<f32>,
+    directionality: f32,
+    has_dir: bool,
+    fresnel: f32,
+    view_dir: vec3<f32>,
+    r: f32,
+}}
+
+fn shade_material_env_part(
     world_pos: vec3<f32>,
     n: vec3<f32>,
     roughness: f32,
@@ -3132,107 +3155,9 @@ fn shade_material_env(
     // Callers with no separate geometric normal pass `n` and get the previous
     // behaviour exactly.
     geom_n: vec3<f32>,
-) -> vec3<f32> {{
+) -> MaterialEnvPart {{
     let view_dir = normalize(cam_pos() - world_pos);
     let r = clamp(roughness, 0.04, 1.0);
-    // Blinn-Phong has an exponent where a PBR model has a roughness, so the two
-    // are bridged by the usual mapping: alpha = r^2, exponent = 2/alpha^2 - 2.
-    // Exact enough for a preview and monotonic, which is what matters -- a
-    // rougher material must never come out shinier.
-    // Distance to the nearest punctual light, for the sphere-light widening.
-    // Computed before the loop because the roughness it feeds is per surface,
-    // not per light: one lobe, sized by whatever is actually lighting this spot.
-    // FIELDS, NOT THE WHOLE STRUCT.
-    //
-    // `let li = lights.lights[i]` copied all sixteen components of a Light
-    // (four vec4s) to read exactly two of them. On a tile GPU that is register
-    // pressure for nothing, and register pressure is occupancy: high GPR use
-    // lowers how many waves stay in flight, which is what hides memory
-    // latency. A shader that "should" be fast then stalls with no other wave
-    // available to fill the gap -- and this frame is fill bound, so per-pixel
-    // occupancy is the cost that counts.
-    //
-    // Indexing a UNIFORM buffer per field is free of the other trap here: the
-    // documented Adreno cliff is a dynamically-indexed LOCAL array, which
-    // spills to scratch memory. There are none of those in this shader, and a
-    // uniform array is not one.
-    //
-    // By SQUARED distance, and one square root after the loop: the nearest
-    // lamp is the same either way, and a root per lamp per pixel was paid to
-    // compare numbers whose order the root does not change.
-    //
-    // AND WHICH LAMPS CAN REACH THIS PIXEL AT ALL, in the same pass: bit `i`
-    // of `reaching` is lamp `i`, tested exactly as the lighting loop used to
-    // test it on a second walk over every lamp -- its baked visibility, its
-    // range, its cone, the sun's mask. The lighting loop below then visits
-    // only those, in the same order. See the comment there.
-    var light_dist_sq = 1e18;
-    var reaching = 0u;
-    let culling = light_culling();
-    for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
-        let kind = lights.lights[i].params.z;
-        let to_lamp = lights.lights[i].position.xyz - world_pos;
-        let dist_sq = dot(to_lamp, to_lamp);
-        if (kind <= 1.5) {{
-            light_dist_sq = min(light_dist_sq, dist_sq);
-        }}
-        if (culling) {{
-            // Hidden from here by its baked mask: exactly zero light.
-            if (stationary_visibility_of(lights.lights[i].position.w) <= 0.0) {{
-                continue;
-            }}
-            if (kind < 1.5) {{
-                // Past its range, where the window is exactly zero.
-                let reach = lights.lights[i].params.x;
-                if (dist_sq >= reach * reach) {{
-                    continue;
-                }}
-                // OUTSIDE A SPOT'S CONE BY MORE THAN ITS SOFT EDGE CAN REACH.
-                // `spot_cone` widens the authored band for antialiasing, but
-                // never past SPOT_EDGE_MAX_WIDEN times it, which moves the
-                // cone's zero at most one authored band outward -- so wherever
-                // the angle's cosine is below `cos_outer - authored` (less a
-                // hair for rounding) the cone is exactly 0, and so is all the
-                // maths it multiplies. `cos = along / dist`, compared squared,
-                // with the signs, so no root is taken.
-                if (kind > 0.5) {{
-                    let cos_outer = lights.lights[i].params.y;
-                    let authored = max(lights.lights[i].direction.w - cos_outer, 0.0001);
-                    let zero_below = cos_outer - authored * (0.5 * (SPOT_EDGE_MAX_WIDEN - 1.0)) - 1e-4;
-                    let along = -dot(to_lamp, lights.lights[i].direction.xyz);
-                    let bound_sq = zero_below * zero_below * max(dist_sq, 1e-8);
-                    let outside = select(
-                        along < 0.0 && along * along >= bound_sq,
-                        along <= 0.0 || along * along <= bound_sq,
-                        zero_below >= 0.0,
-                    );
-                    if (outside) {{
-                        continue;
-                    }}
-                }}
-            }} else if (receiver_sun_mask == 0.0) {{
-                // THE SKY'S SUN WHERE ITS BAKED MASK HIDES IT COMPLETELY --
-                // indoors, most of the level. `sun_visibility` returns exactly
-                // that 0 without sampling anything. A receiver with no mask
-                // carries -1 and is shaded as before.
-                continue;
-            }}
-        }}
-        reaching = reaching | (1u << i);
-    }}
-    let light_dist = sqrt(light_dist_sq);
-    let alpha = r * r;
-    // Widened by the solid angle the lamp subtends from here. `light_dist` is
-    // the nearest light's distance, so a surface right under a fixture gets a
-    // broad sheen and one across the room gets a tight one -- which is how a
-    // real highlight behaves.
-    let widened = clamp(alpha + LIGHT_SOURCE_RADIUS / (2.0 * max(light_dist, 0.05)), alpha, 1.0);
-    let shininess = clamp(2.0 / (widened * widened) - 2.0, 1.0, MAX_SHININESS);
-    // Rough surfaces spread the same energy over a wider lobe, so the peak is
-    // dimmer. Without this, raising roughness only widens the highlight and a
-    // matte wall still has a bright spot on it.
-    let spec_strength = SPEC_STRENGTH * (1.0 - r);
-
     let occ = clamp(ao, 0.0, 1.0) * clamp(sky_vis, 0.0, 1.0);
     // Two accumulators from here on: what the surface's colour tints, and what
     // it does not.
@@ -3431,8 +3356,10 @@ fn shade_material_env(
     let bd_len = length(bd);
     let directionality = clamp(env_dir.w, 0.0, MAX_BOUNCE_DIRECTIONALITY);
     var bounce = env;
-    if (bd_len > MIN_BOUNCE_DIR_LENGTH) {{
-        let bounce_dir = bd / bd_len;
+    var bounce_dir = vec3<f32>(0.0);
+    let has_dir = bd_len > MIN_BOUNCE_DIR_LENGTH;
+    if (has_dir) {{
+        bounce_dir = bd / bd_len;
         // Energy-preserving by construction: the shaping factor averages to
         // exactly 1 over the sphere, so this redistributes the bounce across
         // normals without inventing or destroying any. It ranges over
@@ -3448,6 +3375,130 @@ fn shade_material_env(
         // no normal map now takes exactly its texel.
         let shaped = 1.0 + directionality * (dot(n, bounce_dir) - dot(geom_n, bounce_dir));
         bounce = env * max(shaped, 0.0);
+    }}
+    var p: MaterialEnvPart;
+    p.diffuse = diffuse;
+    p.specular = specular;
+    p.bounce = bounce;
+    p.bounce_dir = bounce_dir;
+    p.directionality = directionality;
+    p.has_dir = has_dir;
+    p.fresnel = fresnel;
+    p.view_dir = view_dir;
+    p.r = r;
+    return p;
+}}
+
+// The lamp half of `shade_material_env`: the lamps, and the bounce's gloss,
+// which is sized by the nearest of them. Reads the stationary masks and the
+// sun mask, which must be set by now. See `MaterialEnvPart`.
+fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, env: vec3<f32>, albedo: vec3<f32>) -> vec3<f32> {{
+    let view_dir = p.view_dir;
+    let r = p.r;
+    // Blinn-Phong has an exponent where a PBR model has a roughness, so the two
+    // are bridged by the usual mapping: alpha = r^2, exponent = 2/alpha^2 - 2.
+    // Exact enough for a preview and monotonic, which is what matters -- a
+    // rougher material must never come out shinier.
+    // Distance to the nearest punctual light, for the sphere-light widening.
+    // Computed before the loop because the roughness it feeds is per surface,
+    // not per light: one lobe, sized by whatever is actually lighting this spot.
+    // FIELDS, NOT THE WHOLE STRUCT.
+    //
+    // `let li = lights.lights[i]` copied all sixteen components of a Light
+    // (four vec4s) to read exactly two of them. On a tile GPU that is register
+    // pressure for nothing, and register pressure is occupancy: high GPR use
+    // lowers how many waves stay in flight, which is what hides memory
+    // latency. A shader that "should" be fast then stalls with no other wave
+    // available to fill the gap -- and this frame is fill bound, so per-pixel
+    // occupancy is the cost that counts.
+    //
+    // Indexing a UNIFORM buffer per field is free of the other trap here: the
+    // documented Adreno cliff is a dynamically-indexed LOCAL array, which
+    // spills to scratch memory. There are none of those in this shader, and a
+    // uniform array is not one.
+    //
+    // By SQUARED distance, and one square root after the loop: the nearest
+    // lamp is the same either way, and a root per lamp per pixel was paid to
+    // compare numbers whose order the root does not change.
+    //
+    // AND WHICH LAMPS CAN REACH THIS PIXEL AT ALL, in the same pass: bit `i`
+    // of `reaching` is lamp `i`, tested exactly as the lighting loop used to
+    // test it on a second walk over every lamp -- its baked visibility, its
+    // range, its cone, the sun's mask. The lighting loop below then visits
+    // only those, in the same order. See the comment there.
+    var light_dist_sq = 1e18;
+    var reaching = 0u;
+    let culling = light_culling();
+    for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
+        let kind = lights.lights[i].params.z;
+        let to_lamp = lights.lights[i].position.xyz - world_pos;
+        let dist_sq = dot(to_lamp, to_lamp);
+        if (kind <= 1.5) {{
+            light_dist_sq = min(light_dist_sq, dist_sq);
+        }}
+        if (culling) {{
+            // Hidden from here by its baked mask: exactly zero light.
+            if (stationary_visibility_of(lights.lights[i].position.w) <= 0.0) {{
+                continue;
+            }}
+            if (kind < 1.5) {{
+                // Past its range, where the window is exactly zero.
+                let reach = lights.lights[i].params.x;
+                if (dist_sq >= reach * reach) {{
+                    continue;
+                }}
+                // OUTSIDE A SPOT'S CONE BY MORE THAN ITS SOFT EDGE CAN REACH.
+                // `spot_cone` widens the authored band for antialiasing, but
+                // never past SPOT_EDGE_MAX_WIDEN times it, which moves the
+                // cone's zero at most one authored band outward -- so wherever
+                // the angle's cosine is below `cos_outer - authored` (less a
+                // hair for rounding) the cone is exactly 0, and so is all the
+                // maths it multiplies. `cos = along / dist`, compared squared,
+                // with the signs, so no root is taken.
+                if (kind > 0.5) {{
+                    let cos_outer = lights.lights[i].params.y;
+                    let authored = max(lights.lights[i].direction.w - cos_outer, 0.0001);
+                    let zero_below = cos_outer - authored * (0.5 * (SPOT_EDGE_MAX_WIDEN - 1.0)) - 1e-4;
+                    let along = -dot(to_lamp, lights.lights[i].direction.xyz);
+                    let bound_sq = zero_below * zero_below * max(dist_sq, 1e-8);
+                    let outside = select(
+                        along < 0.0 && along * along >= bound_sq,
+                        along <= 0.0 || along * along <= bound_sq,
+                        zero_below >= 0.0,
+                    );
+                    if (outside) {{
+                        continue;
+                    }}
+                }}
+            }} else if (receiver_sun_mask == 0.0) {{
+                // THE SKY'S SUN WHERE ITS BAKED MASK HIDES IT COMPLETELY --
+                // indoors, most of the level. `sun_visibility` returns exactly
+                // that 0 without sampling anything. A receiver with no mask
+                // carries -1 and is shaded as before.
+                continue;
+            }}
+        }}
+        reaching = reaching | (1u << i);
+    }}
+    let light_dist = sqrt(light_dist_sq);
+    let alpha = r * r;
+    // Widened by the solid angle the lamp subtends from here. `light_dist` is
+    // the nearest light's distance, so a surface right under a fixture gets a
+    // broad sheen and one across the room gets a tight one -- which is how a
+    // real highlight behaves.
+    let widened = clamp(alpha + LIGHT_SOURCE_RADIUS / (2.0 * max(light_dist, 0.05)), alpha, 1.0);
+    let shininess = clamp(2.0 / (widened * widened) - 2.0, 1.0, MAX_SHININESS);
+    // Rough surfaces spread the same energy over a wider lobe, so the peak is
+    // dimmer. Without this, raising roughness only widens the highlight and a
+    // matte wall still has a bright spot on it.
+    let spec_strength = SPEC_STRENGTH * (1.0 - r);
+
+    var diffuse = p.diffuse;
+    var specular = p.specular;
+    let fresnel = p.fresnel;
+    if (p.has_dir) {{
+        let bounce_dir = p.bounce_dir;
+        let directionality = p.directionality;
         // The room, through the same lobe the lamps use. This is what puts a
         // highlight on a polished floor in a room with no lamp in view -- the
         // floor showing WHERE the light is, not merely how much of it there is.
@@ -3477,6 +3528,7 @@ fn shade_material_env(
             * (combined + 2.0) / (shininess + 2.0);
         specular = specular + env * gloss;
     }}
+    let bounce = p.bounce;
     diffuse = diffuse + bounce;
     // BAKED: the lightmap's bounce, before any runtime light is added.
     // Weighted as the return line weights diffuse light.
@@ -3546,6 +3598,54 @@ fn shade_material_env(
     // Head-on this changes almost nothing -- a dielectric reflects 4% there, so
     // the diffuse keeps 96% of what it always had.
     return diffuse * albedo * (1.0 - fresnel) + specular;
+}}
+
+fn shade_material_env(
+    world_pos: vec3<f32>,
+    n: vec3<f32>,
+    roughness: f32,
+    ao: f32,
+    sky_vis: f32,
+    env: vec3<f32>,
+    // The baked bounce DIRECTION: xyz is a unit vector encoded as `v * 2 - 1`,
+    // w is how directional that light is. w = 0 means "from everywhere", and
+    // then this behaves exactly as the flat term it replaced.
+    env_dir: vec4<f32>,
+    // The surface's own colour. Applied to the DIFFUSE terms only -- see
+    // `LightSplit`. Pass white to get the old behaviour, where the caller
+    // multiplies everything afterwards.
+    albedo: vec3<f32>,
+    // See `probe_environment`: the point the PROBE is chosen from. Pass the
+    // fragment's own position for the previous behaviour.
+    probe_select_pos: vec3<f32>,
+    // THE GEOMETRIC NORMAL, for the Fresnel and the reflection vector only.
+    //
+    // Fresnel is `pow(1 - dot(n, view), 5)`, and that fifth power amplifies
+    // whatever jitter is in `n` enormously near a grazing angle -- which is
+    // where a distant surface is seen from. Fed the normal-MAPPED normal it
+    // aliases: a minified normal map jitters per pixel, the fifth power turns
+    // that into a large swing, and the swing shows up as a dotted line along
+    // room seams. Measured in the lighting-sources view: the BAKED channel
+    // drops and the PROBE channel rises at those pixels by matching amounts
+    // while DIRECT does not move at all -- and Fresnel is the one term baked
+    // and probe share and direct does not touch (headset, 2026-09-22).
+    //
+    // Fresnel is a low-frequency function of viewing angle; it does not want
+    // per-texel normal detail and is not improved by it. Diffuse and direct
+    // keep the mapped normal, which is where the detail belongs.
+    //
+    // The SSR path in the brush shader already does this -- it blends toward
+    // the geometric normal as roughness rises -- so this is the same
+    // correction applied to the environment term rather than a new idea.
+    //
+    // Callers with no separate geometric normal pass `n` and get the previous
+    // behaviour exactly.
+    geom_n: vec3<f32>,
+) -> vec3<f32> {{
+    let p = shade_material_env_part(
+        world_pos, n, roughness, ao, sky_vis, env, env_dir, albedo, probe_select_pos, geom_n,
+    );
+    return shade_material_lamps(p, world_pos, n, env, albedo);
 }}
 
 fn shade(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
@@ -4441,7 +4541,8 @@ mod shadow_skip_tests {
     #[test]
     fn a_light_that_contributes_nothing_is_not_shadow_tested() {
         let code = wgsl_lights_block(0, 1);
-        let env = code.find("fn shade_material_env(").expect("shade_material_env is gone");
+        // The material path's lamps are in its lamp half. See `MaterialEnvPart`.
+        let env = code.find("fn shade_material_lamps(").expect("shade_material_lamps is gone");
         let guard = code[env..]
             .find("if (max(max(c.diffuse.r + c.specular.r, c.diffuse.g + c.specular.g), c.diffuse.b + c.specular.b) <= 0.0) {")
             .expect("the material path shadow-tests lights that contribute nothing");

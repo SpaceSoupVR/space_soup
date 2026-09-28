@@ -703,6 +703,11 @@ impl XrRenderer {
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
             crate::renderer::multiview::ViewMode::Mono,
         );
+        if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::renderer::brush_pipeline::BrushPipeline::log_scene_register_cuts(
+                &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
+            );
+        }
         let probe_pass_targets: [crate::renderer::brush_pipeline::probe_pass::Target; 2] = std::array::from_fn(|_| {
             crate::renderer::brush_pipeline::probe_pass::Target::new(&wgpu_device, &probe_pass_layout, width, height, 1)
         });

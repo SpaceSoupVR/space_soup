@@ -1378,6 +1378,47 @@ impl BrushPipeline {
         }
     }
 
+    /// MEASUREMENT ONLY: `log_probe_pass_register_cuts` for the scene pass's
+    /// brush shader -- the one reading the probe pass -- with the same
+    /// target, samples and group 3 as the one that ships.
+    pub fn log_scene_register_cuts(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+    ) {
+        let base = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+        for (label, edits) in SCENE_REGISTER_CUTS {
+            let mut src = base.clone();
+            let mut missing = None;
+            for (from, to) in edits.iter() {
+                if !src.contains(from) {
+                    missing = Some(*from);
+                    break;
+                }
+                src = src.replacen(from, to, 1);
+            }
+            match missing {
+                Some(from) => log::warn!("register cut {label}: `{from}` is not in the shader"),
+                None => {
+                    let _ = Self::from_source(
+                        device,
+                        format,
+                        uniform_layout,
+                        FrontFace::Ccw,
+                        samples,
+                        None,
+                        crate::renderer::multiview::ViewMode::Mono,
+                        Some(probe_layout),
+                        label,
+                        src,
+                    );
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn from_source(
         device: &Device,
@@ -1711,6 +1752,68 @@ fn brush_shader_with(ssr: bool) -> String {
 ///
 /// Mono scene passes only for now; a stereo pass keeps tracing per pixel.
 /// `Levers::half_res_reflections` switches it off to measure it.
+/// MEASUREMENT ONLY: the scene pass's brush shader (the one reading the probe
+/// pass) with one part cut out at a time -- see
+/// `BrushPipeline::log_scene_register_cuts`. Text edits of the generated WGSL;
+/// nothing draws with them.
+const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
+    ("scene_cut_none", &[]),
+    ("scene_cut_lamp_loop", &[("    var todo = reaching;\n", "    var todo = 0u;\n")]),
+    (
+        "scene_cut_lamps",
+        &[(
+            "i < live_light_count(); i = i + 1u) {\n        let kind = lights.lights[i].params.z;\n        let to_lamp",
+            "i < 0u; i = i + 1u) {\n        let kind = lights.lights[i].params.z;\n        let to_lamp",
+        )],
+    ),
+    ("scene_cut_stationary", &[("    set_stationary_masks(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);\n", "")]),
+    ("scene_cut_bounce", &[("    if (has_dir) {", "    if (false) {")]),
+    (
+        "scene_cut_probe_read",
+        &[("    probe_env_given = probe_pass_upsample(in.clip.xy, in.clip.z, probe_pass_tolerance);", "    probe_env_given = vec4<f32>(0.0);")],
+    ),
+    (
+        "scene_cut_lamp_spec",
+        &[(
+            "    if (ndotl > 0.0 && atten > 0.0) {\n        let h = normalize(l_dir + view_dir);\n        let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;\n        out.specular",
+            "    if (false) {\n        let h = normalize(l_dir + view_dir);\n        let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;\n        out.specular",
+        )],
+    ),
+    (
+        "scene_cut_spot_shadow",
+        &[(
+            "        if (layer >= 0 && f32(layer) < camera.shadow_params.y) {\n            shadow = shadow * pcf_layer(",
+            "        if (false) {\n            shadow = shadow * pcf_layer(",
+        )],
+    ),
+    (
+        "scene_cut_sun_shadow",
+        &[("        if (l.params.z > 1.5) {\n            shadow = sun_visibility(l, world_pos);", "        if (false) {\n            shadow = sun_visibility(l, world_pos);")],
+    ),
+    (
+        "scene_cut_spot_cone",
+        &[(
+            "            let cos_angle = dot(-l_dir, l.direction.xyz);\n            atten = atten * spot_cone(cos_angle, cos_outer, cos_inner, dist);\n        }\n    }\n\n    let ndotl = max(dot(n, l_dir), 0.0);\n    let radiance = l.color_intensity.rgb * l.color_intensity.a;\n    out.diffuse",
+            "            let cos_angle = dot(-l_dir, l.direction.xyz);\n        }\n    }\n\n    let ndotl = max(dot(n, l_dir), 0.0);\n    let radiance = l.color_intensity.rgb * l.color_intensity.a;\n    out.diffuse",
+        )],
+    ),
+    (
+        "scene_cut_sky",
+        &[
+            ("    if (occ > 0.0) {\n        diffuse = sky_irradiance(n) * occ;\n    }", "    if (false) {\n        diffuse = sky_irradiance(n) * occ;\n    }"),
+            (
+                "    if (occ > 0.0) {\n        sky_reflection = environment_radiance(refl) * occ;\n    }",
+                "    if (false) {\n        sky_reflection = environment_radiance(refl) * occ;\n    }",
+            ),
+        ],
+    ),
+    (
+        "scene_cut_sun_mask",
+        &[("    receiver_sun_mask = select(-1.0, smoothstep(-sun_w, sun_w, sun_d), sun_mask.g > 0.25);", "    receiver_sun_mask = -1.0;")],
+    ),
+    ("scene_cut_spec_aa", &[("    let rough_aa = specular_aa_roughness(rough, dpdx(n), dpdy(n));", "    let rough_aa = rough;")]),
+];
+
 /// MEASUREMENT ONLY: what `BrushPipeline::log_probe_pass_register_cuts` cuts
 /// out of the probe pass's shader, one pipeline each -- text edits of the
 /// generated WGSL. They change what the shader computes; nothing draws with them.
@@ -2264,29 +2367,6 @@ struct VOut {{
     let sun_pen = max(sun_mask.g - 0.5, 0.0) * (2.0 * SUN_MASK_DISTANCE_TEXELS);
     let sun_w = max(max(sun_pen, 0.5 * fwidth(sun_d)), 0.02);
     receiver_sun_mask = select(-1.0, smoothstep(-sun_w, sun_w, sun_d), sun_mask.g > 0.25);
-    // THE STATIONARY LAMPS' SHADOWS, rebuilt as the sun's is: per lamp a
-    // signed distance and the bulb's penumbra, two lamps a layer (red and
-    // green, blue and alpha), the edge put back at zero at any magnification
-    // and never narrower than a pixel. Away from a sharp edge the baker stores
-    // a lamp's visibility as a distance this smoothstep gives back exactly, so
-    // soft shadows and the faint bands of thin things come through the same
-    // code. Layers a level does not have are not fetched; the neutral mask an
-    // unbaked level carries reads fully lit. See `stationary_visibility`.
-    let st_layers = textureNumLayers(lm_stationary);
-    let st_0 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 0);
-    var st_1 = vec4<f32>(1.0);
-    var st_2 = vec4<f32>(1.0);
-    var st_3 = vec4<f32>(1.0);
-    if (st_layers > 1u) {
-        st_1 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 1);
-    }
-    if (st_layers > 2u) {
-        st_2 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 2);
-    }
-    if (st_layers > 3u) {
-        st_3 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 3);
-    }
-    set_stationary_masks(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
     // The baked lamps are in this atlas. See `receiver_skips_baked`.
     receiver_skips_baked = true;
     // The albedo goes IN rather than being multiplied over the result: a
@@ -2331,10 +2411,38 @@ struct VOut {{
     // clamping onto the face does not bring it back. That one row of samples
     // then took the OUTDOOR photograph (offline_frame, 2026-09-23).
     probe_volume_pos = vec4<f32>(in.face_centre, 1.0);
-    let lit = shade_material_env(
+    let env_part = shade_material_env_part(
         face_pos, n, rough_aa, ao, baked.a, baked.rgb, bdir, albedo.rgb, face_pos,
         n_geom,
     );
+    // THE MASKS AFTER THE ENVIRONMENT, just before the lamps that read them:
+    // taken first, their eight visibilities rode through all of the
+    // environment's work, and that was the shader's register peak. See
+    // `MaterialEnvPart`.
+    // THE STATIONARY LAMPS' SHADOWS, rebuilt as the sun's is: per lamp a
+    // signed distance and the bulb's penumbra, two lamps a layer (red and
+    // green, blue and alpha), the edge put back at zero at any magnification
+    // and never narrower than a pixel. Away from a sharp edge the baker stores
+    // a lamp's visibility as a distance this smoothstep gives back exactly, so
+    // soft shadows and the faint bands of thin things come through the same
+    // code. Layers a level does not have are not fetched; the neutral mask an
+    // unbaked level carries reads fully lit. See `stationary_visibility`.
+    let st_layers = textureNumLayers(lm_stationary);
+    let st_0 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 0);
+    var st_1 = vec4<f32>(1.0);
+    var st_2 = vec4<f32>(1.0);
+    var st_3 = vec4<f32>(1.0);
+    if (st_layers > 1u) {
+        st_1 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 1);
+    }
+    if (st_layers > 2u) {
+        st_2 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 2);
+    }
+    if (st_layers > 3u) {
+        st_3 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 3);
+    }
+    set_stationary_masks(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
+    let lit = shade_material_lamps(env_part, face_pos, n, baked.rgb, albedo.rgb);
     let c = in.tint.rgb * lit;"#
     };
     // THE HALF-RESOLUTION PROBE PASS. See `probe_pass`.
@@ -2348,7 +2456,7 @@ struct VOut {{
             probe_pass::PASS_LIGHTING.replacen(given, &format!("{given}    probe_fragment = in.clip;\n"), 1)
         }
         BrushProbe::Read => {
-            let marker = "    probe_volume_pos = vec4<f32>(in.face_centre, 1.0);\n    let lit = shade_material_env(";
+            let marker = "    probe_volume_pos = vec4<f32>(in.face_centre, 1.0);\n    let env_part = shade_material_env_part(";
             assert!(
                 lighting.contains(marker),
                 "the brush lighting no longer sets the probe position just before it shades; the pass read goes there",
@@ -4324,6 +4432,24 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
     /// uncut shader under its name -- and the result is valid WGSL. See
     /// `BrushPipeline::log_probe_pass_register_cuts`.
     #[test]
+    fn every_scene_register_cut_applies_and_validates() {
+        use wgpu::naga;
+        let base = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+        for (label, edits) in SCENE_REGISTER_CUTS {
+            let mut src = base.clone();
+            for (from, to) in edits.iter() {
+                assert!(src.contains(from), "{label}: `{from}` is not in the scene shader");
+                src = src.replacen(from, to, 1);
+            }
+            let module = naga::front::wgsl::parse_str(&src)
+                .unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+    }
+
+    #[test]
     fn every_probe_pass_register_cut_applies_and_validates() {
         use wgpu::naga;
         let base = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Pass);
@@ -4431,7 +4557,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
     /// See `ssr_fallback`: doing it twice was most of the eye pass's cost.
     #[test]
     fn the_reflective_pass_does_not_light_the_surface_a_second_time() {
-        const LIGHTS: &str = "let lit = shade_material_env(";
+        const LIGHTS: &str = "let lit = shade_material_lamps(";
         const READ_BACK: &str =
             "let ssr_fallback = textureLoad(ssr_scene_color, vec2<i32>(in.clip.xy), 0).rgb;";
         for _ms in [false] {
@@ -5308,7 +5434,7 @@ mod face_clamp_tests {
             "the per-face position clamp is gone from the brush shader",
         );
         assert!(
-            src.contains("shade_material_env(\n        face_pos,"),
+            src.contains("shade_material_env_part(\n        face_pos,"),
             "the clamp is computed but the RAW `in.world_pos` is still what \
              gets shaded, so it corrects nothing",
         );
