@@ -147,6 +147,19 @@ struct WaterBody {
 /// thing -- a scene pass with nine stereo pipelines and one mono would draw
 /// that one geometry type with the left eye's camera in both views, and nothing
 /// would report it.
+/// THE HALF-RESOLUTION PROBE PASS FOR BOTH EYES AT ONCE, for the multiview
+/// scene pass: the pass, the brush that reads it, and the two-layer target.
+///
+/// Apart from `StereoScenePipelines` on purpose. If these fail to build, only
+/// half-resolution reflections in stereo are lost -- the stereo scene pass
+/// then traces its reflections per pixel, as it always has -- where inside
+/// that set a failure would switch multiview off altogether.
+struct StereoProbePass {
+    pass: crate::renderer::brush_pipeline::BrushPipeline,
+    reader: crate::renderer::brush_pipeline::BrushPipeline,
+    target: crate::renderer::brush_pipeline::probe_pass::Target,
+}
+
 struct StereoScenePipelines {
     solid: SolidPipeline,
     wire: WirePipeline,
@@ -191,6 +204,9 @@ pub struct XrRenderer {
     brush_probe_pass_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     brush_probe_reader_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     probe_pass_targets: [crate::renderer::brush_pipeline::probe_pass::Target; 2],
+    /// The same for the multiview scene pass. `None` without multiview, or if
+    /// the device refused these pipelines. See `StereoProbePass`.
+    stereo_probe: Option<StereoProbePass>,
     brush_mirror_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     brush_materials: crate::renderer::brush_pipeline::BrushMaterials,
     terrain_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
@@ -656,13 +672,15 @@ impl XrRenderer {
         );
         // See `brush_pipeline::probe_pass`.
         let probe_pass_layout = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(&wgpu_device);
-        let brush_probe_pass_pipeline =
-            crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass(&wgpu_device, &uniform_buf.layout);
+        let brush_probe_pass_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass(
+            &wgpu_device, &uniform_buf.layout, crate::renderer::multiview::ViewMode::Mono,
+        );
         let brush_probe_reader_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_multisampled_probe_reader(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
+            crate::renderer::multiview::ViewMode::Mono,
         );
         let probe_pass_targets: [crate::renderer::brush_pipeline::probe_pass::Target; 2] = std::array::from_fn(|_| {
-            crate::renderer::brush_pipeline::probe_pass::Target::new(&wgpu_device, &probe_pass_layout, width, height)
+            crate::renderer::brush_pipeline::probe_pass::Target::new(&wgpu_device, &probe_pass_layout, width, height, 1)
         });
         // White until a scene loads its materials, so an untextured level draws
         // in its authored colours rather than in nothing.
@@ -864,6 +882,31 @@ impl XrRenderer {
         };
         let can_multiview = can_multiview && stereo_pipelines.is_some();
 
+        // Both eyes' half-resolution probe pass, in a scope of its own. See
+        // `StereoProbePass`.
+        let stereo_probe = if can_multiview {
+            let scope = wgpu_device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let stereo = crate::renderer::multiview::ViewMode::Stereo;
+            let built = StereoProbePass {
+                pass: crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass(&wgpu_device, &uniform_buf.layout, stereo),
+                reader: crate::renderer::brush_pipeline::BrushPipeline::new_multisampled_probe_reader(
+                    &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, stereo,
+                ),
+                target: crate::renderer::brush_pipeline::probe_pass::Target::new(
+                    &wgpu_device, &probe_pass_layout, width, height, crate::renderer::multiview::STEREO_VIEWS,
+                ),
+            };
+            match pollster::block_on(scope.pop()) {
+                Some(e) => {
+                    error!("renderer: stereo probe pass REFUSED, stereo traces reflections per pixel -- {e}");
+                    None
+                }
+                None => Some(built),
+            }
+        } else {
+            None
+        };
+
         let (stereo_scene, scene_targets): (Option<StereoSceneTextures>, [SceneTarget; 2]) =
             if can_multiview {
                 let (stereo, targets) = ssr_pipelines.create_scene_targets_stereo(
@@ -978,6 +1021,7 @@ impl XrRenderer {
             brush_probe_pass_pipeline,
             brush_probe_reader_pipeline,
             probe_pass_targets,
+            stereo_probe,
             brush_mirror_pipeline,
             water_pipeline,
             water_bodies: Vec::new(),

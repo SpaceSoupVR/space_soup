@@ -1209,20 +1209,14 @@ impl BrushPipeline {
 
     /// THE HALF-RESOLUTION PROBE PASS: the level's brushes drawn again at half
     /// the eye's resolution, writing only their probe reflection. See
-    /// `probe_pass`.
-    pub fn new_probe_pass(device: &Device, uniform_layout: &BindGroupLayout) -> Self {
-        Self::new_variant(
-            device,
-            probe_pass::FORMAT,
-            uniform_layout,
-            FrontFace::Ccw,
-            1,
-            false,
-            None,
-            crate::renderer::multiview::ViewMode::Mono,
-            BrushProbe::Pass,
-            None,
-        )
+    /// `probe_pass`. `Stereo` draws both eyes into the two layers of one
+    /// target, for the multiview scene pass.
+    pub fn new_probe_pass(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        view: crate::renderer::multiview::ViewMode,
+    ) -> Self {
+        Self::new_variant(device, probe_pass::FORMAT, uniform_layout, FrontFace::Ccw, 1, false, None, view, BrushProbe::Pass, None)
     }
 
     /// The scene pass's opaque brush, reading its probe reflection from that
@@ -1234,6 +1228,7 @@ impl BrushPipeline {
         uniform_layout: &BindGroupLayout,
         samples: u32,
         probe_layout: &BindGroupLayout,
+        view: crate::renderer::multiview::ViewMode,
     ) -> Self {
         Self::new_variant(
             device,
@@ -1243,7 +1238,7 @@ impl BrushPipeline {
             samples,
             BRUSH_SOURCE_DEBUG,
             None,
-            crate::renderer::multiview::ViewMode::Mono,
+            view,
             BrushProbe::Read,
             Some(probe_layout),
         )
@@ -1510,50 +1505,71 @@ fn brush_shader_with(ssr: bool) -> String {
 /// `Levers::half_res_reflections` switches it off to measure it.
 pub mod probe_pass {
     use wgpu::{
-        BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-        BindGroupLayoutEntry, BindingResource, BindingType, Device, Extent3d, ShaderStages, Texture,
-        TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
-        TextureViewDimension,
+        AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
+        BindGroupLayoutEntry, BindingResource, BindingType, Device, Extent3d, FilterMode, Sampler,
+        SamplerBindingType, SamplerDescriptor, ShaderStages, Texture, TextureDescriptor, TextureDimension,
+        TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDimension,
     };
 
     /// Radiance and coverage: premultiplied RGB, coverage in A.
     pub const FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
-    /// Group 3 of the reading brush shader: the pass's colour and its depth.
+    /// Group 3 of the reading brush shader: the pass's colour and its depth,
+    /// a bilinear sampler for the colour and a point sampler to gather the
+    /// depths. See `READER_WGSL`.
     pub fn bind_group_layout(device: &Device) -> BindGroupLayout {
-        let entry = |binding: u32, sample_type: TextureSampleType| BindGroupLayoutEntry {
+        let texture = |binding: u32, sample_type: TextureSampleType| BindGroupLayoutEntry {
             binding,
             visibility: ShaderStages::FRAGMENT,
-            ty: BindingType::Texture { sample_type, view_dimension: TextureViewDimension::D2, multisampled: false },
+            // Arrays, one layer an eye: the reader picks its eye's layer with
+            // `view_slot`, which is 0 in a single-eye pass -- so one shader
+            // serves the per-eye and the two-eye scene pass alike.
+            ty: BindingType::Texture { sample_type, view_dimension: TextureViewDimension::D2Array, multisampled: false },
+            count: None,
+        };
+        let sampler = |binding: u32, kind: SamplerBindingType| BindGroupLayoutEntry {
+            binding,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Sampler(kind),
             count: None,
         };
         device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("probe_pass_layout"),
-            entries: &[entry(0, TextureSampleType::Float { filterable: false }), entry(1, TextureSampleType::Depth)],
+            entries: &[
+                texture(0, TextureSampleType::Float { filterable: true }),
+                texture(1, TextureSampleType::Depth),
+                sampler(2, SamplerBindingType::Filtering),
+                sampler(3, SamplerBindingType::NonFiltering),
+            ],
         })
     }
 
-    /// One eye's half-resolution probe pass: what it renders into, and the
-    /// bind group the scene pass reads it through.
+    /// A half-resolution probe pass's target -- one eye's, or both eyes' as
+    /// the two layers of one for the multiview scene pass -- and the bind
+    /// group the scene pass reads it through.
     pub struct Target {
         _color: Texture,
+        /// What the pass renders into: layer 0, or every layer when stereo.
         pub color_view: TextureView,
         _depth: Texture,
         pub depth_view: TextureView,
+        _samplers: [Sampler; 2],
         pub bind_group: BindGroup,
         pub width: u32,
         pub height: u32,
     }
 
     impl Target {
-        /// For an eye `eye_width` x `eye_height`: half each way, rounded up, so
-        /// the last column and row of pixels still have a texel.
-        pub fn new(device: &Device, layout: &BindGroupLayout, eye_width: u32, eye_height: u32) -> Self {
+        /// For eyes `eye_width` x `eye_height`: half each way, rounded up, so
+        /// the last column and row of pixels still have a texel. `layers` is 1
+        /// for one eye, 2 for both in one multiview pass.
+        pub fn new(device: &Device, layout: &BindGroupLayout, eye_width: u32, eye_height: u32, layers: u32) -> Self {
             let (width, height) = (eye_width.div_ceil(2).max(1), eye_height.div_ceil(2).max(1));
+            let layers = layers.max(1);
             let make = |label: &str, format: TextureFormat| {
                 device.create_texture(&TextureDescriptor {
                     label: Some(label),
-                    size: Extent3d { width, height, depth_or_array_layers: 1 },
+                    size: Extent3d { width, height, depth_or_array_layers: layers },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: TextureDimension::D2,
@@ -1564,17 +1580,43 @@ pub mod probe_pass {
             };
             let color = make("probe_pass_color", FORMAT);
             let depth = make("probe_pass_depth", TextureFormat::Depth32Float);
-            let color_view = color.create_view(&Default::default());
-            let depth_view = depth.create_view(&Default::default());
+            // Rendered into as a plain 2D view for one eye, as the array for
+            // two (a multiview pass takes its view count from it); read as
+            // the array either way.
+            let attachment = |t: &Texture| {
+                t.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(if layers > 1 { TextureViewDimension::D2Array } else { TextureViewDimension::D2 }),
+                    ..Default::default()
+                })
+            };
+            let array = |t: &Texture| {
+                t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..Default::default() })
+            };
+            let (color_view, depth_view) = (attachment(&color), attachment(&depth));
+            let (color_array, depth_array) = (array(&color), array(&depth));
+            // Clamped at the edges, exactly as the four-texel path clamps.
+            let sampler = |label: &str, filter: FilterMode| {
+                device.create_sampler(&SamplerDescriptor {
+                    label: Some(label),
+                    address_mode_u: AddressMode::ClampToEdge,
+                    address_mode_v: AddressMode::ClampToEdge,
+                    mag_filter: filter,
+                    min_filter: filter,
+                    ..Default::default()
+                })
+            };
+            let samplers = [sampler("probe_pass_linear", FilterMode::Linear), sampler("probe_pass_point", FilterMode::Nearest)];
             let bind_group = device.create_bind_group(&BindGroupDescriptor {
                 label: Some("probe_pass_bg"),
                 layout,
                 entries: &[
-                    BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&color_view) },
-                    BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&depth_view) },
+                    BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&color_array) },
+                    BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&depth_array) },
+                    BindGroupEntry { binding: 2, resource: BindingResource::Sampler(&samplers[0]) },
+                    BindGroupEntry { binding: 3, resource: BindingResource::Sampler(&samplers[1]) },
                 ],
             });
-            Self { _color: color, color_view, _depth: depth, depth_view, bind_group, width, height }
+            Self { _color: color, color_view, _depth: depth, depth_view, _samplers: samplers, bind_group, width, height }
         }
     }
 
@@ -1599,8 +1641,10 @@ pub mod probe_pass {
 
     /// Group 3 and the read, appended to the scene pass's brush shader.
     pub(super) const READER_WGSL: &str = r#"
-@group(3) @binding(0) var probe_pass_tex: texture_2d<f32>;
-@group(3) @binding(1) var probe_pass_depth: texture_depth_2d;
+@group(3) @binding(0) var probe_pass_tex: texture_2d_array<f32>;
+@group(3) @binding(1) var probe_pass_depth: texture_depth_2d_array;
+@group(3) @binding(2) var probe_pass_linear: sampler;
+@group(3) @binding(3) var probe_pass_point: sampler;
 
 // THE HALF-RESOLUTION PROBE REFLECTION AT THIS PIXEL: the four pass texels
 // around it, weighted bilinearly and kept only where their depth is this
@@ -1610,29 +1654,47 @@ pub mod probe_pass {
 // (a sliver the half-resolution pass missed), the nearest in depth. The pass
 // stores the reflection premultiplied by its coverage, which is what makes the
 // weighted sum a correct filter; it is divided back out here.
+//
+// TWO READS WHERE IT CAN BE, EIGHT WHERE IT MUST. The four depths come in one
+// gather. When all four are this pixel's surface -- everywhere but along an
+// outline -- the weighted sum IS bilinear filtering, so the hardware's one
+// filtered read replaces four loads. Only along an edge are the texels loaded
+// and weighted one by one. Unrolled rather than looped over an index: a
+// dynamically indexed local array is the Adreno cliff that spills to memory.
+//
+// This eye's layer is `view_slot`: 0 in a single-eye pass, the view index in a
+// multiview one.
 fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32) -> vec4<f32> {
-    let size = vec2<i32>(textureDimensions(probe_pass_tex));
+    let dims = textureDimensions(probe_pass_tex);
+    // A full-resolution pixel centre at `pixel` is at `pixel * 0.5` in the
+    // half-resolution texel grid.
+    let uv = pixel * 0.5 / vec2<f32>(dims);
+    // A gather returns the footprint as (0,1) (1,1) (1,0) (0,0) from its
+    // corner; `.wzxy` puts it in the order (0,0) (1,0) (0,1) (1,1).
+    let gaps = abs(textureGather(probe_pass_depth, probe_pass_point, uv, view_slot) - vec4<f32>(depth)).wzxy;
+    if (all(gaps <= vec4<f32>(tolerance))) {
+        let pre = textureSampleLevel(probe_pass_tex, probe_pass_linear, uv, view_slot, 0.0);
+        return vec4<f32>(pre.rgb / max(pre.a, 1e-4), pre.a);
+    }
+    let size = vec2<i32>(dims);
     let h = pixel * 0.5 - vec2<f32>(0.5);
     let base = vec2<i32>(floor(h));
     let f = h - floor(h);
-    var sum = vec4<f32>(0.0);
-    var weight = 0.0;
-    var nearest = vec4<f32>(0.0);
-    var nearest_gap = 3.4e38;
-    for (var k = 0; k < 4; k = k + 1) {
-        let o = vec2<i32>(k & 1, k >> 1u);
-        let q = clamp(base + o, vec2<i32>(0), size - vec2<i32>(1));
-        let c = textureLoad(probe_pass_tex, q, 0);
-        let gap = abs(textureLoad(probe_pass_depth, q, 0) - depth);
-        let bw = select(1.0 - f.x, f.x, o.x == 1) * select(1.0 - f.y, f.y, o.y == 1);
-        let w = select(0.0, bw, gap <= tolerance);
-        sum = sum + c * w;
-        weight = weight + w;
-        if (gap < nearest_gap) {
-            nearest_gap = gap;
-            nearest = c;
-        }
-    }
+    let top = size - vec2<i32>(1);
+    let c00 = textureLoad(probe_pass_tex, clamp(base, vec2<i32>(0), top), view_slot, 0);
+    let c10 = textureLoad(probe_pass_tex, clamp(base + vec2<i32>(1, 0), vec2<i32>(0), top), view_slot, 0);
+    let c01 = textureLoad(probe_pass_tex, clamp(base + vec2<i32>(0, 1), vec2<i32>(0), top), view_slot, 0);
+    let c11 = textureLoad(probe_pass_tex, clamp(base + vec2<i32>(1, 1), vec2<i32>(0), top), view_slot, 0);
+    let bilinear = vec4<f32>((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
+    let w = select(vec4<f32>(0.0), bilinear, gaps <= vec4<f32>(tolerance));
+    let weight = w.x + w.y + w.z + w.w;
+    // Ties go to the first in that order, as they always have.
+    var nearest = c00;
+    var nearest_gap = gaps.x;
+    if (gaps.y < nearest_gap) { nearest_gap = gaps.y; nearest = c10; }
+    if (gaps.z < nearest_gap) { nearest_gap = gaps.z; nearest = c01; }
+    if (gaps.w < nearest_gap) { nearest_gap = gaps.w; nearest = c11; }
+    let sum = c00 * w.x + c10 * w.y + c01 * w.z + c11 * w.w;
     let pre = select(nearest, sum / max(weight, 1e-6), weight > 1e-4);
     return vec4<f32>(pre.rgb / max(pre.a, 1e-4), pre.a);
 }
@@ -3700,6 +3762,248 @@ mod ssr_pipeline_tests {
         assert_eq!(DebugView::Off.next().next().next(), DebugView::Off, "the cycle does not return to Off");
     }
 
+    /// The two-eye probe pass and the reader that samples its layers pass
+    /// naga once made multiview -- the only check a development machine can
+    /// make, since none can build a multiview pipeline. A failure on the
+    /// headset only switches half-resolution reflections off in stereo; see
+    /// `StereoProbePass` in the XR renderer.
+    #[test]
+    fn the_stereo_probe_pass_shaders_validate_as_multiview() {
+        for (probe, sources) in [(BrushProbe::Pass, false), (BrushProbe::Read, BRUSH_SOURCE_DEBUG)] {
+            let src = brush_shader_probe(false, sources, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, probe);
+            assert_eq!(crate::renderer::multiview::multiview_validation_error_of(&src, false), None, "{probe:?} before the transform");
+            assert_eq!(crate::renderer::multiview::multiview_validation_error(&src), None, "{probe:?} as multiview");
+            if probe == BrushProbe::Read {
+                assert!(crate::renderer::multiview::as_multiview(&src).contains("view_slot = i32(view_index_in);"));
+            }
+        }
+    }
+
+    /// THE UPSAMPLE IS THE DEPTH-AWARE BILINEAR FILTER, on a real device, at
+    /// every pixel: one filtered read inside a surface, texel by texel along
+    /// an edge -- across a vertical AND a horizontal step in depth, so a
+    /// gather read in the wrong order or a swapped axis weights the wrong
+    /// texels and fails. Checked against the four-texel sum on the CPU.
+    #[test]
+    fn the_probe_upsample_is_the_depth_aware_bilinear_filter() {
+        let Some((device, queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        const W: u32 = 64;
+        const H: u32 = 32;
+        const TOLERANCE: f32 = 0.0015;
+        // The half-resolution pass's picture, as a function of its texel: a
+        // colour ramp, a coverage that varies, and two steps in depth -- one
+        // down the middle, one across -- over a gentle slope inside each.
+        const PATTERN: &str = r#"
+fn pass_colour(t: vec2<f32>) -> vec4<f32> {
+    let a = 0.25 + 0.5 * fract(t.x * 0.37 + t.y * 0.11);
+    return vec4<f32>(vec3<f32>(t.x / 32.0, t.y / 16.0, 0.5) * a, a);
+}
+fn pass_depth(t: vec2<f32>) -> f32 {
+    return 0.3 + 0.4 * step(16.0, t.x) + 0.15 * step(8.0, t.y) + 0.001 * t.y;
+}
+// A full-resolution pixel's own depth: its surface by its OWN position, the
+// slope interpolated between the half-resolution rows.
+fn pixel_depth(p: vec2<f32>) -> f32 {
+    return 0.3 + 0.4 * step(32.0, p.x) + 0.15 * step(16.0, p.y) + 0.001 * (p.y * 0.5 - 0.5);
+}
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
+    return vec4<f32>(xy, 0.0, 1.0);
+}
+struct PassOut {
+    @location(0) colour: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+}
+@fragment
+fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
+    let t = floor(pos.xy);
+    return PassOut(pass_colour(t), pass_depth(t));
+}
+"#;
+        let layout = probe_pass::bind_group_layout(&device);
+        let target = probe_pass::Target::new(&device, &layout, W, H, 1);
+        let fill_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("upsample_fill"),
+            source: wgpu::ShaderSource::Wgsl(PATTERN.into()),
+        });
+        let fill = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("upsample_fill"),
+            layout: None,
+            vertex: wgpu::VertexState { module: &fill_module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &fill_module,
+                entry_point: Some("fill"),
+                targets: &[Some(probe_pass::FORMAT.into())],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let read_src = format!(
+            "{PATTERN}var<private> view_slot: i32 = 0;\n{}\n@fragment\nfn read(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{\n    return probe_pass_upsample(pos.xy, pixel_depth(pos.xy), {TOLERANCE:?});\n}}\n",
+            probe_pass::READER_WGSL
+        );
+        let read_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("upsample_read"),
+            source: wgpu::ShaderSource::Wgsl(read_src.into()),
+        });
+        let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[] });
+        let empty_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &empty, entries: &[] });
+        let read_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("upsample_read"),
+            bind_group_layouts: &[Some(&empty), Some(&empty), Some(&empty), Some(&layout)],
+            immediate_size: 0,
+        });
+        let read = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("upsample_read"),
+            layout: Some(&read_layout),
+            vertex: wgpu::VertexState { module: &read_module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &read_module,
+                entry_point: Some("read"),
+                targets: &[Some(TextureFormat::Rgba32Float.into())],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let out = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("upsample_out"),
+            size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let out_view = out.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("upsample_fill"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &target.depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&fill);
+            pass.draw(0..3, 0..1);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("upsample_read"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &out_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&read);
+            for g in 0..3 {
+                pass.set_bind_group(g, &empty_bg, &[]);
+            }
+            pass.set_bind_group(3, &target.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        let row = W * 16;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("upsample_readback"),
+            size: u64::from(row * H),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &out, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(H) },
+            },
+            wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(encoder.finish()));
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let data = readback.slice(..).get_mapped_range().unwrap();
+        let got: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
+        drop(data);
+
+        // The four-texel filter, on the CPU, from the same pattern.
+        let step = |edge: f32, x: f32| if x >= edge { 1.0 } else { 0.0 };
+        let colour = |t: [f32; 2]| {
+            let a = 0.25 + 0.5 * (t[0] * 0.37 + t[1] * 0.11).fract();
+            [t[0] / 32.0 * a, t[1] / 16.0 * a, 0.5 * a, a]
+        };
+        let texel_depth = |t: [f32; 2]| 0.3 + 0.4 * step(16.0, t[0]) + 0.15 * step(8.0, t[1]) + 0.001 * t[1];
+        let (hw, hh) = (W / 2, H / 2);
+        let (mut worst, mut edges) = (0.0f32, 0usize);
+        for y in 0..H {
+            for x in 0..W {
+                let p = [x as f32 + 0.5, y as f32 + 0.5];
+                let depth = 0.3 + 0.4 * step(32.0, p[0]) + 0.15 * step(16.0, p[1]) + 0.001 * (p[1] * 0.5 - 0.5);
+                let h = [p[0] * 0.5 - 0.5, p[1] * 0.5 - 0.5];
+                let base = [h[0].floor(), h[1].floor()];
+                let f = [h[0] - base[0], h[1] - base[1]];
+                let (mut sum, mut weight) = ([0.0f32; 4], 0.0f32);
+                let (mut nearest, mut nearest_gap) = ([0.0f32; 4], f32::MAX);
+                for (ox, oy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                    let t = [(base[0] + ox).clamp(0.0, (hw - 1) as f32), (base[1] + oy).clamp(0.0, (hh - 1) as f32)];
+                    let c = colour(t);
+                    let gap = (texel_depth(t) - depth).abs();
+                    let bw = (if ox == 1.0 { f[0] } else { 1.0 - f[0] }) * (if oy == 1.0 { f[1] } else { 1.0 - f[1] });
+                    let w = if gap <= TOLERANCE { bw } else { 0.0 };
+                    for k in 0..4 {
+                        sum[k] += c[k] * w;
+                    }
+                    weight += w;
+                    if gap < nearest_gap {
+                        nearest_gap = gap;
+                        nearest = c;
+                    }
+                }
+                edges += usize::from(weight < 0.999);
+                let pre = if weight > 1e-4 { sum.map(|v| v / weight) } else { nearest };
+                let want = [pre[0] / pre[3].max(1e-4), pre[1] / pre[3].max(1e-4), pre[2] / pre[3].max(1e-4), pre[3]];
+                let i = ((y * W + x) * 4) as usize;
+                for k in 0..4 {
+                    let d = (got[i + k] - want[k]).abs();
+                    worst = worst.max(d);
+                    assert!(d < 4e-3, "pixel ({x}, {y}) channel {k}: {} against {}", got[i + k], want[k]);
+                }
+            }
+        }
+        // Both paths were exercised: most pixels one surface, a band along
+        // each step on the per-texel path.
+        assert!(edges > 60 && edges < (W * H / 4) as usize, "{edges} edge pixels");
+        eprintln!("upsample: worst difference {worst:.5} over {} pixels, {edges} on an edge", W * H);
+    }
+
     /// THE HALF-RESOLUTION PROBE PASS AND THE BRUSH THAT READS IT build on a
     /// real device -- WGSL is only validated at pipeline creation -- and the
     /// reader is built without the trace. See `probe_pass`.
@@ -3715,12 +4019,15 @@ mod ssr_pipeline_tests {
         let lights = LightsUniform::new(&device);
         let (_shadows, uniforms) = scene_uniforms(&device, &lights);
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let _pass = BrushPipeline::new_probe_pass(&device, &uniforms.layout);
+        let _pass = BrushPipeline::new_probe_pass(&device, &uniforms.layout, crate::renderer::multiview::ViewMode::Mono);
         let layout = probe_pass::bind_group_layout(&device);
         let _reader = BrushPipeline::new_multisampled_probe_reader(
-            &device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &layout,
+            &device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &layout, crate::renderer::multiview::ViewMode::Mono,
         );
-        let target = probe_pass::Target::new(&device, &layout, 1445, 1546);
+        let target = probe_pass::Target::new(&device, &layout, 1445, 1546, 1);
+        // Both eyes' target builds too; its pipelines need multiview, which
+        // no development machine has -- see the naga check below.
+        let _stereo = probe_pass::Target::new(&device, &layout, 1445, 1546, 2);
         assert_eq!((target.width, target.height), (723, 773));
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "the probe pass pipelines failed to build: {err:?}");
