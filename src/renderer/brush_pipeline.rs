@@ -1304,9 +1304,12 @@ impl BrushPipeline {
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("brush_shader"),
             source: ShaderSource::Wgsl(
-                view.shader(brush_shader_probe(
-                    false, sources, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, probe,
-                ))
+                crate::renderer::shader_precision::for_device(
+                    device,
+                    view.shader(brush_shader_probe(
+                        false, sources, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, probe,
+                    )),
+                )
                 .into(),
             ),
         });

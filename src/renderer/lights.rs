@@ -699,8 +699,12 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, probe_from_p
     let probe_box_margin = probe_box_margin();
     let portal_fade = PROBE_PORTAL_FADE;
     let portal_side_fade = PROBE_PORTAL_SIDE_FADE;
+    let precision_aliases = crate::renderer::shader_precision::F32_ALIASES;
     format!(
         r#"
+// HALF-PRECISION ALIASES: `f32` unless `shader_precision::for_device` rewrites
+// them to `f16` for a device that has it. See `shader_precision`.
+{precision_aliases}
 struct Camera {{
     view_proj: array<mat4x4<f32>, 2>,
     inv_view_proj: array<mat4x4<f32>, 2>,
