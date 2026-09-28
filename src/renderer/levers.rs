@@ -63,6 +63,9 @@ pub struct Levers {
     /// range, or behind a wall by its baked mask -- before any of its maths.
     /// Lossless: off changes no pixel, only what the frame costs.
     pub light_culling: bool,
+    /// Brush reflections from the half-resolution probe pass rather than
+    /// traced per pixel. See `brush_pipeline::probe_pass`. Mono scene passes.
+    pub half_res_reflections: bool,
     /// Screen-space reflections. `None` leaves the in-headset switch alone.
     pub ssr: Option<bool>,
     /// Both eyes in one multiview scene pass. `None` leaves it as set.
@@ -91,6 +94,7 @@ impl Default for Levers {
             stationary_lights: true,
             eye_adaptation: true,
             light_culling: true,
+            half_res_reflections: true,
             ssr: None,
             multiview: None,
             half_viewport: false,
@@ -127,6 +131,7 @@ impl Levers {
             Phase::NoProxies => l.reflection_proxies = false,
             Phase::NoStationary => l.stationary_lights = false,
             Phase::NoLightCulling => l.light_culling = false,
+            Phase::FullResReflections => l.half_res_reflections = false,
         }
         l
     }
@@ -152,6 +157,7 @@ impl Levers {
         flag("stationary", self.stationary_lights, d.stationary_lights);
         flag("eye_adaptation", self.eye_adaptation, d.eye_adaptation);
         flag("light_culling", self.light_culling, d.light_culling);
+        flag("half_res_reflections", self.half_res_reflections, d.half_res_reflections);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
         flag("ab_cycle", self.ab_cycle, d.ab_cycle);

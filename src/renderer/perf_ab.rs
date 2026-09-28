@@ -76,10 +76,13 @@ pub enum Phase {
     /// What skipping lamps that cannot reach a pixel saves; the picture is
     /// identical.
     NoLightCulling,
+    /// Reflections traced per pixel in the scene pass again, instead of by the
+    /// half-resolution probe pass. What that pass saves.
+    FullResReflections,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 13] = [
+    pub const ALL: [Phase; 14] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -93,6 +96,7 @@ impl Phase {
         Phase::NoProxies,
         Phase::NoStationary,
         Phase::NoLightCulling,
+        Phase::FullResReflections,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -129,6 +133,7 @@ impl Phase {
             Phase::NoProxies => "no_proxies",
             Phase::NoStationary => "no_stationary",
             Phase::NoLightCulling => "no_light_culling",
+            Phase::FullResReflections => "full_res_reflections",
         }
     }
 }

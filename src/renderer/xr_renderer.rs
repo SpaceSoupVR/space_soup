@@ -186,6 +186,11 @@ pub struct XrRenderer {
     brush_seal_pipeline: crate::renderer::brush_pipeline::BrushSealPipeline,
     /// `brush_pipeline` without blending, for the `perf_ab::Phase::OpaqueBrushes` measurement.
     brush_opaque_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    /// THE HALF-RESOLUTION PROBE PASS and the brush that reads it, with each
+    /// eye's target. See `brush_pipeline::probe_pass`.
+    brush_probe_pass_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    brush_probe_reader_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    probe_pass_targets: [crate::renderer::brush_pipeline::probe_pass::Target; 2],
     brush_mirror_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     brush_materials: crate::renderer::brush_pipeline::BrushMaterials,
     terrain_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
@@ -588,6 +593,16 @@ impl XrRenderer {
         let brush_mirror_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_mirror(
             &wgpu_device, wgpu_format, &uniform_buf.layout,
         );
+        // See `brush_pipeline::probe_pass`.
+        let probe_pass_layout = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(&wgpu_device);
+        let brush_probe_pass_pipeline =
+            crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass(&wgpu_device, &uniform_buf.layout);
+        let brush_probe_reader_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_multisampled_probe_reader(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
+        );
+        let probe_pass_targets: [crate::renderer::brush_pipeline::probe_pass::Target; 2] = std::array::from_fn(|_| {
+            crate::renderer::brush_pipeline::probe_pass::Target::new(&wgpu_device, &probe_pass_layout, width, height)
+        });
         // White until a scene loads its materials, so an untextured level draws
         // in its authored colours rather than in nothing.
         let brush_materials = crate::renderer::brush_pipeline::BrushMaterials::fallback(
@@ -899,6 +914,9 @@ impl XrRenderer {
             brush_sources_pipeline,
             brush_seal_pipeline,
             brush_opaque_pipeline,
+            brush_probe_pass_pipeline,
+            brush_probe_reader_pipeline,
+            probe_pass_targets,
             brush_mirror_pipeline,
             water_pipeline,
             water_bodies: Vec::new(),

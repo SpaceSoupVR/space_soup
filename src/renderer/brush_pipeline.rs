@@ -1202,11 +1202,71 @@ impl BrushPipeline {
         blend: Option<BlendState>,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
+        Self::new_variant(
+            device, format, uniform_layout, front_face, samples, sources, blend, view, BrushProbe::Trace, None,
+        )
+    }
+
+    /// THE HALF-RESOLUTION PROBE PASS: the level's brushes drawn again at half
+    /// the eye's resolution, writing only their probe reflection. See
+    /// `probe_pass`.
+    pub fn new_probe_pass(device: &Device, uniform_layout: &BindGroupLayout) -> Self {
+        Self::new_variant(
+            device,
+            probe_pass::FORMAT,
+            uniform_layout,
+            FrontFace::Ccw,
+            1,
+            false,
+            None,
+            crate::renderer::multiview::ViewMode::Mono,
+            BrushProbe::Pass,
+            None,
+        )
+    }
+
+    /// The scene pass's opaque brush, reading its probe reflection from that
+    /// pass through group 3 (`probe_pass::bind_group_layout`) instead of
+    /// tracing it per pixel.
+    pub fn new_multisampled_probe_reader(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+    ) -> Self {
+        Self::new_variant(
+            device,
+            format,
+            uniform_layout,
+            FrontFace::Ccw,
+            samples,
+            BRUSH_SOURCE_DEBUG,
+            None,
+            crate::renderer::multiview::ViewMode::Mono,
+            BrushProbe::Read,
+            Some(probe_layout),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_variant(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        front_face: FrontFace,
+        samples: u32,
+        sources: bool,
+        blend: Option<BlendState>,
+        view: crate::renderer::multiview::ViewMode,
+        probe: BrushProbe,
+        probe_layout: Option<&BindGroupLayout>,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("brush_shader"),
             source: ShaderSource::Wgsl(
-                view.shader(brush_shader_variant(
-                    false, sources, crate::renderer::ssr::SSR_DEBUG,
+                view.shader(brush_shader_probe(
+                    false, sources, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, probe,
                 ))
                 .into(),
             ),
@@ -1215,9 +1275,13 @@ impl BrushPipeline {
         // Shared with the mesh and cuboid pipelines: a lightmap is a lightmap,
         // and three layouts that must stay identical is three chances to drift.
         let lightmap_layout = super::pipeline::lightmap_bind_group_layout(device);
+        let mut layouts = vec![Some(uniform_layout), Some(&material_layout), Some(&lightmap_layout)];
+        if let Some(l) = probe_layout {
+            layouts.push(Some(l));
+        }
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("brush_layout"),
-            bind_group_layouts: &[Some(uniform_layout), Some(&material_layout), Some(&lightmap_layout)],
+            bind_group_layouts: &layouts,
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -1422,6 +1486,159 @@ fn brush_shader_with(ssr: bool) -> String {
 /// The shipped shader is `brush_shader_with`, which reads the build switches;
 /// this exists so a debug pipeline can be built BESIDE it and chosen at runtime
 /// (see [`DebugView`]) without the shipped text changing by a byte.
+/// REFLECTIONS AT HALF RESOLUTION.
+///
+/// The probe reflection -- choosing the room's photographs, tracing the ray
+/// through rooms, doorways and what stands in them, reading the photographs
+/// that saw the hit -- was the most expensive thing the brush shader did:
+/// 18 ms of a 46 ms frame in the marble hall (headset A/B, 2026-09-27), more
+/// than everything else it lights. It is also the part whose DETAIL is
+/// bounded by something coarser than the screen: a 256-pixel probe texel spans
+/// about five screen pixels at the shipped render scale, so a reflection
+/// computed at every screen pixel resolves nothing the photographs hold.
+///
+/// So it has its own pass: the brushes drawn again at half the eye's
+/// resolution (a quarter of the pixels) with a shader that writes only the
+/// probe reflection -- `lights::probe_env_for_pass`, normalised and
+/// premultiplied by its coverage -- and the scene pass's brush shader reads it
+/// back (`BrushProbe::Read`), four texels around each pixel, keeping only those
+/// on the same surface by depth so a reflection never bleeds across a
+/// silhouette. Built with `PROBE_ENV_FROM_PASS`, that shader carries none of the
+/// trace, which also frees the registers the trace held.
+///
+/// Mono scene passes only for now; a stereo pass keeps tracing per pixel.
+/// `Levers::half_res_reflections` switches it off to measure it.
+pub mod probe_pass {
+    use wgpu::{
+        BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
+        BindGroupLayoutEntry, BindingResource, BindingType, Device, Extent3d, ShaderStages, Texture,
+        TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
+        TextureViewDimension,
+    };
+
+    /// Radiance and coverage: premultiplied RGB, coverage in A.
+    pub const FORMAT: TextureFormat = TextureFormat::Rgba16Float;
+
+    /// Group 3 of the reading brush shader: the pass's colour and its depth.
+    pub fn bind_group_layout(device: &Device) -> BindGroupLayout {
+        let entry = |binding: u32, sample_type: TextureSampleType| BindGroupLayoutEntry {
+            binding,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Texture { sample_type, view_dimension: TextureViewDimension::D2, multisampled: false },
+            count: None,
+        };
+        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("probe_pass_layout"),
+            entries: &[entry(0, TextureSampleType::Float { filterable: false }), entry(1, TextureSampleType::Depth)],
+        })
+    }
+
+    /// One eye's half-resolution probe pass: what it renders into, and the
+    /// bind group the scene pass reads it through.
+    pub struct Target {
+        _color: Texture,
+        pub color_view: TextureView,
+        _depth: Texture,
+        pub depth_view: TextureView,
+        pub bind_group: BindGroup,
+        pub width: u32,
+        pub height: u32,
+    }
+
+    impl Target {
+        /// For an eye `eye_width` x `eye_height`: half each way, rounded up, so
+        /// the last column and row of pixels still have a texel.
+        pub fn new(device: &Device, layout: &BindGroupLayout, eye_width: u32, eye_height: u32) -> Self {
+            let (width, height) = (eye_width.div_ceil(2).max(1), eye_height.div_ceil(2).max(1));
+            let make = |label: &str, format: TextureFormat| {
+                device.create_texture(&TextureDescriptor {
+                    label: Some(label),
+                    size: Extent3d { width, height, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format,
+                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            };
+            let color = make("probe_pass_color", FORMAT);
+            let depth = make("probe_pass_depth", TextureFormat::Depth32Float);
+            let color_view = color.create_view(&Default::default());
+            let depth_view = depth.create_view(&Default::default());
+            let bind_group = device.create_bind_group(&BindGroupDescriptor {
+                label: Some("probe_pass_bg"),
+                layout,
+                entries: &[
+                    BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&color_view) },
+                    BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&depth_view) },
+                ],
+            });
+            Self { _color: color, color_view, _depth: depth, depth_view, bind_group, width, height }
+        }
+    }
+
+    /// The pass's fragment body, after the brush shader's shared preamble
+    /// (footprint, albedo, normal mapping): the probe reflection for this
+    /// surface and nothing else, from the same inputs the scene pass hands
+    /// `shade_material_env`.
+    pub(super) const PASS_LIGHTING: &str = r#"
+    let rough = textureSample(mat_rough, mat_rough_samp, in.uv, i32(in.material)).r;
+    let rough_aa = specular_aa_roughness(rough, dpdx(n), dpdy(n));
+    let ao = textureSample(mat_ao, mat_samp, in.uv, i32(in.material)).r;
+    let lm_uv = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
+    let baked = textureSample(lm_tex, lm_samp, lm_uv);
+    let face_t = normalize(in.tangent.xyz - n_geom * dot(n_geom, in.tangent.xyz));
+    let face_b = cross(n_geom, face_t) * in.tangent.w;
+    let face_d = in.world_pos - in.face_centre;
+    let face_pos = in.face_centre
+        + face_t * clamp(dot(face_d, face_t), -in.face_half_extent.x, in.face_half_extent.x)
+        + face_b * clamp(dot(face_d, face_b), -in.face_half_extent.y, in.face_half_extent.y);
+    probe_volume_pos = vec4<f32>(in.face_centre, 1.0);
+    return probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);"#;
+
+    /// Group 3 and the read, appended to the scene pass's brush shader.
+    pub(super) const READER_WGSL: &str = r#"
+@group(3) @binding(0) var probe_pass_tex: texture_2d<f32>;
+@group(3) @binding(1) var probe_pass_depth: texture_depth_2d;
+
+// THE HALF-RESOLUTION PROBE REFLECTION AT THIS PIXEL: the four pass texels
+// around it, weighted bilinearly and kept only where their depth is this
+// pixel's -- the same surface -- so a reflection never bleeds across a
+// silhouette. `tolerance` is how far two depths may differ and still be one
+// surface, from this pixel's own depth slope. With no neighbour on this surface
+// (a sliver the half-resolution pass missed), the nearest in depth. The pass
+// stores the reflection premultiplied by its coverage, which is what makes the
+// weighted sum a correct filter; it is divided back out here.
+fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32) -> vec4<f32> {
+    let size = vec2<i32>(textureDimensions(probe_pass_tex));
+    let h = pixel * 0.5 - vec2<f32>(0.5);
+    let base = vec2<i32>(floor(h));
+    let f = h - floor(h);
+    var sum = vec4<f32>(0.0);
+    var weight = 0.0;
+    var nearest = vec4<f32>(0.0);
+    var nearest_gap = 3.4e38;
+    for (var k = 0; k < 4; k = k + 1) {
+        let o = vec2<i32>(k & 1, k >> 1u);
+        let q = clamp(base + o, vec2<i32>(0), size - vec2<i32>(1));
+        let c = textureLoad(probe_pass_tex, q, 0);
+        let gap = abs(textureLoad(probe_pass_depth, q, 0) - depth);
+        let bw = select(1.0 - f.x, f.x, o.x == 1) * select(1.0 - f.y, f.y, o.y == 1);
+        let w = select(0.0, bw, gap <= tolerance);
+        sum = sum + c * w;
+        weight = weight + w;
+        if (gap < nearest_gap) {
+            nearest_gap = gap;
+            nearest = c;
+        }
+    }
+    let pre = select(nearest, sum / max(weight, 1e-6), weight > 1e-4);
+    return vec4<f32>(pre.rgb / max(pre.a, 1e-4), pre.a);
+}
+"#;
+}
+
 fn brush_shader_variant(ssr: bool, sources: bool, ssr_debug: bool) -> String {
     brush_shader_modes(ssr, sources, ssr_debug, SsrPath::Inline)
 }
@@ -1449,6 +1666,23 @@ pub enum SsrPath {
 /// reflection can be filtered ACROSS pixels before anything looks at it, which
 /// is the only place the hit/miss cliff can be removed.
 fn brush_shader_modes(ssr: bool, sources: bool, ssr_debug: bool, path: SsrPath) -> String {
+    brush_shader_probe(ssr, sources, ssr_debug, path, BrushProbe::Trace)
+}
+
+/// WHERE A BRUSH SHADER'S PROBE REFLECTION COMES FROM. See `probe_pass`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum BrushProbe {
+    /// Traced per pixel, in the shader that shades. What always shipped.
+    Trace,
+    /// The half-resolution probe pass itself: shades nothing, writes only the
+    /// probe reflection. See `probe_pass`.
+    Pass,
+    /// The scene pass's brush, reading that pass instead of tracing.
+    Read,
+}
+
+/// `brush_shader_modes`, with the probe reflection's source. See `BrushProbe`.
+fn brush_shader_probe(ssr: bool, sources: bool, ssr_debug: bool, path: SsrPath, probe: BrushProbe) -> String {
     let trace = path == SsrPath::Trace;
     let composite = path == SsrPath::Composite;
     let ssr_block = match (ssr, path) {
@@ -1802,7 +2036,27 @@ struct VOut {{
     );
     let c = in.tint.rgb * lit;"#
     };
-    format!(
+    // THE HALF-RESOLUTION PROBE PASS. See `probe_pass`.
+    let lighting: String = match probe {
+        BrushProbe::Trace => lighting.to_string(),
+        BrushProbe::Pass => probe_pass::PASS_LIGHTING.to_string(),
+        BrushProbe::Read => {
+            let marker = "    probe_volume_pos = vec4<f32>(in.face_centre, 1.0);\n    let lit = shade_material_env(";
+            assert!(
+                lighting.contains(marker),
+                "the brush lighting no longer sets the probe position just before it shades; the pass read goes there",
+            );
+            format!(
+                "    let probe_pass_tolerance = max(4.0 * fwidth(in.clip.z), 1e-6);\n{}",
+                lighting.replacen(
+                    marker,
+                    &format!("    probe_env_given = probe_pass_upsample(in.clip.xy, in.clip.z, probe_pass_tolerance);\n{marker}"),
+                    1,
+                )
+            )
+        }
+    };
+    let src = format!(
         r#"
 // Group 0 -- the camera, the lights and both shadow maps -- is declared by
 // `wgsl_lights_block` below, so there is one description of that layout rather
@@ -1948,7 +2202,7 @@ struct VOut {{
 {lighting}{tail}
 }}
 "#,
-        lights_block = wgsl_lights_block(0, 1),
+        lights_block = crate::renderer::lights::wgsl_lights_block_with(0, 1, probe == BrushProbe::Read),
         ssr_block = ssr_block,
         sun_mask_range = SUN_MASK_DISTANCE_TEXELS,
         stationary_range = STATIONARY_MASK_DISTANCE_TEXELS,
@@ -1960,7 +2214,9 @@ struct VOut {{
         },
         edge_varying = edge_varying,
         edge_vs = edge_vs,
-        tail = if BRUSH_EDGE_DEBUG {
+        tail = if probe == BrushProbe::Pass {
+            String::new()
+        } else if BRUSH_EDGE_DEBUG {
             edge_debug.to_string()
         } else if sources {
             match SOURCES_VIEW {
@@ -1980,7 +2236,12 @@ struct VOut {{
         } else {
             ssr_apply
         }
-    )
+    );
+    if probe == BrushProbe::Read {
+        format!("{src}{}", probe_pass::READER_WGSL)
+    } else {
+        src
+    }
 }
 
 #[cfg(test)]
@@ -3437,6 +3698,32 @@ mod ssr_pipeline_tests {
         assert!(ssr_debug.contains("MAGENTA: faces the viewer"), "the SSR view does not paint the SSR paths");
         assert!(!brush_shader_with(true).contains("MAGENTA"), "the shipped shader paints SSR paths");
         assert_eq!(DebugView::Off.next().next().next(), DebugView::Off, "the cycle does not return to Off");
+    }
+
+    /// THE HALF-RESOLUTION PROBE PASS AND THE BRUSH THAT READS IT build on a
+    /// real device -- WGSL is only validated at pipeline creation -- and the
+    /// reader is built without the trace. See `probe_pass`.
+    #[test]
+    fn the_probe_pass_pipelines_build_on_a_real_device() {
+        let reader_src = brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Read);
+        assert!(reader_src.contains("const PROBE_ENV_FROM_PASS: bool = true;"), "the reader still traces per pixel");
+        assert!(brush_shader_variant(false, false, false).contains("const PROBE_ENV_FROM_PASS: bool = false;"));
+        let Some((device, _queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let lights = LightsUniform::new(&device);
+        let (_shadows, uniforms) = scene_uniforms(&device, &lights);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _pass = BrushPipeline::new_probe_pass(&device, &uniforms.layout);
+        let layout = probe_pass::bind_group_layout(&device);
+        let _reader = BrushPipeline::new_multisampled_probe_reader(
+            &device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &layout,
+        );
+        let target = probe_pass::Target::new(&device, &layout, 1445, 1546);
+        assert_eq!((target.width, target.height), (723, 773));
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "the probe pass pipelines failed to build: {err:?}");
     }
 
     /// The debug pipelines must build on a real device, or pressing the button
