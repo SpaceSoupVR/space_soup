@@ -1757,6 +1757,7 @@ pub mod probe_pass {
         + face_t * clamp(dot(face_d, face_t), -in.face_half_extent.x, in.face_half_extent.x)
         + face_b * clamp(dot(face_d, face_b), -in.face_half_extent.y, in.face_half_extent.y);
     probe_volume_pos = vec4<f32>(in.face_centre, 1.0);
+    probe_face_given = in.probe_face;
     return probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);"#;
 
     /// Group 3 and the read, appended to the scene pass's brush shader.
@@ -2325,7 +2326,7 @@ struct VOut {{
     // interpolated copy would be extrapolated at the very pixels it exists to
     // correct. See `BrushVertex::face_half_extent`.
     @location(9) @interpolate(flat) face_half_extent: vec2<f32>,
-{edge_varying}}}
+{probe_face_varying}{edge_varying}}}
 
 @vertex fn vs_main(v: VIn) -> VOut {{
     var out: VOut;
@@ -2341,7 +2342,7 @@ struct VOut {{
     out.uv2       = v.uv2;
     out.material  = v.material;
     out.tint      = v.tint;
-{edge_vs}    return out;
+{probe_face_vs}{edge_vs}    return out;
 }}
 
 // THE DEPTH PREPASS's fragment stage: nothing, with every colour write
@@ -2405,6 +2406,19 @@ struct VOut {{
         },
         edge_varying = edge_varying,
         edge_vs = edge_vs,
+        // THE PROBE PASS CHOOSES ITS ROOM PER FACE, in the vertex stage. See
+        // `probe_face_room`: the box tests against every resident probe were
+        // made per pixel for a result that is the same across the face.
+        probe_face_varying = if probe == BrushProbe::Pass {
+            "    // FLAT: the face's room. See `probe_face_room`.\n    @location(10) @interpolate(flat) probe_face: vec4<f32>,\n"
+        } else {
+            ""
+        },
+        probe_face_vs = if probe == BrushProbe::Pass {
+            "    out.probe_face = probe_face_room(v.face_centre);\n"
+        } else {
+            ""
+        },
         tail = if probe == BrushProbe::Pass {
             String::new()
         } else if BRUSH_EDGE_DEBUG {

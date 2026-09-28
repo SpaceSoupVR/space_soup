@@ -687,6 +687,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, probe_from_p
     let probe_slots = crate::renderer::uniforms::MAX_PROBES * 3;
     let portal_slots = crate::renderer::uniforms::MAX_PORTALS * 3;
     let proxy_slots = crate::renderer::uniforms::MAX_PROXIES * 3;
+    let room_table_rows = crate::renderer::uniforms::ROOM_TABLE_ROWS;
     let max_spot_shadows = super::shadow::MAX_SPOT_SHADOWS;
     // Emitted from the Rust constant so the shader cannot disagree with the
     // atlas the pass actually renders into.
@@ -735,6 +736,9 @@ struct Camera {{
     proxy_params: vec4<f32>,
     // Three vec4 per proxy -- [centre, volume], [half size], [rotation xyzw].
     probe_proxies: array<vec4<f32>, {proxy_slots}>,
+    // The resident rooms' tables -- each room's first slot, doorway and proxy,
+    // and each one's next in its room. See `uniforms::Uniforms::probe_rooms`.
+    probe_rooms: array<vec4<f32>, {room_table_rows}>,
 }}
 
 // Undo the player-frame transform the CPU applied to this vertex.
@@ -811,28 +815,26 @@ fn sky_uv(d: vec3<f32>) -> vec2<f32> {{
 // changing what a level without a sky looks like.
 fn sky_irradiance(n: vec3<f32>) -> vec3<f32> {{
     let x = n.x; let y = n.y; let z = n.z;
-    var b = array<f32, 9>(
-        0.282095,
-        0.488603 * y,
-        0.488603 * z,
-        0.488603 * x,
-        1.092548 * x * y,
-        1.092548 * y * z,
-        0.315392 * (3.0 * z * z - 1.0),
-        1.092548 * x * z,
-        0.546274 * (x * x - y * y),
-    );
-    // The cosine lobe's coefficients, already divided by pi -- see
-    // SkyIrradiance::evaluate in sky.rs, which this mirrors exactly.
-    var a = array<f32, 9>(
-        1.0,
-        0.6666667, 0.6666667, 0.6666667,
-        0.25, 0.25, 0.25, 0.25, 0.25,
-    );
+    // Each term is coefficient * basis * cosine-lobe weight, the lobe's
+    // weights already divided by pi (1, 2/3 three times, 1/4 five times) --
+    // see SkyIrradiance::evaluate in sky.rs, which this mirrors exactly, in the
+    // same order.
+    //
+    // WRITTEN OUT, NOT A LOOP OVER TWO LOCAL ARRAYS. That was the documented
+    // Adreno cliff: a local array read at a loop index is kept in scratch
+    // MEMORY unless the compiler unrolls the loop, and the loop counter wgpu
+    // adds to every loop is exactly what stops it doing so. This runs twice
+    // a pixel in the brush shader and once in the probe pass.
     var e = vec3<f32>(0.0);
-    for (var i: i32 = 0; i < 9; i = i + 1) {{
-        e = e + camera.sky_sh[i].rgb * b[i] * a[i];
-    }}
+    e = e + camera.sky_sh[0].rgb * 0.282095 * 1.0;
+    e = e + camera.sky_sh[1].rgb * (0.488603 * y) * 0.6666667;
+    e = e + camera.sky_sh[2].rgb * (0.488603 * z) * 0.6666667;
+    e = e + camera.sky_sh[3].rgb * (0.488603 * x) * 0.6666667;
+    e = e + camera.sky_sh[4].rgb * (1.092548 * x * y) * 0.25;
+    e = e + camera.sky_sh[5].rgb * (1.092548 * y * z) * 0.25;
+    e = e + camera.sky_sh[6].rgb * (0.315392 * (3.0 * z * z - 1.0)) * 0.25;
+    e = e + camera.sky_sh[7].rgb * (1.092548 * x * z) * 0.25;
+    e = e + camera.sky_sh[8].rgb * (0.546274 * (x * x - y * y)) * 0.25;
     return max(e, vec3<f32>(0.0));
 }}
 const SPEC_STRENGTH: f32 = 0.35;
@@ -1301,7 +1303,10 @@ fn light_contribution_split(
         let dist = length(to_light);
         l_dir = to_light / max(dist, 0.0001);
         let d_over_r = dist / max(l.params.x, 0.0001);
-        let window = clamp(1.0 - pow(d_over_r, 4.0), 0.0, 1.0);
+        // x^4 as two multiplies, as the baker's `powi(4)` has it: `pow` is
+        // exp2(4 log2 x), two transcendental instructions a lamp a pixel.
+        let d2_over_r2 = d_over_r * d_over_r;
+        let window = clamp(1.0 - d2_over_r2 * d2_over_r2, 0.0, 1.0);
         atten = (window * window) / max(dist * dist, LAMP_RADIUS * LAMP_RADIUS);
         if (kind > 0.5) {{
             let cos_outer = l.params.y;
@@ -1314,7 +1319,10 @@ fn light_contribution_split(
     let ndotl = max(dot(n, l_dir), 0.0);
     let radiance = l.color_intensity.rgb * l.color_intensity.a;
     out.diffuse = radiance * ndotl * atten;
-    if (ndotl > 0.0) {{
+    // No highlight where no light arrives: outside a spot's cone `atten` is
+    // exactly 0, and the half-vector and its `pow` were computed to be
+    // multiplied by it. Most of a room is outside most cones.
+    if (ndotl > 0.0 && atten > 0.0) {{
         let h = normalize(l_dir + view_dir);
         let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;
         out.specular = radiance * spec * atten;
@@ -1347,7 +1355,10 @@ fn light_contribution_rough(
         l_dir = to_light / max(dist, 0.0001);
 
         let d_over_r = dist / max(l.params.x, 0.0001);
-        let window = clamp(1.0 - pow(d_over_r, 4.0), 0.0, 1.0);
+        // x^4 as two multiplies, as the baker's `powi(4)` has it: `pow` is
+        // exp2(4 log2 x), two transcendental instructions a lamp a pixel.
+        let d2_over_r2 = d_over_r * d_over_r;
+        let window = clamp(1.0 - d2_over_r2 * d2_over_r2, 0.0, 1.0);
         atten = (window * window) / max(dist * dist, LAMP_RADIUS * LAMP_RADIUS);
 
         if (kind > 0.5) {{
@@ -1364,8 +1375,10 @@ fn light_contribution_rough(
 
     // Blinn-Phong specular, gated on ndotl so a surface facing away from the
     // light gets no highlight. Ungated, the half-vector still lines up on the
-    // far side and rims every object with light coming from behind it.
-    if (ndotl > 0.0) {{
+    // far side and rims every object with light coming from behind it. And on
+    // light arriving at all: outside a spot's cone the highlight would be
+    // multiplied by an `atten` of exactly 0.
+    if (ndotl > 0.0 && atten > 0.0) {{
         let h = normalize(l_dir + view_dir);
         let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;
         out = out + radiance * spec * atten;
@@ -1501,6 +1514,44 @@ fn specular_aa_roughness(roughness: f32, dndx: vec3<f32>, dndy: vec3<f32>) -> f3
     return sqrt(clamp(roughness * roughness + kernel, 0.0, 1.0));
 }}
 
+// THE FACE'S ROOM, when its vertex stage chose it: (x) the room, (y) 1 when a
+// resident box holds the face, (z) 1 when a doorway's carve does, (w) 1 for
+// "given". All zero -- the default -- and `probe_environment` chooses per
+// pixel as it always has. Set by the probe pass; see `probe_face_room`.
+var<private> probe_face_given: vec4<f32> = vec4<f32>(0.0);
+
+// WHICH ROOM A FACE REFLECTS, from its centre `face_pos` (player frame): the
+// half of `probe_environment`'s choice that depends only on the face -- the
+// tightest resident box holding the centre, and whether a doorway's carve
+// does -- made once a VERTEX. Every vertex of a face carries the same centre,
+// so the whole face agrees, as it does when each pixel works it out: the box
+// tests are the same, in the same slot order, with the same margin and the
+// same 0.1% tie rule. Pass the result to the fragment `flat`, and set
+// `probe_face_given` from it before shading.
+fn probe_face_room(face_pos: vec3<f32>) -> vec4<f32> {{
+    let volume_world = to_world_space(face_pos);
+    let count = i32(camera.probe_params.x);
+    var best_volume = 1e30;
+    var best_room = -1.0;
+    var held = 0.0;
+    for (var i = 0; i < count; i = i + 1) {{
+        let lo = camera.probe_boxes[i * 3 + 1].xyz;
+        let hi = camera.probe_boxes[i * 3 + 2].xyz;
+        if (any(volume_world < lo - vec3<f32>(PROBE_BOX_MARGIN)) || any(volume_world > hi + vec3<f32>(PROBE_BOX_MARGIN))) {{
+            continue;
+        }}
+        let d = hi - lo;
+        let volume = d.x * d.y * d.z;
+        if (volume < best_volume * 0.999) {{
+            best_volume = volume;
+            best_room = camera.probe_boxes[i * 3 + 2].w;
+            held = 1.0;
+        }}
+    }}
+    let doorway = select(0.0, 1.0, probe_portal_holding(volume_world) >= 0);
+    return vec4<f32>(best_room, held, doorway, 1.0);
+}}
+
 fn probe_environment(
     frag_pos: vec3<f32>,
     dir: vec3<f32>,
@@ -1553,7 +1604,33 @@ fn probe_environment(
     // than a switch. See the mix at the end of this function.
     var second = -1;
     var second_dist = 1e30;
-    for (var i = 0; i < count; i = i + 1) {{
+    // THE ROOM IS A PROPERTY OF THE FACE, so a caller whose vertex stage has
+    // already chosen it -- `probe_face_room`, once a vertex instead of once a
+    // pixel -- hands it in through `probe_face_given`, and only the choice of
+    // photograph WITHIN that room, which does depend on the pixel, is made
+    // here. The same comparisons as the full loop below, over the same slots
+    // in the same order: its first slot of the chosen room resets exactly as
+    // `tighter` does, and the rest compete as `same_room_but_nearer` does.
+    let face_given = probe_face_given.w > 0.5;
+    if (face_given) {{
+        if (probe_face_given.y > 0.5) {{
+            best_room = probe_face_given.x;
+            for (var i = probe_room_slot(best_room); i >= 0; i = probe_slot_next(i)) {{
+                let to_centre = camera.probe_boxes[i * 3].xyz - select_world;
+                let dist = dot(to_centre, to_centre);
+                if (dist < best_dist) {{
+                    second = best;
+                    second_dist = best_dist;
+                    best_dist = dist;
+                    best = i;
+                }} else if (dist < second_dist) {{
+                    second = i;
+                    second_dist = dist;
+                }}
+            }}
+        }}
+    }}
+    for (var i = 0; i < count && !face_given; i = i + 1) {{
         let lo = camera.probe_boxes[i * 3 + 1].xyz;
         let hi = camera.probe_boxes[i * 3 + 2].xyz;
         // WITH A MARGIN. A room's probe box IS its interior, so every wall,
@@ -1627,7 +1704,14 @@ fn probe_environment(
     // carve that no room claims is traced from the doorway, which is what
     // `probe_trace` does with a room of -1.
     var trace_room = best_room;
-    if (probe_portal_holding(volume_world) >= 0 && (best < 0 || probe_seen_distance(best, d) < 0.0)) {{
+    // Whether a doorway's carve holds the face: also the face's, so also given.
+    var in_doorway = false;
+    if (face_given) {{
+        in_doorway = probe_face_given.z > 0.5;
+    }} else {{
+        in_doorway = probe_portal_holding(volume_world) >= 0;
+    }}
+    if (in_doorway && (best < 0 || probe_seen_distance(best, d) < 0.0)) {{
         trace_room = -1.0;
     }}
     probe_eye_distance = distance(cam_pos(), frag_pos);
@@ -1832,14 +1916,9 @@ fn probe_rim_at(e: vec3<f32>, room: f32, axis: i32, spread: f32) -> ProbeRim {{
     var out: ProbeRim;
     out.portal = -1;
     out.through = 0.0;
-    let n = i32(camera.portal_params.x);
-    for (var p = 0; p < n; p = p + 1) {{
+    // This room's doorways only, in order. See `probe_room_portal`.
+    for (var p = probe_room_portal(room); p >= 0; p = probe_portal_next(p, room)) {{
         if (i32(camera.probe_portals[p * 3].w) != axis) {{
-            continue;
-        }}
-        let low = camera.probe_portals[p * 3 + 1].w;
-        let high = camera.probe_portals[p * 3 + 2].x;
-        if (low != room && high != room) {{
             continue;
         }}
         let plo = camera.probe_portals[p * 3].xyz;
@@ -1928,14 +2007,48 @@ fn probe_clearance(slot: i32, p: vec3<f32>) -> f32 {{
 
 // A resident slot photographing `room`, or -1. Any one serves for the room's
 // BOX: every cell of a room carries the room's box.
+//
+// LOOKED UP, NOT SEARCHED: rooms are numbered 0.. in order of their first slot
+// (`ProbeUpload::dense_rooms`), and this is that first slot -- the one a scan
+// of every slot would have stopped at. A room with no resident slot, -1 ("in
+// no room") included, is outside the table.
 fn probe_room_slot(room: f32) -> i32 {{
-    let count = i32(camera.probe_params.x);
-    for (var i = 0; i < count; i = i + 1) {{
-        if (camera.probe_boxes[i * 3 + 2].w == room) {{
-            return i;
-        }}
+    if (!(room >= 0.0 && room < 16.0)) {{
+        return -1;
     }}
-    return -1;
+    let r = i32(room);
+    return i32(camera.probe_rooms[r >> 2u][r & 3]);
+}}
+// The next slot of the same room after `slot`, ascending, or -1. Walking from
+// `probe_room_slot` visits a room's slots in the order a scan of every slot
+// would, so every tie between two photographs is broken the same way.
+fn probe_slot_next(slot: i32) -> i32 {{
+    return i32(camera.probe_rooms[4 + (slot >> 2u)][slot & 3]);
+}}
+// The first doorway of `room`, or -1; then each one's next in that room,
+// ascending -- onward through whichever of its two sides IS that room. The
+// same doorways, in the same order, as a scan of all of them for the room.
+fn probe_room_portal(room: f32) -> i32 {{
+    if (!(room >= 0.0 && room < 16.0)) {{
+        return -1;
+    }}
+    let r = i32(room);
+    return i32(camera.probe_rooms[8 + (r >> 2u)][r & 3]);
+}}
+fn probe_portal_next(p: i32, room: f32) -> i32 {{
+    let k = p * 2 + select(1, 0, camera.probe_portals[p * 3 + 1].w == room);
+    return i32(camera.probe_rooms[12 + (k >> 2u)][k & 3]);
+}}
+// The first proxy standing in `room`, or -1; then each one's next, ascending.
+fn probe_room_proxy(room: f32) -> i32 {{
+    if (!(room >= 0.0 && room < 16.0)) {{
+        return -1;
+    }}
+    let r = i32(room);
+    return i32(camera.probe_rooms[16 + (r >> 2u)][r & 3]);
+}}
+fn probe_proxy_next(i: i32) -> i32 {{
+    return i32(camera.probe_rooms[20 + (i >> 2u)][i & 3]);
 }}
 
 // `v` rotated by the unit quaternion `q`.
@@ -1956,17 +2069,30 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip
     out.edge_cover = 0.0;
     out.edge_t = 0.0;
     var best = 3.4e38;
-    let n = i32(camera.proxy_params.x);
-    for (var i = 0; i < n; i = i + 1) {{
-        if (camera.probe_proxies[i * 3].w != room || i == skip) {{
+    // The slab test's reciprocal direction for every UNROTATED proxy, whose
+    // frame's direction is `d` itself: three divisions once, not per proxy.
+    let inv_d = 1.0 / select(vec3<f32>(1e-9), d, abs(d) > vec3<f32>(1e-9));
+    // What stands in this room only, in order. See `probe_room_proxy`.
+    for (var i = probe_room_proxy(room); i >= 0; i = probe_proxy_next(i)) {{
+        if (i == skip) {{
             continue;
         }}
+        // Into the box's own frame. SKIPPED for an unrotated box -- the
+        // pillar, and every model standing square to the room -- where the
+        // rotation by the identity is exactly the input: two quaternion
+        // rotations a proxy a hop a pixel, for nothing. The test is on the
+        // uniform, so a whole wave takes the same branch.
         let q = camera.probe_proxies[i * 3 + 2];
-        let qi = vec4<f32>(-q.xyz, q.w);
-        let lo = probe_quat_rotate(qi, o - camera.probe_proxies[i * 3].xyz);
-        let ld = probe_quat_rotate(qi, d);
+        var lo = o - camera.probe_proxies[i * 3].xyz;
+        var ld = d;
+        var inv = inv_d;
+        if (any(q != vec4<f32>(0.0, 0.0, 0.0, 1.0))) {{
+            let qi = vec4<f32>(-q.xyz, q.w);
+            lo = probe_quat_rotate(qi, lo);
+            ld = probe_quat_rotate(qi, ld);
+            inv = 1.0 / select(vec3<f32>(1e-9), ld, abs(ld) > vec3<f32>(1e-9));
+        }}
         let half = camera.probe_proxies[i * 3 + 1].xyz;
-        let inv = 1.0 / select(vec3<f32>(1e-9), ld, abs(ld) > vec3<f32>(1e-9));
         let a = (-half - lo) * inv;
         let b = (half - lo) * inv;
         let lows = min(a, b);
@@ -2048,11 +2174,7 @@ fn probe_proxy_surface(o: vec3<f32>, d: vec3<f32>, t_in: f32, t_out: f32, room: 
     var s1 = -1;
     var d0 = 3.4e38;
     var d1 = 3.4e38;
-    let count = i32(camera.probe_params.x);
-    for (var i = 0; i < count; i = i + 1) {{
-        if (camera.probe_boxes[i * 3 + 2].w != room) {{
-            continue;
-        }}
+    for (var i = probe_room_slot(room); i >= 0; i = probe_slot_next(i)) {{
         let v = camera.probe_boxes[i * 3].xyz - centre;
         let dd = dot(v, v);
         if (dd < d0) {{
@@ -2093,14 +2215,9 @@ fn probe_proxy_surface(o: vec3<f32>, d: vec3<f32>, t_in: f32, t_out: f32, room: 
 // where `e` is on a wall. The portal's box is the carve through the wall, so
 // `e` -- on the room's face -- lies inside it exactly when it is in the opening.
 fn probe_portal_at(e: vec3<f32>, room: f32, axis: i32) -> i32 {{
-    let n = i32(camera.portal_params.x);
-    for (var p = 0; p < n; p = p + 1) {{
+    // This room's doorways only, in order. See `probe_room_portal`.
+    for (var p = probe_room_portal(room); p >= 0; p = probe_portal_next(p, room)) {{
         if (i32(camera.probe_portals[p * 3].w) != axis) {{
-            continue;
-        }}
-        let low = camera.probe_portals[p * 3 + 1].w;
-        let high = camera.probe_portals[p * 3 + 2].x;
-        if (room != low && room != high) {{
             continue;
         }}
         let lo = camera.probe_portals[p * 3].xyz - vec3<f32>(1e-3);
@@ -2420,11 +2537,7 @@ fn probe_escape_colour(e: vec3<f32>, d: vec3<f32>, room: f32, other: f32, p: i32
     let far_point = e + d * PROBE_ESCAPE_DISTANCE;
     var best = -1;
     var best_d = 3.4e38;
-    let count = i32(camera.probe_params.x);
-    for (var i = 0; i < count; i = i + 1) {{
-        if (camera.probe_boxes[i * 3 + 2].w != room) {{
-            continue;
-        }}
+    for (var i = probe_room_slot(room); i >= 0; i = probe_slot_next(i)) {{
         let c = camera.probe_boxes[i * 3].xyz;
         let to = far_point - c;
         if (abs(to[axis]) < 1e-5) {{
@@ -2485,11 +2598,20 @@ fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32)
     var s1 = -1;
     var d0 = 3.4e38;
     var d1 = 3.4e38;
-    let count = i32(camera.probe_params.x);
-    for (var i = 0; i < count; i = i + 1) {{
-        let r = camera.probe_boxes[i * 3 + 2].w;
-        if (r != room && r != other) {{
-            continue;
+    // The slots of `room` and of `other`, merged in ascending slot order --
+    // exactly the slots, and the order, of a scan of every slot for either.
+    var next_a = probe_room_slot(room);
+    var next_b = select(-1, probe_room_slot(other), other != room);
+    loop {{
+        if (next_a < 0 && next_b < 0) {{
+            break;
+        }}
+        var i = next_a;
+        if (next_b >= 0 && (next_a < 0 || next_b < next_a)) {{
+            i = next_b;
+            next_b = probe_slot_next(next_b);
+        }} else {{
+            next_a = probe_slot_next(next_a);
         }}
         let v = camera.probe_boxes[i * 3].xyz - h;
         let dd = dot(v, v);
@@ -2611,13 +2733,9 @@ var<private> volume_sample_brightness: f32 = 0.0;
 fn probe_volume_sample(
     room: f32, select_world: vec3<f32>, world_pos: vec3<f32>, d: vec3<f32>, lod: f32,
 ) -> vec4<f32> {{
-    let count = i32(camera.probe_params.x);
     var pick = -1;
     var pick_dist = 1e30;
-    for (var i = 0; i < count; i = i + 1) {{
-        if (camera.probe_boxes[i * 3 + 2].w != room) {{
-            continue;
-        }}
+    for (var i = probe_room_slot(room); i >= 0; i = probe_slot_next(i)) {{
         let to_centre = camera.probe_boxes[i * 3].xyz - select_world;
         let dist = dot(to_centre, to_centre);
         if (dist < pick_dist) {{
@@ -2763,7 +2881,13 @@ fn probe_env_for_pass(
     let refl = reflect(-view_dir, env_n);
     let probe = probe_environment(world_pos, refl, roughness, probe_select_pos);
     let occ = clamp(ao, 0.0, 1.0) * clamp(sky_vis, 0.0, 1.0);
-    let ambient_here = dot(env + sky_irradiance(n) * occ, vec3<f32>(0.2126, 0.7152, 0.0722));
+    // The sky only where some reaches: `occ` is exactly 0 across most of an
+    // interior, and there the nine-term sum was computed to be multiplied by it.
+    var sky_here = vec3<f32>(0.0);
+    if (occ > 0.0) {{
+        sky_here = sky_irradiance(n) * occ;
+    }}
+    let ambient_here = dot(env + sky_here, vec3<f32>(0.2126, 0.7152, 0.0722));
     let probe_scale = select(
         1.0,
         clamp(ambient_here / max(probe_brightness, 1e-4), PROBE_NORMALISATION_FLOOR, 1.0),
@@ -2824,7 +2948,6 @@ fn shade_material_env(
     // Distance to the nearest punctual light, for the sphere-light widening.
     // Computed before the loop because the roughness it feeds is per surface,
     // not per light: one lobe, sized by whatever is actually lighting this spot.
-    var light_dist = 1e9;
     // FIELDS, NOT THE WHOLE STRUCT.
     //
     // `let li = lights.lights[i]` copied all sixteen components of a Light
@@ -2839,10 +2962,17 @@ fn shade_material_env(
     // documented Adreno cliff is a dynamically-indexed LOCAL array, which
     // spills to scratch memory. There are none of those in this shader, and a
     // uniform array is not one.
+    //
+    // By SQUARED distance, and one square root after the loop: the nearest
+    // lamp is the same either way, and a root per lamp per pixel was paid to
+    // compare numbers whose order the root does not change.
+    var light_dist_sq = 1e18;
     for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
         if (lights.lights[i].params.z > 1.5) {{ continue; }}
-        light_dist = min(light_dist, distance(lights.lights[i].position.xyz, world_pos));
+        let to_lamp = lights.lights[i].position.xyz - world_pos;
+        light_dist_sq = min(light_dist_sq, dot(to_lamp, to_lamp));
     }}
+    let light_dist = sqrt(light_dist_sq);
     let alpha = r * r;
     // Widened by the solid angle the lamp subtends from here. `light_dist` is
     // the nearest light's distance, so a surface right under a fixture gets a
@@ -2858,7 +2988,13 @@ fn shade_material_env(
     let occ = clamp(ao, 0.0, 1.0) * clamp(sky_vis, 0.0, 1.0);
     // Two accumulators from here on: what the surface's colour tints, and what
     // it does not.
-    var diffuse = sky_irradiance(n) * occ;
+    // Only where the baked sky visibility is not exactly 0 -- most of an
+    // interior -- is the sky's nine-term sum worth computing; elsewhere it is
+    // multiplied by that 0. The same below for its reflection.
+    var diffuse = vec3<f32>(0.0);
+    if (occ > 0.0) {{
+        diffuse = sky_irradiance(n) * occ;
+    }}
     var specular = vec3<f32>(0.0);
 
     // ENVIRONMENT SPECULAR -- what actually makes a polished surface read as
@@ -2917,7 +3053,11 @@ fn shade_material_env(
     // to give up.
     let f0 = 0.04;
     let f_max = max(1.0 - r, f0);
-    let fresnel = f0 + (f_max - f0) * pow(1.0 - cos_v, 5.0);
+    // x^5 as three multiplies, as the CPU mirror's `powi(5)` has it; `pow` is
+    // exp2(5 log2 x), two transcendental instructions every pixel.
+    let grazing = 1.0 - cos_v;
+    let grazing2 = grazing * grazing;
+    let fresnel = f0 + (f_max - f0) * (grazing2 * grazing2 * grazing);
     // Sky and room, each occluded by what can actually reach this surface.
     // The sky term keeps its `occ`; the local term does NOT, because `env` is
     // already the light that got here -- occluding it again would darken a
@@ -2942,7 +3082,10 @@ fn shade_material_env(
     if (!PROBE_ENV_FROM_PASS) {{
         probe = probe_environment(world_pos, refl, roughness, probe_select_pos);
     }}
-    let sky_reflection = environment_radiance(refl) * occ;
+    var sky_reflection = vec3<f32>(0.0);
+    if (occ > 0.0) {{
+        sky_reflection = environment_radiance(refl) * occ;
+    }}
     // SPECULAR OCCLUSION.
     //
     // A probe has NO visibility information. It photographed the room from its
@@ -3108,8 +3251,26 @@ fn shade_material_env(
             if (lights.lights[i].params.z < 1.5) {{
                 let to_light = lights.lights[i].position.xyz - world_pos;
                 let reach = lights.lights[i].params.x;
-                if (dot(to_light, to_light) >= reach * reach) {{
+                let dist_sq = dot(to_light, to_light);
+                if (dist_sq >= reach * reach) {{
                     continue;
+                }}
+                // OUTSIDE A SPOT'S CONE BY MORE THAN ITS SOFT EDGE CAN REACH.
+                // `spot_cone` widens the authored band for antialiasing, but
+                // never past SPOT_EDGE_MAX_WIDEN times it, which moves the
+                // cone's zero at most one authored band outward -- so wherever
+                // the angle's cosine is below `cos_outer - authored` (less a
+                // hair for rounding) the cone is exactly 0, and so is all the
+                // attenuation and highlight maths it multiplies. Compared as
+                // `cos * dist`, the way `light_contribution_split` divides.
+                if (lights.lights[i].params.z > 0.5) {{
+                    let cos_outer = lights.lights[i].params.y;
+                    let authored = max(lights.lights[i].direction.w - cos_outer, 0.0001);
+                    let zero_below = cos_outer - authored * (0.5 * (SPOT_EDGE_MAX_WIDEN - 1.0)) - 1e-4;
+                    let along = -dot(to_light, lights.lights[i].direction.xyz);
+                    if (along <= zero_below * max(sqrt(dist_sq), 0.0001)) {{
+                        continue;
+                    }}
                 }}
             }} else if (receiver_sun_mask == 0.0) {{
                 // THE SKY'S SUN WHERE ITS BAKED MASK HIDES IT COMPLETELY --
@@ -3607,14 +3768,14 @@ mod horizon_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            code.contains("let sky_reflection = environment_radiance(refl) * occ;"),
+            code.contains("sky_reflection = environment_radiance(refl) * occ;"),
             "the specular environment is back to reading the raw sky harmonics",
         );
         // And the DIFFUSE ambient must not: it is evaluated along the surface
         // normal, and a ground term there would light undersides that see no
         // ground.
         assert!(
-            code.contains("var diffuse = sky_irradiance(n) * occ;"),
+            code.contains("diffuse = sky_irradiance(n) * occ;"),
             "the diffuse ambient is no longer the plain sky along the normal",
         );
         // The BLEND SHAPE, not just that a blend exists. `the_horizon_is_soft`
@@ -3734,27 +3895,25 @@ mod sky_agreement_tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        // The nine basis terms, exactly as the mirror spells them.
+        // The nine terms -- coefficient, basis, cosine-lobe weight already
+        // divided by pi -- exactly as the mirror spells them, in its order.
         for term in [
-            "0.282095,",
-            "0.488603 * y,",
-            "0.488603 * z,",
-            "0.488603 * x,",
-            "1.092548 * x * y,",
-            "1.092548 * y * z,",
-            "0.315392 * (3.0 * z * z - 1.0),",
-            "1.092548 * x * z,",
-            "0.546274 * (x * x - y * y),",
+            "e = e + camera.sky_sh[0].rgb * 0.282095 * 1.0;",
+            "e = e + camera.sky_sh[1].rgb * (0.488603 * y) * 0.6666667;",
+            "e = e + camera.sky_sh[2].rgb * (0.488603 * z) * 0.6666667;",
+            "e = e + camera.sky_sh[3].rgb * (0.488603 * x) * 0.6666667;",
+            "e = e + camera.sky_sh[4].rgb * (1.092548 * x * y) * 0.25;",
+            "e = e + camera.sky_sh[5].rgb * (1.092548 * y * z) * 0.25;",
+            "e = e + camera.sky_sh[6].rgb * (0.315392 * (3.0 * z * z - 1.0)) * 0.25;",
+            "e = e + camera.sky_sh[7].rgb * (1.092548 * x * z) * 0.25;",
+            "e = e + camera.sky_sh[8].rgb * (0.546274 * (x * x - y * y)) * 0.25;",
         ] {
             assert!(
                 code.contains(term),
-                "the shader's harmonic basis no longer contains `{term}`, so the \
+                "the shader's harmonic sum no longer contains `{term}`, so the \
                  transcription in this module is measuring something else",
             );
         }
-        // And the cosine-lobe weights, already divided by pi.
-        assert!(code.contains("0.6666667, 0.6666667, 0.6666667,"));
-        assert!(code.contains("0.25, 0.25, 0.25, 0.25, 0.25,"));
         assert!(code.contains("return max(e, vec3<f32>(0.0));"), "the shader stopped clamping");
     }
 
@@ -4262,8 +4421,11 @@ mod shader_occupancy_tests {
         // instead of fixed.
         for (i, line) in b.lines().enumerate() {
             let t = line.trim();
-            let local_array_decl =
-                t.starts_with("var<function>") || (t.starts_with("var ") && t.contains(": array<"));
+            // Both spellings: `var x: array<f32, 9>` and the inferred
+            // `var x = array<f32, 9>(...)`, which is how the two in
+            // `sky_irradiance` slipped past this guard until 2026-09-28.
+            let local_array_decl = t.starts_with("var<function>")
+                || (t.starts_with("var ") && (t.contains(": array<") || t.contains("= array<")));
             assert!(
                 !local_array_decl,
                 "line {i} declares a LOCAL array, which spills to scratch memory \
@@ -4278,8 +4440,8 @@ mod shader_occupancy_tests {
     #[test]
     fn the_nearest_light_pass_does_not_copy_the_whole_light() {
         let b = body();
-        let start = b.find("var light_dist = 1e9;").expect("the nearest-light pass is gone");
-        let end = b[start..].find("let alpha = r * r;").expect("the pass lost its terminator") + start;
+        let start = b.find("var light_dist_sq = 1e18;").expect("the nearest-light pass is gone");
+        let end = b[start..].find("let light_dist = sqrt(light_dist_sq);").expect("the pass lost its terminator") + start;
         let loop_body = &b[start..end];
         assert!(
             !loop_body.contains("let li = lights.lights[i];"),
@@ -4288,6 +4450,11 @@ mod shader_occupancy_tests {
         assert!(
             loop_body.contains("lights.lights[i].position.xyz"),
             "the nearest-light loop no longer reads the position field directly",
+        );
+        // Compared by squared distance: one root after the loop, none in it.
+        assert!(
+            !loop_body.contains("distance(") && !loop_body.contains("length(") && !loop_body.contains("sqrt("),
+            "the nearest-light loop takes a square root per lamp again",
         );
     }
 }
@@ -4648,13 +4815,18 @@ mod probe_trace_gpu_tests {
             solid: true,
         };
         probes.set_proxies(&[pillar, lamp], Vec3::ZERO, &[0, 1]);
+        // As `Uniforms::update` fills it: rooms renumbered, with their tables.
+        // (Volumes 0, 0, 1, 2 in slot order renumber to themselves, so the
+        // rooms the rays name below and the hits report keep their numbers.)
+        let (dense, room_tables) = probes.dense_rooms();
         let mut u: Uniforms = bytemuck::Zeroable::zeroed();
         u.probe_params = [probes.count as f32, 0.0, 0.0, 0.0];
-        u.probe_boxes = probes.boxes;
+        u.probe_boxes = dense.boxes;
         u.portal_params = [probes.portal_count as f32, 0.0, 0.0, 0.0];
-        u.probe_portals = probes.portals;
+        u.probe_portals = dense.portals;
         u.proxy_params = [probes.proxy_count as f32, 0.0, 0.0, 0.0];
-        u.probe_proxies = probes.proxies;
+        u.probe_proxies = dense.proxies;
+        u.probe_rooms = room_tables;
 
         let code = format!(
             "{}\n{}",

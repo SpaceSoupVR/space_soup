@@ -100,6 +100,19 @@ pub struct Uniforms {
     /// Per proxy: `[centre.xyz, volume]`, `[half_size.xyz, bounds-only]`,
     /// `[rotation xyzw]`. See [`ProbeUpload::proxies`].
     pub probe_proxies: [[[f32; 4]; 3]; MAX_PROXIES],
+    /// THE RESIDENT ROOMS AS TABLES, so the reflection trace LOOKS a room's
+    /// photographs, doorways and proxies up instead of searching all of them.
+    /// Sixteen entries a block of four rows, entry `k` at `[row + k / 4][k %
+    /// 4]`, -1 for none: rows 0-3 each room's first slot, 4-7 each slot's next
+    /// slot of its room; 8-11 each room's first doorway, 12-15 each doorway's
+    /// next in its low room (entry `2p`) and in its high room (`2p + 1`);
+    /// 16-19 each room's first proxy, 20-23 each proxy's next in its room.
+    /// Every chain ascends. The room numbers in `probe_boxes`,
+    /// `probe_portals` and `probe_proxies` are THIS table's, not the level's
+    /// volume ids. See [`ProbeUpload::dense_rooms`].
+    ///
+    /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
+    pub probe_rooms: [[f32; 4]; ROOM_TABLE_ROWS],
 }
 
 /// How many boxes standing inside rooms -- a pillar, a hanging lamp -- the
@@ -565,6 +578,8 @@ impl UniformBuffer {
         probes: Option<&ProbeUpload>,
     ) {
         let probes = probes.unwrap_or(&self.probes);
+        // Rooms renumbered 0.. with their lookup tables; see `dense_rooms`.
+        let (dense, room_tables) = probes.dense_rooms();
         let u = Uniforms {
             // ONE PER EYE. A single-view pass reads slot 0 and gets the same
             // matrix in both, because `upload_scene_with_probes` duplicates it;
@@ -607,11 +622,12 @@ impl UniformBuffer {
                 let g = sky_ground_irradiance(&sky.sh);
                 [probes.count as f32, g[0], g[1], g[2]]
             },
-            probe_boxes: probes.boxes,
+            probe_boxes: dense.boxes,
             portal_params: [probes.portal_count as f32, if probes.no_trace { 1.0 } else { 0.0 }, 0.0, 0.0],
-            probe_portals: probes.portals,
+            probe_portals: dense.portals,
             proxy_params: [probes.proxy_count as f32, 0.0, 0.0, 0.0],
-            probe_proxies: probes.proxies,
+            probe_proxies: dense.proxies,
+            probe_rooms: room_tables,
             post_params: [
                 post.exposure,
                 match post.tonemap {
@@ -970,7 +986,94 @@ impl ProbeUpload {
     pub fn layer(&self, slot: usize) -> u32 {
         self.boxes.get(slot).map(|b| b[0][3] as u32).unwrap_or(0)
     }
+
+    /// THE UPLOAD WITH ITS ROOMS RENUMBERED 0.., and the tables that let the
+    /// shader find a room's photographs without searching.
+    ///
+    /// Rooms are numbered in order of their first slot, so room `r`'s slots
+    /// are found from `tables[r / 4][r % 4]` and chained, ascending, through
+    /// `tables[4 + s / 4][s % 4]` -- the same slots, in the same order, as a
+    /// scan of every slot for that room visits them, which is what keeps
+    /// every tie between two photographs broken the same way. A portal side
+    /// or a proxy standing in a room with no resident slot is given
+    /// [`NO_RESIDENT_ROOM`], which, like its old volume id, matches no slot.
+    ///
+    /// The shader only ever compares rooms for equality, so renumbering them
+    /// changes no result: it is what makes them usable as indices.
+    pub fn dense_rooms(&self) -> (ProbeUpload, [[f32; 4]; ROOM_TABLE_ROWS]) {
+        const _: () = assert!(
+            MAX_PROBES <= 16 && MAX_PORTALS * 2 <= 16 && MAX_PROXIES <= 16,
+            "each block of the room tables holds sixteen entries",
+        );
+        let mut out = *self;
+        let mut tables = [[-1.0f32; 4]; ROOM_TABLE_ROWS];
+        let put = |tables: &mut [[f32; 4]; ROOM_TABLE_ROWS], row: usize, k: usize, v: usize| {
+            tables[row + k / 4][k % 4] = v as f32;
+        };
+        let mut rooms: Vec<f32> = Vec::new();
+        let mut last: Vec<usize> = Vec::new();
+        for slot in 0..(self.count as usize).min(MAX_PROBES) {
+            let raw = self.boxes[slot][2][3];
+            let room = match rooms.iter().position(|&r| r == raw) {
+                Some(room) => {
+                    put(&mut tables, 4, last[room], slot);
+                    last[room] = slot;
+                    room
+                }
+                None => {
+                    rooms.push(raw);
+                    last.push(slot);
+                    let room = rooms.len() - 1;
+                    put(&mut tables, 0, room, slot);
+                    room
+                }
+            };
+            out.boxes[slot][2][3] = room as f32;
+        }
+        let renumber = |raw: f32| rooms.iter().position(|&r| r == raw);
+        // DOORWAYS: each is in the chain of both its rooms. Its link onward in
+        // its LOW room's chain is entry `2p`, in its HIGH room's `2p + 1`, so
+        // the shader follows whichever side names the room it is walking.
+        let mut last_portal: Vec<Option<usize>> = vec![None; rooms.len()];
+        for p in 0..(self.portal_count as usize).min(MAX_PORTALS) {
+            let low = renumber(self.portals[p][1][3]);
+            let high = renumber(self.portals[p][2][0]);
+            out.portals[p][1][3] = low.map_or(NO_RESIDENT_ROOM, |r| r as f32);
+            out.portals[p][2][0] = high.map_or(NO_RESIDENT_ROOM, |r| r as f32);
+            for room in [low, high.filter(|&h| Some(h) != low)].into_iter().flatten() {
+                match last_portal[room] {
+                    None => put(&mut tables, 8, room, p),
+                    Some(prev) => {
+                        let side = if out.portals[prev][1][3] == room as f32 { 0 } else { 1 };
+                        put(&mut tables, 12, 2 * prev + side, p);
+                    }
+                }
+                last_portal[room] = Some(p);
+            }
+        }
+        let mut last_proxy: Vec<Option<usize>> = vec![None; rooms.len()];
+        for i in 0..(self.proxy_count as usize).min(MAX_PROXIES) {
+            let room = renumber(self.proxies[i][0][3]);
+            out.proxies[i][0][3] = room.map_or(NO_RESIDENT_ROOM, |r| r as f32);
+            if let Some(room) = room {
+                match last_proxy[room] {
+                    None => put(&mut tables, 16, room, i),
+                    Some(prev) => put(&mut tables, 20, prev, i),
+                }
+                last_proxy[room] = Some(i);
+            }
+        }
+        (out, tables)
+    }
 }
+
+/// The room number [`ProbeUpload::dense_rooms`] gives a portal side or a
+/// proxy standing in a room with no resident photograph: matches no slot, and
+/// is outside the tables, so a lookup of it finds nothing.
+pub const NO_RESIDENT_ROOM: f32 = 1_000_000.0;
+
+/// Rows of [`Uniforms::probe_rooms`]: six blocks of sixteen entries.
+pub const ROOM_TABLE_ROWS: usize = 24;
 
 impl Default for ProbeUpload {
     fn default() -> Self {
@@ -1919,5 +2022,120 @@ mod probe_brightness_tests {
         assert_eq!(u.boxes[1][1][3], 0.25, "slot 1 holds layer 0");
         // And a slot past `count` is left alone.
         assert_eq!(u.boxes[2][1][3], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod dense_room_tests {
+    use super::*;
+
+    fn upload(volumes: &[u32]) -> ProbeUpload {
+        let mut u = ProbeUpload { count: volumes.len() as u32, ..Default::default() };
+        for (slot, &v) in volumes.iter().enumerate() {
+            u.set(slot, slot as u32, Vec3::splat(slot as f32), Vec3::ZERO, Vec3::ONE);
+            u.set_volume(slot, v);
+        }
+        u
+    }
+
+    /// What the shader does with the tables: every slot of `room`, in order.
+    fn walk(tables: &[[f32; 4]; ROOM_TABLE_ROWS], room: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut s = tables[room / 4][room % 4];
+        while s >= 0.0 {
+            out.push(s as usize);
+            let i = s as usize;
+            s = tables[4 + i / 4][i % 4];
+        }
+        out
+    }
+
+    /// Each room's slots, in the order a scan of every slot visits them --
+    /// which is what keeps the shader's ties broken as they were.
+    #[test]
+    fn a_room_walks_its_slots_in_scan_order() {
+        let (dense, tables) = upload(&[7, 3, 7, 9, 3, 7]).dense_rooms();
+        let rooms: Vec<f32> = (0..6).map(|s| dense.boxes[s][2][3]).collect();
+        assert_eq!(rooms, vec![0.0, 1.0, 0.0, 2.0, 1.0, 0.0], "numbered by first appearance");
+        assert_eq!(walk(&tables, 0), vec![0, 2, 5]);
+        assert_eq!(walk(&tables, 1), vec![1, 4]);
+        assert_eq!(walk(&tables, 2), vec![3]);
+        assert!(walk(&tables, 3).is_empty(), "no fourth room");
+        // Everything but the room numbers is untouched.
+        let raw = upload(&[7, 3, 7, 9, 3, 7]);
+        for s in 0..6 {
+            assert_eq!(dense.boxes[s][0], raw.boxes[s][0]);
+            assert_eq!(dense.boxes[s][1], raw.boxes[s][1]);
+            assert_eq!(dense.boxes[s][2][..3], raw.boxes[s][2][..3]);
+        }
+    }
+
+    /// Doorways and proxies take the same numbers, and a room with no
+    /// resident photograph takes one that matches no slot and no table entry.
+    #[test]
+    fn portals_and_proxies_are_renumbered_alike() {
+        let mut u = upload(&[7, 3]);
+        let portal = |low, high| ProbePortal { min: Vec3::ZERO, max: Vec3::ONE, axis: 0, low, high, wall: None };
+        u.set_portals(&[portal(7, 3), portal(3, 42)], Vec3::ZERO, &[7, 3]);
+        let proxy = |volume| ProbeProxy { centre: Vec3::ZERO, half_size: Vec3::ONE, rotation: Quat::IDENTITY, volume, solid: true };
+        u.set_proxies(&[proxy(3)], Vec3::ZERO, &[7, 3]);
+        let (dense, _) = u.dense_rooms();
+        let sides: Vec<(f32, f32)> = (0..2).map(|p| (dense.portals[p][1][3], dense.portals[p][2][0])).collect();
+        assert!(sides.contains(&(0.0, 1.0)), "{sides:?}");
+        assert!(sides.contains(&(1.0, NO_RESIDENT_ROOM)), "{sides:?}");
+        assert_eq!(dense.proxies[0][0][3], 1.0);
+        assert!(NO_RESIDENT_ROOM >= 16.0, "outside the tables, so the shader's lookup finds nothing");
+    }
+
+    /// Each room's doorways and proxies, ascending, as the shader walks them:
+    /// a doorway onward through whichever of its sides is the walked room.
+    #[test]
+    fn doorways_and_proxies_chain_by_room() {
+        let mut u = upload(&[10, 20, 30]);
+        let portal = |low, high| ProbePortal { min: Vec3::ZERO, max: Vec3::ONE, axis: 0, low, high, wall: None };
+        // Nearest first: all at the origin, so they keep this order.
+        u.set_portals(&[portal(10, 20), portal(20, 30), portal(10, 30), portal(30, 99)], Vec3::ZERO, &[10, 20, 30]);
+        let proxy = |volume| ProbeProxy { centre: Vec3::ZERO, half_size: Vec3::ONE, rotation: Quat::IDENTITY, volume, solid: true };
+        u.set_proxies(&[proxy(20), proxy(10), proxy(20), proxy(99)], Vec3::ZERO, &[10, 20, 30]);
+        let (dense, t) = u.dense_rooms();
+        let at = |row: usize, k: usize| t[row + k / 4][k % 4];
+        let portals_of = |room: f32| {
+            let mut out = Vec::new();
+            let mut p = at(8, room as usize);
+            while p >= 0.0 {
+                let pi = p as usize;
+                out.push(pi);
+                let side = if dense.portals[pi][1][3] == room { 0 } else { 1 };
+                p = at(12, 2 * pi + side);
+            }
+            out
+        };
+        assert_eq!(portals_of(0.0), vec![0, 2]);
+        assert_eq!(portals_of(1.0), vec![0, 1]);
+        assert_eq!(portals_of(2.0), vec![1, 2, 3]);
+        let proxies_of = |room: usize| {
+            let mut out = Vec::new();
+            let mut i = at(16, room);
+            while i >= 0.0 {
+                out.push(i as usize);
+                i = at(20, i as usize);
+            }
+            out
+        };
+        assert_eq!(proxies_of(1), vec![0, 2]);
+        assert_eq!(proxies_of(0), vec![1]);
+        assert!(proxies_of(2).is_empty());
+        // A proxy in no resident room never reaches the upload (`set_proxies`
+        // keeps only resident rooms'); a doorway with ONE resident side does,
+        // and its other side is in no chain.
+        assert_eq!(u.proxy_count, 3);
+        assert_eq!(dense.portals[3][2][0], NO_RESIDENT_ROOM);
+    }
+
+    /// No probes, no rooms: every lookup finds nothing.
+    #[test]
+    fn an_empty_upload_has_empty_tables() {
+        let (_, tables) = ProbeUpload::default().dense_rooms();
+        assert!(tables.iter().flatten().all(|&v| v == -1.0));
     }
 }
