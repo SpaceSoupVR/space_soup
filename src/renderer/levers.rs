@@ -96,6 +96,9 @@ pub struct Levers {
     /// the ground map's heights. Off: they see only the sky. See
     /// `ground_map::trace`.
     pub ground_trace: bool,
+    /// Fixed foveated rendering: how coarsely the edges of each eye's image
+    /// are shaded, where the headset has it. See `foveation`.
+    pub foveation: crate::renderer::foveation::FoveationLevel,
     /// MEASUREMENT: block on the GPU at the end of every frame, as the
     /// renderer used to. Its wait is then exactly the GPU's time, which is
     /// what the A/B schedule attributes costs with; shipped, the CPU prepares
@@ -139,6 +142,7 @@ impl Default for Levers {
             deferred_reflection_lookups: true,
             terrain_probe_pass: true,
             ground_trace: true,
+            foveation: crate::renderer::foveation::SHIPPED,
             gpu_sync: false,
             ssr: None,
             multiview: None,
@@ -187,6 +191,7 @@ impl Levers {
             Phase::InlineReflectionLookups => l.deferred_reflection_lookups = false,
             Phase::TerrainPerPixelReflections => l.terrain_probe_pass = false,
             Phase::NoGroundTrace => l.ground_trace = false,
+            Phase::NoFoveation => l.foveation = crate::renderer::foveation::FoveationLevel::Off,
         }
         l
     }
@@ -222,6 +227,9 @@ impl Levers {
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
         flag("ab_cycle", self.ab_cycle, d.ab_cycle);
+        if self.foveation != d.foveation {
+            out.push(format!("foveation={}", self.foveation.label()));
+        }
         if let Some(on) = self.ssr {
             out.push(format!("ssr={}", if on { "on" } else { "off" }));
         }

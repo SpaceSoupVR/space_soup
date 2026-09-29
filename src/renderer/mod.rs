@@ -34,6 +34,7 @@ pub mod shader_checks;
 pub mod portal_cull;
 pub mod shader_precision;
 pub mod probe_fixup;
+pub mod foveation;
 pub mod ground_map;
 
 #[cfg(target_os = "android")]

@@ -167,6 +167,17 @@ impl XrRenderer {
         if located && eye_views.len() >= 2 {
             self.last_fov = Some([eye_views[0].fov, eye_views[1].fov]);
         }
+        // The eye images' density maps for this frame's level -- the lever,
+        // with the A/B schedule's switch on top, exactly as `fx` below takes
+        // them -- before anything further down borrows the renderer. See
+        // `foveation`.
+        let foveation_phase = if crate::renderer::perf_ab::ENABLED || self.levers.ab_cycle {
+            crate::renderer::perf_ab::Phase::cycle_phase(self.perf_windows)
+        } else {
+            crate::renderer::perf_ab::Phase::Baseline
+        };
+        let foveation = self.levers.clone().with_phase(foveation_phase).foveation;
+        self.apply_foveation(foveation);
         // Where the headset really is, for the compositor when the head is
         // pinned: see `proj_views` below.
         let tracked_poses: Option<Vec<xr::Posef>> = located.then(|| eye_views.iter().map(|v| v.pose).collect());

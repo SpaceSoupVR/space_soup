@@ -49,6 +49,12 @@ pub struct VkContext {
     /// `device_from_raw`, which (in the SpaceSoupVR fork) trusts robust access
     /// only when its extension is among them.
     pub enabled_extensions: Vec<&'static std::ffi::CStr>,
+    /// Whether FIXED FOVEATED RENDERING can run: `VK_EXT_fragment_density_map`
+    /// enabled with `fragmentDensityMap` and
+    /// `fragmentDensityMapNonSubsampledImages` -- the second is what lets a
+    /// foveated pass draw straight into the OpenXR swapchain's ordinary
+    /// images. See `renderer::foveation`.
+    pub fragment_density_map: bool,
 }
 
 /// Whether to switch on the device's robust buffer and image access.
@@ -263,6 +269,46 @@ impl VkContext {
         };
         let capture_statistics =
             statistics_extension_available && system_property(PIPELINE_STATISTICS_PROPERTY) == "1";
+        // FIXED FOVEATED RENDERING: the density map extension and the two
+        // features it needs here, asked for only where the extension exists
+        // (a feature struct of an extension the device lacks is not valid to
+        // query). See `VkContext::fragment_density_map`.
+        let fdm_extension_available = unsafe {
+            vk_instance
+                .enumerate_device_extension_properties(physical_device)
+                .map(|exts| {
+                    exts.iter().any(|e| {
+                        std::ffi::CStr::from_ptr(e.extension_name.as_ptr()).to_bytes()
+                            == b"VK_EXT_fragment_density_map"
+                    })
+                })
+                .unwrap_or(false)
+        };
+        let mut fdm_query = vk::PhysicalDeviceFragmentDensityMapFeaturesEXT::default();
+        let mut fdm_props = vk::PhysicalDeviceFragmentDensityMapPropertiesEXT::default();
+        if fdm_extension_available {
+            unsafe {
+                let mut q = vk::PhysicalDeviceFeatures2::default().push_next(&mut fdm_query);
+                vk_instance.get_physical_device_features2(physical_device, &mut q);
+                let mut p = vk::PhysicalDeviceProperties2::default().push_next(&mut fdm_props);
+                vk_instance.get_physical_device_properties2(physical_device, &mut p);
+            }
+        }
+        let fdm_supported = fdm_extension_available
+            && fdm_query.fragment_density_map == vk::TRUE
+            && fdm_query.fragment_density_map_non_subsampled_images == vk::TRUE;
+        info!(
+            "vulkan: fragment density map: extension {}, map {}, dynamic {}, non-subsampled images {}, texel {}x{}..{}x{} -- {}",
+            fdm_extension_available,
+            fdm_query.fragment_density_map == vk::TRUE,
+            fdm_query.fragment_density_map_dynamic == vk::TRUE,
+            fdm_query.fragment_density_map_non_subsampled_images == vk::TRUE,
+            fdm_props.min_fragment_density_texel_size.width,
+            fdm_props.min_fragment_density_texel_size.height,
+            fdm_props.max_fragment_density_texel_size.width,
+            fdm_props.max_fragment_density_texel_size.height,
+            if fdm_supported { "ENABLING (fixed foveated rendering)" } else { "no foveation" },
+        );
         if capture_statistics {
             info!("vulkan: pipeline statistics ON -- every pipeline logs PIPESTATS");
         }
@@ -280,6 +326,9 @@ impl VkContext {
         }
         if capture_statistics {
             enabled_extensions.push(ash::khr::pipeline_executable_properties::NAME);
+        }
+        if fdm_supported {
+            enabled_extensions.push(ash::ext::fragment_density_map::NAME);
         }
         let extensions: Vec<*const std::ffi::c_char> = enabled_extensions.iter().map(|e| e.as_ptr()).collect();
 
@@ -311,6 +360,16 @@ impl VkContext {
             &mut statistics_enable as *mut _ as *mut std::ffi::c_void
         } else {
             &mut multiview_enable as *mut _ as *mut std::ffi::c_void
+        };
+        // The density map, when there is one, at the head of the chain.
+        let mut fdm_enable = vk::PhysicalDeviceFragmentDensityMapFeaturesEXT::default()
+            .fragment_density_map(true)
+            .fragment_density_map_non_subsampled_images(true);
+        fdm_enable.p_next = chain;
+        let chain: *mut std::ffi::c_void = if fdm_supported {
+            &mut fdm_enable as *mut _ as *mut std::ffi::c_void
+        } else {
+            chain
         };
         // `robustBufferAccess2` requires the core `robustBufferAccess` too.
         let core_features = vk::PhysicalDeviceFeatures::default().robust_buffer_access(robust_access);
@@ -371,6 +430,7 @@ impl VkContext {
             shader_f16: f16_supported,
             robust_access,
             enabled_extensions,
+            fragment_density_map: fdm_supported,
             timestamp_period_ns,
             instance: vk_instance,
             physical_device,

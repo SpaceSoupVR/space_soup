@@ -20,6 +20,22 @@ use std::collections::HashMap;
 mod render_frame;
 mod vulkan_interop;
 
+/// FIXED FOVEATED RENDERING's state: which density maps exist and which one
+/// the eye images point at. See `foveation` and [`XrRenderer::apply_foveation`].
+struct FoveationState {
+    eye_size: (u32, u32),
+    /// The half-resolution probe pass's targets, foveated the same way: its
+    /// reflections at the edges are read by fragments that cover several
+    /// pixels there anyway.
+    probe_size: (u32, u32),
+    /// Each level's maps, once made: both eyes' images, then both eyes' probe
+    /// pass targets.
+    maps: HashMap<crate::renderer::foveation::FoveationLevel, [usize; 4]>,
+    /// The level the eye targets point at; `None` until a frame has located
+    /// the views, since each eye's map is centred by its field of view.
+    applied: Option<crate::renderer::foveation::FoveationLevel>,
+}
+
 struct EyeTarget {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -306,6 +322,8 @@ pub struct XrRenderer {
     lights_uniform: LightsUniform,
     depth_view: wgpu::TextureView,
     eye_targets: Vec<[EyeTarget; 2]>,
+    /// Fixed foveated rendering, where the device has it. See `foveation`.
+    foveation: Option<FoveationState>,
     default_brush_lightmap: LoadedTexture,
     /// The level's brushes share ONE atlas, because they share one draw call.
     brush_lightmap: Option<LoadedTexture>,
@@ -634,6 +652,14 @@ impl XrRenderer {
         info!("XrRenderer: {} swapchain images", raw_images.len());
 
         let (wgpu_device, wgpu_queue) = unsafe { vulkan_interop::build_wgpu_from_vulkan(vk)? };
+        // FIXED FOVEATED RENDERING, before any pipeline exists: once on, every
+        // render pass carries a density map and every pipeline must be made
+        // compatible with that. See `foveation`.
+        let foveation = (vk.fragment_density_map && unsafe { vulkan_interop::enable_foveation(&wgpu_device) }).then(|| {
+            info!("foveation: available, {}x{} eye images", width, height);
+            let probe = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
+            FoveationState { eye_size: (width, height), probe_size: probe, maps: HashMap::new(), applied: None }
+        });
         // SAY SOMETHING WHEN THE GPU REFUSES SOMETHING.
         //
         // Without this a validation error goes nowhere: `create_render_pipeline`
@@ -1169,6 +1195,7 @@ impl XrRenderer {
             lights_uniform,
             depth_view,
             eye_targets,
+            foveation,
             default_brush_lightmap,
             brush_lightmap: None,
             cuboid_lightmaps: HashMap::new(),
@@ -2156,4 +2183,62 @@ impl XrRenderer {
     }
 
     pub fn cleanup(&self) {}
+}
+
+impl XrRenderer {
+    /// Point the eye images at `level`'s density maps, making them the first
+    /// time the level is asked for. Needs a frame that located the views:
+    /// each eye's map is centred where that eye looks straight ahead, which
+    /// its field of view says (`foveation::centre_of_view`).
+    fn apply_foveation(&mut self, level: crate::renderer::foveation::FoveationLevel) {
+        use crate::renderer::foveation::{centre_of_view, density_pattern, FoveationLevel};
+        let Some(state) = self.foveation.as_mut() else { return };
+        if state.applied == Some(level) {
+            return;
+        }
+        let Some(fov) = self.last_fov else { return };
+        let maps = if level == FoveationLevel::Off {
+            None
+        } else {
+            if !state.maps.contains_key(&level) {
+                let centres: Vec<(f32, f32)> =
+                    fov.iter().map(|f| centre_of_view(f.angle_left, f.angle_right, f.angle_up, f.angle_down)).collect();
+                let patterns: Vec<_> = [state.eye_size, state.probe_size]
+                    .iter()
+                    .flat_map(|&(w, h)| centres.iter().map(move |&c| density_pattern(w, h, c, level)))
+                    .collect();
+                // Written and waited for here, on the render thread, so no
+                // pass that reads them is recorded before they are ready.
+                match unsafe { vulkan_interop::add_foveation_maps(&self.wgpu_device, &patterns) } {
+                    Some(ids) if ids.len() == 4 => {
+                        state.maps.insert(level, [ids[0], ids[1], ids[2], ids[3]]);
+                    }
+                    _ => {
+                        // Not asked again every frame.
+                        state.applied = Some(level);
+                        return;
+                    }
+                }
+                let centres: Vec<String> = fov
+                    .iter()
+                    .map(|f| {
+                        let (x, y) = centre_of_view(f.angle_left, f.angle_right, f.angle_up, f.angle_down);
+                        format!("({x:.3}, {y:.3})")
+                    })
+                    .collect();
+                info!("foveation: {} maps {}x{} texels, centres {}", level.label(), patterns[0].0, patterns[0].1, centres.join(" "));
+            }
+            state.maps.get(&level).copied()
+        };
+        for targets in &self.eye_targets {
+            for (eye, target) in targets.iter().enumerate() {
+                unsafe { vulkan_interop::set_foveation_target(&self.wgpu_device, &target.view, maps.map(|m| m[eye])) };
+            }
+        }
+        for (eye, target) in self.probe_pass_targets.iter().enumerate() {
+            unsafe { vulkan_interop::set_foveation_target(&self.wgpu_device, &target.color_view, maps.map(|m| m[2 + eye])) };
+        }
+        state.applied = Some(level);
+        info!("foveation: {}", level.label());
+    }
 }

@@ -96,10 +96,13 @@ pub enum Phase {
     /// Reflections leaving the building see only the sky: the cost of tracing
     /// them over the ground (`ground_map::trace`).
     NoGroundTrace,
+    /// Every pixel of the eye images shaded: what fixed foveated rendering
+    /// saves.
+    NoFoveation,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 19] = [
+    pub const ALL: [Phase; 20] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -119,6 +122,7 @@ impl Phase {
         Phase::InlineReflectionLookups,
         Phase::TerrainPerPixelReflections,
         Phase::NoGroundTrace,
+        Phase::NoFoveation,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -161,6 +165,7 @@ impl Phase {
             Phase::InlineReflectionLookups => "inline_reflection_lookups",
             Phase::TerrainPerPixelReflections => "terrain_per_pixel_reflections",
             Phase::NoGroundTrace => "no_ground_trace",
+            Phase::NoFoveation => "no_foveation",
         }
     }
 }
