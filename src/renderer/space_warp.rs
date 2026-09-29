@@ -284,6 +284,8 @@ pub struct MotionDraw<'a> {
     pub kind: MotionKind,
     pub vertices: &'a wgpu::Buffer,
     pub indices: &'a wgpu::Buffer,
+    /// The first index and how many, of `indices`.
+    pub first: u32,
     pub count: u32,
     pub slot: u32,
     pub joints: Option<&'a wgpu::BindGroup>,
@@ -324,7 +326,7 @@ pub fn record(
         }
         pass.set_vertex_buffer(0, d.vertices.slice(..));
         pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..d.count, 0, 0..1);
+        pass.draw_indexed(d.first..d.first + d.count, 0, 0..1);
     }
 }
 
