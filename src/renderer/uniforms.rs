@@ -113,6 +113,12 @@ pub struct Uniforms {
     ///
     /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
     pub probe_rooms: [[f32; 4]; ROOM_TABLE_ROWS],
+    /// Where the ground map lies: `[min.x, min.z, 1 / extent.x, 1 / extent.z]`.
+    /// Its top rides in `sky_params.z` and its presence in `sky_params.w`. See
+    /// [`ProbeUpload::ground`].
+    ///
+    /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
+    pub ground_params: [f32; 4],
 }
 
 /// How many boxes standing inside rooms -- a pillar, a hanging lamp -- the
@@ -264,6 +270,9 @@ pub struct UniformBuffer {
     /// references; see [`Self::set_probe_depth`].
     probe_depth_view: TextureView,
     probe_depth_sampler: Sampler,
+    /// The ground seen from above, bound at 10. A single unread texel until a
+    /// level with terrain loads. See `ground_map` and [`Self::set_ground_map`].
+    ground_view: TextureView,
 }
 
 impl UniformBuffer {
@@ -276,8 +285,19 @@ impl UniformBuffer {
         self.probe_depth_view = view;
     }
 
+    /// Bind this ground map from the next [`Self::rebind_probes`] on. Where it
+    /// lies travels in [`ProbeUpload::ground`].
+    pub fn set_ground_map(&mut self, view: TextureView) {
+        self.ground_view = view;
+    }
+
     pub fn set_probes(&mut self, probes: ProbeUpload) {
         self.probes = probes;
+    }
+
+    /// The probes the last [`Self::rebind_probes`] or [`Self::set_probes`] set.
+    pub fn probes(&self) -> ProbeUpload {
+        self.probes
     }
 }
 
@@ -434,9 +454,21 @@ impl UniformBuffer {
                     ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
                 },
+                // The ground seen from above. See `ground_map`.
+                BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let (probe_depth_view, probe_depth_sampler) = default_probe_depth(device);
+        let ground_view = default_ground_map(device);
 
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("uniform_bg"),
@@ -476,6 +508,7 @@ impl UniformBuffer {
                 },
                 BindGroupEntry { binding: 8, resource: BindingResource::TextureView(&probe_depth_view) },
                 BindGroupEntry { binding: 9, resource: BindingResource::Sampler(&probe_depth_sampler) },
+                BindGroupEntry { binding: 10, resource: BindingResource::TextureView(&ground_view) },
             ],
         });
 
@@ -486,6 +519,7 @@ impl UniformBuffer {
             probes: ProbeUpload::default(),
             probe_depth_view,
             probe_depth_sampler,
+            ground_view,
         }
     }
 
@@ -610,7 +644,15 @@ impl UniformBuffer {
                 if shadow.sun_dynamic_enabled { 1.0 } else { 0.0 },
                 0.0,
             ],
-            sky_params: [sky.intensity, 0.0, 0.0, 0.0],
+            // y: the sky's cube layer for reflections PLUS ONE, z: the ground's
+            // top, w: 1 when there is a ground map. Zero means none in every
+            // lane, so a zeroed uniform claims no sky layer and no ground.
+            sky_params: [
+                sky.intensity,
+                dense.sky_layer + 1.0,
+                dense.ground_top,
+                if dense.ground_top > NO_GROUND { 1.0 } else { 0.0 },
+            ],
             sky_sh: sky.sh,
             player_frame: [player.offset.x, player.offset.y, player.offset.z, player.yaw],
             // From the buffer's own state rather than an argument: probe boxes
@@ -625,11 +667,19 @@ impl UniformBuffer {
                 [probes.count as f32, g[0], g[1], g[2]]
             },
             probe_boxes: dense.boxes,
-            portal_params: [probes.portal_count as f32, if probes.no_trace { 1.0 } else { 0.0 }, 0.0, 0.0],
+            // z: the outdoor volume's room number PLUS ONE, 0 for none -- so a
+            // zeroed uniform does not make room 0 the outdoors. See `ProbeUpload`.
+            portal_params: [
+                probes.portal_count as f32,
+                if probes.no_trace { 1.0 } else { 0.0 },
+                dense.outdoor_volume + 1.0,
+                0.0,
+            ],
             probe_portals: dense.portals,
             proxy_params: [probes.proxy_count as f32, 0.0, 0.0, 0.0],
             probe_proxies: dense.proxies,
             probe_rooms: room_tables,
+            ground_params: dense.ground,
             post_params: [
                 post.exposure,
                 match post.tonemap {
@@ -840,7 +890,24 @@ pub struct ProbeUpload {
     /// `[half_size.xyz, bounds-only]`, `[rotation xyzw]`. Named by VOLUME like the
     /// portals, so it means the same thing whichever cells are resident.
     pub proxies: [[[f32; 4]; 3]; MAX_PROXIES],
+    /// THE OUTDOOR VOLUME, by volume id like the portals, or -1: the one whose
+    /// photograph has no depth, because its box stands in for the sky dome and
+    /// has no walls. A reflection starting in it is traced against the ground
+    /// and the sky instead of its box. See `outdoor_radiance` in the shader.
+    pub outdoor_volume: f32,
+    /// THE SKY FOR REFLECTIONS: the cube layer holding the panorama without its
+    /// sun, or -1 where none was built -- the sky's harmonics answer then.
+    pub sky_layer: f32,
+    /// THE GROUND MAP'S PLACE: `[min.x, min.z, 1 / extent.x, 1 / extent.z]` in
+    /// world metres, and the highest the ground rises -- [`NO_GROUND`] when the
+    /// level has no ground map. See `ground_map`.
+    pub ground: [f32; 4],
+    pub ground_top: f32,
 }
+
+/// `ProbeUpload::ground_top` for a level with no ground map: no ray is ever
+/// above it, so the shader's march never starts.
+pub const NO_GROUND: f32 = -1.0e30;
 
 /// One box standing inside a room, for the reflection trace: the rooms' own
 /// boxes are its walls, floors and ceilings, and a proxy is everything else
@@ -905,6 +972,16 @@ impl ProbeUpload {
 
     /// Fill the proxy list with at most [`MAX_PROXIES`] of `proxies`, nearest
     /// to `player` first, keeping only those standing in one of `volumes`.
+    /// The level's outdoors, carried every frame: which volume is outdoors, the
+    /// sky's cube layer, and where the ground map lies. See the fields.
+    pub fn set_outdoors(&mut self, outdoor_volume: Option<u32>, sky_layer: Option<u32>, ground: Option<([f32; 4], f32)>) {
+        self.outdoor_volume = outdoor_volume.map_or(-1.0, |v| v as f32);
+        self.sky_layer = sky_layer.map_or(-1.0, |l| l as f32);
+        let (g, top) = ground.unwrap_or(([0.0; 4], NO_GROUND));
+        self.ground = g;
+        self.ground_top = top;
+    }
+
     pub fn set_proxies(&mut self, proxies: &[ProbeProxy], player: Vec3, volumes: &[u32]) {
         let mut near: Vec<(f32, &ProbeProxy)> = proxies
             .iter()
@@ -1053,6 +1130,13 @@ impl ProbeUpload {
                 last_portal[room] = Some(p);
             }
         }
+        // The outdoor volume, as a room number like every other: -1 when it has
+        // no photograph resident, and then nothing is traced as outdoors.
+        out.outdoor_volume = if self.outdoor_volume < 0.0 {
+            -1.0
+        } else {
+            renumber(self.outdoor_volume).map_or(-1.0, |r| r as f32)
+        };
         let mut last_proxy: Vec<Option<usize>> = vec![None; rooms.len()];
         for i in 0..(self.proxy_count as usize).min(MAX_PROXIES) {
             let room = renumber(self.proxies[i][0][3]);
@@ -1087,6 +1171,10 @@ impl Default for ProbeUpload {
             no_trace: false,
             proxy_count: 0,
             proxies: [[[0.0; 4]; 3]; MAX_PROXIES],
+            outdoor_volume: -1.0,
+            sky_layer: -1.0,
+            ground: [0.0; 4],
+            ground_top: NO_GROUND,
         }
     }
 }
@@ -1132,6 +1220,24 @@ pub fn default_probe_cube(device: &Device) -> (TextureView, Sampler) {
 /// A one-texel, all-zero distance cube array and the NEAREST sampler every
 /// probe-distance read uses. Zero is "no distance baked", which the shader
 /// answers with the box projection it has always used.
+/// The ground map a level without terrain binds: one texel, never read -- the
+/// shader is told there is no ground by [`NO_GROUND`]. Zero-initialised by
+/// wgpu, so it needs no queue.
+pub fn default_ground_map(device: &Device) -> TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("default_ground_map"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 pub fn default_probe_depth(device: &Device) -> (TextureView, Sampler) {
     let tex = device.create_texture(&probe_depth_descriptor(1, 1));
     let view = tex.create_view(&wgpu::TextureViewDescriptor {
@@ -1522,6 +1628,7 @@ impl UniformBuffer {
                 },
                 BindGroupEntry { binding: 8, resource: BindingResource::TextureView(&self.probe_depth_view) },
                 BindGroupEntry { binding: 9, resource: BindingResource::Sampler(&self.probe_depth_sampler) },
+                BindGroupEntry { binding: 10, resource: BindingResource::TextureView(&self.ground_view) },
             ],
         });
         self.probes = probes;
