@@ -1702,8 +1702,19 @@ impl XrRenderer {
         );
     }
 
-    pub fn set_mesh_lightmap(&mut self, key: &str, light: crate::renderer::mesh::LightmapLight, width: u32, height: u32) {
-        let tex = crate::renderer::mesh::create_lightmap_texture_with_sun(
+    /// A mesh's baked light, and its stationary lamps' shadow masks on the
+    /// same atlas -- one RGBA8 image per two lamps, all `stationary_size`; empty
+    /// binds the neutral mask, under which every stationary lamp is unshadowed.
+    pub fn set_mesh_lightmap(
+        &mut self,
+        key: &str,
+        light: crate::renderer::mesh::LightmapLight,
+        width: u32,
+        height: u32,
+        stationary: &[&[u8]],
+        stationary_size: (u32, u32),
+    ) {
+        let tex = crate::renderer::mesh::create_lightmap_texture_full(
             &self.wgpu_device,
             &self.wgpu_queue,
             &self.mesh_pipeline.lightmap_layout,
@@ -1712,6 +1723,7 @@ impl XrRenderer {
             height,
             None,
             None,
+            (!stationary.is_empty()).then_some((stationary, stationary_size.0, stationary_size.1)),
         );
         self.mesh_lightmaps.insert(key.to_string(), tex);
     }
