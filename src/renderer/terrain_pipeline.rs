@@ -212,6 +212,12 @@ impl TerrainPipeline {
             immediate_size: 0,
         });
 
+        // In the probe pass, both of its targets; the reach is left as the
+        // brushes wrote it. See `probe_pass::targets`.
+        let probe_targets = crate::renderer::brush_pipeline::probe_pass::targets(false);
+        let scene_target = [Some(ColorTargetState { format, blend: Some(BlendState::ALPHA_BLENDING), write_mask: ColorWrites::ALL })];
+        let targets: &[Option<ColorTargetState>] =
+            if role == TerrainRole::ProbePass { &probe_targets } else { &scene_target };
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some(match role {
                 TerrainRole::Scene => "terrain_pipeline",
@@ -231,12 +237,8 @@ impl TerrainPipeline {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState {
-                    format,
-                    // The probe pass stores a reflection, not a colour to blend.
-                    blend: if role == TerrainRole::ProbePass { None } else { Some(BlendState::ALPHA_BLENDING) },
-                    write_mask: ColorWrites::ALL,
-                })],
+                // The probe pass stores a reflection, not a colour to blend.
+                targets,
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,

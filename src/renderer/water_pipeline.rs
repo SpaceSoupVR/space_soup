@@ -550,7 +550,7 @@ mod tests {
             3.0,
             u,
             OVERHEAD,
-            PlayerUpload { offset: glam::Vec3::new(101.3, 0.0, 57.7), yaw: 0.0 },
+            PlayerUpload { offset: glam::Vec3::new(101.3, 0.0, 57.7), yaw: 0.0, ..Default::default() },
         )
         .unwrap();
 

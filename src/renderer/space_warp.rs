@@ -22,6 +22,23 @@
 //! its previous joint palette (`GltfSkin::prev_joint_buffer`), skinned twice
 //! in the vertex shader. Not yet: layered meshes (caves) and effects.
 //!
+//! # Reflections
+//!
+//! A reflection is not painted on the surface that shows it: in a mirror the
+//! room behind you is an image as far behind the glass as the room is in
+//! front of it, and it moves as that far-off point would. Moved with the wall,
+//! every reflection sat still on the wall for the synthesised frame and
+//! jumped on the next rendered one -- jitter on every polished floor and wall,
+//! and a doubled image while walking (headset, 2026-09-29).
+//!
+//! So the brushes are drawn with [`MotionKind::BrushReflect`] when the frame
+//! allows it: each pixel moves as a point along its view ray, beyond the
+//! surface by as much as the pixel's reflected image counts
+//! ([`reflection_motion_weight`], read from the eye image's alpha,
+//! `lights::reflection_alpha`) of how far the reflection reached (read from
+//! the probe pass, `probe_pass::REACH_FORMAT`). See [`reflected_point`]. The
+//! depth stays the surface's.
+//!
 //! # Conventions
 //!
 //! The vectors are in normalised device coordinates with y UP -- wgpu's own
@@ -55,6 +72,45 @@ pub struct MotionCamera {
     /// docs; -1 only to diagnose); y = a scale on the whole vector (1; 0 only
     /// to diagnose). zw unused.
     pub params: [f32; 4],
+    /// The eye, in the space the draw's vertices are in, for
+    /// [`MotionKind::BrushReflect`]. w unused.
+    pub eye: [f32; 4],
+    /// For [`MotionKind::BrushReflect`]: x, y = eye-image pixels per motion
+    /// pixel along each axis; z = 1 to move reflected images with what they
+    /// show, 0 to move every pixel with its surface; w = 1 to write, instead
+    /// of motion, what it read -- the reflected share, the reach in metres and
+    /// the distance ratio (DIAGNOSIS ONLY, `space_warp_debug` 32768).
+    pub reflect: [f32; 4],
+}
+
+/// The farthest a pixel's content is taken to be, in metres: the sky's
+/// reflection (`lights::PROBE_REACH_SKY`) moves as a point this far away.
+pub const MAX_REFLECTED_DISTANCE: f32 = 10000.0;
+
+/// HOW MUCH MORE CONTRAST A REFLECTED IMAGE CARRIES than the polished surface
+/// showing it: a room or a sky reflected varies by about half its brightness
+/// from place to place, lit wall to dark corner, doorway to frame; polished
+/// marble's own pattern by about a tenth (Marble020's colour map: 0.08 over a
+/// few texels, 0.11 over the whole). See [`reflection_motion_weight`].
+pub const REFLECTION_CONTRAST_RATIO: f32 = 5.0;
+
+/// HOW MUCH A PIXEL'S REFLECTED IMAGE COUNTS IN ITS MOTION, from its share of
+/// the pixel's brightness (`lights::reflected_image` over the whole).
+///
+/// One vector moves both layers, so one of them is always left behind by
+/// some of the difference between their motions. What shows is a layer's
+/// CONTRAST moved to the wrong place: weighting each layer's error by its
+/// contrast and minimising the sum of squares gives
+/// `(k s)^2 / ((k s)^2 + (1 - s)^2)`, with `s` the share and `k`
+/// [`REFLECTION_CONTRAST_RATIO`]. Weighting by brightness alone gave the
+/// doorway's reflection on the marble floor a fifth of the correction -- the
+/// sky there is a fifth of the pixel's light and nearly all of its detail
+/// (headset, 2026-09-29).
+pub fn reflection_motion_weight(share: f32) -> f32 {
+    let s = share.clamp(0.0, 1.0);
+    let image = REFLECTION_CONTRAST_RATIO * s;
+    let surface = 1.0 - s;
+    image * image / (image * image + surface * surface).max(1e-12)
 }
 
 /// Bytes between two draws' slots in the ring of [`MotionCamera`]s: the
@@ -75,6 +131,8 @@ struct MotionCamera {{
     curr: mat4x4<f32>,
     prev: mat4x4<f32>,
     params: vec4<f32>,
+    eye: vec4<f32>,
+    reflect: vec4<f32>,
 }}
 @group(0) @binding(0) var<uniform> cam: MotionCamera;
 
@@ -116,21 +174,112 @@ struct VOut {{
     return out;
 }}
 
-@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
+fn motion_of(curr: vec4<f32>, prev: vec4<f32>) -> vec4<f32> {{
     // A point behind the previous frame's eye had no place on its screen:
     // no motion is the least wrong answer, where dividing by a w near 0
     // would write infinities for the compositor to sample.
-    if (in.prev.w <= {min_w}) {{
+    if (prev.w <= {min_w}) {{
         return vec4<f32>(0.0);
     }}
-    let d = clamp(in.curr.xyz / in.curr.w - in.prev.xyz / in.prev.w, vec3<f32>(-{max_d}), vec3<f32>({max_d}));
+    let d = clamp(curr.xyz / curr.w - prev.xyz / prev.w, vec3<f32>(-{max_d}), vec3<f32>({max_d}));
     return vec4<f32>(d.x, d.y * cam.params.x, d.z, 0.0) * cam.params.y;
+}}
+
+@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
+    return motion_of(in.curr, in.prev);
+}}
+
+// REFLECTIONS: the brushes again, each pixel moved as what it shows. See the
+// module docs and `reflected_point`, which this is held to.
+@group(1) @binding(0) var eye_image: texture_2d<f32>;
+@group(1) @binding(1) var reach_image: texture_2d<f32>;
+
+struct VOutReflect {{
+    @builtin(position) clip: vec4<f32>,
+    @location(0) pos: vec3<f32>,
+}}
+
+@vertex fn vs_reflect(@location(0) pos: vec3<f32>) -> VOutReflect {{
+    var out: VOutReflect;
+    out.clip = cam.curr * vec4<f32>(pos, 1.0);
+    out.pos = pos;
+    return out;
+}}
+
+// What one eye-image pixel at `texel` says: how much its reflected image
+// counts in its motion (`lights::reflection_alpha`) and how far that image's
+// ray reached. The probe pass is half the eye image each way.
+fn reflect_inputs(texel: vec2<f32>) -> vec2<f32> {{
+    let size = vec2<i32>(textureDimensions(eye_image));
+    let e = clamp(vec2<i32>(texel), vec2<i32>(0), size - vec2<i32>(1));
+    let weight = clamp(1.0 - textureLoad(eye_image, e, 0).a, 0.0, 1.0);
+    let reach_size = vec2<i32>(textureDimensions(reach_image));
+    let r = clamp(e / 2, vec2<i32>(0), reach_size - vec2<i32>(1));
+    return vec2<f32>(weight, max(textureLoad(reach_image, r, 0).r, 0.0));
+}}
+
+// The ratio of a surface point's distance `d` from the eye to the distance
+// its pixel's content moves as: 1 for the surface, less as the image counts
+// for more and reaches further.
+
+fn reflect_ratio(texel: vec2<f32>, d: f32) -> f32 {{
+    let i = reflect_inputs(texel);
+    return 1.0 - i.x * i.y / (d + i.y);
+}}
+
+@fragment fn fs_reflect(in: VOutReflect) -> @location(0) vec4<f32> {{
+    var p = in.pos;
+    if (cam.reflect.z > 0.5) {{
+        let to = in.pos - cam.eye.xyz;
+        let d = max(length(to), 1e-3);
+        // FOUR of the eye pixels under this motion pixel, one in each
+        // quarter of its block: a highlight a few pixels wide still counts.
+        // Averaged as ratios -- inverse distances -- which is averaging the
+        // motions they make.
+        let base = floor(in.clip.xy);
+        let s = cam.reflect.xy;
+        let ratio = 0.25 * (
+            reflect_ratio((base + vec2<f32>(0.25, 0.25)) * s, d)
+            + reflect_ratio((base + vec2<f32>(0.75, 0.25)) * s, d)
+            + reflect_ratio((base + vec2<f32>(0.25, 0.75)) * s, d)
+            + reflect_ratio((base + vec2<f32>(0.75, 0.75)) * s, d)
+        );
+        p = cam.eye.xyz + to / max(ratio, d / {max_reflected});
+        if (cam.reflect.w > 0.5) {{
+            let seen = reflect_inputs((base + vec2<f32>(0.5)) * s);
+            return vec4<f32>(seen.x, seen.y, ratio, 1.0);
+        }}
+    }}
+    return motion_of(cam.curr * vec4<f32>(p, 1.0), cam.prev * vec4<f32>(p, 1.0));
 }}
 "#,
         joints = crate::renderer::mesh::MAX_SKIN_JOINTS,
         min_w = format!("{:?}", MIN_PREV_W),
         max_d = format!("{:?}", MAX_NDC_MOTION),
+        max_reflected = format!("{:?}", MAX_REFLECTED_DISTANCE),
     )
+}
+
+/// WHERE A PIXEL'S CONTENT IS, for its motion: the CPU reference the shader's
+/// `fs_reflect` is held to.
+///
+/// `p` is the surface the eye at `eye` sees; `weight` how much the pixel's
+/// reflected image counts in its motion ([`reflection_motion_weight`], read
+/// back from the eye image's alpha), `reach` how far past the surface the
+/// reflected ray went to what the image shows. A planar mirror's image of
+/// that thing is on the view ray, `reach` beyond `p` -- which moves on screen
+/// exactly as the thing's reflection does.
+///
+/// A pixel that is part surface and part image has one motion for both. Moving
+/// the eye moves a point on screen by an amount that goes as one over its
+/// distance, so blending the two layers' inverse distances by `weight`
+/// blends their motions by it.
+pub fn reflected_point(eye: glam::Vec3, p: glam::Vec3, weight: f32, reach: f32) -> glam::Vec3 {
+    let to = p - eye;
+    let d = to.length().max(1e-3);
+    let reach = reach.max(0.0);
+    let ratio = 1.0 - weight.clamp(0.0, 1.0) * reach / (d + reach);
+    eye + to / ratio.max(d / MAX_REFLECTED_DISTANCE)
 }
 
 /// Below this previous clip w a point counts as having been behind the eye.
@@ -187,6 +336,10 @@ pub fn app_space_delta(prev_world_to_player: Mat4, world_to_player: Mat4) -> xr:
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MotionKind {
     Brush,
+    /// The brushes, moving reflected images with what they show: group 1 is
+    /// the eye image and the probe pass's reach (`reflect_layout`). See the
+    /// module docs.
+    BrushReflect,
     Solid,
     Mesh,
     Skinned,
@@ -198,7 +351,11 @@ pub enum MotionKind {
 pub struct MotionPipelines {
     pub camera_layout: wgpu::BindGroupLayout,
     pub joints_layout: wgpu::BindGroupLayout,
+    /// Group 1 of [`MotionKind::BrushReflect`]: the eye image this frame's
+    /// scene pass drew, and the probe pass's reach, each one eye's.
+    pub reflect_layout: wgpu::BindGroupLayout,
     brush: wgpu::RenderPipeline,
+    brush_reflect: wgpu::RenderPipeline,
     solid: wgpu::RenderPipeline,
     mesh: wgpu::RenderPipeline,
     skinned: wgpu::RenderPipeline,
@@ -246,11 +403,30 @@ impl MotionPipelines {
             bind_group_layouts: &[Some(&camera_layout), Some(&joints_layout)],
             immediate_size: 0,
         });
+        let image_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let reflect_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("space_warp_reflect"),
+            entries: &[image_entry(0), image_entry(1)],
+        });
+        let reflect_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("space_warp_reflect"),
+            bind_group_layouts: &[Some(&camera_layout), Some(&reflect_layout)],
+            immediate_size: 0,
+        });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("space_warp"),
             source: wgpu::ShaderSource::Wgsl(shader().into()),
         });
-        let make = |label: &str, layout: &wgpu::PipelineLayout, entry: &str, stride: u64, attributes: &[wgpu::VertexAttribute]| {
+        let make = |label: &str, layout: &wgpu::PipelineLayout, (entry, fragment): (&str, &str), stride: u64, attributes: &[wgpu::VertexAttribute]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
@@ -280,7 +456,7 @@ impl MotionPipelines {
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(fragment),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: MOTION_FORMAT,
@@ -294,9 +470,12 @@ impl MotionPipelines {
         };
         let position = [wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 }];
         let size = |n: usize| n as u64;
-        let brush = make("space_warp_brush", &plain_layout, "vs_main", size(std::mem::size_of::<crate::renderer::brush_pipeline::BrushVertex>()), &position);
-        let solid = make("space_warp_solid", &plain_layout, "vs_main", size(std::mem::size_of::<crate::renderer::cuboid::SolidVertex>()), &position);
-        let mesh = make("space_warp_mesh", &plain_layout, "vs_main", size(std::mem::size_of::<crate::renderer::mesh::MeshVertex>()), &position);
+        let plain = ("vs_main", "fs_main");
+        let brush_stride = size(std::mem::size_of::<crate::renderer::brush_pipeline::BrushVertex>());
+        let brush = make("space_warp_brush", &plain_layout, plain, brush_stride, &position);
+        let brush_reflect = make("space_warp_brush_reflect", &reflect_pipeline_layout, ("vs_reflect", "fs_reflect"), brush_stride, &position);
+        let solid = make("space_warp_solid", &plain_layout, plain, size(std::mem::size_of::<crate::renderer::cuboid::SolidVertex>()), &position);
+        let mesh = make("space_warp_mesh", &plain_layout, plain, size(std::mem::size_of::<crate::renderer::mesh::MeshVertex>()), &position);
         let skinned_attributes = [
             wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
             wgpu::VertexAttribute {
@@ -313,16 +492,41 @@ impl MotionPipelines {
         let skinned = make(
             "space_warp_skinned",
             &skinned_layout,
-            "vs_skinned",
+            ("vs_skinned", "fs_main"),
             size(std::mem::size_of::<crate::renderer::mesh::SkinnedMeshVertex>()),
             &skinned_attributes,
         );
-        Self { camera_layout, joints_layout, brush, solid, mesh, skinned, stencil: depth_format.has_stencil_aspect() }
+        Self {
+            camera_layout,
+            joints_layout,
+            reflect_layout,
+            brush,
+            brush_reflect,
+            solid,
+            mesh,
+            skinned,
+            stencil: depth_format.has_stencil_aspect(),
+        }
+    }
+
+    /// Group 1 of [`MotionKind::BrushReflect`] for one eye: `eye_image`, a
+    /// single-layer view of what the scene pass drew, and `reach`, the probe
+    /// pass's reach target for the same eye.
+    pub fn reflect_bind_group(&self, device: &wgpu::Device, eye_image: &wgpu::TextureView, reach: &wgpu::TextureView) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("space_warp_reflect"),
+            layout: &self.reflect_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(eye_image) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(reach) },
+            ],
+        })
     }
 
     fn pipeline(&self, kind: MotionKind) -> &wgpu::RenderPipeline {
         match kind {
             MotionKind::Brush => &self.brush,
+            MotionKind::BrushReflect => &self.brush_reflect,
             MotionKind::Solid => &self.solid,
             MotionKind::Mesh => &self.mesh,
             MotionKind::Skinned => &self.skinned,
@@ -331,7 +535,8 @@ impl MotionPipelines {
 }
 
 /// One draw of the motion pass: its geometry, the ring slot of its two
-/// cameras, and -- skinned -- its joints.
+/// cameras, and its group 1 -- a skinned mesh's joints, or the brushes'
+/// reflection inputs (`MotionPipelines::reflect_bind_group`).
 pub struct MotionDraw<'a> {
     pub kind: MotionKind,
     pub vertices: &'a wgpu::Buffer,
@@ -375,7 +580,7 @@ pub fn record(
         ..Default::default()
     });
     for d in draws.iter().filter(|d| d.count > 0 && d.slot < MAX_SLOTS) {
-        if d.kind == MotionKind::Skinned && d.joints.is_none() {
+        if matches!(d.kind, MotionKind::Skinned | MotionKind::BrushReflect) && d.joints.is_none() {
             continue;
         }
         pass.set_pipeline(pipelines.pipeline(d.kind));
@@ -511,6 +716,256 @@ mod tests {
         assert!(r.angle_between(Quat::IDENTITY) < 1e-5 && t.length() < 1e-5, "{r} {t}");
     }
 
+    /// A floor mirror: the image of a point it reflects lies on the view ray,
+    /// as far below the floor as the point is above it -- and that image, not
+    /// the floor, is what the reflection moves as.
+    #[test]
+    fn a_reflection_moves_as_the_image_of_what_it_shows() {
+        let eye = Vec3::new(0.0, 1.6, 0.0);
+        let thing = Vec3::new(0.5, 1.0, -6.0);
+        let image = Vec3::new(thing.x, -thing.y, thing.z);
+        // Where the floor (y = 0) shows it: the view ray to the image.
+        let p = eye + (image - eye) * (eye.y / (eye.y - image.y));
+        let v = reflected_point(eye, p, 1.0, (thing - p).length());
+        assert!((v - image).length() < 1e-4, "{v} vs {image}");
+        // Stepping 5 cm right, from where the frame was drawn: the reflection
+        // moves exactly as the image does, and measurably unlike the floor.
+        let prev = view_proj(eye - Vec3::new(0.05, 0.0, 0.0), 0.0);
+        let curr = view_proj(eye, 0.0);
+        let truth = motion_vector(curr, prev, image);
+        let moved = motion_vector(curr, prev, v);
+        let with_floor = motion_vector(curr, prev, p);
+        assert!((moved - truth).truncate().length() < 1e-5, "{moved} vs {truth}");
+        assert!((with_floor - truth).truncate().length() > 0.002, "the floor alone was right: {with_floor} vs {truth}");
+    }
+
+    /// The image's weight in a pixel's motion: none without a reflection, all
+    /// of it for a mirror, rising steadily between -- and already most of it
+    /// where a sky is a fifth of the light on polished marble, as the doorway's
+    /// reflection on the floor measured (headset, 2026-09-29).
+    #[test]
+    fn a_reflection_counts_by_its_contrast_not_its_brightness() {
+        assert_eq!(reflection_motion_weight(0.0), 0.0);
+        assert!((reflection_motion_weight(1.0) - 1.0).abs() < 1e-6);
+        let mut last = 0.0;
+        for i in 1..=100 {
+            let w = reflection_motion_weight(i as f32 / 100.0);
+            assert!(w > last, "not rising at {i}%: {w} after {last}");
+            last = w;
+        }
+        let at_a_fifth = reflection_motion_weight(0.2);
+        assert!(at_a_fifth > 0.55 && at_a_fifth < 0.7, "{at_a_fifth}");
+        assert!(reflection_motion_weight(0.05) < 0.1, "a faint reflection took over its surface");
+    }
+
+    /// No reflected share, or a reflection that reaches nowhere: the surface.
+    /// And the sky's reach is far but finite.
+    #[test]
+    fn a_pixel_with_no_reflection_moves_with_its_surface() {
+        let eye = Vec3::new(0.0, 1.6, 0.0);
+        let p = Vec3::new(1.0, 0.0, -4.0);
+        assert!((reflected_point(eye, p, 0.0, 30.0) - p).length() < 1e-5);
+        assert!((reflected_point(eye, p, 1.0, 0.0) - p).length() < 1e-5);
+        let sky = reflected_point(eye, p, 1.0, 1e30);
+        assert!(sky.is_finite() && ((sky - eye).length() - MAX_REFLECTED_DISTANCE).abs() < 1.0, "{sky}");
+    }
+
+    /// Half image, half surface: exactly halfway between the two layers'
+    /// motions on screen, because a step of the eye moves a point by one over
+    /// its distance and the blend is of inverse distances.
+    #[test]
+    fn a_half_reflected_pixel_moves_between_its_two_layers() {
+        let eye = Vec3::new(0.0, 1.6, 0.0);
+        let p = Vec3::new(0.3, 0.0, -3.0);
+        let prev = view_proj(eye - Vec3::new(0.02, 0.0, 0.0), 0.0);
+        let curr = view_proj(eye, 0.0);
+        let surface = motion_vector(curr, prev, p).truncate();
+        let image = motion_vector(curr, prev, reflected_point(eye, p, 1.0, 5.0)).truncate();
+        let half = motion_vector(curr, prev, reflected_point(eye, p, 0.5, 5.0)).truncate();
+        let mid = (surface + image) * 0.5;
+        assert!((half - mid).length() < 1e-4 * (surface - image).length().max(1e-3), "{half} vs {mid}");
+        assert!((surface - image).length() > 1e-3, "the two layers moved alike: {surface} {image}");
+    }
+
+    /// The shader moves a reflection as the CPU reference does: a wall 3 m
+    /// ahead, every pixel half an image 8 m beyond it, the eye stepping right
+    /// -- and with the switch off, as the wall.
+    #[test]
+    fn the_shader_moves_reflections_as_the_reference_does() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        use wgpu::util::DeviceExt;
+        const W: u32 = 64;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipelines = MotionPipelines::new(&device, wgpu::TextureFormat::Depth32Float);
+        let eye = Vec3::new(0.0, 1.6, 0.0);
+        let prev = view_proj(eye - Vec3::new(0.05, 0.0, 0.0), 0.0);
+        let curr = view_proj(eye, 0.0);
+
+        // The eye image, four times the motion size, alpha 128: a share of
+        // 127/255. The reach, half the eye image, 8 m everywhere.
+        let texture = |label, size: u32, format, bytes: &[u8]| {
+            device
+                .create_texture_with_data(
+                    &queue,
+                    &wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    bytes,
+                )
+                .create_view(&Default::default())
+        };
+        let eye_bytes: Vec<u8> = (0..(4 * W) * (4 * W)).flat_map(|_| [0u8, 0, 0, 128]).collect();
+        let eye_view = texture("eye", 4 * W, wgpu::TextureFormat::Rgba8UnormSrgb, &eye_bytes);
+        let reach_bytes: Vec<u8> = (0..(2 * W) * (2 * W)).flat_map(|_| 0x4800u16.to_le_bytes()).collect();
+        let reach_view = texture("reach", 2 * W, crate::renderer::brush_pipeline::probe_pass::REACH_FORMAT, &reach_bytes);
+        let reflect = pipelines.reflect_bind_group(&device, &eye_view, &reach_view);
+
+        // Two slots: reflections on, then off.
+        let mut ring = vec![0u8; 2 * SLOT_STRIDE as usize];
+        for (slot, on) in [(0usize, 1.0f32), (1, 0.0)] {
+            let cam = MotionCamera {
+                curr: curr.to_cols_array_2d(),
+                prev: prev.to_cols_array_2d(),
+                params: [1.0, 1.0, 0.0, 0.0],
+                eye: [eye.x, eye.y, eye.z, 1.0],
+                reflect: [4.0, 4.0, on, 0.0],
+            };
+            let at = slot * SLOT_STRIDE as usize;
+            ring[at..at + std::mem::size_of::<MotionCamera>()].copy_from_slice(bytemuck::bytes_of(&cam));
+        }
+        let ring = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ring"),
+            contents: &ring,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let cameras = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cameras"),
+            layout: &pipelines.camera_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &ring,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(std::mem::size_of::<MotionCamera>() as u64),
+                }),
+            }],
+        });
+
+        // The wall: a quad at z = -3 over the whole view, as brush vertices.
+        let stride = std::mem::size_of::<crate::renderer::brush_pipeline::BrushVertex>();
+        let mut vertices = vec![0u8; 4 * stride];
+        for (i, (x, y)) in [(-10.0f32, -10.0f32), (10.0, -10.0), (10.0, 12.0), (-10.0, 12.0)].iter().enumerate() {
+            vertices[i * stride..i * stride + 12].copy_from_slice(bytemuck::cast_slice(&[*x, *y, -3.0f32]));
+        }
+        let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("wall"),
+            contents: &vertices,
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("wall_indices"),
+            contents: bytemuck::cast_slice(&[0u32, 1, 2, 0, 2, 3]),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let target = |label, format, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: W, height: W, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let depth = target("depth", wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let depth_view = depth.create_view(&Default::default());
+
+        let run = |slot: u32| -> Vec3 {
+            let motion = target(
+                "motion",
+                MOTION_FORMAT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            );
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: (W * W * 8) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            let draw = MotionDraw {
+                kind: MotionKind::BrushReflect,
+                vertices: &vertices,
+                indices: &indices,
+                first: 0,
+                count: 6,
+                slot,
+                joints: Some(&reflect),
+            };
+            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], false, 1.0);
+            encoder.copy_texture_to_buffer(
+                motion.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(W * 8), rows_per_image: None },
+                },
+                wgpu::Extent3d { width: W, height: W, depth_or_array_layers: 1 },
+            );
+            queue.submit(Some(encoder.finish()));
+            readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let bytes = readback.slice(..).get_mapped_range().unwrap();
+            let at = ((W / 2) * W + W / 2) as usize * 8;
+            let half = |i: usize| f16_to_f32(u16::from_le_bytes([bytes[at + 2 * i], bytes[at + 2 * i + 1]]));
+            Vec3::new(half(0), half(1), half(2))
+        };
+        let reflected = run(0);
+        let plain = run(1);
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "{err:?}");
+
+        // The wall point at the centre of pixel (32, 32), and what it moves as.
+        let ndc = glam::Vec2::new((W / 2) as f32 + 0.5, (W / 2) as f32 + 0.5) / W as f32 * 2.0 - glam::Vec2::ONE;
+        let ndc = glam::Vec2::new(ndc.x, -ndc.y);
+        let inv = curr.inverse();
+        let near = inv.project_point3(ndc.extend(0.0));
+        let far = inv.project_point3(ndc.extend(1.0));
+        let p = near + (far - near) * ((-3.0 - near.z) / (far.z - near.z));
+        let share = 1.0 - 128.0 / 255.0;
+        let want = motion_vector(curr, prev, reflected_point(eye, p, share, 8.0));
+        let want_plain = motion_vector(curr, prev, p);
+        let close = |got: Vec3, want: Vec3| (got.truncate() - want.truncate()).abs().max_element() < 2e-4;
+        assert!(close(reflected, want), "shader {reflected} vs reference {want}");
+        assert!(close(plain, want_plain), "switched off: {plain} vs the wall's {want_plain}");
+        assert!((want - want_plain).truncate().length() > 1e-3, "the test cannot tell them apart");
+    }
+
+    /// A half float's value: enough of IEEE 754 binary16 for the test above.
+    fn f16_to_f32(h: u16) -> f32 {
+        let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exp = ((h >> 10) & 0x1f) as i32;
+        let frac = (h & 0x3ff) as f32;
+        match exp {
+            0 => sign * frac * 2f32.powi(-24),
+            31 => sign * f32::INFINITY,
+            e => sign * (1.0 + frac / 1024.0) * 2f32.powi(e - 15),
+        }
+    }
+
     /// A point that was behind last frame's eye writes no motion, and no
     /// motion is ever larger than the whole screen: nothing the compositor
     /// samples can be infinite.
@@ -580,7 +1035,17 @@ impl Readback {
     }
 
     /// Copy `layer` of both images back, wait, and describe them.
-    pub fn read(&self, depth: ash::vk::Image, depth_has_stencil: bool, motion: ash::vk::Image, layer: u32) -> Result<String, ash::vk::Result> {
+    /// `save`: also write both images, raw, to this file -- a 16-byte header
+    /// (width, height, layer, whether depth is D24S8, each a little-endian
+    /// u32), the depth words, then the motion texels as four half floats.
+    pub fn read(
+        &self,
+        depth: ash::vk::Image,
+        depth_has_stencil: bool,
+        motion: ash::vk::Image,
+        layer: u32,
+        save: Option<&std::path::Path>,
+    ) -> Result<String, ash::vk::Result> {
         use ash::vk;
         let (w, h) = self.size;
         let d = &self.device;
@@ -633,6 +1098,16 @@ impl Readback {
             let n = (w * h) as usize;
             let ptr = d.map_memory(self.memory, 0, (n * 12) as u64, vk::MemoryMapFlags::empty())? as *const u8;
             let bytes = std::slice::from_raw_parts(ptr, n * 12);
+            if let Some(path) = save {
+                let mut file = Vec::with_capacity(16 + n * 12);
+                for v in [w, h, layer, depth_has_stencil as u32] {
+                    file.extend_from_slice(&v.to_le_bytes());
+                }
+                file.extend_from_slice(bytes);
+                if let Err(e) = std::fs::write(path, &file) {
+                    log::warn!("SWDUMP: could not write {}: {e}", path.display());
+                }
+            }
             let depth_word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
             let depth_value = |i: usize| {
                 if depth_has_stencil {

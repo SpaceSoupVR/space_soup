@@ -121,8 +121,8 @@ pub struct Uniforms {
     ///
     /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
     pub ground_params: [f32; 4],
-    /// Where each model's distance field lies in the atlas, two vec4 a field.
-    /// See `proxy_field::FieldSlot`.
+    /// Where each model's distance field lies in the atlas, and the model's
+    /// mean colour: three vec4 a field. See `proxy_field::FieldSlot`.
     ///
     /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
     pub proxy_fields: [super::proxy_field::FieldSlot; super::proxy_field::MAX_PROXY_FIELDS],
@@ -132,6 +132,13 @@ pub struct Uniforms {
     ///
     /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
     pub building_boxes: [[f32; 4]; MAX_BUILDINGS * 2],
+    /// THE CHARACTERS AS CAPSULES, player frame: see [`CapsuleUpload`].
+    ///
+    /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
+    pub capsules: [[f32; 4]; MAX_CAPSULES * 2],
+    pub capsule_groups: [[f32; 4]; MAX_CAPSULE_GROUPS * 2],
+    /// x = how many characters. yzw reserved.
+    pub capsule_params: [f32; 4],
 }
 
 /// How many buildings' outsides reflections can meet. test_room has three; a
@@ -208,11 +215,94 @@ pub fn scene_limits(base: wgpu::Limits) -> wgpu::Limits {
 // hardware ceiling of 256 layers; that was wgpu's default limit, and Adreno 740
 // reports 2048.)
 
-/// Where the player is, for geometry that must not move with them.
+/// Where the player is, for geometry that must not move with them -- and the
+/// characters around them, as capsules. See [`CapsuleUpload`].
 #[derive(Clone, Copy, Default)]
 pub struct PlayerUpload {
     pub offset: Vec3,
     pub yaw: f32,
+    pub capsules: CapsuleUpload,
+}
+
+/// How many characters the shaders see as capsules: the player and the three
+/// nearest others. The caller chooses them, nearest first.
+pub const MAX_CAPSULE_GROUPS: usize = 4;
+/// Slots a character has: head, torso, and each arm, hand, thigh, shin and
+/// foot. See `avatar_ik::body_capsules`.
+pub const CAPSULES_PER_GROUP: usize = 14;
+pub const MAX_CAPSULES: usize = MAX_CAPSULE_GROUPS * CAPSULES_PER_GROUP;
+
+/// One character as capsules, this frame.
+#[derive(Clone, Debug, Default)]
+pub struct CapsuleGroup {
+    /// `(a, b, radius)` each, in the PLAYER's frame -- the frame the lights
+    /// and the geometry reach the shaders in.
+    pub capsules: Vec<(Vec3, Vec3, f32)>,
+    /// Its mean surface colour, linear: what its reflection is made of.
+    pub colour: [f32; 3],
+}
+
+/// THE CHARACTERS AS CAPSULES, for what their meshes cannot cheaply do every
+/// frame: their soft shadows from lamps with no shadow map for them, the
+/// darkening of the floor under them in indirect light, and their presence in
+/// reflections. Unreal's capsule shadows, from the posed joints. See
+/// `capsule_visibility` in the lights block.
+///
+/// Laid out for the shader: two vec4 a capsule, `[a.xyz, radius]` and
+/// `[b.xyz, 0]`, [`CAPSULES_PER_GROUP`] slots a character with the unused
+/// ones zero; two vec4 a character, `[centre.xyz, bound radius]` and
+/// `[colour.rgb, capsule count]`.
+#[derive(Clone, Copy)]
+pub struct CapsuleUpload {
+    pub capsules: [[f32; 4]; MAX_CAPSULES * 2],
+    pub groups: [[f32; 4]; MAX_CAPSULE_GROUPS * 2],
+    pub group_count: u32,
+}
+
+impl Default for CapsuleUpload {
+    fn default() -> Self {
+        Self { capsules: [[0.0; 4]; MAX_CAPSULES * 2], groups: [[0.0; 4]; MAX_CAPSULE_GROUPS * 2], group_count: 0 }
+    }
+}
+
+impl CapsuleUpload {
+    /// The first [`MAX_CAPSULE_GROUPS`] characters, the first
+    /// [`CAPSULES_PER_GROUP`] capsules of each; a character with none is left
+    /// out rather than holding a slot.
+    pub fn from_groups(groups: &[CapsuleGroup]) -> Self {
+        let mut out = Self::default();
+        let mut g = 0usize;
+        for group in groups {
+            if g == MAX_CAPSULE_GROUPS {
+                break;
+            }
+            let caps: Vec<&(Vec3, Vec3, f32)> = group
+                .capsules
+                .iter()
+                .filter(|(a, b, r)| a.is_finite() && b.is_finite() && *r > 0.0)
+                .take(CAPSULES_PER_GROUP)
+                .collect();
+            if caps.is_empty() {
+                continue;
+            }
+            // The bound: a sphere round every capsule, centred on their ends' mean.
+            let centre = caps.iter().fold(Vec3::ZERO, |s, (a, b, _)| s + *a + *b) / (2 * caps.len()) as f32;
+            let reach = caps
+                .iter()
+                .map(|(a, b, r)| (*a - centre).length().max((*b - centre).length()) + r)
+                .fold(0.0f32, f32::max);
+            for (k, (a, b, r)) in caps.iter().enumerate() {
+                let i = g * CAPSULES_PER_GROUP + k;
+                out.capsules[i * 2] = [a.x, a.y, a.z, *r];
+                out.capsules[i * 2 + 1] = [b.x, b.y, b.z, 0.0];
+            }
+            out.groups[g * 2] = [centre.x, centre.y, centre.z, reach];
+            out.groups[g * 2 + 1] = [group.colour[0], group.colour[1], group.colour[2], caps.len() as f32];
+            g += 1;
+        }
+        out.group_count = g as u32;
+        out
+    }
 }
 
 /// Per-frame display settings: how radiance becomes pixels.
@@ -746,6 +836,9 @@ impl UniformBuffer {
             ground_params: dense.ground,
             proxy_fields: dense.proxy_fields,
             building_boxes: probes.buildings,
+            capsules: player.capsules.capsules,
+            capsule_groups: player.capsules.groups,
+            capsule_params: [player.capsules.group_count as f32, 0.0, 0.0, 0.0],
             post_params: [
                 post.exposure,
                 match post.tonemap {
@@ -1289,7 +1382,7 @@ impl Default for ProbeUpload {
             sky_layer: -1.0,
             ground: [0.0; 4],
             ground_top: NO_GROUND,
-            proxy_fields: [[[0.0; 4]; 2]; super::proxy_field::MAX_PROXY_FIELDS],
+            proxy_fields: [[[0.0; 4]; 3]; super::proxy_field::MAX_PROXY_FIELDS],
             buildings: [[0.0; 4]; MAX_BUILDINGS * 2],
             building_count: 0,
         }

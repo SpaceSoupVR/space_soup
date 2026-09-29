@@ -8,6 +8,12 @@ use super::Color3;
 /// fragment shaders — keep these in sync.
 pub const MAX_LIGHTS: usize = 8;
 
+/// A lamp's bulb radius for the characters' capsule shadows, in metres: the
+/// stationary masks' bulb (`space_soup_engine::stationary::STATIONARY_BULB_RADIUS`),
+/// so a character's shadow is exactly as soft as the pillar's beside it from
+/// the same lamp. See `capsule_visibility` in the lights block.
+pub const CAPSULE_BULB_RADIUS: f32 = 0.03;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightKind {
     Point,
@@ -700,8 +706,13 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let probe_depth_samp = binding_index + 8;
     let ground_tex = binding_index + 9;
     let proxy_field_tex = binding_index + 10;
-    let proxy_field_rows = crate::renderer::proxy_field::MAX_PROXY_FIELDS * 2;
+    let proxy_field_rows = crate::renderer::proxy_field::MAX_PROXY_FIELDS * 3;
     let building_rows = crate::renderer::uniforms::MAX_BUILDINGS * 2;
+    let capsule_rows = crate::renderer::uniforms::MAX_CAPSULES * 2;
+    let capsule_group_rows = crate::renderer::uniforms::MAX_CAPSULE_GROUPS * 2;
+    let capsules_per_group = crate::renderer::uniforms::CAPSULES_PER_GROUP;
+    let capsule_bulb_radius = CAPSULE_BULB_RADIUS;
+    let reflection_contrast = format!("{:?}", crate::renderer::space_warp::REFLECTION_CONTRAST_RATIO);
     // Three vec4 per probe -- centre, min, max -- so the WGSL array length is
     // three times the probe count. Derived rather than written twice: a shader
     // array shorter than the uniform reads garbage past its end.
@@ -773,11 +784,19 @@ struct Camera {{
     // Must match `uniforms::Uniforms::ground_params`.
     ground_params: vec4<f32>,
     // Where each model's distance field lies in the atlas: [origin, reach],
-    // [size, stop] per field. Must match `uniforms::Uniforms::proxy_fields`.
+    // [size, stop], [albedo, 0] per field. Must match
+    // `uniforms::Uniforms::proxy_fields`.
     proxy_fields: array<vec4<f32>, {proxy_field_rows}>,
     // The buildings' outsides: [min.xyz, cube layer], [max.xyz, 0] each; how
     // many in portal_params.w. Must match `uniforms::Uniforms::building_boxes`.
     building_boxes: array<vec4<f32>, {building_rows}>,
+    // The characters as capsules, player frame: [a, radius], [b, 0] each,
+    // CAPSULES_PER_GROUP slots a character; [centre, bound radius] and
+    // [colour, capsule count] a character; how many in capsule_params.x.
+    // Must match `uniforms::Uniforms::capsules`.
+    capsules: array<vec4<f32>, {capsule_rows}>,
+    capsule_groups: array<vec4<f32>, {capsule_group_rows}>,
+    capsule_params: vec4<f32>,
 }}
 
 // Undo the player-frame transform the CPU applied to this vertex.
@@ -994,6 +1013,208 @@ fn stationary_visibility_of(marker: f32) -> f32 {{
     let v = select(stationary_vis_b, stationary_vis_a, c < 4);
     return v[c & 3];
 }}
+// THE CHARACTERS AS CAPSULES: their shadows from lamps that keep no shadow map
+// for them, the darkening of what they stand over in indirect light, and their
+// presence in reflections. See `uniforms::CapsuleUpload`.
+const CAPSULES_PER_GROUP: i32 = {capsules_per_group};
+const CAPSULE_BULB_RADIUS: f32 = {capsule_bulb_radius};
+// How far past a character's bound its contact darkening can reach.
+const CAPSULE_AMBIENT_REACH: f32 = 0.6;
+// HOW WRONG A CAPSULE BODY IS, in metres: no clothes, hands, shoulders or
+// hair. Nothing it shows may be sharper than that -- a crisp capsule body
+// reads as a mannequin, and the headset's pillar reflected the player as a
+// stick figure waving its arms (2026-09-29). So its reflection and its shadow
+// are blurred by at least this, and a limb thinner than the blur fades with
+// it. The crisp shadow of the real body is a shadow map's job.
+const CAPSULE_SHAPE_BLUR: f32 = 0.15;
+// Whether this surface takes the characters' shadows and darkening: not the
+// characters themselves, whose surfaces lie inside their own capsules.
+var<private> capsule_receiver: bool = true;
+
+// The point of capsule `a`..`b` nearest the line `o + d t` (`d` unit length).
+fn capsule_nearest_to_ray(a: vec3<f32>, b: vec3<f32>, o: vec3<f32>, d: vec3<f32>) -> vec3<f32> {{
+    let ba = b - a;
+    let oa = a - o;
+    let baba = dot(ba, ba);
+    let bad = dot(ba, d);
+    let denom = baba - bad * bad;
+    var s = 0.0;
+    if (denom > 1e-8) {{
+        s = (bad * dot(oa, d) - dot(oa, ba)) / denom;
+    }}
+    return a + ba * clamp(s, 0.0, 1.0);
+}}
+
+// How much of a light's disc -- `light` its angular radius -- a disc of
+// angular radius `occ`, centred `sep` from it, covers: the cone-cone overlap
+// of Unreal's capsule shadows (after Oat and Sander's ambient aperture
+// lighting). All of the smaller when one holds the other, none when they are
+// apart, a smooth step between.
+fn capsule_cone_overlap(light: f32, occ: f32, sep: f32) -> f32 {{
+    let smaller = min(light, occ);
+    let most = smaller * smaller / max(light * light, 1e-10);
+    let inner = abs(light - occ);
+    let t = clamp((sep - inner) / max(light + occ - inner, 1e-6), 0.0, 1.0);
+    return most * (1.0 - smoothstep(0.0, 1.0, t));
+}}
+
+// HOW MUCH OF LAMP `l` THE CHARACTERS LET THROUGH TO `p`: each capsule as the
+// sphere at its point nearest the ray to the lamp, the lamp as a disc the size
+// of its bulb -- the share of that disc the spheres cover. Hard where a foot
+// meets the floor, softening with distance as a real penumbra does: sized by
+// the bulb, never blurred for looks. Unreal's capsule shadows. Point and spot
+// lamps only: the sun's shadow of a character is in the moving-objects map.
+fn capsule_visibility(l: Light, p: vec3<f32>) -> f32 {{
+    let groups = i32(camera.capsule_params.x);
+    if (groups <= 0 || !capsule_receiver) {{
+        return 1.0;
+    }}
+    let v = l.position.xyz - p;
+    let reach = length(v);
+    let to_l = v / max(reach, 1e-4);
+    let light = CAPSULE_BULB_RADIUS / max(reach, 1e-3);
+    var vis = 1.0;
+    for (var g = 0; g < groups; g = g + 1) {{
+        // The character's bound against the stretch of ray it could shadow,
+        // widened by the lamp's cone where it passes.
+        let bound = camera.capsule_groups[g * 2];
+        let oc = bound.xyz - p;
+        let along = clamp(dot(oc, to_l), 0.0, reach);
+        if (length(oc - to_l * along) > bound.w + along * light) {{
+            continue;
+        }}
+        let count = i32(camera.capsule_groups[g * 2 + 1].w);
+        for (var k = 0; k < count; k = k + 1) {{
+            let i = g * CAPSULES_PER_GROUP + k;
+            let ar = camera.capsules[i * 2];
+            let w = capsule_nearest_to_ray(ar.xyz, camera.capsules[i * 2 + 1].xyz, p, to_l) - p;
+            let t = dot(w, to_l);
+            if (t <= 0.0 || t >= reach) {{
+                continue;
+            }}
+            let d = max(length(w), 1e-4);
+            // Small angles: the sphere's angular radius, and (as its sine)
+            // the angle between it and the lamp -- alike where they matter.
+            let occ = min(ar.w / d, 1.0);
+            let sep = length(cross(w / d, to_l));
+            // The lamp as seen past this capsule never smaller than the
+            // body's own error seen from here: see `CAPSULE_SHAPE_BLUR`.
+            let soft = max(light, CAPSULE_SHAPE_BLUR / d);
+            vis = vis * (1.0 - capsule_cone_overlap(soft, occ, sep));
+        }}
+    }}
+    return vis;
+}}
+
+// THE CHARACTERS' CONTACT DARKENING at `p`, facing `n`: the share of the light
+// arriving from all around -- the lightmap's bounce, the sky -- they block.
+// Each capsule as the sphere at its point nearest `p`, whose cosine-weighted
+// share of the hemisphere is (r / d)^2 max(n.w, 0). What grounds a character
+// where no lamp shines on it. Unreal's indirect capsule shadows.
+fn capsule_ambient(p: vec3<f32>, n: vec3<f32>) -> f32 {{
+    let groups = i32(camera.capsule_params.x);
+    if (groups <= 0 || !capsule_receiver) {{
+        return 1.0;
+    }}
+    var vis = 1.0;
+    for (var g = 0; g < groups; g = g + 1) {{
+        let bound = camera.capsule_groups[g * 2];
+        if (length(bound.xyz - p) > bound.w + CAPSULE_AMBIENT_REACH) {{
+            continue;
+        }}
+        let count = i32(camera.capsule_groups[g * 2 + 1].w);
+        for (var k = 0; k < count; k = k + 1) {{
+            let i = g * CAPSULES_PER_GROUP + k;
+            let ar = camera.capsules[i * 2];
+            let ba = camera.capsules[i * 2 + 1].xyz - ar.xyz;
+            let s = clamp(dot(p - ar.xyz, ba) / max(dot(ba, ba), 1e-8), 0.0, 1.0);
+            let w = ar.xyz + ba * s - p;
+            let d = max(length(w), ar.w);
+            let k2 = (ar.w / d) * (ar.w / d);
+            vis = vis * (1.0 - k2 * max(dot(n, w / d), 0.0));
+        }}
+    }}
+    return vis;
+}}
+
+// Where a ray from `p` along `d` (player frame) leaves the room this surface's
+// face belongs to; far away where no room is given -- outdoors, the ground.
+fn capsule_room_exit(p: vec3<f32>, d: vec3<f32>) -> f32 {{
+    var t_max = 1e3;
+    if (probe_face_given.y > 0.5) {{
+        let slot = probe_room_slot(probe_face_given.x);
+        if (slot >= 0) {{
+            let pw = to_world_space(p);
+            let dw = to_world_direction(d);
+            let inv = select(vec3<f32>(3.4e38), 1.0 / dw, abs(dw) > vec3<f32>(1e-6));
+            let far = max((camera.probe_boxes[slot * 3 + 2].xyz - pw) * inv, (camera.probe_boxes[slot * 3 + 1].xyz - pw) * inv);
+            t_max = max(min(min(far.x, far.y), far.z), 0.0);
+        }}
+    }}
+    return t_max;
+}}
+
+// Surfaces rougher than this show no character in their reflection: the lobe
+// is far wider than a body at any distance it could be seen, and the test is
+// not worth its cost there.
+const CAPSULE_REFLECT_MAX_ROUGHNESS: f32 = 0.7;
+
+// THE CHARACTERS IN A REFLECTION leaving `p` along `d` (player frame), over
+// `behind` -- what the probe answered, which cannot hold anything that moves:
+// the capsules the ray passes through before it leaves the room, soft over
+// the footprint (the lobe, or a pixel on a mirror), in each character's
+// colour lit by `lit`, the irradiance arriving here -- the light the underside
+// of someone standing on this floor would get.
+fn capsule_reflection(p: vec3<f32>, d: vec3<f32>, roughness: f32, lit: vec3<f32>, behind: vec4<f32>) -> vec4<f32> {{
+    let groups = i32(camera.capsule_params.x);
+    if (groups <= 0 || roughness > CAPSULE_REFLECT_MAX_ROUGHNESS) {{
+        return behind;
+    }}
+    let lobe = probe_lobe_tan(roughness);
+    let eye = max(distance(cam_pos(), p), 0.05);
+    var t_max = -1.0;
+    var cover = 0.0;
+    var colour = vec3<f32>(0.0);
+    for (var g = 0; g < groups; g = g + 1) {{
+        let bound = camera.capsule_groups[g * 2];
+        let oc = bound.xyz - p;
+        let along = dot(oc, d);
+        let at = max(along, 0.0);
+        let spread = at * lobe + pixel_footprint * (1.0 + at / eye) + CAPSULE_SHAPE_BLUR;
+        if (along < -bound.w || length(oc - d * along) > bound.w + spread) {{
+            continue;
+        }}
+        // Only for a ray that passes a character: the room's wall.
+        if (t_max < 0.0) {{
+            t_max = capsule_room_exit(p, d);
+        }}
+        let tint = camera.capsule_groups[g * 2 + 1];
+        let count = i32(tint.w);
+        for (var k = 0; k < count; k = k + 1) {{
+            let i = g * CAPSULES_PER_GROUP + k;
+            let ar = camera.capsules[i * 2];
+            let q = capsule_nearest_to_ray(ar.xyz, camera.capsules[i * 2 + 1].xyz, p, d);
+            let t = dot(q - p, d);
+            if (t <= 0.0 || t >= t_max) {{
+                continue;
+            }}
+            let footprint = max(max(t * lobe, pixel_footprint * (1.0 + t / eye)), CAPSULE_SHAPE_BLUR);
+            // Blurred by the footprint, a limb thinner than it covers only
+            // part of any pixel: its share fades as radius over footprint.
+            let c = (1.0 - smoothstep(ar.w - footprint, ar.w + footprint, length(q - (p + d * t))))
+                * min(ar.w / footprint, 1.0);
+            if (c > cover) {{
+                cover = c;
+                colour = tint.rgb;
+            }}
+        }}
+    }}
+    if (cover <= 0.0) {{
+        return behind;
+    }}
+    return vec4<f32>(mix(behind.rgb, colour * lit * INV_PI, cover), max(behind.a, cover));
+}}
+
 // Whether the light loop may skip a lamp that cannot reach this pixel before
 // doing any of its maths. See `GpuLights::count`; off only to measure it.
 fn light_culling() -> bool {{
@@ -1052,6 +1273,17 @@ fn spot_cone(cos_angle: f32, cos_outer: f32, cos_inner: f32, dist: f32) -> f32 {
 // `probe_environment` for `shade_material_env` to normalise against. Zero means
 // unknown, and an unknown probe is used as it is. See `PROBE_NORMALISATION`.
 var<private> probe_brightness: f32 = 0.0;
+// HOW FAR THE REFLECTED RAY TRAVELLED to what the reflection shows, in metres,
+// written by `probe_environment`: the traced hit, the ground or a building
+// beyond a doorway, `PROBE_REACH_SKY` for the sky; for an untraced (rough)
+// reflection, the room box it was projected onto. The half-resolution probe
+// pass stores it beside the reflection for SpaceWarp, which moves a reflected
+// image with the point it is an image of rather than with the surface showing
+// it. See `space_warp::reflected_point`.
+var<private> probe_reach: f32 = 0.0;
+// The reach of a reflection that met only sky: far enough that its image moves
+// as the sky does, within a half float.
+const PROBE_REACH_SKY: f32 = 10000.0;
 // WHETHER THIS SHADER READS ITS PROBE REFLECTION FROM THE HALF-RESOLUTION
 // PASS rather than tracing it per pixel. See `brush_pipeline::probe_pass`. A
 // constant, so a shader that reads it carries none of the trace: the branch in
@@ -1805,6 +2037,7 @@ fn probe_secondary(
         // though it were not there. Else the proxy itself, at its outline.
         let edge_hit = probe_hit_edge_hit(hit);
         var side = probe_point_hit(hit.origin + d * hit.edge_t, probe_hit_edge_room(hit), hit.edge_t);
+        side.other = probe_proxy_model(probe_hit_edge(hit));
         if (edge_hit) {{
             side = probe_trace_skipping(world_pos, d, trace_room, roughness, probe_hit_edge(hit));
         }}
@@ -2048,11 +2281,50 @@ fn probe_hit_rim_went_through(h: ProbeHit) -> bool {{
     return (h.rim_code & 1) != 0;
 }}
 fn probe_hit_rim_room(h: ProbeHit) -> f32 {{
-    return f32((h.rim_code >> 8u) - 1);
+    return f32(((h.rim_code >> 8u) & 31) - 1);
 }}
-// The other side of the rim: see `probe_rim_point`.
+// The other side of the rim: see `probe_rim_point` and `probe_rim_point_far`.
 fn probe_hit_rim_point(h: ProbeHit, d: vec3<f32>) -> vec3<f32> {{
-    return probe_rim_point(h.origin + d * h.rim_t, (h.rim_code >> 3u) & 31, (h.rim_code >> 1u) & 3, (h.rim_code & 1) == 0);
+    let e = h.origin + d * h.rim_t;
+    let p = (h.rim_code >> 3u) & 31;
+    let axis = (h.rim_code >> 1u) & 3;
+    let into = (h.rim_code & 1) == 0;
+    if ((h.rim_code & PROBE_RIM_FAR) != 0) {{
+        return probe_rim_point_far(e, p, axis, into);
+    }}
+    return probe_rim_point(e, p, axis, into);
+}}
+
+// A rim at the FAR end of a doorway's opening: see `probe_trace`. Bit 13 of
+// `rim_code`, above the room (bits 8-12).
+const PROBE_RIM_FAR: i32 = 8192;
+
+// The point across a doorway's FAR rim from `e`, which lies on the plane where
+// the opening ends -- the wall's far face, or the next room's box. Inside the
+// opening when `into` (the ray met the opening's side before it: the other
+// side is the way through); else ON the side it just missed -- the lintel's
+// underside, a jamb -- a step back inside the wall, where the room's
+// photographs saw it.
+fn probe_rim_point_far(e: vec3<f32>, p: i32, axis: i32, into: bool) -> vec3<f32> {{
+    let plo = camera.probe_portals[p * 3].xyz;
+    let phi = camera.probe_portals[p * 3 + 1].xyz;
+    var q = e;
+    let a = (axis + 1) % 3;
+    let b = (axis + 2) % 3;
+    q[axis] = clamp(e[axis], plo[axis] + PROBE_RIM_STEP, phi[axis] - PROBE_RIM_STEP);
+    if (into) {{
+        q[a] = clamp(e[a], plo[a] + PROBE_RIM_STEP, phi[a] - PROBE_RIM_STEP);
+        q[b] = clamp(e[b], plo[b] + PROBE_RIM_STEP, phi[b] - PROBE_RIM_STEP);
+        return q;
+    }}
+    let in_a = min(e[a] - plo[a], phi[a] - e[a]);
+    let in_b = min(e[b] - plo[b], phi[b] - e[b]);
+    if (in_a <= in_b) {{
+        q[a] = select(phi[a], plo[a], e[a] - plo[a] < phi[a] - e[a]);
+    }} else {{
+        q[b] = select(phi[b], plo[b], e[b] - plo[b] < phi[b] - e[b]);
+    }}
+    return q;
 }}
 // The proxy whose outline the ray passed, or -1.
 fn probe_hit_edge(h: ProbeHit) -> i32 {{
@@ -2254,6 +2526,18 @@ fn probe_proxy_next(i: i32) -> i32 {{
     return i32(camera.probe_rooms[20 + (i >> 2u)][i & 3]);
 }}
 
+// -2 - `i` for a MODEL proxy -- a lamp, not a brush piece -- else -1. Carried
+// in a hit's `other`, which a hit on a proxy has no use for, so the colour
+// lookup knows to shade whatever no photograph saw as the model itself. See
+// `probe_model_colour`.
+fn probe_proxy_model(i: i32) -> f32 {{
+    var m = -1.0;
+    if (i >= 0 && camera.probe_proxies[i * 3 + 1].w > 0.5) {{
+        m = -2.0 - f32(i);
+    }}
+    return m;
+}}
+
 // `v` rotated by the unit quaternion `q`.
 fn probe_quat_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {{
     let t = 2.0 * cross(q.xyz, v);
@@ -2380,10 +2664,35 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip
     // A ray through one lamp's empty box to another lamp behind it sees only
     // the first: rare, and shown as the wall past it.
     if (field_i >= 0 && field_near < best) {{
-        let t_surface = probe_proxy_field_at(o, d, field_i, field_near, min(field_far, best));
-        if (t_surface < best) {{
-            best = t_surface;
+        let walk = probe_proxy_field_at(o, d, field_i, field_near, min(field_far, best), lobe);
+        let touched = walk.x < best;
+        if (touched) {{
+            best = walk.x;
             out.index = field_i;
+        }}
+        // HOW MUCH OF THE REFLECTION THE MODEL IS, blended over what lies past
+        // it (`ProbeHit::edge`), as a solid proxy's outline is:
+        //
+        // - A NEAR MISS within a footprint -- a pixel's, on a mirror -- is its
+        //   outline, faded out over the footprint. A field has no inside to
+        //   measure how deep a hit went, so only misses are faded, outside the
+        //   outline. One ray a texel decided each texel all or nothing, and
+        //   the sconce's reflection in the polished doorway jamb came out in
+        //   stair-steps (headset, 2026-09-29).
+        // - ON A ROUGH SURFACE the lobe is as wide as the model or wider, and a
+        //   model that fills only part of it is only part of the reflection:
+        //   extent^2 / (extent^2 + spread^2), the share of the lobe's area it
+        //   can cover. The rock ceiling over each sconce, 0.44 rough, showed the
+        //   fixture as a hard shape half a metre off (offline, 2026-09-29).
+        let t_at = select(walk.y, walk.x, touched);
+        let extent = (2.0 / 3.0) * dot(camera.probe_proxies[field_i * 3 + 1].xyz, vec3<f32>(1.0));
+        let spread = t_at * lobe;
+        let presence = extent * extent / max(extent * extent + spread * spread, 1e-8);
+        let cover = select(presence * (1.0 - smoothstep(0.0, 1.0, walk.z)), presence, touched);
+        if (out.edge < 0 && cover < 0.99 && cover > 0.004 && t_at > t0) {{
+            out.edge = field_i;
+            out.edge_cover = cover;
+            out.edge_t = t_at;
         }}
     }}
     out.t = best;
@@ -2391,7 +2700,7 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip
 }}
 
 // `probe_proxy_field` for proxy `i`: the ray into its box's own frame first.
-fn probe_proxy_field_at(o: vec3<f32>, d: vec3<f32>, i: i32, t_in: f32, t_out: f32) -> f32 {{
+fn probe_proxy_field_at(o: vec3<f32>, d: vec3<f32>, i: i32, t_in: f32, t_out: f32, lobe: f32) -> vec3<f32> {{
     let q = camera.probe_proxies[i * 3 + 2];
     var lo = o - camera.probe_proxies[i * 3].xyz;
     var ld = d;
@@ -2401,7 +2710,7 @@ fn probe_proxy_field_at(o: vec3<f32>, d: vec3<f32>, i: i32, t_in: f32, t_out: f3
         ld = probe_quat_rotate(qi, ld);
     }}
     let box = camera.probe_proxies[i * 3 + 1];
-    return probe_proxy_field(lo, ld, box.xyz, t_in, t_out, i32(box.w) - 2);
+    return probe_proxy_field(lo, ld, box.xyz, t_in, t_out, i32(box.w) - 2, lobe);
 }}
 
 // Steps a ray may take through a model's distance field.
@@ -2413,9 +2722,15 @@ const PROXY_FIELD_STEPS: i32 = 32;
 // least the stop distance, until it is within that of the surface (a hit) or
 // leaves the box (3.4e38). See `proxy_field` -- the surface itself, where
 // `probe_proxy_surface` below could only guess it from 256-pixel photographs.
-fn probe_proxy_field(lo: vec3<f32>, ld: vec3<f32>, half: vec3<f32>, t_in: f32, t_out: f32, field: i32) -> f32 {{
-    let slot = camera.proxy_fields[field * 2];
-    let size = camera.proxy_fields[field * 2 + 1];
+//
+// Returns (hit, near_t, near): the hit, or 3.4e38; and the CLOSEST the ray
+// came to the model on the way, `near` footprints past the surface at
+// `near_t` -- the footprint as at a solid proxy's outline, the wider of the
+// lobe and the pixel there. The steps shorten as the ray grazes the model, so
+// they sample that minimum where it matters.
+fn probe_proxy_field(lo: vec3<f32>, ld: vec3<f32>, half: vec3<f32>, t_in: f32, t_out: f32, field: i32, lobe: f32) -> vec3<f32> {{
+    let slot = camera.proxy_fields[field * 3];
+    let size = camera.proxy_fields[field * 3 + 1];
     // The ray straight in the atlas's coordinates, `uvw = fo + fd * t`: two
     // vectors live through the walk instead of the box and the slot.
     let scale = size.xyz * (0.5 / max(half, vec3<f32>(1e-4)));
@@ -2427,6 +2742,8 @@ fn probe_proxy_field(lo: vec3<f32>, ld: vec3<f32>, half: vec3<f32>, t_in: f32, t
     let lo_uvw = slot.xyz + texel;
     let hi_uvw = slot.xyz + size.xyz - texel;
     var hit = 3.4e38;
+    var near_t = t_in;
+    var near = 3.4e38;
     var t = t_in;
     for (var k = 0; k < PROXY_FIELD_STEPS && t <= t_out; k = k + 1) {{
         let dist = textureSampleLevel(proxy_field, probe_samp, clamp(fo + fd * t, lo_uvw, hi_uvw), 0.0).r * slot.w;
@@ -2434,9 +2751,19 @@ fn probe_proxy_field(lo: vec3<f32>, ld: vec3<f32>, half: vec3<f32>, t_in: f32, t
             hit = t;
             break;
         }}
+        // No wider than half the field's reach, where its distances are exact:
+        // past that the field says only "at least this far", and a wider fade
+        // ran out at the model's box -- a box-shaped shadow of every lamp in the
+        // rough ceiling above it (offline, 2026-09-29).
+        let footprint = min(max(t * lobe, pixel_footprint * (1.0 + t / max(probe_eye_distance, 0.05))), 4.0 * size.w);
+        let r = (dist - size.w) / max(footprint, 1e-5);
+        if (r < near) {{
+            near = r;
+            near_t = t;
+        }}
         t = t + dist;
     }}
-    return hit;
+    return vec3<f32>(hit, near_t, near);
 }}
 
 // WHERE INSIDE A MODEL'S BOX the model itself is, between `t_in` and `t_out`;
@@ -2672,6 +2999,7 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
         if (t_obj < t_exit) {{
             hit.pos = hit.origin + d * t_obj;
             hit.room = cur;
+            hit.other = probe_proxy_model(proxy.index);
             hit.found = true;
             hit.t = t_obj;
             return hit;
@@ -2680,8 +3008,15 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
         let p = probe_portal_at(e, cur, axis);
         // The first doorway rim within the lobe, whichever side of it this
         // ray lands on. See `probe_rim_at`.
-        if (hit.rim < 0.0 && t_exit * lobe > PROBE_RIM_MIN_SPREAD) {{
-            let rim = probe_rim_at(e, cur, axis, t_exit * lobe);
+        //
+        // AT LEAST A PIXEL WIDE, as a solid proxy's outline is: on polished
+        // marble the lobe is millimetres across, one ray decided each texel
+        // all or nothing, and the front door's lintel came out of the floor's
+        // reflection as a staircase that crawled as the head moved (headset,
+        // 2026-09-29).
+        let spread = max(t_exit * lobe, pixel_footprint * (1.0 + t_exit / max(probe_eye_distance, 0.05)));
+        if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {{
+            let rim = probe_rim_at(e, cur, axis, spread);
             if (rim.portal >= 0) {{
                 hit.rim = rim.through;
                 hit.rim_t = t_exit;
@@ -2726,6 +3061,26 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
             max((wall_far - hit.origin[axis]) * inv[axis], t_exit),
             escapes
         );
+        // THE FAR END OF THE OPENING is a rim too: there the ray either leaves
+        // the wall -- outdoors, into the next room -- or has met the opening's
+        // side just before, the lintel's underside or a jamb. Only the near end
+        // was softened, and there both sides are the same marble; out here one
+        // is the sky, and the front door's lintel came out of the floor's
+        // reflection as a staircase (headset, 2026-09-29). Softened over the
+        // footprint as the near rim is. See `probe_rim_point_far`.
+        if (hit.rim < 0.0) {{
+            let spread_far = max(t_enter * lobe, pixel_footprint * (1.0 + t_enter / max(probe_eye_distance, 0.05)));
+            let e2 = hit.origin + d * t_enter;
+            let a = (axis + 1) % 3;
+            let b = (axis + 2) % 3;
+            let in_a = min(e2[a] - plo[a], phi[a] - e2[a]);
+            let in_b = min(e2[b] - plo[b], phi[b] - e2[b]);
+            if (spread_far > PROBE_RIM_MIN_SPREAD && abs(min(in_a, in_b)) < spread_far) {{
+                hit.rim = smoothstep(-spread_far, spread_far, in_a) * smoothstep(-spread_far, spread_far, in_b);
+                hit.rim_t = t_enter;
+                hit.rim_code = PROBE_RIM_FAR | ((i32(cur) + 1) << 8u) | (p << 3u) | (axis << 1u) | select(0, 1, t_side >= t_enter);
+            }}
+        }}
         if (t_side < t_enter) {{
             hit.pos = hit.origin + d * t_side;
             hit.room = cur;
@@ -2899,9 +3254,12 @@ fn ground_trace_until(e: vec3<f32>, d: vec3<f32>, t_max: f32) -> f32 {{
 // marble hall's outer walls mirrored the hills standing where the brick hall is.
 fn outdoor_radiance(e: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, lod: f32) -> vec3<f32> {{
     let b = building_hit(e, d);
+    // From `e`, which is where the caller's own reach ends. See `probe_reach`.
+    probe_reach = PROBE_REACH_SKY;
     if (camera.sky_params.w > 0.5) {{
         let t = ground_trace_until(e, d, select(3.4e38, b.x, b.x >= 0.0));
         if (t >= 0.0) {{
+            probe_reach = t;
             let texel = 1.0 / max(camera.ground_params.z * f32(textureDimensions(ground_map, 0).x), 1e-6);
             let spread = max(t * probe_lobe_tan(roughness), 1e-4);
             let ground_lod = clamp(log2(spread / texel), 0.0, 12.0);
@@ -2910,6 +3268,7 @@ fn outdoor_radiance(e: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, 
     }}
     if (b.x >= 0.0) {{
         let c = building_colour(e + d * b.x, i32(b.y), roughness, b.x);
+        probe_reach = b.x;
         return c.rgb * c.a + sky_reflection(d, dir, lod) * (1.0 - c.a);
     }}
     return sky_reflection(d, dir, lod);
@@ -2979,7 +3338,40 @@ fn probe_escape_colour(e: vec3<f32>, d: vec3<f32>, sky_dir: vec3<f32>, roughness
 //
 // Each is read from its OWN capture point toward the hit, which is what makes
 // the reflection parallax-correct everywhere rather than on a box.
-fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32) -> vec4<f32> {{
+// A MODEL WITH NO FIELD of its own, where no photograph saw it: a mid-grey
+// surface. See `probe_model_colour`.
+const PROBE_MODEL_ALBEDO: f32 = 0.2;
+
+// A MODEL'S OWN SURFACE WHERE NO PHOTOGRAPH SHOWS IT: the model's mean colour,
+// lit by the room -- the nearest photograph at its blurriest, the roughness-one
+// lobe, towards `n`: the side facing the ray that met it.
+//
+// The photographs are taken at a person's height, below every lamp: nothing
+// saw a lamp's top, and the photograph read in that direction instead showed
+// the lamp's glowing mouth underneath -- a bright ghost of each sconce in the
+// ceiling above it and on the wall beside it (headset, 2026-09-29).
+fn probe_model_colour(proxy: i32, n: vec3<f32>, slot: i32) -> vec4<f32> {{
+    let lit = textureSampleLevel(probe_cube, probe_samp, n, i32(camera.probe_boxes[slot * 3].w), PROBE_MAX_LOD);
+    let kind = camera.probe_proxies[proxy * 3 + 1].w;
+    let field = camera.proxy_fields[max(i32(kind) - 2, 0) * 3 + 2].xyz;
+    let albedo = select(vec3<f32>(PROBE_MODEL_ALBEDO), field, kind > 1.5);
+    return vec4<f32>(albedo * lit.rgb, 1.0);
+}}
+
+// HOW FAR A PHOTOGRAPH TAKEN AT `c` SHOWS A MODEL as a ray along `d` sees it
+// at `h`: all of it within about 25 degrees of the ray's own direction, none
+// past 60. A model is where a view's angle matters: a lampshade is a thin
+// shell with a glowing inside and a dark outside, and a photograph taken from
+// under it shows the glow wherever it looks -- read for a ray coming down onto
+// the shade from the ceiling, blurred at the ceiling's roughness, the glow
+// spilled over the dark outside, and each sconce's ghost glowed in the rock
+// above it (offline, 2026-09-29). A depth test cannot see this: on a shell
+// the two sides are millimetres apart.
+fn probe_view_trust(d: vec3<f32>, c: vec3<f32>, h: vec3<f32>) -> f32 {{
+    return smoothstep(0.5, 0.9, dot(d, normalize(h - c)));
+}}
+
+fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32, d: vec3<f32>) -> vec4<f32> {{
     var s0 = -1;
     var s1 = -1;
     var d0 = 3.4e38;
@@ -3011,15 +3403,28 @@ fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32)
             d1 = dd;
         }}
     }}
+    // A MODEL is shown by a photograph only from about the ray's direction.
+    // See `probe_view_trust`.
+    let model = other < -1.5;
     let c0 = probe_clearance(s0, h);
     let tol0 = PROBE_SEEN_TOLERANCE + 0.01 * sqrt(d0);
-    var w0 = (1.0 - smoothstep(tol0, 2.0 * tol0, abs(c0))) / (d0 + 1.0);
+    // How far each photograph vouches for the point, 0..1, and the most any does.
+    var seen = 1.0 - smoothstep(tol0, 2.0 * tol0, abs(c0));
+    if (model) {{
+        seen *= probe_view_trust(d, camera.probe_boxes[s0 * 3].xyz, h);
+    }}
+    var w0 = seen / (d0 + 1.0);
     var w1 = 0.0;
     var c1 = -3.4e38;
     if (s1 >= 0) {{
         c1 = probe_clearance(s1, h);
         let tol1 = PROBE_SEEN_TOLERANCE + 0.01 * sqrt(d1);
-        w1 = (1.0 - smoothstep(tol1, 2.0 * tol1, abs(c1))) / (d1 + 1.0);
+        var seen1 = 1.0 - smoothstep(tol1, 2.0 * tol1, abs(c1));
+        if (model) {{
+            seen1 *= probe_view_trust(d, camera.probe_boxes[s1 * 3].xyz, h);
+        }}
+        w1 = seen1 / (d1 + 1.0);
+        seen = max(seen, seen1);
     }}
     if (w0 + w1 < 1e-6) {{
         w0 = select(1.0, 0.0, s1 >= 0 && abs(c1) < abs(c0));
@@ -3037,7 +3442,14 @@ fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32)
             probe_hit_lod(roughness, t, sqrt(d1))
         ) * w1;
     }}
-    return col / (w0 + w1);
+    col = col / (w0 + w1);
+    // A MODEL, where no photograph saw it, is the model: see
+    // `probe_model_colour`. A room's wall no photograph saw keeps the less
+    // wrong photograph above -- black holes in walls behind a pillar are worse.
+    if (model && seen < 1.0) {{
+        col = mix(probe_model_colour(i32(-2.0 - other), -d, s0), col, seen);
+    }}
+    return col;
 }}
 
 // THE COLOUR OF A TRACED HIT: where the ray left the rooms, what lies out
@@ -3048,8 +3460,11 @@ fn probe_traced_colour(h: ProbeHit, d: vec3<f32>, roughness: f32, sky_dir: vec3<
     var col: vec4<f32>;
     if (h.escaped) {{
         col = probe_escape_colour(h.pos, d, sky_dir, roughness, lod);
+        // Out through the doorway, then on to the ground, a building or sky.
+        probe_reach = h.t + probe_reach;
     }} else {{
-        col = probe_hit_colour(h.pos, h.room, h.other, roughness, h.t);
+        col = probe_hit_colour(h.pos, h.room, h.other, roughness, h.t, d);
+        probe_reach = h.t;
     }}
     return col;
 }}
@@ -3126,6 +3541,9 @@ fn probe_parallax_direction(world_pos: vec3<f32>, d: vec3<f32>, slot: i32) -> ve
     // only keeps a degenerate capture point from normalising zero.
     var sample_dir = d;
     if (dist >= 0.0) {{
+        // The box is where this untraced reflection was projected. See
+        // `probe_reach`.
+        probe_reach = dist;
         let to_hit = parallax_pos + d * dist - centre;
         if (dot(to_hit, to_hit) > 1e-12) {{
             sample_dir = normalize(to_hit);
@@ -3339,6 +3757,39 @@ struct MaterialEnvPart {{
     fresnel: f32,
     view_dir: vec3<f32>,
     r: f32,
+    // The luminance of the part of `specular` that is NOT an image of
+    // anything: the lightmap's own light, which stays put on the surface.
+    // See `reflected_image`.
+    surface_spec: f32,
+}}
+
+// HOW MUCH OF THIS PIXEL IS A REFLECTED IMAGE, as luminance, written by
+// `shade_material_lamps`: the probe's and the sky's reflection and every
+// lamp's highlight -- what moves with the thing it shows, not with the
+// surface. The brush shader stores its share of the pixel in alpha for
+// SpaceWarp (`reflection_alpha`).
+var<private> reflected_image: f32 = 0.0;
+// WHICH REFLECTIONS SPACEWARP MOVES AS IMAGES, by the surface's roughness: all
+// of one up to the first, none past the second. A step of the eye moves an
+// image `step / distance` radians against its surface, and a reflection is
+// blurred over about `roughness^2`; with steps of 1-4 cm a frame at 2-5 m the
+// two meet around 0.1 (a 0.6 degree blur) and the blur is far the larger by
+// 0.3. Marble is 0.05, the hallway rock 0.55 and up.
+const REFLECTION_SHARP_ROUGHNESS: f32 = 0.1;
+const REFLECTION_BLURRED_ROUGHNESS: f32 = 0.3;
+
+// THE EYE IMAGE'S ALPHA FOR SPACEWARP: one minus how much the reflected image
+// counts in this pixel's motion, from its share of `lit` (the pixel's linear
+// colour) -- `space_warp::reflection_motion_weight`, which this is held to,
+// and `space_warp::reflected_point`, which reads it back. The MSAA resolve and
+// any blend over it average it as they average the colour.
+const REFLECTION_CONTRAST_RATIO: f32 = {reflection_contrast};
+fn reflection_alpha(lit: vec3<f32>) -> f32 {{
+    let total = dot(lit, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let share = clamp(reflected_image / max(total, 1e-6), 0.0, 1.0);
+    let image = REFLECTION_CONTRAST_RATIO * share;
+    let surface = 1.0 - share;
+    return 1.0 - image * image / max(image * image + surface * surface, 1e-12);
 }}
 
 fn shade_material_env_part(
@@ -3347,7 +3798,7 @@ fn shade_material_env_part(
     roughness: f32,
     ao: f32,
     sky_vis: f32,
-    env: vec3<f32>,
+    env_baked: vec3<f32>,
     // The baked bounce DIRECTION: xyz is a unit vector encoded as `v * 2 - 1`,
     // w is how directional that light is. w = 0 means "from everywhere", and
     // then this behaves exactly as the flat term it replaced.
@@ -3385,7 +3836,11 @@ fn shade_material_env_part(
 ) -> MaterialEnvPart {{
     let view_dir = normalize(cam_pos() - world_pos);
     let r = clamp(roughness, 0.04, 1.0);
-    let occ = clamp(ao, 0.0, 1.0) * clamp(sky_vis, 0.0, 1.0);
+    // THE CHARACTERS' CONTACT DARKENING, on everything that arrives from all
+    // around -- the baked bounce and the sky. See `capsule_ambient`.
+    let contact = capsule_ambient(world_pos, n);
+    let env = env_baked * contact;
+    let occ = clamp(ao, 0.0, 1.0) * clamp(sky_vis, 0.0, 1.0) * contact;
     // Two accumulators from here on: what the surface's colour tints, and what
     // it does not.
     // Only where the baked sky visibility is not exactly 0 -- most of an
@@ -3482,6 +3937,9 @@ fn shade_material_env_part(
     if (!PROBE_ENV_FROM_PASS) {{
         probe = probe_environment(world_pos, refl, roughness, probe_select_pos);
     }}
+    // THE CHARACTERS IN IT, at this pixel's own resolution, lit by the light
+    // arriving here. See `capsule_reflection`.
+    probe = capsule_reflection(world_pos, refl, roughness, env, probe);
     var sky_reflection = vec3<f32>(0.0);
     if (occ > 0.0) {{
         sky_reflection = environment_radiance(refl) * occ;
@@ -3567,6 +4025,11 @@ fn shade_material_env_part(
     // No second `(1 - r)`: the Fresnel above is already capped by roughness,
     // and applying it twice was most of why rough stone read as polished.
     specular = specular + environment * fresnel;
+    // Of that, what is the lightmap's own light rather than an image: the
+    // baseline's indirect part, where neither the probe nor the lobe replaced
+    // it. See `MaterialEnvPart::surface_spec`.
+    let image_weight = (1.0 - lobe_is_hemispherical) * clamp(probe.a, 0.0, 1.0);
+    let surface_spec = dot(indirect_specular, vec3<f32>(0.2126, 0.7152, 0.0722)) * (1.0 - image_weight) * fresnel;
 
     // BOUNCED LIGHT, SHAPED BY WHERE IT CAME FROM.
     //
@@ -3613,6 +4076,7 @@ fn shade_material_env_part(
     p.fresnel = fresnel;
     p.view_dir = view_dir;
     p.r = r;
+    p.surface_spec = surface_spec;
     return p;
 }}
 
@@ -3809,6 +4273,12 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
         if (layer >= 0 && f32(layer) < camera.shadow_params.y) {{
             shadow = shadow * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
         }}
+        // THE CHARACTERS' SHADOWS from a lamp with no map that holds them. See
+        // `capsule_visibility`: the sun's are in its moving-objects map, and a
+        // spot's shadow slot draws them already.
+        if (l.params.z < 1.5 && !(layer >= 0 && f32(layer) < camera.shadow_params.y)) {{
+            shadow = shadow * capsule_visibility(l, world_pos);
+        }}
         diffuse = diffuse + c.diffuse * shadow;
         specular = specular + c.specular * shadow;
         // DIRECT: runtime lights, after their shadow test.
@@ -3828,6 +4298,15 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
     //
     // Head-on this changes almost nothing -- a dielectric reflects 4% there, so
     // the diffuse keeps 96% of what it always had.
+    // For SpaceWarp: everything specular but the lightmap's part is an image
+    // -- counted only as far as it is sharp enough to show something. A rough
+    // surface's reflection is a blur with nothing in it to judder, while its
+    // own texture has plenty: counted whole, the hallway rock's dark crevices
+    // came out as mostly reflection and would have swum with it (the motion
+    // pass's inputs read off the headset, 2026-09-29). Between these two
+    // roughnesses the blur outgrows what a step of the eye moves an image by.
+    let sharp = 1.0 - smoothstep(REFLECTION_SHARP_ROUGHNESS, REFLECTION_BLURRED_ROUGHNESS, r);
+    reflected_image = sharp * max(dot(specular, vec3<f32>(0.2126, 0.7152, 0.0722)) - p.surface_spec, 0.0);
     return diffuse * albedo * (1.0 - fresnel) + specular;
 }}
 
@@ -3891,7 +4370,8 @@ fn shade(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
 fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32> {{
     let view_dir = normalize(cam_pos() - world_pos);
     let flash_idx = u32(camera.shadow_params.z);
-    var lit = sky_irradiance(n) * clamp(sky_vis, 0.0, 1.0);
+    // The characters' contact darkening on the sky's light: see `capsule_ambient`.
+    var lit = sky_irradiance(n) * clamp(sky_vis, 0.0, 1.0) * capsule_ambient(world_pos, n);
     for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
         let l = lights.lights[i];
         var c = light_contribution(l, world_pos, n, view_dir);
@@ -3912,6 +4392,9 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
         let layer = i32(l.params.w);
         if (layer >= 0 && f32(layer) < camera.shadow_params.y) {{
             c = c * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
+        }} else if (l.params.z < 1.5) {{
+            // The characters' shadows: see the brushes' loop.
+            c = c * capsule_visibility(l, world_pos);
         }}
         lit = lit + c;
     }}
@@ -5803,7 +6286,7 @@ mod proxy_field_gpu_tests {
                 }
             }
         }
-        ProxyField { dims: [SAMPLES; 3], max_distance: reach, distances }
+        ProxyField { dims: [SAMPLES; 3], max_distance: reach, distances, albedo: [0.2; 3] }
     }
 
     /// Walk each box-local `(origin, direction)` through the field.
@@ -5830,7 +6313,8 @@ fn walk_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let tb = (half - o) * inv;
     let t_in = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z));
     let t_out = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
-    hits[id.x] = probe_proxy_field(o, d, half, t_in, t_out, 0);
+    // A mirror's lobe (0) and no pixel: the hit alone, as before.
+    hits[id.x] = probe_proxy_field(o, d, half, t_in, t_out, 0, 0.0).x;
 }
 "#
         );

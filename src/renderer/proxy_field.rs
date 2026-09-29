@@ -29,14 +29,18 @@ pub struct ProxyField {
     /// Metres a byte of 255 stands for.
     pub max_distance: f32,
     pub distances: Vec<u8>,
+    /// The model's mean surface colour, linear -- how a reflection shades a
+    /// part of it no photograph saw. See `probe_model_colour` in the lights
+    /// block and `space_soup_engine::mesh_lightmap::model_albedo`.
+    pub albedo: [f32; 3],
 }
 
 /// Where each field lies in the atlas, as the shader reads it (the uniform's
 /// `proxy_fields`): `[origin_uvw.xyz, max_distance]`, `[size_uvw.xyz,
-/// stop_distance]`. A box-local point `p` samples at
+/// stop_distance]`, `[albedo.rgb, 0]`. A box-local point `p` samples at
 /// `origin + (p / (2 * half) + 0.5) * size`, clamped half a texel inside the
 /// field so filtering never reaches the gap beside it.
-pub type FieldSlot = [[f32; 4]; 2];
+pub type FieldSlot = [[f32; 4]; 3];
 
 /// The fields packed into one R8 3D texture, stacked along z with a one-sample
 /// gap of "far" between them so filtering never blends two models, and their
@@ -75,6 +79,7 @@ pub fn atlas(device: &Device, queue: &Queue, fields: &[ProxyField]) -> Option<(T
                 f.dims[2] as f32 / d as f32,
                 f.max_distance / 8.0,
             ],
+            [f.albedo[0], f.albedo[1], f.albedo[2], 0.0],
         ]);
         z0 += f.dims[2] + 1;
     }

@@ -65,6 +65,10 @@ struct SpaceWarpState {
     depth_raw: Vec<vk::Image>,
     depth_has_stencil: bool,
     readback: Option<crate::renderer::space_warp::Readback>,
+    /// Per eye swapchain image, per eye: what the brushes' motion reads to
+    /// move reflections as what they show -- that eye's layer of the image,
+    /// and its probe pass's reach. See `space_warp::MotionKind::BrushReflect`.
+    reflect_groups: Vec<[wgpu::BindGroup; 2]>,
 }
 
 impl SpaceWarpState {
@@ -207,6 +211,8 @@ impl SpaceWarpState {
             depth_raw,
             depth_has_stencil: depth_format.has_stencil_aspect(),
             readback,
+            // Once the eye images exist; see `XrRenderer::new`.
+            reflect_groups: Vec::new(),
         })
     }
 }
@@ -1253,7 +1259,7 @@ impl XrRenderer {
         let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         // APPLICATION SPACEWARP's swapchains, where the runtime offers it.
-        let space_warp = xr_ctx.space_warp.and_then(|size| match SpaceWarpState::new(session, &wgpu_device, size, vk) {
+        let mut space_warp = xr_ctx.space_warp.and_then(|size| match SpaceWarpState::new(session, &wgpu_device, size, vk) {
             Ok(s) => Some(s),
             Err(e) => {
                 log::warn!("space warp: unavailable ({e})");
@@ -1280,6 +1286,18 @@ impl XrRenderer {
                 }
             });
             eye_targets.push(targets);
+        }
+        // What SpaceWarp's brush motion reads for reflections: each eye image's
+        // layer and that eye's probe pass reach.
+        if let Some(sw) = space_warp.as_mut() {
+            sw.reflect_groups = eye_targets
+                .iter()
+                .map(|eyes| {
+                    std::array::from_fn(|eye| {
+                        sw.pipelines.reflect_bind_group(&wgpu_device, &eyes[eye].view, &probe_pass_targets[eye].reach_view)
+                    })
+                })
+                .collect();
         }
 
         let white_pixel = [255u8, 255, 255, 255];
@@ -1994,7 +2012,15 @@ impl XrRenderer {
     /// player-frame transform. Per frame, unlike the sky or the tone curve --
     /// it changes every time they take a step.
     pub fn set_player_frame(&mut self, offset: glam::Vec3, yaw: f32) {
-        self.player = crate::renderer::uniforms::PlayerUpload { offset, yaw };
+        // The frame only: the characters' capsules are set on their own.
+        self.player.offset = offset;
+        self.player.yaw = yaw;
+    }
+
+    /// The characters as capsules for this frame, nearest first, in the
+    /// player's frame. See `uniforms::CapsuleUpload`.
+    pub fn set_capsules(&mut self, groups: &[crate::renderer::uniforms::CapsuleGroup]) {
+        self.player.capsules = crate::renderer::uniforms::CapsuleUpload::from_groups(groups);
     }
 
     pub fn set_sky(
