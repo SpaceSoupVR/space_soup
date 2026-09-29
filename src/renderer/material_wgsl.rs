@@ -95,12 +95,83 @@ fn biplanar_axes(world: vec3<f32>, n: vec3<f32>, repeat: f32) -> Biplanar {
 /// z and v along y, and on the z projection u runs along x and v along y. Using
 /// one swizzle for all three is the classic triplanar normal bug and it shows
 /// up as lighting that reverses across the axis boundary.
+///
+/// GREEN IS SUBTRACTED. The maps are OpenGL-style -- green is +Y, UP in the
+/// picture -- and wgpu samples v = 0 at the picture's top row, so the
+/// picture's up is DEcreasing v: -z on the y projection, -y on the other two.
+/// The swizzle this came from was written for a v-up (OpenGL/Unity) sampler,
+/// where adding green is right; here it lit every bump upside down along v
+/// until 2026-09-28. `normal_maps_light_bumps_from_the_side_the_light_is_on`
+/// in `brush_pipeline` pins the same convention for brushes.
 pub fn wgsl_whiteout_block() -> &'static str {
     r#"
 fn whiteout(axis: u32, tn: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    if (axis == 0u) { return vec3<f32>(abs(tn.z) * n.x, tn.y + n.y, tn.x + n.z); }
-    if (axis == 1u) { return vec3<f32>(tn.x + n.x, abs(tn.z) * n.y, tn.y + n.z); }
-    return vec3<f32>(tn.x + n.x, tn.y + n.y, abs(tn.z) * n.z);
+    if (axis == 0u) { return vec3<f32>(abs(tn.z) * n.x, n.y - tn.y, tn.x + n.z); }
+    if (axis == 1u) { return vec3<f32>(tn.x + n.x, abs(tn.z) * n.y, n.z - tn.y); }
+    return vec3<f32>(tn.x + n.x, n.y - tn.y, abs(tn.z) * n.z);
 }
 "#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `biplanar_uv` and `whiteout`, transcribed. Pinned to the WGSL text by
+    /// `the_transcription_is_the_shader_text`, so the geometry test below is a
+    /// test of the shader and not of a copy that could drift from it.
+    fn uv(axis: u32, w: [f32; 3]) -> [f32; 2] {
+        match axis {
+            0 => [w[2], w[1]],
+            1 => [w[0], w[2]],
+            _ => [w[0], w[1]],
+        }
+    }
+    fn whiteout(axis: u32, tn: [f32; 3], n: [f32; 3]) -> [f32; 3] {
+        match axis {
+            0 => [tn[2].abs() * n[0], n[1] - tn[1], tn[0] + n[2]],
+            1 => [tn[0] + n[0], tn[2].abs() * n[1], n[2] - tn[1]],
+            _ => [tn[0] + n[0], n[1] - tn[1], tn[2].abs() * n[2]],
+        }
+    }
+
+    #[test]
+    fn the_transcription_is_the_shader_text() {
+        let b = wgsl_biplanar_block();
+        assert!(b.contains("if (axis == 0u) { return world.zy / r; }"));
+        assert!(b.contains("if (axis == 1u) { return world.xz / r; }"));
+        assert!(b.contains("return world.xy / r;"));
+        let w = wgsl_whiteout_block();
+        assert!(w.contains("if (axis == 0u) { return vec3<f32>(abs(tn.z) * n.x, n.y - tn.y, tn.x + n.z); }"));
+        assert!(w.contains("if (axis == 1u) { return vec3<f32>(tn.x + n.x, abs(tn.z) * n.y, n.z - tn.y); }"));
+        assert!(w.contains("return vec3<f32>(tn.x + n.x, n.y - tn.y, abs(tn.z) * n.z);"));
+    }
+
+    /// ON EVERY PROJECTION, GREEN LEANS TOWARD THE TOP OF THE PICTURE AND RED
+    /// TOWARD ITS RIGHT, as OpenGL maps mean them. The top of the picture is
+    /// where v DEcreases -- wgpu reads v = 0 at the top row -- and its right is
+    /// where u increases. Measured by stepping through the world and asking
+    /// `biplanar_uv` which way each coordinate moves, so the test states the
+    /// convention without restating the swizzle it checks.
+    #[test]
+    fn green_leans_toward_the_top_of_the_picture_on_every_axis() {
+        for axis in 0..3u32 {
+            let mut n = [0.0f32; 3];
+            n[axis as usize] = 1.0;
+            let lean = |tn: [f32; 3]| {
+                let p = whiteout(axis, tn, n);
+                let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                [p[0] / len - n[0], p[1] / len - n[1], p[2] / len - n[2]]
+            };
+            let g = lean([0.0, 0.6, 0.8]);
+            let r = lean([0.6, 0.0, 0.8]);
+            // How u and v change when the world point moves along the lean.
+            let dv = |d: [f32; 3]| uv(axis, d)[1];
+            let du = |d: [f32; 3]| uv(axis, d)[0];
+            assert!(dv(g) < -0.1, "axis {axis}: green must lean toward decreasing v (the picture's top), leaned {g:?}");
+            assert!(du(g).abs() < 1e-6, "axis {axis}: green must not move u: {g:?}");
+            assert!(du(r) > 0.1, "axis {axis}: red must lean toward increasing u (the picture's right), leaned {r:?}");
+            assert!(dv(r).abs() < 1e-6, "axis {axis}: red must not move v: {r:?}");
+        }
+    }
 }

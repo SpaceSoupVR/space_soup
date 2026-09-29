@@ -2667,7 +2667,15 @@ struct VOut {{
     let t = normalize(in.tangent.xyz - n_geom * dot(n_geom, in.tangent.xyz));
     let b = cross(n_geom, t) * in.tangent.w;
     let tn = textureSample(mat_normal, mat_samp, in.uv, i32(in.material)).xyz * 2.0 - 1.0;
-    let n = normalize(t * tn.x + b * tn.y + n_geom * tn.z);
+    // GREEN IS THE IMAGE'S UP, WHICH IS -v HERE. Every installed map is
+    // OpenGL-style (ambientCG NormalGL: green = +Y = up in the picture), and
+    // wgpu samples v = 0 at the picture's TOP row, so up is DEcreasing v --
+    // while `b` above runs along INcreasing v (the face's v axis, `w` its
+    // handedness). Added with `+`, as it was until 2026-09-28, every bump was
+    // lit from the wrong side vertically: a crease under a ledge read as
+    // facing up, and the hallway's rock drew a black gash beside its sconce
+    // where a lit crease should be. `normal_maps_light_bumps_from_the_side_the_light_is_on`.
+    let n = normalize(t * tn.x - b * tn.y + n_geom * tn.z);
 
     // ADDED, not multiplied.
     //
@@ -2781,7 +2789,8 @@ mod tests {
     ///
     /// Encoded the way a normal map is: 0..255 mapping to -1..1, so 255 in red
     /// is a full tilt toward the face's u axis and 128 is no tilt at all.
-    /// Tilted along the face's V axis, so the surface leans UP.
+    /// Tilted along the face's V axis, so the surface leans UP: green is the
+    /// picture's up (OpenGL maps), and the harness shows its picture upright.
     ///
     /// `tilted_normal` leans along U, which for a +Z face is world +X -- and a
     /// surface tilted in X faces light arriving from +Y and from -Y exactly
@@ -3147,11 +3156,17 @@ mod tests {
             );
 
         // A triangle covering the viewport in clip space, facing +z, with the
-        // face's u axis along +x -- the frame a wall brush actually produces.
+        // face's u axis along +x and its v axis DOWN the screen, handedness -1
+        // -- the frame a wall brush actually produces (`default_axes` for a +z
+        // face: u = +x, v = -y; `an_unauthored_box_has_one_consistent_handedness`
+        // pins the -1). So the picture stands the right way up, as on a real
+        // wall. Until 2026-09-28 this ran v UP the screen with handedness +1:
+        // consistent with itself, but upside down against every real wall, and
+        // it hid that the shader read green the wrong way round.
         let v = |p: [f32; 3], uv: [f32; 2]| BrushVertex {
             position: p,
             normal: [0.0, 0.0, 1.0],
-            tangent: [1.0, 0.0, 0.0, 1.0],
+            tangent: [1.0, 0.0, 0.0, -1.0],
             uv,
             material,
             tint,
@@ -3172,10 +3187,13 @@ mod tests {
             // so every expectation in them still means what it meant.
             face_half_extent: [f32::INFINITY; 2],
         };
+        // v falls as y rises, through the same v = 0.5 * uv_scale at the centre
+        // pixel it always read there, so every expectation keyed to the centre
+        // texel still means what it meant.
         let verts = [
-            v([-1.0, -1.0, 0.0], [0.0, 0.0]),
-            v([3.0, -1.0, 0.0], [2.0 * uv_scale, 0.0]),
-            v([-1.0, 3.0, 0.0], [0.0, 2.0 * uv_scale]),
+            v([-1.0, -1.0, 0.0], [0.0, uv_scale]),
+            v([3.0, -1.0, 0.0], [2.0 * uv_scale, uv_scale]),
+            v([-1.0, 3.0, 0.0], [0.0, -uv_scale]),
         ];
 
         let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3906,6 +3924,55 @@ mod tests {
         assert!(
             tilted[0] > flat_px[0],
             "tilted toward the light should be brighter: {flat_px:?} vs {tilted:?}"
+        );
+    }
+
+    /// A NORMAL MAP'S "UP" FACES UP ON A WALL THAT SHOWS ITS PICTURE UPRIGHT.
+    ///
+    /// Stated as the physics, not as the shader's arithmetic: every installed
+    /// map is OpenGL-style, where green above 128 means "this texel faces the
+    /// TOP of the picture". On a wall whose picture stands the right way up
+    /// (the harness frame is a real wall's), a lamp ABOVE must light that texel
+    /// more than one whose green says it faces the bottom.
+    ///
+    /// Until 2026-09-28 the brush shader added green along +v -- DOWN the
+    /// picture in wgpu -- and lit every bump from the wrong side vertically;
+    /// the hallway rock drew a black gash beside its sconce (headset 21:46:25).
+    /// The existing tilt tests used red only, which both conventions share, and
+    /// the harness drew its picture upside down, so nothing could see it.
+    #[test]
+    fn normal_maps_light_bumps_from_the_side_the_light_is_on() {
+        let tilted = |green: u8| TerrainImage {
+            width: 4,
+            height: 4,
+            rgba: (0..16).flat_map(|_| [128, green, 200, 255]).collect(),
+        };
+        // Above the wall and in front of it. Dim, so no channel clips and the
+        // difference cannot vanish into saturation.
+        let above = glam::Vec3::new(0.3, 1.5, 0.8);
+        let grey = [Some(flat([90, 90, 90], 4))];
+        let Some(faces_up) = render_brush_material(
+            0, &grey, &[Some(tilted(230))], &[], &[], [1.0; 4], 1.0, true, above,
+        ) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let faces_down =
+            render_brush_material(0, &grey, &[Some(tilted(26))], &[], &[], [1.0; 4], 1.0, true, above).unwrap();
+        let flat_px =
+            render_brush_material(0, &grey, &[Some(flat([128, 128, 255], 4))], &[], &[], [1.0; 4], 1.0, true, above)
+                .unwrap();
+        let lum = |p: [u8; 4]| p[0] as i32 + p[1] as i32 + p[2] as i32;
+        eprintln!("faces up {faces_up:?}  flat {flat_px:?}  faces down {faces_down:?}");
+        assert!(faces_up[0] < 250 && faces_up[1] < 250, "clipped, so the comparison means nothing: {faces_up:?}");
+        assert!(
+            lum(faces_up) > lum(flat_px) && lum(flat_px) > lum(faces_down),
+            "a texel facing the top of the picture must be lit best by a lamp above: \
+             up {faces_up:?}, flat {flat_px:?}, down {faces_down:?}",
+        );
+        assert!(
+            lum(faces_up) > lum(faces_down) + 30,
+            "barely separated -- the tilt is hardly reaching the shading: {faces_up:?} vs {faces_down:?}",
         );
     }
 
