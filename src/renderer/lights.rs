@@ -699,6 +699,8 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let probe_depth_tex = binding_index + 7;
     let probe_depth_samp = binding_index + 8;
     let ground_tex = binding_index + 9;
+    let proxy_field_tex = binding_index + 10;
+    let proxy_field_rows = crate::renderer::proxy_field::MAX_PROXY_FIELDS * 2;
     // Three vec4 per probe -- centre, min, max -- so the WGSL array length is
     // three times the probe count. Derived rather than written twice: a shader
     // array shorter than the uniform reads garbage past its end.
@@ -769,6 +771,9 @@ struct Camera {{
     // Where the ground map lies: [min.x, min.z, 1 / extent.x, 1 / extent.z].
     // Must match `uniforms::Uniforms::ground_params`.
     ground_params: vec4<f32>,
+    // Where each model's distance field lies in the atlas: [origin, reach],
+    // [size, stop] per field. Must match `uniforms::Uniforms::proxy_fields`.
+    proxy_fields: array<vec4<f32>, {proxy_field_rows}>,
 }}
 
 // Undo the player-frame transform the CPU applied to this vertex.
@@ -827,6 +832,8 @@ struct Lights {{
 // THE GROUND SEEN FROM ABOVE: RGB the light it returns, A its world height.
 // See `ground_map` and `outdoor_radiance`.
 @group({group_index}) @binding({ground_tex}) var ground_map: texture_2d<f32>;
+// Standing models' distance fields. See `proxy_field` and `probe_proxy_field`.
+@group({group_index}) @binding({proxy_field_tex}) var proxy_field: texture_3d<f32>;
 
 const AMBIENT: f32 = 0.6;
 
@@ -2261,6 +2268,11 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip
     out.edge_cover = 0.0;
     out.edge_t = 0.0;
     var best = 3.4e38;
+    // The nearest model box with a distance field that the ray enters:
+    // walked once, after the loop. See the walk below.
+    var field_i = -1;
+    var field_near = 3.4e38;
+    var field_far = 0.0;
     // What stands in this room only, in order. See `probe_room_proxy`.
     for (var i = probe_room_proxy(room); i >= 0; i = probe_proxy_next(i)) {{
         if (i == skip) {{
@@ -2339,7 +2351,16 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip
                 // 2026-09-27).
                 best = t_in;
                 out.index = i;
+            }} else if (camera.probe_proxies[i * 3 + 1].w > 1.5) {{
+                // A MODEL WITH A DISTANCE FIELD: noted, and walked after the
+                // loop -- the nearest such box the ray enters.
+                if (t_in < field_near) {{
+                    field_i = i;
+                    field_near = t_in;
+                    field_far = min(far, t1);
+                }}
             }} else {{
+                // A model without one: the photographs' guess.
                 let t_surface = probe_proxy_surface(o, d, t_in, min(far, t1), room, camera.probe_proxies[i * 3].xyz);
                 if (t_surface < best) {{
                     best = t_surface;
@@ -2348,8 +2369,70 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip
             }}
         }}
     }}
+    // THE NEAREST MODEL'S OWN SHAPE, walked out here rather than inside the
+    // loop: there, every proxy's slab test stayed live beside the walk, and
+    // the probe pass went from 22 registers to 25 -- 50% of its waves in
+    // flight to 37%, for every texel, lamp or none (PIPESTATS, 2026-09-29).
+    // A ray through one lamp's empty box to another lamp behind it sees only
+    // the first: rare, and shown as the wall past it.
+    if (field_i >= 0 && field_near < best) {{
+        let t_surface = probe_proxy_field_at(o, d, field_i, field_near, min(field_far, best));
+        if (t_surface < best) {{
+            best = t_surface;
+            out.index = field_i;
+        }}
+    }}
     out.t = best;
     return out;
+}}
+
+// `probe_proxy_field` for proxy `i`: the ray into its box's own frame first.
+fn probe_proxy_field_at(o: vec3<f32>, d: vec3<f32>, i: i32, t_in: f32, t_out: f32) -> f32 {{
+    let q = camera.probe_proxies[i * 3 + 2];
+    var lo = o - camera.probe_proxies[i * 3].xyz;
+    var ld = d;
+    if (any(q != vec4<f32>(0.0, 0.0, 0.0, 1.0))) {{
+        let qi = vec4<f32>(-q.xyz, q.w);
+        lo = probe_quat_rotate(qi, lo);
+        ld = probe_quat_rotate(qi, ld);
+    }}
+    let box = camera.probe_proxies[i * 3 + 1];
+    return probe_proxy_field(lo, ld, box.xyz, t_in, t_out, i32(box.w) - 2);
+}}
+
+// Steps a ray may take through a model's distance field.
+const PROXY_FIELD_STEPS: i32 = 32;
+
+// WHERE INSIDE A MODEL'S BOX THE MODEL IS, by walking its distance field:
+// `lo`, `ld` the ray in the box's own frame, `half` the box, `t_in`..`t_out`
+// the stretch inside it. Each step goes as far as the field says is empty, at
+// least the stop distance, until it is within that of the surface (a hit) or
+// leaves the box (3.4e38). See `proxy_field` -- the surface itself, where
+// `probe_proxy_surface` below could only guess it from 256-pixel photographs.
+fn probe_proxy_field(lo: vec3<f32>, ld: vec3<f32>, half: vec3<f32>, t_in: f32, t_out: f32, field: i32) -> f32 {{
+    let slot = camera.proxy_fields[field * 2];
+    let size = camera.proxy_fields[field * 2 + 1];
+    // The ray straight in the atlas's coordinates, `uvw = fo + fd * t`: two
+    // vectors live through the walk instead of the box and the slot.
+    let scale = size.xyz * (0.5 / max(half, vec3<f32>(1e-4)));
+    let fo = slot.xyz + 0.5 * size.xyz + lo * scale;
+    let fd = ld * scale;
+    // Half a texel inside the field, so filtering never reaches the gap of
+    // "far" packed between fields.
+    let texel = 0.5 / vec3<f32>(textureDimensions(proxy_field));
+    let lo_uvw = slot.xyz + texel;
+    let hi_uvw = slot.xyz + size.xyz - texel;
+    var hit = 3.4e38;
+    var t = t_in;
+    for (var k = 0; k < PROXY_FIELD_STEPS && t <= t_out; k = k + 1) {{
+        let dist = textureSampleLevel(proxy_field, probe_samp, clamp(fo + fd * t, lo_uvw, hi_uvw), 0.0).r * slot.w;
+        if (dist <= size.w) {{
+            hit = t;
+            break;
+        }}
+        t = t + dist;
+    }}
+    return hit;
 }}
 
 // WHERE INSIDE A MODEL'S BOX the model itself is, between `t_in` and `t_out`;
@@ -5221,6 +5304,7 @@ mod probe_trace_gpu_tests {
             rotation: Quat::IDENTITY,
             volume: 0,
             solid: true,
+            field: None,
         };
         let lamp = ProbeProxy {
             centre: Vec3::new(0.0, 2.5, -12.0),
@@ -5228,6 +5312,7 @@ mod probe_trace_gpu_tests {
             rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_4),
             volume: 0,
             solid: true,
+            field: None,
         };
         probes.set_proxies(&[pillar, lamp], Vec3::ZERO, &[0, 1]);
         // As `Uniforms::update` fills it: rooms renumbered, with their tables.
@@ -5315,13 +5400,19 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
             ..Default::default()
         });
         let (_, depth_samp) = crate::renderer::uniforms::default_probe_depth(&device);
+        // The models' distance fields, and the sampler the trace reads them
+        // with: none here, every proxy is a box. See `proxy_field`.
+        let (_, probe_samp) = crate::renderer::uniforms::default_probe_cube(&device);
+        let fields = crate::renderer::proxy_field::none(&device);
         let g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&probe_samp) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&depth_view) },
                 wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&depth_samp) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&fields) },
             ],
         });
         let g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -5625,5 +5716,156 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         assert!(hits > rays.len() / 3 && hits < rays.len(), "{hits} of {} rays met the ground: not a test of both", rays.len());
         assert!(grazing <= rays.len() / 100, "{grazing} grazing disagreements");
+    }
+}
+
+/// A MODEL'S DISTANCE FIELD, WALKED ON THE GPU: the real WGSL
+/// `probe_proxy_field` over a sphere's field in its box, from a compute shader.
+#[cfg(test)]
+mod proxy_field_gpu_tests {
+    use super::*;
+    use crate::renderer::proxy_field::{self, ProxyField};
+    use crate::renderer::uniforms::Uniforms;
+    use glam::Vec3;
+    use wgpu::util::DeviceExt;
+
+    const HALF: f32 = 0.3;
+    const RADIUS: f32 = 0.2;
+    const SAMPLES: u32 = 24;
+
+    /// A sphere of `RADIUS` in a cube of half-size `HALF`: unsigned distance,
+    /// reaching four samples, as `model_field` builds a model's.
+    fn sphere() -> ProxyField {
+        let cell = 2.0 * HALF / SAMPLES as f32;
+        let reach = 4.0 * cell;
+        let mut distances = Vec::with_capacity((SAMPLES * SAMPLES * SAMPLES) as usize);
+        for k in 0..SAMPLES {
+            for j in 0..SAMPLES {
+                for i in 0..SAMPLES {
+                    let p = (Vec3::new(i as f32, j as f32, k as f32) + 0.5) * cell - HALF;
+                    let d = (p.length() - RADIUS).abs();
+                    distances.push(((d / reach).min(1.0) * 255.0).round() as u8);
+                }
+            }
+        }
+        ProxyField { dims: [SAMPLES; 3], max_distance: reach, distances }
+    }
+
+    /// Walk each box-local `(origin, direction)` through the field.
+    fn walk(rays: &[(Vec3, Vec3)]) -> Option<Vec<f32>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let (atlas, slots) = proxy_field::atlas(&device, &queue, &[sphere()])?;
+        let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
+        let mut u: Uniforms = bytemuck::Zeroable::zeroed();
+        u.proxy_fields[0] = slots[0];
+        let code = format!(
+            "{}\n{}",
+            wgsl_lights_block(0, 1),
+            r#"
+@group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> hits: array<f32>;
+@compute @workgroup_size(1)
+fn walk_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let o = rays[id.x * 2u].xyz;
+    let d = normalize(rays[id.x * 2u + 1u].xyz);
+    let half = vec3<f32>(rays[id.x * 2u].w);
+    // Where the ray is inside the box.
+    let inv = 1.0 / d;
+    let ta = (-half - o) * inv;
+    let tb = (half - o) * inv;
+    let t_in = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z));
+    let t_out = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
+    hits[id.x] = probe_proxy_field(o, d, half, t_in, t_out, 0);
+}
+"#
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("walk_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&u),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let packed: Vec<[f32; 4]> = rays.iter().flat_map(|(o, d)| [[o.x, o.y, o.z, HALF], [d.x, d.y, d.z, 0.0]]).collect();
+        let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&packed),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let size = (rays.len() * 4) as u64;
+        let hit_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&samp) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&atlas) },
+            ],
+        });
+        let g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: hit_buf.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups(rays.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&hit_buf, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let data: Vec<f32> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().ok()?).to_vec();
+        Some(data)
+    }
+
+    /// Straight at the sphere, the walk stops on its surface; through its
+    /// edge, where the chord says; five centimetres above it, through air
+    /// the box's bounds would have called solid, it finds nothing.
+    #[test]
+    fn the_walk_stops_on_the_model_and_passes_the_air_around_it() {
+        let x = Vec3::X;
+        let edge_y = 0.18f32;
+        let Some(t) = walk(&[
+            (Vec3::new(-1.0, 0.0, 0.0), x),
+            (Vec3::new(-1.0, edge_y, 0.0), x),
+            (Vec3::new(-1.0, 0.25, 0.0), x),
+            (Vec3::new(0.0, -1.0, 0.0), Vec3::Y),
+        ]) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let stop = 4.0 * 2.0 * HALF / SAMPLES as f32 / 8.0;
+        let chord = 1.0 - (RADIUS * RADIUS - edge_y * edge_y).sqrt();
+        assert!((t[0] - (1.0 - RADIUS)).abs() < 2.0 * stop, "straight at it: t {} vs {}", t[0], 1.0 - RADIUS);
+        assert!((t[1] - chord).abs() < 3.0 * stop, "through its edge: t {} vs {}", t[1], chord);
+        assert!(t[2] > 1e30, "five centimetres above it, a hit at {}", t[2]);
+        assert!((t[3] - (1.0 - RADIUS)).abs() < 2.0 * stop, "from below: t {}", t[3]);
     }
 }

@@ -149,12 +149,23 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
             .limits
             .max_texture_array_layers
             .max(wgpu::Limits::downlevel_defaults().max_texture_array_layers),
+        // THE SCENE SHADERS' TEXTURES: 17 in the brush shader that reads the
+        // probe pass, one over WebGPU's portable 16. As many as the scene asks
+        // for (`uniforms::scene_limits`), as far as the device allows -- and
+        // the Adreno's Vulkan allows far more.
+        max_sampled_textures_per_shader_stage: exposed
+            .capabilities
+            .limits
+            .max_sampled_textures_per_shader_stage
+            .min(crate::renderer::uniforms::SCENE_SAMPLED_TEXTURES)
+            .max(wgpu::Limits::downlevel_defaults().max_sampled_textures_per_shader_stage),
         ..wgpu::Limits::downlevel_defaults()
     };
     log::info!(
-        "wgpu: max_multiview_view_count = {}, max_texture_array_layers = {}",
+        "wgpu: max_multiview_view_count = {}, max_texture_array_layers = {}, max_sampled_textures_per_shader_stage = {}",
         limits.max_multiview_view_count,
         limits.max_texture_array_layers,
+        limits.max_sampled_textures_per_shader_stage,
     );
     let open_device = exposed.adapter.device_from_raw(
         vk.device.clone(),
