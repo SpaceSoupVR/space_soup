@@ -694,6 +694,58 @@ impl XrRenderer {
             crate::renderer::lights::dynamic_sun_matrix(world_dir, head_world) * player_to_world
         });
 
+        // THE PLAYER'S CRISP SHADOWS: the lamps lighting them most that hold
+        // no spot slot each fill a characters-only tile, fitted round the
+        // player's capsules. See `shadow::MAX_CHARACTER_SHADOWS`.
+        let character_tiles: Vec<(usize, glam::Mat4)> = if fx.shadows && fx.character_shadows && self.player.capsules.group_count > 0 {
+            let b = self.player.capsules.groups[0];
+            let (centre, radius) = (glam::Vec3::new(b[0], b[1], b[2]), b[3]);
+            let lamps: Vec<crate::renderer::shadow::CharacterLamp> = lights
+                .iter()
+                .enumerate()
+                .map(|(i, l)| crate::renderer::shadow::CharacterLamp {
+                    position: l.position,
+                    direction: l.direction,
+                    cos_outer: if l.kind == crate::renderer::LightKind::Spot {
+                        (l.cone_angle_deg.to_radians() * 0.5).cos()
+                    } else {
+                        -1.0
+                    },
+                    range: l.range,
+                    intensity: l.intensity,
+                    eligible: l.kind != crate::renderer::LightKind::Directional && !spot_indices.contains(&i),
+                })
+                .collect();
+            let chosen =
+                crate::renderer::shadow::character_shadow_lamps(&lamps, centre, radius, &self.character_shadow_held.borrow());
+            let now: Vec<glam::Vec3> = chosen.iter().map(|&i| lights[i].position).collect();
+            // On CHANGE, as the spot slots are reported: silence means stable.
+            if *self.character_shadow_held.borrow() != now {
+                log::info!(
+                    "CHARSHADOWS lamps {:?} at {:?} for the player at ({:.2}, {:.2}, {:.2}) r {:.2}",
+                    chosen,
+                    now.iter().map(|p| [p.x, p.y, p.z].map(|v| (v * 100.0).round() / 100.0)).collect::<Vec<_>>(),
+                    centre.x, centre.y, centre.z, radius,
+                );
+            }
+            *self.character_shadow_held.borrow_mut() = now;
+            chosen
+                .into_iter()
+                .filter_map(|i| {
+                    crate::renderer::shadow::character_light_matrix(lights[i].position, centre, radius, lights[i].range)
+                        .map(|m| (i, m))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // The player as this frame's uniforms carry it: which lights hold the
+        // characters' tiles. A copy, because the frame holds borrows of the
+        // renderer by now.
+        let mut frame_player = self.player;
+        frame_player.capsules.shadow_lights =
+            std::array::from_fn(|k| character_tiles.get(k).map_or(-1.0, |(i, _)| *i as f32));
+
         let shadow = crate::renderer::uniforms::ShadowUpload {
             sun_view_proj: match static_sun {
                 Some((m, _)) => m,
@@ -704,12 +756,15 @@ impl XrRenderer {
                     .unwrap_or(glam::Mat4::IDENTITY),
             },
             spot_view_proj: {
-                let mut m = [glam::Mat4::IDENTITY; crate::renderer::shadow::MAX_SPOT_SHADOWS];
+                let mut m = [glam::Mat4::IDENTITY; crate::renderer::shadow::SHADOW_TILES];
                 for (layer, &i) in spot_indices.iter().enumerate() {
                     let l = &lights[i];
                     m[layer] = crate::renderer::shadow::spot_light_matrix(
                         l.position, l.direction, l.cone_angle_deg, l.range,
                     );
+                }
+                for (k, (_, tile)) in character_tiles.iter().enumerate() {
+                    m[crate::renderer::shadow::MAX_SPOT_SHADOWS + k] = *tile;
                 }
                 m
             },
@@ -721,7 +776,7 @@ impl XrRenderer {
 
         // A static sun map is recorded only when it went stale.
         let record_sun = shadow.sun_enabled && static_sun.is_none_or(|(_, stale)| stale);
-        if record_sun || shadow.sun_dynamic_enabled || shadow.spot_count > 0 {
+        if record_sun || shadow.sun_dynamic_enabled || shadow.spot_count > 0 || !character_tiles.is_empty() {
             let solid_caster = (!solid_idx.is_empty())
                 .then_some((&solid_vb, &solid_ib, solid_idx.len() as u32));
             let brush_caster = brush_buffers
@@ -840,7 +895,10 @@ impl XrRenderer {
                     shadow.spot_view_proj[layer],
                 );
             }
-            if shadow.spot_count > 0 {
+            for (k, (_, tile)) in character_tiles.iter().enumerate() {
+                self.shadow_map.upload_light(&self.wgpu_queue, crate::renderer::shadow::ShadowKind::Character(k), *tile);
+            }
+            if shadow.spot_count > 0 || !character_tiles.is_empty() {
                 drawn += self.shadow_map.record_spots(
                     &mut encoder,
                     shadow.spot_count as usize,
@@ -850,6 +908,7 @@ impl XrRenderer {
                     &shadow_casters,
                     &skinned_casters,
                     &solid_chunks,
+                    character_tiles.len(),
                 );
             }
             if diag {
@@ -1003,7 +1062,7 @@ impl XrRenderer {
                 let mirror_eye = mirror_view.inverse().transform_point3(glam::Vec3::ZERO);
                 self.uniform_buf.upload_scene(
                     &self.wgpu_queue, mirror_view_proj, mirror_eye, &shadow, &sky_upload,
-                    &post, &self.player,
+                    &post, &frame_player,
                 );
                 self.mirror_reflected_vp_uniform.upload(&self.wgpu_queue, mirror_view_proj);
 
@@ -1312,12 +1371,12 @@ impl XrRenderer {
             if stereo && eye == 0 {
                 self.uniform_buf.upload_scene_stereo(
                     &self.wgpu_queue, both_view_proj, both_cam_pos, &shadow, &sky_upload,
-                    &post, &self.player, probes_arg,
+                    &post, &frame_player, probes_arg,
                 );
             } else {
                 self.uniform_buf.upload_scene_with_probes(
                     &self.wgpu_queue, eye_view_proj, cam_pos, &shadow, &sky_upload, &post,
-                    &self.player,
+                    &frame_player,
                     // `Some(empty)`, not `None`: `None` means "use the level's
                     // probes", which would leave them on and label it off.
                     probes_arg,
@@ -1809,7 +1868,7 @@ impl XrRenderer {
                     );
                     self.uniform_buf.upload_scene_with_probes(
                         &self.wgpu_queue, eye_view_proj, cam_pos, &shadow, &sky_upload,
-                        &post, &self.player, probes_arg,
+                        &post, &frame_player, probes_arg,
                     );
                 }
                 // THE MIP CHAIN, in this encoder, after the pass that filled

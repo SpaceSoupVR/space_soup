@@ -61,6 +61,10 @@ pub struct Levers {
     pub shadows: bool,
     /// The moving-objects sun map. The static map and the baked mask stay.
     pub sun_dynamic: bool,
+    /// The player's crisp shadows from the lamps lighting them most: a
+    /// characters-only tile of the shadow atlas each. Off, those lamps shadow
+    /// the player by the capsules alone. See `shadow::MAX_CHARACTER_SHADOWS`.
+    pub character_shadows: bool,
     /// The live light loop, the sky's sun included. Baked light and probes stay.
     pub direct_lights: bool,
     /// The STATIONARY lamps -- shaded live, shadowed from their baked masks.
@@ -162,6 +166,7 @@ impl Default for Levers {
             portals: true,
             shadows: true,
             sun_dynamic: true,
+            character_shadows: true,
             direct_lights: true,
             stationary_lights: true,
             eye_adaptation: true,
@@ -246,6 +251,7 @@ impl Levers {
         flag("portals", self.portals, d.portals);
         flag("shadows", self.shadows, d.shadows);
         flag("sun_dynamic", self.sun_dynamic, d.sun_dynamic);
+        flag("character_shadows", self.character_shadows, d.character_shadows);
         flag("direct_lights", self.direct_lights, d.direct_lights);
         flag("stationary", self.stationary_lights, d.stationary_lights);
         flag("eye_adaptation", self.eye_adaptation, d.eye_adaptation);

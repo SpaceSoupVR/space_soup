@@ -306,7 +306,9 @@ impl Renderer {
         let sun_view_proj = sun
             .map(|l| shadow::directional_light_matrix(l.direction, focus, self.sun_shadow_radius))
             .unwrap_or(glam::Mat4::IDENTITY);
-        let mut spot_view_proj = [glam::Mat4::IDENTITY; shadow::MAX_SPOT_SHADOWS];
+        // The characters' tiles are the headset's; the desktop leaves them
+        // empty. See `shadow::MAX_CHARACTER_SHADOWS`.
+        let mut spot_view_proj = [glam::Mat4::IDENTITY; shadow::SHADOW_TILES];
         for (layer, &i) in spot_indices.iter().enumerate() {
             let l = &lights[i];
             spot_view_proj[layer] =

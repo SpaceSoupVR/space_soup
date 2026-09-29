@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use super::shadow::MAX_SPOT_SHADOWS;
+use super::shadow::SHADOW_TILES;
 use glam::{Mat4, Quat, Vec3};
 use wgpu::*;
 
@@ -35,7 +35,10 @@ pub struct Uniforms {
     /// matrix and the first spot in the scene silently claimed it, so a room
     /// with two identical fixtures had one casting a shadow and one not -- which
     /// reads as a broken light rather than an exhausted budget.
-    pub spot_view_proj: [[[f32; 4]; 4]; MAX_SPOT_SHADOWS],
+    ///
+    /// Then the characters' own tiles (`shadow::MAX_CHARACTER_SHADOWS`), whose
+    /// lamps `capsule_params` names.
+    pub spot_view_proj: [[[f32; 4]; 4]; SHADOW_TILES],
     /// World-space camera position (xyz) PER EYE; w unused. Drives specular.
     ///
     /// Per eye for the same reason the matrices are: the two eyes are a few
@@ -137,7 +140,9 @@ pub struct Uniforms {
     /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
     pub capsules: [[f32; 4]; MAX_CAPSULES * 2],
     pub capsule_groups: [[f32; 4]; MAX_CAPSULE_GROUPS * 2],
-    /// x = how many characters. yzw reserved.
+    /// x = how many characters; y, z = which light casts the characters' crisp
+    /// shadow into their first and second tile (`shadow::MAX_CHARACTER_SHADOWS`),
+    /// -1 for none. w reserved.
     pub capsule_params: [f32; 4],
 }
 
@@ -257,11 +262,20 @@ pub struct CapsuleUpload {
     pub capsules: [[f32; 4]; MAX_CAPSULES * 2],
     pub groups: [[f32; 4]; MAX_CAPSULE_GROUPS * 2],
     pub group_count: u32,
+    /// Which light (its index in the frame's list) casts the characters'
+    /// shadow into each of their tiles, -1 for none: set each frame by the
+    /// renderer, which chooses them. See `shadow::MAX_CHARACTER_SHADOWS`.
+    pub shadow_lights: [f32; 2],
 }
 
 impl Default for CapsuleUpload {
     fn default() -> Self {
-        Self { capsules: [[0.0; 4]; MAX_CAPSULES * 2], groups: [[0.0; 4]; MAX_CAPSULE_GROUPS * 2], group_count: 0 }
+        Self {
+            capsules: [[0.0; 4]; MAX_CAPSULES * 2],
+            groups: [[0.0; 4]; MAX_CAPSULE_GROUPS * 2],
+            group_count: 0,
+            shadow_lights: [-1.0; 2],
+        }
     }
 }
 
@@ -357,8 +371,9 @@ pub struct ShadowUpload {
     /// Whether that map was drawn this frame. When it was not, the shader
     /// treats every point as unshadowed by moving things.
     pub sun_dynamic_enabled: bool,
-    /// One per shadow-casting spot, in shadow-layer order.
-    pub spot_view_proj: [Mat4; MAX_SPOT_SHADOWS],
+    /// One per shadow-casting spot, in shadow-layer order; then one per
+    /// characters' tile (`shadow::MAX_CHARACTER_SHADOWS`).
+    pub spot_view_proj: [Mat4; SHADOW_TILES],
     pub sun_enabled: bool,
     /// How many spot shadow layers this frame actually filled.
     ///
@@ -376,7 +391,7 @@ impl ShadowUpload {
             sun_view_proj: Mat4::IDENTITY,
             sun_dynamic_view_proj: Mat4::IDENTITY,
             sun_dynamic_enabled: false,
-            spot_view_proj: [Mat4::IDENTITY; MAX_SPOT_SHADOWS],
+            spot_view_proj: [Mat4::IDENTITY; SHADOW_TILES],
             sun_enabled: false,
             spot_count: 0,
         }
@@ -838,7 +853,12 @@ impl UniformBuffer {
             building_boxes: probes.buildings,
             capsules: player.capsules.capsules,
             capsule_groups: player.capsules.groups,
-            capsule_params: [player.capsules.group_count as f32, 0.0, 0.0, 0.0],
+            capsule_params: [
+                player.capsules.group_count as f32,
+                player.capsules.shadow_lights[0],
+                player.capsules.shadow_lights[1],
+                0.0,
+            ],
             post_params: [
                 post.exposure,
                 match post.tonemap {
