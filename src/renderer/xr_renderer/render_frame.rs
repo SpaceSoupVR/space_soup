@@ -491,7 +491,7 @@ impl XrRenderer {
         // EYE ADAPTATION: meter what the player is looking at, from the probe
         // of the room they stand in, and ease the exposure toward it. The
         // head and gaze go back to WORLD space, where the probes were baked.
-        let post = {
+        let mut post = {
             let now = std::time::Instant::now();
             let dt = self
                 .last_frame_at
@@ -697,7 +697,7 @@ impl XrRenderer {
         // THE PLAYER'S CRISP SHADOWS: the lamps lighting them most that hold
         // no spot slot each fill a characters-only tile, fitted round the
         // player's capsules. See `shadow::MAX_CHARACTER_SHADOWS`.
-        let character_tiles: Vec<(usize, glam::Mat4)> = if fx.shadows && fx.character_shadows && self.player.capsules.group_count > 0 {
+        let character_tiles: Vec<(usize, glam::Mat4)> = if fx.shadows && fx.character_shadows && fx.capsules && self.player.capsules.group_count > 0 {
             let b = self.player.capsules.groups[0];
             let (centre, radius) = (glam::Vec3::new(b[0], b[1], b[2]), b[3]);
             let lamps: Vec<crate::renderer::shadow::CharacterLamp> = lights
@@ -743,6 +743,9 @@ impl XrRenderer {
         // characters' tiles. A copy, because the frame holds borrows of the
         // renderer by now.
         let mut frame_player = self.player;
+        if !fx.capsules {
+            frame_player.capsules.group_count = 0;
+        }
         frame_player.capsules.shadow_lights =
             std::array::from_fn(|k| character_tiles.get(k).map_or(-1.0, |(i, _)| *i as f32));
 
@@ -1005,6 +1008,8 @@ impl XrRenderer {
             && self.debug_view == crate::renderer::brush_pipeline::DebugView::Off
             && brush_buffers.is_some()
             && self.levers.space_warp_debug & 16384 == 0;
+        // The brushes write their reflected share into alpha only for this.
+        post.reflection_share = warp_reflections && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some());
         if let Some(sw) = self.space_warp.as_ref().filter(|sw| sw.acquired.is_some()) {
             use crate::renderer::space_warp::{previous_clip, MotionCamera, SLOT_STRIDE};
             let stride = SLOT_STRIDE as usize;

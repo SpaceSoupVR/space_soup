@@ -65,6 +65,10 @@ pub struct Levers {
     /// characters-only tile of the shadow atlas each. Off, those lamps shadow
     /// the player by the capsules alone. See `shadow::MAX_CHARACTER_SHADOWS`.
     pub character_shadows: bool,
+    /// The characters as capsules: their soft shadows, contact darkening and
+    /// reflections. Off, the shaders see no characters (and the characters'
+    /// shadow tiles go with them). See `uniforms::CapsuleUpload`.
+    pub capsules: bool,
     /// The live light loop, the sky's sun included. Baked light and probes stay.
     pub direct_lights: bool,
     /// The STATIONARY lamps -- shaded live, shadowed from their baked masks.
@@ -167,6 +171,7 @@ impl Default for Levers {
             shadows: true,
             sun_dynamic: true,
             character_shadows: true,
+            capsules: true,
             direct_lights: true,
             stationary_lights: true,
             eye_adaptation: true,
@@ -252,6 +257,7 @@ impl Levers {
         flag("shadows", self.shadows, d.shadows);
         flag("sun_dynamic", self.sun_dynamic, d.sun_dynamic);
         flag("character_shadows", self.character_shadows, d.character_shadows);
+        flag("capsules", self.capsules, d.capsules);
         flag("direct_lights", self.direct_lights, d.direct_lights);
         flag("stationary", self.stationary_lights, d.stationary_lights);
         flag("eye_adaptation", self.eye_adaptation, d.eye_adaptation);

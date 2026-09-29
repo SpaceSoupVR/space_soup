@@ -8,12 +8,6 @@ use super::Color3;
 /// fragment shaders — keep these in sync.
 pub const MAX_LIGHTS: usize = 8;
 
-/// A lamp's bulb radius for the characters' capsule shadows, in metres: the
-/// stationary masks' bulb (`space_soup_engine::stationary::STATIONARY_BULB_RADIUS`),
-/// so a character's shadow is exactly as soft as the pillar's beside it from
-/// the same lamp. See `capsule_visibility` in the lights block.
-pub const CAPSULE_BULB_RADIUS: f32 = 0.03;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightKind {
     Point,
@@ -711,7 +705,6 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let capsule_rows = crate::renderer::uniforms::MAX_CAPSULES * 2;
     let capsule_group_rows = crate::renderer::uniforms::MAX_CAPSULE_GROUPS * 2;
     let capsules_per_group = crate::renderer::uniforms::CAPSULES_PER_GROUP;
-    let capsule_bulb_radius = CAPSULE_BULB_RADIUS;
     let reflection_contrast = format!("{:?}", crate::renderer::space_warp::REFLECTION_CONTRAST_RATIO);
     // Three vec4 per probe -- centre, min, max -- so the WGSL array length is
     // three times the probe count. Derived rather than written twice: a shader
@@ -1015,11 +1008,11 @@ fn stationary_visibility_of(marker: f32) -> f32 {{
     let v = select(stationary_vis_b, stationary_vis_a, c < 4);
     return v[c & 3];
 }}
-// THE CHARACTERS AS CAPSULES: their shadows from lamps that keep no shadow map
-// for them, the darkening of what they stand over in indirect light, and their
-// presence in reflections. See `uniforms::CapsuleUpload`.
+// THE CHARACTERS AS CAPSULES: the darkening of what they stand over in
+// indirect light, and their presence in reflections -- one loop a pixel each.
+// Their shadows from lamps are the characters' shadow tiles (see the lamp
+// loop). See `uniforms::CapsuleUpload`.
 const CAPSULES_PER_GROUP: i32 = {capsules_per_group};
-const CAPSULE_BULB_RADIUS: f32 = {capsule_bulb_radius};
 // How far past a character's bound its contact darkening can reach.
 const CAPSULE_AMBIENT_REACH: f32 = 0.6;
 // HOW WRONG A CAPSULE BODY IS, in metres: no clothes, hands, shoulders or
@@ -1027,7 +1020,7 @@ const CAPSULE_AMBIENT_REACH: f32 = 0.6;
 // reads as a mannequin, and the headset's pillar reflected the player as a
 // stick figure waving its arms (2026-09-29). So its reflection and its shadow
 // are blurred by at least this, and a limb thinner than the blur fades with
-// it. The crisp shadow of the real body is a shadow map's job.
+// it. The crisp shadow of the real body is the characters' shadow tiles'.
 const CAPSULE_SHAPE_BLUR: f32 = 0.15;
 // Whether this surface takes the characters' shadows and darkening: not the
 // characters themselves, whose surfaces lie inside their own capsules.
@@ -1045,74 +1038,6 @@ fn capsule_nearest_to_ray(a: vec3<f32>, b: vec3<f32>, o: vec3<f32>, d: vec3<f32>
         s = (bad * dot(oa, d) - dot(oa, ba)) / denom;
     }}
     return a + ba * clamp(s, 0.0, 1.0);
-}}
-
-// How much of a light's disc -- `light` its angular radius -- a disc of
-// angular radius `occ`, centred `sep` from it, covers: the cone-cone overlap
-// of Unreal's capsule shadows (after Oat and Sander's ambient aperture
-// lighting). All of the smaller when one holds the other, none when they are
-// apart, a smooth step between.
-fn capsule_cone_overlap(light: f32, occ: f32, sep: f32) -> f32 {{
-    let smaller = min(light, occ);
-    let most = smaller * smaller / max(light * light, 1e-10);
-    let inner = abs(light - occ);
-    let t = clamp((sep - inner) / max(light + occ - inner, 1e-6), 0.0, 1.0);
-    return most * (1.0 - smoothstep(0.0, 1.0, t));
-}}
-
-// HOW MUCH OF LAMP `l` THE CHARACTERS LET THROUGH TO `p`: each capsule as the
-// sphere at its point nearest the ray to the lamp, the lamp as a disc the size
-// of its bulb -- the share of that disc the spheres cover. Hard where a foot
-// meets the floor, softening with distance as a real penumbra does: sized by
-// the bulb, never blurred for looks. Unreal's capsule shadows. Point and spot
-// lamps only: the sun's shadow of a character is in the moving-objects map.
-fn capsule_visibility(l: Light, p: vec3<f32>) -> f32 {{
-    return capsule_visibility_from(l, p, 0);
-}}
-
-// The same from character `first` on: from 1 where the lamp's own tile of the
-// characters already shadows the player (`character_shadow_tile`), whose
-// capsules would only darken that shadow a second time.
-fn capsule_visibility_from(l: Light, p: vec3<f32>, first: i32) -> f32 {{
-    let groups = i32(camera.capsule_params.x);
-    if (groups <= first || !capsule_receiver) {{
-        return 1.0;
-    }}
-    let v = l.position.xyz - p;
-    let reach = length(v);
-    let to_l = v / max(reach, 1e-4);
-    let light = CAPSULE_BULB_RADIUS / max(reach, 1e-3);
-    var vis = 1.0;
-    for (var g = first; g < groups; g = g + 1) {{
-        // The character's bound against the stretch of ray it could shadow,
-        // widened by the lamp's cone where it passes.
-        let bound = camera.capsule_groups[g * 2];
-        let oc = bound.xyz - p;
-        let along = clamp(dot(oc, to_l), 0.0, reach);
-        if (length(oc - to_l * along) > bound.w + along * light) {{
-            continue;
-        }}
-        let count = i32(camera.capsule_groups[g * 2 + 1].w);
-        for (var k = 0; k < count; k = k + 1) {{
-            let i = g * CAPSULES_PER_GROUP + k;
-            let ar = camera.capsules[i * 2];
-            let w = capsule_nearest_to_ray(ar.xyz, camera.capsules[i * 2 + 1].xyz, p, to_l) - p;
-            let t = dot(w, to_l);
-            if (t <= 0.0 || t >= reach) {{
-                continue;
-            }}
-            let d = max(length(w), 1e-4);
-            // Small angles: the sphere's angular radius, and (as its sine)
-            // the angle between it and the lamp -- alike where they matter.
-            let occ = min(ar.w / d, 1.0);
-            let sep = length(cross(w / d, to_l));
-            // The lamp as seen past this capsule never smaller than the
-            // body's own error seen from here: see `CAPSULE_SHAPE_BLUR`.
-            let soft = max(light, CAPSULE_SHAPE_BLUR / d);
-            vis = vis * (1.0 - capsule_cone_overlap(soft, occ, sep));
-        }}
-    }}
-    return vis;
 }}
 
 // THE CHARACTERS' CONTACT DARKENING at `p`, facing `n`: the share of the light
@@ -3470,13 +3395,32 @@ fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32,
     }}
     col = col / (w0 + w1);
     // A MODEL, where no photograph saw it, is the model: see
-    // `probe_model_colour`. A room's wall no photograph saw keeps the less
-    // wrong photograph above -- black holes in walls behind a pillar are worse.
+    // `probe_model_colour`.
     if (model && seen < 1.0) {{
         col = mix(probe_model_colour(i32(-2.0 - other), -d, s0), col, seen);
     }}
+    // A ROOM'S WALL NO PHOTOGRAPH SAW: the photograph shows whatever stood in
+    // front of it there -- a sconce, whose silhouette, cut out along the
+    // photograph's depth texels, read on the polished doorway jamb as a
+    // stepped "shadow the wall shouldn't cast" (headset, 2026-09-29). Read
+    // the same photograph soft enough that the thing in front is averaged into
+    // the wall around it. Black holes in walls behind a pillar were worse, so
+    // it is still the photograph. What this wants is photographs taken without
+    // the props in them (tracker).
+    if (!model && seen < 1.0) {{
+        let wide = textureSampleLevel(
+            probe_cube, probe_samp, h - camera.probe_boxes[s0 * 3].xyz, i32(camera.probe_boxes[s0 * 3].w),
+            max(probe_hit_lod(roughness, t, sqrt(d0)), PROBE_UNSEEN_LOD)
+        );
+        col = mix(wide, col, seen);
+    }}
     return col;
 }}
+
+// How soft a photograph is read where it did not see a room's wall: level 4 of
+// a 256-texel face is about six degrees a texel, wider than a sconce seen from
+// across a room. See `probe_hit_colour`.
+const PROBE_UNSEEN_LOD: f32 = 4.0;
 
 // THE COLOUR OF A TRACED HIT: where the ray left the rooms, what lies out
 // there (`probe_escape_colour`); else the photographs of its room that saw it
@@ -3811,6 +3755,10 @@ const REFLECTION_BLURRED_ROUGHNESS: f32 = 0.3;
 // any blend over it average it as they average the colour.
 const REFLECTION_CONTRAST_RATIO: f32 = {reflection_contrast};
 fn reflection_alpha(lit: vec3<f32>) -> f32 {{
+    // Only while SpaceWarp's motion pass reads it (`PostUpload::reflection_share`).
+    if (camera.post_params.w < 0.5) {{
+        return 1.0;
+    }}
     let total = dot(lit, vec3<f32>(0.2126, 0.7152, 0.0722));
     let share = clamp(reflected_image / max(total, 1e-6), 0.0, 1.0);
     let image = REFLECTION_CONTRAST_RATIO * share;
@@ -4306,13 +4254,12 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
         if (tile >= 0) {{
             shadow = shadow * pcf_layer(spot_shadow_tex, tile, world_pos, camera.spot_view_proj[tile]);
         }}
-        // THE CHARACTERS' SHADOWS from a lamp with no map that holds them. See
-        // `capsule_visibility`: the sun's are in its moving-objects map, and a
-        // spot's shadow slot draws them already. A characters' tile holds the
-        // player's; the capsules keep everyone else's.
-        if (l.params.z < 1.5 && !slotted) {{
-            shadow = shadow * capsule_visibility_from(l, world_pos, select(0, 1, tile >= 0));
-        }}
+        // NO CAPSULE SHADOWS HERE. They were a capsule loop inside this lamp
+        // loop -- 1,100 of the scene shader's 3,600 instructions -- and cost
+        // 1 ms an eye even where no character was near, the code's size alone
+        // (headset trace, 2026-09-29). The player's shadows from the lamps
+        // lighting them most are the characters' tiles above; the capsules
+        // keep only what they do once a pixel: contact darkening, reflections.
         diffuse = diffuse + c.diffuse * shadow;
         specular = specular + c.specular * shadow;
         // DIRECT: runtime lights, after their shadow test.
@@ -4432,7 +4379,6 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
             if (tile >= 0) {{
                 c = c * pcf_layer(spot_shadow_tex, tile, world_pos, camera.spot_view_proj[tile]);
             }}
-            c = c * capsule_visibility_from(l, world_pos, select(0, 1, tile >= 0));
         }}
         lit = lit + c;
     }}
