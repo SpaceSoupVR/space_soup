@@ -137,6 +137,9 @@ impl XrRenderer {
         mirror: Option<MirrorSurface>,
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
+        // Before the swapchain image is held: a level load marks it dirty, and
+        // building it takes a moment once. See `ensure_ground_map`.
+        self.ensure_ground_map();
         let image_index = self.swapchain.acquire_image()? as usize;
         self.swapchain.wait_image(xr::Duration::INFINITE)?;
         let cpu_start = std::time::Instant::now();
@@ -1054,6 +1057,9 @@ impl XrRenderer {
                 upload.set_portals(&self.probe_portals, player_world, &upload.volumes());
                 // And what stands in those rooms, for the reflection trace.
                 upload.set_proxies(&self.probe_proxies, player_world, &upload.volumes());
+                // And the outdoors: which room it is, its sky, its ground.
+                let sky_layer = self.probe_stream.borrow().as_ref().and_then(|s| s.sky_layer());
+                upload.set_outdoors(self.probe_outdoor_volume, sky_layer, self.ground_placement);
                 // perf_ab: every slot its own room (no two-photograph blend), or
                 // no doorways. Measurement only; see `perf_ab::Phase`.
                 if !fx.probe_blend {

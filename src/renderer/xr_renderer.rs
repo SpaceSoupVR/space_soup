@@ -330,6 +330,17 @@ pub struct XrRenderer {
     probe_brightness: Vec<f32>,
     /// Each probe's ROOM, by probe index. See `ProbeUpload::set_volume`.
     probe_rooms: Vec<u32>,
+    /// The outdoor volume, when the level's probes name one: the volume none of
+    /// whose photographs has distances. See `ProbeDesc::has_depth`.
+    probe_outdoor_volume: Option<u32>,
+    /// The terrain's heights, from which the ground map is built. See
+    /// `ground_map` and [`Self::set_terrain_heights`].
+    ground_heights: Option<crate::renderer::ground_map::HeightGrid>,
+    /// Something the ground map is made from changed since it was built. It is
+    /// rebuilt once, before the next frame -- not once per setter at load.
+    ground_dirty: bool,
+    /// Where the bound ground map lies and its top; `None` for no ground map.
+    ground_placement: Option<([f32; 4], f32)>,
     /// The doorways between rooms, from the bake. See `ProbeUpload::set_portals`.
     probe_portals: Vec<crate::renderer::uniforms::ProbePortal>,
     /// The rooms, by the numbers the doorways use, with which of them are
@@ -1169,6 +1180,10 @@ impl XrRenderer {
             probe_volumes: Vec::new(),
             probe_brightness: Vec::new(),
             probe_rooms: Vec::new(),
+            probe_outdoor_volume: None,
+            ground_heights: None,
+            ground_dirty: false,
+            ground_placement: None,
             probe_portals: Vec::new(),
             cull_rooms: Vec::new(),
             probe_proxies: Vec::new(),
@@ -1314,7 +1329,9 @@ impl XrRenderer {
                         boxes.len() - 1
                     }
                 };
-                crate::renderer::probe_stream::ProbeDesc { centre: p.2, min: p.3, max: p.4, volume: volume as u32 }
+                // No distances come with this path: no room is told apart as
+                // the outdoors, and nothing is traced as outdoors.
+                crate::renderer::probe_stream::ProbeDesc { centre: p.2, min: p.3, max: p.4, volume: volume as u32, has_depth: true }
             })
             .collect();
         let owned: Arc<Vec<Vec<u8>>> = Arc::new(usable.iter().map(|p| p.0.to_vec()).collect());
@@ -1370,6 +1387,8 @@ impl XrRenderer {
         *self.eye.borrow_mut() = eye;
         log::info!("reflection probes: average radiance by probe {:?}", self.probe_brightness);
 
+        // THE SKY REFLECTIONS SEE, at the probes' size, in a layer of its own.
+        let sky_faces = self.sky.reflection.as_ref().map(|r| r.cube_faces(resolution));
         let stream = crate::renderer::probe_stream::ProbeStream::new_with_depth(
             &self.wgpu_device,
             &self.wgpu_queue,
@@ -1377,7 +1396,11 @@ impl XrRenderer {
             descs.len(),
             source,
             depth,
+            sky_faces,
         );
+        // THE OUTDOORS: the one volume none of whose photographs has distances,
+        // when others do. See `ProbeDesc::has_depth`.
+        self.probe_outdoor_volume = crate::renderer::probe_stream::outdoor_volume(&descs);
         // Every probe's box, by PROBE index, for residency. The layer is
         // decided by the stream, per frame.
         self.probe_volumes =
@@ -1394,6 +1417,8 @@ impl XrRenderer {
         }
         upload.fill_brightness(&self.probe_brightness);
         upload.fill_volumes(&self.probe_rooms);
+        let sky_layer = self.probe_stream.get_mut().as_ref().and_then(|s| s.sky_layer());
+        upload.set_outdoors(self.probe_outdoor_volume, sky_layer, self.ground_placement);
         let stream = self.probe_stream.get_mut().as_mut().expect("just set");
         stream.resolve(&self.wgpu_queue, &mut upload);
         let view = stream.view();
@@ -1733,6 +1758,86 @@ impl XrRenderer {
         // folds this sky into them, so it must come first -- as the client's
         // load order already has it.
         *self.eye.borrow_mut() = crate::renderer::exposure::EyeAdaptation::sky_only(self.sky.irradiance);
+        // The ground's light is the sky's and the sun's.
+        self.ground_dirty = true;
+    }
+
+    /// The terrain's heights over the footprint the terrain's own maps span
+    /// (see [`Self::set_terrain_footprint`]), from which the ground map is
+    /// built. `None` for a level without ground. See `ground_map`.
+    pub fn set_terrain_heights(&mut self, heights: Option<crate::renderer::ground_map::HeightGrid>) {
+        self.ground_heights = heights;
+        self.ground_dirty = true;
+    }
+
+    /// Build the ground map if anything it is made from changed. Once, before
+    /// a frame, rather than in every setter a level load passes through.
+    pub fn ensure_ground_map(&mut self) {
+        if !self.ground_dirty {
+            return;
+        }
+        self.ground_dirty = false;
+        let Some(heights) = self.ground_heights.as_ref() else {
+            if self.ground_placement.take().is_some() {
+                self.uniform_buf.set_ground_map(crate::renderer::uniforms::default_ground_map(&self.wgpu_device));
+                self.rebind_scene_group();
+            }
+            return;
+        };
+        let started = std::time::Instant::now();
+        let map = crate::renderer::ground_map::build(
+            &crate::renderer::ground_map::GroundInputs {
+                heights,
+                sky: &self.sky.irradiance,
+                sun: self.sky.sun.as_ref(),
+                sky_occlusion: self.terrain_sky_occlusion.as_ref(),
+                layers: &self.terrain_layers,
+                splat: self.terrain_splat.as_ref(),
+                settings: &self.terrain_settings,
+            },
+            crate::renderer::ground_map::GROUND_MAP_SIZE,
+        );
+        let view = crate::renderer::ground_map::upload(&self.wgpu_device, &self.wgpu_queue, &map);
+        let extent = map.max - map.min;
+        self.ground_placement = Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top));
+        self.uniform_buf.set_ground_map(view);
+        self.rebind_scene_group();
+        log::info!(
+            "ground map: {}x{} over {:.0} x {:.0} m, top {:.2} m, built in {} ms",
+            map.width,
+            map.height,
+            extent.x,
+            extent.y,
+            map.top,
+            started.elapsed().as_millis(),
+        );
+    }
+
+    /// Rebuild the scene bind group with what is bound now -- after the
+    /// ground map changes -- keeping the probes and their upload as they are.
+    fn rebind_scene_group(&mut self) {
+        let fallback;
+        let probe_view = match self.probe_view.as_ref() {
+            Some(v) => v,
+            None => {
+                fallback = crate::renderer::uniforms::default_probe_cube(&self.wgpu_device).0;
+                &fallback
+            }
+        };
+        let mut probes = self.uniform_buf.probes();
+        let sky_layer = self.probe_stream.get_mut().as_ref().and_then(|s| s.sky_layer());
+        probes.set_outdoors(self.probe_outdoor_volume, sky_layer, self.ground_placement);
+        self.uniform_buf.rebind_probes(
+            &self.wgpu_device,
+            &self.lights_uniform,
+            self.shadow_map.sun_depth_view(),
+            self.shadow_map.sun_dynamic_depth_view(),
+            self.shadow_map.spot_depth_view(),
+            self.shadow_map.sampler(),
+            probe_view,
+            &self.probe_sampler,
+            probes,
+        );
     }
 
     /// Turn eye adaptation on or off. Off, exposure is exactly `post.exposure`.
@@ -2016,6 +2121,8 @@ impl XrRenderer {
     /// discard the first, which is exactly what a setter that took only its own
     /// half would do.
     fn rebuild_terrain_material(&mut self) {
+        // The ground map is built from the same maps and layers.
+        self.ground_dirty = true;
         // The ground map with the lamps' masks after it, when they fit it.
         let ground = match (&self.terrain_sky_occlusion, self.terrain_stationary.is_empty()) {
             (Some(map), false) => Some(map.with_stationary_masks(&self.terrain_stationary).unwrap_or_else(|| {

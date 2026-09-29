@@ -123,8 +123,100 @@ pub struct Sky {
     /// level's lightmaps, so the renderer shades it only on what has none.
     /// The panorama the player SEES keeps its sun; only the lighting moves.
     pub sun: Option<SkySun>,
+    /// The sky REFLECTIONS show: the panorama without its sun, turned and
+    /// scaled as the scene shows it. `None` for no sky. See [`ReflectionSky`].
+    pub reflection: Option<ReflectionSky>,
     _texture: Texture,
     _sampler: Sampler,
+}
+
+/// THE SKY A REFLECTION SEES: the panorama with its sun taken out (the sun
+/// reaches every surface as a light, and its highlight is that light's --
+/// reflected here as well it would be counted twice), with the scene's
+/// rotation and intensity.
+///
+/// Reflections read it from a layer of the probe array, built at the probes'
+/// size by [`Self::cube_faces`] and blurred by the same GGX chain, so a rough
+/// surface blurs the sky exactly as much as a photograph. Until 2026-09-28 a
+/// reflection that left the building read the sky's nine harmonics instead: the
+/// floor mirrored the front door as a flat pale patch where the real sky has
+/// clouds (headset 21:46:20).
+#[derive(Clone)]
+pub struct ReflectionSky {
+    pub pano: Panorama,
+    pub rotation_deg: f32,
+    pub intensity: f32,
+}
+
+impl ReflectionSky {
+    /// The sky reflections see for this panorama: its sun taken out exactly as
+    /// `sky_lighting` takes it out, so the two agree about where the sun was.
+    pub fn new(pano: &Panorama, rotation_deg: f32, intensity: f32) -> Self {
+        let pano = match space_soup_sky::extract_sun(pano, rotation_deg, intensity) {
+            Some((_, rest)) => rest,
+            None => pano.clone(),
+        };
+        Self { pano, rotation_deg, intensity }
+    }
+
+    /// Radiance toward WORLD direction `d`: bilinear, wrapping in longitude.
+    pub fn radiance(&self, d: glam::Vec3) -> [f32; 3] {
+        let (rc, rs) = (self.rotation_deg.to_radians().cos(), self.rotation_deg.to_radians().sin());
+        // The inverse of the rotation `project_irradiance` gives the picture:
+        // world back to panorama.
+        let d = d.normalize_or_zero();
+        let p = [rc * d.x - rs * d.z, d.y, rs * d.x + rc * d.z];
+        let [u, v] = direction_to_uv(p);
+        let (w, h) = (self.pano.width, self.pano.height);
+        let fx = u * w as f32 - 0.5;
+        let fy = (v * h as f32 - 0.5).clamp(0.0, (h - 1) as f32);
+        let x0 = fx.floor();
+        let tx = fx - x0;
+        let y0 = fy.floor();
+        let ty = fy - y0;
+        let wrap = |x: f32| (x.rem_euclid(w as f32) as u32).min(w - 1);
+        let (xa, xb) = (wrap(x0), wrap(x0 + 1.0));
+        let (ya, yb) = (y0 as u32, (y0 as u32 + 1).min(h - 1));
+        let mut out = [0.0f32; 3];
+        let (a, b, c, e) = (self.pano.texel(xa, ya), self.pano.texel(xb, ya), self.pano.texel(xa, yb), self.pano.texel(xb, yb));
+        for k in 0..3 {
+            let top = a[k] + (b[k] - a[k]) * tx;
+            let bottom = c[k] + (e[k] - c[k]) * tx;
+            out[k] = (top + (bottom - top) * ty) * self.intensity;
+        }
+        out
+    }
+
+    /// Six cube faces at `res`, RGBA half floats in the probe cube's layout
+    /// (`probe_prefilter::texel_direction`), ready for `prefilter_probe`. Each
+    /// texel averages a 2x2 of samples, so a panorama finer than the cube is
+    /// not aliased into it.
+    pub fn cube_faces(&self, res: u32) -> Vec<u8> {
+        let res = res.max(1);
+        let mut out = Vec::with_capacity((res * res * 6 * 8) as usize);
+        for face in 0..6usize {
+            for y in 0..res {
+                for x in 0..res {
+                    let mut acc = [0.0f32; 3];
+                    for (sx, sy) in [(0.25f32, 0.25f32), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+                        let d = crate::renderer::probe_prefilter::texel_direction(
+                            face,
+                            (x as f32 + sx) / res as f32,
+                            (y as f32 + sy) / res as f32,
+                        );
+                        let r = self.radiance(d);
+                        for k in 0..3 {
+                            acc[k] += r[k] * 0.25;
+                        }
+                    }
+                    for v in [acc[0], acc[1], acc[2], 1.0] {
+                        out.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 pub fn sky_bind_group_layout(device: &Device) -> BindGroupLayout {
@@ -215,7 +307,12 @@ impl Sky {
             ..Default::default()
         });
 
-        let (irradiance, sun) = sky_lighting(pano, rotation_deg, intensity);
+        // `sky_lighting`, with the sun-free panorama kept for reflections: one
+        // extraction, so the two cannot disagree about where the sun was.
+        let (irradiance, sun, without_sun) = match space_soup_sky::extract_sun(pano, rotation_deg, intensity) {
+            Some((sun, rest)) => (project_irradiance(&rest, rotation_deg, intensity), Some(sun), rest),
+            None => (project_irradiance(pano, rotation_deg, intensity), None, pano.clone()),
+        };
         let view = texture.create_view(&TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("sky_bg"),
@@ -230,6 +327,7 @@ impl Sky {
             bind_group,
             irradiance,
             sun,
+            reflection: Some(ReflectionSky { pano: without_sun, rotation_deg, intensity }),
             _texture: texture,
             _sampler: sampler,
         }
@@ -251,6 +349,8 @@ impl Sky {
         );
         s.irradiance = SkyIrradiance::flat(ambient);
         s.sun = None;
+        // No sky to reflect: the flat ambient's harmonics answer instead.
+        s.reflection = None;
         s
     }
 }

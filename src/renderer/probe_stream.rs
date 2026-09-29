@@ -55,6 +55,32 @@ pub struct ProbeDesc {
     pub max: Vec3,
     /// Which room this probe photographs. Cells of one room share it.
     pub volume: u32,
+    /// Whether the bake gave it distances. A volume none of whose photographs
+    /// has them is the OUTDOOR volume -- its box stands in for the sky dome --
+    /// which reflections trace against the ground and the sky instead.
+    pub has_depth: bool,
+}
+
+/// THE OUTDOOR VOLUME of a level's probes: the one volume none of whose
+/// photographs has distances, when others do. Its box stands in for the sky
+/// dome, so reflections starting in it are traced against the ground and the
+/// sky instead (`outdoor_radiance` in the shader). `None` when no probe has
+/// distances -- an older bake -- since then nothing tells the outdoors apart.
+pub fn outdoor_volume(descs: &[ProbeDesc]) -> Option<u32> {
+    if !descs.iter().any(|d| d.has_depth) {
+        return None;
+    }
+    let mut without: Vec<u32> = descs
+        .iter()
+        .filter(|d| !descs.iter().any(|o| o.volume == d.volume && o.has_depth))
+        .map(|d| d.volume)
+        .collect();
+    without.sort_unstable();
+    without.dedup();
+    if without.len() > 1 {
+        log::warn!("reflection probes: {} volumes have no distances; only the first is treated as outdoors", without.len());
+    }
+    without.first().copied()
 }
 
 /// The most GPU memory the probe pool may take, in bytes.
@@ -174,6 +200,9 @@ pub struct ProbeStream {
     ready: HashMap<usize, Prepared>,
     requested: HashSet<usize>,
     failed: HashSet<usize>,
+    /// The cube layer holding the sky reflections see, past the pool's own
+    /// layers so eviction never touches it. See `sky::ReflectionSky`.
+    sky_layer: Option<u32>,
 }
 
 impl ProbeStream {
@@ -186,10 +215,13 @@ impl ProbeStream {
         count: usize,
         source: ProbeSource,
     ) -> Self {
-        Self::new_with_depth(device, queue, resolution, count, source, None)
+        Self::new_with_depth(device, queue, resolution, count, source, None, None)
     }
 
     /// As [`Self::new`], with each probe's distances streamed beside it.
+    /// `sky`, when given, is the sky reflections see as six cube faces at
+    /// `resolution` (`sky::ReflectionSky::cube_faces`): it gets a layer of its
+    /// own after the pool's, prefiltered like a probe. See [`Self::sky_layer`].
     pub fn new_with_depth(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -197,11 +229,20 @@ impl ProbeStream {
         count: usize,
         source: ProbeSource,
         depth: Option<ProbeDepthSource>,
+        sky: Option<Vec<u8>>,
     ) -> Self {
         let res = resolution.max(1);
-        let layers = pool_size(count, res, super::uniforms::probe_layers_allowed(device));
-        let texture = device.create_texture(&super::uniforms::probe_cube_descriptor(res, layers));
-        let depth_texture = device.create_texture(&super::uniforms::probe_depth_descriptor(res, layers));
+        let sky_cubes = u32::from(sky.is_some());
+        let allowed = super::uniforms::probe_layers_allowed(device).saturating_sub(sky_cubes).max(1);
+        let layers = pool_size(count, res, allowed);
+        let texture = device.create_texture(&super::uniforms::probe_cube_descriptor(res, layers + sky_cubes));
+        let depth_texture = device.create_texture(&super::uniforms::probe_depth_descriptor(res, layers + sky_cubes));
+        // The sky, prefiltered once, in the layer after the pool's. Its depth
+        // layer stays zero: "none baked", which nothing reads for it anyway.
+        let sky_layer = sky.and_then(|faces| super::uniforms::prefilter_probe(&faces, res)).map(|chain| {
+            write_probe_layer(queue, &texture, layers, res, &chain);
+            layers
+        });
         let mut pool = LayerPool::new(layers);
         // Radiance and distance in one step, so a layer never holds one
         // probe's picture beside another probe's depth.
@@ -263,7 +304,13 @@ impl ProbeStream {
             ready: HashMap::new(),
             requested: HashSet::new(),
             failed: HashSet::new(),
+            sky_layer,
         }
+    }
+
+    /// The cube layer holding the reflections' sky, if one was given.
+    pub fn sky_layer(&self) -> Option<u32> {
+        self.sky_layer
     }
 
     /// The cube array view to bind.
@@ -365,6 +412,21 @@ impl ProbeStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn desc(volume: u32, has_depth: bool) -> ProbeDesc {
+        ProbeDesc { centre: Vec3::ZERO, min: Vec3::ZERO, max: Vec3::ONE, volume, has_depth }
+    }
+
+    #[test]
+    fn the_outdoors_is_the_volume_with_no_distances() {
+        let level = [desc(0, true), desc(0, true), desc(1, true), desc(2, false)];
+        assert_eq!(outdoor_volume(&level), Some(2));
+        // A room with one cell lacking distances is still a room.
+        assert_eq!(outdoor_volume(&[desc(0, true), desc(0, false), desc(1, false)]), Some(1));
+        // An older bake with no distances anywhere names no outdoors.
+        assert_eq!(outdoor_volume(&[desc(0, false), desc(1, false)]), None);
+        assert_eq!(outdoor_volume(&[]), None);
+    }
 
     #[test]
     fn free_layers_are_used_before_anything_is_evicted() {

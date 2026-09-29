@@ -698,6 +698,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let sun_dynamic_tex = binding_index + 6;
     let probe_depth_tex = binding_index + 7;
     let probe_depth_samp = binding_index + 8;
+    let ground_tex = binding_index + 9;
     // Three vec4 per probe -- centre, min, max -- so the WGSL array length is
     // three times the probe count. Derived rather than written twice: a shader
     // array shorter than the uniform reads garbage past its end.
@@ -761,6 +762,9 @@ struct Camera {{
     // The resident rooms' tables -- each room's first slot, doorway and proxy,
     // and each one's next in its room. See `uniforms::Uniforms::probe_rooms`.
     probe_rooms: array<vec4<f32>, {room_table_rows}>,
+    // Where the ground map lies: [min.x, min.z, 1 / extent.x, 1 / extent.z].
+    // Must match `uniforms::Uniforms::ground_params`.
+    ground_params: vec4<f32>,
 }}
 
 // Undo the player-frame transform the CPU applied to this vertex.
@@ -816,6 +820,9 @@ struct Lights {{
 // `probe_trace`.
 @group({group_index}) @binding({probe_depth_tex}) var probe_depth: texture_cube_array<f32>;
 @group({group_index}) @binding({probe_depth_samp}) var probe_depth_samp: sampler;
+// THE GROUND SEEN FROM ABOVE: RGB the light it returns, A its world height.
+// See `ground_map` and `outdoor_radiance`.
+@group({group_index}) @binding({ground_tex}) var ground_map: texture_2d<f32>;
 
 const AMBIENT: f32 = 0.6;
 
@@ -2539,6 +2546,19 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
         if (hop == 0 && in_room) {{
             hit.origin = clamp(world_pos, lo, hi);
         }}
+        // OUTDOORS THERE ARE NO WALLS. The outdoor volume's box only stands in
+        // for the sky dome, and a ray run to it met a floor metres under the
+        // grass. A reflection starting out here -- off an outside wall, the
+        // roof -- is out already: `outdoor_radiance` takes it to the ground or
+        // the sky. `portal_params.z` names the outdoor room plus one, 0 none.
+        if (cur + 1.0 == camera.portal_params.z) {{
+            hit.pos = hit.origin + d * t0;
+            hit.room = cur;
+            hit.found = true;
+            hit.escaped = true;
+            hit.t = t0;
+            return hit;
+        }}
         let start = clamp(hit.origin + d * t0, lo, hi);
         let far = select(vec3<f32>(3.4e38), max((hi - start) * inv, (lo - start) * inv), moving);
         var axis = 2;
@@ -2639,116 +2659,99 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
     return hit;
 }}
 
-// How far past a doorway what a reflection sees out there is taken to be when
-// nothing nearer is found: the sky, and ground past the photograph's depth.
-// Sets only the parallax between the photograph's capture point and the ray;
-// the sky is at infinity either way.
-const PROBE_ESCAPE_DISTANCE: f32 = 30.0;
-// Steps the escape march takes, doubling from half a metre: out to 32 m.
-const PROBE_ESCAPE_STEPS: i32 = 7;
-const PROBE_ESCAPE_BISECTIONS: i32 = 3;
+// The ground march: its first step, doublings from there -- 12.5 cm out to
+// 256 m -- and the halvings that settle onto the ground once a step has
+// passed below it.
+const GROUND_MARCH_FIRST: f32 = 0.125;
+const GROUND_MARCH_STEPS: i32 = 12;
+const GROUND_MARCH_BISECTIONS: i32 = 5;
 
-// WHERE A RAY THAT LEFT THE ROOMS MEETS THE OUTDOORS, from what photograph
-// `slot` saw through the opening. Marched outward from the doorway's outer
-// face `e` in doubling steps until the ray passes behind the photographed
-// surface -- the ground, the hill -- then bisected onto it.
-//
-// It used to be a fixed 30 m. The marble ceiling's reflection of the front
-// door looks DOWN through it at grass a few metres outside, and read the
-// photograph toward a point 30 m on and 13 m underground; the floor's looks up
-// at the hill, and read it past the hill (headset, 2026-09-27: the door
-// reflections showed neither terrain nor sky). Sky never stops the march,
-// which then lands at `PROBE_ESCAPE_DISTANCE` as before.
-fn probe_escape_hit(e: vec3<f32>, d: vec3<f32>, slot: i32) -> vec3<f32> {{
-    let c = camera.probe_boxes[slot * 3].xyz;
-    var t_lo = 0.0;
-    var t_hi = PROBE_ESCAPE_DISTANCE;
-    var t = 0.5;
-    var met = false;
-    for (var k = 0; k < PROBE_ESCAPE_STEPS; k = k + 1) {{
-        let v = e + d * t - c;
-        let seen = probe_seen_distance(slot, v);
-        if (seen >= 0.0 && seen < length(v)) {{
-            t_hi = t;
-            met = true;
-            break;
-        }}
-        t_lo = t;
-        t = t * 2.0;
+// THE SKY A REFLECTION SEES along WORLD direction `d`: the panorama without its
+// sun, from its layer of the probe array, at the blur `lod` asks for -- the
+// same prefiltered chain a probe has, so a rough surface blurs it exactly as
+// much as a photograph. The sun reaches every surface as a light, and its
+// highlight is that light's; reflected here too, it would be counted twice.
+// Where no layer was built, the sky's harmonics, which want the direction in
+// the player's frame: `dir`.
+fn sky_reflection(d: vec3<f32>, dir: vec3<f32>, lod: f32) -> vec3<f32> {{
+    // Stored plus one: 0 is none. See `Uniforms::sky_params`.
+    let layer = i32(camera.sky_params.y) - 1;
+    if (layer < 0) {{
+        return environment_radiance(dir);
     }}
-    if (met) {{
-        for (var k = 0; k < PROBE_ESCAPE_BISECTIONS; k = k + 1) {{
-            let tm = 0.5 * (t_lo + t_hi);
-            let v = e + d * tm - c;
-            let seen = probe_seen_distance(slot, v);
-            if (seen >= 0.0 && seen < length(v)) {{
-                t_hi = tm;
-            }} else {{
-                t_lo = tm;
-            }}
-        }}
-    }}
-    return e + d * t_hi;
+    return textureSampleLevel(probe_cube, probe_samp, d, layer, lod).rgb;
 }}
 
-// THE COLOUR OF A REFLECTION THAT LEFT THE ROOMS through doorway `p` at `e`,
-// heading `d`: what is out there is far, so it is read by direction, from a
-// photograph that can SEE out along it.
+// Where world point `p` lies on the ground map, 0..1 across the terrain.
+fn ground_uv(p: vec3<f32>) -> vec2<f32> {{
+    return (p.xz - camera.ground_params.xy) * camera.ground_params.zw;
+}}
+
+// THE OUTDOORS ALONG A RAY from WORLD point `e` heading `d`: the ground where
+// the ray first passes below it, else the sky. See `ground_map`.
 //
-// First choice, `room`'s own photographs whose view toward the far point
-// passes through the same opening: they have the sky baked in, the panorama
-// itself rather than its harmonics. Failing that, the outdoor volume's
-// (`other`), with the sky filling what it left to the renderer -- unoccluded,
-// because the trace has just proven the ray reaches it. `sky_dir` is `d` in the
-// frame `environment_radiance` expects.
-fn probe_escape_colour(e: vec3<f32>, d: vec3<f32>, room: f32, other: f32, p: i32, sky_dir: vec3<f32>, lod: f32) -> vec4<f32> {{
-    let axis = i32(camera.probe_portals[p * 3].w);
-    let plo = camera.probe_portals[p * 3].xyz - vec3<f32>(1e-3);
-    let phi = camera.probe_portals[p * 3 + 1].xyz + vec3<f32>(1e-3);
-    let far_point = e + d * PROBE_ESCAPE_DISTANCE;
-    var best = -1;
-    var best_d = 3.4e38;
-    for (var i = probe_room_slot(room); i >= 0; i = probe_slot_next(i)) {{
-        let c = camera.probe_boxes[i * 3].xyz;
-        let to = far_point - c;
-        if (abs(to[axis]) < 1e-5) {{
-            continue;
+// Marched against the ground's height in doubling steps -- a ray leaving a
+// wall's foot meets the grass within a hand's breadth, one toward the hills
+// crosses fifty metres -- then halved onto the crossing. It stops as soon as
+// it is above the highest ground and rising, or off the terrain: past that is
+// only sky. The ground is read at the blur the lobe has spread to where it
+// lands, against the size of a texel.
+//
+// Before, the ray was run into the outdoor volume's BOX -- whose floor lies
+// metres under the grass -- and the outdoor photograph read toward that point:
+// the shaded wall facing the lake reflected sunlit ground at its foot, lit as
+// if from underneath, and a seam crossed it at eye height (headset, 2026-09-28).
+fn outdoor_radiance(e: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, lod: f32) -> vec3<f32> {{
+    let top = camera.sky_params.z;
+    if (camera.sky_params.w > 0.5) {{
+        var t_lo = 0.0;
+        var t_hi = -1.0;
+        var t = GROUND_MARCH_FIRST;
+        for (var k = 0; k < GROUND_MARCH_STEPS; k = k + 1) {{
+            let p = e + d * t;
+            let uv = ground_uv(p);
+            if ((p.y > top && d.y >= 0.0) || any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) {{
+                break;
+            }}
+            if (p.y <= textureSampleLevel(ground_map, probe_samp, uv, 0.0).a) {{
+                t_hi = t;
+                break;
+            }}
+            t_lo = t;
+            t = t * 2.0;
         }}
-        // Where this photograph's own line of sight to the far point crosses
-        // the doorway's plane -- inside the opening, or into the wall.
-        let s = (e[axis] - c[axis]) / to[axis];
-        if (s <= 0.0 || s >= 1.0) {{
-            continue;
-        }}
-        let q = c + to * s;
-        let within = (q >= plo) & (q <= phi);
-        if (!((within.x || axis == 0) && (within.y || axis == 1) && (within.z || axis == 2))) {{
-            continue;
-        }}
-        let v = c - e;
-        if (dot(v, v) < best_d) {{
-            best_d = dot(v, v);
-            best = i;
+        if (t_hi > 0.0) {{
+            for (var k = 0; k < GROUND_MARCH_BISECTIONS; k = k + 1) {{
+                let tm = 0.5 * (t_lo + t_hi);
+                let p = e + d * tm;
+                if (p.y <= textureSampleLevel(ground_map, probe_samp, ground_uv(p), 0.0).a) {{
+                    t_hi = tm;
+                }} else {{
+                    t_lo = tm;
+                }}
+            }}
+            let texel = 1.0 / max(camera.ground_params.z * f32(textureDimensions(ground_map).x), 1e-6);
+            let spread = max(t_hi * probe_lobe_tan(roughness), 1e-4);
+            let ground_lod = clamp(log2(spread / texel), 0.0, 12.0);
+            return textureSampleLevel(ground_map, probe_samp, ground_uv(e + d * t_hi), ground_lod).rgb;
         }}
     }}
-    if (best >= 0) {{
-        let c = camera.probe_boxes[best * 3].xyz;
-        return textureSampleLevel(
-            probe_cube, probe_samp, probe_escape_hit(e, d, best) - c, i32(camera.probe_boxes[best * 3].w), lod
-        );
-    }}
-    // The outdoor photograph has no depth to march. A ray heading down meets
-    // the ground near the building at about the doorway's own floor level.
-    var t_out = PROBE_ESCAPE_DISTANCE;
-    if (d.y < -1e-4) {{
-        t_out = clamp((plo.y - e.y) / d.y, 0.0, PROBE_ESCAPE_DISTANCE);
-    }}
-    let oslot = probe_room_slot(other);
-    let out = textureSampleLevel(
-        probe_cube, probe_samp, e + d * t_out - camera.probe_boxes[oslot * 3].xyz, i32(camera.probe_boxes[oslot * 3].w), lod
-    );
-    let a = clamp(out.a, 0.0, 1.0);
-    return vec4<f32>(out.rgb * a + environment_radiance(sky_dir) * (1.0 - a), 1.0);
+    return sky_reflection(d, dir, lod);
+}}
+
+// THE COLOUR OF A REFLECTION THAT IS OUTDOORS: one that left the rooms through
+// a doorway at `e`, or that started on an outside wall, heading WORLD `d`. What
+// is out there is the ground and the sky, so that is what it shows; `sky_dir`
+// is `d` in the player's frame, for the harmonics.
+//
+// It used to be read from a photograph -- a room's own looking out through the
+// same doorway, else the outdoor volume's -- and none of them sees the ground
+// just past a door or beside a wall, the building hides it, nor the sky above
+// a door from deep inside the room. The floor mirrored the front door as a
+// flat pale patch where Cycles shows clouds, and the ceiling mirrored the
+// sunlit grass outside as a blocky dim patchwork (headset, 2026-09-28).
+fn probe_escape_colour(e: vec3<f32>, d: vec3<f32>, sky_dir: vec3<f32>, roughness: f32, lod: f32) -> vec4<f32> {{
+    return vec4<f32>(outdoor_radiance(e, d, sky_dir, roughness, lod), 1.0);
 }}
 
 // THE COLOUR AT A TRACED HIT, from the photographs of its room that SAW it.
@@ -2832,7 +2835,7 @@ fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32)
 fn probe_traced_colour(h: ProbeHit, d: vec3<f32>, roughness: f32, sky_dir: vec3<f32>, lod: f32) -> vec4<f32> {{
     var col: vec4<f32>;
     if (h.escaped) {{
-        col = probe_escape_colour(h.pos, d, h.room, h.other, h.portal, sky_dir, lod);
+        col = probe_escape_colour(h.pos, d, sky_dir, roughness, lod);
     }} else {{
         col = probe_hit_colour(h.pos, h.room, h.other, roughness, h.t);
     }}
