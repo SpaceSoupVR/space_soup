@@ -713,9 +713,10 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let portal_slots = crate::renderer::uniforms::MAX_PORTALS * 3;
     let proxy_slots = crate::renderer::uniforms::MAX_PROXIES * 3;
     let room_table_rows = crate::renderer::uniforms::ROOM_TABLE_ROWS;
-    let shadow_tiles = super::shadow::SHADOW_TILES;
+    let shadow_tiles = super::shadow::SHADOW_MATRICES;
     let max_spot_shadows = super::shadow::MAX_SPOT_SHADOWS;
     let atlas_rows = super::shadow::SPOT_ATLAS_ROWS;
+    let sun_atlas_tiles = super::shadow::SUN_ATLAS_TILES;
     // Emitted from the Rust constant so the shader cannot disagree with the
     // atlas the pass actually renders into.
     let atlas_cols = super::shadow::SPOT_ATLAS_COLS;
@@ -1449,7 +1450,7 @@ fn sun_visibility(l: Light, world_pos: vec3<f32>) -> f32 {{
         vis = pcf(sun_shadow_tex, world_pos, camera.sun_view_proj);
     }}
     if (vis > 0.0 && l.position.w > 0.5 && camera.shadow_params.z > 0.5) {{
-        vis = vis * pcf(sun_dynamic_shadow_tex, world_pos, camera.sun_dynamic_view_proj);
+        vis = vis * pcf_tile(sun_dynamic_shadow_tex, vec2<f32>(0.0), SUN_ATLAS_GRID, world_pos, camera.sun_dynamic_view_proj);
     }}
     return vis;
 }}
@@ -1463,12 +1464,19 @@ fn sun_visibility(l: Light, world_pos: vec3<f32>) -> f32 {{
 // reads another light's depth, which shows up as a shadow cast by a lamp that
 // is nowhere near -- far more confusing than a missing shadow.
 fn pcf_layer(tex: texture_depth_2d, layer: i32, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
+    return pcf_tile(
+        tex,
+        vec2<f32>(f32(layer % {atlas_cols}), f32(layer / {atlas_cols})),
+        vec2<f32>(f32({atlas_cols}), f32({atlas_rows})),
+        world_pos,
+        light_view_proj,
+    );
+}}
+
+// Tile `tile` (column, row) of an atlas `grid` tiles across and down.
+fn pcf_tile(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
     let c = shadow_coords(world_pos, light_view_proj);
     if (c.w < 0.5) {{ return 1.0; }}
-    // The atlas's grid, columns by rows: the characters' tiles are rows below
-    // the spots'. See `shadow::SHADOW_TILES`.
-    let grid = vec2<f32>(f32({atlas_cols}), f32({atlas_rows}));
-    let tile = vec2<f32>(f32(layer % {atlas_cols}), f32(layer / {atlas_cols}));
     // One texel, in tile space.
     let tile_texel = grid / vec2<f32>(textureDimensions(tex));
     // Half a texel in from each edge of this tile, in tile space. Sampling
@@ -1492,16 +1500,33 @@ fn pcf_layer(tex: texture_depth_2d, layer: i32, world_pos: vec3<f32>, light_view
     return sum / 9.0;
 }}
 
-// WHICH ATLAS TILE HOLDS LIGHT `i`'S SHADOW OF THE CHARACTERS alone, or -1:
-// its index in `capsule_params.y` or `.z` names the first or second of the
-// characters' tiles, after the spots'. See `shadow::MAX_CHARACTER_SHADOWS`.
+// The moving-objects map's row of tiles: the sun's, then the characters'.
+// See `shadow::SUN_ATLAS_TILES`.
+const SUN_ATLAS_GRID: vec2<f32> = vec2<f32>(f32({sun_atlas_tiles}), 1.0);
+
+// Light `i`'s shadow of the characters alone, where it holds one of their
+// tiles; 1 elsewhere. See `character_shadow_tile`.
+fn character_shadow(i: u32, world_pos: vec3<f32>) -> f32 {{
+    let k = character_shadow_tile(i);
+    if (k < 0) {{
+        return 1.0;
+    }}
+    return pcf_tile(
+        sun_dynamic_shadow_tex, vec2<f32>(f32(1 + k), 0.0), SUN_ATLAS_GRID, world_pos,
+        camera.spot_view_proj[{max_spot_shadows} + k],
+    );
+}}
+
+// WHICH OF THE CHARACTERS' TILES HOLDS LIGHT `i`'S SHADOW of them, or -1:
+// `capsule_params.y` and `.z` name the lights of the first and second. See
+// `shadow::MAX_CHARACTER_SHADOWS`.
 fn character_shadow_tile(i: u32) -> i32 {{
     let f = f32(i);
     if (camera.capsule_params.y == f) {{
-        return {max_spot_shadows};
+        return 0;
     }}
     if (camera.capsule_params.z == f) {{
-        return {max_spot_shadows} + 1;
+        return 1;
     }}
     return -1;
 }}
@@ -4245,14 +4270,12 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
         }}
         // Its spot slot, which draws everything; else, for a lamp lighting
         // the player most, its tile of the characters alone
-        // (`character_shadow_tile`).
-        var tile = i32(l.params.w);
-        let slotted = tile >= 0 && f32(tile) < camera.shadow_params.y;
-        if (!slotted) {{
-            tile = select(-1, character_shadow_tile(i), l.params.z < 1.5);
-        }}
-        if (tile >= 0) {{
-            shadow = shadow * pcf_layer(spot_shadow_tex, tile, world_pos, camera.spot_view_proj[tile]);
+        // (`character_shadow`).
+        let layer = i32(l.params.w);
+        if (layer >= 0 && f32(layer) < camera.shadow_params.y) {{
+            shadow = shadow * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
+        }} else if (l.params.z < 1.5) {{
+            shadow = shadow * character_shadow(i, world_pos);
         }}
         // NO CAPSULE SHADOWS HERE. They were a capsule loop inside this lamp
         // loop -- 1,100 of the scene shader's 3,600 instructions -- and cost
@@ -4375,10 +4398,7 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
             c = c * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
         }} else if (l.params.z < 1.5) {{
             // The characters' shadows: see the brushes' loop.
-            let tile = character_shadow_tile(i);
-            if (tile >= 0) {{
-                c = c * pcf_layer(spot_shadow_tex, tile, world_pos, camera.spot_view_proj[tile]);
-            }}
+            c = c * character_shadow(i, world_pos);
         }}
         lit = lit + c;
     }}

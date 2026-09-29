@@ -759,7 +759,7 @@ impl XrRenderer {
                     .unwrap_or(glam::Mat4::IDENTITY),
             },
             spot_view_proj: {
-                let mut m = [glam::Mat4::IDENTITY; crate::renderer::shadow::SHADOW_TILES];
+                let mut m = [glam::Mat4::IDENTITY; crate::renderer::shadow::SHADOW_MATRICES];
                 for (layer, &i) in spot_indices.iter().enumerate() {
                     let l = &lights[i];
                     m[layer] = crate::renderer::shadow::spot_light_matrix(
@@ -867,23 +867,26 @@ impl XrRenderer {
                 }
             }
             // The sun's shadow of MOVING things, every frame, into its own
-            // small map. Meshes and skinned characters only: the level is in
-            // the brushes' baked mask and in the static map already.
-            if shadow.sun_dynamic_enabled {
-                self.shadow_map.upload_light(
-                    &self.wgpu_queue,
-                    crate::renderer::shadow::ShadowKind::SunDynamic,
-                    shadow.sun_dynamic_view_proj,
-                );
-                drawn += self.shadow_map.record(
+            // small map -- meshes and skinned characters only: the level is in
+            // the brushes' baked mask and in the static map already -- and in
+            // the same pass the characters' own tiles. See `SUN_ATLAS_TILES`.
+            if shadow.sun_dynamic_enabled || !character_tiles.is_empty() {
+                if shadow.sun_dynamic_enabled {
+                    self.shadow_map.upload_light(
+                        &self.wgpu_queue,
+                        crate::renderer::shadow::ShadowKind::SunDynamic,
+                        shadow.sun_dynamic_view_proj,
+                    );
+                }
+                for (k, (_, tile)) in character_tiles.iter().enumerate() {
+                    self.shadow_map.upload_light(&self.wgpu_queue, crate::renderer::shadow::ShadowKind::Character(k), *tile);
+                }
+                drawn += self.shadow_map.record_moving(
                     &mut encoder,
-                    crate::renderer::shadow::ShadowKind::SunDynamic,
-                    None,
-                    None,
+                    shadow.sun_dynamic_enabled,
+                    character_tiles.len(),
                     &shadow_casters,
                     &skinned_casters,
-                    &[],
-                    shadow.sun_dynamic_view_proj,
                 );
             }
             // ONE pass for every spot, filling its own tile of the shared
@@ -898,10 +901,7 @@ impl XrRenderer {
                     shadow.spot_view_proj[layer],
                 );
             }
-            for (k, (_, tile)) in character_tiles.iter().enumerate() {
-                self.shadow_map.upload_light(&self.wgpu_queue, crate::renderer::shadow::ShadowKind::Character(k), *tile);
-            }
-            if shadow.spot_count > 0 || !character_tiles.is_empty() {
+            if shadow.spot_count > 0 {
                 drawn += self.shadow_map.record_spots(
                     &mut encoder,
                     shadow.spot_count as usize,
@@ -911,7 +911,6 @@ impl XrRenderer {
                     &shadow_casters,
                     &skinned_casters,
                     &solid_chunks,
-                    character_tiles.len(),
                 );
             }
             if diag {

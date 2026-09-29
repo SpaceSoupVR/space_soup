@@ -308,7 +308,7 @@ impl Renderer {
             .unwrap_or(glam::Mat4::IDENTITY);
         // The characters' tiles are the headset's; the desktop leaves them
         // empty. See `shadow::MAX_CHARACTER_SHADOWS`.
-        let mut spot_view_proj = [glam::Mat4::IDENTITY; shadow::SHADOW_TILES];
+        let mut spot_view_proj = [glam::Mat4::IDENTITY; shadow::SHADOW_MATRICES];
         for (layer, &i) in spot_indices.iter().enumerate() {
             let l = &lights[i];
             spot_view_proj[layer] =
