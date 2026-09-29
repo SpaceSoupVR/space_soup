@@ -902,7 +902,10 @@ impl XrRenderer {
         // eye, and it is the kind of drift a later edit to one site introduces
         // silently. Deriving both from the same value is what makes it
         // unrepresentable.
-        let plan = crate::renderer::scene_pass_plan::ScenePassPlan::for_frame(needs_scene_depth);
+        // A multiview scene pass draws into its own layered target, so the
+        // eye pass copies each eye across even with nothing to sample back.
+        let stereo_frame = self.multiview_scene && self.stereo_pipelines.is_some();
+        let plan = crate::renderer::scene_pass_plan::ScenePassPlan::for_frame_with(needs_scene_depth, stereo_frame);
 
         // ONCE PER FRAME, not per eye: takes in whatever probes the stream's
         // worker finished, and opens the frame in which layers the eyes use

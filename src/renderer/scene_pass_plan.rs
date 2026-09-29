@@ -29,6 +29,13 @@ pub enum ScenePassPlan {
     Direct,
     /// Into the offscreen target, because something will sample it back.
     ViaOffscreen,
+    /// Both eyes in one MULTIVIEW pass, which draws into its own layered
+    /// target, never the swapchain: the eye pass must copy each eye across,
+    /// though nothing samples the scene back. Until 2026-09-29 this was
+    /// `Direct` whenever SSR was off, so the copy never ran and the headset
+    /// kept showing the last picture it had -- "multiview freezes the screen",
+    /// working only while SSR was on.
+    StereoCopy,
 }
 
 /// Whether screen-space reflections run on the headset.
@@ -63,7 +70,19 @@ pub fn needs_scene_readback(
 impl ScenePassPlan {
     /// `needs_readback` is "something in this frame samples the rendered scene".
     pub fn for_frame(needs_readback: bool) -> Self {
-        if needs_readback { Self::ViaOffscreen } else { Self::Direct }
+        Self::for_frame_with(needs_readback, false)
+    }
+
+    /// [`Self::for_frame`], knowing whether the scene pass is the two-eye
+    /// multiview one.
+    pub fn for_frame_with(needs_readback: bool, stereo: bool) -> Self {
+        if needs_readback {
+            Self::ViaOffscreen
+        } else if stereo {
+            Self::StereoCopy
+        } else {
+            Self::Direct
+        }
     }
 
     /// Whether the scene pass must resolve into the offscreen colour target.
@@ -78,13 +97,24 @@ impl ScenePassPlan {
     /// never disagree: an eye pass that runs after a direct scene pass blits a
     /// stale offscreen texture over the frame that was just drawn.
     pub fn runs_eye_pass(self) -> bool {
-        matches!(self, Self::ViaOffscreen)
+        matches!(self, Self::ViaOffscreen | Self::StereoCopy)
     }
 }
 
 #[cfg(test)]
 mod scene_pass_plan_tests {
     use super::ScenePassPlan;
+
+    /// A multiview frame draws into its own layered target, so the eye pass
+    /// must copy both eyes into the swapchain even with nothing to sample.
+    #[test]
+    fn a_multiview_frame_copies_its_eyes_across() {
+        let plan = ScenePassPlan::for_frame_with(false, true);
+        assert_eq!(plan, ScenePassPlan::StereoCopy);
+        assert!(plan.runs_eye_pass(), "the multiview picture never reaches the swapchain");
+        assert!(!plan.samples_scene_back(), "nothing samples it: no depth copy, no mips");
+        assert_eq!(ScenePassPlan::for_frame_with(true, true), ScenePassPlan::ViaOffscreen);
+    }
 
     #[test]
     fn a_plain_frame_renders_straight_into_the_swapchain() {
