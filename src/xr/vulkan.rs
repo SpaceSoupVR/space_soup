@@ -296,7 +296,10 @@ impl VkContext {
         }
         let fdm_supported = fdm_extension_available
             && fdm_query.fragment_density_map == vk::TRUE
-            && fdm_query.fragment_density_map_non_subsampled_images == vk::TRUE;
+            && fdm_query.fragment_density_map_non_subsampled_images == vk::TRUE
+            // DIAGNOSIS: no density map on any pass, from the next launch --
+            // `adb shell setprop debug.spacesoup.nofdm 1`.
+            && system_property(c"debug.spacesoup.nofdm") != "1";
         info!(
             "vulkan: fragment density map: extension {}, map {}, dynamic {}, non-subsampled images {}, texel {}x{}..{}x{} -- {}",
             fdm_extension_available,

@@ -60,6 +60,11 @@ struct SpaceWarpState {
     /// What each eye's projection view points at; alive until the frame is
     /// handed to the compositor.
     info: [xr::sys::CompositionLayerSpaceWarpInfoFB; 2],
+    /// The swapchains' raw images, for the diagnostic readback.
+    motion_raw: Vec<vk::Image>,
+    depth_raw: Vec<vk::Image>,
+    depth_has_stencil: bool,
+    readback: Option<crate::renderer::space_warp::Readback>,
 }
 
 impl SpaceWarpState {
@@ -67,14 +72,22 @@ impl SpaceWarpState {
         session: &xr::Session<xr::Vulkan>,
         device: &wgpu::Device,
         size: (u32, u32),
+        vk_ctx: &VkContext,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // A depth format the runtime takes that maps onto wgpu's exactly.
+        // A depth format the runtime takes that maps onto wgpu's exactly --
+        // D24S8 first, the one Meta's native AppSW guide names for Vulkan.
+        // The first build used D32_SFLOAT: the runtime accepted it, ran
+        // `Type=App` on every frame, and the frames it made were BLACK
+        // (headset, 2026-09-29).
         let formats = session.enumerate_swapchain_formats()?;
+        let d24s8 = vulkan_interop::supports_depth_attachment(device, vk::Format::D24_UNORM_S8_UINT);
         let (vk_depth, depth_format) = [
+            (vk::Format::D24_UNORM_S8_UINT, wgpu::TextureFormat::Depth24PlusStencil8),
             (vk::Format::D32_SFLOAT, wgpu::TextureFormat::Depth32Float),
             (vk::Format::D16_UNORM, wgpu::TextureFormat::Depth16Unorm),
         ]
         .into_iter()
+        .filter(|(f, _)| *f != vk::Format::D24_UNORM_S8_UINT || d24s8)
         .find(|(f, _)| formats.contains(&(f.as_raw() as u32)))
         .ok_or("no depth swapchain format the renderer can use")?;
         let make = |format: vk::Format, usage: xr::SwapchainUsageFlags| {
@@ -90,8 +103,28 @@ impl SpaceWarpState {
                 mip_count: 1,
             })
         };
-        let motion = make(vk::Format::R16G16B16A16_SFLOAT, xr::SwapchainUsageFlags::COLOR_ATTACHMENT)?;
-        let depth = make(vk_depth, xr::SwapchainUsageFlags::DEPTH_STENCIL_ATTACHMENT)?;
+        // SAMPLED on both: the compositor reads them. The spec says "should"
+        // and Meta's sample and guide both set it; the first build did not.
+        let motion = make(
+            vk::Format::R16G16B16A16_SFLOAT,
+            xr::SwapchainUsageFlags::COLOR_ATTACHMENT | xr::SwapchainUsageFlags::SAMPLED | xr::SwapchainUsageFlags::TRANSFER_SRC,
+        )?;
+        let depth = make(
+            vk_depth,
+            xr::SwapchainUsageFlags::DEPTH_STENCIL_ATTACHMENT | xr::SwapchainUsageFlags::SAMPLED | xr::SwapchainUsageFlags::TRANSFER_SRC,
+        )?;
+        let motion_raw: Vec<vk::Image> = motion.enumerate_images()?.into_iter().map(vk::Image::from_raw).collect();
+        let depth_raw: Vec<vk::Image> = depth.enumerate_images()?.into_iter().map(vk::Image::from_raw).collect();
+        let readback = crate::renderer::space_warp::Readback::new(
+            &vk_ctx.instance,
+            vk_ctx.physical_device,
+            &vk_ctx.device,
+            vk_ctx.queue,
+            vk_ctx.queue_family_index,
+            size,
+        )
+        .map_err(|e| log::warn!("space warp: no readback ({e:?})"))
+        .ok();
         let import = |images: Vec<u64>, format: wgpu::TextureFormat, hal: wgpu::TextureUses| -> Vec<[EyeTarget; 2]> {
             images
                 .into_iter()
@@ -148,10 +181,11 @@ impl SpaceWarpState {
             }],
         });
         info!(
-            "space warp: available, motion vectors {}x{}, depth {:?}, {} + {} images",
+            "space warp: available, motion vectors {}x{}, depth {:?} ({:?}), {} + {} images",
             size.0,
             size.1,
             depth_format,
+            vk_depth,
             motion_targets.len(),
             depth_targets.len(),
         );
@@ -169,6 +203,10 @@ impl SpaceWarpState {
             prev_models: HashMap::new(),
             acquired: None,
             info,
+            motion_raw,
+            depth_raw,
+            depth_has_stencil: depth_format.has_stencil_aspect(),
+            readback,
         })
     }
 }
@@ -1210,7 +1248,7 @@ impl XrRenderer {
         let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         // APPLICATION SPACEWARP's swapchains, where the runtime offers it.
-        let space_warp = xr_ctx.space_warp.and_then(|size| match SpaceWarpState::new(session, &wgpu_device, size) {
+        let space_warp = xr_ctx.space_warp.and_then(|size| match SpaceWarpState::new(session, &wgpu_device, size, vk) {
             Ok(s) => Some(s),
             Err(e) => {
                 log::warn!("space warp: unavailable ({e})");
