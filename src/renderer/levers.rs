@@ -100,8 +100,12 @@ pub struct Levers {
     /// are shaded, where the headset has it. See `foveation`.
     pub foveation: crate::renderer::foveation::FoveationLevel,
     /// APPLICATION SPACEWARP: motion vectors and depth with every frame, so
-    /// the compositor can make every other one. Off by default: objects that
-    /// move by themselves carry no motion of their own yet. See `space_warp`.
+    /// the compositor can make every other one. ON by default since
+    /// 2026-09-29, once its black frames were fixed: 36 frames a second are
+    /// rendered, a 27.8 ms budget. Meshes carry their own motion (previous
+    /// model, previous joints); cuboids, particles, water waves, reflections
+    /// and highlights move only with the camera. It also turns sharpening off
+    /// -- see `layer_settings::sharpening_for`. See `space_warp`.
     pub space_warp: bool,
     /// DIAGNOSIS ONLY: SpaceWarp variants, as bits, to find what makes the
     /// compositor's frames black (headset, 2026-09-29) without a rebuild per
@@ -163,7 +167,7 @@ impl Default for Levers {
             terrain_probe_pass: true,
             ground_trace: true,
             foveation: crate::renderer::foveation::SHIPPED,
-            space_warp: false,
+            space_warp: true,
             space_warp_debug: 0,
             terrain_detail_distance: 0.0,
             gpu_sync: false,

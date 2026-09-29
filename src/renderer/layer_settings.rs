@@ -67,7 +67,27 @@ pub enum Sharpening {
 /// If a future session turns this off again, say which measurement asked for
 /// it -- this one was switched off to test a hypothesis that came back
 /// negative.
+///
+/// It only applies while SpaceWarp is off, which is not the shipped state
+/// since 2026-09-29 -- see `sharpening_for`.
 pub const XR_SHARPENING: Sharpening = Sharpening::Quality;
+
+/// What the headset asks for with Application SpaceWarp on or off: SpaceWarp
+/// wins, so sharpening is `Off` whenever it runs.
+///
+/// Measured on the headset (2026-09-29): with both on, the runtime reported
+/// the compositor tearing 30-60 times a second (VrApi `Tear=`). Sharpening is
+/// worth at most ~0.5 ms and some edge crispness; SpaceWarp renders half the
+/// frames, and that is the headroom characters, water and effects are going
+/// to need. So SpaceWarp ships and takes sharpening off with it (user,
+/// 2026-09-29).
+pub fn sharpening_for(space_warp: bool) -> Sharpening {
+    if space_warp {
+        Sharpening::Off
+    } else {
+        XR_SHARPENING
+    }
+}
 
 impl Sharpening {
     /// Whether a `CompositionLayerSettingsFB` needs chaining onto the layer.
@@ -85,7 +105,25 @@ impl Sharpening {
 
 #[cfg(test)]
 mod layer_settings_tests {
-    use super::{Sharpening, XR_SHARPENING};
+    use super::{sharpening_for, Sharpening, XR_SHARPENING};
+
+    #[test]
+    fn spacewarp_takes_sharpening_off_with_it() {
+        assert!(
+            !sharpening_for(true).wants_layer_settings(),
+            "sharpening with SpaceWarp tore the compositor 30-60 times a second",
+        );
+        assert_eq!(sharpening_for(false), XR_SHARPENING, "without SpaceWarp the policy stands");
+    }
+
+    #[test]
+    fn spacewarp_ships_on() {
+        // SpaceWarp is the frame-rate plan (user, 2026-09-29): the headroom
+        // it buys is for characters, water and effects. Turning it off by
+        // default is a decision to make with bench numbers in hand, and it
+        // brings sharpening back with it -- not an edit to a default.
+        assert!(crate::renderer::levers::Levers::default().space_warp);
+    }
 
     #[test]
     fn off_chains_nothing_at_all() {

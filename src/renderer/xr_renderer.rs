@@ -1924,6 +1924,14 @@ impl XrRenderer {
         self.levers.clone()
     }
 
+    /// Whether frames go out with SpaceWarp's motion and depth: the lever is
+    /// on AND the runtime gave us its swapchains. What the compositor is asked
+    /// for besides follows this, not the lever -- see
+    /// `layer_settings::sharpening_for`.
+    pub fn space_warp_running(&self) -> bool {
+        self.space_warp.is_some() && self.levers.space_warp
+    }
+
     /// Pin the tracked head -- stage space, from `bench::BenchRig` -- or give
     /// it back to the headset with `None`. Per frame, beside
     /// `set_player_frame`, whose offset and yaw the pin is paired with.
