@@ -220,6 +220,11 @@ pub struct PlayerUpload {
 pub struct PostUpload {
     pub exposure: f32,
     pub tonemap: super::tonemap::ToneMapping,
+    /// Metres from the eye past which the terrain's layer NORMAL maps fade out
+    /// (the vertex normal and the variance-widened roughness mips carry the
+    /// detail from there); 0 keeps them everywhere. Rides in `post_params.z`.
+    /// See `Levers::terrain_detail_distance`.
+    pub terrain_detail_distance: f32,
 }
 
 impl Default for PostUpload {
@@ -227,7 +232,7 @@ impl Default for PostUpload {
     /// the hard clamp would leave every scene blowing out its highlights,
     /// which is the thing the curve exists to fix.
     fn default() -> Self {
-        Self { exposure: 1.0, tonemap: super::tonemap::ToneMapping::default() }
+        Self { exposure: 1.0, tonemap: super::tonemap::ToneMapping::default(), terrain_detail_distance: 0.0 }
     }
 }
 
@@ -747,7 +752,7 @@ impl UniformBuffer {
                     super::tonemap::ToneMapping::Aces => 0.0,
                     super::tonemap::ToneMapping::None => 1.0,
                 },
-                0.0,
+                post.terrain_detail_distance,
                 0.0,
             ],
         };

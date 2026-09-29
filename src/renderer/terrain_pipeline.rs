@@ -696,6 +696,9 @@ fn layer_normal_at(layer: i32, n: vec3<f32>, f: SampleFrame) -> vec3<f32> {{
 // rescaling the surviving weights would move the shading further than the
 // omission does.
 const WEIGHT_EPS: f32 = 0.004;
+// Metres over which the terrain's normal maps fade out past the detail
+// distance, so no line marks where they stop.
+const TERRAIN_DETAIL_FADE: f32 = 8.0;
 
 // Blend weights for the four layers, authored or derived.
 //
@@ -755,11 +758,22 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // unit vectors shortens the result wherever they disagree, and a shortened
     // normal darkens the surface -- so the renormalise is load-bearing, not
     // tidiness.
+    //
+    // FADED OUT WITH DISTANCE when `post_params.z` says where: past it a
+    // layer's normal map only shakes a pixel's normal around an average the
+    // vertex normal already is, and what it would have added -- a wider
+    // highlight -- is baked into the roughness mips read below. So the far
+    // field skips the samples and the blend, and loses nothing it could show.
+    let detail_far = camera.post_params.z;
+    let detail = select(1.0, 1.0 - smoothstep(detail_far, detail_far + TERRAIN_DETAIL_FADE, distance(in.world_pos, cam_pos())), detail_far > 0.0);
     var shaded_n = vec3<f32>(0.0);
-    if (w.x > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(0, n, f) * w.x; }}
-    if (w.y > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(1, n, f) * w.y; }}
-    if (w.z > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(2, n, f) * w.z; }}
-    if (w.w > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(3, n, f) * w.w; }}
+    if (detail > 0.0) {{
+        if (w.x > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(0, n, f) * w.x; }}
+        if (w.y > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(1, n, f) * w.y; }}
+        if (w.z > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(2, n, f) * w.z; }}
+        if (w.w > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(3, n, f) * w.w; }}
+        shaded_n = mix(n, shaded_n, detail);
+    }}
 
     // HOW MUCH DETAIL WAS AVERAGED AWAY, read before renormalising.
     //
