@@ -987,6 +987,21 @@ pub(crate) mod tests {
         normals: &[Option<TerrainImage>],
         light: Option<Option<u8>>,
     ) -> Option<[u8; 4]> {
+        render_quad_light_at(normal, palette, splat, sky_occlusion, normals, light, glam::Vec3::new(3.0, 2.0, 0.0))
+    }
+
+    /// `render_quad_lit_by` with the lamp at `light_pos`. The default sits
+    /// level with the quad in z, so it cannot tell a tilt toward +z from one
+    /// toward -z -- which is the axis green lives on in the top-down projection.
+    pub fn render_quad_light_at(
+        normal: [f32; 3],
+        palette: Palette,
+        splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
+        normals: &[Option<TerrainImage>],
+        light: Option<Option<u8>>,
+        light_pos: glam::Vec3,
+    ) -> Option<[u8; 4]> {
         let lit = light.is_some();
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
@@ -1017,7 +1032,7 @@ pub(crate) mod tests {
             // make an x-tilt symmetric and hide exactly what is being tested.
             lights.upload(&queue, &[crate::renderer::lights::Light {
                 mask_channel: light.flatten(),
-                position: glam::Vec3::new(3.0, 2.0, 0.0),
+                position: light_pos,
                 direction: glam::Vec3::new(0.0, -1.0, 0.0),
                 kind: crate::renderer::lights::LightKind::Point,
                 color: crate::renderer::Color3(255, 255, 255, 255),
@@ -2826,6 +2841,35 @@ mod normal_map_tests {
         assert!(
             brightness(toward) > brightness(away),
             "tilting toward the light must be brighter than tilting away: {toward:?} vs {away:?}",
+        );
+    }
+
+    /// GREEN FACES THE TOP OF THE PICTURE, which on the ground is -z.
+    ///
+    /// Ground is textured top-down at uv = world.xz, and wgpu reads v = 0 at
+    /// the picture's top row, so the top of the picture lies toward -z. An
+    /// OpenGL map's green above 128 says "faces the top of the picture"; a lamp
+    /// out toward -z must therefore light that texel more than one facing the
+    /// bottom. The red-only test above cannot see this: red means the same in
+    /// both conventions. Until 2026-09-28 the whiteout added green along +v and
+    /// lit every bump upside down in z.
+    #[test]
+    fn green_tilts_the_ground_toward_the_top_of_its_picture() {
+        let north = glam::Vec3::new(0.4, 2.0, -3.0);
+        let at = |green: u8| {
+            super::tests::render_quad_light_at(
+                FLAT, Palette::Test, None, None, &only_layer0(normal_map([128, green, 180])), Some(None), north,
+            )
+        };
+        let Some(faces_top) = at(230) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let faces_bottom = at(26).unwrap();
+        assert!(
+            brightness(faces_top) > brightness(faces_bottom) + 6,
+            "a texel facing the top of the picture (-z) must be lit more by a lamp toward -z: \
+             {faces_top:?} vs {faces_bottom:?}",
         );
     }
 
