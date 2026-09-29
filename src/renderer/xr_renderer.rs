@@ -531,6 +531,11 @@ pub struct XrRenderer {
     /// The outdoor volume, when the level's probes name one: the volume none of
     /// whose photographs has distances. See `ProbeDesc::has_depth`.
     probe_outdoor_volume: Option<u32>,
+    /// The buildings' outsides reflections leaving a building can meet: world
+    /// boxes, in the stream's building layers' order. See `outdoor_radiance`.
+    probe_buildings: Vec<(glam::Vec3, glam::Vec3)>,
+    /// Their cubes, held until the next probe set builds its stream.
+    pending_buildings: Vec<(glam::Vec3, glam::Vec3, Vec<u8>)>,
     /// The terrain's heights, from which the ground map is built. See
     /// `ground_map` and [`Self::set_terrain_heights`].
     ground_heights: Option<crate::renderer::ground_map::HeightGrid>,
@@ -1399,6 +1404,8 @@ impl XrRenderer {
             probe_brightness: Vec::new(),
             probe_rooms: Vec::new(),
             probe_outdoor_volume: None,
+            probe_buildings: Vec::new(),
+            pending_buildings: Vec::new(),
             ground_heights: None,
             ground_dirty: false,
             ground_placement: None,
@@ -1578,6 +1585,14 @@ impl XrRenderer {
     /// As [`Self::set_reflection_probes_streamed`], with each probe's
     /// per-texel distances, so reflections are traced against what the probe
     /// saw instead of projected onto its box. See `probe_trace` in the shader.
+    /// THE BUILDINGS' OUTSIDES, for the next probe set
+    /// ([`Self::set_reflection_probes_with_depth`]) to put in layers of their
+    /// own: each building's world box and its six outside faces at the probes'
+    /// size. See `outdoor_radiance` in the shader.
+    pub fn set_building_outsides(&mut self, buildings: Vec<(glam::Vec3, glam::Vec3, Vec<u8>)>) {
+        self.pending_buildings = buildings;
+    }
+
     pub fn set_reflection_probes_with_depth(
         &mut self,
         descs: Vec<crate::renderer::probe_stream::ProbeDesc>,
@@ -1607,7 +1622,11 @@ impl XrRenderer {
 
         // THE SKY REFLECTIONS SEE, at the probes' size, in a layer of its own.
         let sky_faces = self.sky.reflection.as_ref().map(|r| r.cube_faces(resolution));
-        let stream = crate::renderer::probe_stream::ProbeStream::new_with_depth(
+        // THE BUILDINGS' OUTSIDES after the sky, when the level has them.
+        let (buildings, building_faces): (Vec<(glam::Vec3, glam::Vec3)>, Vec<Vec<u8>>) =
+            std::mem::take(&mut self.pending_buildings).into_iter().map(|(lo, hi, f)| ((lo, hi), f)).unzip();
+        self.probe_buildings = buildings;
+        let stream = crate::renderer::probe_stream::ProbeStream::new_with_extras(
             &self.wgpu_device,
             &self.wgpu_queue,
             resolution,
@@ -1615,6 +1634,7 @@ impl XrRenderer {
             source,
             depth,
             sky_faces,
+            building_faces,
         );
         // THE OUTDOORS: the one volume none of whose photographs has distances,
         // when others do. See `ProbeDesc::has_depth`.
@@ -1637,6 +1657,8 @@ impl XrRenderer {
         upload.fill_volumes(&self.probe_rooms);
         let sky_layer = self.probe_stream.get_mut().as_ref().and_then(|s| s.sky_layer());
         upload.set_outdoors(self.probe_outdoor_volume, sky_layer, self.ground_placement);
+        let building_layer = self.probe_stream.get_mut().as_ref().and_then(|s| s.building_layer());
+        upload.set_buildings(&self.probe_buildings, building_layer);
         let stream = self.probe_stream.get_mut().as_mut().expect("just set");
         stream.resolve(&self.wgpu_queue, &mut upload);
         let view = stream.view();
@@ -2062,6 +2084,8 @@ impl XrRenderer {
         let mut probes = self.uniform_buf.probes();
         let sky_layer = self.probe_stream.get_mut().as_ref().and_then(|s| s.sky_layer());
         probes.set_outdoors(self.probe_outdoor_volume, sky_layer, self.ground_placement);
+        let building_layer = self.probe_stream.get_mut().as_ref().and_then(|s| s.building_layer());
+        probes.set_buildings(&self.probe_buildings, building_layer);
         self.uniform_buf.rebind_probes(
             &self.wgpu_device,
             &self.lights_uniform,

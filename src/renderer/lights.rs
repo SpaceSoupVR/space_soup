@@ -701,6 +701,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let ground_tex = binding_index + 9;
     let proxy_field_tex = binding_index + 10;
     let proxy_field_rows = crate::renderer::proxy_field::MAX_PROXY_FIELDS * 2;
+    let building_rows = crate::renderer::uniforms::MAX_BUILDINGS * 2;
     // Three vec4 per probe -- centre, min, max -- so the WGSL array length is
     // three times the probe count. Derived rather than written twice: a shader
     // array shorter than the uniform reads garbage past its end.
@@ -774,6 +775,9 @@ struct Camera {{
     // Where each model's distance field lies in the atlas: [origin, reach],
     // [size, stop] per field. Must match `uniforms::Uniforms::proxy_fields`.
     proxy_fields: array<vec4<f32>, {proxy_field_rows}>,
+    // The buildings' outsides: [min.xyz, cube layer], [max.xyz, 0] each; how
+    // many in portal_params.w. Must match `uniforms::Uniforms::building_boxes`.
+    building_boxes: array<vec4<f32>, {building_rows}>,
 }}
 
 // Undo the player-frame transform the CPU applied to this vertex.
@@ -2798,6 +2802,12 @@ fn ground_uv(p: vec3<f32>) -> vec2<f32> {{
 // building that was not there -- and it crawled as the head moved (headset,
 // 2026-09-29).
 fn ground_trace(e: vec3<f32>, d: vec3<f32>) -> f32 {{
+    return ground_trace_until(e, d, 3.4e38);
+}}
+
+// `ground_trace`, giving up past `t_max` -- where the ray has already met a
+// building, the ground beyond it cannot be seen.
+fn ground_trace_until(e: vec3<f32>, d: vec3<f32>, t_max: f32) -> f32 {{
     let top = camera.sky_params.z;
     let size = f32(textureDimensions(ground_map, 0).x);
     let scale = camera.ground_params.zw * size;
@@ -2811,7 +2821,7 @@ fn ground_trace(e: vec3<f32>, d: vec3<f32>) -> f32 {{
     let ta = -q0 * inv;
     let tb = (vec2<f32>(size) - q0) * inv;
     var t = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), 0.0);
-    var t_out = min(max(ta.x, tb.x), max(ta.y, tb.y));
+    var t_out = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), t_max);
     if (d.y > 0.0) {{
         t_out = min(t_out, (top - e.y) / d.y);
     }} else if (d.y < 0.0) {{
@@ -2883,9 +2893,14 @@ fn ground_trace(e: vec3<f32>, d: vec3<f32>) -> f32 {{
 // metres under the grass -- and the outdoor photograph read toward that point:
 // the shaded wall facing the lake reflected sunlit ground at its foot, lit as
 // if from underneath, and a seam crossed it at eye height (headset, 2026-09-28).
+//
+// And the other BUILDINGS: a ray that meets one before the ground or the sky
+// shows its outside (`building_hit`, `building_colour`). Until 2026-09-29 the
+// marble hall's outer walls mirrored the hills standing where the brick hall is.
 fn outdoor_radiance(e: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, lod: f32) -> vec3<f32> {{
+    let b = building_hit(e, d);
     if (camera.sky_params.w > 0.5) {{
-        let t = ground_trace(e, d);
+        let t = ground_trace_until(e, d, select(3.4e38, b.x, b.x >= 0.0));
         if (t >= 0.0) {{
             let texel = 1.0 / max(camera.ground_params.z * f32(textureDimensions(ground_map, 0).x), 1e-6);
             let spread = max(t * probe_lobe_tan(roughness), 1e-4);
@@ -2893,7 +2908,47 @@ fn outdoor_radiance(e: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, 
             return textureSampleLevel(ground_map, probe_samp, ground_uv(e + d * t), ground_lod).rgb;
         }}
     }}
+    if (b.x >= 0.0) {{
+        let c = building_colour(e + d * b.x, i32(b.y), roughness, b.x);
+        return c.rgb * c.a + sky_reflection(d, dir, lod) * (1.0 - c.a);
+    }}
     return sky_reflection(d, dir, lod);
+}}
+
+// THE NEAREST BUILDING a ray from WORLD point `e` along `d` enters, as
+// `[t, slot]`, or t < 0 for none. A box the ray starts in or on -- the building
+// it is leaving -- is behind it. See `Uniforms::building_boxes`.
+fn building_hit(e: vec3<f32>, d: vec3<f32>) -> vec2<f32> {{
+    let n = i32(camera.portal_params.w);
+    let inv = 1.0 / select(d, vec3<f32>(1e-8), abs(d) < vec3<f32>(1e-8));
+    var best = vec2<f32>(-1.0, 0.0);
+    for (var i = 0; i < n; i = i + 1) {{
+        let t0 = (camera.building_boxes[i * 2].xyz - e) * inv;
+        let t1 = (camera.building_boxes[i * 2 + 1].xyz - e) * inv;
+        let near = min(t0, t1);
+        let far = max(t0, t1);
+        let t_in = max(max(near.x, near.y), near.z);
+        let t_out = min(min(far.x, far.y), far.z);
+        if (t_in > 1e-3 && t_in <= t_out && (best.x < 0.0 || t_in < best.x)) {{
+            best = vec2<f32>(t_in, f32(i));
+        }}
+    }}
+    return best;
+}}
+
+// A BUILDING'S OUTSIDE where a reflection meets it: the baked cube whose six
+// faces are its six sides (the baker's `probe::capture_exterior`), read along
+// `(p - centre) / half_size` -- that is the cube direction of the box point --
+// at the blur the lobe has spread to over `t`, against the size of a texel on
+// its faces. Alpha is what the photograph covered; the rest is sky.
+fn building_colour(p: vec3<f32>, slot: i32, roughness: f32, t: f32) -> vec4<f32> {{
+    let lo = camera.building_boxes[slot * 2];
+    let hi = camera.building_boxes[slot * 2 + 1].xyz;
+    let half = max((hi - lo.xyz) * 0.5, vec3<f32>(1e-3));
+    let texel = 2.0 * max(max(half.x, half.y), half.z) / f32(textureDimensions(probe_cube).x);
+    let spread = max(t * probe_lobe_tan(roughness), 1e-4);
+    let lod = clamp(log2(spread / texel), 0.0, PROBE_MAX_LOD);
+    return textureSampleLevel(probe_cube, probe_samp, (p - (lo.xyz + hi) * 0.5) / half, i32(lo.w), lod);
 }}
 
 // THE COLOUR OF A REFLECTION THAT IS OUTDOORS: one that left the rooms through

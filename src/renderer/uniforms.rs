@@ -126,7 +126,17 @@ pub struct Uniforms {
     ///
     /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
     pub proxy_fields: [super::proxy_field::FieldSlot; super::proxy_field::MAX_PROXY_FIELDS],
+    /// THE BUILDINGS' OUTSIDES for reflections that leave a building: two vec4
+    /// each, `[min.xyz, cube layer]` and `[max.xyz, 0]`, world space; how many
+    /// in `portal_params.w`. See [`ProbeUpload::set_buildings`].
+    ///
+    /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
+    pub building_boxes: [[f32; 4]; MAX_BUILDINGS * 2],
 }
+
+/// How many buildings' outsides reflections can meet. test_room has three; a
+/// level with more keeps the largest.
+pub const MAX_BUILDINGS: usize = 8;
 
 /// How many boxes standing inside rooms -- a pillar, a hanging lamp -- the
 /// reflection trace tests. See [`ProbeProxy`].
@@ -722,7 +732,7 @@ impl UniformBuffer {
                 probes.portal_count as f32,
                 if probes.no_trace { 1.0 } else { 0.0 },
                 dense.outdoor_volume + 1.0,
-                0.0,
+                probes.building_count as f32,
             ],
             probe_portals: dense.portals,
             proxy_params: [probes.proxy_count as f32, 0.0, 0.0, 0.0],
@@ -730,6 +740,7 @@ impl UniformBuffer {
             probe_rooms: room_tables,
             ground_params: dense.ground,
             proxy_fields: dense.proxy_fields,
+            building_boxes: probes.buildings,
             post_params: [
                 post.exposure,
                 match post.tonemap {
@@ -956,6 +967,10 @@ pub struct ProbeUpload {
     /// WHERE EACH MODEL'S DISTANCE FIELD LIES in the atlas, as
     /// `proxy_field::atlas` placed it. See `proxy_field::FieldSlot`.
     pub proxy_fields: [super::proxy_field::FieldSlot; super::proxy_field::MAX_PROXY_FIELDS],
+    /// The buildings' outsides: `[min.xyz, layer]`, `[max.xyz, 0]` each. See
+    /// [`Self::set_buildings`].
+    pub buildings: [[f32; 4]; MAX_BUILDINGS * 2],
+    pub building_count: u32,
 }
 
 /// `ProbeUpload::ground_top` for a level with no ground map: no ray is ever
@@ -1031,6 +1046,26 @@ impl ProbeUpload {
     /// to `player` first, keeping only those standing in one of `volumes`.
     /// The level's outdoors, carried every frame: which volume is outdoors, the
     /// sky's cube layer, and where the ground map lies. See the fields.
+    /// THE BUILDINGS' OUTSIDES a reflection leaving a building can meet: each
+    /// one's world box, its cube in layer `first_layer + i`. None without a
+    /// layer. The largest [`MAX_BUILDINGS`] are kept.
+    pub fn set_buildings(&mut self, boxes: &[(glam::Vec3, glam::Vec3)], first_layer: Option<u32>) {
+        self.buildings = [[0.0; 4]; MAX_BUILDINGS * 2];
+        self.building_count = 0;
+        let Some(first) = first_layer else { return };
+        let mut order: Vec<usize> = (0..boxes.len()).collect();
+        order.sort_by(|&a, &b| {
+            let size = |i: usize| (boxes[i].1 - boxes[i].0).max(glam::Vec3::ZERO).element_product();
+            size(b).total_cmp(&size(a))
+        });
+        for (slot, &i) in order.iter().take(MAX_BUILDINGS).enumerate() {
+            let (lo, hi) = boxes[i];
+            self.buildings[slot * 2] = [lo.x, lo.y, lo.z, (first + i as u32) as f32];
+            self.buildings[slot * 2 + 1] = [hi.x, hi.y, hi.z, 0.0];
+            self.building_count += 1;
+        }
+    }
+
     pub fn set_outdoors(&mut self, outdoor_volume: Option<u32>, sky_layer: Option<u32>, ground: Option<([f32; 4], f32)>) {
         self.outdoor_volume = outdoor_volume.map_or(-1.0, |v| v as f32);
         self.sky_layer = sky_layer.map_or(-1.0, |l| l as f32);
@@ -1250,6 +1285,8 @@ impl Default for ProbeUpload {
             ground: [0.0; 4],
             ground_top: NO_GROUND,
             proxy_fields: [[[0.0; 4]; 2]; super::proxy_field::MAX_PROXY_FIELDS],
+            buildings: [[0.0; 4]; MAX_BUILDINGS * 2],
+            building_count: 0,
         }
     }
 }
@@ -2324,3 +2361,33 @@ mod dense_room_tests {
         assert!(tables.iter().flatten().all(|&v| v == -1.0));
     }
 }
+
+#[cfg(test)]
+mod building_tests {
+    use super::*;
+    use glam::Vec3;
+
+    /// Each building keeps the cube layer of its place in the bake's list,
+    /// whatever order the slots end up in; past the cap the smallest go.
+    #[test]
+    fn buildings_keep_their_layers_and_the_largest_are_kept() {
+        let mut up = ProbeUpload::default();
+        let small = (Vec3::ZERO, Vec3::ONE);
+        let big = (Vec3::splat(-5.0), Vec3::splat(5.0));
+        up.set_buildings(&[small, big], Some(40));
+        assert_eq!(up.building_count, 2);
+        // The big one first, still layer 41.
+        assert_eq!(up.buildings[0], [-5.0, -5.0, -5.0, 41.0]);
+        assert_eq!(up.buildings[1], [5.0, 5.0, 5.0, 0.0]);
+        assert_eq!(up.buildings[2], [0.0, 0.0, 0.0, 40.0]);
+        // No layer, no buildings.
+        up.set_buildings(&[small, big], None);
+        assert_eq!(up.building_count, 0);
+        // Over the cap: the smallest is the one left out.
+        let many: Vec<(Vec3, Vec3)> = (0..MAX_BUILDINGS + 1).map(|i| (Vec3::ZERO, Vec3::splat(1.0 + i as f32))).collect();
+        up.set_buildings(&many, Some(0));
+        assert_eq!(up.building_count as usize, MAX_BUILDINGS);
+        assert!((0..MAX_BUILDINGS).all(|slot| up.buildings[slot * 2][3] != 0.0), "the smallest building was kept");
+    }
+}
+

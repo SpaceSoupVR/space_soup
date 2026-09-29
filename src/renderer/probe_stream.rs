@@ -203,6 +203,9 @@ pub struct ProbeStream {
     /// The cube layer holding the sky reflections see, past the pool's own
     /// layers so eviction never touches it. See `sky::ReflectionSky`.
     sky_layer: Option<u32>,
+    /// The first of the buildings' outside cubes, one layer each after the
+    /// sky's, never evicted. See `outdoor_radiance` in the shader.
+    building_layer: Option<u32>,
 }
 
 impl ProbeStream {
@@ -231,18 +234,48 @@ impl ProbeStream {
         depth: Option<ProbeDepthSource>,
         sky: Option<Vec<u8>>,
     ) -> Self {
+        Self::new_with_extras(device, queue, resolution, count, source, depth, sky, Vec::new())
+    }
+
+    /// As [`Self::new_with_depth`], with the buildings' outside cubes (six
+    /// faces each at `resolution`) in layers of their own after the sky's.
+    /// See [`Self::building_layer`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_extras(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resolution: u32,
+        count: usize,
+        source: ProbeSource,
+        depth: Option<ProbeDepthSource>,
+        sky: Option<Vec<u8>>,
+        buildings: Vec<Vec<u8>>,
+    ) -> Self {
         let res = resolution.max(1);
         let sky_cubes = u32::from(sky.is_some());
-        let allowed = super::uniforms::probe_layers_allowed(device).saturating_sub(sky_cubes).max(1);
+        let building_cubes = buildings.len() as u32;
+        let fixed = sky_cubes + building_cubes;
+        let allowed = super::uniforms::probe_layers_allowed(device).saturating_sub(fixed).max(1);
         let layers = pool_size(count, res, allowed);
-        let texture = device.create_texture(&super::uniforms::probe_cube_descriptor(res, layers + sky_cubes));
-        let depth_texture = device.create_texture(&super::uniforms::probe_depth_descriptor(res, layers + sky_cubes));
+        let texture = device.create_texture(&super::uniforms::probe_cube_descriptor(res, layers + fixed));
+        let depth_texture = device.create_texture(&super::uniforms::probe_depth_descriptor(res, layers + fixed));
         // The sky, prefiltered once, in the layer after the pool's. Its depth
         // layer stays zero: "none baked", which nothing reads for it anyway.
         let sky_layer = sky.and_then(|faces| super::uniforms::prefilter_probe(&faces, res)).map(|chain| {
             write_probe_layer(queue, &texture, layers, res, &chain);
             layers
         });
+        // The buildings, after the sky, prefiltered like it: a rough wall
+        // reads a building at the blur its lobe has spread to.
+        let first_building = layers + sky_cubes;
+        let mut written = 0u32;
+        for faces in &buildings {
+            if let Some(chain) = super::uniforms::prefilter_probe(faces, res) {
+                write_probe_layer(queue, &texture, first_building + written, res, &chain);
+            }
+            written += 1;
+        }
+        let building_layer = (building_cubes > 0).then_some(first_building);
         let mut pool = LayerPool::new(layers);
         // Radiance and distance in one step, so a layer never holds one
         // probe's picture beside another probe's depth.
@@ -305,12 +338,19 @@ impl ProbeStream {
             requested: HashSet::new(),
             failed: HashSet::new(),
             sky_layer,
+            building_layer,
         }
     }
 
     /// The cube layer holding the reflections' sky, if one was given.
     pub fn sky_layer(&self) -> Option<u32> {
         self.sky_layer
+    }
+
+    /// The first building's outside cube, the rest following in order, if any
+    /// were given.
+    pub fn building_layer(&self) -> Option<u32> {
+        self.building_layer
     }
 
     /// The cube array view to bind.
