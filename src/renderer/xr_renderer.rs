@@ -36,6 +36,135 @@ struct FoveationState {
     applied: Option<crate::renderer::foveation::FoveationLevel>,
 }
 
+/// APPLICATION SPACEWARP's swapchains, pipelines and history, where the
+/// runtime has it. See `space_warp`.
+struct SpaceWarpState {
+    motion: xr::Swapchain<xr::Vulkan>,
+    depth: xr::Swapchain<xr::Vulkan>,
+    /// Per swapchain image, per eye (each swapchain has a layer an eye).
+    motion_targets: Vec<[EyeTarget; 2]>,
+    depth_targets: Vec<[EyeTarget; 2]>,
+    size: (u32, u32),
+    pipelines: crate::renderer::space_warp::MotionPipelines,
+    cameras: [wgpu::Buffer; 2],
+    camera_groups: [wgpu::BindGroup; 2],
+    /// The previous frame's per-eye view-projections and world-to-player,
+    /// kept every frame so that switching on starts with a true history.
+    prev: Option<([glam::Mat4; 2], glam::Mat4)>,
+    /// This frame's motion and depth images, while held.
+    acquired: Option<(usize, usize)>,
+    /// What each eye's projection view points at; alive until the frame is
+    /// handed to the compositor.
+    info: [xr::sys::CompositionLayerSpaceWarpInfoFB; 2],
+}
+
+impl SpaceWarpState {
+    fn new(
+        session: &xr::Session<xr::Vulkan>,
+        device: &wgpu::Device,
+        size: (u32, u32),
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // A depth format the runtime takes that maps onto wgpu's exactly.
+        let formats = session.enumerate_swapchain_formats()?;
+        let (vk_depth, depth_format) = [
+            (vk::Format::D32_SFLOAT, wgpu::TextureFormat::Depth32Float),
+            (vk::Format::D16_UNORM, wgpu::TextureFormat::Depth16Unorm),
+        ]
+        .into_iter()
+        .find(|(f, _)| formats.contains(&(f.as_raw() as u32)))
+        .ok_or("no depth swapchain format the renderer can use")?;
+        let make = |format: vk::Format, usage: xr::SwapchainUsageFlags| {
+            session.create_swapchain(&xr::SwapchainCreateInfo {
+                create_flags: xr::SwapchainCreateFlags::EMPTY,
+                usage_flags: usage,
+                format: format.as_raw() as _,
+                sample_count: 1,
+                width: size.0,
+                height: size.1,
+                face_count: 1,
+                array_size: 2,
+                mip_count: 1,
+            })
+        };
+        let motion = make(vk::Format::R16G16B16A16_SFLOAT, xr::SwapchainUsageFlags::COLOR_ATTACHMENT)?;
+        let depth = make(vk_depth, xr::SwapchainUsageFlags::DEPTH_STENCIL_ATTACHMENT)?;
+        let import = |images: Vec<u64>, format: wgpu::TextureFormat, hal: wgpu::TextureUses| -> Vec<[EyeTarget; 2]> {
+            images
+                .into_iter()
+                .map(|raw| {
+                    std::array::from_fn(|eye| {
+                        let tex = unsafe {
+                            vulkan_interop::import_vk_image_as_wgpu_with(
+                                device,
+                                vk::Image::from_raw(raw),
+                                format,
+                                (size.0, size.1, 2),
+                                hal,
+                                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                            )
+                        };
+                        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                            dimension: Some(wgpu::TextureViewDimension::D2),
+                            base_array_layer: eye as u32,
+                            array_layer_count: Some(1),
+                            ..Default::default()
+                        });
+                        EyeTarget { _texture: tex, view }
+                    })
+                })
+                .collect()
+        };
+        let motion_targets = import(
+            motion.enumerate_images()?,
+            crate::renderer::space_warp::MOTION_FORMAT,
+            wgpu::TextureUses::COLOR_TARGET,
+        );
+        let depth_targets = import(
+            depth.enumerate_images()?,
+            depth_format,
+            wgpu::TextureUses::DEPTH_STENCIL_WRITE | wgpu::TextureUses::DEPTH_STENCIL_READ,
+        );
+        let pipelines = crate::renderer::space_warp::MotionPipelines::new(device, depth_format);
+        let cameras: [wgpu::Buffer; 2] = std::array::from_fn(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("space_warp_camera"),
+                size: std::mem::size_of::<crate::renderer::space_warp::MotionCamera>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let camera_groups: [wgpu::BindGroup; 2] = std::array::from_fn(|eye| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("space_warp_camera"),
+                layout: &pipelines.layout,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: cameras[eye].as_entire_binding() }],
+            })
+        });
+        info!(
+            "space warp: available, motion vectors {}x{}, depth {:?}, {} + {} images",
+            size.0,
+            size.1,
+            depth_format,
+            motion_targets.len(),
+            depth_targets.len(),
+        );
+        let info = std::array::from_fn(|eye| crate::renderer::space_warp::layer_info(&motion, &depth, eye as u32, size));
+        Ok(Self {
+            motion,
+            depth,
+            motion_targets,
+            depth_targets,
+            size,
+            pipelines,
+            cameras,
+            camera_groups,
+            prev: None,
+            acquired: None,
+            info,
+        })
+    }
+}
+
 struct EyeTarget {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -327,6 +456,8 @@ pub struct XrRenderer {
     /// Where each model's distance field lies in the bound atlas. See
     /// `proxy_field` and [`Self::set_reflection_proxies`].
     proxy_field_slots: Vec<crate::renderer::proxy_field::FieldSlot>,
+    /// Application SpaceWarp, where the runtime has it. See `space_warp`.
+    space_warp: Option<SpaceWarpState>,
     default_brush_lightmap: LoadedTexture,
     /// The level's brushes share ONE atlas, because they share one draw call.
     brush_lightmap: Option<LoadedTexture>,
@@ -1070,6 +1201,15 @@ impl XrRenderer {
         });
         let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // APPLICATION SPACEWARP's swapchains, where the runtime offers it.
+        let space_warp = xr_ctx.space_warp.and_then(|size| match SpaceWarpState::new(session, &wgpu_device, size) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("space warp: unavailable ({e})");
+                None
+            }
+        });
+
         let mut eye_targets: Vec<[EyeTarget; 2]> = Vec::new();
         for &raw_image in &raw_images {
             let targets = std::array::from_fn(|eye| {
@@ -1200,6 +1340,7 @@ impl XrRenderer {
             eye_targets,
             foveation,
             proxy_field_slots: Vec::new(),
+            space_warp,
             default_brush_lightmap,
             brush_lightmap: None,
             cuboid_lightmaps: HashMap::new(),

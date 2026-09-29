@@ -15,6 +15,7 @@ pub mod particle;
 pub mod pipeline;
 pub mod profiler;
 pub mod shadow;
+pub mod space_warp;
 pub mod tonemap;
 pub mod exposure;
 pub mod probe_stream;

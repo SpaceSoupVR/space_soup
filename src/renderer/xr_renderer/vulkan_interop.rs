@@ -205,6 +205,28 @@ pub(super) unsafe fn import_vk_image_as_wgpu(
     height: u32,
     array_layers: u32,
 ) -> wgpu::Texture {
+    unsafe {
+        import_vk_image_as_wgpu_with(
+            device,
+            image,
+            wgpu_format,
+            (width, height, array_layers),
+            wgpu::TextureUses::COLOR_TARGET | wgpu::TextureUses::RESOURCE,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        )
+    }
+}
+
+/// [`import_vk_image_as_wgpu`] with its usages given: a depth swapchain's
+/// image is a depth target, not a colour one.
+pub(super) unsafe fn import_vk_image_as_wgpu_with(
+    device: &wgpu::Device,
+    image: vk::Image,
+    wgpu_format: wgpu::TextureFormat,
+    (width, height, array_layers): (u32, u32, u32),
+    hal_usage: wgpu::TextureUses,
+    usage: wgpu::TextureUsages,
+) -> wgpu::Texture {
     use wgpu::hal::vulkan as hvk;
 
     // A METHOD ON THE HAL DEVICE since wgpu 28, not a free function. Getting
@@ -227,7 +249,7 @@ pub(super) unsafe fn import_vk_image_as_wgpu(
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu_format,
-            usage: wgpu::TextureUses::COLOR_TARGET | wgpu::TextureUses::RESOURCE,
+            usage: hal_usage,
             memory_flags: wgpu::hal::MemoryFlags::empty(),
             view_formats: vec![],
         },
@@ -253,7 +275,7 @@ pub(super) unsafe fn import_vk_image_as_wgpu(
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage,
             view_formats: &[],
         },
         // UNINITIALIZED: a freshly acquired swapchain image holds nothing we

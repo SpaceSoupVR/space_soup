@@ -206,6 +206,27 @@ impl XrRenderer {
             }
         }
 
+        // APPLICATION SPACEWARP: this frame's motion and depth images, when
+        // the lever asks for them -- only now, with the views located, so no
+        // early return above can leave them held. See `space_warp`.
+        let warp_world_to_player = glam::Mat4::from_quat(glam::Quat::from_rotation_y(self.player.yaw).inverse())
+            * glam::Mat4::from_translation(-self.player.offset);
+        let warp_view_proj: [glam::Mat4; 2] = std::array::from_fn(|i| {
+            let v = &eye_views[i.min(eye_views.len() - 1)];
+            Camera::gl_to_wgpu_ndc(Camera::xr_projection(v.fov, crate::renderer::space_warp::NEAR_Z, crate::renderer::space_warp::FAR_Z))
+                * Camera::xr_view(v.pose)
+        });
+        if let Some(sw) = self.space_warp.as_mut() {
+            sw.acquired = None;
+            if self.levers.space_warp {
+                let m = sw.motion.acquire_image()? as usize;
+                sw.motion.wait_image(xr::Duration::INFINITE)?;
+                let d = sw.depth.acquire_image()? as usize;
+                sw.depth.wait_image(xr::Duration::INFINITE)?;
+                sw.acquired = Some((m, d));
+            }
+        }
+
         let head_rot = {
             let o = eye_views[0].pose.orientation;
             glam::Quat::from_xyzw(o.x, o.y, o.z, o.w)
@@ -1921,6 +1942,47 @@ impl XrRenderer {
             }
 
             self.wgpu_queue.submit(Some(encoder.finish()));
+
+            // SPACEWARP: this eye's motion vectors and depth, small, from the
+            // same geometry. See `space_warp`.
+            if let Some(sw) = self.space_warp.as_ref() {
+                if let Some((m, d)) = sw.acquired {
+                    let curr = warp_view_proj[eye];
+                    let prev = sw.prev.map_or(curr, |(vps, w2p)| {
+                        crate::renderer::space_warp::previous_clip(vps[eye], w2p, warp_world_to_player)
+                    });
+                    let cam = crate::renderer::space_warp::MotionCamera {
+                        curr: curr.to_cols_array_2d(),
+                        prev: prev.to_cols_array_2d(),
+                    };
+                    self.wgpu_queue.write_buffer(&sw.cameras[eye], 0, bytemuck::bytes_of(&cam));
+                    let mut encoder = self
+                        .wgpu_device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("space_warp") });
+                    let geometry = crate::renderer::space_warp::MotionGeometry {
+                        brush: brush_buffers.as_ref().map(|(vb, ib, n)| (vb, ib, *n)),
+                        solid: Some((&solid_vb, &solid_ib, solid_idx.len() as u32)),
+                    };
+                    crate::renderer::space_warp::record(
+                        &mut encoder,
+                        &sw.pipelines,
+                        &sw.camera_groups[eye],
+                        &sw.motion_targets[m][eye].view,
+                        &sw.depth_targets[d][eye].view,
+                        &geometry,
+                    );
+                    self.wgpu_queue.submit(Some(encoder.finish()));
+                }
+            }
+        }
+
+        // SPACEWARP: the images go back, and this frame becomes the history.
+        if let Some(sw) = self.space_warp.as_mut() {
+            if sw.acquired.is_some() {
+                sw.motion.release_image()?;
+                sw.depth.release_image()?;
+            }
+            sw.prev = Some((warp_view_proj, warp_world_to_player));
         }
 
         // Resolve the pass timers in their own submission, AFTER every pass
@@ -2040,11 +2102,16 @@ impl XrRenderer {
             (Some(_), Some(tracked)) => tracked.get(i).copied().unwrap_or(ev.pose),
             _ => ev.pose,
         };
+        // With SpaceWarp, each view carries its motion vectors and depth.
+        // The info structs live in the renderer, which is neither moved nor
+        // touched again before the caller hands these views to `xrEndFrame`.
+        let warp_info: Option<&[xr::sys::CompositionLayerSpaceWarpInfoFB; 2]> =
+            self.space_warp.as_ref().filter(|sw| sw.acquired.is_some()).map(|sw| &sw.info);
         let proj_views = eye_views
             .iter()
             .enumerate()
             .map(|(i, ev)| {
-                xr::CompositionLayerProjectionView::new()
+                let view = xr::CompositionLayerProjectionView::new()
                     .pose(submit_pose(i, ev))
                     .fov(ev.fov)
                     .sub_image(
@@ -2058,7 +2125,15 @@ impl XrRenderer {
                                     height: self.height as i32,
                                 },
                             }),
-                    )
+                    );
+                match warp_info.and_then(|info| info.get(i)) {
+                    Some(info) => {
+                        let mut raw = view.into_raw();
+                        raw.next = info as *const _ as *const std::ffi::c_void;
+                        unsafe { xr::CompositionLayerProjectionView::from_raw(raw) }
+                    }
+                    None => view,
+                }
             })
             .collect();
 

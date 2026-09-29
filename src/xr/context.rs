@@ -14,6 +14,9 @@ pub struct XrContext {
     /// Whether `XR_META_performance_metrics` was available and enabled. See
     /// `perf_metrics`.
     pub has_performance_metrics: bool,
+    /// `XR_FB_space_warp`, available and enabled: the motion-vector image
+    /// size the runtime recommends. See `renderer::space_warp`.
+    pub space_warp: Option<(u32, u32)>,
 }
 
 impl XrContext {
@@ -69,6 +72,14 @@ impl XrContext {
             exts.meta_performance_metrics = true;
         }
 
+        // APPLICATION SPACEWARP, where the runtime has it. Enabling it changes
+        // nothing until a frame carries motion vectors; see
+        // `renderer::space_warp`.
+        let has_space_warp = available_exts.fb_space_warp;
+        if has_space_warp {
+            exts.fb_space_warp = true;
+        }
+
         let instance = entry.create_instance(
             &xr::ApplicationInfo {
                 application_name: "space_soup",
@@ -86,12 +97,35 @@ impl XrContext {
         let system = instance.system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)?;
         let _reqs = instance.graphics_requirements::<xr::Vulkan>(system)?;
 
+        // The motion vectors' size, from the system's properties with the
+        // space warp struct chained on (the safe wrapper has no `next`).
+        let space_warp = has_space_warp.then(|| {
+            let mut sw = xr::sys::SystemSpaceWarpPropertiesFB {
+                ty: xr::sys::SystemSpaceWarpPropertiesFB::TYPE,
+                next: std::ptr::null_mut(),
+                recommended_motion_vector_image_rect_width: 0,
+                recommended_motion_vector_image_rect_height: 0,
+            };
+            let mut props: xr::sys::SystemProperties = unsafe { std::mem::zeroed() };
+            props.ty = xr::sys::SystemProperties::TYPE;
+            props.next = &mut sw as *mut _ as *mut std::ffi::c_void;
+            let result = unsafe { (instance.fp().get_system_properties)(instance.as_raw(), system, &mut props) };
+            info!(
+                "Space warp: {:?}, motion vectors {}x{}",
+                result,
+                sw.recommended_motion_vector_image_rect_width,
+                sw.recommended_motion_vector_image_rect_height,
+            );
+            (sw.recommended_motion_vector_image_rect_width.max(1), sw.recommended_motion_vector_image_rect_height.max(1))
+        });
+
         Ok(Self {
             instance,
             system,
             has_hand_tracking,
             has_layer_settings,
             has_performance_metrics,
+            space_warp,
         })
     }
 }
