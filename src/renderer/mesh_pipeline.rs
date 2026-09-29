@@ -550,6 +550,11 @@ struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32> }}
 
 @group(3) @binding(0) var lm_tex: texture_2d<f32>;
 @group(3) @binding(1) var lm_samp: sampler;
+// The stationary lamps' shadows on this mesh, on its own atlas, and the
+// sampler the brushes read theirs with. See `lights::set_stationary_masks`.
+@group(3) @binding(4) var lm_sun_samp: sampler;
+@group(3) @binding(5) var lm_stationary: texture_2d_array<f32>;
+const STATIONARY_MASK_DISTANCE_TEXELS: f32 = {stationary_range:?};
 
 {lights_block}
 
@@ -621,6 +626,25 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // of its shade sees less sky than the top of it.
     // The baked lamps are in this atlas. See `receiver_skips_baked`.
     receiver_skips_baked = true;
+    // THE STATIONARY LAMPS' SHADOWS, as the brushes take theirs. Without them
+    // every live lamp lit a mesh with no visibility at all: a sconce's plate
+    // glowed with its own bulb through its shade (headset, 2026-09-29). A mesh
+    // baked before these existed binds one neutral layer, fully lit.
+    let st_layers = textureNumLayers(lm_stationary);
+    let st_0 = textureSample(lm_stationary, lm_sun_samp, in.uv2, 0);
+    var st_1 = vec4<f32>(1.0);
+    var st_2 = vec4<f32>(1.0);
+    var st_3 = vec4<f32>(1.0);
+    if (st_layers > 1u) {{
+        st_1 = textureSample(lm_stationary, lm_sun_samp, in.uv2, 1);
+    }}
+    if (st_layers > 2u) {{
+        st_2 = textureSample(lm_stationary, lm_sun_samp, in.uv2, 2);
+    }}
+    if (st_layers > 3u) {{
+        st_3 = textureSample(lm_stationary, lm_sun_samp, in.uv2, 3);
+    }}
+    set_stationary_masks(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
     let lit = shade_with_sky(in.world_pos, n, model_u.params.x * baked.a);
     let tex_color = textureSample(tex, samp, in.uv);
     // ADDED, NOT MULTIPLIED.
@@ -656,6 +680,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
 "#,
         lights_block = wgsl_lights_block(0, 1),
         max_strength = super::mesh::MeshVertex::MAX_EMISSIVE_STRENGTH,
+        stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
     )
 }
 
@@ -718,6 +743,28 @@ mod tests {
         render_mesh_baked(emissive, drive, lit, sky_vis, mask, [0, 0, 0, 255])
     }
 
+    /// A stationary lamp takes its shadow on a mesh from the mesh's own baked
+    /// mask, as on a brush: fully shadowed, none of its light arrives; fully
+    /// lit, exactly what the lamp gives unmasked. On the headset a sconce's
+    /// plate glowed with its own bulb because meshes had no mask at all
+    /// (2026-09-29).
+    #[test]
+    fn a_stationary_lamp_is_shadowed_on_a_mesh_by_its_mask() {
+        // No sky, no bake: the lamp is the only light.
+        let neutral_lm = [0, 0, 0, 255];
+        let grey = [128, 128, 128, 255];
+        let render = |stationary| render_mesh_stationary([0.0; 3], 0.0, true, 0.0, [255; 4], neutral_lm, grey, stationary, 40.0);
+        let Some(plain) = render(None) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let lit = render(Some([255, 255, 255, 255])).unwrap();
+        let hidden = render(Some([0, 0, 255, 255])).unwrap();
+        assert!(plain[0] > 60, "the lamp does not light the mesh at all: {plain:?}");
+        assert!((lit[0] as i32 - plain[0] as i32).abs() <= 1, "a fully lit mask changed the light: {lit:?} vs {plain:?}");
+        assert!(hidden[0] <= 2, "a mask that hides the bulb let its light through: {hidden:?}");
+    }
+
     /// The same, with the material's own base colour given explicitly.
     fn render_mesh_albedo(
         base: [u8; 4],
@@ -755,6 +802,24 @@ mod tests {
         lightmap_texel: [u8; 4],
         base: [u8; 4],
     ) -> Option<[u8; 4]> {
+        render_mesh_stationary(emissive, drive, lit, sky_vis, mask, lightmap_texel, base, None, 4.0)
+    }
+
+    /// The same, the lamp a STATIONARY one on mask channel 0 when `stationary`
+    /// is given, and the mesh's own mask layer that one texel; `intensity` the
+    /// lamp's.
+    #[allow(clippy::too_many_arguments)]
+    fn render_mesh_stationary(
+        emissive: [f32; 3],
+        drive: f32,
+        lit: bool,
+        sky_vis: f32,
+        mask: [u8; 4],
+        lightmap_texel: [u8; 4],
+        base: [u8; 4],
+        stationary: Option<[u8; 4]>,
+        intensity: f32,
+    ) -> Option<[u8; 4]> {
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
 
@@ -763,12 +828,12 @@ mod tests {
             lights.upload(
                 &queue,
                 &[Light {
-                    mask_channel: None,
+                    mask_channel: stationary.map(|_| 0),
                     position: glam::Vec3::new(0.0, 0.0, 4.0),
                     direction: glam::Vec3::NEG_Z,
                     kind: LightKind::Point,
                     color: Color3(255, 255, 255, 255),
-                    intensity: 4.0,
+                    intensity,
                     range: 20.0,
                     cone_angle_deg: 90.0,
                     inner_cone_angle_deg: 0.0,
@@ -793,9 +858,22 @@ mod tests {
             &(base.to_vec(), 1, 1),
             &(mask.to_vec(), 1, 1),
         );
-        let lm = create_lightmap_texture(
-            &device, &queue, &pipeline.lightmap_layout, &lightmap_texel, 1, 1, None,
-        );
+        let lm = match stationary {
+            None => create_lightmap_texture(
+                &device, &queue, &pipeline.lightmap_layout, &lightmap_texel, 1, 1, None,
+            ),
+            Some(texel) => crate::renderer::mesh::create_lightmap_texture_full(
+                &device,
+                &queue,
+                &pipeline.lightmap_layout,
+                crate::renderer::mesh::LightmapLight::Srgb8(&lightmap_texel),
+                1,
+                1,
+                None,
+                None,
+                Some((&[&texel[..]], 1, 1)),
+            ),
+        };
 
         let v = |p: [f32; 3]| MeshVertex {
             position: p,
