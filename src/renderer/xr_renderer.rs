@@ -46,11 +46,15 @@ struct SpaceWarpState {
     depth_targets: Vec<[EyeTarget; 2]>,
     size: (u32, u32),
     pipelines: crate::renderer::space_warp::MotionPipelines,
-    cameras: [wgpu::Buffer; 2],
-    camera_groups: [wgpu::BindGroup; 2],
+    /// Every draw's two clip transforms this frame, both eyes, one slot each.
+    cameras: wgpu::Buffer,
+    camera_group: wgpu::BindGroup,
     /// The previous frame's per-eye view-projections and world-to-player,
     /// kept every frame so that switching on starts with a true history.
     prev: Option<([glam::Mat4; 2], glam::Mat4)>,
+    /// Each mesh's model matrix last frame, by its model buffer (which lives
+    /// as long as the mesh does).
+    prev_models: HashMap<wgpu::Buffer, glam::Mat4>,
     /// This frame's motion and depth images, while held.
     acquired: Option<(usize, usize)>,
     /// What each eye's projection view points at; alive until the frame is
@@ -125,20 +129,23 @@ impl SpaceWarpState {
             wgpu::TextureUses::DEPTH_STENCIL_WRITE | wgpu::TextureUses::DEPTH_STENCIL_READ,
         );
         let pipelines = crate::renderer::space_warp::MotionPipelines::new(device, depth_format);
-        let cameras: [wgpu::Buffer; 2] = std::array::from_fn(|_| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("space_warp_camera"),
-                size: std::mem::size_of::<crate::renderer::space_warp::MotionCamera>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
+        let cameras = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("space_warp_cameras"),
+            size: crate::renderer::space_warp::SLOT_STRIDE * crate::renderer::space_warp::MAX_SLOTS as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
-        let camera_groups: [wgpu::BindGroup; 2] = std::array::from_fn(|eye| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("space_warp_camera"),
-                layout: &pipelines.layout,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: cameras[eye].as_entire_binding() }],
-            })
+        let camera_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("space_warp_cameras"),
+            layout: &pipelines.camera_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &cameras,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(std::mem::size_of::<crate::renderer::space_warp::MotionCamera>() as u64),
+                }),
+            }],
         });
         info!(
             "space warp: available, motion vectors {}x{}, depth {:?}, {} + {} images",
@@ -157,8 +164,9 @@ impl SpaceWarpState {
             size,
             pipelines,
             cameras,
-            camera_groups,
+            camera_group,
             prev: None,
+            prev_models: HashMap::new(),
             acquired: None,
             info,
         })

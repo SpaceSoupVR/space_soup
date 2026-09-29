@@ -894,6 +894,46 @@ impl XrRenderer {
             stream.begin_frame();
         }
 
+        // SPACEWARP: which meshes the motion pass draws, and every draw's two
+        // clip transforms for both eyes, into the ring once. A mesh's previous
+        // clip is the previous camera times its previous model matrix -- both
+        // in the previous player frame, so nothing else is needed. See
+        // `space_warp`.
+        let warp_meshes: Vec<(&MeshInstance, glam::Mat4, glam::Mat4)> = match self.space_warp.as_ref() {
+            Some(sw) if sw.acquired.is_some() => meshes
+                .iter()
+                .take(crate::renderer::space_warp::MAX_SLOTS as usize / 2 - 1)
+                .map(|m| {
+                    let model = m.mesh.model_matrix();
+                    let prev = sw.prev_models.get(&m.model.buffer).copied().unwrap_or(model);
+                    (m, model, prev)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let warp_per_eye = 1 + warp_meshes.len() as u32;
+        if let Some(sw) = self.space_warp.as_ref().filter(|sw| sw.acquired.is_some()) {
+            use crate::renderer::space_warp::{previous_clip, MotionCamera, SLOT_STRIDE};
+            let stride = SLOT_STRIDE as usize;
+            let size = std::mem::size_of::<MotionCamera>();
+            let mut bytes = vec![0u8; stride * 2 * warp_per_eye as usize];
+            for eye in 0..2usize {
+                let curr = warp_view_proj[eye];
+                let prev_view_proj = sw.prev.map_or(curr, |(vps, _)| vps[eye]);
+                let world_prev = sw.prev.map_or(curr, |(vps, w2p)| previous_clip(vps[eye], w2p, warp_world_to_player));
+                let mut put = |slot: usize, c: glam::Mat4, p: glam::Mat4| {
+                    let cam = MotionCamera { curr: c.to_cols_array_2d(), prev: p.to_cols_array_2d() };
+                    bytes[slot * stride..slot * stride + size].copy_from_slice(bytemuck::bytes_of(&cam));
+                };
+                let base = eye * warp_per_eye as usize;
+                put(base, curr, world_prev);
+                for (i, (_, model, prev)) in warp_meshes.iter().enumerate() {
+                    put(base + 1 + i, curr * *model, prev_view_proj * *prev);
+                }
+            }
+            self.wgpu_queue.write_buffer(&sw.cameras, 0, &bytes);
+        }
+
         for eye in 0..2usize {
             let ev = &eye_views[eye];
             let view = Camera::xr_view(ev.pose);
@@ -1944,32 +1984,61 @@ impl XrRenderer {
             self.wgpu_queue.submit(Some(encoder.finish()));
 
             // SPACEWARP: this eye's motion vectors and depth, small, from the
-            // same geometry. See `space_warp`.
+            // same geometry -- the world, then every mesh by its own motion.
+            // See `space_warp`.
             if let Some(sw) = self.space_warp.as_ref() {
                 if let Some((m, d)) = sw.acquired {
-                    let curr = warp_view_proj[eye];
-                    let prev = sw.prev.map_or(curr, |(vps, w2p)| {
-                        crate::renderer::space_warp::previous_clip(vps[eye], w2p, warp_world_to_player)
+                    use crate::renderer::space_warp::{MotionDraw, MotionKind};
+                    let base = eye as u32 * warp_per_eye;
+                    let mut draws: Vec<MotionDraw> = Vec::new();
+                    if let Some((vb, ib, n)) = brush_buffers.as_ref() {
+                        draws.push(MotionDraw { kind: MotionKind::Brush, vertices: vb, indices: ib, count: *n, slot: base, joints: None });
+                    }
+                    draws.push(MotionDraw {
+                        kind: MotionKind::Solid,
+                        vertices: &solid_vb,
+                        indices: &solid_ib,
+                        count: solid_idx.len() as u32,
+                        slot: base,
+                        joints: None,
                     });
-                    let cam = crate::renderer::space_warp::MotionCamera {
-                        curr: curr.to_cols_array_2d(),
-                        prev: prev.to_cols_array_2d(),
-                    };
-                    self.wgpu_queue.write_buffer(&sw.cameras[eye], 0, bytemuck::bytes_of(&cam));
+                    for (i, (inst, _, _)) in warp_meshes.iter().enumerate() {
+                        let slot = base + 1 + i as u32;
+                        if let Some(skin) = &inst.mesh.skin {
+                            let joints = skin.motion_bind_group(&self.wgpu_device, &sw.pipelines.joints_layout);
+                            for prim in &skin.primitives {
+                                draws.push(MotionDraw {
+                                    kind: MotionKind::Skinned,
+                                    vertices: &prim.vertex_buffer,
+                                    indices: &prim.index_buffer,
+                                    count: prim.indices.len() as u32,
+                                    slot,
+                                    joints: Some(joints),
+                                });
+                            }
+                        } else {
+                            for prim in inst.mesh.primitives.iter().filter(|p| p.layered.is_none()) {
+                                draws.push(MotionDraw {
+                                    kind: MotionKind::Mesh,
+                                    vertices: &prim.vertex_buffer,
+                                    indices: &prim.index_buffer,
+                                    count: prim.indices.len() as u32,
+                                    slot,
+                                    joints: None,
+                                });
+                            }
+                        }
+                    }
                     let mut encoder = self
                         .wgpu_device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("space_warp") });
-                    let geometry = crate::renderer::space_warp::MotionGeometry {
-                        brush: brush_buffers.as_ref().map(|(vb, ib, n)| (vb, ib, *n)),
-                        solid: Some((&solid_vb, &solid_ib, solid_idx.len() as u32)),
-                    };
                     crate::renderer::space_warp::record(
                         &mut encoder,
                         &sw.pipelines,
-                        &sw.camera_groups[eye],
+                        &sw.camera_group,
                         &sw.motion_targets[m][eye].view,
                         &sw.depth_targets[d][eye].view,
-                        &geometry,
+                        &draws,
                     );
                     self.wgpu_queue.submit(Some(encoder.finish()));
                 }
@@ -1983,6 +2052,7 @@ impl XrRenderer {
                 sw.depth.release_image()?;
             }
             sw.prev = Some((warp_view_proj, warp_world_to_player));
+            sw.prev_models = meshes.iter().map(|m| (m.model.buffer.clone(), m.mesh.model_matrix())).collect();
         }
 
         // Resolve the pass timers in their own submission, AFTER every pass
