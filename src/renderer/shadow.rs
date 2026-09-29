@@ -93,29 +93,36 @@ pub const MAX_SPOT_SHADOWS: usize = 4;
 /// leave half the spots writing outside the texture.
 pub const SPOT_ATLAS_COLS: u32 = 2;
 
-/// THE CHARACTERS' OWN TILES, after the spots': one each for the lamps lighting
-/// the player most that hold no spot slot, fitted around the player's body
-/// and drawing only the characters (`character_light_matrix`). Such a lamp
-/// otherwise shadows the player only by the capsules -- soft by design, since
-/// a crisp capsule body reads as a mannequin -- and the user asked for "more
-/// defined shadows from direct lights" (2026-09-29). Everything else the
-/// lamp's light meets takes its shadow from the lamp's baked mask.
+/// THE CHARACTERS' OWN TILES: one each for the lamps lighting the player most
+/// that hold no spot slot, fitted around the player's body and drawing only
+/// the characters (`character_light_matrix`). Such a lamp otherwise has no
+/// shadow of the characters at all -- and the user asked for "more defined
+/// shadows from direct lights" (2026-09-29). Everything else the lamp's light
+/// meets takes its shadow from the lamp's baked mask.
+///
+/// Tiles of the SUN'S MOVING-OBJECTS MAP, after its own (`SUN_ATLAS_TILES`):
+/// that pass already draws the characters every frame, so a character tile
+/// costs its draws and no pass of its own. In the spot atlas they took a
+/// 2048x3072 pass, 0.7 ms a frame for two small tiles (trace, 2026-09-29).
 pub const MAX_CHARACTER_SHADOWS: usize = 2;
 
-/// Every tile of the atlas: the spots', then the characters'.
-pub const SHADOW_TILES: usize = MAX_SPOT_SHADOWS + MAX_CHARACTER_SHADOWS;
+/// Tiles of the moving-objects map, in one row: the sun's, then the
+/// characters'. See `SUN_DYNAMIC_DIM`.
+pub const SUN_ATLAS_TILES: u32 = 1 + MAX_CHARACTER_SHADOWS as u32;
 
-/// Tile rows of the atlas: as many as `SHADOW_TILES` needs at
-/// `SPOT_ATLAS_COLS` a row.
-pub const SPOT_ATLAS_ROWS: u32 = (SHADOW_TILES as u32).div_ceil(SPOT_ATLAS_COLS);
+/// Light matrices in the uniform: the spots' in layer order, then the
+/// characters' (`Uniforms::spot_view_proj`).
+pub const SHADOW_MATRICES: usize = MAX_SPOT_SHADOWS + MAX_CHARACTER_SHADOWS;
+
+/// Tile rows of the spot atlas.
+pub const SPOT_ATLAS_ROWS: u32 = (MAX_SPOT_SHADOWS as u32).div_ceil(SPOT_ATLAS_COLS);
 
 const _: () = assert!(
-    (SPOT_ATLAS_COLS * SPOT_ATLAS_ROWS) as usize >= SHADOW_TILES,
-    "the shadow atlas must have a tile for every spot and character tile",
+    (SPOT_ATLAS_COLS * SPOT_ATLAS_ROWS) as usize >= MAX_SPOT_SHADOWS,
+    "the spot atlas must have a tile for every spot the budget allows",
 );
 
-/// Which tile of the atlas a layer occupies, as `(col, row)`: the spots'
-/// layers first, then the characters'.
+/// Which tile of the spot atlas a layer occupies, as `(col, row)`.
 pub fn spot_tile(layer: usize) -> (u32, u32) {
     let l = layer as u32;
     (l % SPOT_ATLAS_COLS, l / SPOT_ATLAS_COLS)
@@ -205,6 +212,12 @@ pub fn character_light_matrix(light: Vec3, centre: Vec3, radius: f32, range: f32
     let near = (dist - radius).max(0.05);
     let far = range.max(dist + radius).max(near * 2.0);
     Some(Mat4::perspective_rh((2.0 * half).min(std::f32::consts::PI - 0.1), 1.0, near, far) * view)
+}
+
+/// Aim a pass at tile `tile` of the moving-objects map. See `SUN_ATLAS_TILES`.
+fn sun_atlas_viewport(pass: &mut wgpu::RenderPass, tile: u32) {
+    let d = SUN_DYNAMIC_DIM as f32;
+    pass.set_viewport(tile as f32 * d, 0.0, d, d, 0.0, 1.0);
 }
 
 /// Which shadow slot a pass/upload targets.
@@ -475,6 +488,23 @@ impl ShadowSlot {
         }
     }
 
+    /// A standalone map `width` x `height`.
+    fn new_sized(device: &Device, light_layout: &BindGroupLayout, label: &str, width: u32, height: u32) -> Self {
+        let depth_texture = device.create_texture(&TextureDescriptor {
+            label: Some(label),
+            size: Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Depth32Float,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
+        let (light_buffer, light_bind_group) = Self::light_uniform(device, light_layout);
+        Self { _depth_texture: Some(depth_texture), depth_view: Some(depth_view), light_buffer, light_bind_group }
+    }
+
     /// The per-slot light matrix buffer and its bind group.
     fn light_uniform(device: &Device, light_layout: &BindGroupLayout) -> (Buffer, BindGroup) {
         let light_buffer = device.create_buffer(&BufferDescriptor {
@@ -515,8 +545,10 @@ pub struct ShadowMap {
     /// and a wrong clamp reads a neighbour's depth -- a shadow cast by a light
     /// that is not there. `each_spot_reads_its_own_shadow_map_and_not_a_
     /// neighbours` is the test that holds that line.
-    /// Then the characters' tiles, `MAX_CHARACTER_SHADOWS` of them.
-    spots: [ShadowSlot; SHADOW_TILES],
+    spots: [ShadowSlot; MAX_SPOT_SHADOWS],
+    /// The characters' tiles' light matrices; their depth is in the
+    /// moving-objects map (`SUN_ATLAS_TILES`).
+    characters: [ShadowSlot; MAX_CHARACTER_SHADOWS],
     _spot_texture: Texture,
     /// The whole atlas, as the shader samples it and as the pass renders to it.
     spot_array_view: TextureView,
@@ -769,7 +801,6 @@ impl ShadowMap {
         // is filled by moving the viewport inside a single render pass. Same
         // total memory as the array this replaced -- four dim x dim tiles
         // either way -- and one tile load/store instead of four.
-        // Rows for the characters' tiles below the spots'.
         let spot_texture = device.create_texture(&TextureDescriptor {
             label: Some("spot_shadow_atlas"),
             size: Extent3d { width: dim * SPOT_ATLAS_COLS, height: dim * SPOT_ATLAS_ROWS, depth_or_array_layers: 1 },
@@ -785,20 +816,27 @@ impl ShadowMap {
         // They keep their light matrix and its bind group, which is what still
         // differs per spot.
         let spots = std::array::from_fn(|_| ShadowSlot::light_only(device, &light_layout));
-        // (The characters' tiles are slots like the spots', after them.)
+        let characters = std::array::from_fn(|_| ShadowSlot::light_only(device, &light_layout));
         // NOTE: a fifth `ShadowSlot` used to be allocated here and never read.
         // The four in `spots` are views into one array texture; this was a
         // whole separate depth target, created on every construction and used
         // by nothing. The compiler had been warning about the binding for some
         // time -- the wasted memory was the part nobody had noticed.
 
-        let sun_dynamic =
-            ShadowSlot::new(device, &light_layout, "sun_dynamic_shadow_depth", SUN_DYNAMIC_DIM);
+        // A row of tiles: the sun's, then the characters'.
+        let sun_dynamic = ShadowSlot::new_sized(
+            device,
+            &light_layout,
+            "sun_dynamic_shadow_depth",
+            SUN_DYNAMIC_DIM * SUN_ATLAS_TILES,
+            SUN_DYNAMIC_DIM,
+        );
 
         Self {
             sun,
             sun_dynamic,
             spots,
+            characters,
             _spot_texture: spot_texture,
             spot_array_view,
             spot_tile_dim: dim,
@@ -833,7 +871,7 @@ impl ShadowMap {
             ShadowKind::Sun => &self.sun,
             ShadowKind::SunDynamic => &self.sun_dynamic,
             ShadowKind::Spot(i) => &self.spots[i.min(MAX_SPOT_SHADOWS - 1)],
-            ShadowKind::Character(k) => &self.spots[MAX_SPOT_SHADOWS + k.min(MAX_CHARACTER_SHADOWS - 1)],
+            ShadowKind::Character(k) => &self.characters[k.min(MAX_CHARACTER_SHADOWS - 1)],
         }
     }
 
@@ -869,7 +907,6 @@ impl ShadowMap {
         mesh_draws: &[ShadowMeshDraw],
         skinned_draws: &[ShadowSkinnedDraw],
         solid_chunks: &[CasterChunk],
-        characters: usize,
     ) -> u32 {
         let mut drawn = 0u32;
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -945,18 +982,40 @@ impl ShadowMap {
                 }
             }
         }
-        // THE CHARACTERS' TILES, in the same pass: the characters alone, from
-        // the matrices `upload_light(ShadowKind::Character(k))` set. The rest
-        // of a lamp's shadow is its baked mask.
-        for k in 0..characters.min(MAX_CHARACTER_SHADOWS) {
-            let (col, row) = spot_tile(MAX_SPOT_SHADOWS + k);
-            let d = self.spot_tile_dim as f32;
-            pass.set_viewport(col as f32 * d, row as f32 * d, d, d, 0.0, 1.0);
+        drop(pass);
+        drawn
+    }
+
+    /// THE MOVING-OBJECTS MAP, in ONE pass: the sun's tile when `sun` (every
+    /// moving caster, from `ShadowKind::SunDynamic`'s matrix), then the first
+    /// `characters` characters' tiles (the characters alone, from
+    /// `ShadowKind::Character(k)`'s). Tiles not drawn read as far depth,
+    /// unshadowed. Returns the indices drawn.
+    pub fn record_moving(
+        &self,
+        encoder: &mut CommandEncoder,
+        sun: bool,
+        characters: usize,
+        mesh_draws: &[ShadowMeshDraw],
+        skinned_draws: &[ShadowSkinnedDraw],
+    ) -> u32 {
+        let mut drawn = 0u32;
+        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("moving_shadow_pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: self.sun_dynamic_depth_view(),
+                depth_ops: Some(Operations { load: LoadOp::Clear(1.0), store: StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        let mut skinned = |pass: &mut wgpu::RenderPass, light_bg: &BindGroup| {
             if skinned_draws.is_empty() {
-                continue;
+                return;
             }
             pass.set_pipeline(&self.skinned_pipeline);
-            pass.set_bind_group(0, &self.spots[MAX_SPOT_SHADOWS + k].light_bind_group, &[]);
+            pass.set_bind_group(0, light_bg, &[]);
             for (vb, ib, count, model_bg, skin_bg) in skinned_draws {
                 pass.set_bind_group(1, *model_bg, &[]);
                 pass.set_bind_group(2, *skin_bg, &[]);
@@ -965,6 +1024,24 @@ impl ShadowMap {
                 pass.draw_indexed(0..*count, 0, 0..1);
                 drawn += *count;
             }
+        };
+        if sun {
+            sun_atlas_viewport(&mut pass, 0);
+            if !mesh_draws.is_empty() {
+                pass.set_pipeline(&self.mesh_pipeline);
+                pass.set_bind_group(0, &self.sun_dynamic.light_bind_group, &[]);
+                for (vb, ib, count, model_bg) in mesh_draws {
+                    pass.set_bind_group(1, *model_bg, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
+            }
+            skinned(&mut pass, &self.sun_dynamic.light_bind_group);
+        }
+        for k in 0..characters.min(MAX_CHARACTER_SHADOWS) {
+            sun_atlas_viewport(&mut pass, 1 + k as u32);
+            skinned(&mut pass, &self.characters[k].light_bind_group);
         }
         drop(pass);
         drawn
@@ -995,7 +1072,9 @@ impl ShadowMap {
             // on its own still works and still clears the whole atlas, which is
             // why `record_spots` exists for the frame path -- one clear and one
             // store for all of them.
-            ShadowKind::Spot(_) | ShadowKind::Character(_) => &self.spot_array_view,
+            ShadowKind::Spot(_) => &self.spot_array_view,
+            // A tile of the moving-objects map. See `SUN_ATLAS_TILES`.
+            ShadowKind::Character(_) => self.sun_dynamic.depth_view.as_ref().expect("the dynamic sun owns its own depth target"),
         };
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("shadow_pass"),
@@ -1010,15 +1089,15 @@ impl ShadowMap {
             }),
             ..Default::default()
         });
-        let tile = match kind {
-            ShadowKind::Spot(i) => Some(i.min(MAX_SPOT_SHADOWS - 1)),
-            ShadowKind::Character(k) => Some(MAX_SPOT_SHADOWS + k.min(MAX_CHARACTER_SHADOWS - 1)),
-            ShadowKind::Sun | ShadowKind::SunDynamic => None,
-        };
-        if let Some(t) = tile {
-            let (col, row) = spot_tile(t);
-            let d = self.spot_tile_dim as f32;
-            pass.set_viewport(col as f32 * d, row as f32 * d, d, d, 0.0, 1.0);
+        match kind {
+            ShadowKind::Spot(i) => {
+                let (col, row) = spot_tile(i.min(MAX_SPOT_SHADOWS - 1));
+                let d = self.spot_tile_dim as f32;
+                pass.set_viewport(col as f32 * d, row as f32 * d, d, d, 0.0, 1.0);
+            }
+            ShadowKind::SunDynamic => sun_atlas_viewport(&mut pass, 0),
+            ShadowKind::Character(k) => sun_atlas_viewport(&mut pass, 1 + k.min(MAX_CHARACTER_SHADOWS - 1) as u32),
+            ShadowKind::Sun => {}
         }
 
         if let Some((vb, ib, count)) = solid {
@@ -1146,9 +1225,9 @@ mod atlas_tests {
 
     #[test]
     fn every_tile_is_its_own() {
-        let tiles: Vec<(u32, u32)> = (0..SHADOW_TILES).map(spot_tile).collect();
+        let tiles: Vec<(u32, u32)> = (0..MAX_SPOT_SHADOWS).map(spot_tile).collect();
         let unique: std::collections::HashSet<_> = tiles.iter().collect();
-        assert_eq!(unique.len(), SHADOW_TILES, "two tiles coincide: {tiles:?}");
+        assert_eq!(unique.len(), MAX_SPOT_SHADOWS, "two tiles coincide: {tiles:?}");
         for (c, r) in tiles {
             assert!(c < SPOT_ATLAS_COLS && r < SPOT_ATLAS_ROWS, "tile ({c},{r}) is off the atlas");
         }
@@ -1179,7 +1258,7 @@ mod atlas_tests {
         // into the tile beside it and reads another lamp's depth -- a shadow
         // cast by a light that is nowhere near.
         let dim = 4;
-        for layer in 0..SHADOW_TILES {
+        for layer in 0..MAX_SPOT_SHADOWS {
             let (c, r) = spot_tile(layer);
             let lo = glam::Vec2::new(c as f32, r as f32) / grid();
             let hi = lo + glam::Vec2::ONE / grid();
@@ -1210,7 +1289,7 @@ mod atlas_tests {
         // must escape, or the guard is protecting nothing.
         let dim = 4;
         let tile_texel = glam::Vec2::ONE / glam::Vec2::splat(dim as f32);
-        let (c, r) = spot_tile(SHADOW_TILES - 1);
+        let (c, r) = spot_tile(MAX_SPOT_SHADOWS - 1);
         let lo = glam::Vec2::new(c as f32, r as f32) / grid();
         let unclamped = (glam::Vec2::new(-1.0, -1.0) * tile_texel + glam::Vec2::new(c as f32, r as f32)) / grid();
         assert!(
@@ -1542,7 +1621,7 @@ mod render_tests {
         let sun_view_proj = sun
             .map(|l| directional_light_matrix(l.direction, Vec3::ZERO, 20.0))
             .unwrap_or(Mat4::IDENTITY);
-        let mut spot_view_proj = [Mat4::IDENTITY; SHADOW_TILES];
+        let mut spot_view_proj = [Mat4::IDENTITY; SHADOW_MATRICES];
         for (layer, &i) in spot_indices.iter().enumerate() {
             let l = &scene.lights[i];
             spot_view_proj[layer] =

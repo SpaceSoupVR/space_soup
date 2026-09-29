@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use super::shadow::SHADOW_TILES;
+use super::shadow::SHADOW_MATRICES;
 use glam::{Mat4, Quat, Vec3};
 use wgpu::*;
 
@@ -38,7 +38,7 @@ pub struct Uniforms {
     ///
     /// Then the characters' own tiles (`shadow::MAX_CHARACTER_SHADOWS`), whose
     /// lamps `capsule_params` names.
-    pub spot_view_proj: [[[f32; 4]; 4]; SHADOW_TILES],
+    pub spot_view_proj: [[[f32; 4]; 4]; SHADOW_MATRICES],
     /// World-space camera position (xyz) PER EYE; w unused. Drives specular.
     ///
     /// Per eye for the same reason the matrices are: the two eyes are a few
@@ -384,7 +384,7 @@ pub struct ShadowUpload {
     pub sun_dynamic_enabled: bool,
     /// One per shadow-casting spot, in shadow-layer order; then one per
     /// characters' tile (`shadow::MAX_CHARACTER_SHADOWS`).
-    pub spot_view_proj: [Mat4; SHADOW_TILES],
+    pub spot_view_proj: [Mat4; SHADOW_MATRICES],
     pub sun_enabled: bool,
     /// How many spot shadow layers this frame actually filled.
     ///
@@ -402,7 +402,7 @@ impl ShadowUpload {
             sun_view_proj: Mat4::IDENTITY,
             sun_dynamic_view_proj: Mat4::IDENTITY,
             sun_dynamic_enabled: false,
-            spot_view_proj: [Mat4::IDENTITY; SHADOW_TILES],
+            spot_view_proj: [Mat4::IDENTITY; SHADOW_MATRICES],
             sun_enabled: false,
             spot_count: 0,
         }
