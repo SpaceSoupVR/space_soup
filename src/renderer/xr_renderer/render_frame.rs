@@ -510,6 +510,7 @@ impl XrRenderer {
             }
             crate::renderer::uniforms::PostUpload {
                 exposure: self.post.exposure * if self.auto_exposure { auto } else { 1.0 },
+                terrain_detail_distance: self.levers.terrain_detail_distance,
                 ..self.post
             }
         };

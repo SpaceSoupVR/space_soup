@@ -116,6 +116,9 @@ pub struct Levers {
     /// 2048 = the depth image's stencil stored rather than discarded;
     /// 4096 = the depth image cleared to 0 rather than 1.
     pub space_warp_debug: u32,
+    /// Metres past which the terrain's layer normal maps fade out; 0 keeps
+    /// them everywhere. See `terrain_pipeline` (`post_params.z`).
+    pub terrain_detail_distance: f32,
     /// MEASUREMENT: block on the GPU at the end of every frame, as the
     /// renderer used to. Its wait is then exactly the GPU's time, which is
     /// what the A/B schedule attributes costs with; shipped, the CPU prepares
@@ -162,6 +165,7 @@ impl Default for Levers {
             foveation: crate::renderer::foveation::SHIPPED,
             space_warp: false,
             space_warp_debug: 0,
+            terrain_detail_distance: 0.0,
             gpu_sync: false,
             ssr: None,
             multiview: None,
@@ -252,6 +256,9 @@ impl Levers {
         }
         if self.space_warp_debug != 0 {
             out.push(format!("swdbg={}", self.space_warp_debug));
+        }
+        if self.terrain_detail_distance != d.terrain_detail_distance {
+            out.push(format!("terrain_detail={}", self.terrain_detail_distance));
         }
         if let Some(on) = self.ssr {
             out.push(format!("ssr={}", if on { "on" } else { "off" }));
