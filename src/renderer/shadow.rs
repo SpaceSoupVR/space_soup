@@ -93,15 +93,118 @@ pub const MAX_SPOT_SHADOWS: usize = 4;
 /// leave half the spots writing outside the texture.
 pub const SPOT_ATLAS_COLS: u32 = 2;
 
+/// THE CHARACTERS' OWN TILES, after the spots': one each for the lamps lighting
+/// the player most that hold no spot slot, fitted around the player's body
+/// and drawing only the characters (`character_light_matrix`). Such a lamp
+/// otherwise shadows the player only by the capsules -- soft by design, since
+/// a crisp capsule body reads as a mannequin -- and the user asked for "more
+/// defined shadows from direct lights" (2026-09-29). Everything else the
+/// lamp's light meets takes its shadow from the lamp's baked mask.
+pub const MAX_CHARACTER_SHADOWS: usize = 2;
+
+/// Every tile of the atlas: the spots', then the characters'.
+pub const SHADOW_TILES: usize = MAX_SPOT_SHADOWS + MAX_CHARACTER_SHADOWS;
+
+/// Tile rows of the atlas: as many as `SHADOW_TILES` needs at
+/// `SPOT_ATLAS_COLS` a row.
+pub const SPOT_ATLAS_ROWS: u32 = (SHADOW_TILES as u32).div_ceil(SPOT_ATLAS_COLS);
+
 const _: () = assert!(
-    (SPOT_ATLAS_COLS * SPOT_ATLAS_COLS) as usize >= MAX_SPOT_SHADOWS,
-    "the spot atlas must have a tile for every spot the budget allows",
+    (SPOT_ATLAS_COLS * SPOT_ATLAS_ROWS) as usize >= SHADOW_TILES,
+    "the shadow atlas must have a tile for every spot and character tile",
 );
 
-/// Which tile of the atlas a spot layer occupies, as `(col, row)`.
+/// Which tile of the atlas a layer occupies, as `(col, row)`: the spots'
+/// layers first, then the characters'.
 pub fn spot_tile(layer: usize) -> (u32, u32) {
     let l = layer as u32;
     (l % SPOT_ATLAS_COLS, l / SPOT_ATLAS_COLS)
+}
+
+/// A lamp as [`character_shadow_lamps`] weighs it.
+#[derive(Clone, Copy, Debug)]
+pub struct CharacterLamp {
+    pub position: Vec3,
+    /// Where a spot points, and the cosine of its outer half-angle; -1 for a
+    /// lamp that shines every way.
+    pub direction: Vec3,
+    pub cos_outer: f32,
+    pub range: f32,
+    pub intensity: f32,
+    /// A point or spot lamp without a spot slot of its own.
+    pub eligible: bool,
+}
+
+/// WHICH LAMPS CAST THE PLAYER'S CRISP SHADOW: of `lamps`, those lighting the
+/// body -- the sphere at `centre` of `radius` -- most: by intensity over
+/// squared distance, only within range, and for a spot only where some of the
+/// body is inside its cone (the hall's pendants are downlights: a player a
+/// step to the side of one is not lit by it at all). Strongest first, at most
+/// `MAX_CHARACTER_SHADOWS`. A lamp `held` last frame (by position) keeps its
+/// tile unless one left out lights the body a third more: two lamps lighting
+/// it almost alike would otherwise trade the crisp shadow back and forth as
+/// the player moves, and each trade swaps a sharp shadow for a soft one.
+pub fn character_shadow_lamps(lamps: &[CharacterLamp], centre: Vec3, radius: f32, held: &[Vec3]) -> Vec<usize> {
+    const KEEP: f32 = 1.0 / 1.33;
+    let lights_body = |l: &CharacterLamp| {
+        let to = centre - l.position;
+        let d = to.length();
+        if !l.eligible || l.intensity <= 0.0 || d >= l.range {
+            return false;
+        }
+        if l.cos_outer <= -1.0 || d <= radius {
+            return true;
+        }
+        // The body's own angular size widens the cone it may touch.
+        let angle = l.direction.normalize_or_zero().dot(to / d).clamp(-1.0, 1.0).acos();
+        angle <= l.cos_outer.clamp(-1.0, 1.0).acos() + (radius / d).min(1.0).asin()
+    };
+    let mut candidates: Vec<(usize, f32)> = lamps
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| lights_body(l))
+        .map(|(i, l)| (i, l.intensity / ((l.position - centre).length_squared() + 0.25)))
+        .collect();
+    candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let was_held = |i: usize| held.iter().any(|h| (lamps[i].position - *h).length() < 0.01);
+    let mut chosen: Vec<(usize, f32)> = candidates.iter().copied().filter(|c| was_held(c.0)).take(MAX_CHARACTER_SHADOWS).collect();
+    for c in &candidates {
+        if chosen.iter().any(|k| k.0 == c.0) {
+            continue;
+        }
+        if chosen.len() < MAX_CHARACTER_SHADOWS {
+            chosen.push(*c);
+            continue;
+        }
+        // Full: the newcomer takes the weakest tile only by a clear margin.
+        let (weakest, w) = chosen.iter().enumerate().min_by(|a, b| a.1 .1.total_cmp(&b.1 .1)).map(|(k, c)| (k, c.1)).unwrap();
+        if w < c.1 * KEEP {
+            chosen[weakest] = *c;
+        }
+    }
+    chosen.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    chosen.into_iter().map(|c| c.0).collect()
+}
+
+/// A CHARACTER'S SHADOW FROM A LAMP: the lamp at `light` looking at the body
+/// bounded by the sphere at `centre` of `radius`, just wide enough to hold it,
+/// out to the lamp's `range` -- every receiver the body can shadow for this
+/// lamp lies in that cone, and past its range the lamp lights nothing. `None`
+/// when the lamp is inside the body's bound, which no frustum can hold.
+pub fn character_light_matrix(light: Vec3, centre: Vec3, radius: f32, range: f32) -> Option<Mat4> {
+    let to = centre - light;
+    let dist = to.length();
+    if !(dist > radius * 1.05 && radius > 0.0) {
+        return None;
+    }
+    // The cone that holds the sphere, a tenth wider for the kernel.
+    let half = (radius / dist).asin() * 1.1;
+    let d = to / dist;
+    let up = if d.dot(Vec3::Y).abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let view = Mat4::look_at_rh(light, centre, up);
+    let near = (dist - radius).max(0.05);
+    let far = range.max(dist + radius).max(near * 2.0);
+    Some(Mat4::perspective_rh((2.0 * half).min(std::f32::consts::PI - 0.1), 1.0, near, far) * view)
 }
 
 /// Which shadow slot a pass/upload targets.
@@ -113,6 +216,8 @@ pub enum ShadowKind {
     SunDynamic,
     /// One of the spot layers, by index.
     Spot(usize),
+    /// One of the characters' tiles, by index. See `MAX_CHARACTER_SHADOWS`.
+    Character(usize),
 }
 
 /// Builds the sun's light-space view-projection: an orthographic box aimed
@@ -410,7 +515,8 @@ pub struct ShadowMap {
     /// and a wrong clamp reads a neighbour's depth -- a shadow cast by a light
     /// that is not there. `each_spot_reads_its_own_shadow_map_and_not_a_
     /// neighbours` is the test that holds that line.
-    spots: [ShadowSlot; MAX_SPOT_SHADOWS],
+    /// Then the characters' tiles, `MAX_CHARACTER_SHADOWS` of them.
+    spots: [ShadowSlot; SHADOW_TILES],
     _spot_texture: Texture,
     /// The whole atlas, as the shader samples it and as the pass renders to it.
     spot_array_view: TextureView,
@@ -663,10 +769,10 @@ impl ShadowMap {
         // is filled by moving the viewport inside a single render pass. Same
         // total memory as the array this replaced -- four dim x dim tiles
         // either way -- and one tile load/store instead of four.
-        let atlas_dim = dim * SPOT_ATLAS_COLS;
+        // Rows for the characters' tiles below the spots'.
         let spot_texture = device.create_texture(&TextureDescriptor {
             label: Some("spot_shadow_atlas"),
-            size: Extent3d { width: atlas_dim, height: atlas_dim, depth_or_array_layers: 1 },
+            size: Extent3d { width: dim * SPOT_ATLAS_COLS, height: dim * SPOT_ATLAS_ROWS, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
@@ -679,6 +785,7 @@ impl ShadowMap {
         // They keep their light matrix and its bind group, which is what still
         // differs per spot.
         let spots = std::array::from_fn(|_| ShadowSlot::light_only(device, &light_layout));
+        // (The characters' tiles are slots like the spots', after them.)
         // NOTE: a fifth `ShadowSlot` used to be allocated here and never read.
         // The four in `spots` are views into one array texture; this was a
         // whole separate depth target, created on every construction and used
@@ -726,6 +833,7 @@ impl ShadowMap {
             ShadowKind::Sun => &self.sun,
             ShadowKind::SunDynamic => &self.sun_dynamic,
             ShadowKind::Spot(i) => &self.spots[i.min(MAX_SPOT_SHADOWS - 1)],
+            ShadowKind::Character(k) => &self.spots[MAX_SPOT_SHADOWS + k.min(MAX_CHARACTER_SHADOWS - 1)],
         }
     }
 
@@ -761,6 +869,7 @@ impl ShadowMap {
         mesh_draws: &[ShadowMeshDraw],
         skinned_draws: &[ShadowSkinnedDraw],
         solid_chunks: &[CasterChunk],
+        characters: usize,
     ) -> u32 {
         let mut drawn = 0u32;
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -836,6 +945,27 @@ impl ShadowMap {
                 }
             }
         }
+        // THE CHARACTERS' TILES, in the same pass: the characters alone, from
+        // the matrices `upload_light(ShadowKind::Character(k))` set. The rest
+        // of a lamp's shadow is its baked mask.
+        for k in 0..characters.min(MAX_CHARACTER_SHADOWS) {
+            let (col, row) = spot_tile(MAX_SPOT_SHADOWS + k);
+            let d = self.spot_tile_dim as f32;
+            pass.set_viewport(col as f32 * d, row as f32 * d, d, d, 0.0, 1.0);
+            if skinned_draws.is_empty() {
+                continue;
+            }
+            pass.set_pipeline(&self.skinned_pipeline);
+            pass.set_bind_group(0, &self.spots[MAX_SPOT_SHADOWS + k].light_bind_group, &[]);
+            for (vb, ib, count, model_bg, skin_bg) in skinned_draws {
+                pass.set_bind_group(1, *model_bg, &[]);
+                pass.set_bind_group(2, *skin_bg, &[]);
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..*count, 0, 0..1);
+                drawn += *count;
+            }
+        }
         drop(pass);
         drawn
     }
@@ -865,7 +995,7 @@ impl ShadowMap {
             // on its own still works and still clears the whole atlas, which is
             // why `record_spots` exists for the frame path -- one clear and one
             // store for all of them.
-            ShadowKind::Spot(_) => &self.spot_array_view,
+            ShadowKind::Spot(_) | ShadowKind::Character(_) => &self.spot_array_view,
         };
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("shadow_pass"),
@@ -880,8 +1010,13 @@ impl ShadowMap {
             }),
             ..Default::default()
         });
-        if let ShadowKind::Spot(i) = kind {
-            let (col, row) = spot_tile(i.min(MAX_SPOT_SHADOWS - 1));
+        let tile = match kind {
+            ShadowKind::Spot(i) => Some(i.min(MAX_SPOT_SHADOWS - 1)),
+            ShadowKind::Character(k) => Some(MAX_SPOT_SHADOWS + k.min(MAX_CHARACTER_SHADOWS - 1)),
+            ShadowKind::Sun | ShadowKind::SunDynamic => None,
+        };
+        if let Some(t) = tile {
+            let (col, row) = spot_tile(t);
             let d = self.spot_tile_dim as f32;
             pass.set_viewport(col as f32 * d, row as f32 * d, d, d, 0.0, 1.0);
         }
@@ -1004,13 +1139,18 @@ fn vs_skinned(
 mod atlas_tests {
     use super::*;
 
+    /// The atlas's grid, columns by rows, as the shader's `pcf_layer` has it.
+    fn grid() -> glam::Vec2 {
+        glam::Vec2::new(SPOT_ATLAS_COLS as f32, SPOT_ATLAS_ROWS as f32)
+    }
+
     #[test]
-    fn every_spot_gets_its_own_tile() {
-        let tiles: Vec<(u32, u32)> = (0..MAX_SPOT_SHADOWS).map(spot_tile).collect();
+    fn every_tile_is_its_own() {
+        let tiles: Vec<(u32, u32)> = (0..SHADOW_TILES).map(spot_tile).collect();
         let unique: std::collections::HashSet<_> = tiles.iter().collect();
-        assert_eq!(unique.len(), MAX_SPOT_SHADOWS, "two spots share a tile: {tiles:?}");
+        assert_eq!(unique.len(), SHADOW_TILES, "two tiles coincide: {tiles:?}");
         for (c, r) in tiles {
-            assert!(c < SPOT_ATLAS_COLS && r < SPOT_ATLAS_COLS, "tile ({c},{r}) is off the atlas");
+            assert!(c < SPOT_ATLAS_COLS && r < SPOT_ATLAS_ROWS, "tile ({c},{r}) is off the atlas");
         }
     }
 
@@ -1024,13 +1164,13 @@ mod atlas_tests {
     /// that cannot fail is worse than none, so they were deleted rather than
     /// kept. The gap is real and is recorded here on purpose.
     fn clamped_atlas_uv(layer: usize, tile_uv: glam::Vec2, step: (i32, i32), dim: u32) -> glam::Vec2 {
-        let cols = SPOT_ATLAS_COLS as f32;
-        let atlas_texel = 1.0 / (dim * SPOT_ATLAS_COLS) as f32;
-        let guard = atlas_texel * cols * 0.5;
+        let atlas_texel = glam::Vec2::ONE / (glam::Vec2::splat(dim as f32) * grid());
+        let tile_texel = atlas_texel * grid();
+        let guard = tile_texel * 0.5;
         let (c, r) = spot_tile(layer);
-        let off = glam::Vec2::new(step.0 as f32, step.1 as f32) * atlas_texel * cols;
-        let local = (tile_uv + off).clamp(glam::Vec2::splat(guard), glam::Vec2::splat(1.0 - guard));
-        (local + glam::Vec2::new(c as f32, r as f32)) / cols
+        let off = glam::Vec2::new(step.0 as f32, step.1 as f32) * tile_texel;
+        let local = (tile_uv + off).clamp(guard, glam::Vec2::ONE - guard);
+        (local + glam::Vec2::new(c as f32, r as f32)) / grid()
     }
 
     #[test]
@@ -1039,11 +1179,10 @@ mod atlas_tests {
         // into the tile beside it and reads another lamp's depth -- a shadow
         // cast by a light that is nowhere near.
         let dim = 4;
-        let cols = SPOT_ATLAS_COLS as f32;
-        for layer in 0..MAX_SPOT_SHADOWS {
+        for layer in 0..SHADOW_TILES {
             let (c, r) = spot_tile(layer);
-            let lo = glam::Vec2::new(c as f32, r as f32) / cols;
-            let hi = lo + glam::Vec2::splat(1.0 / cols);
+            let lo = glam::Vec2::new(c as f32, r as f32) / grid();
+            let hi = lo + glam::Vec2::ONE / grid();
             for corner in [
                 glam::Vec2::new(0.0, 0.0),
                 glam::Vec2::new(1.0, 0.0),
@@ -1070,16 +1209,73 @@ mod atlas_tests {
         // against can actually arise. The same arithmetic without the clamp
         // must escape, or the guard is protecting nothing.
         let dim = 4;
-        let cols = SPOT_ATLAS_COLS as f32;
-        let atlas_texel = 1.0 / (dim * SPOT_ATLAS_COLS) as f32;
-        let (c, r) = spot_tile(1);
-        let lo = glam::Vec2::new(c as f32, r as f32) / cols;
-        let off = glam::Vec2::new(-1.0, -1.0) * atlas_texel * cols;
-        let unclamped = (off + glam::Vec2::new(c as f32, r as f32)) / cols;
+        let tile_texel = glam::Vec2::ONE / glam::Vec2::splat(dim as f32);
+        let (c, r) = spot_tile(SHADOW_TILES - 1);
+        let lo = glam::Vec2::new(c as f32, r as f32) / grid();
+        let unclamped = (glam::Vec2::new(-1.0, -1.0) * tile_texel + glam::Vec2::new(c as f32, r as f32)) / grid();
         assert!(
             unclamped.x < lo.x || unclamped.y < lo.y,
             "the unclamped kernel stayed inside its tile, so the guard guards nothing",
         );
+    }
+
+    /// The lamps lighting the player most take the tiles, strongest first;
+    /// a slotted, out-of-range or directional lamp never does; and a held lamp
+    /// keeps its tile against one only a little brighter, not against one
+    /// clearly brighter.
+    #[test]
+    fn the_lamps_lighting_the_player_most_cast_their_crisp_shadows() {
+        let body = Vec3::new(0.0, 0.9, 0.0);
+        let r = 0.8;
+        let lamp = |x: f32, intensity: f32, eligible: bool| CharacterLamp {
+            position: Vec3::new(x, 2.4, 0.0),
+            direction: Vec3::NEG_Y,
+            cos_outer: -1.0,
+            range: 8.0,
+            intensity,
+            eligible,
+        };
+        let lamps = [lamp(1.0, 4.0, true), lamp(-2.0, 4.0, true), lamp(0.5, 50.0, false), lamp(12.0, 99.0, true), lamp(3.0, 4.0, true)];
+        assert_eq!(character_shadow_lamps(&lamps, body, r, &[]), vec![0, 1], "nearest two eligible, strongest first");
+        // Lamp 4 is now a little brighter than lamp 1 at the body, but lamp 1
+        // held a tile: it stays.
+        let lamps = [lamp(1.0, 4.0, true), lamp(-2.0, 4.0, true), lamp(0.5, 50.0, false), lamp(12.0, 99.0, true), lamp(2.0, 4.6, true)];
+        let s = |i: usize| lamps[i].intensity / ((lamps[i].position - body).length_squared() + 0.25);
+        assert!(s(4) > s(1) && s(4) < s(1) / (1.0 / 1.33), "the test lamps are not placed as meant");
+        assert_eq!(character_shadow_lamps(&lamps, body, r, &[lamps[0].position, lamps[1].position]), vec![0, 1]);
+        // Clearly brighter: it takes the weakest held tile.
+        let lamps = [lamp(1.0, 4.0, true), lamp(-2.0, 4.0, true), lamp(0.5, 50.0, false), lamp(12.0, 99.0, true), lamp(1.5, 9.0, true)];
+        assert_eq!(character_shadow_lamps(&lamps, body, r, &[lamps[0].position, lamps[1].position]), vec![4, 0]);
+        // A downlight a step and a half to the side, with a 40 degree cone,
+        // lights none of the body: it gets no tile however near it hangs.
+        let beside = CharacterLamp { position: Vec3::new(1.8, 2.4, 0.0), cos_outer: 20f32.to_radians().cos(), intensity: 40.0, ..lamp(0.0, 0.0, true) };
+        assert_eq!(character_shadow_lamps(&[beside, lamp(-2.0, 4.0, true)], body, r, &[]), vec![1]);
+        let over = CharacterLamp { position: Vec3::new(0.3, 2.4, 0.0), ..beside };
+        assert_eq!(character_shadow_lamps(&[over, lamp(-2.0, 4.0, true)], body, r, &[]), vec![0, 1]);
+    }
+
+    /// A character's tile holds the body whole from the lamp -- its bounding
+    /// sphere inside the frustum -- and reaches the floor beyond it; and a lamp
+    /// inside the body's bound gets none.
+    #[test]
+    fn a_character_tile_holds_the_body_and_what_it_shadows() {
+        let lamp = Vec3::new(1.5, 2.4, 0.0);
+        let centre = Vec3::new(0.0, 0.9, 0.0);
+        let m = character_light_matrix(lamp, centre, 1.0, 8.0).expect("a lamp outside the body");
+        let inside = |p: Vec3| {
+            let c = m * p.extend(1.0);
+            let n = c.truncate() / c.w;
+            c.w > 0.0 && n.x.abs() <= 1.0 && n.y.abs() <= 1.0 && (0.0..=1.0).contains(&n.z)
+        };
+        let to = (centre - lamp).normalize();
+        let side = to.cross(Vec3::Y).normalize();
+        for p in [centre, centre + Vec3::Y * 0.95, centre - Vec3::Y * 0.95, centre + side * 0.95] {
+            assert!(inside(p), "{p} of the body is outside its tile");
+        }
+        // The floor where the body's shadow falls, past the body from the lamp.
+        let floor = lamp + to * ((lamp.y - 0.0) / -to.y);
+        assert!(inside(floor), "the floor behind the body, {floor}, is outside the tile");
+        assert!(character_light_matrix(centre + Vec3::X * 0.2, centre, 1.0, 8.0).is_none());
     }
 }
 
@@ -1221,7 +1417,7 @@ mod render_tests {
     use crate::renderer::cuboid::SolidVertex;
     use crate::renderer::lights::{Light, LightKind, LightsUniform};
     use crate::renderer::pipeline::{lightmap_bind_group_layout, SolidPipeline};
-    use crate::renderer::uniforms::{ShadowUpload, SkyUpload, UniformBuffer};
+    use crate::renderer::uniforms::{PlayerUpload, PostUpload, ShadowUpload, SkyUpload, UniformBuffer};
     use crate::renderer::Color3;
     use wgpu::util::DeviceExt;
 
@@ -1302,6 +1498,9 @@ mod render_tests {
         /// the moving-objects map (`ShadowKind::SunDynamic`) and the static map
         /// is left off -- which is how a player shadows sunlit ground.
         sky_sun_dynamic: bool,
+        /// The light (by index) whose characters' tile the caster is drawn
+        /// into, as the player is: see `MAX_CHARACTER_SHADOWS`.
+        character_lamp: Option<usize>,
     }
 
     /// Renders a lit quad filling the view and returns its centre pixel.
@@ -1343,11 +1542,21 @@ mod render_tests {
         let sun_view_proj = sun
             .map(|l| directional_light_matrix(l.direction, Vec3::ZERO, 20.0))
             .unwrap_or(Mat4::IDENTITY);
-        let mut spot_view_proj = [Mat4::IDENTITY; MAX_SPOT_SHADOWS];
+        let mut spot_view_proj = [Mat4::IDENTITY; SHADOW_TILES];
         for (layer, &i) in spot_indices.iter().enumerate() {
             let l = &scene.lights[i];
             spot_view_proj[layer] =
                 spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range);
+        }
+        // The caster in a characters' tile, fitted round it from its lamp.
+        let character_tile = scene.character_lamp.zip(scene.caster.as_ref()).and_then(|(i, (v, _))| {
+            let centre = v.iter().fold(Vec3::ZERO, |s, p| s + Vec3::from(p.position)) / v.len().max(1) as f32;
+            let radius = v.iter().map(|p| (Vec3::from(p.position) - centre).length()).fold(0.0f32, f32::max);
+            let l = &scene.lights[i];
+            character_light_matrix(l.position, centre, radius, l.range).map(|m| (i, m))
+        });
+        if let Some((_, m)) = character_tile {
+            spot_view_proj[MAX_SPOT_SHADOWS] = m;
         }
         let upload = ShadowUpload {
             sun_view_proj,
@@ -1362,12 +1571,16 @@ mod render_tests {
         // WORLD position -- which is what the shadow lookup and the lights use
         // -- rides on the model translation the view_proj cancels out.
         let world = scene.receiver_at;
-        uniforms.upload_with_sky(
+        let mut player = PlayerUpload::default();
+        player.capsules.shadow_lights[0] = character_tile.map_or(-1.0, |(i, _)| i as f32);
+        uniforms.upload_scene(
             &queue,
             glam::Mat4::from_translation(-world),
             world + scene.eye_offset,
             &upload,
             &scene.sky,
+            &PostUpload::default(),
+            &player,
         );
 
         let pipeline = SolidPipeline::new(&device, format, &uniforms.layout);
@@ -1481,6 +1694,11 @@ mod render_tests {
                 upload.spot_view_proj[layer],
             );
         }
+        if let Some((_, m)) = character_tile {
+            shadow_map.upload_light(&queue, ShadowKind::Character(0), m);
+            let solid = caster_bufs.as_ref().map(|(vb, ib, count)| (vb, ib, *count));
+            shadow_map.record(&mut encoder, ShadowKind::Character(0), solid, None, &[], &[], &[], m);
+        }
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("recv_pass"),
@@ -1577,7 +1795,45 @@ mod render_tests {
             normal: [0.0, 1.0, 0.0],
             sky: SkyUpload::none(),
             sky_sun_dynamic: false,
+            character_lamp: None,
         }
+    }
+
+    /// A POINT lamp without a spot slot shadows through its characters' tile
+    /// -- the path the player's crisp shadow takes -- and nothing else it has
+    /// holds the caster: without the tile the same caster casts nothing. Also
+    /// the only test that reads a tile in the atlas's added rows.
+    #[test]
+    fn a_lamp_shadows_the_player_through_the_characters_tile() {
+        let lamp = Light {
+            mask_channel: None,
+            position: Vec3::new(0.0, 4.0, 0.0),
+            direction: Vec3::NEG_Y,
+            kind: LightKind::Point,
+            color: Color3(255, 255, 255, 255),
+            intensity: 6.0,
+            range: 12.0,
+            cone_angle_deg: 90.0,
+            inner_cone_angle_deg: 0.0,
+        };
+        let scene = |lights: Vec<Light>, tile: Option<usize>| Scene {
+            lights,
+            caster: Some(ground(2.0, 0.6)),
+            character_lamp: tile,
+            ..base()
+        };
+        let Some(shadowed) = shade_receiver(scene(vec![lamp.clone()], Some(0))) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let open = shade_receiver(scene(vec![lamp.clone()], None)).unwrap();
+        let dark = shade_receiver(scene(Vec::new(), None)).unwrap();
+        eprintln!("through the characters' tile {shadowed:?}, without it {open:?}, no lamp {dark:?}");
+        assert!(open[0] as i32 - dark[0] as i32 > 40, "the lamp does not light the receiver measurably: {open:?} vs {dark:?}");
+        assert!(
+            (shadowed[0] as i32 - dark[0] as i32).abs() <= 2,
+            "the characters' tile let the lamp's light through: {shadowed:?}, dark {dark:?}, open {open:?}",
+        );
     }
 
     /// A spot above the receiver, aimed straight down.
@@ -2089,6 +2345,7 @@ mod render_tests {
             normal: [0.0, 1.0, 0.0],
             sky: crate::renderer::uniforms::SkyUpload::none(),
             sky_sun_dynamic: false,
+            character_lamp: None,
         }
     }
 

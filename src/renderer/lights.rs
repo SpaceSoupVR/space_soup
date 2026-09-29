@@ -720,7 +720,9 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let portal_slots = crate::renderer::uniforms::MAX_PORTALS * 3;
     let proxy_slots = crate::renderer::uniforms::MAX_PROXIES * 3;
     let room_table_rows = crate::renderer::uniforms::ROOM_TABLE_ROWS;
+    let shadow_tiles = super::shadow::SHADOW_TILES;
     let max_spot_shadows = super::shadow::MAX_SPOT_SHADOWS;
+    let atlas_rows = super::shadow::SPOT_ATLAS_ROWS;
     // Emitted from the Rust constant so the shader cannot disagree with the
     // atlas the pass actually renders into.
     let atlas_cols = super::shadow::SPOT_ATLAS_COLS;
@@ -747,7 +749,7 @@ struct Camera {{
     inv_view_proj: array<mat4x4<f32>, 2>,
     sun_view_proj: mat4x4<f32>,
     sun_dynamic_view_proj: mat4x4<f32>,
-    spot_view_proj: array<mat4x4<f32>, {max_spot_shadows}>,
+    spot_view_proj: array<mat4x4<f32>, {shadow_tiles}>,
     camera_pos: array<vec4<f32>, 2>,
     // x = sun shadow on, y = spot shadow on, z = which light is the flashlight.
     shadow_params: vec4<f32>,
@@ -1065,8 +1067,15 @@ fn capsule_cone_overlap(light: f32, occ: f32, sep: f32) -> f32 {{
 // the bulb, never blurred for looks. Unreal's capsule shadows. Point and spot
 // lamps only: the sun's shadow of a character is in the moving-objects map.
 fn capsule_visibility(l: Light, p: vec3<f32>) -> f32 {{
+    return capsule_visibility_from(l, p, 0);
+}}
+
+// The same from character `first` on: from 1 where the lamp's own tile of the
+// characters already shadows the player (`character_shadow_tile`), whose
+// capsules would only darken that shadow a second time.
+fn capsule_visibility_from(l: Light, p: vec3<f32>, first: i32) -> f32 {{
     let groups = i32(camera.capsule_params.x);
-    if (groups <= 0 || !capsule_receiver) {{
+    if (groups <= first || !capsule_receiver) {{
         return 1.0;
     }}
     let v = l.position.xyz - p;
@@ -1074,7 +1083,7 @@ fn capsule_visibility(l: Light, p: vec3<f32>) -> f32 {{
     let to_l = v / max(reach, 1e-4);
     let light = CAPSULE_BULB_RADIUS / max(reach, 1e-3);
     var vis = 1.0;
-    for (var g = 0; g < groups; g = g + 1) {{
+    for (var g = first; g < groups; g = g + 1) {{
         // The character's bound against the stretch of ray it could shadow,
         // widened by the lamp's cone where it passes.
         let bound = camera.capsule_groups[g * 2];
@@ -1531,13 +1540,16 @@ fn sun_visibility(l: Light, world_pos: vec3<f32>) -> f32 {{
 fn pcf_layer(tex: texture_depth_2d, layer: i32, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
     let c = shadow_coords(world_pos, light_view_proj);
     if (c.w < 0.5) {{ return 1.0; }}
-    let cols = f32({atlas_cols});
+    // The atlas's grid, columns by rows: the characters' tiles are rows below
+    // the spots'. See `shadow::SHADOW_TILES`.
+    let grid = vec2<f32>(f32({atlas_cols}), f32({atlas_rows}));
     let tile = vec2<f32>(f32(layer % {atlas_cols}), f32(layer / {atlas_cols}));
-    let atlas_texel = 1.0 / vec2<f32>(textureDimensions(tex));
+    // One texel, in tile space.
+    let tile_texel = grid / vec2<f32>(textureDimensions(tex));
     // Half a texel in from each edge of this tile, in tile space. Sampling
     // exactly ON the boundary already blends the neighbour under linear
     // filtering.
-    let guard = atlas_texel * cols * 0.5;
+    let guard = tile_texel * 0.5;
     let lo = guard;
     let hi = vec2<f32>(1.0) - guard;
 
@@ -1546,13 +1558,27 @@ fn pcf_layer(tex: texture_depth_2d, layer: i32, world_pos: vec3<f32>, light_view
         for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
             // Offset in TILE space, then clamped there, so the kernel never
             // walks out of the tile however close to its edge the sample is.
-            let off = vec2<f32>(f32(dx), f32(dy)) * atlas_texel * cols;
+            let off = vec2<f32>(f32(dx), f32(dy)) * tile_texel;
             let local = clamp(c.xy + off, lo, hi);
-            let uv = (local + tile) / cols;
+            let uv = (local + tile) / grid;
             sum = sum + textureSampleCompareLevel(tex, shadow_samp, uv, c.z);
         }}
     }}
     return sum / 9.0;
+}}
+
+// WHICH ATLAS TILE HOLDS LIGHT `i`'S SHADOW OF THE CHARACTERS alone, or -1:
+// its index in `capsule_params.y` or `.z` names the first or second of the
+// characters' tiles, after the spots'. See `shadow::MAX_CHARACTER_SHADOWS`.
+fn character_shadow_tile(i: u32) -> i32 {{
+    let f = f32(i);
+    if (camera.capsule_params.y == f) {{
+        return {max_spot_shadows};
+    }}
+    if (camera.capsule_params.z == f) {{
+        return {max_spot_shadows} + 1;
+    }}
+    return -1;
 }}
 
 fn light_contribution(l: Light, world_pos: vec3<f32>, n: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {{
@@ -4269,15 +4295,23 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
         if (l.params.z > 1.5) {{
             shadow = sun_visibility(l, world_pos);
         }}
-        let layer = i32(l.params.w);
-        if (layer >= 0 && f32(layer) < camera.shadow_params.y) {{
-            shadow = shadow * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
+        // Its spot slot, which draws everything; else, for a lamp lighting
+        // the player most, its tile of the characters alone
+        // (`character_shadow_tile`).
+        var tile = i32(l.params.w);
+        let slotted = tile >= 0 && f32(tile) < camera.shadow_params.y;
+        if (!slotted) {{
+            tile = select(-1, character_shadow_tile(i), l.params.z < 1.5);
+        }}
+        if (tile >= 0) {{
+            shadow = shadow * pcf_layer(spot_shadow_tex, tile, world_pos, camera.spot_view_proj[tile]);
         }}
         // THE CHARACTERS' SHADOWS from a lamp with no map that holds them. See
         // `capsule_visibility`: the sun's are in its moving-objects map, and a
-        // spot's shadow slot draws them already.
-        if (l.params.z < 1.5 && !(layer >= 0 && f32(layer) < camera.shadow_params.y)) {{
-            shadow = shadow * capsule_visibility(l, world_pos);
+        // spot's shadow slot draws them already. A characters' tile holds the
+        // player's; the capsules keep everyone else's.
+        if (l.params.z < 1.5 && !slotted) {{
+            shadow = shadow * capsule_visibility_from(l, world_pos, select(0, 1, tile >= 0));
         }}
         diffuse = diffuse + c.diffuse * shadow;
         specular = specular + c.specular * shadow;
@@ -4394,7 +4428,11 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
             c = c * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
         }} else if (l.params.z < 1.5) {{
             // The characters' shadows: see the brushes' loop.
-            c = c * capsule_visibility(l, world_pos);
+            let tile = character_shadow_tile(i);
+            if (tile >= 0) {{
+                c = c * pcf_layer(spot_shadow_tex, tile, world_pos, camera.spot_view_proj[tile]);
+            }}
+            c = c * capsule_visibility_from(l, world_pos, select(0, 1, tile >= 0));
         }}
         lit = lit + c;
     }}

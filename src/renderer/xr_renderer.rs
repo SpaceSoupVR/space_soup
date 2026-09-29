@@ -628,6 +628,9 @@ pub struct XrRenderer {
     /// the selector reads. This one exists only so the log can fire on change
     /// instead of on a timer -- see `SHADOWSLOTS` in `render_frame`.
     shadow_slot_log: std::cell::RefCell<Vec<usize>>,
+    /// Where the lamps casting the player's crisp shadows stood last frame,
+    /// for `shadow::character_shadow_lamps`' hysteresis.
+    character_shadow_held: std::cell::RefCell<Vec<glam::Vec3>>,
     /// The sky sun's shadow map, drawn once over the level and redrawn only
     /// when the level or the sun changes. See `lights::StaticSunShadow`.
     static_sun_shadow: std::cell::RefCell<Option<crate::renderer::lights::StaticSunShadow>>,
@@ -1453,6 +1456,7 @@ impl XrRenderer {
             baked_lights: Vec::new(),
             shadow_spot_incumbents: std::cell::RefCell::new(Vec::new()),
             shadow_slot_log: std::cell::RefCell::new(Vec::new()),
+            character_shadow_held: std::cell::RefCell::new(Vec::new()),
             static_sun_shadow: std::cell::RefCell::new(None),
             multiview_scene: false,
             stereo_pipelines,
