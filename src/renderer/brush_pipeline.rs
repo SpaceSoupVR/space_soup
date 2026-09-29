@@ -561,6 +561,18 @@ impl DebugView {
             DebugView::Ssr => DebugView::Off,
         }
     }
+
+    /// The tester's toggle: the normal picture and the lighting sources, and
+    /// nothing else. The SSR view is left out because it switches the
+    /// half-resolution probe pass off with it, so it does not show what
+    /// ships -- a tester who stepped into it saw 17-37 fps and reflections
+    /// that moved (found 2026-09-29).
+    pub fn toggle_sources(self) -> Self {
+        match self {
+            DebugView::Off => DebugView::Sources,
+            DebugView::Sources | DebugView::Ssr => DebugView::Off,
+        }
+    }
 }
 
 pub const SSR_ROUGHNESS_THRESHOLD: f32 = 0.35;
@@ -4313,6 +4325,9 @@ mod ssr_pipeline_tests {
         assert!(ssr_debug.contains("MAGENTA: faces the viewer"), "the SSR view does not paint the SSR paths");
         assert!(!brush_shader_with(true).contains("MAGENTA"), "the shipped shader paints SSR paths");
         assert_eq!(DebugView::Off.next().next().next(), DebugView::Off, "the cycle does not return to Off");
+        assert_eq!(DebugView::Off.toggle_sources(), DebugView::Sources);
+        assert_eq!(DebugView::Sources.toggle_sources(), DebugView::Off);
+        assert_eq!(DebugView::Ssr.toggle_sources(), DebugView::Off, "the tester's toggle must never reach the SSR view");
     }
 
     /// The two-eye probe pass and the reader that samples its layers pass
