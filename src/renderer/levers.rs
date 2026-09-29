@@ -118,7 +118,13 @@ pub struct Levers {
     /// motion for the compositor to correct, on a headset lying on a desk;
     /// 512 = depth declared reversed; 1024 = depth declared 500 m .. 1 km;
     /// 2048 = the depth image's stencil stored rather than discarded;
-    /// 4096 = the depth image cleared to 0 rather than 1.
+    /// 4096 = the depth image cleared to 0 rather than 1;
+    /// 16384 = reflections move with their surface, as before 2026-09-29
+    /// (`space_warp`'s reflections section), to compare;
+    /// 32768 = the brushes write what the reflection motion READ instead of
+    /// motion -- reflected share, reach in metres, distance ratio;
+    /// 65536 = with 8192, the images also saved raw to the app's files
+    /// (`swdump.bin`, see `space_warp::Readback::read`).
     pub space_warp_debug: u32,
     /// Metres past which the terrain's layer normal maps fade out; 0 keeps
     /// them everywhere. See `terrain_pipeline` (`post_params.z`).

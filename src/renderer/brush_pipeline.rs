@@ -1482,6 +1482,8 @@ impl BrushPipeline {
         label: &str,
         source: String,
     ) -> Self {
+        // A probe-pass shader writes the reach too. See `probe_pass::targets`.
+        let reaches = source.contains(probe_pass::OUTPUT_SIGNATURE);
         // Audited: see `shader_checks`.
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("brush_shader"),
@@ -1500,6 +1502,10 @@ impl BrushPipeline {
             bind_group_layouts: &layouts,
             immediate_size: 0,
         });
+        let probe_pass_targets = probe_pass::targets(true);
+        let plain_target = [Some(ColorTargetState { format, blend, write_mask: ColorWrites::ALL })];
+        let targets: &[Option<ColorTargetState>] =
+            if reaches { &probe_pass_targets } else { &plain_target };
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some(label),
             layout: Some(&layout),
@@ -1513,11 +1519,7 @@ impl BrushPipeline {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState {
-                    format,
-                    blend,
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets,
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
@@ -1806,12 +1808,12 @@ fn brush_shader_with(ssr: bool) -> String {
 /// part cut out at a time -- see `BrushPipeline::log_deferred_register_cuts`.
 const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("def_cut_none", &[]),
-    ("def_cut_rim_detect", &[("        if (hit.rim < 0.0 && t_exit * lobe > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
+    ("def_cut_rim_detect", &[("        if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
     ("def_cut_edge_detect", &[("        if (hit.edge_code < 0 && proxy.edge >= 0) {", "        if (false) {")]),
     (
         "def_cut_both_detect",
         &[
-            ("        if (hit.rim < 0.0 && t_exit * lobe > PROBE_RIM_MIN_SPREAD) {", "        if (false) {"),
+            ("        if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {", "        if (false) {"),
             ("        if (hit.edge_code < 0 && proxy.edge >= 0) {", "        if (false) {"),
         ],
     ),
@@ -1898,7 +1900,7 @@ const PROBE_PASS_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
         &[("    if (hit.edge_code >= 0) {\n", "    if (false) {\n"), ("    if (hit.rim >= 0.0) {\n", "    if (false) {\n")],
     ),
     ("cut_edge_detect", &[("        if (camera.probe_proxies[i * 3 + 1].w < 0.5 && out.edge < 0) {", "        if (false) {")]),
-    ("cut_rim_detect", &[("        if (hit.rim < 0.0 && t_exit * lobe > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
+    ("cut_rim_detect", &[("        if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
     ("cut_proxies", &[("    for (var i = probe_room_proxy(room); i >= 0; i = probe_proxy_next(i)) {", "    for (var i = -1; i >= 0; i = probe_proxy_next(i)) {")]),
     ("cut_proxy_surface", &[("    if (s0 < 0) {\n        return 3.4e38;\n    }", "    if (true) {\n        return 3.4e38;\n    }")]),
     ("cut_escape_colour", &[("    if (h.escaped) {\n        col = probe_escape_colour(", "    if (false) {\n        col = probe_escape_colour(")]),
@@ -1917,6 +1919,36 @@ pub mod probe_pass {
 
     /// Radiance and coverage: premultiplied RGB, coverage in A.
     pub const FORMAT: TextureFormat = TextureFormat::Rgba16Float;
+
+    /// THE REFLECTION'S REACH, the pass's second target: how far each texel's
+    /// reflected ray travelled to what it shows, in metres (`probe_reach`),
+    /// 0 where no brush was drawn. SpaceWarp reads it to move a reflected image
+    /// with the point it is an image of. See `space_warp::reflected_point`.
+    pub const REACH_FORMAT: TextureFormat = TextureFormat::R16Float;
+
+    /// What a probe-pass shader returns, and how a pipeline recognises one: a
+    /// shader built with it gets the reach target as well (`from_source`).
+    pub const OUTPUT_SIGNATURE: &str = "-> ProbePassOut";
+    pub(crate) const OUTPUT_WGSL: &str = r#"
+struct ProbePassOut {
+    @location(0) reflection: vec4<f32>,
+    @location(1) reach: f32,
+}
+"#;
+
+    /// The pass's two colour targets, for a pipeline that draws into it.
+    /// `reach` false leaves the second one unwritten -- the terrain, whose
+    /// ground reflects nothing SpaceWarp needs to move.
+    pub fn targets(reach: bool) -> [Option<wgpu::ColorTargetState>; 2] {
+        [
+            Some(wgpu::ColorTargetState { format: FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+            Some(wgpu::ColorTargetState {
+                format: REACH_FORMAT,
+                blend: None,
+                write_mask: if reach { wgpu::ColorWrites::ALL } else { wgpu::ColorWrites::empty() },
+            }),
+        ]
+    }
 
     /// Group 3 of the reading brush shader: the pass's colour and its depth,
     /// a bilinear sampler for the colour and a point sampler to gather the
@@ -1955,6 +1987,10 @@ pub mod probe_pass {
         _color: Texture,
         /// What the pass renders into: layer 0, or every layer when stereo.
         pub color_view: TextureView,
+        _reach: Texture,
+        /// The reach target, rendered into as the colour is; for one eye also
+        /// what SpaceWarp's motion pass reads. See `REACH_FORMAT`.
+        pub reach_view: TextureView,
         _depth: Texture,
         pub depth_view: TextureView,
         _samplers: [Sampler; 2],
@@ -1990,6 +2026,7 @@ pub mod probe_pass {
                 if layers == 1 { TextureUsages::STORAGE_BINDING } else { TextureUsages::empty() },
             );
             let depth = make("probe_pass_depth", TextureFormat::Depth32Float, TextureUsages::empty());
+            let reach = make("probe_pass_reach", REACH_FORMAT, TextureUsages::empty());
             // Rendered into as a plain 2D view for one eye, as the array for
             // two (a multiview pass takes its view count from it); read as
             // the array either way.
@@ -2003,6 +2040,7 @@ pub mod probe_pass {
                 t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..Default::default() })
             };
             let (color_view, depth_view) = (attachment(&color), attachment(&depth));
+            let reach_view = attachment(&reach);
             let (color_array, depth_array) = (array(&color), array(&depth));
             // Clamped at the edges, exactly as the four-texel path clamps.
             let sampler = |label: &str, filter: FilterMode| {
@@ -2026,7 +2064,7 @@ pub mod probe_pass {
                     BindGroupEntry { binding: 3, resource: BindingResource::Sampler(&samplers[1]) },
                 ],
             });
-            Self { _color: color, color_view, _depth: depth, depth_view, _samplers: samplers, bind_group, width, height }
+            Self { _color: color, color_view, _reach: reach, reach_view, _depth: depth, depth_view, _samplers: samplers, bind_group, width, height }
         }
     }
 
@@ -2048,7 +2086,8 @@ pub mod probe_pass {
         + face_b * clamp(dot(face_d, face_b), -in.face_half_extent.y, in.face_half_extent.y);
     probe_volume_pos = vec4<f32>(in.face_centre, 1.0);
     probe_face_given = in.probe_face;
-    return probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);"#;
+    let reflection = probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);
+    return ProbePassOut(reflection, probe_reach);"#;
 
     /// Group 3 and the read, appended to the scene pass's brush shader.
     pub(crate) const READER_WGSL: &str = r#"
@@ -2377,6 +2416,17 @@ struct VOut {{
     );"#
     };
     let ssr_apply = format!("{ssr_apply}{ssr_tail}");
+    // THE SCENE PASS'S BRUSH WRITES HOW MUCH OF EACH PIXEL IS REFLECTION into
+    // alpha, which nothing blends with -- the reader's pipeline is opaque and
+    // the compositor ignores the eye image's alpha -- for SpaceWarp's motion
+    // pass to read back. See `lights::reflection_alpha`.
+    let ssr_apply = if probe == BrushProbe::Read && !ssr {
+        let plain = "    return vec4<f32>(tonemap(c), albedo.a * in.tint.a);";
+        assert!(ssr_apply.contains(plain), "the brush shader's plain return moved");
+        ssr_apply.replacen(plain, "    return vec4<f32>(tonemap(c), reflection_alpha(lit));", 1)
+    } else {
+        ssr_apply
+    };
     // THE SHADING, unless this is the reflective pass drawing a shipped frame.
     //
     // That pass reads its surface colour back from the scene pass instead --
@@ -2663,7 +2713,7 @@ struct VOut {{
     return vec4<f32>(0.0);
 }}
 
-@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
+@fragment fn fs_main(in: VOut) -> {fs_return} {{
     // See `pixel_footprint` in the lights block: taken here, in uniform
     // control flow, so the light loop can keep a spot's edge a pixel wide.
     //
@@ -2727,6 +2777,8 @@ struct VOut {{
         stationary_range = STATIONARY_MASK_DISTANCE_TEXELS,
         max_materials = MAX_BRUSH_MATERIALS,
         lighting = lighting,
+        // The probe pass writes its reach as well. See `probe_pass::OUTPUT_WGSL`.
+        fs_return = if pass_like { "ProbePassOut" } else { "@location(0) vec4<f32>" },
         centroid = if BRUSH_CENTROID_VARYINGS {
             "@interpolate(perspective, centroid) "
         } else {
@@ -2772,7 +2824,8 @@ struct VOut {{
     );
     match probe {
         BrushProbe::Read => format!("{src}{}", probe_pass::READER_WGSL),
-        _ => src,
+        BrushProbe::Pass | BrushProbe::PassDeferred => format!("{src}{}", probe_pass::OUTPUT_WGSL),
+        BrushProbe::Trace => src,
     }
 }
 

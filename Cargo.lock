@@ -1941,6 +1941,7 @@ dependencies = [
  "serde_json",
  "space_soup_sky",
  "wgpu",
+ "wgpu-types",
 ]
 
 [[package]]

@@ -933,6 +933,19 @@ impl XrRenderer {
             _ => Vec::new(),
         };
         let warp_per_eye = 1 + warp_meshes.len() as u32;
+        // REFLECTIONS MOVE AS WHAT THEY SHOW wherever this frame can say what
+        // that is: a single-eye scene pass drawn straight into the eye image,
+        // whose alpha holds each pixel's reflected share, with the probe pass
+        // running, which holds how far each reflection reached. Anything else
+        // -- the diagnostic views, a multiview or offscreen frame -- moves
+        // every pixel with its surface, as before. `space_warp_debug` 16384
+        // forces that too, to compare. See `space_warp`'s module docs.
+        let warp_reflections = plan == crate::renderer::scene_pass_plan::ScenePassPlan::Direct
+            && fx.half_res_reflections
+            && fx.probes
+            && self.debug_view == crate::renderer::brush_pipeline::DebugView::Off
+            && brush_buffers.is_some()
+            && self.levers.space_warp_debug & 16384 == 0;
         if let Some(sw) = self.space_warp.as_ref().filter(|sw| sw.acquired.is_some()) {
             use crate::renderer::space_warp::{previous_clip, MotionCamera, SLOT_STRIDE};
             let stride = SLOT_STRIDE as usize;
@@ -949,14 +962,23 @@ impl XrRenderer {
                     0.0,
                     0.0,
                 ];
-                let mut put = |slot: usize, c: glam::Mat4, p: glam::Mat4| {
-                    let cam = MotionCamera { curr: c.to_cols_array_2d(), prev: p.to_cols_array_2d(), params };
+                let mut put = |slot: usize, c: glam::Mat4, p: glam::Mat4, eye: [f32; 4], reflect: [f32; 4]| {
+                    let cam = MotionCamera { curr: c.to_cols_array_2d(), prev: p.to_cols_array_2d(), params, eye, reflect };
                     bytes[slot * stride..slot * stride + size].copy_from_slice(bytemuck::bytes_of(&cam));
                 };
                 let base = eye * warp_per_eye as usize;
-                put(base, curr, world_prev);
+                // The world's slot carries the eye and the pixel scale for the
+                // brushes' reflections. See `space_warp::reflected_point`.
+                let e = eye_views[eye.min(eye_views.len() - 1)].pose.position;
+                let reflect = [
+                    self.width as f32 / sw.size.0.max(1) as f32,
+                    self.height as f32 / sw.size.1.max(1) as f32,
+                    if warp_reflections { 1.0 } else { 0.0 },
+                    if dbg & 32768 != 0 { 1.0 } else { 0.0 },
+                ];
+                put(base, curr, world_prev, [e.x, e.y, e.z, 1.0], reflect);
                 for (i, (_, model, prev)) in warp_meshes.iter().enumerate() {
-                    put(base + 1 + i, curr * *model, prev_view_proj * *prev);
+                    put(base + 1 + i, curr * *model, prev_view_proj * *prev, [0.0; 4], [0.0; 4]);
                 }
             }
             self.wgpu_queue.write_buffer(&sw.cameras, 0, &bytes);
@@ -1345,15 +1367,28 @@ impl XrRenderer {
                             } else {
                                 None
                             },
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &t.color_view,
-                                depth_slice: None,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
+                            color_attachments: &[
+                                Some(wgpu::RenderPassColorAttachment {
+                                    view: &t.color_view,
+                                    depth_slice: None,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                }),
+                                // How far each reflection reached, for
+                                // SpaceWarp; 0 (no reflection) where no brush is.
+                                Some(wgpu::RenderPassColorAttachment {
+                                    view: &t.reach_view,
+                                    depth_slice: None,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                }),
+                            ],
                             // Kept: the scene pass reads it to match its pixels
                             // to this pass's texels by depth.
                             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1919,8 +1954,10 @@ impl XrRenderer {
                     use crate::renderer::space_warp::{MotionDraw, MotionKind};
                     let base = eye as u32 * warp_per_eye;
                     let mut draws: Vec<MotionDraw> = Vec::new();
+                    let reflect_group = sw.reflect_groups.get(image_index).map(|g| &g[eye]).filter(|_| warp_reflections);
                     if let Some((vb, ib, n)) = brush_buffers.as_ref() {
-                        draws.push(MotionDraw { kind: MotionKind::Brush, vertices: vb, indices: ib, first: 0, count: *n, slot: base, joints: None });
+                        let kind = if reflect_group.is_some() { MotionKind::BrushReflect } else { MotionKind::Brush };
+                        draws.push(MotionDraw { kind, vertices: vb, indices: ib, first: 0, count: *n, slot: base, joints: reflect_group });
                     }
                     // The solid buffer: its cuboids whole, and of the ground
                     // only the chunks this eye's scene pass drew.
@@ -1987,12 +2024,29 @@ impl XrRenderer {
                         self.levers.space_warp_debug & 2048 != 0,
                         if self.levers.space_warp_debug & 4096 != 0 { 0.0 } else { 1.0 },
                     );
+                    // THE EYE IMAGE GOES BACK TO BEING AN ATTACHMENT once the
+                    // brushes have read it: OpenXR takes a colour swapchain
+                    // image back only in COLOR_ATTACHMENT_OPTIMAL, and the read
+                    // above left this layer as a sampled texture.
+                    if reflect_group.is_some() {
+                        encoder.transition_resources(
+                            std::iter::empty(),
+                            std::iter::once(wgpu::TextureTransition {
+                                texture: &self.eye_targets[image_index][eye]._texture,
+                                selector: Some(wgpu_types::TextureSelector { mips: 0..1, layers: eye as u32..eye as u32 + 1 }),
+                                state: wgpu::TextureUses::COLOR_TARGET,
+                            }),
+                        );
+                    }
                     self.wgpu_queue.submit(Some(encoder.finish()));
                     // DIAGNOSIS: what the pass left in the images. See
                     // `space_warp::Readback`.
                     if self.levers.space_warp_debug & 8192 != 0 && eye == 0 {
                         if let Some(rb) = sw.readback.as_ref() {
-                            match rb.read(sw.depth_raw[d], sw.depth_has_stencil, sw.motion_raw[m], eye as u32) {
+                            // 65536: and the images themselves, to the app's files.
+                            let save = (self.levers.space_warp_debug & 65536 != 0)
+                                .then(|| ndk_glue::native_activity().external_data_path().join("swdump.bin"));
+                            match rb.read(sw.depth_raw[d], sw.depth_has_stencil, sw.motion_raw[m], eye as u32, save.as_deref()) {
                                 Ok(s) => log::info!("SWDUMP {s}"),
                                 Err(e) => log::warn!("SWDUMP failed: {e:?}"),
                             }

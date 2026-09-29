@@ -43,6 +43,10 @@ ndk-glue       = { version = "0.7" }
 ndk            = { version = "0.7" }
 openxr         = { version = "0.18", features = ["loaded"] }
 ash            = { version = "0.38", default-features = false, features = ["linked"] }
+# `TextureSelector`, which wgpu does not re-export: SpaceWarp's motion pass
+# hands one eye's layer of the eye image back to the compositor as an
+# attachment (`CommandEncoder::transition_resources`).
+wgpu-types     = "30.0.1"
 
 [features]
 default  = ["canvas", "renderer"]
