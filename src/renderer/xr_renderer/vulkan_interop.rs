@@ -252,3 +252,45 @@ pub(super) unsafe fn import_vk_image_as_wgpu(
         wgpu::TextureUses::UNINITIALIZED,
     )
 }
+
+/// FIXED FOVEATED RENDERING from here on: every render pass carries a density
+/// map, full density unless it draws into a registered eye target (the
+/// SpaceSoupVR wgpu fork; see `foveation`). Must run before ANY pipeline is
+/// created -- a pipeline made earlier is incompatible with every pass after.
+pub(super) unsafe fn enable_foveation(device: &wgpu::Device) -> bool {
+    use wgpu::hal::vulkan as hvk;
+    let Some(hal) = (unsafe { device.as_hal::<hvk::Api>() }) else { return false };
+    match unsafe { hal.enable_foveation() } {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("foveation: could not create the density maps ({e}); every pixel is shaded");
+            false
+        }
+    }
+}
+
+/// Density maps for `patterns` (`(width, height, texels)`), written and ready;
+/// their indices, or `None` if the device refused them.
+pub(super) unsafe fn add_foveation_maps(device: &wgpu::Device, patterns: &[(u32, u32, Vec<u8>)]) -> Option<Vec<usize>> {
+    use wgpu::hal::vulkan as hvk;
+    let hal = unsafe { device.as_hal::<hvk::Api>() }?;
+    let patterns: Vec<hvk::DensityPattern> = patterns
+        .iter()
+        .map(|(width, height, texels)| hvk::DensityPattern { width: *width, height: *height, texels })
+        .collect();
+    match unsafe { hal.add_foveation_maps(&patterns) } {
+        Ok(ids) => Some(ids),
+        Err(e) => {
+            log::warn!("foveation: could not add density maps ({e})");
+            None
+        }
+    }
+}
+
+/// A pass drawing into `view` gets density map `map`, or full density.
+pub(super) unsafe fn set_foveation_target(device: &wgpu::Device, view: &wgpu::TextureView, map: Option<usize>) {
+    use wgpu::hal::vulkan as hvk;
+    let Some(hal) = (unsafe { device.as_hal::<hvk::Api>() }) else { return };
+    let Some(raw) = (unsafe { view.as_hal::<hvk::Api>() }).map(|v| unsafe { v.raw_handle() }) else { return };
+    hal.set_foveation_target(raw, map);
+}
