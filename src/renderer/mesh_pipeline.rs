@@ -521,7 +521,7 @@ fn vs_main(v: VIn) -> VOut {{
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
     // A character's surface lies inside its own capsules: it takes no capsule
-    // shadow or darkening, which would black it out. See `capsule_visibility`.
+    // darkening, which would black it out. See `capsule_ambient`.
     capsule_receiver = false;
     let lit = shade_with_sky(in.world_pos, n, model_u.params.x);
     let tex_color = textureSample(tex, samp, in.uv);

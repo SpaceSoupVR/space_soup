@@ -248,10 +248,11 @@ pub struct CapsuleGroup {
 }
 
 /// THE CHARACTERS AS CAPSULES, for what their meshes cannot cheaply do every
-/// frame: their soft shadows from lamps with no shadow map for them, the
-/// darkening of the floor under them in indirect light, and their presence in
-/// reflections. Unreal's capsule shadows, from the posed joints. See
-/// `capsule_visibility` in the lights block.
+/// frame: the darkening of the floor under them in indirect light, and their
+/// presence in reflections, from the posed joints. (Their shadows from lamps
+/// are the characters' shadow tiles: a capsule test inside the lamp loop cost
+/// a millisecond an eye in code size alone.) See `capsule_ambient` and
+/// `capsule_reflection` in the lights block.
 ///
 /// Laid out for the shader: two vec4 a capsule, `[a.xyz, radius]` and
 /// `[b.xyz, 0]`, [`CAPSULES_PER_GROUP`] slots a character with the unused
@@ -329,6 +330,11 @@ pub struct PostUpload {
     /// detail from there); 0 keeps them everywhere. Rides in `post_params.z`.
     /// See `Levers::terrain_detail_distance`.
     pub terrain_detail_distance: f32,
+    /// Whether the brushes write each pixel's reflected share into the eye
+    /// image's alpha, for SpaceWarp's motion pass (`lights::reflection_alpha`).
+    /// Only while that pass reads it: otherwise alpha stays 1, and the eye
+    /// image compresses as it did. Rides in `post_params.w`.
+    pub reflection_share: bool,
 }
 
 impl Default for PostUpload {
@@ -336,7 +342,12 @@ impl Default for PostUpload {
     /// the hard clamp would leave every scene blowing out its highlights,
     /// which is the thing the curve exists to fix.
     fn default() -> Self {
-        Self { exposure: 1.0, tonemap: super::tonemap::ToneMapping::default(), terrain_detail_distance: 0.0 }
+        Self {
+            exposure: 1.0,
+            tonemap: super::tonemap::ToneMapping::default(),
+            terrain_detail_distance: 0.0,
+            reflection_share: false,
+        }
     }
 }
 
@@ -866,7 +877,7 @@ impl UniformBuffer {
                     super::tonemap::ToneMapping::None => 1.0,
                 },
                 post.terrain_detail_distance,
-                0.0,
+                if post.reflection_share { 1.0 } else { 0.0 },
             ],
         };
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&u));
