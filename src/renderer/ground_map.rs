@@ -328,52 +328,295 @@ fn mip_levels(size: u32) -> u32 {
     32 - size.max(1).leading_zeros()
 }
 
-/// The map on the GPU: half floats with a full box-filtered mip chain, so a
-/// distant patch of ground is read averaged rather than aliased. The height
-/// in A is only ever read at level 0.
+/// The trace's finest cells: level 4, sixteen texels a side -- 1.7 m on
+/// test_room. It reads the ground itself across one of these at
+/// [`GROUND_TRACE_READINGS`] points, 43 cm apart: one step of the height grid
+/// the map is built from (257 samples over 110 m), so between two readings the
+/// ground is a single smooth patch and the crossing is interpolated between
+/// them. Finer cells cost more steps for the same answers: over test_room-
+/// shaped hills (`fixtures::hills`), cells of 43 cm read three times took 8.7
+/// steps a ray (53 at worst) and 11.9 texture reads; these take 6.5 (36) and
+/// 11.0, and meet the ground at the same points (step_census, 2026-09-29).
+pub const GROUND_TRACE_FINEST_LEVEL: u32 = 4;
+
+/// Readings of the ground across a finest cell, its two sides included.
+pub const GROUND_TRACE_READINGS: u32 = 5;
+
+/// The level a trace starts from: 64 texels a side, 7 m on test_room. Rays
+/// off a building's walls take the fewest steps from here -- coarse enough to
+/// skip open field at once, fine enough not to spend their first steps coming
+/// down (levels 5 and 7 cost 7 and 1 percent more).
+pub const GROUND_TRACE_START_LEVEL: u32 = 6;
+
+/// The most cells a trace visits. The worst of 20,000 rays off test_room's
+/// walls takes 50; one that ran out would be read as passing over.
+pub const GROUND_TRACE_MAX_STEPS: u32 = 64;
+
+/// Metres over each cell's highest ground its level stores, so the GPU's
+/// filtering and half-float rounding cannot put a reading above it.
+const GROUND_MAX_MARGIN: f32 = 0.02;
+
+/// A half float's value back as a single: the exact value the GPU reads.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let mant = (h & 0x3ff) as f32;
+    match exp {
+        0 => sign * mant * 2f32.powi(-24),
+        0x1f => sign * f32::INFINITY,
+        _ => sign * (1.0 + mant / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+/// `v` as the half float the upload writes (`sky::f32_to_f16` truncates).
+fn as_half(v: f32) -> f32 {
+    f16_to_f32(crate::renderer::sky::f32_to_f16(v))
+}
+
+/// The smallest half float not below `v`: a bound stays a bound once stored.
+fn half_at_least(v: f32) -> f32 {
+    let h = crate::renderer::sky::f32_to_f16(v);
+    if f16_to_f32(h) >= v {
+        return f16_to_f32(h);
+    }
+    // Truncation lost the fraction: one step away from zero for a positive
+    // value, one step toward it for a negative one -- up, either way.
+    f16_to_f32(if h & 0x8000 == 0 { h + 1 } else { h - 1 })
+}
+
+/// One level of the map as it is uploaded, in half-float values.
+pub struct GroundLevel {
+    pub width: u32,
+    pub height: u32,
+    pub texels: Vec<[f32; 4]>,
+}
+
+/// EVERY LEVEL OF THE MAP, as the GPU holds it.
+///
+/// RGB is box-filtered down the chain, so a distant patch of ground is read
+/// averaged rather than aliased. A is the height at level 0, and above it the
+/// HIGHEST ground under each texel -- the bound that lets a trace skip a whole
+/// cell the ray passes over (see [`trace`]). Taken over every level-0 texel a
+/// bilinear read inside the cell can reach -- one beyond each side -- plus
+/// [`GROUND_MAX_MARGIN`], and rounded up: a bound that rounding put below the
+/// ground would let a ray through a hill.
+pub fn levels(map: &GroundMap) -> Vec<GroundLevel> {
+    let count = mip_levels(map.width.max(map.height));
+    let base = GroundLevel { width: map.width, height: map.height, texels: map.texels.iter().map(|t| t.map(as_half)).collect() };
+    let mut out = vec![base];
+    for level in 1..count {
+        let next = {
+            let prev = &out[out.len() - 1];
+            let base = &out[0];
+            let (w, h) = (prev.width, prev.height);
+            let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+            let mut next = Vec::with_capacity((nw * nh) as usize);
+            for y in 0..nh {
+                for x in 0..nw {
+                    let mut rgb = [0.0f32; 3];
+                    let mut highest = f32::MIN;
+                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        let (sx, sy) = ((2 * x + dx).min(w - 1), (2 * y + dy).min(h - 1));
+                        let t = prev.texels[(sy * w + sx) as usize];
+                        for c in 0..3 {
+                            rgb[c] += t[c] * 0.25;
+                        }
+                        highest = highest.max(t[3]);
+                    }
+                    if level == 1 {
+                        // From level 0 itself, one texel wider on every side;
+                        // each coarser level is then the highest of its four.
+                        highest = f32::MIN;
+                        let (bw, bh) = (base.width as i64, base.height as i64);
+                        for sy in 2 * y as i64 - 1..=2 * y as i64 + 2 {
+                            for sx in 2 * x as i64 - 1..=2 * x as i64 + 2 {
+                                let k = (sy.clamp(0, bh - 1) * bw + sx.clamp(0, bw - 1)) as usize;
+                                highest = highest.max(base.texels[k][3]);
+                            }
+                        }
+                        highest = half_at_least(highest + GROUND_MAX_MARGIN);
+                    }
+                    next.push([as_half(rgb[0]), as_half(rgb[1]), as_half(rgb[2]), highest]);
+                }
+            }
+            GroundLevel { width: nw, height: nh, texels: next }
+        };
+        out.push(next);
+    }
+    out
+}
+
+/// The ground's height at `q`, in level-0 texels from the map's corner:
+/// bilinear between texel centres, clamped at the edges -- what the shader's
+/// `textureSampleLevel(ground_map, probe_samp, uv, 0.0).a` returns.
+fn height_at(base: &GroundLevel, q: Vec2) -> f32 {
+    let (w, h) = (base.width as f32, base.height as f32);
+    let fx = (q.x - 0.5).clamp(0.0, w - 1.0);
+    let fy = (q.y - 0.5).clamp(0.0, h - 1.0);
+    let (x0, y0) = (fx.floor() as u32, fy.floor() as u32);
+    let (x1, y1) = ((x0 + 1).min(base.width - 1), (y0 + 1).min(base.height - 1));
+    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+    let s = |x: u32, y: u32| base.texels[(y * base.width + x) as usize][3];
+    let a = s(x0, y0) + (s(x1, y0) - s(x0, y0)) * tx;
+    let b = s(x0, y1) + (s(x1, y1) - s(x0, y1)) * tx;
+    a + (b - a) * ty
+}
+
+/// Where a trace ended: the distance to the ground along the ray, `None` for
+/// sky; how many cells it visited on the way, and how many texture reads
+/// that took -- a cell's highest ground each, and the readings of the ground
+/// itself in the finest ones.
+#[derive(Clone, Copy, Debug)]
+pub struct GroundTrace {
+    pub t: Option<f32>,
+    pub steps: u32,
+    pub reads: u32,
+}
+
+/// THE GROUND A RAY MEETS, from `e` along unit `d` over `levels` placed at
+/// `min..max`: the shader's `ground_trace`, step for step.
+///
+/// A walk through the cells the ray crosses, coarse where it passes high over
+/// the ground and fine where it comes close. A cell whose highest ground stays
+/// below the ray on both sides is passed over whole, and the walk climbs a
+/// level once it leaves its parent; one the ray may touch is entered a level
+/// finer, from where the ray has come down to its highest ground. At the
+/// finest level the ground itself is read evenly from there to the cell's far
+/// side, and the crossing interpolated between the first reading below the
+/// ray and the one before it.
+///
+/// It replaced a march in doubling steps -- 12.5 cm out to 256 m -- that
+/// tested the ground at 32 m and next at 64 m, past test_room's edge, so the
+/// hills between were never tested: a reflection's horizon was the height of
+/// the ground 32 m out, it stepped wherever that reading changed hands, and it
+/// crawled as the head moved (headset, 2026-09-29).
+pub fn trace(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec3, d: Vec3) -> GroundTrace {
+    trace_with(levels, min, max, top, e, d, TraceShape::SHIPPED)
+}
+
+/// How a trace walks: its finest level, the level it starts from, how many
+/// readings of the ground it takes across a finest cell, and its budget.
+#[derive(Clone, Copy, Debug)]
+pub struct TraceShape {
+    pub finest: u32,
+    pub start: u32,
+    pub readings: u32,
+    pub max_steps: u32,
+}
+
+impl TraceShape {
+    /// The shader's, from the `GROUND_TRACE_*` constants.
+    pub const SHIPPED: Self = Self {
+        finest: GROUND_TRACE_FINEST_LEVEL,
+        start: GROUND_TRACE_START_LEVEL,
+        readings: GROUND_TRACE_READINGS,
+        max_steps: GROUND_TRACE_MAX_STEPS,
+    };
+}
+
+/// [`trace`] walked as `shape` says.
+pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec3, d: Vec3, shape: TraceShape) -> GroundTrace {
+    let miss = GroundTrace { t: None, steps: 0, reads: 0 };
+    let Some(base) = levels.first() else { return miss };
+    let size = base.width as f32;
+    let scale = size / (max - min);
+    let q0 = (Vec2::new(e.x, e.z) - min) * scale;
+    let raw = Vec2::new(d.x, d.z) * scale;
+    // An axis the ray barely moves along never bounds a cell it is in.
+    let dq = Vec2::new(if raw.x.abs() < 1e-6 { 1e-6 } else { raw.x }, if raw.y.abs() < 1e-6 { 1e-6 } else { raw.y });
+    let inv = Vec2::ONE / dq;
+    // On the map, and below its highest ground.
+    let ta = -q0 * inv;
+    let tb = (Vec2::splat(size) - q0) * inv;
+    let mut t_in = ta.min(tb).max_element().max(0.0);
+    let mut t_out = ta.max(tb).min_element();
+    if d.y > 0.0 {
+        t_out = t_out.min((top - e.y) / d.y);
+    } else if d.y < 0.0 {
+        t_in = t_in.max((top - e.y) / d.y);
+    } else if e.y > top {
+        return miss;
+    }
+    let top_level = levels.len() as i32 - 1;
+    let finest = (shape.finest as i32).min(top_level);
+    let mut level = (shape.start as i32).clamp(finest, top_level);
+    let ahead = Vec2::new(if dq.x > 0.0 { 1.0 } else { 0.0 }, if dq.y > 0.0 { 1.0 } else { 0.0 });
+    // A thousandth of a texel along the ray: a point on a border is in the
+    // cell ahead.
+    let nudge = Vec2::new(dq.x.signum(), dq.y.signum()) * 1e-3;
+    let gaps = shape.readings.max(2) - 1;
+    let mut t = t_in;
+    let mut steps = 0;
+    let mut reads = 0;
+    while steps < shape.max_steps && t < t_out {
+        steps += 1;
+        reads += 1;
+        let lv = &levels[level as usize];
+        let cell = (1u32 << level) as f32;
+        let last = Vec2::new(lv.width as f32 - 1.0, lv.height as f32 - 1.0);
+        let c = ((q0 + dq * t + nudge) / cell).floor().clamp(Vec2::ZERO, last);
+        let t_exit = (((c + ahead) * cell - q0) * inv).min_element().min(t_out);
+        let highest = lv.texels[(c.y as u32 * lv.width + c.x as u32) as usize][3];
+        let y_in = e.y + d.y * t;
+        let y_out = e.y + d.y * t_exit;
+        if y_in.min(y_out) <= highest {
+            // Nothing in this cell before the ray is down to its highest ground.
+            let t_top = if y_in > highest { t + (y_in - highest) / -d.y } else { t };
+            if level > finest {
+                level -= 1;
+                t = t_top;
+                continue;
+            }
+            // The ground itself, read evenly from there to the cell's far side;
+            // the crossing between the first reading below it and the one before.
+            let at = |t: f32| e.y + d.y * t - height_at(base, q0 + dq * t);
+            let span = (t_exit - t_top) / gaps as f32;
+            reads += gaps + 1;
+            let mut f_prev = at(t_top);
+            if f_prev <= 0.0 {
+                return GroundTrace { t: Some(t_top), steps, reads };
+            }
+            for k in 1..=gaps {
+                let tk = t_top + span * k as f32;
+                let f = at(tk);
+                if f <= 0.0 {
+                    return GroundTrace { t: Some(tk - span + span * f_prev / (f_prev - f)), steps, reads };
+                }
+                f_prev = f;
+            }
+        }
+        // Over this cell: on to the next, a level coarser once it is in
+        // another parent.
+        let next = ((q0 + dq * t_exit + nudge) / cell).floor();
+        if (next * 0.5).floor() != (c * 0.5).floor() {
+            level = (level + 1).min(top_level);
+        }
+        t = t_exit;
+    }
+    GroundTrace { t: None, steps, reads }
+}
+
+/// The map on the GPU: [`levels`] as half floats.
 pub fn upload(device: &Device, queue: &Queue, map: &GroundMap) -> TextureView {
-    let levels = mip_levels(map.width.max(map.height));
+    let chain = levels(map);
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("ground_map"),
         size: wgpu::Extent3d { width: map.width, height: map.height, depth_or_array_layers: 1 },
-        mip_level_count: levels,
+        mip_level_count: chain.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let mut level: Vec<[f32; 4]> = map.texels.clone();
-    let (mut w, mut h) = (map.width, map.height);
-    for mip in 0..levels {
-        let bytes: Vec<u16> = level.iter().flat_map(|t| t.map(crate::renderer::sky::f32_to_f16)).collect();
+    for (mip, level) in chain.iter().enumerate() {
+        let bytes: Vec<u16> = level.texels.iter().flat_map(|t| t.map(crate::renderer::sky::f32_to_f16)).collect();
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: mip, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: mip as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             bytemuck::cast_slice(&bytes),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(level.width * 8), rows_per_image: Some(level.height) },
+            wgpu::Extent3d { width: level.width, height: level.height, depth_or_array_layers: 1 },
         );
-        if w == 1 && h == 1 {
-            break;
-        }
-        let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
-        let mut next = Vec::with_capacity((nw * nh) as usize);
-        for y in 0..nh {
-            for x in 0..nw {
-                let mut acc = [0.0f32; 4];
-                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    let (sx, sy) = ((2 * x + dx).min(w - 1), (2 * y + dy).min(h - 1));
-                    let t = level[(sy * w + sx) as usize];
-                    for c in 0..4 {
-                        acc[c] += t[c] * 0.25;
-                    }
-                }
-                next.push(acc);
-            }
-        }
-        level = next;
-        w = nw;
-        h = nh;
     }
     tex.create_view(&wgpu::TextureViewDescriptor::default())
 }
@@ -394,6 +637,98 @@ pub fn none(device: &Device, queue: &Queue) -> TextureView {
             top: f32::MIN,
         },
     )
+}
+
+/// Ground, rays and a brute-force reference, for the trace's tests here and
+/// its GPU test in the lights block.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+
+    /// test_room's ground in shape: flat for 25 m around the buildings, then
+    /// hills rising to 5-8 m by 50 m out.
+    pub fn hills(x: f32, z: f32) -> f32 {
+        let rise = smoothstep(25.0, 50.0, (x * x + z * z).sqrt());
+        rise * (5.0 + 2.5 * (x * 0.13).sin() * (z * 0.11).cos() + (x * 0.37 + z * 0.23).sin())
+    }
+
+    /// A map `size` texels a side over test_room's 110 m, heights only.
+    pub fn height_map(size: u32, height_at: impl Fn(f32, f32) -> f32) -> GroundMap {
+        let (min, max) = (Vec2::splat(-55.0), Vec2::splat(55.0));
+        let g = HeightGrid::sample(min, max, 257, 257, height_at);
+        let mut texels = Vec::with_capacity((size * size) as usize);
+        let mut top = f32::MIN;
+        for j in 0..size {
+            for i in 0..size {
+                let uv = Vec2::new(i as f32 + 0.5, j as f32 + 0.5) / size as f32;
+                let y = g.at(min.x + 110.0 * uv.x, min.y + 110.0 * uv.y);
+                top = top.max(y);
+                texels.push([0.0, 0.0, 0.0, y]);
+            }
+        }
+        GroundMap { width: size, height: size, texels, min, max, top }
+    }
+
+    /// `n` rays off a building's walls: from 0-3.4 m up, anywhere within 12 m
+    /// of the middle, every way round, from 35 degrees down to 20 up.
+    pub fn rays(n: usize, seed: u64) -> Vec<(Vec3, Vec3)> {
+        let mut s = seed.max(1);
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32
+        };
+        (0..n)
+            .map(|_| {
+                let e = Vec3::new(24.0 * next() - 12.0, 3.4 * next(), 24.0 * next() - 12.0);
+                let (az, el) = (std::f32::consts::TAU * next(), (-35.0 + 55.0 * next()).to_radians());
+                (e, Vec3::new(az.cos() * el.cos(), el.sin(), az.sin() * el.cos()))
+            })
+            .collect()
+    }
+
+    pub struct Marched {
+        pub t: Option<f32>,
+        /// How close the ray came to the ground without passing below it, or
+        /// how little it passed below before coming back out: what separates
+        /// a real disagreement from a ray that only grazes.
+        pub graze: f32,
+    }
+
+    /// The ground along the ray read every centimetre, to where it leaves
+    /// the map or rises above its top; the crossing interpolated.
+    pub fn march(base: &GroundLevel, min: Vec2, max: Vec2, top: f32, e: Vec3, d: Vec3) -> Marched {
+        let scale = base.width as f32 / (max - min);
+        let at = |t: f32| {
+            let p = e + d * t;
+            p.y - height_at(base, (Vec2::new(p.x, p.z) - min) * scale)
+        };
+        let inside = |t: f32| {
+            let p = e + d * t;
+            p.x >= min.x && p.x <= max.x && p.z >= min.y && p.z <= max.y && !(p.y > top && d.y >= 0.0)
+        };
+        let step = 0.01;
+        let mut prev = at(0.0);
+        let mut graze = prev.abs();
+        if prev <= 0.0 {
+            return Marched { t: Some(0.0), graze };
+        }
+        let mut t = step;
+        while inside(t) {
+            let f = at(t);
+            if f <= 0.0 {
+                let hit = t - step + step * prev / (prev - f);
+                // How deep the ray goes over the next metre.
+                let deepest = (1..=100).map(|k| at(t + k as f32 * step)).fold(f, f32::min);
+                return Marched { t: Some(hit), graze: -deepest };
+            }
+            graze = graze.min(f);
+            prev = f;
+            t += step;
+        }
+        Marched { t: None, graze }
+    }
 }
 
 #[cfg(test)]
@@ -496,6 +831,107 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_bound_rounded_to_half_float_stays_a_bound() {
+        for v in [1.9f32, -1.8, 0.3, 8.8, 0.0, 7.123_456, -0.000_1] {
+            let h = half_at_least(v);
+            assert!(h >= v, "{v} -> {h}");
+            assert_eq!(as_half(h), h, "{v} -> {h} is not a half float");
+            assert!(h - v <= v.abs() / 512.0 + 1e-4, "{v} -> {h} is more than one step up");
+        }
+    }
+
+    /// Wherever a bilinear read of the ground can land inside a coarse texel,
+    /// the ground is no higher than that texel says -- and not much lower,
+    /// or the trace would enter cells it has no need to.
+    #[test]
+    fn every_level_bounds_the_ground_under_it() {
+        // Bumpier than any real terrain, so a read between texels matters.
+        let map = fixtures::height_map(64, |x, z| 3.0 * (x * 0.9).sin() * (z * 0.7).cos() + 0.5 * (x * 2.1 + z).sin());
+        let chain = levels(&map);
+        assert_eq!(chain.len(), 7);
+        let base = &chain[0];
+        for (l, lv) in chain.iter().enumerate().skip(1) {
+            let cell = (1u32 << l) as f32;
+            for y in 0..lv.height {
+                for x in 0..lv.width {
+                    let bound = lv.texels[(y * lv.width + x) as usize][3];
+                    let mut highest = f32::MIN;
+                    for sy in 0..=8 {
+                        for sx in 0..=8 {
+                            let q = (Vec2::new(x as f32, y as f32) + Vec2::new(sx as f32, sy as f32) / 8.0) * cell;
+                            highest = highest.max(height_at(base, q));
+                        }
+                    }
+                    assert!(highest <= bound, "level {l} texel ({x}, {y}): ground {highest} over bound {bound}");
+                    // No looser than the level-0 texels a read can reach --
+                    // one beyond each side -- plus the margin.
+                    let span = 1i64 << l;
+                    let mut reachable = f32::MIN;
+                    for sy in y as i64 * span - 1..=(y as i64 + 1) * span {
+                        for sx in x as i64 * span - 1..=(x as i64 + 1) * span {
+                            let k = (sy.clamp(0, 63) * 64 + sx.clamp(0, 63)) as usize;
+                            reachable = reachable.max(base.texels[k][3]);
+                        }
+                    }
+                    let slack = bound - reachable;
+                    assert!(slack >= GROUND_MAX_MARGIN && slack < GROUND_MAX_MARGIN + 0.01, "level {l} texel ({x}, {y}): bound {bound} over reachable {reachable}");
+                }
+            }
+        }
+    }
+
+    /// The trace against brute force: the same ground read every centimetre
+    /// along the ray. They must meet the ground at the same point, and differ
+    /// on hit or miss only for a ray that grazes it within a few centimetres.
+    #[test]
+    fn the_trace_meets_the_ground_where_a_fine_march_does() {
+        let map = fixtures::height_map(1024, fixtures::hills);
+        let chain = levels(&map);
+        let mut grazing = 0;
+        let mut steps = Vec::new();
+        let rays = fixtures::rays(400, 7);
+        for (i, &(e, d)) in rays.iter().enumerate() {
+            let traced = trace(&chain, map.min, map.max, map.top, e, d);
+            let fine = fixtures::march(&chain[0], map.min, map.max, map.top, e, d);
+            steps.push(traced.steps);
+            match (traced.t, fine.t) {
+                (Some(a), Some(b)) => {
+                    assert!((a - b).abs() <= 0.02 + 0.002 * b, "ray {i} from {e} along {d}: traced {a}, marched {b}");
+                }
+                (None, None) => {}
+                (a, b) => {
+                    assert!(fine.graze < 0.03, "ray {i} from {e} along {d}: traced {a:?}, marched {b:?}, clearance {}", fine.graze);
+                    grazing += 1;
+                }
+            }
+        }
+        assert!(grazing <= rays.len() / 100, "{grazing} grazing disagreements");
+        let most = *steps.iter().max().unwrap();
+        let mean = steps.iter().sum::<u32>() as f32 / steps.len() as f32;
+        eprintln!("ground trace over test_room-like hills: mean {mean:.1} steps, most {most}");
+        assert!(most < GROUND_TRACE_MAX_STEPS, "a ray used the whole budget ({most} steps)");
+    }
+
+    /// The case that broke on the headset: flat ground to 40 m and a ridge
+    /// beyond it, and a ray from eye height rising just too slowly to clear
+    /// it. The old march read the ground at 32 m and next past the edge.
+    #[test]
+    fn a_ridge_between_32_and_64_metres_is_met() {
+        let map = fixtures::height_map(1024, |x, _| if x > 40.0 { ((x - 40.0) * 0.8).min(4.0) } else { 0.0 });
+        let chain = levels(&map);
+        let e = Vec3::new(0.0, 1.5, 0.0);
+        let d = Vec3::new(1.0, 0.02, 0.0).normalize();
+        let t = trace(&chain, map.min, map.max, map.top, e, d).t.expect("the ray passed through the ridge");
+        let p = e + d * t;
+        assert!(p.x > 40.0 && p.x < 44.0, "met the ground at {p}");
+        assert!((p.y - map_height(&chain[0], &map, p)).abs() < 0.02, "at {p}, not on the ground");
+    }
+
+    fn map_height(base: &GroundLevel, map: &GroundMap, p: Vec3) -> f32 {
+        height_at(base, (Vec2::new(p.x, p.z) - map.min) * (base.width as f32 / (map.max - map.min)))
+    }
+
     /// Steep ground takes the rock layer, as the shader blends it by slope.
     #[test]
     fn a_cliff_is_rock_and_the_plain_is_grass() {
@@ -513,5 +949,66 @@ mod tests {
         let cliff = map.texels[5 * 10 + 8];
         assert!(plain[1] > plain[0], "the plain is the grass layer: {plain:?}");
         assert!(cliff[0] > cliff[1], "the cliff is the rock layer: {cliff:?}");
+    }
+}
+
+/// THE MEASUREMENTS BEHIND `GROUND_TRACE_*`, run by hand:
+/// `cargo test --release --lib step_census -- --ignored --nocapture`.
+#[cfg(test)]
+mod step_census {
+    use super::*;
+
+    /// Steps, texture reads and agreement with brute force, for several
+    /// finest levels, readings and starting levels.
+    #[test]
+    #[ignore]
+    fn shapes() {
+        let map = fixtures::height_map(1024, fixtures::hills);
+        let chain = levels(&map);
+        let rays = fixtures::rays(4000, 3);
+        let fine: Vec<fixtures::Marched> = rays.iter().map(|&(e, d)| fixtures::march(&chain[0], map.min, map.max, map.top, e, d)).collect();
+        for (finest, readings) in [(2, 3), (3, 3), (3, 5), (4, 5), (4, 9), (5, 9), (5, 17)] {
+            for start in [5, 6, 7] {
+                let shape = TraceShape { finest, start, readings, max_steps: 256 };
+                let (mut sum, mut most, mut bad, mut graze, mut near, mut reads) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+                let mut hist = [0u32; 5];
+                for (&(e, d), f) in rays.iter().zip(&fine) {
+                    let r = trace_with(&chain, map.min, map.max, map.top, e, d, shape);
+                    sum += r.steps;
+                    reads += r.reads;
+                    most = most.max(r.steps);
+                    hist[match r.steps { 0..=8 => 0, 9..=16 => 1, 17..=32 => 2, 33..=64 => 3, _ => 4 }] += 1;
+                    match (r.t, f.t) {
+                        (Some(a), Some(b)) if (a - b).abs() <= 0.02 + 0.002 * b => near += 1,
+                        (None, None) => {}
+                        _ if f.graze < 0.03 => graze += 1,
+                        _ => bad += 1,
+                    }
+                }
+                eprintln!("finest {finest} readings {readings:>2} start {start}: mean {:>5.2} most {most:>3} steps<=8/16/32/64/more {:?}  reads {:>5.2}  bad {bad} grazing {graze} near {near}", sum as f32 / rays.len() as f32, hist, reads as f32 / rays.len() as f32);
+            }
+        }
+    }
+
+    /// Where the shipped walk's steps go, by the ray's elevation: skims just
+    /// above the hills cost the most.
+    #[test]
+    #[ignore]
+    fn steps_by_elevation() {
+        let map = fixtures::height_map(1024, fixtures::hills);
+        let chain = levels(&map);
+        let mut buckets = std::collections::BTreeMap::<i32, (u32, u32, u32, u32)>::new();
+        for (e, d) in fixtures::rays(20000, 3) {
+            let r = trace(&chain, map.min, map.max, map.top, e, d);
+            let el = (d.y.asin().to_degrees() / 5.0).floor() as i32 * 5;
+            let b = buckets.entry(el).or_default();
+            b.0 += 1;
+            b.1 += r.steps;
+            b.2 = b.2.max(r.steps);
+            b.3 += r.t.is_some() as u32;
+        }
+        for (el, (n, s, m, h)) in buckets {
+            eprintln!("elev {el:>4}..{:>3}: rays {n:>5}  mean steps {:>5.1}  max {m:>3}  hit {:>3.0}%", el + 5, s as f32 / n as f32, 100.0 * h as f32 / n as f32);
+        }
     }
 }

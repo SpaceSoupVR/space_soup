@@ -93,10 +93,13 @@ pub enum Phase {
     /// again, instead of in the half-resolution probe pass. What moving it
     /// there saves.
     TerrainPerPixelReflections,
+    /// Reflections leaving the building see only the sky: the cost of tracing
+    /// them over the ground (`ground_map::trace`).
+    NoGroundTrace,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 18] = [
+    pub const ALL: [Phase; 19] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -115,6 +118,7 @@ impl Phase {
         Phase::NoPortalCulling,
         Phase::InlineReflectionLookups,
         Phase::TerrainPerPixelReflections,
+        Phase::NoGroundTrace,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -156,6 +160,7 @@ impl Phase {
             Phase::NoPortalCulling => "no_portal_culling",
             Phase::InlineReflectionLookups => "inline_reflection_lookups",
             Phase::TerrainPerPixelReflections => "terrain_per_pixel_reflections",
+            Phase::NoGroundTrace => "no_ground_trace",
         }
     }
 }

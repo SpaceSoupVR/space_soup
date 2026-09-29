@@ -1059,7 +1059,8 @@ impl XrRenderer {
                 upload.set_proxies(&self.probe_proxies, player_world, &upload.volumes());
                 // And the outdoors: which room it is, its sky, its ground.
                 let sky_layer = self.probe_stream.borrow().as_ref().and_then(|s| s.sky_layer());
-                upload.set_outdoors(self.probe_outdoor_volume, sky_layer, self.ground_placement);
+                let ground = if fx.ground_trace { self.ground_placement } else { None };
+                upload.set_outdoors(self.probe_outdoor_volume, sky_layer, ground);
                 // perf_ab: every slot its own room (no two-photograph blend), or
                 // no doorways. Measurement only; see `perf_ab::Phase`.
                 if !fx.probe_blend {

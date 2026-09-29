@@ -50,7 +50,9 @@ pub struct Uniforms {
     /// than here, because it is a property of the light and not of the camera --
     /// and the previous single "flashlight index" could only ever name one.
     pub shadow_params: [f32; 4],
-    /// x = sky intensity. yzw reserved.
+    /// x = sky intensity, y = the sky's reflection layer + 1 (0 none), z = the
+    /// ground's highest point, w = 1 where there is a ground map. See
+    /// `ProbeUpload::set_outdoors`.
     pub sky_params: [f32; 4],
     /// Nine RGB spherical-harmonic coefficients of the sky's irradiance.
     ///
