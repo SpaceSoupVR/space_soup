@@ -1992,16 +1992,28 @@ impl XrRenderer {
                     let base = eye as u32 * warp_per_eye;
                     let mut draws: Vec<MotionDraw> = Vec::new();
                     if let Some((vb, ib, n)) = brush_buffers.as_ref() {
-                        draws.push(MotionDraw { kind: MotionKind::Brush, vertices: vb, indices: ib, count: *n, slot: base, joints: None });
+                        draws.push(MotionDraw { kind: MotionKind::Brush, vertices: vb, indices: ib, first: 0, count: *n, slot: base, joints: None });
                     }
-                    draws.push(MotionDraw {
+                    // The solid buffer: its cuboids whole, and of the ground
+                    // only the chunks this eye's scene pass drew.
+                    let solid = |first: u32, count: u32| MotionDraw {
                         kind: MotionKind::Solid,
                         vertices: &solid_vb,
                         indices: &solid_ib,
-                        count: solid_idx.len() as u32,
+                        first,
+                        count,
                         slot: base,
                         joints: None,
-                    });
+                    };
+                    match terrain_range {
+                        Some((start, _)) if !solid_chunks.is_empty() => {
+                            draws.push(solid(0, start));
+                            for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c)) {
+                                draws.push(solid(c.first_index, c.index_count));
+                            }
+                        }
+                        _ => draws.push(solid(0, solid_idx.len() as u32)),
+                    }
                     for (i, (inst, _, _)) in warp_meshes.iter().enumerate() {
                         let slot = base + 1 + i as u32;
                         if let Some(skin) = &inst.mesh.skin {
@@ -2011,6 +2023,7 @@ impl XrRenderer {
                                     kind: MotionKind::Skinned,
                                     vertices: &prim.vertex_buffer,
                                     indices: &prim.index_buffer,
+                                    first: 0,
                                     count: prim.indices.len() as u32,
                                     slot,
                                     joints: Some(joints),
@@ -2022,6 +2035,7 @@ impl XrRenderer {
                                     kind: MotionKind::Mesh,
                                     vertices: &prim.vertex_buffer,
                                     indices: &prim.index_buffer,
+                                    first: 0,
                                     count: prim.indices.len() as u32,
                                     slot,
                                     joints: None,
