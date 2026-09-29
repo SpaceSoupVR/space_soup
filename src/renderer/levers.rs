@@ -103,6 +103,19 @@ pub struct Levers {
     /// the compositor can make every other one. Off by default: objects that
     /// move by themselves carry no motion of their own yet. See `space_warp`.
     pub space_warp: bool,
+    /// DIAGNOSIS ONLY: SpaceWarp variants, as bits, to find what makes the
+    /// compositor's frames black (headset, 2026-09-29) without a rebuild per
+    /// guess. 1 = the motion pass draws nothing (cleared vectors and depth);
+    /// 2 = vectors written y DOWN (Vulkan's NDC; shipped is y up); 4 =
+    /// vectors zeroed (depth still drawn);
+    /// 8 = `appSpaceDeltaPose` the identity; 16 = `farZ` infinite; 64 = no
+    /// layer settings (sharpening) on the projection layer; 128 = views drawn
+    /// and submitted 5 cm right of the head, 256 = swaying +-5 cm -- head
+    /// motion for the compositor to correct, on a headset lying on a desk;
+    /// 512 = depth declared reversed; 1024 = depth declared 500 m .. 1 km;
+    /// 2048 = the depth image's stencil stored rather than discarded;
+    /// 4096 = the depth image cleared to 0 rather than 1.
+    pub space_warp_debug: u32,
     /// MEASUREMENT: block on the GPU at the end of every frame, as the
     /// renderer used to. Its wait is then exactly the GPU's time, which is
     /// what the A/B schedule attributes costs with; shipped, the CPU prepares
@@ -148,6 +161,7 @@ impl Default for Levers {
             ground_trace: true,
             foveation: crate::renderer::foveation::SHIPPED,
             space_warp: false,
+            space_warp_debug: 0,
             gpu_sync: false,
             ssr: None,
             multiview: None,
@@ -235,6 +249,9 @@ impl Levers {
         flag("ab_cycle", self.ab_cycle, d.ab_cycle);
         if self.foveation != d.foveation {
             out.push(format!("foveation={}", self.foveation.label()));
+        }
+        if self.space_warp_debug != 0 {
+            out.push(format!("swdbg={}", self.space_warp_debug));
         }
         if let Some(on) = self.ssr {
             out.push(format!("ssr={}", if on { "on" } else { "off" }));

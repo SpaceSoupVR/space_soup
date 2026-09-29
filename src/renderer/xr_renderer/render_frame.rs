@@ -206,6 +206,23 @@ impl XrRenderer {
             }
         }
 
+        // DIAGNOSIS: draw and submit every view from a pose the head is NOT
+        // at, so the compositor has to correct the difference with our depth
+        // and motion vectors -- head motion, on a headset lying still on a
+        // desk. 128: 5 cm to the right; 256: swaying +-5 cm at half a hertz.
+        // See `Levers::space_warp_debug`.
+        let sway_dbg = self.levers.space_warp_debug;
+        if sway_dbg & (128 | 256) != 0 {
+            let dx = if sway_dbg & 256 != 0 {
+                0.05 * (self.started_at.elapsed().as_secs_f32() * std::f32::consts::PI).sin()
+            } else {
+                0.05
+            };
+            for v in eye_views.iter_mut() {
+                v.pose.position.x += dx;
+            }
+        }
+
         // APPLICATION SPACEWARP: this frame's motion and depth images, when
         // the lever asks for them -- only now, with the views located, so no
         // early return above can leave them held. See `space_warp`.
@@ -921,8 +938,15 @@ impl XrRenderer {
                 let curr = warp_view_proj[eye];
                 let prev_view_proj = sw.prev.map_or(curr, |(vps, _)| vps[eye]);
                 let world_prev = sw.prev.map_or(curr, |(vps, w2p)| previous_clip(vps[eye], w2p, warp_world_to_player));
+                let dbg = self.levers.space_warp_debug;
+                let params = [
+                    if dbg & 2 != 0 { -1.0 } else { 1.0 },
+                    if dbg & 4 != 0 { 0.0 } else { 1.0 },
+                    0.0,
+                    0.0,
+                ];
                 let mut put = |slot: usize, c: glam::Mat4, p: glam::Mat4| {
-                    let cam = MotionCamera { curr: c.to_cols_array_2d(), prev: p.to_cols_array_2d() };
+                    let cam = MotionCamera { curr: c.to_cols_array_2d(), prev: p.to_cols_array_2d(), params };
                     bytes[slot * stride..slot * stride + size].copy_from_slice(bytemuck::bytes_of(&cam));
                 };
                 let base = eye * warp_per_eye as usize;
@@ -1872,6 +1896,105 @@ impl XrRenderer {
                 self.wgpu_queue.submit(Some(encoder.finish()));
             }
 
+            // SPACEWARP: this eye's motion vectors and depth, small, from the
+            // same geometry -- the world, then every mesh by its own motion.
+            // See `space_warp`.
+            //
+            // HERE, before the eye pass can be skipped. It sat after the
+            // `continue` below until 2026-09-29: whenever the scene drew
+            // straight into the eye image -- normal play -- no motion or depth
+            // was ever written, the compositor read the swapchains' empty
+            // memory as depth 0, the near plane, and threw every frame off
+            // screen at the first head movement. Black frames, only in the
+            // headset (a still desk headset needs no correction), and only
+            // partly in the debug views, which do run the eye pass.
+            if let Some(sw) = self.space_warp.as_ref() {
+                if let Some((m, d)) = sw.acquired {
+                    use crate::renderer::space_warp::{MotionDraw, MotionKind};
+                    let base = eye as u32 * warp_per_eye;
+                    let mut draws: Vec<MotionDraw> = Vec::new();
+                    if let Some((vb, ib, n)) = brush_buffers.as_ref() {
+                        draws.push(MotionDraw { kind: MotionKind::Brush, vertices: vb, indices: ib, first: 0, count: *n, slot: base, joints: None });
+                    }
+                    // The solid buffer: its cuboids whole, and of the ground
+                    // only the chunks this eye's scene pass drew.
+                    let solid = |first: u32, count: u32| MotionDraw {
+                        kind: MotionKind::Solid,
+                        vertices: &solid_vb,
+                        indices: &solid_ib,
+                        first,
+                        count,
+                        slot: base,
+                        joints: None,
+                    };
+                    match terrain_range {
+                        Some((start, _)) if !solid_chunks.is_empty() => {
+                            draws.push(solid(0, start));
+                            for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c)) {
+                                draws.push(solid(c.first_index, c.index_count));
+                            }
+                        }
+                        _ => draws.push(solid(0, solid_idx.len() as u32)),
+                    }
+                    for (i, (inst, _, _)) in warp_meshes.iter().enumerate() {
+                        let slot = base + 1 + i as u32;
+                        if let Some(skin) = &inst.mesh.skin {
+                            let joints = skin.motion_bind_group(&self.wgpu_device, &sw.pipelines.joints_layout);
+                            for prim in &skin.primitives {
+                                draws.push(MotionDraw {
+                                    kind: MotionKind::Skinned,
+                                    vertices: &prim.vertex_buffer,
+                                    indices: &prim.index_buffer,
+                                    first: 0,
+                                    count: prim.indices.len() as u32,
+                                    slot,
+                                    joints: Some(joints),
+                                });
+                            }
+                        } else {
+                            for prim in inst.mesh.primitives.iter().filter(|p| p.layered.is_none()) {
+                                draws.push(MotionDraw {
+                                    kind: MotionKind::Mesh,
+                                    vertices: &prim.vertex_buffer,
+                                    indices: &prim.index_buffer,
+                                    first: 0,
+                                    count: prim.indices.len() as u32,
+                                    slot,
+                                    joints: None,
+                                });
+                            }
+                        }
+                    }
+                    if self.levers.space_warp_debug & 1 != 0 {
+                        draws.clear();
+                    }
+                    let mut encoder = self
+                        .wgpu_device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("space_warp") });
+                    crate::renderer::space_warp::record(
+                        &mut encoder,
+                        &sw.pipelines,
+                        &sw.camera_group,
+                        &sw.motion_targets[m][eye].view,
+                        &sw.depth_targets[d][eye].view,
+                        &draws,
+                        self.levers.space_warp_debug & 2048 != 0,
+                        if self.levers.space_warp_debug & 4096 != 0 { 0.0 } else { 1.0 },
+                    );
+                    self.wgpu_queue.submit(Some(encoder.finish()));
+                    // DIAGNOSIS: what the pass left in the images. See
+                    // `space_warp::Readback`.
+                    if self.levers.space_warp_debug & 8192 != 0 && eye == 0 {
+                        if let Some(rb) = sw.readback.as_ref() {
+                            match rb.read(sw.depth_raw[d], sw.depth_has_stencil, sw.motion_raw[m], eye as u32) {
+                                Ok(s) => log::info!("SWDUMP {s}"),
+                                Err(e) => log::warn!("SWDUMP failed: {e:?}"),
+                            }
+                        }
+                    }
+                }
+            }
+
             // The scene has already been drawn straight into this image
             // unless something needs to sample it back. See the scene pass.
             if !plan.runs_eye_pass() {
@@ -1983,80 +2106,6 @@ impl XrRenderer {
 
             self.wgpu_queue.submit(Some(encoder.finish()));
 
-            // SPACEWARP: this eye's motion vectors and depth, small, from the
-            // same geometry -- the world, then every mesh by its own motion.
-            // See `space_warp`.
-            if let Some(sw) = self.space_warp.as_ref() {
-                if let Some((m, d)) = sw.acquired {
-                    use crate::renderer::space_warp::{MotionDraw, MotionKind};
-                    let base = eye as u32 * warp_per_eye;
-                    let mut draws: Vec<MotionDraw> = Vec::new();
-                    if let Some((vb, ib, n)) = brush_buffers.as_ref() {
-                        draws.push(MotionDraw { kind: MotionKind::Brush, vertices: vb, indices: ib, first: 0, count: *n, slot: base, joints: None });
-                    }
-                    // The solid buffer: its cuboids whole, and of the ground
-                    // only the chunks this eye's scene pass drew.
-                    let solid = |first: u32, count: u32| MotionDraw {
-                        kind: MotionKind::Solid,
-                        vertices: &solid_vb,
-                        indices: &solid_ib,
-                        first,
-                        count,
-                        slot: base,
-                        joints: None,
-                    };
-                    match terrain_range {
-                        Some((start, _)) if !solid_chunks.is_empty() => {
-                            draws.push(solid(0, start));
-                            for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c)) {
-                                draws.push(solid(c.first_index, c.index_count));
-                            }
-                        }
-                        _ => draws.push(solid(0, solid_idx.len() as u32)),
-                    }
-                    for (i, (inst, _, _)) in warp_meshes.iter().enumerate() {
-                        let slot = base + 1 + i as u32;
-                        if let Some(skin) = &inst.mesh.skin {
-                            let joints = skin.motion_bind_group(&self.wgpu_device, &sw.pipelines.joints_layout);
-                            for prim in &skin.primitives {
-                                draws.push(MotionDraw {
-                                    kind: MotionKind::Skinned,
-                                    vertices: &prim.vertex_buffer,
-                                    indices: &prim.index_buffer,
-                                    first: 0,
-                                    count: prim.indices.len() as u32,
-                                    slot,
-                                    joints: Some(joints),
-                                });
-                            }
-                        } else {
-                            for prim in inst.mesh.primitives.iter().filter(|p| p.layered.is_none()) {
-                                draws.push(MotionDraw {
-                                    kind: MotionKind::Mesh,
-                                    vertices: &prim.vertex_buffer,
-                                    indices: &prim.index_buffer,
-                                    first: 0,
-                                    count: prim.indices.len() as u32,
-                                    slot,
-                                    joints: None,
-                                });
-                            }
-                        }
-                    }
-                    let mut encoder = self
-                        .wgpu_device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("space_warp") });
-                    crate::renderer::space_warp::record(
-                        &mut encoder,
-                        &sw.pipelines,
-                        &sw.camera_group,
-                        &sw.motion_targets[m][eye].view,
-                        &sw.depth_targets[d][eye].view,
-                        &draws,
-                    );
-                    self.wgpu_queue.submit(Some(encoder.finish()));
-                }
-            }
         }
 
         // SPACEWARP: the images go back, and this frame becomes the history.
@@ -2064,6 +2113,30 @@ impl XrRenderer {
             if sw.acquired.is_some() {
                 sw.motion.release_image()?;
                 sw.depth.release_image()?;
+                // How far locomotion moved the tracking space since the last
+                // frame: the runtime fills untouched pixels (the sky) from it,
+                // and stops extrapolating across a jump. See `space_warp`.
+                let dbg = self.levers.space_warp_debug;
+                let delta = sw
+                    .prev
+                    .filter(|_| dbg & 8 == 0)
+                    .map(|(_, prev_w2p)| crate::renderer::space_warp::app_space_delta(prev_w2p, warp_world_to_player))
+                    .unwrap_or(xr::Posef::IDENTITY);
+                for info in sw.info.iter_mut() {
+                    info.app_space_delta_pose = delta;
+                    info.near_z = crate::renderer::space_warp::NEAR_Z;
+                    info.far_z = if dbg & 16 != 0 { f32::INFINITY } else { crate::renderer::space_warp::FAR_Z };
+                    if dbg & 512 != 0 {
+                        // Declared reversed: 1.0 near, 0.0 far.
+                        info.near_z = crate::renderer::space_warp::FAR_Z;
+                        info.far_z = crate::renderer::space_warp::NEAR_Z;
+                    }
+                    if dbg & 1024 != 0 {
+                        // Every depth value 500 m away or more.
+                        info.near_z = 500.0;
+                        info.far_z = crate::renderer::space_warp::FAR_Z;
+                    }
+                }
             }
             sw.prev = Some((warp_view_proj, warp_world_to_player));
             sw.prev_models = meshes.iter().map(|m| (m.model.buffer.clone(), m.mesh.model_matrix())).collect();
@@ -2141,6 +2214,20 @@ impl XrRenderer {
             let counters = self.perf_metric_window.take();
             if self.perf_metrics.is_some() {
                 log::info!("{} [ab={ab} ssr={ssr} levers={levers}]", crate::perf_metrics_log::format_line(&counters));
+            }
+            // Where the window closed, so a slow window from a play session
+            // can be put on the map ("the stone room was laggy").
+            {
+                let p = eye_views[0].pose.position;
+                let head = warp_world_to_player.inverse().transform_point3(glam::Vec3::new(p.x, p.y, p.z));
+                log::info!(
+                    "WHERE: head=({:.2},{:.2},{:.2}) yaw={:.0} debug={:?}",
+                    head.x,
+                    head.y,
+                    head.z,
+                    self.player.yaw.to_degrees(),
+                    self.debug_view
+                );
             }
             if let Some(log) = &self.perf_log {
                 let cycle_len = crate::renderer::perf_ab::Phase::ALL.len() as u64;
