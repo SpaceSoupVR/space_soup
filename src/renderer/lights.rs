@@ -719,6 +719,10 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let portal_side_fade = PROBE_PORTAL_SIDE_FADE;
     let precision_aliases = crate::renderer::shader_precision::F32_ALIASES;
     let probe_fixup_wgsl = crate::renderer::probe_fixup::lights_block_wgsl(defer_secondary);
+    let ground_trace_finest = crate::renderer::ground_map::GROUND_TRACE_FINEST_LEVEL;
+    let ground_trace_start = crate::renderer::ground_map::GROUND_TRACE_START_LEVEL;
+    let ground_trace_readings = crate::renderer::ground_map::GROUND_TRACE_READINGS;
+    let ground_trace_steps = crate::renderer::ground_map::GROUND_TRACE_MAX_STEPS;
     format!(
         r#"
 // HALF-PRECISION ALIASES: `f32` unless `shader_precision::for_device` rewrites
@@ -2659,12 +2663,13 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
     return hit;
 }}
 
-// The ground march: its first step, doublings from there -- 12.5 cm out to
-// 256 m -- and the halvings that settle onto the ground once a step has
-// passed below it.
-const GROUND_MARCH_FIRST: f32 = 0.125;
-const GROUND_MARCH_STEPS: i32 = 12;
-const GROUND_MARCH_BISECTIONS: i32 = 5;
+// The ground trace's finest level, the level it starts from, its readings of
+// the ground across a finest cell and the most cells it visits. Emitted from `ground_map::GROUND_TRACE_*`, which its CPU
+// twin `ground_map::trace` uses.
+const GROUND_TRACE_FINEST_LEVEL: i32 = {ground_trace_finest};
+const GROUND_TRACE_START_LEVEL: i32 = {ground_trace_start};
+const GROUND_TRACE_READINGS: i32 = {ground_trace_readings};
+const GROUND_TRACE_MAX_STEPS: i32 = {ground_trace_steps};
 
 // THE SKY A REFLECTION SEES along WORLD direction `d`: the panorama without its
 // sun, from its layer of the probe array, at the blur `lod` asks for -- the
@@ -2687,53 +2692,122 @@ fn ground_uv(p: vec3<f32>) -> vec2<f32> {{
     return (p.xz - camera.ground_params.xy) * camera.ground_params.zw;
 }}
 
-// THE OUTDOORS ALONG A RAY from WORLD point `e` heading `d`: the ground where
-// the ray first passes below it, else the sky. See `ground_map`.
+// THE GROUND A RAY MEETS, from WORLD point `e` along `d`: how far along it the
+// ray first passes below the ground, or -1 where it meets none -- off the
+// terrain, or above its highest ground and rising.
 //
-// Marched against the ground's height in doubling steps -- a ray leaving a
-// wall's foot meets the grass within a hand's breadth, one toward the hills
-// crosses fifty metres -- then halved onto the crossing. It stops as soon as
-// it is above the highest ground and rising, or off the terrain: past that is
-// only sky. The ground is read at the blur the lobe has spread to where it
-// lands, against the size of a texel.
+// A walk through the ground map's cells, coarse where the ray passes high and
+// fine where it comes close: above level 0 each texel's A is the highest
+// ground under it (`ground_map::levels`). A cell whose highest ground stays
+// below the ray on both sides is passed over whole, and the walk climbs a
+// level once it leaves its parent; a cell the ray may touch is entered a level
+// finer, from where the ray has come down to its highest ground. At the finest
+// level the ground itself is read evenly across the rest of the cell, and the
+// crossing interpolated between the first reading below the ray and the one
+// before. Exact to the ground's own shape, so the horizon it finds moves only
+// when the ray does.
+//
+// `ground_map::trace` is this, step for step, and a GPU test holds the two to
+// the same answers. It replaced a march in doubling steps that tested the
+// ground at 32 m and next at 64 m, past test_room's edge: the hills between
+// were never tested, a reflection's horizon was the ground's height 32 m out,
+// it stepped wherever that reading changed hands -- a wall mirrored a
+// building that was not there -- and it crawled as the head moved (headset,
+// 2026-09-29).
+fn ground_trace(e: vec3<f32>, d: vec3<f32>) -> f32 {{
+    let top = camera.sky_params.z;
+    let size = f32(textureDimensions(ground_map, 0).x);
+    let scale = camera.ground_params.zw * size;
+    // The ray in level-0 texels across the map; an axis it barely moves along
+    // never bounds a cell it is in.
+    let q0 = (e.xz - camera.ground_params.xy) * scale;
+    let raw = d.xz * scale;
+    let dq = select(raw, vec2<f32>(1e-6), abs(raw) < vec2<f32>(1e-6));
+    let inv = 1.0 / dq;
+    // On the map, and below its highest ground.
+    let ta = -q0 * inv;
+    let tb = (vec2<f32>(size) - q0) * inv;
+    var t = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), 0.0);
+    var t_out = min(max(ta.x, tb.x), max(ta.y, tb.y));
+    if (d.y > 0.0) {{
+        t_out = min(t_out, (top - e.y) / d.y);
+    }} else if (d.y < 0.0) {{
+        t = max(t, (top - e.y) / d.y);
+    }} else if (e.y > top) {{
+        t_out = -1.0;
+    }}
+    let top_level = i32(textureNumLevels(ground_map)) - 1;
+    let finest = min(GROUND_TRACE_FINEST_LEVEL, top_level);
+    var level = clamp(GROUND_TRACE_START_LEVEL, finest, top_level);
+    let ahead = select(vec2<f32>(0.0), vec2<f32>(1.0), dq > vec2<f32>(0.0));
+    // A thousandth of a texel along the ray: a point on a border is in the
+    // cell ahead.
+    let nudge = sign(dq) * 1e-3;
+    var hit = -1.0;
+    for (var steps = 0; steps < GROUND_TRACE_MAX_STEPS && t < t_out; steps = steps + 1) {{
+        let cell = f32(1u << u32(level));
+        let last = floor(size / cell) - 1.0;
+        let c = clamp(floor((q0 + dq * t + nudge) / cell), vec2<f32>(0.0), vec2<f32>(last));
+        let exits = ((c + ahead) * cell - q0) * inv;
+        let t_exit = min(min(exits.x, exits.y), t_out);
+        let highest = textureLoad(ground_map, vec2<i32>(c), level).a;
+        let y_in = e.y + d.y * t;
+        if (min(y_in, e.y + d.y * t_exit) <= highest) {{
+            // Nothing in this cell before the ray is down to its highest ground.
+            let t_top = select(t, t + (y_in - highest) / -d.y, y_in > highest);
+            if (level > finest) {{
+                level = level - 1;
+                t = t_top;
+                continue;
+            }}
+            // The ground itself, read evenly from there to the cell's far
+            // side; the crossing between the first reading below the ray and
+            // the one before it. Every reading is taken -- no exit between
+            // them -- so the reads go out together rather than one by one.
+            let span = (t_exit - t_top) / f32(GROUND_TRACE_READINGS - 1);
+            var f_prev = e.y + d.y * t_top - textureSampleLevel(ground_map, probe_samp, (q0 + dq * t_top) / size, 0.0).a;
+            var crossing = select(-1.0, t_top, f_prev <= 0.0);
+            for (var k = 1; k < GROUND_TRACE_READINGS; k = k + 1) {{
+                let tk = t_top + span * f32(k);
+                let f = e.y + d.y * tk - textureSampleLevel(ground_map, probe_samp, (q0 + dq * tk) / size, 0.0).a;
+                if (crossing < 0.0 && f <= 0.0) {{
+                    crossing = tk - span + span * f_prev / (f_prev - f);
+                }}
+                f_prev = f;
+            }}
+            if (crossing >= 0.0) {{
+                hit = crossing;
+                break;
+            }}
+        }}
+        // Over this cell: on to the next, a level coarser once it is in
+        // another parent.
+        let next = floor((q0 + dq * t_exit + nudge) / cell);
+        if (any(floor(next * 0.5) != floor(c * 0.5))) {{
+            level = min(level + 1, top_level);
+        }}
+        t = t_exit;
+    }}
+    return hit;
+}}
+
+// THE OUTDOORS ALONG A RAY from WORLD point `e` heading `d`: the ground where
+// the ray first passes below it (`ground_trace`), else the sky. The ground is
+// read at the blur the lobe has spread to where it lands, against the size of
+// a texel. See `ground_map`.
 //
 // Before, the ray was run into the outdoor volume's BOX -- whose floor lies
 // metres under the grass -- and the outdoor photograph read toward that point:
 // the shaded wall facing the lake reflected sunlit ground at its foot, lit as
 // if from underneath, and a seam crossed it at eye height (headset, 2026-09-28).
 fn outdoor_radiance(e: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, lod: f32) -> vec3<f32> {{
-    let top = camera.sky_params.z;
     if (camera.sky_params.w > 0.5) {{
-        var t_lo = 0.0;
-        var t_hi = -1.0;
-        var t = GROUND_MARCH_FIRST;
-        for (var k = 0; k < GROUND_MARCH_STEPS; k = k + 1) {{
-            let p = e + d * t;
-            let uv = ground_uv(p);
-            if ((p.y > top && d.y >= 0.0) || any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) {{
-                break;
-            }}
-            if (p.y <= textureSampleLevel(ground_map, probe_samp, uv, 0.0).a) {{
-                t_hi = t;
-                break;
-            }}
-            t_lo = t;
-            t = t * 2.0;
-        }}
-        if (t_hi > 0.0) {{
-            for (var k = 0; k < GROUND_MARCH_BISECTIONS; k = k + 1) {{
-                let tm = 0.5 * (t_lo + t_hi);
-                let p = e + d * tm;
-                if (p.y <= textureSampleLevel(ground_map, probe_samp, ground_uv(p), 0.0).a) {{
-                    t_hi = tm;
-                }} else {{
-                    t_lo = tm;
-                }}
-            }}
-            let texel = 1.0 / max(camera.ground_params.z * f32(textureDimensions(ground_map).x), 1e-6);
-            let spread = max(t_hi * probe_lobe_tan(roughness), 1e-4);
+        let t = ground_trace(e, d);
+        if (t >= 0.0) {{
+            let texel = 1.0 / max(camera.ground_params.z * f32(textureDimensions(ground_map, 0).x), 1e-6);
+            let spread = max(t * probe_lobe_tan(roughness), 1e-4);
             let ground_lod = clamp(log2(spread / texel), 0.0, 12.0);
-            return textureSampleLevel(ground_map, probe_samp, ground_uv(e + d * t_hi), ground_lod).rgb;
+            return textureSampleLevel(ground_map, probe_samp, ground_uv(e + d * t), ground_lod).rgb;
         }}
     }}
     return sky_reflection(d, dir, lod);
@@ -5415,5 +5489,141 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
         assert!(h[1].edge >= 0 && h[1].edge_hit && (0.5..0.99).contains(&h[1].edge_cover), "just inside: edge {} hit {} cover {}", h[1].edge, h[1].edge_hit, h[1].edge_cover);
         assert!(h[2].edge < 0, "a ray well clear of the pillar reported its outline: {}", h[2].edge);
         assert!(h[3].edge < 0, "a mirror with no footprint blended the outline: {} cover {}", h[3].edge, h[3].edge_cover);
+    }
+}
+
+/// THE GROUND TRACE, RUN ON THE GPU: the real WGSL `ground_trace` from a
+/// compute shader over test_room-shaped hills, against its CPU twin
+/// `ground_map::trace`. The twin is what the ground map's tests hold to brute
+/// force; this holds the shader to the twin.
+#[cfg(test)]
+mod ground_trace_gpu_tests {
+    use super::*;
+    use crate::renderer::ground_map::{self, fixtures, GroundMap};
+    use crate::renderer::uniforms::Uniforms;
+    use glam::Vec3;
+    use wgpu::util::DeviceExt;
+
+    fn trace(map: &GroundMap, rays: &[(Vec3, Vec3)]) -> Option<Vec<f32>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let view = ground_map::upload(&device, &queue, map);
+        let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
+        let extent = map.max - map.min;
+        let mut u: Uniforms = bytemuck::Zeroable::zeroed();
+        u.ground_params = [map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y];
+        u.sky_params = [1.0, 0.0, map.top, 1.0];
+        let code = format!(
+            "{}\n{}",
+            wgsl_lights_block(0, 1),
+            r#"
+@group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> hits: array<f32>;
+@compute @workgroup_size(1)
+fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    hits[id.x] = ground_trace(rays[id.x * 2u].xyz, rays[id.x * 2u + 1u].xyz);
+}
+"#
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ground_trace_test"),
+            source: wgpu::ShaderSource::Wgsl(code.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("ground_trace_test"),
+            layout: None,
+            module: &module,
+            entry_point: Some("trace_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera"),
+            contents: bytemuck::bytes_of(&u),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let packed: Vec<[f32; 4]> = rays.iter().flat_map(|(e, d)| [[e.x, e.y, e.z, 0.0], [d.x, d.y, d.z, 0.0]]).collect();
+        let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rays"),
+            contents: bytemuck::cast_slice(&packed),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let size = (rays.len() * 4) as u64;
+        let hit_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hits"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("read"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Bindings as `wgsl_lights_block(0, 1)` numbers them: the probe
+        // sampler at 1 + 5, the ground map at 1 + 9.
+        let g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&samp) },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&view) },
+            ],
+        });
+        let g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: hit_buf.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups(rays.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&hit_buf, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let data: Vec<f32> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().ok()?).to_vec();
+        Some(data)
+    }
+
+    /// Hit for hit and centimetre for centimetre, except where the ray only
+    /// grazes the ground: there the GPU's filtering, a few bits coarser than
+    /// the twin's arithmetic, may round a touch either way.
+    #[test]
+    fn the_shader_meets_the_ground_where_its_twin_does() {
+        let map = fixtures::height_map(1024, fixtures::hills);
+        let chain = ground_map::levels(&map);
+        let rays = fixtures::rays(400, 11);
+        let Some(gpu) = trace(&map, &rays) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mut grazing = 0;
+        let mut hits = 0;
+        for (i, (&(e, d), &g)) in rays.iter().zip(&gpu).enumerate() {
+            let twin = ground_map::trace(&chain, map.min, map.max, map.top, e, d).t;
+            let g = (g >= 0.0).then_some(g);
+            hits += g.is_some() as usize;
+            match (g, twin) {
+                (Some(a), Some(b)) if (a - b).abs() <= 0.01 + 0.001 * b => {}
+                (None, None) => {}
+                _ => {
+                    let fine = fixtures::march(&chain[0], map.min, map.max, map.top, e, d);
+                    assert!(fine.graze < 0.03, "ray {i} from {e} along {d}: GPU {g:?}, twin {twin:?}, clearance {}", fine.graze);
+                    grazing += 1;
+                }
+            }
+        }
+        assert!(hits > rays.len() / 3 && hits < rays.len(), "{hits} of {} rays met the ground: not a test of both", rays.len());
+        assert!(grazing <= rays.len() / 100, "{grazing} grazing disagreements");
     }
 }

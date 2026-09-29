@@ -92,6 +92,10 @@ pub struct Levers {
     /// scene pass. See `TerrainPipeline::new_probe_pass`. Single eye, with
     /// `deferred_reflection_lookups`.
     pub terrain_probe_pass: bool,
+    /// Reflections that leave the building meet the ground: the trace over
+    /// the ground map's heights. Off: they see only the sky. See
+    /// `ground_map::trace`.
+    pub ground_trace: bool,
     /// MEASUREMENT: block on the GPU at the end of every frame, as the
     /// renderer used to. Its wait is then exactly the GPU's time, which is
     /// what the A/B schedule attributes costs with; shipped, the CPU prepares
@@ -134,6 +138,7 @@ impl Default for Levers {
             portal_culling: true,
             deferred_reflection_lookups: true,
             terrain_probe_pass: true,
+            ground_trace: true,
             gpu_sync: false,
             ssr: None,
             multiview: None,
@@ -181,6 +186,7 @@ impl Levers {
             Phase::NoPortalCulling => l.portal_culling = false,
             Phase::InlineReflectionLookups => l.deferred_reflection_lookups = false,
             Phase::TerrainPerPixelReflections => l.terrain_probe_pass = false,
+            Phase::NoGroundTrace => l.ground_trace = false,
         }
         l
     }
@@ -211,6 +217,7 @@ impl Levers {
         flag("portal_culling", self.portal_culling, d.portal_culling);
         flag("deferred_lookups", self.deferred_reflection_lookups, d.deferred_reflection_lookups);
         flag("terrain_probe_pass", self.terrain_probe_pass, d.terrain_probe_pass);
+        flag("ground_trace", self.ground_trace, d.ground_trace);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
