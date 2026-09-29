@@ -17,10 +17,10 @@
 //! player_to_world * v`: the head's motion AND locomotion are in the vectors,
 //! and `appSpaceDeltaPose` stays the identity.
 //!
-//! Not yet: objects that move by themselves -- props, avatars, hands. They get
-//! the camera's motion only, so between rendered frames they hold still
-//! where they were, and at half rate they would judder. Behind a lever, off
-//! by default, until they carry their own previous transforms.
+//! Meshes carry their own motion too: a rigid one by its previous model
+//! matrix, a skinned one -- the player's hands and body, other avatars -- by
+//! its previous joint palette (`GltfSkin::prev_joint_buffer`), skinned twice
+//! in the vertex shader. Not yet: layered meshes (caves) and effects.
 //!
 //! # Conventions
 //!
@@ -40,7 +40,8 @@ pub const FAR_Z: f32 = 1000.0;
 /// The motion vectors' format: signed half floats, as the spec recommends.
 pub const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// One eye's two cameras, as the shader reads them.
+/// One draw's two clip transforms, as the shader reads them: this frame's
+/// and the previous frame's, each already carrying the draw's model matrix.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MotionCamera {
@@ -48,39 +49,78 @@ pub struct MotionCamera {
     pub prev: [[f32; 4]; 4],
 }
 
+/// Bytes between two draws' slots in the ring of [`MotionCamera`]s: the
+/// dynamic-offset alignment every device allows.
+pub const SLOT_STRIDE: u64 = 256;
+
+/// Slots in the ring, both eyes: the world and every mesh, per eye.
+pub const MAX_SLOTS: u32 = 256;
+
 /// The shader: this frame's clip position against the previous frame's, as
-/// NDC, y flipped to Vulkan's. See the module docs.
-pub const SHADER: &str = r#"
-struct MotionCamera {
+/// NDC, y flipped to Vulkan's. See the module docs. A skinned vertex is
+/// skinned twice, by this frame's joints and by the previous frame's, the
+/// same weighted sum the eye pass takes (`mesh_pipeline`).
+pub fn shader() -> String {
+    format!(
+        r#"
+struct MotionCamera {{
     curr: mat4x4<f32>,
     prev: mat4x4<f32>,
-}
+}}
 @group(0) @binding(0) var<uniform> cam: MotionCamera;
 
-struct VOut {
+struct Joints {{
+    m: array<mat4x4<f32>, {joints}>,
+}}
+@group(1) @binding(0) var<uniform> joints: Joints;
+@group(1) @binding(1) var<uniform> prev_joints: Joints;
+
+struct VOut {{
     @builtin(position) clip: vec4<f32>,
     @location(0) curr: vec4<f32>,
     @location(1) prev: vec4<f32>,
-}
+}}
 
-@vertex fn vs_main(@location(0) pos: vec3<f32>) -> VOut {
+@vertex fn vs_main(@location(0) pos: vec3<f32>) -> VOut {{
     var out: VOut;
     let p = vec4<f32>(pos, 1.0);
     out.clip = cam.curr * p;
     out.curr = out.clip;
     out.prev = cam.prev * p;
     return out;
-}
+}}
 
-@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {
+@vertex fn vs_skinned(
+    @location(0) pos: vec3<f32>,
+    @location(3) ids: vec4<u32>,
+    @location(4) w: vec4<f32>,
+) -> VOut {{
+    var out: VOut;
+    let p = vec4<f32>(pos, 1.0);
+    let now = (joints.m[ids.x] * p) * w.x + (joints.m[ids.y] * p) * w.y
+        + (joints.m[ids.z] * p) * w.z + (joints.m[ids.w] * p) * w.w;
+    let before = (prev_joints.m[ids.x] * p) * w.x + (prev_joints.m[ids.y] * p) * w.y
+        + (prev_joints.m[ids.z] * p) * w.z + (prev_joints.m[ids.w] * p) * w.w;
+    out.clip = cam.curr * now;
+    out.curr = out.clip;
+    out.prev = cam.prev * before;
+    return out;
+}}
+
+@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let d = in.curr.xyz / in.curr.w - in.prev.xyz / in.prev.w;
     return vec4<f32>(d.x, -d.y, d.z, 0.0);
+}}
+"#,
+        joints = crate::renderer::mesh::MAX_SKIN_JOINTS,
+    )
 }
-"#;
 
 /// The previous frame's clip transform for THIS frame's player-frame
 /// vertices: back to the world through this frame's player transform, into
 /// the previous frame's player frame, through the previous frame's camera.
+/// (A mesh needs none of this: its model matrix is already in each frame's
+/// own player frame, so its previous clip is `prev_view_proj * prev_model`.)
 pub fn previous_clip(prev_view_proj: Mat4, prev_world_to_player: Mat4, world_to_player: Mat4) -> Mat4 {
     prev_view_proj * prev_world_to_player * world_to_player.inverse()
 }
@@ -94,52 +134,82 @@ pub fn motion_vector(curr: Mat4, prev: Mat4, p: glam::Vec3) -> glam::Vec3 {
     glam::Vec3::new(d.x, -d.y, d.z)
 }
 
-/// The motion-vector pipelines: one per vertex stride the world is drawn
-/// with (brushes, and the solid buffer the terrain shares), each reading only
-/// the position at offset 0.
+/// Which vertex layout a motion draw reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MotionKind {
+    Brush,
+    Solid,
+    Mesh,
+    Skinned,
+}
+
+/// The motion-vector pipelines, one per vertex layout the eye pass draws
+/// with, each reading only what places a vertex; and the ring of per-draw
+/// cameras they share.
 pub struct MotionPipelines {
-    pub layout: wgpu::BindGroupLayout,
-    pub brush: wgpu::RenderPipeline,
-    pub solid: wgpu::RenderPipeline,
+    pub camera_layout: wgpu::BindGroupLayout,
+    pub joints_layout: wgpu::BindGroupLayout,
+    brush: wgpu::RenderPipeline,
+    solid: wgpu::RenderPipeline,
+    mesh: wgpu::RenderPipeline,
+    skinned: wgpu::RenderPipeline,
 }
 
 impl MotionPipelines {
     pub fn new(device: &wgpu::Device, depth_format: wgpu::TextureFormat) -> Self {
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("space_warp_camera"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<MotionCamera>() as u64),
                 },
                 count: None,
             }],
         });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let joint_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let joints_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("space_warp_joints"),
+            entries: &[joint_entry(0), joint_entry(1)],
+        });
+        let plain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("space_warp"),
-            bind_group_layouts: &[Some(&layout)],
+            bind_group_layouts: &[Some(&camera_layout)],
+            immediate_size: 0,
+        });
+        let skinned_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("space_warp_skinned"),
+            bind_group_layouts: &[Some(&camera_layout), Some(&joints_layout)],
             immediate_size: 0,
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("space_warp"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(shader().into()),
         });
-        let make = |label: &str, stride: u64| {
-            let attributes = [wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 }];
+        let make = |label: &str, layout: &wgpu::PipelineLayout, entry: &str, stride: u64, attributes: &[wgpu::VertexAttribute]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&pipeline_layout),
+                layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module: &module,
-                    entry_point: Some("vs_main"),
+                    entry_point: Some(entry),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: stride,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &attributes,
+                        attributes,
                     })],
                 },
                 primitive: wgpu::PrimitiveState {
@@ -170,27 +240,63 @@ impl MotionPipelines {
                 cache: None,
             })
         };
-        let brush = make("space_warp_brush", std::mem::size_of::<crate::renderer::brush_pipeline::BrushVertex>() as u64);
-        let solid = make("space_warp_solid", std::mem::size_of::<crate::renderer::cuboid::SolidVertex>() as u64);
-        Self { layout, brush, solid }
+        let position = [wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 }];
+        let size = |n: usize| n as u64;
+        let brush = make("space_warp_brush", &plain_layout, "vs_main", size(std::mem::size_of::<crate::renderer::brush_pipeline::BrushVertex>()), &position);
+        let solid = make("space_warp_solid", &plain_layout, "vs_main", size(std::mem::size_of::<crate::renderer::cuboid::SolidVertex>()), &position);
+        let mesh = make("space_warp_mesh", &plain_layout, "vs_main", size(std::mem::size_of::<crate::renderer::mesh::MeshVertex>()), &position);
+        let skinned_attributes = [
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32x4,
+                offset: std::mem::offset_of!(crate::renderer::mesh::SkinnedMeshVertex, joint_ids) as u64,
+                shader_location: 3,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: std::mem::offset_of!(crate::renderer::mesh::SkinnedMeshVertex, joint_weights) as u64,
+                shader_location: 4,
+            },
+        ];
+        let skinned = make(
+            "space_warp_skinned",
+            &skinned_layout,
+            "vs_skinned",
+            size(std::mem::size_of::<crate::renderer::mesh::SkinnedMeshVertex>()),
+            &skinned_attributes,
+        );
+        Self { camera_layout, joints_layout, brush, solid, mesh, skinned }
+    }
+
+    fn pipeline(&self, kind: MotionKind) -> &wgpu::RenderPipeline {
+        match kind {
+            MotionKind::Brush => &self.brush,
+            MotionKind::Solid => &self.solid,
+            MotionKind::Mesh => &self.mesh,
+            MotionKind::Skinned => &self.skinned,
+        }
     }
 }
 
-/// The world's geometry for one motion-vector pass: `(vertices, indices,
-/// index count)` per stride.
-pub struct MotionGeometry<'a> {
-    pub brush: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer, u32)>,
-    pub solid: Option<(&'a wgpu::Buffer, &'a wgpu::Buffer, u32)>,
+/// One draw of the motion pass: its geometry, the ring slot of its two
+/// cameras, and -- skinned -- its joints.
+pub struct MotionDraw<'a> {
+    pub kind: MotionKind,
+    pub vertices: &'a wgpu::Buffer,
+    pub indices: &'a wgpu::Buffer,
+    pub count: u32,
+    pub slot: u32,
+    pub joints: Option<&'a wgpu::BindGroup>,
 }
 
 /// Draw one eye's motion vectors and depth into `motion` and `depth`.
 pub fn record(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &MotionPipelines,
-    camera: &wgpu::BindGroup,
+    cameras: &wgpu::BindGroup,
     motion: &wgpu::TextureView,
     depth: &wgpu::TextureView,
-    geometry: &MotionGeometry,
+    draws: &[MotionDraw],
 ) {
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("space_warp"),
@@ -207,16 +313,18 @@ pub fn record(
         }),
         ..Default::default()
     });
-    pass.set_bind_group(0, camera, &[]);
-    for (pipeline, geo) in [(&pipelines.brush, geometry.brush), (&pipelines.solid, geometry.solid)] {
-        if let Some((vb, ib, count)) = geo {
-            if count > 0 {
-                pass.set_pipeline(pipeline);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..count, 0, 0..1);
-            }
+    for d in draws.iter().filter(|d| d.count > 0 && d.slot < MAX_SLOTS) {
+        if d.kind == MotionKind::Skinned && d.joints.is_none() {
+            continue;
         }
+        pass.set_pipeline(pipelines.pipeline(d.kind));
+        pass.set_bind_group(0, cameras, &[(d.slot as u64 * SLOT_STRIDE) as u32]);
+        if let Some(j) = d.joints {
+            pass.set_bind_group(1, j, &[]);
+        }
+        pass.set_vertex_buffer(0, d.vertices.slice(..));
+        pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..d.count, 0, 0..1);
     }
 }
 
@@ -266,8 +374,22 @@ mod tests {
         };
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let _p = MotionPipelines::new(&device, wgpu::TextureFormat::Depth32Float);
+        assert!(SLOT_STRIDE >= device.limits().min_uniform_buffer_offset_alignment as u64);
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "{err:?}");
+    }
+
+    /// A hand moving right in front of a still head: its pixels move right,
+    /// through its own model matrix -- a mesh's previous clip is the previous
+    /// camera times its previous model, both in the previous player frame.
+    #[test]
+    fn a_moving_mesh_carries_its_own_motion() {
+        let vp = view_proj(Vec3::new(0.0, 1.6, 0.0), 0.0);
+        let before = Mat4::from_translation(Vec3::new(0.2, 1.2, -0.5));
+        let now = Mat4::from_translation(Vec3::new(0.25, 1.2, -0.5));
+        let local = Vec3::new(0.0, 0.0, 0.0);
+        let mv = motion_vector(vp * now, vp * before, local);
+        assert!(mv.x > 0.05 && mv.y.abs() < 1e-4, "{mv}");
     }
 
     /// A still head and a still player: nothing moves.

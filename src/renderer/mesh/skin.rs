@@ -196,6 +196,14 @@ pub struct GltfSkin {
     pub animations: Vec<GltfAnimationPose>,
 
     pub joint_buffer: wgpu::Buffer,
+    /// The joint matrices of the update before the last: the pose this skin
+    /// had a frame ago, for SpaceWarp's motion vectors (`space_warp`).
+    pub prev_joint_buffer: wgpu::Buffer,
+    /// What `joint_buffer` holds now, so the next update can move it into
+    /// `prev_joint_buffer`. Shared by clones, as the buffers are.
+    pub last_joints: std::sync::Arc<std::sync::Mutex<Option<Vec<[f32; 16]>>>>,
+    /// The motion pass's bind group (both palettes), made on first use.
+    pub motion_bind_group: std::sync::Arc<std::sync::OnceLock<wgpu::BindGroup>>,
 
     pub joint_bind_group: Option<wgpu::BindGroup>,
     pub primitives: Vec<SkinnedMeshPrimitive>,
@@ -221,7 +229,37 @@ impl GltfSkin {
         for (i, mat) in skinned_mats.iter().enumerate().take(MAX_SKIN_JOINTS) {
             buf[i] = mat.to_cols_array();
         }
+        // The pose it replaces becomes the previous one -- the first update
+        // has none, and is its own.
+        let mut last = self.last_joints.lock().unwrap_or_else(|e| e.into_inner());
+        let prev: &[[f32; 16]] = last.as_deref().unwrap_or(&buf);
+        queue.write_buffer(&self.prev_joint_buffer, 0, bytemuck::cast_slice(prev));
         queue.write_buffer(&self.joint_buffer, 0, bytemuck::cast_slice(&buf));
+        *last = Some(buf.to_vec());
+    }
+
+    /// Both palettes, as the motion pass binds them (`space_warp`).
+    pub fn motion_bind_group(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> &wgpu::BindGroup {
+        self.motion_bind_group.get_or_init(|| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("skin_motion_joints"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.joint_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.prev_joint_buffer.as_entire_binding() },
+                ],
+            })
+        })
+    }
+
+    /// A joint buffer the size every skin's is.
+    pub fn joint_buffer(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (MAX_SKIN_JOINTS * 64) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
     }
 
     pub fn blended_local_pose(
