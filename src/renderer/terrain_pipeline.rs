@@ -905,7 +905,7 @@ pub(crate) mod tests {
         .ok()?;
         pollster::block_on(adapter.request_device(&DeviceDescriptor {
             required_features: Features::empty(),
-            required_limits: Limits::default(),
+            required_limits: crate::renderer::uniforms::scene_limits(Limits::default()),
             ..Default::default()
         }))
         .ok()

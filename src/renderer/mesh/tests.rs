@@ -274,7 +274,7 @@
         .ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits: crate::renderer::uniforms::scene_limits(wgpu::Limits::default()),
             ..Default::default()
         }))
         .ok()?;

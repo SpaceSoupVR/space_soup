@@ -121,6 +121,11 @@ pub struct Uniforms {
     ///
     /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
     pub ground_params: [f32; 4],
+    /// Where each model's distance field lies in the atlas, two vec4 a field.
+    /// See `proxy_field::FieldSlot`.
+    ///
+    /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
+    pub proxy_fields: [super::proxy_field::FieldSlot; super::proxy_field::MAX_PROXY_FIELDS],
 }
 
 /// How many boxes standing inside rooms -- a pillar, a hanging lamp -- the
@@ -167,6 +172,25 @@ pub const MAX_PORTALS: usize = 8;
 /// tests only -- ONE `textureSampleLevel` happens, on the winner, however many
 /// probes there are. Sixteen is 3.1 MB and sixteen box tests.
 pub const MAX_PROBES: usize = 16;
+
+/// SAMPLED TEXTURES A SCENE SHADER MAY BIND in one stage. WebGPU's portable
+/// default is 16, and the brush shader that reads the probe pass needs 17:
+/// shadows (3), probes and their depth (2), the ground map, the model fields,
+/// four material arrays, four lightmap textures and the probe pass (2). Every
+/// target has far more -- the Quest's Vulkan reports its descriptor limits,
+/// Apple's Metal 96 -- so every device that builds the scene's pipelines asks
+/// for this many through [`scene_limits`].
+pub const SCENE_SAMPLED_TEXTURES: u32 = 24;
+
+/// `base` with room for [`SCENE_SAMPLED_TEXTURES`]: what every device that
+/// builds the scene's pipelines -- the headset's, the offline harness's, each
+/// test's -- requests, so none of them can drift from the others.
+pub fn scene_limits(base: wgpu::Limits) -> wgpu::Limits {
+    wgpu::Limits {
+        max_sampled_textures_per_shader_stage: base.max_sampled_textures_per_shader_stage.max(SCENE_SAMPLED_TEXTURES),
+        ..base
+    }
+}
 
 // The cube ARRAY's size is no longer a constant: a level's probes stream
 // through a pool sized from a memory budget and the device's own array-layer
@@ -275,6 +299,8 @@ pub struct UniformBuffer {
     /// The ground seen from above, bound at 10. A single unread texel until a
     /// level with terrain loads. See `ground_map` and [`Self::set_ground_map`].
     ground_view: TextureView,
+    /// Standing models' distance fields, bound at 11. See `proxy_field`.
+    proxy_field_view: TextureView,
 }
 
 impl UniformBuffer {
@@ -291,6 +317,13 @@ impl UniformBuffer {
     /// lies travels in [`ProbeUpload::ground`].
     pub fn set_ground_map(&mut self, view: TextureView) {
         self.ground_view = view;
+    }
+
+    /// Bind this atlas of model distance fields from the next
+    /// [`Self::rebind_probes`] on. Where each field lies travels in
+    /// [`ProbeUpload::proxy_fields`].
+    pub fn set_proxy_field_atlas(&mut self, view: TextureView) {
+        self.proxy_field_view = view;
     }
 
     pub fn set_probes(&mut self, probes: ProbeUpload) {
@@ -467,10 +500,22 @@ impl UniformBuffer {
                     },
                     count: None,
                 },
+                // Standing models' distance fields. See `proxy_field`.
+                BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let (probe_depth_view, probe_depth_sampler) = default_probe_depth(device);
         let ground_view = default_ground_map(device);
+        let proxy_field_view = super::proxy_field::none(device);
 
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("uniform_bg"),
@@ -511,6 +556,7 @@ impl UniformBuffer {
                 BindGroupEntry { binding: 8, resource: BindingResource::TextureView(&probe_depth_view) },
                 BindGroupEntry { binding: 9, resource: BindingResource::Sampler(&probe_depth_sampler) },
                 BindGroupEntry { binding: 10, resource: BindingResource::TextureView(&ground_view) },
+                BindGroupEntry { binding: 11, resource: BindingResource::TextureView(&proxy_field_view) },
             ],
         });
 
@@ -522,6 +568,7 @@ impl UniformBuffer {
             probe_depth_view,
             probe_depth_sampler,
             ground_view,
+            proxy_field_view,
         }
     }
 
@@ -682,6 +729,7 @@ impl UniformBuffer {
             probe_proxies: dense.proxies,
             probe_rooms: room_tables,
             ground_params: dense.ground,
+            proxy_fields: dense.proxy_fields,
             post_params: [
                 post.exposure,
                 match post.tonemap {
@@ -905,6 +953,9 @@ pub struct ProbeUpload {
     /// level has no ground map. See `ground_map`.
     pub ground: [f32; 4],
     pub ground_top: f32,
+    /// WHERE EACH MODEL'S DISTANCE FIELD LIES in the atlas, as
+    /// `proxy_field::atlas` placed it. See `proxy_field::FieldSlot`.
+    pub proxy_fields: [super::proxy_field::FieldSlot; super::proxy_field::MAX_PROXY_FIELDS],
 }
 
 /// `ProbeUpload::ground_top` for a level with no ground map: no ray is ever
@@ -923,8 +974,12 @@ pub struct ProbeProxy {
     /// The probe VOLUME (room) it stands in. See [`ProbeUpload::set_volume`].
     pub volume: u32,
     /// A brush piece IS its box; a model's box is only its bounds, and the
-    /// shader asks the room's photographs where inside it the object is.
+    /// shader asks the room's photographs where inside it the object is --
+    /// or, where it has one, walks its distance field.
     pub solid: bool,
+    /// The model's distance field: an index into the fields the level
+    /// installed (`XrRenderer::set_reflection_proxies`). See `proxy_field`.
+    pub field: Option<u32>,
 }
 
 /// One doorway between two probe volumes, as the level's bake found it.
@@ -984,6 +1039,13 @@ impl ProbeUpload {
         self.ground_top = top;
     }
 
+    /// Where the level's model fields lie in the atlas. See `proxy_field`.
+    pub fn set_proxy_fields(&mut self, slots: &[super::proxy_field::FieldSlot]) {
+        for (i, s) in slots.iter().take(super::proxy_field::MAX_PROXY_FIELDS).enumerate() {
+            self.proxy_fields[i] = *s;
+        }
+    }
+
     pub fn set_proxies(&mut self, proxies: &[ProbeProxy], player: Vec3, volumes: &[u32]) {
         let mut near: Vec<(f32, &ProbeProxy)> = proxies
             .iter()
@@ -996,7 +1058,17 @@ impl ProbeUpload {
             let q = p.rotation.normalize();
             self.proxies[i] = [
                 [p.centre.x, p.centre.y, p.centre.z, p.volume as f32],
-                [p.half_size.x, p.half_size.y, p.half_size.z, if p.solid { 0.0 } else { 1.0 }],
+                // w: 0 solid, 1 bounds only, 2 + field for a model with a field.
+                [
+                    p.half_size.x,
+                    p.half_size.y,
+                    p.half_size.z,
+                    match (p.solid, p.field) {
+                        (true, _) => 0.0,
+                        (false, None) => 1.0,
+                        (false, Some(f)) => 2.0 + f as f32,
+                    },
+                ],
                 [q.x, q.y, q.z, q.w],
             ];
         }
@@ -1177,6 +1249,7 @@ impl Default for ProbeUpload {
             sky_layer: -1.0,
             ground: [0.0; 4],
             ground_top: NO_GROUND,
+            proxy_fields: [[[0.0; 4]; 2]; super::proxy_field::MAX_PROXY_FIELDS],
         }
     }
 }
@@ -1631,6 +1704,7 @@ impl UniformBuffer {
                 BindGroupEntry { binding: 8, resource: BindingResource::TextureView(&self.probe_depth_view) },
                 BindGroupEntry { binding: 9, resource: BindingResource::Sampler(&self.probe_depth_sampler) },
                 BindGroupEntry { binding: 10, resource: BindingResource::TextureView(&self.ground_view) },
+                BindGroupEntry { binding: 11, resource: BindingResource::TextureView(&self.proxy_field_view) },
             ],
         });
         self.probes = probes;
@@ -2014,7 +2088,7 @@ mod probe_mip_upload_tests {
         .ok()?;
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits: scene_limits(wgpu::Limits::default()),
             ..Default::default()
         }))
         .ok()
@@ -2188,7 +2262,7 @@ mod dense_room_tests {
         let mut u = upload(&[7, 3]);
         let portal = |low, high| ProbePortal { min: Vec3::ZERO, max: Vec3::ONE, axis: 0, low, high, wall: None };
         u.set_portals(&[portal(7, 3), portal(3, 42)], Vec3::ZERO, &[7, 3]);
-        let proxy = |volume| ProbeProxy { centre: Vec3::ZERO, half_size: Vec3::ONE, rotation: Quat::IDENTITY, volume, solid: true };
+        let proxy = |volume| ProbeProxy { centre: Vec3::ZERO, half_size: Vec3::ONE, rotation: Quat::IDENTITY, volume, solid: true, field: None };
         u.set_proxies(&[proxy(3)], Vec3::ZERO, &[7, 3]);
         let (dense, _) = u.dense_rooms();
         let sides: Vec<(f32, f32)> = (0..2).map(|p| (dense.portals[p][1][3], dense.portals[p][2][0])).collect();
@@ -2206,7 +2280,7 @@ mod dense_room_tests {
         let portal = |low, high| ProbePortal { min: Vec3::ZERO, max: Vec3::ONE, axis: 0, low, high, wall: None };
         // Nearest first: all at the origin, so they keep this order.
         u.set_portals(&[portal(10, 20), portal(20, 30), portal(10, 30), portal(30, 99)], Vec3::ZERO, &[10, 20, 30]);
-        let proxy = |volume| ProbeProxy { centre: Vec3::ZERO, half_size: Vec3::ONE, rotation: Quat::IDENTITY, volume, solid: true };
+        let proxy = |volume| ProbeProxy { centre: Vec3::ZERO, half_size: Vec3::ONE, rotation: Quat::IDENTITY, volume, solid: true, field: None };
         u.set_proxies(&[proxy(20), proxy(10), proxy(20), proxy(99)], Vec3::ZERO, &[10, 20, 30]);
         let (dense, t) = u.dense_rooms();
         let at = |row: usize, k: usize| t[row + k / 4][k % 4];

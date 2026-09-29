@@ -324,6 +324,9 @@ pub struct XrRenderer {
     eye_targets: Vec<[EyeTarget; 2]>,
     /// Fixed foveated rendering, where the device has it. See `foveation`.
     foveation: Option<FoveationState>,
+    /// Where each model's distance field lies in the bound atlas. See
+    /// `proxy_field` and [`Self::set_reflection_proxies`].
+    proxy_field_slots: Vec<crate::renderer::proxy_field::FieldSlot>,
     default_brush_lightmap: LoadedTexture,
     /// The level's brushes share ONE atlas, because they share one draw call.
     brush_lightmap: Option<LoadedTexture>,
@@ -1196,6 +1199,7 @@ impl XrRenderer {
             depth_view,
             eye_targets,
             foveation,
+            proxy_field_slots: Vec::new(),
             default_brush_lightmap,
             brush_lightmap: None,
             cuboid_lightmaps: HashMap::new(),
@@ -1659,8 +1663,25 @@ impl XrRenderer {
         self.cull_rooms = rooms;
     }
 
-    pub fn set_reflection_proxies(&mut self, proxies: Vec<crate::renderer::uniforms::ProbeProxy>) {
+    pub fn set_reflection_proxies(
+        &mut self,
+        proxies: Vec<crate::renderer::uniforms::ProbeProxy>,
+        fields: Vec<crate::renderer::proxy_field::ProxyField>,
+    ) {
         self.probe_proxies = proxies;
+        // The models' distance fields, packed and bound; where each lies goes
+        // up with every frame's probes. See `proxy_field`.
+        match crate::renderer::proxy_field::atlas(&self.wgpu_device, &self.wgpu_queue, &fields) {
+            Some((view, slots)) => {
+                self.uniform_buf.set_proxy_field_atlas(view);
+                self.proxy_field_slots = slots;
+            }
+            None => {
+                self.uniform_buf.set_proxy_field_atlas(crate::renderer::proxy_field::none(&self.wgpu_device));
+                self.proxy_field_slots.clear();
+            }
+        }
+        self.rebind_scene_group();
     }
 
     /// The runtime switches. Per-frame features read them in `render_frame`;

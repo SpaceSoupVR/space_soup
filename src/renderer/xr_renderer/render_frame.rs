@@ -1068,6 +1068,7 @@ impl XrRenderer {
                 upload.set_portals(&self.probe_portals, player_world, &upload.volumes());
                 // And what stands in those rooms, for the reflection trace.
                 upload.set_proxies(&self.probe_proxies, player_world, &upload.volumes());
+                upload.set_proxy_fields(&self.proxy_field_slots);
                 // And the outdoors: which room it is, its sky, its ground.
                 let sky_layer = self.probe_stream.borrow().as_ref().and_then(|s| s.sky_layer());
                 let ground = if fx.ground_trace { self.ground_placement } else { None };
