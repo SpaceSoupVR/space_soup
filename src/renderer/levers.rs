@@ -99,6 +99,10 @@ pub struct Levers {
     /// Fixed foveated rendering: how coarsely the edges of each eye's image
     /// are shaded, where the headset has it. See `foveation`.
     pub foveation: crate::renderer::foveation::FoveationLevel,
+    /// APPLICATION SPACEWARP: motion vectors and depth with every frame, so
+    /// the compositor can make every other one. Off by default: objects that
+    /// move by themselves carry no motion of their own yet. See `space_warp`.
+    pub space_warp: bool,
     /// MEASUREMENT: block on the GPU at the end of every frame, as the
     /// renderer used to. Its wait is then exactly the GPU's time, which is
     /// what the A/B schedule attributes costs with; shipped, the CPU prepares
@@ -143,6 +147,7 @@ impl Default for Levers {
             terrain_probe_pass: true,
             ground_trace: true,
             foveation: crate::renderer::foveation::SHIPPED,
+            space_warp: false,
             gpu_sync: false,
             ssr: None,
             multiview: None,
@@ -223,6 +228,7 @@ impl Levers {
         flag("deferred_lookups", self.deferred_reflection_lookups, d.deferred_reflection_lookups);
         flag("terrain_probe_pass", self.terrain_probe_pass, d.terrain_probe_pass);
         flag("ground_trace", self.ground_trace, d.ground_trace);
+        flag("space_warp", self.space_warp, d.space_warp);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
