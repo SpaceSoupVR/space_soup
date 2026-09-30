@@ -2343,6 +2343,18 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         + face_b * clamp(dot(face_d, face_b), -in.face_half_extent.y, in.face_half_extent.y);
     probe_volume_pos = vec4<f32>(in.face_centre, 1.0);
     probe_face_given = in.probe_face;
+    // NOTHING TO TRACE WHERE THE SCENE WILL NOT USE IT. From this roughness up
+    // the scene shader's reflection is the lightmap's own light alone -- the
+    // probe's answer is multiplied by `1 - lobe_is_hemispherical`, exactly 0
+    // (see `shade_material_env_part`) -- so the trace, the most expensive thing
+    // in the frame, was spent on rough brick and rock to be thrown away: 5.5 ms
+    // of brick_hall_diagonal's 16.1 (headset A/B, 2026-09-30). Decided on the
+    // roughness the scene shader uses (not the widened one this pass blurs
+    // by), after every implicit-derivative sample above; nothing is recorded
+    // for the fix-up, and coverage 0 reads as the lightmap's light.
+    if (clamp(rough, 0.04, 1.0) >= PROBE_LOBE_HEMISPHERICAL) {
+        return ProbePassOut(vec4<f32>(0.0), 0.0);
+    }
     let reflection = probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);
     return ProbePassOut(reflection, probe_reach);"#;
 

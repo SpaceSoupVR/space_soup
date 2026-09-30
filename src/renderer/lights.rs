@@ -1265,6 +1265,11 @@ var<private> probe_brightness: f32 = 0.0;
 // image with the point it is an image of rather than with the surface showing
 // it. See `space_warp::reflected_point`.
 var<private> probe_reach: f32 = 0.0;
+// THE ROUGHNESS FROM WHICH A SURFACE'S REFLECTION IS THE LIGHTMAP'S LIGHT
+// ALONE: its lobe is the whole hemisphere the diffuse term already integrates,
+// so the probe's sharper answer takes no share (`lobe_is_hemispherical` in
+// `shade_material_env_part`), and the probe pass does not trace it.
+const PROBE_LOBE_HEMISPHERICAL: f32 = 0.75;
 // The reach of a reflection that met only sky: far enough that its image moves
 // as the sky does, within a half float.
 const PROBE_REACH_SKY: f32 = 10000.0;
@@ -4422,7 +4427,7 @@ fn shade_material_env_part(
     // Marble here is 0.048 and takes the sharp answer; brick is near 1 and
     // falls back to the baseline, because at that roughness the probe's extra
     // directional detail is not information, it is the artefact.
-    let lobe_is_hemispherical = smoothstep(0.25, 0.75, r);
+    let lobe_is_hemispherical = smoothstep(0.25, PROBE_LOBE_HEMISPHERICAL, r);
     let environment = mix(sharp, baseline, lobe_is_hemispherical);
     // Recorded for the source diagnostic. See `BRUSH_SOURCE_DEBUG`. Set here
     // rather than straight off the probe sample, so the diagnostic shows what
