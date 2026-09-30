@@ -687,6 +687,19 @@ pub struct LightsBlockOptions {
     pub cull_range_first: bool,
 }
 
+/// HOW MANY OF THE PROBE PASS'S OWN PIXELS A REFLECTED EDGE IS SOFTENED
+/// OVER, on each side: a doorway's rim, a solid proxy's outline, a model's
+/// (`probe_pixel_spread` in the lights block).
+///
+/// The pass runs at half resolution and the scene reads it back bilinearly,
+/// and a bilinear read shows an edge's position snapped to the texel grid
+/// unless the edge is at least two texels wide. At one footprint a side, the
+/// reflected doorway's edge moved 0.45 px (RMS) off its line in the headset's
+/// view -- the staircase that crawls as the head moves, worst at middle and
+/// far distance where a texel covers the most (headset 22:04:15, measured
+/// offline with the edge's per-row crossing, 2026-09-29).
+pub const PROBE_EDGE_FOOTPRINTS: f32 = 1.0;
+
 /// `wgsl_lights_block`, with `options`. See `LightsBlockOptions`.
 pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: LightsBlockOptions) -> String {
     let LightsBlockOptions { probe_from_pass, probe_face_always, defer_secondary, cull_range_first } = options;
@@ -708,6 +721,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let capsule_group_rows = crate::renderer::uniforms::MAX_CAPSULE_GROUPS * 2;
     let capsules_per_group = crate::renderer::uniforms::CAPSULES_PER_GROUP;
     let reflection_contrast = format!("{:?}", crate::renderer::space_warp::REFLECTION_CONTRAST_RATIO);
+    let probe_edge_footprints = PROBE_EDGE_FOOTPRINTS;
     // Three vec4 per probe -- centre, min, max -- so the WGSL array length is
     // three times the probe count. Derived rather than written twice: a shader
     // array shorter than the uniform reads garbage past its end.
@@ -1973,6 +1987,59 @@ fn probe_choose_in_room(room: f32, select_world: vec3<f32>) -> ProbeChoice {{
     return c;
 }}
 
+// THE FAR END OF A DOORWAY'S OPENING, for the part of a reflection's lobe that
+// entered it: `through` is what that part shows as far as it went -- out the
+// far end, or the opening's side it met first -- and this blends in the other.
+//
+// A ray passing a doorway's corner has TWO rims within its footprint: the
+// wall's front edge (the wall, or into the opening) and, a wall's depth on,
+// its back edge (the jamb's inside face, or out to the sky). Only the first
+// was ever blended, so which way the second went decided a whole texel: a
+// dark jamb beside the bright sky, a staircase down the reflected doorway
+// that crawled as the head moved (headset 22:04:15, 2026-09-29). Across a
+// jamb the lobe falls three ways -- the wall (1 - near), the jamb's face
+// (near - far) and through (far) -- so inside the opening the far end's share
+// is far / near.
+fn probe_through_far_end(hit: ProbeHit, d: vec3<f32>, through: vec4<f32>, roughness: f32, dir: vec3<f32>, probe_lod: f32) -> vec4<f32> {{
+    let p = (hit.rim_code >> 3u) & 31;
+    let axis = (hit.rim_code >> 1u) & 3;
+    // Parallel to the wall, the ray never reaches its far face.
+    if (abs(d[axis]) < 1e-4) {{
+        return through;
+    }}
+    let plo = camera.probe_portals[p * 3].xyz;
+    let phi = camera.probe_portals[p * 3 + 1].xyz;
+    let wall_far = select(camera.probe_portals[p * 3 + 2].y, camera.probe_portals[p * 3 + 2].z, d[axis] > 0.0);
+    let e = hit.origin + d * hit.rim_t;
+    let t2 = max((wall_far - e[axis]) / d[axis], 0.0);
+    let e2 = e + d * t2;
+    let a = (axis + 1) % 3;
+    let b = (axis + 2) % 3;
+    let in_a = min(e2[a] - plo[a], phi[a] - e2[a]);
+    let in_b = min(e2[b] - plo[b], phi[b] - e2[b]);
+    let t = hit.rim_t + t2;
+    let spread = max(t * probe_lobe_tan(roughness), probe_pixel_spread(t));
+    if (abs(min(in_a, in_b)) >= spread) {{
+        return through;
+    }}
+    let far = smoothstep(-spread, spread, in_a) * smoothstep(-spread, spread, in_b);
+    let share = clamp(far / max(hit.rim, 1e-3), 0.0, 1.0);
+    // This line out the far end: the other part met the side just before it,
+    // a step back inside the wall where the room's photographs saw it. Else
+    // this line met the side: the other part goes out, traced from there.
+    let out = min(in_a, in_b) > 0.0;
+    var other = probe_point_hit(probe_rim_point_far(e2, p, axis, false), probe_hit_rim_room(hit), t);
+    if (!out) {{
+        other = probe_trace(probe_rim_point_far(e2, p, axis, true), d, -1.0, roughness);
+        other.t = t + other.t;
+    }}
+    if (!other.found) {{
+        return through;
+    }}
+    let y = probe_traced_colour(other, d, roughness, dir, probe_lod);
+    return select(mix(through, y, share), mix(y, through, share), out);
+}}
+
 // A TRACED HIT'S SECONDARY LOOKUPS, from its colour `primary`: across a
 // doorway's rim, and across a solid proxy's outline, each a colour at a point
 // already known or a second trace. Made in `probe_environment`, or, where the
@@ -2006,11 +2073,17 @@ fn probe_secondary(
         }}
         if (side.found) {{
             let x = probe_traced_colour(side, d, roughness, dir, probe_lod);
-            if (went_through) {{
-                col = mix(x, col, hit.rim);
-            }} else {{
-                col = mix(col, x, hit.rim);
+            // What passed into the opening, and what met the wall beside it:
+            // one is this hit, the other the lookup.
+            var through = select(x, col, went_through);
+            let beside = select(col, x, went_through);
+            // A NEAR rim's opening also has a far end, where the part of the
+            // lobe inside it either leaves or meets the opening's side. See
+            // `probe_through_far_end`.
+            if ((hit.rim_code & PROBE_RIM_FAR) == 0) {{
+                through = probe_through_far_end(hit, d, through, roughness, dir, probe_lod);
             }}
+            col = mix(beside, through, hit.rim);
         }}
     }}
     // ACROSS A SOLID PROXY'S OUTLINE, the footprint's two parts: the
@@ -2350,6 +2423,18 @@ fn probe_lobe_tan(roughness: f32) -> f32 {{
 // The narrowest lobe, in metres where it meets a wall, worth softening a
 // doorway's rim for: a centimetre is under a pixel wherever it is seen.
 const PROBE_RIM_MIN_SPREAD: f32 = 0.01;
+
+// HOW MANY OF THE PASS'S OWN PIXELS A REFLECTED EDGE IS SOFTENED OVER, each
+// side of it: a doorway's rim, a solid proxy's outline, a model's. See
+// `PROBE_EDGE_FOOTPRINTS` on the Rust side.
+const PROBE_EDGE_FOOTPRINTS: f32 = {probe_edge_footprints:?};
+
+// The half-width, in metres at `t` along a reflected ray, that an edge met
+// there is softened over: `PROBE_EDGE_FOOTPRINTS` of this pixel's footprint,
+// widened as the pixel's cone is by the path from the eye.
+fn probe_pixel_spread(t: f32) -> f32 {{
+    return PROBE_EDGE_FOOTPRINTS * pixel_footprint * (1.0 + t / max(probe_eye_distance, 0.05));
+}}
 // How far past a rim the other side is looked up from, so the lookup lands
 // clearly on that side: inside the opening, or on the wall beside it.
 const PROBE_RIM_STEP: f32 = 0.02;
@@ -2602,7 +2687,7 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip
             let across = select(da * db / max(sqrt(da * da + db * db), 1e-6), 1.0, ax_in == ax_out);
             let inside = (far - near) * across;
             let t_edge = max(0.5 * (near + far), t0);
-            let footprint = max(t_edge * lobe, pixel_footprint * (1.0 + t_edge / max(probe_eye_distance, 0.05)));
+            let footprint = max(t_edge * lobe, probe_pixel_spread(t_edge));
             if (abs(inside) < footprint && t_edge > t0 && t_edge < t1 && far > t0 + 1e-3) {{
                 out.edge = i;
                 out.edge_cover = smoothstep(-footprint, footprint, inside);
@@ -2739,7 +2824,7 @@ fn probe_proxy_field(lo: vec3<f32>, ld: vec3<f32>, half: vec3<f32>, t_in: f32, t
         // past that the field says only "at least this far", and a wider fade
         // ran out at the model's box -- a box-shaped shadow of every lamp in the
         // rough ceiling above it (offline, 2026-09-29).
-        let footprint = min(max(t * lobe, pixel_footprint * (1.0 + t / max(probe_eye_distance, 0.05))), 4.0 * size.w);
+        let footprint = min(max(t * lobe, probe_pixel_spread(t)), 4.0 * size.w);
         let r = (dist - size.w) / max(footprint, 1e-5);
         if (r < near) {{
             near = r;
@@ -2998,7 +3083,7 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
         // all or nothing, and the front door's lintel came out of the floor's
         // reflection as a staircase that crawled as the head moved (headset,
         // 2026-09-29).
-        let spread = max(t_exit * lobe, pixel_footprint * (1.0 + t_exit / max(probe_eye_distance, 0.05)));
+        let spread = max(t_exit * lobe, probe_pixel_spread(t_exit));
         if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {{
             let rim = probe_rim_at(e, cur, axis, spread);
             if (rim.portal >= 0) {{
@@ -3053,7 +3138,7 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
         // reflection as a staircase (headset, 2026-09-29). Softened over the
         // footprint as the near rim is. See `probe_rim_point_far`.
         if (hit.rim < 0.0) {{
-            let spread_far = max(t_enter * lobe, pixel_footprint * (1.0 + t_enter / max(probe_eye_distance, 0.05)));
+            let spread_far = max(t_enter * lobe, probe_pixel_spread(t_enter));
             let e2 = hit.origin + d * t_enter;
             let a = (axis + 1) % 3;
             let b = (axis + 2) % 3;
@@ -3355,30 +3440,64 @@ fn probe_view_trust(d: vec3<f32>, c: vec3<f32>, h: vec3<f32>) -> f32 {{
     return smoothstep(0.5, 0.9, dot(d, normalize(h - c)));
 }}
 
+// WHICH WAY A MODEL'S SURFACE FACES at box-frame point `lo`, from its distance
+// field (`field`): the field's gradient, four samples on a tetrahedron half a
+// sample apart. The field is unsigned, so near the surface the gradient points
+// away from it on whichever side `lo` lies -- the side the ray came from.
+fn probe_field_gradient(lo: vec3<f32>, half: vec3<f32>, field: i32) -> vec3<f32> {{
+    let slot = camera.proxy_fields[field * 3];
+    let size = camera.proxy_fields[field * 3 + 1];
+    let scale = size.xyz * (0.5 / max(half, vec3<f32>(1e-4)));
+    let base = slot.xyz + 0.5 * size.xyz;
+    let texel = 0.5 / vec3<f32>(textureDimensions(proxy_field));
+    let lo_uvw = slot.xyz + texel;
+    let hi_uvw = slot.xyz + size.xyz - texel;
+    let e = max(size.w, 1e-3);
+    let k0 = vec3<f32>(1.0, -1.0, -1.0);
+    let k1 = vec3<f32>(-1.0, -1.0, 1.0);
+    let k2 = vec3<f32>(-1.0, 1.0, -1.0);
+    let k3 = vec3<f32>(1.0, 1.0, 1.0);
+    let f0 = textureSampleLevel(proxy_field, probe_samp, clamp(base + (lo + k0 * e) * scale, lo_uvw, hi_uvw), 0.0).r;
+    let f1 = textureSampleLevel(proxy_field, probe_samp, clamp(base + (lo + k1 * e) * scale, lo_uvw, hi_uvw), 0.0).r;
+    let f2 = textureSampleLevel(proxy_field, probe_samp, clamp(base + (lo + k2 * e) * scale, lo_uvw, hi_uvw), 0.0).r;
+    let f3 = textureSampleLevel(proxy_field, probe_samp, clamp(base + (lo + k3 * e) * scale, lo_uvw, hi_uvw), 0.0).r;
+    return k0 * f0 + k1 * f1 + k2 * f2 + k3 * f3;
+}}
+
 // ONE CARD'S SAY about the box-frame point it shows at `uv`, `t` of the way
-// into the box along its axis: its colour times its weight, and the weight --
-// how squarely the ray meets the card (`facing`) times whether the card's
+// into the box along its axis, read at mip `lod`: its colour times its weight,
+// and the weight --
+// how squarely the surface faces the card (`facing`) times whether the card's
 // surface there IS the hit rather than something in front of or behind it
 // (within `tol` metres, `depth` the box's depth along the card's axis). Read
 // half a texel inside the card, so the filter never reaches the next one.
-fn probe_card_vote(row: f32, face: f32, uv: vec2<f32>, t: f32, depth: f32, tol: f32, facing: f32) -> vec4<f32> {{
+fn probe_card_vote(row: f32, face: f32, uv: vec2<f32>, t: f32, depth: f32, tol: f32, facing: f32, lod: f32) -> vec4<f32> {{
     let dims = vec2<f32>(textureDimensions(proxy_cards));
     let res = dims.x / 6.0;
-    let texel = clamp(uv * res, vec2<f32>(0.5), vec2<f32>(res - 0.5));
-    let card = textureSampleLevel(proxy_cards, probe_samp, (vec2<f32>(face * res, row * res) + texel) / dims, 0.0);
+    let s = exp2(lod);
+    let texel = clamp(uv * res, vec2<f32>(0.5 * s), vec2<f32>(res - 0.5 * s));
+    let card = textureSampleLevel(proxy_cards, probe_samp, (vec2<f32>(face * res, row * res) + texel) / dims, lod);
     let gap = abs(card.w - t) * depth;
     let w = facing * (1.0 - smoothstep(tol, 2.0 * tol, gap));
     return vec4<f32>(card.rgb * w, w);
 }}
 
 // A MODEL'S OWN LOOK WHERE A REFLECTION MEETS IT, at world `h` along world
-// `d`: its cards (`proxy_cards`), the three on the faces the ray comes in
-// through, each weighed by how squarely the ray meets it and trusted only
-// where its surface is the hit itself -- within three of its texels, and 5 mm
-// for the distance field's stop short of the surface. The room photographs no
-// longer hold the model, so they cannot colour it. `w` is 0 where the proxy
-// has no cards, or no card saw the hit.
-fn probe_card_colour(proxy: i32, h: vec3<f32>, d: vec3<f32>) -> vec4<f32> {{
+// `d`: its cards (`proxy_cards`), the three on the faces the SURFACE faces --
+// its normal from the model's field (`probe_field_gradient`) -- each weighed by
+// how squarely the surface faces it and trusted only where its surface is the
+// hit itself: within three of its texels, and 5 mm for the field's stop short
+// of the surface. The room photographs no longer hold the model, so they cannot
+// colour it. `w` is 0 where the proxy has no cards, or no card saw the hit.
+//
+// BY THE NORMAL, NOT THE RAY. A lampshade is a shell millimetres thick, lit
+// inside by its bulb and dark outside, and a depth test cannot tell its two
+// faces apart. Chosen by the ray, a reflection looking up at a wall sconce's
+// shade weighed in the card looking up into it -- the glowing inside, 60 times
+// brighter than the outside -- and every sconce reflected as a white blob while
+// the sconce on the wall stood dark (headset, 2026-09-29). Lumen chooses its
+// cards the same way.
+fn probe_card_colour(proxy: i32, h: vec3<f32>, d: vec3<f32>, t_hit: f32, lobe: f32) -> vec4<f32> {{
     let row = camera.proxy_cards[proxy >> 2u][proxy & 3] - 1.0;
     if (row < 0.0) {{
         return vec4<f32>(0.0);
@@ -3391,27 +3510,44 @@ fn probe_card_colour(proxy: i32, h: vec3<f32>, d: vec3<f32>) -> vec4<f32> {{
         lo = probe_quat_rotate(qi, lo);
         ld = probe_quat_rotate(qi, ld);
     }}
-    let half = max(camera.probe_proxies[proxy * 3 + 1].xyz, vec3<f32>(1e-4));
+    let box = camera.probe_proxies[proxy * 3 + 1];
+    let half = max(box.xyz, vec3<f32>(1e-4));
+    // The surface facing the ray where the field cannot say.
+    var n = -ld;
+    if (box.w > 1.5) {{
+        let g = probe_field_gradient(lo, half, i32(box.w) - 2);
+        if (dot(g, g) > 1e-12) {{
+            n = normalize(g) * select(1.0, -1.0, dot(g, ld) > 0.0);
+        }}
+    }}
     let res = f32(textureDimensions(proxy_cards).x) / 6.0;
-    // Card 2a looks in through the +a face, 2a + 1 through the -a face: the
-    // one a ray heading -a comes in through is the +a card. Axis a's card
-    // runs u along a + 1 and v along a + 2. See
-    // `space_soup_engine::reflection_cards`.
-    let sx = select(1.0, -1.0, ld.x < 0.0);
-    let sy = select(1.0, -1.0, ld.y < 0.0);
-    let sz = select(1.0, -1.0, ld.z < 0.0);
-    let n = lo / (2.0 * half) + 0.5;
+    // READ AT THE FOOTPRINT: what one texel of this reflection covers where it
+    // meets the model -- the pixel's cone, or the lobe on a rough surface --
+    // in card texels. A sconce's glowing mouth, far off, is a fraction of a
+    // pixel; read at full size it lit whole half-resolution texels, on or off
+    // as the head moved (headset, 2026-09-29).
+    let texel_m = 2.0 * max(max(half.x, half.y), half.z) / res;
+    let footprint = max(t_hit * lobe, pixel_footprint * (1.0 + t_hit / max(probe_eye_distance, 0.05)));
+    let lod = clamp(log2(max(footprint / texel_m, 1.0)), 0.0, log2(res));
+    let s = exp2(lod);
+    // Card 2a looks in through the +a face and shows the surfaces facing +a;
+    // 2a + 1 the -a face and those facing -a. Axis a's card runs u along
+    // a + 1 and v along a + 2. See `space_soup_engine::reflection_cards`.
+    let sx = select(1.0, -1.0, n.x > 0.0);
+    let sy = select(1.0, -1.0, n.y > 0.0);
+    let sz = select(1.0, -1.0, n.z > 0.0);
+    let uvw = lo / (2.0 * half) + 0.5;
     var sum = probe_card_vote(
-        row, select(1.0, 0.0, ld.x < 0.0), n.yz, 0.5 * (1.0 + sx * lo.x / half.x), 2.0 * half.x,
-        3.0 * 2.0 * max(half.y, half.z) / res + 0.005, ld.x * ld.x
+        row, select(1.0, 0.0, n.x > 0.0), uvw.yz, 0.5 * (1.0 + sx * lo.x / half.x), 2.0 * half.x,
+        3.0 * s * 2.0 * max(half.y, half.z) / res + 0.005, n.x * n.x, lod
     );
     sum += probe_card_vote(
-        row, select(3.0, 2.0, ld.y < 0.0), n.zx, 0.5 * (1.0 + sy * lo.y / half.y), 2.0 * half.y,
-        3.0 * 2.0 * max(half.z, half.x) / res + 0.005, ld.y * ld.y
+        row, select(3.0, 2.0, n.y > 0.0), uvw.zx, 0.5 * (1.0 + sy * lo.y / half.y), 2.0 * half.y,
+        3.0 * s * 2.0 * max(half.z, half.x) / res + 0.005, n.y * n.y, lod
     );
     sum += probe_card_vote(
-        row, select(5.0, 4.0, ld.z < 0.0), n.xy, 0.5 * (1.0 + sz * lo.z / half.z), 2.0 * half.z,
-        3.0 * 2.0 * max(half.x, half.y) / res + 0.005, ld.z * ld.z
+        row, select(5.0, 4.0, n.z > 0.0), uvw.xy, 0.5 * (1.0 + sz * lo.z / half.z), 2.0 * half.z,
+        3.0 * s * 2.0 * max(half.x, half.y) / res + 0.005, n.z * n.z, lod
     );
     return select(vec4<f32>(0.0), vec4<f32>(sum.rgb / max(sum.w, 1e-6), 1.0), sum.w > 1e-3);
 }}
@@ -3514,7 +3650,7 @@ fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32,
     // model without cards -- an older bake, or one past the level's shaped
     // models (`space_soup_engine::reflection_proxy::shaped_models`).
     if (model) {{
-        let card = probe_card_colour(i32(-2.0 - other), h, d);
+        let card = probe_card_colour(i32(-2.0 - other), h, d, t, probe_lobe_tan(roughness));
         col = select(col, card, card.w > 0.5);
     }}
     return col;
@@ -5889,6 +6025,15 @@ mod probe_trace_gpu_tests {
 
     /// Trace each `(origin, room, dir, roughness)` through `probe_trace`.
     fn trace(rays: &[(Vec3, f32, Vec3, f32)]) -> Option<Vec<Hit>> {
+        trace_seen_from(rays, 0.0, 1.0)
+    }
+
+    /// `trace`, as a pixel `footprint` metres across on the reflecting
+    /// surface, `eye` metres from the eye, would trace it -- what the probe
+    /// pass's fragment stage sets before tracing (`pixel_footprint`,
+    /// `probe_eye_distance`); a compute shader has no derivatives, so the
+    /// other tests trace as a point.
+    fn trace_seen_from(rays: &[(Vec3, f32, Vec3, f32)], footprint: f32, eye: f32) -> Option<Vec<Hit>> {
         let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
         let mut probes = ProbeUpload::default();
         probes.count = 4;
@@ -5958,6 +6103,8 @@ mod probe_trace_gpu_tests {
 @group(1) @binding(1) var<storage, read_write> hits: array<vec4<f32>>;
 @compute @workgroup_size(1)
 fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    pixel_footprint = PIXEL_FOOTPRINT;
+    probe_eye_distance = EYE_DISTANCE;
     let o = rays[id.x * 2u];
     let d = rays[id.x * 2u + 1u];
     let h = probe_trace(o.xyz, normalize(d.xyz), o.w, d.w);
@@ -5968,6 +6115,9 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#
         );
+        let code = code
+            .replace("PIXEL_FOOTPRINT", &format!("{footprint:?}"))
+            .replace("EYE_DISTANCE", &format!("{eye:?}"));
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("probe_trace_test"),
             source: wgpu::ShaderSource::Wgsl(code.into()),
@@ -6171,6 +6321,47 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
         assert!(h[1].room == 1.0, "inside the door the ray goes on into the hallway: room {}", h[1].room);
         assert!(h[2].rim < 0.0, "marble softened a doorway's rim: {}", h[2].rim);
         assert!(h[3].rim < 0.0, "a plain wall has no rim: {}", h[3].rim);
+    }
+
+    /// A MIRROR'S REFLECTION OF A DOORWAY'S RIM, AS THE PROBE PASS TRACES IT:
+    /// from the floor on the left of the hall toward the front door's left
+    /// jamb (the headset's 22:04:15 staircase), with the half-resolution
+    /// pixel's footprint there. Across the jamb the share that passes through
+    /// must rise smoothly -- never jump from nothing to all of it between two
+    /// neighbouring rays.
+    #[test]
+    fn a_mirrors_doorway_rim_blends_across_a_pixel() {
+        let floor = Vec3::new(-1.1, 0.0, 1.0);
+        let rays: Vec<(Vec3, f32, Vec3, f32)> = (0..21)
+            .map(|k| {
+                let x = -0.90 + 0.01 * k as f32;
+                (floor, 0.0, toward(floor, Vec3::new(x, 0.5, 3.7)), 0.048)
+            })
+            .collect();
+        let Some(h) = trace_seen_from(&rays, 0.036, 8.4) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let through: Vec<f32> = h
+            .iter()
+            .map(|h| match (h.rim >= 0.0, h.rim_went_through, h.escaped) {
+                // A rim: the share of the footprint that went through.
+                (true, _, _) => h.rim,
+                // No rim: all or nothing, by where the one ray went.
+                (false, _, true) => 1.0,
+                (false, _, false) => 0.0,
+            })
+            .collect();
+        for (k, (t, h)) in through.iter().zip(&h).enumerate() {
+            eprintln!(
+                "x {:+.2}: through {:.2} (rim {:.2} went {} escaped {} room {} at {:?})",
+                -0.90 + 0.01 * k as f32, t, h.rim, h.rim_went_through, h.escaped, h.room, h.pos
+            );
+        }
+        for w in through.windows(2) {
+            assert!(w[1] + 1e-3 >= w[0] && w[1] - w[0] < 0.5, "the share through jumps between neighbours: {through:?}");
+        }
+        assert!(through[0] < 0.05 && through[20] > 0.95, "{through:?}");
     }
 
     /// THE PILLAR'S OUTLINE IN A REFLECTION IS BLENDED, NOT STEPPED.
@@ -6493,52 +6684,87 @@ fn walk_main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
-/// A MODEL'S CARDS, READ ON THE GPU: the real WGSL `probe_card_colour` against
-/// a small atlas whose cards each have their own colour, from a compute
-/// shader. See `proxy_cards` and `space_soup_engine::reflection_cards`.
+/// A MODEL'S CARDS, READ ON THE GPU: the real WGSL `probe_card_colour` over a
+/// sphere -- a real distance field, and six cards baked from it the way
+/// `tools/bake` bakes them, each card its own colour -- from a compute shader.
+/// See `proxy_cards` and `space_soup_engine::reflection_cards`.
 #[cfg(test)]
 mod proxy_card_gpu_tests {
     use super::*;
     use crate::renderer::proxy_cards::{self, ProxyCards};
+    use crate::renderer::proxy_field::{self, ProxyField};
     use crate::renderer::uniforms::{ProbeProxy, ProbeUpload, Uniforms};
     use glam::{Quat, Vec3};
     use wgpu::util::DeviceExt;
 
     const RES: u32 = 32;
     const CENTRE: Vec3 = Vec3::new(1.0, 2.0, 3.0);
-    const HALF: Vec3 = Vec3::new(0.2, 0.3, 0.4);
-    /// Every card sees its surface a quarter of the way in.
-    const DEPTH: f32 = 0.25;
+    const HALF: f32 = 0.3;
 
-    /// Card k is coloured (k + 1, 0, 0) -- except card 0, the +x one, whose
-    /// colour is its own (u, v), to pin which way the card runs.
+    thread_local! {
+        /// The pixel footprint and hit distance the next `colours_of` reads at.
+        static FOOTPRINT: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+        static HIT_T: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    }
+    const RADIUS: f32 = 0.2;
+    const SAMPLES: u32 = 24;
+
+    /// The sphere's unsigned distance over its box, reaching four samples.
+    fn field() -> ProxyField {
+        let cell = 2.0 * HALF / SAMPLES as f32;
+        let reach = 4.0 * cell;
+        let mut distances = Vec::new();
+        for k in 0..SAMPLES {
+            for j in 0..SAMPLES {
+                for i in 0..SAMPLES {
+                    let p = (Vec3::new(i as f32, j as f32, k as f32) + 0.5) * cell - HALF;
+                    distances.push((((p.length() - RADIUS).abs() / reach).min(1.0) * 255.0).round() as u8);
+                }
+            }
+        }
+        ProxyField { dims: [SAMPLES; 3], max_distance: reach, distances, albedo: [0.2; 3] }
+    }
+
+    /// The sphere's six cards, card k coloured (k + 1, 0, 0): each texel's
+    /// depth the sphere's surface along the card's axis, or nothing.
     fn cards() -> ProxyCards {
         let mut texels = Vec::new();
-        for face in 0..6 {
+        for _face in 0..6 {
             for y in 0..RES {
                 for x in 0..RES {
                     let (u, v) = ((x as f32 + 0.5) / RES as f32, (y as f32 + 0.5) / RES as f32);
-                    let rgb = if face == 0 { [u, v, 0.0] } else { [face as f32 + 1.0, 0.0, 0.0] };
-                    texels.push([rgb[0], rgb[1], rgb[2], DEPTH]);
+                    let r2 = ((2.0 * u - 1.0) * HALF).powi(2) + ((2.0 * v - 1.0) * HALF).powi(2);
+                    let t = if r2 < RADIUS * RADIUS { (HALF - (RADIUS * RADIUS - r2).sqrt()) / (2.0 * HALF) } else { 2.0 };
+                    texels.push([0.0, 0.0, 0.0, t]);
                 }
             }
+        }
+        for (i, t) in texels.iter_mut().enumerate() {
+            t[0] = (i as u32 / (RES * RES) + 1) as f32;
         }
         ProxyCards { resolution: RES, texels }
     }
 
-    /// `probe_card_colour` for each world `(hit, direction)` against one proxy
-    /// with the given rotation; `with_cards` false leaves it without.
+    /// `probe_card_colour` for each world `(hit, direction)` against the sphere
+    /// turned by `rotation`; `with_cards` false leaves it without.
     fn colours(rotation: Quat, with_cards: bool, rays: &[(Vec3, Vec3)]) -> Option<Vec<[f32; 4]>> {
+        colours_of(field(), cards(), rotation, with_cards, rays)
+    }
+
+    fn colours_of(field: ProxyField, cards: ProxyCards, rotation: Quat, with_cards: bool, rays: &[(Vec3, Vec3)]) -> Option<Vec<[f32; 4]>> {
         let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
-        let (atlas, rows) = proxy_cards::atlas(&device, &queue, &[cards()])?;
+        let (card_atlas, rows) = proxy_cards::atlas(&device, &queue, &[cards])?;
         assert_eq!(rows, vec![Some(0)]);
+        let (field_atlas, slots) = proxy_field::atlas(&device, &queue, &[field])?;
         let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
         let mut probes = ProbeUpload::default();
-        let proxy = ProbeProxy { centre: CENTRE, half_size: HALF, rotation, volume: 0, solid: false, field: Some(0), cards: with_cards.then_some(0) };
+        let half = Vec3::splat(HALF);
+        let proxy = ProbeProxy { centre: CENTRE, half_size: half, rotation, volume: 0, solid: false, field: Some(0), cards: with_cards.then_some(0) };
         probes.set_proxies(&[proxy], Vec3::ZERO, &[0]);
         let mut u: Uniforms = bytemuck::Zeroable::zeroed();
         u.probe_proxies = probes.proxies;
         u.proxy_cards = probes.proxy_cards;
+        u.proxy_fields[0] = slots[0];
         let code = format!(
             "{}\n{}",
             wgsl_lights_block(0, 1),
@@ -6547,7 +6773,9 @@ mod proxy_card_gpu_tests {
 @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
 @compute @workgroup_size(1)
 fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
-    out[id.x] = probe_card_colour(0, rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz));
+    pixel_footprint = rays[id.x * 2u].w;
+    probe_eye_distance = 1.0;
+    out[id.x] = probe_card_colour(0, rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz), rays[id.x * 2u + 1u].w, 0.0);
 }
 "#
         );
@@ -6565,7 +6793,9 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
             contents: bytemuck::bytes_of(&u),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let packed: Vec<[f32; 4]> = rays.iter().flat_map(|(h, d)| [[h.x, h.y, h.z, 0.0], [d.x, d.y, d.z, 0.0]]).collect();
+        // w: the pixel's footprint on the reflecting surface, and the hit's
+        // distance along the ray -- 0 and 0 read the cards at full size.
+        let packed: Vec<[f32; 4]> = rays.iter().flat_map(|(h, d)| [[h.x, h.y, h.z, FOOTPRINT.with(|f| f.get())], [d.x, d.y, d.z, HIT_T.with(|f| f.get())]]).collect();
         let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&packed),
@@ -6590,7 +6820,8 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&samp) },
-                wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&atlas) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&field_atlas) },
+                wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&card_atlas) },
             ],
         });
         let g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -6617,59 +6848,131 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
         Some(data)
     }
 
-    fn near(a: [f32; 4], b: [f32; 4], tol: f32) -> bool {
-        (0..4).all(|k| (a[k] - b[k]).abs() < tol)
+    /// Where a ray meets the sphere facing `n`: the field walk stops a hair
+    /// short of the surface, on the ray's side.
+    fn on_sphere(n: Vec3) -> Vec3 {
+        CENTRE + n.normalize() * (RADIUS + 0.003)
     }
 
-    /// The card a ray comes in through colours the hit, read where it shows
-    /// that point; a ray meeting two faces as squarely takes both; a hit
-    /// deeper than the card's surface is something the card did not see.
+    /// The card the SURFACE faces colours it, whichever way the ray came: a
+    /// ray climbing to the sphere's side takes nothing from the card looking
+    /// up at its underside -- the wall sconce's glowing inside, which turned
+    /// every sconce's reflection white (headset, 2026-09-29).
     #[test]
-    fn the_card_facing_the_ray_colours_the_hit_where_it_shows_it() {
-        // A quarter of the way in from the +x face, at (u, v) = (0.7, 0.25).
-        let on_x = CENTRE + Vec3::new(HALF.x * (1.0 - 2.0 * DEPTH), 0.12, -0.2);
-        // A quarter in from both the +x and the +y face.
-        let on_xy = CENTRE + Vec3::new(HALF.x * 0.5, HALF.y * 0.5, 0.0);
-        // Three quarters in from +x: the +x card's surface is in front of it.
-        let behind = CENTRE + Vec3::new(-HALF.x * 0.5, 0.0, 0.0);
+    fn the_card_the_surface_faces_colours_it_whatever_the_ray() {
         let Some(c) = colours(
             Quat::IDENTITY,
             true,
             &[
-                (on_x, -Vec3::X),
-                (on_xy, Vec3::new(-1.0, -1.0, 0.0)),
-                (behind, -Vec3::X),
-                (CENTRE + Vec3::new(0.0, 0.0, -HALF.z * 0.5), Vec3::Z),
+                (on_sphere(Vec3::X), -Vec3::X),
+                (on_sphere(Vec3::X), Vec3::new(-0.3, 0.95, 0.0)),
+                (on_sphere(Vec3::new(1.0, 1.0, 0.0)), Vec3::new(-1.0, -1.0, 0.0)),
+                (on_sphere(-Vec3::Z), Vec3::Z),
             ],
         ) else {
             eprintln!("no GPU adapter; skipping");
             return;
         };
-        assert!(near(c[0], [0.7, 0.25, 0.0, 1.0], 0.02), "the +x card at (0.7, 0.25): {:?}", c[0]);
-        // The +x card shows (u, v) = (0.75, 0.5) there, the +y card 3.
-        let blend = (c[1][0] - 0.5 * (0.75 + 3.0)).abs();
-        assert!(c[1][3] == 1.0 && blend < 0.05, "half the +x card (0.75) and half the +y card (3): {:?}", c[1]);
-        assert_eq!(c[2][3], 0.0, "no card saw a surface there: {:?}", c[2]);
-        assert!(near(c[3], [6.0, 0.0, 0.0, 1.0], 1e-3), "a ray heading +z comes in through the -z card (5): {:?}", c[3]);
+        assert!((c[0][0] - 1.0).abs() < 0.05 && c[0][3] == 1.0, "facing +x, from +x: the +x card (1): {:?}", c[0]);
+        assert!((c[1][0] - 1.0).abs() < 0.05, "facing +x, from below: still the +x card (1), not the one looking up (4): {:?}", c[1]);
+        assert!((c[2][0] - 2.0).abs() < 0.25, "facing +x+y: the +x (1) and +y (3) cards alike: {:?}", c[2]);
+        assert!((c[3][0] - 6.0).abs() < 0.05, "facing -z: the -z card (6): {:?}", c[3]);
     }
 
-    /// The box's own frame: a box turned a quarter about y shows a ray heading
-    /// world +z its +x card.
+    /// A SHELL'S TWO FACES, millimetres apart and at one depth from every card:
+    /// a thin plate through the box's centre, tilted 45 degrees (normal +x+y),
+    /// its upper face met by a ray CLIMBING toward it. The card looking up sees
+    /// the plate's underside right there -- a lampshade's lit inside -- and
+    /// only the normal says the hit is not on it: the upper face is the +x and
+    /// +y cards' (1 and 3), never the one looking up (4).
     #[test]
-    fn a_turned_box_is_read_in_its_own_frame() {
-        let q = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
-        let local = Vec3::new(HALF.x * (1.0 - 2.0 * DEPTH), 0.12, -0.2);
-        let Some(c) = colours(q, true, &[(CENTRE + q * local, q * -Vec3::X)]) else {
+    fn a_shells_two_faces_are_told_apart_by_the_normal() {
+        let n = Vec3::new(1.0, 1.0, 0.0).normalize();
+        let cell = 2.0 * HALF / SAMPLES as f32;
+        let reach = 4.0 * cell;
+        let mut distances = Vec::new();
+        for k in 0..SAMPLES {
+            for j in 0..SAMPLES {
+                for i in 0..SAMPLES {
+                    let p = (Vec3::new(i as f32, j as f32, k as f32) + 0.5) * cell - HALF;
+                    distances.push(((p.dot(n).abs() / reach).min(1.0) * 255.0).round() as u8);
+                }
+            }
+        }
+        let plate = ProxyField { dims: [SAMPLES; 3], max_distance: reach, distances, albedo: [0.2; 3] };
+        // Card k at (u, v): along x (k 0, 1) the plate is at x = -y; along y
+        // (k 2, 3) at y = -x; along z it is edge-on, and missed.
+        let mut texels = Vec::new();
+        for face in 0..6u32 {
+            for y in 0..RES {
+                for x in 0..RES {
+                    let v = ((y as f32 + 0.5) / RES as f32 * 2.0 - 1.0) * HALF;
+                    let u = ((x as f32 + 0.5) / RES as f32 * 2.0 - 1.0) * HALF;
+                    // Axis x runs u along y; axis y runs v along x.
+                    let t = match face {
+                        0 => (HALF + u) / (2.0 * HALF),
+                        1 => (HALF - u) / (2.0 * HALF),
+                        2 => (HALF + v) / (2.0 * HALF),
+                        3 => (HALF - v) / (2.0 * HALF),
+                        _ => 2.0,
+                    };
+                    texels.push([(face + 1) as f32, 0.0, 0.0, t]);
+                }
+            }
+        }
+        let cards = ProxyCards { resolution: RES, texels };
+        let hit = CENTRE + Vec3::new(0.05, -0.05, 0.0) + n * 0.003;
+        let Some(c) = colours_of(plate, cards, Quat::IDENTITY, true, &[(hit, Vec3::new(-0.9, 0.43, 0.0))]) else {
             eprintln!("no GPU adapter; skipping");
             return;
         };
-        assert!(near(c[0], [0.7, 0.25, 0.0, 1.0], 0.02), "{:?}", c[0]);
+        assert!((c[0][0] - 2.0).abs() < 0.25 && c[0][3] == 1.0, "the upper face: the +x (1) and +y (3) cards alike, nothing of the underside's (4): {:?}", c[0]);
+    }
+
+    /// A SMALL BRIGHT PART, FAR OFF, SHOWS AS ITS SHARE: the sphere's +x card
+    /// carries a 2 x 2 texel glint of 100 on 1. Read near, the glint's centre
+    /// is the glint; read from far off, where a pixel covers the whole card,
+    /// it is the card's average -- a steady faint glint, not a texel that
+    /// switches on and off as the head moves.
+    #[test]
+    fn a_far_reflection_reads_a_small_glint_as_its_share() {
+        let mut glinting = cards();
+        let mid = RES / 2;
+        for y in mid - 1..=mid {
+            for x in mid - 1..=mid {
+                glinting.texels[(y * RES + x) as usize][0] = 100.0;
+            }
+        }
+        let near = colours_of(field(), glinting.clone(), Quat::IDENTITY, true, &[(on_sphere(Vec3::X), -Vec3::X)]);
+        FOOTPRINT.with(|f| f.set(0.6));
+        HIT_T.with(|f| f.set(1.0));
+        let far = colours_of(field(), glinting, Quat::IDENTITY, true, &[(on_sphere(Vec3::X), -Vec3::X)]);
+        FOOTPRINT.with(|f| f.set(0.0));
+        HIT_T.with(|f| f.set(0.0));
+        let (Some(near), Some(far)) = (near, far) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        assert!(near[0][0] > 50.0, "near, the glint itself: {:?}", near[0]);
+        assert!(far[0][0] > 1.0 && far[0][0] < 10.0, "far, the card's average (glint 4 of ~560 texels): {:?}", far[0]);
+    }
+
+    /// The box's own frame: turned a quarter about y, the sphere's side facing
+    /// world -z faces the box's +x, and takes the +x card.
+    #[test]
+    fn a_turned_box_is_read_in_its_own_frame() {
+        let q = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let Some(c) = colours(q, true, &[(on_sphere(q * Vec3::X), q * -Vec3::X)]) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        assert!((c[0][0] - 1.0).abs() < 0.05, "{:?}", c[0]);
     }
 
     /// A proxy without cards says so, and the photographs' guess stands.
     #[test]
     fn a_proxy_without_cards_has_no_colour_from_them() {
-        let Some(c) = colours(Quat::IDENTITY, false, &[(CENTRE, -Vec3::X)]) else {
+        let Some(c) = colours(Quat::IDENTITY, false, &[(on_sphere(Vec3::X), -Vec3::X)]) else {
             eprintln!("no GPU adapter; skipping");
             return;
         };
