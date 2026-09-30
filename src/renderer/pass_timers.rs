@@ -115,6 +115,23 @@ impl PassTimers {
         })
     }
 
+    /// `writes` for a COMPUTE pass: the same slot bookkeeping, the compute
+    /// descriptor's type.
+    #[must_use = "the timestamp writes must be ATTACHED to the compute pass \
+                  descriptor; calling this as a statement marks the slot live \
+                  and records nothing, so it reports a confident 0.00 ms"]
+    pub fn compute_writes(&self, pass: usize) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        if pass >= self.labels.len() {
+            return None;
+        }
+        self.written.fetch_or(1 << pass, std::sync::atomic::Ordering::Relaxed);
+        Some(wgpu::ComputePassTimestampWrites {
+            query_set: &self.set,
+            beginning_of_pass_write_index: Some((pass * 2) as u32),
+            end_of_pass_write_index: Some((pass * 2 + 1) as u32),
+        })
+    }
+
     /// The BEGINNING of a slot that spans SEVERAL passes, and the end of one.
     ///
     /// `writes` puts both timestamps on one pass, which cannot measure a block

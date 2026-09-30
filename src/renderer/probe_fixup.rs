@@ -347,7 +347,8 @@ impl ProbeFixups {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("probe_fixups"),
             size: 16 + capacity as u64 * RECORD_BYTES,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            // COPY_SRC for the offline harness's census (`list_buffer`).
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let storage = |read_only: bool, visibility: ShaderStages| BindGroupLayoutEntry {
@@ -463,6 +464,13 @@ impl ProbeFixups {
 
     /// Group 3 of the deferring probe pass: the list it appends to, and the
     /// floor mirror it lays over its floor's texels.
+    /// MEASUREMENT: the record list itself -- a `u32` count, padding to 16
+    /// bytes, then `RECORD_BYTES` a record -- for a census of what the
+    /// fix-up is asked to do (`offline_frame`'s `FIXUP_STATS`).
+    pub fn list_buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+
     pub fn pass_layout(&self) -> &BindGroupLayout {
         &self.pass_layout
     }
@@ -506,8 +514,16 @@ impl ProbeFixups {
     /// Makes the recorded lookups and writes their texels into `target`'s
     /// colour: after the probe pass, before anything reads it. A thread per
     /// slot of the list; those past its count return at once.
-    pub fn dispatch(&self, encoder: &mut CommandEncoder, uniforms: &BindGroup, target: &BindGroup) {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("probe_fixup"), timestamp_writes: None });
+    /// `timestamp_writes`: the pass timer's `fix_l`/`fix_r` slot, so what the
+    /// fix-up costs is measured rather than hidden between the passes that are.
+    pub fn dispatch(
+        &self,
+        encoder: &mut CommandEncoder,
+        uniforms: &BindGroup,
+        target: &BindGroup,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("probe_fixup"), timestamp_writes });
         // As many workgroups as the pass made records: see `args`.
         pass.set_pipeline(&self.args_pipeline);
         pass.set_bind_group(0, &self.args_bind_group, &[]);

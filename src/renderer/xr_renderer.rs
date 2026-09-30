@@ -911,7 +911,7 @@ impl XrRenderer {
                 // APPENDED, not inserted: the existing slots are addressed by
                 // index from the passes themselves, so a new label in the
                 // middle would silently retime them.
-                &["scene_l", "eye_l", "scene_r", "eye_r", "prep_l", "prep_r", "refl_l", "refl_r", "probe_l", "probe_r"],
+                &["scene_l", "eye_l", "scene_r", "eye_r", "prep_l", "prep_r", "refl_l", "refl_r", "probe_l", "probe_r", "fix_l", "fix_r"],
                 period,
             )
         });
