@@ -1906,11 +1906,33 @@ impl XrRenderer {
         self.cull_rooms = rooms;
     }
 
+    /// What stands in the rooms for the reflection trace: the proxies, the
+    /// models' distance fields (`ProbeProxy::field` indexes `fields`) and the
+    /// models' cards (`ProbeProxy::cards` indexes `cards`). See `proxy_field`
+    /// and `proxy_cards`.
     pub fn set_reflection_proxies(
         &mut self,
-        proxies: Vec<crate::renderer::uniforms::ProbeProxy>,
+        mut proxies: Vec<crate::renderer::uniforms::ProbeProxy>,
         fields: Vec<crate::renderer::proxy_field::ProxyField>,
+        cards: Vec<crate::renderer::proxy_cards::ProxyCards>,
     ) {
+        // The models' cards, a row each; a proxy then names its row, and a set
+        // the atlas could not take leaves its proxies with none.
+        match crate::renderer::proxy_cards::atlas(&self.wgpu_device, &self.wgpu_queue, &cards) {
+            Some((view, rows)) => {
+                self.uniform_buf.set_proxy_card_atlas(view);
+                for p in &mut proxies {
+                    p.cards = p.cards.and_then(|i| rows.get(i as usize).copied().flatten());
+                }
+                log::info!("reflection cards: {} model(s) on cards", rows.iter().flatten().count());
+            }
+            None => {
+                self.uniform_buf.set_proxy_card_atlas(crate::renderer::proxy_cards::none(&self.wgpu_device));
+                for p in &mut proxies {
+                    p.cards = None;
+                }
+            }
+        }
         self.probe_proxies = proxies;
         // The models' distance fields, packed and bound; where each lies goes
         // up with every frame's probes. See `proxy_field`.

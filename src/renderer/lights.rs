@@ -700,7 +700,9 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let probe_depth_samp = binding_index + 8;
     let ground_tex = binding_index + 9;
     let proxy_field_tex = binding_index + 10;
+    let proxy_card_tex = binding_index + 11;
     let proxy_field_rows = crate::renderer::proxy_field::MAX_PROXY_FIELDS * 3;
+    let proxy_card_rows = crate::renderer::uniforms::MAX_PROXIES / 4;
     let building_rows = crate::renderer::uniforms::MAX_BUILDINGS * 2;
     let capsule_rows = crate::renderer::uniforms::MAX_CAPSULES * 2;
     let capsule_group_rows = crate::renderer::uniforms::MAX_CAPSULE_GROUPS * 2;
@@ -783,6 +785,9 @@ struct Camera {{
     // [size, stop], [albedo, 0] per field. Must match
     // `uniforms::Uniforms::proxy_fields`.
     proxy_fields: array<vec4<f32>, {proxy_field_rows}>,
+    // Each proxy's row in the card atlas plus one, 0 for none: entry i at
+    // [i >> 2][i & 3]. Must match `uniforms::Uniforms::proxy_cards`.
+    proxy_cards: array<vec4<f32>, {proxy_card_rows}>,
     // The buildings' outsides: [min.xyz, cube layer], [max.xyz, 0] each; how
     // many in portal_params.w. Must match `uniforms::Uniforms::building_boxes`.
     building_boxes: array<vec4<f32>, {building_rows}>,
@@ -853,6 +858,9 @@ struct Lights {{
 @group({group_index}) @binding({ground_tex}) var ground_map: texture_2d<f32>;
 // Standing models' distance fields. See `proxy_field` and `probe_proxy_field`.
 @group({group_index}) @binding({proxy_field_tex}) var proxy_field: texture_3d<f32>;
+// Standing models' cards: a model a row, six cards a row. See `proxy_cards`
+// and `probe_card_colour`.
+@group({group_index}) @binding({proxy_card_tex}) var proxy_cards: texture_2d<f32>;
 
 const AMBIENT: f32 = 0.6;
 
@@ -3347,6 +3355,67 @@ fn probe_view_trust(d: vec3<f32>, c: vec3<f32>, h: vec3<f32>) -> f32 {{
     return smoothstep(0.5, 0.9, dot(d, normalize(h - c)));
 }}
 
+// ONE CARD'S SAY about the box-frame point it shows at `uv`, `t` of the way
+// into the box along its axis: its colour times its weight, and the weight --
+// how squarely the ray meets the card (`facing`) times whether the card's
+// surface there IS the hit rather than something in front of or behind it
+// (within `tol` metres, `depth` the box's depth along the card's axis). Read
+// half a texel inside the card, so the filter never reaches the next one.
+fn probe_card_vote(row: f32, face: f32, uv: vec2<f32>, t: f32, depth: f32, tol: f32, facing: f32) -> vec4<f32> {{
+    let dims = vec2<f32>(textureDimensions(proxy_cards));
+    let res = dims.x / 6.0;
+    let texel = clamp(uv * res, vec2<f32>(0.5), vec2<f32>(res - 0.5));
+    let card = textureSampleLevel(proxy_cards, probe_samp, (vec2<f32>(face * res, row * res) + texel) / dims, 0.0);
+    let gap = abs(card.w - t) * depth;
+    let w = facing * (1.0 - smoothstep(tol, 2.0 * tol, gap));
+    return vec4<f32>(card.rgb * w, w);
+}}
+
+// A MODEL'S OWN LOOK WHERE A REFLECTION MEETS IT, at world `h` along world
+// `d`: its cards (`proxy_cards`), the three on the faces the ray comes in
+// through, each weighed by how squarely the ray meets it and trusted only
+// where its surface is the hit itself -- within three of its texels, and 5 mm
+// for the distance field's stop short of the surface. The room photographs no
+// longer hold the model, so they cannot colour it. `w` is 0 where the proxy
+// has no cards, or no card saw the hit.
+fn probe_card_colour(proxy: i32, h: vec3<f32>, d: vec3<f32>) -> vec4<f32> {{
+    let row = camera.proxy_cards[proxy >> 2u][proxy & 3] - 1.0;
+    if (row < 0.0) {{
+        return vec4<f32>(0.0);
+    }}
+    let q = camera.probe_proxies[proxy * 3 + 2];
+    var lo = h - camera.probe_proxies[proxy * 3].xyz;
+    var ld = d;
+    if (any(q != vec4<f32>(0.0, 0.0, 0.0, 1.0))) {{
+        let qi = vec4<f32>(-q.xyz, q.w);
+        lo = probe_quat_rotate(qi, lo);
+        ld = probe_quat_rotate(qi, ld);
+    }}
+    let half = max(camera.probe_proxies[proxy * 3 + 1].xyz, vec3<f32>(1e-4));
+    let res = f32(textureDimensions(proxy_cards).x) / 6.0;
+    // Card 2a looks in through the +a face, 2a + 1 through the -a face: the
+    // one a ray heading -a comes in through is the +a card. Axis a's card
+    // runs u along a + 1 and v along a + 2. See
+    // `space_soup_engine::reflection_cards`.
+    let sx = select(1.0, -1.0, ld.x < 0.0);
+    let sy = select(1.0, -1.0, ld.y < 0.0);
+    let sz = select(1.0, -1.0, ld.z < 0.0);
+    let n = lo / (2.0 * half) + 0.5;
+    var sum = probe_card_vote(
+        row, select(1.0, 0.0, ld.x < 0.0), n.yz, 0.5 * (1.0 + sx * lo.x / half.x), 2.0 * half.x,
+        3.0 * 2.0 * max(half.y, half.z) / res + 0.005, ld.x * ld.x
+    );
+    sum += probe_card_vote(
+        row, select(3.0, 2.0, ld.y < 0.0), n.zx, 0.5 * (1.0 + sy * lo.y / half.y), 2.0 * half.y,
+        3.0 * 2.0 * max(half.z, half.x) / res + 0.005, ld.y * ld.y
+    );
+    sum += probe_card_vote(
+        row, select(5.0, 4.0, ld.z < 0.0), n.xy, 0.5 * (1.0 + sz * lo.z / half.z), 2.0 * half.z,
+        3.0 * 2.0 * max(half.x, half.y) / res + 0.005, ld.z * ld.z
+    );
+    return select(vec4<f32>(0.0), vec4<f32>(sum.rgb / max(sum.w, 1e-6), 1.0), sum.w > 1e-3);
+}}
+
 fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32, d: vec3<f32>) -> vec4<f32> {{
     var s0 = -1;
     var s1 = -1;
@@ -3438,6 +3507,15 @@ fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32,
             max(probe_hit_lod(roughness, t, sqrt(d0)), PROBE_UNSEEN_LOD)
         );
         col = mix(wide, col, seen);
+    }}
+    // A MODEL ON CARDS IS ITS CARDS: a bake that pictures a model on its own
+    // cards leaves it out of the photographs, which then show the wall behind
+    // it. See `probe_card_colour`. The photographs' guess above stays for a
+    // model without cards -- an older bake, or one past the level's shaped
+    // models (`space_soup_engine::reflection_proxy::shaped_models`).
+    if (model) {{
+        let card = probe_card_colour(i32(-2.0 - other), h, d);
+        col = select(col, card, card.w > 0.5);
     }}
     return col;
 }}
@@ -5847,6 +5925,7 @@ mod probe_trace_gpu_tests {
             volume: 0,
             solid: true,
             field: None,
+            cards: None,
         };
         let lamp = ProbeProxy {
             centre: Vec3::new(0.0, 2.5, -12.0),
@@ -5855,6 +5934,7 @@ mod probe_trace_gpu_tests {
             volume: 0,
             solid: true,
             field: None,
+            cards: None,
         };
         probes.set_proxies(&[pillar, lamp], Vec3::ZERO, &[0, 1]);
         // As `Uniforms::update` fills it: rooms renumbered, with their tables.
@@ -6410,5 +6490,189 @@ fn walk_main(@builtin(global_invocation_id) id: vec3<u32>) {
         assert!((t[1] - chord).abs() < 3.0 * stop, "through its edge: t {} vs {}", t[1], chord);
         assert!(t[2] > 1e30, "five centimetres above it, a hit at {}", t[2]);
         assert!((t[3] - (1.0 - RADIUS)).abs() < 2.0 * stop, "from below: t {}", t[3]);
+    }
+}
+
+/// A MODEL'S CARDS, READ ON THE GPU: the real WGSL `probe_card_colour` against
+/// a small atlas whose cards each have their own colour, from a compute
+/// shader. See `proxy_cards` and `space_soup_engine::reflection_cards`.
+#[cfg(test)]
+mod proxy_card_gpu_tests {
+    use super::*;
+    use crate::renderer::proxy_cards::{self, ProxyCards};
+    use crate::renderer::uniforms::{ProbeProxy, ProbeUpload, Uniforms};
+    use glam::{Quat, Vec3};
+    use wgpu::util::DeviceExt;
+
+    const RES: u32 = 32;
+    const CENTRE: Vec3 = Vec3::new(1.0, 2.0, 3.0);
+    const HALF: Vec3 = Vec3::new(0.2, 0.3, 0.4);
+    /// Every card sees its surface a quarter of the way in.
+    const DEPTH: f32 = 0.25;
+
+    /// Card k is coloured (k + 1, 0, 0) -- except card 0, the +x one, whose
+    /// colour is its own (u, v), to pin which way the card runs.
+    fn cards() -> ProxyCards {
+        let mut texels = Vec::new();
+        for face in 0..6 {
+            for y in 0..RES {
+                for x in 0..RES {
+                    let (u, v) = ((x as f32 + 0.5) / RES as f32, (y as f32 + 0.5) / RES as f32);
+                    let rgb = if face == 0 { [u, v, 0.0] } else { [face as f32 + 1.0, 0.0, 0.0] };
+                    texels.push([rgb[0], rgb[1], rgb[2], DEPTH]);
+                }
+            }
+        }
+        ProxyCards { resolution: RES, texels }
+    }
+
+    /// `probe_card_colour` for each world `(hit, direction)` against one proxy
+    /// with the given rotation; `with_cards` false leaves it without.
+    fn colours(rotation: Quat, with_cards: bool, rays: &[(Vec3, Vec3)]) -> Option<Vec<[f32; 4]>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let (atlas, rows) = proxy_cards::atlas(&device, &queue, &[cards()])?;
+        assert_eq!(rows, vec![Some(0)]);
+        let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
+        let mut probes = ProbeUpload::default();
+        let proxy = ProbeProxy { centre: CENTRE, half_size: HALF, rotation, volume: 0, solid: false, field: Some(0), cards: with_cards.then_some(0) };
+        probes.set_proxies(&[proxy], Vec3::ZERO, &[0]);
+        let mut u: Uniforms = bytemuck::Zeroable::zeroed();
+        u.probe_proxies = probes.proxies;
+        u.proxy_cards = probes.proxy_cards;
+        let code = format!(
+            "{}\n{}",
+            wgsl_lights_block(0, 1),
+            r#"
+@group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+@compute @workgroup_size(1)
+fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    out[id.x] = probe_card_colour(0, rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz));
+}
+"#
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("cards_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&u),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let packed: Vec<[f32; 4]> = rays.iter().flat_map(|(h, d)| [[h.x, h.y, h.z, 0.0], [d.x, d.y, d.z, 0.0]]).collect();
+        let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&packed),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let size = (rays.len() * 16) as u64;
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&samp) },
+                wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&atlas) },
+            ],
+        });
+        let g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: out_buf.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups(rays.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out_buf, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let data: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().ok()?).to_vec();
+        Some(data)
+    }
+
+    fn near(a: [f32; 4], b: [f32; 4], tol: f32) -> bool {
+        (0..4).all(|k| (a[k] - b[k]).abs() < tol)
+    }
+
+    /// The card a ray comes in through colours the hit, read where it shows
+    /// that point; a ray meeting two faces as squarely takes both; a hit
+    /// deeper than the card's surface is something the card did not see.
+    #[test]
+    fn the_card_facing_the_ray_colours_the_hit_where_it_shows_it() {
+        // A quarter of the way in from the +x face, at (u, v) = (0.7, 0.25).
+        let on_x = CENTRE + Vec3::new(HALF.x * (1.0 - 2.0 * DEPTH), 0.12, -0.2);
+        // A quarter in from both the +x and the +y face.
+        let on_xy = CENTRE + Vec3::new(HALF.x * 0.5, HALF.y * 0.5, 0.0);
+        // Three quarters in from +x: the +x card's surface is in front of it.
+        let behind = CENTRE + Vec3::new(-HALF.x * 0.5, 0.0, 0.0);
+        let Some(c) = colours(
+            Quat::IDENTITY,
+            true,
+            &[
+                (on_x, -Vec3::X),
+                (on_xy, Vec3::new(-1.0, -1.0, 0.0)),
+                (behind, -Vec3::X),
+                (CENTRE + Vec3::new(0.0, 0.0, -HALF.z * 0.5), Vec3::Z),
+            ],
+        ) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        assert!(near(c[0], [0.7, 0.25, 0.0, 1.0], 0.02), "the +x card at (0.7, 0.25): {:?}", c[0]);
+        // The +x card shows (u, v) = (0.75, 0.5) there, the +y card 3.
+        let blend = (c[1][0] - 0.5 * (0.75 + 3.0)).abs();
+        assert!(c[1][3] == 1.0 && blend < 0.05, "half the +x card (0.75) and half the +y card (3): {:?}", c[1]);
+        assert_eq!(c[2][3], 0.0, "no card saw a surface there: {:?}", c[2]);
+        assert!(near(c[3], [6.0, 0.0, 0.0, 1.0], 1e-3), "a ray heading +z comes in through the -z card (5): {:?}", c[3]);
+    }
+
+    /// The box's own frame: a box turned a quarter about y shows a ray heading
+    /// world +z its +x card.
+    #[test]
+    fn a_turned_box_is_read_in_its_own_frame() {
+        let q = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let local = Vec3::new(HALF.x * (1.0 - 2.0 * DEPTH), 0.12, -0.2);
+        let Some(c) = colours(q, true, &[(CENTRE + q * local, q * -Vec3::X)]) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        assert!(near(c[0], [0.7, 0.25, 0.0, 1.0], 0.02), "{:?}", c[0]);
+    }
+
+    /// A proxy without cards says so, and the photographs' guess stands.
+    #[test]
+    fn a_proxy_without_cards_has_no_colour_from_them() {
+        let Some(c) = colours(Quat::IDENTITY, false, &[(CENTRE, -Vec3::X)]) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        assert_eq!(c[0][3], 0.0, "{:?}", c[0]);
     }
 }

@@ -37,6 +37,7 @@ pub mod shader_precision;
 pub mod probe_fixup;
 pub mod foveation;
 pub mod ground_map;
+pub mod proxy_cards;
 pub mod proxy_field;
 
 #[cfg(target_os = "android")]
