@@ -722,6 +722,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let capsules_per_group = crate::renderer::uniforms::CAPSULES_PER_GROUP;
     let reflection_contrast = format!("{:?}", crate::renderer::space_warp::REFLECTION_CONTRAST_RATIO);
     let probe_edge_footprints = PROBE_EDGE_FOOTPRINTS;
+    let floor_mirror_bias = super::brush_pipeline::probe_pass::FLOOR_MIRROR_BIAS;
     // Three vec4 per probe -- centre, min, max -- so the WGSL array length is
     // three times the probe count. Derived rather than written twice: a shader
     // array shorter than the uniform reads garbage past its end.
@@ -838,6 +839,15 @@ fn to_world_space(p: vec3<f32>) -> vec3<f32> {{
     let c = cos(yaw);
     let r = vec3<f32>(c * p.x + s * p.z, p.y, -s * p.x + c * p.z);
     return r + camera.player_frame.xyz;
+}}
+
+// `to_world_space` undone.
+fn to_player_space(w: vec3<f32>) -> vec3<f32> {{
+    let yaw = camera.player_frame.w;
+    let s = sin(yaw);
+    let c = cos(yaw);
+    let p = w - camera.player_frame.xyz;
+    return vec3<f32>(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
 }}
 @group({group_index}) @binding(0) var<uniform> camera: Camera;
 {tonemap_block}
@@ -1275,6 +1285,23 @@ var<private> probe_fragment: vec4<f32> = vec4<f32>(0.0);
 // already normalised, and its coverage -- set by the brush shader before it
 // shades. Only read when `PROBE_ENV_FROM_PASS`.
 var<private> probe_env_given: vec4<f32> = vec4<f32>(0.0);
+// THE CHARACTERS' FLOOR MIRROR (`brush_pipeline::probe_pass::MIRROR_FORMAT`):
+// the plane it mirrors in, `FLOOR_MIRROR_BIAS` above its height in
+// `capsule_params.w`, 0 when there is none this frame. The probe pass lays the
+// mirrored characters over a floor texel's reflection; a pixel of that floor
+// then has them already, and its capsules are left out.
+const FLOOR_MIRROR_BIAS: f32 = {floor_mirror_bias:?};
+// How close to the plane a surface must be to be the floor, in metres.
+const FLOOR_MIRROR_SLAB: f32 = 0.02;
+fn on_floor_mirror(pos: vec3<f32>, geom_n: vec3<f32>) -> bool {{
+    let lane = camera.capsule_params.w;
+    return lane != 0.0 && geom_n.y > 0.95 && abs(pos.y - (lane - FLOOR_MIRROR_BIAS)) < FLOOR_MIRROR_SLAB;
+}}
+// Whether the probe pass texel being shaded is on the floor mirror's plane,
+// and the light its capsules are lit by: set before its trace, so a deferred
+// lookup's record carries them too.
+var<private> probe_floor_mirror_here: bool = false;
+var<private> probe_capsule_lit: vec3<f32> = vec3<f32>(0.0);
 // WHERE TO STAND WHEN ASKING WHICH ROOM, set by a caller that knows better than
 // the pixel (`w` = 1). A brush sets its face centre: a face belongs to one room,
 // and an MSAA edge sample extrapolated along a grazing surface can land well
@@ -4029,7 +4056,19 @@ fn probe_env_for_pass(
         sky_here = sky_irradiance(n) * occ;
     }}
     let ambient_here = dot(env + sky_here, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let probe = probe_environment(world_pos, refl, roughness, probe_select_pos);
+    // THE CHARACTERS IN THE REFLECTION, here rather than in the scene shader,
+    // at half the resolution each way: on the floor the player stands on,
+    // themselves, mirrored (`probe_fixup::floor_mirror_blend_wgsl`); elsewhere
+    // their capsules (`capsule_reflection`), lit by the light arriving here.
+    // Decided before the trace, which records both for a deferred lookup.
+    probe_floor_mirror_here = on_floor_mirror(world_pos, geom_n);
+    probe_capsule_lit = env;
+    var probe = probe_environment(world_pos, refl, roughness, probe_select_pos);
+    if (probe_floor_mirror_here) {{
+        probe = probe_floor_mirror_pass(probe, roughness);
+    }} else {{
+        probe = capsule_reflection(world_pos, refl, roughness, env, probe);
+    }}
     let probe_scale = select(
         1.0,
         clamp(ambient_here / max(probe_brightness, 1e-4), PROBE_NORMALISATION_FLOOR, 1.0),
@@ -4244,9 +4283,20 @@ fn shade_material_env_part(
     if (!PROBE_ENV_FROM_PASS) {{
         probe = probe_environment(world_pos, refl, roughness, probe_select_pos);
     }}
-    // THE CHARACTERS IN IT, at this pixel's own resolution, lit by the light
+    // THE CHARACTERS IN IT: on the floor the player stands on they are in the
+    // probe pass's answer already, mirrored (see `on_floor_mirror`); elsewhere
+    // their capsules, at this pixel's own resolution, lit by the light
     // arriving here. See `capsule_reflection`.
-    probe = capsule_reflection(world_pos, refl, roughness, env, probe);
+    // THE CHARACTERS IN IT, where this shader traces its own reflection: their
+    // capsules, at this pixel's resolution, lit by the light arriving here.
+    // A shader that reads the probe pass has them already -- the pass puts
+    // them in, or mirrors them on the floor the player stands on (see
+    // `probe_env_for_pass`) -- so here they are not even compiled. Any test
+    // for the floor made here, however cheap to read, cost the scene shader
+    // 2 ms a frame with the same registers (headset, 2026-09-30).
+    if (!PROBE_ENV_FROM_PASS) {{
+        probe = capsule_reflection(world_pos, refl, roughness, env, probe);
+    }}
     var sky_reflection = vec3<f32>(0.0);
     if (occ > 0.0) {{
         sky_reflection = environment_radiance(refl) * occ;

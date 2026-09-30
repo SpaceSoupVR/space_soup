@@ -780,6 +780,38 @@ impl XrRenderer {
         if !fx.capsules {
             frame_player.capsules.group_count = 0;
         }
+        // THE CHARACTERS' FLOOR MIRROR, where the probe pass runs to hold it
+        // and there is someone to mirror. See `probe_pass::MIRROR_FORMAT`.
+        // Only where the probe pass lays the mirror over the floor -- the
+        // single-eye pass that defers its lookups -- and only when a mirrored
+        // character can be in view: each character's bound, mirrored in the
+        // floor, against both eyes' frusta. Looking ahead the mirrored bodies
+        // are under the floor out of sight, and the pass, about a millisecond,
+        // is not drawn (headset, 2026-09-30).
+        let mirror_in_view = {
+            use crate::renderer::brush_pipeline::probe_pass;
+            let frusta: Vec<[glam::Vec4; 6]> = eye_views
+                .iter()
+                .map(|ev| {
+                    crate::renderer::shadow::frustum_planes(
+                        Camera::gl_to_wgpu_ndc(Camera::xr_projection(ev.fov, probe_pass::EYE_NEAR, probe_pass::EYE_FAR))
+                            * Camera::xr_view(ev.pose),
+                    )
+                })
+                .collect();
+            (0..frame_player.capsules.group_count as usize).any(|g| {
+                let b = frame_player.capsules.groups[g * 2];
+                let c = glam::Vec3::new(b[0], 2.0 * probe_pass::FLOOR_MIRROR_PLANE - b[1], b[2]);
+                let r = glam::Vec3::splat(b[3]);
+                frusta.iter().any(|planes| crate::renderer::shadow::aabb_in_frustum(planes, c - r, c + r))
+            })
+        };
+        frame_player.capsules.floor_mirror = fx.floor_mirror
+            && fx.deferred_reflection_lookups
+            && !self.stereo_scene()
+            && self.probe_pass_runs(&fx, false, brush_buffers.is_some())
+            && !(skinned_draws.is_empty() && mirror_only_skinned_draws.is_empty())
+            && mirror_in_view;
         frame_player.capsules.shadow_lights =
             std::array::from_fn(|k| character_tiles.get(k).map_or(-1.0, |(i, _)| *i as f32));
 
@@ -1223,6 +1255,41 @@ impl XrRenderer {
                 self.wgpu_queue.submit(Some(encoder.finish()));
             }
 
+            // THE CHARACTERS MIRRORED IN THE FLOOR, this eye's: the uniforms
+            // their pass draws with, in the scene uniforms' twin -- the pass
+            // is recorded in this eye's own encoder, before its probe pass,
+            // bound to the twin. A submit of its own left the GPU idle while
+            // the eye's encoder was still being recorded (0.6-0.85 ms a frame
+            // for an avatar at half resolution), and copying its camera into
+            // the scene's buffer and back cost a full barrier each way (2-3
+            // ms): headset, 2026-09-30. See `probe_pass::MIRROR_FORMAT`.
+            if frame_player.capsules.floor_mirror {
+                use crate::renderer::brush_pipeline::probe_pass;
+                let floor_view = view
+                    * mirror::reflection_matrix(glam::Vec3::new(0.0, probe_pass::FLOOR_MIRROR_PLANE, 0.0), glam::Vec3::Y);
+                let floor_proj = Camera::xr_projection(ev.fov, probe_pass::EYE_NEAR, probe_pass::EYE_FAR);
+                let floor_view_proj = Camera::gl_to_wgpu_ndc(floor_proj) * floor_view;
+                let floor_eye = floor_view.inverse().transform_point3(glam::Vec3::ZERO);
+                // Lit as seen from the mirrored eye, and kept linear: the
+                // untoned curve is a clamp, at an exposure that fits.
+                let floor_post = crate::renderer::uniforms::PostUpload {
+                    exposure: probe_pass::MIRROR_EXPOSURE,
+                    tonemap: crate::renderer::tonemap::ToneMapping::None,
+                    ..post
+                };
+                self.uniform_buf.write_scene_stereo_to(
+                    &self.wgpu_queue,
+                    &self.uniform_buf.twin_buffer,
+                    [floor_view_proj; 2],
+                    [floor_eye; 2],
+                    &shadow,
+                    &sky_upload,
+                    &floor_post,
+                    &frame_player,
+                    None,
+                );
+            }
+
             let eye_view_proj = Camera::gl_to_wgpu_ndc(proj) * view;
             let cam_pos = glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
             // BOTH EYES' CAMERAS. A stereo scene pass cannot re-upload the
@@ -1443,6 +1510,41 @@ impl XrRenderer {
                 let mut encoder = self.wgpu_device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor { label: Some("ssr_scene") },
                 );
+                // THE CHARACTERS MIRRORED IN THE FLOOR, into this eye's probe
+                // pass target before its pass lays them over the floor: drawn
+                // with the twin's uniforms, then blurred. Single-eye only: the
+                // flag is off for a two-eye frame. See `probe_pass::MIRROR_FORMAT`.
+                if frame_player.capsules.floor_mirror {
+                    let target = &self.probe_pass_targets[eye];
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("floor_mirror"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &target.mirror_levels[0][0],
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                            })],
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: &target.mirror_depth_views[0],
+                                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                                stencil_ops: None,
+                            }),
+                            ..Default::default()
+                        });
+                        pass.set_pipeline(&self.floor_mirror_skinned.pipeline);
+                        pass.set_bind_group(0, &self.uniform_buf.twin_bind_group, &[]);
+                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in skinned_draws.iter().chain(mirror_only_skinned_draws.iter()) {
+                            pass.set_bind_group(1, *model_bg, &[]);
+                            pass.set_bind_group(2, *tex_bg, &[]);
+                            pass.set_bind_group(3, *joint_bg, &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
+                    }
+                    self.floor_mirror_mips.record(&self.wgpu_device, &mut encoder, &target.mirror_levels[0]);
+                }
                 // Once a frame when stereo, like the scene pass it feeds.
                 if probe_pass && (!stereo || eye == 0) {
                     if let Some((vb, ib, count)) = &brush_buffers {
@@ -1500,7 +1602,7 @@ impl XrRenderer {
                         pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
                         pass.set_bind_group(2, self.brush_lightmap_bg(), &[]);
                         if deferred_lookups {
-                            pass.set_bind_group(3, self.probe_fixups.pass_bind_group(), &[]);
+                            pass.set_bind_group(3, &self.probe_fixup_passes[eye], &[]);
                         }
                         pass.set_vertex_buffer(0, vb.slice(..));
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -1509,7 +1611,7 @@ impl XrRenderer {
                             pass.set_pipeline(&self.terrain_probe_pass_pipeline.pipeline);
                             pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                             pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
-                            pass.set_bind_group(3, self.probe_fixups.pass_bind_group(), &[]);
+                            pass.set_bind_group(3, &self.probe_fixup_passes[eye], &[]);
                             pass.set_vertex_buffer(0, solid_vb.slice(..));
                             pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
                             if solid_chunks.is_empty() {
