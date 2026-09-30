@@ -9,11 +9,14 @@
 //! lamp is coloured from pictures of itself rather than from a capture point
 //! across the room. See `probe_card_colour` in the lights block.
 //!
-//! ONE ATLAS, ONE ROW A MODEL: row `s` holds model `s`'s six cards side by
+//! ONE ATLAS, TWO ROWS A MODEL: row `2s` holds model `s`'s six cards side by
 //! side, card `k` at columns `k * R .. (k + 1) * R`, so the shader finds a card
 //! from its row, its number and the atlas's width alone. RGBA16Float: linear
 //! radiance, and in alpha how deep in the box the surface is (2 where the card
-//! saw nothing).
+//! saw nothing). Row `2s + 1` holds the same cards' normals -- which way each
+//! texel's surface faces, in the box's frame -- with the same depth in alpha.
+//! One texture rather than a second binding: the brush shader is at its
+//! sampled-texture limit.
 //!
 //! Plain data here: `space_soup` cannot depend on the engine, so the app hands
 //! the cards over as [`ProxyCards`].
@@ -36,38 +39,48 @@ pub struct ProxyCards {
     /// `CARD_FACES * resolution^2` texels, card after card, row after row:
     /// linear RGB and the depth `t`.
     pub texels: Vec<[f32; 4]>,
+    /// Which way each texel's surface faces, in the box's frame, laid out as
+    /// `texels`; zero where the card saw nothing.
+    pub normals: Vec<[f32; 3]>,
 }
 
-/// The cards packed into one atlas, a model a row, and which row each input
-/// landed in (`None` for one skipped: a different card size than the first,
-/// or past [`MAX_CARD_SETS`]). `None` for no cards at all.
+/// The cards packed into one atlas, two rows a model, and the row of each
+/// input's colours -- its normals are the row after -- (`None` for one
+/// skipped: a different card size than the first, or past
+/// [`MAX_CARD_SETS`]). `None` for no cards at all.
 pub fn atlas(device: &Device, queue: &Queue, sets: &[ProxyCards]) -> Option<(TextureView, Vec<Option<u32>>)> {
     let res = sets.iter().map(|c| c.resolution).find(|&r| r > 0)?;
     let mut rows: Vec<Option<u32>> = Vec::with_capacity(sets.len());
     let mut used = 0u32;
     for c in sets {
-        let fits = c.resolution == res && c.texels.len() == CARD_FACES * (res * res) as usize && (used as usize) < MAX_CARD_SETS;
+        let texels = CARD_FACES * (res * res) as usize;
+        let fits = c.resolution == res && c.texels.len() == texels && c.normals.len() == texels && (used as usize) < MAX_CARD_SETS;
         if !fits {
             log::warn!("reflection cards: a set of {} texels at {} across does not fit the atlas; skipped", c.texels.len(), c.resolution);
         }
         rows.push(fits.then(|| {
             used += 1;
-            used - 1
+            2 * (used - 1)
         }));
     }
     if used == 0 {
         return None;
     }
-    // Level 0, the atlas as the file has it: linear RGB and the depth `t`.
+    // Level 0, the atlas as the file has it: linear RGB and the depth `t`,
+    // and below, the normal and the same `t`.
     let width = res * CARD_FACES as u32;
-    let height = res * used;
+    let height = 2 * res * used;
     let mut level: Vec<[f32; 4]> = vec![[0.0, 0.0, 0.0, MISS]; (width * height) as usize];
     for (c, row) in sets.iter().zip(&rows) {
         let Some(row) = row else { continue };
         for face in 0..CARD_FACES as u32 {
             for y in 0..res {
                 for x in 0..res {
-                    level[((row * res + y) * width + face * res + x) as usize] = c.texels[((face * res + y) * res + x) as usize];
+                    let i = ((face * res + y) * res + x) as usize;
+                    let t = c.texels[i];
+                    let [nx, ny, nz] = c.normals[i];
+                    level[((row * res + y) * width + face * res + x) as usize] = t;
+                    level[(((row + 1) * res + y) * width + face * res + x) as usize] = [nx, ny, nz, t[3]];
                 }
             }
         }
@@ -81,11 +94,14 @@ pub fn atlas(device: &Device, queue: &Queue, sets: &[ProxyCards]) -> Option<(Tex
     // at multiples of their own power-of-two size.
     let levels = if res.is_power_of_two() { res.trailing_zeros() + 1 } else { 1 };
     let mut chain: Vec<(u32, u32, Vec<[f32; 4]>)> = vec![(width, height, level)];
-    for _ in 1..levels {
+    for l in 1..levels {
         let (pw, ph, prev) = chain.last().unwrap();
         let (w, h) = (pw / 2, ph / 2);
         let mut next = vec![[0.0, 0.0, 0.0, MISS]; (w * h) as usize];
         for y in 0..h {
+            // A normals row: averaged plainly, left unnormalised, so a texel
+            // over a curve or an edge says how little one direction speaks for it.
+            let normals = (y / (res >> l)) % 2 == 1;
             for x in 0..w {
                 // Colour weighted by 1 / (1 + luminance) -- Karis's firefly
                 // weight -- depth plainly. A glowing mouth is sixty times
@@ -96,7 +112,7 @@ pub fn atlas(device: &Device, queue: &Queue, sets: &[ProxyCards]) -> Option<(Tex
                 for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                     let t = prev[((2 * y + dy) * pw + 2 * x + dx) as usize];
                     if t[3] < MISS * 0.75 {
-                        let w = 1.0 / (1.0 + 0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2]);
+                        let w = if normals { 1.0 } else { 1.0 / (1.0 + 0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2]) };
                         for k in 0..3 {
                             rgb[k] += t[k] * w;
                         }

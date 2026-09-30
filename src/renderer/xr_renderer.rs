@@ -1916,8 +1916,9 @@ impl XrRenderer {
         fields: Vec<crate::renderer::proxy_field::ProxyField>,
         cards: Vec<crate::renderer::proxy_cards::ProxyCards>,
     ) {
-        // The models' cards, a row each; a proxy then names its row, and a set
-        // the atlas could not take leaves its proxies with none.
+        // The models' cards, two rows each (colours, then normals); a proxy
+        // then names its colours' row, and a set the atlas could not take
+        // leaves its proxies with none.
         match crate::renderer::proxy_cards::atlas(&self.wgpu_device, &self.wgpu_queue, &cards) {
             Some((view, rows)) => {
                 self.uniform_buf.set_proxy_card_atlas(view);
