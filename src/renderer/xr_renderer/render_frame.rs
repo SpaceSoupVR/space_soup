@@ -1552,6 +1552,9 @@ impl XrRenderer {
                                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                                 stencil_ops: None,
                             }),
+                            // Its own slots, `mirror_l`/`mirror_r`; the blur
+                            // levels' are `mips_l`/`mips_r`.
+                            timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(12 + eye)),
                             ..Default::default()
                         });
                         pass.set_pipeline(&self.floor_mirror_skinned.pipeline);
@@ -1565,7 +1568,13 @@ impl XrRenderer {
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
                     }
-                    self.floor_mirror_mips.record(&self.wgpu_device, &mut encoder, &target.mirror_levels[0]);
+                    self.floor_mirror_mips.record(
+                        &self.wgpu_device,
+                        &mut encoder,
+                        &target.mirror_levels[0],
+                        (target.width, target.height),
+                        self.pass_timers.as_ref().map(|t| (t, 14 + eye)),
+                    );
                 }
                 // Once a frame when stereo, like the scene pass it feeds.
                 if probe_pass && (!stereo || eye == 0) {
