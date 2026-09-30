@@ -526,6 +526,40 @@ impl XrRenderer {
         // one extra switch on top. See `levers`. Every feature below reads
         // this, never the phase, so a lever and a phase cannot disagree.
         let fx = self.levers.clone().with_phase(ab_phase);
+        // GLARE: each lamp's veil for this frame, seen from the head at this
+        // frame's exposure, drawn last in the scene pass. See `glare`.
+        // A lamp behind a wall is found in the probe pass's depth, when the
+        // pass runs this frame.
+        let glare_tests_walls = self.probe_pass_runs(&fx, self.stereo_scene(), brush_buffers.is_some());
+        let (glare_verts, glare_idx) = if fx.glare {
+            let eye_at = |v: &xr::View| glam::Vec3::new(v.pose.position.x, v.pose.position.y, v.pose.position.z);
+            crate::renderer::glare::build_glare(
+                &self.glare_sources,
+                [eye_at(&eye_views[0]), eye_at(&eye_views[1])],
+                cam_right,
+                cam_up,
+                post.exposure,
+                fx.glare_strength,
+                glare_tests_walls,
+                &self.glare_capsules,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let glare_buffers = (!glare_idx.is_empty()).then(|| {
+            (
+                self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("glare_vb"),
+                    contents: bytemuck::cast_slice(&glare_verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("glare_ib"),
+                    contents: bytemuck::cast_slice(&glare_idx),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+            )
+        });
         let no_shadow_phase = !fx.shadows;
         let want_sun = self.shadow_quality != ShadowQuality::Off && !no_shadow_phase;
         let want_spot = self.shadow_quality == ShadowQuality::SunAndSpot && !no_shadow_phase;
@@ -1279,7 +1313,7 @@ impl XrRenderer {
             // cannot share one upload, so the stereo one is written here, the
             // scene pass is submitted on its own below, and the per-eye upload
             // follows it. See the note at that submit.
-            let stereo = self.multiview_scene && self.stereo_pipelines.is_some();
+            let stereo = self.stereo_scene();
             // WHAT THIS PASS CAN SEE, for terrain chunk culling further down.
             //
             // BOTH eyes when the pass is stereo. A multiview pass draws the two
@@ -1388,15 +1422,9 @@ impl XrRenderer {
             }
             self.ssr_camera_uniform.upload(&self.wgpu_queue, eye_view_proj, cam_pos);
             // THE BRUSHES' REFLECTIONS AT HALF RESOLUTION, in their own pass
-            // before the scene pass reads them. See `brush_pipeline::probe_pass`.
-            // The diagnostic views keep the per-pixel shader, which is the only
-            // one that paints them. A stereo scene pass needs the two-eye pass,
-            // which the device may have refused (`StereoProbePass`).
-            let probe_pass = fx.half_res_reflections
-                && fx.probes
-                && (!stereo || self.stereo_probe.is_some())
-                && self.debug_view == crate::renderer::brush_pipeline::DebugView::Off
-                && brush_buffers.is_some();
+            // before the scene pass reads them. See `brush_pipeline::probe_pass`
+            // and `probe_pass_runs`.
+            let probe_pass = self.probe_pass_runs(&fx, stereo, brush_buffers.is_some());
             // Its pipelines and target: this eye's, or both eyes' at once.
             let (probe_pipeline, probe_reader, probe_target) = match (&self.stereo_probe, stereo) {
                 (Some(sp), true) => (&sp.pass, &sp.reader, &sp.target),
@@ -1850,6 +1878,18 @@ impl XrRenderer {
                         pass.set_vertex_buffer(0, particle_vb.slice(..));
                         pass.set_index_buffer(particle_ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..particle_idx.len() as u32, 0, 0..1);
+                    }
+                    // The lamps' veils, over everything the pass drew, hidden
+                    // where a surface stands nearer than the lamp.
+                    if let Some((glare_vb, glare_ib)) = glare_buffers.as_ref() {
+                        pass.set_pipeline(self.sp_glare(stereo));
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        // The probe pass's depth, for the walls: read only
+                        // when that pass ran (`glare_tests_walls`).
+                        pass.set_bind_group(1, &probe_target.bind_group, &[]);
+                        pass.set_vertex_buffer(0, glare_vb.slice(..));
+                        pass.set_index_buffer(glare_ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..glare_idx.len() as u32, 0, 0..1);
                     }
                 }
                 // THE STEREO SCENE PASS LANDS ON ITS OWN.

@@ -11,9 +11,13 @@
 //!
 //! ONE ATLAS, TWO ROWS A MODEL: row `2s` holds model `s`'s six cards side by
 //! side, card `k` at columns `k * R .. (k + 1) * R`, so the shader finds a card
-//! from its row, its number and the atlas's width alone. RGBA16Float: linear
-//! radiance, and in alpha how deep in the box the surface is (2 where the card
-//! saw nothing). Row `2s + 1` holds what the shader TESTS a card by: which
+//! from its row, its number and the atlas's width alone. RGBA16Float: radiance
+//! COMPRESSED as `c / (1 + luminance)` ([`compress`]), so that every average
+//! of it -- the mip chain, and the sampler's own bilinear and trilinear
+//! filtering -- counts a texel as far as it shows, as a display would, rather
+//! than letting a glowing mouth a thousand times white whiten every texel it
+//! touches (the shader expands what it reads); and in alpha how deep in the box
+//! the surface is (2 where the card saw nothing). Row `2s + 1` holds what the shader TESTS a card by: which
 //! way each texel's surface faces, in red and green -- in the CARD's frame,
 //! its u, v and the way it looks from, on a hemispherical octahedral map
 //! ([`to_card_octahedral`]): every surface a card saw faces it, so the map
@@ -94,7 +98,7 @@ pub fn atlas(device: &Device, queue: &Queue, sets: &[ProxyCards]) -> Option<(Tex
                     let t = c.texels[i];
                     let [nx, ny, nz] = c.normals[i];
                     let [ox, oy] = to_card_octahedral(face as usize, [nx, ny, nz]);
-                    level[((row * res + y) * width + face * res + x) as usize] = t;
+                    level[((row * res + y) * width + face * res + x) as usize] = compress(t);
                     level[(((row + 1) * res + y) * width + face * res + x) as usize] = [ox, oy, t[3], t[3]];
                 }
             }
@@ -151,24 +155,36 @@ pub fn atlas(device: &Device, queue: &Queue, sets: &[ProxyCards]) -> Option<(Tex
 /// `space_soup_engine::reflection_cards::CARD_MISS`.
 pub const MISS: f32 = 2.0;
 
-/// Four colour texels as one: the colour weighted by 1 / (1 + luminance) --
-/// Karis's firefly weight -- over those that saw something, and the nearest of
-/// their depths. A glowing mouth is sixty times brighter than the shade round
-/// it: averaged plainly, a texel a quarter mouth was still fifteen times
-/// white, and every far sconce reflected as a white blob the size of the
-/// footprint.
+/// A card texel as the atlas stores it: its colour `c / (1 + luminance)`,
+/// its depth as it was. See the module notes; `probe_card_vote` expands it.
+pub fn compress(t: [f32; 4]) -> [f32; 4] {
+    let shown = 1.0 + 0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2];
+    [t[0] / shown, t[1] / shown, t[2] / shown, t[3]]
+}
+
+/// [`compress`] undone.
+pub fn expand(t: [f32; 4]) -> [f32; 4] {
+    let left = (1.0 - (0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2])).max(1e-3);
+    [t[0] / left, t[1] / left, t[2] / left, t[3]]
+}
+
+/// Four colour texels as one: the mean of the compressed colours of those
+/// that saw something -- which, expanded, is the mean weighted by
+/// 1 / (1 + luminance), Karis's firefly weight -- and the nearest of their
+/// depths. A glowing mouth is sixty times brighter than the shade round it:
+/// averaged plainly, a texel a quarter mouth was still fifteen times white,
+/// and every far sconce reflected as a white blob the size of the footprint.
 fn merge_colours(four: &[[f32; 4]; 4]) -> [f32; 4] {
-    let (mut rgb, mut weight, mut near) = ([0.0f32; 3], 0.0f32, MISS);
+    let (mut rgb, mut count, mut near) = ([0.0f32; 3], 0.0f32, MISS);
     for t in four.iter().filter(|t| t[3] < MISS * 0.75) {
-        let w = 1.0 / (1.0 + 0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2]);
         for k in 0..3 {
-            rgb[k] += t[k] * w;
+            rgb[k] += t[k];
         }
-        weight += w;
+        count += 1.0;
         near = near.min(t[3]);
     }
-    if weight > 0.0 {
-        [rgb[0] / weight, rgb[1] / weight, rgb[2] / weight, near]
+    if count > 0.0 {
+        [rgb[0] / count, rgb[1] / count, rgb[2] / count, near]
     } else {
         [0.0, 0.0, 0.0, MISS]
     }
@@ -278,6 +294,30 @@ mod tests {
     /// on all six cards, the one looking along -z included (whose directions
     /// sat on the fold of a whole-sphere map, where two texels either side of
     /// the pole blended into the opposite pole).
+    #[test]
+    fn a_compressed_average_is_the_karis_weighted_one() {
+        // A glowing mouth, two texels of dark shade and one that saw nothing:
+        // the mip's texel, expanded, is Karis's weighted mean of the three
+        // that saw something.
+        let mouth = [600.0, 520.0, 380.0, 0.4];
+        let shade = [0.05, 0.04, 0.03, 0.5];
+        let missed = [0.0, 0.0, 0.0, MISS];
+        let merged = expand(merge_colours(&[compress(mouth), compress(shade), missed, compress(shade)]));
+        let luma = |c: [f32; 4]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let (wm, ws) = (1.0 / (1.0 + luma(mouth)), 1.0 / (1.0 + luma(shade)));
+        for k in 0..3 {
+            let want = (mouth[k] * wm + 2.0 * shade[k] * ws) / (wm + 2.0 * ws);
+            assert!((merged[k] - want).abs() < 1e-3 * want.max(1e-3), "channel {k}: {} vs {want}", merged[k]);
+        }
+        // A third mouth -- a third of what shows -- not two hundred times white.
+        assert!(luma(merged) < 1.0, "{merged:?}");
+        assert_eq!(merged[3], 0.4, "the nearest depth");
+        for c in [mouth, shade] {
+            let back = expand(compress(c));
+            assert!((0..3).all(|k| (back[k] - c[k]).abs() < 1e-3 * c[k].max(1e-3)), "{c:?} -> {back:?}");
+        }
+    }
+
     #[test]
     fn a_direction_a_card_sees_survives_its_map() {
         let dirs: [[f32; 3]; 6] = [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.48, -0.6, 0.64], [-0.3, 0.5, 0.81], [0.577, 0.577, 0.577], [0.1, -0.1, 0.99]];

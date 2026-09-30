@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn every_scene_shader_survives_the_multiview_transform() {
         use crate::renderer::{
-            brush_pipeline, layered_mesh_pipeline, mesh_pipeline, pipeline, sky,
+            brush_pipeline, glare, layered_mesh_pipeline, mesh_pipeline, particle, pipeline, sky,
             terrain_pipeline, water_pipeline,
         };
         let shaders: Vec<(&str, String)> = vec![
@@ -298,6 +298,8 @@ mod tests {
             ("terrain", terrain_pipeline::terrain_shader_src()),
             ("water", water_pipeline::water_shader_src()),
             ("sky", sky::sky_shader_src()),
+            ("particle", particle::particle_shader()),
+            ("glare", glare::glare_shader()),
         ];
         let mut broken = Vec::new();
         for (name, src) in &shaders {
@@ -309,6 +311,20 @@ mod tests {
             }
             if let Some(e) = multiview_validation_error(src) {
                 broken.push(format!("{name}: {e}"));
+            }
+            // ONE CAMERA FOR BOTH EYES: a shader carrying its own camera as a
+            // single matrix reads the left eye's in a stereo pass for both
+            // views. The particle shader did, from the day multiview landed --
+            // the right eye's particles drawn from the left eye -- and nothing
+            // here could say so, because it was valid WGSL (2026-09-30).
+            // `solid_ssr` carries the SSR pass's own camera (`SsrCamera`), one
+            // uniform per eye: that pass is never stereo (`SolidPipeline::new_ssr`).
+            let one_camera = *name != "solid_ssr" && src.match_indices("view_proj: mat4x4<f32>").any(|(at, _)| {
+                // `view_proj` itself, not `sun_view_proj` or `inv_view_proj`.
+                !src[..at].chars().next_back().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
+            if one_camera {
+                broken.push(format!("{name}: its camera is one matrix, not one a view (`view_proj[view_slot]`)"));
             }
         }
         assert!(

@@ -2088,8 +2088,10 @@ fn probe_secondary(
     }}
     // ACROSS A SOLID PROXY'S OUTLINE, the footprint's two parts: the
     // proxy, and what lies past it, by how much of the footprint the
-    // proxy covers. See `probe_proxy_hit`.
-    if (hit.edge_code >= 0) {{
+    // proxy covers. See `probe_proxy_hit`. A texel across a model's own
+    // outline carries that cover negated (`PROBE_SUBSAMPLE`).
+    let edge_cover = abs(hit.edge_cover);
+    if (hit.edge_code >= 0 && edge_cover < 0.99) {{
         // What lies past the proxy, where the ray hit it: traced again as
         // though it were not there. Else the proxy itself, at its outline.
         let edge_hit = probe_hit_edge_hit(hit);
@@ -2101,9 +2103,9 @@ fn probe_secondary(
         if (side.found) {{
             let x = probe_traced_colour(side, d, roughness, dir, probe_lod);
             if (edge_hit) {{
-                col = mix(x, col, hit.edge_cover);
+                col = mix(x, col, edge_cover);
             }} else {{
-                col = mix(col, x, hit.edge_cover);
+                col = mix(col, x, edge_cover);
             }}
         }}
     }}
@@ -2282,6 +2284,15 @@ fn probe_environment(
 const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.75;
 // How many rooms one reflection may cross: its own and two doorways on.
 const PROBE_TRACE_ROOMS: i32 = 3;
+// `ProbeHit::edge_cover`'s sign for a texel that straddles one of a model's
+// own outlines -- a lampshade's rim against its lit mouth, both the model --
+// where one ray decides the texel all rim or all mouth: the line between them
+// crawled as the head moved (offline crawl, 2026-09-30). The cover's size is
+// still the model's presence in a rough lobe, blended over what lies past it
+// as any model outline is. `probe_fixup` traces the texel again, rays spread
+// across its footprint or its lobe, and averages them; a pass that does not
+// defer keeps its one ray.
+const PROBE_SUBSAMPLE: f32 = -1.0;
 // Samples a ray takes inside a model's box looking for the model. See
 // `probe_proxy_surface`.
 const PROBE_PROXY_SAMPLES: i32 = 4;
@@ -2758,7 +2769,14 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip
         let spread = t_at * lobe;
         let presence = extent * extent / max(extent * extent + spread * spread, 1e-8);
         let cover = select(presence * (1.0 - smoothstep(0.0, 1.0, walk.z)), presence, touched);
-        if (out.edge < 0 && cover < 0.99 && cover > 0.004 && t_at > t0) {{
+        if (out.edge < 0 && touched && walk.z < 0.0) {{
+            // Past one of its own outlines: the texel is sampled again,
+            // several rays across it, and then blended over what lies past the
+            // model by its presence, as below. See `PROBE_SUBSAMPLE`.
+            out.edge = field_i;
+            out.edge_cover = PROBE_SUBSAMPLE * presence;
+            out.edge_t = walk.x;
+        }} else if (out.edge < 0 && cover < 0.99 && cover > 0.004 && t_at > t0) {{
             out.edge = field_i;
             out.edge_cover = cover;
             out.edge_t = t_at;
@@ -2797,6 +2815,12 @@ const PROXY_FIELD_STEPS: i32 = 32;
 // `near_t` -- the footprint as at a solid proxy's outline, the wider of the
 // lobe and the pixel there. The steps shorten as the ray grazes the model, so
 // they sample that minimum where it matters.
+//
+// A HIT PAST ONE OF THE MODEL'S OWN OUTLINES -- the ray passed within a
+// footprint of it, drew a footprint away again, and met the model further
+// on, as through a lampshade's mouth past its rim -- returns `near` -1
+// instead: the texel straddles the outline, and one ray would show it all
+// rim or all mouth. See `PROBE_SUBSAMPLE`.
 fn probe_proxy_field(lo: vec3<f32>, ld: vec3<f32>, half: vec3<f32>, t_in: f32, t_out: f32, field: i32, lobe: f32) -> vec3<f32> {{
     let slot = camera.proxy_fields[field * 3];
     let size = camera.proxy_fields[field * 3 + 1];
@@ -2813,6 +2837,7 @@ fn probe_proxy_field(lo: vec3<f32>, ld: vec3<f32>, half: vec3<f32>, t_in: f32, t
     var hit = 3.4e38;
     var near_t = t_in;
     var near = 3.4e38;
+    var passed = false;
     var t = t_in;
     for (var k = 0; k < PROXY_FIELD_STEPS && t <= t_out; k = k + 1) {{
         let dist = textureSampleLevel(proxy_field, probe_samp, clamp(fo + fd * t, lo_uvw, hi_uvw), 0.0).r * slot.w;
@@ -2830,9 +2855,10 @@ fn probe_proxy_field(lo: vec3<f32>, ld: vec3<f32>, half: vec3<f32>, t_in: f32, t
             near = r;
             near_t = t;
         }}
+        passed = passed || (near < 1.0 && r > near + 1.0);
         t = t + dist;
     }}
-    return vec3<f32>(hit, near_t, near);
+    return vec3<f32>(hit, near_t, select(near, -1.0, passed && hit < 3.0e38));
 }}
 
 // WHERE INSIDE A MODEL'S BOX the model itself is, between `t_in` and `t_out`;
@@ -3494,7 +3520,9 @@ fn probe_card_vote(row: f32, face: f32, uv: vec2<f32>, t: f32, depth: f32, field
         * (1.0 - smoothstep(back_tol, 2.0 * back_tol, behind))
         * (1.0 - smoothstep(front_tol, 2.0 * front_tol, in_front));
     var vote: ProbeCardVote;
-    vote.rgb = card.rgb;
+    // Stored compressed, so every filtered read averages as a display would:
+    // expanded back to radiance. See `proxy_cards`.
+    vote.rgb = card.rgb / max(1.0 - dot(card.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-3);
     vote.w = square * square * valid;
     vote.sure = valid * smoothstep(0.1, 0.3, abs(square));
     return vote;
@@ -3961,6 +3989,20 @@ fn environment_radiance(dir: vec3<f32>) -> vec3<f32> {{
 // that needs -- and premultiplied by its coverage, so the brush shader can
 // filter it across texels. Same arguments as `shade_material_env`, minus what
 // only the lights need. See `brush_pipeline::probe_pass`.
+// THE PROBE PASS STORES ITS REFLECTIONS COMPRESSED, as Karis's
+// `c / (1 + luminance)`, and the scene expands them after its bilinear read of
+// the half-resolution texels (`probe_pass_expand`, beside the reader in
+// `brush_pipeline::probe_pass`). A bulb's mouth reflected at a thousand times
+// white beside the dark shade round it was averaged as light: a texel a
+// hundredth bright still read as white, so the reflection's outline stood on
+// the dark texels' centres and jumped a whole texel at a time as the head
+// moved (offline crawl, 2026-09-30). Averaged compressed, each texel counts
+// as far as it shows, as a display averages, and the outline moves smoothly
+// between texels.
+fn probe_pass_compress(c: vec3<f32>) -> vec3<f32> {{
+    return c / (1.0 + dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)));
+}}
+
 fn probe_env_for_pass(
     world_pos: vec3<f32>,
     n: vec3<f32>,
@@ -3994,7 +4036,7 @@ fn probe_env_for_pass(
         PROBE_NORMALISATION && probe_brightness > 0.0,
     );
     let a = clamp(probe.a, 0.0, 1.0);
-    return vec4<f32>(probe.rgb * probe_scale * a, a);
+    return vec4<f32>(probe_pass_compress(probe.rgb * probe_scale) * a, a);
 }}
 
 // WHAT THE LAMP HALF OF `shade_material_env` NEEDS FROM ITS ENVIRONMENT HALF.
@@ -6618,8 +6660,15 @@ mod proxy_field_gpu_tests {
 
     /// Walk each box-local `(origin, direction)` through the field.
     fn walk(rays: &[(Vec3, Vec3)]) -> Option<Vec<f32>> {
+        walk_full(sphere(), rays, 0.0).map(|v| v.into_iter().map(|h| h[0]).collect())
+    }
+
+    /// Walk each box-local `(origin, direction)` through `field` with a
+    /// mirror's lobe and a pixel `pixel_footprint` wide on the surface it
+    /// left, the eye a metre from that: everything the walk returns.
+    fn walk_full(field: ProxyField, rays: &[(Vec3, Vec3)], pixel_footprint: f32) -> Option<Vec<[f32; 4]>> {
         let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
-        let (atlas, slots) = proxy_field::atlas(&device, &queue, &[sphere()])?;
+        let (atlas, slots) = proxy_field::atlas(&device, &queue, &[field])?;
         let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
         let mut u: Uniforms = bytemuck::Zeroable::zeroed();
         u.proxy_fields[0] = slots[0];
@@ -6628,20 +6677,22 @@ mod proxy_field_gpu_tests {
             wgsl_lights_block(0, 1),
             r#"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
-@group(1) @binding(1) var<storage, read_write> hits: array<f32>;
+@group(1) @binding(1) var<storage, read_write> hits: array<vec4<f32>>;
 @compute @workgroup_size(1)
 fn walk_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let o = rays[id.x * 2u].xyz;
     let d = normalize(rays[id.x * 2u + 1u].xyz);
     let half = vec3<f32>(rays[id.x * 2u].w);
+    pixel_footprint = rays[id.x * 2u + 1u].w;
+    probe_eye_distance = 1.0;
     // Where the ray is inside the box.
     let inv = 1.0 / d;
     let ta = (-half - o) * inv;
     let tb = (half - o) * inv;
     let t_in = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z));
     let t_out = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
-    // A mirror's lobe (0) and no pixel: the hit alone, as before.
-    hits[id.x] = probe_proxy_field(o, d, half, t_in, t_out, 0, 0.0).x;
+    // A mirror's lobe (0).
+    hits[id.x] = vec4<f32>(probe_proxy_field(o, d, half, t_in, t_out, 0, 0.0), 0.0);
 }
 "#
         );
@@ -6659,13 +6710,14 @@ fn walk_main(@builtin(global_invocation_id) id: vec3<u32>) {
             contents: bytemuck::bytes_of(&u),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let packed: Vec<[f32; 4]> = rays.iter().flat_map(|(o, d)| [[o.x, o.y, o.z, HALF], [d.x, d.y, d.z, 0.0]]).collect();
+        let packed: Vec<[f32; 4]> =
+            rays.iter().flat_map(|(o, d)| [[o.x, o.y, o.z, HALF], [d.x, d.y, d.z, pixel_footprint]]).collect();
         let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&packed),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let size = (rays.len() * 4) as u64;
+        let size = (rays.len() * 16) as u64;
         let hit_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size,
@@ -6707,8 +6759,31 @@ fn walk_main(@builtin(global_invocation_id) id: vec3<u32>) {
         queue.submit([enc.finish()]);
         read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-        let data: Vec<f32> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().ok()?).to_vec();
+        let data: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().ok()?).to_vec();
         Some(data)
+    }
+
+    /// A bowl of `RADIUS`, open upward: the lower half of a sphere's shell,
+    /// its rim the circle where it ends -- a lampshade's mouth turned over.
+    fn bowl() -> ProxyField {
+        const FINE: u32 = 48;
+        let cell = 2.0 * HALF / FINE as f32;
+        let reach = 4.0 * cell;
+        let mut distances = Vec::with_capacity((FINE * FINE * FINE) as usize);
+        for k in 0..FINE {
+            for j in 0..FINE {
+                for i in 0..FINE {
+                    let p = (Vec3::new(i as f32, j as f32, k as f32) + 0.5) * cell - HALF;
+                    let d = if p.y <= 0.0 {
+                        (p.length() - RADIUS).abs()
+                    } else {
+                        (p.x.hypot(p.z) - RADIUS).hypot(p.y)
+                    };
+                    distances.push(((d / reach).min(1.0) * 255.0).round() as u8);
+                }
+            }
+        }
+        ProxyField { dims: [FINE; 3], max_distance: reach, distances, albedo: [0.2; 3] }
     }
 
     /// Straight at the sphere, the walk stops on its surface; through its
@@ -6733,6 +6808,37 @@ fn walk_main(@builtin(global_invocation_id) id: vec3<u32>) {
         assert!((t[1] - chord).abs() < 3.0 * stop, "through its edge: t {} vs {}", t[1], chord);
         assert!(t[2] > 1e30, "five centimetres above it, a hit at {}", t[2]);
         assert!((t[3] - (1.0 - RADIUS)).abs() < 2.0 * stop, "from below: t {}", t[3]);
+    }
+
+    /// A HIT PAST THE MODEL'S OWN OUTLINE is marked for sampling again: a ray
+    /// that passes a centimetre over the bowl's rim, inside a footprint of it,
+    /// and meets its inside beyond, straddles the rim and its inside. Not one
+    /// straight down into it, nor one meeting its outside at a slant -- which
+    /// comes ever nearer, never away and back -- nor one skimming the rim and
+    /// out again, a near miss the outline fade already softens.
+    #[test]
+    fn a_hit_past_the_models_own_rim_is_sampled_again() {
+        let d = Vec3::new(1.0, -1.0, 0.0).normalize();
+        let over_rim = Vec3::new(-RADIUS, 0.0, 0.0) + Vec3::new(1.0, 1.0, 0.0).normalize() * 0.012;
+        let Some(h) = walk_full(
+            bowl(),
+            &[
+                (over_rim - d, d),
+                (Vec3::new(0.0, 0.9, 0.0), Vec3::NEG_Y),
+                (Vec3::new(-0.9, -0.19, 0.0), Vec3::X),
+                (Vec3::new(-0.9, 0.012, 0.0), Vec3::X),
+            ],
+            0.01,
+        ) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        // Past the rim, down the chord to the bottom of the bowl's far side.
+        assert!(h[0][0] > 1.1 && h[0][0] < 1.35, "over the rim, into the bowl: hit at {:?}", h[0]);
+        assert_eq!(h[0][2], -1.0, "straddles the rim: {:?}", h[0]);
+        assert!((h[1][0] - (0.9 + RADIUS)).abs() < 0.03 && h[1][2] >= 0.0, "straight down: {:?}", h[1]);
+        assert!(h[2][0] < 1e30 && h[2][2] >= 0.0, "a slanting hit on its outside: {:?}", h[2]);
+        assert!(h[3][0] > 1e30 && h[3][2] >= 0.0 && h[3][2] < 1.0, "skimming the rim, a near miss: {:?}", h[3]);
     }
 }
 

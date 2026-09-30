@@ -117,6 +117,28 @@ pub fn tonemap(color: Vec3, exposure: f32, mode: ToneMapping) -> Vec3 {
 /// drift: there is one set of numbers in this file and both readers use it.
 /// `camera.post_params` carries x = exposure, y = mode (0 = ACES, 1 = none).
 pub fn wgsl_tonemap_block() -> String {
+    format!(
+        "{}{}",
+        wgsl_aces_block(),
+        r#"
+// The last thing every lit fragment does. Output stays LINEAR: the swapchain is
+// Rgba8UnormSrgb, so the hardware does the sRGB encode on write, and doing it
+// here as well would gamma-correct twice and wash the whole image out.
+fn tonemap(color: vec3<f32>) -> vec3<f32> {
+    let exposed = color * max(camera.post_params.x, 0.0);
+    if (camera.post_params.y > 0.5) {
+        return clamp(exposed, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    return aces_fitted(exposed);
+}
+"#
+    )
+}
+
+/// [`aces_fitted`] alone, as WGSL, for a shader that tone maps light it has
+/// already exposed -- the glare's veil (`glare`), which must meet the display
+/// through the same curve as the scene it lies over.
+pub fn wgsl_aces_block() -> String {
     let i = ACES_INPUT;
     let o = ACES_OUTPUT;
     format!(
@@ -143,17 +165,6 @@ fn aces_fitted(color: vec3<f32>) -> vec3<f32> {{
         dot(c, vec3<f32>({o20}, {o21}, {o22})),
     );
     return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
-}}
-
-// The last thing every lit fragment does. Output stays LINEAR: the swapchain is
-// Rgba8UnormSrgb, so the hardware does the sRGB encode on write, and doing it
-// here as well would gamma-correct twice and wash the whole image out.
-fn tonemap(color: vec3<f32>) -> vec3<f32> {{
-    let exposed = color * max(camera.post_params.x, 0.0);
-    if (camera.post_params.y > 0.5) {{
-        return clamp(exposed, vec3<f32>(0.0), vec3<f32>(1.0));
-    }}
-    return aces_fitted(exposed);
 }}
 "#,
         i00 = i[0][0], i01 = i[0][1], i02 = i[0][2],

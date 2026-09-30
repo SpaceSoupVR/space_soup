@@ -1893,11 +1893,11 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
 /// generated WGSL. They change what the shader computes; nothing draws with them.
 const PROBE_PASS_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("cut_none", &[]),
-    ("cut_edge_lookup", &[("    if (hit.edge_code >= 0) {\n", "    if (false) {\n")]),
+    ("cut_edge_lookup", &[("    if (hit.edge_code >= 0 && edge_cover < 0.99) {\n", "    if (false) {\n")]),
     ("cut_rim_lookup", &[("    if (hit.rim >= 0.0) {\n", "    if (false) {\n")]),
     (
         "cut_both_lookups",
-        &[("    if (hit.edge_code >= 0) {\n", "    if (false) {\n"), ("    if (hit.rim >= 0.0) {\n", "    if (false) {\n")],
+        &[("    if (hit.edge_code >= 0 && edge_cover < 0.99) {\n", "    if (false) {\n"), ("    if (hit.rim >= 0.0) {\n", "    if (false) {\n")],
     ),
     ("cut_edge_detect", &[("        if (camera.probe_proxies[i * 3 + 1].w < 0.5 && out.edge < 0) {", "        if (false) {")]),
     ("cut_rim_detect", &[("        if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
@@ -1952,11 +1952,12 @@ struct ProbePassOut {
 
     /// Group 3 of the reading brush shader: the pass's colour and its depth,
     /// a bilinear sampler for the colour and a point sampler to gather the
-    /// depths. See `READER_WGSL`.
+    /// depths. See `READER_WGSL`. The depth is the glare's too, which reads
+    /// it per vertex to find whether a wall hides a lamp (`glare`).
     pub fn bind_group_layout(device: &Device) -> BindGroupLayout {
         let texture = |binding: u32, sample_type: TextureSampleType| BindGroupLayoutEntry {
             binding,
-            visibility: ShaderStages::FRAGMENT,
+            visibility: if binding == 1 { ShaderStages::VERTEX_FRAGMENT } else { ShaderStages::FRAGMENT },
             // Arrays, one layer an eye: the reader picks its eye's layer with
             // `view_slot`, which is 0 in a single-eye pass -- so one shader
             // serves the per-eye and the two-eye scene pass alike.
@@ -2096,14 +2097,21 @@ struct ProbePassOut {
 @group(3) @binding(2) var probe_pass_linear: sampler;
 @group(3) @binding(3) var probe_pass_point: sampler;
 
+// `probe_pass_compress` undone: the pass stores `c / (1 + luminance)`, so the
+// filter averages texels as a display shows them. See the lights block.
+fn probe_pass_expand(c: vec3<f32>) -> vec3<f32> {
+    return c / max(1.0 - dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-3);
+}
+
 // THE HALF-RESOLUTION PROBE REFLECTION AT THIS PIXEL: the four pass texels
 // around it, weighted bilinearly and kept only where their depth is this
 // pixel's -- the same surface -- so a reflection never bleeds across a
 // silhouette. `tolerance` is how far two depths may differ and still be one
 // surface, from this pixel's own depth slope. With no neighbour on this surface
 // (a sliver the half-resolution pass missed), the nearest in depth. The pass
-// stores the reflection premultiplied by its coverage, which is what makes the
-// weighted sum a correct filter; it is divided back out here.
+// stores the reflection compressed (`probe_pass_compress`) and premultiplied by
+// its coverage, which is what makes the weighted sum a correct filter; both
+// are undone here.
 //
 // TWO READS WHERE IT CAN BE, EIGHT WHERE IT MUST. The four depths come in one
 // gather. When all four are this pixel's surface -- everywhere but along an
@@ -2124,7 +2132,7 @@ fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32) -> vec4<f32
     let gaps = abs(textureGather(probe_pass_depth, probe_pass_point, uv, view_slot) - vec4<f32>(depth)).wzxy;
     if (all(gaps <= vec4<f32>(tolerance))) {
         let pre = textureSampleLevel(probe_pass_tex, probe_pass_linear, uv, view_slot, 0.0);
-        return vec4<f32>(pre.rgb / max(pre.a, 1e-4), pre.a);
+        return vec4<f32>(probe_pass_expand(pre.rgb / max(pre.a, 1e-4)), pre.a);
     }
     let size = vec2<i32>(dims);
     let h = pixel * 0.5 - vec2<f32>(0.5);
@@ -2146,7 +2154,7 @@ fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32) -> vec4<f32
     if (gaps.w < nearest_gap) { nearest_gap = gaps.w; nearest = c11; }
     let sum = c00 * w.x + c10 * w.y + c01 * w.z + c11 * w.w;
     let pre = select(nearest, sum / max(weight, 1e-6), weight > 1e-4);
-    return vec4<f32>(pre.rgb / max(pre.a, 1e-4), pre.a);
+    return vec4<f32>(probe_pass_expand(pre.rgb / max(pre.a, 1e-4)), pre.a);
 }
 "#;
 }
@@ -4612,10 +4620,15 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
                 let pre = if weight > 1e-4 { sum.map(|v| v / weight) } else { nearest };
                 let want = [pre[0] / pre[3].max(1e-4), pre[1] / pre[3].max(1e-4), pre[2] / pre[3].max(1e-4), pre[3]];
                 let i = ((y * W + x) * 4) as usize;
+                // The reader expands what it filtered (`probe_pass_expand`):
+                // compressed back, the filter is checked where it filters.
+                let luma = |c: &[f32]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                let shown = 1.0 + luma(&got[i..i + 3]);
+                let filtered = [got[i] / shown, got[i + 1] / shown, got[i + 2] / shown, got[i + 3]];
                 for k in 0..4 {
-                    let d = (got[i + k] - want[k]).abs();
+                    let d = (filtered[k] - want[k]).abs();
                     worst = worst.max(d);
-                    assert!(d < 4e-3, "pixel ({x}, {y}) channel {k}: {} against {}", got[i + k], want[k]);
+                    assert!(d < 4e-3, "pixel ({x}, {y}) channel {k}: {} against {}", filtered[k], want[k]);
                 }
             }
         }

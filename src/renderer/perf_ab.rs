@@ -99,10 +99,12 @@ pub enum Phase {
     /// Every pixel of the eye images shaded: what fixed foveated rendering
     /// saves.
     NoFoveation,
+    /// No glare: the lamps' veils (`glare`) left undrawn. What they cost.
+    NoGlare,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 20] = [
+    pub const ALL: [Phase; 21] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -123,6 +125,7 @@ impl Phase {
         Phase::TerrainPerPixelReflections,
         Phase::NoGroundTrace,
         Phase::NoFoveation,
+        Phase::NoGlare,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -166,6 +169,7 @@ impl Phase {
             Phase::TerrainPerPixelReflections => "terrain_per_pixel_reflections",
             Phase::NoGroundTrace => "no_ground_trace",
             Phase::NoFoveation => "no_foveation",
+            Phase::NoGlare => "no_glare",
         }
     }
 }
