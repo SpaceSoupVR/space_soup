@@ -1298,6 +1298,41 @@ impl BrushPipeline {
         )
     }
 
+    /// MEASUREMENT ONLY: the shipped probe pass with one of
+    /// `DEFERRED_REGISTER_CUTS` applied, to DRAW with (the `pass_cut` lever) --
+    /// so what a part costs by its presence is measured on the headset without
+    /// a build. `None` when `cut` names no entry or no longer matches.
+    pub fn new_probe_pass_deferred_with_cut(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        cut: &str,
+    ) -> Option<Self> {
+        let (label, edits) = DEFERRED_REGISTER_CUTS.iter().find(|(label, _)| *label == cut)?;
+        let mut src = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
+        for (from, to) in edits.iter() {
+            if !src.contains(from) {
+                return None;
+            }
+            src = src.replacen(from, to, 1);
+        }
+        if device.features().contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
+            src = src.replacen(FS_MAIN, "@fragment @early_depth_test(force) fn fs_main(", 1);
+        }
+        Some(Self::from_source(
+            device,
+            probe_pass::FORMAT,
+            uniform_layout,
+            FrontFace::Ccw,
+            1,
+            None,
+            crate::renderer::multiview::ViewMode::Mono,
+            Some(fixups.pass_layout()),
+            label,
+            src,
+        ))
+    }
+
     /// The scene pass's opaque brush, reading its probe reflection from that
     /// pass through group 3 (`probe_pass::bind_group_layout`) instead of
     /// tracing it per pixel.
@@ -1859,6 +1894,25 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("def_cut_proxy_surface", &[("    if (s0 < 0) {\n        return 3.4e38;\n    }", "    if (true) {\n        return 3.4e38;\n    }")]),
     ("def_cut_escape_colour", &[("    if (h.escaped) {\n        col = probe_escape_colour(", "    if (false) {\n        col = probe_escape_colour(")]),
     ("def_cut_untraced", &[("    return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);", "    return own;")]),
+    // PRESENCE, not execution: code that runs for nothing while its lever is
+    // off still costs on this GPU (see `shader-code-size` in the notes). The
+    // floor mirror's blend (off as shipped), every character in the pass, and
+    // SpaceWarp's reach target.
+    (
+        "def_cut_floor_mirror",
+        &[(
+            "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, refl, roughness, env, probe);\n    }",
+            "    probe = capsule_reflection(world_pos, refl, roughness, env, probe);",
+        )],
+    ),
+    (
+        "def_cut_characters",
+        &[(
+            "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, refl, roughness, env, probe);\n    }",
+            "",
+        )],
+    ),
+    ("def_cut_reach", &[("    return ProbePassOut(reflection, probe_reach);", "    return ProbePassOut(reflection, 0.0);")]),
 ];
 
 /// MEASUREMENT ONLY: the scene pass's brush shader (the one reading the probe
@@ -1921,6 +1975,7 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
         &[("    receiver_sun_mask = select(-1.0, smoothstep(-sun_w, sun_w, sun_d), sun_mask.g > 0.25);", "    receiver_sun_mask = -1.0;")],
     ),
     ("scene_cut_terminator_aa", &[("    terminator_width = terminator_width_of(length(tn));", "")]),
+    ("scene_cut_contact", &[("    let contact = capsule_ambient(world_pos, n);", "    let contact = 1.0;")]),
 ];
 
 /// MEASUREMENT ONLY: what `BrushPipeline::log_probe_pass_register_cuts` cuts
