@@ -143,6 +143,10 @@ pub struct Levers {
     /// --eye-capture` drives it. Captures only: it changes nothing drawn, so
     /// it is not in `summary`.
     pub eye_capture: u32,
+    /// Each lamp's terminator shaded over the pixel's footprint rather than at
+    /// its centre, so normal-mapped stone lit at a grazing angle does not
+    /// flip whole pixels between lit and black. See `lights::terminator_aa`.
+    pub terminator_aa: bool,
     /// The lamps' veils: each light source's glare, drawn where an HDR
     /// framebuffer would have bloomed it. See `glare`.
     pub glare: bool,
@@ -155,6 +159,13 @@ pub struct Levers {
     /// wherever a mirrored body could be in view -- which, with the Quest's
     /// tall field of view, is most views (2026-09-30). On once they cost less.
     pub floor_mirror: bool,
+    /// The CPU performance level asked of the runtime. `None` asks nothing,
+    /// as shipped: the app keeps the level it started at. See
+    /// `performance_level`.
+    pub cpu_level: Option<crate::renderer::performance_level::PerformanceLevel>,
+    /// The GPU's, likewise. Play ran at GPU level 2 with nothing asked
+    /// (2026-09-29); this is the lever for when the game needs more.
+    pub gpu_level: Option<crate::renderer::performance_level::PerformanceLevel>,
     /// Metres past which the terrain's layer normal maps fade out; 0 keeps
     /// them everywhere. See `terrain_pipeline` (`post_params.z`).
     pub terrain_detail_distance: f32,
@@ -207,9 +218,12 @@ impl Default for Levers {
             space_warp: true,
             space_warp_debug: 0,
             eye_capture: 0,
+            terminator_aa: true,
             glare: true,
             glare_strength: 1.0,
             floor_mirror: false,
+            cpu_level: None,
+            gpu_level: None,
             terrain_detail_distance: 0.0,
             gpu_sync: false,
             ssr: None,
@@ -261,9 +275,16 @@ impl Levers {
             Phase::NoGroundTrace => l.ground_trace = false,
             Phase::NoFoveation => l.foveation = crate::renderer::foveation::FoveationLevel::Off,
             Phase::NoGlare => l.glare = false,
+            Phase::NoTerminatorAa => l.terminator_aa = false,
             Phase::FloorMirror => l.floor_mirror = true,
         }
         l
+    }
+
+    /// The performance levels asked for, CPU then GPU, as
+    /// `performance_level::requests` takes them.
+    pub fn performance_levels(&self) -> [Option<crate::renderer::performance_level::PerformanceLevel>; 2] {
+        [self.cpu_level, self.gpu_level]
     }
 
     /// What differs from the shipped state, for the `PERF` line: `-` when
@@ -297,6 +318,7 @@ impl Levers {
         flag("ground_trace", self.ground_trace, d.ground_trace);
         flag("space_warp", self.space_warp, d.space_warp);
         flag("glare", self.glare, d.glare);
+        flag("terminator_aa", self.terminator_aa, d.terminator_aa);
         flag("floor_mirror", self.floor_mirror, d.floor_mirror);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("half_viewport", self.half_viewport, d.half_viewport);
@@ -310,6 +332,12 @@ impl Levers {
         }
         if self.glare && self.glare_strength != d.glare_strength {
             out.push(format!("glare_strength={}", self.glare_strength));
+        }
+        if let Some(level) = self.cpu_level {
+            out.push(format!("cpu_level={}", level.label()));
+        }
+        if let Some(level) = self.gpu_level {
+            out.push(format!("gpu_level={}", level.label()));
         }
         if self.terrain_detail_distance != d.terrain_detail_distance {
             out.push(format!("terrain_detail={}", self.terrain_detail_distance));
@@ -390,6 +418,18 @@ mod tests {
         assert!(!l.probe_trace && l.ssr == Some(true));
         assert_eq!(Levers { probe_trace: true, ssr: None, ..l.clone() }, Levers::default());
         assert_eq!(l.summary(), "no_probe_trace,ssr=on");
+    }
+
+    /// A clock request is named on every line measured under it, since it
+    /// moves every timing; a level the extension does not have is refused.
+    #[test]
+    fn a_performance_level_is_read_and_named() {
+        use crate::renderer::performance_level::PerformanceLevel;
+        let l = Levers::parse(r#"{"gpu_level": "sustained_high", "cpu_level": "boost"}"#).unwrap();
+        assert_eq!(l.performance_levels(), [Some(PerformanceLevel::Boost), Some(PerformanceLevel::SustainedHigh)]);
+        assert_eq!(l.summary(), "cpu_level=boost,gpu_level=sustained_high");
+        assert_eq!(Levers::default().performance_levels(), [None, None]);
+        assert!(Levers::parse(r#"{"gpu_level": "max"}"#).is_err());
     }
 
     /// A misspelt lever measures nothing and would look like a finding.

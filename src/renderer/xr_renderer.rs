@@ -614,6 +614,9 @@ pub struct XrRenderer {
     /// The runtime's counters, logged beside `PERF`. `None` without the
     /// extension. See `xr::perf_metrics`.
     perf_metrics: Option<crate::xr::PerfMetrics>,
+    /// The performance levels the levers ask for. `None` without the
+    /// extension. See `performance_level`.
+    perf_settings: Option<crate::xr::PerfSettings>,
     /// Those counters summed over the window's measured frames.
     perf_metric_window: crate::perf_metrics_log::WindowMeans,
     /// Where each window is also written, one JSON line apiece: the host
@@ -1512,6 +1515,7 @@ impl XrRenderer {
             // The first window pays for startup: streaming, pipeline caches.
             perf_warmup: true,
             perf_metrics: crate::xr::PerfMetrics::new(&xr_ctx.instance, session),
+            perf_settings: crate::xr::PerfSettings::new(&xr_ctx.instance, session),
             perf_metric_window: Default::default(),
             perf_log: None,
             started_at: std::time::Instant::now(),
@@ -2060,6 +2064,17 @@ impl XrRenderer {
             }
         }
         self.set_auto_exposure(levers.eye_adaptation);
+        let requests = crate::renderer::performance_level::requests(
+            self.levers.performance_levels(),
+            levers.performance_levels(),
+        );
+        match &self.perf_settings {
+            Some(settings) => requests.into_iter().for_each(|(domain, level)| settings.request(domain, level)),
+            None if !requests.is_empty() => {
+                log::warn!("LEVERS: a performance level asked, but the runtime has no XR_EXT_performance_settings")
+            }
+            None => {}
+        }
         self.levers = levers;
     }
 
