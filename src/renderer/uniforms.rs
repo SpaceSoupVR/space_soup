@@ -129,6 +129,12 @@ pub struct Uniforms {
     ///
     /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
     pub proxy_fields: [super::proxy_field::FieldSlot; super::proxy_field::MAX_PROXY_FIELDS],
+    /// WHICH CARDS PICTURE EACH PROXY: entry `i` at `[i / 4][i % 4]`, the
+    /// proxy's row in the card atlas plus one, 0 for none. See `proxy_cards`
+    /// and [`ProbeUpload::proxy_cards`].
+    ///
+    /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
+    pub proxy_cards: [[f32; 4]; MAX_PROXIES / 4],
     /// THE BUILDINGS' OUTSIDES for reflections that leave a building: two vec4
     /// each, `[min.xyz, cube layer]` and `[max.xyz, 0]`, world space; how many
     /// in `portal_params.w`. See [`ProbeUpload::set_buildings`].
@@ -157,6 +163,7 @@ pub const MAX_BUILDINGS: usize = 8;
 /// on the uniform (48 bytes each), not on the per-pixel cost. Residency picks
 /// the nearest to the player each frame.
 pub const MAX_PROXIES: usize = 16;
+const _: () = assert!(MAX_PROXIES % 4 == 0, "`proxy_cards` packs four proxies a vec4");
 
 /// How many doorway portals the shader walks per fragment.
 ///
@@ -432,6 +439,8 @@ pub struct UniformBuffer {
     ground_view: TextureView,
     /// Standing models' distance fields, bound at 11. See `proxy_field`.
     proxy_field_view: TextureView,
+    /// Standing models' cards, bound at 12. See `proxy_cards`.
+    proxy_card_view: TextureView,
 }
 
 impl UniformBuffer {
@@ -455,6 +464,12 @@ impl UniformBuffer {
     /// [`ProbeUpload::proxy_fields`].
     pub fn set_proxy_field_atlas(&mut self, view: TextureView) {
         self.proxy_field_view = view;
+    }
+
+    /// Bind this atlas of model cards from the next [`Self::rebind_probes`]
+    /// on. Which row each proxy reads travels in [`ProbeUpload::proxy_cards`].
+    pub fn set_proxy_card_atlas(&mut self, view: TextureView) {
+        self.proxy_card_view = view;
     }
 
     pub fn set_probes(&mut self, probes: ProbeUpload) {
@@ -642,11 +657,23 @@ impl UniformBuffer {
                     },
                     count: None,
                 },
+                // Standing models' cards. See `proxy_cards`.
+                BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let (probe_depth_view, probe_depth_sampler) = default_probe_depth(device);
         let ground_view = default_ground_map(device);
         let proxy_field_view = super::proxy_field::none(device);
+        let proxy_card_view = super::proxy_cards::none(device);
 
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("uniform_bg"),
@@ -688,6 +715,7 @@ impl UniformBuffer {
                 BindGroupEntry { binding: 9, resource: BindingResource::Sampler(&probe_depth_sampler) },
                 BindGroupEntry { binding: 10, resource: BindingResource::TextureView(&ground_view) },
                 BindGroupEntry { binding: 11, resource: BindingResource::TextureView(&proxy_field_view) },
+                BindGroupEntry { binding: 12, resource: BindingResource::TextureView(&proxy_card_view) },
             ],
         });
 
@@ -700,6 +728,7 @@ impl UniformBuffer {
             probe_depth_sampler,
             ground_view,
             proxy_field_view,
+            proxy_card_view,
         }
     }
 
@@ -861,6 +890,7 @@ impl UniformBuffer {
             probe_rooms: room_tables,
             ground_params: dense.ground,
             proxy_fields: dense.proxy_fields,
+            proxy_cards: dense.proxy_cards,
             building_boxes: probes.buildings,
             capsules: player.capsules.capsules,
             capsule_groups: player.capsules.groups,
@@ -1096,6 +1126,10 @@ pub struct ProbeUpload {
     /// WHERE EACH MODEL'S DISTANCE FIELD LIES in the atlas, as
     /// `proxy_field::atlas` placed it. See `proxy_field::FieldSlot`.
     pub proxy_fields: [super::proxy_field::FieldSlot; super::proxy_field::MAX_PROXY_FIELDS],
+    /// WHICH CARDS PICTURE EACH LIVE PROXY: entry `i` at `[i / 4][i % 4]`,
+    /// its row in the card atlas plus one, 0 for none -- a zeroed uniform
+    /// selects no cards. Filled by [`Self::set_proxies`]. See `proxy_cards`.
+    pub proxy_cards: [[f32; 4]; MAX_PROXIES / 4],
     /// The buildings' outsides: `[min.xyz, layer]`, `[max.xyz, 0]` each. See
     /// [`Self::set_buildings`].
     pub buildings: [[f32; 4]; MAX_BUILDINGS * 2],
@@ -1124,6 +1158,10 @@ pub struct ProbeProxy {
     /// The model's distance field: an index into the fields the level
     /// installed (`XrRenderer::set_reflection_proxies`). See `proxy_field`.
     pub field: Option<u32>,
+    /// The model's cards: its row in the card atlas the level installed
+    /// (`XrRenderer::set_reflection_cards`), which colour it in reflections.
+    /// See `proxy_cards`.
+    pub cards: Option<u32>,
 }
 
 /// One doorway between two probe volumes, as the level's bake found it.
@@ -1218,7 +1256,9 @@ impl ProbeUpload {
             .collect();
         near.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         self.proxy_count = near.len().min(MAX_PROXIES) as u32;
+        self.proxy_cards = [[0.0; 4]; MAX_PROXIES / 4];
         for (i, (_, p)) in near.iter().take(MAX_PROXIES).enumerate() {
+            self.proxy_cards[i / 4][i % 4] = p.cards.map_or(0.0, |row| row as f32 + 1.0);
             let q = p.rotation.normalize();
             self.proxies[i] = [
                 [p.centre.x, p.centre.y, p.centre.z, p.volume as f32],
@@ -1414,6 +1454,7 @@ impl Default for ProbeUpload {
             ground: [0.0; 4],
             ground_top: NO_GROUND,
             proxy_fields: [[[0.0; 4]; 3]; super::proxy_field::MAX_PROXY_FIELDS],
+            proxy_cards: [[0.0; 4]; MAX_PROXIES / 4],
             buildings: [[0.0; 4]; MAX_BUILDINGS * 2],
             building_count: 0,
         }
@@ -1871,6 +1912,7 @@ impl UniformBuffer {
                 BindGroupEntry { binding: 9, resource: BindingResource::Sampler(&self.probe_depth_sampler) },
                 BindGroupEntry { binding: 10, resource: BindingResource::TextureView(&self.ground_view) },
                 BindGroupEntry { binding: 11, resource: BindingResource::TextureView(&self.proxy_field_view) },
+                BindGroupEntry { binding: 12, resource: BindingResource::TextureView(&self.proxy_card_view) },
             ],
         });
         self.probes = probes;
@@ -2428,7 +2470,7 @@ mod dense_room_tests {
         let mut u = upload(&[7, 3]);
         let portal = |low, high| ProbePortal { min: Vec3::ZERO, max: Vec3::ONE, axis: 0, low, high, wall: None };
         u.set_portals(&[portal(7, 3), portal(3, 42)], Vec3::ZERO, &[7, 3]);
-        let proxy = |volume| ProbeProxy { centre: Vec3::ZERO, half_size: Vec3::ONE, rotation: Quat::IDENTITY, volume, solid: true, field: None };
+        let proxy = |volume| ProbeProxy { centre: Vec3::ZERO, half_size: Vec3::ONE, rotation: Quat::IDENTITY, volume, solid: true, field: None, cards: None };
         u.set_proxies(&[proxy(3)], Vec3::ZERO, &[7, 3]);
         let (dense, _) = u.dense_rooms();
         let sides: Vec<(f32, f32)> = (0..2).map(|p| (dense.portals[p][1][3], dense.portals[p][2][0])).collect();
@@ -2446,7 +2488,7 @@ mod dense_room_tests {
         let portal = |low, high| ProbePortal { min: Vec3::ZERO, max: Vec3::ONE, axis: 0, low, high, wall: None };
         // Nearest first: all at the origin, so they keep this order.
         u.set_portals(&[portal(10, 20), portal(20, 30), portal(10, 30), portal(30, 99)], Vec3::ZERO, &[10, 20, 30]);
-        let proxy = |volume| ProbeProxy { centre: Vec3::ZERO, half_size: Vec3::ONE, rotation: Quat::IDENTITY, volume, solid: true, field: None };
+        let proxy = |volume| ProbeProxy { centre: Vec3::ZERO, half_size: Vec3::ONE, rotation: Quat::IDENTITY, volume, solid: true, field: None, cards: None };
         u.set_proxies(&[proxy(20), proxy(10), proxy(20), proxy(99)], Vec3::ZERO, &[10, 20, 30]);
         let (dense, t) = u.dense_rooms();
         let at = |row: usize, k: usize| t[row + k / 4][k % 4];
