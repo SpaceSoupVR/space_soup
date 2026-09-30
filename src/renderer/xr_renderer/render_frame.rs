@@ -799,11 +799,22 @@ impl XrRenderer {
                     )
                 })
                 .collect();
+            // Capsule by capsule, not the whole body's bound: a body's bound
+            // is a two-metre cube whose corners, mirrored under the floor,
+            // reach into the bottom of almost any view, where its limbs --
+            // straight below the player -- are far out of sight until the
+            // player looks down.
+            let mirrored = |v: [f32; 4]| glam::Vec3::new(v[0], 2.0 * probe_pass::FLOOR_MIRROR_PLANE - v[1], v[2]);
             (0..frame_player.capsules.group_count as usize).any(|g| {
-                let b = frame_player.capsules.groups[g * 2];
-                let c = glam::Vec3::new(b[0], 2.0 * probe_pass::FLOOR_MIRROR_PLANE - b[1], b[2]);
-                let r = glam::Vec3::splat(b[3]);
-                frusta.iter().any(|planes| crate::renderer::shadow::aabb_in_frustum(planes, c - r, c + r))
+                let count = frame_player.capsules.groups[g * 2 + 1][3] as usize;
+                (0..count).any(|k| {
+                    let i = g * crate::renderer::uniforms::CAPSULES_PER_GROUP + k;
+                    let (a, b) = (frame_player.capsules.capsules[i * 2], frame_player.capsules.capsules[i * 2 + 1]);
+                    let (a3, b3) = (mirrored(a), mirrored(b));
+                    let r = glam::Vec3::splat(a[3]);
+                    let (lo, hi) = (a3.min(b3) - r, a3.max(b3) + r);
+                    frusta.iter().any(|planes| crate::renderer::shadow::aabb_in_frustum(planes, lo, hi))
+                })
             })
         };
         frame_player.capsules.floor_mirror = fx.floor_mirror
