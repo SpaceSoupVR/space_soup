@@ -2187,8 +2187,10 @@ struct ProbePassOut {
                 format: MIRROR_FORMAT,
                 // COPY_SRC and COPY_DST so a test can fill a level and read
                 // its blur back. See `the_floor_mirrors_blur_levels_average_the_level_below`.
+                // STORAGE_BINDING: its blur levels are written by `MirrorMips`.
                 usage: TextureUsages::RENDER_ATTACHMENT
                     | TextureUsages::TEXTURE_BINDING
+                    | TextureUsages::STORAGE_BINDING
                     | TextureUsages::COPY_SRC
                     | TextureUsages::COPY_DST,
                 view_formats: &[],
@@ -2270,115 +2272,166 @@ struct ProbePassOut {
     /// Premultiplied colour averages with its coverage, so an outline blurs
     /// into what lies past it rather than into black.
     pub struct MirrorMips {
-        pipeline: wgpu::RenderPipeline,
-        layout: BindGroupLayout,
-        sampler: Sampler,
+        /// One pipeline and layout for each number of blur levels (1..=4),
+        /// since a storage binding per level cannot be left empty.
+        variants: Vec<(wgpu::ComputePipeline, BindGroupLayout)>,
     }
 
     impl MirrorMips {
         pub fn new(device: &Device) -> Self {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("floor_mirror_mips"),
-                source: wgpu::ShaderSource::Wgsl(MIRROR_MIPS_WGSL.into()),
-            });
-            let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-                label: Some("floor_mirror_mips_layout"),
-                entries: &[
-                    BindGroupLayoutEntry {
+            let variants = (1..MIRROR_MIPS as usize)
+                .map(|n| {
+                    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("floor_mirror_mips"),
+                        source: wgpu::ShaderSource::Wgsl(mirror_mips_wgsl(n).into()),
+                    });
+                    let mut entries = vec![BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: ShaderStages::FRAGMENT,
+                        visibility: ShaderStages::COMPUTE,
                         ty: BindingType::Texture {
-                            sample_type: TextureSampleType::Float { filterable: true },
+                            sample_type: TextureSampleType::Float { filterable: false },
                             view_dimension: TextureViewDimension::D2,
                             multisampled: false,
                         },
                         count: None,
-                    },
-                    BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: ShaderStages::FRAGMENT,
-                        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    }];
+                    entries.extend((1..=n as u32).map(|k| BindGroupLayoutEntry {
+                        binding: k,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: MIRROR_FORMAT,
+                            view_dimension: TextureViewDimension::D2,
+                        },
                         count: None,
-                    },
-                ],
-            });
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("floor_mirror_mips"),
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("floor_mirror_mips"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("fs"),
-                    targets: &[Some(MIRROR_FORMAT.into())],
-                    compilation_options: Default::default(),
-                }),
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-            let sampler = device.create_sampler(&SamplerDescriptor {
-                label: Some("floor_mirror_mips"),
-                address_mode_u: AddressMode::ClampToEdge,
-                address_mode_v: AddressMode::ClampToEdge,
-                mag_filter: FilterMode::Linear,
-                min_filter: FilterMode::Linear,
-                ..Default::default()
-            });
-            Self { pipeline, layout, sampler }
+                    }));
+                    let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                        label: Some("floor_mirror_mips_layout"),
+                        entries: &entries,
+                    });
+                    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("floor_mirror_mips"),
+                        bind_group_layouts: &[Some(&layout)],
+                        immediate_size: 0,
+                    });
+                    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("floor_mirror_mips"),
+                        layout: Some(&pipeline_layout),
+                        module: &module,
+                        entry_point: Some("main"),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    });
+                    (pipeline, layout)
+                })
+                .collect();
+            Self { variants }
         }
 
-        /// Every level above the first of `levels` (one layer's), each from
-        /// the one below.
-        pub fn record(&self, device: &Device, encoder: &mut wgpu::CommandEncoder, levels: &[TextureView]) {
-            for k in 1..levels.len() {
-                let bind = device.create_bind_group(&BindGroupDescriptor {
-                    label: Some("floor_mirror_mips"),
-                    layout: &self.layout,
-                    entries: &[
-                        BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&levels[k - 1]) },
-                        BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&self.sampler) },
-                    ],
-                });
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("floor_mirror_mips"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &levels[k],
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-                    })],
-                    ..Default::default()
-                });
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &bind, &[]);
-                pass.draw(0..3, 0..1);
-            }
+        /// Every level above the first of `levels` (one layer's), in ONE
+        /// compute dispatch: each workgroup takes a 32 x 32 block of the first
+        /// level and makes all four above it through workgroup memory. It
+        /// replaced a render pass per level -- eight a frame, whose fixed
+        /// cost was all they cost: 0.2 ms an eye on the headset (2026-09-30).
+        /// `size`: the first level's width and height; `timer`: a pass
+        /// timer's slot for the dispatch.
+        pub fn record(
+            &self,
+            device: &Device,
+            encoder: &mut wgpu::CommandEncoder,
+            levels: &[TextureView],
+            size: (u32, u32),
+            timer: Option<(&crate::renderer::pass_timers::PassTimers, usize)>,
+        ) {
+            let n = levels.len().saturating_sub(1);
+            let Some((pipeline, layout)) = n.checked_sub(1).and_then(|i| self.variants.get(i)) else {
+                return;
+            };
+            let entries: Vec<BindGroupEntry> =
+                levels.iter().enumerate().map(|(k, view)| BindGroupEntry { binding: k as u32, resource: BindingResource::TextureView(view) }).collect();
+            let bind = device.create_bind_group(&BindGroupDescriptor { label: Some("floor_mirror_mips"), layout, entries: &entries });
+            let (w, h) = (size.0 / 2, size.1 / 2);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("floor_mirror_mips"),
+                timestamp_writes: timer.and_then(|(timers, slot)| timers.compute_writes(slot)),
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(w.div_ceil(16).max(1), h.div_ceil(16).max(1), 1);
         }
     }
 
-    /// One blur level from the level below: its texel's centre is the corner
-    /// four texels below share, where one bilinear read is their mean.
-    const MIRROR_MIPS_WGSL: &str = r#"
-@group(0) @binding(0) var below: texture_2d<f32>;
-@group(0) @binding(1) var below_samp: sampler;
-@vertex
-fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
-    let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
-    return vec4<f32>(xy, 0.0, 1.0);
-}
-@fragment
-fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let uv = (floor(pos.xy) * 2.0 + 1.0) / vec2<f32>(textureDimensions(below));
-    return textureSampleLevel(below, below_samp, uv, 0.0);
-}
+    /// The blur levels' compute shader for `n` levels above the first: level k
+    /// is the mean of the four texels of level k-1 below it, exactly as one
+    /// bilinear read at their shared corner was. Premultiplied colour averages
+    /// with its coverage, so an outline blurs into what lies past it.
+    fn mirror_mips_wgsl(n: usize) -> String {
+        let mut s = String::from("@group(0) @binding(0) var level0: texture_2d<f32>;\n");
+        for k in 1..=n {
+            s += &format!("@group(0) @binding({k}) var level{k}: texture_storage_2d<rgba16float, write>;\n");
+        }
+        s += r#"
+var<workgroup> tile_a: array<vec4<f32>, 256>;
+var<workgroup> tile_b: array<vec4<f32>, 64>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: vec3<u32>) {
+    let d0 = vec2<i32>(textureDimensions(level0));
+    let last = d0 - vec2<i32>(1);
+    let d1 = d0 / 2;
+    let p1 = vec2<i32>(g.xy * 16u + t.xy);
+    let q = p1 * 2;
+    let v1 = 0.25 * (textureLoad(level0, min(q, last), 0) + textureLoad(level0, min(q + vec2<i32>(1, 0), last), 0)
+        + textureLoad(level0, min(q + vec2<i32>(0, 1), last), 0) + textureLoad(level0, min(q + vec2<i32>(1, 1), last), 0));
+    if (all(p1 < d1)) {
+        textureStore(level1, p1, v1);
+    }
+    tile_a[t.y * 16u + t.x] = v1;
 "#;
+        if n >= 2 {
+            s += r#"
+    workgroupBarrier();
+    if (t.x < 8u && t.y < 8u) {
+        let i = t.y * 32u + t.x * 2u;
+        let v2 = 0.25 * (tile_a[i] + tile_a[i + 1u] + tile_a[i + 16u] + tile_a[i + 17u]);
+        let p2 = vec2<i32>(g.xy * 8u + t.xy);
+        if (all(p2 < d1 / 2)) {
+            textureStore(level2, p2, v2);
+        }
+        tile_b[t.y * 8u + t.x] = v2;
+    }
+"#;
+        }
+        if n >= 3 {
+            s += r#"
+    workgroupBarrier();
+    if (t.x < 4u && t.y < 4u) {
+        let i = t.y * 16u + t.x * 2u;
+        let v3 = 0.25 * (tile_b[i] + tile_b[i + 1u] + tile_b[i + 8u] + tile_b[i + 9u]);
+        let p3 = vec2<i32>(g.xy * 4u + t.xy);
+        if (all(p3 < d1 / 4)) {
+            textureStore(level3, p3, v3);
+        }
+        tile_a[t.y * 4u + t.x] = v3;
+    }
+"#;
+        }
+        if n >= 4 {
+            s += r#"
+    workgroupBarrier();
+    if (t.x < 2u && t.y < 2u) {
+        let i = t.y * 8u + t.x * 2u;
+        let v4 = 0.25 * (tile_a[i] + tile_a[i + 1u] + tile_a[i + 4u] + tile_a[i + 5u]);
+        let p4 = vec2<i32>(g.xy * 2u + t.xy);
+        if (all(p4 < d1 / 8)) {
+            textureStore(level4, p4, v4);
+        }
+    }
+"#;
+        }
+        s += "}\n";
+        s
+    }
 
     /// The pass's fragment body, after the brush shader's shared preamble
     /// (footprint, albedo, normal mapping): the probe reflection for this
@@ -4869,7 +4922,7 @@ mod ssr_pipeline_tests {
         );
         let mips = probe_pass::MirrorMips::new(&device);
         let mut enc = device.create_command_encoder(&Default::default());
-        mips.record(&device, &mut enc, levels);
+        mips.record(&device, &mut enc, levels, (target.width, target.height), None);
         // Level 1 (4 x 4) and level 3 (1 x 1) back.
         let read = |enc: &mut wgpu::CommandEncoder, level: u32, size: u32| {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -4908,6 +4961,95 @@ mod ssr_pipeline_tests {
         for k in 0..4 {
             assert!((a[k] - 0.25).abs() < 1e-3, "level 1, first texel, channel {k}: {}", a[k]);
             assert!((c[k] - 0.25).abs() < 1e-3, "level 3, channel {k}: {}", c[k]);
+        }
+    }
+
+    /// ALL FOUR LEVELS, AT ODD SIZES, as the headset has them (723 x 773):
+    /// every texel of every level the mean of the four below it, the last
+    /// odd row and column of each level left out as a bilinear read at the
+    /// shared corner left them out -- one compute dispatch against the mean
+    /// taken here on the CPU.
+    #[test]
+    fn the_floor_mirrors_blur_levels_at_odd_sizes_match_their_means() {
+        let Some((device, queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let layout = probe_pass::bind_group_layout(&device);
+        let target = probe_pass::Target::new(&device, &layout, 2 * 45, 2 * 49, 1);
+        let (w0, h0) = (target.width, target.height);
+        let levels = &target.mirror_levels[0];
+        assert_eq!(levels.len(), 5, "{w0}x{h0}");
+        let value = |x: u32, y: u32, c: u32| ((x * 7 + y * 13 + c * 5) % 17) as f32 / 16.0;
+        let mut texels = vec![0u16; (w0 * h0 * 4) as usize];
+        for y in 0..h0 {
+            for x in 0..w0 {
+                for c in 0..4 {
+                    texels[((y * w0 + x) * 4 + c) as usize] = crate::renderer::sky::f32_to_f16(value(x, y, c));
+                }
+            }
+        }
+        let texture = target.mirror_texture();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&texels),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w0 * 8), rows_per_image: Some(h0) },
+            wgpu::Extent3d { width: w0, height: h0, depth_or_array_layers: 1 },
+        );
+        let mut enc = device.create_command_encoder(&Default::default());
+        probe_pass::MirrorMips::new(&device).record(&device, &mut enc, levels, (w0, h0), None);
+        let dims: Vec<(u32, u32)> = (0..5).map(|k| ((w0 >> k).max(1), (h0 >> k).max(1))).collect();
+        let reads: Vec<(wgpu::Buffer, u32)> = (1..5)
+            .map(|k| {
+                let (w, h) = dims[k];
+                let row = (w * 8).div_ceil(256) * 256;
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (row * h) as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                enc.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo { texture, mip_level: k as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) },
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+                (buffer, row)
+            })
+            .collect();
+        queue.submit([enc.finish()]);
+        for (b, _) in &reads {
+            b.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        }
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let half_to_f32 = |h: u16| -> f32 {
+            let exp = ((h >> 10) & 0x1f) as i32;
+            let mant = (h & 0x3ff) as f32 / 1024.0;
+            if exp == 0 { mant * 2f32.powi(-14) } else { (1.0 + mant) * 2f32.powi(exp - 15) }
+        };
+        // Level 0 as the GPU holds it, then each level from the one below.
+        let mut below: Vec<f32> = texels.iter().map(|&h| half_to_f32(h)).collect();
+        for k in 1..5 {
+            let ((wb, _), (w, h)) = (dims[k - 1], dims[k]);
+            let (buffer, row) = &reads[k - 1];
+            let bytes = buffer.slice(..).get_mapped_range().unwrap();
+            let mut got = vec![0f32; (w * h * 4) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..4 {
+                        let at = (y * row + x * 8 + c * 2) as usize;
+                        let v = half_to_f32(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+                        let tap = |dx: u32, dy: u32| below[(((2 * y + dy) * wb + 2 * x + dx) * 4 + c) as usize];
+                        let want = 0.25 * (tap(0, 0) + tap(1, 0) + tap(0, 1) + tap(1, 1));
+                        assert!((v - want).abs() < 2e-3, "level {k} texel {x},{y} channel {c}: {v} vs {want}");
+                        got[((y * w + x) * 4 + c) as usize] = v;
+                    }
+                }
+            }
+            below = got;
         }
     }
 
