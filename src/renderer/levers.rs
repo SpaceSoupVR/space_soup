@@ -146,9 +146,15 @@ pub struct Levers {
     /// The lamps' veils: each light source's glare, drawn where an HDR
     /// framebuffer would have bloomed it. See `glare`.
     pub glare: bool,
-    /// How strong the veils are against `glare::VEIL_SHARE` of Stiles and
-    /// Holladay's: 1 as shipped.
+    /// How strong the veils are against `glare::VEIL_SHARE` of the CIE young
+    /// eye's: 1 as shipped.
     pub glare_strength: f32,
+    /// The characters mirrored in the floor the player stands on, in place of
+    /// their capsules there. See `brush_pipeline::probe_pass::MIRROR_FORMAT`.
+    /// OFF as shipped: its pass and blur levels cost about 1 ms at GPU level 5
+    /// wherever a mirrored body could be in view -- which, with the Quest's
+    /// tall field of view, is most views (2026-09-30). On once they cost less.
+    pub floor_mirror: bool,
     /// Metres past which the terrain's layer normal maps fade out; 0 keeps
     /// them everywhere. See `terrain_pipeline` (`post_params.z`).
     pub terrain_detail_distance: f32,
@@ -203,6 +209,7 @@ impl Default for Levers {
             eye_capture: 0,
             glare: true,
             glare_strength: 1.0,
+            floor_mirror: false,
             terrain_detail_distance: 0.0,
             gpu_sync: false,
             ssr: None,
@@ -254,6 +261,7 @@ impl Levers {
             Phase::NoGroundTrace => l.ground_trace = false,
             Phase::NoFoveation => l.foveation = crate::renderer::foveation::FoveationLevel::Off,
             Phase::NoGlare => l.glare = false,
+            Phase::FloorMirror => l.floor_mirror = true,
         }
         l
     }
@@ -289,6 +297,7 @@ impl Levers {
         flag("ground_trace", self.ground_trace, d.ground_trace);
         flag("space_warp", self.space_warp, d.space_warp);
         flag("glare", self.glare, d.glare);
+        flag("floor_mirror", self.floor_mirror, d.floor_mirror);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);

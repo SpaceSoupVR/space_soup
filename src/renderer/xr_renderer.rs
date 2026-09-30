@@ -409,6 +409,9 @@ pub struct XrRenderer {
     brush_probe_pass_deferred_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     probe_fixups: crate::renderer::probe_fixup::ProbeFixups,
     probe_fixup_targets: [wgpu::BindGroup; 2],
+    /// Group 3 of each eye's deferring probe pass: the record list, and that
+    /// eye's floor mirror. See `probe_fixup::ProbeFixups::pass_bind_group_for`.
+    probe_fixup_passes: [wgpu::BindGroup; 2],
     /// THE GROUND in the probe pass and reading it back. See
     /// `TerrainPipeline::new_probe_pass`; the lever `terrain_probe_pass`.
     terrain_probe_pass_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
@@ -508,6 +511,11 @@ pub struct XrRenderer {
     /// The characters' capsules, which can stand between an eye and a lamp.
     /// See `set_capsules`.
     glare_capsules: Vec<(glam::Vec3, glam::Vec3, f32)>,
+    /// The characters mirrored in the floor, into the probe pass targets'
+    /// floor mirror, and its blur. See `brush_pipeline::probe_pass::MIRROR_FORMAT`.
+    floor_mirror_skinned: SkinnedMeshPipeline,
+    floor_mirror_mips: crate::renderer::brush_pipeline::probe_pass::MirrorMips,
+
     uniform_buf: UniformBuffer,
     lights_uniform: LightsUniform,
     depth_view: wgpu::TextureView,
@@ -975,6 +983,8 @@ impl XrRenderer {
             crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass_deferred(&wgpu_device, &uniform_buf.layout, &probe_fixups);
         let probe_fixup_targets: [wgpu::BindGroup; 2] =
             std::array::from_fn(|eye| probe_fixups.target_bind_group(&wgpu_device, &probe_pass_targets[eye]));
+        let probe_fixup_passes: [wgpu::BindGroup; 2] =
+            std::array::from_fn(|eye| probe_fixups.pass_bind_group_for(&wgpu_device, &probe_pass_targets[eye]));
         let terrain_probe_pass_pipeline =
             crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass(&wgpu_device, &uniform_buf.layout, &probe_fixups);
         let terrain_probe_reader_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_reader(
@@ -1042,6 +1052,15 @@ impl XrRenderer {
         // it does not cull.
         let skinned_mesh_mirror_pipeline =
             SkinnedMeshPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        // The floor mirror's: the same shader at the mirror's own format, its
+        // light kept linear by the untoned curve. See `probe_pass::MIRROR_FORMAT`.
+        let floor_mirror_skinned = SkinnedMeshPipeline::new(
+            &wgpu_device,
+            crate::renderer::brush_pipeline::probe_pass::MIRROR_FORMAT,
+            &uniform_buf.layout,
+        );
+        let floor_mirror_mips = crate::renderer::brush_pipeline::probe_pass::MirrorMips::new(&wgpu_device);
+
         let mirror_solid_pipeline =
             SolidPipeline::new_mirror(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let mirror_mesh_pipeline =
@@ -1384,6 +1403,7 @@ impl XrRenderer {
             brush_probe_pass_deferred_pipeline,
             probe_fixups,
             probe_fixup_targets,
+            probe_fixup_passes,
             terrain_probe_pass_pipeline,
             terrain_probe_reader_pipeline,
             stereo_probe,
@@ -1446,6 +1466,8 @@ impl XrRenderer {
             glare_pipeline,
             glare_sources: Vec::new(),
             glare_capsules: Vec::new(),
+            floor_mirror_skinned,
+            floor_mirror_mips,
             uniform_buf,
             lights_uniform,
             depth_view,

@@ -1926,6 +1926,38 @@ pub mod probe_pass {
     /// with the point it is an image of. See `space_warp::reflected_point`.
     pub const REACH_FORMAT: TextureFormat = TextureFormat::R16Float;
 
+    /// THE CHARACTERS' FLOOR MIRROR, beside the pass in its target: the
+    /// characters -- the player's own body and everyone else's -- rendered
+    /// mirrored in the floor the player stands on, at the pass's resolution,
+    /// which the scene's brush shader lays over that floor's reflection
+    /// (`MIRROR_READ_WGSL`). A floor is a plane, so its reflection of anything
+    /// above it is exactly that thing seen through the plane, and a mesh drawn
+    /// mirrored is the character itself -- limbs, clothes, pose -- where the
+    /// trace's capsules were grey blobs of its mean colour (user, 2026-09-29:
+    /// "replacing the capsule reflections with a cheap mirror of just the
+    /// character"). Only characters are drawn: everything else in the room is
+    /// in the probes already, and the trace's reach says what stands in front
+    /// of them.
+    ///
+    /// The format: their radiance times [`MIRROR_EXPOSURE`], premultiplied
+    /// by coverage, with a short mip chain for a rough floor's blur.
+    pub const MIRROR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
+    /// Levels of the mirror's blur: level k is 2^k texels of the pass across.
+    pub const MIRROR_MIPS: u32 = 5;
+    /// The exposure the mirror pass renders at, through the untoned curve (a
+    /// clamp): radiance up to sixteen fits.
+    pub const MIRROR_EXPOSURE: f32 = 1.0 / 16.0;
+    /// The mirror's plane in the PLAYER's frame: the floor the player stands
+    /// on, at their feet.
+    pub const FLOOR_MIRROR_PLANE: f32 = 0.0;
+    /// `capsule_params.w` carries the plane this far above its height, so
+    /// that a zeroed uniform means no mirror.
+    pub const FLOOR_MIRROR_BIAS: f32 = 4096.0;
+    /// The eye's near and far planes (`XrRenderer`'s `Camera::xr_projection`),
+    /// from which the reader turns the mirror's depth back into a distance.
+    pub const EYE_NEAR: f32 = 0.03;
+    pub const EYE_FAR: f32 = 1000.0;
+
     /// What a probe-pass shader returns, and how a pipeline recognises one: a
     /// shader built with it gets the reach target as well (`from_source`).
     pub const OUTPUT_SIGNATURE: &str = "-> ProbePassOut";
@@ -1994,6 +2026,17 @@ struct ProbePassOut {
         pub reach_view: TextureView,
         _depth: Texture,
         pub depth_view: TextureView,
+        _mirror: Texture,
+        /// The characters' floor mirror, by layer and then level: level 0 is
+        /// what its pass renders into, the rest its blur. See `MIRROR_FORMAT`.
+        pub mirror_levels: Vec<Vec<TextureView>>,
+        _mirror_depth: Texture,
+        /// Its depth, a layer each.
+        pub mirror_depth_views: Vec<TextureView>,
+        /// The first layer's mirror with its blur levels, and its reach alone:
+        /// what a single-eye probe pass and its fix-up read. See `probe_fixup`.
+        pub mirror_view: TextureView,
+        pub reach_single: TextureView,
         _samplers: [Sampler; 2],
         pub bind_group: BindGroup,
         pub width: u32,
@@ -2043,6 +2086,44 @@ struct ProbePassOut {
             let (color_view, depth_view) = (attachment(&color), attachment(&depth));
             let reach_view = attachment(&reach);
             let (color_array, depth_array) = (array(&color), array(&depth));
+            // THE FLOOR MIRROR: its colour with its blur levels, and its depth.
+            let mirror_mips = MIRROR_MIPS.min(width.min(height).max(1).ilog2() + 1);
+            let mirror = device.create_texture(&TextureDescriptor {
+                label: Some("probe_pass_mirror"),
+                size: Extent3d { width, height, depth_or_array_layers: layers },
+                mip_level_count: mirror_mips,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: MIRROR_FORMAT,
+                // COPY_SRC and COPY_DST so a test can fill a level and read
+                // its blur back. See `the_floor_mirrors_blur_levels_average_the_level_below`.
+                usage: TextureUsages::RENDER_ATTACHMENT
+                    | TextureUsages::TEXTURE_BINDING
+                    | TextureUsages::COPY_SRC
+                    | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let mirror_depth = make("probe_pass_mirror_depth", TextureFormat::Depth32Float, TextureUsages::empty());
+            let single = |t: &Texture, layer: u32, level: u32| {
+                t.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(TextureViewDimension::D2),
+                    base_mip_level: level,
+                    mip_level_count: Some(1),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            };
+            let mirror_levels = (0..layers).map(|l| (0..mirror_mips).map(|k| single(&mirror, l, k)).collect()).collect();
+            let mirror_depth_views = (0..layers).map(|l| single(&mirror_depth, l, 0)).collect();
+            // The first layer whole, every level: what the probe pass samples.
+            let mirror_view = mirror.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(TextureViewDimension::D2),
+                base_array_layer: 0,
+                array_layer_count: Some(1),
+                ..Default::default()
+            });
+            let reach_single = single(&reach, 0, 0);
             // Clamped at the edges, exactly as the four-texel path clamps.
             let sampler = |label: &str, filter: FilterMode| {
                 device.create_sampler(&SamplerDescriptor {
@@ -2065,9 +2146,149 @@ struct ProbePassOut {
                     BindGroupEntry { binding: 3, resource: BindingResource::Sampler(&samplers[1]) },
                 ],
             });
-            Self { _color: color, color_view, _reach: reach, reach_view, _depth: depth, depth_view, _samplers: samplers, bind_group, width, height }
+            Self {
+                _color: color,
+                color_view,
+                _reach: reach,
+                reach_view,
+                _depth: depth,
+                depth_view,
+                _mirror: mirror,
+                mirror_levels,
+                _mirror_depth: mirror_depth,
+                mirror_depth_views,
+                mirror_view,
+                reach_single,
+                _samplers: samplers,
+                bind_group,
+                width,
+                height,
+            }
         }
     }
+
+    impl Target {
+        /// The floor mirror's colour texture, every layer and level.
+        pub fn mirror_texture(&self) -> &Texture {
+            &self._mirror
+        }
+    }
+
+    /// THE FLOOR MIRROR'S BLUR LEVELS, each the mean of the four texels of the
+    /// level below it -- one bilinear read at their shared corner -- so a rough
+    /// floor reads its characters as blurred as its lobe (`MIRROR_READ_WGSL`).
+    /// Premultiplied colour averages with its coverage, so an outline blurs
+    /// into what lies past it rather than into black.
+    pub struct MirrorMips {
+        pipeline: wgpu::RenderPipeline,
+        layout: BindGroupLayout,
+        sampler: Sampler,
+    }
+
+    impl MirrorMips {
+        pub fn new(device: &Device) -> Self {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("floor_mirror_mips"),
+                source: wgpu::ShaderSource::Wgsl(MIRROR_MIPS_WGSL.into()),
+            });
+            let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("floor_mirror_mips_layout"),
+                entries: &[
+                    BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            sample_type: TextureSampleType::Float { filterable: true },
+                            view_dimension: TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("floor_mirror_mips"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("floor_mirror_mips"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs"),
+                    targets: &[Some(MIRROR_FORMAT.into())],
+                    compilation_options: Default::default(),
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            let sampler = device.create_sampler(&SamplerDescriptor {
+                label: Some("floor_mirror_mips"),
+                address_mode_u: AddressMode::ClampToEdge,
+                address_mode_v: AddressMode::ClampToEdge,
+                mag_filter: FilterMode::Linear,
+                min_filter: FilterMode::Linear,
+                ..Default::default()
+            });
+            Self { pipeline, layout, sampler }
+        }
+
+        /// Every level above the first of `levels` (one layer's), each from
+        /// the one below.
+        pub fn record(&self, device: &Device, encoder: &mut wgpu::CommandEncoder, levels: &[TextureView]) {
+            for k in 1..levels.len() {
+                let bind = device.create_bind_group(&BindGroupDescriptor {
+                    label: Some("floor_mirror_mips"),
+                    layout: &self.layout,
+                    entries: &[
+                        BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&levels[k - 1]) },
+                        BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&self.sampler) },
+                    ],
+                });
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("floor_mirror_mips"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &levels[k],
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    })],
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+    }
+
+    /// One blur level from the level below: its texel's centre is the corner
+    /// four texels below share, where one bilinear read is their mean.
+    const MIRROR_MIPS_WGSL: &str = r#"
+@group(0) @binding(0) var below: texture_2d<f32>;
+@group(0) @binding(1) var below_samp: sampler;
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
+    return vec4<f32>(xy, 0.0, 1.0);
+}
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = (floor(pos.xy) * 2.0 + 1.0) / vec2<f32>(textureDimensions(below));
+    return textureSampleLevel(below, below_samp, uv, 0.0);
+}
+"#;
 
     /// The pass's fragment body, after the brush shader's shared preamble
     /// (footprint, albedo, normal mapping): the probe reflection for this
@@ -2157,6 +2378,25 @@ fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32) -> vec4<f32
     return vec4<f32>(probe_pass_expand(pre.rgb / max(pre.a, 1e-4)), pre.a);
 }
 "#;
+
+    /// `floor_mirror_linear_depth`: the eye's distance along its axis to a
+    /// point at depth `d` (0 near, 1 far) in the eye's own projection
+    /// (`Camera::xr_projection` at [`EYE_NEAR`], [`EYE_FAR`], put into wgpu's
+    /// depth range).
+    pub(crate) fn eye_linear_depth_wgsl() -> String {
+        format!(
+            r#"
+const FLOOR_MIRROR_NEAR: f32 = {near:?};
+const FLOOR_MIRROR_FAR: f32 = {far:?};
+fn floor_mirror_linear_depth(d: f32) -> f32 {{
+    let z = 2.0 * d - 1.0;
+    return 2.0 * FLOOR_MIRROR_FAR * FLOOR_MIRROR_NEAR / ((FLOOR_MIRROR_FAR + FLOOR_MIRROR_NEAR) - z * (FLOOR_MIRROR_FAR - FLOOR_MIRROR_NEAR));
+}}
+"#,
+            near = EYE_NEAR,
+            far = EYE_FAR,
+        )
+    }
 }
 
 fn brush_shader_variant(ssr: bool, sources: bool, ssr_debug: bool) -> String {
@@ -2595,7 +2835,9 @@ struct VOut {{
                 "    let probe_pass_tolerance = max(4.0 * fwidth(in.clip.z), 1e-6);\n{}",
                 lighting.replacen(
                     marker,
-                    &format!("    probe_env_given = probe_pass_upsample(in.clip.xy, in.clip.z, probe_pass_tolerance);\n{marker}"),
+                    &format!(
+                        "    probe_env_given = probe_pass_upsample(in.clip.xy, in.clip.z, probe_pass_tolerance);\n{marker}"
+                    ),
                     1,
                 )
             )
@@ -4405,6 +4647,156 @@ mod ssr_pipeline_tests {
             if probe == BrushProbe::Read {
                 assert!(crate::renderer::multiview::as_multiview(&src).contains("view_slot = i32(view_index_in);"));
             }
+        }
+    }
+
+    /// THE FLOOR MIRROR'S DEPTH IS A DISTANCE AGAIN: points at known
+    /// distances down the eye's axis, put through the eye's own projection as
+    /// the mirror pass puts its characters, come back out of
+    /// `floor_mirror_linear_depth` -- on the GPU, the WGSL the reader runs.
+    #[test]
+    fn the_floor_mirrors_depth_turns_back_into_a_distance() {
+        let Some((device, queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        // `Camera::xr_projection` is the headset's alone; its depth row is any
+        // GL perspective's at the same planes, which is all this reads.
+        let proj = crate::renderer::camera::Camera::gl_to_wgpu_ndc(glam::Mat4::perspective_rh_gl(
+            1.6,
+            0.95,
+            probe_pass::EYE_NEAR,
+            probe_pass::EYE_FAR,
+        ));
+        let distances = [0.05f32, 0.5, 1.7, 3.0, 12.0, 80.0];
+        let depths: Vec<f32> = distances
+            .iter()
+            .map(|&z| {
+                let c = proj * glam::Vec4::new(0.3, -0.2, -z, 1.0);
+                c.z / c.w
+            })
+            .collect();
+        let code = format!(
+            "{}\n@group(0) @binding(0) var<storage, read_write> io: array<f32>;\n@compute @workgroup_size(1)\nfn main(@builtin(global_invocation_id) id: vec3<u32>) {{\n    io[id.x] = floor_mirror_linear_depth(io[id.x]);\n}}\n",
+            probe_pass::eye_linear_depth_wgsl()
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let io = wgpu::util::DeviceExt::create_buffer_init(
+            &device,
+            &wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&depths),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            },
+        );
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (depths.len() * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: io.as_entire_binding() }],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(depths.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&io, 0, &read, 0, (depths.len() * 4) as u64);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let back: Vec<f32> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+        for (z, got) in distances.iter().zip(&back) {
+            // f32 depth near 1 holds a far distance to a fraction of a percent.
+            assert!((got - z).abs() < 0.002 * z + 1e-4, "{z} m came back {got}");
+        }
+    }
+
+    /// THE FLOOR MIRROR'S BLUR LEVELS AVERAGE: each texel of a level is the
+    /// mean of the four below it, premultiplied colour and coverage alike --
+    /// a checker of one covered texel in four comes out a quarter covered.
+    #[test]
+    fn the_floor_mirrors_blur_levels_average_the_level_below() {
+        let Some((device, queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let layout = probe_pass::bind_group_layout(&device);
+        // A 16 x 16 eye: an 8 x 8 target, four levels.
+        let target = probe_pass::Target::new(&device, &layout, 16, 16, 1);
+        let levels = &target.mirror_levels[0];
+        assert_eq!(levels.len(), 4);
+        // Level 0: one texel in each 2 x 2 block covered, white, the rest clear.
+        let mut texels = vec![0u16; 8 * 8 * 4];
+        let one = crate::renderer::sky::f32_to_f16(1.0);
+        for y in (0..8).step_by(2) {
+            for x in (0..8).step_by(2) {
+                let i = (y * 8 + x) * 4;
+                texels[i..i + 4].copy_from_slice(&[one, one, one, one]);
+            }
+        }
+        let texture = target.mirror_texture();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&texels),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8 * 8), rows_per_image: Some(8) },
+            wgpu::Extent3d { width: 8, height: 8, depth_or_array_layers: 1 },
+        );
+        let mips = probe_pass::MirrorMips::new(&device);
+        let mut enc = device.create_command_encoder(&Default::default());
+        mips.record(&device, &mut enc, levels);
+        // Level 1 (4 x 4) and level 3 (1 x 1) back.
+        let read = |enc: &mut wgpu::CommandEncoder, level: u32, size: u32| {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256 * size as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture, mip_level: level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(size) },
+                },
+                wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            );
+            buffer
+        };
+        let (l1, l3) = (read(&mut enc, 1, 4), read(&mut enc, 3, 1));
+        queue.submit([enc.finish()]);
+        for b in [&l1, &l3] {
+            b.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        }
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        // Half floats, as far as these values need: normal numbers and zero.
+        let half_to_f32 = |h: u16| -> f32 {
+            let exp = ((h >> 10) & 0x1f) as i32;
+            let mant = (h & 0x3ff) as f32 / 1024.0;
+            if exp == 0 { 0.0 } else { (1.0 + mant) * 2f32.powi(exp - 15) }
+        };
+        let half = |b: &wgpu::Buffer| -> Vec<f32> {
+            let bytes = b.slice(..).get_mapped_range().unwrap();
+            bytemuck::cast_slice::<u8, u16>(&bytes).iter().map(|&h| half_to_f32(h)).collect()
+        };
+        let (a, c) = (half(&l1), half(&l3));
+        for k in 0..4 {
+            assert!((a[k] - 0.25).abs() < 1e-3, "level 1, first texel, channel {k}: {}", a[k]);
+            assert!((c[k] - 0.25).abs() < 1e-3, "level 3, channel {k}: {}", c[k]);
         }
     }
 

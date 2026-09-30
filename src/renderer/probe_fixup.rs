@@ -75,17 +75,33 @@ fn probe_fixup_begin(h: ProbeHit, world_pos: vec3<f32>, d: vec3<f32>, dir: vec3<
 }
 fn probe_fixup_finish(slot: i32, col: vec4<f32>) {
 }
+// No floor mirror but in the pass that defers: see `floor_mirror_blend_wgsl`.
+fn probe_floor_mirror_pass(col: vec4<f32>, roughness: f32) -> vec4<f32> {
+    return col;
+}
 "#
         .to_string();
     }
     format!(
-        "{RECORD_WGSL}{}",
+        "{RECORD_WGSL}{}{}",
+        floor_mirror_blend_wgsl(),
         r#"
 struct ProbeFixups {
     count: atomic<u32>,
     items: array<ProbeFixup>,
 }
 @group(3) @binding(0) var<storage, read_write> probe_fixups: ProbeFixups;
+// This eye's floor mirror and its depth. See `floor_mirror_blend_wgsl`.
+@group(3) @binding(1) var probe_fixup_mirror: texture_2d<f32>;
+@group(3) @binding(2) var probe_fixup_mirror_depth: texture_depth_2d;
+
+// The mirrored characters over this texel's reflection.
+fn probe_floor_mirror_pass(col: vec4<f32>, roughness: f32) -> vec4<f32> {
+    return floor_mirror_blend(
+        col, probe_fixup_mirror, probe_fixup_mirror_depth, vec2<i32>(probe_fragment.xy), probe_fragment.z,
+        probe_eye_distance, roughness, probe_reach,
+    );
+}
 
 // Opens this texel's record with everything but the reflection's colour: its
 // slot, or -1 where the list is full -- see `ProbeFixups::new` for why that
@@ -101,7 +117,12 @@ fn probe_fixup_begin(h: ProbeHit, world_pos: vec3<f32>, d: vec3<f32>, dir: vec3<
         probe_fixups.items[k].dir_given = vec4<f32>(dir, probe_lod);
         probe_fixups.items[k].origin = vec4<f32>(h.origin, pixel_footprint);
         probe_fixups.items[k].hit = vec4<f32>(h.rim, h.rim_t, h.edge_cover, h.edge_t);
-        probe_fixups.items[k].codes = vec4<f32>(bitcast<f32>(h.rim_code), bitcast<f32>(h.edge_code), probe_eye_distance, 0.0);
+        // w: the characters' part, for the fix-up to make again -- the
+        // floor mirror (negative), or the capsules lit by this luminance.
+        let lit = dot(probe_capsule_lit, vec3<f32>(0.2126, 0.7152, 0.0722));
+        probe_fixups.items[k].codes = vec4<f32>(
+            bitcast<f32>(h.rim_code), bitcast<f32>(h.edge_code), probe_eye_distance, select(lit, -1.0 - lit, probe_floor_mirror_here),
+        );
     }
     return slot;
 }
@@ -112,6 +133,61 @@ fn probe_fixup_finish(slot: i32, col: vec4<f32>) {
     }
 }
 "#
+    )
+}
+
+/// THE CHARACTERS' FLOOR MIRROR over a texel's reflection
+/// (`brush_pipeline::probe_pass::MIRROR_FORMAT`): in the probe pass that
+/// defers, and in the fix-up that finishes a texel it deferred -- the record's
+/// `codes.w` says the texel is on the mirror's plane -- so a texel at a
+/// doorway's rim keeps the character standing over it.
+///
+/// `floor_mirror_blend` reads the mirror as blurred as the floor is rough:
+/// the level where the lobe, at a body's typical height above the floor, is a
+/// texel of the pass across. It hides a character behind what the trace met
+/// (`reach`), from the character's reflected distance: the mirror's depth and
+/// this texel's, turned back into distances along the eye's axis, scaled to
+/// the ray by the texel's own distance from the eye. Where the character
+/// covers most of the texel the reach becomes the character's, so SpaceWarp
+/// moves the reflected image with the character rather than with what stands
+/// behind it.
+fn floor_mirror_blend_wgsl() -> String {
+    format!(
+        r#"
+const FLOOR_MIRROR_EXPOSURE: f32 = {exposure:?};
+const FLOOR_MIRROR_REACH: f32 = 0.6;
+{linear}
+fn floor_mirror_blend(
+    col: vec4<f32>,
+    mirror: texture_2d<f32>,
+    mirror_depth: texture_depth_2d,
+    texel: vec2<i32>,
+    depth_here: f32,
+    t_here: f32,
+    roughness: f32,
+    reach: f32,
+) -> vec4<f32> {{
+    let dims = vec2<f32>(textureDimensions(mirror));
+    let blur = probe_lobe_tan(roughness) * FLOOR_MIRROR_REACH / max(pixel_footprint, 1e-4);
+    let lod = clamp(log2(max(blur, 1.0)), 0.0, f32(textureNumLevels(mirror)) - 1.0);
+    let m = textureSampleLevel(mirror, probe_samp, (vec2<f32>(texel) + 0.5) / dims, lod);
+    if (m.a < 0.002) {{
+        return col;
+    }}
+    var cover = m.a;
+    let d_char = textureLoad(mirror_depth, texel, 0);
+    if (d_char < 1.0) {{
+        let t_char = floor_mirror_linear_depth(d_char) * t_here / max(floor_mirror_linear_depth(depth_here), 1e-4) - t_here;
+        cover = cover * smoothstep(t_char - 0.25, t_char - 0.05, reach);
+        if (cover > 0.5) {{
+            probe_reach = t_char;
+        }}
+    }}
+    return vec4<f32>(mix(col.rgb, m.rgb / (m.a * FLOOR_MIRROR_EXPOSURE), cover), max(col.a, cover));
+}}
+"#,
+        exposure = probe_pass::MIRROR_EXPOSURE,
+        linear = probe_pass::eye_linear_depth_wgsl(),
     )
 }
 
@@ -134,6 +210,11 @@ struct ProbeFixupList {{
 @group(1) @binding(0) var<storage, read> fixups: ProbeFixupList;
 @group(2) @binding(0) var probe_out: texture_storage_2d<rgba16float, write>;
 @group(2) @binding(1) var probe_depth_in: texture_depth_2d;
+// The floor mirror, its depth and the pass's reach. See `floor_mirror_blend_wgsl`.
+@group(2) @binding(2) var fixup_mirror: texture_2d<f32>;
+@group(2) @binding(3) var fixup_mirror_depth: texture_depth_2d;
+@group(2) @binding(4) var fixup_reach: texture_2d<f32>;
+{blend}
 
 const FIXUP_DEPTH_TOLERANCE: f32 = {tolerance:?};
 
@@ -191,9 +272,21 @@ fn fixup(@builtin(global_invocation_id) id: vec3<u32>) {{
     if (hit.edge_code >= 0 && hit.edge_cover < 0.0) {{
         primary = probe_subsample(f.col, f.from_pos.xyz, f.dir_world.xyz, f.dir_given.xyz, f.dir_world.w, f.dir_given.w, f.from_pos.w);
     }}
-    let col = probe_secondary(
+    var col = probe_secondary(
         hit, primary, f.from_pos.xyz, f.dir_world.xyz, f.dir_given.xyz, f.dir_world.w, f.dir_given.w, f.from_pos.w,
     );
+    // The characters over it, as the pass laid them: mirrored on the floor,
+    // else their capsules (lit grey by the luminance the record kept).
+    if (f.codes.w < 0.0) {{
+        col = floor_mirror_blend(
+            col, fixup_mirror, fixup_mirror_depth, texel, textureLoad(probe_depth_in, texel, 0), f.codes.z,
+            f.dir_world.w, textureLoad(fixup_reach, texel, 0).r,
+        );
+    }} else {{
+        col = capsule_reflection(
+            to_player_space(f.from_pos.xyz), normalize(f.dir_given.xyz), f.dir_world.w, vec3<f32>(f.codes.w), col,
+        );
+    }}
     // As `probe_env_for_pass` finishes a traced reflection: compressed and
     // premultiplied by its coverage, the brightness normalisation out of it (a
     // traced hit leaves `probe_brightness` at 0, and its scale is exactly 1).
@@ -204,6 +297,7 @@ fn fixup(@builtin(global_invocation_id) id: vec3<u32>) {{
         lights = super::lights::wgsl_lights_block(0, 1),
         record = RECORD_WGSL,
         tolerance = DEPTH_TOLERANCE,
+        blend = floor_mirror_blend_wgsl(),
     )
 }
 
@@ -214,11 +308,33 @@ pub struct ProbeFixups {
     buffer: Buffer,
     capacity: u32,
     pass_layout: BindGroupLayout,
-    pass_bind_group: BindGroup,
     list_bind_group: BindGroup,
     target_layout: BindGroupLayout,
     pipeline: ComputePipeline,
+    /// THE FIX-UP'S SIZE, from the list's own count: a workgroup for every 64
+    /// records the pass made, not for every slot the list has room for. A
+    /// thread per slot launched some 2,800 workgroups an eye to find a few
+    /// hundred records, and the scene pass waits for all of them. Written by
+    /// one thread (`args_pipeline`), read by `dispatch_workgroups_indirect`.
+    args: Buffer,
+    args_pipeline: ComputePipeline,
+    args_bind_group: BindGroup,
 }
+
+/// The fix-up's indirect dispatch arguments from the list's count, clamped to
+/// its capacity.
+const ARGS_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read> list_count: array<u32>;
+@group(0) @binding(1) var<storage, read_write> args: array<u32>;
+const CAPACITY: u32 = CAPACITY_VALUE;
+@compute @workgroup_size(1)
+fn args_main() {
+    let n = min(list_count[0], CAPACITY);
+    args[0] = (n + 63u) / 64u;
+    args[1] = 1u;
+    args[2] = 1u;
+}
+"#;
 
 impl ProbeFixups {
     /// For probe pass targets of `texels` texels. ROOM FOR HALF OF THEM,
@@ -240,9 +356,20 @@ impl ProbeFixups {
             ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
+        let texture = |binding: u32, sample_type: TextureSampleType, visibility: ShaderStages| BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: BindingType::Texture { sample_type, view_dimension: TextureViewDimension::D2, multisampled: false },
+            count: None,
+        };
+        // The list, and this eye's floor mirror and its depth.
         let pass_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("probe_fixups_pass_layout"),
-            entries: &[storage(false, ShaderStages::FRAGMENT)],
+            entries: &[
+                storage(false, ShaderStages::FRAGMENT),
+                texture(1, TextureSampleType::Float { filterable: true }, ShaderStages::FRAGMENT),
+                texture(2, TextureSampleType::Depth, ShaderStages::FRAGMENT),
+            ],
         });
         let list_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("probe_fixups_list_layout"),
@@ -271,6 +398,9 @@ impl ProbeFixups {
                     },
                     count: None,
                 },
+                texture(2, TextureSampleType::Float { filterable: true }, ShaderStages::COMPUTE),
+                texture(3, TextureSampleType::Depth, ShaderStages::COMPUTE),
+                texture(4, TextureSampleType::Float { filterable: true }, ShaderStages::COMPUTE),
             ],
         });
         let bind = |layout: &BindGroupLayout, label: &str| {
@@ -280,7 +410,6 @@ impl ProbeFixups {
                 entries: &[BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
             })
         };
-        let pass_bind_group = bind(&pass_layout, "probe_fixups_pass");
         let list_bind_group = bind(&list_layout, "probe_fixups_list");
         // Audited like the probe pass it finishes: see `shader_checks`.
         let module = super::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
@@ -300,20 +429,61 @@ impl ProbeFixups {
             compilation_options: Default::default(),
             cache: None,
         });
-        Self { buffer, capacity, pass_layout, pass_bind_group, list_bind_group, target_layout, pipeline }
+        let args = device.create_buffer(&BufferDescriptor {
+            label: Some("probe_fixups_args"),
+            size: 16,
+            usage: BufferUsages::STORAGE | BufferUsages::INDIRECT,
+            mapped_at_creation: false,
+        });
+        let args_module = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("probe_fixup_args"),
+            source: ShaderSource::Wgsl(ARGS_WGSL.replace("CAPACITY_VALUE", &format!("{capacity}u")).into()),
+        });
+        let args_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("probe_fixup_args"),
+            layout: None,
+            module: &args_module,
+            entry_point: Some("args_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let args_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("probe_fixup_args"),
+            layout: &args_pipeline.get_bind_group_layout(0),
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::Buffer(wgpu::BufferBinding { buffer: &buffer, offset: 0, size: std::num::NonZeroU64::new(16) }),
+                },
+                BindGroupEntry { binding: 1, resource: args.as_entire_binding() },
+            ],
+        });
+        Self { buffer, capacity, pass_layout, list_bind_group, target_layout, pipeline, args, args_pipeline, args_bind_group }
     }
 
-    /// Group 3 of the deferring probe pass: the list it appends to.
+    /// Group 3 of the deferring probe pass: the list it appends to, and the
+    /// floor mirror it lays over its floor's texels.
     pub fn pass_layout(&self) -> &BindGroupLayout {
         &self.pass_layout
     }
 
-    pub fn pass_bind_group(&self) -> &BindGroup {
-        &self.pass_bind_group
+    /// Group 3 for one single-eye probe pass target: the list, and that
+    /// target's floor mirror and its depth.
+    pub fn pass_bind_group_for(&self, device: &Device, target: &probe_pass::Target) -> BindGroup {
+        device.create_bind_group(&BindGroupDescriptor {
+            label: Some("probe_fixups_pass"),
+            layout: &self.pass_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: self.buffer.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&target.mirror_view) },
+                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&target.mirror_depth_views[0]) },
+            ],
+        })
     }
 
     /// What the fix-up writes and checks for one single-eye probe pass target:
-    /// its colour, and the depth it was drawn at.
+    /// its colour, the depth it was drawn at, and its floor mirror, the
+    /// mirror's depth and the pass's reach.
     pub fn target_bind_group(&self, device: &Device, target: &probe_pass::Target) -> BindGroup {
         device.create_bind_group(&BindGroupDescriptor {
             label: Some("probe_fixups_target"),
@@ -321,6 +491,9 @@ impl ProbeFixups {
             entries: &[
                 BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&target.color_view) },
                 BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&target.depth_view) },
+                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&target.mirror_view) },
+                BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&target.mirror_depth_views[0]) },
+                BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&target.reach_single) },
             ],
         })
     }
@@ -335,11 +508,15 @@ impl ProbeFixups {
     /// slot of the list; those past its count return at once.
     pub fn dispatch(&self, encoder: &mut CommandEncoder, uniforms: &BindGroup, target: &BindGroup) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("probe_fixup"), timestamp_writes: None });
+        // As many workgroups as the pass made records: see `args`.
+        pass.set_pipeline(&self.args_pipeline);
+        pass.set_bind_group(0, &self.args_bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, uniforms, &[]);
         pass.set_bind_group(1, &self.list_bind_group, &[]);
         pass.set_bind_group(2, target, &[]);
-        pass.dispatch_workgroups(self.capacity.div_ceil(64), 1, 1);
+        pass.dispatch_workgroups_indirect(&self.args, 0);
     }
 }
 

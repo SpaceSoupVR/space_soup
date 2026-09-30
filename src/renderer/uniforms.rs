@@ -148,7 +148,8 @@ pub struct Uniforms {
     pub capsule_groups: [[f32; 4]; MAX_CAPSULE_GROUPS * 2],
     /// x = how many characters; y, z = which light casts the characters' crisp
     /// shadow into their first and second tile (`shadow::MAX_CHARACTER_SHADOWS`),
-    /// -1 for none. w reserved.
+    /// -1 for none; w the floor mirror's plane, `FLOOR_MIRROR_BIAS` above its
+    /// height, 0 for none (`brush_pipeline::probe_pass`).
     pub capsule_params: [f32; 4],
 }
 
@@ -274,6 +275,10 @@ pub struct CapsuleUpload {
     /// shadow into each of their tiles, -1 for none: set each frame by the
     /// renderer, which chooses them. See `shadow::MAX_CHARACTER_SHADOWS`.
     pub shadow_lights: [f32; 2],
+    /// Whether this frame's probe pass targets hold the characters' FLOOR
+    /// MIRROR, which the floor the player stands on shows in place of their
+    /// capsules. See `brush_pipeline::probe_pass::FLOOR_MIRROR_BIAS`.
+    pub floor_mirror: bool,
 }
 
 impl Default for CapsuleUpload {
@@ -283,6 +288,7 @@ impl Default for CapsuleUpload {
             groups: [[0.0; 4]; MAX_CAPSULE_GROUPS * 2],
             group_count: 0,
             shadow_lights: [-1.0; 2],
+            floor_mirror: false,
         }
     }
 }
@@ -426,6 +432,14 @@ pub struct UniformBuffer {
     pub buffer: Buffer,
     pub layout: BindGroupLayout,
     pub bind_group: BindGroup,
+    /// THE TWIN: a buffer of its own, bound with every other resource of
+    /// `bind_group` -- for a pass drawn with another camera in the middle of a
+    /// frame (the floor mirror's), written with [`Self::write_scene_stereo_to`].
+    /// Copying another camera into `buffer` between passes needed a full
+    /// barrier each way on the headset, and a submit of its own left the GPU
+    /// idle while the rest was recorded (2026-09-30).
+    pub twin_buffer: Buffer,
+    pub twin_bind_group: BindGroup,
     /// Which reflection probes this scene has. See [`ProbeUpload`].
     probes: ProbeUpload,
     /// The probes' per-texel distances, bound at 8. Zero until a level with
@@ -480,6 +494,48 @@ impl UniformBuffer {
     pub fn probes(&self) -> ProbeUpload {
         self.probes
     }
+}
+
+/// The scene's bind group over `buffer`: every binding the scene's shaders
+/// read, in one place for [`UniformBuffer`]'s group and its twin.
+#[allow(clippy::too_many_arguments)]
+fn scene_bind_group(
+    device: &Device,
+    layout: &BindGroupLayout,
+    label: &str,
+    buffer: &Buffer,
+    lights: &LightsUniform,
+    sun_shadow_view: &TextureView,
+    sun_dynamic_view: &TextureView,
+    spot_shadow_view: &TextureView,
+    shadow_sampler: &Sampler,
+    probe_view: &TextureView,
+    probe_sampler: &Sampler,
+    probe_depth_view: &TextureView,
+    probe_depth_sampler: &Sampler,
+    ground_view: &TextureView,
+    proxy_field_view: &TextureView,
+    proxy_card_view: &TextureView,
+) -> BindGroup {
+    device.create_bind_group(&BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: lights.buffer().as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: BindingResource::TextureView(sun_shadow_view) },
+            BindGroupEntry { binding: 3, resource: BindingResource::Sampler(shadow_sampler) },
+            BindGroupEntry { binding: 4, resource: BindingResource::TextureView(spot_shadow_view) },
+            BindGroupEntry { binding: 5, resource: BindingResource::TextureView(probe_view) },
+            BindGroupEntry { binding: 6, resource: BindingResource::Sampler(probe_sampler) },
+            BindGroupEntry { binding: 7, resource: BindingResource::TextureView(sun_dynamic_view) },
+            BindGroupEntry { binding: 8, resource: BindingResource::TextureView(probe_depth_view) },
+            BindGroupEntry { binding: 9, resource: BindingResource::Sampler(probe_depth_sampler) },
+            BindGroupEntry { binding: 10, resource: BindingResource::TextureView(ground_view) },
+            BindGroupEntry { binding: 11, resource: BindingResource::TextureView(proxy_field_view) },
+            BindGroupEntry { binding: 12, resource: BindingResource::TextureView(proxy_card_view) },
+        ],
+    })
 }
 
 impl UniformBuffer {
@@ -675,54 +731,41 @@ impl UniformBuffer {
         let proxy_field_view = super::proxy_field::none(device);
         let proxy_card_view = super::proxy_cards::none(device);
 
-        let bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("uniform_bg"),
-            layout: &layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: lights.buffer().as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::TextureView(sun_shadow_view),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: BindingResource::Sampler(shadow_sampler),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: BindingResource::TextureView(spot_shadow_view),
-                },
-                BindGroupEntry {
-                    binding: 5,
-                    resource: BindingResource::TextureView(probe_view),
-                },
-                BindGroupEntry {
-                    binding: 6,
-                    resource: BindingResource::Sampler(probe_sampler),
-                },
-                BindGroupEntry {
-                    binding: 7,
-                    resource: BindingResource::TextureView(sun_dynamic_view),
-                },
-                BindGroupEntry { binding: 8, resource: BindingResource::TextureView(&probe_depth_view) },
-                BindGroupEntry { binding: 9, resource: BindingResource::Sampler(&probe_depth_sampler) },
-                BindGroupEntry { binding: 10, resource: BindingResource::TextureView(&ground_view) },
-                BindGroupEntry { binding: 11, resource: BindingResource::TextureView(&proxy_field_view) },
-                BindGroupEntry { binding: 12, resource: BindingResource::TextureView(&proxy_card_view) },
-            ],
+        let twin_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("uniform_buf_twin"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        let group = |buffer: &Buffer, label: &str| {
+            scene_bind_group(
+                device,
+                &layout,
+                label,
+                buffer,
+                lights,
+                sun_shadow_view,
+                sun_dynamic_view,
+                spot_shadow_view,
+                shadow_sampler,
+                probe_view,
+                probe_sampler,
+                &probe_depth_view,
+                &probe_depth_sampler,
+                &ground_view,
+                &proxy_field_view,
+                &proxy_card_view,
+            )
+        };
+        let bind_group = group(&buffer, "uniform_bg");
+        let twin_bind_group = group(&twin_buffer, "uniform_bg_twin");
 
         Self {
             buffer,
             layout,
             bind_group,
+            twin_buffer,
+            twin_bind_group,
             probes: ProbeUpload::default(),
             probe_depth_view,
             probe_depth_sampler,
@@ -822,6 +865,25 @@ impl UniformBuffer {
         player: &PlayerUpload,
         probes: Option<&ProbeUpload>,
     ) {
+        self.write_scene_stereo_to(queue, &self.buffer, view_proj, camera_pos, shadow, sky, post, player, probes);
+    }
+
+    /// [`Self::upload_scene_stereo`] into another buffer the size of this
+    /// one's -- the twin's, for a pass drawn with another camera. See
+    /// [`Self::twin_buffer`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_scene_stereo_to(
+        &self,
+        queue: &Queue,
+        target: &Buffer,
+        view_proj: [Mat4; 2],
+        camera_pos: [Vec3; 2],
+        shadow: &ShadowUpload,
+        sky: &SkyUpload,
+        post: &PostUpload,
+        player: &PlayerUpload,
+        probes: Option<&ProbeUpload>,
+    ) {
         let probes = probes.unwrap_or(&self.probes);
         // Rooms renumbered 0.. with their lookup tables; see `dense_rooms`.
         let (dense, room_tables) = probes.dense_rooms();
@@ -898,7 +960,11 @@ impl UniformBuffer {
                 player.capsules.group_count as f32,
                 player.capsules.shadow_lights[0],
                 player.capsules.shadow_lights[1],
-                0.0,
+                if player.capsules.floor_mirror {
+                    super::brush_pipeline::probe_pass::FLOOR_MIRROR_BIAS + super::brush_pipeline::probe_pass::FLOOR_MIRROR_PLANE
+                } else {
+                    0.0
+                },
             ],
             post_params: [
                 post.exposure,
@@ -910,8 +976,9 @@ impl UniformBuffer {
                 if post.reflection_share { 1.0 } else { 0.0 },
             ],
         };
-        queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&u));
+        queue.write_buffer(target, 0, bytemuck::bytes_of(&u));
     }
+
 }
 
 #[cfg(test)]
@@ -1884,37 +1951,28 @@ impl UniformBuffer {
         probe_sampler: &Sampler,
         probes: ProbeUpload,
     ) {
-        self.bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("uniform_bg"),
-            layout: &self.layout,
-            entries: &[
-                BindGroupEntry { binding: 0, resource: self.buffer.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: lights.buffer().as_entire_binding() },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::TextureView(sun_shadow_view),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: BindingResource::Sampler(shadow_sampler),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: BindingResource::TextureView(spot_shadow_view),
-                },
-                BindGroupEntry { binding: 5, resource: BindingResource::TextureView(probe_view) },
-                BindGroupEntry { binding: 6, resource: BindingResource::Sampler(probe_sampler) },
-                BindGroupEntry {
-                    binding: 7,
-                    resource: BindingResource::TextureView(sun_dynamic_view),
-                },
-                BindGroupEntry { binding: 8, resource: BindingResource::TextureView(&self.probe_depth_view) },
-                BindGroupEntry { binding: 9, resource: BindingResource::Sampler(&self.probe_depth_sampler) },
-                BindGroupEntry { binding: 10, resource: BindingResource::TextureView(&self.ground_view) },
-                BindGroupEntry { binding: 11, resource: BindingResource::TextureView(&self.proxy_field_view) },
-                BindGroupEntry { binding: 12, resource: BindingResource::TextureView(&self.proxy_card_view) },
-            ],
-        });
+        let group = |buffer: &Buffer, label: &str| {
+            scene_bind_group(
+                device,
+                &self.layout,
+                label,
+                buffer,
+                lights,
+                sun_shadow_view,
+                sun_dynamic_view,
+                spot_shadow_view,
+                shadow_sampler,
+                probe_view,
+                probe_sampler,
+                &self.probe_depth_view,
+                &self.probe_depth_sampler,
+                &self.ground_view,
+                &self.proxy_field_view,
+                &self.proxy_card_view,
+            )
+        };
+        self.bind_group = group(&self.buffer, "uniform_bg");
+        self.twin_bind_group = group(&self.twin_buffer, "uniform_bg_twin");
         self.probes = probes;
     }
 }
