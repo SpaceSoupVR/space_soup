@@ -3440,81 +3440,106 @@ fn probe_view_trust(d: vec3<f32>, c: vec3<f32>, h: vec3<f32>) -> f32 {{
     return smoothstep(0.5, 0.9, dot(d, normalize(h - c)));
 }}
 
-// WHICH WAY A MODEL'S SURFACE FACES at box-frame point `lo`, from its distance
-// field (`field`): the field's gradient, four samples on a tetrahedron half a
-// sample apart. The field is unsigned, so near the surface the gradient points
-// away from it on whichever side `lo` lies -- the side the ray came from.
-fn probe_field_gradient(lo: vec3<f32>, half: vec3<f32>, field: i32) -> vec3<f32> {{
-    let slot = camera.proxy_fields[field * 3];
-    let size = camera.proxy_fields[field * 3 + 1];
-    let scale = size.xyz * (0.5 / max(half, vec3<f32>(1e-4)));
-    let base = slot.xyz + 0.5 * size.xyz;
-    let texel = 0.5 / vec3<f32>(textureDimensions(proxy_field));
-    let lo_uvw = slot.xyz + texel;
-    let hi_uvw = slot.xyz + size.xyz - texel;
-    let e = max(size.w, 1e-3);
-    let k0 = vec3<f32>(1.0, -1.0, -1.0);
-    let k1 = vec3<f32>(-1.0, -1.0, 1.0);
-    let k2 = vec3<f32>(-1.0, 1.0, -1.0);
-    let k3 = vec3<f32>(1.0, 1.0, 1.0);
-    let f0 = textureSampleLevel(proxy_field, probe_samp, clamp(base + (lo + k0 * e) * scale, lo_uvw, hi_uvw), 0.0).r;
-    let f1 = textureSampleLevel(proxy_field, probe_samp, clamp(base + (lo + k1 * e) * scale, lo_uvw, hi_uvw), 0.0).r;
-    let f2 = textureSampleLevel(proxy_field, probe_samp, clamp(base + (lo + k2 * e) * scale, lo_uvw, hi_uvw), 0.0).r;
-    let f3 = textureSampleLevel(proxy_field, probe_samp, clamp(base + (lo + k3 * e) * scale, lo_uvw, hi_uvw), 0.0).r;
-    return k0 * f0 + k1 * f1 + k2 * f2 + k3 * f3;
-}}
-
 // ONE CARD'S SAY about the box-frame point it shows at `uv`, `t` of the way
-// into the box along its axis `e`, read at mip `lod`: its colour times its
-// weight, and the weight. The card's own normal row (`row + 1`) says which way
-// the surface it saw there faces, and the card is trusted as far as
-// - that surface FACES THE RAY `ld`. A lampshade is a shell millimetres thick:
-//   where a reflection meets its dark outside, the card looking up into it saw
-//   the glowing inside at the same place, and under the collar above the shade
-//   -- which no card sees -- that same inside lay a few millimetres in front,
-//   within any depth tolerance a card can afford. Each was a white speck in a
-//   sconce's reflection, coming and going as the head moved (headset,
-//   2026-09-29 23:25). Both faced away from the ray;
-// - it faces the way the hit does, `n`: at a silhouette both faces of a shell
-//   graze the ray, and only the field's side of it tells them apart;
-// - its depth is the hit's, within `tol` metres (`depth` the box's depth along
-//   the axis) -- not something in front of or behind it;
-// weighed by how squarely it faces the card. Read half a texel inside the
-// card, so the filter never reaches the next one.
-fn probe_card_vote(row: f32, face: f32, uv: vec2<f32>, t: f32, depth: f32, tol: f32, lod: f32, e: vec3<f32>, n: vec3<f32>, ld: vec3<f32>) -> vec4<f32> {{
+// into the box along its axis `e`: its colour, read at mip `lod` -- the
+// reflection's footprint -- and its trust, read at full size from the row
+// below (`row + 1`): which way the surface there faces and the range of depths
+// it lies in (see `proxy_cards`). Read coarse, the tests averaged a shade's
+// inside into "straight down", facing every reflection looking up, and the
+// glowing inside vouched for the dark outside all round the rim. The card is
+// trusted as far as
+// - the surface it saw FACES THE RAY `ld` -- strictly: a surface only
+//   grazing it counts for nothing. A lampshade is a shell millimetres thick,
+//   lit inside by its bulb and dark outside: at any point on it the card on
+//   one side saw the outside and the card on the other side the inside, both
+//   within any depth tolerance, and only their facing tells them apart, since
+//   the two faces' normals are opposite. At the shade's silhouette the inside
+//   is a hair past grazing, and half-trusted there -- where the wall plate
+//   hid the outside from every card but the one below -- it drew white specks
+//   down both edges of the reflected shade (offline, 2026-09-30);
+// - the hit is not BEHIND the surface it saw there -- by more than a
+//   millimetre along that surface's normal -- nor far in front of the nearest
+//   surface round it (`depth` the box's depth along the axis; the field walk
+//   stops up to `field_stop` short of a surface, plus 5 mm). Behind is the
+//   test that counts: a wall two millimetres thick is thinner than a card's
+//   texel, and at a bell-shaped shade's silhouette the card looking up saw the
+//   inside a centimetre below the outside the ray met, where the flare turns
+//   it toward the ray -- within any depth range, but the hit is behind it;
+// -- how far, in `sure` -- and weighed among the cards by how squarely that
+// surface faces this one, in `w`. Two measures, not one: the inside of a
+// steep shade is seen only by the card below, and only at a slant, and a
+// confidence read from its slant alone left the glowing mouth grey. Read
+// half a texel inside the card, so the filter never reaches the next one.
+struct ProbeCardVote {{
+    rgb: vec3<f32>,
+    w: f32,
+    sure: f32,
+}}
+fn probe_card_vote(row: f32, face: f32, uv: vec2<f32>, t: f32, depth: f32, field_stop: f32, lod: f32, cu: vec3<f32>, cv: vec3<f32>, cz: vec3<f32>, ld: vec3<f32>) -> ProbeCardVote {{
     let dims = vec2<f32>(textureDimensions(proxy_cards));
     let res = dims.x / 6.0;
     let s = exp2(lod);
-    let texel = clamp(uv * res, vec2<f32>(0.5 * s), vec2<f32>(res - 0.5 * s));
-    let at = vec2<f32>(face * res, row * res) + texel;
-    let card = textureSampleLevel(proxy_cards, probe_samp, at / dims, lod);
-    let seen = textureSampleLevel(proxy_cards, probe_samp, (at + vec2<f32>(0.0, res)) / dims, lod).xyz;
-    let gap = abs(card.w - t) * depth;
-    let square = dot(seen, e);
-    let w = square * square
-        * (1.0 - smoothstep(-0.05, 0.1, dot(seen, ld)))
-        * smoothstep(0.0, 0.4, dot(seen, n))
-        * (1.0 - smoothstep(tol, 2.0 * tol, gap));
-    return vec4<f32>(card.rgb * w, w);
+    let origin = vec2<f32>(face * res, row * res);
+    let card = textureSampleLevel(proxy_cards, probe_samp, (origin + clamp(uv * res, vec2<f32>(0.5 * s), vec2<f32>(res - 0.5 * s))) / dims, lod);
+    let test = textureSampleLevel(proxy_cards, probe_samp, (origin + vec2<f32>(0.0, res) + clamp(uv * res, vec2<f32>(0.5), vec2<f32>(res - 0.5))) / dims, 0.0);
+    // The card's own frame: `cu`, `cv` its axes, `cz` the way it looks from.
+    let c = probe_card_hemisphere(test.xy);
+    let seen = c.x * cu + c.y * cv + c.z * cz;
+    let square = c.z;
+    let behind = (t - test.z) * depth;
+    let in_front = (test.w - t) * depth;
+    let back_tol = 0.001 / max(square, 0.1);
+    let front_tol = 0.005 + field_stop / max(square, 0.3);
+    let valid = (1.0 - smoothstep(-0.03, 0.0, dot(seen, ld)))
+        * (1.0 - smoothstep(back_tol, 2.0 * back_tol, behind))
+        * (1.0 - smoothstep(front_tol, 2.0 * front_tol, in_front));
+    var vote: ProbeCardVote;
+    vote.rgb = card.rgb;
+    vote.w = square * square * valid;
+    vote.sure = valid * smoothstep(0.1, 0.3, abs(square));
+    return vote;
+}}
+
+// `proxy_cards::hemi_octahedral` undone: a unit direction, in a card's own
+// frame, from two numbers.
+fn probe_card_hemisphere(o: vec2<f32>) -> vec3<f32> {{
+    return normalize(vec3<f32>(o.x, o.y, max(1.0 - abs(o.x) - abs(o.y), 0.0)));
+}}
+
+// Votes summed for `probe_card_colour`: colour weighted by the vote AND by
+// 1 / (1 + luminance) -- Karis's weight, as the cards' mips are -- so a
+// bright card among dark ones is one voice, not the loudest; and the surest
+// card's `sure`.
+struct ProbeCardSum {{
+    colour: vec4<f32>,
+    sure: f32,
+}}
+fn probe_card_add(sum: ProbeCardSum, vote: ProbeCardVote) -> ProbeCardSum {{
+    var out = sum;
+    let k = vote.w / (1.0 + dot(vote.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)));
+    out.colour += vec4<f32>(vote.rgb * k, k);
+    out.sure = max(out.sure, vote.sure);
+    return out;
 }}
 
 // A MODEL'S OWN LOOK WHERE A REFLECTION MEETS IT, at world `h` along world
-// `d`: its cards (`proxy_cards`), the three on the faces the SURFACE faces --
-// its normal from the model's field (`probe_field_gradient`) -- each weighed by
-// how squarely what it saw faces it and trusted only where that is the hit
-// itself: facing the ray and the hit's way, and within three of its texels
-// and 5 mm for the field's stop short of the surface (`probe_card_vote`). The
-// room photographs no longer hold the model, so they cannot colour it. `w` is
-// how sure the cards are: 0 where the proxy has none, or none vouches for the
-// hit.
+// `d`: all six of its cards (`proxy_cards`), each trusted where what it saw
+// there is the hit and faces the ray (`probe_card_vote`), weighed by how
+// squarely. The room photographs no longer hold the model, so they cannot
+// colour it. `w` is how sure the cards are: 0 where the proxy has none, or
+// none vouches for the hit.
 //
-// BY THE NORMAL, NOT THE RAY. A lampshade is a shell millimetres thick, lit
-// inside by its bulb and dark outside, and a depth test cannot tell its two
-// faces apart. Chosen by the ray, a reflection looking up at a wall sconce's
-// shade weighed in the card looking up into it -- the glowing inside, 60 times
-// brighter than the outside -- and every sconce reflected as a white blob while
-// the sconce on the wall stood dark (headset, 2026-09-29). Lumen chooses its
-// cards the same way.
+// ALL SIX, BY WHAT THEY SAW. The three facing the ray, then the three facing
+// the surface's normal from the model's distance field, each left a sconce's
+// glowing inside to colour its dark outside: the field's normal beside a thin
+// shell is barely a direction at all -- samples on both sides of it cancel;
+// 74 degrees off in the tilted-plate test -- and read far off, one averaged
+// depth needed a tolerance of three coarse texels, within which the card
+// looking up into the shade vouched for the stem above it. Together: white
+// specks round every sconce in the floor's reflection, coming and going as the
+// head moved (headset, 2026-09-29 23:25 and the bench view
+// hall_to_hallway_floor, 2026-09-30). Each card now says which way its own
+// surface faces and what range of depths it saw.
 fn probe_card_colour(proxy: i32, h: vec3<f32>, d: vec3<f32>, t_hit: f32, lobe: f32) -> vec4<f32> {{
     let row = camera.proxy_cards[proxy >> 2u][proxy & 3] - 1.0;
     if (row < 0.0) {{
@@ -3530,22 +3555,8 @@ fn probe_card_colour(proxy: i32, h: vec3<f32>, d: vec3<f32>, t_hit: f32, lobe: f
     }}
     let box = camera.probe_proxies[proxy * 3 + 1];
     let half = max(box.xyz, vec3<f32>(1e-4));
-    // The surface facing the ray where the field cannot say.
-    var n = -ld;
-    if (box.w > 1.5) {{
-        let g = probe_field_gradient(lo, half, i32(box.w) - 2);
-        if (dot(g, g) > 1e-12) {{
-            // A normal the field tilts past the ray's grazing plane is brought
-            // back TO it, not turned inside out. At a silhouette the field's
-            // few-degree error decides the sign, and a flipped normal chose
-            // the card behind the shell: the sconce shade's outline, seen from
-            // below, took its glowing inside -- white dots that came and went
-            // as the head moved (headset, 2026-09-29 23:25).
-            let gn = normalize(g);
-            let grazing = gn - ld * max(dot(gn, ld), 0.0);
-            n = select(-ld, normalize(grazing), dot(grazing, grazing) > 1e-6);
-        }}
-    }}
+    // How far short of the surface the field's walk stops: half a sample.
+    let field_stop = select(0.0, camera.proxy_fields[max(i32(box.w) - 2, 0) * 3 + 1].w, box.w > 1.5);
     let res = f32(textureDimensions(proxy_cards).x) / 6.0;
     // READ AT THE FOOTPRINT: what one texel of this reflection covers where it
     // meets the model -- the pixel's cone, or the lobe on a rough surface --
@@ -3555,31 +3566,42 @@ fn probe_card_colour(proxy: i32, h: vec3<f32>, d: vec3<f32>, t_hit: f32, lobe: f
     let texel_m = 2.0 * max(max(half.x, half.y), half.z) / res;
     let footprint = max(t_hit * lobe, pixel_footprint * (1.0 + t_hit / max(probe_eye_distance, 0.05)));
     let lod = clamp(log2(max(footprint / texel_m, 1.0)), 0.0, log2(res));
-    let s = exp2(lod);
-    // Card 2a looks in through the +a face and shows the surfaces facing +a;
-    // 2a + 1 the -a face and those facing -a. Axis a's card runs u along
-    // a + 1 and v along a + 2. See `space_soup_engine::reflection_cards`.
-    let sx = select(1.0, -1.0, n.x > 0.0);
-    let sy = select(1.0, -1.0, n.y > 0.0);
-    let sz = select(1.0, -1.0, n.z > 0.0);
+    // Card 2a looks in through the +a face and shows the surfaces facing +a,
+    // `t` from that face; 2a + 1 through the -a face, those facing -a. Axis
+    // a's cards run u along a + 1 and v along a + 2. See
+    // `space_soup_engine::reflection_cards`.
     let uvw = lo / (2.0 * half) + 0.5;
-    var sum = probe_card_vote(
-        row, select(1.0, 0.0, n.x > 0.0), uvw.yz, 0.5 * (1.0 + sx * lo.x / half.x), 2.0 * half.x,
-        3.0 * s * 2.0 * max(half.y, half.z) / res + 0.005, lod, vec3<f32>(1.0, 0.0, 0.0), n, ld
-    );
-    sum += probe_card_vote(
-        row, select(3.0, 2.0, n.y > 0.0), uvw.zx, 0.5 * (1.0 + sy * lo.y / half.y), 2.0 * half.y,
-        3.0 * s * 2.0 * max(half.z, half.x) / res + 0.005, lod, vec3<f32>(0.0, 1.0, 0.0), n, ld
-    );
-    sum += probe_card_vote(
-        row, select(5.0, 4.0, n.z > 0.0), uvw.xy, 0.5 * (1.0 + sz * lo.z / half.z), 2.0 * half.z,
-        3.0 * s * 2.0 * max(half.x, half.y) / res + 0.005, lod, vec3<f32>(0.0, 0.0, 1.0), n, ld
-    );
+    let ax = vec3<f32>(1.0, 0.0, 0.0);
+    let ay = vec3<f32>(0.0, 1.0, 0.0);
+    let az = vec3<f32>(0.0, 0.0, 1.0);
+    // Each card's frame: u, v, and the side it looks from. See
+    // `proxy_cards::card_frame`.
+    var sum: ProbeCardSum;
+    sum.colour = vec4<f32>(0.0);
+    sum.sure = 0.0;
+    sum = probe_card_add(sum, probe_card_vote(row, 0.0, uvw.yz, 0.5 - 0.5 * lo.x / half.x, 2.0 * half.x, field_stop, lod, ay, az, ax, ld));
+    sum = probe_card_add(sum, probe_card_vote(row, 1.0, uvw.yz, 0.5 + 0.5 * lo.x / half.x, 2.0 * half.x, field_stop, lod, ay, az, -ax, ld));
+    sum = probe_card_add(sum, probe_card_vote(row, 2.0, uvw.zx, 0.5 - 0.5 * lo.y / half.y, 2.0 * half.y, field_stop, lod, az, ax, ay, ld));
+    sum = probe_card_add(sum, probe_card_vote(row, 3.0, uvw.zx, 0.5 + 0.5 * lo.y / half.y, 2.0 * half.y, field_stop, lod, az, ax, -ay, ld));
+    sum = probe_card_add(sum, probe_card_vote(row, 4.0, uvw.xy, 0.5 - 0.5 * lo.z / half.z, 2.0 * half.z, field_stop, lod, ax, ay, az, ld));
+    sum = probe_card_add(sum, probe_card_vote(row, 5.0, uvw.xy, 0.5 + 0.5 * lo.z / half.z, 2.0 * half.z, field_stop, lod, ax, ay, -az, ld));
     // HOW SURE, in `w`: a point no card vouches for -- the collar's underside,
     // hidden from the card below by the shade itself -- is left to the
     // model's own colour (`probe_model_colour`), not to a card's say at a
     // hundredth of a vote.
-    return vec4<f32>(sum.rgb / max(sum.w, 1e-6), smoothstep(0.0, 0.25, sum.w));
+    return vec4<f32>(sum.colour.rgb / max(sum.colour.w, 1e-9), sum.sure);
+}}
+
+// `mix(a, b, k)` weighed as a tone-mapped image would be (Karis's
+// 1 / (1 + luminance)): a colour sixty times brighter than the other shows
+// only as far as it is sure, not as far as a sixtieth of it saturates. A
+// fixture's glowing inside, trusted at a tenth, was still six times the
+// shade round it -- and white on the screen.
+fn probe_mix_bright(a: vec4<f32>, b: vec4<f32>, k: f32) -> vec4<f32> {{
+    let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
+    let wa = (1.0 - k) / (1.0 + dot(a.rgb, luma));
+    let wb = k / (1.0 + dot(b.rgb, luma));
+    return (a * wa + b * wb) / max(wa + wb, 1e-9);
 }}
 
 fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32, d: vec3<f32>) -> vec4<f32> {{
@@ -3681,7 +3703,7 @@ fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32,
     // models (`space_soup_engine::reflection_proxy::shaped_models`).
     if (model) {{
         let card = probe_card_colour(i32(-2.0 - other), h, d, t, probe_lobe_tan(roughness));
-        col = mix(col, vec4<f32>(card.rgb, 1.0), card.w);
+        col = probe_mix_bright(col, vec4<f32>(card.rgb, 1.0), card.w);
     }}
     return col;
 }}
@@ -6797,7 +6819,7 @@ mod proxy_card_gpu_tests {
         let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
         let (card_atlas, rows) = proxy_cards::atlas(&device, &queue, &[cards])?;
         assert_eq!(rows, vec![Some(0)]);
-        let (field_atlas, slots) = proxy_field::atlas(&device, &queue, &[field])?;
+        let (_field_atlas, slots) = proxy_field::atlas(&device, &queue, &[field])?;
         let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
         let mut probes = ProbeUpload::default();
         let half = Vec3::splat(HALF);
@@ -6860,9 +6882,10 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
+                // No field texture: the cards alone colour a hit (the field's
+                // slot, in the uniform, gives only its stop distance).
                 wgpu::BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&samp) },
-                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&field_atlas) },
                 wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&card_atlas) },
             ],
         });
@@ -6888,6 +6911,13 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         let data: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().ok()?).to_vec();
         Some(data)
+    }
+
+    /// Two cards' colours as `probe_card_colour` averages two equal votes:
+    /// weighted by 1 / (1 + luminance), the fixtures' colour all red.
+    fn karis(a: f32, b: f32) -> f32 {
+        let (wa, wb) = (1.0 / (1.0 + 0.2126 * a), 1.0 / (1.0 + 0.2126 * b));
+        (a * wa + b * wb) / (wa + wb)
     }
 
     /// Where a ray meets the sphere facing `n`: the field walk stops a hair
@@ -6917,7 +6947,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
         };
         assert!((c[0][0] - 1.0).abs() < 0.05 && c[0][3] == 1.0, "facing +x, from +x: the +x card (1): {:?}", c[0]);
         assert!((c[1][0] - 1.0).abs() < 0.05, "facing +x, from below: still the +x card (1), not the one looking up (4): {:?}", c[1]);
-        assert!((c[2][0] - 2.0).abs() < 0.25, "facing +x+y: the +x (1) and +y (3) cards alike: {:?}", c[2]);
+        assert!((c[2][0] - karis(1.0, 3.0)).abs() < 0.05, "facing +x+y: the +x (1) and +y (3) cards alike: {:?}", c[2]);
         assert!((c[3][0] - 6.0).abs() < 0.05, "facing -z: the -z card (6): {:?}", c[3]);
     }
 
@@ -6935,7 +6965,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
             eprintln!("no GPU adapter; skipping");
             return;
         };
-        assert!((c[0][0] - 2.0).abs() < 0.25 && c[0][3] == 1.0, "the upper face: the +x (1) and +y (3) cards alike, nothing of the underside's (4): {:?}", c[0]);
+        assert!((c[0][0] - karis(1.0, 3.0)).abs() < 0.05 && c[0][3] == 1.0, "the upper face: the +x (1) and +y (3) cards alike, nothing of the underside's (2, 4): {:?}", c[0]);
     }
 
     /// The unsigned field of a thin plate through the box's centre, facing `n`.
@@ -6983,14 +7013,15 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
         ProxyCards { resolution: RES, texels, normals }
     }
 
-    /// A RAY GRAZING A SHELL takes the face it passes, not the one behind it:
-    /// the field's normal, a few degrees off the plate's (its distances are
-    /// samples, and a shade's silhouette is where they are least sure), says
-    /// the ray has just passed the upper face -- the plate itself says it just
-    /// meets it. A normal turned inside out there took the underside's cards
-    /// (2 and 4): the glowing inside of a sconce's shade, as white dots along
-    /// its reflected outline that came and went as the head moved (headset,
-    /// 2026-09-29 23:25).
+    /// A RAY GRAZING A SHELL takes the face it passes, not the one behind it,
+    /// whatever the model's field says: here the field's plate is tilted a few
+    /// degrees off the cards' (a field's distances are samples, and a shade's
+    /// silhouette is where they are least sure), so by the field the ray has
+    /// just passed the upper face -- by what the cards saw it just meets it. A
+    /// normal from the field, turned inside out there, took the underside's
+    /// cards (2 and 4): the glowing inside of a sconce's shade, as white dots
+    /// along its reflected outline that came and went as the head moved
+    /// (headset, 2026-09-29 23:25).
     #[test]
     fn a_ray_grazing_a_shell_takes_the_face_it_passes() {
         let n = Vec3::new(1.0, 1.0, 0.0).normalize();
@@ -7002,7 +7033,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
             eprintln!("no GPU adapter; skipping");
             return;
         };
-        assert!((c[0][0] - 2.0).abs() < 0.25, "the upper face: the +x (1) and +y (3) cards, nothing of the underside's (2, 4): {:?}", c[0]);
+        assert!((c[0][0] - karis(1.0, 3.0)).abs() < 0.05, "the upper face: the +x (1) and +y (3) cards, nothing of the underside's (2, 4): {:?}", c[0]);
         assert!(c[0][3] > 0.9, "and the cards are sure of it: {:?}", c[0]);
     }
 
@@ -7052,6 +7083,172 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
             return;
         };
         assert!(c[0][3] < 0.02, "no card vouches for the collar: {:?}", c[0]);
+    }
+
+    /// THE INSIDE OF A STEEP SHADE, seen only by the card below it and only at
+    /// a slant (its normal 18 degrees below the horizontal), is that card's
+    /// colour, trusted fully: how squarely a card sees a surface weighs it
+    /// among the cards, not whether it vouches. Taken from the slant alone, the
+    /// trust was a third, and a sconce's glowing mouth reflected grey
+    /// (offline, 2026-09-30).
+    #[test]
+    fn a_surface_only_one_card_sees_at_a_slant_is_that_cards() {
+        let inside = Vec3::new(-0.95, -0.31, 0.0).normalize();
+        let d = Vec3::new(0.8, 0.6, 0.0);
+        assert!(inside.dot(d) < -0.5, "the inside faces the ray");
+        let mut texels = Vec::new();
+        let mut normals = Vec::new();
+        for face in 0..6u32 {
+            for _ in 0..RES * RES {
+                if face == 3 {
+                    // The card looking up sees the inside at y = 0.
+                    texels.push([100.0, 0.0, 0.0, 0.5]);
+                    normals.push(inside.to_array());
+                } else {
+                    texels.push([0.0, 0.0, 0.0, 2.0]);
+                    normals.push([0.0; 3]);
+                }
+            }
+        }
+        let cards = ProxyCards { resolution: RES, texels, normals };
+        // The field stops short of the surface on the ray's side: below it.
+        let hit = CENTRE + Vec3::new(0.0, -0.003, 0.0);
+        let Some(c) = colours_of(field(), cards, Quat::IDENTITY, true, &[(hit, d)]) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        assert!((c[0][0] - 100.0).abs() < 1.0, "the card below's colour: {:?}", c[0]);
+        assert!(c[0][3] > 0.99, "trusted fully: {:?}", c[0]);
+    }
+
+    /// A CARD READ FROM AFAR IS TESTED WHERE THE HIT IS, not over its
+    /// footprint: the card looking up saw a surface whose normal alternates
+    /// column by column -- the inside of a shade all round its rim, facing in
+    /// from every side -- so read coarse its normal averages to "straight
+    /// down", facing a ray climbing toward it, while at the hit's own texel it
+    /// faces away. The glowing inside vouched for the dark outside all round
+    /// the rim of every sconce's reflection so, as white specks beside the
+    /// mouth (offline, 2026-09-30).
+    #[test]
+    fn a_card_read_from_afar_is_tested_where_the_hit_is() {
+        let away = Vec3::new(0.9, -0.44, 0.0).normalize();
+        let toward = Vec3::new(-0.9, -0.44, 0.0).normalize();
+        let d = Vec3::new(0.8, 0.6, 0.0);
+        assert!(away.dot(d) > 0.3 && toward.dot(d) < -0.3);
+        let mut texels = Vec::new();
+        let mut normals = Vec::new();
+        for face in 0..6u32 {
+            for _y in 0..RES {
+                for x in 0..RES {
+                    if face == 3 {
+                        texels.push([100.0, 0.0, 0.0, 0.5]);
+                        normals.push(if x % 2 == 1 { away } else { toward }.to_array());
+                    } else {
+                        texels.push([0.0, 0.0, 0.0, 2.0]);
+                        normals.push([0.0; 3]);
+                    }
+                }
+            }
+        }
+        let cards = ProxyCards { resolution: RES, texels, normals };
+        // At the centre of column 7 of the card looking up (u runs along z),
+        // just below the surface.
+        let z = ((7.5 / RES as f32) - 0.5) * 2.0 * HALF;
+        let hit = CENTRE + Vec3::new(0.0, -0.003, z);
+        FOOTPRINT.with(|f| f.set(0.1));
+        HIT_T.with(|f| f.set(1.0));
+        let c = colours_of(field(), cards, Quat::IDENTITY, true, &[(hit, d)]);
+        FOOTPRINT.with(|f| f.set(0.0));
+        HIT_T.with(|f| f.set(0.0));
+        let Some(c) = c else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        assert!(c[0][3] < 0.02, "the surface at the hit faces away: no card vouches: {:?}", c[0]);
+    }
+
+    /// A HIT BEHIND WHAT A CARD SAW IS NOT WHAT IT SAW: at a bell-shaped
+    /// shade's silhouette the card looking up saw, a centimetre BELOW the
+    /// outside the ray met, the inside where the flare turns it just toward
+    /// the ray -- within any depth range a card can afford, and facing the ray,
+    /// but the hit lies behind it. White specks down both edges of every
+    /// sconce's reflection (offline, 2026-09-30).
+    #[test]
+    fn a_hit_behind_what_a_card_saw_is_not_what_it_saw() {
+        let inside = Vec3::new(0.6, -0.87, 0.0).normalize();
+        let d = Vec3::new(0.8, 0.6, 0.0);
+        assert!(inside.dot(d) < 0.0 && inside.dot(d) > -0.1, "the inside just faces the ray");
+        let mut texels = Vec::new();
+        let mut normals = Vec::new();
+        for face in 0..6u32 {
+            for _ in 0..RES * RES {
+                if face == 3 {
+                    // The card looking up: the inside at y = -0.01, under the
+                    // hit at y = 0.
+                    texels.push([100.0, 0.0, 0.0, 0.5 - 0.5 * 0.01 / HALF]);
+                    normals.push(inside.to_array());
+                } else {
+                    texels.push([0.0, 0.0, 0.0, 2.0]);
+                    normals.push([0.0; 3]);
+                }
+            }
+        }
+        let cards = ProxyCards { resolution: RES, texels, normals };
+        let Some(c) = colours_of(field(), cards, Quat::IDENTITY, true, &[(CENTRE, d)]) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        assert!(c[0][3] < 0.02, "the hit is behind the inside: no card vouches: {:?}", c[0]);
+    }
+
+    /// A CARD READ FROM AFAR VOUCHES ONLY FOR THE DEPTHS IT SAW: a wall facing
+    /// +x -- the stem above a sconce's shade -- met by a ray climbing toward
+    /// it, read at a coarse level, where the card looking up saw a bright
+    /// surface turned toward the ray 5 cm below the hit: the shade's glowing
+    /// inside under the stem. One averaged depth needed three coarse texels'
+    /// tolerance -- half a metre here -- and the stem reflected as a line of
+    /// white texels under the mouth (bench view hall_to_hallway_floor,
+    /// 2026-09-30). The card that saw the wall (+x, colour 1) is the stem.
+    #[test]
+    fn a_card_read_from_afar_vouches_only_for_the_depths_it_saw() {
+        let wall = 0.05;
+        let mut texels = Vec::new();
+        let mut normals = Vec::new();
+        for face in 0..6u32 {
+            for _ in 0..RES * RES {
+                match face {
+                    // The +x card: the wall, at x = 0.05.
+                    0 => {
+                        texels.push([1.0, 0.0, 0.0, 0.5 - 0.5 * wall / HALF]);
+                        normals.push([1.0, 0.0, 0.0]);
+                    }
+                    // The card looking up: something bright and facing down
+                    // at y = -0.05, below the hit at y = 0.
+                    3 => {
+                        texels.push([100.0, 0.0, 0.0, 0.5 - 0.5 * 0.05 / HALF]);
+                        normals.push([0.0, -1.0, 0.0]);
+                    }
+                    _ => {
+                        texels.push([0.0, 0.0, 0.0, 2.0]);
+                        normals.push([0.0; 3]);
+                    }
+                }
+            }
+        }
+        let cards = ProxyCards { resolution: RES, texels, normals };
+        let hit = CENTRE + Vec3::new(wall + 0.003, 0.0, 0.0);
+        // A footprint of 0.2 m at the hit: about ten card texels, level 3.
+        FOOTPRINT.with(|f| f.set(0.1));
+        HIT_T.with(|f| f.set(1.0));
+        let c = colours_of(field(), cards, Quat::IDENTITY, true, &[(hit, Vec3::new(-0.6, 0.8, 0.0))]);
+        FOOTPRINT.with(|f| f.set(0.0));
+        HIT_T.with(|f| f.set(0.0));
+        let Some(c) = c else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        assert!(c[0][0] < 2.0, "the wall's own card, nothing of the bright surface 5 cm off: {:?}", c[0]);
+        assert!(c[0][3] > 0.9, "and sure of it: {:?}", c[0]);
     }
 
     /// A SMALL BRIGHT PART, FAR OFF, SHOWS AS ITS SHARE: the sphere's +x card

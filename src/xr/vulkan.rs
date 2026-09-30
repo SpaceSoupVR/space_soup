@@ -81,6 +81,21 @@ const ENABLE_ROBUST_ACCESS: bool = false;
 /// of it a GPU core keeps in flight, and no other tool on this headset says.
 const PIPELINE_STATISTICS_PROPERTY: &std::ffi::CStr = c"debug.spacesoup.pipestats";
 
+/// The Android system property that lets the renderer copy its eye images
+/// out -- `Levers::eye_capture`. The colour swapchain is created able to be
+/// copied from only when it is set, so the shipped build never pays for it.
+/// Read once, when the renderer is created:
+///
+/// ```text
+/// adb -s <quest> shell setprop debug.spacesoup.eyecapture 1
+/// ```
+const EYE_CAPTURE_PROPERTY: &std::ffi::CStr = c"debug.spacesoup.eyecapture";
+
+/// Whether this run may copy its eye images out. See [`EYE_CAPTURE_PROPERTY`].
+pub(crate) fn eye_capture_enabled() -> bool {
+    system_property(EYE_CAPTURE_PROPERTY).trim() == "1"
+}
+
 /// An Android system property's value; empty when unset.
 fn system_property(name: &std::ffi::CStr) -> String {
     extern "C" {
