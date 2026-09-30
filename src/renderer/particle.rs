@@ -203,9 +203,12 @@ impl ParticlePipeline {
     }
 }
 
-fn particle_shader() -> String {
+/// This eye's camera by `view_slot`, which a stereo pass sets per view; see
+/// `multiview`.
+pub(crate) fn particle_shader() -> String {
     r#"
-struct Uniforms { view_proj: mat4x4<f32> }
+var<private> view_slot: i32 = 0;
+struct Uniforms { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
 struct VIn  { @location(0) pos: vec3<f32>, @location(1) col: vec4<f32>, @location(2) uv: vec2<f32> }
@@ -217,7 +220,7 @@ struct VOut {
 
 @vertex fn vs_main(v: VIn) -> VOut {
     var out: VOut;
-    out.clip = u.view_proj * vec4<f32>(v.pos, 1.0);
+    out.clip = u.view_proj[view_slot] * vec4<f32>(v.pos, 1.0);
     out.col = v.col;
     out.uv = v.uv;
     return out;

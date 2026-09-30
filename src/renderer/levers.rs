@@ -143,6 +143,12 @@ pub struct Levers {
     /// --eye-capture` drives it. Captures only: it changes nothing drawn, so
     /// it is not in `summary`.
     pub eye_capture: u32,
+    /// The lamps' veils: each light source's glare, drawn where an HDR
+    /// framebuffer would have bloomed it. See `glare`.
+    pub glare: bool,
+    /// How strong the veils are against `glare::VEIL_SHARE` of Stiles and
+    /// Holladay's: 1 as shipped.
+    pub glare_strength: f32,
     /// Metres past which the terrain's layer normal maps fade out; 0 keeps
     /// them everywhere. See `terrain_pipeline` (`post_params.z`).
     pub terrain_detail_distance: f32,
@@ -195,6 +201,8 @@ impl Default for Levers {
             space_warp: true,
             space_warp_debug: 0,
             eye_capture: 0,
+            glare: true,
+            glare_strength: 1.0,
             terrain_detail_distance: 0.0,
             gpu_sync: false,
             ssr: None,
@@ -245,6 +253,7 @@ impl Levers {
             Phase::TerrainPerPixelReflections => l.terrain_probe_pass = false,
             Phase::NoGroundTrace => l.ground_trace = false,
             Phase::NoFoveation => l.foveation = crate::renderer::foveation::FoveationLevel::Off,
+            Phase::NoGlare => l.glare = false,
         }
         l
     }
@@ -279,6 +288,7 @@ impl Levers {
         flag("terrain_probe_pass", self.terrain_probe_pass, d.terrain_probe_pass);
         flag("ground_trace", self.ground_trace, d.ground_trace);
         flag("space_warp", self.space_warp, d.space_warp);
+        flag("glare", self.glare, d.glare);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
@@ -288,6 +298,9 @@ impl Levers {
         }
         if self.space_warp_debug != 0 {
             out.push(format!("swdbg={}", self.space_warp_debug));
+        }
+        if self.glare && self.glare_strength != d.glare_strength {
+            out.push(format!("glare_strength={}", self.glare_strength));
         }
         if self.terrain_detail_distance != d.terrain_detail_distance {
             out.push(format!("terrain_detail={}", self.terrain_detail_distance));

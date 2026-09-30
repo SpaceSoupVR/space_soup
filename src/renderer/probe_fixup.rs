@@ -137,6 +137,34 @@ struct ProbeFixupList {{
 
 const FIXUP_DEPTH_TOLERANCE: f32 = {tolerance:?};
 
+// A TEXEL ACROSS ONE OF A MODEL'S OWN OUTLINES, traced again: four rays in a
+// rotated grid across what the texel's reflection covers, each coloured as the
+// pass colours a hit, averaged. See `PROBE_SUBSAMPLE`. Spread over the edge's
+// softening width -- `PROBE_EDGE_FOOTPRINTS` of the pixel each side, or the
+// lobe where a rough surface's is wider -- as every other reflected edge is,
+// so the scene's bilinear read of this half-resolution pass does not snap the
+// outline to its texels. A ray that finds nothing keeps the texel's own
+// colour. The grid is turned a quarter each ray rather than read from an
+// array, which Adreno puts in scratch memory when a loop indexes it.
+fn probe_subsample(primary: vec4<f32>, world_pos: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, probe_lod: f32, trace_room: f32) -> vec4<f32> {{
+    let spread = 2.0 * max(probe_lobe_tan(roughness), PROBE_EDGE_FOOTPRINTS * pixel_footprint / max(probe_eye_distance, 0.05));
+    let a = normalize(cross(d, select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(d.y) > 0.9)));
+    let b = cross(d, a);
+    var o = vec2<f32>(0.125, 0.375);
+    var sum = vec4<f32>(0.0);
+    for (var k = 0; k < 4; k = k + 1) {{
+        let dk = normalize(d + (a * o.x + b * o.y) * spread);
+        let h = probe_trace(world_pos, dk, trace_room, roughness);
+        var c = primary;
+        if (h.found) {{
+            c = probe_traced_colour(h, dk, roughness, dir, probe_lod);
+        }}
+        sum = sum + c;
+        o = vec2<f32>(-o.y, o.x);
+    }}
+    return 0.25 * sum;
+}}
+
 @compute @workgroup_size(64)
 fn fixup(@builtin(global_invocation_id) id: vec3<u32>) {{
     if (id.x >= min(fixups.count, arrayLength(&fixups.items))) {{
@@ -159,14 +187,18 @@ fn fixup(@builtin(global_invocation_id) id: vec3<u32>) {{
     hit.edge_t = f.hit.w;
     hit.rim_code = bitcast<i32>(f.codes.x);
     hit.edge_code = bitcast<i32>(f.codes.y);
+    var primary = f.col;
+    if (hit.edge_code >= 0 && hit.edge_cover < 0.0) {{
+        primary = probe_subsample(f.col, f.from_pos.xyz, f.dir_world.xyz, f.dir_given.xyz, f.dir_world.w, f.dir_given.w, f.from_pos.w);
+    }}
     let col = probe_secondary(
-        hit, f.col, f.from_pos.xyz, f.dir_world.xyz, f.dir_given.xyz, f.dir_world.w, f.dir_given.w, f.from_pos.w,
+        hit, primary, f.from_pos.xyz, f.dir_world.xyz, f.dir_given.xyz, f.dir_world.w, f.dir_given.w, f.from_pos.w,
     );
-    // As `probe_env_for_pass` finishes a traced reflection: premultiplied by
-    // its coverage, the brightness normalisation out of it (a traced hit
-    // leaves `probe_brightness` at 0, and its scale is exactly 1).
+    // As `probe_env_for_pass` finishes a traced reflection: compressed and
+    // premultiplied by its coverage, the brightness normalisation out of it (a
+    // traced hit leaves `probe_brightness` at 0, and its scale is exactly 1).
     let a = clamp(col.a, 0.0, 1.0);
-    textureStore(probe_out, texel, vec4<f32>(col.rgb * 1.0 * a, a));
+    textureStore(probe_out, texel, vec4<f32>(probe_pass_compress(col.rgb * 1.0) * a, a));
 }}
 "#,
         lights = super::lights::wgsl_lights_block(0, 1),

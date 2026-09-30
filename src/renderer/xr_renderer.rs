@@ -371,6 +371,7 @@ struct StereoScenePipelines {
     brush_sources: crate::renderer::brush_pipeline::BrushPipeline,
     brush_seal: crate::renderer::brush_pipeline::BrushSealPipeline,
     particle: ParticlePipeline,
+    glare: crate::renderer::glare::GlarePipeline,
 }
 
 
@@ -499,6 +500,14 @@ pub struct XrRenderer {
     scene_targets: [SceneTarget; 2],
     ssr_camera_uniform: SsrCameraUniform,
     particle_pipeline: ParticlePipeline,
+    /// The lamps' veils, drawn last in the scene pass. See `glare`.
+    glare_pipeline: crate::renderer::glare::GlarePipeline,
+    /// The light sources that glare this frame, in the player's frame. See
+    /// `set_glare_sources`.
+    glare_sources: Vec<crate::renderer::glare::GlareSource>,
+    /// The characters' capsules, which can stand between an eye and a lamp.
+    /// See `set_capsules`.
+    glare_capsules: Vec<(glam::Vec3, glam::Vec3, f32)>,
     uniform_buf: UniformBuffer,
     lights_uniform: LightsUniform,
     depth_view: wgpu::TextureView,
@@ -1165,6 +1174,9 @@ impl XrRenderer {
             particle: ParticlePipeline::new_multisampled_stereo(
                 &wgpu_device, wgpu_format, &uniform_buf.layout, samples,
             ),
+            glare: crate::renderer::glare::GlarePipeline::new_multisampled_stereo(
+                &wgpu_device, wgpu_format, &uniform_buf.layout, &probe_pass_layout, samples,
+            ),
         });
 
         // ONE PAIR OF LAYERED TEXTURES when the device can draw stereo, two
@@ -1254,6 +1266,9 @@ impl XrRenderer {
         let ssr_camera_uniform = ssr_pipelines.create_camera_uniform(&wgpu_device);
         let particle_pipeline = ParticlePipeline::new_multisampled(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples,
+        );
+        let glare_pipeline = crate::renderer::glare::GlarePipeline::new_multisampled(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, &probe_pass_layout, samples,
         );
 
         let depth_tex = wgpu_device.create_texture(&wgpu::TextureDescriptor {
@@ -1428,6 +1443,9 @@ impl XrRenderer {
             scene_targets,
             ssr_camera_uniform,
             particle_pipeline,
+            glare_pipeline,
+            glare_sources: Vec::new(),
+            glare_capsules: Vec::new(),
             uniform_buf,
             lights_uniform,
             depth_view,
@@ -1877,6 +1895,28 @@ impl XrRenderer {
             _ => &self.particle_pipeline.pipeline,
         }
     }
+    /// Whether the scene pass draws both eyes at once this frame.
+    fn stereo_scene(&self) -> bool {
+        self.multiview_scene && self.stereo_pipelines.is_some()
+    }
+    /// Whether this frame's half-resolution probe pass runs: the brushes'
+    /// reflections, and the depth the glare finds walls in front of its lamps
+    /// by. The diagnostic views keep the per-pixel shader, which is the only
+    /// one that paints them; a stereo scene pass needs the two-eye pass, which
+    /// the device may have refused (`StereoProbePass`).
+    fn probe_pass_runs(&self, fx: &crate::renderer::levers::Levers, stereo: bool, has_brushes: bool) -> bool {
+        fx.half_res_reflections
+            && fx.probes
+            && (!stereo || self.stereo_probe.is_some())
+            && self.debug_view == crate::renderer::brush_pipeline::DebugView::Off
+            && has_brushes
+    }
+    fn sp_glare(&self, stereo: bool) -> &wgpu::RenderPipeline {
+        match (stereo, &self.stereo_pipelines) {
+            (true, Some(p)) => &p.glare.pipeline,
+            _ => &self.glare_pipeline.pipeline,
+        }
+    }
     /// The scene-pass brush, whichever diagnostic is showing.
     fn sp_brush(&self, stereo: bool) -> &wgpu::RenderPipeline {
         use crate::renderer::brush_pipeline::DebugView;
@@ -2080,10 +2120,20 @@ impl XrRenderer {
         self.player.yaw = yaw;
     }
 
+    /// The light sources that glare, in the player's frame: each lamp's bulb,
+    /// what it gives off and which sides it shows from. Set every frame, as a
+    /// lamp switches or dims. See `glare`.
+    pub fn set_glare_sources(&mut self, sources: Vec<crate::renderer::glare::GlareSource>) {
+        self.glare_sources = sources;
+    }
+
     /// The characters as capsules for this frame, nearest first, in the
     /// player's frame. See `uniforms::CapsuleUpload`.
     pub fn set_capsules(&mut self, groups: &[crate::renderer::uniforms::CapsuleGroup]) {
         self.player.capsules = crate::renderer::uniforms::CapsuleUpload::from_groups(groups);
+        // Every one, for the hands that shield an eye from a lamp. See `glare`.
+        self.glare_capsules.clear();
+        self.glare_capsules.extend(groups.iter().flat_map(|g| g.capsules.iter().copied()));
     }
 
     pub fn set_sky(
