@@ -2384,6 +2384,16 @@ impl XrRenderer {
                 self.perf_windows += 1;
             }
         }
+        // DIAGNOSIS: both eyes' finished images, once per new request. See
+        // `Levers::eye_capture`.
+        let request = self.levers.eye_capture;
+        if request != 0 && request != self.eye_capture_served {
+            self.eye_capture_served = request;
+            match self.capture_eyes(image_index, request) {
+                Ok(path) => log::info!("EYECAPTURE {request} -> {}", path.display()),
+                Err(e) => log::warn!("EYECAPTURE {request} failed: {e}"),
+            }
+        }
         self.swapchain.release_image()?;
 
         // PINNED, the frame is handed to the compositor as if drawn from where
@@ -2432,5 +2442,74 @@ impl XrRenderer {
             .collect();
 
         Ok(proj_views)
+    }
+
+    /// BOTH EYES' FINISHED IMAGES of swapchain image `image_index`, as the
+    /// compositor is about to get them, to the app's files: `eyecapture_<id>.bin`,
+    /// the bytes `EYES`, width and height as little-endian u32s, then the left
+    /// eye's rows and the right eye's, RGBA8 in sRGB. Waits on the GPU: a
+    /// diagnosis, not a feature. The system's screenshot is one view, so a
+    /// difference between the eyes -- which has happened here before -- shows
+    /// only this way. `quest_app/bench.py --eye-capture` pulls and converts it.
+    fn capture_eyes(&self, image_index: usize, id: u32) -> Result<std::path::PathBuf, String> {
+        if !self.eye_capture_enabled {
+            return Err("the eye images cannot be copied: set debug.spacesoup.eyecapture to 1 before the app starts".into());
+        }
+        let texture = &self.eye_targets[image_index][0]._texture;
+        let (width, height) = (texture.width(), texture.height());
+        let row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let layer_bytes = u64::from(row) * u64::from(height);
+        let buffer = self.wgpu_device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("eye_capture"),
+            size: 2 * layer_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.wgpu_device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("eye_capture") });
+        for layer in 0..2u32 {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: u64::from(layer) * layer_bytes,
+                        bytes_per_row: Some(row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        }
+        // OpenXR takes a colour swapchain image back only as an attachment.
+        encoder.transition_resources(
+            std::iter::empty(),
+            std::iter::once(wgpu::TextureTransition {
+                texture,
+                selector: Some(wgpu_types::TextureSelector { mips: 0..1, layers: 0..2 }),
+                state: wgpu::TextureUses::COLOR_TARGET,
+            }),
+        );
+        self.wgpu_queue.submit(Some(encoder.finish()));
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.wgpu_device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let data = buffer.slice(..).get_mapped_range().map_err(|e| format!("{e:?}"))?;
+        let mut out = Vec::with_capacity(12 + 8 * (width * height) as usize);
+        out.extend_from_slice(b"EYES");
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        for layer in 0..2u64 {
+            for y in 0..u64::from(height) {
+                let start = (layer * layer_bytes + y * u64::from(row)) as usize;
+                out.extend_from_slice(&data[start..start + (width * 4) as usize]);
+            }
+        }
+        let path = ndk_glue::native_activity().external_data_path().join(format!("eyecapture_{id}.bin"));
+        std::fs::write(&path, &out).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(path)
     }
 }

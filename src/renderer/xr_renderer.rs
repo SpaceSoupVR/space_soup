@@ -561,6 +561,10 @@ pub struct XrRenderer {
     probe_proxies: Vec<crate::renderer::uniforms::ProbeProxy>,
     /// The runtime switches, from the headset's lever file. See `levers`.
     levers: crate::renderer::levers::Levers,
+    /// Whether the eye images can be copied out, and the last
+    /// `Levers::eye_capture` request served. See `capture_eyes`.
+    eye_capture_enabled: bool,
+    eye_capture_served: u32,
     /// The GPU pool the level's probes stream through. See `probe_stream`.
     ///
     /// A `RefCell` like `eye`: the frame is rendered through `&self`, and the
@@ -825,10 +829,17 @@ impl XrRenderer {
         let vk_format = vk::Format::R8G8B8A8_SRGB;
         let wgpu_format = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+        // Copied out only when asked to before the app started: see
+        // `Levers::eye_capture`.
+        let eye_capture_enabled = crate::xr::vulkan::eye_capture_enabled();
+        if eye_capture_enabled {
+            info!("XrRenderer: eye capture enabled (debug.spacesoup.eyecapture)");
+        }
         let swapchain = session.create_swapchain(&xr::SwapchainCreateInfo {
             create_flags: xr::SwapchainCreateFlags::EMPTY,
             usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
-                | xr::SwapchainUsageFlags::SAMPLED,
+                | xr::SwapchainUsageFlags::SAMPLED
+                | if eye_capture_enabled { xr::SwapchainUsageFlags::TRANSFER_SRC } else { xr::SwapchainUsageFlags::EMPTY },
             format: vk_format.as_raw() as _,
             sample_count: 1,
             width,
@@ -1274,7 +1285,18 @@ impl XrRenderer {
         for &raw_image in &raw_images {
             let targets = std::array::from_fn(|eye| {
                 let wgpu_tex = unsafe {
-                    vulkan_interop::import_vk_image_as_wgpu(&wgpu_device, raw_image, wgpu_format, width, height, 2)
+                    if eye_capture_enabled {
+                        vulkan_interop::import_vk_image_as_wgpu_with(
+                            &wgpu_device,
+                            raw_image,
+                            wgpu_format,
+                            (width, height, 2),
+                            wgpu::TextureUses::COLOR_TARGET | wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC,
+                            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                        )
+                    } else {
+                        vulkan_interop::import_vk_image_as_wgpu(&wgpu_device, raw_image, wgpu_format, width, height, 2)
+                    }
                 };
                 let view = wgpu_tex.create_view(&wgpu::TextureViewDescriptor {
                     format: Some(wgpu_format),
@@ -1434,6 +1456,8 @@ impl XrRenderer {
             cull_rooms: Vec::new(),
             probe_proxies: Vec::new(),
             levers: crate::renderer::levers::Levers::default(),
+            eye_capture_enabled,
+            eye_capture_served: 0,
             probe_stream: std::cell::RefCell::new(None),
             eye: std::cell::RefCell::new(crate::renderer::exposure::EyeAdaptation::sky_only(
                 crate::renderer::sky::SkyIrradiance::flat(crate::renderer::sky::AMBIENT),

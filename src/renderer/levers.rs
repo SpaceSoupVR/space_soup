@@ -134,6 +134,15 @@ pub struct Levers {
     /// 65536 = with 8192, the images also saved raw to the app's files
     /// (`swdump.bin`, see `space_warp::Readback::read`).
     pub space_warp_debug: u32,
+    /// DIAGNOSIS: both eyes' finished images of the next frame, raw, to the
+    /// app's files as `eyecapture_<n>.bin`, each time this changes to a new
+    /// nonzero `n` -- to see whether something differs between the eyes,
+    /// which no screenshot shows (the system's is one view). Needs the
+    /// `debug.spacesoup.eyecapture` property set to 1 before the app starts;
+    /// see `xr::vulkan::eye_capture_enabled`. `quest_app/bench.py
+    /// --eye-capture` drives it. Captures only: it changes nothing drawn, so
+    /// it is not in `summary`.
+    pub eye_capture: u32,
     /// Metres past which the terrain's layer normal maps fade out; 0 keeps
     /// them everywhere. See `terrain_pipeline` (`post_params.z`).
     pub terrain_detail_distance: f32,
@@ -185,6 +194,7 @@ impl Default for Levers {
             foveation: crate::renderer::foveation::SHIPPED,
             space_warp: true,
             space_warp_debug: 0,
+            eye_capture: 0,
             terrain_detail_distance: 0.0,
             gpu_sync: false,
             ssr: None,
