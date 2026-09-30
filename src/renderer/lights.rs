@@ -2169,8 +2169,9 @@ fn probe_secondary(
             let beside = select(col, x, went_through);
             // A NEAR rim's opening also has a far end, where the part of the
             // lobe inside it either leaves or meets the opening's side. See
-            // `probe_through_far_end`.
-            if ((hit.rim_code & PROBE_RIM_FAR) == 0) {{
+            // `probe_through_far_end`. Not for a lobe as wide as
+            // `PROBE_FAR_END_MAX_ROUGHNESS`'s -- see there.
+            if ((hit.rim_code & PROBE_RIM_FAR) == 0 && roughness < PROBE_FAR_END_MAX_ROUGHNESS) {{
                 through = probe_through_far_end(hit, d, through, roughness, dir, probe_lod);
             }}
             col = mix(beside, through, hit.rim);
@@ -2524,6 +2525,15 @@ fn probe_lobe_tan(roughness: f32) -> f32 {{
 // The narrowest lobe, in metres where it meets a wall, worth softening a
 // doorway's rim for: a centimetre is under a pixel wherever it is seen.
 const PROBE_RIM_MIN_SPREAD: f32 = 0.01;
+// THE ROUGHEST SURFACE WHOSE DOORWAY RIMS GET THEIR FAR END BLENDED TOO
+// (`probe_through_far_end`). The far end was for the marble floor's saw-tooth,
+// where a narrow lobe sees the two rims apart; a lobe this wide already spans
+// both, and on brick its early-out almost never fires -- so every rim record
+// (14% of the brick hall's pass texels) paid another trace for nothing:
+// offline, dropping it changes 0.0035% of brick_hall_diagonal's pixels by more
+// than 6 levels, none visibly (2026-09-30). The near rim's blend stays at every
+// roughness: without it rough stone catches the doorway's light in hard patches.
+const PROBE_FAR_END_MAX_ROUGHNESS: f32 = 0.45;
 
 // HOW MANY OF THE PASS'S OWN PIXELS A REFLECTED EDGE IS SOFTENED OVER, each
 // side of it: a doorway's rim, a solid proxy's outline, a model's. See

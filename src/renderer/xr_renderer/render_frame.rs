@@ -1636,7 +1636,13 @@ impl XrRenderer {
                         }
                         drop(pass);
                         if deferred_lookups {
-                            self.probe_fixups.dispatch(&mut encoder, &self.uniform_buf.bind_group, &self.probe_fixup_targets[eye]);
+                            // Its own slots, `fix_l`/`fix_r`, after the probe pass's.
+                            self.probe_fixups.dispatch(
+                                &mut encoder,
+                                &self.uniform_buf.bind_group,
+                                &self.probe_fixup_targets[eye],
+                                self.pass_timers.as_ref().and_then(|t| t.compute_writes(10 + eye)),
+                            );
                         }
                     }
                 }
