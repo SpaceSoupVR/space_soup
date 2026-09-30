@@ -58,41 +58,85 @@ pub fn atlas(device: &Device, queue: &Queue, sets: &[ProxyCards]) -> Option<(Tex
     if used == 0 {
         return None;
     }
+    // Level 0, the atlas as the file has it: linear RGB and the depth `t`.
     let width = res * CARD_FACES as u32;
     let height = res * used;
-    let mut data: Vec<u16> = vec![0; (width * height * 4) as usize];
+    let mut level: Vec<[f32; 4]> = vec![[0.0, 0.0, 0.0, MISS]; (width * height) as usize];
     for (c, row) in sets.iter().zip(&rows) {
         let Some(row) = row else { continue };
         for face in 0..CARD_FACES as u32 {
             for y in 0..res {
                 for x in 0..res {
-                    let src = c.texels[((face * res + y) * res + x) as usize];
-                    let dst = (((row * res + y) * width + face * res + x) * 4) as usize;
-                    for k in 0..4 {
-                        data[dst + k] = crate::renderer::sky::f32_to_f16(src[k]);
-                    }
+                    level[((row * res + y) * width + face * res + x) as usize] = c.texels[((face * res + y) * res + x) as usize];
                 }
             }
         }
     }
+    // THE MIP CHAIN, down to a texel a card. See `probe_card_colour`: a
+    // reflection far off reads a card at its footprint's size, so a small
+    // bright part -- a sconce's glowing mouth -- shows as its share of the
+    // footprint rather than as whole half-resolution texels switching on and
+    // off as the head moves. Each level averages only the texels that SAW the
+    // model; a texel none of whose four saw it saw nothing. A card's 2 x 2 blocks never straddle two cards, since cards sit
+    // at multiples of their own power-of-two size.
+    let levels = if res.is_power_of_two() { res.trailing_zeros() + 1 } else { 1 };
+    let mut chain: Vec<(u32, u32, Vec<[f32; 4]>)> = vec![(width, height, level)];
+    for _ in 1..levels {
+        let (pw, ph, prev) = chain.last().unwrap();
+        let (w, h) = (pw / 2, ph / 2);
+        let mut next = vec![[0.0, 0.0, 0.0, MISS]; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                // Colour weighted by 1 / (1 + luminance) -- Karis's firefly
+                // weight -- depth plainly. A glowing mouth is sixty times
+                // brighter than the shade round it: averaged plainly, a texel a
+                // quarter mouth was still fifteen times white, and every far
+                // sconce reflected as a white blob the size of the footprint.
+                let (mut rgb, mut weight, mut depth, mut n) = ([0.0f32; 3], 0.0f32, 0.0f32, 0.0f32);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let t = prev[((2 * y + dy) * pw + 2 * x + dx) as usize];
+                    if t[3] < MISS * 0.75 {
+                        let w = 1.0 / (1.0 + 0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2]);
+                        for k in 0..3 {
+                            rgb[k] += t[k] * w;
+                        }
+                        weight += w;
+                        depth += t[3];
+                        n += 1.0;
+                    }
+                }
+                if n > 0.0 {
+                    next[(y * w + x) as usize] = [rgb[0] / weight, rgb[1] / weight, rgb[2] / weight, depth / n];
+                }
+            }
+        }
+        chain.push((w, h, next));
+    }
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("proxy_card_atlas"),
         size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        mip_level_count: 1,
+        mip_level_count: levels,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-        bytemuck::cast_slice(&data),
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 8), rows_per_image: Some(height) },
-        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-    );
+    for (mip, (w, h, texels)) in chain.iter().enumerate() {
+        let data: Vec<u16> = texels.iter().flat_map(|t| t.map(crate::renderer::sky::f32_to_f16)).collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: mip as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&data),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(*h) },
+            wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
+        );
+    }
     Some((tex.create_view(&wgpu::TextureViewDescriptor::default()), rows))
 }
+
+/// `t` for a texel whose card saw nothing. Must equal
+/// `space_soup_engine::reflection_cards::CARD_MISS`.
+pub const MISS: f32 = 2.0;
 
 /// What a level without cards binds: one texel, never read.
 pub fn none(device: &Device) -> TextureView {
