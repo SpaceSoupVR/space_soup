@@ -101,6 +101,10 @@ pub enum Phase {
     NoFoveation,
     /// No glare: the lamps' veils (`glare`) left undrawn. What they cost.
     NoGlare,
+    /// Each lamp's terminator back to the hard clamp at the pixel's centre
+    /// (`lights::terminator_aa` off): what filtering it over the footprint
+    /// costs.
+    NoTerminatorAa,
     /// The floor mirror ON: the characters mirrored in the floor instead of
     /// their capsules there. Off as shipped, so this phase measures what
     /// turning it on would cost.
@@ -108,7 +112,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    pub const ALL: [Phase; 22] = [
+    pub const ALL: [Phase; 23] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -130,6 +134,7 @@ impl Phase {
         Phase::NoGroundTrace,
         Phase::NoFoveation,
         Phase::NoGlare,
+        Phase::NoTerminatorAa,
         Phase::FloorMirror,
     ];
 
@@ -175,6 +180,7 @@ impl Phase {
             Phase::NoGroundTrace => "no_ground_trace",
             Phase::NoFoveation => "no_foveation",
             Phase::NoGlare => "no_glare",
+            Phase::NoTerminatorAa => "no_terminator_aa",
             Phase::FloorMirror => "floor_mirror",
         }
     }

@@ -491,7 +491,8 @@ struct GpuLights {
     /// (the rest are baked into the level's lightmaps and shaded only by
     /// surfaces without one -- see `receiver_skips_baked`); z = 1 turns the
     /// shader's light culling OFF, to measure it (see `light_culling` in the
-    /// shader); w pads the field to the array's 16-byte stride.
+    /// shader); w = 1 turns the lamps' footprint-filtered terminator OFF, to
+    /// measure it (see `terminator_aa` in the shader).
     count: [u32; 4],
     lights: [GpuLight; MAX_LIGHTS],
 }
@@ -508,6 +509,10 @@ pub struct LightsUniform {
     /// `light_culling` lever). A `Cell` so the frame can set it while its draw
     /// lists still borrow the renderer.
     culling: std::cell::Cell<bool>,
+    /// Whether each lamp's terminator is shaded over the pixel's footprint
+    /// (`terminator_aa` in the shader). On as shipped; off only to measure it
+    /// (the `terminator_aa` lever).
+    terminator_aa: std::cell::Cell<bool>,
 }
 
 impl LightsUniform {
@@ -519,12 +524,17 @@ impl LightsUniform {
             mapped_at_creation: false,
         });
 
-        Self { buffer, culling: std::cell::Cell::new(true) }
+        Self { buffer, culling: std::cell::Cell::new(true), terminator_aa: std::cell::Cell::new(true) }
     }
 
     /// See `culling`. Takes effect with the next upload.
     pub fn set_culling(&self, on: bool) {
         self.culling.set(on);
+    }
+
+    /// See `terminator_aa`. Takes effect with the next upload.
+    pub fn set_terminator_aa(&self, on: bool) {
+        self.terminator_aa.set(on);
     }
 
     pub fn buffer(&self) -> &Buffer {
@@ -575,7 +585,8 @@ impl LightsUniform {
         spot_layers: &[usize],
         sun_is_baked: bool,
     ) {
-        let gpu = pack_lights(lights, live, spot_layers, sun_is_baked, self.culling.get());
+        let mut gpu = pack_lights(lights, live, spot_layers, sun_is_baked, self.culling.get());
+        gpu.count[3] = u32::from(!self.terminator_aa.get());
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&gpu));
     }
 }
@@ -980,6 +991,12 @@ var<private> dbg_probe_factors: vec3<f32> = vec3<f32>(0.0);
 // derivatives are only valid in uniform control flow, and the light loop is
 // not that.
 var<private> pixel_footprint: f32 = 0.0;
+// HOW FAR `dot(n, l)` SWINGS ACROSS THIS PIXEL, set once at the top of a
+// fragment shader whose normal is MAPPED, from that normal's derivatives (see
+// `terminator_width_of`). The lamps' terminator is then shaded over the pixel's
+// footprint rather than at its centre -- see `terminator_aa`. 0, as every
+// shader that does not set it leaves it, is the hard clamp exactly as before.
+var<private> terminator_width: f32 = 0.0;
 // A LAMP'S FALLOFF IS THE INVERSE SQUARE, clamped at the bulb.
 //
 // It was `window^2 / (d^2 + 1)`, which is Unreal's formula -- where distances
@@ -1606,6 +1623,45 @@ struct LightSplit {{
 /// highlight by the diffuse colour: on this project's marble, an albedo of
 /// 0.373 made every highlight nearly three times dimmer than it should be, and
 /// the surface read as though it had no shine at all.
+// THE LIGHT A PIXEL'S FOOTPRINT RECEIVES AT A LAMP'S TERMINATOR (2026-09-30).
+//
+// `max(dot(n, l), 0)` at the pixel's centre is a HARD STEP wherever a mapped
+// normal turns away from the lamp: every rock crevice lit at a grazing angle
+// flipped whole pixels between lit and black as the head moved. The hallway's
+// sconce-lit rock and the brick hall's ceiling over its lamp were the worst
+// aliasing in the level against a 3x-supersampled reference
+// (`offline_frame::aliasing`), and mipping cannot help: it averages the
+// normal, and the clamp comes after.
+//
+// Box-filtered instead. With `dot(n, l)` spread evenly over `nl +- w` across
+// the pixel, the mean of the clamp is `(nl + w)^2 / 4w` inside that band, and
+// the share of the pixel facing the lamp -- which gates its highlight -- is
+// `(nl + w) / 2w`. At `w = 0` both are the old step exactly. `lights.count.w`
+// nonzero switches it off, to measure (the `terminator_aa` lever).
+fn terminator_aa(nl: f32) -> vec2<f32> {{
+    let w = select(terminator_width, 0.0, lights.count.w != 0u);
+    let facing = clamp((nl + w) / max(2.0 * w, 1e-6), 0.0, 1.0);
+    return vec2<f32>(select(max(nl, 0.0), 0.5 * (nl + w) * facing, abs(nl) < w), facing);
+}}
+
+// `terminator_width` from the NORMAL MAP'S OWN MEASURE of how much the normals
+// under this pixel disagree: its filtered sample, averaged unnormalised by the
+// mips and by the sampler, comes back shorter the more they spread (Toksvig) --
+// `sigma^2 = (1 - |n|) / |n|`, less the 1% a quantised unit normal reads short.
+// `dot(n, l)` then varies about `sigma^2 / 2`, and a box of that variance is
+// `sqrt(3 sigma^2 / 2)` either side. Capped, so a map seen almost edge-on is
+// softened rather than washed flat.
+//
+// NOT FROM THE SCREEN DERIVATIVES of the normal, which were tried first: a
+// quad's derivatives of a minified normal map are themselves aliased, so the
+// width jumped from quad to quad -- the hallway's aliasing fell 4%, against
+// 11% for this; the brick hall's 5%, against 18% (`offline_frame::aliasing`).
+const TERMINATOR_MAX_WIDTH: f32 = 0.5;
+fn terminator_width_of(normal_length: f32) -> f32 {{
+    let sigma2 = max(1.0 - normal_length - 0.01, 0.0) / max(normal_length, 1e-3);
+    return min(sqrt(1.5 * sigma2), TERMINATOR_MAX_WIDTH);
+}}
+
 fn light_contribution_split(
     l: Light,
     world_pos: vec3<f32>,
@@ -1642,16 +1698,18 @@ fn light_contribution_split(
         }}
     }}
 
-    let ndotl = max(dot(n, l_dir), 0.0);
+    let aa = terminator_aa(dot(n, l_dir));
+    let ndotl = aa.x;
     let radiance = l.color_intensity.rgb * l.color_intensity.a;
     out.diffuse = radiance * ndotl * atten;
     // No highlight where no light arrives: outside a spot's cone `atten` is
     // exactly 0, and the half-vector and its `pow` were computed to be
-    // multiplied by it. Most of a room is outside most cones.
-    if (ndotl > 0.0 && atten > 0.0) {{
+    // multiplied by it. Most of a room is outside most cones. And only on the
+    // share of the pixel that faces the lamp -- see `terminator_aa`.
+    if (aa.y > 0.0 && atten > 0.0) {{
         let h = normalize(l_dir + view_dir);
         let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;
-        out.specular = radiance * spec * atten;
+        out.specular = radiance * spec * atten * aa.y;
     }}
     return out;
 }}
@@ -6036,6 +6094,76 @@ mod baked_gloss_tests {
         let brick = 4.0;
         let c = combined(brick, 0.5);
         assert!(c <= brick + 1e-3, "the spread sharpened a rough lobe to {c}");
+    }
+
+    /// `terminator_aa` on the CPU: the Lambert term and the share of the pixel
+    /// facing the lamp, for `dot(n, l)` spread over `nl +- w`.
+    fn terminator_aa(nl: f32, w: f32) -> (f32, f32) {
+        let facing = ((nl + w) / (2.0 * w).max(1e-6)).clamp(0.0, 1.0);
+        let lambert = if nl.abs() < w { 0.5 * (nl + w) * facing } else { nl.max(0.0) };
+        (lambert, facing)
+    }
+
+    /// `terminator_width_of` on the CPU.
+    fn terminator_width_of(normal_length: f32) -> f32 {
+        let sigma2 = (1.0 - normal_length - 0.01).max(0.0) / normal_length.max(1e-3);
+        (1.5 * sigma2).sqrt().min(0.5)
+    }
+
+    /// THE TERMINATOR IS THE MEAN OF THE CLAMP OVER THE PIXEL, not the clamp
+    /// at its centre: integrated numerically, the pixel's light and the share
+    /// of it facing the lamp are what the closed forms give -- and with no
+    /// spread they are the hard step the shader always had.
+    #[test]
+    fn a_terminator_is_the_clamp_averaged_over_the_pixel() {
+        for nl in [-0.5f32, -1e-3, 0.0, 1e-3, 0.3] {
+            let (lambert, facing) = terminator_aa(nl, 0.0);
+            assert_eq!(lambert, nl.max(0.0));
+            assert_eq!(facing, if nl > 0.0 { 1.0 } else { 0.0 });
+        }
+        for w in [0.05f32, 0.2, 0.5] {
+            for nl in [-0.6f32, -0.2, -0.05, 0.0, 0.05, 0.2, 0.6] {
+                let n = 20_000;
+                let (mut sum, mut lit) = (0.0f64, 0usize);
+                for i in 0..n {
+                    let x = nl + w * (2.0 * (i as f32 + 0.5) / n as f32 - 1.0);
+                    sum += x.max(0.0) as f64;
+                    lit += (x > 0.0) as usize;
+                }
+                let (lambert, facing) = terminator_aa(nl, w);
+                assert!((lambert as f64 - sum / n as f64).abs() < 1e-4, "nl {nl} w {w}: {lambert} vs {}", sum / n as f64);
+                assert!((facing as f64 - lit as f64 / n as f64).abs() < 1e-3, "nl {nl} w {w}: {facing}");
+            }
+        }
+    }
+
+    /// A normal the map's texels agree on -- unit length, give or take its
+    /// 8-bit rounding -- keeps the hard terminator; the shorter the filtered
+    /// normal, the wider it is spread, up to the cap.
+    #[test]
+    fn only_a_normal_its_texels_disagree_on_spreads_the_terminator() {
+        assert_eq!(terminator_width_of(1.0), 0.0);
+        assert_eq!(terminator_width_of(0.992), 0.0, "8-bit rounding is not spread");
+        let (a, b) = (terminator_width_of(0.97), terminator_width_of(0.9));
+        assert!(0.0 < a && a < b && b < 0.5, "{a} {b}");
+        assert_eq!(terminator_width_of(0.2), 0.5);
+    }
+
+    /// And the WGSL computes what its twins above do.
+    #[test]
+    fn the_shader_spreads_the_terminator_as_its_twin_does() {
+        let code = wgsl_lights_block(0, 1);
+        for line in [
+            "let facing = clamp((nl + w) / max(2.0 * w, 1e-6), 0.0, 1.0);",
+            "return vec2<f32>(select(max(nl, 0.0), 0.5 * (nl + w) * facing, abs(nl) < w), facing);",
+            "const TERMINATOR_MAX_WIDTH: f32 = 0.5;",
+            "let sigma2 = max(1.0 - normal_length - 0.01, 0.0) / max(normal_length, 1e-3);",
+            "return min(sqrt(1.5 * sigma2), TERMINATOR_MAX_WIDTH);",
+            "let aa = terminator_aa(dot(n, l_dir));",
+            "out.specular = radiance * spec * atten * aa.y;",
+        ] {
+            assert!(code.contains(line), "the lights block no longer has `{line}`");
+        }
     }
 }
 

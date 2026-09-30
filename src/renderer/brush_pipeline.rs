@@ -1390,6 +1390,41 @@ impl BrushPipeline {
         }
     }
 
+    /// MEASUREMENT ONLY: the scene pass's brush shader reading the probe pass,
+    /// with one of `SCENE_REGISTER_CUTS` applied -- to DRAW with, so an offline
+    /// render can say what a term contributes to a picture (the aliasing
+    /// test's attribution). `None` when `cut` names no entry or one of its
+    /// edits no longer matches the shader.
+    pub fn new_multisampled_probe_reader_with_cut(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        cut: &str,
+    ) -> Option<Self> {
+        let (label, edits) = SCENE_REGISTER_CUTS.iter().find(|(label, _)| *label == cut)?;
+        let mut src = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+        for (from, to) in edits.iter() {
+            if !src.contains(from) {
+                return None;
+            }
+            src = src.replacen(from, to, 1);
+        }
+        Some(Self::from_source(
+            device,
+            format,
+            uniform_layout,
+            FrontFace::Ccw,
+            samples,
+            None,
+            crate::renderer::multiview::ViewMode::Mono,
+            Some(probe_layout),
+            label,
+            src,
+        ))
+    }
+
     /// MEASUREMENT ONLY: `log_probe_pass_register_cuts` for the scene pass's
     /// brush shader -- the one reading the probe pass -- with the same
     /// target, samples and group 3 as the one that ships.
@@ -1849,7 +1884,7 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "scene_cut_lamp_spec",
         &[(
-            "    if (ndotl > 0.0 && atten > 0.0) {\n        let h = normalize(l_dir + view_dir);\n        let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;\n        out.specular",
+            "    if (aa.y > 0.0 && atten > 0.0) {\n        let h = normalize(l_dir + view_dir);\n        let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;\n        out.specular",
             "    if (false) {\n        let h = normalize(l_dir + view_dir);\n        let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;\n        out.specular",
         )],
     ),
@@ -1867,8 +1902,8 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "scene_cut_spot_cone",
         &[(
-            "            let cos_angle = dot(-l_dir, l.direction.xyz);\n            atten = atten * spot_cone(cos_angle, cos_outer, cos_inner, dist);\n        }\n    }\n\n    let ndotl = max(dot(n, l_dir), 0.0);\n    let radiance = l.color_intensity.rgb * l.color_intensity.a;\n    out.diffuse",
-            "            let cos_angle = dot(-l_dir, l.direction.xyz);\n        }\n    }\n\n    let ndotl = max(dot(n, l_dir), 0.0);\n    let radiance = l.color_intensity.rgb * l.color_intensity.a;\n    out.diffuse",
+            "            let cos_angle = dot(-l_dir, l.direction.xyz);\n            atten = atten * spot_cone(cos_angle, cos_outer, cos_inner, dist);\n        }\n    }\n\n    let aa = terminator_aa(dot(n, l_dir));\n    let ndotl = aa.x;\n    let radiance = l.color_intensity.rgb * l.color_intensity.a;\n    out.diffuse",
+            "            let cos_angle = dot(-l_dir, l.direction.xyz);\n        }\n    }\n\n    let aa = terminator_aa(dot(n, l_dir));\n    let ndotl = aa.x;\n    let radiance = l.color_intensity.rgb * l.color_intensity.a;\n    out.diffuse",
         )],
     ),
     (
@@ -1885,7 +1920,7 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
         "scene_cut_sun_mask",
         &[("    receiver_sun_mask = select(-1.0, smoothstep(-sun_w, sun_w, sun_d), sun_mask.g > 0.25);", "    receiver_sun_mask = -1.0;")],
     ),
-    ("scene_cut_spec_aa", &[("    let rough_aa = specular_aa_roughness(rough, dpdx(n), dpdy(n));", "    let rough_aa = rough;")]),
+    ("scene_cut_terminator_aa", &[("    terminator_width = terminator_width_of(length(tn));", "")]),
 ];
 
 /// MEASUREMENT ONLY: what `BrushPipeline::log_probe_pass_register_cuts` cuts
@@ -2686,11 +2721,20 @@ struct VOut {{
     } else {
         r#"
     let rough = textureSample(mat_rough, mat_rough_samp, in.uv, i32(in.material)).r;
-    // The normal's per-pixel variation, put back as roughness -- see
-    // `specular_aa_roughness`. The derivatives are taken HERE, at the top
-    // level of the fragment entry, because a derivative is only legal in
-    // uniform control flow; the terrain shader has a test pinning that rule.
-    let rough_aa = specular_aa_roughness(rough, dpdx(n), dpdy(n));
+    // NO RUNTIME SPECULAR ANTIALIASING HERE, measured (2026-09-30): the normal
+    // map's lost variation is already in the roughness mips (see
+    // `roughness_chain_with_normal_variance`), and widening further from the
+    // quad's derivatives of the normal -- `specular_aa_roughness`, as the probe
+    // pass and the terrain still do -- ADDED aliasing on every normal-mapped
+    // stone view against a 3x-supersampled reference: the derivatives of a
+    // minified normal map are aliased themselves, so the highlight's width
+    // jumped from quad to quad (hallway 0.601 -> 0.575, brick hall 0.896 ->
+    // 0.841 without it; widening from the map's own Toksvig length instead
+    // was worse still). `offline_frame::aliasing`.
+    let rough_aa = rough;
+    // Each lamp's terminator across this pixel, from how much the normals
+    // under it disagree -- see `terminator_aa`.
+    terminator_width = terminator_width_of(length(tn));
     let ao = textureSample(mat_ao, mat_samp, in.uv, i32(in.material)).r;
 
     // RGB is baked direct+bounce and is ADDED; ALPHA is baked sky visibility
@@ -5067,6 +5111,23 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
                 .validate(&module)
                 .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+    }
+
+    /// THE SCENE SHADER SPREADS EACH LAMP'S TERMINATOR, from the normal map's
+    /// Toksvig length, and does NOT widen its roughness from the quad's
+    /// derivatives of the normal: against a 3x-supersampled reference that
+    /// widening added aliasing on every normal-mapped stone view, because the
+    /// derivatives of a minified normal map are aliased themselves
+    /// (`offline_frame::aliasing`, 2026-09-30). Both shaders that shade lamps
+    /// on brushes -- the scene pass's reader and the per-pixel tracer.
+    #[test]
+    fn the_scene_shader_spreads_the_terminator_and_takes_no_derivative_specular_aa() {
+        for probe in [BrushProbe::Read, BrushProbe::Trace] {
+            let src = brush_shader_probe(false, false, false, SsrPath::Inline, probe);
+            assert!(src.contains("    terminator_width = terminator_width_of(length(tn));"), "{probe:?}");
+            assert!(src.contains("    let rough_aa = rough;"), "{probe:?}");
+            assert!(!src.contains("specular_aa_roughness(rough, dpdx(n), dpdy(n))"), "{probe:?}");
         }
     }
 

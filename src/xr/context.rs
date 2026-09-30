@@ -72,6 +72,13 @@ impl XrContext {
             exts.meta_performance_metrics = true;
         }
 
+        // The CPU and GPU performance levels the app may ask for, where the
+        // runtime has them. Enabling it asks for nothing; the `cpu_level` /
+        // `gpu_level` levers do. See `renderer::performance_level`.
+        if available_exts.ext_performance_settings {
+            exts.ext_performance_settings = true;
+        }
+
         // APPLICATION SPACEWARP, where the runtime has it. Enabling it changes
         // nothing until a frame carries motion vectors; see
         // `renderer::space_warp`.

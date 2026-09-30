@@ -676,6 +676,7 @@ impl XrRenderer {
             crate::renderer::lights::append_baked(lights, &self.baked_lights, crate::renderer::lights::MAX_LIGHTS)
         };
         self.lights_uniform.set_culling(fx.light_culling);
+        self.lights_uniform.set_terminator_aa(fx.terminator_aa);
         self.lights_uniform.upload_frame_split(
             &self.wgpu_queue,
             &frame_lights,

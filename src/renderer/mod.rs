@@ -10,6 +10,7 @@ pub mod material_wgsl;
 pub mod mesh;
 pub mod mesh_pipeline;
 pub mod mirror;
+pub mod performance_level;
 pub mod panel;
 pub mod glare;
 pub mod particle;
