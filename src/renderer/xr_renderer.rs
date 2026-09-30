@@ -407,6 +407,12 @@ pub struct XrRenderer {
     /// `probe_fixup_targets`. See `probe_fixup`; the lever
     /// `deferred_reflection_lookups`.
     brush_probe_pass_deferred_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    /// MEASUREMENT: the `pass_cut` / `scene_cut` levers' pipelines, drawn in
+    /// place of the shipped probe pass / scene reader while set, and what
+    /// building them takes. See `Levers::pass_cut`.
+    pass_cut_pipeline: Option<(String, crate::renderer::brush_pipeline::BrushPipeline)>,
+    scene_cut_pipeline: Option<(String, crate::renderer::brush_pipeline::BrushPipeline)>,
+    cut_inputs: (wgpu::TextureFormat, u32, wgpu::BindGroupLayout),
     probe_fixups: crate::renderer::probe_fixup::ProbeFixups,
     probe_fixup_targets: [wgpu::BindGroup; 2],
     /// Group 3 of each eye's deferring probe pass: the record list, and that
@@ -1404,6 +1410,9 @@ impl XrRenderer {
             brush_probe_reader_pipeline,
             probe_pass_targets,
             brush_probe_pass_deferred_pipeline,
+            pass_cut_pipeline: None,
+            scene_cut_pipeline: None,
+            cut_inputs: (wgpu_format, samples, probe_pass_layout.clone()),
             probe_fixups,
             probe_fixup_targets,
             probe_fixup_passes,
@@ -2064,6 +2073,29 @@ impl XrRenderer {
             }
         }
         self.set_auto_exposure(levers.eye_adaptation);
+        if levers.pass_cut != self.levers.pass_cut {
+            self.pass_cut_pipeline = levers.pass_cut.as_ref().and_then(|cut| {
+                let p = crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass_deferred_with_cut(
+                    &self.wgpu_device, &self.uniform_buf.layout, &self.probe_fixups, cut,
+                );
+                if p.is_none() {
+                    log::warn!("LEVERS: pass_cut {cut}: no such cut, or it no longer matches the shader");
+                }
+                p.map(|p| (cut.clone(), p))
+            });
+        }
+        if levers.scene_cut != self.levers.scene_cut {
+            let (format, samples, layout) = &self.cut_inputs;
+            self.scene_cut_pipeline = levers.scene_cut.as_ref().and_then(|cut| {
+                let p = crate::renderer::brush_pipeline::BrushPipeline::new_multisampled_probe_reader_with_cut(
+                    &self.wgpu_device, *format, &self.uniform_buf.layout, *samples, layout, cut,
+                );
+                if p.is_none() {
+                    log::warn!("LEVERS: scene_cut {cut}: no such cut, or it no longer matches the shader");
+                }
+                p.map(|p| (cut.clone(), p))
+            });
+        }
         let requests = crate::renderer::performance_level::requests(
             self.levers.performance_levels(),
             levers.performance_levels(),

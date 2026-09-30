@@ -169,6 +169,14 @@ pub struct Levers {
     /// Metres past which the terrain's layer normal maps fade out; 0 keeps
     /// them everywhere. See `terrain_pipeline` (`post_params.z`).
     pub terrain_detail_distance: f32,
+    /// MEASUREMENT: the probe pass drawn with one of its register cuts
+    /// (`brush_pipeline::DEFERRED_REGISTER_CUTS`, e.g. `def_cut_characters`)
+    /// -- what a part costs by its PRESENCE in the shader, which a runtime
+    /// switch cannot measure (the code stays compiled in). Mono passes.
+    pub pass_cut: Option<String>,
+    /// MEASUREMENT: the scene pass's brush likewise, with one of
+    /// `SCENE_REGISTER_CUTS` (e.g. `scene_cut_contact`). Mono passes.
+    pub scene_cut: Option<String>,
     /// MEASUREMENT: block on the GPU at the end of every frame, as the
     /// renderer used to. Its wait is then exactly the GPU's time, which is
     /// what the A/B schedule attributes costs with; shipped, the CPU prepares
@@ -225,6 +233,8 @@ impl Default for Levers {
             cpu_level: None,
             gpu_level: None,
             terrain_detail_distance: 0.0,
+            pass_cut: None,
+            scene_cut: None,
             gpu_sync: false,
             ssr: None,
             multiview: None,
@@ -347,6 +357,12 @@ impl Levers {
         }
         if let Some(on) = self.multiview {
             out.push(format!("multiview={}", if on { "on" } else { "off" }));
+        }
+        if let Some(cut) = &self.pass_cut {
+            out.push(format!("pass_cut={cut}"));
+        }
+        if let Some(cut) = &self.scene_cut {
+            out.push(format!("scene_cut={cut}"));
         }
         if let Some(b) = &self.bench {
             out.push(format!("bench={}", b.name));

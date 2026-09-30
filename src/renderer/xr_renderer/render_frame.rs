@@ -1507,7 +1507,12 @@ impl XrRenderer {
             // Its pipelines and target: this eye's, or both eyes' at once.
             let (probe_pipeline, probe_reader, probe_target) = match (&self.stereo_probe, stereo) {
                 (Some(sp), true) => (&sp.pass, &sp.reader, &sp.target),
-                _ => (&self.brush_probe_pass_pipeline, &self.brush_probe_reader_pipeline, &self.probe_pass_targets[eye]),
+                _ => (
+                    &self.brush_probe_pass_pipeline,
+                    // MEASUREMENT: the `scene_cut` lever's reader in its place.
+                    self.scene_cut_pipeline.as_ref().map_or(&self.brush_probe_reader_pipeline, |(_, p)| p),
+                    &self.probe_pass_targets[eye],
+                ),
             };
             // ITS SECONDARY LOOKUPS DEFERRED to a compute pass over just the
             // texels that need them, in the single-eye pass. See `probe_fixup`.
@@ -1516,7 +1521,12 @@ impl XrRenderer {
             // scene pass as the brushes' is. See `TerrainPipeline::new_probe_pass`.
             let terrain_in_probe_pass =
                 probe_pass && deferred_lookups && fx.terrain_probe_pass && terrain_range.is_some();
-            let probe_pipeline = if deferred_lookups { &self.brush_probe_pass_deferred_pipeline } else { probe_pipeline };
+            // MEASUREMENT: the `pass_cut` lever's pass in its place.
+            let probe_pipeline = if deferred_lookups {
+                self.pass_cut_pipeline.as_ref().map_or(&self.brush_probe_pass_deferred_pipeline, |(_, p)| p)
+            } else {
+                probe_pipeline
+            };
 
             {
                 let mut encoder = self.wgpu_device.create_command_encoder(
