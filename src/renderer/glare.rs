@@ -102,6 +102,34 @@ pub struct GlareSource {
     /// angles -- whose bulb shows only from where its light goes. `None` for a
     /// lamp that shows from every side `sides` allows.
     pub cone: Option<(Vec3, f32, f32)>,
+    /// WHERE the light shows from each side, in the same order as `sides` --
+    /// the middle of what a side's card saw glowing: a sconce's open mouth from
+    /// below, not its bulb up inside the shade. `None` puts every side's at
+    /// `position`. See `visible_centre`.
+    pub centres: Option<[Vec3; 6]>,
+}
+
+/// Where the light of `s` shows from `eye`: each side's centre weighed as
+/// `visible_share` weighs its share. The veil grows from here -- from the
+/// bulb itself, a sconce seen from below glowed on its dark shade, above the
+/// mouth the light actually leaves by (headset, 2026-09-30).
+pub fn visible_centre(s: &GlareSource, eye: Vec3) -> Vec3 {
+    let Some(centres) = s.centres else { return s.position };
+    let Some(to_eye) = (eye - s.position).try_normalize() else { return s.position };
+    let local = s.rotation.inverse() * to_eye;
+    let (mut sum, mut weight) = (Vec3::ZERO, 0.0f32);
+    for a in 0..3 {
+        let c = local[a];
+        let k = if c >= 0.0 { 2 * a } else { 2 * a + 1 };
+        let w = c * c * s.sides[k].max(0.0);
+        sum += centres[k] * w;
+        weight += w;
+    }
+    if weight > 1e-6 {
+        sum / weight
+    } else {
+        s.position
+    }
 }
 
 /// How much of `s` shows toward an eye at `eye`, as a share of a bare lamp's
@@ -244,15 +272,18 @@ pub fn build_glare(
     let mut idx = Vec::new();
     let eye = 0.5 * (eyes[0] + eyes[1]);
     for s in sources {
-        let shielded = 0.5
-            * (capsule_visibility(s.position, eyes[0], capsules) + capsule_visibility(s.position, eyes[1], capsules));
+        // From where the light SHOWS, not where the bulb hangs: see
+        // `visible_centre`.
+        let at = visible_centre(s, eye);
+        let shielded =
+            0.5 * (capsule_visibility(at, eyes[0], capsules) + capsule_visibility(at, eyes[1], capsules));
         let Some(q) = glare_quad(s, eye, exposure, strength * shielded) else { continue };
         // Where the walls are tested, and the quad's centre: in front of the
-        // bulb by the wall margin, never past half way to the eye. The quad
+        // light by the wall margin, never past half way to the eye. The quad
         // is sized for the angle it subtends from there.
-        let to_eye = eye - s.position;
+        let to_eye = eye - at;
         let d = to_eye.length();
-        let centre = s.position + to_eye.normalize_or_zero() * WALL_MARGIN.min(0.5 * d);
+        let centre = at + to_eye.normalize_or_zero() * WALL_MARGIN.min(0.5 * d);
         let half = q.half * (eye - centre).length() / d.max(1e-6);
         let test = if test_walls { LAMP_RADIUS / half.max(1e-6) } else { -1.0 };
         let base = verts.len() as u32;
@@ -522,7 +553,31 @@ mod tests {
             sides,
             rotation: Quat::IDENTITY,
             cone: None,
+            centres: None,
         }
+    }
+
+    /// A SCONCE'S LIGHT SHOWS FROM ITS MOUTH: seen from below, the veil grows
+    /// from the middle of what the bottom card saw glowing, not from the bulb
+    /// up in the shade; seen square from a side that shows nothing, nothing
+    /// pulls it, and it stays at the bulb; between two sides that both show,
+    /// it lies between their centres by how squarely each faces the eye.
+    #[test]
+    fn a_veil_grows_from_where_the_light_shows() {
+        let bulb = Vec3::new(0.0, 2.0, 0.0);
+        let mouth = Vec3::new(0.0, 1.85, 0.0);
+        let mut centres = [bulb; 6];
+        centres[3] = mouth; // -y: from below
+        let s = GlareSource { centres: Some(centres), ..sconce([0.0, 0.0, 0.0, 0.5, 0.0, 0.0]) };
+        assert!((visible_centre(&s, Vec3::new(0.0, 0.0, 0.0)) - mouth).length() < 1e-5);
+        assert!((visible_centre(&s, Vec3::new(3.0, 2.0, 0.0)) - bulb).length() < 1e-5, "a dark side pulls nothing");
+        let mut both = centres;
+        both[0] = Vec3::new(0.1, 2.0, 0.0); // +x shows its light a little out
+        let s2 = GlareSource { centres: Some(both), ..sconce([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]) };
+        let c = visible_centre(&s2, bulb + Vec3::new(1.0, -1.0, 0.0));
+        assert!((c - (both[0] + mouth) * 0.5).length() < 1e-5, "{c}");
+        // No centres: the bulb, as before.
+        assert_eq!(visible_centre(&sconce([1.0; 6]), Vec3::ZERO), bulb);
     }
 
     /// The lamp radius is the lighting's: the veil's core and the light at the

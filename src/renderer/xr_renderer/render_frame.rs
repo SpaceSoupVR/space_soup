@@ -205,6 +205,11 @@ impl XrRenderer {
                 return Ok(Vec::new());
             }
         }
+        // MEASUREMENT: both eyes from the left eye's view. See
+        // `Levers::same_eyes`.
+        if self.levers.same_eyes && eye_views.len() >= 2 {
+            eye_views[1] = eye_views[0];
+        }
 
         // DIAGNOSIS: draw and submit every view from a pose the head is NOT
         // at, so the compositor has to correct the difference with our depth

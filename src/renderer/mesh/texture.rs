@@ -80,11 +80,35 @@ pub(crate) fn load_primitive_texture(
     // multiplied by one and a material that emits uniformly still works. Black
     // would silence every such material, and the factor would do nothing.
     let emissive = match material.emissive_texture() {
-        Some(info) => decode_image(&images[info.texture().source().index()], true),
+        Some(info) => {
+            let (mut rgba, w, h) = decode_image(&images[info.texture().source().index()], true);
+            clean_emissive_mask(&mut rgba);
+            (rgba, w, h)
+        }
         None => (vec![255u8, 255, 255, 255], 1, 1),
     };
 
     create_mesh_material_texture(device, queue, layout, &base, &emissive)
+}
+
+/// THE EMISSIVE MASK'S COMPRESSION NOISE, ZEROED (2026-09-30).
+///
+/// Poly Haven ships the hanging lamp's mask as a JPEG: black but for the
+/// bulb, plus ~3,400 texels of 1-32 levels of ringing and chroma noise round
+/// the bulb's islands -- 89% of the faintest of them a single colour channel.
+/// Times the bulb's drive, a stray 2/255 of blue is a blue dot on the shade
+/// (headset, 2026-09-30: "colored dots on the hanging light fixtures"). Every
+/// texel above the noise -- the bulb and its anti-aliased edge, from 33 up --
+/// is grey, and kept. So anything at or below an eighth of the mask's
+/// brightest texel is not glow.
+fn clean_emissive_mask(rgba: &mut [u8]) {
+    let peak = rgba.chunks_exact(4).map(|p| p[0].max(p[1]).max(p[2])).max().unwrap_or(0);
+    let floor = (peak / 8).max(2);
+    for p in rgba.chunks_exact_mut(4) {
+        if p[0].max(p[1]).max(p[2]) <= floor {
+            p[..3].fill(0);
+        }
+    }
 }
 
 /// Decode a glTF image to RGBA8, returning `(pixels, width, height)`.
@@ -124,6 +148,50 @@ fn decode_image(image: &gltf::image::Data, force_opaque: bool) -> (Vec<u8>, u32,
 }
 
 
+// THE WHOLE MIP CHAIN, averaged in linear light (both are sRGB). These
+// were one level under a sampler asking for mipmaps -- the defect the
+// brushes' materials and the lightmap each had first: a model seen from
+// past arm's length sampled one texel of dozens, so fixtures sparkled,
+// DIFFERENTLY IN EACH EYE, and an emissive mask's noise came and went as
+// the head moved (headset, 2026-09-30). See `brush_pipeline::mip_chain`.
+fn upload_mipped(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, px: &(Vec<u8>, u32, u32)) -> wgpu::Texture {
+    let chain = crate::renderer::brush_pipeline::mip_chain(
+        &crate::renderer::terrain_pipeline::TerrainImage { width: px.1, height: px.2, rgba: px.0.clone() },
+        true,
+    );
+    let size = wgpu::Extent3d { width: px.1, height: px.2, depth_or_array_layers: 1 };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: chain.len() as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        // COPY_SRC so a test can read a level back:
+        // `a_model_texture_carries_its_whole_mip_chain_and_it_averages`.
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    for (level, img) in chain.iter().enumerate() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &img.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * img.width),
+                rows_per_image: Some(img.height),
+            },
+            wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+        );
+    }
+    tex
+}
+
 /// A mesh material's bind group: base colour, sampler, and the emissive mask.
 ///
 /// Both textures live in ONE bind group because both belong to one material and
@@ -138,45 +206,21 @@ pub fn create_mesh_material_texture(
     base: &(Vec<u8>, u32, u32),
     emissive: &(Vec<u8>, u32, u32),
 ) -> LoadedTexture {
-    let make = |label: &str, px: &(Vec<u8>, u32, u32)| {
-        let size = wgpu::Extent3d { width: px.1, height: px.2, depth_or_array_layers: 1 };
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &px.0,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * px.1),
-                rows_per_image: Some(px.2),
-            },
-            size,
-        );
-        tex
-    };
+    let make = |label: &str, px: &(Vec<u8>, u32, u32)| upload_mipped(device, queue, label, px);
 
     let base_tex = make("gltf_base_color", base);
     let emissive_tex = make("gltf_emissive", emissive);
     let view = base_tex.create_view(&Default::default());
     let emissive_view = emissive_tex.create_view(&Default::default());
+    // Trilinear and anisotropic, as the brushes' materials are: the chain is
+    // only used if the sampler asks for it.
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         address_mode_u: wgpu::AddressMode::Repeat,
         address_mode_v: wgpu::AddressMode::Repeat,
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        anisotropy_clamp: 8,
         ..Default::default()
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -944,5 +988,76 @@ mod lightmap_mip_tests {
             "alpha is a linear scalar and must average to 128, not through the \
              sRGB transfer",
         );
+    }
+}
+
+#[cfg(test)]
+mod model_texture_tests {
+    use super::*;
+
+    /// The bulb and its anti-aliased edge stay; compression noise below an
+    /// eighth of the brightest texel -- coloured or not -- goes, relative to
+    /// the mask's own peak.
+    #[test]
+    fn an_emissive_mask_keeps_its_bulb_and_drops_its_noise() {
+        let mut rgba = vec![
+            255, 250, 240, 255, // bulb
+            60, 60, 60, 255, // its soft edge
+            0, 0, 2, 255, // JPEG chroma noise
+            20, 5, 30, 255, // ringing by the bulb
+            0, 0, 0, 255,
+        ];
+        clean_emissive_mask(&mut rgba);
+        assert_eq!(&rgba[0..4], &[255, 250, 240, 255]);
+        assert_eq!(&rgba[4..8], &[60, 60, 60, 255]);
+        assert_eq!(&rgba[8..12], &[0, 0, 0, 255]);
+        assert_eq!(&rgba[12..16], &[0, 0, 0, 255]);
+        // A dimmer mask's floor is an eighth of ITS peak.
+        let mut dim = vec![64, 64, 64, 255, 9, 9, 9, 255, 8, 8, 8, 255];
+        clean_emissive_mask(&mut dim);
+        assert_eq!(dim, vec![64, 64, 64, 255, 9, 9, 9, 255, 0, 0, 0, 255]);
+    }
+
+    /// A model texture is uploaded with every level, and level 1 is the mean
+    /// of the four below in LIGHT: a black/white checker comes back as the
+    /// grey that is half the light (188), not half the bytes (128).
+    #[test]
+    fn a_model_texture_carries_its_whole_mip_chain_and_it_averages() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let mut rgba = Vec::new();
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let v = if (x + y) % 2 == 0 { 255 } else { 0 };
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let tex = upload_mipped(&device, &queue, "test", &(rgba, 4, 4));
+        assert_eq!(tex.mip_level_count(), 3);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256 * 2,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 1, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(2) },
+            },
+            wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
+        );
+        queue.submit([enc.finish()]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let bytes = buffer.slice(..).get_mapped_range().unwrap();
+        for (x, y) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+            let r = bytes[y * 256 + x * 4];
+            assert!((187..=189).contains(&r), "level 1 texel {x},{y}: {r}");
+        }
     }
 }
