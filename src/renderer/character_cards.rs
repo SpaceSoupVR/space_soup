@@ -746,9 +746,23 @@ mod tests {
     /// (+z) red, back green, sides blue, top and bottom white, all from one
     /// four-texel texture.
     fn box_body() -> (Vec<SkinnedMeshVertex>, Vec<u32>) {
-        let (lo, hi) = (Vec3::new(-0.2, 0.0, -0.1), Vec3::new(0.2, 1.6, 0.1));
-        let mut verts = Vec::new();
-        let mut index = Vec::new();
+        let (mut verts, mut index) = (Vec::new(), Vec::new());
+        add_box(Vec3::new(-0.2, 0.0, -0.1), Vec3::new(0.2, 1.6, 0.1), &mut verts, &mut index);
+        (verts, index)
+    }
+
+    /// The box body standing on legs: below 0.6 m it is 0.16 m wide, so down
+    /// there the view from above (the torso's top) is wider than the view
+    /// from the front -- as shoulders and arms are over a person's legs.
+    fn legged_body() -> (Vec<SkinnedMeshVertex>, Vec<u32>) {
+        let (mut verts, mut index) = (Vec::new(), Vec::new());
+        add_box(Vec3::new(-0.2, 0.6, -0.1), Vec3::new(0.2, 1.6, 0.1), &mut verts, &mut index);
+        add_box(Vec3::new(-0.08, 0.0, -0.1), Vec3::new(0.08, 0.6, 0.1), &mut verts, &mut index);
+        (verts, index)
+    }
+
+    /// A box from `lo` to `hi`, coloured as `box_body`'s.
+    fn add_box(lo: Vec3, hi: Vec3, verts: &mut Vec<SkinnedMeshVertex>, index: &mut Vec<u32>) {
         for (a, sign) in [
             (2usize, 1.0f32),
             (2, -1.0),
@@ -782,18 +796,19 @@ mod tests {
             }
             index.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
         }
-        (verts, index)
     }
 
-    /// END TO END ON THE GPU: the box body drawn onto its cards by `record`
+    /// END TO END ON THE GPU: the box body, on legs, drawn onto its cards by `record`
     /// -- its blur levels made and copied into an atlas's character rows --
     /// and read back by `capsule_reflection` in the lights block, with one
     /// capsule standing for the body -- with the rig unturned and turned
     /// (the body and the rays square to the world, given to the shaders in
     /// the player's frame, as a snap turn leaves them). A ray meeting a side
     /// takes that side's colour; a ray the capsule's soft edge reaches but the body does not
-    /// takes nothing; a ray between two axes mixes their two views; and a
-    /// footprint wider than a texel reads the outline as blurred.
+    /// takes nothing; a ray between two axes mixes their two views; a
+    /// footprint wider than a texel reads the outline as blurred; and a ray
+    /// slanting down past the legs takes nothing from the torso's top seen
+    /// from above (the marble pillar's ghost, headset 2026-10-01).
     #[test]
     fn a_reflection_meeting_the_player_shows_the_side_it_meets() {
         use crate::renderer::brush_pipeline::probe_pass::MirrorMips;
@@ -933,7 +948,7 @@ mod tests {
                     resource: joint_buf.as_entire_binding(),
                 }],
             });
-            let (verts, index) = box_body();
+            let (verts, index) = legged_body();
             let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&verts),
@@ -1024,7 +1039,7 @@ mod tests {
                 cache: None,
             });
             // (from, direction, pixel footprint)
-            let rays: [(Vec3, Vec3, f32); 7] = [
+            let rays: [(Vec3, Vec3, f32); 9] = [
                 (Vec3::new(0.0, 0.8, 2.0), Vec3::NEG_Z, 0.0),
                 (Vec3::new(0.0, 0.8, -2.0), Vec3::Z, 0.0),
                 (Vec3::new(2.0, 0.8, 0.0), Vec3::NEG_X, 0.0),
@@ -1036,6 +1051,13 @@ mod tests {
                 (Vec3::new(2.0, 0.8, 2.0), Vec3::new(-1.0, 0.0, -1.0), 0.0),
                 // At the body's edge with a footprint of a few texels.
                 (Vec3::new(0.2, 0.8, 2.0), Vec3::NEG_Z, 0.05),
+                // Down and back past the legs, as a floor or a pillar in front
+                // of the player reflects them: inside the capsule and the
+                // torso's top seen from above, outside the legs seen from the
+                // front.
+                (Vec3::new(0.15, 1.3, 1.0), Vec3::new(0.0, -1.0, -1.0), 0.0),
+                // The same slant through the legs.
+                (Vec3::new(0.0, 1.3, 1.0), Vec3::new(0.0, -1.0, -1.0), 0.0),
             ];
             // Given in the world; in the player's frame, as the shaders get them.
             let to_player = card_turn(yaw).inverse();
@@ -1156,6 +1178,16 @@ mod tests {
             assert!(
                 (edge[0] / edge[3] - 1.0).abs() < 0.02 && edge[1] < 0.01 && edge[2] < 0.01,
                 "the front's colour, rig turned {yaw}: {edge:?}"
+            );
+            assert!(
+                near(got[7], [0.0; 4], 0.01),
+                "past the legs on a slant, rig turned {yaw}: {:?}",
+                got[7]
+            );
+            assert!(
+                got[8][3] > 0.97 && got[8][0] > 0.97,
+                "through the legs on a slant, rig turned {yaw}: {:?}",
+                got[8]
             );
         }
     }

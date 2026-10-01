@@ -285,10 +285,10 @@ impl ModelUniform {
     /// its reflector sends into the room; see `own_bulb_fill` in the shader.
     /// Anything else, or `None`, adds nothing.
     ///
-    /// `thin_width`: how wide the thin pass draws a thin part at least, as a
-    /// share of its depth -- an eye pixel's size there times how many pixels
-    /// (see `thin_parts`). 0 draws thin parts as they are, and only the thin
-    /// pass reads it.
+    /// `thin_width`: the thin pass's kernel unit as a share of depth -- an eye
+    /// pixel's size there times `levers.thin_parts` -- which sets how far past
+    /// a thin part it draws (see `thin_parts`). 0 draws thin parts as they
+    /// are, and only the thin pass reads it.
     #[allow(clippy::too_many_arguments)]
     pub fn upload_lit_bulb(
         &self,
@@ -642,38 +642,89 @@ fn mesh_shader() -> String {
     mesh_shader_variant(false)
 }
 
-/// THE THIN PASS's widening (see `thin_parts`): a part whose radius is under
-/// half of `params.w` times its depth is pushed out along its welded normal to
-/// that half-width, and fades by the share of the width it really fills -- so
-/// its light per unit length is the true part's, and it is never so narrow
-/// that where it falls among the four samples decides whether it is drawn.
-/// The depth is the clip w, which a pixel's size is proportional to.
+/// THE THIN PASS's widening (see `thin_parts`): a part is pushed out along
+/// its welded normal past its true radius by the reach of the kernel that
+/// spreads its light (see `THIN_SHARE`) -- 1.71 kernel units of `params.w`
+/// times its depth -- so every fragment the kernel gives light to is drawn,
+/// and `fade` is the share of the drawn radius the part really fills. The
+/// depth is the clip w, which a pixel's size is proportional to.
 const THIN_VS: &str = "
     out.fade = 1.0;
     let thin_axis = (model_u.model * vec4<f32>(v.thin.xyz, 0.0)).xyz;
     let thin_scale = length(thin_axis);
     let thin_r = v.thin.w * thin_scale;
+    out.thin = vec4<f32>((model_u.model * vec4<f32>(v.normal, 0.0)).xyz, 0.0);
     if (thin_r > 0.0 && model_u.params.w > 0.0) {
         let depth = (cam_view_proj() * world_pos).w;
-        let half_drawn = max(thin_r, 0.5 * model_u.params.w * depth);
+        let half_drawn = thin_r + 1.7071068 * model_u.params.w * depth;
         world_pos = vec4<f32>(world_pos.xyz + thin_axis / thin_scale * (half_drawn - thin_r), 1.0);
         out.fade = thin_r / half_drawn;
+        out.thin = vec4<f32>(thin_axis, thin_r);
     }";
 
-/// The mesh shader; `thin` for the thin pass, which widens a thin part to
-/// `params.w` of its depth and fades it by the share it really fills (see
-/// `thin_parts`), reading each vertex's welded normal and radius from a second
-/// vertex buffer.
+/// ACROSS A WIDENED PART, each fragment's share of its light (see
+/// `thin_parts`): the true part's width under a kernel round the fragment's
+/// middle -- a box two fragments wide blurred by a box root-two wide, a
+/// trapezoid reaching 1.71 fragments either side. Fragments sample the
+/// distance across an upright wire a whole fragment apart and across a
+/// diagonal one 0.71 apart; this kernel's shares add up to the same light at
+/// both spacings wherever the wire falls (and within a percent at every other
+/// slant), and its flat top keeps a diagonal wire from beading. A tent one
+/// fragment either side added up only upright: along a diagonal its brightest
+/// pixel swung by a quarter, beads that crawled along a lamp's cage as the
+/// head moved -- 14% more shimmer on the headset than the round profile
+/// before it, whose light swung by a quarter as an upright wire slid
+/// (2026-10-01). How far across the part: the widened corners lie its drawn
+/// radius out along their normals, so the normal as interpolated,
+/// unnormalised, is the place across a facet, in radii, along the way it
+/// turns (screen-parallel; the normal's change over the fragment). The
+/// fragment's size: a step to the next one, less its part along the view --
+/// a foveated block's own. A part many fragments wide is solid in its middle
+/// and keeps the kernel's soft edge. Derivatives: called at the top level of
+/// `fs_main`.
+const THIN_SHARE: &str = "
+fn thin_share(fade: f32, thin: vec4<f32>, world_pos: vec3<f32>) -> f32 {
+    let v = normalize(cam_pos() - world_pos);
+    let dnx = dpdx(thin.xyz);
+    let dny = dpdy(thin.xyz);
+    let turn = select(dny, dnx, dot(dnx, dnx) > dot(dny, dny));
+    let way = turn - v * dot(v, turn);
+    let way_len = length(way);
+    let flat_across = length(thin.xyz - v * dot(v, thin.xyz));
+    let across = select(flat_across, abs(dot(thin.xyz, way)) / max(way_len, 1e-9), way_len > 1e-6);
+    let sx = dpdx(world_pos);
+    let sy = dpdy(world_pos);
+    let fragment = max(0.5 * (length(sx - v * dot(sx, v)) + length(sy - v * dot(sy, v))), 1e-9);
+    let d = across * thin.w / max(fade, 1e-4) / fragment;
+    let r = thin.w / fragment;
+    return clamp(thin_kernel_below(d + r) - thin_kernel_below(d - r), 0.0, 1.0);
+}
+// The share of the kernel that lies below `x` (in fragments from its middle):
+// half of it beyond 0, falling straight across the flat top (height a half)
+// and as a square over the sloped sides out to 1 + root a half.
+fn thin_kernel_below(x: f32) -> f32 {
+    let a = abs(x);
+    let s = max(1.7071068 - a, 0.0);
+    let beyond = select(0.5 - 0.5 * a, 0.17677670 * s * s, a >= 0.29289322);
+    return select(beyond, 1.0 - beyond, x > 0.0);
+}
+";
+
+/// The mesh shader; `thin` for the thin pass, which widens a thin part by its
+/// kernel's reach (a unit of `params.w` of its depth) and gives each fragment
+/// its share of the part's light (see `thin_parts`), reading each vertex's
+/// welded normal and radius from a second vertex buffer.
 fn mesh_shader_variant(thin: bool) -> String {
-    let (thin_in, thin_out, thin_vs, thin_fade) = if thin {
+    let (thin_in, thin_out, thin_vs, thin_fn, thin_fade) = if thin {
         (
             "@location(5) thin: vec4<f32>,",
-            "@location(5) fade: f32,",
+            "@location(5) fade: f32,\n    @location(7) thin: vec4<f32>,",
             THIN_VS,
-            " * in.fade",
+            THIN_SHARE,
+            " * thin_share(in.fade, in.thin, in.world_pos)",
         )
     } else {
-        ("", "", "", "")
+        ("", "", "", "", "")
     };
     format!(
         r#"
@@ -798,6 +849,7 @@ fn vs_main(v: VIn) -> VOut {{
     return out;
 }}
 
+{thin_fn}
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
@@ -1407,9 +1459,15 @@ mod tests {
 
     /// A glowing wire `radius_px` eye pixels thick, upright across a 64 px
     /// target with 4x MSAA, `shift_px` right of a fixed place; with `thin_px`
-    /// drawn by the thin pass widened to that many pixels at least. Returns
-    /// the red channel, a row at a time.
+    /// drawn by the thin pass with that kernel unit (see `thin_parts`).
+    /// Returns the red channel, a row at a time.
     fn render_thin_wire(radius_px: f32, shift_px: f32, thin_px: Option<f32>) -> Option<Vec<Vec<u8>>> {
+        render_thin_wire_at(radius_px, shift_px, thin_px, 0.0)
+    }
+
+    /// As `render_thin_wire`, the wire leaning `tilt` radians from upright
+    /// toward +x, and slid `shift_px` across itself.
+    fn render_thin_wire_at(radius_px: f32, shift_px: f32, thin_px: Option<f32>, tilt: f32) -> Option<Vec<Vec<u8>>> {
         const SIZE: u32 = 64;
         let px = 2.0 / SIZE as f32;
         let (device, queue) = headless_gpu()?;
@@ -1429,17 +1487,21 @@ mod tests {
         );
         let lm = create_lightmap_texture(&device, &queue, &pipeline.lightmap_layout, &[0, 0, 0, 255], 1, 1, None);
 
-        // The wire: 8 facets round, upright, at depth 0.5. Facing the camera
-        // (which looks along +z) means a normal with -z in it.
+        // The wire: 8 facets round, along `axis` at depth 0.5. Facing the
+        // camera (which looks along +z) means a normal with -z in it.
         let (sides, r) = (8usize, radius_px * px);
-        let x0 = -0.3 + shift_px * px;
+        let (sin, cos) = tilt.sin_cos();
+        let (axis, across) = (glam::Vec3::new(sin, cos, 0.0), glam::Vec3::new(cos, -sin, 0.0));
+        let middle = glam::Vec3::new(-0.3 * cos, 0.0, 0.5) + across * (shift_px * px);
         let mut verts = Vec::new();
         for (y, _) in [(-0.9f32, 0), (0.9, 1)] {
             for k in 0..sides {
                 let a = k as f32 / sides as f32 * std::f32::consts::TAU;
-                let n = [a.cos(), 0.0, a.sin()];
+                let n = across * a.cos() + glam::Vec3::Z * a.sin();
+                let n = [n.x, n.y, n.z];
+                let at = middle + axis * y + glam::Vec3::from(n) * r;
                 verts.push(MeshVertex {
-                    position: [x0 + n[0] * r, y, 0.5 + n[2] * r],
+                    position: at.to_array(),
                     normal: n,
                     uv: [0.5, 0.5],
                     uv2: [0.5, 0.5],
@@ -1548,8 +1610,12 @@ mod tests {
     /// pixel in eighths: (mean light per row, its variation across shifts,
     /// averaged over rows).
     fn wire_light_across_shifts(radius_px: f32, thin_px: Option<f32>) -> Option<(f32, f32)> {
+        wire_light_across_shifts_at(radius_px, thin_px, 0.0)
+    }
+
+    fn wire_light_across_shifts_at(radius_px: f32, thin_px: Option<f32>, tilt: f32) -> Option<(f32, f32)> {
         let rows: Vec<Vec<f32>> = (0..8)
-            .map(|k| render_thin_wire(radius_px, k as f32 / 8.0, thin_px))
+            .map(|k| render_thin_wire_at(radius_px, k as f32 / 8.0, thin_px, tilt))
             .map(|image| Some(image?.iter().map(|row| row.iter().map(|&v| v as f32).sum()).collect()))
             .collect::<Option<_>>()?;
         let (mut mean_all, mut cv_all, mut n) = (0.0, 0.0, 0.0);
@@ -1566,13 +1632,13 @@ mod tests {
 
     /// THE THIN PASS (`thin_parts`): a wire a third of a pixel thick, drawn
     /// as a mesh with 4x MSAA, gains and loses whole samples as it slides --
-    /// the shimmer of every lamp's cage on the headset (2026-10-01). Widened
-    /// to two pixels and faded, its light per row holds steady, and is the
-    /// same light it had.
+    /// the shimmer of every lamp's cage on the headset (2026-10-01). Drawn by
+    /// the thin pass, its light per row holds steady, and is the same light
+    /// it had.
     #[test]
     fn a_thin_wire_holds_its_light_as_it_slides() {
         let Some((plain_mean, plain_cv)) = wire_light_across_shifts(0.16, None) else { return };
-        let (thin_mean, thin_cv) = wire_light_across_shifts(0.16, Some(2.0)).unwrap();
+        let (thin_mean, thin_cv) = wire_light_across_shifts(0.16, Some(1.0)).unwrap();
         // The light a 0.32 px wire really carries: that share of a pixel the
         // glow covers whole, read from the middle of a wide one.
         let full = *render_thin_wire(3.0, 0.0, None).unwrap()[32].iter().max().unwrap() as f32;
@@ -1583,13 +1649,127 @@ mod tests {
         assert!((thin_mean / truth - 1.0).abs() < 0.1, "and it is the wire's own light: {thin_mean:.1} against {truth:.1}");
     }
 
-    /// A part already wider than the least width is drawn exactly as it was.
+    /// How much a wire's pixels STEP as it slides across a pixel in eighths,
+    /// rather than move: each pixel's second difference across the shifts,
+    /// RMS over the pixels it touches in the middle rows, over its brightest
+    /// -- the headset's J, measured on one wire.
+    fn wire_steps(radius_px: f32, thin_px: Option<f32>) -> Option<f32> {
+        wire_steps_at(radius_px, thin_px, 0.0)
+    }
+
+    fn wire_steps_at(radius_px: f32, thin_px: Option<f32>, tilt: f32) -> Option<f32> {
+        let images: Vec<Vec<Vec<u8>>> =
+            (0..8).map(|k| render_thin_wire_at(radius_px, k as f32 / 8.0, thin_px, tilt)).collect::<Option<_>>()?;
+        let (mut sum, mut n, mut peak) = (0.0f32, 0.0f32, 0.0f32);
+        for y in 16..48 {
+            for x in 0..64 {
+                let v = |k: usize| images[k][y][x] as f32;
+                for k in 1..7 {
+                    if v(k - 1) + v(k) + v(k + 1) > 0.0 {
+                        let d = v(k + 1) - 2.0 * v(k) + v(k - 1);
+                        sum += d * d;
+                        n += 1.0;
+                    }
+                    peak = peak.max(v(k));
+                }
+            }
+        }
+        Some((sum / n.max(1.0)).sqrt() / peak.max(1.0))
+    }
+
+    /// ACROSS A WIDENED WIRE, ITS OWN PROFILE. Widened and faded, a wire
+    /// still had hard edges, and where they fell among the four samples
+    /// stepped the pixels they crossed by a quarter of its fade at a time --
+    /// a far cage's wires redrawn at every millimetre of head movement
+    /// (headset `lamp_by_pillar-mQ`, 2026-10-01: J 0.029 on the cage).
+    /// Weighted across by the tube's own thickness profile, the edges carry
+    /// none of it: the pixels move with the wire, and its light is the same.
     #[test]
-    fn a_wide_part_is_untouched_by_the_thin_pass() {
+    fn a_widened_wires_pixels_move_with_it_instead_of_stepping() {
+        let Some(steps) = wire_steps(0.16, Some(1.0)) else { return };
+        let plain = wire_steps(0.16, None).unwrap();
+        let (mean, cv) = wire_light_across_shifts(0.16, Some(1.0)).unwrap();
+        let full = *render_thin_wire(3.0, 0.0, None).unwrap()[32].iter().max().unwrap() as f32;
+        let truth = 0.32 * full;
+        eprintln!(
+            "THIN wire 0.32 px: steps {steps:.4} (drawn as it is {plain:.4}); light {mean:.1} against {truth:.1}, varies {:.1}%",
+            cv * 100.0
+        );
+        // A band of one faded value stepped 0.180 of its brightest at every
+        // eighth of a pixel; a tent's shares 0.055, this kernel's 0.060 --
+        // both near the rounding of 8-bit pixels this faint.
+        assert!(plain > 0.5, "the plain wire steps ({plain:.3}), or this measures nothing");
+        assert!(steps < 0.09, "its pixels step {steps:.3} of its brightest as it slides");
+        assert!(cv < 0.05, "and its light holds: varies {:.1}%", cv * 100.0);
+        assert!((mean / truth - 1.0).abs() < 0.08, "and is the wire's own: {mean:.1} against {truth:.1}");
+    }
+
+    /// How much a wire BEADS: along it, how its brightest pixel in each row
+    /// varies (over their mean), averaged over the shifts -- a diagonal wire
+    /// whose light lands on one pixel in a row and on two in the next.
+    fn wire_beads(radius_px: f32, thin_px: Option<f32>, tilt: f32) -> Option<f32> {
+        let mut total = 0.0;
+        for k in 0..8 {
+            let image = render_thin_wire_at(radius_px, k as f32 / 8.0, thin_px, tilt)?;
+            let peaks: Vec<f32> = (16..48).map(|y| *image[y].iter().max().unwrap() as f32).collect();
+            let mean = peaks.iter().sum::<f32>() / peaks.len() as f32;
+            let sd = (peaks.iter().map(|p| (p - mean).powi(2)).sum::<f32>() / peaks.len() as f32).sqrt();
+            total += sd / mean.max(1e-6);
+        }
+        Some(total / 8.0)
+    }
+
+    /// A WIRE AT ANY SLANT. Fragments sample the distance across an upright
+    /// wire a pixel apart and across a diagonal one 0.71 apart: a kernel that
+    /// adds up only at the first lets a diagonal wire's light land on one
+    /// pixel of a row and on two in the next -- beads, which crawled along a
+    /// lamp's cage as the head moved (headset `lamp_by_pillar-mQ`,
+    /// 2026-10-01: the cage 14% worse with a tent one pixel either side). The
+    /// thin pass's kernel adds up at both: upright, diagonal and between,
+    /// each row of the wire keeps its light as it slides, its brightest pixel
+    /// hardly changes along it, and its pixels move with it. Measured here
+    /// (2026-10-01), beads at 22.5 and 26.6 degrees: the tent 16.2% and
+    /// 14.0%, this kernel 4.7% and 4.6%; light at 45 degrees varied 4.4%, now
+    /// 1.5%. Rows of a few 8-bit pixels: a percent or two, and steps of about
+    /// 0.05, are rounding.
+    #[test]
+    fn a_slanted_wire_neither_beads_nor_swings() {
+        let Some(image) = render_thin_wire(3.0, 0.0, None) else { return };
+        let full = *image[32].iter().max().unwrap() as f32;
+        // Steeper than 45 degrees is the same wire turned a right angle, which
+        // the kernel (as the pixels) cannot tell apart; and its rows would
+        // run off the wire's ends here.
+        for degrees in [0.0f32, 22.5, 26.57, 45.0] {
+            let tilt = degrees.to_radians();
+            let (mean, cv) = wire_light_across_shifts_at(0.16, Some(1.0), tilt).unwrap();
+            let beads = wire_beads(0.16, Some(1.0), tilt).unwrap();
+            let steps = wire_steps_at(0.16, Some(1.0), tilt).unwrap();
+            // A row crosses a slanted wire along 1/cos of a pixel of it.
+            let truth = 0.32 * full / tilt.cos();
+            eprintln!(
+                "THIN wire 0.32 px at {degrees} degrees: light {mean:.1} against {truth:.1}, varies {:.1}%; beads {:.1}%; steps {steps:.4}",
+                cv * 100.0,
+                beads * 100.0
+            );
+            assert!(cv < 0.04, "at {degrees} degrees a row's light holds as it slides: varies {:.1}%", cv * 100.0);
+            assert!(beads < 0.08, "at {degrees} degrees it does not bead: {:.1}%", beads * 100.0);
+            assert!(steps < 0.09, "at {degrees} degrees its pixels move with it: steps {steps:.3}");
+            assert!((mean / truth - 1.0).abs() < 0.08, "at {degrees} degrees it is the wire's own light: {mean:.1} against {truth:.1}");
+        }
+    }
+
+    /// A part many pixels wide keeps its light, and its middle is drawn as
+    /// it was: only its edges take the kernel's soft fall.
+    #[test]
+    fn a_wide_part_keeps_its_middle_and_its_light() {
         for shift in [0.0, 0.375] {
             let Some(plain) = render_thin_wire(3.0, shift, None) else { return };
-            let thin = render_thin_wire(3.0, shift, Some(2.0)).unwrap();
-            assert_eq!(plain, thin, "a 6 px part, shifted {shift} px");
+            let thin = render_thin_wire(3.0, shift, Some(1.0)).unwrap();
+            let light = |image: &Vec<Vec<u8>>| (16..48).map(|y| image[y].iter().map(|&v| v as f32).sum::<f32>()).sum::<f32>();
+            let (a, b) = (light(&plain), light(&thin));
+            assert!((b / a - 1.0).abs() < 0.03, "a 6 px part, shifted {shift} px: light {b} against {a}");
+            let middle = |image: &Vec<Vec<u8>>| *image[32].iter().max().unwrap() as i32;
+            assert!((middle(&plain) - middle(&thin)).abs() <= 2, "its middle, shifted {shift} px");
         }
     }
 

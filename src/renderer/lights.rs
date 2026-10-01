@@ -1112,7 +1112,14 @@ fn stationary_visibility_of(marker: f32) -> f32 {{
 // Their shadows from lamps are the characters' shadow tiles (see the lamp
 // loop). See `uniforms::CapsuleUpload`.
 const CAPSULES_PER_GROUP: i32 = {capsules_per_group};
-// How far past a character's bound its contact darkening can reach.
+// HOW FAR A CHARACTER DARKENS WHAT IS ROUND IT, from each capsule's own
+// surface: in full within the first distance, faded out smoothly by the
+// second -- which is where the group is culled, so nothing is cut off. It
+// used to be cut off there, at a sphere round the whole body where the
+// capsules together still took 5-10% of the light: a disc with a hard rim
+// on the marble pillar a metre away, which grew and shrank as the player
+// raised an arm, because the arm moved the sphere (headset, 2026-10-01).
+const CAPSULE_AMBIENT_FULL: f32 = 0.15;
 const CAPSULE_AMBIENT_REACH: f32 = 0.6;
 // HOW WRONG A CAPSULE BODY IS, in metres: no clothes, hands, shoulders or
 // hair. Nothing it shows may be sharper than that -- a crisp capsule body
@@ -1163,7 +1170,10 @@ fn capsule_ambient(p: vec3<f32>, n: vec3<f32>) -> f32 {{
             let s = clamp(dot(p - ar.xyz, ba) / max(dot(ba, ba), 1e-8), 0.0, 1.0);
             let w = ar.xyz + ba * s - p;
             let d = max(length(w), ar.w);
-            let k2 = (ar.w / d) * (ar.w / d);
+            // Faded by this capsule's own distance, so moving an arm changes
+            // the arm's darkening and nothing else's.
+            let fade = 1.0 - smoothstep(CAPSULE_AMBIENT_FULL, CAPSULE_AMBIENT_REACH, d - ar.w);
+            let k2 = (ar.w / d) * (ar.w / d) * fade;
             vis = vis * (1.0 - k2 * max(dot(n, w / d), 0.0));
         }}
     }}
@@ -1212,10 +1222,11 @@ fn character_card_at(card: f32, uv: vec2<f32>, row: f32, res: f32, lod: f32, dim
 // it where it passes nearest the character's capsules: the body's albedo
 // premultiplied by its coverage, from the three cards that face the ray, each
 // weighted by how squarely (`d` squared, which sums to one), read at that
-// point and as blurred as the footprint there. A card is an orthographic
-// view, so for a ray along its axis this is exactly what the ray meets first
-// -- a hand in front of a chest included; a ray between two axes mixes their
-// two views. Read at the point inside the body rather than where the ray
+// point and as blurred as the footprint there -- and covered only as far as
+// all three agree. A card is an orthographic view, so for a ray along its
+// axis this is exactly what the ray meets first -- a hand in front of a chest
+// included; a ray between two axes mixes their two views' colours. Read at
+// the point inside the body rather than where the ray
 // enters its capsule: a capsule is fatter than the body it stands for, and
 // its surface seen from the side of the ray falls outside the body's outline
 // on the other card. -1 where the character has no cards this frame. The
@@ -1244,9 +1255,19 @@ fn character_card_look(g: i32, p: vec3<f32>, d: vec3<f32>, t: f32, lobe: f32, ey
     let lod = clamp(log2(max(2.0 * footprint / texel, 1.0)), 0.0, CHARACTER_CARD_MAX_LOD);
     let row = (centre.w - 1.0) * res;
     let k = w * w;
-    return k.x * character_card_at(select(1.0, 0.0, w.x < 0.0), uvw.yz, row, res, lod, dims)
-        + k.y * character_card_at(select(3.0, 2.0, w.y < 0.0), uvw.zx, row, res, lod, dims)
-        + k.z * character_card_at(select(5.0, 4.0, w.z < 0.0), uvw.xy, row, res, lod, dims);
+    let across_x = character_card_at(select(1.0, 0.0, w.x < 0.0), uvw.yz, row, res, lod, dims);
+    let across_y = character_card_at(select(3.0, 2.0, w.y < 0.0), uvw.zx, row, res, lod, dims);
+    let across_z = character_card_at(select(5.0, 4.0, w.z < 0.0), uvw.xy, row, res, lod, dims);
+    // In the body only where EVERY card saw body (the visual hull), so the
+    // least of the three; the colour the cards facing the ray see, by how
+    // squarely. Summed by direction, a card the ray half faces vouched for a
+    // point the other saw empty: looking down at the marble pillar, its
+    // reflection of the player carried half the top view's shoulders beside
+    // the legs and between them -- a faint shadow round the body that grew
+    // and shrank as an arm rose (headset, 2026-10-01).
+    let cover = min(across_x.a, min(across_y.a, across_z.a));
+    let seen = k.x * across_x + k.y * across_y + k.z * across_z;
+    return vec4<f32>(seen.rgb / max(seen.a, 1e-4) * cover, cover);
 }}
 
 // THE CHARACTERS IN A REFLECTION leaving `p` along `d` (player frame), over
@@ -7906,5 +7927,204 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
             return;
         };
         assert_eq!(c[0][3], 0.0, "{:?}", c[0]);
+    }
+}
+
+/// THE CHARACTERS' CONTACT DARKENING, as the shader computes it.
+#[cfg(test)]
+mod capsule_ambient_tests {
+    use glam::Vec3;
+    use wgpu::util::DeviceExt;
+    use wgpu::{BindGroupDescriptor, BindGroupEntry, BufferDescriptor, BufferUsages, ShaderModuleDescriptor, ShaderSource};
+
+    use crate::renderer::uniforms::{CapsuleGroup, CapsuleUpload, Uniforms};
+
+    /// The shader's reach, mirrored: past this from a capsule's surface it
+    /// darkens nothing.
+    const REACH: f32 = 0.6;
+
+    /// A standing body as capsules, its right arm hanging or held out toward
+    /// -z. Returned with the right arm's own capsule.
+    fn body(arm_out: bool) -> (CapsuleUpload, (Vec3, Vec3, f32)) {
+        let v = Vec3::new;
+        let arm = if arm_out {
+            (v(0.22, 1.42, 0.0), v(0.22, 1.42, -0.42), 0.045)
+        } else {
+            (v(0.22, 1.42, 0.0), v(0.24, 0.9, 0.0), 0.045)
+        };
+        let caps = CapsuleUpload::from_groups(&[CapsuleGroup {
+            capsules: vec![
+                (v(0.0, 1.6, 0.0), v(0.0, 1.68, 0.0), 0.1),
+                (v(0.0, 1.4, 0.0), v(0.0, 0.95, 0.0), 0.15),
+                (v(-0.22, 1.42, 0.0), v(-0.24, 0.9, 0.0), 0.045),
+                arm,
+                (v(-0.1, 0.92, 0.0), v(-0.1, 0.08, 0.0), 0.06),
+                (v(0.1, 0.92, 0.0), v(0.1, 0.08, 0.0), 0.06),
+            ],
+            colour: [0.5; 3],
+        }]);
+        (caps, arm)
+    }
+
+    /// How far `p` is from a capsule's surface.
+    fn from_surface(p: Vec3, (a, b, r): (Vec3, Vec3, f32)) -> f32 {
+        let ba = b - a;
+        let s = ((p - a).dot(ba) / ba.length_squared().max(1e-8)).clamp(0.0, 1.0);
+        (a + ba * s - p).length() - r
+    }
+
+    /// `capsule_ambient` at each `(point, normal)`, run on the GPU.
+    fn ambient(caps: &CapsuleUpload, at: &[(Vec3, Vec3)]) -> Option<Vec<f32>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let mut u: Uniforms = bytemuck::Zeroable::zeroed();
+        u.capsules = caps.capsules;
+        u.capsule_groups = caps.groups;
+        u.capsule_params = [caps.group_count as f32, -1.0, -1.0, 0.0];
+        let code = format!(
+            "{}\n{}",
+            super::wgsl_lights_block(0, 1),
+            r#"
+@group(1) @binding(0) var<storage, read> pts: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> out: array<f32>;
+@compute @workgroup_size(1)
+fn ambient_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    out[id.x] = capsule_ambient(pts[id.x * 2u].xyz, pts[id.x * 2u + 1u].xyz);
+}
+"#
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("ambient_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let packed: Vec<[f32; 4]> = at.iter().flat_map(|(p, n)| [[p.x, p.y, p.z, 0.0], [n.x, n.y, n.z, 0.0]]).collect();
+        let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&u),
+            usage: BufferUsages::UNIFORM,
+        });
+        let pts = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&packed),
+            usage: BufferUsages::STORAGE,
+        });
+        let size = (at.len() * 4) as u64;
+        let out = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let g0 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[BindGroupEntry { binding: 0, resource: camera.as_entire_binding() }],
+        });
+        let g1 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                BindGroupEntry { binding: 0, resource: pts.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups(at.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let got: Vec<f32> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+        Some(got)
+    }
+
+    /// A wall half a metre in front of the body, facing it, sampled a
+    /// centimetre apart across and up; and the floor round it, 5 cm apart.
+    fn wall_and_floor() -> (Vec<(Vec3, Vec3)>, Vec<(Vec3, Vec3)>, Vec<(Vec3, Vec3)>) {
+        let across = (0..=400).map(|i| (Vec3::new(-2.0 + i as f32 * 0.01, 1.2, -0.5), Vec3::Z)).collect();
+        let up = (0..=300).map(|i| (Vec3::new(0.05, i as f32 * 0.01, -0.5), Vec3::Z)).collect();
+        let floor = (0..=80)
+            .flat_map(|i| (0..=80).map(move |j| (Vec3::new(-2.0 + i as f32 * 0.05, 0.0, -2.0 + j as f32 * 0.05), Vec3::Y)))
+            .collect();
+        (across, up, floor)
+    }
+
+    /// NO RIM. Across a wall the darkening fades out; it never steps. It used
+    /// to stop dead at a sphere round the whole body, where the capsules
+    /// together still took several percent: a disc with a hard edge on the
+    /// marble pillar (headset, 2026-10-01).
+    #[test]
+    fn a_characters_contact_darkening_fades_out_without_a_rim() {
+        let (across, up, _) = wall_and_floor();
+        for arm_out in [false, true] {
+            let (caps, _) = body(arm_out);
+            for line in [&across, &up] {
+                let Some(vis) = ambient(&caps, line) else {
+                    eprintln!("no GPU adapter; skipping");
+                    return;
+                };
+                let (i, step) = vis
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]).abs())
+                    .enumerate()
+                    .fold((0, 0.0f32), |best, (i, s)| if s > best.1 { (i, s) } else { best });
+                assert!(step < 0.004, "arm out {arm_out}: a step of {step:.4} at {:?}", line[i].0);
+                // Still darker somewhere: the fade did not take it all away.
+                let darkest = vis.iter().cloned().fold(1.0f32, f32::min);
+                assert!(darkest < 0.97, "arm out {arm_out}: nothing darkened ({darkest})");
+            }
+        }
+    }
+
+    /// RAISING AN ARM CHANGES THE ARM'S DARKENING, AND NO OTHER. Everywhere
+    /// farther than the reach from both of the arm's places reads the same
+    /// with it hanging and held out. Faded by the bound round the whole body,
+    /// the disc grew and shrank with the arm (headset, 2026-10-01).
+    #[test]
+    fn raising_an_arm_changes_only_the_darkening_round_the_arm() {
+        let (across, up, floor) = wall_and_floor();
+        let all: Vec<(Vec3, Vec3)> = across.into_iter().chain(up).chain(floor).collect();
+        let ((down, arm_down), (out, arm_out)) = (body(false), body(true));
+        let (Some(a), Some(b)) = (ambient(&down, &all), ambient(&out, &all)) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mut checked = 0;
+        for (k, (p, _)) in all.iter().enumerate() {
+            if from_surface(*p, arm_down) > REACH && from_surface(*p, arm_out) > REACH {
+                checked += 1;
+                assert!((a[k] - b[k]).abs() < 1e-5, "{p}: {} with the arm down, {} with it out", a[k], b[k]);
+            }
+        }
+        assert!(checked > 1000, "{checked}");
+    }
+
+    /// CONTACT STILL DARKENS: a hand held 5 cm off a wall shades the wall
+    /// under it, and the feet the floor they stand on.
+    #[test]
+    fn a_hand_near_a_wall_and_feet_on_the_floor_still_darken_them() {
+        let (caps, _) = body(true);
+        let Some(vis) = ambient(&caps, &[(Vec3::new(0.22, 1.42, -0.5), Vec3::Z), (Vec3::new(0.1, 0.0, 0.0), Vec3::Y)]) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        assert!(vis[0] < 0.75, "the wall under the hand: {}", vis[0]);
+        assert!(vis[1] < 0.8, "the floor under a foot: {}", vis[1]);
     }
 }

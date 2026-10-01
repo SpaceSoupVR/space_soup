@@ -507,7 +507,11 @@ struct VOut {{
     let far  = cam_inv_view_proj() * vec4<f32>(in.ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w - near.xyz / near.w);
 
-    let uv = sky_uv(dir);
+    // That ray is in the PLAYER's frame, the one the camera's matrices are
+    // in; the panorama is pinned to the world. Turned back by the rig's yaw
+    // first, or a snap or stick turn carried the sky round with the player
+    // while the level and its lighting stayed put (headset, 2026-10-01).
+    let uv = sky_uv(to_world_direction(dir));
     let radiance = textureSample(sky_tex, sky_samp, uv).rgb * camera.sky_params.x;
 
     // The shared curve, the same one every lit surface uses. This pass used to
@@ -826,7 +830,7 @@ mod tests {
 mod render_tests {
     use super::*;
     use crate::renderer::lights::LightsUniform;
-    use crate::renderer::uniforms::{ShadowUpload, SkyUpload, UniformBuffer};
+    use crate::renderer::uniforms::{PlayerUpload, PostUpload, ShadowUpload, SkyUpload, UniformBuffer};
 
     const SIZE: u32 = 9; // odd, so the centre texel is exactly at NDC (0, 0)
 
@@ -854,6 +858,12 @@ mod render_tests {
 
     /// Renders the sky looking along `dir` and returns the centre pixel.
     fn look(dir: [f32; 3], pano: &Panorama) -> Option<[u8; 4]> {
+        look_turned(dir, pano, 0.0)
+    }
+
+    /// The same, with the rig turned by `yaw`: `dir` is then the view in the
+    /// PLAYER's frame, as the headset's camera matrices give it.
+    fn look_turned(dir: [f32; 3], pano: &Panorama, yaw: f32) -> Option<[u8; 4]> {
         let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
 
@@ -867,12 +877,14 @@ mod render_tests {
         let up = if d.y.abs() > 0.99 { glam::Vec3::Z } else { glam::Vec3::Y };
         let view_proj = glam::Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0)
             * glam::Mat4::look_at_rh(eye, eye + d, up);
-        uniforms.upload_with_sky(
+        uniforms.upload_scene(
             &queue,
             view_proj,
             eye,
             &ShadowUpload::disabled(),
             &SkyUpload { intensity: 1.0, sh: [[0.0; 4]; 9] },
+            &PostUpload::default(),
+            &PlayerUpload { yaw, ..Default::default() },
         );
 
         let pipeline = SkyPipeline::new(&device, format, &uniforms.layout, 1);
@@ -999,6 +1011,33 @@ mod render_tests {
                 "looking {dir:?}: the CPU mapping says {expected:?} but the \
                  shader drew {px:?}",
             );
+        }
+    }
+
+    /// THE SKY STAYS WITH THE WORLD WHEN THE PLAYER TURNS. A snap or stick
+    /// turn changes only the rig's yaw: the camera then looks along the
+    /// player-frame direction, and the background must still show the sky
+    /// that lies that way in the world. On the headset the sun swung round
+    /// with every snap turn while the level stayed put (2026-10-01); the
+    /// offline frames that pin turning draw no sky, so nothing caught it.
+    #[test]
+    fn the_sky_stays_with_the_world_when_the_player_turns() {
+        let pano = split_panorama();
+        for yaw in [std::f32::consts::FRAC_PI_2, std::f32::consts::PI, -std::f32::consts::FRAC_PI_4] {
+            for world in [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.3, 0.0, 1.0], [0.3, 0.0, -1.0]] {
+                let player = glam::Quat::from_rotation_y(-yaw) * glam::Vec3::from(world);
+                let px = shot!(look_turned(player.to_array(), &pano, yaw));
+                let uv = direction_to_uv(world);
+                let expected = pano.texel(
+                    ((uv[0] * pano.width as f32) as u32).min(pano.width - 1),
+                    ((uv[1] * pano.height as f32) as u32).min(pano.height - 1),
+                );
+                assert!(
+                    (px[0] > px[2]) == (expected[0] > expected[2]),
+                    "turned {yaw} rad, looking {world:?} in the world: the sky there is \
+                     {expected:?} but the shader drew {px:?}",
+                );
+            }
         }
     }
 

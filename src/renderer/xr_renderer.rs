@@ -1748,12 +1748,15 @@ impl XrRenderer {
             .enumerate()
             .map(|(i, d)| match source(i) {
                 Some(faces) => {
-                    eye.add_probe(&faces, resolution, d.centre, d.min, d.max);
+                    eye.add_probe(&faces, resolution, d);
                     crate::renderer::uniforms::probe_mean_radiance(&faces, resolution)
                 }
                 None => 0.0,
             })
             .collect();
+        // The doorways, which the meter hands over across as the
+        // reflections do. See `exposure::EyeAdaptation::meter`.
+        eye.set_portals(&portals);
         *self.eye.borrow_mut() = eye;
         log::info!("reflection probes: average radiance by probe {:?}", self.probe_brightness);
 
@@ -1990,10 +1993,10 @@ impl XrRenderer {
             && self.debug_view == crate::renderer::brush_pipeline::DebugView::Off
             && has_brushes
     }
-    fn sp_glare(&self, stereo: bool) -> &wgpu::RenderPipeline {
+    fn sp_glare(&self, stereo: bool) -> &crate::renderer::glare::GlarePipeline {
         match (stereo, &self.stereo_pipelines) {
-            (true, Some(p)) => &p.glare.pipeline,
-            _ => &self.glare_pipeline.pipeline,
+            (true, Some(p)) => &p.glare,
+            _ => &self.glare_pipeline,
         }
     }
     /// The scene-pass brush, whichever diagnostic is showing.
