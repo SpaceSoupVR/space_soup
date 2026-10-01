@@ -175,11 +175,11 @@ impl MirrorPipeline {
     pub fn create_model_uniform(&self, device: &Device) -> ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("mirror_model_uniform"),
-            // 80, not 64: ModelUniform carries a mat4 AND a params vec4 whose
-            // x is sky visibility. Every buffer bound to it must be the same
-            // size, or `upload` overruns whichever one was left behind -- which
-            // is a validation error at the first frame, not at build time.
-            size: 80,
+            // `MODEL_UNIFORM_SIZE`, not the 64 this shader reads: every
+            // buffer bound as a ModelUniform must be the same size, or an
+            // upload overruns whichever one was left behind -- which is a
+            // validation error at the first frame, not at build time.
+            size: super::mesh_pipeline::MODEL_UNIFORM_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -197,11 +197,11 @@ impl MirrorPipeline {
     pub fn create_reflected_vp_uniform(&self, device: &Device) -> ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("mirror_reflected_vp_uniform"),
-            // 80, not 64: ModelUniform carries a mat4 AND a params vec4 whose
-            // x is sky visibility. Every buffer bound to it must be the same
-            // size, or `upload` overruns whichever one was left behind -- which
-            // is a validation error at the first frame, not at build time.
-            size: 80,
+            // `MODEL_UNIFORM_SIZE`, not the 64 this shader reads: every
+            // buffer bound as a ModelUniform must be the same size, or an
+            // upload overruns whichever one was left behind -- which is a
+            // validation error at the first frame, not at build time.
+            size: super::mesh_pipeline::MODEL_UNIFORM_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

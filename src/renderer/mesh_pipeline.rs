@@ -165,8 +165,8 @@ impl MeshPipeline {
     pub fn create_model_uniform(&self, device: &Device) -> ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("mesh_model_uniform"),
-            // mat4 model + vec4 params (params.x is sky visibility).
-            size: 80,
+            // See `MODEL_UNIFORM_SIZE`.
+            size: MODEL_UNIFORM_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -183,6 +183,13 @@ impl MeshPipeline {
         ModelUniform { buffer, bind_group }
     }
 }
+
+/// A model's uniform, in bytes: its matrix (64), its params (16; x sky
+/// visibility, y emissive drive) and the room's light on it, nine vec4s of
+/// harmonics (144; see `room_light`). EVERY buffer that is ever bound as a
+/// `ModelUniform` is this size -- the mirror's and the caves' too, whose
+/// shaders read only the matrix -- so no upload can overrun one left behind.
+pub const MODEL_UNIFORM_SIZE: u64 = 224;
 
 pub struct ModelUniform {
     pub buffer: Buffer,
@@ -236,10 +243,27 @@ impl ModelUniform {
         sky_vis: f32,
         emissive_drive: f32,
     ) {
-        let mut data = [0f32; 20];
+        self.upload_lit(queue, model, sky_vis, emissive_drive, &[[0.0; 3]; 9]);
+    }
+
+    /// [`Self::upload_full`], with the light of the room the model stands in,
+    /// turned into the frame its normals are in: see `room_light`. Zero is no
+    /// room light, as before it existed.
+    pub fn upload_lit(
+        &self,
+        queue: &Queue,
+        model: glam::Mat4,
+        sky_vis: f32,
+        emissive_drive: f32,
+        room: &crate::renderer::room_light::RoomLight,
+    ) {
+        let mut data = [0f32; (MODEL_UNIFORM_SIZE / 4) as usize];
         data[..16].copy_from_slice(&model.to_cols_array());
         data[16] = sky_vis.clamp(0.0, 1.0);
         data[17] = emissive_drive.max(0.0);
+        for (i, c) in room.iter().enumerate() {
+            data[20 + 4 * i..23 + 4 * i].copy_from_slice(c);
+        }
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&data));
     }
 }
@@ -419,8 +443,8 @@ impl SkinnedMeshPipeline {
     pub fn create_model_uniform(&self, device: &Device) -> ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("skinned_mesh_model_uniform"),
-            // mat4 model + vec4 params (params.x is sky visibility).
-            size: 80,
+            // See `MODEL_UNIFORM_SIZE`.
+            size: MODEL_UNIFORM_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -443,8 +467,9 @@ fn skinned_mesh_shader() -> String {
 // `wgsl_lights_block` below, so there is one description of that layout rather
 // than one per shader.
 
-struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32> }}
+struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
+{room_light}
 
 @group(2) @binding(0) var tex: texture_2d<f32>;
 @group(2) @binding(1) var samp: sampler;
@@ -523,15 +548,40 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // A character's surface lies inside its own capsules: it takes no capsule
     // darkening, which would black it out. See `capsule_ambient`.
     capsule_receiver = false;
-    let lit = shade_with_sky(in.world_pos, n, model_u.params.x);
+    // The lamps and the sky, and the lit room round it: see `room_light`.
+    let lit = shade_with_sky(in.world_pos, n, model_u.params.x) + room_irradiance(n);
     let tex_color = textureSample(tex, samp, in.uv);
     return vec4<f32>(tonemap(tex_color.rgb * lit), tex_color.a);
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
         max_strength = super::mesh::MeshVertex::MAX_EMISSIVE_STRENGTH,
-        max_skin_joints = MAX_SKIN_JOINTS
+        max_skin_joints = MAX_SKIN_JOINTS,
+        room_light = wgsl_room_irradiance(),
     )
+}
+
+/// THE ROOM'S LIGHT ON A MODEL, as WGSL: the harmonics `model_u.room` holds
+/// (see `room_light`), evaluated as `sky_irradiance` evaluates the sky's --
+/// the same basis, the cosine lobe's weights already over pi -- along a
+/// normal in the frame the model is drawn in. Written out term by term, not a
+/// loop over an array, for the reason `sky_irradiance` gives.
+fn wgsl_room_irradiance() -> &'static str {
+    r#"
+fn room_irradiance(n: vec3<f32>) -> vec3<f32> {
+    let x = n.x; let y = n.y; let z = n.z;
+    var e = model_u.room[0].rgb * 0.282095;
+    e = e + model_u.room[1].rgb * (0.488603 * y) * 0.6666667;
+    e = e + model_u.room[2].rgb * (0.488603 * z) * 0.6666667;
+    e = e + model_u.room[3].rgb * (0.488603 * x) * 0.6666667;
+    e = e + model_u.room[4].rgb * (1.092548 * x * y) * 0.25;
+    e = e + model_u.room[5].rgb * (1.092548 * y * z) * 0.25;
+    e = e + model_u.room[6].rgb * (0.315392 * (3.0 * z * z - 1.0)) * 0.25;
+    e = e + model_u.room[7].rgb * (1.092548 * x * z) * 0.25;
+    e = e + model_u.room[8].rgb * (0.546274 * (x * x - y * y)) * 0.25;
+    return max(e, vec3<f32>(0.0));
+}
+"#
 }
 
 fn mesh_shader() -> String {
@@ -541,8 +591,9 @@ fn mesh_shader() -> String {
 // `wgsl_lights_block` below, so there is one description of that layout rather
 // than one per shader.
 
-struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32> }}
+struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
+{room_light}
 
 @group(2) @binding(0) var tex: texture_2d<f32>;
 @group(2) @binding(1) var samp: sampler;
@@ -675,12 +726,15 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // on the texture to pick out the bulb.
     let mask = textureSample(emissive_tex, samp, in.uv).rgb;
     let glow = in.emissive * mask * model_u.params.y;
-    return vec4<f32>(tonemap(tex_color.rgb * (lit + baked.rgb) + glow), tex_color.a);
+    // The lit room round it, which the baked bounce -- an old per-object
+    // estimate -- all but left out: see `room_light`.
+    return vec4<f32>(tonemap(tex_color.rgb * (lit + baked.rgb + room_irradiance(n)) + glow), tex_color.a);
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
         max_strength = super::mesh::MeshVertex::MAX_EMISSIVE_STRENGTH,
         stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
+        room_light = wgsl_room_irradiance(),
     )
 }
 
@@ -765,6 +819,60 @@ mod tests {
         assert!(hidden[0] <= 2, "a mask that hides the bulb let its light through: {hidden:?}");
     }
 
+    /// THE LIT ROOM LIGHTS A MODEL that no lamp and no sky reaches: black
+    /// without it -- a hand indoors out of a lamp's reach, a hanging lamp's
+    /// shade under a bright ceiling (headset, 2026-09-30) -- and with it,
+    /// EXACTLY what the sky's harmonics would give for the same light: a room
+    /// glowing evenly at the flat sky's level, on a model that sees no sky,
+    /// draws the same pixel as that sky on a model that sees all of it. And
+    /// the side the room is brighter on is the side that lights a face
+    /// turned toward it.
+    #[test]
+    fn the_lit_room_lights_a_model_as_the_sky_would() {
+        use crate::renderer::room_light::RoomLight;
+        let grey = [128, 128, 128, 255];
+        let render = |sky_vis: f32, room: &RoomLight| {
+            render_mesh_room(
+                [0.0; 3],
+                0.0,
+                false,
+                sky_vis,
+                [255; 4],
+                [0, 0, 0, 255],
+                grey,
+                None,
+                4.0,
+                room,
+            )
+        };
+        let Some(dark) = render(0.0, &[[0.0; 3]; 9]) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        assert!(dark[0] <= 1, "no lamp, no sky, no room: {dark:?}");
+        // The test uniforms' sky is the flat AMBIENT; the same, as a room.
+        let mut even = [[0.0f32; 3]; 9];
+        even[0] = [crate::renderer::sky::AMBIENT / 0.282_095; 3];
+        let by_room = render(0.0, &even).unwrap();
+        let by_sky = render(1.0, &[[0.0; 3]; 9]).unwrap();
+        assert!(by_room[0] > 8, "the room lit nothing: {by_room:?}");
+        assert!(
+            (by_room[0] as i32 - by_sky[0] as i32).abs() <= 1,
+            "the room {by_room:?} vs the sky {by_sky:?}"
+        );
+        // Brighter toward +z, which the model faces; then toward -z.
+        let mut toward = [[0.0f32; 3]; 9];
+        toward[0] = [0.3 / 0.282_095; 3];
+        toward[2] = [0.4; 3];
+        let mut away = toward;
+        away[2] = [-0.4; 3];
+        let (facing, behind) = (render(0.0, &toward).unwrap(), render(0.0, &away).unwrap());
+        assert!(
+            facing[0] > 3 * behind[0].max(1),
+            "the bright side {facing:?} vs the dark side {behind:?}"
+        );
+    }
+
     /// The same, with the material's own base colour given explicitly.
     fn render_mesh_albedo(
         base: [u8; 4],
@@ -820,6 +928,35 @@ mod tests {
         stationary: Option<[u8; 4]>,
         intensity: f32,
     ) -> Option<[u8; 4]> {
+        render_mesh_room(
+            emissive,
+            drive,
+            lit,
+            sky_vis,
+            mask,
+            lightmap_texel,
+            base,
+            stationary,
+            intensity,
+            &[[0.0; 3]; 9],
+        )
+    }
+
+    /// The same, the model standing in a room whose light is `room` (see
+    /// `room_light`; the model's normal is +z).
+    #[allow(clippy::too_many_arguments)]
+    fn render_mesh_room(
+        emissive: [f32; 3],
+        drive: f32,
+        lit: bool,
+        sky_vis: f32,
+        mask: [u8; 4],
+        lightmap_texel: [u8; 4],
+        base: [u8; 4],
+        stationary: Option<[u8; 4]>,
+        intensity: f32,
+        room: &crate::renderer::room_light::RoomLight,
+    ) -> Option<[u8; 4]> {
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
 
@@ -847,7 +984,7 @@ mod tests {
 
         let pipeline = MeshPipeline::new(&device, format, &uniforms.layout);
         let model = pipeline.create_model_uniform(&device);
-        model.upload_full(&queue, glam::Mat4::IDENTITY, sky_vis, drive);
+        model.upload_lit(&queue, glam::Mat4::IDENTITY, sky_vis, drive, room);
 
         // Mid grey base, with a WHITE emissive mask so this measures the
         // factor and the drive. The mask itself is covered separately.

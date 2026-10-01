@@ -731,6 +731,9 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let capsule_rows = crate::renderer::uniforms::MAX_CAPSULES * 2;
     let capsule_group_rows = crate::renderer::uniforms::MAX_CAPSULE_GROUPS * 2;
     let capsules_per_group = crate::renderer::uniforms::CAPSULES_PER_GROUP;
+    let character_card_sets = super::proxy_cards::CHARACTER_CARD_SETS;
+    let character_card_rows = 2 * character_card_sets;
+    let character_card_max_lod = (super::character_cards::CARD_MIPS - 1) as f32;
     let reflection_contrast = format!("{:?}", crate::renderer::space_warp::REFLECTION_CONTRAST_RATIO);
     let probe_edge_footprints = PROBE_EDGE_FOOTPRINTS;
     let floor_mirror_bias = super::brush_pipeline::probe_pass::FLOOR_MIRROR_BIAS;
@@ -745,6 +748,8 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let max_spot_shadows = super::shadow::MAX_SPOT_SHADOWS;
     let atlas_rows = super::shadow::SPOT_ATLAS_ROWS;
     let sun_atlas_tiles = super::shadow::SUN_ATLAS_TILES;
+    let sun_near_tile = super::shadow::SUN_NEAR_TILE;
+    let sun_near_zoom = super::shadow::SUN_NEAR_ZOOM;
     // Emitted from the Rust constant so the shader cannot disagree with the
     // atlas the pass actually renders into.
     let atlas_cols = super::shadow::SPOT_ATLAS_COLS;
@@ -824,6 +829,10 @@ struct Camera {{
     capsules: array<vec4<f32>, {capsule_rows}>,
     capsule_groups: array<vec4<f32>, {capsule_group_rows}>,
     capsule_params: vec4<f32>,
+    // The characters on cards, player frame: [box centre, atlas row + 1 (0
+    // for none)], [box half size, capsule group] a set. Must match
+    // `uniforms::Uniforms::character_cards`.
+    character_cards: array<vec4<f32>, {character_card_rows}>,
 }}
 
 // Undo the player-frame transform the CPU applied to this vertex.
@@ -1143,12 +1152,66 @@ fn capsule_room_exit(p: vec3<f32>, d: vec3<f32>) -> f32 {{
 // not worth its cost there.
 const CAPSULE_REFLECT_MAX_ROUGHNESS: f32 = 0.7;
 
+// THE PLAYER ON CARDS: six pictures of their body drawn this frame, one
+// looking in through each face of a box round it (`character_cards`). The
+// least blurred level a reflection can be read at sits under the footprint;
+// the coarsest is this.
+const CHARACTER_CARD_SETS: i32 = {character_card_sets};
+const CHARACTER_CARD_MAX_LOD: f32 = {character_card_max_lod:?};
+
+// One card of a character's set: card `card` (0..6), at `uv` across it, read
+// at `lod` and never closer to its edge than half a texel of that level -- a
+// bilinear read there would take its neighbour's.
+fn character_card_at(card: f32, uv: vec2<f32>, row: f32, res: f32, lod: f32, dims: vec2<f32>) -> vec4<f32> {{
+    let s = 0.5 * exp2(ceil(lod));
+    let at = vec2<f32>(card * res, row) + clamp(uv * res, vec2<f32>(s), vec2<f32>(res - s));
+    return textureSampleLevel(proxy_cards, probe_samp, at / dims, lod);
+}}
+
+// What a reflection leaving `p` along `d` shows of character `g`, `t` along
+// it where it passes nearest the character's capsules: the body's albedo
+// premultiplied by its coverage, from the three cards that face the ray, each
+// weighted by how squarely (`d` squared, which sums to one), read at that
+// point and as blurred as the footprint there. A card is an orthographic
+// view, so for a ray along its axis this is exactly what the ray meets first
+// -- a hand in front of a chest included; a ray between two axes mixes their
+// two views. Read at the point inside the body rather than where the ray
+// enters its capsule: a capsule is fatter than the body it stands for, and
+// its surface seen from the side of the ray falls outside the body's outline
+// on the other card. -1 where the character has no cards this frame.
+fn character_card_look(g: i32, p: vec3<f32>, d: vec3<f32>, t: f32, lobe: f32, eye: f32) -> vec4<f32> {{
+    var own = -1;
+    for (var k = 0; k < CHARACTER_CARD_SETS; k = k + 1) {{
+        if (camera.character_cards[k * 2].w > 0.5 && i32(camera.character_cards[k * 2 + 1].w) == g) {{
+            own = k;
+        }}
+    }}
+    if (own < 0) {{
+        return vec4<f32>(-1.0);
+    }}
+    let centre = camera.character_cards[own * 2];
+    let half = camera.character_cards[own * 2 + 1].xyz;
+    let uvw = clamp((p + d * t - centre.xyz) / half * 0.5 + vec3<f32>(0.5), vec3<f32>(0.0), vec3<f32>(1.0));
+    let dims = vec2<f32>(textureDimensions(proxy_cards));
+    let res = dims.x / 6.0;
+    let footprint = max(t * lobe, pixel_footprint * (1.0 + t / eye));
+    let texel = 2.0 * max(max(half.x, half.y), half.z) / res;
+    let lod = clamp(log2(max(2.0 * footprint / texel, 1.0)), 0.0, CHARACTER_CARD_MAX_LOD);
+    let row = (centre.w - 1.0) * res;
+    let k = d * d;
+    return k.x * character_card_at(select(1.0, 0.0, d.x < 0.0), uvw.yz, row, res, lod, dims)
+        + k.y * character_card_at(select(3.0, 2.0, d.y < 0.0), uvw.zx, row, res, lod, dims)
+        + k.z * character_card_at(select(5.0, 4.0, d.z < 0.0), uvw.xy, row, res, lod, dims);
+}}
+
 // THE CHARACTERS IN A REFLECTION leaving `p` along `d` (player frame), over
 // `behind` -- what the probe answered, which cannot hold anything that moves:
 // the capsules the ray passes through before it leaves the room, soft over
 // the footprint (the lobe, or a pixel on a mirror), in each character's
 // colour lit by `lit`, the irradiance arriving here -- the light the underside
-// of someone standing on this floor would get.
+// of someone standing on this floor would get. Where the capsule the ray
+// passes closest is a character with cards, the cards decide what it shows:
+// the body's own outline and colours, lit the same way.
 fn capsule_reflection(p: vec3<f32>, d: vec3<f32>, roughness: f32, lit: vec3<f32>, behind: vec4<f32>) -> vec4<f32> {{
     let groups = i32(camera.capsule_params.x);
     if (groups <= 0 || roughness > CAPSULE_REFLECT_MAX_ROUGHNESS) {{
@@ -1159,6 +1222,10 @@ fn capsule_reflection(p: vec3<f32>, d: vec3<f32>, roughness: f32, lit: vec3<f32>
     var t_max = -1.0;
     var cover = 0.0;
     var colour = vec3<f32>(0.0);
+    // The capsule that covers most: whose character, and how far along the
+    // ray it passes -- for that character's cards.
+    var win_g = -1;
+    var win_t = 0.0;
     for (var g = 0; g < groups; g = g + 1) {{
         let bound = camera.capsule_groups[g * 2];
         let oc = bound.xyz - p;
@@ -1190,11 +1257,21 @@ fn capsule_reflection(p: vec3<f32>, d: vec3<f32>, roughness: f32, lit: vec3<f32>
             if (c > cover) {{
                 cover = c;
                 colour = tint.rgb;
+                win_g = g;
+                win_t = t;
             }}
         }}
     }}
     if (cover <= 0.0) {{
         return behind;
+    }}
+    let look = character_card_look(win_g, p, d, win_t, lobe, eye);
+    if (look.a >= 0.0) {{
+        if (look.a <= 0.0) {{
+            return behind;
+        }}
+        cover = min(look.a, 1.0);
+        colour = look.rgb / look.a;
     }}
     return vec4<f32>(mix(behind.rgb, colour * lit * INV_PI, cover), max(behind.a, cover));
 }}
@@ -1521,9 +1598,30 @@ fn sun_visibility(l: Light, world_pos: vec3<f32>) -> f32 {{
         vis = pcf(sun_shadow_tex, world_pos, camera.sun_view_proj);
     }}
     if (vis > 0.0 && l.position.w > 0.5 && camera.shadow_params.z > 0.5) {{
-        vis = vis * pcf_tile(sun_dynamic_shadow_tex, vec2<f32>(0.0), SUN_ATLAS_GRID, world_pos, camera.sun_dynamic_view_proj);
+        vis = vis * sun_moving_visibility(world_pos);
     }}
     return vis;
+}}
+
+// THE MOVING-OBJECTS MAP AT `world_pos`: its near tile -- the middle half of
+// the sun tile's box at twice the detail -- wherever that holds the point and
+// its kernel, which round the player is everywhere their own shadow falls; the
+// sun tile beyond. One kernel either way: the near coordinates are the sun
+// tile's scaled about its middle, and the depth is the same. See
+// `shadow::SUN_NEAR_ZOOM`.
+fn sun_moving_visibility(world_pos: vec3<f32>) -> f32 {{
+    let c = shadow_coords(world_pos, camera.sun_dynamic_view_proj);
+    if (c.w < 0.5) {{ return 1.0; }}
+    let near = (c.xy - vec2<f32>(0.5)) * SUN_NEAR_ZOOM + vec2<f32>(0.5);
+    // Two of its texels in from its edge: the kernel reaches one and a half.
+    let edge = 2.0 * SUN_ATLAS_GRID.x / f32(textureDimensions(sun_dynamic_shadow_tex).x);
+    let in_near = all(abs(near - vec2<f32>(0.5)) < vec2<f32>(0.5 - edge));
+    return pcf_tile_at(
+        sun_dynamic_shadow_tex,
+        vec2<f32>(select(0.0, SUN_NEAR_TILE, in_near), 0.0),
+        SUN_ATLAS_GRID,
+        vec3<f32>(select(c.xy, near, in_near), c.z),
+    );
 }}
 
 // One spot's depth, read out of its tile of the shared atlas.
@@ -1548,6 +1646,11 @@ fn pcf_layer(tex: texture_depth_2d, layer: i32, world_pos: vec3<f32>, light_view
 fn pcf_tile(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
     let c = shadow_coords(world_pos, light_view_proj);
     if (c.w < 0.5) {{ return 1.0; }}
+    return pcf_tile_at(tex, tile, grid, c.xyz);
+}}
+
+// `pcf_tile` at `c`: the point in the tile (xy, 0..1 across it) and its depth.
+fn pcf_tile_at(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, c: vec3<f32>) -> f32 {{
     // One texel, in tile space.
     let tile_texel = grid / vec2<f32>(textureDimensions(tex));
     // Half a texel in from each edge of this tile, in tile space. Sampling
@@ -1571,9 +1674,12 @@ fn pcf_tile(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, world_pos: 
     return sum / 9.0;
 }}
 
-// The moving-objects map's row of tiles: the sun's, then the characters'.
-// See `shadow::SUN_ATLAS_TILES`.
+// The moving-objects map's row of tiles: the sun's, then the characters',
+// then the sun's near tile. See `shadow::SUN_ATLAS_TILES`.
 const SUN_ATLAS_GRID: vec2<f32> = vec2<f32>(f32({sun_atlas_tiles}), 1.0);
+// The sun's near tile, and how much finer it is. See `shadow::SUN_NEAR_ZOOM`.
+const SUN_NEAR_TILE: f32 = f32({sun_near_tile});
+const SUN_NEAR_ZOOM: f32 = {sun_near_zoom:?};
 
 // Light `i`'s shadow of the characters alone, where it holds one of their
 // tiles; 1 elsewhere. See `character_shadow_tile`.

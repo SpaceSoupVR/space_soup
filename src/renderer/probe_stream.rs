@@ -59,6 +59,9 @@ pub struct ProbeDesc {
     /// has them is the OUTDOOR volume -- its box stands in for the sky dome --
     /// which reflections trace against the ground and the sky instead.
     pub has_depth: bool,
+    /// The room's light round the capture point, for the models standing in
+    /// it: see `room_light`. `None` from an older bake.
+    pub room_light: Option<[[f32; 3]; 9]>,
 }
 
 /// THE OUTDOOR VOLUME of a level's probes: the one volume none of whose
@@ -454,7 +457,9 @@ mod tests {
     use super::*;
 
     fn desc(volume: u32, has_depth: bool) -> ProbeDesc {
-        ProbeDesc { centre: Vec3::ZERO, min: Vec3::ZERO, max: Vec3::ONE, volume, has_depth }
+        ProbeDesc { centre: Vec3::ZERO, min: Vec3::ZERO, max: Vec3::ONE, volume, has_depth,
+            room_light: None
+        }
     }
 
     #[test]

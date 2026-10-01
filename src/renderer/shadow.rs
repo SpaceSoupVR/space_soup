@@ -107,8 +107,43 @@ pub const SPOT_ATLAS_COLS: u32 = 2;
 pub const MAX_CHARACTER_SHADOWS: usize = 2;
 
 /// Tiles of the moving-objects map, in one row: the sun's, then the
-/// characters'. See `SUN_DYNAMIC_DIM`.
-pub const SUN_ATLAS_TILES: u32 = 1 + MAX_CHARACTER_SHADOWS as u32;
+/// characters', then the sun's near tile. See `SUN_DYNAMIC_DIM`.
+pub const SUN_ATLAS_TILES: u32 = 2 + MAX_CHARACTER_SHADOWS as u32;
+
+/// THE PLAYER'S OWN SUN SHADOW AT TWICE THE DETAIL: the near tile holds the
+/// middle half of the sun tile's box -- 1.5 m round the player's body -- at
+/// 0.59 cm a texel where the sun tile has 1.17, and the shader reads it
+/// wherever it holds the point (`sun_moving_visibility`). The sun tile still
+/// holds everything out to 3 m.
+///
+/// WHY HALF THE BOX IS ENOUGH: the map is the sun's view, so a caster and its
+/// shadow on the ground land on the SAME texel. The player's shadow can be as
+/// long as they are tall, but the map only has to hold the player: their whole
+/// body, arms raised, is inside 1.5 m of its middle seen along the sun.
+///
+/// WHY EXACTLY TWO: the near matrix is the sun tile's scaled by two about its
+/// middle (`sun_near_matrix`), so a texel corner of the sun tile at `t` is at
+/// `2t - SUN_DYNAMIC_DIM / 2` in the near tile -- a texel corner there too.
+/// The world stays snapped to the near tile's grid as it is to the sun tile's
+/// (`lights::dynamic_sun_matrix`), and the shader finds the near coordinates
+/// from the sun tile's with no matrix of its own.
+///
+/// The user, 2026-09-30: the outdoor player shadows look pixelated -- "is there
+/// anyway to make them look less pixellated while not requiring them to be
+/// much higher quality?" A 1.17 cm texel is eight display pixels at two metres
+/// on a Quest 3. The Quest filters the map linearly (logged at startup), so the
+/// kernel was not the fault: the texel was.
+pub const SUN_NEAR_ZOOM: f32 = 2.0;
+
+/// The near tile's place in the row. See `SUN_NEAR_ZOOM`.
+pub const SUN_NEAR_TILE: u32 = 1 + MAX_CHARACTER_SHADOWS as u32;
+
+/// The near tile's matrix: the sun tile's, scaled by `SUN_NEAR_ZOOM` about the
+/// middle of its box. The depth is the sun tile's, so one comparison value
+/// serves both. See `SUN_NEAR_ZOOM`.
+pub fn sun_near_matrix(sun_dynamic: Mat4) -> Mat4 {
+    Mat4::from_scale(Vec3::new(SUN_NEAR_ZOOM, SUN_NEAR_ZOOM, 1.0)) * sun_dynamic
+}
 
 /// Light matrices in the uniform: the spots' in layer order, then the
 /// characters' (`Uniforms::spot_view_proj`).
@@ -227,6 +262,8 @@ pub enum ShadowKind {
     /// The sun's shadow of MOVING things only, redrawn every frame over a
     /// small box around the player. See `SUN_DYNAMIC_DIM`.
     SunDynamic,
+    /// The middle of that box at twice the detail. See `SUN_NEAR_ZOOM`.
+    SunNear,
     /// One of the spot layers, by index.
     Spot(usize),
     /// One of the characters' tiles, by index. See `MAX_CHARACTER_SHADOWS`.
@@ -549,6 +586,9 @@ pub struct ShadowMap {
     /// The characters' tiles' light matrices; their depth is in the
     /// moving-objects map (`SUN_ATLAS_TILES`).
     characters: [ShadowSlot; MAX_CHARACTER_SHADOWS],
+    /// The sun's near tile's light matrix; its depth is in the moving-objects
+    /// map too. See `SUN_NEAR_ZOOM`.
+    sun_near: ShadowSlot,
     _spot_texture: Texture,
     /// The whole atlas, as the shader samples it and as the pass renders to it.
     spot_array_view: TextureView,
@@ -817,13 +857,14 @@ impl ShadowMap {
         // differs per spot.
         let spots = std::array::from_fn(|_| ShadowSlot::light_only(device, &light_layout));
         let characters = std::array::from_fn(|_| ShadowSlot::light_only(device, &light_layout));
+        let sun_near = ShadowSlot::light_only(device, &light_layout);
         // NOTE: a fifth `ShadowSlot` used to be allocated here and never read.
         // The four in `spots` are views into one array texture; this was a
         // whole separate depth target, created on every construction and used
         // by nothing. The compiler had been warning about the binding for some
         // time -- the wasted memory was the part nobody had noticed.
 
-        // A row of tiles: the sun's, then the characters'.
+        // A row of tiles: the sun's, then the characters', then the sun's near.
         let sun_dynamic = ShadowSlot::new_sized(
             device,
             &light_layout,
@@ -837,6 +878,7 @@ impl ShadowMap {
             sun_dynamic,
             spots,
             characters,
+            sun_near,
             _spot_texture: spot_texture,
             spot_array_view,
             spot_tile_dim: dim,
@@ -870,6 +912,7 @@ impl ShadowMap {
         match kind {
             ShadowKind::Sun => &self.sun,
             ShadowKind::SunDynamic => &self.sun_dynamic,
+            ShadowKind::SunNear => &self.sun_near,
             ShadowKind::Spot(i) => &self.spots[i.min(MAX_SPOT_SHADOWS - 1)],
             ShadowKind::Character(k) => &self.characters[k.min(MAX_CHARACTER_SHADOWS - 1)],
         }
@@ -881,6 +924,10 @@ impl ShadowMap {
             view_proj: view_proj.to_cols_array_2d(),
         };
         queue.write_buffer(&self.slot(kind).light_buffer, 0, bytemuck::bytes_of(&m));
+        // Its near tile's with it: always the same box, twice the detail.
+        if kind == ShadowKind::SunDynamic {
+            self.upload_light(queue, ShadowKind::SunNear, sun_near_matrix(view_proj));
+        }
     }
 
     /// Every shadow-casting spot, in ONE render pass.
@@ -986,11 +1033,11 @@ impl ShadowMap {
         drawn
     }
 
-    /// THE MOVING-OBJECTS MAP, in ONE pass: the sun's tile when `sun` (every
-    /// moving caster, from `ShadowKind::SunDynamic`'s matrix), then the first
-    /// `characters` characters' tiles (the characters alone, from
-    /// `ShadowKind::Character(k)`'s). Tiles not drawn read as far depth,
-    /// unshadowed. Returns the indices drawn.
+    /// THE MOVING-OBJECTS MAP, in ONE pass: the sun's tile and its near tile
+    /// when `sun` (every moving caster, from `ShadowKind::SunDynamic`'s matrix
+    /// and `ShadowKind::SunNear`'s), then the first `characters` characters'
+    /// tiles (the characters alone, from `ShadowKind::Character(k)`'s). Tiles
+    /// not drawn read as far depth, unshadowed. Returns the indices drawn.
     pub fn record_moving(
         &self,
         encoder: &mut CommandEncoder,
@@ -1026,10 +1073,13 @@ impl ShadowMap {
             }
         };
         if sun {
-            sun_atlas_viewport(&mut pass, 0);
+            // The sun's tile, then the middle of its box at twice the detail
+            // (`SUN_NEAR_ZOOM`): the same casters into both.
+            for (tile, slot) in [(0, &self.sun_dynamic), (SUN_NEAR_TILE, &self.sun_near)] {
+                sun_atlas_viewport(&mut pass, tile);
             if !mesh_draws.is_empty() {
                 pass.set_pipeline(&self.mesh_pipeline);
-                pass.set_bind_group(0, &self.sun_dynamic.light_bind_group, &[]);
+                pass.set_bind_group(0, &slot.light_bind_group, &[]);
                 for (vb, ib, count, model_bg) in mesh_draws {
                     pass.set_bind_group(1, *model_bg, &[]);
                     pass.set_vertex_buffer(0, vb.slice(..));
@@ -1037,7 +1087,8 @@ impl ShadowMap {
                     pass.draw_indexed(0..*count, 0, 0..1);
                 }
             }
-            skinned(&mut pass, &self.sun_dynamic.light_bind_group);
+            skinned(&mut pass, &slot.light_bind_group);
+        }
         }
         for k in 0..characters.min(MAX_CHARACTER_SHADOWS) {
             sun_atlas_viewport(&mut pass, 1 + k as u32);
@@ -1074,7 +1125,7 @@ impl ShadowMap {
             // store for all of them.
             ShadowKind::Spot(_) => &self.spot_array_view,
             // A tile of the moving-objects map. See `SUN_ATLAS_TILES`.
-            ShadowKind::Character(_) => self.sun_dynamic.depth_view.as_ref().expect("the dynamic sun owns its own depth target"),
+            ShadowKind::Character(_) | ShadowKind::SunNear => self.sun_dynamic.depth_view.as_ref().expect("the dynamic sun owns its own depth target"),
         };
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("shadow_pass"),
@@ -1089,76 +1140,85 @@ impl ShadowMap {
             }),
             ..Default::default()
         });
-        match kind {
-            ShadowKind::Spot(i) => {
-                let (col, row) = spot_tile(i.min(MAX_SPOT_SHADOWS - 1));
-                let d = self.spot_tile_dim as f32;
-                pass.set_viewport(col as f32 * d, row as f32 * d, d, d, 0.0, 1.0);
+        // The moving-objects sun fills its tile and then the middle of its box
+        // at twice the detail, as `record_moving` does. See `SUN_NEAR_ZOOM`.
+        let tiles = match kind {
+            ShadowKind::SunDynamic => vec![(kind, slot), (ShadowKind::SunNear, &self.sun_near)],
+            _ => vec![(kind, slot)],
+        };
+        for (kind, slot) in tiles {
+            match kind {
+                ShadowKind::Spot(i) => {
+                    let (col, row) = spot_tile(i.min(MAX_SPOT_SHADOWS - 1));
+                    let d = self.spot_tile_dim as f32;
+                    pass.set_viewport(col as f32 * d, row as f32 * d, d, d, 0.0, 1.0);
+                }
+                ShadowKind::SunDynamic => sun_atlas_viewport(&mut pass, 0),
+                ShadowKind::SunNear => sun_atlas_viewport(&mut pass, SUN_NEAR_TILE),
+                ShadowKind::Character(k) => sun_atlas_viewport(&mut pass, 1 + k.min(MAX_CHARACTER_SHADOWS - 1) as u32),
+                ShadowKind::Sun => {}
             }
-            ShadowKind::SunDynamic => sun_atlas_viewport(&mut pass, 0),
-            ShadowKind::Character(k) => sun_atlas_viewport(&mut pass, 1 + k.min(MAX_CHARACTER_SHADOWS - 1) as u32),
-            ShadowKind::Sun => {}
-        }
 
-        if let Some((vb, ib, count)) = solid {
-            if count > 0 {
-                pass.set_pipeline(&self.solid_pipeline);
-                pass.set_bind_group(0, &slot.light_bind_group, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
-                if solid_chunks.is_empty() {
-                    // No chunking supplied: draw it whole. A caster nobody has
-                    // partitioned is still a caster, and silently dropping it
-                    // would be a missing shadow rather than a slow one.
-                    pass.draw_indexed(0..count, 0, 0..1);
-                    drawn_indices += count;
-                } else {
-                    for c in solid_chunks {
-                        if !aabb_in_frustum(&planes, c.min, c.max) {
-                            continue;
+            if let Some((vb, ib, count)) = solid {
+                if count > 0 {
+                    pass.set_pipeline(&self.solid_pipeline);
+                    pass.set_bind_group(0, &slot.light_bind_group, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    if solid_chunks.is_empty() {
+                        // No chunking supplied: draw it whole. A caster nobody has
+                        // partitioned is still a caster, and silently dropping it
+                        // would be a missing shadow rather than a slow one.
+                        pass.draw_indexed(0..count, 0, 0..1);
+                        drawn_indices += count;
+                    } else {
+                        for c in solid_chunks {
+                            if !aabb_in_frustum(&planes, c.min, c.max) {
+                                continue;
+                            }
+                            pass.draw_indexed(
+                                c.first_index..c.first_index + c.index_count,
+                                0,
+                                0..1,
+                            );
+                            drawn_indices += c.index_count;
                         }
-                        pass.draw_indexed(
-                            c.first_index..c.first_index + c.index_count,
-                            0,
-                            0..1,
-                        );
-                        drawn_indices += c.index_count;
                     }
                 }
             }
-        }
 
-        if let Some((vb, ib, count)) = brushes {
-            if count > 0 {
-                pass.set_pipeline(&self.brush_pipeline);
+            if let Some((vb, ib, count)) = brushes {
+                if count > 0 {
+                    pass.set_pipeline(&self.brush_pipeline);
+                    pass.set_bind_group(0, &slot.light_bind_group, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..count, 0, 0..1);
+                    drawn_indices += count;
+                }
+            }
+
+            if !mesh_draws.is_empty() {
+                pass.set_pipeline(&self.mesh_pipeline);
                 pass.set_bind_group(0, &slot.light_bind_group, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
-                pass.draw_indexed(0..count, 0, 0..1);
-                drawn_indices += count;
+                for (vb, ib, count, model_bg) in mesh_draws {
+                    pass.set_bind_group(1, *model_bg, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
             }
-        }
 
-        if !mesh_draws.is_empty() {
-            pass.set_pipeline(&self.mesh_pipeline);
-            pass.set_bind_group(0, &slot.light_bind_group, &[]);
-            for (vb, ib, count, model_bg) in mesh_draws {
-                pass.set_bind_group(1, *model_bg, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
-                pass.draw_indexed(0..*count, 0, 0..1);
-            }
-        }
-
-        if !skinned_draws.is_empty() {
-            pass.set_pipeline(&self.skinned_pipeline);
-            pass.set_bind_group(0, &slot.light_bind_group, &[]);
-            for (vb, ib, count, model_bg, skin_bg) in skinned_draws {
-                pass.set_bind_group(1, *model_bg, &[]);
-                pass.set_bind_group(2, *skin_bg, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
-                pass.draw_indexed(0..*count, 0, 0..1);
+            if !skinned_draws.is_empty() {
+                pass.set_pipeline(&self.skinned_pipeline);
+                pass.set_bind_group(0, &slot.light_bind_group, &[]);
+                for (vb, ib, count, model_bg, skin_bg) in skinned_draws {
+                    pass.set_bind_group(1, *model_bg, &[]);
+                    pass.set_bind_group(2, *skin_bg, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
             }
         }
         drop(pass);
@@ -2204,6 +2264,111 @@ mod render_tests {
             (open[1] as i32) - (shadowed[1] as i32) > 20,
             "a moving object cast no sun shadow: {shadowed:?} vs {open:?}",
         );
+    }
+
+    /// THE NEAR TILE IS WHAT THE MIDDLE OF THE BOX IS READ FROM, at twice the
+    /// detail (`SUN_NEAR_ZOOM`). One straight shadow edge, on a texel corner,
+    /// and the ground one sun-tile texel outside it: in the middle of the box,
+    /// where the near tile holds it, and 15 m out, where only the sun tile
+    /// does. Through the sun tile the kernel still reaches past the edge and
+    /// takes a sixth of the sun; through the near tile, half as wide, it
+    /// reaches nothing. Lit and shadowed ground read the same in both places,
+    /// so the difference is the tile and not the place.
+    #[test]
+    fn the_near_tile_holds_the_middle_of_the_box_at_twice_the_detail() {
+        // Everything from `x0 - 8` to `x0`, three metres up.
+        let plate = |x0: f32| {
+            let n = [0.0, 1.0, 0.0];
+            let v = vec![
+                vertex([x0 - 8.0, 3.0, -8.0], n),
+                vertex([x0, 3.0, -8.0], n),
+                vertex([x0, 3.0, 8.0], n),
+                vertex([x0 - 8.0, 3.0, 8.0], n),
+            ];
+            (v, vec![0, 2, 1, 0, 3, 2])
+        };
+        // `shade_receiver`'s sun box is 20 m round the origin; its near tile 10.
+        let texel = 2.0 * 20.0 / SUN_DYNAMIC_DIM as f32;
+        // A dim sky under a bright sun, for a wide range without clipping.
+        let at = |x0: f32, dx: f32, caster: bool| {
+            shade_receiver(Scene {
+                lights: vec![Light {
+                    intensity: 0.5,
+                    ..sun()
+                }],
+                caster: caster.then(|| plate(x0)),
+                receiver_at: Vec3::new(x0 + dx, 0.0, 0.0),
+                sky: SkyUpload::from(&crate::renderer::sky::SkyIrradiance::flat(0.1)),
+                sky_sun_dynamic: true,
+                ..base()
+            })
+        };
+        let Some(near) = at(0.0, texel, true) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let wide = at(15.0, texel, true).unwrap();
+        let (lit_near, lit_wide) = (
+            at(0.0, texel, false).unwrap(),
+            at(15.0, texel, false).unwrap(),
+        );
+        let (dark_near, dark_wide) = (at(0.0, -1.0, true).unwrap(), at(15.0, -1.0, true).unwrap());
+        eprintln!(
+            "a texel outside the edge: near tile {near:?}, sun tile {wide:?}; lit {lit_near:?} / {lit_wide:?}; \
+             shadowed {dark_near:?} / {dark_wide:?}",
+        );
+        assert!(
+            (lit_near[1] as i32 - lit_wide[1] as i32).abs() <= 1 && (dark_near[1] as i32 - dark_wide[1] as i32).abs() <= 1,
+            "the two places are not lit alike: lit {lit_near:?} / {lit_wide:?}, shadowed {dark_near:?} / {dark_wide:?}",
+        );
+        let range = lit_wide[1] as i32 - dark_wide[1] as i32;
+        assert!(
+            range > 40,
+            "too little sun to measure a penumbra by: {range}"
+        );
+        // A sixth of the range lost through the sun tile; none through the near.
+        let lost_wide = lit_wide[1] as i32 - wide[1] as i32;
+        let lost_near = lit_near[1] as i32 - near[1] as i32;
+        assert!(
+            lost_wide * 10 > range && lost_near * 4 < lost_wide,
+            "the middle of the box was not read from the near tile: lost {lost_near} there and {lost_wide} \
+             through the sun tile, of {range}",
+        );
+    }
+
+    /// THE NEAR TILE STAYS SNAPPED: the world's origin is on a texel corner of
+    /// the near tile wherever the player stands, as on the sun tile's
+    /// (`lights::dynamic_sun_matrix`) -- so a moving shadow's edge does not
+    /// crawl in the near tile either -- and the near tile is the sun tile's
+    /// middle at twice the size, depth unchanged.
+    #[test]
+    fn the_near_tile_is_the_middle_of_the_sun_tile_snapped_to_its_own_grid() {
+        let dir = Vec3::new(0.4, -0.75, 0.3).normalize();
+        let n = SUN_DYNAMIC_DIM as f32;
+        for head in [
+            Vec3::new(0.0, 1.6, 0.0),
+            Vec3::new(3.137, 1.7, -2.71),
+            Vec3::new(-41.3, 1.55, 12.06),
+        ] {
+            let wide = crate::renderer::lights::dynamic_sun_matrix(dir, head);
+            let near = sun_near_matrix(wide);
+            let texel_of = |m: Mat4, p: Vec3| {
+                let c = m.project_point3(p);
+                (glam::Vec2::new(c.x, c.y) * 0.5 + glam::Vec2::splat(0.5)) * n
+            };
+            let o = texel_of(near, Vec3::ZERO);
+            assert!(
+                (o - o.round()).abs().max_element() < 2e-3,
+                "the world's origin is off the near tile's grid at {o:?}, player at {head}",
+            );
+            let p = head + Vec3::new(0.37, -0.81, 0.52);
+            let (w, nr) = (wide.project_point3(p), near.project_point3(p));
+            assert!(
+                (nr.x - 2.0 * w.x).abs() < 1e-5
+                    && (nr.y - 2.0 * w.y).abs() < 1e-5
+                    && (nr.z - w.z).abs() < 1e-6
+            );
+        }
     }
 
     #[test]

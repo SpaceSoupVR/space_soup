@@ -151,6 +151,10 @@ pub struct Uniforms {
     /// -1 for none; w the floor mirror's plane, `FLOOR_MIRROR_BIAS` above its
     /// height, 0 for none (`brush_pipeline::probe_pass`).
     pub capsule_params: [f32; 4],
+    /// THE CHARACTERS ON CARDS, player frame: see [`CapsuleUpload::cards`].
+    ///
+    /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
+    pub character_cards: [[f32; 4]; 2 * super::proxy_cards::CHARACTER_CARD_SETS],
 }
 
 /// How many buildings' outsides reflections can meet. test_room has three; a
@@ -279,6 +283,11 @@ pub struct CapsuleUpload {
     /// MIRROR, which the floor the player stands on shows in place of their
     /// capsules. See `brush_pipeline::probe_pass::FLOOR_MIRROR_BIAS`.
     pub floor_mirror: bool,
+    /// WHICH CHARACTERS ARE ON CARDS this frame, and where: two vec4 a set,
+    /// `[box centre, atlas row + 1]` and `[box half size, capsule group]`, a
+    /// row of 0 for none. Set each frame by the renderer, which draws them.
+    /// See `character_cards`.
+    pub cards: [[f32; 4]; 2 * super::proxy_cards::CHARACTER_CARD_SETS],
 }
 
 impl Default for CapsuleUpload {
@@ -289,6 +298,7 @@ impl Default for CapsuleUpload {
             group_count: 0,
             shadow_lights: [-1.0; 2],
             floor_mirror: false,
+            cards: [[0.0; 4]; 2 * super::proxy_cards::CHARACTER_CARD_SETS],
         }
     }
 }
@@ -331,6 +341,15 @@ impl CapsuleUpload {
         out.group_count = g as u32;
         out
     }
+}
+
+/// The sky's harmonics `sh`, projected in the world's frame, turned by the
+/// player's `yaw` into theirs -- where the shaders evaluate them, as the room
+/// light is (`room_light::turned_to_player`, the same basis and rotation).
+pub fn sky_in_player_frame(sh: &[[f32; 4]; 9], yaw: f32) -> [[f32; 4]; 9] {
+    let light: super::room_light::RoomLight = std::array::from_fn(|i| [sh[i][0], sh[i][1], sh[i][2]]);
+    let turned = super::room_light::turned_to_player(&light, yaw);
+    std::array::from_fn(|i| [turned[i][0], turned[i][1], turned[i][2], sh[i][3]])
 }
 
 /// Per-frame display settings: how radiance becomes pixels.
@@ -924,7 +943,11 @@ impl UniformBuffer {
                 dense.ground_top,
                 if dense.ground_top > NO_GROUND { 1.0 } else { 0.0 },
             ],
-            sky_sh: sky.sh,
+            // Turned into the player's frame, which is the frame every
+            // `sky_irradiance` caller's direction is in: uploaded in the
+            // world's, the sky light on every surface turned with each snap
+            // turn (2026-10-01).
+            sky_sh: sky_in_player_frame(&sky.sh, player.yaw),
             player_frame: [player.offset.x, player.offset.y, player.offset.z, player.yaw],
             // From the buffer's own state rather than an argument: probe boxes
             // are level data set once when a scene loads, and threading them
@@ -966,6 +989,7 @@ impl UniformBuffer {
                     0.0
                 },
             ],
+            character_cards: player.capsules.cards,
             post_params: [
                 post.exposure,
                 match post.tonemap {
@@ -2019,6 +2043,28 @@ mod ground_irradiance_tests {
             *row = [0.9 - 0.07 * f, 0.5 + 0.03 * f, 0.2 + 0.05 * f, 0.0];
         }
         sh
+    }
+
+    /// The sky light a surface gets depends on which way it faces in the
+    /// WORLD, not on which way the player has turned: the uploaded harmonics,
+    /// read along a player-frame normal, give what the world's give along the
+    /// same normal turned back into the world.
+    #[test]
+    fn the_sky_light_stays_with_the_world_when_the_player_turns() {
+        let sh = sample_sky();
+        for yaw in [0.0f32, 0.4, std::f32::consts::FRAC_PI_2, 2.2, -1.3] {
+            let turned = sky_in_player_frame(&sh, yaw);
+            for n in [Vec3::X, Vec3::Z, Vec3::NEG_X, Vec3::new(0.6, 0.3, -0.74), Vec3::new(-0.2, -0.9, 0.39)] {
+                let n = n.normalize();
+                let world = glam::Quat::from_rotation_y(yaw) * n;
+                let (got, want) = (shader_sky_irradiance(&turned, n.to_array()), shader_sky_irradiance(&sh, world.to_array()));
+                for c in 0..3 {
+                    assert!((got[c] - want[c]).abs() < 1e-4, "yaw {yaw}, normal {n}: {got:?} vs {want:?}");
+                }
+            }
+        }
+        // And the ground term, read straight down, does not turn at all.
+        assert_eq!(sky_ground_irradiance(&sky_in_player_frame(&sh, 1.1)).map(|v| (v * 1e4).round()), sky_ground_irradiance(&sh).map(|v| (v * 1e4).round()));
     }
 
     #[test]
