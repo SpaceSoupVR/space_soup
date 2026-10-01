@@ -282,8 +282,11 @@ struct VIn {{
 struct VOut {{
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
+    // In the player's frame, as every position the shaders get: lighting.
     @location(1) world_pos: vec3<f32>,
     @location(2) weights: vec4<f32>,
+    // The same point in the WORLD: where the rock's textures are read.
+    @location(3) tex_pos: vec3<f32>,
 }}
 
 @vertex fn vs_main(v: VIn) -> VOut {{
@@ -293,6 +296,7 @@ struct VOut {{
     out.normal    = (model_u.model * vec4<f32>(v.norm, 0.0)).xyz;
     out.world_pos = world.xyz;
     out.weights   = v.weights;
+    out.tex_pos   = to_world_space(world.xyz);
     return out;
 }}
 
@@ -385,19 +389,31 @@ fn repeat_of(layer: i32) -> f32 {{
     // where the interpolated normal has been bent away from the geometry.
     n = select(-n, n, front);
 
+    // THE ROCK'S TEXTURES LIE IN THE WORLD. Positions and normals arrive in
+    // the player's frame, turned by every snap and stick turn and shifted
+    // with the rig; read there, the layers slid under a walking player,
+    // swapped projection planes on a turn, and their bumps bent along the
+    // turned axes. So the layers are read at the world point, along the
+    // world's axes chosen by the world's normal, and the maps fold into that
+    // normal there; the finished normal turns back into the player's frame,
+    // where the lamps are. A turn is a rotation, so blending and normalising
+    // on either side of it are the same.
+    let nw = to_world_direction(n);
+
     let t = top_two(in.weights);
-    let ba = biplanar_axes(in.world_pos, n, repeat_of(t.a));
-    let bb = biplanar_axes(in.world_pos, n, repeat_of(t.b));
+    let ba = biplanar_axes(in.tex_pos, nw, repeat_of(t.a));
+    let bb = biplanar_axes(in.tex_pos, nw, repeat_of(t.b));
 
     let albedo_raw = layer_colour(t.a, ba) * t.wa + layer_colour(t.b, bb) * t.wb;
 
-    var shaded_n = layer_normal(t.a, ba, n) * t.wa + layer_normal(t.b, bb, n) * t.wb;
-    shaded_n = normalize(select(n, shaded_n, length(shaded_n) > 0.0001));
+    var bent = layer_normal(t.a, ba, nw) * t.wa + layer_normal(t.b, bb, nw) * t.wb;
+    bent = normalize(select(nw, bent, length(bent) > 0.0001));
+    let shaded_n = to_player_direction(bent);
 
     // Macro variation, sampled in the plane the surface faces rather than from
     // above. A cave wall sampled top-down gets one macro value down its whole
     // height, which is the one place the variation would do nothing at all.
-    let mb = biplanar_axes(in.world_pos, n, mat.macro_repeat);
+    let mb = biplanar_axes(in.tex_pos, nw, mat.macro_repeat);
     let m = textureSample(macro_tex, layer_samp, mb.uv_major).r;
     let albedo = albedo_raw * (1.0 + (m - 0.5) * 2.0 * mat.macro_strength);
 
@@ -451,6 +467,24 @@ mod tests {
         TerrainImage { width: 4, height: 4, rgba }
     }
 
+    /// A ramp, red across and green down, sixteen texels each way, so any
+    /// change in where a layer is read -- the point or the plane -- changes
+    /// the colour.
+    fn ramp() -> TerrainImage {
+        let mut rgba = Vec::with_capacity(16 * 16 * 4);
+        for y in 0..16u8 {
+            for x in 0..16u8 {
+                rgba.extend_from_slice(&[x * 16, y * 16, 128, 255]);
+            }
+        }
+        TerrainImage { width: 16, height: 16, rgba }
+    }
+
+    /// `solid` and `tilted_normal` at the ramp's size, as a texture array needs.
+    fn sized(rgba: [u8; 4]) -> TerrainImage {
+        TerrainImage { width: 16, height: 16, rgba: rgba.repeat(16 * 16) }
+    }
+
     /// What a render asks for. Grouped rather than passed as eight positional
     /// arguments, which is how a harness ends up with call sites nobody can read.
     struct Shot {
@@ -466,6 +500,13 @@ mod tests {
         light_at: [f32; 3],
         /// Wind the triangle the other way, reversing which side faces the eye.
         flipped: bool,
+        /// The player's turn (radians) and the rig's offset, as a frame hands
+        /// them over (`PlayerUpload`). Everything above stays where it is in
+        /// the WORLD -- the surface, its normal, the lamp and the eye -- and is
+        /// given to the shader in the player's frame; the camera turns back
+        /// with it, so the picture is the same world at any turn or offset.
+        yaw: f32,
+        offset: [f32; 3],
         layers: [TerrainImage; 4],
         normals: [Option<TerrainImage>; 4],
         settings: TerrainMaterialUniform,
@@ -480,6 +521,8 @@ mod tests {
                 lit: false,
                 light_at: [3.0, 2.0, 0.0],
                 flipped: false,
+                yaw: 0.0,
+                offset: [0.0, 0.0, 0.0],
                 // Primaries, so a readback names the winning layer with no
                 // arithmetic: red, blue, green, white.
                 layers: [
@@ -511,6 +554,12 @@ mod tests {
     fn render(shot: Shot) -> Option<[u8; 4]> {
         let (device, queue) = terrain_pipeline::tests::headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
+        // World to the player's frame and back: turned by -yaw less the
+        // offset, as `to_player_space` in the shaders undoes.
+        let offset = glam::Vec3::from(shot.offset);
+        let turn = glam::Quat::from_rotation_y(shot.yaw);
+        let to_player = glam::Mat4::from_quat(turn.inverse()) * glam::Mat4::from_translation(-offset);
+        let to_world = glam::Mat4::from_translation(offset) * glam::Mat4::from_quat(turn);
 
         let lights = LightsUniform::new(&device);
         let (_shadows, uniforms) =
@@ -519,8 +568,8 @@ mod tests {
         if shot.lit {
             lights.upload(&queue, &[Light {
                 mask_channel: None,
-                position: glam::Vec3::from(shot.light_at),
-                direction: glam::Vec3::new(0.0, -1.0, 0.0),
+                position: to_player.transform_point3(glam::Vec3::from(shot.light_at)),
+                direction: to_player.transform_vector3(glam::Vec3::new(0.0, -1.0, 0.0)),
                 kind: LightKind::Point,
                 color: Color3(255, 255, 255, 255),
                 // Dim on purpose. Ambient alone already puts a pure-red layer at
@@ -559,10 +608,20 @@ mod tests {
         // surface moved in clip space leaves the 8x8 target and the readback is
         // then just clear colour. So the model matrix translates by `world` and
         // view_proj translates back: `clip` is unchanged, `world_pos` is not.
+        // Both by way of the player's frame, which the model matrix carries the
+        // surface (and its normal) into and the camera brings back from.
         let world = glam::Vec3::from(shot.world);
         let model = pipeline.create_model_uniform(&device);
-        model.upload(&queue, glam::Mat4::from_translation(world));
-        uniforms.upload(&queue, glam::Mat4::from_translation(-world), TEST_EYE, &ShadowUpload::disabled());
+        model.upload(&queue, to_player * glam::Mat4::from_translation(world));
+        uniforms.upload_scene(
+            &queue,
+            glam::Mat4::from_translation(-world) * to_world,
+            to_player.transform_point3(TEST_EYE),
+            &ShadowUpload::disabled(),
+            &crate::renderer::uniforms::SkyUpload::none(),
+            &crate::renderer::uniforms::PostUpload::default(),
+            &crate::renderer::uniforms::PlayerUpload { yaw: shot.yaw, offset, ..Default::default() },
+        );
 
         let v = |p: [f32; 3]| LayeredVertex {
             position: p,
@@ -682,6 +741,50 @@ mod tests {
                 }
             }
         };
+    }
+
+    /// THE ROCK STAYS ON THE ROCK WHEN THE PLAYER TURNS OR MOVES. A cave
+    /// reaches the shader, like everything, in the player's frame: turned by
+    /// every snap and stick turn and shifted with the rig. Its layers were
+    /// read at that frame's position and projected along that frame's axes,
+    /// so the rock's texture slid under a walking player and swapped planes
+    /// on a turn, and its bumps bent along the turned axes. The same wall,
+    /// lamp and eye in the world, at five turns and two rig offsets, must
+    /// give the same pixel.
+    #[test]
+    fn a_caves_rock_does_not_slide_or_turn_with_the_player() {
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+        let wall = glam::Vec3::new(0.9, 0.2, 0.4).normalize().to_array();
+        let world = [2.3, 0.6, -1.7];
+        let at = |yaw: f32, offset: [f32; 3]| {
+            render(Shot {
+                normal: wall,
+                world,
+                lit: true,
+                light_at: [world[0] + 1.5, world[1] + 1.0, world[2] + 2.0],
+                yaw,
+                offset,
+                layers: [ramp(), sized([0, 0, 255, 255]), sized([0, 255, 0, 255]), sized([255, 255, 255, 255])],
+                normals: [Some(sized([250, 128, 140, 255])), None, None, None],
+                ..Default::default()
+            })
+        };
+        let Some(still) = at(0.0, [0.0; 3]) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        for (yaw, offset) in [
+            (FRAC_PI_2, [0.0; 3]),
+            (PI, [0.0; 3]),
+            (-FRAC_PI_4, [0.0; 3]),
+            (1.0, [0.0; 3]),
+            (0.0, [0.37, 0.11, -0.23]),
+            (1.0, [-3.1, 0.2, 5.4]),
+        ] {
+            let px = at(yaw, offset).unwrap();
+            let worst = still.iter().zip(px).map(|(a, b)| (*a as i32 - b as i32).abs()).max().unwrap();
+            assert!(worst <= 1, "turned {yaw} rad, rig moved {offset:?}: {px:?} against {still:?}");
+        }
     }
 
     #[test]
