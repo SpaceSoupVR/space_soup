@@ -27,12 +27,41 @@ pub struct MeshVertex {
     /// can be emissive while the housing around it is not. How brightly, right
     /// now, is a separate per-object value -- see `ModelUniform`.
     pub emissive: u32,
+    /// The triangle's own patch of the lightmap atlas -- min u, min v, max u,
+    /// max v, unorm16 -- which `uv2` is clamped into before any lightmap read.
+    /// The same on all three corners, read flat.
+    ///
+    /// An MSAA edge pixel is shaded at its centre, which can lie outside the
+    /// triangle, so `uv2` arrives extrapolated past the triangle's chart. A
+    /// model gives every triangle its own chart, most of them 2x2 texels, so a
+    /// pixel off a tiny triangle read another triangle's chart, or the unused
+    /// atlas past the gutter, whose stationary mask is neutral -- FULLY LIT:
+    /// the wall sconce's plate, a mass of tiny triangles seen edge-on, showed
+    /// its bulb's light as dashed white specks (headset, 2026-10-01). A flat
+    /// bound costs nothing per pixel; centroid interpolation cost 0.75 ms
+    /// (see `mesh_shader_variant`). [`MeshVertex::WHOLE_ATLAS`] where the
+    /// mesh has no lightmap of its own.
+    pub uv2_rect: [u16; 4],
 }
 
 impl MeshVertex {
-    pub const ATTRIBS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
-        0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2, 4 => Uint32
+    pub const ATTRIBS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+        0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2, 4 => Uint32,
+        // 5 is the thin pass's second buffer. See `ThinVertex`.
+        6 => Unorm16x4
     ];
+
+    /// `uv2_rect` that clamps nothing.
+    pub const WHOLE_ATLAS: [u16; 4] = [0, 0, u16::MAX, u16::MAX];
+
+    /// `uv2_rect` for a triangle with these three lightmap coordinates: their
+    /// bounding box, rounded outward so the clamp never cuts into it.
+    pub fn uv2_rect_of(uv2: [[f32; 2]; 3]) -> [u16; 4] {
+        let s = u16::MAX as f32;
+        let lo = |k: usize| (uv2.iter().map(|c| c[k]).fold(f32::MAX, f32::min).clamp(0.0, 1.0) * s).floor() as u16;
+        let hi = |k: usize| (uv2.iter().map(|c| c[k]).fold(f32::MIN, f32::max).clamp(0.0, 1.0) * s).ceil() as u16;
+        [lo(0), lo(1), hi(0), hi(1)]
+    }
 
     /// Pack a linear 0..1 emissive colour into the vertex field.
     ///

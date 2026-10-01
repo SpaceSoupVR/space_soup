@@ -171,9 +171,12 @@ pub struct Levers {
     /// The least width, in eye pixels, the thin pass draws a model's wires,
     /// chain links and rims at, fading them by the share they really fill so
     /// their light is unchanged (see `mesh::thin_parts`). 0 draws them as
-    /// they are, among the opaque parts. 2 as shipped: a wire a third of a
-    /// pixel thick then holds its light to a few percent as it moves, where
-    /// 4x MSAA alone let it swing by a third (2026-10-01).
+    /// they are, among the opaque parts. At 2 a wire a third of a pixel thick
+    /// holds its light to a few percent as it moves, where 4x MSAA alone let
+    /// it swing by a third; 3 as shipped -- a near cage, its wires a pixel and
+    /// a half, stepped along their edges at 2, and 3 took 22% off its worst
+    /// shimmer (2.5: 12%) for 0.05 ms, the wires a little softer (headset,
+    /// 2026-10-01).
     pub thin_parts: f32,
     /// The CPU performance level asked of the runtime. `None` asks nothing,
     /// as shipped: the app keeps the level it started at. See
@@ -254,7 +257,7 @@ impl Default for Levers {
             floor_mirror: false,
             reflection_blur: true,
             character_cards: true,
-            thin_parts: 2.0,
+            thin_parts: 3.0,
             cpu_level: None,
             gpu_level: None,
             terrain_detail_distance: 0.0,

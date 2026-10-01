@@ -184,12 +184,20 @@ pub(crate) fn collect_node(
                         for (c, &idx) in indices.iter().enumerate() {
                             let i = idx as usize;
                             from.push(i);
+                            // The triangle's own chart, which its pixels'
+                            // `uv2` is clamped into (see `uv2_rect`).
+                            let t = c - c % 3;
+                            let rect = match corner_uv.get(t..t + 3) {
+                                Some(&[a, b, d]) => MeshVertex::uv2_rect_of([a, b, d]),
+                                _ => MeshVertex::WHOLE_ATLAS,
+                            };
                             v.push(MeshVertex {
                                 position: positions.get(i).copied().unwrap_or(Vec3::ZERO).into(),
                                 normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
                                 uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                                 uv2: corner_uv[c],
                                 emissive,
+                                uv2_rect: rect,
                             });
                         }
                         split_corners = from;
@@ -207,6 +215,7 @@ pub(crate) fn collect_node(
                             uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                             uv2: uv2s.get(i).copied().unwrap_or([0.0, 0.0]),
                             emissive,
+                            uv2_rect: MeshVertex::WHOLE_ATLAS,
                         })
                         .collect()
                 });

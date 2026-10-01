@@ -874,6 +874,15 @@ fn to_world_space(p: vec3<f32>) -> vec3<f32> {{
     return r + camera.player_frame.xyz;
 }}
 
+// `to_world_direction` undone: a direction baked in the world -- a lightmap's
+// bounce direction -- into the frame the normals and lights arrive in.
+fn to_player_direction(d: vec3<f32>) -> vec3<f32> {{
+    let yaw = camera.player_frame.w;
+    let s = sin(yaw);
+    let c = cos(yaw);
+    return vec3<f32>(c * d.x - s * d.z, d.y, s * d.x + c * d.z);
+}}
+
 // `to_world_space` undone.
 fn to_player_space(w: vec3<f32>) -> vec3<f32> {{
     let yaw = camera.player_frame.w;
@@ -1060,6 +1069,24 @@ fn set_stationary_masks(st_0: vec4<f32>, st_1: vec4<f32>, st_2: vec4<f32>, st_3:
     let st_pb = vec4<f32>(st_2.g, st_2.a, st_3.g, st_3.a) * range;
     let st_wa = max(max(st_pa, 0.5 * fwidth(st_da)), vec4<f32>(0.02));
     let st_wb = max(max(st_pb, 0.5 * fwidth(st_db)), vec4<f32>(0.02));
+    stationary_vis_a = smoothstep(-st_wa, st_wa, st_da);
+    stationary_vis_b = smoothstep(-st_wb, st_wb, st_db);
+}}
+// A MODEL'S masks, read exactly as baked: no widening by how fast the code
+// changes across the screen. A brush's mask is one continuous field, and
+// widening it there antialiases a shadow's edge; a model gives every triangle
+// a chart of its own, so its code jumps at every triangle -- and across a
+// sliver's quad, whose other pixels read other triangles' charts, a texel
+// baked fully hidden read up to 16% lit (`mesh_pipeline` GPU test
+// `a_hidden_texel_stays_hidden_beside_lit_ones`; 2026-10-01). Found while
+// chasing the sconce plate's white dashes, which were not this alone: see
+// `MeshVertex::uv2_rect`. The model bake gives its masks a full-width
+// penumbra already.
+fn set_stationary_masks_exact(st_0: vec4<f32>, st_1: vec4<f32>, st_2: vec4<f32>, st_3: vec4<f32>, range: f32) {{
+    let st_da = (vec4<f32>(st_0.r, st_0.b, st_1.r, st_1.b) - vec4<f32>(0.5)) * (2.0 * range);
+    let st_db = (vec4<f32>(st_2.r, st_2.b, st_3.r, st_3.b) - vec4<f32>(0.5)) * (2.0 * range);
+    let st_wa = max(vec4<f32>(st_0.g, st_0.a, st_1.g, st_1.a) * range, vec4<f32>(0.02));
+    let st_wb = max(vec4<f32>(st_2.g, st_2.a, st_3.g, st_3.a) * range, vec4<f32>(0.02));
     stationary_vis_a = smoothstep(-st_wa, st_wa, st_da);
     stationary_vis_b = smoothstep(-st_wb, st_wb, st_db);
 }}
@@ -4685,7 +4712,11 @@ fn shade_material_env_part(
     var bounce_dir = vec3<f32>(0.0);
     let has_dir = bd_len > MIN_BOUNCE_DIR_LENGTH;
     if (has_dir) {{
-        bounce_dir = bd / bd_len;
+        // Baked in the world; the normals and the view arrive in the player's
+        // frame. Read as it was stored, the bounce turned with every snap and
+        // stick turn: the hallway's rock 1% darker at 180 degrees, its gloss
+        // pointing the wrong way (headset bench, `NAME-yQ`, 2026-10-01).
+        bounce_dir = to_player_direction(bd / bd_len);
         // Energy-preserving by construction: the shaping factor averages to
         // exactly 1 over the sphere, so this redistributes the bounce across
         // normals without inventing or destroying any. It ranges over
