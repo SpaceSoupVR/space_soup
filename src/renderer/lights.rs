@@ -1178,7 +1178,11 @@ fn character_card_at(card: f32, uv: vec2<f32>, row: f32, res: f32, lod: f32, dim
 // two views. Read at the point inside the body rather than where the ray
 // enters its capsule: a capsule is fatter than the body it stands for, and
 // its surface seen from the side of the ray falls outside the body's outline
-// on the other card. -1 where the character has no cards this frame.
+// on the other card. -1 where the character has no cards this frame. The
+// cards are square to the WORLD (`character_cards::card_box`): `p` and `d`
+// come in the player's frame, which turns with the rig, and are turned back
+// to the world's axes here, so a snap or smooth turn changes nothing a
+// reflection shows.
 fn character_card_look(g: i32, p: vec3<f32>, d: vec3<f32>, t: f32, lobe: f32, eye: f32) -> vec4<f32> {{
     var own = -1;
     for (var k = 0; k < CHARACTER_CARD_SETS; k = k + 1) {{
@@ -1191,17 +1195,18 @@ fn character_card_look(g: i32, p: vec3<f32>, d: vec3<f32>, t: f32, lobe: f32, ey
     }}
     let centre = camera.character_cards[own * 2];
     let half = camera.character_cards[own * 2 + 1].xyz;
-    let uvw = clamp((p + d * t - centre.xyz) / half * 0.5 + vec3<f32>(0.5), vec3<f32>(0.0), vec3<f32>(1.0));
+    let w = to_world_direction(d);
+    let uvw = clamp(to_world_direction(p + d * t - centre.xyz) / half * 0.5 + vec3<f32>(0.5), vec3<f32>(0.0), vec3<f32>(1.0));
     let dims = vec2<f32>(textureDimensions(proxy_cards));
     let res = dims.x / 6.0;
     let footprint = max(t * lobe, pixel_footprint * (1.0 + t / eye));
     let texel = 2.0 * max(max(half.x, half.y), half.z) / res;
     let lod = clamp(log2(max(2.0 * footprint / texel, 1.0)), 0.0, CHARACTER_CARD_MAX_LOD);
     let row = (centre.w - 1.0) * res;
-    let k = d * d;
-    return k.x * character_card_at(select(1.0, 0.0, d.x < 0.0), uvw.yz, row, res, lod, dims)
-        + k.y * character_card_at(select(3.0, 2.0, d.y < 0.0), uvw.zx, row, res, lod, dims)
-        + k.z * character_card_at(select(5.0, 4.0, d.z < 0.0), uvw.xy, row, res, lod, dims);
+    let k = w * w;
+    return k.x * character_card_at(select(1.0, 0.0, w.x < 0.0), uvw.yz, row, res, lod, dims)
+        + k.y * character_card_at(select(3.0, 2.0, w.y < 0.0), uvw.zx, row, res, lod, dims)
+        + k.z * character_card_at(select(5.0, 4.0, w.z < 0.0), uvw.xy, row, res, lod, dims);
 }}
 
 // THE CHARACTERS IN A REFLECTION leaving `p` along `d` (player frame), over

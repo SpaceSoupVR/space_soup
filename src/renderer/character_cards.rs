@@ -28,8 +28,18 @@
 //! kinds of row alike: card `2a` looks in through the box's `+a` face and
 //! `2a + 1` through its `-a` face; `u` runs along axis `a + 1` and `v` along
 //! `a + 2`, `v = 0` the top row; the depth is 0 at the face a card looks
-//! through. The box is square to the player's frame, round the body's
-//! capsules -- which card sees the face does not matter, only that six do.
+//! through. The box is round the body's capsules and SQUARE TO THE WORLD, not
+//! to the player's frame, which turns with every snap or smooth turn of the
+//! rig. A reflection that shows the player to themselves leaves the
+//! reflecting surface square to it -- you see yourself where the mirror is
+//! nearest you -- and walls and floors are square to the world, so their
+//! rays meet the body along a card's axis and one card shows it exactly. A
+//! box square to the rig put the back wall's rays at 45 degrees to its cards
+//! after one snap turn: two orthographic views half each, the body twice,
+//! 20 cm apart -- crisp at load, smeared from the first turn on (headset,
+//! 2026-10-01: "the player reflection looked really bad then and it stayed
+//! bad after that"). A real turn of the body needs nothing: the cards draw
+//! the body as it stands.
 
 use glam::{Mat4, Vec3, Vec4};
 use wgpu::{
@@ -177,12 +187,23 @@ struct CardMesh {
     count: u32,
 }
 
-/// The box round character `g`'s capsules, padded by [`CARD_BOX_MARGIN`], as
-/// its centre and half size; `None` for a character with none.
-pub fn card_box(capsules: &CapsuleUpload, g: usize) -> Option<(Vec3, Vec3)> {
+/// The turn from the player's frame -- what the capsules and the body are
+/// drawn in -- to the cards' own, square to the world, for a rig turned by
+/// `yaw` (`PlayerUpload::yaw`). Only a turn: the cards' centre stays in the
+/// player's frame. The shaders' `to_world_direction`.
+pub fn card_turn(yaw: f32) -> glam::Quat {
+    glam::Quat::from_rotation_y(yaw)
+}
+
+/// The box round character `g`'s capsules, padded by [`CARD_BOX_MARGIN`] and
+/// square to the world for a rig turned by `yaw` (see the module notes): its
+/// centre in the player's frame, and its half size along the world's axes.
+/// `None` for a character with none.
+pub fn card_box(capsules: &CapsuleUpload, g: usize, yaw: f32) -> Option<(Vec3, Vec3)> {
     if g >= capsules.group_count as usize {
         return None;
     }
+    let turn = card_turn(yaw);
     let count = capsules.groups[g * 2 + 1][3] as usize;
     let mut lo = Vec3::splat(f32::MAX);
     let mut hi = Vec3::splat(f32::MIN);
@@ -191,6 +212,7 @@ pub fn card_box(capsules: &CapsuleUpload, g: usize) -> Option<(Vec3, Vec3)> {
         let (a, b) = (capsules.capsules[i * 2], capsules.capsules[i * 2 + 1]);
         let r = Vec3::splat(a[3]);
         for end in [Vec3::new(a[0], a[1], a[2]), Vec3::new(b[0], b[1], b[2])] {
+            let end = turn * end;
             lo = lo.min(end - r);
             hi = hi.max(end + r);
         }
@@ -199,13 +221,20 @@ pub fn card_box(capsules: &CapsuleUpload, g: usize) -> Option<(Vec3, Vec3)> {
         return None;
     }
     let (lo, hi) = (lo - CARD_BOX_MARGIN, hi + CARD_BOX_MARGIN);
-    Some(((lo + hi) * 0.5, ((hi - lo) * 0.5).max(Vec3::splat(0.05))))
+    Some((turn.inverse() * ((lo + hi) * 0.5), ((hi - lo) * 0.5).max(Vec3::splat(0.05))))
 }
 
-/// Card `k`'s view of the box `centre`, `half`: a point to the card's clip
-/// space -- x = 2u - 1, y = 1 - 2v, z = the depth from the face it looks
-/// through. See the module notes.
-pub fn card_matrix(k: usize, centre: Vec3, half: Vec3) -> Mat4 {
+/// Card `k`'s view of the box `centre`, `half` for a rig turned by `yaw` (see
+/// [`card_box`]): a point in the player's frame to the card's clip space --
+/// x = 2u - 1, y = 1 - 2v, z = the depth from the face it looks through. See
+/// the module notes.
+pub fn card_matrix(k: usize, centre: Vec3, half: Vec3, yaw: f32) -> Mat4 {
+    let turn = card_turn(yaw);
+    square_card_matrix(k, turn * centre, half) * Mat4::from_quat(turn)
+}
+
+/// [`card_matrix`] in the cards' own frame.
+fn square_card_matrix(k: usize, centre: Vec3, half: Vec3) -> Mat4 {
     let (a, from_plus) = (k / 2, k % 2 == 0);
     let (a1, a2) = ((a + 1) % 3, (a + 2) % 3);
     let axis = |i: usize| Vec3::AXES[i];
@@ -518,9 +547,9 @@ impl CharacterCards {
         Ok((width, height, texels))
     }
 
-    /// Draws the six cards of the body `parts` in the box `centre`, `half`,
-    /// from each part's [`simplify`]d copy; blurs
-    /// them; and copies every level into `atlas`'s `row`
+    /// Draws the six cards of the body `parts` in the box `centre`, `half` for
+    /// a rig turned by `yaw` ([`card_box`]), from each part's [`simplify`]d
+    /// copy; blurs them; and copies every level into `atlas`'s `row`
     /// (`proxy_cards::CardAtlas::character_rows`). `timer`: a pass timer's
     /// slot for the drawing and the next for the blur levels.
     #[allow(clippy::too_many_arguments)]
@@ -532,6 +561,7 @@ impl CharacterCards {
         mips: &MirrorMips,
         parts: &[CardPart],
         (centre, half): (Vec3, Vec3),
+        yaw: f32,
         atlas: &Texture,
         row: u32,
         timer: Option<(&crate::renderer::pass_timers::PassTimers, usize)>,
@@ -578,7 +608,7 @@ impl CharacterCards {
         }
         let mut bytes = vec![0u8; (CARD_STRIDE * CARD_FACES as u64) as usize];
         for k in 0..CARD_FACES {
-            let m = card_matrix(k, centre, half).to_cols_array();
+            let m = card_matrix(k, centre, half, yaw).to_cols_array();
             let at = k * CARD_STRIDE as usize;
             bytes[at..at + 64].copy_from_slice(bytemuck::cast_slice(&m));
         }
@@ -667,14 +697,23 @@ mod tests {
     /// The cards' frame is the fixtures': card 2a looks in through the +a
     /// face, u along a + 1, v along a + 2 from the top, depth 0 at the face
     /// it looks through -- what `probe_card_colour` and
-    /// `character_card_look` both read by.
+    /// `character_card_look` both read by -- along the WORLD's axes however
+    /// the rig is turned: a point placed by the world's axes round the box
+    /// lands where it would with the rig unturned.
     #[test]
     fn each_card_sees_the_box_as_the_lookup_reads_it() {
         let (centre, half) = (Vec3::new(1.0, 2.0, -3.0), Vec3::new(0.4, 0.9, 0.3));
-        for k in 0..CARD_FACES {
+        for (yaw, k) in [0.0f32, std::f32::consts::FRAC_PI_4, -1.3, 3.0]
+            .into_iter()
+            .flat_map(|yaw| (0..CARD_FACES).map(move |k| (yaw, k)))
+        {
+            // The box's centre in the player's frame; the rest is laid out
+            // from it along the world's axes.
+            let turn = card_turn(yaw);
+            let centre_seen = turn.inverse() * centre;
             let (a, plus) = (k / 2, k % 2 == 0);
             let (a1, a2) = ((a + 1) % 3, (a + 2) % 3);
-            let m = card_matrix(k, centre, half);
+            let m = card_matrix(k, centre_seen, half, yaw);
             // A point at (u, v) = (0.25, 0.75) of the card, on the face it
             // looks through and on the far one.
             let mut on_face = centre;
@@ -683,17 +722,20 @@ mod tests {
             on_face[a] += if plus { half[a] } else { -half[a] };
             let mut far = on_face;
             far[a] = 2.0 * centre[a] - on_face[a];
-            let (c, f) = (m.project_point3(on_face), m.project_point3(far));
+            let (c, f) = (
+                m.project_point3(turn.inverse() * on_face),
+                m.project_point3(turn.inverse() * far),
+            );
             let uv = |p: Vec3| ((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);
             let (u, v) = uv(c);
             assert!(
                 (u - 0.25).abs() < 1e-5 && (v - 0.75).abs() < 1e-5,
-                "card {k}: uv {:?}",
+                "card {k}, rig turned {yaw}: uv {:?}",
                 (u, v)
             );
             assert!(
                 c.z.abs() < 1e-5 && (f.z - 1.0).abs() < 1e-5,
-                "card {k}: depths {} and {}",
+                "card {k}, rig turned {yaw}: depths {} and {}",
                 c.z,
                 f.z
             );
@@ -746,8 +788,10 @@ mod tests {
     /// END TO END ON THE GPU: the box body drawn onto its cards by `record`
     /// -- its blur levels made and copied into an atlas's character rows --
     /// and read back by `capsule_reflection` in the lights block, with one
-    /// capsule standing for the body. A ray meeting a side takes that side's
-    /// colour; a ray the capsule's soft edge reaches but the body does not
+    /// capsule standing for the body -- with the rig unturned and turned
+    /// (the body and the rays square to the world, given to the shaders in
+    /// the player's frame, as a snap turn leaves them). A ray meeting a side
+    /// takes that side's colour; a ray the capsule's soft edge reaches but the body does not
     /// takes nothing; a ray between two axes mixes their two views; and a
     /// footprint wider than a texel reads the outline as blurred.
     #[test]
@@ -814,297 +858,306 @@ mod tests {
             (64, vec![0])
         );
 
-        let mut model = vec![0.0f32; 56];
-        model[..16].copy_from_slice(&Mat4::IDENTITY.to_cols_array());
-        let model_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&model),
-            usage: BufferUsages::UNIFORM,
-        });
-        let joints: Vec<f32> = (0..MAX_SKIN_JOINTS)
-            .flat_map(|_| Mat4::IDENTITY.to_cols_array())
-            .collect();
-        let joint_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&joints),
-            usage: BufferUsages::UNIFORM,
-        });
-        let colours: [[u8; 4]; 4] = [
-            [255, 0, 0, 255],
-            [0, 255, 0, 255],
-            [0, 0, 255, 255],
-            [255, 255, 255, 255],
-        ];
-        let tex = device.create_texture_with_data(
-            &queue,
-            &wgpu::TextureDescriptor {
+        // The body square to the world, and the rig turned under it as snap
+        // and smooth turns leave it: every turn shows the same reflection.
+        for yaw in [0.0f32, std::f32::consts::FRAC_PI_4, -std::f32::consts::FRAC_PI_2, 2.5] {
+            let mut model = vec![0.0f32; 56];
+            model[..16].copy_from_slice(&Mat4::from_quat(card_turn(yaw).inverse()).to_cols_array());
+            let model_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
-                size: wgpu::Extent3d {
-                    width: 4,
-                    height: 1,
-                    depth_or_array_layers: 1,
+                contents: bytemuck::cast_slice(&model),
+                usage: BufferUsages::UNIFORM,
+            });
+            let joints: Vec<f32> = (0..MAX_SKIN_JOINTS)
+                .flat_map(|_| Mat4::IDENTITY.to_cols_array())
+                .collect();
+            let joint_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&joints),
+                usage: BufferUsages::UNIFORM,
+            });
+            let colours: [[u8; 4]; 4] = [
+                [255, 0, 0, 255],
+                [0, 255, 0, 255],
+                [0, 0, 255, 255],
+                [255, 255, 255, 255],
+            ];
+            let tex = device.create_texture_with_data(
+                &queue,
+                &wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: 4,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
                 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            bytemuck::cast_slice(&colours),
-        );
-        let nearest = device.create_sampler(&Default::default());
-        let tex_view = tex.create_view(&Default::default());
-        let model_bg = device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &model_layout,
-            entries: &[BindGroupEntry {
-                binding: 0,
-                resource: model_buf.as_entire_binding(),
-            }],
-        });
-        let tex_bg = device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &texture_layout,
-            entries: &[
-                BindGroupEntry {
+                wgpu::util::TextureDataOrder::LayerMajor,
+                bytemuck::cast_slice(&colours),
+            );
+            let nearest = device.create_sampler(&Default::default());
+            let tex_view = tex.create_view(&Default::default());
+            let model_bg = device.create_bind_group(&BindGroupDescriptor {
+                label: None,
+                layout: &model_layout,
+                entries: &[BindGroupEntry {
                     binding: 0,
-                    resource: BindingResource::TextureView(&tex_view),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::Sampler(&nearest),
-                },
-            ],
-        });
-        let joint_bg = device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &joint_layout,
-            entries: &[BindGroupEntry {
-                binding: 0,
-                resource: joint_buf.as_entire_binding(),
-            }],
-        });
-        let (verts, index) = box_body();
-        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&verts),
-            usage: BufferUsages::VERTEX,
-        });
+                    resource: model_buf.as_entire_binding(),
+                }],
+            });
+            let tex_bg = device.create_bind_group(&BindGroupDescriptor {
+                label: None,
+                layout: &texture_layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::TextureView(&tex_view),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::Sampler(&nearest),
+                    },
+                ],
+            });
+            let joint_bg = device.create_bind_group(&BindGroupDescriptor {
+                label: None,
+                layout: &joint_layout,
+                entries: &[BindGroupEntry {
+                    binding: 0,
+                    resource: joint_buf.as_entire_binding(),
+                }],
+            });
+            let (verts, index) = box_body();
+            let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&verts),
+                usage: BufferUsages::VERTEX,
+            });
 
-        // One capsule down the body's middle, fatter than it front to back.
-        let mut caps = CapsuleUpload::default();
-        caps.group_count = 1;
-        caps.groups[0] = [0.0, 0.8, 0.0, 0.8];
-        caps.groups[1] = [0.5, 0.5, 0.5, 1.0];
-        caps.capsules[0] = [0.0, 0.2, 0.0, 0.2];
-        caps.capsules[1] = [0.0, 1.4, 0.0, 0.0];
-        let (centre, half) = card_box(&caps, 0).unwrap();
-        let row = atlas.character_rows[0];
-        let mut enc = device.create_command_encoder(&Default::default());
-        let part = CardPart {
-            model: &model_bg,
-            texture: &tex_bg,
-            joints: &joint_bg,
-            source: &vb,
-            vertices: &verts,
-            indices: &index,
-        };
-        cards.record(
-            &device,
-            &queue,
-            &mut enc,
-            &mips,
-            &[part],
-            (centre, half),
-            &atlas.texture,
-            row,
-            None,
-        );
-        queue.submit([enc.finish()]);
-        // The cards themselves: each one's middle the side it looks at, its
-        // corners empty -- the body is narrower than its box.
-        let (w, h, texels) = cards.read_back(&device, &queue).unwrap();
-        assert_eq!((w, h), (6 * 64, 64));
-        let at = |card: u32, x: u32, y: u32| texels[(y * w + card * 64 + x) as usize];
-        for (card, colour) in [
-            (0, [0.0, 0.0, 1.0, 1.0]),
-            (1, [0.0, 0.0, 1.0, 1.0]),
-            (2, [1.0; 4]),
-            (3, [1.0; 4]),
-            (4, [1.0, 0.0, 0.0, 1.0]),
-            (5, [0.0, 1.0, 0.0, 1.0]),
-        ] {
-            assert_eq!(at(card, 32, 32), colour, "card {card}'s middle");
-            assert_eq!(at(card, 0, 0), [0.0; 4], "card {card}'s corner");
-        }
+            // One capsule down the body's middle, fatter than it front to back.
+            let mut caps = CapsuleUpload::default();
+            caps.group_count = 1;
+            caps.groups[0] = [0.0, 0.8, 0.0, 0.8];
+            caps.groups[1] = [0.5, 0.5, 0.5, 1.0];
+            caps.capsules[0] = [0.0, 0.2, 0.0, 0.2];
+            caps.capsules[1] = [0.0, 1.4, 0.0, 0.0];
+            let (centre, half) = card_box(&caps, 0, yaw).unwrap();
+            let row = atlas.character_rows[0];
+            let mut enc = device.create_command_encoder(&Default::default());
+            let part = CardPart {
+                model: &model_bg,
+                texture: &tex_bg,
+                joints: &joint_bg,
+                source: &vb,
+                vertices: &verts,
+                indices: &index,
+            };
+            cards.record(
+                &device,
+                &queue,
+                &mut enc,
+                &mips,
+                &[part],
+                (centre, half),
+                yaw,
+                &atlas.texture,
+                row,
+                None,
+            );
+            queue.submit([enc.finish()]);
+            // The cards themselves: each one's middle the side it looks at, its
+            // corners empty -- the body is narrower than its box.
+            let (w, h, texels) = cards.read_back(&device, &queue).unwrap();
+            assert_eq!((w, h), (6 * 64, 64));
+            let at = |card: u32, x: u32, y: u32| texels[(y * w + card * 64 + x) as usize];
+            for (card, colour) in [
+                (0, [0.0, 0.0, 1.0, 1.0]),
+                (1, [0.0, 0.0, 1.0, 1.0]),
+                (2, [1.0; 4]),
+                (3, [1.0; 4]),
+                (4, [1.0, 0.0, 0.0, 1.0]),
+                (5, [0.0, 1.0, 0.0, 1.0]),
+            ] {
+                assert_eq!(at(card, 32, 32), colour, "card {card}'s middle, rig turned {yaw}");
+                assert_eq!(at(card, 0, 0), [0.0; 4], "card {card}'s corner, rig turned {yaw}");
+            }
 
-        let mut u: Uniforms = bytemuck::Zeroable::zeroed();
-        u.capsules = caps.capsules;
-        u.capsule_groups = caps.groups;
-        u.capsule_params = [1.0, -1.0, -1.0, 0.0];
-        u.character_cards = [
-            [centre.x, centre.y, centre.z, row as f32 + 1.0],
-            [half.x, half.y, half.z, 0.0],
-        ];
-        let code = format!(
-            "{}\n{}",
-            crate::renderer::lights::wgsl_lights_block(0, 1),
-            r#"
-@group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
-@group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
-@compute @workgroup_size(1)
-fn look_main(@builtin(global_invocation_id) id: vec3<u32>) {
-    pixel_footprint = rays[id.x * 2u].w;
-    // Lit by pi: the reflection is then the albedo it shows.
-    out[id.x] = capsule_reflection(rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz), 0.0, vec3<f32>(3.14159265), vec4<f32>(0.0));
-}
-"#
-        );
-        let module = device.create_shader_module(ShaderModuleDescriptor {
-            label: None,
-            source: ShaderSource::Wgsl(code.into()),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None,
-            layout: None,
-            module: &module,
-            entry_point: Some("look_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        // (from, direction, pixel footprint)
-        let rays: [(Vec3, Vec3, f32); 7] = [
-            (Vec3::new(0.0, 0.8, 2.0), Vec3::NEG_Z, 0.0),
-            (Vec3::new(0.0, 0.8, -2.0), Vec3::Z, 0.0),
-            (Vec3::new(2.0, 0.8, 0.0), Vec3::NEG_X, 0.0),
-            // Inside the capsule's soft edge, outside the body.
-            (Vec3::new(0.3, 0.8, 2.0), Vec3::NEG_Z, 0.0),
-            // Over the body's head, inside its box and its capsule's edge.
-            (Vec3::new(0.0, 1.63, 2.0), Vec3::NEG_Z, 0.0),
-            // Between two axes: the front's view and the side's, half each.
-            (Vec3::new(2.0, 0.8, 2.0), Vec3::new(-1.0, 0.0, -1.0), 0.0),
-            // At the body's edge with a footprint of a few texels.
-            (Vec3::new(0.2, 0.8, 2.0), Vec3::NEG_Z, 0.05),
-        ];
-        let packed: Vec<[f32; 4]> = rays
-            .iter()
-            .flat_map(|(p, d, f)| [[p.x, p.y, p.z, *f], [d.x, d.y, d.z, 0.0]])
-            .collect();
-        let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::bytes_of(&u),
-            usage: BufferUsages::UNIFORM,
-        });
-        let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&packed),
-            usage: BufferUsages::STORAGE,
-        });
-        let size = (rays.len() * 16) as u64;
-        let out_buf = device.create_buffer(&BufferDescriptor {
-            label: None,
-            size,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let read = device.create_buffer(&BufferDescriptor {
-            label: None,
-            size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
-        let g0 = device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: camera.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 6,
-                    resource: BindingResource::Sampler(&samp),
-                },
-                BindGroupEntry {
-                    binding: 12,
-                    resource: BindingResource::TextureView(&atlas.view),
-                },
-            ],
-        });
-        let g1 = device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(1),
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: ray_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: out_buf.as_entire_binding(),
-                },
-            ],
-        });
-        let mut enc = device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &g0, &[]);
-            pass.set_bind_group(1, &g1, &[]);
-            pass.dispatch_workgroups(rays.len() as u32, 1, 1);
+            let mut u: Uniforms = bytemuck::Zeroable::zeroed();
+            u.capsules = caps.capsules;
+            u.capsule_groups = caps.groups;
+            u.capsule_params = [1.0, -1.0, -1.0, 0.0];
+            u.player_frame = [0.0, 0.0, 0.0, yaw];
+            u.character_cards = [
+                [centre.x, centre.y, centre.z, row as f32 + 1.0],
+                [half.x, half.y, half.z, 0.0],
+            ];
+            let code = format!(
+                "{}\n{}",
+                crate::renderer::lights::wgsl_lights_block(0, 1),
+                r#"
+    @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
+    @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+    @compute @workgroup_size(1)
+    fn look_main(@builtin(global_invocation_id) id: vec3<u32>) {
+        pixel_footprint = rays[id.x * 2u].w;
+        // Lit by pi: the reflection is then the albedo it shows.
+        out[id.x] = capsule_reflection(rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz), 0.0, vec3<f32>(3.14159265), vec4<f32>(0.0));
+    }
+    "#
+            );
+            let module = device.create_shader_module(ShaderModuleDescriptor {
+                label: None,
+                source: ShaderSource::Wgsl(code.into()),
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: None,
+                module: &module,
+                entry_point: Some("look_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            // (from, direction, pixel footprint)
+            let rays: [(Vec3, Vec3, f32); 7] = [
+                (Vec3::new(0.0, 0.8, 2.0), Vec3::NEG_Z, 0.0),
+                (Vec3::new(0.0, 0.8, -2.0), Vec3::Z, 0.0),
+                (Vec3::new(2.0, 0.8, 0.0), Vec3::NEG_X, 0.0),
+                // Inside the capsule's soft edge, outside the body.
+                (Vec3::new(0.3, 0.8, 2.0), Vec3::NEG_Z, 0.0),
+                // Over the body's head, inside its box and its capsule's edge.
+                (Vec3::new(0.0, 1.63, 2.0), Vec3::NEG_Z, 0.0),
+                // Between two axes: the front's view and the side's, half each.
+                (Vec3::new(2.0, 0.8, 2.0), Vec3::new(-1.0, 0.0, -1.0), 0.0),
+                // At the body's edge with a footprint of a few texels.
+                (Vec3::new(0.2, 0.8, 2.0), Vec3::NEG_Z, 0.05),
+            ];
+            // Given in the world; in the player's frame, as the shaders get them.
+            let to_player = card_turn(yaw).inverse();
+            let packed: Vec<[f32; 4]> = rays
+                .iter()
+                .map(|(p, d, f)| (to_player * *p, to_player * *d, f))
+                .flat_map(|(p, d, f)| [[p.x, p.y, p.z, *f], [d.x, d.y, d.z, 0.0]])
+                .collect();
+            let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::bytes_of(&u),
+                usage: BufferUsages::UNIFORM,
+            });
+            let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&packed),
+                usage: BufferUsages::STORAGE,
+            });
+            let size = (rays.len() * 16) as u64;
+            let out_buf = device.create_buffer(&BufferDescriptor {
+                label: None,
+                size,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let read = device.create_buffer(&BufferDescriptor {
+                label: None,
+                size,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
+            let g0 = device.create_bind_group(&BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: camera.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 6,
+                        resource: BindingResource::Sampler(&samp),
+                    },
+                    BindGroupEntry {
+                        binding: 12,
+                        resource: BindingResource::TextureView(&atlas.view),
+                    },
+                ],
+            });
+            let g1 = device.create_bind_group(&BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(1),
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: ray_buf.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: out_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &g0, &[]);
+                pass.set_bind_group(1, &g1, &[]);
+                pass.dispatch_workgroups(rays.len() as u32, 1, 1);
+            }
+            enc.copy_buffer_to_buffer(&out_buf, 0, &read, 0, size);
+            queue.submit([enc.finish()]);
+            read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            let got: Vec<[f32; 4]> =
+                bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+            for (i, g) in got.iter().enumerate() {
+                eprintln!("rig turned {yaw}, ray {i}: {g:?}");
+            }
+            let near =
+                |a: [f32; 4], b: [f32; 4], tol: f32| a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol);
+            assert!(
+                near(got[0], [1.0, 0.0, 0.0, 1.0], 0.01),
+                "front, rig turned {yaw}: {:?}",
+                got[0]
+            );
+            assert!(
+                near(got[1], [0.0, 1.0, 0.0, 1.0], 0.01),
+                "back, rig turned {yaw}: {:?}",
+                got[1]
+            );
+            assert!(
+                near(got[2], [0.0, 0.0, 1.0, 1.0], 0.01),
+                "side, rig turned {yaw}: {:?}",
+                got[2]
+            );
+            assert!(
+                near(got[3], [0.0; 4], 0.01),
+                "beside the body, rig turned {yaw}: {:?}",
+                got[3]
+            );
+            assert!(near(got[4], [0.0; 4], 0.01), "over its head, rig turned {yaw}: {:?}", got[4]);
+            assert!(
+                near(got[5], [0.5, 0.0, 0.5, 1.0], 0.02),
+                "between two axes, rig turned {yaw}: {:?}",
+                got[5]
+            );
+            let edge = got[6];
+            assert!(
+                edge[3] > 0.3 && edge[3] < 0.7,
+                "a blurred outline, rig turned {yaw}: {edge:?}"
+            );
+            assert!(
+                (edge[0] / edge[3] - 1.0).abs() < 0.02 && edge[1] < 0.01 && edge[2] < 0.01,
+                "the front's colour, rig turned {yaw}: {edge:?}"
+            );
         }
-        enc.copy_buffer_to_buffer(&out_buf, 0, &read, 0, size);
-        queue.submit([enc.finish()]);
-        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        let got: Vec<[f32; 4]> =
-            bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
-        for (i, g) in got.iter().enumerate() {
-            eprintln!("ray {i}: {g:?}");
-        }
-        let near =
-            |a: [f32; 4], b: [f32; 4], tol: f32| a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol);
-        assert!(
-            near(got[0], [1.0, 0.0, 0.0, 1.0], 0.01),
-            "front: {:?}",
-            got[0]
-        );
-        assert!(
-            near(got[1], [0.0, 1.0, 0.0, 1.0], 0.01),
-            "back: {:?}",
-            got[1]
-        );
-        assert!(
-            near(got[2], [0.0, 0.0, 1.0, 1.0], 0.01),
-            "side: {:?}",
-            got[2]
-        );
-        assert!(
-            near(got[3], [0.0; 4], 0.01),
-            "beside the body: {:?}",
-            got[3]
-        );
-        assert!(near(got[4], [0.0; 4], 0.01), "over its head: {:?}", got[4]);
-        assert!(
-            near(got[5], [0.5, 0.0, 0.5, 1.0], 0.02),
-            "between two axes: {:?}",
-            got[5]
-        );
-        let edge = got[6];
-        assert!(
-            edge[3] > 0.3 && edge[3] < 0.7,
-            "a blurred outline: {edge:?}"
-        );
-        assert!(
-            (edge[0] / edge[3] - 1.0).abs() < 0.02 && edge[1] < 0.01 && edge[2] < 0.01,
-            "the front's colour: {edge:?}"
-        );
     }
 
     /// What clustering must keep: a box's faces, each its own UV island,
@@ -1150,14 +1203,14 @@ fn look_main(@builtin(global_invocation_id) id: vec3<u32>) {
     #[test]
     fn the_box_holds_the_body_with_its_margin() {
         let mut caps = CapsuleUpload::default();
-        assert!(card_box(&caps, 0).is_none());
+        assert!(card_box(&caps, 0, 0.0).is_none());
         caps.group_count = 1;
         caps.groups[1] = [0.5, 0.5, 0.5, 2.0];
         caps.capsules[0] = [0.0, 0.2, 0.0, 0.1];
         caps.capsules[1] = [0.0, 1.6, 0.0, 0.0];
         caps.capsules[2] = [0.3, 1.3, 0.1, 0.05];
         caps.capsules[3] = [0.7, 1.3, 0.1, 0.0];
-        let (c, h) = card_box(&caps, 0).unwrap();
+        let (c, h) = card_box(&caps, 0, 0.0).unwrap();
         let (lo, hi) = (c - h, c + h);
         let m = CARD_BOX_MARGIN;
         assert!(
@@ -1173,6 +1226,18 @@ fn look_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 .max_element()
                 < 1e-5,
             "{hi}"
+        );
+        // The rig turned a quarter: the arm along the player's +x lies along
+        // the world's -z, and the box is square to the world round it, its
+        // centre still given in the player's frame.
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let (c, h) = card_box(&caps, 0, quarter).unwrap();
+        let world_c = card_turn(quarter) * c;
+        let (lo, hi) = (world_c - h, world_c + h);
+        assert!(
+            (lo - Vec3::new(-0.1 - m, 0.1 - m, -0.75 - m)).abs().max_element() < 1e-5
+                && (hi - Vec3::new(0.15 + m, 1.7 + m, 0.1 + m)).abs().max_element() < 1e-5,
+            "turned a quarter: {lo} to {hi}"
         );
     }
 }

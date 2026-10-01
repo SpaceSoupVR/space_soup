@@ -33,6 +33,12 @@ use serde::{Deserialize, Serialize};
 /// over the rig's origin, which is then where a standing player's feet are.
 pub const TRACKED_EYE_HEIGHT: f32 = 1.6;
 
+/// How long one full sway takes, side to side and back. See `BenchPose::sway`.
+pub const SWAY_PERIOD_SECONDS: f32 = 4.0;
+
+/// The widest sway a pose may ask for, metres each way.
+pub const MAX_SWAY: f32 = 1.0;
+
 /// The spacing given to the eyes when the runtime's own poses mean nothing.
 /// The adult average; the headset's is used whenever it is known.
 pub const FALLBACK_IPD: f32 = 0.063;
@@ -48,6 +54,22 @@ pub struct BenchPose {
     pub eye: [f32; 3],
     /// What they look at, in world metres.
     pub at: [f32; 3],
+    /// The rig's turn, degrees, where it should not simply face `at`: the
+    /// same view reached with the rig turned -- as a snap turn leaves it --
+    /// and the head turned back by the difference. Absent: the rig faces the
+    /// view, as it always has. Everything drawn in the player's frame turns
+    /// with the rig, so the same view at two turns isolates a frame bug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rig_yaw: Option<f32>,
+    /// A head that sways, metres each way: the eye glides along the view's
+    /// own level right axis and back, once every [`SWAY_PERIOD_SECONDS`],
+    /// still looking at `at` -- the drift of a head held nearly still, for
+    /// watching what moves with it: reflections on polished stone, and the
+    /// frames SpaceWarp makes between the rendered ones, which a still view
+    /// never shows (the user, 2026-10-01: reflections still jitter). Absent:
+    /// still.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sway: Option<f32>,
 }
 
 impl BenchPose {
@@ -62,6 +84,12 @@ impl BenchPose {
         if (Vec3::from(self.at) - Vec3::from(self.eye)).length_squared() < 1e-6 {
             return Some(format!("bench '{}' looks at its own eye", self.name));
         }
+        if self.rig_yaw.is_some_and(|y| !y.is_finite()) {
+            return Some(format!("bench '{}' has a rig_yaw that is not a number", self.name));
+        }
+        if self.sway.is_some_and(|s| !(0.0..=MAX_SWAY).contains(&s)) {
+            return Some(format!("bench '{}' sways by {:?} m: 0 to {MAX_SWAY} m", self.name, self.sway));
+        }
         None
     }
 }
@@ -75,13 +103,20 @@ pub struct BenchRig {
     pub yaw: f32,
     /// The tracked head, in the rig's own (stage) space.
     pub head_position: Vec3,
-    /// Its orientation there: pitch only, since the yaw is the rig's.
+    /// Its orientation there: pitch only, since the yaw is the rig's -- or,
+    /// with `BenchPose::rig_yaw`, the rest of the view's turn and the pitch.
     pub head_rotation: Quat,
 }
 
 impl BenchRig {
     pub fn for_pose(pose: &BenchPose) -> Self {
-        let eye = Vec3::from(pose.eye);
+        Self::for_pose_at(pose, 0.0)
+    }
+
+    /// The rig `seconds` into a swaying pose's sway (`BenchPose::sway`); a
+    /// still pose's at any time.
+    pub fn for_pose_at(pose: &BenchPose, seconds: f32) -> Self {
+        let eye = Vec3::from(pose.eye) + sway_offset(pose, seconds);
         let dir = (Vec3::from(pose.at) - eye).normalize_or(Vec3::NEG_Z);
         // `from_rotation_y(yaw) * -Z` is `(-sin yaw, 0, -cos yaw)`. Straight up
         // or down has no heading at all; any yaw is then right, so zero.
@@ -89,15 +124,27 @@ impl BenchRig {
         // `from_rotation_x(pitch) * -Z` is `(0, sin pitch, -cos pitch)`.
         let pitch = dir.y.clamp(-1.0, 1.0).asin();
         let head_position = Vec3::new(0.0, TRACKED_EYE_HEIGHT, 0.0);
+        // A rig turned otherwise: the head turns back by the difference, so the
+        // eyes still face `at`.
+        let rig = pose.rig_yaw.map_or(yaw, f32::to_radians);
         Self {
             // The yaw turns about the vertical, which leaves the head's height
             // where it is: the head lands exactly on `eye`.
             offset: eye - head_position,
-            yaw,
+            yaw: rig,
             head_position,
-            head_rotation: Quat::from_rotation_x(pitch),
+            head_rotation: Quat::from_rotation_y(yaw - rig) * Quat::from_rotation_x(pitch),
         }
     }
+}
+
+/// Where a swaying pose's eye has glided to, `seconds` in: along the level
+/// right axis of its unswayed view.
+fn sway_offset(pose: &BenchPose, seconds: f32) -> Vec3 {
+    let Some(amplitude) = pose.sway else { return Vec3::ZERO };
+    let dir = Vec3::from(pose.at) - Vec3::from(pose.eye);
+    let right = dir.cross(Vec3::Y).try_normalize().unwrap_or(Vec3::X);
+    right * amplitude * (std::f32::consts::TAU * seconds / SWAY_PERIOD_SECONDS).sin()
 }
 
 /// The two eyes of the real head, moved onto the pinned one.
@@ -147,7 +194,7 @@ mod tests {
     use super::*;
 
     fn pose(eye: [f32; 3], at: [f32; 3]) -> BenchPose {
-        BenchPose { name: "t".into(), eye, at }
+        BenchPose { name: "t".into(), eye, at, rig_yaw: None, sway: None }
     }
 
     /// Through the same transform the app puts every tracked pose through:
@@ -175,6 +222,44 @@ mod tests {
             // Level: no roll, so the view's right axis stays horizontal.
             assert!((q * Vec3::X).y.abs() < 1e-5, "the view is rolled for {eye:?} -> {at:?}");
         }
+    }
+
+    /// A rig turned as a snap turn leaves it sees the same view: same eye,
+    /// same target, no roll -- only the player's frame has turned.
+    #[test]
+    fn a_turned_rig_still_stands_at_the_eye_and_looks_at_the_target() {
+        let (eye, at) = ([-1.0, 1.6, -14.84], [-1.0, 1.45, -15.7]);
+        for turn in [0.0f32, 45.0, -90.0, 180.0] {
+            let rig = BenchRig::for_pose(&BenchPose { rig_yaw: Some(turn), ..pose(eye, at) });
+            assert!((rig.yaw - turn.to_radians()).abs() < 1e-6, "rig turned {} for {turn}", rig.yaw.to_degrees());
+            let (p, q) = to_world(&rig, rig.head_position, rig.head_rotation);
+            assert!((p - Vec3::from(eye)).length() < 1e-4, "head at {p} at turn {turn}");
+            let want = (Vec3::from(at) - Vec3::from(eye)).normalize();
+            assert!((q * Vec3::NEG_Z).dot(want) > 0.99999, "at turn {turn} looking along {}", q * Vec3::NEG_Z);
+            assert!((q * Vec3::X).y.abs() < 1e-5, "the view is rolled at turn {turn}");
+        }
+    }
+
+    /// A swaying head glides side to side along the view's right axis, a
+    /// full sway every period, and keeps looking at the target, level; still
+    /// at the start, half way and at the end of each sway.
+    #[test]
+    fn a_swaying_head_glides_sideways_and_keeps_looking_at_the_target() {
+        let (eye, at) = ([0.3, 1.6, -3.0], [0.0, 0.9, -7.0]);
+        let swaying = BenchPose { sway: Some(0.1), ..pose(eye, at) };
+        let right = (Vec3::from(at) - Vec3::from(eye)).cross(Vec3::Y).normalize();
+        for (t, out) in [(0.0, 0.0), (0.25, 0.1), (0.5, 0.0), (0.75, -0.1), (1.0, 0.0)] {
+            let rig = BenchRig::for_pose_at(&swaying, t * SWAY_PERIOD_SECONDS);
+            let (p, q) = to_world(&rig, rig.head_position, rig.head_rotation);
+            let want = Vec3::from(eye) + right * out;
+            assert!((p - want).length() < 1e-4, "at {t} of a sway the head is at {p}, not {want}");
+            let look = (Vec3::from(at) - p).normalize();
+            assert!((q * Vec3::NEG_Z).dot(look) > 0.99999, "at {t} of a sway the head looks away");
+            assert!((q * Vec3::X).y.abs() < 1e-5, "the swaying view is rolled at {t}");
+        }
+        assert_eq!(BenchRig::for_pose_at(&pose(eye, at), 1.3), BenchRig::for_pose(&pose(eye, at)), "a still pose moved");
+        assert!(BenchPose { sway: Some(-0.1), ..pose(eye, at) }.problem().is_some());
+        assert!(BenchPose { sway: Some(f32::NAN), ..pose(eye, at) }.problem().is_some());
     }
 
     #[test]

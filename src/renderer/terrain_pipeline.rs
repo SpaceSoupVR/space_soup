@@ -310,11 +310,17 @@ pub fn terrain_shader_for(role: TerrainRole) -> String {
             let src = src.replacen(&plain_lights, &read_lights, 1).replacen(
                 shade,
                 &format!(
-                    "    // From the half-resolution probe pass, as the brushes read it. See\n    // `brush_pipeline::probe_pass`.\n    let probe_pass_tolerance = max(4.0 * fwidth(in.clip.z), 1e-6);\n    probe_env_given = probe_pass_upsample(in.clip.xy, in.clip.z, probe_pass_tolerance);\n{shade}"
+                    "    // From the half-resolution probe pass, as the brushes read it. See\n    // `brush_pipeline::probe_pass`.\n    let probe_pass_tolerance = max(4.0 * fwidth(in.clip.z), 1e-6);\n    probe_env_given = probe_pass_upsample(in.clip.xy, in.clip.z, probe_pass_tolerance, 0.0);\n{shade}"
                 ),
                 1,
             );
-            format!("{src}{}", crate::renderer::brush_pipeline::probe_pass::READER_WGSL)
+            // The ground writes no face code (`probe_pass::targets(false)`), so
+            // it reads with none: 0, which every texel matches.
+            format!(
+                "{src}{}{}",
+                crate::renderer::brush_pipeline::probe_pass::READER_WGSL,
+                crate::renderer::brush_pipeline::probe_pass::FACE_CODE_WGSL,
+            )
         }
         TerrainRole::ProbePass => {
             let pass_lights = terrain_lights_block(crate::renderer::lights::LightsBlockOptions {
