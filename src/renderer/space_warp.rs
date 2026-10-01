@@ -723,6 +723,35 @@ mod tests {
         assert!(mv.x > 0.005, "{mv}");
     }
 
+    /// A SMOOTH STICK TURN is in the vectors too: the head holds still in the
+    /// tracking space while the space turns under it, so nothing in the
+    /// camera moved, and every still point of the world must still be carried
+    /// across the screen exactly as far as the turn carried it. Five degrees
+    /// a frame (180 a second at 36), from anywhere, facing anywhere.
+    #[test]
+    fn a_smooth_stick_turn_is_in_the_vectors() {
+        let w2p = |offset: Vec3, yaw: f32| Mat4::from_quat(Quat::from_rotation_y(yaw).inverse()) * Mat4::from_translation(-offset);
+        let vp = view_proj(Vec3::new(0.0, 1.6, 0.0), 0.0);
+        let ndc = |m: Mat4, p: Vec3| {
+            let c = m * p.extend(1.0);
+            c.truncate() / c.w
+        };
+        for (at, facing) in [(Vec3::ZERO, 0.0f32), (Vec3::new(3.0, 0.0, -7.0), 2.5)] {
+            for turn in [5.0f32, -5.0] {
+                let prev_w2p = w2p(at, facing);
+                let now_w2p = w2p(at, facing + turn.to_radians());
+                // A still point a few metres ahead of the player, now.
+                let world = now_w2p.inverse().transform_point3(Vec3::new(0.8, 1.4, -4.0));
+                let p = now_w2p.transform_point3(world);
+                let mv = motion_vector(vp, previous_clip(vp, prev_w2p, now_w2p), p);
+                let moved = ndc(vp * now_w2p, world) - ndc(vp * prev_w2p, world);
+                assert!((mv - moved).length() < 1e-4, "turn {turn} at {at}: {mv} vs {moved}");
+                // Turning left (positive yaw) slides the world right.
+                assert!(mv.x * turn > 0.01, "turn {turn}: {mv}");
+            }
+        }
+    }
+
     /// `appSpaceDeltaPose` is where this frame's tracking space sits in last
     /// frame's: half a metre forward is (0, 0, -0.5); a turn is the turn.
     #[test]

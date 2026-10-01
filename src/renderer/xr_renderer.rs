@@ -1926,6 +1926,12 @@ impl XrRenderer {
             _ => &self.mesh_pipeline.pipeline,
         }
     }
+    fn sp_mesh_thin(&self, stereo: bool) -> &wgpu::RenderPipeline {
+        match (stereo, &self.stereo_pipelines) {
+            (true, Some(p)) => &p.mesh.thin_pipeline,
+            _ => &self.mesh_pipeline.thin_pipeline,
+        }
+    }
     fn sp_skinned(&self, stereo: bool) -> &wgpu::RenderPipeline {
         match (stereo, &self.stereo_pipelines) {
             (true, Some(p)) => &p.skinned_mesh.pipeline,

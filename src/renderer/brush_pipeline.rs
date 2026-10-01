@@ -3280,6 +3280,7 @@ struct VOut {{
                 probe_face_always: pass_like,
                 defer_secondary: probe == BrushProbe::PassDeferred,
                 cull_range_first: false,
+                card_tests_filtered: false,
             },
         ),
         ssr_block = ssr_block,

@@ -6,6 +6,7 @@ use std::path::Path;
 mod node;
 mod skin;
 mod texture;
+mod thin_parts;
 mod vertex;
 
 pub use skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, GltfSkin, SkinnedMeshPrimitive, MAX_SKIN_JOINTS};
@@ -15,6 +16,7 @@ pub use texture::{
     LIGHTMAP_MIP_LEVELS, NEUTRAL_BOUNCE_DIRECTION, NEUTRAL_SUN_MASK, SUN_MASK_MIP_LEVELS,
 };
 pub use vertex::{MeshPrimitive, MeshVertex, SkinnedMeshVertex};
+pub use thin_parts::{split_thin_parts, ThinParts, ThinSplit, ThinVertex, THIN_ALTITUDE_FACTOR, THIN_RADIUS_MAX};
 
 use node::{ancestor_joint_and_baked_local, collect_node};
 

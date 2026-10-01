@@ -227,7 +227,18 @@ const FIXUP_DEPTH_TOLERANCE: f32 = {tolerance:?};
 // outline to its texels. A ray that finds nothing keeps the texel's own
 // colour. The grid is turned a quarter each ray rather than read from an
 // array, which Adreno puts in scratch memory when a loop indexes it.
-fn probe_subsample(primary: vec4<f32>, world_pos: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, probe_lod: f32, trace_room: f32) -> vec4<f32> {{
+//
+// A texel marked `PROBE_RETEST` -- on a model's cards, away from its outlines
+// -- takes its one ray again instead: its colour is what this pass's filtered
+// card tests make of it.
+fn probe_subsample(primary: vec4<f32>, world_pos: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, probe_lod: f32, trace_room: f32, retest: bool) -> vec4<f32> {{
+    if (retest) {{
+        let h = probe_trace(world_pos, d, trace_room, roughness);
+        if (h.found) {{
+            return probe_traced_colour(h, d, roughness, dir, probe_lod);
+        }}
+        return primary;
+    }}
     let spread = 2.0 * max(probe_lobe_tan(roughness), PROBE_EDGE_FOOTPRINTS * pixel_footprint / max(probe_eye_distance, 0.05));
     let a = normalize(cross(d, select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(d.y) > 0.9)));
     let b = cross(d, a);
@@ -270,7 +281,10 @@ fn fixup(@builtin(global_invocation_id) id: vec3<u32>) {{
     hit.edge_code = bitcast<i32>(f.codes.y);
     var primary = f.col;
     if (hit.edge_code >= 0 && hit.edge_cover < 0.0) {{
-        primary = probe_subsample(f.col, f.from_pos.xyz, f.dir_world.xyz, f.dir_given.xyz, f.dir_world.w, f.dir_given.w, f.from_pos.w);
+        primary = probe_subsample(
+            f.col, f.from_pos.xyz, f.dir_world.xyz, f.dir_given.xyz, f.dir_world.w, f.dir_given.w, f.from_pos.w,
+            hit.edge_cover < 0.5 * (PROBE_SUBSAMPLE + PROBE_RETEST),
+        );
     }}
     var col = probe_secondary(
         hit, primary, f.from_pos.xyz, f.dir_world.xyz, f.dir_given.xyz, f.dir_world.w, f.dir_given.w, f.from_pos.w,
@@ -294,7 +308,13 @@ fn fixup(@builtin(global_invocation_id) id: vec3<u32>) {{
     textureStore(probe_out, texel, vec4<f32>(probe_pass_compress(col.rgb * 1.0) * a, a));
 }}
 "#,
-        lights = super::lights::wgsl_lights_block(0, 1),
+        // Every texel meeting a model on cards comes through here, so its
+        // cards' trust is filtered here. See `PROBE_CARD_TESTS_FILTERED`.
+        lights = super::lights::wgsl_lights_block_with(
+            0,
+            1,
+            super::lights::LightsBlockOptions { card_tests_filtered: true, ..Default::default() },
+        ),
         record = RECORD_WGSL,
         tolerance = DEPTH_TOLERANCE,
         blend = floor_mirror_blend_wgsl(),
