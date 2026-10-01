@@ -351,7 +351,7 @@ fn roughness_chain_with_normal_variance(
     rough_levels
 }
 
-fn mip_chain(img: &TerrainImage, srgb: bool) -> Vec<TerrainImage> {
+pub(crate) fn mip_chain(img: &TerrainImage, srgb: bool) -> Vec<TerrainImage> {
     let to_linear = |b: u8| {
         let c = b as f32 / 255.0;
         if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }

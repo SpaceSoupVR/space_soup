@@ -169,6 +169,12 @@ pub struct Levers {
     /// Metres past which the terrain's layer normal maps fade out; 0 keeps
     /// them everywhere. See `terrain_pipeline` (`post_params.z`).
     pub terrain_detail_distance: f32,
+    /// MEASUREMENT: the right eye drawn from the LEFT eye's view -- its pose
+    /// and field of view -- so the two finished images must match texel for
+    /// texel; any difference is state one eye's passes keep and the other's
+    /// do not (user, 2026-09-30: "one eye pass that is not doing something the
+    /// same as the other"). Capture both with `bench.py --eye-capture`.
+    pub same_eyes: bool,
     /// MEASUREMENT: the probe pass drawn with one of its register cuts
     /// (`brush_pipeline::DEFERRED_REGISTER_CUTS`, e.g. `def_cut_characters`)
     /// -- what a part costs by its PRESENCE in the shader, which a runtime
@@ -233,6 +239,7 @@ impl Default for Levers {
             cpu_level: None,
             gpu_level: None,
             terrain_detail_distance: 0.0,
+            same_eyes: false,
             pass_cut: None,
             scene_cut: None,
             gpu_sync: false,
@@ -331,6 +338,7 @@ impl Levers {
         flag("terminator_aa", self.terminator_aa, d.terminator_aa);
         flag("floor_mirror", self.floor_mirror, d.floor_mirror);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
+        flag("same_eyes", self.same_eyes, d.same_eyes);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
         flag("ab_cycle", self.ab_cycle, d.ab_cycle);
