@@ -322,6 +322,28 @@ pub fn app_space_delta_rigid(prev_world_to_player: Mat4, world_to_player: Mat4) 
     (rotation, translation)
 }
 
+/// A LOCOMOTION JUMP the compositor must not carry on: a snap turn or a
+/// teleport. Its frame's motion vectors hold the whole jump -- every pixel of
+/// a 45 degree snap thrown to [`MAX_NDC_MOTION`] -- and the frame synthesised
+/// from them threw the world on by half of that again, once at every snap,
+/// for players who turn by stick rather than by turning round (user,
+/// 2026-10-01: snap turns, smooth turns and physical turns must all hold).
+/// The spec's answer is `XR_COMPOSITION_LAYER_SPACE_WARP_INFO_FRAME_SKIP_BIT_FB`
+/// on that frame: no synthesis from it. Smooth turning and walking stay far
+/// under the bounds -- 180 degrees a second is 5 a frame at 36 frames a
+/// second, a sprint 0.1 m -- so only a jump skips.
+pub fn locomotion_jumped(prev_world_to_player: Mat4, world_to_player: Mat4) -> bool {
+    let (r, t) = app_space_delta_rigid(prev_world_to_player, world_to_player);
+    r.angle_between(glam::Quat::IDENTITY) > JUMP_TURN_DEGREES.to_radians() || t.length() > JUMP_METRES
+}
+
+/// How far locomotion may turn the player in one frame and still be motion:
+/// see [`locomotion_jumped`].
+pub const JUMP_TURN_DEGREES: f32 = 15.0;
+
+/// How far it may carry them: see [`locomotion_jumped`].
+pub const JUMP_METRES: f32 = 0.5;
+
 /// [`app_space_delta_rigid`] as the `XrPosef` the layer info carries.
 #[cfg(target_os = "android")]
 pub fn app_space_delta(prev_world_to_player: Mat4, world_to_player: Mat4) -> xr::Posef {
@@ -716,6 +738,27 @@ mod tests {
         assert!(r.angle_between(Quat::IDENTITY) < 1e-5 && t.length() < 1e-5, "{r} {t}");
     }
 
+    /// A SNAP TURN OR A TELEPORT IS A JUMP, and no extrapolation may cross it;
+    /// smooth turning and walking at any sensible speed are motion. Each from
+    /// anywhere, facing anywhere: the jump is the change, not the pose.
+    #[test]
+    fn snap_turns_and_teleports_skip_synthesis_and_smooth_motion_does_not() {
+        let w2p = |offset: Vec3, yaw: f32| Mat4::from_quat(Quat::from_rotation_y(yaw).inverse()) * Mat4::from_translation(-offset);
+        for (at, facing) in [(Vec3::ZERO, 0.0f32), (Vec3::new(3.0, 0.0, -7.0), 2.5), (Vec3::new(-1.0, 0.2, 4.0), -1.0)] {
+            let before = w2p(at, facing);
+            let jump = |offset: Vec3, turn_degrees: f32| locomotion_jumped(before, w2p(at + offset, facing + turn_degrees.to_radians()));
+            for snap in [30.0, 45.0, -45.0, 90.0, 180.0] {
+                assert!(jump(Vec3::ZERO, snap), "a {snap} degree snap at {at} facing {facing}");
+            }
+            assert!(jump(Vec3::new(2.0, 0.0, -1.0), 0.0), "a teleport");
+            // Smooth turning: 180 degrees a second at 36 frames a second.
+            assert!(!jump(Vec3::ZERO, 5.0) && !jump(Vec3::ZERO, -5.0), "a smooth turn");
+            // Walking and sprinting, turning as they go.
+            assert!(!jump(Vec3::new(0.04, 0.0, -0.03), 2.0) && !jump(Vec3::new(0.1, 0.0, 0.0), -4.0), "walking");
+            assert!(!jump(Vec3::ZERO, 0.0), "standing still");
+        }
+    }
+
     /// A floor mirror: the image of a point it reflects lies on the view ray,
     /// as far below the floor as the point is above it -- and that image, not
     /// the floor, is what the reflection moves as.
@@ -827,7 +870,10 @@ mod tests {
         };
         let eye_bytes: Vec<u8> = (0..(4 * W) * (4 * W)).flat_map(|_| [0u8, 0, 0, 128]).collect();
         let eye_view = texture("eye", 4 * W, wgpu::TextureFormat::Rgba8UnormSrgb, &eye_bytes);
-        let reach_bytes: Vec<u8> = (0..(2 * W) * (2 * W)).flat_map(|_| 0x4800u16.to_le_bytes()).collect();
+        // The reach, 8 m, in R; no face's code in G.
+        let reach_bytes: Vec<u8> = (0..(2 * W) * (2 * W))
+            .flat_map(|_| [0x4800u16, 0].into_iter().flat_map(u16::to_le_bytes))
+            .collect();
         let reach_view = texture("reach", 2 * W, crate::renderer::brush_pipeline::probe_pass::REACH_FORMAT, &reach_bytes);
         let reflect = pipelines.reflect_bind_group(&device, &eye_view, &reach_view);
 

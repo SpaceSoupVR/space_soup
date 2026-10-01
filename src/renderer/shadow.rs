@@ -28,7 +28,7 @@
 //! the eye loop would double the cost of the most expensive thing here for an
 //! identical result.
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 use wgpu::*;
 
 use super::cuboid::SolidVertex;
@@ -228,25 +228,128 @@ pub fn character_shadow_lamps(lamps: &[CharacterLamp], centre: Vec3, radius: f32
     chosen.into_iter().map(|c| c.0).collect()
 }
 
+/// How far past a character's capsules their tile reaches: fingers spread
+/// and clothes stand a little outside them (as `CARD_BOX_MARGIN`).
+pub const CHARACTER_TILE_MARGIN: f32 = 0.06;
+
+/// The widest a characters' tile looks, each way from its axis, when the
+/// body reaches round beside a lamp that has no cone to bound it: 75 degrees.
+const CHARACTER_TILE_WIDEST_TAN: f32 = 3.73;
+
 /// A CHARACTER'S SHADOW FROM A LAMP: the lamp at `light` looking at the body
-/// bounded by the sphere at `centre` of `radius`, just wide enough to hold it,
-/// out to the lamp's `range` -- every receiver the body can shadow for this
-/// lamp lies in that cone, and past its range the lamp lights nothing. `None`
-/// when the lamp is inside the body's bound, which no frustum can hold.
-pub fn character_light_matrix(light: Vec3, centre: Vec3, radius: f32, range: f32) -> Option<Mat4> {
-    let to = centre - light;
-    let dist = to.length();
-    if !(dist > radius * 1.05 && radius > 0.0) {
+/// -- `body`, spheres whose hulls are its capsules (each capsule's two ends,
+/// at its radius) -- just wide enough to hold it as the lamp sees it, out to
+/// the lamp's `range`: every receiver the body can shadow for this lamp lies
+/// behind its outline, and past its range the lamp lights nothing. `spot`,
+/// a spot's direction and the cosine of its outer half-angle: it lights
+/// nothing outside its cone, so the tile never looks wider than that.
+///
+/// FITTED TO THE OUTLINE, NOT TO A SPHERE ROUND THE BODY. The tile is 512
+/// texels across whatever it holds. It used to hold the body's bounding
+/// sphere -- 0.9 m of radius once an arm reaches out -- seen from the lamp:
+/// beside a wall lamp that cone is 140 degrees wide, a texel of 1.3 cm on the
+/// wall at a metre, and a hand's shadow came out in blocks; and with the lamp
+/// inside that sphere -- a player standing at a wall spot, putting their hand
+/// in its beam -- there was no tile at all, and no shadow (headset,
+/// 2026-10-01: "only doing so in specific spots and distances ... And they
+/// looked incredibly blocky"). Now the tile holds the capsules' own outline,
+/// off its axis as it needs, and a spot's tile is at most its cone: the
+/// corner spot's 34 degrees put a millimetre and a half on the wall a metre
+/// off. A point lamp a part of the body reaches round looks
+/// [`CHARACTER_TILE_WIDEST_TAN`] each way at most. `None` only for a body the
+/// spot's cone misses, or no body.
+pub fn character_light_matrix(light: Vec3, spot: Option<(Vec3, f32)>, body: &[(Vec3, f32)], range: f32) -> Option<Mat4> {
+    if body.is_empty() {
         return None;
     }
-    // The cone that holds the sphere, a tenth wider for the kernel.
-    let half = (radius / dist).asin() * 1.1;
-    let d = to / dist;
-    let up = if d.dot(Vec3::Y).abs() > 0.99 { Vec3::Z } else { Vec3::Y };
-    let view = Mat4::look_at_rh(light, centre, up);
-    let near = (dist - radius).max(0.05);
-    let far = range.max(dist + radius).max(near * 2.0);
-    Some(Mat4::perspective_rh((2.0 * half).min(std::f32::consts::PI - 0.1), 1.0, near, far) * view)
+    // The axis: a spot's own, else toward the body's middle.
+    let middle = body.iter().fold(Vec3::ZERO, |s, (c, _)| s + *c) / body.len() as f32;
+    let axis = match spot {
+        Some((d, _)) => d.normalize_or_zero(),
+        None => (middle - light).normalize_or_zero(),
+    };
+    let axis = if axis == Vec3::ZERO { Vec3::NEG_Y } else { axis };
+    let up = if axis.dot(Vec3::Y).abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let view = Mat4::look_at_rh(light, light + axis, up);
+    // The outline's bounds as tangents off the axis, each way; `None` on a
+    // side some sphere reaches round past the lamp on.
+    let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+    let (mut open_lo, mut open_hi) = ([false; 2], [false; 2]);
+    let mut near = f32::MAX;
+    let mut deepest = 0.0f32;
+    let mut held = 0;
+    for &(c, r) in body {
+        let r = r + CHARACTER_TILE_MARGIN;
+        let p = view.transform_point3(c);
+        let d = -p.z;
+        // Wholly behind the lamp: outside any spot's cone, and past what one
+        // look toward the body can hold.
+        if d + r <= 0.0 {
+            continue;
+        }
+        held += 1;
+        deepest = deepest.max(d + r);
+        near = near.min(d - r);
+        for (k, x) in [p.x, p.y].into_iter().enumerate() {
+            // The sphere's two tangent lines in the plane of this axis.
+            let dist = (x * x + d * d).sqrt();
+            if d <= 0.0 || dist <= r {
+                open_lo[k] = true;
+                open_hi[k] = true;
+                continue;
+            }
+            let (centre, spread) = (x.atan2(d), (r / dist).asin());
+            let (a, b) = (centre - spread, centre + spread);
+            const SQUARE: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
+            if a <= -SQUARE {
+                open_lo[k] = true;
+            } else {
+                lo[k] = lo[k].min(a.tan());
+            }
+            if b >= SQUARE {
+                open_hi[k] = true;
+            } else {
+                hi[k] = hi[k].max(b.tan());
+            }
+        }
+    }
+    if held == 0 {
+        return None;
+    }
+    // What bounds an open side: a spot's cone, else the widest look.
+    let widest = match spot {
+        Some((_, cos_outer)) => {
+            let c = cos_outer.clamp(-1.0, 1.0);
+            if c <= 0.05 {
+                CHARACTER_TILE_WIDEST_TAN
+            } else {
+                ((1.0 - c * c).sqrt() / c).min(CHARACTER_TILE_WIDEST_TAN)
+            }
+        }
+        None => CHARACTER_TILE_WIDEST_TAN,
+    };
+    for k in 0..2 {
+        lo[k] = if open_lo[k] { -widest } else { lo[k].max(-widest) };
+        hi[k] = if open_hi[k] { widest } else { hi[k].min(widest) };
+        if lo[k] >= hi[k] {
+            // The body is outside the spot's cone.
+            return None;
+        }
+        // Two texels more each way, for the filter's kernel.
+        let pad = (hi[k] - lo[k]) * (2.0 / SUN_DYNAMIC_DIM as f32);
+        lo[k] -= pad;
+        hi[k] += pad;
+    }
+    let near = near.clamp(0.02, 1.0);
+    let far = range.max(deepest).max(near * 2.0);
+    let depth = far / (near - far);
+    let projection = Mat4::from_cols(
+        Vec4::new(2.0 / (hi.x - lo.x), 0.0, 0.0, 0.0),
+        Vec4::new(0.0, 2.0 / (hi.y - lo.y), 0.0, 0.0),
+        Vec4::new((hi.x + lo.x) / (hi.x - lo.x), (hi.y + lo.y) / (hi.y - lo.y), depth, -1.0),
+        Vec4::new(0.0, 0.0, depth * near, 0.0),
+    );
+    Some(projection * view)
 }
 
 /// Aim a pass at tile `tile` of the moving-objects map. See `SUN_ATLAS_TILES`.
@@ -1393,28 +1496,73 @@ mod atlas_tests {
         assert_eq!(character_shadow_lamps(&[over, lamp(-2.0, 4.0, true)], body, r, &[]), vec![0, 1]);
     }
 
-    /// A character's tile holds the body whole from the lamp -- its bounding
-    /// sphere inside the frustum -- and reaches the floor beyond it; and a lamp
-    /// inside the body's bound gets none.
+    /// A character's tile holds the body whole from the lamp and reaches the
+    /// floor beyond it; it is fitted to the body's outline, so a slim body
+    /// gets a narrow tile; a spot's tile is never wider than its cone, and a
+    /// player standing at a wall spot, the lamp inside their reach, still has
+    /// one -- holding the hand in the beam and its shadow on the wall.
     #[test]
     fn a_character_tile_holds_the_body_and_what_it_shadows() {
-        let lamp = Vec3::new(1.5, 2.4, 0.0);
-        let centre = Vec3::new(0.0, 0.9, 0.0);
-        let m = character_light_matrix(lamp, centre, 1.0, 8.0).expect("a lamp outside the body");
-        let inside = |p: Vec3| {
+        let inside = |m: Mat4, p: Vec3| {
             let c = m * p.extend(1.0);
             let n = c.truncate() / c.w;
             c.w > 0.0 && n.x.abs() <= 1.0 && n.y.abs() <= 1.0 && (0.0..=1.0).contains(&n.z)
         };
+        // How wide tile `m` of a lamp at `lamp` looks across its middle row,
+        // in degrees.
+        let width = |m: Mat4, lamp: Vec3| {
+            let inv = m.inverse();
+            let edge = |x: f32| (inv.project_point3(Vec3::new(x, 0.0, 0.5)) - lamp).normalize();
+            edge(-1.0).dot(edge(1.0)).clamp(-1.0, 1.0).acos().to_degrees()
+        };
+        let lamp = Vec3::new(1.5, 2.4, 0.0);
+        let centre = Vec3::new(0.0, 0.9, 0.0);
+        // A standing body: a capsule from the shins to the head.
+        let (foot, head) = (Vec3::new(0.0, 0.2, 0.0), Vec3::new(0.0, 1.6, 0.0));
+        let body = [(foot, 0.2), (head, 0.2)];
+        let m = character_light_matrix(lamp, None, &body, 8.0).expect("a lamp outside the body");
         let to = (centre - lamp).normalize();
         let side = to.cross(Vec3::Y).normalize();
-        for p in [centre, centre + Vec3::Y * 0.95, centre - Vec3::Y * 0.95, centre + side * 0.95] {
-            assert!(inside(p), "{p} of the body is outside its tile");
+        for p in [foot, head, head + Vec3::Y * 0.25, foot - Vec3::Y * 0.25, centre + side * 0.25] {
+            assert!(inside(m, p), "{p} of the body is outside its tile");
         }
-        // The floor where the body's shadow falls, past the body from the lamp.
-        let floor = lamp + to * ((lamp.y - 0.0) / -to.y);
-        assert!(inside(floor), "the floor behind the body, {floor}, is outside the tile");
-        assert!(character_light_matrix(centre + Vec3::X * 0.2, centre, 1.0, 8.0).is_none());
+        // The floor where the head's shadow falls, past the body from the lamp.
+        let ray = (head - lamp).normalize();
+        let floor = lamp + ray * (lamp.y / -ray.y);
+        assert!(inside(m, floor), "the floor behind the body, {floor}, is outside the tile");
+        // The old tile held a 1 m sphere round the middle: the outline's is
+        // narrower across.
+        let sphere = character_light_matrix(lamp, None, &[(centre, 1.0)], 8.0).unwrap();
+        assert!(
+            width(m, lamp) < 0.6 * width(sphere, lamp),
+            "a slim body's tile is {} degrees, a sphere's {}",
+            width(m, lamp),
+            width(sphere, lamp)
+        );
+
+        // A WALL SPOT: at 1.7 m on a wall, aimed along +x, 34 degrees; the
+        // player standing in front of it, the lamp inside their reach, a hand
+        // held out in the beam.
+        let spot_at = Vec3::new(0.0, 1.7, 0.0);
+        let beam = (Vec3::X, 17f32.to_radians().cos());
+        let player = [
+            (Vec3::new(0.35, 0.2, 0.3), 0.15),
+            (Vec3::new(0.35, 1.6, 0.3), 0.15),
+            (Vec3::new(0.45, 1.5, 0.1), 0.05),
+            (Vec3::new(0.7, 1.65, 0.05), 0.05),
+        ];
+        let m = character_light_matrix(spot_at, Some(beam), &player, 4.0).expect("a spot inside the player's reach has a tile");
+        let hand = Vec3::new(0.7, 1.65, 0.05);
+        let shadow = spot_at + (hand - spot_at) * (1.2 / (hand - spot_at).x);
+        assert!(inside(m, hand) && inside(m, shadow), "the hand {hand} or its shadow on the wall {shadow} is outside the tile");
+        assert!(width(m, spot_at) < 36.5, "the spot's tile is {} degrees across, wider than its cone", width(m, spot_at));
+        // A body the cone misses has none.
+        let behind = [(Vec3::new(-1.0, 1.0, 0.0), 0.2), (Vec3::new(-1.0, 1.5, 0.0), 0.2)];
+        assert!(character_light_matrix(spot_at, Some(beam), &behind, 4.0).is_none());
+        // A point lamp the body reaches round still has a tile, at its widest.
+        let near = centre + Vec3::X * 0.1;
+        let reached = character_light_matrix(near, None, &[(centre, 1.0)], 8.0).expect("a tile");
+        assert!(width(reached, near) < 151.0, "{}", width(reached, near));
     }
 }
 
@@ -1692,7 +1840,8 @@ mod render_tests {
             let centre = v.iter().fold(Vec3::ZERO, |s, p| s + Vec3::from(p.position)) / v.len().max(1) as f32;
             let radius = v.iter().map(|p| (Vec3::from(p.position) - centre).length()).fold(0.0f32, f32::max);
             let l = &scene.lights[i];
-            character_light_matrix(l.position, centre, radius, l.range).map(|m| (i, m))
+            let spot = (l.kind == LightKind::Spot).then(|| (l.direction, (l.cone_angle_deg.to_radians() * 0.5).cos()));
+            character_light_matrix(l.position, spot, &[(centre, radius)], l.range).map(|m| (i, m))
         });
         if let Some((_, m)) = character_tile {
             spot_view_proj[MAX_SPOT_SHADOWS] = m;

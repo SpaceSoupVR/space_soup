@@ -1912,7 +1912,13 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             "",
         )],
     ),
-    ("def_cut_reach", &[("    return ProbePassOut(reflection, probe_reach);", "    return ProbePassOut(reflection, 0.0);")]),
+    (
+        "def_cut_reach",
+        &[(
+            "    return ProbePassOut(reflection, vec2<f32>(probe_reach, probe_face_code(n_geom)));",
+            "    return ProbePassOut(reflection, vec2<f32>(0.0, probe_face_code(n_geom)));",
+        )],
+    ),
 ];
 
 /// MEASUREMENT ONLY: the scene pass's brush shader (the one reading the probe
@@ -1933,7 +1939,10 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("scene_cut_bounce", &[("    if (has_dir) {", "    if (false) {")]),
     (
         "scene_cut_probe_read",
-        &[("    probe_env_given = probe_pass_upsample(in.clip.xy, in.clip.z, probe_pass_tolerance);", "    probe_env_given = vec4<f32>(0.0);")],
+        &[(
+            "    probe_env_given = probe_pass_upsample(in.clip.xy, in.clip.z, probe_pass_tolerance, probe_face_code(n_geom));",
+            "    probe_env_given = vec4<f32>(0.0);",
+        )],
     ),
     (
         "scene_cut_lamp_spec",
@@ -2014,7 +2023,52 @@ pub mod probe_pass {
     /// reflected ray travelled to what it shows, in metres (`probe_reach`),
     /// 0 where no brush was drawn. SpaceWarp reads it to move a reflected image
     /// with the point it is an image of. See `space_warp::reflected_point`.
-    pub const REACH_FORMAT: TextureFormat = TextureFormat::R16Float;
+    ///
+    /// And in G WHICH WAY THE TEXEL'S SURFACE FACES (`FACE_CODE_WGSL`), so the
+    /// scene pass and the blur never hand one face's reflection to another:
+    /// see `READER_WGSL`.
+    pub const REACH_FORMAT: TextureFormat = TextureFormat::Rg16Float;
+
+    /// WHICH WAY A SURFACE FACES, as a code a half-resolution texel can carry
+    /// beside its reach: the geometric normal, octahedrally encoded (pole up,
+    /// so walls lie on the octahedron's waist and never on its fold) at 32
+    /// steps each way, plus one -- 0 is "unknown", and every code is an integer
+    /// a 16-bit float holds exactly.
+    ///
+    /// WHY. Depth cannot tell two faces apart where they meet: at a convex
+    /// corner both are continuous with the edge. The pillar's side, seen
+    /// almost edge-on, is a sliver one or two pixels wide that the
+    /// half-resolution pass all but misses; its pixels took the FRONT face's
+    /// texels -- the sunlit doorway behind the player, the lamp's pool on the
+    /// floor -- and multiplied them by the side's own grazing Fresnel, near 1:
+    /// a bright green line, then white specks, down the pillar's corner
+    /// (headset, 2026-10-01 01:00:07). The blur made it wider by blurring
+    /// the side's texels with the front's.
+    pub(crate) const FACE_CODE_WGSL: &str = r#"
+fn probe_face_code(n: vec3<f32>) -> f32 {
+    let a = n / max(abs(n.x) + abs(n.y) + abs(n.z), 1e-6);
+    var o = a.xz;
+    if (a.y < 0.0) {
+        o = (vec2<f32>(1.0) - abs(a.zx)) * select(vec2<f32>(-1.0), vec2<f32>(1.0), a.xz >= vec2<f32>(0.0));
+    }
+    let q = clamp(round((o * 0.5 + vec2<f32>(0.5)) * 31.0), vec2<f32>(0.0), vec2<f32>(31.0));
+    return 1.0 + q.x * 32.0 + q.y;
+}
+
+// Whether two codes are one surface's: within two steps each way, about 12
+// degrees -- a face is one code exactly, a curved surface's neighbours a step
+// or so apart -- or either unknown (a texel the terrain drew, which writes no
+// code: it is read as it always was).
+fn probe_face_same(a: f32, b: f32) -> bool {
+    if (a < 0.5 || b < 0.5) {
+        return true;
+    }
+    let ia = i32(a) - 1;
+    let ib = i32(b) - 1;
+    let d = abs(vec2<i32>(ia / 32 - ib / 32, ia % 32 - ib % 32));
+    return d.x <= 2 && d.y <= 2;
+}
+"#;
 
     /// THE CHARACTERS' FLOOR MIRROR, beside the pass in its target: the
     /// characters -- the player's own body and everyone else's -- rendered
@@ -2054,7 +2108,8 @@ pub mod probe_pass {
     pub(crate) const OUTPUT_WGSL: &str = r#"
 struct ProbePassOut {
     @location(0) reflection: vec4<f32>,
-    @location(1) reach: f32,
+    // The reach, and the face's code: see `REACH_FORMAT`.
+    @location(1) reach: vec2<f32>,
 }
 "#;
 
@@ -2074,7 +2129,7 @@ struct ProbePassOut {
 
     /// Group 3 of the reading brush shader: the pass's colour and its depth,
     /// a bilinear sampler for the colour and a point sampler to gather the
-    /// depths. See `READER_WGSL`. The depth is the glare's too, which reads
+    /// depths, and the reach target for its faces' codes. See `READER_WGSL`. The depth is the glare's too, which reads
     /// it per vertex to find whether a wall hides a lamp (`glare`).
     pub fn bind_group_layout(device: &Device) -> BindGroupLayout {
         let texture = |binding: u32, sample_type: TextureSampleType| BindGroupLayoutEntry {
@@ -2099,6 +2154,7 @@ struct ProbePassOut {
                 texture(1, TextureSampleType::Depth),
                 sampler(2, SamplerBindingType::Filtering),
                 sampler(3, SamplerBindingType::NonFiltering),
+                texture(4, TextureSampleType::Float { filterable: true }),
             ],
         })
     }
@@ -2186,7 +2242,7 @@ struct ProbePassOut {
             };
             let (color_view, depth_view) = (attachment(&color), attachment(&depth));
             let reach_view = attachment(&reach);
-            let (color_array, depth_array) = (array(&color), array(&depth));
+            let (color_array, depth_array, reach_array) = (array(&color), array(&depth), array(&reach));
             // THE FLOOR MIRROR: its colour with its blur levels, and its depth.
             let mirror_mips = MIRROR_MIPS.min(width.min(height).max(1).ilog2() + 1);
             let mirror = device.create_texture(&TextureDescriptor {
@@ -2248,6 +2304,7 @@ struct ProbePassOut {
                         BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&depth_array) },
                         BindGroupEntry { binding: 2, resource: BindingResource::Sampler(&samplers[0]) },
                         BindGroupEntry { binding: 3, resource: BindingResource::Sampler(&samplers[1]) },
+                        BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&reach_array) },
                     ],
                 })
             };
@@ -2484,10 +2541,10 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
     // by), after every implicit-derivative sample above; nothing is recorded
     // for the fix-up, and coverage 0 reads as the lightmap's light.
     if (clamp(rough, 0.04, 1.0) >= PROBE_LOBE_HEMISPHERICAL) {
-        return ProbePassOut(vec4<f32>(0.0), 0.0);
+        return ProbePassOut(vec4<f32>(0.0), vec2<f32>(0.0, probe_face_code(n_geom)));
     }
     let reflection = probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);
-    return ProbePassOut(reflection, probe_reach);"#;
+    return ProbePassOut(reflection, vec2<f32>(probe_reach, probe_face_code(n_geom)));"#;
 
     /// Group 3 and the read, appended to the scene pass's brush shader.
     pub(crate) const READER_WGSL: &str = r#"
@@ -2495,6 +2552,8 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
 @group(3) @binding(1) var probe_pass_depth: texture_depth_2d_array;
 @group(3) @binding(2) var probe_pass_linear: sampler;
 @group(3) @binding(3) var probe_pass_point: sampler;
+// The reach target, read for the faces' codes in G. See `FACE_CODE_WGSL`.
+@group(3) @binding(4) var probe_pass_code: texture_2d_array<f32>;
 
 // `probe_pass_compress` undone: the pass stores `c / (1 + luminance)`, so the
 // filter averages texels as a display shows them. See the lights block.
@@ -2504,13 +2563,17 @@ fn probe_pass_expand(c: vec3<f32>) -> vec3<f32> {
 
 // THE HALF-RESOLUTION PROBE REFLECTION AT THIS PIXEL: the four pass texels
 // around it, weighted bilinearly and kept only where their depth is this
-// pixel's -- the same surface -- so a reflection never bleeds across a
-// silhouette. `tolerance` is how far two depths may differ and still be one
+// pixel's AND their face's code is this pixel's `code` -- the same surface --
+// so a reflection never bleeds across a silhouette, nor round a corner onto
+// the other face. `tolerance` is how far two depths may differ and still be one
 // surface, from this pixel's own depth slope. With no neighbour on this surface
-// (a sliver the half-resolution pass missed), the nearest in depth. The pass
-// stores the reflection compressed (`probe_pass_compress`) and premultiplied by
-// its coverage, which is what makes the weighted sum a correct filter; both
-// are undone here.
+// (a sliver the half-resolution pass missed), the nearest in depth that faces
+// this way; with none facing this way, no reflection -- the room's own light
+// stands in, as it does on a rough tile -- and never another face's: a
+// grazing sliver multiplies what it borrows by a Fresnel near 1 (see
+// `FACE_CODE_WGSL`). The pass stores the reflection compressed
+// (`probe_pass_compress`) and premultiplied by its coverage, which is what
+// makes the weighted sum a correct filter; both are undone here.
 //
 // TWO READS WHERE IT CAN BE, EIGHT WHERE IT MUST. The four depths come in one
 // gather. When all four are this pixel's surface -- everywhere but along an
@@ -2521,7 +2584,7 @@ fn probe_pass_expand(c: vec3<f32>) -> vec3<f32> {
 //
 // This eye's layer is `view_slot`: 0 in a single-eye pass, the view index in a
 // multiview one.
-fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32) -> vec4<f32> {
+fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32, code: f32) -> vec4<f32> {
     let dims = textureDimensions(probe_pass_tex);
     // A full-resolution pixel centre at `pixel` is at `pixel * 0.5` in the
     // half-resolution texel grid.
@@ -2529,7 +2592,13 @@ fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32) -> vec4<f32
     // A gather returns the footprint as (0,1) (1,1) (1,0) (0,0) from its
     // corner; `.wzxy` puts it in the order (0,0) (1,0) (0,1) (1,1).
     let gaps = abs(textureGather(probe_pass_depth, probe_pass_point, uv, view_slot) - vec4<f32>(depth)).wzxy;
-    if (all(gaps <= vec4<f32>(tolerance))) {
+    let codes = textureGather(1, probe_pass_code, probe_pass_point, uv, view_slot).wzxy;
+    let facing = vec4<bool>(
+        probe_face_same(codes.x, code), probe_face_same(codes.y, code),
+        probe_face_same(codes.z, code), probe_face_same(codes.w, code),
+    );
+    let same = facing & (gaps <= vec4<f32>(tolerance));
+    if (all(same)) {
         let pre = textureSampleLevel(probe_pass_tex, probe_pass_linear, uv, view_slot, 0.0);
         return vec4<f32>(probe_pass_expand(pre.rgb / max(pre.a, 1e-4)), pre.a);
     }
@@ -2543,14 +2612,18 @@ fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32) -> vec4<f32
     let c01 = textureLoad(probe_pass_tex, clamp(base + vec2<i32>(0, 1), vec2<i32>(0), top), view_slot, 0);
     let c11 = textureLoad(probe_pass_tex, clamp(base + vec2<i32>(1, 1), vec2<i32>(0), top), view_slot, 0);
     let bilinear = vec4<f32>((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
-    let w = select(vec4<f32>(0.0), bilinear, gaps <= vec4<f32>(tolerance));
+    let w = select(vec4<f32>(0.0), bilinear, same);
     let weight = w.x + w.y + w.z + w.w;
-    // Ties go to the first in that order, as they always have.
-    var nearest = c00;
-    var nearest_gap = gaps.x;
-    if (gaps.y < nearest_gap) { nearest_gap = gaps.y; nearest = c10; }
-    if (gaps.z < nearest_gap) { nearest_gap = gaps.z; nearest = c01; }
-    if (gaps.w < nearest_gap) { nearest_gap = gaps.w; nearest = c11; }
+    // Ties go to the first in that order, as they always have; only a texel
+    // facing this way, and none -- no reflection -- if none does.
+    let far = vec4<f32>(3.4e38);
+    let near = select(far, gaps, facing);
+    var nearest = vec4<f32>(0.0);
+    var nearest_gap = far.x;
+    if (near.x < nearest_gap) { nearest_gap = near.x; nearest = c00; }
+    if (near.y < nearest_gap) { nearest_gap = near.y; nearest = c10; }
+    if (near.z < nearest_gap) { nearest_gap = near.z; nearest = c01; }
+    if (near.w < nearest_gap) { nearest_gap = near.w; nearest = c11; }
     let sum = c00 * w.x + c10 * w.y + c01 * w.z + c11 * w.w;
     let pre = select(nearest, sum / max(weight, 1e-6), weight > 1e-4);
     return vec4<f32>(probe_pass_expand(pre.rgb / max(pre.a, 1e-4)), pre.a);
@@ -3023,7 +3096,7 @@ struct VOut {{
                 lighting.replacen(
                     marker,
                     &format!(
-                        "    probe_env_given = probe_pass_upsample(in.clip.xy, in.clip.z, probe_pass_tolerance);\n{marker}"
+                        "    probe_env_given = probe_pass_upsample(in.clip.xy, in.clip.z, probe_pass_tolerance, probe_face_code(n_geom));\n{marker}"
                     ),
                     1,
                 )
@@ -3260,8 +3333,10 @@ struct VOut {{
         }
     );
     match probe {
-        BrushProbe::Read => format!("{src}{}", probe_pass::READER_WGSL),
-        BrushProbe::Pass | BrushProbe::PassDeferred => format!("{src}{}", probe_pass::OUTPUT_WGSL),
+        BrushProbe::Read => format!("{src}{}{}", probe_pass::READER_WGSL, probe_pass::FACE_CODE_WGSL),
+        BrushProbe::Pass | BrushProbe::PassDeferred => {
+            format!("{src}{}{}", probe_pass::OUTPUT_WGSL, probe_pass::FACE_CODE_WGSL)
+        }
         BrushProbe::Trace => src,
     }
 }
@@ -5080,7 +5155,11 @@ mod ssr_pipeline_tests {
     /// every pixel: one filtered read inside a surface, texel by texel along
     /// an edge -- across a vertical AND a horizontal step in depth, so a
     /// gather read in the wrong order or a swapped axis weights the wrong
-    /// texels and fails. Checked against the four-texel sum on the CPU.
+    /// texels and fails. Checked against the four-texel sum on the CPU. And
+    /// across a CORNER: two faces on one continuous depth, told apart by their
+    /// codes alone -- a pixel takes only its own face's texels (a code within
+    /// the tolerance counts as its own), and where none of the four is its
+    /// face, nothing. The right half writes no code and is read as before.
     #[test]
     fn the_probe_upsample_is_the_depth_aware_bilinear_filter() {
         let Some((device, queue)) = headless_gpu() else {
@@ -5101,6 +5180,22 @@ fn pass_colour(t: vec2<f32>) -> vec4<f32> {
 fn pass_depth(t: vec2<f32>) -> f32 {
     return 0.3 + 0.4 * step(16.0, t.x) + 0.15 * step(8.0, t.y) + 0.001 * t.y;
 }
+// The faces' codes: two faces meeting at texel column 8, where the depth runs
+// on unbroken; none on the right half.
+fn pass_code(t: vec2<f32>) -> f32 {
+    if (t.x < 8.0) { return 529.0; }
+    if (t.x < 16.0) { return 533.0; }
+    return 0.0;
+}
+// A full-resolution pixel's own face: the first face one step off its own
+// code, the second exactly; a corner of the first facing neither; none on the
+// right half.
+fn pixel_code(p: vec2<f32>) -> f32 {
+    if (p.x < 8.0 && p.y >= 28.0) { return 1.0; }
+    if (p.x < 16.0) { return 530.0; }
+    if (p.x < 32.0) { return 533.0; }
+    return 0.0;
+}
 // A full-resolution pixel's own depth: its surface by its OWN position, the
 // slope interpolated between the half-resolution rows.
 fn pixel_depth(p: vec2<f32>) -> f32 {
@@ -5113,12 +5208,13 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 }
 struct PassOut {
     @location(0) colour: vec4<f32>,
+    @location(1) code: vec2<f32>,
     @builtin(frag_depth) depth: f32,
 }
 @fragment
 fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
     let t = floor(pos.xy);
-    return PassOut(pass_colour(t), pass_depth(t));
+    return PassOut(pass_colour(t), vec2<f32>(0.0, pass_code(t)), pass_depth(t));
 }
 "#;
         let layout = probe_pass::bind_group_layout(&device);
@@ -5134,7 +5230,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
             fragment: Some(wgpu::FragmentState {
                 module: &fill_module,
                 entry_point: Some("fill"),
-                targets: &[Some(probe_pass::FORMAT.into())],
+                targets: &[Some(probe_pass::FORMAT.into()), Some(probe_pass::REACH_FORMAT.into())],
                 compilation_options: Default::default(),
             }),
             primitive: Default::default(),
@@ -5150,8 +5246,9 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
             cache: None,
         });
         let read_src = format!(
-            "{PATTERN}var<private> view_slot: i32 = 0;\n{}\n@fragment\nfn read(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{\n    return probe_pass_upsample(pos.xy, pixel_depth(pos.xy), {TOLERANCE:?});\n}}\n",
-            probe_pass::READER_WGSL
+            "{PATTERN}var<private> view_slot: i32 = 0;\n{}{}\n@fragment\nfn read(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{\n    return probe_pass_upsample(pos.xy, pixel_depth(pos.xy), {TOLERANCE:?}, pixel_code(pos.xy));\n}}\n",
+            probe_pass::READER_WGSL,
+            probe_pass::FACE_CODE_WGSL
         );
         let read_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("upsample_read"),
@@ -5195,12 +5292,20 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("upsample_fill"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-                })],
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &target.color_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &target.reach_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    }),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &target.depth_view,
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
@@ -5258,8 +5363,24 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
             [t[0] / 32.0 * a, t[1] / 16.0 * a, 0.5 * a, a]
         };
         let texel_depth = |t: [f32; 2]| 0.3 + 0.4 * step(16.0, t[0]) + 0.15 * step(8.0, t[1]) + 0.001 * t[1];
+        let texel_code = |t: [f32; 2]| if t[0] < 8.0 { 529.0 } else if t[0] < 16.0 { 533.0 } else { 0.0 };
+        let pixel_code = |p: [f32; 2]| match p {
+            [x, y] if x < 8.0 && y >= 28.0 => 1.0,
+            [x, _] if x < 16.0 => 530.0,
+            [x, _] if x < 32.0 => 533.0,
+            _ => 0.0f32,
+        };
+        // `probe_face_same`: unknown matches anything; else within two steps
+        // each way of the code's 32 x 32 grid.
+        let same_face = |a: f32, b: f32| {
+            if a < 0.5 || b < 0.5 {
+                return true;
+            }
+            let (ia, ib) = (a as i32 - 1, b as i32 - 1);
+            (ia / 32 - ib / 32).abs() <= 2 && (ia % 32 - ib % 32).abs() <= 2
+        };
         let (hw, hh) = (W / 2, H / 2);
-        let (mut worst, mut edges) = (0.0f32, 0usize);
+        let (mut worst, mut edges, mut corner, mut facing_none) = (0.0f32, 0usize, 0usize, 0usize);
         for y in 0..H {
             for x in 0..W {
                 let p = [x as f32 + 0.5, y as f32 + 0.5];
@@ -5269,22 +5390,28 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
                 let f = [h[0] - base[0], h[1] - base[1]];
                 let (mut sum, mut weight) = ([0.0f32; 4], 0.0f32);
                 let (mut nearest, mut nearest_gap) = ([0.0f32; 4], f32::MAX);
+                let (mut other_face, mut facing) = (false, 0);
                 for (ox, oy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
                     let t = [(base[0] + ox).clamp(0.0, (hw - 1) as f32), (base[1] + oy).clamp(0.0, (hh - 1) as f32)];
                     let c = colour(t);
                     let gap = (texel_depth(t) - depth).abs();
+                    let faces = same_face(texel_code(t), pixel_code(p));
+                    other_face |= !faces && gap <= TOLERANCE;
+                    facing += usize::from(faces);
                     let bw = (if ox == 1.0 { f[0] } else { 1.0 - f[0] }) * (if oy == 1.0 { f[1] } else { 1.0 - f[1] });
-                    let w = if gap <= TOLERANCE { bw } else { 0.0 };
+                    let w = if gap <= TOLERANCE && faces { bw } else { 0.0 };
                     for k in 0..4 {
                         sum[k] += c[k] * w;
                     }
                     weight += w;
-                    if gap < nearest_gap {
+                    if faces && gap < nearest_gap {
                         nearest_gap = gap;
                         nearest = c;
                     }
                 }
                 edges += usize::from(weight < 0.999);
+                corner += usize::from(other_face && facing > 0);
+                facing_none += usize::from(facing == 0);
                 let pre = if weight > 1e-4 { sum.map(|v| v / weight) } else { nearest };
                 let want = [pre[0] / pre[3].max(1e-4), pre[1] / pre[3].max(1e-4), pre[2] / pre[3].max(1e-4), pre[3]];
                 let i = ((y * W + x) * 4) as usize;
@@ -5301,9 +5428,16 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
             }
         }
         // Both paths were exercised: most pixels one surface, a band along
-        // each step on the per-texel path.
+        // each step on the per-texel path; the corner's band, where the
+        // depth alone would have taken the other face, and its pixels facing
+        // none of the four.
         assert!(edges > 60 && edges < (W * H / 4) as usize, "{edges} edge pixels");
-        eprintln!("upsample: worst difference {worst:.5} over {} pixels, {edges} on an edge", W * H);
+        assert!(corner >= 2 * H as usize, "{corner} pixels by the corner");
+        assert!(facing_none >= 16, "{facing_none} pixels facing no texel");
+        eprintln!(
+            "upsample: worst difference {worst:.5} over {} pixels, {edges} on an edge, {corner} by the corner, {facing_none} facing none",
+            W * H
+        );
     }
 
     /// Every measurement cut of the probe pass still finds its text in the

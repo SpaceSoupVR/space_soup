@@ -789,11 +789,21 @@ impl XrRenderer {
                 );
             }
             *self.character_shadow_held.borrow_mut() = now;
+            // The body as the tile is fitted to it: each capsule's two ends.
+            let count = (self.player.capsules.groups[1][3] as usize).min(crate::renderer::uniforms::CAPSULES_PER_GROUP);
+            let body: Vec<(glam::Vec3, f32)> = (0..count)
+                .flat_map(|k| {
+                    let (a, b) = (self.player.capsules.capsules[k * 2], self.player.capsules.capsules[k * 2 + 1]);
+                    [(glam::Vec3::new(a[0], a[1], a[2]), a[3]), (glam::Vec3::new(b[0], b[1], b[2]), a[3])]
+                })
+                .collect();
             chosen
                 .into_iter()
                 .filter_map(|i| {
-                    crate::renderer::shadow::character_light_matrix(lights[i].position, centre, radius, lights[i].range)
-                        .map(|m| (i, m))
+                    let l = &lights[i];
+                    let spot = (l.kind == crate::renderer::LightKind::Spot)
+                        .then(|| (l.direction, (l.cone_angle_deg.to_radians() * 0.5).cos()));
+                    crate::renderer::shadow::character_light_matrix(l.position, spot, &body, l.range).map(|m| (i, m))
                 })
                 .collect()
         } else {
@@ -860,7 +870,7 @@ impl XrRenderer {
                 if fx.character_cards && !mirror_only_skinned_draws.is_empty() =>
             {
                 atlas.character_rows.first().copied().zip(
-                    crate::renderer::character_cards::card_box(&frame_player.capsules, 0),
+                    crate::renderer::character_cards::card_box(&frame_player.capsules, 0, frame_player.yaw),
                 )
             }
             _ => None,
@@ -1620,6 +1630,7 @@ impl XrRenderer {
                         &self.floor_mirror_mips,
                         &parts,
                         card_box,
+                        frame_player.yaw,
                         &atlas.texture,
                         row,
                         self.pass_timers.as_ref().map(|t| (t, 18)),
@@ -2528,7 +2539,20 @@ impl XrRenderer {
                     .filter(|_| dbg & 8 == 0)
                     .map(|(_, prev_w2p)| crate::renderer::space_warp::app_space_delta(prev_w2p, warp_world_to_player))
                     .unwrap_or(xr::Posef::IDENTITY);
+                // A snap turn or a teleport: nothing may be synthesised from
+                // this frame's vectors. See `space_warp::locomotion_jumped`.
+                let jumped = sw
+                    .prev
+                    .is_some_and(|(_, prev_w2p)| crate::renderer::space_warp::locomotion_jumped(prev_w2p, warp_world_to_player));
+                if jumped {
+                    log::info!("SPACEWARP: locomotion jumped (snap turn or teleport); this frame skips synthesis");
+                }
                 for info in sw.info.iter_mut() {
+                    info.layer_flags = if jumped {
+                        xr::sys::CompositionLayerSpaceWarpInfoFlagsFB::FRAME_SKIP
+                    } else {
+                        xr::sys::CompositionLayerSpaceWarpInfoFlagsFB::EMPTY
+                    };
                     info.app_space_delta_pose = delta;
                     info.near_z = crate::renderer::space_warp::NEAR_Z;
                     info.far_z = if dbg & 16 != 0 { f32::INFINITY } else { crate::renderer::space_warp::FAR_Z };

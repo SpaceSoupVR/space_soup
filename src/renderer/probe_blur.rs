@@ -20,6 +20,15 @@
 //! `probe_pass::PASS_LIGHTING`) neither lends the polished one its emptiness
 //! nor takes a reflection it would throw away.
 //!
+//! And only neighbours of the SAME FACE: depth alone cannot see a convex
+//! corner, where the two faces meet at one depth. There the side face, seen
+//! nearly edge-on, took the front face's reflection and multiplied it by its
+//! own grazing Fresnel -- a bright green line down the marble pillar's corner
+//! on the headset, 2026-10-01. Each texel carries its face's code
+//! (`probe_pass::FACE_CODE_WGSL`) and a neighbour must match it; the plane's
+//! slope is read from matching neighbours only, so a corner no longer widens
+//! the depth test either. The ground writes no code and is blurred as before.
+//!
 //! Averaged as stored -- compressed by `1 / (1 + luminance)` -- so a lone
 //! bright texel is one voice among nine rather than a smear: Karis's weight,
 //! as the upsample and the mips use.
@@ -53,6 +62,8 @@ pub fn compute_wgsl() -> String {
 // Clamped at the edges: a texel's neighbours past the image are the edge's.
 @group(0) @binding(3) var src_linear: sampler;
 @group(0) @binding(4) var src_point: sampler;
+// The reach target: the faces' codes in G (see `probe_face_code`).
+@group(0) @binding(5) var src_code: texture_2d<f32>;
 
 // How far a depth may stray from the plane and still be the same surface, at
 // its steepest: a few steps of a 32-bit float just under 1, where the depths
@@ -108,20 +119,38 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
         textureStore(dst, p, c0);
         return;
     }}
-    // The plane's slope each way: the gentler side's step, so a silhouette on
-    // one side does not widen the test on the other.
-    let slope = vec2<f32>(min(abs(ul.x - d0), abs(ur.y - d0)), min(abs(ul.z - d0), abs(dl.y - d0)));
+    // The faces' codes, gathered as the depths are.
+    let kul = textureGather(1, src_code, src_point, centre + lo * texel);
+    let kur = textureGather(1, src_code, src_point, centre + vec2<f32>(0.5, -0.5) * texel);
+    let kdl = textureGather(1, src_code, src_point, centre + vec2<f32>(-0.5, 0.5) * texel);
+    let kdr = textureGather(1, src_code, src_point, centre + vec2<f32>(0.5) * texel);
+    let k0 = kul.y;
+    let f_l = probe_face_same(kul.x, k0);
+    let f_r = probe_face_same(kur.y, k0);
+    let f_u = probe_face_same(kul.z, k0);
+    let f_d = probe_face_same(kdl.y, k0);
+    // The plane's slope each way: the gentler step of the sides on this face,
+    // so neither a silhouette nor a corner on one side widens the test on the
+    // other; none on this face either way, none that way.
+    let none = 3.4e38;
+    let steps = select(
+        vec4<f32>(none),
+        abs(vec4<f32>(ul.x, ur.y, ul.z, dl.y) - vec4<f32>(d0)),
+        vec4<bool>(f_l, f_r, f_u, f_d),
+    );
+    let gentler = vec2<f32>(min(steps.x, steps.y), min(steps.z, steps.w));
+    let slope = select(gentler, vec2<f32>(0.0), gentler >= vec2<f32>(none));
     let side = vec2<f32>(1.0, 0.0);
     let corner = vec2<f32>(1.0);
     let up = vec2<f32>(0.0, 1.0);
-    let ok_l = same_surface(ul.x, d0, side, slope);
-    let ok_r = same_surface(ur.y, d0, side, slope);
-    let ok_u = same_surface(ul.z, d0, up, slope);
-    let ok_d = same_surface(dl.y, d0, up, slope);
-    let ok_ul = same_surface(ul.w, d0, corner, slope);
-    let ok_ur = same_surface(ur.z, d0, corner, slope);
-    let ok_dl = same_surface(dl.x, d0, corner, slope);
-    let ok_dr = same_surface(dr.y, d0, corner, slope);
+    let ok_l = f_l && same_surface(ul.x, d0, side, slope);
+    let ok_r = f_r && same_surface(ur.y, d0, side, slope);
+    let ok_u = f_u && same_surface(ul.z, d0, up, slope);
+    let ok_d = f_d && same_surface(dl.y, d0, up, slope);
+    let ok_ul = probe_face_same(kul.w, k0) && same_surface(ul.w, d0, corner, slope);
+    let ok_ur = probe_face_same(kur.z, k0) && same_surface(ur.z, d0, corner, slope);
+    let ok_dl = probe_face_same(kdl.x, k0) && same_surface(dl.x, d0, corner, slope);
+    let ok_dr = probe_face_same(kdr.y, k0) && same_surface(dr.y, d0, corner, slope);
     var sum: vec4<f32>;
     if (ok_l && ok_r && ok_u && ok_d && ok_ul && ok_ur && ok_dl && ok_dr) {{
         // Premultiplied, so the filter's alpha is the coverage it weighed by.
@@ -145,7 +174,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
     // The coverage-weighted mean colour, at this texel's own coverage.
     textureStore(dst, p, vec4<f32>(sum.rgb / max(sum.a, 1e-6) * c0.a, c0.a));
 }}
-"#
+{}"#,
+        probe_pass::FACE_CODE_WGSL,
     )
 }
 
@@ -204,6 +234,16 @@ impl ProbeBlur {
                     ty: BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let sampler = |label: &str, filter: wgpu::FilterMode| {
@@ -245,7 +285,7 @@ impl ProbeBlur {
     }
 
     /// What the blur reads and writes for one single-eye probe pass target:
-    /// its colour and depth, into its blurred colour. `None` for a target
+    /// its colour, depth and faces' codes, into its blurred colour. `None` for a target
     /// without one (the two-eye target, which no fix-up or blur follows).
     pub fn bind_group(&self, device: &Device, target: &probe_pass::Target) -> Option<BindGroup> {
         let soft = target.soft.as_ref()?;
@@ -254,17 +294,19 @@ impl ProbeBlur {
             &target.color_view,
             &target.depth_view,
             &soft.write_view,
+            &target.reach_single,
         ))
     }
 
-    /// The blur's bindings from the three views: colour and depth read, the
-    /// blurred colour written.
+    /// The blur's bindings from the four views: colour and depth read, the
+    /// blurred colour written, the faces' codes read.
     fn bind_views(
         &self,
         device: &Device,
         colour: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         out: &wgpu::TextureView,
+        code: &wgpu::TextureView,
     ) -> BindGroup {
         device.create_bind_group(&BindGroupDescriptor {
             label: Some("probe_blur"),
@@ -289,6 +331,10 @@ impl ProbeBlur {
                 BindGroupEntry {
                     binding: 4,
                     resource: BindingResource::Sampler(&self.samplers[1]),
+                },
+                BindGroupEntry {
+                    binding: 5,
+                    resource: BindingResource::TextureView(code),
                 },
             ],
         })
@@ -325,6 +371,8 @@ mod tests {
             0.25 => 0x3400,
             0.5 => 0x3800,
             1.0 => 0x3C00,
+            529.0 => 0x6022,
+            533.0 => 0x602A,
             _ => panic!("no f16 written for {v}"),
         }
     }
@@ -352,7 +400,10 @@ mod tests {
     /// corner of its group, takes nothing from the far half (5/12); a texel
     /// beside the far half takes nothing from it; an empty texel stays empty,
     /// and its neighbour keeps both its colour and its coverage rather than
-    /// averaging the emptiness in.
+    /// averaging the emptiness in. And at the bottom of the slanted half, a
+    /// convex corner: two faces on one continuous depth, told apart only by
+    /// their codes -- neither takes the other's reflection, while the rest,
+    /// writing no code, blur as they always have.
     #[test]
     fn reflections_blur_along_their_surface_and_keep_their_coverage() {
         use wgpu::util::DeviceExt;
@@ -383,6 +434,7 @@ mod tests {
             match (x, y) {
                 (3, 8) | (7, 7) => [0.25, 0.25, 0.25, 1.0],
                 (1, 5) => [0.0; 4],
+                (4..8, 12..) => [0.25, 0.25, 0.25, 1.0],
                 (x, _) if x < 8 => [0.5, 0.5, 0.5, 1.0],
                 _ => [1.0; 4],
             }
@@ -409,6 +461,37 @@ mod tests {
             },
             wgpu::util::TextureDataOrder::LayerMajor,
             bytemuck::cast_slice(&texels),
+        );
+        // The codes: the corner's two faces below row 12, none elsewhere.
+        let code_at = |x: u32, y: u32| -> [f32; 2] {
+            match (x, y) {
+                (0..4, 12..) => [0.0, 529.0],
+                (4..8, 12..) => [0.0, 533.0],
+                _ => [0.0; 2],
+            }
+        };
+        let codes: Vec<u16> = (0..N)
+            .flat_map(|y| (0..N).flat_map(move |x| code_at(x, y)))
+            .map(half)
+            .collect();
+        let code = device.create_texture_with_data(
+            &queue,
+            &wgpu::TextureDescriptor {
+                label: Some("blur_code"),
+                size: wgpu::Extent3d {
+                    width: N,
+                    height: N,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: probe_pass::REACH_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            bytemuck::cast_slice(&codes),
         );
         let depth = make(
             "blur_depth",
@@ -467,7 +550,8 @@ mod tests {
             depth.create_view(&Default::default()),
             dst.create_view(&Default::default()),
         );
-        let group = blur.bind_views(&device, &src_view, &depth_view, &dst_view);
+        let code_view = code.create_view(&Default::default());
+        let group = blur.bind_views(&device, &src_view, &depth_view, &dst_view, &code_view);
         let row = 256u32;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("blur_readback"),
@@ -551,6 +635,17 @@ mod tests {
             "a texel beside an empty one lost colour or coverage to it"
         );
         assert_eq!(at(12, 12), [1.0; 4]);
+        eprintln!("corner: front {:?}, side {:?}", at(3, 13), at(4, 13));
+        assert_eq!(
+            at(3, 13),
+            [0.5, 0.5, 0.5, 1.0],
+            "one face of the corner took the other's reflection"
+        );
+        assert_eq!(
+            at(4, 13),
+            [0.25, 0.25, 0.25, 1.0],
+            "the other face of the corner took the first's reflection"
+        );
     }
 
     #[test]
