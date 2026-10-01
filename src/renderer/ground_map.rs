@@ -357,7 +357,7 @@ pub const GROUND_TRACE_MAX_STEPS: u32 = 64;
 const GROUND_MAX_MARGIN: f32 = 0.02;
 
 /// A half float's value back as a single: the exact value the GPU reads.
-fn f16_to_f32(h: u16) -> f32 {
+pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = ((h >> 10) & 0x1f) as i32;
     let mant = (h & 0x3ff) as f32;

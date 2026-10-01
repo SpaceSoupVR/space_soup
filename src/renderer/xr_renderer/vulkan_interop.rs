@@ -235,6 +235,26 @@ pub(super) fn supports_depth_attachment(device: &wgpu::Device, format: vk::Forma
     props.optimal_tiling_features.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
 }
 
+/// Whether this device filters `format` linearly when sampled. A shadow
+/// map's comparison sampler asks for Linear; where the format cannot, the
+/// driver may return each texel's test unfiltered, and every shadow edge comes
+/// out in texel-sized squares however wide the kernel.
+pub(super) fn filters_linearly(device: &wgpu::Device, format: vk::Format) -> bool {
+    use wgpu::hal::vulkan as hvk;
+    let Some(hal_device) = (unsafe { device.as_hal::<hvk::Api>() }) else {
+        return false;
+    };
+    let props = unsafe {
+        hal_device
+            .shared_instance()
+            .raw_instance()
+            .get_physical_device_format_properties(hal_device.raw_physical_device(), format)
+    };
+    props
+        .optimal_tiling_features
+        .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+}
+
 /// [`import_vk_image_as_wgpu`] with its usages given: a depth swapchain's
 /// image is a depth target, not a colour one.
 pub(super) unsafe fn import_vk_image_as_wgpu_with(

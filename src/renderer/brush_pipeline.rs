@@ -2129,8 +2129,19 @@ struct ProbePassOut {
         pub reach_single: TextureView,
         _samplers: [Sampler; 2],
         pub bind_group: BindGroup,
+        /// The colour blurred, for one eye: see `probe_blur`. `None` for two.
+        pub soft: Option<Soft>,
         pub width: u32,
         pub height: u32,
+    }
+
+    /// A single-eye target's reflections after `probe_blur`: what the blur
+    /// writes, and the scene pass's group 3 reading them in place of the
+    /// colour, with the same depth and samplers.
+    pub struct Soft {
+        _texture: Texture,
+        pub write_view: TextureView,
+        pub bind_group: BindGroup,
     }
 
     impl Target {
@@ -2228,15 +2239,26 @@ struct ProbePassOut {
                 })
             };
             let samplers = [sampler("probe_pass_linear", FilterMode::Linear), sampler("probe_pass_point", FilterMode::Nearest)];
-            let bind_group = device.create_bind_group(&BindGroupDescriptor {
-                label: Some("probe_pass_bg"),
-                layout,
-                entries: &[
-                    BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&color_array) },
-                    BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&depth_array) },
-                    BindGroupEntry { binding: 2, resource: BindingResource::Sampler(&samplers[0]) },
-                    BindGroupEntry { binding: 3, resource: BindingResource::Sampler(&samplers[1]) },
-                ],
+            let reading = |label: &str, colour: &TextureView| {
+                device.create_bind_group(&BindGroupDescriptor {
+                    label: Some(label),
+                    layout,
+                    entries: &[
+                        BindGroupEntry { binding: 0, resource: BindingResource::TextureView(colour) },
+                        BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&depth_array) },
+                        BindGroupEntry { binding: 2, resource: BindingResource::Sampler(&samplers[0]) },
+                        BindGroupEntry { binding: 3, resource: BindingResource::Sampler(&samplers[1]) },
+                    ],
+                })
+            };
+            let bind_group = reading("probe_pass_bg", &color_array);
+            // The blurred colour, for one eye: written by `probe_blur` after the
+            // fix-up, read by the scene pass in place of the colour.
+            let soft = (layers == 1).then(|| {
+                let texture = make("probe_pass_soft", FORMAT, TextureUsages::STORAGE_BINDING);
+                let write_view = attachment(&texture);
+                let bind_group = reading("probe_pass_soft_bg", &array(&texture));
+                Soft { _texture: texture, write_view, bind_group }
             });
             Self {
                 _color: color,
@@ -2253,6 +2275,7 @@ struct ProbePassOut {
                 reach_single,
                 _samplers: samplers,
                 bind_group,
+                soft,
                 width,
                 height,
             }

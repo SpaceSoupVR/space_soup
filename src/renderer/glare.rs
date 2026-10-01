@@ -83,9 +83,87 @@ const MIN_CORE_DEGREES: f32 = 0.5;
 /// half resolution is no finer than that.
 const WALL_MARGIN: f32 = LAMP_RADIUS;
 
+/// HOW MUCH OF A FIXTURE'S LIGHT SHOWS, AND WHERE, from every direction round
+/// it: baked from its model, ray by ray, from 648 directions 10 degrees apart
+/// (`space_soup_engine::reflection_cards::GlareTable`, which this mirrors as
+/// plain data). It replaced weighing six sides by how squarely the eye faces
+/// each: from the side of a hanging lamp that put a quarter of its bulb, seen
+/// whole from below, into a view where the shade hides it, and the veil glared
+/// through the shade; from below a sconce at a slant it grew the veil from up
+/// inside the shade, over the dark outside (headset, 2026-09-30).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlareTable {
+    /// Polar bands from the fixture's `+y` down to `-y`.
+    pub rows: usize,
+    /// Round `+y`, from `+x` toward `+z`.
+    pub cols: usize,
+    /// Row after row: the share of a bare lamp's light that shows toward that
+    /// direction (see `GlareSource::sides`).
+    pub share: Vec<f32>,
+    /// Where it shows, in the fixture's frame from the table's origin.
+    pub centre: Vec<Vec3>,
+}
+
+impl GlareTable {
+    /// The direction, in the fixture's frame, entry `(row, col)` describes:
+    /// `space_soup_engine::reflection_cards::glare_direction`, held to it by
+    /// `quest_app`'s glare tests.
+    pub fn direction(&self, row: usize, col: usize) -> Vec3 {
+        let theta = (row as f32 + 0.5) / self.rows.max(1) as f32 * std::f32::consts::PI;
+        let phi = (col as f32 + 0.5) / self.cols.max(1) as f32 * std::f32::consts::TAU;
+        Vec3::new(
+            theta.sin() * phi.cos(),
+            theta.cos(),
+            theta.sin() * phi.sin(),
+        )
+    }
+
+    /// The share and centre toward `local`, a direction in the fixture's
+    /// frame: the four entries round it, bilinearly, the columns wrapping
+    /// round the pole axis. The centre is weighed by share as well, so an entry
+    /// that shows nothing does not pull it toward the origin.
+    pub fn sample(&self, local: Vec3) -> (f32, Vec3) {
+        let n = self.rows * self.cols;
+        let Some(d) = local.try_normalize() else {
+            return (0.0, Vec3::ZERO);
+        };
+        if n == 0 || self.share.len() != n || self.centre.len() != n {
+            return (0.0, Vec3::ZERO);
+        }
+        let theta = d.y.clamp(-1.0, 1.0).acos();
+        let phi = d.z.atan2(d.x).rem_euclid(std::f32::consts::TAU);
+        let y = (theta / std::f32::consts::PI * self.rows as f32 - 0.5)
+            .clamp(0.0, (self.rows - 1) as f32);
+        let x = phi / std::f32::consts::TAU * self.cols as f32 - 0.5;
+        let (r0, fy) = (y.floor() as usize, y.fract());
+        let r1 = (r0 + 1).min(self.rows - 1);
+        let x0 = x.floor();
+        let fx = x - x0;
+        let c0 = (x0 as i64).rem_euclid(self.cols as i64) as usize;
+        let c1 = (c0 + 1) % self.cols;
+        let (mut share, mut centre) = (0.0f32, Vec3::ZERO);
+        for (r, wy) in [(r0, 1.0 - fy), (r1, fy)] {
+            for (c, wx) in [(c0, 1.0 - fx), (c1, fx)] {
+                let i = r * self.cols + c;
+                let w = wx * wy * self.share[i].max(0.0);
+                share += w;
+                centre += self.centre[i] * w;
+            }
+        }
+        (
+            share,
+            if share > 1e-9 {
+                centre / share
+            } else {
+                Vec3::ZERO
+            },
+        )
+    }
+}
+
 /// One source of glare this frame, in the player's frame (as lights are
 /// uploaded).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GlareSource {
     /// The bulb.
     pub position: Vec3,
@@ -107,6 +185,11 @@ pub struct GlareSource {
     /// below, not its bulb up inside the shade. `None` puts every side's at
     /// `position`. See `visible_centre`.
     pub centres: Option<[Vec3; 6]>,
+    /// The fixture's glare table, and the point in this frame its centres are
+    /// measured from (its box's middle): where it has one, it alone says how
+    /// much shows and where, in place of `sides`, `centres` and `cone`. See
+    /// [`GlareTable`].
+    pub table: Option<(std::sync::Arc<GlareTable>, Vec3)>,
 }
 
 /// Where the light of `s` shows from `eye`: each side's centre weighed as
@@ -114,6 +197,15 @@ pub struct GlareSource {
 /// bulb itself, a sconce seen from below glowed on its dark shade, above the
 /// mouth the light actually leaves by (headset, 2026-09-30).
 pub fn visible_centre(s: &GlareSource, eye: Vec3) -> Vec3 {
+    if let Some((table, origin)) = &s.table {
+        let local = s.rotation.inverse() * (eye - *origin);
+        let (share, centre) = table.sample(local);
+        return if share > 0.0 {
+            *origin + s.rotation * centre
+        } else {
+            s.position
+        };
+    }
     let Some(centres) = s.centres else { return s.position };
     let Some(to_eye) = (eye - s.position).try_normalize() else { return s.position };
     let local = s.rotation.inverse() * to_eye;
@@ -136,6 +228,9 @@ pub fn visible_centre(s: &GlareSource, eye: Vec3) -> Vec3 {
 /// light: its sides weighed by how squarely the eye lies along each axis of the
 /// fixture, and a spot's cone.
 pub fn visible_share(s: &GlareSource, eye: Vec3) -> f32 {
+    if let Some((table, origin)) = &s.table {
+        return table.sample(s.rotation.inverse() * (eye - *origin)).0;
+    }
     let Some(to_eye) = (eye - s.position).try_normalize() else { return 0.0 };
     let local = s.rotation.inverse() * to_eye;
     let mut share = 0.0;
@@ -554,6 +649,7 @@ mod tests {
             rotation: Quat::IDENTITY,
             cone: None,
             centres: None,
+            table: None,
         }
     }
 
@@ -578,6 +674,103 @@ mod tests {
         assert!((c - (both[0] + mouth) * 0.5).length() < 1e-5, "{c}");
         // No centres: the bulb, as before.
         assert_eq!(visible_centre(&sconce([1.0; 6]), Vec3::ZERO), bulb);
+    }
+
+    /// A table whose fixture shows its light only within 30 degrees of
+    /// straight down, from a mouth 10 cm below its middle.
+    fn mouth_down_table() -> GlareTable {
+        let (rows, cols) = (18, 36);
+        let mut t = GlareTable {
+            rows,
+            cols,
+            share: vec![0.0; rows * cols],
+            centre: vec![Vec3::ZERO; rows * cols],
+        };
+        for row in 0..rows {
+            for col in 0..cols {
+                if t.direction(row, col).y < -(30.0f32).to_radians().cos() {
+                    t.share[row * cols + col] = 1.0;
+                    t.centre[row * cols + col] = Vec3::new(0.0, -0.1, 0.0);
+                }
+            }
+        }
+        t
+    }
+
+    /// THE TABLE SAYS WHAT SHOWS, and nothing leaks round it: a lamp whose
+    /// shade hides its bulb past 30 degrees from straight down shows it fully
+    /// below and not at all from 60 degrees off, where weighing six sides by
+    /// how squarely the eye faces each put a quarter of the view from below --
+    /// the veil through a hanging lamp's shade (headset, 2026-09-30). The veil
+    /// grows from the table's centre, turned and placed with the fixture.
+    #[test]
+    fn a_glare_table_shows_only_what_the_fixture_shows() {
+        let origin = Vec3::new(0.0, 2.0, 0.0);
+        let s = GlareSource {
+            table: Some((std::sync::Arc::new(mouth_down_table()), origin)),
+            ..sconce([0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+        };
+        let off_axis = |deg: f32| {
+            origin + Vec3::new(deg.to_radians().sin(), -deg.to_radians().cos(), 0.0) * 3.0
+        };
+        assert!(visible_share(&s, off_axis(0.0)) > 0.99, "straight below");
+        assert_eq!(
+            visible_share(&s, off_axis(60.0)),
+            0.0,
+            "60 degrees off, behind the shade"
+        );
+        let blended = GlareSource {
+            table: None,
+            ..s.clone()
+        };
+        assert!(
+            visible_share(&blended, off_axis(60.0)) > 0.2,
+            "the six sides' blend leaked there"
+        );
+        assert!((visible_centre(&s, off_axis(10.0)) - Vec3::new(0.0, 1.9, 0.0)).length() < 1e-5);
+        // Turned over with its fixture, it shows upward from 10 cm above.
+        let over = GlareSource {
+            rotation: Quat::from_rotation_x(std::f32::consts::PI),
+            ..s.clone()
+        };
+        assert!(visible_share(&over, origin + Vec3::Y * 3.0) > 0.99);
+        assert!(
+            (visible_centre(&over, origin + Vec3::Y * 3.0) - Vec3::new(0.0, 2.1, 0.0)).length()
+                < 1e-5
+        );
+        // Nothing shows: the veil stays at the bulb, and draws nothing.
+        assert_eq!(visible_centre(&s, origin + Vec3::Y * 3.0), s.position);
+        assert!(glare_quad(&s, origin + Vec3::Y * 3.0, 3.6, 1.0).is_none());
+    }
+
+    /// The table is read between its entries, the columns wrapping round:
+    /// half way between the last column and the first is their mean.
+    #[test]
+    fn a_glare_table_reads_between_its_entries_and_wraps_round() {
+        let (rows, cols) = (4, 8);
+        let mut t = GlareTable {
+            rows,
+            cols,
+            share: vec![0.0; rows * cols],
+            centre: vec![Vec3::ZERO; rows * cols],
+        };
+        for row in 0..rows {
+            t.share[row * cols] = 1.0; // column 0
+            t.share[row * cols + cols - 1] = 3.0; // the last column
+            t.centre[row * cols] = Vec3::X;
+            t.centre[row * cols + cols - 1] = Vec3::Z;
+        }
+        // Exactly on the entries.
+        let at = |row: usize, col: usize| t.sample(t.direction(row, col));
+        assert!((at(1, 0).0 - 1.0).abs() < 1e-4 && (at(1, cols - 1).0 - 3.0).abs() < 1e-4);
+        // Through +x, half way between the last column and the first.
+        let between = t.sample(Vec3::new(1.0, 0.1, 0.0));
+        assert!((between.0 - 2.0).abs() < 1e-3, "{between:?}");
+        // The centre by share: three parts +z to one part +x.
+        assert!(
+            (between.1 - (Vec3::X + 3.0 * Vec3::Z) / 4.0).length() < 1e-3,
+            "{between:?}"
+        );
     }
 
     /// The lamp radius is the lighting's: the veil's core and the light at the
@@ -646,7 +839,8 @@ mod tests {
         // Bright enough, the cap: a brighter lamp's quad grows no wider.
         let blinding = glare_quad(&s, Vec3::ZERO, 3600.0, 1.0).unwrap();
         assert_eq!(blinding.degrees, MAX_GLARE_DEGREES);
-        let (v, i) = build_glare(&[s], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[]);
+        let (v, i) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[],
+        );
         assert_eq!((v.len(), i.len()), (4, 6));
         // Centred in front of the bulb by the wall margin, and as wide from
         // there as the veil is from the bulb; the taps sized to the bulb.
@@ -655,7 +849,7 @@ mod tests {
         let half = (Vec3::from(v[0].position) - centre).x.abs();
         assert!((half - (2.0 - WALL_MARGIN) * q.degrees.to_radians().tan()).abs() < 1e-4);
         assert!((v[0].test[3] - LAMP_RADIUS / half).abs() < 1e-5);
-        let (untested, _) = build_glare(&[s], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, false, &[]);
+        let (untested, _) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, false, &[]);
         assert!(untested.iter().all(|v| v.test[3] < 0.0), "no probe pass, no wall test");
     }
 
@@ -681,7 +875,7 @@ mod tests {
         // One eye shielded, the other not: half the veil.
         let s = GlareSource { position: bulb, ..sconce([1.0; 6]) };
         let eyes = [eye - across * 0.032, eye + across * 0.032];
-        let peak = |caps: &[(Vec3, Vec3, f32)]| build_glare(&[s], eyes, across, Vec3::Y, 3.6, 1.0, false, caps).0[0].shape[0];
+        let peak = |caps: &[(Vec3, Vec3, f32)]| build_glare(&[s.clone()], eyes, across, Vec3::Y, 3.6, 1.0, false, caps).0[0].shape[0];
         // `shape[0]` is the veil's scale, which carries the shielding.
         let one_eye = (eyes[0] + to_bulb * 0.3, eyes[0] + to_bulb * 0.3 + Vec3::Y * 0.01, 0.02);
         assert!((peak(&[one_eye]) / peak(&[]) - 0.5).abs() < 0.02, "{} vs {}", peak(&[one_eye]), peak(&[]));

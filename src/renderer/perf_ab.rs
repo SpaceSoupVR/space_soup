@@ -109,10 +109,15 @@ pub enum Phase {
     /// their capsules there. Off as shipped, so this phase measures what
     /// turning it on would cost.
     FloorMirror,
+    /// The reflections unblurred (`probe_blur` off): what the blur costs.
+    NoReflectionBlur,
+    /// The player off cards (`character_cards` off), their reflection their
+    /// capsules again: what drawing and reading the cards costs.
+    NoCharacterCards,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 23] = [
+    pub const ALL: [Phase; 25] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -136,6 +141,8 @@ impl Phase {
         Phase::NoGlare,
         Phase::NoTerminatorAa,
         Phase::FloorMirror,
+        Phase::NoReflectionBlur,
+        Phase::NoCharacterCards,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -182,6 +189,8 @@ impl Phase {
             Phase::NoGlare => "no_glare",
             Phase::NoTerminatorAa => "no_terminator_aa",
             Phase::FloorMirror => "floor_mirror",
+            Phase::NoReflectionBlur => "no_reflection_blur",
+            Phase::NoCharacterCards => "no_character_cards",
         }
     }
 }

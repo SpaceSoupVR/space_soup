@@ -67,7 +67,47 @@ pub struct ProxyCards {
 /// skipped: a different card size than the first, or past
 /// [`MAX_CARD_SETS`]). `None` for no cards at all.
 pub fn atlas(device: &Device, queue: &Queue, sets: &[ProxyCards]) -> Option<(TextureView, Vec<Option<u32>>)> {
-    let res = sets.iter().map(|c| c.resolution).find(|&r| r > 0)?;
+    if !sets.iter().any(|c| c.resolution > 0) {
+        return None;
+    }
+    let a = atlas_with_characters(device, queue, sets, 0);
+    (a.rows.iter().any(Option::is_some)).then_some((a.view, a.rows))
+}
+
+/// How many characters' cards the atlas keeps rows for, after the models':
+/// the player's. See `character_cards`.
+pub const CHARACTER_CARD_SETS: usize = 1;
+
+/// Texels across a card where the level has no cards to set the size.
+pub const DEFAULT_RESOLUTION: u32 = 64;
+
+/// The atlas with rows kept for characters' cards: see [`atlas_with_characters`].
+pub struct CardAtlas {
+    /// Kept to draw into: the characters' rows are filled every frame.
+    pub texture: wgpu::Texture,
+    pub view: TextureView,
+    /// Texels across a card.
+    pub resolution: u32,
+    pub levels: u32,
+    /// Each input set's colour row, as [`atlas`] gives it.
+    pub rows: Vec<Option<u32>>,
+    /// Each character's row, after the models'. A character's cards hold
+    /// their own encoding, not a model's: premultiplied albedo with coverage
+    /// in alpha, and nothing in the row after. See `character_cards`.
+    pub character_rows: Vec<u32>,
+}
+
+/// [`atlas`], always made, with two rows for each of `characters` after the
+/// models' -- at the models' card size, or [`DEFAULT_RESOLUTION`] -- left
+/// empty for `character_cards` to fill every frame.
+pub fn atlas_with_characters(
+    device: &Device,
+    queue: &Queue,
+    sets: &[ProxyCards],
+    characters: usize,
+) -> CardAtlas {
+    let res = sets.iter().map(|c| c.resolution).find(|&r| r > 0)
+        .unwrap_or(DEFAULT_RESOLUTION);
     let mut rows: Vec<Option<u32>> = Vec::with_capacity(sets.len());
     let mut used = 0u32;
     for c in sets {
@@ -81,14 +121,17 @@ pub fn atlas(device: &Device, queue: &Queue, sets: &[ProxyCards]) -> Option<(Tex
             2 * (used - 1)
         }));
     }
-    if used == 0 {
-        return None;
-    }
+    let character_rows: Vec<u32> = (0..characters as u32).map(|k| 2 * (used + k)).collect();
     // Level 0, the atlas as the file has it: linear RGB and the depth `t`,
     // and below, the normal and `t` as a range of one depth, until widened.
+    // The characters' rows empty: no coverage.
     let width = res * CARD_FACES as u32;
-    let height = 2 * res * used;
+    let height = 2 * res * (used + characters as u32).max(1);
     let mut level: Vec<[f32; 4]> = vec![[0.0, 0.0, 0.0, MISS]; (width * height) as usize];
+    for &row in &character_rows {
+        let start = (row * res * width) as usize;
+        level[start..start + (2 * res * width) as usize].fill([0.0; 4]);
+    }
     for (c, row) in sets.iter().zip(&rows) {
         let Some(row) = row else { continue };
         for face in 0..CARD_FACES as u32 {
@@ -148,7 +191,7 @@ pub fn atlas(device: &Device, queue: &Queue, sets: &[ProxyCards]) -> Option<(Tex
             wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
         );
     }
-    Some((tex.create_view(&wgpu::TextureViewDescriptor::default()), rows))
+    CardAtlas { view: tex.create_view(&wgpu::TextureViewDescriptor::default()), texture: tex, resolution: res, levels, rows, character_rows }
 }
 
 /// `t` for a texel whose card saw nothing. Must equal

@@ -418,6 +418,20 @@ pub struct XrRenderer {
     /// Group 3 of each eye's deferring probe pass: the record list, and that
     /// eye's floor mirror. See `probe_fixup::ProbeFixups::pass_bind_group_for`.
     probe_fixup_passes: [wgpu::BindGroup; 2],
+    /// A little blur on every reflection, after the fix-up: each eye's target
+    /// into its blurred colour, which the scene pass then reads. See
+    /// `probe_blur`; the lever `reflection_blur`.
+    probe_blur: crate::renderer::probe_blur::ProbeBlur,
+    probe_blur_groups: [Option<wgpu::BindGroup>; 2],
+    /// THE PLAYER ON CARDS: six views of their body drawn every frame into
+    /// the card atlas's rows kept for them, which a reflection reads where it
+    /// meets them. Made with the atlas, at its cards' size. See
+    /// `character_cards`; the lever `character_cards`.
+    character_cards: Option<crate::renderer::character_cards::CharacterCards>,
+    /// The card atlas the level's models and the characters share: the
+    /// characters' rows are copied into it each frame. See
+    /// `proxy_cards::atlas_with_characters`.
+    card_atlas: Option<crate::renderer::proxy_cards::CardAtlas>,
     /// THE GROUND in the probe pass and reading it back. See
     /// `TerrainPipeline::new_probe_pass`; the lever `terrain_probe_pass`.
     terrain_probe_pass_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
@@ -555,6 +569,9 @@ pub struct XrRenderer {
     /// Each probe's average photographed radiance, indexed by PROBE, for the
     /// shader's normalisation. See `uniforms::probe_mean_radiance`.
     probe_brightness: Vec<f32>,
+    /// The level's photographs as the models take their room's light from
+    /// them: see `room_light`. Empty without probes.
+    room_descs: Vec<crate::renderer::probe_stream::ProbeDesc>,
     /// Each probe's ROOM, by probe index. See `ProbeUpload::set_volume`.
     probe_rooms: Vec<u32>,
     /// The outdoor volume, when the level's probes name one: the volume none of
@@ -917,7 +934,7 @@ impl XrRenderer {
                 // APPENDED, not inserted: the existing slots are addressed by
                 // index from the passes themselves, so a new label in the
                 // middle would silently retime them.
-                &["scene_l", "eye_l", "scene_r", "eye_r", "prep_l", "prep_r", "refl_l", "refl_r", "probe_l", "probe_r", "fix_l", "fix_r", "mirror_l", "mirror_r", "mips_l", "mips_r"],
+                &["scene_l", "eye_l", "scene_r", "eye_r", "prep_l", "prep_r", "refl_l", "refl_r", "probe_l", "probe_r", "fix_l", "fix_r", "mirror_l", "mirror_r", "mips_l", "mips_r", "blur_l", "blur_r", "cards", "card_mips"],
                 period,
             )
         });
@@ -928,6 +945,11 @@ impl XrRenderer {
         let shadow_map = crate::renderer::shadow::ShadowMap::with_dimension(
             &wgpu_device,
             crate::renderer::shadow::QUEST_SHADOW_DIM,
+        );
+        log::info!(
+            "shadow maps: Depth32Float filters linearly: {} (D16: {})",
+            vulkan_interop::filters_linearly(&wgpu_device, vk::Format::D32_SFLOAT),
+            vulkan_interop::filters_linearly(&wgpu_device, vk::Format::D16_UNORM),
         );
         let uniform_buf = UniformBuffer::new(
             &wgpu_device,
@@ -994,6 +1016,10 @@ impl XrRenderer {
             std::array::from_fn(|eye| probe_fixups.target_bind_group(&wgpu_device, &probe_pass_targets[eye]));
         let probe_fixup_passes: [wgpu::BindGroup; 2] =
             std::array::from_fn(|eye| probe_fixups.pass_bind_group_for(&wgpu_device, &probe_pass_targets[eye]));
+        let probe_blur = crate::renderer::probe_blur::ProbeBlur::new(&wgpu_device);
+        let probe_blur_groups: [Option<wgpu::BindGroup>; 2] = std::array::from_fn(|eye| {
+            probe_blur.bind_group(&wgpu_device, &probe_pass_targets[eye])
+        });
         let terrain_probe_pass_pipeline =
             crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass(&wgpu_device, &uniform_buf.layout, &probe_fixups);
         let terrain_probe_reader_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_reader(
@@ -1416,6 +1442,10 @@ impl XrRenderer {
             probe_fixups,
             probe_fixup_targets,
             probe_fixup_passes,
+            probe_blur,
+            probe_blur_groups,
+            character_cards: None,
+            card_atlas: None,
             terrain_probe_pass_pipeline,
             terrain_probe_reader_pipeline,
             stereo_probe,
@@ -1497,6 +1527,7 @@ impl XrRenderer {
             probe_view: None,
             probe_volumes: Vec::new(),
             probe_brightness: Vec::new(),
+            room_descs: Vec::new(),
             probe_rooms: Vec::new(),
             probe_outdoor_volume: None,
             probe_buildings: Vec::new(),
@@ -1655,7 +1686,7 @@ impl XrRenderer {
                 };
                 // No distances come with this path: no room is told apart as
                 // the outdoors, and nothing is traced as outdoors.
-                crate::renderer::probe_stream::ProbeDesc { centre: p.2, min: p.3, max: p.4, volume: volume as u32, has_depth: true }
+                crate::renderer::probe_stream::ProbeDesc { centre: p.2, min: p.3, max: p.4, volume: volume as u32, has_depth: true, room_light: None }
             })
             .collect();
         let owned: Arc<Vec<Vec<u8>>> = Arc::new(usable.iter().map(|p| p.0.to_vec()).collect());
@@ -1701,6 +1732,13 @@ impl XrRenderer {
         depth: Option<crate::renderer::probe_stream::ProbeDepthSource>,
     ) {
         use crate::renderer::uniforms::{ProbeUpload, MAX_PROBES};
+        // The models' room light, from the bake's harmonics: see `room_light`.
+        self.room_descs = descs.clone();
+        log::info!(
+            "room light: {} of {} photograph(s) carry their room's light for the models",
+            descs.iter().filter(|d| d.room_light.is_some()).count(),
+            descs.len(),
+        );
         // ONE PASS OVER THE PIXELS, now: the brightness the shader normalises
         // by and the eye's meter both need every probe, and neither needs the
         // pixels again.
@@ -2015,24 +2053,34 @@ impl XrRenderer {
         fields: Vec<crate::renderer::proxy_field::ProxyField>,
         cards: Vec<crate::renderer::proxy_cards::ProxyCards>,
     ) {
-        // The models' cards, two rows each (colours, then normals); a proxy
-        // then names its colours' row, and a set the atlas could not take
-        // leaves its proxies with none.
-        match crate::renderer::proxy_cards::atlas(&self.wgpu_device, &self.wgpu_queue, &cards) {
-            Some((view, rows)) => {
-                self.uniform_buf.set_proxy_card_atlas(view);
+        // The models' cards, two rows each (colours, then normals), and the
+        // rows the characters' cards are drawn into every frame; a proxy then
+        // names its colours' row, and a set the atlas could not take leaves
+        // its proxies with none.
+        let atlas = crate::renderer::proxy_cards::atlas_with_characters(&self.wgpu_device, &self.wgpu_queue, &cards,
+            crate::renderer::proxy_cards::CHARACTER_CARD_SETS,
+        );
+        self.uniform_buf.set_proxy_card_atlas(atlas.view.clone());
                 for p in &mut proxies {
-                    p.cards = p.cards.and_then(|i| rows.get(i as usize).copied().flatten());
+                    p.cards = p.cards.and_then(|i| atlas.rows.get(i as usize).copied().flatten());
                 }
-                log::info!("reflection cards: {} model(s) on cards", rows.iter().flatten().count());
-            }
-            None => {
-                self.uniform_buf.set_proxy_card_atlas(crate::renderer::proxy_cards::none(&self.wgpu_device));
-                for p in &mut proxies {
-                    p.cards = None;
-                }
-            }
+                log::info!(
+            "reflection cards: {} model(s) on cards; {} character set(s), {} texels a card",
+            atlas.rows.iter().flatten().count(),
+            atlas.character_rows.len(),
+            atlas.resolution,
+        );
+        if self
+            .character_cards
+            .as_ref()
+            .is_none_or(|c| c.resolution() != atlas.resolution)
+        {
+                self.character_cards = Some(crate::renderer::character_cards::CharacterCards::new(&self.wgpu_device,
+                atlas.resolution,
+                &self.skinned_mesh_pipeline,
+            ));
         }
+        self.card_atlas = Some(atlas);
         self.probe_proxies = proxies;
         // The models' distance fields, packed and bound; where each lies goes
         // up with every frame's probes. See `proxy_field`.

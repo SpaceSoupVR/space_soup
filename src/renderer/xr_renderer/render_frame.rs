@@ -386,11 +386,18 @@ impl XrRenderer {
                 * instance.mesh.position
                 + self.player.offset;
             let sky_vis = self.sky_visibility_at(world.x, world.z);
-            instance.model.upload_full(
+            // The lit room round it, turned into the player's frame its
+            // normals are in. See `room_light`.
+            let room = crate::renderer::room_light::turned_to_player(
+                &crate::renderer::room_light::room_light_at(&self.room_descs, world),
+                self.player.yaw,
+            );
+            instance.model.upload_lit(
                 &self.wgpu_queue,
                 instance.mesh.model_matrix(),
                 sky_vis,
                 instance.emissive_drive,
+                &room,
             );
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(
@@ -423,9 +430,22 @@ impl XrRenderer {
         let mut mirror_only_skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut mirror_only_layered_draws: Vec<LayeredDraw> = Vec::new();
         for instance in mirror_only_meshes {
-            instance
-                .model
-                .upload(&self.wgpu_queue, instance.mesh.model_matrix());
+            // Lit as the same mesh in view would be: it is the same body. The
+            // open sky this gave them made a body in the floor brighter than
+            // the one standing on it indoors.
+            let world = glam::Quat::from_rotation_y(self.player.yaw) * instance
+                .mesh.position
+                + self.player.offset;
+            let room = crate::renderer::room_light::turned_to_player(
+                &crate::renderer::room_light::room_light_at(&self.room_descs, world),
+                self.player.yaw,
+            );
+            instance.model
+                .upload_lit(&self.wgpu_queue, instance.mesh.model_matrix(),
+                self.sky_visibility_at(world.x, world.z),
+                instance.emissive_drive,
+                &room,
+            );
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(
                 instance,
@@ -831,6 +851,24 @@ impl XrRenderer {
             && mirror_in_view;
         frame_player.capsules.shadow_lights =
             std::array::from_fn(|k| character_tiles.get(k).map_or(-1.0, |(i, _)| *i as f32));
+        // THE PLAYER ON CARDS this frame: the box round their capsules and the
+        // atlas row the reflections are told to read, drawn before the first
+        // probe pass below. Their body is the mirror-only mesh, and their
+        // capsules the first group (`set_capsules`). See `character_cards`.
+        let card_frame = match (&self.character_cards, &self.card_atlas) {
+            (Some(_), Some(atlas))
+                if fx.character_cards && !mirror_only_skinned_draws.is_empty() =>
+            {
+                atlas.character_rows.first().copied().zip(
+                    crate::renderer::character_cards::card_box(&frame_player.capsules, 0),
+                )
+            }
+            _ => None,
+        };
+        if let Some((row, (centre, half))) = card_frame {
+            frame_player.capsules.cards[0] = [centre.x, centre.y, centre.z, row as f32 + 1.0];
+            frame_player.capsules.cards[1] = [half.x, half.y, half.z, 0.0];
+        }
 
         let shadow = crate::renderer::uniforms::ShadowUpload {
             sun_view_proj: match static_sun {
@@ -1522,6 +1560,17 @@ impl XrRenderer {
             // ITS SECONDARY LOOKUPS DEFERRED to a compute pass over just the
             // texels that need them, in the single-eye pass. See `probe_fixup`.
             let deferred_lookups = fx.deferred_reflection_lookups && !stereo;
+            // A LITTLE BLUR ON EVERY REFLECTION, after the fix-up, in the
+            // single-eye pass; the scene pass then reads the blurred colour.
+            // See `probe_blur`.
+            let blur = match (&self.probe_blur_groups[eye], &probe_target.soft) {
+                (Some(group), Some(soft)) if probe_pass && fx.reflection_blur && !stereo => {
+                    Some((group, soft))
+                }
+                _ => None,
+            };
+            let probe_read_group =
+                blur.map_or(&probe_target.bind_group, |(_, soft)| &soft.bind_group);
             // THE GROUND'S REFLECTION IN THE PROBE PASS TOO, read back in the
             // scene pass as the brushes' is. See `TerrainPipeline::new_probe_pass`.
             let terrain_in_probe_pass =
@@ -1537,6 +1586,45 @@ impl XrRenderer {
                 let mut encoder = self.wgpu_device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor { label: Some("ssr_scene") },
                 );
+                // The player's cards, once a frame, before anything reads them.
+                if let (0, Some((row, card_box)), Some(cards), Some(atlas)) =
+                    (eye, card_frame, &self.character_cards, &self.card_atlas)
+                {
+                    let parts: Vec<crate::renderer::character_cards::CardPart> = mirror_only_meshes
+                        .iter()
+                        .filter_map(|instance| {
+                            instance.mesh.skin.as_ref().map(|skin| (instance, skin))
+                        })
+                        .filter_map(|(instance, skin)| {
+                            skin.joint_bind_group
+                                .as_ref()
+                                .map(|joints| (instance, skin, joints))
+                        })
+                        .flat_map(|(instance, skin, joints)| {
+                            skin.primitives.iter().map(move |prim| {
+                                crate::renderer::character_cards::CardPart {
+                                    model: &instance.model.bind_group,
+                                    texture: &prim.texture.bind_group,
+                                    joints,
+                                    source: &prim.vertex_buffer,
+                                    vertices: &prim.vertices,
+                                    indices: &prim.indices,
+                                }
+                            })
+                        })
+                        .collect();
+                    cards.record(
+                        &self.wgpu_device,
+                        &self.wgpu_queue,
+                        &mut encoder,
+                        &self.floor_mirror_mips,
+                        &parts,
+                        card_box,
+                        &atlas.texture,
+                        row,
+                        self.pass_timers.as_ref().map(|t| (t, 18)),
+                    );
+                }
                 // THE CHARACTERS MIRRORED IN THE FLOOR, into this eye's probe
                 // pass target before its pass lays them over the floor: drawn
                 // with the twin's uniforms, then blurred. Single-eye only: the
@@ -1668,7 +1756,18 @@ impl XrRenderer {
                                 self.pass_timers.as_ref().and_then(|t| t.compute_writes(10 + eye)),
                             );
                         }
-                    }
+                        if let Some((group, _)) = blur {
+                            // Its own slots, `blur_l`/`blur_r`, after every other.
+                            self.probe_blur.dispatch(
+                                &mut encoder,
+                                group,
+                                (t.width, t.height),
+                                self.pass_timers
+                                    .as_ref()
+                                    .and_then(|t| t.compute_writes(16 + eye)),
+                            );
+                        }
+                }
                 }
                 // ONCE PER FRAME WHEN STEREO, not once per eye. The pass
                 // covers both layers, so running it again on the second eye
@@ -1858,7 +1957,7 @@ impl XrRenderer {
                     if let Some((index_start, count)) = terrain_range {
                         if terrain_in_probe_pass {
                             pass.set_pipeline(&self.terrain_probe_reader_pipeline.pipeline);
-                            pass.set_bind_group(3, &probe_target.bind_group, &[]);
+                            pass.set_bind_group(3, probe_read_group, &[]);
                         } else {
                             pass.set_pipeline(self.sp_terrain(stereo));
                         }
@@ -1918,7 +2017,7 @@ impl XrRenderer {
                         // colour map is a layer of one array.
                         if probe_pass {
                             pass.set_pipeline(&probe_reader.pipeline);
-                            pass.set_bind_group(3, &probe_target.bind_group, &[]);
+                            pass.set_bind_group(3, probe_read_group, &[]);
                         } else {
                             pass.set_pipeline(self.sp_brush(stereo));
                         }
@@ -2030,7 +2129,7 @@ impl XrRenderer {
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         // The probe pass's depth, for the walls: read only
                         // when that pass ran (`glare_tests_walls`).
-                        pass.set_bind_group(1, &probe_target.bind_group, &[]);
+                        pass.set_bind_group(1, probe_read_group, &[]);
                         pass.set_vertex_buffer(0, glare_vb.slice(..));
                         pass.set_index_buffer(glare_ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..glare_idx.len() as u32, 0, 0..1);
@@ -2577,6 +2676,14 @@ impl XrRenderer {
                 Ok(path) => log::info!("EYECAPTURE {request} -> {}", path.display()),
                 Err(e) => log::warn!("EYECAPTURE {request} failed: {e}"),
             }
+            // And the player's cards as this frame drew them: what their
+            // reflections read. Needs no swapchain access, so it is served
+            // whether or not the eyes could be.
+            match self.capture_cards(request) {
+                Ok(Some(path)) => log::info!("CARDCAPTURE {request} -> {}", path.display()),
+                Ok(None) => {}
+                Err(e) => log::warn!("CARDCAPTURE {request} failed: {e}"),
+            }
         }
         self.swapchain.release_image()?;
 
@@ -2626,6 +2733,44 @@ impl XrRenderer {
             .collect();
 
         Ok(proj_views)
+    }
+
+    /// THE PLAYER'S CARDS as last drawn, to the app's files:
+    /// `cardcapture_<id>.bin`, the bytes `CARD`, width and height as
+    /// little-endian u32s, then RGBA8 rows -- the six cards side by side,
+    /// albedo times coverage in sRGB, coverage in alpha. `None` with no cards
+    /// made. See `character_cards`.
+    fn capture_cards(&self, id: u32) -> Result<Option<std::path::PathBuf>, String> {
+        let Some(cards) = &self.character_cards else {
+            return Ok(None);
+        };
+        let (width, height, texels) = cards.read_back(&self.wgpu_device, &self.wgpu_queue)?;
+        let mut out = Vec::with_capacity(12 + 4 * texels.len());
+        out.extend_from_slice(b"CARD");
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        let srgb = |c: f32| {
+            let c = c.clamp(0.0, 1.0);
+            let v = if c <= 0.003_130_8 {
+                12.92 * c
+            } else {
+                1.055 * c.powf(1.0 / 2.4) - 0.055
+            };
+            (v * 255.0).round() as u8
+        };
+        for t in &texels {
+            out.extend_from_slice(&[
+                srgb(t[0]),
+                srgb(t[1]),
+                srgb(t[2]),
+                (t[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+            ]);
+        }
+        let path = ndk_glue::native_activity()
+            .external_data_path()
+            .join(format!("cardcapture_{id}.bin"));
+        std::fs::write(&path, &out).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Some(path))
     }
 
     /// BOTH EYES' FINISHED IMAGES of swapchain image `image_index`, as the

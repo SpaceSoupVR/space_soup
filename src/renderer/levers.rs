@@ -159,6 +159,15 @@ pub struct Levers {
     /// wherever a mirrored body could be in view -- which, with the Quest's
     /// tall field of view, is most views (2026-09-30). On once they cost less.
     pub floor_mirror: bool,
+    /// A little blur on every reflection: each half-resolution reflection
+    /// texel averaged with its neighbours on the same surface, so reflected
+    /// edges and highlights stop crawling with the texel grid. See
+    /// `probe_blur`.
+    pub reflection_blur: bool,
+    /// The player on cards: six views of their body drawn every frame, which
+    /// a reflection meeting them reads for their real outline and colours in
+    /// place of their capsules' one colour. See `character_cards`.
+    pub character_cards: bool,
     /// The CPU performance level asked of the runtime. `None` asks nothing,
     /// as shipped: the app keeps the level it started at. See
     /// `performance_level`.
@@ -236,6 +245,8 @@ impl Default for Levers {
             glare: true,
             glare_strength: 1.0,
             floor_mirror: false,
+            reflection_blur: true,
+            character_cards: true,
             cpu_level: None,
             gpu_level: None,
             terrain_detail_distance: 0.0,
@@ -294,6 +305,8 @@ impl Levers {
             Phase::NoGlare => l.glare = false,
             Phase::NoTerminatorAa => l.terminator_aa = false,
             Phase::FloorMirror => l.floor_mirror = true,
+            Phase::NoReflectionBlur => l.reflection_blur = false,
+            Phase::NoCharacterCards => l.character_cards = false,
         }
         l
     }
@@ -337,6 +350,8 @@ impl Levers {
         flag("glare", self.glare, d.glare);
         flag("terminator_aa", self.terminator_aa, d.terminator_aa);
         flag("floor_mirror", self.floor_mirror, d.floor_mirror);
+        flag("reflection_blur", self.reflection_blur, d.reflection_blur);
+        flag("character_cards", self.character_cards, d.character_cards);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("same_eyes", self.same_eyes, d.same_eyes);
         flag("half_viewport", self.half_viewport, d.half_viewport);
