@@ -168,6 +168,13 @@ pub struct Levers {
     /// a reflection meeting them reads for their real outline and colours in
     /// place of their capsules' one colour. See `character_cards`.
     pub character_cards: bool,
+    /// The least width, in eye pixels, the thin pass draws a model's wires,
+    /// chain links and rims at, fading them by the share they really fill so
+    /// their light is unchanged (see `mesh::thin_parts`). 0 draws them as
+    /// they are, among the opaque parts. 2 as shipped: a wire a third of a
+    /// pixel thick then holds its light to a few percent as it moves, where
+    /// 4x MSAA alone let it swing by a third (2026-10-01).
+    pub thin_parts: f32,
     /// The CPU performance level asked of the runtime. `None` asks nothing,
     /// as shipped: the app keeps the level it started at. See
     /// `performance_level`.
@@ -247,6 +254,7 @@ impl Default for Levers {
             floor_mirror: false,
             reflection_blur: true,
             character_cards: true,
+            thin_parts: 2.0,
             cpu_level: None,
             gpu_level: None,
             terrain_detail_distance: 0.0,
@@ -371,6 +379,9 @@ impl Levers {
         }
         if let Some(level) = self.gpu_level {
             out.push(format!("gpu_level={}", level.label()));
+        }
+        if self.thin_parts != d.thin_parts {
+            out.push(format!("thin_parts={}", self.thin_parts));
         }
         if self.terrain_detail_distance != d.terrain_detail_distance {
             out.push(format!("terrain_detail={}", self.terrain_detail_distance));

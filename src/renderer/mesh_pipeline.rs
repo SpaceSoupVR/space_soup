@@ -5,6 +5,10 @@ use wgpu::*;
 
 pub struct MeshPipeline {
     pub pipeline: RenderPipeline,
+    /// The same shading for a primitive's thin parts, widened and faded: see
+    /// `thin_parts`. Drawn after everything opaque and the sky, from the
+    /// primitive's `ThinParts`, with its `ThinVertex` buffer in slot 1.
+    pub thin_pipeline: RenderPipeline,
     pub texture_layout: BindGroupLayout,
     pub model_layout: BindGroupLayout,
     pub lightmap_layout: BindGroupLayout,
@@ -116,17 +120,17 @@ impl MeshPipeline {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("mesh_pipeline"),
+        let build = |label: &str, shader: &ShaderModule, buffers: &[Option<VertexBufferLayout>]| device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[Some(MeshVertex::layout())],
+                buffers,
             },
             fragment: Some(FragmentState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some(ColorTargetState {
@@ -153,9 +157,20 @@ impl MeshPipeline {
             multiview_mask: view.mask(),
             cache: None,
         });
+        let pipeline = build("mesh_pipeline", &shader, &[Some(MeshVertex::layout())]);
+        let thin_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("mesh_thin_shader"),
+            source: ShaderSource::Wgsl(view.shader(mesh_shader_variant(true)).into()),
+        });
+        let thin_pipeline = build(
+            "mesh_thin_pipeline",
+            &thin_shader,
+            &[Some(MeshVertex::layout()), Some(super::mesh::ThinVertex::layout())],
+        );
 
         Self {
             pipeline,
+            thin_pipeline,
             texture_layout,
             model_layout,
             lightmap_layout,
@@ -185,11 +200,14 @@ impl MeshPipeline {
 }
 
 /// A model's uniform, in bytes: its matrix (64), its params (16; x sky
-/// visibility, y emissive drive) and the room's light on it, nine vec4s of
-/// harmonics (144; see `room_light`). EVERY buffer that is ever bound as a
-/// `ModelUniform` is this size -- the mirror's and the caves' too, whose
-/// shaders read only the matrix -- so no upload can overrun one left behind.
-pub const MODEL_UNIFORM_SIZE: u64 = 224;
+/// visibility, y emissive drive, z its own bulb's mask marker, w the thin
+/// parts' least drawn width as a share of depth, 0 as they are), the room's
+/// light on it, nine vec4s of harmonics (144; see `room_light`), and a
+/// fixture's own bulb, three vec4s (48; see `ModelUniform::upload_lit_bulb`).
+/// EVERY buffer that is ever bound as a `ModelUniform` is this size -- the
+/// mirror's and the caves' too, whose shaders read only the matrix -- so no
+/// upload can overrun one left behind.
+pub const MODEL_UNIFORM_SIZE: u64 = 272;
 
 pub struct ModelUniform {
     pub buffer: Buffer,
@@ -257,12 +275,48 @@ impl ModelUniform {
         emissive_drive: f32,
         room: &crate::renderer::room_light::RoomLight,
     ) {
+        self.upload_lit_bulb(queue, model, sky_vis, emissive_drive, room, None, 0.0);
+    }
+
+    /// [`Self::upload_lit`], for a fixture: `own` is the fixture's own lamp
+    /// as this frame lights the room with it, in the same frame. A SPOT with
+    /// a stationary mask channel also lights the fixture's own surfaces
+    /// OUTSIDE its beam -- the bulb shines every way, and the beam is what
+    /// its reflector sends into the room; see `own_bulb_fill` in the shader.
+    /// Anything else, or `None`, adds nothing.
+    ///
+    /// `thin_width`: how wide the thin pass draws a thin part at least, as a
+    /// share of its depth -- an eye pixel's size there times how many pixels
+    /// (see `thin_parts`). 0 draws thin parts as they are, and only the thin
+    /// pass reads it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_lit_bulb(
+        &self,
+        queue: &Queue,
+        model: glam::Mat4,
+        sky_vis: f32,
+        emissive_drive: f32,
+        room: &crate::renderer::room_light::RoomLight,
+        own: Option<&crate::renderer::Light>,
+        thin_width: f32,
+    ) {
         let mut data = [0f32; (MODEL_UNIFORM_SIZE / 4) as usize];
         data[..16].copy_from_slice(&model.to_cols_array());
         data[16] = sky_vis.clamp(0.0, 1.0);
         data[17] = emissive_drive.max(0.0);
+        data[19] = thin_width.max(0.0);
         for (i, c) in room.iter().enumerate() {
             data[20 + 4 * i..23 + 4 * i].copy_from_slice(c);
+        }
+        let spot = own.filter(|l| l.kind == crate::renderer::LightKind::Spot);
+        if let Some((l, channel)) = spot.and_then(|l| Some((l, l.mask_channel?))) {
+            let (cos_outer, cos_inner) = l.cone_cosines();
+            let c = l.color.to_linear();
+            // The marker the light list gives a stationary lamp: 2 + channel.
+            data[18] = 2.0 + channel as f32;
+            data[56..60].copy_from_slice(&[l.position.x, l.position.y, l.position.z, l.range]);
+            data[60..64].copy_from_slice(&[l.direction.x, l.direction.y, l.direction.z, cos_outer]);
+            data[64..68].copy_from_slice(&[c[0] * l.intensity, c[1] * l.intensity, c[2] * l.intensity, cos_inner]);
         }
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&data));
     }
@@ -585,13 +639,52 @@ fn room_irradiance(n: vec3<f32>) -> vec3<f32> {
 }
 
 fn mesh_shader() -> String {
+    mesh_shader_variant(false)
+}
+
+/// THE THIN PASS's widening (see `thin_parts`): a part whose radius is under
+/// half of `params.w` times its depth is pushed out along its welded normal to
+/// that half-width, and fades by the share of the width it really fills -- so
+/// its light per unit length is the true part's, and it is never so narrow
+/// that where it falls among the four samples decides whether it is drawn.
+/// The depth is the clip w, which a pixel's size is proportional to.
+const THIN_VS: &str = "
+    out.fade = 1.0;
+    let thin_axis = (model_u.model * vec4<f32>(v.thin.xyz, 0.0)).xyz;
+    let thin_scale = length(thin_axis);
+    let thin_r = v.thin.w * thin_scale;
+    if (thin_r > 0.0 && model_u.params.w > 0.0) {
+        let depth = (cam_view_proj() * world_pos).w;
+        let half_drawn = max(thin_r, 0.5 * model_u.params.w * depth);
+        world_pos = vec4<f32>(world_pos.xyz + thin_axis / thin_scale * (half_drawn - thin_r), 1.0);
+        out.fade = thin_r / half_drawn;
+    }";
+
+/// The mesh shader; `thin` for the thin pass, which widens a thin part to
+/// `params.w` of its depth and fades it by the share it really fills (see
+/// `thin_parts`), reading each vertex's welded normal and radius from a second
+/// vertex buffer.
+fn mesh_shader_variant(thin: bool) -> String {
+    let (thin_in, thin_out, thin_vs, thin_fade) = if thin {
+        (
+            "@location(5) thin: vec4<f32>,",
+            "@location(5) fade: f32,",
+            THIN_VS,
+            " * in.fade",
+        )
+    } else {
+        ("", "", "", "")
+    };
     format!(
         r#"
 // Group 0 -- the camera, the lights and both shadow maps -- is declared by
 // `wgsl_lights_block` below, so there is one description of that layout rather
 // than one per shader.
 
-struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9> }}
+// `bulb`: a fixture's own lamp -- [position, range], [beam direction, cos of
+// the outer half-angle], [radiance, cos of the inner] -- with its mask marker
+// in `params.z`. See `own_bulb_fill`.
+struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9>, bulb: array<vec4<f32>, 3> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
 {room_light}
 
@@ -608,6 +701,33 @@ struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f
 const STATIONARY_MASK_DISTANCE_TEXELS: f32 = {stationary_range:?};
 
 {lights_block}
+
+// THE FIXTURE'S BULB ON ITS OWN HOUSING: a spot fixture's lamp, outside its
+// beam, on the fixture's own surfaces. The inside of a hanging lamp's bell --
+// what its bulb lights most brightly, 5-10 cm off -- lies outside the cone, so
+// the spot left it grey, and from across the room the lamp looked switched
+// off beside a path-traced reference of it (2026-10-01). The bulb shines every
+// way; the beam is what its reflector sends into the room. So a fixture takes
+// its own lamp as a point -- the light loop's beam, plus this, its complement
+// at the same intensity -- and the room is not lit twice. Shadowed by the
+// lamp's baked mask on this mesh, which keeps a housing's outside dark; with no
+// mask there is no fill (`params.z` 0). The bake's `own_bulb_fill`, term for
+// term.
+fn own_bulb_fill(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
+    let marker = model_u.params.z;
+    if (marker < 1.5) {{
+        return vec3<f32>(0.0);
+    }}
+    let to_light = model_u.bulb[0].xyz - world_pos;
+    let dist = length(to_light);
+    let l_dir = to_light / max(dist, 0.0001);
+    let d_over_r = dist / max(model_u.bulb[0].w, 0.0001);
+    let d2_over_r2 = d_over_r * d_over_r;
+    let window = clamp(1.0 - d2_over_r2 * d2_over_r2, 0.0, 1.0);
+    let atten = (window * window) / max(dist * dist, LAMP_RADIUS * LAMP_RADIUS);
+    let beam = spot_cone(dot(-l_dir, model_u.bulb[1].xyz), model_u.bulb[1].w, model_u.bulb[2].w, dist);
+    return model_u.bulb[2].rgb * max(dot(n, l_dir), 0.0) * atten * (1.0 - beam) * stationary_visibility_of(marker);
+}}
 
 // Unpack the vertex's authored emissive colour.
 //
@@ -636,8 +756,15 @@ struct VIn {{
     @location(2) uv:       vec2<f32>,
     @location(3) uv2:      vec2<f32>,
     @location(4) emissive: u32,
+    {thin_in}
 }}
 
+// At the pixel's centre, NOT the centroid, measured (headset, 2026-10-01):
+// centroid on `normal`, `world_pos` and `uv2` -- so an MSAA edge pixel of a
+// sliver does not extrapolate past its triangle into a neighbour's lightmap
+// chart -- took 13% off the shimmer of a near lamp cage's edges and cost the
+// scene pass 0.75 ms where that lamp filled the view, and left the sconce
+// plate's specks exactly as they were. See `BRUSH_CENTROID_VARYINGS`.
 struct VOut {{
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
@@ -649,12 +776,14 @@ struct VOut {{
     // identical values, and would blend across a seam between two materials
     // rather than switching cleanly at it.
     @location(4) @interpolate(flat) emissive: vec3<f32>,
+    {thin_out}
 }}
 
 @vertex
 fn vs_main(v: VIn) -> VOut {{
-    let world_pos = model_u.model * vec4<f32>(v.position, 1.0);
+    var world_pos = model_u.model * vec4<f32>(v.position, 1.0);
     var out: VOut;
+    {thin_vs}
     out.clip      = cam_view_proj() * world_pos;
     out.normal    = (model_u.model * vec4<f32>(v.normal, 0.0)).xyz;
     out.uv        = v.uv;
@@ -696,7 +825,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         st_3 = textureSample(lm_stationary, lm_sun_samp, in.uv2, 3);
     }}
     set_stationary_masks(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
-    let lit = shade_with_sky(in.world_pos, n, model_u.params.x * baked.a);
+    let lit = shade_with_sky(in.world_pos, n, model_u.params.x * baked.a) + own_bulb_fill(in.world_pos, n);
     let tex_color = textureSample(tex, samp, in.uv);
     // ADDED, NOT MULTIPLIED.
     //
@@ -728,7 +857,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let glow = in.emissive * mask * model_u.params.y;
     // The lit room round it, which the baked bounce -- an old per-object
     // estimate -- all but left out: see `room_light`.
-    return vec4<f32>(tonemap(tex_color.rgb * (lit + baked.rgb + room_irradiance(n)) + glow), tex_color.a);
+    return vec4<f32>(tonemap(tex_color.rgb * (lit + baked.rgb + room_irradiance(n)) + glow), tex_color.a{thin_fade});
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
@@ -819,6 +948,45 @@ mod tests {
         assert!(hidden[0] <= 2, "a mask that hides the bulb let its light through: {hidden:?}");
     }
 
+    /// THE FIXTURE'S BULB ON ITS OWN HOUSING (`own_bulb_fill`). A stationary
+    /// spot aimed AWAY from the surface lights it through its bulb, outside
+    /// the beam; the lamp's mask shadows that light; aimed AT the surface it
+    /// adds nothing, its beam having it already; and a lamp with no mask adds
+    /// nothing. The light list is empty, so only the fill can light anything.
+    #[test]
+    fn a_spot_fixtures_bulb_lights_its_own_housing_outside_the_beam() {
+        let grey = [128, 128, 128, 255];
+        let lamp = |direction: glam::Vec3, mask_channel: Option<u8>| Light {
+            mask_channel,
+            position: glam::Vec3::new(0.0, 0.0, 0.5),
+            direction,
+            kind: LightKind::Spot,
+            color: Color3(255, 255, 255, 255),
+            intensity: 0.4,
+            range: 20.0,
+            cone_angle_deg: 64.0,
+            inner_cone_angle_deg: 30.0,
+        };
+        let (seen, hid) = ([255, 255, 255, 255], [0, 0, 255, 255]);
+        let render = |own: Option<&Light>, mask: [u8; 4]| {
+            render_mesh_room([0.0; 3], 0.0, false, 0.0, [255; 4], [0, 0, 0, 255], grey, Some(mask), 4.0, &[[0.0; 3]; 9], own)
+        };
+        let Some(none) = render(None, seen) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let away = lamp(glam::Vec3::Z, Some(0));
+        let filled = render(Some(&away), seen).unwrap();
+        let hidden = render(Some(&away), hid).unwrap();
+        let aimed = render(Some(&lamp(glam::Vec3::NEG_Z, Some(0))), seen).unwrap();
+        let unmasked = render(Some(&lamp(glam::Vec3::Z, None)), seen).unwrap();
+        assert!(none[0] <= 2, "something else lights the test surface: {none:?}");
+        assert!(filled[0] > 40, "the bulb did not light its housing outside the beam: {filled:?}");
+        assert!(hidden[0] <= 2, "the mask let the bulb's light through the housing: {hidden:?}");
+        assert!(aimed[0] <= 2, "the fill lit the beam a second time: {aimed:?}");
+        assert!(unmasked[0] <= 2, "a lamp with no mask filled its housing: {unmasked:?}");
+    }
+
     /// THE LIT ROOM LIGHTS A MODEL that no lamp and no sky reaches: black
     /// without it -- a hand indoors out of a lamp's reach, a hanging lamp's
     /// shade under a bright ceiling (headset, 2026-09-30) -- and with it,
@@ -843,6 +1011,7 @@ mod tests {
                 None,
                 4.0,
                 room,
+                None,
             )
         };
         let Some(dark) = render(0.0, &[[0.0; 3]; 9]) else {
@@ -939,6 +1108,7 @@ mod tests {
             stationary,
             intensity,
             &[[0.0; 3]; 9],
+            None,
         )
     }
 
@@ -956,6 +1126,7 @@ mod tests {
         stationary: Option<[u8; 4]>,
         intensity: f32,
         room: &crate::renderer::room_light::RoomLight,
+        own: Option<&Light>,
     ) -> Option<[u8; 4]> {
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
@@ -984,7 +1155,7 @@ mod tests {
 
         let pipeline = MeshPipeline::new(&device, format, &uniforms.layout);
         let model = pipeline.create_model_uniform(&device);
-        model.upload_lit(&queue, glam::Mat4::IDENTITY, sky_vis, drive, room);
+        model.upload_lit_bulb(&queue, glam::Mat4::IDENTITY, sky_vis, drive, room, own, 0.0);
 
         // Mid grey base, with a WHITE emissive mask so this measures the
         // factor and the drive. The mask itself is covered separately.
@@ -1116,6 +1287,193 @@ mod tests {
         let data = slice.get_mapped_range().unwrap();
         let c = (SIZE / 2) as usize * 256 + (SIZE / 2) as usize * 4;
         Some([data[c], data[c + 1], data[c + 2], data[c + 3]])
+    }
+
+    /// A glowing wire `radius_px` eye pixels thick, upright across a 64 px
+    /// target with 4x MSAA, `shift_px` right of a fixed place; with `thin_px`
+    /// drawn by the thin pass widened to that many pixels at least. Returns
+    /// the red channel, a row at a time.
+    fn render_thin_wire(radius_px: f32, shift_px: f32, thin_px: Option<f32>) -> Option<Vec<Vec<u8>>> {
+        const SIZE: u32 = 64;
+        let px = 2.0 / SIZE as f32;
+        let (device, queue) = headless_gpu()?;
+        let format = TextureFormat::Rgba8Unorm;
+        let lights = LightsUniform::new(&device);
+        lights.upload(&queue, &[]);
+        let (_shadows, uniforms) = scene_uniforms(&device, &lights);
+        uniforms.upload(&queue, glam::Mat4::IDENTITY, TEST_EYE, &ShadowUpload::disabled());
+        let pipeline = MeshPipeline::new_multisampled(&device, format, &uniforms.layout, 4);
+        let model = pipeline.create_model_uniform(&device);
+        // No sky, no lamp, no room: only the glow, so every pixel of the
+        // wire is the same light. With an identity camera the clip w is 1,
+        // so `params.w` is the width itself, in clip units.
+        model.upload_lit_bulb(&queue, glam::Mat4::IDENTITY, 0.0, 1.0, &[[0.0; 3]; 9], None, thin_px.map_or(0.0, |p| p * px));
+        let tex = crate::renderer::mesh::create_mesh_material_texture(
+            &device, &queue, &pipeline.texture_layout, &(vec![128, 128, 128, 255], 1, 1), &(vec![255; 4], 1, 1),
+        );
+        let lm = create_lightmap_texture(&device, &queue, &pipeline.lightmap_layout, &[0, 0, 0, 255], 1, 1, None);
+
+        // The wire: 8 facets round, upright, at depth 0.5. Facing the camera
+        // (which looks along +z) means a normal with -z in it.
+        let (sides, r) = (8usize, radius_px * px);
+        let x0 = -0.3 + shift_px * px;
+        let mut verts = Vec::new();
+        for (y, _) in [(-0.9f32, 0), (0.9, 1)] {
+            for k in 0..sides {
+                let a = k as f32 / sides as f32 * std::f32::consts::TAU;
+                let n = [a.cos(), 0.0, a.sin()];
+                verts.push(MeshVertex {
+                    position: [x0 + n[0] * r, y, 0.5 + n[2] * r],
+                    normal: n,
+                    uv: [0.5, 0.5],
+                    uv2: [0.5, 0.5],
+                    emissive: MeshVertex::pack_emissive([0.5, 0.5, 0.5]),
+                });
+            }
+        }
+        let mut indices = Vec::new();
+        for k in 0..sides as u32 {
+            let (a, b) = (k, (k + 1) % sides as u32);
+            let (c, d) = (a + sides as u32, b + sides as u32);
+            // Counter-clockwise on screen where the facet faces the camera
+            // (its normal has -z): the far facets are culled, as on any tube.
+            indices.extend([a, b, c, b, d, c]);
+        }
+        let split = crate::renderer::mesh::split_thin_parts(&verts, &indices);
+        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("thin_test_vb"), contents: bytemuck::cast_slice(&verts), usage: BufferUsages::VERTEX,
+        });
+        let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("thin_test_ib"), contents: bytemuck::cast_slice(&indices), usage: BufferUsages::INDEX,
+        });
+        let parts = split.as_ref().map(|s| crate::renderer::mesh::ThinParts::upload(&device, s));
+
+        let tex_desc = |label, samples, format, usage| TextureDescriptor {
+            label: Some(label),
+            size: Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        };
+        let msaa = device.create_texture(&tex_desc("thin_test_msaa", 4, format, TextureUsages::RENDER_ATTACHMENT));
+        let resolve = device.create_texture(&tex_desc("thin_test_resolve", 1, format, TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC));
+        let depth = device.create_texture(&tex_desc("thin_test_depth", 4, TextureFormat::Depth32Float, TextureUsages::RENDER_ATTACHMENT));
+        let (mv, rv, dv) = (msaa.create_view(&Default::default()), resolve.create_view(&Default::default()), depth.create_view(&Default::default()));
+        let readback = device.create_buffer(&BufferDescriptor {
+            label: Some("thin_test_readback"),
+            size: (256 * SIZE) as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("thin_test_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &mv,
+                    depth_slice: None,
+                    resolve_target: Some(&rv),
+                    ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &dv,
+                    depth_ops: Some(Operations { load: LoadOp::Clear(1.0), store: StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                multiview_mask: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &uniforms.bind_group, &[]);
+            pass.set_bind_group(1, &model.bind_group, &[]);
+            pass.set_bind_group(2, &tex.bind_group, &[]);
+            pass.set_bind_group(3, &lm.bind_group, &[]);
+            pass.set_vertex_buffer(0, vb.slice(..));
+            match (&parts, thin_px) {
+                (Some(parts), Some(_)) => {
+                    if parts.solid_count > 0 {
+                        pass.set_pipeline(&pipeline.pipeline);
+                        pass.set_index_buffer(parts.solid_index_buffer.slice(..), IndexFormat::Uint32);
+                        pass.draw_indexed(0..parts.solid_count, 0, 0..1);
+                    }
+                    pass.set_pipeline(&pipeline.thin_pipeline);
+                    pass.set_vertex_buffer(1, parts.vertex_buffer.slice(..));
+                    pass.set_index_buffer(parts.thin_index_buffer.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..parts.thin_count, 0, 0..1);
+                }
+                _ => {
+                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+                }
+            }
+        }
+        encoder.copy_texture_to_buffer(
+            TexelCopyTextureInfo { texture: &resolve, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(SIZE) },
+            },
+            Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(encoder.finish()));
+        let slice = readback.slice(..);
+        slice.map_async(MapMode::Read, |_| {});
+        device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+        let data = slice.get_mapped_range().unwrap();
+        Some((0..SIZE as usize).map(|y| (0..SIZE as usize).map(|x| data[y * 256 + x * 4]).collect()).collect())
+    }
+
+    /// How a wire's light in the middle rows varies as it slides across a
+    /// pixel in eighths: (mean light per row, its variation across shifts,
+    /// averaged over rows).
+    fn wire_light_across_shifts(radius_px: f32, thin_px: Option<f32>) -> Option<(f32, f32)> {
+        let rows: Vec<Vec<f32>> = (0..8)
+            .map(|k| render_thin_wire(radius_px, k as f32 / 8.0, thin_px))
+            .map(|image| Some(image?.iter().map(|row| row.iter().map(|&v| v as f32).sum()).collect()))
+            .collect::<Option<_>>()?;
+        let (mut mean_all, mut cv_all, mut n) = (0.0, 0.0, 0.0);
+        for y in 16..48 {
+            let v: Vec<f32> = rows.iter().map(|r| r[y]).collect();
+            let mean = v.iter().sum::<f32>() / v.len() as f32;
+            let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / v.len() as f32).sqrt();
+            mean_all += mean;
+            cv_all += sd / mean.max(1e-6);
+            n += 1.0;
+        }
+        Some((mean_all / n, cv_all / n))
+    }
+
+    /// THE THIN PASS (`thin_parts`): a wire a third of a pixel thick, drawn
+    /// as a mesh with 4x MSAA, gains and loses whole samples as it slides --
+    /// the shimmer of every lamp's cage on the headset (2026-10-01). Widened
+    /// to two pixels and faded, its light per row holds steady, and is the
+    /// same light it had.
+    #[test]
+    fn a_thin_wire_holds_its_light_as_it_slides() {
+        let Some((plain_mean, plain_cv)) = wire_light_across_shifts(0.16, None) else { return };
+        let (thin_mean, thin_cv) = wire_light_across_shifts(0.16, Some(2.0)).unwrap();
+        // The light a 0.32 px wire really carries: that share of a pixel the
+        // glow covers whole, read from the middle of a wide one.
+        let full = *render_thin_wire(3.0, 0.0, None).unwrap()[32].iter().max().unwrap() as f32;
+        let truth = 0.32 * full;
+        eprintln!("THIN wire 0.32 px (truth {truth:.1}): plain mean {plain_mean:.1} varies {:.1}%, thin pass mean {thin_mean:.1} varies {:.1}%", plain_cv * 100.0, thin_cv * 100.0);
+        assert!(plain_cv > 0.3, "the plain wire shimmers ({:.1}%), or this measures nothing", plain_cv * 100.0);
+        assert!(thin_cv < 0.1, "widened, it holds its light: varies {:.1}%", thin_cv * 100.0);
+        assert!((thin_mean / truth - 1.0).abs() < 0.1, "and it is the wire's own light: {thin_mean:.1} against {truth:.1}");
+    }
+
+    /// A part already wider than the least width is drawn exactly as it was.
+    #[test]
+    fn a_wide_part_is_untouched_by_the_thin_pass() {
+        for shift in [0.0, 0.375] {
+            let Some(plain) = render_thin_wire(3.0, shift, None) else { return };
+            let thin = render_thin_wire(3.0, shift, Some(2.0)).unwrap();
+            assert_eq!(plain, thin, "a 6 px part, shifted {shift} px");
+        }
     }
 
     const NONE: [f32; 3] = [0.0, 0.0, 0.0];

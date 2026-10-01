@@ -140,5 +140,10 @@ pub struct MeshInstance<'a> {
     /// A lamp passes its light's `emissive_drive`, so its bulb brightens, dims
     /// and goes out with the beam and nothing has to keep the two in step.
     pub emissive_drive: f32,
+    /// A fixture's own lamp, as this frame's light list has it (same frame,
+    /// mask channel and all): a stationary SPOT's bulb also lights the
+    /// fixture's own housing outside its beam. `None` for everything else.
+    /// See `ModelUniform::upload_lit_bulb`.
+    pub own_light: Option<Light>,
 }
 

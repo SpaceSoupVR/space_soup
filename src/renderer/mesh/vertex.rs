@@ -164,6 +164,14 @@ pub struct MeshPrimitive {
     /// opaque housing around it blocked 2%. The room was black because the
     /// lamp's glass sealed the bulb inside a shadow.
     pub casts_shadow: bool,
+    /// Glass or a blended material: drawn after everything opaque and the
+    /// sky, as anything see-through has to be. Drawn among the opaque parts,
+    /// the lamp's clear globe (alpha 0, depth written) hid whatever of its own
+    /// cage was drawn after it -- which, once the cage's thin wires moved to a
+    /// pass of their own, was the back half of every cage.
+    pub blended: bool,
+    /// The primitive's wires, chain links and rims, apart: see `thin_parts`.
+    pub thin: Option<super::thin_parts::ThinParts>,
 }
 
 #[cfg(test)]

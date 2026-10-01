@@ -14,14 +14,19 @@ use crate::renderer::{
 use super::{ShadowQuality, XrRenderer};
 
 
-type MeshDraw<'a> = (
-    &'a wgpu::BindGroup,
-    &'a wgpu::BindGroup,
-    &'a wgpu::BindGroup,
-    &'a wgpu::Buffer,
-    &'a wgpu::Buffer,
-    u32,
-);
+/// One static mesh primitive to draw: its model, texture and lightmap bind
+/// groups, vertices, indices and index count, and -- for the eye pass -- its
+/// thin parts apart (see `mesh::thin_parts`) and whether it is see-through.
+struct MeshDraw<'a> {
+    model: &'a wgpu::BindGroup,
+    texture: &'a wgpu::BindGroup,
+    lightmap: &'a wgpu::BindGroup,
+    vertices: &'a wgpu::Buffer,
+    indices: &'a wgpu::Buffer,
+    count: u32,
+    thin: Option<&'a crate::renderer::mesh::ThinParts>,
+    blended: bool,
+}
 
 /// A layered draw needs no texture bind group: every layered mesh in a scene
 /// shares the one terrain material array, which is bound once for the batch.
@@ -75,14 +80,16 @@ fn push_mesh_draws<'a>(
                 ));
                 continue;
             }
-            mesh_draws.push((
-                &instance.model.bind_group,
-                &prim.texture.bind_group,
-                lightmap_bg,
-                &prim.vertex_buffer,
-                &prim.index_buffer,
-                prim.indices.len() as u32,
-            ));
+            mesh_draws.push(MeshDraw {
+                model: &instance.model.bind_group,
+                texture: &prim.texture.bind_group,
+                lightmap: lightmap_bg,
+                vertices: &prim.vertex_buffer,
+                indices: &prim.index_buffer,
+                count: prim.indices.len() as u32,
+                thin: prim.thin.as_ref(),
+                blended: prim.blended,
+            });
         }
     }
 }
@@ -368,6 +375,19 @@ impl XrRenderer {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
+        // The thin parts' least drawn width as a share of depth: an eye
+        // pixel's size at unit depth (tangent span over pixels, both axes
+        // averaged) times `levers.thin_parts` pixels. See `mesh::thin_parts`.
+        let thin_width = match eye_views.first() {
+            Some(v) if self.levers.thin_parts > 0.0 => {
+                let f = v.fov;
+                let across = (f.angle_right.tan() - f.angle_left.tan()) / self.width.max(1) as f32;
+                let up = (f.angle_up.tan() - f.angle_down.tan()) / self.height.max(1) as f32;
+                self.levers.thin_parts * 0.5 * (across + up)
+            }
+            _ => 0.0,
+        };
+        let thin_pass = thin_width > 0.0;
         let mut mesh_draws: Vec<MeshDraw> = Vec::new();
         let mut skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut layered_draws: Vec<LayeredDraw> = Vec::new();
@@ -392,12 +412,14 @@ impl XrRenderer {
                 &crate::renderer::room_light::room_light_at(&self.room_descs, world),
                 self.player.yaw,
             );
-            instance.model.upload_lit(
+            instance.model.upload_lit_bulb(
                 &self.wgpu_queue,
                 instance.mesh.model_matrix(),
                 sky_vis,
                 instance.emissive_drive,
                 &room,
+                instance.own_light.as_ref(),
+                thin_width,
             );
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(
@@ -441,10 +463,12 @@ impl XrRenderer {
                 self.player.yaw,
             );
             instance.model
-                .upload_lit(&self.wgpu_queue, instance.mesh.model_matrix(),
+                .upload_lit_bulb(&self.wgpu_queue, instance.mesh.model_matrix(),
                 self.sky_visibility_at(world.x, world.z),
                 instance.emissive_drive,
                 &room,
+                instance.own_light.as_ref(),
+                0.0,
             );
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(
@@ -1282,13 +1306,15 @@ impl XrRenderer {
                     if !mesh_draws.is_empty() || !mirror_only_mesh_draws.is_empty() {
                         pass.set_pipeline(&self.mirror_mesh_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for (model_bg, tex_bg, lightmap_bg, vb, ib, count) in all_mesh_draws {
-                            pass.set_bind_group(1, *model_bg, &[]);
-                            pass.set_bind_group(2, *tex_bg, &[]);
-                            pass.set_bind_group(3, *lightmap_bg, &[]);
-                            pass.set_vertex_buffer(0, vb.slice(..));
-                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..*count, 0, 0..1);
+                        // Whole, thin parts and all: the mirror has no thin
+                        // pass, and its own resolution.
+                        for d in all_mesh_draws {
+                            pass.set_bind_group(1, d.model, &[]);
+                            pass.set_bind_group(2, d.texture, &[]);
+                            pass.set_bind_group(3, d.lightmap, &[]);
+                            pass.set_vertex_buffer(0, d.vertices.slice(..));
+                            pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..d.count, 0, 0..1);
                         }
                     }
                     if !skinned_draws.is_empty() || !mirror_only_skinned_draws.is_empty() {
@@ -2091,13 +2117,23 @@ impl XrRenderer {
                     if !mesh_draws.is_empty() {
                         pass.set_pipeline(self.sp_mesh(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for (model_bg, tex_bg, lightmap_bg, vb, ib, count) in &mesh_draws {
-                            pass.set_bind_group(1, *model_bg, &[]);
-                            pass.set_bind_group(2, *tex_bg, &[]);
-                            pass.set_bind_group(3, *lightmap_bg, &[]);
-                            pass.set_vertex_buffer(0, vb.slice(..));
+                        // The opaque parts. A primitive with thin parts draws
+                        // the rest here and those in the thin pass, after the
+                        // sky; glass waits for that too.
+                        for d in mesh_draws.iter().filter(|d| !d.blended) {
+                            let (ib, count) = match (d.thin, thin_pass) {
+                                (Some(t), true) => (&t.solid_index_buffer, t.solid_count),
+                                _ => (d.indices, d.count),
+                            };
+                            if count == 0 {
+                                continue;
+                            }
+                            pass.set_bind_group(1, d.model, &[]);
+                            pass.set_bind_group(2, d.texture, &[]);
+                            pass.set_bind_group(3, d.lightmap, &[]);
+                            pass.set_vertex_buffer(0, d.vertices.slice(..));
                             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..*count, 0, 0..1);
+                            pass.draw_indexed(0..count, 0, 0..1);
                         }
                     }
                     if !skinned_draws.is_empty() {
@@ -2125,6 +2161,42 @@ impl XrRenderer {
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.sky.bind_group, &[]);
                         pass.draw(0..3, 0..1);
+                    }
+                    // THE THIN PASS: every model's wires, chain links and rims,
+                    // never narrower than `levers.thin_parts` eye pixels and
+                    // faded by the share they really fill (see
+                    // `mesh::thin_parts`). After everything opaque AND the sky,
+                    // so a faded wire blends over what is truly behind it --
+                    // drawn before the sky it blended over the clear colour.
+                    if thin_pass {
+                        pass.set_pipeline(self.sp_mesh_thin(stereo));
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        for d in mesh_draws.iter().filter(|d| !d.blended) {
+                            let Some(t) = d.thin else { continue };
+                            pass.set_bind_group(1, d.model, &[]);
+                            pass.set_bind_group(2, d.texture, &[]);
+                            pass.set_bind_group(3, d.lightmap, &[]);
+                            pass.set_vertex_buffer(0, d.vertices.slice(..));
+                            pass.set_vertex_buffer(1, t.vertex_buffer.slice(..));
+                            pass.set_index_buffer(t.thin_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..t.thin_count, 0, 0..1);
+                        }
+                    }
+                    // GLASS, after all of that: a see-through surface blends
+                    // over what is behind it, so that has to be drawn first.
+                    // Among the opaque parts, a lamp's clear globe (alpha 0,
+                    // depth written) hid whatever of the lamp came after it.
+                    if mesh_draws.iter().any(|d| d.blended) {
+                        pass.set_pipeline(self.sp_mesh(stereo));
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        for d in mesh_draws.iter().filter(|d| d.blended) {
+                            pass.set_bind_group(1, d.model, &[]);
+                            pass.set_bind_group(2, d.texture, &[]);
+                            pass.set_bind_group(3, d.lightmap, &[]);
+                            pass.set_vertex_buffer(0, d.vertices.slice(..));
+                            pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..d.count, 0, 0..1);
+                        }
                     }
                     if !particle_verts.is_empty() {
                         pass.set_pipeline(self.sp_particle(stereo));

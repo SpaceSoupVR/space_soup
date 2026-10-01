@@ -466,6 +466,21 @@ pub struct Light {
     pub mask_channel: Option<u8>,
 }
 
+impl Light {
+    /// The cosines of a spot's outer and inner half-angles, as the shader's
+    /// `spot_cone` takes them.
+    pub fn cone_cosines(&self) -> (f32, f32) {
+        let cos_outer = (self.cone_angle_deg.to_radians() * 0.5).cos();
+        // Clamped above cos_outer so an inner angle authored wider than the
+        // outer one cannot invert the gradient (or divide by ~zero) and
+        // turn the beam inside out.
+        let cos_inner = (self.inner_cone_angle_deg.to_radians() * 0.5)
+            .cos()
+            .max(cos_outer + 1e-4);
+        (cos_outer, cos_inner)
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct GpuLight {
@@ -601,13 +616,7 @@ fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_bake
         };
         for (slot, l) in gpu.lights.iter_mut().zip(lights.iter().take(MAX_LIGHTS)) {
             let color = l.color.to_linear();
-            let cos_outer = (l.cone_angle_deg.to_radians() * 0.5).cos();
-            // Clamped above cos_outer so an inner angle authored wider than the
-            // outer one cannot invert the gradient (or divide by ~zero) and
-            // turn the beam inside out.
-            let cos_inner = (l.inner_cone_angle_deg.to_radians() * 0.5)
-                .cos()
-                .max(cos_outer + 1e-4);
+            let (cos_outer, cos_inner) = l.cone_cosines();
             // Kind tag packed into params.z — must match the branch constants
             // in `wgsl_lights_block`: 0 = point, 1 = spot, 2 = directional.
             let kind = match l.kind {
@@ -696,6 +705,10 @@ pub struct LightsBlockOptions {
     /// The lamp pre-pass tests a lamp's range before its baked mask. See
     /// `CULL_RANGE_FIRST`.
     pub cull_range_first: bool,
+    /// A model card's trust is tested at its four nearest texels and the
+    /// verdicts blended, rather than tested once on blended texels. See
+    /// `PROBE_CARD_TESTS_FILTERED`.
+    pub card_tests_filtered: bool,
 }
 
 /// HOW MANY OF THE PROBE PASS'S OWN PIXELS A REFLECTED EDGE IS SOFTENED
@@ -713,7 +726,7 @@ pub const PROBE_EDGE_FOOTPRINTS: f32 = 1.0;
 
 /// `wgsl_lights_block`, with `options`. See `LightsBlockOptions`.
 pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: LightsBlockOptions) -> String {
-    let LightsBlockOptions { probe_from_pass, probe_face_always, defer_secondary, cull_range_first } = options;
+    let LightsBlockOptions { probe_from_pass, probe_face_always, defer_secondary, cull_range_first, card_tests_filtered } = options;
     let shadow_tex = binding_index + 1;
     let shadow_samp = binding_index + 2;
     let spot_tex = binding_index + 3;
@@ -1375,6 +1388,16 @@ const PROBE_FACE_ALWAYS_GIVEN: bool = {probe_face_always};
 // for `probe_fixup` (`probe_fixup_begin` and `_finish`) -- the ray's part the
 // moment the trace ends, so it is not carried through the colour lookup.
 const PROBE_SECONDARY_DEFERRED: bool = {defer_secondary};
+// A MODEL CARD'S TRUST, FILTERED: each of the four texels round the point
+// tested on its own and the verdicts blended, as percentage-closer filtering
+// blends a shadow map's -- where one test on blended texels averaged a facing
+// normal with an opposite one, and a depth in with a depth out, and flipped
+// between them as the point moved a hundredth of a texel: the bright inside
+// of a lamp, flickering in its reflection in the polished walls as the head
+// moved a millimetre (offline, 2026-10-01). Four reads a card instead of one,
+// so only in `probe_fixup`, which every texel meeting a model on cards goes
+// through; the probe pass keeps its one read.
+const PROBE_CARD_TESTS_FILTERED: bool = {card_tests_filtered};
 // WHETHER THE LAMP PRE-PASS TESTS A LAMP'S RANGE BEFORE ITS BAKED MASK: three
 // instructions before a dozen, the better order where most lamps are out of
 // range -- the ground outdoors, far from the building's lamps (-0.3 to
@@ -2292,7 +2315,7 @@ fn probe_secondary(
     // proxy, and what lies past it, by how much of the footprint the
     // proxy covers. See `probe_proxy_hit`. A texel across a model's own
     // outline carries that cover negated (`PROBE_SUBSAMPLE`).
-    let edge_cover = abs(hit.edge_cover);
+    let edge_cover = probe_edge_cover(hit.edge_cover);
     if (hit.edge_code >= 0 && edge_cover < 0.99) {{
         // What lies past the proxy, where the ray hit it: traced again as
         // though it were not there. Else the proxy itself, at its outline.
@@ -2495,6 +2518,18 @@ const PROBE_TRACE_ROOMS: i32 = 3;
 // across its footprint or its lobe, and averages them; a pass that does not
 // defer keeps its one ray.
 const PROBE_SUBSAMPLE: f32 = -1.0;
+// `ProbeHit::edge_cover` for a texel that meets a model on cards away from its
+// outlines: the model's presence, less four. `probe_fixup` traces its one ray
+// again with the cards' tests filtered (`PROBE_CARD_TESTS_FILTERED`) -- which
+// is what held the lamps' insides still in the walls -- rather than four rays
+// across it, which cost the headset 0.8 ms a frame for the last few percent
+// (2026-10-01). Read the cover back with `probe_edge_cover`.
+const PROBE_RETEST: f32 = -4.0;
+// The cover a hit's `edge_cover` carries, whatever it marks.
+fn probe_edge_cover(edge_cover: f32) -> f32 {{
+    let c = abs(edge_cover);
+    return select(c, c + PROBE_RETEST, c > 2.0);
+}}
 // Samples a ray takes inside a model's box looking for the model. See
 // `probe_proxy_surface`.
 const PROBE_PROXY_SAMPLES: i32 = 4;
@@ -2980,12 +3015,25 @@ fn probe_proxy_hit(o: vec3<f32>, d: vec3<f32>, room: f32, t0: f32, t1: f32, skip
         let spread = t_at * lobe;
         let presence = extent * extent / max(extent * extent + spread * spread, 1e-8);
         let cover = select(presence * (1.0 - smoothstep(0.0, 1.0, walk.z)), presence, touched);
+        // A MODEL ON CARDS is coloured again wherever the ray meets it, not
+        // only past an outline: each card vouches for a point by tests read
+        // at full size (see `probe_card_vote`), and read once, unfiltered, they
+        // let a lamp's bright inside come and go in its reflection in the
+        // polished walls as the head moved a millimetre -- the shimmer left
+        // once the walls and floors held still (headset and offline,
+        // 2026-10-01). Only texels that meet a lamp pay for it. See
+        // `PROBE_RETEST`.
+        let carded = camera.proxy_cards[field_i >> 2u][field_i & 3] > 0.5;
         if (out.edge < 0 && touched && walk.z < 0.0) {{
             // Past one of its own outlines: the texel is sampled again,
             // several rays across it, and then blended over what lies past the
             // model by its presence, as below. See `PROBE_SUBSAMPLE`.
             out.edge = field_i;
             out.edge_cover = PROBE_SUBSAMPLE * presence;
+            out.edge_t = walk.x;
+        }} else if (out.edge < 0 && touched && carded) {{
+            out.edge = field_i;
+            out.edge_cover = PROBE_RETEST - presence;
             out.edge_t = walk.x;
         }} else if (out.edge < 0 && cover < 0.99 && cover > 0.004 && t_at > t0) {{
             out.edge = field_i;
@@ -3053,7 +3101,16 @@ fn probe_proxy_field(lo: vec3<f32>, ld: vec3<f32>, half: vec3<f32>, t_in: f32, t
     for (var k = 0; k < PROXY_FIELD_STEPS && t <= t_out; k = k + 1) {{
         let dist = textureSampleLevel(proxy_field, probe_samp, clamp(fo + fd * t, lo_uvw, hi_uvw), 0.0).r * slot.w;
         if (dist <= size.w) {{
-            hit = t;
+            // ON the stop surface, not wherever the step that crossed it
+            // landed: anywhere in a band half a field sample deep (1.5 cm on
+            // a hanging lamp), and which step lands there changes with the
+            // ray -- so the hit, and the card texel read there, jumped as the
+            // head moved a millimetre, and the bright inside a lamp's cards
+            // show came and went in its reflection (headset, 2026-10-01).
+            // The field is smooth there: two secant steps settle on it.
+            var th = t + (dist - size.w);
+            th = th + (textureSampleLevel(proxy_field, probe_samp, clamp(fo + fd * th, lo_uvw, hi_uvw), 0.0).r * slot.w - size.w);
+            hit = clamp(th, t_in, t_out);
             break;
         }}
         // No wider than half the field's reach, where its distances are exact:
@@ -3712,31 +3769,69 @@ struct ProbeCardVote {{
     w: f32,
     sure: f32,
 }}
-fn probe_card_vote(row: f32, face: f32, uv: vec2<f32>, t: f32, depth: f32, field_stop: f32, lod: f32, cu: vec3<f32>, cv: vec3<f32>, cz: vec3<f32>, ld: vec3<f32>) -> ProbeCardVote {{
+fn probe_card_vote(row: f32, face: f32, uv: vec2<f32>, t: f32, depth: f32, extent: vec2<f32>, field_stop: f32, lod: f32, cu: vec3<f32>, cv: vec3<f32>, cz: vec3<f32>, ld: vec3<f32>) -> ProbeCardVote {{
     let dims = vec2<f32>(textureDimensions(proxy_cards));
     let res = dims.x / 6.0;
     let s = exp2(lod);
     let origin = vec2<f32>(face * res, row * res);
     let card = textureSampleLevel(proxy_cards, probe_samp, (origin + clamp(uv * res, vec2<f32>(0.5 * s), vec2<f32>(res - 0.5 * s))) / dims, lod);
-    let test = textureSampleLevel(proxy_cards, probe_samp, (origin + vec2<f32>(0.0, res) + clamp(uv * res, vec2<f32>(0.5), vec2<f32>(res - 0.5))) / dims, 0.0);
+    var trust: vec2<f32>;
+    if (PROBE_CARD_TESTS_FILTERED) {{
+        // See `PROBE_CARD_TESTS_FILTERED`: the four texels' verdicts, blended.
+        let p = clamp(uv * res, vec2<f32>(0.5), vec2<f32>(res - 0.5)) - 0.5;
+        let i0 = floor(p);
+        let f = p - i0;
+        let lo = vec2<i32>(origin + vec2<f32>(0.0, res));
+        let hi = lo + vec2<i32>(i32(res) - 1);
+        let a = vec2<i32>(i0) + lo;
+        let b = min(a + vec2<i32>(1), hi);
+        // Metres from each texel's centre to the point, across the card: each
+        // texel's depth is carried there along its own surface before it is
+        // compared -- a sloped surface's neighbours lie centimetres deeper or
+        // shallower than the point, and compared as they are, a sphere's own
+        // texels failed the millimetre test round every hit.
+        let m = extent / res;
+        let t00 = probe_card_trust(textureLoad(proxy_cards, a, 0), f * m, t, depth, field_stop, cu, cv, cz, ld);
+        let t10 = probe_card_trust(textureLoad(proxy_cards, vec2<i32>(b.x, a.y), 0), (f - vec2<f32>(1.0, 0.0)) * m, t, depth, field_stop, cu, cv, cz, ld);
+        let t01 = probe_card_trust(textureLoad(proxy_cards, vec2<i32>(a.x, b.y), 0), (f - vec2<f32>(0.0, 1.0)) * m, t, depth, field_stop, cu, cv, cz, ld);
+        let t11 = probe_card_trust(textureLoad(proxy_cards, b, 0), (f - vec2<f32>(1.0)) * m, t, depth, field_stop, cu, cv, cz, ld);
+        trust = mix(mix(t00, t10, f.x), mix(t01, t11, f.x), f.y);
+    }} else {{
+        let test = textureSampleLevel(proxy_cards, probe_samp, (origin + vec2<f32>(0.0, res) + clamp(uv * res, vec2<f32>(0.5), vec2<f32>(res - 0.5))) / dims, 0.0);
+        trust = probe_card_trust(test, vec2<f32>(0.0), t, depth, field_stop, cu, cv, cz, ld);
+    }}
+    var vote: ProbeCardVote;
+    // Stored compressed, so every filtered read averages as a display would:
+    // expanded back to radiance. See `proxy_cards`.
+    vote.rgb = card.rgb / max(1.0 - dot(card.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-3);
+    vote.w = trust.x;
+    vote.sure = trust.y;
+    return vote;
+}}
+
+// One test-row texel's verdict on the point (see `probe_card_vote`), `off`
+// metres across the card from the texel's centre: its vote's weight -- how
+// squarely its surface faces the card, squared, times how far it is trusted
+// -- and how sure. The texel's depth is carried along its surface's plane to
+// the point; 0 for a test read at the point itself. The slope carried is held
+// to 3.5 to one (74 degrees): steeper, a texel is a rim turning away inside
+// itself, and carried as a plane it reached a sphere's hits a texel away and
+// voted for them with another card's colour. A surface steeper than ten to
+// one is all but edge-on to the card, and its vote weighs nothing.
+fn probe_card_trust(test: vec4<f32>, off: vec2<f32>, t: f32, depth: f32, field_stop: f32, cu: vec3<f32>, cv: vec3<f32>, cz: vec3<f32>, ld: vec3<f32>) -> vec2<f32> {{
     // The card's own frame: `cu`, `cv` its axes, `cz` the way it looks from.
     let c = probe_card_hemisphere(test.xy);
     let seen = c.x * cu + c.y * cv + c.z * cz;
     let square = c.z;
-    let behind = (t - test.z) * depth;
+    let slope = clamp(c.xy / max(c.z, 0.1), vec2<f32>(-3.5), vec2<f32>(3.5));
+    let behind = (t - test.z) * depth - dot(slope, off);
     let in_front = (test.w - t) * depth;
     let back_tol = 0.001 / max(square, 0.1);
     let front_tol = 0.005 + field_stop / max(square, 0.3);
     let valid = (1.0 - smoothstep(-0.03, 0.0, dot(seen, ld)))
         * (1.0 - smoothstep(back_tol, 2.0 * back_tol, behind))
         * (1.0 - smoothstep(front_tol, 2.0 * front_tol, in_front));
-    var vote: ProbeCardVote;
-    // Stored compressed, so every filtered read averages as a display would:
-    // expanded back to radiance. See `proxy_cards`.
-    vote.rgb = card.rgb / max(1.0 - dot(card.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-3);
-    vote.w = square * square * valid;
-    vote.sure = valid * smoothstep(0.1, 0.3, abs(square));
-    return vote;
+    return vec2<f32>(square * square * valid, valid * smoothstep(0.1, 0.3, abs(square)));
 }}
 
 // `proxy_cards::hemi_octahedral` undone: a unit direction, in a card's own
@@ -3818,12 +3913,12 @@ fn probe_card_colour(proxy: i32, h: vec3<f32>, d: vec3<f32>, t_hit: f32, lobe: f
     var sum: ProbeCardSum;
     sum.colour = vec4<f32>(0.0);
     sum.sure = 0.0;
-    sum = probe_card_add(sum, probe_card_vote(row, 0.0, uvw.yz, 0.5 - 0.5 * lo.x / half.x, 2.0 * half.x, field_stop, lod, ay, az, ax, ld));
-    sum = probe_card_add(sum, probe_card_vote(row, 1.0, uvw.yz, 0.5 + 0.5 * lo.x / half.x, 2.0 * half.x, field_stop, lod, ay, az, -ax, ld));
-    sum = probe_card_add(sum, probe_card_vote(row, 2.0, uvw.zx, 0.5 - 0.5 * lo.y / half.y, 2.0 * half.y, field_stop, lod, az, ax, ay, ld));
-    sum = probe_card_add(sum, probe_card_vote(row, 3.0, uvw.zx, 0.5 + 0.5 * lo.y / half.y, 2.0 * half.y, field_stop, lod, az, ax, -ay, ld));
-    sum = probe_card_add(sum, probe_card_vote(row, 4.0, uvw.xy, 0.5 - 0.5 * lo.z / half.z, 2.0 * half.z, field_stop, lod, ax, ay, az, ld));
-    sum = probe_card_add(sum, probe_card_vote(row, 5.0, uvw.xy, 0.5 + 0.5 * lo.z / half.z, 2.0 * half.z, field_stop, lod, ax, ay, -az, ld));
+    sum = probe_card_add(sum, probe_card_vote(row, 0.0, uvw.yz, 0.5 - 0.5 * lo.x / half.x, 2.0 * half.x, 2.0 * half.yz, field_stop, lod, ay, az, ax, ld));
+    sum = probe_card_add(sum, probe_card_vote(row, 1.0, uvw.yz, 0.5 + 0.5 * lo.x / half.x, 2.0 * half.x, 2.0 * half.yz, field_stop, lod, ay, az, -ax, ld));
+    sum = probe_card_add(sum, probe_card_vote(row, 2.0, uvw.zx, 0.5 - 0.5 * lo.y / half.y, 2.0 * half.y, 2.0 * half.zx, field_stop, lod, az, ax, ay, ld));
+    sum = probe_card_add(sum, probe_card_vote(row, 3.0, uvw.zx, 0.5 + 0.5 * lo.y / half.y, 2.0 * half.y, 2.0 * half.zx, field_stop, lod, az, ax, -ay, ld));
+    sum = probe_card_add(sum, probe_card_vote(row, 4.0, uvw.xy, 0.5 - 0.5 * lo.z / half.z, 2.0 * half.z, 2.0 * half.xy, field_stop, lod, ax, ay, az, ld));
+    sum = probe_card_add(sum, probe_card_vote(row, 5.0, uvw.xy, 0.5 + 0.5 * lo.z / half.z, 2.0 * half.z, 2.0 * half.xy, field_stop, lod, ax, ay, -az, ld));
     // HOW SURE, in `w`: a point no card vouches for -- the collar's underside,
     // hidden from the card below by the shade itself -- is left to the
     // model's own colour (`probe_model_colour`), not to a card's say at a
@@ -7167,6 +7262,10 @@ mod proxy_card_gpu_tests {
         /// The pixel footprint and hit distance the next `colours_of` reads at.
         static FOOTPRINT: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
         static HIT_T: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+        /// Whether the next `colours_of` filters the cards' trust, as
+        /// `probe_fixup` does -- the default, since every texel meeting a
+        /// model on cards is finished there. See `PROBE_CARD_TESTS_FILTERED`.
+        static FILTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     }
     const RADIUS: f32 = 0.2;
     const SAMPLES: u32 = 24;
@@ -7239,9 +7338,10 @@ mod proxy_card_gpu_tests {
         u.probe_proxies = probes.proxies;
         u.proxy_cards = probes.proxy_cards;
         u.proxy_fields[0] = slots[0];
+        let options = LightsBlockOptions { card_tests_filtered: FILTERED.with(|f| f.get()), ..Default::default() };
         let code = format!(
             "{}\n{}",
-            wgsl_lights_block(0, 1),
+            wgsl_lights_block_with(0, 1, options),
             r#"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
@@ -7334,6 +7434,68 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
     /// short of the surface, on the ray's side.
     fn on_sphere(n: Vec3) -> Vec3 {
         CENTRE + n.normalize() * (RADIUS + 0.003)
+    }
+
+    /// The +z card seeing a step: the half with x < 0 a surface 0.3 of the
+    /// box deep, the rest one 0.6 deep -- a cage wire in front of the lamp's
+    /// lit inside, as the card looking up into it sees them. Every texel faces
+    /// the card; the other cards see nothing.
+    fn step_cards() -> ProxyCards {
+        let mut texels = Vec::new();
+        let mut normals = Vec::new();
+        for face in 0..6u32 {
+            for _y in 0..RES {
+                for x in 0..RES {
+                    if face == 4 {
+                        let depth = if x < RES / 2 { 0.3 } else { 0.6 };
+                        texels.push([5.0, 0.0, 0.0, depth]);
+                        normals.push([0.0, 0.0, 1.0]);
+                    } else {
+                        texels.push([0.0, 0.0, 0.0, 2.0]);
+                        normals.push([0.0; 3]);
+                    }
+                }
+            }
+        }
+        ProxyCards { resolution: RES, texels, normals }
+    }
+
+    /// THE TRUST FILTERED, AS THE FIX-UP READS IT: a hit on the deeper side
+    /// of `step_cards`' step, sliding toward it a tenth of a texel at a time.
+    /// Tested once on blended texels, the verdict dropped from all to nothing
+    /// the moment the blend took in the nearer surface: the hit lies behind
+    /// that by centimetres. So a lamp's lit inside, seen past its cage wires,
+    /// flickered in its reflection as the head moved a millimetre (offline,
+    /// 2026-10-01). Each texel tested alone and the verdicts blended, the
+    /// trust falls across the texel as the hit crosses it -- and a smooth
+    /// surface, its texels' depths carried to the hit along their slopes, is
+    /// trusted whole (every other test here).
+    #[test]
+    fn filtered_trust_slides_as_the_hit_does() {
+        let texel = 2.0 * HALF / RES as f32;
+        let z = HALF - 0.6 * 2.0 * HALF;
+        let rays: Vec<(Vec3, Vec3)> = (0..30)
+            .map(|k| (CENTRE + Vec3::new(1.5 * texel - k as f32 * 0.1 * texel, 0.0, z + 0.002), Vec3::new(-0.2, 0.1, -1.0).normalize()))
+            .collect();
+        let sure = |filtered: bool| {
+            FILTERED.with(|f| f.set(filtered));
+            let c = colours_of(field(), step_cards(), Quat::IDENTITY, true, &rays);
+            FILTERED.with(|f| f.set(true));
+            c.map(|c| c.iter().map(|v| v[3]).collect::<Vec<f32>>())
+        };
+        let Some(plain) = sure(false) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let filtered = sure(true).unwrap();
+        let worst = |v: &[f32]| v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        let round = |v: &[f32]| v.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>();
+        eprintln!("CARD TRUST across the step: plain {:?}", round(&plain));
+        eprintln!("CARD TRUST across the step: filtered {:?}", round(&filtered));
+        eprintln!("CARD TRUST worst step: plain {:.3}, filtered {:.3}", worst(&plain), worst(&filtered));
+        assert!(worst(&plain) > 0.5, "the plain test drops at once here, or this measures nothing: {:.3}", worst(&plain));
+        assert!(worst(&filtered) < 0.15, "filtered, a tenth of a texel moves it a tenth: {:.3}", worst(&filtered));
+        assert!(filtered[0] > 0.95 && *filtered.last().unwrap() < filtered[0], "whole a texel off the step, less past it: {:?}", round(&filtered));
     }
 
     /// The card the SURFACE faces colours it, whichever way the ray came: a
@@ -7509,10 +7671,14 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let mut texels = Vec::new();
         let mut normals = Vec::new();
         for face in 0..6u32 {
-            for _ in 0..RES * RES {
+            for i in 0..RES * RES {
                 if face == 3 {
-                    // The card looking up sees the inside at y = 0.
-                    texels.push([100.0, 0.0, 0.0, 0.5]);
+                    // The card looking up sees the inside through y = 0 at the
+                    // box's centre, sloping as its normal says: along the
+                    // card's v, which is x, its depth changes by -x * n.x / n.y.
+                    let x = ((i / RES) as f32 + 0.5) / RES as f32 * 2.0 * HALF - HALF;
+                    let y = -x * inside.x / inside.y;
+                    texels.push([100.0, 0.0, 0.0, 0.5 + y / (2.0 * HALF)]);
                     normals.push(inside.to_array());
                 } else {
                     texels.push([0.0, 0.0, 0.0, 2.0]);

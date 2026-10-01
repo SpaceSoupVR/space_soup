@@ -266,6 +266,17 @@ pub(crate) fn collect_node(
                         .map(|t| t.transmission_factor())
                         .unwrap_or(0.0),
                 );
+                // What `texture::load_primitive_texture` draws see-through.
+                let blended = prim.material().alpha_mode() == gltf::material::AlphaMode::Blend
+                    || prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0) > 0.0;
+                // See `thin_parts`. Not for a cave (drawn by the layered
+                // pipeline) nor glass (drawn see-through, after the thin pass).
+                let thin = if layered.is_none() && !blended {
+                    super::thin_parts::split_thin_parts(&vertices, &indices)
+                        .map(|split| super::thin_parts::ThinParts::upload(device, &split))
+                } else {
+                    None
+                };
                 static_out.push(MeshPrimitive {
                     vertices,
                     indices,
@@ -274,6 +285,8 @@ pub(crate) fn collect_node(
                     index_buffer,
                     layered,
                     casts_shadow,
+                    blended,
+                    thin,
                 });
             } else {
                 let (joint_ids, joint_weights): (Vec<[u32; 4]>, Vec<[f32; 4]>) = if real_skin {
