@@ -580,7 +580,20 @@ fn layer_normal(layer: i32, world: vec3<f32>, n: vec3<f32>, repeat: f32) -> vec3
     // Axis 1 is the y projection, which is the only one this samples. For flat
     // ground (n = 0,1,0) and a flat texel (tn = 0,0,1) it returns the geometric
     // normal exactly, which is what makes an unauthored normal set a no-op.
-    return normalize(whiteout(1u, tn, n));
+    return normalize(whiteout(1u, world_planar_bend(tn), n));
+}}
+
+// A planar normal map's bend into the PLAYER's frame. The map is laid out
+// along the world's x and z -- its uv is the world point's xz -- and the
+// whiteout adds it along the x and z of `n`'s frame, which is the player's:
+// turned by every snap and stick turn, so every blade of grass caught the
+// light differently after one (headset `outdoors_front-y90`, 2026-10-01).
+// The bend in the world is (tn.x, 0, -tn.y) (`material_wgsl`: red toward +u,
+// green toward -v); turned into the player's frame and handed back in the
+// whiteout's terms. At no turn it is `tn` exactly.
+fn world_planar_bend(tn: vec3<f32>) -> vec3<f32> {{
+    let p = to_player_direction(vec3<f32>(tn.x, 0.0, -tn.y));
+    return vec3<f32>(p.x, -p.z, tn.z);
 }}
 
 fn layer_colour(layer: i32, world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> vec3<f32> {{
@@ -696,7 +709,7 @@ fn layer_normal_at(layer: i32, n: vec3<f32>, f: SampleFrame) -> vec3<f32> {{
     // variance. Nothing is lost by handing both back.
     var tn = packed * 2.0 - 1.0;
     tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
-    return whiteout(1u, tn, n);
+    return whiteout(1u, world_planar_bend(tn), n);
 }}
 
 // Below this a layer changes the result by less than one 8-bit step, so
@@ -755,7 +768,11 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // bound -- quartering the triangle count moved the frame time by nothing,
     // while removing the ground entirely gave back 13 ms of a 13.9 ms budget --
     // and most fragments are one or two layers, not four.
-    let f = sample_frame(in.tex_pos, n, slope_deg);
+    // The projections are chosen by the WORLD normal, as their uvs are world
+    // axes: picked by the player-frame one, steep ground swapped its x and z
+    // projections at every quarter turn (headset `outdoors_front-y90`,
+    // 2026-10-01, the far bank).
+    let f = sample_frame(in.tex_pos, to_world_direction(n), slope_deg);
     var albedo = vec3<f32>(0.0);
     if (w.x > WEIGHT_EPS) {{ albedo = albedo + layer_colour_at(0, f) * w.x; }}
     if (w.y > WEIGHT_EPS) {{ albedo = albedo + layer_colour_at(1, f) * w.y; }}
@@ -953,6 +970,10 @@ pub(crate) mod tests {
     pub enum Palette {
         Test,
         Fallback,
+        /// `Test` with layer 0 a ramp across its width (red 4 per texel of
+        /// 64), so WHERE it is sampled shows -- which projection, which world
+        /// point -- and not only whether.
+        Ramp,
     }
 
     pub fn render_quad_with_normal(normal: [f32; 3]) -> Option<[u8; 4]> {
@@ -1024,6 +1045,38 @@ pub(crate) mod tests {
         light: Option<Option<u8>>,
         light_pos: glam::Vec3,
     ) -> Option<[u8; 4]> {
+        render_quad_turned(normal, palette, splat, sky_occlusion, normals, light, light_pos, 0.0)
+    }
+
+    /// `render_quad_light_at` seen by a player turned `yaw` radians: the lamp
+    /// and the eye are handed over in the player's frame, as a frame uploads
+    /// them, turned about the pixel read -- so its light comes from the same
+    /// WORLD direction at any turn, and only what the shader gets wrong about
+    /// the turn can change it. The quad's normal is straight up, which no
+    /// turn moves.
+    pub fn render_quad_turned(
+        normal: [f32; 3],
+        palette: Palette,
+        splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
+        normals: &[Option<TerrainImage>],
+        light: Option<Option<u8>>,
+        light_pos: glam::Vec3,
+        yaw: f32,
+    ) -> Option<[u8; 4]> {
+        // The middle of the pixel read (row and column 4 of 8), in clip space,
+        // which is this harness's player frame.
+        let read = glam::Vec3::new(0.125, -0.125, 0.5);
+        let yaw_inv = glam::Quat::from_rotation_y(-yaw);
+        let to_player = |p: glam::Vec3| read + yaw_inv * (p - read);
+        let light_pos = to_player(light_pos);
+        // The rig's offset holds the pixel read at one world point at every
+        // turn -- away from the origin, so a ground texture is read there
+        // well clear of its wrap -- and the quad's normal is the world's,
+        // turned into the player's frame.
+        const WORLD_SHIFT: glam::Vec3 = glam::Vec3::new(2.375, 0.625, 4.0);
+        let offset = read + WORLD_SHIFT - glam::Quat::from_rotation_y(yaw) * read;
+        let normal = (yaw_inv * glam::Vec3::from(normal)).to_array();
         let lit = light.is_some();
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
@@ -1038,15 +1091,18 @@ pub(crate) mod tests {
         // Identity view_proj means the vertex positions ARE clip coordinates,
         // and an empty light list leaves the shader's AMBIENT term, which is all
         // this test wants: it is asserting the splat blend, not the light rig.
-        uniforms.upload(
+        uniforms.upload_scene(
             &queue,
             glam::Mat4::IDENTITY,
             // The eye. Only specular reads it, and these tests assert the splat
             // blend -- so it goes straight out in front of the quad, where a
             // highlight lands symmetrically and cannot be mistaken for one of
             // the layers winning.
-            glam::Vec3::new(0.0, 0.0, 5.0),
+            to_player(glam::Vec3::new(0.0, 0.0, 5.0)),
             &crate::renderer::uniforms::ShadowUpload::disabled(),
+            &crate::renderer::uniforms::SkyUpload::none(),
+            &crate::renderer::uniforms::PostUpload::default(),
+            &crate::renderer::uniforms::PlayerUpload { yaw, offset, ..Default::default() },
         );
         if lit {
             // Placed off to one side so a tilt in the surface normal changes
@@ -1095,6 +1151,20 @@ pub(crate) mod tests {
             ),
             Palette::Fallback => {
                 TerrainMaterial::fallback(&device, &queue, &pipeline.material_layout)
+            }
+            Palette::Ramp => {
+                let ramp = TerrainImage {
+                    width: 64,
+                    height: 64,
+                    rgba: (0..64 * 64).flat_map(|i| [(i % 64) as u8 * 4, 0, 0, 255]).collect(),
+                };
+                // One size for all four, as a texture array needs.
+                let layers = [ramp, solid_image([0, 0, 255], 64, 64), solid_image([0, 255, 0], 64, 64), solid_image([255, 255, 255], 64, 64)];
+                TerrainMaterial::new(
+                    &device, &queue, &pipeline.material_layout,
+                    &layers, &neutral, splat, sky_occlusion, normals,
+                    &[], &[], TerrainMaterialUniform::default(),
+                )
             }
         };
 
@@ -2893,6 +2963,72 @@ mod normal_map_tests {
             "a texel facing the top of the picture (-z) must be lit more by a lamp toward -z: \
              {faces_top:?} vs {faces_bottom:?}",
         );
+    }
+
+    /// THE BUMPS STAY WHERE THE WORLD PUT THEM AT ANY TURN. A snap or stick
+    /// turn turns the frame the shaders work in, not the ground; a normal map
+    /// laid out along the world's x and z must bend the ground the same way in
+    /// the world whichever way the player faces. It was bent along the
+    /// player's axes, so every blade of grass caught a lamp differently after a
+    /// turn (headset `outdoors_front-y90`, 2026-10-01). Tilted on both axes, so
+    /// a turn by a quarter or a half cannot map the tilt onto itself.
+    #[test]
+    fn a_normal_maps_bumps_do_not_turn_with_the_player() {
+        let lamp = glam::Vec3::new(0.4, 2.0, -3.0);
+        let at = |rgb: [u8; 3], yaw: f32| {
+            super::tests::render_quad_turned(
+                FLAT, Palette::Test, None, None, &only_layer0(normal_map(rgb)), Some(None), lamp, yaw,
+            )
+        };
+        let tilted = [210, 60, 170];
+        let Some(still) = at(tilted, 0.0) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        // That the lamp tells the tilts apart at all: tilted the other way on
+        // both axes, it lights the pixel differently.
+        let opposite = at([46, 196, 170], 0.0).unwrap();
+        assert!(
+            brightness(still).abs_diff(brightness(opposite)) > 6,
+            "the test's lamp must tell the tilts apart: {still:?} vs {opposite:?}",
+        );
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+        for yaw in [FRAC_PI_2, PI, -FRAC_PI_4, 1.0] {
+            let turned = at(tilted, yaw).unwrap();
+            let off = still.iter().zip(&turned).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            assert!(off <= 1, "turned {yaw} radians: {turned:?}, unturned {still:?}");
+        }
+    }
+
+    /// STEEP GROUND IS PROJECTED ALONG THE WORLD'S AXES AT ANY TURN. Past
+    /// `biplanar_start_deg` a layer's colour comes from two projections chosen
+    /// by the normal, their uvs world axes; chosen by the player-frame normal,
+    /// a quarter turn swapped a bank's x and z projections and its texture
+    /// changed under the player (headset `outdoors_front-y90`, 2026-10-01; a
+    /// half turn hid it, the axes' sizes being the same). A 20-degree slope --
+    /// biplanar, still one layer -- textured with a ramp, so the place read
+    /// shows.
+    #[test]
+    fn steep_ground_is_projected_along_the_worlds_axes_at_any_turn() {
+        let lamp = glam::Vec3::new(0.4, 2.0, -3.0);
+        let tilt = 20f32.to_radians();
+        let slope = [tilt.sin(), tilt.cos(), 0.0];
+        let at = |yaw: f32| {
+            super::tests::render_quad_turned(
+                slope, Palette::Ramp, None, None, &[None, None, None, None], Some(None), lamp, yaw,
+            )
+        };
+        let Some(still) = at(0.0) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        assert!(still[0] > 10, "the ramp's red shows: {still:?}");
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+        for yaw in [FRAC_PI_2, PI, -FRAC_PI_4, 1.0] {
+            let turned = at(yaw).unwrap();
+            let off = still.iter().zip(&turned).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            assert!(off <= 1, "turned {yaw} radians: {turned:?}, unturned {still:?}");
+        }
     }
 
     /// A flat normal map must be indistinguishable from none at all -- that is

@@ -168,15 +168,17 @@ pub struct Levers {
     /// a reflection meeting them reads for their real outline and colours in
     /// place of their capsules' one colour. See `character_cards`.
     pub character_cards: bool,
-    /// The least width, in eye pixels, the thin pass draws a model's wires,
-    /// chain links and rims at, fading them by the share they really fill so
-    /// their light is unchanged (see `mesh::thin_parts`). 0 draws them as
-    /// they are, among the opaque parts. At 2 a wire a third of a pixel thick
-    /// holds its light to a few percent as it moves, where 4x MSAA alone let
-    /// it swing by a third; 3 as shipped -- a near cage, its wires a pixel and
-    /// a half, stepped along their edges at 2, and 3 took 22% off its worst
-    /// shimmer (2.5: 12%) for 0.05 ms, the wires a little softer (headset,
-    /// 2026-10-01).
+    /// The thin pass's kernel unit, in eye pixels: a model's wires, chain
+    /// links and rims are drawn wider by the kernel's reach and each fragment
+    /// takes its share of their true light (see `mesh::thin_parts` and the
+    /// mesh shader's `thin_share`), so a wire a third of a pixel thick holds
+    /// its light as it moves, where 4x MSAA alone let it swing by a third. 0
+    /// draws them as they are, among the opaque parts. 1 as shipped: the
+    /// kernel then adds up to the same light wherever a wire falls, upright
+    /// or diagonal; more draws a wider band than the kernel needs (where
+    /// foveation shades a block of pixels as one fragment, the kernel is that
+    /// much wider); less cuts its tails. Until 2026-10-01 this was the drawn
+    /// width in pixels, 3 as shipped.
     pub thin_parts: f32,
     /// The CPU performance level asked of the runtime. `None` asks nothing,
     /// as shipped: the app keeps the level it started at. See
@@ -257,7 +259,7 @@ impl Default for Levers {
             floor_mirror: false,
             reflection_blur: true,
             character_cards: true,
-            thin_parts: 3.0,
+            thin_parts: 1.0,
             cpu_level: None,
             gpu_level: None,
             terrain_detail_distance: 0.0,

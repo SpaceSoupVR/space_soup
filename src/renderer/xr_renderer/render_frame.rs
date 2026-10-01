@@ -375,9 +375,9 @@ impl XrRenderer {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-        // The thin parts' least drawn width as a share of depth: an eye
-        // pixel's size at unit depth (tangent span over pixels, both axes
-        // averaged) times `levers.thin_parts` pixels. See `mesh::thin_parts`.
+        // The thin pass's kernel unit as a share of depth: an eye pixel's
+        // size at unit depth (tangent span over pixels, both axes averaged)
+        // times `levers.thin_parts`. See `mesh::thin_parts`.
         let thin_width = match eye_views.first() {
             Some(v) if self.levers.thin_parts > 0.0 => {
                 let f = v.fov;
@@ -580,7 +580,7 @@ impl XrRenderer {
         // A lamp behind a wall is found in the probe pass's depth, when the
         // pass runs this frame.
         let glare_tests_walls = self.probe_pass_runs(&fx, self.stereo_scene(), brush_buffers.is_some());
-        let (glare_verts, glare_idx) = if fx.glare {
+        let (glare_verts, glare_idx, glare_halos) = if fx.glare {
             let eye_at = |v: &xr::View| glam::Vec3::new(v.pose.position.x, v.pose.position.y, v.pose.position.z);
             crate::renderer::glare::build_glare(
                 &self.glare_sources,
@@ -593,7 +593,7 @@ impl XrRenderer {
                 &self.glare_capsules,
             )
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), 0)
         };
         let glare_buffers = (!glare_idx.is_empty()).then(|| {
             (
@@ -2162,6 +2162,21 @@ impl XrRenderer {
                         pass.set_bind_group(1, &self.sky.bind_group, &[]);
                         pass.draw(0..3, 0..1);
                     }
+                    // THE LAMPS' VEILS' CORES, where nothing stands in front of
+                    // the light: after everything opaque and the sky, which
+                    // cut them, and before the thin wires and the glass, which
+                    // blend over them by what they really cover. Their halos
+                    // come last. See `glare`.
+                    if let Some((glare_vb, glare_ib)) = glare_buffers.as_ref() {
+                        if (glare_halos as usize) < glare_idx.len() {
+                            pass.set_pipeline(&self.sp_glare(stereo).core);
+                            pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                            pass.set_bind_group(1, probe_read_group, &[]);
+                            pass.set_vertex_buffer(0, glare_vb.slice(..));
+                            pass.set_index_buffer(glare_ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(glare_halos..glare_idx.len() as u32, 0, 0..1);
+                        }
+                    }
                     // THE THIN PASS: every model's wires, chain links and rims,
                     // never narrower than `levers.thin_parts` eye pixels and
                     // faded by the share they really fill (see
@@ -2205,17 +2220,17 @@ impl XrRenderer {
                         pass.set_index_buffer(particle_ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..particle_idx.len() as u32, 0, 0..1);
                     }
-                    // The lamps' veils, over everything the pass drew, hidden
-                    // where a surface stands nearer than the lamp.
+                    // The lamps' veils' halos, over everything the pass drew;
+                    // each veil gone where a wall hides its bulb.
                     if let Some((glare_vb, glare_ib)) = glare_buffers.as_ref() {
-                        pass.set_pipeline(self.sp_glare(stereo));
+                        pass.set_pipeline(&self.sp_glare(stereo).pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         // The probe pass's depth, for the walls: read only
                         // when that pass ran (`glare_tests_walls`).
                         pass.set_bind_group(1, probe_read_group, &[]);
                         pass.set_vertex_buffer(0, glare_vb.slice(..));
                         pass.set_index_buffer(glare_ib.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..glare_idx.len() as u32, 0, 0..1);
+                        pass.draw_indexed(0..glare_halos, 0, 0..1);
                     }
                 }
                 // THE STEREO SCENE PASS LANDS ON ITS OWN.
