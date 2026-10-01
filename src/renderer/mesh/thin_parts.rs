@@ -229,7 +229,7 @@ mod tests {
     use glam::Vec3;
 
     fn vertex(p: Vec3, n: Vec3) -> MeshVertex {
-        MeshVertex { position: p.into(), normal: n.into(), uv: [0.0; 2], uv2: [0.0; 2], emissive: 0 }
+        MeshVertex { position: p.into(), normal: n.into(), uv: [0.0; 2], uv2: [0.0; 2], emissive: 0, uv2_rect: MeshVertex::WHOLE_ATLAS }
     }
 
     /// A closed-sided tube along y: `sides` facets round, `rings` rings.
@@ -375,7 +375,7 @@ mod shipped_lamps {
                     let p: Vec<Vec3> = r.read_positions().unwrap().map(|v| world.transform_point3(Vec3::from(v))).collect();
                     let n: Vec<Vec3> = r.read_normals().unwrap().map(|v| world.transform_vector3(Vec3::from(v)).normalize()).collect();
                     let idx: Vec<u32> = r.read_indices().map(|i| i.into_u32().collect()).unwrap_or_else(|| (0..p.len() as u32).collect());
-                    let v = p.iter().zip(&n).map(|(p, n)| MeshVertex { position: (*p).into(), normal: (*n).into(), uv: [0.0; 2], uv2: [0.0; 2], emissive: 0 }).collect();
+                    let v = p.iter().zip(&n).map(|(p, n)| MeshVertex { position: (*p).into(), normal: (*n).into(), uv: [0.0; 2], uv2: [0.0; 2], emissive: 0, uv2_rect: MeshVertex::WHOLE_ATLAS }).collect();
                     out.push((v, idx));
                 }
             }

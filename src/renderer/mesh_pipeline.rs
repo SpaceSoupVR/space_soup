@@ -757,14 +757,17 @@ struct VIn {{
     @location(3) uv2:      vec2<f32>,
     @location(4) emissive: u32,
     {thin_in}
+    @location(6) uv2_rect: vec4<f32>,
 }}
 
 // At the pixel's centre, NOT the centroid, measured (headset, 2026-10-01):
 // centroid on `normal`, `world_pos` and `uv2` -- so an MSAA edge pixel of a
 // sliver does not extrapolate past its triangle into a neighbour's lightmap
 // chart -- took 13% off the shimmer of a near lamp cage's edges and cost the
-// scene pass 0.75 ms where that lamp filled the view, and left the sconce
-// plate's specks exactly as they were. See `BRUSH_CENTROID_VARYINGS`.
+// scene pass 0.75 ms where that lamp filled the view. Its specks on the sconce
+// plate stayed only because the masks' fwidth widening leaked as well; `uv2`
+// is now held inside the triangle's chart by the flat `uv2_rect`, for nothing.
+// See `MeshVertex::uv2_rect` and `BRUSH_CENTROID_VARYINGS`.
 struct VOut {{
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
@@ -777,6 +780,7 @@ struct VOut {{
     // rather than switching cleanly at it.
     @location(4) @interpolate(flat) emissive: vec3<f32>,
     {thin_out}
+    @location(6) @interpolate(flat) uv2_rect: vec4<f32>,
 }}
 
 @vertex
@@ -790,17 +794,21 @@ fn vs_main(v: VIn) -> VOut {{
     out.world_pos = world_pos.xyz;
     out.uv2       = v.uv2;
     out.emissive  = unpack_emissive(v.emissive);
+    out.uv2_rect  = v.uv2_rect;
     return out;
 }}
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
+    // Inside the triangle's own chart: an MSAA edge pixel's `uv2` is
+    // extrapolated past it. See `MeshVertex::uv2_rect`.
+    let uv2 = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
     // RGB is baked direct+bounce and is ADDED; ALPHA is baked sky visibility
     // and is MULTIPLIED into the sky term. The two neutrals are at opposite
     // ends of the range -- black adds nothing, 255 scales by one -- which is
     // exactly what an unbaked mesh's default texture carries.
-    let baked = textureSample(lm_tex, lm_samp, in.uv2);
+    let baked = textureSample(lm_tex, lm_samp, uv2);
     // Per-texel sky visibility, narrowing the per-OBJECT value the model
     // uniform carries. One number for a whole lamp cannot say that the inside
     // of its shade sees less sky than the top of it.
@@ -809,22 +817,23 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // THE STATIONARY LAMPS' SHADOWS, as the brushes take theirs. Without them
     // every live lamp lit a mesh with no visibility at all: a sconce's plate
     // glowed with its own bulb through its shade (headset, 2026-09-29). A mesh
-    // baked before these existed binds one neutral layer, fully lit.
+    // baked before these existed binds one neutral layer, fully lit. Read
+    // exactly as baked, unwidened -- see `set_stationary_masks_exact`.
     let st_layers = textureNumLayers(lm_stationary);
-    let st_0 = textureSample(lm_stationary, lm_sun_samp, in.uv2, 0);
+    let st_0 = textureSample(lm_stationary, lm_sun_samp, uv2, 0);
     var st_1 = vec4<f32>(1.0);
     var st_2 = vec4<f32>(1.0);
     var st_3 = vec4<f32>(1.0);
     if (st_layers > 1u) {{
-        st_1 = textureSample(lm_stationary, lm_sun_samp, in.uv2, 1);
+        st_1 = textureSample(lm_stationary, lm_sun_samp, uv2, 1);
     }}
     if (st_layers > 2u) {{
-        st_2 = textureSample(lm_stationary, lm_sun_samp, in.uv2, 2);
+        st_2 = textureSample(lm_stationary, lm_sun_samp, uv2, 2);
     }}
     if (st_layers > 3u) {{
-        st_3 = textureSample(lm_stationary, lm_sun_samp, in.uv2, 3);
+        st_3 = textureSample(lm_stationary, lm_sun_samp, uv2, 3);
     }}
-    set_stationary_masks(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
+    set_stationary_masks_exact(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
     let lit = shade_with_sky(in.world_pos, n, model_u.params.x * baked.a) + own_bulb_fill(in.world_pos, n);
     let tex_color = textureSample(tex, samp, in.uv);
     // ADDED, NOT MULTIPLIED.
@@ -924,6 +933,76 @@ mod tests {
     ) -> Option<[u8; 4]> {
         // The neutral lightmap: adds nothing, narrows no sky.
         render_mesh_baked(emissive, drive, lit, sky_vis, mask, [0, 0, 0, 255])
+    }
+
+    /// A MODEL'S MASK IS READ AS BAKED, not widened by how fast it changes
+    /// across the screen as a brush's is: a model gives each triangle a chart
+    /// of its own, so its mask jumps at every sliver and between the pixels of
+    /// one quad, and widened by that, a texel baked fully hidden read up to
+    /// 16% lit -- enough to show white 15 cm from a bulb (2026-10-01; the
+    /// sconce plate's dashes, which led here, needed `uv2_rect` as well).
+    /// Here the centre pixel reads a hidden texel and both its quad
+    /// neighbours read lit ones.
+    #[test]
+    fn a_hidden_texel_stays_hidden_beside_lit_ones() {
+        let grey = [128, 128, 128, 255];
+        // Channel 0: the distance code, then the full-width penumbra the
+        // model bake writes. Channel 1 neutral.
+        let hidden = [0u8, 255, 255, 255];
+        let lit = [255u8, 255, 255, 255];
+        let render = |texels: &[u8], w: u32, h: u32, uv2s: [[f32; 2]; 3]| {
+            render_mesh_room_with(
+                [0.0; 3], 0.0, true, 0.0, [255; 4], [0, 0, 0, 255], grey, Some((texels, w, h)), 40.0, &[[0.0; 3]; 9], None, uv2s, MeshVertex::WHOLE_ATLAS,
+            )
+        };
+        let flat = [[0.5, 0.5]; 3];
+        let Some(dark) = render(&hidden, 1, 1, flat) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let bright = render(&lit, 1, 1, flat).unwrap();
+        // u = 2x and v = -2y in NDC: the 8x8 target's centre pixel (4, 4)
+        // reads texel (0, 0)'s centre, its right and lower neighbours texels
+        // (1, 0) and (0, 1).
+        let quad = [hidden, lit, lit, lit].concat();
+        let mixed = render(&quad, 2, 2, [[-2.0, 2.0], [6.0, 2.0], [-2.0, -6.0]]).unwrap();
+        assert!(bright[0] > dark[0] + 60, "the lamp lights the model: {bright:?} vs {dark:?}");
+        assert!(mixed[0] <= dark[0] + 2, "a hidden texel read lit beside lit ones: {mixed:?} vs hidden {dark:?}, lit {bright:?}");
+    }
+
+    /// A PIXEL'S `uv2` STAYS IN ITS TRIANGLE'S CHART, however far past the
+    /// triangle it was extrapolated -- as an MSAA edge pixel's is. A 4x4 mask:
+    /// the triangle's chart is texel (1, 1), hidden, with its gutter ring
+    /// hidden too, as the bake dilates it; everything past is lit, as another
+    /// triangle's chart or the atlas's unused neutral is. The centre pixel's
+    /// `uv2` lands on lit texel (3, 3): clamped to the chart it reads hidden,
+    /// and with no bound it reads lit (the control).
+    #[test]
+    fn an_extrapolated_lightmap_read_stays_in_its_triangles_chart() {
+        let grey = [128, 128, 128, 255];
+        let hidden = [0u8, 255, 255, 255];
+        let lit = [255u8, 255, 255, 255];
+        let mask: Vec<u8> = (0..16).flat_map(|i| if i % 4 < 3 && i / 4 < 3 { hidden } else { lit }).collect();
+        // u = -1.375 + 2 (x + 1) and v = 2.625 - 2 (y + 1) in NDC: the 8x8
+        // target's centre pixel reads (0.875, 0.875), texel (3, 3)'s centre.
+        let uv2s = [[-1.375, 2.625], [6.625, 2.625], [-1.375, -5.375]];
+        let render = |rect: [u16; 4]| {
+            render_mesh_room_with(
+                [0.0; 3], 0.0, true, 0.0, [255; 4], [0, 0, 0, 255], grey, Some((&mask, 4, 4)), 40.0, &[[0.0; 3]; 9], None, uv2s, rect,
+            )
+        };
+        let Some(unbounded) = render(MeshVertex::WHOLE_ATLAS) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let chart = MeshVertex::uv2_rect_of([[0.25, 0.25], [0.5, 0.25], [0.25, 0.5]]);
+        let bounded = render(chart).unwrap();
+        let dark = render_mesh_room_with(
+            [0.0; 3], 0.0, true, 0.0, [255; 4], [0, 0, 0, 255], grey, Some((&hidden, 1, 1)), 40.0, &[[0.0; 3]; 9], None, [[0.5, 0.5]; 3], MeshVertex::WHOLE_ATLAS,
+        )
+        .unwrap();
+        assert!(unbounded[0] > dark[0] + 60, "the control reads the lit texel: {unbounded:?} vs hidden {dark:?}");
+        assert!(bounded[0] <= dark[0] + 2, "the read left its chart: {bounded:?} vs hidden {dark:?}");
     }
 
     /// A stationary lamp takes its shadow on a mesh from the mesh's own baked
@@ -1128,6 +1207,42 @@ mod tests {
         room: &crate::renderer::room_light::RoomLight,
         own: Option<&Light>,
     ) -> Option<[u8; 4]> {
+        render_mesh_room_with(
+            emissive,
+            drive,
+            lit,
+            sky_vis,
+            mask,
+            lightmap_texel,
+            base,
+            stationary.as_ref().map(|t| (&t[..], 1, 1)),
+            intensity,
+            room,
+            own,
+            [[0.5, 0.5]; 3],
+            MeshVertex::WHOLE_ATLAS,
+        )
+    }
+
+    /// The same, with a stationary mask of any size and the triangle's three
+    /// lightmap coordinates given -- the centre pixel's neighbours can read
+    /// other texels of the mask.
+    #[allow(clippy::too_many_arguments)]
+    fn render_mesh_room_with(
+        emissive: [f32; 3],
+        drive: f32,
+        lit: bool,
+        sky_vis: f32,
+        mask: [u8; 4],
+        lightmap_texel: [u8; 4],
+        base: [u8; 4],
+        stationary: Option<(&[u8], u32, u32)>,
+        intensity: f32,
+        room: &crate::renderer::room_light::RoomLight,
+        own: Option<&Light>,
+        uv2s: [[f32; 2]; 3],
+        uv2_rect: [u16; 4],
+    ) -> Option<[u8; 4]> {
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
 
@@ -1170,7 +1285,7 @@ mod tests {
             None => create_lightmap_texture(
                 &device, &queue, &pipeline.lightmap_layout, &lightmap_texel, 1, 1, None,
             ),
-            Some(texel) => crate::renderer::mesh::create_lightmap_texture_full(
+            Some((texels, w, h)) => crate::renderer::mesh::create_lightmap_texture_full(
                 &device,
                 &queue,
                 &pipeline.lightmap_layout,
@@ -1179,18 +1294,19 @@ mod tests {
                 1,
                 None,
                 None,
-                Some((&[&texel[..]], 1, 1)),
+                Some((&[texels], w, h)),
             ),
         };
 
-        let v = |p: [f32; 3]| MeshVertex {
+        let v = |p: [f32; 3], uv2: [f32; 2]| MeshVertex {
             position: p,
             normal: [0.0, 0.0, 1.0],
             uv: [0.5, 0.5],
-            uv2: [0.5, 0.5],
+            uv2,
             emissive: MeshVertex::pack_emissive(emissive),
+            uv2_rect,
         };
-        let verts = [v([-1.0, -1.0, 0.0]), v([3.0, -1.0, 0.0]), v([-1.0, 3.0, 0.0])];
+        let verts = [v([-1.0, -1.0, 0.0], uv2s[0]), v([3.0, -1.0, 0.0], uv2s[1]), v([-1.0, 3.0, 0.0], uv2s[2])];
         let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh_test_vb"),
             contents: bytemuck::cast_slice(&verts),
@@ -1328,6 +1444,7 @@ mod tests {
                     uv: [0.5, 0.5],
                     uv2: [0.5, 0.5],
                     emissive: MeshVertex::pack_emissive([0.5, 0.5, 0.5]),
+                    uv2_rect: MeshVertex::WHOLE_ATLAS,
                 });
             }
         }

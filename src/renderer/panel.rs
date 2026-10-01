@@ -17,6 +17,7 @@ pub(crate) fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Ve
             uv2: [0.0, 1.0],
             // A UI panel does not glow.
             emissive: MeshVertex::NO_EMISSIVE,
+            uv2_rect: MeshVertex::WHOLE_ATLAS,
         },
         MeshVertex {
             position: [hw, -hh, 0.0],
@@ -25,6 +26,7 @@ pub(crate) fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Ve
             uv2: [1.0, 1.0],
             // A UI panel does not glow.
             emissive: MeshVertex::NO_EMISSIVE,
+            uv2_rect: MeshVertex::WHOLE_ATLAS,
         },
         MeshVertex {
             position: [hw, hh, 0.0],
@@ -33,6 +35,7 @@ pub(crate) fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Ve
             uv2: [1.0, 0.0],
             // A UI panel does not glow.
             emissive: MeshVertex::NO_EMISSIVE,
+            uv2_rect: MeshVertex::WHOLE_ATLAS,
         },
         MeshVertex {
             position: [-hw, hh, 0.0],
@@ -41,6 +44,7 @@ pub(crate) fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Ve
             uv2: [0.0, 0.0],
             // A UI panel does not glow.
             emissive: MeshVertex::NO_EMISSIVE,
+            uv2_rect: MeshVertex::WHOLE_ATLAS,
         },
     ];
     let indices = vec![0, 1, 2, 0, 2, 3];
