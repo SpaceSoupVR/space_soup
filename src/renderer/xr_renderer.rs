@@ -354,6 +354,10 @@ struct WaterBody {
 struct StereoProbePass {
     pass: crate::renderer::brush_pipeline::BrushPipeline,
     reader: crate::renderer::brush_pipeline::BrushPipeline,
+    /// `reader` for the faces the sun never reaches, and for those whose
+    /// baked sun mask always answers. See `brush_pipeline::SunFaces`.
+    reader_sunless: crate::renderer::brush_pipeline::BrushPipeline,
+    reader_baked: crate::renderer::brush_pipeline::BrushPipeline,
     target: crate::renderer::brush_pipeline::probe_pass::Target,
 }
 
@@ -401,16 +405,46 @@ pub struct XrRenderer {
     /// eye's target. See `brush_pipeline::probe_pass`.
     brush_probe_pass_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     brush_probe_reader_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    /// The readers for the brushes the sky's sun never reaches and for those
+    /// whose baked sun mask always answers, and which faces those are --
+    /// `None` until a level brings a baked sun mask. See
+    /// `brush_pipeline::SunFaces`.
+    brush_probe_reader_sunless_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    brush_probe_reader_baked_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    /// THE SCENE'S SPOTLESS TWINS: the three readers above and the models'
+    /// pipelines with the spots' shadow code left out, drawn in frames where
+    /// no spot casts -- the registers the tent took given back. See
+    /// `lights::without_spot_shadows`; the lever `spotless_shaders`.
+    spotless_readers: [crate::renderer::brush_pipeline::BrushPipeline; 3],
+    spotless_mesh: MeshPipeline,
+    /// This frame draws with them: no spot casts, no lit surface's light
+    /// (whose readers' loop they leave out), and the lever is on. Set
+    /// once the frame knows its spots, while its draw lists borrow the
+    /// renderer, hence atomic.
+    spotless_frame: std::sync::atomic::AtomicBool,
+    sun_faces: Option<crate::renderer::brush_pipeline::SunFaces>,
     probe_pass_targets: [crate::renderer::brush_pipeline::probe_pass::Target; 2],
     /// The single-eye probe pass that ships: its secondary lookups left to
     /// `probe_fixups`, which writes them into each eye's target through
     /// `probe_fixup_targets`. See `probe_fixup`; the lever
     /// `deferred_reflection_lookups`.
     brush_probe_pass_deferred_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    /// THE PROBE PASSES' POOLLESS TWINS, the brushes' and the ground's: the
+    /// torch pool maps' lookup left out, drawn in frames where no surface is
+    /// lit. See `lights::without_pool_maps`; the lever `poolless_shaders`.
+    brush_probe_pass_poolless_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
+    terrain_probe_pass_poolless_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
     /// MEASUREMENT: the `pass_cut` / `scene_cut` levers' pipelines, drawn in
     /// place of the shipped probe pass / scene reader while set, and what
     /// building them takes. See `Levers::pass_cut`.
     pass_cut_pipeline: Option<(String, crate::renderer::brush_pipeline::BrushPipeline)>,
+    /// MEASUREMENT: the ground's probe pass with a `terrain_cut_` register cut,
+    /// drawn in place of `terrain_probe_pass_pipeline` while `pass_cut` names
+    /// one. See `TerrainPipeline::new_probe_pass_with_cut`.
+    terrain_cut_pipeline: Option<(String, crate::renderer::terrain_pipeline::TerrainPipeline)>,
+    /// MEASUREMENT: the mesh pipelines with the thin pass shaded per fragment,
+    /// while `Levers::thin_shading_sampled` is set.
+    thin_sampled_pipeline: Option<crate::renderer::mesh_pipeline::MeshPipeline>,
     scene_cut_pipeline: Option<(String, crate::renderer::brush_pipeline::BrushPipeline)>,
     cut_inputs: (wgpu::TextureFormat, u32, wgpu::BindGroupLayout),
     probe_fixups: crate::renderer::probe_fixup::ProbeFixups,
@@ -428,10 +462,22 @@ pub struct XrRenderer {
     /// meets them. Made with the atlas, at its cards' size. See
     /// `character_cards`; the lever `character_cards`.
     character_cards: Option<crate::renderer::character_cards::CharacterCards>,
+    /// THE PLAYER POSED ONCE A FRAME for the shadow tiles and the cards, and
+    /// each skinned primitive's posed copy. See `skin_compute`; the lever
+    /// `skin_once`.
+    skin_compute: crate::renderer::skin_compute::SkinCompute,
+    /// Behind a lock: the frame fills it while its draw lists borrow the
+    /// renderer.
+    posed_cache: std::sync::Mutex<crate::renderer::skin_compute::PosedCache>,
     /// The card atlas the level's models and the characters share: the
     /// characters' rows are copied into it each frame. See
     /// `proxy_cards::atlas_with_characters`.
     card_atlas: Option<crate::renderer::proxy_cards::CardAtlas>,
+    /// THE TORCH'S POOL IN REFLECTIONS: each lit surface's light, made once a
+    /// frame into the rows the atlas keeps under the player's cards, which a
+    /// reflection meeting the surface reads. Made with the atlas, at its
+    /// cards' size. See `pool_cards`.
+    pool_cards: Option<crate::renderer::pool_cards::PoolCards>,
     /// THE GROUND in the probe pass and reading it back. See
     /// `TerrainPipeline::new_probe_pass`; the lever `terrain_probe_pass`.
     terrain_probe_pass_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
@@ -640,6 +686,11 @@ pub struct XrRenderer {
     /// The performance levels the levers ask for. `None` without the
     /// extension. See `performance_level`.
     perf_settings: Option<crate::xr::PerfSettings>,
+    /// DYNAMIC RESOLUTION: the runtime's size for each frame's eye layer,
+    /// asked while the lever is on, and the window's answers for the `DYNRES`
+    /// line. `None` without the extension. See `dynamic_resolution`.
+    recommended_resolution: Option<crate::xr::RecommendedResolution>,
+    recommendation_window: crate::renderer::dynamic_resolution::RecommendationWindow,
     /// Those counters summed over the window's measured frames.
     perf_metric_window: crate::perf_metrics_log::WindowMeans,
     /// Where each window is also written, one JSON line apiece: the host
@@ -934,7 +985,7 @@ impl XrRenderer {
                 // APPENDED, not inserted: the existing slots are addressed by
                 // index from the passes themselves, so a new label in the
                 // middle would silently retime them.
-                &["scene_l", "eye_l", "scene_r", "eye_r", "prep_l", "prep_r", "refl_l", "refl_r", "probe_l", "probe_r", "fix_l", "fix_r", "mirror_l", "mirror_r", "mips_l", "mips_r", "blur_l", "blur_r", "cards", "card_mips"],
+                &["scene_l", "eye_l", "scene_r", "eye_r", "prep_l", "prep_r", "refl_l", "refl_r", "probe_l", "probe_r", "fix_l", "fix_r", "mirror_l", "mirror_r", "mips_l", "mips_r", "blur_l", "blur_r", "cards", "card_mips", "pools", "pool_mips"],
                 period,
             )
         });
@@ -997,9 +1048,22 @@ impl XrRenderer {
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
             crate::renderer::multiview::ViewMode::Mono,
         );
+        let spotless_readers = crate::renderer::brush_pipeline::BrushPipeline::new_spotless_probe_readers(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
+        );
+        let [brush_probe_reader_sunless_pipeline, brush_probe_reader_baked_pipeline] =
+            [crate::renderer::brush_pipeline::FaceSun::Never, crate::renderer::brush_pipeline::FaceSun::Baked].map(|class| {
+                crate::renderer::brush_pipeline::BrushPipeline::new_multisampled_probe_reader_for(
+                    &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
+                    crate::renderer::multiview::ViewMode::Mono, class,
+                )
+            });
         if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
             crate::renderer::brush_pipeline::BrushPipeline::log_scene_register_cuts(
                 &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
+            );
+            crate::renderer::mesh_pipeline::MeshPipeline::log_register_cuts(
+                &wgpu_device, wgpu_format, &uniform_buf.layout, samples,
             );
         }
         let probe_pass_targets: [crate::renderer::brush_pipeline::probe_pass::Target; 2] = std::array::from_fn(|_| {
@@ -1022,6 +1086,12 @@ impl XrRenderer {
         });
         let terrain_probe_pass_pipeline =
             crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass(&wgpu_device, &uniform_buf.layout, &probe_fixups);
+        let brush_probe_pass_poolless_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass_deferred_poolless(
+            &wgpu_device, &uniform_buf.layout, &probe_fixups,
+        );
+        let terrain_probe_pass_poolless_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass_poolless(
+            &wgpu_device, &uniform_buf.layout, &probe_fixups,
+        );
         let terrain_probe_reader_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_reader(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
         );
@@ -1029,6 +1099,10 @@ impl XrRenderer {
             crate::renderer::brush_pipeline::BrushPipeline::log_deferred_register_cuts(
                 &wgpu_device, &uniform_buf.layout, &probe_fixups,
             );
+            crate::renderer::terrain_pipeline::TerrainPipeline::log_probe_pass_register_cuts(
+                &wgpu_device, &uniform_buf.layout, &probe_fixups,
+            );
+            probe_fixups.log_register_cuts(&wgpu_device);
         }
         let brush_depth_prepass = crate::renderer::brush_pipeline::BrushPipeline::new_depth_prepass(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, crate::renderer::multiview::ViewMode::Mono,
@@ -1079,6 +1153,8 @@ impl XrRenderer {
             WirePipeline::new_multisampled(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
         let mesh_pipeline =
             MeshPipeline::new_multisampled(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
+        let spotless_mesh =
+            MeshPipeline::new_multisampled_spotless(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
         let skinned_mesh_pipeline =
             SkinnedMeshPipeline::new_multisampled(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
         // The mirror pass renders into a single-sampled target, so the skinned
@@ -1256,6 +1332,14 @@ impl XrRenderer {
                 reader: crate::renderer::brush_pipeline::BrushPipeline::new_multisampled_probe_reader(
                     &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, stereo,
                 ),
+                reader_sunless: crate::renderer::brush_pipeline::BrushPipeline::new_multisampled_probe_reader_for(
+                    &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, stereo,
+                    crate::renderer::brush_pipeline::FaceSun::Never,
+                ),
+                reader_baked: crate::renderer::brush_pipeline::BrushPipeline::new_multisampled_probe_reader_for(
+                    &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, stereo,
+                    crate::renderer::brush_pipeline::FaceSun::Baked,
+                ),
                 target: crate::renderer::brush_pipeline::probe_pass::Target::new(
                     &wgpu_device, &probe_pass_layout, width, height, crate::renderer::multiview::STEREO_VIEWS,
                 ),
@@ -1421,6 +1505,7 @@ impl XrRenderer {
             &mesh_pipeline.lightmap_layout,
         );
 
+        let skin_compute = crate::renderer::skin_compute::SkinCompute::new(&wgpu_device);
         Ok(Self {
             swapchain,
             width,
@@ -1434,9 +1519,19 @@ impl XrRenderer {
             brush_opaque_pipeline,
             brush_probe_pass_pipeline,
             brush_probe_reader_pipeline,
+            brush_probe_reader_sunless_pipeline,
+            brush_probe_reader_baked_pipeline,
+            spotless_readers,
+            spotless_mesh,
+            spotless_frame: std::sync::atomic::AtomicBool::new(false),
+            sun_faces: None,
             probe_pass_targets,
             brush_probe_pass_deferred_pipeline,
+            brush_probe_pass_poolless_pipeline,
+            terrain_probe_pass_poolless_pipeline,
             pass_cut_pipeline: None,
+            terrain_cut_pipeline: None,
+            thin_sampled_pipeline: None,
             scene_cut_pipeline: None,
             cut_inputs: (wgpu_format, samples, probe_pass_layout.clone()),
             probe_fixups,
@@ -1445,7 +1540,10 @@ impl XrRenderer {
             probe_blur,
             probe_blur_groups,
             character_cards: None,
+            skin_compute,
+            posed_cache: Default::default(),
             card_atlas: None,
+            pool_cards: None,
             terrain_probe_pass_pipeline,
             terrain_probe_reader_pipeline,
             stereo_probe,
@@ -1556,6 +1654,12 @@ impl XrRenderer {
             perf_warmup: true,
             perf_metrics: crate::xr::PerfMetrics::new(&xr_ctx.instance, session),
             perf_settings: crate::xr::PerfSettings::new(&xr_ctx.instance, session),
+            recommended_resolution: crate::xr::RecommendedResolution::new(
+                &xr_ctx.instance,
+                session,
+                xr_ctx.has_recommended_resolution,
+            ),
+            recommendation_window: Default::default(),
             perf_metric_window: Default::default(),
             perf_log: None,
             started_at: std::time::Instant::now(),
@@ -1619,6 +1723,12 @@ impl XrRenderer {
         stationary: &[&[u8]],
         stationary_size: (u32, u32),
     ) {
+        // The atlas's empty texels near its charts filled first: what the GPU
+        // samples, and so what each face's reader is chosen by. See
+        // `brush_pipeline::dilate_sun_mask`.
+        let sun_mask = sun_mask.map(|(rgba, w, h)| (crate::renderer::brush_pipeline::dilate_sun_mask(rgba, w, h), w, h));
+        let sun_mask = sun_mask.as_ref().map(|(rgba, w, h)| (rgba.as_slice(), *w, *h));
+        self.sun_faces = sun_mask.and_then(|(rgba, w, h)| crate::renderer::brush_pipeline::SunFaces::from_mask(rgba, w, h));
         self.brush_lightmap = Some(crate::renderer::mesh::create_lightmap_texture_full(
             &self.wgpu_device,
             &self.wgpu_queue,
@@ -1926,12 +2036,15 @@ impl XrRenderer {
     fn sp_mesh(&self, stereo: bool) -> &wgpu::RenderPipeline {
         match (stereo, &self.stereo_pipelines) {
             (true, Some(p)) => &p.mesh.pipeline,
+            _ if self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed) => &self.spotless_mesh.pipeline,
             _ => &self.mesh_pipeline.pipeline,
         }
     }
     fn sp_mesh_thin(&self, stereo: bool) -> &wgpu::RenderPipeline {
-        match (stereo, &self.stereo_pipelines) {
-            (true, Some(p)) => &p.mesh.thin_pipeline,
+        match (stereo, &self.stereo_pipelines, &self.thin_sampled_pipeline) {
+            (true, Some(p), _) => &p.mesh.thin_pipeline,
+            (false, _, Some(p)) => &p.thin_pipeline,
+            _ if self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed) => &self.spotless_mesh.thin_pipeline,
             _ => &self.mesh_pipeline.thin_pipeline,
         }
     }
@@ -2089,6 +2202,18 @@ impl XrRenderer {
                 &self.skinned_mesh_pipeline,
             ));
         }
+        // The torch's pool maps, in the rows under the player's cards. See
+        // `pool_cards`.
+        if self.pool_cards.as_ref().is_none_or(|p| p.resolution() != atlas.resolution) {
+            self.pool_cards = Some(crate::renderer::pool_cards::PoolCards::new(
+                &self.wgpu_device,
+                &self.uniform_buf.layout,
+                atlas.resolution,
+            ));
+        }
+        self.lights_uniform.set_pool_row(
+            self.pool_cards.as_ref().map(|p| p.first_row(atlas.pool_row)),
+        );
         self.card_atlas = Some(atlas);
         self.probe_proxies = proxies;
         // The models' distance fields, packed and bound; where each lies goes
@@ -2131,7 +2256,18 @@ impl XrRenderer {
         }
         self.set_auto_exposure(levers.eye_adaptation);
         if levers.pass_cut != self.levers.pass_cut {
-            self.pass_cut_pipeline = levers.pass_cut.as_ref().and_then(|cut| {
+            // The ground's cuts are named for it; any other is the brushes'.
+            let terrain = levers.pass_cut.as_ref().filter(|cut| cut.starts_with("terrain_cut_"));
+            self.terrain_cut_pipeline = terrain.and_then(|cut| {
+                let p = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass_with_cut(
+                    &self.wgpu_device, &self.uniform_buf.layout, &self.probe_fixups, cut,
+                );
+                if p.is_none() {
+                    log::warn!("LEVERS: pass_cut {cut}: no such cut, or it no longer matches the shader");
+                }
+                p.map(|p| (cut.clone(), p))
+            });
+            self.pass_cut_pipeline = levers.pass_cut.as_ref().filter(|_| terrain.is_none()).and_then(|cut| {
                 let p = crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass_deferred_with_cut(
                     &self.wgpu_device, &self.uniform_buf.layout, &self.probe_fixups, cut,
                 );
@@ -2140,6 +2276,17 @@ impl XrRenderer {
                 }
                 p.map(|p| (cut.clone(), p))
             });
+        }
+        if levers.thin_shading_sampled != self.levers.thin_shading_sampled {
+            let (format, samples, _) = &self.cut_inputs;
+            self.thin_sampled_pipeline = levers.thin_shading_sampled.then(|| {
+                crate::renderer::mesh_pipeline::MeshPipeline::new_multisampled_thin_sampled(
+                    &self.wgpu_device, *format, &self.uniform_buf.layout, *samples,
+                )
+            });
+        }
+        if levers.fixup_cut != self.levers.fixup_cut && !self.probe_fixups.set_cut(&self.wgpu_device, levers.fixup_cut.as_deref()) {
+            log::warn!("LEVERS: fixup_cut {:?}: no such cut, or it no longer matches the shader", levers.fixup_cut);
         }
         if levers.scene_cut != self.levers.scene_cut {
             let (format, samples, layout) = &self.cut_inputs;
@@ -2171,12 +2318,46 @@ impl XrRenderer {
         self.levers.clone()
     }
 
+    /// The A/B schedule's phase for the frame about to be drawn: Baseline
+    /// unless the schedule runs (`perf_ab::ENABLED`, `Levers::ab_cycle`).
+    pub fn ab_phase(&self) -> crate::renderer::perf_ab::Phase {
+        if crate::renderer::perf_ab::ENABLED || self.levers.ab_cycle {
+            crate::renderer::perf_ab::Phase::cycle_phase(self.perf_windows)
+        } else {
+            crate::renderer::perf_ab::Phase::Baseline
+        }
+    }
+
+    /// The levers the frame about to be drawn runs with -- the lever file and
+    /// the schedule's phase together, as the frame's own `fx` has them -- for
+    /// what the app decides before the frame: the flashlight's bounce.
+    pub fn frame_levers(&self) -> crate::renderer::levers::Levers {
+        self.levers.clone().with_phase(self.ab_phase())
+    }
+
     /// Whether frames go out with SpaceWarp's motion and depth: the lever is
     /// on AND the runtime gave us its swapchains. What the compositor is asked
     /// for besides follows this, not the lever -- see
     /// `layer_settings::sharpening_for`.
     pub fn space_warp_running(&self) -> bool {
         self.space_warp.is_some() && self.levers.space_warp
+    }
+
+    /// DYNAMIC RESOLUTION, first step: ask the runtime its size for the eyes'
+    /// layer about to be submitted for `display_time` -- while the lever
+    /// `dynamic_resolution` is on and the runtime has the extension -- and keep
+    /// the answer for the window's `DYNRES` line. The eyes are drawn at their
+    /// fixed size whatever it says. See `dynamic_resolution`.
+    pub fn ask_recommended_resolution(&mut self, layer: &xr::sys::CompositionLayerProjection, display_time: xr::Time) {
+        let Some(asker) = self.recommended_resolution.as_ref().filter(|_| self.levers.dynamic_resolution) else {
+            return;
+        };
+        // SAFETY: `layer` is borrowed for the call, and its views and their
+        // swapchain are the ones the caller submits right after.
+        let answer = unsafe {
+            asker.recommend(layer as *const xr::sys::CompositionLayerProjection as *const xr::sys::CompositionLayerBaseHeader, display_time)
+        };
+        self.recommendation_window.add(answer.map_err(|e| e.into_raw()));
     }
 
     /// Pin the tracked head -- stage space, from `bench::BenchRig` -- or give
@@ -2255,11 +2436,21 @@ impl XrRenderer {
 
     /// The characters as capsules for this frame, nearest first, in the
     /// player's frame. See `uniforms::CapsuleUpload`.
+    /// The surfaces the live lamps' beams light this frame, for reflections to
+    /// show their light. See `lights::LitSurface`.
+    pub fn set_lit_surfaces(&self, surfaces: &[crate::renderer::lights::LitSurface]) {
+        self.lights_uniform.set_lit_surfaces(surfaces);
+    }
+
     pub fn set_capsules(&mut self, groups: &[crate::renderer::uniforms::CapsuleGroup]) {
         self.player.capsules = crate::renderer::uniforms::CapsuleUpload::from_groups(groups);
-        // Every one, for the hands that shield an eye from a lamp. See `glare`.
+        // Every body's, for the hands that shield an eye from a lamp. See
+        // `glare`. Not a carried thing's: a torch's glass is a source of glare
+        // itself, and would hide its own.
         self.glare_capsules.clear();
-        self.glare_capsules.extend(groups.iter().flat_map(|g| g.capsules.iter().copied()));
+        self.glare_capsules.extend(groups.iter().flat_map(|g| {
+            g.capsules.iter().enumerate().filter(|(k, _)| g.surfaces.get(*k).map_or(true, |s| *s == 0.0)).map(|(_, c)| *c)
+        }));
     }
 
     pub fn set_sky(

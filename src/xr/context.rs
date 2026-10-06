@@ -17,6 +17,12 @@ pub struct XrContext {
     /// `XR_FB_space_warp`, available and enabled: the motion-vector image
     /// size the runtime recommends. See `renderer::space_warp`.
     pub space_warp: Option<(u32, u32)>,
+    /// `XR_META_recommended_layer_resolution`, available and enabled. See
+    /// `recommended_resolution`.
+    pub has_recommended_resolution: bool,
+    /// `XR_KHR_visibility_mask`, available and enabled: the lenses' hidden
+    /// area, measured at startup (`renderer::visibility_mask`).
+    pub has_visibility_mask: bool,
 }
 
 impl XrContext {
@@ -87,16 +93,47 @@ impl XrContext {
             exts.fb_space_warp = true;
         }
 
-        let instance = entry.create_instance(
-            &xr::ApplicationInfo {
-                application_name: "space_soup",
-                application_version: 1,
-                engine_name: "space_soup",
-                engine_version: 1,
-            },
-            &exts,
-            &[],
-        )?;
+        // The lenses' hidden area, where the runtime lists it. Asking for the
+        // mesh changes nothing drawn; see `renderer::visibility_mask`.
+        let has_visibility_mask = available_exts.khr_visibility_mask;
+        if has_visibility_mask {
+            exts.khr_visibility_mask = true;
+        }
+
+        // The runtime's extensions these bindings have no field for, newest
+        // first to look for when a Meta extension seems missing.
+        info!("xr: runtime extensions unknown to openxr 0.18: {}", available_exts.other.join(", "));
+
+        let app_info = xr::ApplicationInfo {
+            application_name: "space_soup",
+            application_version: 1,
+            engine_name: "space_soup",
+            engine_version: 1,
+        };
+
+        // DYNAMIC RESOLUTION: the runtime's size for each frame's projection
+        // layer. See `recommended_resolution`. Enabling it is what Quest 3
+        // grants GPU level 5 for -- a 599 MHz clock FLOOR (kgsl min_freq); the
+        // 640 MHz cap is the same at every level (deploy98, 2026-10-06).
+        // Runtime v209.91 does not LIST it to this app, yet takes it, so it is
+        // asked for anyway, and the instance made without it if the runtime
+        // refuses.
+        let listed = super::recommended_resolution::available(&available_exts);
+        let mut with_it = exts.clone();
+        with_it.other.push(super::recommended_resolution::EXTENSION_NAME.to_string());
+        let (instance, has_recommended_resolution) = match entry.create_instance(&app_info, &with_it, &[]) {
+            Ok(instance) => (instance, true),
+            Err(e) => {
+                info!("{}: refused at instance creation ({e})", super::recommended_resolution::EXTENSION_NAME);
+                (entry.create_instance(&app_info, &exts, &[])?, false)
+            }
+        };
+        info!(
+            "{}: {} by the runtime, {}",
+            super::recommended_resolution::EXTENSION_NAME,
+            if listed { "listed" } else { "NOT listed" },
+            if has_recommended_resolution { "enabled" } else { "not enabled" },
+        );
 
         let props = instance.properties()?;
         info!("Runtime: {} v{}", props.runtime_name, props.runtime_version);
@@ -133,6 +170,8 @@ impl XrContext {
             has_layer_settings,
             has_performance_metrics,
             space_warp,
+            has_recommended_resolution,
+            has_visibility_mask,
         })
     }
 }

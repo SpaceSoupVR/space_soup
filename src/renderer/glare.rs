@@ -58,6 +58,37 @@
 //! wires and a lamp's clear globe blend over it by what they really cover.
 //! The two are split AFTER the tone curve, which bends: halves tone-mapped
 //! apart left the glow a third dimmer where it fades.
+//!
+//! ONLY IN THE AIR ITS BULB LIGHTS. The core's plane stands in front of the
+//! bulb, and a hanging lamp's cap and neck stand behind it: from under the
+//! lamp the brightest of its glare lay over them, above the shade (headset eye
+//! captures, glare on less glare off, 2026-10-02). So where the bake measured
+//! the air round a fixture's bulb ([`GlareAir`]), each point of its veil takes
+//! as much of it as that air shows of the bulb where the view ray through the
+//! point passes nearest it: inside the shade and out of its mouth, all of it;
+//! beside the shade and above it, none.
+//!
+//! OVER A FIXTURE THE EYE IS ADAPTED TO, ONLY BEHIND IT. A hanging lamp seen
+//! up close draws its own light as an eye adapted to it sees it
+//! (`tonemap::own_light_scale`), the bulb a white shape in a graded bell --
+//! and its veil, drawn at the room's adaptation over that, washed the bell
+//! out again round the bulb (headset eye captures, 2026-10-02: glare on less
+//! glare off, up to 0.41 of white over the inside). Scaled as the fixture is,
+//! the veil over it would be a few hundredths of the inside's own light:
+//! nothing. So such a fixture's core stands behind all of it -- its bulb's
+//! reach past the bulb ([`GlareAir::reach`]) -- and the fixture cuts it the way
+//! a hand does, its dark outline crisp, the glow lying over the ceiling and
+//! the room behind it; where a wall or ceiling stands nearer than that reach,
+//! the shader brings the core forward of it.
+//!
+//! SCREENED, NOT ADDED. The veil is light reaching the eye, so it belongs in
+//! the sum the tone curve is applied to -- but the scene pass has already
+//! applied it, and keeps no HDR image. Over a dark wall the difference is
+//! nothing; over a lamp's lit inside, already on the curve's shoulder, the sum
+//! barely moves, where adding after the curve burnt a white disc round the
+//! bulb. `1 - (1 - scene)(1 - veil)` is within 0.07 of the curve of the sum at
+//! every pairing of 0-6.4 exposed with 0.02-3.2 of veil; adding was out by
+//! 0.25 and clipped (2026-10-02).
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Quat, Vec3};
@@ -133,6 +164,61 @@ pub struct GlareTable {
     /// each drawn as its own veil. `None` for a bake from before 2026-10-01,
     /// which draws one, from `centre`. See [`GlareTableSplit`].
     pub split: Option<GlareTableSplit>,
+    /// The air round the bulb, and how much of the bulb each point of it
+    /// sees. `None` for a bake from before 2026-10-02, whose veils show in
+    /// all of it. See [`GlareAir`].
+    pub air: Option<GlareAir>,
+}
+
+/// THE AIR ROUND A FIXTURE'S BULB, AND HOW MUCH OF THE BULB EACH POINT OF IT
+/// SEES: a grid in the fixture's frame from the table's origin
+/// (`space_soup_engine::reflection_cards::GlareAir`, which this mirrors as
+/// plain data). A veil shows only in air its bulb lights -- inside its shade
+/// and out of its mouth, never beside the shade or above it -- read where each
+/// of its view rays passes nearest the bulb. The depth test cuts a veil by
+/// what stands in front of a plane before the bulb; a hanging lamp's cap and
+/// neck stand behind that plane, and from under the lamp the brightest of its
+/// glare lay over them (headset eye captures, glare on less glare off,
+/// 2026-10-02). See [`build_glare`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlareAir {
+    /// The grid's first and last points.
+    pub min: Vec3,
+    pub max: Vec3,
+    /// Points along x, y and z, both ends included.
+    pub dims: [usize; 3],
+    /// The bulb's middle.
+    pub bulb: Vec3,
+    /// Per point, x fastest, then y, then z: the share of the bulb seen.
+    pub seen: Vec<f32>,
+    /// How far from the bulb's middle the fixture's own surfaces reach that
+    /// the bulb lights, in metres -- its shade, to the rim: where the core of
+    /// a veil over a fixture the eye is adapted to goes behind (see
+    /// [`build_glare`]). 0 where the bake did not measure it.
+    pub reach: f32,
+}
+
+impl GlareAir {
+    /// The share of the bulb seen from `local`, in the grid's frame: between
+    /// its points, and past its edge, the edge's. 1 for a grid that is not
+    /// whole, or a point that is not one.
+    pub fn seen_from(&self, local: Vec3) -> f32 {
+        let [nx, ny, nz] = self.dims;
+        if nx < 2 || ny < 2 || nz < 2 || self.seen.len() != nx * ny * nz || !local.is_finite() {
+            return 1.0;
+        }
+        let last = Vec3::new((nx - 1) as f32, (ny - 1) as f32, (nz - 1) as f32);
+        let g = ((local - self.min) / (self.max - self.min).max(Vec3::splat(1e-6)) * last).clamp(Vec3::ZERO, last);
+        let (lo, f) = (g.floor(), g - g.floor());
+        let (x0, y0, z0) = (lo.x as usize, lo.y as usize, lo.z as usize);
+        let (x1, y1, z1) = ((x0 + 1).min(nx - 1), (y0 + 1).min(ny - 1), (z0 + 1).min(nz - 1));
+        let at = |x: usize, y: usize, z: usize| self.seen[(z * ny + y) * nx + x];
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let plane = |z: usize| {
+            lerp(lerp(at(x0, y0, z), at(x1, y0, z), f.x), lerp(at(x0, y1, z), at(x1, y1, z), f.x), f.y)
+        };
+        lerp(plane(z0), plane(z1), f.z).clamp(0.0, 1.0)
+    }
 }
 
 /// A GLARE TABLE'S LIGHT TOLD APART: what the bulb itself shows, and what the
@@ -376,6 +462,23 @@ pub struct GlareSource {
     /// much shows and where, in place of `sides`, `centres` and `cone`. See
     /// [`GlareTable`].
     pub table: Option<(std::sync::Arc<GlareTable>, Vec3)>,
+    /// The whole veil over everything, as a halo with no cap and no core: for
+    /// a source whose own body stands AT its light -- a torch's bezel round
+    /// its glass, the hand round its grip -- which a core, drawn before the
+    /// thin parts, showed as a dark ring in the middle of its glare (headset
+    /// eye capture, `torch_facing`, 2026-10-02). What stands in front of it
+    /// still takes its veil: a wall by the probe pass, a hand or a body by the
+    /// characters' capsules.
+    pub halo_only: bool,
+    /// A REFLECTION'S POINT ON ITS MIRROR, for a source that is the image of
+    /// one in a polished surface -- the torch's glass in the marble floor
+    /// (user, 2026-10-02: the flashlight "will need to have the hdr bloom
+    /// effect on it, at least in reflections"). The image stands behind the
+    /// mirror, where the probe pass's depth has the mirror in front of it and
+    /// would hide it, so the walls and the hands are tested on the way to this
+    /// point instead. Its veil is a halo alone: a core drawn at the image
+    /// would be behind the mirror too. `None` for a source seen directly.
+    pub mirror: Option<Vec3>,
 }
 
 /// Where the light of `s` shows from `eye`: each side's centre weighed as
@@ -453,6 +556,28 @@ pub fn glare_lobes(s: &GlareSource, eye: Vec3) -> Vec<GlareLobe> {
     }
 }
 
+/// HOW MUCH OF ITS BULB `s` SHOWS an eye at `eye`, 0-1: what its table's
+/// finer rows show of the bulb over all of it, where it has them; otherwise
+/// how much of its light shows over the most it shows anywhere. What the eye
+/// adapts to a fixture by: `tonemap::bulb_adaptation`.
+pub fn bulb_in_view(s: &GlareSource, eye: Vec3) -> f32 {
+    if let Some((table, origin)) = &s.table {
+        let local = table_direction(table, s.rotation, *origin, eye);
+        let fine = table.split.as_ref().and_then(|split| split.bulb_fine.as_ref()).filter(|f| f.whole > 0.0);
+        if let (Some(fine), Some(lobes)) = (fine, table.sample_split(local)) {
+            return (lobes[0].share / fine.whole).clamp(0.0, 1.0);
+        }
+        let most = table.share.iter().copied().fold(0.0, f32::max);
+        return if most > 0.0 { (table.sample(local).0 / most).clamp(0.0, 1.0) } else { 0.0 };
+    }
+    let most = s.sides.iter().copied().fold(0.0, f32::max);
+    if most > 0.0 {
+        (visible_share(s, eye) / most).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -472,16 +597,25 @@ pub struct GlareVertex {
     /// angle, squared; z: the quad's reach, squared; w: the veil at the reach,
     /// taken off it all. Angles in degrees. See the shader.
     pub shape: [f32; 4],
-    /// xyz: the quad's centre -- the bulb, pulled toward the eye by
-    /// [`WALL_MARGIN`] -- where the walls are tested; w: the bulb's radius
-    /// over the quad's half size, which sizes the taps, or -1 for no test
-    /// (no probe pass this frame to test against).
+    /// xyz: where the walls are tested -- the bulb, pulled toward the eye by
+    /// [`WALL_MARGIN`]; w: 1, or -1 for no test (no probe pass this frame to
+    /// test against).
     pub test: [f32; 4],
+    /// xyz: the bulb's radius there, across the view, which sizes the taps;
+    /// w: the share of the veil the air shows at this point (see
+    /// [`GlareAir`]), 1 for a fixture with no air measured.
+    pub reach: [f32; 4],
 }
 
+/// Cells along each side of a veil whose fixture's air was measured: 16
+/// across 50 degrees, a point every 3 -- at a hanging lamp's 28 cm rim from a
+/// metre off, about 5 cm, the air grid's own spacing. See [`build_glare`].
+const AIR_CELLS: usize = 16;
+
 impl GlareVertex {
-    pub const ATTRIBS: [VertexAttribute; 5] =
-        vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Float32x4];
+    pub const ATTRIBS: [VertexAttribute; 6] = vertex_attr_array![
+        0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4
+    ];
 
     pub fn layout() -> VertexBufferLayout<'static> {
         VertexBufferLayout {
@@ -513,6 +647,27 @@ pub fn capsule_visibility(bulb: Vec3, eye: Vec3, capsules: &[(Vec3, Vec3, f32)])
         // as it looks from the eye.
         let soft = (LAMP_RADIUS * t).max(1e-4);
         open *= smoothstep(radius - soft, radius + soft, gap);
+    }
+    open
+}
+
+/// How much of a glowing disc of `radius` at `disc` -- a torch's glass -- the
+/// characters' `capsules` leave in view of a point at `from`, 0..1: as
+/// `capsule_visibility`, softened over the disc's own width where a capsule
+/// crosses the line, and with every capsule the disc stands inside left out:
+/// the hand holding it, which the glass's own beam never meets either. For a
+/// glass's image in a mirror, seen from its point on the mirror -- a hand
+/// raised in front of the torch hides the image and its glare, as the beam's
+/// shadow hides it in the reflections (`capsule_glass_beam`).
+pub fn disc_visibility(disc: Vec3, radius: f32, from: Vec3, capsules: &[(Vec3, Vec3, f32)]) -> f32 {
+    let mut open = 1.0;
+    for &(a, b, r) in capsules {
+        if closest_on_segment(disc, a, b).1 < r + radius {
+            continue;
+        }
+        let (t, gap) = segment_gap(from, disc, a, b);
+        let soft = (radius * t).max(1e-4);
+        open *= smoothstep(r - soft, r + soft, gap);
     }
     open
 }
@@ -562,6 +717,10 @@ fn segment_gap(p: Vec3, q: Vec3, a: Vec3, b: Vec3) -> (f32, f32) {
 /// `capsules`: the characters, whose hands can shield an eye from a lamp --
 /// each eye tested, the veil the share the two see.
 ///
+/// `adapted`: per source, whether its fixture is drawn as an eye adapted to it
+/// sees it (`tonemap::own_light_scale`) -- its core then lies only over what
+/// stands behind the fixture (see the module notes). Missing entries are not.
+///
 /// Each part draws twice (see the module notes): the indices before the
 /// returned count are the halos, drawn over everything; those after it the
 /// cores, drawn only over what stands behind the light.
@@ -574,55 +733,134 @@ pub fn build_glare(
     strength: f32,
     test_walls: bool,
     capsules: &[(Vec3, Vec3, f32)],
+    adapted: &[bool],
 ) -> (Vec<GlareVertex>, Vec<u32>, u32) {
     let mut verts = Vec::new();
     let mut idx = Vec::new();
     let mut cores = Vec::new();
     let eye = 0.5 * (eyes[0] + eyes[1]);
     // A quad facing the eyes, `half` wide either way of `centre`, its uv
-    // spanning `degrees` from the source.
-    let mut quad = |into: &mut Vec<u32>, q: &GlareQuad, centre: Vec3, half: f32, degrees: f32, test: [f32; 4]| {
+    // spanning `degrees` from the source: `cells` a side, each point taking
+    // the share of the veil `air` gives where its view ray passes the bulb.
+    // `test` and `reach`: where the walls are tested and the bulb's radius
+    // there (see the shader), alike at every point.
+    let mut quad = |into: &mut Vec<u32>,
+                    q: &GlareQuad,
+                    centre: Vec3,
+                    half: f32,
+                    degrees: f32,
+                    test: [f32; 4],
+                    reach: Vec3,
+                    cells: usize,
+                    air: &dyn Fn(Vec3) -> f32| {
         let base = verts.len() as u32;
-        for (du, dv) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
-            verts.push(GlareVertex {
-                position: (centre + right * (du * half) + up * (dv * half)).to_array(),
-                colour: q.colour.to_array(),
-                uv: [du, dv],
-                shape: [q.a, q.core2, degrees * degrees, q.edge],
-                test,
-            });
+        let n = cells + 1;
+        for j in 0..n {
+            for i in 0..n {
+                let (du, dv) = (2.0 * i as f32 / cells as f32 - 1.0, 2.0 * j as f32 / cells as f32 - 1.0);
+                let position = centre + right * (du * half) + up * (dv * half);
+                verts.push(GlareVertex {
+                    position: position.to_array(),
+                    colour: q.colour.to_array(),
+                    uv: [du, dv],
+                    shape: [q.a, q.core2, degrees * degrees, q.edge],
+                    test,
+                    reach: [reach.x, reach.y, reach.z, air(position)],
+                });
+            }
         }
-        into.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        let n = n as u32;
+        for j in 0..cells as u32 {
+            for i in 0..cells as u32 {
+                let a = base + j * n + i;
+                // A CELL THAT SHOWS NOTHING IS NOT DRAWN -- the veil's cost is
+                // its area. Dark air at every corner is dark all through (the
+                // air runs straight between them); past the reach the veil is
+                // zero, and the core is too past where the halo takes it all
+                // (see `glare_quad`).
+                let dark = [a, a + 1, a + 1 + n, a + n].iter().all(|&c| verts[c as usize].reach[3] <= 0.0);
+                let (lo, hi) = (verts[a as usize].uv, verts[(a + 1 + n) as usize].uv);
+                let (nu, nv) = (0.0f32.clamp(lo[0], hi[0]), 0.0f32.clamp(lo[1], hi[1]));
+                if dark || nu * nu + nv * nv >= 1.0 {
+                    continue;
+                }
+                into.extend_from_slice(&[a, a + 1, a + 1 + n, a, a + 1 + n, a + n]);
+            }
+        }
     };
+    // The way the view looks: a quad's depth is along it.
+    let forward = up.cross(right).normalize_or_zero();
     // One veil per part of each source that glares: from where the light
     // SHOWS, not where the bulb hangs (see `glare_lobes`).
-    for (s, lobe) in sources.iter().flat_map(|s| glare_lobes(s, eye).into_iter().map(move |l| (s, l))) {
+    let parts = sources.iter().enumerate().flat_map(|(k, s)| glare_lobes(s, eye).into_iter().map(move |l| (k, s, l)));
+    for (k, s, lobe) in parts {
         let at = lobe.centre;
+        // Where its light reaches the eye from: the source, or an image's
+        // point on its mirror (see `GlareSource::mirror`).
+        let seen = s.mirror.unwrap_or(at);
         let shielded =
-            0.5 * (capsule_visibility(at, eyes[0], capsules) + capsule_visibility(at, eyes[1], capsules));
+            0.5 * (capsule_visibility(seen, eyes[0], capsules) + capsule_visibility(seen, eyes[1], capsules));
         let Some(q) = glare_quad(s, &lobe, eye, exposure, strength * shielded) else { continue };
         // Where the walls are tested, and the halo's centre: in front of the
         // light by the wall margin, never past half way to the eye. The quad
         // is sized for the angle it subtends from there; the taps for what
-        // glares.
+        // glares, the bulb's radius across the view.
         let to_eye = eye - at;
         let d = to_eye.length().max(1e-6);
         let toward = to_eye / d;
-        let tested = at + toward * WALL_MARGIN.min(0.5 * d);
+        // An image's mirror point lies on the way from the image to the eye.
+        let from_seen = (eye - seen).length();
+        let tested = seen + toward * WALL_MARGIN.min(0.5 * from_seen);
         let from_tested = (eye - tested).length();
         let half = q.half * from_tested / d;
-        let ratio = if test_walls { lobe.radius / half.max(1e-6) } else { -1.0 };
-        quad(&mut idx, &q, tested, half, q.degrees, [tested.x, tested.y, tested.z, ratio]);
-        if q.core_degrees > 0.0 {
+        // The flag's sign: whether the walls are tested; its size 3, a halo
+        // with no cap (`GlareSource::halo_only`, and an image's).
+        let halo_only = s.halo_only || s.mirror.is_some();
+        let flag = if halo_only { 3.0 } else { 1.0 };
+        let test = [tested.x, tested.y, tested.z, if test_walls { flag } else { -flag }];
+        // The bulb's radius where it is tested, as wide across the view as it
+        // looks: an image is tested at its mirror, nearer than it stands.
+        let reach = right * lobe.radius * if s.mirror.is_some() { from_tested / d } else { 1.0 };
+        // THE AIR ITS BULB LIGHTS, where the bake measured it: each point of
+        // the veil as much of it as the air shows of the bulb where the view
+        // ray through it passes nearest the bulb (see `GlareAir`). Finely
+        // divided, so the cut follows the shade; a plain quad without it.
+        let lit_air = s.table.as_ref().and_then(|(t, origin)| t.air.as_ref().map(|a| (a, *origin)));
+        let cells = if lit_air.is_some() { AIR_CELLS } else { 1 };
+        let air = |point: Vec3| -> f32 {
+            let Some((a, origin)) = lit_air else { return 1.0 };
+            let Some(ray) = (point - eye).try_normalize() else { return 1.0 };
+            let bulb = origin + s.rotation * a.bulb;
+            let nearest = eye + ray * (bulb - eye).dot(ray).max(0.0);
+            a.seen_from(s.rotation.inverse() * (nearest - origin))
+        };
+        quad(&mut idx, &q, tested, half, q.degrees, test, reach, cells, &air);
+        if q.core_degrees > 0.0 && !halo_only {
             // The core's depth: in front of what glows by its own size, so a
             // shade's lit inside never cuts its own veil, and anything nearer
-            // -- the shade's outside, a hand -- does. The same taps: the ratio
-            // sizes the bulb from this quad's corners, nearer by `from_core`.
-            let core_centre = at + toward * WALL_MARGIN.max(lobe.radius).min(0.5 * d);
+            // -- the shade's outside, a hand -- does. The same taps.
+            //
+            // OVER A FIXTURE THE EYE IS ADAPTED TO, behind all of it instead:
+            // its bulb's reach past the bulb, along the view, and the wall
+            // margin for the shade's own thickness -- seen level with a
+            // hanging lamp, its far rim is within 3 mm of its reach -- so the
+            // fixture itself cuts its core and the veil lies over what stands
+            // behind it. Where the probe pass finds a wall or ceiling nearer
+            // than that, the shader brings each point forward of it (`test.w`
+            // 2).
+            let behind = lit_air.filter(|(a, _)| a.reach > 0.0 && adapted.get(k).copied().unwrap_or(false));
+            let (core_centre, core_test) = match behind {
+                Some((a, origin)) => {
+                    let bulb = origin + s.rotation * a.bulb;
+                    let along = (-toward).dot(forward).max(0.5);
+                    let past = ((bulb - at).dot(forward) + a.reach + WALL_MARGIN).max(0.0) / along;
+                    (at - toward * past, [test[0], test[1], test[2], if test_walls { 2.0 } else { -1.0 }])
+                }
+                None => (at + toward * WALL_MARGIN.max(lobe.radius).min(0.5 * d), test),
+            };
             let from_core = (eye - core_centre).length();
             let core_half = from_core * q.core_degrees.to_radians().tan();
-            let ratio = if test_walls { lobe.radius * from_core / (core_half.max(1e-6) * from_tested) } else { -1.0 };
-            quad(&mut cores, &q, core_centre, core_half, q.core_degrees, [tested.x, tested.y, tested.z, ratio]);
+            quad(&mut cores, &q, core_centre, core_half, q.core_degrees, core_test, reach, cells, &air);
         }
     }
     let halos = idx.len() as u32;
@@ -716,7 +954,7 @@ pub fn glare_quad(s: &GlareSource, lobe: &GlareLobe, eye: Vec3, exposure: f32, s
     Some(GlareQuad { half: d * degrees.to_radians().tan(), colour, a, core2, degrees, edge, peak, core_degrees })
 }
 
-/// The glare's pipelines, both additive: the halos over everything the scene
+/// The glare's pipelines, both screened: the halos over everything the scene
 /// pass drew (no depth test), drawn last in it; the cores tested against its
 /// depth, drawn before the thin wires and the glass. See the module notes.
 /// Group 1 is the probe pass's (`brush_pipeline::probe_pass::bind_group_layout`),
@@ -765,7 +1003,8 @@ impl GlarePipeline {
             bind_group_layouts: &[Some(uniform_layout), Some(probe_layout)],
             immediate_size: 0,
         });
-        let add = BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
+        // SCREENED: `veil + scene x (1 - veil)`, as the module notes say.
+        let screen = BlendComponent { src_factor: BlendFactor::OneMinusDst, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
         let build = |label: &str, fragment: &str, depth_compare: CompareFunction| {
             device.create_render_pipeline(&RenderPipelineDescriptor {
                 label: Some(label),
@@ -782,7 +1021,7 @@ impl GlarePipeline {
                     compilation_options: PipelineCompilationOptions::default(),
                     targets: &[Some(ColorTargetState {
                         format,
-                        blend: Some(BlendState { color: add, alpha: BlendComponent::OVER }),
+                        blend: Some(BlendState { color: screen, alpha: BlendComponent::OVER }),
                         write_mask: ColorWrites::COLOR,
                     })],
                 }),
@@ -818,8 +1057,10 @@ impl GlarePipeline {
 /// [`HALO_CAP`] (`fs_main`), the core's the rest (`fs_core`). Scaled by how
 /// much of the bulb no wall hides, which every vertex of a quad works out
 /// alike from the probe pass's depth: seven taps across the bulb's disc, each
-/// hidden where a brush stands nearer than the tested point. This eye's camera
-/// and depth layer by `view_slot`, which a stereo pass sets per view.
+/// hidden where a brush stands nearer than the tested point. A core behind its
+/// fixture comes forward of a brush between it and the lamp, from the same
+/// depth. This eye's camera and depth layer by `view_slot`, which a stereo
+/// pass sets per view.
 pub fn glare_shader() -> String {
     format!(
         "{}{}{}",
@@ -838,23 +1079,27 @@ struct VIn {
     @location(2) uv: vec2<f32>,
     @location(3) shape: vec4<f32>,
     @location(4) test: vec4<f32>,
+    @location(5) reach: vec4<f32>,
 }
 struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) colour: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) @interpolate(flat) shape: vec4<f32>,
+    @location(3) air: f32,
+    @location(4) @interpolate(flat) cap: f32,
 }
-// The share of the bulb no wall hides: `centre` is the quad's centre, in
-// front of the bulb by the wall margin; `corner` this vertex, whose distance
-// from it on screen sizes the bulb's disc by `ratio`.
-fn glare_bulb_visible(centre: vec3<f32>, corner: vec4<f32>, ratio: f32) -> f32 {
+// The share of the bulb no wall hides: `centre` is in front of the bulb by
+// the wall margin, `reach` the bulb's radius there across the view, which
+// sizes its disc on screen; `test` below 0 for no test.
+fn glare_bulb_visible(centre: vec3<f32>, reach: vec3<f32>, test: f32) -> f32 {
     let c = camera.view_proj[view_slot] * vec4<f32>(centre, 1.0);
-    if (ratio < 0.0 || c.w <= 0.0 || corner.w <= 0.0) {
+    let e = camera.view_proj[view_slot] * vec4<f32>(centre + reach, 1.0);
+    if (test < 0.0 || c.w <= 0.0 || e.w <= 0.0) {
         return 1.0;
     }
     let ndc = c.xyz / c.w;
-    let radius = length(corner.xy / corner.w - ndc.xy) * 0.70710678 * ratio;
+    let radius = length(e.xy / e.w - ndc.xy);
     let size = vec2<f32>(textureDimensions(probe_pass_depth));
     let hi = vec2<i32>(size) - vec2<i32>(1);
     var open = 0.0;
@@ -871,33 +1116,69 @@ fn glare_bulb_visible(centre: vec3<f32>, corner: vec4<f32>, ratio: f32) -> f32 {
     }
     return open / 7.0;
 }
+// A core behind its fixture (`test` 2) stands back there only where nothing
+// does: where the probe pass has a wall or ceiling between the lamp, in front
+// of it at `lamp`, and this point, the point comes forward to a quarter of the
+// way from that wall back toward the lamp -- so the fixture alone cuts the
+// core, and the room behind it takes the veil.
+fn glare_before_wall(clip: vec4<f32>, lamp: vec3<f32>) -> f32 {
+    let front = camera.view_proj[view_slot] * vec4<f32>(lamp, 1.0);
+    if (clip.w <= 0.0 || front.w <= 0.0) {
+        return clip.z;
+    }
+    let ndc = clip.xyz / clip.w;
+    let size = vec2<f32>(textureDimensions(probe_pass_depth));
+    let texel = clamp(vec2<i32>(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
+    let wall = textureLoad(probe_pass_depth, texel, view_slot, 0);
+    let lamp_z = front.z / front.w;
+    if (wall > lamp_z && wall < ndc.z) {
+        return mix(wall, lamp_z, 0.25) * clip.w;
+    }
+    return clip.z;
+}
 @vertex fn vs_main(v: VIn) -> VOut {
     var out: VOut;
     out.clip = camera.view_proj[view_slot] * vec4<f32>(v.pos, 1.0);
+    if (v.test.w > 1.5 && v.test.w < 2.5) {
+        out.clip.z = glare_before_wall(out.clip, v.test.xyz);
+    }
     out.colour = v.colour;
     out.uv = v.uv;
     // The share of the bulb no wall hides scales the veil and its edge alike,
     // so it still ends at zero.
-    let open = glare_bulb_visible(v.test.xyz, out.clip, v.test.w);
+    let open = glare_bulb_visible(v.test.xyz, v.reach.xyz, v.test.w);
     out.shape = vec4<f32>(v.shape.x * open, v.shape.y, v.shape.z, v.shape.w * open);
+    // A lamp the walls hide altogether shows nothing: every point of its quad
+    // works that out alike, so the whole quad leaves the view rather than
+    // shading a veil of zeros.
+    if (open <= 0.0) {
+        out.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    }
+    out.air = v.reach.w;
+    // A halo alone (`test` 3) carries the whole veil.
+    out.cap = select(HALO_CAP, 1.0e30, abs(v.test.w) > 2.5);
     return out;
 }
+// The veil here, as much of it as the air its view ray passes through shows.
 fn glare_veil(in: VOut) -> f32 {
     let theta2 = dot(in.uv, in.uv) * in.shape.z + in.shape.y;
     let inv = inverseSqrt(max(theta2, 1e-6));
-    return max(in.shape.x * inv * (CIE_LINEAR + inv * (CIE_SQUARE + inv * CIE_CUBE)) - in.shape.w, 0.0);
+    return max(in.shape.x * inv * (CIE_LINEAR + inv * (CIE_SQUARE + inv * CIE_CUBE)) - in.shape.w, 0.0) * in.air;
 }
-// The halo, over everything: the veil up to the cap.
+// The halo, over everything: the veil up to the cap -- all of it for a halo
+// alone.
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(aces_fitted(in.colour * min(glare_veil(in), HALO_CAP)), 0.0);
+    return vec4<f32>(aces_fitted(in.colour * min(glare_veil(in), in.cap)), 0.0);
 }
 // The core, only where the depth test lets it: the rest of the veil as SHOWN,
-// so where both draw they add up to exactly the veil through the curve.
+// so where both draw they screen the scene exactly as the whole veil through
+// the curve does -- (1 - core)(1 - halo) is 1 - whole.
 @fragment fn fs_core(in: VOut) -> @location(0) vec4<f32> {
     let veil = glare_veil(in);
     let whole = aces_fitted(in.colour * veil);
     let halo = aces_fitted(in.colour * min(veil, HALO_CAP));
-    return vec4<f32>(max(whole - halo, vec3<f32>(0.0)), 0.0);
+    let one = vec3<f32>(1.0);
+    return vec4<f32>(max(one - (one - whole) / (one - halo), vec3<f32>(0.0)), 0.0);
 }
 "#
     )
@@ -916,6 +1197,8 @@ mod tests {
             cone: None,
             centres: None,
             table: None,
+            halo_only: false,
+            mirror: None,
         }
     }
 
@@ -952,6 +1235,7 @@ mod tests {
             share: vec![0.0; rows * cols],
             centre: vec![Vec3::ZERO; rows * cols],
             split: None,
+            air: None,
         };
         for row in 0..rows {
             for col in 0..cols {
@@ -1027,7 +1311,7 @@ mod tests {
     fn a_table_is_read_from_where_its_fixture_glows() {
         let (rows, cols) = (18, 36);
         let glow = Vec3::new(0.0, -0.5, 0.0);
-        let mut t = GlareTable { rows, cols, share: vec![0.0; rows * cols], centre: vec![glow; rows * cols], split: None };
+        let mut t = GlareTable { rows, cols, share: vec![0.0; rows * cols], centre: vec![glow; rows * cols], split: None, air: None };
         for row in 0..rows {
             for col in 0..cols {
                 if t.direction(row, col).y < -(60.0f32).to_radians().cos() {
@@ -1043,6 +1327,196 @@ mod tests {
         assert_eq!(visible_share(&s, beside), 0.0, "from the bulb the shade hides it");
         assert!(glare_lobes(&s, beside).is_empty());
         assert!(visible_share(&s, origin + glow - Vec3::Y * 2.0) > 0.99, "straight below");
+    }
+
+    /// A VEIL SHOWS ONLY IN THE AIR ITS BULB LIGHTS: a lamp whose shade keeps
+    /// its light out of the air from its bulb's height up, seen from in front
+    /// and below. Each point of its veil takes as much of it as the air shows
+    /// where that point's view ray passes the bulb: none along the veil's top,
+    /// all of it along the bottom -- where a hanging lamp's glow, cut from a
+    /// plane in front of its bulb, lay over the cap above its shade (headset,
+    /// 2026-10-02). With no air measured, one plain quad, all of it.
+    #[test]
+    fn a_veil_shows_only_in_the_air_its_bulb_lights() {
+        let (rows, cols, n) = (18, 36, 5);
+        let air = GlareAir {
+            min: Vec3::splat(-0.5),
+            max: Vec3::splat(0.5),
+            dims: [n; 3],
+            bulb: Vec3::ZERO,
+            // Lit in the grid's lower two rows of points, below the bulb.
+            seen: (0..n * n * n).map(|i| if (i / n) % n < 2 { 1.0 } else { 0.0 }).collect(),
+            reach: 0.0,
+        };
+        assert_eq!(air.seen_from(Vec3::new(0.3, -0.5, -0.2)), 1.0);
+        assert_eq!(air.seen_from(Vec3::new(0.0, 0.2, 9.0)), 0.0, "past the edge, the edge's");
+        assert!((air.seen_from(Vec3::new(0.1, -0.125, 0.0)) - 0.5).abs() < 1e-5, "between points, between them");
+        let origin = Vec3::new(0.0, 2.0, 0.0);
+        let table = GlareTable { rows, cols, share: vec![1.0; rows * cols], centre: vec![Vec3::ZERO; rows * cols], split: None, air: Some(air) };
+        let s = GlareSource {
+            position: origin,
+            radiance: Vec3::splat(100.0),
+            table: Some((std::sync::Arc::new(table.clone()), origin)),
+            ..sconce([0.0; 6])
+        };
+        let eye = Vec3::new(0.0, 1.0, 2.0);
+        let build = |s: &GlareSource| build_glare(std::slice::from_ref(s), [eye; 2], Vec3::X, Vec3::Y, 1.0, 1.0, false, &[], &[]);
+        let (verts, idx, halos) = build(&s);
+        let side = AIR_CELLS + 1;
+        // The cells that show nothing are left out (see the next test).
+        assert!(halos > 0 && (halos as usize) < 6 * AIR_CELLS * AIR_CELLS && halos % 6 == 0, "{halos}");
+        assert!(idx.iter().all(|&i| (i as usize) < verts.len()) && verts.len() >= side * side);
+        // The halo's rows of points, from the bottom (v = -1) up.
+        let row = |j: usize| (0..side).map(|i| verts[j * side + i].reach[3]).collect::<Vec<f32>>();
+        assert!(row(0).iter().all(|&a| a > 0.99), "below the bulb the air is lit: {:?}", row(0));
+        assert!(row(side - 1).iter().all(|&a| a < 0.01), "above it, dark: {:?}", row(side - 1));
+        // Without it: four corners a quad, every one all of it.
+        let plain = GlareSource { table: Some((std::sync::Arc::new(GlareTable { air: None, ..table }), origin)), ..s.clone() };
+        let (verts, _, halos) = build(&plain);
+        assert_eq!(halos, 6);
+        assert!(verts.iter().all(|v| v.reach[3] == 1.0));
+    }
+
+    /// A CELL THAT SHOWS NOTHING IS NOT DRAWN, and nothing that shows is left
+    /// out: across every cell missing from the halo and the core -- its air
+    /// run straight between the corners over each of its two triangles, as
+    /// the rasteriser runs it -- the halo's veil is zero and the core's within
+    /// the halo's cap, where the core shows nothing. Here: the dark air above
+    /// the bulb, and the square's corners past the reach.
+    #[test]
+    fn a_cell_that_shows_nothing_is_not_drawn() {
+        let (rows, cols, n) = (18, 36, 5);
+        let air = GlareAir {
+            min: Vec3::splat(-0.5),
+            max: Vec3::splat(0.5),
+            dims: [n; 3],
+            bulb: Vec3::ZERO,
+            // Lit in the grid's lower two rows of points, below the bulb.
+            seen: (0..n * n * n).map(|i| if (i / n) % n < 2 { 1.0 } else { 0.0 }).collect(),
+            reach: 0.0,
+        };
+        let origin = Vec3::new(0.0, 2.0, 0.0);
+        let table = GlareTable { rows, cols, share: vec![1.0; rows * cols], centre: vec![Vec3::ZERO; rows * cols], split: None, air: Some(air) };
+        let s = GlareSource {
+            position: origin,
+            radiance: Vec3::splat(100.0),
+            table: Some((std::sync::Arc::new(table.clone()), origin)),
+            ..sconce([0.0; 6])
+        };
+        let eye = Vec3::new(0.0, 1.0, 2.0);
+        let (verts, idx, halos) = build_glare(std::slice::from_ref(&s), [eye; 2], Vec3::X, Vec3::Y, 1.0, 1.0, false, &[], &[]);
+        let side = AIR_CELLS + 1;
+        // One part: its halo's points, then its core's.
+        assert_eq!(verts.len(), 2 * side * side, "a halo and a core");
+        let drawn: std::collections::HashSet<usize> = idx.chunks(6).map(|c| c[0] as usize).collect();
+        assert!(idx[..halos as usize].chunks(6).all(|c| (c[0] as usize) < side * side), "halo cells first");
+        let (mut left_out, mut kept) = ([0; 2], [0; 2]);
+        for quad in 0..2 {
+            for j in 0..AIR_CELLS {
+                for i in 0..AIR_CELLS {
+                    let a = quad * side * side + j * side + i;
+                    if drawn.contains(&a) {
+                        kept[quad] += 1;
+                        continue;
+                    }
+                    left_out[quad] += 1;
+                    let (c00, c10, c11, c01) = (&verts[a], &verts[a + 1], &verts[a + 1 + side], &verts[a + side]);
+                    let shape = c00.shape;
+                    for (si, ti) in (0..9).flat_map(|si| (0..9).map(move |ti| (si, ti))) {
+                        let (s, t) = (si as f32 / 8.0, ti as f32 / 8.0);
+                        let air = if s >= t {
+                            c00.reach[3] + s * (c10.reach[3] - c00.reach[3]) + t * (c11.reach[3] - c10.reach[3])
+                        } else {
+                            c00.reach[3] + t * (c01.reach[3] - c00.reach[3]) + s * (c11.reach[3] - c01.reach[3])
+                        };
+                        let u = c00.uv[0] + s * (c10.uv[0] - c00.uv[0]);
+                        let v = c00.uv[1] + t * (c01.uv[1] - c00.uv[1]);
+                        let veil = (shape[0] * cie_veil((u * u + v * v) * shape[2] + shape[1]) - shape[3]).max(0.0) * air;
+                        let most = if quad == 0 { 0.0 } else { HALO_CAP };
+                        assert!(veil <= most + 1e-6, "quad {quad} cell {i},{j} left out shows {veil} at {s},{t}");
+                    }
+                }
+            }
+        }
+        assert!(left_out.iter().all(|&n| n > 0) && kept.iter().all(|&n| n > 0), "left out {left_out:?}, kept {kept:?}");
+        // A veil with no air measured keeps its one cell.
+        let plain = GlareSource { table: Some((std::sync::Arc::new(GlareTable { air: None, ..table }), origin)), ..s };
+        let (_, idx, halos) = build_glare(std::slice::from_ref(&plain), [eye; 2], Vec3::X, Vec3::Y, 1.0, 1.0, false, &[], &[]);
+        assert_eq!((halos, idx.len()), (6, 12));
+    }
+
+    /// OVER A FIXTURE THE EYE IS ADAPTED TO, ITS CORE STANDS BEHIND ALL OF IT:
+    /// past its bulb by the reach the bake measured, along the view, covering
+    /// the same view as before, so the fixture cuts it as a hand does -- each
+    /// point flagged to come forward of a wall or ceiling the probe pass finds
+    /// nearer (`test.w` 2). Its halo stays in front of the light, and so does
+    /// the core of a fixture the eye is not adapted to, or one whose reach was
+    /// never measured.
+    #[test]
+    fn a_fixture_the_eye_is_adapted_to_takes_its_core_only_behind_it() {
+        let (rows, cols, n) = (18, 36, 5);
+        let reach = 0.4;
+        let bulb_at = Vec3::new(0.0, -0.1, 0.0);
+        let air = GlareAir { min: Vec3::splat(-0.5), max: Vec3::splat(0.5), dims: [n; 3], bulb: bulb_at, seen: vec![1.0; n * n * n], reach };
+        let origin = Vec3::new(0.0, 2.0, 0.0);
+        let table = GlareTable { rows, cols, share: vec![1.0; rows * cols], centre: vec![bulb_at; rows * cols], split: None, air: Some(air.clone()) };
+        let s = GlareSource { position: origin, radiance: Vec3::splat(100.0), table: Some((std::sync::Arc::new(table.clone()), origin)), ..sconce([0.0; 6]) };
+        // Below the lamp and in front of it, looking straight at it.
+        let eye = Vec3::new(0.0, 1.0, 2.0);
+        let bulb = origin + bulb_at;
+        let ahead = (bulb - eye).normalize();
+        let right = Vec3::X;
+        let up = right.cross(ahead).normalize();
+        let build = |s: &GlareSource, adapted: &[bool], walls: bool| {
+            build_glare(std::slice::from_ref(s), [eye; 2], right, up, 3.6, 1.0, walls, &[], adapted)
+        };
+        let depth = |p: [f32; 3]| (Vec3::from(p) - eye).dot(ahead);
+        let (verts, idx, halos) = build(&s, &[true], true);
+        let (halo, core) = idx.split_at(halos as usize);
+        assert!(!core.is_empty(), "bright enough for a core");
+        for &i in core {
+            let v = &verts[i as usize];
+            assert!(depth(v.position) >= depth(bulb.to_array()) + reach - 1e-4, "behind the fixture: {}", depth(v.position));
+            assert_eq!(v.test[3], 2.0, "brought forward of a nearer wall");
+        }
+        for &i in halo {
+            let v = &verts[i as usize];
+            assert!(depth(v.position) < depth(bulb.to_array()) && v.test[3] == 1.0, "the halo in front of the light");
+        }
+        // The same view as the core a fixture the eye is not adapted to has,
+        // which stands in front of its light.
+        let (plain_verts, plain_idx, plain_halos) = build(&s, &[false], true);
+        assert_eq!((plain_idx.len(), plain_halos), (idx.len(), halos));
+        for (&i, &j) in core.iter().zip(&plain_idx[plain_halos as usize..]) {
+            let (v, p) = (&verts[i as usize], &plain_verts[j as usize]);
+            let along = |q: [f32; 3]| (Vec3::from(q) - eye).normalize();
+            assert!((along(v.position) - along(p.position)).length() < 1e-4, "the same view");
+            assert!(depth(p.position) < depth(bulb.to_array()) && p.test[3] == 1.0, "in front of the light");
+        }
+        // No probe pass: behind still, with no wall to come forward of.
+        let (verts, idx, halos) = build(&s, &[true], false);
+        assert!(idx[halos as usize..].iter().all(|&i| verts[i as usize].test[3] == -1.0));
+        // A reach the bake never measured: in front, as before.
+        let unmeasured = GlareTable { air: Some(GlareAir { reach: 0.0, ..air }), ..table };
+        let s = GlareSource { table: Some((std::sync::Arc::new(unmeasured), origin)), ..s.clone() };
+        let (verts, idx, halos) = build(&s, &[true], true);
+        assert!(idx[halos as usize..].iter().all(|&i| depth(verts[i as usize].position) < depth(bulb.to_array())));
+    }
+
+    /// A SOURCE DRAWN AS A HALO ALONE -- a torch -- has no core: its whole veil
+    /// is the halo, flagged 3 for the shader to leave uncapped, its sign still
+    /// saying whether the walls are tested.
+    #[test]
+    fn a_halo_alone_has_no_core_and_no_cap() {
+        let torch = GlareSource { halo_only: true, ..sconce([1.0; 6]) };
+        let (verts, idx, halos) = build_glare(&[torch.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
+        assert_eq!(halos as usize, idx.len(), "no core");
+        assert!(halos > 0 && verts.iter().all(|v| v.test[3] == 3.0));
+        let (verts, _, _) = build_glare(&[torch], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, false, &[], &[]);
+        assert!(verts.iter().all(|v| v.test[3] == -3.0), "no probe pass, no wall test");
+        // The same lamp with a core: both parts.
+        let (_, idx, halos) = build_glare(&[sconce([1.0; 6])], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
+        assert!((halos as usize) < idx.len());
     }
 
     /// THE BULB'S FINER ROWS CUT ITS VEIL OFF WHERE THE SHADE DOES. A shade
@@ -1094,6 +1568,14 @@ mod tests {
         assert!((sliver.share - 1.0 / 3.0).abs() < 1e-5, "{sliver:?}");
         assert!((sliver.centre - Vec3::new(0.0, -0.14, 0.0)).length() < 1e-5, "{sliver:?}");
         assert!((sliver.radius - LAMP_RADIUS * (1.0f32 / 3.0).sqrt()).abs() < 1e-5, "{sliver:?}");
+        // What an eye adapts to it by: the share of the bulb in view, the
+        // same rows read.
+        let origin = Vec3::new(0.0, 3.0, 0.0);
+        let s = GlareSource { position: origin, table: Some((std::sync::Arc::new(t.clone()), origin)), ..sconce([0.0; 6]) };
+        let middle = origin + t.glow_middle();
+        assert!((bulb_in_view(&s, middle + from_below(20.0) * 3.0) - 1.0).abs() < 1e-5);
+        assert_eq!(bulb_in_view(&s, middle + from_below(30.0) * 3.0), 0.0);
+        assert!((bulb_in_view(&s, middle + from_below(27.0) * 3.0) - 1.0 / 3.0).abs() < 1e-5);
     }
 
     /// A SPLIT TABLE GLARES TWICE: its bulb tight, from where the bulb shows,
@@ -1126,13 +1608,12 @@ mod tests {
         // The lit inside's veil has the wider core and the lower peak.
         let (b, l) = (glare_quad(&s, &bulb, below, 3.6, 1.0).unwrap(), glare_quad(&s, &lit, below, 3.6, 1.0).unwrap());
         assert!(l.core2 > b.core2 && l.peak < b.peak, "{b:?} {l:?}");
-        let (v, i, halos) = build_glare(&[s.clone()], [below; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[]);
+        let (v, i, halos) = build_glare(&[s.clone()], [below; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
         assert_eq!(halos, 12, "a halo for each part");
-        // Each part's taps sized to what glares, from its halo's corners.
-        let halo = |k: usize| &v[i[6 * k] as usize];
-        let half = |k: usize| (Vec3::from(halo(k).position) - Vec3::from_slice(&halo(k).test[..3])).x.abs();
-        assert!((halo(0).test[3] * half(0) - LAMP_RADIUS).abs() < 1e-5);
-        assert!((halo(1).test[3] * half(1) - lit.radius).abs() < 1e-5);
+        // Each part's taps sized to what glares: its radius across the view.
+        let reach = |k: usize| Vec3::from_slice(&v[i[6 * k] as usize].reach[..3]);
+        assert!((reach(0) - Vec3::X * LAMP_RADIUS).length() < 1e-5, "{}", reach(0));
+        assert!((reach(1) - Vec3::X * lit.radius).length() < 1e-5, "{}", reach(1));
         // From where only the shade shows, nothing.
         assert!(glare_lobes(&s, origin + Vec3::Y * 3.0).is_empty());
     }
@@ -1148,6 +1629,7 @@ mod tests {
             share: vec![0.0; rows * cols],
             centre: vec![Vec3::ZERO; rows * cols],
             split: None,
+            air: None,
         };
         for row in 0..rows {
             t.share[row * cols] = 1.0; // column 0
@@ -1234,7 +1716,7 @@ mod tests {
         // Bright enough, the cap: a brighter lamp's quad grows no wider.
         let blinding = quad(&s, Vec3::ZERO, 3600.0).unwrap();
         assert_eq!(blinding.degrees, MAX_GLARE_DEGREES);
-        let (v, i, halos) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[]);
+        let (v, i, halos) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
         assert_eq!((v.len(), i.len(), halos), (8, 12, 6), "a halo, then its core");
         // Centred in front of the bulb by the wall margin, and as wide from
         // there as the veil is from the bulb; the taps sized to the bulb.
@@ -1242,8 +1724,8 @@ mod tests {
         assert!((centre - Vec3::new(0.0, 2.0 - WALL_MARGIN, 0.0)).length() < 1e-5, "{centre}");
         let half = (Vec3::from(v[0].position) - centre).x.abs();
         assert!((half - (2.0 - WALL_MARGIN) * q.degrees.to_radians().tan()).abs() < 1e-4);
-        assert!((v[0].test[3] - LAMP_RADIUS / half).abs() < 1e-5);
-        let (untested, _, _) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, false, &[]);
+        assert!((Vec3::from_slice(&v[0].reach[..3]) - Vec3::X * LAMP_RADIUS).length() < 1e-5 && v[0].test[3] > 0.0);
+        let (untested, _, _) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, false, &[], &[]);
         assert!(untested.iter().all(|v| v.test[3] < 0.0), "no probe pass, no wall test");
     }
 
@@ -1259,7 +1741,7 @@ mod tests {
         let after_edge = |q: &GlareQuad, deg: f32| q.a * cie_veil(deg * deg + q.core2) - q.edge;
         assert!(q.core_degrees > 0.0 && q.core_degrees < q.degrees, "{q:?}");
         assert!((after_edge(&q, q.core_degrees) - HALO_CAP).abs() < 1e-4, "{}", after_edge(&q, q.core_degrees));
-        let (v, i, halos) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[]);
+        let (v, i, halos) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
         let corners = |at: usize| -> Vec<Vec3> { (0..4).map(|k| Vec3::from(v[i[at] as usize + k].position)).collect() };
         let middle = |c: &[Vec3]| c.iter().copied().sum::<Vec3>() / 4.0;
         let (halo, core) = (corners(0), corners(halos as usize));
@@ -1270,13 +1752,15 @@ mod tests {
         assert!((middle(&core) - tested).length() < 1e-5 && (middle(&halo) - tested).length() < 1e-5);
         let core_half = (core[0] - middle(&core)).x.abs();
         assert!((core_half - (2.0 - WALL_MARGIN) * q.core_degrees.to_radians().tan()).abs() < 1e-5);
-        assert!((v[i[halos as usize] as usize].test[3] * core_half - LAMP_RADIUS).abs() < 1e-5);
+        let (core_v, halo_v) = (&v[i[halos as usize] as usize], &v[i[0] as usize]);
+        assert!(core_v.reach == halo_v.reach && core_v.test == halo_v.test, "the same bulb for the walls");
+        assert!((Vec3::from_slice(&core_v.reach[..3]).length() - LAMP_RADIUS).abs() < 1e-5);
         // Dimmed until its brightest is under the cap: all halo.
         let bright = q.a * cie_veil(q.core2);
         let dim = quad(&s, Vec3::ZERO, 3.6 * (VEIL_FLOOR + 0.5 * HALO_CAP) / bright).unwrap();
         assert!(dim.peak > 0.0 && dim.peak <= HALO_CAP && dim.core_degrees == 0.0, "{dim:?}");
         let exposure = 3.6 * (VEIL_FLOOR + 0.5 * HALO_CAP) / bright;
-        let (_, i, halos) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, exposure, 1.0, true, &[]);
+        let (_, i, halos) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, exposure, 1.0, true, &[], &[]);
         assert_eq!(halos as usize, i.len(), "no core");
         // A shade's lit inside, 14 cm across, bright enough for a core: in
         // front of the middle of what it lights by that much.
@@ -1294,11 +1778,49 @@ mod tests {
         let s = GlareSource { table: Some((std::sync::Arc::new(t), origin)), ..sconce([0.0; 6]) };
         let below = origin - Vec3::Y * 3.0;
         let lit = glare_lobes(&s, below)[1];
-        let (v, i, halos) = build_glare(&[s.clone()], [below; 2], Vec3::X, Vec3::Z, 36.0, 1.0, true, &[]);
+        let (v, i, halos) = build_glare(&[s.clone()], [below; 2], Vec3::X, Vec3::Z, 36.0, 1.0, true, &[], &[]);
         assert_eq!(i.len() as u32, 2 * halos, "both parts have a core: {} indices, {halos} halo", i.len());
         let lit_core: Vec<Vec3> = (0..4).map(|k| Vec3::from(v[i[halos as usize + 6] as usize + k].position)).collect();
         let toward = (below - lit.centre).normalize();
         assert!((middle(&lit_core) - (lit.centre + toward * lit.radius)).length() < 1e-5, "{lit:?}");
+    }
+
+    /// AN IMAGE IN A MIRROR IS TESTED AT THE MIRROR: the glass's image stands
+    /// under the floor, where the probe pass's depth has the floor in front
+    /// of it, so its walls are tested just in front of its point on the floor
+    /// -- along the same line of sight, its quad the same angle across -- and
+    /// a hand between the eye and that point shields it, while one under the
+    /// floor beside the image cannot. A halo alone, with no cap.
+    #[test]
+    fn an_image_in_a_mirror_is_tested_at_the_mirror() {
+        let eye = Vec3::new(0.0, 1.6, 0.0);
+        let glass = Vec3::new(0.0, 1.0, -1.0);
+        let image = Vec3::new(glass.x, -glass.y, glass.z);
+        // Where the line of sight to the image crosses the floor.
+        let on_floor = eye + (image - eye) * (eye.y / (eye.y - image.y));
+        let s = GlareSource { position: image, mirror: Some(on_floor), ..sconce([1.0; 6]) };
+        let (verts, idx, halos) = build_glare(&[s.clone()], [eye; 2], Vec3::X, Vec3::Y, 3.6, 1.0, true, &[], &[]);
+        assert_eq!(halos as usize, idx.len(), "no core: it would stand under the floor");
+        assert!(!verts.is_empty() && verts.iter().all(|v| v.test[3] == 3.0));
+        let tested = Vec3::new(verts[0].test[0], verts[0].test[1], verts[0].test[2]);
+        assert!(tested.y > 0.0 && tested.y < 0.06, "just above the floor: {tested}");
+        let sight = (image - eye).normalize();
+        assert!(((tested - eye).normalize() - sight).length() < 1e-4, "on the line of sight to the image");
+        // The quad spans the same angle from where it is drawn as the image's
+        // own halo would: its first quad's opposite corners.
+        let direct = GlareSource { mirror: None, halo_only: true, ..s.clone() };
+        let (plain, _, _) = build_glare(&[direct], [eye; 2], Vec3::X, Vec3::Y, 3.6, 1.0, true, &[], &[]);
+        let span = |v: &[GlareVertex]| {
+            let (a, b) = (Vec3::from(v[0].position), Vec3::from(v[3].position));
+            (a - eye).normalize().angle_between((b - eye).normalize())
+        };
+        assert!((span(&verts) - span(&plain)).abs() < 1e-3, "{} vs {}", span(&verts), span(&plain));
+        // A hand over its point on the floor takes it; one beside the image,
+        // under the floor, does not.
+        let hand_at = |c: Vec3| (c - Vec3::X * 0.08, c + Vec3::X * 0.08, 0.045);
+        let veil = |caps: &[(Vec3, Vec3, f32)]| build_glare(&[s.clone()], [eye; 2], Vec3::X, Vec3::Y, 3.6, 1.0, true, caps, &[]).0.first().map_or(0.0, |v| v.shape[0]);
+        assert!(veil(&[hand_at(eye + (on_floor - eye) * 0.5)]) < 1e-3 * veil(&[]), "a hand over the floor point");
+        assert_eq!(veil(&[hand_at(image + (on_floor - image) * 0.5)]), veil(&[]), "under the floor");
     }
 
     /// A hand held between the eyes and a bulb takes its veil; beside the line
@@ -1323,10 +1845,34 @@ mod tests {
         // One eye shielded, the other not: half the veil.
         let s = GlareSource { position: bulb, ..sconce([1.0; 6]) };
         let eyes = [eye - across * 0.032, eye + across * 0.032];
-        let peak = |caps: &[(Vec3, Vec3, f32)]| build_glare(&[s.clone()], eyes, across, Vec3::Y, 3.6, 1.0, false, caps).0[0].shape[0];
+        let peak = |caps: &[(Vec3, Vec3, f32)]| build_glare(&[s.clone()], eyes, across, Vec3::Y, 3.6, 1.0, false, caps, &[]).0[0].shape[0];
         // `shape[0]` is the veil's scale, which carries the shielding.
         let one_eye = (eyes[0] + to_bulb * 0.3, eyes[0] + to_bulb * 0.3 + Vec3::Y * 0.01, 0.02);
         assert!((peak(&[one_eye]) / peak(&[]) - 0.5).abs() < 0.02, "{} vs {}", peak(&[one_eye]), peak(&[]));
+    }
+
+    /// A hand raised between a torch's glass and its point on a mirror hides
+    /// the glass from that point; beside the line it hides nothing, nor does
+    /// the hand holding the torch, whose capsule the glass stands in.
+    #[test]
+    fn a_hand_in_front_of_a_glass_hides_it_and_the_hand_holding_it_does_not() {
+        let glass = Vec3::new(0.0, 1.2, 0.0);
+        let mirror = Vec3::new(0.3, 1.0, -2.0);
+        let to_mirror = (mirror - glass).normalize();
+        let across = to_mirror.cross(Vec3::Y).normalize();
+        let radius = 0.0168;
+        // An open hand 25 cm in front of the glass, fingers up.
+        let raised = |off: f32| {
+            let c = glass + to_mirror * 0.25 + across * off;
+            (c - Vec3::Y * 0.05, c + Vec3::Y * 0.05, 0.04)
+        };
+        assert!(disc_visibility(glass, radius, mirror, &[raised(0.0)]) < 1e-3, "over the line");
+        assert!(disc_visibility(glass, radius, mirror, &[raised(0.2)]) > 0.999, "beside it");
+        let edge = disc_visibility(glass, radius, mirror, &[raised(0.04)]);
+        assert!(edge > 0.2 && edge < 0.8, "its edge across the glass: {edge}");
+        let holding = (glass - to_mirror * 0.12, glass + to_mirror * 0.01, 0.04);
+        assert_eq!(disc_visibility(glass, radius, mirror, &[holding]), 1.0, "the hand round the torch");
+        assert_eq!(disc_visibility(glass, radius, mirror, &[holding, raised(0.0)]), 0.0, "both");
     }
 
     /// RENDERED, into a 4x multisampled target as the scene pass draws it --
@@ -1354,8 +1900,9 @@ mod tests {
         });
         let probe_layout = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(&device);
         let glare = GlarePipeline::new_multisampled(&device, format, &uniform_layout, &probe_layout, 4);
-        // Clip space is the world here: the source at the origin at depth 0.5.
-        let one: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0];
+        // Clip space is the world here: the source at the origin at depth 0.5,
+        // a point at z 1 at depth 0.75.
+        let one: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.5, 1.0];
         let view_proj = [one, one];
         let camera = wgpu::util::DeviceExt::create_buffer_init(
             &device,
@@ -1366,7 +1913,7 @@ mod tests {
             layout: &uniform_layout,
             entries: &[BindGroupEntry { binding: 0, resource: camera.as_entire_binding() }],
         });
-        // A wall's depth in the probe pass, over `x < wall_x` in clip space.
+        // A wall's depth in the probe pass, `z`, over `x < wall_x` in clip space.
         let wall = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: None,
             layout: None,
@@ -1374,12 +1921,12 @@ mod tests {
                 module: &device.create_shader_module(ShaderModuleDescriptor {
                     label: None,
                     source: ShaderSource::Wgsl(
-                        "struct W { x: f32 }
+                        "struct W { x: f32, z: f32 }
                         @group(0) @binding(0) var<uniform> w: W;
                         @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
                             let c = array<vec2<f32>, 6>(vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, 1.0));
                             let x = mix(-1.0, w.x, c[i].x * 0.5 + 0.5);
-                            return vec4<f32>(x, c[i].y, 0.25, 1.0);
+                            return vec4<f32>(x, c[i].y, w.z, 1.0);
                         }"
                         .into(),
                     ),
@@ -1408,14 +1955,19 @@ mod tests {
         const CORE2: f32 = 0.25;
         const REACH2: f32 = 100.0;
         let edge = |a: f32| a * cie_veil(REACH2 + CORE2);
-        let render = |scene_depth: f32, wall_x: f32, a: f32| -> Vec<u8> {
+        // `under`: what the scene pass drew there, through its curve.
+        // `wall_z`: the wall's depth. `flag`: the vertices' `test.w` -- 1 a
+        // veil tested for walls; 2 the core of a fixture the eye is adapted
+        // to, its points at depth 0.75, past the lamp; 3 a halo alone.
+        let render_with = |scene_depth: f32, wall_x: f32, wall_z: f32, a: f32, under: f64, flag: f32| -> Vec<u8> {
             let quad = [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(u, v)| GlareVertex {
-                position: [u, v, 0.0],
+                position: [u, v, if flag == 2.0 { 1.0 } else { 0.0 }],
                 colour: [1.0, 1.0, 1.0],
                 uv: [u, v],
                 shape: [a, CORE2, REACH2, edge(a)],
                 // The bulb half the quad's size: taps a third of the way out.
-                test: [0.0, 0.0, 0.0, 0.5],
+                test: [0.0, 0.0, 0.0, flag],
+                reach: [0.5, 0.0, 0.0, 1.0],
             });
             let vb = wgpu::util::DeviceExt::create_buffer_init(
                 &device,
@@ -1428,7 +1980,7 @@ mod tests {
             let probe = crate::renderer::brush_pipeline::probe_pass::Target::new(&device, &probe_layout, W, W, 1);
             let wall_x_buf = wgpu::util::DeviceExt::create_buffer_init(
                 &device,
-                &wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&[wall_x, 0.0, 0.0, 0.0]), usage: BufferUsages::UNIFORM },
+                &wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&[wall_x, wall_z, 0.0, 0.0]), usage: BufferUsages::UNIFORM },
             );
             let wall_bind = device.create_bind_group(&BindGroupDescriptor {
                 label: None,
@@ -1482,7 +2034,7 @@ mod tests {
                         view: &msaa_v,
                         depth_slice: None,
                         resolve_target: Some(&resolved_v),
-                        ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Discard },
+                        ops: Operations { load: LoadOp::Clear(Color { r: under, g: under, b: under, a: 1.0 }), store: StoreOp::Discard },
                     })],
                     depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                         view: &depth_v,
@@ -1522,6 +2074,7 @@ mod tests {
             let data = read.slice(..).get_mapped_range().expect("mapped").to_vec();
             data
         };
+        let render = |scene_depth: f32, wall_x: f32, a: f32, under: f64| render_with(scene_depth, wall_x, 0.25, a, under, 1.0);
         let px = |img: &[u8], x: u32, y: u32| img[((y * W + x) * 4) as usize];
         // The pixel `k` pixels right of the centre one, as the shader shades it
         // -- the veil, a `share` of it, through the scene's tone curve.
@@ -1533,7 +2086,7 @@ mod tests {
         };
         let shown = |veil: f32| 255.0 * crate::renderer::tonemap::aces_fitted(Vec3::splat(veil)).x;
         let expected = |a: f32, share: f32, k: u32| shown(veil_at(a, share, k));
-        let open = render(1.0, -1.0, 1.0);
+        let open = render(1.0, -1.0, 1.0, 0.0);
         let (centre, mid, rim) = (px(&open, W / 2, W / 2), px(&open, W / 2 + W / 8, W / 2), px(&open, W - 1, W / 2));
         assert!(centre > 240, "the core is white: {centre}");
         assert!(mid > 20 && mid < centre);
@@ -1547,20 +2100,60 @@ mod tests {
         }
         // A surface nearer than the lamp -- its shade, a hand -- takes the
         // core: only the halo lies over it, never more than its cap shows.
-        let nearer = render(0.25, -1.0, 1.0);
+        let nearer = render(0.25, -1.0, 1.0, 0.0);
         assert!(shown(HALO_CAP) < 3.0, "the cap is a haze: {}", shown(HALO_CAP));
         for k in 0..W / 2 {
             let (got, want) = (px(&nearer, W / 2 + k, W / 2) as f32, shown(veil_at(1.0, 1.0, k).min(HALO_CAP)));
             assert!((got - want).abs() <= 1.0, "over the nearer surface {k} pixels out: {got} vs {want}");
         }
-        let walled = render(1.0, 1.0, 1.0);
+        // SCREENED over what the pass drew: over a lamp's lit inside, high on
+        // the curve already, the veil lifts it only by what the curve has
+        // left -- added, it burnt the inside white round the bulb.
+        let lit = 0.8f32;
+        let over = render(1.0, -1.0, 1.0, lit as f64);
+        for k in [0, W / 16, W / 8, W / 4] {
+            let veil = crate::renderer::tonemap::aces_fitted(Vec3::splat(veil_at(1.0, 1.0, k))).x;
+            let (got, want) = (px(&over, W / 2 + k, W / 2) as f32, 255.0 * (1.0 - (1.0 - lit) * (1.0 - veil)));
+            assert!((got - want).abs() <= 3.0, "over the lit inside {k} pixels out: {got} vs {want}");
+        }
+        assert!(px(&over, W / 2 + W / 8, W / 2) < 250, "not burnt white where the veil alone shows two thirds of white");
+        // BEHIND A FIXTURE THE EYE IS ADAPTED TO: its own inside, at 0.6,
+        // past the lamp and before the core, cuts it -- only the halo lies
+        // over the fixture; the room far behind takes the whole veil, and so
+        // does a ceiling at 0.65, nearer than the core: the core comes forward
+        // of it, and the fixture in front of that ceiling still cuts it.
+        let fixture = render_with(0.6, -1.0, 0.25, 1.0, 0.0, 2.0);
+        let room = render_with(1.0, -1.0, 0.25, 1.0, 0.0, 2.0);
+        let ceiling = render_with(0.65, 1.0, 0.65, 1.0, 0.0, 2.0);
+        let fixture_under_ceiling = render_with(0.6, 1.0, 0.65, 1.0, 0.0, 2.0);
+        // A HALO ALONE -- a torch's glare -- lies whole over a surface nearer
+        // than its light, where a halo with a core showed only its cap: the
+        // torch's own bezel no longer rings its glass.
+        let torch = render_with(0.25, -1.0, 0.25, 1.0, 0.0, 3.0);
+        for k in 0..W / 2 {
+            let (got, want) = (px(&torch, W / 2 + k, W / 2) as f32, expected(1.0, 1.0, k));
+            assert!((got - want).abs() <= 2.0, "a halo alone {k} pixels out: {got} vs {want}");
+        }
+        for k in 0..W / 2 {
+            let want = expected(1.0, 1.0, k);
+            for (img, what) in [(&room, "the room behind"), (&ceiling, "a ceiling nearer than the core")] {
+                let got = px(img, W / 2 + k, W / 2) as f32;
+                assert!((got - want).abs() <= 2.0, "over {what} {k} pixels out: {got} vs {want}");
+            }
+            let haze = shown(veil_at(1.0, 1.0, k).min(HALO_CAP));
+            for (img, what) in [(&fixture, "the fixture"), (&fixture_under_ceiling, "the fixture under a ceiling")] {
+                let got = px(img, W / 2 + k, W / 2) as f32;
+                assert!((got - haze).abs() <= 1.0, "over {what} {k} pixels out: {got} vs {haze}");
+            }
+        }
+        let walled = render(1.0, 1.0, 1.0, 0.0);
         assert_eq!(px(&walled, W / 2, W / 2), 0, "a wall in front of the bulb takes its veil");
         // Three of the seven taps behind a wall standing over the left: the
         // veil at four sevenths of the light. Dim enough that the tone curve
         // does not flatten the difference.
         let dim = 0.01;
-        let half = px(&render(1.0, -0.1, dim), W / 2, W / 2) as f32;
-        let whole = px(&render(1.0, -1.0, dim), W / 2, W / 2) as f32;
+        let half = px(&render(1.0, -0.1, dim, 0.0), W / 2, W / 2) as f32;
+        let whole = px(&render(1.0, -1.0, dim, 0.0), W / 2, W / 2) as f32;
         assert!((whole - expected(dim, 1.0, 0)).abs() <= 2.0, "{whole} vs {}", expected(dim, 1.0, 0));
         assert!(
             (half - expected(dim, 4.0 / 7.0, 0)).abs() <= 2.0,

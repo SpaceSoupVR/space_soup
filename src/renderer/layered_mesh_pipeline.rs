@@ -568,6 +568,9 @@ mod tests {
         if shot.lit {
             lights.upload(&queue, &[Light {
                 mask_channel: None,
+                shadow_near: None,
+                source_radius: 0.0,
+                in_level_bake: true,
                 position: to_player.transform_point3(glam::Vec3::from(shot.light_at)),
                 direction: to_player.transform_vector3(glam::Vec3::new(0.0, -1.0, 0.0)),
                 kind: LightKind::Point,

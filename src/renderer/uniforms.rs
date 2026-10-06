@@ -146,7 +146,7 @@ pub struct Uniforms {
     /// MUST stay in step with the `Camera` struct in `wgsl_lights_block`.
     pub capsules: [[f32; 4]; MAX_CAPSULES * 2],
     pub capsule_groups: [[f32; 4]; MAX_CAPSULE_GROUPS * 2],
-    /// x = how many characters; y, z = which light casts the characters' crisp
+    /// x = how many groups; y, z = which light casts the characters' crisp
     /// shadow into their first and second tile (`shadow::MAX_CHARACTER_SHADOWS`),
     /// -1 for none; w the floor mirror's plane, `FLOOR_MIRROR_BIAS` above its
     /// height, 0 for none (`brush_pipeline::probe_pass`).
@@ -207,6 +207,23 @@ pub const MAX_PORTALS: usize = 8;
 /// probes there are. Sixteen is 3.1 MB and sixteen box tests.
 pub const MAX_PROBES: usize = 16;
 
+/// WHERE `probe_boxes` LIES IN THE CAMERA BUFFER, which the scene's bind group
+/// binds a second time over just those bytes (binding 13, `lights::probe_select`):
+/// a block that small, read only at indices a loop counts, the driver may keep
+/// in constant memory, where the whole camera block -- whose tables the trace
+/// indexes by what it read before -- cannot be.
+pub const PROBE_SELECT_OFFSET: u64 = std::mem::offset_of!(Uniforms, probe_boxes) as u64;
+/// The slots' centres and rooms as push constants, one `vec4` a slot: 256
+/// bytes, all the Quest 3 has (`UniformBuffer::probe_push`,
+/// `brush_pipeline::PUSH_SCAN`).
+pub const PROBE_PUSH_SIZE: u64 = (MAX_PROBES * 16) as u64;
+/// Its length: three `vec4` a slot.
+pub const PROBE_SELECT_SIZE: u64 = std::mem::size_of::<[[[f32; 4]; 3]; MAX_PROBES]>() as u64;
+const _: () = assert!(
+    PROBE_SELECT_OFFSET % 256 == 0,
+    "a uniform binding's offset must meet the strictest offset alignment a device may ask (256)",
+);
+
 /// SAMPLED TEXTURES A SCENE SHADER MAY BIND in one stage. WebGPU's portable
 /// default is 16, and the brush shader that reads the probe pass needs 17:
 /// shadows (3), probes and their depth (2), the ground map, the model fields,
@@ -241,15 +258,17 @@ pub struct PlayerUpload {
     pub capsules: CapsuleUpload,
 }
 
-/// How many characters the shaders see as capsules: the player and the three
-/// nearest others. The caller chooses them, nearest first.
-pub const MAX_CAPSULE_GROUPS: usize = 4;
+/// How many groups the shaders see as capsules: the player and the three
+/// nearest others, and a torch in each one's hand. The caller chooses them,
+/// the player first. A group the frame does not use costs nothing: the
+/// shaders walk `capsule_params.x` of them.
+pub const MAX_CAPSULE_GROUPS: usize = 8;
 /// Slots a character has: head, torso, and each arm, hand, thigh, shin and
 /// foot. See `avatar_ik::body_capsules`.
 pub const CAPSULES_PER_GROUP: usize = 14;
 pub const MAX_CAPSULES: usize = MAX_CAPSULE_GROUPS * CAPSULES_PER_GROUP;
 
-/// One character as capsules, this frame.
+/// One character as capsules, this frame -- or a thing one carries.
 #[derive(Clone, Debug, Default)]
 pub struct CapsuleGroup {
     /// `(a, b, radius)` each, in the PLAYER's frame -- the frame the lights
@@ -257,6 +276,15 @@ pub struct CapsuleGroup {
     pub capsules: Vec<(Vec3, Vec3, f32)>,
     /// Its mean surface colour, linear: what its reflection is made of.
     pub colour: [f32; 3],
+    /// WHAT EACH CAPSULE IS, beside `capsules`; 0 for one past the end. 0 is
+    /// a character's body, which a capsule only roughly matches: shown
+    /// blurred by the shader's `CAPSULE_SHAPE_BLUR`, and by the character's
+    /// cards where it has them. Anything else is a CARRIED THING, whose
+    /// capsules are its shape, never blurred: below 0 a solid of `colour`
+    /// times `-s`; above 0 a disc at `b`, the capsule's radius across, facing
+    /// away from `a` and seen from in front only, giving off `colour` times
+    /// `s` -- a torch's glass. See `capsule_reflection`.
+    pub surfaces: Vec<f32>,
 }
 
 /// THE CHARACTERS AS CAPSULES, for what their meshes cannot cheaply do every
@@ -267,9 +295,9 @@ pub struct CapsuleGroup {
 /// `capsule_reflection` in the lights block.
 ///
 /// Laid out for the shader: two vec4 a capsule, `[a.xyz, radius]` and
-/// `[b.xyz, 0]`, [`CAPSULES_PER_GROUP`] slots a character with the unused
-/// ones zero; two vec4 a character, `[centre.xyz, bound radius]` and
-/// `[colour.rgb, capsule count]`.
+/// `[b.xyz, surface]` (see [`CapsuleGroup::surfaces`]), [`CAPSULES_PER_GROUP`]
+/// slots a character with the unused ones zero; two vec4 a character,
+/// `[centre.xyz, bound radius]` and `[colour.rgb, capsule count]`.
 #[derive(Clone, Copy)]
 pub struct CapsuleUpload {
     pub capsules: [[f32; 4]; MAX_CAPSULES * 2],
@@ -314,25 +342,28 @@ impl CapsuleUpload {
             if g == MAX_CAPSULE_GROUPS {
                 break;
             }
-            let caps: Vec<&(Vec3, Vec3, f32)> = group
+            // Each with what it is, which stays with it past the ones left out.
+            let caps: Vec<(Vec3, Vec3, f32, f32)> = group
                 .capsules
                 .iter()
-                .filter(|(a, b, r)| a.is_finite() && b.is_finite() && *r > 0.0)
+                .zip(group.surfaces.iter().copied().chain(std::iter::repeat(0.0)))
+                .map(|(&(a, b, r), s)| (a, b, r, s))
+                .filter(|(a, b, r, s)| a.is_finite() && b.is_finite() && *r > 0.0 && s.is_finite())
                 .take(CAPSULES_PER_GROUP)
                 .collect();
             if caps.is_empty() {
                 continue;
             }
             // The bound: a sphere round every capsule, centred on their ends' mean.
-            let centre = caps.iter().fold(Vec3::ZERO, |s, (a, b, _)| s + *a + *b) / (2 * caps.len()) as f32;
+            let centre = caps.iter().fold(Vec3::ZERO, |s, (a, b, _, _)| s + *a + *b) / (2 * caps.len()) as f32;
             let reach = caps
                 .iter()
-                .map(|(a, b, r)| (*a - centre).length().max((*b - centre).length()) + r)
+                .map(|(a, b, r, _)| (*a - centre).length().max((*b - centre).length()) + r)
                 .fold(0.0f32, f32::max);
-            for (k, (a, b, r)) in caps.iter().enumerate() {
+            for (k, (a, b, r, s)) in caps.iter().enumerate() {
                 let i = g * CAPSULES_PER_GROUP + k;
                 out.capsules[i * 2] = [a.x, a.y, a.z, *r];
-                out.capsules[i * 2 + 1] = [b.x, b.y, b.z, 0.0];
+                out.capsules[i * 2 + 1] = [b.x, b.y, b.z, *s];
             }
             out.groups[g * 2] = [centre.x, centre.y, centre.z, reach];
             out.groups[g * 2 + 1] = [group.colour[0], group.colour[1], group.colour[2], caps.len() as f32];
@@ -509,6 +540,22 @@ impl UniformBuffer {
         self.probes = probes;
     }
 
+    /// The photograph slots as the probe pass reads them from push constants
+    /// (`brush_pipeline::PUSH_SCAN`) -- each slot's centre and room, one `vec4`
+    /// a slot -- from `probes`, the table this pass's camera block was written
+    /// with, renumbered as it was (`dense_rooms`), so the same choice. `None`
+    /// is the table `set_probes` gave, as it is for the camera block.
+    ///
+    /// THE CAMERA BLOCK'S TABLE, NOT THE ONE FROM LOAD. This read `self.probes`
+    /// alone while the camera block held the frame's RESIDENT slots -- chosen
+    /// per eye from where the player stands (`select_resident_probes`) -- so
+    /// the pass chose between photographs by one table's centres and sampled
+    /// another's slots: reflections that changed what they showed as the
+    /// player walked (headset, 2026-10-02). See [`push_slots`].
+    pub fn probe_push(&self, probes: Option<&ProbeUpload>) -> [[f32; 4]; MAX_PROBES] {
+        push_slots(probes.unwrap_or(&self.probes))
+    }
+
     /// The probes the last [`Self::rebind_probes`] or [`Self::set_probes`] set.
     pub fn probes(&self) -> ProbeUpload {
         self.probes
@@ -553,6 +600,14 @@ fn scene_bind_group(
             BindGroupEntry { binding: 10, resource: BindingResource::TextureView(ground_view) },
             BindGroupEntry { binding: 11, resource: BindingResource::TextureView(proxy_field_view) },
             BindGroupEntry { binding: 12, resource: BindingResource::TextureView(proxy_card_view) },
+            BindGroupEntry {
+                binding: 13,
+                resource: BindingResource::Buffer(BufferBinding {
+                    buffer,
+                    offset: PROBE_SELECT_OFFSET,
+                    size: std::num::NonZeroU64::new(PROBE_SELECT_SIZE),
+                }),
+            },
         ],
     })
 }
@@ -740,6 +795,18 @@ impl UniformBuffer {
                         sample_type: TextureSampleType::Float { filterable: true },
                         view_dimension: TextureViewDimension::D2,
                         multisampled: false,
+                    },
+                    count: None,
+                },
+                // The photographs' slots again, as their own small block.
+                // See `PROBE_SELECT_OFFSET`.
+                BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(PROBE_SELECT_SIZE),
                     },
                     count: None,
                 },
@@ -2206,9 +2273,41 @@ pub fn select_resident_probes(
     upload
 }
 
+/// `probes`' slots as the probe pass takes them in push constants: each slot's
+/// centre and room, one `vec4` a slot, renumbered by `dense_rooms` exactly as
+/// the camera block's are. See `UniformBuffer::probe_push`.
+pub fn push_slots(probes: &ProbeUpload) -> [[f32; 4]; MAX_PROBES] {
+    let (dense, _) = probes.dense_rooms();
+    std::array::from_fn(|i| {
+        let b = dense.boxes[i];
+        [b[0][0], b[0][1], b[0][2], b[2][3]]
+    })
+}
+
 #[cfg(test)]
 mod residency_tests {
     use super::*;
+
+    /// THE PUSH CONSTANTS FOLLOW THE FRAME'S RESIDENT SLOTS. Two places a
+    /// player stands fill the slots in different orders, so the table the
+    /// probe pass chooses photographs by has to be the one the frame chose --
+    /// the one from load cannot be both. Built from the load-time table, the
+    /// pass chose by one table's centres and sampled another's slots, and the
+    /// reflections changed what they showed as the player walked (headset,
+    /// 2026-10-02).
+    #[test]
+    fn the_push_slots_are_the_frames_resident_slots() {
+        let vols: Vec<_> = (0..(MAX_PROBES as u32 + 4)).map(|i| cell(i, i as f32 * 3.0)).collect();
+        let here = select_resident_probes(&vols, Vec3::new(1.0, 1.0, 1.0), |_, _| true);
+        let there = select_resident_probes(&vols, Vec3::new(55.0, 1.0, 1.0), |_, _| true);
+        for up in [&here, &there] {
+            let push = push_slots(up);
+            for slot in 0..up.count as usize {
+                assert_eq!(&push[slot][..3], &up.boxes[slot][0][..3], "slot {slot}'s centre");
+            }
+        }
+        assert_ne!(push_slots(&here), push_slots(&there), "two places, one table: the test proves nothing");
+    }
 
     fn cell(layer: u32, x: f32) -> (u32, Vec3, Vec3, Vec3) {
         let min = Vec3::new(x, 0.0, 0.0);

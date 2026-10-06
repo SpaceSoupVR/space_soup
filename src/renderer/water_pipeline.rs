@@ -314,6 +314,9 @@ mod tests {
             &queue,
             &[Light {
                 mask_channel: None,
+                shadow_near: None,
+                source_radius: 0.0,
+                in_level_bake: true,
                 position: glam::Vec3::new(0.0, 6.0, 0.0),
                 direction: glam::Vec3::NEG_Y,
                 kind: LightKind::Point,

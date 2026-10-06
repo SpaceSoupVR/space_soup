@@ -294,7 +294,7 @@ impl Renderer {
         let spot_indices: Vec<usize> = lights
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.kind == lights::LightKind::Spot)
+            .filter(|(_, l)| l.kind == lights::LightKind::Spot && l.casts_shadow())
             .map(|(i, _)| i)
             .take(shadow::MAX_SPOT_SHADOWS)
             .collect();
@@ -308,11 +308,15 @@ impl Renderer {
             .unwrap_or(glam::Mat4::IDENTITY);
         // The characters' tiles are the headset's; the desktop leaves them
         // empty. See `shadow::MAX_CHARACTER_SHADOWS`.
+        // Drawn with one matrix and read with another when a spot has its own
+        // near plane -- see `shadow::spot_shadow_matrices`.
+        let spot_matrices: Vec<shadow::SpotShadowMatrices> = spot_indices
+            .iter()
+            .map(|&i| shadow::spot_shadow_matrices(&lights[i], self.shadow_map.spot_tile_dim()))
+            .collect();
         let mut spot_view_proj = [glam::Mat4::IDENTITY; shadow::SHADOW_MATRICES];
-        for (layer, &i) in spot_indices.iter().enumerate() {
-            let l = &lights[i];
-            spot_view_proj[layer] =
-                shadow::spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range);
+        for (layer, mats) in spot_matrices.iter().enumerate() {
+            spot_view_proj[layer] = mats.lookup;
         }
         // Each shadow-casting light is told ITS layer, so the shader does not
         // have to guess which one a given light belongs to.
@@ -478,11 +482,9 @@ impl Renderer {
         // One depth pass per shadow-casting spot. This is where the cost lives,
         // which is why MAX_SPOT_SHADOWS is a budget rather than "all of them".
         for layer in 0..shadow.spot_count as usize {
-            self.shadow_map.upload_light(
-                &self.queue,
-                ShadowKind::Spot(layer),
-                shadow.spot_view_proj[layer],
-            );
+            // Drawn with the PASS matrix; the lookups read with `lookup`.
+            let pass = spot_matrices[layer].pass;
+            self.shadow_map.upload_light(&self.queue, ShadowKind::Spot(layer), pass);
             self.shadow_map.record(
                 &mut encoder,
                 ShadowKind::Spot(layer),
@@ -491,7 +493,7 @@ impl Renderer {
                 &shadow_draws,
                 &skinned_shadow_draws,
                 &[],
-                shadow.spot_view_proj[layer],
+                pass,
             );
         }
 

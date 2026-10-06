@@ -28,7 +28,17 @@
 //! against the `f32` ones, and on the headset.
 
 /// The switch. Off: every shader is `f32`, as before.
-pub const HALF_PRECISION: bool = true;
+///
+/// OFF SINCE B1 (2026-10-06). With the lamp loops' colours at `hf`, `f16` put
+/// the full scene reader at 19 registers against `f32`'s 21 (62% occupancy
+/// against 50%) and bought nothing: one build, the whole build at each
+/// precision (`debug.spacesoup.nof16`), two passes, seven views -- the same
+/// within 0.1 ms everywhere but torch_doorway_out, where `f16` was 0.45 ms
+/// SLOWER in both passes. The loops written in `hf` cost nothing at `f32`;
+/// the restructure that came with them (each lamp weighted before its
+/// shadow, the lean tent) is what put the baked and ground readers at 19,
+/// at either precision.
+pub const HALF_PRECISION: bool = false;
 
 /// What the lights block declares: the half-precision aliases, at `f32`.
 pub const F32_ALIASES: &str = "alias hf = f32;\nalias hf2 = vec2<f32>;\nalias hf3 = vec3<f32>;\nalias hf4 = vec4<f32>;\n";

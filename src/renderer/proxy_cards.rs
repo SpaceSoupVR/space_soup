@@ -9,9 +9,9 @@
 //! lamp is coloured from pictures of itself rather than from a capture point
 //! across the room. See `probe_card_colour` in the lights block.
 //!
-//! ONE ATLAS, TWO ROWS A MODEL: row `2s` holds model `s`'s six cards side by
-//! side, card `k` at columns `k * R .. (k + 1) * R`, so the shader finds a card
-//! from its row, its number and the atlas's width alone. RGBA16Float: radiance
+//! ONE ATLAS, THREE ROWS A MODEL ([`ROWS_PER_SET`]): row `3s` holds model `s`'s
+//! six cards side by side, card `k` at columns `k * R .. (k + 1) * R`, so the
+//! shader finds a card from its row, its number and the atlas's width alone. RGBA16Float: radiance
 //! COMPRESSED as `c / (1 + luminance)` ([`compress`]), so that every average
 //! of it -- the mip chain, and the sampler's own bilinear and trilinear
 //! filtering -- counts a texel as far as it shows, as a display would, rather
@@ -24,9 +24,12 @@
 //! never folds and a filtered read between two texels is a direction between
 //! theirs -- in blue the texel's own depth, and in alpha the nearest
 //! depth round it, widened to its neighbours' ([`widen_ranges`]) so a
-//! filtered read is never nearer than a surface the texels around it saw. One
-//! texture rather than a second binding: the brush shader is at its
-//! sampled-texture limit.
+//! filtered read is never nearer than a surface the texels around it saw. Row
+//! `3s + 2` holds each texel's ALBEDO, its surface's own colour, with its
+//! depth in alpha as the colours have it: what a reflection of the model lights
+//! again with the lights the bake never saw -- a player's flashlight on a
+//! hanging lamp (`probe_card_relit`). One texture rather than more bindings:
+//! the brush shader is at its sampled-texture limit.
 //!
 //! COLOUR BY THE FOOTPRINT, TRUST BY THE POINT: the shader reads the colours
 //! at the reflection's footprint and the tests at full size. Read coarse, a
@@ -44,6 +47,11 @@ use wgpu::{Device, Queue, TextureView};
 /// Six cards a model. Must equal `space_soup_engine::reflection_cards::CARD_FACES`.
 pub const CARD_FACES: usize = 6;
 
+/// The atlas's rows a model: its colours, its tests, its albedo. See the
+/// module notes; the lights block finds the tests and the albedo below the
+/// colours' row.
+pub const ROWS_PER_SET: u32 = 3;
+
 /// How many models' cards a level may carry at once: one per proxy the trace
 /// can hold, and a row each.
 pub const MAX_CARD_SETS: usize = 64;
@@ -60,9 +68,13 @@ pub struct ProxyCards {
     /// Which way each texel's surface faces, in the box's frame, laid out as
     /// `texels`; zero where the card saw nothing.
     pub normals: Vec<[f32; 3]>,
+    /// Each texel's surface's own colour, laid out as `texels`; empty for
+    /// cards baked without it, whose reflections take no light the bake did
+    /// not see.
+    pub albedo: Vec<[f32; 3]>,
 }
 
-/// The cards packed into one atlas, two rows a model, and the row of each
+/// The cards packed into one atlas, three rows a model, and the row of each
 /// input's colours -- its normals are the row after -- (`None` for one
 /// skipped: a different card size than the first, or past
 /// [`MAX_CARD_SETS`]). `None` for no cards at all.
@@ -95,11 +107,16 @@ pub struct CardAtlas {
     /// their own encoding, not a model's: premultiplied albedo with coverage
     /// in alpha, and nothing in the row after. See `character_cards`.
     pub character_rows: Vec<u32>,
+    /// The first of the rows kept for the torch's pool maps, after the
+    /// characters': `pool_cards::POOL_ATLAS_ROWS` of them, linear RGB with
+    /// alpha 1. See `pool_cards`.
+    pub pool_row: u32,
 }
 
-/// [`atlas`], always made, with two rows for each of `characters` after the
+/// [`atlas`], always made, with [`ROWS_PER_SET`] rows for each of `characters` after the
 /// models' -- at the models' card size, or [`DEFAULT_RESOLUTION`] -- left
-/// empty for `character_cards` to fill every frame.
+/// empty for `character_cards` to fill every frame, and the pool maps' rows
+/// after those, for `pool_cards`.
 pub fn atlas_with_characters(
     device: &Device,
     queue: &Queue,
@@ -118,20 +135,23 @@ pub fn atlas_with_characters(
         }
         rows.push(fits.then(|| {
             used += 1;
-            2 * (used - 1)
+            ROWS_PER_SET * (used - 1)
         }));
     }
-    let character_rows: Vec<u32> = (0..characters as u32).map(|k| 2 * (used + k)).collect();
+    let character_rows: Vec<u32> = (0..characters as u32).map(|k| ROWS_PER_SET * (used + k)).collect();
+    let pool_row = ROWS_PER_SET * (used + characters as u32).max(1);
     // Level 0, the atlas as the file has it: linear RGB and the depth `t`,
     // and below, the normal and `t` as a range of one depth, until widened.
-    // The characters' rows empty: no coverage.
+    // The characters' rows and the pools' empty: no coverage, no light.
     let width = res * CARD_FACES as u32;
-    let height = 2 * res * (used + characters as u32).max(1);
+    let height = (pool_row + super::pool_cards::POOL_ATLAS_ROWS) * res;
     let mut level: Vec<[f32; 4]> = vec![[0.0, 0.0, 0.0, MISS]; (width * height) as usize];
     for &row in &character_rows {
         let start = (row * res * width) as usize;
-        level[start..start + (2 * res * width) as usize].fill([0.0; 4]);
+        level[start..start + (ROWS_PER_SET * res * width) as usize].fill([0.0; 4]);
     }
+    let pools = (pool_row * res * width) as usize;
+    level[pools..].fill([0.0; 4]);
     for (c, row) in sets.iter().zip(&rows) {
         let Some(row) = row else { continue };
         for face in 0..CARD_FACES as u32 {
@@ -143,6 +163,11 @@ pub fn atlas_with_characters(
                     let [ox, oy] = to_card_octahedral(face as usize, [nx, ny, nz]);
                     level[((row * res + y) * width + face * res + x) as usize] = compress(t);
                     level[(((row + 1) * res + y) * width + face * res + x) as usize] = [ox, oy, t[3], t[3]];
+                    // Its albedo, with the colour's depth: averaged down the
+                    // mips as the colours are, over what the card saw. None
+                    // baked: black, which lights nothing.
+                    let [ar, ag, ab] = c.albedo.get(i).copied().unwrap_or([0.0; 3]);
+                    level[(((row + 2) * res + y) * width + face * res + x) as usize] = [ar, ag, ab, t[3]];
                 }
             }
         }
@@ -161,7 +186,8 @@ pub fn atlas_with_characters(
         let (w, h) = (pw / 2, ph / 2);
         let mut next = vec![[0.0, 0.0, 0.0, MISS]; (w * h) as usize];
         for y in 0..h {
-            let tests = (y / (res >> l)) % 2 == 1;
+            // Colours and albedo average alike; the tests by their own rule.
+            let tests = (y / (res >> l)) % ROWS_PER_SET == 1;
             for x in 0..w {
                 let four = [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dy)| prev[((2 * y + dy) * pw + 2 * x + dx) as usize]);
                 next[(y * w + x) as usize] = if tests { merge_tests(&four) } else { merge_colours(&four) };
@@ -191,7 +217,7 @@ pub fn atlas_with_characters(
             wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
         );
     }
-    CardAtlas { view: tex.create_view(&wgpu::TextureViewDescriptor::default()), texture: tex, resolution: res, levels, rows, character_rows }
+    CardAtlas { view: tex.create_view(&wgpu::TextureViewDescriptor::default()), texture: tex, resolution: res, levels, rows, character_rows, pool_row }
 }
 
 /// `t` for a texel whose card saw nothing. Must equal
@@ -303,12 +329,13 @@ pub fn from_hemi_octahedral(o: [f32; 2]) -> [f32; 3] {
 /// blends saw -- a hit on the stem before the plate behind it is not "far in
 /// front" of what the card saw there. The texel's own depth, in blue, is left
 /// as it is: it says which side of the card's surface a hit lies. Texels that
-/// saw nothing stay so, and the colour rows are left alone. `card` is a card's
-/// size at this level; the atlas's rows alternate colours, tests.
+/// saw nothing stay so, and the colour and albedo rows are left alone. `card`
+/// is a card's size at this level; the atlas's rows run colours, tests,
+/// albedo ([`ROWS_PER_SET`]).
 pub fn widen_ranges(texels: &mut [[f32; 4]], width: u32, height: u32, card: u32) {
     let before: Vec<f32> = texels.iter().map(|t| t[3]).collect();
     for y in 0..height {
-        if (y / card) % 2 == 0 {
+        if (y / card) % ROWS_PER_SET != 1 {
             continue;
         }
         let (cy0, cy1) = (y / card * card, y / card * card + card - 1);

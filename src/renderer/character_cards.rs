@@ -174,6 +174,8 @@ pub struct CardPart<'a> {
     pub model: &'a BindGroup,
     pub texture: &'a BindGroup,
     pub joints: &'a BindGroup,
+    /// The buffer `joints` binds: what the posing pass reads (`skin_compute`).
+    pub joint_buffer: &'a Buffer,
     /// The primitive's own vertex buffer: which simplified copy is its.
     pub source: &'a Buffer,
     pub vertices: &'a [SkinnedMeshVertex],
@@ -185,6 +187,10 @@ struct CardMesh {
     vertices: Buffer,
     indices: Buffer,
     count: u32,
+    vertex_count: u32,
+    /// Its copy posed once a frame (`skin_compute`), and the joint buffer
+    /// that poses it.
+    posed: Option<(Buffer, crate::renderer::skin_compute::Posed)>,
 }
 
 /// The turn from the player's frame -- what the capsules and the body are
@@ -294,6 +300,22 @@ fn vs_main(v: VIn) -> VOut {{
     return out;
 }}
 
+// A body posed once this frame (`skin_compute`): its posed position IS
+// `vs_main`'s `skinned_p`, so the same expression follows; the uv still comes
+// from the simplified copy.
+struct PosedIn {{
+    @location(0) skinned_p: vec4<f32>,
+    @location(2) uv:        vec2<f32>,
+}}
+
+@vertex
+fn vs_posed(v: PosedIn) -> VOut {{
+    var out: VOut;
+    out.clip = card.view_proj * (model_u.model * v.skinned_p);
+    out.uv = v.uv;
+    return out;
+}}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let t = textureSample(tex, samp, in.uv);
@@ -316,6 +338,9 @@ pub struct CharacterCards {
     _depth: Texture,
     depth_view: TextureView,
     pipeline: RenderPipeline,
+    /// The same views of a body posed once this frame (`skin_compute`): its
+    /// posed positions in slot 0, its uv from the simplified copy in slot 1.
+    posed_pipeline: RenderPipeline,
     matrices: Buffer,
     matrices_group: BindGroup,
     /// Each body primitive's simplified copy, by the primitive's own vertex
@@ -465,6 +490,53 @@ impl CharacterCards {
             multiview_mask: None,
             cache: None,
         });
+        // The posed body's: no joints, and its uv from the simplified copy,
+        // 24 bytes into each `SkinnedMeshVertex`.
+        let posed_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("character_cards_posed"),
+            bind_group_layouts: &[Some(&card_layout), Some(model), Some(texture)],
+            immediate_size: 0,
+        });
+        const UV: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![2 => Float32x2];
+        let uv_from_source = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<SkinnedMeshVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[wgpu::VertexAttribute { offset: 24, ..UV[0] }],
+        };
+        let posed_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("character_cards_posed"),
+            layout: Some(&posed_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_posed"),
+                compilation_options: Default::default(),
+                buffers: &[Some(crate::renderer::skin_compute::posed_layout()), Some(uv_from_source)],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         Self {
             resolution,
             target,
@@ -472,6 +544,7 @@ impl CharacterCards {
             _depth: depth,
             depth_view,
             pipeline,
+            posed_pipeline,
             matrices,
             matrices_group,
             meshes: Default::default(),
@@ -565,6 +638,7 @@ impl CharacterCards {
         atlas: &Texture,
         row: u32,
         timer: Option<(&crate::renderer::pass_timers::PassTimers, usize)>,
+        skin: Option<&crate::renderer::skin_compute::SkinCompute>,
     ) {
         let mut meshes = self.meshes.lock().unwrap_or_else(|e| e.into_inner());
         meshes.retain(|source, _| parts.iter().any(|part| part.source == source));
@@ -594,7 +668,8 @@ impl CharacterCards {
                     vertices: wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor {
                         label: Some("character_card_mesh_vb"),
                         contents: bytemuck::cast_slice(&vertices),
-                        usage: BufferUsages::VERTEX,
+                        // STORAGE too: posed once a frame (`skin_compute`).
+                        usage: BufferUsages::VERTEX | BufferUsages::STORAGE,
                     }),
                     indices: wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor {
                         label: Some("character_card_mesh_ib"),
@@ -602,9 +677,28 @@ impl CharacterCards {
                         usage: BufferUsages::INDEX,
                     }),
                     count: indices.len() as u32,
+                    vertex_count: vertices.len() as u32,
+                    posed: None,
                 }
                 });
             }
+        }
+        // POSED ONCE (`skin_compute`): each part's simplified copy posed by
+        // one compute pass, then drawn on all six cards as a rigid mesh of
+        // those positions, where each card skinned it again.
+        if let Some(skin) = skin {
+            for part in parts {
+                if let Some(mesh) = meshes.get_mut(part.source) {
+                    if mesh.posed.as_ref().is_none_or(|(joints, _)| joints != part.joint_buffer) {
+                        let posed = skin.posed_for(device, &mesh.vertices, mesh.vertex_count, part.joint_buffer);
+                        mesh.posed = Some((part.joint_buffer.clone(), posed));
+                    }
+                }
+            }
+            skin.dispatch(
+                encoder,
+                parts.iter().filter_map(|part| meshes.get(part.source)).filter_map(|mesh| mesh.posed.as_ref().map(|(_, p)| p)),
+            );
         }
         let mut bytes = vec![0u8; (CARD_STRIDE * CARD_FACES as u64) as usize];
         for k in 0..CARD_FACES {
@@ -637,15 +731,24 @@ impl CharacterCards {
                 timestamp_writes: timer.and_then(|(timers, slot)| timers.writes(slot)),
                 ..Default::default()
             });
-            pass.set_pipeline(&self.pipeline);
             for part in parts {
                 let Some(mesh) = meshes.get(part.source) else {
                     continue;
                 };
+                match (skin, &mesh.posed) {
+                    (Some(_), Some((_, posed))) => {
+                        pass.set_pipeline(&self.posed_pipeline);
+                        pass.set_vertex_buffer(0, posed.positions.slice(..));
+                        pass.set_vertex_buffer(1, mesh.vertices.slice(..));
+                    }
+                    _ => {
+                        pass.set_pipeline(&self.pipeline);
+                        pass.set_bind_group(3, part.joints, &[]);
+                        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    }
+                }
                 pass.set_bind_group(1, part.model, &[]);
                 pass.set_bind_group(2, part.texture, &[]);
-                pass.set_bind_group(3, part.joints, &[]);
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 for k in 0..CARD_FACES as u32 {
                     pass.set_viewport((k * res) as f32, 0.0, res as f32, res as f32, 0.0, 1.0);
@@ -969,6 +1072,7 @@ mod tests {
                 model: &model_bg,
                 texture: &tex_bg,
                 joints: &joint_bg,
+                joint_buffer: &joint_buf,
                 source: &vb,
                 vertices: &verts,
                 indices: &index,
@@ -983,6 +1087,7 @@ mod tests {
                 yaw,
                 &atlas.texture,
                 row,
+                None,
                 None,
             );
             queue.submit([enc.finish()]);
@@ -1090,6 +1195,9 @@ mod tests {
                 mapped_at_creation: false,
             });
             let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
+            // No lamps, so no glass's beam to look past (`capsule_glass_beam`).
+            let lights_uniform = crate::renderer::lights::LightsUniform::new(&device);
+            let shadow_map = crate::renderer::shadow::ShadowMap::with_dimension(&device, 64);
             let g0 = device.create_bind_group(&BindGroupDescriptor {
                 label: None,
                 layout: &pipeline.get_bind_group_layout(0),
@@ -1097,6 +1205,18 @@ mod tests {
                     BindGroupEntry {
                         binding: 0,
                         resource: camera.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: lights_uniform.buffer().as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: BindingResource::Sampler(shadow_map.sampler()),
+                    },
+                    BindGroupEntry {
+                        binding: 4,
+                        resource: BindingResource::TextureView(shadow_map.spot_depth_view()),
                     },
                     BindGroupEntry {
                         binding: 6,
@@ -1271,5 +1391,145 @@ mod tests {
                 && (hi - Vec3::new(0.15 + m, 1.7 + m, 0.1 + m)).abs().max_element() < 1e-5,
             "turned a quarter: {lo} to {hi}"
         );
+    }
+
+    /// POSED ONCE, THE SAME CARDS: the legged body bent at a joint, drawn onto
+    /// its six cards skinned per card and posed once by `skin_compute`, reads
+    /// back the same, texel for texel.
+    #[test]
+    fn a_body_posed_once_draws_the_cards_it_drew_skinned() {
+        use crate::renderer::brush_pipeline::probe_pass::MirrorMips;
+        use wgpu::util::DeviceExt;
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
+            eprintln!("no GPU adapter; skipped");
+            return;
+        };
+        let entry = |binding: u32, visibility: ShaderStages, ty: BindingType| BindGroupLayoutEntry { binding, visibility, ty, count: None };
+        let uniform = BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None };
+        let model_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[entry(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT, uniform)],
+        });
+        let texture_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                entry(
+                    0,
+                    ShaderStages::FRAGMENT,
+                    BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
+                entry(1, ShaderStages::FRAGMENT, BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+            ],
+        });
+        let joint_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[entry(0, ShaderStages::VERTEX, uniform)],
+        });
+        let mips = MirrorMips::new(&device);
+        let atlas = crate::renderer::proxy_cards::atlas_with_characters(&device, &queue, &[], 1);
+        let mut model = vec![0.0f32; 56];
+        model[..16].copy_from_slice(&Mat4::IDENTITY.to_cols_array());
+        let model_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&model),
+            usage: BufferUsages::UNIFORM,
+        });
+        // The torso on joint 0, turned and lifted; the legs on joint 1, swung.
+        let mut joints: Vec<f32> = (0..MAX_SKIN_JOINTS).flat_map(|_| Mat4::IDENTITY.to_cols_array()).collect();
+        joints[..16].copy_from_slice(
+            &(Mat4::from_translation(Vec3::new(0.05, 0.1, 0.0)) * Mat4::from_rotation_y(0.4)).to_cols_array(),
+        );
+        joints[16..32].copy_from_slice(&Mat4::from_rotation_x(0.3).to_cols_array());
+        let joint_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&joints),
+            usage: BufferUsages::UNIFORM,
+        });
+        let colours: [[u8; 4]; 4] = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 255, 255]];
+        let tex = device.create_texture_with_data(
+            &queue,
+            &wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: 4, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            bytemuck::cast_slice(&colours),
+        );
+        let nearest = device.create_sampler(&Default::default());
+        let tex_view = tex.create_view(&Default::default());
+        let model_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &model_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: model_buf.as_entire_binding() }],
+        });
+        let tex_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &texture_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&tex_view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&nearest) },
+            ],
+        });
+        let joint_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &joint_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: joint_buf.as_entire_binding() }],
+        });
+        let (mut verts, index) = legged_body();
+        for v in verts.iter_mut().filter(|v| v.position[1] < 0.6) {
+            v.joint_ids = [1, 0, 0, 0];
+        }
+        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&verts),
+            usage: BufferUsages::VERTEX,
+        });
+        let mut caps = CapsuleUpload::default();
+        caps.group_count = 1;
+        caps.groups[0] = [0.0, 0.8, 0.0, 0.8];
+        caps.groups[1] = [0.5, 0.5, 0.5, 1.0];
+        caps.capsules[0] = [0.0, 0.2, 0.0, 0.3];
+        caps.capsules[1] = [0.0, 1.4, 0.0, 0.0];
+        let (centre, half) = card_box(&caps, 0, 0.0).unwrap();
+        let part = CardPart {
+            model: &model_bg,
+            texture: &tex_bg,
+            joints: &joint_bg,
+            joint_buffer: &joint_buf,
+            source: &vb,
+            vertices: &verts,
+            indices: &index,
+        };
+        let skin = crate::renderer::skin_compute::SkinCompute::new(&device);
+        let draw = |posed: bool| {
+            let cards = CharacterCards::with_layouts(&device, 64, [&model_layout, &texture_layout, &joint_layout]);
+            let mut enc = device.create_command_encoder(&Default::default());
+            let skin = posed.then_some(&skin);
+            cards.record(&device, &queue, &mut enc, &mips, &[part], (centre, half), 0.0, &atlas.texture, atlas.character_rows[0], None, skin);
+            queue.submit([enc.finish()]);
+            cards.read_back(&device, &queue).unwrap()
+        };
+        let (w, h, skinned) = draw(false);
+        let (_, _, posed) = draw(true);
+        let covered = skinned.iter().filter(|t| t[3] > 0.5).count();
+        assert!(covered > (w * h / 20) as usize, "the body must cover the cards: {covered} of {}", w * h);
+        let worst = skinned
+            .iter()
+            .zip(&posed)
+            .map(|(a, b)| (0..4).map(|c| (a[c] - b[c]).abs()).fold(0.0f32, f32::max))
+            .fold(0.0f32, f32::max);
+        let differing = skinned.iter().zip(&posed).filter(|(a, b)| (0..4).any(|c| (a[c] - b[c]).abs() > 1e-3)).count();
+        eprintln!("posed against skinned: {differing} of {} texels differ, worst {worst:.2e}", w * h);
+        assert!(differing <= (w * h / 1000) as usize, "{differing} texels differ, worst {worst}");
     }
 }

@@ -61,6 +61,31 @@ pub struct Levers {
     pub shadows: bool,
     /// The moving-objects sun map. The static map and the baked mask stay.
     pub sun_dynamic: bool,
+    /// Each model left out of the shadow tiles its bounding sphere cannot
+    /// reach -- the moving-objects map's two sun tiles and each spot's (see
+    /// `shadow::sphere_in_frustum`). Lossless: the GPU clips those casters
+    /// whole, so off changes no texel, only what the passes cost.
+    pub shadow_mesh_cull: bool,
+    /// The player's body posed ONCE a frame by a compute pass, and drawn into
+    /// the moving-objects map, the spot atlas and the cards as a rigid mesh of
+    /// those positions -- where each of those draws skinned every vertex again
+    /// (`skin_compute`). The same arithmetic, so the same shadows and cards.
+    pub skin_once: bool,
+    /// In frames where no spot casts, the scene's brush readers and models
+    /// drawn by their SPOTLESS TWINS: the spots' shadow code left out, which
+    /// gives back the registers the tent took (`lights::without_spot_shadows`).
+    /// The same pixels: with no spot casting, every spot's test is false.
+    pub spotless_shaders: bool,
+    /// In frames where no surface is lit by the torch, the probe pass and the
+    /// ground's drawn by their POOLLESS TWINS: the pool maps' lookup left out
+    /// (`lights::without_pool_maps`). The same pixels: with no lit surface,
+    /// every lookup adds nothing.
+    pub poolless_shaders: bool,
+    /// DYNAMIC RESOLUTION: ask the runtime each frame for its size for the
+    /// eyes' layer (`XR_META_recommended_layer_resolution`), which Quest 3
+    /// makes the condition for GPU level 5. The eyes are still drawn at their
+    /// fixed size. Off: never asked.
+    pub dynamic_resolution: bool,
     /// The player's crisp shadows from the lamps lighting them most: a
     /// characters-only tile of the shadow atlas each. Off, those lamps shadow
     /// the player by the capsules alone. See `shadow::MAX_CHARACTER_SHADOWS`.
@@ -153,6 +178,26 @@ pub struct Levers {
     /// How strong the veils are against `glare::VEIL_SHARE` of the CIE young
     /// eye's: 1 as shipped.
     pub glare_strength: f32,
+    /// Where a fixture's bulb meets the tone curve, exposed, when it would be
+    /// brighter: its own light -- the bulb's glow and its lamp on the inside
+    /// of its shade -- scaled as one, as an eye adapts to a lamp it looks into
+    /// (`tonemap::own_light_scale`). 16 as shipped, the bulb white and its
+    /// reflector graded down to the rim; 0 leaves it unscaled, the mouth one
+    /// white with the bulb lost in it, as until 2026-10-02.
+    pub fixture_bulb_level: f32,
+    /// The player's flashlight throwing its light back off what its beam
+    /// lands on, as one more light standing at the lit patch. The renderer
+    /// draws it as any light; the app places it (`quest_app::flashlight_bounce`).
+    pub flashlight_bounce: bool,
+    /// The lit surfaces' lights -- that bounce -- shaded by the scene readers
+    /// apart from the lamps, with none of the lamp loop's work for a shadow
+    /// or a highlight they never have (`lights::Light::is_surface_light`).
+    /// Off, they go through the lamp loop as before, the shaders unchanged.
+    pub surface_light_loop: bool,
+    /// A carried torch in reflections, as its own capsules: its body, and its
+    /// glass glowing. The app hands them over (`quest_app::flashlight`); off,
+    /// it hands none, and a torch shows in no reflection, as until 2026-10-02.
+    pub torch_reflection: bool,
     /// The characters mirrored in the floor the player stands on, in place of
     /// their capsules there. See `brush_pipeline::probe_pass::MIRROR_FORMAT`.
     /// OFF as shipped: its pass and blur levels cost about 1 ms at GPU level 5
@@ -180,6 +225,11 @@ pub struct Levers {
     /// much wider); less cuts its tails. Until 2026-10-01 this was the drawn
     /// width in pixels, 3 as shipped.
     pub thin_parts: f32,
+    /// MEASUREMENT: the thin pass shaded as it was before 2026-10-01, from
+    /// the normal interpolated at each fragment of the widened band, instead
+    /// of the mean over the stretch of the part each fragment's kernel
+    /// reaches (`mesh_pipeline::THIN_SHADE`). Single-eye passes.
+    pub thin_shading_sampled: bool,
     /// The CPU performance level asked of the runtime. `None` asks nothing,
     /// as shipped: the app keeps the level it started at. See
     /// `performance_level`.
@@ -199,11 +249,17 @@ pub struct Levers {
     /// MEASUREMENT: the probe pass drawn with one of its register cuts
     /// (`brush_pipeline::DEFERRED_REGISTER_CUTS`, e.g. `def_cut_characters`)
     /// -- what a part costs by its PRESENCE in the shader, which a runtime
-    /// switch cannot measure (the code stays compiled in). Mono passes.
+    /// switch cannot measure (the code stays compiled in). Mono passes. A cut
+    /// named `terrain_cut_...` is the ground's instead
+    /// (`terrain_pipeline::PROBE_PASS_REGISTER_CUTS`), the brushes' as shipped.
     pub pass_cut: Option<String>,
     /// MEASUREMENT: the scene pass's brush likewise, with one of
     /// `SCENE_REGISTER_CUTS` (e.g. `scene_cut_contact`). Mono passes.
     pub scene_cut: Option<String>,
+    /// MEASUREMENT: the reflection fix-up run with one of
+    /// `probe_fixup::FIXUP_CUTS` (e.g. `fixup_cut_rims`) -- what each kind of
+    /// record costs. Lossy: the cut lookups are not made.
+    pub fixup_cut: Option<String>,
     /// MEASUREMENT: block on the GPU at the end of every frame, as the
     /// renderer used to. Its wait is then exactly the GPU's time, which is
     /// what the A/B schedule attributes costs with; shipped, the CPU prepares
@@ -237,6 +293,11 @@ impl Default for Levers {
             portals: true,
             shadows: true,
             sun_dynamic: true,
+            shadow_mesh_cull: true,
+            skin_once: true,
+            spotless_shaders: true,
+            poolless_shaders: true,
+            dynamic_resolution: true,
             character_shadows: true,
             capsules: true,
             direct_lights: true,
@@ -256,16 +317,22 @@ impl Default for Levers {
             terminator_aa: true,
             glare: true,
             glare_strength: 1.0,
+            fixture_bulb_level: 16.0,
+            flashlight_bounce: true,
+            surface_light_loop: true,
+            torch_reflection: true,
             floor_mirror: false,
             reflection_blur: true,
             character_cards: true,
             thin_parts: 1.0,
+            thin_shading_sampled: false,
             cpu_level: None,
             gpu_level: None,
             terrain_detail_distance: 0.0,
             same_eyes: false,
             pass_cut: None,
             scene_cut: None,
+            fixup_cut: None,
             gpu_sync: false,
             ssr: None,
             multiview: None,
@@ -320,6 +387,8 @@ impl Levers {
             Phase::FloorMirror => l.floor_mirror = true,
             Phase::NoReflectionBlur => l.reflection_blur = false,
             Phase::NoCharacterCards => l.character_cards = false,
+            Phase::NoFlashlightBounce => l.flashlight_bounce = false,
+            Phase::NoTorchReflection => l.torch_reflection = false,
         }
         l
     }
@@ -347,6 +416,11 @@ impl Levers {
         flag("portals", self.portals, d.portals);
         flag("shadows", self.shadows, d.shadows);
         flag("sun_dynamic", self.sun_dynamic, d.sun_dynamic);
+        flag("shadow_mesh_cull", self.shadow_mesh_cull, d.shadow_mesh_cull);
+        flag("skin_once", self.skin_once, d.skin_once);
+        flag("spotless_shaders", self.spotless_shaders, d.spotless_shaders);
+        flag("poolless_shaders", self.poolless_shaders, d.poolless_shaders);
+        flag("dynamic_resolution", self.dynamic_resolution, d.dynamic_resolution);
         flag("character_shadows", self.character_shadows, d.character_shadows);
         flag("capsules", self.capsules, d.capsules);
         flag("direct_lights", self.direct_lights, d.direct_lights);
@@ -365,8 +439,12 @@ impl Levers {
         flag("floor_mirror", self.floor_mirror, d.floor_mirror);
         flag("reflection_blur", self.reflection_blur, d.reflection_blur);
         flag("character_cards", self.character_cards, d.character_cards);
+        flag("flashlight_bounce", self.flashlight_bounce, d.flashlight_bounce);
+        flag("surface_light_loop", self.surface_light_loop, d.surface_light_loop);
+        flag("torch_reflection", self.torch_reflection, d.torch_reflection);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("same_eyes", self.same_eyes, d.same_eyes);
+        flag("thin_shading_sampled", self.thin_shading_sampled, d.thin_shading_sampled);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
         flag("ab_cycle", self.ab_cycle, d.ab_cycle);
@@ -378,6 +456,9 @@ impl Levers {
         }
         if self.glare && self.glare_strength != d.glare_strength {
             out.push(format!("glare_strength={}", self.glare_strength));
+        }
+        if self.fixture_bulb_level != d.fixture_bulb_level {
+            out.push(format!("fixture_bulb_level={}", self.fixture_bulb_level));
         }
         if let Some(level) = self.cpu_level {
             out.push(format!("cpu_level={}", level.label()));
@@ -402,6 +483,9 @@ impl Levers {
         }
         if let Some(cut) = &self.scene_cut {
             out.push(format!("scene_cut={cut}"));
+        }
+        if let Some(cut) = &self.fixup_cut {
+            out.push(format!("fixup_cut={cut}"));
         }
         if let Some(b) = &self.bench {
             out.push(format!("bench={}", b.name));

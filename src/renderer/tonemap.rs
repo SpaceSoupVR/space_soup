@@ -111,6 +111,58 @@ pub fn tonemap(color: Vec3, exposure: f32, mode: ToneMapping) -> Vec3 {
     }
 }
 
+/// THE EYE ADAPTED TO A FIXTURE'S OWN LIGHT: the scale its bulb's glow and its
+/// lamp's light on its own surfaces take this frame -- the bulb meeting the
+/// curve at `bulb_level` exposed as far as the eye is `adapted` to it (see
+/// [`bulb_adaptation`]), and 1 for a bulb no brighter than that.
+///
+/// A bulb is drawn at the radiance of the light it gives off
+/// (`space_soup_engine::scene_light::emissive_drive`), thousands of times a lit
+/// wall, and its lamp lights the inside of its own shade from centimetres
+/// (`own_bulb_fill`): a fifth of the bulb 10 cm off. Exposed for the room both
+/// are far past white, and the mouth was one flat white with the bulb lost in
+/// it (user, headset 2026-10-02: "we originally had actual drawn bulb shapes
+/// that were visible and were supposed to be the sources of the light"). An
+/// eye looking into a lamp adapts to it where it looks -- locally; the room
+/// round it does not dim -- and sees the bulb as the brightest thing in a
+/// graded mouth. So the fixture's own light is scaled as ONE: every ratio
+/// inside it kept, the bulb held at the top of the curve, its reflector shaded
+/// down to the rim. Not the room's light on the fixture, nor anything else,
+/// nor the glare: that is the light reaching the eye.
+pub fn own_light_scale(exposure: f32, drive: f32, bulb_level: f32, adapted: f32) -> f32 {
+    let exposed = exposure * drive;
+    if bulb_level > 0.0 && exposed > bulb_level && adapted > 0.0 {
+        (bulb_level / exposed).powf(adapted.min(1.0))
+    } else {
+        1.0
+    }
+}
+
+/// The angular radius, in degrees, from which an eye adapts wholly to a bulb
+/// it sees: a pendant's bulb from 1.9 m.
+pub const ADAPTS_FROM_DEGREES: f32 = 1.5;
+
+/// The angular radius below which a bulb is a point the eye cannot adapt to:
+/// a pendant's bulb from 11 m.
+pub const ADAPTS_NOT_BELOW_DEGREES: f32 = 0.25;
+
+/// HOW FAR THE EYE ADAPTS TO A BULB, 0-1: by how large it looks -- wholly
+/// from [`ADAPTS_FROM_DEGREES`] of radius, not at all below
+/// [`ADAPTS_NOT_BELOW_DEGREES`], smoothly between on a log scale -- and by
+/// the share of it `in_view`. An eye adapts where it looks to what it can look
+/// at: a bulb in view and big enough to see. A lamp across the room, or one
+/// whose shade hides its bulb, burns white in its mouth as photographs show it;
+/// adapted to a bulb it could not see, the far pendant's mouth went grey and
+/// the lamp looked switched off (headset, 2026-10-02, `lamp_in_floor`).
+pub fn bulb_adaptation(bulb_radius: f32, distance: f32, in_view: f32) -> f32 {
+    if !(distance > 0.0) || !(bulb_radius > 0.0) {
+        return 0.0;
+    }
+    let degrees = (bulb_radius / distance).atan().to_degrees();
+    let t = ((degrees / ADAPTS_NOT_BELOW_DEGREES).ln() / (ADAPTS_FROM_DEGREES / ADAPTS_NOT_BELOW_DEGREES).ln()).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t) * in_view.clamp(0.0, 1.0)
+}
+
 /// The same curve as WGSL, generated from the same constants.
 ///
 /// Emitted rather than hand-written so the shader and [`aces_fitted`] cannot
@@ -310,6 +362,56 @@ mod tests {
             }
         }
         assert!(wgsl.contains("camera.post_params.x"), "exposure not wired");
+    }
+
+    /// A pendant's bulb (intensity 9, so 3600 at the bulb) at the exposure the
+    /// headset metered under it (5.33): held at its level, and its reflector,
+    /// scaled alike, shows as a bright mouth graded down to the rim with the
+    /// bulb the one white thing in it -- where unscaled all of it was white.
+    #[test]
+    fn a_fixtures_own_light_keeps_its_ratios_with_the_bulb_at_its_level() {
+        let (exposure, drive, level) = (5.33, 3600.0, 16.0);
+        let k = own_light_scale(exposure, drive, level, 1.0);
+        assert!((exposure * drive * k - level).abs() < 1e-3, "{k}");
+        let shown = |share: f32| aces_fitted(Vec3::splat(exposure * drive * share * k)).x;
+        // The bulb, then its reflector 10, 15 and 28 cm off: (5 cm / d)^2 of it.
+        let [bulb, near, behind, rim] = [1.0, 0.25, 0.111, 0.032].map(shown);
+        assert!(bulb > 0.98, "the bulb is white: {bulb}");
+        assert!(bulb - near > 0.05 && near > behind && behind > rim, "{bulb} {near} {behind} {rim}");
+        assert!(rim < 0.5, "the rim is shaded: {rim}");
+        // Unscaled, the same mouth: every part of it white.
+        let raw = |share: f32| aces_fitted(Vec3::splat(exposure * drive * share)).x;
+        assert!(raw(0.032) > 0.99, "{}", raw(0.032));
+    }
+
+    /// A bulb no brighter than its level, a level of 0, an eye not adapted
+    /// to it, and nonsense: as lit.
+    #[test]
+    fn a_dim_bulb_or_no_level_leaves_a_fixtures_light_alone() {
+        assert_eq!(own_light_scale(1.0, 4.0, 16.0, 1.0), 1.0);
+        assert_eq!(own_light_scale(5.33, 3600.0, 0.0, 1.0), 1.0);
+        assert_eq!(own_light_scale(5.33, 3600.0, 16.0, 0.0), 1.0);
+        assert_eq!(own_light_scale(f32::NAN, 3600.0, 16.0, 1.0), 1.0);
+        assert_eq!(own_light_scale(5.33, 0.0, 16.0, 1.0), 1.0);
+        // Half adapted, half way there on a log scale.
+        let half = own_light_scale(5.33, 3600.0, 16.0, 0.5);
+        assert!((half - own_light_scale(5.33, 3600.0, 16.0, 1.0).sqrt()).abs() < 1e-6, "{half}");
+    }
+
+    /// The eye adapts to a pendant's bulb (5 cm) a metre off and in full
+    /// view, not to one 15 m off, nor to one its shade hides; part way at
+    /// 5 m, and as far as the bulb shows.
+    #[test]
+    fn the_eye_adapts_to_a_bulb_it_sees_and_can_look_at() {
+        assert_eq!(bulb_adaptation(0.05, 1.0, 1.0), 1.0);
+        assert_eq!(bulb_adaptation(0.05, 15.0, 1.0), 0.0);
+        assert_eq!(bulb_adaptation(0.05, 1.0, 0.0), 0.0);
+        let at_five = bulb_adaptation(0.05, 5.0, 1.0);
+        assert!(at_five > 0.2 && at_five < 0.8, "{at_five}");
+        assert!((bulb_adaptation(0.05, 1.0, 0.3) - 0.3).abs() < 1e-6);
+        assert!(bulb_adaptation(0.05, 2.0, 1.0) > bulb_adaptation(0.05, 3.0, 1.0));
+        assert_eq!(bulb_adaptation(0.05, 0.0, 1.0), 0.0);
+        assert_eq!(bulb_adaptation(0.05, f32::NAN, 1.0), 0.0);
     }
 
     #[test]
