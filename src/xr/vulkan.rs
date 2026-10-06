@@ -269,7 +269,12 @@ impl VkContext {
                 })
                 .unwrap_or(false)
         };
-        let f16_supported = f16_extension_available && f16_query.shader_float16 == vk::TRUE;
+        let f16_supported = f16_extension_available
+            && f16_query.shader_float16 == vk::TRUE
+            // MEASUREMENT: every shader at f32, from the next launch -- the
+            // half-precision maths' control in one build (`shader_precision`).
+            // `adb shell setprop debug.spacesoup.nof16 1`.
+            && system_property(c"debug.spacesoup.nof16") != "1";
         // PIPELINE STATISTICS, when asked for. See `PIPELINE_STATISTICS_PROPERTY`.
         let statistics_extension_available = unsafe {
             vk_instance

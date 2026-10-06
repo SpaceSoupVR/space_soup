@@ -181,6 +181,90 @@ impl TerrainPipeline {
         )
     }
 
+    /// The ground's probe pass's POOLLESS TWIN: [`Self::new_probe_pass`]
+    /// without the torch pool maps' lookup (`lights::without_pool_maps`), for
+    /// frames where no surface is lit. `Levers::poolless_shaders`.
+    pub fn new_probe_pass_poolless(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+    ) -> Self {
+        Self::build_from(
+            device,
+            crate::renderer::brush_pipeline::probe_pass::FORMAT,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::ProbePass,
+            Some(fixups.pass_layout()),
+            crate::renderer::lights::without_pool_maps(terrain_shader_for(TerrainRole::ProbePass)),
+            "terrain_probe_pass_poolless",
+        )
+    }
+
+    /// MEASUREMENT: the ground's probe pass with the register cut `cut` (one of
+    /// `PROBE_PASS_REGISTER_CUTS`) applied, to DRAW with in the shipped one's
+    /// place (the `pass_cut` lever). `None` for a cut it does not have, or
+    /// one whose line moved.
+    pub fn new_probe_pass_with_cut(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        cut: &str,
+    ) -> Option<Self> {
+        let (label, edits) = PROBE_PASS_REGISTER_CUTS.iter().find(|(label, _)| *label == cut)?;
+        let mut src = terrain_shader_for(TerrainRole::ProbePass);
+        for (from, to) in edits.iter() {
+            if !src.contains(from) {
+                return None;
+            }
+            src = src.replacen(from, to, 1);
+        }
+        Some(Self::build_from(
+            device,
+            crate::renderer::brush_pipeline::probe_pass::FORMAT,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::ProbePass,
+            Some(fixups.pass_layout()),
+            src,
+            label,
+        ))
+    }
+
+    /// MEASUREMENT ONLY: the ground's probe pass with each of
+    /// `PROBE_PASS_REGISTER_CUTS` applied, one pipeline each, built so the
+    /// PIPESTATS log lists its registers. Nothing draws with them.
+    pub fn log_probe_pass_register_cuts(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+    ) {
+        let base = terrain_shader_for(TerrainRole::ProbePass);
+        for (label, edits) in PROBE_PASS_REGISTER_CUTS {
+            let mut src = base.clone();
+            if let Some((from, _)) = edits.iter().find(|(from, _)| !src.contains(from)) {
+                log::warn!("register cut {label}: `{from}` is not in the shader");
+                continue;
+            }
+            for (from, to) in edits.iter() {
+                src = src.replacen(from, to, 1);
+            }
+            let _ = Self::build_from(
+                device,
+                crate::renderer::brush_pipeline::probe_pass::FORMAT,
+                uniform_layout,
+                1,
+                crate::renderer::multiview::ViewMode::Mono,
+                TerrainRole::ProbePass,
+                Some(fixups.pass_layout()),
+                src,
+                label,
+            );
+        }
+    }
+
     fn build(
         device: &Device,
         format: TextureFormat,
@@ -190,7 +274,26 @@ impl TerrainPipeline {
         role: TerrainRole,
         group3: Option<&BindGroupLayout>,
     ) -> Self {
-        let mut source = terrain_shader_for(role);
+        let label = match role {
+            TerrainRole::Scene => "terrain_pipeline",
+            TerrainRole::Read => "terrain_pipeline_read",
+            TerrainRole::ProbePass => "terrain_probe_pass",
+        };
+        Self::build_from(device, format, uniform_layout, samples, view, role, group3, terrain_shader_for(role), label)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_from(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        role: TerrainRole,
+        group3: Option<&BindGroupLayout>,
+        mut source: String,
+        label: &str,
+    ) -> Self {
         if role == TerrainRole::ProbePass && device.features().contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
             // It writes the fix-up list: see `BrushPipeline::new_probe_pass_deferred`.
             source = source.replacen("@fragment fn fs_main(", "@fragment @early_depth_test(force) fn fs_main(", 1);
@@ -219,11 +322,7 @@ impl TerrainPipeline {
         let targets: &[Option<ColorTargetState>] =
             if role == TerrainRole::ProbePass { &probe_targets } else { &scene_target };
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some(match role {
-                TerrainRole::Scene => "terrain_pipeline",
-                TerrainRole::Read => "terrain_pipeline_read",
-                TerrainRole::ProbePass => "terrain_probe_pass",
-            }),
+            label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -262,6 +361,32 @@ impl TerrainPipeline {
         Self { pipeline, material_layout }
     }
 }
+
+/// MEASUREMENT ONLY: what `TerrainPipeline::log_probe_pass_register_cuts` cuts
+/// out of the ground's probe pass, one pipeline each -- text edits of the
+/// generated WGSL; `pass_cut` draws with one. 2026-10-06: the glass's gate
+/// took the pass from 24 registers to 25 until it was asked after the
+/// capsules' answer was made (`lights::capsule_glass_beam`).
+const PROBE_PASS_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
+    ("terrain_cut_none", &[]),
+    // No gate: the glow as the capsules give it.
+    (
+        "terrain_cut_gate",
+        &[(
+            "rgb * seen / a\n            * capsule_glass_beam(p, camera.capsules[glow_i * 2 + 1].xyz);",
+            "rgb * seen / a;",
+        )],
+    ),
+    // No beam's light on a lit surface in the pass's colours. See
+    // `lights::probe_surface_relit`. 2026-10-06: worked out at every hit, that
+    // light took the pass from 24 registers to 25 in every form tried (seen
+    // head on, summed at half precision, both, a one-tap shadow); read from
+    // its pool map now.
+    (
+        "terrain_cut_relight",
+        &[(crate::renderer::lights::SURFACE_RELIT_READ, ""), (crate::renderer::lights::SURFACE_RELIT_CALL, "")],
+    ),
+];
 
 /// The lights block as the ground takes it: with `options`, testing each
 /// lamp's range before its baked mask -- out of range is what the building's
@@ -756,7 +881,9 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // The GEOMETRIC MEAN of the two screen axes, not their sum: seen at a
     // grazing angle one axis stretches to metres while the other stays a
     // pixel, and the sum let that stretch widen a spot's pool across the floor.
-    pixel_footprint = sqrt(length(dpdx(in.world_pos)) * length(dpdy(in.world_pos)));
+    let step_x = dpdx(in.world_pos);
+    let step_y = dpdy(in.world_pos);
+    pixel_footprint = sqrt(length(step_x) * length(step_y));
     let n = normalize(in.normal);
 
     // Slope straight from the normal: no derivative, no extra sampling.
@@ -1110,6 +1237,9 @@ pub(crate) mod tests {
             // make an x-tilt symmetric and hide exactly what is being tested.
             lights.upload(&queue, &[crate::renderer::lights::Light {
                 mask_channel: light.flatten(),
+                shadow_near: None,
+                source_radius: 0.0,
+                in_level_bake: true,
                 position: light_pos,
                 direction: glam::Vec3::new(0.0, -1.0, 0.0),
                 kind: crate::renderer::lights::LightKind::Point,
@@ -1280,13 +1410,18 @@ pub(crate) mod tests {
     #[test]
     fn the_probe_pass_terrain_shaders_validate_and_build() {
         use wgpu::naga;
-        for role in [TerrainRole::Read, TerrainRole::ProbePass] {
-            let src = terrain_shader_for(role);
+        // The pass's poolless twin too, for frames no torch lights.
+        let poolless = crate::renderer::lights::without_pool_maps(terrain_shader_for(TerrainRole::ProbePass));
+        for (role, src) in [
+            ("read", terrain_shader_for(TerrainRole::Read)),
+            ("pass", terrain_shader_for(TerrainRole::ProbePass)),
+            ("poolless pass", poolless),
+        ] {
             let module = naga::front::wgsl::parse_str(&src)
-                .unwrap_or_else(|e| panic!("{role:?}: {}", e.emit_to_string(&src)));
+                .unwrap_or_else(|e| panic!("{role}: {}", e.emit_to_string(&src)));
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
                 .validate(&module)
-                .unwrap_or_else(|e| panic!("{role:?}: {e:?}"));
+                .unwrap_or_else(|e| panic!("{role}: {e:?}"));
         }
         assert!(terrain_shader_for(TerrainRole::Read).contains("const PROBE_ENV_FROM_PASS: bool = true;"));
         let pass = terrain_shader_for(TerrainRole::ProbePass);
@@ -1302,8 +1437,30 @@ pub(crate) mod tests {
         let _read = TerrainPipeline::new_probe_reader(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &probe_layout);
         let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, 1024);
         let _pass = TerrainPipeline::new_probe_pass(&device, &uniforms.layout, &fixups);
+        let _poolless = TerrainPipeline::new_probe_pass_poolless(&device, &uniforms.layout, &fixups);
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "the terrain probe pipelines failed to build: {err:?}");
+    }
+
+    /// Every register cut of the ground's probe pass still finds its line, and
+    /// what it leaves is valid WGSL -- a cut whose line moved logs a warning on
+    /// the headset and measures nothing.
+    #[test]
+    fn every_terrain_register_cut_applies_and_validates() {
+        use wgpu::naga;
+        let base = terrain_shader_for(TerrainRole::ProbePass);
+        for (label, edits) in PROBE_PASS_REGISTER_CUTS {
+            let mut src = base.clone();
+            for (from, to) in edits.iter() {
+                assert!(src.contains(from), "{label}: `{from}` is not in the ground's probe pass");
+                src = src.replacen(from, to, 1);
+            }
+            let module = naga::front::wgsl::parse_str(&src)
+                .unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
     }
 
     #[test]
@@ -1358,7 +1515,7 @@ pub(crate) mod tests {
         // branch: the specular-AA one above, and the pixel footprint the light
         // loop uses to keep a spot's edge a pixel wide (`pixel_footprint`).
         // Anything beyond those is a sampling gradient that escaped the frame.
-        let footprint = "pixel_footprint = sqrt(length(dpdx(in.world_pos)) * length(dpdy(in.world_pos)));";
+        let footprint = "let step_x = dpdx(in.world_pos);\n    let step_y = dpdy(in.world_pos);";
         let extra = usize::from(entry.contains(footprint));
         assert!(
             entry.matches("dpdx(").count() <= 1 + extra && entry.matches("dpdy(").count() <= 1 + extra,

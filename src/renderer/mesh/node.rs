@@ -334,7 +334,9 @@ pub(crate) fn collect_node(
                 let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("skinned_mesh_vb"),
                     contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
+                    // STORAGE too: read by the pass that poses it once a frame
+                    // (`skin_compute`).
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
                 });
                 let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("skinned_mesh_ib"),

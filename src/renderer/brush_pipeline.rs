@@ -157,6 +157,10 @@ pub struct BrushPipeline {
     pub material_layout: BindGroupLayout,
     /// Layout for group 2, a brush object's baked lighting.
     pub lightmap_layout: BindGroupLayout,
+    /// Its shader reads the photograph slots as push constants
+    /// (`with_push_scan`), so its pass must set them
+    /// (`UniformBuffer::probe_push`).
+    pub reads_immediates: bool,
 }
 
 /// Roughness assumed for a material that ships no roughness map.
@@ -1228,7 +1232,7 @@ impl BrushPipeline {
             multiview_mask: None,
             cache: None,
         });
-        Self { pipeline, material_layout, lightmap_layout }
+        Self { pipeline, material_layout, lightmap_layout, reads_immediates: false }
     }
 
     fn new_with_front_face(
@@ -1279,22 +1283,57 @@ impl BrushPipeline {
     /// write the record list, so their depth test is forced EARLY where the
     /// device allows it: a shader with side effects is otherwise tested after
     /// it runs, and every hidden fragment would be shaded.
+    ///
+    /// ITS PHOTOGRAPH SLOTS AS PUSH CONSTANTS where the device has them
+    /// (`with_push_scan`): exp64, hall_front, render 2.20 -> 1.84 ms an eye.
     pub fn new_probe_pass_deferred(
         device: &Device,
         uniform_layout: &BindGroupLayout,
         fixups: &crate::renderer::probe_fixup::ProbeFixups,
     ) -> Self {
-        Self::new_variant(
+        Self::probe_pass_deferred_from(device, uniform_layout, fixups, "brush_probe_pass_deferred", |source| source)
+    }
+
+    /// The deferring probe pass's POOLLESS TWIN: [`Self::new_probe_pass_deferred`]
+    /// without the torch pool maps' lookup (`lights::without_pool_maps`), for
+    /// frames where no surface is lit. `Levers::poolless_shaders`.
+    pub fn new_probe_pass_deferred_poolless(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+    ) -> Self {
+        Self::probe_pass_deferred_from(
+            device,
+            uniform_layout,
+            fixups,
+            "brush_probe_pass_deferred_poolless",
+            crate::renderer::lights::without_pool_maps,
+        )
+    }
+
+    fn probe_pass_deferred_from(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        label: &str,
+        edit: fn(String) -> String,
+    ) -> Self {
+        let mut source = edit(brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred));
+        if device.features().contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
+            assert!(source.contains(FS_MAIN), "the fragment entry point moved");
+            source = source.replacen(FS_MAIN, "@fragment @early_depth_test(force) fn fs_main(", 1);
+        }
+        Self::from_source(
             device,
             probe_pass::FORMAT,
             uniform_layout,
             FrontFace::Ccw,
             1,
-            false,
             None,
             crate::renderer::multiview::ViewMode::Mono,
-            BrushProbe::PassDeferred,
             Some(fixups.pass_layout()),
+            label,
+            with_push_scan(device, source),
         )
     }
 
@@ -1318,6 +1357,12 @@ impl BrushPipeline {
         }
         if device.features().contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
             src = src.replacen(FS_MAIN, "@fragment @early_depth_test(force) fn fs_main(", 1);
+        }
+        // As shipped: the slots as push constants -- except in the cut that
+        // reads them from the camera block as before, and wherever a cut took
+        // the scan's reads out.
+        if *label != SCAN_FROM_UNIFORMS {
+            src = with_push_scan(device, src);
         }
         Some(Self::from_source(
             device,
@@ -1356,6 +1401,66 @@ impl BrushPipeline {
             BrushProbe::Read,
             Some(probe_layout),
         )
+    }
+
+    /// The scene readers' SPOTLESS TWINS -- [`Self::new_multisampled_probe_reader`]
+    /// and its sunless and baked classes, in that order -- with the spots'
+    /// shadow maps never read (`lights::without_spot_shadows`), for frames
+    /// where no spot casts. `Levers::spotless_shaders`.
+    pub fn new_spotless_probe_readers(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+    ) -> [Self; 3] {
+        let read = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+        let spotless = crate::renderer::lights::without_spot_shadows;
+        let build = |label: &str, source: String| {
+            Self::from_source(
+                device,
+                format,
+                uniform_layout,
+                FrontFace::Ccw,
+                samples,
+                None,
+                crate::renderer::multiview::ViewMode::Mono,
+                Some(probe_layout),
+                label,
+                spotless(source),
+            )
+        };
+        [
+            build("brush_pipeline_read_spotless", read.clone()),
+            build("brush_pipeline_read_sunless_spotless", sun_reader_shader(read.clone(), FaceSun::Never)),
+            build("brush_pipeline_read_baked_spotless", sun_reader_shader(read, FaceSun::Baked)),
+        ]
+    }
+
+    /// [`Self::new_multisampled_probe_reader`] for the brushes of one
+    /// [`FaceSun`] class: the same picture there, without the sun code those
+    /// faces can never run -- all of it (~350 instructions) where the sun
+    /// never reaches, the level's static sun map where the mask is baked
+    /// throughout. See [`SunFaces`].
+    pub fn new_multisampled_probe_reader_for(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        view: crate::renderer::multiview::ViewMode,
+        class: FaceSun,
+    ) -> Self {
+        let source = sun_reader_shader(
+            brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read),
+            class,
+        );
+        let label = match class {
+            FaceSun::Never => "brush_pipeline_read_sunless",
+            FaceSun::Baked => "brush_pipeline_read_baked",
+            FaceSun::Unbaked => "brush_pipeline_read",
+        };
+        Self::from_source(device, format, uniform_layout, FrontFace::Ccw, samples, None, view, Some(probe_layout), label, source)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1519,6 +1624,9 @@ impl BrushPipeline {
                 }
                 src = src.replacen(from, to, 1);
             }
+            if *label != SCAN_FROM_UNIFORMS {
+                src = with_push_scan(device, src);
+            }
             match missing {
                 Some(from) => log::warn!("register cut {label}: `{from}` is not in the shader"),
                 None => {
@@ -1554,6 +1662,10 @@ impl BrushPipeline {
     ) -> Self {
         // A probe-pass shader writes the reach too. See `probe_pass::targets`.
         let reaches = source.contains(probe_pass::OUTPUT_SIGNATURE);
+        // The probe pass that ships reads its photograph slots as push
+        // constants (`with_push_scan`), and declares them.
+        let reads_immediates = source.contains(IMMEDIATE_DECLARATION);
+        let immediate_size = if reads_immediates { crate::renderer::uniforms::PROBE_PUSH_SIZE as u32 } else { 0 };
         // Audited: see `shader_checks`.
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("brush_shader"),
@@ -1570,7 +1682,7 @@ impl BrushPipeline {
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("brush_layout"),
             bind_group_layouts: &layouts,
-            immediate_size: 0,
+            immediate_size,
         });
         let probe_pass_targets = probe_pass::targets(true);
         let plain_target = [Some(ColorTargetState { format, blend, write_mask: ColorWrites::ALL })];
@@ -1613,7 +1725,7 @@ impl BrushPipeline {
             multiview_mask: view.mask(),
             cache: None,
         });
-        Self { pipeline, material_layout, lightmap_layout }
+        Self { pipeline, material_layout, lightmap_layout, reads_immediates }
     }
 
     /// THE DEPTH PREPASS: the level's brushes drawn first in the scene pass,
@@ -1687,7 +1799,7 @@ impl BrushPipeline {
             multiview_mask: view.mask(),
             cache: None,
         });
-        Self { pipeline, material_layout, lightmap_layout }
+        Self { pipeline, material_layout, lightmap_layout, reads_immediates: false }
     }
 }
 
@@ -1843,9 +1955,304 @@ pub const SUN_MASK_DISTANCE_TEXELS: f32 = 4.0;
 /// holds the two together.
 pub const STATIONARY_MASK_DISTANCE_TEXELS: f32 = 4.0;
 
+/// WHAT THE SKY'S SUN CAN DO AT EACH BRUSH FACE, read off the baked sun mask
+/// (`XrRenderer::set_brush_lightmap`), so each face can be drawn with the
+/// smallest scene reader that gives it the same picture. See [`FaceSun`].
+///
+/// WHY: the scene reader sits at the Quest's instruction-cache cliff. At 3,387
+/// instructions it drew hall_front in 16.3 ms; at 3,398 -- ten ALU more, the
+/// same registers and occupancy -- in 18.6, the brush draw 35% slower
+/// (headset, 2026-10-01). The cliff is the size of the shader, not of the path
+/// a pixel takes: code a pixel skips still counts. So code goes out of the
+/// shader, for the faces where it can never run.
+///
+/// MEASURED (headset, 2026-10-01, synced GPU): the readers compile to 3,050
+/// instructions (sunless), 3,257 (baked) and 3,398 (full). With every face of
+/// the shipped level on the first two, hall_front went 18.70 -> 16.48 ms,
+/// hall_back 16.54 -> 14.76, hallway 17.10 -> 14.84, brick_hall 17.83 ->
+/// 14.89, torch_pillar 16.43 -> 14.38. The baked reader has ~130 instructions
+/// of room under the cliff: spend them knowingly.
+///
+/// EXACT, not approximate: a face's class rests on every mask texel its pixels
+/// can read -- its `uv2_rect`, plus [`SUN_MASK_READ_REACH`] for the bilinear
+/// taps at the deepest mip the mask's sampler allows -- in the mask as the GPU
+/// holds it, which is [`dilate_sun_mask`]'s.
+pub struct SunFaces {
+    /// Summed-area tables, `(width + 1) x (height + 1)`: of the mask texels the
+    /// sun may reach (anything but baked and hidden), and of the texels with no
+    /// bake.
+    reachable: Vec<u32>,
+    unbaked: Vec<u32>,
+    width: u32,
+    height: u32,
+}
+
+/// Which scene reader a brush face takes. See [`SunFaces`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceSun {
+    /// Every texel its pixels can read is baked (the baker's green >= 128,
+    /// which `pack_sun_mask_texel` turns into the shader's `sun_mask.g > 0.25`)
+    /// and fully hidden (red 0: a signed distance of -4 texels, at or past any
+    /// width the shader widens to -- the penumbra's at most 4, and `fwidth` of
+    /// a constant 0). There the shader's mask is exactly 0, the lamp pre-pass
+    /// culled every directional light, and the sun contributed exactly
+    /// nothing. Averaging such texels keeps both, so every mip of them is the
+    /// same. Drawn without the sun (`SKY_SUN_NEVER_REACHES`).
+    Never,
+    /// Every texel it can read is baked, so every read -- any blend of them, at
+    /// any mip -- has green above a half, `receiver_sun_mask` is never the -1
+    /// of "no bake", and the level's static sun map is never sampled. Drawn
+    /// without that lookup (`SUN_MASK_EVERYWHERE`).
+    Baked,
+    /// Anything else -- a face with no bake within reach. The full reader.
+    Unbaked,
+}
+
+/// Mask texels round a face's patch that its pixels' reads can touch: a
+/// bilinear read at the deepest level the sampler allows,
+/// `SUN_MASK_MIP_LEVELS - 1` = 4, spans 2x2 texels of 16 -- at most 24 mask
+/// texels either side of the sample, which stays inside the patch.
+pub const SUN_MASK_READ_REACH: u32 = 32;
+
+impl SunFaces {
+    /// From the mask as the GPU holds it -- [`dilate_sun_mask`]'s RGBA, before
+    /// `pack_sun_mask_texel`; `None` for one that does not hold
+    /// `width x height` texels.
+    pub fn from_mask(rgba: &[u8], width: u32, height: u32) -> Option<Self> {
+        let (w, h) = (width as usize, height as usize);
+        if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+            return None;
+        }
+        let mut reachable = vec![0u32; (w + 1) * (h + 1)];
+        let mut unbaked = vec![0u32; (w + 1) * (h + 1)];
+        for y in 0..h {
+            let (mut reach_row, mut unbaked_row) = (0u32, 0u32);
+            for x in 0..w {
+                let t = &rgba[(y * w + x) * 4..(y * w + x) * 4 + 2];
+                let baked = t[1] >= 128;
+                reach_row += u32::from(!(baked && t[0] == 0));
+                unbaked_row += u32::from(!baked);
+                let (above, here) = (y * (w + 1) + x + 1, (y + 1) * (w + 1) + x + 1);
+                reachable[here] = reachable[above] + reach_row;
+                unbaked[here] = unbaked[above] + unbaked_row;
+            }
+        }
+        Some(Self { reachable, unbaked, width, height })
+    }
+
+    /// The class of the face whose patch is `uv2_rect` (atlas uv: min u, min v,
+    /// max u, max v).
+    pub fn class_of(&self, uv2_rect: [f32; 4]) -> FaceSun {
+        if !uv2_rect.iter().all(|c| c.is_finite()) {
+            return FaceSun::Unbaked;
+        }
+        let (w, h) = (i64::from(self.width), i64::from(self.height));
+        let border = i64::from(SUN_MASK_READ_REACH);
+        let x0 = ((uv2_rect[0] * w as f32).floor() as i64 - border).clamp(0, w);
+        let y0 = ((uv2_rect[1] * h as f32).floor() as i64 - border).clamp(0, h);
+        let x1 = ((uv2_rect[2] * w as f32).ceil() as i64 + border).clamp(0, w);
+        let y1 = ((uv2_rect[3] * h as f32).ceil() as i64 + border).clamp(0, h);
+        if x1 <= x0 || y1 <= y0 {
+            return FaceSun::Unbaked;
+        }
+        let sum = |t: &[u32]| {
+            let at = |x: i64, y: i64| i64::from(t[(y * (w + 1) + x) as usize]);
+            at(x1, y1) - at(x0, y1) - at(x1, y0) + at(x0, y0)
+        };
+        if sum(&self.reachable) == 0 {
+            FaceSun::Never
+        } else if sum(&self.unbaked) == 0 {
+            FaceSun::Baked
+        } else {
+            FaceSun::Unbaked
+        }
+    }
+
+    /// `indices` (triangles of `vertices`) reordered by class -- the faces the
+    /// sun never reaches, then the baked ones, then the rest, each in its own
+    /// order -- with where the first two parts end.
+    pub fn partition(&self, vertices: &[BrushVertex], indices: &[u32]) -> (Vec<u32>, [u32; 2]) {
+        let mut parts: [Vec<u32>; 3] = [Vec::with_capacity(indices.len()), Vec::new(), Vec::new()];
+        // The faces' triangles arrive together; one table read a face.
+        let mut last: Option<([f32; 4], FaceSun)> = None;
+        for tri in indices.chunks_exact(3) {
+            let rect = vertices.get(tri[0] as usize).map_or([f32::NAN; 4], |v| v.uv2_rect);
+            let class = match last {
+                Some((r, c)) if r == rect => c,
+                _ => {
+                    let c = self.class_of(rect);
+                    last = Some((rect, c));
+                    c
+                }
+            };
+            parts[class as usize].extend_from_slice(tri);
+        }
+        let [mut out, baked, rest] = parts;
+        let never_end = out.len() as u32;
+        out.extend_from_slice(&baked);
+        let baked_end = out.len() as u32;
+        out.extend_from_slice(&rest);
+        (out, [never_end, baked_end])
+    }
+}
+
+/// THE BRUSH SUN MASK WITH THE ATLAS'S EMPTY TEXELS FILLED from the charts
+/// beside them, out to [`SUN_MASK_READ_REACH`]: each takes the texel of the
+/// nearest baked one along its row, else along its column from those.
+///
+/// The empty atlas holds zeros -- "no bake" -- and a read near a chart packed
+/// beside it blends them in once it is deep enough in the mips: the chart's
+/// sun fades toward hidden, and where its green falls under a half the read
+/// stops counting as baked and the sun drops to the level's static map. Filled
+/// from the chart, the read stays the chart's own, as a chart's gutter keeps
+/// it at shallower levels. And it is what lets every face of a baked level be
+/// [`FaceSun::Baked`] or better: unfilled, the empty atlas lay within reach of
+/// nearly every chart, and 97% of the shipped level's brush area kept the full
+/// reader; filled, none -- 40% never reached, 60% baked (the shipped-level
+/// test in `quest_app::brush_render`).
+pub fn dilate_sun_mask(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let mut px = rgba.to_vec();
+    if w == 0 || h == 0 || px.len() < w * h * 4 {
+        return px;
+    }
+    let reach = SUN_MASK_READ_REACH as usize;
+    let filled = |px: &[u8], i: usize| px[i * 4 + 1] >= 128;
+    // ROWS: the nearer of the nearest baked texels left and right, found
+    // before any of the row is written.
+    let mut left = vec![usize::MAX; w];
+    let mut sources = Vec::new();
+    for y in 0..h {
+        let row = y * w;
+        let mut last = usize::MAX;
+        for x in 0..w {
+            if filled(&px, row + x) {
+                last = x;
+            }
+            left[x] = last;
+        }
+        let mut next = usize::MAX;
+        sources.clear();
+        for x in (0..w).rev() {
+            if filled(&px, row + x) {
+                next = x;
+                continue;
+            }
+            let from_left = (left[x] != usize::MAX).then(|| x - left[x]);
+            let from_right = (next != usize::MAX).then(|| next - x);
+            let source = match (from_left, from_right) {
+                (Some(l), Some(r)) if l <= r => Some((l, left[x])),
+                (_, Some(r)) => Some((r, next)),
+                (Some(l), None) => Some((l, left[x])),
+                (None, None) => None,
+            };
+            if let Some((_, s)) = source.filter(|(d, _)| *d <= reach) {
+                sources.push((x, s));
+            }
+        }
+        for &(x, s) in &sources {
+            px.copy_within((row + s) * 4..(row + s) * 4 + 4, (row + x) * 4);
+        }
+    }
+    // COLUMNS, from what the rows left, walked row by row so memory is read in
+    // order: the nearest filled texel above on the way down, below on the way
+    // up. Only unfilled texels are written, and every source is a filled one,
+    // so no texel is read after it changes.
+    let mut above = vec![u8::MAX; w * h];
+    let mut last = vec![usize::MAX; w];
+    for y in 0..h {
+        for x in 0..w {
+            if filled(&px, y * w + x) {
+                last[x] = y;
+            }
+            if last[x] != usize::MAX {
+                above[y * w + x] = (y - last[x]).min(usize::from(u8::MAX)) as u8;
+            }
+        }
+    }
+    let mut below = vec![usize::MAX; w];
+    for y in (0..h).rev() {
+        for x in 0..w {
+            let i = y * w + x;
+            if filled(&px, i) {
+                below[x] = y;
+                continue;
+            }
+            let up = usize::from(above[i]);
+            let down = if below[x] == usize::MAX { usize::MAX } else { below[x] - y };
+            let source_row = if up <= down && up <= reach {
+                y - up
+            } else if down <= reach {
+                y + down
+            } else {
+                continue;
+            };
+            let s = source_row * w + x;
+            px.copy_within(s * 4..s * 4 + 4, i * 4);
+        }
+    }
+    px
+}
+
+/// The scene reader's source for the faces of one [`FaceSun`] class: the full
+/// reader with its sun switch for that class set. See [`SunFaces`].
+pub(crate) fn sun_reader_shader(source: String, class: FaceSun) -> String {
+    let switch = match class {
+        FaceSun::Never => "SKY_SUN_NEVER_REACHES",
+        FaceSun::Baked => "SUN_MASK_EVERYWHERE",
+        FaceSun::Unbaked => return source,
+    };
+    let off = format!("const {switch}: bool = false;");
+    assert_eq!(source.matches(off.as_str()).count(), 1, "the lights block's {switch} switch moved");
+    source.replacen(&off, &format!("const {switch}: bool = true;"), 1)
+}
+
 fn brush_shader_with(ssr: bool) -> String {
     brush_shader_variant(ssr, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG)
 }
+
+/// The photograph slots declared as push constants, in place of
+/// `PROBE_MAX_SLOTS`'s line and after it. A pipeline whose shader holds it is
+/// laid out with `uniforms::PROBE_PUSH_SIZE` bytes of them (`from_source`), and
+/// its pass sets them (`render_frame`, `UniformBuffer::probe_push`).
+const IMMEDIATE_DECLARATION: &str =
+    "const PROBE_MAX_SLOTS: i32 = 16;\nvar<immediate> probe_push: array<vec4<f32>, 16>;\n";
+
+/// THE PROBE PASS'S SCAN READING PUSH CONSTANTS: `lights::probe_nearest_two`'s
+/// two reads of each slot taken from `probe_push` -- sixteen `vec4` of centre
+/// and room, the same bytes the camera block holds there, so the same slots,
+/// order and picture. No uniform block reached constant memory in this shader,
+/// whatever its size or indexing (exp63); push constants live there by
+/// definition. exp64, hall_front: render 2.20 -> 1.84 ms an eye, against
+/// 1.60 with no choice made at all.
+const PUSH_SCAN: [(&str, &str); 2] = [
+    ("const PROBE_MAX_SLOTS: i32 = 16;\n", IMMEDIATE_DECLARATION),
+    (
+        "        let room = camera.probe_boxes[i * 3 + 2].w;\n        let v = camera.probe_boxes[i * 3].xyz - p;",
+        "        let room = probe_push[i].w;\n        let v = probe_push[i].xyz - p;",
+    ),
+];
+
+/// `src` with [`PUSH_SCAN`], or `None` when it does not hold the scan's reads.
+fn push_scan(src: &str) -> Option<String> {
+    if !PUSH_SCAN.iter().all(|(from, _)| src.contains(from)) {
+        return None;
+    }
+    Some(PUSH_SCAN.iter().fold(src.to_string(), |s, (from, to)| s.replacen(from, to, 1)))
+}
+
+/// `src` reading its slots as push constants where `device` has them, and
+/// unchanged otherwise.
+fn with_push_scan(device: &Device, src: String) -> String {
+    if !device.features().contains(wgpu::Features::IMMEDIATES) {
+        return src;
+    }
+    push_scan(&src).unwrap_or(src)
+}
+
+/// The deferred cut that reads the slots from the camera block, as the probe
+/// pass did until 2026-10-02: the push constants' price.
+const SCAN_FROM_UNIFORMS: &str = "def_scan_uniform";
 
 /// The brush shader with each diagnostic chosen by the caller.
 ///
@@ -1889,7 +2296,44 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ),
     (
         "def_cut_record",
-        &[("            slot = probe_fixup_begin(hit, world_pos, d, dir, roughness, probe_lod, trace_room);", "            slot = -1;")],
+        &[("            slot = probe_fixup_begin(hit, world_pos, d, dir, roughness, probe_lod, trace_room, recolour);", "            slot = -1;")],
+    ),
+    // No beam's light on a lit surface in the pass's colours: what it costs
+    // the pass by its presence. See `lights::probe_surface_relit`.
+    (
+        "def_cut_relight",
+        &[(crate::renderer::lights::SURFACE_RELIT_READ, ""), (crate::renderer::lights::SURFACE_RELIT_CALL, "")],
+    ),
+    // The model cards' colour back in the pass, as before 2026-10-01 (the
+    // fix-up still colours those hits again, so the picture is the same): what
+    // the cards cost the pass by their presence. See `lights::probe_hit_carded`.
+    ("def_cards_in_pass", &[("    if (model && !PROBE_SECONDARY_DEFERRED) {", "    if (model) {")]),
+    // ROLLED LOOPS: each fixed-count loop's bound made one the compiler cannot
+    // see through (a uniform that is never that large), so it cannot unroll
+    // it -- does the trace's size come from copies of its loop bodies? The
+    // room hops (3), a proxy's surface samples (5) and the field walk (32),
+    // the ground march (64 steps, 5 readings). Same picture.
+    ("def_rolled_trace", &[(ROLL_TRACE_FROM, ROLL_TRACE_TO)]),
+    ("def_rolled_proxy", &[(ROLL_SAMPLES_FROM, ROLL_SAMPLES_TO), (ROLL_FIELD_FROM, ROLL_FIELD_TO)]),
+    ("def_rolled_ground", &[(ROLL_GROUND_FROM, ROLL_GROUND_TO), (ROLL_READINGS_FROM, ROLL_READINGS_TO)]),
+    (
+        "def_rolled_all",
+        &[
+            (ROLL_TRACE_FROM, ROLL_TRACE_TO),
+            (ROLL_SAMPLES_FROM, ROLL_SAMPLES_TO),
+            (ROLL_FIELD_FROM, ROLL_FIELD_TO),
+            (ROLL_GROUND_FROM, ROLL_GROUND_TO),
+            (ROLL_READINGS_FROM, ROLL_READINGS_TO),
+        ],
+    ),
+    // ...and the pass exactly as it was: no hit on cards recorded for the fix-up
+    // but those `PROBE_RETEST` marks. The picture before, to compare against.
+    (
+        "def_cards_before",
+        &[
+            ("    if (model && !PROBE_SECONDARY_DEFERRED) {", "    if (model) {"),
+            ("        let recolour = PROBE_SECONDARY_DEFERRED && probe_hit_carded(hit);", "        let recolour = false;"),
+        ],
     ),
     ("def_cut_proxy_surface", &[("    if (s0 < 0) {\n        return 3.4e38;\n    }", "    if (true) {\n        return 3.4e38;\n    }")]),
     ("def_cut_escape_colour", &[("    if (h.escaped) {\n        col = probe_escape_colour(", "    if (false) {\n        col = probe_escape_colour(")]),
@@ -1919,7 +2363,336 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             "    return ProbePassOut(reflection, vec2<f32>(0.0, probe_face_code(n_geom)));",
         )],
     ),
+    // THE STAGES' SIZES, to split the pass along (2026-10-01: it misses the
+    // instruction cache three times as often as the scene reader over its
+    // cliff). The trace replaced by a hit read from a uniform, so nothing
+    // after it folds away; the hit's colour by its own fields; everything
+    // after the material reads by them.
+    ("def_cut_trace", &[("    let hit = probe_trace(world_pos, d, trace_room, roughness);", STAGE_CUT_HIT)]),
+    (
+        "def_cut_colour",
+        &[(
+            "        let col = probe_traced_colour(hit, d, roughness, dir, probe_lod);",
+            "        let col = vec4<f32>(hit.pos * hit.t, hit.room + hit.other);",
+        )],
+    ),
+    (
+        "def_cut_trace_colour",
+        &[
+            ("    let hit = probe_trace(world_pos, d, trace_room, roughness);", STAGE_CUT_HIT),
+            (
+                "        let col = probe_traced_colour(hit, d, roughness, dir, probe_lod);",
+                "        let col = vec4<f32>(hit.pos * hit.t, hit.room + hit.other);",
+            ),
+        ],
+    ),
+    (
+        "def_cut_all_but_preamble",
+        &[(
+            "    let reflection = probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);",
+            "    let reflection = vec4<f32>(face_pos * rough_aa, ao + baked.a + dot(baked.rgb, n));",
+        )],
+    ),
+    // THE HIT'S PHOTOGRAPHS READ IN TURN, as before 2026-10-01: the second's
+    // depth inside its branch, each colour after the weights that keep it.
+    // The same picture; what reading them together saves. See
+    // `lights::probe_hit_colour`.
+    (
+        "def_hit_serial",
+        &[
+            ("    let depth1 = textureSampleLevel(probe_depth, probe_depth_samp, v1, i32(b1.w), 0.0);\n", ""),
+            ("        c1 = probe_clearance_of(depth1, v1);", "        c1 = probe_clearance(s1, h);"),
+            (
+                "    let col0 = textureSampleLevel(probe_cube, probe_samp, v0, i32(b0.w), lod0);\n    let col1 = textureSampleLevel(probe_cube, probe_samp, v1, i32(b1.w), lod1);\n",
+                "",
+            ),
+            (
+                "    var col = col0 * w0;\n    if (w1 > 0.0) {\n        col += col1 * w1;\n    }",
+                "    var col = textureSampleLevel(probe_cube, probe_samp, v0, i32(b0.w), lod0) * w0;\n    if (w1 > 0.0) {\n        col += textureSampleLevel(probe_cube, probe_samp, v1, i32(b1.w), lod1) * w1;\n    }",
+            ),
+        ],
+    ),
+    // THE HIT'S PHOTOGRAPHS CHOSEN BY WALKING the two rooms' chains, as before
+    // 2026-10-01, in place of `lights::probe_nearest_two`'s fixed scan: the
+    // same two, so the same picture; what the walk's dependent reads cost.
+    (
+        "def_hit_walk",
+        &[(
+            "    let near = probe_nearest_two(h, room, other);
+    let s0 = near.s0;
+    let s1 = near.s1;
+    let d0 = near.d0;
+    let d1 = near.d1;",
+            "    var s0 = -1;
+    var s1 = -1;
+    var d0 = 3.4e38;
+    var d1 = 3.4e38;
+    var next_a = probe_room_slot(room);
+    var next_b = select(-1, probe_room_slot(other), other != room);
+    loop {
+        if (next_a < 0 && next_b < 0) {
+            break;
+        }
+        var i = next_a;
+        if (next_b >= 0 && (next_a < 0 || next_b < next_a)) {
+            i = next_b;
+            next_b = probe_slot_next(next_b);
+        } else {
+            next_a = probe_slot_next(next_a);
+        }
+        let v = camera.probe_boxes[i * 3].xyz - h;
+        let dd = dot(v, v);
+        if (dd < d0) {
+            s1 = s0;
+            d1 = d0;
+            s0 = i;
+            d0 = dd;
+        } else if (dd < d1) {
+            s1 = i;
+            d1 = dd;
+        }
+    }",
+        )],
+    ),
+    // THE HIT'S SCAN WRITTEN OUT, one block a slot, as shipped for a day: the
+    // same two photographs, so the same picture; whether the loop still wins.
+    (
+        "def_scan_unrolled",
+        &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_unrolled(h, room, other);")],
+    ),
+    // THE SCAN FROM A UNIFORM BLOCK OF ITS OWN (`lights::probe_select`): the
+    // same bytes bound twice, so the same picture; whether the driver keeps a
+    // small block read only at counted indices in constant memory.
+    (
+        "def_scan_const",
+        &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_const(h, room, other);")],
+    ),
+    // The same block, read written out, at fixed places.
+    (
+        "def_scan_const_unrolled",
+        &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_const_unrolled(h, room, other);")],
+    ),
+    // THE SLOTS FROM THE CAMERA BLOCK, as before 2026-10-02, in place of the
+    // push constants that ship (`PUSH_SCAN`): what they buy.
+    (SCAN_FROM_UNIFORMS, &[]),
+    // THE SCAN'S READS, priced: the same loop and comparisons over made-up
+    // rooms and capture points, so no table is read. Not the same picture;
+    // what is left is what the choice costs with its data in registers.
+    (
+        "def_scan_noload",
+        &[(
+            "        let room = camera.probe_boxes[i * 3 + 2].w;\n        let v = camera.probe_boxes[i * 3].xyz - p;",
+            "        let room = a;\n        let v = vec3<f32>(f32(i)) - p;",
+        )],
+    ),
+    // THE SCAN WITHOUT ITS STOP: all sixteen slots, those past the live count
+    // given a room no pixel is in. The same picture; whether a loop with no
+    // exit is scheduled better than one with a uniform one.
+    (
+        "def_scan_flat",
+        &[(
+            "        if (i >= count) {\n            break;\n        }\n        let room = camera.probe_boxes[i * 3 + 2].w;",
+            "        let room = select(-2.0, camera.probe_boxes[i * 3 + 2].w, i < count);",
+        )],
+    ),
+    // THE LOBE WIDENED FROM THE SHADING NORMAL'S DERIVATIVES again, as before
+    // 2026-10-01 (jitter plan, row 8): what the sharper reflections cost.
+    (
+        "def_rough_shading_n",
+        &[(
+            "    let rough_aa = specular_aa_roughness(rough, dpdx(n_geom), dpdy(n_geom));",
+            "    let rough_aa = specular_aa_roughness(rough, dpdx(n), dpdy(n));",
+        )],
+    ),
+    // THE CHOICE OF PHOTOGRAPHS, priced: the hit room's first two in place of
+    // the nearest two of both rooms'. Not the same picture.
+    (
+        "def_cut_slot_walk",
+        &[(
+            "    let near = probe_nearest_two(h, room, other);",
+            "    var near: ProbeNearest;
+    near.s0 = probe_room_slot(room);
+    near.s1 = select(-1, probe_slot_next(near.s0), near.s0 >= 0);
+    let cut_v0 = camera.probe_boxes[near.s0 * 3].xyz - h;
+    let cut_v1 = camera.probe_boxes[max(near.s1, 0) * 3].xyz - h;
+    near.d0 = dot(cut_v0, cut_v0);
+    near.d1 = select(3.4e38, dot(cut_v1, cut_v1), near.s1 >= 0);",
+        )],
+    ),
+    // THE HIT'S TWO DEPTH READS, priced: texels that vouch for the point
+    // exactly. Close to the same picture where the photographs saw the hit.
+    (
+        "def_cut_hit_depth",
+        &[(
+            "    let depth0 = textureSampleLevel(probe_depth, probe_depth_samp, v0, i32(b0.w), 0.0);\n    let depth1 = textureSampleLevel(probe_depth, probe_depth_samp, v1, i32(b1.w), 0.0);",
+            "    let depth0 = vec4<f32>(-normalize(v0), -length(v0));\n    let depth1 = vec4<f32>(-normalize(v1), -length(v1));",
+        )],
+    ),
+    // B2 (2026-10-06): WHAT RIDES THROUGH THE TRACE, held for after it. The
+    // face's code taken before the trace, so its normal is let go first: the
+    // same code.
+    ("def_face_code_early", &[B2_FACE_CODE]),
+    // The reflected ray in the player's frame made again from the world's
+    // after the trace -- for the record, the colour and the capsules -- so
+    // only the world's rides through it: the same ray, to rounding.
+    ("def_dir_from_d", &[B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR]),
+    ("def_dir_and_code", &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR]),
+    // The characters and the record both gone: whether their two 26s (each
+    // alone) make the 24 of the next step. Not the same picture.
+    ("def_cut_characters_record", &[B2_NO_CHARACTERS, B2_NO_RECORD]),
+    // The light the capsules are lit by held as one grey through the trace,
+    // not a colour: what the colour costs. Not the same picture.
+    ("def_lit_grey", &[B2_LIT_GREY, B2_CAPSULE_GREY]),
+    ("def_dir_code_grey", &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR_GREY, B2_LIT_GREY]),
+    // The reflection's blur level worked out after the trace, from the
+    // roughness the trace holds anyway: the same level.
+    ("def_lod_late", &[B2_LOD_EARLY, B2_LOD_LATE]),
+    ("def_dir_code_lod", &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE]),
+    // The texel the record and the floor mirror name, its x and y packed in one
+    // word through the trace: the same texel.
+    ("def_fragment_packed", &[B2_FRAG_DECL, B2_FRAG_SET, B2_FRAG_MIRROR, B2_FRAG_RECORD]),
+    (
+        "def_b2_lossless",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_FRAG_DECL, B2_FRAG_SET, B2_FRAG_MIRROR, B2_FRAG_RECORD,
+        ],
+    ),
+    // The face centre's world position, which only a miss uses after the
+    // trace (`probe_choose`), worked out again there from the face centre
+    // instead of held through it: the same position.
+    (
+        "def_dlc_volume_late",
+        &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_VOLUME_LATE],
+    ),
+    // MEASUREMENT ONLY: a miss choosing its photographs at the surface, not
+    // the face centre -- whether that held position is in the peak at all.
+    (
+        "def_dlc_miss_at_hit",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_MISS_CHOICE_AT_HIT, B2_MISS_PORTALS_AT_HIT,
+        ],
+    ),
 ];
+
+// The edits of B2's cuts, above.
+const B2_FACE_CODE: (&str, &str) = (
+    "    let reflection = probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);\n    return ProbePassOut(reflection, vec2<f32>(probe_reach, probe_face_code(n_geom)));",
+    "    let face_code = probe_face_code(n_geom);\n    let reflection = probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);\n    return ProbePassOut(reflection, vec2<f32>(probe_reach, face_code));",
+);
+const B2_RAY_DECL: (&str, &str) = (
+    "var<private> probe_capsule_lit: vec3<f32> = vec3<f32>(0.0);\n",
+    "var<private> probe_capsule_lit: vec3<f32> = vec3<f32>(0.0);\nvar<private> probe_ray_world: vec3<f32> = vec3<f32>(0.0);\n",
+);
+const B2_RAY_SET: (&str, &str) = ("    let d = normalize(world_dir);\n", "    let d = normalize(world_dir);\n    probe_ray_world = d;\n");
+const B2_RECORD_DIR: (&str, &str) = (
+    "            slot = probe_fixup_begin(hit, world_pos, d, dir, roughness, probe_lod, trace_room, recolour);",
+    "            slot = probe_fixup_begin(hit, world_pos, d, to_player_direction(d), roughness, probe_lod, trace_room, recolour);",
+);
+const B2_COLOUR_DIR: (&str, &str) = (
+    "        let col = probe_traced_colour(hit, d, roughness, dir, probe_lod);",
+    "        let col = probe_traced_colour(hit, d, roughness, to_player_direction(d), probe_lod);",
+);
+const B2_CAPSULE_DIR: (&str, &str) = (
+    "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, refl, roughness, env, probe);\n    }",
+    "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, to_player_direction(probe_ray_world), roughness, env, probe);\n    }",
+);
+const B2_NO_CHARACTERS: (&str, &str) = (
+    "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, refl, roughness, env, probe);\n    }",
+    "",
+);
+const B2_NO_RECORD: (&str, &str) = (
+    "            slot = probe_fixup_begin(hit, world_pos, d, dir, roughness, probe_lod, trace_room, recolour);",
+    "            slot = -1;",
+);
+const B2_LIT_GREY: (&str, &str) = ("    probe_capsule_lit = env;\n", "    probe_capsule_lit = vec3<f32>(ambient_here);\n");
+const B2_FRAG_DECL: (&str, &str) = (
+    "var<private> probe_fragment: vec4<f32> = vec4<f32>(0.0);",
+    "var<private> probe_fragment_texel: u32 = 0u;\nvar<private> probe_fragment_z: f32 = 0.0;",
+);
+const B2_FRAG_SET: (&str, &str) = (
+    "    probe_fragment = in.clip;\n",
+    "    probe_fragment_texel = u32(in.clip.x) | (u32(in.clip.y) << 16u);\n    probe_fragment_z = in.clip.z;\n",
+);
+const B2_FRAG_MIRROR: (&str, &str) = (
+    "vec2<i32>(probe_fragment.xy), probe_fragment.z,",
+    "vec2<i32>(vec2<u32>(probe_fragment_texel & 0xFFFFu, probe_fragment_texel >> 16u)), probe_fragment_z,",
+);
+const B2_FRAG_RECORD: (&str, &str) = (
+    "vec4<u32>(vec2<u32>(probe_fragment.xy), bitcast<u32>(probe_fragment.z), select(0u, 1u, recolour))",
+    "vec4<u32>(probe_fragment_texel & 0xFFFFu, probe_fragment_texel >> 16u, bitcast<u32>(probe_fragment_z), select(0u, 1u, recolour))",
+);
+const B2_LOD_EARLY: (&str, &str) = ("    let probe_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);\n", "");
+const B2_VOLUME_LATE: (&str, &str) = (
+    "    let choice = probe_choose(select_world, volume_world);\n",
+    "    let choice = probe_choose(select_world, select(select_world, to_world_space(probe_volume_pos.xyz), probe_volume_pos.w > 0.5));\n",
+);
+const B2_MISS_CHOICE_AT_HIT: (&str, &str) =
+    ("    let choice = probe_choose(select_world, volume_world);\n", "    let choice = probe_choose(world_pos, world_pos);\n");
+const B2_MISS_PORTALS_AT_HIT: (&str, &str) = (
+    "    return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);",
+    "    return probe_through_portals(own, own_room, world_pos, world_pos, d, probe_lod);",
+);
+const B2_LOD_LATE: (&str, &str) = (
+    "    let hit = probe_trace(world_pos, d, trace_room, roughness);\n",
+    "    let hit = probe_trace(world_pos, d, trace_room, roughness);\n    let probe_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);\n",
+);
+const B2_CAPSULE_GREY: (&str, &str) = (
+    "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, refl, roughness, env, probe);\n    }",
+    "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, refl, roughness, probe_capsule_lit, probe);\n    }",
+);
+const B2_CAPSULE_DIR_GREY: (&str, &str) = (
+    "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, refl, roughness, env, probe);\n    }",
+    "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, to_player_direction(probe_ray_world), roughness, probe_capsule_lit, probe);\n    }",
+);
+/// The fixed-count loops of the probe pass, and each with its bound hidden
+/// from the compiler: `post_params.z` is never past 3e38, so the count is the
+/// same. See `def_rolled_all`.
+const ROLL_TRACE_FROM: &str = "    for (var hop = 0; hop < PROBE_TRACE_ROOMS; hop = hop + 1) {";
+const ROLL_TRACE_TO: &str =
+    "    for (var hop = 0; hop < PROBE_TRACE_ROOMS + i32(camera.post_params.z > 3.0e38); hop = hop + 1) {";
+const ROLL_SAMPLES_FROM: &str = "    for (var k = 0; k <= PROBE_PROXY_SAMPLES; k = k + 1) {";
+const ROLL_SAMPLES_TO: &str =
+    "    for (var k = 0; k <= PROBE_PROXY_SAMPLES + i32(camera.post_params.z > 3.0e38); k = k + 1) {";
+const ROLL_FIELD_FROM: &str = "    for (var k = 0; k < PROXY_FIELD_STEPS && t <= t_out; k = k + 1) {";
+const ROLL_FIELD_TO: &str =
+    "    for (var k = 0; k < PROXY_FIELD_STEPS + i32(camera.post_params.z > 3.0e38) && t <= t_out; k = k + 1) {";
+const ROLL_GROUND_FROM: &str = "    for (var steps = 0; steps < GROUND_TRACE_MAX_STEPS && t < t_out; steps = steps + 1) {";
+const ROLL_GROUND_TO: &str = "    for (var steps = 0; steps < GROUND_TRACE_MAX_STEPS + i32(camera.post_params.z > 3.0e38) && t < t_out; steps = steps + 1) {";
+const ROLL_READINGS_FROM: &str = "            for (var k = 1; k < GROUND_TRACE_READINGS; k = k + 1) {";
+const ROLL_READINGS_TO: &str =
+    "            for (var k = 1; k < GROUND_TRACE_READINGS + i32(camera.post_params.z > 3.0e38); k = k + 1) {";
+
+/// `def_cut_trace`'s hit: every field from a uniform the compiler cannot see
+/// through, so the code that reads it all stays.
+const STAGE_CUT_HIT: &str = "    var hit: ProbeHit;
+    hit.pos = world_pos + d * camera.post_params.z;
+    hit.room = trace_room;
+    hit.other = camera.post_params.w - 2.0;
+    hit.found = camera.post_params.z > 0.5;
+    hit.escaped = camera.post_params.w > 0.5;
+    hit.portal = i32(camera.post_params.w);
+    hit.t = camera.post_params.z;
+    hit.origin = world_pos;
+    hit.rim = camera.post_params.z - 1.0;
+    hit.rim_t = camera.post_params.z;
+    hit.rim_code = i32(camera.post_params.z * 100.0);
+    hit.edge_cover = camera.post_params.w;
+    hit.edge_t = camera.post_params.z;
+    hit.edge_code = i32(camera.post_params.w * 100.0) - 1;";
+
+/// The spots' tent counted to `shadow_params.w` where that is set, nine taps
+/// where it is not (as uploaded): see `scene_tent_opaque`.
+const SHADOW_TENT_OPAQUE: (&str, &str) = (
+    "    for (var t = 0; t < 9; t = t + 1) {\n        let x = pcf_tent_tap_axis(",
+    "    for (var t = 0; t < select(9, i32(camera.shadow_params.w), camera.shadow_params.w > 0.5); t = t + 1) {\n        let x = pcf_tent_tap_axis(",
+);
+/// A 3x3 box's outer loop likewise: see `scene_box_opaque`.
+const SHADOW_BOX_OPAQUE: (&str, &str) = (
+    "    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {",
+    "    for (var dx: i32 = -1; dx <= select(1, i32(camera.shadow_params.w), camera.shadow_params.w > 0.5); dx = dx + 1) {",
+);
 
 /// MEASUREMENT ONLY: the scene pass's brush shader (the one reading the probe
 /// pass) with one part cut out at a time -- see
@@ -1947,25 +2720,33 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "scene_cut_lamp_spec",
         &[(
-            "    if (aa.y > 0.0 && atten > 0.0) {\n        let h = normalize(l_dir + view_dir);\n        let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;\n        out.specular",
+            "    if (aa.y > 0.0 && atten > 0.0 && l.params.w > -1.5) {\n        let h = normalize(l_dir + view_dir);\n        let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;\n        out.specular",
             "    if (false) {\n        let h = normalize(l_dir + view_dir);\n        let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;\n        out.specular",
         )],
     ),
-    (
-        "scene_cut_spot_shadow",
-        &[(
-            "        if (layer >= 0 && f32(layer) < camera.shadow_params.y) {\n            shadow = shadow * pcf_layer(",
-            "        if (false) {\n            shadow = shadow * pcf_layer(",
-        )],
-    ),
+    // THE SPOTS' SHADOWS, all of them: the spotless twin
+    // (`lights::without_spot_shadows`). Until 2026-10-02 this cut edited the
+    // first match of the spot test's line -- in `light_debug`, which the
+    // reader never calls -- and so measured nothing.
+    ("scene_cut_spot_shadow", &[("const SPOT_SHADOWS: bool = true;", "const SPOT_SHADOWS: bool = false;")]),
+    // The spots' tent and the 3x3 boxes counted to a uniform the compiler
+    // cannot see -- `shadow_params.w`, 0 as uploaded, reading as the constant
+    // -- so it cannot write the loops out: whether they were, and what it
+    // cost the readers' size. The same taps and the same shadows. Measured
+    // (deploy112): 66, 23 and 89 instructions MORE than the full reader's
+    // 3,688. Counted to a constant they are the smaller code; the spots'
+    // shadow code is 286 instructions either way (`scene_cut_spot_shadow`).
+    ("scene_tent_opaque", &[SHADOW_TENT_OPAQUE]),
+    ("scene_box_opaque", &[SHADOW_BOX_OPAQUE, SHADOW_BOX_OPAQUE]),
+    ("scene_shadow_loops_opaque", &[SHADOW_TENT_OPAQUE, SHADOW_BOX_OPAQUE, SHADOW_BOX_OPAQUE]),
     (
         "scene_cut_sun_shadow",
-        &[("        if (l.params.z > 1.5) {\n            shadow = sun_visibility(l, world_pos);", "        if (false) {\n            shadow = sun_visibility(l, world_pos);")],
+        &[("        if (!SKY_SUN_NEVER_REACHES && l.params.z > 1.5) {\n            shadow = sun_visibility(l, world_pos);", "        if (false) {\n            shadow = sun_visibility(l, world_pos);")],
     ),
     (
         "scene_cut_spot_cone",
         &[(
-            "            let cos_angle = dot(-l_dir, l.direction.xyz);\n            atten = atten * spot_cone(cos_angle, cos_outer, cos_inner, dist);\n        }\n    }\n\n    let aa = terminator_aa(dot(n, l_dir));\n    let ndotl = aa.x;\n    let radiance = l.color_intensity.rgb * l.color_intensity.a;\n    out.diffuse",
+            "            let cos_angle = dot(-l_dir, l.direction.xyz);\n            atten = atten * spot_cone(cos_angle, cos_outer, cos_inner, dist, spot_cone_across(l.direction.xyz, l_dir, cos_angle, dist, n, view_dir));\n        }\n    }\n\n    let aa = terminator_aa(dot(n, l_dir));\n    let ndotl = aa.x;\n    let radiance = l.color_intensity.rgb * l.color_intensity.a;\n    out.diffuse",
             "            let cos_angle = dot(-l_dir, l.direction.xyz);\n        }\n    }\n\n    let aa = terminator_aa(dot(n, l_dir));\n    let ndotl = aa.x;\n    let radiance = l.color_intensity.rgb * l.color_intensity.a;\n    out.diffuse",
         )],
     ),
@@ -1985,6 +2766,24 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ),
     ("scene_cut_terminator_aa", &[("    terminator_width = terminator_width_of(length(tn));", "")]),
     ("scene_cut_contact", &[("    let contact = capsule_ambient(world_pos, n);", "    let contact = 1.0;")]),
+    // THE SPOTS' SHADOWS WITH THE BOX they had before 2026-10-01, in place of
+    // the tent (`lights::pcf_tile_tent_at`): the same nine taps. Against
+    // `scene_cut_none`, both the full reader.
+    ("scene_box_spots", &[("    return pcf_tile_tent_lean_at(\n        tex,", "    return pcf_tile_at(\n        tex,")]),
+    // THE TENT WRITTEN OUT (`lights::pcf_tile_tent_unrolled_at`), as it
+    // shipped for a day: the same taps, weights and picture in more code.
+    ("scene_tent_unrolled", &[("    return pcf_tile_tent_lean_at(\n        tex,", "    return pcf_tile_tent_unrolled_at(\n        tex,")]),
+    // THE TENT AS A LOOP OVER PICKED TAPS (`lights::pcf_tile_tent_at`), as it
+    // shipped until B1 -- the lean form (nothing per axis held across its loop)
+    // ships since -- and with its positions and weights at half precision
+    // (`pcf_tile_tent_half_at`): the same taps, for the registers.
+    ("scene_tent_loop", &[("    return pcf_tile_tent_lean_at(\n        tex,", "    return pcf_tile_tent_at(\n        tex,")]),
+    ("scene_tent_half", &[("    return pcf_tile_tent_lean_at(\n        tex,", "    return pcf_tile_tent_half_at(\n        tex,")]),
+    // THE WHOLE READER AT `f32`: its aliases no longer match the text
+    // `shader_precision::for_device` rewrites, so every `hf` stays `f32`.
+    // Against `scene_cut_none` in one build, the precision alone -- with
+    // `HALF_PRECISION` on; off as shipped since B1, this IS `scene_cut_none`.
+    ("scene_all_f32", &[("alias hf = f32;\n", "alias hf = f32; // scene_all_f32\n")]),
 ];
 
 /// MEASUREMENT ONLY: what `BrushPipeline::log_probe_pass_register_cuts` cuts
@@ -2519,7 +3318,15 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
     /// `shade_material_env`.
     pub(super) const PASS_LIGHTING: &str = r#"
     let rough = textureSample(mat_rough, mat_rough_samp, in.uv, i32(in.material)).r;
-    let rough_aa = specular_aa_roughness(rough, dpdx(n), dpdy(n));
+    // WIDENED BY THE SURFACE'S CURVATURE, not its normal map's: the
+    // derivatives of the GEOMETRIC normal (Tokuyoshi & Kaplanyan, *Stable
+    // Geometric Specular Antialiasing with Projected-Space NDF Filtering*,
+    // JCGT 2021). The map's own variation is already in the roughness mips
+    // (`roughness_chain_with_normal_variance`), and the derivatives of a
+    // minified normal map are aliased themselves: widening by them made the
+    // lobe's width jump from quad to quad, which added aliasing in the scene
+    // shader (2026-09-30) and did here what it did there. Zero on a flat face.
+    let rough_aa = specular_aa_roughness(rough, dpdx(n_geom), dpdy(n_geom));
     let ao = textureSample(mat_ao, mat_samp, in.uv, i32(in.material)).r;
     let lm_uv = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
     let baked = textureSample(lm_tex, lm_samp, lm_uv);
@@ -3281,6 +4088,7 @@ struct VOut {{
                 defer_secondary: probe == BrushProbe::PassDeferred,
                 cull_range_first: false,
                 card_tests_filtered: false,
+                card_relit: false,
             },
         ),
         ssr_block = ssr_block,
@@ -3672,6 +4480,9 @@ mod tests {
                 &queue,
                 &[Light {
                     mask_channel: None,
+                    shadow_near: None,
+                    source_radius: 0.0,
+                    in_level_bake: true,
                     position: glam::Vec3::ZERO,
                     direction: glam::Vec3::new(0.0, 0.0, -1.0),
                     kind: LightKind::Directional,
@@ -3693,6 +4504,9 @@ mod tests {
                 &queue,
                 &[Light {
                     mask_channel: None,
+                    shadow_near: None,
+                    source_radius: 0.0,
+                    in_level_bake: true,
                     position: light_pos,
                     direction: glam::Vec3::new(-1.0, 0.0, 0.0),
                     kind: LightKind::Point,
@@ -5463,6 +6277,24 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         }
     }
 
+    /// THE SHIPPED PROBE PASS READS ITS SLOTS FROM PUSH CONSTANTS where the
+    /// device has them: the edit finds both its places in the deferring pass,
+    /// the result declares exactly the 256 bytes the pass sets, and it is valid
+    /// WGSL.
+    #[test]
+    fn the_probe_pass_reads_its_slots_from_push_constants() {
+        use wgpu::naga;
+        let base = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
+        let src = push_scan(&base).expect("the deferring probe pass holds the scan's reads");
+        assert!(!src.contains("camera.probe_boxes[i * 3 + 2].w;\n        let v = camera.probe_boxes[i * 3].xyz - p;"));
+        assert_eq!(crate::renderer::uniforms::PROBE_PUSH_SIZE, 16 * 16);
+        assert_eq!(crate::renderer::uniforms::MAX_PROBES, 16, "the declaration is written for sixteen slots");
+        let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+    }
+
     #[test]
     fn every_scene_register_cut_applies_and_validates() {
         use wgpu::naga;
@@ -5545,12 +6377,23 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         // compute pass that makes them, writing into that target.
         let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, target.width * target.height);
         let _deferred = BrushPipeline::new_probe_pass_deferred(&device, &uniforms.layout, &fixups);
+        let _poolless = BrushPipeline::new_probe_pass_deferred_poolless(&device, &uniforms.layout, &fixups);
         let _fixup_target = fixups.target_bind_group(&device, &target);
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "the probe pass pipelines failed to build: {err:?}");
         let deferred_src = brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::PassDeferred);
         assert!(deferred_src.contains("const PROBE_SECONDARY_DEFERRED: bool = true;"));
         assert!(deferred_src.contains("probe_fragment = in.clip;") && deferred_src.contains("atomicAdd(&probe_fixups.count"));
+        // Its poolless twin, for frames no torch lights: the pool maps' lookup
+        // and its use gone, and nothing else.
+        let poolless = crate::renderer::lights::without_pool_maps(deferred_src.clone());
+        assert!(deferred_src.contains("= probe_surface_relit(") && !poolless.contains("= probe_surface_relit("));
+        assert_eq!(
+            poolless.len(),
+            deferred_src.len()
+                - crate::renderer::lights::SURFACE_RELIT_READ.len()
+                - crate::renderer::lights::SURFACE_RELIT_CALL.len()
+        );
         assert!(brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Pass)
             .contains("const PROBE_SECONDARY_DEFERRED: bool = false;"));
     }
@@ -5884,13 +6727,12 @@ mod source_debug_tests {
         // (1 - Fresnel), the probe by Fresnel. Unweighted, the sources view
         // painted walls blue that the probe barely lit (headset, 2026-09-17).
         assert!(
-            lights.contains("dbg_baked = bounce * albedo * (1.0 - fresnel);"),
+            lights.contains("let kd = albedo * (1.0 - fresnel);") && lights.contains("dbg_baked = bounce * kd;"),
             "the baked term is not recorded as the picture weights it",
         );
         assert!(
-            lights.contains(
-                "dbg_direct = dbg_direct + (c.diffuse * albedo * (1.0 - fresnel) + c.specular) * shadow;"
-            ),
+            lights.contains("let lit = unshadowed * hf(shadow);")
+                && lights.contains("dbg_direct = dbg_direct + vec3<f32>(lit);"),
             "the direct term is not recorded, or is recorded before its shadow test",
         );
     }
@@ -6422,6 +7264,140 @@ mod roughness_sampler_tests {
             "group(1) bindings are {b:?}; the layout in \
              `brush_material_bind_group_layout` must declare exactly these",
         );
+    }
+}
+
+#[cfg(test)]
+mod sun_faces_tests {
+    use super::*;
+
+    const W: u32 = 256;
+    const H: u32 = 128;
+    const LIT: [u8; 4] = [9, 255, 40, 255];
+    const UNBAKED: [u8; 4] = [0, 0, 0, 0];
+
+    /// A mask baked and hidden everywhere (the baker's red 0, green 255), with
+    /// `texels` set to `texel`.
+    fn mask(texels: &[(u32, u32)], texel: [u8; 4]) -> Vec<u8> {
+        let mut m: Vec<u8> = (0..W * H).flat_map(|_| [0u8, 255, 40, 255]).collect();
+        for &(x, y) in texels {
+            let i = ((y * W + x) * 4) as usize;
+            m[i..i + 4].copy_from_slice(&texel);
+        }
+        m
+    }
+
+    fn faces(m: &[u8]) -> SunFaces {
+        SunFaces::from_mask(m, W, H).unwrap()
+    }
+
+    /// A patch 20 x 10 texels at (100, 50).
+    fn patch() -> [f32; 4] {
+        [100.0 / W as f32, 50.0 / H as f32, 120.0 / W as f32, 60.0 / H as f32]
+    }
+
+    fn texel(m: &[u8], x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * W + x) * 4) as usize;
+        m[i..i + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn a_patch_hidden_out_to_its_border_is_never_reached() {
+        assert_eq!(faces(&mask(&[], UNBAKED)).class_of(patch()), FaceSun::Never);
+    }
+
+    #[test]
+    fn a_texel_the_sun_reaches_within_the_border_makes_it_baked() {
+        // Lit (red above 0) 20 texels right of the patch: a deep mip reads it.
+        assert_eq!(faces(&mask(&[(140, 55)], LIT)).class_of(patch()), FaceSun::Baked);
+        // Beyond the border no read of the patch's pixels reaches it.
+        let far = mask(&[(120 + SUN_MASK_READ_REACH + 2, 55)], LIT);
+        assert_eq!(faces(&far).class_of(patch()), FaceSun::Never);
+    }
+
+    #[test]
+    fn an_unbaked_texel_within_reach_keeps_the_full_reader() {
+        // Green under a half is the neutral mask: the sun falls back to the
+        // level's static map there, so the shader still needs it.
+        assert_eq!(faces(&mask(&[(110, 55)], [0, 100, 0, 255])).class_of(patch()), FaceSun::Unbaked);
+        assert_eq!(faces(&mask(&[(140, 55)], UNBAKED)).class_of(patch()), FaceSun::Unbaked);
+        // A rect that is not one keeps it too.
+        assert_eq!(faces(&mask(&[], UNBAKED)).class_of([f32::NAN; 4]), FaceSun::Unbaked);
+    }
+
+    #[test]
+    fn the_border_covers_the_deepest_mip_the_sampler_reads() {
+        // A bilinear read at level L touches texels up to 1.5 * 2^L away.
+        let deepest = crate::renderer::mesh::SUN_MASK_MIP_LEVELS - 1;
+        assert!(SUN_MASK_READ_REACH as f32 >= 1.5 * (1u32 << deepest) as f32 + 1.0);
+    }
+
+    #[test]
+    fn the_partition_keeps_each_parts_order() {
+        // Lit at (10, 10); unbaked at (200, 100).
+        let mut m = mask(&[(10, 10)], [200, 255, 40, 255]);
+        let i = ((100 * W + 200) * 4) as usize;
+        m[i..i + 4].copy_from_slice(&UNBAKED);
+        let f = faces(&m);
+        let vertex = |rect: [f32; 4]| BrushVertex { uv2_rect: rect, ..bytemuck::Zeroable::zeroed() };
+        let lit = [8.0 / W as f32, 8.0 / H as f32, 12.0 / W as f32, 12.0 / H as f32];
+        let bare = [198.0 / W as f32, 98.0 / H as f32, 202.0 / W as f32, 102.0 / H as f32];
+        let v = [vertex(patch()), vertex(lit), vertex(patch()), vertex(lit), vertex(bare)];
+        let idx = [4, 4, 4, 1, 1, 1, 0, 0, 0, 3, 3, 3, 2, 2, 2];
+        let (out, ends) = f.partition(&v, &idx);
+        assert_eq!(ends, [6, 12]);
+        assert_eq!(out, vec![0, 0, 0, 2, 2, 2, 1, 1, 1, 3, 3, 3, 4, 4, 4]);
+    }
+
+    #[test]
+    fn dilation_fills_the_empty_atlas_out_to_the_reach_from_the_nearest_chart_texel() {
+        // A chart: x 40..60, y 40..60, hidden except a lit column at x = 59.
+        let mut m: Vec<u8> = (0..W * H).flat_map(|_| UNBAKED).collect();
+        for y in 40..60 {
+            for x in 40..60 {
+                let t = if x == 59 { LIT } else { [0, 255, 40, 255] };
+                let i = ((y * W + x) * 4) as usize;
+                m[i..i + 4].copy_from_slice(&t);
+            }
+        }
+        let d = dilate_sun_mask(&m, W, H);
+        // Along its rows: the nearest chart texel's value, either side.
+        assert_eq!(texel(&d, 59 + SUN_MASK_READ_REACH, 50), LIT);
+        assert_eq!(texel(&d, 40 - SUN_MASK_READ_REACH, 50), [0, 255, 40, 255]);
+        // Off its corners, within the reach on both axes.
+        assert_eq!(texel(&d, 59 + 10, 40 - 10), LIT);
+        assert_eq!(texel(&d, 40 - SUN_MASK_READ_REACH, 40 - SUN_MASK_READ_REACH), [0, 255, 40, 255]);
+        // Past the reach, left as it was.
+        assert_eq!(texel(&d, 59 + SUN_MASK_READ_REACH + 1, 50), UNBAKED);
+        assert_eq!(texel(&d, 45, 40 - SUN_MASK_READ_REACH - 1), UNBAKED);
+        // Every baked texel kept, and nothing else changed.
+        for i in 0..(W * H) as usize {
+            if m[i * 4 + 1] >= 128 {
+                assert_eq!(d[i * 4..i * 4 + 4], m[i * 4..i * 4 + 4]);
+            }
+        }
+        // So every face of the chart can read only baked texels.
+        let inner = [41.0 / W as f32, 41.0 / H as f32, 50.0 / W as f32, 59.0 / H as f32];
+        assert_eq!(faces(&m).class_of(inner), FaceSun::Unbaked);
+        assert_eq!(faces(&d).class_of(inner), FaceSun::Baked);
+    }
+
+    #[test]
+    fn each_sun_reader_differs_only_in_its_switch_and_validates() {
+        use wgpu::naga;
+        let base = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+        assert_eq!(sun_reader_shader(base.clone(), FaceSun::Unbaked), base);
+        for (class, switch) in [(FaceSun::Never, "SKY_SUN_NEVER_REACHES"), (FaceSun::Baked, "SUN_MASK_EVERYWHERE")] {
+            let source = sun_reader_shader(base.clone(), class);
+            assert_eq!(
+                source.replace(&format!("const {switch}: bool = true;"), &format!("const {switch}: bool = false;")),
+                base
+            );
+            let module = naga::front::wgsl::parse_str(&source).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap();
+        }
     }
 }
 

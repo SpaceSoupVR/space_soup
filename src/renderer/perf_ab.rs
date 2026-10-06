@@ -114,10 +114,18 @@ pub enum Phase {
     /// The player off cards (`character_cards` off), their reflection their
     /// capsules again: what drawing and reading the cards costs.
     NoCharacterCards,
+    /// No flashlight bounce (`flashlight_bounce` off): the lights at the
+    /// patches the beam lands on left out. What they cost. Read by the app,
+    /// which places them, through `XrRenderer::frame_levers`.
+    NoFlashlightBounce,
+    /// No torch in reflections (`torch_reflection` off): its capsules left
+    /// out of the frame's. What tracing it costs. Read by the app, which hands
+    /// them over, through `XrRenderer::frame_levers`.
+    NoTorchReflection,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 25] = [
+    pub const ALL: [Phase; 27] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -143,6 +151,8 @@ impl Phase {
         Phase::FloorMirror,
         Phase::NoReflectionBlur,
         Phase::NoCharacterCards,
+        Phase::NoFlashlightBounce,
+        Phase::NoTorchReflection,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -191,6 +201,8 @@ impl Phase {
             Phase::FloorMirror => "floor_mirror",
             Phase::NoReflectionBlur => "no_reflection_blur",
             Phase::NoCharacterCards => "no_character_cards",
+            Phase::NoFlashlightBounce => "no_flashlight_bounce",
+            Phase::NoTorchReflection => "no_torch_reflection",
         }
     }
 }

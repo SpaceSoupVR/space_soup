@@ -88,10 +88,39 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
     if exposed.features.contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
         features |= wgpu::Features::SHADER_EARLY_DEPTH_TEST;
     }
+    // 16-BIT UNORM TEXTURES: what a moment shadow map is stored in -- four
+    // moments of depth quantised to 64 bits a texel (Peters & Klein, I3D
+    // 2015), for the lights that move. Claimed where the adapter has it, on the
+    // same contract as the rest. The log says what the format can do here,
+    // since a moving light's map needs it rendered into at 4x, resolved and
+    // filtered (docs/quest3-research-2026-10-01.md §2, row 2).
+    if exposed.features.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+        features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+    }
+    // PUSH CONSTANTS ("immediates" since wgpu 28): 256 bytes on the Quest 3
+    // (`maxPushConstantsSize`, see `log_driver_offer`). They live in the
+    // constant file, where a table indexed by a loop counter might be read
+    // without the memory path every uniform block took: the probe pass reads
+    // its photograph slots from them (`brush_pipeline::PUSH_SCAN`; exp64,
+    // -0.36 ms an eye). Claimed where the adapter
+    // has it, on the same contract as the rest, with its limit below.
+    if exposed.features.contains(wgpu::Features::IMMEDIATES) {
+        features |= wgpu::Features::IMMEDIATES;
+    }
+    {
+        use wgpu::hal::Adapter as _;
+        let rgba16 = exposed.adapter.texture_format_capabilities(wgpu::TextureFormat::Rgba16Unorm);
+        log::info!(
+            "wgpu: 16-bit unorm {}; Rgba16Unorm {:?}",
+            if features.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) { "yes" } else { "NO" },
+            rgba16,
+        );
+    }
     log::info!(
         "wgpu: shader f16 {}",
         if vk.shader_f16 { "yes (arithmetic only)" } else { "NO" },
     );
+    log_driver_offer(vk);
     log::info!(
         "wgpu: multiview {}, multisampled arrays {} -- stereo scene pass {}",
         if vk.multiview { "yes" } else { "NO" },
@@ -159,13 +188,21 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
             .max_sampled_textures_per_shader_stage
             .min(crate::renderer::uniforms::SCENE_SAMPLED_TEXTURES)
             .max(wgpu::Limits::downlevel_defaults().max_sampled_textures_per_shader_stage),
+        // A FEATURE IS NOT ENOUGH, as for multiview: every stock limit set
+        // allows no push constants at all.
+        max_immediate_size: if features.contains(wgpu::Features::IMMEDIATES) {
+            exposed.capabilities.limits.max_immediate_size
+        } else {
+            0
+        },
         ..wgpu::Limits::downlevel_defaults()
     };
     log::info!(
-        "wgpu: max_multiview_view_count = {}, max_texture_array_layers = {}, max_sampled_textures_per_shader_stage = {}",
+        "wgpu: max_multiview_view_count = {}, max_texture_array_layers = {}, max_sampled_textures_per_shader_stage = {}, max_immediate_size = {}",
         limits.max_multiview_view_count,
         limits.max_texture_array_layers,
         limits.max_sampled_textures_per_shader_stage,
+        limits.max_immediate_size,
     );
     let open_device = exposed.adapter.device_from_raw(
         vk.device.clone(),
@@ -195,6 +232,42 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
     )?;
 
     Ok((device, queue))
+}
+
+/// WHAT THIS DRIVER OFFERS, whether or not wgpu exposes it: the limits that
+/// decide where a small uniform table can live (push constants, inline uniform
+/// blocks), and every device extension. We own a wgpu fork, so an extension
+/// the driver has is something we can build on (`docs/quest3-research-...`);
+/// this is the list to plan from, read once at startup.
+unsafe fn log_driver_offer(vk: &VkContext) {
+    let props = unsafe { vk.instance.get_physical_device_properties(vk.physical_device) };
+    let l = &props.limits;
+    let mut inline = vk::PhysicalDeviceInlineUniformBlockProperties::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut inline);
+    unsafe { vk.instance.get_physical_device_properties2(vk.physical_device, &mut props2) };
+    log::info!(
+        "vulkan: api {}.{}.{}, driver {:#x}; push constants {} B; uniform range {} B, offset alignment {} B; \
+         inline uniform block {} B, {} a stage; bound descriptor sets {}",
+        vk::api_version_major(props.api_version),
+        vk::api_version_minor(props.api_version),
+        vk::api_version_patch(props.api_version),
+        props.driver_version,
+        l.max_push_constants_size,
+        l.max_uniform_buffer_range,
+        l.min_uniform_buffer_offset_alignment,
+        inline.max_inline_uniform_block_size,
+        inline.max_per_stage_descriptor_inline_uniform_blocks,
+        l.max_bound_descriptor_sets,
+    );
+    let exts = unsafe { vk.instance.enumerate_device_extension_properties(vk.physical_device) }.unwrap_or_default();
+    let names: Vec<String> = exts
+        .iter()
+        .filter_map(|e| e.extension_name_as_c_str().ok().map(|c| c.to_string_lossy().into_owned()))
+        .collect();
+    log::info!("vulkan: {} device extensions", names.len());
+    for chunk in names.chunks(8) {
+        log::info!("vulkan ext: {}", chunk.join(" "));
+    }
 }
 
 pub(super) unsafe fn import_vk_image_as_wgpu(

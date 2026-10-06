@@ -43,6 +43,17 @@ impl MeshPipeline {
         Self::new_with_front_face(device, format, camera_layout, FrontFace::Cw, 1, crate::renderer::multiview::ViewMode::Mono)
     }
 
+    /// MEASUREMENT: as [`Self::new_multisampled`], its thin pass shaded per
+    /// fragment as before 2026-10-01. See `Levers::thin_shading_sampled`.
+    pub fn new_multisampled_thin_sampled(
+        device: &Device,
+        format: TextureFormat,
+        camera_layout: &BindGroupLayout,
+        samples: u32,
+    ) -> Self {
+        Self::new_full(device, format, camera_layout, FrontFace::Ccw, samples, crate::renderer::multiview::ViewMode::Mono, false)
+    }
+
     fn new_with_front_face(
         device: &Device,
         format: TextureFormat,
@@ -50,10 +61,89 @@ impl MeshPipeline {
         front_face: FrontFace,
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
+    ) -> Self {
+        Self::new_full(device, format, camera_layout, front_face, samples, view, true)
+    }
+
+    fn new_full(
+        device: &Device,
+        format: TextureFormat,
+        camera_layout: &BindGroupLayout,
+        front_face: FrontFace,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        thin_mean: bool,
 ) -> Self {
+        Self::new_edited(device, format, camera_layout, front_face, samples, view, thin_mean, &|src| src, ("mesh_pipeline", "mesh_thin_pipeline"))
+    }
+
+    /// [`Self::new_multisampled`]'s SPOTLESS TWIN: the spots' shadow maps
+    /// never read (`lights::without_spot_shadows`), for frames where no spot
+    /// casts. `Levers::spotless_shaders`.
+    pub fn new_multisampled_spotless(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout, samples: u32) -> Self {
+        Self::new_edited(
+            device,
+            format,
+            camera_layout,
+            FrontFace::Ccw,
+            samples,
+            crate::renderer::multiview::ViewMode::Mono,
+            true,
+            &crate::renderer::lights::without_spot_shadows,
+            ("mesh_pipeline_spotless", "mesh_thin_pipeline_spotless"),
+        )
+    }
+
+    /// MEASUREMENT ONLY: every [`MESH_REGISTER_CUTS`] variant of the scene
+    /// pass's mesh shader and its thin pass, built under the cut's name so
+    /// PIPESTATS logs their registers and occupancy. Nothing draws with them.
+    pub fn log_register_cuts(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout, samples: u32) {
+        let base = mesh_shader();
+        for (label, edits) in MESH_REGISTER_CUTS {
+            if let Some((from, _)) = edits.iter().find(|(from, _)| !base.contains(from)) {
+                log::warn!("register cut {label}: `{from}` is not in the shader");
+                continue;
+            }
+            let edit = |mut src: String| {
+                for (from, to) in edits.iter() {
+                    src = src.replacen(from, to, 1);
+                }
+                src
+            };
+            let thin_label = format!("{label}_thin");
+            let _ = Self::new_edited(
+                device,
+                format,
+                camera_layout,
+                FrontFace::Ccw,
+                samples,
+                crate::renderer::multiview::ViewMode::Mono,
+                true,
+                &edit,
+                (label, &thin_label),
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_edited(
+        device: &Device,
+        format: TextureFormat,
+        camera_layout: &BindGroupLayout,
+        front_face: FrontFace,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        thin_mean: bool,
+        edit: &dyn Fn(String) -> String,
+        (label, thin_label): (&str, &str),
+    ) -> Self {
+        // Through `shader_precision`, as the scene readers: at half precision
+        // where the device has it and `HALF_PRECISION` is on (off as shipped).
+        // The lamp loop's colours (`shade_with_sky`, `thin_shade_with_sky`)
+        // are the only `hf` maths a mesh shader reaches (B1, 2026-10-06).
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("mesh_shader"),
-            source: ShaderSource::Wgsl(view.shader(mesh_shader()).into()),
+            source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, view.shader(edit(mesh_shader()))).into()),
         });
 
         let texture_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -157,13 +247,15 @@ impl MeshPipeline {
             multiview_mask: view.mask(),
             cache: None,
         });
-        let pipeline = build("mesh_pipeline", &shader, &[Some(MeshVertex::layout())]);
+        let pipeline = build(label, &shader, &[Some(MeshVertex::layout())]);
         let thin_shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("mesh_thin_shader"),
-            source: ShaderSource::Wgsl(view.shader(mesh_shader_variant(true)).into()),
+            source: ShaderSource::Wgsl(
+                crate::renderer::shader_precision::for_device(device, view.shader(edit(mesh_shader_variant_with(true, thin_mean)))).into(),
+            ),
         });
         let thin_pipeline = build(
-            "mesh_thin_pipeline",
+            thin_label,
             &thin_shader,
             &[Some(MeshVertex::layout()), Some(super::mesh::ThinVertex::layout())],
         );
@@ -300,6 +392,28 @@ impl ModelUniform {
         own: Option<&crate::renderer::Light>,
         thin_width: f32,
     ) {
+        self.upload_lit_bulb_scaled(queue, model, sky_vis, emissive_drive, room, own, thin_width, 1.0);
+    }
+
+    /// [`Self::upload_lit_bulb`], the fixture's OWN light -- its bulb's glow
+    /// and its lamp on its own surfaces -- scaled by `own_scale`, as an eye
+    /// adapted to the lamp sees it (`tonemap::own_light_scale`). Only a
+    /// fixture whose lamp lights its own housing takes it (see
+    /// `own_bulb_fill`): scaling the glow of one whose shade the light loop
+    /// lights at full strength -- a sconce -- would put a grey bulb in a white
+    /// mouth, as before 2026-09-30.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_lit_bulb_scaled(
+        &self,
+        queue: &Queue,
+        model: glam::Mat4,
+        sky_vis: f32,
+        emissive_drive: f32,
+        room: &crate::renderer::room_light::RoomLight,
+        own: Option<&crate::renderer::Light>,
+        thin_width: f32,
+        own_scale: f32,
+    ) {
         let mut data = [0f32; (MODEL_UNIFORM_SIZE / 4) as usize];
         data[..16].copy_from_slice(&model.to_cols_array());
         data[16] = sky_vis.clamp(0.0, 1.0);
@@ -312,15 +426,78 @@ impl ModelUniform {
         if let Some((l, channel)) = spot.and_then(|l| Some((l, l.mask_channel?))) {
             let (cos_outer, cos_inner) = l.cone_cosines();
             let c = l.color.to_linear();
+            let k = own_scale.clamp(0.0, 1.0);
+            data[17] *= k;
             // The marker the light list gives a stationary lamp: 2 + channel.
             data[18] = 2.0 + channel as f32;
             data[56..60].copy_from_slice(&[l.position.x, l.position.y, l.position.z, l.range]);
             data[60..64].copy_from_slice(&[l.direction.x, l.direction.y, l.direction.z, cos_outer]);
-            data[64..68].copy_from_slice(&[c[0] * l.intensity, c[1] * l.intensity, c[2] * l.intensity, cos_inner]);
+            let i = l.intensity * k;
+            data[64..68].copy_from_slice(&[c[0] * i, c[1] * i, c[2] * i, cos_inner]);
         }
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&data));
     }
 }
+
+/// The spot shadows' tent, as `lights::pcf_layer` calls it: the lean form
+/// since B1 (2026-10-06).
+const TENT_CALL: &str = "    return pcf_tile_tent_lean_at(\n        tex,";
+/// The models' per-pixel choice of photograph in their room: every slot
+/// looked at (`lights::probe_nearest_two`), as from 2026-10-01 to exp64 ...
+const CHOOSE_SCAN: &str = "    let near = probe_nearest_two(select_world, room, room);
+    c.best = near.s0;
+    c.second = near.s1;
+    c.best_dist = select(1e30, near.d0, near.s0 >= 0);
+    c.second_dist = select(1e30, near.d1, near.s1 >= 0);";
+/// ... and the room's own chain walked, as before that and in exp64.
+const CHOOSE_WALK: &str = "    for (var i = probe_room_slot(room); i >= 0; i = probe_slot_next(i)) {
+        let to_centre = camera.probe_boxes[i * 3].xyz - select_world;
+        let dist = dot(to_centre, to_centre);
+        if (dist < c.best_dist) {
+            c.second = c.best;
+            c.second_dist = c.best_dist;
+            c.best_dist = dist;
+            c.best = i;
+        } else if (dist < c.second_dist) {
+            c.second = i;
+            c.second_dist = dist;
+        }
+    }";
+/// `lights::probe_volume_sample`'s one nearest photograph, scanned ...
+const VOLUME_SCAN: &str = "    let pick = probe_nearest_two(select_world, room, room).s0;";
+/// ... and walked.
+const VOLUME_WALK: &str = "    var pick = -1;
+    var pick_dist = 1e30;
+    for (var i = probe_room_slot(room); i >= 0; i = probe_slot_next(i)) {
+        let to_centre = camera.probe_boxes[i * 3].xyz - select_world;
+        let dist = dot(to_centre, to_centre);
+        if (dist < pick_dist) {
+            pick = i;
+            pick_dist = dist;
+        }
+    }";
+
+/// MEASUREMENT ONLY: the scene pass's mesh shader with one part changed at a
+/// time -- see [`MeshPipeline::log_register_cuts`]. 2026-10-02: the spots'
+/// tent and the per-pixel scan together took `mesh_pipeline` from 19
+/// registers to 22 and its occupancy from 62% to 50%; these say which. The
+/// shader walks its room's chain (exp64); `scan` is every slot looked at.
+const MESH_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
+    ("mesh_cut_none", &[]),
+    ("mesh_box_spots", &[(TENT_CALL, "    return pcf_tile_at(\n        tex,")]),
+    // The tent's loop over picked taps, as it shipped until B1.
+    ("mesh_tent_loop", &[(TENT_CALL, "    return pcf_tile_tent_at(\n        tex,")]),
+    ("mesh_spotless", &[("const SPOT_SHADOWS: bool = true;", "const SPOT_SHADOWS: bool = false;")]),
+    ("mesh_choose_scan", &[(CHOOSE_WALK, CHOOSE_SCAN), (VOLUME_WALK, VOLUME_SCAN)]),
+    (
+        "mesh_scan_loop",
+        &[(TENT_CALL, "    return pcf_tile_tent_at(\n        tex,"), (CHOOSE_WALK, CHOOSE_SCAN), (VOLUME_WALK, VOLUME_SCAN)],
+    ),
+    (
+        "mesh_scan_box",
+        &[(TENT_CALL, "    return pcf_tile_at(\n        tex,"), (CHOOSE_WALK, CHOOSE_SCAN), (VOLUME_WALK, VOLUME_SCAN)],
+    ),
+];
 
 pub struct SkinnedMeshPipeline {
     pub pipeline: RenderPipeline,
@@ -365,7 +542,7 @@ impl SkinnedMeshPipeline {
     ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("skinned_mesh_shader"),
-            source: ShaderSource::Wgsl(view.shader(skinned_mesh_shader()).into()),
+            source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, view.shader(skinned_mesh_shader())).into()),
         });
 
         let texture_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -659,7 +836,7 @@ const THIN_VS: &str = "
         let half_drawn = thin_r + 1.7071068 * model_u.params.w * depth;
         world_pos = vec4<f32>(world_pos.xyz + thin_axis / thin_scale * (half_drawn - thin_r), 1.0);
         out.fade = thin_r / half_drawn;
-        out.thin = vec4<f32>(thin_axis, thin_r);
+        out.thin = vec4<f32>(thin_axis / thin_scale, thin_r);
     }";
 
 /// ACROSS A WIDENED PART, each fragment's share of its light (see
@@ -710,11 +887,226 @@ fn thin_kernel_below(x: f32) -> f32 {
 }
 ";
 
+/// THE THIN PASS's LIGHT (see `thin_parts`). A part under a pixel wide has its
+/// lit side, its shadowed side and its highlight inside one pixel, which shows
+/// their MEAN. Shaded instead from the normal interpolated at each fragment of
+/// the widened band, the band sampled that profile wherever the fragment
+/// centres fell -- the lit half of a wire on one side of it, the dark half on
+/// the other -- and which fragments took which half changed with every step
+/// of the head: the lit side of a cage wire beside its bulb crawled, the
+/// most left in the level (headset census, 2026-10-01: J 0.17 on hall_front's
+/// near pendant), and a wire lit from its side came out half as bright as it
+/// is, the band's middle -- most of its light -- facing the eye and not the
+/// lamp (`a_side_lit_thin_wire_keeps_its_light_and_its_shading_as_it_slides`).
+///
+/// So each fragment takes the mean of the lighting over the stretch of the
+/// part its kernel reaches (`THIN_SHARE`): all of a part under a pixel --
+/// every fragment the same colour, which nothing can make crawl -- and a
+/// fragment's own few pixels of one many pixels wide. Round the visible half,
+/// with `c` the normal facing the eye, `b` across the part on screen and theta
+/// the angle from `c`, the normal is c cos(theta) + b sin(theta) and the
+/// position across the part, in radii, is u = sin(theta): a fragment's reach
+/// is an interval of u, and a mean over the screen is a mean over u. In closed
+/// form: the lamps' diffuse exactly, their highlights as Gaussians (erf), the
+/// sky's and the room's harmonics from the normal's first and second moments.
+/// The axis is square to the normal and to the way it turns across the
+/// screen. The lightmap is still read where the fragment is.
+const THIN_SHADE: &str = "
+struct ThinSpan {
+    c: vec3<f32>,
+    b: vec3<f32>,
+    t: vec3<f32>,
+    // The stretch of the visible half a fragment's kernel reaches, as u and
+    // as theta.
+    ua: f32,
+    ub: f32,
+    ta: f32,
+    tb: f32,
+}
+// Derivatives: called at the top level of `fs_main`.
+fn thin_span_at(fade: f32, thin: vec4<f32>, world_pos: vec3<f32>) -> ThinSpan {
+    let v = normalize(cam_pos() - world_pos);
+    let dnx = dpdx(thin.xyz);
+    let dny = dpdy(thin.xyz);
+    let turn = select(dny, dnx, dot(dnx, dnx) > dot(dny, dny));
+    let sx = dpdx(world_pos);
+    let sy = dpdy(world_pos);
+    let fragment = max(0.5 * (length(sx - v * dot(sx, v)) + length(sy - v * dot(sy, v))), 1e-9);
+    var axis = cross(thin.xyz, turn);
+    if (dot(axis, axis) < 1e-12) {
+        axis = cross(thin.xyz, select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(thin.x) > 0.7));
+    }
+    var s: ThinSpan;
+    s.t = normalize(axis);
+    let v_square = v - s.t * dot(v, s.t);
+    let v_square_len = length(v_square);
+    s.c = select(normalize(thin.xyz), v_square / max(v_square_len, 1e-9), v_square_len > 1e-4);
+    s.b = cross(s.t, s.c);
+    // Where this fragment is across the part, in its own radii: the band
+    // holds the part scaled by `fade`. Its kernel reaches 1.71 fragments.
+    let u = dot(thin.xyz, s.b) / max(fade, 1e-4);
+    let reach = 1.7071068 * fragment / max(thin.w, 1e-9);
+    var ua = clamp(u - reach, -1.0, 1.0);
+    var ub = clamp(u + reach, -1.0, 1.0);
+    // A fragment the part only grazes: a sliver at its edge.
+    if (ub - ua < 2e-3) {
+        let m = clamp(0.5 * (ua + ub), -0.999, 0.999);
+        ua = m - 1e-3;
+        ub = m + 1e-3;
+    }
+    s.ua = ua;
+    s.ub = ub;
+    s.ta = asin(ua);
+    s.tb = asin(ub);
+    return s;
+}
+// erf, to 1.5e-7 (Abramowitz and Stegun 7.1.26).
+fn thin_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let p = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    return sign(x) * (1.0 - p * exp(-a * a));
+}
+// A lamp along `l` over the stretch, as `light_contribution` shades it: x the
+// mean of max(n.l, 0), y of pow(max(n.h, 0), shininess) where n.l > 0. Round
+// the circle n.l is |l square to the part| cos(theta - phi) and a step across
+// the screen is cos(theta) d theta, so the diffuse integral is closed-form;
+// n.h is |h square| cos(theta - theta_h), and cos^s is close to a Gaussian of
+// width 1/sqrt(s), whose integral over the lit stretch is an erf.
+fn thin_mean_light(s: ThinSpan, l: vec3<f32>, h: vec3<f32>, shininess: f32) -> vec2<f32> {
+    let lc = dot(l, s.c);
+    let lb = dot(l, s.b);
+    let phi = atan2(lb, lc);
+    let a = max(s.ta, phi - 1.5707963);
+    let z = min(s.tb, phi + 1.5707963);
+    if (z <= a) {
+        return vec2<f32>(0.0);
+    }
+    let w = s.ub - s.ua;
+    let diffuse = sqrt(lc * lc + lb * lb) * 0.5 * ((z - a) * cos(phi) + cos(a + z - phi) * sin(z - a)) / w;
+    let hc = dot(h, s.c);
+    let hb = dot(h, s.b);
+    let th = atan2(hb, hc);
+    let k = sqrt(0.5 * shininess);
+    let mass = 0.5 * (thin_erf((z - th) * k) - thin_erf((a - th) * k));
+    let highlight = pow(max(hc * hc + hb * hb, 0.0), 0.5 * shininess) * sqrt(6.2831853 / shininess) * mass * cos(clamp(th, a, z)) / w;
+    return vec2<f32>(diffuse, highlight);
+}
+// The normal's mean over the stretch, and the means of the products of its
+// components -- which a sum of harmonics to order two is linear in. Over u:
+// cos(theta) = sqrt(1 - u^2), sin(theta) = u.
+struct ThinMoments {
+    n: vec3<f32>,
+    // xx, yy, zz
+    diag: vec3<f32>,
+    // xy, yz, xz
+    off: vec3<f32>,
+}
+fn thin_moments(s: ThinSpan) -> ThinMoments {
+    let w = s.ub - s.ua;
+    let ca = sqrt(max(1.0 - s.ua * s.ua, 0.0));
+    let cb = sqrt(max(1.0 - s.ub * s.ub, 0.0));
+    // From the antiderivatives (u sqrt(1 - u^2) + asin u) / 2 and
+    // -(1 - u^2)^(3/2) / 3.
+    let e_c = 0.5 * ((s.ub * cb + s.tb) - (s.ua * ca + s.ta)) / w;
+    let e_s = 0.5 * (s.ua + s.ub);
+    let e_ss = (s.ua * s.ua + s.ua * s.ub + s.ub * s.ub) / 3.0;
+    let e_cs = (ca * ca * ca - cb * cb * cb) / (3.0 * w);
+    let e_cc = 1.0 - e_ss;
+    let c = s.c;
+    let b = s.b;
+    var m: ThinMoments;
+    m.n = c * e_c + b * e_s;
+    m.diag = c * c * e_cc + 2.0 * c * b * e_cs + b * b * e_ss;
+    m.off = vec3<f32>(c.x * c.y, c.y * c.z, c.x * c.z) * e_cc
+        + vec3<f32>(c.x * b.y + b.x * c.y, c.y * b.z + b.y * c.z, c.x * b.z + b.x * c.z) * e_cs
+        + vec3<f32>(b.x * b.y, b.y * b.z, b.x * b.z) * e_ss;
+    return m;
+}
+// `sky_irradiance`, term for term, of the moments.
+fn thin_sky_irradiance(m: ThinMoments) -> vec3<f32> {
+    var e = vec3<f32>(0.0);
+    e = e + camera.sky_sh[0].rgb * 0.282095 * 1.0;
+    e = e + camera.sky_sh[1].rgb * (0.488603 * m.n.y) * 0.6666667;
+    e = e + camera.sky_sh[2].rgb * (0.488603 * m.n.z) * 0.6666667;
+    e = e + camera.sky_sh[3].rgb * (0.488603 * m.n.x) * 0.6666667;
+    e = e + camera.sky_sh[4].rgb * (1.092548 * m.off.x) * 0.25;
+    e = e + camera.sky_sh[5].rgb * (1.092548 * m.off.y) * 0.25;
+    e = e + camera.sky_sh[6].rgb * (0.315392 * (3.0 * m.diag.z - 1.0)) * 0.25;
+    e = e + camera.sky_sh[7].rgb * (1.092548 * m.off.z) * 0.25;
+    e = e + camera.sky_sh[8].rgb * (0.546274 * (m.diag.x - m.diag.y)) * 0.25;
+    return max(e, vec3<f32>(0.0));
+}
+// `room_irradiance`, term for term, of the moments.
+fn thin_room_irradiance(m: ThinMoments) -> vec3<f32> {
+    var e = model_u.room[0].rgb * 0.282095;
+    e = e + model_u.room[1].rgb * (0.488603 * m.n.y) * 0.6666667;
+    e = e + model_u.room[2].rgb * (0.488603 * m.n.z) * 0.6666667;
+    e = e + model_u.room[3].rgb * (0.488603 * m.n.x) * 0.6666667;
+    e = e + model_u.room[4].rgb * (1.092548 * m.off.x) * 0.25;
+    e = e + model_u.room[5].rgb * (1.092548 * m.off.y) * 0.25;
+    e = e + model_u.room[6].rgb * (0.315392 * (3.0 * m.diag.z - 1.0)) * 0.25;
+    e = e + model_u.room[7].rgb * (1.092548 * m.off.z) * 0.25;
+    e = e + model_u.room[8].rgb * (0.546274 * (m.diag.x - m.diag.y)) * 0.25;
+    return max(e, vec3<f32>(0.0));
+}
+// `shade_with_sky` over the stretch.
+fn thin_shade_with_sky(world_pos: vec3<f32>, s: ThinSpan, m: ThinMoments, sky_vis: f32) -> vec3<f32> {
+    let view_dir = normalize(cam_pos() - world_pos);
+    // In `hf` through the shadows, as `shade_with_sky`.
+    var lit = hf3(min(thin_sky_irradiance(m) * clamp(sky_vis, 0.0, 1.0) * capsule_ambient(world_pos, normalize(m.n)), vec3<f32>(HF_MAX)));
+    for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {
+        let l = lights.lights[i];
+        // The light arriving here as `light_contribution` has it -- colour,
+        // falloff, cone -- on a surface square to it; spread round the part.
+        let l_dir = select(normalize(l.position.xyz - world_pos), normalize(-l.direction.xyz), l.params.z > 1.5);
+        let arriving = light_contribution_rough(l, world_pos, l_dir, view_dir, 1.0, 0.0);
+        // Out of its range or its cone: nothing to spread, as `shade_with_sky`
+        // skips it -- the means cost two atan2s and two erfs a lamp.
+        if (max(max(arriving.r, arriving.g), arriving.b) <= 0.0) {
+            continue;
+        }
+        let means = thin_mean_light(s, l_dir, normalize(l_dir + view_dir), SHININESS);
+        let spread = arriving * (means.x + SPEC_STRENGTH * means.y);
+        // THE SHADOWS, AS `shade_with_sky` TAKES THEM.
+        if (max(max(spread.r, spread.g), spread.b) <= 0.0) {
+            continue;
+        }
+        var c = hf3(min(spread, vec3<f32>(HF_MAX)));
+        if (l.params.z > 1.5) {
+            c = c * hf(sun_visibility(l, world_pos));
+        }
+        c = c * hf(stationary_visibility(l));
+        let layer = i32(l.params.w);
+        if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {
+            c = c * hf(pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]));
+        } else if (l.params.z < 1.5) {
+            c = c * hf(character_shadow(i, world_pos));
+        }
+        lit = min(lit + c, hf3(hf(HF_MAX)));
+    }
+    return vec3<f32>(lit);
+}
+// `own_bulb_fill` over the stretch: the bulb shines every way, so only its
+// diffuse.
+fn thin_own_bulb_fill(world_pos: vec3<f32>, s: ThinSpan) -> vec3<f32> {
+    let l_dir = normalize(model_u.bulb[0].xyz - world_pos);
+    return own_bulb_fill(world_pos, l_dir) * thin_mean_light(s, l_dir, l_dir, SHININESS).x;
+}
+";
+
 /// The mesh shader; `thin` for the thin pass, which widens a thin part by its
 /// kernel's reach (a unit of `params.w` of its depth) and gives each fragment
 /// its share of the part's light (see `thin_parts`), reading each vertex's
 /// welded normal and radius from a second vertex buffer.
 fn mesh_shader_variant(thin: bool) -> String {
+    mesh_shader_variant_with(thin, thin)
+}
+
+/// `mesh_shader_variant`, the thin pass shaded with the mean over each
+/// fragment's reach (`thin_mean`, as shipped) or, to measure, from the normal
+/// interpolated at the fragment as before 2026-10-01.
+fn mesh_shader_variant_with(thin: bool, thin_mean: bool) -> String {
     let (thin_in, thin_out, thin_vs, thin_fn, thin_fade) = if thin {
         (
             "@location(5) thin: vec4<f32>,",
@@ -725,6 +1117,23 @@ fn mesh_shader_variant(thin: bool) -> String {
         )
     } else {
         ("", "", "", "", "")
+    };
+    // The thin pass shades with the mean over each fragment's reach: see
+    // `THIN_SHADE`. The other variant's text is unchanged.
+    let (thin_shade, thin_span, lit, room) = if thin && thin_mean {
+        (
+            THIN_SHADE,
+            "\n    let thin_span = thin_span_at(in.fade, in.thin, in.world_pos);\n    let thin_m = thin_moments(thin_span);",
+            "thin_shade_with_sky(in.world_pos, thin_span, thin_m, model_u.params.x * baked.a) + thin_own_bulb_fill(in.world_pos, thin_span)",
+            "thin_room_irradiance(thin_m)",
+        )
+    } else {
+        (
+            "",
+            "",
+            "shade_with_sky(in.world_pos, n, model_u.params.x * baked.a) + own_bulb_fill(in.world_pos, n)",
+            "room_irradiance(n)",
+        )
     };
     format!(
         r#"
@@ -776,7 +1185,7 @@ fn own_bulb_fill(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
     let d2_over_r2 = d_over_r * d_over_r;
     let window = clamp(1.0 - d2_over_r2 * d2_over_r2, 0.0, 1.0);
     let atten = (window * window) / max(dist * dist, LAMP_RADIUS * LAMP_RADIUS);
-    let beam = spot_cone(dot(-l_dir, model_u.bulb[1].xyz), model_u.bulb[1].w, model_u.bulb[2].w, dist);
+    let beam = spot_cone(dot(-l_dir, model_u.bulb[1].xyz), model_u.bulb[1].w, model_u.bulb[2].w, dist, 0.0);
     return model_u.bulb[2].rgb * max(dot(n, l_dir), 0.0) * atten * (1.0 - beam) * stationary_visibility_of(marker);
 }}
 
@@ -849,10 +1258,10 @@ fn vs_main(v: VIn) -> VOut {{
     return out;
 }}
 
-{thin_fn}
+{thin_fn}{thin_shade}
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
-    let n = normalize(in.normal);
+    let n = normalize(in.normal);{thin_span}
     // Inside the triangle's own chart: an MSAA edge pixel's `uv2` is
     // extrapolated past it. See `MeshVertex::uv2_rect`.
     let uv2 = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
@@ -886,7 +1295,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         st_3 = textureSample(lm_stationary, lm_sun_samp, uv2, 3);
     }}
     set_stationary_masks_exact(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
-    let lit = shade_with_sky(in.world_pos, n, model_u.params.x * baked.a) + own_bulb_fill(in.world_pos, n);
+    let lit = {lit};
     let tex_color = textureSample(tex, samp, in.uv);
     // ADDED, NOT MULTIPLIED.
     //
@@ -918,7 +1327,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let glow = in.emissive * mask * model_u.params.y;
     // The lit room round it, which the baked bounce -- an old per-object
     // estimate -- all but left out: see `room_light`.
-    return vec4<f32>(tonemap(tex_color.rgb * (lit + baked.rgb + room_irradiance(n)) + glow), tex_color.a{thin_fade});
+    return vec4<f32>(tonemap(tex_color.rgb * (lit + baked.rgb + {room}) + glow), tex_color.a{thin_fade});
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
@@ -947,6 +1356,54 @@ mod tests {
     /// now. Rendering rather than merely building the pipeline is the point:
     /// creating it proves only that the WGSL parses, which is exactly the check
     /// that passed twice this session while the shader was wrong.
+    /// THE SPOTLESS TWINS DRAW THE SAME PIXELS where no spot casts: every read
+    /// of a spot's shadow map, in the models' shaders (the thin pass's own
+    /// copy included) and in the lights block every scene shader shares, sits
+    /// directly under the `SPOT_SHADOWS` switch and the live-spot test -- so
+    /// with no spot casting, switching it off removes code no pixel ran.
+    #[test]
+    fn every_spot_shadow_read_is_behind_the_switch() {
+        let lights = crate::renderer::lights::wgsl_lights_block(0, 1);
+        for (name, src) in [("mesh", mesh_shader()), ("thin", mesh_shader_variant_with(true, true)), ("lights", lights)] {
+            let lines: Vec<&str> = src.lines().collect();
+            let mut reads = 0;
+            for (k, line) in lines.iter().enumerate() {
+                if line.contains("(spot_shadow_tex,") {
+                    reads += 1;
+                    assert!(
+                        lines[k - 1].contains("if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {"),
+                        "{name}: an ungated spot shadow read: {line}"
+                    );
+                }
+            }
+            assert!(reads > 0, "{name}: no spot shadow read found");
+            let spotless = crate::renderer::lights::without_spot_shadows(src.clone());
+            assert_eq!(spotless.lines().count(), lines.len(), "{name}: the twin changes one line");
+        }
+    }
+
+    /// Every measurement cut of the mesh shader still finds its text, in the
+    /// shader and in its thin pass -- a cut that no longer applies would
+    /// report the uncut shader under its name -- and both results are valid
+    /// WGSL. See `MeshPipeline::log_register_cuts`.
+    #[test]
+    fn every_mesh_register_cut_applies_and_validates() {
+        use wgpu::naga;
+        for base in [mesh_shader(), mesh_shader_variant_with(true, true)] {
+            for (label, edits) in MESH_REGISTER_CUTS {
+                let mut src = base.clone();
+                for (from, to) in edits.iter() {
+                    assert!(src.contains(from), "{label}: `{from}` is not in the mesh shader");
+                    src = src.replacen(from, to, 1);
+                }
+                let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(&src)));
+                naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                    .validate(&module)
+                    .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            }
+        }
+    }
+
     fn render_mesh(emissive: [f32; 3], drive: f32, lit: bool) -> Option<[u8; 4]> {
         render_mesh_sky(emissive, drive, lit, 1.0)
     }
@@ -1089,6 +1546,9 @@ mod tests {
         let grey = [128, 128, 128, 255];
         let lamp = |direction: glam::Vec3, mask_channel: Option<u8>| Light {
             mask_channel,
+            shadow_near: None,
+            source_radius: 0.0,
+            in_level_bake: true,
             position: glam::Vec3::new(0.0, 0.0, 0.5),
             direction,
             kind: LightKind::Spot,
@@ -1304,6 +1764,9 @@ mod tests {
                 &queue,
                 &[Light {
                     mask_channel: stationary.map(|_| 0),
+                    shadow_near: None,
+                    source_radius: 0.0,
+                    in_level_bake: true,
                     position: glam::Vec3::new(0.0, 0.0, 4.0),
                     direction: glam::Vec3::NEG_Z,
                     kind: LightKind::Point,
@@ -1468,33 +1931,100 @@ mod tests {
     /// As `render_thin_wire`, the wire leaning `tilt` radians from upright
     /// toward +x, and slid `shift_px` across itself.
     fn render_thin_wire_at(radius_px: f32, shift_px: f32, thin_px: Option<f32>, tilt: f32) -> Option<Vec<Vec<u8>>> {
-        const SIZE: u32 = 64;
-        let px = 2.0 / SIZE as f32;
-        let (device, queue) = headless_gpu()?;
-        let format = TextureFormat::Rgba8Unorm;
-        let lights = LightsUniform::new(&device);
-        lights.upload(&queue, &[]);
-        let (_shadows, uniforms) = scene_uniforms(&device, &lights);
-        uniforms.upload(&queue, glam::Mat4::IDENTITY, TEST_EYE, &ShadowUpload::disabled());
-        let pipeline = MeshPipeline::new_multisampled(&device, format, &uniforms.layout, 4);
-        let model = pipeline.create_model_uniform(&device);
-        // No sky, no lamp, no room: only the glow, so every pixel of the
-        // wire is the same light. With an identity camera the clip w is 1,
-        // so `params.w` is the width itself, in clip units.
-        model.upload_lit_bulb(&queue, glam::Mat4::IDENTITY, 0.0, 1.0, &[[0.0; 3]; 9], None, thin_px.map_or(0.0, |p| p * px));
-        let tex = crate::renderer::mesh::create_mesh_material_texture(
-            &device, &queue, &pipeline.texture_layout, &(vec![128, 128, 128, 255], 1, 1), &(vec![255; 4], 1, 1),
-        );
-        let lm = create_lightmap_texture(&device, &queue, &pipeline.lightmap_layout, &[0, 0, 0, 255], 1, 1, None);
+        render_wire(radius_px, shift_px, thin_px, tilt, WireLight::Glow, 1.0, false)
+    }
 
+    /// How `render_wire` lights its wire: by its own glow over black, or by a
+    /// lamp at its side -- over black, or over a grey wall, which shows a
+    /// wire pixel darker than what is behind it as well as one brighter.
+    #[derive(Clone, Copy, PartialEq)]
+    enum WireLight {
+        Glow,
+        Side,
+        SideOnWall,
+    }
+
+    /// What `WireLight::SideOnWall` clears to, as the target stores it.
+    const WALL: f32 = 51.0;
+
+    /// How far off to the wire's side `render_wire`'s lamp stands, and the
+    /// light it lands there with (radiance times the falloff).
+    const SIDE_LAMP_DISTANCE: f32 = 60.0;
+    const SIDE_LAMP_LIGHT: f32 = 6.0;
+
+    /// The wire `render_thin_wire_at` draws: glowing, or with `lit` dark
+    /// itself and lit by a lamp far off to its side, square to it and to the
+    /// eye -- the half of its visible side that faces the lamp lit, the other
+    /// half in the wire's own shadow, as a cage wire beside its bulb is. Then
+    /// the eye is far down -z, the side the identity camera shows. `zoom`
+    /// magnifies the camera, the scene shrunk to match: a wire past a third
+    /// of a pixel thick is thicker than a thin part can be (`THIN_RADIUS_MAX`)
+    /// at 1, and a thin part's pixels at 10. `sampled`: the thin pass shaded
+    /// per fragment, as before 2026-10-01 (`Levers::thin_shading_sampled`).
+    #[allow(clippy::too_many_arguments)]
+    fn render_wire(
+        radius_px: f32,
+        shift_px: f32,
+        thin_px: Option<f32>,
+        tilt: f32,
+        light: WireLight,
+        zoom: f32,
+        sampled: bool,
+    ) -> Option<Vec<Vec<u8>>> {
+        let lit = light != WireLight::Glow;
+        const SIZE: u32 = 64;
+        let px = 2.0 / SIZE as f32 / zoom;
         // The wire: 8 facets round, along `axis` at depth 0.5. Facing the
         // camera (which looks along +z) means a normal with -z in it.
         let (sides, r) = (8usize, radius_px * px);
         let (sin, cos) = tilt.sin_cos();
         let (axis, across) = (glam::Vec3::new(sin, cos, 0.0), glam::Vec3::new(cos, -sin, 0.0));
-        let middle = glam::Vec3::new(-0.3 * cos, 0.0, 0.5) + across * (shift_px * px);
+        let middle = glam::Vec3::new(-0.3 * cos / zoom, 0.0, 0.5) + across * (shift_px * px);
+        let (device, queue) = headless_gpu()?;
+        let format = TextureFormat::Rgba8Unorm;
+        let lights = LightsUniform::new(&device);
+        if lit {
+            lights.upload(
+                &queue,
+                &[Light {
+                    mask_channel: None,
+                    shadow_near: None,
+                    source_radius: 0.0,
+                    in_level_bake: true,
+                    position: middle + across * SIDE_LAMP_DISTANCE,
+                    direction: glam::Vec3::NEG_Z,
+                    kind: LightKind::Point,
+                    color: Color3(255, 255, 255, 255),
+                    intensity: SIDE_LAMP_LIGHT * SIDE_LAMP_DISTANCE * SIDE_LAMP_DISTANCE,
+                    range: 1000.0,
+                    cone_angle_deg: 90.0,
+                    inner_cone_angle_deg: 0.0,
+                }],
+            );
+        } else {
+            lights.upload(&queue, &[]);
+        }
+        let (_shadows, uniforms) = scene_uniforms(&device, &lights);
+        let eye = if lit { glam::Vec3::new(0.0, 0.0, -1.0e4) } else { TEST_EYE };
+        uniforms.upload(&queue, glam::Mat4::from_scale(glam::Vec3::new(zoom, zoom, 1.0)), eye, &ShadowUpload::disabled());
+        let pipeline = if sampled {
+            MeshPipeline::new_multisampled_thin_sampled(&device, format, &uniforms.layout, 4)
+        } else {
+            MeshPipeline::new_multisampled(&device, format, &uniforms.layout, 4)
+        };
+        let model = pipeline.create_model_uniform(&device);
+        // No sky, no room, and either the glow alone, so every pixel of the
+        // wire is the same light, or the lamp alone. With an identity camera
+        // the clip w is 1, so `params.w` is the width itself, in clip units.
+        let glow = if lit { 0.0 } else { 1.0 };
+        model.upload_lit_bulb(&queue, glam::Mat4::IDENTITY, 0.0, glow, &[[0.0; 3]; 9], None, thin_px.map_or(0.0, |p| p * px));
+        let tex = crate::renderer::mesh::create_mesh_material_texture(
+            &device, &queue, &pipeline.texture_layout, &(vec![128, 128, 128, 255], 1, 1), &(vec![255; 4], 1, 1),
+        );
+        let lm = create_lightmap_texture(&device, &queue, &pipeline.lightmap_layout, &[0, 0, 0, 255], 1, 1, None);
+
         let mut verts = Vec::new();
-        for (y, _) in [(-0.9f32, 0), (0.9, 1)] {
+        for (y, _) in [(-0.9 / zoom, 0), (0.9 / zoom, 1)] {
             for k in 0..sides {
                 let a = k as f32 / sides as f32 * std::f32::consts::TAU;
                 let n = across * a.cos() + glam::Vec3::Z * a.sin();
@@ -1555,7 +2085,15 @@ mod tests {
                     view: &mv,
                     depth_slice: None,
                     resolve_target: Some(&rv),
-                    ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store },
+                    ops: Operations {
+                        load: LoadOp::Clear(if light == WireLight::SideOnWall {
+                            let w = WALL as f64 / 255.0;
+                            Color { r: w, g: w, b: w, a: 1.0 }
+                        } else {
+                            Color::BLACK
+                        }),
+                        store: StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                     view: &dv,
@@ -1614,8 +2152,19 @@ mod tests {
     }
 
     fn wire_light_across_shifts_at(radius_px: f32, thin_px: Option<f32>, tilt: f32) -> Option<(f32, f32)> {
+        wire_light_across_shifts_lit(radius_px, thin_px, tilt, WireLight::Glow, 1.0, false)
+    }
+
+    fn wire_light_across_shifts_lit(
+        radius_px: f32,
+        thin_px: Option<f32>,
+        tilt: f32,
+        light: WireLight,
+        zoom: f32,
+        sampled: bool,
+    ) -> Option<(f32, f32)> {
         let rows: Vec<Vec<f32>> = (0..8)
-            .map(|k| render_thin_wire_at(radius_px, k as f32 / 8.0, thin_px, tilt))
+            .map(|k| render_wire(radius_px, k as f32 / 8.0, thin_px, tilt, light, zoom, sampled))
             .map(|image| Some(image?.iter().map(|row| row.iter().map(|&v| v as f32).sum()).collect()))
             .collect::<Option<_>>()?;
         let (mut mean_all, mut cv_all, mut n) = (0.0, 0.0, 0.0);
@@ -1658,19 +2207,47 @@ mod tests {
     }
 
     fn wire_steps_at(radius_px: f32, thin_px: Option<f32>, tilt: f32) -> Option<f32> {
-        let images: Vec<Vec<Vec<u8>>> =
-            (0..8).map(|k| render_thin_wire_at(radius_px, k as f32 / 8.0, thin_px, tilt)).collect::<Option<_>>()?;
-        let (mut sum, mut n, mut peak) = (0.0f32, 0.0f32, 0.0f32);
+        wire_steps_lit(radius_px, thin_px, tilt, WireLight::Glow, 1.0)
+    }
+
+    /// The headset's J on one wire, in 8-bit levels: each pixel's second
+    /// difference across eighth-pixel shifts, RMS over every pixel of the
+    /// middle rows -- the same pixels whatever is drawn, so a wire that steps
+    /// less scores less however faint it is against what is behind it.
+    fn wire_crawl(radius_px: f32, thin_px: Option<f32>, tilt: f32, light: WireLight, zoom: f32, sampled: bool) -> Option<f32> {
+        let images: Vec<Vec<Vec<u8>>> = (0..8)
+            .map(|k| render_wire(radius_px, k as f32 / 8.0, thin_px, tilt, light, zoom, sampled))
+            .collect::<Option<_>>()?;
+        let mut sum = 0.0f32;
         for y in 16..48 {
             for x in 0..64 {
                 let v = |k: usize| images[k][y][x] as f32;
                 for k in 1..7 {
-                    if v(k - 1) + v(k) + v(k + 1) > 0.0 {
+                    let d = v(k + 1) - 2.0 * v(k) + v(k - 1);
+                    sum += d * d;
+                }
+            }
+        }
+        Some((sum / (32.0 * 64.0 * 6.0)).sqrt())
+    }
+
+    /// Over a wall, each pixel as it differs from the wall: a wire pixel
+    /// darker than what is behind it steps as much as a brighter one.
+    fn wire_steps_lit(radius_px: f32, thin_px: Option<f32>, tilt: f32, light: WireLight, zoom: f32) -> Option<f32> {
+        let images: Vec<Vec<Vec<u8>>> =
+            (0..8).map(|k| render_wire(radius_px, k as f32 / 8.0, thin_px, tilt, light, zoom, false)).collect::<Option<_>>()?;
+        let behind = if light == WireLight::SideOnWall { WALL } else { 0.0 };
+        let (mut sum, mut n, mut peak) = (0.0f32, 0.0f32, 0.0f32);
+        for y in 16..48 {
+            for x in 0..64 {
+                let v = |k: usize| images[k][y][x] as f32 - behind;
+                for k in 1..7 {
+                    if v(k - 1).abs() + v(k).abs() + v(k + 1).abs() > 0.0 {
                         let d = v(k + 1) - 2.0 * v(k) + v(k - 1);
                         sum += d * d;
                         n += 1.0;
                     }
-                    peak = peak.max(v(k));
+                    peak = peak.max(v(k).abs());
                 }
             }
         }
@@ -1770,6 +2347,112 @@ mod tests {
             assert!((b / a - 1.0).abs() < 0.03, "a 6 px part, shifted {shift} px: light {b} against {a}");
             let middle = |image: &Vec<Vec<u8>>| *image[32].iter().max().unwrap() as i32;
             assert!((middle(&plain) - middle(&thin)).abs() <= 2, "its middle, shifted {shift} px");
+        }
+    }
+
+    /// THE THIN PASS's MEANS ARE EVERY MESH's TERMS. `THIN_SHADE` writes the
+    /// sky's and the room's harmonics of the normal's moments, and repeats the
+    /// light loop's shadows: held here to the functions they mirror, term for
+    /// term, so a change to one that misses the other fails.
+    #[test]
+    fn the_thin_pass_takes_the_same_terms_and_shadows_as_every_mesh() {
+        let code = |text: &str| -> Vec<String> {
+            text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")).map(String::from).collect()
+        };
+        let moments = |line: &str| {
+            line.replace("(0.488603 * y)", "(0.488603 * m.n.y)")
+                .replace("(0.488603 * z)", "(0.488603 * m.n.z)")
+                .replace("(0.488603 * x)", "(0.488603 * m.n.x)")
+                .replace("(1.092548 * x * y)", "(1.092548 * m.off.x)")
+                .replace("(1.092548 * y * z)", "(1.092548 * m.off.y)")
+                .replace("(3.0 * z * z - 1.0)", "(3.0 * m.diag.z - 1.0)")
+                .replace("(1.092548 * x * z)", "(1.092548 * m.off.z)")
+                .replace("(x * x - y * y)", "(m.diag.x - m.diag.y)")
+        };
+        let body = |text: &str, from: &str, to: &str| -> Vec<String> {
+            let start = text.find(from).unwrap_or_else(|| panic!("no `{from}`"));
+            let end = start + text[start..].find(to).unwrap_or_else(|| panic!("no `{to}` after `{from}`")) + to.len();
+            code(&text[start..end])
+        };
+        let thin = code(THIN_SHADE);
+        let lights = crate::renderer::lights::wgsl_lights_block(0, 1);
+        let sky = body(&lights, "fn sky_irradiance(", "return max(e, vec3<f32>(0.0));");
+        let room = body(wgsl_room_irradiance(), "fn room_irradiance(", "return max(e, vec3<f32>(0.0));");
+        for line in sky.iter().chain(&room).filter(|l| l.contains("_sh[") || l.contains("room[")) {
+            let want = moments(line);
+            assert!(thin.contains(&want), "THIN_SHADE lacks `{want}`, its mean of `{line}`");
+        }
+        let shade_with_sky = &lights[lights.find("fn shade_with_sky(").expect("the lights block shades meshes")..];
+        let shadows = body(shade_with_sky, "if (l.params.z > 1.5) {\n            c = c * hf(sun_visibility", "c = c * hf(character_shadow(i, world_pos));\n        }");
+        let found = thin.windows(shadows.len()).any(|w| w == shadows.as_slice());
+        assert!(found, "THIN_SHADE's shadows are not `shade_with_sky`'s:\n{}", shadows.join("\n"));
+    }
+
+    /// What a pixel wider than `render_wire`'s side-lit wire shows of it: the
+    /// light round its visible side -- `light_contribution`'s diffuse and
+    /// highlight, the eye down -z and the lamp square to both -- averaged
+    /// across the wire as the screen sees it (evenly in u = sin of the angle
+    /// round from the eye), summed finely. Times the lamp's light: what the
+    /// albedo multiplies.
+    fn side_lit_wire_mean() -> f32 {
+        let (eye, lamp) = (glam::Vec3::NEG_Z, glam::Vec3::X);
+        let half = (lamp + eye).normalize();
+        let steps = 20_000;
+        let sum: f32 = (0..steps)
+            .map(|k| {
+                let u = -1.0 + (k as f32 + 0.5) / steps as f32 * 2.0;
+                let n = eye * (1.0 - u * u).max(0.0).sqrt() + lamp * u;
+                let facing = n.dot(lamp).max(0.0);
+                let highlight = if facing > 0.0 { n.dot(half).max(0.0).powf(32.0) * 0.35 } else { 0.0 };
+                facing + highlight
+            })
+            .sum();
+        SIDE_LAMP_LIGHT * sum / steps as f32
+    }
+
+    /// A WIRE LIT FROM ITS SIDE: its lit half and its shadowed half inside
+    /// one pixel, which shows their average. The thin pass shaded each
+    /// fragment of the widened band from the normal interpolated there -- the
+    /// lit half of the wire on one side of the band, the dark half on the
+    /// other -- so as the wire slid, which fragments sampled which half
+    /// changed: the lit side of a cage wire beside its bulb crawled at every
+    /// millimetre of head movement (headset census, 2026-10-01: J 0.17 on
+    /// hall_front's near pendant, the most left in the level). Shaded with
+    /// the mean over the stretch of the wire each fragment's kernel reaches
+    /// (`THIN_SHADE`), at any slant every row keeps its light as it slides,
+    /// its pixels move with it, and the light is the wire's own.
+    #[test]
+    fn a_side_lit_thin_wire_keeps_its_light_and_its_shading_as_it_slides() {
+        let albedo = ((128.0f32 / 255.0 + 0.055) / 1.055).powf(2.4);
+        let colour = crate::renderer::tonemap::tonemap(
+            glam::Vec3::splat(albedo * side_lit_wire_mean()),
+            1.0,
+            crate::renderer::tonemap::ToneMapping::Aces,
+        )
+        .x;
+        // A third of a pixel thick, and (zoomed, still a thin part) 1.6.
+        for (radius, zoom) in [(0.16f32, 1.0f32), (0.8, 10.0)] {
+            for degrees in [0.0f32, 22.5, 26.57, 45.0] {
+                let tilt = degrees.to_radians();
+                let Some((mean, cv)) = wire_light_across_shifts_lit(radius, Some(1.0), tilt, WireLight::Side, zoom, false) else {
+                    return;
+                };
+                let (sampled, sampled_cv) = wire_light_across_shifts_lit(radius, Some(1.0), tilt, WireLight::Side, zoom, true).unwrap();
+                let crawl = wire_crawl(radius, Some(1.0), tilt, WireLight::SideOnWall, zoom, false).unwrap();
+                let sampled_crawl = wire_crawl(radius, Some(1.0), tilt, WireLight::SideOnWall, zoom, true).unwrap();
+                let truth = 2.0 * radius / tilt.cos() * 255.0 * colour;
+                eprintln!(
+                    "SIDE-LIT wire {:.2} px at {degrees} degrees: light {mean:.1} against {truth:.1}, varies {:.1}%, crawl {crawl:.3} levels \
+                     (per fragment: {sampled:.1}, {:.1}%, {sampled_crawl:.3})",
+                    2.0 * radius,
+                    cv * 100.0,
+                    sampled_cv * 100.0
+                );
+                assert!(sampled < 0.7 * truth, "per fragment it came out dark ({sampled:.1} against {truth:.1}), or this measures nothing");
+                assert!(cv < 0.05, "a row's light holds as it slides: varies {:.1}%", cv * 100.0);
+                assert!((mean / truth - 1.0).abs() < 0.06, "it is the wire's own light: {mean:.1} against {truth:.1}");
+                assert!(crawl < sampled_crawl * 1.05, "and steps no more than it did: {crawl:.3} against {sampled_crawl:.3}");
+            }
         }
     }
 
@@ -1989,3 +2672,4 @@ pub fn mesh_shader_src() -> String {
 pub fn skinned_mesh_shader_src() -> String {
     skinned_mesh_shader()
 }
+

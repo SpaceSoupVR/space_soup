@@ -70,6 +70,25 @@ pub struct BenchPose {
     /// still.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sway: Option<f32>,
+    /// The player's flashlight, held still for this view: its glass at `at`,
+    /// aimed at `aim`, world metres, the torch drawn with it when `torch`.
+    /// Absent: none, whatever the player last switched on -- a benchmark
+    /// measures what it names. See quest_app's `flashlight`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flashlight: Option<BenchFlashlight>,
+}
+
+/// A flashlight a bench view holds still. See [`BenchPose::flashlight`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchFlashlight {
+    /// Where the glass is, world metres.
+    pub at: [f32; 3],
+    /// What the beam is aimed at, world metres.
+    pub aim: [f32; 3],
+    /// Whether the torch itself is drawn, as well as its light.
+    #[serde(default)]
+    pub torch: bool,
 }
 
 impl BenchPose {
@@ -89,6 +108,14 @@ impl BenchPose {
         }
         if self.sway.is_some_and(|s| !(0.0..=MAX_SWAY).contains(&s)) {
             return Some(format!("bench '{}' sways by {:?} m: 0 to {MAX_SWAY} m", self.name, self.sway));
+        }
+        if let Some(f) = &self.flashlight {
+            if !f.at.iter().chain(f.aim.iter()).all(|v| v.is_finite()) {
+                return Some(format!("bench '{}' has a flashlight coordinate that is not a number", self.name));
+            }
+            if (Vec3::from(f.aim) - Vec3::from(f.at)).length_squared() < 1e-6 {
+                return Some(format!("bench '{}' aims its flashlight at its own glass", self.name));
+            }
         }
         None
     }
@@ -194,7 +221,7 @@ mod tests {
     use super::*;
 
     fn pose(eye: [f32; 3], at: [f32; 3]) -> BenchPose {
-        BenchPose { name: "t".into(), eye, at, rig_yaw: None, sway: None }
+        BenchPose { name: "t".into(), eye, at, rig_yaw: None, sway: None, flashlight: None }
     }
 
     /// Through the same transform the app puts every tracked pose through:
@@ -314,5 +341,25 @@ mod tests {
         assert!(BenchPose { name: String::new(), ..pose([0.0; 3], [1.0; 3]) }.problem().is_some());
         assert!(pose([0.0; 3], [0.0; 3]).problem().is_some(), "a view with no direction");
         assert!(pose([f32::NAN, 0.0, 0.0], [1.0; 3]).problem().is_some());
+    }
+
+    #[test]
+    fn a_bench_flashlight_reads_from_the_lever_file_and_is_checked() {
+        let lit: BenchPose = serde_json::from_str(
+            r#"{"name": "t", "eye": [0, 1.6, 0], "at": [0, 1, -3],
+                "flashlight": {"at": [0.2, 1.2, -0.2], "aim": [0, 0.5, -3], "torch": true}}"#,
+        )
+        .expect("a view with a flashlight parses");
+        let f = lit.flashlight.as_ref().expect("the flashlight is kept");
+        assert!(f.torch && f.at == [0.2, 1.2, -0.2]);
+        assert!(lit.problem().is_none());
+        let no_torch: BenchFlashlight = serde_json::from_str(r#"{"at": [0, 1, 0], "aim": [0, 0, -1]}"#).unwrap();
+        assert!(!no_torch.torch, "the torch is drawn only when asked for");
+        let pointless = BenchPose {
+            flashlight: Some(BenchFlashlight { at: [1.0; 3], aim: [1.0; 3], torch: false }),
+            ..pose([0.0; 3], [0.0, 0.0, -1.0])
+        };
+        assert!(pointless.problem().is_some(), "a flashlight aimed at its own glass");
+        assert!(serde_json::from_str::<BenchFlashlight>(r#"{"at": [0, 1, 0], "aim": [0, 0, -1], "beam": 3}"#).is_err());
     }
 }

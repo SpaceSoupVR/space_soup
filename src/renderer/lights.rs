@@ -6,7 +6,15 @@ use super::Color3;
 
 /// Matches the fixed-size `array<Light, MAX_LIGHTS>` declared in the mesh/solid
 /// fragment shaders — keep these in sync.
-pub const MAX_LIGHTS: usize = 8;
+///
+/// SIXTEEN, not eight (2026-10-02). test_room's seven lamps, the sky's sun and
+/// the player's flashlight are nine already: with eight, lighting the torch
+/// dropped the brick wall wash's light from every surface, and the torch's
+/// bounce never made the cut at all. Only the lights a frame actually has are
+/// walked -- every loop runs to `count`, and each lamp that cannot reach a
+/// pixel is skipped there -- and the array's size costs nothing of its own: the
+/// driver reads these blocks through memory whatever their size (exp63).
+pub const MAX_LIGHTS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightKind {
@@ -344,6 +352,9 @@ pub fn sky_sun_light(
     };
     Some(Light {
         mask_channel: None,
+        shadow_near: None,
+        source_radius: 0.0,
+        in_level_bake: true,
         position: Vec3::ZERO,
         // The way the light TRAVELS -- away from the sun.
         direction: world_to_player * -Vec3::from(sun.direction),
@@ -429,17 +440,21 @@ pub fn static_sun_matrix(
 /// only stable one is its position in the list it came in on. The shadow slots
 /// need exactly that -- see [`spot_shadow_slots`].
 pub fn rank_for_budget_indices(lights: &[Light], max: usize) -> Vec<usize> {
-    if lights.len() <= max {
-        return (0..lights.len()).collect();
-    }
     let mut idx: Vec<usize> = (0..lights.len()).collect();
-    idx.sort_by(|&a, &b| {
-        influence_score(&lights[b])
-            .partial_cmp(&influence_score(&lights[a]))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
-    idx.truncate(max);
+    if lights.len() > max {
+        idx.sort_by(|&a, &b| {
+            influence_score(&lights[b])
+                .partial_cmp(&influence_score(&lights[a]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        idx.truncate(max);
+    }
+    // THE LIT SURFACES' LIGHTS FIRST, each kind in its own order: the scene
+    // readers shade those from the front of the list on their own
+    // (`GpuLights::surface_lights`). Only the order of what fits changes,
+    // never which lights fit.
+    idx.sort_by_key(|&i| !lights[i].is_surface_light());
     idx
 }
 
@@ -464,9 +479,64 @@ pub struct Light {
     /// bake. `None` for every other light. See `stationary_visibility` in the
     /// lights block and `space_soup_engine::stationary`.
     pub mask_channel: Option<u8>,
+    /// Where a spot's shadow map begins, metres from the light. `None` is a
+    /// fixture's [`super::shadow::SPOT_SHADOW_NEAR`], which leaves the lamp's
+    /// own housing out of its map; a light with nothing round it -- the
+    /// player's flashlight, whose glass is the front of the torch -- gives its
+    /// own, so a hand a few centimetres in front of it still casts. See
+    /// `shadow::spot_shadow_matrices`, which keeps the shadow's bias in step.
+    /// Past the light's range, it casts no shadow at all: see
+    /// [`Light::casts_shadow`].
+    pub shadow_near: Option<f32>,
+    /// HOW WIDE ITS SOURCE IS, metres: the radius of the patch a light that
+    /// stands for a lit SURFACE gives its light off from -- a flashlight's
+    /// bounce ([`SURFACE_LIGHT`]). Its light falls off as `1 / (d^2 + r^2)`,
+    /// what a disc that wide gives on its axis, so nothing beside the patch is
+    /// lit more than the patch could light it. A point standing for a metre of
+    /// lit wall lit the stone a few centimetres off at hundreds of times what
+    /// it gave a metre away (headset, 2026-10-02: "a bright spot that looked
+    /// almost like what it looks like when you focus a light through a
+    /// magnifying glass"). 0 for a bulb, whose near field the lights block
+    /// holds at its `LAMP_RADIUS`. Only a light that casts no shadow carries
+    /// it to the GPU (`pack_lights`): a lamp with a shadow is a bulb.
+    pub source_radius: f32,
+    /// WHETHER THE LEVEL'S BAKE SAW IT: its light is in the probe photographs
+    /// and the models' cards already -- every light a level authors, whatever
+    /// its mode. One the game adds while it runs -- the player's flashlight,
+    /// its bounce -- is not, and a reflection of a model on cards takes its
+    /// light there (`PROBE_CARD_RELIT`): `position.w` -1 on the GPU.
+    pub in_level_bake: bool,
 }
 
 impl Light {
+    /// Whether this light can cast a shadow: not when its shadow would begin
+    /// past where its light ends. Such a light takes no spot shadow slot and
+    /// no characters' tile -- a flashlight's BOUNCE, which stands for a lit
+    /// patch of wall: a source that wide casts no shadow sharp enough to map,
+    /// and its half-space cone no shadow map can hold.
+    pub fn casts_shadow(&self) -> bool {
+        self.shadow_near.is_none_or(|near| near < self.range)
+    }
+
+    /// Whether the scene readers shade this light ON ITS OWN, as a lit
+    /// surface's (`surface_lights` in the lights block) rather than through
+    /// their lamp loop: it casts no shadow, so the shader gives it no
+    /// highlight either ([`SURFACE_LIGHT`]), and a spot's edge spans more
+    /// cosine than [`SURFACE_LIGHT_MIN_BAND`]. A flashlight's bounce.
+    /// [`rank_for_budget_indices`] puts these at the front of the list, and
+    /// `pack_lights` counts them there.
+    pub fn is_surface_light(&self) -> bool {
+        !self.casts_shadow()
+            && match self.kind {
+                LightKind::Point => true,
+                LightKind::Spot => {
+                    let (cos_outer, cos_inner) = self.cone_cosines();
+                    cos_inner - cos_outer > SURFACE_LIGHT_MIN_BAND
+                }
+                LightKind::Directional => false,
+            }
+    }
+
     /// The cosines of a spot's outer and inner half-angles, as the shader's
     /// `spot_cone` takes them.
     pub fn cone_cosines(&self) -> (f32, f32) {
@@ -488,7 +558,8 @@ struct GpuLight {
     direction: [f32; 4],
     color_intensity: [f32; 4],
     /// x = range, y = cos(outer half-angle), z = kind (0 = point, 1 = spot),
-    /// w = which spot shadow layer this light casts into, or -1 for none.
+    /// w = which spot shadow layer this light casts into, or -1 for none --
+    /// [`SURFACE_LIGHT`] for a light that stands for a lit surface.
     ///
     /// `direction.w` carries cos(inner half-angle) -- it was padding, and the
     /// inner angle is measured against that very direction.
@@ -497,6 +568,57 @@ struct GpuLight {
     /// of the light. The camera used to carry a single "flashlight index",
     /// which by construction could only ever name one shadow-casting spot.
     params: [f32; 4],
+}
+
+/// A SURFACE A LIVE LAMP'S BEAM IS KNOWN TO LIGHT, in the PLAYER's frame like
+/// every light: the plane `normal . p == offset`, `normal` facing the lamp, and
+/// its albedo, linear RGB -- with the frame of its POOL MAP, the beam's light
+/// on that plane as seen from the glass: where the glass is (`lens`), the
+/// map's middle (`forward`, the beam's axis) and across (`right`), and how far
+/// off the axis it reaches, as a tangent (`tan_half`; 0 for none). A
+/// flashlight's rays find these where they land
+/// (`quest_app::flashlight_bounce`). Each frame the lamps the bake never saw
+/// light every such plane into its map (`pool_cards`, `pool_map_light` in the
+/// shader); a reflection meeting the plane reads it there, so the torch's
+/// pool on a wall shows in the polished floor (`probe_surface_relit`) -- the
+/// photographs hold only the level's own light.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LitSurface {
+    pub normal: Vec3,
+    pub offset: f32,
+    pub albedo: Vec3,
+    pub lens: Vec3,
+    pub forward: Vec3,
+    pub right: Vec3,
+    pub tan_half: f32,
+}
+
+/// How many [`LitSurface`]s the shaders take: a pool map each, in the card
+/// atlas's rows kept for them (`pool_cards`).
+pub const MAX_LIT_SURFACES: usize = 6;
+
+/// The vec4s a surface takes in the lights block. See [`pack_lit_surfaces`].
+pub const LIT_SURFACE_VEC4S: usize = 5;
+
+/// The surfaces as the shader reads them, five vec4s each: the plane; the
+/// glass and the map's reach (0 ends the list); the beam's axis and the
+/// card-atlas texel row the maps start at; the map's across; the albedo. NONE
+/// without that row: then no map is made this frame, and none may be read.
+/// See `lit_surface_at` and `pool_map_light` in the shader.
+fn pack_lit_surfaces(surfaces: &[LitSurface], pool_row: Option<u32>) -> [[f32; 4]; LIT_SURFACE_VEC4S * MAX_LIT_SURFACES] {
+    let mut out = [[0.0; 4]; LIT_SURFACE_VEC4S * MAX_LIT_SURFACES];
+    let Some(row) = pool_row else {
+        return out;
+    };
+    for (k, s) in surfaces.iter().filter(|s| s.tan_half > 0.0).take(MAX_LIT_SURFACES).enumerate() {
+        let at = LIT_SURFACE_VEC4S * k;
+        out[at] = [s.normal.x, s.normal.y, s.normal.z, s.offset];
+        out[at + 1] = [s.lens.x, s.lens.y, s.lens.z, s.tan_half];
+        out[at + 2] = [s.forward.x, s.forward.y, s.forward.z, row as f32];
+        out[at + 3] = [s.right.x, s.right.y, s.right.z, 0.0];
+        out[at + 4] = [s.albedo.x, s.albedo.y, s.albedo.z, 0.0];
+    }
+    out
 }
 
 #[repr(C)]
@@ -509,7 +631,14 @@ struct GpuLights {
     /// shader); w = 1 turns the lamps' footprint-filtered terminator OFF, to
     /// measure it (see `terminator_aa` in the shader).
     count: [u32; 4],
+    /// x = how many lights, from the front, are lit surfaces' own
+    /// ([`Light::is_surface_light`]), which the scene readers shade apart
+    /// (`surface_lights` in the shader) and their lamp loop starts past; 0
+    /// with the `surface_light_loop` lever off, and they are lamps there.
+    surface_lights: [u32; 4],
     lights: [GpuLight; MAX_LIGHTS],
+    /// The frame's [`LitSurface`]s: see `pack_lit_surfaces`.
+    surfaces: [[f32; 4]; LIT_SURFACE_VEC4S * MAX_LIT_SURFACES],
 }
 
 /// Owns just the GPU buffer — the bind group itself lives alongside the
@@ -528,6 +657,17 @@ pub struct LightsUniform {
     /// (`terminator_aa` in the shader). On as shipped; off only to measure it
     /// (the `terminator_aa` lever).
     terminator_aa: std::cell::Cell<bool>,
+    /// Whether the scene readers shade the lit surfaces' lights apart from
+    /// the lamps (`GpuLights::surface_lights`). On as shipped; off only to
+    /// measure it (the `surface_light_loop` lever).
+    surface_lights_apart: std::cell::Cell<bool>,
+    /// The surfaces the live lamps' beams are known to light, in order. See
+    /// [`LitSurface`]. Uploaded with the lights.
+    surfaces: std::cell::Cell<[Option<LitSurface>; MAX_LIT_SURFACES]>,
+    /// The card-atlas texel row their pool maps are made in this frame, or
+    /// none where none are made -- and then no surface is uploaded. See
+    /// `pool_cards`.
+    pool_row: std::cell::Cell<Option<u32>>,
 }
 
 impl LightsUniform {
@@ -539,7 +679,45 @@ impl LightsUniform {
             mapped_at_creation: false,
         });
 
-        Self { buffer, culling: std::cell::Cell::new(true), terminator_aa: std::cell::Cell::new(true) }
+        Self {
+            buffer,
+            culling: std::cell::Cell::new(true),
+            terminator_aa: std::cell::Cell::new(true),
+            surface_lights_apart: std::cell::Cell::new(true),
+            surfaces: std::cell::Cell::new([None; MAX_LIT_SURFACES]),
+            pool_row: std::cell::Cell::new(None),
+        }
+    }
+
+    /// The surfaces the live lamps' beams light this frame, at most
+    /// [`MAX_LIT_SURFACES`], brightest first; one with no map's reach is left
+    /// out. Takes effect with the next upload.
+    pub fn set_lit_surfaces(&self, surfaces: &[LitSurface]) {
+        let mut held = [None; MAX_LIT_SURFACES];
+        for (slot, s) in held.iter_mut().zip(surfaces.iter().filter(|s| s.tan_half > 0.0)) {
+            *slot = Some(*s);
+        }
+        self.surfaces.set(held);
+    }
+
+    /// The surfaces the next upload sends, in the order their pool maps lie in
+    /// the atlas (`pool_cards`).
+    pub fn lit_surfaces(&self) -> Vec<LitSurface> {
+        self.surfaces.get().iter().flatten().copied().collect()
+    }
+
+    /// The card-atlas texel row the pool maps are made in this frame, or None
+    /// where they are not made -- then no surface is uploaded, so none is
+    /// read. Takes effect with the next upload.
+    pub fn set_pool_row(&self, row: Option<u32>) {
+        self.pool_row.set(row);
+    }
+
+    /// The next upload sends a surface for the pool maps' lookup to read.
+    /// Where it does not, every lookup adds nothing, and the reflection
+    /// passes' poolless twins draw the same pixels (`without_pool_maps`).
+    pub fn reads_pool_maps(&self) -> bool {
+        self.pool_row.get().is_some() && self.surfaces.get().iter().any(Option::is_some)
     }
 
     /// See `culling`. Takes effect with the next upload.
@@ -550,6 +728,11 @@ impl LightsUniform {
     /// See `terminator_aa`. Takes effect with the next upload.
     pub fn set_terminator_aa(&self, on: bool) {
         self.terminator_aa.set(on);
+    }
+
+    /// See `surface_lights_apart`. Takes effect with the next upload.
+    pub fn set_surface_lights_apart(&self, on: bool) {
+        self.surface_lights_apart.set(on);
     }
 
     pub fn buffer(&self) -> &Buffer {
@@ -602,17 +785,55 @@ impl LightsUniform {
     ) {
         let mut gpu = pack_lights(lights, live, spot_layers, sun_is_baked, self.culling.get());
         gpu.count[3] = u32::from(!self.terminator_aa.get());
+        if !self.surface_lights_apart.get() {
+            gpu.surface_lights[0] = 0;
+        }
+        gpu.surfaces = pack_lit_surfaces(&self.lit_surfaces(), self.pool_row.get());
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&gpu));
     }
 }
+
+/// The pool map's light at a reflection's hit, read in `probe_hit_colour` with
+/// the photographs' four texels so all five reads wait together
+/// (`probe_surface_relit`), and added to a hit off any model -- in the passes
+/// that ship (the deferring probe pass and its fix-up) and nowhere else. The
+/// `*_cut_relight` measurement cuts take both out.
+pub(crate) const SURFACE_RELIT_READ: &str = "    let relit = probe_surface_relit(h, d, roughness, t);\n";
+pub(crate) const SURFACE_RELIT_CALL: &str = "    if (!model) {\n        col = vec4<f32>(col.rgb + relit, col.a);\n    }\n";
+
+/// `GpuLight::params.w` for a light that stands for a lit SURFACE -- one that
+/// casts no shadow ([`Light::casts_shadow`]), a flashlight's bounce off a
+/// wall: it lights as any lamp does but makes no highlight, a point's
+/// highlight being the reflection of something a metre wide. Below the
+/// shadow layers' -1, so every `layer >= 0` test reads it as no layer. Less
+/// the patch's radius ([`Light::source_radius`]), which the lights block
+/// reads back as `-2 - params.w`.
+pub const SURFACE_LIGHT: f32 = -2.0;
+
+/// A spot whose soft edge spans more cosine than this is shaded as a lit
+/// surface's light ([`Light::is_surface_light`]): its edge ramped plainly, the
+/// baker's smoothstep from the outer cosine to the inner. `spot_cone` would
+/// not widen an edge this wide, and its average along the pixel's long step
+/// would be no truer: that average stretches the ramp about its middle, a box
+/// filter's width for an edge about a pixel wide, while across an edge this
+/// wide a pixel's true mean IS the plain ramp to second order in what the
+/// pixel spans (`surface_light_gpu_tests`). Offline renders of six torch
+/// views moved by at most one level, on no pixel by more (2026-10-06). A
+/// flashlight's bounce is a half space or wider
+/// (`quest_app::flashlight_bounce`); every lamp's edge is far narrower -- the
+/// torch's 0.084, a 16 degree hot spot in 50.
+pub const SURFACE_LIGHT_MIN_BAND: f32 = 0.5;
 
 /// The GPU's copy of a frame's lights. See `GpuLights::count`.
 fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_baked: bool, culling: bool) -> GpuLights {
     {
         let count = lights.len().min(MAX_LIGHTS);
+        let surface = lights.iter().take(live.min(count)).take_while(|l| l.is_surface_light()).count();
         let mut gpu = GpuLights {
             count: [count as u32, live.min(count) as u32, u32::from(!culling), 0],
+            surface_lights: [surface as u32, 0, 0, 0],
             lights: [GpuLight::zeroed(); MAX_LIGHTS],
+            surfaces: [[0.0; 4]; LIT_SURFACE_VEC4S * MAX_LIT_SURFACES],
         };
         for (slot, l) in gpu.lights.iter_mut().zip(lights.iter().take(MAX_LIGHTS)) {
             let color = l.color.to_linear();
@@ -627,17 +848,24 @@ fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_bake
             let baked = sun_is_baked && l.kind == LightKind::Directional;
             // position.w = 1 marks the sky's sun -- see `sun_visibility`; 2 + c
             // a stationary lamp shadowed by mask channel c -- see
-            // `stationary_visibility`.
+            // `stationary_visibility`; -1 a light the level's bake never saw --
+            // see `PROBE_CARD_RELIT`.
             let marker = match l.mask_channel {
                 Some(c) => 2.0 + c as f32,
                 None if baked => 1.0,
+                None if !l.in_level_bake => -1.0,
                 None => 0.0,
             };
             *slot = GpuLight {
                 position: [l.position.x, l.position.y, l.position.z, marker],
                 direction: [l.direction.x, l.direction.y, l.direction.z, cos_inner],
                 color_intensity: [color[0], color[1], color[2], l.intensity],
-                params: [l.range, cos_outer, kind, -1.0],
+                params: [
+                    l.range,
+                    cos_outer,
+                    kind,
+                    if l.casts_shadow() { -1.0 } else { SURFACE_LIGHT - l.source_radius.max(0.0) },
+                ],
             };
         }
         for (layer, &light_index) in spot_layers.iter().enumerate() {
@@ -688,6 +916,45 @@ pub fn wgsl_lights_block(group_index: u32, binding_index: u32) -> String {
     wgsl_lights_block_with(group_index, binding_index, LightsBlockOptions::default())
 }
 
+/// The lights block's switch for the spots' shadow maps, as generated: on.
+pub const SPOT_SHADOWS_ON: &str = "const SPOT_SHADOWS: bool = true;";
+const SPOT_SHADOWS_OFF: &str = "const SPOT_SHADOWS: bool = false;";
+/// The lights block's switch for the scene readers' own loop over the lit
+/// surfaces' lights (`surface_lights` in the shader), as generated: on.
+pub const SURFACE_LIGHTS_ON: &str = "const SURFACE_LIGHTS: bool = true;";
+const SURFACE_LIGHTS_OFF: &str = "const SURFACE_LIGHTS: bool = false;";
+
+/// A scene shader's SPOTLESS TWIN: `src` with the spots' shadow maps never
+/// read, so the compiler drops the tent and everything only it kept live. The
+/// same pixels in any frame where no spot casts (`shadow_params.y` = 0), where
+/// every spot's test is false anyway. 2026-10-02: the tent alone took the
+/// scene readers from 19 registers to 22 and their occupancy from 62% to 50%,
+/// in every view, for the flashlight's sake.
+///
+/// AND NO LIT SURFACE'S LIGHT SHADED APART: the readers' loop over them
+/// (`surface_lights`) is compiled out with the spots' shadows, since a frame
+/// with one draws with the full readers (`XrRenderer::spotless_frame`) -- a
+/// flashlight's bounce comes with its beam. Any such light in a spotless
+/// frame is shaded as a lamp, as before the loop.
+pub fn without_spot_shadows(src: String) -> String {
+    assert!(src.contains(SPOT_SHADOWS_ON), "the shader has no spot-shadow switch");
+    assert!(src.contains(SURFACE_LIGHTS_ON), "the shader has no surface-light switch");
+    src.replacen(SPOT_SHADOWS_ON, SPOT_SHADOWS_OFF, 1).replacen(SURFACE_LIGHTS_ON, SURFACE_LIGHTS_OFF, 1)
+}
+
+/// A reflection pass's POOLLESS TWIN: `src` without the torch pool maps'
+/// lookup, for frames where no surface is lit (`LightsUniform::reads_pool_maps`),
+/// where every lookup adds nothing anyway -- the same pixels. 2026-10-06
+/// (deploy96, the lever off against on, two passes): the twins save 0.10-0.18
+/// ms a frame in every torchless view, halls and outdoors.
+pub fn without_pool_maps(src: String) -> String {
+    assert!(
+        src.contains(SURFACE_RELIT_READ) && src.contains(SURFACE_RELIT_CALL),
+        "the shader reads no pool map"
+    );
+    src.replacen(SURFACE_RELIT_READ, "", 1).replacen(SURFACE_RELIT_CALL, "", 1)
+}
+
 /// What a shader asks of the lights block beyond the default. See
 /// `wgsl_lights_block_with`.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
@@ -709,6 +976,10 @@ pub struct LightsBlockOptions {
     /// verdicts blended, rather than tested once on blended texels. See
     /// `PROBE_CARD_TESTS_FILTERED`.
     pub card_tests_filtered: bool,
+    /// A reflection of a model on cards takes the light of the lamps the
+    /// level's bake never saw -- a player's flashlight -- on the card's albedo.
+    /// See `PROBE_CARD_RELIT`.
+    pub card_relit: bool,
 }
 
 /// HOW MANY OF THE PROBE PASS'S OWN PIXELS A REFLECTED EDGE IS SOFTENED
@@ -726,7 +997,24 @@ pub const PROBE_EDGE_FOOTPRINTS: f32 = 1.0;
 
 /// `wgsl_lights_block`, with `options`. See `LightsBlockOptions`.
 pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: LightsBlockOptions) -> String {
-    let LightsBlockOptions { probe_from_pass, probe_face_always, defer_secondary, cull_range_first, card_tests_filtered } = options;
+    let LightsBlockOptions { probe_from_pass, probe_face_always, defer_secondary, cull_range_first, card_tests_filtered, card_relit } =
+        options;
+    // Written into `probe_card_colour` only where asked for, not behind the
+    // constant: a call in a constant-false branch still counts the lamps and
+    // the shadow maps among the bindings a shader uses, and every pipeline
+    // laid out from its shader would need them. See `PROBE_CARD_RELIT`.
+    let card_relit_call = if card_relit {
+        "    if (PROBE_CARD_RELIT && sum.best > 0.0) {\n        colour += probe_card_relit(row, sum.card, lod, h, q);\n    }\n"
+    } else {
+        ""
+    };
+    // A hit on a surface a live lamp's beam lights, lit by it: where the
+    // reflections that ship are coloured -- the probe pass that defers and its
+    // fix-up -- and nowhere else, for the same reason. See
+    // `probe_surface_relit`.
+    let (surface_relit_read, surface_relit_call) =
+        if defer_secondary || card_relit { (SURFACE_RELIT_READ, SURFACE_RELIT_CALL) } else { ("", "") };
+    let lit_surface_vec4s = LIT_SURFACE_VEC4S * MAX_LIT_SURFACES;
     let shadow_tex = binding_index + 1;
     let shadow_samp = binding_index + 2;
     let spot_tex = binding_index + 3;
@@ -738,6 +1026,8 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let ground_tex = binding_index + 9;
     let proxy_field_tex = binding_index + 10;
     let proxy_card_tex = binding_index + 11;
+    let probe_select_binding = binding_index + 12;
+    let probe_select_rows = 3 * crate::renderer::uniforms::MAX_PROBES;
     let proxy_field_rows = crate::renderer::proxy_field::MAX_PROXY_FIELDS * 3;
     let proxy_card_rows = crate::renderer::uniforms::MAX_PROXIES / 4;
     let building_rows = crate::renderer::uniforms::MAX_BUILDINGS * 2;
@@ -747,13 +1037,69 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let character_card_sets = super::proxy_cards::CHARACTER_CARD_SETS;
     let character_card_rows = 2 * character_card_sets;
     let character_card_max_lod = (super::character_cards::CARD_MIPS - 1) as f32;
+    let pool_maps_across = super::pool_cards::POOL_MAPS_ACROSS;
     let reflection_contrast = format!("{:?}", crate::renderer::space_warp::REFLECTION_CONTRAST_RATIO);
     let probe_edge_footprints = PROBE_EDGE_FOOTPRINTS;
     let floor_mirror_bias = super::brush_pipeline::probe_pass::FLOOR_MIRROR_BIAS;
+    // A carried glass's glow, which a shader tracing its own reflection adds
+    // past the probe's normalisation (see `capsule_glow`). One reading the
+    // probe pass has it in the pass's answer already, and keeps its text.
+    let capsule_glow_term = if probe_from_pass { "" } else { " + capsule_glow * spec_occ" };
     // Three vec4 per probe -- centre, min, max -- so the WGSL array length is
     // three times the probe count. Derived rather than written twice: a shader
     // array shorter than the uniform reads garbage past its end.
     let probe_slots = crate::renderer::uniforms::MAX_PROBES * 3;
+    let max_probes = crate::renderer::uniforms::MAX_PROBES;
+    // `probe_nearest_two_unrolled`'s body, one block a slot: see there.
+    let probe_nearest_unrolled: String = (0..max_probes)
+        .map(|k| {
+            format!(
+                "    if (count > {k}) {{
+        let room{k} = camera.probe_boxes[{room_at}].w;
+        let v{k} = camera.probe_boxes[{centre_at}].xyz - p;
+        let dd{k} = dot(v{k}, v{k});
+        let mine{k} = room{k} == a || room{k} == b;
+        if (mine{k} && dd{k} < n.d0) {{
+            n.s1 = n.s0;
+            n.d1 = n.d0;
+            n.s0 = {k};
+            n.d0 = dd{k};
+        }} else if (mine{k} && dd{k} < n.d1) {{
+            n.s1 = {k};
+            n.d1 = dd{k};
+        }}
+    }}
+",
+                room_at = 3 * k + 2,
+                centre_at = 3 * k,
+            )
+        })
+        .collect();
+    // The same, reading `probe_select`: `probe_nearest_two_const_unrolled`.
+    let probe_nearest_const_unrolled: String = (0..max_probes)
+        .map(|k| {
+            format!(
+                "    if (count > {k}) {{
+        let room{k} = probe_select[{room_at}].w;
+        let v{k} = probe_select[{centre_at}].xyz - p;
+        let dd{k} = dot(v{k}, v{k});
+        let mine{k} = room{k} == a || room{k} == b;
+        if (mine{k} && dd{k} < n.d0) {{
+            n.s1 = n.s0;
+            n.d1 = n.d0;
+            n.s0 = {k};
+            n.d0 = dd{k};
+        }} else if (mine{k} && dd{k} < n.d1) {{
+            n.s1 = {k};
+            n.d1 = dd{k};
+        }}
+    }}
+",
+                room_at = 3 * k + 2,
+                centre_at = 3 * k,
+            )
+        })
+        .collect();
     let portal_slots = crate::renderer::uniforms::MAX_PORTALS * 3;
     let proxy_slots = crate::renderer::uniforms::MAX_PROXIES * 3;
     let room_table_rows = crate::renderer::uniforms::ROOM_TABLE_ROWS;
@@ -774,6 +1120,8 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let portal_fade = PROBE_PORTAL_FADE;
     let portal_side_fade = PROBE_PORTAL_SIDE_FADE;
     let precision_aliases = crate::renderer::shader_precision::F32_ALIASES;
+    let spot_shadows_on = SPOT_SHADOWS_ON;
+    let surface_lights_on = SURFACE_LIGHTS_ON;
     let probe_fixup_wgsl = crate::renderer::probe_fixup::lights_block_wgsl(defer_secondary);
     let ground_trace_finest = crate::renderer::ground_map::GROUND_TRACE_FINEST_LEVEL;
     let ground_trace_start = crate::renderer::ground_map::GROUND_TRACE_START_LEVEL;
@@ -782,8 +1130,18 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     format!(
         r#"
 // HALF-PRECISION ALIASES: `f32` unless `shader_precision::for_device` rewrites
-// them to `f16` for a device that has it. See `shader_precision`.
+// them to `f16` for a device that has it -- which it does not as shipped:
+// `shader_precision::HALF_PRECISION` is off since B1 (2026-10-06).
 {precision_aliases}
+// THE LARGEST VALUE CARRIED AT HALF PRECISION: below f16's 65,504, so a light
+// clamped to it stays finite whichever precision `hf` is.
+const HF_MAX: f32 = 60000.0;
+// THE SPOTS' SHADOW MAPS READ AT ALL: false in the scene shaders' spotless
+// twins, drawn in frames where no spot casts (`without_spot_shadows`).
+{spot_shadows_on}
+// THE LIT SURFACES' LIGHTS SHADED APART FROM THE LAMPS (`surface_lights`):
+// false in the same twins, whose frames have none.
+{surface_lights_on}
 struct Camera {{
     view_proj: array<mat4x4<f32>, 2>,
     inv_view_proj: array<mat4x4<f32>, 2>,
@@ -902,7 +1260,13 @@ struct Light {{
 }}
 struct Lights {{
     count: vec4<u32>,
+    // x: how many lights, from the front, are lit surfaces' own. See
+    // `surface_light_count`.
+    surface_lights: vec4<u32>,
     lights: array<Light, {MAX_LIGHTS}>,
+    // The surfaces the live lamps' beams are known to light. See
+    // `lit_surface_at` and `lights::LitSurface`.
+    surfaces: array<vec4<f32>, {lit_surface_vec4s}>,
 }}
 @group({group_index}) @binding({binding_index}) var<uniform> lights: Lights;
 @group({group_index}) @binding({shadow_tex}) var sun_shadow_tex: texture_depth_2d;
@@ -927,6 +1291,13 @@ struct Lights {{
 // Standing models' cards: a model a row, six cards a row. See `proxy_cards`
 // and `probe_card_colour`.
 @group({group_index}) @binding({proxy_card_tex}) var proxy_cards: texture_2d<f32>;
+// THE PHOTOGRAPHS' CAPTURE POINTS AND ROOMS AGAIN, as a uniform block of their
+// own: the camera buffer's `probe_boxes`, bound a second time over just those
+// bytes (`uniforms::PROBE_SELECT_OFFSET`). Read only at indices a loop counts,
+// so the driver may keep all of it in constant memory -- which it cannot for
+// the camera block, whose tables the trace indexes by what it read before.
+// Read by `probe_nearest_two_const`, the `def_scan_const` cut.
+@group({group_index}) @binding({probe_select_binding}) var<uniform> probe_select: array<vec4<f32>, {probe_select_rows}>;
 
 const AMBIENT: f32 = 0.6;
 
@@ -1022,6 +1393,24 @@ var<private> dbg_probe_factors: vec3<f32> = vec3<f32>(0.0);
 // derivatives are only valid in uniform control flow, and the light loop is
 // not that.
 var<private> pixel_footprint: f32 = 0.0;
+// A PIXEL'S LONGER STEP ON A SURFACE, for a spot's soft edge seen edge-on
+// (`spot_cone_across`): the footprint over the square root of how squarely
+// the eye sees the surface, `vn` the cosine between the view and the normal.
+// On a plane a pixel's footprint is an ellipse whose axes are the footprint
+// times and over that root: seen edge-on a pixel spans a few centimetres up a
+// wall and decimetres along it, and the footprint -- the mean of the two --
+// left a far wall spot's whole edge inside a pixel along the wall, flickering
+// as the head moved (2026-10-05). From the footprint the lamps hold already
+// and the cosine they work out anyway. The screen derivatives for it, taken
+// beside the lamps, cost the spotless scene readers three registers and an
+// occupancy step, 0.45 ms a frame (PIPESTATS bisection, 2026-10-06) -- and
+// the longer of the screen's two steps is not even the ellipse's axis: it
+// turns with the head. Capped at grazing, where the pool is a sliver inside
+// one pixel whatever the cap.
+const SPOT_LONG_MIN_COS: f32 = 1e-3;
+fn spot_long_step(vn: f32) -> f32 {{
+    return pixel_footprint * inverseSqrt(max(abs(vn), SPOT_LONG_MIN_COS));
+}}
 // HOW FAR `dot(n, l)` SWINGS ACROSS THIS PIXEL, set once at the top of a
 // fragment shader whose normal is MAPPED, from that normal's derivatives (see
 // `terminator_width_of`). The lamps' terminator is then shaded over the pixel's
@@ -1270,6 +1659,14 @@ fn character_card_look(g: i32, p: vec3<f32>, d: vec3<f32>, t: f32, lobe: f32, ey
     return vec4<f32>(seen.rgb / max(seen.a, 1e-4) * cover, cover);
 }}
 
+// THE GLOW OF A CARRIED GLASS in the reflection `capsule_reflection` last
+// answered, as straight colour to add to its answer's before that answer's
+// alpha is applied. Light given off, not the probe's light: each caller adds
+// it past the probe's brightness normalisation, which would put a torch out
+// in the dark corner it is lighting. See `CapsuleGroup::surfaces`. Already
+// dimmed by the glass's own beam's shadow: see `capsule_glass_beam`.
+var<private> capsule_glow: vec3<f32> = vec3<f32>(0.0);
+
 // THE CHARACTERS IN A REFLECTION leaving `p` along `d` (player frame), over
 // `behind` -- what the probe answered, which cannot hold anything that moves:
 // the capsules the ray passes through before it leaves the room, soft over
@@ -1278,6 +1675,14 @@ fn character_card_look(g: i32, p: vec3<f32>, d: vec3<f32>, t: f32, lobe: f32, ey
 // of someone standing on this floor would get. Where the capsule the ray
 // passes closest is a character with cards, the cards decide what it shows:
 // the body's own outline and colours, lit the same way.
+//
+// AND WHAT THEY CARRY (`CapsuleGroup::surfaces`): a torch as its own shape,
+// unblurred, its glass glowing (user, 2026-10-02: the flashlight "does not
+// show as a reflection on any surface ... nor does the front of the
+// flashlight light up or show lit in the avatar's reflection"). Of two
+// capsules covering a ray alike the nearer shows, so a torch held in front of
+// a chest is not lost behind it. The glass's glow is light given off, so it
+// is ADDED, in `capsule_glow`, dimmed only by what covers the ray nearer.
 fn capsule_reflection(p: vec3<f32>, d: vec3<f32>, roughness: f32, lit: vec3<f32>, behind: vec4<f32>) -> vec4<f32> {{
     let groups = i32(camera.capsule_params.x);
     if (groups <= 0 || roughness > CAPSULE_REFLECT_MAX_ROUGHNESS) {{
@@ -1286,12 +1691,15 @@ fn capsule_reflection(p: vec3<f32>, d: vec3<f32>, roughness: f32, lit: vec3<f32>
     let lobe = probe_lobe_tan(roughness);
     let eye = max(distance(cam_pos(), p), 0.05);
     var t_max = -1.0;
+    // The capsule that covers most, and how far along the ray it passes --
+    // for its colour, and its character's cards.
     var cover = 0.0;
-    var colour = vec3<f32>(0.0);
-    // The capsule that covers most: whose character, and how far along the
-    // ray it passes -- for that character's cards.
-    var win_g = -1;
+    var win_i = -1;
     var win_t = 0.0;
+    // The brightest glass: the light it sends along the ray, and from where.
+    var glow = 0.0;
+    var glow_i = -1;
+    var glow_t = 0.0;
     for (var g = 0; g < groups; g = g + 1) {{
         let bound = camera.capsule_groups[g * 2];
         let oc = bound.xyz - p;
@@ -1305,42 +1713,126 @@ fn capsule_reflection(p: vec3<f32>, d: vec3<f32>, roughness: f32, lit: vec3<f32>
         if (t_max < 0.0) {{
             t_max = capsule_room_exit(p, d);
         }}
-        let tint = camera.capsule_groups[g * 2 + 1];
-        let count = i32(tint.w);
+        let count = i32(camera.capsule_groups[g * 2 + 1].w);
         for (var k = 0; k < count; k = k + 1) {{
             let i = g * CAPSULES_PER_GROUP + k;
             let ar = camera.capsules[i * 2];
-            let q = capsule_nearest_to_ray(ar.xyz, camera.capsules[i * 2 + 1].xyz, p, d);
-            let t = dot(q - p, d);
+            let bs = camera.capsules[i * 2 + 1];
+            // Where the ray passes it: nearest its axis -- or, for a glass,
+            // where the ray crosses the glass's plane from in front.
+            var t = -1.0;
+            var off = 0.0;
+            if (bs.w > 0.0) {{
+                let n = normalize(bs.xyz - ar.xyz);
+                let facing = dot(d, n);
+                t = select(-1.0, dot(bs.xyz - p, n) / facing, facing < -1e-4);
+                off = distance(p + d * t, bs.xyz);
+            }} else {{
+                let q = capsule_nearest_to_ray(ar.xyz, bs.xyz, p, d);
+                t = dot(q - p, d);
+                off = length(q - (p + d * t));
+            }}
             if (t <= 0.0 || t >= t_max) {{
                 continue;
             }}
-            let footprint = max(max(t * lobe, pixel_footprint * (1.0 + t / eye)), CAPSULE_SHAPE_BLUR);
+            // A body's capsule is as wrong as `CAPSULE_SHAPE_BLUR`; a carried
+            // thing's capsules are its shape.
+            let footprint =
+                max(max(t * lobe, pixel_footprint * (1.0 + t / eye)), select(0.0, CAPSULE_SHAPE_BLUR, bs.w == 0.0));
+            if (bs.w > 0.0) {{
+                // The disc blurred over the footprint, keeping the light it
+                // gives off: its edge softened by f, to the footprint's own
+                // radius where that is wider than the disc, and its share
+                // scaled so that summed over the plane it is the disc's own
+                // area -- the softened edge adds 0.2 f^2 to the spread's.
+                let f2 = footprint * footprint;
+                let reach = max(ar.w, footprint);
+                let c = ar.w * ar.w / (reach * reach + 0.2 * f2) * (1.0 - smoothstep(reach - footprint, reach + footprint, off));
+                if (c * bs.w > glow) {{
+                    glow = c * bs.w;
+                    glow_i = i;
+                    glow_t = t;
+                }}
+                continue;
+            }}
             // Blurred by the footprint, a limb thinner than it covers only
             // part of any pixel: its share fades as radius over footprint.
-            let c = (1.0 - smoothstep(ar.w - footprint, ar.w + footprint, length(q - (p + d * t))))
-                * min(ar.w / footprint, 1.0);
-            if (c > cover) {{
+            let c = (1.0 - smoothstep(ar.w - footprint, ar.w + footprint, off)) * min(ar.w / footprint, 1.0);
+            if (c > cover || (c == cover && t < win_t)) {{
                 cover = c;
-                colour = tint.rgb;
-                win_g = g;
+                win_i = i;
                 win_t = t;
             }}
         }}
     }}
-    if (cover <= 0.0) {{
+    if (cover <= 0.0 && glow <= 0.0) {{
         return behind;
     }}
-    let look = character_card_look(win_g, p, d, win_t, lobe, eye);
-    if (look.a >= 0.0) {{
-        if (look.a <= 0.0) {{
-            return behind;
+    var colour = vec3<f32>(0.0);
+    if (cover > 0.0) {{
+        // The group's colour; a carried solid's scaled by its surface.
+        let g = win_i / CAPSULES_PER_GROUP;
+        let s = camera.capsules[win_i * 2 + 1].w;
+        colour = camera.capsule_groups[g * 2 + 1].rgb * select(1.0, -s, s < 0.0);
+        let look = character_card_look(g, p, d, win_t, lobe, eye);
+        if (look.a >= 0.0) {{
+            cover = min(look.a, 1.0);
+            colour = look.rgb / max(look.a, 1e-4);
         }}
-        cover = min(look.a, 1.0);
-        colour = look.rgb / look.a;
     }}
-    return vec4<f32>(mix(behind.rgb, colour * lit * INV_PI, cover), max(behind.a, cover));
+    var a = max(behind.a, cover);
+    var seen = 0.0;
+    if (glow_i >= 0) {{
+        // Through whatever covers the ray nearer than the glass.
+        seen = glow * select(1.0, 1.0 - cover, win_t < glow_t);
+        // The glass covers its own share of the ray, whatever lay behind.
+        a = max(a, glow / camera.capsules[glow_i * 2 + 1].w);
+    }}
+    // The answer made BEFORE the glass's beam is asked about, so what it is
+    // made from is let go first. See `capsule_glass_beam`.
+    let answer = vec4<f32>(mix(behind.rgb, colour * lit * INV_PI, cover), a);
+    if (glow_i >= 0) {{
+        capsule_glow = camera.capsule_groups[(glow_i / CAPSULES_PER_GROUP) * 2 + 1].rgb * seen / a
+            * capsule_glass_beam(p, camera.capsules[glow_i * 2 + 1].xyz);
+    }}
+    return answer;
 }}
+
+// HOW MUCH OF THE GLASS AT `glass` A MIRROR AT `p` SEES (player frame): as
+// much as that glass's own beam reaches `p` past its spot shadow map -- which
+// holds the hand raised in front of the torch, as the capsules cannot: the
+// trace dims a glass only by the capsule covering most of the ray, and behind
+// a carried glass that is the arm carrying it, so a hand held between the
+// glass and a polished wall hid none of the glass's image in it (user,
+// 2026-10-05: "I cast a shadow with the hand that would have blocked the
+// light from being visible on the wall but it still showed it reflected as if
+// nothing was blocking it"). The beam reaching `p` and the glass seen in a
+// mirror at `p` are one line, so the shadow on the wall and the image in it
+// now go together. Its beam is the shadowed spot standing at the glass
+// (`flashlight::torch_capsules` puts the glass on the beam's origin); a point
+// outside its map, or a glass with no shadowed beam, sees it whole.
+//
+// ASKED LAST, inside `capsule_reflection` once its answer is made: asked
+// while that answer's colour, cover and light were still held -- at the end
+// of the probe pass, or before the answer here -- it took the ground's
+// reflection pass from 24 registers to 25, its occupancy from 50% to 37%,
+// whichever of the search or the shadow lookup below was cut out: +0.3 to
+// +0.6 ms a frame outdoors (headset A/B, 2026-10-06). Asked after, 24.
+fn capsule_glass_beam(p: vec3<f32>, glass: vec3<f32>) -> f32 {{
+    for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
+        let apart = lights.lights[i].position.xyz - glass;
+        if (dot(apart, apart) >= GLASS_ON_ITS_BEAM * GLASS_ON_ITS_BEAM) {{
+            continue;
+        }}
+        let layer = i32(lights.lights[i].params.w);
+        if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
+            return pcf_layer_tap(spot_shadow_tex, layer, p, camera.spot_view_proj[layer]);
+        }}
+    }}
+    return 1.0;
+}}
+// How near a lamp must stand to a glass to be its beam, metres.
+const GLASS_ON_ITS_BEAM: f32 = 0.01;
 
 // Whether the light loop may skip a lamp that cannot reach this pixel before
 // doing any of its maths. See `GpuLights::count`; off only to measure it.
@@ -1357,6 +1849,14 @@ var<private> receiver_skips_baked: bool = false;
 fn live_light_count() -> u32 {{
     return select(lights.count.x, lights.count.y, receiver_skips_baked);
 }}
+// How many lights, from the front of the list, are lit surfaces' -- a
+// flashlight's bounce -- which the scene readers shade apart from the lamps
+// (`surface_lights`), their lamp loop starting past them. 0 in the spotless
+// twins, which shade every light as a lamp (`SURFACE_LIGHTS`). Every other
+// light loop takes them as lamps. See `GpuLights::surface_lights`.
+fn surface_light_count() -> u32 {{
+    return select(0u, lights.surface_lights.x, SURFACE_LIGHTS);
+}}
 // A spot's soft edge is never drawn narrower than this many pixels.
 const SPOT_EDGE_MIN_PIXELS: f32 = 1.5;
 // ...but never more than this many times its AUTHORED width.
@@ -1368,6 +1868,19 @@ const SPOT_EDGE_MIN_PIXELS: f32 = 1.5;
 // footprint jumped between the floor and the door threshold (2026-09-23). A
 // cap keeps the anti-aliasing and refuses to invent light.
 const SPOT_EDGE_MAX_WIDEN: f32 = 3.0;
+// THE PIXEL'S MEAN ALONG ITS LONG STEP (`spot_cone`). Measured 2026-10-05:
+// from the hall's front doorways the far corner spot's pixels that jump more
+// than 8 levels between 3 mm head steps fell from 3.2% to 1.0%
+// (`offline_frame::measure_the_move_shimmer`), and `spot_edge_gpu_tests` holds
+// the shimmer below a sensor's square pixels'. It first cost 0.45 ms a frame:
+// the spotless scene readers went from 18-19 registers to 21-22, 62% -> 50%
+// occupancy. Eight formulations of the lamps' maths -- the steps as vectors,
+// packed, the gradient as scalar dots, the lamp read field by field, the
+// stationary masks packed, the sum at half precision -- all landed at 22; a
+// bisection (2026-10-06) found the cost was the pixel's long step taken from
+// screen derivatives beside the lamps, not the lamps' maths at all. See
+// `spot_long_step`.
+const SPOT_EDGE_AVERAGE: bool = true;
 // A spot's cone, with its soft edge kept at least `SPOT_EDGE_MIN_PIXELS` wide
 // ON SCREEN.
 //
@@ -1383,18 +1896,55 @@ const SPOT_EDGE_MAX_WIDEN: f32 = 3.0;
 // The pixel's angular size seen FROM THE LIGHT is its world footprint over the
 // distance, and a step of angle becomes `sin(angle) * step` in cosine space,
 // which is the space the cone is measured in.
-fn spot_cone(cos_angle: f32, cos_outer: f32, cos_inner: f32, dist: f32) -> f32 {{
+//
+// THE PIXEL'S AVERAGE ALONG ITS LONG STEP (2026-10-05). The footprint above
+// is the mean of the pixel's two axes, and seen edge-on the axis along the
+// surface is ten times the other: from the hall's front doorways the far
+// corner spot's whole soft edge fitted inside one pixel along the wall, and
+// as the head moved its pool flickered between two and three pixels wide.
+// `across` is how far the cone's cosine really moves across this pixel
+// (`spot_cone_across`; 0 where no fragment shader set the pixel's steps), and
+// what of it the widening above has not already spanned (the two spreads add
+// as squares, as blurs do) is averaged over: the smoothstep stretched by that
+// range on both sides about its middle, which is the shape of the pixel's
+// mean of it and keeps its light and its centre. One smoothstep, not the
+// exact mean's two integrals -- the scene readers' register peak is in this
+// loop -- and it shimmers less than a sensor's square pixels would
+// (`spot_edge_gpu_tests`). Nothing spreads past the pixel that saw it, the
+// trap a widening by the full footprint fell into (2026-09-23), so no cap. A
+// pixel seen head-on spans no more than the footprint says, and is exactly
+// as before.
+fn spot_cone(cos_angle: f32, cos_outer: f32, cos_inner: f32, dist: f32, across: f32) -> f32 {{
     let authored = max(cos_inner - cos_outer, 0.0001);
     let sin_a = sqrt(max(1.0 - cos_angle * cos_angle, 0.0));
-    let at_least = SPOT_EDGE_MIN_PIXELS * sin_a * pixel_footprint / max(dist, 0.001);
+    let footprint = sin_a * pixel_footprint / max(dist, 0.001);
+    let at_least = SPOT_EDGE_MIN_PIXELS * footprint;
     let width = max(authored, min(at_least, authored * SPOT_EDGE_MAX_WIDEN));
     // How much the edge grew, split evenly either side of the authored band.
-    // ZERO in a bake, which has no pixels -- and with `widen` at zero this is
-    // exactly the baker's cone, (cos_angle - cos_outer) / authored, which
-    // `renderer_and_baker_agree_on_the_formula` pins by text.
+    // ZERO in a bake, which has no pixels.
     let widen = width - authored;
-    let t = clamp((cos_angle - cos_outer + 0.5 * widen) / width, 0.0, 1.0);
-    return t * t * (3.0 - 2.0 * t);
+    // The ramp stretched about its middle by `half` of itself each way: the
+    // average along the pixel's long step, the span's excess over the
+    // footprint taken in quadrature. ONE expression, not the plain ramp and
+    // the stretched one chosen between -- which held both -- since at `half`
+    // zero the stretched ramp IS the plain one. With `widen` and `half` at
+    // zero this is exactly the baker's cone, (cos_angle - cos_outer) /
+    // authored, which `renderer_and_baker_agree_on_the_formula` pins by text.
+    let half = select(0.0, 0.5 * sqrt(max(across * across - footprint * footprint, 0.0)) / width, SPOT_EDGE_AVERAGE);
+    let s = clamp(((cos_angle - cos_outer + 0.5 * widen) / width + half) / (1.0 + 2.0 * half), 0.0, 1.0);
+    return s * s * (3.0 - 2.0 * s);
+}}
+// How far a spot's cone cosine moves across this pixel, for `spot_cone`: the
+// cosine's gradient over the surface, (d - cos u) / dist with `u` the way from
+// the lamp (`-l_dir`), along the pixel's longer screen step -- which runs
+// along the view ray laid onto the surface (`n`, `view_dir` toward the eye),
+// as long as `spot_long_step` says. 0 where no footprint was set.
+fn spot_cone_across(spot_dir: vec3<f32>, l_dir: vec3<f32>, cos_angle: f32, dist: f32, n: vec3<f32>, view_dir: vec3<f32>) -> f32 {{
+    // g . along, with g = (d + cos l) / dist and along = v - (v.n) n, as dot
+    // products of what the loop holds anyway: no vector is built.
+    let vn = dot(view_dir, n);
+    let g_along = dot(view_dir, spot_dir) - vn * dot(n, spot_dir) + cos_angle * (dot(view_dir, l_dir) - vn * dot(n, l_dir));
+    return abs(g_along) * inverseSqrt(max(1.0 - vn * vn, 1e-8)) * spot_long_step(vn) / max(dist, 0.001);
 }}
 // The average radiance the chosen probe photographed, written by
 // `probe_environment` for `shade_material_env` to normalise against. Zero means
@@ -1446,12 +1996,43 @@ const PROBE_SECONDARY_DEFERRED: bool = {defer_secondary};
 // so only in `probe_fixup`, which every texel meeting a model on cards goes
 // through; the probe pass keeps its one read.
 const PROBE_CARD_TESTS_FILTERED: bool = {card_tests_filtered};
+// A MODEL'S REFLECTION LIT BY WHAT THE BAKE NEVER SAW: the cards hold the
+// level's own light, baked, so a player's flashlight on a hanging lamp lit the
+// lamp and not its reflection in the polished floor (headset, 2026-10-02:
+// "if I shine the flashlight on the hanging light fixture, the reflection of
+// the light fixture appears to be lit from the flashlight in its
+// reflection"). Each hit on cards takes, on the albedo of the card vouching
+// most for it, the light of every lamp the bake never saw (`position.w` -1:
+// `pack_lights`), shadowed as the lamp's own map has it. Only in
+// `probe_fixup`, which every texel meeting a model on cards goes through.
+const PROBE_CARD_RELIT: bool = {card_relit};
+// How far off the card's surface its point is lifted before the lamp's
+// shadow map is read there: a card texel's depth is a fraction of a texel of
+// the lamp's map from the surface the map drew, either side.
+const PROBE_CARD_RELIT_LIFT: f32 = 0.02;
 // WHETHER THE LAMP PRE-PASS TESTS A LAMP'S RANGE BEFORE ITS BAKED MASK: three
 // instructions before a dozen, the better order where most lamps are out of
 // range -- the ground outdoors, far from the building's lamps (-0.3 to
 // -0.6 ms a frame, 2026-09-28). The brushes keep the mask first, the order
 // they were measured in. The same lamps are kept either way.
 const CULL_RANGE_FIRST: bool = {cull_range_first};
+// THE SKY'S SUN CANNOT REACH THIS SHADER'S SURFACES: the brushes whose baked
+// sun mask is dark over every texel their pixels can read (see
+// `brush_pipeline::SunFaces`), drawn with a reader that sets this. There
+// every directional light already came out exactly 0 -- the mask's 0 culled it
+// -- so dropping it in the lamp pre-pass changes no pixel, and its shadow
+// lookups leave the shader: ~350 of the scene reader's ~3,400 instructions,
+// which on the Quest decide whether it fits its instruction cache (headset,
+// 2026-10-01: 3,387 instructions drew hall_front in 16.3 ms, 3,398 in 18.6).
+// `brush_pipeline::sun_reader_shader` sets it; nothing else does.
+const SKY_SUN_NEVER_REACHES: bool = false;
+// THIS SHADER'S SURFACES ALWAYS HAVE A BAKED SUN MASK to read: the brushes
+// whose every readable mask texel is baked (`brush_pipeline::SunFaces`), where
+// `receiver_sun_mask` is never the -1 of "no bake", so `sun_visibility` never
+// falls back to the level's static sun map -- and that lookup leaves the
+// shader. The same instruction-cache reason as `SKY_SUN_NEVER_REACHES`, for
+// the faces the sun does reach. `brush_pipeline::sun_reader_shader` sets it.
+const SUN_MASK_EVERYWHERE: bool = false;
 // The fragment whose reflection this is -- its position builtin, set by the
 // probe pass before it shades -- for the record of a deferred lookup.
 var<private> probe_fragment: vec4<f32> = vec4<f32>(0.0);
@@ -1627,12 +2208,19 @@ fn shadow_coords(world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> vec4<f32
     let lp = light_view_proj * vec4<f32>(world_pos, 1.0);
     let ndc = lp.xyz / lp.w;
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let bias = 0.0015;
+    // THE MAP'S FAR END, TESTED ON THE DEPTH COMPARED. The flashlight's lookup
+    // matrix puts this bias into its depth row for the line below to take back
+    // out (`shadow::spot_shadow_matrices`); tested before that, a receiver
+    // past about 8 m from its 2 cm near plane read as outside the map, and lit:
+    // its shadows stopped at a set distance from the torch (headset,
+    // 2026-10-02).
+    let depth = ndc.z - bias;
     var valid = 1.0;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0 || ndc.z < 0.0) {{
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || depth > 1.0 || ndc.z < 0.0) {{
         valid = 0.0;
     }}
-    let bias = 0.0015;
-    return vec4<f32>(uv.x, uv.y, ndc.z - bias, valid);
+    return vec4<f32>(uv.x, uv.y, depth, valid);
 }}
 
 // 3x3 hardware PCF: 1 is lit, 0 is shadowed.
@@ -1668,7 +2256,7 @@ fn pcf(tex: texture_depth_2d, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>
 // the brushes cost almost nothing on a floor the sun never touches.
 fn sun_visibility(l: Light, world_pos: vec3<f32>) -> f32 {{
     var vis = 1.0;
-    if (receiver_sun_mask >= 0.0) {{
+    if (SUN_MASK_EVERYWHERE || receiver_sun_mask >= 0.0) {{
         vis = receiver_sun_mask;
     }} else if (camera.shadow_params.x > 0.5) {{
         vis = pcf(sun_shadow_tex, world_pos, camera.sun_view_proj);
@@ -1705,17 +2293,192 @@ fn sun_moving_visibility(world_pos: vec3<f32>) -> f32 {{
 // The atlas exists because a pass is the expensive unit on a tile GPU, not the
 // triangles in it -- see `ShadowMap::spots`. The cost of that is here: every
 // sample has to be mapped into its own tile AND CLAMPED to it. Without the
-// clamp, the 3x3 kernel at a tile's edge reaches into the neighbouring tile and
+// clamp, the kernel at a tile's edge reaches into the neighbouring tile and
 // reads another light's depth, which shows up as a shadow cast by a lamp that
 // is nowhere near -- far more confusing than a missing shadow.
+//
+// THE LEAN TENT (`pcf_tile_tent_lean_at`) since B1 (2026-10-06): the same
+// shadow to the hardware's own bilinear precision
+// (`every_tent_form_gives_the_same_shadow`), with nothing per axis held across
+// its loop: one register under the loop over picked taps in the full reader
+// at either precision -- 21 against 22 at `f32` as shipped (the
+// `scene_tent_loop` cut, deploy107), 19 against 20 at `f16` (deploy105).
 fn pcf_layer(tex: texture_depth_2d, layer: i32, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
-    return pcf_tile(
+    let c = shadow_coords(world_pos, light_view_proj);
+    if (c.w < 0.5) {{ return 1.0; }}
+    return pcf_tile_tent_lean_at(
         tex,
         vec2<f32>(f32(layer % {atlas_cols}), f32(layer / {atlas_cols})),
         vec2<f32>(f32({atlas_cols}), f32({atlas_rows})),
-        world_pos,
-        light_view_proj,
+        c.xyz,
     );
+}}
+// `pcf_layer` as ONE bilinear compare: the four texels round the point,
+// blended by where it falls among them, so the answer still slides as the
+// point moves rather than stepping. For the glass's gate in the reflection
+// passes (`capsule_glass_beam`), which says only whether a highlight shows:
+// 160 instructions fewer in the ground's reflection pass than the tent's
+// nine taps (headset, 2026-10-06), for an edge a few millimetres sharper on
+// a wall a few metres off.
+fn pcf_layer_tap(tex: texture_depth_2d, layer: i32, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
+    let c = shadow_coords(world_pos, light_view_proj);
+    if (c.w < 0.5) {{ return 1.0; }}
+    let grid = vec2<f32>(f32({atlas_cols}), f32({atlas_rows}));
+    let lo = grid / vec2<f32>(textureDimensions(tex)) * 0.5;
+    let tile = vec2<f32>(f32(layer % {atlas_cols}), f32(layer / {atlas_cols}));
+    return textureSampleCompareLevel(tex, shadow_samp, (clamp(c.xy, lo, vec2<f32>(1.0) - lo) + tile) / grid, c.z);
+}}
+
+// ONE AXIS OF A 5x5 TENT carried by three bilinear taps: each tap's offset in
+// texels from the texel corner nearest the sample (`off`), and its weight
+// (`w`, summing to one). `f` is the sample's offset from that corner,
+// -0.5..0.5.
+//
+// The tent, 2.5 texels to each side, lies over six texels; each pair of them
+// is one bilinear tap, placed between the pair's centres so it blends them in
+// the ratio of the tent's area over each, and weighted by their sum. 0.08 is
+// 1/12.5, twice the tent's area. See `pcf_tile_tent_at`.
+struct PcfTentAxis {{
+    off: vec3<f32>,
+    w: vec3<f32>,
+}}
+fn pcf_tent_axis(f: f32) -> PcfTentAxis {{
+    let w = vec3<f32>((1.5 - f) * (1.5 - f) * 0.08, 0.0, (1.5 + f) * (1.5 + f) * 0.08);
+    let w_mid = 1.0 - w.x - w.z;
+    // Each pair's right-hand texel's share.
+    let fp = max(f, 0.0);
+    let right = vec3<f32>((2.0 - 2.0 * f) * 0.08, (4.0 + 2.0 * f - 2.0 * fp * fp) * 0.08, (0.5 + f) * (0.5 + f) * 0.08);
+    let weights = vec3<f32>(w.x, w_mid, w.z);
+    return PcfTentAxis(vec3<f32>(-2.5, -0.5, 1.5) + right / weights, weights);
+}}
+
+// `pcf_tile_tent_at` written out, tap by tap: the same taps, weights and
+// order of summing. As shipped for a day (2026-10-01): it put the scene
+// shader's baked reader past the instruction-cache cliff, ~0.9 ms an eye.
+// For the `scene_tent_unrolled` cut.
+fn pcf_tile_tent_unrolled_at(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, c: vec3<f32>) -> f32 {{
+    let tile_texel = grid / vec2<f32>(textureDimensions(tex));
+    let lo = tile_texel * 0.5;
+    let hi = vec2<f32>(1.0) - lo;
+    let p = c.xy / tile_texel;
+    let corner = floor(p + vec2<f32>(0.5));
+    let ax = pcf_tent_axis(p.x - corner.x);
+    let ay = pcf_tent_axis(p.y - corner.y);
+    let u = (vec3<f32>(corner.x) + ax.off) * tile_texel.x;
+    let v = (vec3<f32>(corner.y) + ay.off) * tile_texel.y;
+    var sum = 0.0;
+    sum += ax.w.x * ay.w.x * pcf_tent_tap(tex, tile, grid, vec2<f32>(u.x, v.x), lo, hi, c.z);
+    sum += ax.w.y * ay.w.x * pcf_tent_tap(tex, tile, grid, vec2<f32>(u.y, v.x), lo, hi, c.z);
+    sum += ax.w.z * ay.w.x * pcf_tent_tap(tex, tile, grid, vec2<f32>(u.z, v.x), lo, hi, c.z);
+    sum += ax.w.x * ay.w.y * pcf_tent_tap(tex, tile, grid, vec2<f32>(u.x, v.y), lo, hi, c.z);
+    sum += ax.w.y * ay.w.y * pcf_tent_tap(tex, tile, grid, vec2<f32>(u.y, v.y), lo, hi, c.z);
+    sum += ax.w.z * ay.w.y * pcf_tent_tap(tex, tile, grid, vec2<f32>(u.z, v.y), lo, hi, c.z);
+    sum += ax.w.x * ay.w.z * pcf_tent_tap(tex, tile, grid, vec2<f32>(u.x, v.z), lo, hi, c.z);
+    sum += ax.w.y * ay.w.z * pcf_tent_tap(tex, tile, grid, vec2<f32>(u.y, v.z), lo, hi, c.z);
+    sum += ax.w.z * ay.w.z * pcf_tent_tap(tex, tile, grid, vec2<f32>(u.z, v.z), lo, hi, c.z);
+    return sum;
+}}
+// `pcf_tile_at` with a 5x5 TENT in place of its box (Castano, *Shadow Mapping
+// Summary*, 2013): the same nine bilinear compares, each moved within its pair
+// of texels and weighted by the tent's area over them. The box's equal taps
+// at whole-texel offsets made a kernel with corners a texel apart, and those
+// corners drew steps along every spot shadow's edge, which shimmered as the
+// head moved over them (jitter plan, row 3); the tent's slope has none.
+//
+// A LOOP, each axis's tap picked by its index out of what `pcf_tent_axis`
+// gives -- not written out, and not indexing a local array, which goes to
+// scratch memory on this GPU (`adreno-local-array-cliff`). Written out, it
+// was the code that put the scene shader past the instruction-cache cliff
+// (`pcf_tile_tent_unrolled_at`).
+fn pcf_tile_tent_at(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, c: vec3<f32>) -> f32 {{
+    let tile_texel = grid / vec2<f32>(textureDimensions(tex));
+    let lo = tile_texel * 0.5;
+    let hi = vec2<f32>(1.0) - lo;
+    let p = c.xy / tile_texel;
+    let corner = floor(p + vec2<f32>(0.5));
+    let ax = pcf_tent_axis(p.x - corner.x);
+    let ay = pcf_tent_axis(p.y - corner.y);
+    let u = (vec3<f32>(corner.x) + ax.off) * tile_texel.x;
+    let v = (vec3<f32>(corner.y) + ay.off) * tile_texel.y;
+    var sum = 0.0;
+    for (var j = 0; j < 3; j = j + 1) {{
+        let vj = select(select(v.z, v.y, j == 1), v.x, j == 0);
+        let wj = select(select(ay.w.z, ay.w.y, j == 1), ay.w.x, j == 0);
+        for (var i = 0; i < 3; i = i + 1) {{
+            let ui = select(select(u.z, u.y, i == 1), u.x, i == 0);
+            let wi = select(select(ax.w.z, ax.w.y, i == 1), ax.w.x, i == 0);
+            sum += wi * wj * pcf_tent_tap(tex, tile, grid, vec2<f32>(ui, vj), lo, hi, c.z);
+        }}
+    }}
+    return sum;
+}}
+// `pcf_tent_axis`'s tap `k` (-1, 0 or 1) alone, in closed form: its position
+// in texels from the corner (x) and its weight (y). An outer pair, with
+// a = 1.5 + k f, weighs 0.08 a^2 and its outer texel 0.08 (a - 1)^2, so its
+// tap lies (1 - 1/a)^2 out from the inner texel's centre, 1.5 texels from the
+// corner; the middle pair's tap is f / (4 + 2|f|) from the corner. The shipped
+// tent's taps (`pcf_tile_tent_lean_at`) since B1.
+fn pcf_tent_tap_axis(k: f32, f: f32) -> vec2<f32> {{
+    let a = 1.5 + k * f;
+    let s = 1.0 - 1.0 / a;
+    return select(
+        vec2<f32>(k * (1.5 + s * s), 0.08 * a * a),
+        vec2<f32>(f / (4.0 + 2.0 * abs(f)), 0.16 * (4.0 - f * f)),
+        k == 0.0,
+    );
+}}
+// `pcf_tile_tent_at` with each tap's position and weight worked out at the
+// tap from the sample's offset: the same taps, weights and order of summing,
+// and nothing per axis held across the loop. 2026-10-02: the tent's six
+// positions and six weights, live through the loop, took the scene readers
+// from 19 registers to 22, and occupancy from 62% to 50%.
+fn pcf_tile_tent_lean_at(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, c: vec3<f32>) -> f32 {{
+    let tile_texel = grid / vec2<f32>(textureDimensions(tex));
+    let lo = tile_texel * 0.5;
+    let hi = vec2<f32>(1.0) - lo;
+    let p = c.xy / tile_texel;
+    let corner = floor(p + vec2<f32>(0.5));
+    let f = p - corner;
+    var sum = 0.0;
+    for (var t = 0; t < 9; t = t + 1) {{
+        let x = pcf_tent_tap_axis(f32(t % 3) - 1.0, f.x);
+        let y = pcf_tent_tap_axis(f32(t / 3) - 1.0, f.y);
+        sum += x.y * y.y * pcf_tent_tap(tex, tile, grid, (corner + vec2<f32>(x.x, y.x)) * tile_texel, lo, hi, c.z);
+    }}
+    return sum;
+}}
+// `pcf_tile_tent_at` with each axis's tap positions and weights held at half
+// precision (`hf`): positions to a five-hundredth of a texel, weights to three
+// figures -- finer than the bilinear compare's own weights -- in half the
+// registers where the device has `f16` and `HALF_PRECISION` is on. For the
+// `scene_tent_half` cut.
+fn pcf_tile_tent_half_at(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, c: vec3<f32>) -> f32 {{
+    let tile_texel = grid / vec2<f32>(textureDimensions(tex));
+    let lo = tile_texel * 0.5;
+    let hi = vec2<f32>(1.0) - lo;
+    let p = c.xy / tile_texel;
+    let corner = floor(p + vec2<f32>(0.5));
+    let ax = pcf_tent_axis(p.x - corner.x);
+    let ay = pcf_tent_axis(p.y - corner.y);
+    let ox = hf3(ax.off);
+    let oy = hf3(ay.off);
+    let wx = hf3(ax.w);
+    let wy = hf3(ay.w);
+    var sum = 0.0;
+    for (var j = 0; j < 3; j = j + 1) {{
+        let vj = (corner.y + f32(select(select(oy.z, oy.y, j == 1), oy.x, j == 0))) * tile_texel.y;
+        let wj = select(select(wy.z, wy.y, j == 1), wy.x, j == 0);
+        for (var i = 0; i < 3; i = i + 1) {{
+            let ui = (corner.x + f32(select(select(ox.z, ox.y, i == 1), ox.x, i == 0))) * tile_texel.x;
+            let wi = select(select(wx.z, wx.y, i == 1), wx.x, i == 0);
+            sum += f32(wi * wj) * pcf_tent_tap(tex, tile, grid, vec2<f32>(ui, vj), lo, hi, c.z);
+        }}
+    }}
+    return sum;
+}}
+// One tap at `local` in tile space, clamped into the tile as `pcf_tile_at`'s.
+fn pcf_tent_tap(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, local: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>, depth: f32) -> f32 {{
+    return textureSampleCompareLevel(tex, shadow_samp, (clamp(local, lo, hi) + tile) / grid, depth);
 }}
 
 // Tile `tile` (column, row) of an atlas `grid` tiles across and down.
@@ -1876,12 +2639,16 @@ fn light_contribution_split(
         // exp2(4 log2 x), two transcendental instructions a lamp a pixel.
         let d2_over_r2 = d_over_r * d_over_r;
         let window = clamp(1.0 - d2_over_r2 * d2_over_r2, 0.0, 1.0);
-        atten = (window * window) / max(dist * dist, LAMP_RADIUS * LAMP_RADIUS);
+        // A light standing for a lit surface carries its patch's radius below
+        // `SURFACE_LIGHT` (`Light::source_radius`): the falloff a disc that
+        // wide gives. 0 for every lamp, whose falloff is what it was.
+        let source = max(-2.0 - l.params.w, 0.0);
+        atten = (window * window) / max(dist * dist + source * source, LAMP_RADIUS * LAMP_RADIUS);
         if (kind > 0.5) {{
             let cos_outer = l.params.y;
             let cos_inner = l.direction.w;
             let cos_angle = dot(-l_dir, l.direction.xyz);
-            atten = atten * spot_cone(cos_angle, cos_outer, cos_inner, dist);
+            atten = atten * spot_cone(cos_angle, cos_outer, cos_inner, dist, spot_cone_across(l.direction.xyz, l_dir, cos_angle, dist, n, view_dir));
         }}
     }}
 
@@ -1892,13 +2659,63 @@ fn light_contribution_split(
     // No highlight where no light arrives: outside a spot's cone `atten` is
     // exactly 0, and the half-vector and its `pow` were computed to be
     // multiplied by it. Most of a room is outside most cones. And only on the
-    // share of the pixel that faces the lamp -- see `terminator_aa`.
-    if (aa.y > 0.0 && atten > 0.0) {{
+    // share of the pixel that faces the lamp -- see `terminator_aa`. None
+    // from a light that stands for a lit surface (`SURFACE_LIGHT`).
+    if (aa.y > 0.0 && atten > 0.0 && l.params.w > -1.5) {{
         let h = normalize(l_dir + view_dir);
         let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;
         out.specular = radiance * spec * atten * aa.y;
     }}
     return out;
+}}
+
+// THE LIT SURFACES' LIGHTS, APART FROM THE LAMPS: the diffuse light
+// `light_contribution_split` gives each, summed, and nothing it holds for a
+// lamp. Such a light (`Light::is_surface_light`, a flashlight's bounce) casts
+// no shadow and makes no highlight, and a spot's edge is a half space or
+// wider -- so it is its range, its patch's falloff, a plain ramp across its
+// edge (`SURFACE_LIGHT_MIN_BAND`) and the terminator. Through the lamp loop
+// each paid the culling pre-pass, the zero test, the half-precision sums and
+// the shadows' branches as well, which changed no pixel: the torch's two
+// bounce lights were 260 ALU a fragment of the readers and 1.5M clocks of a
+// torch view's scene passes, 9% of its frame (per-draw trace, 2026-10-06).
+// The caller weights it by the albedo.
+fn surface_lights(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
+    var lit = vec3<f32>(0.0);
+    // WALKED AS A MASK, as the lamp loop walks `reaching`: counted to a
+    // uniform, the same loop compiled 42-47 instructions bigger in every
+    // reader that has it (PIPESTATS, deploy110 against deploy111: 219 against
+    // 177 in the baked reader) -- and past about 3,390 a reader's size is its
+    // cost on this GPU, through its instruction cache
+    // (docs/frame-budget-plan-2026-10-06.md §1.6).
+    var todo = (1u << surface_light_count()) - 1u;
+    loop {{
+        if (todo == 0u) {{
+            break;
+        }}
+        let i = countTrailingZeros(todo);
+        todo = todo & (todo - 1u);
+        let to_light = lights.lights[i].position.xyz - world_pos;
+        let dist_sq = dot(to_light, to_light);
+        let range = lights.lights[i].params.x;
+        // Past its range the window is exactly zero.
+        if (dist_sq >= range * range) {{
+            continue;
+        }}
+        let l_dir = to_light * inverseSqrt(max(dist_sq, 1e-8));
+        let d2_over_r2 = dist_sq / max(range * range, 1e-8);
+        let window = clamp(1.0 - d2_over_r2 * d2_over_r2, 0.0, 1.0);
+        let source = max(-2.0 - lights.lights[i].params.w, 0.0);
+        var atten = (window * window) / max(dist_sq + source * source, LAMP_RADIUS * LAMP_RADIUS);
+        if (lights.lights[i].params.z > 0.5) {{
+            let cos_outer = lights.lights[i].params.y;
+            let s = clamp((dot(-l_dir, lights.lights[i].direction.xyz) - cos_outer) / (lights.lights[i].direction.w - cos_outer), 0.0, 1.0);
+            atten = atten * s * s * (3.0 - 2.0 * s);
+        }}
+        let radiance = lights.lights[i].color_intensity.rgb * lights.lights[i].color_intensity.a;
+        lit = lit + radiance * (terminator_aa(dot(n, l_dir)).x * atten);
+    }}
+    return lit;
 }}
 
 fn light_contribution_rough(
@@ -1930,13 +2747,17 @@ fn light_contribution_rough(
         // exp2(4 log2 x), two transcendental instructions a lamp a pixel.
         let d2_over_r2 = d_over_r * d_over_r;
         let window = clamp(1.0 - d2_over_r2 * d2_over_r2, 0.0, 1.0);
-        atten = (window * window) / max(dist * dist, LAMP_RADIUS * LAMP_RADIUS);
+        // A light standing for a lit surface carries its patch's radius below
+        // `SURFACE_LIGHT` (`Light::source_radius`): the falloff a disc that
+        // wide gives. 0 for every lamp, whose falloff is what it was.
+        let source = max(-2.0 - l.params.w, 0.0);
+        atten = (window * window) / max(dist * dist + source * source, LAMP_RADIUS * LAMP_RADIUS);
 
         if (kind > 0.5) {{
             let cos_outer = l.params.y;
             let cos_inner = l.direction.w;
             let cos_angle = dot(-l_dir, l.direction.xyz);
-            atten = atten * spot_cone(cos_angle, cos_outer, cos_inner, dist);
+            atten = atten * spot_cone(cos_angle, cos_outer, cos_inner, dist, spot_cone_across(l.direction.xyz, l_dir, cos_angle, dist, n, view_dir));
         }}
     }}
 
@@ -1948,8 +2769,9 @@ fn light_contribution_rough(
     // light gets no highlight. Ungated, the half-vector still lines up on the
     // far side and rims every object with light coming from behind it. And on
     // light arriving at all: outside a spot's cone the highlight would be
-    // multiplied by an `atten` of exactly 0.
-    if (ndotl > 0.0 && atten > 0.0) {{
+    // multiplied by an `atten` of exactly 0. Nor from a light that stands for
+    // a lit surface (`SURFACE_LIGHT`).
+    if (ndotl > 0.0 && atten > 0.0 && l.params.w > -1.5) {{
         let h = normalize(l_dir + view_dir);
         let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;
         out = out + radiance * spec * atten;
@@ -2034,7 +2856,7 @@ fn light_debug(world_pos: vec3<f32>, n: vec3<f32>) -> vec2<f32> {{
         let lum = dot(c.diffuse, vec3<f32>(0.2126, 0.7152, 0.0722));
         var shadow = stationary_visibility(l);
         let layer = i32(l.params.w);
-        if (layer >= 0 && f32(layer) < camera.shadow_params.y) {{
+        if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
             shadow = shadow * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
         }}
         pre = pre + lum;
@@ -2243,6 +3065,11 @@ fn probe_choose_in_room(room: f32, select_world: vec3<f32>) -> ProbeChoice {{
     c.best_dist = 1e30;
     c.second_dist = 1e30;
     c.room = room;
+    // ONE ROOM'S CHAIN, WALKED: this room's few slots, where
+    // `probe_nearest_two` looks at all sixteen -- the same two photographs.
+    // Per pixel at full resolution in the scene pass's models; the probe
+    // pass's hit, over two rooms, scans (exp61-62). Walk against scan, the
+    // models' draws timed: exp63-64.
     for (var i = probe_room_slot(room); i >= 0; i = probe_slot_next(i)) {{
         let to_centre = camera.probe_boxes[i * 3].xyz - select_world;
         let dist = dot(to_centre, to_centre);
@@ -2480,10 +3307,13 @@ fn probe_environment(
     // `probe_traced_colour`.
     let hit = probe_trace(world_pos, d, trace_room, roughness);
     if (hit.found) {{
-        let secondary = hit.rim >= 0.0 || hit.edge_code >= 0;
+        // A MODEL ON CARDS is coloured by the fix-up in a pass that defers:
+        // see `probe_hit_carded`.
+        let recolour = PROBE_SECONDARY_DEFERRED && probe_hit_carded(hit);
+        let secondary = hit.rim >= 0.0 || hit.edge_code >= 0 || recolour;
         var slot = -1;
         if (PROBE_SECONDARY_DEFERRED && secondary) {{
-            slot = probe_fixup_begin(hit, world_pos, d, dir, roughness, probe_lod, trace_room);
+            slot = probe_fixup_begin(hit, world_pos, d, dir, roughness, probe_lod, trace_room, recolour);
         }}
         let col = probe_traced_colour(hit, d, roughness, dir, probe_lod);
         if (!secondary) {{
@@ -2837,6 +3667,10 @@ fn probe_hit_lod(roughness: f32, t: f32, t_probe: f32) -> f32 {{
 // 3.4e38: sky, or a plane the direction never meets. -1: no depth baked.
 fn probe_seen_distance(slot: i32, v: vec3<f32>) -> f32 {{
     let t = textureSampleLevel(probe_depth, probe_depth_samp, v, i32(camera.probe_boxes[slot * 3].w), 0.0);
+    return probe_seen_distance_of(t, v);
+}}
+// `probe_seen_distance` from its depth texel `t`, read already.
+fn probe_seen_distance_of(t: vec4<f32>, v: vec3<f32>) -> f32 {{
     if (dot(t.xyz, t.xyz) < 0.25) {{
         return select(-1.0, 3.4e38, t.w > 0.5);
     }}
@@ -2850,7 +3684,13 @@ fn probe_seen_distance(slot: i32, v: vec3<f32>) -> f32 {{
 // vouches for nothing.
 fn probe_clearance(slot: i32, p: vec3<f32>) -> f32 {{
     let v = p - camera.probe_boxes[slot * 3].xyz;
-    let s = probe_seen_distance(slot, v);
+    let t = textureSampleLevel(probe_depth, probe_depth_samp, v, i32(camera.probe_boxes[slot * 3].w), 0.0);
+    return probe_clearance_of(t, v);
+}}
+// `probe_clearance` from the depth texel `t` read along `v`, the point less
+// the capture point.
+fn probe_clearance_of(t: vec4<f32>, v: vec3<f32>) -> f32 {{
+    let s = probe_seen_distance_of(t, v);
     return select(s - length(v), -3.4e38, s < 0.0);
 }}
 
@@ -2873,6 +3713,96 @@ fn probe_room_slot(room: f32) -> i32 {{
 // would, so every tie between two photographs is broken the same way.
 fn probe_slot_next(slot: i32) -> i32 {{
     return i32(camera.probe_rooms[4 + (slot >> 2u)][slot & 3]);
+}}
+
+// THE NEAREST TWO PHOTOGRAPHS OF ROOM `a` OR ROOM `b` to `p`, -1 for none,
+// and their SQUARED distances. Every slot the camera holds is looked at, in
+// ascending order and with the same strict comparisons as walking the two
+// rooms' chains merged (`probe_room_slot`, `probe_slot_next`): the same slots
+// in the same order, so the same two, ties included.
+//
+// LOOKED AT, NOT WALKED: every slot in turn, at an index the loop counts,
+// not one the previous read had to supply. Walking a chain read the table at
+// places only the previous read could say, each read waiting out the one
+// before -- and through the memory path: indices the compiler cannot see keep
+// a table out of constant memory (Qualcomm, *Adreno GPU best practices*). The
+// walk in `probe_hit_colour` was a quarter of the probe pass's time (stage
+// counters, 2026-10-01: 478K clocks a tile with it, 349K with no choice made
+// at all).
+//
+// A LOOP, NOT WRITTEN OUT, by measurement: per tile of the probe pass,
+// hall_front, 2026-10-01 (exp61), the loop 514K clocks, the same scan written
+// out one block a slot (`probe_nearest_two_unrolled`) 556K and 563K, the walk
+// 576K. Slots past the live count keep stale rooms, so the loop stops there --
+// the same count for every pixel, so the stop costs no divergence.
+struct ProbeNearest {{
+    s0: i32,
+    s1: i32,
+    d0: f32,
+    d1: f32,
+}}
+const PROBE_MAX_SLOTS: i32 = {max_probes};
+// `probe_nearest_two` written out, one block a slot, reading the table at
+// fixed places: the same slots, order and result. Measured slower (above);
+// kept for the `def_scan_unrolled` cut.
+fn probe_nearest_two_unrolled(p: vec3<f32>, a: f32, b: f32) -> ProbeNearest {{
+    let count = i32(camera.probe_params.x);
+    var n = ProbeNearest(-1, -1, 3.4e38, 3.4e38);
+{probe_nearest_unrolled}    return n;
+}}
+fn probe_nearest_two(p: vec3<f32>, a: f32, b: f32) -> ProbeNearest {{
+    let count = i32(camera.probe_params.x);
+    var n = ProbeNearest(-1, -1, 3.4e38, 3.4e38);
+    for (var i = 0; i < PROBE_MAX_SLOTS; i = i + 1) {{
+        if (i >= count) {{
+            break;
+        }}
+        let room = camera.probe_boxes[i * 3 + 2].w;
+        let v = camera.probe_boxes[i * 3].xyz - p;
+        let dd = dot(v, v);
+        let mine = room == a || room == b;
+        if (mine && dd < n.d0) {{
+            n.s1 = n.s0;
+            n.d1 = n.d0;
+            n.s0 = i;
+            n.d0 = dd;
+        }} else if (mine && dd < n.d1) {{
+            n.s1 = i;
+            n.d1 = dd;
+        }}
+    }}
+    return n;
+}}
+// `probe_nearest_two_unrolled` reading `probe_select`: the `def_scan_const_unrolled` cut.
+fn probe_nearest_two_const_unrolled(p: vec3<f32>, a: f32, b: f32) -> ProbeNearest {{
+    let count = i32(camera.probe_params.x);
+    var n = ProbeNearest(-1, -1, 3.4e38, 3.4e38);
+{probe_nearest_const_unrolled}    return n;
+}}
+// `probe_nearest_two` reading its own uniform block, `probe_select`, in place
+// of the camera's: the same bytes, so the same slots, order and result.
+fn probe_nearest_two_const(p: vec3<f32>, a: f32, b: f32) -> ProbeNearest {{
+    let count = i32(camera.probe_params.x);
+    var n = ProbeNearest(-1, -1, 3.4e38, 3.4e38);
+    for (var i = 0; i < PROBE_MAX_SLOTS; i = i + 1) {{
+        if (i >= count) {{
+            break;
+        }}
+        let room = probe_select[i * 3 + 2].w;
+        let v = probe_select[i * 3].xyz - p;
+        let dd = dot(v, v);
+        let mine = room == a || room == b;
+        if (mine && dd < n.d0) {{
+            n.s1 = n.s0;
+            n.d1 = n.d0;
+            n.s0 = i;
+            n.d0 = dd;
+        }} else if (mine && dd < n.d1) {{
+            n.s1 = i;
+            n.d1 = dd;
+        }}
+    }}
+    return n;
 }}
 // The first doorway of `room`, or -1; then each one's next in that room,
 // ascending -- onward through whichever of its two sides IS that room. The
@@ -3187,23 +4117,10 @@ fn probe_proxy_field(lo: vec3<f32>, ld: vec3<f32>, half: vec3<f32>, t_in: f32, t
 // first point neither did is the object. Short and rare -- only rays that
 // enter a model's box pay for it.
 fn probe_proxy_surface(o: vec3<f32>, d: vec3<f32>, t_in: f32, t_out: f32, room: f32, centre: vec3<f32>) -> f32 {{
-    var s0 = -1;
-    var s1 = -1;
-    var d0 = 3.4e38;
-    var d1 = 3.4e38;
-    for (var i = probe_room_slot(room); i >= 0; i = probe_slot_next(i)) {{
-        let v = camera.probe_boxes[i * 3].xyz - centre;
-        let dd = dot(v, v);
-        if (dd < d0) {{
-            s1 = s0;
-            d1 = d0;
-            s0 = i;
-            d0 = dd;
-        }} else if (dd < d1) {{
-            s1 = i;
-            d1 = dd;
-        }}
-    }}
+    // The room's two photographs nearest the object: see `probe_nearest_two`.
+    let near = probe_nearest_two(centre, room, room);
+    let s0 = near.s0;
+    let s1 = near.s1;
     if (s0 < 0) {{
         return 3.4e38;
     }}
@@ -3816,6 +4733,8 @@ struct ProbeCardVote {{
     rgb: vec3<f32>,
     w: f32,
     sure: f32,
+    // Which card, and where on it: its number, u and v.
+    card: vec3<f32>,
 }}
 fn probe_card_vote(row: f32, face: f32, uv: vec2<f32>, t: f32, depth: f32, extent: vec2<f32>, field_stop: f32, lod: f32, cu: vec3<f32>, cv: vec3<f32>, cz: vec3<f32>, ld: vec3<f32>) -> ProbeCardVote {{
     let dims = vec2<f32>(textureDimensions(proxy_cards));
@@ -3854,6 +4773,7 @@ fn probe_card_vote(row: f32, face: f32, uv: vec2<f32>, t: f32, depth: f32, exten
     vote.rgb = card.rgb / max(1.0 - dot(card.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-3);
     vote.w = trust.x;
     vote.sure = trust.y;
+    vote.card = vec3<f32>(face, uv);
     return vote;
 }}
 
@@ -3895,13 +4815,222 @@ fn probe_card_hemisphere(o: vec2<f32>) -> vec3<f32> {{
 struct ProbeCardSum {{
     colour: vec4<f32>,
     sure: f32,
+    // The card that vouches most, for what one card's texel says alone: the
+    // surface's albedo and facing (`probe_card_relit`).
+    best: f32,
+    card: vec3<f32>,
 }}
 fn probe_card_add(sum: ProbeCardSum, vote: ProbeCardVote) -> ProbeCardSum {{
     var out = sum;
     let k = vote.w / (1.0 + dot(vote.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)));
     out.colour += vec4<f32>(vote.rgb * k, k);
     out.sure = max(out.sure, vote.sure);
+    out.card = select(out.card, vote.card, vote.w > out.best);
+    out.best = max(out.best, vote.w);
     return out;
+}}
+
+// Axis `k` of a box's own frame.
+fn probe_axis(k: u32) -> vec3<f32> {{
+    return vec3<f32>(f32(k == 0u), f32(k == 1u), f32(k == 2u));
+}}
+
+// THE LIGHT OF THE LAMPS THE BAKE NEVER SAW on a surface their beams are
+// known to light (`lights::LitSurface`), where a reflection meets it at `h`
+// (world) after `t` from a surface of `roughness`: the torch's pool on a
+// wall, as the polished floor should show it (user, 2026-10-05: "making the
+// flashlight torch light on the wall be reflected on other surfaces"). The
+// photographs hold the level's own light only. READ FROM THE SURFACE'S POOL
+// MAP, made once a frame (`pool_map_light`): the map as seen from the glass,
+// at `h`'s place in it, as blurred as the reflection's footprint there --
+// so a hand's shadow in the pool softens with the floor's roughness as the
+// pool's edge does. Nothing for a point on no such surface, or outside its
+// map.
+//
+// A MAP, NOT THE LAMPS WORKED OUT AT EVERY HIT: worked out here -- the lamp
+// loop, the cone and each lamp's nine-tap shadow at every reflected point on
+// a lit plane -- the light cost the torch views 1.3-1.5 ms of the reflection
+// pass (headset A/B, 2026-10-06), and the ground's pass a register whatever
+// form it took. Nor deferred to the fix-up, whose list it filled to the cap
+// (277,000 records, half the pass, offline 2026-10-06). `d` is unused: the
+// map is the same light whichever way it is seen.
+//
+// READ WITH NO BRANCH but the frame's (no surface lit at all): every hit reads
+// a texel -- surface 0's map where it is on no lit plane -- and keeps it only
+// where it is on one, inside its map. So the read can be issued beside the
+// photographs' (`probe_hit_colour`), and waits with them rather than after.
+// Headset, synced frame, two passes: read here, the lookup costs the torch
+// views 0.36-0.52 ms (deploy96); read last behind a branch it cost 0.22-0.60
+// (deploy95) -- the same within noise, and this form is 53 instructions
+// smaller. A frame with no surface lit draws without any of this: the passes'
+// poolless twins (`without_pool_maps`).
+fn probe_surface_relit(h: vec3<f32>, d: vec3<f32>, roughness: f32, t: f32) -> vec3<f32> {{
+    if (lights.surfaces[1].w <= 0.0) {{
+        return vec3<f32>(0.0);
+    }}
+    let p = to_player_space(h);
+    let k = lit_surface_at(p);
+    let at = max(k, 0) * LIT_SURFACE_VEC4S;
+    let glass = lights.surfaces[at + 1];
+    let axis = lights.surfaces[at + 2];
+    let right = lights.surfaces[at + 3].xyz;
+    let v = p - glass.xyz;
+    let z = dot(v, axis.xyz);
+    let xy = vec2<f32>(dot(v, right), dot(v, cross(right, axis.xyz))) / (max(z, 1e-4) * glass.w);
+    let inside = k >= 0 && z > 0.0 && max(abs(xy.x), abs(xy.y)) < 1.0;
+    // The maps lie three across the atlas in bands, each two cards square,
+    // from the texel row the surfaces name (`pool_cards`); a texel of one
+    // spans `2 z tan / block` where the hit is.
+    let dims = vec2<f32>(textureDimensions(proxy_cards));
+    let block = dims.x / f32(POOL_MAPS_ACROSS);
+    let footprint = max(t * probe_lobe_tan(roughness), pixel_footprint * (1.0 + t / max(probe_eye_distance, 0.05)));
+    let lod = clamp(log2(max(footprint * block / (2.0 * max(z, 1e-4) * glass.w), 1.0)), 0.0, POOL_MAP_MAX_LOD);
+    let s = 0.5 * exp2(ceil(lod));
+    let kk = max(k, 0);
+    let corner = vec2<f32>(f32(kk % POOL_MAPS_ACROSS), f32(kk / POOL_MAPS_ACROSS)) * block + vec2<f32>(0.0, axis.w);
+    let texel = corner + clamp((clamp(xy, vec2<f32>(-1.0), vec2<f32>(1.0)) * 0.5 + vec2<f32>(0.5)) * block, vec2<f32>(s), vec2<f32>(block - s));
+    let lit = textureSampleLevel(proxy_cards, probe_samp, texel / dims, lod).rgb;
+    return select(vec3<f32>(0.0), lit, inside);
+}}
+
+// THE POOL MAP's TEXEL `uv` OF SURFACE `k`: the lamps the bake never saw on
+// the surface's plane, where the ray from the glass through that texel meets
+// it -- each lamp's cone, falloff and own shadow map (lifted off the plane),
+// on the surface's albedo; black where the ray meets the plane behind the
+// glass or not at all. `texels`: the map's size, which sizes the cone's
+// edge (`pixel_footprint`) to a texel there. Seen from the glass, the map's
+// texels are as fine where the pool is near as where it is far, as the
+// player -- holding the glass -- sees it. Made by `pool_cards` once a frame;
+// read by `probe_surface_relit`.
+fn pool_map_light(k: i32, uv: vec2<f32>, texels: f32) -> vec3<f32> {{
+    if (k >= MAX_LIT_SURFACES) {{
+        return vec3<f32>(0.0);
+    }}
+    let at = k * LIT_SURFACE_VEC4S;
+    let glass = lights.surfaces[at + 1];
+    if (glass.w <= 0.0) {{
+        return vec3<f32>(0.0);
+    }}
+    let plane = lights.surfaces[at];
+    let axis = lights.surfaces[at + 2].xyz;
+    let right = lights.surfaces[at + 3].xyz;
+    let xy = (uv * 2.0 - vec2<f32>(1.0)) * glass.w;
+    let dir = normalize(axis + right * xy.x + cross(right, axis) * xy.y);
+    let facing = dot(plane.xyz, dir);
+    if (facing > -1e-4) {{
+        return vec3<f32>(0.0);
+    }}
+    let along = (plane.w - dot(plane.xyz, glass.xyz)) / facing;
+    if (along <= 0.0) {{
+        return vec3<f32>(0.0);
+    }}
+    let p = glass.xyz + dir * along;
+    let n = plane.xyz;
+    pixel_footprint = along * 2.0 * glass.w / texels;
+    var lit = vec3<f32>(0.0);
+    for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
+        let l = lights.lights[i];
+        // The lamps the bake never saw -- but not a lit surface's own light,
+        // which it sends away from itself (`SURFACE_LIGHT`).
+        if (l.position.w > -0.5 || l.params.w < -1.5) {{
+            continue;
+        }}
+        let c = light_contribution_split(l, p, n, -dir, 1.0, 0.0);
+        if (max(max(c.diffuse.r, c.diffuse.g), c.diffuse.b) <= 0.0) {{
+            continue;
+        }}
+        var shadow = 1.0;
+        let layer = i32(l.params.w);
+        if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
+            shadow = pcf_layer(spot_shadow_tex, layer, p + n * PROBE_CARD_RELIT_LIFT, camera.spot_view_proj[layer]);
+        }}
+        lit += c.diffuse * shadow;
+    }}
+    return lights.surfaces[at + 4].rgb * lit;
+}}
+
+// Which lit surface (`lights::LitSurface`) holds `p` (player frame): the
+// first on whose plane it lies within `LIT_SURFACE_TOLERANCE`; -1 for none.
+// One with no map (`w` 0: past the list's end) holds nothing. Where its light
+// falls on the plane is its map's to say. Every surface tested, last first,
+// with no early exit: a loop of fixed length over fixed places in the block,
+// which the compiler can unroll into reads it need not index. 2026-10-06:
+// finding the surface as a walk with a `break`, with nothing lit there, cost
+// the torch views 0.25-0.32 ms of the reflection pass (headset, cut
+// `def_cut_relight_found`).
+fn lit_surface_at(p: vec3<f32>) -> i32 {{
+    var k = -1;
+    for (var j = MAX_LIT_SURFACES - 1; j >= 0; j = j - 1) {{
+        let plane = lights.surfaces[j * LIT_SURFACE_VEC4S];
+        let mapped = lights.surfaces[j * LIT_SURFACE_VEC4S + 1].w > 0.0;
+        k = select(k, j, mapped && abs(dot(plane.xyz, p) - plane.w) < LIT_SURFACE_TOLERANCE);
+    }}
+    return k;
+}}
+const MAX_LIT_SURFACES: i32 = {MAX_LIT_SURFACES};
+const LIT_SURFACE_VEC4S: i32 = {LIT_SURFACE_VEC4S};
+const POOL_MAPS_ACROSS: i32 = {pool_maps_across};
+// The pool maps' blur levels: the character cards' mip pass makes both.
+const POOL_MAP_MAX_LOD: f32 = {character_card_max_lod:?};
+// How far off a lit surface's plane a reflected point may lie and still be on
+// it, metres: the rooms' boxes the trace meets lie on the walls they stand
+// for, to the bake's centimetre.
+const LIT_SURFACE_TOLERANCE: f32 = 0.05;
+
+// THE LIGHT OF THE LAMPS THE BAKE NEVER SAW on a model's surface, where a
+// reflection meets it: see `PROBE_CARD_RELIT`. `card` is the card vouching
+// most for the hit and the point's u, v on it, in the colours' row `row`; `h`
+// the hit, world; `q` the proxy's turn; `lod` the level its colour was read
+// at, which the albedo is read at too. Nothing at all -- not a texture read --
+// while no such lamp is lit.
+fn probe_card_relit(row: f32, card: vec3<f32>, lod: f32, h: vec3<f32>, q: vec4<f32>) -> vec3<f32> {{
+    var unseen = false;
+    for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
+        unseen = unseen || lights.lights[i].position.w < -0.5;
+    }}
+    if (!unseen) {{
+        return vec3<f32>(0.0);
+    }}
+    let dims = vec2<f32>(textureDimensions(proxy_cards));
+    let res = dims.x / 6.0;
+    let s = exp2(lod);
+    let origin = vec2<f32>(card.x * res, row * res);
+    let uv = card.yz;
+    // Its facing from the tests' row, read where it is, and its albedo two
+    // rows down, read as its colour was. See `proxy_cards`.
+    let test = textureSampleLevel(proxy_cards, probe_samp, (origin + vec2<f32>(0.0, res) + clamp(uv * res, vec2<f32>(0.5), vec2<f32>(res - 0.5))) / dims, 0.0);
+    let albedo = textureSampleLevel(proxy_cards, probe_samp, (origin + vec2<f32>(0.0, 2.0 * res) + clamp(uv * res, vec2<f32>(0.5 * s), vec2<f32>(res - 0.5 * s))) / dims, lod).rgb;
+    // The card's frame, as `proxy_cards::card_frame` has it: it looks along
+    // axis `a`, u along the next, v the one after.
+    let a = u32(card.x) / 2u;
+    let o = probe_card_hemisphere(test.xy);
+    var n = o.x * probe_axis((a + 1u) % 3u) + o.y * probe_axis((a + 2u) % 3u)
+        + o.z * probe_axis(a) * select(1.0, -1.0, (u32(card.x) & 1u) == 1u);
+    if (any(q != vec4<f32>(0.0, 0.0, 0.0, 1.0))) {{
+        n = probe_quat_rotate(q, n);
+    }}
+    // In the player's frame, as the lamps arrive.
+    let p = to_player_space(h);
+    let np = normalize(to_player_direction(n));
+    var lit = vec3<f32>(0.0);
+    for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
+        let l = lights.lights[i];
+        if (l.position.w > -0.5) {{
+            continue;
+        }}
+        let c = light_contribution_split(l, p, np, np, 1.0, 0.0);
+        if (max(max(c.diffuse.r, c.diffuse.g), c.diffuse.b) <= 0.0) {{
+            continue;
+        }}
+        var shadow = 1.0;
+        let layer = i32(l.params.w);
+        if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
+            shadow = pcf_layer(spot_shadow_tex, layer, p + np * PROBE_CARD_RELIT_LIFT, camera.spot_view_proj[layer]);
+        }}
+        lit += c.diffuse * shadow;
+    }}
+    // As the lamps light a surface: its albedo times what arrives.
+    return albedo * lit;
 }}
 
 // A MODEL'S OWN LOOK WHERE A REFLECTION MEETS IT, at world `h` along world
@@ -3961,6 +5090,8 @@ fn probe_card_colour(proxy: i32, h: vec3<f32>, d: vec3<f32>, t_hit: f32, lobe: f
     var sum: ProbeCardSum;
     sum.colour = vec4<f32>(0.0);
     sum.sure = 0.0;
+    sum.best = 0.0;
+    sum.card = vec3<f32>(0.0);
     sum = probe_card_add(sum, probe_card_vote(row, 0.0, uvw.yz, 0.5 - 0.5 * lo.x / half.x, 2.0 * half.x, 2.0 * half.yz, field_stop, lod, ay, az, ax, ld));
     sum = probe_card_add(sum, probe_card_vote(row, 1.0, uvw.yz, 0.5 + 0.5 * lo.x / half.x, 2.0 * half.x, 2.0 * half.yz, field_stop, lod, ay, az, -ax, ld));
     sum = probe_card_add(sum, probe_card_vote(row, 2.0, uvw.zx, 0.5 - 0.5 * lo.y / half.y, 2.0 * half.y, 2.0 * half.zx, field_stop, lod, az, ax, ay, ld));
@@ -3971,7 +5102,8 @@ fn probe_card_colour(proxy: i32, h: vec3<f32>, d: vec3<f32>, t_hit: f32, lobe: f
     // hidden from the card below by the shade itself -- is left to the
     // model's own colour (`probe_model_colour`), not to a card's say at a
     // hundredth of a vote.
-    return vec4<f32>(sum.colour.rgb / max(sum.colour.w, 1e-9), sum.sure);
+    var colour = sum.colour.rgb / max(sum.colour.w, 1e-9);
+{card_relit_call}    return vec4<f32>(colour, sum.sure);
 }}
 
 // `mix(a, b, k)` weighed as a tone-mapped image would be (Karis's
@@ -3987,75 +5119,65 @@ fn probe_mix_bright(a: vec4<f32>, b: vec4<f32>, k: f32) -> vec4<f32> {{
 }}
 
 fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32, d: vec3<f32>) -> vec4<f32> {{
-    var s0 = -1;
-    var s1 = -1;
-    var d0 = 3.4e38;
-    var d1 = 3.4e38;
-    // The slots of `room` and of `other`, merged in ascending slot order --
-    // exactly the slots, and the order, of a scan of every slot for either.
-    var next_a = probe_room_slot(room);
-    var next_b = select(-1, probe_room_slot(other), other != room);
-    loop {{
-        if (next_a < 0 && next_b < 0) {{
-            break;
-        }}
-        var i = next_a;
-        if (next_b >= 0 && (next_a < 0 || next_b < next_a)) {{
-            i = next_b;
-            next_b = probe_slot_next(next_b);
-        }} else {{
-            next_a = probe_slot_next(next_a);
-        }}
-        let v = camera.probe_boxes[i * 3].xyz - h;
-        let dd = dot(v, v);
-        if (dd < d0) {{
-            s1 = s0;
-            d1 = d0;
-            s0 = i;
-            d0 = dd;
-        }} else if (dd < d1) {{
-            s1 = i;
-            d1 = dd;
-        }}
-    }}
+    // The nearest two photographs of the hit's room and of `other`'s: see
+    // `probe_nearest_two`.
+    let near = probe_nearest_two(h, room, other);
+    let s0 = near.s0;
+    let s1 = near.s1;
+    let d0 = near.d0;
+    let d1 = near.d1;
     // A MODEL is shown by a photograph only from about the ray's direction.
     // See `probe_view_trust`.
     let model = other < -1.5;
-    let c0 = probe_clearance(s0, h);
+    // BOTH PHOTOGRAPHS' TEXELS AT ONCE, depth and colour, before anything is
+    // made of them: four reads that wait together. Read in turn -- the
+    // second's depth after the first's had come back, the colours after the
+    // depths had said which to keep -- each waited out the one before, and
+    // these reads miss the cache, since every pixel's ray meets the
+    // photographs somewhere else: this colouring was nearly half the probe
+    // pass's time (stage counters, 2026-10-01). A photograph that turns out
+    // not to vouch has its colour read for nothing; with no second
+    // photograph, the first is read twice, which the cache serves.
+    let has1 = s1 >= 0;
+    let b0 = camera.probe_boxes[s0 * 3];
+    let b1 = camera.probe_boxes[select(s0, s1, has1) * 3];
+    let v0 = h - b0.xyz;
+    let v1 = h - b1.xyz;
+    // Each photograph read at the blur the hit's distance calls for, from its
+    // own distance to the hit. See `probe_hit_lod`.
+    let lod0 = probe_hit_lod(roughness, t, sqrt(d0));
+    let lod1 = probe_hit_lod(roughness, t, sqrt(select(d0, d1, has1)));
+    let depth0 = textureSampleLevel(probe_depth, probe_depth_samp, v0, i32(b0.w), 0.0);
+    let depth1 = textureSampleLevel(probe_depth, probe_depth_samp, v1, i32(b1.w), 0.0);
+    let col0 = textureSampleLevel(probe_cube, probe_samp, v0, i32(b0.w), lod0);
+    let col1 = textureSampleLevel(probe_cube, probe_samp, v1, i32(b1.w), lod1);
+{surface_relit_read}    let c0 = probe_clearance_of(depth0, v0);
     let tol0 = PROBE_SEEN_TOLERANCE + 0.01 * sqrt(d0);
     // How far each photograph vouches for the point, 0..1, and the most any does.
     var seen = 1.0 - smoothstep(tol0, 2.0 * tol0, abs(c0));
     if (model) {{
-        seen *= probe_view_trust(d, camera.probe_boxes[s0 * 3].xyz, h);
+        seen *= probe_view_trust(d, b0.xyz, h);
     }}
     var w0 = seen / (d0 + 1.0);
     var w1 = 0.0;
     var c1 = -3.4e38;
-    if (s1 >= 0) {{
-        c1 = probe_clearance(s1, h);
+    if (has1) {{
+        c1 = probe_clearance_of(depth1, v1);
         let tol1 = PROBE_SEEN_TOLERANCE + 0.01 * sqrt(d1);
         var seen1 = 1.0 - smoothstep(tol1, 2.0 * tol1, abs(c1));
         if (model) {{
-            seen1 *= probe_view_trust(d, camera.probe_boxes[s1 * 3].xyz, h);
+            seen1 *= probe_view_trust(d, b1.xyz, h);
         }}
         w1 = seen1 / (d1 + 1.0);
         seen = max(seen, seen1);
     }}
     if (w0 + w1 < 1e-6) {{
-        w0 = select(1.0, 0.0, s1 >= 0 && abs(c1) < abs(c0));
+        w0 = select(1.0, 0.0, has1 && abs(c1) < abs(c0));
         w1 = 1.0 - w0;
     }}
-    // Each photograph read at the blur the hit's distance calls for, from its
-    // own distance to the hit. See `probe_hit_lod`.
-    var col = textureSampleLevel(
-        probe_cube, probe_samp, h - camera.probe_boxes[s0 * 3].xyz, i32(camera.probe_boxes[s0 * 3].w),
-        probe_hit_lod(roughness, t, sqrt(d0))
-    ) * w0;
+    var col = col0 * w0;
     if (w1 > 0.0) {{
-        col += textureSampleLevel(
-            probe_cube, probe_samp, h - camera.probe_boxes[s1 * 3].xyz, i32(camera.probe_boxes[s1 * 3].w),
-            probe_hit_lod(roughness, t, sqrt(d1))
-        ) * w1;
+        col += col1 * w1;
     }}
     col = col / (w0 + w1);
     // A MODEL, where no photograph saw it, is the model: see
@@ -4072,22 +5194,35 @@ fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32,
     // it is still the photograph. What this wants is photographs taken without
     // the props in them (tracker).
     if (!model && seen < 1.0) {{
-        let wide = textureSampleLevel(
-            probe_cube, probe_samp, h - camera.probe_boxes[s0 * 3].xyz, i32(camera.probe_boxes[s0 * 3].w),
-            max(probe_hit_lod(roughness, t, sqrt(d0)), PROBE_UNSEEN_LOD)
-        );
+        let wide = textureSampleLevel(probe_cube, probe_samp, v0, i32(b0.w), max(lod0, PROBE_UNSEEN_LOD));
         col = mix(wide, col, seen);
     }}
     // A MODEL ON CARDS IS ITS CARDS: a bake that pictures a model on its own
     // cards leaves it out of the photographs, which then show the wall behind
     // it. See `probe_card_colour`. The photographs' guess above stays for a
     // model without cards -- an older bake, or one past the level's shaped
-    // models (`space_soup_engine::reflection_proxy::shaped_models`).
-    if (model) {{
+    // models (`space_soup_engine::reflection_proxy::shaped_models`). Not in a
+    // pass that defers, whose fix-up colours every hit on cards: see
+    // `probe_hit_carded`.
+    if (model && !PROBE_SECONDARY_DEFERRED) {{
         let card = probe_card_colour(i32(-2.0 - other), h, d, t, probe_lobe_tan(roughness));
         col = probe_mix_bright(col, vec4<f32>(card.rgb, 1.0), card.w);
     }}
-    return col;
+{surface_relit_call}    return col;
+}}
+
+// WHETHER A HIT IS ON A MODEL'S CARDS (`probe_card_colour`). A pass that
+// defers its secondary lookups leaves those hits' colour to `probe_fixup`,
+// which reads the cards' tests filtered (`PROBE_CARD_TESTS_FILTERED`) and had
+// traced nearly every such texel's ray again already (`PROBE_RETEST`): the
+// six cards' votes were about a fifth of the probe pass's code, run for
+// colours the fix-up then replaced -- in a pass that misses the GPU's
+// instruction cache three times as often as the scene shader over its cliff
+// (2026-10-01). Only where another outline already held the hit's edge did
+// the pass's own card colour stand, read unfiltered.
+fn probe_hit_carded(h: ProbeHit) -> bool {{
+    let m = max(i32(-2.0 - h.other), 0);
+    return h.other < -1.5 && camera.proxy_cards[m >> 2u][m & 3] > 0.5;
 }}
 
 // How soft a photograph is read where it did not see a room's wall: level 4 of
@@ -4211,6 +5346,7 @@ var<private> volume_sample_brightness: f32 = 0.0;
 fn probe_volume_sample(
     room: f32, select_world: vec3<f32>, world_pos: vec3<f32>, d: vec3<f32>, lod: f32,
 ) -> vec4<f32> {{
+    // The room's nearest photograph, its chain walked: see `probe_choose_in_room`.
     var pick = -1;
     var pick_dist = 1e30;
     for (var i = probe_room_slot(room); i >= 0; i = probe_slot_next(i)) {{
@@ -4402,7 +5538,8 @@ fn probe_env_for_pass(
         PROBE_NORMALISATION && probe_brightness > 0.0,
     );
     let a = clamp(probe.a, 0.0, 1.0);
-    return vec4<f32>(probe_pass_compress(probe.rgb * probe_scale) * a, a);
+    // A carried glass's glow past the normalisation: see `capsule_glow`.
+    return vec4<f32>(probe_pass_compress(probe.rgb * probe_scale + capsule_glow) * a, a);
 }}
 
 // WHAT THE LAMP HALF OF `shade_material_env` NEEDS FROM ITS ENVIRONMENT HALF.
@@ -4687,7 +5824,7 @@ fn shade_material_env_part(
         clamp(ambient_here / max(probe_brightness, 1e-4), PROBE_NORMALISATION_FLOOR, 1.0),
         PROBE_NORMALISATION && probe_brightness > 0.0,
     );
-    let sharp = mix(baseline, probe.rgb * spec_occ * probe_scale, clamp(probe.a, 0.0, 1.0));
+    let sharp = mix(baseline, probe.rgb * spec_occ * probe_scale{capsule_glow_term}, clamp(probe.a, 0.0, 1.0));
     // Marble here is 0.048 and takes the sharp answer; brick is near 1 and
     // falls back to the baseline, because at that roughness the probe's extra
     // directional detail is not information, it is the artefact.
@@ -4805,15 +5942,29 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
     // test it on a second walk over every lamp -- its baked visibility, its
     // range, its cone, the sun's mask. The lighting loop below then visits
     // only those, in the same order. See the comment there.
+    // The pixel's longer step on this surface, for the cone test below: how
+    // far a spot's averaged edge can reach past its cone. Once a pixel, not
+    // per lamp.
+    let pixel_long = spot_long_step(dot(view_dir, n));
     var light_dist_sq = 1e18;
     var reaching = 0u;
     let culling = light_culling();
-    for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
+    // Past the lit surfaces' lights, which are shaded apart below.
+    for (var i: u32 = surface_light_count(); i < live_light_count(); i = i + 1u) {{
         let kind = lights.lights[i].params.z;
         let to_lamp = lights.lights[i].position.xyz - world_pos;
         let dist_sq = dot(to_lamp, to_lamp);
         if (kind <= 1.5) {{
-            light_dist_sq = min(light_dist_sq, dist_sq);
+            // The nearest BULB. A light standing for a lit surface makes no
+            // highlight (`SURFACE_LIGHT`), so it sizes none: a flashlight's
+            // bounce 3 cm off a wall opened the torch's own highlight round
+            // it into a bright blob, nowhere near the torch's mirror angle
+            // (headset, 2026-10-02).
+            light_dist_sq = select(light_dist_sq, min(light_dist_sq, dist_sq), lights.lights[i].params.w > -1.5);
+        }} else if (SKY_SUN_NEVER_REACHES) {{
+            // Whatever the culling lever says: the sun's lookups are not in
+            // this shader. See `SKY_SUN_NEVER_REACHES`.
+            continue;
         }}
         if (culling) {{
             // Past its range, where the window is exactly zero: here or below,
@@ -4831,17 +5982,31 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
                     continue;
                 }}
                 // OUTSIDE A SPOT'S CONE BY MORE THAN ITS SOFT EDGE CAN REACH.
-                // `spot_cone` widens the authored band for antialiasing, but
-                // never past SPOT_EDGE_MAX_WIDEN times it, which moves the
-                // cone's zero at most one authored band outward -- so wherever
-                // the angle's cosine is below `cos_outer - authored` (less a
-                // hair for rounding) the cone is exactly 0, and so is all the
-                // maths it multiplies. `cos = along / dist`, compared squared,
-                // with the signs, so no root is taken.
+                // `spot_cone` widens the authored band for antialiasing to
+                // `SPOT_EDGE_MIN_PIXELS` of this pixel's footprint as seen from
+                // the lamp, never past SPOT_EDGE_MAX_WIDEN times the band --
+                // so wherever the angle's cosine is below `cos_outer` less
+                // half that widening (less a hair for rounding) the cone is
+                // exactly 0, and so is all the maths it multiplies. The
+                // widening is bounded HERE, at this distance, with the sine at
+                // its largest: never less than `spot_cone` widens. Bounded by
+                // the cap alone, a band as wide as the flashlight bounce's
+                // half space was never culled at all, and the wall behind its
+                // patch was shaded in full for nothing (2026-10-02). `cos =
+                // along / dist`, compared squared, with the signs, so no root
+                // is taken but the one reciprocal the footprint needs.
                 if (kind > 0.5) {{
                     let cos_outer = lights.lights[i].params.y;
                     let authored = max(lights.lights[i].direction.w - cos_outer, 0.0001);
-                    let zero_below = cos_outer - authored * (0.5 * (SPOT_EDGE_MAX_WIDEN - 1.0)) - 1e-4;
+                    // And past that, the pixel's average along its long step
+                    // reaches half of `spot_cone_across` further out, which is
+                    // at most half the pixel's LONGER step over the distance
+                    // (the cosine's gradient is sin / dist); 0 where no steps
+                    // were set.
+                    let inv_dist = inverseSqrt(max(dist_sq, 1e-6));
+                    let at_most = SPOT_EDGE_MIN_PIXELS * pixel_footprint * inv_dist;
+                    let widen = clamp(at_most - authored, 0.0, authored * (SPOT_EDGE_MAX_WIDEN - 1.0));
+                    let zero_below = cos_outer - 0.5 * widen - select(0.0, 0.5 * pixel_long * inv_dist, SPOT_EDGE_AVERAGE) - 1e-4;
                     let along = -dot(to_lamp, lights.lights[i].direction.xyz);
                     let bound_sq = zero_below * zero_below * max(dist_sq, 1e-8);
                     let outside = select(
@@ -4876,7 +6041,6 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
     // matte wall still has a bright spot on it.
     let spec_strength = SPEC_STRENGTH * (1.0 - r);
 
-    var diffuse = p.diffuse;
     var specular = p.specular;
     let fresnel = p.fresnel;
     if (p.has_dir) {{
@@ -4912,10 +6076,60 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
         specular = specular + env * gloss;
     }}
     let bounce = p.bounce;
-    diffuse = diffuse + bounce;
+    // ENERGY CONSERVATION. The albedo lands on the diffuse half only.
+    //
+    // `1 - fresnel` is the light that was NOT reflected off the surface, and so
+    // is the only light available to enter it, scatter, and come back out as
+    // diffuse. Without it the specular was added ON TOP of a full-strength
+    // diffuse and the surface emitted more than arrived -- measured at 1.62x
+    // for marble and 1.37x for rock at a grazing angle, which is every wall in
+    // a room seen from anywhere but straight on. That surplus is what read as
+    // "too reflective", and on the rougher materials as "wet" or "metallic":
+    // a strong specular over a full diffuse is exactly how a coated surface
+    // looks.
+    //
+    // Head-on this changes almost nothing -- a dielectric reflects 4% there, so
+    // the diffuse keeps 96% of what it always had.
+    let kd = albedo * (1.0 - fresnel);
     // BAKED: the lightmap's bounce, before any runtime light is added.
-    // Weighted as the return line weights diffuse light.
-    dbg_baked = bounce * albedo * (1.0 - fresnel);
+    // Weighted as the picture weights diffuse light.
+    dbg_baked = bounce * kd;
+    // ONE SUM, NOT TWO. The lamps' diffuse and specular were summed apart and
+    // weighted after the loop, which kept two colours, the albedo, the Fresnel
+    // and the roughness live across every lamp: the loop is the scene readers'
+    // register peak, and those were four registers of it (PIPESTATS,
+    // 2026-10-05). Each lamp is weighted as it is added, which is the same sum.
+    // The specular's luminance -- all `reflected_image` needs of it -- is kept
+    // as one number, the lightmap's own share taken off at the start.
+    //
+    // AND WRITTEN IN `hf` THROUGH THE LOOP (B1, 2026-10-06): the sums, and
+    // the albedo, tightness and strength each lamp is weighted by, are the
+    // colours and factors `hf` is for -- live across every lamp's shadow
+    // lookup, the readers' register peak. The lamp maths that needs `f32` --
+    // positions, the normal, the view, the highlight's `pow` -- stays `f32`.
+    // Every sum is clamped below f16's limit: a reflection of the sun can
+    // carry more, and comes out white either way. `hf` is `f32` as shipped
+    // (`shader_precision::HALF_PRECISION`), and these are the same sums.
+    var colour = hf3(min((p.diffuse + bounce) * kd + specular, vec3<f32>(HF_MAX)));
+    var spec_luma = hf(clamp(dot(specular, vec3<f32>(0.2126, 0.7152, 0.0722)) - p.surface_spec, -HF_MAX, HF_MAX));
+    let kd_h = hf3(kd);
+    let shininess_h = hf(shininess);
+    let spec_strength_h = hf(spec_strength);
+    // For SpaceWarp: everything specular but the lightmap's part is an image
+    // -- counted only as far as it is sharp enough to show something. A rough
+    // surface's reflection is a blur with nothing in it to judder, while its
+    // own texture has plenty: counted whole, the hallway rock's dark crevices
+    // came out as mostly reflection and would have swum with it (the motion
+    // pass's inputs read off the headset, 2026-09-29). Between these two
+    // roughnesses the blur outgrows what a step of the eye moves an image by.
+    let sharp = hf(1.0 - smoothstep(REFLECTION_SHARP_ROUGHNESS, REFLECTION_BLURRED_ROUGHNESS, r));
+    // THE LIT SURFACES' LIGHTS, apart from the lamps (`surface_lights`), and
+    // weighted as each lamp's diffuse is below.
+    if (SURFACE_LIGHTS) {{
+        let surface_lit = hf3(min(surface_lights(world_pos, n), vec3<f32>(HF_MAX))) * kd_h;
+        colour = min(colour + surface_lit, hf3(hf(HF_MAX)));
+        dbg_direct = dbg_direct + vec3<f32>(surface_lit);
+    }}
     // A LAMP THAT CANNOT REACH THIS PIXEL IS SKIPPED BEFORE ANY OF ITS MATHS:
     // past its range, outside its cone, or a stationary lamp its baked mask
     // says is hidden from here -- behind a wall, in another room. Each makes
@@ -4932,9 +6146,8 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
         }}
         let i = countTrailingZeros(todo);
         todo = todo & (todo - 1u);
-        let seen = stationary_visibility_of(lights.lights[i].position.w);
         let l = lights.lights[i];
-        let c = light_contribution_split(l, world_pos, n, view_dir, shininess, spec_strength);
+        let c = light_contribution_split(l, world_pos, n, view_dir, f32(shininess_h), f32(spec_strength_h));
         // NOTHING ARRIVES, SO THERE IS NOTHING TO SHADOW.
         //
         // Outside a spot's cone, past its range, or facing away from it, the
@@ -4950,18 +6163,33 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
         if (max(max(c.diffuse.r + c.specular.r, c.diffuse.g + c.specular.g), c.diffuse.b + c.specular.b) <= 0.0) {{
             continue;
         }}
+        // WEIGHTED BEFORE THE SHADOW, AND AT HALF PRECISION (B1, 2026-10-06).
+        // The lamp's two halves were six numbers held through its shadow
+        // lookup, to be weighted after it -- and the lookups are the readers'
+        // register peak: every cut of a shadow moved it, 22 -> 19 without the
+        // spots' or the sun's (PIPESTATS, `ps96`). Weighted first, they are the
+        // one colour and one luminance the shadow scales, as `hf`: half the
+        // registers where the device has `f16`, and at `f32` the same sum as
+        // before. A lamp's light here is a few thousand at most (intensities
+        // up to 10 over `LAMP_RADIUS` squared), clamped below f16's limit all
+        // the same. `hf` is `f32` as shipped: at `f16` the readers lost
+        // registers and no time (`shader_precision::HALF_PRECISION`).
+        let unshadowed = hf3(min(c.diffuse, vec3<f32>(HF_MAX))) * kd_h + hf3(min(c.specular, vec3<f32>(HF_MAX)));
+        let unshadowed_luma = hf(min(dot(c.specular, vec3<f32>(0.2126, 0.7152, 0.0722)), HF_MAX));
         // ONE shadow factor for both halves: a surface in shadow receives no
         // light at all, and a highlight that survives its own shadow is the
-        // classic tell of a renderer that shadows only the diffuse term.
-        var shadow = seen;
-        if (l.params.z > 1.5) {{
+        // classic tell of a renderer that shadows only the diffuse term. The
+        // baked mask's part read here, past the lamp's own maths, so it is not
+        // carried through them.
+        var shadow = stationary_visibility_of(l.position.w);
+        if (!SKY_SUN_NEVER_REACHES && l.params.z > 1.5) {{
             shadow = sun_visibility(l, world_pos);
         }}
         // Its spot slot, which draws everything; else, for a lamp lighting
         // the player most, its tile of the characters alone
         // (`character_shadow`).
         let layer = i32(l.params.w);
-        if (layer >= 0 && f32(layer) < camera.shadow_params.y) {{
+        if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
             shadow = shadow * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
         }} else if (l.params.z < 1.5) {{
             shadow = shadow * character_shadow(i, world_pos);
@@ -4972,35 +6200,14 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
         // (headset trace, 2026-09-29). The player's shadows from the lamps
         // lighting them most are the characters' tiles above; the capsules
         // keep only what they do once a pixel: contact darkening, reflections.
-        diffuse = diffuse + c.diffuse * shadow;
-        specular = specular + c.specular * shadow;
+        let lit = unshadowed * hf(shadow);
+        colour = min(colour + lit, hf3(hf(HF_MAX)));
+        spec_luma = min(spec_luma + unshadowed_luma * hf(shadow), hf(HF_MAX));
         // DIRECT: runtime lights, after their shadow test.
-        dbg_direct = dbg_direct + (c.diffuse * albedo * (1.0 - fresnel) + c.specular) * shadow;
+        dbg_direct = dbg_direct + vec3<f32>(lit);
     }}
-    // ENERGY CONSERVATION. The albedo lands here, on the diffuse half only.
-    //
-    // `1 - fresnel` is the light that was NOT reflected off the surface, and so
-    // is the only light available to enter it, scatter, and come back out as
-    // diffuse. Without it the specular was added ON TOP of a full-strength
-    // diffuse and the surface emitted more than arrived -- measured at 1.62x
-    // for marble and 1.37x for rock at a grazing angle, which is every wall in
-    // a room seen from anywhere but straight on. That surplus is what read as
-    // "too reflective", and on the rougher materials as "wet" or "metallic":
-    // a strong specular over a full diffuse is exactly how a coated surface
-    // looks.
-    //
-    // Head-on this changes almost nothing -- a dielectric reflects 4% there, so
-    // the diffuse keeps 96% of what it always had.
-    // For SpaceWarp: everything specular but the lightmap's part is an image
-    // -- counted only as far as it is sharp enough to show something. A rough
-    // surface's reflection is a blur with nothing in it to judder, while its
-    // own texture has plenty: counted whole, the hallway rock's dark crevices
-    // came out as mostly reflection and would have swum with it (the motion
-    // pass's inputs read off the headset, 2026-09-29). Between these two
-    // roughnesses the blur outgrows what a step of the eye moves an image by.
-    let sharp = 1.0 - smoothstep(REFLECTION_SHARP_ROUGHNESS, REFLECTION_BLURRED_ROUGHNESS, r);
-    reflected_image = sharp * max(dot(specular, vec3<f32>(0.2126, 0.7152, 0.0722)) - p.surface_spec, 0.0);
-    return diffuse * albedo * (1.0 - fresnel) + specular;
+    reflected_image = f32(sharp * max(spec_luma, hf(0.0)));
+    return vec3<f32>(colour);
 }}
 
 fn shade_material_env(
@@ -5064,34 +6271,40 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
     let view_dir = normalize(cam_pos() - world_pos);
     let flash_idx = u32(camera.shadow_params.z);
     // The characters' contact darkening on the sky's light: see `capsule_ambient`.
-    var lit = sky_irradiance(n) * clamp(sky_vis, 0.0, 1.0) * capsule_ambient(world_pos, n);
+    //
+    // THE SUM AND EACH LAMP'S LIGHT IN `hf` through the shadow lookups, as in
+    // `shade_material_lamps` (B1, 2026-10-06): colours, held live across
+    // every lamp's shadows -- the meshes' register peak. Clamped below f16's
+    // limit; `hf` is `f32` as shipped, and these are the same sums.
+    var lit = hf3(min(sky_irradiance(n) * clamp(sky_vis, 0.0, 1.0) * capsule_ambient(world_pos, n), vec3<f32>(HF_MAX)));
     for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
         let l = lights.lights[i];
-        var c = light_contribution(l, world_pos, n, view_dir);
+        let arriving = light_contribution(l, world_pos, n, view_dir);
         // As in `shade_material_env`: no light arriving, no shadow test.
-        if (max(max(c.r, c.g), c.b) <= 0.0) {{
+        if (max(max(arriving.r, arriving.g), arriving.b) <= 0.0) {{
             continue;
         }}
+        var c = hf3(min(arriving, vec3<f32>(HF_MAX)));
         // Only the sun casts the orthographic map, and only the flashlight the
         // perspective one. Every other light is unshadowed, which is the whole
         // reason a scene may have eight of them.
         if (l.params.z > 1.5) {{
-            c = c * sun_visibility(l, world_pos);
+            c = c * hf(sun_visibility(l, world_pos));
         }}
-        c = c * stationary_visibility(l);
+        c = c * hf(stationary_visibility(l));
         // params.w is this light's own shadow layer, or -1 when it did not get
         // one. Asking the LIGHT beats the old "is this the flashlight index"
         // test, which by construction could only ever be true for one lamp.
         let layer = i32(l.params.w);
-        if (layer >= 0 && f32(layer) < camera.shadow_params.y) {{
-            c = c * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
+        if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
+            c = c * hf(pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]));
         }} else if (l.params.z < 1.5) {{
             // The characters' shadows: see the brushes' loop.
-            c = c * character_shadow(i, world_pos);
+            c = c * hf(character_shadow(i, world_pos));
         }}
-        lit = lit + c;
+        lit = min(lit + c, hf3(hf(HF_MAX)));
     }}
-    return lit;
+    return vec3<f32>(lit);
 }}
 "#
     )
@@ -5195,6 +6408,55 @@ mod shadow_slot_tests {
         let got = spot_shadow_slots(&[(5, 0.4)], &[0, 1, 2, 3], MAX, SHADOW_SLOT_MARGIN);
         assert_eq!(got, vec![5], "a departed incumbent still holds a slot: {got:?}");
     }
+
+    /// A light whose shadow would begin past its range casts none -- a
+    /// flashlight's bounce, a lit patch of wall -- and any other light can.
+    #[test]
+    fn a_light_whose_shadow_begins_past_its_range_casts_none() {
+        let spot = Light {
+            position: Vec3::ZERO,
+            direction: Vec3::NEG_Y,
+            kind: LightKind::Spot,
+            color: crate::renderer::Color3(255, 255, 255, 255),
+            intensity: 1.0,
+            range: 8.0,
+            cone_angle_deg: 180.0,
+            inner_cone_angle_deg: 0.0,
+            mask_channel: None,
+            shadow_near: None,
+            source_radius: 0.0,
+            in_level_bake: true,
+        };
+        assert!(spot.casts_shadow(), "a fixture's");
+        assert!(Light { shadow_near: Some(0.02), ..spot }.casts_shadow(), "a flashlight's, from its glass");
+        assert!(!Light { shadow_near: Some(8.0), ..spot }.casts_shadow());
+        let surface = Light { shadow_near: Some(f32::INFINITY), ..spot };
+        assert!(!surface.casts_shadow());
+        // On the GPU it is marked to make no highlight, and holds no layer.
+        let gpu = pack_lights(&[spot, surface], 2, &[], false, true);
+        assert_eq!(gpu.lights[0].params[3], -1.0);
+        assert_eq!(gpu.lights[1].params[3], SURFACE_LIGHT);
+        assert!(SURFACE_LIGHT < -1.5, "below the shader's test");
+        // Its patch's radius rides below the mark; a lamp with a shadow is a
+        // bulb whatever it says.
+        let wide = pack_lights(
+            &[Light { source_radius: 0.6, ..surface }, Light { source_radius: 0.6, ..spot }],
+            2,
+            &[],
+            false,
+            true,
+        );
+        assert_eq!(wide.lights[0].params[3], SURFACE_LIGHT - 0.6);
+        assert_eq!(wide.lights[1].params[3], -1.0);
+        let src = wgsl_lights_block(0, 1);
+        assert_eq!(SURFACE_LIGHT, -2.0, "the lights block reads the radius back as -2 - params.w");
+        assert_eq!(
+            src.matches("let source = max(-2.0 - l.params.w, 0.0);").count(),
+            2,
+            "both lamp functions read the patch's radius back",
+        );
+        assert!(src.contains("let source = max(-2.0 - lights.lights[i].params.w, 0.0);"), "and the lit surfaces' own loop");
+    }
 }
 
 #[cfg(test)]
@@ -5205,6 +6467,9 @@ mod budget_tests {
     fn light(kind: LightKind, pos: Vec3, intensity: f32) -> Light {
         Light {
             mask_channel: None,
+            shadow_near: None,
+            source_radius: 0.0,
+            in_level_bake: true,
             position: pos,
             direction: Vec3::NEG_Z,
             kind,
@@ -5217,6 +6482,45 @@ mod budget_tests {
     }
     fn point(x: f32, intensity: f32) -> Light {
         light(LightKind::Point, Vec3::new(x, 0.0, 0.0), intensity)
+    }
+
+    /// A LIT SURFACE'S LIGHT -- no shadow, a spot's edge a half space or
+    /// wider -- ranks to the front of the list, each kind keeping its order,
+    /// and the upload counts the run of them there for the scene readers to
+    /// shade apart (`surface_lights`). A lamp, a narrow spot without a
+    /// shadow, one behind a lamp and one in a baked tail are lamps.
+    #[test]
+    fn the_lit_surfaces_lights_lead_the_list_and_are_counted_there() {
+        let lamp = point(1.0, 1.0);
+        let bounce = Light {
+            kind: LightKind::Spot,
+            direction: Vec3::X,
+            range: 6.0,
+            cone_angle_deg: 200.0,
+            inner_cone_angle_deg: 0.0,
+            shadow_near: Some(f32::INFINITY),
+            source_radius: 0.3,
+            in_level_bake: false,
+            ..point(2.0, 1.0)
+        };
+        assert!(bounce.is_surface_light());
+        assert!(Light { kind: LightKind::Point, ..bounce }.is_surface_light());
+        assert!(!lamp.is_surface_light(), "a lamp casts");
+        let narrow = Light { cone_angle_deg: 40.0, inner_cone_angle_deg: 20.0, ..bounce };
+        assert!(!narrow.casts_shadow() && !narrow.is_surface_light(), "a narrow edge keeps the lamp loop's averaging");
+        let ls = [lamp, bounce, Light { intensity: 2.0, ..lamp }, Light { source_radius: 0.5, ..bounce }];
+        assert_eq!(rank_for_budget_indices(&ls, MAX_LIGHTS), vec![1, 3, 0, 2]);
+        // Over budget the ranking chooses first: scores 0.5, 0.2, 1.0, 0.2.
+        assert_eq!(rank_for_budget_indices(&ls, 3), vec![1, 2, 0]);
+        assert_eq!(rank_for_budget_indices(&ls, 2), vec![2, 0]);
+        let ranked = rank_for_budget(&ls, MAX_LIGHTS);
+        assert_eq!(pack_lights(&ranked, 4, &[], false, true).surface_lights[0], 2);
+        assert_eq!(pack_lights(&[lamp, bounce], 2, &[], false, true).surface_lights[0], 0, "only a leading run");
+        assert_eq!(pack_lights(&[bounce, lamp], 0, &[], false, true).surface_lights[0], 0, "never a baked tail");
+        // The spotless twins shade none apart; their frames have none.
+        let src = wgsl_lights_block(0, 1);
+        assert!(src.contains(SURFACE_LIGHTS_ON));
+        assert!(without_spot_shadows(src).contains(SURFACE_LIGHTS_OFF));
     }
 
     #[test]
@@ -5375,8 +6679,17 @@ mod energy_tests {
             code.contains("let f_max = max(1.0 - r, f0);"),
             "the Fresnel is no longer capped by roughness",
         );
+        // Weighted as each lamp is added (one sum, for the registers) -- before
+        // its shadow, at half precision -- and the lightmap's diffuse the same
+        // way.
         assert!(
-            code.contains("return diffuse * albedo * (1.0 - fresnel) + specular;"),
+            code.contains("let kd = albedo * (1.0 - fresnel);")
+                && code.contains("var colour = hf3(min((p.diffuse + bounce) * kd + specular, vec3<f32>(HF_MAX)));")
+                && code.contains("let kd_h = hf3(kd);")
+                && code.contains(
+                    "let unshadowed = hf3(min(c.diffuse, vec3<f32>(HF_MAX))) * kd_h + hf3(min(c.specular, vec3<f32>(HF_MAX)));"
+                )
+                && code.contains("let lit = unshadowed * hf(shadow);"),
             "the diffuse no longer gives up what the specular reflects",
         );
         assert!(
@@ -5884,8 +7197,15 @@ mod probe_blend_tests {
         // Its own parallax, or -- where the trace hit -- the same point seen
         // from its own capture point. Either way, never the near one's.
         assert!(code.contains("let far_dir = probe_parallax_direction(world_pos, d, second);"));
-        assert!(code.contains("h - camera.probe_boxes[s1 * 3].xyz, i32(camera.probe_boxes[s1 * 3].w),"));
-        assert!(code.contains("probe_hit_lod(roughness, t, sqrt(d1))"), "the far photograph's blur is not its own");
+        // The traced hit's second photograph: its own box, its own direction
+        // to the hit, its own blur (`probe_hit_colour` reads both at once).
+        assert!(code.contains("let b1 = camera.probe_boxes[select(s0, s1, has1) * 3];"));
+        assert!(code.contains("let v1 = h - b1.xyz;"));
+        assert!(code.contains("let col1 = textureSampleLevel(probe_cube, probe_samp, v1, i32(b1.w), lod1);"));
+        assert!(
+            code.contains("let lod1 = probe_hit_lod(roughness, t, sqrt(select(d0, d1, has1)));"),
+            "the far photograph's blur is not its own",
+        );
         assert!(
             code.contains("probe_cube, probe_samp, far_dir, i32(camera.probe_boxes[second * 3].w), probe_lod"),
             "the far photograph is read along the near one's direction again",
@@ -5958,7 +7278,7 @@ mod shadow_skip_tests {
 
         let sky = code.find("fn shade_with_sky(").expect("shade_with_sky is gone");
         let guard = code[sky..]
-            .find("if (max(max(c.r, c.g), c.b) <= 0.0) {")
+            .find("if (max(max(arriving.r, arriving.g), arriving.b) <= 0.0) {")
             .expect("the sky path shadow-tests lights that contribute nothing");
         let kernel = code[sky..].find("pcf").expect("the sky path's shadow test is gone");
         assert!(guard < kernel, "the sky path's guard runs after its shadow kernel");
@@ -5995,10 +7315,22 @@ mod probe_normalisation_tests {
             "clamp(ambient_here / max(probe_brightness, 1e-4), PROBE_NORMALISATION_FLOOR, 1.0)"
         ));
         assert!(code.contains("PROBE_NORMALISATION && probe_brightness > 0.0"));
+        // ...and not to a carried glass's glow, which is not the probe's light.
         assert!(
-            code.contains("let sharp = mix(baseline, probe.rgb * spec_occ * probe_scale, clamp(probe.a, 0.0, 1.0));"),
+            code.contains(
+                "let sharp = mix(baseline, probe.rgb * spec_occ * probe_scale + capsule_glow * spec_occ, clamp(probe.a, 0.0, 1.0));"
+            ),
             "the scale is computed but not applied to the probe",
         );
+        // A shader reading the probe pass has the glow in the pass's answer,
+        // normalised already, and its line is as it was.
+        let from_pass = super::wgsl_lights_block_with(
+            0,
+            1,
+            super::LightsBlockOptions { probe_from_pass: true, ..Default::default() },
+        );
+        assert!(from_pass.contains("let sharp = mix(baseline, probe.rgb * spec_occ * probe_scale, clamp(probe.a, 0.0, 1.0));"));
+        assert!(from_pass.contains("probe_pass_compress(probe.rgb * probe_scale + capsule_glow) * a"));
         // The brightness comes from the chosen probe's slot, blended like the
         // photographs, and starts at zero (unknown) on every call.
         assert!(code.contains("probe_brightness = camera.probe_boxes[best * 3 + 1].w;"));
@@ -6448,6 +7780,9 @@ mod baked_light_split_tests {
     fn point(x: f32, i: f32) -> Light {
         Light {
             mask_channel: None,
+            shadow_near: None,
+            source_radius: 0.0,
+            in_level_bake: true,
             position: Vec3::new(x, 1.0, 0.0),
             direction: Vec3::NEG_Y,
             kind: LightKind::Point,
@@ -6462,7 +7797,8 @@ mod baked_light_split_tests {
     #[test]
     fn live_lights_come_first_and_baked_fill_what_is_left() {
         let live = [point(0.0, 1.0), point(1.0, 1.0)];
-        let baked: Vec<Light> = (0..10).map(|i| point(i as f32, 0.5)).collect();
+        // More baked lamps than fit beside the live ones, whatever the budget.
+        let baked: Vec<Light> = (0..MAX_LIGHTS + 2).map(|i| point(i as f32, 0.5)).collect();
         let out = append_baked(&live, &baked, MAX_LIGHTS);
         assert_eq!(out.len(), MAX_LIGHTS);
         assert_eq!(out[0].position, live[0].position);
@@ -6490,10 +7826,14 @@ mod baked_light_split_tests {
     fn lightmapped_surfaces_skip_the_baked_tail_and_nothing_else_does() {
         let code = wgsl_lights_block(0, 1);
         assert!(!code.contains("i < lights.count.x;"), "a light loop walks the baked tail");
-        // Three walks bounded by the live count. The fourth, the lighting in
-        // `shade_material_env`, walks the `reaching` bits that its nearest-lamp
-        // pass -- one of the three -- set, so it honours the split too.
-        assert_eq!(code.matches("i < live_light_count();").count(), 3);
+        // Seven walks bounded by the live count: two of them the lamps the
+        // bake never saw lighting a model's cards (`probe_card_relit`), one
+        // those lamps on a surface their beams light (`probe_surface_relit`),
+        // one the beam of a glass a reflection shows (`capsule_glass_beam`).
+        // The eighth, the lighting in `shade_material_env`, walks the
+        // `reaching` bits that its nearest-lamp pass -- one of the seven --
+        // set, so it honours the split too.
+        assert_eq!(code.matches("i < live_light_count();").count(), 7);
         assert!(code.contains("reaching = reaching | (1u << i);") && code.contains("var todo = reaching;"));
         let brush = crate::renderer::brush_pipeline::brush_shader_src();
         assert!(brush.contains("receiver_skips_baked = true;"), "brushes carry baked lamps in their atlas");
@@ -7318,6 +8658,10 @@ mod proxy_card_gpu_tests {
         /// `probe_fixup` does -- the default, since every texel meeting a
         /// model on cards is finished there. See `PROBE_CARD_TESTS_FILTERED`.
         static FILTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        /// The lamps the next `colours_of` lights the cards with, as
+        /// `probe_fixup` does (`PROBE_CARD_RELIT`); `None` reads them unlit,
+        /// as every other shader does.
+        static RELIT: std::cell::RefCell<Option<Vec<Light>>> = const { std::cell::RefCell::new(None) };
     }
     const RADIUS: f32 = 0.2;
     const SAMPLES: u32 = 24;
@@ -7367,7 +8711,7 @@ mod proxy_card_gpu_tests {
         for (i, t) in texels.iter_mut().enumerate() {
             t[0] = (i as u32 / (RES * RES) + 1) as f32;
         }
-        ProxyCards { resolution: RES, texels, normals }
+        ProxyCards { resolution: RES, texels, normals, albedo: Vec::new() }
     }
 
     /// `probe_card_colour` for each world `(hit, direction)` against the sphere
@@ -7390,7 +8734,15 @@ mod proxy_card_gpu_tests {
         u.probe_proxies = probes.proxies;
         u.proxy_cards = probes.proxy_cards;
         u.proxy_fields[0] = slots[0];
-        let options = LightsBlockOptions { card_tests_filtered: FILTERED.with(|f| f.get()), ..Default::default() };
+        let relit = RELIT.with(|r| r.borrow().clone());
+        let options =
+            LightsBlockOptions { card_tests_filtered: FILTERED.with(|f| f.get()), card_relit: relit.is_some(), ..Default::default() };
+        // The lamps, and a spot atlas no lamp holds a layer of.
+        let lights_uniform = LightsUniform::new(&device);
+        let shadow_map = crate::renderer::shadow::ShadowMap::with_dimension(&device, 8);
+        if let Some(lamps) = &relit {
+            lights_uniform.upload_frame(&queue, lamps, &[], false);
+        }
         let code = format!(
             "{}\n{}",
             wgsl_lights_block_with(0, 1, options),
@@ -7440,16 +8792,22 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // No field texture: the cards alone colour a hit (the field's slot, in
+        // the uniform, gives only its stop distance).
+        let mut entries = vec![
+            wgpu::BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&samp) },
+            wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&card_atlas) },
+        ];
+        if relit.is_some() {
+            entries.push(wgpu::BindGroupEntry { binding: 1, resource: lights_uniform.buffer().as_entire_binding() });
+            entries.push(wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(shadow_map.sampler()) });
+            entries.push(wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(shadow_map.spot_depth_view()) });
+        }
         let g0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                // No field texture: the cards alone colour a hit (the field's
-                // slot, in the uniform, gives only its stop distance).
-                wgpu::BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&samp) },
-                wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&card_atlas) },
-            ],
+            entries: &entries,
         });
         let g1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -7509,7 +8867,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
         }
-        ProxyCards { resolution: RES, texels, normals }
+        ProxyCards { resolution: RES, texels, normals, albedo: Vec::new() }
     }
 
     /// THE TRUST FILTERED, AS THE FIX-UP READS IT: a hit on the deeper side
@@ -7634,7 +8992,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
         }
-        ProxyCards { resolution: RES, texels, normals }
+        ProxyCards { resolution: RES, texels, normals, albedo: Vec::new() }
     }
 
     /// A RAY GRAZING A SHELL takes the face it passes, not the one behind it,
@@ -7700,7 +9058,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
         }
-        let cards = ProxyCards { resolution: RES, texels, normals };
+        let cards = ProxyCards { resolution: RES, texels, normals, albedo: Vec::new() };
         let hit = CENTRE + Vec3::new(0.0, y0 - 0.003, 0.0);
         let Some(c) = colours_of(collar, cards, Quat::IDENTITY, true, &[(hit, d)]) else {
             eprintln!("no GPU adapter; skipping");
@@ -7738,7 +9096,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
         }
-        let cards = ProxyCards { resolution: RES, texels, normals };
+        let cards = ProxyCards { resolution: RES, texels, normals, albedo: Vec::new() };
         // The field stops short of the surface on the ray's side: below it.
         let hit = CENTRE + Vec3::new(0.0, -0.003, 0.0);
         let Some(c) = colours_of(field(), cards, Quat::IDENTITY, true, &[(hit, d)]) else {
@@ -7778,7 +9136,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
         }
-        let cards = ProxyCards { resolution: RES, texels, normals };
+        let cards = ProxyCards { resolution: RES, texels, normals, albedo: Vec::new() };
         // At the centre of column 7 of the card looking up (u runs along z),
         // just below the surface.
         let z = ((7.5 / RES as f32) - 0.5) * 2.0 * HALF;
@@ -7821,7 +9179,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
         }
-        let cards = ProxyCards { resolution: RES, texels, normals };
+        let cards = ProxyCards { resolution: RES, texels, normals, albedo: Vec::new() };
         let Some(c) = colours_of(field(), cards, Quat::IDENTITY, true, &[(CENTRE, d)]) else {
             eprintln!("no GPU adapter; skipping");
             return;
@@ -7863,7 +9221,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
         }
-        let cards = ProxyCards { resolution: RES, texels, normals };
+        let cards = ProxyCards { resolution: RES, texels, normals, albedo: Vec::new() };
         let hit = CENTRE + Vec3::new(wall + 0.003, 0.0, 0.0);
         // A footprint of 0.2 m at the hit: about ten card texels, level 3.
         FOOTPRINT.with(|f| f.set(0.1));
@@ -7928,6 +9286,415 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
         };
         assert_eq!(c[0][3], 0.0, "{:?}", c[0]);
     }
+
+    /// The sphere's cards with an albedo: `a` grey wherever a card saw it.
+    fn albedo_cards(a: f32) -> ProxyCards {
+        let mut c = cards();
+        c.albedo = c.normals.iter().map(|n| if *n == [0.0; 3] { [0.0; 3] } else { [a; 3] }).collect();
+        c
+    }
+
+    /// A point lamp at `at` the level's bake never saw -- a flashlight's kind.
+    fn runtime_lamp(at: Vec3, intensity: f32) -> Light {
+        Light {
+            position: at,
+            direction: Vec3::NEG_Y,
+            kind: LightKind::Point,
+            color: crate::renderer::Color3(255, 255, 255, 255),
+            intensity,
+            range: 20.0,
+            cone_angle_deg: 180.0,
+            inner_cone_angle_deg: 0.0,
+            mask_channel: None,
+            shadow_near: None,
+            source_radius: 0.0,
+            in_level_bake: false,
+        }
+    }
+
+    /// `colours_of` the sphere's `cards`, lit by `lamps` as `probe_fixup` lights
+    /// them, or read as every other shader reads them for `None`.
+    fn relit(lamps: Option<Vec<Light>>, cards: ProxyCards, rays: &[(Vec3, Vec3)]) -> Option<Vec<[f32; 4]>> {
+        RELIT.with(|r| *r.borrow_mut() = lamps);
+        let out = colours_of(field(), cards, Quat::IDENTITY, true, rays);
+        RELIT.with(|r| *r.borrow_mut() = None);
+        out
+    }
+
+    /// A FLASHLIGHT ON A LAMP LIGHTS ITS REFLECTION (`PROBE_CARD_RELIT`): a
+    /// lamp the bake never saw, out along the +x side's normal, adds that
+    /// side's albedo times the light arriving -- `a I / d^2` head on -- to its
+    /// reflection, and nothing to the far side's, which faces away. The same
+    /// lamp as one the bake saw adds nothing: its light is in the cards
+    /// already. Nor does any lamp to cards baked without albedo.
+    #[test]
+    fn a_lamp_the_bake_never_saw_lights_a_models_reflection() {
+        let rays = [(on_sphere(Vec3::X), -Vec3::X), (on_sphere(-Vec3::X), Vec3::X)];
+        let Some(unlit) = relit(None, albedo_cards(0.5), &rays) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let lamp = runtime_lamp(CENTRE + Vec3::X, 2.0);
+        let lit = relit(Some(vec![lamp]), albedo_cards(0.5), &rays).unwrap();
+        let seen = relit(Some(vec![Light { in_level_bake: true, ..lamp }]), albedo_cards(0.5), &rays).unwrap();
+        let bare = relit(Some(vec![lamp]), cards(), &rays).unwrap();
+        let d = 1.0 - (RADIUS + 0.003);
+        let want = 0.5 * 2.0 / (d * d);
+        eprintln!("CARD RELIT: unlit {unlit:?}\n  lit {lit:?}\n  seen by the bake {seen:?}\n  no albedo {bare:?}\n  want +{want} green on +x");
+        assert!(unlit[0][3] > 0.5, "the cards do not vouch for the +x hit: {:?}", unlit[0]);
+        assert!(
+            (lit[0][1] - unlit[0][1] - want).abs() < 0.03 * want,
+            "the +x side's reflection took {} of light, not {want}",
+            lit[0][1] - unlit[0][1],
+        );
+        assert!((lit[1][1] - unlit[1][1]).abs() < 1e-4, "the far side, facing away, was lit: {:?} vs {:?}", lit[1], unlit[1]);
+        assert!((seen[0][1] - unlit[0][1]).abs() < 1e-4, "a lamp the bake saw lit the cards twice: {:?}", seen[0]);
+        assert!((bare[0][1] - unlit[0][1]).abs() < 1e-4, "cards without albedo were lit: {:?}", bare[0]);
+    }
+}
+
+/// A SPOT'S POOL SEEN EDGE-ON, as `spot_cone` draws it: test_room's corner
+/// spot (34 degrees, a 16-degree core) 0.85 m from the wall it lights, the
+/// wall seen from 15 m down the hall at about 5 degrees, where a pixel spans
+/// 1.9 cm up the wall and 20 cm along it (2026-10-05).
+#[cfg(test)]
+mod spot_edge_gpu_tests {
+    use glam::Vec3;
+    use wgpu::util::DeviceExt;
+    use wgpu::{BindGroupDescriptor, BindGroupEntry, BufferDescriptor, BufferUsages, ShaderModuleDescriptor, ShaderSource};
+
+    const WALL: f32 = 0.85;
+    const OUTER_DEG: f32 = 17.0;
+    const INNER_DEG: f32 = 8.0;
+    const ALONG: f32 = 0.2;
+    const UP: f32 = 0.019;
+
+    /// The cone at each `(point, toward the eye, the wall's normal, footprint)`:
+    /// the lamp at the origin aimed along +x, run on the GPU through the
+    /// shipped functions -- with the pixel's mean along its long step
+    /// (`SPOT_EDGE_AVERAGE`), or without it, the cone as it was before.
+    fn cone(at: &[(Vec3, Vec3, Vec3, f32)], average: bool) -> Option<Vec<f32>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let code = format!(
+            "{}\n
+@group(1) @binding(0) var<storage, read> q: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> out: array<f32>;
+@compute @workgroup_size(1)
+fn edge_main(@builtin(global_invocation_id) id: vec3<u32>) {{
+    let p = q[id.x * 3u].xyz;
+    let view = q[id.x * 3u + 1u].xyz;
+    let n = q[id.x * 3u + 2u].xyz;
+    pixel_footprint = q[id.x * 3u].w;
+    let dist = length(p);
+    let l_dir = -p / dist;
+    let d = vec3<f32>(1.0, 0.0, 0.0);
+    let cos_angle = dot(-l_dir, d);
+    out[id.x] = spot_cone(cos_angle, {:?}, {:?}, dist, spot_cone_across(d, l_dir, cos_angle, dist, n, view));
+}}
+",
+            if average {
+                super::wgsl_lights_block(0, 1)
+            } else {
+                super::wgsl_lights_block(0, 1).replacen("const SPOT_EDGE_AVERAGE: bool = true;", "const SPOT_EDGE_AVERAGE: bool = false;", 1)
+            },
+            OUTER_DEG.to_radians().cos(),
+            INNER_DEG.to_radians().cos(),
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("edge_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let packed: Vec<[f32; 4]> = at
+            .iter()
+            .flat_map(|(p, v, n, f)| [[p.x, p.y, p.z, *f], [v.x, v.y, v.z, 0.0], [n.x, n.y, n.z, 0.0]])
+            .collect();
+        let q = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&packed),
+            usage: BufferUsages::STORAGE,
+        });
+        let size = (at.len() * 4) as u64;
+        let out = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST, mapped_at_creation: false });
+        let g0 = device.create_bind_group(&BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[] });
+        let g1 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups(at.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let got: Vec<f32> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+        Some(got)
+    }
+
+    /// What a row of pixels `step` apart sees of `profile` (sampled every
+    /// millimetre) as the head moves and the row slides `slide` at a time: per
+    /// pixel, the RMS of the second difference of its value along the slide --
+    /// `offline_frame`'s `measure_the_move_shimmer` in one dimension. A
+    /// picture that moves smoothly scores nothing; what jumps scores.
+    fn shimmer(profile: &[f32], step: f32, slide: f32) -> f32 {
+        let (every, by) = ((step * 1000.0).round() as usize, (slide * 1000.0).round() as usize);
+        let (mut sum, mut n) = (0.0f32, 0usize);
+        for start in (0..profile.len()).step_by(every) {
+            let v: Vec<f32> = (0..=every / by + 1).filter_map(|j| profile.get(start + j * by).copied()).collect();
+            for w in v.windows(3) {
+                sum += (w[2] - 2.0 * w[1] + w[0]).powi(2);
+                n += 1;
+            }
+        }
+        (sum / n.max(1) as f32).sqrt()
+    }
+
+    /// FAR, EDGE-ON, ALONG THE WALL the pool's edge was inside one pixel: a
+    /// head moving 3 mm at a time (the wall 16 m off moves 0.16 of a pixel)
+    /// saw pixels jump along the pool's edge, the far corner spot shimmering
+    /// from the hall's front doorways. Averaged over what the pixel spans
+    /// along the wall, the jumps go and the pool keeps its light. UP the wall,
+    /// where the same pixel is short, and for a pixel seen head-on, the cone is
+    /// exactly what it was.
+    #[test]
+    fn an_edge_on_pool_is_averaged_along_the_long_step_alone() {
+        let footprint = (ALONG * UP).sqrt();
+        // The wall faces the lamp (-x); the eye is 15.8 m down it along +z
+        // and 1.5 m in from it, about 5 degrees off the wall's plane -- where
+        // the footprint over the root of that cosine is the 20 cm a pixel
+        // spans along the wall (`spot_long_step`).
+        let wall_n = Vec3::NEG_X;
+        let grazing = Vec3::new(-1.5, 0.0, 15.8).normalize();
+        assert!((footprint / grazing.dot(wall_n).abs().sqrt() - ALONG).abs() < 0.002, "the pixel's long step here");
+        let n = 1201;
+        let along: Vec<Vec3> = (0..n).map(|i| Vec3::new(WALL, 0.0, -0.6 + i as f32 * 0.001)).collect();
+        let up: Vec<Vec3> = (0..n).map(|i| Vec3::new(WALL, -0.6 + i as f32 * 0.001, 0.0)).collect();
+        let mut q = Vec::new();
+        for p in along.iter().chain(&up) {
+            q.push((*p, grazing, wall_n, footprint));
+        }
+        for p in &along {
+            q.push((*p, -wall_n, wall_n, UP)); // head-on
+        }
+        let (Some(now_all), Some(was_all)) = (cone(&q, true), cone(&q, false)) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let pick = |c: &[f32], from: usize| -> Vec<f32> { c[from..from + n].to_vec() };
+        let (along_now, along_was) = (pick(&now_all, 0), pick(&was_all, 0));
+        let (up_now, up_was) = (pick(&now_all, n), pick(&was_all, n));
+        let (head_now, head_was) = (pick(&now_all, 2 * n), pick(&was_all, 2 * n));
+        let slide = 0.16 * ALONG;
+        let (now, was) = (shimmer(&along_now, ALONG, slide), shimmer(&along_was, ALONG, slide));
+        // The least any filter can do: each pixel the exact mean of the pool
+        // as it was over the 20 cm it spans along the wall, a sensor's pixel.
+        let w = (ALONG * 1000.0) as usize;
+        let sensor: Vec<f32> = (0..n)
+            .map(|i| (i.saturating_sub(w / 2)..(i + w / 2).min(n)).map(|k| along_was[k]).sum::<f32>() / w as f32)
+            .collect();
+        let floor = shimmer(&sensor, ALONG, slide);
+        let total = |v: &[f32]| v.iter().sum::<f32>() * 0.001;
+        let largest = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        eprintln!(
+            "SPOT EDGE ON: along the wall shimmer {was:.4} -> {now:.4} (a sensor's pixels {floor:.4}); light along it {:.4} -> {:.4} m; up it largest change {:.2e}; head-on {:.2e}",
+            total(&along_was),
+            total(&along_now),
+            largest(&up_now, &up_was),
+            largest(&head_now, &head_was),
+        );
+        assert!(was > 0.02, "the test no longer reproduces the shimmer: {was}");
+        assert!(
+            now < was / 2.0 && now < 1.5 * floor,
+            "the far pool still shimmers along the wall: {was} -> {now}, where a sensor's pixels give {floor}",
+        );
+        // A mean moves no light, to first order: the cosine's span is taken
+        // as straight across the pixel, and over 20 cm a lamp 0.85 m off it
+        // bends, which overstates the pool's light here by about 3%.
+        assert!(
+            (total(&along_now) / total(&along_was) - 1.0).abs() < 0.05,
+            "averaging moved the pool's light along the wall: {} -> {}",
+            total(&along_was),
+            total(&along_now),
+        );
+        assert!(largest(&up_now, &up_was) < 1e-5, "the pool changed up the wall, where the pixel is short");
+        assert!(largest(&head_now, &head_was) < 1e-5, "a pool seen head-on changed");
+    }
+}
+
+/// THE LIT SURFACES' OWN LOOP (`surface_lights`) against the lamp loop's
+/// maths for the same lights (`light_contribution_split`), on the GPU through
+/// the shipped functions and one uploaded list: a flashlight's bounce off a
+/// wall, a second as a point, and a lamp behind them that is not one.
+#[cfg(test)]
+mod surface_light_gpu_tests {
+    use super::{Light, LightKind, LightsUniform};
+    use glam::Vec3;
+    use wgpu::util::DeviceExt;
+    use wgpu::{BindGroupDescriptor, BindGroupEntry, BufferDescriptor, BufferUsages, ShaderModuleDescriptor, ShaderSource};
+
+    /// Per `(point, normal)`: the surface loop's light, and the lamp maths'
+    /// diffuse summed over the lights the upload counted as surfaces' -- with
+    /// `spot_cone`'s average along the pixel's long step, or without it.
+    fn both(lights: &[Light], at: &[(Vec3, Vec3)], average: bool) -> Option<Vec<(Vec3, Vec3)>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let uniform = LightsUniform::new(&device);
+        uniform.upload_frame(&queue, lights, &[], false);
+        let code = format!(
+            "{}\n
+@group(1) @binding(0) var<storage, read> q: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+@compute @workgroup_size(1)
+fn surface_main(@builtin(global_invocation_id) id: vec3<u32>) {{
+    let p = q[id.x * 2u].xyz;
+    let n = q[id.x * 2u + 1u].xyz;
+    // A pixel 5 mm across, and normal-mapped stone's terminator width.
+    pixel_footprint = 0.005;
+    terminator_width = 0.1;
+    let view = normalize(vec3<f32>(0.0, 1.6, 0.0) - p);
+    var lamps = vec3<f32>(0.0);
+    for (var i: u32 = 0u; i < lights.surface_lights.x; i = i + 1u) {{
+        lamps = lamps + light_contribution_split(lights.lights[i], p, n, view, 1.0, 0.0).diffuse;
+    }}
+    out[id.x * 2u] = vec4<f32>(surface_lights(p, n), f32(lights.surface_lights.x));
+    out[id.x * 2u + 1u] = vec4<f32>(lamps, 0.0);
+}}
+",
+            if average {
+                super::wgsl_lights_block(0, 1)
+            } else {
+                super::wgsl_lights_block(0, 1).replacen("const SPOT_EDGE_AVERAGE: bool = true;", "const SPOT_EDGE_AVERAGE: bool = false;", 1)
+            },
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("surface_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let packed: Vec<[f32; 4]> = at.iter().flat_map(|(p, n)| [[p.x, p.y, p.z, 0.0], [n.x, n.y, n.z, 0.0]]).collect();
+        let q = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&packed),
+            usage: BufferUsages::STORAGE,
+        });
+        let size = (at.len() * 32) as u64;
+        let out = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST, mapped_at_creation: false });
+        let g0 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[BindGroupEntry { binding: 1, resource: uniform.buffer().as_entire_binding() }],
+        });
+        let g1 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups(at.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let got: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+        assert!(got.iter().step_by(2).all(|v| v[3] == 2.0), "the upload counted the two leading surfaces' lights");
+        Some(got.chunks(2).map(|c| (Vec3::new(c[0][0], c[0][1], c[0][2]), Vec3::new(c[1][0], c[1][1], c[1][2]))).collect())
+    }
+
+    /// THE SAME LIGHT AS THE LAMP MATHS GIVE with no average along the
+    /// pixel's long step -- the falloff, the patch's radius, the window, the
+    /// cone's ramp, the terminator and the colour, to rounding -- and exactly
+    /// none past the lights' range. With that average, the lamp maths
+    /// stretch the ramp about its middle, a box filter's width for an edge a
+    /// pixel wide (`spot_cone`); across an edge this wide a pixel's true
+    /// mean is the plain ramp to second order, so the stretch is what moves:
+    /// printed, by distance from the bounce's light.
+    #[test]
+    fn the_surface_loop_lights_as_the_lamp_loop_did() {
+        let bounce = Light {
+            position: Vec3::new(0.0, 1.0, -2.0),
+            direction: Vec3::Z,
+            kind: LightKind::Spot,
+            color: crate::renderer::Color3(230, 200, 170, 255),
+            intensity: 3.0,
+            range: 6.0,
+            cone_angle_deg: 2.0 * 105.0,
+            inner_cone_angle_deg: 0.0,
+            mask_channel: None,
+            shadow_near: Some(f32::INFINITY),
+            source_radius: 0.4,
+            in_level_bake: false,
+        };
+        let corner = Light { position: Vec3::new(1.5, 0.5, -1.0), kind: LightKind::Point, source_radius: 0.7, intensity: 1.0, ..bounce };
+        let lamp = Light { position: Vec3::new(0.0, 2.5, 0.0), shadow_near: None, source_radius: 0.0, in_level_bake: true, ..corner };
+        assert!(bounce.is_surface_light() && corner.is_surface_light() && !lamp.is_surface_light());
+        let normals = [Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z, Vec3::X, Vec3::new(0.3, 0.8, -0.5).normalize()];
+        let mut at = Vec::new();
+        for k in 0..400 {
+            let t = k as f32 / 400.0;
+            // A spiral out of the patch to past the bounce's range, every way.
+            let r = 0.05 + 7.0 * t;
+            let a = 37.0 * t;
+            let p = bounce.position + Vec3::new(r * a.cos() * (0.3 + t), r * (2.0 * t - 1.0), r * a.sin());
+            at.push((p, normals[k % normals.len()]));
+        }
+        let lights = [bounce, corner, lamp];
+        let (Some(plain), Some(averaged)) = (both(&lights, &at, false), both(&lights, &at, true)) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let off = |a: Vec3, b: Vec3| (a.max_element() - b.max_element()).abs() / b.max_element().max(1e-3);
+        let mut lit = 0;
+        for ((p, n), (apart, lamps)) in at.iter().zip(&plain) {
+            lit += usize::from(lamps.max_element() > 0.0);
+            assert!(off(*apart, *lamps) < 1e-4, "at {p:?} facing {n:?}: apart {apart:?}, as lamps {lamps:?}");
+        }
+        assert!(lit > at.len() / 3, "the test lit too little to say anything: {lit}");
+        // Past the range of both: nothing, from either.
+        let far = at.iter().position(|(p, _)| (*p - bounce.position).length() > 6.5 && (*p - corner.position).length() > 6.5).unwrap();
+        assert_eq!(plain[far].0, Vec3::ZERO);
+        let worst = |near: f32, far: f32| {
+            at.iter()
+                .zip(&averaged)
+                .filter(|((p, _), _)| (near..far).contains(&(*p - bounce.position).length()))
+                .map(|(_, (apart, lamps))| off(*apart, *lamps))
+                .fold(0.0f32, f32::max)
+        };
+        eprintln!(
+            "SURFACE LIGHTS: {lit} of {} points lit; the lamp maths' average moved them by at most {:.1}% within 0.3 m of the bounce's light, {:.2}% from 0.3 to 1 m, {:.3}% past 1 m",
+            at.len(),
+            100.0 * worst(0.0, 0.3),
+            100.0 * worst(0.3, 1.0),
+            100.0 * worst(1.0, 100.0),
+        );
+    }
 }
 
 /// THE CHARACTERS' CONTACT DARKENING, as the shader computes it.
@@ -7962,6 +9729,7 @@ mod capsule_ambient_tests {
                 (v(0.1, 0.92, 0.0), v(0.1, 0.08, 0.0), 0.06),
             ],
             colour: [0.5; 3],
+            surfaces: Vec::new(),
         }]);
         (caps, arm)
     }
@@ -8126,5 +9894,925 @@ fn ambient_main(@builtin(global_invocation_id) id: vec3<u32>) {
         };
         assert!(vis[0] < 0.75, "the wall under the hand: {}", vis[0]);
         assert!(vis[1] < 0.8, "the floor under a foot: {}", vis[1]);
+    }
+}
+
+/// A CARRIED TORCH IN A REFLECTION, as the shader shows it: its body dark and
+/// its own shape, its glass glowing toward what is in front of it, in front
+/// of or behind the characters round it as it stands. See `capsule_reflection`
+/// and `CapsuleGroup::surfaces`.
+#[cfg(test)]
+mod capsule_reflection_tests {
+    use glam::Vec3;
+    use wgpu::util::DeviceExt;
+    use wgpu::{
+        BindGroupDescriptor, BindGroupEntry, BindingResource, BufferDescriptor, BufferUsages, ShaderModuleDescriptor,
+        ShaderSource,
+    };
+
+    use crate::renderer::uniforms::{CapsuleGroup, CapsuleUpload, Uniforms};
+
+    const GLASS: [f32; 3] = [1.0, 0.945, 0.894];
+    const DRIVE: f32 = 6400.0;
+    const ALBEDO: f32 = 0.037;
+    const GLASS_RADIUS: f32 = 0.0168;
+    const BODY_RADIUS: f32 = 0.0165;
+
+    /// A torch 15 cm long, its glass at `at` facing `forward`.
+    fn torch(at: Vec3, forward: Vec3) -> CapsuleGroup {
+        let back = -forward.normalize();
+        CapsuleGroup {
+            capsules: vec![
+                (at + back * (0.15 - BODY_RADIUS), at + back * BODY_RADIUS, BODY_RADIUS),
+                (at + back * 0.01, at, GLASS_RADIUS),
+            ],
+            colour: GLASS,
+            surfaces: vec![-ALBEDO, DRIVE],
+        }
+    }
+
+    /// A character's trunk standing at `at`, wide enough that its middle
+    /// covers a ray wholly through the shape blur.
+    fn trunk(at: Vec3) -> CapsuleGroup {
+        CapsuleGroup {
+            capsules: vec![(at + Vec3::Y * 0.3, at - Vec3::Y * 0.3, 0.3)],
+            colour: [0.5, 0.25, 0.1],
+            surfaces: Vec::new(),
+        }
+    }
+
+    /// What a ray's reflection shows: `capsule_reflection`'s answer over
+    /// nothing, lit by pi so a body shows its albedo, and the glow it hands
+    /// the caller, as it reaches the picture (times the answer's alpha).
+    struct Seen {
+        reflection: [f32; 4],
+        glow: [f32; 3],
+    }
+
+    /// Each `(from, direction, pixel footprint)` ray, run on the GPU.
+    fn reflect(groups: &[CapsuleGroup], rays: &[(Vec3, Vec3, f32)]) -> Option<Vec<Seen>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let caps = CapsuleUpload::from_groups(groups);
+        let mut u: Uniforms = bytemuck::Zeroable::zeroed();
+        u.capsules = caps.capsules;
+        u.capsule_groups = caps.groups;
+        u.capsule_params = [caps.group_count as f32, -1.0, -1.0, 0.0];
+        // The eye far off: a mirror's footprint is then the pixel's alone.
+        u.camera_pos = [[0.0, 0.0, -1.0e4, 0.0]; 2];
+        let code = format!(
+            "{}\n{}",
+            super::wgsl_lights_block(0, 1),
+            r#"
+@group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+@compute @workgroup_size(1)
+fn reflect_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    pixel_footprint = rays[id.x * 2u].w;
+    let r = capsule_reflection(rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz), 0.0, vec3<f32>(3.14159265), vec4<f32>(0.0));
+    out[id.x * 2u] = r;
+    out[id.x * 2u + 1u] = vec4<f32>(capsule_glow * r.a, 0.0);
+}
+"#
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("reflect_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let packed: Vec<[f32; 4]> =
+            rays.iter().flat_map(|(p, d, f)| [[p.x, p.y, p.z, *f], [d.x, d.y, d.z, 0.0]]).collect();
+        let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&u),
+            usage: BufferUsages::UNIFORM,
+        });
+        let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&packed),
+            usage: BufferUsages::STORAGE,
+        });
+        let size = (rays.len() * 32) as u64;
+        let out = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
+        let cards = crate::renderer::proxy_cards::none(&device);
+        // No lamps, so no glass's beam to look past (`capsule_glass_beam`).
+        let lights_uniform = super::LightsUniform::new(&device);
+        let shadow_map = crate::renderer::shadow::ShadowMap::with_dimension(&device, 64);
+        let g0 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: lights_uniform.buffer().as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: BindingResource::Sampler(shadow_map.sampler()) },
+                BindGroupEntry { binding: 4, resource: BindingResource::TextureView(shadow_map.spot_depth_view()) },
+                BindGroupEntry { binding: 6, resource: BindingResource::Sampler(&samp) },
+                BindGroupEntry { binding: 12, resource: BindingResource::TextureView(&cards) },
+            ],
+        });
+        let g1 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            assert!(rays.len() <= 65535, "one workgroup a ray, along x");
+            pass.dispatch_workgroups(rays.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let got: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+        Some(got.chunks(2).map(|c| Seen { reflection: c[0], glow: [c[1][0], c[1][1], c[1][2]] }).collect())
+    }
+
+    fn near(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol
+    }
+
+    /// THE GLASS GLOWS TOWARD WHAT IS IN FRONT OF IT: a mirror in front of a
+    /// torch shows its glass as bright as the glass is drawn, across the
+    /// glass and not beside it; from behind or beside the torch the glass is
+    /// out of sight and the body shows, dark.
+    #[test]
+    fn a_torchs_glass_glows_in_front_of_it_and_its_body_hides_it_from_behind() {
+        let groups = [torch(Vec3::new(0.0, 1.0, 0.0), Vec3::NEG_Z)];
+        let f = 0.002;
+        let rays = [
+            (Vec3::new(0.0, 1.0, -2.0), Vec3::Z, f),
+            (Vec3::new(0.008, 1.005, -2.0), Vec3::Z, f),
+            (Vec3::new(0.05, 1.0, -2.0), Vec3::Z, f),
+            (Vec3::new(0.0, 1.0, 2.0), Vec3::NEG_Z, f),
+            (Vec3::new(2.0, 1.0, 0.07), Vec3::NEG_X, f),
+        ];
+        let Some(got) = reflect(&groups, &rays) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        for (i, s) in got.iter().enumerate() {
+            eprintln!("ray {i}: reflection {:?} glow {:?}", s.reflection, s.glow);
+        }
+        for (i, what) in [(0, "the glass's middle"), (1, "across the glass")] {
+            for c in 0..3 {
+                assert!(near(got[i].glow[c], GLASS[c] * DRIVE, 0.01 * DRIVE), "{what}: {:?}", got[i].glow);
+            }
+            assert!(got[i].reflection[3] > 0.99, "{what} covers the ray: {:?}", got[i].reflection);
+        }
+        assert!(got[2].glow[0] < 1e-3 && got[2].reflection[3] < 1e-3, "beside it: {:?}", got[2].reflection);
+        for (i, what) in [(3, "behind it"), (4, "beside the body")] {
+            assert_eq!(got[i].glow, [0.0; 3], "{what}: no glass in sight");
+            assert!(got[i].reflection[3] > 0.99, "{what}: the body covers the ray");
+            for c in 0..3 {
+                assert!(near(got[i].reflection[c], GLASS[c] * ALBEDO, 1e-3), "{what}: {:?}", got[i].reflection);
+            }
+        }
+        // The glass alone shows nothing from behind: it faces one way, and
+        // a body is not what hides it.
+        let mut glass = torch(Vec3::new(0.0, 1.0, 0.0), Vec3::NEG_Z);
+        glass.capsules.remove(0);
+        glass.surfaces.remove(0);
+        let Some(back) = reflect(&[glass], &rays[3..4]) else { return };
+        assert_eq!(back[0].glow, [0.0; 3], "the glass's back");
+    }
+
+    /// A BLURRED GLASS KEEPS ITS LIGHT. However wide the footprint a rough
+    /// surface or a far reflection spreads it over, the glow summed across
+    /// the plane is the glass's own: its radiance times its area.
+    #[test]
+    fn a_blurred_glass_keeps_the_light_it_gives_off() {
+        let at = Vec3::new(0.0, 1.0, 0.0);
+        let glass_only = CapsuleGroup {
+            capsules: vec![(at + Vec3::Z * 0.01, at, GLASS_RADIUS)],
+            colour: [1.0; 3],
+            surfaces: vec![DRIVE],
+        };
+        for f in [0.002, 0.01, 0.03, 0.1] {
+            // Past the softened edge of the widest the glass spreads to.
+            let reach = GLASS_RADIUS.max(f) + 1.5 * f;
+            let step = GLASS_RADIUS.min(f) / 4.0;
+            let n = (reach / step).ceil() as i32;
+            let rays: Vec<(Vec3, Vec3, f32)> = (-n..=n)
+                .flat_map(|i| (-n..=n).map(move |j| (Vec3::new(i as f32 * step, 1.0 + j as f32 * step, -2.0), Vec3::Z, f)))
+                .collect();
+            let Some(got) = reflect(&[glass_only.clone()], &rays) else {
+                eprintln!("no GPU adapter; skipping");
+                return;
+            };
+            let light: f32 = got.iter().map(|s| s.glow[0] * step * step).sum();
+            let want = DRIVE * std::f32::consts::PI * GLASS_RADIUS * GLASS_RADIUS;
+            eprintln!("footprint {f}: {light} of {want}, peak {}", got.iter().map(|s| s.glow[0]).fold(0.0, f32::max));
+            assert!((light / want - 1.0).abs() < 0.03, "footprint {f}: {light} of {want}");
+        }
+    }
+
+    /// NEARER SHOWS. A torch held in front of a chest shows in front of it --
+    /// of two capsules covering a ray alike, the first listed used to win,
+    /// and the player's body is listed first -- and its glass behind a body is
+    /// hidden by it.
+    #[test]
+    fn a_torch_in_front_of_a_body_shows_and_one_behind_it_is_hidden() {
+        // Held across the chest, pointing to the side: the viewer sees the
+        // torch's body with the trunk behind it.
+        let across = [trunk(Vec3::new(0.0, 1.0, 0.4)), torch(Vec3::new(0.05, 1.0, 0.0), Vec3::X)];
+        // Pointing at the viewer from behind someone.
+        let behind = [trunk(Vec3::new(0.0, 1.0, -0.5)), torch(Vec3::new(0.0, 1.0, 0.0), Vec3::NEG_Z)];
+        let ray = [(Vec3::new(-0.04, 1.0, -2.0), Vec3::Z, 0.002), (Vec3::new(0.0, 1.0, -2.0), Vec3::Z, 0.002)];
+        let (Some(a), Some(b)) = (reflect(&across, &ray[..1]), reflect(&behind, &ray[1..])) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        eprintln!("across the chest: {:?}; behind someone: {:?} glow {:?}", a[0].reflection, b[0].reflection, b[0].glow);
+        for c in 0..3 {
+            assert!(near(a[0].reflection[c], GLASS[c] * ALBEDO, 1e-3), "the torch in front: {:?}", a[0].reflection);
+        }
+        assert!(b[0].glow.iter().all(|g| *g < 1e-3), "the glass behind the trunk: {:?}", b[0].glow);
+        assert!(near(b[0].reflection[0], 0.5, 0.01), "the trunk in front: {:?}", b[0].reflection);
+    }
+
+    /// Each ray's glass glow as the reflecting point sees it past the glass's
+    /// own beam (`capsule_glass_beam`): `lamps` uploaded with the first in
+    /// spot layer 0 when `layered`, every tile of the spot atlas cleared to
+    /// `depth` -- 1 hides nothing, 0 everything in a map's frustum.
+    fn seen_past_the_beam(
+        groups: &[CapsuleGroup],
+        rays: &[(Vec3, Vec3, f32)],
+        lamps: &[super::Light],
+        layered: bool,
+        depth: f32,
+    ) -> Option<Vec<[f32; 3]>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let caps = CapsuleUpload::from_groups(groups);
+        let mut u: Uniforms = bytemuck::Zeroable::zeroed();
+        u.capsules = caps.capsules;
+        u.capsule_groups = caps.groups;
+        u.capsule_params = [caps.group_count as f32, -1.0, -1.0, 0.0];
+        u.camera_pos = [[0.0, 0.0, -1.0e4, 0.0]; 2];
+        let shadow_map = crate::renderer::shadow::ShadowMap::with_dimension(&device, 64);
+        if layered {
+            let m = crate::renderer::shadow::spot_shadow_matrices(&lamps[0], shadow_map.spot_tile_dim());
+            u.spot_view_proj[0] = m.lookup.to_cols_array_2d();
+            u.shadow_params[1] = 1.0;
+        }
+        let lights_uniform = super::LightsUniform::new(&device);
+        lights_uniform.upload_frame(&queue, lamps, if layered { &[0] } else { &[] }, false);
+        let code = format!(
+            "{}\n{}",
+            super::wgsl_lights_block(0, 1),
+            r#"
+@group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+@compute @workgroup_size(1)
+fn seen_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    pixel_footprint = rays[id.x * 2u].w;
+    let r = capsule_reflection(rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz), 0.0, vec3<f32>(3.14159265), vec4<f32>(0.0));
+    out[id.x] = vec4<f32>(capsule_glow * r.a, 0.0);
+}
+"#
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("seen_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let packed: Vec<[f32; 4]> =
+            rays.iter().flat_map(|(p, d, f)| [[p.x, p.y, p.z, *f], [d.x, d.y, d.z, 0.0]]).collect();
+        let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&u),
+            usage: BufferUsages::UNIFORM,
+        });
+        let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&packed),
+            usage: BufferUsages::STORAGE,
+        });
+        let size = (rays.len() * 16) as u64;
+        let out = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
+        let cards = crate::renderer::proxy_cards::none(&device);
+        let g0 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: lights_uniform.buffer().as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: BindingResource::Sampler(shadow_map.sampler()) },
+                BindGroupEntry { binding: 4, resource: BindingResource::TextureView(shadow_map.spot_depth_view()) },
+                BindGroupEntry { binding: 6, resource: BindingResource::Sampler(&samp) },
+                BindGroupEntry { binding: 12, resource: BindingResource::TextureView(&cards) },
+            ],
+        });
+        let g1 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: shadow_map.spot_depth_view(),
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(depth), store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        }));
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups(rays.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let got: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+        Some(got.iter().map(|c| [c[0], c[1], c[2]]).collect())
+    }
+
+    /// The player's flashlight as `flashlight::beam` makes it: a spot at the
+    /// glass `at`, along `forward`, its map starting 2 cm out.
+    fn beam(at: Vec3, forward: Vec3) -> super::Light {
+        super::Light {
+            position: at,
+            direction: forward.normalize(),
+            kind: super::LightKind::Spot,
+            color: crate::renderer::Color3(255, 255, 255, 255),
+            intensity: 40.0,
+            range: 8.0,
+            cone_angle_deg: 50.0,
+            inner_cone_angle_deg: 16.0,
+            mask_channel: None,
+            shadow_near: Some(0.02),
+            source_radius: 0.0,
+            in_level_bake: false,
+        }
+    }
+
+    /// THE GLASS IS HIDDEN WHERE ITS OWN BEAM IS: a mirror point the beam's
+    /// shadow map says is shadowed -- a hand held up between the torch and the
+    /// wall -- sees no glass in it, and one it lights sees it whole. A lamp
+    /// that is not the glass's beam, a beam with no shadow layer, and a point
+    /// outside the beam's map leave the glow as the capsules gave it.
+    #[test]
+    fn a_glass_is_hidden_where_its_own_beam_is_shadowed() {
+        let glass = Vec3::new(0.0, 1.0, 0.0);
+        let groups = [torch(glass, Vec3::NEG_Z)];
+        // A wall 2 m down the beam, looking back at the glass: head on, and
+        // 30 cm off the beam's axis, inside its cone. And a point well off to
+        // the side of the glass, 80 degrees off the beam, outside its map.
+        let rays = [
+            (Vec3::new(0.0, 1.0, -2.0), Vec3::Z, 0.002),
+            (Vec3::new(0.3, 1.0, -2.0), (glass - Vec3::new(0.3, 1.0, -2.0)).normalize(), 0.002),
+            (Vec3::new(1.5, 1.0, -0.26), (glass - Vec3::new(1.5, 1.0, -0.26)).normalize(), 0.002),
+        ];
+        let lamp = beam(glass, Vec3::NEG_Z);
+        // With no lamp at all, the glow as the capsules give it.
+        let Some(whole) = seen_past_the_beam(&groups, &rays, &[], false, 0.0) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let shadowed = seen_past_the_beam(&groups, &rays, &[lamp], true, 0.0).unwrap();
+        let lit = seen_past_the_beam(&groups, &rays, &[lamp], true, 1.0).unwrap();
+        let elsewhere = seen_past_the_beam(&groups, &rays, &[beam(glass + Vec3::X * 0.05, Vec3::NEG_Z)], true, 0.0).unwrap();
+        let unlayered = seen_past_the_beam(&groups, &rays, &[lamp], false, 0.0).unwrap();
+        eprintln!(
+            "GLASS PAST ITS BEAM: whole {whole:?}\n  shadowed {shadowed:?}\n  lit {lit:?}\n  another lamp {elsewhere:?}\n  no layer {unlayered:?}"
+        );
+        for (i, what) in [(0, "head on"), (1, "off the axis")] {
+            assert!(whole[i][0] > 1.0, "{what}: the capsules give the glass a glow: {:?}", whole[i]);
+            assert!(shadowed[i].iter().all(|g| *g < 1e-4), "{what}: the shadowed point still sees the glass: {:?}", shadowed[i]);
+            for c in 0..3 {
+                assert!(near(lit[i][c], whole[i][c], 1e-3 * whole[i][c]), "{what}: a lit point sees all of it: {:?}", lit[i]);
+                assert_eq!(elsewhere[i][c], whole[i][c], "{what}: a lamp elsewhere is not its beam");
+                assert_eq!(unlayered[i][c], whole[i][c], "{what}: a beam with no shadow layer");
+            }
+        }
+        assert!(whole[2][0] > 1.0, "off to the side the glass still shows: {:?}", whole[2]);
+        assert_eq!(shadowed[2], whole[2], "outside the beam's map nothing is known to hide it");
+    }
+
+    /// A CAPSULE KEEPS WHAT IT IS past one left out of the upload.
+    #[test]
+    fn a_capsule_keeps_what_it_is_past_one_left_out() {
+        let mut g = torch(Vec3::ZERO, Vec3::NEG_Z);
+        g.capsules.insert(0, (Vec3::splat(f32::NAN), Vec3::ZERO, 0.1));
+        g.surfaces.insert(0, -0.5);
+        let up = CapsuleUpload::from_groups(&[g]);
+        assert_eq!(up.groups[1][3], 2.0, "two capsules kept");
+        assert_eq!((up.capsules[1][3], up.capsules[3][3]), (-ALBEDO, DRIVE));
+        // And a group with no surfaces given is all body.
+        let t = CapsuleUpload::from_groups(&[trunk(Vec3::ZERO)]);
+        assert_eq!(t.capsules[1][3], 0.0);
+    }
+}
+
+/// A TORCH'S POOL IN A REFLECTION, as the fix-up lights it: a reflected point
+/// on a surface the beam lights takes the beam's light on that surface's
+/// albedo, as the surface itself does, shadowed by the beam's own map; a point
+/// off the surface, past its reach or outside the cone takes none. See
+/// `probe_surface_relit`.
+#[cfg(test)]
+mod surface_relit_tests {
+    use glam::Vec3;
+    use wgpu::util::DeviceExt;
+    use wgpu::{
+        BindGroupDescriptor, BindGroupEntry, BindingResource, BufferDescriptor, BufferUsages, ShaderModuleDescriptor,
+        ShaderSource,
+    };
+
+    use super::{LitSurface, LightsUniform};
+    use crate::renderer::uniforms::Uniforms;
+
+    const ALBEDO: Vec3 = Vec3::new(0.5, 0.4, 0.3);
+
+    /// The player's flashlight as `flashlight::beam` makes it: a spot at
+    /// `at` along `forward`, its map starting 2 cm out.
+    fn beam(at: Vec3, forward: Vec3) -> super::Light {
+        super::Light {
+            position: at,
+            direction: forward.normalize(),
+            kind: super::LightKind::Spot,
+            color: crate::renderer::Color3(255, 255, 255, 255),
+            intensity: 40.0,
+            range: 8.0,
+            cone_angle_deg: 50.0,
+            inner_cone_angle_deg: 16.0,
+            mask_channel: None,
+            shadow_near: Some(0.02),
+            source_radius: 0.0,
+            in_level_bake: false,
+        }
+    }
+
+    /// The wall 3 m down the beam from a torch at (0, 1, 0) along -z, facing
+    /// it, its pool map seen from the glass a little past the 25-degree cone.
+    fn wall() -> LitSurface {
+        LitSurface {
+            normal: Vec3::Z,
+            offset: -3.0,
+            albedo: ALBEDO,
+            lens: Vec3::new(0.0, 1.0, 0.0),
+            forward: Vec3::NEG_Z,
+            right: Vec3::X,
+            tan_half: 26.25f32.to_radians().tan(),
+        }
+    }
+
+    /// What `probe_surface_relit` gives each `(hit, ray)` once the pool maps
+    /// are made (`pool_cards`) into a card atlas with one character's rows,
+    /// the player standing at the world's origin: `lamps` with the first in
+    /// spot layer 0 when `layered`, every tile of the spot atlas cleared to
+    /// `depth`.
+    fn relit_at(
+        lamps: &[super::Light],
+        layered: bool,
+        depth: f32,
+        surfaces: &[LitSurface],
+        hits: &[(Vec3, Vec3)],
+    ) -> Option<Vec<Vec3>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let mut u: Uniforms = bytemuck::Zeroable::zeroed();
+        let shadow_map = crate::renderer::shadow::ShadowMap::with_dimension(&device, 64);
+        if layered {
+            let m = crate::renderer::shadow::spot_shadow_matrices(&lamps[0], shadow_map.spot_tile_dim());
+            u.spot_view_proj[0] = m.lookup.to_cols_array_2d();
+            u.shadow_params[1] = 1.0;
+        }
+        let atlas = crate::renderer::proxy_cards::atlas_with_characters(&device, &queue, &[], 1);
+        // The maps' pipeline takes the scene's group 0; here, only what its
+        // shader reads of it -- camera, lights, the shadow sampler and the
+        // spot atlas.
+        let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty,
+            count: None,
+        };
+        let uniform = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None };
+        let pool_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                entry(0, uniform),
+                entry(1, uniform),
+                entry(3, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison)),
+                entry(
+                    4,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
+            ],
+        });
+        let pools = crate::renderer::pool_cards::PoolCards::new(&device, &pool_layout, atlas.resolution);
+        let mips = crate::renderer::brush_pipeline::probe_pass::MirrorMips::new(&device);
+        let lights_uniform = LightsUniform::new(&device);
+        lights_uniform.set_lit_surfaces(surfaces);
+        // No row, nothing read -- the poolless twins' condition.
+        assert!(!lights_uniform.reads_pool_maps());
+        lights_uniform.set_pool_row(Some(pools.first_row(atlas.pool_row)));
+        assert_eq!(lights_uniform.reads_pool_maps(), surfaces.iter().any(|s| s.tan_half > 0.0));
+        lights_uniform.upload_frame(&queue, lamps, if layered { &[0] } else { &[] }, false);
+        let code = format!(
+            "{}\n{}",
+            super::wgsl_lights_block(0, 1),
+            r#"
+@group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+@compute @workgroup_size(1)
+fn relit_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    pixel_footprint = 0.0005;
+    probe_eye_distance = 2.0;
+    out[id.x] = vec4<f32>(probe_surface_relit(rays[id.x * 2u].xyz, rays[id.x * 2u + 1u].xyz, 0.05, 2.0), pixel_footprint);
+}
+"#
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("relit_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let packed: Vec<[f32; 4]> = hits.iter().flat_map(|(h, d)| [[h.x, h.y, h.z, 0.0], [d.x, d.y, d.z, 0.0]]).collect();
+        let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&u),
+            usage: BufferUsages::UNIFORM,
+        });
+        let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&packed),
+            usage: BufferUsages::STORAGE,
+        });
+        let size = (hits.len() * 16) as u64;
+        let out = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let pool_group = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pool_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: lights_uniform.buffer().as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: BindingResource::Sampler(shadow_map.sampler()) },
+                BindGroupEntry { binding: 4, resource: BindingResource::TextureView(shadow_map.spot_depth_view()) },
+            ],
+        });
+        let linear = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        // The lookup's: the camera, the lights, the probes' sampler and the
+        // card atlas.
+        let g0 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: lights_uniform.buffer().as_entire_binding() },
+                BindGroupEntry { binding: 6, resource: BindingResource::Sampler(&linear) },
+                BindGroupEntry { binding: 12, resource: BindingResource::TextureView(&atlas.view) },
+            ],
+        });
+        let g1 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: shadow_map.spot_depth_view(),
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(depth), store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        }));
+        if !lights_uniform.lit_surfaces().is_empty() {
+            pools.record(&device, &mut enc, &pool_group, &mips, &atlas.texture, pools.first_row(atlas.pool_row), None);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups(hits.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let got: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+        for g in &got {
+            assert_eq!(g[3], 0.0005, "the reflecting pixel's footprint is left as it was");
+        }
+        Some(got.iter().map(|g| Vec3::new(g[0], g[1], g[2])).collect())
+    }
+
+    /// The wall's own light on the beam's axis, 3 m off, square on: I / d^2
+    /// in the window `(1 - (d/r)^4)^2`. LAMP_RADIUS is far smaller.
+    fn expected_scale() -> f32 {
+        let window = (1.0 - (3.0f32 / 8.0).powi(4)).powi(2);
+        40.0 / 9.0 * window
+    }
+
+    #[test]
+    fn a_reflected_point_on_a_lit_wall_takes_the_beams_light_and_its_shadow() {
+        let glass = Vec3::new(0.0, 1.0, 0.0);
+        let lamp = beam(glass, Vec3::NEG_Z);
+        // Seen from a polished floor in front of the wall, down and back.
+        let ray = Vec3::new(0.0, 0.5, -1.0).normalize();
+        let hits = [
+            // On the beam's axis.
+            (Vec3::new(0.0, 1.0, -3.0), ray),
+            // 10 cm off the wall's plane: not on it.
+            (Vec3::new(0.0, 1.0, -2.9), ray),
+            // On it, outside the 25-degree cone and past the map's reach.
+            (Vec3::new(1.9, 1.0, -3.0), ray),
+            // On it, inside the cone, 50 cm off the axis.
+            (Vec3::new(0.5, 1.0, -3.0), ray),
+            // On it, just outside the cone (26 degrees), inside the map.
+            (Vec3::new(1.463, 1.0, -3.0), ray),
+        ];
+        let Some(lit) = relit_at(&[lamp], true, 1.0, &[wall()], &hits) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let shadowed = relit_at(&[lamp], true, 0.0, &[wall()], &hits).unwrap();
+        let no_surface = relit_at(&[lamp], true, 1.0, &[], &hits).unwrap();
+        // The same wall with a map reaching only 30 cm round the axis.
+        let narrow = relit_at(&[lamp], true, 1.0, &[LitSurface { tan_half: 0.1, ..wall() }], &hits).unwrap();
+        let baked = relit_at(&[super::Light { in_level_bake: true, ..lamp }], true, 1.0, &[wall()], &hits).unwrap();
+        // The wall as the fifth surface, behind four planes no hit lies on:
+        // its map in the second band, second across -- made and read there.
+        let decoy = |k: f32| LitSurface { normal: Vec3::Y, offset: 50.0 + k, ..wall() };
+        let fifth = relit_at(&[lamp], true, 1.0, &[decoy(0.0), decoy(1.0), decoy(2.0), decoy(3.0), wall()], &hits).unwrap();
+        assert!((fifth[0] - lit[0]).abs().max_element() < 1e-3 * expected_scale(), "the fifth map, read where it was made: {:?}", fifth[0]);
+        eprintln!(
+            "SURFACE RELIT: lit {lit:?}\n  shadowed {shadowed:?}\n  no surface {no_surface:?}\n  narrow {narrow:?}\n  a lamp the bake saw {baked:?}"
+        );
+        // The wall's own light on its axis, on its albedo, read from the map:
+        // within its half-float texels.
+        let expected = ALBEDO * expected_scale();
+        assert!((lit[0] - expected).abs().max_element() < 0.01 * expected.max_element(), "on the axis: {:?} vs {expected:?}", lit[0]);
+        for (i, why) in [(1, "off the wall's plane"), (2, "outside the cone and the map"), (4, "outside the cone")] {
+            assert!(lit[i].max_element() < 1e-3 * expected.max_element(), "{why}: {:?}", lit[i]);
+        }
+        assert!(lit[3].max_element() > 0.5 * expected.max_element(), "inside the cone: {:?}", lit[3]);
+        assert!(narrow[3].max_element() < 1e-4, "past the map's reach: {:?}", narrow[3]);
+        assert!((narrow[0] - lit[0]).abs().max_element() < 0.01 * expected.max_element(), "within its reach, the same");
+        assert!(shadowed[0].max_element() < 1e-4, "a hand's shadow on the wall is in its reflection: {:?}", shadowed[0]);
+        assert!(no_surface[0].max_element() < 1e-4, "no lit surface, no light: {:?}", no_surface[0]);
+        assert!(baked[0].max_element() < 1e-4, "a lamp the bake saw is in the photographs already: {:?}", baked[0]);
+    }
+}
+
+#[cfg(test)]
+mod tent_tests {
+    use wgpu::util::DeviceExt;
+    use wgpu::*;
+
+    /// Each tent form at the same points of one random depth tile pair, on the
+    /// GPU: the shipped loop, the written-out copy, the closed form per tap
+    /// and the half-precision one (`f16` where the adapter has it). Columns:
+    /// shipped, unrolled, lean, half.
+    fn tents(f16: bool) -> Option<Vec<[f32; 4]>> {
+        let instance = Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions::default())).ok()?;
+        if f16 && !adapter.features().contains(Features::SHADER_F16) {
+            return None;
+        }
+        let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
+            required_features: if f16 { Features::SHADER_F16 } else { Features::empty() },
+            required_limits: crate::renderer::uniforms::scene_limits(Limits::default()),
+            ..Default::default()
+        }))
+        .ok()?;
+        let block = crate::renderer::shader_precision::with_half_precision(super::wgsl_lights_block(0, 1), f16);
+        let samp_binding: u32 = {
+            let at = block.find(" var shadow_samp:").expect("the lights block declares shadow_samp");
+            let head = &block[..at];
+            let open = head.rfind("@binding(").unwrap() + "@binding(".len();
+            head[open..].split(')').next().unwrap().parse().unwrap()
+        };
+        let code = format!(
+            "{block}\n{}",
+            r#"
+@group(1) @binding(0) var test_depth: texture_depth_2d;
+@group(1) @binding(1) var<storage, read> pts: array<vec4<f32>>;
+@group(1) @binding(2) var<storage, read_write> out: array<vec4<f32>>;
+@compute @workgroup_size(64)
+fn tent_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= arrayLength(&pts)) { return; }
+    let p = pts[id.x];
+    let tile = vec2<f32>(p.w, 0.0);
+    let grid = vec2<f32>(2.0, 1.0);
+    out[id.x] = vec4<f32>(
+        pcf_tile_tent_at(test_depth, tile, grid, p.xyz),
+        pcf_tile_tent_unrolled_at(test_depth, tile, grid, p.xyz),
+        pcf_tile_tent_lean_at(test_depth, tile, grid, p.xyz),
+        pcf_tile_tent_half_at(test_depth, tile, grid, p.xyz),
+    );
+}
+"#
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("tent_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        // Two 32x32 tiles side by side, every texel a random depth.
+        let (w, h) = (64u32, 32u32);
+        let mut seed = 0x2545_f491_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        let texels: Vec<u16> = (0..w * h).map(|_| (next() * 65535.0) as u16).collect();
+        let depth = device.create_texture_with_data(
+            &queue,
+            &TextureDescriptor {
+                label: None,
+                size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Depth16Unorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            util::TextureDataOrder::LayerMajor,
+            bytemuck::cast_slice(&texels),
+        );
+        let sampler = device.create_sampler(&SamplerDescriptor {
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            compare: Some(CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        // Points all over both tiles, edges included, at depths across the range.
+        let pts: Vec<[f32; 4]> = (0..4096).map(|i| [next(), next(), next(), (i % 2) as f32]).collect();
+        let pts_buf = device.create_buffer_init(&util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&pts),
+            usage: BufferUsages::STORAGE,
+        });
+        let size = (pts.len() * 16) as u64;
+        let out = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let view = depth.create_view(&Default::default());
+        let g0 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[BindGroupEntry { binding: samp_binding, resource: BindingResource::Sampler(&sampler) }],
+        });
+        let g1 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&view) },
+                BindGroupEntry { binding: 1, resource: pts_buf.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups((pts.len() as u32).div_ceil(64), 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(MapMode::Read, |_| {});
+        let _ = device.poll(PollType::Wait { submission_index: None, timeout: None });
+        let got: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+        Some(got)
+    }
+
+    /// The largest and the mean difference of column `k` from the shipped one.
+    fn spread(got: &[[f32; 4]], k: usize) -> (f32, f32) {
+        let d: Vec<f32> = got.iter().map(|r| (r[k] - r[0]).abs()).collect();
+        (d.iter().cloned().fold(0.0, f32::max), d.iter().sum::<f32>() / d.len() as f32)
+    }
+
+    /// THE LEAN TENT IS THE TENT: each tap's position and weight worked out at
+    /// the tap give the shipped loop's shadow, over random depths at random
+    /// points, to the precision of the hardware's own bilinear weights.
+    #[test]
+    fn every_tent_form_gives_the_same_shadow() {
+        let Some(got) = tents(false) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let lit = got.iter().filter(|r| r[0] > 0.0 && r[0] < 1.0).count();
+        assert!(lit > got.len() / 4, "the points must fall on partial shadow: {lit} of {}", got.len());
+        for (k, name, tol) in [(1, "unrolled", 1e-5), (2, "lean", 2e-3), (3, "half (at f32)", 1e-5)] {
+            let (max, mean) = spread(&got, k);
+            eprintln!("{name}: max {max:.2e}, mean {mean:.2e}");
+            assert!(max <= tol, "{name} differs from the shipped tent by {max}");
+        }
+    }
+
+    /// At `f16` the half-precision tent moves a tap by at most a
+    /// five-hundredth of a texel: within a few hundredths of a percent of the
+    /// shipped shadow, and never darker than a bilinear weight's step.
+    #[test]
+    fn the_half_precision_tent_holds_at_f16() {
+        let Some(got) = tents(true) else {
+            eprintln!("no f16 adapter; skipping");
+            return;
+        };
+        let (max, mean) = spread(&got, 3);
+        eprintln!("half at f16: max {max:.2e}, mean {mean:.2e}");
+        assert!(max <= 6e-3 && mean <= 1e-3, "half: max {max}, mean {mean}");
+        let (max, mean) = spread(&got, 2);
+        eprintln!("lean at f16 (f32 maths): max {max:.2e}, mean {mean:.2e}");
+        assert!(max <= 2e-3, "lean: max {max}");
     }
 }

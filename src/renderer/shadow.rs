@@ -32,6 +32,7 @@ use glam::{Mat4, Vec2, Vec3, Vec4};
 use wgpu::*;
 
 use super::cuboid::SolidVertex;
+use super::lights::Light;
 use super::mesh::MeshVertex;
 
 /// Side length of each (square) shadow depth texture on desktop.
@@ -471,6 +472,78 @@ pub struct CasterChunk {
 pub const SPOT_SHADOW_NEAR: f32 = 0.30;
 
 pub fn spot_light_matrix(pos: Vec3, dir: Vec3, cone_angle_deg: f32, range: f32) -> Mat4 {
+    spot_light_matrix_near(pos, dir, cone_angle_deg, range, SPOT_SHADOW_NEAR)
+}
+
+/// The bias the lights block takes off every shadow lookup's depth, in NDC
+/// depth (`shadow_coords`). Mirrored here so a lookup matrix can take it back
+/// out; `the_lookup_bias_matches_the_shader` pins the two together.
+pub const SHADER_DEPTH_BIAS: f32 = 0.0015;
+
+/// How far behind its occluder a receiver must be to be shadowed, in the
+/// map's own texels, for a light with its own near plane. See
+/// `spot_shadow_matrices`.
+pub const SPOT_BIAS_TEXELS: f32 = 1.5;
+
+/// A spot's shadow matrices: the one its map is DRAWN with, and the one the
+/// lights block READS it with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpotShadowMatrices {
+    pub pass: Mat4,
+    pub lookup: Mat4,
+}
+
+/// The matrices for `l`'s shadow, its tiles `tile_dim` texels a side.
+///
+/// The same matrix both ways for a fixture. A light with its own near plane
+/// (`Light::shadow_near` -- the player's flashlight) READS its map through a
+/// matrix whose depth row carries a different bias. The lights block takes a
+/// constant [`SHADER_DEPTH_BIAS`] off every receiver's depth, and a constant
+/// in perspective depth is `bias z^2 / near` metres at `z` metres: about 2 cm
+/// at 2 m with a fixture's 30 cm near plane, which is what it was tuned
+/// against, but 30 cm with a flashlight's 2 cm -- a hand's shadow on a wall
+/// two metres away would have floated a foot off it, and closer than that it
+/// would have vanished. So the lookup matrix takes the constant back out and
+/// puts in [`SPOT_BIAS_TEXELS`] of the map's own texels at the receiver's
+/// depth: the depth row becomes `(1 + c) z + (SHADER_DEPTH_BIAS - c a) w`,
+/// which the shader's divide and subtraction turn into `d - c (a - d)` --
+/// `c z` metres at depth `z`, where one texel there is `2 z tan(fov/2) / dim`.
+/// The map itself is drawn with the plain matrix: a bias folded into both
+/// would cancel. Nothing in the shader changes, so the fixtures' shadows are
+/// bit for bit what they were.
+pub fn spot_shadow_matrices(l: &Light, tile_dim: u32) -> SpotShadowMatrices {
+    let Some(wanted) = l.shadow_near else {
+        let m = spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range);
+        return SpotShadowMatrices { pass: m, lookup: m };
+    };
+    let pass = spot_light_matrix_near(l.position, l.direction, l.cone_angle_deg, l.range, wanted);
+    let (fov, near, far) = spot_frustum(l.cone_angle_deg, l.range, wanted);
+    let a = far / (far - near);
+    let c = SPOT_BIAS_TEXELS * 2.0 * (fov * 0.5).tan() / tile_dim.max(1) as f32;
+    let mut lookup = pass;
+    for col in [&mut lookup.x_axis, &mut lookup.y_axis, &mut lookup.z_axis, &mut lookup.w_axis] {
+        col.z = (1.0 + c) * col.z + (SHADER_DEPTH_BIAS - c * a) * col.w;
+    }
+    SpotShadowMatrices { pass, lookup }
+}
+
+/// A spot shadow's field of view, near and far planes, from the light: the
+/// one place `spot_light_matrix_near` and `spot_shadow_matrices` read them.
+fn spot_frustum(cone_angle_deg: f32, range: f32, near_wanted: f32) -> (f32, f32, f32) {
+    // Pad the fov slightly beyond the full cone so the cone edge isn't clipped.
+    let fov = (cone_angle_deg.to_radians() * 1.1).clamp(0.1, std::f32::consts::PI - 0.1);
+    let far = range.max(0.2);
+    // Halved against `far`, so a deliberately short-range light -- a muzzle
+    // flash, a small prop lamp -- cannot end up with its near plane past its
+    // own far plane and produce an inside-out projection. See
+    // `spot_light_matrix_near` for why a fixture's is a constant.
+    let near = near_wanted.min(far * 0.5).max(0.02);
+    (fov, near, far)
+}
+
+/// `spot_light_matrix` with the near plane given: [`SPOT_SHADOW_NEAR`] for a
+/// fixture, its own for a light with nothing round it.
+pub fn spot_light_matrix_near(pos: Vec3, dir: Vec3, cone_angle_deg: f32, range: f32, near_wanted: f32) -> Mat4 {
     let d = {
         let n = dir.normalize_or_zero();
         if n == Vec3::ZERO {
@@ -485,9 +558,6 @@ pub fn spot_light_matrix(pos: Vec3, dir: Vec3, cone_angle_deg: f32, range: f32) 
         Vec3::Y
     };
     let view = Mat4::look_at_rh(pos, pos + d, up);
-    // Pad the fov slightly beyond the full cone so the cone edge isn't clipped.
-    let fov = (cone_angle_deg.to_radians() * 1.1).clamp(0.1, std::f32::consts::PI - 0.1);
-    let far = range.max(0.2);
     // THE NEAR PLANE IS A PROPERTY OF THE FIXTURE, NOT OF THE LIGHT'S REACH.
     //
     // It used to be `far * 0.02`, which tied it to `range` -- a number chosen
@@ -508,12 +578,10 @@ pub fn spot_light_matrix(pos: Vec3, dir: Vec3, cone_angle_deg: f32, range: f32) 
     // 0.3 m clears a hanging lamp's housing. It is a real trade: a caster
     // genuinely within 30 cm of a bulb now casts nothing. For room fixtures
     // the only thing that close is the fixture, which is the thing being
-    // excluded on purpose.
-    //
-    // Halved against `far` as well, so a deliberately short-range light -- a
-    // muzzle flash, a small prop lamp -- cannot end up with its near plane
-    // past its own far plane and produce an inside-out projection.
-    let near = SPOT_SHADOW_NEAR.min(far * 0.5).max(0.02);
+    // excluded on purpose. A light with nothing round it gives its own
+    // (`Light::shadow_near`): the player's flashlight, whose glass is the front
+    // of the torch, so a hand a few centimetres before it still casts.
+    let (fov, near, far) = spot_frustum(cone_angle_deg, range, near_wanted);
     let proj = Mat4::perspective_rh(fov, 1.0, near, far);
     proj * view
 }
@@ -527,6 +595,56 @@ struct LightMatrix {
 /// One mesh caster for a shadow pass: vertex buffer, index buffer, index count,
 /// and the mesh's model-matrix bind group (reused from the main mesh pass).
 pub type ShadowMeshDraw<'a> = (&'a Buffer, &'a Buffer, u32, &'a BindGroup);
+
+/// A mesh caster's bounding sphere in the frame its light matrices map from
+/// (the player's): `xyz` the centre, `w` the radius. A list of these runs
+/// parallel to the `ShadowMeshDraw` list it bounds.
+///
+/// THE MOVING-OBJECTS MAP'S COST WAS ITS CASTERS, NOT ITS TEXELS. Every model
+/// in the level went into both 3 m sun tiles every frame, and each spot tile
+/// took them all as well: 0.66 ms of binning a frame for a 2048x512 depth map
+/// (hall_front, 2026-10-01), for models the clip planes then threw away.
+pub type ShadowMeshBound = glam::Vec4;
+
+/// Whether a sphere is at all inside a frustum (`frustum_planes`): false only
+/// when it lies wholly behind one plane.
+///
+/// LOSSLESS, not merely conservative: the shadow pipelines clip at every plane
+/// (no `unclipped_depth`), so a caster wholly behind one has every triangle
+/// clipped by the GPU anyway. Skipping it saves the vertices and the binning
+/// and cannot change a texel.
+pub fn sphere_in_frustum(planes: &[glam::Vec4; 6], sphere: ShadowMeshBound) -> bool {
+    planes.iter().all(|p| p.truncate().dot(sphere.truncate()) + p.w >= -sphere.w)
+}
+
+/// Whether the `i`-th mesh caster can reach a pass whose planes are `planes`.
+/// No bound for it -- an empty or short list, which is how a caller asks for
+/// no culling -- reads as yes.
+fn mesh_caster_reaches(planes: &[glam::Vec4; 6], bounds: &[ShadowMeshBound], i: usize) -> bool {
+    bounds.get(i).is_none_or(|&s| sphere_in_frustum(planes, s))
+}
+
+/// How many of `draws` reach a pass whose planes are `planes`, and their
+/// indices: what the cull leaves, for the frame diagnostic.
+pub fn mesh_casters_reaching(
+    planes: &[glam::Vec4; 6],
+    draws: &[ShadowMeshDraw],
+    bounds: &[ShadowMeshBound],
+) -> (usize, u32) {
+    draws
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| mesh_caster_reaches(planes, bounds, *i))
+        .fold((0, 0), |(n, indices), (_, d)| (n + 1, indices + d.2))
+}
+
+/// A mesh's bounding sphere where its model matrix puts it, in the frame that
+/// matrix maps to: `bounding_radius` is its farthest vertex from the model's
+/// origin, so scaled by the largest axis scale it holds every vertex whatever
+/// the rotation does to them.
+pub fn mesh_caster_bound(mesh: &crate::renderer::mesh::GltfMesh) -> ShadowMeshBound {
+    mesh.position.extend(mesh.bounding_radius * mesh.scale.abs().max_element())
+}
 
 /// A skinned caster: vertices, indices, count, model uniform, joint matrices.
 ///
@@ -701,6 +819,9 @@ pub struct ShadowMap {
     solid_pipeline: RenderPipeline,
     mesh_pipeline: RenderPipeline,
     skinned_pipeline: RenderPipeline,
+    /// A skinned caster posed once this frame (`skin_compute`), drawn as a
+    /// rigid mesh of its posed positions: `vs_posed`.
+    posed_pipeline: RenderPipeline,
     /// Level geometry. A separate pipeline only because `BrushVertex` has a
     /// different stride -- the shader is `vs_solid`, unchanged, because a depth
     /// pass reads position and nothing else.
@@ -910,6 +1031,36 @@ impl ShadowMap {
             cache: None,
         });
 
+        let posed_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("shadow_posed_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_posed"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(super::skin_compute::posed_layout())],
+            },
+            fragment: None,
+            // As the skinned pipeline's: no culling, for the same reason.
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
+                stencil: StencilState::default(),
+                bias,
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let brush_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("shadow_brush_pipeline"),
             layout: Some(&solid_layout),
@@ -989,8 +1140,29 @@ impl ShadowMap {
             solid_pipeline,
             mesh_pipeline,
             skinned_pipeline,
+            posed_pipeline,
             brush_pipeline,
         }
+    }
+
+    /// The skinned casters posed once this frame (`skin_compute`), into the
+    /// tile the pass's viewport is on: rigid meshes of their posed positions.
+    /// Returns the indices drawn.
+    fn draw_posed(&self, pass: &mut RenderPass, light_bg: &BindGroup, posed_draws: &[ShadowMeshDraw]) -> u32 {
+        if posed_draws.is_empty() {
+            return 0;
+        }
+        pass.set_pipeline(&self.posed_pipeline);
+        pass.set_bind_group(0, light_bg, &[]);
+        let mut drawn = 0;
+        for (vb, ib, count, model_bg) in posed_draws {
+            pass.set_bind_group(1, *model_bg, &[]);
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+            pass.draw_indexed(0..*count, 0, 0..1);
+            drawn += *count;
+        }
+        drawn
     }
 
     pub fn sun_depth_view(&self) -> &TextureView {
@@ -1005,6 +1177,12 @@ impl ShadowMap {
     /// The spot shadow array, as the shading pass samples it.
     pub fn spot_depth_view(&self) -> &TextureView {
         &self.spot_array_view
+    }
+
+    /// Side of one spot tile in texels, which a spot's lookup bias is
+    /// measured in. See `spot_shadow_matrices`.
+    pub fn spot_tile_dim(&self) -> u32 {
+        self.spot_tile_dim
     }
 
     pub fn sampler(&self) -> &Sampler {
@@ -1055,7 +1233,9 @@ impl ShadowMap {
         solid: Option<(&Buffer, &Buffer, u32)>,
         brushes: Option<(&Buffer, &Buffer, u32)>,
         mesh_draws: &[ShadowMeshDraw],
+        mesh_bounds: &[ShadowMeshBound],
         skinned_draws: &[ShadowSkinnedDraw],
+        posed_draws: &[ShadowMeshDraw],
         solid_chunks: &[CasterChunk],
     ) -> u32 {
         let mut drawn = 0u32;
@@ -1113,7 +1293,10 @@ impl ShadowMap {
             if !mesh_draws.is_empty() {
                 pass.set_pipeline(&self.mesh_pipeline);
                 pass.set_bind_group(0, light_bg, &[]);
-                for (vb, ib, count, model_bg) in mesh_draws {
+                for (i, (vb, ib, count, model_bg)) in mesh_draws.iter().enumerate() {
+                    if !mesh_caster_reaches(&planes, mesh_bounds, i) {
+                        continue;
+                    }
                     pass.set_bind_group(1, *model_bg, &[]);
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
@@ -1131,6 +1314,7 @@ impl ShadowMap {
                     pass.draw_indexed(0..*count, 0, 0..1);
                 }
             }
+            drawn += self.draw_posed(&mut pass, light_bg, posed_draws);
         }
         drop(pass);
         drawn
@@ -1141,13 +1325,21 @@ impl ShadowMap {
     /// and `ShadowKind::SunNear`'s), then the first `characters` characters'
     /// tiles (the characters alone, from `ShadowKind::Character(k)`'s). Tiles
     /// not drawn read as far depth, unshadowed. Returns the indices drawn.
+    ///
+    /// `sun_view_proj` is the sun tile's matrix, as `upload_light` was given
+    /// it for `ShadowKind::SunDynamic`; a mesh caster outside a tile's box is
+    /// left out of that tile (`sphere_in_frustum`), by its `mesh_bounds` entry.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_moving(
         &self,
         encoder: &mut CommandEncoder,
         sun: bool,
+        sun_view_proj: Mat4,
         characters: usize,
         mesh_draws: &[ShadowMeshDraw],
+        mesh_bounds: &[ShadowMeshBound],
         skinned_draws: &[ShadowSkinnedDraw],
+        posed_draws: &[ShadowMeshDraw],
     ) -> u32 {
         let mut drawn = 0u32;
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1161,6 +1353,7 @@ impl ShadowMap {
             ..Default::default()
         });
         let mut skinned = |pass: &mut wgpu::RenderPass, light_bg: &BindGroup| {
+            drawn += self.draw_posed(pass, light_bg, posed_draws);
             if skinned_draws.is_empty() {
                 return;
             }
@@ -1177,13 +1370,21 @@ impl ShadowMap {
         };
         if sun {
             // The sun's tile, then the middle of its box at twice the detail
-            // (`SUN_NEAR_ZOOM`): the same casters into both.
-            for (tile, slot) in [(0, &self.sun_dynamic), (SUN_NEAR_TILE, &self.sun_near)] {
+            // (`SUN_NEAR_ZOOM`): the same casters into both, each culled by
+            // its own box.
+            let tiles = [
+                (0, &self.sun_dynamic, frustum_planes(sun_view_proj)),
+                (SUN_NEAR_TILE, &self.sun_near, frustum_planes(sun_near_matrix(sun_view_proj))),
+            ];
+            for (tile, slot, planes) in tiles {
                 sun_atlas_viewport(&mut pass, tile);
             if !mesh_draws.is_empty() {
                 pass.set_pipeline(&self.mesh_pipeline);
                 pass.set_bind_group(0, &slot.light_bind_group, &[]);
-                for (vb, ib, count, model_bg) in mesh_draws {
+                for (i, (vb, ib, count, model_bg)) in mesh_draws.iter().enumerate() {
+                    if !mesh_caster_reaches(&planes, mesh_bounds, i) {
+                        continue;
+                    }
                     pass.set_bind_group(1, *model_bg, &[]);
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
@@ -1373,6 +1574,13 @@ fn vs_skinned(
         (joints.mats[joint_ids.y] * p) * joint_weights.y +
         (joints.mats[joint_ids.z] * p) * joint_weights.z +
         (joints.mats[joint_ids.w] * p) * joint_weights.w;
+    return light.view_proj * model_u.model * skinned;
+}
+
+// A skinned caster posed once this frame (`skin_compute`): its posed position
+// IS `vs_skinned`'s `skinned`, so the same expression follows.
+@vertex
+fn vs_posed(@location(0) skinned: vec4<f32>) -> @builtin(position) vec4<f32> {
     return light.view_proj * model_u.model * skinned;
 }
 "#;
@@ -1816,7 +2024,7 @@ mod render_tests {
                 .lights
                 .iter()
                 .enumerate()
-                .filter(|(_, l)| l.kind == LightKind::Spot)
+                .filter(|(_, l)| l.kind == LightKind::Spot && l.casts_shadow())
                 .map(|(i, _)| i)
                 .take(MAX_SPOT_SHADOWS)
                 .collect()
@@ -1829,11 +2037,14 @@ mod render_tests {
         let sun_view_proj = sun
             .map(|l| directional_light_matrix(l.direction, Vec3::ZERO, 20.0))
             .unwrap_or(Mat4::IDENTITY);
+        // Drawn with `pass`, read with `lookup`, as both renderers do.
+        let spot_matrices: Vec<SpotShadowMatrices> = spot_indices
+            .iter()
+            .map(|&i| spot_shadow_matrices(&scene.lights[i], shadow_map.spot_tile_dim()))
+            .collect();
         let mut spot_view_proj = [Mat4::IDENTITY; SHADOW_MATRICES];
-        for (layer, &i) in spot_indices.iter().enumerate() {
-            let l = &scene.lights[i];
-            spot_view_proj[layer] =
-                spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range);
+        for (layer, mats) in spot_matrices.iter().enumerate() {
+            spot_view_proj[layer] = mats.lookup;
         }
         // The caster in a characters' tile, fitted round it from its lamp.
         let character_tile = scene.character_lamp.zip(scene.caster.as_ref()).and_then(|(i, (v, _))| {
@@ -1969,17 +2180,13 @@ mod render_tests {
         }
         // One depth pass per spot layer, matching both renderers.
         for layer in 0..upload.spot_count as usize {
-            shadow_map.upload_light(
-                &queue,
-                ShadowKind::Spot(layer),
-                upload.spot_view_proj[layer],
-            );
+            shadow_map.upload_light(&queue, ShadowKind::Spot(layer), spot_matrices[layer].pass);
             let solid = caster_bufs
                 .as_ref()
                 .map(|(vb, ib, count)| (vb, ib, *count));
             shadow_map.record(
                 &mut encoder, ShadowKind::Spot(layer), solid, None, &[], &[], &[],
-                upload.spot_view_proj[layer],
+                spot_matrices[layer].pass,
             );
         }
         if let Some((_, m)) = character_tile {
@@ -2042,6 +2249,9 @@ mod render_tests {
     fn sun() -> Light {
         Light {
             mask_channel: None,
+            shadow_near: None,
+            source_radius: 0.0,
+            in_level_bake: true,
             position: Vec3::ZERO,
             // Straight down. `direction` is the way the light TRAVELS.
             direction: Vec3::NEG_Y,
@@ -2095,6 +2305,9 @@ mod render_tests {
     fn a_lamp_shadows_the_player_through_the_characters_tile() {
         let lamp = Light {
             mask_channel: None,
+            shadow_near: None,
+            source_radius: 0.0,
+            in_level_bake: true,
             position: Vec3::new(0.0, 4.0, 0.0),
             direction: Vec3::NEG_Y,
             kind: LightKind::Point,
@@ -2128,6 +2341,9 @@ mod render_tests {
     fn spot_above(x: f32, intensity: f32) -> Light {
         Light {
             mask_channel: None,
+            shadow_near: None,
+            source_radius: 0.0,
+            in_level_bake: true,
             position: Vec3::new(x, 6.0, 0.0),
             direction: Vec3::NEG_Y,
             kind: LightKind::Spot,
@@ -2351,6 +2567,9 @@ mod render_tests {
             shade_receiver(Scene {
                 lights: vec![Light {
                     mask_channel: None,
+                    shadow_near: None,
+                    source_radius: 0.0,
+                    in_level_bake: true,
                     position: Vec3::new(0.0, distance, 0.0),
                     direction: Vec3::NEG_Y,
                     kind: LightKind::Point,
@@ -2517,6 +2736,49 @@ mod render_tests {
                     && (nr.y - 2.0 * w.y).abs() < 1e-5
                     && (nr.z - w.z).abs() < 1e-6
             );
+        }
+    }
+
+    #[test]
+    fn a_culled_caster_had_nothing_inside_the_tile() {
+        // THE CULL MUST BE LOSSLESS. A sphere the cull leaves out must have no
+        // point the GPU would have kept -- inside the clip volume, wgpu's depth
+        // 0..w -- or a model's shadow would vanish at the tile's edge. And it
+        // must leave SOMETHING out, or it is a cull of nothing: models a few
+        // metres off fall outside the 3 m sun box.
+        let head = Vec3::new(3.137, 1.7, -2.71);
+        let wide = crate::renderer::lights::dynamic_sun_matrix(Vec3::new(0.4, -0.75, 0.3).normalize(), head);
+        let tiles = [
+            ("sun tile", wide),
+            ("near tile", sun_near_matrix(wide)),
+            ("spot", spot_light_matrix(head + Vec3::new(1.0, 1.2, 0.5), Vec3::new(-0.2, -1.0, 0.1), 70.0, 8.0)),
+        ];
+        let mut seed = 0x2545_f491_u32;
+        let mut rand = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for (name, m) in tiles {
+            let planes = frustum_planes(m);
+            let (mut kept, mut culled) = (0, 0);
+            for _ in 0..2000 {
+                let centre = head + Vec3::new(rand() - 0.5, rand() - 0.5, rand() - 0.5) * 16.0;
+                let sphere = centre.extend(0.05 + rand() * 1.5);
+                let inside = sphere_in_frustum(&planes, sphere);
+                if inside {
+                    kept += 1;
+                    continue;
+                }
+                culled += 1;
+                for _ in 0..200 {
+                    let d = Vec3::new(rand() - 0.5, rand() - 0.5, rand() - 0.5);
+                    let p = sphere.truncate() + d.normalize_or_zero() * sphere.w * rand().sqrt();
+                    let c = m * p.extend(1.0);
+                    let clipped = c.x < -c.w || c.x > c.w || c.y < -c.w || c.y > c.w || c.z < 0.0 || c.z > c.w;
+                    assert!(clipped, "{name}: culled {sphere:?} but {p} is inside the tile at {c:?}");
+                }
+            }
+            assert!(culled > 100 && kept > 10, "{name}: kept {kept}, culled {culled}");
         }
     }
 
@@ -2711,6 +2973,9 @@ mod render_tests {
     fn hall_spot_1() -> Light {
         Light {
             mask_channel: None,
+            shadow_near: None,
+            source_radius: 0.0,
+            in_level_bake: true,
             position: Vec3::new(0.0, 3.1 - 1.18, -4.5),
             direction: Vec3::NEG_Y,
             kind: LightKind::Spot,
@@ -2799,6 +3064,192 @@ mod render_tests {
             "the glass envelope changed the result, so it IS reaching the shadow map now \
              and the near-plane reasoning above no longer holds",
         );
+    }
+
+    /// A torch `height` metres over the floor under the hall lamp, aimed
+    /// straight down, its shadow map beginning `near` from the glass -- the
+    /// player's flashlight when `near` is given (`Light::shadow_near`).
+    fn torch(height: f32, near: Option<f32>) -> Light {
+        Light {
+            mask_channel: None,
+            shadow_near: near,
+            source_radius: 0.0,
+            in_level_bake: true,
+            position: Vec3::new(0.0, height, -4.5),
+            direction: Vec3::NEG_Y,
+            kind: LightKind::Spot,
+            color: Color3(255, 241, 228, 255),
+            // Dim for headroom, as `hall_spot_1`: a floor lit to 255 cannot
+            // show a shadow that halves it.
+            intensity: 0.12 * height * height,
+            range: 20.0,
+            cone_angle_deg: 50.0,
+            inner_cone_angle_deg: 16.0,
+        }
+    }
+
+    /// A square `half` metres each way, level at `y`, over the receiver.
+    fn plate(y: f32, half: f32) -> (Vec<SolidVertex>, Vec<u32>) {
+        let (mut v, i) = ground(y, half);
+        for p in &mut v {
+            p.position[2] -= 4.5;
+        }
+        (v, i)
+    }
+
+    /// THE HAND IN FRONT OF THE TORCH. A fixture's map starts 30 cm from its
+    /// bulb to leave its housing out (`SPOT_SHADOW_NEAR`), so a hand 10 cm in
+    /// front of a light read that way casts nothing -- the first thing anyone
+    /// tries with a flashlight. With the torch's own near plane it shadows the
+    /// floor under it.
+    #[test]
+    fn a_hand_held_in_front_of_a_flashlight_shadows_its_beam() {
+        let hand = || Some(plate(0.9, 0.03));
+        let floor = |light: Light, caster| Scene { lights: vec![light], caster, ..floor_under_the_lamp() };
+        // The rig's ambient alone: what a floor the torch cannot reach shows.
+        let unlit = shot!(floor(Light { intensity: 0.0, ..torch(1.0, Some(0.02)) }, None));
+        let open = shot!(floor(torch(1.0, Some(0.02)), None));
+        let as_a_fixture = shot!(floor(torch(1.0, None), hand()));
+        let as_a_torch = shot!(floor(torch(1.0, Some(0.02)), hand()));
+        eprintln!(
+            "TORCH HAND: unlit {unlit:?}  open {open:?}  fixture's near plane {as_a_fixture:?}  torch's {as_a_torch:?}"
+        );
+        assert!(
+            open[0] as i32 > unlit[0] as i32 + 20,
+            "the torch does not light the floor ({open:?} against {unlit:?}); nothing below means anything",
+        );
+        assert!(
+            (as_a_fixture[0] as i32 - open[0] as i32).abs() <= 3,
+            "with a fixture's near plane the hand 10 cm from the glass should be clipped out of \
+             the map ({as_a_fixture:?} against {open:?}) -- the reason the torch has its own",
+        );
+        assert!(
+            (as_a_torch[0] as i32 - unlit[0] as i32).abs() <= 3,
+            "the hand before the torch does not shadow the floor: {as_a_torch:?}, unlit {unlit:?}, open {open:?}",
+        );
+    }
+
+    /// AND ITS SHADOW STAYS ON ITS CASTER. A constant bias in perspective depth
+    /// is `0.0015 z^2 / near` metres -- 47 cm at 2.5 m for a 2 cm near plane --
+    /// so a plate 4 cm off the floor would have cast nothing under a torch read
+    /// with the fixtures' bias. The torch's lookup matrix holds the bias to
+    /// `SPOT_BIAS_TEXELS` of its own texels (`spot_shadow_matrices`): the plate
+    /// shadows, and the floor, drawn into the map itself, still does not
+    /// shadow itself.
+    #[test]
+    fn a_flashlight_shadow_sits_on_its_caster_and_the_floor_does_not_shadow_itself() {
+        let floor = |light: Light, caster| Scene { lights: vec![light], caster, ..floor_under_the_lamp() };
+        let lamp = || torch(2.5, Some(0.02));
+        let unlit = shot!(floor(Light { intensity: 0.0, ..lamp() }, None));
+        let open = shot!(floor(lamp(), None));
+        let low_plate = shot!(floor(lamp(), Some(plate(0.04, 0.2))));
+        let itself = shot!(floor(lamp(), Some(ground(0.0, 8.0))));
+        eprintln!(
+            "TORCH BIAS: unlit {unlit:?}  open {open:?}  plate 4 cm up {low_plate:?}  floor in its own map {itself:?}"
+        );
+        assert!(open[0] as i32 > unlit[0] as i32 + 20, "the torch does not light the floor ({open:?} against {unlit:?})");
+        assert!(
+            (low_plate[0] as i32 - unlit[0] as i32).abs() <= 3,
+            "a plate 4 cm off the floor casts nothing at 2.5 m: the lookup bias is not in texels \
+             ({low_plate:?}, unlit {unlit:?}, open {open:?})",
+        );
+        assert!(
+            (open[0] as i32 - itself[0] as i32) <= 3,
+            "the floor shadows itself under the torch -- acne ({itself:?} against {open:?})",
+        );
+    }
+
+    /// A LIT PATCH LIGHTS WHAT IS BESIDE IT AS A DISC DOES. A light standing
+    /// for a surface (`Light::source_radius`), a metre across and 5 cm over the
+    /// floor, lights it as a bulb a metre up does -- `1 / (d^2 + r^2)` -- where
+    /// a point there lights it hundreds of times over: the headset's
+    /// "magnifying glass" spot beside a flashlight's pool (2026-10-02).
+    #[test]
+    fn a_lit_patch_lights_the_floor_beside_it_as_a_disc_does() {
+        let patch = |height: f32, radius: f32| Light {
+            mask_channel: None,
+            shadow_near: Some(f32::INFINITY),
+            source_radius: radius,
+            in_level_bake: true,
+            position: Vec3::new(0.0, height, -4.5),
+            direction: Vec3::NEG_Y,
+            kind: LightKind::Point,
+            color: Color3(255, 255, 255, 255),
+            intensity: 0.12,
+            range: 20.0,
+            cone_angle_deg: 180.0,
+            inner_cone_angle_deg: 0.0,
+        };
+        let floor = |light: Light| Scene { lights: vec![light], ..floor_under_the_lamp() };
+        let unlit = shot!(floor(Light { intensity: 0.0, ..patch(1.0, 0.0) }));
+        let bulb = shot!(floor(patch((1.0f32 + 0.05 * 0.05).sqrt(), 0.0)));
+        let disc = shot!(floor(patch(0.05, 1.0)));
+        let point = shot!(floor(patch(0.05, 0.0)));
+        eprintln!("PATCH: unlit {unlit:?}  bulb 1 m up {bulb:?}  metre-wide patch 5 cm up {disc:?}  point 5 cm up {point:?}");
+        assert!(bulb[0] as i32 > unlit[0] as i32 + 20, "the bulb does not light the floor ({bulb:?} against {unlit:?})");
+        assert!(
+            (disc[0] as i32 - bulb[0] as i32).abs() <= 2,
+            "a metre-wide patch 5 cm up lights the floor to {disc:?}, a bulb a metre up to {bulb:?}",
+        );
+        assert!(
+            point[0] as i32 > bulb[0] as i32 + 40,
+            "a point 5 cm up lights the floor to {point:?}, no more than the bulb's {bulb:?}: \
+             nothing above shows the radius doing anything",
+        );
+    }
+
+    /// AS FAR AS ITS LIGHT GOES. The torch's lookup matrix carries
+    /// `SHADER_DEPTH_BIAS` in its depth row for `shadow_coords` to take back
+    /// out, so the depth that function tested against the map's far end was
+    /// the compared depth PLUS the bias -- and with a 2 cm near plane that
+    /// crossed 1 at about 8 m, where every receiver was called outside the map
+    /// and lit. The hand's shadow on the grass ended in a hard line 8 m out
+    /// while the beam went on (headset, 2026-10-02: "at a set distance from the
+    /// flashlight the shadows stop"). The hand 10 cm before the glass, the
+    /// floor further and further below; the light raised to keep the floor
+    /// lit as the range window closes.
+    #[test]
+    fn a_flashlights_shadow_reaches_as_far_as_its_light() {
+        let floor = |light: Light, caster| Scene { lights: vec![light], caster, ..floor_under_the_lamp() };
+        for height in [2.0f32, 5.0, 9.0, 12.0, 18.0] {
+            let window = (1.0 - (height / 20.0).powi(4)).max(0.05).powi(2);
+            let lamp = || Light { intensity: 0.12 * height * height / window, ..torch(height, Some(0.02)) };
+            let hand = || Some(plate(height - 0.1, 0.03));
+            let unlit = shot!(floor(Light { intensity: 0.0, ..lamp() }, None));
+            let open = shot!(floor(lamp(), None));
+            let shaded = shot!(floor(lamp(), hand()));
+            eprintln!("TORCH REACH {height} m: unlit {unlit:?}  open {open:?}  hand {shaded:?}");
+            assert!(
+                open[0] as i32 > unlit[0] as i32 + 20,
+                "the torch does not light the floor {height} m below ({open:?} against {unlit:?})",
+            );
+            assert!(
+                (shaded[0] as i32 - unlit[0] as i32).abs() <= 3,
+                "the hand 10 cm before the glass does not shadow the floor {height} m below: \
+                 {shaded:?}, unlit {unlit:?}, open {open:?}",
+            );
+        }
+    }
+
+    /// The lookup matrix takes back out exactly the constant the shader
+    /// subtracts. If the shader's changes, a torch's shadow lands a long way off.
+    #[test]
+    fn the_lookup_bias_matches_the_shader() {
+        let src = crate::renderer::lights::wgsl_lights_block(0, 1);
+        assert!(
+            src.contains(&format!("let bias = {SHADER_DEPTH_BIAS:?};")),
+            "shadow_coords no longer subtracts SHADER_DEPTH_BIAS ({SHADER_DEPTH_BIAS:?})",
+        );
+    }
+
+    /// A fixture reads its map through the matrix it was drawn with: nothing in
+    /// the torch's bias reaches the lamps' shadows.
+    #[test]
+    fn a_fixtures_shadow_matrices_are_unchanged() {
+        let l = hall_spot_1();
+        let m = spot_shadow_matrices(&l, 1024);
+        assert_eq!(m.pass, m.lookup);
+        assert_eq!(m.pass, spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range));
     }
 
 }
