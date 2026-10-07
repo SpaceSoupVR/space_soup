@@ -980,6 +980,11 @@ pub struct LightsBlockOptions {
     /// level's bake never saw -- a player's flashlight -- on the card's albedo.
     /// See `PROBE_CARD_RELIT`.
     pub card_relit: bool,
+    /// A spot's averaged edge takes the pixel's long step from the surface's
+    /// own plane, which the fragment shader hands `set_pixel_long_step` once a
+    /// pixel, rather than from the normal it shades with. See
+    /// `spot_long_step`.
+    pub long_step_from_plane: bool,
 }
 
 /// HOW MANY OF THE PROBE PASS'S OWN PIXELS A REFLECTED EDGE IS SOFTENED
@@ -997,8 +1002,22 @@ pub const PROBE_EDGE_FOOTPRINTS: f32 = 1.0;
 
 /// `wgsl_lights_block`, with `options`. See `LightsBlockOptions`.
 pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: LightsBlockOptions) -> String {
-    let LightsBlockOptions { probe_from_pass, probe_face_always, defer_secondary, cull_range_first, card_tests_filtered, card_relit } =
-        options;
+    let LightsBlockOptions {
+        probe_from_pass,
+        probe_face_always,
+        defer_secondary,
+        cull_range_first,
+        card_tests_filtered,
+        card_relit,
+        long_step_from_plane,
+    } = options;
+    // Written as asked, so every shader that sets no plane keeps its code
+    // exactly. See `spot_long_step`.
+    let spot_long_step_fn = if long_step_from_plane {
+        "var<private> pixel_long_step: f32 = 0.0;\nfn set_pixel_long_step(n_plane: vec3<f32>, view_dir: vec3<f32>) {\n    pixel_long_step = pixel_footprint * inverseSqrt(max(abs(dot(view_dir, n_plane)), SPOT_LONG_MIN_COS));\n}\nfn spot_long_step(vn: f32) -> f32 {\n    return pixel_long_step;\n}"
+    } else {
+        "fn spot_long_step(vn: f32) -> f32 {\n    return pixel_footprint * inverseSqrt(max(abs(vn), SPOT_LONG_MIN_COS));\n}"
+    };
     // Written into `probe_card_colour` only where asked for, not behind the
     // constant: a call in a constant-false branch still counts the lamps and
     // the shadow maps among the bindings a shader uses, and every pipeline
@@ -1104,6 +1123,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let proxy_slots = crate::renderer::uniforms::MAX_PROXIES * 3;
     let room_table_rows = crate::renderer::uniforms::ROOM_TABLE_ROWS;
     let shadow_tiles = super::shadow::SHADOW_MATRICES;
+    let moving_maps = shadow_tiles + 1;
     let max_spot_shadows = super::shadow::MAX_SPOT_SHADOWS;
     let atlas_rows = super::shadow::SPOT_ATLAS_ROWS;
     let sun_atlas_tiles = super::shadow::SUN_ATLAS_TILES;
@@ -1146,8 +1166,13 @@ struct Camera {{
     view_proj: array<mat4x4<f32>, 2>,
     inv_view_proj: array<mat4x4<f32>, 2>,
     sun_view_proj: mat4x4<f32>,
-    sun_dynamic_view_proj: mat4x4<f32>,
-    spot_view_proj: array<mat4x4<f32>, {shadow_tiles}>,
+    // The moving-objects sun map's matrix [0], then one per spot tile and per
+    // characters' tile [1 + i]: `sun_dynamic_view_proj` and `spot_view_proj`
+    // in `uniforms::Uniforms`, which lie side by side, read as one array, so
+    // the lamp loop carries a point into whichever map a lamp reads with one
+    // copy of `shadow_coords`. Read through `spot_view_proj(i)`,
+    // `SUN_MOVING_MAP` and `CHARACTER_MAPS`.
+    moving_view_proj: array<mat4x4<f32>, {moving_maps}>,
     camera_pos: array<vec4<f32>, 2>,
     // x = sun shadow on, y = spot shadow on, z = which light is the flashlight.
     shadow_params: vec4<f32>,
@@ -1407,10 +1432,18 @@ var<private> pixel_footprint: f32 = 0.0;
 // the longer of the screen's two steps is not even the ellipse's axis: it
 // turns with the head. Capped at grazing, where the pool is a sliver inside
 // one pixel whatever the cap.
+//
+// FROM THE SURFACE'S OWN PLANE where the shader knows it
+// (`LightsBlockOptions::long_step_from_plane`: the brushes and the ground,
+// once a pixel through `set_pixel_long_step`), not from the normal map's
+// normal. A bump tilts the shading, not the surface: the pixel still covers a
+// patch of the plane. Taken from a bump turned nearly edge-on to the eye, the
+// step stretched up to 32 times, the cone's edge was averaged that far, and a
+// pixel past a pool took about half its light -- white specks past the
+// sconces' pools on the stone ceiling (headset, 2026-10-06). The bumps still
+// shade every lamp's light through `dot(n, l)` and the highlight.
 const SPOT_LONG_MIN_COS: f32 = 1e-3;
-fn spot_long_step(vn: f32) -> f32 {{
-    return pixel_footprint * inverseSqrt(max(abs(vn), SPOT_LONG_MIN_COS));
-}}
+{spot_long_step_fn}
 // HOW FAR `dot(n, l)` SWINGS ACROSS THIS PIXEL, set once at the top of a
 // fragment shader whose normal is MAPPED, from that normal's derivatives (see
 // `terminator_width_of`). The lamps' terminator is then shaded over the pixel's
@@ -1826,7 +1859,7 @@ fn capsule_glass_beam(p: vec3<f32>, glass: vec3<f32>) -> f32 {{
         }}
         let layer = i32(lights.lights[i].params.w);
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
-            return pcf_layer_tap(spot_shadow_tex, layer, p, camera.spot_view_proj[layer]);
+            return pcf_layer_tap(spot_shadow_tex, layer, p, spot_view_proj(layer));
         }}
     }}
     return 1.0;
@@ -2204,6 +2237,13 @@ fn cam_view_proj() -> mat4x4<f32> {{ return camera.view_proj[view_slot]; }}
 fn cam_inv_view_proj() -> mat4x4<f32> {{ return camera.inv_view_proj[view_slot]; }}
 fn cam_pos() -> vec3<f32> {{ return camera.camera_pos[view_slot].xyz; }}
 
+// Rows of `Camera::moving_view_proj`: the sun's moving-objects map's, the
+// first characters' tile's, and spot tile `i`'s (or, past the spots,
+// characters' tile `i - {max_spot_shadows}`'s), which lie between.
+const SUN_MOVING_MAP: i32 = 0;
+const CHARACTER_MAPS: i32 = 1 + {max_spot_shadows};
+fn spot_view_proj(i: i32) -> mat4x4<f32> {{ return camera.moving_view_proj[1 + i]; }}
+
 fn shadow_coords(world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> vec4<f32> {{
     let lp = light_view_proj * vec4<f32>(world_pos, 1.0);
     let ndc = lp.xyz / lp.w;
@@ -2255,14 +2295,21 @@ fn pcf(tex: texture_depth_2d, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>
 // sun, which indoors is nearly everywhere -- that is what makes a live sun on
 // the brushes cost almost nothing on a floor the sun never touches.
 fn sun_visibility(l: Light, world_pos: vec3<f32>) -> f32 {{
+    var vis = sun_level_visibility(world_pos);
+    if (vis > 0.0 && l.position.w > 0.5 && camera.shadow_params.z > 0.5) {{
+        vis = vis * sun_moving_visibility(world_pos);
+    }}
+    return vis;
+}}
+
+// `sun_visibility`'s first half: the LEVEL's shadow alone, baked or from the
+// static map.
+fn sun_level_visibility(world_pos: vec3<f32>) -> f32 {{
     var vis = 1.0;
     if (SUN_MASK_EVERYWHERE || receiver_sun_mask >= 0.0) {{
         vis = receiver_sun_mask;
     }} else if (camera.shadow_params.x > 0.5) {{
         vis = pcf(sun_shadow_tex, world_pos, camera.sun_view_proj);
-    }}
-    if (vis > 0.0 && l.position.w > 0.5 && camera.shadow_params.z > 0.5) {{
-        vis = vis * sun_moving_visibility(world_pos);
     }}
     return vis;
 }}
@@ -2274,7 +2321,7 @@ fn sun_visibility(l: Light, world_pos: vec3<f32>) -> f32 {{
 // tile's scaled about its middle, and the depth is the same. See
 // `shadow::SUN_NEAR_ZOOM`.
 fn sun_moving_visibility(world_pos: vec3<f32>) -> f32 {{
-    let c = shadow_coords(world_pos, camera.sun_dynamic_view_proj);
+    let c = shadow_coords(world_pos, camera.moving_view_proj[SUN_MOVING_MAP]);
     if (c.w < 0.5) {{ return 1.0; }}
     let near = (c.xy - vec2<f32>(0.5)) * SUN_NEAR_ZOOM + vec2<f32>(0.5);
     // Two of its texels in from its edge: the kernel reaches one and a half.
@@ -2286,6 +2333,20 @@ fn sun_moving_visibility(world_pos: vec3<f32>) -> f32 {{
         SUN_ATLAS_GRID,
         vec3<f32>(select(c.xy, near, in_near), c.z),
     );
+}}
+
+// Where `sun_moving_visibility` reads the map for a point at `c` in the sun
+// tile: the point in the tile it reads -- the near tile wherever that holds
+// the point and its kernel -- and its depth (xyz), and that tile's column
+// (w). For the lamp loop, which carries the point into whichever map a lamp
+// reads itself. The wrappers keep their own bodies: written over helpers like
+// these, they cost the models' shaders 50 instructions (PIPESTATS, build 117).
+fn sun_moving_tile_at(c: vec3<f32>) -> vec4<f32> {{
+    let near = (c.xy - vec2<f32>(0.5)) * SUN_NEAR_ZOOM + vec2<f32>(0.5);
+    // Two of its texels in from its edge: the kernel reaches one and a half.
+    let edge = 2.0 * SUN_ATLAS_GRID.x / f32(textureDimensions(sun_dynamic_shadow_tex).x);
+    let in_near = all(abs(near - vec2<f32>(0.5)) < vec2<f32>(0.5 - edge));
+    return vec4<f32>(select(c.xy, near, in_near), c.z, select(0.0, SUN_NEAR_TILE, in_near));
 }}
 
 // One spot's depth, read out of its tile of the shared atlas.
@@ -2306,11 +2367,17 @@ fn sun_moving_visibility(world_pos: vec3<f32>) -> f32 {{
 fn pcf_layer(tex: texture_depth_2d, layer: i32, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
     let c = shadow_coords(world_pos, light_view_proj);
     if (c.w < 0.5) {{ return 1.0; }}
+    return pcf_layer_at(tex, layer, c.xyz);
+}}
+// `pcf_layer` from the point already in the tile's map: `c` as
+// `shadow_coords` gives it, where it holds the point. For the lamp loop,
+// which carries the point into whichever map a lamp reads itself.
+fn pcf_layer_at(tex: texture_depth_2d, layer: i32, c: vec3<f32>) -> f32 {{
     return pcf_tile_tent_lean_at(
         tex,
         vec2<f32>(f32(layer % {atlas_cols}), f32(layer / {atlas_cols})),
         vec2<f32>(f32({atlas_cols}), f32({atlas_rows})),
-        c.xyz,
+        c,
     );
 }}
 // `pcf_layer` as ONE bilinear compare: the four texels round the point,
@@ -2529,7 +2596,7 @@ fn character_shadow(i: u32, world_pos: vec3<f32>) -> f32 {{
     }}
     return pcf_tile(
         sun_dynamic_shadow_tex, vec2<f32>(f32(1 + k), 0.0), SUN_ATLAS_GRID, world_pos,
-        camera.spot_view_proj[{max_spot_shadows} + k],
+        spot_view_proj({max_spot_shadows} + k),
     );
 }}
 
@@ -2857,7 +2924,7 @@ fn light_debug(world_pos: vec3<f32>, n: vec3<f32>) -> vec2<f32> {{
         var shadow = stationary_visibility(l);
         let layer = i32(l.params.w);
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
-            shadow = shadow * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
+            shadow = shadow * pcf_layer(spot_shadow_tex, layer, world_pos, spot_view_proj(layer));
         }}
         pre = pre + lum;
         post = post + lum * shadow;
@@ -4942,7 +5009,7 @@ fn pool_map_light(k: i32, uv: vec2<f32>, texels: f32) -> vec3<f32> {{
         var shadow = 1.0;
         let layer = i32(l.params.w);
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
-            shadow = pcf_layer(spot_shadow_tex, layer, p + n * PROBE_CARD_RELIT_LIFT, camera.spot_view_proj[layer]);
+            shadow = pcf_layer(spot_shadow_tex, layer, p + n * PROBE_CARD_RELIT_LIFT, spot_view_proj(layer));
         }}
         lit += c.diffuse * shadow;
     }}
@@ -5025,7 +5092,7 @@ fn probe_card_relit(row: f32, card: vec3<f32>, lod: f32, h: vec3<f32>, q: vec4<f
         var shadow = 1.0;
         let layer = i32(l.params.w);
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
-            shadow = pcf_layer(spot_shadow_tex, layer, p + np * PROBE_CARD_RELIT_LIFT, camera.spot_view_proj[layer]);
+            shadow = pcf_layer(spot_shadow_tex, layer, p + np * PROBE_CARD_RELIT_LIFT, spot_view_proj(layer));
         }}
         lit += c.diffuse * shadow;
     }}
@@ -5462,7 +5529,11 @@ const GROUND_ALBEDO: f32 = 0.28;
 // surface NORMAL, which points away from the ground, and adding a ground term
 // there would light the undersides of things that see no ground at all.
 fn environment_radiance(dir: vec3<f32>) -> vec3<f32> {{
-    let sky = sky_irradiance(dir);
+    return environment_radiance_of(dir, sky_irradiance(dir));
+}}
+
+// `environment_radiance` with the sky's sum along `dir` already taken.
+fn environment_radiance_of(dir: vec3<f32>, sky: vec3<f32>) -> vec3<f32> {{
     // The ground term is the SAME for every fragment in the frame -- it depends
     // only on the sky. Evaluating nine harmonics per pixel to recompute a
     // constant was pure waste on a fill-bound GPU, so the CPU works it out once
@@ -5652,10 +5723,9 @@ fn shade_material_env_part(
     let env = env_baked * contact;
     let occ = clamp(ao, 0.0, 1.0) * clamp(sky_vis, 0.0, 1.0) * contact;
     // Two accumulators from here on: what the surface's colour tints, and what
-    // it does not.
-    // Only where the baked sky visibility is not exactly 0 -- most of an
-    // interior -- is the sky's nine-term sum worth computing; elsewhere it is
-    // multiplied by that 0. The same below for its reflection.
+    // it does not. The first starts as the sky along the normal -- only where
+    // the baked sky visibility is not exactly 0, most of an interior being
+    // multiplied by that 0. Its reflection is taken below.
     var diffuse = vec3<f32>(0.0);
     if (occ > 0.0) {{
         diffuse = sky_irradiance(n) * occ;
@@ -5761,6 +5831,13 @@ fn shade_material_env_part(
     if (!PROBE_ENV_FROM_PASS) {{
         probe = capsule_reflection(world_pos, refl, roughness, env, probe);
     }}
+    // THE SKY ALONG THE MIRROR DIRECTION, for its reflection -- its nine-term
+    // sum written out here and at the diffuse above. Builds 118-119 walked one
+    // copy over a two-bit mask instead, the two copies being a reader's
+    // largest repeated code (`shader_inlining`), and that form was slower in
+    // every view priced against this one in one session -- outdoors 0.10-0.21
+    // ms, halls 0.07, the torch doorway 0.1 (build 120, 2026-10-06; it is
+    // `READER_EDITS`' `sky_walked`).
     var sky_reflection = vec3<f32>(0.0);
     if (occ > 0.0) {{
         sky_reflection = environment_radiance(refl) * occ;
@@ -6183,16 +6260,47 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
         // carried through them.
         var shadow = stationary_visibility_of(l.position.w);
         if (!SKY_SUN_NEVER_REACHES && l.params.z > 1.5) {{
-            shadow = sun_visibility(l, world_pos);
+            shadow = sun_level_visibility(world_pos);
         }}
         // Its spot slot, which draws everything; else, for a lamp lighting
         // the player most, its tile of the characters alone
-        // (`character_shadow`).
+        // (`character_shadow`); else, for the sky's sun, the moving things
+        // round the player (`sun_visibility`).
+        //
+        // ONE TRANSFORM AND ONE KERNEL A MAP KIND, at one place. No lamp
+        // reads two maps -- spot slots go to spots alone -- and every map is a
+        // row of `camera.moving_view_proj`, so the branches only choose the
+        // row: one copy of `shadow_coords` carries the point into it, where
+        // each read at its own call was a copy of its own. A characters' tile
+        // and the sun's moving things are the same kernel on the same atlas,
+        // read by one copy too (2026-10-06).
         let layer = i32(l.params.w);
+        var map = -1;
+        var tile = 0.0;
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
-            shadow = shadow * pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]);
+            map = 1 + layer;
         }} else if (l.params.z < 1.5) {{
-            shadow = shadow * character_shadow(i, world_pos);
+            let k = character_shadow_tile(i);
+            if (k >= 0) {{
+                map = CHARACTER_MAPS + k;
+                tile = f32(1 + k);
+            }}
+        }} else if (!SKY_SUN_NEVER_REACHES && shadow > 0.0 && l.position.w > 0.5 && camera.shadow_params.z > 0.5) {{
+            map = SUN_MOVING_MAP;
+        }}
+        if (map >= 0) {{
+            let c = shadow_coords(world_pos, camera.moving_view_proj[map]);
+            if (c.w >= 0.5) {{
+                if (SPOT_SHADOWS && map > SUN_MOVING_MAP && map < CHARACTER_MAPS) {{
+                    shadow = shadow * pcf_layer_at(spot_shadow_tex, layer, c.xyz);
+                }} else {{
+                    var at = vec4<f32>(c.xyz, tile);
+                    if (!SKY_SUN_NEVER_REACHES && map == SUN_MOVING_MAP) {{
+                        at = sun_moving_tile_at(c.xyz);
+                    }}
+                    shadow = shadow * pcf_tile_at(sun_dynamic_shadow_tex, vec2<f32>(at.w, 0.0), SUN_ATLAS_GRID, at.xyz);
+                }}
+            }}
         }}
         // NO CAPSULE SHADOWS HERE. They were a capsule loop inside this lamp
         // loop -- 1,100 of the scene shader's 3,600 instructions -- and cost
@@ -6297,7 +6405,7 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
         // test, which by construction could only ever be true for one lamp.
         let layer = i32(l.params.w);
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
-            c = c * hf(pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]));
+            c = c * hf(pcf_layer(spot_shadow_tex, layer, world_pos, spot_view_proj(layer)));
         }} else if (l.params.z < 1.5) {{
             // The characters' shadows: see the brushes' loop.
             c = c * hf(character_shadow(i, world_pos));
@@ -7273,7 +7381,7 @@ mod shadow_skip_tests {
         let guard = code[env..]
             .find("if (max(max(c.diffuse.r + c.specular.r, c.diffuse.g + c.specular.g), c.diffuse.b + c.specular.b) <= 0.0) {")
             .expect("the material path shadow-tests lights that contribute nothing");
-        let kernel = code[env..].find("pcf_layer(spot_shadow_tex").expect("the spot shadow test is gone");
+        let kernel = code[env..].find("shadow_coords(world_pos, camera.moving_view_proj[map])").expect("the shadow test is gone");
         assert!(guard < kernel, "the guard runs after the shadow kernel it should skip");
 
         let sky = code.find("fn shade_with_sky(").expect("shade_with_sky is gone");
@@ -9372,9 +9480,14 @@ mod spot_edge_gpu_tests {
     /// The cone at each `(point, toward the eye, the wall's normal, footprint)`:
     /// the lamp at the origin aimed along +x, run on the GPU through the
     /// shipped functions -- with the pixel's mean along its long step
-    /// (`SPOT_EDGE_AVERAGE`), or without it, the cone as it was before.
-    fn cone(at: &[(Vec3, Vec3, Vec3, f32)], average: bool) -> Option<Vec<f32>> {
+    /// (`SPOT_EDGE_AVERAGE`), or without it, the cone as it was before. With
+    /// `plane`, the long step from that plane (`long_step_from_plane`), as the
+    /// brushes and the ground take it, whatever the normal shaded with.
+    fn cone(at: &[(Vec3, Vec3, Vec3, f32)], average: bool, plane: Option<Vec3>) -> Option<Vec<f32>> {
         let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let options = super::LightsBlockOptions { long_step_from_plane: plane.is_some(), ..Default::default() };
+        let block = super::wgsl_lights_block_with(0, 1, options);
+        let set_plane = plane.map_or(String::new(), |p| format!("    set_pixel_long_step(vec3<f32>({:?}, {:?}, {:?}), view);\n", p.x, p.y, p.z));
         let code = format!(
             "{}\n
 @group(1) @binding(0) var<storage, read> q: array<vec4<f32>>;
@@ -9385,7 +9498,7 @@ fn edge_main(@builtin(global_invocation_id) id: vec3<u32>) {{
     let view = q[id.x * 3u + 1u].xyz;
     let n = q[id.x * 3u + 2u].xyz;
     pixel_footprint = q[id.x * 3u].w;
-    let dist = length(p);
+{}    let dist = length(p);
     let l_dir = -p / dist;
     let d = vec3<f32>(1.0, 0.0, 0.0);
     let cos_angle = dot(-l_dir, d);
@@ -9393,10 +9506,11 @@ fn edge_main(@builtin(global_invocation_id) id: vec3<u32>) {{
 }}
 ",
             if average {
-                super::wgsl_lights_block(0, 1)
+                block
             } else {
-                super::wgsl_lights_block(0, 1).replacen("const SPOT_EDGE_AVERAGE: bool = true;", "const SPOT_EDGE_AVERAGE: bool = false;", 1)
+                block.replacen("const SPOT_EDGE_AVERAGE: bool = true;", "const SPOT_EDGE_AVERAGE: bool = false;", 1)
             },
+            set_plane,
             OUTER_DEG.to_radians().cos(),
             INNER_DEG.to_radians().cos(),
         );
@@ -9491,7 +9605,7 @@ fn edge_main(@builtin(global_invocation_id) id: vec3<u32>) {{
         for p in &along {
             q.push((*p, -wall_n, wall_n, UP)); // head-on
         }
-        let (Some(now_all), Some(was_all)) = (cone(&q, true), cone(&q, false)) else {
+        let (Some(now_all), Some(was_all)) = (cone(&q, true, None), cone(&q, false, None)) else {
             eprintln!("no GPU adapter; skipping");
             return;
         };
@@ -9533,6 +9647,52 @@ fn edge_main(@builtin(global_invocation_id) id: vec3<u32>) {{
         );
         assert!(largest(&up_now, &up_was) < 1e-5, "the pool changed up the wall, where the pixel is short");
         assert!(largest(&head_now, &head_was) < 1e-5, "a pool seen head-on changed");
+    }
+
+    /// A BUMP TURNED EDGE-ON TO THE EYE PULLS NO LIGHT PAST THE POOL. Where the
+    /// shader knows the surface's own plane (`long_step_from_plane`), the
+    /// pixel's long step is the patch of that plane it covers, whatever the
+    /// normal map says. Taken from a bump's normal nearly square to the eye's
+    /// line, the step stretched up to 32 times, and pixels just past the
+    /// pool's edge took a share of its light: the white specks past the
+    /// sconces' pools on the stone ceiling (headset, 2026-10-06). A flat
+    /// pixel's cone is exactly what it was, seen square or edge-on.
+    #[test]
+    fn a_bump_turned_edge_on_pulls_no_light_past_the_pool() {
+        let wall_n = Vec3::NEG_X;
+        // The wall seen square from 3 m, a pixel 2 cm across; the bump's
+        // normal tipped all but square to the eye's line.
+        let (square, footprint) = (Vec3::NEG_X, 0.02);
+        let bump = Vec3::new(-0.0005, 1.0, 0.0).normalize();
+        // Just past the pool's edge: 17.3 to 19.4 degrees off the beam,
+        // outside its 17.
+        let past: Vec<Vec3> = (0..=35).map(|i| Vec3::new(WALL, 0.0, 0.265 + i as f32 * 0.001)).collect();
+        let bumpy: Vec<_> = past.iter().map(|&p| (p, square, bump, footprint)).collect();
+        // Flat, square and edge-on (`an_edge_on_pool_is_averaged_along_the_long_step_alone`'s
+        // eye), across the whole soft edge.
+        let grazing = Vec3::new(-1.5, 0.0, 15.8).normalize();
+        let flat: Vec<_> = (0..=300)
+            .map(|i| Vec3::new(WALL, 0.0, 0.05 + i as f32 * 0.001))
+            .flat_map(|p| [(p, square, wall_n, footprint), (p, grazing, wall_n, (ALONG * UP).sqrt())])
+            .collect();
+        let (Some(from_bump), Some(from_plane), Some(flat_was), Some(flat_now)) =
+            (cone(&bumpy, true, None), cone(&bumpy, true, Some(wall_n)), cone(&flat, true, None), cone(&flat, true, Some(wall_n)))
+        else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let most = |v: &[f32]| v.iter().cloned().fold(0.0f32, f32::max);
+        let largest = flat_was.iter().zip(&flat_now).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!(
+            "PAST THE POOL: a bump's step lights it up to {:.3}, the plane's {:.2e}; a flat pixel's cone moves {largest:.2e} (lit {:.3} at most)",
+            most(&from_bump),
+            most(&from_plane),
+            most(&flat_was),
+        );
+        assert!(most(&from_bump) > 0.1, "the test no longer reproduces the specks: {}", most(&from_bump));
+        assert!(most(&from_plane) < 1e-6, "a bump still pulls light past the pool: {}", most(&from_plane));
+        assert!(most(&flat_was) > 0.9, "the flat row does not cross the pool's edge: {}", most(&flat_was));
+        assert!(largest < 1e-6, "a flat pixel's cone changed by {largest}");
     }
 }
 

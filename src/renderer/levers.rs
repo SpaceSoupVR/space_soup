@@ -260,6 +260,19 @@ pub struct Levers {
     /// `probe_fixup::FIXUP_CUTS` (e.g. `fixup_cut_rims`) -- what each kind of
     /// record costs. Lossy: the cut lookups are not made.
     pub fixup_cut: Option<String>,
+    /// MEASUREMENT: the ground drawn by its full reader everywhere, with no
+    /// twin (`full`), or as it was before its layer reads became one loop
+    /// (`inlined`: reader and probe pass, no twin). The same picture as the
+    /// shipped readers. See `TerrainPipeline::new_probe_reader_twins`.
+    pub terrain_reader: Option<String>,
+    /// MEASUREMENT: every scene reader -- the brushes' sun classes, their
+    /// spotless twins, the ground's four -- rebuilt with one of
+    /// `brush_pipeline::READER_EDITS` (e.g. `sky_walked`) and drawn in
+    /// place of the shipped ones, chosen per frame and per face as they are.
+    /// Two forms of one piece of reader code, priced against each other in
+    /// one session in the configuration that ships; `reader_edit_none` is
+    /// the control, rebuilt unedited. The same picture as the shipped readers.
+    pub reader_edit: Option<String>,
     /// MEASUREMENT: block on the GPU at the end of every frame, as the
     /// renderer used to. Its wait is then exactly the GPU's time, which is
     /// what the A/B schedule attributes costs with; shipped, the CPU prepares
@@ -333,6 +346,8 @@ impl Default for Levers {
             pass_cut: None,
             scene_cut: None,
             fixup_cut: None,
+            terrain_reader: None,
+            reader_edit: None,
             gpu_sync: false,
             ssr: None,
             multiview: None,
@@ -486,6 +501,12 @@ impl Levers {
         }
         if let Some(cut) = &self.fixup_cut {
             out.push(format!("fixup_cut={cut}"));
+        }
+        if let Some(reader) = &self.terrain_reader {
+            out.push(format!("terrain_reader={reader}"));
+        }
+        if let Some(edit) = &self.reader_edit {
+            out.push(format!("reader_edit={edit}"));
         }
         if let Some(b) = &self.bench {
             out.push(format!("bench={}", b.name));

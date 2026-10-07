@@ -1768,23 +1768,27 @@ impl XrRenderer {
             // and `probe_pass_runs`.
             let probe_pass = self.probe_pass_runs(&fx, stereo, brush_buffers.is_some());
             // Its pipelines and target: this eye's, or both eyes' at once.
+            // MEASUREMENT: under `reader_edit`, the edited readers in the
+            // shipped ones' places, chosen the same way.
+            let edited = self.reader_edits.as_ref().map(|(_, brushes, _)| brushes);
             let (probe_pipeline, probe_reader, probe_sun_readers, probe_target) = match (&self.stereo_probe, stereo) {
                 (Some(sp), true) => (&sp.pass, &sp.reader, Some([&sp.reader_sunless, &sp.reader_baked]), &sp.target),
                 // No spot casting: the spotless twins. See `spotless_frame`.
                 _ if self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed) && self.scene_cut_pipeline.is_none() => (
                     &self.brush_probe_pass_pipeline,
-                    &self.spotless_readers[0],
-                    Some([&self.spotless_readers[1], &self.spotless_readers[2]]),
+                    edited.map_or(&self.spotless_readers[0], |e| &e[3]),
+                    Some(edited.map_or([&self.spotless_readers[1], &self.spotless_readers[2]], |e| [&e[4], &e[5]])),
                     &self.probe_pass_targets[eye],
                 ),
                 _ => (
                     &self.brush_probe_pass_pipeline,
                     // MEASUREMENT: the `scene_cut` lever's reader in its place,
                     // for every brush.
-                    self.scene_cut_pipeline.as_ref().map_or(&self.brush_probe_reader_pipeline, |(_, p)| p),
-                    self.scene_cut_pipeline
-                        .is_none()
-                        .then_some([&self.brush_probe_reader_sunless_pipeline, &self.brush_probe_reader_baked_pipeline]),
+                    self.scene_cut_pipeline.as_ref().map_or(edited.map_or(&self.brush_probe_reader_pipeline, |e| &e[0]), |(_, p)| p),
+                    self.scene_cut_pipeline.is_none().then_some(edited.map_or(
+                        [&self.brush_probe_reader_sunless_pipeline, &self.brush_probe_reader_baked_pipeline],
+                        |e| [&e[1], &e[2]],
+                    )),
                     &self.probe_pass_targets[eye],
                 ),
             };
@@ -1992,11 +1996,14 @@ impl XrRenderer {
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..*count, 0, 0..1);
                         if let (true, Some((index_start, count))) = (terrain_in_probe_pass, terrain_range) {
-                            // MEASUREMENT: the `pass_cut` lever's ground in its place.
-                            let terrain = match &self.terrain_cut_pipeline {
-                                Some((_, p)) => p,
-                                None if poolless => &self.terrain_probe_pass_poolless_pipeline,
-                                None => &self.terrain_probe_pass_pipeline,
+                            // MEASUREMENT: the `pass_cut` lever's ground in its
+                            // place, or the `terrain_reader` lever's inlined one.
+                            let terrain = match (&self.terrain_cut_pipeline, &self.terrain_inlined) {
+                                (Some((_, p)), _) => p,
+                                (None, Some([_, _, pass])) if poolless => pass,
+                                (None, Some([_, pass, _])) => pass,
+                                (None, None) if poolless => &self.terrain_probe_pass_poolless_pipeline,
+                                (None, None) => &self.terrain_probe_pass_pipeline,
                             };
                             pass.set_pipeline(&terrain.pipeline);
                             pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
@@ -2222,7 +2229,8 @@ impl XrRenderer {
                     }
                     if let Some((index_start, count)) = terrain_range {
                         if terrain_in_probe_pass {
-                            pass.set_pipeline(&self.terrain_probe_reader_pipeline.pipeline);
+                            // Its twin for this frame. See `terrain_reader`.
+                            pass.set_pipeline(&self.terrain_reader().pipeline);
                             pass.set_bind_group(3, probe_read_group, &[]);
                         } else {
                             pass.set_pipeline(self.sp_terrain(stereo));
