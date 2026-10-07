@@ -162,6 +162,153 @@ impl TerrainPipeline {
         )
     }
 
+    /// The ground reader's TWINS, as the brushes' readers have theirs, in the
+    /// order `[spotless, baked, baked_spotless]`, for the frames and levels
+    /// where each is the same picture:
+    /// - SPOTLESS (`lights::without_spot_shadows`) for frames where no spot
+    ///   casts -- the frames the brushes draw with theirs
+    ///   (`XrRenderer::spotless_frame`);
+    /// - BAKED (`SUN_MASK_EVERYWHERE`, as `brush_pipeline::FaceSun::Baked`)
+    ///   for a level whose ground map carries a baked sun over every texel
+    ///   ([`TerrainImage::sun_baked_everywhere`]): its `receiver_sun_mask` is
+    ///   then never the -1 of "no bake", and the level's static sun map is
+    ///   never read.
+    /// 2026-10-06: the reader alone was 4,292 instructions, past the Quest's
+    /// instruction cache in every outdoor view, and had no twin at all.
+    pub fn new_probe_reader_twins(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+    ) -> [Self; 3] {
+        [(true, false), (false, true), (true, true)].map(|(spotless, sun_baked)| {
+            Self::new_probe_reader_twin(device, format, uniform_layout, samples, probe_layout, spotless, sun_baked)
+        })
+    }
+
+    /// MEASUREMENT: the ground's scene readers with one of
+    /// `brush_pipeline::READER_EDITS`: the full reader, then
+    /// [`Self::new_probe_reader_twins`]' order. `None` when `edit` names no
+    /// entry or one of its edits no longer matches. `Levers::reader_edit`;
+    /// `edit@class` as the brushes take it (the ground has no `sunless`).
+    pub fn new_edited_probe_readers(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        edit: &str,
+    ) -> Option<[Self; 4]> {
+        let (edit, only) = edit.split_once('@').map_or((edit, None), |(e, c)| (e, Some(c)));
+        let shipped = terrain_shader_for(TerrainRole::Read);
+        let edited = crate::renderer::brush_pipeline::with_reader_edit(shipped.clone(), edit)?;
+        let class = |name: &str| if only.map_or(true, |c| c == name) { edited.clone() } else { shipped.clone() };
+        let baked = |s: String| crate::renderer::brush_pipeline::sun_reader_shader(s, crate::renderer::brush_pipeline::FaceSun::Baked);
+        let spotless = crate::renderer::lights::without_spot_shadows;
+        let build = |source: String, label: &str| {
+            Self::build_from(
+                device,
+                format,
+                uniform_layout,
+                samples,
+                crate::renderer::multiview::ViewMode::Mono,
+                TerrainRole::Read,
+                Some(probe_layout),
+                source,
+                label,
+            )
+        };
+        Some([
+            build(class("full"), "terrain_pipeline_read_edited"),
+            build(spotless(class("full")), "terrain_pipeline_read_spotless_edited"),
+            build(baked(class("baked")), "terrain_pipeline_read_baked_edited"),
+            build(spotless(baked(class("baked"))), "terrain_pipeline_read_baked_spotless_edited"),
+        ])
+    }
+
+    /// One of [`Self::new_probe_reader_twins`]: the ground's reader without
+    /// the spots' shadows when `spotless`, without the static sun map's
+    /// lookup when `sun_baked`; with neither, the full reader.
+    pub fn new_probe_reader_twin(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        spotless: bool,
+        sun_baked: bool,
+    ) -> Self {
+        let mut source = terrain_shader_for(TerrainRole::Read);
+        if sun_baked {
+            source = crate::renderer::brush_pipeline::sun_reader_shader(source, crate::renderer::brush_pipeline::FaceSun::Baked);
+        }
+        if spotless {
+            source = crate::renderer::lights::without_spot_shadows(source);
+        }
+        let label = match (spotless, sun_baked) {
+            (false, false) => "terrain_pipeline_read",
+            (true, false) => "terrain_pipeline_read_spotless",
+            (false, true) => "terrain_pipeline_read_baked",
+            (true, true) => "terrain_pipeline_read_baked_spotless",
+        };
+        Self::build_from(
+            device,
+            format,
+            uniform_layout,
+            samples,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::Read,
+            Some(probe_layout),
+            source,
+            label,
+        )
+    }
+
+    /// MEASUREMENT: the ground's reader, its probe pass and that pass's
+    /// poolless twin, in that order, with the layer reads inlined per layer as
+    /// they were before the loop ([`with_inlined_layer_reads`]) -- drawn in the
+    /// shipped ones' place, and without the reader's twins, while
+    /// `Levers::terrain_reader` is `inlined`.
+    pub fn new_inlined(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+    ) -> [Self; 3] {
+        let pass = with_inlined_layer_reads(terrain_shader_for(TerrainRole::ProbePass));
+        let in_pass = |source: String, label: &str| {
+            Self::build_from(
+                device,
+                crate::renderer::brush_pipeline::probe_pass::FORMAT,
+                uniform_layout,
+                1,
+                crate::renderer::multiview::ViewMode::Mono,
+                TerrainRole::ProbePass,
+                Some(fixups.pass_layout()),
+                source,
+                label,
+            )
+        };
+        [
+            Self::build_from(
+                device,
+                format,
+                uniform_layout,
+                samples,
+                crate::renderer::multiview::ViewMode::Mono,
+                TerrainRole::Read,
+                Some(probe_layout),
+                with_inlined_layer_reads(terrain_shader_for(TerrainRole::Read)),
+                "terrain_pipeline_read_inlined",
+            ),
+            in_pass(pass.clone(), "terrain_probe_pass_inlined"),
+            in_pass(crate::renderer::lights::without_pool_maps(pass), "terrain_probe_pass_poolless_inlined"),
+        ]
+    }
+
     /// THE GROUND IN THE HALF-RESOLUTION PROBE PASS: its probe reflection and
     /// nothing else, with the secondary lookups left to `fixups`, exactly as the
     /// brushes' pass does. See `brush_pipeline::probe_pass` and `probe_fixup`.
@@ -386,16 +533,34 @@ const PROBE_PASS_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
         "terrain_cut_relight",
         &[(crate::renderer::lights::SURFACE_RELIT_READ, ""), (crate::renderer::lights::SURFACE_RELIT_CALL, "")],
     ),
+    // The repeated code written once, as for the brushes' pass: the same
+    // picture. See `brush_pipeline::DEDUP_EDITS`.
+    ("terrain_cut_dedup_all", crate::renderer::brush_pipeline::DEDUP_EDITS),
+    // ... which took this pass 24 -> 26 registers (build 120): each of the
+    // three alone, to find which.
+    ("terrain_cut_dedup_sky", &[crate::renderer::brush_pipeline::DEDUP_OUTDOOR_SKY]),
+    ("terrain_cut_dedup_portals", &[crate::renderer::brush_pipeline::DEDUP_PORTAL_SAMPLES]),
+    ("terrain_cut_dedup_near_far", &[crate::renderer::brush_pipeline::DEDUP_NEAR_FAR]),
+    // The two that left it at 24, together (build 122).
+    (
+        "terrain_cut_dedup_sky_near_far",
+        &[crate::renderer::brush_pipeline::DEDUP_OUTDOOR_SKY, crate::renderer::brush_pipeline::DEDUP_NEAR_FAR],
+    ),
+    // No escape colour: what the dedup's sky rewrite reaches on the ground.
+    // Not the same picture.
+    ("terrain_cut_escape_colour", &[("    if (h.escaped) {\n        col = probe_escape_colour(", "    if (false) {\n        col = probe_escape_colour(")]),
 ];
 
 /// The lights block as the ground takes it: with `options`, testing each
 /// lamp's range before its baked mask -- out of range is what the building's
-/// lamps are from nearly all the ground. See `CULL_RANGE_FIRST`.
+/// lamps are from nearly all the ground. See `CULL_RANGE_FIRST`. And a spot's
+/// edge averaged over the ground's own slope, not its layers' bumps: see
+/// `spot_long_step`.
 fn terrain_lights_block(options: crate::renderer::lights::LightsBlockOptions) -> String {
     crate::renderer::lights::wgsl_lights_block_with(
         0,
         1,
-        crate::renderer::lights::LightsBlockOptions { cull_range_first: true, ..options },
+        crate::renderer::lights::LightsBlockOptions { cull_range_first: true, long_step_from_plane: true, ..options },
     )
 }
 
@@ -885,6 +1050,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     let step_y = dpdy(in.world_pos);
     pixel_footprint = sqrt(length(step_x) * length(step_y));
     let n = normalize(in.normal);
+    set_pixel_long_step(n, normalize(cam_pos() - in.world_pos));
 
     // Slope straight from the normal: no derivative, no extra sampling.
     let slope_deg = degrees(acos(clamp(n.y, -1.0, 1.0)));
@@ -900,11 +1066,6 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // projections at every quarter turn (headset `outdoors_front-y90`,
     // 2026-10-01, the far bank).
     let f = sample_frame(in.tex_pos, to_world_direction(n), slope_deg);
-    var albedo = vec3<f32>(0.0);
-    if (w.x > WEIGHT_EPS) {{ albedo = albedo + layer_colour_at(0, f) * w.x; }}
-    if (w.y > WEIGHT_EPS) {{ albedo = albedo + layer_colour_at(1, f) * w.y; }}
-    if (w.z > WEIGHT_EPS) {{ albedo = albedo + layer_colour_at(2, f) * w.z; }}
-    if (w.w > WEIGHT_EPS) {{ albedo = albedo + layer_colour_at(3, f) * w.w; }}
 
     // Blend the layers' normals by the same weights, then renormalise. Summing
     // unit vectors shortens the result wherever they disagree, and a shortened
@@ -918,14 +1079,6 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // field skips the samples and the blend, and loses nothing it could show.
     let detail_far = camera.post_params.z;
     let detail = select(1.0, 1.0 - smoothstep(detail_far, detail_far + TERRAIN_DETAIL_FADE, distance(in.world_pos, cam_pos())), detail_far > 0.0);
-    var shaded_n = vec3<f32>(0.0);
-    if (detail > 0.0) {{
-        if (w.x > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(0, n, f) * w.x; }}
-        if (w.y > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(1, n, f) * w.y; }}
-        if (w.z > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(2, n, f) * w.z; }}
-        if (w.w > WEIGHT_EPS) {{ shaded_n = shaded_n + layer_normal_at(3, n, f) * w.w; }}
-        shaded_n = mix(n, shaded_n, detail);
-    }}
 
     // HOW MUCH DETAIL WAS AVERAGED AWAY, read before renormalising.
     //
@@ -946,13 +1099,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // `roughness_chain_with_normal_variance` at load, per level, exactly as
     // brush materials get it. Adding a runtime term for it here as well would
     // count the same variance twice and over-roughen distant ground.
-    var rough_map = 0.0;
-    var ao_map = 0.0;
-    if (w.x > WEIGHT_EPS) {{ rough_map = rough_map + layer_rough_at(0, f) * w.x; ao_map = ao_map + layer_ao_at(0, f) * w.x; }}
-    if (w.y > WEIGHT_EPS) {{ rough_map = rough_map + layer_rough_at(1, f) * w.y; ao_map = ao_map + layer_ao_at(1, f) * w.y; }}
-    if (w.z > WEIGHT_EPS) {{ rough_map = rough_map + layer_rough_at(2, f) * w.z; ao_map = ao_map + layer_ao_at(2, f) * w.z; }}
-    if (w.w > WEIGHT_EPS) {{ rough_map = rough_map + layer_rough_at(3, f) * w.w; ao_map = ao_map + layer_ao_at(3, f) * w.w; }}
-
+{layer_reads}
     shaded_n = normalize(select(n, shaded_n, length(shaded_n) > 0.0001));
 
     // What the MIPS could not see: the geometric normal's own variation across
@@ -1046,7 +1193,79 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
         stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
         biplanar_block = wgsl_biplanar_block(),
         whiteout_block = wgsl_whiteout_block(),
+        layer_reads = LAYER_READS,
     )
+}
+
+/// THE GROUND'S LAYER READS -- each contributing layer's colour, normal,
+/// roughness and occlusion, summed by its weight -- as `fs_main` takes them,
+/// after the weights `w`, the sampling frame `f` and the normals' fade
+/// `detail`.
+///
+/// ONE COPY OF EACH READ, walked over the layers that contribute. They were
+/// twelve inlined copies -- colour, normal, and roughness with occlusion, for
+/// each of the four layers ([`LAYER_READS_INLINED`]) -- and the scene's ground
+/// reader came to 4,292 instructions, past what the Quest's instruction cache
+/// holds (PIPESTATS, 2026-10-06; the brushes' readers draw a third slower past
+/// about 3,390). The same reads in the same order: the mask is walked lowest
+/// bit first, so every sum still adds layer 0 first and layer 3 last. Walked as
+/// a mask rather than counted, as the lamps are (`surface_lights`), and each
+/// weight picked by `select` rather than by indexing `w` at a runtime index,
+/// which Adreno can keep in scratch memory.
+const LAYER_READS: &str = "    var albedo = vec3<f32>(0.0);
+    var shaded_n = vec3<f32>(0.0);
+    var rough_map = 0.0;
+    var ao_map = 0.0;
+    var layers_left = select(0u, 1u, w.x > WEIGHT_EPS) | select(0u, 2u, w.y > WEIGHT_EPS)
+        | select(0u, 4u, w.z > WEIGHT_EPS) | select(0u, 8u, w.w > WEIGHT_EPS);
+    loop {
+        if (layers_left == 0u) {
+            break;
+        }
+        let layer = i32(countTrailingZeros(layers_left));
+        layers_left = layers_left & (layers_left - 1u);
+        let lw = select(select(select(w.x, w.y, layer == 1), w.z, layer == 2), w.w, layer == 3);
+        albedo = albedo + layer_colour_at(layer, f) * lw;
+        if (detail > 0.0) {
+            shaded_n = shaded_n + layer_normal_at(layer, n, f) * lw;
+        }
+        rough_map = rough_map + layer_rough_at(layer, f) * lw;
+        ao_map = ao_map + layer_ao_at(layer, f) * lw;
+    }
+    if (detail > 0.0) {
+        shaded_n = mix(n, shaded_n, detail);
+    }
+";
+
+/// MEASUREMENT: [`LAYER_READS`] as they were before the loop, each read
+/// inlined for each layer, to draw against it in one build
+/// (`Levers::terrain_reader`, `inlined`). The same picture.
+const LAYER_READS_INLINED: &str = "    var albedo = vec3<f32>(0.0);
+    if (w.x > WEIGHT_EPS) { albedo = albedo + layer_colour_at(0, f) * w.x; }
+    if (w.y > WEIGHT_EPS) { albedo = albedo + layer_colour_at(1, f) * w.y; }
+    if (w.z > WEIGHT_EPS) { albedo = albedo + layer_colour_at(2, f) * w.z; }
+    if (w.w > WEIGHT_EPS) { albedo = albedo + layer_colour_at(3, f) * w.w; }
+    var shaded_n = vec3<f32>(0.0);
+    if (detail > 0.0) {
+        if (w.x > WEIGHT_EPS) { shaded_n = shaded_n + layer_normal_at(0, n, f) * w.x; }
+        if (w.y > WEIGHT_EPS) { shaded_n = shaded_n + layer_normal_at(1, n, f) * w.y; }
+        if (w.z > WEIGHT_EPS) { shaded_n = shaded_n + layer_normal_at(2, n, f) * w.z; }
+        if (w.w > WEIGHT_EPS) { shaded_n = shaded_n + layer_normal_at(3, n, f) * w.w; }
+        shaded_n = mix(n, shaded_n, detail);
+    }
+    var rough_map = 0.0;
+    var ao_map = 0.0;
+    if (w.x > WEIGHT_EPS) { rough_map = rough_map + layer_rough_at(0, f) * w.x; ao_map = ao_map + layer_ao_at(0, f) * w.x; }
+    if (w.y > WEIGHT_EPS) { rough_map = rough_map + layer_rough_at(1, f) * w.y; ao_map = ao_map + layer_ao_at(1, f) * w.y; }
+    if (w.z > WEIGHT_EPS) { rough_map = rough_map + layer_rough_at(2, f) * w.z; ao_map = ao_map + layer_ao_at(2, f) * w.z; }
+    if (w.w > WEIGHT_EPS) { rough_map = rough_map + layer_rough_at(3, f) * w.w; ao_map = ao_map + layer_ao_at(3, f) * w.w; }
+";
+
+/// MEASUREMENT: a ground shader's `src` with its layer reads inlined per
+/// layer, as they were before the loop. See [`LAYER_READS_INLINED`].
+pub fn with_inlined_layer_reads(src: String) -> String {
+    assert_eq!(src.matches(LAYER_READS).count(), 1, "the ground shader's layer reads moved");
+    src.replacen(LAYER_READS, LAYER_READS_INLINED, 1)
 }
 
 #[cfg(test)]
@@ -1410,12 +1629,21 @@ pub(crate) mod tests {
     #[test]
     fn the_probe_pass_terrain_shaders_validate_and_build() {
         use wgpu::naga;
-        // The pass's poolless twin too, for frames no torch lights.
+        // The pass's poolless twin too, for frames no torch lights; the
+        // reader's twins; and the measurement's inlined reads in both.
         let poolless = crate::renderer::lights::without_pool_maps(terrain_shader_for(TerrainRole::ProbePass));
+        let read = terrain_shader_for(TerrainRole::Read);
+        let baked = crate::renderer::brush_pipeline::sun_reader_shader(read.clone(), crate::renderer::brush_pipeline::FaceSun::Baked);
+        let spotless = crate::renderer::lights::without_spot_shadows;
         for (role, src) in [
-            ("read", terrain_shader_for(TerrainRole::Read)),
+            ("read", read.clone()),
             ("pass", terrain_shader_for(TerrainRole::ProbePass)),
             ("poolless pass", poolless),
+            ("spotless read", spotless(read.clone())),
+            ("baked read", baked.clone()),
+            ("baked spotless read", spotless(baked)),
+            ("inlined read", with_inlined_layer_reads(read)),
+            ("inlined pass", with_inlined_layer_reads(terrain_shader_for(TerrainRole::ProbePass))),
         ] {
             let module = naga::front::wgsl::parse_str(&src)
                 .unwrap_or_else(|e| panic!("{role}: {}", e.emit_to_string(&src)));
@@ -1438,8 +1666,49 @@ pub(crate) mod tests {
         let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, 1024);
         let _pass = TerrainPipeline::new_probe_pass(&device, &uniforms.layout, &fixups);
         let _poolless = TerrainPipeline::new_probe_pass_poolless(&device, &uniforms.layout, &fixups);
+        let _twins =
+            TerrainPipeline::new_probe_reader_twins(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &probe_layout);
+        let _inlined =
+            TerrainPipeline::new_inlined(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &probe_layout, &fixups);
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "the terrain probe pipelines failed to build: {err:?}");
+    }
+
+    /// Each of the ground reader's twins is the reader with its own switches
+    /// set and nothing else, and the measurement's inlined reads replace the
+    /// loop and nothing else -- so any difference in their pictures is the
+    /// switch's, and any difference in their cost is what they leave out.
+    #[test]
+    fn the_ground_readers_twins_and_inlined_reads_change_only_their_switches() {
+        let read = terrain_shader_for(TerrainRole::Read);
+        let baked = crate::renderer::brush_pipeline::sun_reader_shader(read.clone(), crate::renderer::brush_pipeline::FaceSun::Baked);
+        assert_eq!(baked.replacen("const SUN_MASK_EVERYWHERE: bool = true;", "const SUN_MASK_EVERYWHERE: bool = false;", 1), read);
+        let spotless = crate::renderer::lights::without_spot_shadows(read.clone());
+        assert_ne!(spotless, read, "the spotless twin switched nothing off");
+        let inlined = with_inlined_layer_reads(read.clone());
+        assert_eq!(inlined.replacen(LAYER_READS_INLINED, LAYER_READS, 1), read);
+        // One copy of each read in the loop; four, one a layer, inlined.
+        for call in ["layer_colour_at(", "layer_normal_at(", "layer_rough_at(", "layer_ao_at("] {
+            let body = |src: &str| src.split("@fragment").nth(1).map_or(0, |entry| entry.matches(call).count());
+            assert_eq!((body(&read), body(&inlined)), (1, 4), "{call}");
+        }
+    }
+
+    /// A ground map is baked everywhere only when every texel is: one texel
+    /// from an older bake (alpha 255) or no map at all keeps the full reader.
+    #[test]
+    fn a_ground_map_is_baked_everywhere_only_when_every_texel_is() {
+        let map = |alphas: &[u8]| TerrainImage {
+            width: alphas.len() as u32,
+            height: 1,
+            rgba: alphas.iter().flat_map(|&a| [200, 128, 0, a]).collect(),
+        };
+        assert!(map(&[0, 0, 0, 0]).sun_baked_everywhere());
+        assert!(map(&[0, 127]).sun_baked_everywhere(), "127 reads as 0.498, under the shader's half");
+        assert!(!map(&[0, 128]).sun_baked_everywhere(), "128 reads as 0.502: not baked there");
+        assert!(!map(&[255]).sun_baked_everywhere());
+        assert!(!FULL_SKY.sun_baked_everywhere(), "no map is no bake");
+        assert!(!TerrainImage { width: 0, height: 0, rgba: Vec::new() }.sun_baked_everywhere());
     }
 
     /// Every register cut of the ground's probe pass still finds its line, and
@@ -1453,6 +1722,8 @@ pub(crate) mod tests {
             let mut src = base.clone();
             for (from, to) in edits.iter() {
                 assert!(src.contains(from), "{label}: `{from}` is not in the ground's probe pass");
+                // Once: the edit is made at the first match.
+                assert_eq!(src.matches(from).count(), 1, "{label}: `{from}` is in the ground's probe pass more than once");
                 src = src.replacen(from, to, 1);
             }
             let module = naga::front::wgsl::parse_str(&src)
@@ -2438,6 +2709,16 @@ impl TerrainImage {
         }
         Some(TerrainImage { width: self.width, height: self.height, rgba })
     }
+
+    /// Whether this GROUND MAP carries a baked sun over every texel: alpha
+    /// under a half everywhere (the bake writes 0; a map from before the sun
+    /// was baked beside the sky is 255). Then every read of it -- any blend of
+    /// texels, at any mip -- is under a half too, `fs_main` never sets
+    /// `receiver_sun_mask` to the -1 of "no bake", and the ground can be drawn
+    /// by its baked reader ([`TerrainPipeline::new_probe_reader_twins`]).
+    pub fn sun_baked_everywhere(&self) -> bool {
+        !self.rgba.is_empty() && self.rgba.chunks_exact(4).all(|texel| texel[3] < 128)
+    }
 }
 
 #[cfg(test)]
@@ -3313,11 +3594,11 @@ mod terrain_material_parity_tests {
         // runtime, or the same variance is counted twice and distant ground
         // goes flat.
         assert!(
-            src.contains("layer_rough_at(0, f)"),
+            src.contains("layer_rough_at(layer, f)"),
             "terrain no longer samples a roughness map",
         );
         assert!(
-            src.contains("layer_ao_at(0, f)"),
+            src.contains("layer_ao_at(layer, f)"),
             "terrain no longer samples an occlusion map",
         );
         assert!(

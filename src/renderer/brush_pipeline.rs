@@ -1463,6 +1463,52 @@ impl BrushPipeline {
         Self::from_source(device, format, uniform_layout, FrontFace::Ccw, samples, None, view, Some(probe_layout), label, source)
     }
 
+    /// MEASUREMENT: the brushes' scene readers with one of [`READER_EDITS`]:
+    /// the full, sunless and baked classes, then their spotless twins -- the
+    /// orders of [`Self::new_multisampled_probe_reader_for`] and
+    /// [`Self::new_spotless_probe_readers`]. `None` when `edit` names no entry
+    /// or one of its edits no longer matches. `Levers::reader_edit`.
+    ///
+    /// `edit@class` (`full`, `sunless` or `baked`) edits that class and its
+    /// spotless twin only, the rest drawn as shipped: one reader at the
+    /// instruction cache's edge priced alone (2026-10-06).
+    pub fn new_edited_probe_readers(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        edit: &str,
+    ) -> Option<[Self; 6]> {
+        let (edit, only) = edit.split_once('@').map_or((edit, None), |(e, c)| (e, Some(c)));
+        let shipped = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+        let edited = with_reader_edit(shipped.clone(), edit)?;
+        let class = |name: &str| if only.map_or(true, |c| c == name) { edited.clone() } else { shipped.clone() };
+        let spotless = crate::renderer::lights::without_spot_shadows;
+        let build = |label: &str, source: String| {
+            Self::from_source(
+                device,
+                format,
+                uniform_layout,
+                FrontFace::Ccw,
+                samples,
+                None,
+                crate::renderer::multiview::ViewMode::Mono,
+                Some(probe_layout),
+                label,
+                source,
+            )
+        };
+        Some([
+            build("brush_pipeline_read_edited", class("full")),
+            build("brush_pipeline_read_sunless_edited", sun_reader_shader(class("sunless"), FaceSun::Never)),
+            build("brush_pipeline_read_baked_edited", sun_reader_shader(class("baked"), FaceSun::Baked)),
+            build("brush_pipeline_read_spotless_edited", spotless(class("full"))),
+            build("brush_pipeline_read_sunless_spotless_edited", spotless(sun_reader_shader(class("sunless"), FaceSun::Never))),
+            build("brush_pipeline_read_baked_spotless_edited", spotless(sun_reader_shader(class("baked"), FaceSun::Baked))),
+        ])
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_variant(
         device: &Device,
@@ -2574,7 +2620,258 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             B2_MISS_CHOICE_AT_HIT, B2_MISS_PORTALS_AT_HIT,
         ],
     ),
+    // B2, THE SECOND ROUND (2026-10-06 evening), all on `def_dir_code_lod`
+    // (25). The capsules lit grey and the mip level late each took one
+    // register off `def_dir_and_code` (26), and were never asked together.
+    // Not the same picture.
+    (
+        "def_dlc_grey",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR_GREY, B2_LIT_GREY, B2_LOD_EARLY,
+            B2_LOD_LATE,
+        ],
+    ),
+    // The surface's position rides through the trace twice: in the world's
+    // frame for the record and a miss, in the player's for the capsules. The
+    // world's made again after it from the player's: the same position, to
+    // the bit.
+    (
+        "def_dlc_pos_late",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_POS_LATE_SET, B2_POS_LATE_RECORD, B2_POS_LATE_CHOICE, B2_POS_LATE_NEAR, B2_POS_LATE_FAR, B2_POS_LATE_PORTALS,
+        ],
+    ),
+    // The capsules' light through the trace in two words, not three: the same
+    // light to f16's rounding.
+    (
+        "def_dlc_lit_half",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_LIT_HALF_DECL, B2_LIT_HALF_SET, B2_LIT_HALF_RECORD, B2_LIT_HALF_CAPSULES,
+        ],
+    ),
+    (
+        "def_dlc_pos_lit_half",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_POS_LATE_SET, B2_POS_LATE_RECORD, B2_POS_LATE_CHOICE, B2_POS_LATE_NEAR, B2_POS_LATE_FAR, B2_POS_LATE_PORTALS,
+            B2_LIT_HALF_DECL, B2_LIT_HALF_SET, B2_LIT_HALF_RECORD, B2_LIT_HALF_CAPSULES,
+        ],
+    ),
+    // Every exact one together: `def_b2_lossless` with both.
+    (
+        "def_b2_all_exact",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_FRAG_DECL, B2_FRAG_SET, B2_FRAG_MIRROR, B2_FRAG_RECORD, B2_POS_LATE_SET, B2_POS_LATE_RECORD, B2_POS_LATE_CHOICE,
+            B2_POS_LATE_NEAR, B2_POS_LATE_FAR, B2_POS_LATE_PORTALS, B2_LIT_HALF_DECL, B2_LIT_HALF_SET, B2_LIT_HALF_RECORD,
+            B2_LIT_HALF_CAPSULES,
+        ],
+    ),
+    (
+        "def_dlc_pos_late_grey",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR_GREY, B2_LIT_GREY, B2_LOD_EARLY,
+            B2_LOD_LATE, B2_POS_LATE_SET, B2_POS_LATE_RECORD, B2_POS_LATE_CHOICE, B2_POS_LATE_NEAR, B2_POS_LATE_FAR,
+            B2_POS_LATE_PORTALS,
+        ],
+    ),
+    // THE TRACE'S OWN WORKING SET, a part at a time on `def_dir_code_lod`:
+    // where the 25 is. None the same picture.
+    (
+        "def_dlc_no_far_rim",
+        &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_NO_FAR_RIM],
+    ),
+    (
+        "def_dlc_no_rims",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_NO_FAR_RIM, B2_NO_NEAR_RIM,
+        ],
+    ),
+    (
+        "def_dlc_no_edges",
+        &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_NO_EDGES],
+    ),
+    (
+        "def_dlc_no_field_walk",
+        &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_NO_FIELD_WALK],
+    ),
+    (
+        "def_dlc_no_proxy_surface",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_NO_PROXY_SURFACE,
+        ],
+    ),
+    (
+        "def_dlc_no_proxies",
+        &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_NO_PROXIES],
+    ),
+    (
+        "def_dlc_no_doorway_start",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_NO_DOORWAY_START,
+        ],
+    ),
+    (
+        "def_dlc_no_portals",
+        &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_NO_PORTALS],
+    ),
+    (
+        "def_dlc_one_hop",
+        &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_ONE_HOP],
+    ),
+    // THE PASS'S REPEATED CODE, each written once (2026-10-06): the pass is
+    // 8,877 instructions, misses the instruction cache on 0.14% of them (the
+    // frame's worst draw) and keeps its ALU 20% busy, so a loop's bookkeeping
+    // is cheap here where a copy is not. Each the same picture, to the byte:
+    // the same calls in the same order. See `shader_inlining`.
+    // The sky behind a building and the sky alone, one lookup.
+    ("def_dedup_sky", &[DEDUP_OUTDOOR_SKY]),
+    // The three photographs read through a doorway (one room, or both
+    // sides'), one read in a loop.
+    ("def_dedup_portals", &[DEDUP_PORTAL_SAMPLES]),
+    // An untraced reflection's two photographs, one read in a loop.
+    ("def_dedup_near_far", &[DEDUP_NEAR_FAR]),
+    ("def_dedup_all", DEDUP_EDITS),
+    // B2, THE THIRD ROUND (2026-10-06 night): the doorway crossing, where the
+    // peak is. Each the same picture, to the bit. On the shipped pass alone,
+    // then on `def_b2_all_exact` (25).
+    ("def_inv_per_use", &[B2_INV_FAR, B2_INV_SIDE, B2_INV_ENTER]),
+    (
+        "def_b2_inv_per_use",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_FRAG_DECL, B2_FRAG_SET, B2_FRAG_MIRROR, B2_FRAG_RECORD, B2_POS_LATE_SET, B2_POS_LATE_RECORD, B2_POS_LATE_CHOICE,
+            B2_POS_LATE_NEAR, B2_POS_LATE_FAR, B2_POS_LATE_PORTALS, B2_LIT_HALF_DECL, B2_LIT_HALF_SET, B2_LIT_HALF_RECORD,
+            B2_LIT_HALF_CAPSULES, B2_INV_FAR, B2_INV_SIDE, B2_INV_ENTER,
+        ],
+    ),
+    (
+        "def_b2_rim_reread",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_FRAG_DECL, B2_FRAG_SET, B2_FRAG_MIRROR, B2_FRAG_RECORD, B2_POS_LATE_SET, B2_POS_LATE_RECORD, B2_POS_LATE_CHOICE,
+            B2_POS_LATE_NEAR, B2_POS_LATE_FAR, B2_POS_LATE_PORTALS, B2_LIT_HALF_DECL, B2_LIT_HALF_SET, B2_LIT_HALF_RECORD,
+            B2_LIT_HALF_CAPSULES, B2_RIM_REREAD,
+        ],
+    ),
+    (
+        "def_b2_round3",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_FRAG_DECL, B2_FRAG_SET, B2_FRAG_MIRROR, B2_FRAG_RECORD, B2_POS_LATE_SET, B2_POS_LATE_RECORD, B2_POS_LATE_CHOICE,
+            B2_POS_LATE_NEAR, B2_POS_LATE_FAR, B2_POS_LATE_PORTALS, B2_LIT_HALF_DECL, B2_LIT_HALF_SET, B2_LIT_HALF_RECORD,
+            B2_LIT_HALF_CAPSULES, B2_INV_FAR, B2_INV_SIDE, B2_INV_ENTER, B2_RIM_REREAD,
+        ],
+    ),
+    // B2, THE FOURTH ROUND (build 122): the crossing's depth read asked only
+    // what it is for. On the shipped pass, and on `def_b2_all_exact`. The same
+    // picture.
+    ("def_seen_texel_only", &[B2_SEEN_TEXEL_ONLY]),
+    (
+        "def_b2_seen_texel_only",
+        &[
+            B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE,
+            B2_FRAG_DECL, B2_FRAG_SET, B2_FRAG_MIRROR, B2_FRAG_RECORD, B2_POS_LATE_SET, B2_POS_LATE_RECORD, B2_POS_LATE_CHOICE,
+            B2_POS_LATE_NEAR, B2_POS_LATE_FAR, B2_POS_LATE_PORTALS, B2_LIT_HALF_DECL, B2_LIT_HALF_SET, B2_LIT_HALF_RECORD,
+            B2_LIT_HALF_CAPSULES, B2_SEEN_TEXEL_ONLY,
+        ],
+    ),
+    // ... and the crossing's parts cut, on `def_dir_code_lod`: where its six
+    // registers are. Not the same picture.
+    ("def_dlc_seen_uniform", &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_SEEN_UNIFORM]),
+    ("def_dlc_no_side", &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_NO_SIDE]),
+    // B5 AS IT CAN SHIP TO BOTH PASSES: the sky and the untraced pair, each of
+    // which left the ground at 24 (build 121); not the doorway reads' loop,
+    // which took it to 27.
+    ("def_dedup_sky_near_far", &[DEDUP_OUTDOOR_SKY, DEDUP_NEAR_FAR]),
 ];
+/// `def_dedup_all`'s edits, which the ground's probe pass takes too
+/// (`terrain_cut_dedup_all`).
+pub(crate) const DEDUP_EDITS: &[(&str, &str)] = &[DEDUP_OUTDOOR_SKY, DEDUP_PORTAL_SAMPLES, DEDUP_NEAR_FAR];
+pub(crate) const DEDUP_OUTDOOR_SKY: (&str, &str) = (
+    "    if (b.x >= 0.0) {\n        let c = building_colour(e + d * b.x, i32(b.y), roughness, b.x);\n        probe_reach = b.x;\n        return c.rgb * c.a + sky_reflection(d, dir, lod) * (1.0 - c.a);\n    }\n    return sky_reflection(d, dir, lod);\n",
+    "    var c = vec4<f32>(0.0);\n    if (b.x >= 0.0) {\n        c = building_colour(e + d * b.x, i32(b.y), roughness, b.x);\n        probe_reach = b.x;\n    }\n    return c.rgb * c.a + sky_reflection(d, dir, lod) * (1.0 - c.a);\n",
+);
+pub(crate) const DEDUP_PORTAL_SAMPLES: (&str, &str) = (
+    "        if (own_room == low_room || own_room == high_room) {
+            // One side is this surface's own room: blend toward the other.
+            let other_room = select(low_room, high_room, own_room == low_room);
+            let w_other = reach * select(1.0 - w_high, w_high, own_room == low_room);
+            let other = probe_volume_sample(other_room, select_world, world_pos, d, lod);
+            if (other.a < 0.0) {
+                return own;
+            }
+            probe_brightness = mix(probe_brightness, volume_sample_brightness, w_other);
+            return mix(own, other, w_other);
+        }
+        // In the wall between them -- the jambs, the threshold -- neither side
+        // is this surface's room, so the doorway answers outright.
+        let a = probe_volume_sample(low_room, select_world, world_pos, d, lod);
+        let a_bright = volume_sample_brightness;
+        let b = probe_volume_sample(high_room, select_world, world_pos, d, lod);
+        let b_bright = volume_sample_brightness;
+",
+    "        let own_side = own_room == low_room || own_room == high_room;
+        var a = vec4<f32>(-1.0);
+        var a_bright = 0.0;
+        var b = vec4<f32>(-1.0);
+        var b_bright = 0.0;
+        for (var k = 0; k < select(2, 1, own_side); k = k + 1) {
+            let room = select(select(low_room, high_room, k == 1), select(low_room, high_room, own_room == low_room), own_side);
+            let s = probe_volume_sample(room, select_world, world_pos, d, lod);
+            if (k == 0) {
+                a = s;
+                a_bright = volume_sample_brightness;
+            } else {
+                b = s;
+                b_bright = volume_sample_brightness;
+            }
+        }
+        if (own_side) {
+            let w_other = reach * select(1.0 - w_high, w_high, own_room == low_room);
+            if (a.a < 0.0) {
+                return own;
+            }
+            probe_brightness = mix(probe_brightness, a_bright, w_other);
+            return mix(own, a, w_other);
+        }
+",
+);
+pub(crate) const DEDUP_NEAR_FAR: (&str, &str) = (
+    "        let sample_dir = probe_parallax_direction(world_pos, d, best);
+        let layer = i32(camera.probe_boxes[best * 3].w);
+        let near = textureSampleLevel(probe_cube, probe_samp, sample_dir, layer, probe_lod);
+        probe_brightness = camera.probe_boxes[best * 3 + 1].w;
+        own = near;
+        if (second >= 0) {
+            let far_dir = probe_parallax_direction(world_pos, d, second);
+            let far = textureSampleLevel(
+                probe_cube, probe_samp, far_dir, i32(camera.probe_boxes[second * 3].w), probe_lod
+            );
+",
+    "        var near = vec4<f32>(0.0);
+        var far = vec4<f32>(0.0);
+        for (var k = 0; k < select(1, 2, second >= 0); k = k + 1) {
+            let slot = select(best, second, k == 1);
+            let s = textureSampleLevel(
+                probe_cube, probe_samp, probe_parallax_direction(world_pos, d, slot), i32(camera.probe_boxes[slot * 3].w), probe_lod
+            );
+            if (k == 0) {
+                near = s;
+            } else {
+                far = s;
+            }
+        }
+        probe_brightness = camera.probe_boxes[best * 3 + 1].w;
+        own = near;
+        if (second >= 0) {
+",
+);
 
 // The edits of B2's cuts, above.
 const B2_FACE_CODE: (&str, &str) = (
@@ -2646,6 +2943,103 @@ const B2_CAPSULE_DIR_GREY: (&str, &str) = (
     "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, refl, roughness, env, probe);\n    }",
     "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, to_player_direction(probe_ray_world), roughness, probe_capsule_lit, probe);\n    }",
 );
+// `def_dlc_pos_late`: `late_zero` is 0 from a uniform the compiler cannot see
+// through, so the positions made after the trace are not merged back into the
+// ones made before it.
+const B2_POS_LATE_SET: (&str, &str) = (
+    "    let hit = probe_trace(world_pos, d, trace_room, roughness);\n",
+    "    let hit = probe_trace(world_pos, d, trace_room, roughness);\n    let late_zero = vec3<f32>(f32(camera.post_params.z > 3.0e38));\n    let world_late = to_world_space(frag_pos + late_zero);\n    let select_late = to_world_space(select_pos + late_zero);\n    let volume_late = select(select_late, to_world_space(probe_volume_pos.xyz + late_zero), probe_volume_pos.w > 0.5);\n",
+);
+const B2_POS_LATE_RECORD: (&str, &str) = (
+    "            slot = probe_fixup_begin(hit, world_pos, d, to_player_direction(d), roughness, probe_lod, trace_room, recolour);",
+    "            slot = probe_fixup_begin(hit, world_late, d, to_player_direction(d), roughness, probe_lod, trace_room, recolour);",
+);
+const B2_POS_LATE_CHOICE: (&str, &str) =
+    ("    let choice = probe_choose(select_world, volume_world);\n", "    let choice = probe_choose(select_late, volume_late);\n");
+const B2_POS_LATE_NEAR: (&str, &str) = (
+    "        let sample_dir = probe_parallax_direction(world_pos, d, best);",
+    "        let sample_dir = probe_parallax_direction(world_late, d, best);",
+);
+const B2_POS_LATE_FAR: (&str, &str) = (
+    "            let far_dir = probe_parallax_direction(world_pos, d, second);",
+    "            let far_dir = probe_parallax_direction(world_late, d, second);",
+);
+const B2_POS_LATE_PORTALS: (&str, &str) = (
+    "    return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);",
+    "    return probe_through_portals(own, own_room, select_late, world_late, d, probe_lod);",
+);
+// `def_dlc_lit_half`.
+const B2_LIT_HALF_DECL: (&str, &str) = (
+    "var<private> probe_capsule_lit: vec3<f32> = vec3<f32>(0.0);\n",
+    "var<private> probe_capsule_lit: vec3<f32> = vec3<f32>(0.0);\nvar<private> probe_capsule_lit_half: vec2<u32> = vec2<u32>(0u);\nfn probe_capsule_lit_read() -> vec3<f32> {\n    return vec3<f32>(unpack2x16float(probe_capsule_lit_half.x), unpack2x16float(probe_capsule_lit_half.y).x);\n}\n",
+);
+const B2_LIT_HALF_SET: (&str, &str) = (
+    "    probe_capsule_lit = env;\n",
+    "    probe_capsule_lit_half = vec2<u32>(pack2x16float(env.rg), pack2x16float(vec2<f32>(env.b, 0.0)));\n",
+);
+const B2_LIT_HALF_RECORD: (&str, &str) = (
+    "let lit = dot(probe_capsule_lit, vec3<f32>(0.2126, 0.7152, 0.0722));",
+    "let lit = dot(probe_capsule_lit_read(), vec3<f32>(0.2126, 0.7152, 0.0722));",
+);
+const B2_LIT_HALF_CAPSULES: (&str, &str) = (
+    "        probe = capsule_reflection(world_pos, to_player_direction(probe_ray_world), roughness, env, probe);",
+    "        probe = capsule_reflection(world_pos, to_player_direction(probe_ray_world), roughness, probe_capsule_lit_read(), probe);",
+);
+// The trace's parts, for `def_dlc_no_*`: each cut so what follows it stays.
+const B2_NO_FAR_RIM: (&str, &str) =
+    ("        if (hit.rim < 0.0) {\n            let spread_far", "        if (false) {\n            let spread_far");
+const B2_NO_NEAR_RIM: (&str, &str) = ("        if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {", "        if (false) {");
+const B2_NO_EDGES: (&str, &str) = ("        if (hit.edge_code < 0 && proxy.edge >= 0) {", "        if (false) {");
+const B2_NO_FIELD_WALK: (&str, &str) = (
+    "        let walk = probe_proxy_field_at(o, d, field_i, field_near, min(field_far, best), lobe);",
+    "        let walk = vec3<f32>(camera.post_params.z, camera.post_params.w, camera.post_params.z - 1.0);",
+);
+const B2_NO_PROXY_SURFACE: (&str, &str) =
+    ("    if (s0 < 0) {\n        return 3.4e38;\n    }", "    if (true) {\n        return 3.4e38;\n    }");
+const B2_NO_PROXIES: (&str, &str) = (
+    "        let proxy = probe_proxy_hit(hit.origin, d, cur, t0, t_exit, skip, lobe);",
+    "        var proxy: ProbeProxyHit;\n        proxy.t = t0 + camera.post_params.z;\n        proxy.index = i32(camera.post_params.w);\n        proxy.edge = i32(camera.post_params.w) - 1;\n        proxy.edge_cover = camera.post_params.w;\n        proxy.edge_t = t0 + camera.post_params.w;",
+);
+const B2_NO_DOORWAY_START: (&str, &str) = ("    if (!in_room) {\n", "    if (false) {\n");
+const B2_NO_PORTALS: (&str, &str) = ("        let p = probe_portal_at(e, cur, axis);", "        let p = -1;");
+const B2_ONE_HOP: (&str, &str) = (ROLL_TRACE_FROM, "    for (var hop = 0; hop < 1; hop = hop + 1) {");
+// B2, THE THIRD ROUND: the trace's loop-carried reciprocal (`inv`, and the
+// `moving` it is chosen by) made again at each of its three uses in the loop,
+// each from its own opaque zero so the compiler cannot merge them back into
+// one value held round the loop -- the same `1.0 / d`, to the bit. And the
+// doorway's corners read again for the far rim, after the depth read they
+// were held across. See `def_dlc_no_portals` (19): the peak is in that block.
+const B2_INV_FAR: (&str, &str) = (
+    "        let far = select(vec3<f32>(3.4e38), max((hi - start) * inv, (lo - start) * inv), moving);",
+    "        let inv_far = select(vec3<f32>(3.4e38), 1.0 / (d + vec3<f32>(f32(camera.post_params.z > 3.0e38))), abs(d) > vec3<f32>(1e-6));\n        let far = select(vec3<f32>(3.4e38), max((hi - start) * inv_far, (lo - start) * inv_far), abs(d) > vec3<f32>(1e-6));",
+);
+const B2_INV_SIDE: (&str, &str) = (
+    "        var side = select(vec3<f32>(3.4e38), max((phi - e) * inv, (plo - e) * inv), moving);",
+    "        let inv_side = select(vec3<f32>(3.4e38), 1.0 / (d + vec3<f32>(f32(camera.post_params.z > 3.1e38))), abs(d) > vec3<f32>(1e-6));\n        var side = select(vec3<f32>(3.4e38), max((phi - e) * inv_side, (plo - e) * inv_side), abs(d) > vec3<f32>(1e-6));",
+);
+const B2_INV_ENTER: (&str, &str) = (
+    "            max((face[axis] - hit.origin[axis]) * inv[axis], t_exit),\n            max((wall_far - hit.origin[axis]) * inv[axis], t_exit),",
+    "            max((face[axis] - hit.origin[axis]) * select(3.4e38, 1.0 / (d[axis] + f32(camera.post_params.z > 3.2e38)), abs(d[axis]) > 1e-6), t_exit),\n            max((wall_far - hit.origin[axis]) * select(3.4e38, 1.0 / (d[axis] + f32(camera.post_params.z > 3.2e38)), abs(d[axis]) > 1e-6), t_exit),",
+);
+const B2_RIM_REREAD: (&str, &str) = (
+    "            let in_a = min(e2[a] - plo[a], phi[a] - e2[a]);\n            let in_b = min(e2[b] - plo[b], phi[b] - e2[b]);",
+    "            let plo_far = camera.probe_portals[p * 3 + i32(camera.post_params.z > 3.3e38)].xyz;\n            let phi_far = camera.probe_portals[p * 3 + 1 + i32(camera.post_params.z > 3.3e38)].xyz;\n            let in_a = min(e2[a] - plo_far[a], phi_far[a] - e2[a]);\n            let in_b = min(e2[b] - plo_far[b], phi_far[b] - e2[b]);",
+);
+// B2, THE FOURTH ROUND: what the crossing's depth read is for. Only "the
+// photograph saw nothing this way" (`probe_seen_distance` < 0) is asked, which
+// is the texel alone -- no direction normalised, no distance divided out after
+// the read. The same answer for every texel, NaN included.
+const B2_SEEN_TEXEL_ONLY: (&str, &str) = (
+    "        let escapes = probe_seen_distance(oslot, d) < 0.0;",
+    "        let seen_texel = textureSampleLevel(probe_depth, probe_depth_samp, d, i32(camera.probe_boxes[oslot * 3].w), 0.0);\n        let escapes = dot(seen_texel.xyz, seen_texel.xyz) < 0.25 && !(seen_texel.w > 0.5);",
+);
+// DIAGNOSTICS, not the same picture: the crossing a part at a time.
+const B2_SEEN_UNIFORM: (&str, &str) = (
+    "        let escapes = probe_seen_distance(oslot, d) < 0.0;",
+    "        let escapes = other + 1.0 == camera.portal_params.z || camera.post_params.z > 3.0e38;",
+);
+const B2_NO_SIDE: (&str, &str) =
+    ("        let t_side = t_exit + min(min(side.x, side.y), side.z);", "        let t_side = 3.4e38 + camera.post_params.z;");
 /// The fixed-count loops of the probe pass, and each with its bound hidden
 /// from the compiler: `post_params.z` is never past 3e38, so the count is the
 /// same. See `def_rolled_all`.
@@ -2739,9 +3133,33 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("scene_tent_opaque", &[SHADOW_TENT_OPAQUE]),
     ("scene_box_opaque", &[SHADOW_BOX_OPAQUE, SHADOW_BOX_OPAQUE]),
     ("scene_shadow_loops_opaque", &[SHADOW_TENT_OPAQUE, SHADOW_BOX_OPAQUE, SHADOW_BOX_OPAQUE]),
+    // The sun's shadow, the level's and the moving things' both.
     (
         "scene_cut_sun_shadow",
-        &[("        if (!SKY_SUN_NEVER_REACHES && l.params.z > 1.5) {\n            shadow = sun_visibility(l, world_pos);", "        if (false) {\n            shadow = sun_visibility(l, world_pos);")],
+        &[
+            (
+                "        if (!SKY_SUN_NEVER_REACHES && l.params.z > 1.5) {\n            shadow = sun_level_visibility(world_pos);",
+                "        if (false) {\n            shadow = sun_level_visibility(world_pos);",
+            ),
+            ("        } else if (!SKY_SUN_NEVER_REACHES && shadow > 0.0 && l.position.w > 0.5", "        } else if (false && shadow > 0.0 && l.position.w > 0.5"),
+            ("                    if (!SKY_SUN_NEVER_REACHES && map == SUN_MOVING_MAP) {", "                    if (false) {"),
+        ],
+    ),
+    // THE SHADOW MAPS READ AT THEIR OWN CALLS, as before 2026-10-06: the
+    // sun's moving things inside `sun_visibility`, a characters' tile in
+    // `character_shadow`, a spot's in `pcf_layer` -- a transform and a kernel
+    // each. The same lookups and shadows; against `scene_cut_none`, what
+    // reading every map at one place saves, and on the headset (where the
+    // offline frame has no shadows) the proof that the picture is the same.
+    (
+        "scene_moving_two_reads",
+        &[
+            ("            shadow = sun_level_visibility(world_pos);\n", "            shadow = sun_visibility(l, world_pos);\n"),
+            (
+                "        var map = -1;\n        var tile = 0.0;\n        if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {\n            map = 1 + layer;\n        } else if (l.params.z < 1.5) {\n            let k = character_shadow_tile(i);\n            if (k >= 0) {\n                map = CHARACTER_MAPS + k;\n                tile = f32(1 + k);\n            }\n        } else if (!SKY_SUN_NEVER_REACHES && shadow > 0.0 && l.position.w > 0.5 && camera.shadow_params.z > 0.5) {\n            map = SUN_MOVING_MAP;\n        }\n        if (map >= 0) {\n            let c = shadow_coords(world_pos, camera.moving_view_proj[map]);\n            if (c.w >= 0.5) {\n                if (SPOT_SHADOWS && map > SUN_MOVING_MAP && map < CHARACTER_MAPS) {\n                    shadow = shadow * pcf_layer_at(spot_shadow_tex, layer, c.xyz);\n                } else {\n                    var at = vec4<f32>(c.xyz, tile);\n                    if (!SKY_SUN_NEVER_REACHES && map == SUN_MOVING_MAP) {\n                        at = sun_moving_tile_at(c.xyz);\n                    }\n                    shadow = shadow * pcf_tile_at(sun_dynamic_shadow_tex, vec2<f32>(at.w, 0.0), SUN_ATLAS_GRID, at.xyz);\n                }\n            }\n        }\n",
+                "        if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {\n            shadow = shadow * pcf_layer(spot_shadow_tex, layer, world_pos, spot_view_proj(layer));\n        } else if (l.params.z < 1.5) {\n            shadow = shadow * character_shadow(i, world_pos);\n        }\n",
+            ),
+        ],
     ),
     (
         "scene_cut_spot_cone",
@@ -2750,14 +3168,26 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             "            let cos_angle = dot(-l_dir, l.direction.xyz);\n        }\n    }\n\n    let aa = terminator_aa(dot(n, l_dir));\n    let ndotl = aa.x;\n    let radiance = l.color_intensity.rgb * l.color_intensity.a;\n    out.diffuse",
         )],
     ),
+    // DIAGNOSTIC: a spot's edge not averaged along the pixel's long step --
+    // the cone as it was before 2026-10-05. Not the same picture.
+    ("scene_cut_spot_average", &[("const SPOT_EDGE_AVERAGE: bool = true;", "const SPOT_EDGE_AVERAGE: bool = false;")]),
+    // The upsample's four face tests in `READER_EDITS`' other two forms, here
+    // for their instruction counts and the offline picture. The same picture.
+    ("scene_cut_face_same_loop", &[FACE_SAME_LOOP]),
+    ("scene_cut_face_same_calls", &[FACE_SAME_CALLS]),
+    // The lamp loop by a wave-uniform index (`READER_EDITS`), and the same
+    // with the reach tests in it. The same picture.
+    ("scene_cut_lamp_loop_uniform", &[LAMP_LOOP_UNIFORM]),
+    ("scene_cut_lamp_loop_merged", &[LAMP_REACHES_FN, LAMP_WALK_NO_MASK, LAMP_LOOP_MERGED]),
+    // DIAGNOSTIC: the pixel's long step from the normal it shades with, a
+    // bump's, as it was until 2026-10-06 -- white specks past the pools' tips
+    // on stone. See `spot_long_step`. Not the same picture.
+    ("scene_cut_spot_long_mapped", &[SPOT_LONG_MAPPED]),
     (
         "scene_cut_sky",
         &[
-            ("    if (occ > 0.0) {\n        diffuse = sky_irradiance(n) * occ;\n    }", "    if (false) {\n        diffuse = sky_irradiance(n) * occ;\n    }"),
-            (
-                "    if (occ > 0.0) {\n        sky_reflection = environment_radiance(refl) * occ;\n    }",
-                "    if (false) {\n        sky_reflection = environment_radiance(refl) * occ;\n    }",
-            ),
+            ("        diffuse = sky_irradiance(n) * occ;\n", ""),
+            ("        sky_reflection = environment_radiance(refl) * occ;\n", ""),
         ],
     ),
     (
@@ -2785,6 +3215,109 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     // `HALF_PRECISION` on; off as shipped since B1, this IS `scene_cut_none`.
     ("scene_all_f32", &[("alias hf = f32;\n", "alias hf = f32; // scene_all_f32\n")]),
 ];
+
+/// MEASUREMENT: text edits of every scene reader's generated WGSL -- the
+/// brushes' and the ground's alike -- that keep the picture and change the
+/// code, for `Levers::reader_edit`: an earlier form of one piece of reader
+/// code, drawn in place of the shipped readers with the same choice per frame
+/// and face, so the two forms are priced against each other in one session in
+/// the configuration that ships. `reader_edit_none` rebuilds them unedited,
+/// the control. Each find matches exactly once ([`with_reader_edit`]).
+pub(crate) const READER_EDITS: &[(&str, &[(&str, &str)])] = &[
+    ("reader_edit_none", &[]),
+    // THE SKY WALKED, as builds 118-119 shipped it: one copy of its sum,
+    // walked over a two-bit mask for the normal and the mirror direction. The
+    // two calls it replaced were faster in every view (build 120).
+    ("sky_walked", &[SKY_WALKED_DIFFUSE, SKY_WALKED_REFLECTION]),
+    // THE SUN'S MOVING MAP AT ITS FIXED ROW: its transform apart from the
+    // other maps', which are read at a row known only per lamp -- as before
+    // build 118, a second copy of the transform.
+    ("sun_matrix_fixed", &[SUN_MATRIX_FIXED]),
+    // THE UPSAMPLE'S FOUR FACE TESTS, shipped since build 127 as one test on
+    // all four taps at once: as four inlined calls, as they were until then
+    // (`shader_inlining`: 68 proxy units, after the sky the readers' largest
+    // repeat; 0.05-1.2 ms slower, build 126), or in a loop the compiler is
+    // not told the count of. The same answer for every tap.
+    ("face_same_calls", &[FACE_SAME_CALLS]),
+    ("face_same_loop", &[FACE_SAME_LOOP]),
+    // THE SPOT'S LONG STEP FROM THE NORMAL SHADED WITH, a bump's, as it was
+    // until 2026-10-06 (`spot_long_step`): white specks past the pools on
+    // stone. Against the plane's step, which took the sunless brush reader
+    // from 19 registers to 20 (build 125). Not the same picture.
+    ("spot_long_mapped", &[SPOT_LONG_MAPPED]),
+    // THE LAMP LOOP OVER EVERY LIVE LAMP IN TURN, skipping those this pixel's
+    // walk did not mark, instead of jumping to each marked one: the same lamps
+    // in the same order, so the same sum. The lamp's index is then the same
+    // in every lane, where `countTrailingZeros` of a per-pixel mask made each
+    // lamp's four uniform reads per-lane loads. The same picture.
+    ("lamp_loop_uniform", &[LAMP_LOOP_UNIFORM]),
+    // THE SAME, WITH THE REACH TESTS IN THE LOOP: the walk before it finds only
+    // the nearest bulb, and the loop tests each lamp as the walk did before
+    // shading it, so no mask of reaching lamps is held through it -- the
+    // register `lamp_loop_uniform` added (19 -> 20 overall, build 127). The
+    // same lamps in the same order. The same picture.
+    ("lamp_loop_merged", &[LAMP_REACHES_FN, LAMP_WALK_NO_MASK, LAMP_LOOP_MERGED]),
+];
+/// `lamp_loop_merged`'s reach test: the walk's culling, verbatim, as a
+/// function of one lamp.
+const LAMP_REACHES_FN: (&str, &str) = (
+    "fn shade_material_lamps(",
+    "fn lamp_reaches(i: u32, world_pos: vec3<f32>, pixel_long: f32, culling: bool) -> bool {\n    let kind = lights.lights[i].params.z;\n    let to_lamp = lights.lights[i].position.xyz - world_pos;\n    let dist_sq = dot(to_lamp, to_lamp);\n    if (kind > 1.5 && SKY_SUN_NEVER_REACHES) {\n        return false;\n    }\n    if (culling) {\n        if (CULL_RANGE_FIRST && kind < 1.5 && dist_sq >= lights.lights[i].params.x * lights.lights[i].params.x) {\n            return false;\n        }\n        if (stationary_visibility_of(lights.lights[i].position.w) <= 0.0) {\n            return false;\n        }\n        if (kind < 1.5) {\n            let reach = lights.lights[i].params.x;\n            if (!CULL_RANGE_FIRST && dist_sq >= reach * reach) {\n                return false;\n            }\n            if (kind > 0.5) {\n                let cos_outer = lights.lights[i].params.y;\n                let authored = max(lights.lights[i].direction.w - cos_outer, 0.0001);\n                let inv_dist = inverseSqrt(max(dist_sq, 1e-6));\n                let at_most = SPOT_EDGE_MIN_PIXELS * pixel_footprint * inv_dist;\n                let widen = clamp(at_most - authored, 0.0, authored * (SPOT_EDGE_MAX_WIDEN - 1.0));\n                let zero_below = cos_outer - 0.5 * widen - select(0.0, 0.5 * pixel_long * inv_dist, SPOT_EDGE_AVERAGE) - 1e-4;\n                let along = -dot(to_lamp, lights.lights[i].direction.xyz);\n                let bound_sq = zero_below * zero_below * max(dist_sq, 1e-8);\n                let outside = select(\n                    along < 0.0 && along * along >= bound_sq,\n                    along <= 0.0 || along * along <= bound_sq,\n                    zero_below >= 0.0,\n                );\n                if (outside) {\n                    return false;\n                }\n            }\n        } else if (receiver_sun_mask == 0.0) {\n            return false;\n        }\n    }\n    return true;\n}\n\nfn shade_material_lamps(",
+);
+/// The walk keeps its nearest bulb and marks nothing.
+const LAMP_WALK_NO_MASK: (&str, &str) = ("        reaching = reaching | (1u << i);\n", "");
+/// The loop over every live lamp by a wave-uniform index, testing each.
+const LAMP_LOOP_MERGED: (&str, &str) = (
+    LAMP_LOOP_UNIFORM.0,
+    "    for (var i: u32 = surface_light_count(); i < live_light_count(); i = i + 1u) {\n        if (!lamp_reaches(i, world_pos, pixel_long, culling)) {\n            continue;\n        }\n        let l = lights.lights[i];\n",
+);
+/// The lamp loop's head as `shade_material_lamps` ships it, and as one walk
+/// over every live lamp by a wave-uniform index.
+const LAMP_LOOP_UNIFORM: (&str, &str) = (
+    "    var todo = reaching;\n    loop {\n        if (todo == 0u) {\n            break;\n        }\n        let i = countTrailingZeros(todo);\n        todo = todo & (todo - 1u);\n        let l = lights.lights[i];\n",
+    "    for (var i: u32 = surface_light_count(); i < live_light_count(); i = i + 1u) {\n        if ((reaching & (1u << i)) == 0u) {\n            continue;\n        }\n        let l = lights.lights[i];\n",
+);
+/// The spot's long step as `long_step_from_plane` writes it, and as it was.
+const SPOT_LONG_MAPPED: (&str, &str) = (
+    "fn spot_long_step(vn: f32) -> f32 {\n    return pixel_long_step;\n}",
+    "fn spot_long_step(vn: f32) -> f32 {\n    return pixel_footprint * inverseSqrt(max(abs(vn), SPOT_LONG_MIN_COS));\n}",
+);
+/// The upsample's face test as `probe_pass::READER_WGSL` ships it.
+const FACE_SAME_FROM: &str = "    let code_i = i32(code) - 1;\n    let codes_i = vec4<i32>(codes) - vec4<i32>(1);\n    let face_dx = abs(codes_i / vec4<i32>(32) - vec4<i32>(code_i / 32));\n    let face_dy = abs(codes_i % vec4<i32>(32) - vec4<i32>(code_i % 32));\n    let facing = (codes < vec4<f32>(0.5)) | vec4<bool>(code < 0.5) | ((face_dx <= vec4<i32>(2)) & (face_dy <= vec4<i32>(2)));\n";
+const FACE_SAME_LOOP: (&str, &str) = (
+    FACE_SAME_FROM,
+    "    var facing = vec4<bool>(false);\n    for (var k = 0; k < 4 + i32(camera.post_params.z > 3.0e38); k = k + 1) {\n        facing[k] = probe_face_same(codes[k], code);\n    }\n",
+);
+const FACE_SAME_CALLS: (&str, &str) = (
+    FACE_SAME_FROM,
+    "    let facing = vec4<bool>(\n        probe_face_same(codes.x, code), probe_face_same(codes.y, code),\n        probe_face_same(codes.z, code), probe_face_same(codes.w, code),\n    );\n",
+);
+const SKY_WALKED_DIFFUSE: (&str, &str) = (
+    "    var diffuse = vec3<f32>(0.0);\n    if (occ > 0.0) {\n        diffuse = sky_irradiance(n) * occ;\n    }\n",
+    "    var diffuse = vec3<f32>(0.0);\n",
+);
+const SKY_WALKED_REFLECTION: (&str, &str) = (
+    "    if (occ > 0.0) {\n        sky_reflection = environment_radiance(refl) * occ;\n    }\n",
+    "    var sky_dirs = select(0u, 3u, occ > 0.0);\n    loop {\n        if (sky_dirs == 0u) {\n            break;\n        }\n        let k = countTrailingZeros(sky_dirs);\n        sky_dirs = sky_dirs & (sky_dirs - 1u);\n        let dir = select(n, refl, k == 1u);\n        let sky = sky_irradiance(dir);\n        if (k == 0u) {\n            diffuse = sky * occ;\n        } else {\n            sky_reflection = environment_radiance_of(dir, sky) * occ;\n        }\n    }\n",
+);
+const SUN_MATRIX_FIXED: (&str, &str) = (
+    "            let c = shadow_coords(world_pos, camera.moving_view_proj[map]);\n",
+    "            var c = vec4<f32>(0.0);\n            if (map == SUN_MOVING_MAP) {\n                c = shadow_coords(world_pos, camera.moving_view_proj[SUN_MOVING_MAP]);\n            } else {\n                c = shadow_coords(world_pos, camera.moving_view_proj[map]);\n            }\n",
+);
+
+/// `src` with one of [`READER_EDITS`]: `None` when `edit` names no entry, or
+/// one of its finds does not match exactly once.
+pub(crate) fn with_reader_edit(src: String, edit: &str) -> Option<String> {
+    let (_, edits) = READER_EDITS.iter().find(|(name, _)| *name == edit)?;
+    let mut src = src;
+    for (from, to) in edits.iter() {
+        if src.matches(from).count() != 1 {
+            return None;
+        }
+        src = src.replacen(from, to, 1);
+    }
+    Some(src)
+}
 
 /// MEASUREMENT ONLY: what `BrushPipeline::log_probe_pass_register_cuts` cuts
 /// out of the probe pass's shader, one pipeline each -- text edits of the
@@ -3400,39 +3933,51 @@ fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32, code: f32) 
     // corner; `.wzxy` puts it in the order (0,0) (1,0) (0,1) (1,1).
     let gaps = abs(textureGather(probe_pass_depth, probe_pass_point, uv, view_slot) - vec4<f32>(depth)).wzxy;
     let codes = textureGather(1, probe_pass_code, probe_pass_point, uv, view_slot).wzxy;
-    let facing = vec4<bool>(
-        probe_face_same(codes.x, code), probe_face_same(codes.y, code),
-        probe_face_same(codes.z, code), probe_face_same(codes.w, code),
-    );
+    // `probe_face_same` on all four taps as ONE vector test: the same answer
+    // for every tap, where four calls were inlined four times over (build 126:
+    // 186 fewer instructions in the full reader; torch_pendant 19.45 -> 18.24
+    // ms, no view slower).
+    let code_i = i32(code) - 1;
+    let codes_i = vec4<i32>(codes) - vec4<i32>(1);
+    let face_dx = abs(codes_i / vec4<i32>(32) - vec4<i32>(code_i / 32));
+    let face_dy = abs(codes_i % vec4<i32>(32) - vec4<i32>(code_i % 32));
+    let facing = (codes < vec4<f32>(0.5)) | vec4<bool>(code < 0.5) | ((face_dx <= vec4<i32>(2)) & (face_dy <= vec4<i32>(2)));
     let same = facing & (gaps <= vec4<f32>(tolerance));
+    // The texel or blend this pixel takes, still compressed and premultiplied:
+    // undone once, below, whichever way it was read.
+    // (One expand rather than one per path: 18 instructions on the Quest. Off
+    // the device it moves one outline pixel of the offline hall by one level,
+    // a compiler folding the edge path's two divisions differently; with a
+    // return per path the picture is the same to the byte -- 2026-10-06.)
+    var pre: vec4<f32>;
     if (all(same)) {
-        let pre = textureSampleLevel(probe_pass_tex, probe_pass_linear, uv, view_slot, 0.0);
-        return vec4<f32>(probe_pass_expand(pre.rgb / max(pre.a, 1e-4)), pre.a);
+        pre = textureSampleLevel(probe_pass_tex, probe_pass_linear, uv, view_slot, 0.0);
+    } else {
+        let size = vec2<i32>(dims);
+        let h = pixel * 0.5 - vec2<f32>(0.5);
+        let base = vec2<i32>(floor(h));
+        let f = h - floor(h);
+        let top = size - vec2<i32>(1);
+        let c00 = textureLoad(probe_pass_tex, clamp(base, vec2<i32>(0), top), view_slot, 0);
+        let c10 = textureLoad(probe_pass_tex, clamp(base + vec2<i32>(1, 0), vec2<i32>(0), top), view_slot, 0);
+        let c01 = textureLoad(probe_pass_tex, clamp(base + vec2<i32>(0, 1), vec2<i32>(0), top), view_slot, 0);
+        let c11 = textureLoad(probe_pass_tex, clamp(base + vec2<i32>(1, 1), vec2<i32>(0), top), view_slot, 0);
+        let bilinear = vec4<f32>((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
+        let w = select(vec4<f32>(0.0), bilinear, same);
+        let weight = w.x + w.y + w.z + w.w;
+        // Ties go to the first in that order, as they always have; only a texel
+        // facing this way, and none -- no reflection -- if none does.
+        let far = vec4<f32>(3.4e38);
+        let near = select(far, gaps, facing);
+        var nearest = vec4<f32>(0.0);
+        var nearest_gap = far.x;
+        if (near.x < nearest_gap) { nearest_gap = near.x; nearest = c00; }
+        if (near.y < nearest_gap) { nearest_gap = near.y; nearest = c10; }
+        if (near.z < nearest_gap) { nearest_gap = near.z; nearest = c01; }
+        if (near.w < nearest_gap) { nearest_gap = near.w; nearest = c11; }
+        let sum = c00 * w.x + c10 * w.y + c01 * w.z + c11 * w.w;
+        pre = select(nearest, sum / max(weight, 1e-6), weight > 1e-4);
     }
-    let size = vec2<i32>(dims);
-    let h = pixel * 0.5 - vec2<f32>(0.5);
-    let base = vec2<i32>(floor(h));
-    let f = h - floor(h);
-    let top = size - vec2<i32>(1);
-    let c00 = textureLoad(probe_pass_tex, clamp(base, vec2<i32>(0), top), view_slot, 0);
-    let c10 = textureLoad(probe_pass_tex, clamp(base + vec2<i32>(1, 0), vec2<i32>(0), top), view_slot, 0);
-    let c01 = textureLoad(probe_pass_tex, clamp(base + vec2<i32>(0, 1), vec2<i32>(0), top), view_slot, 0);
-    let c11 = textureLoad(probe_pass_tex, clamp(base + vec2<i32>(1, 1), vec2<i32>(0), top), view_slot, 0);
-    let bilinear = vec4<f32>((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
-    let w = select(vec4<f32>(0.0), bilinear, same);
-    let weight = w.x + w.y + w.z + w.w;
-    // Ties go to the first in that order, as they always have; only a texel
-    // facing this way, and none -- no reflection -- if none does.
-    let far = vec4<f32>(3.4e38);
-    let near = select(far, gaps, facing);
-    var nearest = vec4<f32>(0.0);
-    var nearest_gap = far.x;
-    if (near.x < nearest_gap) { nearest_gap = near.x; nearest = c00; }
-    if (near.y < nearest_gap) { nearest_gap = near.y; nearest = c10; }
-    if (near.z < nearest_gap) { nearest_gap = near.z; nearest = c01; }
-    if (near.w < nearest_gap) { nearest_gap = near.w; nearest = c11; }
-    let sum = c00 * w.x + c10 * w.y + c01 * w.z + c11 * w.w;
-    let pre = select(nearest, sum / max(weight, 1e-6), weight > 1e-4);
     return vec4<f32>(probe_pass_expand(pre.rgb / max(pre.a, 1e-4)), pre.a);
 }
 "#;
@@ -4043,6 +4588,9 @@ struct VOut {{
     // Tangent frame from the brush face's own axes, re-orthogonalised against
     // the interpolated normal so the two cannot drift apart.
     let n_geom = normalize(in.normal);
+    // A spot's edge is averaged over the patch of the FACE this pixel covers,
+    // not a bump's: see `spot_long_step`.
+    set_pixel_long_step(n_geom, normalize(cam_pos() - in.world_pos));
     let t = normalize(in.tangent.xyz - n_geom * dot(n_geom, in.tangent.xyz));
     let b = cross(n_geom, t) * in.tangent.w;
     let tn = textureSample(mat_normal, mat_samp, in.uv, i32(in.material)).xyz * 2.0 - 1.0;
@@ -4089,6 +4637,7 @@ struct VOut {{
                 cull_range_first: false,
                 card_tests_filtered: false,
                 card_relit: false,
+                long_step_from_plane: true,
             },
         ),
         ssr_block = ssr_block,
@@ -6267,6 +6816,9 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
             let mut src = base.clone();
             for (from, to) in edits.iter() {
                 assert!(src.contains(from), "{label}: `{from}` is not in the deferring probe pass");
+                // Once: an edit is made at the first match, and one also found
+                // earlier in the shader would cut something else.
+                assert_eq!(src.matches(from).count(), 1, "{label}: `{from}` is in the deferring probe pass more than once");
                 src = src.replacen(from, to, 1);
             }
             let module = naga::front::wgsl::parse_str(&src)
@@ -6311,6 +6863,36 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
                 .validate(&module)
                 .unwrap_or_else(|e| panic!("{label}: {e:?}"));
         }
+    }
+
+    /// Every `READER_EDITS` entry applies to the brushes' reader and the
+    /// ground's, each find exactly once, and leaves every sun class and twin
+    /// valid -- so the `reader_edit` lever never draws the shipped readers
+    /// while claiming an edit.
+    #[test]
+    fn every_reader_edit_applies_and_validates() {
+        use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainRole};
+        use wgpu::naga;
+        let readers = [
+            ("brush", brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read)),
+            ("ground", terrain_shader_for(TerrainRole::Read)),
+        ];
+        for (label, _) in READER_EDITS {
+            for (reader, base) in &readers {
+                let src = with_reader_edit(base.clone(), label).unwrap_or_else(|| panic!("{label} does not apply to the {reader} reader"));
+                assert_eq!(src == *base, *label == "reader_edit_none", "{label}: {reader}");
+                for class in [FaceSun::Unbaked, FaceSun::Never, FaceSun::Baked] {
+                    for twin in [sun_reader_shader(src.clone(), class), crate::renderer::lights::without_spot_shadows(sun_reader_shader(src.clone(), class))] {
+                        let module = naga::front::wgsl::parse_str(&twin)
+                            .unwrap_or_else(|e| panic!("{label} {reader}: {}", e.emit_to_string(&twin)));
+                        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                            .validate(&module)
+                            .unwrap_or_else(|e| panic!("{label} {reader} {class:?}: {e:?}"));
+                    }
+                }
+            }
+        }
+        assert!(with_reader_edit(readers[0].1.clone(), "no_such_edit").is_none());
     }
 
     /// THE SCENE SHADER SPREADS EACH LAMP'S TERMINATOR, from the normal map's
@@ -7398,6 +7980,49 @@ mod sun_faces_tests {
                 .validate(&module)
                 .unwrap();
         }
+    }
+
+    /// WHERE THE SCENE READERS' INSTRUCTIONS COME FROM: each torch-view
+    /// reader's functions ranked by what their repeated inlined copies cost
+    /// (`shader_inlining`), the brushes' and the ground's. A measurement --
+    /// `cargo test --lib where_the_readers -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn where_the_readers_instructions_come_from() {
+        use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainRole};
+        let read = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+        let ground = terrain_shader_for(TerrainRole::Read);
+        let readers = [
+            ("brush_pipeline_read", read.clone()),
+            ("brush_pipeline_read_baked", sun_reader_shader(read, FaceSun::Baked)),
+            ("terrain_pipeline_read", ground.clone()),
+            ("terrain_pipeline_read_baked", sun_reader_shader(ground, FaceSun::Baked)),
+        ];
+        for (label, source) in readers {
+            println!("{}", crate::renderer::shader_inlining::report(label, &source, "fs_main", 30));
+        }
+    }
+
+    /// The same for the reflection passes as they ship: the brushes'
+    /// deferring pass and the ground's.
+    #[test]
+    #[ignore]
+    fn where_the_probe_passes_instructions_come_from() {
+        use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainRole};
+        let passes = [
+            ("brush_probe_pass_deferred", brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred)),
+            ("terrain_probe_pass", terrain_shader_for(TerrainRole::ProbePass)),
+        ];
+        for (label, source) in passes {
+            println!("{}", crate::renderer::shader_inlining::report(label, &source, "fs_main", 30));
+        }
+        // And the brushes' pass with its repeated code written once.
+        let (_, edits) = DEFERRED_REGISTER_CUTS.iter().find(|(label, _)| *label == "def_dedup_all").unwrap();
+        let mut source = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
+        for (from, to) in edits.iter() {
+            source = source.replacen(from, to, 1);
+        }
+        println!("{}", crate::renderer::shader_inlining::report("def_dedup_all", &source, "fs_main", 12));
     }
 }
 

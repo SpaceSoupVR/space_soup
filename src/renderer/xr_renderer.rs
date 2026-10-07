@@ -482,6 +482,24 @@ pub struct XrRenderer {
     /// `TerrainPipeline::new_probe_pass`; the lever `terrain_probe_pass`.
     terrain_probe_pass_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
     terrain_probe_reader_pipeline: crate::renderer::terrain_pipeline::TerrainPipeline,
+    /// The ground reader's twins, `[spotless, baked, baked_spotless]`, and
+    /// whether the level's ground map lets it draw the baked ones. See
+    /// `TerrainPipeline::new_probe_reader_twins`, `Self::terrain_reader`.
+    terrain_reader_twins: [crate::renderer::terrain_pipeline::TerrainPipeline; 3],
+    terrain_sun_baked: bool,
+    /// MEASUREMENT: the ground's reader, probe pass and poolless pass with
+    /// their layer reads inlined, drawn in the shipped ones' place while
+    /// `Levers::terrain_reader` is `inlined`. See `TerrainPipeline::new_inlined`.
+    terrain_inlined: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 3]>,
+    /// MEASUREMENT: every scene reader rebuilt with one of
+    /// `brush_pipeline::READER_EDITS` (`Levers::reader_edit`): the brushes'
+    /// full, sunless and baked classes and their spotless twins, and the
+    /// ground's full reader and its twins, drawn in place of the shipped ones.
+    reader_edits: Option<(
+        String,
+        [crate::renderer::brush_pipeline::BrushPipeline; 6],
+        [crate::renderer::terrain_pipeline::TerrainPipeline; 4],
+    )>,
     /// The same for the multiview scene pass. `None` without multiview, or if
     /// the device refused these pipelines. See `StereoProbePass`.
     stereo_probe: Option<StereoProbePass>,
@@ -1095,6 +1113,9 @@ impl XrRenderer {
         let terrain_probe_reader_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_reader(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
         );
+        let terrain_reader_twins = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_reader_twins(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
+        );
         if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
             crate::renderer::brush_pipeline::BrushPipeline::log_deferred_register_cuts(
                 &wgpu_device, &uniform_buf.layout, &probe_fixups,
@@ -1103,6 +1124,10 @@ impl XrRenderer {
                 &wgpu_device, &uniform_buf.layout, &probe_fixups,
             );
             probe_fixups.log_register_cuts(&wgpu_device);
+            // Built only for the log: the `terrain_reader` lever's inlined set.
+            let _ = crate::renderer::terrain_pipeline::TerrainPipeline::new_inlined(
+                &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, &probe_fixups,
+            );
         }
         let brush_depth_prepass = crate::renderer::brush_pipeline::BrushPipeline::new_depth_prepass(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, crate::renderer::multiview::ViewMode::Mono,
@@ -1546,6 +1571,10 @@ impl XrRenderer {
             pool_cards: None,
             terrain_probe_pass_pipeline,
             terrain_probe_reader_pipeline,
+            terrain_reader_twins,
+            terrain_sun_baked: false,
+            terrain_inlined: None,
+            reader_edits: None,
             stereo_probe,
             brush_depth_prepass,
             stereo_depth_prepass,
@@ -2060,6 +2089,28 @@ impl XrRenderer {
             _ => &self.terrain_pipeline.pipeline,
         }
     }
+
+    /// The ground's reader for this frame, chosen as the brushes' are: its
+    /// spotless twin when no spot casts (`spotless_frame`), its baked one when
+    /// the level's ground map is baked over every texel (`terrain_sun_baked`).
+    /// The full reader under the `scene_cut` lever, as the brushes', and under
+    /// `terrain_reader` `full`; its inlined reads under `inlined`.
+    fn terrain_reader(&self) -> &crate::renderer::terrain_pipeline::TerrainPipeline {
+        if let Some([read, _, _]) = &self.terrain_inlined {
+            return read;
+        }
+        // Under `reader_edit`, its edited set in the shipped ones' places.
+        let edited = self.reader_edits.as_ref().map(|(_, _, ground)| ground);
+        if self.levers.terrain_reader.as_deref() == Some("full") || self.scene_cut_pipeline.is_some() {
+            return edited.map_or(&self.terrain_probe_reader_pipeline, |e| &e[0]);
+        }
+        match (self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed), self.terrain_sun_baked) {
+            (false, false) => edited.map_or(&self.terrain_probe_reader_pipeline, |e| &e[0]),
+            (true, false) => edited.map_or(&self.terrain_reader_twins[0], |e| &e[1]),
+            (false, true) => edited.map_or(&self.terrain_reader_twins[1], |e| &e[2]),
+            (true, true) => edited.map_or(&self.terrain_reader_twins[2], |e| &e[3]),
+        }
+    }
     fn sp_layered(&self, stereo: bool) -> &wgpu::RenderPipeline {
         match (stereo, &self.stereo_pipelines) {
             (true, Some(p)) => &p.layered_mesh.pipeline,
@@ -2287,6 +2338,37 @@ impl XrRenderer {
         }
         if levers.fixup_cut != self.levers.fixup_cut && !self.probe_fixups.set_cut(&self.wgpu_device, levers.fixup_cut.as_deref()) {
             log::warn!("LEVERS: fixup_cut {:?}: no such cut, or it no longer matches the shader", levers.fixup_cut);
+        }
+        if levers.terrain_reader != self.levers.terrain_reader {
+            let (format, samples, layout) = &self.cut_inputs;
+            self.terrain_inlined = match levers.terrain_reader.as_deref() {
+                Some("inlined") => Some(crate::renderer::terrain_pipeline::TerrainPipeline::new_inlined(
+                    &self.wgpu_device, *format, &self.uniform_buf.layout, *samples, layout, &self.probe_fixups,
+                )),
+                None | Some("full") => None,
+                Some(other) => {
+                    log::warn!("LEVERS: terrain_reader {other}: neither `full` nor `inlined`; the shipped readers draw");
+                    None
+                }
+            };
+        }
+        if levers.reader_edit != self.levers.reader_edit {
+            let (format, samples, layout) = &self.cut_inputs;
+            self.reader_edits = levers.reader_edit.as_ref().and_then(|edit| {
+                let brushes = crate::renderer::brush_pipeline::BrushPipeline::new_edited_probe_readers(
+                    &self.wgpu_device, *format, &self.uniform_buf.layout, *samples, layout, edit,
+                );
+                let ground = crate::renderer::terrain_pipeline::TerrainPipeline::new_edited_probe_readers(
+                    &self.wgpu_device, *format, &self.uniform_buf.layout, *samples, layout, edit,
+                );
+                match (brushes, ground) {
+                    (Some(brushes), Some(ground)) => Some((edit.clone(), brushes, ground)),
+                    _ => {
+                        log::warn!("LEVERS: reader_edit {edit}: no such edit, or it no longer matches the readers; the shipped readers draw");
+                        None
+                    }
+                }
+            });
         }
         if levers.scene_cut != self.levers.scene_cut {
             let (format, samples, layout) = &self.cut_inputs;
@@ -2743,6 +2825,9 @@ impl XrRenderer {
             height: s.height,
             rgba: s.rgba.clone(),
         });
+        // The ground's baked readers draw it only where the map is baked over
+        // every texel. See `TerrainImage::sun_baked_everywhere`.
+        self.terrain_sun_baked = occ.is_some_and(|s| s.sun_baked_everywhere());
         self.rebuild_terrain_material();
     }
 

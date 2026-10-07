@@ -1079,7 +1079,7 @@ fn thin_shade_with_sky(world_pos: vec3<f32>, s: ThinSpan, m: ThinMoments, sky_vi
         c = c * hf(stationary_visibility(l));
         let layer = i32(l.params.w);
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {
-            c = c * hf(pcf_layer(spot_shadow_tex, layer, world_pos, camera.spot_view_proj[layer]));
+            c = c * hf(pcf_layer(spot_shadow_tex, layer, world_pos, spot_view_proj(layer)));
         } else if (l.params.z < 1.5) {
             c = c * hf(character_shadow(i, world_pos));
         }
@@ -1360,18 +1360,24 @@ mod tests {
     /// of a spot's shadow map, in the models' shaders (the thin pass's own
     /// copy included) and in the lights block every scene shader shares, sits
     /// directly under the `SPOT_SHADOWS` switch and the live-spot test -- so
-    /// with no spot casting, switching it off removes code no pixel ran.
+    /// with no spot casting, switching it off removes code no pixel ran. The
+    /// scene readers' lamp loop, which carries the point into every kind of
+    /// map with one transform, reads a spot's map under the switch and a
+    /// spot's row of `camera.moving_view_proj` -- which only the live-spot
+    /// test hands out.
     #[test]
     fn every_spot_shadow_read_is_behind_the_switch() {
+        const LIVE_SPOT: &str = "if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {";
+        const SPOT_ROW: &str = "if (SPOT_SHADOWS && map > SUN_MOVING_MAP && map < CHARACTER_MAPS) {";
         let lights = crate::renderer::lights::wgsl_lights_block(0, 1);
-        for (name, src) in [("mesh", mesh_shader()), ("thin", mesh_shader_variant_with(true, true)), ("lights", lights)] {
+        for (name, src) in [("mesh", mesh_shader()), ("thin", mesh_shader_variant_with(true, true)), ("lights", lights.clone())] {
             let lines: Vec<&str> = src.lines().collect();
             let mut reads = 0;
             for (k, line) in lines.iter().enumerate() {
                 if line.contains("(spot_shadow_tex,") {
                     reads += 1;
                     assert!(
-                        lines[k - 1].contains("if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {"),
+                        lines[k - 1].contains(LIVE_SPOT) || lines[k - 1].contains(SPOT_ROW),
                         "{name}: an ungated spot shadow read: {line}"
                     );
                 }
@@ -1380,6 +1386,11 @@ mod tests {
             let spotless = crate::renderer::lights::without_spot_shadows(src.clone());
             assert_eq!(spotless.lines().count(), lines.len(), "{name}: the twin changes one line");
         }
+        // Every row the lamp loop picks: none, a spot's under the live-spot
+        // test, a characters' tile past the spots', the sun's moving map.
+        let picks: Vec<&str> = lights.lines().map(str::trim).filter(|l| l.starts_with("map = ") || l.starts_with("var map = ")).collect();
+        assert_eq!(picks, ["var map = -1;", "map = 1 + layer;", "map = CHARACTER_MAPS + k;", "map = SUN_MOVING_MAP;"]);
+        assert!(lights.contains(&format!("{LIVE_SPOT}\n            map = 1 + layer;")), "a spot's row is handed out past the live-spot test");
     }
 
     /// Every measurement cut of the mesh shader still finds its text, in the
