@@ -22,7 +22,8 @@
 //! its previous joint palette (`GltfSkin::prev_joint_buffer`), skinned twice
 //! in the vertex shader. Water by its waves: its surface placed twice, from
 //! the wave field's set for this frame and the one for the last
-//! ([`MotionKind::Water`]). Not yet: layered meshes (caves) and effects.
+//! ([`MotionKind::Water`]). Layered meshes (caves) by their ordinary vertices,
+//! as [`MotionKind::Mesh`].
 //!
 //! # Reflections
 //!
@@ -112,10 +113,7 @@ pub const REFLECTION_CONTRAST_RATIO: f32 = 5.0;
 /// sky there is a fifth of the pixel's light and nearly all of its detail
 /// (headset, 2026-09-29).
 pub fn reflection_motion_weight(share: f32) -> f32 {
-    let s = share.clamp(0.0, 1.0);
-    let image = REFLECTION_CONTRAST_RATIO * s;
-    let surface = 1.0 - s;
-    image * image / (image * image + surface * surface).max(1e-12)
+    layer_motion_weight(share, REFLECTION_CONTRAST_RATIO)
 }
 
 /// Bytes between two draws' slots in the ring of [`MotionCamera`]s: the
@@ -125,11 +123,13 @@ pub const SLOT_STRIDE: u64 = 256;
 /// Slots in the ring, both eyes: the world and every mesh, per eye.
 pub const MAX_SLOTS: u32 = 256;
 
-/// The shader: this frame's clip position against the previous frame's, as
-/// NDC, y flipped to Vulkan's. See the module docs. A skinned vertex is
-/// skinned twice, by this frame's joints and by the previous frame's, the
-/// same weighted sum the eye pass takes (`mesh_pipeline`).
-pub fn shader() -> String {
+/// What every motion shader opens with -- the SpaceWarp shader here and the
+/// particles' motion twins (`weather::motion_shader`,
+/// `effects::motion_shader`): the per-draw cameras (group 0, at a dynamic
+/// offset), `motion_of`, which turns two clip positions into the vector the
+/// compositor reads, and `layer_weight`, how much a see-through layer's own
+/// motion counts over what lies behind it ([`layer_motion_weight`]).
+pub fn motion_block() -> String {
     format!(
         r#"
 struct MotionCamera {{
@@ -140,6 +140,67 @@ struct MotionCamera {{
     reflect: vec4<f32>,
 }}
 @group(0) @binding(0) var<uniform> cam: MotionCamera;
+
+fn motion_of(curr: vec4<f32>, prev: vec4<f32>) -> vec4<f32> {{
+    // A point behind the previous frame's eye had no place on its screen:
+    // no motion is the least wrong answer, where dividing by a w near 0
+    // would write infinities for the compositor to sample.
+    if (prev.w <= {min_w}) {{
+        return vec4<f32>(0.0);
+    }}
+    let d = clamp(curr.xyz / curr.w - prev.xyz / prev.w, vec3<f32>(-{max_d}), vec3<f32>({max_d}));
+    return vec4<f32>(d.x, d.y * cam.params.x, d.z, 0.0) * cam.params.y;
+}}
+
+// `layer_motion_weight`: a layer covering `share` of a pixel, carrying `k`
+// times the contrast of what is behind it.
+fn layer_weight(share: f32, k: f32) -> f32 {{
+    let s = clamp(share, 0.0, 1.0);
+    let layer = k * s;
+    let behind = 1.0 - s;
+    return layer * layer / max(layer * layer + behind * behind, 1e-12);
+}}
+"#,
+        min_w = format!("{:?}", MIN_PREV_W),
+        max_d = format!("{:?}", MAX_NDC_MOTION),
+    )
+}
+
+/// HOW MUCH A SEE-THROUGH LAYER'S OWN MOTION COUNTS in its pixel's, when it
+/// covers `share` of the pixel and carries `k` times the contrast of what is
+/// behind it: `(k s)^2 / ((k s)^2 + (1 - s)^2)`. One vector moves both
+/// layers, so one is always left behind; this puts the error where it shows
+/// least -- minimising each layer's contrast moved to the wrong place,
+/// squared. The reflections' rule ([`reflection_motion_weight`]) and the
+/// particles' (written over what is behind them, premultiplied, so a pixel's
+/// motion becomes `w * own + (1 - w) * behind`). See the round-4 table in
+/// `docs/perf-recovery-2026-10-08.md`.
+pub fn layer_motion_weight(share: f32, k: f32) -> f32 {
+    let s = share.clamp(0.0, 1.0);
+    let layer = k * s;
+    let behind = 1.0 - s;
+    layer * layer / (layer * layer + behind * behind).max(1e-12)
+}
+
+/// A BRIGHT, SHARP LAYER over a duller one -- a flame, an ember, a glinting
+/// mote, a rain streak or a flake against the room or the sky -- carries
+/// about as much more contrast as a reflected image over its polished surface
+/// ([`REFLECTION_CONTRAST_RATIO`]): its own motion wins once it covers a
+/// sixth of its pixel.
+pub const BRIGHT_LAYER_CONTRAST: f32 = REFLECTION_CONTRAST_RATIO;
+/// A SOFT LAYER -- smoke, a splash's crown and mist, a bed of coals -- is
+/// no sharper than what is behind it: its motion wins only where it hides
+/// more than half of it.
+pub const SOFT_LAYER_CONTRAST: f32 = 1.0;
+
+/// The shader: this frame's clip position against the previous frame's, as
+/// NDC, y flipped to Vulkan's. See the module docs. A skinned vertex is
+/// skinned twice, by this frame's joints and by the previous frame's, the
+/// same weighted sum the eye pass takes (`mesh_pipeline`).
+pub fn shader() -> String {
+    format!(
+        r#"
+{motion}
 
 struct Joints {{
     m: array<mat4x4<f32>, {joints}>,
@@ -177,17 +238,6 @@ struct VOut {{
     out.curr = out.clip;
     out.prev = cam.prev * before;
     return out;
-}}
-
-fn motion_of(curr: vec4<f32>, prev: vec4<f32>) -> vec4<f32> {{
-    // A point behind the previous frame's eye had no place on its screen:
-    // no motion is the least wrong answer, where dividing by a w near 0
-    // would write infinities for the compositor to sample.
-    if (prev.w <= {min_w}) {{
-        return vec4<f32>(0.0);
-    }}
-    let d = clamp(curr.xyz / curr.w - prev.xyz / prev.w, vec3<f32>(-{max_d}), vec3<f32>({max_d}));
-    return vec4<f32>(d.x, d.y * cam.params.x, d.z, 0.0) * cam.params.y;
 }}
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
@@ -285,9 +335,8 @@ fn reflect_ratio(texel: vec2<f32>, d: f32) -> f32 {{
     return out;
 }}
 "#,
+        motion = motion_block(),
         joints = crate::renderer::mesh::MAX_SKIN_JOINTS,
-        min_w = format!("{:?}", MIN_PREV_W),
-        max_d = format!("{:?}", MAX_NDC_MOTION),
         max_reflected = format!("{:?}", MAX_REFLECTED_DISTANCE),
         surface = crate::renderer::water_pipeline::surface_wgsl(),
         surface_now = crate::renderer::water_pipeline::surface_fn_wgsl("surface_now", "wave_now"),
@@ -405,6 +454,18 @@ pub enum MotionKind {
     /// frame and last: group 1 is the body's uniform and the wave field's two
     /// sets (`MotionPipelines::water_bind_group`).
     Water,
+    /// The falling rain and snow and their splashes (`weather`), each where
+    /// it falls this frame and where it fell the last, written over what is
+    /// behind it by [`layer_motion_weight`]: no vertex buffer, group 1 the
+    /// weather's own group. See `weather::motion_shader`.
+    Weather,
+    /// The effects drawn over what is behind them -- smoke, flames, coals, a
+    /// splash's crown and mist -- and those screened over it -- embers, dust
+    /// motes, a splash's drops. Their instance buffer; group 1 the probe
+    /// pass's read group, group 2 the effects' own. See
+    /// `effects::motion_shader`.
+    EffectsOver,
+    EffectsScreened,
 }
 
 /// The motion-vector pipelines, one per vertex layout the eye pass draws
@@ -425,6 +486,9 @@ pub struct MotionPipelines {
     mesh: wgpu::RenderPipeline,
     skinned: wgpu::RenderPipeline,
     water: wgpu::RenderPipeline,
+    weather: wgpu::RenderPipeline,
+    effects_over: wgpu::RenderPipeline,
+    effects_screened: wgpu::RenderPipeline,
     /// Whether the depth format carries stencil (D24S8), which the pass then
     /// clears too rather than leave for wgpu to zero on first use.
     stencil: bool,
@@ -600,6 +664,92 @@ impl MotionPipelines {
             size(std::mem::size_of::<crate::renderer::water_pipeline::WaterVertex>()),
             &water_attributes,
         );
+        // THE PARTICLES: drawn after everything opaque, tested against its
+        // depth and writing none -- what is behind a drop is still where the
+        // compositor reprojects the pixel from -- and blended premultiplied
+        // over the motion already there: a pixel moves by `w` of the
+        // particle's motion and `1 - w` of what is behind it
+        // ([`layer_motion_weight`]). Colour only: the vector's w is unused.
+        // Group layouts made again here are the renderer's own: wgpu keeps one
+        // of each, so their bind groups fit.
+        let particle = |label: &str,
+                        layouts: &[Option<&wgpu::BindGroupLayout>],
+                        source: String,
+                        (entry, fragment): (&str, &str),
+                        buffers: &[Option<wgpu::VertexBufferLayout>]| {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: layouts,
+                immediate_size: 0,
+            });
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let over = wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            };
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    buffers,
+                },
+                primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth_format,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(fragment),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: MOTION_FORMAT,
+                        blend: Some(wgpu::BlendState { color: over, alpha: over }),
+                        write_mask: wgpu::ColorWrites::COLOR,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let weather_group = crate::renderer::weather::bind_group_layout(device);
+        let weather = particle(
+            "space_warp_weather",
+            &[Some(&camera_layout), Some(&weather_group)],
+            crate::renderer::weather::motion_shader(),
+            ("vs_weather_motion", "fs_weather_motion"),
+            &[],
+        );
+        let probe_group = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(device);
+        let effects_group = crate::renderer::effects::bind_group_layout(device);
+        let effects_layouts = [Some(&camera_layout), Some(&probe_group), Some(&effects_group)];
+        let instances = [Some(crate::renderer::effects::EffectInstance::motion_layout())];
+        let effects_source = crate::renderer::effects::motion_shader();
+        let effects_over = particle(
+            "space_warp_effects_over",
+            &effects_layouts,
+            effects_source.clone(),
+            ("vs_fx_motion", "fs_fx_motion_over"),
+            &instances,
+        );
+        let effects_screened = particle(
+            "space_warp_effects_screened",
+            &effects_layouts,
+            effects_source,
+            ("vs_fx_motion", "fs_fx_motion_screened"),
+            &instances,
+        );
         Self {
             camera_layout,
             joints_layout,
@@ -611,6 +761,9 @@ impl MotionPipelines {
             mesh,
             skinned,
             water,
+            weather,
+            effects_over,
+            effects_screened,
             stencil: depth_format.has_stencil_aspect(),
         }
     }
@@ -660,6 +813,9 @@ impl MotionPipelines {
             MotionKind::Mesh => &self.mesh,
             MotionKind::Skinned => &self.skinned,
             MotionKind::Water => &self.water,
+            MotionKind::Weather => &self.weather,
+            MotionKind::EffectsOver => &self.effects_over,
+            MotionKind::EffectsScreened => &self.effects_screened,
         }
     }
 }
@@ -679,7 +835,22 @@ pub struct MotionDraw<'a> {
     pub joints: Option<&'a wgpu::BindGroup>,
 }
 
-/// Draw one eye's motion vectors and depth into `motion` and `depth`.
+/// One particle draw of the motion pass, after every [`MotionDraw`]:
+/// `vertices` a particle, `range` the instances, from `instances` (the
+/// effects') or none (the weather's, placed from their index alone), with
+/// group 1 and group 2 as its kind takes them.
+pub struct MotionParticles<'a> {
+    pub kind: MotionKind,
+    pub instances: Option<&'a wgpu::Buffer>,
+    pub vertices: u32,
+    pub range: std::ops::Range<u32>,
+    pub slot: u32,
+    pub groups: [Option<&'a wgpu::BindGroup>; 2],
+}
+
+/// Draw one eye's motion vectors and depth into `motion` and `depth`: the
+/// opaque `draws`, then the `particles` over them.
+#[allow(clippy::too_many_arguments)]
 pub fn record(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &MotionPipelines,
@@ -687,6 +858,7 @@ pub fn record(
     motion: &wgpu::TextureView,
     depth: &wgpu::TextureView,
     draws: &[MotionDraw],
+    particles: &[MotionParticles],
     stencil_store: bool,
     depth_clear: f32,
 ) {
@@ -710,19 +882,93 @@ pub fn record(
         }),
         ..Default::default()
     });
+    // A run of draws of one buffer -- the brushes' visible ranges -- binds
+    // it once.
+    let mut bound: Option<(MotionKind, u32, *const wgpu::Buffer, *const wgpu::Buffer, Option<*const wgpu::BindGroup>)> = None;
     for d in draws.iter().filter(|d| d.count > 0 && d.slot < MAX_SLOTS) {
         if matches!(d.kind, MotionKind::Skinned | MotionKind::BrushReflect | MotionKind::Water) && d.joints.is_none() {
             continue;
         }
-        pass.set_pipeline(pipelines.pipeline(d.kind));
-        pass.set_bind_group(0, cameras, &[(d.slot as u64 * SLOT_STRIDE) as u32]);
-        if let Some(j) = d.joints {
-            pass.set_bind_group(1, j, &[]);
+        if matches!(d.kind, MotionKind::Weather | MotionKind::EffectsOver | MotionKind::EffectsScreened) {
+            continue;
         }
-        pass.set_vertex_buffer(0, d.vertices.slice(..));
-        pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
+        let key = (d.kind, d.slot, d.vertices as *const _, d.indices as *const _, d.joints.map(|j| j as *const _));
+        if bound != Some(key) {
+            pass.set_pipeline(pipelines.pipeline(d.kind));
+            pass.set_bind_group(0, cameras, &[(d.slot as u64 * SLOT_STRIDE) as u32]);
+            if let Some(j) = d.joints {
+                pass.set_bind_group(1, j, &[]);
+            }
+            pass.set_vertex_buffer(0, d.vertices.slice(..));
+            pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
+            bound = Some(key);
+        }
         pass.draw_indexed(d.first..d.first + d.count, 0, 0..1);
     }
+    for p in particles.iter().filter(|p| !p.range.is_empty() && p.vertices > 0 && p.slot < MAX_SLOTS) {
+        let wants = match p.kind {
+            MotionKind::Weather => p.groups[0].is_some(),
+            MotionKind::EffectsOver | MotionKind::EffectsScreened => p.groups.iter().all(Option::is_some) && p.instances.is_some(),
+            _ => false,
+        };
+        if !wants {
+            continue;
+        }
+        pass.set_pipeline(pipelines.pipeline(p.kind));
+        pass.set_bind_group(0, cameras, &[(p.slot as u64 * SLOT_STRIDE) as u32]);
+        for (k, g) in p.groups.iter().enumerate() {
+            if let Some(g) = g {
+                pass.set_bind_group(1 + k as u32, *g, &[]);
+            }
+        }
+        if let Some(b) = p.instances {
+            pass.set_vertex_buffer(0, b.slice(..));
+        }
+        pass.draw(0..p.vertices, p.range.clone());
+    }
+}
+
+/// TRIANGLES A RUN when the brushes are cut into runs for the motion pass's
+/// cull ([`index_runs`]): small enough that a run is a few faces of one
+/// room, large enough that a level is a thousand runs or so.
+pub const RUN_TRIANGLES: usize = 64;
+
+/// THE BRUSHES' INDEX LIST IN RUNS of [`RUN_TRIANGLES`], each with the box
+/// round its triangles (`position` of each vertex index), in the frame the
+/// vertices are in. Consecutive brush triangles are faces of one brush, so a
+/// run is small in space and most of a level's runs are out of a view.
+pub fn index_runs(indices: &[u32], position: impl Fn(u32) -> glam::Vec3) -> Vec<crate::renderer::shadow::CasterChunk> {
+    let per = RUN_TRIANGLES * 3;
+    indices
+        .chunks(per)
+        .enumerate()
+        .map(|(k, run)| {
+            let (min, max) = run.iter().fold(
+                (glam::Vec3::splat(f32::INFINITY), glam::Vec3::splat(f32::NEG_INFINITY)),
+                |(lo, hi), &i| {
+                    let p = position(i);
+                    (lo.min(p), hi.max(p))
+                },
+            );
+            crate::renderer::shadow::CasterChunk { first_index: (k * per) as u32, index_count: run.len() as u32, min, max }
+        })
+        .collect()
+}
+
+/// THE RANGES OF THE INDEX LIST ONE EYE CAN SEE: the runs whose box is not
+/// wholly behind one plane of its frustum (`shadow::frustum_planes`),
+/// neighbours merged into one range. LOSSLESS: the motion pipelines clip at
+/// every plane, so a triangle wholly outside one draws nothing anyway --
+/// what the cull saves is its vertices and its binning, per eye.
+pub fn visible_ranges(runs: &[crate::renderer::shadow::CasterChunk], planes: &[glam::Vec4; 6]) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for r in runs.iter().filter(|r| crate::renderer::shadow::aabb_in_frustum(planes, r.min, r.max)) {
+        match out.last_mut() {
+            Some((first, count)) if *first + *count == r.first_index => *count += r.index_count,
+            _ => out.push((r.first_index, r.index_count)),
+        }
+    }
+    out
 }
 
 /// The space warp info for one eye, as `XrCompositionLayerSpaceWarpInfoFB`.
@@ -774,6 +1020,69 @@ mod tests {
         assert!(SLOT_STRIDE >= device.limits().min_uniform_buffer_offset_alignment as u64);
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "{err:?}");
+    }
+
+    /// THE MOTION PASS'S CULL IS LOSSLESS: every triangle with a corner in
+    /// an eye's view is in that eye's ranges; the runs wholly behind it are
+    /// left out -- most of a level spread all round the head -- and the
+    /// ranges are merged and inside the list.
+    #[test]
+    fn the_motion_cull_keeps_every_triangle_in_view_and_drops_the_rest() {
+        // A ring of small walls round the head, a triangle pair a wall.
+        let mut positions: Vec<Vec3> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        for k in 0..2000 {
+            let a = k as f32 / 2000.0 * std::f32::consts::TAU;
+            let r = 3.0 + (k % 7) as f32;
+            let c = Vec3::new(a.cos() * r, 1.0 + (k % 3) as f32, a.sin() * r);
+            let n = positions.len() as u32;
+            positions.extend([c, c + Vec3::new(0.3, 0.0, 0.0), c + Vec3::new(0.3, 0.3, 0.0), c + Vec3::new(0.0, 0.3, 0.0)]);
+            indices.extend([n, n + 1, n + 2, n, n + 2, n + 3]);
+        }
+        let runs = index_runs(&indices, |i| positions[i as usize]);
+        let vp = view_proj(Vec3::new(0.0, 1.6, 0.0), 0.7);
+        let planes = crate::renderer::shadow::frustum_planes(vp);
+        let ranges = visible_ranges(&runs, &planes);
+        let drawn = |t: usize| ranges.iter().any(|&(f, c)| (t * 3) as u32 >= f && ((t * 3) as u32) < f + c);
+        let inside = |p: Vec3| {
+            let c = vp * p.extend(1.0);
+            c.w > 0.0 && c.x.abs() <= c.w && c.y.abs() <= c.w && c.z >= 0.0 && c.z <= c.w
+        };
+        let mut seen = 0;
+        for t in 0..indices.len() / 3 {
+            if (0..3).any(|k| inside(positions[indices[t * 3 + k] as usize])) {
+                seen += 1;
+                assert!(drawn(t), "triangle {t} is in view and was culled");
+            }
+        }
+        let kept: u32 = ranges.iter().map(|r| r.1).sum();
+        assert!(seen > 0);
+        assert!((kept as usize) < indices.len() / 2, "kept {kept} of {}", indices.len());
+        assert!(ranges.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "ranges merged and in order");
+        assert!(ranges.iter().all(|&(f, c)| (f + c) as usize <= indices.len()));
+        // Unculled, as `space_warp_debug` 131072 draws it: everything.
+        let all = [glam::Vec4::new(0.0, 0.0, 0.0, 1.0); 6];
+        assert_eq!(visible_ranges(&runs, &all), vec![(0, indices.len() as u32)]);
+    }
+
+    /// HOW MUCH A PARTICLE MOVES ITS PIXEL: nothing where it covers nothing,
+    /// all of it where it covers all; a bright sharp layer wins at a sixth of
+    /// the pixel, a soft one at half; and more cover never counts for less.
+    #[test]
+    fn a_particle_moves_its_pixel_by_its_share() {
+        for k in [BRIGHT_LAYER_CONTRAST, SOFT_LAYER_CONTRAST] {
+            assert_eq!(layer_motion_weight(0.0, k), 0.0);
+            assert!((layer_motion_weight(1.0, k) - 1.0).abs() < 1e-6);
+            let mut last = 0.0;
+            for i in 0..=100 {
+                let w = layer_motion_weight(i as f32 / 100.0, k);
+                assert!(w >= last - 1e-6);
+                last = w;
+            }
+        }
+        assert!((layer_motion_weight(1.0 / 6.0, BRIGHT_LAYER_CONTRAST) - 0.5).abs() < 1e-5);
+        assert!((layer_motion_weight(0.5, SOFT_LAYER_CONTRAST) - 0.5).abs() < 1e-6);
+        assert_eq!(reflection_motion_weight(0.3), layer_motion_weight(0.3, REFLECTION_CONTRAST_RATIO));
     }
 
     /// A hand moving right in front of a still head: its pixels move right,
@@ -1100,7 +1409,7 @@ mod tests {
                 slot,
                 joints: Some(&reflect),
             };
-            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], false, 1.0);
+            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], &[], false, 1.0);
             encoder.copy_texture_to_buffer(
                 motion.as_image_copy(),
                 wgpu::TexelCopyBufferInfo {
@@ -1248,7 +1557,7 @@ mod tests {
                 joints: Some(&groups[waves.current()]),
             };
             let depth_view = depth.create_view(&Default::default());
-            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], false, 1.0);
+            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], &[], false, 1.0);
             for (texture, back, bytes, aspect) in
                 [(&motion, &motion_back, 8, wgpu::TextureAspect::All), (&depth, &depth_back, 4, wgpu::TextureAspect::DepthOnly)]
             {

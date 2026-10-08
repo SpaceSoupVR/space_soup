@@ -4617,6 +4617,11 @@ fn ground_trace_until(e: vec3<f32>, d: vec3<f32>, t_max: f32) -> f32 {{
     // cell ahead.
     let nudge = sign(dq) * 1e-3;
     var hit = -1.0;
+    // A ray that STARTS UNDER the map's ground -- from a hollow finer than its
+    // texels, where a puddle lies -- meets nothing until it has risen above
+    // it: before, it met the ground where it started and a mirror puddle
+    // showed the grass under it, a flat dark-green pool (headset, 2026-10-08).
+    var risen = false;
     for (var steps = 0; steps < GROUND_TRACE_MAX_STEPS && t < t_out; steps = steps + 1) {{
         let cell = f32(1u << u32(level));
         let last = floor(size / cell) - 1.0;
@@ -4625,6 +4630,7 @@ fn ground_trace_until(e: vec3<f32>, d: vec3<f32>, t_max: f32) -> f32 {{
         let t_exit = min(min(exits.x, exits.y), t_out);
         let highest = textureLoad(ground_map, vec2<i32>(c), level).a;
         let y_in = e.y + d.y * t;
+        risen = risen || y_in > highest;
         if (min(y_in, e.y + d.y * t_exit) <= highest) {{
             // Nothing in this cell before the ray is down to its highest ground.
             let t_top = select(t, t + (y_in - highest) / -d.y, y_in > highest);
@@ -4639,13 +4645,15 @@ fn ground_trace_until(e: vec3<f32>, d: vec3<f32>, t_max: f32) -> f32 {{
             // them -- so the reads go out together rather than one by one.
             let span = (t_exit - t_top) / f32(GROUND_TRACE_READINGS - 1);
             var f_prev = e.y + d.y * t_top - textureSampleLevel(ground_map, probe_samp, (q0 + dq * t_top) / size, 0.0).a;
-            var crossing = select(-1.0, t_top, f_prev <= 0.0);
+            var crossing = select(-1.0, t_top, f_prev <= 0.0 && risen);
+            risen = risen || f_prev > 0.0;
             for (var k = 1; k < GROUND_TRACE_READINGS; k = k + 1) {{
                 let tk = t_top + span * f32(k);
                 let f = e.y + d.y * tk - textureSampleLevel(ground_map, probe_samp, (q0 + dq * tk) / size, 0.0).a;
-                if (crossing < 0.0 && f <= 0.0) {{
+                if (crossing < 0.0 && f <= 0.0 && risen) {{
                     crossing = tk - span + span * f_prev / (f_prev - f);
                 }}
+                risen = risen || f > 0.0;
                 f_prev = f;
             }}
             if (crossing >= 0.0) {{

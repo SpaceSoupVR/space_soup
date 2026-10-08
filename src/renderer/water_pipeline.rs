@@ -122,8 +122,20 @@ fn breaker_amp(t: f32, xz: glam::Vec2, count: f32) -> f32 {
     let section = 0.5 + 0.5 * (xz.dot(glam::Vec2::new(ax, az)) + inner + 3.0 * w0 * t).sin();
     set * (0.45 + 0.55 * section)
 }
-const BREAKER_FRONT: f32 = 0.035;
-const BREAKER_BACK: f32 = 0.07;
+/// The breaker's face toward the shore, in periods: a ROUNDED crest on most
+/// waves (`BREAKER_FRONT_ROUND`), steepening to a lip (`BREAKER_FRONT`) only
+/// on the biggest of a set (`breaker_amp` over `BREAKER_LIP_FROM`). Every
+/// wave had the lip's 0.035 and a 0.07 back: a crest eight times as sharp in
+/// front as behind, a pinched ridge on every wave (user, Checkpoint 52).
+const BREAKER_FRONT: f32 = 0.04;
+const BREAKER_FRONT_ROUND: f32 = 0.08;
+const BREAKER_LIP_FROM: f32 = 0.8;
+const BREAKER_BACK: f32 = 0.1;
+/// `breaker_front` in [`surface_wgsl`]: the face's width for a breaker `amp` big.
+fn breaker_front(amp: f32) -> f32 {
+    let t = ((amp - BREAKER_LIP_FROM) / (1.0 - BREAKER_LIP_FROM)).clamp(0.0, 1.0);
+    BREAKER_FRONT_ROUND + (BREAKER_FRONT - BREAKER_FRONT_ROUND) * t * t * (3.0 - 2.0 * t)
+}
 /// Metres from the eye over which a sea's skirt is raised to the eye's own
 /// height, so its far edge meets the sky AT the horizon. Left level, the edge
 /// lay a few ten-thousandths of a radian below it, where the sky draws its
@@ -581,7 +593,8 @@ pub fn swash_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
     let height = grown.min(BREAK_RATIO * still_depth.max(0.0));
     let s = phase - phase.round();
     let b = s / BREAKER_BACK;
-    let profile = if s > 0.0 { (1.0 + b) * (-b).exp() } else { (-(s * s) / (BREAKER_FRONT * BREAKER_FRONT)).exp() };
+    let front = breaker_front(amp);
+    let profile = if s > 0.0 { (1.0 + b) * (-b).exp() } else { (-(s * s) / (front * front)).exp() };
     swash * (1.0 - smooth(0.3, 1.5, still_depth)) * rise * (0.5 + 0.5 * amp) + height * profile + swell_lift(u, still_depth, xz)
 }
 
@@ -634,6 +647,8 @@ const SWASH_LEAD: f32 = {swash_lead};
 const BREAKER_PER_SWASH: f32 = {breaker_per_swash};
 const BREAK_RATIO: f32 = {break_ratio};
 const BREAKER_FRONT: f32 = {breaker_front};
+const BREAKER_FRONT_ROUND: f32 = {breaker_front_round};
+const BREAKER_LIP_FROM: f32 = {breaker_lip_from};
 const BREAKER_BACK: f32 = {breaker_back};
 
 struct WaterMat {{
@@ -683,17 +698,24 @@ fn breaker_height(still_depth: f32, amp: f32) -> f32 {{
 // Its shape about its crest, 1 there, by the swash's phase: steep ahead of it
 // (toward the shore, where the phase is still to come), long behind it, and
 // level at the crest itself so the light does not crease along it.
-fn breaker_profile(phase: f32) -> f32 {{
+fn breaker_profile(phase: f32, amp: f32) -> f32 {{
     let s = phase - round(phase);
     let b = s / BREAKER_BACK;
-    return select(exp(-(s * s) / (BREAKER_FRONT * BREAKER_FRONT)), (1.0 + b) * exp(-b), s > 0.0);
+    let f = breaker_front(amp);
+    return select(exp(-(s * s) / (f * f)), (1.0 + b) * exp(-b), s > 0.0);
+}}
+
+// The face's width: rounded, a lip only on the biggest (`breaker_front`).
+fn breaker_front(amp: f32) -> f32 {{
+    return mix(BREAKER_FRONT_ROUND, BREAKER_FRONT, smoothstep(BREAKER_LIP_FROM, 1.0, amp));
 }}
 
 // Its rate of change with the phase.
-fn breaker_profile_slope(phase: f32) -> f32 {{
+fn breaker_profile_slope(phase: f32, amp: f32) -> f32 {{
     let s = phase - round(phase);
     let b = s / BREAKER_BACK;
-    return select(-2.0 * s / (BREAKER_FRONT * BREAKER_FRONT) * exp(-(s * s) / (BREAKER_FRONT * BREAKER_FRONT)), -b / BREAKER_BACK * exp(-b), s > 0.0);
+    let f = breaker_front(amp);
+    return select(-2.0 * s / (f * f) * exp(-(s * s) / (f * f)), -b / BREAKER_BACK * exp(-b), s > 0.0);
 }}
 
 // THE SWELL at a world xz and time: its height, per metre of `air.y`, and its
@@ -724,6 +746,8 @@ fn swell_at(xz: vec2<f32>, t: f32) -> vec3<f32> {{
         break_ratio = format!("{BREAK_RATIO:?}"),
         breaker_front = format!("{BREAKER_FRONT:?}"),
         breaker_back = format!("{BREAKER_BACK:?}"),
+        breaker_front_round = format!("{BREAKER_FRONT_ROUND:?}"),
+        breaker_lip_from = format!("{BREAKER_LIP_FROM:?}"),
         swell0 = swell_wgsl(0),
         swell1 = swell_wgsl(1),
         swell2 = swell_wgsl(2),
@@ -761,7 +785,7 @@ fn {name}(pos: vec3<f32>, depth: f32, eye: vec3<f32>, t: f32) -> vec3<f32> {{
         let count = swash_count(depth, pos.xz, t);
         let phase = fract(count);
         let amp = breaker_amp(pos.xz, t, count);
-        p.y = p.y + water.waves.y * shore * swash_rise(phase) * (0.5 + 0.5 * amp) + breaker_height(depth, amp) * breaker_profile(phase);
+        p.y = p.y + water.waves.y * shore * swash_rise(phase) * (0.5 + 0.5 * amp) + breaker_height(depth, amp) * breaker_profile(phase, amp);
     }}
     if (water.air.y > 0.0) {{
         p.y = p.y + water.air.y * swell_at(pos.xz, t).x * near * smoothstep(0.15, 0.6, depth);
@@ -1051,7 +1075,8 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         let dx = px - breaker_phase;
         let dz = pz - breaker_phase;
         let across = vec2<f32>(dx - round(dx), dz - round(dz)) / 0.5;
-        tilt = tilt + breaker_height(still_depth, breaker_amp(q, water.tiles.w, breaker_count)) * breaker_profile_slope(breaker_phase) * across;
+        let breaker_size = breaker_amp(q, water.tiles.w, breaker_count);
+        tilt = tilt + breaker_height(still_depth, breaker_size) * breaker_profile_slope(breaker_phase, breaker_size) * across;
     }}
     // SPLASHES' RINGS, and the foam each leaves where it struck. A ring's
     // train is gone where a pixel spans half its wavelength: further off it

@@ -56,6 +56,10 @@ struct SpaceWarpState {
     /// Each mesh's model matrix last frame, by its model buffer (which lives
     /// as long as the mesh does).
     prev_models: HashMap<wgpu::Buffer, glam::Mat4>,
+    /// The previous frame's clocks -- the weather's and the effects' -- for
+    /// how far each particle moved since it (`space_warp::MotionKind::
+    /// Weather`, `EffectsOver`).
+    prev_clocks: Option<(f64, f64)>,
     /// This frame's motion and depth images, while held.
     acquired: Option<(usize, usize)>,
     /// What each eye's projection view points at; alive until the frame is
@@ -206,6 +210,7 @@ impl SpaceWarpState {
             camera_group,
             prev: None,
             prev_models: HashMap::new(),
+            prev_clocks: None,
             acquired: None,
             info,
             motion_raw,

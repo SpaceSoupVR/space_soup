@@ -458,7 +458,7 @@ fn preset(kind: EffectKind) -> Preset {
 }
 
 /// One particle as the GPU draws it: its cutout, fanned from
-/// `vertex_index`. 96 bytes.
+/// `vertex_index`. 112 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct EffectInstance {
@@ -482,6 +482,11 @@ pub struct EffectInstance {
     /// flame, negative mirrored; 0 is square) or a bed's clock, and how it
     /// is shaded: 1 six-way smoke, 2 a flame, 3 a bed of coals, 0 plain.
     pub params: [f32; 4],
+    /// HOW IT MOVES, for SpaceWarp (`motion_shader`): its centre's velocity,
+    /// m/s, player frame; w, for a flame, the book seconds its sheet plays a
+    /// second (its gas rises through the frame at that pace, `flame_v`), 0
+    /// otherwise. Not read by the effects' own shader.
+    pub motion: [f32; 4],
 }
 
 impl EffectInstance {
@@ -494,6 +499,20 @@ impl EffectInstance {
             array_stride: std::mem::size_of::<Self>() as BufferAddress,
             step_mode: VertexStepMode::Instance,
             attributes: &Self::ATTRIBS,
+        }
+    }
+
+    pub const MOTION_ATTRIBS: [VertexAttribute; 7] = vertex_attr_array![
+        0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4
+    ];
+
+    /// The layout SpaceWarp's motion twin reads: [`Self::layout`] and the
+    /// motion besides, at location 6.
+    pub fn motion_layout() -> VertexBufferLayout<'static> {
+        VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as BufferAddress,
+            step_mode: VertexStepMode::Instance,
+            attributes: &Self::MOTION_ATTRIBS,
         }
     }
 }
@@ -587,6 +606,17 @@ fn ballistic(p0: Vec3, v0: Vec3, accel: Vec3, k: f32, age: f32) -> (Vec3, Vec3) 
 /// have it at a pixel with no averaging, unshadowed: (rgb, direction toward
 /// the lamp). Suns are left out: indoors their light would come through the
 /// walls, and a particle has no mask to say so.
+/// The step a particle's velocity is taken over where it is not had in closed
+/// form (the air's drift, a mote's jostle, a crown's swell): a 64th of a
+/// second, about a SpaceWarp frame's half.
+const MOTION_H: f32 = 1.0 / 64.0;
+
+/// How fast a swirl -- `radius` out at `angle`, growing `growth` m/s and
+/// turning `turn` rad/s -- carries a particle, m/s.
+fn swirl_motion(growth: f32, radius: f32, turn: f32, angle: f32) -> Vec3 {
+    Vec3::new(angle.cos(), 0.0, angle.sin()) * growth + Vec3::new(-angle.sin(), 0.0, angle.cos()) * (radius * turn)
+}
+
 fn lamp_at(l: &Light, p: Vec3) -> Option<(Vec3, Vec3)> {
     if matches!(l.kind, LightKind::Directional) || l.intensity <= 0.0 {
         return None;
@@ -872,6 +902,8 @@ struct FlameSheet {
     mirrored: bool,
     /// Its uniform for brightness and temperature.
     heat: f32,
+    /// Book seconds it plays a second: 0 once it has reached the book's end.
+    book: f32,
 }
 
 /// A FIRE'S SHEETS at `time`: standing on their spots of the bed, their base a
@@ -942,11 +974,13 @@ fn fire_sheets(e: &EffectEmitter, time: f64) -> Vec<FlameSheet> {
         if start < 0.0 {
             start += per;
         }
+        let frame = start.clamp(0.0, range) + age * pace;
         out.push(FlameSheet {
             base: spot,
             size,
             stretch: FLAME_STRETCH * tall / wide,
-            frame: (start.clamp(0.0, range) + age * pace).min(last),
+            frame: frame.min(last),
+            book: if frame < last { pace * FLAME_SECONDS / FIRE_FRAMES as f32 } else { 0.0 },
             risen: smoothstep(0.0, 0.25, t),
             stands: 1.0 - smoothstep(0.6, 1.0, t),
             rotation: (2.0 * u[9] - 1.0) * (p.spin.1 * v.turbulence) + p.spin.0 * age * spin_dir,
@@ -1122,6 +1156,8 @@ fn coals_instance(e: &EffectEmitter, time: f64, at: &Surroundings, own: &dyn Fn(
         light_dir: [0.0, 1.0, 0.0, v.flicker - 1.0],
         axis: [normal.x, normal.y, normal.z, 0.0],
         params: [spin, COALS_LAYER as f32, ((time * v.flicker_rate as f64) % 3600.0) as f32, 3.0],
+        // A bed lies still.
+        motion: [0.0; 4],
     })
 }
 
@@ -1258,18 +1294,25 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
             };
             let dir = cone_direction(up, p.spread_deg, u[2], u[3]);
             let (mut pos, vel) = ballistic(p0, dir * speed, p.accel, p.drag, age);
+            // Its velocity, for SpaceWarp: the throw's, and what carries it
+            // besides, each as its own term moves.
+            let mut moving = vel;
             if let Some(air) = &air {
                 // Carried by the room's air with its neighbours, and jostled
                 // on its own by the smallest eddies -- a wander that never
                 // retraces itself, where a sum of sines drew loops.
                 pos += (air_drift(air, p0, time) - air_drift(air, p0, time - age as f64)) * v.turbulence;
                 let seed = base ^ (i as u64).wrapping_mul(0x632be59bd9b4e019) ^ (n as i64 as u64);
+                let wander = |jitter: f32| Vec3::new(noise1(jitter, seed), 0.6 * noise1(jitter, seed ^ 1), noise1(jitter, seed ^ 2)) * (p.swirl.0 * v.turbulence);
                 let jitter = age * p.swirl.1;
-                pos += Vec3::new(noise1(jitter, seed), 0.6 * noise1(jitter, seed ^ 1), noise1(jitter, seed ^ 2)) * (p.swirl.0 * v.turbulence);
+                pos += wander(jitter);
+                moving += (air_drift(air, p0, time) - air_drift(air, p0, time - MOTION_H as f64)) * (v.turbulence / MOTION_H)
+                    + (wander(jitter) - wander((age - MOTION_H) * p.swirl.1)) / MOTION_H;
             } else {
                 let swirl_r = p.swirl.0 * v.turbulence * t * e.scale;
                 let swirl_a = p.swirl.1 * age + u[7] * std::f32::consts::TAU;
                 pos += Vec3::new(swirl_a.cos(), 0.0, swirl_a.sin()) * swirl_r;
+                moving += swirl_motion(p.swirl.0 * v.turbulence * e.scale / life, swirl_r, p.swirl.1, swirl_a);
             }
             let mut size = if e.kind == EffectKind::Dust {
                 // Many faint, few bright (`DUST_LIGHT_SIZE`); spread over
@@ -1293,9 +1336,18 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                             pos.y = under - 0.15 * size * (1.0 - (-excess).exp());
                             pos += Vec3::new(a.cos(), 0.0, a.sin()) * (0.9 * excess);
                             size *= 1.0 + 0.5 * excess.min(2.0);
+                            // What still rises is turned out under it.
+                            let rise = moving.y;
+                            moving.y = 0.15 * size * (-excess).exp() * -rise;
+                            moving += Vec3::new(a.cos(), 0.0, a.sin()) * (0.9 * rise);
                         }
                     }
-                    EffectKind::Embers => pos.y = pos.y.min(top - 0.02),
+                    EffectKind::Embers => {
+                        if pos.y >= top - 0.02 {
+                            pos.y = top - 0.02;
+                            moving.y = moving.y.min(0.0);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1306,6 +1358,7 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
             let centre = player(pos);
             let axis = at.yaw_inv * vel.try_normalize().unwrap_or(Vec3::Y);
             let to_eye = (at.head - centre).normalize_or_zero();
+            let moving = at.yaw_inv * moving;
             let mut inst = EffectInstance {
                 centre: [centre.x, centre.y, centre.z, size],
                 colour: [0.0; 4],
@@ -1313,6 +1366,7 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                 light_dir: [0.0, 1.0, 0.0, streak],
                 axis: [axis.x, axis.y, axis.z, p.soft * e.scale.sqrt()],
                 params: [rotation, frame, 0.0, 0.0],
+                motion: [moving.x, moving.y, moving.z, 0.0],
             };
             match e.kind {
                 EffectKind::Embers => {
@@ -1527,6 +1581,8 @@ fn fire_instances(e: &EffectEmitter, time: f64, at: &Surroundings, over: &mut Ve
                 light_dir: [0.0, 1.0, 0.0, 0.0],
                 axis: [axis.x, axis.y, axis.z, p.soft * e.scale.sqrt()],
                 params: [s.rotation, FIRE_FIRST as f32 + s.frame, if s.mirrored { -s.stretch } else { s.stretch }, 2.0],
+                // A sheet stands on its spot; its gas rises through it.
+                motion: [0.0, 0.0, 0.0, s.book],
             },
         ));
     }
@@ -1602,9 +1658,14 @@ fn ember_pops(e: &EffectEmitter, time: f64, at: &Surroundings, screened: &mut Ve
             let swirl_r = p.swirl.0 * v.turbulence * t * e.scale;
             let swirl_a = p.swirl.1 * age + u[7] * std::f32::consts::TAU;
             pos += Vec3::new(swirl_a.cos(), 0.0, swirl_a.sin()) * swirl_r;
+            let mut moving = vel + swirl_motion(p.swirl.0 * v.turbulence * e.scale / life, swirl_r, p.swirl.1, swirl_a);
             if let Some(top) = e.ceiling {
-                pos.y = pos.y.min(top - 0.02);
+                if pos.y >= top - 0.02 {
+                    pos.y = top - 0.02;
+                    moving.y = moving.y.min(0.0);
+                }
             }
+            let moving = at.yaw_inv * moving;
             let size = lerp(p.size.0, p.size.1, smoothstep(0.0, 1.0, t)) * e.scale * size_spread(u[8], &v);
             let centre = at.yaw_inv * (pos - at.offset);
             let axis = at.yaw_inv * vel.try_normalize().unwrap_or(Vec3::Y);
@@ -1619,6 +1680,7 @@ fn ember_pops(e: &EffectEmitter, time: f64, at: &Surroundings, screened: &mut Ve
                 light_dir: [0.0, 1.0, 0.0, vel.length() * p.streak],
                 axis: [axis.x, axis.y, axis.z, p.soft * root],
                 params: [0.0, p.frames.0 as f32, 0.0, 0.0],
+                motion: [moving.x, moving.y, moving.z, 0.0],
             });
         }
     }
@@ -1717,6 +1779,7 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         }
         let centre = player(pos);
         let axis = at.yaw_inv * vel.normalize_or(Vec3::Y);
+        let moving = at.yaw_inv * vel;
         let c = lit(centre, DROP_ALBEDO, DROP_PHASE_G);
         let radius = lerp(0.0015, 0.004, u[5]);
         screened.push(EffectInstance {
@@ -1726,6 +1789,7 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
             light_dir: [0.0, 1.0, 0.0, vel.length() * DROP_STREAK],
             axis: [axis.x, axis.y, axis.z, 0.01],
             params: [0.0, EMBER_LAYER as f32, 0.0, 0.0],
+            motion: [moving.x, moving.y, moving.z, 0.0],
         });
     }
     // THE CROWN: the body of the splash, the jets it throws up -- thousands
@@ -1737,9 +1801,11 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
     let t = age / crown_life;
     if t < 1.0 {
         let u = uniforms(hash64(s.seed ^ 0xc80));
-        let height = rise * smoothstep(0.0, 0.3, t) * (1.0 - 0.45 * smoothstep(0.45, 1.0, t));
-        let half = 0.5 * height.max(s.size);
+        let half_at = |t: f32| 0.5 * (rise * smoothstep(0.0, 0.3, t) * (1.0 - 0.45 * smoothstep(0.45, 1.0, t))).max(s.size);
+        let half = half_at(t);
         let centre = player(s.position + Vec3::Y * (half * 0.92));
+        // It stands on the water, its middle rising and sinking with it.
+        let lift = 0.92 * (half - half_at(t - MOTION_H / crown_life)) / MOTION_H;
         let c = lit(centre, 0.95, 0.0);
         let opacity = 0.85 * smoothstep(0.0, 0.04, t) * (1.0 - smoothstep(0.5, 1.0, t)) * strength.sqrt().clamp(0.35, 1.0);
         over.push((
@@ -1751,6 +1817,7 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
                 light_dir: [0.0, 1.0, 0.0, 0.0],
                 axis: [0.0, 1.0, 0.0, 0.03],
                 params: [(2.0 * u[0] - 1.0) * 0.15, CROWN_LAYER as f32, if u[1] < 0.5 { -1.0 } else { 1.0 }, 0.0],
+                motion: [0.0, lift, 0.0, 0.0],
             },
         ));
     }
@@ -1766,8 +1833,10 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         let azimuth = u[1] * std::f32::consts::TAU;
         let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
         let v0 = out * lerp(0.2, 0.7, u[2]) * s.speed.sqrt() + Vec3::Y * lerp(0.3, 1.0, u[3]) * s.speed.sqrt();
-        let (pos, _) = ballistic(s.position + out * s.size * 0.6, v0, Vec3::new(0.0, -2.0, 0.0), 3.0, age);
-        let centre = player(pos.max(Vec3::new(f32::MIN, s.position.y + 0.02, f32::MIN)));
+        let (pos, vel) = ballistic(s.position + out * s.size * 0.6, v0, Vec3::new(0.0, -2.0, 0.0), 3.0, age);
+        let floor = s.position.y + 0.02;
+        let centre = player(pos.max(Vec3::new(f32::MIN, floor, f32::MIN)));
+        let moving = at.yaw_inv * if pos.y < floor { vel * Vec3::new(1.0, 0.0, 1.0) } else { vel };
         let size = s.size * lerp(0.7, 1.2, u[4]) * (0.6 + 1.6 * t) * strength.sqrt().clamp(0.6, 1.8);
         // Thick, its light is scattered many times over: as bright from any
         // side, so even (g = 0), not a single drop's forward lobe.
@@ -1783,6 +1852,7 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
                 light_dir: [0.0, 1.0, 0.0, 0.0],
                 axis: [0.0, 1.0, 0.0, 0.05],
                 params: [(2.0 * u[5] - 1.0) * std::f32::consts::PI, frame.min((SMOKE_FRAMES - 1) as f32), 0.0, 0.0],
+                motion: [moving.x, moving.y, moving.z, 0.0],
             },
         ));
     }
@@ -2797,6 +2867,13 @@ impl EffectsGpu {
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(uniform));
     }
 
+    /// What SpaceWarp's motion twin draws (`space_warp::MotionKind::
+    /// EffectsOver`): the instances, the group, and how many are drawn over
+    /// and how many screened.
+    pub fn motion_parts(&self) -> (&Buffer, &BindGroup, u32, u32) {
+        (&self.instances, &self.bind_group, self.over, self.screened)
+    }
+
     /// Whether there is anything to draw this frame.
     pub fn any(&self) -> bool {
         self.over + self.screened > 0
@@ -3224,6 +3301,161 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
         .replace("FLAME_BASE", &format!("{FLAME_BASE:?}"))
         .replace("FLAME_W0", &format!("{FLAME_W0:?}"))
         .replace("FLAME_W1", &format!("{FLAME_W1:?}"))
+    )
+}
+
+/// THE EFFECTS' SPACEWARP MOTION (`space_warp::MotionKind::EffectsOver`,
+/// `EffectsScreened`): the effects' shader itself, its vertex stage run twice
+/// -- as drawn, and with each centre moved back along its velocity
+/// (`EffectInstance::motion`) by the last `cam.params.w` seconds and seen by
+/// the previous frame's camera -- and its fragment stages again for how much
+/// each pixel shows of it.
+///
+/// One source: the twin is [`effects_shader`]'s text with these changes,
+/// each checked to have matched: its stages are plain functions
+/// (`fx_vertex`, `fx_over`, `fx_screen`); the camera is SpaceWarp's
+/// (`fx_motion_view`) at a motion pixel's size; and a flame's upright axes
+/// are the vertex stage's own lines, taken from it (`fx_flame_along`).
+///
+/// WHAT MOVES, AND HOW MUCH IT COUNTS. Each written over what is behind it,
+/// premultiplied, by `space_warp::layer_weight` of its share of the pixel:
+/// - A FLAME's sheet stands still on its spot, but its gas rises through it
+///   (`flame_v`, at the sheet's book pace): each pixel moves as the gas at
+///   its height does, from nothing at its root to the tongue's tip. It is
+///   the brightest, sharpest thing in its view: a bright layer
+///   (`BRIGHT_LAYER_CONTRAST`).
+/// - Embers, a splash's drops and dust motes: their own velocity, bright
+///   layers by what they add -- so a glinting mote moves itself and a faint
+///   one leaves the room behind it moving.
+/// - Smoke, a splash's crown and mist, and a bed of coals: their own
+///   velocity, soft layers (`SOFT_LAYER_CONTRAST`) -- they move themselves
+///   only where they hide most of what is behind.
+pub fn motion_shader() -> String {
+    let mut s = effects_shader();
+    let swap = |s: &mut String, from: &str, to: &str, n: usize| {
+        assert_eq!(s.matches(from).count(), n, "effects motion twin: `{from}` moved in the effects' shader");
+        *s = s.replace(from, to);
+    };
+    // A flame's axes, from the vertex stage's own lines.
+    let from = s.find("        var r = fx.right.xyz;\n").expect("effects motion twin: the upright axes moved");
+    let end = "        along = u * c - r * s;\n";
+    let to = from + s[from..].find(end).expect("effects motion twin: the upright axes moved") + end.len();
+    let upright = s[from..to].to_string();
+    swap(&mut s, "@group(0) @binding(0) var<uniform> camera: Camera;", "", 1);
+    swap(&mut s, "camera.view_proj[view_slot]", "fx_motion_view()", 2);
+    swap(&mut s, "0.75 * fx.depth.w * ", "0.75 * fx.depth.w * fx_pixel_scale * ", 1);
+    swap(&mut s, "@vertex fn vs_main(@builtin(vertex_index) vi: u32, inst: IIn) -> VOut", "fn fx_vertex(vi: u32, inst: IIn) -> VOut", 1);
+    swap(&mut s, "@fragment fn fs_over(in: VOut) -> @location(0) vec4<f32>", "fn fx_over(in: VOut) -> vec4<f32>", 1);
+    swap(&mut s, "@fragment fn fs_screen(in: VOut) -> @location(0) vec4<f32>", "fn fx_screen(in: VOut) -> vec4<f32>", 1);
+    format!(
+        r#"{motion}
+{s}
+var<private> fx_before: bool = false;
+var<private> fx_pixel_scale: f32 = 1.0;
+
+fn fx_motion_view() -> mat4x4<f32> {{
+    if (fx_before) {{
+        return cam.prev;
+    }}
+    return cam.curr;
+}}
+
+// The way up an upright quad (a flame), as the vertex stage turns it.
+fn fx_flame_along(inst: IIn) -> vec3<f32> {{
+    let to_eye = normalize(fx.head.xyz - inst.centre.xyz);
+    var across = fx.right.xyz;
+    var along = fx.up.xyz;
+{upright}    return along;
+}}
+
+struct FxMotionOut {{
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) colour: vec4<f32>,
+    @location(2) @interpolate(flat) light: vec3<f32>,
+    @location(3) @interpolate(flat) light_q: vec3<f32>,
+    @location(4) @interpolate(flat) layer: vec3<f32>,
+    @location(5) at: vec4<f32>,
+    @location(6) @interpolate(flat) soft: f32,
+    @location(7) @interpolate(flat) time: f32,
+    @location(8) @interpolate(flat) flicker: f32,
+    @location(9) curr: vec4<f32>,
+    @location(10) prev: vec4<f32>,
+    // A flame: its height's way up in the previous clip space, and the book
+    // seconds its gas rose since the previous frame.
+    @location(11) @interpolate(flat) gas: vec4<f32>,
+    @location(12) @interpolate(flat) book: f32,
+}}
+
+@vertex fn vs_fx_motion(@builtin(vertex_index) vi: u32, inst: IIn, @location(6) motion: vec4<f32>) -> FxMotionOut {{
+    fx_pixel_scale = cam.reflect.x;
+    let step = cam.params.w;
+    var was = inst;
+    was.centre = vec4<f32>(inst.centre.xyz - motion.xyz * step, inst.centre.w);
+    fx_before = true;
+    let b = fx_vertex(vi, was);
+    fx_before = false;
+    let n = fx_vertex(vi, inst);
+    var out: FxMotionOut;
+    out.clip = n.clip;
+    out.uv = n.uv;
+    out.colour = n.colour;
+    out.light = n.light;
+    out.light_q = n.light_q;
+    out.layer = n.layer;
+    out.at = n.at;
+    out.soft = n.soft;
+    out.time = n.time;
+    out.flicker = n.flicker;
+    out.curr = n.clip;
+    out.prev = b.clip;
+    out.gas = vec4<f32>(0.0);
+    out.book = 0.0;
+    if (inst.params.w > 1.5 && inst.params.w < 2.5 && motion.w > 0.0) {{
+        let height = 2.0 * inst.centre.w * max(abs(inst.params.z), 1.0);
+        out.gas = cam.prev * vec4<f32>(fx_flame_along(inst) * height, 0.0);
+        out.book = motion.w * step;
+    }}
+    return out;
+}}
+
+fn fx_vout(in: FxMotionOut) -> VOut {{
+    var v: VOut;
+    v.clip = in.clip;
+    v.uv = in.uv;
+    v.colour = in.colour;
+    v.light = in.light;
+    v.light_q = in.light_q;
+    v.layer = in.layer;
+    v.at = in.at;
+    v.soft = in.soft;
+    v.time = in.time;
+    v.flicker = in.flicker;
+    return v;
+}}
+
+@fragment fn fs_fx_motion_over(in: FxMotionOut) -> @location(0) vec4<f32> {{
+    let shown = fx_over(fx_vout(in));
+    var prev = in.prev;
+    if (in.book > 0.0) {{
+        // Where this height's gas was: lower, as it rose.
+        let v = 1.0 - in.uv.y;
+        prev = prev - in.gas * (v - fx_flame_v(v, in.book));
+    }}
+    let flame = in.layer.z > 1.5 && in.layer.z < 2.5;
+    let w = layer_weight(shown.a, select({soft:?}, {bright:?}, flame));
+    return vec4<f32>(motion_of(in.curr, prev).xyz * w, w);
+}}
+
+@fragment fn fs_fx_motion_screened(in: FxMotionOut) -> @location(0) vec4<f32> {{
+    let shown = fx_screen(fx_vout(in));
+    let w = layer_weight(max(shown.r, max(shown.g, shown.b)), {bright:?});
+    return vec4<f32>(motion_of(in.curr, in.prev).xyz * w, w);
+}}
+"#,
+        motion = crate::renderer::space_warp::motion_block(),
+        soft = crate::renderer::space_warp::SOFT_LAYER_CONTRAST,
+        bright = crate::renderer::space_warp::BRIGHT_LAYER_CONTRAST,
     )
 }
 
@@ -4676,6 +4908,100 @@ mod tests {
             std::hint::black_box(fire_glare(&emitters[0], t, Vec3::ZERO, Quat::IDENTITY));
         }
         eprintln!("  fire_light + fire_glare: {:.4} ms", start.elapsed().as_secs_f64() / 2000.0 * 1e3);
+    }
+
+    /// The effects' SpaceWarp twin validates and is the effects' shader
+    /// itself (`motion_shader` checks each change matched), with a flame's
+    /// axes taken from the vertex stage's lines.
+    #[test]
+    fn the_effects_motion_twin_validates_and_is_the_effects_shader() {
+        let twin = motion_shader();
+        let error = crate::renderer::multiview::multiview_validation_error_of(&twin, false);
+        assert!(error.is_none(), "{error:?}");
+        for part in ["fn fx_vertex(vi: u32, inst: IIn) -> VOut", "fn fx_over(in: VOut) -> vec4<f32>", "fn fx_flame_along", "along = u * c - r * s;"] {
+            assert!(twin.contains(part), "{part}");
+        }
+        assert!(!effects_shader().contains("fx_motion_view"), "the draw shader carries none of the twin");
+    }
+
+    /// EVERY PARTICLE CARRIES ITS VELOCITY (`EffectInstance::motion`), for
+    /// SpaceWarp: where it is a moment later is where its velocity takes it.
+    /// Each instance's centre moved on by its motion is found among the next
+    /// moment's -- embers in a stream and in pops, dust carried by the air,
+    /// smoke, a splash's drops, crown and mist. Zeroed, the same test fails
+    /// (the check that it can).
+    #[test]
+    fn every_particle_carries_its_velocity() {
+        // A moment later: a millisecond, or for dust -- carried at a few
+        // centimetres a second -- a hundredth of a second.
+        let check = |label: &str, at: f64, h: f32, frame: &dyn Fn(f64) -> EffectFrame, zeroed: bool| {
+            let (a, b) = (frame(at), frame(at + h as f64));
+            let mut moving = 0;
+            let mut found = 0;
+            for i in &a.instances {
+                let v = Vec3::from_slice(&i.motion[..3]);
+                if v.length() < 0.005 {
+                    continue;
+                }
+                moving += 1;
+                let v = if zeroed { Vec3::ZERO } else { v };
+                let next = Vec3::from_slice(&i.centre[..3]) + v * h;
+                let nearest = b.instances.iter().map(|j| Vec3::from_slice(&j.centre[..3]).distance(next)).fold(f32::INFINITY, f32::min);
+                let speed = Vec3::from_slice(&i.motion[..3]).length();
+                if nearest < 0.1 * speed * h + 2e-5 {
+                    found += 1;
+                }
+            }
+            assert!(moving >= 5, "{label}: {moving} moving");
+            (found, moving)
+        };
+        let head = Vec3::new(0.4, 1.2, 1.5);
+        let at = seen_from(head);
+        let mut dust = emitter(EffectKind::Dust);
+        dust.position = Vec3::new(0.0, 1.2, 0.0);
+        dust.extent = [Vec3::X * 1.5, Vec3::Y * 0.8, Vec3::Z * 1.5];
+        dust.rate = 3.0;
+        let mut embers = emitter(EffectKind::Embers);
+        embers.rate = 4.0;
+        let smoke = emitter(EffectKind::Smoke);
+        let cases: Vec<(&str, f64, f32, Box<dyn Fn(f64) -> EffectFrame>)> = vec![
+            ("embers", 7.3, 1e-3, Box::new(|t| simulate(std::slice::from_ref(&embers), t, &at))),
+            ("dust", 20.0, 0.01, Box::new(|t| simulate(std::slice::from_ref(&dust), t, &at))),
+            ("smoke", 9.0, 1e-3, Box::new(|t| simulate(std::slice::from_ref(&smoke), t, &at))),
+            ("splash", 0.25, 1e-3, Box::new(|t| simulate_with(&[], &[step_splash(0.0)], t, &at))),
+        ];
+        for (label, t, h, frame) in &cases {
+            let (found, moving) = check(label, *t, *h, frame.as_ref(), false);
+            assert!(found as f32 >= 0.95 * moving as f32, "{label}: {found} of {moving} found where their velocity took them");
+            let (found, moving) = check(label, *t, *h, frame.as_ref(), true);
+            assert!((found as f32) < 0.5 * moving as f32, "{label}: still found with no velocity ({found} of {moving}): the test cannot fail");
+        }
+    }
+
+    /// A FLAME'S SHEET STANDS ON ITS SPOT and its gas rises through it at the
+    /// pace its book plays: the motion SpaceWarp moves its pixels by is the
+    /// book seconds a second its frame advances (`EffectInstance::motion` w).
+    #[test]
+    fn a_flame_sheet_stands_still_and_its_gas_rises_at_its_book_pace() {
+        let fire = emitter(EffectKind::Fire);
+        let at = seen_from(Vec3::new(0.0, 0.6, 1.5));
+        let h = 1e-3;
+        let (a, b) = (simulate(std::slice::from_ref(&fire), 12.0, &at), simulate(std::slice::from_ref(&fire), 12.0 + h, &at));
+        let flames: Vec<&EffectInstance> = a.instances.iter().filter(|i| i.params[3] == 2.0).collect();
+        assert!(flames.len() >= 3, "{} flames", flames.len());
+        let mut checked = 0;
+        for f in flames {
+            assert_eq!(&f.motion[..3], &[0.0; 3], "a sheet stands on its spot");
+            let Some(g) = b.instances.iter().find(|g| g.params[3] == 2.0 && g.centre[0] == f.centre[0] && g.centre[2] == f.centre[2]) else { continue };
+            if f.motion[3] == 0.0 {
+                continue;
+            }
+            let frames_a_second = (g.params[1] - f.params[1]) / h as f32;
+            let book = frames_a_second * FLAME_SECONDS / FIRE_FRAMES as f32;
+            assert!((book - f.motion[3]).abs() < 0.02 * f.motion[3] + 1e-3, "book pace {book} against {}", f.motion[3]);
+            checked += 1;
+        }
+        assert!(checked >= 3, "{checked} sheets checked");
     }
 
     #[test]
