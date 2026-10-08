@@ -18,6 +18,7 @@ use crate::xr::{VkContext, XrContext};
 use std::collections::HashMap;
 
 mod render_frame;
+mod time_of_day;
 mod vulkan_interop;
 
 /// FIXED FOVEATED RENDERING's state: which density maps exist and which one
@@ -325,15 +326,35 @@ impl MsaaLevel {
     }
 }
 
-/// One installed body of water: its buffers and its current optics.
+/// One installed body of water: its buffers, its waves and its optics.
 struct WaterBody {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    /// One per set of the wave field's textures: drawn with
+    /// `[waves.current()]`.
+    bind_groups: [wgpu::BindGroup; 2],
     index_count: u32,
-    /// Kept so the animation time can be advanced without rebuilding the rest.
+    /// Kept so the shore's time can be advanced without rebuilding the rest.
     uniform: crate::renderer::water_pipeline::WaterUniform,
+    /// Its own sea: a pond's wind and fetch raise different waves from a
+    /// bay's. Advanced once a frame, before the scene pass reads it.
+    waves: crate::renderer::water_waves::WaveField,
+    /// SpaceWarp's group 1 for it, by which set holds this frame's surface:
+    /// drawn with `[waves.current()]`. `None` without SpaceWarp.
+    motion_groups: Option<[wgpu::BindGroup; 2]>,
+    /// The world box its surface can reach, waves and all: what decides
+    /// whether it is seen. See `water_pipeline::water_seen`.
+    bounds: (glam::Vec3, glam::Vec3),
+    /// Seen this frame (and, until it is decided, last frame). Out of sight
+    /// its waves stand still, and the frame it comes back its other set holds
+    /// a surface long gone. A cell, as the frame decides it while holding
+    /// the renderer's other parts.
+    seen: std::cell::Cell<bool>,
+    /// Its groups for the view from under it, by wave set. See `underwater`.
+    under_groups: [wgpu::BindGroup; 2],
+    /// Its still depth over the ground, to ask at an eye.
+    still: crate::renderer::underwater::StillDepth,
 }
 
 /// Every scene pipeline again, built to draw BOTH EYES in one pass.
@@ -376,6 +397,7 @@ struct StereoScenePipelines {
     brush_seal: crate::renderer::brush_pipeline::BrushSealPipeline,
     particle: ParticlePipeline,
     glare: crate::renderer::glare::GlarePipeline,
+    effects: crate::renderer::effects::EffectsPipeline,
 }
 
 
@@ -387,12 +409,19 @@ pub struct XrRenderer {
     wgpu_queue: wgpu::Queue,
     solid_pipeline: SolidPipeline,
     water_pipeline: crate::renderer::water_pipeline::WaterPipeline,
-    /// One body of water: its geometry in the player's frame, and its optics.
-    ///
-    /// Rebuilt on scene load rather than per frame -- the surface is static
-    /// world geometry, so only the player-frame transform changes, and that is
-    /// done by the caller exactly as it is for brushes and terrain.
+    /// The level's water: each body's surface in the WORLD -- the vertex
+    /// shader poses it into the player's frame -- its optics and its waves.
+    /// Built on scene load.
     water_bodies: Vec<WaterBody>,
+    /// The view from under the water. See `underwater`.
+    underwater: crate::renderer::underwater::UnderwaterGpu,
+    /// When an eye last came out of the water: the wet film.
+    surfacing: crate::renderer::underwater::Surfacing,
+    /// The waves' clock, seconds. See `set_water_time`.
+    water_seconds: f64,
+    /// How far that clock moved since the last frame, seconds: the shore's
+    /// swash's step, for SpaceWarp's motion.
+    water_step: f32,
     brush_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
     /// `brush_pipeline` drawing the lighting-sources diagnostic. See `DebugView`.
     brush_sources_pipeline: crate::renderer::brush_pipeline::BrushPipeline,
@@ -446,6 +475,8 @@ pub struct XrRenderer {
     /// while `Levers::thin_shading_sampled` is set.
     thin_sampled_pipeline: Option<crate::renderer::mesh_pipeline::MeshPipeline>,
     scene_cut_pipeline: Option<(String, crate::renderer::brush_pipeline::BrushPipeline)>,
+    /// `Levers::water_cut`'s water.
+    water_cut_pipeline: Option<(String, wgpu::RenderPipeline)>,
     cut_inputs: (wgpu::TextureFormat, u32, wgpu::BindGroupLayout),
     probe_fixups: crate::renderer::probe_fixup::ProbeFixups,
     probe_fixup_targets: [wgpu::BindGroup; 2],
@@ -486,6 +517,18 @@ pub struct XrRenderer {
     /// whether the level's ground map lets it draw the baked ones. See
     /// `TerrainPipeline::new_probe_reader_twins`, `Self::terrain_reader`.
     terrain_reader_twins: [crate::renderer::terrain_pipeline::TerrainPipeline; 3],
+    /// The ground's gentle readers, `[full, spotless, baked, baked_spotless]`,
+    /// for the triangles no steep pixel comes from. See `ground_twins`.
+    terrain_gentle: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 4]>,
+    /// The same for the triangles no gentle pixel comes from: the steep
+    /// ground's code alone. See `ground_twins::steep_readers`.
+    terrain_steep: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 4]>,
+    /// The terrain's indices with each chunk's gentle triangles first, for the
+    /// terrain the frame was last handed. See `ground_twins::SlopeSplit`.
+    slope_split: Option<crate::renderer::ground_twins::SlopeSplit>,
+    /// The ground's probe pass and its poolless twin with the repeated code
+    /// written once. See `ground_twins::dedup_passes`.
+    terrain_dedup_passes: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 2]>,
     terrain_sun_baked: bool,
     /// MEASUREMENT: the ground's reader, probe pass and poolless pass with
     /// their layer reads inlined, drawn in the shipped ones' place while
@@ -595,6 +638,20 @@ pub struct XrRenderer {
     /// The characters' capsules, which can stand between an eye and a lamp.
     /// See `set_capsules`.
     glare_capsules: Vec<(glam::Vec3, glam::Vec3, f32)>,
+    /// THE LEVEL'S EFFECTS -- fire, smoke, embers, dust -- in the world's
+    /// frame, as `set_effects` hands them over; simulated, lit and drawn each
+    /// frame after the glass. See `effects`.
+    effect_emitters: Vec<crate::renderer::effects::EffectEmitter>,
+    /// SPLASHES the client saw, born on the water's clock (`set_water_time`),
+    /// kept while their drops fly or their rings spread. See `add_splash`.
+    splashes: Vec<crate::renderer::effects::Splash>,
+    effects_layout: wgpu::BindGroupLayout,
+    effects_pipeline: crate::renderer::effects::EffectsPipeline,
+    /// Their textures and buffers, made when a level first has an effect.
+    effects_gpu: Option<crate::renderer::effects::EffectsGpu>,
+    /// THE LEVEL'S WEATHER, when it has any: its maps, the ground's weather
+    /// twins, the particles. See `weather` and [`Self::set_weather`].
+    weather: Option<crate::renderer::weather::WeatherScene>,
     /// The characters mirrored in the floor, into the probe pass targets'
     /// floor mirror, and its blur. See `brush_pipeline::probe_pass::MIRROR_FORMAT`.
     floor_mirror_skinned: SkinnedMeshPipeline,
@@ -614,6 +671,10 @@ pub struct XrRenderer {
     default_brush_lightmap: LoadedTexture,
     /// The level's brushes share ONE atlas, because they share one draw call.
     brush_lightmap: Option<LoadedTexture>,
+    /// THE TIME OF DAY: its clock, the photographed sky to go back to, the
+    /// bake's daylight layers. Default: none, a photographed sky as before.
+    /// See `xr_renderer::time_of_day`.
+    tod: time_of_day::TodState,
     cuboid_lightmaps: HashMap<String, LoadedTexture>,
     default_cuboid_lightmap: LoadedTexture,
     mesh_lightmaps: HashMap<String, LoadedTexture>,
@@ -660,6 +721,10 @@ pub struct XrRenderer {
     /// closed, for culling what lies outside the building. See `portal_cull`
     /// and `set_closed_rooms`.
     cull_rooms: Vec<crate::renderer::portal_cull::CullRoom>,
+    /// The doors this frame, in the world. See `doors` and `set_doors`.
+    doors: Vec<crate::renderer::doors::DoorView>,
+    /// Which of `probe_portals` a shut door seals, from `doors`.
+    shut_portals: Vec<bool>,
     /// What stands inside the rooms, for the reflection trace. See
     /// `ProbeUpload::set_proxies`.
     probe_proxies: Vec<crate::renderer::uniforms::ProbeProxy>,
@@ -977,6 +1042,9 @@ impl XrRenderer {
             let probe = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
             FoveationState { eye_size: (width, height), probe_size: probe, maps: HashMap::new(), applied: None }
         });
+        // LAST LAUNCH'S COMPILED SHADERS, before any of the renderer's
+        // pipelines exist. See `pipeline_cache_file`.
+        unsafe { vulkan_interop::start_pipeline_cache(vk, &wgpu_device) };
         // SAY SOMETHING WHEN THE GPU REFUSES SOMETHING.
         //
         // Without this a validation error goes nowhere: `create_render_pipeline`
@@ -1056,6 +1124,10 @@ impl XrRenderer {
         );
         // See `brush_pipeline::probe_pass`.
         let probe_pass_layout = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(&wgpu_device);
+        let underwater = crate::renderer::underwater::UnderwaterGpu::new(&wgpu_device, wgpu_format, &uniform_buf.layout, &probe_pass_layout, samples);
+        // The effects' own group, shared by their pipelines and by the
+        // textures made when a level first has an effect. See `effects`.
+        let effects_layout = crate::renderer::effects::bind_group_layout(&wgpu_device);
         let brush_probe_pass_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass(
             &wgpu_device, &uniform_buf.layout, crate::renderer::multiview::ViewMode::Mono,
         );
@@ -1110,12 +1182,25 @@ impl XrRenderer {
         let terrain_probe_pass_poolless_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass_poolless(
             &wgpu_device, &uniform_buf.layout, &probe_fixups,
         );
+        let terrain_dedup_passes = crate::renderer::ground_twins::dedup_passes(&wgpu_device, &uniform_buf.layout, &probe_fixups, None);
+        if terrain_dedup_passes.is_none() {
+            log::warn!("terrain: the probe pass's dedup edits no longer match; it draws as it was");
+        }
         let terrain_probe_reader_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_reader(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
         );
         let terrain_reader_twins = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_reader_twins(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
         );
+        let terrain_gentle = crate::renderer::ground_twins::gentle_readers(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, None,
+        );
+        let terrain_steep = terrain_gentle.as_ref().and_then(|_| {
+            crate::renderer::ground_twins::steep_readers(&wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout)
+        });
+        if terrain_gentle.is_none() {
+            log::warn!("terrain: the ground's steep tests are not where its gentle twins take them out; the full readers draw everywhere");
+        }
         if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
             crate::renderer::brush_pipeline::BrushPipeline::log_deferred_register_cuts(
                 &wgpu_device, &uniform_buf.layout, &probe_fixups,
@@ -1124,6 +1209,9 @@ impl XrRenderer {
                 &wgpu_device, &uniform_buf.layout, &probe_fixups,
             );
             probe_fixups.log_register_cuts(&wgpu_device);
+            crate::renderer::ground_cuts::log_ground_cuts(
+                &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, &probe_fixups,
+            );
             // Built only for the log: the `terrain_reader` lever's inlined set.
             let _ = crate::renderer::terrain_pipeline::TerrainPipeline::new_inlined(
                 &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, &probe_fixups,
@@ -1332,6 +1420,9 @@ impl XrRenderer {
             glare: crate::renderer::glare::GlarePipeline::new_multisampled_stereo(
                 &wgpu_device, wgpu_format, &uniform_buf.layout, &probe_pass_layout, samples,
             ),
+            effects: crate::renderer::effects::EffectsPipeline::new_multisampled_stereo(
+                &wgpu_device, wgpu_format, &uniform_buf.layout, &probe_pass_layout, &effects_layout, samples,
+            ),
         });
 
         // ONE PAIR OF LAYERED TEXTURES when the device can draw stereo, two
@@ -1432,6 +1523,9 @@ impl XrRenderer {
         );
         let glare_pipeline = crate::renderer::glare::GlarePipeline::new_multisampled(
             &wgpu_device, wgpu_format, &uniform_buf.layout, &probe_pass_layout, samples,
+        );
+        let effects_pipeline = crate::renderer::effects::EffectsPipeline::new_multisampled(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, &probe_pass_layout, &effects_layout, samples,
         );
 
         let depth_tex = wgpu_device.create_texture(&wgpu::TextureDescriptor {
@@ -1558,6 +1652,7 @@ impl XrRenderer {
             terrain_cut_pipeline: None,
             thin_sampled_pipeline: None,
             scene_cut_pipeline: None,
+            water_cut_pipeline: None,
             cut_inputs: (wgpu_format, samples, probe_pass_layout.clone()),
             probe_fixups,
             probe_fixup_targets,
@@ -1572,8 +1667,13 @@ impl XrRenderer {
             terrain_probe_pass_pipeline,
             terrain_probe_reader_pipeline,
             terrain_reader_twins,
+            terrain_gentle,
+            terrain_steep,
+            slope_split: None,
+            terrain_dedup_passes,
             terrain_sun_baked: false,
             terrain_inlined: None,
+            weather: None,
             reader_edits: None,
             stereo_probe,
             brush_depth_prepass,
@@ -1581,6 +1681,10 @@ impl XrRenderer {
             brush_mirror_pipeline,
             water_pipeline,
             water_bodies: Vec::new(),
+            underwater,
+            surfacing: Default::default(),
+            water_seconds: 0.0,
+            water_step: 0.0,
             brush_materials,
             terrain_pipeline,
             shadow_map,
@@ -1635,6 +1739,11 @@ impl XrRenderer {
             glare_pipeline,
             glare_sources: Vec::new(),
             glare_capsules: Vec::new(),
+            effect_emitters: Vec::new(),
+            splashes: Vec::new(),
+            effects_layout,
+            effects_pipeline,
+            effects_gpu: None,
             floor_mirror_skinned,
             floor_mirror_mips,
             uniform_buf,
@@ -1646,6 +1755,7 @@ impl XrRenderer {
             space_warp,
             default_brush_lightmap,
             brush_lightmap: None,
+            tod: Default::default(),
             cuboid_lightmaps: HashMap::new(),
             default_cuboid_lightmap,
             mesh_lightmaps: HashMap::new(),
@@ -1664,6 +1774,8 @@ impl XrRenderer {
             ground_placement: None,
             probe_portals: Vec::new(),
             cull_rooms: Vec::new(),
+            doors: Vec::new(),
+            shut_portals: Vec::new(),
             probe_proxies: Vec::new(),
             levers: crate::renderer::levers::Levers::default(),
             eye_capture_enabled,
@@ -1769,9 +1881,18 @@ impl XrRenderer {
             sun_mask,
             (!stationary.is_empty()).then_some((stationary, stationary_size.0, stationary_size.1)),
         ));
+        let shipped = match light {
+            crate::renderer::mesh::LightmapLight::Linear(t) => Some((t.to_vec(), width, height)),
+            crate::renderer::mesh::LightmapLight::Srgb8(_) => None,
+        };
+        self.tod_brush_atlas_changed(shipped);
     }
 
     fn brush_lightmap_bg(&self) -> &wgpu::BindGroup {
+        // A sun off its baked direction: the same atlas, the neutral mask.
+        if let Some(bg) = self.tod_brush_lightmap_bg() {
+            return bg;
+        }
         self.brush_lightmap
             .as_ref()
             .map(|t| &t.bind_group)
@@ -1881,29 +2002,26 @@ impl XrRenderer {
         // ONE PASS OVER THE PIXELS, now: the brightness the shader normalises
         // by and the eye's meter both need every probe, and neither needs the
         // pixels again.
-        let mut eye = crate::renderer::exposure::EyeAdaptation::sky_only(self.sky.irradiance);
-        self.probe_brightness = descs
-            .iter()
-            .enumerate()
-            .map(|(i, d)| match source(i) {
-                Some(faces) => {
-                    eye.add_probe(&faces, resolution, d);
-                    crate::renderer::uniforms::probe_mean_radiance(&faces, resolution)
-                }
-                None => 0.0,
-            })
-            .collect();
+        // Under a time of day, binned with the lamps-only photographs and
+        // relit to the hour; the stream reads them relit too. See
+        // `xr_renderer::time_of_day`.
+        let mut eye = self.tod_meter_probes(&descs, resolution, &source);
+        let source = self.tod_probe_source(source);
         // The doorways, which the meter hands over across as the
         // reflections do. See `exposure::EyeAdaptation::meter`.
         eye.set_portals(&portals);
         *self.eye.borrow_mut() = eye;
+        self.tod_probes_loaded();
         log::info!("reflection probes: average radiance by probe {:?}", self.probe_brightness);
 
         // THE SKY REFLECTIONS SEE, at the probes' size, in a layer of its own.
         let sky_faces = self.sky.reflection.as_ref().map(|r| r.cube_faces(resolution));
         // THE BUILDINGS' OUTSIDES after the sky, when the level has them.
         let (buildings, building_faces): (Vec<(glam::Vec3, glam::Vec3)>, Vec<Vec<u8>>) =
-            std::mem::take(&mut self.pending_buildings).into_iter().map(|(lo, hi, f)| ((lo, hi), f)).unzip();
+            {
+                let pending = std::mem::take(&mut self.pending_buildings);
+                self.tod_take_buildings(pending).into_iter().map(|(lo, hi, f)| ((lo, hi), f)).unzip()
+            };
         self.probe_buildings = buildings;
         let stream = crate::renderer::probe_stream::ProbeStream::new_with_extras(
             &self.wgpu_device,
@@ -2095,6 +2213,46 @@ impl XrRenderer {
     /// the level's ground map is baked over every texel (`terrain_sun_baked`).
     /// The full reader under the `scene_cut` lever, as the brushes', and under
     /// `terrain_reader` `full`; its inlined reads under `inlined`.
+    /// The ground reader's WEATHER TWIN for this frame, chosen as
+    /// [`Self::terrain_reader`] chooses the dry one.
+    fn terrain_weather_reader<'a>(
+        &self,
+        w: &'a crate::renderer::weather::WeatherScene,
+    ) -> &'a crate::renderer::terrain_pipeline::TerrainPipeline {
+        if self.levers.terrain_reader.as_deref() == Some("full") {
+            return &w.twins.readers[0];
+        }
+        let spotless = self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed);
+        &w.twins.readers[match (spotless, self.terrain_sun_baked) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (true, true) => 3,
+        }]
+    }
+
+    /// Which of the ground's four readers this frame draws -- `[full,
+    /// spotless, baked, baked_spotless]` -- chosen as [`Self::terrain_reader`]
+    /// chooses.
+    fn terrain_twin(&self) -> usize {
+        match (self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed), self.terrain_sun_baked) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (true, true) => 3,
+        }
+    }
+
+    /// Whether this frame draws the ground's gentle triangles with its slope
+    /// twins: not while a measurement lever draws a ground reader of its own.
+    fn slope_twins_on(&self) -> bool {
+        self.levers.slope_twins
+            && self.terrain_inlined.is_none()
+            && self.reader_edits.is_none()
+            && self.scene_cut_pipeline.is_none()
+            && self.levers.terrain_reader.as_deref() != Some("full")
+    }
+
     fn terrain_reader(&self) -> &crate::renderer::terrain_pipeline::TerrainPipeline {
         if let Some([read, _, _]) = &self.terrain_inlined {
             return read;
@@ -2117,11 +2275,18 @@ impl XrRenderer {
             _ => &self.layered_mesh_pipeline.pipeline,
         }
     }
+    /// The water's pipeline: its ringless twin while no splash's rings are
+    /// spreading. See `water_pipeline::RING_BLOCK`.
     fn sp_water(&self, stereo: bool) -> &wgpu::RenderPipeline {
-        match (stereo, &self.stereo_pipelines) {
-            (true, Some(p)) => &p.water.pipeline,
-            _ => &self.water_pipeline.pipeline,
+        let ringing = self.water_bodies.iter().any(|b| b.uniform.rings[0][3] > 0.0);
+        let w = match (stereo, &self.stereo_pipelines) {
+            (true, Some(p)) => &p.water,
+            _ => &self.water_pipeline,
+        };
+        if let (false, Some((_, cut))) = (stereo, &self.water_cut_pipeline) {
+            return cut;
         }
+        if ringing { &w.pipeline } else { &w.ringless }
     }
     fn sp_sky(&self, stereo: bool) -> &wgpu::RenderPipeline {
         match (stereo, &self.stereo_pipelines) {
@@ -2161,6 +2326,12 @@ impl XrRenderer {
         match (stereo, &self.stereo_pipelines) {
             (true, Some(p)) => &p.glare,
             _ => &self.glare_pipeline,
+        }
+    }
+    fn sp_effects(&self, stereo: bool) -> &crate::renderer::effects::EffectsPipeline {
+        match (stereo, &self.stereo_pipelines) {
+            (true, Some(p)) => &p.effects,
+            _ => &self.effects_pipeline,
         }
     }
     /// The scene-pass brush, whichever diagnostic is showing.
@@ -2214,6 +2385,16 @@ impl XrRenderer {
             rooms.iter().filter(|r| r.closed).map(|r| r.id).collect::<Vec<_>>(),
         );
         self.cull_rooms = rooms;
+    }
+
+    /// THE DOORS THIS FRAME, in the WORLD: each leaf where it stands and
+    /// whether it is shut. Their meshes are drawn with the other models (and
+    /// marked `MeshInstance::tile_caster`); this is what their shadow tiles
+    /// are fitted to and which doorways portal culling may not see through.
+    /// See `doors`.
+    pub fn set_doors(&mut self, doors: Vec<crate::renderer::doors::DoorView>) {
+        self.shut_portals = crate::renderer::doors::shut_portals(&self.probe_portals, &doors);
+        self.doors = doors;
     }
 
     /// What stands in the rooms for the reflection trace: the proxies, the
@@ -2370,6 +2551,15 @@ impl XrRenderer {
                 }
             });
         }
+        if levers.water_cut != self.levers.water_cut {
+            self.water_cut_pipeline = levers.water_cut.as_ref().and_then(|cut| {
+                let p = self.water_pipeline.with_cut(&self.wgpu_device, cut);
+                if p.is_none() {
+                    log::warn!("LEVERS: water_cut {cut}: no such cut, or it no longer matches the shader");
+                }
+                p.map(|p| (cut.clone(), p))
+            });
+        }
         if levers.scene_cut != self.levers.scene_cut {
             let (format, samples, layout) = &self.cut_inputs;
             self.scene_cut_pipeline = levers.scene_cut.as_ref().and_then(|cut| {
@@ -2516,6 +2706,121 @@ impl XrRenderer {
         self.glare_sources = sources;
     }
 
+    /// THE LEVEL'S EFFECTS, in the world's frame: set when a level loads.
+    /// Their textures are made the first time there are any. See `effects`.
+    /// THE LEVEL'S WEATHER: one map an area, `texels` across each, and the
+    /// terrain chunks (by their first index into the terrain's own index
+    /// buffer) an area touches, which are drawn with the ground's weather
+    /// twins. Builds the twins and the particles' pipeline, so a level
+    /// without weather -- `texels` empty -- builds and pays nothing. Then
+    /// [`Self::update_weather`] each frame.
+    pub fn set_weather(&mut self, texels: &[(u32, u32)], mut chunks: Vec<(u32, u32)>) {
+        use crate::renderer::weather;
+        if texels.is_empty() {
+            self.weather = None;
+            return;
+        }
+        let device = &self.wgpu_device;
+        let layout = weather::bind_group_layout(device);
+        let probe_layout = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(device);
+        let twins = crate::renderer::terrain_pipeline::TerrainPipeline::new_weather_twins(
+            device,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            &self.uniform_buf.layout,
+            self.msaa.samples(),
+            &probe_layout,
+            &self.probe_fixups,
+            &layout,
+        );
+        let particles = weather::WeatherPipeline::new(
+            device,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            &self.uniform_buf.layout,
+            &self.terrain_pipeline.material_layout,
+            &layout,
+            self.msaa.samples(),
+            crate::renderer::multiview::ViewMode::Mono,
+        );
+        let maps = weather::WeatherMaps::new(device, &layout, texels);
+        chunks.sort_unstable();
+        // The gentle readers' twins, by what the ground holds. See `ground_twins`.
+        let gentle: Vec<[crate::renderer::terrain_pipeline::TerrainPipeline; 4]> = weather::WeatherKinds::ALL
+            .iter()
+            .map_while(|kinds| {
+                crate::renderer::ground_twins::gentle_readers(
+                    device,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                    &self.uniform_buf.layout,
+                    self.msaa.samples(),
+                    &probe_layout,
+                    Some((&layout, *kinds)),
+                )
+            })
+            .collect();
+        if gentle.len() != weather::WeatherKinds::ALL.len() {
+            log::warn!("WEATHER: the ground's gentle weather twins did not build; its full ones draw everywhere");
+        }
+        let gentle = if gentle.len() == weather::WeatherKinds::ALL.len() { gentle } else { Vec::new() };
+        let dedup_passes = crate::renderer::ground_twins::dedup_passes(device, &self.uniform_buf.layout, &self.probe_fixups, Some(&layout));
+        log::info!("WEATHER: {} area(s), {} terrain chunk(s) take the weather twins", texels.len(), chunks.len());
+        self.weather = Some(weather::WeatherScene {
+            layout,
+            maps,
+            twins,
+            particles,
+            chunks,
+            gentle,
+            dedup_passes,
+            holds: vec![(true, true); texels.len()],
+            areas: Vec::new(),
+            texels: texels.to_vec(),
+            counts: (0, 0, 0),
+            torch: None,
+            seconds: 0.0,
+        });
+    }
+
+    /// This frame's weather: its clock, each area's numbers, and -- when the
+    /// app worked them out again (a few times a second) -- each area's map,
+    /// texels as `space_soup_engine::weather::surface` makes them.
+    pub fn update_weather(&mut self, seconds: f64, areas: &[crate::renderer::weather::AreaParams], maps: &[Vec<[f32; 4]>]) {
+        let Some(w) = self.weather.as_mut() else { return };
+        w.seconds = seconds;
+        w.areas = areas.to_vec();
+        for (k, a) in areas.iter().enumerate() {
+            let size = w.texels.get(k).copied().unwrap_or((1, 1));
+            w.maps.set_area(k, a, size);
+            if let Some(m) = maps.get(k) {
+                w.maps.upload_map(&self.wgpu_queue, k as u32, size.0, size.1, m);
+                if let Some(h) = w.holds.get_mut(k) {
+                    *h = crate::renderer::weather::map_holds(m);
+                }
+            }
+        }
+    }
+
+    /// The player's torch this frame (its beam, player frame), which lights
+    /// the rain and snow in its cone; `None` while it is off.
+    pub fn set_weather_torch(&mut self, torch: Option<crate::renderer::Light>) {
+        if let Some(w) = self.weather.as_mut() {
+            w.torch = torch;
+        }
+    }
+
+    pub fn set_effects(&mut self, emitters: Vec<crate::renderer::effects::EffectEmitter>) {
+        if !emitters.is_empty() && self.effects_gpu.is_none() {
+            let started = std::time::Instant::now();
+            self.effects_gpu = Some(crate::renderer::effects::EffectsGpu::new(
+                &self.wgpu_device,
+                &self.wgpu_queue,
+                &self.effects_layout,
+            ));
+            log::info!("EFFECTS textures made in {:.0} ms", started.elapsed().as_secs_f32() * 1000.0);
+        }
+        log::info!("EFFECTS {} emitters", emitters.len());
+        self.effect_emitters = emitters;
+    }
+
     /// The characters as capsules for this frame, nearest first, in the
     /// player's frame. See `uniforms::CapsuleUpload`.
     /// The surfaces the live lamps' beams light this frame, for reflections to
@@ -2557,6 +2862,8 @@ impl XrRenderer {
                 crate::renderer::sky::AMBIENT,
             ),
         };
+        // What the time of day relights the bake against, and goes back to.
+        self.tod_sky_changed(pano.map(|p| (p.clone(), rotation_deg, intensity)));
         // The eye meters the sky until probes arrive; `set_reflection_probes`
         // folds this sky into them, so it must come first -- as the client's
         // load order already has it.
@@ -2717,82 +3024,100 @@ impl XrRenderer {
     ///
     /// Takes the tessellated surface rather than the `WaterDef` because the
     /// depth at each vertex comes from the TERRAIN, and the renderer has no
-    /// heightfield -- see `space_soup_engine::water::build_surface`.
+    /// heightfield -- see `space_soup_engine::water::build_surface`. The
+    /// surface is in the WORLD and stays there: the vertex shader poses it.
+    /// Toward the sky's sun, in the world; `None` without one. The client
+    /// looks for what stands between a splash and it.
+    pub fn sun_toward(&self) -> Option<glam::Vec3> {
+        self.sky.sun.as_ref().map(|s| glam::Vec3::from(s.direction).normalize_or_zero())
+    }
+
+    /// SOMETHING STRUCK THE WATER: its drops and spray fly with the effects,
+    /// its rings spread on every body's surface. `born` is on the clock
+    /// `set_water_time` is given. See `effects::Splash`.
+    pub fn add_splash(&mut self, mut splash: crate::renderer::effects::Splash) {
+        const KEPT: usize = 48;
+        // Onto the surface as drawn: the body whose still surface it struck.
+        if let Some(b) = self.water_bodies.iter().find(|b| (b.uniform.extinction[3] - splash.position.y).abs() < 0.05) {
+            let xz = glam::Vec2::new(splash.position.x, splash.position.z);
+            splash.position.y += crate::renderer::water_pipeline::swash_lift(&b.uniform, splash.depth, xz);
+        }
+        if self.splashes.len() >= KEPT {
+            self.splashes.remove(0);
+        }
+        self.splashes.push(splash);
+    }
+
     pub fn set_water(
         &mut self,
         bodies: &[(
             Vec<crate::renderer::water_pipeline::WaterVertex>,
             Vec<u32>,
             crate::renderer::water_pipeline::WaterUniform,
+            crate::renderer::water_waves::WaveParams,
         )],
     ) {
         use wgpu::util::DeviceExt;
         self.water_bodies = bodies
             .iter()
-            .filter(|(v, i, _)| !v.is_empty() && !i.is_empty())
-            .map(|(verts, indices, uniform)| {
-                let vb = self.wgpu_device.create_buffer_init(
-                    &wgpu::util::BufferInitDescriptor {
-                        label: Some("water_vb"),
-                        contents: bytemuck::cast_slice(verts),
-                        // COPY_DST as well as VERTEX: the surface is static in
-                        // the WORLD and moves in the PLAYER's frame, so its
-                        // positions are rewritten whenever the player walks --
-                        // and only then. See `update_water_surface`.
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    },
-                );
-                let ib = self.wgpu_device.create_buffer_init(
-                    &wgpu::util::BufferInitDescriptor {
-                        label: Some("water_ib"),
-                        contents: bytemuck::cast_slice(indices),
-                        usage: wgpu::BufferUsages::INDEX,
-                    },
-                );
-                let ub = self.wgpu_device.create_buffer(&wgpu::BufferDescriptor {
+            .filter(|(v, i, _, _)| !v.is_empty() && !i.is_empty())
+            .map(|(verts, indices, uniform, params)| {
+                let vertex_buffer = self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("water_vb"),
+                    contents: bytemuck::cast_slice(verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let index_buffer = self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("water_ib"),
+                    contents: bytemuck::cast_slice(indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                let uniform_buffer = self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("water_uniform"),
-                    size: std::mem::size_of::<
-                        crate::renderer::water_pipeline::WaterUniform,
-                    >() as u64,
+                    contents: bytemuck::bytes_of(uniform),
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
                 });
-                self.wgpu_queue.write_buffer(&ub, 0, bytemuck::bytes_of(uniform));
-                let bind_group = self.wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("water_material"),
-                    layout: &self.water_pipeline.material_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: ub.as_entire_binding(),
-                    }],
+                let bounds = crate::renderer::water_pipeline::water_bounds(verts, params);
+                let waves = crate::renderer::water_waves::WaveField::new(&self.wgpu_device, &self.wgpu_queue, *params);
+                let bind_groups = self.water_pipeline.bind_groups(&self.wgpu_device, &uniform_buffer, &waves);
+                let motion_groups = self.space_warp.as_ref().map(|sw| {
+                    std::array::from_fn(|now| {
+                        sw.pipelines.water_bind_group(
+                            &self.wgpu_device,
+                            &uniform_buffer,
+                            &waves.displacement_views[now],
+                            &waves.displacement_views[1 - now],
+                            &self.water_pipeline.sampler,
+                        )
+                    })
                 });
+                let under_groups = self.underwater.pipes.water_groups(&self.wgpu_device, &uniform_buffer, &waves);
                 WaterBody {
-                    vertex_buffer: vb,
-                    index_buffer: ib,
-                    uniform_buffer: ub,
-                    bind_group,
+                    vertex_buffer,
+                    index_buffer,
+                    uniform_buffer,
+                    bind_groups,
                     index_count: indices.len() as u32,
                     uniform: *uniform,
+                    waves,
+                    motion_groups,
+                    bounds,
+                    seen: std::cell::Cell::new(false),
+                    under_groups,
+                    still: crate::renderer::underwater::StillDepth::new(verts),
                 }
             })
             .collect();
-        log::info!("water: {} body/bodies installed", self.water_bodies.len());
-    }
-
-    /// Rewrite one body's vertices, after the player has moved.
-    ///
-    /// Only when they HAVE moved: a lake is thousands of vertices, and pushing
-    /// them across the bus every frame for a player standing still would cost
-    /// more than the water does to draw.
-    pub fn update_water_surface(
-        &self,
-        index: usize,
-        verts: &[crate::renderer::water_pipeline::WaterVertex],
-    ) {
-        let Some(body) = self.water_bodies.get(index) else {
-            return;
-        };
-        self.wgpu_queue.write_buffer(&body.vertex_buffer, 0, bytemuck::cast_slice(verts));
+        log::info!(
+            "water: {} body/bodies installed, {} blending",
+            self.water_bodies.len(),
+            if self.water_pipeline.dual_source { "dual-source" } else { "one-alpha" },
+        );
+        // Splashes fly with the effects: their textures now, not at the
+        // first splash, which would stall a frame making them.
+        if !self.water_bodies.is_empty() && self.effects_gpu.is_none() {
+            self.effects_gpu = Some(crate::renderer::effects::EffectsGpu::new(&self.wgpu_device, &self.wgpu_queue, &self.effects_layout));
+        }
     }
 
     /// How many bodies of water are installed.
@@ -2800,19 +3125,23 @@ impl XrRenderer {
         self.water_bodies.len()
     }
 
-    /// Advance the wave animation.
+    /// Advance the waves.
     ///
-    /// Separate from `set_water` because the geometry is static and the time is
-    /// not: re-uploading vertices every frame to move a wave would be the most
-    /// expensive possible way to add a sine.
+    /// Only a clock: the wave field itself is computed on the GPU once a
+    /// frame, and the shore's breakers from this time in the shader.
     pub fn set_water_time(&mut self, seconds: f32) {
+        // Clamped as the wave field clamps its own frame: a jump in time is a
+        // restart or a scene change, not a long frame.
+        self.water_step = (seconds as f64 - self.water_seconds).clamp(0.0, 0.1) as f32;
+        self.water_seconds = seconds as f64;
+        let now = self.water_seconds;
+        let lasts = crate::renderer::effects::SPLASH_SECONDS.max(crate::renderer::water_pipeline::RING_SECONDS) as f64;
+        self.splashes.retain(|s| now - s.born < lasts && s.born <= now + 1.0);
+        let rings = crate::renderer::effects::splash_rings(&self.splashes, now, self.player.offset);
         for body in &mut self.water_bodies {
-            body.uniform.anim[0] = seconds;
-            self.wgpu_queue.write_buffer(
-                &body.uniform_buffer,
-                0,
-                bytemuck::bytes_of(&body.uniform),
-            );
+            body.uniform.set_time(self.water_seconds, body.waves.params.loop_seconds);
+            body.uniform.rings = rings;
+            self.wgpu_queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
         }
     }
 
@@ -2827,7 +3156,7 @@ impl XrRenderer {
         });
         // The ground's baked readers draw it only where the map is baked over
         // every texel. See `TerrainImage::sun_baked_everywhere`.
-        self.terrain_sun_baked = occ.is_some_and(|s| s.sun_baked_everywhere());
+        self.terrain_sun_baked = !self.tod.off_bake && occ.is_some_and(|s| s.sun_baked_everywhere());
         self.rebuild_terrain_material();
     }
 
@@ -2947,6 +3276,19 @@ impl XrRenderer {
                 height: m.height,
                 rgba: m.rgba.clone(),
             }),
+        };
+        // A SUN OFF ITS BAKED DIRECTION (the time of day): the map's sun marked
+        // unbaked -- alpha up -- in its own layer only, so the ground's reader
+        // takes the sun's shadow from the static map. See `set_sun_off_bake`.
+        let ground = match (ground, self.tod.off_bake) {
+            (Some(mut g), true) => {
+                let first = self.terrain_sky_occlusion.as_ref().map_or(0, |m| m.rgba.len()).min(g.rgba.len());
+                for texel in g.rgba[..first].chunks_exact_mut(4) {
+                    texel[3] = 255;
+                }
+                Some(g)
+            }
+            (g, _) => g,
         };
         self.terrain_material =
             crate::renderer::terrain_pipeline::TerrainMaterial::from_layers_with(

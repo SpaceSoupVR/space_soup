@@ -477,52 +477,67 @@ fn evolve(@builtin(global_invocation_id) id: vec3<u32>) {{
 
 // THE INVERSE FFT of one row or column of one pair, in workgroup memory:
 // Stockham's autosort radix-2 (Govindaraju et al. 2008), {stages} stages, no
-// bit reversal, each thread one butterfly a stage. Returns which half of
-// `buf` holds the result.
-var<workgroup> buf: array<array<vec2<f32>, {n}>, 2>;
+// bit reversal, each thread one butterfly a stage. TWO lines a workgroup, so
+// one fills a whole 64-wide wave of the Quest's GPU instead of half of one.
+// Returns which of each line's two buffers in `buf` holds the result.
+var<workgroup> buf: array<array<vec2<f32>, {n}>, 4>;
+// e^(i pi j / {half}): every turn a butterfly takes, worked out once a
+// workgroup rather than once a butterfly a stage.
+var<workgroup> twiddle: array<vec2<f32>, {half}>;
 
-fn inverse_fft(t: u32) -> u32 {{
+fn inverse_fft(line: u32, t: u32) -> u32 {{
     var src = 0u;
     for (var s = 0u; s < {stages}u; s = s + 1u) {{
         let ns = 1u << s;
-        let angle = 2.0 * PI * f32(t % ns) / f32(ns * 2u);
-        let v0 = buf[src][t];
-        let v1 = cmul(buf[src][t + N / 2u], vec2<f32>(cos(angle), sin(angle)));
+        let v0 = buf[line * 2u + src][t];
+        let v1 = cmul(buf[line * 2u + src][t + N / 2u], twiddle[(t % ns) * ({half}u / ns)]);
         let d = (t / ns) * ns * 2u + t % ns;
-        buf[1u - src][d] = v0 + v1;
-        buf[1u - src][d + ns] = v0 - v1;
+        buf[line * 2u + 1u - src][d] = v0 + v1;
+        buf[line * 2u + 1u - src][d + ns] = v0 - v1;
         src = 1u - src;
         workgroupBarrier();
     }}
     return src;
 }}
 
-@compute @workgroup_size({half}, 1, 1)
-fn rows(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {{
-    let t = lid.x;
-    let row = wid.x;
-    let pair = wid.y;
-    let c = wid.z;
-    buf[0][t] = spec[spec_index(c, pair, row, t)];
-    buf[0][t + N / 2u] = spec[spec_index(c, pair, row, t + N / 2u)];
-    workgroupBarrier();
-    let src = inverse_fft(t);
-    spec[spec_index(c, pair, row, t)] = buf[src][t];
-    spec[spec_index(c, pair, row, t + N / 2u)] = buf[src][t + N / 2u];
+// The turns, one a thread; the barrier after the caller's loads covers them.
+fn turns(i: u32) {{
+    if (i < {half}u) {{
+        let a = PI * f32(i) / f32({half}u);
+        twiddle[i] = vec2<f32>(cos(a), sin(a));
+    }}
 }}
 
-@compute @workgroup_size({half}, 1, 1)
-fn columns(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {{
-    let t = lid.x;
-    let col = wid.x;
+@compute @workgroup_size({n}, 1, 1)
+fn rows(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {{
+    let line = lid.x / {half}u;
+    let t = lid.x % {half}u;
+    let row = wid.x * 2u + line;
     let pair = wid.y;
     let c = wid.z;
-    buf[0][t] = spec[spec_index(c, pair, t, col)];
-    buf[0][t + N / 2u] = spec[spec_index(c, pair, t + N / 2u, col)];
+    turns(lid.x);
+    buf[line * 2u][t] = spec[spec_index(c, pair, row, t)];
+    buf[line * 2u][t + N / 2u] = spec[spec_index(c, pair, row, t + N / 2u)];
     workgroupBarrier();
-    let src = inverse_fft(t);
-    spec[spec_index(c, pair, t, col)] = buf[src][t];
-    spec[spec_index(c, pair, t + N / 2u, col)] = buf[src][t + N / 2u];
+    let src = inverse_fft(line, t);
+    spec[spec_index(c, pair, row, t)] = buf[line * 2u + src][t];
+    spec[spec_index(c, pair, row, t + N / 2u)] = buf[line * 2u + src][t + N / 2u];
+}}
+
+@compute @workgroup_size({n}, 1, 1)
+fn columns(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {{
+    let line = lid.x / {half}u;
+    let t = lid.x % {half}u;
+    let col = wid.x * 2u + line;
+    let pair = wid.y;
+    let c = wid.z;
+    turns(lid.x);
+    buf[line * 2u][t] = spec[spec_index(c, pair, t, col)];
+    buf[line * 2u][t + N / 2u] = spec[spec_index(c, pair, t + N / 2u, col)];
+    workgroupBarrier();
+    let src = inverse_fft(line, t);
+    spec[spec_index(c, pair, t, col)] = buf[line * 2u + src][t];
+    spec[spec_index(c, pair, t + N / 2u, col)] = buf[line * 2u + src][t + N / 2u];
 }}
 
 // The transformed pairs into the three surfaces. The spectrum's zero sits in
@@ -606,6 +621,11 @@ struct WaveUniform {
 /// surface each frame, and the surface.
 pub struct WaveField {
     pub params: WaveParams,
+    /// [`WaveParams::significant_height`], worked out once: it sums the
+    /// spectrum over every wave vector of every cascade, and read per eye per
+    /// frame (`underwater::wave_reach`) it cost the Quest's render thread
+    /// ~130 ms a frame (2026-10-08).
+    pub significant_height: f32,
     uniform: Buffer,
     /// Displacement -- x, height, z, and d(Dx)/dz -- written in turns, so the
     /// one the last update did not write is last frame's: the water's motion
@@ -835,6 +855,7 @@ impl WaveField {
             curvature,
             foam,
             foam_gains: params.foam_gains(),
+            significant_height: params.significant_height(),
             current: AtomicUsize::new(1),
             primed: AtomicBool::new(false),
             last_seconds: AtomicU64::new(0f64.to_bits()),
@@ -844,6 +865,13 @@ impl WaveField {
             assemble: pipeline(&module, &layout, "assemble"),
             mip: pipeline(&mip_module, &mip_layout, "halve"),
         }
+    }
+
+    /// Have the next update write both sets, as the first does: for a field
+    /// left unupdated for a while -- out of sight -- whose other set holds a
+    /// surface long gone, and would tell SpaceWarp the water leapt.
+    pub fn reprime(&self) {
+        self.primed.store(false, Ordering::Relaxed);
     }
 
     /// Which of the pairs holds this frame's surface; the other holds last
@@ -878,10 +906,11 @@ impl WaveField {
             pass.set_bind_group(0, &self.groups[t], &[]);
             pass.set_pipeline(&self.evolve);
             pass.dispatch_workgroups(cells, cells, CASCADES as u32);
+            // Two lines a workgroup: see the shader.
             pass.set_pipeline(&self.rows);
-            pass.dispatch_workgroups(N, PAIRS, CASCADES as u32);
+            pass.dispatch_workgroups(N / 2, PAIRS, CASCADES as u32);
             pass.set_pipeline(&self.columns);
-            pass.dispatch_workgroups(N, PAIRS, CASCADES as u32);
+            pass.dispatch_workgroups(N / 2, PAIRS, CASCADES as u32);
             pass.set_pipeline(&self.assemble);
             pass.dispatch_workgroups(cells, cells, CASCADES as u32);
             pass.set_pipeline(&self.mip);

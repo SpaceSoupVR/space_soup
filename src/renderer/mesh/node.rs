@@ -129,6 +129,14 @@ pub(crate) fn collect_node(
             } else {
                 None
             };
+            // And what the editor measured on the rock (COLOR_1): sky seen,
+            // soot, tide band. Absent: the whole sky and nothing else, as
+            // before it existed.
+            let layered_aux: Vec<[f32; 4]> = if layered_weights.is_some() {
+                reader.read_colors(1).map(|c| c.into_rgba_f32().collect()).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
             // The material's emissive colour, as the ARTIST authored it.
             //
@@ -252,6 +260,15 @@ pub(crate) fn collect_node(
                             // all-zero weights as layer 0 too, so the two
                             // agree instead of one of them rendering black.
                             weights: weights.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]),
+                            aux: layered_aux.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 1.0]),
+                            // The ground copy: terrain uv (TEXCOORD_0) and
+                            // how much of the vertex it is (TEXCOORD_1.x).
+                            // A file without them reads 0: rock throughout.
+                            ground: {
+                                let uv = uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+                                let b = uv2s.get(i).map(|u| u[0]).unwrap_or(0.0);
+                                [uv[0], uv[1], b, 0.0]
+                            },
                         })
                         .collect();
                     let vertex_buffer =

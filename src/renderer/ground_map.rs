@@ -203,13 +203,17 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 
 /// The terrain shader's `layer_weights`, transcribed: the painted splat map
 /// when there is one, else rock by slope and high ground by height.
+///
+/// WHEN THERE IS ONE, as `TerrainMaterial::new` decides the shader's
+/// `use_splat` -- not by the settings' own `use_splat`, which only the
+/// material's copy has set: the renderer's stays 0. Read from it, the map
+/// coloured test_room's sand beach as grass, and so did every reflection of
+/// it and the water's view of the bed past the map's edge (2026-10-07).
 fn layer_weights(settings: &TerrainMaterialUniform, splat: Option<&TerrainImage>, uv: Vec2, world_y: f32, slope_deg: f32) -> [f32; 4] {
-    if settings.use_splat > 0.5 {
-        if let Some(s) = splat {
-            let w = sample_rgba(s, uv);
-            let total = (w[0] + w[1] + w[2] + w[3]).max(0.001);
-            return w.map(|v| v / total);
-        }
+    if let Some(s) = splat {
+        let w = sample_rgba(s, uv);
+        let total = (w[0] + w[1] + w[2] + w[3]).max(0.001);
+        return w.map(|v| v / total);
     }
     let rock = smoothstep(settings.slope_start_deg, settings.slope_end_deg, slope_deg);
     let mut w = [1.0 - rock, rock, 0.0, 0.0];
@@ -259,6 +263,9 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
             let slope_deg = n.y.clamp(-1.0, 1.0).acos().to_degrees();
             let w = layer_weights(inputs.settings, inputs.splat, uv, y, slope_deg);
             let albedo = means[0] * w[0] + means[1] * w[1] + means[2] * w[2] + means[3] * w[3];
+            // Wet sand, as the terrain shader darkens it.
+            let s = inputs.settings;
+            let albedo = albedo * (1.0 - 0.45 * (1.0 - smoothstep(s.wet_line, s.wet_line + s.wet_band, y)));
             let (sky_vis, sun_vis, under_a_floor) = sky_and_sun(inputs.sky_occlusion, uv);
             buried.push(under_a_floor);
             let e = inputs.sky.evaluate([n.x, n.y, n.z]);
@@ -949,6 +956,31 @@ mod tests {
         let cliff = map.texels[5 * 10 + 8];
         assert!(plain[1] > plain[0], "the plain is the grass layer: {plain:?}");
         assert!(cliff[0] > cliff[1], "the cliff is the rock layer: {cliff:?}");
+    }
+
+    /// A painted splat map decides the layers, as it does in the terrain
+    /// shader -- with the settings as the renderer holds them, whose own
+    /// `use_splat` is never set.
+    #[test]
+    fn a_painted_splat_is_the_ground_maps_colour() {
+        let g = HeightGrid::sample(Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0), 11, 11, |_, _| 0.0);
+        let s = TerrainMaterialUniform::default();
+        assert_eq!(s.use_splat, 0.0, "the renderer's settings carry no splat flag");
+        let layers = [
+            Some(TerrainImage { width: 1, height: 1, rgba: vec![0, 255, 0, 255] }),
+            Some(TerrainImage { width: 1, height: 1, rgba: vec![255, 0, 0, 255] }),
+            Some(TerrainImage { width: 1, height: 1, rgba: vec![0, 0, 255, 255] }),
+            Some(TerrainImage { width: 1, height: 1, rgba: vec![255, 255, 0, 255] }),
+        ];
+        // All sediment: the flat plain painted as a beach.
+        let splat = TerrainImage { width: 2, height: 2, rgba: [0u8, 0, 0, 255].repeat(4) };
+        let map = build(
+            &GroundInputs { heights: &g, sky: &sky(), sun: None, sky_occlusion: None, layers: &layers, splat: Some(&splat), settings: &s },
+            10,
+        );
+        let t = map.texels[5 * 10 + 5];
+        assert!(t[0] > 0.0 && t[1] > 0.0 && t[2] < 1e-6, "the plain is the painted sediment, not grass by slope: {t:?}");
+        assert!((t[0] - t[1]).abs() < 1e-3 * t[0], "sediment's red and green, equally: {t:?}");
     }
 }
 

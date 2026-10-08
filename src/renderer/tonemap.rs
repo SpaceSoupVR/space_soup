@@ -98,6 +98,38 @@ pub fn aces_fitted(color: Vec3) -> Vec3 {
     mul3(&ACES_OUTPUT, c).clamp(Vec3::ZERO, Vec3::ONE)
 }
 
+/// THE EYE AT NIGHT: rod vision's weights over linear sRGB -- the scotopic
+/// luminance V' (Pattanaik's -0.702 X + 1.039 Y + 0.433 Z, through sRGB's XYZ)
+/// scaled so white keeps its brightness. Red barely counts and blue counts
+/// for more: the Purkinje shift.
+pub const SCOTOPIC_WEIGHTS: [f32; 3] = [-0.0714, 0.6447, 0.4267];
+/// What rod vision's grey looks like: the blue cast a moonlit scene has to a
+/// dark-adapted eye (Jensen et al. 2001, "A Physically-Based Night Sky
+/// Model"), luminance 1.
+pub const NIGHT_TINT: [f32; 3] = [1.04, 0.96, 1.26];
+
+/// Colour toward rod vision by `night` (0 day .. 1 fully scotopic): one
+/// linear map, `mix(c, dot(c, SCOTOPIC_WEIGHTS) * NIGHT_TINT, night)`, so in
+/// the shader it is a dot, a multiply and a mix -- and at 0 exactly nothing.
+pub fn night_vision(color: Vec3, night: f32) -> Vec3 {
+    let rods = color.dot(Vec3::from(SCOTOPIC_WEIGHTS)).max(0.0) * Vec3::from(NIGHT_TINT);
+    color + (rods - color) * night.clamp(0.0, 1.0)
+}
+
+/// How far toward rod vision an eye adapted to `luminance_cd` (cd/m^2) sees:
+/// photopic (0) above 3 cd/m^2, toward scotopic below, by the log of the
+/// light, reaching `NIGHT_VISION_MAX` at 0.001 cd/m^2 (a moonless night).
+/// Mesopic in between -- a moonlit night (~0.01-0.1) is mostly toward rods.
+pub fn night_vision_for(luminance_cd: f32) -> f32 {
+    let (hi, lo) = (3.0f32.log10(), 0.001f32.log10());
+    let t = ((hi - luminance_cd.max(1e-9).log10()) / (hi - lo)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t) * NIGHT_VISION_MAX
+}
+
+/// Never wholly grey: even a dark-adapted eye keeps a little colour in the
+/// brightest things it sees.
+pub const NIGHT_VISION_MAX: f32 = 0.85;
+
 /// Exposure then tone curve, in that order -- the order Babylon uses.
 ///
 /// Exposure has to come first: it is a camera setting, and scaling AFTER the
@@ -172,18 +204,26 @@ pub fn wgsl_tonemap_block() -> String {
     format!(
         "{}{}",
         wgsl_aces_block(),
-        r#"
+        format!(
+            r#"
 // The last thing every lit fragment does. Output stays LINEAR: the swapchain is
 // Rgba8UnormSrgb, so the hardware does the sRGB encode on write, and doing it
 // here as well would gamma-correct twice and wash the whole image out.
-fn tonemap(color: vec3<f32>) -> vec3<f32> {
-    let exposed = color * max(camera.post_params.x, 0.0);
-    if (camera.post_params.y > 0.5) {
+fn tonemap(color: vec3<f32>) -> vec3<f32> {{
+    var exposed = color * max(camera.post_params.x, 0.0);
+    // THE EYE AT NIGHT (`tonemap::night_vision`): toward rod vision's blue-grey
+    // by `proxy_params.y`, 0 by day -- a dot and a mix, no branch.
+    let rods = max(dot(exposed, vec3<f32>({w0:?}, {w1:?}, {w2:?})), 0.0) * vec3<f32>({t0:?}, {t1:?}, {t2:?});
+    exposed = mix(exposed, rods, camera.proxy_params.y);
+    if (camera.post_params.y > 0.5) {{
         return clamp(exposed, vec3<f32>(0.0), vec3<f32>(1.0));
-    }
+    }}
     return aces_fitted(exposed);
-}
-"#
+}}
+"#,
+            w0 = SCOTOPIC_WEIGHTS[0], w1 = SCOTOPIC_WEIGHTS[1], w2 = SCOTOPIC_WEIGHTS[2],
+            t0 = NIGHT_TINT[0], t1 = NIGHT_TINT[1], t2 = NIGHT_TINT[2],
+        )
     )
 }
 
@@ -412,6 +452,29 @@ mod tests {
         assert!(bulb_adaptation(0.05, 2.0, 1.0) > bulb_adaptation(0.05, 3.0, 1.0));
         assert_eq!(bulb_adaptation(0.05, 0.0, 1.0), 0.0);
         assert_eq!(bulb_adaptation(0.05, f32::NAN, 1.0), 0.0);
+    }
+
+    #[test]
+    fn night_vision_is_nothing_by_day_keeps_white_and_greys_colour_at_night() {
+        let c = Vec3::new(0.8, 0.3, 0.1);
+        assert_eq!(night_vision(c, 0.0), c);
+        let white = night_vision(Vec3::ONE, 1.0);
+        let lum = |v: Vec3| v.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+        assert!((lum(white) - 1.0).abs() < 0.02, "{white}");
+        // Purkinje: a red that is bright by day goes dark to the rods, a blue
+        // does not.
+        let red = lum(night_vision(Vec3::new(1.0, 0.0, 0.0), 1.0));
+        let blue = lum(night_vision(Vec3::new(0.0, 0.0, 1.0), 1.0));
+        assert!(red < 0.01 && blue > 0.3, "{red} {blue}");
+        assert!(night_vision_for(100.0) == 0.0);
+        assert!((night_vision_for(1e-4) - NIGHT_VISION_MAX).abs() < 1e-6);
+        let moonlit = night_vision_for(0.03);
+        assert!(moonlit > 0.4 && moonlit < NIGHT_VISION_MAX, "{moonlit}");
+        let wgsl = wgsl_tonemap_block();
+        for v in SCOTOPIC_WEIGHTS.iter().chain(NIGHT_TINT.iter()) {
+            assert!(wgsl.contains(&format!("{v:?}")), "{v} never reached the shader");
+        }
+        assert!(wgsl.contains("camera.proxy_params.y"));
     }
 
     #[test]

@@ -22,7 +22,10 @@
 //!
 //! What it cannot see is what the probe did not: a lamp switched on after the
 //! bake, or the player's own torch. Those are the cases a frame meter handles
-//! and this does not -- worth knowing, and not this level.
+//! and this does not -- worth knowing. A fire is the exception, told it from
+//! outside: its flames and the pool its light throws are worked out where it
+//! burns and weighed in with the photographs (`meter_with`,
+//! `effects::meter_samples`).
 //!
 //! # From where the player stands, not where the photograph was taken
 //!
@@ -144,6 +147,21 @@ struct ProbeMeter {
     /// (direction, luminance, solid angle in steradians) per bin, from
     /// `centre`.
     bins: Vec<(Vec3, f32, f32)>,
+    /// What each bin's luminance is made of, so a changed sky and a changed
+    /// daylight can be metered without the pixels: see [`EyeAdaptation::relight`].
+    parts: Vec<BinParts>,
+}
+
+/// One bin's luminance by source: the surfaces the photograph saw, the share
+/// of them the LAMPS lit (when the bake split its probes into layers), and the
+/// sky filled in where it saw sky, with that sky's own luminance in the bin's
+/// direction to scale a new sky by.
+#[derive(Clone, Copy, Debug)]
+struct BinParts {
+    surface: f32,
+    lamps: Option<f32>,
+    sky: f32,
+    sky_ref: f32,
 }
 
 /// The adapted eye: what it meters from, and where it has got to.
@@ -157,12 +175,15 @@ pub struct EyeAdaptation {
     /// the first frame, which adapts instantly rather than fading in from an
     /// arbitrary start.
     adapted_log2: Option<f32>,
+    /// The ceiling on exposure: [`MAX_EXPOSURE`], unless a time-of-day sky
+    /// lets the night in (`set_max_exposure`).
+    max_exposure: f32,
 }
 
 impl EyeAdaptation {
     /// No probes: meters the sky alone.
     pub fn sky_only(sky: SkyIrradiance) -> Self {
-        Self { meters: Vec::new(), portals: Vec::new(), sky, adapted_log2: None }
+        Self { meters: Vec::new(), portals: Vec::new(), sky, adapted_log2: None, max_exposure: MAX_EXPOSURE }
     }
 
     /// Reduce each probe -- `(faces, resolution, where and what it is)`, as
@@ -180,15 +201,62 @@ impl EyeAdaptation {
     /// Add one probe's meter -- for a level whose probes are read one at a
     /// time rather than held together. See `probe_stream`.
     pub fn add_probe(&mut self, faces: &[u8], res: u32, desc: &ProbeDesc) {
+        self.add_probe_layered(faces, None, res, desc);
+    }
+
+    /// [`Self::add_probe`], with the photograph's LAMPS-ONLY layer when the
+    /// bake made one: what the lamps alone lit, so the meter can take the
+    /// daylight away at night and keep the lamps (`relight`).
+    pub fn add_probe_layered(&mut self, faces: &[u8], lamps: Option<&[u8]>, res: u32, desc: &ProbeDesc) {
         if let Some(texels) = super::uniforms::decode_probe_texels(faces, res) {
-            self.meters.push(ProbeMeter {
-                centre: desc.centre,
-                min: desc.min,
-                max: desc.max,
-                room: desc.volume,
-                bins: bin_probe(&texels, res, &self.sky),
-            });
+            let lamps = lamps.and_then(|l| super::uniforms::decode_probe_texels(l, res));
+            let (bins, parts) = bin_probe_parts(&texels, lamps.as_deref(), res, &self.sky);
+            self.meters.push(ProbeMeter { centre: desc.centre, min: desc.min, max: desc.max, room: desc.volume, bins, parts });
         }
+    }
+
+    /// A TIME-OF-DAY SKY: meter as if the photographs had been taken under
+    /// `sky`, with their daylight -- what the bake's sky and sun put on the
+    /// surfaces, everything but the lamps -- scaled by `daylight` (0 at night,
+    /// 1 as baked). Where a probe has no lamps layer its surfaces stay as
+    /// photographed. Cheap: 96 bins a probe, no pixels.
+    pub fn relight(&mut self, sky: SkyIrradiance, daylight: f32) {
+        for m in &mut self.meters {
+            for (bin, part) in m.bins.iter_mut().zip(&m.parts) {
+                let sky_now = luminance(sky.radiance(bin.0.to_array()));
+                let ratio = if part.sky_ref > 0.0 { sky_now / part.sky_ref } else { 0.0 };
+                let surface = match part.lamps {
+                    Some(l) => l + (part.surface - l).max(0.0) * daylight,
+                    None => part.surface,
+                };
+                bin.1 = surface + part.sky * ratio;
+            }
+        }
+        self.sky = sky;
+    }
+
+    /// Let exposure rise to `max` (a time-of-day sky's night needs ~1e5:
+    /// moonlight is a millionth of the sun).
+    pub fn set_max_exposure(&mut self, max: f32) {
+        self.max_exposure = max.max(MIN_EXPOSURE);
+    }
+
+    /// The darkest luminance the meter tells apart: the day's floor, or the
+    /// night's once the time of day has let the night in. With the day's
+    /// floor every moonlit bin read as 1e-4 -- 2.5 cd/m2, a lit room -- and the
+    /// night came out black (2026-10-08).
+    fn log_floor(&self) -> f32 {
+        if self.max_exposure > MAX_EXPOSURE {
+            NIGHT_LOG_FLOOR
+        } else {
+            LOG_FLOOR
+        }
+    }
+
+    /// The luminance the eye has settled toward (engine units), once it has
+    /// metered a frame.
+    pub fn adapted_luminance(&self) -> Option<f32> {
+        self.adapted_log2.map(f32::exp2)
     }
 
     /// The level's doorways, which the meter hands over across.
@@ -199,6 +267,13 @@ impl EyeAdaptation {
     /// The luminance a centre-weighted meter reads at `head` looking along
     /// `gaze`, both in WORLD space.
     pub fn meter(&self, head: Vec3, gaze: Vec3) -> f32 {
+        self.meter_with(head, gaze, &[])
+    }
+
+    /// [`Self::meter`] with light the photographs never saw -- a fire, and the
+    /// pool its light throws -- as (direction from the head, luminance, solid
+    /// angle) in WORLD space, weighed in as a photograph's bins are.
+    pub fn meter_with(&self, head: Vec3, gaze: Vec3, extra: &[(Vec3, f32, f32)]) -> f32 {
         let gaze = gaze.normalize_or_zero();
         // IN A DOORWAY: both rooms it joins, handed over along its depth. In
         // the wall's thickness the head is in neither room's box, and the
@@ -210,7 +285,7 @@ impl EyeAdaptation {
             hi[a] += DOORWAY_HANDOVER;
             if head.cmpge(lo).all() && head.cmple(hi).all() {
                 let f = smoothstep(lo[a], hi[a], head[a]);
-                match (self.room_log(p.low, head, gaze), self.room_log(p.high, head, gaze)) {
+                match (self.room_log(p.low, head, gaze, extra), self.room_log(p.high, head, gaze, extra)) {
                     (Some(lo), Some(hi)) => return (lo + (hi - lo) * f).exp(),
                     (Some(one), None) | (None, Some(one)) => return one.exp(),
                     (None, None) => {}
@@ -218,10 +293,10 @@ impl EyeAdaptation {
             }
         }
         let log = match self.room_at(head) {
-            Some(room) => self.room_log(room, head, gaze),
+            Some(room) => self.room_log(room, head, gaze, extra),
             None => {
                 let samples: Vec<(f32, f32)> =
-                    sky_bins(&self.sky).into_iter().map(|b| weighted(b, gaze, 1.0)).collect();
+                    sky_bins(&self.sky).into_iter().chain(extra.iter().copied()).map(|b| weighted(b, gaze, 1.0, self.log_floor())).collect();
                 band_log(samples)
             }
         };
@@ -246,10 +321,10 @@ impl EyeAdaptation {
     }
 
     /// What the meter reads in `room` from `head`, as a log luminance: the
-    /// room's photographs, and through each of its doorways the room beyond,
-    /// as much as the opening fills of the view. `None` for a room with no
-    /// photographs.
-    fn room_log(&self, room: u32, head: Vec3, gaze: Vec3) -> Option<f32> {
+    /// room's photographs, through each of its doorways the room beyond, as
+    /// much as the opening fills of the view, and the `extra` light (see
+    /// [`Self::meter_with`]). `None` for a room with no photographs.
+    fn room_log(&self, room: u32, head: Vec3, gaze: Vec3, extra: &[(Vec3, f32, f32)]) -> Option<f32> {
         let mut samples = Vec::new();
         if !self.photographs(room, head, gaze, 1.0, &mut samples) {
             return None;
@@ -265,6 +340,7 @@ impl EyeAdaptation {
                 }
             }
         }
+        samples.extend(extra.iter().map(|&b| weighted(b, gaze, 1.0, self.log_floor())));
         band_log(samples)
     }
 
@@ -279,7 +355,7 @@ impl EyeAdaptation {
         }
         for m in self.meters.iter().filter(|m| m.room == room) {
             let k = scale * near(m) / total;
-            out.extend(m.bins.iter().map(|&b| weighted(b, gaze, k)));
+            out.extend(m.bins.iter().map(|&b| weighted(b, gaze, k, self.log_floor())));
         }
         true
     }
@@ -328,7 +404,7 @@ impl EyeAdaptation {
     /// Advance the eye by `dt` seconds toward `metered` luminance and return
     /// the exposure multiplier to render with.
     pub fn update(&mut self, metered: f32, dt: f32) -> f32 {
-        let target = metered.max(LOG_FLOOR).log2();
+        let target = metered.max(self.log_floor()).log2();
         let current = match self.adapted_log2 {
             None => target,
             Some(c) => {
@@ -342,21 +418,32 @@ impl EyeAdaptation {
             }
         };
         self.adapted_log2 = Some(current);
-        exposure_for(current.exp2())
+        exposure_for_up_to(current.exp2(), self.max_exposure)
     }
 }
 
 /// The steady-state exposure for an eye fully settled at `luminance`.
 pub fn exposure_for(luminance: f32) -> f32 {
-    let ratio = REFERENCE_LUMINANCE / luminance.max(LOG_FLOOR);
-    ratio.powf(ADAPTATION_STRENGTH).clamp(MIN_EXPOSURE, MAX_EXPOSURE)
+    exposure_for_up_to(luminance, MAX_EXPOSURE)
 }
+
+/// [`exposure_for`] with its own ceiling. The log floor falls with it, so a
+/// moonlit meter (~1e-6) is not read as the floor.
+pub fn exposure_for_up_to(luminance: f32, max: f32) -> f32 {
+    let floor = if max > MAX_EXPOSURE { NIGHT_LOG_FLOOR } else { LOG_FLOOR };
+    let ratio = REFERENCE_LUMINANCE / luminance.max(floor);
+    ratio.powf(ADAPTATION_STRENGTH).clamp(MIN_EXPOSURE, max)
+}
+
+/// The luminance floor when the night is let in: under a new moon a lit
+/// surface is ~1e-8 engine units.
+const NIGHT_LOG_FLOOR: f32 = 1e-10;
 
 /// A bin as a weighted log-luminance sample: its solid angle, centre-weighted
 /// toward `gaze`, times `k`.
-fn weighted((d, lum, omega): (Vec3, f32, f32), gaze: Vec3, k: f32) -> (f32, f32) {
+fn weighted((d, lum, omega): (Vec3, f32, f32), gaze: Vec3, k: f32, floor: f32) -> (f32, f32) {
     let w = k * omega * (CENTRE_WEIGHT_FLOOR + d.dot(gaze).max(0.0).powf(CENTRE_WEIGHT_POWER));
-    (lum.max(LOG_FLOOR).ln(), w)
+    (lum.max(floor).ln(), w)
 }
 
 /// The solid angle of a rectangle `ahead` metres in front of a point, its
@@ -397,6 +484,52 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 
 fn luminance(c: [f32; 3]) -> f32 {
     0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+
+/// [`bin_probe`], with each bin's luminance kept by source too. The bins are
+/// `bin_probe`'s exactly: the surface and sky shares add back to them.
+fn bin_probe_parts(texels: &[[f32; 4]], lamps: Option<&[[f32; 4]]>, res: u32, sky: &SkyIrradiance) -> (Vec<(Vec3, f32, f32)>, Vec<BinParts>) {
+    let bins = bin_probe(texels, res, sky);
+    let per = (res / METER_BINS).max(1);
+    let mut parts = Vec::with_capacity(bins.len());
+    for face in 0..6usize {
+        for by in 0..METER_BINS {
+            for bx in 0..METER_BINS {
+                let (mut surface, mut lamp, mut sky_part, mut omega_sum) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                for ty in by * per..((by + 1) * per).min(res) {
+                    for tx in bx * per..((bx + 1) * per).min(res) {
+                        let u = (tx as f32 + 0.5) / res as f32;
+                        let v = (ty as f32 + 0.5) / res as f32;
+                        let d = super::probe_prefilter::texel_direction(face, u, v);
+                        let (a, b) = (2.0 * u - 1.0, 2.0 * v - 1.0);
+                        let omega = (1.0 + a * a + b * b).powf(-1.5);
+                        let i = (face as u32 * res * res + ty * res + tx) as usize;
+                        let t = texels[i];
+                        let cover = t[3].clamp(0.0, 1.0);
+                        surface += cover * luminance([t[0], t[1], t[2]]) * omega;
+                        if let Some(l) = lamps {
+                            let l = l[i];
+                            lamp += cover * luminance([l[0], l[1], l[2]]) * omega;
+                        }
+                        sky_part += (1.0 - cover) * luminance(sky.radiance(d.to_array())) * omega;
+                        omega_sum += omega;
+                    }
+                }
+                if omega_sum > 0.0 {
+                    let u = (bx as f32 + 0.5) / METER_BINS as f32;
+                    let v = (by as f32 + 0.5) / METER_BINS as f32;
+                    let d = super::probe_prefilter::texel_direction(face, u, v);
+                    parts.push(BinParts {
+                        surface: surface / omega_sum,
+                        lamps: lamps.map(|_| lamp / omega_sum),
+                        sky: sky_part / omega_sum,
+                        sky_ref: luminance(sky.radiance(d.to_array())),
+                    });
+                }
+            }
+        }
+    }
+    (bins, parts)
 }
 
 /// A probe's texels reduced to `METER_BINS` x `METER_BINS` per face.
@@ -592,6 +725,57 @@ mod tests {
         let tiny = rectangle_solid_angle(10.0, (-0.05, 0.05), (-0.05, 0.05));
         assert!((tiny / (0.01 / 100.0) - 1.0).abs() < 1e-3, "{tiny}");
         assert_eq!(rectangle_solid_angle(1.0, (2.0, 3.0), (2.0, 3.0)) > 0.0, true);
+    }
+
+    #[test]
+    fn light_the_photographs_never_saw_is_metered_too() {
+        // A fire in the dark room, looked at: what the photographs hold, and
+        // a bright patch filling a good part of the view.
+        let eye = two_rooms();
+        let (head, gaze) = (Vec3::new(-2.5, 1.6, 0.0), Vec3::new(0.0, -0.6, -0.8));
+        let alone = eye.meter(head, gaze);
+        assert_eq!(eye.meter_with(head, gaze, &[]), alone);
+        let lit = eye.meter_with(head, gaze, &[(gaze, 0.5, 1.5)]);
+        assert!(lit > 5.0 * alone, "{lit} vs {alone}");
+    }
+
+    #[test]
+    fn a_night_sky_takes_the_daylight_out_of_the_meter_and_keeps_the_lamps() {
+        let res = 8;
+        let day = faces(res, |_| 0.4);
+        let lamps = faces(res, |_| 0.004);
+        let mut eye = EyeAdaptation::sky_only(SkyIrradiance::flat(0.5));
+        eye.add_probe_layered(&day, Some(&lamps), res, &desc(Vec3::ZERO, Vec3::splat(-5.0), Vec3::splat(5.0), 0, true));
+        let noon = eye.meter(Vec3::ZERO, Vec3::NEG_Z);
+        eye.relight(SkyIrradiance::flat(0.5), 1.0);
+        assert!((eye.meter(Vec3::ZERO, Vec3::NEG_Z) - noon).abs() < 1e-3 * noon, "as baked");
+        eye.relight(SkyIrradiance::flat(1e-7), 0.0);
+        let night = eye.meter(Vec3::ZERO, Vec3::NEG_Z);
+        assert!((night - 0.004).abs() < 1e-4, "only the lamps: {night}");
+        // The ceiling lets a moonlit meter through.
+        assert_eq!(exposure_for(1e-6), MAX_EXPOSURE);
+        assert!(exposure_for_up_to(1e-6, 1e5) > 1e4);
+    }
+
+    /// A MOONLIT METER READS THE MOONLIGHT: with the night's ceiling the
+    /// meter's floor falls too, so a field at 2e-7 is not read as the day's
+    /// 1e-4. The field is the day's photograph relit in f32 (`relight`): a
+    /// photograph at 2e-7 is below half-float's normal range and reads ~0.
+    #[test]
+    fn a_moonlit_meter_is_not_read_as_the_day_floor() {
+        let res = 8;
+        let field = faces(res, |_| 0.2);
+        let unlit = faces(res, |_| 0.0);
+        let mut eye = EyeAdaptation::sky_only(SkyIrradiance::flat(0.1));
+        eye.add_probe_layered(&field, Some(&unlit), res, &desc(Vec3::ZERO, Vec3::splat(-5.0), Vec3::splat(5.0), 0, true));
+        eye.relight(SkyIrradiance::flat(1e-7), 1e-6);
+        assert!((eye.meter(Vec3::ZERO, Vec3::NEG_Z) - 1e-4).abs() < 1e-6, "the day reads its floor");
+        eye.set_max_exposure(2e5);
+        let night = eye.meter(Vec3::ZERO, Vec3::NEG_Z);
+        assert!((night / 2e-7 - 1.0).abs() < 0.05, "the night reads the field: {night}");
+        let e = eye.update(night, 0.0);
+        assert!(e > 1e4, "and opens the eye: x{e}");
+        assert!((eye.adapted_luminance().unwrap() / night - 1.0).abs() < 0.01);
     }
 
     #[test]

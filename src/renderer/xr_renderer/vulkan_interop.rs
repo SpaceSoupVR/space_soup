@@ -55,6 +55,12 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
     if vk.shader_f16 {
         features |= wgpu::Features::SHADER_F16;
     }
+    // DUAL-SOURCE BLENDING, on the same contract: `VkContext` switched
+    // `dualSrcBlend` on itself. Without it the water blends by one alpha and
+    // the bed under it greys rather than turning blue-green.
+    if vk.dual_src_blend {
+        features |= wgpu::Features::DUAL_SOURCE_BLENDING;
+    }
     // MULTISAMPLE_ARRAY: the feature that makes MULTIVIEW USABLE HERE AT ALL.
     //
     // WebGPU forbids a texture that is both multisampled and layered -- wgpu
@@ -395,6 +401,87 @@ pub(super) unsafe fn import_vk_image_as_wgpu_with(
         // expects.
         wgpu::TextureUses::UNINITIALIZED,
     )
+}
+
+/// When the pipeline cache is written back, in seconds after the renderer is
+/// made: once startup has built most pipelines, once a scene has been played
+/// in, and once more for those built late. Written only when it has grown.
+const PIPELINE_CACHE_SAVES_S: [u64; 3] = [45, 180, 600];
+
+/// THE DRIVER'S COMPILED SHADERS FROM THE LAST LAUNCH, for every pipeline
+/// built from here on (see `pipeline_cache_file`). Must run before the
+/// renderer's pipelines are created; a thread writes the cache back as it
+/// fills. The cache lives as long as the process: it is never destroyed.
+pub(super) unsafe fn start_pipeline_cache(vk: &VkContext, device: &wgpu::Device) {
+    use crate::renderer::pipeline_cache_file as file;
+    use wgpu::hal::vulkan as hvk;
+
+    let Some(hal) = (unsafe { device.as_hal::<hvk::Api>() }) else { return };
+    let props = unsafe { vk.instance.get_physical_device_properties(vk.physical_device) };
+    let key = file::CacheKey {
+        vendor_id: props.vendor_id,
+        device_id: props.device_id,
+        driver_version: props.driver_version,
+        cache_uuid: props.pipeline_cache_uuid,
+        build: file::build_identity(),
+    };
+    let path = ndk_glue::native_activity().external_data_path().join("pipelines.cache");
+    let saved = std::fs::read(&path).ok();
+    let initial: &[u8] = match saved.as_deref().map(|bytes| file::decode(&key, bytes)) {
+        Some(Ok(data)) => data,
+        Some(Err(why)) => {
+            log::info!("pipeline cache: {} not used ({why:?}); every pipeline compiles", path.display());
+            &[]
+        }
+        None => {
+            log::info!("pipeline cache: none yet; every pipeline compiles");
+            &[]
+        }
+    };
+    let create = |data: &[u8]| unsafe {
+        vk.device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(data), None)
+    };
+    // A driver that refuses the bytes it wrote last time still gets a cache
+    // to fill this time.
+    let cache = match create(initial).or_else(|_| create(&[])) {
+        Ok(cache) => cache,
+        Err(e) => {
+            log::warn!("pipeline cache: could not create one ({e}); every pipeline compiles");
+            return;
+        }
+    };
+    unsafe { hal.set_default_pipeline_cache(cache) };
+    log::info!("pipeline cache: started from {} bytes (build {:016x})", initial.len(), key.build);
+
+    let raw = vk.device.clone();
+    let mut written = initial.len();
+    let started = std::time::Instant::now();
+    let saver = std::thread::Builder::new().name("pipeline-cache".into()).spawn(move || {
+        for at in PIPELINE_CACHE_SAVES_S {
+            let due = std::time::Duration::from_secs(at);
+            std::thread::sleep(due.saturating_sub(started.elapsed()));
+            let data = match unsafe { raw.get_pipeline_cache_data(cache) } {
+                Ok(data) => data,
+                Err(e) => {
+                    log::warn!("pipeline cache: could not read it back ({e})");
+                    return;
+                }
+            };
+            if data.len() == written {
+                continue;
+            }
+            match file::write_whole(&path, &file::encode(&key, &data)) {
+                Ok(()) => {
+                    log::info!("pipeline cache: wrote {} bytes at {at} s", data.len());
+                    written = data.len();
+                }
+                Err(e) => log::warn!("pipeline cache: could not write {} ({e})", path.display()),
+            }
+        }
+    });
+    if let Err(e) = saver {
+        log::warn!("pipeline cache: no thread to save it ({e}); it lasts this launch only");
+    }
 }
 
 /// FIXED FOVEATED RENDERING from here on: every render pass carries a density

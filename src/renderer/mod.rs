@@ -15,6 +15,7 @@ pub mod performance_level;
 pub mod dynamic_resolution;
 pub mod panel;
 pub mod glare;
+pub mod effects;
 pub mod particle;
 pub mod pipeline;
 pub mod profiler;
@@ -25,19 +26,26 @@ pub mod exposure;
 pub mod probe_stream;
 pub mod room_light;
 pub mod sky;
+pub mod time_of_day;
 pub mod ssr;
 pub mod terrain_pipeline;
 pub mod water_pipeline;
+pub mod underwater;
+pub mod weather;
+pub mod ground_cuts;
+pub mod ground_twins;
 pub mod uniforms;
 pub mod probe_prefilter;
 pub mod multiview;
 pub mod pass_timers;
+pub mod pipeline_cache_file;
 pub mod bench;
 pub mod levers;
 pub mod perf_ab;
 pub mod scene_pass_plan;
 pub mod shader_checks;
 pub mod portal_cull;
+pub mod doors;
 pub mod shader_precision;
 #[cfg(test)]
 pub(crate) mod shader_inlining;
@@ -152,5 +160,8 @@ pub struct MeshInstance<'a> {
     /// fixture's own housing outside its beam. `None` for everything else.
     /// See `ModelUniform::upload_lit_bulb`.
     pub own_light: Option<Light>,
+    /// A door's leaf: drawn into the lamps' moving casters' tiles as well as
+    /// every map a model is drawn into. See `doors`.
+    pub tile_caster: bool,
 }
 

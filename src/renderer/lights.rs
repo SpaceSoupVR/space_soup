@@ -668,6 +668,10 @@ pub struct LightsUniform {
     /// none where none are made -- and then no surface is uploaded. See
     /// `pool_cards`.
     pool_row: std::cell::Cell<Option<u32>>,
+    /// Which lights hold the moving casters' tiles this frame: tile k's light
+    /// index, or `usize::MAX` for none. Uploaded as each light's shadow layer,
+    /// `MAX_SPOT_SHADOWS + k` (`character_shadow_tile` in the shader).
+    tile_lamps: std::cell::Cell<[usize; super::shadow::MAX_CHARACTER_SHADOWS]>,
 }
 
 impl LightsUniform {
@@ -686,7 +690,19 @@ impl LightsUniform {
             surface_lights_apart: std::cell::Cell::new(true),
             surfaces: std::cell::Cell::new([None; MAX_LIT_SURFACES]),
             pool_row: std::cell::Cell::new(None),
+            tile_lamps: std::cell::Cell::new([usize::MAX; super::shadow::MAX_CHARACTER_SHADOWS]),
         }
+    }
+
+    /// The lights holding the moving casters' tiles, tile by tile: `lamps[k]`
+    /// is the index in the uploaded list of tile k's light. Takes effect with
+    /// the next upload; `&[]` for none.
+    pub fn set_tile_lamps(&self, lamps: &[usize]) {
+        let mut held = [usize::MAX; super::shadow::MAX_CHARACTER_SHADOWS];
+        for (slot, &l) in held.iter_mut().zip(lamps) {
+            *slot = l;
+        }
+        self.tile_lamps.set(held);
     }
 
     /// The surfaces the live lamps' beams light this frame, at most
@@ -784,6 +800,12 @@ impl LightsUniform {
         sun_is_baked: bool,
     ) {
         let mut gpu = pack_lights(lights, live, spot_layers, sun_is_baked, self.culling.get());
+        for (k, &l) in self.tile_lamps.get().iter().enumerate() {
+            // A spot slot's light keeps its slot: a light reads one map.
+            if let Some(slot) = gpu.lights.get_mut(l).filter(|s| s.params[3] == -1.0) {
+                slot.params[3] = (super::shadow::MAX_SPOT_SHADOWS + k) as f32;
+            }
+        }
         gpu.count[3] = u32::from(!self.terminator_aa.get());
         if !self.surface_lights_apart.get() {
             gpu.surface_lights[0] = 0;
@@ -1991,6 +2013,11 @@ var<private> probe_brightness: f32 = 0.0;
 // image with the point it is an image of rather than with the surface showing
 // it. See `space_warp::reflected_point`.
 var<private> probe_reach: f32 = 0.0;
+// How many levels coarser than `GROUND_TRACE_FINEST_LEVEL` the ground trace
+// stops at. Only the water sets it: a rippled, moving surface blurs what it
+// mirrors far past the finest cells, and its rays skim the ground for tens
+// of metres, the trace's most expensive case.
+var<private> ground_trace_coarsen: i32 = 0;
 // THE ROUGHNESS FROM WHICH A SURFACE'S REFLECTION IS THE LIGHTMAP'S LIGHT
 // ALONE: its lobe is the whole hemisphere the diffuse term already integrates,
 // so the probe's sharper answer takes no share (`lobe_is_hemispherical` in
@@ -2587,10 +2614,11 @@ const SUN_ATLAS_GRID: vec2<f32> = vec2<f32>(f32({sun_atlas_tiles}), 1.0);
 const SUN_NEAR_TILE: f32 = f32({sun_near_tile});
 const SUN_NEAR_ZOOM: f32 = {sun_near_zoom:?};
 
-// Light `i`'s shadow of the characters alone, where it holds one of their
-// tiles; 1 elsewhere. See `character_shadow_tile`.
-fn character_shadow(i: u32, world_pos: vec3<f32>) -> f32 {{
-    let k = character_shadow_tile(i);
+// A light's shadow of the moving casters alone -- the characters and the
+// doors -- where its shadow `layer` names one of their tiles; 1 elsewhere. See
+// `character_shadow_tile`.
+fn character_shadow(layer: i32, world_pos: vec3<f32>) -> f32 {{
+    let k = character_shadow_tile(layer);
     if (k < 0) {{
         return 1.0;
     }}
@@ -2600,18 +2628,14 @@ fn character_shadow(i: u32, world_pos: vec3<f32>) -> f32 {{
     );
 }}
 
-// WHICH OF THE CHARACTERS' TILES HOLDS LIGHT `i`'S SHADOW of them, or -1:
-// `capsule_params.y` and `.z` name the lights of the first and second. See
-// `shadow::MAX_CHARACTER_SHADOWS`.
-fn character_shadow_tile(i: u32) -> i32 {{
-    let f = f32(i);
-    if (camera.capsule_params.y == f) {{
-        return 0;
-    }}
-    if (camera.capsule_params.z == f) {{
-        return 1;
-    }}
-    return -1;
+// WHICH OF THE MOVING CASTERS' TILES HOLDS A LIGHT'S SHADOW of them, or -1:
+// the light's shadow `layer` (`params.w`) past the spot slots names one,
+// `MAX_SPOT_SHADOWS + k` for tile k. See `shadow::MAX_CHARACTER_SHADOWS`.
+// The light's own field rather than a list of lights to compare its index
+// with: one subtraction for any number of tiles, where the list was a compare
+// a tile (`capsule_params.y` and `.z`, 2026-10-07).
+fn character_shadow_tile(layer: i32) -> i32 {{
+    return select(-1, layer - {max_spot_shadows}, layer >= {max_spot_shadows});
 }}
 
 fn light_contribution(l: Light, world_pos: vec3<f32>, n: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {{
@@ -4580,7 +4604,7 @@ fn ground_trace_until(e: vec3<f32>, d: vec3<f32>, t_max: f32) -> f32 {{
         t_out = -1.0;
     }}
     let top_level = i32(textureNumLevels(ground_map)) - 1;
-    let finest = min(GROUND_TRACE_FINEST_LEVEL, top_level);
+    let finest = min(GROUND_TRACE_FINEST_LEVEL + ground_trace_coarsen, top_level);
     var level = clamp(GROUND_TRACE_START_LEVEL, finest, top_level);
     let ahead = select(vec2<f32>(0.0), vec2<f32>(1.0), dq > vec2<f32>(0.0));
     // A thousandth of a texel along the ray: a point on a border is in the
@@ -6280,7 +6304,7 @@ fn shade_material_lamps(p: MaterialEnvPart, world_pos: vec3<f32>, n: vec3<f32>, 
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
             map = 1 + layer;
         }} else if (l.params.z < 1.5) {{
-            let k = character_shadow_tile(i);
+            let k = character_shadow_tile(layer);
             if (k >= 0) {{
                 map = CHARACTER_MAPS + k;
                 tile = f32(1 + k);
@@ -6408,7 +6432,7 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
             c = c * hf(pcf_layer(spot_shadow_tex, layer, world_pos, spot_view_proj(layer)));
         }} else if (l.params.z < 1.5) {{
             // The characters' shadows: see the brushes' loop.
-            c = c * hf(character_shadow(i, world_pos));
+            c = c * hf(character_shadow(layer, world_pos));
         }}
         lit = min(lit + c, hf3(hf(HF_MAX)));
     }}

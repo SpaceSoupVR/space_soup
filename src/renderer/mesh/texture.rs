@@ -628,6 +628,17 @@ fn upload_linear_f16_mipped(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
+    write_lightmap_mips(queue, &texture, &lightmap_mips_f16(texels, width, height));
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// A linear light map's half-float mip chain, as [`upload_linear_f16_mipped`]
+/// uploads it: each level's bytes and size. Pure CPU, so a worker thread can
+/// make it (the time of day relights the brush atlas off the render thread).
+pub fn lightmap_mips_f16(texels: &[f32], width: u32, height: u32) -> Vec<(Vec<u8>, u32, u32)> {
+    let levels = mip_levels_for(width, height, LIGHTMAP_MIP_LEVELS);
+    let mut out = Vec::with_capacity(levels as usize);
     let mut level: Vec<f32> = texels.to_vec();
     let (mut lw, mut lh) = (width, height);
     for mip in 0..levels {
@@ -635,17 +646,7 @@ fn upload_linear_f16_mipped(
             .iter()
             .flat_map(|v| crate::renderer::sky::f32_to_f16(*v).to_le_bytes())
             .collect();
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: mip,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &half,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8 * lw), rows_per_image: Some(lh) },
-            wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 },
-        );
+        out.push((half, lw, lh));
         if mip + 1 == levels {
             break;
         }
@@ -668,8 +669,64 @@ fn upload_linear_f16_mipped(
         lw = dw;
         lh = dh;
     }
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
+    out
+}
+
+/// Write a chain [`lightmap_mips_f16`] made into a light map's texture, in
+/// place: the bind groups that hold it keep working.
+pub fn write_lightmap_mips(queue: &wgpu::Queue, texture: &wgpu::Texture, chain: &[(Vec<u8>, u32, u32)]) {
+    for (mip, (half, lw, lh)) in chain.iter().enumerate() {
+        if mip as u32 >= texture.mip_level_count() {
+            break;
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: mip as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            half,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8 * lw), rows_per_image: Some(*lh) },
+            wgpu::Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
+        );
+    }
+}
+
+impl LoadedTexture {
+    /// This light map's bind group again, with the NEUTRAL sun mask in place
+    /// of its baked one: every brush then reads the sun's level shadow from
+    /// the static map -- what a sun that has moved off the baked direction
+    /// needs. Shares every other texture. `None` for a map built without the
+    /// lightmap layout's parts.
+    pub fn sunless_bind_group(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+    ) -> Option<(wgpu::BindGroup, wgpu::Texture)> {
+        let dir = self._direction.as_ref()?;
+        let (_, sun_sampler, st_tex) = self._sun_mask.as_ref()?;
+        let (neutral, neutral_view) = upload_rg8_mipped(device, queue, &NEUTRAL_SUN_MASK, 1, 1, "lightmap_sun_mask_neutral");
+        let dir_view = dir.create_view(&wgpu::TextureViewDescriptor::default());
+        let st_view = st_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lightmap_bg_sunless"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self._sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&dir_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&neutral_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(sun_sampler) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&st_view) },
+            ],
+        });
+        Some((bind_group, neutral))
+    }
 }
 
 /// Upload an RGBA image's red and green channels as a mipped `Rg8Unorm`.
