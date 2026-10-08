@@ -716,7 +716,7 @@ const WX_GONE: vec4<f32> = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     } else if (shape == 1u) {
         // SNOW: 0.9-1.4 m/s, wandering on the air and carried by the wind.
         let fall = 0.9 + 0.5 * r3;
-        let wob = 0.35 * vec2<f32>(sin(t * (0.6 + 0.5 * r4) + 6.2832 * r5), cos(t * (0.5 + 0.4 * r5) + 6.2832 * r4));
+        let wob = WX_WOBBLE_T;
         let cx = r0 * 10.0 + wind.x * t + wob.x;
         let cz = r1 * 10.0 + wind.y * t + wob.y;
         let cy = r2 * 7.0 - fall * t;
@@ -850,7 +850,128 @@ const WX_GONE: vec4<f32> = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     return vec4<f32>(aces_fitted(lit) * alpha, alpha);
 }
 "#
-        .replace("WX_SUN_RANGE", &format!("{:?}", super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS)),
+        .replace("WX_SUN_RANGE", &format!("{:?}", super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS))
+        .replace("WX_WOBBLE_T", &snow_wobble("t")),
+    )
+}
+
+/// A FLAKE'S WANDER on the air at the WGSL time `t` (the expression's text),
+/// across x and z: one source for the particle shader and its motion twin,
+/// which takes it at two times.
+fn snow_wobble(t: &str) -> String {
+    format!("0.35 * vec2<f32>(sin({t} * (0.6 + 0.5 * r4) + 6.2832 * r5), cos({t} * (0.5 + 0.4 * r5) + 6.2832 * r4))")
+}
+
+/// THE RAIN, SNOW AND SPLASHES' SPACEWARP MOTION (`space_warp::MotionKind::
+/// Weather`): the particle shader itself, its vertex stage run twice -- as
+/// drawn, and as the previous frame had each one -- and its cover again.
+///
+/// One source: the twin is [`particle_shader`]'s text with these changes,
+/// each checked to have matched (so an edit there that moves one fails
+/// here, at build time on the device and in the tests, rather than letting
+/// the two drift):
+/// - its vertex and fragment stages are plain functions (`wx_vertex`);
+/// - the camera is SpaceWarp's (`wx_motion_view`: this frame's, or the
+///   previous frame's for the previous place), at a motion pixel's size;
+/// - the weather's group is group 1, the ground's (unused) group 3;
+/// - the place it is drawn is moved back by how far it fell and drifted in
+///   the last `cam.params.z` seconds of the weather's clock (`wx_moved`:
+///   the fall and the wind, exactly, as the sim is stateless; a flake's
+///   wander at both times), and a splash's crown is as grown as it was.
+///
+/// Moved back from where it is, not placed again at the earlier time: the
+/// box a drop is wrapped into is the head's, and one that wrapped between
+/// the two times would have moved across the box.
+///
+/// Its motion is written over what is behind it by its cover, as a bright
+/// sharp layer (`space_warp::BRIGHT_LAYER_CONTRAST`), widened to a motion
+/// pixel and a half as the particle shader widens it to an eye pixel and a
+/// half, its alpha spread as there: a streak no motion pixel's centre falls
+/// in still counts, by its share.
+pub fn motion_shader() -> String {
+    let mut s = particle_shader();
+    let swap = |s: &mut String, from: &str, to: &str, n: usize| {
+        assert_eq!(s.matches(from).count(), n, "weather motion twin: `{from}` moved in the particle shader");
+        *s = s.replace(from, to);
+    };
+    swap(&mut s, "@group(0) @binding(0) var<uniform> camera: Camera;", "", 1);
+    swap(&mut s, "camera.view_proj[view_slot]", "wx_motion_view()", 2);
+    swap(&mut s, "@group(1) @binding(1) var wx_ground_samp", "@group(3) @binding(1) var wx_ground_samp", 1);
+    swap(&mut s, "@group(1) @binding(6) var wx_ground_tex", "@group(3) @binding(6) var wx_ground_tex", 1);
+    swap(&mut s, "@group(2) @binding(", "@group(1) @binding(", 3);
+    swap(&mut s, "@vertex fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> PVOut", "fn wx_vertex(vi: u32, ii: u32) -> PVOut", 1);
+    swap(&mut s, "@fragment fn fs_main(in: PVOut) -> @location(0) vec4<f32>", "fn wx_fragment(in: PVOut) -> vec4<f32>", 1);
+    swap(&mut s, "0.75 * wx.pixel.x * depth", "0.75 * wx.pixel.x * wx_pixel_scale * depth", 1);
+    swap(&mut s, "    let pp = wx_to_player(p);\n", "    let pp = wx_to_player(p - wx_moved(shape, vel, t, r4, r5));\n", 1);
+    swap(&mut s, "let grow = 0.025 + 0.35 * splash_age;", "let grow = 0.025 + 0.35 * max(splash_age - wx_back, 0.0);", 1);
+    // The cover: the fragment stage's own shape, taken from it.
+    let from = s.find("    var a: f32;\n").expect("weather motion twin: the particle's cover moved");
+    let to = from + s[from..].find("    var sky_vis").expect("weather motion twin: the particle's cover moved");
+    let cover = s[from..to].to_string();
+    format!(
+        r#"{motion}
+{s}
+var<private> wx_back: f32 = 0.0;
+var<private> wx_before: bool = false;
+var<private> wx_pixel_scale: f32 = 1.0;
+
+fn wx_motion_view() -> mat4x4<f32> {{
+    if (wx_before) {{
+        return cam.prev;
+    }}
+    return cam.curr;
+}}
+
+// How far a particle fell and drifted in the last `wx_back` seconds.
+fn wx_moved(shape: u32, vel: vec3<f32>, t: f32, r4: f32, r5: f32) -> vec3<f32> {{
+    if (shape == 2u) {{
+        return vec3<f32>(0.0);
+    }}
+    var d = vel * wx_back;
+    if (shape == 1u) {{
+        let now = {wob_now};
+        let before = {wob_before};
+        d = d + vec3<f32>(now.x - before.x, 0.0, now.y - before.y);
+    }}
+    return d;
+}}
+
+struct WxMotionOut {{
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) sky: vec4<f32>,
+    @location(2) @interpolate(flat) ground: vec3<f32>,
+    @location(3) curr: vec4<f32>,
+    @location(4) prev: vec4<f32>,
+}}
+
+@vertex fn vs_weather_motion(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> WxMotionOut {{
+    wx_pixel_scale = cam.reflect.x;
+    wx_back = cam.params.z;
+    wx_before = true;
+    let before = wx_vertex(vi, ii);
+    wx_back = 0.0;
+    wx_before = false;
+    let now = wx_vertex(vi, ii);
+    var out: WxMotionOut;
+    out.clip = now.clip;
+    out.uv = now.uv;
+    out.sky = now.sky;
+    out.ground = now.ground;
+    out.curr = now.clip;
+    out.prev = before.clip;
+    return out;
+}}
+
+@fragment fn fs_weather_motion(in: WxMotionOut) -> @location(0) vec4<f32> {{
+{cover}    let w = layer_weight(in.sky.a * a, {bright:?});
+    return vec4<f32>(motion_of(in.curr, in.prev).xyz * w, w);
+}}
+"#,
+        motion = crate::renderer::space_warp::motion_block(),
+        wob_now = snow_wobble("t"),
+        wob_before = snow_wobble("(t - wx_back)"),
+        bright = crate::renderer::space_warp::BRIGHT_LAYER_CONTRAST,
     )
 }
 
@@ -1453,6 +1574,42 @@ mod tests {
             let (dry, wet) = (size(&src), size(&with_weather(&src).unwrap()));
             eprintln!("{label}: {dry} -> {wet} expressions (+{}, +{:.1}%)", wet - dry, 100.0 * (wet - dry) as f32 / dry as f32);
         }
+    }
+
+    /// The rain, snow and splashes' SpaceWarp twin validates, and is the
+    /// particle shader's own text: every change it makes is checked to have
+    /// matched (`motion_shader` panics otherwise), and the draw shader is
+    /// still the one it was -- the wander written once (`snow_wobble`).
+    #[test]
+    fn the_weather_motion_twin_validates_and_is_the_particle_shader() {
+        validate("weather motion", &motion_shader());
+        let draw = particle_shader();
+        assert!(draw.contains(
+            "let wob = 0.35 * vec2<f32>(sin(t * (0.6 + 0.5 * r4) + 6.2832 * r5), cos(t * (0.5 + 0.4 * r5) + 6.2832 * r4));"
+        ));
+        assert!(draw.contains("@vertex fn vs_main(") && !draw.contains("wx_moved"), "the draw shader carries none of the twin");
+        let twin = motion_shader();
+        for part in ["fn wx_vertex(vi: u32, ii: u32) -> PVOut", "wx_to_player(p - wx_moved(shape, vel, t, r4, r5))", "@vertex fn vs_weather_motion", "@fragment fn fs_weather_motion"] {
+            assert!(twin.contains(part), "{part}");
+        }
+    }
+
+    /// WHERE A DROP WAS: moved back from where it is by its fall and the
+    /// wind (`wx_moved`), not placed again at the earlier time -- a drop that
+    /// wrapped across the head's box between the frames would have crossed
+    /// the box. A CPU twin of the rain's placement at two times.
+    #[test]
+    fn a_drop_moves_back_by_its_fall_not_across_its_box() {
+        let wrap = |c: f32, lo: f32, w: f32| c - w * (((c - lo) / w).floor());
+        let (r2, fall, head_y) = (0.999f32, 8.0f32, 1.6f32);
+        let (t, back) = (10.0f32, 1.0 / 36.0);
+        let y = |t: f32| wrap(r2 * 9.0 - fall * t, head_y - 3.5, 9.0);
+        // Find a moment it wraps between the frames.
+        let t = (0..10_000).map(|k| t + k as f32 * 0.001).find(|&t| y(t - back) < y(t)).expect("a wrap");
+        let placed_again = y(t - back);
+        let moved_back = y(t) + fall * back;
+        assert!((placed_again - y(t)).abs() > 4.0, "placed again, it jumped across the box");
+        assert!((moved_back - y(t) - fall * back).abs() < 1e-4);
     }
 
     #[test]

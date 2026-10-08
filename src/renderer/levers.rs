@@ -166,7 +166,10 @@ pub struct Levers {
     /// 32768 = the brushes write what the reflection motion READ instead of
     /// motion -- reflected share, reach in metres, distance ratio;
     /// 65536 = with 8192, the images also saved raw to the app's files
-    /// (`swdump.bin`, see `space_warp::Readback::read`).
+    /// (`swdump.bin`, see `space_warp::Readback::read`);
+    /// 131072 = the motion pass unculled -- every brush and mesh in both
+    /// eyes, as before 2026-10-08 round 4 -- to price the cull;
+    /// 262144 = no particle motion (rain, snow, effects), to compare.
     pub space_warp_debug: u32,
     /// DIAGNOSIS: both eyes' finished images of the next frame, raw, to the
     /// app's files as `eyecapture_<n>.bin`, each time this changes to a new

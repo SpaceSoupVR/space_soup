@@ -1658,6 +1658,33 @@ impl XrRenderer {
                 .collect(),
             _ => Vec::new(),
         };
+        // THE MOTION PASS'S CULL, per eye: its own frustum, as the motion
+        // pass is drawn one eye at a time. The brushes in runs of a few faces
+        // (`space_warp::index_runs`), each eye drawing the runs it can see;
+        // a rigid mesh only when its bound is in that eye's view. Lossless --
+        // the GPU clipped the rest -- and it was the pass's whole cost
+        // besides its fill: every brush and every mesh twice a frame (0.46-
+        // 0.65 ms, round 3). Skinned meshes are drawn whole: their bound is
+        // the bind pose's. `space_warp_debug` 131072 draws it all, to price
+        // the cull.
+        let warp_planes: [[glam::Vec4; 6]; 2] =
+            std::array::from_fn(|e| crate::renderer::shadow::frustum_planes(warp_view_proj[e]));
+        let warp_cull = self.levers.space_warp_debug & 131072 == 0;
+        let brush_motion_ranges: Option<[Vec<(u32, u32)>; 2]> =
+            match (warp_cull && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some()), brush_geometry) {
+                (true, Some((v, i))) => {
+                    let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
+                    let runs = crate::renderer::space_warp::index_runs(i, |k| glam::Vec3::from(v[k as usize].position));
+                    Some(std::array::from_fn(|e| crate::renderer::space_warp::visible_ranges(&runs, &warp_planes[e])))
+                }
+                _ => None,
+            };
+        // The clocks the particles move by -- the weather's and the
+        // effects' -- and how far each ran since the previous frame.
+        let warp_clocks = (self.weather.as_ref().map_or(0.0, |w| w.seconds), time.as_nanos() as f64 * 1e-9);
+        let warp_steps = self.space_warp.as_ref().and_then(|sw| sw.prev_clocks).map_or((0.0, 0.0), |(w, f)| {
+            (((warp_clocks.0 - w).clamp(0.0, 0.1)) as f32, ((warp_clocks.1 - f).clamp(0.0, 0.1)) as f32)
+        });
         // WHICH BODIES OF WATER EITHER EYE SEES this frame: only theirs are
         // the waves moved and the surfaces drawn. In the world, where their
         // bounds are, and through the doorways from inside a closed room, as
@@ -1745,11 +1772,13 @@ impl XrRenderer {
                 let prev_view_proj = sw.prev.map_or(curr, |(vps, _)| vps[eye]);
                 let world_prev = sw.prev.map_or(curr, |(vps, w2p)| previous_clip(vps[eye], w2p, warp_world_to_player));
                 let dbg = self.levers.space_warp_debug;
+                // z, w: the seconds the weather's and the effects' clocks ran
+                // since the previous frame, for the particles.
                 let params = [
                     if dbg & 2 != 0 { -1.0 } else { 1.0 },
                     if dbg & 4 != 0 { 0.0 } else { 1.0 },
-                    0.0,
-                    0.0,
+                    warp_steps.0,
+                    warp_steps.1,
                 ];
                 let mut put = |slot: usize, c: glam::Mat4, p: glam::Mat4, eye: [f32; 4], reflect: [f32; 4]| {
                     let cam = MotionCamera { curr: c.to_cols_array_2d(), prev: p.to_cols_array_2d(), params, eye, reflect };
@@ -3230,7 +3259,11 @@ impl XrRenderer {
                     let reflect_group = sw.reflect_groups.get(image_index).map(|g| &g[eye]).filter(|_| warp_reflections);
                     if let Some((vb, ib, n)) = brush_buffers.as_ref() {
                         let kind = if reflect_group.is_some() { MotionKind::BrushReflect } else { MotionKind::Brush };
-                        draws.push(MotionDraw { kind, vertices: vb, indices: ib, first: 0, count: *n, slot: base, joints: reflect_group });
+                        let brush = |first: u32, count: u32| MotionDraw { kind, vertices: vb, indices: ib, first, count, slot: base, joints: reflect_group };
+                        match brush_motion_ranges.as_ref() {
+                            Some(ranges) => draws.extend(ranges[eye].iter().map(|&(first, count)| brush(first, count))),
+                            None => draws.push(brush(0, *n)),
+                        }
                     }
                     // The solid buffer: its cuboids whole, and of the ground
                     // only the chunks this eye's scene pass drew.
@@ -3254,6 +3287,15 @@ impl XrRenderer {
                     }
                     for (i, (inst, _, _)) in warp_meshes.iter().enumerate() {
                         let slot = base + 1 + i as u32;
+                        if warp_cull
+                            && inst.mesh.skin.is_none()
+                            && !crate::renderer::shadow::sphere_in_frustum(
+                                &warp_planes[eye],
+                                crate::renderer::shadow::mesh_caster_bound(&inst.mesh),
+                            )
+                        {
+                            continue;
+                        }
                         if let Some(skin) = &inst.mesh.skin {
                             let joints = skin.motion_bind_group(&self.wgpu_device, &sw.pipelines.joints_layout);
                             for prim in &skin.primitives {
@@ -3268,7 +3310,12 @@ impl XrRenderer {
                                 });
                             }
                         } else {
-                            for prim in inst.mesh.primitives.iter().filter(|p| p.layered.is_none()) {
+                            // Caves too (layered): their ordinary vertices are
+                            // kept beside the layered ones. Left out until
+                            // 2026-10-08, a cave wrote no depth or motion: the
+                            // compositor moved its pixels by the ridge's outer
+                            // face behind them, and the cave smeared.
+                            for prim in inst.mesh.primitives.iter() {
                                 draws.push(MotionDraw {
                                     kind: MotionKind::Mesh,
                                     vertices: &prim.vertex_buffer,
@@ -3295,8 +3342,44 @@ impl XrRenderer {
                             });
                         }
                     }
+                    // THE PARTICLES, over all that: the effects and the weather,
+                    // where and when their colour is drawn (seen emitters
+                    // only; the weather near where it falls, mono passes),
+                    // each moving itself as far as it shows. See
+                    // `effects::motion_shader`, `weather::motion_shader`.
+                    use crate::renderer::space_warp::MotionParticles;
+                    let mut particles: Vec<MotionParticles> = Vec::new();
+                    if self.levers.space_warp_debug & 262144 == 0 {
+                        if let (true, Some(gpu)) = (effects_drawn, self.effects_gpu.as_ref()) {
+                            let (instances, group, over, screened) = gpu.motion_parts();
+                            for (kind, range) in [
+                                (MotionKind::EffectsOver, 0..over),
+                                (MotionKind::EffectsScreened, over..over + screened),
+                            ] {
+                                particles.push(MotionParticles {
+                                    kind,
+                                    instances: Some(instances),
+                                    vertices: crate::renderer::effects::VERTICES_PER_PARTICLE,
+                                    range,
+                                    slot: base,
+                                    groups: [Some(probe_read_group), Some(group)],
+                                });
+                            }
+                        }
+                        if let (true, false, Some(w)) = (weather_on, stereo, self.weather.as_ref()) {
+                            particles.push(MotionParticles {
+                                kind: MotionKind::Weather,
+                                instances: None,
+                                vertices: crate::renderer::weather::VERTICES_PER_PARTICLE,
+                                range: 0..w.counts.0 + w.counts.1 + w.counts.2,
+                                slot: base,
+                                groups: [Some(&w.maps.bind_group), None],
+                            });
+                        }
+                    }
                     if self.levers.space_warp_debug & 1 != 0 {
                         draws.clear();
+                        particles.clear();
                     }
                     let mut encoder = self
                         .wgpu_device
@@ -3308,6 +3391,7 @@ impl XrRenderer {
                         &sw.motion_targets[m][eye].view,
                         &sw.depth_targets[d][eye].view,
                         &draws,
+                        &particles,
                         self.levers.space_warp_debug & 2048 != 0,
                         if self.levers.space_warp_debug & 4096 != 0 { 0.0 } else { 1.0 },
                     );
@@ -3499,6 +3583,7 @@ impl XrRenderer {
                 }
             }
             sw.prev = Some((warp_view_proj, warp_world_to_player));
+            sw.prev_clocks = Some(warp_clocks);
             sw.prev_models = meshes.iter().map(|m| (m.model.buffer.clone(), m.mesh.model_matrix())).collect();
         }
 

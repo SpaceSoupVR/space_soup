@@ -555,6 +555,9 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
     let mut t = t_in;
     let mut steps = 0;
     let mut reads = 0;
+    // A ray that starts under the map's ground meets nothing until it has
+    // risen above it (`ground_trace_until`).
+    let mut risen = false;
     while steps < shape.max_steps && t < t_out {
         steps += 1;
         reads += 1;
@@ -566,6 +569,7 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
         let highest = lv.texels[(c.y as u32 * lv.width + c.x as u32) as usize][3];
         let y_in = e.y + d.y * t;
         let y_out = e.y + d.y * t_exit;
+        risen = risen || y_in > highest;
         if y_in.min(y_out) <= highest {
             // Nothing in this cell before the ray is down to its highest ground.
             let t_top = if y_in > highest { t + (y_in - highest) / -d.y } else { t };
@@ -580,15 +584,17 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
             let span = (t_exit - t_top) / gaps as f32;
             reads += gaps + 1;
             let mut f_prev = at(t_top);
-            if f_prev <= 0.0 {
+            if f_prev <= 0.0 && risen {
                 return GroundTrace { t: Some(t_top), steps, reads };
             }
+            risen = risen || f_prev > 0.0;
             for k in 1..=gaps {
                 let tk = t_top + span * k as f32;
                 let f = at(tk);
-                if f <= 0.0 {
+                if f <= 0.0 && risen {
                     return GroundTrace { t: Some(tk - span + span * f_prev / (f_prev - f)), steps, reads };
                 }
+                risen = risen || f > 0.0;
                 f_prev = f;
             }
         }
@@ -886,6 +892,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A ray from a hollow finer than the map's texels -- a puddle, under the
+    /// map's ground there -- meets nothing until it has risen above it: it
+    /// went straight to the ground where it started, and a mirror puddle
+    /// showed the grass (headset, 2026-10-08). Rising away it meets nothing;
+    /// rising over a hill it still meets the hill.
+    #[test]
+    fn a_ray_from_under_the_maps_ground_meets_only_what_it_rises_to() {
+        let map = fixtures::height_map(1024, fixtures::hills);
+        let chain = levels(&map);
+        let size = map.max - map.min;
+        let mut checked = 0;
+        for i in 0..400 {
+            let x = map.min.x + size.x * (0.1 + 0.8 * ((i * 37 % 400) as f32 / 400.0));
+            let z = map.min.y + size.y * (0.1 + 0.8 * ((i * 91 % 400) as f32 / 400.0));
+            let under = height_at(&chain[0], (Vec2::new(x, z) - map.min) * (chain[0].width as f32 / size)) - 0.05;
+            let e = Vec3::new(x, under, z);
+            // Straight up: nothing above but the sky.
+            let up = trace(&chain, map.min, map.max, map.top, e, Vec3::Y);
+            assert!(up.t.is_none(), "from under the ground at {e}, straight up met {:?}", up.t);
+            // Nearly level: whatever it meets is past the point it rose clear.
+            let d = Vec3::new(0.7, 0.05, 0.7).normalize();
+            if let Some(t) = trace(&chain, map.min, map.max, map.top, e, d).t {
+                assert!(t > 0.05, "from under the ground at {e}, met it where it started ({t})");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no level ray met a hill");
     }
 
     /// The trace against brute force: the same ground read every centimetre
