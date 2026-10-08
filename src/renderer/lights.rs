@@ -4396,8 +4396,10 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
             hit.t = t0;
             return hit;
         }}
-        let start = clamp(hit.origin + d * t0, lo, hi);
-        let far = select(vec3<f32>(3.4e38), max((hi - start) * inv, (lo - start) * inv), moving);
+        // Where the ray leaves the box, along the ray from its origin: the
+        // ray is in the box from its entry on, so the slabs' far sides are
+        // the exit.
+        let far = select(vec3<f32>(3.4e38), max((hi - hit.origin) * inv, (lo - hit.origin) * inv), moving);
         var axis = 2;
         var t_exit = far.z;
         if (far.x <= far.y && far.x <= far.z) {{
@@ -4407,7 +4409,9 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
             axis = 1;
             t_exit = far.y;
         }}
-        t_exit = t0 + t_exit;
+        // From `t0`: past the first room, where the ray LEFT the room before
+        // -- through the doorway's wall, where a door's leaf hangs (see
+        // `space_soup_engine::reflection_proxy::door_proxies`).
         let proxy = probe_proxy_hit(hit.origin, d, cur, t0, t_exit, skip, lobe);
         let t_obj = proxy.t;
         if (hit.edge_code < 0 && proxy.edge >= 0) {{
@@ -4519,7 +4523,9 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
             return hit;
         }}
         cur = other;
-        t0 = t_enter;
+        // The next room's proxies are met from this room's exit on: a shut
+        // door stands in the wall between the two boxes.
+        t0 = t_exit;
     }}
     return hit;
 }}

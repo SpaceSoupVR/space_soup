@@ -842,6 +842,18 @@ fn fire_phase(e: &EffectEmitter, time: f64) -> f32 {
     ((time * f).rem_euclid(1.0) as f32 + wander).rem_euclid(1.0)
 }
 
+/// The spot on a fire's bed of the sheet born `birth`-th: its distance out as a share of the bed's
+/// radius and its angle round as a share of a turn, from the R2 sequence
+/// (even over the disc, and over any run of slots), jittered by two
+/// uniforms by a tenth either way.
+fn fire_spot(birth: f64, ju: f32, jv: f32) -> (f32, f32) {
+    let x = (0.5 + birth * 0.754_877_666_246_692_8).rem_euclid(1.0) as f32;
+    let y = (0.5 + birth * 0.569_840_290_998_053_3).rem_euclid(1.0) as f32;
+    let x = (x + 0.1 * (ju - 0.5)).rem_euclid(1.0);
+    let y = (y + 0.1 * (jv - 0.5)).rem_euclid(1.0);
+    (x.sqrt(), y)
+}
+
 /// One sheet of a fire at one moment: what `simulate_with` draws and
 /// `fire_glow` adds up. In the WORLD's frame.
 struct FlameSheet {
@@ -903,10 +915,19 @@ fn fire_sheets(e: &EffectEmitter, time: f64) -> Vec<FlameSheet> {
             continue;
         }
         let t = age / life;
-        let r = p.bed * e.scale * u[4].sqrt();
-        let phi = u[5] * std::f32::consts::TAU;
+        // SPREAD OVER THE BED, NOT SCATTERED: slot by slot along an R2
+        // sequence, jittered a little -- the sheets alive at once are always a
+        // run of slots born one after another, and any run of R2 covers the
+        // disc evenly. Scattered at random, a dozen sheets leaned the fire up
+        // to 12 cm off its bed at times, and it stood beside its fuel
+        // (headset, Checkpoint 51).
+        // By birth, not by slot: slot by slot, each slot's spot and size came
+        // round every cycle and the hand-overs beat at 1/period.
+        let (r2, a2) = fire_spot(n * slots as f64 + i as f64, u[4], u[5]);
+        let r = p.bed * e.scale * r2;
+        let phi = a2 * std::f32::consts::TAU;
         let spot = e.position + (side * phi.cos() + up.cross(side) * phi.sin()) * r;
-        let size = lerp(p.size.0, p.size.1, smoothstep(0.0, 1.0, t)) * e.scale * size_spread(u[8], &v) * wide * (1.15 - 0.45 * u[4].sqrt());
+        let size = lerp(p.size.0, p.size.1, smoothstep(0.0, 1.0, t)) * e.scale * size_spread(u[8], &v) * wide * (1.15 - 0.45 * r2);
         let tall = if v.size_variation == 1.0 { 0.85 + 0.35 * u[7] } else { (1.025 + (u[7] - 0.5) * 0.35 * v.size_variation).max(0.2) };
         let spin_dir = if u[10] < 0.5 { -1.0 } else { 1.0 };
         let pace_of = if v.speed_variation == 1.0 { 0.85 + 0.3 * u[1] } else { (1.0 + (u[1] - 0.5) * 0.3 * v.speed_variation).max(0.1) };
@@ -949,7 +970,7 @@ const FLAME_AREA: [f32; FIRE_FRAMES as usize] = [
 /// of it stands (`FlameSheet::stands`) at 0, 1/8 .. 1: the book's mean.
 const EROSION_COVER: [f32; 9] = [0.0014, 0.0114, 0.0565, 0.1624, 0.3356, 0.5441, 0.7620, 0.9568, 1.0];
 /// The mean of `fire_glow`'s sum at scale 1, rate 1: what makes it 1.
-const FLAME_AREA_MEAN: f32 = 0.183015;
+const FLAME_AREA_MEAN: f32 = 0.182531;
 
 fn flame_area(frame: f32) -> f32 {
     let f = frame.clamp(0.0, (FIRE_FRAMES - 1) as f32);
@@ -1137,6 +1158,16 @@ pub fn simulate(emitters: &[EffectEmitter], time: f64, at: &Surroundings) -> Eff
 
 /// [`simulate`], with the splashes still in the air at `time` (`splash`).
 pub fn simulate_with(emitters: &[EffectEmitter], splashes: &[Splash], time: f64, at: &Surroundings) -> EffectFrame {
+    simulate_seen(emitters, &|_| true, splashes, time, at)
+}
+
+/// [`simulate_with`], drawing only the emitters `seen` keeps (by index; see
+/// [`emitter_seen`]). Those left out still lend what the others take from
+/// them -- a fire's adaptation to its smoke and its own light, its swell to
+/// its coals -- so a fire below the view does not leave its smoke over it a
+/// hundred times too bright. Each particle is a function of the time, so one
+/// coming back into view is where it would have been.
+pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, splashes: &[Splash], time: f64, at: &Surroundings) -> EffectFrame {
     let mut over: Vec<(f32, EffectInstance)> = Vec::new();
     let mut screened: Vec<EffectInstance> = Vec::new();
     let player = |p: Vec3| at.yaw_inv * (p - at.offset);
@@ -1157,7 +1188,10 @@ pub fn simulate_with(emitters: &[EffectEmitter], splashes: &[Splash], time: f64,
             .find(|f| !l.in_level_bake && f.0.distance_squared(l.position) < f.1 * f.1)
             .map_or(1.0, |f| f.2)
     };
-    for e in emitters {
+    for (index, e) in emitters.iter().enumerate() {
+        if !seen(index) {
+            continue;
+        }
         match e.kind {
             EffectKind::Coals => {
                 // Drawn before all it lies under: as the farthest of all.
@@ -1358,6 +1392,104 @@ pub fn simulate_with(emitters: &[EffectEmitter], splashes: &[Splash], time: f64,
     frame.instances.extend(over.into_iter().map(|(_, i)| i));
     frame.instances.extend(screened);
     frame
+}
+
+/// HOW FAR AN EMITTER CAN DRAW, in the WORLD's frame: a box holding every
+/// particle it makes -- a fire's tallest tongues, smoke risen four metres or
+/// spread under its ceiling, a pop's sparks, dust carried by the air -- and
+/// `EMITTER_MARGIN` besides, so one is simulated before its edge reaches the
+/// view and nothing pops in. Its light is not in it: that lights the room
+/// whether or not its flames are drawn (`fire_light`).
+pub fn emitter_bounds(e: &EffectEmitter) -> (Vec3, Vec3) {
+    let s = e.scale.max(0.0);
+    let root = s.sqrt();
+    let p = e.position;
+    let (lo, hi) = match e.kind {
+        EffectKind::Fire => (p - Vec3::new(0.45 * s, 0.15 * s, 0.45 * s), p + Vec3::new(0.45 * s, 1.4 * s, 0.45 * s)),
+        EffectKind::Coals => (p - Vec3::splat(0.36 * s), p + Vec3::splat(0.36 * s)),
+        EffectKind::Smoke => {
+            let wide = 0.8 * s + 0.6 + if e.ceiling.is_some() { 2.5 } else { 0.0 };
+            (p - Vec3::new(wide, 0.6 * s, wide), p + Vec3::new(wide, 4.5 * s.max(root) + 0.6 * s, wide))
+        }
+        EffectKind::Embers => (p - Vec3::new(0.6 * s + 0.4, 0.3, 0.6 * s + 0.4), p + Vec3::new(0.6 * s + 0.4, 3.5 * root, 0.6 * s + 0.4)),
+        EffectKind::Dust => {
+            let half = e.extent[0].abs() + e.extent[1].abs() + e.extent[2].abs() + Vec3::splat(0.25 * e.variation.clamped().turbulence + 0.05);
+            (p - half, p + half)
+        }
+    };
+    let hi = match (e.ceiling, e.kind) {
+        (Some(top), EffectKind::Smoke | EffectKind::Embers) => hi.with_y(hi.y.min(top + 0.05).max(lo.y)),
+        _ => hi,
+    };
+    (lo - Vec3::splat(EMITTER_MARGIN), hi + Vec3::splat(EMITTER_MARGIN))
+}
+
+/// Slack round an emitter's bounds, metres: what the culling's hysteresis
+/// is in space (and `EMITTER_HOLD` in time).
+pub const EMITTER_MARGIN: f32 = 0.3;
+/// How long an emitter stays drawn after it was last seen, seconds: a head
+/// turning back and forth at a doorway does not switch it every frame.
+pub const EMITTER_HOLD: f64 = 0.5;
+
+/// WHETHER EITHER EYE CAN SEE ANY OF AN EMITTER: its bounds (`emitter_bounds`)
+/// in one of `views` (the eyes' frusta, in the WORLD's frame; their far plane
+/// ignored), and -- from inside a closed room -- its room reached from the
+/// head's through doorways that are open (`portals`, a shut door's left out,
+/// as the renderer's culling has them; `rooms` its rooms). Within four
+/// doorways, as `portal_cull` walks; an emitter in no room, or seen from
+/// outside every closed room, takes the frusta alone.
+pub fn emitter_seen(
+    e: &EffectEmitter,
+    views: &[[glam::Vec4; 6]],
+    head: Vec3,
+    rooms: &[super::portal_cull::CullRoom],
+    portals: &[super::uniforms::ProbePortal],
+) -> bool {
+    let (lo, hi) = emitter_bounds(e);
+    let in_view = views.iter().any(|planes| {
+        let mut unbounded = *planes;
+        unbounded[5] = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+        super::shadow::aabb_in_frustum(&unbounded, lo, hi)
+    });
+    if !in_view {
+        return false;
+    }
+    let room_of = |p: Vec3| {
+        rooms
+            .iter()
+            .filter(|r| (r.min.cmplt(p) & p.cmplt(r.max)).all())
+            .min_by(|a, b| (a.max - a.min).element_product().total_cmp(&(b.max - b.min).element_product()))
+    };
+    let Some(start) = room_of(head).filter(|r| r.closed) else { return true };
+    let goal = room_of(e.position);
+    if goal.is_some_and(|g| g.id == start.id) {
+        return true;
+    }
+    // Rooms reached through open doorways, a doorway at a time.
+    let mut reached = vec![start.id];
+    let mut frontier = vec![start.id];
+    for _ in 0..super::portal_cull::MAX_DOORWAYS {
+        let mut next = Vec::new();
+        for p in portals {
+            for (from, to) in [(p.low, p.high), (p.high, p.low)] {
+                if frontier.contains(&from) && !reached.contains(&to) {
+                    reached.push(to);
+                    next.push(to);
+                }
+            }
+        }
+        match goal {
+            Some(g) if reached.contains(&g.id) => return true,
+            // Outdoors: any room not closed opens onto it.
+            None if reached.iter().any(|id| rooms.iter().any(|r| r.id == *id && !r.closed)) => return true,
+            _ => {}
+        }
+        if next.is_empty() {
+            return false;
+        }
+        frontier = next;
+    }
+    false
 }
 
 /// A FIRE'S SHEETS as the GPU draws them (`fire_sheets`): upright, taller than
@@ -2927,9 +3059,10 @@ struct VOut {
     reach = drawn;
     // A FLAME OR A PUFF IS A LOW DOME, its middle toward the eye by CONVEX of
     // its half width, its outline where it was: a body in stereo, not a card.
-    let domed = k == 0u && inst.params.w > 0.5 && inst.params.w < 2.5 && inst.light.w < 1.5 && streak <= 0.0;
-    let dome = select(0.0, CONVEX * min(reach.x, reach.y), domed);
-    let world = middle + across * (corner.x * reach.x) + along * (corner.y * reach.y) + to_eye * dome;
+    // Half forward and half back, so the body stays on its spot: domed
+    // forward only, a fire's flames stood in front of their fuel in stereo.
+    let dome = select(0.0, CONVEX * min(reach.x, reach.y), inst.params.w > 0.5 && inst.params.w < 2.5 && inst.light.w < 1.5 && streak <= 0.0);
+    let world = middle + across * (corner.x * reach.x) + along * (corner.y * reach.y) + to_eye * (select(-0.5, 0.5, k == 0u) * dome);
     out.clip = camera.view_proj[view_slot] * vec4<f32>(world, 1.0);
     out.at = out.clip;
     // Row 0 of a frame is its TOP, so the quad's top takes v = 0.
@@ -3878,6 +4011,41 @@ mod tests {
     }
 
     #[test]
+    fn an_emitter_out_of_view_or_behind_a_shut_door_is_not_simulated() {
+        use super::super::portal_cull::CullRoom;
+        use super::super::uniforms::ProbePortal;
+        // Looking down -z from (0, 1.6, 2).
+        let view = glam::Mat4::perspective_rh(1.6, 1.0, 0.05, 100.0) * glam::Mat4::look_at_rh(Vec3::new(0.0, 1.6, 2.0), Vec3::new(0.0, 1.2, 0.0), Vec3::Y);
+        let views = [super::super::shadow::frustum_planes(view)];
+        let head = Vec3::new(0.0, 1.6, 2.0);
+        let fire = EffectEmitter { scale: 1.5, ..emitter(EffectKind::Fire) };
+        assert!(emitter_seen(&fire, &views, head, &[], &[]), "in front");
+        let behind = EffectEmitter { position: Vec3::new(0.0, 0.0, 6.0), ..fire.clone() };
+        assert!(!emitter_seen(&behind, &views, head, &[], &[]), "behind the head");
+        // Two closed rooms side by side along -z; the fire in the far one.
+        let rooms = [
+            CullRoom { id: 1, min: Vec3::new(-3.0, -1.0, -0.5), max: Vec3::new(3.0, 4.0, 4.0), closed: true },
+            CullRoom { id: 2, min: Vec3::new(-3.0, -1.0, -4.0), max: Vec3::new(3.0, 4.0, -0.5), closed: true },
+        ];
+        let far = EffectEmitter { position: Vec3::new(0.0, 0.0, -2.0), ..fire.clone() };
+        let door = ProbePortal { min: Vec3::new(-0.5, 0.0, -0.7), max: Vec3::new(0.5, 2.0, -0.3), axis: 2, low: 2, high: 1, wall: None };
+        assert!(emitter_seen(&far, &views, head, &rooms, &[door]), "through the open doorway");
+        assert!(!emitter_seen(&far, &views, head, &rooms, &[]), "the doorway shut");
+        assert!(emitter_seen(&fire, &views, head, &rooms, &[]), "in the head's own room");
+        // A fire left out still lends its smoke the eye's adaptation to it.
+        let smoke = EffectEmitter { id: "s".into(), position: Vec3::new(0.0, 0.5, 0.0), ..emitter(EffectKind::Smoke) };
+        let lights = [fire_light(&fire, 10.0, Vec3::ZERO, Quat::IDENTITY).unwrap()];
+        let dark = |_: Vec3| Vec3::ZERO;
+        let at = Surroundings { lights: &lights, ambient: &dark, exposure: 9.0, ..seen_from(Vec3::new(0.0, 1.2, 1.8)) };
+        let both = [fire.clone(), smoke];
+        let all = simulate(&both, 10.0, &at);
+        let smoke_only = simulate_seen(&both, &|i| i == 1, &[], 10.0, &at);
+        let smoke_of = |f: &EffectFrame| f.instances.iter().filter(|i| i.params[3] == 1.0).map(|i| i.light[0]).collect::<Vec<_>>();
+        assert!(smoke_only.instances.iter().all(|i| i.params[3] == 1.0) && !smoke_only.instances.is_empty());
+        assert_eq!(smoke_of(&all), smoke_of(&smoke_only));
+    }
+
+    #[test]
     fn a_bed_breathes_with_the_fire_on_it() {
         let at = seen_from(Vec3::new(0.3, 1.6, 3.0));
         let fire = EffectEmitter { id: "f".into(), scale: 1.5, ..emitter(EffectKind::Fire) };
@@ -4393,6 +4561,29 @@ mod tests {
         let path = out.join("effects_alone.png");
         image::save_buffer(&path, &rgba, w, h, image::ExtendedColorType::Rgba8).expect("write the frame");
         eprintln!("wrote {}", path.display());
+    }
+
+    /// Where a fire's flame mass sits over its bed: `cargo test --release
+    /// --lib print_where_the_flames_stand -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn print_where_the_flames_stand() {
+        let fire = EffectEmitter { id: "brick_fire".into(), scale: 1.5, ..emitter(EffectKind::Fire) };
+        let (mut sum, mut w, mut worst) = (Vec3::ZERO, 0.0f32, 0.0f32);
+        for k in 0..2000 {
+            let (mut s1, mut w1) = (Vec3::ZERO, 0.0f32);
+            for s in fire_sheets(&fire, 100.0 + k as f64 * 0.05) {
+                let a = s.size * s.size * s.stretch * erosion_cover(s.stands) * rise_cover(s.risen);
+                s1 += s.base * a;
+                w1 += a;
+            }
+            if w1 > 0.0 {
+                worst = worst.max((s1 / w1).length());
+                sum += s1;
+                w += w1;
+            }
+        }
+        eprintln!("mean flame centre {:?}, worst moment {worst:.3} m off", sum / w);
     }
 
     /// THE FLAME TABLES, measured from the book: `cargo test --release --lib

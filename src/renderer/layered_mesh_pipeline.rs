@@ -539,7 +539,17 @@ fn repeat_of(layer: i32) -> f32 {{
     return vec4<f32>(tonemap(colour), 1.0);
 }}
 "#,
-        lights_block = wgsl_lights_block(0, 1),
+        // THE CAVE TRACES NO REFLECTION OF ITS OWN. Built as a reader of the
+        // probe pass (`probe_from_pass`), whose answer it never sets, so
+        // `shade_material_env` keeps its baked and sky terms and compiles out
+        // the per-pixel probe trace, the model cards and the characters'
+        // capsules: those took the cave from 2,538 instructions to 30,863
+        // (25% occupancy) once its floors went through the ground's path
+        // (headset PIPESTATS, 2026-10-08), and a cave floor of wet sand and
+        // rough rock shows nothing they would add. See `cave_shader_size`.
+        lights_block = super::lights::wgsl_lights_block_with(
+            0, 1, super::lights::LightsBlockOptions { probe_from_pass: true, ..Default::default() },
+        ),
         biplanar_block = wgsl_biplanar_block(),
         whiteout_block = wgsl_whiteout_block(),
         sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
@@ -1287,6 +1297,15 @@ mod tests {
             }
         }
         Some((out, None))
+    }
+
+    /// The cave's fragment shader by `shader_inlining`'s proxy -- run with
+    /// `--ignored --nocapture` to compare builds.
+    #[test]
+    #[ignore]
+    fn cave_shader_size() {
+        let src = crate::renderer::multiview::ViewMode::Mono.shader(layered_mesh_shader());
+        println!("{}", crate::renderer::shader_inlining::report("layered_mesh fs_main", &src, "fs_main", 12));
     }
 
     #[test]

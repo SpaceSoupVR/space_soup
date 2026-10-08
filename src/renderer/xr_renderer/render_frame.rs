@@ -521,7 +521,7 @@ impl XrRenderer {
         // frame's display time, lit by this frame's lamps in their emitter's
         // room and by the room's baked light, and drawn after the glass. Here,
         // before the frame's draws borrow the renderer. See `effects`.
-        let effects_drawn = effects_on && !(self.effect_emitters.is_empty() && self.splashes.is_empty()) && self.effects_gpu.is_some();
+        let mut effects_drawn = effects_on && !(self.effect_emitters.is_empty() && self.splashes.is_empty()) && self.effects_gpu.is_some();
         if effects_drawn {
             let yaw = glam::Quat::from_rotation_y(self.player.yaw);
             let (offset, descs) = (self.player.offset, &self.room_descs);
@@ -553,9 +553,43 @@ impl XrRenderer {
                 .iter()
                 .map(|s| crate::renderer::effects::Splash { born: now - (self.water_seconds - s.born), ..*s })
                 .collect();
-            let frame = crate::renderer::effects::simulate_with(&self.effect_emitters, &splashes, now, &at);
-            if let Some(gpu) = self.effects_gpu.as_mut() {
-                gpu.upload(&self.wgpu_device, &self.wgpu_queue, &frame);
+            // WHICH EMITTERS EITHER EYE SEES -- in a frustum and, from inside
+            // a closed room, through open doorways -- and those seen within
+            // the last EMITTER_HOLD, so one at a view's edge does not pop.
+            // The rest are neither simulated nor drawn; being closed-form,
+            // one comes back where its clock has it (its light, in the
+            // frame's lights, never stopped). See `effects::emitter_seen`.
+            let lv = self.frame_levers();
+            let world_to_player = glam::Mat4::from_quat(yaw.inverse()) * glam::Mat4::from_translation(-offset);
+            let views: Vec<[glam::Vec4; 6]> = eye_views
+                .iter()
+                .map(|ev| {
+                    let vp = Camera::gl_to_wgpu_ndc(Camera::xr_projection(ev.fov, 0.03, 1000.0)) * Camera::xr_view(ev.pose);
+                    crate::renderer::shadow::frustum_planes(vp * world_to_player)
+                })
+                .collect();
+            let portals: Vec<crate::renderer::uniforms::ProbePortal> = if lv.door_culling {
+                crate::renderer::doors::open_portals(&self.probe_portals, &self.shut_portals)
+            } else {
+                self.probe_portals.clone()
+            };
+            let rooms: &[crate::renderer::portal_cull::CullRoom] = if lv.portal_culling { &self.cull_rooms } else { &[] };
+            let head_world = yaw * mid_eye + offset;
+            self.effect_seen_until.resize(self.effect_emitters.len(), f64::NEG_INFINITY);
+            for (e, until) in self.effect_emitters.iter().zip(self.effect_seen_until.iter_mut()) {
+                if crate::renderer::effects::emitter_seen(e, &views, head_world, rooms, &portals) {
+                    *until = now + crate::renderer::effects::EMITTER_HOLD;
+                }
+            }
+            let held = &self.effect_seen_until;
+            let seen = |i: usize| held.get(i).map_or(true, |&t| now <= t);
+            if (0..self.effect_emitters.len()).any(|i| seen(i)) || !splashes.is_empty() {
+                let frame = crate::renderer::effects::simulate_seen(&self.effect_emitters, &seen, &splashes, now, &at);
+                if let Some(gpu) = self.effects_gpu.as_mut() {
+                    gpu.upload(&self.wgpu_device, &self.wgpu_queue, &frame);
+                }
+            } else {
+                effects_drawn = false;
             }
         }
 
@@ -1981,7 +2015,7 @@ impl XrRenderer {
                 // onto a room with a photograph in this frame.
                 upload.set_portals(&self.probe_portals, player_world, &upload.volumes());
                 // And what stands in those rooms, for the reflection trace.
-                upload.set_proxies(&self.probe_proxies, player_world, &upload.volumes());
+                upload.set_proxies(&crate::renderer::doors::posed_proxies(&self.probe_proxies, &self.doors), player_world, &upload.volumes());
                 upload.set_proxy_fields(&self.proxy_field_slots);
                 // And the outdoors: which room it is, its sky, its ground.
                 let sky_layer = self.probe_stream.borrow().as_ref().and_then(|s| s.sky_layer());
@@ -3002,6 +3036,9 @@ impl XrRenderer {
                     // (multiview is parked, `frame-budget-plan` A3).
                     if let (true, false, Some(w)) = (weather_on, stereo, self.weather.as_ref()) {
                         w.particles.draw(&mut pass, &self.uniform_buf.bind_group, &self.terrain_material.bind_group, &w.maps.bind_group, w.counts);
+                        // The areas' columns seen from afar, ended by the probe
+                        // pass's depth. See `weather::veil_shader`.
+                        w.particles.draw_veils(&mut pass, &self.uniform_buf.bind_group, &self.terrain_material.bind_group, &w.maps.bind_group, probe_read_group);
                     }
                     // The lamps' veils' halos, over everything the pass drew;
                     // each veil gone where a wall hides its bulb.

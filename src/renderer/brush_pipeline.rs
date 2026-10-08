@@ -3010,8 +3010,8 @@ const B2_ONE_HOP: (&str, &str) = (ROLL_TRACE_FROM, "    for (var hop = 0; hop < 
 // doorway's corners read again for the far rim, after the depth read they
 // were held across. See `def_dlc_no_portals` (19): the peak is in that block.
 const B2_INV_FAR: (&str, &str) = (
-    "        let far = select(vec3<f32>(3.4e38), max((hi - start) * inv, (lo - start) * inv), moving);",
-    "        let inv_far = select(vec3<f32>(3.4e38), 1.0 / (d + vec3<f32>(f32(camera.post_params.z > 3.0e38))), abs(d) > vec3<f32>(1e-6));\n        let far = select(vec3<f32>(3.4e38), max((hi - start) * inv_far, (lo - start) * inv_far), abs(d) > vec3<f32>(1e-6));",
+    "        let far = select(vec3<f32>(3.4e38), max((hi - hit.origin) * inv, (lo - hit.origin) * inv), moving);",
+    "        let inv_far = select(vec3<f32>(3.4e38), 1.0 / (d + vec3<f32>(f32(camera.post_params.z > 3.0e38))), abs(d) > vec3<f32>(1e-6));\n        let far = select(vec3<f32>(3.4e38), max((hi - hit.origin) * inv_far, (lo - hit.origin) * inv_far), abs(d) > vec3<f32>(1e-6));",
 );
 const B2_INV_SIDE: (&str, &str) = (
     "        var side = select(vec3<f32>(3.4e38), max((phi - e) * inv, (plo - e) * inv), moving);",

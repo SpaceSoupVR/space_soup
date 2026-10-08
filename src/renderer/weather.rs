@@ -854,6 +854,231 @@ const WX_GONE: vec4<f32> = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     )
 }
 
+/// THE RAIN AND SNOW SEEN FROM AFAR: each area's column of falling water or
+/// snow as one box, its back faces drawn so every pixel it covers is shaded
+/// once from inside or out. The fragment finds where its ray enters the box
+/// and where it leaves it -- or meets what the probe pass drew, the ground or
+/// a wall -- and takes three samples between for how much of the column is
+/// there: faded in from the area's edges, from the ground up to a height and
+/// thinning above, with slow drifting shafts, and none within the particles'
+/// reach of the head (they take over there). Over that, at the middle of the
+/// ray, falling streaks or flakes in the view's own angles, each at least two
+/// pixels and a half, scrolling down at the rain's or the snow's speed. A
+/// scattering medium's alpha, `1 - exp(-sigma * depth)`, lit by the sky and
+/// the sun as the particles are. No march in any scene shader: one draw an
+/// area, on the pixels the box covers.
+fn veil_shader() -> String {
+    // The cube, wound counter-clockwise seen from outside.
+    let mut cube = String::new();
+    let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
+        ([1.0, 0.0, 0.0], [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [1.0, 0.0, 1.0]]),
+        ([-1.0, 0.0, 0.0], [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 1.0], [0.0, 1.0, 0.0]]),
+        ([0.0, 1.0, 0.0], [[0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 0.0]]),
+        ([0.0, -1.0, 0.0], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0]]),
+        ([0.0, 0.0, 1.0], [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0]]),
+        ([0.0, 0.0, -1.0], [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [1.0, 0.0, 0.0]]),
+    ];
+    for (n, q) in faces {
+        let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        let (u, v) = (sub(q[1], q[0]), sub(q[2], q[0]));
+        let c = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+        let out = c[0] * n[0] + c[1] * n[1] + c[2] * n[2] > 0.0;
+        let order = if out { [0, 1, 2, 0, 2, 3] } else { [0, 2, 1, 0, 3, 2] };
+        for i in order {
+            let p = q[i];
+            cube.push_str(&format!("vec3<f32>({:?}, {:?}, {:?}), ", p[0], p[1], p[2]));
+        }
+    }
+    format!(
+        "{aces}{map}const VEIL_CUBE = array<vec3<f32>, 36>({cube});\nconst VEIL_NEAR: f32 = {near:?};\nconst VEIL_FAR: f32 = {far:?};\n{body}",
+        aces = crate::renderer::tonemap::wgsl_aces_block(),
+        map = map_block(),
+        near = crate::renderer::brush_pipeline::probe_pass::EYE_NEAR,
+        far = crate::renderer::brush_pipeline::probe_pass::EYE_FAR,
+        body = r#"
+var<private> view_slot: i32 = 0;
+struct Camera { view_proj: array<mat4x4<f32>, 2> }
+@group(0) @binding(0) var<uniform> camera: Camera;
+// What the probe pass drew: the ground and the walls the column ends at.
+@group(3) @binding(1) var veil_depth: texture_depth_2d_array;
+
+struct VeilOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) at: vec4<f32>,
+    // The column's bottom and top, world y; its area.
+    @location(2) @interpolate(flat) span: vec2<f32>,
+    @location(3) @interpolate(flat) area: u32,
+}
+
+fn veil_to_player(p: vec3<f32>) -> vec3<f32> {
+    let s = sin(wx.frame.w);
+    let c = cos(wx.frame.w);
+    let q = p - wx.frame.xyz;
+    return vec3<f32>(c * q.x - s * q.z, q.y, s * q.x + c * q.z);
+}
+
+// Area `k`'s map at world x/z, clamped to its box.
+fn veil_map(k: u32, xz: vec2<f32>) -> vec4<f32> {
+    let a0 = wx.areas[k * 3u];
+    let a1 = wx.areas[k * 3u + 1u];
+    let uv = clamp((xz - a0.xy) * a0.zw, vec2<f32>(0.0), vec2<f32>(1.0));
+    return textureSampleLevel(wx_map, wx_samp, uv * a1.xy, i32(k), 0.0);
+}
+
+// How high a column stands over its ground, metres: rain from a cloud
+// above the view, thinning; snow lower and softer.
+fn veil_height(snow: bool) -> f32 {
+    return select(24.0, 22.0, snow);
+}
+
+@vertex fn vs_veil(@builtin(vertex_index) vi: u32, @builtin(instance_index) k: u32) -> VeilOut {
+    var out: VeilOut;
+    out.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    out.world = vec3<f32>(0.0);
+    out.at = vec4<f32>(0.0);
+    out.span = vec2<f32>(0.0);
+    out.area = k;
+    if (k >= u32(wx.params.x)) {
+        return out;
+    }
+    let a0 = wx.areas[k * 3u];
+    let a1 = wx.areas[k * 3u + 1u];
+    if (a1.w <= 0.0) {
+        return out;
+    }
+    let lo = a0.xy;
+    let hi = a0.xy + vec2<f32>(1.0) / a0.zw;
+    var top = -1.0e4;
+    var bottom = 1.0e4;
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        for (var j = 0u; j < 3u; j = j + 1u) {
+            let c = veil_map(k, mix(lo, hi, vec2<f32>(f32(i), f32(j)) * 0.5)).w;
+            top = max(top, c);
+            bottom = min(bottom, c);
+        }
+    }
+    top = top + veil_height(a1.z > 0.5);
+    bottom = bottom - 2.0;
+    let c = VEIL_CUBE[vi];
+    let w = vec3<f32>(mix(lo.x, hi.x, c.x), mix(bottom, top, c.y), mix(lo.y, hi.y, c.z));
+    let clip = camera.view_proj[view_slot] * vec4<f32>(veil_to_player(w), 1.0);
+    out.clip = clip;
+    out.at = clip;
+    out.world = w;
+    out.span = vec2<f32>(bottom, top);
+    return out;
+}
+
+@fragment fn fs_veil(in: VeilOut) -> @location(0) vec4<f32> {
+    let k = in.area;
+    let a0 = wx.areas[k * 3u];
+    let a1 = wx.areas[k * 3u + 1u];
+    let a2 = wx.areas[k * 3u + 2u];
+    let snow = a1.z > 0.5;
+    let eye = wx.head.xyz;
+    let to = in.world - eye;
+    let t_back = max(length(to), 1e-3);
+    let dir = to / t_back;
+    // Where the ray enters the box (0 inside it).
+    let lo = vec3<f32>(a0.x, in.span.x, a0.y);
+    let hi = vec3<f32>(a0.x + 1.0 / a0.z, in.span.y, a0.y + 1.0 / a0.w);
+    let inv = vec3<f32>(1.0) / select(dir, vec3<f32>(1e-6), abs(dir) < vec3<f32>(1e-6));
+    let ta = (lo - eye) * inv;
+    let tb = (hi - eye) * inv;
+    let t_in = max(max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z)), 0.0);
+    // Where it meets what the probe pass drew, along the ray.
+    var t_end = t_back;
+    if (in.at.w > 0.0) {
+        let ndc = in.at.xyz / in.at.w;
+        let size = vec2<f32>(textureDimensions(veil_depth));
+        let texel = clamp(vec2<i32>(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
+        let z = textureLoad(veil_depth, texel, view_slot, 0);
+        if (z < 1.0) {
+            let scene = VEIL_NEAR * VEIL_FAR / (VEIL_FAR - z * (VEIL_FAR - VEIL_NEAR));
+            t_end = min(t_end, scene * t_back / in.at.w);
+        }
+    }
+    // The particles' reach: they draw the near part.
+    let hand = select(vec2<f32>(6.0, 11.0), vec2<f32>(3.5, 7.5), snow);
+    let t0 = max(t_in, hand.x);
+    if (t_end <= t0) {
+        return vec4<f32>(0.0);
+    }
+    let time = wx.params.y;
+    let height = veil_height(snow);
+    let soft = max(2.0 * a2.w, 6.0);
+    let dt = (t_end - t0) / 3.0;
+    var depth = 0.0;
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        let t = t0 + (f32(i) + 0.5) * dt;
+        let p = eye + dir * t;
+        let ground = veil_map(k, p.xz).w;
+        let above = p.y - ground;
+        let rise = smoothstep(-0.3, 0.3, above) * (1.0 - smoothstep(select(0.15, 0.35, snow) * height, 0.9 * height, above));
+        let inside = min(p.xz - a0.xy, a0.xy + vec2<f32>(1.0) / a0.zw - p.xz);
+        let edge = smoothstep(0.0, soft, min(inside.x, inside.y));
+        let near = smoothstep(hand.x, hand.y, t);
+        // Shafts: the fall is heavier here than there, drifting on the wind.
+        let shaft = 0.45 + 1.1 * wx_noise(p.xz * 0.11 - a2.xy * (time * 0.09) + vec2<f32>(p.y * 0.02, 0.0));
+        depth = depth + rise * edge * near * shaft * dt;
+    }
+    if (depth <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    // THE FALL ITSELF, in the view's angles at the column's middle: columns
+    // of streaks (or a scatter of flakes) a pixel and a quarter at least
+    // either side, so the far rain shimmers rather than aliases.
+    let centre = a0.xy + 0.5 / a0.zw;
+    let reach = max(length(centre - eye.xz), 1.0);
+    let flat_len = max(length(dir.xz), 1e-3);
+    let across = atan2(dir.z, dir.x);
+    let rise_v = dir.y / flat_len * reach;
+    // Seen from under it the fall is end-on and shows no streaks.
+    let side_on = 1.0 - smoothstep(0.45, 0.85, abs(dir.y));
+    var fall = 1.0;
+    if (snow) {
+        // Two scatters of flakes at different sizes and speeds, each flake
+        // anywhere in its cell and only some cells holding one, so no
+        // lattice shows.
+        var flakes = 0.0;
+        for (var layer = 0u; layer < 2u; layer = layer + 1u) {
+            let cell = max(0.5 / reach, 6.0 * wx.pixel.x) * (1.0 + 0.7 * f32(layer));
+            let speed = 1.15 - 0.35 * f32(layer);
+            let q = vec2<f32>(across / cell + 0.5 * f32(layer), (rise_v / reach + speed * time / reach) / cell);
+            let h = wx_cell(floor(q) + vec2<f32>(0.0, 517.0 * f32(layer)));
+            let jit = (vec2<f32>(f32(h & 0xffu), f32((h >> 8u) & 0xffu)) / 255.0 - vec2<f32>(0.5)) * 0.8;
+            let d = length(fract(q) - vec2<f32>(0.5) - 0.5 * jit);
+            flakes = flakes + (1.0 - smoothstep(0.08, 0.24, d)) * select(0.0, 1.0, ((h >> 16u) & 1u) == 0u);
+        }
+        fall = 0.7 + 1.2 * flakes * side_on;
+    } else {
+        // Two layers of columns, each a thin line at a jittered place in its
+        // column, only some of them carrying a streak at a time.
+        var streaks = 0.0;
+        for (var layer = 0u; layer < 2u; layer = layer + 1u) {
+            let width = max(0.05 / reach, 2.5 * wx.pixel.x) * (1.0 + 0.6 * f32(layer));
+            let u = across / width + 0.37 * f32(layer);
+            let col = floor(u);
+            let h = wx_hash(bitcast<u32>(i32(col)) * 747796405u + 2891336453u + layer * 1013904223u);
+            let r = f32(h & 0xffffu) / 65535.0;
+            let r2 = f32(h >> 16u) / 65535.0;
+            let line = 1.0 - smoothstep(0.1, 0.4, abs(fract(u) - 0.5 - 0.3 * (r2 - 0.5)));
+            let len = 1.4 + 1.2 * r;
+            let seg = fract((rise_v + (7.0 + 2.0 * r) * time) / len + r * 7.0);
+            streaks = streaks + smoothstep(0.0, 0.08, seg) * (1.0 - smoothstep(0.25, 0.4, seg)) * line * step(0.3, r2);
+        }
+        fall = 0.6 + 1.1 * streaks * side_on;
+    }
+    let sigma = select(0.016, 0.09, snow) * clamp(a1.w, 0.0, 1.5);
+    let alpha = clamp(1.0 - exp(-sigma * depth * fall), 0.0, 0.7);
+    var light = wx.sky.rgb * select(0.75, 1.0, snow) + wx.sun.rgb * select(0.12, 0.5, snow) * wx.sun_dir.w;
+    return vec4<f32>(aces_fitted(light) * alpha, alpha);
+}
+"#,
+    )
+}
+
 /// The falling rain and snow's pipeline: group 0 the scene's camera, group 1
 /// the ground's material (`terrain_pipeline::material_bind_group_layout`) for
 /// its baked sky and sun, group 2 [`bind_group_layout`]. Premultiplied over,
@@ -862,6 +1087,9 @@ const WX_GONE: vec4<f32> = vec4<f32>(2.0, 2.0, 2.0, 1.0);
 /// pipeline.
 pub struct WeatherPipeline {
     pub pipeline: RenderPipeline,
+    /// The areas' columns seen from afar (`veil_shader`): group 3 the
+    /// probe pass's read group, for its depth.
+    pub veils: RenderPipeline,
 }
 
 impl WeatherPipeline {
@@ -915,7 +1143,66 @@ impl WeatherPipeline {
             multiview_mask: view.mask(),
             cache: None,
         });
-        Self { pipeline }
+        let veil_module = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("weather_veils"),
+            source: ShaderSource::Wgsl(view.shader(veil_shader()).into()),
+        });
+        let probe_layout = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(device);
+        let veil_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("weather_veils_layout"),
+            bind_group_layouts: &[Some(uniform_layout), Some(ground_layout), Some(weather_layout), Some(&probe_layout)],
+            immediate_size: 0,
+        });
+        let veils = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("weather_veils"),
+            layout: Some(&veil_layout),
+            vertex: VertexState {
+                module: &veil_module,
+                entry_point: Some("vs_veil"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(FragmentState {
+                module: &veil_module,
+                entry_point: Some("fs_veil"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format,
+                    blend: Some(BlendState { color: over, alpha: BlendComponent::OVER }),
+                    write_mask: ColorWrites::COLOR,
+                })],
+            }),
+            // The box's far faces: each covered pixel once, inside or out.
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                front_face: FrontFace::Ccw,
+                cull_mode: Some(Face::Front),
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::Always),
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState { count: samples, ..Default::default() },
+            multiview_mask: view.mask(),
+            cache: None,
+        });
+        Self { pipeline, veils }
+    }
+
+    /// The areas' columns seen from afar, after the particles: `probe` the
+    /// probe pass's read group (its depth ends each column at the ground and
+    /// the walls). One box an area that is falling.
+    pub fn draw_veils(&self, pass: &mut RenderPass<'_>, camera: &BindGroup, ground: &BindGroup, weather: &BindGroup, probe: &BindGroup) {
+        pass.set_pipeline(&self.veils);
+        pass.set_bind_group(0, camera, &[]);
+        pass.set_bind_group(1, ground, &[]);
+        pass.set_bind_group(2, weather, &[]);
+        pass.set_bind_group(3, probe, &[]);
+        pass.draw(0..36, 0..MAX_AREAS as u32);
     }
 
     /// Draw `counts` (rain, snow, splashes) -- as [`particle_counts`] gave
@@ -1171,6 +1458,8 @@ mod tests {
     #[test]
     fn the_particle_shader_validates_mono_and_stereo() {
         validate("particles", &particle_shader());
+        validate("veils", &veil_shader());
+        validate("veils stereo", &crate::renderer::multiview::ViewMode::Stereo.shader(veil_shader()));
         validate("particles stereo", &crate::renderer::multiview::ViewMode::Stereo.shader(particle_shader()));
     }
 
