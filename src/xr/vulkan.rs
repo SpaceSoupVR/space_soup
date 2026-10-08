@@ -55,6 +55,10 @@ pub struct VkContext {
     /// foveated pass draw straight into the OpenXR swapchain's ordinary
     /// images. See `renderer::foveation`.
     pub fragment_density_map: bool,
+    /// Whether `dualSrcBlend` was ENABLED: a fragment shader's second output
+    /// as a blend factor, which is how water tints what lies under it channel
+    /// by channel (`water_pipeline`). Same contract as `multiview`.
+    pub dual_src_blend: bool,
 }
 
 /// Whether to switch on the device's robust buffer and image access.
@@ -180,6 +184,7 @@ impl VkContext {
             vk_instance.get_physical_device_features2(physical_device, &mut features2);
         }
         let robust_buffer_access_supported = features2.features.robust_buffer_access == vk::TRUE;
+        let dual_src_blend = features2.features.dual_src_blend == vk::TRUE;
         let robustness2_extension_available = unsafe {
             vk_instance
                 .enumerate_device_extension_properties(physical_device)
@@ -196,6 +201,7 @@ impl VkContext {
             && robustness2_query.robust_buffer_access2 == vk::TRUE
             && robustness2_query.robust_image_access2 == vk::TRUE;
         let multiview_supported = multiview_query.multiview == vk::TRUE;
+        info!("vulkan: dualSrcBlend {dual_src_blend}");
         // ROBUST ACCESS, recorded: wgpu-hal decides from what the PHYSICAL
         // device supports whether naga's shaders clamp their own buffer and
         // image-load indices, on the assumption that it enabled the matching
@@ -395,7 +401,9 @@ impl VkContext {
             chain
         };
         // `robustBufferAccess2` requires the core `robustBufferAccess` too.
-        let core_features = vk::PhysicalDeviceFeatures::default().robust_buffer_access(robust_access);
+        let core_features = vk::PhysicalDeviceFeatures::default()
+            .robust_buffer_access(robust_access)
+            .dual_src_blend(dual_src_blend);
         let device_ci = vk::DeviceCreateInfo {
             queue_create_info_count: 1,
             p_queue_create_infos: &queue_info,
@@ -454,6 +462,7 @@ impl VkContext {
             robust_access,
             enabled_extensions,
             fragment_density_map: fdm_supported,
+            dual_src_blend,
             timestamp_period_ns,
             instance: vk_instance,
             physical_device,

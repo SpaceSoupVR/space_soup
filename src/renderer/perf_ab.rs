@@ -122,10 +122,30 @@ pub enum Phase {
     /// out of the frame's. What tracing it costs. Read by the app, which hands
     /// them over, through `XrRenderer::frame_levers`.
     NoTorchReflection,
+    /// No effects (`effects` off): no flames, coals, smoke, embers or dust,
+    /// and no fire's light. What the level's effects cost. Read by the app,
+    /// which places the fires' lights, through `XrRenderer::frame_levers`.
+    NoEffects,
+    /// No water (`water` off): no surfaces, no waves computed, no motion for
+    /// SpaceWarp. What the level's water costs.
+    NoWater,
+    /// No weather (`weather` off): the dry ground's shaders over the weather
+    /// areas, and no rain, snow or splashes. What the level's weather costs.
+    NoWeather,
+    /// No doors' lamp shadows (`door_shadows` off): the lamps near a door
+    /// keep no tile for it. What the doors' tiles cost.
+    NoDoorShadows,
+    /// The time of day's clock stopped (`time_of_day_minutes` 0): no sky
+    /// refreshes, no static sun map redraws, no atlas, probe or ground map
+    /// relights. Run with the clock going (`time_of_day_hour` and
+    /// `time_of_day_minutes` set), it is what a running day costs over a
+    /// frozen one; without, it starts a frozen time of day, and is what the
+    /// time of day's sky costs over the photograph.
+    TimeFrozen,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 27] = [
+    pub const ALL: [Phase; 32] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -153,6 +173,11 @@ impl Phase {
         Phase::NoCharacterCards,
         Phase::NoFlashlightBounce,
         Phase::NoTorchReflection,
+        Phase::NoEffects,
+        Phase::NoWater,
+        Phase::NoWeather,
+        Phase::NoDoorShadows,
+        Phase::TimeFrozen,
     ];
 
     /// The phase for the frames of the `window`-th `PERF` window.
@@ -203,6 +228,11 @@ impl Phase {
             Phase::NoCharacterCards => "no_character_cards",
             Phase::NoFlashlightBounce => "no_flashlight_bounce",
             Phase::NoTorchReflection => "no_torch_reflection",
+            Phase::NoEffects => "no_effects",
+            Phase::NoWater => "no_water",
+            Phase::NoWeather => "no_weather",
+            Phase::NoDoorShadows => "no_door_shadows",
+            Phase::TimeFrozen => "time_frozen",
         }
     }
 }

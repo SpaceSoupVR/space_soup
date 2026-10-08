@@ -105,7 +105,20 @@ pub const SPOT_ATLAS_COLS: u32 = 2;
 /// that pass already draws the characters every frame, so a character tile
 /// costs its draws and no pass of its own. In the spot atlas they took a
 /// 2048x3072 pass, 0.7 ms a frame for two small tiles (trace, 2026-09-29).
-pub const MAX_CHARACTER_SHADOWS: usize = 2;
+///
+/// AND THE DOORS' (2026-10-07): a door is never baked -- the level's masks
+/// hold its doorway open -- so the lamps near a door shadow it in these tiles
+/// too, the light a closed leaf stops included: a tile per lamp, fitted round
+/// every moving caster that lamp must shadow (`moving_caster_tiles`), at most
+/// `MAX_BODY_TILES` of them chosen for the player. A lamp names its tile by
+/// its own shadow layer, `MAX_SPOT_SHADOWS + k` (`character_shadow_tile` in
+/// the shader), so a tile more costs the shader nothing; each costs 512 x 512
+/// of depth and the draws of what it holds.
+pub const MAX_CHARACTER_SHADOWS: usize = 4;
+
+/// Of the moving casters' tiles, how many go to lamps for the player alone:
+/// the two lighting them most, as before the doors.
+pub const MAX_BODY_TILES: usize = 2;
 
 /// Tiles of the moving-objects map, in one row: the sun's, then the
 /// characters', then the sun's near tile. See `SUN_DYNAMIC_DIM`.
@@ -148,7 +161,12 @@ pub fn sun_near_matrix(sun_dynamic: Mat4) -> Mat4 {
 
 /// Light matrices in the uniform: the spots' in layer order, then the
 /// characters' (`Uniforms::spot_view_proj`).
-pub const SHADOW_MATRICES: usize = MAX_SPOT_SHADOWS + MAX_CHARACTER_SHADOWS;
+///
+/// Two more than they use, unused: the camera block binds its probe table a
+/// second time at its own offset (`uniforms::PROBE_SELECT_OFFSET`), which must
+/// stay a multiple of 256 bytes, and the doors' two more tiles' matrices (128
+/// bytes) moved it off one. A matrix is 64 bytes: grow this by fours.
+pub const SHADOW_MATRICES: usize = MAX_SPOT_SHADOWS + MAX_CHARACTER_SHADOWS + 2;
 
 /// Tile rows of the spot atlas.
 pub const SPOT_ATLAS_ROWS: u32 = (MAX_SPOT_SHADOWS as u32).div_ceil(SPOT_ATLAS_COLS);
@@ -183,7 +201,7 @@ pub struct CharacterLamp {
 /// squared distance, only within range, and for a spot only where some of the
 /// body is inside its cone (the hall's pendants are downlights: a player a
 /// step to the side of one is not lit by it at all). Strongest first, at most
-/// `MAX_CHARACTER_SHADOWS`. A lamp `held` last frame (by position) keeps its
+/// `MAX_BODY_TILES`. A lamp `held` last frame (by position) keeps its
 /// tile unless one left out lights the body a third more: two lamps lighting
 /// it almost alike would otherwise trade the crisp shadow back and forth as
 /// the player moves, and each trade swaps a sharp shadow for a soft one.
@@ -210,12 +228,12 @@ pub fn character_shadow_lamps(lamps: &[CharacterLamp], centre: Vec3, radius: f32
         .collect();
     candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     let was_held = |i: usize| held.iter().any(|h| (lamps[i].position - *h).length() < 0.01);
-    let mut chosen: Vec<(usize, f32)> = candidates.iter().copied().filter(|c| was_held(c.0)).take(MAX_CHARACTER_SHADOWS).collect();
+    let mut chosen: Vec<(usize, f32)> = candidates.iter().copied().filter(|c| was_held(c.0)).take(MAX_BODY_TILES).collect();
     for c in &candidates {
         if chosen.iter().any(|k| k.0 == c.0) {
             continue;
         }
-        if chosen.len() < MAX_CHARACTER_SHADOWS {
+        if chosen.len() < MAX_BODY_TILES {
             chosen.push(*c);
             continue;
         }
@@ -227,6 +245,149 @@ pub fn character_shadow_lamps(lamps: &[CharacterLamp], centre: Vec3, radius: f32
     }
     chosen.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     chosen.into_iter().map(|c| c.0).collect()
+}
+
+/// A door's leaf as the lamps' tiles take it: its eight corners, in the
+/// frame the tiles are drawn in (the player's).
+#[derive(Clone, Copy, Debug)]
+pub struct DoorCaster {
+    pub corners: [Vec3; 8],
+}
+
+impl DoorCaster {
+    fn centre(&self) -> Vec3 {
+        self.corners.iter().fold(Vec3::ZERO, |s, c| s + *c) / 8.0
+    }
+    fn radius(&self) -> f32 {
+        let c = self.centre();
+        self.corners.iter().map(|p| (*p - c).length()).fold(0.0, f32::max)
+    }
+}
+
+/// How far from the eye a door's shadows are worth a tile, metres.
+pub const DOOR_SHADOW_REACH: f32 = 12.0;
+/// The distance from the eye at which a door's claim on a tile halves.
+const DOOR_SHADOW_FALLOFF: f32 = 4.0;
+/// The corners' radius as a tile is fitted round a leaf: its edges, a
+/// little proud of the box.
+const DOOR_CORNER_RADIUS: f32 = 0.02;
+/// HOW FAR APART, SEEN FROM ITS LAMP, THE CASTERS ONE TILE HOLDS MAY STAND:
+/// the cosine of the angle between the tile's aim (the body, else its
+/// strongest door) and another caster's centre. A tile is one look from its
+/// lamp, at most `CHARACTER_TILE_WIDEST_TAN` (75 degrees) each way: a sconce
+/// halfway down the hallway reaches the doors at both its ends, and one tile
+/// holding both looked between them, so neither the receivers behind the one
+/// nor the other's fell inside it -- the doors shadowed nothing (offline,
+/// 2026-10-08). 50 degrees off the aim leaves a leaf's own width inside.
+const MOVING_TILE_SPREAD_COS: f32 = 0.643;
+
+/// THE MOVING CASTERS' TILES: which lamps get one, and what each holds -- the
+/// tile's spheres, for `character_light_matrix`. Up to `MAX_BODY_TILES` lamps
+/// lighting the player most (`character_shadow_lamps`, with its hysteresis),
+/// then the lamps that shadow the doors most, until `MAX_CHARACTER_SHADOWS`.
+/// A lamp shadows a door when its light reaches the leaf (range, and a spot's
+/// cone, against the leaf's bounding sphere), weighed by intensity over
+/// squared distance and by how near the eye the door is (`DOOR_SHADOW_REACH`,
+/// halving at `DOOR_SHADOW_FALLOFF`). Every chosen lamp's tile holds every
+/// moving caster it reaches: the body where it lights it, and each door it
+/// reaches, so one lamp casts the player and the door from one tile and one
+/// lookup.
+///
+/// HELD, as the body's lamps are: a lamp in `held` (last frame's, by
+/// position) keeps its tile unless one left out claims a third more. A door
+/// swinging changes its claim little; a tile changing hands changes the
+/// shadow's resolution, which is the pop to avoid.
+pub fn moving_caster_tiles(
+    lamps: &[CharacterLamp],
+    body: Option<(Vec3, f32, &[(Vec3, f32)])>,
+    doors: &[DoorCaster],
+    eye: Vec3,
+    held: &[Vec3],
+) -> Vec<(usize, Vec<(Vec3, f32)>)> {
+    const KEEP: f32 = 1.0 / 1.33;
+    let reaches = |l: &CharacterLamp, centre: Vec3, radius: f32| {
+        let to = centre - l.position;
+        let d = to.length();
+        if !l.eligible || l.intensity <= 0.0 || d - radius >= l.range {
+            return false;
+        }
+        if l.cos_outer <= -1.0 || d <= radius {
+            return true;
+        }
+        let angle = l.direction.normalize_or_zero().dot(to / d).clamp(-1.0, 1.0).acos();
+        angle <= l.cos_outer.clamp(-1.0, 1.0).acos() + (radius / d).min(1.0).asin()
+    };
+    let body_lamps: Vec<usize> = match body {
+        Some((centre, radius, _)) => character_shadow_lamps(lamps, centre, radius, held),
+        None => Vec::new(),
+    };
+    let near: Vec<&DoorCaster> = doors.iter().filter(|d| (d.centre() - eye).length() < DOOR_SHADOW_REACH).collect();
+    let door_claim = |i: usize| -> f32 {
+        let l = &lamps[i];
+        near.iter()
+            .filter(|d| reaches(l, d.centre(), d.radius()))
+            .map(|d| {
+                let seen = (d.centre() - eye).length() / DOOR_SHADOW_FALLOFF;
+                l.intensity / ((l.position - d.centre()).length_squared() + 0.25) / (1.0 + seen * seen)
+            })
+            .fold(0.0, f32::max)
+    };
+    let mut chosen: Vec<usize> = body_lamps.clone();
+    let mut contenders: Vec<(usize, f32)> = (0..lamps.len())
+        .filter(|i| !chosen.contains(i))
+        .map(|i| (i, door_claim(i)))
+        .filter(|c| c.1 > 0.0)
+        .collect();
+    contenders.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let was_held = |i: usize| held.iter().any(|h| (lamps[i].position - *h).length() < 0.01);
+    let room = MAX_CHARACTER_SHADOWS - chosen.len().min(MAX_CHARACTER_SHADOWS);
+    let mut doors_chosen: Vec<(usize, f32)> = contenders.iter().copied().filter(|c| was_held(c.0)).take(room).collect();
+    for c in &contenders {
+        if doors_chosen.iter().any(|k| k.0 == c.0) {
+            continue;
+        }
+        if doors_chosen.len() < room {
+            doors_chosen.push(*c);
+            continue;
+        }
+        let Some((weakest, w)) = doors_chosen.iter().enumerate().min_by(|a, b| a.1 .1.total_cmp(&b.1 .1)).map(|(k, c)| (k, c.1)) else {
+            break;
+        };
+        if w < c.1 * KEEP {
+            doors_chosen[weakest] = *c;
+        }
+    }
+    doors_chosen.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    chosen.extend(doors_chosen.into_iter().map(|c| c.0));
+    chosen
+        .into_iter()
+        .map(|i| {
+            let l = &lamps[i];
+            let mut spheres: Vec<(Vec3, f32)> = Vec::new();
+            let body_here = body.filter(|(centre, radius, _)| reaches(l, *centre, *radius));
+            if let Some((_, _, parts)) = body_here {
+                spheres.extend_from_slice(parts);
+            }
+            // The doors it reaches, strongest first; the tile aims at the
+            // body, else the strongest, and holds what stands near that aim
+            // (`MOVING_TILE_SPREAD_COS`).
+            let mut doors_here: Vec<(&DoorCaster, f32)> = near
+                .iter()
+                .filter(|d| reaches(l, d.centre(), d.radius()))
+                .map(|d| (*d, l.intensity / ((l.position - d.centre()).length_squared() + 0.25)))
+                .collect();
+            doors_here.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let aim = body_here.map(|(c, _, _)| c).or(doors_here.first().map(|(d, _)| d.centre()));
+            let toward = |p: Vec3| (p - l.position).normalize_or_zero();
+            for (d, _) in doors_here {
+                if aim.is_some_and(|a| toward(a).dot(toward(d.centre())) >= MOVING_TILE_SPREAD_COS) {
+                    spheres.extend(d.corners.iter().map(|c| (*c, DOOR_CORNER_RADIUS)));
+                }
+            }
+            (i, spheres)
+        })
+        .filter(|(_, s)| !s.is_empty())
+        .collect()
 }
 
 /// How far past a character's capsules their tile reaches: fingers spread
@@ -1322,9 +1483,11 @@ impl ShadowMap {
 
     /// THE MOVING-OBJECTS MAP, in ONE pass: the sun's tile and its near tile
     /// when `sun` (every moving caster, from `ShadowKind::SunDynamic`'s matrix
-    /// and `ShadowKind::SunNear`'s), then the first `characters` characters'
-    /// tiles (the characters alone, from `ShadowKind::Character(k)`'s). Tiles
-    /// not drawn read as far depth, unshadowed. Returns the indices drawn.
+    /// and `ShadowKind::SunNear`'s), then a moving casters' tile for each of
+    /// `characters` (its matrix, as uploaded for `ShadowKind::Character(k)`):
+    /// the characters, and the meshes `tile_meshes` names in `mesh_draws` --
+    /// the doors -- where their bounds reach it. Tiles not drawn read as far
+    /// depth, unshadowed. Returns the indices drawn.
     ///
     /// `sun_view_proj` is the sun tile's matrix, as `upload_light` was given
     /// it for `ShadowKind::SunDynamic`; a mesh caster outside a tile's box is
@@ -1335,11 +1498,12 @@ impl ShadowMap {
         encoder: &mut CommandEncoder,
         sun: bool,
         sun_view_proj: Mat4,
-        characters: usize,
+        characters: &[Mat4],
         mesh_draws: &[ShadowMeshDraw],
         mesh_bounds: &[ShadowMeshBound],
         skinned_draws: &[ShadowSkinnedDraw],
         posed_draws: &[ShadowMeshDraw],
+        tile_meshes: &[usize],
     ) -> u32 {
         let mut drawn = 0u32;
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -1394,12 +1558,30 @@ impl ShadowMap {
             skinned(&mut pass, &slot.light_bind_group);
         }
         }
-        for k in 0..characters.min(MAX_CHARACTER_SHADOWS) {
+        let mut tile_drawn = 0u32;
+        for (k, tile) in characters.iter().take(MAX_CHARACTER_SHADOWS).enumerate() {
             sun_atlas_viewport(&mut pass, 1 + k as u32);
-            skinned(&mut pass, &self.characters[k].light_bind_group);
+            let bind = &self.characters[k].light_bind_group;
+            if !tile_meshes.is_empty() {
+                let planes = frustum_planes(*tile);
+                pass.set_pipeline(&self.mesh_pipeline);
+                pass.set_bind_group(0, bind, &[]);
+                for &i in tile_meshes {
+                    let Some((vb, ib, count, model_bg)) = mesh_draws.get(i) else { continue };
+                    if !mesh_caster_reaches(&planes, mesh_bounds, i) {
+                        continue;
+                    }
+                    pass.set_bind_group(1, *model_bg, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                    tile_drawn += *count;
+                }
+            }
+            skinned(&mut pass, bind);
         }
         drop(pass);
-        drawn
+        drawn + tile_drawn
     }
 
     /// Records a depth-only shadow pass for `kind` into `encoder`: clears that
@@ -1702,6 +1884,72 @@ mod atlas_tests {
         assert_eq!(character_shadow_lamps(&[beside, lamp(-2.0, 4.0, true)], body, r, &[]), vec![1]);
         let over = CharacterLamp { position: Vec3::new(0.3, 2.4, 0.0), ..beside };
         assert_eq!(character_shadow_lamps(&[over, lamp(-2.0, 4.0, true)], body, r, &[]), vec![0, 1]);
+    }
+
+    /// THE DOORS' TILES: after the player's two, the lamps reaching a door
+    /// near the eye, strongest first; a lamp lighting both holds both in one
+    /// tile; a lamp out of reach of every door or a door far from the eye
+    /// takes none; and a door lamp keeps its tile against a slightly stronger
+    /// newcomer.
+    #[test]
+    fn the_lamps_reaching_a_door_shadow_it_in_their_tiles() {
+        let point = |p: Vec3, intensity: f32| CharacterLamp {
+            position: p,
+            direction: Vec3::NEG_Y,
+            cos_outer: -1.0,
+            range: 6.0,
+            intensity,
+            eligible: true,
+        };
+        // A leaf across x = 3, 80 cm wide, 2.2 m tall.
+        let leaf = DoorCaster {
+            corners: std::array::from_fn(|i| {
+                Vec3::new(
+                    if i & 4 == 0 { 2.98 } else { 3.02 },
+                    if i & 2 == 0 { 0.0 } else { 2.2 },
+                    if i & 1 == 0 { -3.8 } else { -3.0 },
+                )
+            }),
+        };
+        let eye = Vec3::new(1.0, 1.6, -3.4);
+        // Two sconces by the door, one lamp eight metres off.
+        let lamps = [point(Vec3::new(5.0, 1.9, -4.2), 3.0), point(Vec3::new(0.0, 3.1, -4.5), 9.0), point(Vec3::new(11.0, 2.0, -3.0), 9.0)];
+        let tiles = moving_caster_tiles(&lamps, None, &[leaf], eye, &[]);
+        let chosen: Vec<usize> = tiles.iter().map(|t| t.0).collect();
+        assert_eq!(chosen, vec![1, 0], "both lamps in reach, strongest at the door first");
+        assert!(tiles.iter().all(|t| t.1.len() == 8), "a door-only tile holds the leaf's corners");
+        // The player stands under lamp 1: its tile holds them and the door.
+        let body_parts = [(Vec3::new(1.0, 0.4, -3.4), 0.2), (Vec3::new(1.0, 1.5, -3.4), 0.2)];
+        let tiles = moving_caster_tiles(&lamps, Some((Vec3::new(1.0, 0.9, -3.4), 0.8, &body_parts)), &[leaf], eye, &[]);
+        let lamp1 = tiles.iter().find(|t| t.0 == 1).expect("lamp 1 has a tile");
+        assert_eq!(lamp1.1.len(), 2 + 8, "the body's spheres and the leaf's corners");
+        assert!(tiles.len() <= MAX_CHARACTER_SHADOWS);
+        // A door 20 m from the eye takes no tile.
+        assert!(moving_caster_tiles(&lamps, None, &[leaf], eye + Vec3::new(0.0, 0.0, 20.0), &[]).is_empty());
+        // Held: the player's two lamps, then three sconces by the door
+        // for the last two places.
+        let mut many = vec![point(Vec3::new(1.0, 2.4, -3.4), 50.0), point(Vec3::new(1.5, 2.4, -3.4), 50.0)];
+        many.extend([point(Vec3::new(4.0, 1.9, -3.4), 3.0), point(Vec3::new(4.0, 1.9, -3.5), 3.2), point(Vec3::new(4.0, 2.0, -3.3), 3.1)]);
+        let body = Some((Vec3::new(1.0, 0.9, -3.4), 0.8, &body_parts[..]));
+        let fresh: Vec<usize> = moving_caster_tiles(&many, body, &[leaf], eye, &[]).iter().map(|t| t.0).collect();
+        assert_eq!(fresh, vec![0, 1, 3, 2], "two for the player, then the two strongest at the door");
+        // Lamp 4 held a door tile last frame; lamp 2 claims only 6% more.
+        let held = [many[0].position, many[1].position, many[3].position, many[4].position];
+        let kept: Vec<usize> = moving_caster_tiles(&many, body, &[leaf], eye, &held).iter().map(|t| t.0).collect();
+        assert!(kept.contains(&3) && kept.contains(&4) && !kept.contains(&2), "held door lamps keep their tiles: {kept:?}");
+        // A sconce between two doors, one at each end of its hallway: its
+        // tile looks at the nearer and holds that one alone -- one tile
+        // holding both looked between them and shadowed neither.
+        let far_leaf = DoorCaster { corners: leaf.corners.map(|c| c + Vec3::new(7.3, 0.0, 0.0)) };
+        let between = [point(Vec3::new(5.0, 1.9, -4.0), 3.0)];
+        let tiles = moving_caster_tiles(&between, None, &[leaf, far_leaf], eye, &[]);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].1.len(), 8, "one leaf's corners");
+        assert!(tiles[0].1.iter().all(|(c, _)| c.x < 3.1), "the nearer leaf's");
+        let m = character_light_matrix(between[0].position, None, &tiles[0].1, 6.0).unwrap();
+        let behind = m * Vec3::new(1.5, 0.0, -3.2).extend(1.0);
+        let ndc = behind.truncate() / behind.w;
+        assert!(ndc.x.abs() < 1.0 && ndc.y.abs() < 1.0 && ndc.z < 1.0, "the floor behind the leaf is in its tile: {ndc}");
     }
 
     /// A character's tile holds the body whole from the lamp and reaches the
@@ -2054,8 +2302,11 @@ mod render_tests {
             let spot = (l.kind == LightKind::Spot).then(|| (l.direction, (l.cone_angle_deg.to_radians() * 0.5).cos()));
             character_light_matrix(l.position, spot, &[(centre, radius)], l.range).map(|m| (i, m))
         });
-        if let Some((_, m)) = character_tile {
+        if let Some((i, m)) = character_tile {
             spot_view_proj[MAX_SPOT_SHADOWS] = m;
+            // Its light names the tile by its shadow layer.
+            lights_uniform.set_tile_lamps(&[i]);
+            lights_uniform.upload_frame(&queue, &scene.lights, &spot_indices, scene.sky_sun_dynamic);
         }
         let upload = ShadowUpload {
             sun_view_proj,

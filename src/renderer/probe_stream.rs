@@ -45,6 +45,24 @@ pub type ProbeDepthSource = Arc<dyn Fn(usize) -> Option<Vec<u16>> + Send + Sync>
 /// distances.
 type Prepared = (Vec<Vec<u8>>, Option<Vec<u16>>);
 
+/// Six cube faces made on the stream's worker, for one of its fixed layers
+/// (the sky's, a building's) -- see [`ProbeStream::refresh`].
+pub type FixedFaces = Box<dyn FnOnce() -> Option<Vec<u8>> + Send>;
+
+/// What the stream's worker is asked for.
+enum Request {
+    /// Probe `i`'s photograph, from the source as it reads now.
+    Probe(usize),
+    /// A fixed layer's faces, made and prefiltered on the worker.
+    Fixed(u32, FixedFaces),
+}
+
+/// What the worker hands back.
+enum Done {
+    Probe(usize, Option<Prepared>),
+    Fixed(u32, Option<Vec<Vec<u8>>>),
+}
+
 /// Everything about a probe except its pixels.
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeDesc {
@@ -198,11 +216,18 @@ pub struct ProbeStream {
     depth_texture: wgpu::Texture,
     resolution: u32,
     count: usize,
-    requests: Option<mpsc::Sender<usize>>,
-    results: mpsc::Receiver<(usize, Option<Prepared>)>,
+    requests: Option<mpsc::Sender<Request>>,
+    results: mpsc::Receiver<Done>,
     ready: HashMap<usize, Prepared>,
     requested: HashSet<usize>,
     failed: HashSet<usize>,
+    /// Resident probes asked for again by [`Self::refresh`], with how many
+    /// asks are in flight; and the relit photographs back from the worker,
+    /// to write over their layers in place.
+    refreshing: HashMap<usize, u32>,
+    refreshed: HashMap<usize, Vec<Vec<u8>>>,
+    /// Fixed layers (the sky's, the buildings') made again, to write.
+    fixed_ready: Vec<(u32, Vec<Vec<u8>>)>,
     /// The cube layer holding the sky reflections see, past the pool's own
     /// layers so eviction never touches it. See `sky::ReflectionSky`.
     sky_layer: Option<u32>,
@@ -312,34 +337,41 @@ impl ProbeStream {
             if everything_fits { ", all resident" } else { ", streaming" },
         );
 
-        // THE WORKER, for everything that was not preloaded. It holds only the
-        // source; each probe it finishes is handed back and uploaded on the
-        // render thread, which owns the queue.
-        let (req_tx, req_rx) = mpsc::channel::<usize>();
+        // THE WORKER, for everything that was not preloaded, and for what
+        // [`Self::refresh`] asks again (a level that all fits has one too: the
+        // time of day relights it). It holds only the source; each probe it
+        // finishes is handed back and uploaded on the render thread, which
+        // owns the queue. Idle, it waits on its channel and costs nothing.
+        let (req_tx, req_rx) = mpsc::channel::<Request>();
         let (res_tx, res_rx) = mpsc::channel();
-        if !everything_fits {
-            std::thread::Builder::new()
-                .name("probe_stream".into())
-                .spawn(move || {
-                    while let Ok(i) = req_rx.recv() {
-                        if res_tx.send((i, prepare(i))).is_err() {
-                            break;
-                        }
+        std::thread::Builder::new()
+            .name("probe_stream".into())
+            .spawn(move || {
+                while let Ok(request) = req_rx.recv() {
+                    let done = match request {
+                        Request::Probe(i) => Done::Probe(i, prepare(i)),
+                        Request::Fixed(layer, faces) => Done::Fixed(layer, faces().and_then(|f| prefilter_probe(&f, res))),
+                    };
+                    if res_tx.send(done).is_err() {
+                        break;
                     }
-                })
-                .ok();
-        }
+                }
+            })
+            .ok();
         Self {
             pool,
             texture,
             depth_texture,
             resolution: res,
             count,
-            requests: (!everything_fits).then_some(req_tx),
+            requests: Some(req_tx),
             results: res_rx,
             ready: HashMap::new(),
             requested: HashSet::new(),
             failed: HashSet::new(),
+            refreshing: HashMap::new(),
+            refreshed: HashMap::new(),
+            fixed_ready: Vec::new(),
             sky_layer,
             building_layer,
         }
@@ -367,7 +399,29 @@ impl ProbeStream {
 
     pub fn begin_frame(&mut self) {
         self.pool.begin_frame();
-        while let Ok((i, chain)) = self.results.try_recv() {
+        while let Ok(done) = self.results.try_recv() {
+            let (i, chain) = match done {
+                Done::Probe(i, chain) => (i, chain),
+                Done::Fixed(layer, chain) => {
+                    if let Some(chain) = chain {
+                        self.fixed_ready.retain(|(l, _)| *l != layer);
+                        self.fixed_ready.push((layer, chain));
+                    }
+                    continue;
+                }
+            };
+            // A refresh's answer: relit over the probe's layer in place, the
+            // newest ask winning.
+            if let Some(n) = self.refreshing.get_mut(&i) {
+                *n -= 1;
+                if *n == 0 {
+                    self.refreshing.remove(&i);
+                }
+                if let Some((chain, _)) = chain {
+                    self.refreshed.insert(i, chain);
+                }
+                continue;
+            }
             match chain {
                 Some(chain) => {
                     self.ready.insert(i, chain);
@@ -422,7 +476,7 @@ impl ProbeStream {
                 None => {
                     if !self.ready.contains_key(&probe) && self.requested.insert(probe) {
                         if let Some(tx) = &self.requests {
-                            let _ = tx.send(probe);
+                            let _ = tx.send(Request::Probe(probe));
                         }
                     }
                     None
@@ -436,6 +490,59 @@ impl ProbeStream {
         }
         kept.count = n as u32;
         *upload = kept;
+        // RELIT LAYERS, with what the frame's budget has left: streaming a
+        // missing probe comes first, a photograph a little out of date is
+        // still the right room. A relit probe since evicted is dropped (its
+        // next stream reads the source as it is then).
+        while uploads < PROBE_UPLOADS_PER_FRAME {
+            if let Some((layer, chain)) = self.fixed_ready.pop() {
+                write_probe_layer(queue, &self.texture, layer, self.resolution, &chain);
+                uploads += 1;
+                continue;
+            }
+            let Some(&i) = self.refreshed.keys().next() else { break };
+            let chain = self.refreshed.remove(&i).expect("just listed");
+            if let Some(&layer) = self.pool.layer_of.get(&i) {
+                write_probe_layer(queue, &self.texture, layer, self.resolution, &chain);
+                uploads += 1;
+            }
+        }
+    }
+
+    /// LIGHT THE PHOTOGRAPHS AGAIN: every resident probe is read from its
+    /// source once more and prefiltered on the worker, then written over its
+    /// own layer a few a frame ([`PROBE_UPLOADS_PER_FRAME`], after streaming);
+    /// photographs waiting to stream are dropped to be read again; `sky` and
+    /// `buildings` (in their layers' order) remake the fixed layers the same
+    /// way. The source decides what "again"
+    /// means: the time of day's reads the photograph relit for the hour
+    /// (`time_of_day::relit_probe_source`). Distances are left alone.
+    ///
+    /// Nothing happens on the render thread but the channel sends and, later,
+    /// the uploads: ~1 MB a 128 px probe.
+    pub fn refresh(&mut self, sky: Option<FixedFaces>, buildings: Vec<FixedFaces>) {
+        let Some(tx) = &self.requests else { return };
+        self.ready.clear();
+        self.requested.clear();
+        let resident: Vec<usize> = self.pool.layer_of.keys().copied().collect();
+        for i in resident {
+            if tx.send(Request::Probe(i)).is_ok() {
+                *self.refreshing.entry(i).or_insert(0) += 1;
+            }
+        }
+        if let (Some(layer), Some(faces)) = (self.sky_layer, sky) {
+            let _ = tx.send(Request::Fixed(layer, faces));
+        }
+        if let Some(first) = self.building_layer {
+            for (k, faces) in buildings.into_iter().enumerate() {
+                let _ = tx.send(Request::Fixed(first + k as u32, faces));
+            }
+        }
+    }
+
+    /// Whether a [`Self::refresh`] is still being worked through.
+    pub fn refreshing(&self) -> bool {
+        !self.refreshing.is_empty() || !self.refreshed.is_empty() || !self.fixed_ready.is_empty()
     }
 
     /// The distance cube array to bind beside [`Self::view`].
@@ -455,6 +562,25 @@ impl ProbeStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What one relight costs the stream's worker per probe: a prefilter at
+    /// the shipped 256 px. `cargo test --release --lib prefilter_cost --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn prefilter_cost() {
+        for res in [128u32, 256] {
+            let faces: Vec<u8> = (0..res * res * 6).flat_map(|i| {
+                let v = super::super::uniforms::f32_to_f16(0.1 + (i % 97) as f32 * 0.01).to_le_bytes();
+                let one = super::super::uniforms::f32_to_f16(1.0).to_le_bytes();
+                [v[0], v[1], v[0], v[1], v[0], v[1], one[0], one[1]]
+            }).collect();
+            let t = std::time::Instant::now();
+            let chain = prefilter_probe(&faces, res).unwrap();
+            let bytes: usize = chain.iter().map(Vec::len).sum();
+            eprintln!("prefilter {res} px: {:.1} ms, {:.1} MB chain", t.elapsed().as_secs_f64() * 1e3, bytes as f64 / 1048576.0);
+        }
+    }
 
     fn desc(volume: u32, has_depth: bool) -> ProbeDesc {
         ProbeDesc { centre: Vec3::ZERO, min: Vec3::ZERO, max: Vec3::ONE, volume, has_depth,

@@ -20,7 +20,9 @@
 //! Meshes carry their own motion too: a rigid one by its previous model
 //! matrix, a skinned one -- the player's hands and body, other avatars -- by
 //! its previous joint palette (`GltfSkin::prev_joint_buffer`), skinned twice
-//! in the vertex shader. Not yet: layered meshes (caves) and effects.
+//! in the vertex shader. Water by its waves: its surface placed twice, from
+//! the wave field's set for this frame and the one for the last
+//! ([`MotionKind::Water`]). Not yet: layered meshes (caves) and effects.
 //!
 //! # Reflections
 //!
@@ -73,13 +75,16 @@ pub struct MotionCamera {
     /// to diagnose). zw unused.
     pub params: [f32; 4],
     /// The eye, in the space the draw's vertices are in, for
-    /// [`MotionKind::BrushReflect`]. w unused.
+    /// [`MotionKind::BrushReflect`] and [`MotionKind::Water`] (the world).
+    /// w unused.
     pub eye: [f32; 4],
     /// For [`MotionKind::BrushReflect`]: x, y = eye-image pixels per motion
     /// pixel along each axis; z = 1 to move reflected images with what they
     /// show, 0 to move every pixel with its surface; w = 1 to write, instead
     /// of motion, what it read -- the reflected share, the reach in metres and
     /// the distance ratio (DIAGNOSIS ONLY, `space_warp_debug` 32768).
+    /// For [`MotionKind::Water`]: x = seconds since the last frame's water,
+    /// for the shore's swash. yzw unused.
     pub reflect: [f32; 4],
 }
 
@@ -252,11 +257,41 @@ fn reflect_ratio(texel: vec2<f32>, d: f32) -> f32 {{
     }}
     return motion_of(cam.curr * vec4<f32>(p, 1.0), cam.prev * vec4<f32>(p, 1.0));
 }}
+
+// WATER: its surface where it is drawn this frame and where it was drawn the
+// last -- the long waves from each frame's set of the wave field, the swash at
+// each frame's time -- so the compositor carries the waves on as they move.
+// Its vertices are in the WORLD: the two cameras carry each frame's way into
+// the player's frame, and `cam.eye` is the world eye. See `MotionKind::Water`.
+{surface}
+@group(1) @binding(0) var<uniform> water: WaterMat;
+@group(1) @binding(1) var wave_now: texture_2d_array<f32>;
+@group(1) @binding(2) var wave_last: texture_2d_array<f32>;
+@group(1) @binding(3) var wave_samp: sampler;
+{surface_now}
+{surface_last}
+
+@vertex fn vs_water(@location(0) pos: vec3<f32>, @location(1) depth: f32) -> VOut {{
+    var out: VOut;
+    let now = surface_now(pos, depth, cam.eye.xyz, water.tiles.w);
+    let last = surface_last(pos, depth, cam.eye.xyz, water.tiles.w - cam.reflect.x);
+    out.clip = cam.curr * vec4<f32>(now, 1.0);
+    out.curr = out.clip;
+    out.prev = cam.prev * vec4<f32>(last, 1.0);
+    // The horizon, held where the water's own pass holds it.
+    if (out.clip.w > 0.0) {{
+        out.clip.z = min(out.clip.z, out.clip.w * 0.999999);
+    }}
+    return out;
+}}
 "#,
         joints = crate::renderer::mesh::MAX_SKIN_JOINTS,
         min_w = format!("{:?}", MIN_PREV_W),
         max_d = format!("{:?}", MAX_NDC_MOTION),
         max_reflected = format!("{:?}", MAX_REFLECTED_DISTANCE),
+        surface = crate::renderer::water_pipeline::surface_wgsl(),
+        surface_now = crate::renderer::water_pipeline::surface_fn_wgsl("surface_now", "wave_now"),
+        surface_last = crate::renderer::water_pipeline::surface_fn_wgsl("surface_last", "wave_last"),
     )
 }
 
@@ -365,6 +400,11 @@ pub enum MotionKind {
     Solid,
     Mesh,
     Skinned,
+    /// A body of water, its vertices in the WORLD
+    /// (`water_pipeline::WaterVertex`), placed where its waves put it this
+    /// frame and last: group 1 is the body's uniform and the wave field's two
+    /// sets (`MotionPipelines::water_bind_group`).
+    Water,
 }
 
 /// The motion-vector pipelines, one per vertex layout the eye pass draws
@@ -376,11 +416,15 @@ pub struct MotionPipelines {
     /// Group 1 of [`MotionKind::BrushReflect`]: the eye image this frame's
     /// scene pass drew, and the probe pass's reach, each one eye's.
     pub reflect_layout: wgpu::BindGroupLayout,
+    /// Group 1 of [`MotionKind::Water`]: a body's uniform, the wave field's
+    /// set holding this frame's surface and the set holding the last's.
+    pub water_layout: wgpu::BindGroupLayout,
     brush: wgpu::RenderPipeline,
     brush_reflect: wgpu::RenderPipeline,
     solid: wgpu::RenderPipeline,
     mesh: wgpu::RenderPipeline,
     skinned: wgpu::RenderPipeline,
+    water: wgpu::RenderPipeline,
     /// Whether the depth format carries stencil (D24S8), which the pass then
     /// clears too rather than leave for wgpu to zero on first use.
     stencil: bool,
@@ -442,6 +486,29 @@ impl MotionPipelines {
         let reflect_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("space_warp_reflect"),
             bind_group_layouts: &[Some(&camera_layout), Some(&reflect_layout)],
+            immediate_size: 0,
+        });
+        let water_entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::VERTEX, ty, count: None };
+        let wave_set = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        };
+        let water_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("space_warp_water"),
+            entries: &[
+                water_entry(
+                    0,
+                    wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                ),
+                water_entry(1, wave_set),
+                water_entry(2, wave_set),
+                water_entry(3, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+            ],
+        });
+        let water_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("space_warp_water"),
+            bind_group_layouts: &[Some(&camera_layout), Some(&water_layout)],
             immediate_size: 0,
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -518,17 +585,57 @@ impl MotionPipelines {
             size(std::mem::size_of::<crate::renderer::mesh::SkinnedMeshVertex>()),
             &skinned_attributes,
         );
+        let water_attributes = [
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: std::mem::offset_of!(crate::renderer::water_pipeline::WaterVertex, depth) as u64,
+                shader_location: 1,
+            },
+        ];
+        let water = make(
+            "space_warp_water",
+            &water_pipeline_layout,
+            ("vs_water", "fs_main"),
+            size(std::mem::size_of::<crate::renderer::water_pipeline::WaterVertex>()),
+            &water_attributes,
+        );
         Self {
             camera_layout,
             joints_layout,
             reflect_layout,
+            water_layout,
             brush,
             brush_reflect,
             solid,
             mesh,
             skinned,
+            water,
             stencil: depth_format.has_stencil_aspect(),
         }
+    }
+
+    /// Group 1 of [`MotionKind::Water`] for one body: its uniform, the wave
+    /// field's set holding this frame's surface (`now`) and the set holding
+    /// the last frame's, and the sampler the water itself reads them with.
+    pub fn water_bind_group(
+        &self,
+        device: &wgpu::Device,
+        uniform: &wgpu::Buffer,
+        now: &wgpu::TextureView,
+        last: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("space_warp_water"),
+            layout: &self.water_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(now) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(last) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
+            ],
+        })
     }
 
     /// Group 1 of [`MotionKind::BrushReflect`] for one eye: `eye_image`, a
@@ -552,13 +659,15 @@ impl MotionPipelines {
             MotionKind::Solid => &self.solid,
             MotionKind::Mesh => &self.mesh,
             MotionKind::Skinned => &self.skinned,
+            MotionKind::Water => &self.water,
         }
     }
 }
 
 /// One draw of the motion pass: its geometry, the ring slot of its two
-/// cameras, and its group 1 -- a skinned mesh's joints, or the brushes'
-/// reflection inputs (`MotionPipelines::reflect_bind_group`).
+/// cameras, and its group 1 -- a skinned mesh's joints, the brushes'
+/// reflection inputs (`MotionPipelines::reflect_bind_group`), or a body of
+/// water's waves (`MotionPipelines::water_bind_group`).
 pub struct MotionDraw<'a> {
     pub kind: MotionKind,
     pub vertices: &'a wgpu::Buffer,
@@ -602,7 +711,7 @@ pub fn record(
         ..Default::default()
     });
     for d in draws.iter().filter(|d| d.count > 0 && d.slot < MAX_SLOTS) {
-        if matches!(d.kind, MotionKind::Skinned | MotionKind::BrushReflect) && d.joints.is_none() {
+        if matches!(d.kind, MotionKind::Skinned | MotionKind::BrushReflect | MotionKind::Water) && d.joints.is_none() {
             continue;
         }
         pass.set_pipeline(pipelines.pipeline(d.kind));
@@ -1027,6 +1136,162 @@ mod tests {
         assert!(close(reflected, want), "shader {reflected} vs reference {want}");
         assert!(close(plain, want_plain), "switched off: {plain} vs the wall's {want_plain}");
         assert!((want - want_plain).truncate().length() > 1e-3, "the test cannot tell them apart");
+    }
+
+    /// Water moves as its waves do. With the camera still, a sea whose two
+    /// sets of the wave field hold one surface writes no motion; half a second
+    /// on, the same sea writes motion where its waves moved -- and its depth,
+    /// which the compositor reprojects it by.
+    #[test]
+    fn water_moves_as_its_waves_do() {
+        use crate::renderer::water_pipeline::{WaterOptics, WaterUniform, WaterVertex};
+        use crate::renderer::water_waves::{WaveField, WaveParams};
+        use wgpu::util::DeviceExt;
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        const W: u32 = 64;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipelines = MotionPipelines::new(&device, wgpu::TextureFormat::Depth32Float);
+
+        // Open water 16 m across, half a metre a vertex, 30 m deep.
+        let n = 33usize;
+        let verts: Vec<WaterVertex> = (0..n * n)
+            .map(|i| WaterVertex { position: [(i % n) as f32 * 0.5 - 8.0, 0.0, (i / n) as f32 * 0.5 - 16.0], depth: 30.0 })
+            .collect();
+        let indices: Vec<u32> = (0..n - 1)
+            .flat_map(|iz| (0..n - 1).map(move |ix| (iz * n + ix) as u32))
+            .flat_map(|a| [a, a + n as u32, a + 1, a + 1, a + n as u32, a + n as u32 + 1])
+            .collect();
+        let buffer = |label, contents: &[u8], usage| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage });
+        let vertices = buffer("sea", bytemuck::cast_slice(&verts), wgpu::BufferUsages::VERTEX);
+        let index_buffer = buffer("sea_indices", bytemuck::cast_slice(&indices), wgpu::BufferUsages::INDEX);
+
+        // A fresh breeze over open water.
+        let params = WaveParams { wind_speed: 8.0, fetch: 5000.0, ..WaveParams::default() };
+        let waves = WaveField::new(&device, &queue, params);
+        let optics = WaterOptics { height: 0.0, shallow: [0.5; 3], deep: [0.05; 3], depth_scale: 4.0, shore_fade: 0.3, swash: 0.0, swell: 0.0 };
+        let mut uniform = WaterUniform::new(&optics, &params);
+        uniform.set_time(10.0, params.loop_seconds);
+        let uniform = buffer("sea_uniform", bytemuck::bytes_of(&uniform), wgpu::BufferUsages::UNIFORM);
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let groups: [wgpu::BindGroup; 2] = std::array::from_fn(|now| {
+            pipelines.water_bind_group(&device, &uniform, &waves.displacement_views[now], &waves.displacement_views[1 - now], &sampler)
+        });
+
+        // A still camera 3 m up, looking out over the water.
+        let eye = Vec3::new(0.0, 3.0, 1.0);
+        let vp = Mat4::perspective_rh(1.5, 1.0, NEAR_Z, FAR_Z) * Mat4::look_at_rh(eye, Vec3::new(0.0, 0.0, -7.0), Vec3::Y);
+        let target = |label, format, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: W, height: W, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let run = |dt: f32| -> (Vec<Vec3>, Vec<f32>) {
+            let cam = MotionCamera {
+                curr: vp.to_cols_array_2d(),
+                prev: vp.to_cols_array_2d(),
+                params: [1.0, 1.0, 0.0, 0.0],
+                eye: [eye.x, eye.y, eye.z, 1.0],
+                reflect: [dt, 0.0, 0.0, 0.0],
+            };
+            let mut ring = vec![0u8; SLOT_STRIDE as usize];
+            ring[..std::mem::size_of::<MotionCamera>()].copy_from_slice(bytemuck::bytes_of(&cam));
+            let ring = buffer("ring", &ring, wgpu::BufferUsages::UNIFORM);
+            let cameras = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cameras"),
+                layout: &pipelines.camera_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &ring,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(std::mem::size_of::<MotionCamera>() as u64),
+                    }),
+                }],
+            });
+            let copy = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+            let motion = target("motion", MOTION_FORMAT, copy);
+            let depth = target("depth", wgpu::TextureFormat::Depth32Float, copy);
+            let readback = |label, bytes: u32| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: (W * W * bytes) as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
+            };
+            let (motion_back, depth_back) = (readback("motion_back", 8), readback("depth_back", 4));
+            let mut encoder = device.create_command_encoder(&Default::default());
+            let draw = MotionDraw {
+                kind: MotionKind::Water,
+                vertices: &vertices,
+                indices: &index_buffer,
+                first: 0,
+                count: indices.len() as u32,
+                slot: 0,
+                joints: Some(&groups[waves.current()]),
+            };
+            let depth_view = depth.create_view(&Default::default());
+            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], false, 1.0);
+            for (texture, back, bytes, aspect) in
+                [(&motion, &motion_back, 8, wgpu::TextureAspect::All), (&depth, &depth_back, 4, wgpu::TextureAspect::DepthOnly)]
+            {
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: back,
+                        layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(W * bytes), rows_per_image: None },
+                    },
+                    wgpu::Extent3d { width: W, height: W, depth_or_array_layers: 1 },
+                );
+            }
+            queue.submit(Some(encoder.finish()));
+            motion_back.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            depth_back.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let m = motion_back.slice(..).get_mapped_range().unwrap();
+            let half = |at: usize| f16_to_f32(u16::from_le_bytes([m[at], m[at + 1]]));
+            let motions = (0..(W * W) as usize).map(|i| Vec3::new(half(i * 8), half(i * 8 + 2), half(i * 8 + 4))).collect();
+            let d = depth_back.slice(..).get_mapped_range().unwrap();
+            let depths = bytemuck::cast_slice::<u8, f32>(&d).to_vec();
+            (motions, depths)
+        };
+
+        // The first update writes both sets at one time: one surface twice.
+        let step = |seconds: f64| {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            waves.update(&queue, &mut encoder, seconds);
+            queue.submit(Some(encoder.finish()));
+        };
+        step(10.0);
+        let (still, depth) = run(0.0);
+        // Half a second on: this frame's set moves on, the other keeps the last.
+        step(10.5);
+        let (moving, _) = run(0.5);
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "{err:?}");
+
+        let wet: Vec<usize> = (0..depth.len()).filter(|&i| depth[i] < 1.0).collect();
+        assert!(wet.len() > (W * W / 4) as usize, "the water wrote depth at {} pixels of {}", wet.len(), W * W);
+        let largest = |m: &[Vec3]| wet.iter().map(|&i| m[i].truncate().length()).fold(0.0f32, f32::max);
+        assert!(largest(&still) < 1e-6, "a still sea moved: {}", largest(&still));
+        assert!(largest(&moving) > 1e-3, "the waves moved and the motion did not: {}", largest(&moving));
     }
 
     /// A half float's value: enough of IEEE 754 binary16 for the test above.

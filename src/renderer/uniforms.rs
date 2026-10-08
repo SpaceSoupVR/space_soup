@@ -398,6 +398,12 @@ pub struct PostUpload {
     /// Only while that pass reads it: otherwise alpha stays 1, and the eye
     /// image compresses as it did. Rides in `post_params.w`.
     pub reflection_share: bool,
+    /// How far toward rod vision the eye sees, 0 (day) .. ~0.85: the
+    /// Purkinje shift at night (`tonemap::night_vision`). Rides in
+    /// `proxy_params.y`, the camera block's one free lane -- the block is
+    /// shared by every scene shader and other work changes it, so the lane
+    /// is borrowed rather than the struct grown.
+    pub night_vision: f32,
 }
 
 impl Default for PostUpload {
@@ -410,6 +416,7 @@ impl Default for PostUpload {
             tonemap: super::tonemap::ToneMapping::default(),
             terrain_detail_distance: 0.0,
             reflection_share: false,
+            night_vision: 0.0,
         }
     }
 }
@@ -1037,7 +1044,8 @@ impl UniformBuffer {
                 probes.building_count as f32,
             ],
             probe_portals: dense.portals,
-            proxy_params: [probes.proxy_count as f32, 0.0, 0.0, 0.0],
+            // y: the eye's night vision -- see `PostUpload::night_vision`.
+            proxy_params: [probes.proxy_count as f32, post.night_vision, 0.0, 0.0],
             probe_proxies: dense.proxies,
             probe_rooms: room_tables,
             ground_params: dense.ground,
@@ -1780,7 +1788,7 @@ pub fn probe_mip_levels(resolution: u32) -> u32 {
 }
 
 /// IEEE binary16 to f32. See `f32_to_f16` for why these live here.
-fn f16_to_f32(h: u16) -> f32 {
+pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
     let exp = ((h >> 10) & 0x1f) as i32;
     let mant = (h & 0x3ff) as u32;
@@ -1810,7 +1818,7 @@ fn f16_to_f32(h: u16) -> f32 {
 /// crates.io and must not depend on `space_soup_engine`; the alternative to
 /// twenty duplicated lines is a dependency that would drag the whole engine
 /// into a published renderer.
-fn f32_to_f16(v: f32) -> u16 {
+pub(crate) fn f32_to_f16(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127;

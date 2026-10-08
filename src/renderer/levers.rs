@@ -90,6 +90,15 @@ pub struct Levers {
     /// characters-only tile of the shadow atlas each. Off, those lamps shadow
     /// the player by the capsules alone. See `shadow::MAX_CHARACTER_SHADOWS`.
     pub character_shadows: bool,
+    /// The doors' shadows from the lamps: the lamps reaching a door near the
+    /// eye take moving casters' tiles that hold the door, so a closed leaf
+    /// stops the light its doorway was baked letting through. Off, a door
+    /// casts only in the sun's and the torch's maps. See `doors`.
+    pub door_shadows: bool,
+    /// A shut door seals its doorway for portal culling: what lies beyond is
+    /// culled as if the doorway were wall. Off, doors cull nothing. See
+    /// `doors::shut_portals`.
+    pub door_culling: bool,
     /// The characters as capsules: their soft shadows, contact darkening and
     /// reflections. Off, the shaders see no characters (and the characters'
     /// shadow tiles go with them). See `uniforms::CapsuleUpload`.
@@ -178,6 +187,21 @@ pub struct Levers {
     /// How strong the veils are against `glare::VEIL_SHARE` of the CIE young
     /// eye's: 1 as shipped.
     pub glare_strength: f32,
+    /// The level's effects -- fire, smoke, embers, dust -- simulated, lit and
+    /// drawn. See `effects`.
+    pub effects: bool,
+    /// The level's water -- its surfaces, their waves and, under SpaceWarp,
+    /// their motion -- drawn. See `water_pipeline`.
+    pub water: bool,
+    /// The view from under the water -- the veil, the surface's underside,
+    /// the waterline and the wet film -- when an eye is in it. Off, an eye
+    /// under the water sees the surface's top and an unfogged bed. See
+    /// `underwater`.
+    pub underwater: bool,
+    /// The level's weather -- the ground's weather twins over its areas, and
+    /// the falling rain, snow and splashes -- drawn. Off draws the dry
+    /// ground's shaders everywhere and no particles. See `weather`.
+    pub weather: bool,
     /// Where a fixture's bulb meets the tone curve, exposed, when it would be
     /// brighter: its own light -- the bulb's glow and its lamp on the inside
     /// of its shade -- scaled as one, as an eye adapts to a lamp it looks into
@@ -260,6 +284,18 @@ pub struct Levers {
     /// `probe_fixup::FIXUP_CUTS` (e.g. `fixup_cut_rims`) -- what each kind of
     /// record costs. Lossy: the cut lookups are not made.
     pub fixup_cut: Option<String>,
+    /// MEASUREMENT: the water drawn with one of `water_pipeline::WATER_CUTS`
+    /// (e.g. `breaker_face`) in place of its ringless shader -- what a part
+    /// costs by its presence and its work. Not the same picture.
+    pub water_cut: Option<String>,
+    /// The ground's slope twins (`ground_twins`): its gentle triangles drawn
+    /// by the readers without the steep ground's code. Off draws every
+    /// triangle with the full readers. The same picture.
+    pub slope_twins: bool,
+    /// The ground's probe pass with its repeated code written once
+    /// (`ground_twins::dedup_passes`). Off draws the pass as it was. The same
+    /// picture.
+    pub pass_dedup: bool,
     /// MEASUREMENT: the ground drawn by its full reader everywhere, with no
     /// twin (`full`), or as it was before its layer reads became one loop
     /// (`inlined`: reader and probe pass, no twin). The same picture as the
@@ -294,6 +330,20 @@ pub struct Levers {
     /// head. The app moves the rig and the renderer pins the tracked head;
     /// see `bench`.
     pub bench: Option<crate::renderer::bench::BenchPose>,
+    /// THE TIME OF DAY'S HOUR, local solar time: setting it turns a level
+    /// with a photographed sky over to the time-of-day sky (its defaults,
+    /// north turned so the sun keeps the photograph's side) and pins the
+    /// clock there; a level that authors a time of day jumps to it. `None`
+    /// leaves the level's own clock. See `renderer::time_of_day`.
+    pub time_of_day_hour: Option<f32>,
+    /// Real minutes a whole day takes, over the level's own: 0 freezes the
+    /// clock, 24 runs an hour a minute. With `time_of_day_hour`, the clock
+    /// runs on from that hour.
+    pub time_of_day_minutes: Option<f32>,
+    /// The eye's night vision -- the Purkinje shift toward rod vision's
+    /// blue-grey under moonlight (`tonemap::night_vision`). Off for an A/B:
+    /// the shader's code stays; its amount is 0.
+    pub night_vision: bool,
 }
 
 impl Default for Levers {
@@ -312,6 +362,8 @@ impl Default for Levers {
             poolless_shaders: true,
             dynamic_resolution: true,
             character_shadows: true,
+            door_shadows: true,
+            door_culling: true,
             capsules: true,
             direct_lights: true,
             stationary_lights: true,
@@ -330,6 +382,10 @@ impl Default for Levers {
             terminator_aa: true,
             glare: true,
             glare_strength: 1.0,
+            effects: true,
+            water: true,
+            underwater: true,
+            weather: true,
             fixture_bulb_level: 16.0,
             flashlight_bounce: true,
             surface_light_loop: true,
@@ -346,6 +402,9 @@ impl Default for Levers {
             pass_cut: None,
             scene_cut: None,
             fixup_cut: None,
+            water_cut: None,
+            slope_twins: true,
+            pass_dedup: true,
             terrain_reader: None,
             reader_edit: None,
             gpu_sync: false,
@@ -355,6 +414,9 @@ impl Default for Levers {
             direct_path: false,
             ab_cycle: false,
             bench: None,
+            time_of_day_hour: None,
+            time_of_day_minutes: None,
+            night_vision: true,
         }
     }
 }
@@ -404,6 +466,11 @@ impl Levers {
             Phase::NoCharacterCards => l.character_cards = false,
             Phase::NoFlashlightBounce => l.flashlight_bounce = false,
             Phase::NoTorchReflection => l.torch_reflection = false,
+            Phase::NoEffects => l.effects = false,
+            Phase::NoWater => l.water = false,
+            Phase::NoWeather => l.weather = false,
+            Phase::NoDoorShadows => l.door_shadows = false,
+            Phase::TimeFrozen => l.time_of_day_minutes = Some(0.0),
         }
         l
     }
@@ -437,6 +504,8 @@ impl Levers {
         flag("poolless_shaders", self.poolless_shaders, d.poolless_shaders);
         flag("dynamic_resolution", self.dynamic_resolution, d.dynamic_resolution);
         flag("character_shadows", self.character_shadows, d.character_shadows);
+        flag("door_shadows", self.door_shadows, d.door_shadows);
+        flag("door_culling", self.door_culling, d.door_culling);
         flag("capsules", self.capsules, d.capsules);
         flag("direct_lights", self.direct_lights, d.direct_lights);
         flag("stationary", self.stationary_lights, d.stationary_lights);
@@ -450,6 +519,10 @@ impl Levers {
         flag("ground_trace", self.ground_trace, d.ground_trace);
         flag("space_warp", self.space_warp, d.space_warp);
         flag("glare", self.glare, d.glare);
+        flag("effects", self.effects, d.effects);
+        flag("water", self.water, d.water);
+        flag("underwater", self.underwater, d.underwater);
+        flag("weather", self.weather, d.weather);
         flag("terminator_aa", self.terminator_aa, d.terminator_aa);
         flag("floor_mirror", self.floor_mirror, d.floor_mirror);
         flag("reflection_blur", self.reflection_blur, d.reflection_blur);
@@ -502,6 +575,15 @@ impl Levers {
         if let Some(cut) = &self.fixup_cut {
             out.push(format!("fixup_cut={cut}"));
         }
+        if let Some(cut) = &self.water_cut {
+            out.push(format!("water_cut={cut}"));
+        }
+        if !self.slope_twins {
+            out.push("no_slope_twins".to_string());
+        }
+        if !self.pass_dedup {
+            out.push("no_pass_dedup".to_string());
+        }
         if let Some(reader) = &self.terrain_reader {
             out.push(format!("terrain_reader={reader}"));
         }
@@ -510,6 +592,15 @@ impl Levers {
         }
         if let Some(b) = &self.bench {
             out.push(format!("bench={}", b.name));
+        }
+        if let Some(h) = self.time_of_day_hour {
+            out.push(format!("time_of_day_hour={h}"));
+        }
+        if let Some(m) = self.time_of_day_minutes {
+            out.push(format!("time_of_day_minutes={m}"));
+        }
+        if !self.night_vision {
+            out.push("no_night_vision".to_string());
         }
         if out.is_empty() {
             "-".to_string()

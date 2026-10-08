@@ -298,8 +298,13 @@ impl MeshPipeline {
 /// fixture's own bulb, three vec4s (48; see `ModelUniform::upload_lit_bulb`).
 /// EVERY buffer that is ever bound as a `ModelUniform` is this size -- the
 /// mirror's and the caves' too, whose shaders read only the matrix -- so no
-/// upload can overrun one left behind.
-pub const MODEL_UNIFORM_SIZE: u64 = 272;
+/// upload can overrun one left behind. Then the WEATHER on it, one vec4
+/// (16; x how wet it is, 0..1), written apart from the rest
+/// ([`ModelUniform::set_wetness`]) so an upload of the others leaves it be.
+pub const MODEL_UNIFORM_SIZE: u64 = 288;
+/// Where [`MODEL_UNIFORM_SIZE`]'s weather vec4 starts: after what
+/// `upload_lit_bulb_scaled` writes.
+pub const MODEL_WEATHER_OFFSET: u64 = 272;
 
 pub struct ModelUniform {
     pub buffer: Buffer,
@@ -307,6 +312,13 @@ pub struct ModelUniform {
 }
 
 impl ModelUniform {
+    /// HOW WET THE MODEL IS, 0 dry to 1 soaked: the avatar and hands in the
+    /// rain (`weather`). Its diffuse darkens and a film of water glosses it,
+    /// lit as any surface is. Kept until set again.
+    pub fn set_wetness(&self, queue: &Queue, wet: f32) {
+        queue.write_buffer(&self.buffer, MODEL_WEATHER_OFFSET, bytemuck::cast_slice(&[wet.clamp(0.0, 1.0), 0.0, 0.0, 0.0]));
+    }
+
     /// Upload the model matrix with FULL sky visibility.
     ///
     /// The neutral, and what every caller that has no occlusion data wants: 1.0
@@ -414,7 +426,7 @@ impl ModelUniform {
         thin_width: f32,
         own_scale: f32,
     ) {
-        let mut data = [0f32; (MODEL_UNIFORM_SIZE / 4) as usize];
+        let mut data = [0f32; (MODEL_WEATHER_OFFSET / 4) as usize];
         data[..16].copy_from_slice(&model.to_cols_array());
         data[16] = sky_vis.clamp(0.0, 1.0);
         data[17] = emissive_drive.max(0.0);
@@ -698,7 +710,7 @@ fn skinned_mesh_shader() -> String {
 // `wgsl_lights_block` below, so there is one description of that layout rather
 // than one per shader.
 
-struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9> }}
+struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9>, own: array<vec4<f32>, 3>, weather: vec4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
 {room_light}
 
@@ -782,7 +794,19 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // The lamps and the sky, and the lit room round it: see `room_light`.
     let lit = shade_with_sky(in.world_pos, n, model_u.params.x) + room_irradiance(n);
     let tex_color = textureSample(tex, samp, in.uv);
-    return vec4<f32>(tonemap(tex_color.rgb * lit), tex_color.a);
+    // WET IN THE RAIN (`weather`): water in the skin and cloth darkens them,
+    // and a film of it glosses them -- its highlight and reflection from the
+    // same lamps, sun, probes and sky as any surface (albedo black: the film
+    // alone). A uniform branch: a dry body skips it.
+    let wet = model_u.weather.x;
+    var rgb = tex_color.rgb * lit * (1.0 - 0.4 * wet);
+    if (wet > 0.0) {{
+        rgb = rgb + wet * shade_material_env(
+            in.world_pos, n, 0.3, 1.0, model_u.params.x, vec3<f32>(0.0), vec4<f32>(0.5, 0.5, 0.5, 0.0),
+            vec3<f32>(0.0), in.world_pos, n,
+        );
+    }}
+    return vec4<f32>(tonemap(rgb), tex_color.a);
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
@@ -1081,7 +1105,7 @@ fn thin_shade_with_sky(world_pos: vec3<f32>, s: ThinSpan, m: ThinMoments, sky_vi
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {
             c = c * hf(pcf_layer(spot_shadow_tex, layer, world_pos, spot_view_proj(layer)));
         } else if (l.params.z < 1.5) {
-            c = c * hf(character_shadow(i, world_pos));
+            c = c * hf(character_shadow(layer, world_pos));
         }
         lit = min(lit + c, hf3(hf(HF_MAX)));
     }
@@ -2394,7 +2418,7 @@ mod tests {
             assert!(thin.contains(&want), "THIN_SHADE lacks `{want}`, its mean of `{line}`");
         }
         let shade_with_sky = &lights[lights.find("fn shade_with_sky(").expect("the lights block shades meshes")..];
-        let shadows = body(shade_with_sky, "if (l.params.z > 1.5) {\n            c = c * hf(sun_visibility", "c = c * hf(character_shadow(i, world_pos));\n        }");
+        let shadows = body(shade_with_sky, "if (l.params.z > 1.5) {\n            c = c * hf(sun_visibility", "c = c * hf(character_shadow(layer, world_pos));\n        }");
         let found = thin.windows(shadows.len()).any(|w| w == shadows.as_slice());
         assert!(found, "THIN_SHADE's shadows are not `shade_with_sky`'s:\n{}", shadows.join("\n"));
     }

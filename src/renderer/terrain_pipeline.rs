@@ -77,7 +77,11 @@ pub struct TerrainMaterialUniform {
     /// its samples and changes nothing, so the shader never has to be told
     /// whether to trust it.
     pub normal_strength: f32,
-    pub _pad: [f32; 3],
+    /// WET SAND: ground below this world y is darkened as the sea's wash
+    /// leaves it wet, over `wet_band` metres above it. Off far below.
+    pub wet_line: f32,
+    pub wet_band: f32,
+    pub _pad: f32,
 }
 
 impl Default for TerrainMaterialUniform {
@@ -93,7 +97,9 @@ impl Default for TerrainMaterialUniform {
             biplanar_start_deg: 18.0,
             use_splat: 0.0,
             normal_strength: 1.0,
-            _pad: [0.0; 3],
+            wet_line: -1e9,
+            wet_band: 1.0,
+            _pad: 0.0,
         }
     }
 }
@@ -412,6 +418,66 @@ impl TerrainPipeline {
         }
     }
 
+    /// THE GROUND'S WEATHER TWINS (`weather::with_weather`): the reader in
+    /// [`TerrainWeatherTwins::readers`]' order and the probe pass with its
+    /// poolless twin, each with the weather's group 2 (`weather_layout`).
+    /// Drawn in place of the shipped ones for the terrain chunks a weather
+    /// area touches, and built only for a level with weather.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_weather_twins(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        weather_layout: &BindGroupLayout,
+    ) -> TerrainWeatherTwins {
+        let twin = |src: String| crate::renderer::weather::with_weather(&src).expect("the ground's weather twin no longer matches its shader");
+        let read = terrain_shader_for(TerrainRole::Read);
+        let baked = crate::renderer::brush_pipeline::sun_reader_shader(read.clone(), crate::renderer::brush_pipeline::FaceSun::Baked);
+        let spotless = crate::renderer::lights::without_spot_shadows;
+        let reader = |src: String, label: &str| {
+            Self::build_from_with(
+                device,
+                format,
+                uniform_layout,
+                samples,
+                crate::renderer::multiview::ViewMode::Mono,
+                TerrainRole::Read,
+                Some(weather_layout),
+                Some(probe_layout),
+                twin(src),
+                label,
+            )
+        };
+        let pass_src = terrain_shader_for(TerrainRole::ProbePass);
+        let pass = |src: String, label: &str| {
+            Self::build_from_with(
+                device,
+                crate::renderer::brush_pipeline::probe_pass::FORMAT,
+                uniform_layout,
+                1,
+                crate::renderer::multiview::ViewMode::Mono,
+                TerrainRole::ProbePass,
+                Some(weather_layout),
+                Some(fixups.pass_layout()),
+                twin(src),
+                label,
+            )
+        };
+        TerrainWeatherTwins {
+            readers: [
+                reader(read.clone(), "terrain_weather_read"),
+                reader(spotless(read), "terrain_weather_read_spotless"),
+                reader(baked.clone(), "terrain_weather_read_baked"),
+                reader(spotless(baked), "terrain_weather_read_baked_spotless"),
+            ],
+            pass: pass(pass_src.clone(), "terrain_weather_probe_pass"),
+            pass_poolless: pass(crate::renderer::lights::without_pool_maps(pass_src), "terrain_weather_probe_pass_poolless"),
+        }
+    }
+
     fn build(
         device: &Device,
         format: TextureFormat,
@@ -438,6 +504,24 @@ impl TerrainPipeline {
         view: crate::renderer::multiview::ViewMode,
         role: TerrainRole,
         group3: Option<&BindGroupLayout>,
+        source: String,
+        label: &str,
+    ) -> Self {
+        Self::build_from_with(device, format, uniform_layout, samples, view, role, None, group3, source, label)
+    }
+
+    /// [`Self::build_from`] with a group 2 -- the weather's, for the ground's
+    /// weather twins (`weather::with_weather`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_from_with(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        role: TerrainRole,
+        group2: Option<&BindGroupLayout>,
+        group3: Option<&BindGroupLayout>,
         mut source: String,
         label: &str,
     ) -> Self {
@@ -452,8 +536,10 @@ impl TerrainPipeline {
         });
         let material_layout = material_bind_group_layout(device);
         let mut layouts = vec![Some(uniform_layout), Some(&material_layout)];
+        if group2.is_some() || group3.is_some() {
+            layouts.push(group2);
+        }
         if let Some(l) = group3 {
-            layouts.push(None);
             layouts.push(Some(l));
         }
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -507,6 +593,15 @@ impl TerrainPipeline {
 
         Self { pipeline, material_layout }
     }
+}
+
+/// The ground's weather twins. See [`TerrainPipeline::new_weather_twins`].
+pub struct TerrainWeatherTwins {
+    /// `[full, spotless, baked, baked_spotless]`, as the reader's twins are
+    /// chosen (`XrRenderer::terrain_reader`).
+    pub readers: [TerrainPipeline; 4],
+    pub pass: TerrainPipeline,
+    pub pass_poolless: TerrainPipeline,
 }
 
 /// MEASUREMENT ONLY: what `TerrainPipeline::log_probe_pass_register_cuts` cuts
@@ -765,8 +860,8 @@ struct Material {{
     biplanar_start_deg: f32,
     use_splat: f32,
     normal_strength: f32,
-    pad0: f32,
-    pad1: f32,
+    wet_line: f32,
+    wet_band: f32,
     pad2: f32,
 }}
 @group(1) @binding(3) var<uniform> mat: Material;
@@ -917,7 +1012,31 @@ struct SampleFrame {{
     minor_ddy: vec2<f32>,
     blend: f32,
     biplanar: f32,
+    // THE DETAIL MAPS' PROJECTION: normal, roughness, occlusion and macro.
+    // Top-down on gentle ground, as they always were; on steep ground the
+    // colour's MAJOR plane, the one the face looks along. Read top-down, a
+    // cliff took one texel row of each down its whole height -- the vertical
+    // streaks a near-vertical face showed (2026-10-08, the headland). One
+    // fetch either way, so the change costs selects and no taps; only the
+    // colour blends the minor plane in.
+    detail_uv: vec2<f32>,
+    detail_ddx: vec2<f32>,
+    detail_ddy: vec2<f32>,
+    detail_axis: u32,
+    // The macro variation, read once here (it steers the warp below).
+    macro_value: f32,
+    minor_axis: u32,
 }}
+
+// How far, in metres, the macro variation shifts the side planes' uvs on a
+// cliff: enough that one tile of rock never lines up with the next the same
+// way, so a long face stops showing its normal map's repeat as rows of the
+// same chevron (2026-10-08). Low frequency, so no texel is stretched.
+const CLIFF_WARP_M: f32 = 2.5;
+// The band warp: how far a face's stripes are bent, and over what distance
+// the bend changes (the macro map at this repeat).
+const CLIFF_BAND_WARP_M: f32 = 3.0;
+const CLIFF_BAND_SCALE_M: f32 = 7.0;
 
 fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> SampleFrame {{
     var f: SampleFrame;
@@ -935,6 +1054,30 @@ fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> SampleFrame {
     f.minor_ddy = dpdy(b.uv_minor);
     f.blend     = b.w;
     f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);
+    let steep = slope_deg >= mat.biplanar_start_deg;
+    f.detail_uv   = select(f.planar_uv, f.major_uv, steep);
+    f.detail_ddx  = select(f.planar_ddx, f.major_ddx, steep);
+    f.detail_ddy  = select(f.planar_ddy, f.major_ddy, steep);
+    f.detail_axis = select(1u, b.axis_major, steep);
+    f.minor_axis  = b.axis_minor;
+    let mr = max(mat.macro_repeat, 0.001);
+    f.macro_value = textureSampleGrad(macro_tex, layer_samp, f.detail_uv / mr, f.detail_ddx / mr, f.detail_ddy / mr).r;
+    var warp = select(vec2<f32>(0.0), vec2<f32>(f.macro_value - 0.5, 0.4 - 0.8 * f.macro_value) * CLIFF_WARP_M, steep);
+    // THE BANDS. The rock map is a scan of bedded rock, so it carries level
+    // stripes, and tiled every 2 m up a 13 m face they read as strata laid
+    // at an even pitch -- the "made" look from the beach (2026-10-08). The
+    // macro map read again at a few metres' scale bends the face's v by up
+    // to a metre and a half, so the stripes wander, thicken and thin along
+    // the face instead of running level at one pitch. Steep faces only, so
+    // its fetch is skipped on the ground.
+    if (steep) {{
+        let ms = 1.0 / CLIFF_BAND_SCALE_M;
+        let m2 = textureSampleGrad(macro_tex, layer_samp, f.detail_uv * ms + vec2<f32>(0.31, 0.57), f.detail_ddx * ms, f.detail_ddy * ms).r;
+        warp = warp + vec2<f32>(0.35, 1.0) * (m2 - 0.5) * CLIFF_BAND_WARP_M;
+    }}
+    f.major_uv  = f.major_uv + warp;
+    f.minor_uv  = f.minor_uv + warp;
+    f.detail_uv = f.detail_uv + warp;
     return f;
 }}
 
@@ -946,9 +1089,20 @@ fn layer_colour_at(layer: i32, f: SampleFrame) -> vec3<f32> {{
             f.planar_ddx / r, f.planar_ddy / r,
         ).rgb;
     }}
-    let c_major = textureSampleGrad(
-        layer_tex, layer_samp, f.major_uv / r, layer, f.major_ddx / r, f.major_ddy / r,
-    ).rgb;
+    // TWO SCALES ON THE FACE THE CLIFF LOOKS ALONG, as for the normal: the
+    // rock scan's level stripes, tiled every 2 m, read as strata at one even
+    // pitch from the beach. A second read 2.3x larger and tilted 37 degrees
+    // puts a second, unrelated pitch over the first, so no period shows.
+    let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
+    let s2 = 1.0 / (r * 2.3);
+    let c_major = mix(
+        textureSampleGrad(layer_tex, layer_samp, f.major_uv / r, layer, f.major_ddx / r, f.major_ddy / r).rgb,
+        textureSampleGrad(
+            layer_tex, layer_samp, rot * f.major_uv * s2 + vec2<f32>(0.37, 0.11), layer,
+            rot * f.major_ddx * s2, rot * f.major_ddy * s2,
+        ).rgb,
+        0.3 + 0.3 * f.macro_value,
+    );
     let c_minor = textureSampleGrad(
         layer_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r,
     ).rgb;
@@ -964,21 +1118,21 @@ fn layer_colour_at(layer: i32, f: SampleFrame) -> vec3<f32> {{
 fn layer_rough_at(layer: i32, f: SampleFrame) -> f32 {{
     let r = max(mat.repeat[layer], 0.001);
     return textureSampleGrad(
-        rough_tex, layer_samp, f.planar_uv / r, layer, f.planar_ddx / r, f.planar_ddy / r,
+        rough_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r,
     ).r;
 }}
 
 fn layer_ao_at(layer: i32, f: SampleFrame) -> f32 {{
     let r = max(mat.repeat[layer], 0.001);
     return textureSampleGrad(
-        ao_tex, layer_samp, f.planar_uv / r, layer, f.planar_ddx / r, f.planar_ddy / r,
+        ao_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r,
     ).r;
 }}
 
 fn layer_normal_at(layer: i32, n: vec3<f32>, f: SampleFrame) -> vec3<f32> {{
     let r = max(mat.repeat[layer], 0.001);
     let packed = textureSampleGrad(
-        normal_tex, layer_samp, f.planar_uv / r, layer, f.planar_ddx / r, f.planar_ddy / r,
+        normal_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r,
     ).rgb;
 
     // Identical to `layer_normal` above, which stays for the planar path used
@@ -999,8 +1153,47 @@ fn layer_normal_at(layer: i32, n: vec3<f32>, f: SampleFrame) -> vec3<f32> {{
     // variance. Nothing is lost by handing both back.
     var tn = packed * 2.0 - 1.0;
     tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
+    // A side plane (a cliff's) is folded in where its axes are -- the
+    // world's -- and turned back into the player's frame; the top plane keeps
+    // the bend it always had, so gentle ground shades exactly as before.
+    if (f.detail_axis != 1u) {{
+        // TWO SCALES ON A CLIFF. One normal map tiled down a long face showed
+        // its repeat as rows of the same chevron. A second read, 2.3x larger
+        // and turned 37 degrees, is mixed in: the two periods never line up,
+        // so the sum does not repeat within any face we have. Its bumps are
+        // turned back into the first read's axes before the mix, and the mix
+        // (which averages two unrelated patterns, so comes out short) is
+        // given back its strength. Steep faces only.
+        let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
+        let s2 = 1.0 / (r * 2.3);
+        let p2 = textureSampleGrad(
+            normal_tex, layer_samp, rot * f.detail_uv * s2 + vec2<f32>(0.37, 0.11), layer,
+            rot * f.detail_ddx * s2, rot * f.detail_ddy * s2,
+        ).rgb;
+        var t2 = p2 * 2.0 - 1.0;
+        t2 = vec3<f32>(transpose(rot) * (t2.xy * mat.normal_strength), t2.z);
+        let k = 0.3 + 0.3 * f.macro_value;
+        tn = vec3<f32>(mix(tn.xy, t2.xy, k) * 1.3, mix(tn.z, t2.z, k));
+        let nw = to_world_direction(n);
+        var bent = whiteout(f.detail_axis, tn, nw);
+        // NEAR THE SWITCH between two side planes (a face turning through
+        // 45 degrees in plan), the minor plane's normal is blended in over a
+        // short band, so the bumps do not change direction along a line.
+        // Its fetch is taken only inside that band.
+        let w_major = 0.5 + 0.5 * smoothstep(0.5, 0.62, f.blend);
+        if (w_major < 0.999 && f.biplanar > 0.5) {{
+            let pm = textureSampleGrad(
+                normal_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r,
+            ).rgb;
+            var tm = pm * 2.0 - 1.0;
+            tm = vec3<f32>(tm.xy * mat.normal_strength, tm.z);
+            bent = bent * w_major + whiteout(f.minor_axis, tm, nw) * (1.0 - w_major);
+        }}
+        return to_player_direction(bent);
+    }}
     return whiteout(1u, world_planar_bend(tn), n);
 }}
+
 
 // Below this a layer changes the result by less than one 8-bit step, so
 // sampling it buys nothing but bandwidth. Not renormalised afterwards:
@@ -1111,8 +1304,12 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
 
     // Macro variation: one low-frequency sample, centred on 1 so it darkens and
     // lightens rather than only darkening.
-    let m = textureSample(macro_tex, layer_samp, in.tex_pos.xz / max(mat.macro_repeat, 0.001)).r;
+    // Along the face on a cliff, as the detail maps are: read in `sample_frame`.
+    let m = f.macro_value;
     albedo = albedo * (1.0 + (m - 0.5) * 2.0 * mat.macro_strength);
+    // WET SAND where the sea's wash reaches: water in its pores darkens it to
+    // about half, damp fading out above.
+    albedo = albedo * (1.0 - 0.45 * (1.0 - smoothstep(mat.wet_line, mat.wet_line + mat.wet_band, in.tex_pos.y)));
 
     // Vertex colour survives as a tint, so the editor can still mark up ground
     // per-vertex without a second pipeline.

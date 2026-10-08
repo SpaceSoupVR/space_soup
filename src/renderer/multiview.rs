@@ -267,6 +267,14 @@ mod tests {
             &wgpu::BindGroupLayout,
             u32,
         ) -> BrushSealPipeline = BrushSealPipeline::new_stereo;
+        let _: fn(
+            &wgpu::Device,
+            wgpu::TextureFormat,
+            &wgpu::BindGroupLayout,
+            &wgpu::BindGroupLayout,
+            &wgpu::BindGroupLayout,
+            u32,
+        ) -> crate::renderer::effects::EffectsPipeline = crate::renderer::effects::EffectsPipeline::new_multisampled_stereo;
     }
 
     /// EVERY SHADER THE SCENE PASS DRAWS WITH MUST SURVIVE THE TRANSFORM.
@@ -283,7 +291,7 @@ mod tests {
     #[test]
     fn every_scene_shader_survives_the_multiview_transform() {
         use crate::renderer::{
-            brush_pipeline, glare, layered_mesh_pipeline, mesh_pipeline, particle, pipeline, sky,
+            brush_pipeline, effects, glare, layered_mesh_pipeline, mesh_pipeline, particle, pipeline, sky,
             terrain_pipeline, water_pipeline,
         };
         let shaders: Vec<(&str, String)> = vec![
@@ -300,6 +308,7 @@ mod tests {
             ("sky", sky::sky_shader_src()),
             ("particle", particle::particle_shader()),
             ("glare", glare::glare_shader()),
+            ("effects", effects::effects_shader()),
         ];
         let mut broken = Vec::new();
         for (name, src) in &shaders {

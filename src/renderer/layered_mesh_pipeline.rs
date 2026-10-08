@@ -60,11 +60,25 @@ pub struct LayeredVertex {
     pub normal: [f32; 3],
     /// Blend weights over the four material layers, from the glTF `COLOR_0`.
     pub weights: [f32; 4],
+    /// What the editor measured on the rock, from the glTF `COLOR_1`, else
+    /// `[1, 0, 0, 1]`: red, how much of the sky this point sees (scales the
+    /// live ambient -- without it the back of a tunnel was lit by the whole
+    /// sky); green, soot from a fire below; blue, the wet band a sea leaves at
+    /// a mouth; alpha, the static sun the bake marched through the hill.
+    /// See the editor's caveSky.js.
+    pub aux: [f32; 4],
+    /// The cave's COPY OF THE GROUND round a mouth: xy, where the vertex lies
+    /// on the terrain's maps (its footprint uv, glTF `TEXCOORD_0`); z, how
+    /// much of it is that copy (`TEXCOORD_1.x`, 0 on carved rock). Such a
+    /// fragment takes its layers from the terrain's splat and its sky and sun
+    /// from the terrain's baked ground map, so the join reads as one surface.
+    /// Zero for a cave baked before it existed: rock throughout, as before.
+    pub ground: [f32; 4],
 }
 
 impl LayeredVertex {
-    pub const ATTRIBS: [VertexAttribute; 3] =
-        vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
+    pub const ATTRIBS: [VertexAttribute; 5] =
+        vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4];
 
     pub fn layout() -> VertexBufferLayout<'static> {
         VertexBufferLayout {
@@ -146,11 +160,21 @@ impl LayeredMeshPipeline {
         // what lets a cave reuse a `mesh_pipeline::ModelUniform` bind group:
         // wgpu treats identical layout descriptors as compatible, so the two
         // paths do not need to agree about who owns the layout.
+        //
+        // IDENTICAL MEANS FLAGS INCLUDED: it MUST match `mesh_model_bgl` in
+        // mesh_pipeline.rs exactly (see the same note on `shadow_model_bgl`
+        // in shadow.rs). When the mesh layout gained FRAGMENT and this one
+        // stayed VERTEX, the two stopped deduping: every cave draw on the
+        // headset was a validation error that invalidated the whole
+        // `ssr_scene` submit (2026-10-08). This shader's fragment stage does
+        // not read the uniform, so FRAGMENT is redundant to it and
+        // load-bearing anyway. `cave_draws_with_a_mesh_model_bind_group`
+        // holds it.
         let model_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("layered_mesh_model_bgl"),
             entries: &[BindGroupLayoutEntry {
                 binding: 0,
-                visibility: ShaderStages::VERTEX,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                 ty: BindingType::Buffer {
                     ty: BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -259,12 +283,17 @@ struct Material {{
     biplanar_start_deg: f32,
     use_splat: f32,
     normal_strength: f32,
-    pad0: f32,
-    pad1: f32,
+    wet_line: f32,
+    wet_band: f32,
     pad2: f32,
 }}
 @group(1) @binding(3) var<uniform> mat: Material;
+// The terrain's splat and baked ground map, for the cave's copy of the ground
+// round a mouth (`VIn.ground`): read as the terrain reads them.
+@group(1) @binding(4) var splat_tex: texture_2d<f32>;
 @group(1) @binding(5) var normal_tex: texture_2d_array<f32>;
+@group(1) @binding(6) var sky_occ_tex: texture_2d_array<f32>;
+@group(1) @binding(7) var rough_tex: texture_2d_array<f32>;
 
 struct ModelUniform {{ model: mat4x4<f32> }}
 @group(2) @binding(0) var<uniform> model_u: ModelUniform;
@@ -277,6 +306,8 @@ struct VIn {{
     @location(0) pos: vec3<f32>,
     @location(1) norm: vec3<f32>,
     @location(2) weights: vec4<f32>,
+    @location(3) aux: vec4<f32>,
+    @location(4) ground: vec4<f32>,
 }}
 
 struct VOut {{
@@ -287,6 +318,8 @@ struct VOut {{
     @location(2) weights: vec4<f32>,
     // The same point in the WORLD: where the rock's textures are read.
     @location(3) tex_pos: vec3<f32>,
+    @location(4) aux: vec4<f32>,
+    @location(5) ground: vec4<f32>,
 }}
 
 @vertex fn vs_main(v: VIn) -> VOut {{
@@ -297,6 +330,8 @@ struct VOut {{
     out.world_pos = world.xyz;
     out.weights   = v.weights;
     out.tex_pos   = to_world_space(world.xyz);
+    out.aux       = v.aux;
+    out.ground    = v.ground;
     return out;
 }}
 
@@ -400,7 +435,13 @@ fn repeat_of(layer: i32) -> f32 {{
     // on either side of it are the same.
     let nw = to_world_direction(n);
 
-    let t = top_two(in.weights);
+    // THE GROUND COPY takes the terrain's own layers: its splat, normalised as
+    // the terrain normalises it. Read unconditionally (a texture read under
+    // a branch on a varying would lose its derivatives) and blended in.
+    let gb = clamp(in.ground.z, 0.0, 1.0);
+    let splat_raw = textureSample(splat_tex, layer_samp, in.ground.xy);
+    let splat_w = splat_raw / max(splat_raw.r + splat_raw.g + splat_raw.b + splat_raw.a, 0.001);
+    let t = top_two(mix(in.weights, splat_w, gb));
     let ba = biplanar_axes(in.tex_pos, nw, repeat_of(t.a));
     let bb = biplanar_axes(in.tex_pos, nw, repeat_of(t.b));
 
@@ -415,15 +456,93 @@ fn repeat_of(layer: i32) -> f32 {{
     // height, which is the one place the variation would do nothing at all.
     let mb = biplanar_axes(in.tex_pos, nw, mat.macro_repeat);
     let m = textureSample(macro_tex, layer_samp, mb.uv_major).r;
-    let albedo = albedo_raw * (1.0 + (m - 0.5) * 2.0 * mat.macro_strength);
+    var albedo = albedo_raw * (1.0 + (m - 0.5) * 2.0 * mat.macro_strength);
 
-    let lit = shade(in.world_pos, shaded_n);
-    return vec4<f32>(tonemap(albedo * lit), 1.0);
+    // DAMP ROCK. Deep in, where little sky reaches and air is still, rock is
+    // wet: darker, and more so toward the floor where water collects. The
+    // sky term is the measure of "deep in" (1 in the open, toward 0 inside),
+    // and the normal's facing tells floor from roof. At most a third darker,
+    // nothing in the open.
+    // A wall in the open sees half the sky (the other half is ground), so the
+    // damp starts below that: rock round a mouth stays the cliff's colour.
+    // The ground copy's sky is the terrain's baked one (the ground map's red).
+    let ground_map = textureSample(sky_occ_tex, layer_samp, in.ground.xy, 0);
+    let sky = mix(clamp(in.aux.x, 0.0, 1.0), ground_map.r, gb);
+    let deep = 1.0 - smoothstep(0.08, 0.4, sky);
+    let floorward = 0.6 + 0.4 * clamp(nw.y, 0.0, 1.0);
+    albedo = albedo * (1.0 - 0.33 * deep * floorward);
+    // THE TIDE BAND at a sea mouth: rock below the splash line, wet and
+    // crusted dark olive-black (the Verrucaria band over barnacles), broken
+    // up by the macro texture so its upper edge is ragged, not ruled.
+    let wet = clamp(in.aux.z * (0.75 + 0.5 * m), 0.0, 1.0);
+    albedo = mix(albedo, albedo * vec3<f32>(0.30, 0.33, 0.27), 0.85 * wet);
+    // SOOT on the roof over a hearth.
+    albedo = albedo * (1.0 - 0.8 * clamp(in.aux.y, 0.0, 1.0));
+    // WET SAND where the sea's wash reaches, exactly as the terrain darkens
+    // it, on the floors the wash runs over.
+    let washed = 1.0 - smoothstep(mat.wet_line, mat.wet_line + mat.wet_band, in.tex_pos.y);
+    albedo = albedo * (1.0 - 0.45 * washed * smoothstep(0.5, 0.8, nw.y));
+
+    // NO SUN WHERE NO SKY. A cave is one sheet of rock with nothing behind
+    // it, so the sun's map can leak a band of light where a wall meets the
+    // floor right under it -- inside a hill, where no sun reaches. A point
+    // that sees no sky cannot see the sun either, so the map's answer is
+    // gated by the measured sky (COLOR_1): untouched wherever the mouth
+    // shows any of the sky, and dark where it shows none.
+    var sun_map = 1.0;
+    if (camera.shadow_params.x > 0.5) {{
+        sun_map = pcf(sun_shadow_tex, in.world_pos, camera.sun_view_proj);
+    }}
+    // COLOR_1's alpha is the static sun the bake marched through the hill
+    // (caveSky.sunVisibility): the hill's own shadow, which the terrain round
+    // the cave takes from its baked map and the live map need not hold. The
+    // darker of the two answers, so neither doubles the other.
+    let cave_sun = smoothstep(0.01, 0.08, sky) * min(sun_map, clamp(in.aux.w, 0.0, 1.0));
+    // The ground copy's sun is the terrain's baked shadow, rebuilt as the
+    // terrain rebuilds it (a signed distance in green, the penumbra in blue,
+    // alpha 0 when baked); a map baked before that leaves it on the live map.
+    let ground_sun_d = (ground_map.g - 0.5) * (2.0 * {sun_range:?});
+    let ground_sun_w = max(max(ground_map.b * {sun_range:?}, 0.5 * fwidth(ground_sun_d)), 0.02);
+    let ground_sun = select(sun_map, smoothstep(-ground_sun_w, ground_sun_w, ground_sun_d), ground_map.a < 0.5);
+    receiver_sun_mask = mix(cave_sun, ground_sun, gb);
+
+    var lit = shade_with_sky(in.world_pos, shaded_n, sky);
+    // THE GROUND'S BOUNCE. The terrain and the brushes carry their bounce in
+    // baked maps; the cave is lit live and had none, so a rock face in the
+    // open read near-black beside the baked cliff it grows out of. What a
+    // face sees below the horizon is ground lit by the same sky: the sky's
+    // downward-facing light times a ground albedo, over the share of the
+    // hemisphere that looks down, and only where the rock is in the open
+    // (deep in, the floor that would bounce is itself dark).
+    let up_p = to_player_direction(vec3<f32>(0.0, 1.0, 0.0));
+    let downward = 0.5 - 0.5 * clamp(nw.y, -1.0, 1.0);
+    lit = lit + sky_irradiance(up_p) * (GROUND_ALBEDO * downward * smoothstep(0.1, 0.45, sky) * (1.0 - gb));
+    var colour = albedo * lit;
+    // THE GROUND COPY THROUGH THE GROUND'S OWN SHADING PATH: the terrain is
+    // shaded by `shade_material_env` (Fresnel, the probes' environment), and
+    // the sky term alone left the copy about a third darker than the sand it
+    // continues -- an outline of opened cells in every shadow. Taken only
+    // where the copy is, so the rock keeps its own path.
+    let ground_rough = textureSample(rough_tex, layer_samp, in.tex_pos.xz / max(repeat_of(t.a), 0.001), t.a).r;
+    // THE FLOOR TOO: sand carried in from the beach is the same sand, so a
+    // floor is shaded as the ground is and darkens only by what it measures
+    // -- less sky, the sun's shadow, the damp -- not by changing shading
+    // model at the drip line, which drew a grey strip across every mouth.
+    let as_ground_w = max(gb, smoothstep(0.6, 0.85, nw.y));
+    if (as_ground_w > 0.0) {{
+        let as_ground = shade_material_env(
+            in.world_pos, shaded_n, ground_rough, 1.0, sky,
+            vec3<f32>(0.0), vec4<f32>(0.5, 0.5, 0.5, 0.0), albedo, in.world_pos, n,
+        );
+        colour = mix(colour, as_ground, as_ground_w);
+    }}
+    return vec4<f32>(tonemap(colour), 1.0);
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
         biplanar_block = wgsl_biplanar_block(),
         whiteout_block = wgsl_whiteout_block(),
+        sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
     )
 }
 
@@ -487,6 +606,9 @@ mod tests {
 
     /// What a render asks for. Grouped rather than passed as eight positional
     /// arguments, which is how a harness ends up with call sites nobody can read.
+    /// Steep enough to be shaded as rock rather than as a floor (ny < 0.6).
+    const WALLISH: [f32; 3] = [0.0, 0.55, 0.835];
+
     struct Shot {
         normal: [f32; 3],
         weights: [f32; 4],
@@ -630,6 +752,8 @@ mod tests {
             position: p,
             normal: shot.normal,
             weights: shot.weights,
+            aux: [1.0, 0.0, 0.0, 1.0],
+            ground: [0.0; 4],
         };
         let verts = [
             v([-1.0, -1.0, 0.5]),
@@ -805,7 +929,9 @@ mod tests {
     fn two_layers_blend_rather_than_switching() {
         // A hard switch between materials reads as a painted-on seam. Red and
         // green at equal weight must produce both channels.
-        let px = shot!(Shot { weights: [0.5, 0.0, 0.5, 0.0], ..Default::default() });
+        // On a WALL: a floor is shaded through the ground's path, whose
+        // untinted specular would put every channel in (`fs_main`).
+        let px = shot!(Shot { weights: [0.5, 0.0, 0.5, 0.0], normal: WALLISH, ..Default::default() });
         assert!(px[0] > 8, "layer 0 vanished from the blend: {px:?}");
         assert!(px[1] > 8, "layer 2 vanished from the blend: {px:?}");
         assert!(px[2] < 8, "layer 1 was never weighted, but is present: {px:?}");
@@ -839,7 +965,7 @@ mod tests {
         // The documented trade, asserted rather than left as a comment: a third
         // layer at low weight is dropped, not faded. Layer 2 is the only green
         // one, so its absence is readable in a single channel.
-        let px = shot!(Shot { weights: [0.5, 0.4, 0.1, 0.0], ..Default::default() });
+        let px = shot!(Shot { weights: [0.5, 0.4, 0.1, 0.0], normal: WALLISH, ..Default::default() });
         assert!(px[0] > 8, "layer 0 should be present: {px:?}");
         assert!(px[2] > 8, "layer 1 should be present: {px:?}");
         assert_eq!(px[1], 0, "the third layer was sampled after all: {px:?}");
@@ -1004,7 +1130,21 @@ mod tests {
         view_proj: glam::Mat4,
         size: u32,
     ) -> Option<Vec<[u8; 4]>> {
+        render_geometry_with(verts, indices, view_proj, size, false).map(|(img, _)| img)
+    }
+
+    /// `render_geometry`, optionally binding the model uniform the way the
+    /// game does -- a `MeshPipeline` ModelUniform, not this pipeline's own --
+    /// and returning any validation error the draw raised.
+    fn render_geometry_with(
+        verts: &[LayeredVertex],
+        indices: &[u32],
+        view_proj: glam::Mat4,
+        size: u32,
+        mesh_model: bool,
+    ) -> Option<(Vec<[u8; 4]>, Option<String>)> {
         let (device, queue) = terrain_pipeline::tests::headless_gpu()?;
+        let scope = device.push_error_scope(ErrorFilter::Validation);
         let format = TextureFormat::Rgba8Unorm;
 
         let lights = LightsUniform::new(&device);
@@ -1033,7 +1173,12 @@ mod tests {
             &[],
             TerrainMaterialUniform { macro_strength: 0.0, ..Default::default() },
         );
-        let model = pipeline.create_model_uniform(&device);
+        let model = if mesh_model {
+            crate::renderer::mesh_pipeline::MeshPipeline::new(&device, format, &uniforms.layout)
+                .create_model_uniform(&device)
+        } else {
+            pipeline.create_model_uniform(&device)
+        };
         model.upload(&queue, glam::Mat4::IDENTITY);
 
         let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1123,7 +1268,12 @@ mod tests {
             },
             Extent3d { width: size, height: size, depth_or_array_layers: 1 },
         );
-        queue.submit(Some(encoder.finish()));
+        let finished = encoder.finish();
+        let error = pollster::block_on(scope.pop()).map(|e| e.to_string());
+        if error.is_some() {
+            return Some((Vec::new(), error));
+        }
+        queue.submit(Some(finished));
 
         let slice = readback.slice(..);
         slice.map_async(MapMode::Read, |_| {});
@@ -1136,7 +1286,40 @@ mod tests {
                 out.push([data[at], data[at + 1], data[at + 2], data[at + 3]]);
             }
         }
-        Some(out)
+        Some((out, None))
+    }
+
+    #[test]
+    fn cave_draws_with_a_mesh_model_bind_group() {
+        // THE GAME'S BINDING, NOT THE TEST'S. A cave is drawn with a
+        // `MeshPipeline` ModelUniform, and that works only while this
+        // pipeline's model layout dedups with the mesh one -- flags
+        // included. When the mesh layout gained FRAGMENT and this stayed
+        // VERTEX, every cave draw on the headset was a validation error
+        // ("Entries with binding 0 differ in visibility") that threw away
+        // the whole `ssr_scene` submit (2026-10-08). The other tests bind
+        // this pipeline's own uniform, so they could not see it.
+        let w = |n: [f32; 3], p: [f32; 3]| LayeredVertex {
+            position: p,
+            normal: n,
+            weights: [1.0, 0.0, 0.0, 0.0],
+            aux: [1.0, 0.0, 0.0, 1.0],
+            ground: [0.0; 4],
+        };
+        let up = [0.0, 0.0, -1.0];
+        let verts = [
+            w(up, [-1.0, -1.0, 0.5]), w(up, [3.0, -1.0, 0.5]), w(up, [-1.0, 3.0, 0.5]),
+        ];
+        let Some((img, error)) =
+            render_geometry_with(&verts, &[0, 1, 2], glam::Mat4::IDENTITY, 8, true)
+        else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        if let Some(e) = error {
+            panic!("the cave's draw with a mesh ModelUniform failed validation: {e}");
+        }
+        assert!(img.iter().any(|p| p[0] > 0 || p[1] > 0 || p[2] > 0), "the draw produced nothing");
     }
 
     #[test]
