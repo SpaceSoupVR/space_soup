@@ -642,6 +642,9 @@ pub struct XrRenderer {
     /// frame, as `set_effects` hands them over; simulated, lit and drawn each
     /// frame after the glass. See `effects`.
     effect_emitters: Vec<crate::renderer::effects::EffectEmitter>,
+    /// Until when (display seconds) each emitter counts as seen: the last
+    /// frame either eye saw it plus `effects::EMITTER_HOLD`. Index for index.
+    effect_seen_until: Vec<f64>,
     /// SPLASHES the client saw, born on the water's clock (`set_water_time`),
     /// kept while their drops fly or their rings spread. See `add_splash`.
     splashes: Vec<crate::renderer::effects::Splash>,
@@ -1740,6 +1743,7 @@ impl XrRenderer {
             glare_sources: Vec::new(),
             glare_capsules: Vec::new(),
             effect_emitters: Vec::new(),
+            effect_seen_until: Vec::new(),
             splashes: Vec::new(),
             effects_layout,
             effects_pipeline,
@@ -2819,6 +2823,7 @@ impl XrRenderer {
         }
         log::info!("EFFECTS {} emitters", emitters.len());
         self.effect_emitters = emitters;
+        self.effect_seen_until.clear();
     }
 
     /// The characters as capsules for this frame, nearest first, in the

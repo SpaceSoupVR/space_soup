@@ -21,7 +21,7 @@
 
 use glam::{Quat, Vec3};
 
-use crate::renderer::uniforms::ProbePortal;
+use crate::renderer::uniforms::{ProbePortal, ProbeProxy};
 
 /// One door leaf this frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,6 +32,9 @@ pub struct DoorView {
     pub closed_centre: Vec3,
     /// Within `space_soup_engine::door::SHUT_DEG` of closed.
     pub shut: bool,
+    /// The leaf's rotation now, and closed, world.
+    pub rotation: Quat,
+    pub closed_rotation: Quat,
 }
 
 impl DoorView {
@@ -91,6 +94,26 @@ pub fn light_point(doors: &[DoorView], centre: Vec3, eye: Vec3) -> Vec3 {
     centre + normal * (side * LIGHT_READ_OUT)
 }
 
+/// THE DOORS' REFLECTION PROXIES AS THE LEAVES HANG NOW: `rest` with each
+/// door's proxies (`space_soup_engine::reflection_proxy::door_proxies`, a
+/// model's box at the leaf's closed pose) turned about the hinge with their
+/// leaf. A proxy is a door's when its centre is the door's closed centre.
+/// Everything else is as it was.
+pub fn posed_proxies(rest: &[ProbeProxy], doors: &[DoorView]) -> Vec<ProbeProxy> {
+    rest.iter()
+        .map(|p| {
+            let mut p = *p;
+            if let Some(d) = doors.iter().find(|d| !p.solid && (p.centre - d.closed_centre).length() < 0.05) {
+                let turn = d.rotation * d.closed_rotation.inverse();
+                let now = d.corners.iter().sum::<Vec3>() / 8.0;
+                p.centre = now + turn * (p.centre - d.closed_centre);
+                p.rotation = (turn * p.rotation).normalize();
+            }
+            p
+        })
+        .collect()
+}
+
 /// The doorways portal culling may walk through: every one but the shut.
 pub fn open_portals(portals: &[ProbePortal], shut: &[bool]) -> Vec<ProbePortal> {
     portals.iter().zip(shut.iter().chain(std::iter::repeat(&false))).filter(|(_, s)| !**s).map(|(p, _)| *p).collect()
@@ -112,7 +135,7 @@ mod tests {
     }
 
     fn leaf(z: f32, shut: bool) -> DoorView {
-        DoorView { corners: [Vec3::ZERO; 8], closed_centre: Vec3::new(2.85, 1.1, z), shut }
+        DoorView { corners: [Vec3::ZERO; 8], closed_centre: Vec3::new(2.85, 1.1, z), shut, rotation: Quat::IDENTITY, closed_rotation: Quat::IDENTITY }
     }
 
     #[test]
@@ -152,13 +175,44 @@ mod tests {
                     if i & 4 == 0 { -half.z } else { half.z },
                 )
         });
-        let d = [DoorView { corners, closed_centre: centre, shut: true }];
+        let d = [DoorView { corners, closed_centre: centre, shut: true, rotation: Quat::IDENTITY, closed_rotation: Quat::IDENTITY }];
         let hall = light_point(&d, centre, Vec3::new(-1.0, 1.6, -3.0));
         assert!((hall - (centre - Vec3::X * LIGHT_READ_OUT)).length() < 1e-5, "{hall}");
         let hallway = light_point(&d, centre, Vec3::new(6.0, 1.6, -3.0));
         assert!((hallway - (centre + Vec3::X * LIGHT_READ_OUT)).length() < 1e-5, "{hallway}");
         let elsewhere = Vec3::new(0.0, 1.0, 0.0);
         assert_eq!(light_point(&d, elsewhere, Vec3::ZERO), elsewhere);
+    }
+
+    /// A door's proxy turns with its leaf about the hinge; anything else
+    /// stays put.
+    #[test]
+    fn a_doors_reflection_proxy_turns_with_its_leaf() {
+        let closed = Vec3::new(2.85, 1.1, -3.39);
+        let hinge = Vec3::new(2.85, 1.1, -3.77);
+        let turn = Quat::from_rotation_y(0.5);
+        let now = hinge + turn * (closed - hinge);
+        let leaf = DoorView {
+            corners: [now; 8],
+            closed_centre: closed,
+            shut: false,
+            rotation: turn,
+            closed_rotation: Quat::IDENTITY,
+        };
+        let proxy = ProbeProxy {
+            centre: closed,
+            half_size: Vec3::new(0.02, 1.09, 0.38),
+            rotation: Quat::IDENTITY,
+            volume: 1,
+            solid: false,
+            field: Some(2),
+            cards: None,
+        };
+        let pillar = ProbeProxy { centre: Vec3::new(0.0, 1.5, -6.0), solid: true, field: None, ..proxy };
+        let posed = posed_proxies(&[proxy, pillar], &[leaf]);
+        assert!((posed[0].centre - now).length() < 1e-5, "{}", posed[0].centre);
+        assert!(posed[0].rotation.angle_between(turn) < 1e-5);
+        assert_eq!(posed[1], pillar);
     }
 
     /// PORTAL CULLING WITH A DOOR: from the hallway (closed) looking back

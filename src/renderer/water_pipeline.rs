@@ -88,6 +88,40 @@ const SWASH_LEAD: f32 = 0.45;
 /// breaker was a white line on a flat surface.
 const BREAKER_PER_SWASH: f32 = 1.8;
 const BREAK_RATIO: f32 = 0.78;
+/// THE BREAKERS IN SETS, NOT ONE LINE (user, Checkpoint 51: "the big wave
+/// coming in shore seems ... too connected all the way across the water").
+/// Where a breaker arrives along the shore wanders by up to about a third of
+/// a period -- three incommensurate along-shore waves, each drifting by whole
+/// turns of the loop -- so the crest curves, its break point travels along it
+/// (peels), and neighbouring sections break at different moments.
+/// `(k x, k z, share of a period, offset, turns a loop)`.
+const SWASH_ALONG: [(f32, f32, f32, f32, f32); 3] =
+    [(0.047, 0.031, 0.14, 0.0, 1.0), (-0.083, 0.059, 0.09, 1.7, -2.0), (0.151, -0.112, 0.08, 4.1, 3.0)];
+/// Its height by the wave: sets of bigger waves and lulls between (whole
+/// turns over the loop's waves), times sections of the shore some 25-30 m
+/// long that run bigger or smaller, drifting. The biggest are the breaker as
+/// it was; the least break nowhere.
+const SWASH_SET_TURNS: f32 = 4.0;
+const SWASH_SECTION: (f32, f32, f32, f32) = (0.21, -0.13, -0.11, 0.17);
+/// Swashes a loop of the waves' clock (240 s / `SWASH_PERIOD`).
+fn swashes_a_loop() -> f32 {
+    crate::renderer::water_waves::WaveParams::default().loop_seconds / SWASH_PERIOD
+}
+/// Where the breaker is (`swash_count`): its count of periods, unwrapped.
+fn swash_count(t: f32, still_depth: f32, xz: glam::Vec2) -> f32 {
+    let w0 = 2.0 * std::f32::consts::PI / crate::renderer::water_waves::WaveParams::default().loop_seconds;
+    let along: f32 = SWASH_ALONG.iter().map(|&(kx, kz, a, o, n)| a * (xz.dot(glam::Vec2::new(kx, kz)) + o + n * w0 * t).sin()).sum();
+    t / SWASH_PERIOD + still_depth * SWASH_LEAD + along
+}
+/// How big this breaker is here (`breaker_amp`), 0..1.
+fn breaker_amp(t: f32, xz: glam::Vec2, count: f32) -> f32 {
+    let w0 = 2.0 * std::f32::consts::PI / crate::renderer::water_waves::WaveParams::default().loop_seconds;
+    let set = 0.6 + 0.4 * (2.0 * std::f32::consts::PI * SWASH_SET_TURNS / swashes_a_loop() * count + 0.7).sin();
+    let (ax, az, bx, bz) = SWASH_SECTION;
+    let inner = 1.1 * (xz.dot(glam::Vec2::new(bx, bz)) + 2.0 * w0 * t).sin();
+    let section = 0.5 + 0.5 * (xz.dot(glam::Vec2::new(ax, az)) + inner + 3.0 * w0 * t).sin();
+    set * (0.45 + 0.55 * section)
+}
 const BREAKER_FRONT: f32 = 0.035;
 const BREAKER_BACK: f32 = 0.07;
 /// Metres from the eye over which a sea's skirt is raised to the eye's own
@@ -381,7 +415,7 @@ pub(crate) const WATER_CUTS: &[(&str, &[(&str, &str)])] = &[
     // The breaker's face, its slope from the phase over the bed map.
     (
         "breaker_face",
-        &[("    if (water.waves.y > 0.0 && still_depth > 0.0 && still_depth < 2.8) {\n        breaker_phase", "    if (false) {\n        breaker_phase")],
+        &[("    if (water.waves.y > 0.0 && still_depth > 0.0 && still_depth < 2.8) {\n        let breaker_count", "    if (false) {\n        let breaker_count")],
     ),
     // The swell's tilt.
     ("swell", &[("        tilt = tilt + water.air.y * smoothstep(0.15, 0.6, still_depth) * swell_at(q, water.tiles.w).yz;\n", "")]),
@@ -392,11 +426,15 @@ pub(crate) const WATER_CUTS: &[(&str, &[(&str, &str)])] = &[
     // The caustics altogether.
     ("caustics", &[("    let caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, 5.0, thickness)));", "    let caustic = 1.0;")]),
     // The breakers' and the wash's foam.
-    ("surf", &[("    if (water.waves.y > 0.0) {\n        let phase = swash_phase(still_depth, q, water.tiles.w);", "    if (false) {\n        let phase = swash_phase(still_depth, q, water.tiles.w);")]),
+    ("surf", &[("    if (water.waves.y > 0.0) {\n        let count = swash_count(still_depth, q, water.tiles.w);", "    if (false) {\n        let count = swash_count(still_depth, q, water.tiles.w);")]),
     // The walk to the drawn bed: the map's picture everywhere.
-    ("walk", &[("    if (on_map) {\n        let flat", "    if (false) {\n        let flat")]),
+    ("walk", &[("    if (on_map && bed_shows) {\n        let flat", "    if (false) {\n        let flat")]),
+    // The deep water's skip of the walk and the picture taken out: the water
+    // as it was before it.
+    ("no_deep_skip", &[("    let bed_shows = max(max(t_view.x * t_light.x, t_view.y * t_light.y), t_view.z * t_light.z) >= DEEP_SKIP
+        || smoothstep(0.0, water.scatter.w, thickness) < 1.0;", "    let bed_shows = true;")]),
     // The map's picture of the bed.
-    ("beyond", &[("    if (drawn < 1.0) {\n        beyond", "    if (false) {\n        beyond")]),
+    ("beyond", &[("    if (drawn < 1.0 && bed_shows) {\n        beyond", "    if (false) {\n        beyond")]),
     // The refracted path's second read of the bed.
     ("refract", &[("    if (has_map) {\n        let closing", "    if (false) {\n        let closing")]),
     // The reflection: the ground's trace and the probes.
@@ -534,16 +572,17 @@ pub fn swash_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
         let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     };
-    let along = 0.06 * xz.dot(glam::Vec2::new(0.071, 0.113)).sin() + 0.04 * (xz.dot(glam::Vec2::new(-0.193, 0.051)) + 1.7).sin();
-    let phase = (u.tiles[3] / u.waves[3] + still_depth * SWASH_LEAD + along).rem_euclid(1.0);
+    let count = swash_count(u.tiles[3], still_depth, xz);
+    let phase = count.rem_euclid(1.0);
+    let amp = breaker_amp(u.tiles[3], xz, count);
     let rise = smooth(0.0, 0.16, phase) * (1.0 - smooth(0.16, 0.92, phase));
     // The breaker (`breaker_height`, `breaker_profile`).
-    let grown = BREAKER_PER_SWASH * swash * (1.0 - smooth(1.2, 2.8, still_depth));
+    let grown = BREAKER_PER_SWASH * swash * amp * (1.0 - smooth(1.2, 2.8, still_depth));
     let height = grown.min(BREAK_RATIO * still_depth.max(0.0));
     let s = phase - phase.round();
     let b = s / BREAKER_BACK;
     let profile = if s > 0.0 { (1.0 + b) * (-b).exp() } else { (-(s * s) / (BREAKER_FRONT * BREAKER_FRONT)).exp() };
-    swash * (1.0 - smooth(0.3, 1.5, still_depth)) * rise + height * profile + swell_lift(u, still_depth, xz)
+    swash * (1.0 - smooth(0.3, 1.5, still_depth)) * rise * (0.5 + 0.5 * amp) + height * profile + swell_lift(u, still_depth, xz)
 }
 
 /// The swell's lift (`swell_at` in [`surface_wgsl`]) on the CPU.
@@ -577,6 +616,17 @@ fn swell_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
 /// Shared rather than copied because SpaceWarp's motion pass (`space_warp`)
 /// places this same surface at this frame and the last: the motion the
 /// compositor is told has to be the motion drawn.
+/// One turn over the waves' loop, radians a second.
+fn loop_rate() -> f32 {
+    2.0 * std::f32::consts::PI / crate::renderer::water_waves::WaveParams::default().loop_seconds
+}
+
+/// `SWASH_ALONG`'s term `i` as WGSL of `xz` and `t`.
+fn along_wgsl(i: usize) -> String {
+    let (kx, kz, a, o, n) = SWASH_ALONG[i];
+    format!("{a:?} * sin(dot(xz, vec2<f32>({kx:?}, {kz:?})) + {o:?} + {:?} * t)", n * loop_rate())
+}
+
 pub fn surface_wgsl() -> String {
     format!(
         r#"
@@ -599,9 +649,23 @@ struct WaterMat {{
 // THE SHORE'S WAVES. Each breaker rolls in toward the beach -- a point a
 // metre deeper meets it `SWASH_LEAD` of a period sooner -- and arrives a
 // little unevenly along the shore. 0 is its crest.
+// It wanders along the shore (`SWASH_ALONG`): `swash_count` is the phase
+// unwrapped, a count of periods.
+fn swash_count(still_depth: f32, xz: vec2<f32>, t: f32) -> f32 {{
+    let along = {along0} + {along1} + {along2};
+    return t / water.waves.w + still_depth * SWASH_LEAD + along;
+}}
 fn swash_phase(still_depth: f32, xz: vec2<f32>, t: f32) -> f32 {{
-    let along = 0.06 * sin(dot(xz, vec2<f32>(0.071, 0.113))) + 0.04 * sin(dot(xz, vec2<f32>(-0.193, 0.051)) + 1.7);
-    return fract(t / water.waves.w + still_depth * SWASH_LEAD + along);
+    return fract(swash_count(still_depth, xz, t));
+}}
+
+// How big this breaker is here, 0..1: sets and lulls by the wave, sections of
+// the shore bigger or smaller (`breaker_amp`).
+fn breaker_amp(xz: vec2<f32>, t: f32, count: f32) -> f32 {{
+    let sets = 0.6 + 0.4 * sin({set_rate:?} * count + 0.7);
+    let inner = 1.1 * sin(dot(xz, vec2<f32>({bx:?}, {bz:?})) + {w2:?} * t);
+    let section = 0.5 + 0.5 * sin(dot(xz, vec2<f32>({ax:?}, {az:?})) + inner + {w3:?} * t);
+    return sets * (0.45 + 0.55 * section);
 }}
 
 // Its wash: quickly up the sand, slowly back down it.
@@ -611,8 +675,8 @@ fn swash_rise(phase: f32) -> f32 {{
 
 // THE BREAKER over still water `still_depth` deep: as high as it has grown
 // shoaling in, no higher than the water there can hold.
-fn breaker_height(still_depth: f32) -> f32 {{
-    let grown = BREAKER_PER_SWASH * water.waves.y * (1.0 - smoothstep(1.2, 2.8, still_depth));
+fn breaker_height(still_depth: f32, amp: f32) -> f32 {{
+    let grown = BREAKER_PER_SWASH * water.waves.y * amp * (1.0 - smoothstep(1.2, 2.8, still_depth));
     return min(grown, BREAK_RATIO * max(still_depth, 0.0));
 }}
 
@@ -646,6 +710,16 @@ fn swell_at(xz: vec2<f32>, t: f32) -> vec3<f32> {{
 }}
 "#,
         swash_lead = format!("{SWASH_LEAD:?}"),
+        along0 = along_wgsl(0),
+        along1 = along_wgsl(1),
+        along2 = along_wgsl(2),
+        set_rate = 2.0 * std::f32::consts::PI * SWASH_SET_TURNS / swashes_a_loop(),
+        ax = SWASH_SECTION.0,
+        az = SWASH_SECTION.1,
+        bx = SWASH_SECTION.2,
+        bz = SWASH_SECTION.3,
+        w2 = 2.0 * loop_rate(),
+        w3 = 3.0 * loop_rate(),
         breaker_per_swash = format!("{BREAKER_PER_SWASH:?}"),
         break_ratio = format!("{BREAK_RATIO:?}"),
         breaker_front = format!("{BREAKER_FRONT:?}"),
@@ -684,8 +758,10 @@ fn {name}(pos: vec3<f32>, depth: f32, eye: vec3<f32>, t: f32) -> vec3<f32> {{
     }}
     if (water.waves.y > 0.0) {{
         let shore = 1.0 - smoothstep(0.3, 1.5, depth);
-        let phase = swash_phase(depth, pos.xz, t);
-        p.y = p.y + water.waves.y * shore * swash_rise(phase) + breaker_height(depth) * breaker_profile(phase);
+        let count = swash_count(depth, pos.xz, t);
+        let phase = fract(count);
+        let amp = breaker_amp(pos.xz, t, count);
+        p.y = p.y + water.waves.y * shore * swash_rise(phase) * (0.5 + 0.5 * amp) + breaker_height(depth, amp) * breaker_profile(phase);
     }}
     if (water.air.y > 0.0) {{
         p.y = p.y + water.air.y * swell_at(pos.xz, t).x * near * smoothstep(0.15, 0.6, depth);
@@ -826,6 +902,9 @@ const FOAM_TILES: f32 = {foam_tiles};
 const BED_ALBEDO: f32 = {bed_albedo};
 const RING_SPEED: f32 = {ring_speed};
 const WATER_TRACE_COARSEN: i32 = 2;
+// Under this share of the bed's light reaching the eye, the bed is not looked
+// for: half an 8-bit level of the brightest the display shows.
+const DEEP_SKIP: f32 = {deep_skip:?};
 const CAUSTIC_CONTRAST: f32 = 0.6;
 const CAUSTIC_MURK: f32 = 1.0;
 const PAWS_RATE: vec2<f32> = vec2<f32>(0.1308997, 0.0785398);
@@ -963,7 +1042,8 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     }}
     var breaker_phase = 0.0;
     if (water.waves.y > 0.0 && still_depth > 0.0 && still_depth < 2.8) {{
-        breaker_phase = swash_phase(still_depth, q, water.tiles.w);
+        let breaker_count = swash_count(still_depth, q, water.tiles.w);
+        breaker_phase = fract(breaker_count);
         let ax = p + vec3<f32>(0.5, 0.0, 0.0);
         let az = p + vec3<f32>(0.0, 0.0, 0.5);
         let px = swash_phase(surface - select(bed, bed_at(ax).w, has_map), q + vec2<f32>(0.5, 0.0), water.tiles.w);
@@ -971,7 +1051,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         let dx = px - breaker_phase;
         let dz = pz - breaker_phase;
         let across = vec2<f32>(dx - round(dx), dz - round(dz)) / 0.5;
-        tilt = tilt + breaker_height(still_depth) * breaker_profile_slope(breaker_phase) * across;
+        tilt = tilt + breaker_height(still_depth, breaker_amp(q, water.tiles.w, breaker_count)) * breaker_profile_slope(breaker_phase) * across;
     }}
     // SPLASHES' RINGS, and the foam each leaves where it struck. A ring's
     // train is gone where a pixel spans half its wavelength: further off it
@@ -1069,8 +1149,19 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     // clear colour ran across the sea along the edge, 2026-10-07). All of
     // them hand over to the map's picture, which the drawn bed only adds its
     // grain to.
+    // What reaches the eye from the bed at most -- the water's loss down to
+    // it and back -- read here, before the walk: where it is under half an
+    // 8-bit level, neither the drawn bed nor the map's picture of it can
+    // show, and the walk and the picture are skipped (`DEEP_SKIP`; 2026-10-08,
+    // the walk was 1.2 ms of the beach's water and most of the sea in view is
+    // that deep).
+    let k = water.extinction.xyz;
+    let t_view = exp(-k * path);
+    let t_light = exp(-k * (bed_depth * LIGHT_PATH));
+    let bed_shows = max(max(t_view.x * t_light.x, t_view.y * t_light.y), t_view.z * t_light.z) >= DEEP_SKIP
+        || smoothstep(0.0, water.scatter.w, thickness) < 1.0;
     var drawn = select(0.0, 1.0, !has_map);
-    if (on_map) {{
+    if (on_map && bed_shows) {{
         let flat = thickness / max(cos_i, 0.01);
         var seen = flat * OPEN_PATH;
         var walked = 0.0;
@@ -1101,9 +1192,6 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     // way down to the bed and the view's way back. What the water scatters
     // back is its own colour, lit by the sky and the sun.
     let sky_down = sky_irradiance(vec3<f32>(0.0, 1.0, 0.0));
-    let k = water.extinction.xyz;
-    let t_view = exp(-k * path);
-    let t_light = exp(-k * (bed_depth * LIGHT_PATH));
     let body = water.scatter.rgb * (sky_down + sunlight) * (vec3<f32>(1.0) - t_view);
 
     // CAUSTICS: the waves gather the sun's light on the bed under their
@@ -1147,7 +1235,8 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let caps = max(c0.w, c1.w) * shoal;
     var surf = 0.0;
     if (water.waves.y > 0.0) {{
-        let phase = swash_phase(still_depth, q, water.tiles.w);
+        let count = swash_count(still_depth, q, water.tiles.w);
+        let phase = fract(count);
         // A breaker does not break all along its length at once: patches of
         // it, drifting.
         let patchy = 0.5 + 0.5 * sin(dot(q, vec2<f32>(0.41, 0.17)) + 1.3 * sin(dot(q, vec2<f32>(-0.23, 0.37)) + water.tiles.w * 0.0785398));
@@ -1155,7 +1244,8 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         // hold: its crest spilling first, then, broken, its whole face and a
         // trail of foam left behind it. Clear green face before that.
         let s = phase - round(phase);
-        let grown = BREAKER_PER_SWASH * water.waves.y * (1.0 - smoothstep(1.2, 2.8, still_depth));
+        let amp = breaker_amp(q, water.tiles.w, count);
+        let grown = BREAKER_PER_SWASH * water.waves.y * amp * (1.0 - smoothstep(1.2, 2.8, still_depth));
         let holds = grown / max(BREAK_RATIO * still_depth, 1e-3);
         let spilling = smoothstep(0.75, 1.0, holds) * exp(-(s - 0.008) * (s - 0.008) / (0.012 * 0.012));
         let broken = smoothstep(1.0, 1.4, holds) * smoothstep(-0.02, 0.1, still_depth);
@@ -1163,7 +1253,9 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         let trail = select(0.0, exp(-s / 0.05), s > 0.0);
         let breaker = max(spilling, broken * max(face, 0.65 * trail)) * mix(0.3, 1.0, patchy);
         let wash = smoothstep(0.0, 0.04, phase) * (1.0 - smoothstep(0.08, 0.4, phase))
-            * (1.0 - smoothstep(0.0, 0.25, thickness)) * (1.0 - smoothstep(0.0, 0.6, still_depth));
+            * (1.0 - smoothstep(0.0, 0.25, thickness)) * (1.0 - smoothstep(0.0, 0.6, still_depth))
+            // a small wave's wash is a thin lace, not the big one's white band
+            * smoothstep(0.1, 0.75, amp);
         surf = max(breaker, wash) + 0.18 * patchy * (1.0 - smoothstep(0.0, 0.2, thickness));
     }}
     let froth = clamp(caps + surf + ring_foam, 0.0, 1.0);
@@ -1182,7 +1274,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     // shows the drawn one: its light, as the display has it, through the
     // water.
     var beyond = vec3<f32>(0.0);
-    if (drawn < 1.0) {{
+    if (drawn < 1.0 && bed_shows) {{
         beyond = under * tonemap(bed_at(p + refracted * path).xyz) * ((1.0 - drawn) * (1.0 - froth_cover));
     }}
     let through = under * (drawn * (1.0 - froth_cover));
@@ -1198,6 +1290,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         bed_albedo = format!("{BED_ALBEDO:?}"),
         ring_block = ring_block,
         ring_speed = format!("{RING_SPEED:?}"),
+        deep_skip = 0.5f32 / 255.0,
         ring_wavelength = format!("{RING_WAVELENGTH:?}"),
         ring_height = format!("{RING_HEIGHT:?}"),
         ring_seconds = format!("{RING_SECONDS:?}"),
@@ -1567,6 +1660,39 @@ mod tests {
     /// The waterline twin is the water's own shader with one test added
     /// before it returns: the surface drawn above the line is the surface
     /// drawn everywhere else, and the ordinary pipelines carry none of it.
+    #[test]
+    fn the_breakers_come_in_sets_and_sections_and_loop_seamlessly() {
+        let loop_s = crate::renderer::water_waves::WaveParams::default().loop_seconds;
+        // Seamless: a whole loop on, the same breaker everywhere.
+        for x in [-20.0f32, 0.0, 13.0, 41.0] {
+            let xz = glam::Vec2::new(x, 30.0);
+            let a = (swash_count(17.0, 1.1, xz).rem_euclid(1.0), breaker_amp(17.0, xz, swash_count(17.0, 1.1, xz)));
+            let b = (swash_count(17.0 + loop_s, 1.1, xz).rem_euclid(1.0), breaker_amp(17.0 + loop_s, xz, swash_count(17.0 + loop_s, 1.1, xz)));
+            assert!((a.0 - b.0).abs() < 1e-3 || (a.0 - b.0).abs() > 0.999, "{a:?} {b:?}");
+            assert!((a.1 - b.1).abs() < 2e-3, "{a:?} {b:?}");
+        }
+        // Not one line: along 60 m of shore, at one moment, the crest's
+        // phase spreads by a good share of a period and its height by more
+        // than half.
+        let (mut lo, mut hi, mut amp_lo, mut amp_hi) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for i in 0..61 {
+            let xz = glam::Vec2::new(-30.0 + i as f32, 30.0);
+            let c = swash_count(50.0, 1.0, xz);
+            let a = breaker_amp(50.0, xz, c);
+            lo = lo.min(c);
+            hi = hi.max(c);
+            amp_lo = amp_lo.min(a);
+            amp_hi = amp_hi.max(a);
+        }
+        assert!(hi - lo > 0.15, "the crest arrives together: {lo}..{hi}");
+        assert!(amp_hi - amp_lo > 0.3, "the crest is one height: {amp_lo}..{amp_hi}");
+        // The shader's terms are the CPU's.
+        let src = surface_wgsl();
+        for i in 0..3 {
+            assert!(src.contains(&along_wgsl(i)));
+        }
+    }
+
     #[test]
     fn every_water_cut_matches_and_validates() {
         for (cut, edits) in WATER_CUTS {
