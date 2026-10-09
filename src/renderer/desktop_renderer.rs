@@ -17,6 +17,14 @@ struct CuboidCacheEntry {
     wire: Option<(Vec<WireVertex>, Vec<u32>)>,
 }
 
+struct DesktopTerrain {
+    pipeline: super::terrain_pipeline::TerrainPipeline,
+    material: super::terrain_pipeline::TerrainMaterial,
+    vb: Buffer,
+    ib: Buffer,
+    index_count: u32,
+}
+
 pub struct Renderer {
     pub device: Device,
     pub queue: Queue,
@@ -30,6 +38,12 @@ pub struct Renderer {
     pub format: TextureFormat,
     /// What the 3D pass clears to each frame.
     pub clear_color: wgpu::Color,
+    /// The scene's ground, when one is set: its splat-material pipeline,
+    /// material and geometry. See [`Renderer::set_terrain`].
+    terrain: Option<DesktopTerrain>,
+    /// Whether the terrain draws this frame -- the editor hides the scene's
+    /// ground on its isolated stages (Prop Studio, Hands, Walk).
+    pub terrain_visible: bool,
     mesh_pipeline: mesh_pipeline::MeshPipeline,
     skinned_mesh_pipeline: mesh_pipeline::SkinnedMeshPipeline,
     uniform_buf: uniforms::UniformBuffer,
@@ -101,6 +115,8 @@ impl Renderer {
             overlay_pipeline,
             format,
             clear_color: wgpu::Color { r: 0.02, g: 0.02, b: 0.05, a: 1.0 },
+            terrain: None,
+            terrain_visible: true,
             mesh_pipeline,
             skinned_mesh_pipeline,
             uniform_buf,
@@ -124,6 +140,65 @@ impl Renderer {
     pub fn set_cuboids_double_sided(&mut self) {
         self.solid_pipeline =
             pipeline::SolidPipeline::new_double_sided(&self.device, self.format, &self.uniform_buf.layout);
+    }
+
+    /// The scene's ground: world-space terrain geometry (splat UVs in `uv2`,
+    /// see the engine's terrain loader) with its four-layer splat material.
+    /// Replaces whatever terrain was set before; `clear_terrain` removes it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_terrain(
+        &mut self,
+        vertices: &[SolidVertex],
+        indices: &[u32],
+        layers: &[Option<super::terrain_pipeline::TerrainImage>],
+        normals: &[Option<super::terrain_pipeline::TerrainImage>],
+        rough: &[Option<super::terrain_pipeline::TerrainImage>],
+        ao: &[Option<super::terrain_pipeline::TerrainImage>],
+        splat: Option<&super::terrain_pipeline::TerrainImage>,
+        settings: super::terrain_pipeline::TerrainMaterialUniform,
+    ) {
+        if vertices.is_empty() || indices.is_empty() {
+            self.terrain = None;
+            return;
+        }
+        let pipeline = super::terrain_pipeline::TerrainPipeline::new(
+            &self.device,
+            self.format,
+            &self.uniform_buf.layout,
+        );
+        let material = super::terrain_pipeline::TerrainMaterial::from_layers_with(
+            &self.device,
+            &self.queue,
+            &pipeline.material_layout,
+            layers,
+            normals,
+            rough,
+            ao,
+            splat,
+            None,
+            settings,
+        );
+        let vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("terrain_vb"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: BufferUsages::VERTEX,
+        });
+        let ib = self.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("terrain_ib"),
+            contents: bytemuck::cast_slice(indices),
+            usage: BufferUsages::INDEX,
+        });
+        self.terrain = Some(DesktopTerrain {
+            pipeline,
+            material,
+            vb,
+            ib,
+            index_count: indices.len() as u32,
+        });
+    }
+
+    pub fn clear_terrain(&mut self) {
+        self.terrain = None;
     }
 
     pub fn set_cuboid_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
@@ -584,6 +659,17 @@ impl Renderer {
                     pass.set_bind_group(1, lightmap_bg, &[]);
                     pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
                 }
+            }
+
+            // The ground under everything else: its own pipeline (splat
+            // materials), the same camera/lights bind group.
+            if let Some(t) = self.terrain.as_ref().filter(|_| self.terrain_visible) {
+                pass.set_pipeline(&t.pipeline.pipeline);
+                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                pass.set_bind_group(1, &t.material.bind_group, &[]);
+                pass.set_vertex_buffer(0, t.vb.slice(..));
+                pass.set_index_buffer(t.ib.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..t.index_count, 0, 0..1);
             }
 
             if !wire_verts.is_empty() {
