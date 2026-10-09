@@ -201,6 +201,16 @@ impl Renderer {
         self.terrain = None;
     }
 
+    /// Stream painted splat weights into the terrain's material. `false`
+    /// when no terrain is set or the sizes mismatch (rebuild via
+    /// `set_terrain` then).
+    pub fn update_terrain_splat(&mut self, image: &super::terrain_pipeline::TerrainImage) -> bool {
+        match self.terrain.as_ref() {
+            Some(t) => t.material.update_splat(&self.queue, image),
+            None => false,
+        }
+    }
+
     /// Replace just the terrain's geometry -- the editor sculpting path,
     /// which changes heights every frame of a stroke and must not pay for a
     /// pipeline and material rebuild each time. No-op when no terrain is set.
