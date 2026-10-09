@@ -201,6 +201,24 @@ impl Renderer {
         self.terrain = None;
     }
 
+    /// Replace just the terrain's geometry -- the editor sculpting path,
+    /// which changes heights every frame of a stroke and must not pay for a
+    /// pipeline and material rebuild each time. No-op when no terrain is set.
+    pub fn update_terrain_geometry(&mut self, vertices: &[SolidVertex], indices: &[u32]) {
+        let Some(t) = self.terrain.as_mut() else { return };
+        t.vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("terrain_vb"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: BufferUsages::VERTEX,
+        });
+        t.ib = self.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("terrain_ib"),
+            contents: bytemuck::cast_slice(indices),
+            usage: BufferUsages::INDEX,
+        });
+        t.index_count = indices.len() as u32;
+    }
+
     pub fn set_cuboid_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
         let tex = create_lightmap_texture(&self.device, &self.queue, &self.solid_pipeline.lightmap_layout, rgba, width, height, None);
         self.cuboid_lightmaps.insert(key.to_string(), tex);
