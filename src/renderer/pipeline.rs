@@ -44,11 +44,32 @@ impl SolidPipeline {
         Self::new_with_front_face(device, format, uniform_layout, FrontFace::Cw)
     }
 
+    /// Solids without backface culling: interiors render, so a camera inside
+    /// a cuboid sees walls instead of an x-ray. Editors want this; the VR
+    /// renderer keeps the culled default.
+    pub fn new_double_sided(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+    ) -> Self {
+        Self::new_full(device, format, uniform_layout, FrontFace::Ccw, None)
+    }
+
     fn new_with_front_face(
         device: &Device,
         format: TextureFormat,
         uniform_layout: &BindGroupLayout,
         front_face: FrontFace,
+    ) -> Self {
+        Self::new_full(device, format, uniform_layout, front_face, Some(Face::Back))
+    }
+
+    fn new_full(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        front_face: FrontFace,
+        cull_mode: Option<Face>,
     ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("solid_shader"),
@@ -81,7 +102,7 @@ impl SolidPipeline {
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
-                cull_mode: Some(Face::Back),
+                cull_mode,
                 front_face,
                 polygon_mode: PolygonMode::Fill,
                 ..Default::default()
@@ -90,6 +111,70 @@ impl SolidPipeline {
                 format: TextureFormat::Depth32Float,
                 depth_write_enabled: true,
                 depth_compare: CompareFunction::Less,
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        Self {
+            pipeline,
+            lightmap_layout,
+        }
+    }
+
+    /// Draws regardless of what's already in the depth buffer (always
+    /// passes, never writes) -- an "x-ray" pass meant to run after
+    /// everything else in the frame, so a highlight (e.g. a skeleton
+    /// overlay) reads through solid geometry drawn earlier instead of
+    /// being hidden inside it. Double-sided too, so it reads the same from
+    /// any angle.
+    pub fn new_overlay(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+    ) -> Self {
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("solid_overlay_shader"),
+            source: ShaderSource::Wgsl(solid_shader().into()),
+        });
+        let lightmap_layout = lightmap_bind_group_layout(device);
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("solid_overlay_layout"),
+            bind_group_layouts: &[uniform_layout, &lightmap_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("solid_overlay_pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[SolidVertex::layout()],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: CompareFunction::Always,
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),

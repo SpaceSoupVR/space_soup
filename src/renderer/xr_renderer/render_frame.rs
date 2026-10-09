@@ -288,6 +288,10 @@ impl XrRenderer {
             self.uniform_buf.upload(&self.wgpu_queue, eye_view_proj);
             let cam_pos = glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
             self.ssr_camera_uniform.upload(&self.wgpu_queue, eye_view_proj, cam_pos);
+            // This eye's position, for skinned meshes' specular highlight.
+            for instance in meshes.iter().chain(mirror_only_meshes.iter()) {
+                instance.model.upload_eye(&self.wgpu_queue, cam_pos);
+            }
 
             {
                 let mut encoder = self.wgpu_device.create_command_encoder(

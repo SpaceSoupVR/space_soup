@@ -10,6 +10,8 @@ pub mod voxelize;
 pub mod xr;
 
 pub use renderer::{Color3, Cuboid, CuboidShape, CuboidStyle, Renderer};
+#[cfg(feature = "renderer")]
+pub use wgpu;
 
 #[cfg(target_os = "android")]
 pub use xr::{

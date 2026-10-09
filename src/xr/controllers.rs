@@ -54,6 +54,8 @@ pub struct Controllers {
     x_button: xr::Action<bool>,
     y_button: xr::Action<bool>,
     menu_button: xr::Action<bool>,
+    left_haptic: xr::Action<xr::Haptic>,
+    right_haptic: xr::Action<xr::Haptic>,
     left_grip_space: xr::Space,
     right_grip_space: xr::Space,
     left_aim_space: xr::Space,
@@ -111,6 +113,10 @@ impl Controllers {
         let y_button: xr::Action<bool> = action_set.create_action("y_button", "Y Button", &[])?;
         let menu_button: xr::Action<bool> =
             action_set.create_action("menu_button", "Menu Button", &[])?;
+        let left_haptic: xr::Action<xr::Haptic> =
+            action_set.create_action("left_haptic", "Left Vibration", &[])?;
+        let right_haptic: xr::Action<xr::Haptic> =
+            action_set.create_action("right_haptic", "Right Vibration", &[])?;
 
         let profile = instance.string_to_path("/interaction_profiles/oculus/touch_controller")?;
         instance.suggest_interaction_profile_bindings(
@@ -208,6 +214,14 @@ impl Controllers {
                     &menu_button,
                     instance.string_to_path("/user/hand/left/input/menu/click")?,
                 ),
+                xr::Binding::new(
+                    &left_haptic,
+                    instance.string_to_path("/user/hand/left/output/haptic")?,
+                ),
+                xr::Binding::new(
+                    &right_haptic,
+                    instance.string_to_path("/user/hand/right/output/haptic")?,
+                ),
             ],
         )?;
 
@@ -266,12 +280,52 @@ impl Controllers {
             x_button,
             y_button,
             menu_button,
+            left_haptic,
+            right_haptic,
             left_grip_space,
             right_grip_space,
             left_aim_space,
             right_aim_space,
             state,
         })
+    }
+
+    /// Buzzes one controller. `amplitude` is 0..1 and `seconds` is capped at 2 --
+    /// a script asking for a long rumble is almost always a units mistake, and a
+    /// controller that will not stop buzzing is worse than one that stops early.
+    /// A new call on the same hand replaces whatever that hand was already doing.
+    pub fn vibrate(
+        &self,
+        session: &xr::Session<xr::Vulkan>,
+        left: bool,
+        amplitude: f32,
+        seconds: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let amplitude = if amplitude.is_finite() { amplitude.clamp(0.0, 1.0) } else { 0.0 };
+        let seconds = if seconds.is_finite() { seconds.clamp(0.0, 2.0) } else { 0.0 };
+        let event = xr::HapticVibration::new()
+            .amplitude(amplitude)
+            .duration(xr::Duration::from_nanos((seconds as f64 * 1e9) as i64))
+            .frequency(xr::FREQUENCY_UNSPECIFIED);
+        self.haptic(left).apply_feedback(session, xr::Path::NULL, &event)?;
+        Ok(())
+    }
+
+    pub fn stop_vibration(
+        &self,
+        session: &xr::Session<xr::Vulkan>,
+        left: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.haptic(left).stop_feedback(session, xr::Path::NULL)?;
+        Ok(())
+    }
+
+    fn haptic(&self, left: bool) -> &xr::Action<xr::Haptic> {
+        if left {
+            &self.left_haptic
+        } else {
+            &self.right_haptic
+        }
     }
 
     pub fn sync(

@@ -154,7 +154,20 @@ impl ModelUniform {
             bytemuck::cast_slice(&model.to_cols_array()),
         );
     }
+
+    /// The camera's world position, for skinned meshes' specular highlight
+    /// (stored after the model matrix; ignored for other uniforms).
+    pub fn upload_eye(&self, queue: &Queue, eye: glam::Vec3) {
+        if self.buffer.size() >= SKINNED_MODEL_UNIFORM_SIZE {
+            queue.write_buffer(&self.buffer, 64, bytemuck::cast_slice(&[eye.x, eye.y, eye.z, 0.0f32]));
+        }
+    }
 }
+
+/// A skinned mesh's model uniform: its model matrix, then the camera
+/// position (vec4) -- kept in this group, not a group of its own, so the
+/// pipeline stays within 4 bind groups (the Quest's GPU limit).
+const SKINNED_MODEL_UNIFORM_SIZE: u64 = 80;
 
 pub struct SkinnedMeshPipeline {
     pub pipeline: RenderPipeline,
@@ -192,11 +205,13 @@ impl SkinnedMeshPipeline {
             ],
         });
 
+        // Model matrix (vertex) and camera position (fragment, for the
+        // specular highlight) -- see `SKINNED_MODEL_UNIFORM_SIZE`.
         let model_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("skinned_mesh_model_bgl"),
             entries: &[BindGroupLayoutEntry {
                 binding: 0,
-                visibility: ShaderStages::VERTEX,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                 ty: BindingType::Buffer {
                     ty: BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -280,7 +295,7 @@ impl SkinnedMeshPipeline {
     pub fn create_model_uniform(&self, device: &Device) -> ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("skinned_mesh_model_uniform"),
-            size: 64,
+            size: SKINNED_MODEL_UNIFORM_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -302,7 +317,7 @@ fn skinned_mesh_shader() -> String {
 struct CameraUniform {{ view_proj: mat4x4<f32> }}
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
-struct ModelUniform {{ model: mat4x4<f32> }}
+struct ModelUniform {{ model: mat4x4<f32>, eye: vec4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
 
 @group(2) @binding(0) var tex: texture_2d<f32>;
@@ -359,7 +374,9 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
     let lit = shade(in.world_pos, n);
     let tex_color = textureSample(tex, samp, in.uv);
-    return vec4<f32>(tex_color.rgb * lit, tex_color.a);
+    let view_dir = normalize(model_u.eye.xyz - in.world_pos);
+    let spec = specular(in.world_pos, n, view_dir, 0.5, 48.0);
+    return vec4<f32>(tex_color.rgb * lit + spec, tex_color.a);
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
