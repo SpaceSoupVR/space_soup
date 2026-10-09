@@ -14,6 +14,10 @@ pub enum CuboidStyle {
 pub enum CuboidShape {
     Box,
     Cylinder,
+    /// Point at +Y (half_size.y), round base at -Y -- arrow heads.
+    Cone,
+    /// Ellipsoid filling the box -- handles and markers.
+    Sphere,
 }
 
 impl Default for CuboidShape {
@@ -270,8 +274,11 @@ pub fn build_solid_mesh_one(c: &Cuboid) -> Option<(Vec<SolidVertex>, Vec<u32>)> 
     if matches!(c.style, CuboidStyle::Wireframe) {
         return None;
     }
-    if matches!(c.shape, CuboidShape::Cylinder) {
-        return Some(build_cylinder_solid_mesh(c));
+    match c.shape {
+        CuboidShape::Cylinder => return Some(build_cylinder_solid_mesh(c)),
+        CuboidShape::Cone => return Some(build_cone_solid_mesh(c)),
+        CuboidShape::Sphere => return Some(build_sphere_solid_mesh(c)),
+        CuboidShape::Box => {}
     }
 
     let mut verts: Vec<SolidVertex> = Vec::with_capacity(24);
@@ -378,8 +385,80 @@ fn build_cylinder_solid_mesh(c: &Cuboid) -> (Vec<SolidVertex>, Vec<u32>) {
     (verts, indices)
 }
 
+fn build_cone_solid_mesh(c: &Cuboid) -> (Vec<SolidVertex>, Vec<u32>) {
+    const SEGMENTS: usize = 24;
+    let model = c.model_matrix();
+    let color = c.color.to_linear();
+    let vert = |p: Vec3, n: Vec3| SolidVertex {
+        position: model.transform_point3(p).into(),
+        normal: (c.rotation * n).normalize_or_zero().into(),
+        color,
+        uv2: [0.5, 0.5],
+        reflectivity: c.reflectivity,
+    };
+    let mut verts = Vec::with_capacity(SEGMENTS * 4 + 2);
+    let mut indices = Vec::with_capacity(SEGMENTS * 6);
+    let ring = |i: usize| {
+        let a = (i % SEGMENTS) as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+        Vec3::new(a.cos() * 0.5, -0.5, a.sin() * 0.5)
+    };
+    // Sides: one triangle per segment, tip shared per face for flat-ish shading.
+    for i in 0..SEGMENTS {
+        let (a, b) = (ring(i), ring(i + 1));
+        let mid = (a + b) * 0.5;
+        let n = Vec3::new(mid.x, 0.5, mid.z);
+        let base = verts.len() as u32;
+        verts.push(vert(Vec3::new(0.0, 0.5, 0.0), n));
+        verts.push(vert(a, Vec3::new(a.x, 0.5, a.z)));
+        verts.push(vert(b, Vec3::new(b.x, 0.5, b.z)));
+        indices.extend_from_slice(&[base, base + 2, base + 1]);
+    }
+    // Base cap.
+    let cap = verts.len() as u32;
+    verts.push(vert(Vec3::new(0.0, -0.5, 0.0), Vec3::NEG_Y));
+    for i in 0..SEGMENTS {
+        verts.push(vert(ring(i), Vec3::NEG_Y));
+    }
+    for i in 0..SEGMENTS as u32 {
+        indices.extend_from_slice(&[cap, cap + 1 + i, cap + 1 + (i + 1) % SEGMENTS as u32]);
+    }
+    (verts, indices)
+}
+
+fn build_sphere_solid_mesh(c: &Cuboid) -> (Vec<SolidVertex>, Vec<u32>) {
+    const RINGS: usize = 12;
+    const SEGMENTS: usize = 20;
+    let model = c.model_matrix();
+    let color = c.color.to_linear();
+    let mut verts = Vec::with_capacity((RINGS + 1) * (SEGMENTS + 1));
+    let mut indices = Vec::with_capacity(RINGS * SEGMENTS * 6);
+    for r in 0..=RINGS {
+        let phi = r as f32 / RINGS as f32 * std::f32::consts::PI;
+        for s in 0..=SEGMENTS {
+            let theta = s as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            let n = Vec3::new(phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin());
+            verts.push(SolidVertex {
+                position: model.transform_point3(n * 0.5).into(),
+                normal: (c.rotation * n).into(),
+                color,
+                uv2: [0.5, 0.5],
+                reflectivity: c.reflectivity,
+            });
+        }
+    }
+    let row = (SEGMENTS + 1) as u32;
+    for r in 0..RINGS as u32 {
+        for s in 0..SEGMENTS as u32 {
+            let a = r * row + s;
+            let b = a + row;
+            indices.extend_from_slice(&[a, a + 1, b, a + 1, b + 1, b]);
+        }
+    }
+    (verts, indices)
+}
+
 pub fn build_wire_mesh_one(c: &Cuboid) -> Option<(Vec<WireVertex>, Vec<u32>)> {
-    if matches!(c.style, CuboidStyle::Solid) || matches!(c.shape, CuboidShape::Cylinder) {
+    if matches!(c.style, CuboidStyle::Solid) || !matches!(c.shape, CuboidShape::Box) {
         return None;
     }
 

@@ -11,6 +11,8 @@ pub mod particle;
 pub mod pipeline;
 pub mod ssr;
 pub mod uniforms;
+#[cfg(target_os = "macos")]
+pub mod macos_window;
 
 #[cfg(target_os = "android")]
 pub mod xr_renderer;
@@ -21,8 +23,15 @@ pub use desktop_renderer::Renderer;
 pub use icon::{billboard_rotation, IconAssets, IconKind};
 pub use lights::{Light, LightKind};
 pub use mesh::GltfMesh;
+pub use mesh::{load_clips_for, GltfClip};
 pub use mirror::MirrorSurface;
 pub use panel::WorldPanel;
+#[cfg(target_os = "macos")]
+pub use macos_window::{
+    configure_macos_window, install_window_vibrancy, MacosWindowChrome, VibrancyMaterial,
+    WindowAppearance,
+    MACOS_TITLEBAR_PT,
+};
 pub use particle::{Beam, Particle, ParticlePipeline, ParticleVertex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

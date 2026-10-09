@@ -127,6 +127,39 @@ fn shade(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
     }}
     return lit;
 }}
+
+// Blinn-Phong specular, same attenuation/falloff as `light_contribution`'s
+// diffuse term -- a flat shininess for everything (there's no per-material
+// roughness data reaching this shader), so it reads as a generic glossy
+// highlight rather than a material-correct one. Real and view-dependent
+// (moves as the camera orbits), not a fake static sheen.
+fn specular_contribution(l: Light, world_pos: vec3<f32>, n: vec3<f32>, view_dir: vec3<f32>, shininess: f32) -> vec3<f32> {{
+    let to_light = l.position.xyz - world_pos;
+    let dist = length(to_light);
+    let l_dir = to_light / max(dist, 0.0001);
+    let half_dir = normalize(l_dir + view_dir);
+    let spec_angle = max(dot(n, half_dir), 0.0);
+
+    let d_over_r = dist / max(l.params.x, 0.0001);
+    let window = clamp(1.0 - pow(d_over_r, 4.0), 0.0, 1.0);
+    var atten = (window * window) / (dist * dist + 1.0);
+    if (l.params.z > 0.5) {{
+        let cos_outer = l.params.y;
+        let cos_angle = dot(-l_dir, l.direction.xyz);
+        let cone = clamp((cos_angle - cos_outer) / max(1.0 - cos_outer, 0.0001), 0.0, 1.0);
+        atten = atten * cone * cone * (3.0 - 2.0 * cone);
+    }}
+
+    return l.color_intensity.rgb * l.color_intensity.a * pow(spec_angle, shininess) * atten;
+}}
+
+fn specular(world_pos: vec3<f32>, n: vec3<f32>, view_dir: vec3<f32>, strength: f32, shininess: f32) -> vec3<f32> {{
+    var s = vec3<f32>(0.0, 0.0, 0.0);
+    for (var i: u32 = 0u; i < lights.count.x; i = i + 1u) {{
+        s = s + specular_contribution(lights.lights[i], world_pos, n, view_dir, shininess);
+    }}
+    return s * strength;
+}}
 "#
     )
 }

@@ -26,6 +26,11 @@ fontdue     = "0.9.3"
 lazy_static = "1.5.0"
 log         = "0.4"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2            = "0.5"
+objc2-app-kit    = { version = "0.2", features = ["NSResponder", "NSView", "NSVisualEffectView", "NSGraphics", "NSWindow", "NSToolbar", "NSAppearance"] }
+objc2-foundation = { version = "0.2", features = ["NSGeometry", "NSThread"] }
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 env_logger = "0.11"
 pollster   = "0.3"

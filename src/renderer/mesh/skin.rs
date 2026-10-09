@@ -44,7 +44,9 @@ impl SkinnedMeshPrimitive {
     }
 }
 
-pub const MAX_SKIN_JOINTS: usize = 96;
+/// The most joints a skin can have (a full character rig with face and
+/// fingers runs to a few hundred).
+pub const MAX_SKIN_JOINTS: usize = 256;
 
 #[derive(Clone)]
 pub struct GltfAnimationPose {
@@ -159,6 +161,9 @@ pub struct GltfSkin {
     pub joint_parents: Vec<Option<usize>>,
     pub joint_local_bind: Vec<(Vec3, Quat, Vec3)>,
     pub animations: Vec<GltfAnimationPose>,
+    /// The file's animations as keyframed clips (same order as
+    /// `animations`), shared between copies of the mesh.
+    pub clips: std::sync::Arc<Vec<super::clip::GltfClip>>,
 
     pub joint_buffer: wgpu::Buffer,
 
@@ -168,10 +173,12 @@ pub struct GltfSkin {
 
 impl GltfSkin {
     pub fn update_joint_matrices(&self, queue: &wgpu::Queue, skinned_mats: &[Mat4]) {
-        let mut buf = [[0f32; 16]; MAX_SKIN_JOINTS];
-        for (i, mat) in skinned_mats.iter().enumerate().take(MAX_SKIN_JOINTS) {
-            buf[i] = mat.to_cols_array();
+        // Only the joints this skin has (the buffer holds the most any can).
+        let n = skinned_mats.len().min(MAX_SKIN_JOINTS);
+        if n == 0 {
+            return;
         }
+        let buf: Vec<[f32; 16]> = skinned_mats[..n].iter().map(|m| m.to_cols_array()).collect();
         queue.write_buffer(&self.joint_buffer, 0, bytemuck::cast_slice(&buf));
     }
 

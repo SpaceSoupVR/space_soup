@@ -5,16 +5,59 @@ pub struct LoadedTexture {
     pub bind_group: wgpu::BindGroup,
 }
 
+impl LoadedTexture {
+    /// Wraps an existing texture (e.g. a UI panel render target) in the
+    /// sampler + bind group the mesh pipeline expects.
+    pub fn from_texture(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        texture: wgpu::Texture,
+    ) -> Self {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("panel_quad_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("panel_quad_texture_bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        Self {
+            texture,
+            view,
+            _sampler: sampler,
+            bind_group,
+        }
+    }
+}
+
 pub(crate) fn load_primitive_texture(
     prim: &gltf::Primitive,
     images: &[gltf::image::Data],
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
+    force_all_opaque: bool,
 ) -> LoadedTexture {
     let material = prim.material();
     let pbr = material.pbr_metallic_roughness();
-    let force_opaque = material.alpha_mode() != gltf::material::AlphaMode::Blend;
+    // Avatars and other closed meshes want every material opaque: BLEND-mode
+    // clothing on a double-sided skin otherwise reads as see-through.
+    let force_opaque =
+        force_all_opaque || material.alpha_mode() != gltf::material::AlphaMode::Blend;
 
     if let Some(info) = pbr.base_color_texture() {
         let image = &images[info.texture().source().index()];
@@ -22,10 +65,29 @@ pub(crate) fn load_primitive_texture(
     }
 
     let c = pbr.base_color_factor();
+    // This renderer's `shade()` is direct lights + a flat ambient term --
+    // no specular/IBL response at all. A physically-based metal's
+    // `baseColorFactor` is close to zero by design (metals have near-zero
+    // *diffuse* albedo; real brightness comes from specular environment
+    // reflections), which authoring tools like Sketchfab's own viewer
+    // compensate for with strong image-based lighting. Without that, an
+    // untextured metallic material renders as flat black here even though
+    // every renderer with reflections shows it as ordinary gunmetal gray.
+    // Lift the baked fallback color's brightness (hue/chroma preserved --
+    // this scales luminance up, it doesn't blend toward gray) in
+    // proportion to how metallic the material is, as a stand-in for the
+    // missing specular term. Only engages when there's no real base-color
+    // texture (the common, well-lit case) and only when the authored
+    // color is already below the floor, so normal-brightness or
+    // intentionally-dark non-metal materials are untouched.
+    let metallic = pbr.metallic_factor().clamp(0.0, 1.0);
+    let lum = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+    let floor = 0.26 + 0.28 * metallic;
+    let boost = if lum > 0.0001 && lum < floor { floor / lum } else { 1.0 };
     let rgba = [
-        (c[0] * 255.0) as u8,
-        (c[1] * 255.0) as u8,
-        (c[2] * 255.0) as u8,
+        (c[0] * boost * 255.0).clamp(0.0, 255.0) as u8,
+        (c[1] * boost * 255.0).clamp(0.0, 255.0) as u8,
+        (c[2] * boost * 255.0).clamp(0.0, 255.0) as u8,
         if force_opaque { 255 } else { (c[3] * 255.0) as u8 },
     ];
     upload_solid_texture(device, queue, layout, rgba)

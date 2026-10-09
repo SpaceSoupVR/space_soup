@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 use wgpu::*;
 
-use super::cuboid::{build_solid_mesh_one, build_wire_mesh_one, CuboidSnapshot, SolidVertex, WireVertex};
+use super::cuboid::{build_solid_mesh_one, build_solid_mesh_with_ranges, build_wire_mesh_one, CuboidSnapshot, SolidVertex, WireVertex};
 use super::lights::LightsUniform;
 use super::mesh::{create_texture_from_rgba, LoadedTexture};
 use super::{icon, lights, mesh_pipeline, pipeline, uniforms};
@@ -17,8 +17,14 @@ struct CuboidCacheEntry {
 pub struct Renderer {
     pub device: Device,
     pub queue: Queue,
+    format: TextureFormat,
+    /// Color the 3D pass clears to. An alpha below 1.0 lets the OS composite
+    /// whatever is behind the window through (used by the editor's
+    /// transparent/vibrancy chrome); the default is the old opaque deep blue.
+    pub clear_color: wgpu::Color,
     solid_pipeline: pipeline::SolidPipeline,
     wire_pipeline: pipeline::WirePipeline,
+    overlay_pipeline: pipeline::SolidPipeline,
     mesh_pipeline: mesh_pipeline::MeshPipeline,
     skinned_mesh_pipeline: mesh_pipeline::SkinnedMeshPipeline,
     uniform_buf: uniforms::UniformBuffer,
@@ -46,6 +52,7 @@ impl Renderer {
         let uniform_buf = uniforms::UniformBuffer::new(&device, &lights_uniform);
         let solid_pipeline = pipeline::SolidPipeline::new(&device, format, &uniform_buf.layout);
         let wire_pipeline = pipeline::WirePipeline::new(&device, format, &uniform_buf.layout);
+        let overlay_pipeline = pipeline::SolidPipeline::new_overlay(&device, format, &uniform_buf.layout);
         let mesh_pipeline = mesh_pipeline::MeshPipeline::new(&device, format, &uniform_buf.layout);
         let skinned_mesh_pipeline =
             mesh_pipeline::SkinnedMeshPipeline::new(&device, format, &uniform_buf.layout);
@@ -59,8 +66,16 @@ impl Renderer {
         Self {
             device,
             queue,
+            format,
+            clear_color: wgpu::Color {
+                r: 0.02,
+                g: 0.02,
+                b: 0.05,
+                a: 1.0,
+            },
             solid_pipeline,
             wire_pipeline,
+            overlay_pipeline,
             mesh_pipeline,
             skinned_mesh_pipeline,
             uniform_buf,
@@ -75,6 +90,13 @@ impl Renderer {
             mesh_lightmaps: HashMap::new(),
             default_mesh_lightmap,
         }
+    }
+
+    /// Editor nicety: render solid cuboids double-sided so a camera flown
+    /// inside one sees its interior instead of an x-ray hole.
+    pub fn set_cuboids_double_sided(&mut self) {
+        self.solid_pipeline =
+            pipeline::SolidPipeline::new_double_sided(&self.device, self.format, &self.uniform_buf.layout);
     }
 
     pub fn set_cuboid_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
@@ -160,7 +182,25 @@ impl Renderer {
         meshes: &[MeshInstance],
         lights: &[lights::Light],
     ) {
-        self.render_internal(target_view, camera, cuboids, meshes, &[], lights);
+        self.render_internal(target_view, camera, cuboids, meshes, &[], lights, &[]);
+    }
+
+    /// Like `render_with_lights`, but `overlay_cuboids` draw in an extra
+    /// pass at the very end, through an "always passes the depth test"
+    /// pipeline (see `pipeline::SolidPipeline::new_overlay`) -- so they
+    /// read on top of everything else (meshes included) instead of being
+    /// hidden inside whatever solid geometry already occupies that space.
+    /// Meant for a highlight overlay (e.g. a skeleton), not real geometry.
+    pub fn render_with_overlay(
+        &mut self,
+        target_view: &TextureView,
+        camera: &Camera,
+        cuboids: &[Cuboid],
+        overlay_cuboids: &[Cuboid],
+        meshes: &[MeshInstance],
+        lights: &[lights::Light],
+    ) {
+        self.render_internal(target_view, camera, cuboids, meshes, &[], lights, overlay_cuboids);
     }
 
     pub fn render_with_panels(
@@ -172,7 +212,204 @@ impl Renderer {
         panels: &[&WorldPanel],
         lights: &[lights::Light],
     ) {
-        self.render_internal(target_view, camera, cuboids, meshes, panels, lights);
+        self.render_internal(target_view, camera, cuboids, meshes, panels, lights, &[]);
+    }
+
+    /// Renders just `meshes` (no cuboids, no overlay) to an off-screen
+    /// `width`x`height` RGBA8 texture and reads it back to CPU memory --
+    /// for a timeline filmstrip's thumbnails, which want a handful of real
+    /// snapshots of a posed mesh, not one static icon repeated. Blocks
+    /// (polls the device to completion) instead of returning a future:
+    /// meant to run a few times whenever a clip's duration/keyframes
+    /// change, not per frame, so a few milliseconds of stall here is an
+    /// acceptable trade for not needing an async executor in the engine
+    /// thread's otherwise-synchronous render loop.
+    pub fn render_mesh_thumbnail(
+        &mut self,
+        camera: &Camera,
+        meshes: &[MeshInstance],
+        lights: &[lights::Light],
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let color_tex = self.device.create_texture(&TextureDescriptor {
+            label: Some("thumb_color"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: self.format,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let color_view = color_tex.create_view(&TextureViewDescriptor::default());
+        let (_depth_tex, depth_view) = Self::make_depth(&self.device, width, height);
+
+        let vp = camera.projection() * camera.view();
+        self.uniform_buf.upload(&self.queue, vp);
+        self.lights_uniform.upload(&self.queue, lights);
+
+        let mut draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> = Vec::new();
+        let mut skinned_draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> =
+            Vec::new();
+        for instance in meshes {
+            instance
+                .model
+                .upload(&self.queue, instance.mesh.model_matrix());
+            instance.model.upload_eye(&self.queue, camera.position);
+            if let Some(skin) = &instance.mesh.skin {
+                if let Some(joint_bg) = &skin.joint_bind_group {
+                    for prim in &skin.primitives {
+                        skinned_draws.push((
+                            &prim.vertex_buffer,
+                            &prim.index_buffer,
+                            prim.indices.len() as u32,
+                            &instance.model.bind_group,
+                            &prim.texture.bind_group,
+                            joint_bg,
+                        ));
+                    }
+                }
+            } else {
+                let lightmap_bg = instance
+                    .lightmap_key
+                    .and_then(|k| self.mesh_lightmaps.get(k))
+                    .map(|t| &t.bind_group)
+                    .unwrap_or(&self.default_mesh_lightmap.bind_group);
+                for prim in &instance.mesh.primitives {
+                    draws.push((
+                        &prim.vertex_buffer,
+                        &prim.index_buffer,
+                        prim.indices.len() as u32,
+                        &instance.model.bind_group,
+                        &prim.texture.bind_group,
+                        lightmap_bg,
+                    ));
+                }
+            }
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("thumb_frame"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("thumb_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &color_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(self.clear_color),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Clear(1.0),
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            if !draws.is_empty() {
+                pass.set_pipeline(&self.mesh_pipeline.pipeline);
+                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                for (vb, ib, count, model_bg, tex_bg, lightmap_bg) in &draws {
+                    pass.set_bind_group(1, *model_bg, &[]);
+                    pass.set_bind_group(2, *tex_bg, &[]);
+                    pass.set_bind_group(3, *lightmap_bg, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
+            }
+
+            if !skinned_draws.is_empty() {
+                pass.set_pipeline(&self.skinned_mesh_pipeline.pipeline);
+                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                for (vb, ib, count, model_bg, tex_bg, joint_bg) in &skinned_draws {
+                    pass.set_bind_group(1, *model_bg, &[]);
+                    pass.set_bind_group(2, *tex_bg, &[]);
+                    pass.set_bind_group(3, *joint_bg, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
+            }
+        }
+
+        // Copy to a mappable buffer -- rows must be padded to a 256-byte
+        // stride (`COPY_BYTES_PER_ROW_ALIGNMENT`), unpadded again below.
+        let unpadded_bytes_per_row = width * 4;
+        let padded_bytes_per_row =
+            unpadded_bytes_per_row.div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT) * COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer_size = (padded_bytes_per_row * height) as BufferAddress;
+        let out_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("thumb_readback"),
+            size: buffer_size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture: &color_tex,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            TexelCopyBufferInfo {
+                buffer: &out_buffer,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = out_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        let _ = self.device.poll(PollType::Wait);
+        let _ = rx.recv();
+
+        let data = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
+        for row in 0..height {
+            let start = (row * padded_bytes_per_row) as usize;
+            out.extend_from_slice(&data[start..start + unpadded_bytes_per_row as usize]);
+        }
+        drop(data);
+        out_buffer.unmap();
+        // The swapchain format on this platform is commonly BGRA, not
+        // RGBA -- PNG/the `image` crate wants RGBA byte order, so swap R
+        // and B per pixel when that's what we actually rendered into.
+        if matches!(
+            self.format,
+            TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb
+        ) {
+            for px in out.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        out
     }
 
     #[allow(clippy::type_complexity)]
@@ -237,6 +474,7 @@ impl Renderer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_internal(
         &mut self,
         target_view: &TextureView,
@@ -245,6 +483,7 @@ impl Renderer {
         meshes: &[MeshInstance],
         panels: &[&WorldPanel],
         lights: &[lights::Light],
+        overlay_cuboids: &[Cuboid],
     ) {
         let vp = camera.projection() * camera.view();
         self.uniform_buf.upload(&self.queue, vp);
@@ -274,6 +513,20 @@ impl Renderer {
             usage: BufferUsages::INDEX,
         });
 
+        // Overlay cuboids aren't cached (there are only ever a handful --
+        // a skeleton's worth -- and they're rebuilt every frame anyway).
+        let (overlay_verts, overlay_indices, _) = build_solid_mesh_with_ranges(overlay_cuboids);
+        let overlay_vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("overlay_vb"),
+            contents: bytemuck::cast_slice(&overlay_verts),
+            usage: BufferUsages::VERTEX,
+        });
+        let overlay_ib = self.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("overlay_ib"),
+            contents: bytemuck::cast_slice(&overlay_indices),
+            usage: BufferUsages::INDEX,
+        });
+
         let mut panel_buffers: Vec<(Buffer, Buffer)> = Vec::with_capacity(panels.len());
         for panel in panels {
             panel.upload_model(&self.queue);
@@ -298,6 +551,7 @@ impl Renderer {
             instance
                 .model
                 .upload(&self.queue, instance.mesh.model_matrix());
+            instance.model.upload_eye(&self.queue, camera.position);
 
             if let Some(skin) = &instance.mesh.skin {
                 if let Some(joint_bg) = &skin.joint_bind_group {
@@ -355,12 +609,7 @@ impl Renderer {
                     view: target_view,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.02,
-                            b: 0.05,
-                            a: 1.0,
-                        }),
+                        load: LoadOp::Clear(self.clear_color),
                         store: StoreOp::Store,
                     },
                 })],
@@ -423,6 +672,17 @@ impl Renderer {
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(0..*count, 0, 0..1);
                 }
+            }
+
+            // Last, so it reads on top of everything above (see
+            // `SolidPipeline::new_overlay`'s own doc comment).
+            if !overlay_verts.is_empty() {
+                pass.set_pipeline(&self.overlay_pipeline.pipeline);
+                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                pass.set_bind_group(1, &self.default_cuboid_lightmap.bind_group, &[]);
+                pass.set_vertex_buffer(0, overlay_vb.slice(..));
+                pass.set_index_buffer(overlay_ib.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..overlay_indices.len() as u32, 0, 0..1);
             }
         }
 

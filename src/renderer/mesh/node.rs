@@ -55,6 +55,7 @@ pub(crate) fn collect_node(
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
     force_static: bool,
+    force_all_opaque: bool,
     node_to_joint: &HashMap<usize, usize>,
     static_out: &mut Vec<MeshPrimitive>,
     skinned_out: &mut Vec<SkinnedMeshPrimitive>,
@@ -112,7 +113,8 @@ pub(crate) fn collect_node(
                 None => (0..positions.len() as u32).collect(),
             };
 
-            let texture = load_primitive_texture(&prim, images, device, queue, layout);
+            let texture =
+                load_primitive_texture(&prim, images, device, queue, layout, force_all_opaque);
             let texture = Arc::new(texture);
 
             if bake {
@@ -209,6 +211,7 @@ pub(crate) fn collect_node(
             queue,
             layout,
             force_static,
+            force_all_opaque,
             node_to_joint,
             static_out,
             skinned_out,
