@@ -709,6 +709,19 @@ impl LoadedTexture {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
+        // The layout's third binding is the emissive map; a panel quad has
+        // none, so it binds a 1x1 black texel (emissive's neutral).
+        let emissive_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("panel_quad_emissive"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let emissive_view = emissive_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("panel_quad_texture_bg"),
             layout,
@@ -721,6 +734,10 @@ impl LoadedTexture {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&emissive_view),
+                },
             ],
         });
         Self {
@@ -728,7 +745,8 @@ impl LoadedTexture {
             view,
             _sampler: sampler,
             bind_group,
-            _direction: None,
+            // Holds the emissive placeholder so the bind group's view stays valid.
+            _direction: Some(emissive_tex),
             _sun_mask: None,
         }
     }
