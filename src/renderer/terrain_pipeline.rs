@@ -2136,6 +2136,11 @@ pub(crate) mod tests {
 pub struct TerrainMaterial {
     pub bind_group: BindGroup,
     pub uniform: Buffer,
+    /// The bound splat texture, kept so the editor can stream painted
+    /// weights into it without rebuilding the material.
+    pub splat_texture: Texture,
+    /// The bound splat texture's size (`update_splat` refuses a mismatch).
+    pub splat_size: [u32; 2],
 }
 
 /// Mip levels for a texture of this size: down to 1x1, as the spec requires.
@@ -2751,7 +2756,8 @@ impl TerrainMaterial {
             ],
         });
 
-        Self { bind_group, uniform }
+        let splat_size = [splat_image.width, splat_image.height];
+        Self { bind_group, uniform, splat_texture: splat_tex, splat_size }
     }
 
     /// A material with no authored textures: flat colours per layer.
@@ -2762,6 +2768,31 @@ impl TerrainMaterial {
     /// takes, and the wiring bugs all surface later, at once, blamed on the art.
     /// The colours are the ones the previous flat-shaded terrain used, so
     /// turning this on changes shading but not palette.
+    /// Stream painted weights into the bound splat texture. `false` when the
+    /// image's size does not match what the material was built with (the
+    /// caller rebuilds the material instead).
+    pub fn update_splat(&self, queue: &Queue, image: &TerrainImage) -> bool {
+        if [image.width, image.height] != self.splat_size {
+            return false;
+        }
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &self.splat_texture,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            &image.rgba,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * image.width),
+                rows_per_image: Some(image.height),
+            },
+            Extent3d { width: image.width, height: image.height, depth_or_array_layers: 1 },
+        );
+        true
+    }
+
     pub fn fallback(device: &Device, queue: &Queue, layout: &BindGroupLayout) -> Self {
         Self::fallback_with_splat(device, queue, layout, None, None)
     }
