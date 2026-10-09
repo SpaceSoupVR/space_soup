@@ -22,6 +22,14 @@ pub struct Renderer {
     pub queue: Queue,
     solid_pipeline: pipeline::SolidPipeline,
     wire_pipeline: pipeline::WirePipeline,
+    /// Depth-ignoring highlight variant: see `render_with_overlay`.
+    overlay_pipeline: pipeline::SolidPipeline,
+    /// The surface format, kept so pipelines can be rebuilt
+    /// (`set_cuboids_double_sided`) and off-screen thumbnail targets can
+    /// match the format the pipelines were built for.
+    pub format: TextureFormat,
+    /// What the 3D pass clears to each frame.
+    pub clear_color: wgpu::Color,
     mesh_pipeline: mesh_pipeline::MeshPipeline,
     skinned_mesh_pipeline: mesh_pipeline::SkinnedMeshPipeline,
     uniform_buf: uniforms::UniformBuffer,
@@ -67,6 +75,7 @@ impl Renderer {
         );
         let solid_pipeline = pipeline::SolidPipeline::new(&device, format, &uniform_buf.layout);
         let wire_pipeline = pipeline::WirePipeline::new(&device, format, &uniform_buf.layout);
+        let overlay_pipeline = pipeline::SolidPipeline::new_overlay(&device, format, &uniform_buf.layout);
         let mesh_pipeline = mesh_pipeline::MeshPipeline::new(&device, format, &uniform_buf.layout);
         let skinned_mesh_pipeline =
             mesh_pipeline::SkinnedMeshPipeline::new(&device, format, &uniform_buf.layout);
@@ -89,6 +98,9 @@ impl Renderer {
             queue,
             solid_pipeline,
             wire_pipeline,
+            overlay_pipeline,
+            format,
+            clear_color: wgpu::Color { r: 0.02, g: 0.02, b: 0.05, a: 1.0 },
             mesh_pipeline,
             skinned_mesh_pipeline,
             uniform_buf,
@@ -105,6 +117,13 @@ impl Renderer {
             mesh_lightmaps: HashMap::new(),
             default_mesh_lightmap,
         }
+    }
+
+    /// Editor nicety: render solid cuboids double-sided so a camera flown
+    /// inside one sees its interior instead of an x-ray hole.
+    pub fn set_cuboids_double_sided(&mut self) {
+        self.solid_pipeline =
+            pipeline::SolidPipeline::new_double_sided(&self.device, self.format, &self.uniform_buf.layout);
     }
 
     pub fn set_cuboid_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
@@ -190,7 +209,23 @@ impl Renderer {
         meshes: &[MeshInstance],
         lights: &[lights::Light],
     ) {
-        self.render_internal(target_view, camera, cuboids, meshes, &[], lights);
+        self.render_internal(target_view, camera, cuboids, meshes, &[], lights, &[]);
+    }
+
+    /// Like `render_with_lights`, but `overlay_cuboids` draw in an extra
+    /// pass that ignores depth (see `pipeline::SolidPipeline::new_overlay`)
+    /// -- so they read on top of everything. Meant for a highlight overlay
+    /// (e.g. a skeleton), not real geometry.
+    pub fn render_with_overlay(
+        &mut self,
+        target_view: &TextureView,
+        camera: &Camera,
+        cuboids: &[Cuboid],
+        overlay_cuboids: &[Cuboid],
+        meshes: &[MeshInstance],
+        lights: &[lights::Light],
+    ) {
+        self.render_internal(target_view, camera, cuboids, meshes, &[], lights, overlay_cuboids);
     }
 
     pub fn render_with_panels(
@@ -202,7 +237,7 @@ impl Renderer {
         panels: &[&WorldPanel],
         lights: &[lights::Light],
     ) {
-        self.render_internal(target_view, camera, cuboids, meshes, panels, lights);
+        self.render_internal(target_view, camera, cuboids, meshes, panels, lights, &[]);
     }
 
     #[allow(clippy::type_complexity)]
@@ -275,6 +310,7 @@ impl Renderer {
         meshes: &[MeshInstance],
         panels: &[&WorldPanel],
         lights: &[lights::Light],
+        overlay_cuboids: &[Cuboid],
     ) {
         let vp = camera.projection() * camera.view();
 
@@ -497,6 +533,20 @@ impl Renderer {
             );
         }
 
+        // Overlay cuboids aren't cached (there are only ever a handful --
+        // a skeleton's worth -- and they're rebuilt every frame anyway).
+        let (overlay_verts, overlay_indices, _) = super::cuboid::build_solid_mesh_with_ranges(overlay_cuboids);
+        let overlay_vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("overlay_vb"),
+            contents: bytemuck::cast_slice(&overlay_verts),
+            usage: BufferUsages::VERTEX,
+        });
+        let overlay_ib = self.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("overlay_ib"),
+            contents: bytemuck::cast_slice(&overlay_indices),
+            usage: BufferUsages::INDEX,
+        });
+
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("3d_pass"),
@@ -505,12 +555,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.02,
-                            b: 0.05,
-                            a: 1.0,
-                        }),
+                        load: LoadOp::Clear(self.clear_color),
                         store: StoreOp::Store,
                     },
                 })],
@@ -573,6 +618,17 @@ impl Renderer {
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(0..*count, 0, 0..1);
                 }
+            }
+
+            // Last, so it reads on top of everything above (see
+            // `SolidPipeline::new_overlay`'s own doc comment).
+            if !overlay_verts.is_empty() {
+                pass.set_pipeline(&self.overlay_pipeline.pipeline);
+                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                pass.set_bind_group(1, &self.default_cuboid_lightmap.bind_group, &[]);
+                pass.set_vertex_buffer(0, overlay_vb.slice(..));
+                pass.set_index_buffer(overlay_ib.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..overlay_indices.len() as u32, 0, 0..1);
             }
         }
 

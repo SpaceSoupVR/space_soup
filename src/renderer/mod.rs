@@ -117,7 +117,7 @@ pub use cuboid::{Cuboid, CuboidShape, CuboidStyle};
 pub use desktop_renderer::Renderer;
 pub use icon::{billboard_rotation, IconAssets, IconKind};
 pub use lights::{Light, LightKind};
-pub use mesh::{GltfMesh, MeshLightmapUv};
+pub use mesh::{load_clips_for, GltfClip, GltfMesh, MeshLightmapUv};
 pub use mirror::MirrorSurface;
 pub use panel::WorldPanel;
 pub use particle::{Beam, Particle, ParticlePipeline, ParticleVertex};

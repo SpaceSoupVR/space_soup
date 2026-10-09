@@ -694,6 +694,45 @@ pub fn write_lightmap_mips(queue: &wgpu::Queue, texture: &wgpu::Texture, chain: 
 }
 
 impl LoadedTexture {
+    /// Wraps an existing texture (e.g. a UI panel render target) in the
+    /// sampler + bind group the mesh pipeline expects.
+    pub fn from_texture(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        texture: wgpu::Texture,
+    ) -> Self {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("panel_quad_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("panel_quad_texture_bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        Self {
+            texture,
+            view,
+            _sampler: sampler,
+            bind_group,
+            _direction: None,
+            _sun_mask: None,
+        }
+    }
+
     /// This light map's bind group again, with the NEUTRAL sun mask in place
     /// of its baked one: every brush then reads the sun's level shadow from
     /// the static map -- what a sun that has moved off the baked direction
