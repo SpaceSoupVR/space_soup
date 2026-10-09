@@ -3,6 +3,7 @@ use glam::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
 use std::path::Path;
 
+pub mod clip;
 mod node;
 mod skin;
 mod texture;
@@ -15,6 +16,7 @@ pub use texture::{
     create_texture_from_rgba, LoadedTexture, lightmap_mips_f16, write_lightmap_mips,
     LIGHTMAP_MIP_LEVELS, NEUTRAL_BOUNCE_DIRECTION, NEUTRAL_SUN_MASK, SUN_MASK_MIP_LEVELS,
 };
+pub use clip::{load_clips_for, GltfClip};
 pub use vertex::{MeshPrimitive, MeshVertex, SkinnedMeshVertex};
 pub use thin_parts::{split_thin_parts, ThinParts, ThinSplit, ThinVertex, THIN_ALTITUDE_FACTOR, THIN_RADIUS_MAX};
 
@@ -190,7 +192,218 @@ impl GltfMesh {
         m
     }
 
+    /// A single textured quad in the XZ-facing plane (+Z normal), centered on
+    /// the origin — the mesh a world-space UI panel renders as. `u`/`v` map
+    /// left→right / top→bottom of `texture`.
+    pub fn textured_quad(
+        device: &wgpu::Device,
+        texture: std::sync::Arc<LoadedTexture>,
+        width_m: f32,
+        height_m: f32,
+    ) -> Self {
+        use wgpu::util::DeviceExt;
+        let (hw, hh) = (width_m * 0.5, height_m * 0.5);
+        let n = [0.0, 0.0, 1.0];
+        let vertices = vec![
+            MeshVertex { position: [-hw, hh, 0.0], normal: n, uv: [0.0, 0.0], uv2: [0.0, 0.0], uv2_rect: MeshVertex::WHOLE_ATLAS, emissive: 0 },
+            MeshVertex { position: [hw, hh, 0.0], normal: n, uv: [1.0, 0.0], uv2: [0.0, 0.0], uv2_rect: MeshVertex::WHOLE_ATLAS, emissive: 0 },
+            MeshVertex { position: [hw, -hh, 0.0], normal: n, uv: [1.0, 1.0], uv2: [0.0, 0.0], uv2_rect: MeshVertex::WHOLE_ATLAS, emissive: 0 },
+            MeshVertex { position: [-hw, -hh, 0.0], normal: n, uv: [0.0, 1.0], uv2: [0.0, 0.0], uv2_rect: MeshVertex::WHOLE_ATLAS, emissive: 0 },
+        ];
+        let indices: Vec<u32> = vec![0, 2, 1, 0, 3, 2];
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("panel_quad_vb"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("panel_quad_ib"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        Self {
+            primitives: vec![MeshPrimitive {
+                vertices,
+                indices,
+                texture,
+                vertex_buffer,
+                index_buffer,
+                layered: None,
+                casts_shadow: false,
+                blended: false,
+                thin: None,
+            }],
+            skin: None,
+            position: glam::Vec3::ZERO,
+            rotation: glam::Quat::IDENTITY,
+            scale: glam::Vec3::ONE,
+            bounding_radius: (hw * hw + hh * hh).sqrt(),
+        }
+    }
+
+    /// Loads a prop whose top-level mesh nodes should each be posable as a
+    /// "part": every mesh-bearing node becomes its own synthetic joint with
+    /// an identity inverse bind, so a caller can move parts (slide, bolt,
+    /// magazine) by writing that joint's matrix.
+    ///
+    /// Returns the mesh plus each joint's (name, bind-pose world transform)
+    /// in joint order, matching `update_joint_matrices`'s own joint order --
+    /// the caller composes `root * bind_world * own_animated_offset` per
+    /// part and passes the results straight through.
+    pub fn load_parts(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        path: &Path,
+    ) -> Result<(Self, Vec<(String, Mat4)>)> {
+        let (doc, buffers, images) =
+            gltf::import(path).with_context(|| format!("failed to open {}", path.display()))?;
+
+        let all_nodes: Vec<gltf::Node> = doc.nodes().collect();
+        let mut parent_of_node: HashMap<usize, usize> = HashMap::new();
+        for node in doc.nodes() {
+            for child in node.children() {
+                parent_of_node.insert(child.index(), node.index());
+            }
+        }
+
+        // Every mesh-bearing node becomes its own synthetic joint, in a
+        // stable (sorted) order -- registered up front, same two-pass
+        // approach `load_with_lightmap_uv` uses for orphan animation nodes,
+        // so a child's ancestor-joint lookup always finds its parent already
+        // mapped regardless of node declaration order.
+        let mesh_nodes: std::collections::BTreeSet<usize> = all_nodes
+            .iter()
+            .filter(|n| n.mesh().is_some())
+            .map(|n| n.index())
+            .collect();
+
+        let mut joint_names: Vec<String> = Vec::new();
+        let mut inv_bind_mats: Vec<Mat4> = Vec::new();
+        let mut joint_parents: Vec<Option<usize>> = Vec::new();
+        let mut joint_local_bind: Vec<(Vec3, Quat, Vec3)> = Vec::new();
+        let mut node_index_to_joint: HashMap<usize, usize> = HashMap::new();
+
+        for &node_idx in &mesh_nodes {
+            let node = &all_nodes[node_idx];
+            let ji = joint_names.len();
+            joint_names.push(node.name().unwrap_or("").to_string());
+            inv_bind_mats.push(Mat4::IDENTITY);
+            node_index_to_joint.insert(node_idx, ji);
+        }
+        for &node_idx in &mesh_nodes {
+            let node = &all_nodes[node_idx];
+            let (parent_joint, t, r, s) =
+                ancestor_joint_and_baked_local(node, &all_nodes, &parent_of_node, &node_index_to_joint);
+            joint_parents.push(parent_joint);
+            joint_local_bind.push((t, r, s));
+        }
+
+        if joint_names.len() > MAX_SKIN_JOINTS {
+            log::warn!(
+                "GltfMesh::load_parts: {} has {} mesh parts, exceeding MAX_SKIN_JOINTS={} -- extra parts will not animate correctly",
+                path.display(),
+                joint_names.len(),
+                MAX_SKIN_JOINTS,
+            );
+        }
+
+        let mut static_prims: Vec<MeshPrimitive> = Vec::new();
+        let mut skinned_prims: Vec<SkinnedMeshPrimitive> = Vec::new();
+        for scene in doc.scenes() {
+            for node in scene.nodes() {
+                collect_node(
+                    &node,
+                    Mat4::IDENTITY,
+                    None,
+                    &buffers,
+                    &images,
+                    device,
+                    queue,
+                    layout,
+                    false,
+                    &node_index_to_joint,
+                    None,
+                    &mut static_prims,
+                    &mut skinned_prims,
+                );
+            }
+        }
+        // Every mesh node was registered as a synthetic joint above, so
+        // `collect_node` never bakes and never falls back to a static
+        // primitive -- this would only be empty if the file had no
+        // mesh-bearing nodes at all.
+        if skinned_prims.is_empty() {
+            anyhow::bail!("no renderable mesh-bearing nodes found in {}", path.display());
+        }
+
+        log::info!(
+            "GltfMesh::load_parts: loaded {} parts from {}: {:?}",
+            joint_names.len(),
+            path.display(),
+            &joint_names,
+        );
+
+        let joint_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("skin_joint_buf"),
+            size: (MAX_SKIN_JOINTS * 64) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let skin = GltfSkin {
+            joint_names: joint_names.clone(),
+            inv_bind_mats,
+            joint_parents,
+            joint_local_bind: joint_local_bind.clone(),
+            animations: Vec::new(),
+            joint_buffer,
+            prev_joint_buffer: GltfSkin::joint_buffer(device, "skin_prev_joint_buf"),
+            last_joints: Default::default(),
+            motion_bind_group: Default::default(),
+            joint_bind_group: None,
+            primitives: skinned_prims,
+            bind_stature: 0.0,
+        };
+
+        let bind_world = skin.hierarchical_transforms(&joint_local_bind);
+        skin.update_joint_matrices(queue, &bind_world);
+
+        let bounding_radius = skin
+            .primitives
+            .iter()
+            .flat_map(|p| p.vertices.iter())
+            .map(|v| {
+                let world = bind_world.get(v.dominant_joint()).copied().unwrap_or(Mat4::IDENTITY);
+                world.transform_point3(Vec3::from(v.position)).length()
+            })
+            .fold(0.0_f32, f32::max);
+
+        let mesh = Self {
+            primitives: static_prims,
+            skin: Some(skin),
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+            bounding_radius,
+        };
+        let parts = joint_names.into_iter().zip(bind_world).collect();
+        Ok((mesh, parts))
+    }
+
     pub fn load(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        path: &Path,
+    ) -> Result<Self> {
+        Self::load_with_lightmap_uv(device, queue, layout, path, None)
+    }
+
+    /// Historically forced every material opaque for avatars whose BLEND-mode
+    /// clothing read as see-through. This loader now draws blended materials
+    /// in their own ordered pass, so it simply loads -- kept for callers
+    /// written against the old API.
+    pub fn load_all_opaque(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,

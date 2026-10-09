@@ -134,6 +134,86 @@ impl SolidPipeline {
         )
     }
 
+    /// Editor variant: no back-face culling, so a camera inside a cuboid
+    /// still sees its interior (SSStudio's scene editor).
+    pub fn new_double_sided(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+    ) -> Self {
+        Self::new_variant(device, format, uniform_layout, None, true)
+    }
+
+    /// Highlight variant: no culling and no depth test, drawn last so a
+    /// selection/skeleton overlay reads through real geometry.
+    pub fn new_overlay(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+    ) -> Self {
+        Self::new_variant(device, format, uniform_layout, None, false)
+    }
+
+    fn new_variant(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        cull_mode: Option<Face>,
+        depth_test: bool,
+    ) -> Self {
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("solid_variant_shader"),
+            source: ShaderSource::Wgsl(crate::renderer::multiview::ViewMode::Mono.shader(solid_shader()).into()),
+        });
+        let lightmap_layout = lightmap_bind_group_layout(device);
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("solid_variant_layout"),
+            bind_group_layouts: &[Some(uniform_layout), Some(&lightmap_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("solid_variant_pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(SolidVertex::layout())],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode,
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(depth_test),
+                depth_compare: Some(if depth_test { CompareFunction::Less } else { CompareFunction::Always }),
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: crate::renderer::multiview::ViewMode::Mono.mask(),
+            cache: None,
+        });
+        Self {
+            pipeline,
+            lightmap_layout,
+        }
+    }
+
     fn new_with_front_face(
         device: &Device,
         format: TextureFormat,
