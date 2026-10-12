@@ -2356,7 +2356,7 @@ mod stereo_target_tests {
 }
 
 mod depth_resolve_tests {
-    use super::*;
+    
 
     /// It must read EVERY sample, and take the nearest.
     #[test]
@@ -3018,7 +3018,7 @@ fn wgsl_ssr_block_debug(
     scene_group: u32,
     output: SsrOutput,
 ) -> String {
-    let debug = output == SsrOutput::FalseColour;
+    let _debug = output == SsrOutput::FalseColour;
     // The resolved depth, always. See `SceneTarget::resolved_depth_view`.
     let depth_ty = "texture_2d<f32>";
     // The coarsest mip the chain actually has, so the shader never asks for a

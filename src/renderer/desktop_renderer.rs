@@ -5,7 +5,7 @@ use wgpu::*;
 
 use super::cuboid::{build_solid_mesh_one, build_wire_mesh_one, CuboidSnapshot, SolidVertex, WireVertex};
 use super::lights::LightsUniform;
-use super::mesh::{create_texture_from_rgba, LoadedTexture};
+use super::mesh::LoadedTexture;
 use super::shadow::{self, ShadowKind, ShadowMap};
 use super::uniforms::ShadowUpload;
 use super::{icon, lights, mesh_pipeline, pipeline, uniforms};

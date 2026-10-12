@@ -61,7 +61,7 @@ use wgpu::*;
 
 use crate::renderer::lights::wgsl_lights_block;
 use crate::renderer::water_pipeline::{surface_fn_wgsl, surface_wgsl, swash_lift, WaterUniform, WaterVertex, LIGHT_PATH};
-use crate::renderer::water_waves::{WaveField, WaveParams, MIPS, N as WAVE_N};
+use crate::renderer::water_waves::{WaveField, MIPS, N as WAVE_N};
 
 /// Water's index for red, green and blue light: the window's edge fringes.
 pub const IOR_RGB: [f32; 3] = [1.331, 1.334, 1.338];

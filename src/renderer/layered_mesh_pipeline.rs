@@ -46,7 +46,6 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::*;
 
-use super::lights::wgsl_lights_block;
 use super::material_wgsl::{wgsl_biplanar_block, wgsl_whiteout_block};
 
 /// A vertex of a layer-blended mesh.
