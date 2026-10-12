@@ -53,7 +53,6 @@ pub use space_soup_sky::{
 pub use space_soup_sky::time_of_day::{AtlasLayers, LayerWeights, SkySnapshot, TimeOfDayParams, TimeOfDaySky};
 
 
-use anyhow::{bail, Result};
 use wgpu::*;
 
 use super::lights::wgsl_lights_block;

@@ -2,3 +2,6 @@ target/
 .claude/
 .claude/
 .claude/
+.DS_Store
+.cortex/
+*.bak
