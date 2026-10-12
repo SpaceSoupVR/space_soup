@@ -79,7 +79,10 @@ impl SkinnedMeshPrimitive {
     }
 }
 
-pub const MAX_SKIN_JOINTS: usize = 96;
+/// Joints past this get no matrix and collapse to streaks. Rigs run well past
+/// a humanoid's count (the SCP-427-1 monster has 256 bones), so this holds
+/// them; the palette is a 64 KB-limited uniform, 256 x 64 B = 16 KB.
+pub const MAX_SKIN_JOINTS: usize = 256;
 
 #[derive(Clone)]
 pub struct GltfAnimationPose {

@@ -791,8 +791,20 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // A character's surface lies inside its own capsules: it takes no capsule
     // darkening, which would black it out. See `capsule_ambient`.
     capsule_receiver = false;
+    // A material override's gloss rides in the emissive map's ALPHA -- a
+    // channel nothing reads and the loader force-bakes to 1 on every real
+    // asset. At 1 the surface keeps the classic constant-sheen shading every
+    // asset was lit with; below 1 it is the surface's roughness (0 polished,
+    // ~1 matte) and it shades as a material (see `shade_material`).
+    let rough = textureSample(emissive_tex, samp, in.uv).a;
     // The lamps and the sky, and the lit room round it: see `room_light`.
-    let lit = shade_with_sky(in.world_pos, n, model_u.params.x) + room_irradiance(n);
+    var lit: vec3<f32>;
+    if (rough >= 0.996) {{
+        lit = shade_with_sky(in.world_pos, n, model_u.params.x);
+    }} else {{
+        lit = shade_material(in.world_pos, n, rough, 1.0, model_u.params.x);
+    }}
+    lit = lit + room_irradiance(n);
     let tex_color = textureSample(tex, samp, in.uv);
     // WET IN THE RAIN (`weather`): water in the skin and cloth darkens them,
     // and a film of it glosses them -- its highlight and reflection from the

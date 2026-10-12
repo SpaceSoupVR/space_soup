@@ -66,6 +66,9 @@ pub struct Renderer {
     default_cuboid_lightmap: LoadedTexture,
     mesh_lightmaps: HashMap<String, LoadedTexture>,
     default_mesh_lightmap: LoadedTexture,
+    /// Caller-built line geometry drawn with the wire pipeline every frame
+    /// (an editor's grids and guides), on top of the cuboids' own edges.
+    raw_wire: (Vec<WireVertex>, Vec<u32>),
 }
 
 impl Renderer {
@@ -132,7 +135,14 @@ impl Renderer {
             default_cuboid_lightmap,
             mesh_lightmaps: HashMap::new(),
             default_mesh_lightmap,
+            raw_wire: (Vec::new(), Vec::new()),
         }
+    }
+
+    /// Replace the line geometry drawn each frame (`indices` pair up into
+    /// line segments). Pass empty vectors to clear it.
+    pub fn set_raw_wire(&mut self, vertices: Vec<WireVertex>, indices: Vec<u32>) {
+        self.raw_wire = (vertices, indices);
     }
 
     /// Editor nicety: render solid cuboids double-sided so a camera flown
@@ -473,8 +483,11 @@ impl Renderer {
         self.uniform_buf
             .upload(&self.queue, vp, camera.position, &shadow);
 
-        let ((solid_verts, solid_indices, solid_ranges), (wire_verts, wire_indices)) =
+        let ((solid_verts, solid_indices, solid_ranges), (mut wire_verts, mut wire_indices)) =
             self.bake_cuboids(cuboids);
+        let raw_base = wire_verts.len() as u32;
+        wire_verts.extend_from_slice(&self.raw_wire.0);
+        wire_indices.extend(self.raw_wire.1.iter().map(|i| i + raw_base));
 
         let solid_vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("solid_vb"),
