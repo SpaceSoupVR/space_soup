@@ -311,7 +311,14 @@ pub const CROWN_FRAMES: u32 = 3;
 pub const JET_LAYER: u32 = CROWN_LAYER + CROWN_VARIANTS * CROWN_FRAMES;
 pub const JET_VARIANTS: u32 = 2;
 pub const JET_FRAMES: u32 = 3;
-pub const ATLAS_LAYERS: u32 = JET_LAYER + JET_VARIANTS * JET_FRAMES;
+/// A splash's spray, and its white water (`spray_frame`, `froth_frame`).
+pub const SPRAY_LAYER: u32 = JET_LAYER + JET_VARIANTS * JET_FRAMES;
+pub const SPRAY_VARIANTS: u32 = 2;
+pub const SPRAY_FRAMES: u32 = 3;
+pub const FROTH_LAYER: u32 = SPRAY_LAYER + SPRAY_VARIANTS * SPRAY_FRAMES;
+pub const FROTH_VARIANTS: u32 = 2;
+pub const FROTH_FRAMES: u32 = 3;
+pub const ATLAS_LAYERS: u32 = FROTH_LAYER + FROTH_VARIANTS * FROTH_FRAMES;
 pub const ATLAS_SIZE: u32 = 128;
 const ATLAS_MIPS: u32 = 8;
 
@@ -1730,6 +1737,10 @@ pub struct Splash {
     /// open cavity or the churned, aerated patch of a splash before it, where
     /// there is no clean surface to lift a sheet from. Set by [`strike`].
     pub calm: f32,
+    /// 1 where what struck is HELD in its own cavity and does not leave it
+    /// behind -- a leg, a hand, an arm reaching in: the water cannot close
+    /// over it, so no jet. 0 for anything that goes on down.
+    pub held: f32,
     pub seed: u64,
 }
 
@@ -1739,7 +1750,7 @@ impl Splash {
     /// `sunlit` where they are known.
     pub fn new(position: Vec3, born: f64, velocity: Vec3, size: f32, mass: f32) -> Self {
         let seed = hash64(born.to_bits() ^ hash64((position.x.to_bits() as u64) << 32 | position.z.to_bits() as u64));
-        Self { position, born, velocity, size, mass, sunlit: 1.0, depth: 30.0, calm: 1.0, seed }
+        Self { position, born, velocity, size, mass, sunlit: 1.0, depth: 30.0, calm: 1.0, held: 0.0, seed }
     }
 
     /// A BULLET or any small fast thing meeting the water at `position`:
@@ -1786,14 +1797,14 @@ const DROP_DRAG: f32 = 4.5e-4;
 const SEAL_SPEED: (f32, f32) = (8.0, 40.0);
 /// The most drops one splash draws; the rest of its water is in its crown,
 /// its jet and its mist.
-const SPLASH_DROPS: usize = 160;
+const SPLASH_DROPS: usize = 110;
 /// The most pieces a crown is drawn in: each at most three times as wide as
 /// it is tall, so a low wide crown takes more.
-const SPLASH_PETALS: usize = 16;
-/// The step a splash's sprites' velocities are taken over, seconds.
+const SPLASH_PETALS: usize = 14;
 /// A crown's sheet, as a share of its cavity's radius: a few tenths of a
 /// millimetre for a pebble's, millimetres for a crate's.
 const SHEET_THICKNESS: f32 = 0.01;
+/// The step a splash's sprites' velocities are taken over, seconds.
 const SPLASH_H: f32 = 1.0 / 256.0;
 
 /// WHAT A SPLASH IS, worked out from what struck ([`splash_shape`]). Lengths
@@ -1836,7 +1847,21 @@ pub struct SplashShape {
     /// into its rim before it falls, and stays clear; a crate's, thick and
     /// tall, cannot be, and comes down in pieces.
     pub broken: f32,
-    /// Puffs of mist.
+    /// 0..1: how WHITE what it throws is -- a broken sheet's white water, or
+    /// what a strike into water already churned and full of air throws
+    /// instead of a crown.
+    pub white: f32,
+    /// How many fans of SPRAY stand round its rim (`spray_frame`), and how
+    /// many pieces of WHITE WATER (`froth_frame`).
+    pub spray: usize,
+    pub froth: usize,
+    /// How much faster the sheet leaves AHEAD of a thing that struck at a
+    /// slant: a wading foot ploughs its water forward.
+    pub plow: f32,
+    /// How fast the thing struck, m/s: no body of water it throws leaves
+    /// faster (a little thin spray does).
+    pub struck: f32,
+    /// Puffs of mist: a sealed strike's plume.
     pub mist: usize,
     /// THE RINGS it sends out over the water: the length of their waves, how
     /// fast the group of them travels, and how high they start.
@@ -1847,6 +1872,8 @@ pub struct SplashShape {
     /// until the water there is still again -- which is also how long a
     /// second strike finds it disturbed ([`strike`]).
     pub foam: f32,
+    /// How long the foam takes to dissolve, seconds.
+    pub foam_seconds: f32,
     pub settle: f32,
     /// Which way it was travelling over the water, as long as the cosine of
     /// the angle it came in at: none straight down, 1 skimming. What is
@@ -1858,6 +1885,26 @@ pub struct SplashShape {
     pub seconds: f32,
 }
 
+/// How high something thrown straight up at `up` m/s, slowed by the air at
+/// `k` a second, is after `t` seconds (below where it left, in the end).
+///
+/// `up a1 - g (t - a1) / k` with `a1 = (1 - e^(-kt)) / k` -- which in single
+/// precision loses `t - a1` to rounding while `kt` is small, and a sprite's
+/// last moments with it (its landing time out by parts in ten thousand, its
+/// fade by parts in a hundred): so through `exp_m1`, and by its series where
+/// `kt` is under a twentieth.
+fn thrown_height(up: f32, k: f32, t: f32) -> f32 {
+    let x = k * t;
+    // (t - a1) / k = t^2 phi(x), phi(x) = (x - 1 + e^-x) / x^2.
+    let (a1, phi) = if x < 0.05 {
+        (t * (1.0 - x * (0.5 - x * (1.0 / 6.0 - x / 24.0))), 0.5 - x * (1.0 / 6.0 - x * (1.0 / 24.0 - x / 120.0)))
+    } else {
+        let e = (-x).exp_m1();
+        (-e / k, (x + e) / (x * x))
+    };
+    up * a1 - GRAVITY * t * t * phi
+}
+
 /// How long something thrown straight up at `up` m/s, slowed by the air at
 /// `k` a second, is in the air.
 fn aloft(up: f32, k: f32) -> f32 {
@@ -1867,12 +1914,11 @@ fn aloft(up: f32, k: f32) -> f32 {
     if k < 1e-3 {
         return 2.0 * up / GRAVITY;
     }
-    let height = |t: f32| (up + GRAVITY / k) * (1.0 - (-k * t).exp()) / k - GRAVITY * t / k;
-    let apex = (1.0 + up * k / GRAVITY).ln() / k;
+    let apex = (up * k / GRAVITY).ln_1p() / k;
     let (mut lo, mut hi) = (apex, apex + 2.0 * up / GRAVITY + 1.0 / k);
     for _ in 0..24 {
         let mid = 0.5 * (lo + hi);
-        if height(mid) > 0.0 {
+        if thrown_height(up, k, mid) > 0.0 {
             lo = mid;
         } else {
             hi = mid;
@@ -1886,10 +1932,13 @@ fn apex(up: f32, k: f32) -> f32 {
     if up <= 0.0 {
         return 0.0;
     }
-    if k < 1e-3 {
-        return up * up / (2.0 * GRAVITY);
+    // up / k - g / k^2 ln(1 + y), y = up k / g: by its series while y is
+    // small, where the two terms are nearly equal.
+    let y = up * k / GRAVITY;
+    if y < 0.1 {
+        return up * up / GRAVITY * (0.5 - y * (1.0 / 3.0 - y * (0.25 - y * (0.2 - y / 6.0))));
     }
-    up / k - GRAVITY / (k * k) * (1.0 + up * k / GRAVITY).ln()
+    up / k - GRAVITY / (k * k) * y.ln_1p()
 }
 
 /// THE SPLASH A STRIKE MAKES, from its speed, its angle, the size and mass of
@@ -1977,9 +2026,21 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
 
     // The crown.
     // The wall's mean speed out is (a - r) in half the cavity's time; it
-    // starts faster than it ends, and the sheet leaves at its start.
-    let sheet_speed = 3.5 * (cavity - r) / collapse;
-    let sheet_angle = lerp(28.0f32, 68.0, deep).to_radians();
+    // starts faster than it ends, and the sheet leaves at its start. And
+    // the water a blunt thing throws off its shoulder as it goes in leaves
+    // at a share of the thing's own speed: a small share where the sheet is
+    // thin enough for surface tension to hold it back (a pebble's, a
+    // quarter), most of it for a thing a hand wide or more -- so a brick
+    // dropped a metre throws water most of the way back up, and a pebble's
+    // crown is a few centimetres. Nothing from a thing too light to drive in.
+    let shoulder = (WATER_DENSITY * normal * normal * r / SURFACE_TENSION).sqrt();
+    let thrown = 0.8 * shoulder / (shoulder + 150.0) * normal * (1.0 - sealed) * (travel / r).min(1.0);
+    let sheet_speed = (3.5 * (cavity - r) / collapse).max(thrown);
+    // Steeply where there is water under the thing; flat from a puddle
+    // shallower than the thing is wide, which has nowhere to go but out.
+    let steep = smoothstep(0.3, 1.5, s.depth / r);
+    let sheet_angle = lerp(28.0f32, 68.0, steep).to_radians();
+    let plow = 0.9 * flat.length() * (1.0 - sealed);
     let weber = WATER_DENSITY * sheet_speed * sheet_speed * cavity / SURFACE_TENSION;
     let drop = (cavity / weber.max(1.0).sqrt()).clamp(1.5e-4, 4e-3);
     let fine = 1.0 - smoothstep(3e-4, 1e-3, drop);
@@ -1989,23 +2050,32 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
     let crown_seconds = aloft(up, air);
     // As many pieces as cover its rim, each wider than it is tall.
     let rim = 1.2 * cavity;
-    let petals = if crown_height > 0.004 && fine < 0.75 { ((TAU * rim / (2.1 * crown_height)).round() as usize).clamp(5, SPLASH_PETALS) } else { 0 };
+    let petals = if crown_height > 0.004 && fine < 0.75 { ((TAU * rim / (1.6 * crown_height)).round() as usize).clamp(10, SPLASH_PETALS) } else { 0 };
     // The rim's fingers, a drop or two from each; in churned water fewer hold
     // together.
     let fingers = TAU * cavity / (9.0 * drop.max(1.5e-3));
     let drops = if sheet_speed > 0.15 { ((1.5 * fingers * (0.15 + 0.85 * (1.0 - fine)) * (0.4 + 0.6 * calm)).round() as usize).clamp(4, SPLASH_DROPS) } else { 0 };
-    let spray_speed = 0.6 * normal;
+    // The first, thin spray off the thing's shoulder: most of the thing's
+    // own speed from a big one, less from one small enough for surface
+    // tension to hold it back.
+    let spray_speed = (0.5 + 0.75 * shoulder / (shoulder + 150.0)) * normal;
 
     // The jet: only from a cavity with water under it that the thing has
     // left, closing evenly -- which one opened in churned water does not.
-    let jet_height = depth * passes * deep * calm * calm;
+    // (Nearly half as high again as the cavity was deep: the rebound is
+    // thin, and goes further than the hole it came from. None round a leg.)
+    let jet_height = 1.4 * depth * passes * deep * calm * calm * (1.0 - s.held.clamp(0.0, 1.0));
     let jet_width = (0.3 * cavity * (cavity / depth.max(1e-3)).sqrt()).clamp(0.08 * cavity, 0.45 * cavity);
     let jet_seconds = 2.0 * (2.0 * jet_height / GRAVITY).sqrt();
 
     // The sheet is about a hundredth of its cavity thick.
     let retracts = (2.0 * SURFACE_TENSION / (WATER_DENSITY * SHEET_THICKNESS * cavity)).sqrt();
     let broken = smoothstep(0.6, 2.5, crown_height / (retracts * crown_seconds.max(1e-3))) * (1.0 - fine);
-    let mist = ((1.0 + 9.0 * cavity * (0.3 + 0.7 * fine).sqrt() + 6.0 * sealed + 5.0 * broken + 2.0 * (1.0 - calm)).round() as usize).clamp(1, 10);
+    let white = broken.max(0.85 * (1.0 - calm)) * (1.0 - fine);
+    let throws = sheet_speed > 0.15;
+    let spray = if throws { ((1.5 + 9.0 * cavity.sqrt() * (1.0 - sealed) + 2.5 * sealed).round() as usize).clamp(3, 6) } else { 0 };
+    let froth = if throws && white > 0.4 { ((white * (6.0 + 4.0 * cavity.sqrt())).round() as usize).clamp(6, 9) } else { 0 };
+    let mist = if sealed > 0.05 { (2.0 + 6.0 * sealed).round() as usize } else { 0 };
 
     // The rings: waves a few cavity radii long, at the group speed of
     // gravity-capillary waves that long.
@@ -2016,7 +2086,11 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
     let ring_speed = phase_speed * (1.0 + 3.0 * bond) / (2.0 * (1.0 + bond));
     let ring_height = 0.12 * (cavity - r).max(0.0) * (0.3 + 0.7 * calm) * (1.0 - 0.5 * sealed);
 
-    let foam = ((0.2 + 0.5 * sealed + 0.3 * smoothstep(0.05, 0.5, cavity)) * smoothstep(0.1, 0.6, sheet_speed) * (1.0 + 0.5 * (1.0 - calm))).min(0.85);
+    // Foam: over 1 the patch is white right across (`splash_rings`); under,
+    // it is broken. More from a big cavity's collapse, from a sealed one's
+    // (which is all air), from water already churned.
+    let foam = ((0.7 + 0.9 * smoothstep(0.03, 0.5, cavity) + 0.4 * sealed + 0.4 * (1.0 - calm)) * smoothstep(0.1, 0.6, sheet_speed)).min(1.25);
+    let foam_seconds = 1.2 + 3.0 * cavity.sqrt();
     let settle = (1.5 + 4.0 * cavity.sqrt()).min(6.0);
 
     // A sheet keeps some of the thing's own way; spray thrown straight up by
@@ -2024,11 +2098,15 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
     let carry = (flat * 0.4).clamp_length_max(sheet_speed) * (1.0 - 0.8 * sealed);
     // Its fastest drops' flight (the finest hang in the air long after they
     // can be seen: not counted), its jet's, its crown's, its mist's.
-    let fastest = sheet_speed + spray_speed;
+    let fastest = sheet_speed + spray_speed + plow;
     let finest = (drop * (sheet_speed / fastest.max(1e-3)).clamp(0.08, 1.0)).max(1.5e-4);
+    // Its fans of spray: thrown with the sheet and some of the fast spray.
+    let fan = 1.25 * sheet_speed + 0.45 * spray_speed + plow;
+    let fan_seconds = if spray > 0 { aloft(fan * sheet_angle.sin(), DROP_DRAG * fan / (0.6 * drop)).min(2.5) + 0.25 * collapse } else { 0.0 };
     let seconds = (0.5 * collapse + aloft(fastest * sheet_angle.sin(), DROP_DRAG * fastest / finest).min(2.5) * (1.0 - fine))
         .max(collapse + jet_seconds + 0.1)
         .max(if petals > 0 { 1.3 * crown_seconds + 0.2 * collapse } else { 0.0 })
+        .max(fan_seconds * (1.0 - sealed))
         .max(0.6 * collapse + 0.5 + 1.2 * cavity.sqrt() + 0.4 * sealed)
         .min(SPLASH_SECONDS);
     SplashShape {
@@ -2048,11 +2126,17 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
         jet_height,
         jet_width,
         broken,
+        white,
+        spray,
+        froth,
+        plow,
+        struck: speed,
         mist,
         ring_wavelength,
         ring_speed,
         ring_height,
         foam,
+        foam_seconds,
         settle,
         forward,
         carry,
@@ -2069,7 +2153,7 @@ pub fn splash_range(shape: &SplashShape) -> f32 {
 /// The box (world, min and max) everything a splash throws stays in.
 pub fn splash_bounds(s: &Splash) -> (Vec3, Vec3) {
     let shape = splash_shape(s);
-    let fastest = shape.sheet_speed + shape.spray_speed;
+    let fastest = shape.sheet_speed + shape.spray_speed + shape.plow;
     // Its biggest drops fly furthest; its mist and crown stay nearer.
     let (up, out) = (fastest * shape.sheet_angle.sin(), fastest * shape.sheet_angle.cos() + shape.carry.length());
     let slowed = DROP_DRAG / (1.6 * shape.drop);
@@ -2208,9 +2292,10 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         let down_range = out.dot(toward) * lean;
         // Most leave with the sheet; a few, thrown as the thing first met the
         // water, far faster -- and those are the finest.
-        let launch = shape.sheet_speed * lerp(0.6, 1.0, u[6]) + shape.spray_speed * u[2] * u[2] * (1.0 + 0.8 * down_range).max(0.2);
+        let ahead = down_range.max(0.0);
+        let launch = shape.sheet_speed * lerp(0.6, 1.0, u[6]) + shape.spray_speed * u[2] * u[2] * (1.0 + 0.8 * down_range).max(0.2) + shape.plow * ahead * ahead * u[6];
         let width = (shape.drop * lerp(0.6, 1.6, u[5]) * (shape.sheet_speed / launch.max(1e-3)).clamp(0.08, 1.0)).max(1.5e-4);
-        let elevation = shape.sheet_angle + (u[1] - 0.5) * 0.42;
+        let elevation = shape.sheet_angle * (1.0 - 0.45 * ahead) + (u[1] - 0.5) * 0.42;
         let v0 = out * (elevation.cos() * launch) + Vec3::Y * (elevation.sin() * launch) + shape.carry * (u[7] * (0.5 + 0.5 * down_range));
         let p0 = middle + out * (shape.cavity * lerp(0.8, 1.1, u[3]));
         let a = age - 0.5 * shape.collapse * u[4];
@@ -2238,21 +2323,28 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
 
     // THE CROWN, in pieces round the rim: the sheet the opening cavity lifts,
     // each piece thrown up and out on its own, wider than it is tall, leaning
-    // out as the sheet leaves, standing where it is in the world -- so the
-    // crown is a ring seen from any side and in each eye, not a card. No two
-    // pieces alike, nor two splashes: which of the textures, how high, how
-    // soon. It breaks up as it falls back (the texture's three stages) and
-    // thins: no sheet from water already churned.
-    let whole = (1.0 - shape.fine) * calm;
-    if shape.petals > 0 && whole > 0.02 {
+    // out as the sheet leaves, standing where it is in the world and
+    // overlapping its neighbours -- so the crown is a wall the whole way
+    // round, seen from any side and in each eye, not a card. No two pieces
+    // alike, nor two splashes: which of the textures, how high, how soon. It
+    // breaks up as it falls back (the texture's three stages) and thins: no
+    // sheet from water already churned. Ahead of a thing that struck at a
+    // slant it leaves faster and lower -- ploughed.
+    // And little of one too thick to hold together: that goes up white.
+    let whole = (1.0 - shape.fine) * calm * (1.0 - 0.85 * shape.broken);
+    let crown_opacity = 0.92 * whole;
+    // (A sheet nearly all white water is drawn as that, below: a faint clear
+    // one behind it would be paid for and not seen.)
+    if shape.petals > 0 && crown_opacity > 0.2 {
         let turn = uniforms(hash64(s.seed ^ 0xc80))[0] * TAU;
-        let up0 = shape.sheet_speed * shape.sheet_angle.sin();
         for k in 0..shape.petals {
             let u = uniforms(hash64(s.seed ^ 0xc80 ^ (k as u64 + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
-            let azimuth = turn + TAU * (k as f32 + 0.7 * (u[0] - 0.5)) / shape.petals as f32;
+            let azimuth = turn + TAU * (k as f32 + 0.5 * (u[0] - 0.5)) / shape.petals as f32;
             let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
             let down_range = out.dot(toward) * lean;
-            let up = up0 * lerp(0.75, 1.3, u[1]) * (1.0 + 0.6 * down_range).max(0.3);
+            let ahead = down_range.max(0.0);
+            let angle = shape.sheet_angle * (1.0 - 0.45 * ahead);
+            let up = (shape.sheet_speed + shape.plow * ahead * ahead) * angle.sin() * lerp(0.8, 1.25, u[1]) * (1.0 + 0.6 * down_range.min(0.0)).max(0.3);
             let air = DROP_DRAG * up / shape.drop;
             let life = aloft(up, air).max(0.04);
             let start = 0.2 * shape.collapse * u[2];
@@ -2261,18 +2353,20 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
                 continue;
             }
             // The piece's axis: up and out at the sheet's angle.
-            let axis = (Vec3::Y * shape.sheet_angle.sin() + out * shape.sheet_angle.cos()).normalize();
+            let axis = (Vec3::Y * angle.sin() + out * angle.cos()).normalize();
             let tangent = Vec3::new(-out.z, 0.0, out.x);
             let place = |since: f32| -> (Vec3, f32, f32, f32) {
                 let since = since.clamp(0.0, life);
-                let high = ballistic(Vec3::ZERO, Vec3::Y * up, gravity, air, since).0.y.max(0.0);
-                let long = high / shape.sheet_angle.sin();
-                let rim = shape.cavity * (0.8 + 0.45 * smoothstep(0.0, 0.5 * shape.collapse, since)) + 0.3 * shape.carry.length() * since * down_range.max(0.0);
+                let high = thrown_height(up, air, since).max(0.0);
+                let long = high / angle.sin();
+                let rim = shape.cavity * (0.8 + 0.45 * smoothstep(0.0, 0.5 * shape.collapse, since)) + (0.3 * shape.carry.length() + 0.5 * shape.plow * angle.cos()) * since * ahead;
                 let centre = middle + out * rim + axis * (0.5 * long);
                 let (spin, shows) = seen_along(centre, axis);
                 let (_, across) = seen_along(centre, tangent);
                 let half = (0.5 * long * shows.max(0.2)).max(1e-4);
-                let wide = (1.25 * PI * rim / shape.petals as f32 * across.max(0.45)).min(3.0 * half).max(half);
+                // Its whole place on the rim each side: it laps half of each
+                // neighbour, and their faded sides make one wall.
+                let wide = (2.0 * PI * rim / shape.petals as f32 * across.max(0.45)).min(6.0 * half).max(half);
                 (centre, half, wide / half, spin)
             };
             let since = age - start;
@@ -2280,11 +2374,13 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
             let moving = (place(since + 0.5 * SPLASH_H).0 - place(since - 0.5 * SPLASH_H).0) / SPLASH_H;
             let centre = player(centre_w);
             let moving = at.yaw_inv * moving;
-            let c = lit(centre, 0.95, 0.0);
+            // A wall of water shows the sky through and off it: lit from
+            // every side, a little more against the sun.
+            let c = lit(centre, 0.95, 0.15);
             // A sheet too thick to draw back into its rim is in pieces sooner.
             let stage = 1.999 * smoothstep(0.3 - 0.3 * shape.broken, 0.95 - 0.35 * shape.broken, t);
             let variant = (u[3] * CROWN_VARIANTS as f32) as u32 % CROWN_VARIANTS;
-            let opacity = 0.85 * whole * smoothstep(0.0, 0.06, t) * (1.0 - smoothstep(0.8, 1.0, t));
+            let opacity = crown_opacity * smoothstep(0.0, 0.06, t) * (1.0 - smoothstep(0.8, 1.0, t));
             over.push((
                 (centre - at.head).length_squared(),
                 EffectInstance {
@@ -2296,6 +2392,110 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
                     // Its texture lies on its side (`crown_frame`): a quarter
                     // turn stands it up, and its length is then its width.
                     params: [FRAC_PI_2 + spin, (CROWN_LAYER + variant * CROWN_FRAMES) as f32 + stage, aspect, 0.0],
+                    motion: [moving.x, moving.y, moving.z, 0.0],
+                },
+            ));
+        }
+    }
+
+    // SPRAY, and WHITE WATER: what the eye takes a splash for from across a
+    // pond. Hundreds of drops leave with the sheet and ahead of it, far too
+    // many and too small to draw one by one (the streaks above are the few
+    // that glint): they are drawn as FANS of them standing round the rim
+    // (`spray_frame`), each growing as its drops fly up and apart, thinning
+    // as they come down. A sheet too thick to hold together, and anything
+    // thrown from water already churned and full of air, goes up WHITE
+    // (`froth_frame`): tongues of it shoulder to shoulder round the rim,
+    // straight up, lower, denser, slower to fall -- facing the eye, each of
+    // them, so the ring of them is a body of white water from any side and
+    // never a fence of boards. A sealed strike's spray is not round a rim
+    // but up its middle, tall and narrow: a bullet's white needle.
+    struct Fan {
+        count: usize,
+        layer: u32,
+        variants: u32,
+        salt: u64,
+        /// How much of the fast spray's speed its front has, and how coarse
+        /// its drops are against the sheet's (the air stops fine ones).
+        fast: (f32, f32),
+        coarse: f32,
+        /// How much taller than wide.
+        tall: (f32, f32),
+        /// 1: standing straight up, not leaning out with the sheet.
+        stand: f32,
+        opacity: f32,
+        phase_g: f32,
+    }
+    let plume = shape.sealed;
+    let fans = [
+        Fan { count: shape.froth, layer: FROTH_LAYER, variants: FROTH_VARIANTS, salt: 0xf207, fast: (0.0, 0.05), coarse: 1.5, tall: (1.0, 1.15), stand: 1.0, opacity: 0.95 * shape.white, phase_g: 0.0 },
+        // (A fan's picture is of some hundreds of drops: a pebble's handful
+        // is a fainter one.)
+        Fan { count: shape.spray, layer: SPRAY_LAYER, variants: SPRAY_VARIANTS, salt: 0x5b7a, fast: (0.15, 0.45), coarse: 0.6, tall: (1.0, 1.5), stand: 0.0, opacity: 0.95 * (shape.drops as f32 / 60.0).clamp(0.45, 1.0).max(plume), phase_g: 0.2 },
+    ];
+    for fan in &fans {
+        if fan.opacity < 0.02 {
+            continue;
+        }
+        let turn = uniforms(hash64(s.seed ^ fan.salt))[0] * TAU;
+        for j in 0..fan.count {
+            let u = uniforms(hash64(s.seed ^ fan.salt ^ (j as u64 + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
+            let azimuth = turn + TAU * (j as f32 + 0.7 * (u[0] - 0.5)) / fan.count as f32;
+            let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
+            let down_range = out.dot(toward) * lean;
+            let ahead = down_range.max(0.0);
+            let open_launch = ((shape.sheet_speed * lerp(0.9, 1.25, u[1]) + shape.spray_speed * lerp(fan.fast.0, fan.fast.1, u[2]) + shape.plow * ahead * ahead) * (1.0 + 0.5 * down_range.min(0.0)).max(0.4)).min(0.9 * shape.struck);
+            // A plume's is as high as its jet, give or take.
+            let launch = lerp(open_launch, (2.0 * GRAVITY * shape.jet_height.max(0.3 * shape.depth)).sqrt() * lerp(0.6, 1.1, u[1]), plume);
+            let angle = lerp(shape.sheet_angle * (1.0 - 0.45 * ahead), 1.5, plume);
+            let up = launch * angle.sin();
+            // A cloud of spray carries its air with it; a sealed strike's
+            // goes up its own column.
+            let air = DROP_DRAG * launch / (fan.coarse * shape.drop) * (1.0 - plume) / 2.2;
+            let life = aloft(up, air).max(0.1);
+            let rises = if air < 1e-3 { up / GRAVITY } else { (up * air / GRAVITY).ln_1p() / air };
+            let start = 0.25 * shape.collapse * u[3] * (1.0 - plume) + 0.3 * shape.collapse * plume * u[3];
+            let since = age - start;
+            let t = since / life;
+            if !(t > 0.0 && t < 1.0) {
+                continue;
+            }
+            let leans = lerp(angle, FRAC_PI_2, fan.stand);
+            let axis = (Vec3::Y * leans.sin() + out * leans.cos()).normalize();
+            // (A big splash's fans are narrower for their height: its spray
+            // goes up more than out.)
+            let tall_by = lerp(fan.tall.0, fan.tall.1, u[4]) * (1.0 + 1.2 * plume) * (1.0 + 0.35 * (1.0 - fan.stand) * smoothstep(0.2, 0.7, shape.cavity));
+            let place = |since: f32| -> (Vec3, f32, f32) {
+                let since = since.clamp(0.0, life);
+                // Its front climbs to the top of its throw; then its drops
+                // rain back through it and it sinks as it thins.
+                let top = thrown_height(up, air, since.min(rises)).max(0.0);
+                let high = top * (1.0 - 0.4 * smoothstep(0.55, 1.0, since / life));
+                let long = high / leans.sin();
+                let rim = shape.cavity * (0.85 + 0.35 * smoothstep(0.0, 0.5 * shape.collapse, since)) * (1.0 - plume) * lerp(0.6 + 0.4 * u[5], 1.0, fan.stand);
+                let foot = middle + out * rim + (shape.carry * 0.3 + toward * (0.5 * shape.plow * angle.cos())) * (since * ahead * (1.0 - plume));
+                let centre = foot + axis * (0.5 * long);
+                let (spin, shows) = seen_along(centre, axis);
+                ((centre), (0.5 * long * shows.max(0.25)).max(1e-4), spin)
+            };
+            let (centre_w, tall, spin) = place(since);
+            let moving = at.yaw_inv * ((place(since + 0.5 * SPLASH_H).0 - place(since - 0.5 * SPLASH_H).0) / SPLASH_H);
+            let centre = player(centre_w);
+            let half = tall / tall_by;
+            let c = lit(centre, 0.97, fan.phase_g);
+            // White water falls back as a body; spray is apart at once.
+            let stage = 1.999 * smoothstep(lerp(0.12, 0.4, fan.stand), lerp(0.8, 0.97, fan.stand), t);
+            let variant = (u[6] * fan.variants as f32) as u32 % fan.variants;
+            let opacity = fan.opacity * lerp(0.8, 1.0, u[7]) * smoothstep(0.0, 0.05, t) * (1.0 - smoothstep(0.7, 1.0, t));
+            over.push((
+                (centre - at.head).length_squared(),
+                EffectInstance {
+                    centre: [centre.x, centre.y, centre.z, half],
+                    colour: [c.x, c.y, c.z, opacity],
+                    light: [0.0, 0.0, 0.0, 1.0],
+                    light_dir: [0.0, 1.0, 0.0, 0.0],
+                    axis: [0.0, 1.0, 0.0, (0.25 * half).clamp(0.005, 0.05)],
+                    params: [spin, (fan.layer + variant * 3) as f32 + stage, if u[8] < 0.5 { -tall_by } else { tall_by }, 0.0],
                     motion: [moving.x, moving.y, moving.z, 0.0],
                 },
             ));
@@ -2372,14 +2572,11 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         }
     }
 
-    // MIST: what was thrown too fine to see as drops, in puffs that the air
-    // stops and that sink and thin as they spread. Little of a pebble's
-    // splash is this, and it lies low. Most of a bullet's is: a sealed
-    // strike's water goes straight up, a narrow PLUME that the air stops
-    // within a metre -- its finest spray lowest, its coarsest highest --
-    // standing a moment where it struck and falling back as it fades. More
-    // from water already churned.
-    let plume = shape.sealed;
+    // MIST: what a SEALED strike throws too fine to see as drops -- most of
+    // a bullet's splash. Its water goes straight up, a narrow PLUME that the
+    // air stops within a metre -- its finest spray lowest, its coarsest
+    // highest -- standing a moment where it struck and falling back as it
+    // fades. (An open strike's fine water is in its fans of spray.)
     let mist_turn = uniforms(hash64(s.seed ^ 0x5bd1e995))[0] * TAU;
     for i in 0..shape.mist {
         let u = uniforms(hash64(s.seed ^ 0x5bd1e995 ^ (i as u64 + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
@@ -2400,32 +2597,24 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         // (By the golden ratio, so that neighbours round the rim are not
         // neighbours in this.)
         let share = ((i as f32 + 1.0) * 0.618_034 + u[2] / shape.mist as f32).fract();
-        // White water goes where the drops do: the coarsest of it with the
-        // fast spray thrown as the thing first met the water.
-        let launch = (shape.sheet_speed + shape.broken * shape.spray_speed * share * share) * lerp(0.35, 1.0, share);
+        let launch = shape.sheet_speed * lerp(0.35, 1.0, share);
         let width = shape.drop * lerp(0.35, 1.2, share);
         let v0 = out * (launch * shape.sheet_angle.cos() * (1.0 - 0.9 * plume)) + Vec3::Y * (launch * lerp(shape.sheet_angle.sin() * 0.6, 1.0, plume)) + shape.carry * 0.3;
         // A cloud of fine drops drags the air along with it: it goes about
         // twice as far as one of its drops would alone.
-        let drag = (DROP_DRAG * launch / (2.2 * width)).max(3.0 - 2.5 * shape.broken);
+        let drag = (DROP_DRAG * launch / (2.2 * width)).max(3.0);
         let (pos, vel) = ballistic(middle + out * (shape.cavity * 0.6 * (1.0 - plume)), v0, gravity, drag, since);
         // As big as the spray it is: the crown's height and some of the
         // cavity's width -- a plume's, half its narrow cavity's, and taller
         // than wide.
-        let size = lerp(0.3 * shape.cavity + shape.crown_height, 0.7 * shape.cavity, plume) * lerp(0.7, 1.3, u[4]) * (0.5 + 1.7 * t);
-        // White water stands ON the water, not half in it.
-        let floor = s.position.y + 0.02 + 0.5 * size * shape.broken;
+        let size = lerp(0.3 * shape.cavity + shape.crown_height, 0.45 * shape.cavity, plume) * lerp(0.7, 1.3, u[4]) * (0.5 + 1.7 * t);
+        let floor = s.position.y + 0.02;
         let centre = player(pos.max(Vec3::new(f32::MIN, floor, f32::MIN)));
         let moving = at.yaw_inv * if pos.y < floor { vel * Vec3::new(1.0, 0.0, 1.0) } else { vel };
         // Thick, its light is scattered many times over: as bright from any
-        // side, so even (g = 0), not a single drop's forward lobe. And a
-        // broken sheet's white water is thick enough to be lit as a white
-        // SURFACE is (the sun's light over pi, some of it turned from the
-        // eye), four times what one scattering sends this way.
-        let c = lit(centre, 0.95 * (1.0 + 1.4 * shape.broken), 0.0);
-        // Over dark water a twentieth of white is already a grey cloud: an
-        // open strike's mist is a breath, a sealed one's a plume.
-        let opacity = (0.015 + 0.3 * shape.fine + 0.55 * shape.broken * shape.broken + 0.12 * (1.0 - calm)) * smoothstep(0.0, 0.08, t) * (1.0 - t).powf(1.4);
+        // side, so even (g = 0), not a single drop's forward lobe.
+        let c = lit(centre, 0.95, 0.0);
+        let opacity = (0.05 + 0.7 * shape.fine) * plume * smoothstep(0.0, 0.08, t) * (1.0 - t).powf(1.4);
         let frame = SMOKE_FRAMES as f32 * (0.35 + 0.55 * t);
         over.push((
             (centre - at.head).length_squared(),
@@ -2491,7 +2680,7 @@ pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: 
             }
             let shape = splash_shape(s);
             let lasts = ring_seconds(&shape);
-            if age >= lasts.max(shape.settle) || shape.ring_height <= 0.0 && shape.foam <= 0.0 {
+            if age >= lasts.max(shape.foam_seconds + shape.collapse) || shape.ring_height <= 0.0 && shape.foam <= 0.0 {
                 return None;
             }
             let k = TAU / shape.ring_wavelength;
@@ -2512,8 +2701,15 @@ pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: 
             // The cavity, open: a bowl a cavity's radius wide, as deep as it
             // is (no deeper than wide: past that it is a hole, not a slope).
             let bowl = 0.5 * shape.depth.min(shape.cavity) * (PI * (age / shape.collapse).min(1.0)).sin().max(0.0);
-            let reach = shape.cavity * (1.1 + 0.6 * smoothstep(0.0, shape.settle, age));
-            let foam = shape.foam * smoothstep(0.3 * shape.collapse, 1.2 * shape.collapse, age) * (1.0 - smoothstep(0.35 * shape.settle, shape.settle, age));
+            // THE FOAM: the air the collapse folds in, white right across as
+            // the cavity shuts (over 1: the water fills its bubbles in),
+            // spreading, thinning to a broken patch and gone in a second or
+            // two -- fresh water holds no foam -- drawn out into arcs along
+            // the waves that leave through it as it goes.
+            let foamed = (age - 0.3 * shape.collapse) / shape.foam_seconds;
+            let reach = shape.cavity * (1.0 + 0.9 * smoothstep(0.0, 1.0, foamed));
+            let foam = shape.foam * smoothstep(0.3 * shape.collapse, 0.9 * shape.collapse, age) * (1.0 - smoothstep(0.0, 1.0, foamed)).powf(1.5);
+            let streaked = 0.2 * smoothstep(0.1, 0.6, foamed);
             let apart = (s.position - head_world).length();
             // Nothing at the moment it lands -- no ring yet, no foam -- so it
             // comes to matter as it opens, and what it crowds out sinks as it
@@ -2524,7 +2720,7 @@ pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: 
                 [
                     [s.position.x, s.position.z, radius, height.max(1e-7)],
                     [k, 1.0 / (2.0 * width * width), phase, 2.0 * bowl / (reach * reach)],
-                    [foam, 1.0 / (reach * reach), 0.0, 0.0],
+                    [foam, 1.0 / (reach * reach), streaked, 0.0],
                 ],
             ))
         })
@@ -2537,7 +2733,7 @@ pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: 
         let keep = (2.0 * (1.0 - cut / weight)).clamp(0.0, 1.0);
         out.rings[i] = [ring[0], ring[1], ring[2], (ring[3] * keep).max(1e-7)];
         out.waves[i] = [wave[0], wave[1], wave[2], wave[3] * keep];
-        out.pools[i] = [pool[0] * keep, pool[1], 0.0, 0.0];
+        out.pools[i] = [pool[0] * keep, pool[1], pool[2], 0.0];
     }
     out
 }
@@ -3184,6 +3380,12 @@ pub fn atlas_layers() -> Vec<Vec<u8>> {
     for variant in 0..JET_VARIANTS {
         layers.extend((0..JET_FRAMES).map(|stage| jet_frame(variant, stage)));
     }
+    for variant in 0..SPRAY_VARIANTS {
+        layers.extend((0..SPRAY_FRAMES).map(|stage| spray_frame(variant, stage)));
+    }
+    for variant in 0..FROTH_VARIANTS {
+        layers.extend((0..FROTH_FRAMES).map(|stage| froth_frame(variant, stage)));
+    }
     layers
 }
 
@@ -3243,56 +3445,57 @@ impl Dabs {
 
 /// A PIECE OF A SPLASH'S CROWN, seen from the side, in one of three stages
 /// of its breaking up -- which a piece is blended through as it rises and
-/// falls back. Stage 0, THE SHEET: a film of water lifted from the surface --
-/// nearly clear, a film a millimetre thick hides little; what shows of it is
-/// the streaks it was thrown in and its edge -- thickening into a rim that
+/// falls back. Stage 0, THE SHEET: a wall of water lifted from the surface.
+/// A film of water is clear, but it is not flat: it is thrown in streaks and
+/// ripples, and each catches the sky -- so from across a pond a crown is a
+/// pale, streaked curtain with a bright thick rim, not glass. The rim
 /// scallops into short fingers, each shedding a drop. Stage 1, BREAKING: the
-/// film thinner and torn into holes, the rim in lengths, the fingers necked.
-/// Stage 2, DROPS: no film; the rim and the fingers are beads, falling
-/// apart. `variant` is which piece: no two alike, and a crown is several. On
-/// its side (`Dabs::finish`).
+/// film torn into holes from its top, the rim in lengths, the fingers necked.
+/// Stage 2, DROPS: the rim and the fingers are beads, falling apart; of the
+/// film, threads. `variant` is which piece: no two alike, and a crown is
+/// several, each overlapping its neighbours, its sides fading into theirs --
+/// a wall the whole way round, not petals. On its side (`Dabs::finish`).
 fn crown_frame(variant: u32, stage: u32) -> Vec<u8> {
     let seed = 0xc0ffee ^ ((variant as u64 + 1) << 20);
     let stage = stage.min(2);
     let mut d = Dabs::new();
-    let base = 0.97f32;
-    // The rim's height across the piece: scalloped.
-    // A hump: highest in its middle, down to the water at its sides, so
-    // pieces side by side are a scalloped wall and none is a box.
+    let base = 0.98f32;
+    // The wall's top across the piece: scalloped, a little lower at its
+    // sides where the next piece takes over.
     let rim = move |x: f32| {
-        let hump = (std::f32::consts::PI * x.clamp(0.0, 1.0)).sin().max(0.0).powf(0.55);
-        base - (base - 0.36) * hump + (0.06 * noise1(x * 4.0, seed) + 0.035 * noise1(x * 11.0, seed ^ 7)) * hump
+        let side = (2.0 * x - 1.0) * (2.0 * x - 1.0);
+        0.38 + 0.1 * noise1(x * 3.3, seed) + 0.045 * noise1(x * 9.0, seed ^ 7) + 0.07 * side
     };
     // The rim: water gathered along the sheet's edge.
-    for c in 0..96 {
-        let x = 0.03 + 0.94 * (c as f32 + 0.5) / 96.0;
+    for c in 0..110 {
+        let x = 0.01 + 0.98 * (c as f32 + 0.5) / 110.0;
         let u = uniforms(hash64(seed ^ 0x71 ^ (c as u64).wrapping_mul(0x9e3779b97f4a7c15)));
         // Thicker and thinner along it: where it is thick, a finger starts.
-        let thick = 0.019 + 0.008 * noise1(x * 9.0, seed ^ 0x33);
+        let thick = 0.024 + 0.011 * noise1(x * 9.0, seed ^ 0x33);
         match stage {
-            0 => d.dab(x, rim(x), thick, 0.85),
+            0 => d.dab(x, rim(x), thick, 0.95),
             // In lengths, parting where it was thin.
             1 => {
-                if noise1(x * 9.0, seed ^ 0x33) > -0.35 {
-                    d.dab(x, rim(x) + 0.012, 0.9 * thick, 0.85);
+                if noise1(x * 9.0, seed ^ 0x33) > -0.4 {
+                    d.dab(x, rim(x) + 0.012, 0.9 * thick, 0.95);
                 }
             }
             // Beads, falling a little as they part.
             _ => {
-                if c % 5 == 0 {
-                    d.dab(x + 0.012 * (u[0] - 0.5), rim(x) + 0.03 + 0.04 * u[1], lerp(0.009, 0.016, u[2]), 0.9);
+                if c % 4 == 0 {
+                    d.dab(x + 0.012 * (u[0] - 0.5), rim(x) + 0.03 + 0.05 * u[1], lerp(0.011, 0.02, u[2]), 0.95);
                 }
             }
         }
     }
     // Fingers: the rim's thick places thrown on ahead of it, short, each
     // ending in the drop it sheds.
-    for f in 0..6u64 {
+    for f in 0..7u64 {
         let u = uniforms(hash64(seed ^ 0xf1 ^ f.wrapping_mul(0x632be59bd9b4e019)));
-        let x0 = 0.1 + 0.8 * (f as f32 + 0.15 + 0.7 * u[0]) / 6.0;
+        let x0 = 0.06 + 0.88 * (f as f32 + 0.15 + 0.7 * u[0]) / 7.0;
         let lean = (u[1] - 0.5) * 0.7;
-        let long = lerp(0.05, 0.17, u[2] * u[2]) * [1.0f32, 1.35, 1.6][stage as usize];
-        let wide = lerp(0.01, 0.017, u[3]);
+        let long = lerp(0.07, 0.2, u[2] * u[2]) * [1.0f32, 1.35, 1.6][stage as usize];
+        let wide = lerp(0.012, 0.02, u[3]);
         let y0 = rim(x0);
         let steps = 28;
         for k in 0..=steps {
@@ -3312,36 +3515,132 @@ fn crown_frame(variant: u32, stage: u32) -> Vec<u8> {
                 }
             };
             if neck > 0.0 {
-                d.dab(x, y, wide * (1.0 - 0.45 * t) * neck, 0.9);
+                d.dab(x, y, wide * (1.0 - 0.45 * t) * neck, 0.95);
             }
         }
         let tip = (x0 + lean * long, y0 - long * 0.75);
-        d.dab(tip.0, tip.1 - 0.008, wide * 1.3, 0.95);
+        d.dab(tip.0, tip.1 - 0.008, wide * 1.4, 0.97);
         // And those already shed, flying on.
-        for k in 0..stage + 1 {
+        for k in 0..2 * stage + 2 {
             let v = uniforms(hash64(seed ^ 0xd0 ^ (f * 8 + k as u64).wrapping_mul(0x8cb92ba72f3d8dd7)));
-            d.dab(tip.0 + (v[0] - 0.5) * 0.14, (tip.1 - 0.03 - 0.2 * v[1] * v[1]).max(0.04), lerp(0.005, 0.01, v[2]), 0.9);
+            d.dab(tip.0 + (v[0] - 0.5) * 0.16, (tip.1 - 0.03 - 0.22 * v[1] * v[1]).max(0.03), lerp(0.006, 0.012, v[2]), 0.95);
         }
     }
-    // THE FILM under them: thin, streaked the way it was thrown, a little
-    // thicker toward the rim it feeds; torn as it breaks.
+    // THE FILM under them: streaked the way it was thrown, each streak a
+    // ripple that catches the sky, thicker toward the rim it feeds and at
+    // its foot where it leaves the water; torn as it breaks.
     let film = move |x: f32, y: f32| -> f32 {
-        if stage == 2 || y < rim(x) || y > base {
+        if y < rim(x) || y > base {
             return 0.0;
         }
         let up = 1.0 - (y - rim(x)) / (base - rim(x));
-        // Hardly there but for the streaks that catch the light.
-        let streak = 0.5 + 0.5 * noise1(x * 23.0 + 0.6 * noise1(y * 5.0, seed ^ 0x52), seed ^ 0x51);
-        let body = (0.02 + 0.2 * streak.powi(6)) * (0.6 + 0.6 * up);
-        if stage == 0 {
-            return body;
+        let warp = 0.5 * noise1(y * 4.0, seed ^ 0x52);
+        let streak = 0.5 + 0.5 * noise1(x * 21.0 + warp, seed ^ 0x51);
+        let fine = 0.5 + 0.5 * noise1(x * 55.0 + 2.0 * warp, seed ^ 0x53);
+        let under_rim = smoothstep(0.75, 1.0, up);
+        // Clearest where it leaves the water, thick and smooth; whiter up
+        // toward the rim, where it is thin, rippled and breaking.
+        let body = (0.13 + 0.42 * streak * streak * streak + 0.16 * fine * fine + 0.22 * under_rim) * (0.12 + 0.88 * smoothstep(0.0, 0.65, up));
+        match stage {
+            0 => body,
+            // Holes open from the top down.
+            1 => 0.8 * body * smoothstep(-0.25, 0.2, noise3(Vec3::new(x * 8.0, y * 6.0, 3.7), seed ^ 0x40) + 0.6 * (1.0 - up) - 0.25),
+            // Threads of it, falling.
+            _ => 0.55 * body * smoothstep(0.05, 0.4, noise3(Vec3::new(x * 12.0, y * 5.0, 9.1), seed ^ 0x41) + 0.35 * (1.0 - up) - 0.2),
         }
-        // Holes open from the top down.
-        let torn = smoothstep(-0.25, 0.2, noise3(Vec3::new(x * 9.0, y * 7.0, 3.7), seed ^ 0x40) + 0.55 * (1.0 - up) - 0.2);
-        0.6 * body * torn
     };
     // Its sides fade into the pieces beside it, its foot into the water.
-    d.finish(film, |x, y| smoothstep(0.0, 0.04, x) * smoothstep(1.0, 0.96, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.95, y), true)
+    d.finish(film, |x, y| smoothstep(0.0, 0.24, x) * smoothstep(1.0, 0.76, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.96, y), true)
+}
+
+/// SPRAY: the drops a splash throws, too many and too small to draw one by
+/// one -- a fan of them from where its foot stands on the water (the bottom
+/// row's middle), most along its axis, the fastest furthest. Stage 0, JUST
+/// THROWN: each a short streak along its flight, a breath of mist among them.
+/// Stage 1: apart, round. Stage 2: half of them down, the rest smaller. The
+/// sprite that shows it grows as they fly, which is what parts them.
+fn spray_frame(variant: u32, stage: u32) -> Vec<u8> {
+    let seed = 0x5b7a1 ^ ((variant as u64 + 1) << 20);
+    let stage = stage.min(2) as usize;
+    let mut d = Dabs::new();
+    let foot = (0.5f32, 0.975f32);
+    let count = [340u64, 340, 170][stage];
+    for i in 0..count {
+        let u = uniforms(hash64(seed ^ (i + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
+        // Either side of its axis, most near it.
+        let angle = (u[0] + u[1] - 1.0) * 0.8;
+        let far = [0.8f32, 0.93, 0.95][stage] * u[2].powf(0.55) * (1.0 - 0.3 * angle * angle);
+        let (sx, sy) = (angle.sin(), -angle.cos());
+        let (x, y) = (foot.0 + sx * far, foot.1 + sy * far);
+        // Few big, many small; the far ones are the small fast ones.
+        let r = lerp(0.0035, 0.012, u[3] * u[3] * u[3]) * (1.15 - 0.4 * far) * [1.0f32, 1.0, 0.8][stage];
+        if stage == 0 {
+            let long = lerp(0.03, 0.09, u[4]) * (0.4 + 0.6 * far);
+            for k in 0..6 {
+                let t = k as f32 / 5.0;
+                d.dab(x - sx * long * t, y - sy * long * t, r * (1.0 - 0.55 * t), 0.92);
+            }
+        } else {
+            d.dab(x, y + 0.03 * u[5] * (stage as f32 - 1.0), r, 0.92);
+        }
+    }
+    let haze = move |x: f32, y: f32| -> f32 {
+        let (dx, dy) = (x - foot.0, foot.1 - y);
+        let far = (dx * dx + dy * dy).sqrt();
+        let angle = dx.atan2(dy.max(1e-4));
+        let cone = (1.0 - (angle / 0.75) * (angle / 0.75)).max(0.0) * smoothstep(0.0, 0.08, far) * (1.0 - smoothstep(0.25, 0.8, far));
+        [0.2f32, 0.1, 0.0][stage] * cone * (0.55 + 0.45 * noise3(Vec3::new(x * 9.0, y * 9.0, 0.7), seed ^ 0x11))
+    };
+    d.finish(haze, |x, y| smoothstep(0.0, 0.04, x) * smoothstep(1.0, 0.96, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.985, y), false)
+}
+
+/// WHITE WATER IN THE AIR: what a sheet too thick to hold together is thrown
+/// as (`SplashShape::broken`), and what a strike into churned water throws
+/// -- water full of air, white the way a breaking wave is. One of the
+/// TONGUES of it that stand round the rim, shoulder to shoulder, where a
+/// clear crown would: upright, its foot on the bottom row, its sides fading
+/// into its neighbours'. Not a puff and not a sheet: thick at its foot,
+/// streaked the way it was thrown, lumpy, its top ragged -- tongues of it
+/// running ahead and shedding drops. Stage 0, THROWN: dense. Stage 1:
+/// thinning, holes opening from its top. Stage 2: shreds of it falling back,
+/// and drops.
+fn froth_frame(variant: u32, stage: u32) -> Vec<u8> {
+    let seed = 0xf207 ^ ((variant as u64 + 1) << 20);
+    let stage = stage.min(2) as usize;
+    let mut d = Dabs::new();
+    let base = 0.98f32;
+    // How high each tongue of it reaches, across the piece (y down).
+    let top = move |x: f32| {
+        let side = (2.0 * x - 1.0) * (2.0 * x - 1.0);
+        (0.34 + 0.26 * noise1(x * 3.7, seed) + 0.12 * noise1(x * 10.0, seed ^ 3) + 0.16 * side).clamp(0.06, 0.85)
+    };
+    // The drops its tongues shed, and more as it thins.
+    for i in 0..[60u64, 120, 150][stage] {
+        let u = uniforms(hash64(seed ^ 0xbead ^ (i + 1).wrapping_mul(0x632be59bd9b4e019)));
+        let x = 0.08 + 0.84 * u[0];
+        let reach = base - top(x);
+        let h = reach * lerp([0.85f32, 0.5, 0.15][stage], 1.25, u[2]);
+        d.dab(x, (base - h).max(0.02), lerp(0.005, 0.014, u[3] * u[3]), 0.92);
+    }
+    let body = move |x: f32, y: f32| -> f32 {
+        if y > base {
+            return 0.0;
+        }
+        let up = (base - y) / (base - top(x));
+        let lives = 1.0 - smoothstep(0.65, 1.0, up);
+        let warp = 0.6 * noise1(y * 3.0, seed ^ 0x21);
+        let streak = 0.5 + 0.5 * noise3(Vec3::new(x * 22.0 + warp, y * 4.0, 1.9), seed ^ 0x22);
+        let lumps = 0.5 + 0.5 * noise3(Vec3::new(x * 6.0, y * 6.0, 4.3), seed ^ 0x23);
+        let dense = [0.85f32 - 0.3 * up, 0.72 - 0.3 * up, 0.5 - 0.2 * up][stage];
+        // Its foot is in the foam it stands on, not a line across the water.
+        let a = lives * dense * (0.25 + 0.4 * streak + 0.5 * lumps) * smoothstep(0.0, 0.3, up);
+        match stage {
+            0 => a,
+            1 => a * smoothstep(-0.3, 0.2, noise3(Vec3::new(x * 7.0, y * 6.0, 7.7), seed ^ 0x24) + 0.5 - 0.8 * up),
+            _ => a * smoothstep(0.0, 0.35, noise3(Vec3::new(x * 9.0 + warp, y * 4.0, 2.2), seed ^ 0x25) + 0.25 - 0.35 * up),
+        }
+    };
+    d.finish(body, |x, y| smoothstep(0.0, 0.4, x) * smoothstep(1.0, 0.6, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.97, y), false)
 }
 
 /// A SPLASH'S JET, seen from the side, in three stages of ITS breaking up.
@@ -3467,14 +3766,13 @@ pub fn cutouts(layers: &[Vec<u8>]) -> Vec<[f32; 16]> {
             let next = match l {
                 l if l < SMOKE_FRAMES - 1 => Some(l + 1),
                 l if (FIRE_FIRST..FIRE_FIRST + FIRE_FRAMES - 1).contains(&l) => Some(l + 1),
-                // A splash's crown and jet: each stage toward the next of its
-                // own variant.
-                l if (CROWN_LAYER..JET_LAYER).contains(&l) && (l - CROWN_LAYER) % CROWN_FRAMES < CROWN_FRAMES - 1 => Some(l + 1),
-                l if (JET_LAYER..ATLAS_LAYERS).contains(&l) && (l - JET_LAYER) % JET_FRAMES < JET_FRAMES - 1 => Some(l + 1),
+                // A splash's crown, jet, spray and white water: each stage
+                // toward the next of its own variant (three stages each).
+                l if (CROWN_LAYER..ATLAS_LAYERS).contains(&l) && (l - CROWN_LAYER) % CROWN_FRAMES < CROWN_FRAMES - 1 => Some(l + 1),
                 _ => None,
             };
             let smeared: Vec<Vec<u8>> = match next {
-                Some(m) if l >= FIRE_FIRST => vec![flame_smear(&layers[l as usize], dt), flame_smear(&layers[m as usize], -dt)],
+                Some(m) if (FIRE_FIRST..FIRE_FIRST + FIRE_FRAMES).contains(&l) => vec![flame_smear(&layers[l as usize], dt), flame_smear(&layers[m as usize], -dt)],
                 _ => Vec::new(),
             };
             let mut with: Vec<&[u8]> = vec![&layers[l as usize]];
@@ -4456,12 +4754,19 @@ mod tests {
         let grows = (b.cavity - 0.02) / (a.cavity - 0.02);
         assert!((1.45..1.75).contains(&grows), "cavity {} -> {} ({grows})", a.cavity, b.cavity);
         // The same Froude number at four times the size: four times the
-        // cavity, twice as slow, twice as fast a sheet, four times the crown.
+        // cavity, twice as slow; its sheet at least twice as fast and its
+        // crown at least four times as high -- and more, since what the
+        // bigger thing throws off its shoulder surface tension holds back
+        // less.
         let (small, big) = (splash_shape(&heavy(3.0, 0.03)), splash_shape(&heavy(6.0, 0.12)));
         assert!((big.cavity / small.cavity - 4.0).abs() < 0.2, "{} vs {}", big.cavity, small.cavity);
         assert!((big.collapse / small.collapse - 2.0).abs() < 0.1, "{} vs {}", big.collapse, small.collapse);
-        assert!((big.sheet_speed / small.sheet_speed - 2.0).abs() < 0.1);
-        assert!((big.crown_height / small.crown_height - 4.0).abs() < 0.6, "{} vs {}", big.crown_height, small.crown_height);
+        assert!((1.9..5.0).contains(&(big.sheet_speed / small.sheet_speed)), "{} vs {}", big.sheet_speed, small.sheet_speed);
+        assert!((3.4..25.0).contains(&(big.crown_height / small.crown_height)), "{} vs {}", big.crown_height, small.crown_height);
+        // A pebble's sheet leaves at about a quarter of the pebble's speed;
+        // a crate's at over half the crate's.
+        let (p, c) = (splash_shape(&pebble()), splash_shape(&crate_box()));
+        assert!((0.18..0.32).contains(&(p.sheet_speed / 4.4)) && (0.5..0.8).contains(&(c.sheet_speed / 6.3)), "{} {}", p.sheet_speed, c.sheet_speed);
         assert!(big.ring_wavelength > 3.5 * small.ring_wavelength && big.ring_speed > 1.5 * small.ring_speed);
         // Lowered in, nothing: no cavity past its own width, no sheet.
         let lowered = splash_shape(&heavy(0.05, 0.05));
@@ -4513,7 +4818,9 @@ mod tests {
         let (a, b) = (simulate_with(&[], &soft, 0.12, &at), simulate_with(&[], &hard, 0.12, &at));
         let top = |f: &EffectFrame| f.instances[..f.over as usize].iter().map(|i| i.centre[1] + i.centre[3]).fold(0.0, f32::max);
         assert!(b.screened > 2 * a.screened, "{} vs {}", b.screened, a.screened);
-        assert!(top(&b) > 1.5 * top(&a), "{} vs {}", top(&b), top(&a));
+        assert!(top(&b) > 1.3 * top(&a), "{} vs {}", top(&b), top(&a));
+        let (p, g) = (splash_shape(&pebble()), splash_shape(&pistol()));
+        assert!(g.crown_height > 1.8 * p.crown_height && g.spray >= p.spray, "{} vs {}", g.crown_height, p.crown_height);
     }
 
     /// What a foot throws goes the way the foot was going.
@@ -4564,15 +4871,20 @@ mod tests {
         let churned = second(shape.collapse as f64 + 0.3, 0.03);
         assert!((0.25..0.7).contains(&churned.calm), "{}", churned.calm);
         assert!(second(0.1, 2.0).calm == 1.0 && second(shape.settle as f64 + 0.1, 0.0).calm == 1.0);
-        // What it throws: no pieces of crown, no jet; fewer drops; more mist.
+        // What it throws: no pieces of crown, no jet; fewer drops, lower
+        // rings. But not nothing: spray still, the water it throws white
+        // with the air already in it, and more foam where it struck.
         let (calm, rough) = (splash_shape(&first), splash_shape(&into_the_hole));
         assert_eq!(rough.jet_height, 0.0);
-        assert!(rough.drops < calm.drops && rough.mist > calm.mist && rough.ring_height < 0.5 * calm.ring_height);
-        let crown_pieces = |s: Splash| {
+        assert!(rough.drops < calm.drops && rough.ring_height < 0.5 * calm.ring_height);
+        assert!(calm.froth == 0 && rough.froth >= 6 && rough.white > 0.8 && rough.spray >= 3 && rough.foam > calm.foam, "{rough:?}");
+        let pieces = |s: Splash, layers: std::ops::Range<u32>| {
             let f = simulate_with(&[], &[Splash { born: 0.0, ..s }], 0.08, &at);
-            f.instances[..f.over as usize].iter().filter(|i| i.params[1] >= CROWN_LAYER as f32 && i.colour[3] > 0.02).count()
+            f.instances[..f.over as usize].iter().filter(|i| layers.contains(&(i.params[1] as u32)) && i.colour[3] > 0.02).count()
         };
-        assert!(crown_pieces(first) >= 5 && crown_pieces(into_the_hole) == 0);
+        assert!(pieces(first, CROWN_LAYER..JET_LAYER) >= 5 && pieces(into_the_hole, CROWN_LAYER..JET_LAYER) == 0);
+        assert!(pieces(first, FROTH_LAYER..ATLAS_LAYERS) == 0 && pieces(into_the_hole, FROTH_LAYER..ATLAS_LAYERS) >= 4);
+        assert!(pieces(into_the_hole, SPRAY_LAYER..FROTH_LAYER) >= 2);
         // A pebble into a crate's patch is swallowed; a crate onto a
         // pebble's hardly notices.
         let mut live = vec![crate_box()];
@@ -4650,7 +4962,8 @@ mod tests {
         for k in 0..1600 {
             let (a, b) = (total(0.005 * k as f64), total(0.005 * (k + 1) as f64));
             assert!((a.0 - b.0).abs() < 0.06 * peak, "heights jump at {} s: {} -> {} of {peak}", 0.005 * k as f64, a.0, b.0);
-            assert!((a.1 - b.1).abs() < 0.03, "foam jumps at {} s: {} -> {}", 0.005 * k as f64, a.1, b.1);
+            // (Foam comes as its cavity shuts, in a tenth of a second.)
+            assert!((a.1 - b.1).abs() < 0.1, "foam jumps at {} s: {} -> {}", 0.005 * k as f64, a.1, b.1);
         }
     }
 
@@ -4696,12 +5009,20 @@ mod tests {
     fn save_the_splash_textures() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let n = ATLAS_SIZE as usize;
-        let cols = (CROWN_VARIANTS + JET_VARIANTS) as usize;
+        let cols = (CROWN_VARIANTS + JET_VARIANTS + SPRAY_VARIANTS + FROTH_VARIANTS) as usize;
         let (w, h) = (cols * n, 3 * n);
         let mut sheet = vec![0u8; w * h * 4];
         for stage in 0..3u32 {
             for c in 0..cols as u32 {
-                let (layer, on_its_side) = if c < CROWN_VARIANTS { (crown_frame(c, stage), true) } else { (jet_frame(c - CROWN_VARIANTS, stage), false) };
+                let (layer, on_its_side) = if c < CROWN_VARIANTS {
+                    (crown_frame(c, stage), true)
+                } else if c < CROWN_VARIANTS + JET_VARIANTS {
+                    (jet_frame(c - CROWN_VARIANTS, stage), false)
+                } else if c < CROWN_VARIANTS + JET_VARIANTS + SPRAY_VARIANTS {
+                    (spray_frame(c - CROWN_VARIANTS - JET_VARIANTS, stage), false)
+                } else {
+                    (froth_frame(c - CROWN_VARIANTS - JET_VARIANTS - SPRAY_VARIANTS, stage), false)
+                };
                 for y in 0..n {
                     for x in 0..n {
                         // Stood up: the stored texel that shows at (x, y).
@@ -4717,26 +5038,73 @@ mod tests {
         image::save_buffer(out.join("splash_textures.png"), &sheet, w as u32, h as u32, image::ExtendedColorType::Rgba8).expect("textures");
     }
 
+    /// WHITE WATER. A crate's sheet is too thick to draw back into its rim
+    /// and comes down white, in tongues round the rim; a pebble's and a
+    /// pistol's hold together and are clear. And the foam each leaves is
+    /// white right across for a moment, then broken, then gone -- in a second
+    /// or two for a pebble, three or four for a crate.
+    #[test]
+    fn a_crate_throws_white_water_and_foam_dissolves() {
+        let (p, g, c) = (splash_shape(&pebble()), splash_shape(&pistol()), splash_shape(&crate_box()));
+        assert!(p.broken == 0.0 && p.froth == 0 && g.froth == 0, "{} {}", p.froth, g.froth);
+        assert!(c.broken > 0.6 && c.froth >= 6 && c.white > 0.6, "{c:?}");
+        assert!(p.foam_seconds < g.foam_seconds && g.foam_seconds < c.foam_seconds);
+        assert!((1.2..2.2).contains(&p.foam_seconds) && (3.0..4.5).contains(&c.foam_seconds));
+        let head = Vec3::new(0.0, 1.6, 3.0);
+        let foam = |s: Splash, t: f64| splash_rings::<4>(&[s], t, head).pools[0];
+        // The crate's: over 1 as its cavity shuts, under a half two seconds
+        // on, gone by four; drawn out along its rings more as it goes.
+        let shut = c.collapse as f64 + 0.1;
+        assert!(foam(crate_box(), shut)[0] > 1.0 && foam(crate_box(), 2.0)[0] < 0.6 && foam(crate_box(), 4.3)[0] == 0.0, "{:?}", foam(crate_box(), 2.0));
+        assert!(foam(crate_box(), 2.0)[2] > foam(crate_box(), shut)[2]);
+        assert!(foam(pebble(), 0.25)[0] > 0.4 && foam(pebble(), 1.8)[0] < 0.02);
+        // It spreads as it thins.
+        assert!(foam(crate_box(), 2.0)[1] < foam(crate_box(), shut)[1]);
+    }
+
+    /// A LEG OR A HAND stays in the cavity it opens: the water cannot shut
+    /// over it, and throws no jet. All else of its splash is the same.
+    #[test]
+    fn what_is_held_in_its_cavity_throws_no_jet() {
+        let free = Splash { depth: 0.6, ..foot() };
+        let held = Splash { held: 1.0, ..free };
+        let (a, b) = (splash_shape(&free), splash_shape(&held));
+        assert!(a.jet_height > 0.05 && b.jet_height == 0.0, "{} {}", a.jet_height, b.jet_height);
+        assert!(a.cavity == b.cavity && a.sheet_speed == b.sheet_speed && a.spray == b.spray);
+    }
+
     /// WHAT EACH COSTS: `cargo test --release --lib print_the_splashes --
     /// --ignored --nocapture` prints, for each of the things in the strips,
-    /// its shape and, seen from 3 m, the most instances it draws at once and
-    /// the most quad area (square metres, cutouts not taken off).
+    /// its shape and, seen from 3 m, the most instances it draws at once,
+    /// the most quad area (square metres) and how much of that lies within
+    /// the sprites' cutouts -- what is rasterised.
     #[test]
     #[ignore]
     fn print_the_splashes() {
         let at = seen_from(Vec3::new(0.0, 1.6, 3.0));
+        // Each layer's cutout as a share of its quad (shoelace, in -1..1).
+        let share: Vec<f32> = cutouts(&atlas_layers())
+            .iter()
+            .map(|c| {
+                let p: Vec<[f32; 2]> = (0..8).map(|k| [c[2 * k], c[2 * k + 1]]).collect();
+                (0..8).map(|k| p[k][0] * p[(k + 1) % 8][1] - p[(k + 1) % 8][0] * p[k][1]).sum::<f32>().abs() / 8.0
+            })
+            .collect();
         for (name, s) in [("pebble", pebble()), ("pistol", pistol()), ("bullet", bullet()), ("foot", foot()), ("crate", crate_box())] {
             let shape = splash_shape(&s);
-            let (mut most, mut most_over, mut area) = (0u32, 0u32, 0.0f32);
+            let (mut most, mut most_over, mut area, mut drawn) = (0u32, 0u32, 0.0f32, 0.0f32);
             for k in 0..600 {
                 let f = simulate_with(&[], &[s], 0.005 * k as f64, &at);
                 most = most.max(f.over + f.screened);
                 most_over = most_over.max(f.over);
                 let a: f32 = f.instances[..f.over as usize].iter().map(|i| 4.0 * i.centre[3] * i.centre[3] * i.params[2].abs().max(1.0)).sum();
                 area = area.max(a);
+                // What is drawn of each quad: its cutout's share of it.
+                let d: f32 = f.instances[..f.over as usize].iter().map(|i| 4.0 * i.centre[3] * i.centre[3] * i.params[2].abs().max(1.0) * share[(i.params[1] as usize).min(share.len() - 1)]).sum();
+                drawn = drawn.max(d);
             }
             eprintln!(
-                "{name:7} cavity {:.3} m x {:.3} deep, closes in {:.3} s, sealed {:.2}; sheet {:.2} m/s at {:.0} deg, crown {:.3} m for {:.2} s in {} pieces, broken {:.2}; drops {} of {:.2} mm (fine {:.2}), spray +{:.1} m/s; jet {:.3} m high, {:.3} wide; mist {}; rings {:.2} m long at {:.2} m/s, {:.1} mm high; foam {:.2}, settles {:.1} s; lasts {:.2} s | most instances {most} ({most_over} over), over-drawn quads {area:.3} m2",
+                "{name:7} cavity {:.3} m x {:.3} deep, closes in {:.3} s, sealed {:.2}; sheet {:.2} m/s at {:.0} deg, crown {:.3} m for {:.2} s in {} pieces, broken {:.2}; drops {} of {:.2} mm (fine {:.2}), spray +{:.1} m/s; jet {:.3} m high, {:.3} wide; mist {}; rings {:.2} m long at {:.2} m/s, {:.1} mm high; foam {:.2}, settles {:.1} s; lasts {:.2} s | most instances {most} ({most_over} over), quads {area:.3} m2, drawn within their cutouts {drawn:.3} m2",
                 shape.cavity, shape.depth, shape.collapse, shape.sealed, shape.sheet_speed, shape.sheet_angle.to_degrees(), shape.crown_height,
                 shape.crown_seconds, shape.petals, shape.broken, shape.drops, shape.drop * 1e3, shape.fine, shape.spray_speed, shape.jet_height, shape.jet_width,
                 shape.mist, shape.ring_wavelength, shape.ring_speed, shape.ring_height * 1e3, shape.foam, shape.settle, shape.seconds,
@@ -5623,9 +5991,22 @@ mod tests {
                 ..emitter(EffectKind::Dust)
             },
         ];
-        let splashes = [Splash { depth: 0.3, seed: 7, ..Splash::new(Vec3::new(-1.0, 0.0, 1.0), 9.8, Vec3::new(0.0, -2.5, 0.0), 0.08, 3.0) }];
+        // One of each thing a splash can be, so the port's every branch is
+        // held: a dropped weight; a pebble's clear crown and thin jet; a
+        // bullet's sealed plume; a wading foot's plough (held: no jet); a
+        // crate's white water; a strike into water already churned, in shade.
+        let splashes = [
+            Splash { depth: 0.3, seed: 7, ..Splash::new(Vec3::new(-1.0, 0.0, 1.0), 9.8, Vec3::new(0.0, -2.5, 0.0), 0.08, 3.0) },
+            Splash { depth: 2.0, seed: 3, ..Splash::new(Vec3::new(1.5, 0.0, 1.5), 9.85, Vec3::new(0.0, -4.4, 0.0), 0.015, 0.035) },
+            Splash { depth: 2.0, seed: 5, ..Splash::projectile(Vec3::new(-2.5, 0.0, 0.5), 9.9, Vec3::new(247.0, -247.0, 0.0), 0.009, 0.008) },
+            Splash { depth: 0.2, held: 1.0, seed: 9, ..Splash::new(Vec3::new(0.5, 0.0, 2.0), 9.85, Vec3::new(-2.3, -1.1, 0.4), 0.07, 3.0) },
+            Splash { depth: 0.5, seed: 13, ..Splash::new(Vec3::new(-3.0, 0.0, -1.0), 9.7, Vec3::new(0.0, -6.3, 0.0), 0.4, 30.0) },
+            Splash { depth: 1.0, calm: 0.15, sunlit: 0.4, seed: 21, ..Splash::new(Vec3::new(2.5, 0.0, -0.5), 9.9, Vec3::new(0.0, -4.4, 0.0), 0.07, 0.9) },
+        ];
         let mut frames = Vec::new();
-        for (time, yaw, offset) in [(10.0f64, 0.0f32, Vec3::ZERO), (10.35, 0.0, Vec3::ZERO), (23.7, 0.9, Vec3::new(1.0, 0.0, -2.0))] {
+        for (time, yaw, offset) in
+            [(10.0f64, 0.0f32, Vec3::ZERO), (10.35, 0.0, Vec3::ZERO), (10.2, 0.9, Vec3::new(1.0, 0.0, -2.0)), (23.7, 0.9, Vec3::new(1.0, 0.0, -2.0))]
+        {
             let head = Vec3::new(0.3, 1.6, 3.0);
             let at = Surroundings { head, offset, yaw_inv: Quat::from_rotation_y(-yaw), lights: &lights, ambient: &ambient, exposure: 1.3, ..seen_from(head) };
             let f = simulate_with(&emitters, &splashes, time, &at);
@@ -5659,12 +6040,12 @@ mod tests {
             })).collect::<Vec<_>>(),
             "splashes": splashes.iter().map(|s| serde_json::json!({
                 "position": s.position.to_array(), "born": s.born, "velocity": s.velocity.to_array(), "size": s.size, "mass": s.mass,
-                "sunlit": s.sunlit, "depth": s.depth, "calm": s.calm, "seed": s.seed.to_string(),
+                "sunlit": s.sunlit, "depth": s.depth, "calm": s.calm, "held": s.held, "seed": s.seed.to_string(),
             })).collect::<Vec<_>>(),
             "frames": frames,
         });
         std::fs::write(out.join("effects_golden.json"), serde_json::to_string(&golden).unwrap()).expect("golden");
-        eprintln!("wrote the atlas ({} layers), cutouts and {} golden frames to {}", layers.len(), 3, out.display());
+        eprintln!("wrote the atlas ({} layers), cutouts and {} golden frames to {}", layers.len(), golden["frames"].as_array().map_or(0, |f| f.len()), out.display());
     }
 
     /// A LOOK AT THE TEXTURES: `OUT=dir cargo test --release --lib

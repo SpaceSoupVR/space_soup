@@ -837,7 +837,8 @@ const RING_BLOCK: &str = r#"    if (water.rings[0].w > 0.0) {
             let x = dist - r.z;
             let resolved = 1.0 - smoothstep(0.25, 0.5, span * wv.x * (0.5 / WATER_PI));
             let train = exp(-x * x * wv.y);
-            let rise = r.w * resolved * train * -wv.x * sin(wv.x * x + wv.z);
+            let wave = sin(wv.x * x + wv.z);
+            let rise = r.w * resolved * train * -wv.x * wave;
             // Where it struck: the cavity's dimple while it is open, and the
             // foam it leaves.
             let bowl = exp(-dist * dist * pool.y);
@@ -845,10 +846,35 @@ const RING_BLOCK: &str = r#"    if (water.rings[0].w > 0.0) {
             // Too fine for the pixel, its slopes roughen the water instead:
             // far off, a ring is a band of duller or sparklier water.
             ring_rough = ring_rough + 0.5 * (r.w * wv.x) * (r.w * wv.x) * train * (1.0 - resolved);
-            ring_foam = ring_foam + pool.x * bowl;
+            // Its foam, drawn out into arcs along the waves leaving through
+            // it as it dissolves (`pool.z`): three to a wave (sin 3a from
+            // sin a), running out with them.
+            ring_foam = ring_foam + pool.x * bowl * (1.0 + pool.z * (wave * (3.0 - 4.0 * wave * wave) - 1.0));
         }
     }
 "#;
+
+/// A SPLASH'S FOAM over the water (the ringed twin only): not the lace a
+/// whitecap leaves -- the brightest bubble walls, a hard net -- but a soft
+/// patch, white right across where there is a lot of it and broken into
+/// clumps where there is less: the foam's own texture read finer
+/// (`RING_FOAM_TILES` of it a metre) and nearly two mips coarse, so its
+/// bubbles' walls are blurred into their cells and no line of it is left,
+/// and the clumps it breaks into are a few centimetres across. (Read round
+/// the splash by angle, to draw the clumps out along the rings, it pinched
+/// into spokes at the middle; the rings' own waves draw the foam into arcs
+/// instead, in `RING_BLOCK`.) Several splashes' foam together is no whiter
+/// than one's.
+const RING_COVER: &str = r#"    let ring_grain = textureSampleBias(foam_tex, wave_samp, q * RING_FOAM_TILES, 1.7).r;
+    cover = max(cover, clamp(min(ring_foam, 1.2) * (0.75 + RING_FOAM_CONTRAST * (ring_grain - RING_FOAM_MEAN)) - 0.2, 0.0, 1.0));
+"#;
+
+/// How many times a metre the foam texture repeats under a splash's foam.
+const RING_FOAM_TILES: f32 = 1.9;
+/// The blurred foam texture's mean, and how hard a splash's foam is broken
+/// about it.
+const RING_FOAM_MEAN: f32 = 0.35;
+const RING_FOAM_CONTRAST: f32 = 3.0;
 
 
 fn water_wgsl(dual: bool) -> String {
@@ -910,6 +936,14 @@ fn water_line_under(player: vec3<f32>) -> bool {
 
 fn water_wgsl_with(dual: bool, rings: bool) -> String {
     let ring_block = if rings { RING_BLOCK.replace("RINGS_N", &RINGS.to_string()) } else { String::new() };
+    let ring_cover = if rings {
+        RING_COVER
+            .replace("RING_FOAM_TILES", &format!("{RING_FOAM_TILES:?}"))
+            .replace("RING_FOAM_MEAN", &format!("{RING_FOAM_MEAN:?}"))
+            .replace("RING_FOAM_CONTRAST", &format!("{RING_FOAM_CONTRAST:?}"))
+    } else {
+        String::new()
+    };
     let output = if dual {
         "struct FsOut {\n    @location(0) @blend_src(0) colour: vec4<f32>,\n    @location(0) @blend_src(1) through: vec4<f32>,\n}"
     } else {
@@ -1299,9 +1333,9 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
             * smoothstep(0.1, 0.75, amp);
         surf = max(breaker, wash) + 0.18 * patchy * (1.0 - smoothstep(0.0, 0.2, thickness));
     }}
-    let froth = clamp(caps + surf + ring_foam, 0.0, 1.0);
-    let cover = clamp((bubbles - (1.0 - froth)) * 4.0, 0.0, 1.0) * smoothstep(0.0, 0.05, froth);
-    let foam_light = 0.8 * (sky_irradiance(n) + sunlight);
+    let froth = clamp(caps + surf, 0.0, 1.0);
+    var cover = clamp((bubbles - (1.0 - froth)) * 4.0, 0.0, 1.0) * smoothstep(0.0, 0.05, froth);
+{ring_cover}    let foam_light = 0.8 * (sky_irradiance(n) + sunlight);
 
     // THE SHORELINE fades in over `shore_fade` of depth rather than ending
     // in the line where the surface meets the ground. Foam keeps to the lip.
@@ -1330,6 +1364,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         foam_tiles = format!("{FOAM_TILES:?}"),
         bed_albedo = format!("{BED_ALBEDO:?}"),
         ring_block = ring_block,
+        ring_cover = ring_cover,
         deep_skip = 0.5f32 / 255.0,
         output = output,
         ret = ret,
@@ -1793,7 +1828,11 @@ pub fn water_shader_src() -> String {
 /// the shader (79 by the proxy: 2,385 against 2,306, the audit of
 /// 2026-10-12, with four rings of one fixed length and speed); now the CPU
 /// sends each ring's radius, height and width, and the loop is a length, two
-/// exponentials and a sine (55).
+/// exponentials and a sine (55) -- and a splash's foam, soft, broken by a
+/// second read of the foam's texture instead of the whitecaps' hard net and
+/// drawn into arcs by the rings' own waves, takes the ringed twin to about
+/// 75 (the ringless one lost its one add: 2,305). No more than it was, with
+/// six rings for four.
 #[cfg(test)]
 mod ring_size_tests {
     use super::*;
@@ -1805,7 +1844,7 @@ mod ring_size_tests {
         let (ringed, ringless) = (total(true), total(false));
         eprintln!("water by the proxy: ringed {ringed}, ringless {ringless}, the rings {}", ringed - ringless);
         assert!(ringed > ringless, "the ringed twin has the rings in it");
-        assert!(ringed - ringless <= 60, "the rings' loop grew: {} by the proxy", ringed - ringless);
+        assert!(ringed - ringless <= 80, "the rings' loop grew: {} by the proxy", ringed - ringless);
     }
 }
 

@@ -355,6 +355,35 @@ impl TerrainPipeline {
         )
     }
 
+    /// THE GROUND'S PROBE PASS'S OPEN-GROUND TWIN ([`open_pass_shader`]), for
+    /// the chunks the nowhere twin would draw, reflecting the outdoors; with
+    /// `weather_layout`, its weather twin. `None` when the shader's switch or
+    /// the weather's edits moved. `Levers::open_reflections`.
+    pub fn new_probe_pass_open(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        weather_layout: Option<&BindGroupLayout>,
+    ) -> Option<Self> {
+        let src = open_pass_shader()?;
+        let (src, label) = match weather_layout {
+            Some(_) => (crate::renderer::weather::with_weather(&src)?, "terrain_weather_probe_pass_open"),
+            None => (src, "terrain_probe_pass_open"),
+        };
+        Some(Self::build_from_with(
+            device,
+            crate::renderer::brush_pipeline::probe_pass::FORMAT,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::ProbePass,
+            weather_layout,
+            Some(fixups.pass_layout()),
+            src,
+            label,
+        ))
+    }
+
     /// THE GROUND'S PROBE PASS'S NOWHERE TWIN ([`nowhere_pass_shader`]), for
     /// the chunks of ground that touch no photograph's box and no doorway's
     /// reach this frame (`outdoor_pass::NowhereFrame`); with `weather_layout`,
@@ -675,6 +704,23 @@ const ALL_OUTDOORS_ON: &str = "const PROBE_ALL_OUTDOORS: bool = true;";
 const NOWHERE_OFF: &str = "const PROBE_NOWHERE: bool = false;";
 const NOWHERE_ON: &str = "const PROBE_NOWHERE: bool = true;";
 
+/// The switch [`open_pass_shader`] turns: see `PROBE_OPEN_GROUND` in the
+/// lights block.
+const OPEN_GROUND_OFF: &str = "const PROBE_OPEN_GROUND: bool = false;";
+const OPEN_GROUND_ON: &str = "const PROBE_OPEN_GROUND: bool = true;";
+
+/// THE GROUND'S PROBE PASS FOR OPEN GROUND THAT REFLECTS THE OUTDOORS: the
+/// pass with `PROBE_OPEN_GROUND` set, for the same chunks as
+/// [`nowhere_pass_shader`] (`outdoor_pass::NowhereFrame::holds`). Ground
+/// smooth enough to trace shows the ground map, the buildings' outsides and
+/// the sky -- as ground inside the baked outdoor volume does -- where the
+/// full pass and the nowhere twin show nothing. `Levers::open_reflections`.
+/// `None` if the switch is not in the shader exactly once.
+pub(crate) fn open_pass_shader() -> Option<String> {
+    let src = terrain_shader_for(TerrainRole::ProbePass);
+    (src.matches(OPEN_GROUND_OFF).count() == 1).then(|| src.replacen(OPEN_GROUND_OFF, OPEN_GROUND_ON, 1))
+}
+
 /// THE GROUND'S PROBE PASS FOR GROUND IN NO PHOTOGRAPH'S BOX: the pass with
 /// `PROBE_NOWHERE` set, so the lookup answers "nothing" at once, as the full
 /// pass does for such ground after choosing among every photograph, starting
@@ -754,6 +800,10 @@ const PROBE_PASS_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     // statistics, and what the pass costs with no lookup at all. Not the same
     // picture on ground inside a photograph's box.
     ("terrain_cut_nowhere", &[(NOWHERE_OFF, NOWHERE_ON)]),
+    // ALL OF THE GROUND BY ITS OPEN-GROUND TWIN (`open_pass_shader`): for its
+    // statistics, and off the headset (`TERRAIN_PASS_CUT`) to see open ground's
+    // reflections on a whole view. Not the full pass's picture anywhere.
+    ("terrain_cut_open", &[(OPEN_GROUND_OFF, OPEN_GROUND_ON)]),
     // No gate: the glow as the capsules give it.
     (
         "terrain_cut_gate",
@@ -798,7 +848,7 @@ fn terrain_lights_block(options: crate::renderer::lights::LightsBlockOptions) ->
     crate::renderer::lights::wgsl_lights_block_with(
         0,
         1,
-        crate::renderer::lights::LightsBlockOptions { cull_range_first: true, long_step_from_plane: true, ..options },
+        crate::renderer::lights::LightsBlockOptions { cull_range_first: true, long_step_from_plane: true, open_fallback: true, ..options },
     )
 }
 
@@ -817,22 +867,67 @@ pub enum TerrainRole {
     ProbePass,
 }
 
-/// MEASUREMENT (`adb shell setprop debug.spacesoup.painted 1`, read once when
-/// the device is created): every ground shader built for a PAINTED level.
+/// WHETHER THE GROUND'S SHADERS ARE BUILT FOR A PAINTED LEVEL: what
+/// [`terrain_shader_for`] hands every ground pipeline built from now on.
 ///
 /// The ground's layer weights are the splat map's where the level has one
 /// (`mat.use_splat`, set by `TerrainMaterial::new`) and worked out from the
-/// slope where it has not -- and the shader works out both for every pixel and
-/// selects, because which it is arrives in a uniform. On a painted level the
-/// slope's weights, an `acos` among them, are computed and thrown away:
-/// 176 of the gentle reader's 2,719 instructions, 179 of the steep one's 3,010,
-/// 80 of the mixed one's 3,141, 93 of the pass's 9,215 (PIPESTATS, 2026-10-12,
-/// `shader_opt`'s `splat_probe`). With this set the shaders have the painted
-/// answer alone: the same picture on a painted level, the WRONG one on an
-/// unpainted level, which is why it is a switch for measuring and not the
-/// fix -- that is building the ground's pipelines once the level's material
-/// is known (docs/shader-optimization-2026-10-12.md).
+/// slope where it has not -- and the shader as written works out both for
+/// every pixel and selects, because which it is arrives in a uniform. On a
+/// painted level the slope's weights, an `acos` among them, were computed and
+/// thrown away: 176 of the gentle reader's 2,719 instructions, 179 of the
+/// steep one's 3,010, 80 of the mixed one's 3,141, 93 of the pass's 9,215
+/// (PIPESTATS, 2026-10-12, `shader_opt`'s `splat_probe`).
+///
+/// So it is a fact of the BUILD, per level: the app says what it expects
+/// before the renderer exists ([`expect_painted_ground`], from the entry
+/// level's own file), and the renderer rebuilds the ground's pipelines when a
+/// level's material turns out otherwise ([`ground_build_moves`],
+/// `XrRenderer::set_terrain_splat`). With it set the shaders have the painted
+/// answer alone -- the same picture on a painted level; with it clear, the
+/// choice by the uniform, right for any level.
+///
+/// MEASUREMENT: `adb shell setprop debug.spacesoup.painted 0` (read once when
+/// the device is created) pins the build with the choice in it, the control;
+/// `1` pins the painted build whatever the level holds, which is the WRONG
+/// picture on an unpainted one ([`pin_ground_build`]).
 pub static GROUND_PAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a measurement pinned [`GROUND_PAINTED`]: levels no longer move it.
+static GROUND_BUILD_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the app expects of the level it is about to load, said before the
+/// renderer builds its pipelines so they are built once. A wrong guess costs
+/// one rebuild of the ground's pipelines when the level arrives, nothing else.
+pub fn expect_painted_ground(painted: bool) {
+    if !GROUND_BUILD_PINNED.load(std::sync::atomic::Ordering::Relaxed) {
+        GROUND_PAINTED.store(painted, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// MEASUREMENT: the ground's build held at `painted`, whatever levels load.
+pub fn pin_ground_build(painted: bool) {
+    GROUND_PAINTED.store(painted, std::sync::atomic::Ordering::Relaxed);
+    GROUND_BUILD_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What the ground's pipelines are to be built for, given what they are built
+/// for now, whether the level in hand has a splat map, and a measurement's
+/// pin: the level's fact unless pinned.
+pub fn ground_build_wanted(built_painted: bool, level_painted: bool, pinned: bool) -> bool {
+    if pinned { built_painted } else { level_painted }
+}
+
+/// A level with (or without) a splat map is in hand: sets [`GROUND_PAINTED`]
+/// to what its ground wants and says whether that MOVED it -- the ground's
+/// pipelines are then stale and the caller rebuilds them.
+pub fn ground_build_moves(level_painted: bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let built = GROUND_PAINTED.load(Relaxed);
+    let want = ground_build_wanted(built, level_painted, GROUND_BUILD_PINNED.load(Relaxed));
+    GROUND_PAINTED.store(want, Relaxed);
+    want != built
+}
 
 /// Where the ground chooses between its two sets of layer weights, and the
 /// painted choice alone.
@@ -848,8 +943,14 @@ pub(crate) fn painted_shader(src: &str) -> Option<String> {
 /// The terrain shader for `role`: `terrain_shader`, with its reflection read
 /// from the probe pass or its fragment stage cut down to the reflection alone.
 pub fn terrain_shader_for(role: TerrainRole) -> String {
+    terrain_shader_built(role, GROUND_PAINTED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`terrain_shader_for`] for a level known to be `painted` or not: see
+/// [`GROUND_PAINTED`].
+pub fn terrain_shader_built(role: TerrainRole, painted: bool) -> String {
     let src = terrain_shader();
-    let src = match GROUND_PAINTED.load(std::sync::atomic::Ordering::Relaxed) {
+    let src = match painted {
         true => painted_shader(&src).unwrap_or(src),
         false => src,
     };
@@ -1175,13 +1276,16 @@ fn layer_colour(layer: i32, world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> v
 //
 // The gradients are taken here, before any branch, and every projection scales
 // as 1/repeat -- so a per-layer repeat is a divide, never another derivative.
+//
+// ONE PLANE HELD, NOT THREE (2026-10-13). The frame carried the top-down
+// plane, the cliff's major plane and the detail maps' -- which is one or the
+// other of those two -- each with its two gradients: 18 floats across the
+// layer loop where a pixel only ever reads one of them (the top-down plane
+// when it is not steep, the major plane when it is). `detail_*` is that
+// plane; the colour reads it too. The same values in every read, and the
+// reader that draws triangles with both kinds of pixel holds what the steep
+// twin holds (`ground_twins`; `shader_opt::frame_was` is the frame as it was).
 struct SampleFrame {{
-    planar_uv: vec2<f32>,
-    planar_ddx: vec2<f32>,
-    planar_ddy: vec2<f32>,
-    major_uv: vec2<f32>,
-    major_ddx: vec2<f32>,
-    major_ddy: vec2<f32>,
     minor_uv: vec2<f32>,
     minor_ddx: vec2<f32>,
     minor_ddy: vec2<f32>,
@@ -1215,24 +1319,23 @@ const CLIFF_BAND_SCALE_M: f32 = 7.0;
 
 fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> SampleFrame {{
     var f: SampleFrame;
-    f.planar_uv  = world.xz;
-    f.planar_ddx = dpdx(world.xz);
-    f.planar_ddy = dpdy(world.xz);
+    let planar_uv  = world.xz;
+    let planar_ddx = dpdx(world.xz);
+    let planar_ddy = dpdy(world.xz);
 
     // At unit repeat, so each layer divides rather than recomputing.
     let b = biplanar_axes(world, n, 1.0);
-    f.major_uv  = b.uv_major;
-    f.major_ddx = dpdx(b.uv_major);
-    f.major_ddy = dpdy(b.uv_major);
+    let major_ddx = dpdx(b.uv_major);
+    let major_ddy = dpdy(b.uv_major);
     f.minor_uv  = b.uv_minor;
     f.minor_ddx = dpdx(b.uv_minor);
     f.minor_ddy = dpdy(b.uv_minor);
     f.blend     = b.w;
     f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);
     let steep = slope_deg >= mat.biplanar_start_deg;
-    f.detail_uv   = select(f.planar_uv, f.major_uv, steep);
-    f.detail_ddx  = select(f.planar_ddx, f.major_ddx, steep);
-    f.detail_ddy  = select(f.planar_ddy, f.major_ddy, steep);
+    f.detail_uv   = select(planar_uv, b.uv_major, steep);
+    f.detail_ddx  = select(planar_ddx, major_ddx, steep);
+    f.detail_ddy  = select(planar_ddy, major_ddy, steep);
     f.detail_axis = select(1u, b.axis_major, steep);
     f.minor_axis  = b.axis_minor;
     let mr = max(mat.macro_repeat, 0.001);
@@ -1250,7 +1353,7 @@ fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> SampleFrame {
         let m2 = textureSampleGrad(macro_tex, layer_samp, f.detail_uv * ms + vec2<f32>(0.31, 0.57), f.detail_ddx * ms, f.detail_ddy * ms).r;
         warp = warp + vec2<f32>(0.35, 1.0) * (m2 - 0.5) * CLIFF_BAND_WARP_M;
     }}
-    f.major_uv  = f.major_uv + warp;
+    // Gentle ground's warp is nothing, so its top-down uv is as it was.
     f.minor_uv  = f.minor_uv + warp;
     f.detail_uv = f.detail_uv + warp;
     return f;
@@ -1258,11 +1361,11 @@ fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> SampleFrame {
 
 fn layer_colour_at(layer: i32, f: SampleFrame) -> vec3<f32> {{
     let r = max(mat.repeat[layer], 0.001);
+    // The plane the pixel is read on (`SampleFrame`): top-down, and the whole
+    // colour, where it is not steep; a cliff's major plane where it is.
+    let c_face = textureSampleGrad(layer_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r).rgb;
     if (f.biplanar < 0.5) {{
-        return textureSampleGrad(
-            layer_tex, layer_samp, f.planar_uv / r, layer,
-            f.planar_ddx / r, f.planar_ddy / r,
-        ).rgb;
+        return c_face;
     }}
     // TWO SCALES ON THE FACE THE CLIFF LOOKS ALONG, as for the normal: the
     // rock scan's level stripes, tiled every 2 m, read as strata at one even
@@ -1271,10 +1374,10 @@ fn layer_colour_at(layer: i32, f: SampleFrame) -> vec3<f32> {{
     let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
     let s2 = 1.0 / (r * 2.3);
     let c_major = mix(
-        textureSampleGrad(layer_tex, layer_samp, f.major_uv / r, layer, f.major_ddx / r, f.major_ddy / r).rgb,
+        c_face,
         textureSampleGrad(
-            layer_tex, layer_samp, rot * f.major_uv * s2 + vec2<f32>(0.37, 0.11), layer,
-            rot * f.major_ddx * s2, rot * f.major_ddy * s2,
+            layer_tex, layer_samp, rot * f.detail_uv * s2 + vec2<f32>(0.37, 0.11), layer,
+            rot * f.detail_ddx * s2, rot * f.detail_ddy * s2,
         ).rgb,
         0.3 + 0.3 * f.macro_value,
     );
@@ -2061,6 +2164,149 @@ pub(crate) mod tests {
         // `select(f, t, cond)` is `t` where `cond` holds, and the material sets
         // the flag to 1 exactly when it was given a splat map.
         assert!(PAINTED_FROM.contains("select(derived, authored, mat.use_splat > 0.5)"));
+    }
+
+    /// What the ground's pipelines are built for follows the level in hand,
+    /// unless a measurement pinned it.
+    #[test]
+    fn the_ground_is_built_for_the_level_unless_pinned() {
+        for built in [false, true] {
+            for level in [false, true] {
+                assert_eq!(ground_build_wanted(built, level, false), level, "built {built}, level {level}");
+                assert_eq!(ground_build_wanted(built, level, true), built, "pinned at {built}, level {level}");
+            }
+        }
+    }
+
+    /// Every twin the renderer builds of the ground's shaders takes the
+    /// painted build as it takes the one with the choice in it: each edit
+    /// still finds its text once, and what comes out validates. (The switch
+    /// itself is not set here: tests share it. `terrain_shader_built` is what
+    /// it selects.)
+    #[test]
+    fn every_ground_twin_takes_the_painted_build() {
+        use crate::renderer::brush_pipeline::{sun_reader_shader, FaceSun};
+        use crate::renderer::ground_twins::{dedup_pass_shader, gentle_shader, steep_shader};
+        use crate::renderer::lights::{without_pool_maps, without_spot_shadows};
+        use crate::renderer::weather::{with_weather, with_weather_kinds, WeatherKinds};
+        use wgpu::naga;
+        let read = terrain_shader_built(TerrainRole::Read, true);
+        let pass = terrain_shader_built(TerrainRole::ProbePass, true);
+        for (role, src) in [(TerrainRole::Read, &read), (TerrainRole::ProbePass, &pass)] {
+            assert_eq!(src.matches(PAINTED_TO).count(), 1, "{role:?}");
+            assert!(!src.contains(PAINTED_FROM), "{role:?}: the choice is still in the painted build");
+            assert_eq!(src.replacen(PAINTED_TO, PAINTED_FROM, 1), terrain_shader_built(role, false), "{role:?}");
+        }
+        let turned = |off: &str, on: &str| {
+            assert_eq!(pass.matches(off).count(), 1, "`{off}` is not in the painted pass once");
+            pass.replacen(off, on, 1)
+        };
+        let gentle = gentle_shader(&read).expect("gentle");
+        let steep = steep_shader(&read).expect("steep");
+        let dedup = dedup_pass_shader(&pass).expect("dedup");
+        let nowhere = turned(NOWHERE_OFF, NOWHERE_ON);
+        let outdoors = turned(ALL_OUTDOORS_OFF, ALL_OUTDOORS_ON);
+        let open = turned(OPEN_GROUND_OFF, OPEN_GROUND_ON);
+        let mut sources: Vec<(String, String)> = vec![
+            ("read baked spotless".into(), without_spot_shadows(sun_reader_shader(read.clone(), FaceSun::Baked))),
+            ("gentle baked spotless".into(), without_spot_shadows(sun_reader_shader(gentle.clone(), FaceSun::Baked))),
+            ("steep baked spotless".into(), without_spot_shadows(sun_reader_shader(steep.clone(), FaceSun::Baked))),
+            ("dedup poolless".into(), without_pool_maps(dedup.clone())),
+            ("nowhere".into(), nowhere.clone()),
+            ("outdoors".into(), outdoors.clone()),
+            ("open".into(), open.clone()),
+        ];
+        for (label, src) in [("read", &read), ("pass", &pass), ("dedup", &dedup), ("nowhere", &nowhere), ("outdoors", &outdoors), ("open", &open)] {
+            sources.push((format!("weather {label}"), with_weather(src).unwrap_or_else(|| panic!("{label}: the weather's edits moved"))));
+        }
+        for kinds in WeatherKinds::ALL {
+            let twin = with_weather_kinds(&gentle, kinds).unwrap_or_else(|| panic!("gentle {kinds:?}: the weather's edits moved"));
+            sources.push((format!("weather gentle {kinds:?}"), twin));
+        }
+        for (label, src) in &sources {
+            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+    }
+
+    /// The open-ground twin is the pass with its one switch turned: valid,
+    /// much smaller, the outdoor answer and nothing of the photographs', the
+    /// rooms' or the doorways' -- and it answers as the full pass does for a
+    /// surface in no room and no doorway once the frame says open ground
+    /// reflects (`ProbeUpload::open_ground`): escaped where it lies, coloured
+    /// by `probe_escape_colour`; nothing where too rough to trace.
+    #[test]
+    fn the_open_twin_is_the_pass_with_its_switch_turned() {
+        use wgpu::naga;
+        let pass = terrain_shader_for(TerrainRole::ProbePass);
+        let twin = open_pass_shader().expect("the open-ground switch moved");
+        assert_eq!(twin.replacen(OPEN_GROUND_ON, OPEN_GROUND_OFF, 1), pass);
+        let at = |s: &str, m: &str| s.find(m).unwrap_or_else(|| panic!("`{m}` is not in the shader"));
+        let env = &twin[at(&twin, "fn probe_environment(")..at(&twin, "fn probe_outdoor_untraced(")];
+        let branch = at(env, "    if (PROBE_OPEN_GROUND) {");
+        for later in [
+            "    if (PROBE_NOWHERE) {",
+            "    if (PROBE_ALL_OUTDOORS) {",
+            "probe_portal_holding(volume_world)",
+            "probe_choose(select_world, volume_world)",
+            "    let hit = probe_trace(world_pos, d, trace_room, roughness);",
+        ] {
+            assert!(branch < at(env, later), "`{later}` comes before the open ground's answer");
+        }
+        let body = &env[branch..at(env, "    if (PROBE_NOWHERE) {")];
+        // The trace's own roughness test, then the escape from the surface
+        // itself in the full pass's direction and blur.
+        assert!(body.contains("if (roughness > PROBE_TRACE_MAX_ROUGHNESS) {"));
+        assert!(body.contains("let open_dir = normalize(world_dir);"));
+        assert!(body.contains("let open_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);"));
+        assert!(body.contains("probe_escape_colour(world_pos, open_dir, dir, roughness, open_lod)"));
+        assert!(env.contains("    let d = normalize(world_dir);"));
+        assert!(env.contains("    let probe_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);"));
+        // THE FULL PASS'S HALF: in the trace, where no room and no doorway
+        // holds the surface, under the table's word -- an escaped hit at the
+        // surface, which `probe_traced_colour` colours the same way.
+        let trace = &pass[at(&pass, "fn probe_trace_skipping(")..at(&pass, "fn ground_trace_until(")];
+        let holding = at(trace, "        let p = probe_portal_holding(world_pos);\n        if (p < 0) {\n            if (camera.portal_params.y < -0.5) {");
+        let fallback = &trace[holding..holding + at(&trace[holding..], "            return hit;\n        }\n")];
+        for line in ["hit.pos = world_pos;", "hit.found = true;", "hit.escaped = true;"] {
+            assert!(fallback.contains(line), "`{line}` is not in the open ground's hit");
+        }
+        assert!(at(trace, "if (roughness > PROBE_TRACE_MAX_ROUGHNESS || camera.portal_params.y > 0.5) {") < holding);
+        assert!(pass.contains("        col = probe_escape_colour(h.pos, d, sky_dir, roughness, lod);"));
+        // The ground's shaders alone: the brushes' pass keeps its text.
+        let brush = crate::renderer::brush_pipeline::brush_shader_src();
+        assert!(brush.contains("let p = probe_portal_holding(world_pos);"));
+        assert!(!brush.contains("camera.portal_params.y < -0.5"));
+        for (label, src) in [
+            ("twin", twin.clone()),
+            ("weather twin", crate::renderer::weather::with_weather(&twin).expect("the weather's edits moved")),
+        ] {
+            let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+        let size = |s: &str| -> usize {
+            crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum()
+        };
+        let (full, out) = (size(&pass), size(&twin));
+        println!("the ground's pass: {full} proxy units; its open-ground twin: {out}");
+        assert!(out * 5 < full * 3, "the open-ground twin is {out} of {full}: the rooms' machinery is still in it");
+        let Some((device, _queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let lights = LightsUniform::new(&device);
+        let (_shadows, uniforms) = crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, 1024);
+        let weather_layout = crate::renderer::weather::bind_group_layout(&device);
+        assert!(TerrainPipeline::new_probe_pass_open(&device, &uniforms.layout, &fixups, None).is_some());
+        assert!(TerrainPipeline::new_probe_pass_open(&device, &uniforms.layout, &fixups, Some(&weather_layout)).is_some());
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "the open-ground twins failed to build: {err:?}");
     }
 
     /// The nowhere twin is the pass with its one switch turned: valid, far

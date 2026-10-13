@@ -74,6 +74,7 @@ fn build_icon_mesh(
             blended: false,
             thin: None,
             layered: None,
+            baked_cave: None,
             vertices,
             indices,
             texture,

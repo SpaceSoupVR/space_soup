@@ -1046,7 +1046,9 @@ impl UniformBuffer {
             // zeroed uniform does not make room 0 the outdoors. See `ProbeUpload`.
             portal_params: [
                 probes.portal_count as f32,
-                if probes.no_trace { 1.0 } else { 0.0 },
+                // y: 1 the trace off; -1 open ground reflecting the outdoors
+                // (`ProbeUpload::open_ground`); 0 neither.
+                probes.trace_word(),
                 dense.outdoor_volume + 1.0,
                 probes.building_count as f32,
             ],
@@ -1277,6 +1279,12 @@ pub struct ProbeUpload {
     /// Skip the probe depth trace this frame: `perf_ab` measures its cost by
     /// turning it off. Rides in `portal_params.y`, which was unused.
     pub no_trace: bool,
+    /// OPEN GROUND REFLECTS THE OUTDOORS (`Levers::open_reflections`): a
+    /// ground pixel in no room and no doorway is traced as out of doors
+    /// where it lies, instead of answering nothing. Rides in
+    /// `portal_params.y` as -1 (nothing while the trace is off). See
+    /// `PROBE_OPEN_GROUND` in the lights block.
+    pub open_ground: bool,
     /// How many of `proxies` are live. Never more than [`MAX_PROXIES`].
     pub proxy_count: u32,
     /// WHAT STANDS IN THE ROOMS NEAR THE PLAYER: `[centre.xyz, volume]`,
@@ -1612,6 +1620,21 @@ pub const NO_RESIDENT_ROOM: f32 = 1_000_000.0;
 /// Rows of [`Uniforms::probe_rooms`]: six blocks of sixteen entries.
 pub const ROOM_TABLE_ROWS: usize = 24;
 
+impl ProbeUpload {
+    /// What `portal_params.y` tells the reflection trace: 1 off (`no_trace`),
+    /// -1 on with open ground reflecting the outdoors (`open_ground`), 0 on.
+    /// Off wins: with no trace there is no outdoor answer to give.
+    pub fn trace_word(&self) -> f32 {
+        if self.no_trace {
+            1.0
+        } else if self.open_ground {
+            -1.0
+        } else {
+            0.0
+        }
+    }
+}
+
 impl Default for ProbeUpload {
     fn default() -> Self {
         Self {
@@ -1620,6 +1643,7 @@ impl Default for ProbeUpload {
             portal_count: 0,
             portals: [[[0.0; 4]; 3]; MAX_PORTALS],
             no_trace: false,
+            open_ground: false,
             proxy_count: 0,
             proxies: [[[0.0; 4]; 3]; MAX_PROXIES],
             outdoor_volume: -1.0,

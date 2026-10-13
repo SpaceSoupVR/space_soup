@@ -36,7 +36,7 @@
 //!
 //! Its own module because the XR renderer compiles for the headset alone.
 
-use crate::renderer::uniforms::{ProbeUpload, MAX_PORTALS, MAX_PROBES};
+use crate::renderer::uniforms::{ProbePortal, ProbeUpload, MAX_PORTALS, MAX_PROBES};
 use glam::Vec3;
 
 /// How far inside the outdoor box, and clear of every room and doorway, a
@@ -150,6 +150,123 @@ impl NowhereFrame {
     }
 }
 
+/// THE SAME TWO DECISIONS FOR ONE TRIANGLE, ONCE A LEVEL: from the level's
+/// WHOLE probe table -- every baked photograph's box and every doorway, not
+/// the frame's resident ones.
+///
+/// A chunk that straddles the baked outdoor volume's edge, or holds a
+/// building, is neither out of doors nor nowhere by its bounds, and all of it
+/// was drawn by the full pass: at rain_puddles_down the whole view. Sorted by
+/// triangle (`ground_twins::SlopeSplit::classed`), only the triangles that
+/// themselves touch a room, a doorway or the volume's edge are.
+///
+/// What is decided from the whole table holds in every frame, whose table is
+/// a part of it: a triangle NOWHERE here touches no box and no doorway of any
+/// frame's; a triangle OUT OF DOORS here is inside the outdoor volume's box
+/// and clear of every other box and doorway of any frame's -- and is drawn by
+/// the outdoor twin only in a frame whose own [`OutdoorFrame`] exists (the
+/// trace on, the volume's photograph resident), by the full pass otherwise
+/// (`tests::what_the_level_decides_holds_in_every_frame`).
+pub struct LevelGround {
+    outdoor: Option<OutdoorFrame>,
+    nowhere: NowhereFrame,
+    /// The box round everything the table reaches: ground outside it is
+    /// nowhere without asking each box (most of a level's triangles, and a
+    /// level may bake hundreds of photographs).
+    reach_bounds: (Vec3, Vec3),
+    /// Names this table, for `SlopeSplit::is_for`: never 0, which is "no
+    /// classifier".
+    pub key: u64,
+}
+
+/// A triangle's ground class: what the reflection pass may draw it with.
+pub const GROUND_FULL: usize = 0;
+pub const GROUND_OUTDOORS: usize = 1;
+pub const GROUND_NOWHERE: usize = 2;
+
+impl LevelGround {
+    /// `volumes` as `XrRenderer::probe_volumes` holds them -- `(probe, centre,
+    /// min, max)` for every baked probe -- `rooms` each probe's room by
+    /// probe, `outdoor_room` the outdoor volume's.
+    pub fn new(volumes: &[(u32, Vec3, Vec3, Vec3)], rooms: &[u32], outdoor_room: Option<u32>, portals: &[ProbePortal]) -> Self {
+        let margin = Vec3::splat(crate::renderer::lights::probe_box_margin() + SLACK);
+        let fade = Vec3::splat(PORTAL_MARGIN + SLACK);
+        let mut outdoors: Option<(Vec3, Vec3)> = None;
+        let mut indoors = Vec::new();
+        let mut reach = Vec::new();
+        let mut key: u64 = 1469598103934665603;
+        let mut mix = |v: Vec3| {
+            for x in v.to_array() {
+                key = (key ^ x.to_bits() as u64).wrapping_mul(1099511628211);
+            }
+        };
+        for &(probe, _, lo, hi) in volumes {
+            mix(lo);
+            mix(hi);
+            reach.push((lo - margin, hi + margin));
+            let room = rooms.get(probe as usize).copied();
+            mix(Vec3::splat(room.map_or(-1.0, |r| r as f32)));
+            if room.is_some() && room == outdoor_room {
+                outdoors = Some(match outdoors {
+                    Some((l, h)) => (l.max(lo), h.min(hi)),
+                    None => (lo, hi),
+                });
+            } else {
+                indoors.push((lo - margin, hi + margin));
+            }
+        }
+        for p in portals {
+            mix(p.min);
+            mix(p.max);
+            indoors.push((p.min - fade, p.max + fade));
+            reach.push((p.min - fade, p.max + fade));
+        }
+        let outdoor = outdoors.map(|(lo, hi)| OutdoorFrame { outdoors: (lo + Vec3::splat(SLACK), hi - Vec3::splat(SLACK)), indoors });
+        let reach_bounds = Self::bounds_of(&reach);
+        Self { outdoor, nowhere: NowhereFrame { reach }, reach_bounds, key: key | 1 }
+    }
+
+    fn bounds_of(reach: &[(Vec3, Vec3)]) -> (Vec3, Vec3) {
+        reach.iter().fold((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(lo, hi), (l, h)| (lo.min(*l), hi.max(*h)))
+    }
+
+    /// The same from ONE table, taken as the whole level's: for a renderer
+    /// that reads a single table and never streams (the offline harness).
+    pub fn of_table(probes: &ProbeUpload) -> Self {
+        let nowhere = NowhereFrame::new(probes);
+        let reach_bounds = Self::bounds_of(&nowhere.reach);
+        Self { outdoor: OutdoorFrame::new(probes), nowhere, reach_bounds, key: 1 }
+    }
+
+    /// The class of ground whose every point lies in the world-frame box
+    /// `lo..hi` (a triangle's bounds).
+    pub fn class_of(&self, lo: Vec3, hi: Vec3) -> usize {
+        let outside = !(lo.cmple(self.reach_bounds.1).all() && hi.cmpge(self.reach_bounds.0).all());
+        if outside || self.nowhere.holds(lo, hi) {
+            GROUND_NOWHERE
+        } else if self.outdoor.as_ref().is_some_and(|f| f.holds(lo, hi)) {
+            GROUND_OUTDOORS
+        } else {
+            GROUND_FULL
+        }
+    }
+
+    /// [`Self::class_of`] a triangle given in the PLAYER's frame, as the app
+    /// hands the ground: its corners taken to the world as the shader takes
+    /// them (`to_world_space`: a turn by `yaw`, then `offset`).
+    pub fn class_of_posed(&self, offset: Vec3, yaw: f32, corners: [[f32; 3]; 3]) -> usize {
+        let (s, c) = yaw.sin_cos();
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
+        for p in corners {
+            let w = Vec3::new(c * p[0] + s * p[2], p[1], -s * p[0] + c * p[2]) + offset;
+            lo = lo.min(w);
+            hi = hi.max(w);
+        }
+        self.class_of(lo, hi)
+    }
+}
+
 /// The world-frame box holding a player-frame box: the shader's
 /// `to_world_space` -- a turn by `yaw` about the vertical, then `offset` --
 /// of its eight corners.
@@ -245,6 +362,115 @@ mod tests {
             }
         }
         assert!(held > 200, "only {held} boxes held: the sample no longer tests the rule");
+    }
+
+    /// What the level's whole table decides of a box holds in a frame whose
+    /// table is any part of it: nowhere stays nowhere, and out of doors stays
+    /// out of doors wherever the frame has an outdoor twin to draw with at
+    /// all. And the level's table sorts ground the frame's own tests cannot:
+    /// a box straddling the volume's edge has triangles on both sides.
+    #[test]
+    fn what_the_level_decides_holds_in_every_frame() {
+        // The level: the outdoor volume (room 7, two cells), a hall (room 3,
+        // two cells), a hut (room 4) and two doorways.
+        let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
+        let volumes = vec![
+            (0u32, v(-2.0, 1.5, 0.0), v(-5.0, 0.0, -4.0), v(5.0, 3.0, 4.0)),
+            (1, v(2.0, 1.5, 0.0), v(-5.0, 0.0, -4.0), v(5.0, 3.0, 4.0)),
+            (2, v(0.0, 20.0, 0.0), v(-40.0, -10.0, -40.0), v(40.0, 60.0, 40.0)),
+            (3, v(10.0, 20.0, 0.0), v(-40.0, -10.0, -40.0), v(40.0, 60.0, 40.0)),
+            (4, v(20.0, 1.0, 20.0), v(18.0, 0.0, 18.0), v(22.0, 2.5, 22.0)),
+        ];
+        let rooms = vec![3u32, 3, 7, 7, 4];
+        let portals = vec![
+            ProbePortal { min: v(5.0, 0.0, -1.0), max: v(5.4, 2.2, 1.0), axis: 0, low: 3, high: 7, wall: None },
+            ProbePortal { min: v(17.6, 0.0, 19.5), max: v(18.0, 2.0, 20.5), axis: 0, low: 7, high: 4, wall: None },
+        ];
+        let level = LevelGround::new(&volumes, &rooms, Some(7), &portals);
+        assert_ne!(level.key, 0);
+        assert_ne!(level.key, LevelGround::new(&volumes[..4], &rooms, Some(7), &portals).key);
+        assert_eq!(level.class_of(v(50.0, -1.0, 0.0), v(51.0, 0.0, 1.0)), GROUND_NOWHERE);
+        assert_eq!(level.class_of(v(30.0, -1.0, 0.0), v(31.0, 0.0, 1.0)), GROUND_OUTDOORS);
+        assert_eq!(level.class_of(v(39.5, -1.0, 0.0), v(40.5, 0.0, 1.0)), GROUND_FULL, "across the volume's edge");
+        assert_eq!(level.class_of(v(4.0, -0.5, 0.0), v(6.0, 0.1, 1.0)), GROUND_FULL, "in the hall and its doorway");
+        assert_eq!(level.class_of(v(17.0, 0.0, 19.8), v(17.5, 0.2, 20.2)), GROUND_FULL, "by the hut's doorway");
+        // No outdoor volume: nothing is out of doors, the rest as before.
+        let no_volume = LevelGround::new(&volumes, &rooms, None, &portals);
+        assert_eq!(no_volume.class_of(v(30.0, -1.0, 0.0), v(31.0, 0.0, 1.0)), GROUND_FULL);
+        assert_eq!(no_volume.class_of(v(50.0, -1.0, 0.0), v(51.0, 0.0, 1.0)), GROUND_NOWHERE);
+        // Posed: the same triangle seen from a player who has walked and turned.
+        let (offset, yaw) = (v(3.0, 0.4, -2.0), 0.7f32);
+        let posed = |w: Vec3| {
+            let d = w - offset;
+            let (s, c) = yaw.sin_cos();
+            [c * d.x - s * d.z, d.y, s * d.x + c * d.z]
+        };
+        for (lo, hi) in [(v(50.0, -1.0, 0.0), v(51.0, 0.0, 1.0)), (v(30.0, -1.0, 0.0), v(31.0, 0.0, 1.0)), (v(4.0, -0.5, 0.0), v(6.0, 0.1, 1.0))] {
+            let tri = [posed(lo), posed(v(hi.x, lo.y, lo.z)), posed(hi)];
+            assert_eq!(level.class_of_posed(offset, yaw, tri), level.class_of(lo, hi));
+        }
+
+        let mut seed = 5u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32) / (1u64 << 31) as f32
+        };
+        let (mut nowhere, mut outdoors, mut with_twin) = (0, 0, 0);
+        for frame in 0..64u32 {
+            // A frame: some of the probes, some of the doorways.
+            let mut p = ProbeUpload::default();
+            let mut slot = 0usize;
+            for (i, &(probe, centre, lo, hi)) in volumes.iter().enumerate() {
+                if frame >> i & 1 == 1 {
+                    p.set(slot, probe, centre, lo, hi);
+                    p.set_volume(slot, rooms[probe as usize]);
+                    slot += 1;
+                }
+            }
+            p.count = slot as u32;
+            let kept: Vec<ProbePortal> = portals.iter().enumerate().filter(|(i, _)| frame >> (5 + i) & 1 == 1).map(|(_, d)| *d).collect();
+            p.portal_count = kept.len() as u32;
+            for (i, d) in kept.iter().enumerate() {
+                p.portals[i] = [[d.min.x, d.min.y, d.min.z, d.axis as f32], [d.max.x, d.max.y, d.max.z, d.low as f32], [d.high as f32, 0.0, 0.0, 0.0]];
+            }
+            p.outdoor_volume = 7.0;
+            let frame_nowhere = NowhereFrame::new(&p);
+            let frame_outdoors = OutdoorFrame::new(&p);
+            with_twin += frame_outdoors.is_some() as u32;
+            for _ in 0..400 {
+                let lo = v(rnd() * 100.0 - 50.0, rnd() * 4.0 - 2.0, rnd() * 100.0 - 50.0);
+                let hi = lo + v(rnd() * 1.5 + 0.05, rnd() * 0.5 + 0.01, rnd() * 1.5 + 0.05);
+                match level.class_of(lo, hi) {
+                    GROUND_NOWHERE => {
+                        nowhere += 1;
+                        assert!(frame_nowhere.holds(lo, hi), "frame {frame}: {lo}..{hi} is nowhere in the level and somewhere in a frame");
+                    }
+                    GROUND_OUTDOORS => {
+                        outdoors += 1;
+                        if let Some(f) = &frame_outdoors {
+                            assert!(f.holds(lo, hi), "frame {frame}: {lo}..{hi} is out of doors in the level and not in a frame");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(nowhere > 1000 && outdoors > 1000 && with_twin >= 16, "{nowhere} nowhere, {outdoors} out of doors, {with_twin} frames with a twin");
+    }
+
+    /// What the trace reads of the table: off beats open ground, and a table
+    /// that says neither is 0 -- which a zeroed uniform is too.
+    #[test]
+    fn the_trace_word_is_off_open_or_neither() {
+        let mut p = level();
+        assert_eq!(p.trace_word(), 0.0);
+        p.open_ground = true;
+        assert_eq!(p.trace_word(), -1.0);
+        p.no_trace = true;
+        assert_eq!(p.trace_word(), 1.0);
+        p.open_ground = false;
+        assert_eq!(p.trace_word(), 1.0);
+        assert_eq!(ProbeUpload::default().trace_word(), 0.0);
     }
 
     #[test]

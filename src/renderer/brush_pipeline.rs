@@ -4702,6 +4702,7 @@ struct VOut {{
                 card_tests_filtered: false,
                 card_relit: false,
                 long_step_from_plane: true,
+                open_fallback: false,
             },
         ),
         ssr_block = ssr_block,

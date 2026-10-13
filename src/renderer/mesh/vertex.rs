@@ -188,6 +188,9 @@ pub struct MeshPrimitive {
     /// to do it with. Both, because a mesh that asks and does not supply would
     /// otherwise render as a single flat layer with no clue why.
     pub layered: Option<LayeredPrimitive>,
+    /// Present when the file is a baked cave (`renderer::baked_cave`): the
+    /// same triangles and index buffer, as the vertices its pipeline draws.
+    pub baked_cave: Option<crate::renderer::baked_cave::BakedCavePrimitive>,
     /// Whether this primitive belongs in a shadow map.
     ///
     /// False for glass. A shadow map is BINARY -- a fragment either occludes or

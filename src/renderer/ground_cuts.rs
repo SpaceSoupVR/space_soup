@@ -44,14 +44,14 @@ pub(crate) const GROUND_CUTS: &[(&str, &[(&str, &str)])] = &[
     // The cliff's uv warp altogether (the bands with it).
     (
         "warp",
-        &[("    f.major_uv  = f.major_uv + warp;\n    f.minor_uv  = f.minor_uv + warp;\n    f.detail_uv = f.detail_uv + warp;\n", "")],
+        &[("    f.minor_uv  = f.minor_uv + warp;\n    f.detail_uv = f.detail_uv + warp;\n", "")],
     ),
     // The colour's second scale on the face the cliff looks along.
     (
         "colour2",
         &[(
-            "    let c_major = mix(\n        textureSampleGrad(layer_tex, layer_samp, f.major_uv / r, layer, f.major_ddx / r, f.major_ddy / r).rgb,\n",
-            "    let c_major = textureSampleGrad(layer_tex, layer_samp, f.major_uv / r, layer, f.major_ddx / r, f.major_ddy / r).rgb;\n    let c_unused = mix(\n        vec3<f32>(0.0),\n",
+            "    let c_major = mix(\n        c_face,\n",
+            "    let c_major = c_face;\n    let c_unused = mix(\n        vec3<f32>(0.0),\n",
         )],
     ),
     // The normal's second scale on a cliff.

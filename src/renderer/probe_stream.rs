@@ -674,13 +674,13 @@ mod tests {
         let faces = vec![0u8; (RES * RES * 8 * 6) as usize];
         let source: ProbeSource = Arc::new(move |_| Some(faces.clone()));
         let mut stream = ProbeStream::new(&device, &queue, RES, 1, source);
-        let mut up = ProbeUpload { count: 1, portal_count: 2, proxy_count: 3, no_trace: true, ..Default::default() };
+        let mut up = ProbeUpload { count: 1, portal_count: 2, proxy_count: 3, no_trace: true, open_ground: true, ..Default::default() };
         up.portals[1][0][0] = 7.0;
         up.proxies[2][1][2] = 9.0;
         up.set(0, 0, Vec3::ZERO, Vec3::splat(-1.0), Vec3::splat(1.0));
         stream.begin_frame();
         stream.resolve(&queue, &mut up);
-        assert_eq!((up.portal_count, up.proxy_count, up.no_trace), (2, 3, true), "resolve dropped a field");
+        assert_eq!((up.portal_count, up.proxy_count, up.no_trace, up.open_ground), (2, 3, true, true), "resolve dropped a field");
         assert_eq!(up.portals[1][0][0], 7.0, "the doorways were lost");
         assert_eq!(up.proxies[2][1][2], 9.0, "the reflection proxies were lost");
     }
