@@ -172,15 +172,16 @@ const BED_ALBEDO: f32 = 0.45;
 /// metres.
 pub const WAVE_REACH: f32 = 40.0;
 
-/// SPLASH RINGS: the newest splashes' ripples spreading over the surface
-/// (`effects::splash_rings`), each a short train of waves -- a few
-/// centimetres long, as a foot or a hand raises -- running out at about the
-/// slowest speed water waves have, widening and dying away.
-pub const RINGS: usize = 4;
-pub const RING_SECONDS: f32 = 3.0;
-const RING_SPEED: f32 = 0.3;
-const RING_WAVELENGTH: f32 = 0.08;
-const RING_HEIGHT: f32 = 0.006;
+/// SPLASH RINGS: the splashes' ripples spreading over the surface
+/// (`effects::splash_rings`), each a short train of waves as long and as
+/// fast as what struck raises -- centimetres and a walking pace from a
+/// pebble, a metre and faster from a crate -- widening and dying away, with
+/// the foam and the dimple where it struck. The `RINGS` that matter most to
+/// the eye are drawn.
+pub const RINGS: usize = 6;
+/// The longest any splash's rings are drawn, seconds
+/// (`effects::ring_seconds`).
+pub const RING_SECONDS: f32 = 8.0;
 
 /// Per-body optics and the waves' state, as the shader takes them.
 #[repr(C)]
@@ -201,9 +202,15 @@ pub struct WaterUniform {
     /// Per mip level of the wave textures, the slope variance each cascade's
     /// level averages away. See `WaveParams::lost_slope_variance`.
     pub lost: [[f32; 4]; MIPS as usize],
-    /// Splashes' rings: world x, z, seconds since, strength (0: none, and
-    /// none after it). See `RINGS`.
+    /// Splashes' rings, as `effects::SplashRings` has them: world x, z, the
+    /// radius the ring has reached, its waves' height (0: none, and none
+    /// after it). See `RINGS`.
     pub rings: [[f32; 4]; RINGS],
+    /// Each ring's waves: wavenumber, 1 / (2 width^2), the crests' phase, and
+    /// the dimple's slope a metre out.
+    pub ring_waves: [[f32; 4]; RINGS],
+    /// Each one's foam: its whiteness, and 1 / reach^2.
+    pub ring_pools: [[f32; 4]; RINGS],
     /// x: how far the ripples fall in the lulls between gusts (1: no lulls;
     /// see `paws_calm`); y: the swell, metres; zw: the wind's way, x and z.
     pub air: [f32; 4],
@@ -239,8 +246,17 @@ impl WaterUniform {
             waves: [waves.unresolved_slope_variance(), o.swash.max(0.0), WAVE_REACH, SWASH_PERIOD],
             lost: waves.lost_slope_variance(),
             rings: [[0.0; 4]; RINGS],
+            ring_waves: [[0.0; 4]; RINGS],
+            ring_pools: [[0.0; 4]; RINGS],
             air: [paws_calm(waves.wind_speed), o.swell.max(0.0), waves.wind_dir.cos(), waves.wind_dir.sin()],
         }
+    }
+
+    /// The splashes on this surface (`effects::splash_rings`).
+    pub fn set_rings(&mut self, r: &crate::renderer::effects::SplashRings<RINGS>) {
+        self.rings = r.rings;
+        self.ring_waves = r.waves;
+        self.ring_pools = r.pools;
     }
 
     /// The shore's waves' time, wrapped to the wave field's loop so they
@@ -658,6 +674,8 @@ struct WaterMat {{
     waves: vec4<f32>,
     lost: array<vec4<f32>, {mips}>,
     rings: array<vec4<f32>, {rings}>,
+    ring_waves: array<vec4<f32>, {rings}>,
+    ring_pools: array<vec4<f32>, {rings}>,
     air: vec4<f32>,
 }}
 
@@ -806,30 +824,32 @@ fn {name}(pos: vec3<f32>, depth: f32, eye: vec3<f32>, t: f32) -> vec3<f32> {{
 /// for code it skips, which on the headset cost about a millisecond at the
 /// shore (bench 2026-10-07_2155).
 const RING_BLOCK: &str = r#"    if (water.rings[0].w > 0.0) {
-        let resolved = 1.0 - smoothstep(0.25, 0.5, span / RING_WAVELENGTH);
         for (var i = 0; i < RINGS_N; i = i + 1) {
             let r = water.rings[i];
             if (r.w <= 0.0) {
                 break;
             }
+            let wv = water.ring_waves[i];
+            let pool = water.ring_pools[i];
             let d = q - r.xy;
             let dist = length(d);
-            let age = r.z;
-            let spread = 0.03 + 0.08 * age;
-            let x = dist - RING_SPEED * age;
-            let k = 2.0 * WATER_PI / RING_WAVELENGTH;
-            let amp = RING_HEIGHT * sqrt(r.w) * exp(-age / 1.1) / sqrt(1.0 + dist * 10.0);
-            let train = exp(-x * x / (2.0 * spread * spread));
-            let rise = amp * resolved * train * -k * sin(k * x);
-            tilt = tilt + d / max(dist, 1e-4) * rise;
+            // Where the ring of waves has reached, and this pixel in it.
+            let x = dist - r.z;
+            let resolved = 1.0 - smoothstep(0.25, 0.5, span * wv.x * (0.5 / WATER_PI));
+            let train = exp(-x * x * wv.y);
+            let rise = r.w * resolved * train * -wv.x * sin(wv.x * x + wv.z);
+            // Where it struck: the cavity's dimple while it is open, and the
+            // foam it leaves.
+            let bowl = exp(-dist * dist * pool.y);
+            tilt = tilt + d / max(dist, 1e-4) * rise + d * (wv.w * bowl);
             // Too fine for the pixel, its slopes roughen the water instead:
             // far off, a ring is a band of duller or sparklier water.
-            ring_rough = ring_rough + 0.5 * (amp * k) * (amp * k) * train * (1.0 - resolved);
-            let foam_reach = 0.12 + 0.1 * sqrt(r.w) + 0.15 * age;
-            ring_foam = ring_foam + min(0.35 * sqrt(r.w), 0.6) * exp(-dist * dist / (foam_reach * foam_reach)) * (1.0 - smoothstep(0.4, RING_SECONDS, age));
+            ring_rough = ring_rough + 0.5 * (r.w * wv.x) * (r.w * wv.x) * train * (1.0 - resolved);
+            ring_foam = ring_foam + pool.x * bowl;
         }
     }
 "#;
+
 
 fn water_wgsl(dual: bool) -> String {
     water_wgsl_with(dual, true)
@@ -924,7 +944,6 @@ const WALK_STEPS: i32 = 6;
 const SHELF_SLOPE: f32 = 0.15;
 const FOAM_TILES: f32 = {foam_tiles};
 const BED_ALBEDO: f32 = {bed_albedo};
-const RING_SPEED: f32 = {ring_speed};
 const WATER_TRACE_COARSEN: i32 = 2;
 // Under this share of the bed's light reaching the eye, the bed is not looked
 // for: half an 8-bit level of the brightest the display shows.
@@ -932,9 +951,6 @@ const DEEP_SKIP: f32 = {deep_skip:?};
 const CAUSTIC_CONTRAST: f32 = 0.6;
 const CAUSTIC_MURK: f32 = 1.0;
 const PAWS_RATE: vec2<f32> = vec2<f32>(0.1308997, 0.0785398);
-const RING_WAVELENGTH: f32 = {ring_wavelength};
-const RING_HEIGHT: f32 = {ring_height};
-const RING_SECONDS: f32 = {ring_seconds};
 {surface}
 @group(1) @binding(0) var<uniform> water: WaterMat;
 @group(1) @binding(1) var wave_disp: texture_2d_array<f32>;
@@ -1314,11 +1330,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         foam_tiles = format!("{FOAM_TILES:?}"),
         bed_albedo = format!("{BED_ALBEDO:?}"),
         ring_block = ring_block,
-        ring_speed = format!("{RING_SPEED:?}"),
         deep_skip = 0.5f32 / 255.0,
-        ring_wavelength = format!("{RING_WAVELENGTH:?}"),
-        ring_height = format!("{RING_HEIGHT:?}"),
-        ring_seconds = format!("{RING_SECONDS:?}"),
         output = output,
         ret = ret,
         surface = surface_wgsl(),
@@ -1770,6 +1782,31 @@ mod tests {
 #[cfg(test)]
 pub fn water_shader_src() -> String {
     water_wgsl(false)
+}
+
+/// THE RINGS' CODE IS SMALL: what a splash's rings, foam and dimple add to
+/// the water's shader, by the host's instruction proxy
+/// (`shader_inlining`). The water is past the instruction cache without them
+/// (3,220 instructions, PIPESTATS 2026-10-12) and draws its ringed twin
+/// whenever a splash is spreading, so this part is kept under what it was
+/// when each ring worked out its own age's square roots and exponentials in
+/// the shader (79 by the proxy: 2,385 against 2,306, the audit of
+/// 2026-10-12, with four rings of one fixed length and speed); now the CPU
+/// sends each ring's radius, height and width, and the loop is a length, two
+/// exponentials and a sine (55).
+#[cfg(test)]
+mod ring_size_tests {
+    use super::*;
+    use crate::renderer::shader_inlining::inlined_sizes;
+
+    #[test]
+    fn the_rings_add_less_to_the_water_than_they_did() {
+        let total = |rings: bool| -> usize { inlined_sizes(&water_wgsl_with(false, rings), "fs_main").iter().map(|r| r.own * r.copies).sum() };
+        let (ringed, ringless) = (total(true), total(false));
+        eprintln!("water by the proxy: ringed {ringed}, ringless {ringless}, the rings {}", ringed - ringless);
+        assert!(ringed > ringless, "the ringed twin has the rings in it");
+        assert!(ringed - ringless <= 60, "the rings' loop grew: {} by the proxy", ringed - ringless);
+    }
 }
 
 #[cfg(test)]

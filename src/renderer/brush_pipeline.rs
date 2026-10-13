@@ -1694,6 +1694,42 @@ impl BrushPipeline {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// MEASUREMENT ONLY: the brushes' bases of `shader_opt::OPTS` with every
+    /// candidate that applies, one pipeline each (`opt_<base>_<candidate>`),
+    /// for the PIPESTATS log. The ground's: `shader_opt::log_ground_opts`.
+    pub fn log_opts(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+    ) {
+        for (base, pass, src) in opt_bases() {
+            for opt in crate::renderer::shader_opt::OPTS {
+                let Some(mut source) = (opt.edit)(&src) else {
+                    continue;
+                };
+                if pass {
+                    source = with_push_scan(device, source);
+                }
+                let label = format!("opt_{base}_{}", opt.label);
+                let _ = Self::from_source(
+                    device,
+                    if pass { probe_pass::FORMAT } else { format },
+                    uniform_layout,
+                    FrontFace::Ccw,
+                    if pass { 1 } else { samples },
+                    None,
+                    crate::renderer::multiview::ViewMode::Mono,
+                    Some(if pass { fixups.pass_layout() } else { probe_layout }),
+                    &label,
+                    source,
+                );
+            }
+        }
+    }
+
     fn from_source(
         device: &Device,
         format: TextureFormat,
@@ -2238,6 +2274,30 @@ pub fn dilate_sun_mask(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
         }
     }
     px
+}
+
+/// The brushes' hot shaders as generated, for `shader_audit`: the scene
+/// reader that draws most faces (baked sun, no spot casting) and the
+/// deferring reflection pass.
+#[cfg(test)]
+pub(crate) fn audit_sources() -> Vec<(&'static str, String)> {
+    let read = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+    vec![
+        ("brush_read_baked_spotless", crate::renderer::lights::without_spot_shadows(sun_reader_shader(read, FaceSun::Baked))),
+        ("brush_probe_pass_deferred", brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred)),
+    ]
+}
+
+/// The brushes' shaders `shader_opt`'s candidates are measured on, by label,
+/// with whether each is a probe pass: the reader that draws most faces (baked
+/// sun, no spot casting), the full reader, and the deferring reflection pass.
+pub(crate) fn opt_bases() -> Vec<(&'static str, bool, String)> {
+    let read = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+    vec![
+        ("bread", false, crate::renderer::lights::without_spot_shadows(sun_reader_shader(read.clone(), FaceSun::Baked))),
+        ("bfull", false, read),
+        ("bpass", true, brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred)),
+    ]
 }
 
 /// The scene reader's source for the faces of one [`FaceSun`] class: the full
@@ -3308,6 +3368,10 @@ const SUN_MATRIX_FIXED: (&str, &str) = (
 /// `src` with one of [`READER_EDITS`]: `None` when `edit` names no entry, or
 /// one of its finds does not match exactly once.
 pub(crate) fn with_reader_edit(src: String, edit: &str) -> Option<String> {
+    // `opt_*`: `shader_opt`'s candidates, by label or all together.
+    if edit.starts_with("opt_") {
+        return crate::renderer::shader_opt::edit_named(&src, edit);
+    }
     let (_, edits) = READER_EDITS.iter().find(|(name, _)| *name == edit)?;
     let mut src = src;
     for (from, to) in edits.iter() {

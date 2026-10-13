@@ -233,11 +233,6 @@ pub(crate) fn collect_node(
                     contents: bytemuck::cast_slice(&vertices),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh_ib"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
                 let layered = layered_weights.map(|weights| {
                     // The layered buffer is drawn with the SAME index buffer as
                     // the shaded one, so it has to be split wherever that was.
@@ -277,7 +272,25 @@ pub(crate) fn collect_node(
                             contents: bytemuck::cast_slice(&lv),
                             usage: wgpu::BufferUsages::VERTEX,
                         });
-                    LayeredPrimitive { vertices: lv, vertex_buffer }
+                    // THE TRIANGLES BY CLASS, for the cave shader's twins: the
+                    // same triangles, reordered. See `cave_twins::partition`.
+                    let (by_class, twin_ends) = crate::renderer::cave_twins::partition(&lv, &indices);
+                    let bounds = lv.iter().fold([[f32::INFINITY; 3], [f32::NEG_INFINITY; 3]], |[lo, hi], v| {
+                        [
+                            [lo[0].min(v.position[0]), lo[1].min(v.position[1]), lo[2].min(v.position[2])],
+                            [hi[0].max(v.position[0]), hi[1].max(v.position[1]), hi[2].max(v.position[2])],
+                        ]
+                    });
+                    (LayeredPrimitive { vertices: lv, vertex_buffer, twin_ends, bounds }, by_class)
+                });
+                let (layered, indices) = match layered {
+                    Some((layered, by_class)) => (Some(layered), by_class),
+                    None => (None, indices),
+                };
+                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mesh_ib"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
                 });
 
                 // See `MeshPrimitive::casts_shadow`. Half, because that is the

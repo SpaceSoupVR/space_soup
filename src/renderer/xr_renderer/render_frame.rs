@@ -26,6 +26,9 @@ struct MeshDraw<'a> {
     count: u32,
     thin: Option<&'a crate::renderer::mesh::ThinParts>,
     blended: bool,
+    /// Its mesh's bounding sphere where the model matrix puts it (player
+    /// frame), for the scene pass's cull. See `scene_cull`.
+    bound: glam::Vec4,
 }
 
 /// A layered draw needs no texture bind group: every layered mesh in a scene
@@ -35,6 +38,13 @@ type LayeredDraw<'a> = (
     &'a wgpu::Buffer,
     &'a wgpu::Buffer,
     u32,
+    // Where its triangle classes end, when its model keeps the vertical the
+    // classes were found under. See `cave_twins`.
+    Option<[u32; 4]>,
+    // Its box where its model puts it, player frame
+    // (`cave_twins::placed_box`): for the reflection pass's occluder and the
+    // scene pass's cull.
+    (glam::Vec3, glam::Vec3),
 );
 
 type SkinnedDraw<'a> = (
@@ -45,6 +55,30 @@ type SkinnedDraw<'a> = (
     &'a wgpu::Buffer,
     u32,
 );
+
+/// One frame of `wgpu::hal::vulkan::DRAW_LOG`: set from here to the end of
+/// the frame's recording, whichever way it is left.
+struct DrawLogFrame(bool);
+
+impl DrawLogFrame {
+    fn begin() -> Self {
+        let on = crate::renderer::levers::DRAW_LOG_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if on {
+            log::warn!("DRAWLOG frame start");
+            wgpu::hal::vulkan::DRAW_LOG.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Self(on)
+    }
+}
+
+impl Drop for DrawLogFrame {
+    fn drop(&mut self) {
+        if self.0 {
+            wgpu::hal::vulkan::DRAW_LOG.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::warn!("DRAWLOG frame end");
+        }
+    }
+}
 
 fn push_mesh_draws<'a>(
     instance: &'a MeshInstance,
@@ -77,6 +111,9 @@ fn push_mesh_draws<'a>(
                     &layered.vertex_buffer,
                     &prim.index_buffer,
                     prim.indices.len() as u32,
+                    crate::renderer::cave_twins::keeps_vertical(instance.mesh.model_matrix())
+                        .then_some(layered.twin_ends),
+                    crate::renderer::cave_twins::placed_box(instance.mesh.model_matrix(), layered.bounds),
                 ));
                 continue;
             }
@@ -89,6 +126,7 @@ fn push_mesh_draws<'a>(
                 count: prim.indices.len() as u32,
                 thin: prim.thin.as_ref(),
                 blended: prim.blended,
+                bound: crate::renderer::shadow::mesh_caster_bound(&instance.mesh),
             });
         }
     }
@@ -144,6 +182,8 @@ impl XrRenderer {
         mirror: Option<MirrorSurface>,
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
+        // MEASUREMENT: this frame's draws logged, when `Levers::draw_log` asked.
+        let _draw_log = DrawLogFrame::begin();
         // THE TIME OF DAY first: everything below reads the sky, its light
         // and the brush atlas it relights. See `xr_renderer::time_of_day`.
         self.update_time_of_day();
@@ -575,6 +615,9 @@ impl XrRenderer {
             };
             let rooms: &[crate::renderer::portal_cull::CullRoom] = if lv.portal_culling { &self.cull_rooms } else { &[] };
             let head_world = yaw * mid_eye + offset;
+            // A splash out of both eyes' sight throws nothing to draw.
+            let splashes: Vec<crate::renderer::effects::Splash> =
+                splashes.into_iter().filter(|s| crate::renderer::effects::splash_seen(s, now, &views)).collect();
             self.effect_seen_until.resize(self.effect_emitters.len(), f64::NEG_INFINITY);
             for (e, until) in self.effect_emitters.iter().zip(self.effect_seen_until.iter_mut()) {
                 if crate::renderer::effects::emitter_seen(e, &views, head_world, rooms, &portals) {
@@ -1901,7 +1944,7 @@ impl XrRenderer {
                         pass.set_pipeline(&self.layered_mesh_mirror_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
-                        for (model_bg, vb, ib, count) in
+                        for (model_bg, vb, ib, count, _, _) in
                             layered_draws.iter().chain(mirror_only_layered_draws.iter())
                         {
                             pass.set_bind_group(2, *model_bg, &[]);
@@ -2421,6 +2464,27 @@ impl XrRenderer {
                             timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(8 + eye)),
                             ..Default::default()
                         });
+                        // THE CAVE'S DEPTH FIRST, so the brushes and the
+                        // ground behind its rock are not traced here for
+                        // pixels the scene shows as rock: for a cave the eye
+                        // is in. From outside, the hill round it already hides
+                        // what lies behind, and its depth cost 0.2 ms
+                        // (cave_mouth, 2026-10-08). Single-eye only. See
+                        // `cave_twins`.
+                        if let (Some(t), false, true) = (&self.cave_twins, stereo, self.levers.cave_occluder) {
+                            let inside = |(lo, hi): &(glam::Vec3, glam::Vec3)| cam_pos.cmpge(*lo).all() && cam_pos.cmple(*hi).all();
+                            if layered_draws.iter().any(|d| inside(&d.5)) {
+                                pass.set_pipeline(&t.occluder);
+                                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                                pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                                for (model_bg, vb, ib, count, _, _) in layered_draws.iter().filter(|d| inside(&d.5)) {
+                                    pass.set_bind_group(2, *model_bg, &[]);
+                                    pass.set_vertex_buffer(0, vb.slice(..));
+                                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                    pass.draw_indexed(0..*count, 0, 0..1);
+                                }
+                            }
+                        }
                         pass.set_pipeline(&probe_pipeline.pipeline);
                         // Its photograph slots, as push constants: THIS eye's
                         // table, the one its camera block was just written with.
@@ -2467,11 +2531,58 @@ impl XrRenderer {
                                     && self.terrain_inlined.is_none()
                                     && self.weather.as_ref().is_some_and(|w| w.weathered(c.first_index - index_start))
                             };
+                            // THE GROUND THAT IS ALL OUT OF DOORS with the pass's
+                            // outdoor twin: the same reflection, without the
+                            // rooms' machinery compiled in. Which chunks, from
+                            // this pass's own probe table. See `outdoor_pass`.
+                            let outdoor_twins = self
+                                .terrain_outdoor_passes
+                                .as_ref()
+                                .filter(|_| self.levers.outdoor_pass && self.terrain_cut_pipeline.is_none() && self.terrain_inlined.is_none());
+                            let outdoor_frame = outdoor_twins.and_then(|_| {
+                                crate::renderer::outdoor_pass::OutdoorFrame::new(self.uniform_buf.probes_or_level(probes_arg))
+                            });
+                            // THE GROUND IN NO PHOTOGRAPH'S BOX with the pass's
+                            // nowhere twin: the lookup's "nothing" at once.
+                            // See `outdoor_pass::NowhereFrame`.
+                            let nowhere_twins = self
+                                .terrain_nowhere_passes
+                                .as_ref()
+                                .filter(|_| self.levers.nowhere_pass && self.terrain_cut_pipeline.is_none() && self.terrain_inlined.is_none());
+                            let nowhere_frame = nowhere_twins
+                                .map(|_| crate::renderer::outdoor_pass::NowhereFrame::new(self.uniform_buf.probes_or_level(probes_arg)));
+                            let nowhere = |c: &crate::renderer::shadow::CasterChunk| {
+                                nowhere_frame.as_ref().is_some_and(|f| {
+                                    let (lo, hi) =
+                                        crate::renderer::outdoor_pass::world_box(self.player.offset, self.player.yaw, c.min, c.max);
+                                    f.holds(lo, hi)
+                                })
+                            };
+                            // (A chunk nowhere is not in the outdoor volume: the two never both hold.)
+                            let outdoors = |c: &crate::renderer::shadow::CasterChunk| {
+                                outdoor_frame.as_ref().is_some_and(|f| {
+                                    let (lo, hi) =
+                                        crate::renderer::outdoor_pass::world_box(self.player.offset, self.player.yaw, c.min, c.max);
+                                    f.holds(lo, hi)
+                                })
+                            };
                             if solid_chunks.is_empty() {
                                 pass.draw_indexed(index_start..index_start + count, 0, 0..1);
                             } else {
-                                for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && !weathered(c)) {
+                                for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && !weathered(c) && !outdoors(c) && !nowhere(c)) {
                                     pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                }
+                                if let Some([twin, _]) = nowhere_twins {
+                                    pass.set_pipeline(&twin.pipeline);
+                                    for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && !weathered(c) && nowhere(c)) {
+                                        pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                    }
+                                }
+                                if let Some([twin, _]) = outdoor_twins.filter(|_| outdoor_frame.is_some()) {
+                                    pass.set_pipeline(&twin.pipeline);
+                                    for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && !weathered(c) && outdoors(c)) {
+                                        pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                    }
                                 }
                                 if let Some(w) = self.weather.as_ref().filter(|_| solid_chunks.iter().any(|c| weathered(c))) {
                                     let dedup = w.dedup_passes.as_ref().filter(|_| self.levers.pass_dedup);
@@ -2482,8 +2593,20 @@ impl XrRenderer {
                                         (None, false) => &w.twins.pass.pipeline,
                                     });
                                     pass.set_bind_group(2, &w.maps.bind_group, &[]);
-                                    for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && weathered(c)) {
+                                    for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && weathered(c) && !outdoors(c) && !nowhere(c)) {
                                         pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                    }
+                                    if let Some([_, twin]) = nowhere_twins {
+                                        pass.set_pipeline(&twin.pipeline);
+                                        for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && weathered(c) && nowhere(c)) {
+                                            pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                        }
+                                    }
+                                    if let Some([_, twin]) = outdoor_twins.filter(|_| outdoor_frame.is_some()) {
+                                        pass.set_pipeline(&twin.pipeline);
+                                        for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && weathered(c) && outdoors(c)) {
+                                            pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                        }
                                     }
                                 }
                             }
@@ -2880,6 +3003,10 @@ impl XrRenderer {
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
                     }
+                    // THE MODELS THIS PASS'S EYES CAN SEE INTO: the rest are not
+                    // drawn (`scene_cull`).
+                    let scene_cull = self.levers.scene_cull;
+                    let mesh_seen = |d: &MeshDraw| !scene_cull || crate::renderer::scene_cull::sees(&cull_planes, d.bound);
                     if !layered_draws.is_empty() {
                         // One material bind for the batch: every cave in a scene
                         // blends the same four terrain layers, so the only thing
@@ -2887,11 +3014,26 @@ impl XrRenderer {
                         pass.set_pipeline(self.sp_layered(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
-                        for (model_bg, vb, ib, count) in &layered_draws {
+                        // BY ITS SHADER'S TWINS in the single-eye pass: each
+                        // triangle class by the twin without the path its
+                        // pixels never take. See `cave_twins`.
+                        let twins = self.cave_twins.as_ref().filter(|_| !stereo && self.levers.cave_twins);
+                        for (model_bg, vb, ib, count, ends, bounds) in &layered_draws {
+                            if self.levers.scene_cull && !crate::renderer::scene_cull::sees_box(&cull_planes, *bounds) {
+                                continue;
+                            }
                             pass.set_bind_group(2, *model_bg, &[]);
                             pass.set_vertex_buffer(0, vb.slice(..));
                             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..*count, 0, 0..1);
+                            match (twins, ends) {
+                                (Some(t), Some(ends)) if ends[3] == *count => {
+                                    t.draw(&mut pass, self.sp_layered(stereo), *ends)
+                                }
+                                _ => {
+                                    pass.set_pipeline(self.sp_layered(stereo));
+                                    pass.draw_indexed(0..*count, 0, 0..1);
+                                }
+                            }
                         }
                     }
                     if !wire_verts.is_empty() {
@@ -2907,7 +3049,7 @@ impl XrRenderer {
                         // The opaque parts. A primitive with thin parts draws
                         // the rest here and those in the thin pass, after the
                         // sky; glass waits for that too.
-                        for d in mesh_draws.iter().filter(|d| !d.blended) {
+                        for d in mesh_draws.iter().filter(|d| !d.blended && mesh_seen(d)) {
                             let (ib, count) = match (d.thin, thin_pass) {
                                 (Some(t), true) => (&t.solid_index_buffer, t.solid_count),
                                 _ => (d.indices, d.count),
@@ -3019,7 +3161,7 @@ impl XrRenderer {
                     if thin_pass {
                         pass.set_pipeline(self.sp_mesh_thin(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for d in mesh_draws.iter().filter(|d| !d.blended) {
+                        for d in mesh_draws.iter().filter(|d| !d.blended && mesh_seen(d)) {
                             let Some(t) = d.thin else { continue };
                             pass.set_bind_group(1, d.model, &[]);
                             pass.set_bind_group(2, d.texture, &[]);
@@ -3037,7 +3179,7 @@ impl XrRenderer {
                     if mesh_draws.iter().any(|d| d.blended) {
                         pass.set_pipeline(self.sp_mesh(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for d in mesh_draws.iter().filter(|d| d.blended) {
+                        for d in mesh_draws.iter().filter(|d| d.blended && mesh_seen(d)) {
                             pass.set_bind_group(1, d.model, &[]);
                             pass.set_bind_group(2, d.texture, &[]);
                             pass.set_bind_group(3, d.lightmap, &[]);

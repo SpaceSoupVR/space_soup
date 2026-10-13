@@ -534,6 +534,16 @@ pub struct XrRenderer {
     /// The ground's probe pass and its poolless twin with the repeated code
     /// written once. See `ground_twins::dedup_passes`.
     terrain_dedup_passes: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 2]>,
+    /// The ground's probe pass's OUTDOOR TWIN and its weather twin, for the
+    /// chunks every texel of which starts its reflection out of doors
+    /// (`outdoor_pass`, `Levers::outdoor_pass`). `None` when the shader's
+    /// switch or the weather's edits moved (logged): the ground draws as it did.
+    terrain_outdoor_passes: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 2]>,
+    /// The ground's probe pass's NOWHERE TWIN and its weather twin, for the
+    /// chunks that touch no photograph's box and no doorway's reach
+    /// (`outdoor_pass::NowhereFrame`, `Levers::nowhere_pass`). `None` when the
+    /// shader's switch or the weather's edits moved (logged).
+    terrain_nowhere_passes: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 2]>,
     terrain_sun_baked: bool,
     /// MEASUREMENT: the ground's reader, probe pass and poolless pass with
     /// their layer reads inlined, drawn in the shipped ones' place while
@@ -577,6 +587,10 @@ pub struct XrRenderer {
     msaa: MsaaLevel,
     layered_mesh_pipeline: crate::renderer::layered_mesh_pipeline::LayeredMeshPipeline,
     layered_mesh_mirror_pipeline: crate::renderer::layered_mesh_pipeline::LayeredMeshPipeline,
+    /// The cave's shader twins for the single-eye scene pass, and its depth
+    /// for the reflection pass. `None` when a twin no longer matches the cave
+    /// shader (logged): the cave is then drawn as shipped. See `cave_twins`.
+    cave_twins: Option<crate::renderer::cave_twins::CaveTwins>,
     // The material is per-scene, but it is built here with the fallback so
     // terrain renders through the real pipeline before any textures exist.
     // Replaced via `set_terrain_material` when a scene authors its own.
@@ -1191,6 +1205,30 @@ impl XrRenderer {
             &wgpu_device, &uniform_buf.layout, &probe_fixups,
         );
         let terrain_dedup_passes = crate::renderer::ground_twins::dedup_passes(&wgpu_device, &uniform_buf.layout, &probe_fixups, None);
+        let terrain_outdoor_passes = {
+            let weather_layout = crate::renderer::weather::bind_group_layout(&wgpu_device);
+            let twin = |weather| {
+                crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass_outdoors(
+                    &wgpu_device, &uniform_buf.layout, &probe_fixups, weather,
+                )
+            };
+            twin(None).zip(twin(Some(&weather_layout))).map(|(plain, wet)| [plain, wet])
+        };
+        if terrain_outdoor_passes.is_none() {
+            log::warn!("terrain: the probe pass's outdoor twin no longer matches its shader; the ground draws by the full pass");
+        }
+        let terrain_nowhere_passes = {
+            let weather_layout = crate::renderer::weather::bind_group_layout(&wgpu_device);
+            let twin = |weather| {
+                crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass_nowhere(
+                    &wgpu_device, &uniform_buf.layout, &probe_fixups, weather,
+                )
+            };
+            twin(None).zip(twin(Some(&weather_layout))).map(|(plain, wet)| [plain, wet])
+        };
+        if terrain_nowhere_passes.is_none() {
+            log::warn!("terrain: the probe pass's nowhere twin no longer matches its shader; the ground draws by the full pass");
+        }
         if terrain_dedup_passes.is_none() {
             log::warn!("terrain: the probe pass's dedup edits no longer match; it draws as it was");
         }
@@ -1218,6 +1256,12 @@ impl XrRenderer {
             );
             probe_fixups.log_register_cuts(&wgpu_device);
             crate::renderer::ground_cuts::log_ground_cuts(
+                &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, &probe_fixups,
+            );
+            crate::renderer::brush_pipeline::BrushPipeline::log_opts(
+                &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, &probe_fixups,
+            );
+            crate::renderer::shader_opt::log_ground_opts(
                 &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, &probe_fixups,
             );
             // Built only for the log: the `terrain_reader` lever's inlined set.
@@ -1270,6 +1314,12 @@ impl XrRenderer {
             crate::renderer::layered_mesh_pipeline::LayeredMeshPipeline::new_mirror(
                 &wgpu_device, wgpu_format, &uniform_buf.layout, &terrain_pipeline.material_layout,
             );
+        let cave_twins = crate::renderer::cave_twins::CaveTwins::new(
+            &wgpu_device, wgpu_format, &uniform_buf.layout, &terrain_pipeline.material_layout, samples,
+        );
+        if cave_twins.is_none() {
+            log::warn!("CAVE TWINS: a substitution no longer matches the cave shader; the cave draws as shipped");
+        }
         let wire_pipeline =
             WirePipeline::new_multisampled(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
         let mesh_pipeline =
@@ -1679,6 +1729,8 @@ impl XrRenderer {
             terrain_steep,
             slope_split: None,
             terrain_dedup_passes,
+            terrain_outdoor_passes,
+            terrain_nowhere_passes,
             terrain_sun_baked: false,
             terrain_inlined: None,
             weather: None,
@@ -1712,6 +1764,7 @@ impl XrRenderer {
             skinned_mesh_mirror_pipeline,
             layered_mesh_pipeline,
             layered_mesh_mirror_pipeline,
+            cave_twins,
             terrain_material,
             terrain_layers: vec![None, None, None, None],
             terrain_normals: vec![None, None, None, None],
@@ -2486,6 +2539,9 @@ impl XrRenderer {
             self.perf_windows = 0;
             self.perf_warmup = true;
         }
+        if levers.draw_log != 0 && levers.draw_log != self.levers.draw_log {
+            crate::renderer::levers::DRAW_LOG_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(on) = levers.ssr {
             self.set_screen_space_reflections(on);
         }
@@ -3052,10 +3108,9 @@ impl XrRenderer {
             let xz = glam::Vec2::new(splash.position.x, splash.position.z);
             splash.position.y += crate::renderer::water_pipeline::swash_lift(&b.uniform, splash.depth, xz);
         }
-        if self.splashes.len() >= KEPT {
-            self.splashes.remove(0);
-        }
-        self.splashes.push(splash);
+        // Among those still spreading: it is told how still the water it
+        // met was (`effects::strike`).
+        crate::renderer::effects::strike(&mut self.splashes, splash, KEPT);
     }
 
     pub fn set_water(
@@ -3150,7 +3205,7 @@ impl XrRenderer {
         let rings = crate::renderer::effects::splash_rings(&self.splashes, now, self.player.offset);
         for body in &mut self.water_bodies {
             body.uniform.set_time(self.water_seconds, body.waves.params.loop_seconds);
-            body.uniform.rings = rings;
+            body.uniform.set_rings(&rings);
             self.wgpu_queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
         }
     }

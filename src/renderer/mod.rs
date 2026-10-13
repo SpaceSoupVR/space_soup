@@ -6,6 +6,10 @@ mod desktop_renderer;
 pub mod icon;
 pub mod layer_settings;
 pub mod layered_mesh_pipeline;
+pub mod cave_twins;
+pub mod outdoor_pass;
+pub mod scene_cull;
+pub mod shader_opt;
 pub mod lights;
 pub mod material_wgsl;
 pub mod mesh;
@@ -49,6 +53,8 @@ pub mod doors;
 pub mod shader_precision;
 #[cfg(test)]
 pub(crate) mod shader_inlining;
+#[cfg(test)]
+pub(crate) mod shader_audit;
 pub mod skin_compute;
 pub mod water_waves;
 pub mod probe_blur;

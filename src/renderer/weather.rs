@@ -1091,7 +1091,29 @@ fn veil_height(snow: bool) -> f32 {
     return out;
 }
 
-@fragment fn fs_veil(in: VeilOut) -> @location(0) vec4<f32> {
+// The column's colour, and the depth of the point its ray enters it at.
+//
+// THAT DEPTH IS THE COLUMN'S OCCLUSION TEST against everything the frame drew,
+// with the pipeline's LessEqual: the probe pass's depth ends the ray at the
+// ground and the brushes, but nothing else is in it -- no cave, no model, no
+// character -- and the box's far faces are behind all of them, so with no
+// depth test the rain over a distant area was painted straight through the
+// cave's arch (`cave_back_out`, 2026-10-08: a speckled slab inside the back
+// exit, the rain_demo area 45 m behind the hill). Whatever stands in front
+// of where the column begins now hides it; a surface inside the column is
+// still found by the probe pass's depth, as before.
+struct VeilFrag {
+    @location(0) colour: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+}
+fn veil_frag(colour: vec4<f32>, depth: f32) -> VeilFrag {
+    var f: VeilFrag;
+    f.colour = colour;
+    f.depth = depth;
+    return f;
+}
+
+@fragment fn fs_veil(in: VeilOut) -> VeilFrag {
     let k = in.area;
     let a0 = wx.areas[k * 3u];
     let a1 = wx.areas[k * 3u + 1u];
@@ -1123,8 +1145,11 @@ fn veil_height(snow: bool) -> f32 {
     // The particles' reach: they draw the near part.
     let hand = select(vec2<f32>(6.0, 11.0), vec2<f32>(3.5, 7.5), snow);
     let t0 = max(t_in, hand.x);
+    // Where the column begins along this pixel's ray, as the frame's depth.
+    let begin = camera.view_proj[view_slot] * vec4<f32>(veil_to_player(eye + dir * t0), 1.0);
+    let begin_depth = clamp(begin.z / max(begin.w, 1e-6), 0.0, 1.0);
     if (t_end <= t0) {
-        return vec4<f32>(0.0);
+        return veil_frag(vec4<f32>(0.0), begin_depth);
     }
     let time = wx.params.y;
     let height = veil_height(snow);
@@ -1145,7 +1170,7 @@ fn veil_height(snow: bool) -> f32 {
         depth = depth + rise * edge * near * shaft * dt;
     }
     if (depth <= 0.0) {
-        return vec4<f32>(0.0);
+        return veil_frag(vec4<f32>(0.0), begin_depth);
     }
     // THE FALL ITSELF, in the view's angles at the column's middle: columns
     // of streaks (or a scatter of flakes) a pixel and a quarter at least
@@ -1194,7 +1219,7 @@ fn veil_height(snow: bool) -> f32 {
     let sigma = select(0.016, 0.09, snow) * clamp(a1.w, 0.0, 1.5);
     let alpha = clamp(1.0 - exp(-sigma * depth * fall), 0.0, 0.7);
     var light = wx.sky.rgb * select(0.75, 1.0, snow) + wx.sun.rgb * select(0.12, 0.5, snow) * wx.sun_dir.w;
-    return vec4<f32>(aces_fitted(light) * alpha, alpha);
+    return veil_frag(vec4<f32>(aces_fitted(light) * alpha, alpha), begin_depth);
 }
 "#,
     )
@@ -1303,7 +1328,9 @@ impl WeatherPipeline {
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(CompareFunction::Always),
+                // Against the fragment's own depth, where its column begins
+                // (`VeilFrag`): hidden by whatever the frame drew in front.
+                depth_compare: Some(CompareFunction::LessEqual),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
@@ -1645,6 +1672,116 @@ mod tests {
         assert!(s > 0 && s < SNOW_PARTICLES);
         let stopped = AreaParams { falling: 0.0, ..rain };
         assert_eq!(particle_counts(&[stopped], [5.0, 1.6, 5.0]), (0, 0, 0));
+    }
+
+    /// A FAR COLUMN IS HIDDEN BY WHATEVER THE FRAME DREW IN FRONT OF IT, not
+    /// only by what the probe pass drew. A rain area 30-60 m ahead, seen
+    /// through a frame whose probe pass holds nothing (a cave or any model is
+    /// never in it): with the frame's depth clear, the column shows; with
+    /// something drawn a few centimetres in front of the eye, it must not.
+    /// The veils used to draw with no depth test and painted the rain
+    /// through the cave's back arch (`cave_back_out`, 2026-10-08).
+    #[test]
+    fn a_far_column_is_hidden_by_anything_drawn_in_front_of_it() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        const SIZE: u32 = 16;
+        let format = TextureFormat::Rgba8Unorm;
+        let lights = crate::renderer::lights::LightsUniform::new(&device);
+        let (_shadows, uniforms) = crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
+        let eye = glam::Vec3::new(0.0, 2.0, 0.0);
+        let view_proj = glam::Mat4::perspective_rh(1.2, 1.0, 0.1, 200.0)
+            * glam::Mat4::look_at_rh(eye, glam::Vec3::new(0.0, 2.0, -40.0), glam::Vec3::Y);
+        uniforms.upload(&queue, view_proj, eye, &crate::renderer::uniforms::ShadowUpload::disabled());
+        let layout = bind_group_layout(&device);
+        let ground_layout = crate::renderer::terrain_pipeline::material_bind_group_layout(&device);
+        let material = crate::renderer::terrain_pipeline::TerrainMaterial::fallback(&device, &queue, &ground_layout);
+        let probe_layout = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(&device);
+        let probe = crate::renderer::brush_pipeline::probe_pass::Target::new(&device, &probe_layout, SIZE, SIZE, 1);
+        let pipeline = WeatherPipeline::new(&device, format, &uniforms.layout, &ground_layout, &layout, 1, crate::renderer::multiview::ViewMode::Mono);
+        let mut maps = WeatherMaps::new(&device, &layout, &[(8, 8)]);
+        maps.upload_map(&queue, 0, 8, 8, &[[0.0; 4]; 64]);
+        maps.set_area(0, &AreaParams { min: [-30.0, -60.0], extent: [60.0, 30.0], snow: false, falling: 1.0, wind: [0.0, 0.0], edge: 3.0 }, (8, 8));
+        let view = ParticleView { head_world: eye.to_array(), sky: [1.0; 3], exposure: 1.0, pixel: 0.01, ..Default::default() };
+        maps.set_view(&view, (0, 0, 0), [0.0, 0.0]);
+        maps.write(&queue);
+
+        let centre_after = |frame_depth: f32| -> [u8; 4] {
+            let make = |label: &str, format: TextureFormat| {
+                device.create_texture(&TextureDescriptor {
+                    label: Some(label),
+                    size: Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format,
+                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+            };
+            let target = make("veil_test_target", format);
+            let depth = make("veil_test_depth", TextureFormat::Depth32Float);
+            let (target_view, depth_view) = (target.create_view(&Default::default()), depth.create_view(&Default::default()));
+            let readback = device.create_buffer(&BufferDescriptor {
+                label: Some("veil_test_readback"),
+                size: (256 * SIZE) as u64,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            // The probe pass drew nothing: its depth is clear.
+            encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("veil_test_probe_depth"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &probe.depth_view,
+                    depth_ops: Some(Operations { load: LoadOp::Clear(1.0), store: StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            {
+                // The frame's depth: clear, or something just in front of the eye.
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("veil_test_pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &target_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(Operations { load: LoadOp::Clear(frame_depth), store: StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                pipeline.draw_veils(&mut pass, &uniforms.bind_group, &material.bind_group, &maps.bind_group, &probe.bind_group);
+            }
+            encoder.copy_texture_to_buffer(
+                TexelCopyTextureInfo { texture: &target, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+                TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(SIZE) },
+                },
+                Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            );
+            queue.submit(Some(encoder.finish()));
+            let slice = readback.slice(..);
+            slice.map_async(MapMode::Read, |_| {});
+            device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+            let data = slice.get_mapped_range().unwrap();
+            let at = (SIZE / 2) as usize * 256 + (SIZE / 2) as usize * 4;
+            [data[at], data[at + 1], data[at + 2], data[at + 3]]
+        };
+        let open = centre_after(1.0);
+        assert!(open[3] > 0 && open[0] > 0, "the column should show with nothing in front of it: {open:?}");
+        // About a tenth of a metre from the eye: a cave's wall, a model.
+        let hidden = centre_after(0.2);
+        assert_eq!(hidden, [0, 0, 0, 255], "the column drew over something in front of it (the clear is opaque black)");
     }
 
     /// GPU SMOKE: the twins and the particles build on a real device, with

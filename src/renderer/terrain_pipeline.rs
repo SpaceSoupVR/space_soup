@@ -355,6 +355,67 @@ impl TerrainPipeline {
         )
     }
 
+    /// THE GROUND'S PROBE PASS'S NOWHERE TWIN ([`nowhere_pass_shader`]), for
+    /// the chunks of ground that touch no photograph's box and no doorway's
+    /// reach this frame (`outdoor_pass::NowhereFrame`); with `weather_layout`,
+    /// its weather twin. `None` when the shader's switch or the weather's
+    /// edits moved. `Levers::nowhere_pass`.
+    pub fn new_probe_pass_nowhere(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        weather_layout: Option<&BindGroupLayout>,
+    ) -> Option<Self> {
+        let src = nowhere_pass_shader()?;
+        let (src, label) = match weather_layout {
+            Some(_) => (crate::renderer::weather::with_weather(&src)?, "terrain_weather_probe_pass_nowhere"),
+            None => (src, "terrain_probe_pass_nowhere"),
+        };
+        Some(Self::build_from_with(
+            device,
+            crate::renderer::brush_pipeline::probe_pass::FORMAT,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::ProbePass,
+            weather_layout,
+            Some(fixups.pass_layout()),
+            src,
+            label,
+        ))
+    }
+
+    /// THE GROUND'S PROBE PASS'S OUTDOOR TWIN ([`outdoor_pass_shader`]), for
+    /// the chunks of ground every texel of which starts out of doors this frame
+    /// (`outdoor_pass::all_outdoors`); with `weather_layout`, its weather twin
+    /// (`weather::with_weather`), for those of them a weather area touches.
+    /// `None` when the shader's switch or the weather's edits moved.
+    /// `Levers::outdoor_pass`.
+    pub fn new_probe_pass_outdoors(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        weather_layout: Option<&BindGroupLayout>,
+    ) -> Option<Self> {
+        let src = outdoor_pass_shader()?;
+        let (src, label) = match weather_layout {
+            Some(_) => (crate::renderer::weather::with_weather(&src)?, "terrain_weather_probe_pass_outdoors"),
+            None => (src, "terrain_probe_pass_outdoors"),
+        };
+        Some(Self::build_from_with(
+            device,
+            crate::renderer::brush_pipeline::probe_pass::FORMAT,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::ProbePass,
+            weather_layout,
+            Some(fixups.pass_layout()),
+            src,
+            label,
+        ))
+    }
+
     /// MEASUREMENT: the ground's probe pass with the register cut `cut` (one of
     /// `PROBE_PASS_REGISTER_CUTS`) applied, to DRAW with in the shipped one's
     /// place (the `pass_cut` lever). `None` for a cut it does not have, or
@@ -604,6 +665,76 @@ pub struct TerrainWeatherTwins {
     pub pass_poolless: TerrainPipeline,
 }
 
+/// The switch [`outdoor_pass_shader`] turns: see `PROBE_ALL_OUTDOORS` in the
+/// lights block.
+const ALL_OUTDOORS_OFF: &str = "const PROBE_ALL_OUTDOORS: bool = false;";
+const ALL_OUTDOORS_ON: &str = "const PROBE_ALL_OUTDOORS: bool = true;";
+
+/// The switch [`nowhere_pass_shader`] turns: see `PROBE_NOWHERE` in the lights
+/// block.
+const NOWHERE_OFF: &str = "const PROBE_NOWHERE: bool = false;";
+const NOWHERE_ON: &str = "const PROBE_NOWHERE: bool = true;";
+
+/// THE GROUND'S PROBE PASS FOR GROUND IN NO PHOTOGRAPH'S BOX: the pass with
+/// `PROBE_NOWHERE` set, so the lookup answers "nothing" at once, as the full
+/// pass does for such ground after choosing among every photograph, starting
+/// a trace and walking the doorways -- and the pass is the ground's material
+/// and the characters' reflections alone. The same picture wherever
+/// `outdoor_pass::NowhereFrame::holds`, which is where it is drawn. `None` if
+/// the switch is not in the shader exactly once.
+pub(crate) fn nowhere_pass_shader() -> Option<String> {
+    let src = terrain_shader_for(TerrainRole::ProbePass);
+    (src.matches(NOWHERE_OFF).count() == 1).then(|| src.replacen(NOWHERE_OFF, NOWHERE_ON, 1))
+}
+
+/// THE GROUND'S PROBE PASS FOR GROUND THAT IS ALL OUT OF DOORS: the pass with
+/// `PROBE_ALL_OUTDOORS` set, so its reflection is the outdoor one alone -- the
+/// ground map's trace, the buildings' outsides, the sky -- and none of the
+/// rooms' machinery is compiled in. The same picture wherever
+/// `outdoor_pass::all_outdoors` holds, which is where it is drawn. `None` if
+/// the switch is not in the shader exactly once.
+///
+/// A surface too rough to trace takes the photographs' path in the full pass;
+/// here, the outdoor volume's photographs alone (`probe_outdoor_untraced`),
+/// which is all that path finds further from a doorway than its fades.
+pub(crate) fn outdoor_pass_shader() -> Option<String> {
+    let src = terrain_shader_for(TerrainRole::ProbePass);
+    if src.matches(ALL_OUTDOORS_OFF).count() != 1 {
+        return None;
+    }
+    let src = src.replacen(ALL_OUTDOORS_OFF, ALL_OUTDOORS_ON, 1);
+    // The sky read once where the outdoor answer has it twice -- behind a
+    // building and with none -- as the pass's dedup twin has it
+    // (`brush_pipeline::DEDUP_OUTDOOR_SKY`: the same picture to the byte).
+    let (from, to) = crate::renderer::brush_pipeline::DEDUP_OUTDOOR_SKY;
+    Some(if src.matches(from).count() == 1 { src.replacen(from, to, 1) } else { src })
+}
+
+/// MEASUREMENT ONLY (`terrain_cut_rough_skip`): nothing traced where the scene
+/// gives the reflection no share of its own texel, as the brushes' pass has it
+/// (`brush_pipeline::probe_pass::PASS_LIGHTING`) -- from this roughness up the
+/// scene shader multiplies the reflection by `1 - lobe_is_hemispherical`, 0
+/// (`shade_material_env_part`).
+///
+/// NOT THE SAME PICTURE, so not in the pass: the reflection is half the
+/// resolution each way, and a scene pixel a little smoother than its texel
+/// still reads the texel -- skipped, it reads the sky's and the lightmap's
+/// light in the trace's place. Offline, 2026-10-12: 1.1% of the front lawn's
+/// pixels and 1.9% of the field's differ, nearly all by one level of 255, the
+/// worst by 11 (docs/shader-optimization-2026-10-12.md). The cut says what the
+/// rough ground's reflection costs.
+///
+/// After `probe_fragment = in.clip`, which is where the weather twin puts its
+/// own code (`weather::with_weather`): wet ground is made smooth there, before
+/// this asks, so a puddle is still traced. And after every implicit-derivative
+/// sample, at the entry point's top level.
+pub(crate) const PASS_ROUGH_SKIP: &str =
+    "    if (clamp(rough, 0.04, 1.0) >= PROBE_LOBE_HEMISPHERICAL) {\n        return vec4<f32>(0.0);\n    }\n";
+
+/// Where [`PASS_ROUGH_SKIP`] goes, and the same with it in.
+const PASS_ROUGH_SKIP_AT: &str = "    probe_fragment = in.clip;\n    return probe_env_for_pass(\n";
+const PASS_ROUGH_SKIP_IN: &str = "    probe_fragment = in.clip;\n    if (clamp(rough, 0.04, 1.0) >= PROBE_LOBE_HEMISPHERICAL) {\n        return vec4<f32>(0.0);\n    }\n    return probe_env_for_pass(\n";
+
 /// MEASUREMENT ONLY: what `TerrainPipeline::log_probe_pass_register_cuts` cuts
 /// out of the ground's probe pass, one pipeline each -- text edits of the
 /// generated WGSL; `pass_cut` draws with one. 2026-10-06: the glass's gate
@@ -611,6 +742,18 @@ pub struct TerrainWeatherTwins {
 /// capsules' answer was made (`lights::capsule_glass_beam`).
 const PROBE_PASS_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("terrain_cut_none", &[]),
+    // The rough ground not traced: what its reflection costs. Not the same
+    // picture -- see `PASS_ROUGH_SKIP`.
+    ("terrain_cut_rough_skip", &[(PASS_ROUGH_SKIP_AT, PASS_ROUGH_SKIP_IN)]),
+    // ALL OF THE GROUND BY ITS OUTDOOR TWIN (`outdoor_pass_shader`): for its
+    // statistics, and to draw a view of open ground with it alone -- on the
+    // headset by this lever, off it by `TERRAIN_PASS_CUT`. Not the same
+    // picture on ground in or beside a building.
+    ("terrain_cut_all_outdoors", &[(ALL_OUTDOORS_OFF, ALL_OUTDOORS_ON)]),
+    // ALL OF THE GROUND BY ITS NOWHERE TWIN (`nowhere_pass_shader`): for its
+    // statistics, and what the pass costs with no lookup at all. Not the same
+    // picture on ground inside a photograph's box.
+    ("terrain_cut_nowhere", &[(NOWHERE_OFF, NOWHERE_ON)]),
     // No gate: the glow as the capsules give it.
     (
         "terrain_cut_gate",
@@ -674,10 +817,42 @@ pub enum TerrainRole {
     ProbePass,
 }
 
+/// MEASUREMENT (`adb shell setprop debug.spacesoup.painted 1`, read once when
+/// the device is created): every ground shader built for a PAINTED level.
+///
+/// The ground's layer weights are the splat map's where the level has one
+/// (`mat.use_splat`, set by `TerrainMaterial::new`) and worked out from the
+/// slope where it has not -- and the shader works out both for every pixel and
+/// selects, because which it is arrives in a uniform. On a painted level the
+/// slope's weights, an `acos` among them, are computed and thrown away:
+/// 176 of the gentle reader's 2,719 instructions, 179 of the steep one's 3,010,
+/// 80 of the mixed one's 3,141, 93 of the pass's 9,215 (PIPESTATS, 2026-10-12,
+/// `shader_opt`'s `splat_probe`). With this set the shaders have the painted
+/// answer alone: the same picture on a painted level, the WRONG one on an
+/// unpainted level, which is why it is a switch for measuring and not the
+/// fix -- that is building the ground's pipelines once the level's material
+/// is known (docs/shader-optimization-2026-10-12.md).
+pub static GROUND_PAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Where the ground chooses between its two sets of layer weights, and the
+/// painted choice alone.
+pub(crate) const PAINTED_FROM: &str = "    return select(derived, authored, mat.use_splat > 0.5);\n";
+pub(crate) const PAINTED_TO: &str = "    return authored;\n";
+
+/// `src` built for a painted level: see [`GROUND_PAINTED`]. `None` if the
+/// choice is not in the shader exactly once.
+pub(crate) fn painted_shader(src: &str) -> Option<String> {
+    (src.matches(PAINTED_FROM).count() == 1).then(|| src.replacen(PAINTED_FROM, PAINTED_TO, 1))
+}
+
 /// The terrain shader for `role`: `terrain_shader`, with its reflection read
 /// from the probe pass or its fragment stage cut down to the reflection alone.
 pub fn terrain_shader_for(role: TerrainRole) -> String {
     let src = terrain_shader();
+    let src = match GROUND_PAINTED.load(std::sync::atomic::Ordering::Relaxed) {
+        true => painted_shader(&src).unwrap_or(src),
+        false => src,
+    };
     if role == TerrainRole::Scene {
         return src;
     }
@@ -1806,6 +1981,193 @@ pub(crate) mod tests {
         let data = slice.get_mapped_range().unwrap();
         let centre = (SIZE / 2) as usize * 256 + (SIZE / 2) as usize * 4;
         Some([data[centre], data[centre + 1], data[centre + 2], data[centre + 3]])
+    }
+
+    /// The outdoor twin is the pass with its one switch turned, valid, and
+    /// much the smaller; the ground gives the lookup no face of its own (the
+    /// twin's reasoning starts from that).
+    #[test]
+    fn the_outdoor_twin_is_the_pass_with_its_switch_turned() {
+        use wgpu::naga;
+        let pass = terrain_shader_for(TerrainRole::ProbePass);
+        let twin = outdoor_pass_shader().expect("the outdoor switch moved");
+        let (sky_twice, sky_once) = crate::renderer::brush_pipeline::DEDUP_OUTDOOR_SKY;
+        assert_eq!(twin.replacen(ALL_OUTDOORS_ON, ALL_OUTDOORS_OFF, 1).replacen(sky_once, sky_twice, 1), pass);
+        assert!(twin.contains(sky_once), "the outdoor sky's two reads are no longer where the dedup edit expects them");
+        assert!(pass.contains("const PROBE_FACE_ALWAYS_GIVEN: bool = false;"));
+        assert!(!pass.contains("probe_face_given = ") && !pass.contains("probe_volume_pos = "));
+        let at = |s: &str, m: &str| s.find(m).unwrap_or_else(|| panic!("`{m}` is not in the shader"));
+        // The lookup's outdoor answer is asked before anything of the rooms'.
+        let env = &twin[at(&twin, "fn probe_environment(")..at(&twin, "fn probe_trace(")];
+        assert!(at(env, "    if (PROBE_ALL_OUTDOORS) {") < at(env, "    let hit = probe_trace(world_pos, d, trace_room, roughness);"));
+        assert!(at(env, "    if (PROBE_ALL_OUTDOORS) {") < at(env, "probe_choose(select_world, volume_world)"));
+        assert!(at(env, "    if (PROBE_ALL_OUTDOORS) {") < at(env, "probe_portal_holding(volume_world)"));
+        for (label, src) in [
+            ("twin", twin.clone()),
+            ("weather twin", crate::renderer::weather::with_weather(&twin).expect("the weather's edits moved")),
+        ] {
+            let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+        let size = |s: &str| -> usize {
+            crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum()
+        };
+        let (full, out) = (size(&pass), size(&twin));
+        println!("the ground's pass: {full} proxy units; its outdoor twin: {out}");
+        if std::env::var("TWIN_REPORT").is_ok() {
+            println!("{}", crate::renderer::shader_inlining::report("outdoor twin", &twin, "fs_main", 30));
+        }
+        // 2,162 of 4,165 with the untraced answer's two photographs in it
+        // (2026-10-12); the trace through the rooms alone is 1,500.
+        assert!(out * 5 < full * 3, "the outdoor twin is {out} of {full}: the rooms' code is still in it");
+        let Some((device, _queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let lights = LightsUniform::new(&device);
+        let (_shadows, uniforms) = crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, 1024);
+        let weather_layout = crate::renderer::weather::bind_group_layout(&device);
+        assert!(TerrainPipeline::new_probe_pass_outdoors(&device, &uniforms.layout, &fixups, None).is_some());
+        assert!(TerrainPipeline::new_probe_pass_outdoors(&device, &uniforms.layout, &fixups, Some(&weather_layout)).is_some());
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "the outdoor twins failed to build: {err:?}");
+    }
+
+    /// The painted build is each ground shader with its slope-driven weights
+    /// gone and nothing else changed: valid, the choice in every role's
+    /// shader exactly once, and what it keeps is what the choice returns on a
+    /// painted level. (The switch itself is not set here: tests share it.)
+    #[test]
+    fn the_painted_build_keeps_the_splats_weights_alone() {
+        use wgpu::naga;
+        assert!(!GROUND_PAINTED.load(std::sync::atomic::Ordering::Relaxed));
+        for role in [TerrainRole::Scene, TerrainRole::Read, TerrainRole::ProbePass] {
+            let src = terrain_shader_for(role);
+            let painted = painted_shader(&src).unwrap_or_else(|| panic!("{role:?}: the weights' choice moved"));
+            assert_eq!(painted.replacen(PAINTED_TO, PAINTED_FROM, 1), src);
+            let module = naga::front::wgsl::parse_str(&painted).unwrap_or_else(|e| panic!("{role:?}: {}", e.emit_to_string(&painted)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{role:?}: {e:?}"));
+            let size = |s: &str| -> usize {
+                crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum()
+            };
+            assert!(size(&painted) < size(&src), "{role:?}: nothing left the shader");
+        }
+        // `select(f, t, cond)` is `t` where `cond` holds, and the material sets
+        // the flag to 1 exactly when it was given a splat map.
+        assert!(PAINTED_FROM.contains("select(derived, authored, mat.use_splat > 0.5)"));
+    }
+
+    /// The nowhere twin is the pass with its one switch turned: valid, far
+    /// smaller, its lookup answering before anything of the photographs', the
+    /// rooms' or the doorways' -- and what it answers is what the full lookup
+    /// leaves when it finds nothing.
+    #[test]
+    fn the_nowhere_twin_is_the_pass_with_its_switch_turned() {
+        use wgpu::naga;
+        let pass = terrain_shader_for(TerrainRole::ProbePass);
+        let twin = nowhere_pass_shader().expect("the nowhere switch moved");
+        assert_eq!(twin.replacen(NOWHERE_ON, NOWHERE_OFF, 1), pass);
+        let at = |s: &str, m: &str| s.find(m).unwrap_or_else(|| panic!("`{m}` is not in the shader"));
+        let env = &twin[at(&twin, "fn probe_environment(")..at(&twin, "fn probe_outdoor_untraced(")];
+        let branch = at(env, "    if (PROBE_NOWHERE) {");
+        for later in [
+            "    if (PROBE_ALL_OUTDOORS) {",
+            "probe_portal_holding(volume_world)",
+            "probe_choose(select_world, volume_world)",
+            "    let hit = probe_trace(world_pos, d, trace_room, roughness);",
+            "    return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);",
+        ] {
+            assert!(branch < at(env, later), "`{later}` comes before the nowhere answer");
+        }
+        // What the full lookup leaves behind when it finds nothing: brightness
+        // 0 before the branch, the eye's distance in it, the reach untouched.
+        assert!(at(env, "    probe_brightness = 0.0;") < branch);
+        let body = &env[branch..branch + at(&env[branch..], "    }\n")];
+        assert!(body.contains("probe_eye_distance = distance(cam_pos(), frag_pos);"));
+        assert!(body.contains("let nothing = vec4<f32>(0.0);") && body.contains("return nothing;"));
+        assert!(!body.contains("probe_reach"));
+        for (label, src) in [
+            ("twin", twin.clone()),
+            ("weather twin", crate::renderer::weather::with_weather(&twin).expect("the weather's edits moved")),
+        ] {
+            let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+        let size = |s: &str| -> usize {
+            crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum()
+        };
+        let (full, out) = (size(&pass), size(&twin));
+        println!("the ground's pass: {full} proxy units; its nowhere twin: {out}");
+        // 1,495 of 4,165 (2026-10-12): the ground's own layers, the
+        // characters' capsules and the floor mirror.
+        assert!(out * 5 < full * 2, "the nowhere twin is {out} of {full}: the lookup is still in it");
+        if std::env::var("TWIN_REPORT").is_ok() {
+            println!("{}", crate::renderer::shader_inlining::report("nowhere twin", &twin, "fs_main", 20));
+        }
+        let Some((device, _queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let lights = LightsUniform::new(&device);
+        let (_shadows, uniforms) = crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, 1024);
+        let weather_layout = crate::renderer::weather::bind_group_layout(&device);
+        assert!(TerrainPipeline::new_probe_pass_nowhere(&device, &uniforms.layout, &fixups, None).is_some());
+        assert!(TerrainPipeline::new_probe_pass_nowhere(&device, &uniforms.layout, &fixups, Some(&weather_layout)).is_some());
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "the nowhere twins failed to build: {err:?}");
+    }
+
+    /// The ground's pass traces every texel, rough ones too -- skipping them is
+    /// not the same picture (`PASS_ROUGH_SKIP`) -- and the cut that prices the
+    /// rough ones' reflection puts the skip where the scene shader's own
+    /// weighting says it belongs: after the weather's code, which is what
+    /// makes wet ground smooth, from the roughness where a texel's own pixel
+    /// gives the reflection no share.
+    #[test]
+    fn the_rough_skip_is_a_cut_and_not_in_the_ground_pass() {
+        let pass = terrain_shader_for(TerrainRole::ProbePass);
+        assert!(!pass.contains(PASS_ROUGH_SKIP));
+        assert_eq!(PASS_ROUGH_SKIP_IN, PASS_ROUGH_SKIP_AT.replacen("    return", &format!("{PASS_ROUGH_SKIP}    return"), 1));
+        let (_, edits) = PROBE_PASS_REGISTER_CUTS.iter().find(|(l, _)| *l == "terrain_cut_rough_skip").unwrap();
+        let wet = crate::renderer::weather::with_weather(&pass).expect("the ground's weather twin no longer matches its shader");
+        assert!(wet.contains("    var rough = specular_aa_roughness("));
+        let at = |s: &str, m: &str| s.find(m).unwrap_or_else(|| panic!("`{m}` is not in the shader"));
+        for src in [&pass, &wet] {
+            assert_eq!(src.matches(edits[0].0).count(), 1);
+            let cut = src.replacen(edits[0].0, edits[0].1, 1);
+            assert_eq!(cut.matches(PASS_ROUGH_SKIP).count(), 1);
+            assert!(at(&cut, "    probe_fragment = in.clip;\n") < at(&cut, PASS_ROUGH_SKIP));
+            assert!(at(&cut, PASS_ROUGH_SKIP) < at(&cut, "    return probe_env_for_pass(\n        in.world_pos"));
+        }
+        // The three places the scene shader weighs the probe's answer, each by
+        // `1 - lobe_is_hemispherical`, which is 0 from the skip's roughness up.
+        let read = terrain_shader_for(TerrainRole::Read);
+        for line in [
+            "    let lobe_is_hemispherical = smoothstep(0.25, PROBE_LOBE_HEMISPHERICAL, r);",
+            "    let environment = mix(sharp, baseline, lobe_is_hemispherical);",
+            "    let image_weight = (1.0 - lobe_is_hemispherical) * clamp(probe.a, 0.0, 1.0);",
+            "    let r = clamp(roughness, 0.04, 1.0);",
+        ] {
+            assert!(read.contains(line), "the scene shader no longer has `{line}`");
+        }
+        let smoothstep = |lo: f32, hi: f32, x: f32| {
+            let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        for r in [0.75f32, 0.7500001, 0.8, 0.93, 1.0] {
+            assert_eq!(smoothstep(0.25, 0.75, r), 1.0, "{r}");
+        }
+        assert!(smoothstep(0.25, 0.75, 0.7499) < 1.0);
     }
 
     #[test]

@@ -281,6 +281,13 @@ impl VkContext {
             // half-precision maths' control in one build (`shader_precision`).
             // `adb shell setprop debug.spacesoup.nof16 1`.
             && system_property(c"debug.spacesoup.nof16") != "1";
+        // MEASUREMENT: the ground's shaders built for a painted level, from
+        // the next launch -- `adb shell setprop debug.spacesoup.painted 1`.
+        // See `terrain_pipeline::GROUND_PAINTED`.
+        crate::renderer::terrain_pipeline::GROUND_PAINTED.store(
+            system_property(c"debug.spacesoup.painted") == "1",
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // PIPELINE STATISTICS, when asked for. See `PIPELINE_STATISTICS_PROPERTY`.
         let statistics_extension_available = unsafe {
             vk_instance
