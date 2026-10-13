@@ -134,6 +134,14 @@ impl SolidPipeline {
         )
     }
 
+    /// [`Self::new_mirror`] for vertices in the WORLD: the ground, where it
+    /// is kept so (`terrain_pipeline::WORLD_GROUND`), drawn into a mirror.
+    /// `None` if the shader no longer opens as `world_vertices` expects.
+    pub fn new_mirror_world(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Option<Self> {
+        let source = crate::renderer::terrain_pipeline::world_vertices(&solid_shader())?;
+        Some(Self::build(device, format, uniform_layout, FrontFace::Cw, 1, crate::renderer::multiview::ViewMode::Mono, source))
+    }
+
     fn new_with_front_face(
         device: &Device,
         format: TextureFormat,
@@ -142,9 +150,21 @@ impl SolidPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
+        Self::build(device, format, uniform_layout, front_face, samples, view, solid_shader())
+    }
+
+    fn build(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        front_face: FrontFace,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        source: String,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("solid_shader"),
-            source: ShaderSource::Wgsl(view.shader(solid_shader()).into()),
+            source: ShaderSource::Wgsl(view.shader(source).into()),
         });
         let lightmap_layout = lightmap_bind_group_layout(device);
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {

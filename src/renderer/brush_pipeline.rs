@@ -1833,6 +1833,46 @@ impl BrushPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
+        let targets = [Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::empty() })];
+        Self::depth_prepass_into(device, uniform_layout, samples, view, &targets, DepthBiasState::default(), "brush_depth_prepass")
+    }
+
+    /// THE SAME IN THE REFLECTION PASS (`Levers::probe_prepass`): the brushes'
+    /// depth into the half-resolution pass's own depth before its shader --
+    /// 8,600 instructions a pixel, the most expensive in the frame -- is run,
+    /// so a wall behind a wall, which one draw of the whole level may shade
+    /// first, is not traced. The pass's own targets, none written.
+    ///
+    /// PUSHED BACK A LITTLE ([`PROBE_PREPASS_BIAS`]): the pass's shader is
+    /// another program, and its depth for a wall is not this one's to the
+    /// bit -- laid exactly, the wall's own shading failed its depth test on
+    /// a screen-door of texels (offline, 2026-10-13: 93,000 pixels of
+    /// hall_back). Behind the bias the nearest wall always passes; a wall
+    /// within the bias behind it may be shaded too, and the pass's own depth
+    /// test then settles the two as it always did. The same picture as with
+    /// no prepass.
+    pub fn new_probe_depth_prepass(device: &Device, uniform_layout: &BindGroupLayout) -> Self {
+        let targets = probe_pass::targets(true).map(|t| t.map(|t| ColorTargetState { write_mask: ColorWrites::empty(), ..t }));
+        Self::depth_prepass_into(
+            device,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            &targets,
+            PROBE_PREPASS_BIAS,
+            "brush_probe_depth_prepass",
+        )
+    }
+
+    fn depth_prepass_into(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        targets: &[Option<ColorTargetState>],
+        bias: DepthBiasState,
+        label: &str,
+    ) -> Self {
         // Audited: see `shader_checks`.
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("brush_depth_prepass"),
@@ -1849,7 +1889,7 @@ impl BrushPipeline {
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("brush_depth_prepass"),
+            label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -1861,7 +1901,7 @@ impl BrushPipeline {
                 module: &shader,
                 entry_point: Some("fs_depth"),
                 compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::empty() })],
+                targets,
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
@@ -1875,7 +1915,7 @@ impl BrushPipeline {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(CompareFunction::Less),
                 stencil: StencilState::default(),
-                bias: DepthBiasState::default(),
+                bias,
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
             multiview_mask: view.mask(),
@@ -1884,6 +1924,11 @@ impl BrushPipeline {
         Self { pipeline, material_layout, lightmap_layout, reads_immediates: false }
     }
 }
+
+/// How far behind a wall the reflection pass's depth prepass lays it: a few
+/// of the depth buffer's steps, and twice the wall's own depth slope across a
+/// texel. See [`BrushPipeline::new_probe_depth_prepass`].
+pub const PROBE_PREPASS_BIAS: DepthBiasState = DepthBiasState { constant: 16, slope_scale: 2.0, clamp: 0.0 };
 
 /// Whether the scene pass seals the cracks between brush faces.
 ///

@@ -364,6 +364,46 @@ pub struct Levers {
     /// One line turns it on: this default, or `"open_reflections": true` in
     /// the lever file.
     pub open_reflections: bool,
+    /// WET GROUND BEYOND THE BAKED OUTDOOR VOLUME REFLECTS THE OUTDOORS: the
+    /// weather's ground there -- rained-on ground, its puddles, a shore's
+    /// washed sand -- is drawn by the reflection pass's OPEN-GROUND twin (the
+    /// ground map's trace, the buildings' outsides, the sky) where the dry
+    /// ground beside it keeps the nowhere twin. A film of water and a puddle
+    /// are mirrors, and a mirror with nothing in it is a dark patch: without
+    /// this the washed sand at the water's edge is only darker, and far
+    /// puddles lie flat and black (`docs/ground-wetness-2026-10-12.md`).
+    /// `open_reflections` for the weather's chunks alone: no dry cliff takes
+    /// a sheen from it. ON, NOT YET MEASURED ON THE HEADSET (2026-10-13): the
+    /// weather's open twin is 3,755 instructions at 16 registers against its
+    /// nowhere twin's 2,907, at half resolution, on the weather's chunks
+    /// only; `open_reflections` over every such chunk cost rain_puddles_down
+    /// 3.2 ms. One line turns it off.
+    pub wet_reflections: bool,
+    /// THE WET-ONLY TWINS OF THE MIXED AND STEEP READERS
+    /// (`ground_twins::wet_readers`): a weather chunk that holds no standing
+    /// water and no snow -- a beach's washed chunks with the cliff over them
+    /// -- draws its triangles that are not gentle by them, not by the
+    /// weather's full reader (3,820 instructions, past the instruction cache;
+    /// these about 3,270 by the host proxy). The same picture. Off: the full
+    /// reader, as on 2026-10-13 09:05, which measured cave_mouth +3.8 ms.
+    pub wet_steep_twins: bool,
+    /// ... AND ONLY WHERE WATER STANDS: with `wet_reflections`, the
+    /// open-ground twin draws only the weather chunks that hold standing
+    /// water (a puddle, a flooded hollow); wet sand, rained-on slopes and
+    /// snow keep the nowhere twin, as before `wet_reflections`. A film of
+    /// water on sand then lies as dark as it did; a puddle mirrors the sky.
+    pub puddle_reflections: bool,
+    /// THE SKY IN WET GROUND, by a twin that fits: the weather's chunks that
+    /// hold a film of water or a puddle THIS FRAME (`WeatherScene::films_of`:
+    /// a washed shore, an area whose map is wet) are drawn in the reflection
+    /// pass by the puddle twin (`terrain_pipeline::puddle_pass_shader`) --
+    /// the sky at the lobe's blur, with no walk over the ground map and no
+    /// buildings' outsides -- so washed sand, wet rock and puddles mirror the
+    /// sky they lie under; a dry area's chunks keep the nowhere twin. In
+    /// place of `wet_reflections`' open twin, whose whole answer puts the
+    /// weather's pass past the Quest's instruction cache. With
+    /// `puddle_reflections`, only where water stands.
+    pub wet_sky: bool,
     /// The reflection pass's ground twins reach TRIANGLES, not only whole
     /// chunks: a chunk that is neither all out of doors nor all nowhere by
     /// its bounds -- one across the baked outdoor volume's edge, one with a
@@ -422,6 +462,78 @@ pub struct Levers {
     /// the sand in front hides the cliff's foot, and now goes down after it),
     /// the other 18 within 0.1. 0 wgpu errors.
     pub ground_steep_first: bool,
+    /// THE GROUND AND THE WATER THE GROUND HIDES ARE NOT DRAWN: a chunk of the
+    /// ground, or a body of water, wholly behind a hill for both eyes is left
+    /// out of the reflection pass, the scene pass and the motion pass (and
+    /// the water's waves are not moved), by a horizon taken over the drawn
+    /// ground itself, with a cave's mouth a hole in it. The same picture:
+    /// only what lies behind a drawn, depth-writing pixel is left out. See
+    /// `ground_horizon`.
+    ///
+    /// ON since 2026-10-13 (rounds 11 and 13, with `ground_horizon_caves`):
+    /// cave_back_out -1.28 ms, cave_mouth -0.83, outdoors_field and pond
+    /// -0.30, rain_puddles_down -0.28, nothing over 0.15 the other way.
+    pub ground_horizon: bool,
+    /// ... AND THE GROUND HIDDEN BY A BAKED CAVE'S ROCK: where every cave
+    /// drawn is a baked one (a closed sheet joined to the ground along its
+    /// mouths), a sight line that is under the ground reaches no ground
+    /// beyond until a mouth lets it out -- so from inside a cave only the
+    /// ground its mouths show is drawn, and from outside none behind a mouth
+    /// that the cave does not show. With `ground_horizon`. The same picture
+    /// for an eye in the air; an eye pushed into rock inside a cave's box no
+    /// longer sees ground through the rock's back.
+    pub ground_horizon_caves: bool,
+    /// THE SCENE PASS DRAWS A BAKED CAVE THE EYE IS INSIDE BEFORE THE GROUND,
+    /// where it drew it after the ground and the brushes: from inside, the
+    /// rock covers most of the picture and the ground lies behind it, so the
+    /// rock's depth goes down before the ground's readers shade what it
+    /// hides. A cave the eye is outside of is drawn where it was (the hill
+    /// round it hides it, not it the hill). The same picture: both are
+    /// opaque and depth-tested.
+    ///
+    /// ON since 2026-10-13 (round 13): cave_back_exit -3.2 ms, cave_chamber
+    /// -2.8, cave_back_out -0.2; the cave's mouth from outside unchanged.
+    pub cave_first: bool,
+    /// A BODY OF WATER IS DRAWN ONLY WHERE IT CAN BE SEEN: its index buffer,
+    /// in the order it lies, in runs of consecutive triangles; the scene pass
+    /// and the motion pass draw the runs some eye's view reaches (through a
+    /// doorway, from inside a closed room) and the ground does not hide
+    /// (with `ground_horizon`), where they drew the whole body if any of its
+    /// box was in view. The same picture, the same order. See `water_runs`.
+    ///
+    /// ON since 2026-10-13 (round 13): snow_hills -0.87 ms, cave_back_out
+    /// -0.36, rain_puddles_down, beach_south, pond, torch_doorway_out and
+    /// hall_back -0.2, nothing the other way.
+    pub water_runs: bool,
+    /// THE GROUND'S BUFFERS KEPT ON THE GPU: the frame's solid vertex and
+    /// index buffers live across frames, the ground first in each, and the
+    /// ground's part is written only when it is not what was last written
+    /// (the app re-posed it for a rig that moved; the slope split redone;
+    /// another level) -- where every frame copied the whole ground, rebased
+    /// its indices and made two new GPU buffers of them. The same bytes at
+    /// other offsets; the same picture. Off: as it was. See `static_solid`.
+    pub ground_buffers: bool,
+    /// HOW FAR A BIG THING IS STILL DRAWN, in its own bounding radii: the
+    /// app hands the renderer a model, a fixture, a baked cave or a cuboid
+    /// while its nearest point is within 40 m OR it is nearer than this many
+    /// radii (quest_app's `draw_range::drawn_at`). 229 is where its sphere is
+    /// half a degree across; 76, a degree and a half; 0 leaves the 40 m rule
+    /// alone, by bounds. Measured in `docs/shader-optimization-2026-10-12.md`.
+    pub size_reach: u32,
+    /// THE REFLECTION PASS LAYS THE BRUSHES' DEPTH FIRST, as the scene pass
+    /// does (`BrushPipeline::new_probe_depth_prepass`): its shader, the most
+    /// expensive in the frame, then runs once a pixel, on the nearest wall,
+    /// where one draw of the whole level shaded whatever lay behind it too
+    /// if it came first in the buffer. The same picture: the pass's shader
+    /// passes on equal depth, as the scene's does.
+    pub probe_prepass: bool,
+    /// THE MODELS A CLOSED ROOM'S WALLS HIDE ARE NOT DRAWN: from inside a
+    /// closed room, a model (not a character) is drawn in the scene pass and
+    /// the motion pass only where its bound reaches into the room or into
+    /// what one of the room's open doorways shows. The shadow passes and the
+    /// reflections keep them all. The same picture: `portal_cull::room_view`,
+    /// by the rule the ground outside has been drawn by since 2026-09-28.
+    pub model_rooms: bool,
     /// MEASUREMENT: the ground drawn by its full reader everywhere, with no
     /// twin (`full`), or as it was before its layer reads became one loop
     /// (`inlined`: reader and probe pass, no twin). The same picture as the
@@ -541,10 +653,22 @@ impl Default for Levers {
             outdoor_pass: true,
             nowhere_pass: true,
             open_reflections: false,
+            wet_reflections: false,
+            wet_steep_twins: true,
+            puddle_reflections: false,
+            wet_sky: false,
             ground_classes: true,
             ground_near_first: false,
             ground_near_chunks: 0,
             ground_steep_first: true,
+            ground_horizon: true,
+            ground_horizon_caves: true,
+            cave_first: true,
+            water_runs: true,
+            ground_buffers: true,
+            size_reach: 229,
+            probe_prepass: false,
+            model_rooms: false,
             terrain_reader: None,
             reader_edit: None,
             gpu_sync: false,
@@ -742,13 +866,27 @@ impl Levers {
             ("outdoor_pass", self.outdoor_pass, d.outdoor_pass),
             ("nowhere_pass", self.nowhere_pass, d.nowhere_pass),
             ("open_reflections", self.open_reflections, d.open_reflections),
+            ("wet_reflections", self.wet_reflections, d.wet_reflections),
+            ("wet_steep_twins", self.wet_steep_twins, d.wet_steep_twins),
+            ("puddle_reflections", self.puddle_reflections, d.puddle_reflections),
+            ("wet_sky", self.wet_sky, d.wet_sky),
             ("ground_classes", self.ground_classes, d.ground_classes),
             ("ground_near_first", self.ground_near_first, d.ground_near_first),
             ("ground_steep_first", self.ground_steep_first, d.ground_steep_first),
+            ("ground_horizon", self.ground_horizon, d.ground_horizon),
+            ("ground_horizon_caves", self.ground_horizon_caves, d.ground_horizon_caves),
+            ("cave_first", self.cave_first, d.cave_first),
+            ("water_runs", self.water_runs, d.water_runs),
+            ("ground_buffers", self.ground_buffers, d.ground_buffers),
+            ("probe_prepass", self.probe_prepass, d.probe_prepass),
+            ("model_rooms", self.model_rooms, d.model_rooms),
         ] {
             if on != default {
                 out.push(if on { name.to_string() } else { format!("no_{name}") });
             }
+        }
+        if self.size_reach != d.size_reach {
+            out.push(format!("size_reach={}", self.size_reach));
         }
         if self.ground_near_chunks != d.ground_near_chunks {
             out.push(format!("ground_near_chunks={}", self.ground_near_chunks));

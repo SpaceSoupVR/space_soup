@@ -52,6 +52,74 @@ pub const VERTICES_PER_PARTICLE: u32 = 6;
 /// Fresh snow's albedo, linear (about 0.85-0.9 in the visible).
 pub const SNOW_ALBEDO: [f32; 3] = [0.86, 0.88, 0.92];
 
+/// WET GROUND, the law (Lekner & Dorf 1988; Twomey et al. 1986). Soaked
+/// ground is the dry ground under a skin of water. Light the grains scatter
+/// back must leave through the water's surface, and of diffuse light inside
+/// water a share [`WET_BACK`] (`1 - 1/n^2`, n = 1.33) is turned back down by
+/// internal reflection onto the grains, which absorb some of it again; what
+/// does leave is the rest, less the surface's own reflection going in
+/// ([`WET_OUT`] = `(1 - 0.02)(1 - WET_BACK)`). Summing the bounces, a dry
+/// albedo `A` becomes `WET_OUT A / (1 - WET_BACK A)`: dark ground loses more
+/// than pale ground (soil 0.08 -> 0.046, sand 0.38 -> 0.25), and channel by
+/// channel a colour's weak channels lose most, so wet ground is also more
+/// SATURATED -- neither of which a flat multiply gives.
+pub const WET_BACK: f32 = 0.435;
+pub const WET_OUT: f32 = 0.554;
+/// The roughness of a film of water standing on soaked ground: a soft mirror
+/// (still water is 0.035, as a puddle; a film a grain deep keeps a little of
+/// the ground's relief).
+pub const FILM_ROUGH: f32 = 0.12;
+/// A film stands only once the ground is nearly soaked: none under this
+/// wetness, whole at 1.
+pub const FILM_FROM: f32 = 0.6;
+/// A film LEVELS the ground's bumps only where water can lie: wholly on
+/// level ground, not at all where the ground's normal is this far up or less
+/// (29 degrees of slope) -- there it runs off as a sheet a tenth of a
+/// millimetre thick, which glosses the rock and fills none of its relief.
+pub const FILM_LEVEL: f32 = 0.875;
+/// How unevenly ground wets and dries, grain by grain (`wet_soak`): the
+/// first drops speckle it, and the last damp is in patches.
+pub const WET_SPECKLE: f32 = 0.6;
+
+/// [`WET_BACK`]'s law for one channel, as the shader writes it: the first
+/// three terms of its series, so it costs no division (1.8% under the closed
+/// form at an albedo of 0.6, less below).
+pub fn wet_albedo(dry: f32) -> f32 {
+    WET_OUT * dry * (1.0 + WET_BACK * dry * (1.0 + WET_BACK * dry))
+}
+
+/// How soaked a point of ground is, from its area's wetness there (the map's,
+/// under open sky) and the ground's own fine grain `fine` (0..1): the first
+/// drops darken it in spots, the driest grain last; soaked is soaked
+/// everywhere. Never wet where the map is dry.
+pub fn wet_soak(wet: f32, fine: f32) -> f32 {
+    (wet * (1.0 + WET_SPECKLE) - WET_SPECKLE * fine).clamp(0.0, 1.0)
+}
+
+/// How much of the ground a film of water covers: `film` the share its
+/// material can hold when soaked (`TerrainMaterialUniform::film`: packed sand
+/// nearly all, a lawn almost none, its blades standing through it), `soak`
+/// how soaked it is.
+pub fn wet_film(film: f32, soak: f32) -> f32 {
+    film * ((soak - FILM_FROM) / (1.0 - FILM_FROM)).clamp(0.0, 1.0)
+}
+
+/// How far a film `film` (of [`wet_film`]) levels the bumps of ground whose
+/// normal is `up` (its y): [`FILM_LEVEL`].
+pub fn film_levels(film: f32, up: f32) -> f32 {
+    film * ((up - FILM_LEVEL) / (1.0 - FILM_LEVEL)).clamp(0.0, 1.0)
+}
+
+/// Wet ground as the ground's weather twin shades it (`TERRAIN_APPLY`): the
+/// albedo and roughness of ground of dry `albedo` and `rough`, `soak` soaked,
+/// whose material darkens by `porosity` of the law and holds a film over
+/// `film` of it.
+pub fn wet_ground(albedo: [f32; 3], rough: f32, soak: f32, porosity: f32, film: f32) -> ([f32; 3], f32) {
+    let k = soak * porosity;
+    let f = wet_film(film, soak);
+    (albedo.map(|a| a + (wet_albedo(a) - a) * k), rough + (FILM_ROUGH - rough) * f)
+}
+
 /// The weather's uniform, group 2 of the ground's twins and of the particles.
 /// Per area three vec4: `[min x, min z, 1 / extent x, 1 / extent z]`, `[uv
 /// scale x, uv scale z (the area's share of the texture), kind (0 rain, 1
@@ -106,6 +174,16 @@ pub struct AreaParams {
     pub falling: f32,
     pub wind: [f32; 2],
     pub edge: f32,
+    /// A SHORE'S LAYER, not an area of weather: nothing falls, and its map's
+    /// first number is not a wetness but the WET LINE -- how far above the
+    /// sea's still surface (`TerrainMaterialUniform::sea_line`) the wash has
+    /// the sand wet at each point (`water_pipeline::shore_wet_line`), coarse, since the line varies
+    /// along a shore over tens of metres; each pixel is wet by its own height
+    /// against it, so the wet edge follows the beach's shape exactly. Its
+    /// water and snow are zero and its cover open sky: the wash comes in
+    /// under a roof. Laid FIRST, so an area of weather over the same ground
+    /// is the one read there (`wx_at` reads the last a point lies in).
+    pub shore: bool,
 }
 
 /// Group 2: the uniform, the maps (one layer an area), their sampler.
@@ -248,7 +326,7 @@ impl WeatherMaps {
         self.params.areas[3 * k + 1] = [
             texels.0 as f32 / self.size.0 as f32,
             texels.1 as f32 / self.size.1 as f32,
-            if a.snow { 1.0 } else { 0.0 },
+            if a.shore { 2.0 } else if a.snow { 1.0 } else { 0.0 },
             a.falling.max(0.0),
         ];
         self.params.areas[3 * k + 2] = [a.wind[0], a.wind[1], k as f32, a.edge.max(1e-3)];
@@ -333,16 +411,26 @@ fn wx_cell(c: vec2<f32>) -> u32 {
 // x is its key plus 1973, along z plus 9277 -- the same keys, so the same
 // noise, without converting and keying each corner on its own (2026-10-08:
 // the ground's weather twins were past the instruction cache).
+//
+// A corner's value is two multiplies with a shift between them, not the full
+// `wx_hash`: the grain needs sixteen well-mixed bits, not an avalanche, and
+// the eight corners of its two octaves were 32 instructions dearer (2026-10-13:
+// the room the wet ground's law is paid from).
+fn wx_corner(key: u32) -> f32 {
+    var x = key * 0x7feb352du;
+    x = (x ^ (x >> 15u)) * 0x846ca68bu;
+    return f32(x >> 16u) / 65535.0;
+}
 fn wx_noise(q: vec2<f32>) -> f32 {
     let i = floor(q);
     let f = q - i;
     let s = f * f * (3.0 - 2.0 * f);
     let ii = vec2<i32>(i);
     let key = bitcast<u32>(ii.x) * 1973u + bitcast<u32>(ii.y) * 9277u + 26699u;
-    let a = f32(wx_hash(key) & 0xffffu) / 65535.0;
-    let b = f32(wx_hash(key + 1973u) & 0xffffu) / 65535.0;
-    let c = f32(wx_hash(key + 9277u) & 0xffffu) / 65535.0;
-    let d = f32(wx_hash(key + 11250u) & 0xffffu) / 65535.0;
+    let a = wx_corner(key);
+    let b = wx_corner(key + 1973u);
+    let c = wx_corner(key + 9277u);
+    let d = wx_corner(key + 11250u);
     return mix(mix(a, b, s.x), mix(c, d, s.x), s.y);
 }
 
@@ -437,11 +525,15 @@ fn wx_surface(p: vec3<f32>, n: vec3<f32>, view: vec3<f32>, footprint: f32) -> Wx
     let at = wx_at(p);
     let open = wx_open(p.y, at.m.w);
     let up = smoothstep(0.55, 0.9, n.y);
-    var fine = 0.0;
-    if (WX_WATER || WX_SNOW) {{
-        fine = 0.65 * wx_noise(p.xz * 3.1) + 0.35 * wx_noise(p.xz * 9.7);
-    }}
-    s.wet = at.m.x * open;
+    let fine = 0.65 * wx_noise(p.xz * 3.1) + 0.35 * wx_noise(p.xz * 9.7);
+    // A SHORE's layer (`AreaParams::shore`) holds how far over the sea's
+    // still surface the wash has the sand wet: soaked `SHORE_BAND` under
+    // that line and below, dry above it.
+    let damp = select(at.m.x, clamp((mat.sea_line + at.m.x - p.y) * {shore_fade:?}, 0.0, 1.0), at.area.y > 1.5);
+    // HOW SOAKED (`weather::wet_soak`): the first drops darken the ground in
+    // spots and the last damp lies in patches, by its own grain; soaked is
+    // soaked everywhere, and dry in the map is dry.
+    s.wet = clamp(damp * open * {soak_gain:?} - {speckle:?} * fine, 0.0, 1.0);
     s.water = 0.0;
     s.snow = 0.0;
     s.ripple = vec2<f32>(0.0);
@@ -486,6 +578,12 @@ fn wx_lift(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
     return p + vec3<f32>(0.0, at.m.z * wx_open(w.y, at.m.w) * smoothstep(0.55, 0.9, n.y), 0.0);
 }}
 const WX_SNOW_ALBEDO: vec3<f32> = vec3<f32>({sa:?}, {sb:?}, {sc:?});
+// Wet ground's law and a film's gloss: `weather::WET_BACK` and its fellows.
+const WX_WET_BACK: f32 = {wet_back:?};
+const WX_WET_OUT: f32 = {wet_out:?};
+const WX_FILM_ROUGH: f32 = {film_rough:?};
+const WX_FILM_FROM: f32 = {film_from:?};
+const WX_FILM_LEVEL: f32 = {film_level:?};
 // Whether this twin draws standing water and snow (`WeatherKinds`): false
 // only where none lies, so a twin without one is the same picture there.
 const WX_WATER: bool = true;
@@ -494,42 +592,63 @@ const WX_SNOW: bool = true;
         sa = SNOW_ALBEDO[0],
         sb = SNOW_ALBEDO[1],
         sc = SNOW_ALBEDO[2],
+        shore_fade = 1.0 / crate::renderer::water_pipeline::SHORE_BAND,
+        soak_gain = 1.0 + WET_SPECKLE,
+        speckle = WET_SPECKLE,
+        wet_back = WET_BACK,
+        wet_out = WET_OUT,
+        film_rough = FILM_ROUGH,
+        film_from = FILM_FROM,
+        film_level = FILM_LEVEL,
     )
 }
 
 /// What the ground's fragment stage does with the weather, just before it
 /// shades -- on its albedo, roughness, normal and occlusion, which then go
-/// into the shading every dry pixel takes. Wet porous ground darkens to about
-/// half and its highlight tightens (Lagarde, "Water drop 2"); standing water
-/// is a flat, near-mirror film over the darkened ground, its slope the rain's
-/// rings; snow is white and rough, smooths the bumps under it, and a grain in
-/// seventy is a tilted mirror.
+/// into the shading every dry pixel takes.
+///
+/// SOAKED GROUND darkens by the wet-surface law ([`wet_albedo`]), as far as
+/// its layers take water in (`mat.porosity`, by the layer weights `w` the
+/// reader already has), and where its material can hold a FILM of water
+/// (`mat.film`: sand and rock, hardly a lawn) the film is a soft mirror over
+/// it: its roughness, and the ground's bumps levelled under it where it can
+/// lie ([`film_levels`]: a cliff's film glosses its relief, not fills it), so sky, sun
+/// and lamps are reflected in it by the ground's own reflection path.
+/// Standing water is a flat, near-mirror sheet over the darkened ground, its
+/// slope the rain's rings; snow is white and rough, smooths the bumps under
+/// it, and a grain in seventy is a tilted mirror.
+///
+/// Both dots are taken here, after the layer loop, from weights that are
+/// live to the loop's end anyway: nothing more is held across it
+/// (`docs/shader-optimization-2026-10-12.md`, N2).
 const TERRAIN_APPLY: &str = "    // WEATHER: see `weather::with_weather`.
     let wx_s = wx_surface(in.tex_pos, to_world_direction(n), to_world_space(cam_pos()) - in.tex_pos, pixel_footprint);
-    let wx_porous = clamp((rough - 0.2) / 0.6, 0.0, 1.0);
-    // Without water (or snow), each mix by its zero cover leaves its value as
-    // it was, but for the normal's renormalising, which is kept.
+    // mix(albedo, the wet law's, how far it soaks in), with the law's series
+    // gathered so each channel is two multiply-adds and a multiply.
+    let wx_in = wx_s.wet * dot(w, mat.porosity);
+    let wx_back = WX_WET_BACK * albedo;
+    albedo = albedo * ((1.0 - wx_in * (1.0 - WX_WET_OUT)) + (wx_in * WX_WET_OUT) * (wx_back * wx_back + wx_back));
+    // No film on ground under still water: there is no air over it.
+    let wx_film = dot(w, mat.film) * clamp((wx_s.wet - WX_FILM_FROM) / (1.0 - WX_FILM_FROM), 0.0, 1.0) * clamp((in.tex_pos.y - mat.sea_line) * 20.0, 0.0, 1.0);
+    rough = mix(rough, WX_FILM_ROUGH, wx_film);
+    // The film levels the ground's bumps only where water can lie: on a
+    // slope it runs off as a sheet too thin to fill them, and only glosses.
+    // One normalize at the end, of every mix: without water (or snow) each
+    // mix by its zero cover leaves the normal as it was.
+    var wx_n = mix(shaded_n, n, wx_film * clamp((n.y - WX_FILM_LEVEL) / (1.0 - WX_FILM_LEVEL), 0.0, 1.0));
     if (WX_WATER) {
-        albedo = albedo * (1.0 - 0.35 * wx_s.wet * wx_porous) * (1.0 - 0.3 * wx_s.water);
-    } else {
-        albedo = albedo * (1.0 - 0.35 * wx_s.wet * wx_porous) * 1.0;
-    }
-    rough = mix(rough, mix(min(rough, 0.15), max(0.85 * rough, 0.65), wx_porous), wx_s.wet);
-    if (WX_WATER) {
+        albedo = albedo * (1.0 - 0.3 * wx_s.water);
         rough = mix(rough, 0.035, wx_s.water);
-        shaded_n = normalize(mix(shaded_n, to_player_direction(normalize(vec3<f32>(-wx_s.ripple.x, 1.0, -wx_s.ripple.y))), wx_s.water));
-    } else {
-        shaded_n = normalize(shaded_n);
+        wx_n = mix(wx_n, to_player_direction(normalize(vec3<f32>(-wx_s.ripple.x, 1.0, -wx_s.ripple.y))), wx_s.water);
     }
     if (WX_SNOW) {
         let wx_snow_n = normalize(mix(normalize(n + to_player_direction(vec3<f32>(-wx_s.drift.x, 0.0, -wx_s.drift.y))), to_player_direction(wx_s.grain), wx_s.sparkle));
         albedo = mix(albedo, WX_SNOW_ALBEDO, wx_s.snow);
         rough = mix(rough, mix(0.62, 0.06, wx_s.sparkle), wx_s.snow);
-        shaded_n = normalize(mix(shaded_n, wx_snow_n, wx_s.snow));
+        wx_n = mix(wx_n, wx_snow_n, wx_s.snow);
         ao_map = mix(ao_map, 1.0, wx_s.snow);
-    } else {
-        shaded_n = normalize(shaded_n);
     }
+    shaded_n = normalize(wx_n);
 ";
 
 /// THE GROUND'S WEATHER TWIN of a ground shader (any of its roles and twins):
@@ -538,7 +657,10 @@ const TERRAIN_APPLY: &str = "    // WEATHER: see `weather::with_weather`.
 /// test catches that (`every_ground_shader_takes_its_weather_twin`).
 pub fn with_weather(src: &str) -> Option<String> {
     let mut s = src.to_string();
-    let edits: [(&str, &str); 4] = [
+    let edits: [(&str, &str); 5] = [
+        // The ground under still water: the map's, here (a shore's layer, and
+        // an area's texels under the sea, are soaked there), not the line's.
+        (crate::renderer::terrain_pipeline::SEA_LINE_WGSL, ""),
         (
             "    out.clip      = cam_view_proj() * vec4<f32>(v.pos, 1.0);",
             "    let wx_pos = wx_lift(v.pos, v.norm);\n    out.clip      = cam_view_proj() * vec4<f32>(wx_pos, 1.0);",
@@ -575,16 +697,22 @@ pub enum WeatherKinds {
     Snowless,
     /// Snow; no standing water.
     Waterless,
+    /// WET GROUND ALONE: neither standing water nor snow -- ground rained on
+    /// where no puddle can form (a slope, a ridge), and a shore the sea has
+    /// washed. The lightest twin: the dry reader, the map's read and the wet
+    /// ground's law.
+    WetOnly,
 }
 
 impl WeatherKinds {
-    pub const ALL: [WeatherKinds; 3] = [WeatherKinds::Both, WeatherKinds::Snowless, WeatherKinds::Waterless];
+    pub const ALL: [WeatherKinds; 4] = [WeatherKinds::Both, WeatherKinds::Snowless, WeatherKinds::Waterless, WeatherKinds::WetOnly];
 
     /// The twin for ground where standing water may lie (`water`) and snow
     /// may (`snow`).
     pub fn of(water: bool, snow: bool) -> Self {
         match (water, snow) {
-            (_, false) => WeatherKinds::Snowless,
+            (true, false) => WeatherKinds::Snowless,
+            (false, false) => WeatherKinds::WetOnly,
             (false, true) => WeatherKinds::Waterless,
             (true, true) => WeatherKinds::Both,
         }
@@ -599,6 +727,7 @@ impl WeatherKinds {
             WeatherKinds::Both => "",
             WeatherKinds::Snowless => "_snowless",
             WeatherKinds::Waterless => "_waterless",
+            WeatherKinds::WetOnly => "_wet",
         }
     }
 }
@@ -614,6 +743,7 @@ pub fn with_weather_kinds(src: &str, kinds: WeatherKinds) -> Option<String> {
         WeatherKinds::Both => Some(s),
         WeatherKinds::Snowless => off(s, "WX_SNOW"),
         WeatherKinds::Waterless => off(s, "WX_WATER"),
+        WeatherKinds::WetOnly => off(s, "WX_WATER").and_then(|s| off(s, "WX_SNOW")),
     }
 }
 
@@ -625,6 +755,12 @@ pub fn map_holds(texels: &[[f32; 4]]) -> (bool, bool) {
     let water = texels.iter().any(|t| t[1] > 0.0004);
     let snow = texels.iter().any(|t| t[2] > 0.002);
     (water, snow)
+}
+
+/// Whether an area's map holds any wetness a pixel could show: the wet
+/// ground's law darkens and smooths from a few hundredths up.
+pub fn map_is_wet(texels: &[[f32; 4]]) -> bool {
+    texels.iter().any(|t| t[0] > 0.02 || t[1] > 0.0004)
 }
 
 /// THE FALLING RAIN AND SNOW AND THE SPLASHES, one draw: instances
@@ -1452,6 +1588,10 @@ pub fn particle_light(
     ([mean(0), mean(1), mean(2)], sun.map(|s| (s.light_rgb, s.direction)))
 }
 
+/// The first of a chunk mask's bits that say where water can stand
+/// (`WeatherScene::chunks`).
+pub const CHUNK_POOLS: u32 = 16;
+
 /// A level's weather on the headset (`XrRenderer::set_weather`): its maps,
 /// the ground's weather twins, the particles' pipeline, which terrain chunks
 /// take the twins, and this frame's numbers.
@@ -1462,17 +1602,28 @@ pub struct WeatherScene {
     pub particles: WeatherPipeline,
     /// The terrain chunks drawn with the twins, by their first index into the
     /// terrain's own index buffer, sorted, each with the areas it touches as
-    /// a bit mask.
+    /// a bit mask: bit `k` for area `k`, and bit [`CHUNK_POOLS`]` + k` where
+    /// water can stand in the chunk's part of it (`WeatherGround::can_pool`),
+    /// which is what decides whether the chunk needs the standing water's
+    /// twin at all.
     pub chunks: Vec<(u32, u32)>,
     /// The ground's gentle readers' weather twins, by [`WeatherKinds`]: see
     /// `ground_twins`. Empty when the ground has no steep tests to take out.
     pub gentle: Vec<[crate::renderer::terrain_pipeline::TerrainPipeline; 4]>,
+    /// The wet-only twins of the mixed and the steep readers, `[mixed, steep]`
+    /// (`ground_twins::wet_readers`), for the triangles that are not gentle in
+    /// a chunk whose [`Self::kinds_of`] is [`WeatherKinds::WetOnly`]. `None`
+    /// when they did not build: the full reader draws them.
+    pub wet: Option<[[crate::renderer::terrain_pipeline::TerrainPipeline; 4]; 2]>,
     /// The weather twin's probe pass and its poolless twin with the repeated
     /// code written once (`ground_twins::dedup_passes`).
     pub dedup_passes: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 2]>,
     /// Per area, whether its map last uploaded holds standing water, and snow
     /// ([`map_holds`]); both until its first map.
     pub holds: Vec<(bool, bool)>,
+    /// Per area, whether its map last uploaded holds any wetness at all
+    /// ([`map_is_wet`]); wet until its first map. See [`Self::films_of`].
+    pub films: Vec<bool>,
     pub areas: Vec<AreaParams>,
     pub texels: Vec<(u32, u32)>,
     /// Rain, snow and splashes drawn this frame.
@@ -1496,14 +1647,28 @@ impl WeatherScene {
         self.chunks.binary_search_by_key(&first, |c| c.0).ok().map(|i| self.chunks[i].1)
     }
 
+    /// Whether the chunk starting at `first` may show a film of water or a
+    /// puddle this frame: one of its areas is a shore the sea washes, or its
+    /// map holds wetness or standing water. A chunk of a dry area -- rain
+    /// long gone, snow alone -- does not; its ground mirrors nothing, and the
+    /// reflection pass draws it by the nowhere twin (`Levers::wet_sky`).
+    pub fn films_of(&self, first: u32) -> bool {
+        let mask = self.areas_of(first).unwrap_or(u32::MAX);
+        (0..CHUNK_POOLS as usize).filter(|k| mask & (1 << k) != 0).any(|k| {
+            self.areas.get(k).is_some_and(|a| a.shore)
+                || self.films.get(k).copied().unwrap_or(true)
+                || self.holds.get(k).is_none_or(|h| h.0)
+        })
+    }
+
     /// The twin for the chunk starting at `first`: what its areas' maps hold.
     pub fn kinds_of(&self, first: u32) -> WeatherKinds {
         let mask = self.areas_of(first).unwrap_or(u32::MAX);
         let (mut water, mut snow) = (false, false);
-        for k in 0..32usize {
+        for k in 0..CHUNK_POOLS as usize {
             if mask & (1 << k) != 0 {
                 let (w, s) = self.holds.get(k).copied().unwrap_or((true, true));
-                water |= w;
+                water |= w && mask & (1 << (k + CHUNK_POOLS as usize)) != 0;
                 snow |= s;
             }
         }
@@ -1600,6 +1765,183 @@ mod tests {
         ] {
             let (dry, wet) = (size(&src), size(&with_weather(&src).unwrap()));
             eprintln!("{label}: {dry} -> {wet} expressions (+{}, +{:.1}%)", wet - dry, 100.0 * (wet - dry) as f32 / dry as f32);
+        }
+    }
+
+    /// THE WET-SURFACE LAW: the shader's series is the closed form to within
+    /// two parts in a hundred up to pale stone; dark ground loses more of its
+    /// light than pale ground; a colour's weak channels lose most, so wet
+    /// ground is more saturated; and the numbers in the ground's own "under
+    /// still water" line are the same law's.
+    #[test]
+    fn wet_ground_darkens_by_the_wet_surface_law() {
+        let closed = |a: f32| WET_OUT * a / (1.0 - WET_BACK * a);
+        for a in [0.02f32, 0.08, 0.2, 0.38, 0.6] {
+            assert!((wet_albedo(a) / closed(a) - 1.0).abs() < 0.02, "albedo {a}: {} against {}", wet_albedo(a), closed(a));
+        }
+        // n = 1.33: internal reflection of diffuse light, and what leaves.
+        assert!((WET_BACK - (1.0 - 1.0 / (1.33f32 * 1.33))).abs() < 2e-3 && (WET_OUT - 0.98 * (1.0 - WET_BACK)).abs() < 2e-3);
+        let ratio = |a: f32| wet_albedo(a) / a;
+        assert!(ratio(0.08) < ratio(0.2) && ratio(0.2) < ratio(0.38) && ratio(0.38) < ratio(0.6));
+        assert!((0.55..0.60).contains(&ratio(0.08)) && (0.64..0.69).contains(&ratio(0.38)), "soil {}, sand {}", ratio(0.08), ratio(0.38));
+        // A lawn's green, soaked: darker, and greener.
+        let (wet, _) = wet_ground([0.10, 0.20, 0.05], 0.8, 1.0, 1.0, 0.0);
+        assert!(wet[1] / wet[0] > 2.0 && wet[1] / wet[2] > 4.0 && wet[1] < 0.2 * 0.62, "{wet:?}");
+        let line = crate::renderer::terrain_pipeline::SEA_LINE_WGSL;
+        for (written, law) in [("0.435 * albedo", WET_BACK), ("sea_in * 0.446)", 1.0 - WET_OUT), ("(sea_in * 0.554)", WET_OUT)] {
+            let n: f32 = written.trim_matches(|c: char| !c.is_ascii_digit() && c != '.').split(' ').find_map(|t| t.parse().ok()).unwrap();
+            assert!(line.contains(written) && (n - law).abs() < 1e-6, "the sea line's {written} is not the law's {law}");
+        }
+    }
+
+    /// What a film of water does to each kind of ground: packed sand and bare
+    /// rock go to a soft mirror, a lawn keeps its broad sheen (at 0.3 it went
+    /// seven times too dark and drew the horizon across itself, 10-07); and
+    /// none of it before the ground is nearly soaked, nor where it is dry.
+    #[test]
+    fn a_film_glosses_what_can_hold_one() {
+        use crate::renderer::terrain_pipeline::{WET_FILM, WET_POROSITY};
+        let soaked = |layer: usize, rough: f32| wet_ground([0.3; 3], rough, 1.0, WET_POROSITY[layer], WET_FILM[layer]).1;
+        let (lawn, rock, sand) = (soaked(0, 0.78), soaked(1, 0.7), soaked(3, 0.85));
+        assert!(lawn > 0.65 && lawn < 0.78, "a soaked lawn's roughness {lawn}");
+        assert!(rock < 0.3 && sand < 0.22 && sand > FILM_ROUGH, "rock {rock}, sand {sand}");
+        // Damp, not soaked: darker, no glossier.
+        let (albedo, rough) = wet_ground([0.3; 3], 0.85, FILM_FROM, 1.0, 0.9);
+        assert!(rough == 0.85 && albedo[0] < 0.3);
+        assert_eq!(wet_ground([0.3; 3], 0.85, 0.0, 1.0, 0.9), ([0.3; 3], 0.85));
+        // A film fills the bumps of level ground and none of a cliff's: the
+        // shader's law, in its numbers.
+        assert_eq!(film_levels(0.75, 1.0), 0.75);
+        assert_eq!(film_levels(0.75, 30f32.to_radians().cos()), 0.0);
+        let at_15 = film_levels(1.0, 15f32.to_radians().cos());
+        assert!(at_15 > 0.6 && at_15 < 0.85, "{at_15}");
+        let src = with_weather(&crate::renderer::terrain_pipeline::terrain_shader_for(crate::renderer::terrain_pipeline::TerrainRole::Read)).expect("the ground's weather twin");
+        assert!(src.contains("wx_film * clamp((n.y - WX_FILM_LEVEL) / (1.0 - WX_FILM_LEVEL), 0.0, 1.0)"), "the film's levelling left the ground's shader");
+        assert!(src.contains(&format!("const WX_FILM_LEVEL: f32 = {FILM_LEVEL:?};")));
+        // Rock takes a third of the darkening sand does.
+        let dark = |layer: usize| 0.3 - wet_ground([0.3; 3], 0.8, 1.0, WET_POROSITY[layer], 0.0).0[0];
+        assert!((dark(1) / dark(3) - 0.35).abs() < 1e-3);
+    }
+
+    /// The first drops darken the ground in spots, by its grain; soaked is
+    /// soaked everywhere; and ground the map has dry is dry whatever its grain.
+    #[test]
+    fn ground_wets_in_spots_and_soaks_whole() {
+        for fine in [0.0f32, 0.3, 0.7, 1.0] {
+            assert_eq!(wet_soak(0.0, fine), 0.0);
+            assert_eq!(wet_soak(1.0, fine), 1.0);
+        }
+        assert!(wet_soak(0.2, 0.1) > 0.2 && wet_soak(0.2, 0.9) == 0.0);
+        assert!(wet_soak(0.5, 0.0) > wet_soak(0.5, 1.0) && wet_soak(0.5, 1.0) > 0.0);
+        // More rain is never drier.
+        assert!((0..=20).map(|k| wet_soak(k as f32 / 20.0, 0.6)).collect::<Vec<_>>().windows(2).all(|p| p[1] >= p[0]));
+    }
+
+    /// A map is wet -- its chunks draw the film's twin in the reflection pass
+    /// under `Levers::wet_sky` -- from the first texel with wetness or with
+    /// standing water in it, and a dry or a snowed-on map is not.
+    #[test]
+    fn a_map_is_wet_from_its_first_damp_texel() {
+        let dry = [0.0, 0.0, 0.0, 1.0];
+        assert!(!map_is_wet(&[]));
+        assert!(!map_is_wet(&[dry; 16]));
+        assert!(!map_is_wet(&[[0.0, 0.0, 0.8, 1.0]; 16]), "snow alone is not a film");
+        assert!(!map_is_wet(&[[0.01, 0.0003, 0.0, 1.0]; 16]), "under what the law shows");
+        let mut one = [dry; 16];
+        one[11] = [0.3, 0.0, 0.0, 1.0];
+        assert!(map_is_wet(&one), "one damp texel");
+        one[11] = [0.0, 0.002, 0.0, 1.0];
+        assert!(map_is_wet(&one), "one texel of standing water");
+        // What holds water is wet: the twin for standing water is never
+        // drawn where the film's would not be.
+        assert!(map_holds(&one).0 && map_is_wet(&one));
+    }
+
+    /// Which twin a chunk draws: the standing water's only where its area's
+    /// map holds water AND water can stand in the chunk's own ground; a chunk
+    /// of a rain area with no hollow, and a shore's, the wet ground's alone.
+    #[test]
+    fn a_chunk_draws_the_lightest_twin_that_shows_what_it_holds() {
+        assert_eq!(WeatherKinds::of(false, false), WeatherKinds::WetOnly);
+        assert_eq!(WeatherKinds::of(true, false), WeatherKinds::Snowless);
+        assert_eq!(WeatherKinds::of(false, true), WeatherKinds::Waterless);
+        assert_eq!(WeatherKinds::of(true, true), WeatherKinds::Both);
+        assert_eq!(WeatherKinds::ALL.map(|k| k.index()), [0, 1, 2, 3]);
+        let kinds = |holds: &[(bool, bool)], mask: u32| {
+            let (mut water, mut snow) = (false, false);
+            for k in 0..CHUNK_POOLS as usize {
+                if mask & (1 << k) != 0 {
+                    let (w, s) = holds.get(k).copied().unwrap_or((true, true));
+                    water |= w && mask & (1 << (k + CHUNK_POOLS as usize)) != 0;
+                    snow |= s;
+                }
+            }
+            WeatherKinds::of(water, snow)
+        };
+        // Area 1 is rain with puddles somewhere; area 0 a shore.
+        let holds = [(false, false), (true, false)];
+        assert_eq!(kinds(&holds, 0b10), WeatherKinds::WetOnly, "a slope of the rain area");
+        assert_eq!(kinds(&holds, 0b10 | 0b10 << CHUNK_POOLS), WeatherKinds::Snowless, "its hollows");
+        assert_eq!(kinds(&holds, 0b01), WeatherKinds::WetOnly, "the beach");
+        // The twin without water or snow has neither's code, and validates.
+        let wet = with_weather_kinds(&terrain_shader_for(TerrainRole::Read), WeatherKinds::WetOnly).unwrap();
+        assert!(wet.contains("const WX_WATER: bool = false;") && wet.contains("const WX_SNOW: bool = false;"));
+        assert!(!wet.contains("mat.sea_line - in.tex_pos.y"), "the twin reads the sea's soaking from the map");
+        validate("wet-only read", &wet);
+        // And the steep reader's, for a washed chunk's cliff: every twin of
+        // it the frame may draw, each smaller than the weather's full reader
+        // it replaces (`ground_twins::wet_readers`).
+        let size = |s: &str| crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum::<usize>();
+        let read = terrain_shader_for(TerrainRole::Read);
+        let steep = crate::renderer::ground_twins::steep_shader(&read).expect("the ground's steep twin");
+        let baked = |s: String| crate::renderer::brush_pipeline::sun_reader_shader(s, crate::renderer::brush_pipeline::FaceSun::Baked);
+        let spotless = crate::renderer::lights::without_spot_shadows;
+        for (name, src) in [("mixed", read), ("steep", steep)] {
+            for (twin, src) in [("", src.clone()), ("_spotless", spotless(src.clone())), ("_baked", baked(src.clone())), ("_baked_spotless", spotless(baked(src)))] {
+                let wet = with_weather_kinds(&src, WeatherKinds::WetOnly).unwrap_or_else(|| panic!("no wet-only twin of the {name}{twin} reader"));
+                validate(&format!("wet-only {name}{twin}"), &wet);
+                let full = with_weather(&src).unwrap();
+                assert!(size(&wet) + 300 < size(&full), "wet-only {name}{twin}: {} against the full twin's {}", size(&wet), size(&full));
+            }
+        }
+    }
+
+    /// MEASUREMENT: the host's instruction proxy (`shader_inlining`) of every
+    /// ground reader and reflection-pass twin the weather touches, as
+    /// test_room draws them (painted, baked sun, no spot shadows), beside the
+    /// dry reader each is an edit of. Read beside the headset's PIPESTATS
+    /// (`docs/shader-optimization-2026-10-12.md`, "what each ground and
+    /// weather reader has left").
+    #[test]
+    #[ignore]
+    fn wetness_reader_sizes() {
+        use crate::renderer::ground_twins::{gentle_shader, steep_shader};
+        use crate::renderer::terrain_pipeline::terrain_shader_built;
+        let total = |s: &str| crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum::<usize>();
+        let lit = |src: String| {
+            crate::renderer::lights::without_spot_shadows(crate::renderer::brush_pipeline::sun_reader_shader(src, crate::renderer::brush_pipeline::FaceSun::Baked))
+        };
+        let read = terrain_shader_built(TerrainRole::Read, true);
+        let gentle = lit(gentle_shader(&read).unwrap());
+        let steep = lit(steep_shader(&read).unwrap());
+        let mixed = lit(read);
+        eprintln!("dry gentle {}  dry steep {}  dry mixed {}", total(&gentle), total(&steep), total(&mixed));
+        for kinds in WeatherKinds::ALL {
+            eprintln!(
+                "weather{:<10} gentle {}  mixed {}  steep {}",
+                kinds.label(),
+                total(&with_weather_kinds(&gentle, kinds).unwrap()),
+                total(&with_weather_kinds(&mixed, kinds).unwrap()),
+                total(&with_weather_kinds(&steep, kinds).unwrap()),
+            );
+        }
+        for (label, src) in [
+            ("pass nowhere", crate::renderer::terrain_pipeline::nowhere_pass_shader().unwrap()),
+            ("pass outdoors", crate::renderer::terrain_pipeline::outdoor_pass_shader().unwrap()),
+            ("pass full", terrain_shader_for(TerrainRole::ProbePass)),
+        ] {
+            let kinds: Vec<String> = WeatherKinds::ALL.iter().map(|k| format!("{:?} {}", k, total(&with_weather_kinds(&src, *k).unwrap()))).collect();
+            eprintln!("{label}: dry {}  {}", total(&src), kinds.join("  "));
         }
     }
 
@@ -1703,7 +2045,7 @@ mod tests {
         let pipeline = WeatherPipeline::new(&device, format, &uniforms.layout, &ground_layout, &layout, 1, crate::renderer::multiview::ViewMode::Mono);
         let mut maps = WeatherMaps::new(&device, &layout, &[(8, 8)]);
         maps.upload_map(&queue, 0, 8, 8, &[[0.0; 4]; 64]);
-        maps.set_area(0, &AreaParams { min: [-30.0, -60.0], extent: [60.0, 30.0], snow: false, falling: 1.0, wind: [0.0, 0.0], edge: 3.0 }, (8, 8));
+        maps.set_area(0, &AreaParams { min: [-30.0, -60.0], extent: [60.0, 30.0], snow: false, falling: 1.0, wind: [0.0, 0.0], edge: 3.0, shore: false }, (8, 8));
         let view = ParticleView { head_world: eye.to_array(), sky: [1.0; 3], exposure: 1.0, pixel: 0.01, ..Default::default() };
         maps.set_view(&view, (0, 0, 0), [0.0, 0.0]);
         maps.write(&queue);
@@ -1813,11 +2155,13 @@ mod tests {
         }
         crate::renderer::ground_twins::gentle_readers(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &probe_layout, None)
             .expect("the ground's gentle twins");
+        crate::renderer::ground_twins::wet_readers(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &probe_layout, &layout)
+            .expect("the ground's wet-only mixed and steep twins");
         let ground = crate::renderer::terrain_pipeline::material_bind_group_layout(&device);
         let _p = WeatherPipeline::new(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, &ground, &layout, 4, crate::renderer::multiview::ViewMode::Mono);
         let mut maps = WeatherMaps::new(&device, &layout, &[(64, 48), (32, 80)]);
         maps.upload_map(&queue, 1, 32, 80, &vec![[1.0, 0.01, 0.1, 0.0]; 32 * 80]);
-        maps.set_area(1, &AreaParams { min: [0.0, 0.0], extent: [8.0, 20.0], snow: true, falling: 1.0, wind: [1.0, 0.0], edge: 2.0 }, (32, 80));
+        maps.set_area(1, &AreaParams { min: [0.0, 0.0], extent: [8.0, 20.0], snow: true, falling: 1.0, wind: [1.0, 0.0], edge: 2.0, shore: false }, (32, 80));
         maps.write(&queue);
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "the weather pipelines failed to build: {err:?}");

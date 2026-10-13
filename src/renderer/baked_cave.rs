@@ -13,10 +13,27 @@
 //! cache that holds about 3,387 (PIPESTATS, 2026-10-08).
 //!
 //! The bake does all of that once:
-//! - every triangle lies in a BOX-PROJECTED CHART, so its vertices carry the
-//!   world's planar coordinate on the chart's axis (`uv0`, metres) and the
-//!   axis itself. A layer is read once, at `uv0 / its metres a tile` -- the
-//!   same texels the terrain reads on that plane, so rock and ground match;
+//! - every face reads the layers on ONE OF THE WORLD'S THREE PLANES, chosen
+//!   by the bake (`sdfBake.js::planeLabels`), at the world's own coordinate
+//!   on it divided by a layer's metres a tile -- the same texels the terrain
+//!   reads on that plane, so rock and ground match. Each vertex carries the
+//!   SHARE of each plane (`planes`): one plane whole over most of the rock,
+//!   and two blended in a band where a smooth run turns from one plane to
+//!   the next, so the pattern never changes along a line there (2026-10-13:
+//!   read on one plane a chart, it did, and showed at arm's length under a
+//!   torch). A pixel reads the planes it has a share of and no other;
+//! - and THE SHADER IS THREE TWINS, ONE A CLASS OF TRIANGLE (`CavePlanes`,
+//!   `partition`): one plane at every corner (seven tenths of the rock) is
+//!   drawn by the one-plane shader, its coordinate worked out a vertex; two
+//!   or three of the rock's own planes by a twin that reads those; and only
+//!   the triangles that take some of a cliff's reading by the one that can
+//!   do everything. One shader for all of it held 25 registers on the
+//!   headset against the one-plane shader's 16 -- 37% occupancy against 75%
+//!   -- on every pixel of rock (PIPESTATS, 2026-10-13);
+//! - where the rock meets a CLIFF the terrain reads its layers on two planes,
+//!   warped and at two scales (`terrain_pipeline::sample_frame`), and the
+//!   rock takes that same reading by the share its vertices carry
+//!   (`cliff`), behind the branch the ground's maps are read in;
 //! - the untouched ground round a mouth is not the cave's to draw at all: it
 //!   goes out as a terrain patch and the terrain draws it
 //!   (`space_soup_engine::terrain`), so there is no copy of the ground here;
@@ -38,7 +55,10 @@
 //! mesh's ordinary vertices, as they do for every model.
 //!
 //! EMISSIVE, FREE WHERE UNUSED: a cave with no glowing paint draws with the
-//! twin that has no emissive term (`CaveShader::emissive`).
+//! twin that has no emissive term (`CaveShader::emissive`). The paint has a
+//! brightness and a COLOUR a vertex: the colour is opened in the vertex stage
+//! of the emissive twin alone (`EMISSIVE_PARTS`), and a pixel pays one
+//! multiply and one add for it.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
@@ -56,8 +76,9 @@ pub const SHADING: &str = "baked_cave";
 pub struct BakedCaveVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
-    /// The WORLD's planar coordinate on the chart's axis, metres.
-    pub uv0: [f32; 2],
+    /// The share of each plane the layers are read on (along x, y, z), and
+    /// how much of a cliff's reading the vertex takes where it meets one.
+    pub planes: [u8; 4],
     /// The lightmap atlas.
     pub uv1: [f32; 2],
     /// The terrain footprint's uv at the vertex: where the ground's maps are
@@ -68,13 +89,19 @@ pub struct BakedCaveVertex {
     /// Sky seen, static sun seen, the tide band, soot.
     pub aux: [u8; 4],
     /// The chart's axis (0 x, 1 y, 2 z), emissive (0 to 63), the ground's
-    /// share of the vertex's lighting (0 to 255), spare.
+    /// share of the vertex's lighting (0 to 255), and the HUE of the
+    /// emissive paint's colour (`glow_hue_saturation`).
     pub misc: [u8; 4],
+    /// Where the rock meets a cliff: the terrain's own shares of the planes
+    /// there (x, y, z); and the SATURATION of the emissive paint's colour
+    /// (0: the rock glows in its own colour, as a file without one does).
+    pub cliff: [u8; 4],
 }
 
 impl BakedCaveVertex {
-    pub const ATTRIBS: [VertexAttribute; 8] = vertex_attr_array![
-        0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x2, 4 => Float32x2, 5 => Unorm8x4, 6 => Unorm8x4, 7 => Uint8x4
+    pub const ATTRIBS: [VertexAttribute; 9] = vertex_attr_array![
+        0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4, 3 => Float32x2, 4 => Float32x2, 5 => Unorm8x4, 6 => Unorm8x4, 7 => Uint8x4,
+        8 => Unorm8x4
     ];
 
     pub fn layout() -> VertexBufferLayout<'static> {
@@ -88,30 +115,79 @@ impl BakedCaveVertex {
     /// From the file's attributes: `COLOR_0` is three weights and a packed
     /// byte (the top two bits the chart's axis, the low six the emissive);
     /// the fourth weight is what the three leave of 255. `COLOR_1` is `aux`;
-    /// `ground` is `TEXCOORD_2` and the red of `COLOR_2`.
+    /// `ground` is `TEXCOORD_2` and the red of `COLOR_2`. `planes` is the
+    /// rest of `COLOR_2` (the shares of the planes along x, y, z) with
+    /// `COLOR_3` (the terrain's shares at a cliff, and in alpha how much of
+    /// the cliff's reading is taken); `None` for a file that has no
+    /// `COLOR_3`, which reads each chart on its own axis and nothing else.
+    /// `glow` is `COLOR_4`, which only a cave with emissive paint has: the
+    /// paint's colour at full brightness; `None` glows in the rock's own.
     #[allow(clippy::too_many_arguments)]
     pub fn from_file(
         position: [f32; 3],
         normal: [f32; 3],
-        uv0: [f32; 2],
         uv1: [f32; 2],
         colour0: [u8; 4],
         colour1: [u8; 4],
         ground: ([f32; 2], u8),
+        planes: Option<([u8; 3], [u8; 4])>,
+        glow: Option<[u8; 4]>,
     ) -> Self {
+        let (hue, saturation) = glow.map_or((0, 0), |c| glow_hue_saturation([c[0], c[1], c[2]]));
         let [a, b, c, packed] = colour0;
         let rest = 255u16.saturating_sub(a as u16 + b as u16 + c as u16) as u8;
+        let axis = (packed >> 6).min(2);
+        let (own, cliff) = match planes {
+            Some((own, cliff)) if own != [0, 0, 0] => (own, cliff),
+            _ => ([(axis == 0) as u8 * 255, (axis == 1) as u8 * 255, (axis == 2) as u8 * 255], [0; 4]),
+        };
         Self {
             position,
             normal,
-            uv0,
+            planes: [own[0], own[1], own[2], cliff[3]],
+            cliff: [cliff[0], cliff[1], cliff[2], saturation],
             uv1,
             ground_uv: ground.0,
             weights: [a, b, c, rest],
             aux: colour1,
-            misc: [(packed >> 6).min(2), packed & 63, ground.1, 0],
+            misc: [axis, packed & 63, ground.1, hue],
         }
     }
+}
+
+/// A colour byte as a picker has it (sRGB) to the light it stands for.
+fn srgb_to_linear(byte: u8) -> f32 {
+    let c = byte as f32 / 255.0;
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+/// THE COLOUR OF EMISSIVE PAINT, as the two spare bytes of a vertex carry
+/// it: the hue and the saturation of the light it stands for (the file's
+/// colour is a picker's, sRGB). How bright it is rides apart, in the file's
+/// six bits, so the colour is taken at full brightness. White, grey and
+/// black are saturation 0: the rock glows in its own colour.
+pub fn glow_hue_saturation(rgb: [u8; 3]) -> (u8, u8) {
+    let [r, g, b] = rgb.map(srgb_to_linear);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let spread = max - min;
+    if max <= 0.0 || spread <= 0.0 {
+        return (0, 0);
+    }
+    let sixth = if max == r { ((g - b) / spread).rem_euclid(6.0) } else if max == g { (b - r) / spread + 2.0 } else { (r - g) / spread + 4.0 };
+    // 255 is the hue 0 again: the shader takes the fraction.
+    (((sixth / 6.0) * 255.0).round() as u8, ((spread / max) * 255.0).round() as u8)
+}
+
+/// What the emissive twin's vertex stage makes of those two bytes
+/// (`EMISSIVE_PARTS`), on the CPU: the tint at full brightness. For the tests.
+#[cfg(test)]
+fn glow_tint(hue: u8, saturation: u8) -> [f32; 3] {
+    let h = hue as f32 / 255.0;
+    let s = saturation as f32 / 255.0;
+    [0.0f32, 2.0 / 3.0, 1.0 / 3.0].map(|k| {
+        let pure = (((h + k).fract() * 6.0 - 3.0).abs() - 1.0).clamp(0.0, 1.0);
+        1.0 + (pure - 1.0) * s
+    })
 }
 
 /// One brick chunk of a baked cave: a run of the index buffer and the box
@@ -125,6 +201,96 @@ pub struct CaveChunk {
     /// How many of the run's LAST indices are the lip the rock runs under the
     /// ground's edge: drawn, and not part of the cave's surface.
     pub lip: u32,
+    /// Which twin draws the run (`partition`). A file's own table says
+    /// `Cliff`: the twin that draws anything.
+    pub planes: CavePlanes,
+}
+
+/// HOW MANY PLANES A TRIANGLE'S LAYERS ARE READ ON, which is which twin of
+/// the shader draws it (`partition`, `CaveShader::planes`).
+///
+/// Reading every pixel through the shader that can blend planes and take a
+/// cliff's reading cost all of them: on the headset it held 25 registers
+/// against the 16 of the one-plane shader, two occupancy tiers down (75% to
+/// 37%, PIPESTATS 2026-10-13), for work seven triangles in ten never do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CavePlanes {
+    /// One plane at every corner, the same one: the layers are read once, at
+    /// a coordinate the vertices carry.
+    One,
+    /// The rock's own planes, two or three of them, by their shares.
+    Own,
+    /// Some of a cliff's reading too (or shares that do not add up to one):
+    /// everything the shader can do.
+    #[default]
+    Cliff,
+}
+
+impl CavePlanes {
+    pub const ALL: [CavePlanes; 3] = [CavePlanes::One, CavePlanes::Own, CavePlanes::Cliff];
+
+    /// A triangle's class, from its corners. A plane is read where its share
+    /// passes `WEIGHT_EPS` of the corner's total, as the shader's own test.
+    pub fn of(corners: [&BakedCaveVertex; 3]) -> CavePlanes {
+        let mut read = [false; 3];
+        for v in corners {
+            let total = v.planes[0] as u32 + v.planes[1] as u32 + v.planes[2] as u32;
+            // A cliff's reading, or shares the shader would have to
+            // normalise: the twin that does.
+            if v.planes[3] > 0 || total != 255 {
+                return CavePlanes::Cliff;
+            }
+            for k in 0..3 {
+                read[k] |= v.planes[k] as f32 / 255.0 > WEIGHT_EPS;
+            }
+        }
+        match read.iter().filter(|r| **r).count() {
+            1 => CavePlanes::One,
+            _ => CavePlanes::Own,
+        }
+    }
+}
+
+/// A share under this is not read (the shader's constant of the same name).
+pub const WEIGHT_EPS: f32 = 0.004;
+
+/// THE TRIANGLES BY CLASS: the same triangles, reordered so that each twin of
+/// the shader draws runs of its own. Returns the index buffer -- every
+/// chunk's one-plane triangles, then every chunk's blended ones, then the
+/// rest, each in the file's order -- and the table of those runs, a chunk's
+/// box on each of its (up to three). The lip stays the tail of a chunk's last
+/// run and is drawn by the twin that draws anything.
+pub fn partition(vertices: &[BakedCaveVertex], indices: &[u32], chunks: &[CaveChunk]) -> (Vec<u32>, Vec<CaveChunk>) {
+    let mut out = Vec::with_capacity(indices.len());
+    let mut table = Vec::new();
+    let class_of = |c: &CaveChunk, at: usize| {
+        let surface_end = (c.first + c.count - c.lip.min(c.count)) as usize;
+        if at >= surface_end {
+            return CavePlanes::Cliff;
+        }
+        let corner = |k: usize| vertices.get(indices[at + k] as usize);
+        match (corner(0), corner(1), corner(2)) {
+            (Some(a), Some(b), Some(d)) => CavePlanes::of([a, b, d]),
+            _ => CavePlanes::Cliff,
+        }
+    };
+    for planes in CavePlanes::ALL {
+        for c in chunks {
+            let first = out.len() as u32;
+            let run = c.first as usize..(c.first + c.count) as usize;
+            for at in run.step_by(3) {
+                if at + 2 < indices.len() && class_of(c, at) == planes {
+                    out.extend_from_slice(&indices[at..at + 3]);
+                }
+            }
+            let count = out.len() as u32 - first;
+            if count > 0 {
+                let lip = if planes == CavePlanes::Cliff { c.lip.min(count) } else { 0 };
+                table.push(CaveChunk { first, count, min: c.min, max: c.max, lip, planes });
+            }
+        }
+    }
+    (out, table)
 }
 
 /// What a baked cave's file says of itself (`extras.space_soup`).
@@ -157,6 +323,7 @@ impl BakedCaveMeta {
                             min: [f(2)? as f32, f(3)? as f32, f(4)? as f32],
                             max: [f(5)? as f32, f(6)? as f32, f(7)? as f32],
                             lip: f(8).map_or(0, |l| l as u32).min(f(1)? as u32),
+                            planes: CavePlanes::Cliff,
                         })
                     })
                     .collect()
@@ -172,8 +339,9 @@ impl BakedCaveMeta {
 pub struct BakedCavePrimitive {
     pub vertices: Vec<BakedCaveVertex>,
     pub vertex_buffer: Buffer,
-    /// In index order, covering the index buffer. One chunk for a file that
-    /// names none.
+    /// The runs of the index buffer, in its order and covering it: each of
+    /// the file's chunks (one over everything for a file that names none) in
+    /// up to three runs, one a twin of the shader (`partition`).
     pub chunks: Vec<CaveChunk>,
     pub emissive: bool,
     /// The box round every vertex, in the model's frame.
@@ -181,10 +349,12 @@ pub struct BakedCavePrimitive {
 }
 
 impl BakedCavePrimitive {
-    /// `index_count` is the primitive's; a chunk table that does not cover
-    /// exactly that is replaced by one chunk over all of it (a stale or
+    /// `indices` are the primitive's, and are REORDERED here, the same
+    /// triangles by the twin that draws each (`partition`): every pass that
+    /// draws the mesh takes them as they leave. A chunk table that does not
+    /// cover exactly them is replaced by one chunk over all of it (a stale or
     /// hand-edited file draws whole rather than in part).
-    pub fn new(device: &Device, vertices: Vec<BakedCaveVertex>, index_count: u32, meta: &BakedCaveMeta) -> Self {
+    pub fn new(device: &Device, vertices: Vec<BakedCaveVertex>, indices: &mut Vec<u32>, meta: &BakedCaveMeta) -> Self {
         use wgpu::util::DeviceExt;
         let bounds = vertices.iter().fold([[f32::INFINITY; 3], [f32::NEG_INFINITY; 3]], |[lo, hi], v| {
             [
@@ -197,7 +367,15 @@ impl BakedCavePrimitive {
             contents: bytemuck::cast_slice(&vertices),
             usage: BufferUsages::VERTEX,
         });
-        Self { chunks: covering_chunks(&meta.chunks, index_count, bounds), vertices, vertex_buffer, emissive: meta.emissive, bounds }
+        let (by_class, chunks) = partition(&vertices, indices, &covering_chunks(&meta.chunks, indices.len() as u32, bounds));
+        if by_class.len() == indices.len() {
+            *indices = by_class;
+            Self { chunks, vertices, vertex_buffer, emissive: meta.emissive, bounds }
+        } else {
+            // Not whole triangles: drawn as it is, by the twin that draws anything.
+            let whole = vec![CaveChunk { first: 0, count: indices.len() as u32, min: bounds[0], max: bounds[1], lip: 0, planes: CavePlanes::Cliff }];
+            Self { chunks: whole, vertices, vertex_buffer, emissive: meta.emissive, bounds }
+        }
     }
 }
 
@@ -215,17 +393,22 @@ pub fn covering_chunks(chunks: &[CaveChunk], index_count: u32, bounds: [[f32; 3]
     if tiles {
         chunks.to_vec()
     } else {
-        vec![CaveChunk { first: 0, count: index_count, min: bounds[0], max: bounds[1], lip: 0 }]
+        vec![CaveChunk { first: 0, count: index_count, min: bounds[0], max: bounds[1], lip: 0, planes: CavePlanes::Cliff }]
     }
 }
 
 /// The runs of the index buffer to draw: the chunks some eye of `planes` can
 /// see into, with neighbours in the buffer joined into one run. `None` draws
-/// every chunk.
-pub fn visible_ranges(chunks: &[CaveChunk], model: Mat4, planes: Option<&[[Vec4; 6]]>) -> Vec<std::ops::Range<u32>> {
+/// every chunk. `of`: only the runs of that twin (`CaveChunk::planes`).
+pub fn visible_ranges(
+    chunks: &[CaveChunk],
+    model: Mat4,
+    planes: Option<&[[Vec4; 6]]>,
+    of: Option<CavePlanes>,
+) -> Vec<std::ops::Range<u32>> {
     let mut out: Vec<std::ops::Range<u32>> = Vec::new();
     for c in chunks {
-        if c.count == 0 {
+        if c.count == 0 || of.is_some_and(|k| c.planes != k) {
             continue;
         }
         let seen = match planes {
@@ -251,19 +434,63 @@ pub struct CaveShader {
     /// For frames in which no spot casts a shadow
     /// (`lights::without_spot_shadows`).
     pub spotless: bool,
+    /// For the triangles of which class. `Cliff`, the default, draws any.
+    pub planes: CavePlanes,
 }
 
-const EMISSIVE_LINE: &str = "    colour = colour + albedo * (in.glow * EMISSIVE_GAIN);\n";
+/// The emissive term: the rock's colour times the paint's light, which the
+/// vertex stage has already opened and scaled. The same in every twin.
+fn emissive_line(_planes: CavePlanes) -> String {
+    "    colour = colour + albedo * in.glow_rgb;\n".to_string()
+}
+
+/// WHAT ONLY THE EMISSIVE TWIN CARRIES, each a whole piece of text that a
+/// cave with no glow is compiled without: the function that opens the
+/// paint's colour, its varying, the line of the vertex stage that fills it,
+/// and (`emissive_line`) the line of the pixel's that adds it. The paint's
+/// brightness still rides where it did (a spare component of a varying the
+/// twins already have); the colour is its own three.
+const GLOW_FN: &str = r#"// EMISSIVE PAINT (the emissive twin only): its brightness (`misc.y`, 0 to
+// 63) times its colour -- a hue (`misc.w`) and a saturation -- and the gain,
+// worked out a VERTEX. Saturation 0 is white: the rock glows in its own colour.
+fn glow_light(misc: vec4<u32>, saturation: f32) -> vec3<f32> {
+    let hue = f32(misc.w) / 255.0;
+    let pure = clamp(abs(fract(vec3<f32>(hue) + vec3<f32>(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, vec3<f32>(0.0), vec3<f32>(1.0));
+    return mix(vec3<f32>(1.0), pure, saturation) * (f32(misc.y) / 63.0 * EMISSIVE_GAIN);
+}
+
+"#;
+const GLOW_FIELD: &str = "    @location(9) glow_rgb: vec3<f32>,\n";
+const GLOW_VERTEX: &str = "    out.glow_rgb  = glow_light(v.misc, v.cliff.w);\n";
+
+/// A twin's vertex text with the emissive twin's varying and the line that
+/// fills it put in: after the last varying, and before the stage returns.
+fn with_glow(vertex: &str) -> String {
+    const LAST_FIELD: &str = "    @location(8) ground: vec3<f32>,\n}";
+    const RETURN: &str = "    return out;\n";
+    assert_eq!(vertex.matches(LAST_FIELD).count(), 1, "the baked cave's last varying moved");
+    assert_eq!(vertex.matches(RETURN).count(), 1, "the baked cave's vertex stage returns once");
+    vertex
+        .replacen(LAST_FIELD, &format!("    @location(8) ground: vec3<f32>,\n{GLOW_FIELD}}}"), 1)
+        .replacen(RETURN, &format!("{GLOW_VERTEX}{RETURN}"), 1)
+}
+
+/// Every piece of text the emissive twin has and the plain one has not.
+fn emissive_parts(planes: CavePlanes) -> [String; 4] {
+    [GLOW_FN.to_string(), GLOW_FIELD.to_string(), GLOW_VERTEX.to_string(), emissive_line(planes)]
+}
 
 /// How bright full emissive paint is, against the rock's own colour.
 pub const EMISSIVE_GAIN: f32 = 6.0;
 
 /// The baked cave's shader for a twin.
 pub fn baked_cave_shader(which: CaveShader) -> String {
-    let mut src = full_shader();
+    let mut src = full_shader(which.planes);
     if !which.emissive {
-        assert_eq!(src.matches(EMISSIVE_LINE).count(), 1, "the baked cave's emissive line moved");
-        src = src.replacen(EMISSIVE_LINE, "", 1);
+        for part in emissive_parts(which.planes) {
+            assert_eq!(src.matches(&part).count(), 1, "the baked cave's emissive part moved: {part}");
+            src = src.replacen(&part, "", 1);
+        }
     }
     // The sun is the bake's on every pixel: the level's static map is never read.
     src = super::brush_pipeline::sun_reader_shader(src, super::brush_pipeline::FaceSun::Baked);
@@ -283,7 +510,393 @@ fn material_struct() -> String {
     old[from..to].to_string()
 }
 
-fn full_shader() -> String {
+/// ONE PLANE (`CavePlanes::One`): the layers' coordinate is the world's on
+/// the triangle's plane, worked out a vertex and interpolated, and each layer
+/// is read once. This is the shader the cave shipped with on 2026-10-13 (16
+/// registers, 15 without the spots: 75% occupancy), its coordinate now the
+/// world's own rather than a chart's.
+const ONE_VERTEX: &str = r#"struct VOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    // In the player's frame, as every position the shaders get: lighting.
+    @location(1) world_pos: vec3<f32>,
+    @location(2) weights: vec4<f32>,
+    // xy: the layers' coordinate, the world's on the triangle's one plane. zw: the lightmap.
+    @location(3) uv: vec4<f32>,
+    @location(4) aux: vec4<f32>,
+    // That plane: one value a triangle.
+    @location(5) @interpolate(flat) axis: u32,
+    // The point's height in the WORLD (the sea's wash line), and its glow.
+    @location(6) height: f32,
+    @location(7) glow: f32,
+    // xy: the terrain footprint's uv. z: the ground's share of the lighting.
+    @location(8) ground: vec3<f32>,
+}
+
+@vertex fn vs_main(v: VIn) -> VOut {
+    let world = model_u.model * vec4<f32>(v.pos, 1.0);
+    let wpos = to_world_space(world.xyz);
+    let axis = select(select(2u, 0u, v.planes.x >= v.planes.z), 1u, v.planes.y >= max(v.planes.x, v.planes.z));
+    var out: VOut;
+    out.clip      = cam_view_proj() * world;
+    out.normal    = (model_u.model * vec4<f32>(v.norm, 0.0)).xyz;
+    out.world_pos = world.xyz;
+    out.weights   = v.weights;
+    out.uv        = vec4<f32>(plane_uv(axis, wpos), v.uv1);
+    out.aux       = v.aux;
+    out.axis      = axis;
+    out.height    = wpos.y;
+    out.glow      = f32(v.misc.y) / 63.0;
+    out.ground    = vec3<f32>(v.ground_uv, f32(v.misc.z) / 255.0);
+    return out;
+}
+"#;
+const ONE_LAYERS: &str = r#"    // The layers, each read ONCE, on the triangle's one plane: its gradients taken
+    // here, in uniform control flow, and scaled into the loop.
+    let uv = in.uv.xy;
+    let uv_dx = dpdx(uv);
+    let uv_dy = dpdy(uv);
+    let total = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
+    var w = select(vec4<f32>(0.0, 1.0, 0.0, 0.0), in.weights / max(total, 0.0001), total > 0.0001);
+    // WHERE THE ROCK MEETS THE GROUND IT IS THE GROUND: the terrain's own
+    // paint and its own sky and sun, read from the terrain's maps where the
+    // ground reads them, taken whole at the join and less over the blend
+    // band -- so the two draws are the same surface where they touch, and the
+    // rock comes back to what its sculpt says over the band. Behind a branch
+    // (explicit levels, so it may be): most of a cave has none of it and
+    // takes neither fetch.
+    let ground = clamp(in.ground.z, 0.0, 1.0);
+    var ground_map = vec4<f32>(1.0, 1.0, 0.0, 1.0);
+    if (ground > 0.0) {
+        let paint = textureSampleLevel(splat_tex, layer_samp, in.ground.xy, 0.0);
+        let painted = paint / max(paint.r + paint.g + paint.b + paint.a, 0.001);
+        w = mix(w, painted, ground * step(0.5, mat.use_splat));
+        ground_map = textureSampleLevel(sky_occ_tex, layer_samp, in.ground.xy, 0, 0.0);
+    }
+    var albedo = vec3<f32>(0.0);
+    var bent = vec3<f32>(0.0);
+    var rough_map = 0.0;
+    var ao_map = 0.0;
+    // Walked as a mask, lowest layer first, each weight picked by `select`:
+    // the ground's own loop (`terrain_pipeline::LAYER_READS`).
+    var layers_left = select(0u, 1u, w.x > WEIGHT_EPS) | select(0u, 2u, w.y > WEIGHT_EPS)
+        | select(0u, 4u, w.z > WEIGHT_EPS) | select(0u, 8u, w.w > WEIGHT_EPS);
+    loop {
+        if (layers_left == 0u) {
+            break;
+        }
+        let layer = i32(countTrailingZeros(layers_left));
+        layers_left = layers_left & (layers_left - 1u);
+        let lw = select(select(select(w.x, w.y, layer == 1), w.z, layer == 2), w.w, layer == 3);
+        let r = 1.0 / max(mat.repeat[layer], 0.001);
+        let at = uv * r;
+        let gx = uv_dx * r;
+        let gy = uv_dy * r;
+        albedo = albedo + textureSampleGrad(layer_tex, layer_samp, at, layer, gx, gy).rgb * lw;
+        // OpenGL convention: green is +Y in tangent space.
+        var tn = textureSampleGrad(normal_tex, layer_samp, at, layer, gx, gy).rgb * 2.0 - 1.0;
+        tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
+        bent = bent + whiteout(in.axis, tn, nw) * lw;
+        rough_map = rough_map + textureSampleGrad(rough_tex, layer_samp, at, layer, gx, gy).r * lw;
+        ao_map = ao_map + textureSampleGrad(ao_tex, layer_samp, at, layer, gx, gy).r * lw;
+    }
+    bent = normalize(select(nw, bent, dot(bent, bent) > 0.00000001));
+    let shaded_n = to_player_direction(bent);
+    // The ground's macro variation, on that plane as the ground reads
+    // it on a face's: without it the rock is a flat tone beside ground that
+    // drifts a third lighter and darker.
+    let mr = 1.0 / max(mat.macro_repeat, 0.001);
+    let macro_value = textureSampleGrad(macro_tex, layer_samp, uv * mr, uv_dx * mr, uv_dy * mr).r;
+    albedo = albedo * (1.0 + (macro_value - 0.5) * 2.0 * mat.macro_strength);
+"#;
+
+/// THE ROCK'S OWN PLANES (`CavePlanes::Own`): two or three by their shares,
+/// read at the world's coordinates. The planes are written out one after
+/// another, each with its swizzle of the one position and its gradients, so
+/// nothing is copied to choose a plane and nothing indexed by a counter.
+const OWN_VERTEX: &str = r#"struct VOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    // In the player's frame, as every position the shaders get: lighting.
+    @location(1) world_pos: vec3<f32>,
+    @location(2) weights: vec4<f32>,
+    // The lightmap.
+    @location(3) uv: vec2<f32>,
+    @location(4) aux: vec4<f32>,
+    // xyz: the share of each plane the layers are read on (they add up to
+    // one: `CavePlanes::of`). w: the glow.
+    @location(5) planes: vec4<f32>,
+    // The point in the WORLD: the layers' coordinates on every plane, and
+    // its height (the sea's wash line).
+    @location(6) wpos: vec3<f32>,
+    // xy: the terrain footprint's uv. z: the ground's share of the lighting.
+    @location(8) ground: vec3<f32>,
+}
+
+@vertex fn vs_main(v: VIn) -> VOut {
+    let world = model_u.model * vec4<f32>(v.pos, 1.0);
+    var out: VOut;
+    out.clip      = cam_view_proj() * world;
+    out.normal    = (model_u.model * vec4<f32>(v.norm, 0.0)).xyz;
+    out.world_pos = world.xyz;
+    out.weights   = v.weights;
+    out.uv        = v.uv1;
+    out.aux       = v.aux;
+    out.planes    = vec4<f32>(v.planes.xyz, f32(v.misc.y) / 63.0);
+    out.wpos      = to_world_space(world.xyz);
+    out.ground    = vec3<f32>(v.ground_uv, f32(v.misc.z) / 255.0);
+    return out;
+}
+"#;
+const OWN_LAYERS_HEAD: &str = r#"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, at the world's own
+    // coordinates: its gradients taken here, in uniform control flow.
+    let wp = in.wpos;
+    let wdx = dpdx(wp);
+    let wdy = dpdy(wp);
+    let total = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
+    var w = select(vec4<f32>(0.0, 1.0, 0.0, 0.0), in.weights / max(total, 0.0001), total > 0.0001);
+    // WHERE THE ROCK MEETS THE GROUND IT IS THE GROUND (see the one-plane
+    // twin): the terrain's paint, its sky and its sun, behind a branch.
+    let ground = clamp(in.ground.z, 0.0, 1.0);
+    var ground_map = vec4<f32>(1.0, 1.0, 0.0, 1.0);
+    if (ground > 0.0) {
+        let paint = textureSampleLevel(splat_tex, layer_samp, in.ground.xy, 0.0);
+        let painted = paint / max(paint.r + paint.g + paint.b + paint.a, 0.001);
+        w = mix(w, painted, ground * step(0.5, mat.use_splat));
+        ground_map = textureSampleLevel(sky_occ_tex, layer_samp, in.ground.xy, 0, 0.0);
+    }
+    let mr = 1.0 / max(mat.macro_repeat, 0.001);
+    let layers = select(0u, 1u, w.x > WEIGHT_EPS) | select(0u, 2u, w.y > WEIGHT_EPS)
+        | select(0u, 4u, w.z > WEIGHT_EPS) | select(0u, 8u, w.w > WEIGHT_EPS);
+    var albedo = vec3<f32>(0.0);
+    var bent = vec3<f32>(0.0);
+    var rough_map = 0.0;
+    var ao_map = 0.0;
+    var macro_value = 0.0;
+"#;
+/// One plane of `Own`: `AXIS` its number, `SHARE` its component of the
+/// shares, `SWZ` the swizzle that is its coordinate (`plane_uv`).
+const OWN_LAYERS_PLANE: &str = r#"    if (in.planes.SHARE > WEIGHT_EPS) {
+        // The ground's macro variation on this plane, by its share.
+        macro_value = macro_value
+            + textureSampleGrad(macro_tex, layer_samp, wp.SWZ * mr, wdx.SWZ * mr, wdy.SWZ * mr).r * in.planes.SHARE;
+        // The layers, walked as a mask, lowest first: the ground's own loop.
+        var layers_left = layers;
+        loop {
+            if (layers_left == 0u) {
+                break;
+            }
+            let layer = i32(countTrailingZeros(layers_left));
+            layers_left = layers_left & (layers_left - 1u);
+            let lw = select(select(select(w.x, w.y, layer == 1), w.z, layer == 2), w.w, layer == 3) * in.planes.SHARE;
+            let r = 1.0 / max(mat.repeat[layer], 0.001);
+            let at = wp.SWZ * r;
+            let gx = wdx.SWZ * r;
+            let gy = wdy.SWZ * r;
+            albedo = albedo + textureSampleGrad(layer_tex, layer_samp, at, layer, gx, gy).rgb * lw;
+            // OpenGL convention: green is +Y in tangent space.
+            var tn = textureSampleGrad(normal_tex, layer_samp, at, layer, gx, gy).rgb * 2.0 - 1.0;
+            tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
+            bent = bent + whiteout(AXISu, tn, nw) * lw;
+            rough_map = rough_map + textureSampleGrad(rough_tex, layer_samp, at, layer, gx, gy).r * lw;
+            ao_map = ao_map + textureSampleGrad(ao_tex, layer_samp, at, layer, gx, gy).r * lw;
+        }
+    }
+"#;
+const OWN_LAYERS_TAIL: &str = r#"    bent = normalize(select(nw, bent, dot(bent, bent) > 0.00000001));
+    let shaded_n = to_player_direction(bent);
+    albedo = albedo * (1.0 + (macro_value - 0.5) * 2.0 * mat.macro_strength);
+"#;
+
+/// EVERYTHING (`CavePlanes::Cliff`): the rock's own planes by their shares
+/// and a cliff's two by theirs, warped and at two scales. Draws any triangle
+/// (the mirrored world and the two-eye pass draw every one with it).
+const CLIFF_VERTEX: &str = r#"struct VOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    // In the player's frame, as every position the shaders get: lighting.
+    @location(1) world_pos: vec3<f32>,
+    @location(2) weights: vec4<f32>,
+    // The lightmap.
+    @location(3) uv: vec2<f32>,
+    @location(4) aux: vec4<f32>,
+    // The share of each plane the layers are read on (x, y, z), and of a
+    // cliff's reading.
+    @location(5) planes: vec4<f32>,
+    // The point in the WORLD: the layers' coordinates on every plane, and
+    // its height (the sea's wash line).
+    @location(6) wpos: vec3<f32>,
+    // xyz: the terrain's shares of the planes at a cliff. w: the glow.
+    @location(7) cliff: vec4<f32>,
+    // xy: the terrain footprint's uv. z: the ground's share of the lighting.
+    @location(8) ground: vec3<f32>,
+}
+
+@vertex fn vs_main(v: VIn) -> VOut {
+    let world = model_u.model * vec4<f32>(v.pos, 1.0);
+    var out: VOut;
+    out.clip      = cam_view_proj() * world;
+    out.normal    = (model_u.model * vec4<f32>(v.norm, 0.0)).xyz;
+    out.world_pos = world.xyz;
+    out.weights   = v.weights;
+    out.uv        = v.uv1;
+    out.aux       = v.aux;
+    out.planes    = v.planes;
+    out.wpos      = to_world_space(world.xyz);
+    out.cliff     = vec4<f32>(v.cliff.xyz, f32(v.misc.y) / 63.0);
+    out.ground    = vec3<f32>(v.ground_uv, f32(v.misc.z) / 255.0);
+    return out;
+}
+"#;
+const CLIFF_LAYERS: &str = r#"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, at the world's own
+    // coordinates: its gradients taken here, in uniform control flow, and
+    // swizzled and scaled into the loops.
+    let wp = in.wpos;
+    let wdx = dpdx(wp);
+    let wdy = dpdy(wp);
+    let total = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
+    var w = select(vec4<f32>(0.0, 1.0, 0.0, 0.0), in.weights / max(total, 0.0001), total > 0.0001);
+    // WHERE THE ROCK MEETS THE GROUND IT IS THE GROUND: the terrain's own
+    // paint and its own sky and sun, read from the terrain's maps where the
+    // ground reads them, taken whole at the join and less over the blend
+    // band -- so the two draws are the same surface where they touch, and the
+    // rock comes back to what its sculpt says over the band. Behind a branch
+    // (explicit levels, so it may be): most of a cave has none of it and
+    // takes neither fetch.
+    let ground = clamp(in.ground.z, 0.0, 1.0);
+    var ground_map = vec4<f32>(1.0, 1.0, 0.0, 1.0);
+    // AND WHERE THAT GROUND IS A CLIFF, its pattern is the cliff's: the
+    // terrain reads a cliff on its two strongest planes, both shifted by a
+    // warp the macro map steers on the stronger, the stronger again at a
+    // second scale (`terrain_pipeline::sample_frame`, `layer_colour_at`).
+    // The vertices carry the terrain's two shares and how much of that
+    // reading the rock takes; what is read here is what the terrain reads.
+    let mr = 1.0 / max(mat.macro_repeat, 0.001);
+    let cliff_total = in.cliff.x + in.cliff.y + in.cliff.z;
+    let cliff = clamp(in.planes.w, 0.0, 1.0) * step(0.0001, cliff_total);
+    var cliff_major = 3u;
+    var cliff_macro = 0.5;
+    var cliff_warp = vec2<f32>(0.0);
+    if (ground > 0.0) {
+        let paint = textureSampleLevel(splat_tex, layer_samp, in.ground.xy, 0.0);
+        let painted = paint / max(paint.r + paint.g + paint.b + paint.a, 0.001);
+        w = mix(w, painted, ground * step(0.5, mat.use_splat));
+        ground_map = textureSampleLevel(sky_occ_tex, layer_samp, in.ground.xy, 0, 0.0);
+        if (cliff > 0.0) {
+            cliff_major = select(select(2u, 0u, in.cliff.x >= in.cliff.z), 1u, in.cliff.y >= max(in.cliff.x, in.cliff.z));
+            let muv = plane_uv(cliff_major, wp);
+            let mdx = plane_uv(cliff_major, wdx);
+            let mdy = plane_uv(cliff_major, wdy);
+            cliff_macro = textureSampleGrad(macro_tex, layer_samp, muv * mr, mdx * mr, mdy * mr).r;
+            let ms = 1.0 / CLIFF_BAND_SCALE_M;
+            let m2 = textureSampleGrad(macro_tex, layer_samp, muv * ms + vec2<f32>(0.31, 0.57), mdx * ms, mdy * ms).r;
+            cliff_warp = vec2<f32>(cliff_macro - 0.5, 0.4 - 0.8 * cliff_macro) * CLIFF_WARP_M
+                + vec2<f32>(0.35, 1.0) * (m2 - 0.5) * CLIFF_BAND_WARP_M;
+        }
+    }
+    // What is read: the rock's own planes by their shares, less the cliff's;
+    // and the cliff's two by theirs. Six entries at most, one for most pixels.
+    let own_total = in.planes.x + in.planes.y + in.planes.z;
+    let ours = select(vec3<f32>(0.0, 1.0, 0.0), in.planes.xyz / max(own_total, 0.0001), own_total > 0.0001) * (1.0 - cliff);
+    let theirs = in.cliff.xyz / max(cliff_total, 0.0001) * cliff;
+    var entries_left = select(0u, 1u, ours.x > WEIGHT_EPS) | select(0u, 2u, ours.y > WEIGHT_EPS) | select(0u, 4u, ours.z > WEIGHT_EPS)
+        | select(0u, 8u, theirs.x > WEIGHT_EPS) | select(0u, 16u, theirs.y > WEIGHT_EPS) | select(0u, 32u, theirs.z > WEIGHT_EPS);
+    let layers = select(0u, 1u, w.x > WEIGHT_EPS) | select(0u, 2u, w.y > WEIGHT_EPS)
+        | select(0u, 4u, w.z > WEIGHT_EPS) | select(0u, 8u, w.w > WEIGHT_EPS);
+    var albedo = vec3<f32>(0.0);
+    var bent = vec3<f32>(0.0);
+    var rough_map = 0.0;
+    var ao_map = 0.0;
+    var macro_value = 0.0;
+    loop {
+        if (entries_left == 0u) {
+            break;
+        }
+        let entry = countTrailingZeros(entries_left);
+        entries_left = entries_left & (entries_left - 1u);
+        let of_cliff = entry >= 3u;
+        let axis = select(entry, entry - 3u, of_cliff);
+        let shares = select(ours, theirs, of_cliff);
+        let share = select(select(shares.x, shares.y, axis == 1u), shares.z, axis == 2u);
+        var uv = plane_uv(axis, wp);
+        let uv_dx = plane_uv(axis, wdx);
+        let uv_dy = plane_uv(axis, wdy);
+        // The ground's macro variation, on the plane as the ground reads it
+        // there: without it the rock is a flat tone beside ground that
+        // drifts a third lighter and darker. A cliff's is its stronger
+        // plane's, read above; its second scale is that plane's alone.
+        var tone = cliff_macro;
+        var second = 0.0;
+        if (of_cliff) {
+            uv = uv + cliff_warp;
+            second = select(0.0, 0.3 + 0.3 * cliff_macro, axis == cliff_major);
+        } else {
+            tone = textureSampleGrad(macro_tex, layer_samp, uv * mr, uv_dx * mr, uv_dy * mr).r;
+        }
+        macro_value = macro_value + tone * share;
+        // The layers, walked as a mask, lowest first, each weight picked by
+        // `select`: the ground's own loop (`terrain_pipeline::LAYER_READS`).
+        var layers_left = layers;
+        loop {
+            if (layers_left == 0u) {
+                break;
+            }
+            let layer = i32(countTrailingZeros(layers_left));
+            layers_left = layers_left & (layers_left - 1u);
+            let lw = select(select(select(w.x, w.y, layer == 1), w.z, layer == 2), w.w, layer == 3) * share;
+            let r = 1.0 / max(mat.repeat[layer], 0.001);
+            let at = uv * r;
+            let gx = uv_dx * r;
+            let gy = uv_dy * r;
+            var c = textureSampleGrad(layer_tex, layer_samp, at, layer, gx, gy).rgb;
+            // OpenGL convention: green is +Y in tangent space.
+            var tn = textureSampleGrad(normal_tex, layer_samp, at, layer, gx, gy).rgb * 2.0 - 1.0;
+            tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
+            if (second > 0.0) {
+                // The cliff's second scale: 2.3 times larger, turned 37 degrees.
+                let s2 = r / 2.3;
+                let at2 = CLIFF_ROT * uv * s2 + vec2<f32>(0.37, 0.11);
+                let g2x = CLIFF_ROT * uv_dx * s2;
+                let g2y = CLIFF_ROT * uv_dy * s2;
+                c = mix(c, textureSampleGrad(layer_tex, layer_samp, at2, layer, g2x, g2y).rgb, second);
+                if (axis != 1u) {
+                    var t2 = textureSampleGrad(normal_tex, layer_samp, at2, layer, g2x, g2y).rgb * 2.0 - 1.0;
+                    t2 = vec3<f32>(transpose(CLIFF_ROT) * (t2.xy * mat.normal_strength), t2.z);
+                    tn = vec3<f32>(mix(tn.xy, t2.xy, second) * 1.3, mix(tn.z, t2.z, second));
+                }
+            }
+            albedo = albedo + c * lw;
+            bent = bent + whiteout(axis, tn, nw) * lw;
+            rough_map = rough_map + textureSampleGrad(rough_tex, layer_samp, at, layer, gx, gy).r * lw;
+            ao_map = ao_map + textureSampleGrad(ao_tex, layer_samp, at, layer, gx, gy).r * lw;
+        }
+    }
+    bent = normalize(select(nw, bent, dot(bent, bent) > 0.00000001));
+    let shaded_n = to_player_direction(bent);
+    albedo = albedo * (1.0 + (macro_value - 0.5) * 2.0 * mat.macro_strength);
+"#;
+
+/// A twin's vertex stage and its reading of the layers.
+fn planes_text(planes: CavePlanes) -> (String, String) {
+    match planes {
+        CavePlanes::One => (ONE_VERTEX.to_string(), ONE_LAYERS.to_string()),
+        CavePlanes::Own => {
+            let mut layers = OWN_LAYERS_HEAD.to_string();
+            for (axis, share, swizzle) in [("0", "x", "zy"), ("1", "y", "xz"), ("2", "z", "xy")] {
+                layers += &OWN_LAYERS_PLANE.replace("AXIS", axis).replace("SHARE", share).replace("SWZ", swizzle);
+            }
+            (OWN_VERTEX.to_string(), layers + OWN_LAYERS_TAIL)
+        }
+        CavePlanes::Cliff => (CLIFF_VERTEX.to_string(), CLIFF_LAYERS.to_string()),
+    }
+}
+
+fn full_shader(planes: CavePlanes) -> String {
+    let (vertex, layers) = planes_text(planes);
+    let (lm_uv, height) = match planes {
+        CavePlanes::One => ("in.uv.zw", "in.height"),
+        CavePlanes::Own | CavePlanes::Cliff => ("in.uv", "wp.y"),
+    };
     format!(
         r#"
 // Group 0 -- the camera, the lights and the shadow maps -- is the lights block's.
@@ -311,56 +924,38 @@ struct ModelUniform {{ model: mat4x4<f32> }}
 const STATIONARY_MASK_DISTANCE_TEXELS: f32 = {stationary_range:?};
 const GROUND_SUN_RANGE: f32 = {sun_range:?};
 const EMISSIVE_GAIN: f32 = {emissive_gain:?};
-const WEIGHT_EPS: f32 = 0.004;
+const WEIGHT_EPS: f32 = {weight_eps:?};
+// The terrain's cliff reading, as `terrain_pipeline` has it: how far the
+// macro map shifts a cliff's planes, the band warp and its scale, and the
+// turn of the second scale. Pinned to the terrain's text by a test.
+const CLIFF_WARP_M: f32 = 2.5;
+const CLIFF_BAND_WARP_M: f32 = 3.0;
+const CLIFF_BAND_SCALE_M: f32 = 7.0;
+const CLIFF_ROT: mat2x2<f32> = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
 
 {lights_block}
 {whiteout_block}
 
+// A point's (or a gradient's) coordinate on the plane read along `axis`:
+// 0 along x (z, y), 1 along y (x, z), 2 along z (x, y), as the terrain's
+// `biplanar_uv`.
+fn plane_uv(axis: u32, p: vec3<f32>) -> vec2<f32> {{
+    return select(select(p.zy, p.xz, axis == 1u), p.xy, axis == 2u);
+}}
+
 struct VIn {{
     @location(0) pos: vec3<f32>,
     @location(1) norm: vec3<f32>,
-    @location(2) uv0: vec2<f32>,
+    @location(2) planes: vec4<f32>,
     @location(3) uv1: vec2<f32>,
     @location(4) ground_uv: vec2<f32>,
     @location(5) weights: vec4<f32>,
     @location(6) aux: vec4<f32>,
     @location(7) misc: vec4<u32>,
+    @location(8) cliff: vec4<f32>,
 }}
 
-struct VOut {{
-    @builtin(position) clip: vec4<f32>,
-    @location(0) normal: vec3<f32>,
-    // In the player's frame, as every position the shaders get: lighting.
-    @location(1) world_pos: vec3<f32>,
-    @location(2) weights: vec4<f32>,
-    // xy: the layers' coordinate, metres on the chart's plane. zw: the lightmap.
-    @location(3) uv: vec4<f32>,
-    @location(4) aux: vec4<f32>,
-    // The chart's axis: one value a triangle.
-    @location(5) @interpolate(flat) axis: u32,
-    // The point's height in the WORLD (the sea's wash line), and its glow.
-    @location(6) height: f32,
-    @location(7) glow: f32,
-    // xy: the terrain footprint's uv. z: the ground's share of the lighting.
-    @location(8) ground: vec3<f32>,
-}}
-
-@vertex fn vs_main(v: VIn) -> VOut {{
-    let world = model_u.model * vec4<f32>(v.pos, 1.0);
-    var out: VOut;
-    out.clip      = cam_view_proj() * world;
-    out.normal    = (model_u.model * vec4<f32>(v.norm, 0.0)).xyz;
-    out.world_pos = world.xyz;
-    out.weights   = v.weights;
-    out.uv        = vec4<f32>(v.uv0, v.uv1);
-    out.aux       = v.aux;
-    out.axis      = v.misc.x;
-    out.height    = to_world_space(world.xyz).y;
-    out.glow      = f32(v.misc.y) / 63.0;
-    out.ground    = vec3<f32>(v.ground_uv, f32(v.misc.z) / 255.0);
-    return out;
-}}
-
+{glow_fn}{vertex}
 @fragment fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {{
     // Renormalised: interpolation shortens a normal wherever its corners
     // disagree. FACING THE VIEWER: a cave is one sheet seen from inside and
@@ -372,91 +967,40 @@ struct VOut {{
     // frame, where the lamps are.
     let nw = to_world_direction(n);
 
-    // The layers, each read ONCE on the chart's plane: its gradients taken
-    // here, in uniform control flow, and scaled into the loop.
-    let uv = in.uv.xy;
-    let uv_dx = dpdx(uv);
-    let uv_dy = dpdy(uv);
-    let total = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
-    var w = select(vec4<f32>(0.0, 1.0, 0.0, 0.0), in.weights / max(total, 0.0001), total > 0.0001);
-    // WHERE THE ROCK MEETS THE GROUND IT IS THE GROUND: the terrain's own
-    // paint and its own sky and sun, read from the terrain's maps where the
-    // ground reads them, taken whole at the join and less over the blend
-    // band -- so the two draws are the same surface where they touch, and the
-    // rock comes back to what its sculpt says over the band. Behind a branch
-    // (explicit levels, so it may be): most of a cave has none of it and
-    // takes neither fetch.
-    let ground = clamp(in.ground.z, 0.0, 1.0);
-    var ground_map = vec4<f32>(1.0, 1.0, 0.0, 1.0);
-    if (ground > 0.0) {{
-        let paint = textureSampleLevel(splat_tex, layer_samp, in.ground.xy, 0.0);
-        let painted = paint / max(paint.r + paint.g + paint.b + paint.a, 0.001);
-        w = mix(w, painted, ground * step(0.5, mat.use_splat));
-        ground_map = textureSampleLevel(sky_occ_tex, layer_samp, in.ground.xy, 0, 0.0);
-    }}
-    var albedo = vec3<f32>(0.0);
-    var bent = vec3<f32>(0.0);
-    var rough_map = 0.0;
-    var ao_map = 0.0;
-    // Walked as a mask, lowest layer first, each weight picked by `select`:
-    // the ground's own loop (`terrain_pipeline::LAYER_READS`).
-    var layers_left = select(0u, 1u, w.x > WEIGHT_EPS) | select(0u, 2u, w.y > WEIGHT_EPS)
-        | select(0u, 4u, w.z > WEIGHT_EPS) | select(0u, 8u, w.w > WEIGHT_EPS);
-    loop {{
-        if (layers_left == 0u) {{
-            break;
-        }}
-        let layer = i32(countTrailingZeros(layers_left));
-        layers_left = layers_left & (layers_left - 1u);
-        let lw = select(select(select(w.x, w.y, layer == 1), w.z, layer == 2), w.w, layer == 3);
-        let r = 1.0 / max(mat.repeat[layer], 0.001);
-        let at = uv * r;
-        let gx = uv_dx * r;
-        let gy = uv_dy * r;
-        albedo = albedo + textureSampleGrad(layer_tex, layer_samp, at, layer, gx, gy).rgb * lw;
-        // OpenGL convention: green is +Y in tangent space.
-        var tn = textureSampleGrad(normal_tex, layer_samp, at, layer, gx, gy).rgb * 2.0 - 1.0;
-        tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
-        bent = bent + whiteout(in.axis, tn, nw) * lw;
-        rough_map = rough_map + textureSampleGrad(rough_tex, layer_samp, at, layer, gx, gy).r * lw;
-        ao_map = ao_map + textureSampleGrad(ao_tex, layer_samp, at, layer, gx, gy).r * lw;
-    }}
-    bent = normalize(select(nw, bent, dot(bent, bent) > 0.00000001));
-    let shaded_n = to_player_direction(bent);
-    // The ground's macro variation, on the chart's plane as the ground reads
-    // it on a face's: without it the rock is a flat tone beside ground that
-    // drifts a third lighter and darker.
-    let mr = 1.0 / max(mat.macro_repeat, 0.001);
-    let macro_value = textureSampleGrad(macro_tex, layer_samp, uv * mr, uv_dx * mr, uv_dy * mr).r;
-    albedo = albedo * (1.0 + (macro_value - 0.5) * 2.0 * mat.macro_strength);
-
+{layers}
     // THE LIGHTMAP: rgb the baked lamps and their bounce, ADDED; alpha the
     // sky this texel sees. The vertices carry the editor's measure of the
-    // same sky, and the LESSER of the two is taken: multiplied, a wall that
-    // sees a fifth of the sky by both counts would be lit by a twenty-fifth.
-    // An unbaked cave binds black and one, and is lit by what its vertices
-    // measured alone.
-    let baked = textureSample(lm_tex, lm_samp, in.uv.zw);
+    // same sky, and THE MEAN of the two is taken. They are two measures of
+    // one thing with errors of their own: traced on the shipped cave's front
+    // collar (2026-10-13, 157 places, 384 rays each) the sky really seen was
+    // 0.469; the vertices said 0.440, the lightmap 0.507, the lesser of the
+    // two 0.428 and their mean 0.474 -- with half the scatter of either
+    // (rms 0.035 against 0.066 and 0.077). (Multiplied, a wall that sees a
+    // fifth of the sky by both counts would be lit by a twenty-fifth.)
+    // An unbaked cave binds the neutral lightmap, one texel of black and
+    // one, and is lit by what its vertices measured alone.
+    let baked = textureSample(lm_tex, lm_samp, {lm_uv});
     // The baked lamps are in this atlas. See `receiver_skips_baked`.
     receiver_skips_baked = true;
     // The stationary lamps' shadows, as every model takes them.
     let st_layers = textureNumLayers(lm_stationary);
-    let st_0 = textureSample(lm_stationary, lm_sun_samp, in.uv.zw, 0);
+    let st_0 = textureSample(lm_stationary, lm_sun_samp, {lm_uv}, 0);
     var st_1 = vec4<f32>(1.0);
     var st_2 = vec4<f32>(1.0);
     var st_3 = vec4<f32>(1.0);
     if (st_layers > 1u) {{
-        st_1 = textureSample(lm_stationary, lm_sun_samp, in.uv.zw, 1);
+        st_1 = textureSample(lm_stationary, lm_sun_samp, {lm_uv}, 1);
     }}
     if (st_layers > 2u) {{
-        st_2 = textureSample(lm_stationary, lm_sun_samp, in.uv.zw, 2);
+        st_2 = textureSample(lm_stationary, lm_sun_samp, {lm_uv}, 2);
     }}
     if (st_layers > 3u) {{
-        st_3 = textureSample(lm_stationary, lm_sun_samp, in.uv.zw, 3);
+        st_3 = textureSample(lm_stationary, lm_sun_samp, {lm_uv}, 3);
     }}
     set_stationary_masks_exact(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
 
-    var sky = min(clamp(in.aux.x, 0.0, 1.0), baked.a);
+    let vertex_sky = clamp(in.aux.x, 0.0, 1.0);
+    var sky = select(vertex_sky, 0.5 * (vertex_sky + baked.a), textureDimensions(lm_tex).x > 1u);
     // THE SUN THE HILL LETS THROUGH, baked: none where no sky is seen.
     var sun = smoothstep(0.01, 0.08, sky) * clamp(in.aux.y, 0.0, 1.0);
     // The ground's sky and its baked sun (`ground_map`, read above), by the
@@ -477,7 +1021,7 @@ struct VOut {{
     albedo = albedo * (1.0 - 0.8 * clamp(in.aux.w, 0.0, 1.0));
     // WET SAND where the sea's wash reaches: on the floors it runs over, and
     // on everything at the join, as the terrain darkens it.
-    let washed = 1.0 - smoothstep(mat.wet_line, mat.wet_line + mat.wet_band, in.height);
+    let washed = 1.0 - smoothstep(mat.wet_line, mat.wet_line + mat.wet_band, {height});
     albedo = albedo * (1.0 - 0.45 * washed * mix(smoothstep(0.5, 0.8, nw.y), 1.0, ground));
 
     receiver_sun_mask = sun;
@@ -488,8 +1032,7 @@ struct VOut {{
         in.world_pos, shaded_n, clamp(rough_map, 0.0, 1.0), clamp(ao_map, 0.0, 1.0), sky,
         baked.rgb * own, vec4<f32>(0.5, 0.5, 0.5, 0.0), albedo, in.world_pos, n,
     );
-    colour = colour + albedo * (in.glow * EMISSIVE_GAIN);
-    return vec4<f32>(tonemap(colour), 1.0);
+{emissive}    return vec4<f32>(tonemap(colour), 1.0);
 }}
 "#,
         material = material_struct(),
@@ -505,6 +1048,13 @@ struct VOut {{
         stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
         sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
         emissive_gain = EMISSIVE_GAIN,
+        weight_eps = WEIGHT_EPS,
+        glow_fn = GLOW_FN,
+        vertex = with_glow(&vertex),
+        layers = layers,
+        lm_uv = lm_uv,
+        height = height,
+        emissive = emissive_line(planes),
     )
 }
 
@@ -539,10 +1089,18 @@ pub struct BakedCaveDraw<'a> {
     pub bounds: (Vec3, Vec3),
 }
 
+impl BakedCaveDraw<'_> {
+    /// Whether `eye` (player frame) is inside the cave's box.
+    pub fn holds(&self, eye: Vec3) -> bool {
+        eye.cmpge(self.bounds.0).all() && eye.cmple(self.bounds.1).all()
+    }
+}
+
 /// Every pipeline a baked cave is drawn with.
 pub struct BakedCavePipelines {
-    /// `[emissive][spotless]`, for the single-eye scene pass.
-    scene: [[RenderPipeline; 2]; 2],
+    /// `[planes][emissive][spotless]`, for the single-eye scene pass: a twin
+    /// a class of triangle (`CavePlanes`).
+    scene: [[[RenderPipeline; 2]; 2]; 3],
     /// `[emissive]`, both eyes in one pass. Built only when asked for.
     stereo: Option<[RenderPipeline; 2]>,
     /// `[emissive]`, for a mirrored world (its windings reversed).
@@ -620,23 +1178,27 @@ impl BakedCavePipelines {
                 cache: None,
             })
         };
-        let twin = |emissive: bool, spotless: bool| {
-            let label = match (emissive, spotless) {
-                (false, false) => "baked_cave",
-                (false, true) => "baked_cave_spotless",
-                (true, false) => "baked_cave_emissive",
-                (true, true) => "baked_cave_emissive_spotless",
-            };
-            build(CaveShader { emissive, spotless }, FrontFace::Ccw, samples, ViewMode::Mono, label)
+        let twin = |planes: CavePlanes, emissive: bool, spotless: bool| {
+            let label = format!(
+                "baked_cave{}{}{}",
+                match planes {
+                    CavePlanes::One => "_one",
+                    CavePlanes::Own => "_own",
+                    CavePlanes::Cliff => "",
+                },
+                if emissive { "_emissive" } else { "" },
+                if spotless { "_spotless" } else { "" },
+            );
+            build(CaveShader { emissive, spotless, planes }, FrontFace::Ccw, samples, ViewMode::Mono, &label)
         };
-        let scene = [[twin(false, false), twin(false, true)], [twin(true, false), twin(true, true)]];
-        let stereo = stereo.then(|| {
-            [false, true].map(|emissive| {
-                build(CaveShader { emissive, spotless: false }, FrontFace::Ccw, samples, ViewMode::Stereo, "baked_cave_stereo")
-            })
-        });
-        let mirror = [false, true]
-            .map(|emissive| build(CaveShader { emissive, spotless: false }, FrontFace::Cw, 1, ViewMode::Mono, "baked_cave_mirror"));
+        let scene = CavePlanes::ALL
+            .map(|planes| [false, true].map(|emissive| [false, true].map(|spotless| twin(planes, emissive, spotless))));
+        // The two-eye pass and the mirrored world draw every triangle with
+        // the twin that draws anything.
+        let any = |emissive: bool| CaveShader { emissive, spotless: false, planes: CavePlanes::Cliff };
+        let stereo = stereo
+            .then(|| [false, true].map(|emissive| build(any(emissive), FrontFace::Ccw, samples, ViewMode::Stereo, "baked_cave_stereo")));
+        let mirror = [false, true].map(|emissive| build(any(emissive), FrontFace::Cw, 1, ViewMode::Mono, "baked_cave_mirror"));
         let occluder = Self::occluder_pipeline(device, uniform_layout, &model_layout);
         Self { scene, stereo, mirror, occluder, model_layout }
     }
@@ -688,16 +1250,15 @@ impl BakedCavePipelines {
         })
     }
 
-    /// The scene pass's pipeline for a cave.
-    pub fn scene_pipeline(&self, emissive: bool, spotless: bool, stereo: bool) -> &RenderPipeline {
-        match (&self.stereo, stereo) {
-            (Some(s), true) => &s[emissive as usize],
-            _ => &self.scene[emissive as usize][spotless as usize],
-        }
+    /// The scene pass's pipeline for a cave's triangles of one class.
+    pub fn scene_pipeline(&self, planes: CavePlanes, emissive: bool, spotless: bool) -> &RenderPipeline {
+        &self.scene[planes as usize][emissive as usize][spotless as usize]
     }
 
     /// Every cave of the scene pass: the chunks `planes` can see into (all of
-    /// them for `None`). Returns the triangles drawn.
+    /// them for `None`). Returns the triangles drawn. `only`: just the caves
+    /// whose box holds that eye (`true`) or does not (`false`) -- the pass
+    /// draws those it is inside before the ground (`Levers::cave_first`).
     #[allow(clippy::too_many_arguments)]
     pub fn draw_scene<'a>(
         &'a self,
@@ -708,28 +1269,48 @@ impl BakedCavePipelines {
         planes: Option<&[[Vec4; 6]]>,
         spotless: bool,
         stereo: bool,
+        only: Option<(Vec3, bool)>,
     ) -> u32 {
         let mut triangles = 0;
         for d in draws {
+            if only.is_some_and(|(eye, inside)| d.holds(eye) != inside) {
+                continue;
+            }
             if let Some(p) = planes {
                 if !super::scene_cull::sees_box(p, d.bounds) {
                     continue;
                 }
             }
-            let ranges = visible_ranges(d.chunks, d.placed, planes);
-            if ranges.is_empty() {
-                continue;
-            }
-            pass.set_pipeline(self.scene_pipeline(d.emissive, spotless, stereo));
-            pass.set_bind_group(0, uniform, &[]);
-            pass.set_bind_group(1, material, &[]);
-            pass.set_bind_group(2, d.model, &[]);
-            pass.set_bind_group(3, d.lightmap, &[]);
-            pass.set_vertex_buffer(0, d.vertices.slice(..));
-            pass.set_index_buffer(d.indices.slice(..), IndexFormat::Uint32);
-            for r in ranges {
-                triangles += (r.end - r.start) / 3;
-                pass.draw_indexed(r, 0, 0..1);
+            // Both eyes in one pass: one pipeline, every run. Otherwise a
+            // twin a class of triangle, each drawing its own runs.
+            let both_eyes = self.stereo.as_ref().filter(|_| stereo).map(|s| &s[d.emissive as usize]);
+            let passes: Vec<(&RenderPipeline, Vec<std::ops::Range<u32>>)> = match both_eyes {
+                Some(pipeline) => vec![(pipeline, visible_ranges(d.chunks, d.placed, planes, None))],
+                None => CavePlanes::ALL
+                    .iter()
+                    .map(|&k| (self.scene_pipeline(k, d.emissive, spotless), visible_ranges(d.chunks, d.placed, planes, Some(k))))
+                    .collect(),
+            };
+            let mut bound = false;
+            for (pipeline, ranges) in passes {
+                if ranges.is_empty() {
+                    continue;
+                }
+                pass.set_pipeline(pipeline);
+                if !bound {
+                    // One layout for every twin: bound once.
+                    pass.set_bind_group(0, uniform, &[]);
+                    pass.set_bind_group(1, material, &[]);
+                    pass.set_bind_group(2, d.model, &[]);
+                    pass.set_bind_group(3, d.lightmap, &[]);
+                    pass.set_vertex_buffer(0, d.vertices.slice(..));
+                    pass.set_index_buffer(d.indices.slice(..), IndexFormat::Uint32);
+                    bound = true;
+                }
+                for r in ranges {
+                    triangles += (r.end - r.start) / 3;
+                    pass.draw_indexed(r, 0, 0..1);
+                }
             }
         }
         triangles
@@ -758,7 +1339,7 @@ impl BakedCavePipelines {
     /// The depth of every cave the eye at `eye` is inside, in the reflection
     /// pass (as `CaveTwins::occluder`).
     pub fn draw_occluders<'a>(&'a self, pass: &mut RenderPass<'a>, uniform: &'a BindGroup, draws: &[BakedCaveDraw<'a>], eye: Vec3) {
-        let inside = |d: &BakedCaveDraw| eye.cmpge(d.bounds.0).all() && eye.cmple(d.bounds.1).all();
+        let inside = |d: &BakedCaveDraw| d.holds(eye);
         if !draws.iter().any(inside) {
             return;
         }
@@ -778,21 +1359,58 @@ mod tests {
     use super::*;
 
     fn chunk(first: u32, count: u32, x: f32) -> CaveChunk {
-        CaveChunk { first, count, min: [x, 0.0, -1.0], max: [x + 1.0, 1.0, 1.0], lip: 0 }
+        CaveChunk { first, count, min: [x, 0.0, -1.0], max: [x + 1.0, 1.0, 1.0], lip: 0, planes: CavePlanes::Cliff }
     }
 
     #[test]
     fn a_file_vertex_unpacks_its_weights_axis_and_glow() {
         let v = BakedCaveVertex::from_file(
-            [1.0; 3], [0.0, 1.0, 0.0], [2.0, 3.0], [0.25, 0.5], [100, 50, 5, (2 << 6) | 40], [255, 128, 3, 9], ([0.7, 0.2], 77),
+            [1.0; 3], [0.0, 1.0, 0.0], [0.25, 0.5], [100, 50, 5, (2 << 6) | 40], [255, 128, 3, 9], ([0.7, 0.2], 77),
+            Some(([200, 55, 0], [30, 0, 225, 90])),
+            None,
         );
         assert_eq!(v.weights, [100, 50, 5, 100], "the fourth weight is what the three leave of 255");
         assert_eq!(v.misc, [2, 40, 77, 0]);
+        assert_eq!(v.planes, [200, 55, 0, 90], "the planes' shares, and the cliff's");
+        assert_eq!(v.cliff, [30, 0, 225, 0], "the terrain's shares at a cliff");
+        // A file from before the planes: each chart on its own axis, no cliff.
+        let old = BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0, 255, 0, 2 << 6], [0; 4], ([0.0; 2], 0), None, None);
+        assert_eq!((old.planes, old.cliff), ([0, 0, 255, 0], [0; 4]));
+        let old = BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0, 255, 0, 0], [0; 4], ([0.0; 2], 0), None, None);
+        assert_eq!(old.planes, [255, 0, 0, 0]);
         assert_eq!(v.ground_uv, [0.7, 0.2]);
         assert_eq!(v.aux, [255, 128, 3, 9]);
         assert_eq!(std::mem::size_of::<BakedCaveVertex>(), 60);
         // Three weights over 255 (a file by another hand) leave nothing, not a wrapped byte.
-assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [200, 100, 0, 0], [0; 4], ([0.0; 2], 0)).weights[3], 0);
+        assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [200, 100, 0, 0], [0; 4], ([0.0; 2], 0), None, None).weights[3], 0);
+    }
+
+    #[test]
+    fn a_glows_colour_rides_in_the_two_spare_bytes_and_opens_to_the_same_colour() {
+        // The paint's colour (COLOR_4) beside everything else the vertex had: nothing else moves.
+        let args = ([1.0; 3], [0.0, 1.0, 0.0], [0.25, 0.5], [100, 50, 5, (2 << 6) | 40], [255, 128, 3, 9], ([0.7, 0.2], 77), Some(([200, 55, 0], [30, 0, 225, 90])));
+        let plain = BakedCaveVertex::from_file(args.0, args.1, args.2, args.3, args.4, args.5, args.6, None);
+        let teal = BakedCaveVertex::from_file(args.0, args.1, args.2, args.3, args.4, args.5, args.6, Some([60, 220, 200, 255]));
+        assert_eq!((plain.misc[3], plain.cliff[3]), (0, 0), "no colour: the rock's own");
+        assert_ne!(teal.cliff[3], 0);
+        assert_eq!(BakedCaveVertex { misc: [2, 40, 77, 0], cliff: [30, 0, 225, 0], ..teal }, plain, "the colour is in the two spare bytes and nowhere else");
+        // White, grey and black have no colour of their own.
+        for grey in [[255, 255, 255], [128, 128, 128], [0, 0, 0]] {
+            assert_eq!(glow_hue_saturation(grey), (0, 0));
+        }
+        // What the shader opens is the colour that was painted, at full brightness, to a hundredth.
+        for rgb in [[255u8, 0, 0], [0, 255, 0], [0, 0, 255], [255, 180, 90], [60, 220, 200], [180, 140, 255], [255, 255, 0], [255, 0, 254], [255, 200, 200]] {
+            let (hue, saturation) = glow_hue_saturation(rgb);
+            let got = glow_tint(hue, saturation);
+            let linear = rgb.map(srgb_to_linear);
+            let top = linear[0].max(linear[1]).max(linear[2]);
+            for k in 0..3 {
+                assert!((got[k] - linear[k] / top).abs() < 0.012, "{rgb:?}: opened {got:?}, painted {:?}", linear.map(|c| c / top));
+            }
+        }
+        // And the shader's own text is that arithmetic: the CPU copy above is checked against it by name.
+        assert!(GLOW_FN.contains("abs(fract(vec3<f32>(hue) + vec3<f32>(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0"));
+        assert!(GLOW_FN.contains("mix(vec3<f32>(1.0), pure, saturation) * (f32(misc.y) / 63.0 * EMISSIVE_GAIN)"));
     }
 
     #[test]
@@ -804,7 +1422,7 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
         .expect("a baked cave");
         assert!(meta.emissive);
         assert_eq!(meta.chunks.len(), 2);
-        assert_eq!(meta.chunks[1], CaveChunk { first: 6, count: 3, min: [0.0, 0.0, 0.0], max: [4.0, 5.0, 6.0], lip: 3 });
+        assert_eq!(meta.chunks[1], CaveChunk { first: 6, count: 3, min: [0.0, 0.0, 0.0], max: [4.0, 5.0, 6.0], lip: 3, planes: CavePlanes::Cliff });
         assert_eq!(meta.chunks[0].lip, 0, "a table from before the lip was counted: none");
         assert!(BakedCaveMeta::parse(r#"{"space_soup":{"shading":"layered"}}"#).is_none(), "the old cave is not this one");
         assert!(BakedCaveMeta::parse("{}").is_none());
@@ -819,7 +1437,7 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
         assert_eq!(covering_chunks(&good, 15, b), good.to_vec());
         for (bad, count) in [(vec![chunk(0, 6, 0.0), chunk(9, 6, 2.0)], 15), (good.to_vec(), 18), (vec![chunk(0, 5, 0.0)], 5), (vec![], 12)] {
             let one = covering_chunks(&bad, count, b);
-            assert_eq!(one, vec![CaveChunk { first: 0, count, min: b[0], max: b[1], lip: 0 }]);
+            assert_eq!(one, vec![CaveChunk { first: 0, count, min: b[0], max: b[1], lip: 0, planes: CavePlanes::Cliff }]);
         }
     }
 
@@ -828,32 +1446,43 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
         // An eye at the origin looking down -z: chunks at z -6..-4, spread along x.
         let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.05, 500.0);
         let planes = [crate::renderer::shadow::frustum_planes(proj * Mat4::look_to_rh(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y))];
-        let at = |first: u32, x: f32| CaveChunk { first, count: 3, min: [x, -0.5, -6.0], max: [x + 1.0, 0.5, -4.0], lip: 0 };
+        let at = |first: u32, x: f32| CaveChunk { first, count: 3, min: [x, -0.5, -6.0], max: [x + 1.0, 0.5, -4.0], lip: 0, planes: CavePlanes::Cliff };
         let chunks = [at(0, -40.0), at(3, -1.0), at(6, 0.5), at(9, 40.0), at(12, 2.0)];
-        assert_eq!(visible_ranges(&chunks, Mat4::IDENTITY, Some(&planes)), vec![3..9, 12..15]);
-        assert_eq!(visible_ranges(&chunks, Mat4::IDENTITY, None), vec![0..15]);
+        assert_eq!(visible_ranges(&chunks, Mat4::IDENTITY, Some(&planes), None), vec![3..9, 12..15]);
+        assert_eq!(visible_ranges(&chunks, Mat4::IDENTITY, None, None), vec![0..15]);
         // Placed elsewhere, the boxes move with the model.
         let moved = Mat4::from_translation(Vec3::new(40.0, 0.0, 0.0));
-        assert_eq!(visible_ranges(&chunks, moved, Some(&planes)), vec![0..3]);
+        assert_eq!(visible_ranges(&chunks, moved, Some(&planes), None), vec![0..3]);
         // Behind the eye: nothing.
-        assert!(visible_ranges(&chunks, Mat4::from_translation(Vec3::new(0.0, 0.0, 20.0)), Some(&planes)).is_empty());
+        assert!(visible_ranges(&chunks, Mat4::from_translation(Vec3::new(0.0, 0.0, 20.0)), Some(&planes), None).is_empty());
     }
 
     #[test]
     fn every_twin_validates_and_differs_only_as_it_says() {
-        let full = baked_cave_shader(CaveShader { emissive: true, spotless: false });
-        let plain = baked_cave_shader(CaveShader { emissive: false, spotless: false });
-        assert!(full.contains(EMISSIVE_LINE) && !plain.contains(EMISSIVE_LINE));
-        assert_eq!(full.replacen(EMISSIVE_LINE, "", 1), plain, "a cave with no glow has the same shader less one line");
-        for emissive in [false, true] {
-            for spotless in [false, true] {
-                for view in [ViewMode::Mono, ViewMode::Stereo] {
-                    let src = view.shader(baked_cave_shader(CaveShader { emissive, spotless }));
-                    let module = naga::front::wgsl::parse_str(&src)
-                        .unwrap_or_else(|e| panic!("baked cave (emissive {emissive}, spotless {spotless}, {view:?}): {}", e.emit_to_string(&src)));
-                    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
-                        .validate(&module)
-                        .unwrap_or_else(|e| panic!("baked cave (emissive {emissive}, spotless {spotless}, {view:?}) does not validate: {e:?}"));
+        for planes in CavePlanes::ALL {
+            let full = baked_cave_shader(CaveShader { emissive: true, spotless: false, planes });
+            let plain = baked_cave_shader(CaveShader { emissive: false, spotless: false, planes });
+            // A cave with no glow has the same shader less the emissive twin's four pieces,
+            // and no trace of them: not the varying, not the function, not the line.
+            let mut less = full.clone();
+            for part in emissive_parts(planes) {
+                assert_eq!(full.matches(&part).count(), 1, "{planes:?}: {part}");
+                assert!(!plain.contains(&part), "{planes:?}: the plain twin carries {part}");
+                less = less.replacen(&part, "", 1);
+            }
+            assert_eq!(less, plain, "a cave with no glow has the same shader less the emissive pieces");
+            assert!(!plain.contains("glow_rgb") && !plain.contains("glow_light") && !plain.contains("@location(9)"));
+            assert!(full.contains("@location(9) glow_rgb: vec3<f32>,") && full.contains("out.glow_rgb  = glow_light(v.misc, v.cliff.w);"));
+            for emissive in [false, true] {
+                for spotless in [false, true] {
+                    for view in [ViewMode::Mono, ViewMode::Stereo] {
+                        let what = format!("baked cave ({planes:?}, emissive {emissive}, spotless {spotless}, {view:?})");
+                        let src = view.shader(baked_cave_shader(CaveShader { emissive, spotless, planes }));
+                        let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{what}: {}", e.emit_to_string(&src)));
+                        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                            .validate(&module)
+                            .unwrap_or_else(|e| panic!("{what} does not validate: {e:?}"));
+                    }
                 }
             }
         }
@@ -863,18 +1492,22 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
     }
 
     #[test]
-    fn the_shader_reads_each_layer_once_and_takes_no_shadow_tap_of_the_levels_sun() {
+    fn the_shader_reads_each_layer_once_a_plane_and_takes_no_shadow_tap_of_the_levels_sun() {
         let src = baked_cave_shader(CaveShader::default());
         let fs = &src[src.find("@fragment fn fs_main").unwrap()..];
-        // Four reads in the layer loop (colour, normal, roughness, occlusion)
-        // and the macro variation; the lightmap and the stationary masks; and
-        // the ground map behind its branch. No splat, no second plane.
-        assert_eq!(fs.matches("textureSampleGrad(").count(), 5);
+        // In the layer loop colour, normal, roughness and occlusion, and a
+        // cliff's second scale of colour and normal behind its own branch; the
+        // macro variation a plane; a cliff's two macro reads behind the
+        // ground's branch; the lightmap and the stationary masks; and the
+        // ground's maps behind that branch. One loop body, whatever the planes.
+        assert_eq!(fs.matches("textureSampleGrad(").count(), 9);
+        let second = fs.find("if (second > 0.0) {").expect("the cliff's second scale is behind a branch");
+        assert_eq!(fs[second..].matches("textureSampleGrad(").count(), 4, "two reads behind it, and roughness and occlusion after");
         assert_eq!(fs.matches("textureSample(").count(), 5);
         assert_eq!(fs.matches("textureSampleLevel(").count(), 2);
         let branch = fs.find("if (ground > 0.0) {").expect("the ground's maps are read behind a branch");
-        let end = branch + fs[branch..].find("\n    }").unwrap();
-        for read in ["textureSampleLevel(sky_occ_tex", "textureSampleLevel(splat_tex"] {
+        let end = branch + fs[branch..].find("\n    }\n").unwrap();
+        for read in ["textureSampleLevel(sky_occ_tex", "textureSampleLevel(splat_tex", "m2 = textureSampleGrad(macro_tex"] {
             let at = fs.find(read).unwrap();
             assert!(at > branch && at < end, "{read} is inside the branch");
         }
@@ -907,16 +1540,25 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
 
     struct Shot {
         weights: [u8; 4],
-        uv0: [f32; 2],
-        /// Where the surface is in the world: must NOT change what a layer reads.
+        /// The shares of the planes the layers are read on (x, y, z), and of a cliff's reading.
+        planes: [u8; 4],
+        /// The terrain's shares of the planes at a cliff.
+        cliff: [u8; 3],
+        /// Where the surface is in the world: what a layer reads there.
         world: [f32; 3],
         aux: [u8; 4],
         glow: u8,
+        /// The emissive paint's colour (`COLOR_4`), or none: the rock's own.
+        glow_colour: Option<[u8; 3]>,
         emissive: bool,
         spotless: bool,
-        /// The lightmap's one texel.
+        /// The lightmap's texel (a 2 x 2 lightmap of it: a baked one), or with
+        /// `unbaked` the one neutral texel a cave with no bake binds.
         lightmap: [u8; 4],
+        unbaked: bool,
         mirror: bool,
+        /// Drawn by the twin that draws anything, whatever its class.
+        any_twin: bool,
         /// The ground's share of the lighting, and the ground map's one texel
         /// (sky, sun distance, penumbra, 0 = "has a baked sun").
         ground: u8,
@@ -927,18 +1569,29 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
         macro_strength: f32,
         macro_value: u8,
     }
+    fn copy_of(s: &Shot) -> Shot {
+        Shot {
+            weights: s.weights, planes: s.planes, cliff: s.cliff, world: s.world, aux: s.aux, glow: s.glow, glow_colour: s.glow_colour, emissive: s.emissive,
+            spotless: s.spotless, lightmap: s.lightmap, unbaked: s.unbaked, mirror: s.mirror, any_twin: s.any_twin, ground: s.ground,
+            ground_map: s.ground_map, paint: s.paint, macro_strength: s.macro_strength, macro_value: s.macro_value,
+        }
+    }
     impl Default for Shot {
         fn default() -> Self {
             Self {
                 weights: [0, 255, 0, 0],
-                uv0: [0.0; 2],
+                planes: [0, 0, 255, 0],
+                cliff: [0; 3],
                 world: [0.0; 3],
                 aux: [255, 255, 0, 0],
                 glow: 0,
+                glow_colour: None,
                 emissive: false,
                 spotless: false,
                 lightmap: [0, 0, 0, 255],
+                unbaked: false,
                 mirror: false,
+                any_twin: false,
                 ground: 0,
                 ground_map: [255, 255, 0, 0],
                 paint: None,
@@ -978,24 +1631,30 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
             &[],
             TerrainMaterialUniform { macro_strength: shot.macro_strength, macro_repeat: 1.0, repeat: [1.0; 4], ..Default::default() },
         );
-        let lightmap = crate::renderer::mesh::create_lightmap_texture(&device, &queue, &mesh.lightmap_layout, &shot.lightmap, 1, 1, None);
+        let lightmap = if shot.unbaked {
+            crate::renderer::mesh::create_lightmap_texture(&device, &queue, &mesh.lightmap_layout, &[0, 0, 0, 255], 1, 1, None)
+        } else {
+            crate::renderer::mesh::create_lightmap_texture(&device, &queue, &mesh.lightmap_layout, &shot.lightmap.repeat(4), 2, 2, None)
+        };
         let world = Vec3::from(shot.world);
         let model = mesh.create_model_uniform(&device);
         model.upload(&queue, Mat4::from_translation(world));
         // The eye goes with the surface, so only WHERE it is changes.
         uniforms.upload(&queue, Mat4::from_translation(-world), TEST_EYE + world, &ShadowUpload::disabled());
 
+        let (hue, saturation) = shot.glow_colour.map_or((0, 0), glow_hue_saturation);
         let v = |p: [f32; 3]| BakedCaveVertex {
             position: p,
             // Facing the eye (+z toward it in clip space is away; the shader
             // faces the normal to the viewer either way).
             normal: [0.0, 0.3, -0.954],
-            uv0: shot.uv0,
+            planes: shot.planes,
+            cliff: [shot.cliff[0], shot.cliff[1], shot.cliff[2], saturation],
             uv1: [0.5, 0.5],
             ground_uv: [0.5, 0.5],
             weights: shot.weights,
             aux: shot.aux,
-            misc: [2, shot.glow, shot.ground, 0],
+            misc: [2, shot.glow, shot.ground, hue],
         };
         let verts = [v([-1.0, -1.0, 0.5]), v([3.0, -1.0, 0.5]), v([-1.0, 3.0, 0.5])];
         let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1030,7 +1689,8 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let chunks = [CaveChunk { first: 0, count: 3, min: [-1.0, -1.0, 0.0], max: [3.0, 3.0, 1.0], lip: 0 }];
+        let planes = if shot.any_twin { CavePlanes::Cliff } else { CavePlanes::of([&verts[0], &verts[1], &verts[2]]) };
+        let chunks = [CaveChunk { first: 0, count: 3, min: [-1.0, -1.0, 0.0], max: [3.0, 3.0, 1.0], lip: 0, planes }];
         let draws = [BakedCaveDraw {
             model: &model.bind_group,
             lightmap: &lightmap.bind_group,
@@ -1064,7 +1724,7 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
             if shot.mirror {
                 pipelines.draw_mirror(&mut pass, &uniforms.bind_group, &material.bind_group, draws.iter());
             } else {
-                let drawn = pipelines.draw_scene(&mut pass, &uniforms.bind_group, &material.bind_group, &draws, None, shot.spotless, false);
+                let drawn = pipelines.draw_scene(&mut pass, &uniforms.bind_group, &material.bind_group, &draws, None, shot.spotless, false, None);
                 assert_eq!(drawn, 1);
             }
         }
@@ -1115,19 +1775,99 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
     }
 
     #[test]
-    fn a_layer_is_read_at_the_baked_uv_and_nowhere_else() {
+    fn a_layer_is_read_at_the_worlds_coordinate_on_its_plane() {
         // Layer 1 is the ramp: red rises with u, green with v, a tile a metre.
-        let at = |uv0: [f32; 2], world: [f32; 3]| render(Shot { uv0, world, ..Default::default() });
-        let Some(a) = at([0.2, 0.2], [0.0; 3]) else { return };
-        let b = at([0.8, 0.2], [0.0; 3]).unwrap();
-        let c = at([0.2, 0.8], [0.0; 3]).unwrap();
-        assert!(b[0] > a[0] + 30 && b[1].abs_diff(a[1]) < 12, "u moves the read across: {a:?} {b:?}");
-        assert!(c[1] > a[1] + 30 && c[0].abs_diff(a[0]) < 12, "v moves it down: {a:?} {c:?}");
-        // The same uv with the surface somewhere else in the world: the same
-        // texel. The old cave shader projected from the world's position.
-        let moved = at([0.2, 0.2], [0.37, 5.21, -3.3]).unwrap();
+        let at = |planes: [u8; 4], world: [f32; 3]| render(Shot { planes, world, ..Default::default() });
+        // Along z: u is the world's x, v its y, and its z moves nothing.
+        let z = [0, 0, 255, 0];
+        let Some(a) = at(z, [0.1, 0.1, 0.0]) else { return };
+        let b = at(z, [0.7, 0.1, 0.0]).unwrap();
+        let c = at(z, [0.1, -0.3, 0.0]).unwrap();
+        let d = at(z, [0.1, 0.1, 0.4]).unwrap();
+        assert!(b[0] > a[0] + 15 && b[1].abs_diff(a[1]) < 12, "x moves the read across: {a:?} {b:?}");
+        assert!(a[1] > c[1] + 10 && c[0].abs_diff(a[0]) < 12, "y moves it down: {a:?} {c:?}");
         for k in 0..3 {
-            assert!(moved[k].abs_diff(a[k]) <= 3, "the world's position must not move the read: {a:?} {moved:?}");
+            assert!(d[k].abs_diff(a[k]) <= 3, "along the plane's own axis nothing moves: {a:?} {d:?}");
+        }
+        // Along x: u is the world's z, v its y. Along y: u its x, v its z.
+        let x = [255, 0, 0, 0];
+        let (xa, xb, xc) = (at(x, [0.0, 0.1, -0.4]).unwrap(), at(x, [0.0, 0.1, 0.2]).unwrap(), at(x, [0.4, 0.1, -0.4]).unwrap());
+        assert!(xb[0] > xa[0] + 15 && xb[1].abs_diff(xa[1]) < 12, "{xa:?} {xb:?}");
+        assert!((0..3).all(|k| xc[k].abs_diff(xa[k]) <= 3), "{xa:?} {xc:?}");
+        let y = [0, 255, 0, 0];
+        let (ya, yb, yc) = (at(y, [0.1, 0.0, -0.4]).unwrap(), at(y, [0.1, 0.0, 0.2]).unwrap(), at(y, [0.1, 0.4, -0.4]).unwrap());
+        assert!(yb[1] > ya[1] + 10 && yb[0].abs_diff(ya[0]) < 12, "{ya:?} {yb:?}");
+        assert!((0..3).all(|k| yc[k].abs_diff(ya[k]) <= 3), "{ya:?} {yc:?}");
+    }
+
+    #[test]
+    fn two_planes_blend_by_their_shares_and_a_plane_with_no_share_is_not_read() {
+        // Somewhere the x plane and the z plane read different texels of the ramp.
+        let world = [0.1, 0.3, 0.3];
+        let Some(x) = render(Shot { planes: [255, 0, 0, 0], world, ..Default::default() }) else { return };
+        let z = render(Shot { planes: [0, 0, 255, 0], world, ..Default::default() }).unwrap();
+        let half = render(Shot { planes: [128, 0, 127, 0], world, ..Default::default() }).unwrap();
+        let mostly_z = render(Shot { planes: [26, 0, 229, 0], world, ..Default::default() }).unwrap();
+        assert!(x[0].abs_diff(z[0]) > 25, "the two planes read apart here: {x:?} {z:?}");
+        let (lo, hi) = (x[0].min(z[0]), x[0].max(z[0]));
+        assert!(half[0] > lo + 6 && half[0] < hi - 6, "half and half lies between: {x:?} {half:?} {z:?}");
+        assert!(mostly_z[0].abs_diff(z[0]) < half[0].abs_diff(z[0]), "a tenth of x is nearer z: {mostly_z:?} {half:?} {z:?}");
+        // No shares at all (a damaged file): the top plane, not black.
+        let none = render(Shot { planes: [0; 4], world, ..Default::default() }).unwrap();
+        assert!(none[0] as u32 + none[1] as u32 > 30, "{none:?}");
+    }
+
+    #[test]
+    fn at_a_cliff_the_rock_takes_the_cliffs_reading_by_its_share() {
+        // The macro map's one texel steers the warp: a constant shift of the
+        // read, so the ramp is read somewhere else; a flat layer is the same
+        // colour either way.
+        let ramp = |cliff_share: u8, ground: u8| {
+            render(Shot { planes: [0, 0, 255, cliff_share], cliff: [0, 0, 255], ground, macro_value: 200, ..Default::default() })
+        };
+        let Some(own) = ramp(0, 255) else { return };
+        let cliff = ramp(255, 255).unwrap();
+        let half = ramp(128, 255).unwrap();
+        let no_ground = ramp(255, 0).unwrap();
+        assert!(cliff[0].abs_diff(own[0]) > 25 || cliff[1].abs_diff(own[1]) > 25, "the warp moves the cliff's read: {own:?} {cliff:?}");
+        for k in 0..2 {
+            let (lo, hi) = (own[k].min(cliff[k]), own[k].max(cliff[k]));
+            assert!(half[k] + 4 >= lo && half[k] <= hi + 4, "half the cliff's share lies between: {own:?} {half:?} {cliff:?}");
+        }
+        assert!((0..3).all(|k| no_ground[k].abs_diff(own[k]) <= 3), "none of it away from the ground: {own:?} {no_ground:?}");
+        // No terrain shares to read it by: none of it.
+        let unshared = render(Shot { planes: [0, 0, 255, 255], cliff: [0; 3], ground: 255, macro_value: 200, ..Default::default() }).unwrap();
+        assert!((0..3).all(|k| unshared[k].abs_diff(own[k]) <= 3), "{own:?} {unshared:?}");
+        let flat = |cliff_share: u8| {
+            render(Shot { weights: [255, 0, 0, 0], planes: [0, 0, 255, cliff_share], cliff: [77, 0, 178], ground: 255, macro_value: 200, ..Default::default() })
+                .unwrap()
+        };
+        let (a, b) = (flat(0), flat(255));
+        assert!((0..3).all(|k| a[k].abs_diff(b[k]) <= 3), "a flat layer is one colour however it is read: {a:?} {b:?}");
+    }
+
+    /// The cliff's constants are the terrain's own: the two shaders are read
+    /// side by side where rock meets cliff, and a constant that drifted would
+    /// show as a line there.
+    #[test]
+    fn the_cliffs_reading_is_the_terrains_text() {
+        let cave = baked_cave_shader(CaveShader::default());
+        let ground = crate::renderer::terrain_pipeline::terrain_shader_built(crate::renderer::terrain_pipeline::TerrainRole::Scene, true);
+        for both in [
+            "const CLIFF_WARP_M: f32 = 2.5;",
+            "const CLIFF_BAND_WARP_M: f32 = 3.0;",
+            "const CLIFF_BAND_SCALE_M: f32 = 7.0;",
+            "mat2x2<f32>(0.8, 0.6, -0.6, 0.8)",
+            "vec2<f32>(0.31, 0.57)",
+            "vec2<f32>(0.37, 0.11)",
+            "vec2<f32>(0.35, 1.0)",
+            "0.4 - 0.8 * ",
+            "0.3 + 0.3 * ",
+            "2.3",
+            "* 1.3, mix(tn.z, t2.z, ",
+        ] {
+            assert!(cave.contains(both), "the cave's cliff reading lost `{both}`");
+            assert!(ground.contains(both), "the terrain's cliff reading no longer has `{both}`: bring the cave's along");
         }
     }
 
@@ -1138,11 +1878,19 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
         let lit = shot!(Shot { lightmap: [200, 60, 20, 255], weights: [0, 0, 0, 255], ..Default::default() });
         assert!(lit[0] > plain[0] + 20, "baked light is added: {plain:?} {lit:?}");
         assert!(lit[0] as i32 - lit[2] as i32 > plain[0] as i32 - plain[2] as i32 + 15, "...in its colour: {plain:?} {lit:?}");
-        let shut = shot!(Shot { lightmap: [0, 0, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
-        assert!(shut[1] + 20 < plain[1], "a texel that sees no sky takes none of its light: {plain:?} {shut:?}");
-        // And the vertex's own measure of the sky does the same.
-        let buried = shot!(Shot { aux: [0, 255, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
-        assert!(buried[1] + 20 < plain[1], "{plain:?} {buried:?}");
+        // The sky is the MEAN of the texel's measure and the vertex's: either
+        // saying none takes half of it away, both take it all.
+        let texel = shot!(Shot { lightmap: [0, 0, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
+        let vertex = shot!(Shot { aux: [0, 255, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
+        let both = shot!(Shot { lightmap: [0, 0, 0, 0], aux: [0, 255, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
+        assert!(texel[1] + 8 < plain[1] && vertex[1] + 8 < plain[1], "either measure alone darkens: {plain:?} {texel:?} {vertex:?}");
+        assert!(texel[1].abs_diff(vertex[1]) <= 3, "...and by the same: {texel:?} {vertex:?}");
+        assert!(both[1] + 8 < texel[1] && both[1] + 20 < plain[1], "a place neither sees sky from takes none of its light: {plain:?} {texel:?} {both:?}");
+        // An unbaked cave (the neutral lightmap, one texel) is lit by its vertices alone.
+        let unbaked_open = shot!(Shot { unbaked: true, weights: [0, 0, 0, 255], ..Default::default() });
+        let unbaked_shut = shot!(Shot { unbaked: true, aux: [0, 255, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
+        assert!((0..3).all(|k| unbaked_open[k].abs_diff(plain[k]) <= 2), "{plain:?} {unbaked_open:?}");
+        assert!((0..3).all(|k| unbaked_shut[k].abs_diff(both[k]) <= 2), "{both:?} {unbaked_shut:?}");
     }
 
     #[test]
@@ -1157,8 +1905,8 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
         assert!(half[1] > joined[1] && half[1] < own[1], "and between, between: {joined:?} {half:?} {own:?}");
         // The other way: the rock's own says buried, the ground's map says open.
         let open = [255, 255, 0, 0];
-        let buried = shot!(Shot { weights: w, aux: [0, 0, 0, 0], ground: 0, ground_map: open, ..Default::default() });
-        let lifted = shot!(Shot { weights: w, aux: [0, 0, 0, 0], ground: 255, ground_map: open, ..Default::default() });
+        let buried = shot!(Shot { weights: w, aux: [0, 0, 0, 0], lightmap: [0, 0, 0, 0], ground: 0, ground_map: open, ..Default::default() });
+        let lifted = shot!(Shot { weights: w, aux: [0, 0, 0, 0], lightmap: [0, 0, 0, 0], ground: 255, ground_map: open, ..Default::default() });
         assert!(lifted[1] > buried[1] + 20, "{buried:?} {lifted:?}");
         // Its baked light and its tide band are its own: gone at the join, where the ground has neither.
         let lamp = shot!(Shot { weights: w, lightmap: [200, 60, 20, 255], ground: 255, ..Default::default() });
@@ -1210,10 +1958,40 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
     }
 
     #[test]
+    fn a_glow_takes_its_paints_colour_in_every_class_of_triangle_and_none_in_the_plain_twin() {
+        // Grey rock (a layer whose albedo is even), in the dark, glowing half way.
+        let w = [0, 0, 0, 255];
+        let classes: [(&str, [u8; 4], [u8; 3]); 3] = [
+            ("one plane", [0, 0, 255, 0], [0; 3]),
+            ("its own planes", [60, 195, 0, 0], [0; 3]),
+            ("a cliff's", [0, 55, 200, 128], [0, 100, 155]),
+        ];
+        for (what, planes, cliff) in classes {
+            let dark = || Shot { weights: w, planes, cliff, world: [0.6, 0.3, 0.2], lightmap: [0, 0, 0, 0], glow: 24, ..Default::default() };
+            let none = shot!(Shot { ..dark() });
+            let white = shot!(Shot { emissive: true, ..dark() });
+            let red = shot!(Shot { emissive: true, glow_colour: Some([255, 0, 0]), ..dark() });
+            let blue = shot!(Shot { emissive: true, glow_colour: Some([0, 0, 255]), ..dark() });
+            let also_white = shot!(Shot { emissive: true, glow_colour: Some([255, 255, 255]), ..dark() });
+            // No colour and white are the same glow: the rock's own colour, as before the colour existed.
+            assert_eq!(white, also_white, "{what}");
+            assert!(white[0] > none[0] + 20 && white[2] > none[2] + 20, "{what}: {none:?} {white:?}");
+            // Red paint lights the rock red and blue paint blue (the tone map lets a little of a
+            // strong colour into the other channels, so these are comparisons, not equalities).
+            assert!(red[0] > none[0] + 20 && red[0] > red[1] + 60 && red[0] > red[2] + 60, "{what}: red {red:?}, none {none:?}");
+            assert!(blue[2] > none[2] + 20 && blue[2] > blue[0] + 60 && blue[2] > blue[1] + 60, "{what}: blue {blue:?}, none {none:?}");
+            assert!(red[1] + 40 < white[1] && blue[0] + 40 < white[0], "{what}: red {red:?}, blue {blue:?}, white {white:?}");
+            // And a painted colour does nothing at all in the twin a cave with no glow draws with.
+            let plain_red = shot!(Shot { glow_colour: Some([255, 0, 0]), ..dark() });
+            assert_eq!(plain_red, none, "{what}");
+        }
+    }
+
+    #[test]
     fn the_spotless_and_mirror_twins_draw_the_same_rock() {
-        let base = shot!(Shot { uv0: [0.3, 0.6], ..Default::default() });
-        let spotless = shot!(Shot { uv0: [0.3, 0.6], spotless: true, ..Default::default() });
-        let mirror = shot!(Shot { uv0: [0.3, 0.6], mirror: true, ..Default::default() });
+        let base = shot!(Shot { world: [0.3, 0.6, 0.0], ..Default::default() });
+        let spotless = shot!(Shot { world: [0.3, 0.6, 0.0], spotless: true, ..Default::default() });
+        let mirror = shot!(Shot { world: [0.3, 0.6, 0.0], mirror: true, ..Default::default() });
         for k in 0..4 {
             assert!(base[k].abs_diff(spotless[k]) <= 2, "{base:?} {spotless:?}");
             // The mirror's front faces are the other winding: this triangle is
@@ -1228,13 +2006,139 @@ assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], [2
     /// shipped cave shader's (`layered_mesh_pipeline::tests::cave_shader_size`,
     /// 2,646 expressions for 4,702 headset instructions, x1.78). Run with
     /// `--ignored --nocapture`.
+    fn corner(planes: [u8; 4]) -> BakedCaveVertex {
+        BakedCaveVertex { planes, ..Zeroable::zeroed() }
+    }
+
+    #[test]
+    fn a_triangle_goes_to_the_twin_that_reads_what_it_reads() {
+        let (x, z) = (corner([255, 0, 0, 0]), corner([0, 0, 255, 0]));
+        assert_eq!(CavePlanes::of([&x, &x, &x]), CavePlanes::One);
+        assert_eq!(CavePlanes::of([&z, &z, &z]), CavePlanes::One);
+        // A share the shader does not read (one part in 255 is under its
+        // threshold) is not a second plane.
+        assert_eq!(CavePlanes::of([&x, &corner([254, 1, 0, 0]), &x]), CavePlanes::One);
+        // One plane each, and not the same one: two planes across the triangle.
+        assert_eq!(CavePlanes::of([&x, &x, &z]), CavePlanes::Own);
+        assert_eq!(CavePlanes::of([&x, &corner([128, 127, 0, 0]), &x]), CavePlanes::Own);
+        assert_eq!(CavePlanes::of([&corner([85, 85, 85, 0]), &x, &z]), CavePlanes::Own);
+        // Any of a cliff's reading, at any corner; and shares that do not add up.
+        assert_eq!(CavePlanes::of([&x, &x, &corner([255, 0, 0, 1])]), CavePlanes::Cliff);
+        assert_eq!(CavePlanes::of([&x, &corner([200, 0, 0, 0]), &x]), CavePlanes::Cliff);
+        assert_eq!(CavePlanes::default(), CavePlanes::Cliff, "a file's own table, and a shader asked for by no class: anything");
+    }
+
+    #[test]
+    fn the_triangles_are_reordered_by_twin_and_none_is_lost() {
+        // 0 1 2: one plane. 3: half and half. 4: a cliff's.
+        let vertices = [corner([255, 0, 0, 0]), corner([255, 0, 0, 0]), corner([255, 0, 0, 0]), corner([128, 127, 0, 0]), corner([255, 0, 0, 9])];
+        // Chunk a: own, one, cliff, and a lip (one plane by its corners: the lip is the last twin's all the same).
+        // Chunk b: one, one.
+        let indices = [0, 1, 3, 0, 1, 2, 0, 1, 4, 2, 1, 0, 1, 2, 0, 2, 0, 1];
+        let a = CaveChunk { first: 0, count: 12, min: [0.0; 3], max: [1.0; 3], lip: 3, planes: CavePlanes::Cliff };
+        let b = CaveChunk { first: 12, count: 6, min: [2.0; 3], max: [3.0; 3], lip: 0, planes: CavePlanes::Cliff };
+        let (out, table) = partition(&vertices, &indices, &[a, b]);
+        assert_eq!(out, vec![0, 1, 2, 1, 2, 0, 2, 0, 1, 0, 1, 3, 0, 1, 4, 2, 1, 0]);
+        let run = |first, count, of: CaveChunk, lip, planes| CaveChunk { first, count, min: of.min, max: of.max, lip, planes };
+        assert_eq!(
+            table,
+            vec![
+                run(0, 3, a, 0, CavePlanes::One),
+                run(3, 6, b, 0, CavePlanes::One),
+                run(9, 3, a, 0, CavePlanes::Own),
+                run(12, 6, a, 3, CavePlanes::Cliff),
+            ]
+        );
+        // The same triangles: nothing lost, nothing twice.
+        let mut before: Vec<[u32; 3]> = indices.chunks(3).map(|t| [t[0], t[1], t[2]]).collect();
+        let mut after: Vec<[u32; 3]> = out.chunks(3).map(|t| [t[0], t[1], t[2]]).collect();
+        before.sort();
+        after.sort();
+        assert_eq!(before, after);
+        // A twin's runs are its own, joined where they are neighbours.
+        assert_eq!(visible_ranges(&table, Mat4::IDENTITY, None, Some(CavePlanes::One)), vec![0..9]);
+        assert_eq!(visible_ranges(&table, Mat4::IDENTITY, None, Some(CavePlanes::Own)), vec![9..12]);
+        assert_eq!(visible_ranges(&table, Mat4::IDENTITY, None, Some(CavePlanes::Cliff)), vec![12..18]);
+        assert_eq!(visible_ranges(&table, Mat4::IDENTITY, None, None), vec![0..18]);
+        // An index past the vertices: the twin that draws anything, not a panic.
+        let (out, table) = partition(&vertices, &[0, 1, 99], &[CaveChunk { first: 0, count: 3, ..a }]);
+        assert_eq!((out, table[0].planes), (vec![0, 1, 99], CavePlanes::Cliff));
+    }
+
+    #[test]
+    fn the_one_plane_twin_reads_each_layer_once_and_the_blended_twin_once_a_plane() {
+        let fs_of = |planes| {
+            let src = baked_cave_shader(CaveShader { planes, ..Default::default() });
+            src[src.find("@fragment fn fs_main").unwrap()..].to_string()
+        };
+        // ONE: colour, normal, roughness, occlusion in the layer loop, and the macro variation. No position's
+        // gradients, no shares, nothing of a cliff: the shader measured at 16 registers.
+        let one = fs_of(CavePlanes::One);
+        assert_eq!(one.matches("textureSampleGrad(").count(), 5);
+        for absent in ["in.planes", "in.cliff", "in.wpos", "dpdx(wp)", "cliff_warp", "entries_left"] {
+            assert!(!one.contains(absent), "the one-plane twin has no {absent}");
+        }
+        assert!(one.contains("let uv = in.uv.xy;") && one.contains("whiteout(in.axis, tn, nw)"));
+        // OWN: the same five reads, written out for each of the three planes behind its share; nothing of a cliff,
+        // no plane chosen by a counter.
+        let own = fs_of(CavePlanes::Own);
+        assert_eq!(own.matches("textureSampleGrad(").count(), 15);
+        for (share, swizzle, axis) in [("x", "zy", "0u"), ("y", "xz", "1u"), ("z", "xy", "2u")] {
+            let block = own.find(&format!("if (in.planes.{share} > WEIGHT_EPS) {{")).expect("a plane is read behind its share");
+            let end = block + own[block..].find("\n    }\n").unwrap();
+            assert_eq!(own[block..end].matches("textureSampleGrad(").count(), 5);
+            assert_eq!(own[block..end].matches(&format!("wp.{swizzle} * ")).count(), 2);
+            assert!(own[block..end].contains(&format!("whiteout({axis}, tn, nw)")));
+        }
+        for absent in ["in.cliff", "cliff_warp", "entries_left", "plane_uv("] {
+            assert!(!own.contains(absent), "the blended twin has no {absent}");
+        }
+        // Each twin's vertex stage carries what its pixels read.
+        let vs_of = |planes| {
+            let src = baked_cave_shader(CaveShader { planes, ..Default::default() });
+            src[src.find("struct VOut").unwrap()..src.find("@fragment fn fs_main").unwrap()].to_string()
+        };
+        assert!(vs_of(CavePlanes::One).contains("out.uv        = vec4<f32>(plane_uv(axis, wpos), v.uv1);"));
+        assert!(vs_of(CavePlanes::Own).contains("out.planes    = vec4<f32>(v.planes.xyz, f32(v.misc.y) / 63.0);"));
+    }
+
+    #[test]
+    fn each_twin_draws_what_the_twin_that_draws_anything_draws() {
+        let mixed = [100, 80, 50, 25];
+        let cases = [
+            ("one plane, along z", Shot { world: [0.3, 0.2, 0.0], ..Default::default() }),
+            ("one plane, along x", Shot { planes: [255, 0, 0, 0], world: [5.0, 0.45, 0.6], weights: mixed, ..Default::default() }),
+            ("one plane, along y", Shot { planes: [0, 255, 0, 0], world: [0.35, 2.0, 0.7], weights: mixed, macro_strength: 0.8, macro_value: 40, ..Default::default() }),
+            ("one plane at the ground", Shot { world: [0.6, 0.3, 0.0], ground: 200, ground_map: [90, 200, 60, 0], paint: Some([0, 0, 255, 0]), ..Default::default() }),
+            ("one plane, glowing", Shot { world: [0.6, 0.3, 0.0], glow: 40, emissive: true, ..Default::default() }),
+            ("two planes", Shot { planes: [128, 0, 127, 0], world: [5.2, 0.45, 0.6], weights: mixed, macro_strength: 0.8, macro_value: 200, ..Default::default() }),
+            ("three planes", Shot { planes: [100, 80, 75, 0], world: [0.35, 0.8, 0.7], ..Default::default() }),
+            ("two planes at the ground", Shot { planes: [0, 200, 55, 0], world: [0.6, 0.3, 0.2], ground: 128, ground_map: [90, 200, 60, 0], ..Default::default() }),
+            ("two planes, glowing, spotless", Shot { planes: [60, 195, 0, 0], world: [0.6, 0.3, 0.2], glow: 40, emissive: true, spotless: true, ..Default::default() }),
+        ];
+        for (what, case) in cases {
+            let class = CavePlanes::of([&corner(case.planes), &corner(case.planes), &corner(case.planes)]);
+            assert_ne!(class, CavePlanes::Cliff, "{what} is a twin's");
+            let any = shot!(Shot { any_twin: true, ..copy_of(&case) });
+            let own = shot!(case);
+            assert!(any[0] > 8 || any[1] > 8 || any[2] > 8, "{what}: something is drawn ({any:?})");
+            assert!((0..4).all(|k| any[k].abs_diff(own[k]) <= 2), "{what}: the {class:?} twin draws {own:?}, the twin that draws anything {any:?}");
+        }
+    }
+
     #[test]
     #[ignore]
     fn baked_cave_sizes() {
         for (name, which) in [
-            ("baked_cave", CaveShader { emissive: false, spotless: false }),
-            ("baked_cave_spotless", CaveShader { emissive: false, spotless: true }),
-            ("baked_cave_emissive", CaveShader { emissive: true, spotless: false }),
+            ("baked_cave", CaveShader { emissive: false, spotless: false, ..Default::default() }),
+            ("baked_cave_spotless", CaveShader { emissive: false, spotless: true, ..Default::default() }),
+            ("baked_cave_emissive", CaveShader { emissive: true, spotless: false, ..Default::default() }),
+            ("baked_cave_one", CaveShader { emissive: false, spotless: false, planes: CavePlanes::One }),
+            ("baked_cave_one_spotless", CaveShader { emissive: false, spotless: true, planes: CavePlanes::One }),
+            ("baked_cave_own", CaveShader { emissive: false, spotless: false, planes: CavePlanes::Own }),
+            ("baked_cave_own_spotless", CaveShader { emissive: false, spotless: true, planes: CavePlanes::Own }),
+            ("baked_cave_one_emissive", CaveShader { emissive: true, spotless: false, planes: CavePlanes::One }),
+            ("baked_cave_own_emissive", CaveShader { emissive: true, spotless: false, planes: CavePlanes::Own }),
         ] {
             let src = ViewMode::Mono.shader(baked_cave_shader(which));
             println!("{}", crate::renderer::shader_inlining::report(name, &src, "fs_main", 8));

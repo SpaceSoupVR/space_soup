@@ -1000,6 +1000,38 @@ pub fn layer_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE GROUND IN THE WORLD MOVES AS THE GROUND POSED DID. Posed, a vertex
+    /// was `world_to_player * w` and went through this frame's camera and
+    /// `previous_clip`; in the world it is `w`, through the world's slot --
+    /// this frame's camera times this frame's world-to-player, and the last
+    /// frame's times the last frame's. Two matrices a frame, no posed copy of
+    /// either, and the same vector: while the rig walks, turns and the head
+    /// moves, near and far.
+    #[test]
+    fn a_world_vertex_through_the_worlds_slot_moves_as_its_posed_copy_did() {
+        let proj = Mat4::perspective_rh(1.6, 0.93, NEAR_Z, FAR_Z);
+        let frame = |offset: Vec3, yaw: f32, head: Vec3, look: f32| {
+            let world_to_player = Mat4::from_quat(glam::Quat::from_rotation_y(yaw).inverse()) * Mat4::from_translation(-offset);
+            let view = (Mat4::from_translation(head) * Mat4::from_rotation_y(look)).inverse();
+            (proj * view, world_to_player)
+        };
+        let (prev_vp, prev_w2p) = frame(Vec3::new(3.0, 0.2, -7.0), 0.40, Vec3::new(0.02, 1.6, 0.01), 0.10);
+        let (curr_vp, w2p) = frame(Vec3::new(3.04, 0.21, -7.03), 0.43, Vec3::new(0.03, 1.61, 0.0), 0.13);
+        let mut worst = 0.0f32;
+        for k in 0..400 {
+            let a = k as f32 * 0.7;
+            let w = Vec3::new(3.0 + a.sin() * (1.0 + k as f32 * 0.2), (k % 9) as f32 * 0.5 - 1.0, -7.0 - 2.0 - a.cos().abs() * (1.0 + k as f32 * 0.3));
+            // As it was: posed by the app, the world's first slot.
+            let posed = motion_vector(curr_vp, previous_clip(prev_vp, prev_w2p, w2p), w2p.transform_point3(w));
+            // As it is: the world's vertex, the slot the water has always had.
+            let world = motion_vector(curr_vp * w2p, prev_vp * prev_w2p, w);
+            worst = worst.max((posed - world).abs().max_element());
+        }
+        // Single precision's own noise through two more matrix products:
+        // under a hundredth of a motion pixel of SpaceWarp's 512-wide image.
+        assert!(worst < 4e-5, "the two differ by {worst} of NDC");
+    }
     use glam::{Quat, Vec3};
 
     fn view_proj(eye: Vec3, yaw: f32) -> Mat4 {

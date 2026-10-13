@@ -357,6 +357,11 @@ struct WaterBody {
     /// a surface long gone. A cell, as the frame decides it while holding
     /// the renderer's other parts.
     seen: std::cell::Cell<bool>,
+    /// Its index buffer in runs, each with the box it stays in, and the
+    /// ranges of it this frame draws: all of it, or the runs some eye sees
+    /// (`Levers::water_runs`). See `water_runs`.
+    runs: Vec<crate::renderer::water_runs::Run>,
+    ranges: std::cell::RefCell<Vec<std::ops::Range<u32>>>,
     /// Its groups for the view from under it, by wave set. See `underwater`.
     under_groups: [wgpu::BindGroup; 2],
     /// Its still depth over the ground, to ask at an eye.
@@ -532,6 +537,13 @@ pub struct XrRenderer {
     /// The terrain's indices with each chunk's gentle triangles first, for the
     /// terrain the frame was last handed. See `ground_twins::SlopeSplit`.
     slope_split: Option<crate::renderer::ground_twins::SlopeSplit>,
+    /// The frame's solid vertex and index buffers, kept across frames with
+    /// the ground first in them (`Levers::ground_buffers`). See `static_solid`.
+    static_solid: Option<crate::renderer::static_solid::StaticSolid>,
+    /// What this frame's parts reported of their CPU work (`note_cpu`), and
+    /// the same summed over the window's measured frames.
+    cpu_frame: std::collections::BTreeMap<&'static str, f64>,
+    cpu_window: std::collections::BTreeMap<&'static str, f64>,
     /// The ground's probe pass and its poolless twin with the repeated code
     /// written once. See `ground_twins::dedup_passes`.
     terrain_dedup_passes: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 2]>,
@@ -549,6 +561,9 @@ pub struct XrRenderer {
     /// reflecting the outdoors (`terrain_pipeline::open_pass_shader`,
     /// `Levers::open_reflections`). `None` when the shader's switch moved.
     terrain_open_passes: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 2]>,
+    /// The weather's open twin answering with the sky alone, for standing
+    /// water (`Levers::puddle_sky`).
+    terrain_puddle_pass: Option<crate::renderer::terrain_pipeline::TerrainPipeline>,
     terrain_sun_baked: bool,
     /// MEASUREMENT: the ground's reader, probe pass and poolless pass with
     /// their layer reads inlined, drawn in the shipped ones' place while
@@ -569,6 +584,8 @@ pub struct XrRenderer {
     /// The brushes' depth, drawn first in the scene pass. See
     /// `BrushPipeline::new_depth_prepass`; the lever `depth_prepass`.
     brush_depth_prepass: crate::renderer::brush_pipeline::BrushPipeline,
+    /// The same into the reflection pass's depth (`Levers::probe_prepass`).
+    brush_probe_depth_prepass: crate::renderer::brush_pipeline::BrushPipeline,
     /// The same for the multiview scene pass, in its own error scope like
     /// `stereo_probe`: refused, stereo simply runs without a prepass.
     stereo_depth_prepass: Option<crate::renderer::brush_pipeline::BrushPipeline>,
@@ -620,6 +637,11 @@ pub struct XrRenderer {
     /// position back into a texel. Kept beside the image because one is
     /// meaningless without the other.
     terrain_footprint: Option<(glam::Vec3, glam::Vec3)>,
+    /// The drawn ground as what it hides, with each chunk's first index and
+    /// WORLD bounds, and the horizon held from the last frame. See
+    /// [`Self::set_ground_horizon`].
+    ground_occluder: Option<(crate::renderer::ground_horizon::GroundOccluder, Vec<(u32, (glam::Vec3, glam::Vec3))>)>,
+    ground_horizon: std::cell::RefCell<Option<crate::renderer::ground_horizon::Horizon>>,
     /// How the layers tile, from the project's `settings.json`. Held alongside
     /// the textures for the same reason they are: it arrives independently.
     terrain_settings: crate::renderer::terrain_pipeline::TerrainMaterialUniform,
@@ -628,6 +650,16 @@ pub struct XrRenderer {
     skinned_mesh_mirror_pipeline: SkinnedMeshPipeline,
     skinned_mesh_pipeline: SkinnedMeshPipeline,
     mirror_solid_pipeline: SolidPipeline,
+    /// The same for vertices in the world: the ground, drawn into a mirror
+    /// while it is kept so (`ground_world`).
+    mirror_solid_world: Option<SolidPipeline>,
+    /// THE GROUND IS HANDED OVER IN THE WORLD and posed by the vertex shader
+    /// (`terrain_pipeline::WORLD_GROUND`, as it stood when the renderer was
+    /// built -- every ground pipeline was built by it). See `ground_in_world`.
+    ground_world: bool,
+    /// The player's frame from the world, as a model's uniform: what poses
+    /// the ground's chunks in the shadow passes. Written each frame.
+    ground_model: crate::renderer::mesh_pipeline::ModelUniform,
     mirror_mesh_pipeline: MeshPipeline,
     mirror_pipeline: MirrorPipeline,
     mirror_targets: [MirrorTarget; 2],
@@ -1215,6 +1247,7 @@ impl XrRenderer {
             outdoor_passes: terrain_outdoor_passes,
             nowhere_passes: terrain_nowhere_passes,
             open_passes: terrain_open_passes,
+            puddle_pass: terrain_puddle_pass,
             reader: terrain_probe_reader_pipeline,
             reader_twins: terrain_reader_twins,
             gentle: terrain_gentle,
@@ -1245,6 +1278,8 @@ impl XrRenderer {
         let brush_depth_prepass = crate::renderer::brush_pipeline::BrushPipeline::new_depth_prepass(
             &wgpu_device, wgpu_format, &uniform_buf.layout, samples, crate::renderer::multiview::ViewMode::Mono,
         );
+        let brush_probe_depth_prepass =
+            crate::renderer::brush_pipeline::BrushPipeline::new_probe_depth_prepass(&wgpu_device, &uniform_buf.layout);
 
         // White until a scene loads its materials, so an untextured level draws
         // in its authored colours rather than in nothing.
@@ -1275,6 +1310,8 @@ impl XrRenderer {
             crate::renderer::sky::AMBIENT,
         );
 
+        // (Timed: what a level with no layered cave pays at start-up for them.)
+        let layered_clock = std::time::Instant::now();
         let layered_mesh_pipeline =
             crate::renderer::layered_mesh_pipeline::LayeredMeshPipeline::new_multisampled(
                 &wgpu_device,
@@ -1293,6 +1330,10 @@ impl XrRenderer {
         if cave_twins.is_none() {
             log::warn!("CAVE TWINS: a substitution no longer matches the cave shader; the cave draws as shipped");
         }
+        log::info!(
+            "STARTUP: the layered cave's pipelines (scene, mirror, twins) built in {:.0} ms",
+            layered_clock.elapsed().as_secs_f64() * 1e3
+        );
         let wire_pipeline =
             WirePipeline::new_multisampled(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
         let mesh_pipeline =
@@ -1318,6 +1359,14 @@ impl XrRenderer {
 
         let mirror_solid_pipeline =
             SolidPipeline::new_mirror(&wgpu_device, wgpu_format, &uniform_buf.layout);
+        // The ground in the world, if this launch keeps it so: read ONCE, as
+        // the ground's pipelines read it when they are built.
+        let ground_world = crate::renderer::terrain_pipeline::WORLD_GROUND.load(std::sync::atomic::Ordering::Relaxed);
+        let mirror_solid_world = ground_world
+            .then(|| SolidPipeline::new_mirror_world(&wgpu_device, wgpu_format, &uniform_buf.layout))
+            .flatten();
+        let ground_model = mesh_pipeline.create_model_uniform(&wgpu_device);
+        log::info!("GROUND: its vertices are {}", if ground_world { "the world's, posed by the vertex shader" } else { "posed by the app" });
         let mirror_mesh_pipeline =
             MeshPipeline::new_mirror(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let mirror_pipeline = MirrorPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
@@ -1471,6 +1520,7 @@ impl XrRenderer {
 
         // After the stereo scope: its two-eye twins are built only where the
         // scene's own were accepted.
+        let baked_clock = std::time::Instant::now();
         let baked_cave_pipelines = crate::renderer::baked_cave::BakedCavePipelines::new(
             &wgpu_device,
             wgpu_format,
@@ -1480,6 +1530,7 @@ impl XrRenderer {
             samples,
             can_multiview,
         );
+        log::info!("STARTUP: the baked cave's pipelines built in {:.0} ms", baked_clock.elapsed().as_secs_f64() * 1e3);
 
         // Both eyes' half-resolution probe pass, in a scope of its own. See
         // `StereoProbePass`.
@@ -1713,16 +1764,21 @@ impl XrRenderer {
             terrain_gentle,
             terrain_steep,
             slope_split: None,
+            static_solid: None,
+            cpu_frame: Default::default(),
+            cpu_window: Default::default(),
             terrain_dedup_passes,
             terrain_outdoor_passes,
             terrain_nowhere_passes,
             terrain_open_passes,
+            terrain_puddle_pass,
             terrain_sun_baked: false,
             terrain_inlined: None,
             weather: None,
             reader_edits: None,
             stereo_probe,
             brush_depth_prepass,
+            brush_probe_depth_prepass,
             stereo_depth_prepass,
             brush_mirror_pipeline,
             water_pipeline,
@@ -1761,11 +1817,16 @@ impl XrRenderer {
             terrain_sky_occlusion: None,
             terrain_stationary: Vec::new(),
             terrain_footprint: None,
+            ground_occluder: None,
+            ground_horizon: std::cell::RefCell::new(None),
             terrain_settings: Default::default(),
             wire_pipeline,
             mesh_pipeline,
             skinned_mesh_pipeline,
             mirror_solid_pipeline,
+            mirror_solid_world,
+            ground_world,
+            ground_model,
             mirror_mesh_pipeline,
             mirror_pipeline,
             mirror_targets,
@@ -2748,6 +2809,22 @@ impl XrRenderer {
     /// Where the player is, so geometry pinned to the WORLD can undo the
     /// player-frame transform. Per frame, unlike the sky or the tone curve --
     /// it changes every time they take a step.
+    /// WHETHER THE GROUND IS TO BE HANDED OVER IN THE WORLD: its vertices as
+    /// loaded, never posed by the app, with its chunks' boxes still in the
+    /// player's frame. The vertex shaders pose it (`terrain_pipeline::
+    /// world_vertices`), a model matrix in the shadow passes, the world's
+    /// camera slot in the motion pass. `false`: posed vertices, as before.
+    pub fn ground_in_world(&self) -> bool {
+        self.ground_world
+    }
+
+    /// A part of this frame's CPU work, or of what it sent to the GPU, for
+    /// the window's record (`WindowRecord::cpu`): added to whatever the same
+    /// name has had this frame. Called before the frame is rendered.
+    pub fn note_cpu(&mut self, part: &'static str, value: f64) {
+        *self.cpu_frame.entry(part).or_default() += value;
+    }
+
     pub fn set_player_frame(&mut self, offset: glam::Vec3, yaw: f32) {
         // The frame only: the characters' capsules are set on their own.
         self.player.offset = offset;
@@ -2779,7 +2856,7 @@ impl XrRenderer {
         let layout = weather::bind_group_layout(device);
         let probe_layout = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(device);
         // The ground's weather pipelines. See `ground_build::weather_ground`.
-        let (twins, gentle, dedup_passes) = ground_build::weather_ground(
+        let (twins, gentle, dedup_passes, wet) = ground_build::weather_ground(
             device,
             wgpu::TextureFormat::Rgba8UnormSrgb,
             &self.uniform_buf.layout,
@@ -2807,8 +2884,10 @@ impl XrRenderer {
             particles,
             chunks,
             gentle,
+            wet,
             dedup_passes,
             holds: vec![(true, true); texels.len()],
+            films: vec![true; texels.len()],
             areas: Vec::new(),
             texels: texels.to_vec(),
             counts: (0, 0, 0),
@@ -2827,10 +2906,15 @@ impl XrRenderer {
         for (k, a) in areas.iter().enumerate() {
             let size = w.texels.get(k).copied().unwrap_or((1, 1));
             w.maps.set_area(k, a, size);
-            if let Some(m) = maps.get(k) {
+            // An empty map is one not worked out again this frame (a shore's
+            // line is, several times as often as an area's weather).
+            if let Some(m) = maps.get(k).filter(|m| !m.is_empty()) {
                 w.maps.upload_map(&self.wgpu_queue, k as u32, size.0, size.1, m);
                 if let Some(h) = w.holds.get_mut(k) {
                     *h = crate::renderer::weather::map_holds(m);
+                }
+                if let Some(f) = w.films.get_mut(k) {
+                    *f = crate::renderer::weather::map_is_wet(m);
                 }
             }
         }
@@ -3055,9 +3139,36 @@ impl XrRenderer {
         self.rebuild_terrain_material();
     }
 
+    /// THE DRAWN GROUND AS WHAT IT HIDES (`Levers::ground_horizon`): built by
+    /// the client from the triangles it hands the frame, with every chunk's
+    /// first index (as in the frame's `terrain_chunks`) and bounds in the
+    /// WORLD. `None` for a level without ground, and whenever the ground
+    /// changes. See `ground_horizon`.
+    pub fn set_ground_horizon(
+        &mut self,
+        ground: Option<(crate::renderer::ground_horizon::GroundOccluder, Vec<(u32, (glam::Vec3, glam::Vec3))>)>,
+    ) {
+        if let Some((g, chunks)) = &ground {
+            log::info!("HORIZON: the ground hides behind {} cells of ground, {} chunk(s)", g.solid_cells, chunks.len());
+        }
+        self.ground_occluder = ground;
+        *self.ground_horizon.get_mut() = None;
+    }
+
     /// The world-space x/z extent the terrain occlusion map covers.
+    /// The level's ground has been loaded again or changed in place: what
+    /// is kept of it on the GPU is written again next frame (`static_solid`
+    /// tells another ground by its slice, its length, the rig and a sample
+    /// of its contents, which an edit to a few vertices can leave as it was).
+    pub fn ground_changed(&mut self) {
+        crate::renderer::static_solid::StaticSolid::forget(&mut self.static_solid);
+    }
+
     pub fn set_terrain_footprint(&mut self, min: glam::Vec3, max: glam::Vec3) {
         self.terrain_footprint = Some((min, max));
+        // A level's ground has just been loaded: whatever ground is on the GPU
+        // is written again, whatever the next frame's slices look like.
+        crate::renderer::static_solid::StaticSolid::forget(&mut self.static_solid);
     }
 
     /// Install the scene's water. Replaces whatever was there.
@@ -3142,6 +3253,12 @@ impl XrRenderer {
                     motion_groups,
                     bounds,
                     seen: std::cell::Cell::new(false),
+                    runs: {
+                        // As far as `water_bounds` lets the waves move a vertex.
+                        let raw = verts.iter().fold(f32::INFINITY, |lo, v| lo.min(v.position[0]));
+                        crate::renderer::water_runs::runs(|i| glam::Vec3::from(verts[i as usize].position), indices, raw - bounds.0.x)
+                    },
+                    ranges: std::cell::RefCell::new(vec![0..indices.len() as u32]),
                     under_groups,
                     still: crate::renderer::underwater::StillDepth::new(verts),
                 }

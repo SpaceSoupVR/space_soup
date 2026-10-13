@@ -31,10 +31,38 @@
 //!   stands for every eye within that far of where it was taken -- both eyes of
 //!   a frame, and the next frames of a head that has hardly moved.
 //!
+//! THE HOLE'S TOP. A hole is a gap in the sheet, and the sheet can be thought
+//! on across it: any continuous filling that meets the ground round the hole
+//! stays under the highest ground on the hole's rim. A line that passes over
+//! the hole above that -- over a cave's brow -- is above the filled sheet
+//! too, and has not gone in; only lines at or under the rim's top are
+//! forgotten.
+//!
+//! UNDER THE GROUND, WHERE THE HOLES ARE PLUGGED ([`Horizon::new`]'s `caves`):
+//! a baked cave is a closed sheet of rock joined to the ground along its
+//! mouths' outlines, drawn from both sides. So a sight line from an eye in the
+//! air that is under the ground somewhere -- through the ground's upper side,
+//! or in at a mouth -- reaches no ground beyond, until it passes over a hole
+//! in a cave's box at or under the rim's top, where it may come out (a hole
+//! that is no cave's -- the ground left out under a building's floor -- lets
+//! nothing out: under it is the floor, not a cave's air). That is what hides the
+//! level from inside a cave, and behind a cave's mouth from outside it. It
+//! is said of the GROUND only ([`Horizon::hides_ground`]), whose triangles lie
+//! on the sheet; what may stand in a cave's air (water, a fire) is asked of
+//! the first rule alone ([`Horizon::hides`]). And only for an eye known to be
+//! in the air: over the ground, or in a cave's box -- an eye pushed into a
+//! hillside is told nothing, and sees what it saw.
+//!
 //! Held to the drawn triangles themselves, ray by ray, in this file's tests
 //! and on the shipped level in `quest_app::terrain_render`.
 
 use glam::{Vec2, Vec3};
+
+/// MEASUREMENT: how many chunks a side the client cuts the ground into, when
+/// `adb shell setprop debug.spacesoup.chunks N` asked for other than its own
+/// (read once at launch, `xr::vulkan`; 0: the client's). Finer chunks leave
+/// more out of a view and behind a hill, and are more draws.
+pub static CHUNKS_A_SIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Sectors the full turn is cut into: two degrees each.
 pub const BINS: usize = 180;
@@ -43,14 +71,24 @@ pub const BINS: usize = 180;
 /// metres. Half the distance between the eyes and some head movement.
 pub const REACH: f32 = 0.10;
 
+/// The angle, in radians, a box has to be behind the ground by to be called
+/// hidden: about two pixels of an eye's picture and one texel of its
+/// half-resolution reflection pass. A sight line can be behind a ridge's
+/// crest by the geometry and miss it by the raster -- a crest 7 cm through
+/// at 52 m is a pixel thin, and the samples of five pixels along it showed
+/// the ground beyond (offline, torch_pendant_west, 2026-10-13).
+pub const SLIVER: f32 = 4e-3;
+
 /// How near, in cells of the grid, the steps along a sight line are taken.
 const STEP_CELLS: f32 = 2.0;
 
 /// Coverage of a cell, as a share of its area, within this of one is whole.
 const WHOLE: f32 = 2e-3;
 
-/// `[lowest, highest]` of the ground over a cell; a cell that is not wholly
-/// ground is `HOLE`.
+/// `[lowest, highest]` of the ground over a cell. A cell that is not wholly
+/// ground has no lowest (`-inf`), and for its highest the top of the ground
+/// round the hole it is part of -- `inf` for a hole that reaches the grid's
+/// edge, and for anything off the grid (`HOLE`).
 type Span = [f32; 2];
 const HOLE: Span = [f32::NEG_INFINITY, f32::INFINITY];
 
@@ -159,12 +197,48 @@ impl GroundOccluder {
         }
         let whole = cell.x * cell.y;
         let mut solid_cells = 0;
-        for k in 0..n {
-            let ok = !broken[k] && (covered[k] / whole - 1.0).abs() <= WHOLE && spans[k][0].is_finite() && spans[k][1].is_finite();
-            if ok {
+        let solid: Vec<bool> = (0..n)
+            .map(|k| !broken[k] && (covered[k] / whole - 1.0).abs() <= WHOLE && spans[k][0].is_finite() && spans[k][1].is_finite())
+            .collect();
+        // EACH HOLE'S TOP: the cells that are not ground, joined by side or
+        // corner into holes, and for each the highest ground of the cells
+        // round it -- which every continuous filling of the hole stays under.
+        // A hole at the grid's edge has no top.
+        let mut seen = vec![false; n];
+        let mut stack: Vec<usize> = Vec::new();
+        let mut members: Vec<usize> = Vec::new();
+        for start in 0..n {
+            if solid[start] {
                 solid_cells += 1;
-            } else {
-                spans[k] = HOLE;
+                continue;
+            }
+            if seen[start] {
+                continue;
+            }
+            let mut top = f32::NEG_INFINITY;
+            members.clear();
+            stack.push(start);
+            seen[start] = true;
+            while let Some(k) = stack.pop() {
+                members.push(k);
+                let (ix, iz) = ((k as u32 % nx) as i64, (k as u32 / nx) as i64);
+                for (dx, dz) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                    let (jx, jz) = (ix + dx, iz + dz);
+                    if jx < 0 || jz < 0 || jx >= nx as i64 || jz >= nz as i64 {
+                        top = f32::INFINITY;
+                        continue;
+                    }
+                    let j = (jz as u32 * nx + jx as u32) as usize;
+                    if solid[j] {
+                        top = top.max(spans[j][1]);
+                    } else if !seen[j] {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+            for &k in &members {
+                spans[k] = [f32::NEG_INFINITY, top];
             }
         }
         let mut levels = vec![Level { nx, nz, spans }];
@@ -194,7 +268,10 @@ impl GroundOccluder {
     /// `lo..hi` of x and z -- `HOLE` when any of it is not ground, or lies
     /// off the grid. Never a narrower span than the truth.
     fn span(&self, lo: Vec2, hi: Vec2) -> Span {
-        let ratio = ((hi - lo) / self.cell).max_element().max(1.0);
+        // The finest level at which the box is no more than three cells across
+        // (so four a side are read at most): a coarser one calls ground high
+        // and holes near that are neither.
+        let ratio = (((hi - lo) / self.cell).max_element() / 3.0).max(1.0);
         let k = ratio.ceil() as u32;
         let level = ((32 - (k - 1).leading_zeros()) as usize).min(self.levels.len() - 1);
         let l = &self.levels[level];
@@ -215,13 +292,23 @@ impl GroundOccluder {
     }
 }
 
-/// From `from` metres on, a sight line whose slope lies between `low` and
-/// `high` has gone through the drawn ground.
-#[derive(Clone, Copy, Debug)]
+/// A range of slopes, open at both ends; `NONE` holds none.
+type Slopes = (f32, f32);
+const NONE: Slopes = (f32::INFINITY, f32::NEG_INFINITY);
+
+fn within(s: Slopes, flattest: f32, steepest: f32) -> bool {
+    flattest > s.0 && steepest < s.1
+}
+
+/// From `from` metres on (until the next stop): a sight line whose slope is in
+/// `through` has gone through the drawn ground's upper side, for good; one
+/// whose slope is in `sunk` is under the ground where the holes are plugged,
+/// and has not yet passed a hole it could come out of.
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Stop {
     from: f32,
-    low: f32,
-    high: f32,
+    through: Slopes,
+    sunk: Slopes,
 }
 
 /// The unit directions of the sectors' edges, `BINS + 1` of them from -pi.
@@ -239,14 +326,25 @@ pub struct Horizon {
     reach: f32,
     radii: Vec<f32>,
     bins: Vec<Option<Vec<Stop>>>,
+    /// Whether the holes are plugged and the eye in the air: the second rule.
+    plugged: bool,
+    /// The caves' boxes over x and z, grown by the reach and a cell: where a
+    /// hole is a mouth.
+    mouths: Vec<(Vec2, Vec2)>,
     /// Sectors walked so far, for the log.
     pub walked: u32,
 }
 
 impl Horizon {
-    pub fn new(ground: &GroundOccluder, centre: Vec3, reach: f32) -> Self {
+    /// `caves`: the WORLD boxes of the closed caves that plug this ground's
+    /// holes -- empty where a hole may be open to the rock (then only what is
+    /// behind the ground's own upper side is hidden). See the module.
+    pub fn new(ground: &GroundOccluder, centre: Vec3, reach: f32, caves: &[(Vec3, Vec3)]) -> Self {
         let (lo, hi) = ground.footprint();
         let c = Vec2::new(centre.x, centre.z);
+        // The eye in the air: over the ground it stands on, by more than its
+        // reach, or in a cave's box.
+        let plugged = Self::plugged_at(ground, centre, reach, caves);
         let far = [lo, hi, Vec2::new(lo.x, hi.y), Vec2::new(hi.x, lo.y)].iter().map(|p| p.distance(c)).fold(0.0, f32::max);
         let step = ground.cell.max_element() * STEP_CELLS;
         let grow = 1.0 + std::f32::consts::TAU / BINS as f32;
@@ -255,7 +353,27 @@ impl Horizon {
             let r = *radii.last().unwrap();
             radii.push((r + step).max(r * grow));
         }
-        Self { centre, reach, radii, bins: vec![None; BINS], walked: 0 }
+        let grow = Vec2::splat(reach + ground.cell.max_element());
+        let mouths = caves.iter().map(|(l, h)| (Vec2::new(l.x, l.z) - grow, Vec2::new(h.x, h.z) + grow)).collect();
+        Self { centre, reach, radii, bins: vec![None; BINS], plugged, mouths, walked: 0 }
+    }
+
+    /// Whether the second rule is in force: the holes plugged, the eye in the
+    /// air.
+    pub fn plugged(&self) -> bool {
+        self.plugged
+    }
+
+    /// The eye in the air where the holes are plugged: over the ground it
+    /// stands on, by more than its reach, or in a cave's box.
+    fn plugged_at(ground: &GroundOccluder, centre: Vec3, reach: f32, caves: &[(Vec3, Vec3)]) -> bool {
+        let c = Vec2::new(centre.x, centre.z);
+        // (Every eye the horizon stands for is over the cells this box
+        // touches, and the ground in them is no higher than their highest.)
+        let about = Vec2::splat(reach);
+        let over_ground = centre.y - reach > ground.span(c - about, c + about)[1];
+        let in_a_cave = caves.iter().any(|(l, h)| centre.cmpge(*l - reach).all() && centre.cmple(*h + reach).all());
+        !caves.is_empty() && (over_ground || in_a_cave)
     }
 
     pub fn centre(&self) -> Vec3 {
@@ -268,9 +386,9 @@ impl Horizon {
     }
 
     /// One sector, walked outwards. `above` is the lowest slope a sight line
-    /// may have and be known to stand above the ground somewhere behind it on
-    /// this unbroken run of ground (infinite: not known of any); a line under
-    /// the ground ahead with a slope over that has gone through it.
+    /// may have and be known to stand above the ground (its holes filled)
+    /// somewhere behind it, with no hole it could have gone into since
+    /// (infinite: not known of any).
     fn walk(&self, ground: &GroundOccluder, bin: usize) -> Vec<Stop> {
         let e = edges();
         let (d0, d1) = (e[bin], e[bin + 1]);
@@ -281,38 +399,69 @@ impl Horizon {
         let pad = Vec2::splat(self.reach + 1e-3);
         let mut stops: Vec<Stop> = Vec::new();
         let mut above = f32::INFINITY;
+        let (mut through, mut sunk) = (NONE, NONE);
         for i in 0..self.radii.len() - 1 {
             let (ra, rb) = (self.radii[i], self.radii[i + 1]);
             let p = [c + d0 * ra, c + d1 * ra, c + d0 * rb * widen, c + d1 * rb * widen];
             let lo = p[0].min(p[1]).min(p[2]).min(p[3]) - pad;
             let hi = p[0].max(p[1]).max(p[2]).max(p[3]) + pad;
             let [lowest, highest] = ground.span(lo, hi);
+            // The slope over which a line clears everything here through the
+            // whole step, and the slope over which it clears it somewhere.
+            let h = highest + self.reach - self.centre.y;
+            let clears = if h > 0.0 { if ra > 0.0 { h / ra } else { f32::INFINITY } } else { h / rb };
+            let from;
             if lowest == f32::NEG_INFINITY {
-                // A hole, or the grid's edge: what was above the ground before
-                // it is not known to be above the ground after it.
-                above = f32::INFINITY;
-                continue;
-            }
-            if i >= 1 {
-                // Under the ground somewhere in this step: at its near end
-                // when the ground is above the eye, at its far end when below.
-                let h = lowest - self.reach - self.centre.y;
-                let under = if h > 0.0 { h / ra } else { h / rb };
-                if under > above {
-                    let (low, high) = match stops.last() {
-                        Some(s) if above < s.high && under > s.low => (s.low.min(above), s.high.max(under)),
-                        Some(s) if under <= s.high => (s.low, s.high),
-                        _ => (above, under),
-                    };
-                    if stops.last().map_or(true, |s| s.low != low || s.high != high) {
-                        stops.push(Stop { from: rb, low, high });
+                // A HOLE (or the grid's edge) in the step. A line that clears
+                // its top all the way is above the filled sheet, and known to
+                // be; any other may have gone in -- and one that was under
+                // the ground may come out.
+                above = clears;
+                // (Out of a cave's mouth, or over the grid's edge; not out
+                // from under a building's floor.)
+                let a_mouth = highest == f32::INFINITY || self.mouths.iter().any(|(l, h)| lo.cmple(*h).all() && hi.cmpge(*l).all());
+                if sunk != NONE && a_mouth {
+                    sunk.0 = sunk.0.max(clears);
+                    if !(sunk.0 < sunk.1) {
+                        sunk = NONE;
                     }
                 }
+                // What a hole lets out, it lets out from its near side.
+                from = ra;
+            } else {
+                if i >= 1 {
+                    // Under the ground somewhere in this step: at its near end
+                    // when the ground is above the eye, at its far end when below.
+                    let d = lowest - self.reach - self.centre.y;
+                    let under = if d > 0.0 { d / ra } else { d / rb };
+                    if under > above {
+                        through = if through == NONE {
+                            (above, under)
+                        } else if above < through.1 && under > through.0 {
+                            (through.0.min(above), through.1.max(under))
+                        } else if under > through.1 {
+                            (above, under)
+                        } else {
+                            through
+                        };
+                    }
+                    if self.plugged {
+                        sunk = if sunk == NONE || under > sunk.0 {
+                            (f32::NEG_INFINITY, if sunk == NONE { under } else { sunk.1.max(under) })
+                        } else {
+                            sunk
+                        };
+                    }
+                }
+                // Above the ground somewhere in this step, for the steps after it.
+                let over = if h > 0.0 { h / rb } else if ra > 0.0 { h / ra } else { f32::NEG_INFINITY };
+                above = above.min(over);
+                from = rb;
             }
-            // Above the ground somewhere in this step, for the steps after it.
-            let h = highest + self.reach - self.centre.y;
-            let over = if h > 0.0 { h / rb } else if ra > 0.0 { h / ra } else { f32::NEG_INFINITY };
-            above = above.min(over);
+            let stop = Stop { from, through, sunk };
+            if stops.last().map_or(through != NONE || sunk != NONE, |s| s.through != through || s.sunk != sunk) {
+                stops.push(stop);
+            }
         }
         stops
     }
@@ -321,6 +470,19 @@ impl Horizon {
     /// for every eye this horizon covers. Never true of anything such an eye
     /// could see a point of.
     pub fn hides(&mut self, ground: &GroundOccluder, lo: Vec3, hi: Vec3) -> bool {
+        self.hidden(ground, lo, hi, false)
+    }
+
+    /// Whether the GROUND's own triangles in the WORLD box `lo..hi` are
+    /// hidden from every eye this horizon covers: behind drawn ground, or --
+    /// where the holes are plugged -- reached only by sight lines that are
+    /// under the ground. Not to be asked of anything that may stand in a
+    /// cave's air.
+    pub fn hides_ground(&mut self, ground: &GroundOccluder, lo: Vec3, hi: Vec3) -> bool {
+        self.hidden(ground, lo, hi, true)
+    }
+
+    fn hidden(&mut self, ground: &GroundOccluder, lo: Vec3, hi: Vec3, on_the_sheet: bool) -> bool {
         let c = Vec2::new(self.centre.x, self.centre.z);
         let (blo, bhi) = (Vec2::new(lo.x, lo.z), Vec2::new(hi.x, hi.z));
         let nearest = c.clamp(blo, bhi).distance(c);
@@ -332,6 +494,11 @@ impl Horizon {
         let (top, bottom) = (hi.y - self.centre.y, lo.y - self.centre.y);
         let steepest = if top >= 0.0 { top / nearest } else { top / farthest };
         let flattest = if bottom >= 0.0 { bottom / farthest } else { bottom / nearest };
+        // ... AND A SLIVER MORE either way (`SLIVER`): hidden has to mean
+        // behind ground a rasteriser draws, and a crest a pixel thin, seen
+        // edge on, is not all drawn.
+        let steepest = steepest + SLIVER * (1.0 + steepest * steepest);
+        let flattest = flattest - SLIVER * (1.0 + flattest * flattest);
         // The box's sectors: its corners' bearings about its middle's.
         let mid = (blo + bhi) * 0.5 - c;
         let bearing = mid.y.atan2(mid.x);
@@ -358,9 +525,26 @@ impl Horizon {
                 self.walked += 1;
             }
             let stops = self.bins[bin].as_ref().unwrap();
-            let hidden = stops.iter().rev().find(|s| s.from <= nearest).is_some_and(|s| steepest < s.high && flattest > s.low);
-            if !hidden {
-                return false;
+            // The stop the box's near side stands at, and every one up to
+            // its far side: what is under the ground at the near side may be
+            // let out by a hole before the far one.
+            let Some(first) = stops.iter().rposition(|s| s.from <= nearest) else { return false };
+            for (k, s) in stops[first..].iter().enumerate() {
+                if k > 0 && s.from > farthest {
+                    break;
+                }
+                let hidden = within(s.through, flattest, steepest)
+                    || (on_the_sheet
+                        && (within(s.sunk, flattest, steepest)
+                            || (s.through.0 < s.sunk.1
+                                && s.sunk.0 < s.through.1
+                                && within((s.through.0.min(s.sunk.0), s.through.1.max(s.sunk.1)), flattest, steepest))));
+                if !hidden {
+                    return false;
+                }
+                if within(s.through, flattest, steepest) {
+                    break;
+                }
             }
         }
         true
@@ -369,15 +553,17 @@ impl Horizon {
 
 /// A frame's horizon: last frame's while it stands for both eyes, else a new
 /// one from between them. `eyes` in the WORLD.
-pub fn for_eyes(held: Option<Horizon>, ground: &GroundOccluder, eyes: &[Vec3]) -> Option<Horizon> {
+pub fn for_eyes(held: Option<Horizon>, ground: &GroundOccluder, eyes: &[Vec3], caves: &[(Vec3, Vec3)]) -> Option<Horizon> {
     if eyes.is_empty() {
         return None;
     }
+    let centre = eyes.iter().copied().sum::<Vec3>() / eyes.len() as f32;
     match held {
-        Some(h) if eyes.iter().all(|e| h.covers(*e)) => Some(h),
+        // (A horizon taken with the holes plugged is not kept when they no
+        // longer are, nor the other way.)
+        Some(h) if eyes.iter().all(|e| h.covers(*e)) && h.plugged == Horizon::plugged_at(ground, h.centre, h.reach, caves) => Some(h),
         _ => {
-            let centre = eyes.iter().copied().sum::<Vec3>() / eyes.len() as f32;
-            let h = Horizon::new(ground, centre, REACH);
+            let h = Horizon::new(ground, centre, REACH, caves);
             eyes.iter().all(|e| h.covers(*e)).then_some(h)
         }
     }
@@ -440,7 +626,7 @@ pub(crate) mod tests {
 
     fn horizon(positions: &[[f32; 3]], indices: &[u32], n: u32, eye: Vec3) -> (GroundOccluder, Horizon) {
         let g = GroundOccluder::from_triangles(positions, indices, [n, n]).unwrap();
-        let h = Horizon::new(&g, eye, REACH);
+        let h = Horizon::new(&g, eye, REACH, &[]);
         (g, h)
     }
 
@@ -449,11 +635,18 @@ pub(crate) mod tests {
         let (p, i) = field(8, 1.0, |_, _| 0.0, |ix, iz| ix == 3 && iz == 4);
         let g = GroundOccluder::from_triangles(&p, &i, [8, 8]).unwrap();
         assert_eq!(g.solid_cells, 63);
-        assert_eq!(g.span(Vec2::new(3.2, 4.2), Vec2::new(3.8, 4.8)), HOLE);
+        // A hole has no lowest, and for its top the ground's round it.
+        assert_eq!(g.span(Vec2::new(3.2, 4.2), Vec2::new(3.8, 4.8)), [f32::NEG_INFINITY, 0.0]);
         assert_eq!(g.span(Vec2::new(2.2, 4.2), Vec2::new(2.8, 4.8)), [0.0, 0.0]);
-        // A box that reaches the hole, or off the grid, is not ground.
-        assert_eq!(g.span(Vec2::new(2.2, 4.2), Vec2::new(3.1, 4.8)), HOLE);
+        // A box that reaches the hole is not ground; off the grid is nothing.
+        assert_eq!(g.span(Vec2::new(2.2, 4.2), Vec2::new(3.1, 4.8)), [f32::NEG_INFINITY, 0.0]);
         assert_eq!(g.span(Vec2::new(-0.5, 1.0), Vec2::new(0.5, 2.0)), HOLE);
+        // A hole's top is the highest ground on its rim, and a hole at the
+        // grid's edge has none.
+        let (p2, i2) = field(8, 1.0, |x, _| x, |ix, iz| (ix == 3 || ix == 4) && iz == 4 || ix == 0 && iz == 0);
+        let g2 = GroundOccluder::from_triangles(&p2, &i2, [8, 8]).unwrap();
+        assert_eq!(g2.span(Vec2::new(3.2, 4.2), Vec2::new(3.8, 4.8)), [f32::NEG_INFINITY, 6.0]);
+        assert_eq!(g2.span(Vec2::new(0.2, 0.2), Vec2::new(0.8, 0.8)), HOLE);
         // One triangle of a cell is not the cell.
         let half = &i[..i.len() - 3];
         assert_eq!(GroundOccluder::from_triangles(&p, half, [8, 8]).unwrap().solid_cells, 62);
@@ -517,16 +710,16 @@ pub(crate) mod tests {
         let (p, i) = field(16, 1.0, |_, _| 0.0, |_, _| false);
         let g = GroundOccluder::from_triangles(&p, &i, [16, 16]).unwrap();
         let eyes = [Vec3::new(8.0, 1.6, 8.0), Vec3::new(8.064, 1.6, 8.0)];
-        let h = for_eyes(None, &g, &eyes).unwrap();
+        let h = for_eyes(None, &g, &eyes, &[]).unwrap();
         let centre = h.centre();
         assert!(eyes.iter().all(|e| h.covers(*e)));
         // A head that has hardly moved keeps it; one that has gets a new one.
-        let h = for_eyes(Some(h), &g, &eyes.map(|e| e + Vec3::X * 0.03)).unwrap();
+        let h = for_eyes(Some(h), &g, &eyes.map(|e| e + Vec3::X * 0.03), &[]).unwrap();
         assert_eq!(h.centre(), centre);
-        let h = for_eyes(Some(h), &g, &eyes.map(|e| e + Vec3::X * 0.2)).unwrap();
+        let h = for_eyes(Some(h), &g, &eyes.map(|e| e + Vec3::X * 0.2), &[]).unwrap();
         assert_ne!(h.centre(), centre);
         // Eyes too far apart for one horizon get none: nothing is hidden.
-        assert!(for_eyes(None, &g, &[Vec3::ZERO, Vec3::X]).is_none());
+        assert!(for_eyes(None, &g, &[Vec3::ZERO, Vec3::X], &[]).is_none());
     }
 
     /// EVERY BOX CALLED HIDDEN IS HIDDEN, RAY BY RAY: hills, pits and holes
@@ -554,7 +747,7 @@ pub(crate) mod tests {
             for _ in 0..24 {
                 let (ex, ez) = (2.0 + rnd() * 28.0, 2.0 + rnd() * 28.0);
                 let eye = Vec3::new(ex, height(ex, ez) + rnd() * 3.0 - 0.5, ez);
-                let mut h = Horizon::new(&g, eye, REACH);
+                let mut h = Horizon::new(&g, eye, REACH, &[]);
                 for _ in 0..40 {
                     let lo = Vec3::new(rnd() * 30.0, -4.0 + rnd() * 6.0, rnd() * 30.0);
                     let hi = lo + Vec3::new(0.2 + rnd() * 4.0, rnd() * 3.0, 0.2 + rnd() * 4.0);
@@ -572,5 +765,148 @@ pub(crate) mod tests {
             }
         }
         assert!(hidden * 12 > asked, "only {hidden} of {asked} boxes hidden: the test proves little");
+    }
+
+    /// The ridge with a cave through it at z = 19..21, and the cave's rock: a
+    /// closed tube two metres high joined to the ground along both mouths'
+    /// outlines (floor, walls, roof, and the brows where the ridge stands over
+    /// the roof), to be drawn from both sides. Its box too.
+    fn ridge_with_a_cave() -> ((Vec<[f32; 3]>, Vec<u32>), Vec<[Vec3; 3]>, (Vec3, Vec3)) {
+        let mouth = |ix: u32, iz: u32| {
+            let (x, z) = (ix as f32 * 0.5, iz as f32 * 0.5);
+            (19.0..21.0).contains(&z) && ((16.0..17.5).contains(&x) || (22.5..24.0).contains(&x))
+        };
+        let ground = field(80, 0.5, ridge, mouth);
+        let mut rock: Vec<[Vec3; 3]> = Vec::new();
+        let mut quad = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+            rock.push([a, b, c]);
+            rock.push([a, c, d]);
+        };
+        let v = Vec3::new;
+        quad(v(16.0, 0.0, 19.0), v(24.0, 0.0, 19.0), v(24.0, 0.0, 21.0), v(16.0, 0.0, 21.0));
+        quad(v(17.0, 2.0, 19.0), v(23.0, 2.0, 19.0), v(23.0, 2.0, 21.0), v(17.0, 2.0, 21.0));
+        for z in [19.0, 21.0] {
+            quad(v(16.0, 0.0, z), v(24.0, 0.0, z), v(23.0, 2.0, z), v(17.0, 2.0, z));
+        }
+        quad(v(17.0, 2.0, 19.0), v(17.5, 3.0, 19.0), v(17.5, 3.0, 21.0), v(17.0, 2.0, 21.0));
+        quad(v(23.0, 2.0, 19.0), v(22.5, 3.0, 19.0), v(22.5, 3.0, 21.0), v(23.0, 2.0, 21.0));
+        (ground, rock, (v(16.0, 0.0, 19.0), v(24.0, 3.0, 21.0)))
+    }
+
+    /// Whether the segment meets one of `rock`'s triangles, from either side.
+    fn meets(rock: &[[Vec3; 3]], eye: Vec3, to: Vec3) -> bool {
+        let dir = to - eye;
+        rock.iter().any(|&[a, b, c]| {
+            let n = (b - a).cross(c - a);
+            let facing = n.dot(dir);
+            if facing.abs() < 1e-12 {
+                return false;
+            }
+            let t = n.dot(a - eye) / facing;
+            if !(t > 1e-4 && t < 1.0 - 1e-4) {
+                return false;
+            }
+            let p = eye + dir * t;
+            let slack = -1e-4 * n.length();
+            let inside = |u: Vec3, w: Vec3| (w - u).cross(p - u).dot(n) >= slack * (w - u).length();
+            inside(a, b) && inside(b, c) && inside(c, a)
+        })
+    }
+
+    #[test]
+    fn from_inside_a_plugged_cave_only_its_mouths_show_the_ground() {
+        let ((p, i), _, cave) = ridge_with_a_cave();
+        let g = GroundOccluder::from_triangles(&p, &i, [80, 80]).unwrap();
+        let inside = Vec3::new(20.0, 0.8, 20.0);
+        let side = (Vec3::new(28.0, 0.0, 30.0), Vec3::new(34.0, 1.0, 36.0));
+        let ahead = (Vec3::new(26.0, 0.0, 19.5), Vec3::new(30.0, 1.0, 20.5));
+        // With the holes plugged: the ground off to the side is under the
+        // rock; the ground out of either mouth is seen.
+        let mut h = Horizon::new(&g, inside, REACH, &[cave]);
+        assert!(h.plugged());
+        assert!(h.hides_ground(&g, side.0, side.1));
+        assert!(!h.hides_ground(&g, ahead.0, ahead.1));
+        assert!(!h.hides_ground(&g, Vec3::new(8.0, 0.0, 19.5), Vec3::new(12.0, 1.0, 20.5)));
+        // ... which is said of the ground alone: what may stand in the cave's
+        // air is asked of the first rule, and that hides nothing from here.
+        assert!(!h.hides(&g, side.0, side.1));
+        // With the holes not known to be plugged, nothing is said at all.
+        let mut open = Horizon::new(&g, inside, REACH, &[]);
+        assert!(!open.plugged() && !open.hides_ground(&g, side.0, side.1));
+        // An eye pushed into the hillside, outside every cave's box, is told
+        // nothing by the second rule either.
+        let mut buried = Horizon::new(&g, Vec3::new(20.0, 3.0, 30.0), REACH, &[cave]);
+        assert!(!buried.plugged() && !buried.hides_ground(&g, side.0, side.1));
+        // From outside, looking at the mouth: the ground behind the ridge
+        // beside the cave's line is hidden, the ground through the cave is
+        // not, and neither is anything the cave's line only touches.
+        let mut out = Horizon::new(&g, Vec3::new(8.0, 1.0, 20.0), REACH, &[cave]);
+        assert!(out.plugged());
+        assert!(out.hides_ground(&g, Vec3::new(28.0, 0.0, 4.0), Vec3::new(34.0, 1.0, 10.0)));
+        assert!(!out.hides_ground(&g, Vec3::new(28.0, 0.0, 19.5), Vec3::new(30.0, 1.0, 20.5)));
+        assert!(!out.hides_ground(&g, Vec3::new(28.0, 0.0, 12.0), Vec3::new(34.0, 1.0, 20.0)));
+    }
+
+    /// NO GROUND CALLED HIDDEN UNDER THE SECOND RULE CAN BE SEEN: eyes in the
+    /// cave, outside it by both mouths and round the ridge, from a fixed
+    /// seed; of every box of ground `hides_ground` answers for, every one of
+    /// the ground's triangles in it that faces an eye within the horizon's
+    /// reach is asked of the ground's upper sides and the cave's rock, ray by
+    /// ray. And the rule does answer for ground the first rule cannot.
+    #[test]
+    fn no_ground_called_hidden_from_a_plugged_cave_can_be_seen() {
+        let ((p, i), rock, cave) = ridge_with_a_cave();
+        let g = GroundOccluder::from_triangles(&p, &i, [80, 80]).unwrap();
+        let mut seed = 0x9e37_79b9u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let tris: Vec<([Vec3; 3], Vec3)> = i
+            .chunks_exact(3)
+            .map(|t| {
+                let c = [0, 1, 2].map(|k| Vec3::from(p[t[k] as usize]));
+                (c, (c[0] + c[1] + c[2]) / 3.0)
+            })
+            .collect();
+        let (mut hidden, mut by_the_cave, mut asked, mut rays) = (0, 0, 0, 0);
+        for e in 0..60 {
+            let eye = match e % 3 {
+                // In the cave's air, clear of its rock by more than the reach.
+                0 => Vec3::new(17.6 + rnd() * 4.8, 0.2 + rnd() * 1.6, 19.2 + rnd() * 1.6),
+                // Before one mouth or the other.
+                1 => Vec3::new(if rnd() < 0.5 { 4.0 + rnd() * 11.0 } else { 25.0 + rnd() * 11.0 }, 0.4 + rnd() * 2.0, 17.0 + rnd() * 6.0),
+                _ => Vec3::new(2.0 + rnd() * 36.0, ridge(0.0, 0.0) + 9.0 * rnd() + 8.2 * (rnd() < 0.3) as u8 as f32, 2.0 + rnd() * 36.0),
+            };
+            let mut h = Horizon::new(&g, eye, REACH, &[cave]);
+            if !h.plugged() {
+                continue;
+            }
+            for _ in 0..60 {
+                let lo = Vec3::new(rnd() * 36.0, -0.5, rnd() * 36.0);
+                let hi = lo + Vec3::new(0.5 + rnd() * 4.0, 0.6 + rnd() * 9.0, 0.5 + rnd() * 4.0);
+                asked += 1;
+                if !h.hides_ground(&g, lo, hi) {
+                    continue;
+                }
+                hidden += 1;
+                by_the_cave += !h.hides(&g, lo, hi) as u32;
+                for (corners, mid) in tris.iter().filter(|(_, m)| m.cmpge(lo).all() && m.cmple(hi).all()).step_by(3) {
+                    let from = eye + (Vec3::new(rnd(), rnd(), rnd()) * 2.0 - 1.0).normalize_or_zero() * REACH * rnd();
+                    let n = (corners[1] - corners[0]).cross(corners[2] - corners[0]);
+                    if n.dot(from - *mid) <= 0.0 {
+                        continue;
+                    }
+                    rays += 1;
+                    assert!(
+                        blocked(&p, &i, from, *mid) || meets(&rock, from, *mid),
+                        "the ground at {mid:?} is seen from {from:?} (box {lo:?}..{hi:?}, horizon at {eye:?})"
+                    );
+                }
+            }
+        }
+        assert!(hidden * 10 > asked && by_the_cave * 4 > hidden && rays > 2000, "{hidden} of {asked} boxes hidden, {by_the_cave} by the cave alone, {rays} rays: the test proves little");
     }
 }

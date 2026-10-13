@@ -60,8 +60,9 @@ pub(crate) const GROUND_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("minor_normal", &[("        if (w_major < 0.999 && f.biplanar > 0.5) {", "        if (false) {")]),
     // A side plane's normal at all: the top plane's everywhere.
     ("side_normal", &[("    if (f.detail_axis != 1u) {", "    if (false) {")]),
-    // Wet sand.
-    ("wet", &[("    albedo = albedo * (1.0 - 0.45 * (1.0 - smoothstep(mat.wet_line, mat.wet_line + mat.wet_band, in.tex_pos.y)));\n", "")]),
+    // The ground under still water, soaked (the dry shaders only: the
+    // weather's twins read it from the map).
+    ("wet", &[(crate::renderer::terrain_pipeline::SEA_LINE_WGSL, "")]),
     // THE WEATHER'S PARTS (its twins only): the snow's, the rain's rings,
     // and the noise that breaks both edges.
     ("wx_snow", &[("const WX_SNOW: bool = true;", "const WX_SNOW: bool = false;")]),
@@ -84,7 +85,7 @@ pub(crate) const GROUND_CUTS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     ("wx_rings", &[("        if (at.area.x > 0.0 && at.area.y < 0.5 && s.water > 0.0) {", "        if (false) {")]),
-    ("wx_noise", &[("        fine = 0.65 * wx_noise(p.xz * 3.1) + 0.35 * wx_noise(p.xz * 9.7);", "        fine = 0.5;")]),
+    ("wx_noise", &[("    let fine = 0.65 * wx_noise(p.xz * 3.1) + 0.35 * wx_noise(p.xz * 9.7);", "    let fine = 0.5;")]),
 ];
 
 /// The shaders the cuts are measured on, by label: the readers as the frames
@@ -164,7 +165,7 @@ mod tests {
         for (base, _, weathered, src) in ground_cut_bases() {
             for (cut, edits) in GROUND_CUTS {
                 let applies = with_cut(&src, edits);
-                let expected = !(cut.starts_with("wx_") || cut.ends_with("less")) || weathered;
+                let expected = if *cut == "wet" { !weathered } else { !(cut.starts_with("wx_") || cut.ends_with("less")) || weathered };
                 assert_eq!(applies.is_some(), expected, "cut {cut} on {base}");
                 if let Some(s) = applies {
                     let module = naga::front::wgsl::parse_str(&s).unwrap_or_else(|e| panic!("{base}/{cut}: {}", e.emit_to_string(&s)));

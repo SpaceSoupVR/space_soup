@@ -263,9 +263,12 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
             let slope_deg = n.y.clamp(-1.0, 1.0).acos().to_degrees();
             let w = layer_weights(inputs.settings, inputs.splat, uv, y, slope_deg);
             let albedo = means[0] * w[0] + means[1] * w[1] + means[2] * w[2] + means[3] * w[3];
-            // Wet sand, as the terrain shader darkens it.
+            // Under still water, soaked, as the terrain shader has it
+            // (`terrain_pipeline::SEA_LINE_WGSL`). The wash above it moves,
+            // and this map is made once: a beach is here as it is dry.
             let s = inputs.settings;
-            let albedo = albedo * (1.0 - 0.45 * (1.0 - smoothstep(s.wet_line, s.wet_line + s.wet_band, y)));
+            let soaked = (0..4).map(|k| w[k] * s.porosity[k]).sum::<f32>() * ((s.sea_line - y) * 20.0).clamp(0.0, 1.0);
+            let albedo = albedo + (albedo.map(crate::renderer::weather::wet_albedo) - albedo) * soaked;
             let (sky_vis, sun_vis, under_a_floor) = sky_and_sun(inputs.sky_occlusion, uv);
             buried.push(under_a_floor);
             let e = inputs.sky.evaluate([n.x, n.y, n.z]);
