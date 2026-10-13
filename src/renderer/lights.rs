@@ -1007,6 +1007,10 @@ pub struct LightsBlockOptions {
     /// pixel, rather than from the normal it shades with. See
     /// `spot_long_step`.
     pub long_step_from_plane: bool,
+    /// A surface in no room and no doorway reflects the outdoors from where
+    /// it lies when the frame says so (`ProbeUpload::open_ground`), instead
+    /// of nothing: the ground's shaders. See `PROBE_OPEN_GROUND`.
+    pub open_fallback: bool,
 }
 
 /// HOW MANY OF THE PROBE PASS'S OWN PIXELS A REFLECTED EDGE IS SOFTENED
@@ -1032,7 +1036,21 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
         card_tests_filtered,
         card_relit,
         long_step_from_plane,
+        open_fallback,
     } = options;
+    // Written only where asked for, so every other shader keeps its code
+    // exactly. OPEN GROUND, per pixel: what `PROBE_OPEN_GROUND` says of a whole
+    // draw. A surface in no room that no doorway holds starts no trace -- and,
+    // with `portal_params.y` under 0 (`ProbeUpload::open_ground`), is out of
+    // doors already, as a surface in the outdoor volume is: escaped where it
+    // lies, to be coloured by `probe_escape_colour` like any ray that left the
+    // rooms. So the full pass draws ground that straddles the baked volume's
+    // edge as the open-ground twin draws ground past it.
+    let open_fallback_code = if open_fallback {
+        "            if (camera.portal_params.y < -0.5) {\n                hit.pos = world_pos;\n                hit.found = true;\n                hit.escaped = true;\n                return hit;\n            }\n"
+    } else {
+        ""
+    };
     // Written as asked, so every shader that sets no plane keeps its code
     // exactly. See `spot_long_step`.
     let spot_long_step_fn = if long_step_from_plane {
@@ -2072,6 +2090,20 @@ const PROBE_ALL_OUTDOORS: bool = false;
 // That is most of this level's ground: the baked outdoor volume is the box
 // round the buildings, and the hills, the beach and the cave lie outside it.
 const PROBE_NOWHERE: bool = false;
+// OPEN GROUND, by the caller's word: every texel of the draw is NOWHERE as
+// above -- in no photograph's box, beyond every doorway -- and reflects what
+// lies out of doors all the same: the ground map's trace, the buildings'
+// outsides, the sky (`probe_escape_colour`), which is what ground inside the
+// baked outdoor volume shows and needs nothing of that volume (the ground map
+// and the buildings' boxes cover the level; no photograph is read). Until
+// 2026-10-13 such ground reflected nothing -- a puddle on the far lawn showed
+// the sky's flat light where its neighbour inside the volume mirrored the
+// hills. Too rough to trace, it still answers nothing: the volume's
+// photographs, which rough ground inside it blends, are not this ground's.
+// A constant, so the ground's twin for it (`terrain_pipeline::open_pass_shader`,
+// `Levers::open_reflections`) has the outdoor answer and none of the rooms'
+// machinery. NOT the full pass's picture: more than it.
+const PROBE_OPEN_GROUND: bool = false;
 // A MODEL CARD'S TRUST, FILTERED: each of the four texels round the point
 // tested on its own and the verdicts blended, as percentage-closer filtering
 // blends a shadow map's -- where one test on blended texels averaged a facing
@@ -3368,6 +3400,21 @@ fn probe_environment(
     // (`cur + 1.0 == camera.portal_params.z`, at t = 0), nothing is deferred,
     // and `probe_traced_colour` colours the escape and adds its 0 to the reach.
     // The same expressions as below, so the same values.
+    if (PROBE_OPEN_GROUND) {{
+        // The outdoor answer from the surface itself, as `PROBE_ALL_OUTDOORS`
+        // has it below for ground smooth enough to trace; nothing for the rest,
+        // as `PROBE_NOWHERE`. (Names of its own: the passes' cuts find the
+        // lines below by their text, once.)
+        probe_eye_distance = distance(cam_pos(), frag_pos);
+        if (roughness > PROBE_TRACE_MAX_ROUGHNESS) {{
+            let unlit = vec4<f32>(0.0);
+            return unlit;
+        }}
+        let open_dir = normalize(world_dir);
+        let open_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);
+        let open_col = probe_escape_colour(world_pos, open_dir, dir, roughness, open_lod);
+        return open_col;
+    }}
     if (PROBE_NOWHERE) {{
         // As the code below leaves them when it finds nothing: the brightness
         // 0 (set above), the reach untouched, the eye's distance set.
@@ -4422,7 +4469,7 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
         // reflection around every doorway (headset, 2026-09-26).
         let p = probe_portal_holding(world_pos);
         if (p < 0) {{
-            return hit;
+{open_fallback_code}            return hit;
         }}
         let axis = i32(camera.probe_portals[p * 3].w);
         let plo = camera.probe_portals[p * 3].xyz;

@@ -17,6 +17,7 @@ use crate::renderer::{
 use crate::xr::{VkContext, XrContext};
 use std::collections::HashMap;
 
+mod ground_build;
 mod render_frame;
 mod time_of_day;
 mod vulkan_interop;
@@ -544,6 +545,10 @@ pub struct XrRenderer {
     /// (`outdoor_pass::NowhereFrame`, `Levers::nowhere_pass`). `None` when the
     /// shader's switch or the weather's edits moved (logged).
     terrain_nowhere_passes: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 2]>,
+    /// `[dry, weather]`: the pass's open-ground twins, for the same chunks,
+    /// reflecting the outdoors (`terrain_pipeline::open_pass_shader`,
+    /// `Levers::open_reflections`). `None` when the shader's switch moved.
+    terrain_open_passes: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 2]>,
     terrain_sun_baked: bool,
     /// MEASUREMENT: the ground's reader, probe pass and poolless pass with
     /// their layer reads inlined, drawn in the shipped ones' place while
@@ -591,6 +596,8 @@ pub struct XrRenderer {
     /// for the reflection pass. `None` when a twin no longer matches the cave
     /// shader (logged): the cave is then drawn as shipped. See `cave_twins`.
     cave_twins: Option<crate::renderer::cave_twins::CaveTwins>,
+    /// What a baked distance-field cave is drawn with. See `baked_cave`.
+    baked_cave_pipelines: crate::renderer::baked_cave::BakedCavePipelines,
     // The material is per-scene, but it is built here with the fallback so
     // terrain renders through the real pipeline before any textures exist.
     // Replaced via `set_terrain_material` when a scene authors its own.
@@ -1196,57 +1203,23 @@ impl XrRenderer {
         let probe_blur_groups: [Option<wgpu::BindGroup>; 2] = std::array::from_fn(|eye| {
             probe_blur.bind_group(&wgpu_device, &probe_pass_targets[eye])
         });
-        let terrain_probe_pass_pipeline =
-            crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass(&wgpu_device, &uniform_buf.layout, &probe_fixups);
         let brush_probe_pass_poolless_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass_deferred_poolless(
             &wgpu_device, &uniform_buf.layout, &probe_fixups,
         );
-        let terrain_probe_pass_poolless_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass_poolless(
-            &wgpu_device, &uniform_buf.layout, &probe_fixups,
-        );
-        let terrain_dedup_passes = crate::renderer::ground_twins::dedup_passes(&wgpu_device, &uniform_buf.layout, &probe_fixups, None);
-        let terrain_outdoor_passes = {
-            let weather_layout = crate::renderer::weather::bind_group_layout(&wgpu_device);
-            let twin = |weather| {
-                crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass_outdoors(
-                    &wgpu_device, &uniform_buf.layout, &probe_fixups, weather,
-                )
-            };
-            twin(None).zip(twin(Some(&weather_layout))).map(|(plain, wet)| [plain, wet])
-        };
-        if terrain_outdoor_passes.is_none() {
-            log::warn!("terrain: the probe pass's outdoor twin no longer matches its shader; the ground draws by the full pass");
-        }
-        let terrain_nowhere_passes = {
-            let weather_layout = crate::renderer::weather::bind_group_layout(&wgpu_device);
-            let twin = |weather| {
-                crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_pass_nowhere(
-                    &wgpu_device, &uniform_buf.layout, &probe_fixups, weather,
-                )
-            };
-            twin(None).zip(twin(Some(&weather_layout))).map(|(plain, wet)| [plain, wet])
-        };
-        if terrain_nowhere_passes.is_none() {
-            log::warn!("terrain: the probe pass's nowhere twin no longer matches its shader; the ground draws by the full pass");
-        }
-        if terrain_dedup_passes.is_none() {
-            log::warn!("terrain: the probe pass's dedup edits no longer match; it draws as it was");
-        }
-        let terrain_probe_reader_pipeline = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_reader(
-            &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
-        );
-        let terrain_reader_twins = crate::renderer::terrain_pipeline::TerrainPipeline::new_probe_reader_twins(
-            &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout,
-        );
-        let terrain_gentle = crate::renderer::ground_twins::gentle_readers(
-            &wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, None,
-        );
-        let terrain_steep = terrain_gentle.as_ref().and_then(|_| {
-            crate::renderer::ground_twins::steep_readers(&wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout)
-        });
-        if terrain_gentle.is_none() {
-            log::warn!("terrain: the ground's steep tests are not where its gentle twins take them out; the full readers draw everywhere");
-        }
+        // THE GROUND'S PIPELINES, as a set: built again when a level's ground
+        // is not what this build assumed. See `ground_build`.
+        let ground_build::GroundSet {
+            pass: terrain_probe_pass_pipeline,
+            pass_poolless: terrain_probe_pass_poolless_pipeline,
+            dedup_passes: terrain_dedup_passes,
+            outdoor_passes: terrain_outdoor_passes,
+            nowhere_passes: terrain_nowhere_passes,
+            open_passes: terrain_open_passes,
+            reader: terrain_probe_reader_pipeline,
+            reader_twins: terrain_reader_twins,
+            gentle: terrain_gentle,
+            steep: terrain_steep,
+        } = ground_build::GroundSet::build(&wgpu_device, wgpu_format, &uniform_buf.layout, samples, &probe_pass_layout, &probe_fixups);
         if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
             crate::renderer::brush_pipeline::BrushPipeline::log_deferred_register_cuts(
                 &wgpu_device, &uniform_buf.layout, &probe_fixups,
@@ -1496,6 +1469,18 @@ impl XrRenderer {
         };
         let can_multiview = can_multiview && stereo_pipelines.is_some();
 
+        // After the stereo scope: its two-eye twins are built only where the
+        // scene's own were accepted.
+        let baked_cave_pipelines = crate::renderer::baked_cave::BakedCavePipelines::new(
+            &wgpu_device,
+            wgpu_format,
+            &uniform_buf.layout,
+            &terrain_pipeline.material_layout,
+            &mesh_pipeline.lightmap_layout,
+            samples,
+            can_multiview,
+        );
+
         // Both eyes' half-resolution probe pass, in a scope of its own. See
         // `StereoProbePass`.
         let stereo_probe = if can_multiview {
@@ -1731,6 +1716,7 @@ impl XrRenderer {
             terrain_dedup_passes,
             terrain_outdoor_passes,
             terrain_nowhere_passes,
+            terrain_open_passes,
             terrain_sun_baked: false,
             terrain_inlined: None,
             weather: None,
@@ -1765,6 +1751,7 @@ impl XrRenderer {
             layered_mesh_pipeline,
             layered_mesh_mirror_pipeline,
             cave_twins,
+            baked_cave_pipelines,
             terrain_material,
             terrain_layers: vec![None, None, None, None],
             terrain_normals: vec![None, None, None, None],
@@ -2307,10 +2294,13 @@ impl XrRenderer {
 
     /// Whether this frame draws the ground's gentle triangles with its slope
     /// twins: not while a measurement lever draws a ground reader of its own.
+    /// But under `opt_frame_was`, the control of the sample frame: the twins
+    /// stay, and only the triangles with both kinds of pixel -- the one
+    /// reader the frame changed -- draw as they did (`shader_opt::frame_was`).
     fn slope_twins_on(&self) -> bool {
         self.levers.slope_twins
             && self.terrain_inlined.is_none()
-            && self.reader_edits.is_none()
+            && self.reader_edits.as_ref().map_or(true, |(edit, _, _)| edit == "opt_frame_was")
             && self.scene_cut_pipeline.is_none()
             && self.levers.terrain_reader.as_deref() != Some("full")
     }
@@ -2788,7 +2778,8 @@ impl XrRenderer {
         let device = &self.wgpu_device;
         let layout = weather::bind_group_layout(device);
         let probe_layout = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(device);
-        let twins = crate::renderer::terrain_pipeline::TerrainPipeline::new_weather_twins(
+        // The ground's weather pipelines. See `ground_build::weather_ground`.
+        let (twins, gentle, dedup_passes) = ground_build::weather_ground(
             device,
             wgpu::TextureFormat::Rgba8UnormSrgb,
             &self.uniform_buf.layout,
@@ -2808,25 +2799,6 @@ impl XrRenderer {
         );
         let maps = weather::WeatherMaps::new(device, &layout, texels);
         chunks.sort_unstable();
-        // The gentle readers' twins, by what the ground holds. See `ground_twins`.
-        let gentle: Vec<[crate::renderer::terrain_pipeline::TerrainPipeline; 4]> = weather::WeatherKinds::ALL
-            .iter()
-            .map_while(|kinds| {
-                crate::renderer::ground_twins::gentle_readers(
-                    device,
-                    wgpu::TextureFormat::Rgba8UnormSrgb,
-                    &self.uniform_buf.layout,
-                    self.msaa.samples(),
-                    &probe_layout,
-                    Some((&layout, *kinds)),
-                )
-            })
-            .collect();
-        if gentle.len() != weather::WeatherKinds::ALL.len() {
-            log::warn!("WEATHER: the ground's gentle weather twins did not build; its full ones draw everywhere");
-        }
-        let gentle = if gentle.len() == weather::WeatherKinds::ALL.len() { gentle } else { Vec::new() };
-        let dedup_passes = crate::renderer::ground_twins::dedup_passes(device, &self.uniform_buf.layout, &self.probe_fixups, Some(&layout));
         log::info!("WEATHER: {} area(s), {} terrain chunk(s) take the weather twins", texels.len(), chunks.len());
         self.weather = Some(weather::WeatherScene {
             layout,
@@ -3032,6 +3004,8 @@ impl XrRenderer {
             height: s.height,
             rgba: s.rgba.clone(),
         });
+        // The ground's pipelines for this level's ground. See `ground_build`.
+        self.ground_for_level();
         self.rebuild_terrain_material();
     }
 

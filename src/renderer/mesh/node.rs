@@ -138,6 +138,32 @@ pub(crate) fn collect_node(
                 Vec::new()
             };
 
+            // A BAKED CAVE (`baked_cave`): the file says so, and carries its
+            // layer weights and what the bake measured in COLOR_0 and COLOR_1.
+            let baked_cave_meta = mesh
+                .extras()
+                .as_ref()
+                .and_then(|raw| crate::renderer::baked_cave::BakedCaveMeta::parse(raw.get()));
+            let baked_cave_colours: Option<(Vec<[u8; 4]>, Vec<[u8; 4]>)> = baked_cave_meta.as_ref().and_then(|_| {
+                let c0: Vec<[u8; 4]> = reader.read_colors(0)?.into_rgba_u8().collect();
+                let c1: Vec<[u8; 4]> = reader.read_colors(1).map(|c| c.into_rgba_u8().collect()).unwrap_or_default();
+                Some((c0, c1))
+            });
+            // And where it meets the ground: the terrain footprint's uv
+            // (TEXCOORD_2) and the ground's share of its lighting (COLOR_2's
+            // red). A file without them takes none of the ground's.
+            let baked_cave_ground: (Vec<[f32; 2]>, Vec<[u8; 4]>) = if baked_cave_colours.is_some() {
+                (
+                    reader.read_tex_coords(2).map(|t| t.into_f32().collect()).unwrap_or_default(),
+                    reader.read_colors(2).map(|c| c.into_rgba_u8().collect()).unwrap_or_default(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            // Its TEXCOORD_1 IS the lightmap's layout: nothing is generated
+            // for it, and nothing is split.
+            let lightmap = if baked_cave_colours.is_some() { None } else { lightmap };
+
             // The material's emissive colour, as the ARTIST authored it.
             //
             // This is what makes a lamp read correctly: the bulb's material is
@@ -287,6 +313,27 @@ pub(crate) fn collect_node(
                     Some((layered, by_class)) => (Some(layered), by_class),
                     None => (None, indices),
                 };
+                let baked_cave = baked_cave_meta.as_ref().zip(baked_cave_colours.as_ref()).map(|(meta, (c0, c1))| {
+                    let cv: Vec<crate::renderer::baked_cave::BakedCaveVertex> = (0..positions.len())
+                        .map(|i| {
+                            crate::renderer::baked_cave::BakedCaveVertex::from_file(
+                                positions[i].into(),
+                                normals.get(i).copied().unwrap_or(Vec3::Y).into(),
+                                uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                                uv2s.get(i).copied().unwrap_or([0.0, 0.0]),
+                                // A short COLOR_0: layer 1 (rock), as the shader reads no weights.
+                                c0.get(i).copied().unwrap_or([0, 255, 0, 1 << 6]),
+                                // A file without COLOR_1: the whole sky and sun, dry, clean.
+                                c1.get(i).copied().unwrap_or([255, 255, 0, 0]),
+                                (
+                                    baked_cave_ground.0.get(i).copied().unwrap_or([0.0, 0.0]),
+                                    baked_cave_ground.1.get(i).map_or(0, |c| c[0]),
+                                ),
+                            )
+                        })
+                        .collect();
+                    crate::renderer::baked_cave::BakedCavePrimitive::new(device, cv, indices.len() as u32, meta)
+                });
                 let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("mesh_ib"),
                     contents: bytemuck::cast_slice(&indices),
@@ -310,7 +357,7 @@ pub(crate) fn collect_node(
                     || prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0) > 0.0;
                 // See `thin_parts`. Not for a cave (drawn by the layered
                 // pipeline) nor glass (drawn see-through, after the thin pass).
-                let thin = if layered.is_none() && !blended {
+                let thin = if layered.is_none() && baked_cave.is_none() && !blended {
                     super::thin_parts::split_thin_parts(&vertices, &indices)
                         .map(|split| super::thin_parts::ThinParts::upload(device, &split))
                 } else {
@@ -323,6 +370,7 @@ pub(crate) fn collect_node(
                     vertex_buffer,
                     index_buffer,
                     layered,
+                    baked_cave,
                     casts_shadow,
                     blended,
                     thin,

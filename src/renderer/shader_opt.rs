@@ -233,53 +233,47 @@ fn axis_select(src: &str) -> Option<String> {
     every(&s, "let b = (axis + 2) % 3;", "let b = select(axis + 2, axis - 1, axis >= 1);")
 }
 
-/// THE GROUND'S TEXTURE GRADIENTS FROM ONE PAIR OF VECTORS. The sample frame
-/// carries a uv and its two screen gradients for each of four projections --
-/// top-down, the cliff's major and minor planes, the detail maps' -- 24 floats
-/// held across the layer loop, and that is the ground reader's register peak
-/// (27 registers where steep and gentle ground share a triangle, 24 on a
-/// cliff: 37% and 50% of the waves in flight, against 62% at 18). Every one of
-/// those gradients is two components of the world position's own gradient,
-/// chosen by the plane's axis. So: the position's two gradients (6 floats) and
-/// the axes, and each read picks its components -- 16 floats fewer held.
+/// THE GROUND'S SAMPLE FRAME AS IT WAS before 2026-10-13: the top-down plane,
+/// the cliff's major plane and the detail maps' plane each held with its two
+/// gradients, where the shipped frame holds the one a pixel reads
+/// (`terrain_pipeline`'s `SampleFrame`). THE CONTROL the shipped frame is
+/// measured against, and the same picture: every read takes the same values.
+/// Listed `Near` only so that `opt_all` leaves it out.
 ///
-/// NEAR, NOT SAME: where the four pixels of a quad agree on a plane's axis the
-/// values are the same. Where they do not -- along the line a cliff's major
-/// plane switches -- the shipped gradient is the difference of two unrelated
-/// uvs, a huge one (the coarsest mip, a blurred line); this takes each pixel's
-/// own plane's, which is the gradient the read wanted. To be looked at.
-fn frame_dw(src: &str) -> Option<String> {
-    let mut s = once(
-        src,
-        "    planar_ddx: vec2<f32>,\n    planar_ddy: vec2<f32>,\n",
-        "    dwdx: vec3<f32>,\n    dwdy: vec3<f32>,\n    major_axis: u32,\n",
-    )?;
+/// (`frame_dw`, round 6's candidate here -- every gradient picked from the
+/// world position's two -- left the readers at 24 and 27 registers and is
+/// gone: the compiler hoisted its picks out of the layer loop, so as much was
+/// held as before.)
+fn frame_was(src: &str) -> Option<String> {
+    let mut s = src.to_string();
     for (from, to) in [
-        ("    major_ddx: vec2<f32>,\n    major_ddy: vec2<f32>,\n", ""),
-        ("    minor_ddx: vec2<f32>,\n    minor_ddy: vec2<f32>,\n", ""),
-        ("    detail_ddx: vec2<f32>,\n    detail_ddy: vec2<f32>,\n", ""),
-        ("    f.planar_ddx = dpdx(world.xz);\n    f.planar_ddy = dpdy(world.xz);\n", "    f.dwdx = dpdx(world);\n    f.dwdy = dpdy(world);\n"),
-        ("    f.major_ddx = dpdx(b.uv_major);\n    f.major_ddy = dpdy(b.uv_major);\n", "    f.major_axis = b.axis_major;\n"),
-        ("    f.minor_ddx = dpdx(b.uv_minor);\n    f.minor_ddy = dpdy(b.uv_minor);\n", ""),
-        ("    f.detail_ddx  = select(f.planar_ddx, f.major_ddx, steep);\n    f.detail_ddy  = select(f.planar_ddy, f.major_ddy, steep);\n", ""),
         (
-            "fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> SampleFrame {\n",
-            "fn frame_plane(axis: u32, w: vec3<f32>) -> vec2<f32> {\n    return select(select(w.xy, w.xz, axis == 1u), w.zy, axis == 0u);\n}\n\nfn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> SampleFrame {\n",
+            "struct SampleFrame {\n",
+            "struct SampleFrame {\n    planar_uv: vec2<f32>,\n    planar_ddx: vec2<f32>,\n    planar_ddy: vec2<f32>,\n    major_uv: vec2<f32>,\n    major_ddx: vec2<f32>,\n    major_ddy: vec2<f32>,\n",
+        ),
+        (
+            "    let planar_uv  = world.xz;\n    let planar_ddx = dpdx(world.xz);\n    let planar_ddy = dpdy(world.xz);\n",
+            "    f.planar_uv  = world.xz;\n    f.planar_ddx = dpdx(world.xz);\n    f.planar_ddy = dpdy(world.xz);\n",
+        ),
+        (
+            "    let major_ddx = dpdx(b.uv_major);\n    let major_ddy = dpdy(b.uv_major);\n",
+            "    f.major_uv  = b.uv_major;\n    f.major_ddx = dpdx(b.uv_major);\n    f.major_ddy = dpdy(b.uv_major);\n",
+        ),
+        (
+            "    f.detail_uv   = select(planar_uv, b.uv_major, steep);\n    f.detail_ddx  = select(planar_ddx, major_ddx, steep);\n    f.detail_ddy  = select(planar_ddy, major_ddy, steep);\n",
+            "    f.detail_uv   = select(f.planar_uv, f.major_uv, steep);\n    f.detail_ddx  = select(f.planar_ddx, f.major_ddx, steep);\n    f.detail_ddy  = select(f.planar_ddy, f.major_ddy, steep);\n",
+        ),
+        ("    f.minor_uv  = f.minor_uv + warp;\n", "    f.major_uv  = f.major_uv + warp;\n    f.minor_uv  = f.minor_uv + warp;\n"),
+        (
+            "    let c_face = textureSampleGrad(layer_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r).rgb;\n    if (f.biplanar < 0.5) {\n        return c_face;\n    }\n",
+            "    if (f.biplanar < 0.5) {\n        return textureSampleGrad(\n            layer_tex, layer_samp, f.planar_uv / r, layer,\n            f.planar_ddx / r, f.planar_ddy / r,\n        ).rgb;\n    }\n",
+        ),
+        (
+            "    let c_major = mix(\n        c_face,\n        textureSampleGrad(\n            layer_tex, layer_samp, rot * f.detail_uv * s2 + vec2<f32>(0.37, 0.11), layer,\n            rot * f.detail_ddx * s2, rot * f.detail_ddy * s2,\n        ).rgb,\n",
+            "    let c_major = mix(\n        textureSampleGrad(layer_tex, layer_samp, f.major_uv / r, layer, f.major_ddx / r, f.major_ddy / r).rgb,\n        textureSampleGrad(\n            layer_tex, layer_samp, rot * f.major_uv * s2 + vec2<f32>(0.37, 0.11), layer,\n            rot * f.major_ddx * s2, rot * f.major_ddy * s2,\n        ).rgb,\n",
         ),
     ] {
         s = once(&s, from, to)?;
-    }
-    for (from, to) in [
-        ("f.planar_ddx", "f.dwdx.xz"),
-        ("f.planar_ddy", "f.dwdy.xz"),
-        ("f.major_ddx", "frame_plane(f.major_axis, f.dwdx)"),
-        ("f.major_ddy", "frame_plane(f.major_axis, f.dwdy)"),
-        ("f.minor_ddx", "frame_plane(f.minor_axis, f.dwdx)"),
-        ("f.minor_ddy", "frame_plane(f.minor_axis, f.dwdy)"),
-        ("f.detail_ddx", "frame_plane(f.detail_axis, f.dwdx)"),
-        ("f.detail_ddy", "frame_plane(f.detail_axis, f.dwdy)"),
-    ] {
-        s = every(&s, from, to)?;
     }
     Some(s)
 }
@@ -300,7 +294,7 @@ pub(crate) const OPTS: &[Opt] = &[
     Opt { label: "expand_once", picture: Picture::Same, edit: expand_once },
     Opt { label: "face_shift", picture: Picture::Same, edit: face_shift },
     Opt { label: "axis_select", picture: Picture::Same, edit: axis_select },
-    Opt { label: "frame_dw", picture: Picture::Near, edit: frame_dw },
+    Opt { label: "frame_was", picture: Picture::Near, edit: frame_was },
 ];
 
 /// The label of every same-picture candidate at once, for `Levers::reader_edit`.
@@ -472,10 +466,10 @@ mod tests {
         }
         let (_, src) = &all_bases()[0];
         assert!(edit_named(src, "opt_yaw_probe").is_none());
-        // A near-picture candidate by its own name only.
+        // A near-picture candidate, and the frame's control, by its own name only.
         let ground = &ground_bases().into_iter().find(|b| b.0 == "gread").unwrap().3;
-        assert!(edit_named(ground, "opt_frame_dw").is_some_and(|s| s != *ground));
-        assert!(!edit_named(ground, OPT_ALL).unwrap().contains("frame_plane"));
+        assert!(edit_named(ground, "opt_frame_was").is_some_and(|s| s != *ground));
+        assert!(!edit_named(ground, OPT_ALL).unwrap().contains("planar_uv: vec2<f32>"));
         assert!(edit_named(src, "opt_no_such").is_none());
         assert!(edit_named(src, "sky_walked").is_none());
     }

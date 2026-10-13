@@ -319,9 +319,10 @@ pub struct Levers {
     /// (`docs/shader-optimization-2026-10-12.md`). The same picture: the GPU
     /// clipped them.
     ///
-    /// OFF UNTIL MEASURED ON THE HEADSET (built 2026-10-12 with the headset
-    /// out of reach; `docs/bench/shader_opt_1012/round6.sh` is the run that
-    /// decides it).
+    /// ON since 2026-10-13 (rounds 6 and 7, `docs/bench/shader_opt_1012`):
+    /// -0.02 to -1.01 ms in 18 of 20 views, 0 wgpu errors. outdoors_field
+    /// read +0.28 twice with every model culled and nothing else changed:
+    /// see docs/shader-optimization-2026-10-12.md for where that goes.
     pub scene_cull: bool,
     /// The reflection pass draws the ground that is all out of doors -- in the
     /// outdoor volume, clear of every room and of every doorway's fades --
@@ -329,7 +330,8 @@ pub struct Levers {
     /// the rooms' machinery (`outdoor_pass`). Off draws all of the ground
     /// with the full pass. The same picture.
     ///
-    /// OFF UNTIL MEASURED ON THE HEADSET, as `scene_cull`.
+    /// ON since 2026-10-13 (round 8) with `ground_classes`, which is what
+    /// lets it reach this level's ground: by whole chunks it drew 1 of 64.
     pub outdoor_pass: bool,
     /// The reflection pass draws the ground that lies in no photograph's box
     /// and beyond every doorway's reach -- most of a level whose outdoor
@@ -338,8 +340,88 @@ pub struct Levers {
     /// its searching (`outdoor_pass::NowhereFrame`). Off draws that ground
     /// with the full pass. The same picture.
     ///
-    /// OFF UNTIL MEASURED ON THE HEADSET, as `scene_cull`.
+    /// ON since 2026-10-13 (round 7): -0.2 to -5.0 ms in the 11 views that
+    /// look at such ground (cave_back_out 35.5 -> 30.5, cave_mouth 25.2 ->
+    /// 21.7, under_cove 16.4 -> 14.2, beach_south 19.7 -> 17.8), nothing over
+    /// the noise elsewhere, 0 wgpu errors.
     pub nowhere_pass: bool,
+    /// OPEN GROUND REFLECTS THE OUTDOORS: the ground the nowhere twin would
+    /// draw -- beyond the baked outdoor volume, where the reflection lookup
+    /// finds nothing -- is drawn by the pass's open-ground twin instead, and
+    /// where it is smooth enough to trace (a puddle, wet sand) mirrors the
+    /// ground, the buildings' outsides and the sky, as ground inside the
+    /// volume does (`PROBE_OPEN_GROUND`, `terrain_pipeline::open_pass_shader`).
+    /// Off, that ground reflects nothing, as it did until 2026-10-13: by the
+    /// nowhere twin under `nowhere_pass`, else by the full pass. NOT the same
+    /// picture: reflections where there were none.
+    ///
+    /// OFF, JUDGED 2026-10-13 (round 8; docs/shader-optimization-2026-10-12.md,
+    /// "Open ground"): it costs 0.3 to 3.2 ms over the nowhere twin where the
+    /// view is such ground (rain_puddles_down +3.2, cave_back_out +2.6,
+    /// snow_hills +1.8, beach_south +1.6, cave_mouth +1.5), and beside far
+    /// puddles that now mirror the hills it puts a pale sky sheen on every
+    /// cliff -- a change of look for the user to choose, not a correction.
+    /// One line turns it on: this default, or `"open_reflections": true` in
+    /// the lever file.
+    pub open_reflections: bool,
+    /// The reflection pass's ground twins reach TRIANGLES, not only whole
+    /// chunks: a chunk that is neither all out of doors nor all nowhere by
+    /// its bounds -- one across the baked outdoor volume's edge, one with a
+    /// building in it -- is drawn in its triangles' classes, sorted once a
+    /// level from the level's whole probe table (`outdoor_pass::LevelGround`,
+    /// `ground_twins::SlopeSplit::classed`), each class by the twin
+    /// `outdoor_pass`, `nowhere_pass` and `open_reflections` give it. Off
+    /// draws such a chunk whole by the full pass. The same picture (offline,
+    /// against the same triangles in the same order all by the full pass:
+    /// beach_south to the byte, rain_puddles_down 3 pixels of 2.2 M by one
+    /// level, outdoors_field 521 by one to four -- rounding).
+    ///
+    /// ON since 2026-10-13 (round 8, `docs/bench/shader_opt_1012/r8`), with
+    /// `outdoor_pass`: rain_puddles_down -4.9 ms, pond -4.1, snow_hills -3.1,
+    /// outdoors_field -2.3, beach_south -1.9, torch_doorway_out -1.7,
+    /// outdoors_front -0.8, cave_back_out -0.8, shore -0.7; hall_back +0.16
+    /// (two more pipelines in its reflection pass for the ground through its
+    /// door); nothing over the 0.15 ms floor in the other ten. 0 wgpu errors.
+    pub ground_classes: bool,
+    /// The scene pass and the reflection pass draw the ground's chunks
+    /// nearest the eye first -- in the scene pass each chunk's gentle, mixed
+    /// and steep triangles together, by their own readers -- so ground hidden
+    /// behind nearer ground fails its depth test before it is shaded. Off
+    /// draws them in the order they lie in the buffer, slope class by slope
+    /// class. The same picture.
+    ///
+    /// OFF, MEASURED 2026-10-13 (round 8): -0.2 to -0.6 ms where near ground
+    /// hides far (outdoors_front, cave_mouth, rain_field, outdoors_field,
+    /// cave_back_out) and +0.2 to +0.4 where it does not (beach_south, pond,
+    /// rain_puddles_down, shore) or where no ground shows at all
+    /// (cave_chamber, cave_back_exit): the reader changes up to three times a
+    /// chunk. See `ground_near_chunks`.
+    pub ground_near_first: bool,
+    /// THE NEAREST FEW CHUNKS OF THE GROUND FIRST, the rest reader by reader:
+    /// this many of the chunks nearest the eye are drawn as
+    /// `ground_near_first` draws every chunk -- one walk, each chunk's slope
+    /// ranges by their own readers -- and the chunks beyond them reader by
+    /// reader as before, nearest first within each. The near ground is what
+    /// hides the far, and it is few chunks; walking every chunk that way
+    /// changes the reader up to three times a chunk, which the far ground's
+    /// many small chunks pay for (round 8: beach_south +0.42 ms under
+    /// `ground_near_first`, outdoors_front -0.64). 0 leaves the order alone.
+    /// Ignored under `ground_near_first`. The same picture.
+    pub ground_near_chunks: u32,
+    /// THE SCENE PASS DRAWS THE GROUND'S STEEP TRIANGLES FIRST, then those with
+    /// both kinds of pixel, then the gentle ones, where it drew mixed, gentle,
+    /// steep -- the chunks in the order they lie in the buffer either way
+    /// (nearest first only under `ground_near_chunks`). What stands up is what hides: a cliff covers the slopes behind
+    /// it, level ground covers next to nothing, so the cliff's depth goes down
+    /// before the ground behind it is shaded. Three readers bound once each,
+    /// as before -- none of `ground_near_first`'s changes of reader. The same
+    /// picture.
+    ///
+    /// ON since 2026-10-13 (rounds 9b and 9c, all 20 views): cave_back_out
+    /// -0.65 to -0.90 ms (its scene pass -0.4 an eye), cave_mouth +0.21 (there
+    /// the sand in front hides the cliff's foot, and now goes down after it),
+    /// the other 18 within 0.1. 0 wgpu errors.
+    pub ground_steep_first: bool,
     /// MEASUREMENT: the ground drawn by its full reader everywhere, with no
     /// twin (`full`), or as it was before its layer reads became one loop
     /// (`inlined`: reader and probe pass, no twin). The same picture as the
@@ -455,9 +537,14 @@ impl Default for Levers {
             draw_log: 0,
             cave_twins: true,
             cave_occluder: true,
-            scene_cull: false,
-            outdoor_pass: false,
-            nowhere_pass: false,
+            scene_cull: true,
+            outdoor_pass: true,
+            nowhere_pass: true,
+            open_reflections: false,
+            ground_classes: true,
+            ground_near_first: false,
+            ground_near_chunks: 0,
+            ground_steep_first: true,
             terrain_reader: None,
             reader_edit: None,
             gpu_sync: false,
@@ -646,14 +733,25 @@ impl Levers {
         if !self.cave_occluder {
             out.push("no_cave_occluder".to_string());
         }
-        if self.scene_cull {
-            out.push("scene_cull".to_string());
+        // Against the default, as the flags above: `x` where it is on and the
+        // default is off, `no_x` the other way, nothing where they agree -- so
+        // a default accepted later changes the token and an arm that names it
+        // (`armbench.py`) cannot take the other arm's windows for its own.
+        for (name, on, default) in [
+            ("scene_cull", self.scene_cull, d.scene_cull),
+            ("outdoor_pass", self.outdoor_pass, d.outdoor_pass),
+            ("nowhere_pass", self.nowhere_pass, d.nowhere_pass),
+            ("open_reflections", self.open_reflections, d.open_reflections),
+            ("ground_classes", self.ground_classes, d.ground_classes),
+            ("ground_near_first", self.ground_near_first, d.ground_near_first),
+            ("ground_steep_first", self.ground_steep_first, d.ground_steep_first),
+        ] {
+            if on != default {
+                out.push(if on { name.to_string() } else { format!("no_{name}") });
+            }
         }
-        if self.outdoor_pass {
-            out.push("outdoor_pass".to_string());
-        }
-        if self.nowhere_pass {
-            out.push("nowhere_pass".to_string());
+        if self.ground_near_chunks != d.ground_near_chunks {
+            out.push(format!("ground_near_chunks={}", self.ground_near_chunks));
         }
         if let Some(reader) = &self.terrain_reader {
             out.push(format!("terrain_reader={reader}"));
@@ -740,6 +838,26 @@ mod tests {
         assert!(!l.probe_trace && l.ssr == Some(true));
         assert_eq!(Levers { probe_trace: true, ssr: None, ..l.clone() }, Levers::default());
         assert_eq!(l.summary(), "no_probe_trace,ssr=on");
+    }
+
+    /// The ground's levers are named against their defaults, whichever way
+    /// those stand: an arm that names one (`armbench.py`) keeps its meaning
+    /// when a default is accepted later.
+    #[test]
+    fn the_grounds_levers_are_named_against_their_defaults() {
+        let d = Levers::default();
+        let l = Levers { scene_cull: !d.scene_cull, ground_near_first: !d.ground_near_first, ground_near_chunks: d.ground_near_chunks + 3, ..d.clone() };
+        let name = |name: &str, default: bool| if default { format!("no_{name}") } else { name.to_string() };
+        assert_eq!(
+            l.summary(),
+            format!(
+                "{},{},ground_near_chunks={}",
+                name("scene_cull", d.scene_cull),
+                name("ground_near_first", d.ground_near_first),
+                d.ground_near_chunks + 3,
+            ),
+        );
+        assert_eq!(Levers::parse(r#"{"ground_near_chunks": 4}"#).unwrap().ground_near_chunks, 4);
     }
 
     /// A clock request is named on every line measured under it, since it

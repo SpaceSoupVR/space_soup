@@ -86,6 +86,7 @@ fn push_mesh_draws<'a>(
     mesh_draws: &mut Vec<MeshDraw<'a>>,
     skinned_draws: &mut Vec<SkinnedDraw<'a>>,
     layered_draws: &mut Vec<LayeredDraw<'a>>,
+    baked_cave_draws: &mut Vec<crate::renderer::baked_cave::BakedCaveDraw<'a>>,
 ) {
     if let Some(skin) = &instance.mesh.skin {
         if let Some(joint_bg) = &skin.joint_bind_group {
@@ -115,6 +116,22 @@ fn push_mesh_draws<'a>(
                         .then_some(layered.twin_ends),
                     crate::renderer::cave_twins::placed_box(instance.mesh.model_matrix(), layered.bounds),
                 ));
+                continue;
+            }
+            // A baked cave, by its own pipeline and in its chunks (`baked_cave`).
+            if let Some(cave) = &prim.baked_cave {
+                let placed = instance.mesh.model_matrix();
+                baked_cave_draws.push(crate::renderer::baked_cave::BakedCaveDraw {
+                    model: &instance.model.bind_group,
+                    lightmap: lightmap_bg,
+                    vertices: &cave.vertex_buffer,
+                    indices: &prim.index_buffer,
+                    index_count: prim.indices.len() as u32,
+                    chunks: &cave.chunks,
+                    emissive: cave.emissive,
+                    placed,
+                    bounds: crate::renderer::cave_twins::placed_box(placed, cave.bounds),
+                });
                 continue;
             }
             mesh_draws.push(MeshDraw {
@@ -326,18 +343,38 @@ impl XrRenderer {
                 // slope twins. The same triangles in each chunk's range, so
                 // every other pass is unchanged. See `ground_twins`.
                 let threshold = self.terrain_settings.biplanar_start_deg;
+                // ... AND, WITHIN EACH SLOPE CLASS, BY WHAT THE REFLECTION PASS
+                // MAY DRAW A TRIANGLE WITH -- its outdoor twin, its nowhere
+                // twin, or the pass itself -- from the level's whole probe
+                // table, in the world's frame. See `outdoor_pass::LevelGround`.
+                let level_ground = crate::renderer::outdoor_pass::LevelGround::new(
+                    &self.probe_volumes,
+                    &self.probe_rooms,
+                    self.probe_outdoor_volume,
+                    &self.probe_portals,
+                );
                 if self.terrain_gentle.is_some()
-                    && !self.slope_split.as_ref().is_some_and(|s| s.is_for(terrain_verts, terrain_idx, terrain_chunks, threshold))
+                    && !self.slope_split.as_ref().is_some_and(|s| s.is_for(terrain_verts, terrain_idx, terrain_chunks, threshold, level_ground.key))
                 {
                     let started = std::time::Instant::now();
-                    let split = crate::renderer::ground_twins::SlopeSplit::new(terrain_verts, terrain_idx, terrain_chunks, threshold);
+                    let (offset, yaw) = (self.player.offset, self.player.yaw);
+                    let split = crate::renderer::ground_twins::SlopeSplit::classed(
+                        terrain_verts,
+                        terrain_idx,
+                        terrain_chunks,
+                        threshold,
+                        level_ground.key,
+                        &|corners| level_ground.class_of_posed(offset, yaw, corners),
+                    );
                     log::info!(
-                        "SLOPES: {:.1}% of the ground's triangles are gentle (under {:.0} degrees), {:.1}% steep (over {:.0}) over {} chunk(s), {:.1} ms",
+                        "SLOPES: {:.1}% of the ground's triangles are gentle (under {:.0} degrees), {:.1}% steep (over {:.0}) over {} chunk(s); {:.1}% out of doors, {:.1}% nowhere to the reflection pass; {:.1} ms",
                         100.0 * split.gentle_total as f64 / terrain_idx.len().max(1) as f64,
                         threshold - crate::renderer::ground_twins::GENTLE_MARGIN_DEG,
                         100.0 * split.steep_total as f64 / terrain_idx.len().max(1) as f64,
                         threshold + crate::renderer::ground_twins::GENTLE_MARGIN_DEG,
                         split.gentle.len(),
+                        100.0 * split.class_totals[crate::renderer::outdoor_pass::GROUND_OUTDOORS] as f64 / terrain_idx.len().max(1) as f64,
+                        100.0 * split.class_totals[crate::renderer::outdoor_pass::GROUND_NOWHERE] as f64 / terrain_idx.len().max(1) as f64,
                         started.elapsed().as_secs_f64() * 1000.0,
                     );
                     self.slope_split = Some(split);
@@ -701,6 +738,7 @@ impl XrRenderer {
         let mut mesh_draws: Vec<MeshDraw> = Vec::new();
         let mut skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut layered_draws: Vec<LayeredDraw> = Vec::new();
+        let mut baked_cave_draws: Vec<crate::renderer::baked_cave::BakedCaveDraw> = Vec::new();
         // Depth-pass casters. The ordinary vertex buffer even for a layered
         // mesh -- a depth pass reads position and nothing else, so a baked cave
         // casts here with no pipeline of its own.
@@ -773,6 +811,7 @@ impl XrRenderer {
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(
                 instance, lightmap_bg, &mut mesh_draws, &mut skinned_draws, &mut layered_draws,
+                &mut baked_cave_draws,
             );
             if instance.mesh.skin.is_none() {
                 let bound = crate::renderer::shadow::mesh_caster_bound(&instance.mesh);
@@ -805,6 +844,7 @@ impl XrRenderer {
 
         let mut mirror_only_skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut mirror_only_layered_draws: Vec<LayeredDraw> = Vec::new();
+        let mut mirror_only_baked_caves: Vec<crate::renderer::baked_cave::BakedCaveDraw> = Vec::new();
         for instance in mirror_only_meshes {
             // Lit as the same mesh in view would be: it is the same body. The
             // open sky this gave them made a body in the floor brighter than
@@ -831,6 +871,7 @@ impl XrRenderer {
                 &mut mirror_only_mesh_draws,
                 &mut mirror_only_skinned_draws,
                 &mut mirror_only_layered_draws,
+                &mut mirror_only_baked_caves,
             );
             // HIDDEN FROM ITS OWNER, NOT FROM THE SUN. A mirror-only mesh is
             // the player's own head: left out of their view so they do not see
@@ -1953,6 +1994,12 @@ impl XrRenderer {
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
                     }
+                    self.baked_cave_pipelines.draw_mirror(
+                        &mut pass,
+                        &self.uniform_buf.bind_group,
+                        &self.terrain_material.bind_group,
+                        baked_cave_draws.iter().chain(mirror_only_baked_caves.iter()),
+                    );
                     let all_mesh_draws = mesh_draws.iter().chain(mirror_only_mesh_draws.iter());
                     let all_skinned_draws =
                         skinned_draws.iter().chain(mirror_only_skinned_draws.iter());
@@ -2106,6 +2153,9 @@ impl XrRenderer {
                     upload.portal_count = 0;
                 }
                 upload.no_trace = !fx.probe_trace;
+                // Ground past the baked outdoor volume reflects the outdoors
+                // (`Levers::open_reflections`). See `PROBE_OPEN_GROUND`.
+                upload.open_ground = self.levers.open_reflections;
                 if !fx.reflection_proxies {
                     upload.proxy_count = 0;
                 }
@@ -2206,6 +2256,23 @@ impl XrRenderer {
             // WHETHER A TERRAIN CHUNK IS DRAWN this eye: in the view, and, from
             // inside a closed room, seen through a doorway. One rule for the
             // scene pass and the probe pass, which must draw the same ground.
+            // THE GROUND'S CHUNKS NEAREST THIS EYE FIRST (`Levers::ground_near_first`),
+            // so the ground in front has its depth down before the ground
+            // behind it is drawn and hidden pixels are never shaded: the
+            // ground's readers are the scene pass's dearest pixels, and its
+            // chunks were drawn in the order they lie in the buffer -- a cliff
+            // five metres off after every ridge behind it. The same picture:
+            // opaque, depth-tested, and no two of a heightfield's triangles
+            // share a pixel's depth.
+            let chunk_order: Vec<usize> = {
+                let mut order: Vec<usize> = (0..solid_chunks.len()).collect();
+                if self.levers.ground_near_first || self.levers.ground_near_chunks > 0 {
+                    let near = |k: usize| crate::renderer::scene_cull::distance_squared_to_box(cam_pos, solid_chunks[k].min, solid_chunks[k].max);
+                    order.sort_by(|&a, &b| near(a).total_cmp(&near(b)));
+                }
+                order
+            };
+            let ordered_chunks = || chunk_order.iter().map(|&k| (k, &solid_chunks[k]));
             let terrain_chunk_visible = |c: &crate::renderer::shadow::CasterChunk| {
                 // THE TESTED HELPER, not a second copy of the rule. An inline
                 // `any` here would be the shipped behaviour while the tests
@@ -2485,6 +2552,12 @@ impl XrRenderer {
                                 }
                             }
                         }
+                        // A baked cave's, the same way (`baked_cave`).
+                        if !stereo && self.levers.cave_occluder {
+                            self.baked_cave_pipelines.draw_occluders(
+                                &mut pass, &self.uniform_buf.bind_group, &baked_cave_draws, cam_pos,
+                            );
+                        }
                         pass.set_pipeline(&probe_pipeline.pipeline);
                         // Its photograph slots, as push constants: THIS eye's
                         // table, the one its camera block was just written with.
@@ -2549,6 +2622,21 @@ impl XrRenderer {
                                 .terrain_nowhere_passes
                                 .as_ref()
                                 .filter(|_| self.levers.nowhere_pass && self.terrain_cut_pipeline.is_none() && self.terrain_inlined.is_none());
+                            // ... OR, WHERE OPEN GROUND REFLECTS THE OUTDOORS
+                            // this frame, with the pass's open-ground twin: what
+                            // the full pass draws there under the same word of
+                            // the table (`ProbeUpload::open_ground`), without
+                            // its lookup. The same chunks.
+                            let open_ground = {
+                                let table = self.uniform_buf.probes_or_level(probes_arg);
+                                table.open_ground && !table.no_trace
+                            };
+                            let nowhere_twins = match self.terrain_open_passes.as_ref() {
+                                Some(open) if open_ground && self.terrain_cut_pipeline.is_none() && self.terrain_inlined.is_none() => Some(open),
+                                // No twin for it: the full pass draws it, right.
+                                None if open_ground => None,
+                                _ => nowhere_twins,
+                            };
                             let nowhere_frame = nowhere_twins
                                 .map(|_| crate::renderer::outdoor_pass::NowhereFrame::new(self.uniform_buf.probes_or_level(probes_arg)));
                             let nowhere = |c: &crate::renderer::shadow::CasterChunk| {
@@ -2566,46 +2654,89 @@ impl XrRenderer {
                                     f.holds(lo, hi)
                                 })
                             };
+                            // WHAT OF CHUNK `k` EACH GROUND CLASS DRAWS: all of
+                            // it where its bounds and this frame's table put
+                            // the whole chunk in one class, as before; else its
+                            // triangles' runs by their own classes, which the
+                            // level's whole table gave them (`LevelGround`) --
+                            // a class whose twin this frame lacks to the full
+                            // pass. `(first index, count)` runs, and how many.
+                            let class_split = self.slope_split.as_ref().filter(|s| {
+                                self.levers.ground_classes
+                                    && self.terrain_gentle.is_some()
+                                    && s.has_classes()
+                                    && self.terrain_cut_pipeline.is_none()
+                                    && self.terrain_inlined.is_none()
+                            });
+                            let outdoor_twins = outdoor_twins.filter(|_| outdoor_frame.is_some());
+                            let (outdoors_drawn, nowhere_drawn) = (outdoor_twins.is_some(), nowhere_twins.is_some());
+                            use crate::renderer::outdoor_pass::{GROUND_FULL, GROUND_NOWHERE, GROUND_OUTDOORS};
+                            let runs = |k: usize, c: &crate::renderer::shadow::CasterChunk, class: usize| -> ([(u32, u32); 4], usize) {
+                                let whole = ([(c.first_index, c.index_count), (0, 0), (0, 0), (0, 0)], 1);
+                                let none = ([(0, 0); 4], 0);
+                                let chunks_class = if nowhere(c) {
+                                    GROUND_NOWHERE
+                                } else if outdoors(c) {
+                                    GROUND_OUTDOORS
+                                } else {
+                                    GROUND_FULL
+                                };
+                                match (chunks_class, class_split) {
+                                    (GROUND_FULL, Some(split)) => {
+                                        let pick = [
+                                            class == GROUND_FULL,
+                                            if outdoors_drawn { class == GROUND_OUTDOORS } else { class == GROUND_FULL },
+                                            if nowhere_drawn { class == GROUND_NOWHERE } else { class == GROUND_FULL },
+                                        ];
+                                        let (mut r, n) = split.class_ranges(k, pick);
+                                        r[..n].iter_mut().for_each(|run| run.0 += c.first_index);
+                                        (r, n)
+                                    }
+                                    (found, _) if found == class => whole,
+                                    _ => none,
+                                }
+                            };
                             if solid_chunks.is_empty() {
                                 pass.draw_indexed(index_start..index_start + count, 0, 0..1);
                             } else {
-                                for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && !weathered(c) && !outdoors(c) && !nowhere(c)) {
-                                    pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
-                                }
-                                if let Some([twin, _]) = nowhere_twins {
-                                    pass.set_pipeline(&twin.pipeline);
-                                    for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && !weathered(c) && nowhere(c)) {
-                                        pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                // The dry ground, then the weather's, each: the
+                                // pass itself, its nowhere (or open-ground)
+                                // twin, its outdoor twin.
+                                for wet in [false, true] {
+                                    let weather = self.weather.as_ref().filter(|_| wet && solid_chunks.iter().any(|c| weathered(c)));
+                                    if wet {
+                                        let Some(w) = weather else { continue };
+                                        let dedup = w.dedup_passes.as_ref().filter(|_| self.levers.pass_dedup);
+                                        pass.set_pipeline(match (dedup, poolless) {
+                                            (Some([_, p]), true) => &p.pipeline,
+                                            (Some([p, _]), false) => &p.pipeline,
+                                            (None, true) => &w.twins.pass_poolless.pipeline,
+                                            (None, false) => &w.twins.pass.pipeline,
+                                        });
+                                        pass.set_bind_group(2, &w.maps.bind_group, &[]);
                                     }
-                                }
-                                if let Some([twin, _]) = outdoor_twins.filter(|_| outdoor_frame.is_some()) {
-                                    pass.set_pipeline(&twin.pipeline);
-                                    for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && !weathered(c) && outdoors(c)) {
-                                        pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
-                                    }
-                                }
-                                if let Some(w) = self.weather.as_ref().filter(|_| solid_chunks.iter().any(|c| weathered(c))) {
-                                    let dedup = w.dedup_passes.as_ref().filter(|_| self.levers.pass_dedup);
-                                    pass.set_pipeline(match (dedup, poolless) {
-                                        (Some([_, p]), true) => &p.pipeline,
-                                        (Some([p, _]), false) => &p.pipeline,
-                                        (None, true) => &w.twins.pass_poolless.pipeline,
-                                        (None, false) => &w.twins.pass.pipeline,
-                                    });
-                                    pass.set_bind_group(2, &w.maps.bind_group, &[]);
-                                    for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && weathered(c) && !outdoors(c) && !nowhere(c)) {
-                                        pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
-                                    }
-                                    if let Some([_, twin]) = nowhere_twins {
-                                        pass.set_pipeline(&twin.pipeline);
-                                        for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && weathered(c) && nowhere(c)) {
-                                            pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                    let which = wet as usize;
+                                    for (class, twin) in [
+                                        (GROUND_FULL, None),
+                                        (GROUND_NOWHERE, nowhere_twins.map(|t| &t[which])),
+                                        (GROUND_OUTDOORS, outdoor_twins.map(|t| &t[which])),
+                                    ] {
+                                        if class != GROUND_FULL && twin.is_none() {
+                                            continue;
                                         }
-                                    }
-                                    if let Some([_, twin]) = outdoor_twins.filter(|_| outdoor_frame.is_some()) {
-                                        pass.set_pipeline(&twin.pipeline);
-                                        for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && weathered(c) && outdoors(c)) {
-                                            pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                        let mut bound = twin.is_none();
+                                        for (k, c) in ordered_chunks() {
+                                            if !terrain_chunk_visible(c) || weathered(c) != wet {
+                                                continue;
+                                            }
+                                            let (r, n) = runs(k, c, class);
+                                            for &(first, len) in &r[..n] {
+                                                if let (false, Some(twin)) = (bound, twin) {
+                                                    pass.set_pipeline(&twin.pipeline);
+                                                    bound = true;
+                                                }
+                                                pass.draw_indexed(first..first + len, 0, 0..1);
+                                            }
                                         }
                                     }
                                 }
@@ -2875,42 +3006,117 @@ impl XrRenderer {
                         if solid_chunks.is_empty() {
                             pass.draw_indexed(index_start..index_start + count, 0, 0..1);
                         } else {
-                            for (k, c) in solid_chunks.iter().enumerate() {
-                                if terrain_chunk_visible(c) && !weathered(c) {
-                                    let g = gentle_of(k).min(c.index_count);
-                                    let end = c.index_count - steep_of(k).min(c.index_count - g);
-                                    if g < end {
-                                        pass.draw_indexed(c.first_index + g..c.first_index + end, 0, 0..1);
+                            // How many of the nearest chunks are walked that way:
+                            // all of them, or `Levers::ground_near_chunks`.
+                            let near_walk = if self.levers.ground_near_first { usize::MAX } else { self.levers.ground_near_chunks as usize };
+                            if near_walk > 0 || self.levers.ground_steep_first {
+                                // ONE WALK, NEAREST CHUNK FIRST, each chunk's three
+                                // slope ranges by their own readers -- not all the
+                                // mixed, then all the gentle, then all the steep,
+                                // which drew a near cliff last. See `chunk_order`.
+                                // Past the first `near_walk` chunks drawn, the
+                                // rest reader by reader, still nearest first.
+                                let mixed = if terrain_in_probe_pass { &self.terrain_reader().pipeline } else { self.sp_terrain(stereo) };
+                                let gentle = self.terrain_gentle.as_ref().filter(|_| gentle_split.is_some());
+                                let steep = self.terrain_steep.as_ref().filter(|_| steep_split.is_some());
+                                // Which reader is bound: 0 the mixed (bound above), 1 gentle, 2 steep.
+                                let mut bound = 0usize;
+                                // Each of a chunk's slope ranges: 0 the mixed, 1 gentle, 2 steep.
+                                let ranges = |k: usize, c: &crate::renderer::shadow::CasterChunk| {
+                                    let g = if gentle.is_some() { gentle_of(k).min(c.index_count) } else { 0 };
+                                    let st = if steep.is_some() { steep_of(k).min(c.index_count - g) } else { 0 };
+                                    let end = c.index_count - st;
+                                    [(1usize, 0..g), (0, g..end), (2, end..c.index_count)]
+                                };
+                                let mut far: Vec<(usize, &crate::renderer::shadow::CasterChunk)> = Vec::new();
+                                let mut walked = 0usize;
+                                for (k, c) in ordered_chunks() {
+                                    if !terrain_chunk_visible(c) {
+                                        terrain_culled += c.index_count;
+                                        continue;
+                                    }
+                                    if weathered(c) {
+                                        continue;
                                     }
                                     terrain_drawn += c.index_count;
-                                } else if !terrain_chunk_visible(c) {
-                                    terrain_culled += c.index_count;
-                                }
-                            }
-                            if let Some(gentle) = self.terrain_gentle.as_ref().filter(|_| gentle_split.is_some()) {
-                                let mut bound = false;
-                                for (k, c) in solid_chunks.iter().enumerate() {
-                                    let g = gentle_of(k).min(c.index_count);
-                                    if g > 0 && terrain_chunk_visible(c) && !weathered(c) {
-                                        if !bound {
-                                            pass.set_pipeline(&gentle[twin].pipeline);
-                                            bound = true;
+                                    if walked >= near_walk {
+                                        far.push((k, c));
+                                        continue;
+                                    }
+                                    walked += 1;
+                                    for (which, range) in ranges(k, c) {
+                                        if range.is_empty() {
+                                            continue;
                                         }
-                                        pass.draw_indexed(c.first_index..c.first_index + g, 0, 0..1);
+                                        if bound != which {
+                                            pass.set_pipeline(match (which, gentle, steep) {
+                                                (1, Some(gentle), _) => &gentle[twin].pipeline,
+                                                (2, _, Some(steep)) => &steep[twin].pipeline,
+                                                _ => mixed,
+                                            });
+                                            bound = which;
+                                        }
+                                        pass.draw_indexed(c.first_index + range.start..c.first_index + range.end, 0, 0..1);
                                     }
                                 }
-                            }
-                            if let Some(steep) = self.terrain_steep.as_ref().filter(|_| steep_split.is_some()) {
-                                let mut bound = false;
-                                for (k, c) in solid_chunks.iter().enumerate() {
-                                    let g = gentle_of(k).min(c.index_count);
-                                    let st = steep_of(k).min(c.index_count - g);
-                                    if st > 0 && terrain_chunk_visible(c) && !weathered(c) {
-                                        if !bound {
-                                            pass.set_pipeline(&steep[twin].pipeline);
-                                            bound = true;
+                                // The chunks beyond: gentle, mixed, steep, each nearest
+                                // first -- or what stands up first, steep, mixed,
+                                // gentle (`Levers::ground_steep_first`).
+                                for which in crate::renderer::ground_twins::reader_order(self.levers.ground_steep_first) {
+                                    for (k, c) in &far {
+                                        let range = ranges(*k, c)[match which { 1 => 0, 0 => 1, _ => 2 }].1.clone();
+                                        if range.is_empty() {
+                                            continue;
                                         }
-                                        pass.draw_indexed(c.first_index + c.index_count - st..c.first_index + c.index_count, 0, 0..1);
+                                        if bound != which {
+                                            pass.set_pipeline(match (which, gentle, steep) {
+                                                (1, Some(gentle), _) => &gentle[twin].pipeline,
+                                                (2, _, Some(steep)) => &steep[twin].pipeline,
+                                                _ => mixed,
+                                            });
+                                            bound = which;
+                                        }
+                                        pass.draw_indexed(c.first_index + range.start..c.first_index + range.end, 0, 0..1);
+                                    }
+                                }
+                            } else {
+                                for (k, c) in solid_chunks.iter().enumerate() {
+                                    if terrain_chunk_visible(c) && !weathered(c) {
+                                        let g = gentle_of(k).min(c.index_count);
+                                        let end = c.index_count - steep_of(k).min(c.index_count - g);
+                                        if g < end {
+                                            pass.draw_indexed(c.first_index + g..c.first_index + end, 0, 0..1);
+                                        }
+                                        terrain_drawn += c.index_count;
+                                    } else if !terrain_chunk_visible(c) {
+                                        terrain_culled += c.index_count;
+                                    }
+                                }
+                                if let Some(gentle) = self.terrain_gentle.as_ref().filter(|_| gentle_split.is_some()) {
+                                    let mut bound = false;
+                                    for (k, c) in solid_chunks.iter().enumerate() {
+                                        let g = gentle_of(k).min(c.index_count);
+                                        if g > 0 && terrain_chunk_visible(c) && !weathered(c) {
+                                            if !bound {
+                                                pass.set_pipeline(&gentle[twin].pipeline);
+                                                bound = true;
+                                            }
+                                            pass.draw_indexed(c.first_index..c.first_index + g, 0, 0..1);
+                                        }
+                                    }
+                                }
+                                if let Some(steep) = self.terrain_steep.as_ref().filter(|_| steep_split.is_some()) {
+                                    let mut bound = false;
+                                    for (k, c) in solid_chunks.iter().enumerate() {
+                                        let g = gentle_of(k).min(c.index_count);
+                                        let st = steep_of(k).min(c.index_count - g);
+                                        if st > 0 && terrain_chunk_visible(c) && !weathered(c) {
+                                            if !bound {
+                                                pass.set_pipeline(&steep[twin].pipeline);
+                                                bound = true;
+                                            }
+                                            pass.draw_indexed(c.first_index + c.index_count - st..c.first_index + c.index_count, 0, 0..1);
+                                        }
                                     }
                                 }
                             }
@@ -2920,7 +3126,7 @@ impl XrRenderer {
                                 let gentle_w = |k: usize| if w.gentle.is_empty() { 0 } else { gentle_of(k) };
                                 pass.set_pipeline(&self.terrain_weather_reader(w).pipeline);
                                 pass.set_bind_group(2, &w.maps.bind_group, &[]);
-                                for (k, c) in solid_chunks.iter().enumerate().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
+                                for (k, c) in ordered_chunks().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
                                     let g = gentle_w(k).min(c.index_count);
                                     if g < c.index_count {
                                         pass.draw_indexed(c.first_index + g..c.first_index + c.index_count, 0, 0..1);
@@ -2929,7 +3135,7 @@ impl XrRenderer {
                                 }
                                 for kinds in crate::renderer::weather::WeatherKinds::ALL {
                                     let mut bound = false;
-                                    for (k, c) in solid_chunks.iter().enumerate().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
+                                    for (k, c) in ordered_chunks().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
                                         let g = gentle_w(k).min(c.index_count);
                                         if g == 0 || w.kinds_of(c.first_index - index_start) != kinds {
                                             continue;
@@ -3035,6 +3241,18 @@ impl XrRenderer {
                                 }
                             }
                         }
+                    }
+                    // THE BAKED CAVES, the chunks this pass's eyes can see into.
+                    if !baked_cave_draws.is_empty() {
+                        self.baked_cave_pipelines.draw_scene(
+                            &mut pass,
+                            &self.uniform_buf.bind_group,
+                            &self.terrain_material.bind_group,
+                            &baked_cave_draws,
+                            self.levers.scene_cull.then_some(&cull_planes[..]),
+                            self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed),
+                            stereo,
+                        );
                     }
                     if !wire_verts.is_empty() {
                         pass.set_pipeline(self.sp_wire(stereo));

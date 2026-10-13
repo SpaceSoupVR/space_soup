@@ -281,13 +281,21 @@ impl VkContext {
             // half-precision maths' control in one build (`shader_precision`).
             // `adb shell setprop debug.spacesoup.nof16 1`.
             && system_property(c"debug.spacesoup.nof16") != "1";
-        // MEASUREMENT: the ground's shaders built for a painted level, from
-        // the next launch -- `adb shell setprop debug.spacesoup.painted 1`.
-        // See `terrain_pipeline::GROUND_PAINTED`.
-        crate::renderer::terrain_pipeline::GROUND_PAINTED.store(
-            system_property(c"debug.spacesoup.painted") == "1",
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        // MEASUREMENT: the ground's shaders pinned to the build with the
+        // weights' choice in it (`0`, the control) or to the painted build
+        // (`1`), from the next launch -- `adb shell setprop
+        // debug.spacesoup.painted 0`. Unset, the level decides. See
+        // `terrain_pipeline::GROUND_PAINTED`. `expect0` is not a pin: it
+        // overrides the app's guess with "unpainted", so a painted level
+        // rebuilds the ground's pipelines as it loads -- the rebuild
+        // (`XrRenderer::ground_for_level`) exercised on a level that would
+        // otherwise never take it.
+        match system_property(c"debug.spacesoup.painted").as_str() {
+            "0" => crate::renderer::terrain_pipeline::pin_ground_build(false),
+            "1" => crate::renderer::terrain_pipeline::pin_ground_build(true),
+            "expect0" => crate::renderer::terrain_pipeline::expect_painted_ground(false),
+            _ => {}
+        }
         // PIPELINE STATISTICS, when asked for. See `PIPELINE_STATISTICS_PROPERTY`.
         let statistics_extension_available = unsafe {
             vk_instance

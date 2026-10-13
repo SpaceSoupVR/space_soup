@@ -33,6 +33,13 @@ pub fn sees_box(planes: &[[Vec4; 6]], (lo, hi): (Vec3, Vec3)) -> bool {
     planes.iter().any(|p| crate::renderer::shadow::aabb_in_frustum(p, lo - m, hi + m))
 }
 
+/// How far `p` is from the box `lo..hi`, squared: 0 inside it. What the scene
+/// pass orders the ground's chunks by, nearest first
+/// (`Levers::ground_near_first`).
+pub fn distance_squared_to_box(p: Vec3, lo: Vec3, hi: Vec3) -> f32 {
+    (p.clamp(lo, hi) - p).length_squared()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -42,6 +49,16 @@ mod tests {
     fn eye_at(eye: Vec3) -> [Vec4; 6] {
         let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.05, 500.0);
         crate::renderer::shadow::frustum_planes(proj * Mat4::look_to_rh(eye, Vec3::NEG_Z, Vec3::Y))
+    }
+
+    #[test]
+    fn a_box_is_as_far_as_its_nearest_point() {
+        let (lo, hi) = (Vec3::new(1.0, 0.0, -1.0), Vec3::new(3.0, 2.0, 1.0));
+        assert_eq!(distance_squared_to_box(Vec3::new(2.0, 1.0, 0.0), lo, hi), 0.0);
+        assert_eq!(distance_squared_to_box(Vec3::new(0.0, 1.0, 0.0), lo, hi), 1.0);
+        assert_eq!(distance_squared_to_box(Vec3::new(5.0, 4.0, 0.0), lo, hi), 8.0);
+        // The box the eye stands in sorts before every other.
+        assert!(distance_squared_to_box(Vec3::ZERO, Vec3::splat(-1.0), Vec3::ONE) < distance_squared_to_box(Vec3::ZERO, lo, hi));
     }
 
     #[test]
