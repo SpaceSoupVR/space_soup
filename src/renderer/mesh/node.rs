@@ -160,6 +160,13 @@ pub(crate) fn collect_node(
             } else {
                 (Vec::new(), Vec::new())
             };
+            // The planes its layers are read on: the rest of COLOR_2, and
+            // COLOR_3 (a cliff's). A file without COLOR_3 has neither.
+            let baked_cave_planes: Option<Vec<[u8; 4]>> =
+                if baked_cave_colours.is_some() { reader.read_colors(3).map(|c| c.into_rgba_u8().collect()) } else { None };
+            // The colour of its emissive paint (COLOR_4): only a cave that glows has one.
+            let baked_cave_glow: Option<Vec<[u8; 4]>> =
+                if baked_cave_colours.is_some() { reader.read_colors(4).map(|c| c.into_rgba_u8().collect()) } else { None };
             // Its TEXCOORD_1 IS the lightmap's layout: nothing is generated
             // for it, and nothing is split.
             let lightmap = if baked_cave_colours.is_some() { None } else { lightmap };
@@ -309,7 +316,7 @@ pub(crate) fn collect_node(
                     });
                     (LayeredPrimitive { vertices: lv, vertex_buffer, twin_ends, bounds }, by_class)
                 });
-                let (layered, indices) = match layered {
+                let (layered, mut indices) = match layered {
                     Some((layered, by_class)) => (Some(layered), by_class),
                     None => (None, indices),
                 };
@@ -319,7 +326,6 @@ pub(crate) fn collect_node(
                             crate::renderer::baked_cave::BakedCaveVertex::from_file(
                                 positions[i].into(),
                                 normals.get(i).copied().unwrap_or(Vec3::Y).into(),
-                                uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                                 uv2s.get(i).copied().unwrap_or([0.0, 0.0]),
                                 // A short COLOR_0: layer 1 (rock), as the shader reads no weights.
                                 c0.get(i).copied().unwrap_or([0, 255, 0, 1 << 6]),
@@ -329,10 +335,15 @@ pub(crate) fn collect_node(
                                     baked_cave_ground.0.get(i).copied().unwrap_or([0.0, 0.0]),
                                     baked_cave_ground.1.get(i).map_or(0, |c| c[0]),
                                 ),
+                                baked_cave_planes.as_ref().and_then(|c3| {
+                                    let c2 = baked_cave_ground.1.get(i)?;
+                                    Some(([c2[1], c2[2], c2[3]], *c3.get(i)?))
+                                }),
+                                baked_cave_glow.as_ref().and_then(|g| g.get(i).copied()),
                             )
                         })
                         .collect();
-                    crate::renderer::baked_cave::BakedCavePrimitive::new(device, cv, indices.len() as u32, meta)
+                    crate::renderer::baked_cave::BakedCavePrimitive::new(device, cv, &mut indices, meta)
                 });
                 let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("mesh_ib"),

@@ -52,6 +52,13 @@ pub struct WindowRecord {
     /// The runtime's counters (`XR_META_performance_metrics`), averaged over
     /// the window's frames; `app/gpu_frametime` is the app's GPU time.
     pub xr: BTreeMap<String, f64>,
+    /// CPU work and bytes sent to the GPU that the frame's parts reported
+    /// (`XrRenderer::note_cpu`), each averaged over the window's frames:
+    /// `pose_ms` (the app posing static geometry for the rig),
+    /// `geometry_ms` (the frame's vertex and index buffers built and
+    /// sent), `upload_mb` (their bytes). Absent in older logs.
+    #[serde(default)]
+    pub cpu: BTreeMap<String, f64>,
 }
 
 impl WindowRecord {
@@ -140,6 +147,7 @@ mod tests {
             fps: 24.0,
             pass: [("scene0".to_string(), 12.0f32)].into_iter().collect(),
             xr: [("app/gpu_frametime".to_string(), 31.2)].into_iter().collect(),
+            cpu: [("pose_ms".to_string(), 1.5)].into_iter().collect(),
         }
     }
 

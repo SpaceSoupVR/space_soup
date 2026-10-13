@@ -81,7 +81,21 @@ pub struct TerrainMaterialUniform {
     /// leaves it wet, over `wet_band` metres above it. Off far below.
     pub wet_line: f32,
     pub wet_band: f32,
-    pub _pad: f32,
+    /// UNDER STILL WATER: ground below this world y lies under a sea or a
+    /// lake's still surface and is soaked ([`SEA_LINE_WGSL`]). Off far below.
+    /// Above it a beach is wetted by the wash, which moves: that is the
+    /// weather's (`weather::AreaParams::shore`).
+    pub sea_line: f32,
+    /// WET GROUND, per layer (`weather::wet_ground`): how far soaking darkens
+    /// it, 0..1 -- how much of the wet-surface law it takes: open-grained sand
+    /// and soil all of it, dense rock a third.
+    pub porosity: [f32; 4],
+    /// And how much of it a film of water covers once it is soaked, 0..1: its
+    /// gloss. Packed sand and bare rock hold a film nearly all over; a lawn
+    /// hardly any, its blades standing through it (at 0.3 roughness a wet lawn
+    /// lost its sheen and drew the hill's horizon across itself,
+    /// `docs/weather-2026-10-07.md`).
+    pub film: [f32; 4],
 }
 
 impl Default for TerrainMaterialUniform {
@@ -99,14 +113,76 @@ impl Default for TerrainMaterialUniform {
             normal_strength: 1.0,
             wet_line: -1e9,
             wet_band: 1.0,
-            _pad: 0.0,
+            sea_line: -1e9,
+            // By the layers' roles: ground (a lawn), rock, high ground (scree
+            // and dry grass), sediment (sand).
+            porosity: WET_POROSITY,
+            film: WET_FILM,
         }
     }
 }
 
+/// GROUND UNDER STILL WATER IS SOAKED: below `mat.sea_line`, darkened by the
+/// wet-surface law as far as its layers take water in (`weather::wet_albedo`,
+/// written as the weather's twin writes it, its numbers `weather::WET_BACK`
+/// and `WET_OUT` -- a test holds them equal), whole from five centimetres
+/// under the line. No film's gloss: there is no surface of air over it. The
+/// one line of the ground's shader that is the sea's; its weather twin takes
+/// it out, and reads the same from the shore's layer of the weather map
+/// (`weather::with_weather`).
+pub(crate) const SEA_LINE_WGSL: &str = "    // UNDER STILL WATER the ground is soaked: see `SEA_LINE_WGSL`.
+    let sea_in = dot(w, mat.porosity) * clamp((mat.sea_line - in.tex_pos.y) * 20.0, 0.0, 1.0);
+    let sea_back = 0.435 * albedo;
+    albedo = albedo * ((1.0 - sea_in * 0.446) + (sea_in * 0.554) * (sea_back * sea_back + sea_back));
+";
+
+/// The layers' response to water where `settings.json` gives none: by their
+/// roles -- ground (a lawn), rock, high ground (scree and dry grass), sediment
+/// (sand). See [`TerrainMaterialUniform::porosity`].
+pub const WET_POROSITY: [f32; 4] = [0.85, 0.35, 0.7, 1.0];
+pub const WET_FILM: [f32; 4] = [0.12, 0.75, 0.3, 0.9];
+
 pub struct TerrainPipeline {
     pub pipeline: RenderPipeline,
     pub material_layout: BindGroupLayout,
+}
+
+/// THE SCENE'S GROUND IS DRAWN WITHOUT BLENDING. Its shader writes alpha 1
+/// (one `return`, a literal; `the_grounds_scene_shaders_write_alpha_one`), so
+/// a blend kept nothing of the target -- but a blended draw does not write
+/// the GPU's coarse depth, so nothing drawn after the ground was rejected
+/// there against it. Quest 3, 2026-10-13, one build launched both ways
+/// (`bench/shader_opt_1012/r13/opaque{0,1}.log`): cave_back_out 30.82 ->
+/// 25.77 ms, cave_mouth 31.72 -> 29.71, snow_hills -0.30, the other five
+/// views tried -0.0 to -0.12. `false` builds it blended as it always was:
+/// `adb shell setprop debug.spacesoup.opaque 0` before a launch on the
+/// headset, `OPAQUE_GROUND=0` in the offline harness. See `build_from_with`.
+pub static OPAQUE_GROUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// THE GROUND'S VERTICES ARE THE WORLD'S (`true`), posed into the player's
+/// frame by the vertex shader ([`world_vertices`]) -- where the app posed
+/// every vertex on the CPU and sent the whole ground to the GPU again on
+/// each frame the rig moved or turned (`docs/scale-audit-2026-10-13.md`, F1).
+/// Read when a ground pipeline is BUILT, so it is set once, before the
+/// renderer exists: the headset app sets it at launch (`xr::vulkan`;
+/// `adb shell setprop debug.spacesoup.worldground 0` keeps the old way), the
+/// offline harness by `WORLD_GROUND`. `false` here, so everything else that
+/// builds a ground pipeline -- the tests -- hands it posed vertices as before.
+pub static WORLD_GROUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A solid vertex shader's opening, and the same posing its vertex first:
+/// what [`world_vertices`] rewrites. The ground's shaders and the solid
+/// pipeline's (`pipeline::solid_shader`) open alike.
+const POSED_VERTEX: &str = "@vertex fn vs_main(v: VIn) -> VOut {\n    var out: VOut;\n";
+const WORLD_VERTEX: &str = "@vertex fn vs_main(w: VIn) -> VOut {\n    var out: VOut;\n    var v = w;\n    v.pos = to_player_space(w.pos);\n    v.norm = to_player_direction(w.norm);\n";
+
+/// `src` taking its vertices in the WORLD: position and normal are turned
+/// into the player's frame (`lights`' `to_player_space`, the inverse of the
+/// `to_world_space` every shader already has) before anything reads them, so
+/// all that follows is as it was for a vertex the app had posed. `None` if
+/// the shader does not open as the ground's does.
+pub fn world_vertices(src: &str) -> Option<String> {
+    (src.matches(POSED_VERTEX).count() == 1).then(|| src.replacen(POSED_VERTEX, WORLD_VERTEX, 1))
 }
 
 impl TerrainPipeline {
@@ -384,6 +460,30 @@ impl TerrainPipeline {
         ))
     }
 
+    /// The weather's ground where water stands, mirroring the sky alone
+    /// ([`puddle_pass_shader`]). `None` when the shader's line or the
+    /// weather's edits no longer match.
+    pub fn new_probe_pass_puddle(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        weather_layout: &BindGroupLayout,
+    ) -> Option<Self> {
+        let src = crate::renderer::weather::with_weather(&puddle_pass_shader()?)?;
+        Some(Self::build_from_with(
+            device,
+            crate::renderer::brush_pipeline::probe_pass::FORMAT,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::ProbePass,
+            Some(weather_layout),
+            Some(fixups.pass_layout()),
+            src,
+            "terrain_weather_probe_pass_puddle",
+        ))
+    }
+
     /// THE GROUND'S PROBE PASS'S NOWHERE TWIN ([`nowhere_pass_shader`]), for
     /// the chunks of ground that touch no photograph's box and no doorway's
     /// reach this frame (`outdoor_pass::NowhereFrame`); with `weather_layout`,
@@ -615,6 +715,13 @@ impl TerrainPipeline {
         mut source: String,
         label: &str,
     ) -> Self {
+        if WORLD_GROUND.load(std::sync::atomic::Ordering::Relaxed) {
+            match world_vertices(&source) {
+                Some(world) => source = world,
+                // Drawn from world vertices it would stand in the wrong place.
+                None => log::error!("WORLD GROUND: the ground shader '{label}' does not open as expected; it reads its vertices as posed"),
+            }
+        }
         if role == TerrainRole::ProbePass && device.features().contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
             // It writes the fix-up list: see `BrushPipeline::new_probe_pass_deferred`.
             source = source.replacen("@fragment fn fs_main(", "@fragment @early_depth_test(force) fn fs_main(", 1);
@@ -641,7 +748,12 @@ impl TerrainPipeline {
         // In the probe pass, both of its targets; the reach is left as the
         // brushes wrote it. See `probe_pass::targets`.
         let probe_targets = crate::renderer::brush_pipeline::probe_pass::targets(false);
-        let scene_target = [Some(ColorTargetState { format, blend: Some(BlendState::ALPHA_BLENDING), write_mask: ColorWrites::ALL })];
+        // The scene's ground is opaque -- its shader writes alpha 1 -- and
+        // was drawn with blending on until 2026-10-13. Without, it is the
+        // same colour (alpha 1 keeps nothing of what lay under it) and the
+        // ground writes the GPU's coarse depth. See `OPAQUE_GROUND`.
+        let blend = if OPAQUE_GROUND.load(std::sync::atomic::Ordering::Relaxed) { None } else { Some(BlendState::ALPHA_BLENDING) };
+        let scene_target = [Some(ColorTargetState { format, blend, write_mask: ColorWrites::ALL })];
         let targets: &[Option<ColorTargetState>] =
             if role == TerrainRole::ProbePass { &probe_targets } else { &scene_target };
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -719,6 +831,24 @@ const OPEN_GROUND_ON: &str = "const PROBE_OPEN_GROUND: bool = true;";
 pub(crate) fn open_pass_shader() -> Option<String> {
     let src = terrain_shader_for(TerrainRole::ProbePass);
     (src.matches(OPEN_GROUND_OFF).count() == 1).then(|| src.replacen(OPEN_GROUND_OFF, OPEN_GROUND_ON, 1))
+}
+
+/// The open ground's answer, and the sky alone in its place: what
+/// [`puddle_pass_shader`] rewrites.
+const OPEN_COLOUR: &str = "        let open_col = probe_escape_colour(world_pos, open_dir, dir, roughness, open_lod);";
+const OPEN_SKY_COLOUR: &str = "        let open_col = vec4<f32>(sky_reflection(open_dir, dir, open_lod), 1.0);";
+
+/// THE GROUND'S PROBE PASS FOR STANDING WATER BEYOND THE OUTDOOR VOLUME: the
+/// open-ground twin ([`open_pass_shader`]) answering with the SKY ALONE, at
+/// the lobe's blur -- no walk over the ground map for a hill, no buildings'
+/// outsides. A puddle then mirrors the sky it lies under and not the ridge
+/// behind it; the open twin's whole answer put the weather's pass past the
+/// Quest's instruction cache (3,755 instructions; rain_puddles_down +3.6 ms,
+/// 2026-10-13). `Levers::puddle_sky`. `None` if the line is not in the shader
+/// exactly once.
+pub(crate) fn puddle_pass_shader() -> Option<String> {
+    let src = open_pass_shader()?;
+    (src.matches(OPEN_COLOUR).count() == 1).then(|| src.replacen(OPEN_COLOUR, OPEN_SKY_COLOUR, 1))
 }
 
 /// THE GROUND'S PROBE PASS FOR GROUND IN NO PHOTOGRAPH'S BOX: the pass with
@@ -1138,7 +1268,9 @@ struct Material {{
     normal_strength: f32,
     wet_line: f32,
     wet_band: f32,
-    pad2: f32,
+    sea_line: f32,
+    porosity: vec4<f32>,
+    film: vec4<f32>,
 }}
 @group(1) @binding(3) var<uniform> mat: Material;
 @group(1) @binding(4) var splat_tex: texture_2d<f32>;
@@ -1585,10 +1717,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // Along the face on a cliff, as the detail maps are: read in `sample_frame`.
     let m = f.macro_value;
     albedo = albedo * (1.0 + (m - 0.5) * 2.0 * mat.macro_strength);
-    // WET SAND where the sea's wash reaches: water in its pores darkens it to
-    // about half, damp fading out above.
-    albedo = albedo * (1.0 - 0.45 * (1.0 - smoothstep(mat.wet_line, mat.wet_line + mat.wet_band, in.tex_pos.y)));
-
+{sea_line}
     // Vertex colour survives as a tint, so the editor can still mark up ground
     // per-vertex without a second pipeline.
     // The ambient term is scaled by baked sky visibility BEFORE the lights are
@@ -1664,6 +1793,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
 }}
 "#,
         lights_block = terrain_lights_block(crate::renderer::lights::LightsBlockOptions::default()),
+        sea_line = SEA_LINE_WGSL,
         sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
         stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
         biplanar_block = wgsl_biplanar_block(),
@@ -2237,6 +2367,96 @@ pub(crate) mod tests {
     /// surface in no room and no doorway once the frame says open ground
     /// reflects (`ProbeUpload::open_ground`): escaped where it lies, coloured
     /// by `probe_escape_colour`; nothing where too rough to trace.
+    /// The scene's ground is drawn without blending ([`OPAQUE_GROUND`]), which
+    /// is the picture a blend drew only while every reader's one answer has
+    /// alpha 1: the plain readers, the steep ones, and each with the weather.
+    #[test]
+    fn the_grounds_scene_shaders_write_alpha_one() {
+        use crate::renderer::weather::{with_weather, with_weather_kinds, WeatherKinds};
+        const ANSWER: &str = "return vec4<f32>(tonemap(in.col.rgb * lit), 1.0);";
+        let mut seen = 0;
+        for role in [TerrainRole::Scene, TerrainRole::Read] {
+            let plain = terrain_shader_for(role);
+            let mut sources = vec![plain.clone()];
+            sources.extend(crate::renderer::ground_twins::steep_shader(&plain));
+            for src in sources.clone() {
+                sources.extend(with_weather(&src));
+                sources.extend(WeatherKinds::ALL.iter().filter_map(|&k| with_weather_kinds(&src, k)));
+            }
+            for src in sources {
+                let main = &src[src.find("fn fs_main(").expect("the ground's fragment shader")..];
+                let main = &main[..main.find("\n}\n").expect("its end")];
+                let returns: Vec<&str> = main.lines().map(str::trim).filter(|l| l.starts_with("return ")).collect();
+                assert_eq!(returns, [ANSWER], "a ground reader answers with something a blend would not keep");
+                seen += 1;
+            }
+        }
+        assert!(seen >= 8, "{seen} readers looked at");
+    }
+
+    /// Every ground shader a frame may draw takes world vertices by the one
+    /// rewrite ([`world_vertices`]), and validates with it; so does the solid
+    /// pipeline's, which draws the ground into a mirror.
+    #[test]
+    fn every_ground_shader_takes_its_vertices_in_the_world() {
+        use crate::renderer::weather::{with_weather, with_weather_kinds, WeatherKinds};
+        let mut seen = 0;
+        for role in [TerrainRole::Scene, TerrainRole::Read, TerrainRole::ProbePass] {
+            let plain = terrain_shader_for(role);
+            let mut sources = vec![plain.clone()];
+            sources.extend(crate::renderer::ground_twins::steep_shader(&plain));
+            if role == TerrainRole::ProbePass {
+                sources.extend(nowhere_pass_shader());
+                sources.extend(open_pass_shader());
+                sources.extend(puddle_pass_shader());
+            }
+            for src in sources.clone() {
+                sources.extend(with_weather(&src));
+                sources.extend(WeatherKinds::ALL.iter().filter_map(|&k| with_weather_kinds(&src, k)));
+            }
+            for src in sources {
+                let world = world_vertices(&src).expect("a ground shader that does not open as the ground's does");
+                assert!(world.contains("v.pos = to_player_space(w.pos);") && world.contains("v.norm = to_player_direction(w.norm);"));
+                assert_eq!(world.matches("fn vs_main(").count(), 1);
+                // Nothing after the opening reads the world's vertex.
+                let body = &world[world.find("v.norm = to_player_direction(w.norm);").unwrap() + 40..];
+                let body = &body[..body.find("\n}\n").unwrap()];
+                assert!(!body.contains("w."), "the vertex shader reads the world's vertex past its posing");
+                seen += 1;
+            }
+        }
+        assert!(seen >= 12, "{seen} shaders looked at");
+        let validate = |label: &str, src: &str| {
+            use wgpu::naga;
+            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        };
+        validate("the ground reader from world vertices", &world_vertices(&terrain_shader_for(TerrainRole::Read)).unwrap());
+        validate("the ground's reflection pass from world vertices", &world_vertices(&terrain_shader_for(TerrainRole::ProbePass)).unwrap());
+        let solid = world_vertices(&crate::renderer::pipeline::solid_shader_src()).expect("the solid pipeline's shader opens as the ground's");
+        validate("the solid pipeline from world vertices", &solid);
+    }
+
+    /// The puddle twin is the open twin but for its answer, which is the sky
+    /// the open twin's own answer ends in; and it validates.
+    #[test]
+    fn the_puddle_twin_is_the_open_twin_answering_with_the_sky() {
+        use wgpu::naga;
+        let open = open_pass_shader().expect("the open-ground switch moved");
+        let puddle = puddle_pass_shader().expect("the open ground's answer moved");
+        assert_eq!(puddle.replacen(OPEN_SKY_COLOUR, OPEN_COLOUR, 1), open);
+        assert!(open.contains("    return sky_reflection(d, dir, lod);"), "the outdoors no longer ends in the sky");
+        let wet = crate::renderer::weather::with_weather(&puddle).expect("the weather's edits");
+        for src in [&puddle, &wet] {
+            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{e:?}"));
+        }
+    }
+
     #[test]
     fn the_open_twin_is_the_pass_with_its_switch_turned() {
         use wgpu::naga;
@@ -3877,6 +4097,16 @@ pub fn load_terrain_settings(dir: &std::path::Path) -> TerrainMaterialUniform {
     }
     if let Some(v) = raw.get("normal_strength").and_then(|v| v.as_f64()) {
         out.normal_strength = (v as f32).clamp(0.0, 4.0);
+    }
+    // How each layer takes water: see `TerrainMaterialUniform::porosity`.
+    for (key, into) in [("porosity", &mut out.porosity), ("film", &mut out.film)] {
+        if let Some(values) = raw.get(key).and_then(|r| r.as_array()) {
+            for (i, slot) in into.iter_mut().enumerate() {
+                if let Some(v) = values.get(i).and_then(|v| v.as_f64()) {
+                    *slot = (v as f32).clamp(0.0, 1.0);
+                }
+            }
+        }
     }
     out
 }

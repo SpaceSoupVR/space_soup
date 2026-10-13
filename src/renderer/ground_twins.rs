@@ -150,11 +150,18 @@ pub fn reader_order(steep_first: bool) -> [usize; 3] {
     if steep_first { [2, 0, 1] } else { [1, 0, 2] }
 }
 
+/// How far a sampled normal's height may move and the ground still be the
+/// ground the split was built for: far over what a pose's arithmetic leaves
+/// (a few parts in ten million), far under what another ground's differs by.
+pub const HEIGHT_TOLERANCE: f32 = 1e-4;
+
 /// THE TERRAIN'S INDICES WITH EACH CHUNK'S GENTLE TRIANGLES FIRST, and how
 /// many of each chunk's indices they are. Built once per terrain and
 /// threshold; `key` tells a new terrain from the one it was built for.
 pub struct SlopeSplit {
     key: (usize, usize, usize, usize, u32, u64),
+    /// The sampled normals' heights the split was built from (`heights_of`).
+    heights: Vec<f32>,
     /// The terrain's index buffer, reordered within each chunk.
     pub indices: Vec<u32>,
     /// Per chunk, as handed: how many of its indices, from its first, are
@@ -182,11 +189,11 @@ impl SlopeSplit {
     fn key_of(verts: &[SolidVertex], idx: &[u32], chunks: &[CasterChunk], threshold_deg: f32, class_key: u64) -> (usize, usize, usize, usize, u32, u64) {
         // A sample of the data as well as where it lies: a terrain loaded
         // again can land at the same address. Of what a POSE leaves alone --
-        // the indices and the normals' heights, which a turn about the
-        // vertical keeps -- and not the positions: the app hands the ground
-        // posed into the player's frame, so a sampled height changed with
-        // every step up or down a slope, and the split (128,680 triangles
-        // sorted) was built again on each such frame.
+        // the indices here, and the normals' heights in `heights_of` -- and
+        // not the positions: the app hands the ground posed into the player's
+        // frame, so a sampled height changed with every step up or down a
+        // slope, and the split (128,680 triangles sorted) was built again on
+        // each such frame.
         let mut h: u64 = 1469598103934665603 ^ class_key;
         let mut mix = |v: u64| {
             h ^= v;
@@ -196,12 +203,6 @@ impl SlopeSplit {
             mix(c.first_index as u64);
             mix(c.index_count as u64);
         }
-        // (To a part in 8,192: the app's turn leaves a height its last bits
-        // different from one yaw to the next.)
-        let step = (verts.len() / 997).max(1);
-        for v in verts.iter().step_by(step) {
-            mix((v.normal[1] * 8192.0).round() as i64 as u64);
-        }
         let step = (idx.len() / 997).max(1);
         for i in idx.iter().step_by(step) {
             mix(*i as u64);
@@ -209,10 +210,29 @@ impl SlopeSplit {
         (verts.as_ptr() as usize, verts.len(), idx.as_ptr() as usize, idx.len(), threshold_deg.to_bits(), h)
     }
 
+    /// A sample of the normals' heights, which a turn about the vertical
+    /// keeps -- to its last bits only: the app's turn leaves each a few ulps
+    /// different from one yaw to the next. COMPARED WITHIN A TOLERANCE
+    /// ([`HEIGHT_TOLERANCE`]), not hashed: rounded into a hash (to a part in
+    /// 8,192, until 2026-10-13) some sample of a thousand always lay on a
+    /// rounding's edge, the key changed on about every other frame the rig
+    /// turned, and the whole split was built again each time -- 33 to 42 ms
+    /// of the render thread on the Quest, 400 times in 14 windows of a
+    /// walking bench view. That was the lag as played.
+    fn heights_of(verts: &[SolidVertex]) -> Vec<f32> {
+        let step = (verts.len() / 997).max(1);
+        verts.iter().step_by(step).map(|v| v.normal[1]).collect()
+    }
+
     /// Whether this split is the one for this terrain and these ground
     /// classes (`class_key`: 0 for none).
     pub fn is_for(&self, verts: &[SolidVertex], idx: &[u32], chunks: &[CasterChunk], threshold_deg: f32, class_key: u64) -> bool {
-        self.key == Self::key_of(verts, idx, chunks, threshold_deg, class_key)
+        if self.key != Self::key_of(verts, idx, chunks, threshold_deg, class_key) {
+            return false;
+        }
+        let step = (verts.len() / 997).max(1);
+        let mut now = verts.iter().step_by(step).map(|v| v.normal[1]);
+        self.heights.len() == now.len() && self.heights.iter().all(|was| now.next().is_some_and(|is| (is - was).abs() <= HEIGHT_TOLERANCE))
     }
 
     /// `idx` with each chunk's gentle triangles first. No chunks: the whole
@@ -289,6 +309,7 @@ impl SlopeSplit {
         }
         Self {
             key: Self::key_of(verts, idx, chunks, threshold_deg, class_key),
+            heights: Self::heights_of(verts),
             indices,
             gentle,
             gentle_total,
@@ -370,6 +391,57 @@ pub fn gentle_readers(
         ));
     }
     built.try_into().ok()
+}
+
+/// THE WET-ONLY TWINS OF THE GROUND'S MIXED AND STEEP SCENE READERS, `[mixed,
+/// steep]`, each `[full, spotless, baked, baked_spotless]`: the weather's
+/// twin with no standing water's code and no snow's
+/// (`weather::WeatherKinds::WetOnly`), for the triangles that are not gentle
+/// in a chunk that holds neither -- a beach's washed chunks with the cliff
+/// over them, a rained-on slope that cannot pool.
+///
+/// WHY. Such a chunk's gentle triangles had a wet-only twin and the rest drew
+/// the weather's full reader, snow and puddles and all: 3,820 instructions,
+/// past the instruction cache (3,387), where the dry steep twin they drew
+/// before the shore's wetness is 2,831. Measured 2026-10-13 on the Quest:
+/// cave_mouth +3.8 ms, beach_south +1.8, shore +0.9 from that alone. These
+/// are about 3,270 by the host proxy (2,183 x the same ratio), under the edge;
+/// to be confirmed on the headset. `Levers::wet_steep_twins`.
+///
+/// `None` when the ground's steep tests are not there to take out, or the
+/// weather's edits no longer match a reader.
+pub fn wet_readers(
+    device: &Device,
+    format: TextureFormat,
+    uniform_layout: &BindGroupLayout,
+    samples: u32,
+    probe_layout: &BindGroupLayout,
+    weather_layout: &BindGroupLayout,
+) -> Option<[[TerrainPipeline; 4]; 2]> {
+    let spotless = crate::renderer::lights::without_spot_shadows;
+    let mut both = Vec::with_capacity(2);
+    for (read, name) in [(terrain_shader_for(TerrainRole::Read), "read"), (steep_shader(&terrain_shader_for(TerrainRole::Read))?, "steep_read")] {
+        let baked = crate::renderer::brush_pipeline::sun_reader_shader(read.clone(), crate::renderer::brush_pipeline::FaceSun::Baked);
+        let sources = [read.clone(), spotless(read), baked.clone(), spotless(baked)];
+        let mut built = Vec::with_capacity(4);
+        for (src, suffix) in sources.into_iter().zip(["", "_spotless", "_baked", "_baked_spotless"]) {
+            let src = crate::renderer::weather::with_weather_kinds(&src, crate::renderer::weather::WeatherKinds::WetOnly)?;
+            built.push(TerrainPipeline::build_from_with(
+                device,
+                format,
+                uniform_layout,
+                samples,
+                crate::renderer::multiview::ViewMode::Mono,
+                TerrainRole::Read,
+                Some(weather_layout),
+                Some(probe_layout),
+                src,
+                &format!("terrain_weather_wet_{name}{suffix}"),
+            ));
+        }
+        both.push(<[TerrainPipeline; 4]>::try_from(built).ok()?);
+    }
+    both.try_into().ok()
 }
 
 /// The ground's steep-only scene readers, `[full, spotless, baked,
@@ -611,6 +683,17 @@ mod tests {
             v.normal[1] += 1e-7;
         }
         assert!(split.is_for(&posed, &idx, &chunks, 18.0, 0));
+        // ... at EVERY turn of the rig: a thousand yaws, each leaving the
+        // normals' heights their last bits different, and none a new ground.
+        let world = posed.clone();
+        for k in 0..1000 {
+            let turn = glam::Quat::from_rotation_y(k as f32 * 0.0123);
+            for (p, w) in posed.iter_mut().zip(&world) {
+                p.normal = (turn * glam::Vec3::from(w.normal)).to_array();
+                p.position = (turn * glam::Vec3::from(w.position)).to_array();
+            }
+            assert!(split.is_for(&posed, &idx, &chunks, 18.0, 0), "turn {k} built the split again");
+        }
         posed[0].normal = [0.7, 0.7, 0.0];
         assert!(!split.is_for(&posed, &idx, &chunks, 18.0, 0), "the ground itself changed");
     }

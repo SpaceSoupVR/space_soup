@@ -614,6 +614,64 @@ pub fn swash_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
     swash * (1.0 - smooth(0.3, 1.5, still_depth)) * rise * (0.5 + 0.5 * amp) + height * profile + swell_lift(u, still_depth, xz)
 }
 
+/// How much further up a beach the wash wets the sand than the water's own
+/// surface rises (`swash_rise` at its peak): the sheet runs on up the slope,
+/// and the sand above it draws water up.
+pub const SHORE_RUN_UP: f32 = 1.3;
+/// Metres of height above the wet line over which the sand goes from soaked
+/// to dry: on the cove's 1-in-9 beach nearly two metres, the upper metre of it damp and matte.
+pub const SHORE_BAND: f32 = 0.2;
+/// How fast the wet line sinks back down a beach after a wave, metres of
+/// height a second: the film drains into the sand from the top (about half a
+/// metre of a 1-in-9 beach between one wave and the next).
+pub const SHORE_CREEP: f32 = 0.007;
+/// The waves back that can still hold the line up.
+const SHORE_WAVES: usize = 4;
+
+/// The most [`shore_wet_line`] is, for a shore of this `swash`.
+pub fn shore_wet_line_most(swash: f32) -> f32 {
+    SHORE_RUN_UP * swash.max(0.0) + SHORE_BAND
+}
+
+/// THE WET LINE ON A BEACH: the height above the still surface up to which
+/// the sea's wash has the sand at a world `xz` wet now, at the waves' clock
+/// `t` (seconds, as `WaterUniform::tiles[3]`), for a shore whose swash is
+/// `swash` metres; [`SHORE_BAND`] over that the sand is dry.
+///
+/// No state: the breakers are a closed form of the clock (`swash_count`,
+/// `breaker_amp`), so which waves have run up here, how high each ran and
+/// how long ago are too. Each of the last few reached [`SHORE_RUN_UP`] times
+/// its own rise -- bigger in a set, and in the sections of the shore that run
+/// bigger -- and since then its line has sunk at [`SHORE_CREEP`]; the wave
+/// coming in now has reached as far as it has risen. The line is the highest
+/// of them: it jumps up the beach with a big wave, creeps back between waves,
+/// lies higher where the bigger sections break, and is never below the still
+/// water's edge.
+pub fn shore_wet_line(t: f32, swash: f32, xz: glam::Vec2) -> f32 {
+    if swash <= 0.0 {
+        return SHORE_BAND;
+    }
+    let smooth = |e0: f32, e1: f32, x: f32| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    // The wash is highest this far into a period (`swash_rise`).
+    const PEAK: f32 = 0.16;
+    let count = swash_count(t, 0.0, xz);
+    let phase = count.rem_euclid(1.0);
+    let mut line = 0.0f32;
+    for back in 0..SHORE_WAVES {
+        // Periods since this wave was at its highest, and how big it was
+        // then: one size a wave, whenever it is asked.
+        let since = phase - PEAK + back as f32;
+        let amp = breaker_amp(t - since * SWASH_PERIOD, xz, count - since);
+        let ran = SHORE_RUN_UP * swash * (0.5 + 0.5 * amp);
+        let reach = if since < 0.0 { ran * smooth(0.0, PEAK, phase) } else { ran - SHORE_CREEP * since * SWASH_PERIOD };
+        line = line.max(reach);
+    }
+    line + SHORE_BAND
+}
+
 /// The swell's lift (`swell_at` in [`surface_wgsl`]) on the CPU.
 fn swell_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
     if u.air[1] <= 0.0 {
@@ -1795,6 +1853,35 @@ mod tests {
             let end = without.find("@fragment fn fs_main").unwrap();
             assert_eq!(format!("{}{}", &without[..start], &without[end..]), plain);
         }
+    }
+
+    /// THE WET LINE on a beach: never below the still water's edge nor above
+    /// the highest a wave can run; it jumps up with a wave and creeps back
+    /// down after it; it is not level along the shore; it repeats with the
+    /// waves' loop; and a still lake has none.
+    #[test]
+    fn the_wet_line_follows_the_waves_up_and_creeps_back() {
+        let swash = 0.22;
+        let xz = glam::Vec2::new(12.0, 31.0);
+        let most = shore_wet_line_most(swash);
+        let line = |t: f32| shore_wet_line(t, swash, xz);
+        let samples: Vec<f32> = (0..2400).map(|k| line(k as f32 * 0.1)).collect();
+        assert!(samples.iter().all(|&l| l >= SHORE_BAND && l <= most + 1e-5), "outside {SHORE_BAND}..{most}");
+        let (lo, hi) = samples.iter().fold((f32::MAX, f32::MIN), |(a, b), &l| (a.min(l), b.max(l)));
+        assert!(hi - lo > 0.3 * swash, "the line hardly moves: {lo}..{hi}");
+        // It never sinks faster than it creeps (it only ever jumps UP).
+        let fall = samples.windows(2).map(|p| p[0] - p[1]).fold(f32::MIN, f32::max);
+        assert!(fall <= SHORE_CREEP * 0.1 * 1.5 + 2e-3, "the line dropped {fall} m in a tenth of a second");
+        let rise = samples.windows(2).map(|p| p[1] - p[0]).fold(f32::MIN, f32::max);
+        assert!(rise > 10.0 * SHORE_CREEP * 0.1, "no wave ever lifts it");
+        // Not level along the shore: sections 25-30 m long run bigger.
+        let along: Vec<f32> = (0..40).map(|k| shore_wet_line(57.0, swash, glam::Vec2::new(k as f32 * 2.0, 31.0))).collect();
+        let (a, b) = along.iter().fold((f32::MAX, f32::MIN), |(a, b), &l| (a.min(l), b.max(l)));
+        assert!(b - a > 0.1 * swash, "level along 80 m of shore: {a}..{b}");
+        let loop_s = crate::renderer::water_waves::WaveParams::default().loop_seconds;
+        assert!((line(17.0) - line(17.0 + loop_s)).abs() < 2e-3);
+        assert_eq!(shore_wet_line(17.0, 0.0, xz), SHORE_BAND);
+        assert!((shore_wet_line_most(swash) - (SHORE_RUN_UP * swash + SHORE_BAND)).abs() < 1e-6);
     }
 
     #[test]

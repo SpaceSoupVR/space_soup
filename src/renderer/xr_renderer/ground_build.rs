@@ -38,6 +38,9 @@ pub(super) struct GroundSet {
     pub outdoor_passes: Option<[TerrainPipeline; 2]>,
     pub nowhere_passes: Option<[TerrainPipeline; 2]>,
     pub open_passes: Option<[TerrainPipeline; 2]>,
+    /// The weather's open twin answering with the sky alone
+    /// (`Levers::puddle_sky`).
+    pub puddle_pass: Option<TerrainPipeline>,
     pub reader: TerrainPipeline,
     pub reader_twins: [TerrainPipeline; 3],
     pub gentle: Option<[TerrainPipeline; 4]>,
@@ -73,6 +76,10 @@ impl GroundSet {
         if open_passes.is_none() {
             log::warn!("terrain: the probe pass's open-ground twin no longer matches its shader; that ground draws by the nowhere twin");
         }
+        let puddle_pass = TerrainPipeline::new_probe_pass_puddle(device, uniform_layout, fixups, &weather_layout);
+        if puddle_pass.is_none() {
+            log::warn!("terrain: the probe pass's puddle twin no longer matches its shader; puddles draw by the open-ground twin");
+        }
         if dedup_passes.is_none() {
             log::warn!("terrain: the probe pass's dedup edits no longer match; it draws as it was");
         }
@@ -85,13 +92,14 @@ impl GroundSet {
         if gentle.is_none() {
             log::warn!("terrain: the ground's steep tests are not where its gentle twins take them out; the full readers draw everywhere");
         }
-        Self { pass, pass_poolless, dedup_passes, outdoor_passes, nowhere_passes, open_passes, reader, reader_twins, gentle, steep }
+        Self { pass, pass_poolless, dedup_passes, outdoor_passes, nowhere_passes, open_passes, puddle_pass, reader, reader_twins, gentle, steep }
     }
 }
 
 /// The weather's ground pipelines: the twins, the gentle readers' twins by
-/// what the ground holds (empty when they did not build), and the pass's
-/// dedup twins. See `XrRenderer::set_weather`.
+/// what the ground holds (empty when they did not build), the pass's dedup
+/// twins, and the mixed and steep readers' wet-only twins. See
+/// `XrRenderer::set_weather`.
 pub(super) fn weather_ground(
     device: &Device,
     format: TextureFormat,
@@ -100,7 +108,7 @@ pub(super) fn weather_ground(
     probe_pass_layout: &BindGroupLayout,
     fixups: &crate::renderer::probe_fixup::ProbeFixups,
     weather_layout: &BindGroupLayout,
-) -> (TerrainWeatherTwins, Vec<[TerrainPipeline; 4]>, Option<[TerrainPipeline; 2]>) {
+) -> (TerrainWeatherTwins, Vec<[TerrainPipeline; 4]>, Option<[TerrainPipeline; 2]>, Option<[[TerrainPipeline; 4]; 2]>) {
     use crate::renderer::weather;
     let twins = TerrainPipeline::new_weather_twins(device, format, uniform_layout, samples, probe_pass_layout, fixups, weather_layout);
     // The gentle readers' twins, by what the ground holds. See `ground_twins`.
@@ -115,7 +123,13 @@ pub(super) fn weather_ground(
     }
     let gentle = if gentle.len() == weather::WeatherKinds::ALL.len() { gentle } else { Vec::new() };
     let dedup_passes = crate::renderer::ground_twins::dedup_passes(device, uniform_layout, fixups, Some(weather_layout));
-    (twins, gentle, dedup_passes)
+    // The mixed and steep readers' wet-only twins, for chunks that hold no
+    // standing water and no snow. See `ground_twins::wet_readers`.
+    let wet = crate::renderer::ground_twins::wet_readers(device, format, uniform_layout, samples, probe_pass_layout, weather_layout);
+    if wet.is_none() {
+        log::warn!("WEATHER: the ground's wet-only mixed and steep twins did not build; its full weather reader draws them");
+    }
+    (twins, gentle, dedup_passes, wet)
 }
 
 impl XrRenderer {
@@ -139,6 +153,7 @@ impl XrRenderer {
         self.terrain_outdoor_passes = set.outdoor_passes;
         self.terrain_nowhere_passes = set.nowhere_passes;
         self.terrain_open_passes = set.open_passes;
+        self.terrain_puddle_pass = set.puddle_pass;
         self.terrain_probe_reader_pipeline = set.reader;
         self.terrain_reader_twins = set.reader_twins;
         self.terrain_gentle = set.gentle;
@@ -149,12 +164,13 @@ impl XrRenderer {
         self.terrain_inlined = None;
         if self.weather.is_some() {
             let layout = crate::renderer::weather::bind_group_layout(&self.wgpu_device);
-            let (twins, gentle, dedup_passes) =
+            let (twins, gentle, dedup_passes, wet) =
                 weather_ground(&self.wgpu_device, format, &self.uniform_buf.layout, samples, &probe_pass_layout, &self.probe_fixups, &layout);
             if let Some(w) = self.weather.as_mut() {
                 w.twins = twins;
                 w.gentle = gentle;
                 w.dedup_passes = dedup_passes;
+                w.wet = wet;
             }
         }
         log::info!(

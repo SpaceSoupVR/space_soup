@@ -82,6 +82,68 @@ pub fn outdoor_frusta(
     Some(out)
 }
 
+/// WHAT AN EYE IN A CLOSED ROOM CAN SEE OF THE MODELS (`Levers::model_rooms`):
+/// those that reach into the room itself, and those one of its doorways
+/// shows. Everything else stands behind the room's walls -- a lamp two rooms
+/// away, in the eye's frustum, was drawn in full: its thousands of wire
+/// triangles through the scene pass and the motion pass for no pixel (Quest 3,
+/// 2026-10-13, torch_doorway_out: five lamps' thin parts, 39,000 triangles an
+/// eye, 5,000 fragments between them).
+///
+/// One doorway deep: what a doorway shows is not narrowed further by the
+/// rooms beyond it. See [`room_view`].
+#[derive(Clone, Debug)]
+pub struct RoomView {
+    /// The room's box, WORLD.
+    room: (Vec3, Vec3),
+    /// The view narrowed to each of its doorways in sight, in the caller's
+    /// frame.
+    doorways: Vec<[Vec4; 6]>,
+}
+
+impl RoomView {
+    /// Whether a model may be seen: its bounding sphere, centre in the WORLD
+    /// (`world_centre`) and in the caller's frame (`bound`, xyz and radius),
+    /// reaches into the room or into what a doorway shows.
+    pub fn shows(&self, world_centre: Vec3, bound: Vec4, margin: f32) -> bool {
+        let r = bound.w + margin;
+        let nearest = world_centre.clamp(self.room.0, self.room.1);
+        nearest.distance_squared(world_centre) <= r * r
+            || self.doorways.iter().any(|p| crate::renderer::shadow::sphere_in_frustum(p, bound.truncate().extend(r)))
+    }
+
+    /// How many of the room's doorways are in sight.
+    pub fn doorways(&self) -> usize {
+        self.doorways.len()
+    }
+}
+
+/// The closed room `eye` is in and what its doorways show, or `None` where
+/// nothing can be culled this way (as [`outdoor_frusta`]: the eye in no room,
+/// in an open one, in a doorway). Frames as [`outdoor_frusta`].
+pub fn room_view(
+    eye: Vec3,
+    clip_from_world: Mat4,
+    clip_from_frame: Mat4,
+    rooms: &[CullRoom],
+    portals: &[ProbePortal],
+) -> Option<RoomView> {
+    let start = rooms
+        .iter()
+        .filter(|r| (r.min.cmplt(eye) & eye.cmplt(r.max)).all())
+        .min_by(|a, b| volume(a).total_cmp(&volume(b)))?;
+    if !start.closed {
+        return None;
+    }
+    let doorways = portals
+        .iter()
+        .filter(|p| p.low == start.id || p.high == start.id)
+        .filter_map(|p| doorway_window(p, clip_from_world))
+        .map(|w| crate::renderer::shadow::frustum_planes(window_matrix(w) * clip_from_frame))
+        .collect();
+    Some(RoomView { room: (start.min, start.max), doorways })
+}
+
 fn volume(r: &CullRoom) -> f32 {
     let d = r.max - r.min;
     d.x * d.y * d.z
@@ -261,6 +323,43 @@ mod tests {
         open[1].closed = false;
         let frusta = outdoor_frusta(eye, cam, cam, &open, &portals).unwrap();
         assert!(chunk_seen(&chunk(Vec3::new(12.0, 0.0, -3.5), Vec3::new(14.0, 1.0, -2.5)), &frusta));
+    }
+
+    /// A model is drawn from inside the hall where it stands in the hall, in
+    /// a doorway of it, or where a doorway shows it -- not behind a wall, in
+    /// the frustum or out of it.
+    #[test]
+    fn a_closed_rooms_walls_hide_the_models_behind_them() {
+        let (rooms, portals) = level();
+        let eye = Vec3::new(0.0, 1.6, -6.0);
+        let cam = camera(eye, Vec3::new(0.0, 1.6, 10.0));
+        let view = room_view(eye, cam, cam, &rooms, &portals).expect("in a closed room");
+        let shows = |c: Vec3, r: f32| view.shows(c, c.extend(r), 0.25);
+        assert!(shows(Vec3::new(1.0, 2.5, 0.0), 0.3), "a lamp in the hall");
+        assert!(shows(Vec3::new(-2.0, 1.0, -15.0), 0.3), "one behind the eye, in the hall: the frustum's to cull, not the room's");
+        assert!(shows(Vec3::new(0.0, 1.0, 4.15), 1.2), "the front door's leaf, in its doorway");
+        assert!(shows(Vec3::new(0.0, 1.0, 12.0), 0.5), "a lamp on the lawn, straight out of the door");
+        assert!(!shows(Vec3::new(8.0, 1.0, 12.0), 0.5), "one on the lawn behind the hall's front wall");
+        assert!(!shows(Vec3::new(-9.0, 2.0, 0.0), 0.5), "one behind the hall's far side wall");
+        // The side door is behind the frustum's edge here: the hallway's lamp
+        // is hidden; turned to face that door, it shows.
+        let in_hallway = Vec3::new(4.7, 0.9, -1.5);
+        let turned = camera(eye, Vec3::new(10.0, 1.6, -3.0));
+        let view = room_view(eye, turned, turned, &rooms, &portals).unwrap();
+        assert!(view.shows(in_hallway, in_hallway.extend(0.4), 0.25), "the hallway's lamp through the side door");
+        assert_eq!(view.doorways(), 1, "the front door is out of this view");
+        // A sphere that only just reaches the room's box counts as in it.
+        assert!(view.shows(Vec3::new(-3.5, 1.0, 0.0), Vec3::new(-3.5, 1.0, 0.0).extend(0.3), 0.25));
+        // Outdoors, or in a doorway: no view, nothing culled.
+        assert!(room_view(Vec3::new(0.0, 1.6, 10.0), cam, cam, &rooms, &portals).is_none());
+        assert!(room_view(Vec3::new(0.0, 1.6, 4.2), cam, cam, &rooms, &portals).is_none());
+        // The frame the caller draws in: the planes follow `clip_from_frame`.
+        let shift = Mat4::from_translation(Vec3::new(50.0, 0.0, 0.0));
+        let view = room_view(eye, cam, cam * shift.inverse(), &rooms, &portals).unwrap();
+        let lawn = Vec3::new(0.0, 1.0, 12.0);
+        assert!(view.shows(lawn, shift.transform_point3(lawn).extend(0.5), 0.25));
+        let hidden = Vec3::new(8.0, 1.0, 12.0);
+        assert!(!view.shows(hidden, shift.transform_point3(hidden).extend(0.5), 0.25));
     }
 
     /// Outdoors, in an open room, or standing in a doorway: no culling.

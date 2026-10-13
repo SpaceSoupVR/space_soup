@@ -296,6 +296,26 @@ impl VkContext {
             "expect0" => crate::renderer::terrain_pipeline::expect_painted_ground(false),
             _ => {}
         }
+        // MEASUREMENT: `adb shell setprop debug.spacesoup.chunks 16` cuts the
+        // ground into that many chunks a side from the next launch. See
+        // `ground_horizon::CHUNKS_A_SIDE`.
+        if let Ok(n) = system_property(c"debug.spacesoup.chunks").parse::<u32>() {
+            crate::renderer::ground_horizon::CHUNKS_A_SIDE.store(n.min(64), std::sync::atomic::Ordering::Relaxed);
+        }
+        // MEASUREMENT: `adb shell setprop debug.spacesoup.opaque 0` builds the
+        // scene's ground pipelines WITH blending, as they were until
+        // 2026-10-13, from the next launch. See `terrain_pipeline::OPAQUE_GROUND`.
+        if system_property(c"debug.spacesoup.opaque") == "0" {
+            crate::renderer::terrain_pipeline::OPAQUE_GROUND.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("OPAQUE: off -- the scene's ground is drawn with blending");
+        }
+        // THE GROUND IN THE WORLD, posed by its vertex shaders, unless
+        // `adb shell setprop debug.spacesoup.worldground 0` before a launch
+        // keeps the app posing every vertex as it did until 2026-10-13. Set
+        // here, before any ground pipeline is built. See
+        // `terrain_pipeline::WORLD_GROUND`.
+        let world_ground = system_property(c"debug.spacesoup.worldground") != "0";
+        crate::renderer::terrain_pipeline::WORLD_GROUND.store(world_ground, std::sync::atomic::Ordering::Relaxed);
         // PIPELINE STATISTICS, when asked for. See `PIPELINE_STATISTICS_PROPERTY`.
         let statistics_extension_available = unsafe {
             vk_instance

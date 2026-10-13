@@ -2863,6 +2863,31 @@ pub fn room_ambient(descs: &[ProbeDesc], world: Vec3) -> Vec3 {
     Vec3::new(l[0][0], l[0][1], l[0][2]) * 0.282_095
 }
 
+/// [`room_ambient`] AT THE LEVEL'S TIME OF DAY. The room's light was baked
+/// under the photographed sky; at dusk the sky is a hundredth of that, the
+/// ground is lit by what the sky is now, and smoke and airborne water lit by
+/// the bake stood white over it (splashes, 2026-10-13). `relit` is, by
+/// photograph in `descs`' order, how bright each is now over how bright it
+/// was photographed -- what the time of day already keeps for the
+/// reflections (`XrRenderer::probe_brightness` over the photographed mean:
+/// the daylight's share scaled to the hour, the lamps' kept) -- and the
+/// room's baked light takes the ratio of the photograph the point is in: the
+/// smallest room's that holds it, else the nearest. Empty: as baked.
+pub fn room_ambient_now(descs: &[ProbeDesc], world: Vec3, relit: &[f32]) -> Vec3 {
+    let baked = room_ambient(descs, world);
+    if relit.is_empty() {
+        return baked;
+    }
+    let lit = || descs.iter().enumerate().filter(|(_, d)| d.room_light.is_some());
+    let size = |d: &ProbeDesc| (d.max - d.min).max(Vec3::ZERO).element_product();
+    let inside = lit().filter(|(_, d)| (world - d.min).min(d.max - world).min_element() >= 0.0).min_by(|a, b| size(a.1).total_cmp(&size(b.1)));
+    let nearest = || lit().min_by(|a, b| (a.1.centre - world).length_squared().total_cmp(&(b.1.centre - world).length_squared()));
+    match inside.or_else(nearest) {
+        Some((i, _)) => baked * relit.get(i).copied().filter(|k| k.is_finite()).unwrap_or(1.0).max(0.0),
+        None => baked,
+    }
+}
+
 /// Whether a lamp lights an emitter's particles: it hangs in the smallest
 /// room box holding the emitter, or a little outside it (a lamp in a
 /// doorway). Both points in the world's frame. Without rooms, every lamp
@@ -5772,6 +5797,30 @@ mod tests {
         let (lo, hi) = with.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
         assert!(hi > 1.03 * lo && hi < 1.25 * alone && lo > 0.8 * alone, "{lo} to {hi}, alone {alone}");
         assert!((0..50).map(|k| glow(&[bed.clone()], 50.0 + k as f64 * 0.05)).all(|g| g == alone), "alone it does not");
+    }
+
+    /// The effects' ambient follows the time of day: the baked light of the
+    /// room a point is in, by how bright that room's photograph is now over
+    /// how it was photographed -- outdoors at dusk a hundredth, a lamplit room
+    /// nearly what it was -- and as baked when no time of day runs.
+    #[test]
+    fn the_rooms_ambient_follows_the_time_of_day() {
+        let level = [[1.0f32; 3]; 9];
+        let room = |volume: u32, lo: Vec3, hi: Vec3| ProbeDesc { centre: 0.5 * (lo + hi), min: lo, max: hi, volume, has_depth: true, room_light: Some(level) };
+        let descs = [room(0, Vec3::splat(-50.0), Vec3::splat(50.0)), room(1, Vec3::ZERO, Vec3::splat(4.0))];
+        let (outdoors, indoors) = (Vec3::new(20.0, 1.0, 20.0), Vec3::splat(2.0));
+        let baked = room_ambient(&descs, outdoors);
+        assert!(baked.x > 0.0);
+        assert_eq!(room_ambient_now(&descs, outdoors, &[]), baked);
+        // Dusk: the outdoors' photograph at a hundredth, the hall's (lamps) at 0.8.
+        let relit = [0.01, 0.8];
+        assert!((room_ambient_now(&descs, outdoors, &relit).x / baked.x - 0.01).abs() < 1e-4);
+        let hall = room_ambient(&descs, indoors);
+        assert!((room_ambient_now(&descs, indoors, &relit).x / hall.x - 0.8).abs() < 1e-4, "the smallest room that holds the point is its room");
+        // Past every box, the nearest photograph's; a ratio that is not a number, the bake's.
+        let far = Vec3::new(-200.0, 0.0, -200.0);
+        assert!((room_ambient_now(&descs, far, &relit).x / room_ambient(&descs, far).x - 0.01).abs() < 1e-4);
+        assert_eq!(room_ambient_now(&descs, outdoors, &[f32::NAN, 1.0]), baked);
     }
 
     #[test]

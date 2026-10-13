@@ -978,6 +978,13 @@ pub struct ShadowMap {
     spot_tile_dim: u32,
     sampler: Sampler,
     solid_pipeline: RenderPipeline,
+    /// The solid pipeline for vertices in the WORLD -- the ground, where it
+    /// is kept so (`terrain_pipeline::WORLD_GROUND`): `vs_mesh` over solid
+    /// vertices, posed by the model matrix in [`Self::solid_world`].
+    solid_world_pipeline: RenderPipeline,
+    /// The player's frame from the world, as a model's uniform, when the
+    /// ground's chunks are world vertices this frame. See `set_solid_world`.
+    solid_world: std::cell::RefCell<Option<(BindGroup, bool)>>,
     mesh_pipeline: RenderPipeline,
     skinned_pipeline: RenderPipeline,
     /// A skinned caster posed once this frame (`skin_compute`), drawn as a
@@ -1124,6 +1131,35 @@ impl ShadowMap {
             label: Some("shadow_mesh_layout"),
             bind_group_layouts: &[Some(&light_layout), Some(&model_layout)],
             immediate_size: 0,
+        });
+        // As the solid pipeline in everything but where its vertices are.
+        let solid_world_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("shadow_solid_world_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_mesh"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(SolidVertex::layout())],
+            },
+            fragment: None,
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: Some(Face::Back),
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
+                stencil: StencilState::default(),
+                bias,
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
         });
         let mesh_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("shadow_mesh_pipeline"),
@@ -1299,6 +1335,8 @@ impl ShadowMap {
             spot_tile_dim: dim,
             sampler,
             solid_pipeline,
+            solid_world_pipeline,
+            solid_world: Default::default(),
             mesh_pipeline,
             skinned_pipeline,
             posed_pipeline,
@@ -1372,6 +1410,25 @@ impl ShadowMap {
         }
     }
 
+    /// THE GROUND'S CHUNKS ARE WORLD VERTICES (`Some`: the player's frame
+    /// from the world, as a mesh's model uniform) or posed ones (`None`), for
+    /// every pass recorded from here on. `whole`: so is the solid buffer
+    /// drawn whole, with no chunks handed (a harness whose solid buffer is
+    /// the ground alone); on the headset that buffer holds the frame's
+    /// posed cuboids too, and only the chunks are the world's.
+    pub fn set_solid_world(&self, model: Option<&BindGroup>, whole: bool) {
+        *self.solid_world.borrow_mut() = model.map(|m| (m.clone(), whole));
+    }
+
+    /// The solid pipeline for a pass's solids, with its group 1 where it has
+    /// one: the world's when what is drawn is world vertices.
+    fn solid_pipeline_for(&self, chunks: bool) -> (&RenderPipeline, Option<BindGroup>) {
+        match self.solid_world.borrow().clone().filter(|(_, whole)| chunks || *whole) {
+            Some((model, _)) => (&self.solid_world_pipeline, Some(model)),
+            None => (&self.solid_pipeline, None),
+        }
+    }
+
     /// Every shadow-casting spot, in ONE render pass.
     ///
     /// THIS is why the spots share an atlas. On a tile GPU a render pass is a
@@ -1400,6 +1457,7 @@ impl ShadowMap {
         solid_chunks: &[CasterChunk],
     ) -> u32 {
         let mut drawn = 0u32;
+        let (solid_pipeline, solid_model) = self.solid_pipeline_for(!solid_chunks.is_empty());
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("spot_shadow_atlas_pass"),
             color_attachments: &[],
@@ -1423,8 +1481,11 @@ impl ShadowMap {
 
             if let Some((vb, ib, total)) = solid {
                 if total > 0 {
-                    pass.set_pipeline(&self.solid_pipeline);
+                    pass.set_pipeline(solid_pipeline);
                     pass.set_bind_group(0, light_bg, &[]);
+                    if let Some(model) = &solid_model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     if solid_chunks.is_empty() {
@@ -1613,6 +1674,7 @@ impl ShadowMap {
             // A tile of the moving-objects map. See `SUN_ATLAS_TILES`.
             ShadowKind::Character(_) | ShadowKind::SunNear => self.sun_dynamic.depth_view.as_ref().expect("the dynamic sun owns its own depth target"),
         };
+        let (solid_pipeline, solid_model) = self.solid_pipeline_for(!solid_chunks.is_empty());
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("shadow_pass"),
             color_attachments: &[],
@@ -1647,8 +1709,11 @@ impl ShadowMap {
 
             if let Some((vb, ib, count)) = solid {
                 if count > 0 {
-                    pass.set_pipeline(&self.solid_pipeline);
+                    pass.set_pipeline(solid_pipeline);
                     pass.set_bind_group(0, &slot.light_bind_group, &[]);
+                    if let Some(model) = &solid_model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     if solid_chunks.is_empty() {
