@@ -2046,6 +2046,32 @@ const PROBE_FACE_ALWAYS_GIVEN: bool = {probe_face_always};
 // for `probe_fixup` (`probe_fixup_begin` and `_finish`) -- the ray's part the
 // moment the trace ends, so it is not carried through the colour lookup.
 const PROBE_SECONDARY_DEFERRED: bool = {defer_secondary};
+// WHETHER EVERY SURFACE THIS SHADER DRAWS STARTS OUT OF DOORS: in the outdoor
+// volume, in no room and no doorway, with the trace on -- which the CPU knows
+// of a whole chunk of ground from its bounds (`outdoor_pass::all_outdoors`).
+// `probe_environment` then answers with the one thing it would find on its
+// way through the rooms' machinery: the trace starts in the outdoor volume
+// and leaves it where it starts, so the reflection is `probe_escape_colour`
+// from the surface itself (too rough to trace, the photographs of the outdoor
+// volume: `probe_outdoor_untraced`). A constant, so the ground's outdoor twin
+// (`terrain_pipeline::outdoor_pass_shader`) carries none of that machinery --
+// the choice of photographs, the walk through rooms and doorways, their rims,
+// what stands in them, the fix-up's records -- nor the registers it holds.
+const PROBE_ALL_OUTDOORS: bool = false;
+// NOWHERE, by the caller's word: every texel of the draw lies in no
+// photograph's box and beyond every doorway's fades -- which the CPU knows of
+// a whole chunk of ground from its bounds and the frame's probe table
+// (`outdoor_pass::NowhereFrame`). `probe_environment` then answers what it
+// would have found: no room to start a trace in and no doorway holding the
+// surface (`probe_trace_skipping` returns at once), no photograph chosen, no
+// doorway near enough to blend one in -- nothing, coverage 0, and the scene
+// shader lights the surface from the sky and its lightmap. A constant, so
+// the ground's twin for such chunks (`terrain_pipeline::nowhere_pass_shader`)
+// has none of the lookup compiled in: only the characters' reflections.
+//
+// That is most of this level's ground: the baked outdoor volume is the box
+// round the buildings, and the hills, the beach and the cave lie outside it.
+const PROBE_NOWHERE: bool = false;
 // A MODEL CARD'S TRUST, FILTERED: each of the four texels round the point
 // tested on its own and the verdicts blended, as percentage-closer filtering
 // blends a shadow map's -- where one test on blended texels averaged a facing
@@ -3335,6 +3361,35 @@ fn probe_environment(
     let volume_world = select(select_world, to_world_space(probe_volume_pos.xyz), probe_volume_pos.w > 0.5);
     let world_dir = to_world_direction(dir);
     probe_brightness = 0.0;
+    // OUT OF DOORS, by the caller's word (`PROBE_ALL_OUTDOORS`): what the code
+    // below does for a surface in the outdoor volume alone, with nothing else
+    // compiled in. There `probe_choose` returns that volume's room, the trace
+    // starts in it (its origin the surface, inside its box) and leaves at once
+    // (`cur + 1.0 == camera.portal_params.z`, at t = 0), nothing is deferred,
+    // and `probe_traced_colour` colours the escape and adds its 0 to the reach.
+    // The same expressions as below, so the same values.
+    if (PROBE_NOWHERE) {{
+        // As the code below leaves them when it finds nothing: the brightness
+        // 0 (set above), the reach untouched, the eye's distance set.
+        probe_eye_distance = distance(cam_pos(), frag_pos);
+        let nothing = vec4<f32>(0.0);
+        return nothing;
+    }}
+    if (PROBE_ALL_OUTDOORS) {{
+        // (`away` and `away_lod`, not `d` and `probe_lod`: the deferring pass's
+        // cuts find the lines below by their text, once.)
+        let away = normalize(world_dir);
+        let away_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);
+        probe_eye_distance = distance(cam_pos(), frag_pos);
+        // TOO ROUGH TO TRACE (`probe_trace_skipping`'s own test, and the
+        // trace's switch is the caller's word too): the photographs, as below.
+        if (roughness > PROBE_TRACE_MAX_ROUGHNESS) {{
+            return probe_outdoor_untraced(probe_choose(select_world, volume_world), world_pos, away, away_lod);
+        }}
+        let col = probe_escape_colour(world_pos, away, dir, roughness, away_lod);
+        probe_reach = 0.0 + probe_reach;
+        return col;
+    }}
     let face_given = PROBE_FACE_ALWAYS_GIVEN || probe_face_given.w > 0.5;
     // Whether a doorway's carve holds the face: also the face's, so also given.
     var in_doorway = false;
@@ -3464,6 +3519,41 @@ fn probe_environment(
         }}
     }}
     return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);
+}}
+
+// OPEN GROUND TOO ROUGH TO TRACE (`PROBE_ALL_OUTDOORS`): the end of
+// `probe_environment` for a surface no doorway is near -- the nearest
+// photograph of its room, blended with the runner-up across the band between
+// them, each corrected from its own capture point -- and nothing of the
+// doorways, which `probe_through_portals` passes by from further than its
+// fades (`outdoor_pass::OutdoorFrame` keeps the twin's ground that far). The
+// same operations in the same order as there, under names of its own: the
+// passes' measurement cuts find that code by its text, once
+// (`lights::tests::the_outdoor_twins_rough_answer_is_the_full_pass_s`).
+fn probe_outdoor_untraced(pick: ProbeChoice, world_pos: vec3<f32>, away: vec3<f32>, away_lod: f32) -> vec4<f32> {{
+    var mine = vec4<f32>(0.0);
+    if (pick.best >= 0) {{
+        var share = 1.0;
+        if (pick.second >= 0) {{
+            let apart = sqrt(pick.second_dist) - sqrt(pick.best_dist);
+            share = 0.5 + 0.5 * smoothstep(0.0, PROBE_BLEND_BAND, apart);
+        }}
+        let near_dir = probe_parallax_direction(world_pos, away, pick.best);
+        let near_layer = i32(camera.probe_boxes[pick.best * 3].w);
+        let near_photo = textureSampleLevel(probe_cube, probe_samp, near_dir, near_layer, away_lod);
+        probe_brightness = camera.probe_boxes[pick.best * 3 + 1].w;
+        mine = near_photo;
+        if (pick.second >= 0) {{
+            let far_photo_dir = probe_parallax_direction(world_pos, away, pick.second);
+            let far_photo = textureSampleLevel(
+                probe_cube, probe_samp, far_photo_dir, i32(camera.probe_boxes[pick.second * 3].w), away_lod
+            );
+            // The brightness blends with the same weight as the photographs it describes.
+            probe_brightness = mix(camera.probe_boxes[pick.second * 3 + 1].w, camera.probe_boxes[pick.best * 3 + 1].w, share);
+            mine = mix(far_photo, near_photo, share);
+        }}
+    }}
+    return mine;
 }}
 
 // As far as the probe is used at all: `shade_material_env` fades it into the
@@ -4621,7 +4711,12 @@ fn ground_trace_until(e: vec3<f32>, d: vec3<f32>, t_max: f32) -> f32 {{
     // texels, where a puddle lies -- meets nothing until it has risen above
     // it: before, it met the ground where it started and a mirror puddle
     // showed the grass under it, a flat dark-green pool (headset, 2026-10-08).
-    var risen = false;
+    // A ray heading DOWN from under it is in the ground already and meets it
+    // where it starts, as before that: waiting for it to rise walked every
+    // such ray to the end of its 64 steps (61 on average, against 9-20 for a
+    // rising one; `under_ground_census`) to answer the sky -- for a ray
+    // pointed into the ground (round 5, 2026-10-08).
+    var risen = d.y <= 0.0;
     for (var steps = 0; steps < GROUND_TRACE_MAX_STEPS && t < t_out; steps = steps + 1) {{
         let cell = f32(1u << u32(level));
         let last = floor(size / cell) - 1.0;
@@ -7247,6 +7342,53 @@ mod probe_blend_tests {
         let env = &code[code.find("fn probe_environment(").unwrap()..code.find("fn probe_trace(").unwrap()];
         assert!(!env.contains("return vec4<f32>(0.0);"), "an early return skips the doorways again");
         assert!(env.contains("return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);"));
+    }
+
+    /// `probe_outdoor_untraced` is the end of `probe_environment` -- the
+    /// photographs' blend -- under names of its own, and stays so: the two are
+    /// compared with the names mapped back and the comments and spacing out.
+    /// And the outdoor branch asks it by the trace's own roughness test.
+    #[test]
+    fn the_outdoor_twins_rough_answer_is_the_full_pass_s() {
+        let code = shader();
+        let bare = |text: &str| -> String {
+            text.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .flat_map(|l| l.chars())
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let at = |hay: &str, needle: &str| hay.find(needle).unwrap_or_else(|| panic!("missing: {needle}"));
+        let env = &code[at(&code, "fn probe_environment(")..at(&code, "fn probe_outdoor_untraced(")];
+        let full = &env[at(env, "    var own = vec4<f32>(0.0);")..at(env, "    return probe_through_portals(own")];
+        let full = bare(full).replace("varown_room=-1.0;", "").replace("own_room=best_room;", "");
+        let twin = &code[at(&code, "fn probe_outdoor_untraced(")..];
+        let twin = &twin[at(twin, "    var mine = vec4<f32>(0.0);")..at(twin, "    return mine;")];
+        let mut twin = bare(twin);
+        for (mine, theirs) in [
+            ("pick.second_dist", "second_dist"),
+            ("pick.best_dist", "best_dist"),
+            ("pick.second", "second"),
+            ("pick.best", "best"),
+            ("far_photo_dir", "far_dir"),
+            ("far_photo", "far"),
+            ("near_photo", "near"),
+            ("near_dir", "sample_dir"),
+            ("near_layer", "layer"),
+            ("away_lod", "probe_lod"),
+            ("away", "d"),
+            ("apart", "gap"),
+            ("share", "band"),
+            ("mine", "own"),
+        ] {
+            twin = twin.replace(mine, theirs);
+        }
+        assert_eq!(twin, full);
+        // Asked where the trace would give up, by its test.
+        assert!(code.contains("if (roughness > PROBE_TRACE_MAX_ROUGHNESS || camera.portal_params.y > 0.5) {"));
+        let branch = &env[at(env, "    if (PROBE_ALL_OUTDOORS) {")..at(env, "    let face_given = ")];
+        assert!(at(branch, "if (roughness > PROBE_TRACE_MAX_ROUGHNESS) {") < at(branch, "probe_escape_colour("));
+        assert!(branch.contains("return probe_outdoor_untraced(probe_choose(select_world, volume_world), world_pos, away, away_lod);"));
     }
 
     /// The doorway blend's reach is generated from the Rust constants.

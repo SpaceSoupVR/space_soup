@@ -169,6 +169,12 @@ impl SkinnedMeshVertex {
 pub struct LayeredPrimitive {
     pub vertices: Vec<LayeredVertex>,
     pub vertex_buffer: wgpu::Buffer,
+    /// Where each triangle class ends in the (reordered) index buffer:
+    /// rock, ground in front, ground behind, mixed. See `cave_twins`.
+    pub twin_ends: [u32; 4],
+    /// The box round its vertices, in the model's frame: whether an eye is in
+    /// the cave, for its depth in the reflection pass (`cave_twins`).
+    pub bounds: [[f32; 3]; 2],
 }
 
 #[derive(Clone)]

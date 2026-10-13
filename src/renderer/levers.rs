@@ -299,6 +299,47 @@ pub struct Levers {
     /// (`ground_twins::dedup_passes`). Off draws the pass as it was. The same
     /// picture.
     pub pass_dedup: bool,
+    /// MEASUREMENT: each time this changes to a new non-zero value, the next
+    /// frame's command buffers, draws and dispatches are logged with their
+    /// pipelines' labels (`DRAWLOG` lines), in the order a per-draw GPU trace
+    /// numbers them. See `wgpu_hal::vulkan::DRAW_LOG`.
+    pub draw_log: u32,
+    /// The cave drawn by its shader's twins, each triangle class by the twin
+    /// without the path its pixels never take (`cave_twins`). Off draws the
+    /// whole cave with the full shader. The same picture.
+    pub cave_twins: bool,
+    /// The cave's depth drawn first in the reflection (probe) pass, so the
+    /// ground behind its rock is not traced there (`cave_twins`). Off leaves
+    /// the cave out of that pass, as before. The same picture.
+    pub cave_occluder: bool,
+    /// The scene pass draws a model, or a cave, only for an eye whose view
+    /// its bound reaches: the motion pass's cull (`space_warp`), for the pass
+    /// that shades. Off draws every model for both eyes wherever it stands --
+    /// its vertices shaded twice a frame for nothing
+    /// (`docs/shader-optimization-2026-10-12.md`). The same picture: the GPU
+    /// clipped them.
+    ///
+    /// OFF UNTIL MEASURED ON THE HEADSET (built 2026-10-12 with the headset
+    /// out of reach; `docs/bench/shader_opt_1012/round6.sh` is the run that
+    /// decides it).
+    pub scene_cull: bool,
+    /// The reflection pass draws the ground that is all out of doors -- in the
+    /// outdoor volume, clear of every room and of every doorway's fades --
+    /// with its outdoor twin, which has the outdoor reflection and none of
+    /// the rooms' machinery (`outdoor_pass`). Off draws all of the ground
+    /// with the full pass. The same picture.
+    ///
+    /// OFF UNTIL MEASURED ON THE HEADSET, as `scene_cull`.
+    pub outdoor_pass: bool,
+    /// The reflection pass draws the ground that lies in no photograph's box
+    /// and beyond every doorway's reach -- most of a level whose outdoor
+    /// volume is the box round its buildings -- with its nowhere twin, whose
+    /// lookup answers "nothing" at once, as the full pass's does after all
+    /// its searching (`outdoor_pass::NowhereFrame`). Off draws that ground
+    /// with the full pass. The same picture.
+    ///
+    /// OFF UNTIL MEASURED ON THE HEADSET, as `scene_cull`.
+    pub nowhere_pass: bool,
     /// MEASUREMENT: the ground drawn by its full reader everywhere, with no
     /// twin (`full`), or as it was before its layer reads became one loop
     /// (`inlined`: reader and probe pass, no twin). The same picture as the
@@ -348,6 +389,9 @@ pub struct Levers {
     /// the shader's code stays; its amount is 0.
     pub night_vision: bool,
 }
+
+/// Set by a change of [`Levers::draw_log`]; taken by the next frame.
+pub static DRAW_LOG_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl Default for Levers {
     fn default() -> Self {
@@ -408,6 +452,12 @@ impl Default for Levers {
             water_cut: None,
             slope_twins: true,
             pass_dedup: true,
+            draw_log: 0,
+            cave_twins: true,
+            cave_occluder: true,
+            scene_cull: false,
+            outdoor_pass: false,
+            nowhere_pass: false,
             terrain_reader: None,
             reader_edit: None,
             gpu_sync: false,
@@ -586,6 +636,24 @@ impl Levers {
         }
         if !self.pass_dedup {
             out.push("no_pass_dedup".to_string());
+        }
+        if self.draw_log != 0 {
+            out.push(format!("draw_log={}", self.draw_log));
+        }
+        if !self.cave_twins {
+            out.push("no_cave_twins".to_string());
+        }
+        if !self.cave_occluder {
+            out.push("no_cave_occluder".to_string());
+        }
+        if self.scene_cull {
+            out.push("scene_cull".to_string());
+        }
+        if self.outdoor_pass {
+            out.push("outdoor_pass".to_string());
+        }
+        if self.nowhere_pass {
+            out.push("nowhere_pass".to_string());
         }
         if let Some(reader) = &self.terrain_reader {
             out.push(format!("terrain_reader={reader}"));

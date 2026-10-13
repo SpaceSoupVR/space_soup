@@ -556,8 +556,8 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
     let mut steps = 0;
     let mut reads = 0;
     // A ray that starts under the map's ground meets nothing until it has
-    // risen above it (`ground_trace_until`).
-    let mut risen = false;
+    // risen above it -- unless it heads down (`ground_trace_until`).
+    let mut risen = d.y <= 0.0;
     while steps < shape.max_steps && t < t_out {
         steps += 1;
         reads += 1;
@@ -923,6 +923,28 @@ mod tests {
         assert!(checked > 0, "no level ray met a hill");
     }
 
+    /// A ray heading DOWN from under the map's ground is in the ground: it
+    /// meets it where it starts, in the first cell's steps, rather than
+    /// walking its whole budget waiting to rise and answering the sky
+    /// (round 5, 2026-10-08).
+    #[test]
+    fn a_ray_heading_down_from_under_the_ground_meets_it_where_it_starts() {
+        let map = fixtures::height_map(1024, fixtures::hills);
+        let chain = levels(&map);
+        let size = map.max - map.min;
+        for i in 0..400 {
+            let x = map.min.x + size.x * (0.1 + 0.8 * ((i * 37 % 400) as f32 / 400.0));
+            let z = map.min.y + size.y * (0.1 + 0.8 * ((i * 91 % 400) as f32 / 400.0));
+            let under = height_at(&chain[0], (Vec2::new(x, z) - map.min) * (chain[0].width as f32 / size)) - 0.05;
+            let e = Vec3::new(x, under, z);
+            for d in [Vec3::new(0.7, -0.05, 0.7).normalize(), Vec3::new(-0.3, -0.6, 0.2).normalize(), Vec3::new(1.0, 0.0, 0.0)] {
+                let r = trace(&chain, map.min, map.max, map.top, e, d);
+                assert!(r.t.is_some_and(|t| t < 1e-3), "from under the ground at {e} along {d}: {:?}", r.t);
+                assert!(r.steps <= 4, "from under the ground at {e} along {d}: {} steps", r.steps);
+            }
+        }
+    }
+
     /// The trace against brute force: the same ground read every centimetre
     /// along the ray. They must meet the ground at the same point, and differ
     /// on hit or miss only for a ray that grazes it within a few centimetres.
@@ -1076,6 +1098,38 @@ mod step_census {
         }
         for (el, (n, s, m, h)) in buckets {
             eprintln!("elev {el:>4}..{:>3}: rays {n:>5}  mean steps {:>5.1}  max {m:>3}  hit {:>3.0}%", el + 5, s as f32 / n as f32, 100.0 * h as f32 / n as f32);
+        }
+    }
+}
+
+/// Where a reflection that starts UNDER the map's ground goes (a puddle's,
+/// round 5): steps by elevation, for rays from 3 cm under the ground against
+/// rays from on it. `cargo test --release --lib under_ground_census -- --ignored --nocapture`.
+#[cfg(test)]
+mod under_ground_census {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn steps_from_under_the_ground() {
+        let map = fixtures::height_map(1024, fixtures::hills);
+        let chain = levels(&map);
+        for under in [0.0f32, 0.03] {
+            let mut buckets = std::collections::BTreeMap::<i32, (u32, u32, u32, u32)>::new();
+            for (e, d) in fixtures::rays(20000, 5) {
+                let q = (Vec2::new(e.x, e.z) - map.min) / (map.max - map.min) * Vec2::new(chain[0].width as f32, chain[0].height as f32);
+                let e = Vec3::new(e.x, height_at(&chain[0], q) - under, e.z);
+                let r = trace(&chain, map.min, map.max, map.top, e, d);
+                let el = (d.y.asin().to_degrees() / 5.0).floor() as i32 * 5;
+                let b = buckets.entry(el).or_default();
+                b.0 += 1;
+                b.1 += r.steps;
+                b.2 = b.2.max(r.steps);
+                b.3 += r.t.is_some() as u32;
+            }
+            for (el, (n, s, m, h)) in buckets {
+                eprintln!("under {under}: elev {el:>4}..{:>3}: rays {n:>5}  mean steps {:>5.1}  max {m:>3}  hit {:>3.0}%", el + 5, s as f32 / n as f32, 100.0 * h as f32 / n as f32);
+            }
         }
     }
 }

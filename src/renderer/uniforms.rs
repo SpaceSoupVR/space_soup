@@ -563,6 +563,13 @@ impl UniformBuffer {
         push_slots(probes.unwrap_or(&self.probes))
     }
 
+    /// The probe table a pass's camera block is written with: `probes`, or --
+    /// `None` -- the table `set_probes` gave. For what the CPU decides from
+    /// the same table the shader reads (`outdoor_pass`).
+    pub fn probes_or_level<'a>(&'a self, probes: Option<&'a ProbeUpload>) -> &'a ProbeUpload {
+        probes.unwrap_or(&self.probes)
+    }
+
     /// The probes the last [`Self::rebind_probes`] or [`Self::set_probes`] set.
     pub fn probes(&self) -> ProbeUpload {
         self.probes
