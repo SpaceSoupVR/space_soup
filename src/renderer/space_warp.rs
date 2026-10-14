@@ -480,13 +480,13 @@ pub enum MotionKind {
     /// behind it by [`layer_motion_weight`]: no vertex buffer, group 1 the
     /// weather's own group. See `weather::motion_shader`.
     Weather,
-    /// The effects drawn over what is behind them -- smoke, flames, coals, a
-    /// splash's crown and mist -- and those screened over it -- embers, dust
-    /// motes, a splash's drops. Their instance buffer; group 1 the probe
-    /// pass's read group, group 2 the effects' own. See
-    /// `effects::motion_shader`.
-    EffectsOver,
-    EffectsScreened,
+    /// The effects: a run of their instances drawn by one shader variant
+    /// (`effects::variants`), by that variant's own twin -- those drawn over
+    /// what is behind them (smoke, flames, coals, a splash's crown and mist)
+    /// and those screened over it (embers, dust motes, a splash's drops, a
+    /// muzzle flash). Their instance buffer; group 1 the probe pass's read
+    /// group, group 2 the effects' own. See `effects::motion_shader_of`.
+    Effects(crate::renderer::effects::FxVariant),
 }
 
 /// The motion-vector pipelines, one per vertex layout the eye pass draws
@@ -508,8 +508,8 @@ pub struct MotionPipelines {
     skinned: wgpu::RenderPipeline,
     water: wgpu::RenderPipeline,
     weather: wgpu::RenderPipeline,
-    effects_over: wgpu::RenderPipeline,
-    effects_screened: wgpu::RenderPipeline,
+    /// One twin a variant of the effects' shader, by `FxVariant as usize`.
+    effects: Vec<wgpu::RenderPipeline>,
     /// Whether the depth format carries stencil (D24S8), which the pass then
     /// clears too rather than leave for wgpu to zero on first use.
     stencil: bool,
@@ -756,21 +756,14 @@ impl MotionPipelines {
         let effects_group = crate::renderer::effects::bind_group_layout(device);
         let effects_layouts = [Some(&camera_layout), Some(&probe_group), Some(&effects_group)];
         let instances = [Some(crate::renderer::effects::EffectInstance::motion_layout())];
-        let effects_source = crate::renderer::effects::motion_shader();
-        let effects_over = particle(
-            "space_warp_effects_over",
-            &effects_layouts,
-            effects_source.clone(),
-            ("vs_fx_motion", "fs_fx_motion_over"),
-            &instances,
-        );
-        let effects_screened = particle(
-            "space_warp_effects_screened",
-            &effects_layouts,
-            effects_source,
-            ("vs_fx_motion", "fs_fx_motion_screened"),
-            &instances,
-        );
+        // A twin a variant, each from its variant's own text.
+        let effects: Vec<wgpu::RenderPipeline> = crate::renderer::effects::FxVariant::ALL
+            .iter()
+            .map(|v| {
+                let (source, fragment) = v.motion_shader();
+                particle(&format!("space_warp_{}", v.label()), &effects_layouts, source, ("vs_fx_motion", fragment), &instances)
+            })
+            .collect();
         Self {
             camera_layout,
             joints_layout,
@@ -783,8 +776,7 @@ impl MotionPipelines {
             skinned,
             water,
             weather,
-            effects_over,
-            effects_screened,
+            effects,
             stencil: depth_format.has_stencil_aspect(),
         }
     }
@@ -835,8 +827,7 @@ impl MotionPipelines {
             MotionKind::Skinned => &self.skinned,
             MotionKind::Water => &self.water,
             MotionKind::Weather => &self.weather,
-            MotionKind::EffectsOver => &self.effects_over,
-            MotionKind::EffectsScreened => &self.effects_screened,
+            MotionKind::Effects(variant) => &self.effects[variant as usize],
         }
     }
 }
@@ -910,7 +901,7 @@ pub fn record(
         if matches!(d.kind, MotionKind::Skinned | MotionKind::BrushReflect | MotionKind::Water) && d.joints.is_none() {
             continue;
         }
-        if matches!(d.kind, MotionKind::Weather | MotionKind::EffectsOver | MotionKind::EffectsScreened) {
+        if matches!(d.kind, MotionKind::Weather | MotionKind::Effects(_)) {
             continue;
         }
         let key = (d.kind, d.slot, d.vertices as *const _, d.indices as *const _, d.joints.map(|j| j as *const _));
@@ -929,7 +920,7 @@ pub fn record(
     for p in particles.iter().filter(|p| !p.range.is_empty() && p.vertices > 0 && p.slot < MAX_SLOTS) {
         let wants = match p.kind {
             MotionKind::Weather => p.groups[0].is_some(),
-            MotionKind::EffectsOver | MotionKind::EffectsScreened => p.groups.iter().all(Option::is_some) && p.instances.is_some(),
+            MotionKind::Effects(_) => p.groups.iter().all(Option::is_some) && p.instances.is_some(),
             _ => false,
         };
         if !wants {

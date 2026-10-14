@@ -21,6 +21,7 @@ pub mod dynamic_resolution;
 pub mod panel;
 pub mod glare;
 pub mod effects;
+pub mod effect_asset;
 pub mod particle;
 pub mod pipeline;
 pub mod profiler;

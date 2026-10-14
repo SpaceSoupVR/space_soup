@@ -61,6 +61,12 @@ use wgpu::*;
 use super::lights::{Light, LightKind};
 use super::probe_stream::ProbeDesc;
 
+mod flash;
+pub mod stack;
+pub mod templates;
+pub mod variants;
+pub use variants::FxVariant;
+
 /// What an emitter makes: one of a few presets, each a whole look.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EffectKind {
@@ -262,6 +268,7 @@ fn temperature(u: f32, v: &Variation) -> Vec3 {
 
 /// A kind's look and motion. Sizes are the quad's half size in metres at the
 /// emitter's scale 1.
+#[derive(Clone, Debug, PartialEq)]
 struct Preset {
     /// Particles a second; for dust, alive per cubic metre.
     rate: f32,
@@ -318,7 +325,16 @@ pub const SPRAY_FRAMES: u32 = 3;
 pub const FROTH_LAYER: u32 = SPRAY_LAYER + SPRAY_VARIANTS * SPRAY_FRAMES;
 pub const FROTH_VARIANTS: u32 = 2;
 pub const FROTH_FRAMES: u32 = 3;
-pub const ATLAS_LAYERS: u32 = FROTH_LAYER + FROTH_VARIANTS * FROTH_FRAMES;
+/// A MUZZLE FLASH's jets (`flash::lobe_frame`: `FLASH_VARIANTS` of each of
+/// `FLASH_FRAMES` forms, its heat in red and its cover in alpha, its root at
+/// the bottom) and its core at the muzzle (`flash::core_frame`). Added after
+/// every older layer, so none of theirs moved.
+pub const FLASH_LAYER: u32 = FROTH_LAYER + FROTH_VARIANTS * FROTH_FRAMES;
+pub const FLASH_VARIANTS: u32 = 4;
+pub const FLASH_FRAMES: u32 = 3;
+pub const CORE_LAYER: u32 = FLASH_LAYER + FLASH_VARIANTS * FLASH_FRAMES;
+pub const CORE_VARIANTS: u32 = 2;
+pub const ATLAS_LAYERS: u32 = CORE_LAYER + CORE_VARIANTS;
 pub const ATLAS_SIZE: u32 = 128;
 const ATLAS_MIPS: u32 = 8;
 
@@ -373,103 +389,10 @@ pub const VERTICES_PER_PARTICLE: u32 = 24;
 /// were 18.
 const CONVEX: f32 = 0.35;
 
+/// A kind's preset: what its built-in template's stack compiles to
+/// (`templates`). The numbers live in the stack.
 fn preset(kind: EffectKind) -> Preset {
-    match kind {
-        EffectKind::Fire => Preset {
-            // Sheets of flame standing on the bed, each playing a stretch of
-            // the flipbook and fading in and out over it: the flames' motion
-            // is the book's, the base stays on the fuel.
-            rate: 9.0,
-            life: (0.9, 1.3),
-            speed: (0.0, 0.0),
-            spread_deg: 0.0,
-            bed: 0.15,
-            size: (0.145, 0.13),
-            drag: 0.0,
-            accel: Vec3::ZERO,
-            swirl: (0.0, 0.0),
-            spin: (0.0, 0.07),
-            streak: 0.0,
-            soft: 0.05,
-            frames: (FIRE_FIRST, FIRE_FRAMES),
-            phase_g: 0.0,
-            albedo: 0.0,
-        },
-        EffectKind::Smoke => Preset {
-            rate: 6.0,
-            life: (4.0, 6.0),
-            speed: (0.15, 0.28),
-            spread_deg: 10.0,
-            bed: 0.06,
-            size: (0.1, 0.55),
-            drag: 0.6,
-            accel: Vec3::new(0.0, 0.3, 0.0),
-            swirl: (0.14, 0.7),
-            spin: (0.2, std::f32::consts::PI),
-            streak: 0.0,
-            soft: 0.3,
-            frames: (0, SMOKE_FRAMES),
-            phase_g: 0.35,
-            albedo: 0.3,
-        },
-        EffectKind::Embers => Preset {
-            rate: 5.0,
-            life: (1.2, 2.4),
-            speed: (0.9, 1.8),
-            spread_deg: 28.0,
-            bed: 0.06,
-            size: (0.005, 0.003),
-            drag: 1.3,
-            accel: Vec3::new(0.0, -1.1, 0.0),
-            swirl: (0.06, 3.0),
-            spin: (0.0, 0.0),
-            streak: 0.035,
-            soft: 0.02,
-            frames: (EMBER_LAYER, 1),
-            phase_g: 0.0,
-            albedo: 0.0,
-        },
-        // One bed, drawn whole (`coals_instance`); only its look is here.
-        EffectKind::Coals => Preset {
-            rate: 0.0,
-            life: (1.0, 1.0),
-            speed: (0.0, 0.0),
-            spread_deg: 0.0,
-            bed: 0.0,
-            size: (COALS_HALF, COALS_HALF),
-            drag: 0.0,
-            accel: Vec3::ZERO,
-            swirl: (0.0, 0.0),
-            spin: (0.0, 0.0),
-            streak: 0.0,
-            soft: 0.0,
-            frames: (COALS_LAYER, 1),
-            phase_g: 0.0,
-            albedo: 0.0,
-        },
-        // A life is how long the eye keeps hold of one mote, not how long
-        // it is in the air: it is noticed as it tumbles into the light, held
-        // a few seconds and lost, while others are found elsewhere. Its
-        // motion is the room's air (`air_drift`) plus its own jitter and a
-        // slow settling; `swirl` is that jitter's reach and pace.
-        EffectKind::Dust => Preset {
-            rate: 90.0,
-            life: (3.5, 6.5),
-            speed: (0.0, 0.004),
-            spread_deg: 180.0,
-            bed: 0.0,
-            size: DUST_LIGHT_SIZE,
-            drag: 0.4,
-            accel: Vec3::new(0.0, -0.0012, 0.0),
-            swirl: (0.006, 0.8),
-            spin: (0.0, 0.0),
-            streak: 0.0,
-            soft: 0.02,
-            frames: (MOTE_LAYER, 1),
-            phase_g: 0.7,
-            albedo: 0.8,
-        },
-    }
+    templates::template(kind).preset.clone()
 }
 
 /// One particle as the GPU draws it: its cutout, fanned from
@@ -539,6 +462,12 @@ pub struct EffectFrame {
     pub instances: Vec<EffectInstance>,
     pub over: u32,
     pub screened: u32,
+    /// How many of the screened, at their end, are lit through the heat
+    /// ramp (`stack::SHADE_SCREEN_HEAT`): drawn by their own variant, so an
+    /// ember's or a mote's pixels carry none of a flash's code.
+    pub screened_heat: u32,
+    /// What the event bursts among them came to (`stack`).
+    pub bursts: stack::BurstCount,
 }
 
 /// What lights the particles and where they are seen from.
@@ -1219,6 +1148,21 @@ pub fn simulate_with(emitters: &[EffectEmitter], splashes: &[Splash], time: f64,
 /// hundred times too bright. Each particle is a function of the time, so one
 /// coming back into view is where it would have been.
 pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, splashes: &[Splash], time: f64, at: &Surroundings) -> EffectFrame {
+    simulate_all(emitters, seen, splashes, None, time, at)
+}
+
+/// [`simulate_seen`], with the event bursts in play (`stack::BurstSet`,
+/// already given this frame's clock by its `frame`): a shot's flash, its
+/// smoke. Lit as the emitters' particles are, and by a fire's own light as
+/// the eye adapted to the fire sees it.
+pub fn simulate_all(
+    emitters: &[EffectEmitter],
+    seen: &dyn Fn(usize) -> bool,
+    splashes: &[Splash],
+    bursts: Option<&stack::BurstFrame>,
+    time: f64,
+    at: &Surroundings,
+) -> EffectFrame {
     let mut over: Vec<(f32, EffectInstance)> = Vec::new();
     let mut screened: Vec<EffectInstance> = Vec::new();
     let player = |p: Vec3| at.yaw_inv * (p - at.offset);
@@ -1243,32 +1187,35 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
         if !seen(index) {
             continue;
         }
-        match e.kind {
-            EffectKind::Coals => {
+        // ITS STACK, compiled (`templates`): the fused modules each draw
+        // their own way; the rest is the slot loop below, every choice in
+        // it one of the stack's modules.
+        let tpl = templates::template(e.kind);
+        let s = match tpl.form {
+            templates::Form::Bed => {
                 // Drawn before all it lies under: as the farthest of all.
                 let breath = coals_breath(e, emitters, time);
                 over.extend(coals_instance(e, time, at, &own, breath).map(|i| (f32::INFINITY, i)));
                 continue;
             }
-            EffectKind::Fire => {
+            templates::Form::Sheets => {
                 fire_instances(e, time, at, &mut over);
                 continue;
             }
-            EffectKind::Embers => ember_pops(e, time, at, &mut screened),
-            _ => {}
+            templates::Form::WaterEntry => continue,
+            templates::Form::Slots(s) => s,
+        };
+        if s.pops {
+            ember_pops(e, time, at, &mut screened);
         }
-        let p = preset(e.kind);
+        let p = &tpl.preset;
         let v = e.variation.clamped();
-        let rate = e.rate.max(0.0)
-            * match e.kind {
-                EffectKind::Dust => p.rate * e.volume() / (0.5 * (p.life.0 + p.life.1)),
-                _ => p.rate,
-            };
+        let rate = e.rate.max(0.0) * if s.density { p.rate * e.volume() / (0.5 * (p.life.0 + p.life.1)) } else { p.rate };
         if !(rate > 0.0) || !(e.scale > 0.0) {
             continue;
         }
-        let lives = life_range(&p, &v);
-        let speeds = speed_range(&p, &v);
+        let lives = life_range(p, &v);
+        let speeds = speed_range(p, &v);
         let slots = ((rate * lives.1).ceil() as usize).clamp(1, MAX_SLOTS);
         // Each slot respawns every `period`: never sooner than its longest
         // life, and the emitter as a whole at `rate`.
@@ -1278,9 +1225,9 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
         let ambient = (at.ambient)(e.position);
         let lamps: Vec<usize> = (0..at.lights.len()).filter(|&i| (at.reaches)(e, i)).collect();
         // Embers as the eye adapted to the fire sees them.
-        let glow = if e.kind == EffectKind::Embers { at.exposure * fire_adaptation(e, at) } else { at.exposure };
+        let glow = if s.own_light { at.exposure * fire_adaptation(e, at) } else { at.exposure };
         let up = e.direction.try_normalize().unwrap_or(Vec3::Y);
-        let air = (e.kind == EffectKind::Dust).then(|| air_waves(base));
+        let air = s.air.then(|| air_waves(base));
         for i in 0..slots {
             let since = time - i as f64 / rate as f64;
             let n = (since / period).floor();
@@ -1294,9 +1241,11 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
             }
             let t = age / life;
             let speed = lerp(speeds.0, speeds.1, u[1]) * e.scale.sqrt();
-            let p0 = if e.kind == EffectKind::Dust {
+            let p0 = if s.boxed {
                 let p0 = e.position + e.extent[0] * (2.0 * u[4] - 1.0) + e.extent[1] * (2.0 * u[5] - 1.0) + e.extent[2] * (2.0 * u[6] - 1.0);
-                if p0.distance_squared(head_world) > DUST_SEEN_WITHIN * DUST_SEEN_WITHIN {
+                // What the eye cannot hold that far off (`glint`) is not
+                // worked out at all.
+                if s.held && p0.distance_squared(head_world) > DUST_SEEN_WITHIN * DUST_SEEN_WITHIN {
                     continue;
                 }
                 p0
@@ -1329,7 +1278,7 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                 pos += Vec3::new(swirl_a.cos(), 0.0, swirl_a.sin()) * swirl_r;
                 moving += swirl_motion(p.swirl.0 * v.turbulence * e.scale / life, swirl_r, p.swirl.1, swirl_a);
             }
-            let mut size = if e.kind == EffectKind::Dust {
+            let mut size = if s.log_size {
                 // Many faint, few bright (`DUST_LIGHT_SIZE`); spread over
                 // fewer or more octaves about its middle by `size_variation`.
                 let k = if v.size_variation == 1.0 { u[11] * u[11] } else { 1.0 / 3.0 + (u[11] * u[11] - 1.0 / 3.0) * v.size_variation };
@@ -1342,8 +1291,8 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
             // flattening and widening -- the layer that gathers under the
             // roof of a cave or a hall. Embers stop against it.
             if let Some(top) = e.ceiling {
-                match e.kind {
-                    EffectKind::Smoke => {
+                match s.ceiling {
+                    templates::Ceiling::Spread => {
                         let under = top - 0.6 * size;
                         let excess = pos.y - under;
                         if excess > 0.0 {
@@ -1357,13 +1306,13 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                             moving += Vec3::new(a.cos(), 0.0, a.sin()) * (0.9 * rise);
                         }
                     }
-                    EffectKind::Embers => {
+                    templates::Ceiling::Stop => {
                         if pos.y >= top - 0.02 {
                             pos.y = top - 0.02;
                             moving.y = moving.y.min(0.0);
                         }
                     }
-                    _ => {}
+                    templates::Ceiling::Open => {}
                 }
             }
             let spin_dir = if u[10] < 0.5 { -1.0 } else { 1.0 };
@@ -1383,15 +1332,15 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                 params: [rotation, frame, 0.0, 0.0],
                 motion: [moving.x, moving.y, moving.z, 0.0],
             };
-            match e.kind {
-                EffectKind::Embers => {
+            match s.shade {
+                templates::SlotShade::Ember => {
                     inst.colour = ember_colour(&v, tint, glow, age, t, u[11]);
                 }
-                EffectKind::Dust => {
+                templates::SlotShade::Scatter { ambient: seen } => {
                     // Only the light it scatters, each lamp's by its own
                     // angle to the eye; the room's even light hardly shows
                     // it (`DUST_AMBIENT_SEEN`).
-                    let mut scattered = ambient * DUST_AMBIENT_SEEN;
+                    let mut scattered = ambient * seen;
                     for &li in &lamps {
                         if let Some((c, d)) = lamp_at(&at.lights[li], centre) {
                             scattered += c * (own(&at.lights[li]) * henyey_greenstein(p.phase_g, -d, to_eye));
@@ -1400,15 +1349,15 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                     // Seen as the eye holds it: found as it turns into the
                     // light, flashing and dimming as it tumbles, then lost;
                     // and only where the eye could focus on it.
-                    let glint = mote_glint(age, lerp(0.35, 1.3, u[7]), id_hash("glint") ^ u[8].to_bits() as u64);
+                    let glint = if s.held { mote_glint(age, lerp(0.35, 1.3, u[7]), id_hash("glint") ^ u[8].to_bits() as u64) } else { 1.0 };
                     let c = scattered * p.albedo * tint * (at.exposure * glint * v.intensity);
                     let held = smoothstep(0.0, 0.2, t) * smoothstep(1.0, 0.7, t);
                     let d = (centre - at.head).length();
-                    let focus = smoothstep(DUST_NEAREST.0, DUST_NEAREST.1, d) * smoothstep(DUST_SEEN_WITHIN, 0.75 * DUST_SEEN_WITHIN, d);
+                    let focus = if s.held { smoothstep(DUST_NEAREST.0, DUST_NEAREST.1, d) * smoothstep(DUST_SEEN_WITHIN, 0.75 * DUST_SEEN_WITHIN, d) } else { 1.0 };
                     inst.colour = [c.x, c.y, c.z, held * focus];
                     inst.params[3] = -1.0;
                 }
-                EffectKind::Smoke => {
+                templates::SlotShade::Sixway { peak, rise, power } => {
                     let mut strongest: Option<(f32, Vec3, Vec3)> = None;
                     let mut rest = ambient;
                     for &li in &lamps {
@@ -1426,7 +1375,7 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                     }
                     let a = Vec3::splat(p.albedo) * tint * at.exposure;
                     let base = rest * a;
-                    let opacity = 0.55 * smoothstep(0.0, 0.1, t) * (1.0 - t).powf(1.4) * v.intensity;
+                    let opacity = peak * smoothstep(0.0, rise, t) * (1.0 - t).powf(power) * v.intensity;
                     inst.colour = [base.x, base.y, base.z, opacity];
                     if let Some((_, c, d)) = strongest {
                         let lit = c * a * henyey_greenstein(p.phase_g, -d, to_eye);
@@ -1435,13 +1384,11 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                     }
                     inst.params[3] = 1.0;
                 }
-                // Drawn above, each its own way.
-                EffectKind::Coals | EffectKind::Fire => unreachable!("coals and flames are drawn apart"),
             }
             if inst.colour[3] <= 0.0 {
                 continue;
             }
-            if e.kind.screened() {
+            if s.screened {
                 screened.push(inst);
             } else {
                 over.push(((centre - at.head).length_squared(), inst));
@@ -1451,12 +1398,22 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
     for s in splashes {
         splash(s, time, at, &mut over, &mut screened);
     }
+    let burst_count = bursts.map_or_else(Default::default, |b| stack::simulate_bursts(b, time, at, &own, &mut over, &mut screened));
+    // Those lit through the heat ramp last among the screened (which need
+    // no order), for their own draw. Stable: the rest keep theirs.
+    let hot = |i: &EffectInstance| i.params[3] == stack::SHADE_SCREEN_HEAT;
+    let screened_heat = screened.iter().filter(|i| hot(i)).count() as u32;
+    if screened_heat > 0 {
+        screened.sort_by_key(|i| hot(i));
+    }
     // Back to front, so each puff lands over what is behind it.
     over.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut frame = EffectFrame {
         instances: Vec::with_capacity(over.len() + screened.len()),
         over: over.len() as u32,
         screened: screened.len() as u32,
+        screened_heat,
+        bursts: burst_count,
     };
     frame.instances.extend(over.into_iter().map(|(_, i)| i));
     frame.instances.extend(screened);
@@ -3411,7 +3368,61 @@ pub fn atlas_layers() -> Vec<Vec<u8>> {
     for variant in 0..FROTH_VARIANTS {
         layers.extend((0..FROTH_FRAMES).map(|stage| froth_frame(variant, stage)));
     }
+    for variant in 0..FLASH_VARIANTS {
+        layers.extend((0..FLASH_FRAMES).map(|form| flash::lobe_frame(variant, form)));
+    }
+    layers.extend((0..CORE_VARIANTS).map(flash::core_frame));
     layers
+}
+
+/// The share of its quad each layer's cutout covers: what a particle of it
+/// pays fill for. Kept from the first atlas made (`EffectsGpu::new`), or
+/// worked out when first asked.
+static CUTOUT_SHARES: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+
+fn cutout_shares_of(cut: &[[f32; 16]]) -> Vec<f32> {
+    cut.iter()
+        .map(|c| {
+            // The outline's area (shoelace) over the quad's 4.
+            let area: f32 = (0..8).map(|k| (c[2 * k] * c[2 * ((k + 1) % 8) + 1] - c[2 * ((k + 1) % 8)] * c[2 * k + 1]) * 0.5).sum();
+            (area.abs() / 4.0).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+/// THE BOOKS an effect asset can name (`effect_asset::BookInfo`): each a run
+/// of the atlas's layers, with what a particle of it fills and what it
+/// weighs. All made here from noise (`atlas_layers`); a baked book would
+/// join this list.
+pub fn books() -> &'static [super::effect_asset::BookInfo] {
+    use super::effect_asset::{BookInfo, Channels};
+    static BOOKS: std::sync::OnceLock<Vec<BookInfo>> = std::sync::OnceLock::new();
+    BOOKS.get_or_init(|| {
+        let shares = CUTOUT_SHARES.get_or_init(|| cutout_shares_of(&cutouts(&atlas_layers())));
+        let layer_bytes = (0..ATLAS_MIPS).map(|m| ((ATLAS_SIZE >> m).max(1) as u64).pow(2) * 4).sum::<u64>();
+        let book = |name, first: u32, frames: u32, variants: u32, channels, layers: u32| BookInfo {
+            name,
+            first_layer: first,
+            frames,
+            variants,
+            channels,
+            cutout_share: shares[first as usize..(first + frames * variants) as usize].iter().sum::<f32>() / (frames * variants) as f32,
+            bytes: layers as u64 * layer_bytes,
+        };
+        vec![
+            book("smoke", 0, SMOKE_FRAMES, 1, Channels::Sixway, 2 * SMOKE_FRAMES),
+            book("flame", FIRE_FIRST, FIRE_FRAMES, 1, Channels::HeatCover, FIRE_FRAMES),
+            book("ember", EMBER_LAYER, 1, 1, Channels::Alpha, 1),
+            book("mote", MOTE_LAYER, 1, 1, Channels::Alpha, 1),
+            book("coals", COALS_LAYER, 1, 1, Channels::Bed, 1),
+            book("crown", CROWN_LAYER, CROWN_FRAMES, CROWN_VARIANTS, Channels::Alpha, CROWN_FRAMES * CROWN_VARIANTS),
+            book("jet", JET_LAYER, JET_FRAMES, JET_VARIANTS, Channels::Alpha, JET_FRAMES * JET_VARIANTS),
+            book("spray", SPRAY_LAYER, SPRAY_FRAMES, SPRAY_VARIANTS, Channels::Alpha, SPRAY_FRAMES * SPRAY_VARIANTS),
+            book("froth", FROTH_LAYER, FROTH_FRAMES, FROTH_VARIANTS, Channels::Alpha, FROTH_FRAMES * FROTH_VARIANTS),
+            book("muzzle_flash", FLASH_LAYER, FLASH_FRAMES, FLASH_VARIANTS, Channels::HeatCover, FLASH_FRAMES * FLASH_VARIANTS),
+            book("muzzle_core", CORE_LAYER, 1, CORE_VARIANTS, Channels::HeatCover, CORE_VARIANTS),
+        ]
+    })
 }
 
 /// Dabs of cover laid one over another, on a square of clear: what a
@@ -3793,7 +3804,7 @@ pub fn cutouts(layers: &[Vec<u8>]) -> Vec<[f32; 16]> {
                 l if (FIRE_FIRST..FIRE_FIRST + FIRE_FRAMES - 1).contains(&l) => Some(l + 1),
                 // A splash's crown, jet, spray and white water: each stage
                 // toward the next of its own variant (three stages each).
-                l if (CROWN_LAYER..ATLAS_LAYERS).contains(&l) && (l - CROWN_LAYER) % CROWN_FRAMES < CROWN_FRAMES - 1 => Some(l + 1),
+                l if (CROWN_LAYER..FLASH_LAYER).contains(&l) && (l - CROWN_LAYER) % CROWN_FRAMES < CROWN_FRAMES - 1 => Some(l + 1),
                 _ => None,
             };
             let smeared: Vec<Vec<u8>> = match next {
@@ -3944,6 +3955,16 @@ pub struct EffectsGpu {
     capacity: u64,
     over: u32,
     screened: u32,
+    /// The frame's draws: runs of its instances, each of one shader variant
+    /// (`variants::runs`).
+    runs: Vec<variants::Run>,
+    /// What those runs came to (`variants::RunStats`).
+    pub run_stats: variants::RunStats,
+    /// Draw each run with its own variant (as shipped), or everything with
+    /// the union shader (`Levers::effect_variants` off: the A/B).
+    pub use_variants: bool,
+    /// DEBUG: draw the overdraw view instead (`Levers::effects_overdraw`).
+    pub overdraw: bool,
 }
 
 impl EffectsGpu {
@@ -3971,6 +3992,7 @@ impl EffectsGpu {
             mapped_at_creation: false,
         });
         let cut: Vec<[f32; 16]> = cutouts(&layers);
+        let _ = CUTOUT_SHARES.set(cutout_shares_of(&cut));
         let cutouts = device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("effects_cutouts"),
             contents: bytemuck::cast_slice(&cut),
@@ -3988,7 +4010,20 @@ impl EffectsGpu {
         });
         let capacity = 256;
         let instances = Self::instance_buffer(device, capacity);
-        Self { _atlas: atlas, uniform, _cutouts: cutouts, bind_group, instances, capacity, over: 0, screened: 0 }
+        Self {
+            _atlas: atlas,
+            uniform,
+            _cutouts: cutouts,
+            bind_group,
+            instances,
+            capacity,
+            over: 0,
+            screened: 0,
+            runs: Vec::new(),
+            run_stats: Default::default(),
+            use_variants: true,
+            overdraw: false,
+        }
     }
 
     fn instance_buffer(device: &Device, capacity: u64) -> Buffer {
@@ -4012,6 +4047,7 @@ impl EffectsGpu {
         }
         self.over = frame.over;
         self.screened = frame.screened;
+        (self.runs, self.run_stats) = variants::runs(frame, self.use_variants);
     }
 
     /// This frame's view of them, for [`Self::draw`]: written apart from the
@@ -4021,11 +4057,11 @@ impl EffectsGpu {
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(uniform));
     }
 
-    /// What SpaceWarp's motion twin draws (`space_warp::MotionKind::
-    /// EffectsOver`): the instances, the group, and how many are drawn over
-    /// and how many screened.
-    pub fn motion_parts(&self) -> (&Buffer, &BindGroup, u32, u32) {
-        (&self.instances, &self.bind_group, self.over, self.screened)
+    /// What SpaceWarp's motion twins draw (`space_warp::MotionKind::
+    /// Effects`): the instances, the group, and the frame's runs, each drawn
+    /// by its own variant's twin.
+    pub fn motion_parts(&self) -> (&Buffer, &BindGroup, &[variants::Run]) {
+        (&self.instances, &self.bind_group, &self.runs)
     }
 
     /// Whether there is anything to draw this frame.
@@ -4044,13 +4080,14 @@ impl EffectsGpu {
         pass.set_bind_group(1, probe, &[]);
         pass.set_bind_group(2, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
-        if self.over > 0 {
-            pass.set_pipeline(&pipelines.over);
-            pass.draw(0..VERTICES_PER_PARTICLE, 0..self.over);
+        if self.overdraw {
+            pass.set_pipeline(&pipelines.overdraw);
+            pass.draw(0..VERTICES_PER_PARTICLE, 0..self.over + self.screened);
+            return;
         }
-        if self.screened > 0 {
-            pass.set_pipeline(&pipelines.screened);
-            pass.draw(0..VERTICES_PER_PARTICLE, self.over..self.over + self.screened);
+        for run in &self.runs {
+            pass.set_pipeline(&pipelines.variants[run.variant as usize]);
+            pass.draw(0..VERTICES_PER_PARTICLE, run.first..run.first + run.count);
         }
     }
 }
@@ -4061,8 +4098,12 @@ impl EffectsGpu {
 /// [`bind_group_layout`]. Mono and stereo twins, like every scene-pass
 /// pipeline. See `multiview`.
 pub struct EffectsPipeline {
-    pub over: RenderPipeline,
-    pub screened: RenderPipeline,
+    /// One pipeline a shader variant, by `FxVariant as usize`: each holds
+    /// only its own shading's code (`variants`).
+    pub variants: Vec<RenderPipeline>,
+    /// DEBUG: every particle a flat eighth of white, added
+    /// (`Levers::effects_overdraw`).
+    pub overdraw: RenderPipeline,
 }
 
 impl EffectsPipeline {
@@ -4097,10 +4138,9 @@ impl EffectsPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("effects_shader"),
-            source: ShaderSource::Wgsl(view.shader(effects_shader()).into()),
-        });
+        let module = |label: &str, source: String| {
+            device.create_shader_module(ShaderModuleDescriptor { label: Some(label), source: ShaderSource::Wgsl(view.shader(source).into()) })
+        };
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("effects_layout"),
             bind_group_layouts: &[Some(uniform_layout), Some(probe_layout), Some(effects_layout)],
@@ -4109,18 +4149,18 @@ impl EffectsPipeline {
         // Premultiplied over; screened as the glare is.
         let over = BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::OneMinusSrcAlpha, operation: BlendOperation::Add };
         let screen = BlendComponent { src_factor: BlendFactor::OneMinusDst, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
-        let build = |label: &str, fragment: &str, color: BlendComponent| {
+        let build = |label: &str, shader: &ShaderModule, fragment: &str, color: BlendComponent| {
             device.create_render_pipeline(&RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
                 vertex: VertexState {
-                    module: &shader,
+                    module: shader,
                     entry_point: Some("vs_main"),
                     compilation_options: PipelineCompilationOptions::default(),
                     buffers: &[Some(EffectInstance::layout())],
                 },
                 fragment: Some(FragmentState {
-                    module: &shader,
+                    module: shader,
                     entry_point: Some(fragment),
                     compilation_options: PipelineCompilationOptions::default(),
                     targets: &[Some(ColorTargetState {
@@ -4149,7 +4189,30 @@ impl EffectsPipeline {
                 cache: None,
             })
         };
-        Self { over: build("effects_over", "fs_over", over), screened: build("effects_screened", "fs_screen", screen) }
+        let added = BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
+        let variants = FxVariant::ALL
+            .iter()
+            .map(|v| {
+                let shader = module(v.label(), v.shader());
+                if v.screened() {
+                    build(v.label(), &shader, "fs_screen", screen)
+                } else {
+                    build(v.label(), &shader, "fs_over", over)
+                }
+            })
+            .collect();
+        if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
+            // MEASUREMENT: the union with one module cut at a time, built
+            // once for the PIPESTATS log (`effects_cut_<name>`): each
+            // module's cost is the union's less its cut's.
+            for (name, entry, _) in variants::EFFECT_MODULE_CUTS {
+                let Some(source) = variants::module_cut(name) else { continue };
+                let label = format!("effects_cut_{name}");
+                let _ = build(&label, &module(&label, source), entry, if *entry == "fs_screen" { screen } else { over });
+            }
+        }
+        let overdraw = build("effects_overdraw", &module("effects_overdraw", variants::overdraw_shader()), "fs_overdraw", added);
+        Self { variants, overdraw }
     }
 }
 
@@ -4363,6 +4426,7 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
     let fade = fx_depth_fade(in);
     let layer = i32(in.layer.x);
     let next = select(layer, layer + 1, in.layer.y > 0.0);
+    // <fx:coals>
     if (in.layer.z > 2.5) {
         // A BED OF COALS: red how hot each coal is, green its char's albedo,
         // blue its own phase of flicker. Its glow as its fire's flames are
@@ -4374,6 +4438,8 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
         let shown = aces_fitted(fx_flame(in.colour.rgb, b.r * flicker) + in.light * b.g);
         return vec4<f32>(shown * alpha, alpha);
     }
+    // </fx:coals>
+    // <fx:flame>
     if (in.layer.z > 1.5) {
         let v = 1.0 - in.uv.y;
         let was = vec2<f32>(in.uv.x, 1.0 - fx_flame_v(v, in.layer.y * FLAME_DT));
@@ -4413,6 +4479,7 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
         let covers = alpha * FLAME_COVER * clamp(max(shown.r, max(shown.g, shown.b)), 0.0, 1.0);
         return vec4<f32>(shown * alpha + root, covers);
     }
+    // </fx:flame>
     let six = in.layer.z > 0.5;
     let back = select(layer, layer + SMOKE_BACK, six);
     let back_next = select(next, next + SMOKE_BACK, six);
@@ -4434,7 +4501,10 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
     let next = select(layer, layer + 1, in.layer.y > 0.0);
     let t = mix(textureSample(fx_atlas, fx_samp, in.uv, layer), textureSample(fx_atlas, fx_samp, in.uv, next), in.layer.y);
     let strength = in.colour.a * t.a * fx_depth_fade(in);
-    return vec4<f32>(aces_fitted(in.colour.rgb * strength), 0.0);
+    // A FLASH (shade 4): its light by its book's own heat, through the
+    // flame's ramp -- white-yellow core, orange body, red thin edges.
+    let light = select(in.colour.rgb, fx_flame(in.colour.rgb, t.r), in.layer.z > 3.5);
+    return vec4<f32>(aces_fitted(light * strength), 0.0);
 }
 "#
         .replace("CUT_VEC4S", &(ATLAS_LAYERS * 4).to_string())
@@ -4485,7 +4555,13 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
 ///   velocity, soft layers (`SOFT_LAYER_CONTRAST`) -- they move themselves
 ///   only where they hide most of what is behind.
 pub fn motion_shader() -> String {
-    let mut s = effects_shader();
+    motion_shader_of(effects_shader())
+}
+
+/// [`motion_shader`] of one of the effects shader's variants
+/// (`FxVariant::shader`): the same checked changes to that text.
+pub fn motion_shader_of(source: String) -> String {
+    let mut s = source;
     let swap = |s: &mut String, from: &str, to: &str, n: usize| {
         assert_eq!(s.matches(from).count(), n, "effects motion twin: `{from}` moved in the effects' shader");
         *s = s.replace(from, to);

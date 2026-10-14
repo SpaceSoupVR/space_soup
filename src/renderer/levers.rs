@@ -193,6 +193,23 @@ pub struct Levers {
     /// The level's effects -- fire, smoke, embers, dust -- simulated, lit and
     /// drawn. See `effects`.
     pub effects: bool,
+    /// THE MUZZLE TEST: the right hand's A fires the selected firearm effect
+    /// from its muzzle point (a tap one shot, held automatic fire) and B
+    /// steps to the next effect (`quest_app::muzzle_test`). A way to look at
+    /// `game/effects` in the headset before a weapon's script raises them.
+    /// On for now, for that look; a shipped build turns it off.
+    pub muzzle_test: bool,
+    /// Each effect particle drawn by the shader VARIANT that holds only its
+    /// own shading (`effects::variants`): smoke without the flame's code, an
+    /// ember without a flash's. Off, the union shader draws them all, as
+    /// before 2026-10-13 -- the same pixels; the A/B that prices the variants
+    /// (`fire_close`, `fire_and_smoke`, `brick_hall`).
+    pub effect_variants: bool,
+    /// DEBUG VIEW: every effect particle drawn as a flat eighth-step of
+    /// white over black, added, so the count of layers a pixel pays for
+    /// reads as its brightness (8 or more is white). The same instances and
+    /// cutouts as the real draw. See `effects::overdraw_shader`.
+    pub effects_overdraw: bool,
     /// The level's water -- its surfaces, their waves and, under SpaceWarp,
     /// their motion -- drawn. See `water_pipeline`.
     pub water: bool,
@@ -671,6 +688,9 @@ impl Default for Levers {
             glare: true,
             glare_strength: 1.0,
             effects: true,
+            muzzle_test: true,
+            effect_variants: true,
+            effects_overdraw: false,
             water: true,
             underwater: true,
             weather: true,
@@ -835,6 +855,9 @@ impl Levers {
         flag("space_warp", self.space_warp, d.space_warp);
         flag("glare", self.glare, d.glare);
         flag("effects", self.effects, d.effects);
+        flag("muzzle_test", self.muzzle_test, d.muzzle_test);
+        flag("effect_variants", self.effect_variants, d.effect_variants);
+        flag("effects_overdraw", self.effects_overdraw, d.effects_overdraw);
         flag("water", self.water, d.water);
         flag("underwater", self.underwater, d.underwater);
         flag("weather", self.weather, d.weather);

@@ -607,6 +607,8 @@ impl XrRenderer {
             } else {
                 Vec::new()
             };
+            // And the pools the live lamps throw: a torch close to a wall.
+            let fires: Vec<_> = fires.into_iter().chain(self.lights_uniform.pool_light()).collect();
             let mut eye = self.eye.borrow_mut();
             let mut metered = eye.meter_with(head_world, gaze, &fires);
             // Under the water the eye adapts to the water's own light, which
@@ -640,7 +642,9 @@ impl XrRenderer {
         // frame's display time, lit by this frame's lamps in their emitter's
         // room and by the room's baked light, and drawn after the glass. Here,
         // before the frame's draws borrow the renderer. See `effects`.
-        let mut effects_drawn = effects_on && !(self.effect_emitters.is_empty() && self.splashes.is_empty()) && self.effects_gpu.is_some();
+        let mut effects_drawn =
+            effects_on && !(self.effect_emitters.is_empty() && self.splashes.is_empty() && self.bursts.live.is_empty()) && self.effects_gpu.is_some();
+        self.last_exposure = post.exposure;
         if effects_drawn {
             let yaw = glam::Quat::from_rotation_y(self.player.yaw);
             let (offset, descs) = (self.player.offset, &self.room_descs);
@@ -711,14 +715,21 @@ impl XrRenderer {
             }
             let held = &self.effect_seen_until;
             let seen = |i: usize| held.get(i).map_or(true, |&t| now <= t);
-            if (0..self.effect_emitters.len()).any(|i| seen(i)) || !splashes.is_empty() {
-                let frame = crate::renderer::effects::simulate_seen(&self.effect_emitters, &seen, &splashes, now, &at);
+            // The event bursts: given this frame's clock, culled by their
+            // travel bounds, thinned if the frame is over (`BurstSet::frame`).
+            let bursts_drawn = self.bursts.frame(&self.effect_library, now, &views, head_world);
+            if (0..self.effect_emitters.len()).any(|i| seen(i)) || !splashes.is_empty() || bursts_drawn.contains(&true) {
+                let bursts = crate::renderer::effects::stack::BurstFrame { lib: &self.effect_library, set: &self.bursts, drawn: &bursts_drawn };
+                let frame = crate::renderer::effects::simulate_all(&self.effect_emitters, &seen, &splashes, Some(&bursts), now, &at);
+                self.burst_count = frame.bursts;
                 if let Some(gpu) = self.effects_gpu.as_mut() {
+                    (gpu.use_variants, gpu.overdraw) = (lv.effect_variants, lv.effects_overdraw);
                     gpu.upload(&self.wgpu_device, &self.wgpu_queue, &frame);
                 }
             } else {
                 effects_drawn = false;
             }
+            self.bursts.end_frame();
         }
 
         // THE WEATHER'S VIEW: the head, its axes, the sky's and sun's light,
@@ -4228,16 +4239,13 @@ impl XrRenderer {
                     let mut particles: Vec<MotionParticles> = Vec::new();
                     if self.levers.space_warp_debug & 262144 == 0 {
                         if let (true, Some(gpu)) = (effects_drawn, self.effects_gpu.as_ref()) {
-                            let (instances, group, over, screened) = gpu.motion_parts();
-                            for (kind, range) in [
-                                (MotionKind::EffectsOver, 0..over),
-                                (MotionKind::EffectsScreened, over..over + screened),
-                            ] {
+                            let (instances, group, runs) = gpu.motion_parts();
+                            for run in runs {
                                 particles.push(MotionParticles {
-                                    kind,
+                                    kind: MotionKind::Effects(run.variant),
                                     instances: Some(instances),
                                     vertices: crate::renderer::effects::VERTICES_PER_PARTICLE,
-                                    range,
+                                    range: run.first..run.first + run.count,
                                     slot: base,
                                     groups: [Some(probe_read_group), Some(group)],
                                 });
