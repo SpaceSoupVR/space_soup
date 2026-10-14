@@ -534,6 +534,32 @@ pub struct Levers {
     /// so nothing but the range test (`baked_cave::occluder_ranges`) has
     /// checked it. Turn on after a headset look at cave_mouth / cave_floor.
     pub cave_chunk_cull: bool,
+    /// THE GROUND COARSER WITH DISTANCE: each node of the chunks' quadtree
+    /// drawn at the step its distance from the head gives it (1, 2, 4, 8 or
+    /// 16 samples over the same vertices), borders stitched to the coarser
+    /// neighbour (`ground_lod`). The reflection, scene, motion and spot
+    /// shadow passes draw the one choice. Does nothing unless the level's
+    /// load built the lists (`adb shell setprop debug.spacesoup.groundlod 1`
+    /// before the launch).
+    ///
+    /// OFF: built 2026-10-13 with NO HEADSET. Offline it is watertight and
+    /// near the step-1 picture (`docs/ground-lod-status-2026-10-13.md`);
+    /// ridge shimmer under MSAA, SpaceWarp on a chunk as its step changes,
+    /// shadows, the cave mouth and wet cliffs have to be looked at first.
+    pub ground_lod: bool,
+    /// WITH `ground_lod`: no node of the ground drawn coarser than its own
+    /// error allows at ANY distance (a pixel, `ground_lod::PIXEL_RAD`). Off,
+    /// the design's distance caps apply too: step 1 ends at 120 m and step 2
+    /// at 240 m whatever a coarser step moves -- on the shipped ground, with
+    /// its cliffs, that is where most of the triangles saved come from, and
+    /// where a cliff moves by up to 10 mrad (8 pixels) as the cap is crossed.
+    /// ON, so that `ground_lod` alone is the rule that keeps the surface
+    /// within a pixel: offline at stress_625's hilltop the caps change 8.7%
+    /// of the picture's pixels (7,098 by more than 20 levels, far cliffs
+    /// visibly another shape), this rule 2.9% (766 by more than 20: shading
+    /// along rims, the normals being the vertices').
+    /// `docs/ground-lod-status-2026-10-13.md`.
+    pub ground_lod_strict: bool,
     /// HOW FAR A BIG THING IS STILL DRAWN, in its own bounding radii: the
     /// app hands the renderer a model, a fixture, a baked cave or a cuboid
     /// while its nearest point is within 40 m OR it is nearer than this many
@@ -689,6 +715,8 @@ impl Default for Levers {
             ground_buffers: true,
             brush_buffers: true,
             cave_chunk_cull: false,
+            ground_lod: false,
+            ground_lod_strict: true,
             size_reach: 229,
             probe_prepass: false,
             model_rooms: false,
@@ -903,6 +931,8 @@ impl Levers {
             ("ground_buffers", self.ground_buffers, d.ground_buffers),
             ("brush_buffers", self.brush_buffers, d.brush_buffers),
             ("cave_chunk_cull", self.cave_chunk_cull, d.cave_chunk_cull),
+            ("ground_lod", self.ground_lod, d.ground_lod),
+            ("ground_lod_strict", self.ground_lod_strict, d.ground_lod_strict),
             ("probe_prepass", self.probe_prepass, d.probe_prepass),
             ("model_rooms", self.model_rooms, d.model_rooms),
         ] {

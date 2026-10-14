@@ -199,7 +199,11 @@ impl SlopeSplit {
             h ^= v;
             h = h.wrapping_mul(1099511628211);
         };
-        for c in chunks {
+        // A sample of the chunks, as of the indices: with chunks of a fixed
+        // size (and the coarser lists' runs among them) there are tens of
+        // thousands on a large level, and this is asked every frame.
+        mix(chunks.len() as u64);
+        for c in chunks.iter().step_by((chunks.len() / 997).max(1)) {
             mix(c.first_index as u64);
             mix(c.index_count as u64);
         }

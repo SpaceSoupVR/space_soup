@@ -650,6 +650,11 @@ pub struct XrRenderer {
     /// [`Self::set_ground_horizon`].
     ground_occluder: Option<(crate::renderer::ground_horizon::GroundOccluder, Vec<(u32, (glam::Vec3, glam::Vec3))>)>,
     ground_horizon: std::cell::RefCell<Option<crate::renderer::ground_horizon::Horizon>>,
+    /// The ground's chunks, the quadtree over them and their coarser lists:
+    /// what a frame asks which chunks it draws and at which step. In a cell:
+    /// it keeps each node's last answer (the hysteresis), and is asked while
+    /// the frame's draws hold the renderer. See [`Self::set_ground_lod`].
+    ground_lod: std::cell::RefCell<Option<crate::renderer::ground_lod::GroundLod>>,
     /// How the layers tile, from the project's `settings.json`. Held alongside
     /// the textures for the same reason they are: it arrives independently.
     terrain_settings: crate::renderer::terrain_pipeline::TerrainMaterialUniform,
@@ -1833,6 +1838,7 @@ impl XrRenderer {
             terrain_footprint: None,
             ground_occluder: None,
             ground_horizon: std::cell::RefCell::new(None),
+            ground_lod: std::cell::RefCell::new(None),
             terrain_settings: Default::default(),
             wire_pipeline,
             mesh_pipeline,
@@ -3224,6 +3230,27 @@ impl XrRenderer {
     pub fn set_terrain_stationary_masks(&mut self, masks: Vec<crate::renderer::terrain_pipeline::TerrainImage>) {
         self.terrain_stationary = masks;
         self.rebuild_terrain_material();
+    }
+
+    /// THE GROUND'S CHUNKS AND THE TREE OVER THEM (`ground_lod`), for the
+    /// ground the frames are handed: its runs are the frame's
+    /// `terrain_chunks`, entry for entry. The frame then draws the chunks its
+    /// frusta touch -- asked of the tree, not of every chunk -- and, under
+    /// `Levers::ground_lod` where the lists were built, each at the step its
+    /// distance gives it. `None` for a level without ground, and whenever
+    /// the ground changes; without one a frame draws every chunk it is
+    /// handed, by the boxes it is handed.
+    pub fn set_ground_lod(&mut self, lod: Option<crate::renderer::ground_lod::GroundLod>) {
+        if let Some(l) = &lod {
+            log::info!(
+                "GROUNDLOD: {} x {} chunks, {} runs{}",
+                l.chunks()[0],
+                l.chunks()[1],
+                l.units.len(),
+                if l.has_lists() { "; the coarser lists are built (lever `ground_lod` draws by them)" } else { "; step 1 only (no lists: `debug.spacesoup.groundlod 1` at launch builds them)" },
+            );
+        }
+        *self.ground_lod.get_mut() = lod;
     }
 
     /// THE DRAWN GROUND AS WHAT IT HIDES (`Levers::ground_horizon`): built by

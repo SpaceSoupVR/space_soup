@@ -302,6 +302,15 @@ impl VkContext {
         if let Ok(n) = system_property(c"debug.spacesoup.chunks").parse::<u32>() {
             crate::renderer::ground_horizon::CHUNKS_A_SIDE.store(n.min(64), std::sync::atomic::Ordering::Relaxed);
         }
+        // `adb shell setprop debug.spacesoup.groundlod 1` before a launch: a
+        // level's load builds the ground's coarser lists (about 2.8 times the
+        // ground's indices), for `Levers::ground_lod` to draw by. Without it
+        // the index buffer is step 1's alone and the lever does nothing. See
+        // `ground_lod::LISTS`.
+        if system_property(c"debug.spacesoup.groundlod") == "1" {
+            crate::renderer::ground_lod::LISTS.store(true, std::sync::atomic::Ordering::Relaxed);
+            log::info!("GROUNDLOD: the ground's coarser lists are built at load (lever `ground_lod` draws by them)");
+        }
         // MEASUREMENT: `adb shell setprop debug.spacesoup.opaque 0` builds the
         // scene's ground pipelines WITH blending, as they were until
         // 2026-10-13, from the next launch. See `terrain_pipeline::OPAQUE_GROUND`.
