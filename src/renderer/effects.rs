@@ -608,6 +608,24 @@ fn henyey_greenstein(g: f32, travel: Vec3, to_eye: Vec3) -> f32 {
     ((1.0 - g2) / (d * d.sqrt())).min(12.0)
 }
 
+/// THE AIR'S READINESS FOR MIST at `hour` (0-24, the time of day's clock), a
+/// multiple of a fog slab's authored density (`sprite_fog`; the authored look
+/// is the dawn's). Mist over still water is radiation fog and steam fog: the
+/// ground and air cool all night under a clear sky while the water keeps its
+/// warmth, so it forms in the evening, thickens through the night, is
+/// thickest at and just after dawn (5 to 7:30, the coldest air), and the
+/// rising sun burns it off by mid-morning (10:30, a twentieth); it is all
+/// but gone through the warm afternoon and returns from about 17:00, at
+/// 0.8 of its dawn by 21:00. Eased between those points; wraps at 24.
+pub fn mist_conditions(hour: f32) -> f32 {
+    const AT: [(f32, f32); 7] = [(0.0, 0.85), (5.0, 1.0), (7.5, 1.0), (10.5, 0.05), (17.0, 0.05), (21.0, 0.8), (24.0, 0.85)];
+    let h = hour.rem_euclid(24.0);
+    let i = AT.iter().rposition(|&(t, _)| t <= h).unwrap_or(0).min(AT.len() - 2);
+    let ((t0, a), (t1, b)) = (AT[i], AT[i + 1]);
+    let x = ((h - t0) / (t1 - t0)).clamp(0.0, 1.0);
+    a + (b - a) * x * x * (3.0 - 2.0 * x)
+}
+
 /// Smooth noise along one axis, in [-1, 1]: a random slope at each whole
 /// number, eased between them. Never repeats, unlike a sum of sines.
 fn noise1(x: f32, seed: u64) -> f32 {
@@ -1327,7 +1345,7 @@ pub fn governor_wants(
         };
         let area = if cost.points { 0.0 } else { count * cost.area_each * e.scale * e.scale };
         let (facing, flat) = if cost.flat { (0.0, area) } else { (area, 0.0) };
-        let fill = seen::seen_fill(eyes, lo, hi, facing, flat, if cost.points { count } else { 0.0 });
+        let fill = seen::seen_fill(eyes, lo, hi, facing, flat, if cost.points { count } else { 0.0 }, 0.0);
         out.push(stack::Want {
             key: emitter_key(e),
             score: cost.importance * 100.0 + pixels.max(1.0).log2(),
@@ -2001,13 +2019,19 @@ const SHEET_THICKNESS: f32 = 0.01;
 const SPLASH_H: f32 = 1.0 / 256.0;
 /// THE RINGS' ENERGY: the share of a strike's energy (into the water, and a
 /// tenth of its skimming energy) that leaves as the ring of waves. Most of
-/// the rest goes into the crown, the jet, the bubbles and heat. A few per
-/// cent, and most of that the long first waves; 3 per cent here.
-const RING_ENERGY_SHARE: f32 = 0.03;
+/// the rest goes into the crown, the jet, the bubbles and heat. Impacts put
+/// some 5-15 per cent of what they bring into waves (inferred from impact
+/// cratering in water); 10 per cent here. At 3 per cent (round 1) a thrown
+/// rock's first crest was 14 mm two cavity radii out and the user found the
+/// surface hardly raised for the splash's size (2026-10-14, fifth test).
+const RING_ENERGY_SHARE: f32 = 0.10;
 /// The steepest disturbance the rings can be made from: a depression no
 /// deeper than this share of its radius. Steeper, water breaks: the excess
-/// goes into white water, not waves.
-const RING_STEEPEST: f32 = 0.4;
+/// goes into white water, not waves. 0.6: the collapse's first crest at the
+/// rim (`RING_PEAK` of the source) is then a quarter of the cavity's radius
+/// at most -- the lip a cavity throws up as it closes -- where 0.4 held a
+/// thrown rock's to a sixth.
+const RING_STEEPEST: f32 = 0.6;
 /// The rings' source's edge, as a share of its cavity's radius: the
 /// spectrum's `exp(-k c)` (`splash_shape`).
 const RING_EDGE: f32 = 0.5;
@@ -4711,9 +4735,68 @@ struct VOut {
     // the preset's, less one.
     @location(7) @interpolate(flat) time: f32,
     @location(8) @interpolate(flat) flicker: f32,
+    // A FOG SLAB: where on its covering quad (WORLD, the player's frame), its
+    // box's middle and soft edge, and its half sizes and falloff.
+    @location(9) world: vec3<f32>,
+    @location(10) @interpolate(flat) fog_a: vec4<f32>,
+    @location(11) @interpolate(flat) fog_b: vec4<f32>,
+}
+
+// A FOG SLAB'S COVERING QUAD (`stack::Program::fog`): square across the line
+// to its box's middle, at the near side of the box's bounding sphere and as
+// wide as the sphere's outline there -- every pixel the box can cover and few
+// more. No part of the box is nearer the eye than the quad, so the depth test
+// hides it only where something hides all of the box behind it. From inside
+// the sphere: the whole view, just in front of the eye. Eight triangles, as
+// a sprite's, round an octagon holding the outline's circle.
+fn fx_fog_vertex(vi: u32, inst: IIn) -> VOut {
+    var out: VOut;
+    let tri = vi / 3u;
+    let k = vi % 3u;
+    var corner = vec2<f32>(0.0);
+    if (k != 0u) {
+        let a = f32((tri + k - 1u) % 8u) * 0.78539816;
+        corner = vec2<f32>(cos(a), sin(a)) * 1.0824;
+    }
+    let c = inst.centre.xyz;
+    let r = length(inst.axis.xyz);
+    let eye = fx.head.xyz;
+    let d = length(c - eye);
+    var mid = eye;
+    var across = fx.right.xyz;
+    var along = fx.up.xyz;
+    var reach = 1.0;
+    if (d > r * 1.02) {
+        let f = (c - eye) / d;
+        let s = d - r;
+        mid = eye + f * s;
+        reach = s * r / sqrt(d * d - r * r);
+        across = normalize(select(cross(f, vec3<f32>(0.0, 1.0, 0.0)), cross(f, vec3<f32>(1.0, 0.0, 0.0)), abs(f.y) > 0.99));
+        along = cross(across, f);
+    } else {
+        mid = eye + normalize(cross(fx.up.xyz, fx.right.xyz)) * 0.25;
+    }
+    let world = mid + (across * corner.x + along * corner.y) * reach;
+    out.clip = camera.view_proj[view_slot] * vec4<f32>(world, 1.0);
+    out.at = out.clip;
+    out.world = world;
+    out.uv = corner;
+    out.colour = inst.colour;
+    out.light = inst.light.xyz;
+    out.light_q = inst.light_dir.xyz;
+    out.layer = vec3<f32>(0.0, inst.params.y, inst.params.w);
+    out.soft = inst.light.w;
+    out.time = inst.params.x;
+    out.flicker = inst.params.z;
+    out.fog_a = inst.centre;
+    out.fog_b = inst.axis;
+    return out;
 }
 
 @vertex fn vs_main(@builtin(vertex_index) vi: u32, inst: IIn) -> VOut {
+    if (inst.params.w < -1.5) {
+        return fx_fog_vertex(vi, inst);
+    }
     var out: VOut;
     // Eight triangles fanned from its middle to its cutout's eight corners.
     let tri = vi / 3u;
@@ -4835,6 +4918,153 @@ fn fx_depth_fade(in: VOut) -> f32 {
     return clamp((scene - in.at.w) / in.soft, 0.0, 1.0);
 }
 
+// A FOG SLAB'S PIXEL (`sprite_fog`): its density, `colour.a` a metre at the
+// box's bottom, along this pixel's line of sight from where it enters the box
+// to where it leaves it or meets the scene's depth (a bank, the shore: so it
+// thins to nothing where it meets them), in FOG_STEPS stretches. In each, its
+// density falls by e every `fog_b.w` metres up times a local thickness (thin
+// sheets hugging the water, taller banks that rise and curl), INTEGRATED
+// EXACTLY over the stretch, times what is there at the middle of its density
+// (near the water for a line looking down, so the strands stay sharp):
+// - where it lies: the ellipse its box's footprint holds (a pond's water,
+//   the object sized to it), thinning to nothing `fog_a.w` metres in from its
+//   rim -- so the mist hugs the water and never climbs the bank;
+// - its wisps (`fx_fog_wisps`): banks and the strands that curl out of them,
+//   stretched along the wind (`soft`, the wind's way across the box;
+//   `flicker`, how far it has drifted), clear water between; where they are
+//   thick they also stand taller;
+// - its top: gone well before the box's (`1 - smoothstep` over its upper
+//   two-fifths), so no plane is ever seen.
+// Seen through it, `1 - e^-depth` of what is behind is hidden. Lit by its even
+// light (`colour.rgb`) and the sun (`light`) through Henyey-Greenstein toward
+// it (`light_q`, `layer.y` its g), as `light_cpu` lights a mote
+// (`effects::henyey_greenstein`), the phase evening out as it thickens.
+const FOG_TILE: f32 = 1.6;
+const FOG_STRETCH: f32 = 3.0;
+const FOG_STEPS: i32 = 6;
+
+// Its wisps at a point of the box (its own frame) for the wind's way `wind`
+// and drift `drift`, over a stretch `blur` metres across the ground: x how
+// much is there, y how tall it stands (a multiple of its falloff).
+// - BANKS: a coarse noise FOG_TILE metres across the wind (FOG_STRETCH times
+//   that along it), where the mist gathers;
+// - STRANDS: the ridges of two finer noises, warped by the banks and by each
+//   other, so they curl and fork: the filaments, gathered in the banks and
+//   trailing out of them, the water clear between;
+// - a VEIL FOG_FLOOR of the most between them, so the whole water is misted;
+// - where it is thick it stands taller (0.6 to 1.9 times its falloff).
+// A noise finer than its stretch would be read at points too far apart --
+// straight stripes as they slide along the ray -- so the strands give way to
+// their mean (FOG_STRANDS) and the whole to the wisps' (FOG_MEAN, x its
+// mist, y its height weighted by it): a long grazing line of sight sees the
+// layer averaged, as it would.
+const FOG_FLOOR: f32 = 0.12;
+const FOG_STRANDS: f32 = 0.34;
+const FOG_MEAN: vec2<f32> = vec2<f32>(0.405, 1.35);
+fn fx_fog_wisps(m: vec2<f32>, wind: vec2<f32>, drift: f32, blur: f32) -> vec2<f32> {
+    let b = blur / FOG_TILE;
+    let a = vec2<f32>(dot(m, wind) - drift, dot(m, vec2<f32>(-wind.y, wind.x)));
+    let n1 = fx_fog_noise(vec2<f32>(a.x / FOG_STRETCH, a.y) / FOG_TILE);
+    let q2 = vec2<f32>((a.x - 0.4 * drift) / FOG_STRETCH, a.y) / (0.45 * FOG_TILE) + vec2<f32>(17.0 + 1.6 * n1, 3.0 - 1.6 * n1);
+    let n2 = fx_fog_noise(q2);
+    let n3 = fx_fog_noise(q2 * 2.3 + vec2<f32>(5.0 - 1.1 * n2, 11.0 + 1.1 * n2));
+    let ridges = 0.65 * (1.0 - abs(2.0 * n2 - 1.0)) + 0.35 * (1.0 - abs(2.0 * n3 - 1.0));
+    let strands = mix(smoothstep(0.5, 0.92, ridges), FOG_STRANDS, smoothstep(0.1, 0.35, b));
+    let banks = smoothstep(0.3, 0.75, n1);
+    let w = FOG_FLOOR + (1.0 - FOG_FLOOR) * min(1.0, 0.7 * banks * (0.35 + 0.65 * strands) + 0.6 * strands * smoothstep(0.15, 0.5, n1));
+    let wisp = vec2<f32>(w, 0.6 + 1.3 * smoothstep(0.25, 0.8, w));
+    return mix(wisp, FOG_MEAN, smoothstep(0.35, 1.1, b));
+}
+
+// Smooth, low-frequency and without a grid: two waves each warped by the
+// other's axis, in [0, 1]. Cheaper than lattice noise by half the proxy.
+fn fx_fog_noise(p: vec2<f32>) -> f32 {
+    return 0.5 + 0.25 * (sin(p.x * 1.7 + sin(p.y * 1.3)) + sin(p.y * 1.9 + 1.7 * sin(p.x * 0.9)));
+}
+
+fn fx_fog(in: VOut) -> vec4<f32> {
+    let eye = fx.head.xyz;
+    let ray = in.world - eye;
+    let t_quad = max(length(ray), 1e-6);
+    let d = ray / t_quad;
+    var t_far = 1e6;
+    if (fx.depth.z > 0.5 && in.at.w > 0.0) {
+        let ndc = in.at.xyz / in.at.w;
+        let size = vec2<f32>(textureDimensions(probe_pass_depth));
+        let texel = clamp(vec2<i32>(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
+        let z = textureLoad(probe_pass_depth, texel, view_slot, 0);
+        if (z < 1.0) {
+            let n = fx.depth.x;
+            let f = fx.depth.y;
+            t_far = t_quad * (n * f / (f - z * (f - n))) / in.at.w;
+        }
+    }
+    // The box's own axes: the world's x and z, turned as the player's frame is.
+    let bx = vec3<f32>(cos(in.time), 0.0, sin(in.time));
+    let bz = vec3<f32>(-bx.z, 0.0, bx.x);
+    let o = eye - in.fog_a.xyz;
+    let lo = vec3<f32>(dot(o, bx), o.y, dot(o, bz));
+    let ld = vec3<f32>(dot(d, bx), d.y, dot(d, bz));
+    let h = in.fog_b.xyz;
+    let inv = 1.0 / select(ld, vec3<f32>(1e-6), abs(ld) < vec3<f32>(1e-6));
+    let ta = (-h - lo) * inv;
+    let tb = (h - lo) * inv;
+    let t0 = max(max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z)), 0.0);
+    let t1 = min(min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z)), t_far);
+    if (t1 <= t0) {
+        return vec4<f32>(0.0);
+    }
+    let fall = max(in.fog_b.w, 0.01);
+    let wind = vec2<f32>(cos(in.soft), sin(in.soft));
+    let rim = in.fog_a.w / max(min(h.x, h.z), 1e-3);
+    // Stretches of EQUAL MIST, not equal length: for a line looking down
+    // they crowd into the few centimetres over the water that hold its mist
+    // (each a few centimetres across the ground, so its strands stay sharp);
+    // for a level one they are even. `u` of its mist (as its mean thickness
+    // has it) lies `-ln(1 - u (1 - e^-k)) / k` of the way along.
+    let len = t1 - t0;
+    let k = clamp(ld.y * len / (fall * FOG_MEAN.y), -30.0, 30.0);
+    let e = 1.0 - exp(-k);
+    let level = abs(k) < 1e-3;
+    var sa = 0.0;
+    var depth = 0.0;
+    for (var i = 0; i < FOG_STEPS; i++) {
+        let u = f32(i + 1) / f32(FOG_STEPS);
+        let um = (f32(i) + 0.5) / f32(FOG_STEPS);
+        let sb = select(-log(max(1.0 - u * e, 1e-6)) / k, u, level);
+        let sm = select(-log(max(1.0 - um * e, 1e-6)) / k, um, level);
+        let ta = t0 + sa * len;
+        let span = (sb - sa) * len;
+        sa = sb;
+        // Read at the middle of its mist; blurred by how far it runs across
+        // the ground.
+        let m = lo + ld * (t0 + sm * len);
+        let lies = 1.0 - smoothstep(1.0 - rim, 1.0, length(m.xz / max(h.xz, vec2<f32>(1e-3))));
+        let top = 1.0 - smoothstep(1.2 * h.y, 2.0 * h.y, m.y + h.y);
+        let wisp = fx_fog_wisps(m.xz, wind, in.flicker, span * length(ld.xz));
+        let f = fall * wisp.y;
+        let y = lo.y + h.y + ld.y * ta;
+        let dy = ld.y * span;
+        var seg = span * exp(-y / f);
+        if (abs(dy) > 1e-4 * f) {
+            seg = span * f / dy * (exp(-y / f) - exp(-(y + dy) / f));
+        }
+        depth += seg * lies * top * wisp.x;
+    }
+    depth *= in.colour.a;
+    let alpha = 1.0 - exp(-depth);
+    let g = in.layer.y;
+    let cosine = dot(d, in.light_q);
+    // Light scattered more than once forgets its way: as the mist thickens
+    // its phase goes from the droplets' own (g) toward a quarter of it -- so
+    // a bank of mist with the sun behind the eye is white, not grey.
+    let hg = min((1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * cosine, 1e-4), 1.5), 12.0);
+    let g4 = 0.25 * g;
+    let hg4 = (1.0 - g4 * g4) / pow(max(1.0 + g4 * g4 - 2.0 * g4 * cosine, 1e-4), 1.5);
+    let shown = aces_fitted(in.colour.rgb + in.light * mix(hg, hg4, alpha));
+    return vec4<f32>(shown * alpha, alpha);
+}
+
 // A flame's light by its heat, `hottest` at heat 1: black through deep red,
 // orange and amber to pale yellow, brightening steeply (`flame_colour`).
 fn fx_flame(hottest: vec3<f32>, heat: f32) -> vec3<f32> {
@@ -4924,6 +5154,11 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
         return vec4<f32>(shown * alpha + root, covers);
     }
     // </fx:flame>
+    // <fx:fog>
+    if (in.layer.z < -1.5) {
+        return fx_fog(in);
+    }
+    // </fx:fog>
     let six = in.layer.z > 0.5;
     let back = select(layer, layer + SMOKE_BACK, six);
     let back_next = select(next, next + SMOKE_BACK, six);
@@ -5016,7 +5251,7 @@ pub fn motion_shader_of(source: String) -> String {
     let to = from + s[from..].find(end).expect("effects motion twin: the upright axes moved") + end.len();
     let upright = s[from..to].to_string();
     swap(&mut s, "@group(0) @binding(0) var<uniform> camera: Camera;", "", 1);
-    swap(&mut s, "camera.view_proj[view_slot]", "fx_motion_view()", 2);
+    swap(&mut s, "camera.view_proj[view_slot]", "fx_motion_view()", 3);
     swap(&mut s, "0.75 * fx.depth.w * ", "0.75 * fx.depth.w * fx_pixel_scale * ", 1);
     swap(&mut s, "@vertex fn vs_main(@builtin(vertex_index) vi: u32, inst: IIn) -> VOut", "fn fx_vertex(vi: u32, inst: IIn) -> VOut", 1);
     swap(&mut s, "@fragment fn fs_over(in: VOut) -> @location(0) vec4<f32>", "fn fx_over(in: VOut) -> vec4<f32>", 1);
@@ -5059,6 +5294,9 @@ struct FxMotionOut {{
     // seconds its gas rose since the previous frame.
     @location(11) @interpolate(flat) gas: vec4<f32>,
     @location(12) @interpolate(flat) book: f32,
+    @location(13) world: vec3<f32>,
+    @location(14) @interpolate(flat) fog_a: vec4<f32>,
+    @location(15) @interpolate(flat) fog_b: vec4<f32>,
 }}
 
 @vertex fn vs_fx_motion(@builtin(vertex_index) vi: u32, inst: IIn, @location(6) motion: vec4<f32>) -> FxMotionOut {{
@@ -5083,6 +5321,9 @@ struct FxMotionOut {{
     out.flicker = n.flicker;
     out.curr = n.clip;
     out.prev = b.clip;
+    out.world = n.world;
+    out.fog_a = n.fog_a;
+    out.fog_b = n.fog_b;
     out.gas = vec4<f32>(0.0);
     out.book = 0.0;
     if (inst.params.w > 1.5 && inst.params.w < 2.5 && motion.w > 0.0) {{
@@ -5105,6 +5346,9 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
     v.soft = in.soft;
     v.time = in.time;
     v.flicker = in.flicker;
+    v.world = in.world;
+    v.fog_a = in.fog_a;
+    v.fog_b = in.fog_b;
     return v;
 }}
 
@@ -5136,6 +5380,26 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mist is thickest at dawn, burnt off by mid-morning, all but gone in
+    /// the afternoon, back by the evening and high all night; smooth, and the
+    /// same either side of midnight.
+    #[test]
+    fn mist_follows_the_hour_thick_at_dawn_gone_by_midday() {
+        assert_eq!(mist_conditions(6.0), 1.0);
+        assert!(mist_conditions(10.5) <= 0.05 + 1e-6);
+        assert!(mist_conditions(14.0) < 0.06);
+        assert!((mist_conditions(21.0) - 0.8).abs() < 1e-6);
+        assert!(mist_conditions(2.0) > 0.85 && mist_conditions(23.0) > 0.8);
+        assert!(mist_conditions(9.0) < 0.6 && mist_conditions(9.0) > 0.3, "burning off: {}", mist_conditions(9.0));
+        assert!((mist_conditions(24.0) - mist_conditions(0.0)).abs() < 1e-6 && (mist_conditions(-1.0) - mist_conditions(23.0)).abs() < 1e-6);
+        let mut last = mist_conditions(0.0);
+        for k in 1..=2400 {
+            let m = mist_conditions(k as f32 * 0.01);
+            assert!((m - last).abs() < 0.01, "a step at {}: {last} -> {m}", k as f32 * 0.01);
+            last = m;
+        }
+    }
 
     fn emitter(kind: EffectKind) -> EffectEmitter {
         EffectEmitter {

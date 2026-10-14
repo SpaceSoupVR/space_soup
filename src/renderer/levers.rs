@@ -532,6 +532,15 @@ pub struct Levers {
     /// `mesh_pipeline::opaque_target`. ON since 2026-10-14 (not yet measured
     /// on the headset: `--levers '{"opaque_models": false}'` is the A/B).
     pub opaque_models: bool,
+    /// THE PLAYER'S BODY'S DEPTH FIRST: laid at the start of the scene pass
+    /// (`SkinnedMeshPipeline::prepass`), so the ground and brushes under the
+    /// body are not shaded, and the body is shaded once a pixel -- not its
+    /// skin and then its clothes over it. Round 23 on the headset: the body
+    /// cost 9-11 ms of scene pass looking down, 1.31 M fragments an eye at
+    /// ~1,050 ALU each for 1.45 M pixels (skin 0.54 M, clothes 0.77 M). The
+    /// same picture: a see-through part lays depth only where its texture is
+    /// wholly opaque.
+    pub body_prepass: bool,
     /// THE SKY BEFORE THE WATER, where it was drawn after it. The water is
     /// blended AND writes depth, which turns Adreno's coarse depth (LRZ) off
     /// for every draw after it in the pass -- the full-screen sky among them.
@@ -773,6 +782,7 @@ impl Default for Levers {
             ground_horizon_caves: true,
             cave_first: true,
             opaque_models: true,
+            body_prepass: true,
             sky_before_water: true,
             water_runs: true,
             ground_buffers: true,
@@ -1000,6 +1010,7 @@ impl Levers {
             ("ground_horizon_caves", self.ground_horizon_caves, d.ground_horizon_caves),
             ("cave_first", self.cave_first, d.cave_first),
             ("opaque_models", self.opaque_models, d.opaque_models),
+            ("body_prepass", self.body_prepass, d.body_prepass),
             ("sky_before_water", self.sky_before_water, d.sky_before_water),
             ("water_runs", self.water_runs, d.water_runs),
             ("ground_buffers", self.ground_buffers, d.ground_buffers),

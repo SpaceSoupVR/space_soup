@@ -730,6 +730,8 @@ impl XrRenderer {
             // The placed emitters and splashes in view are weighed with them
             // by the one governor: far and small shed first, whatever kind.
             let wants = crate::renderer::effects::governor_wants(&self.effect_emitters, &seen, &splashes, &self.bursts.splash_measured, head_world, &sight);
+            // A fog slab's density follows the hour while a time of day runs.
+            self.bursts.mist_hour = self.time_of_day_hour();
             let bursts_drawn = self.bursts.frame_with(&self.effect_library, now, &views, head_world, &wants);
             if (0..self.effect_emitters.len()).any(|i| seen(i)) || !splashes.is_empty() || bursts_drawn.contains(&true) {
                 let bursts = crate::renderer::effects::stack::BurstFrame { lib: &self.effect_library, set: &self.bursts, drawn: &bursts_drawn };
@@ -3413,6 +3415,23 @@ impl XrRenderer {
                         pass.set_vertex_buffer(0, vb.slice(..));
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                    // THE BODY'S DEPTH, before anything it hides is shaded:
+                    // its opaque parts, then its see-through ones where their
+                    // texture is wholly opaque. See `Levers::body_prepass`.
+                    if let (Some([plain, texels]), false) = (self.sp_body_prepass(stereo), skinned_draws.is_empty()) {
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        for see_through in [false, true] {
+                            pass.set_pipeline(if see_through { texels } else { plain });
+                            for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in skinned_draws.iter().filter(|d| d.6 == see_through) {
+                                pass.set_bind_group(1, *model_bg, &[]);
+                                pass.set_bind_group(2, *tex_bg, &[]);
+                                pass.set_bind_group(3, *joint_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
+                        }
                     }
 
                     // A BAKED CAVE THE EYE IS INSIDE, BEFORE THE GROUND its rock

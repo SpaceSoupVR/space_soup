@@ -579,6 +579,13 @@ pub struct SkinnedMeshPipeline {
     /// The same twins with blending OFF, for a body's opaque parts
     /// (`Levers::opaque_models`; see [`opaque_target`]).
     pub opaque_twins: Option<[RenderPipeline; 2]>,
+    /// THE BODY'S DEPTH PREPASS, `[opaque part, see-through part]`
+    /// (`Levers::body_prepass`): the body's depth laid at the start of the
+    /// scene pass, so the ground, brushes and models it hides are not shaded
+    /// under it, and its own shading runs once a pixel -- not for the skin
+    /// and then again for the clothes over it. A see-through part writes
+    /// depth only where its texture is wholly opaque (`fs_depth_opaque_texels`).
+    pub prepass: Option<[RenderPipeline; 2]>,
 }
 
 /// THE PLAYER'S BODY, DRY OR WET, as its own shader each (Round 2,
@@ -744,6 +751,7 @@ impl SkinnedMeshPipeline {
             view,
             body_twins: None,
             opaque_twins: None,
+            prepass: None,
         }
     }
 
@@ -768,6 +776,21 @@ impl SkinnedMeshPipeline {
                 self.opaque_twins = Some([dry_opaque, wet_opaque]);
             }
             _ => log::warn!("skinned body twins: the shader's edits no longer match; the body draws with the one shader"),
+        }
+        // The prepass: the dry twin's module (its vertex stage is every
+        // twin's, to the character), depth only.
+        if let Some(dry) = skinned_body_twin(&src, false) {
+            let shader = device.create_shader_module(ShaderModuleDescriptor {
+                label: Some("skinned_body_prepass"),
+                source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, self.view.shader(dry)).into()),
+            });
+            let depth = |label: &str, entry: &str| {
+                Self::build_entry(device, &self.layout, &shader, label, self.format, self.samples, self.view, None, entry, ColorWrites::empty())
+            };
+            self.prepass = Some([
+                depth("skinned_body_prepass", "fs_depth"),
+                depth("skinned_body_prepass_texels", "fs_depth_opaque_texels"),
+            ]);
         }
         self
     }
@@ -802,6 +825,24 @@ impl SkinnedMeshPipeline {
         view: crate::renderer::multiview::ViewMode,
         blend: Option<BlendState>,
     ) -> RenderPipeline {
+        Self::build_entry(device, layout, shader, label, format, samples, view, blend, "fs_main", ColorWrites::ALL)
+    }
+
+    /// [`Self::build`] with another fragment entry and colour mask: the
+    /// depth prepass's (`fs_depth`, nothing written but depth).
+    #[allow(clippy::too_many_arguments)]
+    fn build_entry(
+        device: &Device,
+        layout: &PipelineLayout,
+        shader: &ShaderModule,
+        label: &str,
+        format: TextureFormat,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        blend: Option<BlendState>,
+        fragment_entry: &str,
+        write_mask: ColorWrites,
+    ) -> RenderPipeline {
         device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some(label),
             layout: Some(layout),
@@ -813,12 +854,12 @@ impl SkinnedMeshPipeline {
             },
             fragment: Some(FragmentState {
                 module: shader,
-                entry_point: Some("fs_main"),
+                entry_point: Some(fragment_entry),
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some(ColorTargetState {
                     format,
                     blend,
-                    write_mask: ColorWrites::ALL,
+                    write_mask,
                 })],
             }),
             primitive: PrimitiveState {
@@ -831,7 +872,11 @@ impl SkinnedMeshPipeline {
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(CompareFunction::Less),
+                // LessEqual: after the body's depth prepass its own shading
+                // passes at the depth the prepass laid (`prepass`; the
+                // position is `@invariant`). Without one, the same as Less
+                // but for exactly coincident triangles.
+                depth_compare: Some(CompareFunction::LessEqual),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
@@ -911,7 +956,9 @@ struct VIn {{
 }}
 
 struct VOut {{
-    @builtin(position) clip: vec4<f32>,
+    // INVARIANT: the body's depth prepass and its shading put a vertex at
+    // the same depth to the bit. See `SkinnedMeshPipeline::prepass`.
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) uv:     vec2<f32>,
     @location(2) world_pos: vec3<f32>,
@@ -965,6 +1012,23 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         );
     }}
     return vec4<f32>(tonemap(rgb), tex_color.a);
+}}
+
+// THE BODY'S DEPTH PREPASS (`SkinnedMeshPipeline::prepass`): depth only.
+@fragment
+fn fs_depth() -> @location(0) vec4<f32> {{
+    return vec4<f32>(0.0);
+}}
+
+// The same for a see-through part: only where its texture is wholly
+// opaque, so a pixel it only partly covers keeps what lies behind it, to
+// be blended over as before.
+@fragment
+fn fs_depth_opaque_texels(in: VOut) -> @location(0) vec4<f32> {{
+    if (textureSample(tex, samp, in.uv).a < 0.999) {{
+        discard;
+    }}
+    return vec4<f32>(0.0);
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
@@ -2759,6 +2823,15 @@ mod tests {
         assert!(mesh.opaque.is_some() && spotless.opaque.is_some() && solid.opaque.is_some());
         assert!(mirror.opaque.is_none() && mirror_solid.opaque.is_none());
         assert!(body.for_opaque_body(false).is_some() && body.for_opaque_body(true).is_some());
+        // The body's depth prepass, built and validated with them; its
+        // position is invariant, so the shading passes at LessEqual.
+        assert!(body.prepass.is_some(), "the body's depth prepass was not built");
+        let src = skinned_mesh_shader();
+        assert!(src.contains("@builtin(position) @invariant clip"));
+        for twin in [skinned_body_twin(&src, false).unwrap(), skinned_body_twin(&src, true).unwrap()] {
+            let vs = |s: &str| s[s.find("fn vs_main").unwrap()..s.find("@fragment").unwrap()].to_string();
+            assert_eq!(vs(&twin), vs(&src), "a twin's vertex stage differs from the prepass's");
+        }
     }
 
     /// MEASUREMENT (Round 2, 2026-10-14: lag looking down at the body in
