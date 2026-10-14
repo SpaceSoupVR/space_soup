@@ -347,6 +347,31 @@ impl TerrainPipeline {
         )
     }
 
+    /// DIAGNOSTIC: the ground's scene reader answering with one of
+    /// [`GROUND_DEBUG_VIEWS`] (`GROUND_DEBUG` in the offline frame). `None`
+    /// for a name that is not one.
+    pub fn new_debug_reader(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        view: &str,
+    ) -> Option<Self> {
+        let source = ground_debug_shader(&terrain_shader_for(TerrainRole::Read), view)?;
+        Some(Self::build_from(
+            device,
+            format,
+            uniform_layout,
+            samples,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::Read,
+            Some(probe_layout),
+            source,
+            "terrain_pipeline_read_debug",
+        ))
+    }
+
     /// MEASUREMENT: the ground's reader, its probe pass and that pass's
     /// poolless twin, in that order, with the layer reads inlined per layer as
     /// they were before the loop ([`with_inlined_layer_reads`]) -- drawn in the
@@ -1070,6 +1095,85 @@ pub(crate) fn painted_shader(src: &str) -> Option<String> {
     (src.matches(PAINTED_FROM).count() == 1).then(|| src.replacen(PAINTED_FROM, PAINTED_TO, 1))
 }
 
+/// The ground reader's answer, which a diagnostic picture replaces.
+const GROUND_ANSWER: &str = "    return vec4<f32>(tonemap(in.col.rgb * lit), 1.0);\n";
+
+/// DIAGNOSTIC PICTURES of the ground's scene reader, for the offline frame
+/// (`GROUND_DEBUG=<name>`): each replaces the reader's answer with ONE
+/// quantity as a colour, so a fault seen on the ground can be traced to the
+/// term that draws it. One picture, one question.
+///
+/// - `albedo`: the layers' blended colour, unlit -- is the fault in the
+///   texturing or in the light?
+/// - `plane`: the plane the pixel is textured on, red / green / blue for the
+///   projection along x / y / z, dimmer as the second plane's share grows.
+/// - `stretch`: how much that plane STRETCHES the texture on the triangle
+///   actually drawn: white where a texel covers its own size, falling to
+///   black as it is pulled out, RED past four times (a streak).
+/// - `facet`: the drawn triangle's own slope against the slope the
+///   interpolated normal claims, as |difference| / 45 degrees.
+/// - `lod`: the colour read's mip level / 10 (white = the smallest mips).
+/// - `rough`: the roughness handed to the shading.
+/// - `weights`: the layer weights, ground / rock / high as red / green / blue.
+/// - `sky`, `sun`: the ground map's sky visibility and its baked sun mask.
+/// - `normal`, `shape`: the shaded (mapped) normal and the interpolated one,
+///   in the world, as colours.
+/// - `layer0` .. `layer2`: one layer's colour alone, as the frame reads it.
+/// - `ao`: the occlusion handed to the shading.
+///
+/// And `cut:<name>`: the LIT picture with one of `ground_cuts::GROUND_CUTS`
+/// taken out of the reader -- what that part draws. And
+/// `edit:<from>=><to>[;;<from>=><to>...]`: the lit picture with those exact
+/// text edits of the WGSL (each `from` once in the shader), to try a change
+/// of the reader on a picture without a build.
+pub const GROUND_DEBUG_VIEWS: &[(&str, &str)] = &[
+    ("albedo", "albedo"),
+    ("plane", "select(select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), f.detail_axis == 1u), vec3<f32>(1.0, 0.0, 0.0), f.detail_axis == 0u) * (2.0 * f.blend - 1.0 + 0.25)"),
+    (
+        "stretch",
+        "select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(dbg_face[f.detail_axis]), dbg_face[f.detail_axis] > 0.25)",
+    ),
+    ("facet", "vec3<f32>(abs(degrees(acos(clamp(dbg_face.y, 0.0, 1.0))) - slope_deg) / 45.0)"),
+    (
+        "lod",
+        "vec3<f32>(0.5 * log2(max(max(dot(f.detail_ddx, f.detail_ddx), dot(f.detail_ddy, f.detail_ddy)), 1e-12) * 512.0 * 512.0) / 10.0)",
+    ),
+    ("rough", "vec3<f32>(rough)"),
+    ("weights", "w.rgb"),
+    ("sky", "vec3<f32>(sky_vis)"),
+    ("sun", "vec3<f32>(receiver_sun_mask)"),
+    ("normal", "to_world_direction(shaded_n) * 0.5 + 0.5"),
+    ("shape", "to_world_direction(n) * 0.5 + 0.5"),
+    ("layer0", "layer_colour_at(0, f)"),
+    ("layer1", "layer_colour_at(1, f)"),
+    ("layer2", "layer_colour_at(2, f)"),
+    ("ao", "vec3<f32>(ao_map)"),
+];
+
+/// `src` (a ground scene shader) answering with one of
+/// [`GROUND_DEBUG_VIEWS`]; `None` for a name that is not one, or a shader
+/// whose answer is not where it is expected.
+pub fn ground_debug_shader(src: &str, view: &str) -> Option<String> {
+    if let Some(cut) = view.strip_prefix("cut:") {
+        let (_, edits) = crate::renderer::ground_cuts::GROUND_CUTS.iter().find(|(name, _)| *name == cut)?;
+        return crate::renderer::ground_cuts::with_cut(src, edits);
+    }
+    if let Some(edits) = view.strip_prefix("edit:") {
+        let edits: Vec<(&str, &str)> = edits.split(";;").map(|e| e.split_once("=>")).collect::<Option<_>>()?;
+        return crate::renderer::ground_cuts::with_cut(src, &edits);
+    }
+    let (_, colour) = GROUND_DEBUG_VIEWS.iter().find(|(name, _)| *name == view)?;
+    (src.matches(GROUND_ANSWER).count() == 1).then(|| {
+        src.replacen(
+            GROUND_ANSWER,
+            &format!(
+                "    let dbg_face = abs(normalize(cross(dpdx(in.tex_pos), dpdy(in.tex_pos))));\n    return vec4<f32>(clamp({colour}, vec3<f32>(0.0), vec3<f32>(1.0)) + 0.0 * lit, 1.0);\n"
+            ),
+            1,
+        )
+    })
+}
+
 /// The terrain shader for `role`: `terrain_shader`, with its reflection read
 /// from the probe pass or its fragment stage cut down to the reflection alone.
 pub fn terrain_shader_for(role: TerrainRole) -> String {
@@ -1417,25 +1521,42 @@ fn layer_colour(layer: i32, world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> v
 // plane; the colour reads it too. The same values in every read, and the
 // reader that draws triangles with both kinds of pixel holds what the steep
 // twin holds (`ground_twins`; `shader_opt::frame_was` is the frame as it was).
+//
+// TWO PLANES, EVERY MAP ON BOTH, ONE SHARE (2026-10-13, the headset's line
+// artifacts on steep ground). A steep pixel is read on the plane its surface
+// faces most (`detail_*`) and, only where a second plane faces it nearly as
+// much, on that one too (`minor_*`), the first by `blend` and the second by
+// the rest -- colour, normal, roughness and occlusion alike. Until then the
+// colour alone was blended and the other three changed plane along a line,
+// which drew the polygon the two normals' tie traces across a face as a
+// patch of another rock (the pale V on the scarp); and the share was the
+// plain ratio of the normal's two largest parts, which leaves a plane that
+// stretches the picture three times a third of the say.
 struct SampleFrame {{
     minor_uv: vec2<f32>,
     minor_ddx: vec2<f32>,
     minor_ddy: vec2<f32>,
+    // The first plane's share of every map: 1 where it is read alone (all
+    // gentle ground, and steep ground away from a turn between two planes).
     blend: f32,
-    biplanar: f32,
-    // THE DETAIL MAPS' PROJECTION: normal, roughness, occlusion and macro.
-    // Top-down on gentle ground, as they always were; on steep ground the
-    // colour's MAJOR plane, the one the face looks along. Read top-down, a
-    // cliff took one texel row of each down its whole height -- the vertical
-    // streaks a near-vertical face showed (2026-10-08, the headland). One
-    // fetch either way, so the change costs selects and no taps; only the
-    // colour blends the minor plane in.
+    // The share of the SECOND SCALE in the first plane's colour and normal:
+    // a side plane's alone, and none at a tie, where the two planes must be
+    // read alike for the picture to be the same from either side of it.
+    second: f32,
+    // THE FIRST PLANE: top-down on gentle ground, as it always was; on steep
+    // ground the one the face looks along. Read top-down, a cliff took one
+    // texel row of each map down its whole height -- the vertical streaks a
+    // near-vertical face showed (2026-10-08, the headland).
     detail_uv: vec2<f32>,
     detail_ddx: vec2<f32>,
     detail_ddy: vec2<f32>,
     detail_axis: u32,
     // The macro variation, read once here (it steers the warp below).
     macro_value: f32,
+    // How the top plane's bumps are folded into the normal (`fold_bumps`):
+    // 1 where the triangle drawn is the surface the interpolated normal
+    // describes, 0 where the planes were chosen by the triangle instead.
+    fold: f32,
     minor_axis: u32,
 }}
 
@@ -1448,30 +1569,101 @@ const CLIFF_WARP_M: f32 = 2.5;
 // the bend changes (the macro map at this repeat).
 const CLIFF_BAND_WARP_M: f32 = 3.0;
 const CLIFF_BAND_SCALE_M: f32 = 7.0;
+// Whether the level's material carries a macro map (`sample_frame`).
+const GROUND_MACRO_MAP: bool = false;
 
-fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> SampleFrame {{
+// A plane has a share of a steep pixel only where the surface faces it more
+// than this: 1/sqrt(3), what all three face at once. So a plane is never read
+// where it would stretch the picture more than 1.73 times, and the plane left
+// out -- the third -- has no share to lose where it swaps with the second.
+const PLANE_TIE: f32 = 0.57735;
+// The first plane's share past which the second is not read at all.
+const PLANE_ALONE: f32 = 0.999;
+// How far the triangle drawn may turn from the interpolated normal before the
+// planes are chosen by the triangle instead: on any smooth ground the two
+// agree (their dot) within 6 degrees, and by 14 the triangle alone decides.
+// `FACE_BAND` is one over the width between.
+const FACE_DIFFERS: f32 = 0.9703;
+const FACE_BAND: f32 = 41.3;
+// What the macro variation reads where there is no macro map: the middle,
+// which changes nothing.
+const MACRO_NEUTRAL: f32 = 0.5019608;
+
+// `n` is the interpolated normal, and `step_x` and `step_y` the position's
+// two screen steps -- all three in the player's frame, where the steps stay
+// small near the eye in a level of any size.
+fn sample_frame(world: vec3<f32>, n: vec3<f32>, step_x: vec3<f32>, step_y: vec3<f32>) -> SampleFrame {{
     var f: SampleFrame;
     let planar_uv  = world.xz;
-    let planar_ddx = dpdx(world.xz);
-    let planar_ddy = dpdy(world.xz);
+    // THE WORLD POSITION'S TWO SCREEN GRADIENTS, taken once: every plane's
+    // are two of their components. Never the derivative of a uv a pixel
+    // CHOSE: across the line where the choice changes that is the difference
+    // of two unrelated coordinates, read as a gradient of metres a pixel, and
+    // every map drops to its smallest mip along it -- the one-pixel pale
+    // lines down a cliff (headset, 2026-10-13).
+    let world_ddx = dpdx(world);
+    let world_ddy = dpdy(world);
+    let planar_ddx = world_ddx.xz;
+    let planar_ddy = world_ddy.xz;
 
+    // THE DRAWN TRIANGLE'S OWN NORMAL, on `n`'s side: both steps lie in the
+    // triangle's plane, so their cross is its normal exactly, at a triangle's
+    // edge too. (A triangle seen so edge-on that the steps have no area
+    // between them has none, and the interpolated normal stands in below.)
+    let across = cross(step_x, step_y);
+    let along = dot(across, n);
+    let across_len = inverseSqrt(max(dot(across, across), 1e-30));
+    let face = across * (sign(along) * across_len);
+    // STEEP WHERE THE NORMAL OR THE TRIANGLE IS. The interpolated normal is
+    // the light's; it is a blend of the faces round each vertex, and on a rise
+    // one cell wide it reads twenty degrees gentler than the face it is drawn
+    // on, and straight up along a knife ridge's crest, where the faces either
+    // side cancel. Asked alone, a ridge's top was "gentle" and took the
+    // top-down plane on seventy-degree faces: the picture pulled down each
+    // side's fall line, the herringbone along the crest.
+    let steep = min(n.y, face.y) <= cos(radians(mat.biplanar_start_deg));
+    // THE PLANES ARE CHOSEN BY THE SURFACE THAT IS DRAWN: the interpolated
+    // normal where the triangle agrees with it -- so on rounded ground the
+    // shares turn smoothly, with no facet -- and the triangle's own where it
+    // does not: at a cliff's foot and rim, on a one-cell step, along a ridge.
+    // There the ground has a crease, and the picture changes plane on it.
+    // In the world, as the planes are.
+    let agree = clamp((abs(along) * across_len - FACE_DIFFERS) * FACE_BAND, 0.0001, 1.0);
+    let pn = to_world_direction(normalize(mix(face, n, agree)));
     // At unit repeat, so each layer divides rather than recomputing.
-    let b = biplanar_axes(world, n, 1.0);
-    let major_ddx = dpdx(b.uv_major);
-    let major_ddy = dpdy(b.uv_major);
+    let b = biplanar_axes(world, pn, 1.0);
+    let a = abs(pn);
+    let ma = max(a.x, max(a.y, a.z));
+    let me = a.x + a.y + a.z - ma - min(a.x, min(a.y, a.z));
+    // Each plane's share is how far the surface faces it PAST the three-way
+    // tie: the second plane's is nothing until then, and equal to the
+    // first's where the two tie.
+    let lead = ma - PLANE_TIE;
+    let share = (lead + 0.0001) / (lead + max(me - PLANE_TIE, 0.0) + 0.0001);
+    let major_ddx = select(select(world_ddx.xy, world_ddx.xz, b.axis_major == 1u), world_ddx.zy, b.axis_major == 0u);
+    let major_ddy = select(select(world_ddy.xy, world_ddy.xz, b.axis_major == 1u), world_ddy.zy, b.axis_major == 0u);
     f.minor_uv  = b.uv_minor;
-    f.minor_ddx = dpdx(b.uv_minor);
-    f.minor_ddy = dpdy(b.uv_minor);
-    f.blend     = b.w;
-    f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);
-    let steep = slope_deg >= mat.biplanar_start_deg;
+    f.minor_ddx = select(select(world_ddx.xy, world_ddx.xz, b.axis_minor == 1u), world_ddx.zy, b.axis_minor == 0u);
+    f.minor_ddy = select(select(world_ddy.xy, world_ddy.xz, b.axis_minor == 1u), world_ddy.zy, b.axis_minor == 0u);
+    f.blend     = select(1.0, share, steep);
     f.detail_uv   = select(planar_uv, b.uv_major, steep);
     f.detail_ddx  = select(planar_ddx, major_ddx, steep);
     f.detail_ddy  = select(planar_ddy, major_ddy, steep);
     f.detail_axis = select(1u, b.axis_major, steep);
     f.minor_axis  = b.axis_minor;
-    let mr = max(mat.macro_repeat, 0.001);
-    f.macro_value = textureSampleGrad(macro_tex, layer_samp, f.detail_uv / mr, f.detail_ddx / mr, f.detail_ddy / mr).r;
+    f.fold        = select(1.0, agree, steep);
+    // THE MACRO VARIATION, where a level has a macro map. None has: every
+    // material is built with the one neutral texel (`TerrainMaterial::
+    // from_layers_with`), and every ground pixel paid a fetch here -- a cliff
+    // a second below -- to read the middle. `GROUND_MACRO_MAP` is the build
+    // with the reads in it, for the day a level brings a map.
+    f.macro_value = MACRO_NEUTRAL;
+    if (GROUND_MACRO_MAP) {{
+        let mr = max(mat.macro_repeat, 0.001);
+        f.macro_value = textureSampleGrad(macro_tex, layer_samp, f.detail_uv / mr, f.detail_ddx / mr, f.detail_ddy / mr).r;
+    }}
+    // The second scale: on a side plane, by how far it leads (`SampleFrame`).
+    f.second = select(0.0, (0.3 + 0.3 * f.macro_value) * clamp(4.0 * f.blend - 2.0, 0.0, 1.0), f.detail_axis != 1u);
     var warp = select(vec2<f32>(0.0), vec2<f32>(f.macro_value - 0.5, 0.4 - 0.8 * f.macro_value) * CLIFF_WARP_M, steep);
     // THE BANDS. The rock map is a scan of bedded rock, so it carries level
     // stripes, and tiled every 2 m up a 13 m face they read as strata laid
@@ -1482,61 +1674,109 @@ fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> SampleFrame {
     // its fetch is skipped on the ground.
     if (steep) {{
         let ms = 1.0 / CLIFF_BAND_SCALE_M;
-        let m2 = textureSampleGrad(macro_tex, layer_samp, f.detail_uv * ms + vec2<f32>(0.31, 0.57), f.detail_ddx * ms, f.detail_ddy * ms).r;
+        var m2 = MACRO_NEUTRAL;
+        if (GROUND_MACRO_MAP) {{
+            m2 = textureSampleGrad(macro_tex, layer_samp, f.detail_uv * ms + vec2<f32>(0.31, 0.57), f.detail_ddx * ms, f.detail_ddy * ms).r;
+        }}
         warp = warp + vec2<f32>(0.35, 1.0) * (m2 - 0.5) * CLIFF_BAND_WARP_M;
     }}
-    // Gentle ground's warp is nothing, so its top-down uv is as it was.
-    f.minor_uv  = f.minor_uv + warp;
-    f.detail_uv = f.detail_uv + warp;
+    // The side planes' alone: the top plane is read where gentle ground
+    // reads it, so nothing moves where steep ground begins.
+    f.minor_uv  = f.minor_uv + select(warp, vec2<f32>(0.0), f.minor_axis == 1u);
+    f.detail_uv = f.detail_uv + select(warp, vec2<f32>(0.0), f.detail_axis == 1u);
     return f;
 }}
 
 fn layer_colour_at(layer: i32, f: SampleFrame) -> vec3<f32> {{
     let r = max(mat.repeat[layer], 0.001);
-    // The plane the pixel is read on (`SampleFrame`): top-down, and the whole
-    // colour, where it is not steep; a cliff's major plane where it is.
-    let c_face = textureSampleGrad(layer_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r).rgb;
-    if (f.biplanar < 0.5) {{
-        return c_face;
-    }}
+    // The first plane (`SampleFrame`): top-down, and the whole colour, on
+    // gentle ground; on steep ground the plane the face looks along.
+    var c = textureSampleGrad(layer_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r).rgb;
     // TWO SCALES ON THE FACE THE CLIFF LOOKS ALONG, as for the normal: the
     // rock scan's level stripes, tiled every 2 m, read as strata at one even
     // pitch from the beach. A second read 2.3x larger and tilted 37 degrees
     // puts a second, unrelated pitch over the first, so no period shows.
-    let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
-    let s2 = 1.0 / (r * 2.3);
-    let c_major = mix(
-        c_face,
-        textureSampleGrad(
-            layer_tex, layer_samp, rot * f.detail_uv * s2 + vec2<f32>(0.37, 0.11), layer,
-            rot * f.detail_ddx * s2, rot * f.detail_ddy * s2,
-        ).rgb,
-        0.3 + 0.3 * f.macro_value,
-    );
-    let c_minor = textureSampleGrad(
-        layer_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r,
-    ).rgb;
-    return mix(c_minor, c_major, f.blend);
+    if (f.second > 0.0) {{
+        let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
+        let s2 = 1.0 / (r * 2.3);
+        c = mix(
+            c,
+            textureSampleGrad(
+                layer_tex, layer_samp, rot * f.detail_uv * s2 + vec2<f32>(0.37, 0.11), layer,
+                rot * f.detail_ddx * s2, rot * f.detail_ddy * s2,
+            ).rgb,
+            f.second,
+        );
+    }}
+    // The second plane, where it has a share.
+    if (f.blend < PLANE_ALONE) {{
+        c = mix(
+            textureSampleGrad(layer_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r).rgb,
+            c,
+            f.blend,
+        );
+    }}
+    return c;
 }}
 
 // Roughness and occlusion for one layer, sampled with the same frame and
 // gradients the normal uses so all four maps agree about which mip they are on.
 //
-// Planar only: both are low-frequency compared with colour, and a biplanar pair
-// for each would double the fetches on a fill-bound frame to move a value that
-// barely changes across the blend.
+// On the planes the colour is read on, by the same share: read on the first
+// alone they changed plane along the line where two planes tie, and a patch
+// of ground shone and shaded as another rock (`SampleFrame`). The second
+// plane's fetch is taken only where it has a share.
 fn layer_rough_at(layer: i32, f: SampleFrame) -> f32 {{
     let r = max(mat.repeat[layer], 0.001);
-    return textureSampleGrad(
+    var v = textureSampleGrad(
         rough_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r,
     ).r;
+    if (f.blend < PLANE_ALONE) {{
+        v = mix(textureSampleGrad(rough_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r).r, v, f.blend);
+    }}
+    return v;
 }}
 
 fn layer_ao_at(layer: i32, f: SampleFrame) -> f32 {{
     let r = max(mat.repeat[layer], 0.001);
-    return textureSampleGrad(
+    var v = textureSampleGrad(
         ao_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r,
     ).r;
+    if (f.blend < PLANE_ALONE) {{
+        v = mix(textureSampleGrad(ao_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r).r, v, f.blend);
+    }}
+    return v;
+}}
+
+// ONE PLANE'S BUMPS FOLDED INTO THE SURFACE NORMAL, without leaning it.
+//
+// `whiteout` shortens only the normal's part along the plane's axis, by the
+// bump's z, and leaves the rest whole: the result leans away from the axis.
+// The grass map's bumps average z 0.63 (rock's 0.97), so on the top plane a
+// slope's mean normal was shaded half as steep again as it is, and on a side
+// plane as much too upright. Where the two planes met on one normal -- a
+// patch of the face chosen by the other plane, the level triangle at a bank's
+// foot beside the bank's own -- one side shaded dark and the other pale: the
+// pale V on the grass scarp (and, by their shape, the dark triangles in the
+// beach hill's shots), a straight line along the foot of every rise
+// (headset, 2026-10-13). It was never the
+// highlight: with the specular and the reflections off, and at roughness 1,
+// the V stayed.
+//
+// So a SIDE plane shortens the whole normal alike, and its bumps leave the
+// direction where it was. The TOP plane keeps the fold every gentle pixel has
+// always had -- level ground, where the two agree exactly, is most of every
+// level and shades as before -- wherever the triangle drawn is the surface
+// the interpolated normal describes (`keep` 1), and folds as a side plane
+// does where the planes were chosen by the triangle (`keep` 0): at a bank's
+// foot and rim, where the normal leans forty degrees over level ground.
+fn fold_bumps(axis: u32, tn: vec3<f32>, n: vec3<f32>, keep: f32) -> vec3<f32> {{
+    let z = abs(tn.z);
+    if (axis == 1u) {{
+        let g = mix(z, 1.0, keep);
+        return vec3<f32>(tn.x + g * n.x, z * n.y, g * n.z - tn.y);
+    }}
+    return n * z + select(vec3<f32>(tn.x, -tn.y, 0.0), vec3<f32>(0.0, -tn.y, tn.x), axis == 0u);
 }}
 
 fn layer_normal_at(layer: i32, n: vec3<f32>, f: SampleFrame) -> vec3<f32> {{
@@ -1563,17 +1803,20 @@ fn layer_normal_at(layer: i32, n: vec3<f32>, f: SampleFrame) -> vec3<f32> {{
     // variance. Nothing is lost by handing both back.
     var tn = packed * 2.0 - 1.0;
     tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
-    // A side plane (a cliff's) is folded in where its axes are -- the
-    // world's -- and turned back into the player's frame; the top plane keeps
-    // the bend it always had, so gentle ground shades exactly as before.
-    if (f.detail_axis != 1u) {{
-        // TWO SCALES ON A CLIFF. One normal map tiled down a long face showed
-        // its repeat as rows of the same chevron. A second read, 2.3x larger
-        // and turned 37 degrees, is mixed in: the two periods never line up,
-        // so the sum does not repeat within any face we have. Its bumps are
-        // turned back into the first read's axes before the mix, and the mix
-        // (which averages two unrelated patterns, so comes out short) is
-        // given back its strength. Steep faces only.
+    // The top plane read alone -- all gentle ground, and steep ground whose
+    // face still looks up -- keeps the bend it always had, so gentle ground
+    // shades exactly as before.
+    if (f.detail_axis == 1u && f.blend >= PLANE_ALONE) {{
+        return fold_bumps(1u, world_planar_bend(tn), n, f.fold);
+    }}
+    // TWO SCALES ON A CLIFF. One normal map tiled down a long face showed
+    // its repeat as rows of the same chevron. A second read, 2.3x larger
+    // and turned 37 degrees, is mixed in: the two periods never line up,
+    // so the sum does not repeat within any face we have. Its bumps are
+    // turned back into the first read's axes before the mix, and the mix
+    // (which averages two unrelated patterns, so comes out short) is
+    // given back its strength. A side plane's alone, by `f.second`.
+    if (f.second > 0.0) {{
         let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
         let s2 = 1.0 / (r * 2.3);
         let p2 = textureSampleGrad(
@@ -1582,26 +1825,24 @@ fn layer_normal_at(layer: i32, n: vec3<f32>, f: SampleFrame) -> vec3<f32> {{
         ).rgb;
         var t2 = p2 * 2.0 - 1.0;
         t2 = vec3<f32>(transpose(rot) * (t2.xy * mat.normal_strength), t2.z);
-        let k = 0.3 + 0.3 * f.macro_value;
-        tn = vec3<f32>(mix(tn.xy, t2.xy, k) * 1.3, mix(tn.z, t2.z, k));
-        let nw = to_world_direction(n);
-        var bent = whiteout(f.detail_axis, tn, nw);
-        // NEAR THE SWITCH between two side planes (a face turning through
-        // 45 degrees in plan), the minor plane's normal is blended in over a
-        // short band, so the bumps do not change direction along a line.
-        // Its fetch is taken only inside that band.
-        let w_major = 0.5 + 0.5 * smoothstep(0.5, 0.62, f.blend);
-        if (w_major < 0.999 && f.biplanar > 0.5) {{
-            let pm = textureSampleGrad(
-                normal_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r,
-            ).rgb;
-            var tm = pm * 2.0 - 1.0;
-            tm = vec3<f32>(tm.xy * mat.normal_strength, tm.z);
-            bent = bent * w_major + whiteout(f.minor_axis, tm, nw) * (1.0 - w_major);
-        }}
-        return to_player_direction(bent);
+        tn = vec3<f32>(mix(tn.xy, t2.xy, f.second) * (1.0 + 0.667 * f.second), mix(tn.z, t2.z, f.second));
     }}
-    return whiteout(1u, world_planar_bend(tn), n);
+    // Each plane's bumps are folded in where its axes are -- the world's --
+    // and the sum turned back into the player's frame.
+    let nw = to_world_direction(n);
+    var bent = fold_bumps(f.detail_axis, tn, nw, f.fold);
+    // THE SECOND PLANE'S, by its share, as the colour's: so the bumps do
+    // not change direction along a line where a face turns from one plane
+    // to the next. Its fetch is taken only where it has a share.
+    if (f.blend < PLANE_ALONE) {{
+        let pm = textureSampleGrad(
+            normal_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r,
+        ).rgb;
+        var tm = pm * 2.0 - 1.0;
+        tm = vec3<f32>(tm.xy * mat.normal_strength, tm.z);
+        bent = mix(fold_bumps(f.minor_axis, tm, nw, f.fold), bent, f.blend);
+    }}
+    return to_player_direction(bent);
 }}
 
 
@@ -1668,7 +1909,9 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // axes: picked by the player-frame one, steep ground swapped its x and z
     // projections at every quarter turn (headset `outdoors_front-y90`,
     // 2026-10-01, the far bank).
-    let f = sample_frame(in.tex_pos, to_world_direction(n), slope_deg);
+    // And by the triangle that is drawn, where it is not the surface the
+    // interpolated normal describes (`sample_frame`).
+    let f = sample_frame(in.tex_pos, n, step_x, step_y);
 
     // Blend the layers' normals by the same weights, then renormalise. Summing
     // unit vectors shortens the result wherever they disagree, and a shortened
@@ -2028,6 +2271,22 @@ pub(crate) mod tests {
         const WORLD_SHIFT: glam::Vec3 = glam::Vec3::new(2.375, 0.625, 4.0);
         let offset = read + WORLD_SHIFT - glam::Quat::from_rotation_y(yaw) * read;
         let normal = (yaw_inv * glam::Vec3::from(normal)).to_array();
+        // THE QUAD LIES IN THE PLANE ITS NORMAL SAYS, through the pixel read:
+        // the ground's shader asks the triangle it is drawn on which way it
+        // faces (`sample_frame`), and a quad square to the eye carrying
+        // another surface's normal is a crease nothing on a level has. Its
+        // corners are placed so that `quad_view` puts them where they always
+        // were on screen, and the pixel read is the same point as before.
+        let plane_n = glam::Vec3::from(normal).try_normalize().unwrap_or(glam::Vec3::Z);
+        let plane_t = plane_n.any_orthonormal_vector();
+        let plane_b = plane_n.cross(plane_t);
+        let on_plane = |x: f32, y: f32| (read + plane_t * (x - read.x) + plane_b * (y - read.y)).to_array();
+        let quad_view = glam::Mat4::from_cols(
+            glam::Vec4::new(plane_t.x, plane_b.x, 0.0, 0.0),
+            glam::Vec4::new(plane_t.y, plane_b.y, 0.0, 0.0),
+            glam::Vec4::new(plane_t.z, plane_b.z, 0.0, 0.0),
+            glam::Vec4::new(read.x - plane_t.dot(read), read.y - plane_b.dot(read), 0.5, 1.0),
+        );
         let lit = light.is_some();
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
@@ -2039,12 +2298,13 @@ pub(crate) mod tests {
         // Both uniform buffers are created UNINITIALISED. Without writing them
         // view_proj is garbage -- the triangle lands somewhere arbitrary and the
         // readback is just clear colour -- and the light count is undefined.
-        // Identity view_proj means the vertex positions ARE clip coordinates,
-        // and an empty light list leaves the shader's AMBIENT term, which is all
-        // this test wants: it is asserting the splat blend, not the light rig.
+        // `quad_view` puts the quad's corners at the clip coordinates named
+        // below, and an empty light list leaves the shader's AMBIENT term,
+        // which is all this test wants: it is asserting the splat blend, not
+        // the light rig.
         uniforms.upload_scene(
             &queue,
-            glam::Mat4::IDENTITY,
+            quad_view,
             // The eye. Only specular reads it, and these tests assert the splat
             // blend -- so it goes straight out in front of the quad, where a
             // highlight lands symmetrically and cannot be mistaken for one of
@@ -2122,13 +2382,13 @@ pub(crate) mod tests {
             }
         };
 
-        // A quad filling clip space, carrying the normal under test. The vertex
-        // stage multiplies by view_proj, which defaults to identity here, so
-        // positions ARE clip coordinates.
+        // A quad filling clip space, carrying the normal under test and lying
+        // in its plane: the corners that `quad_view` sends to (-1, -1),
+        // (3, -1) and (-1, 3).
         let verts = [
-            vertex([-1.0, -1.0, 0.5], normal),
-            vertex([3.0, -1.0, 0.5], normal),
-            vertex([-1.0, 3.0, 0.5], normal),
+            vertex(on_plane(-1.0, -1.0), normal),
+            vertex(on_plane(3.0, -1.0), normal),
+            vertex(on_plane(-1.0, 3.0), normal),
         ];
         let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("test_vb"),
@@ -4033,11 +4293,49 @@ pub fn load_terrain_layers(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
 /// A missing map is ordinary and not an error: that layer takes
 /// `DEFAULT_TERRAIN_ROUGHNESS`, which is what every layer used before these
 /// existed, so a project that has not authored them looks exactly as it did.
+///
+/// READ AS THE PROJECT READS THAT MATERIAL: a layer whose asset (`sources.json`
+/// beside the maps) has a `"roughness": {"min", "max"}` in the game's
+/// `material_overrides.json` takes it, as the brushes' copy of the same
+/// material does (`quest_app::brush_render::roughness_range`). The rock layer
+/// is Rock063, whose map ships at 0.33-0.59 -- wet, mirror-like stone, which is
+/// why the hallway's walls were given 0.55-1.0 (2026-09-29). The ground's copy
+/// never was: every cliff was the wet stone the walls had stopped being, bright
+/// sheen down the steep faces (headset, 2026-10-13), and every rock pixel under
+/// the probe pass's 0.75 took the reflection trace. Absent, a map is read as
+/// it is.
 pub fn load_terrain_rough(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
     TERRAIN_ROUGH_FILES
         .iter()
-        .map(|name| TerrainImage::load(&dir.join(name)))
+        .enumerate()
+        .map(|(layer, name)| {
+            let mut img = TerrainImage::load(&dir.join(name));
+            if let (Some(img), Some((lo, hi))) = (img.as_mut(), terrain_roughness_range(dir, layer)) {
+                for px in img.rgba.chunks_exact_mut(4) {
+                    for c in &mut px[..3] {
+                        *c = ((lo + (*c as f32 / 255.0) * (hi - lo)).clamp(0.0, 1.0) * 255.0).round() as u8;
+                    }
+                }
+                log::info!("terrain: layer {layer}'s roughness read as {lo:.2}..{hi:.2}");
+            }
+            img
+        })
         .collect()
+}
+
+/// What terrain layer `layer`'s roughness map's 0 and 1 stand for: its asset's
+/// entry in the game's `material_overrides.json` (the game folder is two up
+/// from the layer maps, `textures/terrain`), found through `sources.json`.
+pub fn terrain_roughness_range(dir: &std::path::Path, layer: usize) -> Option<(f32, f32)> {
+    let read = |path: std::path::PathBuf| -> Option<serde_json::Value> { serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok() };
+    let role = TERRAIN_LAYER_FILES.get(layer)?.strip_suffix(".jpg")?;
+    let sources = read(dir.join("sources.json"))?;
+    let id = sources.get(role)?.get("assetId")?.as_str()?;
+    let overrides = read(dir.parent()?.parent()?.join("material_overrides.json"))?;
+    let r = overrides.get(id)?.get("roughness")?;
+    let lo = r.get("min")?.as_f64()? as f32;
+    let hi = r.get("max")?.as_f64()? as f32;
+    (lo.is_finite() && hi.is_finite()).then_some((lo.clamp(0.0, 1.0), hi.clamp(0.0, 1.0)))
 }
 
 /// Load the four occlusion maps, per layer, falling back to none.
@@ -4707,6 +5005,45 @@ mod terrain_mip_tests {
 
     /// Every layer ships the full material set, so terrain is not a
     /// second-class surface next to a brush.
+    /// A layer's roughness is read through its asset's override, as the
+    /// brushes read the same material, and a layer with none as it is.
+    #[test]
+    fn a_layers_roughness_takes_its_materials_override() {
+        let game = std::env::temp_dir().join(format!("terrain_rough_{}", std::process::id()));
+        let dir = game.join("textures").join("terrain");
+        let _ = std::fs::remove_dir_all(&game);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sources.json"), r#"{"ground": {"assetId": "Grass005"}, "rock": {"assetId": "Rock063"}}"#).unwrap();
+        std::fs::write(game.join("material_overrides.json"), r#"{"Rock063": {"roughness": {"min": 0.55, "max": 1.0}}}"#).unwrap();
+        assert_eq!(super::terrain_roughness_range(&dir, 1), Some((0.55, 1.0)), "the rock layer is Rock063");
+        assert_eq!(super::terrain_roughness_range(&dir, 0), None, "grass has no override");
+        assert_eq!(super::terrain_roughness_range(&dir, 2), None, "a layer with no source");
+        // The map itself, remapped: 0.4 reads as 0.55 + 0.4 * 0.45 = 0.73.
+        let grey = image::RgbImage::from_pixel(4, 4, image::Rgb([102, 102, 102]));
+        grey.save(dir.join("rock_r.jpg")).unwrap();
+        grey.save(dir.join("ground_r.jpg")).unwrap();
+        let maps = super::load_terrain_rough(&dir);
+        let read = |m: &Option<super::TerrainImage>| m.as_ref().unwrap().rgba[0] as f32 / 255.0;
+        assert!((read(&maps[1]) - 0.73).abs() < 0.02, "rock read as {}", read(&maps[1]));
+        assert!((read(&maps[0]) - 0.4).abs() < 0.02, "grass read as {}", read(&maps[0]));
+        let _ = std::fs::remove_dir_all(&game);
+    }
+
+    /// The shipped rock reads as the hallway's walls read the same stone:
+    /// dry, its median 0.74 where the map's own is 0.43.
+    #[test]
+    fn the_shipped_cliffs_read_as_dry_rock() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/textures/terrain");
+        let Some(Some(rock)) = super::load_terrain_rough(&dir).into_iter().nth(1) else {
+            eprintln!("skipping: no terrain rock map");
+            return;
+        };
+        let mut v: Vec<u8> = rock.rgba.chunks_exact(4).map(|p| p[0]).collect();
+        v.sort_unstable();
+        let median = v[v.len() / 2] as f32 / 255.0;
+        assert!(median > 0.7, "the cliffs' rock reads at a median roughness of {median}: wet stone");
+    }
+
     #[test]
     fn every_layer_has_a_roughness_and_occlusion_file_name() {
         assert_eq!(super::TERRAIN_ROUGH_FILES.len(), super::TERRAIN_LAYER_FILES.len());
@@ -4745,6 +5082,235 @@ mod terrain_mip_tests {
                     (*b as i32 - 128).abs() <= 1,
                     "a flat 128 became {b}; the linear chain is bending values",
                 );
+            }
+        }
+    }
+}
+
+/// STEEP SHAPES, as the ground's frame reads them (2026-10-13): a CPU
+/// transcription of how `sample_frame` chooses its planes and shares and how
+/// `layer_normal_at` folds a layer's bumps, run on the heightfield mesh of each
+/// shape the headset showed faults on -- with the old reading beside it, which
+/// each test must catch. Cells are test_room's (0.43 m), split on one diagonal,
+/// normals area-weighted as `terrain_render::vertex_normals` makes them.
+#[cfg(test)]
+mod steep_shapes_frame {
+    use glam::Vec3;
+
+    const CELL: f32 = 0.43;
+    const TIE: f32 = 0.57735;
+    const STEEP_COS: f32 = 0.95106; // cos 18 degrees, `biplanar_start_deg`
+    // The grass map's mean bump z (`ground_n.jpg`): what whiteout shortened.
+    const BUMP_Z: f32 = 0.63;
+
+    struct Mesh {
+        p: Vec<Vec3>,
+        n: Vec<Vec3>,
+        tris: Vec<[usize; 3]>,
+    }
+
+    fn mesh(size: usize, h: impl Fn(usize, usize) -> f32) -> Mesh {
+        let at = |i: usize, j: usize| i * size + j;
+        let p: Vec<Vec3> = (0..size * size).map(|k| Vec3::new((k % size) as f32 * CELL, h(k / size, k % size), (k / size) as f32 * CELL)).collect();
+        let mut tris = Vec::new();
+        for i in 0..size - 1 {
+            for j in 0..size - 1 {
+                tris.push([at(i, j), at(i + 1, j), at(i, j + 1)]);
+                tris.push([at(i, j + 1), at(i + 1, j), at(i + 1, j + 1)]);
+            }
+        }
+        let mut n = vec![Vec3::ZERO; p.len()];
+        for t in &tris {
+            let c = (p[t[1]] - p[t[0]]).cross(p[t[2]] - p[t[0]]);
+            let c = if c.y < 0.0 { -c } else { c };
+            for &v in t {
+                n[v] += c;
+            }
+        }
+        Mesh { p, n: n.into_iter().map(|v| v.normalize()).collect(), tris }
+    }
+
+    /// The five shapes: a one-cell wall, an 85-degree face over four cells, a
+    /// knife ridge, a cliff's foot onto level sand, and a stair of one-cell
+    /// steps.
+    fn shapes() -> Vec<(&'static str, Mesh)> {
+        let s = 12;
+        vec![
+            ("wall", mesh(s, |_, j| if j >= 6 { 13.0 } else { 0.0 })),
+            ("face85", mesh(s, |_, j| (j.clamp(4, 8) - 4) as f32 * CELL * 85f32.to_radians().tan())),
+            ("ridge", mesh(s, |_, j| (6.0 - (j as f32 - 6.0).abs() * CELL * 70f32.to_radians().tan()).max(0.0))),
+            ("foot", mesh(s, |_, j| (j.max(6) - 6) as f32 * CELL * 80f32.to_radians().tan())),
+            ("stair", mesh(s, |_, j| (j / 2) as f32 * 0.8)),
+        ]
+    }
+
+    /// The planes and their shares as the frame reads them: (axis, share)
+    /// pairs, and the top plane's fold.
+    fn planes_new(n: Vec3, face: Vec3) -> ([(usize, f32); 2], f32) {
+        let steep = n.y.min(face.y) <= STEEP_COS;
+        let agree = ((n.dot(face).abs() - 0.9703) * 41.3).clamp(0.0001, 1.0);
+        let pn = face.lerp(n, agree).normalize();
+        let (major, minor) = axes(pn);
+        let a = pn.abs();
+        let (ma, me) = (a[major], a[minor]);
+        let lead = ma - TIE;
+        let share = (lead + 0.0001) / (lead + (me - TIE).max(0.0) + 0.0001);
+        if !steep {
+            return ([(1, 1.0), (minor, 0.0)], 1.0);
+        }
+        ([(major, share), (minor, 1.0 - share)], agree)
+    }
+
+    /// As it was: the planes by the interpolated normal alone, steep by its
+    /// slope, the second plane by `ma / (ma + me)` in the colour only, and the
+    /// normal folded on the first plane alone.
+    fn planes_old(n: Vec3) -> ([(usize, f32); 2], [(usize, f32); 2]) {
+        let (major, minor) = axes(n);
+        if n.y > STEEP_COS {
+            return ([(1, 1.0), (minor, 0.0)], [(1, 1.0), (minor, 0.0)]);
+        }
+        let a = n.abs();
+        let w = a[major] / (a[major] + a[minor]);
+        ([(major, w), (minor, 1.0 - w)], [(major, 1.0), (minor, 0.0)])
+    }
+
+    fn axes(n: Vec3) -> (usize, usize) {
+        let a = n.abs();
+        let major = if a.y >= a.x && a.y >= a.z { 1 } else if a.x >= a.z { 0 } else { 2 };
+        let minor = (0..3).filter(|&k| k != major).max_by(|&i, &j| a[i].total_cmp(&a[j])).unwrap();
+        (major, minor)
+    }
+
+    /// A flat bump (its mean) folded on `axis`: `fold_bumps` and `whiteout`.
+    fn fold(axis: usize, n: Vec3, keep: f32) -> Vec3 {
+        if axis == 1 {
+            let g = BUMP_Z + (1.0 - BUMP_Z) * keep;
+            return Vec3::new(g * n.x, BUMP_Z * n.y, g * n.z);
+        }
+        n * BUMP_Z
+    }
+    fn whiteout(axis: usize, n: Vec3) -> Vec3 {
+        let mut v = n;
+        v[axis] *= BUMP_Z;
+        v
+    }
+
+    /// Points across each triangle (barycentric), with the triangle's own
+    /// normal and the interpolated one there.
+    fn samples(m: &Mesh) -> Vec<(usize, Vec3, Vec3, Vec3)> {
+        let mut out = Vec::new();
+        for (t, tri) in m.tris.iter().enumerate() {
+            let [a, b, c] = tri.map(|v| m.p[v]);
+            let face = (b - a).cross(c - a).normalize();
+            let face = if face.y < 0.0 { -face } else { face };
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.5, 0.0), (0.0, 0.5), (0.5, 0.5), (0.33, 0.33), (0.1, 0.1), (0.8, 0.1), (0.1, 0.8)] {
+                let w = 1.0 - u - v;
+                let pos = a * w + b * u + c * v;
+                let n = (m.n[tri[0]] * w + m.n[tri[1]] * u + m.n[tri[2]] * v).normalize();
+                out.push((t, pos, n, face));
+            }
+        }
+        out
+    }
+
+    /// The most a plane with any visible share (a tenth) stretches the picture
+    /// on the triangle it is drawn on: 1 / |face . axis|.
+    fn worst_stretch(planes: &[(usize, f32)], face: Vec3) -> f32 {
+        planes.iter().filter(|(_, s)| *s >= 0.1).map(|&(k, _)| 1.0 / face.abs()[k].max(0.01)).fold(1.0, f32::max)
+    }
+
+    /// M1: NO PLANE IS READ STRETCHED. The old reading, taking its planes from
+    /// the interpolated normal, pulled the picture out several times on every
+    /// shape (the herringbone, the comb teeth); the frame keeps every plane
+    /// with a share within 2.8 (the tie's 1.73, widened by the 14 degrees
+    /// over which the triangle takes over from the normal).
+    #[test]
+    fn no_plane_is_read_stretched_on_any_steep_shape() {
+        for (name, m) in shapes() {
+            let (mut new, mut old) = (1.0f32, 1.0f32);
+            for (_, _, n, face) in samples(&m) {
+                new = new.max(worst_stretch(&planes_new(n, face).0, face));
+                old = old.max(worst_stretch(&planes_old(n).0, face));
+            }
+            assert!(new <= 2.8, "{name}: a plane is read stretched {new:.1} times");
+            assert!(old > 3.0, "{name}: the old reading stretched only {old:.1} times -- the shape no longer tests anything");
+        }
+    }
+
+    /// M2: THE BUMPS SHADE ONE NORMAL ON EITHER SIDE OF ANY LINE. Where two
+    /// triangles meet, and where a plane takes over inside one, the mean
+    /// shading normal must not jump: the old reading turned it by up to
+    /// fifteen degrees at once (the pale V, the dark facets, the line along a
+    /// rise's foot).
+    #[test]
+    fn the_mean_shading_normal_never_jumps() {
+        let shade_new = |n: Vec3, face: Vec3| {
+            let (planes, keep) = planes_new(n, face);
+            planes.iter().map(|&(k, s)| fold(k, n, keep) * s).sum::<Vec3>().normalize()
+        };
+        let shade_old = |n: Vec3| {
+            let (_, normal) = planes_old(n);
+            whiteout(normal[0].0, n).normalize()
+        };
+        for (name, m) in shapes() {
+            let (mut new, mut old) = (0.0f32, 0.0f32);
+            // The same point seen from every triangle it lies on: a vertex,
+            // with that triangle's own normal and the shared interpolated one.
+            let pts = samples(&m);
+            for (i, &(ti, pi, ni, fi)) in pts.iter().enumerate() {
+                for &(tj, pj, nj, fj) in &pts[i + 1..] {
+                    if ti == tj || pi.distance(pj) > 1e-4 {
+                        continue;
+                    }
+                    new = new.max(shade_new(ni, fi).angle_between(shade_new(nj, fj)).to_degrees());
+                    old = old.max(shade_old(ni).angle_between(shade_old(nj)).to_degrees());
+                }
+            }
+            // And along a fine line up each shape (a row of edges, across the
+            // rise), where the old reading's plane flipped inside a triangle.
+            let k = |r: usize, c: usize| r * 12 + c;
+            let steps = 4000;
+            let along = |t: f32| {
+                let (j, f) = ((t as usize).min(10), t - (t as usize).min(10) as f32);
+                m.n[k(5, j)].lerp(m.n[k(5, j + 1)], f).normalize()
+            };
+            for step in 0..steps {
+                let (t0, t1) = (step as f32 * 11.0 / steps as f32, (step + 1) as f32 * 11.0 / steps as f32);
+                old = old.max(shade_old(along(t0)).angle_between(shade_old(along(t1))).to_degrees());
+            }
+            assert!(new < 1.0, "{name}: the shading normal jumps {new:.1} degrees across a line");
+            // (A smooth 85-degree face and a stair of 62-degree steps never
+            // cross a tie: their old fault was the stretch, above.)
+            if name != "face85" && name != "stair" {
+                assert!(old > 4.0, "{name}: the old reading jumped only {old:.1} degrees -- the shape no longer tests anything");
+            }
+        }
+    }
+
+    /// M3: no derivative of a coordinate a pixel CHOSE: every gradient the
+    /// frame hands the reads is two parts of the world position's own.
+    #[test]
+    fn the_frame_takes_no_derivative_of_a_chosen_coordinate() {
+        let src = super::terrain_shader();
+        let frame = src.split("fn sample_frame").nth(1).and_then(|s| s.split("\nfn ").next()).expect("sample_frame");
+        for (i, _) in frame.match_indices("dpdx(").chain(frame.match_indices("dpdy(")) {
+            assert!(frame[i + 5..].starts_with("world)"), "a derivative of something other than the world position: {}", &frame[i..i + 40]);
+        }
+    }
+
+    /// The twins' classes agree with the frame: a triangle whose own face is
+    /// steep is never drawn by the gentle twin, whatever its normals say --
+    /// the ridge's crest and the stair's treads, whose normals read gentle.
+    #[test]
+    fn a_steep_faced_triangle_is_never_gentle() {
+        for (name, m) in shapes() {
+            for tri in &m.tris {
+                let pos = tri.map(|v| m.p[v].to_array());
+                let face_y = crate::renderer::ground_twins::face_height(pos);
+                let normals = tri.map(|v| m.n[v].to_array());
+                if face_y <= STEEP_COS {
+                    assert!(!crate::renderer::ground_twins::triangle_is_gentle(normals, face_y, 18.0), "{name}: a steep face drawn gentle");
+                }
             }
         }
     }

@@ -237,7 +237,9 @@ fn axis_select(src: &str) -> Option<String> {
 /// the cliff's major plane and the detail maps' plane each held with its two
 /// gradients, where the shipped frame holds the one a pixel reads
 /// (`terrain_pipeline`'s `SampleFrame`). THE CONTROL the shipped frame is
-/// measured against, and the same picture: every read takes the same values.
+/// measured against, and the same picture: every read takes the same values
+/// (the colour's first read from the top-down plane where that is the plane
+/// read, from the side plane kept beside it elsewhere).
 /// Listed `Near` only so that `opt_all` leaves it out.
 ///
 /// (`frame_dw`, round 6's candidate here -- every gradient picked from the
@@ -252,25 +254,20 @@ fn frame_was(src: &str) -> Option<String> {
             "struct SampleFrame {\n    planar_uv: vec2<f32>,\n    planar_ddx: vec2<f32>,\n    planar_ddy: vec2<f32>,\n    major_uv: vec2<f32>,\n    major_ddx: vec2<f32>,\n    major_ddy: vec2<f32>,\n",
         ),
         (
-            "    let planar_uv  = world.xz;\n    let planar_ddx = dpdx(world.xz);\n    let planar_ddy = dpdy(world.xz);\n",
-            "    f.planar_uv  = world.xz;\n    f.planar_ddx = dpdx(world.xz);\n    f.planar_ddy = dpdy(world.xz);\n",
+            "    let planar_ddx = world_ddx.xz;\n    let planar_ddy = world_ddy.xz;\n",
+            "    f.planar_uv  = planar_uv;\n    f.planar_ddx = world_ddx.xz;\n    f.planar_ddy = world_ddy.xz;\n    let planar_ddx = f.planar_ddx;\n    let planar_ddy = f.planar_ddy;\n",
         ),
         (
-            "    let major_ddx = dpdx(b.uv_major);\n    let major_ddy = dpdy(b.uv_major);\n",
-            "    f.major_uv  = b.uv_major;\n    f.major_ddx = dpdx(b.uv_major);\n    f.major_ddy = dpdy(b.uv_major);\n",
+            "    let major_ddx = select(select(world_ddx.xy, world_ddx.xz, b.axis_major == 1u), world_ddx.zy, b.axis_major == 0u);\n    let major_ddy = select(select(world_ddy.xy, world_ddy.xz, b.axis_major == 1u), world_ddy.zy, b.axis_major == 0u);\n",
+            "    f.major_ddx = select(select(world_ddx.xy, world_ddx.xz, b.axis_major == 1u), world_ddx.zy, b.axis_major == 0u);\n    f.major_ddy = select(select(world_ddy.xy, world_ddy.xz, b.axis_major == 1u), world_ddy.zy, b.axis_major == 0u);\n    let major_ddx = f.major_ddx;\n    let major_ddy = f.major_ddy;\n",
         ),
         (
-            "    f.detail_uv   = select(planar_uv, b.uv_major, steep);\n    f.detail_ddx  = select(planar_ddx, major_ddx, steep);\n    f.detail_ddy  = select(planar_ddy, major_ddy, steep);\n",
-            "    f.detail_uv   = select(f.planar_uv, f.major_uv, steep);\n    f.detail_ddx  = select(f.planar_ddx, f.major_ddx, steep);\n    f.detail_ddy  = select(f.planar_ddy, f.major_ddy, steep);\n",
-        ),
-        ("    f.minor_uv  = f.minor_uv + warp;\n", "    f.major_uv  = f.major_uv + warp;\n    f.minor_uv  = f.minor_uv + warp;\n"),
-        (
-            "    let c_face = textureSampleGrad(layer_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r).rgb;\n    if (f.biplanar < 0.5) {\n        return c_face;\n    }\n",
-            "    if (f.biplanar < 0.5) {\n        return textureSampleGrad(\n            layer_tex, layer_samp, f.planar_uv / r, layer,\n            f.planar_ddx / r, f.planar_ddy / r,\n        ).rgb;\n    }\n",
+            "    f.detail_uv = f.detail_uv + select(warp, vec2<f32>(0.0), f.detail_axis == 1u);\n",
+            "    f.detail_uv = f.detail_uv + select(warp, vec2<f32>(0.0), f.detail_axis == 1u);\n    f.major_uv  = f.detail_uv;\n",
         ),
         (
-            "    let c_major = mix(\n        c_face,\n        textureSampleGrad(\n            layer_tex, layer_samp, rot * f.detail_uv * s2 + vec2<f32>(0.37, 0.11), layer,\n            rot * f.detail_ddx * s2, rot * f.detail_ddy * s2,\n        ).rgb,\n",
-            "    let c_major = mix(\n        textureSampleGrad(layer_tex, layer_samp, f.major_uv / r, layer, f.major_ddx / r, f.major_ddy / r).rgb,\n        textureSampleGrad(\n            layer_tex, layer_samp, rot * f.major_uv * s2 + vec2<f32>(0.37, 0.11), layer,\n            rot * f.major_ddx * s2, rot * f.major_ddy * s2,\n        ).rgb,\n",
+            "    var c = textureSampleGrad(layer_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r).rgb;\n",
+            "    var c = vec3<f32>(0.0);\n    if (f.detail_axis == 1u) {\n        c = textureSampleGrad(layer_tex, layer_samp, f.planar_uv / r, layer, f.planar_ddx / r, f.planar_ddy / r).rgb;\n    } else {\n        c = textureSampleGrad(layer_tex, layer_samp, f.major_uv / r, layer, f.major_ddx / r, f.major_ddy / r).rgb;\n    }\n",
         ),
     ] {
         s = once(&s, from, to)?;
