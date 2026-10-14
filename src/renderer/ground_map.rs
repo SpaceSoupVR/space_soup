@@ -27,9 +27,10 @@
 //!
 //! The ground is rough enough that the light it returns barely depends on where
 //! it is seen from, which is what lets one picture serve every viewpoint.
-//! What it leaves out, deliberately: the layers' normal-map detail and texture
-//! grain (averaged into each layer's mean colour), the ground's own specular,
-//! and moving shadows. Buildings are not in it -- a reflection that should meet
+//! Its colour is each layer's texture filtered to the map's grain
+//! (`LayerDetail`), so a mirror of a rock face shows the rock's blocks. What it
+//! leaves out, deliberately: the layers' normal-map detail, texture grain finer
+//! than a texel, the ground's own specular, and moving shadows. Buildings are not in it -- a reflection that should meet
 //! another building's wall outdoors passes behind it.
 
 use glam::{Vec2, Vec3};
@@ -153,6 +154,74 @@ fn layer_mean(layer: Option<&TerrainImage>, fallback: [u8; 3]) -> Vec3 {
     sum / n.max(1) as f32
 }
 
+/// A LAYER'S TEXTURE AT THE MAP'S GRAIN: its tile box-filtered, in linear
+/// light, to about one pixel a map texel (`repeat` metres a tile over
+/// `texel` metres a texel), so each texel reads what the terrain shader's
+/// texture averages to over it -- the rock's blocks and the sand's ripples
+/// where they are larger than a texel -- and never aliases. Its mean is the
+/// layer's mean. Without it the map was each layer's ONE mean colour, and a
+/// calm pond mirroring the rock slope behind it showed a flat tan smear: not
+/// water, an olive mound (2026-10-14).
+struct LayerDetail {
+    size: u32,
+    texels: Vec<Vec3>,
+}
+
+impl LayerDetail {
+    fn of(img: &TerrainImage, repeat: f32, texel: f32) -> Option<Self> {
+        if img.width == 0 || img.height == 0 || img.rgba.len() < (img.width * img.height * 4) as usize || repeat <= 0.0 || texel <= 0.0 {
+            return None;
+        }
+        let size = ((repeat / texel).round() as u32).clamp(1, img.width.min(img.height));
+        let mut texels = Vec::with_capacity((size * size) as usize);
+        for j in 0..size {
+            let (y0, y1) = (j * img.height / size, ((j + 1) * img.height / size).max(j * img.height / size + 1));
+            for i in 0..size {
+                let (x0, x1) = (i * img.width / size, ((i + 1) * img.width / size).max(i * img.width / size + 1));
+                let mut sum = Vec3::ZERO;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let k = ((y * img.width + x) * 4) as usize;
+                        sum += Vec3::new(srgb_to_linear(img.rgba[k]), srgb_to_linear(img.rgba[k + 1]), srgb_to_linear(img.rgba[k + 2]));
+                    }
+                }
+                texels.push(sum / ((y1 - y0) * (x1 - x0)) as f32);
+            }
+        }
+        Some(Self { size, texels })
+    }
+
+    /// Bilinear, the tile repeating, at `uv` in tiles.
+    fn at(&self, uv: Vec2) -> Vec3 {
+        let n = self.size as f32;
+        let f = (uv - uv.floor()) * n - Vec2::splat(0.5);
+        let (fx, fy) = (f.x.rem_euclid(n), f.y.rem_euclid(n));
+        let (x0, y0) = (fx.floor() as u32 % self.size, fy.floor() as u32 % self.size);
+        let (x1, y1) = ((x0 + 1) % self.size, (y0 + 1) % self.size);
+        let (tx, ty) = (fx - fx.floor(), fy - fy.floor());
+        let p = |x: u32, y: u32| self.texels[(y * self.size + x) as usize];
+        let a = p(x0, y0).lerp(p(x1, y0), tx);
+        let b = p(x0, y1).lerp(p(x1, y1), tx);
+        a.lerp(b, ty)
+    }
+
+    /// The layer's colour at a WORLD point with the ground's normal `n` there:
+    /// top-down on gentle ground, and on ground steeper than
+    /// `biplanar_start_deg` along the world's axes, each by how squarely the
+    /// ground faces it -- the terrain shader's biplanar projection
+    /// (`material_wgsl::biplanar_axes`), as a weighted blend of all three.
+    fn colour(&self, world: Vec3, n: Vec3, repeat: f32, steep: bool) -> Vec3 {
+        let r = repeat.max(1e-3);
+        if !steep {
+            return self.at(Vec2::new(world.x, world.z) / r);
+        }
+        let a = n.abs();
+        let w = Vec3::new(a.x.powi(4), a.y.powi(4), a.z.powi(4));
+        let w = w / (w.x + w.y + w.z).max(1e-6);
+        self.at(Vec2::new(world.z, world.y) / r) * w.x + self.at(Vec2::new(world.x, world.z) / r) * w.y + self.at(Vec2::new(world.x, world.y) / r) * w.z
+    }
+}
+
 /// Bilinear RGBA of an 8-bit image at `uv` in 0..1, each channel 0..1.
 fn sample_rgba(img: &TerrainImage, uv: Vec2) -> [f32; 4] {
     let fx = (uv.x.clamp(0.0, 1.0) * img.width as f32 - 0.5).max(0.0);
@@ -250,6 +319,12 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
     let means: Vec<Vec3> = (0..4)
         .map(|i| layer_mean(inputs.layers.get(i).and_then(|l| l.as_ref()), FALLBACK_LAYER_COLOURS[i]))
         .collect();
+    // Each layer's texture at the map's grain (`LayerDetail`), where it has one.
+    let texel = (extent.x / size as f32).max(extent.y / size as f32);
+    let details: Vec<Option<LayerDetail>> = (0..4)
+        .map(|i| inputs.layers.get(i).and_then(|l| l.as_ref()).and_then(|img| LayerDetail::of(img, inputs.settings.repeat[i], texel)))
+        .collect();
+    let steep_cos = inputs.settings.biplanar_start_deg.to_radians().cos();
     let sun = inputs.sun.map(|s| (Vec3::from(s.direction).normalize_or_zero(), Vec3::from(s.light_rgb)));
     let mut texels = Vec::with_capacity((size * size) as usize);
     let mut buried = Vec::with_capacity((size * size) as usize);
@@ -262,7 +337,14 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
             let n = g.normal(x, z);
             let slope_deg = n.y.clamp(-1.0, 1.0).acos().to_degrees();
             let w = layer_weights(inputs.settings, inputs.splat, uv, y, slope_deg);
-            let albedo = means[0] * w[0] + means[1] * w[1] + means[2] * w[2] + means[3] * w[3];
+            let world = Vec3::new(x, y, z);
+            let albedo: Vec3 = (0..4)
+                .filter(|&k| w[k] > 1e-3)
+                .map(|k| match &details[k] {
+                    Some(d) => d.colour(world, n, inputs.settings.repeat[k], n.y < steep_cos) * w[k],
+                    None => means[k] * w[k],
+                })
+                .sum();
             // Under still water, soaked, as the terrain shader has it
             // (`terrain_pipeline::SEA_LINE_WGSL`). The wash above it moves,
             // and this map is made once: a beach is here as it is dry.
