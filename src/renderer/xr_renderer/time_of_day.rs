@@ -305,7 +305,18 @@ impl XrRenderer {
 
     /// The ground map rebuilt off the render thread from copies of its inputs.
     fn start_ground_rebuild(&mut self, daylight: f32, dir: [f32; 3]) {
-        let Some(h) = self.ground_heights.as_ref() else { return };
+        let Some(rx) = self.ground_map_worker("tod_ground_map") else { return };
+        self.tod.ground_from = Some((daylight, dir));
+        self.tod.ground_build = Some(rx);
+    }
+
+    /// THE GROUND MAP BUILT ON A WORKER THREAD from copies of its inputs as
+    /// they stand: what the time of day's relight and a level load
+    /// (`ensure_ground_map`) wait on, rather than the render thread -- a
+    /// level's took 843 ms on the headset (2026-10-14). `None` without
+    /// ground, or when the thread would not start.
+    pub(super) fn ground_map_worker(&self, name: &str) -> Option<mpsc::Receiver<crate::renderer::ground_map::GroundMap>> {
+        let h = self.ground_heights.as_ref()?;
         let copy = |i: &crate::renderer::terrain_pipeline::TerrainImage| crate::renderer::terrain_pipeline::TerrainImage {
             width: i.width,
             height: i.height,
@@ -319,10 +330,8 @@ impl XrRenderer {
         let splat = self.terrain_splat.as_ref().map(copy);
         let settings = self.terrain_settings;
         let (tx, rx) = mpsc::channel();
-        self.tod.ground_from = Some((daylight, dir));
-        self.tod.ground_build = Some(rx);
         std::thread::Builder::new()
-            .name("tod_ground_map".into())
+            .name(name.into())
             .spawn(move || {
                 let map = crate::renderer::ground_map::build(
                     &crate::renderer::ground_map::GroundInputs {
@@ -338,7 +347,8 @@ impl XrRenderer {
                 );
                 let _ = tx.send(map);
             })
-            .ok();
+            .ok()?;
+        Some(rx)
     }
 
     fn poll_ground_rebuild(&mut self) {

@@ -178,8 +178,9 @@ pub struct Levers {
     /// 16 = the player's own whole body, hidden from them (`mirror_only`),
     /// 32 = the rigid meshes' THIN parts (cords, chains, cage wires: see
     /// `mesh::thin_parts`; their solid triangles still cast), 64 = no
-    /// characters' tiles at all (the lamps without a spot slot).
-    /// 0, the shipped state, leaves nothing out.
+    /// characters' tiles at all (the lamps without a spot slot); and 128
+    /// leaves nothing out but draws each spot tile with a scissor as well as
+    /// its viewport. 0, the shipped state, leaves nothing out.
     pub spot_caster_drop: u32,
     /// DIAGNOSIS: both eyes' finished images of the next frame, raw, to the
     /// app's files as `eyecapture_<n>.bin`, each time this changes to a new
@@ -563,6 +564,19 @@ pub struct Levers {
     /// See `render_frame` "THE SKY". 2026-10-14, LRZ audit; not yet measured
     /// on the headset: `--levers '{"sky_before_water": false}'` is the A/B.
     pub sky_before_water: bool,
+    /// THE PLANAR WATER MIRROR: at most one body a frame -- the
+    /// mirror-flagged body (`WaterDef::mirror`) covering the most of the
+    /// screen, with hysteresis -- mirrors the scene drawn mirrored in its
+    /// surface (each eye, scissored to the body's rect, the cheap twins,
+    /// models only near) in place of the ground map's top-down picture,
+    /// which smears a steep bank into a streak (2026-10-14). None when no
+    /// flagged body covers a few percent of the screen, nor with the eye in
+    /// water. On: the headset bench (2026-10-14, GPU level 5, interleaved
+    /// off/on/off, `docs/bench/planar_*`) put it at +1.0 ms app GPU in `pond`
+    /// (17.08 -> 18.08), within noise in `pond_near_shore` and nothing in
+    /// `outdoors_front`; CPU +0.5 ms in the pond views. `{"planar_water":
+    /// false}` is the A/B.
+    pub planar_water: bool,
     /// A BODY OF WATER IS DRAWN ONLY WHERE IT CAN BE SEEN: its index buffer,
     /// in the order it lies, in runs of consecutive triangles; the scene pass
     /// and the motion pass draw the runs some eye's view reaches (through a
@@ -795,6 +809,7 @@ impl Default for Levers {
             opaque_models: true,
             body_prepass: true,
             sky_before_water: true,
+            planar_water: true,
             water_runs: true,
             ground_buffers: true,
             brush_buffers: true,
@@ -1026,6 +1041,7 @@ impl Levers {
             ("opaque_models", self.opaque_models, d.opaque_models),
             ("body_prepass", self.body_prepass, d.body_prepass),
             ("sky_before_water", self.sky_before_water, d.sky_before_water),
+            ("planar_water", self.planar_water, d.planar_water),
             ("water_runs", self.water_runs, d.water_runs),
             ("ground_buffers", self.ground_buffers, d.ground_buffers),
             ("brush_buffers", self.brush_buffers, d.brush_buffers),
@@ -1143,6 +1159,9 @@ mod tests {
         let s = Levers::parse(r#"{"sky_before_water": false}"#).unwrap();
         assert!(!s.sky_before_water && Levers::default().sky_before_water);
         assert_eq!(s.summary(), "no_sky_before_water");
+        let m = Levers::parse(r#"{"planar_water": false}"#).unwrap();
+        assert!(!m.planar_water && Levers::default().planar_water);
+        assert_eq!(m.summary(), "no_planar_water");
     }
 
     /// The ground's levers are named against their defaults, whichever way

@@ -985,6 +985,10 @@ pub struct ShadowMap {
     spot_array_view: TextureView,
     /// Side of one tile in texels; the atlas is `SPOT_ATLAS_COLS` of these.
     spot_tile_dim: u32,
+    /// DIAGNOSIS: each spot tile drawn with a scissor as well as its viewport
+    /// (`Levers::spot_caster_drop` 128), to rule out a tile's casters
+    /// reaching its neighbour's texels.
+    tile_scissor: std::cell::Cell<bool>,
     sampler: Sampler,
     solid_pipeline: RenderPipeline,
     /// The solid pipeline for vertices in the WORLD -- the ground, where it
@@ -1379,6 +1383,7 @@ impl ShadowMap {
             _spot_texture: spot_texture,
             spot_array_view,
             spot_tile_dim: dim,
+            tile_scissor: Default::default(),
             sampler,
             solid_pipeline,
             solid_world_pipeline,
@@ -1428,6 +1433,10 @@ impl ShadowMap {
 
     /// Side of one spot tile in texels, which a spot's lookup bias is
     /// measured in. See `spot_shadow_matrices`.
+    pub fn set_tile_scissor(&self, on: bool) {
+        self.tile_scissor.set(on);
+    }
+
     pub fn spot_tile_dim(&self) -> u32 {
         self.spot_tile_dim
     }
@@ -1536,6 +1545,10 @@ impl ShadowMap {
             let (col, row) = spot_tile(layer);
             let d = self.spot_tile_dim as f32;
             pass.set_viewport(col as f32 * d, row as f32 * d, d, d, 0.0, 1.0);
+            if self.tile_scissor.get() {
+                let t = self.spot_tile_dim;
+                pass.set_scissor_rect(col as u32 * t, row as u32 * t, t, t);
+            }
             // Per-spot frustum culling still applies -- it is worth less than
             // merging the passes was, but it is not worth nothing, and it is
             // already paid for.

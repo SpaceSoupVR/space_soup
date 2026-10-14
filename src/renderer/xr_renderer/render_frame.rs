@@ -1851,6 +1851,7 @@ impl XrRenderer {
                 // `Levers::spot_caster_drop`; 0 leaves every list as it is.
                 let drop = self.levers.spot_caster_drop;
                 let keep = |bit: u32| drop & bit == 0;
+                self.shadow_map.set_tile_scissor(!keep(128));
                 let spot_posed: Vec<crate::renderer::shadow::ShadowMeshDraw> = posed_casters
                     .iter()
                     .enumerate()
@@ -2149,6 +2150,8 @@ impl XrRenderer {
         // the waves moved and the surfaces drawn. In the world, where their
         // bounds are, and through the doorways from inside a closed room, as
         // the ground is. See `water_pipeline::water_seen`.
+        let mut planar_shares: Vec<Option<f32>> = Vec::new();
+        let mut planar_rects_all: Vec<[Option<[f32; 4]>; 2]> = Vec::new();
         if fx.water && !self.water_bodies.is_empty() {
             let yaw = glam::Quat::from_rotation_y(self.player.yaw);
             let world_to_player =
@@ -2216,11 +2219,43 @@ impl XrRenderer {
                 }
                 body.seen.set(seen);
             }
+            // THE PLANAR WATER MIRROR'S CANDIDATES: each body authored as a
+            // mirror, seen, with both eyes above it -- its rectangle in each
+            // eye and its share of the view, the larger eye's. See
+            // `planar_water`.
+            if self.levers.planar_water {
+                for body in &self.water_bodies {
+                    let (lo, hi) = crate::renderer::planar_water::surface_box(body.bounds, body.uniform.extinction[3]);
+                    let rects: [Option<[f32; 4]>; 2] =
+                        std::array::from_fn(|i| eyes.get(i).and_then(|(_, clip)| crate::renderer::planar_water::screen_rect(*clip, lo, hi)));
+                    let above = world_eyes.iter().all(|e| e.y > body.uniform.extinction[3]);
+                    let share = (body.uniform.mirror[0] > 0.5 && body.seen.get() && above)
+                        .then(|| rects.iter().flatten().map(|r| crate::renderer::planar_water::share(*r)).fold(0.0, f32::max));
+                    planar_shares.push(share);
+                    planar_rects_all.push(rects);
+                }
+            }
         } else {
             for body in &self.water_bodies {
                 body.seen.set(false);
             }
         }
+        // THE FRAME'S ONE PLANAR MIRROR (`Levers::planar_water`): the flagged
+        // body covering the most of the view, held with hysteresis; none with
+        // an eye in the water, in a two-eye pass, or under a water cut.
+        let planar_allowed = self.levers.planar_water
+            && fx.water
+            && !self.stereo_scene()
+            && self.water_cut_pipeline.is_none()
+            && eyes_in_water.iter().all(Option::is_none);
+        let planar_body = {
+            let mut choice = self.planar_choice.get();
+            let body = choice.choose(if planar_allowed { &planar_shares } else { &[] });
+            self.planar_choice.set(choice);
+            body
+        };
+        let planar_rects: [Option<[f32; 4]>; 2] =
+            planar_body.and_then(|b| planar_rects_all.get(b).copied()).unwrap_or([None; 2]);
         // The water's slot follows the meshes': one for every body, as its
         // vertices are in the WORLD and its cameras carry each frame's way
         // into the player's frame. See `space_warp::MotionKind::Water`.
@@ -2482,6 +2517,42 @@ impl XrRenderer {
                 }
                 self.wgpu_queue.submit(Some(encoder.finish()));
             }
+
+            // THE PLANAR WATER MIRROR, this eye's: the eye mirrored in the
+            // frame's mirror body, in the planar twin's uniforms, lit as seen
+            // from there and kept linear at `HEADROOM` of the exposure (the
+            // water's tone curve is the only one applied); and the body's
+            // lane saying what undoes that. Drawn in this eye's own encoder
+            // below, as the floor mirror is. See `planar_water`.
+            let planar_eye = planar_body.zip(planar_rects[eye]).map(|(b, rect)| {
+                let body = &self.water_bodies[b];
+                let surface = body.uniform.extinction[3] - self.player.offset.y;
+                let (mirror_vp, mirror_eye) = crate::renderer::planar_water::mirror_camera(view, proj, surface);
+                let planar_post = crate::renderer::uniforms::PostUpload {
+                    exposure: post.exposure * crate::renderer::planar_water::HEADROOM,
+                    tonemap: crate::renderer::tonemap::ToneMapping::None,
+                    night_vision: 0.0,
+                    ..post
+                };
+                self.uniform_buf.write_scene_stereo_to(
+                    &self.wgpu_queue,
+                    &self.uniform_buf.planar_buffer,
+                    [mirror_vp; 2],
+                    [mirror_eye; 2],
+                    &shadow,
+                    &sky_upload,
+                    &planar_post,
+                    &frame_player,
+                    None,
+                );
+                let lane = crate::renderer::planar_water::uniform_lane(true, true, post.exposure, false);
+                self.wgpu_queue.write_buffer(
+                    &body.uniform_buffer,
+                    std::mem::offset_of!(crate::renderer::water_pipeline::WaterUniform, mirror) as u64,
+                    bytemuck::cast_slice(&lane),
+                );
+                (b, mirror_vp, mirror_eye, rect)
+            });
 
             // THE CHARACTERS MIRRORED IN THE FLOOR, this eye's: the uniforms
             // their pass draws with, in the scene uniforms' twin -- the pass
@@ -2909,6 +2980,137 @@ impl XrRenderer {
                             pools.first_row(atlas.pool_row),
                             self.pass_timers.as_ref().map(|t| (t, 20)),
                         );
+                    }
+                }
+                // THE PLANAR WATER MIRROR, this eye's image of the scene
+                // mirrored in the frame's mirror body, before the scene pass
+                // reads it: scissored to the body's rectangle, its ground by
+                // the chunks the mirrored view sees, models only within
+                // `MODEL_REACH`, then the sky. Every winding is reversed, so
+                // the mirror pipelines draw it. See `planar_water`.
+                if let Some((_, mirror_vp, _, rect)) = planar_eye {
+                    use crate::renderer::planar_water;
+                    let target = &self.planar_targets[eye];
+                    let planes = [crate::renderer::shadow::frustum_planes(mirror_vp)];
+                    let (sx, sy, sw, sh) = planar_water::scissor(rect, self.planar_size.0, self.planar_size.1);
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("planar_water"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &target.color_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &target.depth_view,
+                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+                    if sw > 0 && sh > 0 {
+                        pass.set_scissor_rect(sx, sy, sw, sh);
+                        let group = &self.uniform_buf.planar_bind_group;
+                        // The ground, by the chunks the mirrored view sees.
+                        if let Some((index_start, count)) = terrain_range {
+                            pass.set_pipeline(&self.terrain_mirror.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                            pass.set_vertex_buffer(0, solid_vb.slice(..));
+                            pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                            if ground_partitioned {
+                                for c in solid_chunks.iter().filter(|c| crate::renderer::shadow::chunk_seen(c, &planes)) {
+                                    pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                }
+                            } else {
+                                let count = ground_step1.map_or(count, |step1| step1.min(count));
+                                pass.draw_indexed(index_start..index_start + count, 0, 0..1);
+                            }
+                        }
+                        // The level's solids, the ground's range left to the above.
+                        if solid_any {
+                            pass.set_pipeline(&self.mirror_solid_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_vertex_buffer(0, solid_vb.slice(..));
+                            pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                            for (lightmap_key, index_start, count, _) in &solid_ranges {
+                                if terrain_range == Some((*index_start, *count)) {
+                                    continue;
+                                }
+                                pass.set_bind_group(1, self.cuboid_lightmap_bg(lightmap_key.as_deref()), &[]);
+                                pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
+                            }
+                        }
+                        if let Some((vb, ib, count)) = &brush_buffers {
+                            pass.set_pipeline(&self.brush_mirror_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
+                            pass.set_bind_group(2, self.brush_lightmap_bg(), &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
+                        // Rocks and caves: the landscape, by their boxes.
+                        let layered: Vec<&LayeredDraw> = layered_draws
+                            .iter()
+                            .chain(mirror_only_layered_draws.iter())
+                            .filter(|d| crate::renderer::scene_cull::sees_box(&planes, d.5))
+                            .collect();
+                        if !layered.is_empty() {
+                            pass.set_pipeline(&self.layered_mesh_mirror_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                            for (model_bg, vb, ib, count, _, _) in layered {
+                                pass.set_bind_group(2, *model_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
+                        }
+                        self.baked_cave_pipelines.draw_mirror(
+                            &mut pass,
+                            group,
+                            &self.terrain_material.bind_group,
+                            baked_cave_draws
+                                .iter()
+                                .chain(mirror_only_baked_caves.iter())
+                                .filter(|d| crate::renderer::scene_cull::sees_box(&planes, d.bounds)),
+                        );
+                        // Models near enough to matter, and the characters.
+                        let near_model = |d: &&MeshDraw| {
+                            crate::renderer::scene_cull::sees(&planes, d.bound)
+                                && (d.bound.truncate() - cam_pos).length() - d.bound.w < planar_water::MODEL_REACH
+                        };
+                        let models: Vec<&MeshDraw> = mesh_draws.iter().chain(mirror_only_mesh_draws.iter()).filter(near_model).collect();
+                        if !models.is_empty() {
+                            pass.set_pipeline(&self.mirror_mesh_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            for d in models {
+                                pass.set_bind_group(1, d.model, &[]);
+                                pass.set_bind_group(2, d.texture, &[]);
+                                pass.set_bind_group(3, d.lightmap, &[]);
+                                pass.set_vertex_buffer(0, d.vertices.slice(..));
+                                pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..d.count, 0, 0..1);
+                            }
+                        }
+                        if !skinned_draws.is_empty() || !mirror_only_skinned_draws.is_empty() {
+                            pass.set_pipeline(&self.skinned_mesh_mirror_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in skinned_draws.iter().chain(mirror_only_skinned_draws.iter()) {
+                                pass.set_bind_group(1, *model_bg, &[]);
+                                pass.set_bind_group(2, *tex_bg, &[]);
+                                pass.set_bind_group(3, *joint_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
+                        }
+                        // The sky, last: what nothing covers.
+                        pass.set_pipeline(&self.sky_mirror_pipeline.pipeline);
+                        pass.set_bind_group(0, group, &[]);
+                        pass.set_bind_group(1, &self.sky.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
                     }
                 }
                 // THE CHARACTERS MIRRORED IN THE FLOOR, into this eye's probe
@@ -3966,8 +4168,15 @@ impl XrRenderer {
                                 continue;
                             }
                             // Along a waterline, its twin that leaves the
-                            // view under the line to the underwater one.
-                            pass.set_pipeline(if eyes_body { &self.water_pipeline.waterline } else { self.sp_water(stereo) });
+                            // view under the line to the underwater one. The
+                            // frame's planar mirror, its mirror twin over
+                            // this eye's image (`planar_water`).
+                            if planar_eye.is_some_and(|p| p.0 == i) {
+                                pass.set_pipeline(self.water_pipeline.mirrored_for_rings(&body.uniform.rings[0], &body.uniform.ring_drops));
+                                pass.set_bind_group(2, &self.planar_groups[eye], &[]);
+                            } else {
+                                pass.set_pipeline(if eyes_body { &self.water_pipeline.waterline } else { self.sp_water(stereo) });
+                            }
                             pass.set_bind_group(1, &body.bind_groups[body.waves.current()], &[]);
                             pass.set_vertex_buffer(0, body.vertex_buffer.slice(..));
                             pass.set_index_buffer(body.index_buffer.slice(..), wgpu::IndexFormat::Uint32);

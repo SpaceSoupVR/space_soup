@@ -679,6 +679,16 @@ pub struct XrRenderer {
     mirror_mesh_pipeline: MeshPipeline,
     mirror_pipeline: MirrorPipeline,
     mirror_targets: [MirrorTarget; 2],
+    /// THE PLANAR WATER MIRROR (`Levers::planar_water`): each eye's image of
+    /// the scene mirrored in the frame's mirror body, at
+    /// `planar_water::SCALE` of the eye's resolution; the water's mirror
+    /// twins' group 2 over each; the ground's mirror twin; and which body is
+    /// the mirror, held from frame to frame. See `planar_water`.
+    planar_targets: [MirrorTarget; 2],
+    planar_size: (u32, u32),
+    planar_groups: [wgpu::BindGroup; 2],
+    terrain_mirror: crate::renderer::terrain_pipeline::TerrainPipeline,
+    planar_choice: std::cell::Cell<crate::renderer::planar_water::PlanarChoice>,
     mirror_model_uniform: ModelUniform,
     mirror_reflected_vp_uniform: ModelUniform,
     ssr_pipelines: SsrPipelines,
@@ -803,6 +813,9 @@ pub struct XrRenderer {
     /// Something the ground map is made from changed since it was built. It is
     /// rebuilt once, before the next frame -- not once per setter at load.
     ground_dirty: bool,
+    /// The ground map a level load is building on a worker, and since when.
+    /// See `ensure_ground_map`.
+    ground_load_build: Option<(std::sync::mpsc::Receiver<crate::renderer::ground_map::GroundMap>, std::time::Instant)>,
     /// Where the bound ground map lies and its top; `None` for no ground map.
     ground_placement: Option<([f32; 4], f32)>,
     /// The doorways between rooms, from the bake. See `ProbeUpload::set_portals`.
@@ -1405,6 +1418,14 @@ impl XrRenderer {
         let mirror_pipeline = MirrorPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let mirror_targets: [MirrorTarget; 2] =
             std::array::from_fn(|_| mirror_pipeline.create_target(&wgpu_device, wgpu_format, width, height));
+        let planar_size = |n: u32| ((n as f32 * crate::renderer::planar_water::SCALE).round() as u32).max(1);
+        let planar_targets: [MirrorTarget; 2] = std::array::from_fn(|_| {
+            mirror_pipeline.create_target(&wgpu_device, wgpu_format, planar_size(width), planar_size(height))
+        });
+        let planar_groups: [wgpu::BindGroup; 2] =
+            std::array::from_fn(|eye| water_pipeline.mirror_group(&wgpu_device, &planar_targets[eye].color_view));
+        let terrain_mirror =
+            crate::renderer::terrain_pipeline::TerrainPipeline::new_mirror(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let mirror_model_uniform = mirror_pipeline.create_model_uniform(&wgpu_device);
         let mirror_reflected_vp_uniform = mirror_pipeline.create_reflected_vp_uniform(&wgpu_device);
         // The blit and the reflective solids read the scene DEPTH, which is
@@ -1867,6 +1888,11 @@ impl XrRenderer {
             mirror_mesh_pipeline,
             mirror_pipeline,
             mirror_targets,
+            planar_targets,
+            planar_size: (planar_size(width), planar_size(height)),
+            planar_groups,
+            terrain_mirror,
+            planar_choice: Default::default(),
             mirror_model_uniform,
             mirror_reflected_vp_uniform,
             ssr_pipelines,
@@ -1924,6 +1950,7 @@ impl XrRenderer {
             pending_buildings: Vec::new(),
             ground_heights: None,
             ground_dirty: false,
+            ground_load_build: None,
             ground_placement: None,
             probe_portals: Vec::new(),
             cull_rooms: Vec::new(),
@@ -3177,39 +3204,45 @@ impl XrRenderer {
     }
 
     /// Build the ground map if anything it is made from changed. Once, before
-    /// a frame, rather than in every setter a level load passes through.
+    /// a frame, rather than in every setter a level load passes through --
+    /// and ON A WORKER THREAD (`ground_map_worker`): the frames go on with
+    /// the map they had until the new one is in, as the time of day's relight
+    /// does. A change while one is building starts another and drops the
+    /// first. It took 843 ms of the render thread on the headset
+    /// (2026-10-14).
     pub fn ensure_ground_map(&mut self) {
-        if !self.ground_dirty {
-            return;
-        }
-        self.ground_dirty = false;
-        let Some(heights) = self.ground_heights.as_ref() else {
-            if self.ground_placement.take().is_some() {
-                self.uniform_buf.set_ground_map(crate::renderer::uniforms::default_ground_map(&self.wgpu_device));
-                self.rebind_scene_group();
+        if self.ground_dirty {
+            self.ground_dirty = false;
+            // A relight of what was there before is no longer wanted.
+            self.tod.ground_build = None;
+            if self.ground_heights.is_none() {
+                self.ground_load_build = None;
+                if self.ground_placement.take().is_some() {
+                    self.uniform_buf.set_ground_map(crate::renderer::uniforms::default_ground_map(&self.wgpu_device));
+                    self.rebind_scene_group();
+                }
+                return;
             }
-            return;
+            self.ground_load_build = self.ground_map_worker("ground_map").map(|rx| (rx, std::time::Instant::now()));
+        }
+        let Some((rx, started)) = self.ground_load_build.as_ref() else { return };
+        let map = match rx.try_recv() {
+            Ok(map) => map,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.ground_load_build = None;
+                return;
+            }
         };
-        let started = std::time::Instant::now();
-        let map = crate::renderer::ground_map::build(
-            &crate::renderer::ground_map::GroundInputs {
-                heights,
-                sky: &self.sky.irradiance,
-                sun: self.sky.sun.as_ref(),
-                sky_occlusion: self.terrain_sky_occlusion.as_ref(),
-                layers: &self.terrain_layers,
-                splat: self.terrain_splat.as_ref(),
-                settings: &self.terrain_settings,
-            },
-            crate::renderer::ground_map::GROUND_MAP_SIZE,
-        );
+        let started = *started;
+        self.ground_load_build = None;
         let view = crate::renderer::ground_map::upload(&self.wgpu_device, &self.wgpu_queue, &map);
         let extent = map.max - map.min;
         self.ground_placement = Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top));
         self.uniform_buf.set_ground_map(view);
         self.rebind_scene_group();
         log::info!(
-            "ground map: {}x{} over {:.0} x {:.0} m, top {:.2} m, built in {} ms",
+            "ground map: {}x{} over {:.0} x {:.0} m, top {:.2} m, built in {} ms on a worker",
             map.width,
             map.height,
             extent.x,
