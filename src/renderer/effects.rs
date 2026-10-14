@@ -62,6 +62,7 @@ use super::lights::{Light, LightKind};
 use super::probe_stream::ProbeDesc;
 
 mod flash;
+pub mod authoring;
 pub mod stack;
 pub mod templates;
 pub mod variants;
@@ -468,6 +469,10 @@ pub struct EffectFrame {
     pub screened_heat: u32,
     /// What the event bursts among them came to (`stack`).
     pub bursts: stack::BurstCount,
+    /// Each splash drawn: its key, and its fill and instances whole
+    /// (`simulate_governed`), for the next frame's governor
+    /// (`stack::BurstSet::measured`).
+    pub splash_costs: Vec<(u64, f32, f32)>,
 }
 
 /// What lights the particles and where they are seen from.
@@ -1163,6 +1168,172 @@ pub fn simulate_all(
     time: f64,
     at: &Surroundings,
 ) -> EffectFrame {
+    simulate_governed(emitters, seen, splashes, bursts, None, time, at)
+}
+
+/// THE GOVERNOR'S SHARES of the placed emitters and the splashes
+/// (`stack::BurstSet::share_of` by [`emitter_key`] and [`splash_key`]): the
+/// share of each one's particles drawn, 1 for all of them.
+pub struct Shares<'a> {
+    pub emitter: &'a dyn Fn(&EffectEmitter) -> f32,
+    pub splash: &'a dyn Fn(&Splash) -> f32,
+}
+
+/// The governor's key for a placed emitter: its object's id.
+pub fn emitter_key(e: &EffectEmitter) -> u64 {
+    hash64(id_hash(&e.id) ^ 0x51ac_ed00_e1u64)
+}
+
+/// The governor's key for a splash: its seed (`Splash::new` draws it from
+/// where and when it struck).
+pub fn splash_key(s: &Splash) -> u64 {
+    hash64(s.seed ^ 0x5b1a_54u64)
+}
+
+/// The share of the reference view's quad a particle's cutout covers, on
+/// average over the books: what [`instance_fill`] counts a quad at.
+const CUTOUT_MEAN: f32 = 0.6;
+
+/// WHAT ONE PARTICLE FILLS, megapixel-layers, both eyes at the reference
+/// view's pixels per radian (`effect_asset::REFERENCE_FOCAL_PIXELS`): its
+/// quad across (a streak's length along), at least the 1.5 pixel floor. What
+/// a splash is weighed by, measured from what it drew.
+pub fn instance_fill(i: &EffectInstance, head: Vec3) -> f32 {
+    use super::effect_asset::{REFERENCE_EYES, REFERENCE_FOCAL_PIXELS};
+    let d = (Vec3::from_slice(&i.centre[..3]) - head).length().max(0.05);
+    let across = (2.0 * i.centre[3] / d * REFERENCE_FOCAL_PIXELS).max(1.5);
+    let along = (i.light_dir[3] / d * REFERENCE_FOCAL_PIXELS).max(across);
+    across * along * CUTOUT_MEAN * REFERENCE_EYES / 1e6
+}
+
+/// What a kind's template costs a placed emitter of it, from its stack's
+/// report (`effect_asset::EffectAsset::check`): fill per live particle at
+/// the reference distance, that distance, its importance, and whether its
+/// particles are points (the 1.5 pixel floor at any distance).
+struct KindCost {
+    fill_each: f32,
+    reference: f32,
+    importance: f32,
+    points: bool,
+    instances: f32,
+}
+
+fn kind_cost(kind: EffectKind) -> &'static KindCost {
+    static COSTS: std::sync::OnceLock<Vec<KindCost>> = std::sync::OnceLock::new();
+    let all = COSTS.get_or_init(|| {
+        EffectKind::ALL
+            .iter()
+            .map(|k| {
+                let a = templates::asset(*k);
+                let r = a.check(books()).unwrap_or_else(|e| panic!("the built-in {} template: {}", k.template_name(), e.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")));
+                let points = *k == EffectKind::Dust;
+                let fill_each = if points || r.instances_steady == 0 { 1.5 * 1.5 * super::effect_asset::REFERENCE_EYES / 1e6 } else { r.fill_steady / r.instances_steady as f32 };
+                KindCost { fill_each, reference: r.reference_distance, importance: a.scalability.importance, points, instances: r.instances_steady as f32 }
+            })
+            .collect()
+    });
+    &all[EffectKind::ALL.iter().position(|k| *k == kind).expect("every kind is listed")]
+}
+
+/// WHAT THE GOVERNOR WEIGHS BESIDE THE BURSTS (`stack::BurstSet::frame_with`):
+/// each placed emitter `seen` keeps and each splash in `splashes`, with its
+/// estimated fill and instances this frame and its score. An emitter's are
+/// its live particles (the slot loop's count: rate x longest life, or its
+/// box's density) times its template's fill a particle at its reference
+/// view, scaled by `scale`^2 and by (reference / distance)^2; a fire's
+/// sheets and a bed of coals are counted and never shed. A splash's are what
+/// it drew whole last frame (`measured`, by [`splash_key`]); a new one is
+/// weighed from its second frame. WHAT IT COSTS: one entry per emitter in
+/// view and per splash, a few multiplies each.
+pub fn governor_wants(
+    emitters: &[EffectEmitter],
+    seen: &dyn Fn(usize) -> bool,
+    splashes: &[Splash],
+    measured: &std::collections::HashMap<u64, (f32, f32)>,
+    head_world: Vec3,
+) -> Vec<stack::Want> {
+    use super::effect_asset::REFERENCE_FOCAL_PIXELS;
+    let mut out = Vec::new();
+    for (index, e) in emitters.iter().enumerate() {
+        if !seen(index) || !(e.scale > 0.0) || !(e.rate > 0.0) {
+            continue;
+        }
+        let cost = kind_cost(e.kind);
+        let tpl = templates::template(e.kind);
+        let (count, sheddable) = match tpl.form {
+            templates::Form::Slots(s) => {
+                let p = &tpl.preset;
+                let v = e.variation.clamped();
+                let rate = e.rate * if s.density { p.rate * e.volume() / (0.5 * (p.life.0 + p.life.1)) } else { p.rate };
+                let slots = ((rate * life_range(p, &v).1).ceil()).clamp(1.0, MAX_SLOTS as f32);
+                // Motes past `DUST_SEEN_WITHIN` are never worked out: only
+                // the share of the box within it counts (27 points of it).
+                let within = if s.boxed && s.held {
+                    let near = (0..27)
+                        .filter(|k| {
+                            let f = |a: i32| (a - 1) as f32 * (2.0 / 3.0);
+                            let p0 = e.position + e.extent[0] * f(k % 3) + e.extent[1] * f(k / 3 % 3) + e.extent[2] * f(k / 9);
+                            p0.distance_squared(head_world) <= DUST_SEEN_WITHIN * DUST_SEEN_WITHIN
+                        })
+                        .count();
+                    near as f32 / 27.0
+                } else {
+                    1.0
+                };
+                ((slots * within).ceil(), true)
+            }
+            _ => (cost.instances, false),
+        };
+        let (lo, hi) = emitter_bounds(e);
+        let d = (0.5 * (lo + hi)).distance(head_world).max(0.3);
+        let pixels = (hi - lo).length() / d * REFERENCE_FOCAL_PIXELS;
+        let near = if cost.points { 1.0 } else { e.scale * e.scale * (cost.reference / d).powi(2) };
+        out.push(stack::Want {
+            key: emitter_key(e),
+            score: cost.importance * 100.0 + pixels.max(1.0).log2(),
+            fill: (count * cost.fill_each * near).min(3.0),
+            count,
+            sheddable,
+            kind: stack::WantKind::Emitter,
+        });
+    }
+    for s in splashes {
+        let (lo, hi) = splash_bounds(s);
+        let d = (0.5 * (lo + hi)).distance(head_world).max(0.3);
+        let pixels = (hi - lo).length() / d * REFERENCE_FOCAL_PIXELS;
+        let (fill, count) = measured.get(&splash_key(s)).copied().unwrap_or((0.0, 0.0));
+        out.push(stack::Want {
+            key: splash_key(s),
+            score: templates::water_entry_asset().scalability.importance * 100.0 + pixels.max(1.0).log2(),
+            fill,
+            count,
+            sheddable: true,
+            kind: stack::WantKind::Splash,
+        });
+    }
+    out
+}
+
+/// [`simulate_all`], with THE GOVERNOR'S SHARES of the placed emitters and
+/// splashes (`shares`; `None` draws every particle): a slot of a thinned
+/// emitter outside its share is skipped before it is worked out, and a
+/// thinned splash's pieces outside its share are not drawn -- in a fixed
+/// order each, so a falling share drops them one at a time and a rising one
+/// brings the same ones back. Sparser, never smaller or dimmer: every
+/// particle still drawn is the same bytes it would be whole. A fire's sheets,
+/// a bed of coals and an embers emitter's pops are never thinned.
+pub fn simulate_governed(
+    emitters: &[EffectEmitter],
+    seen: &dyn Fn(usize) -> bool,
+    splashes: &[Splash],
+    bursts: Option<&stack::BurstFrame>,
+    shares: Option<&Shares>,
+    time: f64,
+    at: &Surroundings,
+) -> EffectFrame {
+    let mut emitter_shed = 0u32;
+    let mut splash_shed = 0u32;
+    let mut splash_costs: Vec<(u64, f32, f32)> = Vec::new();
     let mut over: Vec<(f32, EffectInstance)> = Vec::new();
     let mut screened: Vec<EffectInstance> = Vec::new();
     let player = |p: Vec3| at.yaw_inv * (p - at.offset);
@@ -1221,6 +1392,10 @@ pub fn simulate_all(
         // life, and the emitter as a whole at `rate`.
         let period = (slots as f64 / rate as f64).max(lives.1 as f64);
         let base = emitter_seed(e);
+        // The governor's share of its particles, and its own order of
+        // shedding them (`stack::kept`).
+        let share = shares.map_or(1.0, |sh| (sh.emitter)(e));
+        let shed_phase = (hash64(base ^ 0x0de5_ead) >> 40) as f32 / (1u64 << 24) as f32;
         let tint = Vec3::from(e.tint);
         let ambient = (at.ambient)(e.position);
         let lamps: Vec<usize> = (0..at.lights.len()).filter(|&i| (at.reaches)(e, i)).collect();
@@ -1256,6 +1431,12 @@ pub fn simulate_all(
                 let phi = u[5] * std::f32::consts::TAU;
                 e.position + (side * phi.cos() + up.cross(side) * phi.sin()) * r
             };
+            // Outside the governor's share: left out before it is worked
+            // out (after the motes past seeing, which were never drawn).
+            if share < 1.0 && !stack::kept(i as u32, share, shed_phase) {
+                emitter_shed += 1;
+                continue;
+            }
             let dir = cone_direction(up, p.spread_deg, u[2], u[3]);
             let (mut pos, vel) = ballistic(p0, dir * speed, p.accel, p.drag, age);
             // Its velocity, for SpaceWarp: the throw's, and what carries it
@@ -1396,9 +1577,31 @@ pub fn simulate_all(
         }
     }
     for s in splashes {
+        let (o0, s0) = (over.len(), screened.len());
         splash(s, time, at, &mut over, &mut screened);
+        // What it fills drawn whole: what it is weighed by next frame.
+        let key = splash_key(s);
+        let fill: f32 = over[o0..].iter().map(|(_, i)| i).chain(screened[s0..].iter()).map(|i| instance_fill(i, at.head)).sum();
+        splash_costs.push((key, fill, (over.len() - o0 + screened.len() - s0) as f32));
+        let share = shares.map_or(1.0, |sh| (sh.splash)(s));
+        if share < 1.0 {
+            let phase = uniforms(key)[0];
+            let mut j = 0u32;
+            let mut keep = |_: &EffectInstance| {
+                j += 1;
+                let kept = stack::kept(j - 1, share, phase);
+                splash_shed += !kept as u32;
+                kept
+            };
+            let tail: Vec<(f32, EffectInstance)> = over.drain(o0..).collect();
+            over.extend(tail.into_iter().filter(|(_, i)| keep(i)));
+            let tail: Vec<EffectInstance> = screened.drain(s0..).collect();
+            screened.extend(tail.into_iter().filter(|i| keep(i)));
+        }
     }
-    let burst_count = bursts.map_or_else(Default::default, |b| stack::simulate_bursts(b, time, at, &own, &mut over, &mut screened));
+    let mut burst_count = bursts.map_or_else(Default::default, |b| stack::simulate_bursts(b, time, at, &own, &mut over, &mut screened));
+    burst_count.emitter_shed = emitter_shed;
+    burst_count.splash_shed = splash_shed;
     // Those lit through the heat ramp last among the screened (which need
     // no order), for their own draw. Stable: the rest keep theirs.
     let hot = |i: &EffectInstance| i.params[3] == stack::SHADE_SCREEN_HEAT;
@@ -1414,6 +1617,7 @@ pub fn simulate_all(
         screened: screened.len() as u32,
         screened_heat,
         bursts: burst_count,
+        splash_costs,
     };
     frame.instances.extend(over.into_iter().map(|(_, i)| i));
     frame.instances.extend(screened);
@@ -1763,6 +1967,30 @@ const SPLASH_PETALS: usize = 14;
 const SHEET_THICKNESS: f32 = 0.01;
 /// The step a splash's sprites' velocities are taken over, seconds.
 const SPLASH_H: f32 = 1.0 / 256.0;
+/// THE RINGS' ENERGY: the share of a strike's energy (into the water, and a
+/// tenth of its skimming energy) that leaves as the ring of waves. Most of
+/// the rest goes into the crown, the jet, the bubbles and heat. A few per
+/// cent, and most of that the long first waves; 3 per cent here.
+const RING_ENERGY_SHARE: f32 = 0.03;
+/// The steepest disturbance the rings can be made from: a depression no
+/// deeper than this share of its radius. Steeper, water breaks: the excess
+/// goes into white water, not waves.
+const RING_STEEPEST: f32 = 0.4;
+/// The rings' source's edge, as a share of its cavity's radius: the
+/// spectrum's `exp(-k c)` (`splash_shape`).
+const RING_EDGE: f32 = 0.5;
+/// The train's height at its middle, as `RING_PEAK D a / r` (the Mexican
+/// hat's stationary phase gives 0.58; its sharp edge spreads the same energy
+/// over more lengths).
+const RING_PEAK: f32 = 0.4;
+/// How fast short ripples die on real water, m2/s: ten times pure water's
+/// viscosity, for the film every pond and sea carries (`exp(-2 nu k^2 t)`).
+pub const RING_FILM_VISCOSITY: f32 = 1.0e-5;
+/// The drops falling back are scattered over cells, one drop a cell at
+/// most, about a third of their band across: so many a metre, within these
+/// (see `water_pipeline::DROPS_BLOCK`). A drop's ring is kept inside its
+/// cell, so a smaller splash's are smaller and shorter-lived.
+pub const DROP_CELLS: (f32, f32) = (4.0, 24.0);
 
 /// WHAT A SPLASH IS, worked out from what struck ([`splash_shape`]). Lengths
 /// in metres, times in seconds, speeds in m/s.
@@ -1820,11 +2048,33 @@ pub struct SplashShape {
     pub struck: f32,
     /// Puffs of mist: a sealed strike's plume.
     pub mist: usize,
-    /// THE RINGS it sends out over the water: the length of their waves, how
-    /// fast the group of them travels, and how high they start.
+    /// THE RINGS it sends out over the water: the length of the waves that
+    /// carry most of their energy, how fast that part of the train travels
+    /// (its group speed), and how high its first crest is two cavity radii
+    /// out. The train itself is dispersive (`splash_rings`): these are its
+    /// middle.
     pub ring_wavelength: f32,
     pub ring_speed: f32,
     pub ring_height: f32,
+    /// The disturbance the rings are made from: the cavity's depression and
+    /// the rim round it, as a Mexican hat this deep at its middle, metres
+    /// (`RING_ENERGY_SHARE` of the strike's energy, no steeper than
+    /// `RING_STEEPEST`).
+    pub wave_source: f32,
+    /// Gravity as waves the train's length feel it, surface tension
+    /// included (`g (1 + sigma k^2 / rho g)` at its middle).
+    pub ring_gravity: f32,
+    /// When the train leaves: the cavity at its widest, the crown falling
+    /// back, seconds after the strike.
+    pub ring_release: f32,
+    /// THE DROPS FALLING BACK: how far from where it struck most of them
+    /// land, how wide the band is, when the first land, over how long, and
+    /// how many land on a square metre there. Each makes its own small ring.
+    pub drops_land: f32,
+    pub drops_band: f32,
+    pub drops_from: f32,
+    pub drops_over: f32,
+    pub drops_density: f32,
     /// THE FOAM it leaves where it struck: how white (0..1), and how long
     /// until the water there is still again -- which is also how long a
     /// second strike finds it disturbed ([`strike`]).
@@ -2034,19 +2284,35 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
     let froth = if throws && white > 0.4 { ((white * (6.0 + 4.0 * cavity.sqrt())).round() as usize).clamp(6, 9) } else { 0 };
     let mist = if sealed > 0.05 { (2.0 + 6.0 * sealed).round() as usize } else { 0 };
 
-    // The rings: waves a few cavity radii long, at the group speed of
-    // gravity-capillary waves that long.
-    let ring_wavelength = (2.5 * cavity).max(0.02);
-    let k = TAU / ring_wavelength;
+    // THE RINGS (Cauchy-Poisson). The cavity and the rim it lifts are a
+    // depression with a raised edge and no water gained or lost -- about a
+    // Mexican hat `-D (1 - r^2/a^2) exp(-r^2/a^2)`, whose depth holds
+    // `RING_ENERGY_SHARE` of the energy that went in (`rho g pi a^2 D^2 /
+    // 8`), no steeper than water holds. Its edge is sharp -- the crown falls
+    // back along a rim a sheet thick -- so its spectrum runs on far past the
+    // hat's: `k^2 exp(-k c)` with `c` half the cavity's radius, its waves'
+    // heights peaking at `k = 3 / c`, a cavity radius long, with a long tail
+    // of shorter ones following them out. Every length runs out at its own
+    // group speed (`splash_rings`).
+    let into = 0.5 * s.mass.max(0.0) * (normal * normal + 0.1 * flat.length_squared());
+    let a = cavity.max(0.01);
+    let wave_source = ((8.0 * RING_ENERGY_SHARE * into / (WATER_DENSITY * GRAVITY * PI * a * a)).sqrt()).min(RING_STEEPEST * a)
+        * (0.3 + 0.7 * calm)
+        * (1.0 - 0.5 * sealed);
+    let k = 3.0 / (RING_EDGE * a);
+    let ring_wavelength = TAU / k;
     let bond = SURFACE_TENSION * k * k / (WATER_DENSITY * GRAVITY);
-    let phase_speed = (GRAVITY / k * (1.0 + bond)).sqrt();
-    let ring_speed = phase_speed * (1.0 + 3.0 * bond) / (2.0 * (1.0 + bond));
-    let ring_height = 0.12 * (cavity - r).max(0.0) * (0.3 + 0.7 * calm) * (1.0 - 0.5 * sealed);
+    let ring_gravity = GRAVITY * (1.0 + bond);
+    let ring_speed = 0.5 * (ring_gravity / k).sqrt();
+    // The stationary-phase train's height at radius r is `RING_PEAK D a / r`
+    // at its middle: its first crest two radii out.
+    let ring_height = 0.5 * RING_PEAK * wave_source;
+    let ring_release = 0.5 * collapse;
 
     // Foam: over 1 the patch is white right across (`splash_rings`); under,
     // it is broken. More from a big cavity's collapse, from a sealed one's
     // (which is all air), from water already churned.
-    let foam = ((0.7 + 0.9 * smoothstep(0.03, 0.5, cavity) + 0.4 * sealed + 0.4 * (1.0 - calm)) * smoothstep(0.1, 0.6, sheet_speed)).min(1.25);
+    let foam = ((0.7 + 0.9 * smoothstep(0.03, 0.5, cavity) + 0.4 * sealed + 0.4 * (1.0 - calm)) * smoothstep(0.1, 0.6, sheet_speed)).min(0.65 + 0.3 * (1.0 - calm));
     let foam_seconds = 1.2 + 3.0 * cavity.sqrt();
     let settle = (1.5 + 4.0 * cavity.sqrt()).min(6.0);
 
@@ -2066,6 +2332,18 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
         .max(fan_seconds * (1.0 - sealed))
         .max(0.6 * collapse + 0.5 + 1.2 * cavity.sqrt() + 0.4 * sealed)
         .min(SPLASH_SECONDS);
+    // THE DROPS FALLING BACK, off the rim at the sheet's speed and angle:
+    // the crown's own pieces close in, the drops further out, most of them
+    // landing over most of a flight; the fans of spray are hundreds more.
+    let fly_k = DROP_DRAG * sheet_speed / drop;
+    let flight = aloft(up, fly_k);
+    let reach = sheet_speed * sheet_angle.cos() * if fly_k < 1e-4 { flight } else { (1.0 - (-fly_k * flight).exp()) / fly_k };
+    let drops_land = 1.1 * cavity + 0.7 * reach;
+    let drops_band = 0.3 * cavity + 0.5 * reach;
+    let drops_from = 0.25 * collapse + 0.6 * flight;
+    let drops_over = (0.8 * flight).max(0.15);
+    let falling = if throws { (drops as f32 * 3.0 + spray as f32 * 25.0) * (1.0 - fine) } else { 0.0 };
+    let drops_density = falling / (TAU * drops_land * 2.0 * drops_band).max(1e-3);
     SplashShape {
         cavity,
         depth,
@@ -2092,6 +2370,14 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
         ring_wavelength,
         ring_speed,
         ring_height,
+        wave_source,
+        ring_gravity,
+        ring_release,
+        drops_land,
+        drops_band,
+        drops_from,
+        drops_over,
+        drops_density,
         foam,
         foam_seconds,
         settle,
@@ -2218,6 +2504,31 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         }
         c * at.exposure
     };
+    // CLEAR WATER -- a sheet, a column -- is not lit like a white thing: it
+    // shows the sky off its face (Fresnel's share, more at a slant), the
+    // sun's glint where its curved face turns it to the eye, the sun's own
+    // light through it where it stands against the sun, and what is behind
+    // it through it (the blend, by one less its opacity). Drawn as one
+    // colour over `opacity`, so the colour is what it adds over the opacity.
+    // `face` is its face's normal in the world, either side.
+    let glassy = |centre: Vec3, face: Vec3, opacity: f32| -> Vec3 {
+        let to_eye = (at.head - centre).normalize_or_zero();
+        let f = at.yaw_inv * face.normalize_or(Vec3::Y);
+        let n = if f.dot(to_eye) < 0.0 { -f } else { f };
+        let cos_v = n.dot(to_eye).clamp(0.05, 1.0);
+        let fresnel = 0.02 + 0.98 * (1.0 - cos_v).powi(5);
+        let mut c = ambient * (0.15 + fresnel);
+        if let Some((to_sun, rgb)) = sun {
+            // A sheet's face is wavy: GGX at alpha 0.3, either face lit.
+            let h = (to_sun + to_eye).normalize_or_zero();
+            let nh = n.dot(h).abs();
+            let a2 = 0.09f32;
+            let d = a2 / (PI * (nh * nh * (a2 - 1.0) + 1.0).powi(2));
+            let glint = d * (0.02 + 0.98 * (1.0 - h.dot(to_eye).clamp(0.0, 1.0)).powi(5)) / (4.0 * cos_v);
+            c += rgb * (glint * n.dot(to_sun).abs() + 0.08 * henyey_greenstein(0.8, -to_sun, to_eye));
+        }
+        c * (at.exposure / opacity.max(0.05))
+    };
     let gravity = Vec3::new(0.0, -GRAVITY, 0.0);
     let calm = s.calm.clamp(0.0, 1.0);
     let lean = shape.forward.length();
@@ -2288,8 +2599,11 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
     // sheet from water already churned. Ahead of a thing that struck at a
     // slant it leaves faster and lower -- ploughed.
     // And little of one too thick to hold together: that goes up white.
+    // A whole sheet is clear: a little over half covers what is behind it
+    // (its streaked film and beaded rim in the texture's alpha carry the
+    // rest); a breaking one goes up white.
     let whole = (1.0 - shape.fine) * calm * (1.0 - 0.85 * shape.broken);
-    let crown_opacity = 0.92 * whole;
+    let crown_opacity = lerp(0.55, 0.92, shape.broken) * whole;
     // (A sheet nearly all white water is drawn as that, below: a faint clear
     // one behind it would be paid for and not seen.)
     if shape.petals > 0 && crown_opacity > 0.2 {
@@ -2331,9 +2645,11 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
             let moving = (place(since + 0.5 * SPLASH_H).0 - place(since - 0.5 * SPLASH_H).0) / SPLASH_H;
             let centre = player(centre_w);
             let moving = at.yaw_inv * moving;
-            // A wall of water shows the sky through and off it: lit from
-            // every side, a little more against the sun.
-            let c = lit(centre, 0.95, 0.15);
+            // A wall of water shows the sky through and off it, the sun's
+            // glint on its face and the sun through it: clear while whole,
+            // white as it breaks (`glassy`).
+            let face = out * angle.sin() - Vec3::Y * angle.cos();
+            let c = glassy(centre, face, crown_opacity).lerp(lit(centre, 0.95, 0.15), shape.broken);
             // A sheet too thick to draw back into its rim is in pieces sooner.
             let stage = 1.999 * smoothstep(0.3 - 0.3 * shape.broken, 0.95 - 0.35 * shape.broken, t);
             let variant = (u[3] * CROWN_VARIANTS as f32) as u32 % CROWN_VARIANTS;
@@ -2388,7 +2704,9 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         Fan { count: shape.froth, layer: FROTH_LAYER, variants: FROTH_VARIANTS, salt: 0xf207, fast: (0.0, 0.05), coarse: 1.5, tall: (1.0, 1.15), stand: 1.0, opacity: 0.95 * shape.white, phase_g: 0.0 },
         // (A fan's picture is of some hundreds of drops: a pebble's handful
         // is a fainter one.)
-        Fan { count: shape.spray, layer: SPRAY_LAYER, variants: SPRAY_VARIANTS, salt: 0x5b7a, fast: (0.15, 0.45), coarse: 0.6, tall: (1.0, 1.5), stand: 0.0, opacity: 0.95 * (shape.drops as f32 / 60.0).clamp(0.45, 1.0).max(plume), phase_g: 0.2 },
+        // Spray is clear drops, each a lens: bright toward the sun, faint with
+        // it behind the eye (a strong forward lobe), not a white cloud.
+        Fan { count: shape.spray, layer: SPRAY_LAYER, variants: SPRAY_VARIANTS, salt: 0x5b7a, fast: (0.15, 0.45), coarse: 0.6, tall: (1.0, 1.5), stand: 0.0, opacity: 0.8 * (shape.drops as f32 / 60.0).clamp(0.45, 1.0).max(plume), phase_g: 0.55 },
     ];
     for fan in &fans {
         if fan.opacity < 0.02 {
@@ -2484,11 +2802,14 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
             let (centre_w, half, aspect, spin) = place(since_close);
             let moving = at.yaw_inv * ((place(since_close + 0.5 * SPLASH_H).0 - place(since_close - 0.5 * SPLASH_H).0) / SPLASH_H);
             let centre = player(centre_w);
-            let c = lit(centre, 0.95, 0.0);
             let stage = 1.999 * smoothstep(0.3, 0.85, t);
             let variant = (u[2] * JET_VARIANTS as f32) as u32 % JET_VARIANTS;
-            // A fine one (a bullet's) is spray, not a glassy column.
-            let opacity = 0.9 * (1.0 - 0.5 * shape.fine) * smoothstep(0.0, 0.05, t) * (1.0 - smoothstep(0.85, 1.0, t));
+            // A clear column, white only as it breaks into beads; a fine one
+            // (a bullet's) is spray, not a glassy column.
+            let opacity = lerp(0.6, 0.9, shape.fine.max(0.5 * t)) * smoothstep(0.0, 0.05, t) * (1.0 - smoothstep(0.85, 1.0, t));
+            // Round, it turns a face to the eye wherever it is seen from.
+            let face = (head_world - centre_w) * Vec3::new(1.0, 0.0, 1.0);
+            let c = glassy(centre, face, opacity).lerp(lit(centre, 0.95, 0.0), shape.fine.max(0.5 * t));
             over.push((
                 (centre - at.head).length_squared(),
                 EffectInstance {
@@ -2589,46 +2910,57 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
 }
 
 /// THE WATER'S SHARE OF THE SPLASHES, as [`WaterUniform`] takes it: for each
-/// of the `N` it draws, where its rings are and how high, the waves in them,
-/// and the foam and the dimple where it struck. `rings[i].w` 0: none, and
+/// of the `N` it draws, its ring train, the foam and the dimple or boil where
+/// it struck, and the drops falling back round it. `rings[i].w` 0: none, and
 /// none after it.
 ///
 /// [`WaterUniform`]: super::water_pipeline::WaterUniform
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SplashRings<const N: usize> {
-    /// World x, z of where it struck; the radius its ring of waves has
-    /// reached, metres; the waves' height there, metres.
+    /// World x, z of where it struck; seconds since its ring train left
+    /// (`SplashShape::ring_release`; 0 before); the train's size, its
+    /// height `size k^3 exp(-k c) / r` (`SplashShape::wave_source`).
     pub rings: [[f32; 4]; N],
-    /// The waves' wavenumber, radians a metre; one over twice the square of
-    /// the ring's width; the phase its crests have run ahead by (they travel
-    /// faster than the ring does); and the dimple's slope a metre from its
-    /// middle -- the cavity while it is open, seen in the water's surface.
+    /// A quarter of gravity as its waves feel it (`ring_gravity / 4`); the
+    /// spectrum's edge `c` (`RING_EDGE` of the cavity's radius);
+    /// the cavity's radius, the rim the train is measured from (inside it
+    /// are the dimple and the boil); and the dimple's slope a metre from its
+    /// middle -- negative: the boil's dome.
     pub waves: [[f32; 4]; N],
-    /// The foam's whiteness; one over the square of the patch's radius.
+    /// The foam's whiteness; one over the square of the patch's radius; how
+    /// far it is drawn out into arcs; and over how long its drops land,
+    /// seconds.
     pub pools: [[f32; 4]; N],
+    /// THE DROPS FALLING BACK: the radius they land round, one over the
+    /// square of the band's half-width, seconds since the first landed, and
+    /// how many cells a metre they are scattered over (`DROP_CELLS`), whole,
+    /// plus the share of them a drop lands in (0: none).
+    pub drops: [[f32; 4]; N],
 }
 
-/// How much one splash's rings and foam matter to the eye at `head_world`.
-fn ring_weight(slope: f32, foam: f32, apart: f32) -> f32 {
-    (slope + 0.3 * foam) / (1.0 + apart / 4.0).powi(2)
-}
-
-/// The splashes' rings, foam and dimples on the water at `time`
-/// ([`SplashRings`]).
+/// The splashes' rings, foam, dimples and the drops falling back, on the
+/// water at `time` ([`SplashRings`]).
 ///
-/// A ring of waves leaves the cavity's rim as it opens and runs out at the
-/// group speed of waves its length (`SplashShape::ring_speed`), spreading and
-/// sinking as its circle grows; its crests run through it at their own, faster
-/// speed. Foam gathers as the cavity falls in and clears as the patch settles.
+/// THE RING TRAIN leaves as the cavity is at its widest and its crown falls
+/// back. Every wavelength in the disturbance runs out at its own group
+/// speed, so at radius r and t seconds on the waves there are those whose
+/// group speed is r / t: for gravity waves `k = g t^2 / 4 r^2`, crests at
+/// phase `g t^2 / 4 r` (Cauchy and Poisson's ring waves; Lamb 1932 sec. 255).
+/// Long waves lead, short ones follow, crests are born at the back of the
+/// train and die at its front, and the train spreads and thins as it goes:
+/// its height at its middle falls as `0.58 D a / r`. The shader evaluates it
+/// per pixel (`water_pipeline::RING_BLOCK`); here are only its constants and
+/// its clock. Foam gathers as the cavity falls in; the cavity's middle then
+/// BOILS up as a low dome; and the crown's drops, landing round it, each
+/// make a ring of their own.
 ///
 /// THE `N` THAT MATTER MOST to the eye are drawn -- by how steep and how near
 /// -- each scaled by how far it stands clear of the first one left out, so
 /// two that change places do it at nothing, and what a new splash crowds out
-/// is the faintest there is, sinking as the new one opens. With six drawn, a
-/// wader's seventh-newest step is a twentieth of what it was.
+/// is the faintest there is, sinking as the new one opens.
 pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: Vec3) -> SplashRings<N> {
-    use std::f32::consts::{PI, TAU};
-    let mut live: Vec<(f32, [[f32; 4]; 3])> = splashes
+    use std::f32::consts::PI;
+    let mut live: Vec<(f32, [[f32; 4]; 4])> = splashes
         .iter()
         .filter_map(|s| {
             let age = (time - s.born) as f32;
@@ -2637,47 +2969,70 @@ pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: 
             }
             let shape = splash_shape(s);
             let lasts = ring_seconds(&shape);
-            if age >= lasts.max(shape.foam_seconds + shape.collapse) || shape.ring_height <= 0.0 && shape.foam <= 0.0 {
+            if age >= lasts.max(shape.foam_seconds + shape.collapse) || shape.wave_source <= 0.0 && shape.foam <= 0.0 {
                 return None;
             }
-            let k = TAU / shape.ring_wavelength;
-            // The ring forms as the cavity opens, then leaves its rim.
-            let run = (age - 0.5 * shape.collapse).max(0.0);
-            let radius = shape.cavity + shape.ring_speed * run;
-            let width = 0.5 * shape.ring_wavelength + 0.25 * shape.ring_speed * run;
-            // Its energy is spread round a growing circle, and through a
-            // widening band.
-            let height = shape.ring_height
-                * smoothstep(0.0, 0.5 * shape.collapse, age)
-                * (shape.cavity / radius).sqrt()
-                * (0.5 * shape.ring_wavelength / width).sqrt()
-                * (1.0 - smoothstep(0.6 * lasts, lasts, age));
-            // Crests travel at twice the group's speed in long waves: they
-            // run through the ring.
-            let phase = (-k * shape.ring_speed * run).rem_euclid(TAU);
+            let a = shape.cavity.max(0.01);
+            let run = (age - shape.ring_release).max(0.0);
+            let fade = 1.0 - smoothstep(0.6 * lasts, lasts, age);
+            // Its size: `RING_PEAK D a / r` at the peak `k = 3 / c`, where
+            // the shader's `size k^3 exp(-k c) / r` is `size 27 e^-3 / c^3 / r`.
+            let c = RING_EDGE * a;
+            let size = RING_PEAK * shape.wave_source * a * c.powi(3) * (3.0f32).exp() / 27.0 * fade;
+            // How steep the train is now where it is steepest -- the shader's
+            // slope `size k^4 exp(-k c) / r` along it, at the radius each
+            // length has reached (`a + t sqrt(g / 4 k)`) -- for its weight.
+            let g4 = 0.25 * shape.ring_gravity;
+            let steep = [1.5f32, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0]
+                .iter()
+                .map(|m| {
+                    let k = m / c;
+                    let from_rim = run * (g4 / k).sqrt();
+                    size * k.powi(4) * (-k * (c + 2.0 * RING_FILM_VISCOSITY * k * run)).exp() * smoothstep(0.0, a, from_rim) / (a + from_rim)
+                })
+                .fold(0.0, f32::max);
             // The cavity, open: a bowl a cavity's radius wide, as deep as it
             // is (no deeper than wide: past that it is a hole, not a slope).
-            let bowl = 0.5 * shape.depth.min(shape.cavity) * (PI * (age / shape.collapse).min(1.0)).sin().max(0.0);
-            // THE FOAM: the air the collapse folds in, white right across as
-            // the cavity shuts (over 1: the water fills its bubbles in),
-            // spreading, thinning to a broken patch and gone in a second or
-            // two -- fresh water holds no foam -- drawn out into arcs along
-            // the waves that leave through it as it goes.
+            // Shut, the water it folded in BOILS up its middle -- a low dome,
+            // a quarter of its radius at most, rising and settling in about
+            // its own time.
+            let bowl = if age < shape.collapse {
+                0.5 * shape.depth.min(shape.cavity) * (PI * age / shape.collapse).sin().max(0.0)
+            } else {
+                let x = (age - shape.collapse) / (0.3 * shape.collapse + 0.15);
+                -0.25 * shape.depth.min(shape.cavity) * x * (1.0 - x).exp()
+            };
+            // THE FOAM: the air the collapse folds in, white as the cavity
+            // shuts, spreading, thinning to a broken patch and gone in a
+            // second or a few -- fresh water holds no foam -- drawn out into
+            // arcs along the waves that leave through it as it goes.
             let foamed = (age - 0.3 * shape.collapse) / shape.foam_seconds;
             let reach = shape.cavity * (1.0 + 0.9 * smoothstep(0.0, 1.0, foamed));
             let foam = shape.foam * smoothstep(0.3 * shape.collapse, 0.9 * shape.collapse, age) * (1.0 - smoothstep(0.0, 1.0, foamed)).powf(1.5);
             let streaked = 0.2 * smoothstep(0.1, 0.6, foamed);
+            // THE DROPS falling back, in their band and their while.
+            let landed = age - shape.drops_from;
+            let raining = landed < shape.drops_over + DROP_RING_SECONDS;
+            let cells = (3.0 / shape.drops_band.max(1e-3)).clamp(DROP_CELLS.0, DROP_CELLS.1).round();
+            let share = if raining { (shape.drops_density / (cells * cells)).min(1.0) } else { 0.0 };
             let apart = (s.position - head_world).length();
             // Nothing at the moment it lands -- no ring yet, no foam -- so it
             // comes to matter as it opens, and what it crowds out sinks as it
             // grows.
-            let weight = ring_weight(height * k + 2.0 * bowl / reach, foam, apart);
+            let rain = share * smoothstep(0.0, 0.05, landed) * (1.0 - smoothstep(shape.drops_over, shape.drops_over + DROP_RING_SECONDS, landed));
+            // (Coming to matter slowly over its first half second -- as the
+            // cube of its age -- so that one it crowds out of the drawn, when
+            // all `N` are taken, sinks over a tenth of a second or so rather
+            // than vanishing: it is crowded out when the newcomer outweighs
+            // it, and the newcomer's weight must grow by little in a frame.)
+            let weight = ring_weight(steep + 2.0 * bowl.abs() / reach + 0.05 * rain, foam, apart) * (age / 0.5).min(1.0).powi(3);
             (weight > 0.0).then_some((
                 weight,
                 [
-                    [s.position.x, s.position.z, radius, height.max(1e-7)],
-                    [k, 1.0 / (2.0 * width * width), phase, 2.0 * bowl / (reach * reach)],
-                    [foam, 1.0 / (reach * reach), streaked, 0.0],
+                    [s.position.x, s.position.z, run, size.max(1e-12)],
+                    [0.25 * shape.ring_gravity, c, a, 2.0 * bowl / (reach * reach)],
+                    [foam, 1.0 / (reach * reach), streaked, shape.drops_over],
+                    [shape.drops_land, 1.0 / (shape.drops_band * shape.drops_band).max(1e-6), landed, if share > 0.0 { cells + 0.999 * share } else { 0.0 }],
                 ],
             ))
         })
@@ -2685,22 +3040,39 @@ pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: 
     live.sort_by(|a, b| b.0.total_cmp(&a.0));
     // The first left out: those kept stand clear of it, or sink toward it.
     let cut = live.get(N).map_or(0.0, |l| l.0);
-    let mut out = SplashRings { rings: [[0.0; 4]; N], waves: [[0.0; 4]; N], pools: [[0.0; 4]; N] };
-    for (i, (weight, [ring, wave, pool])) in live.into_iter().take(N).enumerate() {
-        let keep = (2.0 * (1.0 - cut / weight)).clamp(0.0, 1.0);
-        out.rings[i] = [ring[0], ring[1], ring[2], (ring[3] * keep).max(1e-7)];
+    let mut out = SplashRings { rings: [[0.0; 4]; N], waves: [[0.0; 4]; N], pools: [[0.0; 4]; N], drops: [[0.0; 4]; N] };
+    for (i, (weight, [ring, wave, pool, drop])) in live.into_iter().take(N).enumerate() {
+        // Whole at three times the first left out's weight, nothing at it.
+        let keep = if cut > 0.0 { (0.5 * (weight / cut - 1.0)).clamp(0.0, 1.0) } else { 1.0 };
+        out.rings[i] = [ring[0], ring[1], ring[2], (ring[3] * keep).max(1e-12)];
         out.waves[i] = [wave[0], wave[1], wave[2], wave[3] * keep];
-        out.pools[i] = [pool[0] * keep, pool[1], pool[2], 0.0];
+        out.pools[i] = [pool[0] * keep, pool[1], pool[2], pool[3]];
+        // (Its cells a metre whole, and the share of them a drop lands in
+        // its fraction: kept as the share.)
+        out.drops[i] = [drop[0], drop[1], drop[2], if drop[3] > 0.0 { drop[3].floor() + drop[3].fract() * keep } else { 0.0 }];
     }
     out
 }
 
-/// How long a splash's rings are drawn, seconds: longer for the long, fast
-/// waves of a big one. Never past [`RING_SECONDS`].
+/// How much one splash's rings and foam matter to the eye at `head_world`.
+fn ring_weight(slope: f32, foam: f32, apart: f32) -> f32 {
+    (slope + 0.3 * foam) / (1.0 + apart / 4.0).powi(2)
+}
+
+/// How long one drop's own ring is seen, seconds (`water_pipeline::RING_BLOCK`).
+pub const DROP_RING_SECONDS: f32 = 0.45;
+
+/// How long a splash's rings are drawn: until the middle of its train is
+/// shallower than a slope of 1 in 300 -- no longer seen in a reflection --
+/// or [`RING_SECONDS`] at most.
 ///
 /// [`RING_SECONDS`]: super::water_pipeline::RING_SECONDS
 pub fn ring_seconds(shape: &SplashShape) -> f32 {
-    (2.0 + 5.0 * shape.cavity.sqrt()).min(super::water_pipeline::RING_SECONDS)
+    let a = shape.cavity.max(0.01);
+    let k = 3.0 / (RING_EDGE * a);
+    // RING_PEAK D a / r * k falls to 1/300 at r = 300 RING_PEAK D a k.
+    let reach = 300.0 * RING_PEAK * shape.wave_source * a * k;
+    (shape.ring_release + reach / shape.ring_speed.max(1e-3)).clamp(1.0, super::water_pipeline::RING_SECONDS)
 }
 
 /// How strong a fire's light is at scale 1, in the lights block's units (the
@@ -2831,17 +3203,32 @@ pub fn room_ambient(descs: &[ProbeDesc], world: Vec3) -> Vec3 {
 /// room's baked light takes the ratio of the photograph the point is in: the
 /// smallest room's that holds it, else the nearest. Empty: as baked.
 pub fn room_ambient_now(descs: &[ProbeDesc], world: Vec3, relit: &[f32]) -> Vec3 {
+    let ratio = |i: usize| if relit.is_empty() { 1.0 } else { relit.get(i).copied().filter(|k| k.is_finite()).unwrap_or(1.0).max(0.0) };
     let baked = room_ambient(descs, world);
-    if relit.is_empty() {
-        return baked;
-    }
     let lit = || descs.iter().enumerate().filter(|(_, d)| d.room_light.is_some());
     let size = |d: &ProbeDesc| (d.max - d.min).max(Vec3::ZERO).element_product();
+    let near = |a: &(usize, &ProbeDesc), b: &(usize, &ProbeDesc)| (a.1.centre - world).length_squared().total_cmp(&(b.1.centre - world).length_squared());
     let inside = lit().filter(|(_, d)| (world - d.min).min(d.max - world).min_element() >= 0.0).min_by(|a, b| size(a.1).total_cmp(&size(b.1)));
-    let nearest = || lit().min_by(|a, b| (a.1.centre - world).length_squared().total_cmp(&(b.1.centre - world).length_squared()));
-    match inside.or_else(nearest) {
-        Some((i, _)) => baked * relit.get(i).copied().filter(|k| k.is_finite()).unwrap_or(1.0).max(0.0),
-        None => baked,
+    let now = match inside.or_else(|| lit().min_by(near)) {
+        Some((i, _)) if !relit.is_empty() => baked * ratio(i),
+        _ => baked,
+    };
+    // OUT IN THE OPEN past every room's box -- the pond, the beach beyond the
+    // outdoor photographs' box -- the nearest photograph can be a ROOM's,
+    // and a splash or a mist there was lit as if indoors (a dark disc on a
+    // sunlit pond, 2026-10-14). There it is the open air's: the OUTDOOR
+    // volume's nearest photograph (the volume whose photographs have no
+    // distances: its box stands in for the sky), blended in over
+    // `room_light::ROOM_EDGE` as `room_light_at` blends rooms.
+    let held = lit().map(|(_, d)| smoothstep(-super::room_light::ROOM_EDGE, 0.0, (world - d.min).min(d.max - world).min_element())).fold(0.0, f32::max);
+    let outdoor = |v: u32| descs.iter().filter(|d| d.volume == v).all(|d| !d.has_depth);
+    match lit().filter(|(_, d)| outdoor(d.volume)).min_by(near) {
+        Some((i, d)) if held < 1.0 => {
+            let l = d.room_light.unwrap_or_default();
+            let open = Vec3::new(l[0][0], l[0][1], l[0][2]) * (0.282_095 * ratio(i));
+            now.lerp(open, 1.0 - held)
+        }
+        _ => now,
     }
 }
 
@@ -4871,7 +5258,9 @@ mod tests {
         assert!(big.ring_wavelength > 3.5 * small.ring_wavelength && big.ring_speed > 1.5 * small.ring_speed);
         // Lowered in, nothing: no cavity past its own width, no sheet.
         let lowered = splash_shape(&heavy(0.05, 0.05));
-        assert!(lowered.sheet_speed < 0.02 && lowered.cavity < 0.0501 && lowered.ring_height < 1e-4, "{lowered:?}");
+        // (Its rings are a fraction of a millimetre: the water it pushes
+        // aside as it settles.)
+        assert!(lowered.sheet_speed < 0.02 && lowered.cavity < 0.0501 && lowered.ring_height < 1e-3, "{lowered:?}");
         let at = seen_from(Vec3::new(0.0, 1.6, 2.0));
         assert_eq!(simulate_with(&[], &[heavy(0.05, 0.05)], 0.1, &at).instances.len(), 0);
     }
@@ -5021,48 +5410,97 @@ mod tests {
         assert!(f.instances.iter().all(|i| i.colour[0] < 1e-6), "a shaded splash has no sun in it");
     }
 
-    /// THE RINGS on the water: each splash's own -- longer and faster from a
-    /// bigger thing, running out from the cavity's rim -- with the foam and
-    /// the open cavity's dimple where it struck; and of more than the water
-    /// draws, the ones that matter most to the eye, the next sinking away
-    /// rather than vanishing as another lands.
+    /// The height a splash's ring train draws at `dist` from where it struck,
+    /// as `water_pipeline::RING_BLOCK` works it out: the CPU's twin of the
+    /// shader's line, for the tests.
+    fn ring_drawn(r: [f32; 4], w: [f32; 4], dist: f32) -> f32 {
+        let from_rim = (dist - w[2]).max(1e-4);
+        let ph = w[0] * r[2] * r[2] / from_rim;
+        let k = ph / from_rim;
+        if r[3] <= 0.0 || k <= 0.0 {
+            return 0.0;
+        }
+        let t = (from_rim / w[2].max(1e-6)).clamp(0.0, 1.0);
+        -r[3] * k * k * k * (-k * (w[1] + k * r[2] * 2.0 * RING_FILM_VISCOSITY)).exp() * t * t * (3.0 - 2.0 * t) / dist * ph.cos()
+    }
+
+    /// THE RINGS on the water: each splash's own, leaving as its cavity is
+    /// at its widest -- not at the strike -- from its rim; a DISPERSIVE
+    /// train, long waves leading and shorter ones following, so its crests
+    /// crowd together toward the middle and spread apart outward, and it
+    /// thins as it spreads; bigger from a bigger thing. The dimple while the
+    /// cavity is open, the boil after. Of more than the water draws, the
+    /// ones that matter most to the eye, the next sinking away rather than
+    /// vanishing as another lands.
     #[test]
     fn the_rings_that_matter_most_go_to_the_water_and_none_pops() {
         let head = Vec3::new(0.0, 1.6, 0.0);
-        let one = splash_rings::<4>(&[pistol()], 1.0, head);
         let shape = splash_shape(&pistol());
-        assert!(one.rings[0][3] > 1e-4 && one.rings[1][3] == 0.0, "{one:?}");
-        let run = 1.0 - 0.5 * shape.collapse;
-        assert!((one.rings[0][2] - (shape.cavity + shape.ring_speed * run)).abs() < 1e-4);
-        assert!((one.waves[0][0] - std::f32::consts::TAU / shape.ring_wavelength).abs() < 1e-3);
+        // Nothing has left before the cavity is at its widest.
+        let early = splash_rings::<4>(&[pistol()], 0.9 * shape.ring_release as f64, head);
+        assert_eq!(early.rings[0][2], 0.0);
+        assert!((0..400).all(|i| ring_drawn(early.rings[0], early.waves[0], 0.01 * i as f32) == 0.0));
+        let one = splash_rings::<4>(&[pistol()], 1.0, head);
+        assert!(one.rings[0][3] > 0.0 && one.rings[1][3] == 0.0, "{one:?}");
+        assert!((one.rings[0][2] - (1.0 - shape.ring_release)).abs() < 1e-5);
+        assert!((one.waves[0][0] - 0.25 * shape.ring_gravity).abs() < 1e-5 && one.waves[0][2] == shape.cavity);
         assert!(one.pools[0][0] > 0.05, "foam where it struck: {one:?}");
-        // The cavity's dimple only while it is open.
+        // THE TRAIN at 3 s: its crests, inside out. Their spacing grows
+        // outward (dispersion) and the crests' heights fall far out. (A
+        // gravity train's crests are as many as `t sqrt(g k)` turns over its
+        // band: two at one second, six at three.)
+        let three = splash_rings::<4>(&[pistol()], 3.0, head);
+        let profile: Vec<f32> = (0..3000).map(|i| ring_drawn(three.rings[0], three.waves[0], 0.001 * i as f32)).collect();
+        let most = profile.iter().fold(0.0f32, |m, h| m.max(h.abs()));
+        let crests: Vec<usize> = (1..2999).filter(|&i| profile[i] > profile[i - 1] && profile[i] >= profile[i + 1] && profile[i] > 0.01 * most).collect();
+        assert!(crests.len() >= 4, "a train of crests, not one: {crests:?}");
+        let gaps: Vec<usize> = crests.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|g| g[1] >= g[0]), "crests further apart outward: {gaps:?}");
+        let highest = crests.iter().copied().max_by(|a, b| profile[*a].total_cmp(&profile[*b])).unwrap();
+        assert!(profile[*crests.last().unwrap()] < profile[highest] && highest > crests[0], "{crests:?}");
+        // Each crest runs out through the train: a crest a moment later is
+        // further out.
+        let later = splash_rings::<4>(&[pistol()], 3.02, head);
+        let next = (crests[1]..3000).find(|&i| ring_drawn(later.rings[0], later.waves[0], 0.001 * i as f32) > ring_drawn(later.rings[0], later.waves[0], 0.001 * (i - 1) as f32) && ring_drawn(later.rings[0], later.waves[0], 0.001 * i as f32) >= ring_drawn(later.rings[0], later.waves[0], 0.001 * (i + 1) as f32));
+        assert!(next.is_some_and(|n| n > crests[1]));
+        // The cavity's dimple while it is open, its boil (a dome) after.
         let open = splash_rings::<4>(&[pistol()], 0.5 * shape.collapse as f64, head);
-        assert!(open.waves[0][3] > 1.0 && one.waves[0][3] == 0.0, "{open:?}");
-        // Bigger: longer waves, faster.
+        let boil = splash_rings::<4>(&[pistol()], (shape.collapse + 0.1) as f64, head);
+        assert!(open.waves[0][3] > 1.0 && boil.waves[0][3] < 0.0, "{open:?} {boil:?}");
+        // Bigger: a wider rim, a bigger train.
         let big = splash_rings::<4>(&[crate_box()], 1.0, head);
-        assert!(big.waves[0][0] < 0.4 * one.waves[0][0] && big.rings[0][2] > one.rings[0][2]);
+        let (crate_shape, small) = (splash_shape(&crate_box()), splash_shape(&pebble()));
+        assert!(big.waves[0][2] > one.waves[0][2] && crate_shape.ring_height > shape.ring_height && shape.ring_height > small.ring_height, "{} {} {}", crate_shape.ring_height, shape.ring_height, small.ring_height);
+        assert!(crate_shape.ring_wavelength > shape.ring_wavelength && crate_shape.ring_speed > shape.ring_speed);
         // All gone in the end.
         let gone = splash_rings::<4>(&[pistol(), crate_box()], super::super::water_pipeline::RING_SECONDS as f64 + 0.1, head);
         assert!(gone.rings.iter().all(|r| r[3] == 0.0));
         // A WADER, a step every half second for five seconds: at no moment
-        // does what the water is given jump -- not as a step lands, not as
-        // the oldest is crowded out of the six drawn. The sum of the heights
-        // and of the foam, sampled every 5 ms, moves by a small share of the
-        // most it reaches.
+        // does what the water DRAWS jump -- not as a step lands, not as the
+        // oldest is crowded out of the six drawn. The heights along a line
+        // through the steps, and the foam, sampled every 5 ms, move by no
+        // more than the crests' own running does (a crest moves a sixth of a
+        // radian in 5 ms; one splash crowded out at once was half the peak).
         const N: usize = super::super::water_pipeline::RINGS;
         let steps: Vec<Splash> =
             (0..10).map(|k| Splash { born: 0.5 * k as f64, position: Vec3::new(0.3 * (k % 2) as f32, 0.0, 0.65 * k as f32), seed: k as u64, ..foot() }).collect();
-        let total = |t: f64| {
+        let drawn = |t: f64| {
             let r = splash_rings::<N>(&steps, t, Vec3::new(0.0, 1.6, 3.0));
-            (r.rings.iter().map(|x| x[3]).sum::<f32>(), r.pools.iter().map(|x| x[0]).sum::<f32>(), r.rings.iter().filter(|x| x[3] > 1e-6).count())
+            let line: Vec<f32> = (0..160)
+                .map(|j| {
+                    let p = glam::Vec2::new(0.6, -0.5 + 0.045 * j as f32);
+                    (0..N).map(|i| ring_drawn(r.rings[i], r.waves[i], (p - glam::Vec2::new(r.rings[i][0], r.rings[i][1])).length())).sum::<f32>()
+                })
+                .collect();
+            (line, r.pools.iter().map(|x| x[0]).sum::<f32>(), r.rings.iter().filter(|x| x[3] > 1e-9).count())
         };
-        let peak = (0..1600).map(|k| total(0.005 * k as f64).0).fold(0.0, f32::max);
-        assert!(peak > 1e-3, "{peak}");
-        assert!((0..1600).any(|k| total(0.005 * k as f64).2 == N), "the wader fills the water's rings");
-        for k in 0..1600 {
-            let (a, b) = (total(0.005 * k as f64), total(0.005 * (k + 1) as f64));
-            assert!((a.0 - b.0).abs() < 0.06 * peak, "heights jump at {} s: {} -> {} of {peak}", 0.005 * k as f64, a.0, b.0);
+        let peak = (0..1100).map(|k| drawn(0.005 * k as f64).0.iter().fold(0.0f32, |m, h| m.max(h.abs()))).fold(0.0, f32::max);
+        assert!(peak > 1e-4, "{peak}");
+        assert!((0..1100).any(|k| drawn(0.005 * k as f64).2 == N), "the wader fills the water's rings");
+        for k in 0..1100 {
+            let (a, b) = (drawn(0.005 * k as f64), drawn(0.005 * (k + 1) as f64));
+            let jump = a.0.iter().zip(&b.0).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+            assert!(jump < 0.2 * peak, "heights jump at {} s: {jump} of {peak}", 0.005 * k as f64);
             // (Foam comes as its cavity shuts, in a tenth of a second.)
             assert!((a.1 - b.1).abs() < 0.1, "foam jumps at {} s: {} -> {}", 0.005 * k as f64, a.1, b.1);
         }
@@ -5142,8 +5580,9 @@ mod tests {
     /// WHITE WATER. A crate's sheet is too thick to draw back into its rim
     /// and comes down white, in tongues round the rim; a pebble's and a
     /// pistol's hold together and are clear. And the foam each leaves is
-    /// white right across for a moment, then broken, then gone -- in a second
-    /// or two for a pebble, three or four for a crate.
+    /// whitest for a moment -- a patch broken into clumps, never a flat white
+    /// disc (2026-10-14) -- then thinner, then gone -- in a second or two for
+    /// a pebble, three or four for a crate.
     #[test]
     fn a_crate_throws_white_water_and_foam_dissolves() {
         let (p, g, c) = (splash_shape(&pebble()), splash_shape(&pistol()), splash_shape(&crate_box()));
@@ -5156,7 +5595,7 @@ mod tests {
         // The crate's: over 1 as its cavity shuts, under a half two seconds
         // on, gone by four; drawn out along its rings more as it goes.
         let shut = c.collapse as f64 + 0.1;
-        assert!(foam(crate_box(), shut)[0] > 1.0 && foam(crate_box(), 2.0)[0] < 0.6 && foam(crate_box(), 4.3)[0] == 0.0, "{:?}", foam(crate_box(), 2.0));
+        assert!(foam(crate_box(), shut)[0] > 0.5 && foam(crate_box(), 2.0)[0] < 0.4 && foam(crate_box(), 4.3)[0] == 0.0, "{:?}", foam(crate_box(), 2.0));
         assert!(foam(crate_box(), 2.0)[2] > foam(crate_box(), shut)[2]);
         assert!(foam(pebble(), 0.25)[0] > 0.4 && foam(pebble(), 1.8)[0] < 0.02);
         // It spreads as it thins.
@@ -5172,6 +5611,37 @@ mod tests {
         let (a, b) = (splash_shape(&free), splash_shape(&held));
         assert!(a.jet_height > 0.05 && b.jet_height == 0.0, "{} {}", a.jet_height, b.jet_height);
         assert!(a.cavity == b.cavity && a.sheet_speed == b.sheet_speed && a.spray == b.spray);
+    }
+
+    /// THE CAUSAL CHAIN of each of the strikes the user threw on the
+    /// headset (2026-10-14), in numbers: `cargo test --release --lib
+    /// print_the_causal_chain -- --ignored --nocapture`.
+    pub(crate) fn user_strikes() -> [(&'static str, Splash); 6] {
+        let at = |v: Vec3, r: f32, m: f32, depth: f32| Splash { depth, seed: 11, ..Splash::new(Vec3::ZERO, 0.0, v, r, m) };
+        [
+            ("pebble 0.1 kg dropped 1 m", at(Vec3::new(0.0, -4.43, 0.0), 0.021, 0.1, 1.5)),
+            ("fist rock 1 kg thrown", at(Vec3::new(6.0, -6.0, 0.0), 0.045, 1.0, 1.5)),
+            ("boulder 8 kg dropped 1.5 m", at(Vec3::new(0.0, -5.4, 0.0), 0.09, 8.0, 1.5)),
+            ("boulder 8 kg thrown", at(Vec3::new(4.0, -6.0, 0.0), 0.09, 8.0, 1.5)),
+            ("crate 5 kg thrown", at(Vec3::new(3.0, -4.0, 0.0), 0.22, 5.0, 1.5)),
+            ("crate 5 kg bobbing", Splash { held: 1.0, ..at(Vec3::new(0.0, -0.25, 0.0), 0.22, 5.0, 1.5) }),
+        ]
+    }
+
+    #[test]
+    #[ignore]
+    fn print_the_causal_chain() {
+        for (name, s) in user_strikes() {
+            let c = splash_shape(&s);
+            eprintln!(
+                "{name}: cavity {:.3} m wide x {:.3} deep, open {:.0} ms; crown {:.2} m/s at {:.0} deg, {:.3} m high for {:.2} s, broken {:.2}; jet {:.3} m at {:.0} ms; \
+                 RINGS leave at {:.0} ms from a {:.1} mm deep source: middle {:.3} m long at {:.2} m/s, first crest {:.1} mm, seen {:.1} s; \
+                 drops land {:.2} m out (band {:.2}) from {:.0} ms over {:.0} ms, {:.0} a m2; foam {:.2} for {:.1} s",
+                c.cavity, c.depth, c.collapse * 1e3, c.sheet_speed, c.sheet_angle.to_degrees(), c.crown_height, c.crown_seconds, c.broken,
+                c.jet_height, c.collapse * 1e3, c.ring_release * 1e3, c.wave_source * 1e3, c.ring_wavelength, c.ring_speed, c.ring_height * 1e3,
+                ring_seconds(&c), c.drops_land, c.drops_band, c.drops_from * 1e3, c.drops_over * 1e3, c.drops_density, c.foam, c.foam_seconds,
+            );
+        }
     }
 
     /// WHAT EACH COSTS: `cargo test --release --lib print_the_splashes --
@@ -5897,6 +6367,24 @@ mod tests {
         let far = Vec3::new(-200.0, 0.0, -200.0);
         assert!((room_ambient_now(&descs, far, &relit).x / room_ambient(&descs, far).x - 0.01).abs() < 1e-4);
         assert_eq!(room_ambient_now(&descs, outdoors, &[f32::NAN, 1.0]), baked);
+    }
+
+    /// Past every box, out in the open, the light is the OUTDOOR volume's
+    /// (its photographs have no distances), not that of whichever room's
+    /// photograph is nearest -- the pond past the outdoor box was lit as if
+    /// indoors (2026-10-14).
+    #[test]
+    fn out_in_the_open_past_every_box_the_light_is_the_outdoors() {
+        let photo = |volume: u32, lo: Vec3, hi: Vec3, depth: bool, v: f32| ProbeDesc { centre: 0.5 * (lo + hi), min: lo, max: hi, volume, has_depth: depth, room_light: Some([[v; 3]; 9]) };
+        // A sunlit outdoors (box x, z 0..40) and a dim room nearer the pond.
+        let descs = [photo(0, Vec3::new(0.0, -5.0, 0.0), Vec3::new(40.0, 20.0, 40.0), false, 2.0), photo(1, Vec3::new(-12.0, 0.0, -12.0), Vec3::new(-4.0, 4.0, -4.0), true, 0.05)];
+        let pond = Vec3::new(-20.0, 0.0, -20.0);
+        let open = 2.0 * 0.282_095;
+        assert!((room_ambient_now(&descs, pond, &[]).x - open).abs() < 1e-4, "{:?}", room_ambient_now(&descs, pond, &[]));
+        assert!((room_ambient_now(&descs, pond, &[0.5, 1.0]).x - 0.5 * open).abs() < 1e-4);
+        // Inside the room, the room's; inside the outdoor box, the outdoors'.
+        assert!((room_ambient_now(&descs, Vec3::new(-8.0, 2.0, -8.0), &[]).x - 0.05 * 0.282_095).abs() < 1e-4);
+        assert!((room_ambient_now(&descs, Vec3::new(20.0, 1.0, 20.0), &[]).x - open).abs() < 1e-4);
     }
 
     #[test]

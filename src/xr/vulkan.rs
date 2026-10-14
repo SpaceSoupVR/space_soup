@@ -324,6 +324,13 @@ impl VkContext {
         // here, before any ground pipeline is built. See
         // `terrain_pipeline::WORLD_GROUND`.
         let world_ground = system_property(c"debug.spacesoup.worldground") != "0";
+        // THE TORCH'S PUDDLE READERS WALK THE SKY, unless `adb shell setprop
+        // debug.spacesoup.torchskywalk 0` before a launch builds them with its
+        // two calls. See `ground_twins::TORCH_WEATHER_SKY_WALK`.
+        if system_property(c"debug.spacesoup.torchskywalk") == "0" {
+            crate::renderer::ground_twins::TORCH_WEATHER_SKY_WALK.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("TORCHSKYWALK: off -- the torch-lit weather twins read the sky twice");
+        }
         crate::renderer::terrain_pipeline::WORLD_GROUND.store(world_ground, std::sync::atomic::Ordering::Relaxed);
         // THE BRUSHES IN THE WORLD, posed by their vertex shaders. Set here,
         // before any brush pipeline is built. See

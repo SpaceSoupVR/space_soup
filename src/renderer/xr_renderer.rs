@@ -2432,7 +2432,14 @@ impl XrRenderer {
         if let (false, Some((_, cut))) = (stereo, &self.water_cut_pipeline) {
             return cut;
         }
-        if ringing { &w.pipeline } else { &w.ringless }
+        if !ringing {
+            return &w.ringless;
+        }
+        // While a splash's drops land, the twin that draws their rings.
+        match self.water_bodies.iter().find(|b| b.uniform.ring_drops.iter().any(|d| d[3] > 0.0)) {
+            Some(b) => w.for_rings(&b.uniform.rings[0], &b.uniform.ring_drops),
+            None => &w.pipeline,
+        }
     }
     fn sp_sky(&self, stereo: bool) -> &wgpu::RenderPipeline {
         match (stereo, &self.stereo_pipelines) {
@@ -3326,6 +3333,21 @@ impl XrRenderer {
         log::info!("EFFECTS library: {}", library.names().collect::<Vec<_>>().join(", "));
         self.effect_library = library;
         self.bursts.live.clear();
+    }
+
+    /// THE LEVEL'S PLACED EFFECTS that name an asset (`effect.asset`): each
+    /// stands at its object for as long as the level is loaded, its streams
+    /// running, governed with everything else (`BurstSet::place`). Replaces
+    /// the last level's; call after [`Self::set_effect_library`]. An asset
+    /// the library does not hold is skipped, and logged.
+    pub fn place_effects(&mut self, placed: &[crate::renderer::effects::stack::PlacedEffect]) {
+        self.bursts.clear_placed();
+        for p in placed {
+            match self.effect_library.id(&p.asset) {
+                Some(id) => self.bursts.place(&self.effect_library, id, p.position, p.direction, p.source, p.placed),
+                None => log::error!("EFFECTS placed `{}` names the asset `{}`, which the library does not hold", p.object, p.asset),
+            }
+        }
     }
 
     /// An effect of the library by name: resolved once, not a frame.

@@ -717,11 +717,27 @@ impl XrRenderer {
             let seen = |i: usize| held.get(i).map_or(true, |&t| now <= t);
             // The event bursts: given this frame's clock, culled by their
             // travel bounds, thinned if the frame is over (`BurstSet::frame`).
-            let bursts_drawn = self.bursts.frame(&self.effect_library, now, &views, head_world);
+            // The placed emitters and splashes in view are weighed with them
+            // by the one governor: far and small shed first, whatever kind.
+            let wants = crate::renderer::effects::governor_wants(&self.effect_emitters, &seen, &splashes, &self.bursts.splash_measured, head_world);
+            let bursts_drawn = self.bursts.frame_with(&self.effect_library, now, &views, head_world, &wants);
             if (0..self.effect_emitters.len()).any(|i| seen(i)) || !splashes.is_empty() || bursts_drawn.contains(&true) {
                 let bursts = crate::renderer::effects::stack::BurstFrame { lib: &self.effect_library, set: &self.bursts, drawn: &bursts_drawn };
-                let frame = crate::renderer::effects::simulate_all(&self.effect_emitters, &seen, &splashes, Some(&bursts), now, &at);
+                let set = &self.bursts;
+                let shares = crate::renderer::effects::Shares {
+                    emitter: &|e| set.share_of(crate::renderer::effects::emitter_key(e)),
+                    splash: &|s| set.share_of(crate::renderer::effects::splash_key(s)),
+                };
+                let frame = crate::renderer::effects::simulate_governed(&self.effect_emitters, &seen, &splashes, Some(&bursts), Some(&shares), now, &at);
                 self.burst_count = frame.bursts;
+                self.bursts.measured(&frame.splash_costs);
+                let (s, c) = (&self.bursts.stats, &frame.bursts);
+                if self.shadow_diag_frames.get() % 180 == 0 && (s.fill_wanted > s.fill + 1e-4 || s.instances_wanted > s.instances + 0.5) {
+                    log::info!(
+                        "EFFECTS GOVERNOR fill {:.2} of {:.2} wanted, instances {:.0} of {:.0} | thinned bursts {} emitters {} splashes {} | shed bursts {} emitters {} splashes {} | frames governed {}",
+                        s.fill, s.fill_wanted, s.instances, s.instances_wanted, s.thinned, s.emitters_thinned, s.splashes_thinned, c.shed, c.emitter_shed, c.splash_shed, s.frames_governed
+                    );
+                }
                 if let Some(gpu) = self.effects_gpu.as_mut() {
                     (gpu.use_variants, gpu.overdraw) = (lv.effect_variants, lv.effects_overdraw);
                     gpu.upload(&self.wgpu_device, &self.wgpu_queue, &frame);
@@ -825,11 +841,12 @@ impl XrRenderer {
             // The lit room round it, turned into the player's frame its
             // normals are in. See `room_light`. A door leaf reads it in front
             // of the face the eye sees (`doors::light_point`).
+            let eye_world = glam::Quat::from_rotation_y(self.player.yaw) * mid_eye + self.player.offset;
             let light_at = if instance.tile_caster {
-                let eye_world = glam::Quat::from_rotation_y(self.player.yaw) * mid_eye + self.player.offset;
                 crate::renderer::doors::light_point(&self.doors, world, eye_world)
             } else {
-                world
+                // A door's frame or lever reads the room the eye is in too.
+                crate::renderer::doors::doorway_light_point(&self.doors, world, eye_world)
             };
             let room = crate::renderer::room_light::turned_to_player(
                 &crate::renderer::room_light::room_light_at(&self.room_descs, light_at),

@@ -400,6 +400,39 @@ impl SlopeSplit {
     }
 }
 
+/// THE TORCH'S PUDDLE READERS WALK THE SKY (`true`): the weather's gentle
+/// twins a frame draws while a spot casts -- the player's torch in the rain
+/// -- take the sky as ONE copy walked over the normal and the mirror
+/// direction (`brush_pipeline::READER_EDITS`' `sky_walked`, as builds
+/// 118-119 shipped every reader), not two inlined calls. Same picture.
+///
+/// WHY (2026-10-14, headset: "lag ... looking down at the rain puddle
+/// ripples", and with the torch casting the hand's shadow in the rain).
+/// Reading the spots' shadows adds 190 proxy units to every weather gentle
+/// twin (`weather::tests::torch_wetness_reader_sizes`): the puddle reader
+/// (`terrain_weather_snowless_gentle_read_baked`) goes from about 3,205
+/// instructions to about 3,460, past the instruction cache's 3,387, on the
+/// view's dearest draw (9.35 ms full-screen at rain_puddles_down). The sky's
+/// second copy is 101 units (about 136 instructions): walked, it is back
+/// under. The walk lost to two calls in readers UNDER the edge (build 120),
+/// so the spotless twins -- every frame with no torch -- keep the calls.
+/// Read when the readers are BUILT: `adb shell setprop
+/// debug.spacesoup.torchskywalk 0` before a launch builds them as before.
+pub static TORCH_WEATHER_SKY_WALK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `src`, a weather twin a torch-lit frame draws, with its sky walked when
+/// [`TORCH_WEATHER_SKY_WALK`] says so (unchanged if the edit no longer
+/// matches).
+pub(crate) fn torch_weather_twin(src: String) -> String {
+    if !TORCH_WEATHER_SKY_WALK.load(std::sync::atomic::Ordering::Relaxed) {
+        return src;
+    }
+    crate::renderer::brush_pipeline::with_reader_edit(src.clone(), "sky_walked").unwrap_or_else(|| {
+        log::warn!("TORCH_WEATHER_SKY_WALK: the sky's calls are no longer where `sky_walked` finds them; the twin is built as it was");
+        src
+    })
+}
+
 /// The ground's gentle scene readers, in the weather twins' order `[full,
 /// spotless, baked, baked_spotless]` (`XrRenderer::terrain_twin`), from the
 /// shaders the shipped ones are built from; `weathered` the weather's twin of
@@ -423,7 +456,12 @@ pub fn gentle_readers(
     let mut built = Vec::with_capacity(4);
     for (src, suffix) in sources.into_iter().zip(labels) {
         let (src, label) = match weather {
-            Some((_, kinds)) => (crate::renderer::weather::with_weather_kinds(&src, kinds)?, format!("terrain_weather{kind}_gentle_read{suffix}")),
+            Some((_, kinds)) => {
+                let twin = crate::renderer::weather::with_weather_kinds(&src, kinds)?;
+                // The spots' shadows read: see `TORCH_WEATHER_SKY_WALK`.
+                let twin = if suffix.ends_with("spotless") { twin } else { torch_weather_twin(twin) };
+                (twin, format!("terrain_weather{kind}_gentle_read{suffix}"))
+            }
             None => (src, format!("terrain_gentle_read{suffix}")),
         };
         built.push(TerrainPipeline::build_from_with(
