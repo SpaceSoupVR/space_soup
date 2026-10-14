@@ -540,6 +540,14 @@ pub struct XrRenderer {
     /// The frame's solid vertex and index buffers, kept across frames with
     /// the ground first in them (`Levers::ground_buffers`). See `static_solid`.
     static_solid: Option<crate::renderer::static_solid::StaticSolid>,
+    /// The brushes' buffers, split and runs, kept across frames
+    /// (`Levers::brush_buffers`). See `static_brush`.
+    static_brushes: Option<crate::renderer::static_brush::StaticBrushes>,
+    /// THE BRUSHES ARE HANDED OVER IN THE WORLD and posed by the vertex
+    /// shader (`brush_pipeline::WORLD_BRUSHES`, as it stood when the renderer
+    /// was built -- every brush pipeline was built by it). See
+    /// `brushes_in_world`.
+    brush_world: bool,
     /// What this frame's parts reported of their CPU work (`note_cpu`), and
     /// the same summed over the window's measured frames.
     cpu_frame: std::collections::BTreeMap<&'static str, f64>,
@@ -1367,6 +1375,10 @@ impl XrRenderer {
             .flatten();
         let ground_model = mesh_pipeline.create_model_uniform(&wgpu_device);
         log::info!("GROUND: its vertices are {}", if ground_world { "the world's, posed by the vertex shader" } else { "posed by the app" });
+        // The brushes in the world, if this launch keeps them so: read ONCE,
+        // as the brush pipelines read it when they are built.
+        let brush_world = crate::renderer::brush_pipeline::WORLD_BRUSHES.load(std::sync::atomic::Ordering::Relaxed);
+        log::info!("BRUSHES: their vertices are {}", if brush_world { "the world's, posed by the vertex shader" } else { "posed by the app" });
         let mirror_mesh_pipeline =
             MeshPipeline::new_mirror(&wgpu_device, wgpu_format, &uniform_buf.layout);
         let mirror_pipeline = MirrorPipeline::new(&wgpu_device, wgpu_format, &uniform_buf.layout);
@@ -1765,6 +1777,8 @@ impl XrRenderer {
             terrain_steep,
             slope_split: None,
             static_solid: None,
+            static_brushes: None,
+            brush_world,
             cpu_frame: Default::default(),
             cpu_window: Default::default(),
             terrain_dedup_passes,
@@ -2816,6 +2830,79 @@ impl XrRenderer {
     /// camera slot in the motion pass. `false`: posed vertices, as before.
     pub fn ground_in_world(&self) -> bool {
         self.ground_world
+    }
+
+    /// THE GROUND'S SLOPE AND GROUND-CLASS SPLIT, MADE NOW if the one kept
+    /// is not this ground's (`ground_twins::SlopeSplit::ensure`): each
+    /// chunk's triangles sorted by slope and by what the reflection pass may
+    /// draw them with. The app calls it when a level's ground and probe
+    /// table are loaded, so the first frame finds it made -- it was made ON
+    /// the first frame, a hitch that grew with the level (35 ms on test_room,
+    /// seconds on a large one; `docs/scale-audit-2026-10-13.md`, F12). The
+    /// frame makes the same call, which then only compares a sample.
+    ///
+    /// `terrain` as the frame is handed it: in the world where the ground is
+    /// kept so (`ground_in_world`), posed for the rig otherwise.
+    pub fn prepare_ground(
+        &mut self,
+        terrain_verts: &[crate::renderer::cuboid::SolidVertex],
+        terrain_idx: &[u32],
+        terrain_chunks: &[crate::renderer::shadow::CasterChunk],
+        when: &str,
+    ) {
+        if self.terrain_gentle.is_none() || terrain_verts.is_empty() || terrain_idx.is_empty() {
+            return;
+        }
+        let threshold = self.terrain_settings.biplanar_start_deg;
+        let level_ground = crate::renderer::outdoor_pass::LevelGround::new(
+            &self.probe_volumes,
+            &self.probe_rooms,
+            self.probe_outdoor_volume,
+            &self.probe_portals,
+        );
+        // (World vertices are their own world positions.)
+        let (offset, yaw) = if self.ground_world { (glam::Vec3::ZERO, 0.0) } else { (self.player.offset, self.player.yaw) };
+        let built = crate::renderer::ground_twins::SlopeSplit::ensure(
+            &mut self.slope_split,
+            terrain_verts,
+            terrain_idx,
+            terrain_chunks,
+            threshold,
+            level_ground.key,
+            &|corners| level_ground.class_of_posed(offset, yaw, corners),
+        );
+        if let (Some(ms), Some(split)) = (built, self.slope_split.as_ref()) {
+            log::info!(
+                "SLOPES: {:.1}% of the ground's triangles are gentle (under {:.0} degrees), {:.1}% steep (over {:.0}) over {} chunk(s); {:.1}% out of doors, {:.1}% nowhere to the reflection pass; {:.1} ms, {when}",
+                100.0 * split.gentle_total as f64 / terrain_idx.len().max(1) as f64,
+                threshold - crate::renderer::ground_twins::GENTLE_MARGIN_DEG,
+                100.0 * split.steep_total as f64 / terrain_idx.len().max(1) as f64,
+                threshold + crate::renderer::ground_twins::GENTLE_MARGIN_DEG,
+                split.gentle.len(),
+                100.0 * split.class_totals[crate::renderer::outdoor_pass::GROUND_OUTDOORS] as f64 / terrain_idx.len().max(1) as f64,
+                100.0 * split.class_totals[crate::renderer::outdoor_pass::GROUND_NOWHERE] as f64 / terrain_idx.len().max(1) as f64,
+                ms,
+            );
+        }
+    }
+
+    /// WHETHER THE BRUSHES ARE TO BE HANDED OVER IN THE WORLD: their
+    /// vertices as meshed at load, never posed by the app
+    /// (`BrushGeometry::assemble_world`). The vertex shaders pose them
+    /// (`brush_pipeline::world_brush_vertices`), a model matrix in the shadow
+    /// passes, a world camera slot in the motion pass. `false`: posed
+    /// vertices, as before.
+    pub fn brushes_in_world(&self) -> bool {
+        self.brush_world
+    }
+
+    /// The level's brushes have been loaded again or changed in place (one
+    /// hidden or shown): what is kept of them on the GPU is made again next
+    /// frame (`static_brush` tells other brushes by their slices, lengths
+    /// and a sample of their contents, which hiding one wall can leave as
+    /// they were).
+    pub fn brushes_changed(&mut self) {
+        crate::renderer::static_brush::StaticBrushes::forget(&mut self.static_brushes);
     }
 
     /// A part of this frame's CPU work, or of what it sent to the GPU, for

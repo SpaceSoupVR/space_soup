@@ -347,44 +347,14 @@ impl XrRenderer {
                 // terrain, so the scene pass can draw them with the ground's
                 // slope twins. The same triangles in each chunk's range, so
                 // every other pass is unchanged. See `ground_twins`.
-                let threshold = self.terrain_settings.biplanar_start_deg;
                 // ... AND, WITHIN EACH SLOPE CLASS, BY WHAT THE REFLECTION PASS
                 // MAY DRAW A TRIANGLE WITH -- its outdoor twin, its nowhere
                 // twin, or the pass itself -- from the level's whole probe
                 // table, in the world's frame. See `outdoor_pass::LevelGround`.
-                let level_ground = crate::renderer::outdoor_pass::LevelGround::new(
-                    &self.probe_volumes,
-                    &self.probe_rooms,
-                    self.probe_outdoor_volume,
-                    &self.probe_portals,
-                );
-                if self.terrain_gentle.is_some()
-                    && !self.slope_split.as_ref().is_some_and(|s| s.is_for(terrain_verts, terrain_idx, terrain_chunks, threshold, level_ground.key))
-                {
-                    let started = std::time::Instant::now();
-                    // (World vertices are their own world positions.)
-                    let (offset, yaw) = if self.ground_world { (glam::Vec3::ZERO, 0.0) } else { (self.player.offset, self.player.yaw) };
-                    let split = crate::renderer::ground_twins::SlopeSplit::classed(
-                        terrain_verts,
-                        terrain_idx,
-                        terrain_chunks,
-                        threshold,
-                        level_ground.key,
-                        &|corners| level_ground.class_of_posed(offset, yaw, corners),
-                    );
-                    log::info!(
-                        "SLOPES: {:.1}% of the ground's triangles are gentle (under {:.0} degrees), {:.1}% steep (over {:.0}) over {} chunk(s); {:.1}% out of doors, {:.1}% nowhere to the reflection pass; {:.1} ms",
-                        100.0 * split.gentle_total as f64 / terrain_idx.len().max(1) as f64,
-                        threshold - crate::renderer::ground_twins::GENTLE_MARGIN_DEG,
-                        100.0 * split.steep_total as f64 / terrain_idx.len().max(1) as f64,
-                        threshold + crate::renderer::ground_twins::GENTLE_MARGIN_DEG,
-                        split.gentle.len(),
-                        100.0 * split.class_totals[crate::renderer::outdoor_pass::GROUND_OUTDOORS] as f64 / terrain_idx.len().max(1) as f64,
-                        100.0 * split.class_totals[crate::renderer::outdoor_pass::GROUND_NOWHERE] as f64 / terrain_idx.len().max(1) as f64,
-                        started.elapsed().as_secs_f64() * 1000.0,
-                    );
-                    self.slope_split = Some(split);
-                }
+                // MADE AT THE LEVEL'S LOAD (`XrRenderer::prepare_ground`, the
+                // same call): a frame finds it made, and makes it here only
+                // when the ground or the probe table is another since.
+                self.prepare_ground(terrain_verts, terrain_idx, terrain_chunks, "in a frame");
                 let terrain_idx: &[u32] = match &self.slope_split {
                     Some(split) if self.terrain_gentle.is_some() => &split.indices,
                     _ => terrain_idx,
@@ -469,30 +439,59 @@ impl XrRenderer {
         // part with the smallest reader that gives it the same picture. Every
         // other pass draws the whole range, where the order changes nothing.
         // See `SunFaces`.
+        //
+        // KEPT ACROSS FRAMES (`Levers::brush_buffers`): the split, the two
+        // buffers and the motion pass's runs are made again only when the
+        // brushes handed over are not the ones they were made from -- once a
+        // level where the app hands them over in the world. See
+        // `static_brush`. Off: every frame, as it was.
         let partitioned = match (&self.sun_faces, brush_geometry) {
-            (Some(faces), Some((v, i))) => Some(faces.partition(v, i)),
+            (Some(faces), Some((v, i))) if !self.levers.brush_buffers => Some(faces.partition(v, i)),
             _ => None,
         };
-        let brush_sun_ends = partitioned.as_ref().map_or([0, 0], |(_, ends)| *ends);
-        let brush_buffers = brush_geometry.map(|(v, i)| {
-            let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
-            uploaded += std::mem::size_of_val(v) as u64 + std::mem::size_of_val(i) as u64;
-            (
-                self.wgpu_device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("brush_vb"),
-                        contents: bytemuck::cast_slice(v),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                self.wgpu_device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("brush_ib"),
-                        contents: bytemuck::cast_slice(i),
-                        usage: wgpu::BufferUsages::INDEX,
-                    }),
-                i.len() as u32,
-            )
-        });
+        let mut brush_sun_ends = partitioned.as_ref().map_or([0, 0], |(_, ends)| *ends);
+        let brush_buffers = match brush_geometry {
+            Some((v, i)) if self.levers.brush_buffers => {
+                // World vertices are the same for every pose: made once.
+                let pose = if self.brush_world { (glam::Vec3::ZERO, 0.0) } else { (self.player.offset, self.player.yaw) };
+                uploaded += crate::renderer::static_brush::StaticBrushes::update(
+                    &mut self.static_brushes,
+                    &self.wgpu_device,
+                    v,
+                    i,
+                    pose,
+                    self.sun_faces.as_ref(),
+                );
+                let kept = self.static_brushes.as_ref().expect("update leaves the buffers");
+                brush_sun_ends = kept.sun_ends;
+                Some((kept.vertices.clone(), kept.indices.clone(), kept.index_count))
+            }
+            Some((v, i)) => {
+                self.static_brushes = None;
+                let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
+                uploaded += std::mem::size_of_val(v) as u64 + std::mem::size_of_val(i) as u64;
+                Some((
+                    self.wgpu_device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("brush_vb"),
+                            contents: bytemuck::cast_slice(v),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        }),
+                    self.wgpu_device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("brush_ib"),
+                            contents: bytemuck::cast_slice(i),
+                            usage: wgpu::BufferUsages::INDEX,
+                        }),
+                    i.len() as u32,
+                ))
+            }
+            None => {
+                self.static_brushes = None;
+                None
+            }
+        };
+        let brush_sun_ends = brush_sun_ends;
         let (wire_verts, wire_idx) = build_wire_mesh(cuboids);
         let (particle_verts, particle_idx) =
             particle::build_particle_mesh(particles, beams, cam_right, cam_up, view_dir);
@@ -1312,7 +1311,12 @@ impl XrRenderer {
             if stale {
                 let world_view_proj = crate::renderer::lights::static_sun_matrix(
                     world_dir,
-                    brushes.map(|(v, _)| v.iter().map(|b| b.position)),
+                    // (World vertices: taken into the player's frame, as
+                    // the ground's below.)
+                    brushes.map(|(v, _)| {
+                        let world = self.brush_world;
+                        v.iter().map(move |b| if world { warp_world_to_player.transform_point3(glam::Vec3::from(b.position)).to_array() } else { b.position })
+                    }),
                     // (World vertices: taken into the player's frame, which
                     // the matrix beside them takes back out.)
                     terrain.map(|(v, _)| {
@@ -1550,12 +1554,15 @@ impl XrRenderer {
                 .then_some((&solid_vb, &solid_ib, solid_index_count));
             // The ground's chunks, where they are world vertices, are posed
             // by this matrix in every shadow pass below.
-            if self.ground_world && terrain_range.is_some() {
+            // The brushes the same, where they are world vertices
+            // (`brush_pipeline::WORLD_BRUSHES`): one matrix poses both.
+            let world_ground_cast = self.ground_world && terrain_range.is_some();
+            let world_brush_cast = self.brush_world && brush_buffers.is_some();
+            if world_ground_cast || world_brush_cast {
                 self.ground_model.upload(&self.wgpu_queue, warp_world_to_player);
-                self.shadow_map.set_solid_world(Some(&self.ground_model.bind_group), false);
-            } else {
-                self.shadow_map.set_solid_world(None, false);
             }
+            self.shadow_map.set_solid_world(world_ground_cast.then_some(&self.ground_model.bind_group), false);
+            self.shadow_map.set_brush_world(world_brush_cast.then_some(&self.ground_model.bind_group));
             let brush_caster = brush_buffers
                 .as_ref()
                 .map(|(vb, ib, count)| (vb, ib, *count));
@@ -1795,10 +1802,22 @@ impl XrRenderer {
         // clip is the previous camera times its previous model matrix -- both
         // in the previous player frame, so nothing else is needed. See
         // `space_warp`.
+        // (More meshes drawn than the ring has slots: the rest write no
+        // motion. Said once a second, never in silence.)
+        let warp_mesh_room = crate::renderer::space_warp::MAX_SLOTS as usize / 2 - 3;
+        if meshes.len() > warp_mesh_room && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some()) && self.shadow_diag_frames.get() % 36 == 0 {
+            log::error!(
+                "SPACEWARP: {} meshes drawn and {warp_mesh_room} motion slots an eye: {} mesh(es) write no motion vectors this frame",
+                meshes.len(),
+                meshes.len() - warp_mesh_room,
+            );
+        }
         let warp_meshes: Vec<(&MeshInstance, glam::Mat4, glam::Mat4)> = match self.space_warp.as_ref() {
             Some(sw) if sw.acquired.is_some() => meshes
                 .iter()
-                .take(crate::renderer::space_warp::MAX_SLOTS as usize / 2 - 2)
+                // (An eye's slots: the posed world, these, the brushes' in
+                // the world, the water's and ground's in the world.)
+                .take(warp_mesh_room)
                 .map(|m| {
                     let model = m.mesh.model_matrix();
                     let prev = sw.prev_models.get(&m.model.buffer).copied().unwrap_or(model);
@@ -1822,9 +1841,21 @@ impl XrRenderer {
         let brush_motion_ranges: Option<[Vec<(u32, u32)>; 2]> =
             match (warp_cull && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some()), brush_geometry) {
                 (true, Some((v, i))) => {
-                    let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
-                    let runs = crate::renderer::space_warp::index_runs(i, |k| glam::Vec3::from(v[k as usize].position));
-                    Some(std::array::from_fn(|e| crate::renderer::space_warp::visible_ranges(&runs, &warp_planes[e])))
+                    // The runs' boxes are in the frame the vertices are in:
+                    // the eye's planes in the world for world vertices.
+                    let planes = |e: usize| match self.brush_world {
+                        true => crate::renderer::shadow::frustum_planes(warp_view_proj[e] * warp_world_to_player),
+                        false => warp_planes[e],
+                    };
+                    match self.static_brushes.as_ref().filter(|_| self.levers.brush_buffers) {
+                        // Kept with the buffers: no index is walked.
+                        Some(kept) => Some(std::array::from_fn(|e| crate::renderer::space_warp::visible_ranges(&kept.runs, &planes(e)))),
+                        None => {
+                            let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
+                            let runs = crate::renderer::space_warp::index_runs(i, |k| glam::Vec3::from(v[k as usize].position));
+                            Some(std::array::from_fn(|e| crate::renderer::space_warp::visible_ranges(&runs, &planes(e))))
+                        }
+                    }
                 }
                 _ => None,
             };
@@ -2005,7 +2036,16 @@ impl XrRenderer {
         // same slot as the water: this frame's and the last frame's clip
         // from the WORLD -- two matrices, and no posed copy of either frame.
         let warp_world = warp_water || (self.ground_world && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some()));
-        let warp_per_eye = 1 + warp_meshes.len() as u32 + warp_world as u32;
+        // The brushes, where their vertices are the world's, take a slot of
+        // their own after the meshes': the world's two matrices, as the
+        // ground's, WITH the eye and pixel scale their reflections move by --
+        // the eye in the world, where the water's slot carries its clock
+        // there. See `space_warp::MotionKind::BrushReflect`.
+        let warp_brush_world = self.brush_world
+            && brush_buffers.is_some()
+            && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some());
+        let warp_brush_slot = 1 + warp_meshes.len() as u32;
+        let warp_per_eye = 1 + warp_meshes.len() as u32 + warp_brush_world as u32 + warp_world as u32;
         // REFLECTIONS MOVE AS WHAT THEY SHOW wherever this frame can say what
         // that is: a single-eye scene pass drawn straight into the eye image,
         // whose alpha holds each pixel's reflected share, with the probe pass
@@ -2056,6 +2096,10 @@ impl XrRenderer {
                 put(base, curr, world_prev, [e.x, e.y, e.z, 1.0], reflect);
                 for (i, (_, model, prev)) in warp_meshes.iter().enumerate() {
                     put(base + 1 + i, curr * *model, prev_view_proj * *prev, [0.0; 4], [0.0; 4]);
+                }
+                if warp_brush_world {
+                    let (c, p, world_eye) = crate::renderer::space_warp::world_slot(curr, sw.prev.map(|(vps, w2p)| (vps[eye], w2p)), warp_world_to_player, glam::Vec3::new(e.x, e.y, e.z));
+                    put(base + warp_brush_slot as usize, c, p, [world_eye.x, world_eye.y, world_eye.z, 1.0], reflect);
                 }
                 if warp_world {
                     let prev_water = sw.prev.map_or(curr * warp_world_to_player, |(vps, w2p)| vps[eye] * w2p);
@@ -2787,6 +2831,8 @@ impl XrRenderer {
                         if !stereo && self.levers.cave_occluder {
                             self.baked_cave_pipelines.draw_occluders(
                                 &mut pass, &self.uniform_buf.bind_group, &baked_cave_draws, cam_pos,
+                                // Its chunks in view only (`Levers::cave_chunk_cull`).
+                                (self.levers.cave_chunk_cull && self.levers.scene_cull).then_some(&cull_planes[..]),
                             );
                         }
                         // THE BRUSHES' DEPTH FIRST (`Levers::probe_prepass`), so
@@ -3954,7 +4000,9 @@ impl XrRenderer {
                     let reflect_group = sw.reflect_groups.get(image_index).map(|g| &g[eye]).filter(|_| warp_reflections);
                     if let Some((vb, ib, n)) = brush_buffers.as_ref() {
                         let kind = if reflect_group.is_some() { MotionKind::BrushReflect } else { MotionKind::Brush };
-                        let brush = |first: u32, count: u32| MotionDraw { kind, vertices: vb, indices: ib, first, count, slot: base, joints: reflect_group };
+                        // From their own slot where they are world vertices.
+                        let slot = if warp_brush_world { base + warp_brush_slot } else { base };
+                        let brush = |first: u32, count: u32| MotionDraw { kind, vertices: vb, indices: ib, first, count, slot, joints: reflect_group };
                         match brush_motion_ranges.as_ref() {
                             Some(ranges) => draws.extend(ranges[eye].iter().map(|&(first, count)| brush(first, count))),
                             None => draws.push(brush(0, *n)),
@@ -4024,15 +4072,33 @@ impl XrRenderer {
                             // compositor moved its pixels by the ridge's outer
                             // face behind them, and the cave smeared.
                             for prim in inst.mesh.primitives.iter() {
-                                draws.push(MotionDraw {
-                                    kind: MotionKind::Mesh,
-                                    vertices: &prim.vertex_buffer,
-                                    indices: &prim.index_buffer,
-                                    first: 0,
-                                    count: prim.indices.len() as u32,
-                                    slot,
-                                    joints: None,
-                                });
+                                // A BAKED CAVE IN THE CHUNKS THIS EYE SEES
+                                // (`Levers::cave_chunk_cull`), as the scene
+                                // pass draws it: its index buffer is in its
+                                // chunks' order. Lossless, as the cull above:
+                                // the GPU clipped the rest.
+                                let runs = match &prim.baked_cave {
+                                    Some(cave) if warp_cull && self.levers.cave_chunk_cull => {
+                                        crate::renderer::baked_cave::visible_ranges(
+                                            &cave.chunks,
+                                            inst.mesh.model_matrix(),
+                                            Some(std::slice::from_ref(&warp_planes[eye])),
+                                            None,
+                                        )
+                                    }
+                                    _ => vec![0..prim.indices.len() as u32],
+                                };
+                                for run in runs {
+                                    draws.push(MotionDraw {
+                                        kind: MotionKind::Mesh,
+                                        vertices: &prim.vertex_buffer,
+                                        indices: &prim.index_buffer,
+                                        first: run.start,
+                                        count: run.end - run.start,
+                                        slot,
+                                        joints: None,
+                                    });
+                                }
                             }
                         }
                     }

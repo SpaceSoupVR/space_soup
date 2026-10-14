@@ -316,6 +316,15 @@ impl VkContext {
         // `terrain_pipeline::WORLD_GROUND`.
         let world_ground = system_property(c"debug.spacesoup.worldground") != "0";
         crate::renderer::terrain_pipeline::WORLD_GROUND.store(world_ground, std::sync::atomic::Ordering::Relaxed);
+        // THE BRUSHES IN THE WORLD, posed by their vertex shaders. Set here,
+        // before any brush pipeline is built. See
+        // `brush_pipeline::WORLD_BRUSHES` and [`WORLD_BRUSHES_BY_DEFAULT`].
+        let world_brushes = match system_property(c"debug.spacesoup.worldbrushes").as_str() {
+            "0" => false,
+            "1" => true,
+            _ => crate::renderer::static_brush::WORLD_BRUSHES_BY_DEFAULT,
+        };
+        crate::renderer::brush_pipeline::WORLD_BRUSHES.store(world_brushes, std::sync::atomic::Ordering::Relaxed);
         // PIPELINE STATISTICS, when asked for. See `PIPELINE_STATISTICS_PROPERTY`.
         let statistics_extension_available = unsafe {
             vk_instance

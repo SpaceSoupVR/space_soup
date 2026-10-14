@@ -59,6 +59,125 @@ const PORTAL_MARGIN: f32 = {
     if fade > 0.02 { fade } else { 0.02 }
 };
 
+/// BOXES BY WHERE THEY STAND, so "does this box of ground touch any of them"
+/// asks the few boxes over that spot and not every box of the level.
+///
+/// The ground's classes were found by asking each triangle against every
+/// baked photograph's box and every doorway -- twice over for a triangle
+/// inside the outdoor volume: triangles x probes, 18 ms on test_room's 13
+/// probes, 152 ms at 625 samples a side, 809 ms at 1,025 and 9.9 s at 2,049
+/// with 449 (`docs/scale-audit-2026-10-13.md`, F12), on the render thread.
+///
+/// A grid over the boxes' footprints (x, z), each cell listing the boxes that
+/// reach it; a box too wide to list -- the outdoor volume's, which is the
+/// level -- is asked first, every time. THE SAME ANSWER as asking them all:
+/// a box can only touch a query that shares a cell with it
+/// (`tests::the_boxes_by_where_they_stand_answer_as_asking_them_all`).
+///
+/// WHAT IT COSTS NOW: a triangle, the boxes of its own cell -- the split is
+/// linear in the ground's triangles whatever the level bakes.
+struct BoxIndex {
+    boxes: Vec<(Vec3, Vec3)>,
+    /// Boxes over more cells than are worth listing them in, and any with a
+    /// bound that is not a number: asked for every query.
+    wide: Vec<u32>,
+    origin: [f32; 2],
+    cell: f32,
+    cells_x: usize,
+    cells_z: usize,
+    cells: Vec<Vec<u32>>,
+    #[cfg(test)]
+    tests: std::cell::Cell<u64>,
+}
+
+impl BoxIndex {
+    /// A box over more cells than this is asked every time instead.
+    const WIDE_CELLS: usize = 64;
+
+    fn new(boxes: &[(Vec3, Vec3)]) -> Self {
+        let finite = |b: &(Vec3, Vec3)| b.0.is_finite() && b.1.is_finite();
+        let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+        for (l, h) in boxes.iter().filter(|b| finite(b)) {
+            lo = [lo[0].min(l.x), lo[1].min(l.z)];
+            hi = [hi[0].max(h.x), hi[1].max(h.z)];
+        }
+        let mut index = Self {
+            boxes: boxes.to_vec(),
+            wide: Vec::new(),
+            origin: lo,
+            cell: 1.0,
+            cells_x: 0,
+            cells_z: 0,
+            cells: Vec::new(),
+            #[cfg(test)]
+            tests: Default::default(),
+        };
+        if !(lo[0] <= hi[0] && lo[1] <= hi[1]) {
+            index.wide = (0..boxes.len() as u32).collect();
+            return index;
+        }
+        // About as many cells as boxes, none under 2 m: a room's cells of
+        // photographs share a few cells, the open ground's cells are empty.
+        let side = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1.0);
+        let per_axis = ((boxes.len() as f32).sqrt().ceil() as usize * 2).clamp(1, 256);
+        index.cell = (side / per_axis as f32).max(2.0);
+        index.cells_x = (((hi[0] - lo[0]) / index.cell).floor() as usize + 1).max(1);
+        index.cells_z = (((hi[1] - lo[1]) / index.cell).floor() as usize + 1).max(1);
+        index.cells = vec![Vec::new(); index.cells_x * index.cells_z];
+        for (i, b) in boxes.iter().enumerate() {
+            if !finite(b) {
+                index.wide.push(i as u32);
+                continue;
+            }
+            let (x, z) = (index.span(b.0.x, b.1.x, 0), index.span(b.0.z, b.1.z, 1));
+            if (x.1 - x.0 + 1) * (z.1 - z.0 + 1) > Self::WIDE_CELLS {
+                index.wide.push(i as u32);
+                continue;
+            }
+            for cz in z.0..=z.1 {
+                for cx in x.0..=x.1 {
+                    index.cells[cz * index.cells_x + cx].push(i as u32);
+                }
+            }
+        }
+        index
+    }
+
+    /// The cells `lo..hi` reaches along axis `k` (0: x, 1: z), kept inside
+    /// the grid: what lies past its edge shares its edge cell, where no box
+    /// that could touch it is missing.
+    fn span(&self, lo: f32, hi: f32, k: usize) -> (usize, usize) {
+        let n = if k == 0 { self.cells_x } else { self.cells_z };
+        let at = |v: f32| (((v - self.origin[k]) / self.cell).floor().max(0.0) as usize).min(n - 1);
+        (at(lo), at(hi))
+    }
+
+    /// Whether the box `lo..hi` touches any of the boxes.
+    fn touches(&self, lo: Vec3, hi: Vec3) -> bool {
+        let touch = |i: &u32| {
+            #[cfg(test)]
+            self.tests.set(self.tests.get() + 1);
+            let (l, h) = &self.boxes[*i as usize];
+            lo.cmple(*h).all() && hi.cmpge(*l).all()
+        };
+        if self.wide.iter().any(touch) {
+            return true;
+        }
+        if self.cells.is_empty() || !(lo.is_finite() && hi.is_finite()) {
+            // (A query that is not a number touches nothing, as it did.)
+            return false;
+        }
+        // Past the grid's edge on the far side nothing is listed.
+        let far_x = self.origin[0] + self.cell * self.cells_x as f32;
+        let far_z = self.origin[1] + self.cell * self.cells_z as f32;
+        if hi.x < self.origin[0] || hi.z < self.origin[1] || lo.x > far_x || lo.z > far_z {
+            return false;
+        }
+        let (x, z) = (self.span(lo.x, hi.x, 0), self.span(lo.z, hi.z, 1));
+        (z.0..=z.1).any(|cz| (x.0..=x.1).any(|cx| self.cells[cz * self.cells_x + cx].iter().any(touch)))
+    }
+}
+
 /// What a frame's probe table lets be decided of a box of ground. World frame,
 /// as the table is.
 pub struct OutdoorFrame {
@@ -177,6 +296,11 @@ pub struct LevelGround {
     /// Names this table, for `SlopeSplit::is_for`: never 0, which is "no
     /// classifier".
     pub key: u64,
+    /// The table's boxes by where they stand ([`BoxIndex`]): everything it
+    /// reaches, and the rooms and doorways alone. Made the first time a
+    /// triangle is classed -- once a level -- and not on the frames that
+    /// only read `key`.
+    index: std::cell::OnceCell<(BoxIndex, Option<BoxIndex>)>,
 }
 
 /// A triangle's ground class: what the reflection pass may draw it with.
@@ -223,7 +347,7 @@ impl LevelGround {
         }
         let outdoor = outdoors.map(|(lo, hi)| OutdoorFrame { outdoors: (lo + Vec3::splat(SLACK), hi - Vec3::splat(SLACK)), indoors });
         let reach_bounds = Self::bounds_of(&reach);
-        Self { outdoor, nowhere: NowhereFrame { reach }, reach_bounds, key: key | 1 }
+        Self { outdoor, nowhere: NowhereFrame { reach }, reach_bounds, key: key | 1, index: Default::default() }
     }
 
     fn bounds_of(reach: &[(Vec3, Vec3)]) -> (Vec3, Vec3) {
@@ -235,12 +359,34 @@ impl LevelGround {
     pub fn of_table(probes: &ProbeUpload) -> Self {
         let nowhere = NowhereFrame::new(probes);
         let reach_bounds = Self::bounds_of(&nowhere.reach);
-        Self { outdoor: OutdoorFrame::new(probes), nowhere, reach_bounds, key: 1 }
+        Self { outdoor: OutdoorFrame::new(probes), nowhere, reach_bounds, key: 1, index: Default::default() }
     }
 
     /// The class of ground whose every point lies in the world-frame box
     /// `lo..hi` (a triangle's bounds).
     pub fn class_of(&self, lo: Vec3, hi: Vec3) -> usize {
+        let outside = !(lo.cmple(self.reach_bounds.1).all() && hi.cmpge(self.reach_bounds.0).all());
+        if outside {
+            return GROUND_NOWHERE;
+        }
+        // `NowhereFrame::holds` and `OutdoorFrame::holds`, asked of the
+        // boxes over this spot instead of every box of the level.
+        let (reach, indoors) = self.index.get_or_init(|| (BoxIndex::new(&self.nowhere.reach), self.outdoor.as_ref().map(|f| BoxIndex::new(&f.indoors))));
+        if !reach.touches(lo, hi) {
+            GROUND_NOWHERE
+        } else if self.outdoor.as_ref().zip(indoors.as_ref()).is_some_and(|(f, indoors)| {
+            lo.cmpge(f.outdoors.0).all() && hi.cmple(f.outdoors.1).all() && !indoors.touches(lo, hi)
+        }) {
+            GROUND_OUTDOORS
+        } else {
+            GROUND_FULL
+        }
+    }
+
+    /// [`Self::class_of`] asking every box of the table, as it did until
+    /// 2026-10-13: what the indexed one is held to.
+    #[cfg(test)]
+    fn class_of_asking_every_box(&self, lo: Vec3, hi: Vec3) -> usize {
         let outside = !(lo.cmple(self.reach_bounds.1).all() && hi.cmpge(self.reach_bounds.0).all());
         if outside || self.nowhere.holds(lo, hi) {
             GROUND_NOWHERE
@@ -284,6 +430,55 @@ pub fn world_box(offset: Vec3, yaw: f32, lo: Vec3, hi: Vec3) -> (Vec3, Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A LEVEL LARGER THAN test_room: 16 x 16 buildings on a 640 m square,
+    /// each a hall cut into cells of photographs with a doorway, some
+    /// overlapping their neighbours, and one outdoor volume over all of it --
+    /// about 1,300 boxes. THE BOXES BY WHERE THEY STAND ANSWER AS ASKING THEM
+    /// ALL: every triangle-sized box of a ground sampled across the level,
+    /// through rooms, doorways, the volume's edge and beyond it, gets the
+    /// class it got from every box -- and from a fraction of the box tests.
+    #[test]
+    fn the_boxes_by_where_they_stand_answer_as_asking_them_all() {
+        let mut volumes: Vec<(u32, Vec3, Vec3, Vec3)> = Vec::new();
+        let mut rooms: Vec<u32> = Vec::new();
+        let mut portals: Vec<ProbePortal> = Vec::new();
+        let outdoor = 16 * 16;
+        for b in 0..256u32 {
+            let (i, j) = ((b % 16) as f32, (b / 16) as f32);
+            let centre = Vec3::new(i * 40.0 - 300.0 + (b as f32 * 0.7).sin() * 14.0, 1.5 + (b % 4) as f32, j * 40.0 - 300.0 + (b as f32 * 1.3).cos() * 14.0);
+            let half = Vec3::new(6.0 + (b % 5) as f32 * 3.0, 2.5, 5.0 + (b % 3) as f32 * 4.0);
+            for cell in 0..(2 + b % 4) {
+                volumes.push((volumes.len() as u32, centre, centre - half, centre + half));
+                let _ = cell;
+                rooms.push(b);
+            }
+            portals.push(ProbePortal { min: centre + Vec3::new(half.x - 0.3, -2.5, -0.8), max: centre + Vec3::new(half.x + 0.3, -0.3, 0.8), axis: 0, low: b, high: outdoor, wall: None });
+        }
+        let (olo, ohi) = (Vec3::new(-330.0, -12.0, -330.0), Vec3::new(330.0, 40.0, 330.0));
+        volumes.push((volumes.len() as u32, (olo + ohi) * 0.5, olo, ohi));
+        rooms.push(outdoor);
+        let level = LevelGround::new(&volumes, &rooms, Some(outdoor), &portals);
+        let (mut seen, mut asked) = ([0u32; 3], 0u64);
+        for k in 0..60_000u32 {
+            // A ground triangle's box, from past one edge of the level to
+            // past the other, at heights through and over the rooms.
+            let p = Vec3::new((k % 251) as f32 * 2.9 - 364.0, ((k / 7) % 13) as f32 * 0.9 - 3.0, (k / 251) as f32 * 3.05 - 364.0);
+            let (lo, hi) = (p, p + Vec3::new(0.43, 0.2 + (k % 3) as f32, 0.43));
+            let class = level.class_of(lo, hi);
+            assert_eq!(class, level.class_of_asking_every_box(lo, hi), "the box {lo}..{hi}");
+            seen[class] += 1;
+            asked += (volumes.len() + portals.len()) as u64;
+        }
+        assert!(seen.iter().all(|&n| n > 1500), "every class on this level: {seen:?}");
+        // A box the size of a chunk, and one over the whole level.
+        for (lo, hi) in [(Vec3::new(-100.0, -5.0, -60.0), Vec3::new(10.0, 9.0, 50.0)), (olo - Vec3::splat(50.0), ohi + Vec3::splat(50.0)), (Vec3::new(400.0, 0.0, 400.0), Vec3::new(420.0, 1.0, 420.0))] {
+            assert_eq!(level.class_of(lo, hi), level.class_of_asking_every_box(lo, hi));
+        }
+        let (reach, indoors) = level.index.get().expect("made by the first triangle");
+        let tests = reach.tests.get() + indoors.as_ref().map_or(0, |i| i.tests.get());
+        assert!(tests * 20 < asked, "{tests} box tests through the grid; asking every box, at least {asked}");
+    }
 
     /// A level: the outdoor volume (7) round everything, a hall (3) and a
     /// doorway in its east wall.

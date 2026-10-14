@@ -1337,8 +1337,16 @@ impl BakedCavePipelines {
     }
 
     /// The depth of every cave the eye at `eye` is inside, in the reflection
-    /// pass (as `CaveTwins::occluder`).
-    pub fn draw_occluders<'a>(&'a self, pass: &mut RenderPass<'a>, uniform: &'a BindGroup, draws: &[BakedCaveDraw<'a>], eye: Vec3) {
+    /// pass (as `CaveTwins::occluder`). `planes`: only the chunks some eye of
+    /// them can see into (`visible_ranges`); `None` draws each cave whole.
+    pub fn draw_occluders<'a>(
+        &'a self,
+        pass: &mut RenderPass<'a>,
+        uniform: &'a BindGroup,
+        draws: &[BakedCaveDraw<'a>],
+        eye: Vec3,
+        planes: Option<&[[Vec4; 6]]>,
+    ) {
         let inside = |d: &BakedCaveDraw| d.holds(eye);
         if !draws.iter().any(inside) {
             return;
@@ -1349,8 +1357,26 @@ impl BakedCavePipelines {
             pass.set_bind_group(2, d.model, &[]);
             pass.set_vertex_buffer(0, d.vertices.slice(..));
             pass.set_index_buffer(d.indices.slice(..), IndexFormat::Uint32);
-            pass.draw_indexed(0..d.index_count, 0, 0..1);
+            for r in occluder_ranges(d.chunks, d.index_count, d.placed, planes) {
+                pass.draw_indexed(r, 0, 0..1);
+            }
         }
+    }
+}
+
+/// The runs of a cave the depth-only passes draw: all of it for no `planes`,
+/// else the chunks some eye of them can see into, whatever their twin. What
+/// is left out lies wholly outside a frustum the GPU would have clipped it
+/// against, so no pixel changes.
+pub fn occluder_ranges(
+    chunks: &[CaveChunk],
+    index_count: u32,
+    placed: Mat4,
+    planes: Option<&[[Vec4; 6]]>,
+) -> Vec<std::ops::Range<u32>> {
+    match planes {
+        None => vec![0..index_count],
+        Some(_) => visible_ranges(chunks, placed, planes, None),
     }
 }
 
@@ -1438,6 +1464,40 @@ mod tests {
         for (bad, count) in [(vec![chunk(0, 6, 0.0), chunk(9, 6, 2.0)], 15), (good.to_vec(), 18), (vec![chunk(0, 5, 0.0)], 5), (vec![], 12)] {
             let one = covering_chunks(&bad, count, b);
             assert_eq!(one, vec![CaveChunk { first: 0, count, min: b[0], max: b[1], lip: 0, planes: CavePlanes::Cliff }]);
+        }
+    }
+
+    /// THE DEPTH-ONLY PASSES DRAW A LONG CAVE BY WHAT IS IN VIEW, not by its
+    /// length: a tunnel of 400 chunks along x, an eye inside it looking down
+    /// the tunnel one way. Drawn whole (as the occluder and motion passes did)
+    /// it is 400 chunks whatever the eye sees; by its chunks, fewer than half,
+    /// and every triangle with a corner inside the frustum is still drawn.
+    #[test]
+    fn a_long_caves_depth_is_drawn_by_the_chunks_in_view_and_none_in_view_is_lost() {
+        let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.05, 500.0);
+        let view_proj = proj * Mat4::look_to_rh(Vec3::new(0.0, 0.0, 0.0), Vec3::X, Vec3::Y);
+        let planes = [crate::renderer::shadow::frustum_planes(view_proj)];
+        let placed = Mat4::from_translation(Vec3::new(0.0, -1.0, 0.0));
+        // Chunk k: 2 m of tunnel from x = 2k - 400, one triangle in its box.
+        let chunks: Vec<CaveChunk> = (0..400u32)
+            .map(|k| {
+                let x = 2.0 * k as f32 - 400.0;
+                CaveChunk { first: 3 * k, count: 3, min: [x, 0.0, -1.5], max: [x + 2.0, 2.5, 1.5], lip: 0, planes: CavePlanes::ALL[k as usize % 3] }
+            })
+            .collect();
+        let whole = occluder_ranges(&chunks, 1200, placed, None);
+        assert_eq!(whole, vec![0..1200]);
+        let seen = occluder_ranges(&chunks, 1200, placed, Some(&planes));
+        let drawn: u32 = seen.iter().map(|r| r.end - r.start).sum();
+        assert!(drawn < 1200 / 2 + 12, "{drawn} of 1200 indices");
+        assert!(drawn >= 3 * 190, "{drawn}: the half ahead is in view");
+        // No chunk with a point inside the frustum is left out.
+        for c in &chunks {
+            let centre = placed.transform_point3((Vec3::from(c.min) + Vec3::from(c.max)) * 0.5);
+            let inside = planes[0].iter().all(|p| p.truncate().dot(centre) + p.w >= 0.0);
+            if inside {
+                assert!(seen.iter().any(|r| r.contains(&c.first)), "chunk at {} is in view and not drawn", c.first);
+            }
         }
     }
 

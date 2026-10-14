@@ -40,6 +40,7 @@ pub mod weather;
 pub mod ground_cuts;
 pub mod ground_horizon;
 pub mod water_runs;
+pub mod static_brush;
 pub mod static_solid;
 pub mod ground_twins;
 pub mod uniforms;

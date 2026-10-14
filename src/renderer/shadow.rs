@@ -994,6 +994,13 @@ pub struct ShadowMap {
     /// different stride -- the shader is `vs_solid`, unchanged, because a depth
     /// pass reads position and nothing else.
     brush_pipeline: RenderPipeline,
+    /// The brush pipeline for vertices in the WORLD -- the rooms, where they
+    /// are kept so (`brush_pipeline::WORLD_BRUSHES`): `vs_mesh` over brush
+    /// vertices, posed by the model matrix in [`Self::brush_world`].
+    brush_world_pipeline: RenderPipeline,
+    /// The player's frame from the world, as a model's uniform, when the
+    /// brushes are world vertices this frame. See `set_brush_world`.
+    brush_world: std::cell::RefCell<Option<BindGroup>>,
 }
 
 impl ShadowMap {
@@ -1287,6 +1294,36 @@ impl ShadowMap {
             cache: None,
         });
 
+        // As the brush pipeline in everything but where its vertices are.
+        let brush_world_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("shadow_brush_world_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_mesh"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(super::brush_pipeline::BrushVertex::layout())],
+            },
+            fragment: None,
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: Some(Face::Back),
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
+                stencil: StencilState::default(),
+                bias,
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let sun = ShadowSlot::new(device, &light_layout, "sun_shadow_depth", dim);
         // ONE 2D atlas, `SPOT_ATLAS_COLS` tiles a side, so every spot's depth
         // is filled by moving the viewport inside a single render pass. Same
@@ -1341,6 +1378,8 @@ impl ShadowMap {
             skinned_pipeline,
             posed_pipeline,
             brush_pipeline,
+            brush_world_pipeline,
+            brush_world: Default::default(),
         }
     }
 
@@ -1418,6 +1457,21 @@ impl ShadowMap {
     /// posed cuboids too, and only the chunks are the world's.
     pub fn set_solid_world(&self, model: Option<&BindGroup>, whole: bool) {
         *self.solid_world.borrow_mut() = model.map(|m| (m.clone(), whole));
+    }
+
+    /// THE BRUSHES ARE WORLD VERTICES (`Some`: the player's frame from the
+    /// world, as a mesh's model uniform) or posed ones (`None`), for every
+    /// pass recorded from here on. See `brush_pipeline::WORLD_BRUSHES`.
+    pub fn set_brush_world(&self, model: Option<&BindGroup>) {
+        *self.brush_world.borrow_mut() = model.cloned();
+    }
+
+    /// The brush pipeline for a pass, with its group 1 where it has one.
+    fn brush_pipeline_now(&self) -> (&RenderPipeline, Option<BindGroup>) {
+        match self.brush_world.borrow().clone() {
+            Some(model) => (&self.brush_world_pipeline, Some(model)),
+            None => (&self.brush_pipeline, None),
+        }
     }
 
     /// The solid pipeline for a pass's solids, with its group 1 where it has
@@ -1504,8 +1558,12 @@ impl ShadowMap {
             }
             if let Some((vb, ib, total)) = brushes {
                 if total > 0 {
-                    pass.set_pipeline(&self.brush_pipeline);
+                    let (pipeline, model) = self.brush_pipeline_now();
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, light_bg, &[]);
+                    if let Some(model) = &model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(0..total, 0, 0..1);
@@ -1740,8 +1798,12 @@ impl ShadowMap {
 
             if let Some((vb, ib, count)) = brushes {
                 if count > 0 {
-                    pass.set_pipeline(&self.brush_pipeline);
+                    let (pipeline, model) = self.brush_pipeline_now();
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &slot.light_bind_group, &[]);
+                    if let Some(model) = &model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(0..count, 0, 0..1);
