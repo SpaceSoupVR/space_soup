@@ -672,15 +672,15 @@ pub enum RenderModule {
     /// placed object's footprint (`shape_disc` -- `fills_object` for a level's
     /// pond or hollow, its radius in the editor), from its origin up
     /// `height` metres. Its density, per metre of sight, is `density` at the
-    /// bottom and falls by e every `falloff` metres up (times a local
-    /// thickness: thin sheets, taller banks), gone well before its top; it
+    /// bottom and falls by e every `falloff` metres up (a streak a little
+    /// taller than the layer), gone well before its top; it
     /// lies in the ellipse the box's footprint holds (size the object to the
     /// water), thinning to nothing over `edge` metres in from its rim, and
     /// ends where the scene's depth does (a bank, the shore), so it is soft
     /// where it meets ground. Integrated along each pixel's line of sight,
-    /// so a grazing view sees it thicker, as a real layer is. Banks and
-    /// strands drift with `wind` (m/s, world), stretched along it, clear
-    /// water between; that motion is its SpaceWarp vectors. Its density is
+    /// so a grazing view sees it thicker, as a real layer is. Mostly an
+    /// even layer with many fine streaks along `wind` (m/s, world), drifting
+    /// with it; that motion is its SpaceWarp vectors. Its density is
     /// also its object's `strength` and, while a time of day runs, the
     /// hour's `effects::mist_conditions`. Lit as `light_cpu` (scatter) works
     /// out: the room's or sky's even light, its lamps, and the sun by
