@@ -838,6 +838,9 @@ impl XrRenderer {
         // moving-objects SUN map (see where it is recorded, and
         // `MeshInstance::moves`).
         let mut level_casters: Vec<bool> = Vec::new();
+        // Each caster's triangles without its thin parts, where it has any
+        // (`Levers::spot_caster_drop` 32).
+        let mut caster_solid_only: Vec<Option<(&wgpu::Buffer, u32)>> = Vec::new();
         // Which of `shadow_casters` are doors, for the lamps' moving casters'
         // tiles. See `MeshInstance::tile_caster`.
         let mut tile_meshes: Vec<usize> = Vec::new();
@@ -918,6 +921,7 @@ impl XrRenderer {
                         prim.indices.len() as u32,
                         &instance.model.bind_group,
                     ));
+                    caster_solid_only.push(prim.thin.as_ref().map(|t| (&t.solid_index_buffer, t.solid_count)));
                     shadow_bounds.push(bound);
                     level_casters.push(!instance.moves);
                 }
@@ -984,6 +988,7 @@ impl XrRenderer {
                         prim.indices.len() as u32,
                         &instance.model.bind_group,
                     ));
+                    caster_solid_only.push(prim.thin.as_ref().map(|t| (&t.solid_index_buffer, t.solid_count)));
                     shadow_bounds.push(bound);
                     level_casters.push(false);
                 }
@@ -1408,7 +1413,11 @@ impl XrRenderer {
             Vec::new()
         };
         let has_body = fx.capsules && self.player.capsules.group_count > 0;
-        let character_tiles: Vec<(usize, glam::Mat4)> = if fx.shadows && fx.character_shadows && (has_body || !door_casters.is_empty()) {
+        let character_tiles: Vec<(usize, glam::Mat4)> = if fx.shadows
+            && fx.character_shadows
+            && self.levers.spot_caster_drop & 64 == 0
+            && (has_body || !door_casters.is_empty())
+        {
             let b = self.player.capsules.groups[0];
             let (centre, radius) = (glam::Vec3::new(b[0], b[1], b[2]), b[3]);
             let lamps: Vec<crate::renderer::shadow::CharacterLamp> = lights
@@ -1855,13 +1864,21 @@ impl XrRenderer {
                     .map(|(_, d)| *d)
                     .collect();
                 let no_meshes: [crate::renderer::shadow::ShadowMeshDraw; 0] = [];
+                let spot_meshes: Vec<crate::renderer::shadow::ShadowMeshDraw> = shadow_casters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(vb, ib, n, model))| match caster_solid_only.get(i).copied().flatten() {
+                        Some((solid, count)) if !keep(32) => (vb, solid, count, model),
+                        _ => (vb, ib, n, model),
+                    })
+                    .collect();
                 drawn += self.shadow_map.record_spots(
                     &mut encoder,
                     shadow.spot_count as usize,
                     &spot_pass,
                     solid_caster.filter(|_| keep(1)),
                     brush_caster.filter(|_| keep(2)),
-                    if keep(4) { &shadow_casters } else { &no_meshes },
+                    if keep(4) { &spot_meshes } else { &no_meshes },
                     if keep(4) { cull_bounds } else { &[] },
                     &spot_skinned,
                     &spot_posed,
