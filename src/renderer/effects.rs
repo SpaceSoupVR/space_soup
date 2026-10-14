@@ -4922,58 +4922,48 @@ fn fx_depth_fade(in: VOut) -> f32 {
 // box's bottom, along this pixel's line of sight from where it enters the box
 // to where it leaves it or meets the scene's depth (a bank, the shore: so it
 // thins to nothing where it meets them), in FOG_STEPS stretches. In each, its
-// density falls by e every `fog_b.w` metres up times a local thickness (thin
-// sheets hugging the water, taller banks that rise and curl), INTEGRATED
+// density falls by e every `fog_b.w` metres up times a local thickness (a
+// streak stands a little taller than the layer), INTEGRATED
 // EXACTLY over the stretch, times what is there at the middle of its density
 // (near the water for a line looking down, so the strands stay sharp):
 // - where it lies: the ellipse its box's footprint holds (a pond's water,
 //   the object sized to it), thinning to nothing `fog_a.w` metres in from its
 //   rim -- so the mist hugs the water and never climbs the bank;
-// - its wisps (`fx_fog_wisps`): banks and the strands that curl out of them,
-//   stretched along the wind (`soft`, the wind's way across the box;
-//   `flicker`, how far it has drifted), clear water between; where they are
-//   thick they also stand taller;
+// - its wisps (`fx_fog_wisps`): an even layer with many fine streaks along
+//   the wind (`soft`, the wind's way across the box; `flicker`, how far it
+//   has drifted);
 // - its top: gone well before the box's (`1 - smoothstep` over its upper
 //   two-fifths), so no plane is ever seen.
 // Seen through it, `1 - e^-depth` of what is behind is hidden. Lit by its even
 // light (`colour.rgb`) and the sun (`light`) through Henyey-Greenstein toward
 // it (`light_q`, `layer.y` its g), as `light_cpu` lights a mote
 // (`effects::henyey_greenstein`), the phase evening out as it thickens.
-const FOG_TILE: f32 = 1.6;
-const FOG_STRETCH: f32 = 3.0;
+const FOG_TILE: f32 = 0.3;
+const FOG_STRETCH: f32 = 5.0;
 const FOG_STEPS: i32 = 6;
 
 // Its wisps at a point of the box (its own frame) for the wind's way `wind`
 // and drift `drift`, over a stretch `blur` metres across the ground: x how
-// much is there, y how tall it stands (a multiple of its falloff).
-// - BANKS: a coarse noise FOG_TILE metres across the wind (FOG_STRETCH times
-//   that along it), where the mist gathers;
-// - STRANDS: the ridges of two finer noises, warped by the banks and by each
-//   other, so they curl and fork: the filaments, gathered in the banks and
-//   trailing out of them, the water clear between;
-// - a VEIL FOG_FLOOR of the most between them, so the whole water is misted;
-// - where it is thick it stands taller (0.6 to 1.9 times its falloff).
-// A noise finer than its stretch would be read at points too far apart --
-// straight stripes as they slide along the ray -- so the strands give way to
-// their mean (FOG_STRANDS) and the whole to the wisps' (FOG_MEAN, x its
-// mist, y its height weighted by it): a long grazing line of sight sees the
-// layer averaged, as it would.
-const FOG_FLOOR: f32 = 0.12;
-const FOG_STRANDS: f32 = 0.34;
-const FOG_MEAN: vec2<f32> = vec2<f32>(0.405, 1.35);
+// much is there, y how tall it stands (a multiple of its falloff). MOSTLY AN
+// EVEN LAYER (0.55 of the most everywhere) with many fine STREAKS along the
+// wind: the ridges of two noises FOG_TILE and 1.9 x that across the wind
+// (streaks some 0.3 to 1 m wide), FOG_STRETCH times longer along it, bent by
+// a gentle meander under a streak's width (no swirls) that also swells and
+// thins them by +-20%; a streak stands a little taller (0.85 to 1.25). A
+// streak finer than its stretch would be read at points too far apart --
+// straight stripes as they slide along the ray -- so the whole gives way to
+// its mean (FOG_MEAN, x its mist, y its height weighted by it): a long
+// grazing line of sight sees the layer averaged, as it would.
+const FOG_MEAN: vec2<f32> = vec2<f32>(0.89, 1.08);
 fn fx_fog_wisps(m: vec2<f32>, wind: vec2<f32>, drift: f32, blur: f32) -> vec2<f32> {
-    let b = blur / FOG_TILE;
     let a = vec2<f32>(dot(m, wind) - drift, dot(m, vec2<f32>(-wind.y, wind.x)));
-    let n1 = fx_fog_noise(vec2<f32>(a.x / FOG_STRETCH, a.y) / FOG_TILE);
-    let q2 = vec2<f32>((a.x - 0.4 * drift) / FOG_STRETCH, a.y) / (0.45 * FOG_TILE) + vec2<f32>(17.0 + 1.6 * n1, 3.0 - 1.6 * n1);
-    let n2 = fx_fog_noise(q2);
-    let n3 = fx_fog_noise(q2 * 2.3 + vec2<f32>(5.0 - 1.1 * n2, 11.0 + 1.1 * n2));
-    let ridges = 0.65 * (1.0 - abs(2.0 * n2 - 1.0)) + 0.35 * (1.0 - abs(2.0 * n3 - 1.0));
-    let strands = mix(smoothstep(0.5, 0.92, ridges), FOG_STRANDS, smoothstep(0.1, 0.35, b));
-    let banks = smoothstep(0.3, 0.75, n1);
-    let w = FOG_FLOOR + (1.0 - FOG_FLOOR) * min(1.0, 0.7 * banks * (0.35 + 0.65 * strands) + 0.6 * strands * smoothstep(0.15, 0.5, n1));
-    let wisp = vec2<f32>(w, 0.6 + 1.3 * smoothstep(0.25, 0.8, w));
-    return mix(wisp, FOG_MEAN, smoothstep(0.35, 1.1, b));
+    let c = fx_fog_noise(vec2<f32>(a.x / (6.0 * FOG_STRETCH), a.y / 6.0) / FOG_TILE);
+    let y = a.y + 2.1 * FOG_TILE * (c - 0.5);
+    let n1 = fx_fog_noise(vec2<f32>(a.x / (FOG_STRETCH * FOG_TILE) + 3.0, y / FOG_TILE));
+    let n2 = fx_fog_noise(vec2<f32>(a.x / (1.9 * FOG_STRETCH * FOG_TILE) + 11.0, y / (1.9 * FOG_TILE) + 5.0));
+    let streak = smoothstep(0.35, 0.9, 0.55 * (1.0 - abs(2.0 * n1 - 1.0)) + 0.45 * (1.0 - abs(2.0 * n2 - 1.0)));
+    let wisp = vec2<f32>(0.55 + 0.9 * streak * (0.6 + 0.4 * c), 0.85 + 0.4 * streak);
+    return mix(wisp, FOG_MEAN, smoothstep(0.6, 2.0, blur / FOG_TILE));
 }
 
 // Smooth, low-frequency and without a grid: two waves each warped by the

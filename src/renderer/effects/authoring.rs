@@ -64,7 +64,7 @@ fn channels(c: Channels) -> &'static str {
 /// function sizes a fragment entry reaches), in `FxVariant::ALL`'s order.
 /// The proxy is a test-only tool, so the numbers are pinned here and
 /// `the_variant_table_is_the_proxys` fails the moment a shader edit moves one.
-pub const VARIANT_PROXY: [usize; 9] = [436, 114, 160, 215, 142, 130, 105, 126, 472];
+pub const VARIANT_PROXY: [usize; 9] = [436, 114, 160, 215, 142, 130, 105, 126, 437];
 
 /// A variant's size by the proxy, and as instructions estimated.
 pub fn variant_cost(v: FxVariant) -> (usize, f32) {
