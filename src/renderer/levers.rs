@@ -175,7 +175,10 @@ pub struct Levers {
     /// the flashlight's), to find which one casts a shadow on the headset:
     /// 1 = the solid buffer (ground, cuboids), 2 = brushes, 4 = rigid meshes,
     /// 8 = skinned meshes in view (characters, the first-person body),
-    /// 16 = the player's own whole body, hidden from them (`mirror_only`).
+    /// 16 = the player's own whole body, hidden from them (`mirror_only`),
+    /// 32 = the rigid meshes' THIN parts (cords, chains, cage wires: see
+    /// `mesh::thin_parts`; their solid triangles still cast), 64 = no
+    /// characters' tiles at all (the lamps without a spot slot).
     /// 0, the shipped state, leaves nothing out.
     pub spot_caster_drop: u32,
     /// DIAGNOSIS: both eyes' finished images of the next frame, raw, to the
