@@ -1546,12 +1546,14 @@ impl ShadowMap {
                         pass.draw_indexed(0..total, 0, 0..1);
                         drawn += total;
                     } else {
-                        for c in solid_chunks {
-                            if !aabb_in_frustum(&planes, c.min, c.max) {
-                                continue;
-                            }
-                            pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
-                            drawn += c.index_count;
+                        // (Chunks that touch in the buffer -- a block of the
+                        // chunk grid -- as one draw: `ground_lod::merged`.)
+                        let runs = crate::renderer::ground_lod::merged(
+                            solid_chunks.iter().filter(|c| aabb_in_frustum(&planes, c.min, c.max)).map(|c| (c.first_index, c.index_count)),
+                        );
+                        for (first, count) in runs {
+                            pass.draw_indexed(first..first + count, 0, 0..1);
+                            drawn += count;
                         }
                     }
                 }
@@ -1781,16 +1783,12 @@ impl ShadowMap {
                         pass.draw_indexed(0..count, 0, 0..1);
                         drawn_indices += count;
                     } else {
-                        for c in solid_chunks {
-                            if !aabb_in_frustum(&planes, c.min, c.max) {
-                                continue;
-                            }
-                            pass.draw_indexed(
-                                c.first_index..c.first_index + c.index_count,
-                                0,
-                                0..1,
-                            );
-                            drawn_indices += c.index_count;
+                        let runs = crate::renderer::ground_lod::merged(
+                            solid_chunks.iter().filter(|c| aabb_in_frustum(&planes, c.min, c.max)).map(|c| (c.first_index, c.index_count)),
+                        );
+                        for (first, count) in runs {
+                            pass.draw_indexed(first..first + count, 0, 0..1);
+                            drawn_indices += count;
                         }
                     }
                 }

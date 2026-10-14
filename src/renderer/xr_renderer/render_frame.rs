@@ -419,16 +419,13 @@ impl XrRenderer {
         // chunk offsets have to move with them. Using the raw offsets here
         // would draw whatever happened to sit at that position in the combined
         // buffer -- cuboids, or nothing.
-        let solid_chunks: Vec<crate::renderer::shadow::CasterChunk> = match terrain_range {
-            Some((index_start, _)) => terrain_chunks
-                .iter()
-                .map(|c| crate::renderer::shadow::CasterChunk {
-                    first_index: c.first_index + index_start,
-                    ..*c
-                })
-                .collect(),
-            None => Vec::new(),
-        };
+        // (`solid_chunks` is made further down, with the frame's frusta in
+        // hand: it is the ground's chunks THIS FRAME DRAWS, not all of them.)
+        // Whether the ground came in chunks at all. NOT "are any drawn this
+        // frame": a frame that looks at the sky draws none, and must not fall
+        // back to the whole index range -- which holds every chunk, and with
+        // the coarser lists built the same ground several times over.
+        let ground_partitioned = terrain_range.is_some() && !terrain_chunks.is_empty();
         let solid_ranges = solid_ranges;
         // Empty when the scene has no brushes, or when every one of them has
         // been shot away -- both are ordinary, and both mean no draw rather
@@ -1538,6 +1535,58 @@ impl XrRenderer {
             sun_dynamic_enabled: dynamic_sun.is_some(),
         };
 
+        // THE GROUND'S CHUNKS THIS FRAME DRAWS (`ground_lod`): asked of the
+        // quadtree over them with every frustum that draws ground this frame
+        // -- each eye's, each spot's shadow, and the sun's when its map is
+        // drawn every frame -- in the WORLD, where the chunks' boxes stand
+        // still. One list for the reflection, scene, motion and shadow
+        // passes, so they draw the same ground at the same step; each still
+        // culls it by its own frustum. Their boxes are posed here, for the
+        // chunks chosen only. With `Levers::ground_lod` off (or no lists
+        // built) every chunk is at step 1, as it always was.
+        //
+        // Terrain indices were rebased into the shared solid buffer, so the
+        // chunk offsets move with them (`index_start`).
+        let ground_head = {
+            let n = eye_views.len().max(1) as f32;
+            let mid = eye_views.iter().fold(glam::Vec3::ZERO, |sum, v| sum + glam::Vec3::new(v.pose.position.x, v.pose.position.y, v.pose.position.z)) / n;
+            glam::Quat::from_rotation_y(self.player.yaw) * mid + self.player.offset
+        };
+        let ground_frame: Option<crate::renderer::ground_lod::FrameGround> = match (terrain_range, self.ground_lod.borrow_mut().as_mut()) {
+            (Some((index_start, _)), Some(lod)) if ground_partitioned && lod.units.len() == terrain_chunks.len() => {
+                let world_planes = |m: glam::Mat4| crate::renderer::shadow::frustum_planes(m * warp_world_to_player);
+                let frusta: Vec<[glam::Vec4; 6]> = eye_views
+                    .iter()
+                    .map(|v| world_planes(Camera::gl_to_wgpu_ndc(Camera::xr_projection(v.fov, 0.03, 1000.0)) * Camera::xr_view(v.pose)))
+                    .chain(spot_matrices.iter().map(|m| world_planes(m.pass)))
+                    .chain((shadow.sun_enabled && static_sun.is_none()).then(|| world_planes(shadow.sun_view_proj)))
+                    .collect();
+                lod.set_strict(self.levers.ground_lod_strict);
+                Some(lod.frame(ground_head, &frusta, self.levers.ground_lod, self.player.offset, self.player.yaw, index_start))
+            }
+            _ => None,
+        };
+        // Whether the tree chose them (else: every chunk the frame was handed).
+        let ground_selected = ground_frame.is_some();
+        // Per chunk drawn: its place in the slope split's tables (and the
+        // horizon's bounds), which were made over EVERY run of the buffer.
+        let (solid_chunks, ground_units, ground_boxes, ground_error): (Vec<crate::renderer::shadow::CasterChunk>, Vec<u32>, Vec<(glam::Vec3, glam::Vec3)>, f32) =
+            match (ground_frame, terrain_range) {
+                (Some(f), _) => (f.chunks, f.units, f.world, f.error_rad),
+                // No tree handed over: every chunk, as the app posed it.
+                (None, Some((index_start, _))) => (
+                    terrain_chunks.iter().map(|c| crate::renderer::shadow::CasterChunk { first_index: c.first_index + index_start, ..*c }).collect(),
+                    Vec::new(),
+                    Vec::new(),
+                    0.0,
+                ),
+                (None, None) => (Vec::new(), Vec::new(), Vec::new(), 0.0),
+            };
+        let unit_of = |k: usize| ground_units.get(k).map_or(k, |u| *u as usize);
+        // The ground at step 1 is the first of its indices; a pass that
+        // draws "the whole ground" draws those.
+        let ground_step1 = self.ground_lod.borrow().as_ref().map(|l| l.level0_len()).filter(|n| *n > 0);
+
         // No spot casts this frame: the scene draws with its spotless twins.
         // See `XrRenderer::spotless_frame`. Nor any lit surface's light: the
         // twins shade none apart (`lights::without_spot_shadows`).
@@ -1550,7 +1599,9 @@ impl XrRenderer {
         // A static sun map is recorded only when it went stale.
         let record_sun = shadow.sun_enabled && static_sun.is_none_or(|(_, stale)| stale);
         if record_sun || shadow.sun_dynamic_enabled || shadow.spot_count > 0 || !character_tiles.is_empty() {
-            let solid_caster = (solid_index_count > 0)
+            // (In chunks, and none of them in any frustum this frame: no
+            // ground to cast. An empty list would mean "draw it whole".)
+            let solid_caster = (solid_index_count > 0 && !(ground_partitioned && solid_chunks.is_empty()))
                 .then_some((&solid_vb, &solid_ib, solid_index_count));
             // The ground's chunks, where they are world vertices, are posed
             // by this matrix in every shadow pass below.
@@ -1621,10 +1672,29 @@ impl XrRenderer {
                 // holds cuboids, which can move. `record` draws only the
                 // terrain chunks when it is given any, so without them the
                 // buffer is left out rather than frozen into the map.
-                let solid_caster = if static_sun.is_some() && solid_chunks.is_empty() {
+                // A STATIC map outlives the frame and the head's place: its
+                // ground is every chunk the sun's box reaches, at step 1 --
+                // asked of the tree with the sun's frustum alone, whatever
+                // the eyes see and whatever `Levers::ground_lod` says.
+                let sun_chunks: Option<Vec<crate::renderer::shadow::CasterChunk>> = match (static_sun.is_some() && ground_selected, terrain_range, self.ground_lod.borrow_mut().as_mut()) {
+                    (true, Some((index_start, _)), Some(lod)) => Some(
+                        lod.frame(
+                            ground_head,
+                            &[crate::renderer::shadow::frustum_planes(shadow.sun_view_proj * warp_world_to_player)],
+                            false,
+                            self.player.offset,
+                            self.player.yaw,
+                            index_start,
+                        )
+                        .chunks,
+                    ),
+                    _ => None,
+                };
+                let sun_ground: &[crate::renderer::shadow::CasterChunk] = sun_chunks.as_deref().unwrap_or(&solid_chunks);
+                let solid_caster = if sun_ground.is_empty() && (static_sun.is_some() || ground_partitioned) {
                     None
                 } else {
-                    solid_caster
+                    (solid_index_count > 0).then_some((&solid_vb, &solid_ib, solid_index_count))
                 };
                 let no_meshes: [crate::renderer::shadow::ShadowMeshDraw; 0] = [];
                 let no_skinned: [crate::renderer::shadow::ShadowSkinnedDraw; 0] = [];
@@ -1645,7 +1715,7 @@ impl XrRenderer {
                     brush_caster,
                     mesh_casters,
                     skinned,
-                    &solid_chunks,
+                    sun_ground,
                     shadow.sun_view_proj,
                 );
                 if static_sun.is_some() {
@@ -1877,12 +1947,21 @@ impl XrRenderer {
         // And each body's runs (`Levers::water_runs`): by the second rule too
         // where a run lies clear of every cave's box, so is in no cave's air.
         let mut horizon_runs: Vec<Vec<bool>> = Vec::new();
-        let (horizon_hidden, horizon_water): (Vec<bool>, Vec<bool>) = match (&self.ground_occluder, terrain_range) {
-            (Some((ground, bounds)), Some((index_start, _)))
-                if self.levers.ground_horizon
-                    && bounds.len() == solid_chunks.len()
-                    && bounds.iter().zip(&solid_chunks).all(|((first, _), c)| first + index_start == c.first_index) =>
+        // Each drawn chunk's box in the WORLD: the frame's own choice's, or
+        // (no tree handed over) the bounds the horizon was set with, when
+        // they are these chunks'.
+        let horizon_boxes: Option<Vec<(glam::Vec3, glam::Vec3)>> = match (&self.ground_occluder, terrain_range) {
+            _ if !self.levers.ground_horizon => None,
+            (Some(_), Some(_)) if ground_selected => Some(ground_boxes.clone()),
+            (Some((_, bounds)), Some((index_start, _)))
+                if bounds.len() == solid_chunks.len() && bounds.iter().zip(&solid_chunks).all(|((first, _), c)| first + index_start == c.first_index) =>
             {
+                Some(bounds.iter().map(|(_, b)| *b).collect())
+            }
+            _ => None,
+        };
+        let (horizon_hidden, horizon_water): (Vec<bool>, Vec<bool>) = match (&self.ground_occluder, horizon_boxes) {
+            (Some((ground, _)), Some(boxes)) => {
                 let yaw = glam::Quat::from_rotation_y(self.player.yaw);
                 let to_world = |p: glam::Vec3| yaw * p + self.player.offset;
                 let eyes: Vec<glam::Vec3> = eye_views
@@ -1909,6 +1988,12 @@ impl XrRenderer {
                 } else {
                     Vec::new()
                 };
+                // WITH THE GROUND DRAWN COARSER (`Levers::ground_lod`) a ridge
+                // may stand a little under the step-1 ridge the horizon was
+                // built from: what is asked after is raised by as much as
+                // that could show (`ground_lod::lifted`; nothing, lever off).
+                let lift_eye = eyes.first().copied().unwrap_or(glam::Vec3::ZERO);
+                let lift = |lo: glam::Vec3, hi: glam::Vec3| crate::renderer::ground_lod::lifted(ground_error, lift_eye, lo, hi);
                 // (In a cell: the frame's draws hold the renderer by now.)
                 let mut held = self.ground_horizon.borrow_mut();
                 *held = crate::renderer::ground_horizon::for_eyes(held.take(), ground, &eyes, &caves);
@@ -1927,6 +2012,7 @@ impl XrRenderer {
                                             let in_a_caves_box = caves.iter().any(|(clo, chi)| {
                                                 lo.cmple(*chi + CLEAR).all() && hi.cmpge(*clo - CLEAR).all()
                                             });
+                                            let hi = lift(lo, hi);
                                             if in_a_caves_box { h.hides(ground, lo, hi) } else { h.hides_ground(ground, lo, hi) }
                                         })
                                         .collect()
@@ -1934,13 +2020,13 @@ impl XrRenderer {
                                 .collect();
                         }
                         (
-                            bounds.iter().map(|(_, (lo, hi))| h.hides_ground(ground, *lo, *hi)).collect(),
+                            boxes.iter().map(|(lo, hi)| h.hides_ground(ground, *lo, lift(*lo, *hi))).collect(),
                             // (As high as its far skirt is lifted: `water_runs::lifted`.)
                             self.water_bodies
                                 .iter()
                                 .map(|b| {
                                     let (lo, hi) = crate::renderer::water_runs::lifted(b.bounds, &eyes);
-                                    h.hides(ground, lo, hi)
+                                    h.hides(ground, lo, lift(lo, hi))
                                 })
                                 .collect(),
                         )
@@ -2189,7 +2275,13 @@ impl XrRenderer {
                                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                             }
                             pass.set_bind_group(1, self.cuboid_lightmap_bg(lightmap_key.as_deref()), &[]);
-                            pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
+                            // (The ground: its step-1 indices, the first of
+                            // its range -- not the coarser lists after them.)
+                            let count = match ground_step1 {
+                                Some(step1) if terrain_range == Some((*index_start, *count)) => step1.min(*count),
+                                _ => *count,
+                            };
+                            pass.draw_indexed(*index_start..*index_start + count, 0, 0..1);
                             if world.is_some() {
                                 pass.set_pipeline(&self.mirror_solid_pipeline.pipeline);
                                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
@@ -2975,7 +3067,7 @@ impl XrRenderer {
                                             if outdoors_drawn { class == GROUND_OUTDOORS } else { class == GROUND_FULL },
                                             if nowhere_drawn { class == GROUND_NOWHERE } else { class == GROUND_FULL },
                                         ];
-                                        let (mut r, n) = split.class_ranges(k, pick);
+                                        let (mut r, n) = split.class_ranges(unit_of(k), pick);
                                         r[..n].iter_mut().for_each(|run| run.0 += c.first_index);
                                         (r, n)
                                     }
@@ -2983,7 +3075,7 @@ impl XrRenderer {
                                     _ => none,
                                 }
                             };
-                            if solid_chunks.is_empty() {
+                            if !ground_partitioned {
                                 pass.draw_indexed(index_start..index_start + count, 0, 0..1);
                             } else {
                                 // The dry ground, then the weather's, each: the
@@ -3044,21 +3136,22 @@ impl XrRenderer {
                                             continue;
                                         }
                                         let mut bound = twin.is_none();
-                                        for (k, c) in ordered_chunks() {
-                                            if !terrain_chunk_visible(c) || weathered(c) != wet {
-                                                continue;
+                                        // (Runs that touch in the buffer as
+                                        // one draw: `ground_lod::merged`.)
+                                        let class_runs = crate::renderer::ground_lod::merged(
+                                            ordered_chunks()
+                                                .filter(|(_, c)| terrain_chunk_visible(c) && weathered(c) == wet && !only.is_some_and(|want| mirrors(c) != want))
+                                                .flat_map(|(k, c)| {
+                                                    let (r, n) = runs(k, c, class);
+                                                    r.into_iter().take(n)
+                                                }),
+                                        );
+                                        for (first, len) in class_runs {
+                                            if let (false, Some(twin)) = (bound, twin) {
+                                                pass.set_pipeline(&twin.pipeline);
+                                                bound = true;
                                             }
-                                            if only.is_some_and(|want| mirrors(c) != want) {
-                                                continue;
-                                            }
-                                            let (r, n) = runs(k, c, class);
-                                            for &(first, len) in &r[..n] {
-                                                if let (false, Some(twin)) = (bound, twin) {
-                                                    pass.set_pipeline(&twin.pipeline);
-                                                    bound = true;
-                                                }
-                                                pass.draw_indexed(first..first + len, 0, 0..1);
-                                            }
+                                            pass.draw_indexed(first..first + len, 0, 0..1);
                                         }
                                     }
                                 }
@@ -3330,16 +3423,16 @@ impl XrRenderer {
                             (Some(split), Some(_)) if terrain_in_probe_pass && self.slope_twins_on() => Some(&split.gentle),
                             _ => None,
                         };
-                        let gentle_of = |k: usize| gentle_split.and_then(|g| g.get(k).copied()).unwrap_or(0);
+                        let gentle_of = |k: usize| gentle_split.and_then(|g| g.get(unit_of(k)).copied()).unwrap_or(0);
                         // And its steep ones -- the last `steep_of` -- with the
                         // steep twin, when there is one.
                         let steep_split: Option<&[u32]> = match (&self.slope_split, &self.terrain_steep) {
                             (Some(split), Some(_)) if gentle_split.is_some() => Some(&split.steep),
                             _ => None,
                         };
-                        let steep_of = |k: usize| steep_split.and_then(|g| g.get(k).copied()).unwrap_or(0);
+                        let steep_of = |k: usize| steep_split.and_then(|g| g.get(unit_of(k)).copied()).unwrap_or(0);
                         let twin = self.terrain_twin();
-                        if solid_chunks.is_empty() {
+                        if !ground_partitioned {
                             pass.draw_indexed(index_start..index_start + count, 0, 0..1);
                         } else {
                             // How many of the nearest chunks are walked that way:
@@ -3398,12 +3491,15 @@ impl XrRenderer {
                                 // The chunks beyond: gentle, mixed, steep, each nearest
                                 // first -- or what stands up first, steep, mixed,
                                 // gentle (`Levers::ground_steep_first`).
+                                // (A reader's runs that touch in the buffer --
+                                // a block of chunks that are all its own --
+                                // as one draw: `ground_lod::merged`.)
                                 for which in crate::renderer::ground_twins::reader_order(self.levers.ground_steep_first) {
-                                    for (k, c) in &far {
+                                    let reader_runs = crate::renderer::ground_lod::merged(far.iter().map(|(k, c)| {
                                         let range = ranges(*k, c)[match which { 1 => 0, 0 => 1, _ => 2 }].1.clone();
-                                        if range.is_empty() {
-                                            continue;
-                                        }
+                                        (c.first_index + range.start, range.end - range.start)
+                                    }));
+                                    for (first, len) in reader_runs {
                                         if bound != which {
                                             pass.set_pipeline(match (which, gentle, steep) {
                                                 (1, Some(gentle), _) => &gentle[twin].pipeline,
@@ -3412,7 +3508,7 @@ impl XrRenderer {
                                             });
                                             bound = which;
                                         }
-                                        pass.draw_indexed(c.first_index + range.start..c.first_index + range.end, 0, 0..1);
+                                        pass.draw_indexed(first..first + len, 0, 0..1);
                                     }
                                 }
                             } else {
@@ -4020,7 +4116,7 @@ impl XrRenderer {
                         joints: None,
                     };
                     match terrain_range {
-                        Some((start, count)) if !solid_chunks.is_empty() => {
+                        Some((start, count)) if ground_partitioned => {
                             // The cuboids lie before the ground's indices, or
                             // after them (`Levers::ground_buffers`).
                             for (first, n) in [(0, start), (start + count, solid_index_count.saturating_sub(start + count))] {
@@ -4031,8 +4127,12 @@ impl XrRenderer {
                             // The ground's chunks from the world's slot
                             // where they are world vertices.
                             let slot = if self.ground_world { base + warp_per_eye - 1 } else { base };
-                            for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c)) {
-                                draws.push(MotionDraw { slot, ..solid(c.first_index, c.index_count) });
+                            // (Chunks that touch in the buffer as one draw.)
+                            let seen = crate::renderer::ground_lod::merged(
+                                solid_chunks.iter().filter(|c| terrain_chunk_visible(c)).map(|c| (c.first_index, c.index_count)),
+                            );
+                            for (first, count) in seen {
+                                draws.push(MotionDraw { slot, ..solid(first, count) });
                             }
                         }
                         _ => draws.push(solid(0, solid_index_count)),
