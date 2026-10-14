@@ -668,23 +668,24 @@ pub enum RenderModule {
         #[serde(default)]
         play: Play,
     },
-    /// A HEIGHT-FOG SLAB, not particles: one layer over a box that fills its
-    /// placed object's footprint (`shape_disc` -- `fills_object` for a level's
-    /// pond or hollow, its radius in the editor), from its origin up
-    /// `height` metres. Its density, per metre of sight, is `density` at the
-    /// bottom and falls by e every `falloff` metres up (a streak a little
-    /// taller than the layer), gone well before its top; it
+    /// A MIST LAYER HOVERING IN TUFTS, not particles: one layer over a box
+    /// that fills its placed object's footprint (`shape_disc` --
+    /// `fills_object` for a level's pond, its radius in the editor), standing
+    /// on its origin (the water's surface) and `height` metres up. Soft
+    /// cloud-like tufts -- a 3D billow noise some 0.5-2 m across, gathered in
+    /// clusters with clear water between -- in a band 3/8 of the height up,
+    /// `falloff` metres either side of its middle: clear just over the water,
+    /// soft bottom and top. `density` is per metre of sight inside a tuft. It
     /// lies in the ellipse the box's footprint holds (size the object to the
     /// water), thinning to nothing over `edge` metres in from its rim, and
-    /// ends where the scene's depth does (a bank, the shore), so it is soft
-    /// where it meets ground. Integrated along each pixel's line of sight,
-    /// so a grazing view sees it thicker, as a real layer is. Mostly an
-    /// even layer with many fine streaks along `wind` (m/s, world), drifting
-    /// with it; that motion is its SpaceWarp vectors. Its density is
-    /// also its object's `strength` and, while a time of day runs, the
-    /// hour's `effects::mist_conditions`. Lit as `light_cpu` (scatter) works
-    /// out: the room's or sky's even light, its lamps, and the sun by
-    /// `sunlit`.
+    /// ends where the scene's depth does (a bank, the shore). Summed along
+    /// each pixel's line of sight in ten stretches. Drifts with `wind` (m/s,
+    /// world), the tufts slowly changing shape as it goes; that drift is its
+    /// SpaceWarp vectors. Its density is also its object's `strength` and,
+    /// while a time of day runs, the hour's `effects::mist_conditions`. Lit
+    /// as `light_cpu` (scatter) works out -- the room's or sky's even light,
+    /// its lamps, and the sun by `sunlit` -- a tuft's top brighter than its
+    /// underside.
     SpriteFog {
         density: f32,
         height: f32,
