@@ -798,7 +798,14 @@ const CLIFF_LAYERS: &str = r#"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, 
     // and the cliff's two by theirs. Six entries at most, one for most pixels.
     let own_total = in.planes.x + in.planes.y + in.planes.z;
     let ours = select(vec3<f32>(0.0, 1.0, 0.0), in.planes.xyz / max(own_total, 0.0001), own_total > 0.0001) * (1.0 - cliff);
-    let theirs = in.cliff.xyz / max(cliff_total, 0.0001) * cliff;
+    // THE CLIFF'S SHARES AS THE TERRAIN NOW TAKES THEM (`terrain_pipeline`'s
+    // `sample_frame`, 2026-10-13): a plane's share is how far the surface
+    // faces it past the three-way tie, not its plain part of the normal. The
+    // vertices carry the plain parts; as a direction they are the normal the
+    // terrain chose its planes by (exactly, where the bake wrote all three;
+    // with the two strongest alone, to within the third's part).
+    let cliff_faces = max(in.cliff.xyz * inverseSqrt(max(dot(in.cliff.xyz, in.cliff.xyz), 0.00000001)) - vec3<f32>(0.57735), vec3<f32>(0.0));
+    let theirs = cliff_faces / max(cliff_faces.x + cliff_faces.y + cliff_faces.z, 0.0001) * cliff;
     var entries_left = select(0u, 1u, ours.x > WEIGHT_EPS) | select(0u, 2u, ours.y > WEIGHT_EPS) | select(0u, 4u, ours.z > WEIGHT_EPS)
         | select(0u, 8u, theirs.x > WEIGHT_EPS) | select(0u, 16u, theirs.y > WEIGHT_EPS) | select(0u, 32u, theirs.z > WEIGHT_EPS);
     let layers = select(0u, 1u, w.x > WEIGHT_EPS) | select(0u, 2u, w.y > WEIGHT_EPS)
@@ -828,8 +835,14 @@ const CLIFF_LAYERS: &str = r#"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, 
         var tone = cliff_macro;
         var second = 0.0;
         if (of_cliff) {
-            uv = uv + cliff_warp;
-            second = select(0.0, 0.3 + 0.3 * cliff_macro, axis == cliff_major);
+            // The side planes' alone, and the second scale a side plane's by
+            // how far it leads, as the terrain has them.
+            uv = uv + select(cliff_warp, vec2<f32>(0.0), axis == 1u);
+            second = select(
+                0.0,
+                (0.3 + 0.3 * cliff_macro) * clamp(4.0 * (share / max(theirs.x + theirs.y + theirs.z, 0.0001)) - 2.0, 0.0, 1.0),
+                axis == cliff_major && axis != 1u,
+            );
         } else {
             tone = textureSampleGrad(macro_tex, layer_samp, uv * mr, uv_dx * mr, uv_dy * mr).r;
         }
@@ -862,7 +875,7 @@ const CLIFF_LAYERS: &str = r#"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, 
                 if (axis != 1u) {
                     var t2 = textureSampleGrad(normal_tex, layer_samp, at2, layer, g2x, g2y).rgb * 2.0 - 1.0;
                     t2 = vec3<f32>(transpose(CLIFF_ROT) * (t2.xy * mat.normal_strength), t2.z);
-                    tn = vec3<f32>(mix(tn.xy, t2.xy, second) * 1.3, mix(tn.z, t2.z, second));
+                    tn = vec3<f32>(mix(tn.xy, t2.xy, second) * (1.0 + 0.667 * second), mix(tn.z, t2.z, second));
                 }
             }
             albedo = albedo + c * lw;
@@ -1924,7 +1937,9 @@ mod tests {
             "0.4 - 0.8 * ",
             "0.3 + 0.3 * ",
             "2.3",
-            "* 1.3, mix(tn.z, t2.z, ",
+            "* (1.0 + 0.667 * ",
+            " - 2.0, 0.0, 1.0)",
+            "0.57735",
         ] {
             assert!(cave.contains(both), "the cave's cliff reading lost `{both}`");
             assert!(ground.contains(both), "the terrain's cliff reading no longer has `{both}`: bring the cave's along");

@@ -11,12 +11,15 @@
 //! with that test made false (`ground_cuts` `gentle`): 18 registers, 62%,
 //! 2,719 instructions for the outdoor one (build of 2026-10-08 10:44).
 //!
-//! THE SAME PICTURE. A pixel's slope is that of its interpolated normal, and
-//! the normalised blend of a triangle's vertex normals with positive weights
-//! lies in the cone they span: no steeper than its steepest vertex. So a
-//! triangle whose every vertex is gentler than the threshold, by a margin for
-//! the centre of an MSAA edge pixel just outside it, draws no steep pixel, and
-//! the twin -- the reader with that test false -- draws it as the reader does.
+//! THE SAME PICTURE. A pixel is steep where its interpolated normal is, or
+//! where the triangle it is drawn on is (`terrain_pipeline`'s `sample_frame`:
+//! the interpolated normal reads level along a knife ridge's crest). The
+//! normalised blend of a triangle's vertex normals with positive weights lies
+//! in the cone they span: no steeper than its steepest vertex. So a triangle
+//! whose every vertex AND whose own plane is gentler than the threshold, by a
+//! margin for the centre of an MSAA edge pixel just outside it, draws no steep
+//! pixel, and the twin -- the reader with that test false -- draws it as the
+//! reader does.
 //!
 //! HOW. Each terrain chunk's triangles are reordered once, its gentle ones
 //! first ([`SlopeSplit`]); the chunk keeps its range, so every other pass and
@@ -28,12 +31,17 @@ use crate::renderer::shadow::CasterChunk;
 use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainPipeline, TerrainRole};
 use wgpu::{BindGroupLayout, Device, TextureFormat};
 
-/// The ground shader's two steep tests, as `terrain_shader`'s `sample_frame`
-/// writes them, and the twin's.
-pub(crate) const GENTLE_EDITS: &[(&str, &str)] = &[
-    ("    f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);\n", "    f.biplanar  = 0.0;\n"),
-    ("    let steep = slope_deg >= mat.biplanar_start_deg;\n", "    let steep = false;\n"),
-];
+/// The ground shader's steep test, as `terrain_shader`'s `sample_frame`
+/// writes it.
+pub(crate) const STEEP_TEST: &str = "    let steep = min(n.y, face.y) <= cos(radians(mat.biplanar_start_deg));\n";
+
+/// The steep test and the twin's.
+/// The top plane's fold where the frame says how (`fold_bumps`): on gentle
+/// ground always the fold it always had, written so, so that the gentle
+/// twins carry none of the steep frame's arithmetic.
+pub(crate) const FOLD_KEEP: &str = "        let g = mix(z, 1.0, keep);\n";
+pub(crate) const FOLD_KEPT: &str = "        let g = 1.0;\n";
+pub(crate) const GENTLE_EDITS: &[(&str, &str)] = &[(STEEP_TEST, "    let steep = false;\n"), (FOLD_KEEP, FOLD_KEPT)];
 
 /// Degrees under the threshold every vertex of a twin's triangle must be: room
 /// for the centre of an MSAA edge pixel, just outside the triangle, where its
@@ -46,27 +54,36 @@ pub fn gentle_shader(src: &str) -> Option<String> {
     crate::renderer::ground_cuts::with_cut(src, GENTLE_EDITS)
 }
 
-/// Whether a triangle with these vertex normals can draw no steep pixel under
-/// a `threshold_deg` slope (`TerrainMaterialUniform::biplanar_start_deg`).
-pub fn triangle_is_gentle(normals: [[f32; 3]; 3], threshold_deg: f32) -> bool {
+/// The height (the slope's cosine) of the plane a triangle with these corners
+/// lies in, whichever way it is wound; 1 for a triangle with no area, which
+/// draws no pixel.
+pub fn face_height(positions: [[f32; 3]; 3]) -> f32 {
+    use glam::Vec3;
+    let [a, b, c] = positions.map(Vec3::from);
+    (b - a).cross(c - a).try_normalize().map_or(1.0, |n| n.y.abs())
+}
+
+/// Whether a triangle with these vertex normals, lying in a plane of height
+/// `face_y` ([`face_height`]), can draw no steep pixel under a `threshold_deg`
+/// slope (`TerrainMaterialUniform::biplanar_start_deg`): a pixel is steep
+/// where its interpolated normal is or where its triangle is.
+pub fn triangle_is_gentle(normals: [[f32; 3]; 3], face_y: f32, threshold_deg: f32) -> bool {
     let limit = threshold_deg - GENTLE_MARGIN_DEG;
     if limit <= 0.0 {
         return false;
     }
     let cos_limit = limit.to_radians().cos();
-    normals.iter().all(|n| {
-        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        len > 0.0 && n[1] / len > cos_limit
-    })
+    face_y > cos_limit
+        && normals.iter().all(|n| {
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            len > 0.0 && n[1] / len > cos_limit
+        })
 }
 
 /// The ground shader's two steep tests made true: the twin for triangles
 /// every pixel of which is steep (`ground_cuts` `steep`: 24 registers, 50%,
 /// against the reader's 27, 37%).
-pub(crate) const STEEP_EDITS: &[(&str, &str)] = &[
-    ("    f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);\n", "    f.biplanar  = 1.0;\n"),
-    ("    let steep = slope_deg >= mat.biplanar_start_deg;\n", "    let steep = true;\n"),
-];
+pub(crate) const STEEP_EDITS: &[(&str, &str)] = &[(STEEP_TEST, "    let steep = true;\n")];
 
 /// `src` with only the steep ground's code, or `None` when its steep tests
 /// are not there once each.
@@ -74,7 +91,10 @@ pub fn steep_shader(src: &str) -> Option<String> {
     crate::renderer::ground_cuts::with_cut(src, STEEP_EDITS)
 }
 
-/// Whether a triangle with these vertex normals can draw no gentle pixel.
+/// Whether a triangle with these vertex normals, lying in a plane of height
+/// `face_y` ([`face_height`]), can draw no gentle pixel: its own plane is
+/// steep, which makes every pixel of it steep, or no blend of its normals is
+/// gentle.
 /// Not its gentlest vertex's slope: two steep normals leaning opposite ways
 /// blend to a level one. A pixel's normal is a blend of the vertices' with
 /// positive weights -- a point of the spherical triangle they span -- so the
@@ -89,11 +109,9 @@ pub fn steep_shader(src: &str) -> Option<String> {
 /// span a wide cap and a thin triangle. The exact bound moves 1.4% of
 /// test_room's ground from the reader for both kinds of pixel to the steep
 /// twin: 156,873 of its 386,040 indices (40.6%) against 39.2%.)
-pub fn triangle_is_steep(normals: [[f32; 3]; 3], threshold_deg: f32) -> bool {
-    steepest_bound_y(normals).is_some_and(|max_y| {
-        let limit = threshold_deg + GENTLE_MARGIN_DEG;
-        limit < 90.0 && max_y <= limit.to_radians().cos()
-    })
+pub fn triangle_is_steep(normals: [[f32; 3]; 3], face_y: f32, threshold_deg: f32) -> bool {
+    let limit = threshold_deg + GENTLE_MARGIN_DEG;
+    limit < 90.0 && (face_y <= limit.to_radians().cos() || steepest_bound_y(normals).is_some_and(|max_y| max_y <= limit.to_radians().cos()))
 }
 
 /// The greatest `y` (the cosine of the least slope) any normalised blend of
@@ -282,9 +300,10 @@ impl SlopeSplit {
             let mut buckets: [Vec<u32>; 9] = Default::default();
             for t in tris.chunks_exact(3) {
                 let n = [normal(t[0]), normal(t[1]), normal(t[2])];
-                let slope = if triangle_is_gentle(n, threshold_deg) {
+                let face_y = face_height([position(t[0]), position(t[1]), position(t[2])]);
+                let slope = if triangle_is_gentle(n, face_y, threshold_deg) {
                     0
-                } else if triangle_is_steep(n, threshold_deg) {
+                } else if triangle_is_steep(n, face_y, threshold_deg) {
                     2
                 } else {
                     1
@@ -641,11 +660,30 @@ mod tests {
     fn a_triangle_is_gentle_only_when_every_vertex_is_under_the_margin() {
         let flat = [0.0, 1.0, 0.0];
         let tilt = |deg: f32| [deg.to_radians().sin(), deg.to_radians().cos(), 0.0];
-        assert!(triangle_is_gentle([flat, flat, flat], 18.0));
-        assert!(triangle_is_gentle([flat, tilt(12.9), flat], 18.0));
-        assert!(!triangle_is_gentle([flat, tilt(13.1), flat], 18.0));
-        assert!(!triangle_is_gentle([flat, flat, [0.0, 0.0, 0.0]], 18.0));
-        assert!(!triangle_is_gentle([flat, flat, flat], 4.0));
+        assert!(triangle_is_gentle([flat, flat, flat], 1.0, 18.0));
+        assert!(triangle_is_gentle([flat, tilt(12.9), flat], 1.0, 18.0));
+        assert!(!triangle_is_gentle([flat, tilt(13.1), flat], 1.0, 18.0));
+        assert!(!triangle_is_gentle([flat, flat, [0.0, 0.0, 0.0]], 1.0, 18.0));
+        assert!(!triangle_is_gentle([flat, flat, flat], 1.0, 4.0));
+        // ITS OWN PLANE COUNTS: a knife ridge's crest carries level normals
+        // on faces that stand at seventy degrees.
+        assert!(triangle_is_gentle([flat, flat, flat], 12.9f32.to_radians().cos(), 18.0));
+        assert!(!triangle_is_gentle([flat, flat, flat], 13.1f32.to_radians().cos(), 18.0));
+        assert!(!triangle_is_gentle([flat, flat, flat], 70.0f32.to_radians().cos(), 18.0));
+    }
+
+    /// A triangle's plane from its corners, whichever way it is wound; a
+    /// triangle with no area is level (it draws nothing).
+    #[test]
+    fn a_triangles_own_height_is_its_planes() {
+        let level = [[0.0, 2.0, 0.0], [1.0, 2.0, 0.0], [0.0, 2.0, 1.0]];
+        assert!((face_height(level) - 1.0).abs() < 1e-6);
+        let wall = [[0.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 1.0]];
+        assert!(face_height(wall) < 1e-6);
+        let ramp = [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert!((face_height(ramp) - 45.0f32.to_radians().cos()).abs() < 1e-6);
+        assert!((face_height([ramp[0], ramp[2], ramp[1]]) - face_height(ramp)).abs() < 1e-6);
+        assert_eq!(face_height([[1.0; 3]; 3]), 1.0);
     }
 
     /// THE BOUND HOLDS AND IS TIGHT: over random triangles of normals, no
@@ -684,7 +722,7 @@ mod tests {
             }
             assert!(most_level <= max_y + 1e-4, "a blend is more level ({most_level}) than the bound ({max_y}): {n:?}");
             assert!(most_level.acos().to_degrees() - max_y.acos().to_degrees() < 1.5, "the bound is loose: {n:?}");
-            if triangle_is_steep(n, 18.0) {
+            if triangle_is_steep(n, 1.0, 18.0) {
                 steep += 1;
                 assert!(most_level.acos().to_degrees() >= 23.0 - 0.01);
                 // What the cap round the mean said of the same triangle.
@@ -700,9 +738,9 @@ mod tests {
         assert!(cap_missed > 50, "the cap's bound left out {cap_missed}");
         // A face 60 degrees steep turning 70 degrees in plan across a triangle.
         let turning = [dir(60.0, 0.0), dir(60.0, 35.0), dir(60.0, 70.0)];
-        assert!(triangle_is_steep(turning, 18.0));
+        assert!(triangle_is_steep(turning, 1.0, 18.0));
         // Straight up among the blends: never.
-        assert!(!triangle_is_steep([dir(40.0, 0.0), dir(40.0, 120.0), dir(40.0, 240.0)], 18.0));
+        assert!(!triangle_is_steep([dir(40.0, 0.0), dir(40.0, 120.0), dir(40.0, 240.0)], 1.0, 18.0));
         assert!(steepest_bound_y([dir(30.0, 0.0), dir(30.0, 100.0), dir(30.0, 200.0)]).is_none());
     }
 
@@ -723,12 +761,17 @@ mod tests {
             let (s, c) = (deg.to_radians().sin(), deg.to_radians().cos());
             [s * az.to_radians().cos(), c, s * az.to_radians().sin()]
         };
-        assert!(triangle_is_steep([tilt(60.0, 0.0), tilt(62.0, 5.0), tilt(58.0, -5.0)], 18.0));
+        assert!(triangle_is_steep([tilt(60.0, 0.0), tilt(62.0, 5.0), tilt(58.0, -5.0)], 1.0, 18.0));
         // Leaning opposite ways: their middle is level.
-        assert!(!triangle_is_steep([tilt(40.0, 0.0), tilt(40.0, 180.0), tilt(40.0, 0.0)], 18.0));
+        assert!(!triangle_is_steep([tilt(40.0, 0.0), tilt(40.0, 180.0), tilt(40.0, 0.0)], 1.0, 18.0));
         // Within the margin over the threshold: mixed.
-        assert!(!triangle_is_steep([tilt(22.0, 0.0), tilt(22.0, 0.0), tilt(22.0, 0.0)], 18.0));
-        assert!(triangle_is_steep([tilt(24.0, 0.0), tilt(24.0, 0.0), tilt(24.0, 0.0)], 18.0));
+        assert!(!triangle_is_steep([tilt(22.0, 0.0), tilt(22.0, 0.0), tilt(22.0, 0.0)], 1.0, 18.0));
+        assert!(triangle_is_steep([tilt(24.0, 0.0), tilt(24.0, 0.0), tilt(24.0, 0.0)], 1.0, 18.0));
+        // A steep plane makes every pixel steep, whatever its normals say:
+        // the faces under a ridge's level crest.
+        let level = [0.0, 1.0, 0.0];
+        assert!(triangle_is_steep([level, level, level], 24.0f32.to_radians().cos(), 18.0));
+        assert!(!triangle_is_steep([level, level, level], 22.0f32.to_radians().cos(), 18.0));
     }
 
     #[test]

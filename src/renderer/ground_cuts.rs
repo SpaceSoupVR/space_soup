@@ -25,16 +25,15 @@ pub(crate) const GROUND_CUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "gentle",
         &[
-            ("    f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);\n", "    f.biplanar  = 0.0;\n"),
-            ("    let steep = slope_deg >= mat.biplanar_start_deg;\n", "    let steep = false;\n"),
+            (crate::renderer::ground_twins::STEEP_TEST, "    let steep = false;\n"),
+            (crate::renderer::ground_twins::FOLD_KEEP, crate::renderer::ground_twins::FOLD_KEPT),
         ],
     ),
     // Only steep ground: the planar reads dead (`ground_twins`' other side).
     (
         "steep",
         &[
-            ("    f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);\n", "    f.biplanar  = 1.0;\n"),
-            ("    let steep = slope_deg >= mat.biplanar_start_deg;\n", "    let steep = true;\n"),
+            (crate::renderer::ground_twins::STEEP_TEST, "    let steep = true;\n"),
         ],
     ),
     // The brushes' repeated code written once (`brush_pipeline::DEDUP_EDITS`).
@@ -44,22 +43,25 @@ pub(crate) const GROUND_CUTS: &[(&str, &[(&str, &str)])] = &[
     // The cliff's uv warp altogether (the bands with it).
     (
         "warp",
-        &[("    f.minor_uv  = f.minor_uv + warp;\n    f.detail_uv = f.detail_uv + warp;\n", "")],
+        &[(
+            "    f.minor_uv  = f.minor_uv + select(warp, vec2<f32>(0.0), f.minor_axis == 1u);\n    f.detail_uv = f.detail_uv + select(warp, vec2<f32>(0.0), f.detail_axis == 1u);\n",
+            "",
+        )],
     ),
     // The colour's second scale on the face the cliff looks along.
     (
         "colour2",
         &[(
-            "    let c_major = mix(\n        c_face,\n",
-            "    let c_major = c_face;\n    let c_unused = mix(\n        vec3<f32>(0.0),\n",
+            "    if (f.second > 0.0) {\n        let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);\n        let s2 = 1.0 / (r * 2.3);\n        c = mix(\n",
+            "    if (false) {\n        let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);\n        let s2 = 1.0 / (r * 2.3);\n        c = mix(\n",
         )],
     ),
     // The normal's second scale on a cliff.
-    ("normal2", &[("        tn = vec3<f32>(mix(tn.xy, t2.xy, k) * 1.3, mix(tn.z, t2.z, k));\n", "")]),
+    ("normal2", &[("        tn = vec3<f32>(mix(tn.xy, t2.xy, f.second) * (1.0 + 0.667 * f.second), mix(tn.z, t2.z, f.second));\n", "")]),
     // The minor plane's normal blended in near a 45-degree turn.
-    ("minor_normal", &[("        if (w_major < 0.999 && f.biplanar > 0.5) {", "        if (false) {")]),
+    ("minor_normal", &[("    if (f.blend < PLANE_ALONE) {\n        let pm = textureSampleGrad(", "    if (false) {\n        let pm = textureSampleGrad(")]),
     // A side plane's normal at all: the top plane's everywhere.
-    ("side_normal", &[("    if (f.detail_axis != 1u) {", "    if (false) {")]),
+    ("side_normal", &[("    if (f.detail_axis == 1u && f.blend >= PLANE_ALONE) {", "    if (true) {")]),
     // The ground under still water, soaked (the dry shaders only: the
     // weather's twins read it from the map).
     ("wet", &[(crate::renderer::terrain_pipeline::SEA_LINE_WGSL, "")]),
@@ -71,16 +73,16 @@ pub(crate) const GROUND_CUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "gentle_snowless",
         &[
-            ("    f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);\n", "    f.biplanar  = 0.0;\n"),
-            ("    let steep = slope_deg >= mat.biplanar_start_deg;\n", "    let steep = false;\n"),
+            (crate::renderer::ground_twins::STEEP_TEST, "    let steep = false;\n"),
+            (crate::renderer::ground_twins::FOLD_KEEP, crate::renderer::ground_twins::FOLD_KEPT),
             ("const WX_SNOW: bool = true;", "const WX_SNOW: bool = false;"),
         ],
     ),
     (
         "gentle_waterless",
         &[
-            ("    f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);\n", "    f.biplanar  = 0.0;\n"),
-            ("    let steep = slope_deg >= mat.biplanar_start_deg;\n", "    let steep = false;\n"),
+            (crate::renderer::ground_twins::STEEP_TEST, "    let steep = false;\n"),
+            (crate::renderer::ground_twins::FOLD_KEEP, crate::renderer::ground_twins::FOLD_KEPT),
             ("const WX_WATER: bool = true;", "const WX_WATER: bool = false;"),
         ],
     ),
