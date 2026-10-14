@@ -719,6 +719,15 @@ pub struct XrRenderer {
     /// SPLASHES the client saw, born on the water's clock (`set_water_time`),
     /// kept while their drops fly or their rings spread. See `add_splash`.
     splashes: Vec<crate::renderer::effects::Splash>,
+    /// The effects a level can raise (`game/effects`, compiled at load) and
+    /// the event bursts of them in play: a shot's flash and smoke. See
+    /// `add_burst`, `effects::stack`.
+    effect_library: crate::renderer::effects::stack::EffectLibrary,
+    bursts: crate::renderer::effects::stack::BurstSet,
+    /// What the last frame's bursts drew, and the exposure it was drawn at
+    /// (what a flash's light is judged visible by, `burst_lights`).
+    burst_count: crate::renderer::effects::stack::BurstCount,
+    last_exposure: f32,
     effects_layout: wgpu::BindGroupLayout,
     effects_pipeline: crate::renderer::effects::EffectsPipeline,
     /// Their textures and buffers, made when a level first has an effect.
@@ -1871,6 +1880,10 @@ impl XrRenderer {
             effect_emitters: Vec::new(),
             effect_seen_until: Vec::new(),
             splashes: Vec::new(),
+            effect_library: Default::default(),
+            bursts: Default::default(),
+            burst_count: Default::default(),
+            last_exposure: 1.0,
             effects_layout,
             effects_pipeline,
             effects_gpu: None,
@@ -3044,6 +3057,12 @@ impl XrRenderer {
         self.lights_uniform.set_lit_surfaces(surfaces);
     }
 
+    /// The live lamps' pools as the eye's meter takes them, in the WORLD. See
+    /// `lights::LightsUniform::set_pool_light`.
+    pub fn set_pool_light(&self, samples: &[(glam::Vec3, f32, f32)]) {
+        self.lights_uniform.set_pool_light(samples);
+    }
+
     pub fn set_capsules(&mut self, groups: &[crate::renderer::uniforms::CapsuleGroup]) {
         self.player.capsules = crate::renderer::uniforms::CapsuleUpload::from_groups(groups);
         // Every body's, for the hands that shield an eye from a lamp. See
@@ -3295,6 +3314,44 @@ impl XrRenderer {
     /// looks for what stands between a splash and it.
     pub fn sun_toward(&self) -> Option<glam::Vec3> {
         self.sky.sun.as_ref().map(|s| glam::Vec3::from(s.direction).normalize_or_zero())
+    }
+
+    /// THE EFFECTS THIS LEVEL CAN RAISE: `game/effects`, checked and compiled
+    /// (`effects::stack::EffectLibrary::from_dir`). Their textures are made
+    /// here if no placed effect made them, so the first shot draws at once.
+    pub fn set_effect_library(&mut self, library: crate::renderer::effects::stack::EffectLibrary) {
+        if !library.is_empty() && self.effects_gpu.is_none() {
+            self.effects_gpu = Some(crate::renderer::effects::EffectsGpu::new(&self.wgpu_device, &self.wgpu_queue, &self.effects_layout));
+        }
+        log::info!("EFFECTS library: {}", library.names().collect::<Vec<_>>().join(", "));
+        self.effect_library = library;
+        self.bursts.live.clear();
+    }
+
+    /// An effect of the library by name: resolved once, not a frame.
+    pub fn effect_id(&self, name: &str) -> Option<crate::renderer::effects::stack::EffectId> {
+        self.effect_library.id(name)
+    }
+
+    /// AN EVENT RAISES AN EFFECT: a shot. Drawn from the next frame, whose
+    /// clock it is born on (less its `age`). One source is held to its
+    /// asset's `max_live` (`effects::stack::BurstSet::add`).
+    pub fn add_burst(&mut self, burst: crate::renderer::effects::stack::EffectBurst) {
+        self.bursts.add(&self.effect_library, burst);
+    }
+
+    /// The lights this frame's bursts raise -- a flash's pulse -- in the
+    /// player's frame, for the frame's light list: asked for as the fires'
+    /// lights are, before the frame is drawn. Gated by the last frame's
+    /// exposure: a shot in daylight raises none.
+    pub fn burst_lights(&mut self, offset: glam::Vec3, yaw_inv: glam::Quat) -> Vec<crate::renderer::Light> {
+        self.bursts.lights(&self.effect_library, self.last_exposure, offset, yaw_inv)
+    }
+
+    /// What the bursts came to last frame: live, seen, culled, thinned,
+    /// lights raised and gated; and the particles drawn and shed.
+    pub fn burst_stats(&self) -> (crate::renderer::effects::stack::BurstStats, crate::renderer::effects::stack::BurstCount) {
+        (self.bursts.stats, self.burst_count)
     }
 
     /// SOMETHING STRUCK THE WATER: its drops and spray fly with the effects,
