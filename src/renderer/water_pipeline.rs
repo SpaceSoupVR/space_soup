@@ -525,6 +525,23 @@ pub(crate) const WATER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("refract", &[("    if (has_map) {\n        let closing", "    if (false) {\n        let closing")]),
     // The reflection: the ground's trace and the probes.
     ("env", &[("    let env = outdoor_radiance(", "    let env = vec3<f32>(0.0);\n    let env_unused = outdoor_radiance(")]),
+    // What it mirrors alone, at full weight, and nothing through it: the
+    // reflection's source as the water reads it (the pond's olive mound,
+    // 2026-10-14). And the Fresnel weight alone, as grey.
+    (
+        "env_only",
+        &[
+            ("    let shade = (env * fresnel + glint + (body + brighter) * (1.0 - fresnel)) * edge;", "    let shade = env;"),
+            ("    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge);", "    let under = vec3<f32>(0.0);"),
+        ],
+    ),
+    (
+        "fresnel_only",
+        &[
+            ("    let shade = (env * fresnel + glint + (body + brighter) * (1.0 - fresnel)) * edge;", "    let shade = vec3<f32>(fresnel);"),
+            ("    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge);", "    let under = vec3<f32>(0.0);"),
+        ],
+    ),
     // The sun's glint (its lights loop's GGX).
     ("glint", &[("        glint = glint + radiance * WATER_PI * water_ggx(n, v, to_l, a2);\n", "")]),
 ];
