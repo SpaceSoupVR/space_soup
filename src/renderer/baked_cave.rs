@@ -1123,6 +1123,48 @@ pub struct BakedCavePipelines {
     pub model_layout: BindGroupLayout,
 }
 
+/// What the cave's scene shader answers with.
+const CAVE_ANSWER: &str = "    return vec4<f32>(tonemap(colour), 1.0);\n";
+
+/// DIAGNOSTIC PICTURES of the baked cave (`CAVE_DEBUG=<name>` in the offline
+/// frame), as the ground's `GROUND_DEBUG_VIEWS`: one quantity as a colour.
+/// - `sky`, `sun`: the sky and the baked sun the pixel is lit with (after the
+///   ground's share); `vsky`, `lmsky`: the vertices' and the lightmap's sky.
+/// - `ground`: the ground's share (red), its sky (green), its sun (blue).
+/// - `albedo`, `normal` (shaded, world), `facing` (green front, red back).
+/// - `tide`, `soot`: the tide band and the soot, as painted.
+pub const CAVE_DEBUG_VIEWS: &[(&str, &str)] = &[
+    ("sky", "vec3<f32>(sky)"),
+    ("sun", "vec3<f32>(sun)"),
+    ("vsky", "vec3<f32>(vertex_sky)"),
+    ("lmsky", "vec3<f32>(baked.a)"),
+    ("ground", "vec3<f32>(ground, ground_map.r, ground_sun)"),
+    ("albedo", "albedo"),
+    ("normal", "to_world_direction(shaded_n) * 0.5 + 0.5"),
+    ("facing", "select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), front)"),
+    ("tide", "vec3<f32>(clamp(in.aux.z, 0.0, 1.0))"),
+    ("soot", "vec3<f32>(clamp(in.aux.w, 0.0, 1.0))"),
+];
+
+/// `src` (a baked cave scene shader) answering with one of
+/// [`CAVE_DEBUG_VIEWS`], or `edit:<from>=><to>[;;...]` (exact text edits, as
+/// the ground's): `None` for a name that is not one or an edit that does not
+/// match once.
+pub fn cave_debug_shader(src: &str, view: &str) -> Option<String> {
+    if let Some(edits) = view.strip_prefix("edit:") {
+        let edits: Vec<(&str, &str)> = edits.split(";;").map(|e| e.split_once("=>")).collect::<Option<_>>()?;
+        return super::ground_cuts::with_cut(src, &edits);
+    }
+    let (_, colour) = CAVE_DEBUG_VIEWS.iter().find(|(name, _)| *name == view)?;
+    (src.matches(CAVE_ANSWER).count() == 1).then(|| {
+        src.replacen(
+            CAVE_ANSWER,
+            &format!("    return vec4<f32>(clamp({colour}, vec3<f32>(0.0), vec3<f32>(1.0)) + 0.0 * colour, 1.0);\n"),
+            1,
+        )
+    })
+}
+
 impl BakedCavePipelines {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1134,6 +1176,30 @@ impl BakedCavePipelines {
         samples: u32,
         stereo: bool,
     ) -> Self {
+        Self::new_debug(device, format, uniform_layout, material_layout, lightmap_layout, samples, stereo, None)
+    }
+
+    /// As [`Self::new`], every twin answering with [`cave_debug_shader`]'s
+    /// `debug` picture (the offline frame's `CAVE_DEBUG`). Panics on a name
+    /// that is not one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_debug(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        material_layout: &BindGroupLayout,
+        lightmap_layout: &BindGroupLayout,
+        samples: u32,
+        stereo: bool,
+        debug: Option<&str>,
+    ) -> Self {
+        let shader_text = |which: CaveShader| {
+            let src = baked_cave_shader(which);
+            match debug {
+                Some(view) => cave_debug_shader(&src, view).unwrap_or_else(|| panic!("CAVE_DEBUG={view}: not one of the cave's pictures")),
+                None => src,
+            }
+        };
         // As `layered_mesh_model_bgl`: identical to the mesh pipeline's model
         // layout, flags included, so a model's bind group fits.
         let model_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -1153,7 +1219,7 @@ impl BakedCavePipelines {
         let build = |which: CaveShader, front_face: FrontFace, samples: u32, view: ViewMode, label: &str| {
             let shader = device.create_shader_module(ShaderModuleDescriptor {
                 label: Some(label),
-                source: ShaderSource::Wgsl(view.shader(baked_cave_shader(which)).into()),
+                source: ShaderSource::Wgsl(view.shader(shader_text(which)).into()),
             });
             device.create_render_pipeline(&RenderPipelineDescriptor {
                 label: Some(label),
@@ -1562,6 +1628,26 @@ mod tests {
         let occ = occluder_shader();
         let module = naga::front::wgsl::parse_str(&occ).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&occ)));
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap();
+    }
+
+    /// Every `CAVE_DEBUG` picture builds on every twin (the offline frame
+    /// panics on one that does not), and a name that is not one is refused.
+    #[test]
+    fn every_cave_debug_picture_validates_on_every_twin() {
+        for planes in CavePlanes::ALL {
+            for emissive in [false, true] {
+                let src = baked_cave_shader(CaveShader { emissive, spotless: false, planes });
+                for (name, _) in CAVE_DEBUG_VIEWS {
+                    let what = format!("CAVE_DEBUG={name} ({planes:?}, emissive {emissive})");
+                    let debug = ViewMode::Mono.shader(cave_debug_shader(&src, name).unwrap_or_else(|| panic!("{what}: no answer line")));
+                    let module = naga::front::wgsl::parse_str(&debug).unwrap_or_else(|e| panic!("{what}: {}", e.emit_to_string(&debug)));
+                    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                        .validate(&module)
+                        .unwrap_or_else(|e| panic!("{what} does not validate: {e:?}"));
+                }
+                assert!(cave_debug_shader(&src, "no_such_picture").is_none());
+            }
+        }
     }
 
     #[test]

@@ -202,15 +202,21 @@ pub struct WaterUniform {
     /// Per mip level of the wave textures, the slope variance each cascade's
     /// level averages away. See `WaveParams::lost_slope_variance`.
     pub lost: [[f32; 4]; MIPS as usize],
-    /// Splashes' rings, as `effects::SplashRings` has them: world x, z, the
-    /// radius the ring has reached, its waves' height (0: none, and none
-    /// after it). See `RINGS`.
+    /// Splashes' ring trains, as `effects::SplashRings` has them: world x,
+    /// z, seconds since the train left, its size (0: none, and none after
+    /// it). See `RINGS`.
     pub rings: [[f32; 4]; RINGS],
-    /// Each ring's waves: wavenumber, 1 / (2 width^2), the crests' phase, and
-    /// the dimple's slope a metre out.
+    /// Each train's gravity / 4, its spectrum's width with its damping, the
+    /// radius inside which it is not drawn, and the dimple's (or the boil's)
+    /// slope a metre out.
     pub ring_waves: [[f32; 4]; RINGS],
-    /// Each one's foam: its whiteness, and 1 / reach^2.
+    /// Each one's foam: its whiteness, 1 / reach^2, its arcs, and over how
+    /// long its drops land.
     pub ring_pools: [[f32; 4]; RINGS],
+    /// Each one's drops falling back: the radius they land round, 1 / the
+    /// band's half-width^2, seconds since the first landed, the share of
+    /// cells a drop lands in.
+    pub ring_drops: [[f32; 4]; RINGS],
     /// x: how far the ripples fall in the lulls between gusts (1: no lulls;
     /// see `paws_calm`); y: the swell, metres; zw: the wind's way, x and z.
     pub air: [f32; 4],
@@ -248,6 +254,7 @@ impl WaterUniform {
             rings: [[0.0; 4]; RINGS],
             ring_waves: [[0.0; 4]; RINGS],
             ring_pools: [[0.0; 4]; RINGS],
+            ring_drops: [[0.0; 4]; RINGS],
             air: [paws_calm(waves.wind_speed), o.swell.max(0.0), waves.wind_dir.cos(), waves.wind_dir.sin()],
         }
     }
@@ -257,6 +264,7 @@ impl WaterUniform {
         self.rings = r.rings;
         self.ring_waves = r.waves;
         self.ring_pools = r.pools;
+        self.ring_drops = r.drops;
     }
 
     /// The shore's waves' time, wrapped to the wave field's loop so they
@@ -270,6 +278,8 @@ pub struct WaterPipeline {
     pub pipeline: RenderPipeline,
     /// The same without the splashes' rings: see `RING_BLOCK`.
     pub ringless: RenderPipeline,
+    /// The same with the drops falling back round a splash: see `DROPS_BLOCK`.
+    pub raining: RenderPipeline,
     /// THE WATERLINE TWIN, drawn only while an eye straddles the surface:
     /// the same surface and shading, leaving out every pixel whose view
     /// starts under the water -- the underwater view's, split from this one
@@ -391,6 +401,7 @@ impl WaterPipeline {
         };
 
         let pipeline = build_water(device, &layout, format, blend, samples, view, water_wgsl_with(dual_source, true), "water_pipeline");
+        let raining = build_water(device, &layout, format, blend, samples, view, water_wgsl_raining(dual_source), "water_pipeline_raining");
         let ringless = build_water(device, &layout, format, blend, samples, view, water_wgsl_with(dual_source, false), "water_pipeline_ringless");
         let waterline = build_water(device, &layout, format, blend, samples, view, water_line_wgsl(dual_source), "water_pipeline_waterline");
         let inputs = (layout, format, blend, samples, view);
@@ -401,7 +412,20 @@ impl WaterPipeline {
             }
         }
 
-        Self { pipeline, ringless, waterline, material_layout, sampler, dual_source, inputs }
+        Self { pipeline, raining, ringless, waterline, material_layout, sampler, dual_source, inputs }
+    }
+
+    /// THE TWIN TO DRAW for these splashes (`WaterUniform::set_rings`):
+    /// ringless while no ring is spreading, raining while any splash's drops
+    /// are landing, ringed otherwise.
+    pub fn for_rings(&self, rings: &[f32; 4], drops: &[[f32; 4]; RINGS]) -> &RenderPipeline {
+        if drops.iter().any(|d| d[3] > 0.0) {
+            &self.raining
+        } else if rings[3] > 0.0 {
+            &self.pipeline
+        } else {
+            &self.ringless
+        }
     }
 
     /// MEASUREMENT: the ringless water with one of [`WATER_CUTS`], to draw in
@@ -734,6 +758,7 @@ struct WaterMat {{
     rings: array<vec4<f32>, {rings}>,
     ring_waves: array<vec4<f32>, {rings}>,
     ring_pools: array<vec4<f32>, {rings}>,
+    ring_drops: array<vec4<f32>, {rings}>,
     air: vec4<f32>,
 }}
 
@@ -881,7 +906,8 @@ fn {name}(pos: vec3<f32>, depth: f32, eye: vec3<f32>, t: f32) -> vec3<f32> {{
 /// splash's rings are spreading -- nearly always -- the water does not pay
 /// for code it skips, which on the headset cost about a millisecond at the
 /// shore (bench 2026-10-07_2155).
-const RING_BLOCK: &str = r#"    if (water.rings[0].w > 0.0) {
+const RING_BLOCK: &str = r#"    var ring_curve = vec3<f32>(0.0);
+    if (water.rings[0].w > 0.0) {
         for (var i = 0; i < RINGS_N; i = i + 1) {
             let r = water.rings[i];
             if (r.w <= 0.0) {
@@ -890,26 +916,65 @@ const RING_BLOCK: &str = r#"    if (water.rings[0].w > 0.0) {
             let wv = water.ring_waves[i];
             let pool = water.ring_pools[i];
             let d = q - r.xy;
-            let dist = length(d);
-            // Where the ring of waves has reached, and this pixel in it.
-            let x = dist - r.z;
-            let resolved = 1.0 - smoothstep(0.25, 0.5, span * wv.x * (0.5 / WATER_PI));
-            let train = exp(-x * x * wv.y);
-            let wave = sin(wv.x * x + wv.z);
-            let rise = r.w * resolved * train * -wv.x * wave;
-            // Where it struck: the cavity's dimple while it is open, and the
-            // foam it leaves.
-            let bowl = exp(-dist * dist * pool.y);
-            tilt = tilt + d / max(dist, 1e-4) * rise + d * (wv.w * bowl);
+            let dist = max(length(d), 1e-4);
+            let outward = d / dist;
+            // THE RING TRAIN (`effects::splash_rings`): here and now, the
+            // waves whose group speed brought them here -- k = g t^2 / 4 r^2,
+            // crests at phase g t^2 / 4 r -- as high as the disturbance's
+            // spectrum made them (k^3 exp(-k c) / r, damped as short waves
+            // are, 2 nu k^2 t): long waves lead, short ones follow, the crests run
+            // out through the train. Measured from the cavity's rim, where
+            // the disturbance is (`wv.z`, its radius): inside it are the
+            // dimple and the boil.
+            let from_rim = max(dist - wv.z, 1e-4);
+            let ph = wv.x * r.z * r.z / from_rim;
+            let k = ph / from_rim;
+            let resolved = 1.0 - smoothstep(0.25, 0.5, span * k * (0.5 / WATER_PI));
+            let steep = r.w * k * k * k * k * exp(-k * (wv.y + k * r.z * RING_FILM_DAMPING)) * smoothstep(0.0, wv.z, from_rim) / dist;
+            let s = sin(ph);
+            tilt = tilt - outward * (steep * resolved * s);
+            // Its crests gather the sun on the bed under them, its troughs
+            // spread it: caustic rings, in clear water the rings' clearest
+            // sign.
+            ring_curve = ring_curve - (k * steep * resolved * cos(ph)) * vec3<f32>(outward.x * outward.x, outward.y * outward.y, outward.x * outward.y);
             // Too fine for the pixel, its slopes roughen the water instead:
             // far off, a ring is a band of duller or sparklier water.
-            ring_rough = ring_rough + 0.5 * (r.w * wv.x) * (r.w * wv.x) * train * (1.0 - resolved);
-            // Its foam, drawn out into arcs along the waves leaving through
-            // it as it dissolves (`pool.z`): three to a wave (sin 3a from
-            // sin a), running out with them.
-            ring_foam = ring_foam + pool.x * bowl * (1.0 + pool.z * (wave * (3.0 - 4.0 * wave * wave) - 1.0));
-        }
+            ring_rough = ring_rough + 0.5 * steep * steep * (1.0 - resolved);
+            // Where it struck: the cavity's dimple while it is open, the boil
+            // after, and the foam it leaves, drawn out into arcs along the
+            // waves leaving through it as it dissolves (`pool.z`).
+            let bowl = exp(-dist * dist * pool.y);
+            tilt = tilt + d * (wv.w * bowl);
+            ring_foam = ring_foam + pool.x * bowl * (1.0 + pool.z * (s * (3.0 - 4.0 * s * s) - 1.0));
+DROPS_FALLING_BACK        }
     }
+"#;
+
+/// THE DROPS FALLING BACK round a splash, each with its own small ring
+/// (`effects::SplashRings::drops`): drawn only by the RAINING twin, while a
+/// splash's drops are landing -- a second or so of each -- since its code
+/// (about 75 by the proxy) would take the ringed twin past the instruction
+/// cache for the whole of every ring's life (`ring_size_tests`).
+const DROPS_BLOCK: &str = r#"            // THE DROPS FALLING BACK round it, each making its own small ring
+            // where it lands: one drop at most a cell (`effects::DROP_CELLS`, so many a metre),
+            // at a place and a moment of its own in the band and the while
+            // they land over.
+            let dr = water.ring_drops[i];
+            if (dr.w > 0.0) {
+                let cells = floor(dr.w);
+                let cell = floor(q * cells);
+                let h = fract(sin(dot(cell, vec2<f32>(12.9898, 78.233)) + f32(i) * 1.7) * vec3<f32>(43758.547, 28001.83, 50849.41));
+                let pd = q - (cell + 0.3 + 0.4 * h.xy) / cells;
+                let pr = max(length(pd), 1e-4);
+                let since = dr.z - h.z * pool.w;
+                let band = dist - dr.x;
+                let x = pr - DROP_RING_SPEED * since;
+                let lands = select(0.0, 1.0, since > 0.0 && since < DROP_RING_SECONDS && fract(h.x + h.y * 7.13) < fract(dr.w));
+                let pock = lands * exp(-band * band * dr.y - max(since, 0.0) * DROP_RING_FADE * cells - x * x * DROP_RING_WIDTH);
+                let sharp = 1.0 - smoothstep(0.25, 0.5, span * DROP_RING_K * (0.5 / WATER_PI));
+                tilt = tilt + pd * (DROP_RING_SLOPE * pock * sharp * sin(DROP_RING_K * x) / pr);
+                ring_rough = ring_rough + 0.5 * DROP_RING_SLOPE * DROP_RING_SLOPE * pock * (1.0 - sharp);
+            }
 "#;
 
 /// A SPLASH'S FOAM over the water (the ringed twin only): not the lace a
@@ -926,6 +991,21 @@ const RING_BLOCK: &str = r#"    if (water.rings[0].w > 0.0) {
 const RING_COVER: &str = r#"    let ring_grain = textureSampleBias(foam_tex, wave_samp, q * RING_FOAM_TILES, 1.7).r;
     cover = max(cover, clamp(min(ring_foam, 1.2) * (0.75 + RING_FOAM_CONTRAST * (ring_grain - RING_FOAM_MEAN)) - 0.2, 0.0, 1.0));
 "#;
+
+/// ONE DROP'S RING, falling back from a splash (`RING_BLOCK`): a drop a few
+/// millimetres across leaves capillary ripples about 1.5 cm long, running
+/// out at about 0.3 m/s and gone in a few tenths of a second -- sooner where
+/// its cell is small (the fade is a rate per cell a metre), so it never
+/// reaches its cell's edge; how steep they start -- a drop's crater and the
+/// first ripple round it are steep (0.25 was not seen on the pond from
+/// 1.2 m offline, 0.6 and 1.5 barely; 3.0 drew them plainly, small rings
+/// catching the light: `docs/splash-realism-2026-10-14/drop_rings_close_*`) -- and the train's
+/// width (`1 / 2 sigma^2`, sigma 8 mm).
+const DROP_RING_SPEED: f32 = 0.3;
+const DROP_RING_FADE: f32 = 1.4;
+const DROP_RING_WIDTH: f32 = 7800.0;
+const DROP_RING_K: f32 = 420.0;
+const DROP_RING_SLOPE: f32 = 3.0;
 
 /// How many times a metre the foam texture repeats under a splash's foam.
 const RING_FOAM_TILES: f32 = 1.9;
@@ -992,8 +1072,30 @@ fn water_line_under(player: vec3<f32>) -> bool {
         .replacen("    return FsOut(", "    if (water_line_under(in.world_pos)) {\n        discard;\n    }\n    return FsOut(", 1)
 }
 
+/// The water's shader with the drops falling back as well (`DROPS_BLOCK`).
+fn water_wgsl_raining(dual: bool) -> String {
+    water_wgsl_parts(dual, true, true)
+}
+
 fn water_wgsl_with(dual: bool, rings: bool) -> String {
-    let ring_block = if rings { RING_BLOCK.replace("RINGS_N", &RINGS.to_string()) } else { String::new() };
+    water_wgsl_parts(dual, rings, false)
+}
+
+fn water_wgsl_parts(dual: bool, rings: bool, drops: bool) -> String {
+    let ring_block = if rings {
+        RING_BLOCK
+            .replace("DROPS_FALLING_BACK", if drops { DROPS_BLOCK } else { "" })
+            .replace("RINGS_N", &RINGS.to_string())
+            .replace("RING_FILM_DAMPING", &format!("{:?}", 2.0 * crate::renderer::effects::RING_FILM_VISCOSITY))
+            .replace("DROP_RING_SECONDS", &format!("{:?}", crate::renderer::effects::DROP_RING_SECONDS))
+            .replace("DROP_RING_SPEED", &format!("{DROP_RING_SPEED:?}"))
+            .replace("DROP_RING_FADE", &format!("{DROP_RING_FADE:?}"))
+            .replace("DROP_RING_WIDTH", &format!("{DROP_RING_WIDTH:?}"))
+            .replace("DROP_RING_K", &format!("{DROP_RING_K:?}"))
+            .replace("DROP_RING_SLOPE", &format!("{DROP_RING_SLOPE:?}"))
+    } else {
+        String::new()
+    };
     let ring_cover = if rings {
         RING_COVER
             .replace("RING_FOAM_TILES", &format!("{RING_FOAM_TILES:?}"))
@@ -1339,7 +1441,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     // cascade fades as a pixel spans its cells.
     let fine = 0.5 * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N * 0.25 / water.tiles.z));
     let mid = max(shoal, 0.6) * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N / water.tiles.y));
-    let curve = c0.xyz * (0.5 * shoal) + c1.xyz * mid + c2.xyz * fine;
+    let curve = c0.xyz * (0.5 * shoal) + c1.xyz * mid + c2.xyz * fine{ring_curve};
     let focus = thickness * (1.0 - 1.0 / IOR_WATER);
     let jx = 1.0 - focus * curve.x;
     let jz = 1.0 - focus * curve.y;
@@ -1422,6 +1524,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         foam_tiles = format!("{FOAM_TILES:?}"),
         bed_albedo = format!("{BED_ALBEDO:?}"),
         ring_block = ring_block,
+        ring_curve = if rings { " + ring_curve" } else { "" },
         ring_cover = ring_cover,
         deep_skip = 0.5f32 / 255.0,
         output = output,
@@ -1906,20 +2009,18 @@ pub fn water_shader_src() -> String {
     water_wgsl(false)
 }
 
-/// THE RINGS' CODE IS SMALL: what a splash's rings, foam and dimple add to
-/// the water's shader, by the host's instruction proxy
-/// (`shader_inlining`). The water is past the instruction cache without them
-/// (3,220 instructions, PIPESTATS 2026-10-12) and draws its ringed twin
-/// whenever a splash is spreading, so this part is kept under what it was
-/// when each ring worked out its own age's square roots and exponentials in
-/// the shader (79 by the proxy: 2,385 against 2,306, the audit of
-/// 2026-10-12, with four rings of one fixed length and speed); now the CPU
-/// sends each ring's radius, height and width, and the loop is a length, two
-/// exponentials and a sine (55) -- and a splash's foam, soft, broken by a
-/// second read of the foam's texture instead of the whitecaps' hard net and
-/// drawn into arcs by the rings' own waves, takes the ringed twin to about
-/// 75 (the ringless one lost its one add: 2,305). No more than it was, with
-/// six rings for four.
+/// THE RINGS' CODE IS SMALL: what a splash's rings, foam, dimple and boil
+/// add to the water's shader, by the host's instruction proxy
+/// (`shader_inlining`), against the Quest's instruction cache (about 3,387
+/// instructions; the ringless water was 3,220 by PIPESTATS, 2026-10-12, at
+/// 2,305 by the proxy: 1.40 a proxy instruction). The ringed twin is drawn
+/// whenever a splash's rings are spreading -- seconds of each -- so it is
+/// held under the cache: 2,424 by the proxy at most. 2026-10-14: the
+/// dispersive train (k = g t^2 / 4 r^2, its spectrum, its damping) and its
+/// caustics take the rings to 96 over the ringless twin (75 before, with one
+/// wavelength and one speed a ring). The drops falling back (75 more) are
+/// in the RAINING twin only, drawn while drops land: that one is past the
+/// cache, for a second or so of each splash.
 #[cfg(test)]
 mod ring_size_tests {
     use super::*;
@@ -1931,7 +2032,38 @@ mod ring_size_tests {
         let (ringed, ringless) = (total(true), total(false));
         eprintln!("water by the proxy: ringed {ringed}, ringless {ringless}, the rings {}", ringed - ringless);
         assert!(ringed > ringless, "the ringed twin has the rings in it");
-        assert!(ringed - ringless <= 80, "the rings' loop grew: {} by the proxy", ringed - ringless);
+        assert!(ringed <= 2424, "the ringed twin is past the instruction cache: {ringed} by the proxy (2,424 at most)");
+        assert!(ringed - ringless <= 110, "the rings' loop grew: {} by the proxy", ringed - ringless);
+        let raining: usize = inlined_sizes(&water_wgsl_raining(false), "fs_main").iter().map(|r| r.own * r.copies).sum();
+        eprintln!("raining twin {raining}: the drops {}", raining - ringed);
+        assert!(raining > ringed && raining - ringed <= 90, "the drops' rings: {} by the proxy", raining - ringed);
+    }
+
+    /// What each part of the rings' loop costs by the proxy: the loop with
+    /// one part taken out at a time. `cargo test --release --lib
+    /// what_each_part_of_the_rings_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn what_each_part_of_the_rings_costs() {
+        let total = |src: &str| -> usize { inlined_sizes(src, "fs_main").iter().map(|r| r.own * r.copies).sum() };
+        let full = water_wgsl_raining(false);
+        let ringless = total(&water_wgsl_with(false, false));
+        let cut = |from: &str, to: &str| -> String {
+            let a = full.find(from).unwrap_or_else(|| panic!("no {from}"));
+            let b = a + full[a..].find(to).unwrap_or_else(|| panic!("no {to}")) + to.len();
+            format!("{}{}", &full[..a], &full[b..])
+        };
+        eprintln!("ringless {ringless}, ringed {} (+{})", total(&full), total(&full) - ringless);
+        for (name, src) in [
+            ("drops", cut("            let dr = water.ring_drops[i];", "            }\n")),
+            ("caustic", cut("            ring_curve = ring_curve -", ";\n")),
+            ("rough", cut("            ring_rough = ring_rough + 0.5 * steep", ";\n")),
+            ("foam arcs", full.replace("pool.x * bowl * (1.0 + pool.z * (s * (3.0 - 4.0 * s * s) - 1.0))", "pool.x * bowl")),
+            ("inner fade", full.replace(" * smoothstep(wv.z, 2.0 * wv.z, dist)", "")),
+        ] {
+            let t = total(&src);
+            eprintln!("without {name}: {t} ({} for it)", total(&full) - t);
+        }
     }
 }
 

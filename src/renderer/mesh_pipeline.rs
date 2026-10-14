@@ -299,8 +299,9 @@ impl MeshPipeline {
 /// EVERY buffer that is ever bound as a `ModelUniform` is this size -- the
 /// mirror's and the caves' too, whose shaders read only the matrix -- so no
 /// upload can overrun one left behind. Then the WEATHER on it, one vec4
-/// (16; x how wet it is, 0..1), written apart from the rest
-/// ([`ModelUniform::set_wetness`]) so an upload of the others leaves it be.
+/// (16; x how wet it is, 0..1; y the grab glow, 0..1), written apart from
+/// the rest ([`ModelUniform::set_wetness`], [`ModelUniform::set_highlight`])
+/// so an upload of the others leaves it be.
 pub const MODEL_UNIFORM_SIZE: u64 = 288;
 /// Where [`MODEL_UNIFORM_SIZE`]'s weather vec4 starts: after what
 /// `upload_lit_bulb_scaled` writes.
@@ -316,7 +317,15 @@ impl ModelUniform {
     /// rain (`weather`). Its diffuse darkens and a film of water glosses it,
     /// lit as any surface is. Kept until set again.
     pub fn set_wetness(&self, queue: &Queue, wet: f32) {
-        queue.write_buffer(&self.buffer, MODEL_WEATHER_OFFSET, bytemuck::cast_slice(&[wet.clamp(0.0, 1.0), 0.0, 0.0, 0.0]));
+        queue.write_buffer(&self.buffer, MODEL_WEATHER_OFFSET, bytemuck::cast_slice(&[wet.clamp(0.0, 1.0)]));
+    }
+
+    /// THE GRAB GLOW on this model, 0 (none: the default, and what every
+    /// model but a hand's choice has) to 1: see `grab_highlight` in the mesh
+    /// shader. Kept until set again; the weather vec4's y, which no other
+    /// upload writes.
+    pub fn set_highlight(&self, queue: &Queue, level: f32) {
+        queue.write_buffer(&self.buffer, MODEL_WEATHER_OFFSET + 4, bytemuck::cast_slice(&[level.clamp(0.0, 1.0)]));
     }
 
     /// Upload the model matrix with FULL sky visibility.
@@ -489,6 +498,12 @@ const VOLUME_WALK: &str = "    var pick = -1;
         }
     }";
 
+/// The mesh shader's grab glow, as it reads in the shader: see
+/// `grab_highlight`.
+const GRAB_GLOW_BRANCH: &str = "    if (grab_glow > 0.0) {
+        out = grab_highlight(out, n, in.world_pos, grab_glow);
+    }";
+
 /// MEASUREMENT ONLY: the scene pass's mesh shader with one part changed at a
 /// time -- see [`MeshPipeline::log_register_cuts`]. 2026-10-02: the spots'
 /// tent and the per-pixel scan together took `mesh_pipeline` from 19
@@ -496,6 +511,8 @@ const VOLUME_WALK: &str = "    var pick = -1;
 /// shader walks its room's chain (exp64); `scan` is every slot looked at.
 const MESH_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("mesh_cut_none", &[]),
+    // The shader as it was before the grab glow (2026-10-14).
+    ("mesh_no_grab_glow", &[(GRAB_GLOW_BRANCH, "")]),
     ("mesh_box_spots", &[(TENT_CALL, "    return pcf_tile_at(\n        tex,")]),
     // The tent's loop over picked taps, as it shipped until B1.
     ("mesh_tent_loop", &[(TENT_CALL, "    return pcf_tile_tent_at(\n        tex,")]),
@@ -1168,7 +1185,9 @@ fn mesh_shader_variant_with(thin: bool, thin_mean: bool) -> String {
 // `bulb`: a fixture's own lamp -- [position, range], [beam direction, cos of
 // the outer half-angle], [radiance, cos of the inner] -- with its mask marker
 // in `params.z`. See `own_bulb_fill`.
-struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9>, bulb: array<vec4<f32>, 3> }}
+// `weather`: y the grab glow (`ModelUniform::set_highlight`); x is the
+// skinned shader's wetness, which this one does not read.
+struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9>, bulb: array<vec4<f32>, 3>, weather: vec4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
 {room_light}
 
@@ -1283,6 +1302,20 @@ fn vs_main(v: VIn) -> VOut {{
 }}
 
 {thin_fn}{thin_shade}
+// THE GRAB GLOW: what a hand's grip will take when it closes (quest_app
+// `grab_reach`, `space_soup_engine::grab_target`). Laid over the finished,
+// tonemapped colour -- display-referred, so it reads the same in a sunlit
+// field and a dark hall, whatever the exposure -- as a cool tint over the
+// whole thing and a bright rim where it turns away from the eye. No lamp
+// lights a thing that colour, and its level breathes slowly (the CPU's
+// `GlowFade`), so it is not taken for the object's own light. `k` 0..1.
+const GRAB_GLOW_COLOUR: vec3<f32> = vec3<f32>(0.62, 0.86, 1.0);
+fn grab_highlight(c: vec3<f32>, n: vec3<f32>, world_pos: vec3<f32>, k: f32) -> vec3<f32> {{
+    let f = 1.0 - abs(dot(n, normalize(cam_pos() - world_pos)));
+    let rim = f * f * f;
+    return mix(c, GRAB_GLOW_COLOUR, k * (0.16 + 0.64 * rim));
+}}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);{thin_span}
@@ -1351,7 +1384,13 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let glow = in.emissive * mask * model_u.params.y;
     // The lit room round it, which the baked bounce -- an old per-object
     // estimate -- all but left out: see `room_light`.
-    return vec4<f32>(tonemap(tex_color.rgb * (lit + baked.rgb + {room}) + glow), tex_color.a{thin_fade});
+    var out = tonemap(tex_color.rgb * (lit + baked.rgb + {room}) + glow);
+    // A uniform branch: every model but the one a hand will take skips it.
+    let grab_glow = model_u.weather.y;
+    if (grab_glow > 0.0) {{
+        out = grab_highlight(out, n, in.world_pos, grab_glow);
+    }}
+    return vec4<f32>(out, tex_color.a{thin_fade});
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
@@ -1821,6 +1860,7 @@ mod tests {
         let pipeline = MeshPipeline::new(&device, format, &uniforms.layout);
         let model = pipeline.create_model_uniform(&device);
         model.upload_lit_bulb(&queue, glam::Mat4::IDENTITY, sky_vis, drive, room, own, 0.0);
+        model.set_highlight(&queue, TEST_HIGHLIGHT.with(|h| h.get()));
 
         // Mid grey base, with a WHITE emissive mask so this measures the
         // factor and the drive. The mask itself is covered separately.
@@ -2492,6 +2532,61 @@ mod tests {
     }
 
     const NONE: [f32; 3] = [0.0, 0.0, 0.0];
+
+    thread_local! {
+        /// The grab glow `render_mesh_room_with` draws its model with.
+        static TEST_HIGHLIGHT: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    }
+
+    /// THE GRAB GLOW READS IN THE DARK AND IN DAYLIGHT, as a cool tint, and a
+    /// model at zero is drawn as before: what a hand will take is lit, and
+    /// nothing else changes.
+    #[test]
+    fn the_grab_glow_reads_in_the_dark_and_in_daylight() {
+        let bright = |glow: f32| {
+            TEST_HIGHLIGHT.with(|h| h.set(glow));
+            let px = render_mesh_stationary(NONE, 0.0, true, 1.0, [255; 4], [0, 0, 0, 255], [200, 200, 200, 255], None, 60.0);
+            TEST_HIGHLIGHT.with(|h| h.set(0.0));
+            px
+        };
+        let dark = |glow: f32| {
+            TEST_HIGHLIGHT.with(|h| h.set(glow));
+            let px = render_mesh_sky(NONE, 0.0, false, 0.0);
+            TEST_HIGHLIGHT.with(|h| h.set(0.0));
+            px
+        };
+        let Some(dark_plain) = dark(0.0) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let (dark_lit, day_plain, day_lit) = (dark(1.0).unwrap(), bright(0.0).unwrap(), bright(1.0).unwrap());
+        eprintln!("dark {dark_plain:?} -> {dark_lit:?}; daylight {day_plain:?} -> {day_lit:?}");
+        // In the dark: a cool glow where there was black.
+        assert!(dark_lit[2] >= dark_plain[2] + 24 && dark_lit[2] > dark_lit[0], "dark: {dark_plain:?} -> {dark_lit:?}");
+        // In daylight on a near-white face: still shifted to the glow's hue.
+        assert!(day_plain[0] > 200, "the daylight case is not bright: {day_plain:?}");
+        assert!(day_lit[0] + 6 <= day_plain[0] && day_lit[2] >= day_lit[0], "daylight: {day_plain:?} -> {day_lit:?}");
+        // At zero, nothing: the same pixel as a model never lit.
+        assert_eq!(dark(0.0).unwrap(), dark_plain);
+    }
+
+    /// THE GRAB GLOW COSTS A MODEL NOTHING UNTIL IT IS LIT: behind a uniform
+    /// branch on its own uniform, in every mesh shader the scene draws with;
+    /// and what it adds, by the inlining proxy (PIPESTATS on the headset:
+    /// the `mesh_no_grab_glow` cut).
+    #[test]
+    fn the_grab_glow_is_behind_a_uniform_branch_and_small() {
+        for (label, src) in [("mesh", mesh_shader()), ("thin", mesh_shader_variant_with(true, true))] {
+            assert!(src.contains(GRAB_GLOW_BRANCH), "{label}: the glow is not behind its branch");
+            assert!(src.contains("let grab_glow = model_u.weather.y;"), "{label}");
+            let total = |s: &str| -> usize {
+                crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|r| r.own * r.copies).sum()
+            };
+            let (with, without) = (total(&src), total(&src.replacen(GRAB_GLOW_BRANCH, "", 1)));
+            eprintln!("{label} fs_main by the proxy: {without} without the grab glow, {with} with it (+{})", with - without);
+            assert!(with - without <= 40, "{label}: the glow grew the shader by {}", with - without);
+        }
+    }
     const RED_BULB: [f32; 3] = [0.9, 0.1, 0.05];
 
     #[test]

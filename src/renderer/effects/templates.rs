@@ -363,7 +363,8 @@ pub fn water_entry_asset() -> EffectAsset {
         budget: Budget { fill_megapixel_layers: 1.5, instances: 400, lights: 0 },
         over_budget: Some(
             "what a strike throws follows what struck, and its stack is costed at the largest thing (a 120 kg body dropped in 2.5 m away) with every strike the renderer keeps alive at once; \
-             strikes are culled by range and view and thin their drops with distance, but the governor does not shed them yet"
+             strikes are culled by range and view, thin their drops with distance, and the frame's governor sheds the pieces of the far and small ones first \
+             (`effects::simulate_governed`)"
                 .into(),
         ),
         seed_policy: SeedPolicy::PerSpawn,
@@ -915,7 +916,7 @@ mod tests {
             }
         }
         over.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let mut frame = EffectFrame { instances: Vec::new(), over: over.len() as u32, screened: screened.len() as u32, screened_heat: 0, bursts: Default::default() };
+        let mut frame = EffectFrame { instances: Vec::new(), over: over.len() as u32, screened: screened.len() as u32, screened_heat: 0, bursts: Default::default(), splash_costs: Vec::new() };
         frame.instances.extend(over.into_iter().map(|(_, i)| i));
         frame.instances.extend(screened);
         frame

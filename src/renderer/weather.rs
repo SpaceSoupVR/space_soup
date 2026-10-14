@@ -1945,6 +1945,69 @@ mod tests {
         }
     }
 
+    /// THE TORCH'S PUDDLE READERS ARE UNDER THE INSTRUCTION CACHE: every
+    /// weather gentle twin a torch-lit frame draws takes the walked sky
+    /// (`ground_twins::TORCH_WEATHER_SKY_WALK`), validates, and is no larger
+    /// by the proxy than its spotless twin plus the spots' shadows less the
+    /// sky's second copy -- for the puddles (snowless) at most 2,600 units
+    /// (x 1.35 = 3,510 by the proxy's raw ratio; dead steep code counted, see
+    /// `docs/steep-lines-status-2026-10-13.md`), where the two calls are 2,671.
+    #[test]
+    fn the_torch_puddle_reader_walks_its_sky() {
+        use crate::renderer::ground_twins::gentle_shader;
+        use crate::renderer::terrain_pipeline::terrain_shader_built;
+        let total = |s: &str| crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum::<usize>();
+        let baked = |src: String| crate::renderer::brush_pipeline::sun_reader_shader(src, crate::renderer::brush_pipeline::FaceSun::Baked);
+        let gentle = baked(gentle_shader(&terrain_shader_built(TerrainRole::Read, true)).unwrap());
+        for kinds in WeatherKinds::ALL {
+            let twin = with_weather_kinds(&gentle, kinds).unwrap();
+            let walked = crate::renderer::ground_twins::torch_weather_twin(twin.clone());
+            assert_ne!(walked, twin, "{kinds:?}: the sky was not walked");
+            validate(&format!("torch walked {kinds:?}"), &walked);
+            assert!(total(&walked) + 80 < total(&twin), "{kinds:?}: {} walked against {}", total(&walked), total(&twin));
+        }
+        let puddles = crate::renderer::ground_twins::torch_weather_twin(with_weather_kinds(&gentle, WeatherKinds::ALL[1]).unwrap());
+        assert!(total(&puddles) <= 2600, "the torch's puddle reader is {} by the proxy", total(&puddles));
+    }
+
+    /// MEASUREMENT (2026-10-14, the torch in the rain): the same readers as
+    /// [`wetness_reader_sizes`], with the spots' shadows read -- what a frame
+    /// with the player's torch casting draws (`spotless_frame` false) --
+    /// beside the spotless ones, by the host proxy.
+    #[test]
+    #[ignore]
+    fn torch_wetness_reader_sizes() {
+        use crate::renderer::ground_twins::gentle_shader;
+        use crate::renderer::terrain_pipeline::terrain_shader_built;
+        let total = |s: &str| crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum::<usize>();
+        let baked = |src: String| crate::renderer::brush_pipeline::sun_reader_shader(src, crate::renderer::brush_pipeline::FaceSun::Baked);
+        let read = terrain_shader_built(TerrainRole::Read, true);
+        let gentle = baked(gentle_shader(&read).unwrap());
+        let spotless = crate::renderer::lights::without_spot_shadows(gentle.clone());
+        eprintln!("dry gentle: spotless {}  torch {}", total(&spotless), total(&gentle));
+        for kinds in WeatherKinds::ALL {
+            eprintln!(
+                "weather{:<10} gentle: spotless {}  torch {}",
+                kinds.label(),
+                total(&with_weather_kinds(&spotless, kinds).unwrap()),
+                total(&with_weather_kinds(&gentle, kinds).unwrap()),
+            );
+        }
+        for kinds in WeatherKinds::ALL {
+            let torch = with_weather_kinds(&gentle, kinds).unwrap();
+            eprintln!(
+                "weather{:<10} gentle: torch, sky walked {}",
+                kinds.label(),
+                total(&crate::renderer::ground_twins::torch_weather_twin(torch)),
+            );
+        }
+        if std::env::var("REPORT").is_ok() {
+            let k = WeatherKinds::ALL[1];
+            eprintln!("{}", crate::renderer::shader_inlining::report("snowless torch", &with_weather_kinds(&gentle, k).unwrap(), "fs_main", 25));
+            eprintln!("{}", crate::renderer::shader_inlining::report("snowless spotless", &with_weather_kinds(&spotless, k).unwrap(), "fs_main", 25));
+        }
+    }
+
     /// The rain, snow and splashes' SpaceWarp twin validates, and is the
     /// particle shader's own text: every change it makes is checked to have
     /// matched (`motion_shader` panics otherwise), and the draw shader is

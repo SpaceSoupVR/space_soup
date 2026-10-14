@@ -242,6 +242,12 @@ pub struct Levers {
     /// glass glowing. The app hands them over (`quest_app::flashlight`); off,
     /// it hands none, and a torch shows in no reflection, as until 2026-10-02.
     pub torch_reflection: bool,
+    /// The eye's meter shown the pools the live lamps throw -- a torch close
+    /// to a wall -- beside the probes' photographs
+    /// (`lights::LightsUniform::set_pool_light`). Off, it meters the level's
+    /// own light alone, and a torch a hand's width from pale stone draws its
+    /// pool flat white at the dark room's exposure, as until 2026-10-13.
+    pub pool_metering: bool,
     /// The characters mirrored in the floor the player stands on, in place of
     /// their capsules there. See `brush_pipeline::probe_pass::MIRROR_FORMAT`.
     /// OFF as shipped: its pass and blur levels cost about 1 ms at GPU level 5
@@ -698,6 +704,7 @@ impl Default for Levers {
             flashlight_bounce: true,
             surface_light_loop: true,
             torch_reflection: true,
+            pool_metering: true,
             floor_mirror: false,
             reflection_blur: true,
             character_cards: true,
@@ -868,6 +875,7 @@ impl Levers {
         flag("flashlight_bounce", self.flashlight_bounce, d.flashlight_bounce);
         flag("surface_light_loop", self.surface_light_loop, d.surface_light_loop);
         flag("torch_reflection", self.torch_reflection, d.torch_reflection);
+        flag("pool_metering", self.pool_metering, d.pool_metering);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("same_eyes", self.same_eyes, d.same_eyes);
         flag("thin_shading_sampled", self.thin_shading_sampled, d.thin_shading_sampled);

@@ -50,6 +50,9 @@ pub const FRAME_INSTANCE_BUDGET: u32 = 1500;
 /// governor wants, a frame: ten frames from whole to none, so particles
 /// leave one at a time and none pops.
 const SHARE_STEP: f32 = 0.1;
+/// The share of the budget the governor aims at, so that the frame stays
+/// under the budget itself while its shares move.
+const GOVERN_AIM: f32 = 0.9;
 
 /// A light pulse is left out where, as the eye in that room takes it
 /// ([`brief_light_scale`]), it would raise a surface this far off by under
@@ -564,6 +567,66 @@ pub struct LiveBurst {
     superseded: Option<f64>,
     /// The share of its lasting particles drawn (the governor's).
     pub share: f32,
+    /// A PLACED EFFECT (a scene object's `effect.asset`): never retired,
+    /// never taken over, its streams running for as long as the level is
+    /// loaded; with the object's own scale, rate and tint ([`BurstSet::place`]).
+    pub standing: Option<Placed>,
+}
+
+/// What a scene object's effect says beside its asset's name, as the
+/// templates' `scale`, `rate` and `tint` do: its sprites' size, its streams'
+/// rate and its colour, each a multiple of the asset's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placed {
+    pub scale: f32,
+    pub rate: f32,
+    /// Linear (the scene's sRGB tint, decoded).
+    pub tint: [f32; 3],
+}
+
+impl Default for Placed {
+    fn default() -> Self {
+        Self { scale: 1.0, rate: 1.0, tint: [1.0; 3] }
+    }
+}
+
+/// A scene object's effect that names an asset, as the client loads it
+/// (`quest_app::scene_effects::placed`), in the WORLD's frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlacedEffect {
+    /// The object's id: what a log names, and (hashed) its source.
+    pub object: String,
+    pub asset: String,
+    pub position: Vec3,
+    /// Its object's up.
+    pub direction: Vec3,
+    pub source: u64,
+    pub placed: Placed,
+}
+
+/// SOMETHING ELSE THE GOVERNOR WEIGHS beside the bursts
+/// ([`BurstSet::frame_with`]): a placed template emitter or a splash in view,
+/// by a key of its own (`effects::governor_wants`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Want {
+    pub key: u64,
+    /// Lowest sheds first: importance x 100 plus log2 of its pixels across,
+    /// so among equals the farthest and smallest go first.
+    pub score: f32,
+    /// Its fill this frame drawn whole, megapixel-layers (estimated), and
+    /// its instances.
+    pub fill: f32,
+    pub count: f32,
+    /// False for what fewer of would be a smaller thing, not a sparser one
+    /// (a fire's sheets, a bed of coals): counted in the frame, never shed.
+    pub sheddable: bool,
+    pub kind: WantKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WantKind {
+    Emitter,
+    Splash,
 }
 
 /// What a frame's bursts came to.
@@ -591,6 +654,16 @@ pub struct BurstStats {
     /// (since the set was made): what a level firing more than it can keep
     /// shows up as.
     pub dropped: u32,
+    /// Placed emitters and splashes in view the governor is thinning this
+    /// frame ([`Want`]), and the frame's estimated instances before and
+    /// after it (bursts, emitters and splashes together; `fill_wanted` and
+    /// `fill` are of all three too).
+    pub emitters_thinned: u32,
+    pub splashes_thinned: u32,
+    pub instances_wanted: f32,
+    pub instances: f32,
+    /// Frames the governor shed anything in, since the set was made.
+    pub frames_governed: u32,
 }
 
 /// THE BURSTS IN PLAY, and what admits, culls, thins and retires them.
@@ -600,8 +673,15 @@ pub struct BurstSet {
     /// The effects' clock at the last frame.
     now: f64,
     pub stats: BurstStats,
-    /// What the governor holds the frame's bursts to.
+    /// What the governor holds the frame's effects to.
     pub budget: FrameBudget,
+    /// The governor's share of each placed emitter and splash it weighed
+    /// last frame, by [`Want::key`]; what it did not weigh is whole.
+    shares: std::collections::HashMap<u64, f32>,
+    /// Each splash's fill and instances as last drawn whole, by its key
+    /// (`effects::simulate_governed` measures them): what it is weighed by
+    /// on the next frame.
+    pub splash_measured: std::collections::HashMap<u64, (f32, f32)>,
 }
 
 /// The estimated fill of the bursts in view, megapixel-layers, and their
@@ -642,7 +722,7 @@ impl BurstSet {
     pub fn add(&mut self, lib: &EffectLibrary, burst: EffectBurst) {
         let Some(c) = lib.get(burst.asset) else { return };
         let most = c.scalability.max_live.max(1);
-        let same = |l: &LiveBurst| l.burst.asset == burst.asset && l.burst.source == burst.source && l.lasting;
+        let same = |l: &LiveBurst| l.burst.asset == burst.asset && l.burst.source == burst.source && l.lasting && l.standing.is_none();
         let ages: Vec<f32> = self.live.iter().filter(|l| same(l)).map(|l| self.age(l) - burst.age).collect();
         let whole_alive = ages.iter().filter(|a| **a < c.seconds).count() as u32;
         let since_last = ages.iter().copied().fold(f32::INFINITY, f32::min);
@@ -651,11 +731,43 @@ impl BurstSet {
             self.stats.merged += 1;
         }
         if self.live.len() >= BURSTS_KEPT {
-            let oldest_flash = self.live.iter().position(|l| !l.lasting);
-            self.live.remove(oldest_flash.unwrap_or(0));
-            self.stats.dropped += 1;
+            let oldest_flash = self.live.iter().position(|l| !l.lasting && l.standing.is_none());
+            if let Some(k) = oldest_flash.or_else(|| self.live.iter().position(|l| l.standing.is_none())) {
+                self.live.remove(k);
+                self.stats.dropped += 1;
+            }
         }
-        self.live.push(LiveBurst { burst, born: None, frames: 0, lasting, superseded: None, share: 1.0 });
+        self.live.push(LiveBurst { burst, born: None, frames: 0, lasting, superseded: None, share: 1.0, standing: None });
+    }
+
+    /// A PLACED EFFECT: a scene object's `effect.asset`, at the object, along
+    /// its up, for as long as the level is loaded. Its streams run from the
+    /// first frame on; a burst emitter in it fires once, then. `source` is
+    /// the object's (one key a placed effect, for the governor and the seed).
+    pub fn place(&mut self, lib: &EffectLibrary, asset: EffectId, position: Vec3, direction: Vec3, source: u64, placed: Placed) {
+        if lib.get(asset).is_none() {
+            return;
+        }
+        let burst = EffectBurst::new(asset, position, direction, source, hash64(source ^ 0x5eed_0f_91ace));
+        self.live.push(LiveBurst { burst, born: None, frames: 0, lasting: true, superseded: None, share: 1.0, standing: Some(placed) });
+    }
+
+    /// Every placed effect taken away (a scene change), the bursts left.
+    pub fn clear_placed(&mut self) {
+        self.live.retain(|l| l.standing.is_none());
+    }
+
+    /// The governor's share of a placed emitter or splash ([`Want::key`]):
+    /// 1 for one it has not thinned.
+    pub fn share_of(&self, key: u64) -> f32 {
+        self.shares.get(&key).copied().unwrap_or(1.0)
+    }
+
+    /// What each splash drawn this frame filled whole (`EffectFrame::splash_costs`),
+    /// kept for the next frame's governor.
+    pub fn measured(&mut self, costs: &[(u64, f32, f32)]) {
+        self.splash_measured.clear();
+        self.splash_measured.extend(costs.iter().map(|&(k, f, n)| (k, (f, n))));
     }
 
     /// THE FRAME'S BURSTS at `now` on the effects' clock: new ones are given
@@ -669,6 +781,15 @@ impl BurstSet {
     /// a tenth a frame until they do not. Returns, per live burst, whether
     /// it is drawn.
     pub fn frame(&mut self, lib: &EffectLibrary, now: f64, views: &[[glam::Vec4; 6]], head: Vec3) -> Vec<bool> {
+        self.frame_with(lib, now, views, head, &[])
+    }
+
+    /// [`Self::frame`], with THE PLACED EMITTERS AND SPLASHES in view weighed
+    /// by the same governor (`others`, from `effects::governor_wants`): the
+    /// whole frame's effects -- bursts, emitters, splashes -- are held to one
+    /// budget, the lowest scored shed first whatever kind it is. Their shares
+    /// are read back with [`Self::share_of`].
+    pub fn frame_with(&mut self, lib: &EffectLibrary, now: f64, views: &[[glam::Vec4; 6]], head: Vec3, others: &[Want]) -> Vec<bool> {
         self.now = now;
         // New ones: their moment, and their source's stream.
         for i in 0..self.live.len() {
@@ -677,21 +798,27 @@ impl BurstSet {
             }
             let born = now - self.live[i].burst.age.max(0.0) as f64;
             self.live[i].born = Some(born);
+            if self.live[i].standing.is_some() {
+                continue;
+            }
             let (asset, source) = (self.live[i].burst.asset, self.live[i].burst.source);
             for (k, l) in self.live.iter_mut().enumerate() {
-                if k != i && l.burst.asset == asset && l.burst.source == source && l.superseded.is_none() && l.born.is_some_and(|b| b <= born) {
+                if k != i && l.standing.is_none() && l.burst.asset == asset && l.burst.source == source && l.superseded.is_none() && l.born.is_some_and(|b| b <= born) {
                     l.superseded = Some(born);
                 }
             }
         }
-        self.live.retain(|l| lib.get(l.burst.asset).is_some_and(|c| now < l.until(c)));
+        self.live.retain(|l| lib.get(l.burst.asset).is_some_and(|c| l.standing.is_some() || now < l.until(c)));
         let mut drawn = vec![false; self.live.len()];
-        // (score, fill, instances, index): what the governor weighs.
+        // (score, fill, instances, index): what the governor weighs. An
+        // index past the bursts is `others[index - live]`.
         let mut wants: Vec<(f32, f32, f32, usize)> = Vec::new();
+        let (mut fixed_fill, mut fixed_count) = (0.0f32, 0.0f32);
         for (i, l) in self.live.iter().enumerate() {
             let c = lib.get(l.burst.asset).expect("retained with its effect");
+            let placed = l.standing.unwrap_or_default();
             let d = l.burst.position.distance(head);
-            let pixels = 2.0 * c.reach / d.max(0.05) * asset::REFERENCE_FOCAL_PIXELS;
+            let pixels = 2.0 * c.reach * placed.scale.max(0.0) / d.max(0.05) * asset::REFERENCE_FOCAL_PIXELS;
             if d > c.scalability.cull_distance || pixels < c.scalability.min_pixels {
                 continue;
             }
@@ -713,18 +840,32 @@ impl BurstSet {
             drawn[i] = true;
             if l.lasting {
                 let near = (c.report.reference_distance / d.max(0.3)).powi(2);
+                // A placed one's sprites are `scale` times the size, its
+                // streams `rate` times as dense.
+                let grown = placed.scale * placed.scale * placed.rate;
                 let lasting: f32 = c.report.emitters.iter().filter(|e| e.longest_life > 0.0).map(|e| e.fill).sum();
                 let count: u32 = c.report.emitters.iter().filter(|e| e.longest_life > 0.0).map(|e| e.instances).sum();
-                wants.push((c.scalability.importance * 100.0 + pixels.max(1.0).log2(), (lasting * near).min(3.0), count as f32, i));
+                wants.push((c.scalability.importance * 100.0 + pixels.max(1.0).log2(), (lasting * near * grown).min(3.0), count as f32 * placed.rate, i));
+            }
+        }
+        let bursts = self.live.len();
+        for (k, w) in others.iter().enumerate() {
+            if w.sheddable {
+                wants.push((w.score, w.fill, w.count, bursts + k));
+            } else {
+                fixed_fill += w.fill;
+                fixed_count += w.count;
             }
         }
         // THE GOVERNOR. Lowest score first loses its particles.
         wants.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let fill_wanted: f32 = wants.iter().map(|w| w.1).sum();
-        let count_wanted: f32 = wants.iter().map(|w| w.2).sum();
-        let mut over_fill = fill_wanted - self.budget.fill;
-        let mut over_count = count_wanted - self.budget.instances as f32;
-        let mut target = vec![1.0f32; self.live.len()];
+        let fill_wanted: f32 = wants.iter().map(|w| w.1).sum::<f32>() + fixed_fill;
+        let count_wanted: f32 = wants.iter().map(|w| w.2).sum::<f32>() + fixed_count;
+        // Aimed a little under the budget: what it sheds goes a tenth a
+        // frame, and new bursts and splashes arrive whole meanwhile.
+        let mut over_fill = fill_wanted - GOVERN_AIM * self.budget.fill;
+        let mut over_count = count_wanted - GOVERN_AIM * self.budget.instances as f32;
+        let mut target = vec![1.0f32; bursts + others.len()];
         for &(_, fill, count, i) in &wants {
             if over_fill <= 0.0 && over_count <= 0.0 {
                 break;
@@ -735,14 +876,35 @@ impl BurstSet {
             over_fill -= fill * cut;
             over_count -= count * cut;
         }
-        let mut fill = 0.0;
-        let mut thinned = 0;
-        for &(_, f, _, i) in &wants {
-            let l = &mut self.live[i];
-            l.share += (target[i] - l.share).clamp(-SHARE_STEP, SHARE_STEP);
-            fill += f * l.share;
-            thinned += (l.share < 1.0) as u32;
+        let (mut fill, mut count) = (fixed_fill, fixed_count);
+        let (mut thinned, mut emitters_thinned, mut splashes_thinned) = (0, 0, 0);
+        let mut shares = std::collections::HashMap::with_capacity(others.len());
+        for &(_, f, n, i) in &wants {
+            let share = if i < bursts {
+                let l = &mut self.live[i];
+                // One never drawn yet starts where the governor wants it:
+                // nothing of it was on screen to go.
+                l.share = if l.frames == 0 { target[i] } else { l.share + (target[i] - l.share).clamp(-SHARE_STEP, SHARE_STEP) };
+                thinned += (l.share < 1.0) as u32;
+                l.share
+            } else {
+                let w = &others[i - bursts];
+                let was = self.share_of(w.key);
+                let share = was + (target[i] - was).clamp(-SHARE_STEP, SHARE_STEP);
+                if share < 1.0 {
+                    shares.insert(w.key, share);
+                    match w.kind {
+                        WantKind::Emitter => emitters_thinned += 1,
+                        WantKind::Splash => splashes_thinned += 1,
+                    }
+                }
+                share
+            };
+            fill += f * share;
+            count += n * share;
         }
+        // What was not weighed this frame (out of view) comes back whole.
+        self.shares = shares;
         // One out of view comes back whole when the frame has room for it.
         for (i, l) in self.live.iter_mut().enumerate() {
             if !drawn[i] {
@@ -750,7 +912,21 @@ impl BurstSet {
             }
         }
         let seen = drawn.iter().filter(|d| **d).count() as u32;
-        self.stats = BurstStats { live: self.live.len() as u32, seen, culled: self.live.len() as u32 - seen, fill_wanted, fill, thinned, ..self.stats };
+        let shed = thinned + emitters_thinned + splashes_thinned > 0;
+        self.stats = BurstStats {
+            live: self.live.len() as u32,
+            seen,
+            culled: self.live.len() as u32 - seen,
+            fill_wanted,
+            fill,
+            thinned,
+            emitters_thinned,
+            splashes_thinned,
+            instances_wanted: count_wanted,
+            instances: count,
+            frames_governed: self.stats.frames_governed + shed as u32,
+            ..self.stats
+        };
         drawn
     }
 
@@ -891,7 +1067,7 @@ impl Program {
 /// Whether particle `j` of a burst is among the `share` of them kept: a
 /// fixed order, so a falling share drops them one at a time and a rising
 /// one brings the same ones back.
-fn kept(j: u32, share: f32, phase: f32) -> bool {
+pub(super) fn kept(j: u32, share: f32, phase: f32) -> bool {
     share >= 1.0 || ((j as f32 + 1.0) * 0.618_034 + phase).fract() < share
 }
 
@@ -912,6 +1088,9 @@ struct Ctx<'a> {
     flash: Option<Light>,
     near_fade: Option<[f32; 2]>,
     ceiling: Option<f32>,
+    /// A placed effect's own scale and tint ([`Placed`]); 1 for a burst.
+    scale: f32,
+    tint: Vec3,
 }
 
 /// The particle record a program's steps read and write.
@@ -971,7 +1150,7 @@ impl Program {
             rotation: 0.0,
             opacity: 1.0,
             bright: 1.0,
-            tint: Vec3::ONE,
+            tint: cx.tint,
             lit: None,
             adapt: None,
         };
@@ -1130,6 +1309,7 @@ impl Program {
                 Step::AdaptOwnLight { radius, level } => p.adapt = Some((*radius, *level)),
             }
         }
+        p.size *= cx.scale;
         let centre = player(p.pos);
         let distance = (centre - at.head).length();
         if let Some([near, far]) = cx.near_fade {
@@ -1222,6 +1402,10 @@ pub struct BurstCount {
     pub screened: u32,
     /// Particles the governor's share left out.
     pub shed: u32,
+    /// The same for the placed emitters and the splashes
+    /// (`effects::simulate_governed`).
+    pub emitter_shed: u32,
+    pub splash_shed: u32,
 }
 
 /// The bursts' part of a frame: the library, the bursts in play and which
@@ -1255,6 +1439,7 @@ pub(super) fn simulate_bursts(
             continue;
         }
         let (Some(c), Some(born)) = (bursts.lib.get(l.burst.asset), l.born) else { continue };
+        let placed = l.standing.unwrap_or_default();
         let age = (time - born) as f32;
         let seed = l.seed(c);
         let (chance, energy) = c.draws(l);
@@ -1303,6 +1488,8 @@ pub(super) fn simulate_bursts(
                 flash,
                 near_fade: c.scalability.near_fade,
                 ceiling: None,
+                scale: placed.scale,
+                tint: Vec3::from(placed.tint),
             };
             let own_seed = hash64(seed ^ (k as u64 + 1).wrapping_mul(0x632b_e59b_d9b4_e019));
             // Each burst sheds in an order of its own: a row of them thinned
@@ -1339,7 +1526,7 @@ pub(super) fn simulate_bursts(
                     // A STREAM: particle `j` leaves `(j + phase) / rate`
                     // after the event, until the window closes or a later
                     // burst of the source takes the stream over.
-                    let rate = per_second * p.by(SpawnTarget::Rate, &l.burst.inputs);
+                    let rate = per_second * p.by(SpawnTarget::Rate, &l.burst.inputs) * placed.rate;
                     if !(rate > 0.0) {
                         continue;
                     }
@@ -1373,7 +1560,7 @@ pub(super) fn simulate_bursts(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn every(_: &EffectEmitter, _: usize) -> bool {
@@ -1436,6 +1623,46 @@ mod tests {
             assert!(r.over_budget.is_none(), "{name} ships over a budget");
             assert!(r.instances_steady <= asset::LIMIT_INSTANCES && r.fill_steady <= asset::LIMIT_FILL_STEADY && r.fill_per_burst <= asset::LIMIT_FILL_BURST);
         }
+    }
+
+    /// EVERY EFFECT ASSET IN `game/effects` -- what the editor saves -- reads,
+    /// passes the validator against the books that exist and compiles to a
+    /// program the engine runs; and every one that exceeds a budget says why.
+    /// The built-in templates are checked the same way. `cargo test --release
+    /// --lib every_effect_asset -- --nocapture` LISTS THE OVERRIDES: each
+    /// asset over a budget, its reason, and what it exceeds.
+    #[test]
+    fn every_effect_asset_validates_and_its_overrides_are_listed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/effects");
+        let (assets, failed) = EffectAsset::load_dir(&dir);
+        assert!(failed.is_empty(), "{}", failed.iter().map(|(p, e)| format!("{}: {e}", p.display())).collect::<Vec<_>>().join("\n"));
+        let mut overrides = Vec::new();
+        let shipped = assets.len();
+        for (a, origin) in assets.into_iter().map(|a| (a, "game/effects")).chain(templates::assets().into_iter().map(|a| (a, "built-in template"))) {
+            let report = a.check(books()).unwrap_or_else(|issues| panic!("{origin} `{}` is refused:\n  {}", a.name, issues.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("\n  ")));
+            if origin == "game/effects" {
+                CompiledEffect::compile(&a, books()).unwrap_or_else(|issues| panic!("`{}` checks but does not compile: {}", a.name, issues.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")));
+            }
+            eprintln!(
+                "{origin:>17} {:<20} {:>4} instances, {:.3} megapixel-layers at {} m (one burst {} / {:.3}){}",
+                a.name,
+                report.instances_steady,
+                report.fill_steady,
+                report.reference_distance,
+                report.instances_per_burst,
+                report.fill_per_burst,
+                if report.over_budget.is_some() { "  OVER BUDGET" } else { "" }
+            );
+            if let Some((reason, what)) = report.over_budget {
+                assert!(!reason.trim().is_empty());
+                overrides.push(format!("{origin} `{}`: \"{reason}\"\n      exceeds: {}", a.name, if what.is_empty() { "nothing now".to_string() } else { what.join("; ") }));
+            }
+        }
+        eprintln!("\nOVERRIDES ({} of {} assets and {} templates):", overrides.len(), shipped, templates::assets().len());
+        for o in &overrides {
+            eprintln!("  {o}");
+        }
+        assert!(shipped >= 3, "game/effects holds {shipped} assets");
     }
 
     /// A FLASH IS ONE APP FRAME, whatever the frame time; its smoke goes on.
@@ -1653,7 +1880,9 @@ mod tests {
                     }
                 }
             }
-            assert!(moving >= 20, "{name}: {moving} moving");
+            // (Ten at least: pond_mist's puffs drift at 2-6 cm/s, most of them
+            // under the 5 mm/s counted here.)
+            assert!(moving >= 10, "{name}: {moving} moving");
             assert!(found as f32 >= 0.95 * moving as f32, "{name}: {found} of {moving} found where their velocity took them");
         }
     }
@@ -1684,6 +1913,371 @@ mod tests {
         assert!(all.instances.iter().all(|i| i.centre[2] < head.z));
         set.end_frame();
         assert!(set.frame(&lib, 1.0 + 20.0, &views, head).is_empty() && set.live.is_empty());
+    }
+
+    /// A stream as a placed asset would be: puffs rising from a vent.
+    pub(crate) const VENT: &str = r#"{
+      "name": "test_vent", "version": 1,
+      "emitters": [{
+        "name": "steam",
+        "spawn": [{ "module": "rate", "per_second": 10 }],
+        "initialize": [
+          { "module": "life", "value": { "range": [1.0, 2.0] } },
+          { "module": "shape_cone", "angle_deg": 12 },
+          { "module": "speed", "value": { "range": [0.6, 1.0] } },
+          { "module": "size", "value": 0.05 }],
+        "update": [
+          { "module": "ballistic", "accel": [0, 0.4, 0], "drag": 1.2 },
+          { "module": "size_over_life", "to": 0.3 },
+          { "module": "puff_fade", "peak": 0.3, "rise": 0.15, "power": 1.5 },
+          { "module": "light_cpu", "mode": "sixway", "phase_g": 0.4, "albedo": [0.8, 0.8, 0.8] }],
+        "render": [
+          { "module": "sprite_sixway", "book": "smoke" },
+          { "module": "placement", "mode": "facing" },
+          { "module": "flipbook" },
+          { "module": "soft_depth", "metres": 0.2 },
+          { "module": "motion", "layer": "soft" }]
+      }],
+      "scalability": { "cull_distance": 60, "min_pixels": 2, "importance": 0.5, "max_live": 1 },
+      "budget": { "fill_megapixel_layers": 1.5, "instances": 40 }
+    }"#;
+
+    /// Every generic module once, for the editor's port to be held to.
+    const SINK: &str = r#"{
+      "name": "fixture_sink", "version": 1, "inputs": ["heat"],
+      "energy": { "lognormal": [1.0, 0.3] },
+      "emitters": [
+        { "name": "glow",
+          "spawn": [{ "module": "burst", "count": { "range": [3, 6] }, "chance": 0.9 }],
+          "initialize": [
+            { "module": "life", "value": { "squared": [0.3, 0.8] } },
+            { "module": "shape_disc", "radius": 0.05 },
+            { "module": "shape_cone", "angle_deg": 25 },
+            { "module": "speed", "value": { "lognormal": [2.0, 0.3] } },
+            { "module": "size", "value": { "log_squared": [0.01, 0.03] } },
+            { "module": "spin", "rate": 2.0, "start": 0.5 }],
+          "update": [
+            { "module": "ballistic", "accel": [0, -2, 0], "drag": 3.0 },
+            { "module": "jitter", "reach": 0.02, "pace": 1.5 },
+            { "module": "size_over_life", "value": { "curve": [[0, 1], [0.5, 1.6], [1, 0.4]] } },
+            { "module": "colour_over_life", "gradient": [[0, 1, 0.8, 0.5, 1], [0.4, 1, 0.5, 0.2, 0.9], [1, 0.6, 0.2, 0.1, 0.3]] },
+            { "module": "by_input", "input": "heat", "target": "brightness", "curve": [[0, 0.5], [1, 1.5]] },
+            { "module": "adapt_own_light", "radius": 0.05, "level": 3.0 }],
+          "render": [
+            { "module": "sprite_emissive", "book": "ember", "radiance": 30, "colour": [1, 0.5, 0.2], "adapt": "own_light" },
+            { "module": "placement", "mode": "streak", "streak_seconds": 0.03 },
+            { "module": "soft_depth", "metres": 0.02 },
+            { "module": "motion", "layer": "bright" }] },
+        { "name": "haze",
+          "spawn": [{ "module": "rate", "per_second": 8, "for_seconds": 1.5 }, { "module": "by_input", "input": "heat", "target": "rate", "curve": [[0, 0.5], [1, 1]] }],
+          "initialize": [
+            { "module": "life", "value": { "range": [0.8, 1.6] } },
+            { "module": "shape_cone", "angle_deg": 15, "about": "up" },
+            { "module": "speed", "value": { "uniform": [0.3, 0.6] } },
+            { "module": "size", "value": 0.04 }],
+          "update": [
+            { "module": "ballistic", "accel": [0, 0.3, 0], "drag": 1.5 },
+            { "module": "swirl", "radius": 0.05, "turn": 1.2 },
+            { "module": "air_drift", "strength": 0.7 },
+            { "module": "size_over_life", "to": 0.2 },
+            { "module": "opacity_over_life", "value": { "curve": [[0, 0], [0.2, 0.3], [1, 0]] } },
+            { "module": "puff_fade", "peak": 0.9, "rise": 0.1, "power": 0.5 },
+            { "module": "by_input", "input": "heat", "target": "opacity", "curve": [[0, 0.6], [1, 1]] },
+            { "module": "light_cpu", "mode": "sixway", "phase_g": 0.3, "albedo": [0.7, 0.7, 0.75] }],
+          "render": [
+            { "module": "sprite_sixway", "book": "smoke" },
+            { "module": "placement", "mode": "facing" },
+            { "module": "flipbook" },
+            { "module": "soft_depth", "metres": 0.2 },
+            { "module": "motion", "layer": "soft" }] },
+        { "name": "motes",
+          "spawn": [{ "module": "burst", "count": 12 }],
+          "initialize": [
+            { "module": "life", "value": { "range": [1, 2] } },
+            { "module": "shape_point" },
+            { "module": "shape_cone", "angle_deg": 180 },
+            { "module": "speed", "value": { "range": [0, 0.2] } },
+            { "module": "size", "value": 0.002 }],
+          "update": [
+            { "module": "ballistic", "drag": 0.5 },
+            { "module": "light_cpu", "mode": "scatter", "phase_g": 0.6, "albedo": [0.9, 0.9, 0.9], "ambient": 0.3 }],
+          "render": [
+            { "module": "sprite_scatter", "book": "mote" },
+            { "module": "placement", "mode": "point" },
+            { "module": "flipbook", "play": "seed" },
+            { "module": "soft_depth", "metres": 0.02 },
+            { "module": "motion", "layer": "bright" }] },
+        { "name": "after", "at": "port",
+          "spawn": [{ "module": "burst", "count": 2 }],
+          "initialize": [{ "module": "life", "value": "one_frame" }, { "module": "delay", "frames": 1 }, { "module": "size", "value": 0.05 }],
+          "update": [],
+          "render": [
+            { "module": "sprite_plain", "book": "crown" },
+            { "module": "placement", "mode": "upright" },
+            { "module": "flipbook", "play": "seed" },
+            { "module": "soft_depth", "metres": 0.05 },
+            { "module": "motion", "layer": "soft" }] }
+      ],
+      "scalability": { "cull_distance": 60, "min_pixels": 1, "importance": 0.5, "max_live": 3, "near_fade": [0.1, 0.3] },
+      "budget": { "fill_megapixel_layers": 1.5, "instances": 200, "lights": 0 }
+    }"#;
+
+    /// THE EDITOR'S PREVIEW IS HELD TO THESE: every generic module, the
+    /// three muzzle assets and a placed stream, run through `BurstSet` and
+    /// `simulate_all` in a turned, moved player frame with a lamp, and every
+    /// instance's 28 floats written to the editor
+    /// (`scene_editor_web/frontend/src/lib/__effect_stack_fixtures.json`),
+    /// which `effectStack.test.js` replays through its port. Writes them with
+    /// `WRITE_FIXTURES=1`; otherwise fails if what is there is not what the
+    /// engine makes now (re-export after any change to the stacks).
+    #[test]
+    fn the_editors_stack_fixtures_are_current() {
+        use serde_json::json;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scene_editor_web/frontend/src/lib/__effect_stack_fixtures.json");
+        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/effects");
+        let read = |name: &str| std::fs::read_to_string(game.join(format!("{name}.json"))).ok();
+        let (Some(rifle), Some(pistol), Some(quiet)) = (read("muzzle_556_a2"), read("muzzle_9mm_bare"), read("muzzle_suppressed")) else { return };
+        // The effect authored in the editor (2026-10-14), placed as a scene's object places it.
+        let steam = read("steam_vent").unwrap_or_default();
+        let yaw = 0.4f32;
+        let offset = Vec3::new(0.5, 0.0, -0.2);
+        let lamp = Light {
+            position: Vec3::new(-0.6, 2.2, -0.4),
+            direction: Vec3::NEG_Y,
+            kind: LightKind::Point,
+            color: crate::renderer::Color3(255, 214, 170, 255),
+            intensity: 2.5,
+            range: 5.0,
+            cone_angle_deg: 0.0,
+            inner_cone_angle_deg: 0.0,
+            mask_channel: None,
+            shadow_near: None,
+            source_radius: 0.03,
+            in_level_bake: true,
+        };
+        let lights = [lamp];
+        let ambient = |_: Vec3| Vec3::new(0.05, 0.05, 0.06);
+        let v3 = |v: Vec3| json!([v.x, v.y, v.z]);
+        let mut cases = Vec::new();
+        // (name, assets, exposure, head (player frame), events: (frame, burst | placed), times)
+        type Ev = (usize, &'static str, Vec3, Vec3, Option<(Vec3, Vec3)>, [f32; 4], u64, u64, Option<Placed>);
+        let shot = |frame: usize, asset: &'static str, seed: u64, heat: f32| -> Ev {
+            (frame, asset, Vec3::new(0.1, 1.45, -0.6), Vec3::new(0.2, 0.05, -1.0).normalize(), Some((Vec3::new(0.14, 1.47, -0.4), Vec3::new(1.0, 0.3, 0.2).normalize())), [heat, 0.0, 0.0, 0.0], 3, seed, None)
+        };
+        let specs: Vec<(&str, Vec<&str>, f32, Vec3, Vec<Ev>, Vec<f64>)> = vec![
+            ("sink_one_shot", vec![SINK], 2.5, Vec3::new(0.3, 1.6, 0.4), vec![shot(0, "fixture_sink", 11, 0.6)], vec![5.0, 5.0 + 1.0 / 36.0, 5.0 + 2.0 / 36.0, 5.0 + 3.0 / 36.0, 5.3, 5.9, 6.4, 7.1]),
+            (
+                "sink_automatic",
+                vec![SINK],
+                2.5,
+                Vec3::new(0.3, 1.6, 0.4),
+                (0..6).map(|k| shot(k * 3, "fixture_sink", 100 + k as u64, 0.15 * k as f32)).collect(),
+                (0..24).map(|k| 9.0 + k as f64 / 36.0).collect(),
+            ),
+            (
+                "placed_stream",
+                vec![VENT],
+                1.2,
+                Vec3::new(0.0, 1.6, 2.0),
+                vec![(0, "test_vent", Vec3::new(0.2, 0.0, -0.5), Vec3::Y, None, [0.0; 4], 77, 0, Some(Placed { scale: 1.5, rate: 0.8, tint: [1.0, 0.9, 0.8] }))],
+                vec![0.0, 0.5, 30.0, 30.0 + 1.0 / 36.0, 700.25],
+            ),
+            ("muzzle_556_a2", vec![], 4.0, Vec3::new(0.0, 1.6, 0.0), vec![shot(0, "muzzle_556_a2", 5, 0.3)], vec![2.0, 2.0 + 1.0 / 72.0, 2.3, 3.0]),
+            ("muzzle_9mm_bare", vec![], 9.0, Vec3::new(0.0, 1.6, 0.0), vec![shot(0, "muzzle_9mm_bare", 6, 0.0)], vec![2.0, 2.0 + 1.0 / 36.0, 2.5]),
+            ("muzzle_suppressed", vec![], 1.4, Vec3::new(0.0, 1.6, 0.0), vec![shot(0, "muzzle_suppressed", 7, 1.0)], vec![2.0, 2.0 + 1.0 / 36.0, 2.6, 3.4]),
+            (
+                "steam_vent",
+                vec![],
+                2.0,
+                Vec3::new(0.0, 1.6, 2.5),
+                vec![(0, "steam_vent", Vec3::new(0.0, 0.0, 0.0), Vec3::Y, None, [0.0; 4], 7, 0, Some(Placed::default()))],
+                vec![0.0, 1.0 / 36.0, 4.0, 30.0, 30.0 + 1.0 / 36.0],
+            ),
+        ];
+        for (name, extra, exposure, head, events, times) in specs {
+            let mut texts: Vec<String> = extra.iter().map(|t| t.to_string()).collect();
+            texts.extend([&rifle, &pistol, &quiet, &steam].into_iter().filter(|t| t.contains(&format!("\"name\": \"{name}\""))).cloned());
+            if texts.is_empty() {
+                continue; // (an effect not in this game/effects)
+            }
+            let mut lib = EffectLibrary::new();
+            for t in &texts {
+                lib.add(&EffectAsset::parse(t).unwrap()).unwrap();
+            }
+            let at = Surroundings { head, offset, yaw_inv: Quat::from_rotation_y(-yaw), lights: &lights, reaches: &every, ambient: &ambient, exposure };
+            let mut set = BurstSet::default();
+            let mut frames = Vec::new();
+            for (k, time) in times.iter().enumerate() {
+                for e in events.iter().filter(|e| e.0 == k) {
+                    let id = lib.id(e.1).unwrap();
+                    match e.8 {
+                        Some(p) => set.place(&lib, id, e.2, e.3, e.6, p),
+                        None => set.add(&lib, EffectBurst { port: e.4, inputs: e.5, velocity: Vec3::new(0.0, 0.2, 0.4), up: Vec3::new(0.1, 1.0, 0.0).normalize(), ..EffectBurst::new(id, e.2, e.3, e.6, e.7) }),
+                    }
+                }
+                let f = frame(&lib, &mut set, *time, &at);
+                assert_eq!(set.stats.thinned, 0, "the fixtures do not reach the governor");
+                frames.push(json!({
+                    "time": time, "over": f.over, "screened": f.screened,
+                    "instances": f.instances.iter().map(|i| bytemuck::cast::<EffectInstance, [f32; 28]>(*i).to_vec()).collect::<Vec<_>>(),
+                }));
+            }
+            cases.push(json!({
+                "name": name,
+                "assets": texts,
+                "surroundings": { "head": v3(head), "offset": v3(offset), "yaw": yaw, "exposure": exposure, "ambient": [0.05, 0.05, 0.06],
+                    "lights": [{ "position": v3(lights[0].position), "direction": v3(lights[0].direction), "kind": "Point", "color": [255, 214, 170, 255],
+                        "intensity": lights[0].intensity, "range": lights[0].range, "source_radius": lights[0].source_radius }] },
+                "events": events.iter().map(|e| json!({
+                    "frame": e.0, "asset": e.1, "position": v3(e.2), "direction": v3(e.3), "port": e.4.map(|(p, d)| json!([v3(p), v3(d)])),
+                    "inputs": e.5, "source": e.6.to_string(), "seed": e.7.to_string(), "velocity": [0.0, 0.2, 0.4], "up": v3(Vec3::new(0.1, 1.0, 0.0).normalize()),
+                    "placed": e.8.map(|p| json!({ "scale": p.scale, "rate": p.rate, "tint": p.tint })),
+                })).collect::<Vec<_>>(),
+                "frames": frames,
+            }));
+        }
+        let text = serde_json::to_string(&json!({
+            "about": "space_soup effects::stack::tests::the_editors_stack_fixtures_are_current: WRITE_FIXTURES=1 cargo test --release --lib the_editors_stack_fixtures",
+            "books": crate::renderer::effects::authoring::books_json(),
+            "cases": cases,
+        }))
+        .unwrap()
+            + "\n";
+        if std::env::var("WRITE_FIXTURES").is_ok() {
+            std::fs::write(&path, &text).unwrap();
+            eprintln!("wrote {} ({} bytes)", path.display(), text.len());
+        } else if let Ok(old) = std::fs::read_to_string(&path) {
+            assert!(old == text, "the editor's fixtures are not what the engine makes now: WRITE_FIXTURES=1 cargo test --release --lib the_editors_stack_fixtures, then npx vitest run effectStack");
+        }
+    }
+
+    /// A PLACED ASSET stands for as long as the level is loaded: its stream
+    /// keeps about rate x life alive at any hour, it is never retired or
+    /// taken over by a shot of the same asset, and its object's scale, rate
+    /// and tint are its sprites' size, its density and its colour.
+    #[test]
+    fn a_placed_asset_streams_for_as_long_as_the_level_is_loaded() {
+        let mut lib = EffectLibrary::new();
+        let id = lib.add(&EffectAsset::parse(VENT).unwrap()).unwrap();
+        let at = seen_from(Vec3::new(0.0, 1.6, 3.0), 1.0);
+        let run = |placed: Placed, time: f64| {
+            let mut set = BurstSet::default();
+            set.place(&lib, id, Vec3::ZERO, Vec3::Y, 7, placed);
+            // A shot of the same asset from the same source changes nothing of it.
+            set.add(&lib, EffectBurst::new(id, Vec3::new(5.0, 0.0, 0.0), Vec3::Y, 7, 1));
+            frame(&lib, &mut set, 0.0, &at);
+            let f = frame(&lib, &mut set, time, &at);
+            assert_eq!(set.live.iter().filter(|l| l.standing.is_some()).count(), 1, "still standing at {time} s");
+            f.instances.into_iter().filter(|i| i.centre[0].abs() < 2.0).collect::<Vec<_>>()
+        };
+        for time in [3.0, 700.0, 3600.0] {
+            let n = run(Placed::default(), time).len();
+            assert!((10..=20).contains(&n), "{n} puffs at {time} s (rate 10 x life 1-2 s)");
+        }
+        let one = run(Placed::default(), 30.0);
+        let big = run(Placed { scale: 2.0, ..Default::default() }, 30.0);
+        assert_eq!(one.len(), big.len());
+        for (a, b) in one.iter().zip(&big) {
+            assert_eq!(a.centre[..3], b.centre[..3], "scale sizes sprites, it does not move them");
+            assert!((b.centre[3] - 2.0 * a.centre[3]).abs() < 1e-5);
+        }
+        let dense = run(Placed { rate: 2.0, ..Default::default() }, 30.0);
+        assert!(dense.len() as f32 > 1.6 * one.len() as f32, "{} against {}", dense.len(), one.len());
+        let red = run(Placed { tint: [1.0, 0.5, 0.25], ..Default::default() }, 30.0);
+        for (a, b) in one.iter().zip(&red) {
+            assert_eq!(a.colour[0], b.colour[0]);
+            assert!((b.colour[1] - 0.5 * a.colour[1]).abs() < 1e-6 && (b.colour[2] - 0.25 * a.colour[2]).abs() < 1e-6);
+        }
+    }
+
+    /// THE GOVERNOR COVERS PLACED EMITTERS AND SPLASHES: with a row of smokes
+    /// and a row of splashes over the budget, the far ones are thinned
+    /// before the near, a tenth a frame; a fire's sheets are never thinned;
+    /// what it sheds is counted; every particle still drawn is the same bytes
+    /// it is in the whole frame; and with room again all of it comes back.
+    #[test]
+    fn the_governor_thins_far_placed_emitters_and_splashes_first() {
+        use crate::renderer::effects::{emitter_key, governor_wants, simulate_governed, splash_key, EffectKind, Shares, Splash};
+        let head = Vec3::new(0.0, 1.6, 0.0);
+        let at = seen_from(head, 1.0);
+        let lib = EffectLibrary::new();
+        let placed = |kind: EffectKind, id: String, position: Vec3| EffectEmitter {
+            id,
+            kind,
+            position,
+            direction: Vec3::Y,
+            extent: [Vec3::X, Vec3::Y, Vec3::Z],
+            scale: 1.0,
+            rate: 1.0,
+            tint: [1.0; 3],
+            ceiling: None,
+            variation: Default::default(),
+        };
+        let mut emitters: Vec<EffectEmitter> = (0..16).map(|k| placed(EffectKind::Smoke, format!("s{k}"), Vec3::new(0.5, 0.0, -2.0 - 1.5 * k as f32))).collect();
+        emitters.push(placed(EffectKind::Fire, "fire".into(), Vec3::new(-0.8, 0.0, -30.0)));
+        let splashes: Vec<Splash> = (0..8)
+            .map(|k| Splash { seed: 900 + k, ..Splash::new(Vec3::new(-0.5, 0.0, -3.0 - 3.0 * k as f32), 9.6, Vec3::new(0.0, -6.3, 0.0), 0.4, 30.0) })
+            .collect();
+        let mut set = BurstSet { budget: FrameBudget { fill: 1e9, instances: u32::MAX }, ..Default::default() };
+        let step = |set: &mut BurstSet, time: f64, governed: bool| {
+            let wants = governor_wants(&emitters, &|_| true, &splashes, &set.splash_measured, head);
+            let drawn = set.frame_with(&lib, time, &[], head, &wants);
+            let shares = Shares { emitter: &|e| set.share_of(emitter_key(e)), splash: &|s| set.share_of(splash_key(s)) };
+            let f = simulate_governed(&emitters, &|_| true, &splashes, Some(&BurstFrame { lib: &lib, set, drawn: &drawn }), governed.then_some(&shares), time, &at);
+            set.measured(&f.splash_costs);
+            set.end_frame();
+            f
+        };
+        // A budget with room for everything but half the smoke: the splashes
+        // (importance 0.7) outrank the smokes (0.6), so smoke is what goes.
+        for k in 0..12 {
+            step(&mut set, 9.7 + k as f64 / 36.0, true);
+        }
+        let wants = governor_wants(&emitters, &|_| true, &splashes, &set.splash_measured, head);
+        let all: f32 = wants.iter().map(|w| w.count).sum();
+        let smoke: f32 = wants.iter().filter(|w| w.kind == WantKind::Emitter && w.sheddable).map(|w| w.count).sum();
+        set.budget.instances = (all - 0.5 * smoke) as u32;
+        let mut sizes = Vec::new();
+        let mut last = EffectFrame::default();
+        for k in 0..16 {
+            last = step(&mut set, 10.0 + k as f64 / 36.0, true);
+            sizes.push(last.instances.len());
+        }
+        let s = set.stats;
+        assert!(s.instances_wanted > GOVERN_AIM * set.budget.instances as f32, "the test must ask for more than there is: {s:?}");
+        assert!(s.instances <= set.budget.instances as f32 * 1.05, "{s:?}");
+        assert!(s.emitters_thinned > 0 && s.splashes_thinned == 0, "{s:?}");
+        assert!(last.bursts.emitter_shed > 0 && last.bursts.splash_shed == 0, "{:?}", last.bursts);
+        // FAR FIRST.
+        let share = |e: &EffectEmitter| set.share_of(emitter_key(e));
+        assert_eq!(share(&emitters[0]), 1.0, "the nearest smoke is whole");
+        assert!(share(&emitters[15]) < 0.5, "the farthest is thinned: {}", share(&emitters[15]));
+        assert!(emitters[..16].windows(2).all(|w| share(&w[0]) >= share(&w[1])), "{:?}", emitters.iter().map(share).collect::<Vec<_>>());
+        assert_eq!(share(&emitters[16]), 1.0, "a fire's sheets are never thinned");
+        // Tighter still: the splashes are thinned too, the far first.
+        set.budget.instances = (0.03 * all) as u32;
+        for k in 16..32 {
+            last = step(&mut set, 10.0 + k as f64 / 36.0, true);
+        }
+        let wet = |s: &Splash| set.share_of(splash_key(s));
+        assert!(set.stats.splashes_thinned > 0 && last.bursts.splash_shed > 0, "{:?} {:?}", set.stats, last.bursts);
+        assert!(wet(&splashes[7]) < wet(&splashes[0]), "{:?}", splashes.iter().map(wet).collect::<Vec<_>>());
+        assert!(set.stats.instances <= set.budget.instances as f32 * 1.05, "{:?}", set.stats);
+        // A tenth a frame.
+        assert!(sizes[2..].windows(2).all(|w| w[0] as f32 - w[1] as f32 <= 0.2 * sizes[1] as f32), "{sizes:?}");
+        // SPARSER, NOT SMALLER OR DIMMER.
+        let whole = step(&mut set.clone(), 10.0 + 32.0 / 36.0, false);
+        let thinned = step(&mut set.clone(), 10.0 + 32.0 / 36.0, true);
+        assert!(whole.instances.len() > thinned.instances.len());
+        let key = |i: &EffectInstance| bytemuck::bytes_of(i).to_vec();
+        let all: std::collections::HashSet<Vec<u8>> = whole.instances.iter().map(key).collect();
+        assert!(thinned.instances.iter().all(|i| all.contains(&key(i))), "a thinned frame's particles are the whole frame's, fewer");
+        // With room again, all of it comes back.
+        set.budget = FrameBudget::default();
+        for k in 32..56 {
+            last = step(&mut set, 10.0 + k as f64 / 36.0, true);
+        }
+        assert_eq!((set.stats.emitters_thinned, set.stats.splashes_thinned, last.bursts.emitter_shed, last.bursts.splash_shed), (0, 0, 0, 0));
     }
 
     /// THE GOVERNOR: with more bursts in view than the frame's budget, the
@@ -1720,7 +2314,8 @@ mod tests {
         assert!(farthest_whole > 0.0 && nearest_thinned > farthest_whole, "whole out to {farthest_whole} m, thinned from {nearest_thinned} m");
         // Thinned by a tenth a frame: no frame loses its puffs at once.
         assert!(sizes[1..].windows(2).all(|w| w[0] as f32 - w[1] as f32 <= 0.2 * sizes[1] as f32), "{sizes:?}");
-        assert!(sizes[13] < sizes[1], "{sizes:?}");
+        // Never drawn before, they start where the governor wants them:
+        // nothing on screen went at once.
         // SPARSER, NOT SMALLER OR DIMMER: every particle still drawn is the
         // same bytes as with no governor at all.
         let mut free = BurstSet { budget: FrameBudget { fill: 1e9, instances: u32::MAX }, ..Default::default() };
@@ -1767,9 +2362,13 @@ mod tests {
             ceiling: None,
             variation: Default::default(),
         };
-        println!("| scale | facing | emitters seen | bursts live / seen | splashes seen | instances | over + screened | draws | fill wanted -> drawn | thinned | CPU ms a frame (median) |");
-        println!("|---|---|---|---|---|---|---|---|---|---|---|");
-        for units in [1usize, 4, 16] {
+        println!(
+            "| scale | governor | facing | emitters seen | bursts live / seen | splashes seen | instances (worst) | over + screened | draws | est. fill wanted -> held (budget {}) | drawn fill, worst | instances wanted -> held (budget {}) | thinned: bursts / emitters / splashes | shed a frame: bursts / emitters / splashes | CPU ms a frame (median) |",
+            FRAME_FILL_BUDGET, FRAME_INSTANCE_BUDGET
+        );
+        println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+        let mut worst_at_16 = (0.0f32, 0usize, 0.0f32);
+        for (units, governed) in [(1usize, true), (4, true), (16, false), (16, true)] {
             let side = (units as f32).sqrt().round() as usize;
             let posts: Vec<Vec3> = (0..units).map(|u| Vec3::new((u % side) as f32 * 8.0, 0.0, (u / side) as f32 * 8.0)).collect();
             let mut emitters = Vec::new();
@@ -1796,7 +2395,11 @@ mod tests {
                 let mut splashes: Vec<Splash> = Vec::new();
                 let (mut shots, mut struck) = (0u64, 0u64);
                 let (mut times, mut frames): (Vec<f64>, u32) = (Vec::new(), 0);
-                let mut sums = [0.0f64; 10];
+                let mut sums = [0.0f64; 16];
+                let (mut worst_fill, mut worst_instances, mut shed) = (0.0f32, 0usize, [0.0f64; 3]);
+                if !governed {
+                    set.budget = FrameBudget { fill: 1e9, instances: u32::MAX };
+                }
                 for step in 0..(6 * 36) {
                     let time = 100.0 + step as f64 / 36.0;
                     // Each rifle's shots since the last frame, at 12.5 a second.
@@ -1821,12 +2424,37 @@ mod tests {
                     let start = std::time::Instant::now();
                     let seen: Vec<bool> = emitters.iter().map(|e| emitter_seen(e, &views, head, &[], &[])).collect();
                     let wet: Vec<Splash> = splashes.iter().copied().filter(|s| splash_seen(s, time, &views)).collect();
-                    let drawn = set.frame(&lib, time, &views, head);
-                    let f = simulate_all(&emitters, &|i| seen[i], &wet, Some(&BurstFrame { lib: &lib, set: &set, drawn: &drawn }), time, &at);
+                    // THE WHOLE FRAME GOVERNED, as `render_frame` runs it:
+                    // the placed emitters and splashes weighed with the bursts.
+                    let wants = crate::renderer::effects::governor_wants(&emitters, &|i| seen[i], &wet, &set.splash_measured, head);
+                    let drawn = set.frame_with(&lib, time, &views, head, &wants);
+                    let shares = crate::renderer::effects::Shares {
+                        emitter: &|e| set.share_of(crate::renderer::effects::emitter_key(e)),
+                        splash: &|s| set.share_of(crate::renderer::effects::splash_key(s)),
+                    };
+                    let f = crate::renderer::effects::simulate_governed(
+                        &emitters,
+                        &|i| seen[i],
+                        &wet,
+                        Some(&BurstFrame { lib: &lib, set: &set, drawn: &drawn }),
+                        if governed { Some(&shares) } else { None },
+                        time,
+                        &at,
+                    );
                     let (runs, stats) = variants::runs(&f, true);
                     std::hint::black_box(&runs);
                     let took = start.elapsed().as_secs_f64();
+                    set.measured(&f.splash_costs);
                     set.end_frame();
+                    // What the frame drew, measured from its particles.
+                    let drawn_fill: f32 = f.instances.iter().map(|i| crate::renderer::effects::instance_fill(i, head)).sum();
+                    if step >= 4 * 36 {
+                        worst_fill = worst_fill.max(drawn_fill);
+                        worst_instances = worst_instances.max(f.instances.len());
+                        shed[0] += f.bursts.shed as f64;
+                        shed[1] += f.bursts.emitter_shed as f64;
+                        shed[2] += f.bursts.splash_shed as f64;
+                    }
                     if step >= 4 * 36 {
                         times.push(took);
                         frames += 1;
@@ -1841,6 +2469,12 @@ mod tests {
                             stats.draws as f64,
                             set.stats.fill_wanted as f64,
                             set.stats.fill as f64,
+                            set.stats.instances_wanted as f64,
+                            set.stats.instances as f64,
+                            set.stats.thinned as f64,
+                            set.stats.emitters_thinned as f64,
+                            set.stats.splashes_thinned as f64,
+                            drawn_fill as f64,
                         ]
                         .into_iter()
                         .enumerate()
@@ -1850,8 +2484,10 @@ mod tests {
                     }
                 }
                 let n = frames as f64;
+                times.sort_by(f64::total_cmp);
                 println!(
-                    "| {units}x | {facing} | {:.0} of {} | {:.0} / {:.0} | {:.0} of {} | {:.0} | {:.0} + {:.0} | {:.1} | {:.2} -> {:.2} | {} | {:.3} |",
+                    "| {units}x | {} | {facing} | {:.0} of {} | {:.0} / {:.0} | {:.0} of {} | {:.0} ({}) | {:.0} + {:.0} | {:.1} | {:.2} -> {:.2} | {:.2}, {:.2} | {:.0} -> {:.0} | {:.0} / {:.0} / {:.0} | {:.0} / {:.0} / {:.0} | {:.3} |",
+                    if governed { "on" } else { "off" },
                     sums[0] / n,
                     emitters.len(),
                     sums[1] / n,
@@ -1859,19 +2495,35 @@ mod tests {
                     sums[3] / n,
                     splashes.len(),
                     sums[4] / n,
+                    worst_instances,
                     sums[5] / n,
                     sums[6] / n,
                     sums[7] / n,
                     sums[8] / n,
                     sums[9] / n,
-                    format!("{} ({} dropped)", set.stats.thinned, set.stats.dropped),
-                    {
-                        times.sort_by(f64::total_cmp);
-                        times[times.len() / 2] * 1e3
-                    }
+                    sums[15] / n,
+                    worst_fill,
+                    sums[10] / n,
+                    sums[11] / n,
+                    sums[12] / n,
+                    sums[13] / n,
+                    sums[14] / n,
+                    shed[0] / n,
+                    shed[1] / n,
+                    shed[2] / n,
+                    times[times.len() / 2] * 1e3
                 );
+                if units == 16 && governed && facing == "toward" {
+                    worst_at_16 = (sums[9] as f32 / n as f32, worst_instances, sums[11] as f32 / n as f32);
+                }
             }
         }
+        // AT 16x, GOVERNED: the frame's estimated fill and instances are held
+        // to the budget (the frame's own fixed parts -- a fire's sheets, a
+        // flash -- besides, which it cannot shed).
+        let (fill, _, instances) = worst_at_16;
+        assert!(fill <= FRAME_FILL_BUDGET * 1.05, "16x: estimated fill {fill} over the budget {FRAME_FILL_BUDGET}");
+        assert!(instances <= FRAME_INSTANCE_BUDGET as f32 * 1.05, "16x: {instances} instances over the budget {FRAME_INSTANCE_BUDGET}");
     }
 
 }

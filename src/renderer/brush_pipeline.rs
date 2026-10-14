@@ -2504,6 +2504,13 @@ const SCAN_FROM_UNIFORMS: &str = "def_scan_uniform";
 /// part cut out at a time -- see `BrushPipeline::log_deferred_register_cuts`.
 const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("def_cut_none", &[]),
+    // NOT THE PICTURE (the `pass_cut` lever draws with it): a carried torch's glass seen in the reflections from
+    // every way in front of it, outside its beam too, as until 2026-10-13
+    // (the patch of white speckle beside the pool). See `capsule_glass_beam`.
+    (
+        "def_glass_any_way",
+        &[("let into = select(1.0, s * s * (3.0 - 2.0 * s), lights.lights[i].params.z > 0.5);", "let into = 1.0;")],
+    ),
     ("def_cut_rim_detect", &[("        if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
     ("def_cut_edge_detect", &[("        if (hit.edge_code < 0 && proxy.edge >= 0) {", "        if (false) {")]),
     (
@@ -3387,6 +3394,26 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     // Against `scene_cut_none` in one build, the precision alone -- with
     // `HALF_PRECISION` on; off as shipped since B1, this IS `scene_cut_none`.
     ("scene_all_f32", &[("alias hf = f32;\n", "alias hf = f32; // scene_all_f32\n")]),
+    // DIAGNOSTIC, NOT THE PICTURE: each brush pixel RED where the reflection
+    // pass traces it -- its roughness, one mip coarser as the half-resolution
+    // pass reads it, under `PROBE_LOBE_HEMISPHERICAL` -- and GREEN where the
+    // pass skips it as too rough. Counted offline (`LINEAR=1 EXPOSURE=1`),
+    // what the trace is spent on and what a material's roughness decides
+    // (docs/specular-status-2026-10-13.md).
+    // NOT THE PICTURE: the lamps' highlight as it shipped until 2026-10-13, a
+    // fixed peak with no normalisation, Fresnel or n.l -- the sheen on rough
+    // stone under a torch. See `lights::lamp_highlight_share`.
+    (
+        "scene_highlight_uncapped",
+        &[("    out.specular = radiance * spec * atten * lamp_highlight_share(view_dir, h, ndotl, aa.y, shininess, spec_strength);", "    out.specular = radiance * spec * atten * aa.y;")],
+    ),
+    (
+        "scene_census_trace",
+        &[(
+            "    return vec4<f32>(tonemap(c), reflection_alpha(lit));",
+            "    let census = clamp(textureSampleBias(mat_rough, mat_rough_samp, in.uv, i32(in.material), 1.0).r, 0.04, 1.0) < PROBE_LOBE_HEMISPHERICAL;\n    return vec4<f32>(select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), census), 1.0);",
+        )],
+    ),
 ];
 
 /// MEASUREMENT: text edits of every scene reader's generated WGSL -- the

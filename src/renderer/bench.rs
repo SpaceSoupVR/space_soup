@@ -101,6 +101,17 @@ pub struct BenchPose {
     /// measures what it names. See quest_app's `flashlight`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flashlight: Option<BenchFlashlight>,
+    /// THE DOORS for this view, degrees from shut, in the scene's order (as
+    /// `DOORS=a,b,c,d` in the offline harness): held at these angles, or with
+    /// [`Self::door_swing`] swung from shut to them and back. Absent: as the
+    /// player and the server left them. See [`Self::door_angles_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doors: Option<Vec<f32>>,
+    /// Seconds for each door to swing from shut to its [`Self::doors`] angle
+    /// and back, smoothly (a player opening a door and letting it close):
+    /// a door that MOVES every frame, against the same angles held still.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub door_swing: Option<f32>,
 }
 
 /// A flashlight a bench view holds still. See [`BenchPose::flashlight`].
@@ -117,6 +128,17 @@ pub struct BenchFlashlight {
 }
 
 impl BenchPose {
+    /// The doors' angles, degrees, `t` seconds into the view; none when it
+    /// names none. See [`Self::doors`].
+    pub fn door_angles_at(&self, t: f32) -> Option<Vec<f32>> {
+        let doors = self.doors.as_ref()?;
+        let k = match self.door_swing.filter(|s| *s > 0.0) {
+            Some(period) => 0.5 - 0.5 * (std::f32::consts::TAU * t / period).cos(),
+            None => 1.0,
+        };
+        Some(doors.iter().map(|a| a * k).collect())
+    }
+
     /// Whether the rig is somewhere else from one frame to the next.
     pub fn moves(&self) -> bool {
         self.sway.is_some() || self.path.is_some() || self.spin.is_some()
@@ -331,8 +353,22 @@ pub fn pin_xr_views(views: &mut [openxr::View], located: bool, rig: &BenchRig) {
 mod tests {
     use super::*;
 
+    /// A view's doors held open, or swung shut-open-shut over its period.
+    #[test]
+    fn a_views_doors_are_held_or_swung() {
+        let held = BenchPose { doors: Some(vec![80.0, -60.0]), ..pose([0.0; 3], [1.0; 3]) };
+        assert_eq!(held.door_angles_at(3.7), Some(vec![80.0, -60.0]));
+        let swung = BenchPose { door_swing: Some(4.0), ..held.clone() };
+        assert_eq!(swung.door_angles_at(0.0), Some(vec![0.0, 0.0]));
+        let half = swung.door_angles_at(2.0).unwrap();
+        assert!((half[0] - 80.0).abs() < 1e-3 && (half[1] + 60.0).abs() < 1e-3);
+        assert!(pose([0.0; 3], [1.0; 3]).door_angles_at(1.0).is_none());
+        let parsed: BenchPose = serde_json::from_str(r#"{"name":"d","eye":[0,1,0],"at":[1,1,0],"doors":[80,80],"door_swing":2.5}"#).unwrap();
+        assert_eq!(parsed.door_swing, Some(2.5));
+    }
+
     fn pose(eye: [f32; 3], at: [f32; 3]) -> BenchPose {
-        BenchPose { name: "t".into(), eye, at, rig_yaw: None, sway: None, path: None, speed: None, spin: None, flashlight: None }
+        BenchPose { name: "t".into(), eye, at, rig_yaw: None, sway: None, path: None, speed: None, spin: None, flashlight: None, doors: None, door_swing: None }
     }
 
     /// Through the same transform the app puts every tracked pose through:

@@ -672,6 +672,11 @@ pub struct LightsUniform {
     /// index, or `usize::MAX` for none. Uploaded as each light's shadow layer,
     /// `MAX_SPOT_SHADOWS + k` (`character_shadow_tile` in the shader).
     tile_lamps: std::cell::Cell<[usize; super::shadow::MAX_CHARACTER_SHADOWS]>,
+    /// What the live lamps' pools put in front of the eye this frame, in the
+    /// WORLD, as the eye's meter takes light the probes' photographs never
+    /// saw: (direction from the head, luminance, solid angle). See
+    /// [`Self::set_pool_light`].
+    pool_light: std::cell::RefCell<Vec<(Vec3, f32, f32)>>,
 }
 
 impl LightsUniform {
@@ -691,7 +696,27 @@ impl LightsUniform {
             surfaces: std::cell::Cell::new([None; MAX_LIT_SURFACES]),
             pool_row: std::cell::Cell::new(None),
             tile_lamps: std::cell::Cell::new([usize::MAX; super::shadow::MAX_CHARACTER_SHADOWS]),
+            pool_light: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// THE POOLS THE LIVE LAMPS THROW, AS THE EYE SEES THEM: samples for
+    /// `exposure::EyeAdaptation::meter_with`, (direction from the head,
+    /// luminance, solid angle) in the WORLD, from where a beam lands
+    /// (`quest_app::flashlight_bounce::Landings::meter_samples`). The
+    /// photographs the meter reads hold the level's own light only, so
+    /// without these a torch a hand's width from a wall was drawn at the dark
+    /// room's exposure, its pool flat white (2026-10-13). Read by the frame's
+    /// meter; `&[]` for none.
+    pub fn set_pool_light(&self, samples: &[(Vec3, f32, f32)]) {
+        let mut held = self.pool_light.borrow_mut();
+        held.clear();
+        held.extend_from_slice(samples);
+    }
+
+    /// What [`Self::set_pool_light`] last set.
+    pub fn pool_light(&self) -> Vec<(Vec3, f32, f32)> {
+        self.pool_light.borrow().clone()
     }
 
     /// The lights holding the moving casters' tiles, tile by tile: `lamps[k]`
@@ -1883,7 +1908,21 @@ fn capsule_reflection(p: vec3<f32>, d: vec3<f32>, roughness: f32, lit: vec3<f32>
 // mirror at `p` are one line, so the shadow on the wall and the image in it
 // now go together. Its beam is the shadowed spot standing at the glass
 // (`flashlight::torch_capsules` puts the glass on the beam's origin); a point
-// outside its map, or a glass with no shadowed beam, sees it whole.
+// outside its map, or a glass with no shadowed beam, is not shadowed.
+//
+// AND ONLY AS FAR AS THE BEAM SHINES TOWARD `p` (2026-10-13). A torch's glass
+// is bright only into its beam: seen from outside the cone it sends nothing
+// that way -- the glass's radiance toward `p` is the beam's intensity toward
+// `p` over the glass's area, so its image in a mirror at `p` falls off with
+// the beam's own cone, full in the hot spot, nothing past the spill. Without
+// this the glass was drawn at its full drive toward every direction in front
+// of it, and "outside its map" -- every point outside the cone -- saw it
+// whole: on rough stone a hand's width from a wall that put a patch of hard
+// white speckle beside the torch's pool, at the mirror point between the eye
+// and the hand, and seen along the wall a white streak (headset, 2026-10-13;
+// offline: the patch is in the probe pass's answer alone and goes with
+// `TORCH=0`). Its light reaching `p` and its image seen from `p` are one
+// line: the same cone the lamp loop lights `p` with, unwidened.
 //
 // ASKED LAST, inside `capsule_reflection` once its answer is made: asked
 // while that answer's colour, cover and light were still held -- at the end
@@ -1897,10 +1936,18 @@ fn capsule_glass_beam(p: vec3<f32>, glass: vec3<f32>) -> f32 {{
         if (dot(apart, apart) >= GLASS_ON_ITS_BEAM * GLASS_ON_ITS_BEAM) {{
             continue;
         }}
+        // The beam's cone toward `p`, as `surface_lights` ramps a cone: 1 for
+        // a point light, which shines every way.
+        let to_p = p - lights.lights[i].position.xyz;
+        let cos_p = dot(to_p, lights.lights[i].direction.xyz) * inverseSqrt(max(dot(to_p, to_p), 1e-12));
+        let cos_outer = lights.lights[i].params.y;
+        let s = clamp((cos_p - cos_outer) / max(lights.lights[i].direction.w - cos_outer, 1e-4), 0.0, 1.0);
+        let into = select(1.0, s * s * (3.0 - 2.0 * s), lights.lights[i].params.z > 0.5);
         let layer = i32(lights.lights[i].params.w);
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
-            return pcf_layer_tap(spot_shadow_tex, layer, p, spot_view_proj(layer));
+            return into * pcf_layer_tap(spot_shadow_tex, layer, p, spot_view_proj(layer));
         }}
+        return into;
     }}
     return 1.0;
 }}
@@ -2761,6 +2808,33 @@ fn terminator_width_of(normal_length: f32) -> f32 {{
     return min(sqrt(1.5 * sigma2), TERMINATOR_MAX_WIDTH);
 }}
 
+// HOW MUCH OF A LAMP'S HIGHLIGHT A SURFACE MAY SEND BACK, as a factor on
+// `spec_strength` (2026-10-13): the highlight as shipped, `spec_strength` x
+// the facing share, but never more than an energy-conserving one gives --
+// Blinn-Phong normalised for its exponent, `(s + 8) / 8` (Akenine-Moller et
+// al.), times Schlick's Fresnel at the half vector from a dielectric's 4%,
+// times the box-filtered `n . l` the diffuse half takes (the lamps' units are
+// E/pi, so the pi of the BRDF's normalisation cancels).
+//
+// WHY A CAP AND NOT A REPLACEMENT. The shipped highlight has neither the
+// normalisation nor the Fresnel nor the `n . l`: a fixed peak, `0.35 (1 - r)`,
+// whatever the lobe's width. That is about right for a narrow lobe -- marble's
+// exponent is at its 320 clamp, where the normalised peak is five times
+// higher still, so the cap leaves it exactly as it was -- and far too much for
+// a wide one: rough stone a hand's width from a torch, its lobe widened by the
+// source size to an exponent of 1-3, spread a fixed 0.07-0.2 of the light
+// over the whole pool as a sheen. Measured on the brick hall's wall at 0.6 m
+// against Cycles with the same maps and spot: the highlight was 11.6% of the
+// pool's light where the path tracer's specular is 1.1% (`docs/
+// specular-status-2026-10-13.md`), the stone reading wet. Capped, every
+// highlight is at most what physics allows and never brighter than it was.
+fn lamp_highlight_share(view_dir: vec3<f32>, h: vec3<f32>, nl: f32, facing: f32, shininess: f32, spec_strength: f32) -> f32 {{
+    let g = 1.0 - clamp(dot(view_dir, h), 0.0, 1.0);
+    let g2 = g * g;
+    let fresnel = 0.04 + 0.96 * (g2 * g2 * g);
+    return min(facing, fresnel * (shininess + 8.0) * 0.125 * nl / max(spec_strength, 1e-4));
+}}
+
 fn light_contribution_split(
     l: Light,
     world_pos: vec3<f32>,
@@ -2813,7 +2887,7 @@ fn light_contribution_split(
     if (aa.y > 0.0 && atten > 0.0 && l.params.w > -1.5) {{
         let h = normalize(l_dir + view_dir);
         let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;
-        out.specular = radiance * spec * atten * aa.y;
+        out.specular = radiance * spec * atten * lamp_highlight_share(view_dir, h, ndotl, aa.y, shininess, spec_strength);
     }}
     return out;
 }}
@@ -8100,7 +8174,7 @@ mod baked_gloss_tests {
             "let sigma2 = max(1.0 - normal_length - 0.01, 0.0) / max(normal_length, 1e-3);",
             "return min(sqrt(1.5 * sigma2), TERMINATOR_MAX_WIDTH);",
             "let aa = terminator_aa(dot(n, l_dir));",
-            "out.specular = radiance * spec * atten * aa.y;",
+            "out.specular = radiance * spec * atten * lamp_highlight_share(view_dir, h, ndotl, aa.y, shininess, spec_strength);",
         ] {
             assert!(code.contains(line), "the lights block no longer has `{line}`");
         }
@@ -9688,6 +9762,144 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
+/// A LAMP'S HIGHLIGHT IS NEVER MORE THAN PHYSICS ALLOWS (2026-10-13), run on
+/// the GPU through `light_contribution_split` as the scene readers call it:
+/// rough stone a hand's width from a torch, its lobe widened as the readers
+/// widen it, sends back a normalised Blinn-Phong's share at a dielectric's
+/// Fresnel -- a few percent of the light, where it sent a fixed 0.14 (the
+/// brick hall's wall read wet under the torch, headset 2026-10-13) -- while
+/// marble's narrow lobe, and every highlight at all, keeps what it had.
+#[cfg(test)]
+mod highlight_cap_tests {
+    use glam::Vec3;
+    use wgpu::util::DeviceExt;
+    use wgpu::{BindGroupDescriptor, BindGroupEntry, BufferDescriptor, BufferUsages, ShaderModuleDescriptor, ShaderSource};
+
+    /// `(diffuse, specular)` red of a white point lamp of intensity 1 at
+    /// `lamp`, lighting a surface at the origin facing +z, seen from `eye`,
+    /// with the highlight's exponent and strength given as the readers give
+    /// them.
+    fn split(cases: &[(Vec3, Vec3, f32, f32)]) -> Option<Vec<(f32, f32)>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let code = format!(
+            "{}\n
+@group(1) @binding(0) var<storage, read> q: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+@compute @workgroup_size(1)
+fn split_main(@builtin(global_invocation_id) id: vec3<u32>) {{
+    var l: Light;
+    l.position = vec4<f32>(q[id.x * 2u].xyz, -1.0);
+    l.direction = vec4<f32>(0.0, 0.0, -1.0, 1.0);
+    l.color_intensity = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    l.params = vec4<f32>(100.0, -1.0, 0.0, -1.0);
+    let eye = q[id.x * 2u + 1u].xyz;
+    let c = light_contribution_split(l, vec3<f32>(0.0), vec3<f32>(0.0, 0.0, 1.0), normalize(eye), q[id.x * 2u].w, q[id.x * 2u + 1u].w);
+    out[id.x] = vec4<f32>(c.diffuse.r, c.specular.r, 0.0, 0.0);
+}}
+",
+            super::wgsl_lights_block(0, 1)
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("split_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let lights_uniform = super::LightsUniform::new(&device);
+        lights_uniform.upload_frame(&queue, &[], &[], false);
+        let packed: Vec<[f32; 4]> =
+            cases.iter().flat_map(|(lamp, eye, s, k)| [[lamp.x, lamp.y, lamp.z, *s], [eye.x, eye.y, eye.z, *k]]).collect();
+        let q = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&packed),
+            usage: BufferUsages::STORAGE,
+        });
+        let size = (cases.len() * 16) as u64;
+        let out = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST, mapped_at_creation: false });
+        let g0 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[BindGroupEntry { binding: 1, resource: lights_uniform.buffer().as_entire_binding() }],
+        });
+        let g1 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[BindGroupEntry { binding: 0, resource: q.as_entire_binding() }, BindGroupEntry { binding: 1, resource: out.as_entire_binding() }],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups(cases.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let got: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+        Some(got.iter().map(|c| (c[0], c[1])).collect())
+    }
+
+    /// The readers' lobe for roughness `r` with the nearest bulb `d` away:
+    /// `shade_material_lamps`' widening and exponent, and its strength.
+    fn lobe(r: f32, d: f32) -> (f32, f32) {
+        const LIGHT_SOURCE_RADIUS: f32 = 0.35;
+        let alpha = r * r;
+        let widened = (alpha + LIGHT_SOURCE_RADIUS / (2.0 * d.max(0.05))).clamp(alpha, 1.0);
+        ((2.0 / (widened * widened) - 2.0).clamp(1.0, 320.0), 0.35 * (1.0 - r))
+    }
+
+    #[test]
+    fn a_highlight_is_never_more_than_physics_allows() {
+        // The lamp 0.6 m off, seen from beside it at the mirror angle (the
+        // eye where the torch-holding hand's head is) and from 40 degrees.
+        let lamp = Vec3::new(0.15, 0.0, 0.6);
+        let mirror = Vec3::new(-0.15, 0.0, 0.6);
+        let aside = Vec3::new(-0.6 * 40f32.to_radians().sin(), 0.0, 0.6 * 40f32.to_radians().cos());
+        let (stone_s, stone_k) = lobe(0.6, 0.6);
+        let (marble_s, marble_k) = lobe(0.048, 3.0);
+        let (marble_near_s, marble_near_k) = lobe(0.048, 0.6);
+        let cases = [
+            (lamp, mirror, stone_s, stone_k),
+            (lamp, aside, stone_s, stone_k),
+            (lamp * 5.0, mirror * 5.0, marble_s, marble_k),
+            (lamp, mirror, marble_near_s, marble_near_k),
+        ];
+        let Some(got) = split(&cases) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        for (c, (d, s)) in cases.iter().zip(&got) {
+            eprintln!("exponent {:6.1} strength {:.3}: diffuse {d:.4} highlight {s:.4} ({:.1}% of the diffuse light)", c.2, c.3, 100.0 * s / d);
+        }
+        // What shipped: the peak `pow(n.h, s) * strength` on the share facing
+        // the lamp (1 here), times the falloff the diffuse has over its n.l.
+        let shipped = |k: usize| {
+            let (l, e, s, st) = cases[k];
+            let h = (l.normalize() + e.normalize()).normalize();
+            let nl = l.normalize().z;
+            got[k].0 / nl * h.z.powf(s) * st
+        };
+        // ROUGH STONE AT THE TORCH: a normalised lobe, Fresnel 4% at the
+        // mirror angle -- (2.7 + 8) / 8 x 0.04 x n.l: about a fifteenth of
+        // the 0.14 it sent before, in proportion to the light it takes.
+        let stone = got[0].1 / got[0].0;
+        assert!(stone < 0.07, "rough stone's highlight at the torch: {stone} of its diffuse light");
+        assert!(got[0].1 < 0.5 * shipped(0), "and well under what shipped: {} against {}", got[0].1, shipped(0));
+        assert!(got[1].1 <= got[0].1, "and less off the mirror angle");
+        // MARBLE across a room keeps its highlight exactly; beside a torch,
+        // its lobe widened, it may lose some but never gains.
+        assert!((got[2].1 - shipped(2)).abs() <= 1e-4 * shipped(2).max(1e-6), "marble across the room: {} against {}", got[2].1, shipped(2));
+        assert!(got[3].1 <= shipped(3) * (1.0 + 1e-4) && got[3].1 > 0.2 * shipped(3), "marble beside a torch: {} against {}", got[3].1, shipped(3));
+    }
+}
+
 /// A SPOT'S POOL SEEN EDGE-ON, as `spot_cone` draws it: test_room's corner
 /// spot (34 degrees, a 16-degree core) 0.85 m from the wall it lights, the
 /// wall seen from 15 m down the hall at about 5 degrees, where a pixel spans
@@ -10290,7 +10502,7 @@ fn ambient_main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// and `CapsuleGroup::surfaces`.
 #[cfg(test)]
 mod capsule_reflection_tests {
-    use glam::Vec3;
+    use glam::{Quat, Vec3};
     use wgpu::util::DeviceExt;
     use wgpu::{
         BindGroupDescriptor, BindGroupEntry, BindingResource, BufferDescriptor, BufferUsages, ShaderModuleDescriptor,
@@ -10712,16 +10924,72 @@ fn seen_main(@builtin(global_invocation_id) id: vec3<u32>) {
             "GLASS PAST ITS BEAM: whole {whole:?}\n  shadowed {shadowed:?}\n  lit {lit:?}\n  another lamp {elsewhere:?}\n  no layer {unlayered:?}"
         );
         for (i, what) in [(0, "head on"), (1, "off the axis")] {
+            // As much as the beam shines toward the point (`beam_toward`):
+            // the second point is just past the hot spot's edge.
+            let k = beam_toward(&lamp, rays[i].0);
+            assert!(k > 0.99, "{what}: inside the hot spot, or all but: {k}");
             assert!(whole[i][0] > 1.0, "{what}: the capsules give the glass a glow: {:?}", whole[i]);
             assert!(shadowed[i].iter().all(|g| *g < 1e-4), "{what}: the shadowed point still sees the glass: {:?}", shadowed[i]);
             for c in 0..3 {
-                assert!(near(lit[i][c], whole[i][c], 1e-3 * whole[i][c]), "{what}: a lit point sees all of it: {:?}", lit[i]);
+                assert!(near(lit[i][c], whole[i][c] * k, 1e-3 * whole[i][c]), "{what}: a lit point sees all of it: {:?}", lit[i]);
                 assert_eq!(elsewhere[i][c], whole[i][c], "{what}: a lamp elsewhere is not its beam");
-                assert_eq!(unlayered[i][c], whole[i][c], "{what}: a beam with no shadow layer");
+                assert!(near(unlayered[i][c], whole[i][c] * k, 1e-3 * whole[i][c]), "{what}: a beam with no shadow layer: {:?}", unlayered[i]);
             }
         }
-        assert!(whole[2][0] > 1.0, "off to the side the glass still shows: {:?}", whole[2]);
-        assert_eq!(shadowed[2], whole[2], "outside the beam's map nothing is known to hide it");
+        // 80 degrees off the beam: with no beam known, the capsules' glow; with
+        // its beam, NONE -- the glass sends nothing that way, map or no map
+        // (until 2026-10-13 it showed whole there: a white patch of speckle
+        // beside the torch's pool on rough stone).
+        assert!(whole[2][0] > 1.0, "with no beam known the glass shows: {:?}", whole[2]);
+        assert!(shadowed[2].iter().all(|g| *g == 0.0), "outside its beam the glass sends nothing: {:?}", shadowed[2]);
+        assert!(unlayered[2].iter().all(|g| *g == 0.0), "outside its beam, shadow layer or not: {:?}", unlayered[2]);
+        assert_eq!(elsewhere[2], whole[2], "a lamp elsewhere is not its beam");
+    }
+
+    /// The share of `lamp`'s light that leaves it toward `p`: its cone's
+    /// smoothstep in the cosine, the shader's `capsule_glass_beam` ramp.
+    fn beam_toward(lamp: &super::Light, p: Vec3) -> f32 {
+        let cos_p = (p - lamp.position).normalize().dot(lamp.direction.normalize());
+        let (outer, inner) = lamp.cone_cosines();
+        let s = ((cos_p - outer) / (inner - outer).max(1e-4)).clamp(0.0, 1.0);
+        s * s * (3.0 - 2.0 * s)
+    }
+
+    /// A TORCH'S GLASS SHOWS IN A MIRROR ONLY AS FAR AS ITS BEAM SHINES THERE
+    /// (2026-10-13): a mirror point that looks back at the glass from inside
+    /// the hot spot sees it whole, one on the cone's ramp sees the ramp's
+    /// share of it, and one outside the spill sees nothing -- the patch of
+    /// white speckle the headset showed beside the pool, on stone a hand's
+    /// width from the torch, was the glass seen from outside its beam.
+    #[test]
+    fn a_glass_shows_in_a_mirror_only_into_its_beam() {
+        let glass = Vec3::new(0.0, 1.0, 0.0);
+        let groups = [torch(glass, Vec3::NEG_Z)];
+        let lamp = beam(glass, Vec3::NEG_Z);
+        // Points 1 m from the glass at these angles off the beam, each
+        // looking straight back at it.
+        let angles = [0.0f32, 6.0, 14.0, 20.0, 26.0, 40.0, 80.0];
+        let rays: Vec<(Vec3, Vec3, f32)> = angles
+            .iter()
+            .map(|a| {
+                let p = glass + Quat::from_rotation_y(a.to_radians()) * Vec3::NEG_Z;
+                (p, (glass - p).normalize(), 0.002)
+            })
+            .collect();
+        let Some(whole) = seen_past_the_beam(&groups, &rays, &[], false, 1.0) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let seen = seen_past_the_beam(&groups, &rays, &[lamp], false, 1.0).unwrap();
+        for (k, a) in angles.iter().enumerate() {
+            let share = beam_toward(&lamp, rays[k].0);
+            eprintln!("{a:>4} deg off the beam: share {share:.4}, glow {:.3} of {:.3}", seen[k][0], whole[k][0]);
+            assert!(whole[k][0] > 1.0, "{a} deg: the capsules give the glass a glow: {:?}", whole[k]);
+            assert!(near(seen[k][0], whole[k][0] * share, 1e-3 * whole[k][0]), "{a} deg: {:?} against {} x {share}", seen[k], whole[k][0]);
+        }
+        assert!(seen[0][0] > 0.999 * whole[0][0], "on the axis the glass shows whole");
+        assert!(seen[2][0] > 0.05 * whole[2][0] && seen[2][0] < 0.95 * whole[2][0], "on the ramp, part of it");
+        assert!(seen[4..].iter().all(|g| g[0] == 0.0), "past the spill (25 degrees), none: {:?}", &seen[4..]);
     }
 
     /// A CAPSULE KEEPS WHAT IT IS past one left out of the upload.
