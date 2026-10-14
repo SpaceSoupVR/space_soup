@@ -497,6 +497,11 @@ pub struct UniformBuffer {
     /// idle while the rest was recorded (2026-09-30).
     pub twin_buffer: Buffer,
     pub twin_bind_group: BindGroup,
+    /// A SECOND TWIN, the planar water mirror's (`planar_water`): its pass
+    /// is drawn in the same eye's encoder as the floor mirror's, and a write
+    /// lands before the encoder runs, so the two cannot share one buffer.
+    pub planar_buffer: Buffer,
+    pub planar_bind_group: BindGroup,
     /// Which reflection probes this scene has. See [`ProbeUpload`].
     probes: ProbeUpload,
     /// The probes' per-texel distances, bound at 8. Zero until a level with
@@ -837,6 +842,12 @@ impl UniformBuffer {
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let planar_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("uniform_buf_planar"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let group = |buffer: &Buffer, label: &str| {
             scene_bind_group(
                 device,
@@ -859,6 +870,7 @@ impl UniformBuffer {
         };
         let bind_group = group(&buffer, "uniform_bg");
         let twin_bind_group = group(&twin_buffer, "uniform_bg_twin");
+        let planar_bind_group = group(&planar_buffer, "uniform_bg_planar");
 
         Self {
             buffer,
@@ -866,6 +878,8 @@ impl UniformBuffer {
             bind_group,
             twin_buffer,
             twin_bind_group,
+            planar_buffer,
+            planar_bind_group,
             probes: ProbeUpload::default(),
             probe_depth_view,
             probe_depth_sampler,
@@ -2103,6 +2117,7 @@ impl UniformBuffer {
         };
         self.bind_group = group(&self.buffer, "uniform_bg");
         self.twin_bind_group = group(&self.twin_buffer, "uniform_bg_twin");
+        self.planar_bind_group = group(&self.planar_buffer, "uniform_bg_planar");
         self.probes = probes;
     }
 }

@@ -43,6 +43,7 @@ pub mod ground_horizon;
 pub mod ground_lod;
 pub mod water_runs;
 pub mod water_wake;
+pub mod planar_water;
 pub mod static_brush;
 pub mod static_solid;
 pub mod ground_twins;

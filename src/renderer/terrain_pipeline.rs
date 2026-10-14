@@ -737,8 +737,45 @@ impl TerrainPipeline {
         role: TerrainRole,
         group2: Option<&BindGroupLayout>,
         group3: Option<&BindGroupLayout>,
+        source: String,
+        label: &str,
+    ) -> Self {
+        Self::build_faced(device, format, uniform_layout, samples, view, role, group2, group3, source, label, FrontFace::Ccw)
+    }
+
+    /// THE GROUND IN A PLANAR WATER MIRROR (`planar_water`): the scene's
+    /// ground, single-sampled and single-eye, with the winding a mirrored
+    /// view reverses taken as the front.
+    pub fn new_mirror(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
+        let source = terrain_shader_for(TerrainRole::Scene);
+        Self::build_faced(
+            device,
+            format,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::Scene,
+            None,
+            None,
+            source,
+            "terrain_pipeline_mirror",
+            FrontFace::Cw,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_faced(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        role: TerrainRole,
+        group2: Option<&BindGroupLayout>,
+        group3: Option<&BindGroupLayout>,
         mut source: String,
         label: &str,
+        front_face: FrontFace,
     ) -> Self {
         if WORLD_GROUND.load(std::sync::atomic::Ordering::Relaxed) {
             match world_vertices(&source) {
@@ -802,7 +839,7 @@ impl TerrainPipeline {
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
                 cull_mode: Some(Face::Back),
-                front_face: FrontFace::Ccw,
+                front_face,
                 polygon_mode: PolygonMode::Fill,
                 ..Default::default()
             },

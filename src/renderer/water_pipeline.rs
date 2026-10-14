@@ -224,6 +224,12 @@ pub struct WaterUniform {
     /// world x, z of its grid's corner, one over its side, 1 while it holds
     /// anything.
     pub wake: [f32; 4],
+    /// THE PLANAR MIRROR (`planar_water`): x 1 when the body is authored as a
+    /// mirror (`WaterDef::mirror`); y 1 while it is this frame's mirror; z
+    /// what turns the mirror image's values back into radiance (one over the
+    /// exposure it was drawn at); w 1 when the image is drawn flipped left to
+    /// right (the offline harness's, which keeps the winding that way).
+    pub mirror: [f32; 4],
 }
 
 /// A body's optics as authored, in linear light.
@@ -261,6 +267,7 @@ impl WaterUniform {
             ring_drops: [[0.0; 4]; RINGS],
             air: [paws_calm(waves.wind_speed), o.swell.max(0.0), waves.wind_dir.cos(), waves.wind_dir.sin()],
             wake: [0.0; 4],
+            mirror: [0.0; 4],
         }
     }
 
@@ -290,6 +297,13 @@ pub struct WaterPipeline {
     /// starts under the water -- the underwater view's, split from this one
     /// along the same line (`underwater`). See `water_line_wgsl`.
     pub waterline: RenderPipeline,
+    /// THE MIRROR TWINS -- ringless, ringed, raining -- for the body that is
+    /// this frame's planar mirror (`planar_water`): what the water mirrors is
+    /// read from the scene drawn mirrored in its surface (group 2,
+    /// [`Self::mirror_group`]) where the others march the ground map.
+    pub mirrored: [RenderPipeline; 3],
+    pub mirror_layout: BindGroupLayout,
+    mirror_sampler: Sampler,
     pub material_layout: BindGroupLayout,
     /// The waves' and the foam's: repeating, filtered between mip levels.
     pub sampler: Sampler,
@@ -414,6 +428,37 @@ impl WaterPipeline {
         let raining = build_water(device, &layout, format, blend, samples, view, water_wgsl_raining(dual_source), "water_pipeline_raining");
         let ringless = build_water(device, &layout, format, blend, samples, view, water_wgsl_with(dual_source, false), "water_pipeline_ringless");
         let waterline = build_water(device, &layout, format, blend, samples, view, water_line_wgsl(dual_source), "water_pipeline_waterline");
+        let mirror_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("water_mirror_bgl"),
+            entries: &[
+                texture(0, ShaderStages::FRAGMENT, TextureViewDimension::D2),
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let mirror_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("water_mirror_sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+        let mirror_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("water_mirror_pipeline_layout"),
+            bind_group_layouts: &[Some(camera_layout), Some(&material_layout), Some(&mirror_layout)],
+            immediate_size: 0,
+        });
+        let mirrored = [
+            (water_wgsl_with(dual_source, false), "water_pipeline_mirror_ringless"),
+            (water_wgsl_with(dual_source, true), "water_pipeline_mirror"),
+            (water_wgsl_raining(dual_source), "water_pipeline_mirror_raining"),
+        ]
+        .map(|(src, label)| build_water(device, &mirror_pipeline_layout, format, blend, samples, view, mirrored_wgsl(&src), label));
         let inputs = (layout, format, blend, samples, view);
         if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
             // MEASUREMENT: each cut built once, for the PIPESTATS log.
@@ -434,7 +479,7 @@ impl WaterPipeline {
             view_formats: &[],
         });
         let wake_view = wake_texture.create_view(&TextureViewDescriptor::default());
-        Self { pipeline, raining, ringless, waterline, material_layout, sampler, dual_source, wake_texture, wake_view, inputs }
+        Self { pipeline, raining, ringless, waterline, mirrored, mirror_layout, mirror_sampler, material_layout, sampler, dual_source, wake_texture, wake_view, inputs }
     }
 
     /// Write the wake's texels (`water_wake::WakeField::texels`).
@@ -459,6 +504,29 @@ impl WaterPipeline {
         } else {
             &self.ringless
         }
+    }
+
+    /// The mirror twin to draw for these splashes, as [`Self::for_rings`].
+    pub fn mirrored_for_rings(&self, rings: &[f32; 4], drops: &[[f32; 4]; RINGS]) -> &RenderPipeline {
+        if drops.iter().any(|d| d[3] > 0.0) {
+            &self.mirrored[2]
+        } else if rings[3] > 0.0 {
+            &self.mirrored[1]
+        } else {
+            &self.mirrored[0]
+        }
+    }
+
+    /// The mirror twins' group 2 over a mirror image (`planar_water`).
+    pub fn mirror_group(&self, device: &Device, view: &TextureView) -> BindGroup {
+        device.create_bind_group(&BindGroupDescriptor {
+            label: Some("water_mirror"),
+            layout: &self.mirror_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&self.mirror_sampler) },
+            ],
+        })
     }
 
     /// MEASUREMENT: the ringless water with one of [`WATER_CUTS`], to draw in
@@ -487,6 +555,47 @@ impl WaterPipeline {
             })
         })
     }
+}
+
+/// The most a wave's tilt may move the mirror image's read from one pixel
+/// to the next, in the image's texels, before the tilt is scaled down: far
+/// off, ripples finer than a pixel moved it many texels a pixel and the
+/// grass bank mirrored as a sparkle of noise (offline, 2026-10-14); near,
+/// where a ripple spans pixels, the tilt is kept whole.
+const MIRROR_JUMP: f32 = 2.0;
+
+/// The line of the water's shader that finds what it mirrors, which the
+/// mirror twins replace.
+const ENV_LINE: &str = "    let env = outdoor_radiance(p, normalize(to_world_direction(r)), r, rough, clamp(rough * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD));";
+
+/// A MIRROR TWIN of a water shader (`planar_water`): what it mirrors read
+/// from the scene drawn mirrored in the still surface -- the rock face and
+/// the sky behind a calm pond as sharp as they stand -- where the ground
+/// map's top-down picture smeared a steep face into a streak (2026-10-14).
+/// The reflected ray is followed as far as the eye is from the point, its
+/// end mirrored in the surface and found on the screen: where a flat surface
+/// mirrors, that is the pixel itself; a wave's tilt moves it as it moves the
+/// reflection. Read at full sharpness: a mirror body is a calm one.
+pub(crate) fn mirrored_wgsl(src: &str) -> String {
+    assert_eq!(src.matches(ENV_LINE).count(), 1, "the water's reflection line moved");
+    let planar = "    let reach = r * clamp(distance(cam_pos(), in.world_pos), 1.0, 30.0);
+    let image = cam_view_proj() * vec4<f32>(in.world_pos.x + reach.x, in.world_pos.y - reach.y, in.world_pos.z + reach.z, 1.0);
+    let here = cam_view_proj() * vec4<f32>(in.world_pos, 1.0);
+    let flat_uv = vec2<f32>(0.5, -0.5) * here.xy / max(here.w, 1e-4) + vec2<f32>(0.5);
+    var shift = vec2<f32>(0.5, -0.5) * image.xy / max(image.w, 1e-4) + vec2<f32>(0.5) - flat_uv;
+    let jump = length(fwidth(shift) * vec2<f32>(textureDimensions(mirror_tex)));
+    shift = shift * min(MIRROR_JUMP / max(jump, 1e-4), 1.0);
+    var mirror_uv = flat_uv + shift;
+    mirror_uv.x = select(mirror_uv.x, 1.0 - mirror_uv.x, water.mirror.w > 0.5);
+    let env = textureSampleLevel(mirror_tex, mirror_samp, mirror_uv, 0.0).rgb * water.mirror.z;";
+    let decl = "@group(1) @binding(6) var wake_tex: texture_2d<f32>;\n";
+    assert_eq!(src.matches(decl).count(), 1, "the water's bindings moved");
+    let planar = planar.replace("MIRROR_JUMP", &format!("{MIRROR_JUMP:?}"));
+    src.replacen(ENV_LINE, &planar, 1).replacen(
+        decl,
+        &format!("{decl}@group(2) @binding(0) var mirror_tex: texture_2d<f32>;\n@group(2) @binding(1) var mirror_samp: sampler;\n"),
+        1,
+    )
 }
 
 /// What a water pipeline is built from besides its source.
@@ -812,6 +921,7 @@ struct WaterMat {{
     ring_drops: array<vec4<f32>, {rings}>,
     air: vec4<f32>,
     wake: vec4<f32>,
+    mirror: vec4<f32>,
 }}
 
 // THE SHORE'S WAVES. Each breaker rolls in toward the beach -- a point a
@@ -2011,6 +2121,63 @@ mod tests {
         }
     }
 
+    /// EVERY WATER TWIN -- ringless, ringed, raining, waterline and the three
+    /// planar-mirror twins -- validates, and writes no vertex output past
+    /// location 14: the Quest 3 stops there and a twin past it fails to build
+    /// on the headset only (2026-10-14).
+    #[test]
+    fn every_water_twin_validates_and_fits_the_quest_3s_inter_stage_limit() {
+        const QUEST3_MAX_INTER_STAGE_LOCATIONS: u32 = 15;
+        for dual in [false, true] {
+            let twins = [
+                ("ringless", water_wgsl_with(dual, false)),
+                ("ringed", water_wgsl_with(dual, true)),
+                ("raining", water_wgsl_raining(dual)),
+                ("waterline", water_line_wgsl(dual)),
+                ("mirror ringless", mirrored_wgsl(&water_wgsl_with(dual, false))),
+                ("mirror ringed", mirrored_wgsl(&water_wgsl_with(dual, true))),
+                ("mirror raining", mirrored_wgsl(&water_wgsl_raining(dual))),
+            ];
+            for (what, src) in twins {
+                let module = wgpu::naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{what}: {}", e.emit_to_string(&src)));
+                wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
+                    .validate(&module)
+                    .unwrap_or_else(|e| panic!("{what}: {}", e.emit_to_string(&src)));
+                for ep in module.entry_points.iter().filter(|e| e.stage == wgpu::naga::ShaderStage::Vertex) {
+                    let Some(result) = &ep.function.result else { continue };
+                    let mut locs = Vec::new();
+                    if let Some(wgpu::naga::Binding::Location { location, .. }) = &result.binding {
+                        locs.push(*location);
+                    }
+                    if let wgpu::naga::TypeInner::Struct { members, .. } = &module.types[result.ty].inner {
+                        for m in members {
+                            if let Some(wgpu::naga::Binding::Location { location, .. }) = &m.binding {
+                                locs.push(*location);
+                            }
+                        }
+                    }
+                    let top = locs.iter().max().copied().unwrap_or(0);
+                    assert!(
+                        top < QUEST3_MAX_INTER_STAGE_LOCATIONS,
+                        "water {what} `{}` writes location {top}; the Quest 3 stops at {}",
+                        ep.name, QUEST3_MAX_INTER_STAGE_LOCATIONS - 1,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The mirror twin reads the mirror image where the others march the
+    /// ground map, and nothing else changes.
+    #[test]
+    fn the_mirror_twin_reads_the_image_in_place_of_the_ground_map() {
+        let plain = water_wgsl_with(false, true);
+        let mirror = mirrored_wgsl(&plain);
+        assert!(plain.contains(ENV_LINE) && !mirror.contains(ENV_LINE));
+        assert!(mirror.contains("textureSampleLevel(mirror_tex, mirror_samp, mirror_uv, 0.0)"));
+        assert!(!plain.contains("mirror_tex"));
+    }
+
     #[test]
     fn the_waterline_twin_is_the_water_plus_its_test() {
         for dual in [true, false] {
@@ -2122,6 +2289,12 @@ mod ring_size_tests {
             format!("{}{}", &full[..a], &full[b..])
         };
         eprintln!("ringless {ringless}, ringed {} (+{})", total(&full), total(&full) - ringless);
+        eprintln!(
+            "mirror twins: ringless {}, ringed {}, raining {}",
+            total(&mirrored_wgsl(&water_wgsl_with(false, false))),
+            total(&mirrored_wgsl(&water_wgsl_with(false, true))),
+            total(&mirrored_wgsl(&full)),
+        );
         for (name, src) in [
             ("drops", cut("            let dr = water.ring_drops[i];", "            }\n")),
             ("caustic", cut("            ring_curve = ring_curve -", ";\n")),
