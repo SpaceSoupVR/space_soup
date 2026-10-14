@@ -152,6 +152,56 @@ impl BrushVertex {
 /// twenty-fifth. Exceeding it logs and clamps, so it is diagnosable.
 pub const MAX_BRUSH_MATERIALS: usize = 24;
 
+/// THE BRUSHES' VERTICES ARE THE WORLD'S (`true`), posed into the player's
+/// frame by the vertex shader ([`world_brush_vertices`]) -- where the app
+/// re-posed every brush vertex on the CPU on each frame the rig moved or
+/// turned and the frame sent all of them to two new GPU buffers every frame
+/// (`docs/scale-audit-2026-10-13.md`, F1's other half; `static_brush`). The
+/// ground's switch, for the rooms: see `terrain_pipeline::WORLD_GROUND`.
+///
+/// Read when a brush pipeline is BUILT, so it is set once, before the
+/// renderer exists: the headset app sets it at launch (`xr::vulkan`;
+/// `adb shell setprop debug.spacesoup.worldbrushes 0` keeps the old way), the
+/// offline harness by `WORLD_BRUSHES`. `false` here, so everything else that
+/// builds a brush pipeline -- the tests -- hands it posed vertices as before.
+pub static WORLD_BRUSHES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How the brush shader's vertex stage opens, and the same posing its vertex
+/// first: what [`world_brush_vertices`] rewrites.
+const POSED_BRUSH_VERTEX: &str = "@vertex fn vs_main(v: VIn) -> VOut {\n    var out: VOut;\n";
+const WORLD_BRUSH_VERTEX: &str = "@vertex fn vs_main(w: VIn) -> VOut {\n    var out: VOut;\n    var v = w;\n    v.pos = to_player_space(w.pos);\n    v.norm = to_player_direction(w.norm);\n    v.tangent = vec4<f32>(to_player_direction(w.tangent.xyz), w.tangent.w);\n    v.face_centre = to_player_space(w.face_centre);\n";
+/// The crack seal's vertex stage, which reads a position alone.
+const POSED_SEAL_VERTEX: &str = "return cam_view_proj() * vec4<f32>(pos, 1.0);";
+const WORLD_SEAL_VERTEX: &str = "return cam_view_proj() * vec4<f32>(to_player_space(pos), 1.0);";
+
+/// `src` taking its vertices in the WORLD: everything the app posed -- the
+/// position and the face's centre as points, the normal and the tangent as
+/// directions (`BrushGeometry::assemble`) -- is turned into the player's
+/// frame by `lights`' `to_player_space` / `to_player_direction` before
+/// anything reads it, so all that follows, the fragment stage with it, is as
+/// it was for a vertex the app had posed. `None` if the shader does not open
+/// as the brush shader does (`BRUSH_LIGHT_DEBUG`'s, which has no face centre).
+pub fn world_brush_vertices(src: &str) -> Option<String> {
+    (src.matches(POSED_BRUSH_VERTEX).count() == 1 && src.contains("@location(7) face_centre: vec3<f32>"))
+        .then(|| src.replacen(POSED_BRUSH_VERTEX, WORLD_BRUSH_VERTEX, 1))
+}
+
+/// A brush shader as its pipeline is built from it: [`world_brush_vertices`]
+/// of it where the brushes are kept in the world ([`WORLD_BRUSHES`]).
+fn in_the_brushes_frame(src: String) -> String {
+    if !WORLD_BRUSHES.load(std::sync::atomic::Ordering::Relaxed) {
+        return src;
+    }
+    match world_brush_vertices(&src) {
+        Some(world) => world,
+        None => {
+            // Drawn from world vertices it would stand in the wrong place.
+            log::error!("WORLD BRUSHES: a brush shader does not open as expected; it reads its vertices as posed");
+            src
+        }
+    }
+}
+
 pub struct BrushPipeline {
     pub pipeline: RenderPipeline,
     pub material_layout: BindGroupLayout,
@@ -2042,6 +2092,15 @@ impl BrushSealPipeline {
 
 fn brush_seal_shader() -> String {
     let [r, g, b] = CRACK_SEAL_COLOUR;
+    let src = brush_seal_shader_posed(r, g, b);
+    if WORLD_BRUSHES.load(std::sync::atomic::Ordering::Relaxed) {
+        debug_assert_eq!(src.matches(POSED_SEAL_VERTEX).count(), 1);
+        return src.replacen(POSED_SEAL_VERTEX, WORLD_SEAL_VERTEX, 1);
+    }
+    src
+}
+
+fn brush_seal_shader_posed(r: f32, g: f32, b: f32) -> String {
     format!(
         r#"
 {lights_block}
@@ -2112,6 +2171,9 @@ pub struct SunFaces {
     unbaked: Vec<u32>,
     width: u32,
     height: u32,
+    /// Which mask this is, among every one made this run: what a split kept
+    /// across frames was made from (`static_brush`).
+    serial: u64,
 }
 
 /// Which scene reader a brush face takes. See [`SunFaces`].
@@ -2164,7 +2226,13 @@ impl SunFaces {
                 unbaked[here] = unbaked[above] + unbaked_row;
             }
         }
-        Some(Self { reachable, unbaked, width, height })
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Some(Self { reachable, unbaked, width, height, serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) })
+    }
+
+    /// Which mask this is: never 0, and another for every mask made.
+    pub fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// The class of the face whose patch is `uv2_rect` (atlas uv: min u, min v,
@@ -4800,6 +4868,8 @@ struct VOut {{
             ssr_apply
         }
     );
+    // (Where the brushes are kept in the world, the vertex stage poses them.)
+    let src = in_the_brushes_frame(src);
     match probe {
         BrushProbe::Read => format!("{src}{}{}", probe_pass::READER_WGSL, probe_pass::FACE_CODE_WGSL),
         BrushProbe::Pass | BrushProbe::PassDeferred => {
@@ -6624,6 +6694,48 @@ mod ssr_pipeline_tests {
             below = got;
         }
     }
+
+    /// EVERY BRUSH SHADER TAKES ITS VERTICES IN THE WORLD when asked to: each
+    /// variant a pipeline is built from opens as `world_brush_vertices`
+    /// expects, the rewrite poses all four things the app posed (position,
+    /// normal, tangent, the face's centre) and nothing else of the source
+    /// changes -- the fragment stage, whose instruction count the Quest's
+    /// budget is about, is the same text -- and the result is valid WGSL.
+    #[test]
+    fn every_brush_shader_takes_its_vertices_in_the_world() {
+        let variants: Vec<(&str, String)> = vec![
+            ("trace", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Trace)),
+            ("sources", brush_shader_probe(false, true, false, SsrPath::Inline, BrushProbe::Trace)),
+            ("ssr", brush_shader_probe(true, false, false, SsrPath::Inline, BrushProbe::Trace)),
+            ("ssr trace", brush_shader_probe(true, false, false, SsrPath::Trace, BrushProbe::Trace)),
+            ("ssr composite", brush_shader_probe(true, false, false, SsrPath::Composite, BrushProbe::Trace)),
+            ("probe pass", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Pass)),
+            ("probe pass deferred", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::PassDeferred)),
+            ("probe reader", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Read)),
+        ];
+        for (name, posed) in variants {
+            if BRUSH_LIGHT_DEBUG {
+                assert!(world_brush_vertices(&posed).is_none());
+                continue;
+            }
+            let world = world_brush_vertices(&posed).unwrap_or_else(|| panic!("{name}: does not open as a brush shader"));
+            for line in ["v.pos = to_player_space(w.pos);", "v.norm = to_player_direction(w.norm);", "to_player_direction(w.tangent.xyz), w.tangent.w", "v.face_centre = to_player_space(w.face_centre);"] {
+                assert_eq!(world.matches(line).count(), 1, "{name}: {line}");
+            }
+            // Only the opening differs.
+            assert_eq!(world.replacen(WORLD_BRUSH_VERTEX, POSED_BRUSH_VERTEX, 1), posed, "{name}");
+            let from = posed.find("@fragment fn fs_main(").expect("a fragment stage");
+            assert!(world.ends_with(&posed[from..]), "{name}: the fragment stage changed");
+            naga::front::wgsl::parse_str(&world).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&world)));
+        }
+        // The crack seal, which reads a position alone.
+        let [r, g, b] = CRACK_SEAL_COLOUR;
+        let seal = brush_seal_shader_posed(r, g, b);
+        assert_eq!(seal.matches(POSED_SEAL_VERTEX).count(), 1);
+        let world = seal.replacen(POSED_SEAL_VERTEX, WORLD_SEAL_VERTEX, 1);
+        naga::front::wgsl::parse_str(&world).unwrap_or_else(|e| panic!("seal: {}", e.emit_to_string(&world)));
+    }
+
 
     /// THE UPSAMPLE IS THE DEPTH-AWARE BILINEAR FILTER, on a real device, at
     /// every pixel: one filtered read inside a surface, texel by texel along

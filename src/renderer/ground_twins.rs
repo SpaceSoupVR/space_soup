@@ -320,6 +320,32 @@ impl SlopeSplit {
         }
     }
 
+    /// THE SPLIT FOR THIS GROUND, MADE IF `kept` IS NOT IT: the one call
+    /// both the level's load and the frame make, so the load's split is the
+    /// frame's -- a frame that finds it made does nothing but compare a
+    /// thousand samples ([`Self::is_for`]). Returns the milliseconds a build
+    /// took, `None` when `kept` stood.
+    ///
+    /// It was made on the first FRAME that drew the ground, on the render
+    /// thread: a hitch of 35 ms on test_room, 152 ms at 625 samples a side,
+    /// 9.9 s at 2,049 (`docs/scale-audit-2026-10-13.md`, F12).
+    pub fn ensure(
+        kept: &mut Option<SlopeSplit>,
+        verts: &[SolidVertex],
+        idx: &[u32],
+        chunks: &[CasterChunk],
+        threshold_deg: f32,
+        class_key: u64,
+        class_of: &dyn Fn([[f32; 3]; 3]) -> usize,
+    ) -> Option<f64> {
+        if kept.as_ref().is_some_and(|s| s.is_for(verts, idx, chunks, threshold_deg, class_key)) {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        *kept = Some(Self::classed(verts, idx, chunks, threshold_deg, class_key, class_of));
+        Some(started.elapsed().as_secs_f64() * 1000.0)
+    }
+
     /// Whether any triangle has a ground class of its own (1 or 2).
     pub fn has_classes(&self) -> bool {
         self.class_totals[1] + self.class_totals[2] > 0
@@ -537,6 +563,58 @@ mod tests {
 
     fn vertex(n: [f32; 3]) -> SolidVertex {
         SolidVertex { position: [0.0; 3], normal: n, color: [1.0; 4], uv2: [0.0; 2], reflectivity: 0.0 }
+    }
+
+    /// THE SPLIT MADE AT A LEVEL'S LOAD IS THE ONE ITS FRAMES FIND: `ensure`
+    /// builds it once -- sorting a ground larger than test_room's, 320,000
+    /// triangles -- and every later call for the same ground, as each frame
+    /// makes, builds nothing. Another probe table (its key), another
+    /// threshold or another ground builds it again, once.
+    #[test]
+    fn the_split_made_at_load_is_the_one_the_frames_find() {
+        let n = 401usize;
+        let mut verts = Vec::with_capacity(n * n);
+        for z in 0..n {
+            for x in 0..n {
+                let tilt = ((x as f32 * 0.21).sin() * (z as f32 * 0.17).cos()).abs();
+                let mut v = vertex([tilt, 1.0 - tilt * 0.9, 0.2]);
+                v.position = [x as f32 * 0.43, tilt * 4.0, z as f32 * 0.43];
+                verts.push(v);
+            }
+        }
+        let mut idx = Vec::with_capacity((n - 1) * (n - 1) * 6);
+        for z in 0..n - 1 {
+            for x in 0..n - 1 {
+                let a = (z * n + x) as u32;
+                idx.extend_from_slice(&[a, a + n as u32, a + 1, a + 1, a + n as u32, a + n as u32 + 1]);
+            }
+        }
+        let chunks: Vec<CasterChunk> = idx
+            .chunks(idx.len() / 64)
+            .scan(0u32, |at, c| {
+                let first = *at;
+                *at += c.len() as u32;
+                Some(CasterChunk { first_index: first, index_count: c.len() as u32, min: glam::Vec3::ZERO, max: glam::Vec3::ZERO })
+            })
+            .collect();
+        let class_of = |c: [[f32; 3]; 3]| if c[0][0] < 60.0 { 1 } else { 2 };
+        let mut kept = None;
+        // The load.
+        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 77, &class_of).is_some());
+        let made = kept.as_ref().unwrap().indices.clone();
+        assert!(kept.as_ref().unwrap().has_classes());
+        // Its frames: the chunks' boxes follow the rig, nothing else changes.
+        for frame in 0..30 {
+            let moved: Vec<CasterChunk> = chunks.iter().map(|c| CasterChunk { min: glam::Vec3::splat(frame as f32), ..*c }).collect();
+            assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &moved, 35.0, 77, &class_of).is_none(), "built again on frame {frame}");
+        }
+        assert_eq!(kept.as_ref().unwrap().indices, made);
+        // Another probe table; another threshold; another ground.
+        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 78, &class_of).is_some());
+        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 78, &class_of).is_none());
+        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 30.0, 78, &class_of).is_some());
+        let other: Vec<SolidVertex> = verts.iter().map(|v| { let mut o = *v; o.normal = [0.0, 1.0, 0.0]; o }).collect();
+        assert!(SlopeSplit::ensure(&mut kept, &other, &idx, &chunks, 30.0, 78, &class_of).is_some());
     }
 
     #[test]

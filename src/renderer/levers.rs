@@ -513,6 +513,27 @@ pub struct Levers {
     /// its indices and made two new GPU buffers of them. The same bytes at
     /// other offsets; the same picture. Off: as it was. See `static_solid`.
     pub ground_buffers: bool,
+    /// THE BRUSHES' BUFFERS KEPT ON THE GPU: the rooms' vertex and index
+    /// buffers, their split by sun class and the motion pass's runs live
+    /// across frames and are made again only when the brushes handed over
+    /// are not the ones they were made from -- where every frame split all
+    /// of them and made two new GPU buffers. With the brushes handed over in
+    /// the world (`brush_pipeline::WORLD_BRUSHES`, a launch switch) that is
+    /// once a level; with the app posing them, every frame the rig moves, as
+    /// before. The same bytes; the same picture. Off: as it was. See
+    /// `static_brush`. ON since 2026-10-13 on the offline byte comparison and
+    /// tests alone: NOT YET MEASURED ON THE HEADSET.
+    pub brush_buffers: bool,
+    /// A BAKED CAVE'S DEPTH AND MOTION IN THE CHUNKS IN VIEW: the scene pass
+    /// draws a baked cave by the chunks an eye can see into
+    /// (`baked_cave::visible_ranges`), but the SpaceWarp motion pass and the
+    /// reflection pass's occluder drew every cave whole -- their cost
+    /// followed the cave's size, not the view. On: both draw the chunks in
+    /// view. Lossless (what is left out the GPU clipped). OFF: written
+    /// 2026-10-13 with no headset, and neither pass is in the offline frame,
+    /// so nothing but the range test (`baked_cave::occluder_ranges`) has
+    /// checked it. Turn on after a headset look at cave_mouth / cave_floor.
+    pub cave_chunk_cull: bool,
     /// HOW FAR A BIG THING IS STILL DRAWN, in its own bounding radii: the
     /// app hands the renderer a model, a fixture, a baked cave or a cuboid
     /// while its nearest point is within 40 m OR it is nearer than this many
@@ -666,6 +687,8 @@ impl Default for Levers {
             cave_first: true,
             water_runs: true,
             ground_buffers: true,
+            brush_buffers: true,
+            cave_chunk_cull: false,
             size_reach: 229,
             probe_prepass: false,
             model_rooms: false,
@@ -878,6 +901,8 @@ impl Levers {
             ("cave_first", self.cave_first, d.cave_first),
             ("water_runs", self.water_runs, d.water_runs),
             ("ground_buffers", self.ground_buffers, d.ground_buffers),
+            ("brush_buffers", self.brush_buffers, d.brush_buffers),
+            ("cave_chunk_cull", self.cave_chunk_cull, d.cave_chunk_cull),
             ("probe_prepass", self.probe_prepass, d.probe_prepass),
             ("model_rooms", self.model_rooms, d.model_rooms),
         ] {

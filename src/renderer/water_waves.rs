@@ -236,10 +236,29 @@ impl WaveParams {
         total as f32
     }
 
+    /// EVERY SUM OVER THE SPECTRUM A BODY OF WATER ASKS FOR, FROM ONE PASS
+    /// OVER IT, kept by the wind that makes it. See [`WaveSums`].
+    pub fn sums(&self) -> WaveSums {
+        let key = WaveSums::key(self);
+        if let Some(found) = WAVE_SUMS.lock().ok().and_then(|kept| kept.iter().find(|(k, _)| *k == key).map(|(_, s)| *s)) {
+            return found;
+        }
+        let made = WaveSums::of(self);
+        if let Ok(mut kept) = WAVE_SUMS.lock() {
+            // A level's bodies share a handful of winds; a level of hundreds
+            // of different ones starts the list again rather than growing it.
+            if kept.len() >= 256 {
+                kept.clear();
+            }
+            kept.push((key, made));
+        }
+        made
+    }
+
     /// The height variance the field holds, m^2: a sixteenth of the
     /// significant wave height squared.
     pub fn height_variance(&self) -> f32 {
-        self.sum_over_waves(|_, _, _, e| e as f64)
+        self.sums().height_variance
     }
 
     /// The significant wave height the field holds, m: the mean height of the
@@ -251,6 +270,9 @@ impl WaveParams {
     /// The slope variance (both directions together) of every wave the field
     /// holds shorter than wavenumber `k_cut` allows.
     pub fn slope_variance_beyond(&self, k_cut: f32) -> f32 {
+        if k_cut == 0.0 {
+            return self.sums().slope_variance;
+        }
         self.sum_over_waves(|_, kx, kz, e| {
             let k2 = kx * kx + kz * kz;
             if k2 >= k_cut * k_cut { (k2 * e) as f64 } else { 0.0 }
@@ -259,7 +281,7 @@ impl WaveParams {
 
     /// The slope variance of cascade `c`'s waves, all of them.
     pub fn cascade_slope_variance(&self, c: usize) -> f32 {
-        self.sum_over_waves(|cc, kx, kz, e| if cc == c { ((kx * kx + kz * kz) * e) as f64 } else { 0.0 })
+        self.sums().cascade_slope_variance[c]
     }
 
     /// PER MIP LEVEL, the slope variance of each cascade's waves that level
@@ -269,17 +291,7 @@ impl WaveParams {
     /// single texel, loses the whole cascade. `[level][cascade]`, the fourth
     /// lane unused.
     pub fn lost_slope_variance(&self) -> [[f32; 4]; MIPS as usize] {
-        let mut out = [[0.0f32; 4]; MIPS as usize];
-        for (level, row) in out.iter_mut().enumerate() {
-            for (c, lane) in row.iter_mut().take(CASCADES).enumerate() {
-                let texels = (N >> level).max(1) as f32;
-                let nyquist = if level + 1 == MIPS as usize { 0.0 } else { PI * texels / self.tile[c] };
-                *lane = self.sum_over_waves(|cc, kx, kz, e| {
-                    if cc == c && (kx.abs() > nyquist || kz.abs() > nyquist) { ((kx * kx + kz * kz) * e) as f64 } else { 0.0 }
-                });
-            }
-        }
-        out
+        self.sums().lost
     }
 
     /// HOW HARD EACH CASCADE'S FOLDS ARE READ for foam. The surface folds
@@ -305,6 +317,105 @@ impl WaveParams {
     pub fn unresolved_slope_variance(&self) -> f32 {
         let measured = 0.003 + 0.005_12 * self.wind_speed.max(0.0);
         (measured - self.slope_variance_beyond(0.0)).max(0.0)
+    }
+}
+
+/// EVERY SUM OVER THE SPECTRUM A BODY OF WATER ASKS FOR, from ONE pass over
+/// its wave vectors.
+///
+/// Each was its own pass, and each pass evaluated the whole spectrum --
+/// 3 x 64 x 64 wave vectors, a `tanh`, an `atan2` and five powers each --
+/// whichever waves it then kept: `lost_slope_variance` alone made 21 of them
+/// (a pass a mip level a cascade, each keeping one cascade's waves),
+/// `foam_gains` six more, the wave height and the unresolved ripples the
+/// rest. About thirty passes a body, 0.6 s of a load each on the audit's
+/// machine: test_room paid 1.3 s for its two bodies, a level with 65 bodies
+/// 37 s (`docs/scale-audit-2026-10-13.md`, L2).
+///
+/// THE SAME NUMBERS, bit for bit: every sum adds the same terms in the same
+/// order it always did -- cascade by cascade, row by row -- and a term a sum
+/// left out it added as 0.0, which changes nothing
+/// (`the_sums_from_one_pass_are_the_sums_each_pass_made`).
+///
+/// KEPT BY THE WIND: the sums follow the wind, the fetch, the depth and the
+/// tiles -- not the seed, which only says which way each wave starts -- so
+/// the bodies of a level that share a wind share one pass.
+///
+/// WHAT IT COSTS NOW: one pass over the spectrum for each DIFFERENT sea in a
+/// level (about 10 ms), nothing for a body like one already loaded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WaveSums {
+    /// [`WaveParams::height_variance`].
+    pub height_variance: f32,
+    /// [`WaveParams::slope_variance_beyond`] of 0: every wave's.
+    pub slope_variance: f32,
+    /// [`WaveParams::cascade_slope_variance`].
+    pub cascade_slope_variance: [f32; CASCADES],
+    /// [`WaveParams::lost_slope_variance`].
+    pub lost: [[f32; 4]; MIPS as usize],
+}
+
+/// What the sums follow, bit for bit: wind speed and direction, fetch, depth,
+/// the tiles.
+type WaveSumsKey = [u32; 4 + CASCADES];
+
+static WAVE_SUMS: std::sync::Mutex<Vec<(WaveSumsKey, WaveSums)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+thread_local! {
+    /// Passes over the spectrum made on this thread (`WaveSums::of`).
+    static SPECTRUM_PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+impl WaveSums {
+    fn key(p: &WaveParams) -> WaveSumsKey {
+        let mut key = [p.wind_speed.to_bits(), p.wind_dir.to_bits(), p.fetch.to_bits(), p.depth.to_bits(), 0, 0, 0];
+        for (k, t) in key[4..].iter_mut().zip(p.tile) {
+            *k = t.to_bits();
+        }
+        key
+    }
+
+    /// The one pass. Not kept: see [`WaveParams::sums`].
+    pub fn of(p: &WaveParams) -> Self {
+        #[cfg(test)]
+        SPECTRUM_PASSES.with(|n| n.set(n.get() + 1));
+        let n = N as usize;
+        let mut height = 0.0f64;
+        let mut slope = 0.0f64;
+        let mut cascade = [0.0f64; CASCADES];
+        let mut lost = [[0.0f64; CASCADES]; MIPS as usize];
+        for c in 0..CASCADES {
+            let dk = 2.0 * PI / p.tile[c];
+            // Each level's Nyquist wavenumber for this cascade: 0 at the
+            // last, a single texel, which loses every wave.
+            let nyquist: [f32; MIPS as usize] = std::array::from_fn(|level| {
+                let texels = (N >> level).max(1) as f32;
+                if level + 1 == MIPS as usize { 0.0 } else { PI * texels / p.tile[c] }
+            });
+            for zi in 0..n {
+                for xi in 0..n {
+                    let Some((kx, kz)) = p.wave_vector(c, xi, zi) else { continue };
+                    let e = p.spectrum(kx, kz) * dk * dk;
+                    let k2e = ((kx * kx + kz * kz) * e) as f64;
+                    height += e as f64;
+                    slope += k2e;
+                    cascade[c] += k2e;
+                    for (level, lane) in lost.iter_mut().enumerate() {
+                        if kx.abs() > nyquist[level] || kz.abs() > nyquist[level] {
+                            lane[c] += k2e;
+                        }
+                    }
+                }
+            }
+        }
+        let mut out_lost = [[0.0f32; 4]; MIPS as usize];
+        for (row, sums) in out_lost.iter_mut().zip(&lost) {
+            for (lane, sum) in row.iter_mut().zip(sums) {
+                *lane = *sum as f32;
+            }
+        }
+        Self { height_variance: height as f32, slope_variance: slope as f32, cascade_slope_variance: cascade.map(|v| v as f32), lost: out_lost }
     }
 }
 
@@ -1168,6 +1279,67 @@ mod tests {
     /// nothing; each level loses more; the last loses the cascade whole; and
     /// the cascades' wholes plus the ripples none of them hold come to Cox
     /// and Munk's measured slope variance for the wind.
+    /// THE SUMS FROM ONE PASS ARE THE SUMS EACH PASS MADE, bit for bit: the
+    /// wave height, every wave's slope variance, each cascade's, and what
+    /// each mip level loses of each cascade -- each against its own pass over
+    /// the whole spectrum, as it was summed until 2026-10-13. For a pond, a
+    /// lake, a gale at sea and shallow water.
+    #[test]
+    fn the_sums_from_one_pass_are_the_sums_each_pass_made() {
+        for p in [
+            WaveParams::default(),
+            WaveParams { wind_speed: 2.0, fetch: 20.0, depth: 0.7, ..WaveParams::default() },
+            WaveParams { wind_speed: 16.0, fetch: 20_000.0, tile: [90.0, 20.0, 4.4], depth: 30.0, wind_dir: -2.1, ..WaveParams::default() },
+            WaveParams { wind_speed: 0.0, fetch: 1.0, ..WaveParams::default() },
+        ] {
+            let sums = WaveSums::of(&p);
+            assert!(sums.height_variance > 0.0 && sums.slope_variance > 0.0, "{p:?}");
+            assert_eq!(sums.height_variance, p.sum_over_waves(|_, _, _, e| e as f64));
+            assert_eq!(sums.slope_variance, p.sum_over_waves(|_, kx, kz, e| ((kx * kx + kz * kz) * e) as f64));
+            for c in 0..CASCADES {
+                assert_eq!(sums.cascade_slope_variance[c], p.sum_over_waves(|cc, kx, kz, e| if cc == c { ((kx * kx + kz * kz) * e) as f64 } else { 0.0 }));
+            }
+            for level in 0..MIPS as usize {
+                for c in 0..CASCADES {
+                    let texels = (N >> level).max(1) as f32;
+                    let nyquist = if level + 1 == MIPS as usize { 0.0 } else { PI * texels / p.tile[c] };
+                    let was = p.sum_over_waves(|cc, kx, kz, e| {
+                        if cc == c && (kx.abs() > nyquist || kz.abs() > nyquist) { ((kx * kx + kz * kz) * e) as f64 } else { 0.0 }
+                    });
+                    assert_eq!(sums.lost[level][c], was, "level {level} cascade {c}");
+                }
+                assert_eq!(sums.lost[level][3], 0.0);
+            }
+            // And what a body reads is the kept copy of them.
+            assert_eq!(p.sums(), sums);
+            assert_eq!((p.height_variance(), p.slope_variance_beyond(0.0), p.lost_slope_variance()), (sums.height_variance, sums.slope_variance, sums.lost));
+        }
+    }
+
+    /// A LEVEL OF MANY BODIES UNDER ONE WIND PASSES OVER THE SPECTRUM ONCE:
+    /// 65 bodies -- each with its own seed, as the app gives them -- ask for
+    /// everything a load asks of a body (its uniform's lanes, its foam gains,
+    /// its wave height, its bounds' reach) and the spectrum is walked one
+    /// time, where it was walked about thirty times a body. Another wind,
+    /// another depth: one pass more each.
+    #[test]
+    fn a_levels_bodies_under_one_wind_pass_over_the_spectrum_once() {
+        // A wind no other test asks for, so the kept list cannot hold it yet.
+        let wind = WaveParams { wind_speed: 6.125, fetch: 437.5, depth: 2.25, ..WaveParams::default() };
+        let passes = || SPECTRUM_PASSES.with(|n| n.get());
+        let before = passes();
+        let load = |p: &WaveParams| (p.lost_slope_variance(), p.unresolved_slope_variance(), p.foam_gains(), p.significant_height());
+        let first = load(&wind);
+        for body in 1..65u64 {
+            let p = WaveParams { seed: wind.seed ^ body.wrapping_mul(0x9e37_79b9_7f4a_7c15), choppiness: 0.1 + body as f32 * 0.01, ..wind };
+            assert_eq!(load(&p), first, "the sums do not follow the seed or the chop");
+        }
+        assert_eq!(passes() - before, 1, "65 bodies under one wind");
+        load(&WaveParams { wind_speed: 6.25, ..wind });
+        load(&WaveParams { depth: 2.5, ..wind });
+        assert_eq!(passes() - before, 3);
+    }
+
     #[test]
     fn roughness_accounts_for_every_wave() {
         let p = WaveParams::default();
