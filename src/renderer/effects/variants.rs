@@ -504,4 +504,41 @@ mod tests {
         assert_eq!(stats.union_instances, over.len() as u32);
         check(&frame(&[], &[]));
     }
+
+    /// The Quest 3 allows 15 inter-stage locations (0-14); the host adapters
+    /// the other tests run on allow far more, so a 16th varying validated here
+    /// and refused every effects motion pipeline on the headset (black frames,
+    /// 10-14). Checked from the WGSL itself, against the headset's number.
+    #[test]
+    fn every_variants_varyings_fit_the_quest_3s_inter_stage_limit() {
+        const QUEST3_MAX_INTER_STAGE_LOCATIONS: u32 = 15;
+        for v in FxVariant::ALL {
+            let main = v.shader();
+            let (motion, _) = v.motion_shader();
+            for (what, src) in [("shader", main), ("motion shader", motion)] {
+                let module = wgpu::naga::front::wgsl::parse_str(&src)
+                    .unwrap_or_else(|e| panic!("{} {what}: {}", v.label(), e.emit_to_string(&src)));
+                for ep in module.entry_points.iter().filter(|e| e.stage == wgpu::naga::ShaderStage::Vertex) {
+                    let Some(result) = &ep.function.result else { continue };
+                    let mut locs = Vec::new();
+                    if let Some(wgpu::naga::Binding::Location { location, .. }) = &result.binding {
+                        locs.push(*location);
+                    }
+                    if let wgpu::naga::TypeInner::Struct { members, .. } = &module.types[result.ty].inner {
+                        for m in members {
+                            if let Some(wgpu::naga::Binding::Location { location, .. }) = &m.binding {
+                                locs.push(*location);
+                            }
+                        }
+                    }
+                    let top = locs.iter().max().copied().unwrap_or(0);
+                    assert!(
+                        top < QUEST3_MAX_INTER_STAGE_LOCATIONS,
+                        "{} {what} `{}` writes location {top}; the Quest 3 stops at {}",
+                        v.label(), ep.name, QUEST3_MAX_INTER_STAGE_LOCATIONS - 1,
+                    );
+                }
+            }
+        }
+    }
 }

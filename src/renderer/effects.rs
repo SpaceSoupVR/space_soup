@@ -5285,18 +5285,18 @@ struct FxMotionOut {{
     @location(3) @interpolate(flat) light_q: vec3<f32>,
     @location(4) @interpolate(flat) layer: vec3<f32>,
     @location(5) at: vec4<f32>,
-    @location(6) @interpolate(flat) soft: f32,
-    @location(7) @interpolate(flat) time: f32,
-    @location(8) @interpolate(flat) flicker: f32,
-    @location(9) curr: vec4<f32>,
-    @location(10) prev: vec4<f32>,
-    // A flame: its height's way up in the previous clip space, and the book
-    // seconds its gas rose since the previous frame.
-    @location(11) @interpolate(flat) gas: vec4<f32>,
-    @location(12) @interpolate(flat) book: f32,
-    @location(13) world: vec3<f32>,
-    @location(14) @interpolate(flat) fog_a: vec4<f32>,
-    @location(15) @interpolate(flat) fog_b: vec4<f32>,
+    // soft, time, flicker, and (a flame) the book seconds its gas rose since
+    // the previous frame -- one slot, because the Quest 3 allows 15
+    // inter-stage locations (0-14) and the host far more: at 16 every
+    // effects motion pipeline was refused on the headset only.
+    @location(6) @interpolate(flat) stfb: vec4<f32>,
+    @location(7) curr: vec4<f32>,
+    @location(8) prev: vec4<f32>,
+    // A flame: its height's way up in the previous clip space.
+    @location(9) @interpolate(flat) gas: vec4<f32>,
+    @location(10) world: vec3<f32>,
+    @location(11) @interpolate(flat) fog_a: vec4<f32>,
+    @location(12) @interpolate(flat) fog_b: vec4<f32>,
 }}
 
 @vertex fn vs_fx_motion(@builtin(vertex_index) vi: u32, inst: IIn, @location(6) motion: vec4<f32>) -> FxMotionOut {{
@@ -5316,20 +5316,17 @@ struct FxMotionOut {{
     out.light_q = n.light_q;
     out.layer = n.layer;
     out.at = n.at;
-    out.soft = n.soft;
-    out.time = n.time;
-    out.flicker = n.flicker;
+    out.stfb = vec4<f32>(n.soft, n.time, n.flicker, 0.0);
     out.curr = n.clip;
     out.prev = b.clip;
     out.world = n.world;
     out.fog_a = n.fog_a;
     out.fog_b = n.fog_b;
     out.gas = vec4<f32>(0.0);
-    out.book = 0.0;
     if (inst.params.w > 1.5 && inst.params.w < 2.5 && motion.w > 0.0) {{
         let height = 2.0 * inst.centre.w * max(abs(inst.params.z), 1.0);
         out.gas = cam.prev * vec4<f32>(fx_flame_along(inst) * height, 0.0);
-        out.book = motion.w * step;
+        out.stfb.w = motion.w * step;
     }}
     return out;
 }}
@@ -5343,9 +5340,9 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
     v.light_q = in.light_q;
     v.layer = in.layer;
     v.at = in.at;
-    v.soft = in.soft;
-    v.time = in.time;
-    v.flicker = in.flicker;
+    v.soft = in.stfb.x;
+    v.time = in.stfb.y;
+    v.flicker = in.stfb.z;
     v.world = in.world;
     v.fog_a = in.fog_a;
     v.fog_b = in.fog_b;
@@ -5355,10 +5352,10 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
 @fragment fn fs_fx_motion_over(in: FxMotionOut) -> @location(0) vec4<f32> {{
     let shown = fx_over(fx_vout(in));
     var prev = in.prev;
-    if (in.book > 0.0) {{
+    if (in.stfb.w > 0.0) {{
         // Where this height's gas was: lower, as it rose.
         let v = 1.0 - in.uv.y;
-        prev = prev - in.gas * (v - fx_flame_v(v, in.book));
+        prev = prev - in.gas * (v - fx_flame_v(v, in.stfb.w));
     }}
     let flame = in.layer.z > 1.5 && in.layer.z < 2.5;
     let w = layer_weight(shown.a, select({soft:?}, {bright:?}, flame));
