@@ -936,6 +936,9 @@ impl XrRenderer {
             })
             .collect();
 
+        // Where the player's own whole body starts in the skinned and posed
+        // casters (`Levers::spot_caster_drop`).
+        let skinned_mirror_from = skinned_casters.len();
         let mut mirror_only_skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut mirror_only_layered_draws: Vec<LayeredDraw> = Vec::new();
         let mut mirror_only_baked_caves: Vec<crate::renderer::baked_cave::BakedCaveDraw> = Vec::new();
@@ -999,8 +1002,12 @@ impl XrRenderer {
         let mut posed_live: Vec<(wgpu::Buffer, wgpu::Buffer)> = Vec::new();
         let mut posed: Vec<(crate::renderer::skin_compute::Posed, &wgpu::Buffer, u32, &wgpu::BindGroup)> = Vec::new();
         let mut posed_cache = self.posed_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut posed_mirror_from = usize::MAX;
         if self.levers.skin_once {
-            for instance in meshes.iter().chain(mirror_only_meshes.iter()) {
+            for (k, instance) in meshes.iter().chain(mirror_only_meshes.iter()).enumerate() {
+                if k == meshes.len() {
+                    posed_mirror_from = posed.len();
+                }
                 let Some(skin) = &instance.mesh.skin else {
                     continue;
                 };
@@ -1020,6 +1027,7 @@ impl XrRenderer {
                 }
             }
         }
+        let posed_mirror_from = posed_mirror_from.min(posed.len());
         posed_cache.keep_only(&posed_live);
         drop(posed_cache);
         let posed_casters: Vec<crate::renderer::shadow::ShadowMeshDraw> =
@@ -1830,17 +1838,34 @@ impl XrRenderer {
                 );
             }
             if shadow.spot_count > 0 {
+                // DIAGNOSIS: caster classes left out of the spot tiles. See
+                // `Levers::spot_caster_drop`; 0 leaves every list as it is.
+                let drop = self.levers.spot_caster_drop;
+                let keep = |bit: u32| drop & bit == 0;
+                let spot_posed: Vec<crate::renderer::shadow::ShadowMeshDraw> = posed_casters
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| if *i < posed_mirror_from { keep(8) } else { keep(16) })
+                    .map(|(_, d)| *d)
+                    .collect();
+                let spot_skinned: Vec<crate::renderer::shadow::ShadowSkinnedDraw> = frame_skinned_casters
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| if *i < skinned_mirror_from { keep(8) } else { keep(16) })
+                    .map(|(_, d)| *d)
+                    .collect();
+                let no_meshes: [crate::renderer::shadow::ShadowMeshDraw; 0] = [];
                 drawn += self.shadow_map.record_spots(
                     &mut encoder,
                     shadow.spot_count as usize,
                     &spot_pass,
-                    solid_caster,
-                    brush_caster,
-                    &shadow_casters,
-                    cull_bounds,
-                    frame_skinned_casters,
-                    &posed_casters,
-                    &solid_chunks,
+                    solid_caster.filter(|_| keep(1)),
+                    brush_caster.filter(|_| keep(2)),
+                    if keep(4) { &shadow_casters } else { &no_meshes },
+                    if keep(4) { cull_bounds } else { &[] },
+                    &spot_skinned,
+                    &spot_posed,
+                    if keep(1) { &solid_chunks } else { &[] },
                 );
             }
             if diag {

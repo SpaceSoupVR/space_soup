@@ -171,6 +171,13 @@ pub struct Levers {
     /// eyes, as before 2026-10-08 round 4 -- to price the cull;
     /// 262144 = no particle motion (rain, snow, effects), to compare.
     pub space_warp_debug: u32,
+    /// DIAGNOSIS: caster classes left OUT of every spot tile (the lamps' and
+    /// the flashlight's), to find which one casts a shadow on the headset:
+    /// 1 = the solid buffer (ground, cuboids), 2 = brushes, 4 = rigid meshes,
+    /// 8 = skinned meshes in view (characters, the first-person body),
+    /// 16 = the player's own whole body, hidden from them (`mirror_only`).
+    /// 0, the shipped state, leaves nothing out.
+    pub spot_caster_drop: u32,
     /// DIAGNOSIS: both eyes' finished images of the next frame, raw, to the
     /// app's files as `eyecapture_<n>.bin`, each time this changes to a new
     /// nonzero `n` -- to see whether something differs between the eyes,
@@ -731,6 +738,7 @@ impl Default for Levers {
             foveation: crate::renderer::foveation::SHIPPED,
             space_warp: true,
             space_warp_debug: 0,
+            spot_caster_drop: 0,
             eye_capture: 0,
             terminator_aa: true,
             glare: true,
@@ -935,6 +943,9 @@ impl Levers {
         }
         if self.space_warp_debug != 0 {
             out.push(format!("swdbg={}", self.space_warp_debug));
+        }
+        if self.spot_caster_drop != 0 {
+            out.push(format!("spot_drop={}", self.spot_caster_drop));
         }
         if self.glare && self.glare_strength != d.glare_strength {
             out.push(format!("glare_strength={}", self.glare_strength));
