@@ -112,6 +112,19 @@ pub struct BenchPose {
     /// a door that MOVES every frame, against the same angles held still.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub door_swing: Option<f32>,
+    /// A WALK FACING BACK: the eye turned to look where the walk came from,
+    /// so a [`Self::path`] is walked backward. Absent: forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backward: Option<bool>,
+    /// The eye's pitch, degrees (negative: down), in place of a walk's or a
+    /// turn's level look. Absent: theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitch: Option<f32>,
+    /// The player's own body drawn in this view (true), as the headset
+    /// draws it; absent, a pinned view leaves it out, as it always has (the
+    /// controllers on the desk would carry its hands into the view).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<bool>,
 }
 
 /// A flashlight a bench view holds still. See [`BenchPose::flashlight`].
@@ -256,6 +269,21 @@ fn along(legs: &[(Vec3, Vec3)], metres: f32) -> (Vec3, Vec3) {
 /// swaying one's (`BenchPose::sway`); a walker's along its path
 /// (`BenchPose::path`); or the still view turned (`BenchPose::spin`).
 pub fn view_at(pose: &BenchPose, seconds: f32) -> (Vec3, Vec3) {
+    let (eye, dir) = view_at_level(pose, seconds);
+    // Facing back along the walk, and pitched (`BenchPose::backward`, `pitch`).
+    let dir = if pose.backward == Some(true) { Vec3::new(-dir.x, dir.y, -dir.z) } else { dir };
+    let dir = match pose.pitch {
+        Some(deg) if deg.is_finite() => {
+            let level = Vec3::new(dir.x, 0.0, dir.z).normalize_or(Vec3::NEG_Z);
+            let p = deg.clamp(-89.0, 89.0).to_radians();
+            level * p.cos() + Vec3::Y * p.sin()
+        }
+        _ => dir,
+    };
+    (eye, dir)
+}
+
+fn view_at_level(pose: &BenchPose, seconds: f32) -> (Vec3, Vec3) {
     let still_eye = Vec3::from(pose.eye);
     let still = (Vec3::from(pose.at) - still_eye).normalize_or(Vec3::NEG_Z);
     if pose.path.is_some() {
@@ -353,6 +381,19 @@ pub fn pin_xr_views(views: &mut [openxr::View], located: bool, rig: &BenchRig) {
 mod tests {
     use super::*;
 
+    /// A walk walked backward looking down: the eye moves along the path as
+    /// a forward walk's does, facing the other way, pitched down.
+    #[test]
+    fn a_walk_can_be_walked_backward_looking_down() {
+        let fwd = BenchPose { path: Some(vec![[0.0, 1.6, -10.0]]), speed: Some(1.0), ..pose([0.0, 1.6, 0.0], [0.0, 1.6, -5.0]) };
+        let back = BenchPose { backward: Some(true), pitch: Some(-60.0), ..fwd.clone() };
+        let (e0, d0) = view_at(&fwd, 2.0);
+        let (e1, d1) = view_at(&back, 2.0);
+        assert!((e0 - e1).length() < 1e-6, "the same place on the walk");
+        assert!(d0.z < -0.9 && d1.z > 0.4, "facing back: {d0} {d1}");
+        assert!((d1.y - (-60f32).to_radians().sin()).abs() < 1e-5, "pitched down: {d1}");
+    }
+
     /// A view's doors held open, or swung shut-open-shut over its period.
     #[test]
     fn a_views_doors_are_held_or_swung() {
@@ -368,7 +409,7 @@ mod tests {
     }
 
     fn pose(eye: [f32; 3], at: [f32; 3]) -> BenchPose {
-        BenchPose { name: "t".into(), eye, at, rig_yaw: None, sway: None, path: None, speed: None, spin: None, flashlight: None, doors: None, door_swing: None }
+        BenchPose { name: "t".into(), eye, at, rig_yaw: None, sway: None, path: None, speed: None, spin: None, flashlight: None, doors: None, door_swing: None, backward: None, pitch: None, body: None }
     }
 
     /// Through the same transform the app puts every tracked pose through:

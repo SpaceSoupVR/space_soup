@@ -346,6 +346,27 @@
         }
     }
 
+    /// The player's body has see-through parts -- the boy's
+    /// `Facials_Hair_Clothing_Extra` is a glTF BLEND material -- and the
+    /// eye pass draws them blended after the opaque ones
+    /// (`Levers::opaque_models`); the hands have none.
+    #[test]
+    fn a_bodys_see_through_parts_are_marked_blended() {
+        let Some((device, queue, layout)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        let root = workspace_root();
+        for (rel, some_blended) in [("game/models/boy/boy.glb", true), ("game/models/left_hand.glb", false)] {
+            let mesh = GltfMesh::load(&device, &queue, &layout, &root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            let prims = &mesh.skin.as_ref().expect("skinned").primitives;
+            let blended = prims.iter().filter(|p| p.blended).count();
+            println!("{rel}: {blended} of {} skinned primitives blended", prims.len());
+            assert_eq!(blended > 0, some_blended, "{rel}");
+            assert!(blended < prims.len(), "{rel}: every part blended");
+        }
+    }
+
     use crate::renderer::mesh::skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, IDLE_BLEND};
 
     // ── Multi-clip blending ──────────────────────────────────────────────────

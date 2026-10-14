@@ -327,6 +327,12 @@ impl VkContext {
         // THE TORCH'S PUDDLE READERS WALK THE SKY, unless `adb shell setprop
         // debug.spacesoup.torchskywalk 0` before a launch builds them with its
         // two calls. See `ground_twins::TORCH_WEATHER_SKY_WALK`.
+        // THE WET BODY TRACED AS BEFORE: `adb shell setprop
+        // debug.spacesoup.bodyfilmtraced 1`. See `mesh_pipeline::SKINNED_FILM_TRACED`.
+        if system_property(c"debug.spacesoup.bodyfilmtraced") == "1" {
+            crate::renderer::mesh_pipeline::SKINNED_FILM_TRACED.store(true, std::sync::atomic::Ordering::Relaxed);
+            log::info!("BODYFILMTRACED: on -- the wet body traces the rooms' reflections");
+        }
         if system_property(c"debug.spacesoup.torchskywalk") == "0" {
             crate::renderer::ground_twins::TORCH_WEATHER_SKY_WALK.store(false, std::sync::atomic::Ordering::Relaxed);
             log::info!("TORCHSKYWALK: off -- the torch-lit weather twins read the sky twice");

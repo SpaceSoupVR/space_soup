@@ -54,6 +54,9 @@ type SkinnedDraw<'a> = (
     &'a wgpu::Buffer,
     &'a wgpu::Buffer,
     u32,
+    // See-through (`SkinnedMeshPrimitive::blended`): the eye pass draws it
+    // blended, after the opaque parts. See `Levers::opaque_models`.
+    bool,
 );
 
 /// One frame of `wgpu::hal::vulkan::DRAW_LOG`: set from here to the end of
@@ -98,6 +101,7 @@ fn push_mesh_draws<'a>(
                     &prim.vertex_buffer,
                     &prim.index_buffer,
                     prim.indices.len() as u32,
+                    prim.blended,
                 ));
             }
         }
@@ -665,7 +669,8 @@ impl XrRenderer {
                 Some(_) => self.tod.probe_means.iter().zip(&self.probe_brightness).map(|(m, now)| if m.0 > 0.0 { now / m.0 } else { 1.0 }).collect(),
                 None => Vec::new(),
             };
-            let ambient = |world: glam::Vec3| crate::renderer::effects::room_ambient_now(descs, world, &relit);
+            let ground = self.ground_heights.as_ref();
+            let ambient = |world: glam::Vec3| crate::renderer::effects::room_ambient_now(descs, world, &relit, ground);
             let at = crate::renderer::effects::Surroundings {
                 head: mid_eye,
                 offset,
@@ -708,10 +713,15 @@ impl XrRenderer {
             let splashes: Vec<crate::renderer::effects::Splash> =
                 splashes.into_iter().filter(|s| crate::renderer::effects::splash_seen(s, now, &views)).collect();
             self.effect_seen_until.resize(self.effect_emitters.len(), f64::NEG_INFINITY);
+            // Each one's SIGHT: the eyes it is seen through, narrowed to the
+            // doorways it is seen through (`effects::emitter_sight`).
+            let mut sight: Vec<Vec<crate::renderer::effects::seen::Eye>> = Vec::with_capacity(self.effect_emitters.len());
             for (e, until) in self.effect_emitters.iter().zip(self.effect_seen_until.iter_mut()) {
-                if crate::renderer::effects::emitter_seen(e, &views, head_world, rooms, &portals) {
+                let eyes = crate::renderer::effects::emitter_sight(e, &views, head_world, rooms, &portals);
+                if !eyes.is_empty() {
                     *until = now + crate::renderer::effects::EMITTER_HOLD;
                 }
+                sight.push(eyes);
             }
             let held = &self.effect_seen_until;
             let seen = |i: usize| held.get(i).map_or(true, |&t| now <= t);
@@ -719,7 +729,7 @@ impl XrRenderer {
             // travel bounds, thinned if the frame is over (`BurstSet::frame`).
             // The placed emitters and splashes in view are weighed with them
             // by the one governor: far and small shed first, whatever kind.
-            let wants = crate::renderer::effects::governor_wants(&self.effect_emitters, &seen, &splashes, &self.bursts.splash_measured, head_world);
+            let wants = crate::renderer::effects::governor_wants(&self.effect_emitters, &seen, &splashes, &self.bursts.splash_measured, head_world, &sight);
             let bursts_drawn = self.bursts.frame_with(&self.effect_library, now, &views, head_world, &wants);
             if (0..self.effect_emitters.len()).any(|i| seen(i)) || !splashes.is_empty() || bursts_drawn.contains(&true) {
                 let bursts = crate::renderer::effects::stack::BurstFrame { lib: &self.effect_library, set: &self.bursts, drawn: &bursts_drawn };
@@ -727,6 +737,7 @@ impl XrRenderer {
                 let shares = crate::renderer::effects::Shares {
                     emitter: &|e| set.share_of(crate::renderer::effects::emitter_key(e)),
                     splash: &|s| set.share_of(crate::renderer::effects::splash_key(s)),
+                    sight: &sight,
                 };
                 let frame = crate::renderer::effects::simulate_governed(&self.effect_emitters, &seen, &splashes, Some(&bursts), Some(&shares), now, &at);
                 self.burst_count = frame.bursts;
@@ -821,6 +832,10 @@ impl XrRenderer {
         // Each caster's bounding sphere, entry for entry, so a shadow tile can
         // leave out the models it cannot reach. See `shadow::ShadowMeshBound`.
         let mut shadow_bounds: Vec<crate::renderer::shadow::ShadowMeshBound> = Vec::new();
+        // Which of `shadow_casters` never move, so are never in the
+        // moving-objects SUN map (see where it is recorded, and
+        // `MeshInstance::moves`).
+        let mut level_casters: Vec<bool> = Vec::new();
         // Which of `shadow_casters` are doors, for the lamps' moving casters'
         // tiles. See `MeshInstance::tile_caster`.
         let mut tile_meshes: Vec<usize> = Vec::new();
@@ -902,6 +917,7 @@ impl XrRenderer {
                         &instance.model.bind_group,
                     ));
                     shadow_bounds.push(bound);
+                    level_casters.push(!instance.moves);
                 }
             }
         }
@@ -913,7 +929,7 @@ impl XrRenderer {
         // a shadow that belongs to nobody.
         let mut skinned_casters: Vec<crate::renderer::shadow::ShadowSkinnedDraw> = skinned_draws
             .iter()
-            .map(|(model_bg, _tex, joint_bg, vb, ib, count)| {
+            .map(|(model_bg, _tex, joint_bg, vb, ib, count, _)| {
                 (*vb, *ib, *count, *model_bg, *joint_bg)
             })
             .collect();
@@ -964,13 +980,14 @@ impl XrRenderer {
                         &instance.model.bind_group,
                     ));
                     shadow_bounds.push(bound);
+                    level_casters.push(false);
                 }
             }
         }
         skinned_casters.extend(
             mirror_only_skinned_draws
                 .iter()
-                .map(|(model_bg, _tex, joint_bg, vb, ib, count)| (*vb, *ib, *count, *model_bg, *joint_bg)),
+                .map(|(model_bg, _tex, joint_bg, vb, ib, count, _)| (*vb, *ib, *count, *model_bg, *joint_bg)),
         );
         // POSED ONCE (`Levers::skin_once`): each of those primitives posed by
         // one compute pass at the head of the shadow encoder, and drawn into
@@ -1765,13 +1782,33 @@ impl XrRenderer {
                 for (k, (_, tile)) in character_tiles.iter().enumerate() {
                     self.shadow_map.upload_light(&self.wgpu_queue, crate::renderer::shadow::ShadowKind::Character(k), *tile);
                 }
+                // NOTHING STILL IN THE MOVING-OBJECTS SUN MAP. It follows the
+                // head, so a model that never moves -- the cave's rock first --
+                // cast its sun shadow only within its box of the player, and
+                // the shadow drew itself in and faded as they walked (the back
+                // mouth's jamb across its floor tongue, headset 081923-081935,
+                // 095001-095034). A still model's sun is in the level's baked
+                // data at any distance. A bound no tile reaches leaves it out
+                // here and nowhere else: the lamps' and the torch's maps still
+                // take it. See `MeshInstance::moves`.
+                let moving_bounds: Vec<crate::renderer::shadow::ShadowMeshBound> = level_casters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &level)| {
+                        if level {
+                            glam::Vec4::new(0.0, -1.0e9, 0.0, 0.0)
+                        } else {
+                            cull_bounds.get(i).copied().unwrap_or(glam::Vec4::new(0.0, 0.0, 0.0, f32::INFINITY))
+                        }
+                    })
+                    .collect();
                 drawn += self.shadow_map.record_moving(
                     &mut encoder,
                     shadow.sun_dynamic_enabled,
                     shadow.sun_dynamic_view_proj,
                     &character_tiles.iter().map(|(_, m)| *m).collect::<Vec<_>>(),
                     &shadow_casters,
-                    cull_bounds,
+                    &moving_bounds,
                     frame_skinned_casters,
                     &posed_casters,
                     &tile_meshes,
@@ -2378,7 +2415,7 @@ impl XrRenderer {
                         // mirror target.
                         pass.set_pipeline(&self.skinned_mesh_mirror_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in all_skinned_draws {
+                        for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in all_skinned_draws {
                             pass.set_bind_group(1, *model_bg, &[]);
                             pass.set_bind_group(2, *tex_bg, &[]);
                             pass.set_bind_group(3, *joint_bg, &[]);
@@ -2857,7 +2894,7 @@ impl XrRenderer {
                         });
                         pass.set_pipeline(&self.floor_mirror_skinned.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.twin_bind_group, &[]);
-                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in skinned_draws.iter().chain(mirror_only_skinned_draws.iter()) {
+                        for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in skinned_draws.iter().chain(mirror_only_skinned_draws.iter()) {
                             pass.set_bind_group(1, *model_bg, &[]);
                             pass.set_bind_group(2, *tex_bg, &[]);
                             pass.set_bind_group(3, *joint_bg, &[]);
@@ -3393,7 +3430,14 @@ impl XrRenderer {
                         );
                     }
                     if solid_any {
-                        pass.set_pipeline(self.sp_solid(stereo));
+                        // Without blending when every cuboid is opaque, so
+                        // they write the coarse depth everything after them
+                        // is rejected by. See `Levers::opaque_models`.
+                        let cuboids_opaque = cuboids
+                            .iter()
+                            .all(|c| matches!(c.style, crate::renderer::cuboid::CuboidStyle::Wireframe) || c.color.3 == 255);
+                        let solid_opaque = self.sp_solid_opaque(stereo).filter(|_| cuboids_opaque);
+                        pass.set_pipeline(solid_opaque.unwrap_or(self.sp_solid(stereo)));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_vertex_buffer(0, solid_vb.slice(..));
                         pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -3758,7 +3802,8 @@ impl XrRenderer {
                         pass.draw_indexed(0..wire_idx.len() as u32, 0, 0..1);
                     }
                     if !mesh_draws.is_empty() {
-                        pass.set_pipeline(self.sp_mesh(stereo));
+                        // Without blending: see `Levers::opaque_models`.
+                        pass.set_pipeline(self.sp_mesh_opaque(stereo).unwrap_or(self.sp_mesh(stereo)));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         // The opaque parts. A primitive with thin parts draws
                         // the rest here and those in the thin pass, after the
@@ -3780,16 +3825,49 @@ impl XrRenderer {
                         }
                     }
                     if !skinned_draws.is_empty() {
-                        pass.set_pipeline(self.sp_skinned(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in &skinned_draws {
-                            pass.set_bind_group(1, *model_bg, &[]);
-                            pass.set_bind_group(2, *tex_bg, &[]);
-                            pass.set_bind_group(3, *joint_bg, &[]);
-                            pass.set_vertex_buffer(0, vb.slice(..));
-                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..*count, 0, 0..1);
+                        // A body's opaque parts without blending, then its
+                        // see-through ones (the boy's hair and clothing
+                        // extras) blended over them; with the lever off, all
+                        // blended in the order they came, as before. See
+                        // `Levers::opaque_models`.
+                        // Each run: which parts (`None`: all), and with what.
+                        let blended_body = self.sp_skinned(stereo);
+                        let runs: [Option<(Option<bool>, &wgpu::RenderPipeline)>; 2] = match self.sp_skinned_opaque(stereo) {
+                            Some(opaque) => [Some((Some(false), opaque)), Some((Some(true), blended_body))],
+                            None => [Some((None, blended_body)), None],
+                        };
+                        for (which, pipeline) in runs.into_iter().flatten() {
+                            let mut set = false;
+                            for (model_bg, tex_bg, joint_bg, vb, ib, count, blended) in &skinned_draws {
+                                if which.is_some_and(|w| w != *blended) {
+                                    continue;
+                                }
+                                if !set {
+                                    pass.set_pipeline(pipeline);
+                                    set = true;
+                                }
+                                pass.set_bind_group(1, *model_bg, &[]);
+                                pass.set_bind_group(2, *tex_bg, &[]);
+                                pass.set_bind_group(3, *joint_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
                         }
+                    }
+                    // THE SKY BEFORE THE WATER (`Levers::sky_before_water`):
+                    // the water's blended depth-writing draw turns Adreno's LRZ
+                    // off for the rest of the pass, and the sky is the biggest
+                    // draw after it. Where the sky is behind water the water
+                    // multiplies it away (`through` carries `drawn`, 0 there).
+                    // Not with the eye in a body: see below.
+                    let sky_first = self.levers.sky_before_water && eye_in_water.is_none();
+                    if sky_first {
+                        pass.set_pipeline(self.sp_sky(stereo));
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.sky.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
                     }
                     // WATER LAST of the world geometry, and that ordering is
                     // the whole reason it looks right: it tints what is
@@ -3854,7 +3932,7 @@ impl XrRenderer {
                     // blended and have to land on top of it.
                     // Not from wholly under the water: it shows only through
                     // the surface, whose underside draws it.
-                    if !wholly_under {
+                    if !wholly_under && !sky_first {
                         pass.set_pipeline(self.sp_sky(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.sky.bind_group, &[]);
