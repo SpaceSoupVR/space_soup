@@ -462,6 +462,9 @@ pub struct XrRenderer {
     /// once the frame knows its spots, while its draw lists borrow the
     /// renderer, hence atomic.
     spotless_frame: std::sync::atomic::AtomicBool,
+    /// Whether the player's body is wet this frame: which of the skinned
+    /// pipeline's twins draws it (`mesh_pipeline::skinned_body_twin`).
+    body_wet: std::sync::atomic::AtomicBool,
     sun_faces: Option<crate::renderer::brush_pipeline::SunFaces>,
     probe_pass_targets: [crate::renderer::brush_pipeline::probe_pass::Target; 2],
     /// The single-eye probe pass that ships: its secondary lookups left to
@@ -719,6 +722,10 @@ pub struct XrRenderer {
     /// SPLASHES the client saw, born on the water's clock (`set_water_time`),
     /// kept while their drops fly or their rings spread. See `add_splash`.
     splashes: Vec<crate::renderer::effects::Splash>,
+    /// THE WAKE round the player and what stirs it this frame
+    /// (`water_wake`, `stir_water`).
+    water_wake: crate::renderer::water_wake::WakeField,
+    wake_sources: Vec<crate::renderer::water_wake::WakeSource>,
     /// The effects a level can raise (`game/effects`, compiled at load) and
     /// the event bursts of them in play: a shot's flash and smoke. See
     /// `add_burst`, `effects::stack`.
@@ -1363,7 +1370,7 @@ impl XrRenderer {
         let spotless_mesh =
             MeshPipeline::new_multisampled_spotless(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
         let skinned_mesh_pipeline =
-            SkinnedMeshPipeline::new_multisampled(&wgpu_device, wgpu_format, &uniform_buf.layout, samples);
+            SkinnedMeshPipeline::new_multisampled(&wgpu_device, wgpu_format, &uniform_buf.layout, samples).with_body_twins(&wgpu_device);
         // The mirror pass renders into a single-sampled target, so the skinned
         // pipeline needs a 1x twin. Every other pipeline used there already had
         // a separate mirror variant for its winding; this one did not, because
@@ -1763,6 +1770,7 @@ impl XrRenderer {
             spotless_readers,
             spotless_mesh,
             spotless_frame: std::sync::atomic::AtomicBool::new(false),
+            body_wet: std::sync::atomic::AtomicBool::new(false),
             sun_faces: None,
             probe_pass_targets,
             brush_probe_pass_deferred_pipeline,
@@ -1880,6 +1888,8 @@ impl XrRenderer {
             effect_emitters: Vec::new(),
             effect_seen_until: Vec::new(),
             splashes: Vec::new(),
+            water_wake: Default::default(),
+            wake_sources: Vec::new(),
             effect_library: Default::default(),
             bursts: Default::default(),
             burst_count: Default::default(),
@@ -2341,8 +2351,31 @@ impl XrRenderer {
     fn sp_skinned(&self, stereo: bool) -> &wgpu::RenderPipeline {
         match (stereo, &self.stereo_pipelines) {
             (true, Some(p)) => &p.skinned_mesh.pipeline,
-            _ => &self.skinned_mesh_pipeline.pipeline,
+            _ => self.skinned_mesh_pipeline.for_body(self.body_wet.load(std::sync::atomic::Ordering::Relaxed)),
         }
+    }
+    /// THE OPAQUE TWINS of [`Self::sp_solid`], [`Self::sp_mesh`] and
+    /// [`Self::sp_skinned`]: blending off, for what is opaque, while
+    /// `Levers::opaque_models` is on. `None` -- draw with the blended one --
+    /// with the lever off, in the stereo pass (which has none), or for a body
+    /// traced wet as before. See `mesh_pipeline::opaque_target`.
+    fn sp_solid_opaque(&self, stereo: bool) -> Option<&wgpu::RenderPipeline> {
+        (self.levers.opaque_models && !stereo).then_some(self.solid_pipeline.opaque.as_ref()).flatten()
+    }
+    fn sp_mesh_opaque(&self, stereo: bool) -> Option<&wgpu::RenderPipeline> {
+        if !self.levers.opaque_models || stereo {
+            return None;
+        }
+        if self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed) {
+            self.spotless_mesh.opaque.as_ref()
+        } else {
+            self.mesh_pipeline.opaque.as_ref()
+        }
+    }
+    fn sp_skinned_opaque(&self, stereo: bool) -> Option<&wgpu::RenderPipeline> {
+        (self.levers.opaque_models && !stereo)
+            .then(|| self.skinned_mesh_pipeline.for_opaque_body(self.body_wet.load(std::sync::atomic::Ordering::Relaxed)))
+            .flatten()
     }
     fn sp_terrain(&self, stereo: bool) -> &wgpu::RenderPipeline {
         match (stereo, &self.stereo_pipelines) {
@@ -2545,6 +2578,13 @@ impl XrRenderer {
     /// marked `MeshInstance::tile_caster`); this is what their shadow tiles
     /// are fitted to and which doorways portal culling may not see through.
     /// See `doors`.
+    /// Whether the player's body is wet (`ModelUniform::set_wetness` above
+    /// zero): the skinned scene pass draws it with its wet twin, else its dry
+    /// one. See `mesh_pipeline::skinned_body_twin`.
+    pub fn set_body_wet(&self, wet: bool) {
+        self.body_wet.store(wet, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn set_doors(&mut self, doors: Vec<crate::renderer::doors::DoorView>) {
         self.shut_portals = crate::renderer::doors::shut_portals(&self.probe_portals, &doors);
         self.doors = doors;
@@ -2635,6 +2675,16 @@ impl XrRenderer {
         }
         if let Some(on) = levers.ssr {
             self.set_screen_space_reflections(on);
+        }
+        // The diagnostic view, when the file names it (`Levers::debug_view`).
+        if let Some(name) = levers.debug_view.as_deref() {
+            use crate::renderer::brush_pipeline::DebugView;
+            match name {
+                "off" => self.set_debug_view(DebugView::Off),
+                "sources" => self.set_debug_view(DebugView::Sources),
+                "ssr" => self.set_debug_view(DebugView::Ssr),
+                other => log::warn!("LEVERS: debug_view {other:?}: not off, sources or ssr; left as it is"),
+            }
         }
         if let Some(on) = levers.multiview {
             let got = self.set_multiview_scene(on);
@@ -3379,6 +3429,13 @@ impl XrRenderer {
     /// SOMETHING STRUCK THE WATER: its drops and spray fly with the effects,
     /// its rings spread on every body's surface. `born` is on the clock
     /// `set_water_time` is given. See `effects::Splash`.
+    /// WHAT STIRS THE WATER this frame -- hands, legs, floating things, where
+    /// they cross the surface (`water_wake::WakeSource`) -- for the next
+    /// `set_water_time` to push the wake with.
+    pub fn stir_water(&mut self, sources: &[crate::renderer::water_wake::WakeSource]) {
+        self.wake_sources.extend_from_slice(sources);
+    }
+
     pub fn add_splash(&mut self, mut splash: crate::renderer::effects::Splash) {
         const KEPT: usize = 48;
         // Onto the surface as drawn: the body whose still surface it struck.
@@ -3487,9 +3544,20 @@ impl XrRenderer {
         let lasts = crate::renderer::effects::SPLASH_SECONDS.max(crate::renderer::water_pipeline::RING_SECONDS) as f64;
         self.splashes.retain(|s| now - s.born < lasts && s.born <= now + 1.0);
         let rings = crate::renderer::effects::splash_rings(&self.splashes, now, self.player.offset);
+        // THE WAKE: stepped by what is in the water, round the player, and
+        // uploaded while it holds anything (`water_wake`).
+        if !self.water_bodies.is_empty() {
+            let centre = glam::Vec2::new(self.player.offset.x, self.player.offset.z);
+            if self.water_wake.step(self.water_step, centre, &self.wake_sources) {
+                self.water_pipeline.write_wake(&self.wgpu_queue, &self.water_wake.texels());
+            }
+        }
+        self.wake_sources.clear();
+        let wake = self.water_wake.uniform();
         for body in &mut self.water_bodies {
             body.uniform.set_time(self.water_seconds, body.waves.params.loop_seconds);
             body.uniform.set_rings(&rings);
+            body.uniform.wake = wake;
             self.wgpu_queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
         }
     }

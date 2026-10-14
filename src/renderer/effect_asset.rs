@@ -83,6 +83,10 @@ pub struct EffectAsset {
     pub seed_policy: SeedPolicy,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeedPolicy {
@@ -459,8 +463,17 @@ pub enum InitModule {
         start: f32,
     },
     ShapePoint {},
-    /// Born on a disc of this radius across the emitter's direction.
-    ShapeDisc { radius: f32 },
+    /// Born on a disc of this radius across the emitter's direction. With
+    /// `fills_object`, a PLACED effect's disc spans its object's footprint
+    /// instead -- stretched to the box's width and depth, its rate grown
+    /// with the area so it stays as dense (`stack::Placed::footprint`): one
+    /// pond mist for every pond, sized by the pond's box. The editor's
+    /// preview, with no object, draws the disc as authored.
+    ShapeDisc {
+        radius: f32,
+        #[serde(default, skip_serializing_if = "is_false")]
+        fills_object: bool,
+    },
     /// Born anywhere in the placed object's box.
     ShapeBox {},
     /// Launched within this angle of the emitter's direction, or of the
@@ -825,12 +838,43 @@ pub struct EmitterCost {
     pub instances: u32,
     /// Seconds its longest-lived particle lasts (0 for one frame).
     pub longest_life: f32,
-    /// Fill of those particles, megapixel-layers, at the reference view.
+    /// Fill of those particles, megapixel-layers, at the reference view: a
+    /// burst's every particle at its reference distance (held in the hand);
+    /// a placed effect's seen from its stated view (`effects::seen`).
     pub fill: f32,
     /// Spawned at a rate: one stream per source however many bursts are
     /// alive (a newer burst takes the stream over), so it is not multiplied
     /// by `max_live`.
     pub stream: bool,
+    /// What its particles draw, worst case, square metres within their
+    /// cutouts, whatever the distance: turned to the eye, or lying level
+    /// (`placement: flat`). With `points`, what a frame's fill is worked out
+    /// from where the eyes are (`effects::seen`).
+    pub area: f32,
+    pub flat: bool,
+    /// Particles drawn at the 1.5 pixel floor (`placement: point`).
+    pub points: u32,
+    /// Where its particles get to from its origin (its up the emitter's).
+    pub extent: Extent,
+    /// The radius of a disc that fills its placed object (`shape_disc`
+    /// `fills_object`), 0 for none.
+    pub fills_disc: f32,
+}
+
+/// WHERE AN EFFECT'S PARTICLES GET TO from its origin, metres, its up the
+/// emitter's direction: out to the side, down, up (`stack::emitter_extent`).
+/// The box its fill is seen through (`effects::seen`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Extent {
+    pub lateral: f32,
+    pub below: f32,
+    pub above: f32,
+}
+
+impl Extent {
+    pub fn union(self, o: Self) -> Self {
+        Self { lateral: self.lateral.max(o.lateral), below: self.below.max(o.below), above: self.above.max(o.above) }
+    }
 }
 
 /// What an effect costs, from its stacks alone, and what it was held to.
@@ -849,6 +893,17 @@ pub struct Report {
     pub reference_distance: f32,
     /// Whether any of its emitters is spawned by an event.
     pub burst: bool,
+    /// HOW ITS FILL WAS STATED. A burst: every particle at
+    /// `reference_distance` (held in the hand). A placed effect: seen
+    /// `reference_distance` off the side of its box, standing (`seen`); the
+    /// frame's governor weighs it from the eyes of each frame.
+    pub seen_from_side: bool,
+    /// Every emitter's box together, and their particles' area at the cap
+    /// (turned to the eye; lying level) and points: what the frame weighs.
+    pub extent: Extent,
+    pub area_facing: f32,
+    pub area_flat: f32,
+    pub points: u32,
     /// The reason it may exceed a budget, and the budget errors it then
     /// carries.
     pub over_budget: Option<(String, Vec<String>)>,
@@ -953,6 +1008,18 @@ impl EffectAsset {
         if names.windows(2).any(|w| w[0] == w[1]) {
             note(false, None, "two emitters share a name".into());
         }
+        // A PLACED EFFECT'S FILL, seen from beside it: its box from its
+        // stated view, times each emitter's layers (`effects::seen`) -- not
+        // every particle at one distance, which priced a wide mist's far
+        // sheets as near ones and past the edges of the view.
+        let extent = costs.iter().fold(Extent::default(), |a, c| a.union(c.extent));
+        if !burst {
+            let (lo, hi, eyes) = crate::renderer::effects::seen::stated_view(extent.lateral, extent.below, extent.above, reference);
+            for c in costs.iter_mut() {
+                let (facing, flat) = if c.flat { (0.0, c.area) } else { (c.area, 0.0) };
+                c.fill = crate::renderer::effects::seen::seen_fill(&eyes, lo, hi, facing, flat, c.points as f32);
+            }
+        }
         let instances_per_burst: u32 = costs.iter().map(|c| c.instances).sum();
         let fill_per_burst: f32 = costs.iter().map(|c| c.fill).sum();
         // AT THE CAP: an emitter whose particles outlive the event keeps up
@@ -961,6 +1028,9 @@ impl EffectAsset {
         let held = |c: &EmitterCost| if burst && c.longest_life > 0.0 && !c.stream { s.max_live.max(1) } else { 1 };
         let instances_steady: u32 = costs.iter().map(|c| c.instances * held(c)).sum();
         let fill_steady: f32 = costs.iter().map(|c| c.fill * held(c) as f32).sum();
+        let area_facing: f32 = costs.iter().filter(|c| !c.flat).map(|c| c.area * held(c) as f32).sum();
+        let area_flat: f32 = costs.iter().filter(|c| c.flat).map(|c| c.area * held(c) as f32).sum();
+        let points: u32 = costs.iter().map(|c| c.points * held(c)).sum();
         let texture_bytes: u64 = texture.iter().filter_map(|n| books.iter().find(|b| b.name == *n)).map(|b| b.bytes).sum();
         let mut over = |what: String| note(true, None, what);
         if instances_steady > self.budget.instances {
@@ -970,10 +1040,8 @@ impl EffectAsset {
             over(format!("it budgets {} instances; the limit is {LIMIT_INSTANCES}", self.budget.instances));
         }
         if fill_steady > self.budget.fill_megapixel_layers {
-            over(format!(
-                "fill {fill_steady:.2} megapixel-layers at {reference} m at its cap; it budgets {}",
-                self.budget.fill_megapixel_layers
-            ));
+            let seen = if burst { format!("at {reference} m") } else { format!("seen from {reference} m off its side") };
+            over(format!("fill {fill_steady:.2} megapixel-layers {seen} at its cap; it budgets {}", self.budget.fill_megapixel_layers));
         }
         if self.budget.fill_megapixel_layers > LIMIT_FILL_STEADY {
             over(format!("it budgets {} megapixel-layers; the limit is {LIMIT_FILL_STEADY}", self.budget.fill_megapixel_layers));
@@ -1011,6 +1079,11 @@ impl EffectAsset {
             texture_bytes,
             reference_distance: reference,
             burst,
+            seen_from_side: !burst,
+            extent,
+            area_facing,
+            area_flat,
+            points,
             over_budget: self.over_budget.clone().map(|r| (r, over_budget)),
         })
     }
@@ -1099,7 +1172,8 @@ impl EffectAsset {
                     }
                 }
                 InitModule::ShapeCone { angle_deg, .. } if !(0.0..=180.0).contains(angle_deg) => bad("shape_cone: 0-180 degrees".into()),
-                InitModule::ShapeDisc { radius } if !(*radius >= 0.0) => bad("shape_disc: radius 0 or more".into()),
+                InitModule::ShapeDisc { radius, .. } if !(*radius >= 0.0) => bad("shape_disc: radius 0 or more".into()),
+                InitModule::ShapeDisc { radius, fills_object: true } if !(*radius > 0.0) => bad("shape_disc: a disc that fills its object needs a radius over 0".into()),
                 InitModule::ShapePoint {} | InitModule::ShapeDisc { .. } | InitModule::ShapeBox {} | InitModule::SpotsLowDiscrepancy { .. } => shapes += 1,
                 InitModule::Delay { frames } if *frames > 8 => bad("delay: at most 8 frames".into()),
                 _ => {}
@@ -1280,14 +1354,49 @@ impl EffectAsset {
             _ => half,
         };
         let across = 2.0 * mean_half / reference * REFERENCE_FOCAL_PIXELS;
-        let along = match (lobe_length, placements.first()) {
-            (Some(l), _) => (l.mean() / reference * REFERENCE_FOCAL_PIXELS).max(across),
-            (None, Some(PlacementMode::Point)) => 1.5,
+        // A streak is as long as its speed for `streak_seconds`: its launch,
+        // and what its acceleration has brought it to against its drag by
+        // the middle of its life.
+        let streak_metres = e.render.iter().find_map(|m| match m {
+            RenderModule::Placement { mode: PlacementMode::Streak, streak_seconds } => {
+                let launch = e.initialize.iter().find_map(|m| if let InitModule::Speed { value } = m { Some(value.mean()) } else { None }).unwrap_or(0.0);
+                let gained = e.update.iter().find_map(|m| match m {
+                    UpdateModule::Ballistic { accel, drag } => {
+                        let a = (accel[0] * accel[0] + accel[1] * accel[1] + accel[2] * accel[2]).sqrt();
+                        Some(if *drag > 1e-4 { a / drag * (1.0 - (-drag * 0.5 * longest).exp()) } else { a * 0.5 * longest })
+                    }
+                    _ => None,
+                });
+                Some(*streak_seconds * (launch + gained.unwrap_or(0.0)))
+            }
+            _ => None,
+        });
+        let along = match (lobe_length, placements.first(), streak_metres) {
+            (Some(l), _, _) => (l.mean() / reference * REFERENCE_FOCAL_PIXELS).max(across),
+            (None, Some(PlacementMode::Point), _) => 1.5,
+            (None, _, Some(m)) => (m / reference * REFERENCE_FOCAL_PIXELS).max(across),
             _ => across,
         };
         let across = if matches!(placements.first(), Some(PlacementMode::Point)) { 1.5 } else { across };
         let fill = instances as f32 * across * along * share * REFERENCE_EYES / 1e6;
-        EmitterCost { name: e.name.clone(), instances, longest_life: if one_frame { 0.0 } else { longest }, fill, stream: rate.is_some() }
+        // The same area, whatever the distance (`across` and `along` in
+        // metres): what the frame's governor sees through.
+        let point = matches!(placements.first(), Some(PlacementMode::Point));
+        let metres = |px: f32| px * reference / REFERENCE_FOCAL_PIXELS;
+        let area = if point { 0.0 } else { instances as f32 * metres(across) * metres(along) * share };
+        let fills_disc = e.initialize.iter().find_map(|m| if let InitModule::ShapeDisc { radius, fills_object: true } = m { Some(*radius) } else { None }).unwrap_or(0.0);
+        EmitterCost {
+            name: e.name.clone(),
+            instances,
+            longest_life: if one_frame { 0.0 } else { longest },
+            fill,
+            stream: rate.is_some(),
+            area,
+            flat: matches!(placements.first(), Some(PlacementMode::Flat)),
+            points: if point { instances } else { 0 },
+            extent: crate::renderer::effects::stack::emitter_extent(e),
+            fills_disc,
+        }
     }
 }
 

@@ -220,6 +220,10 @@ pub struct WaterUniform {
     /// x: how far the ripples fall in the lulls between gusts (1: no lulls;
     /// see `paws_calm`); y: the swell, metres; zw: the wind's way, x and z.
     pub air: [f32; 4],
+    /// THE WAKE round the player (`water_wake::WakeField::uniform`): the
+    /// world x, z of its grid's corner, one over its side, 1 while it holds
+    /// anything.
+    pub wake: [f32; 4],
 }
 
 /// A body's optics as authored, in linear light.
@@ -256,6 +260,7 @@ impl WaterUniform {
             ring_pools: [[0.0; 4]; RINGS],
             ring_drops: [[0.0; 4]; RINGS],
             air: [paws_calm(waves.wind_speed), o.swell.max(0.0), waves.wind_dir.cos(), waves.wind_dir.sin()],
+            wake: [0.0; 4],
         }
     }
 
@@ -291,6 +296,10 @@ pub struct WaterPipeline {
     /// Whether the bed is tinted channel by channel (dual-source blending) or
     /// by one alpha. See the module notes.
     pub dual_source: bool,
+    /// THE WAKE's texture (`water_wake`): every body's material reads this
+    /// one, which `XrRenderer` writes each frame the wake moves.
+    pub wake_texture: Texture,
+    wake_view: TextureView,
     /// Its layout, target and blending, for a cut built later.
     inputs: WaterInputs,
 }
@@ -364,6 +373,7 @@ impl WaterPipeline {
                     ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
                 },
+                texture(6, ShaderStages::FRAGMENT, TextureViewDimension::D2),
             ],
         });
         let sampler = device.create_sampler(&SamplerDescriptor {
@@ -412,7 +422,30 @@ impl WaterPipeline {
             }
         }
 
-        Self { pipeline, raining, ringless, waterline, material_layout, sampler, dual_source, inputs }
+        let n = crate::renderer::water_wake::WAKE_N as u32;
+        let wake_texture = device.create_texture(&TextureDescriptor {
+            label: Some("water_wake"),
+            size: Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba16Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let wake_view = wake_texture.create_view(&TextureViewDescriptor::default());
+        Self { pipeline, raining, ringless, waterline, material_layout, sampler, dual_source, wake_texture, wake_view, inputs }
+    }
+
+    /// Write the wake's texels (`water_wake::WakeField::texels`).
+    pub fn write_wake(&self, queue: &Queue, texels: &[u16]) {
+        let n = crate::renderer::water_wake::WAKE_N as u32;
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &self.wake_texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            bytemuck::cast_slice(texels),
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 8), rows_per_image: Some(n) },
+            Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+        );
     }
 
     /// THE TWIN TO DRAW for these splashes (`WaterUniform::set_rings`):
@@ -449,6 +482,7 @@ impl WaterPipeline {
                     BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&waves.curvature_views[set]) },
                     BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&waves.foam_view) },
                     BindGroupEntry { binding: 5, resource: BindingResource::Sampler(&self.sampler) },
+                    BindGroupEntry { binding: 6, resource: BindingResource::TextureView(&self.wake_view) },
                 ],
             })
         })
@@ -760,6 +794,7 @@ struct WaterMat {{
     ring_pools: array<vec4<f32>, {rings}>,
     ring_drops: array<vec4<f32>, {rings}>,
     air: vec4<f32>,
+    wake: vec4<f32>,
 }}
 
 // THE SHORE'S WAVES. Each breaker rolls in toward the beach -- a point a
@@ -930,7 +965,7 @@ const RING_BLOCK: &str = r#"    var ring_curve = vec3<f32>(0.0);
             let ph = wv.x * r.z * r.z / from_rim;
             let k = ph / from_rim;
             let resolved = 1.0 - smoothstep(0.25, 0.5, span * k * (0.5 / WATER_PI));
-            let steep = r.w * k * k * k * k * exp(-k * (wv.y + k * r.z * RING_FILM_DAMPING)) * smoothstep(0.0, wv.z, from_rim) / dist;
+            let steep = r.w * k * k * k * k * exp(-k * (wv.y + k * r.z * RING_FILM_DAMPING)) * min(from_rim / wv.z, 1.0) / dist;
             let s = sin(ph);
             tilt = tilt - outward * (steep * resolved * s);
             // Its crests gather the sun on the bed under them, its troughs
@@ -945,7 +980,9 @@ const RING_BLOCK: &str = r#"    var ring_curve = vec3<f32>(0.0);
             // waves leaving through it as it dissolves (`pool.z`).
             let bowl = exp(-dist * dist * pool.y);
             tilt = tilt + d * (wv.w * bowl);
-            ring_foam = ring_foam + pool.x * bowl * (1.0 + pool.z * (s * (3.0 - 4.0 * s * s) - 1.0));
+            // (Its arcs along the leaving waves, `pool.z`, were cut
+            // 2026-10-14 to make room for the wake under the cache: 8.)
+            ring_foam = ring_foam + pool.x * bowl;
 DROPS_FALLING_BACK        }
     }
 "#;
@@ -1007,12 +1044,16 @@ const DROP_RING_WIDTH: f32 = 7800.0;
 const DROP_RING_K: f32 = 420.0;
 const DROP_RING_SLOPE: f32 = 3.0;
 
-/// How many times a metre the foam texture repeats under a splash's foam.
-const RING_FOAM_TILES: f32 = 1.9;
+/// How many times a metre the foam texture repeats under a splash's foam,
+/// and how hard it is broken about its mean. (1.9 and 3.0 until 2026-10-14:
+/// within a metre and a half the cells were 5 cm leopard spots with black
+/// water between -- the user's 'lace' -- so finer and softer: bubbles in
+/// clumps a centimetre or two across.)
+const RING_FOAM_TILES: f32 = 4.0;
 /// The blurred foam texture's mean, and how hard a splash's foam is broken
 /// about it.
 const RING_FOAM_MEAN: f32 = 0.35;
-const RING_FOAM_CONTRAST: f32 = 3.0;
+const RING_FOAM_CONTRAST: f32 = 1.6;
 
 
 fn water_wgsl(dual: bool) -> String {
@@ -1152,6 +1193,7 @@ const PAWS_RATE: vec2<f32> = vec2<f32>(0.1308997, 0.0785398);
 @group(1) @binding(3) var wave_curve: texture_2d_array<f32>;
 @group(1) @binding(4) var foam_tex: texture_2d<f32>;
 @group(1) @binding(5) var wave_samp: sampler;
+@group(1) @binding(6) var wake_tex: texture_2d<f32>;
 
 struct VIn {{
     @location(0) pos: vec3<f32>,
@@ -1288,6 +1330,15 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         let breaker_size = breaker_amp(q, water.tiles.w, breaker_count);
         tilt = tilt + breaker_height(still_depth, breaker_size) * breaker_profile_slope(breaker_phase, breaker_size) * across;
     }}
+    // THE WAKE round the player (`water_wake`): the water hands, legs and
+    // floating things push aside as they move -- bow, V and trailing
+    // ripples -- its slope and its curvature for the caustics. Only on the
+    // grid (the sampler repeats; its edge is a still sponge, so the cut does
+    // not show), nothing while it rests.
+    let wake_uv = (q - water.wake.xy) * water.wake.z;
+    let wake = textureSample(wake_tex, wave_samp, wake_uv);
+    let wake_in = select(0.0, water.wake.w, all(abs(wake_uv - vec2<f32>(0.5)) < vec2<f32>(0.47)));
+    tilt = tilt + wake.xy * wake_in;
     // SPLASHES' RINGS, and the foam each leaves where it struck. A ring's
     // train is gone where a pixel spans half its wavelength: further off it
     // would only alias.
@@ -1441,7 +1492,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     // cascade fades as a pixel spans its cells.
     let fine = 0.5 * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N * 0.25 / water.tiles.z));
     let mid = max(shoal, 0.6) * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N / water.tiles.y));
-    let curve = c0.xyz * (0.5 * shoal) + c1.xyz * mid + c2.xyz * fine{ring_curve};
+    let curve = c0.xyz * (0.5 * shoal) + c1.xyz * mid + c2.xyz * fine + vec3<f32>(wake.zw * wake_in, 0.0){ring_curve};
     let focus = thickness * (1.0 - 1.0 / IOR_WATER);
     let jx = 1.0 - focus * curve.x;
     let jz = 1.0 - focus * curve.y;
@@ -2058,8 +2109,8 @@ mod ring_size_tests {
             ("drops", cut("            let dr = water.ring_drops[i];", "            }\n")),
             ("caustic", cut("            ring_curve = ring_curve -", ";\n")),
             ("rough", cut("            ring_rough = ring_rough + 0.5 * steep", ";\n")),
-            ("foam arcs", full.replace("pool.x * bowl * (1.0 + pool.z * (s * (3.0 - 4.0 * s * s) - 1.0))", "pool.x * bowl")),
-            ("inner fade", full.replace(" * smoothstep(wv.z, 2.0 * wv.z, dist)", "")),
+            ("inner fade", full.replace(" * min(from_rim / wv.z, 1.0)", "")),
+            ("wake", full.replace("    tilt = tilt + wake.xy * wake_in;\n", "").replace(" + vec3<f32>(wake.zw * wake_in, 0.0)", "")),
         ] {
             let t = total(&src);
             eprintln!("without {name}: {t} ({} for it)", total(&full) - t);

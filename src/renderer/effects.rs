@@ -63,6 +63,7 @@ use super::probe_stream::ProbeDesc;
 
 mod flash;
 pub mod authoring;
+pub mod seen;
 pub mod stack;
 pub mod templates;
 pub mod variants;
@@ -1177,6 +1178,11 @@ pub fn simulate_all(
 pub struct Shares<'a> {
     pub emitter: &'a dyn Fn(&EffectEmitter) -> f32,
     pub splash: &'a dyn Fn(&Splash) -> f32,
+    /// The eyes each emitter is seen through this frame, by its index
+    /// ([`emitter_sight`]: narrowed to the doorways it is seen through):
+    /// a box of motes works out only the motes they hold. Empty: no
+    /// emitter is narrowed (every mote within seeing is worked out).
+    pub sight: &'a [Vec<seen::Eye>],
 }
 
 /// The governor's key for a placed emitter: its object's id.
@@ -1211,8 +1217,11 @@ pub fn instance_fill(i: &EffectInstance, head: Vec3) -> f32 {
 /// the reference distance, that distance, its importance, and whether its
 /// particles are points (the 1.5 pixel floor at any distance).
 struct KindCost {
-    fill_each: f32,
-    reference: f32,
+    /// One live particle's drawn area within its cutout, square metres,
+    /// whatever the distance (`effect_asset::EmitterCost::area`), and
+    /// whether it lies level.
+    area_each: f32,
+    flat: bool,
     importance: f32,
     points: bool,
     instances: f32,
@@ -1227,8 +1236,9 @@ fn kind_cost(kind: EffectKind) -> &'static KindCost {
                 let a = templates::asset(*k);
                 let r = a.check(books()).unwrap_or_else(|e| panic!("the built-in {} template: {}", k.template_name(), e.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")));
                 let points = *k == EffectKind::Dust;
-                let fill_each = if points || r.instances_steady == 0 { 1.5 * 1.5 * super::effect_asset::REFERENCE_EYES / 1e6 } else { r.fill_steady / r.instances_steady as f32 };
-                KindCost { fill_each, reference: r.reference_distance, importance: a.scalability.importance, points, instances: r.instances_steady as f32 }
+                let area = r.area_facing + r.area_flat;
+                let area_each = if points || r.instances_steady == 0 { 0.0 } else { area / r.instances_steady as f32 };
+                KindCost { area_each, flat: r.area_flat > r.area_facing, importance: a.scalability.importance, points, instances: r.instances_steady as f32 }
             })
             .collect()
     });
@@ -1239,9 +1249,11 @@ fn kind_cost(kind: EffectKind) -> &'static KindCost {
 /// each placed emitter `seen` keeps and each splash in `splashes`, with its
 /// estimated fill and instances this frame and its score. An emitter's are
 /// its live particles (the slot loop's count: rate x longest life, or its
-/// box's density) times its template's fill a particle at its reference
-/// view, scaled by `scale`^2 and by (reference / distance)^2; a fire's
-/// sheets and a bed of coals are counted and never shed. A splash's are what
+/// box's density -- only the share of the box in `sight`) and WHAT THEY FILL
+/// IN THE EYES THAT SEE IT (`seen::seen_fill`: its bounds clipped to each
+/// eye of `sight`, narrowed through doorways, times its particles' layers,
+/// each a particle of its template's area x `scale`^2); a fire's sheets and
+/// a bed of coals are counted and never shed. A splash's are what
 /// it drew whole last frame (`measured`, by [`splash_key`]); a new one is
 /// weighed from its second frame. WHAT IT COSTS: one entry per emitter in
 /// view and per splash, a few multiplies each.
@@ -1251,6 +1263,7 @@ pub fn governor_wants(
     splashes: &[Splash],
     measured: &std::collections::HashMap<u64, (f32, f32)>,
     head_world: Vec3,
+    sight: &[Vec<seen::Eye>],
 ) -> Vec<stack::Want> {
     use super::effect_asset::REFERENCE_FOCAL_PIXELS;
     let mut out = Vec::new();
@@ -1268,15 +1281,33 @@ pub fn governor_wants(
                 let slots = ((rate * life_range(p, &v).1).ceil()).clamp(1.0, MAX_SLOTS as f32);
                 // Motes past `DUST_SEEN_WITHIN` are never worked out: only
                 // the share of the box within it counts (27 points of it).
+                let eyes = sight.get(index);
+                let margin = mote_margin(e);
                 let within = if s.boxed && s.held {
-                    let near = (0..27)
-                        .filter(|k| {
-                            let f = |a: i32| (a - 1) as f32 * (2.0 / 3.0);
-                            let p0 = e.position + e.extent[0] * f(k % 3) + e.extent[1] * f(k / 3 % 3) + e.extent[2] * f(k / 9);
-                            p0.distance_squared(head_world) <= DUST_SEEN_WITHIN * DUST_SEEN_WITHIN
-                        })
-                        .count();
-                    near as f32 / 27.0
+                    // Sampled over the part of the box within seeing (125
+                    // points of it, in the box's own frame), so a doorway's
+                    // slice of a hall is weighed as a slice.
+                    let ext = e.extent.map(|v| v.length().max(1e-4));
+                    let rel = head_world - e.position;
+                    let span: [(f32, f32); 3] = std::array::from_fn(|k| {
+                        let u = rel.dot(e.extent[k]) / (ext[k] * ext[k]);
+                        let r = DUST_SEEN_WITHIN / ext[k];
+                        ((u - r).max(-1.0), (u + r).min(1.0))
+                    });
+                    if span.iter().any(|(a, b)| a >= b) {
+                        0.0
+                    } else {
+                        let at = |k: usize, i: usize| span[k].0 + (span[k].1 - span[k].0) * (i as f32 + 0.5) / 5.0;
+                        let near = (0..125)
+                            .filter(|n| {
+                                let p0 = e.position + e.extent[0] * at(0, n % 5) + e.extent[1] * at(1, n / 5 % 5) + e.extent[2] * at(2, n / 25);
+                                p0.distance_squared(head_world) <= DUST_SEEN_WITHIN * DUST_SEEN_WITHIN
+                                    && eyes.map_or(true, |eyes| eyes.iter().any(|v| v.holds(p0, margin)))
+                            })
+                            .count();
+                        let part: f32 = span.iter().map(|(a, b)| (b - a) / 2.0).product();
+                        near as f32 / 125.0 * part
+                    }
                 } else {
                     1.0
                 };
@@ -1287,11 +1318,20 @@ pub fn governor_wants(
         let (lo, hi) = emitter_bounds(e);
         let d = (0.5 * (lo + hi)).distance(head_world).max(0.3);
         let pixels = (hi - lo).length() / d * REFERENCE_FOCAL_PIXELS;
-        let near = if cost.points { 1.0 } else { e.scale * e.scale * (cost.reference / d).powi(2) };
+        // What it fills in the eyes that see it (both reference eyes
+        // looking at it where none were given).
+        let looking = [seen::Eye::looking(head_world, 0.5 * (lo + hi)); 2];
+        let eyes: &[seen::Eye] = match sight.get(index) {
+            Some(v) => v,
+            None => &looking,
+        };
+        let area = if cost.points { 0.0 } else { count * cost.area_each * e.scale * e.scale };
+        let (facing, flat) = if cost.flat { (0.0, area) } else { (area, 0.0) };
+        let fill = seen::seen_fill(eyes, lo, hi, facing, flat, if cost.points { count } else { 0.0 });
         out.push(stack::Want {
             key: emitter_key(e),
             score: cost.importance * 100.0 + pixels.max(1.0).log2(),
-            fill: (count * cost.fill_each * near).min(3.0),
+            fill,
             count,
             sheddable,
             kind: stack::WantKind::Emitter,
@@ -1395,6 +1435,8 @@ pub fn simulate_governed(
         // The governor's share of its particles, and its own order of
         // shedding them (`stack::kept`).
         let share = shares.map_or(1.0, |sh| (sh.emitter)(e));
+        let sight = shares.and_then(|sh| sh.sight.get(index));
+        let margin = mote_margin(e);
         let shed_phase = (hash64(base ^ 0x0de5_ead) >> 40) as f32 / (1u64 << 24) as f32;
         let tint = Vec3::from(e.tint);
         let ambient = (at.ambient)(e.position);
@@ -1421,6 +1463,11 @@ pub fn simulate_governed(
                 // What the eye cannot hold that far off (`glint`) is not
                 // worked out at all.
                 if s.held && p0.distance_squared(head_world) > DUST_SEEN_WITHIN * DUST_SEEN_WITHIN {
+                    continue;
+                }
+                // Nor what no eye can see: through a doorway, only the motes
+                // its opening shows (`emitter_sight`).
+                if s.held && !sight.map_or(true, |eyes| eyes.iter().any(|v| v.holds(p0, margin))) {
                     continue;
                 }
                 p0
@@ -1675,51 +1722,31 @@ pub fn emitter_seen(
     rooms: &[super::portal_cull::CullRoom],
     portals: &[super::uniforms::ProbePortal],
 ) -> bool {
+    !emitter_sight(e, views, head, rooms, portals).is_empty()
+}
+
+/// THE EYES AN EMITTER IS SEEN THROUGH this frame (`seen::sight`): each
+/// view holding its bounds (`emitter_bounds`), and from inside a closed room
+/// only through the open doorways that lead to its room, each view NARROWED
+/// to their openings. Empty: out of sight. So the room behind a door that
+/// opens is not simulated and weighed whole the moment it opens: its dust
+/// works out only the motes the doorway shows (`simulate_governed`), and the
+/// governor weighs its fill through the opening (`governor_wants`).
+pub fn emitter_sight(
+    e: &EffectEmitter,
+    views: &[[glam::Vec4; 6]],
+    head: Vec3,
+    rooms: &[super::portal_cull::CullRoom],
+    portals: &[super::uniforms::ProbePortal],
+) -> Vec<seen::Eye> {
     let (lo, hi) = emitter_bounds(e);
-    let in_view = views.iter().any(|planes| {
-        let mut unbounded = *planes;
-        unbounded[5] = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
-        super::shadow::aabb_in_frustum(&unbounded, lo, hi)
-    });
-    if !in_view {
-        return false;
-    }
-    let room_of = |p: Vec3| {
-        rooms
-            .iter()
-            .filter(|r| (r.min.cmplt(p) & p.cmplt(r.max)).all())
-            .min_by(|a, b| (a.max - a.min).element_product().total_cmp(&(b.max - b.min).element_product()))
-    };
-    let Some(start) = room_of(head).filter(|r| r.closed) else { return true };
-    let goal = room_of(e.position);
-    if goal.is_some_and(|g| g.id == start.id) {
-        return true;
-    }
-    // Rooms reached through open doorways, a doorway at a time.
-    let mut reached = vec![start.id];
-    let mut frontier = vec![start.id];
-    for _ in 0..super::portal_cull::MAX_DOORWAYS {
-        let mut next = Vec::new();
-        for p in portals {
-            for (from, to) in [(p.low, p.high), (p.high, p.low)] {
-                if frontier.contains(&from) && !reached.contains(&to) {
-                    reached.push(to);
-                    next.push(to);
-                }
-            }
-        }
-        match goal {
-            Some(g) if reached.contains(&g.id) => return true,
-            // Outdoors: any room not closed opens onto it.
-            None if reached.iter().any(|id| rooms.iter().any(|r| r.id == *id && !r.closed)) => return true,
-            _ => {}
-        }
-        if next.is_empty() {
-            return false;
-        }
-        frontier = next;
-    }
-    false
+    seen::sight(views, head, lo, hi, e.position, rooms, portals)
+}
+
+/// How far past a view a dust mote's spot may be and still drift into it:
+/// the air's carry and its own size (`emitter_bounds`' margin).
+fn mote_margin(e: &EffectEmitter) -> f32 {
+    0.25 * e.variation.clamped().turbulence + 0.05
 }
 
 /// A FIRE'S SHEETS as the GPU draws them (`fire_sheets`): upright, taller than
@@ -1902,6 +1929,11 @@ pub struct Splash {
     /// behind -- a leg, a hand, an arm reaching in: the water cannot close
     /// over it, so no jet. 0 for anything that goes on down.
     pub held: f32,
+    /// 1 where what struck met the water FLAT -- a palm slapped down, a
+    /// board, a belly flop: no crown, the water leaves sideways low and fast
+    /// as a sheet of spray, the crater is shallow and brief. 0 for a round
+    /// or pointed thing.
+    pub flat: f32,
     pub seed: u64,
 }
 
@@ -1911,7 +1943,7 @@ impl Splash {
     /// `sunlit` where they are known.
     pub fn new(position: Vec3, born: f64, velocity: Vec3, size: f32, mass: f32) -> Self {
         let seed = hash64(born.to_bits() ^ hash64((position.x.to_bits() as u64) << 32 | position.z.to_bits() as u64));
-        Self { position, born, velocity, size, mass, sunlit: 1.0, depth: 30.0, calm: 1.0, held: 0.0, seed }
+        Self { position, born, velocity, size, mass, sunlit: 1.0, depth: 30.0, calm: 1.0, held: 0.0, flat: 0.0, seed }
     }
 
     /// A BULLET or any small fast thing meeting the water at `position`:
@@ -2215,7 +2247,9 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
     // The wall is pushed out no further than the thing drove in: a cork
     // stopped at the surface opens no cavity wider than itself.
     cavity = r + (cavity - r).min(travel);
-    let mut depth = (travel * sin_entry).min(s.depth.max(0.0)).max(0.0);
+    // A flat thing's crater is shallow: it stops in a hand's depth.
+    let flat_hit = s.flat.clamp(0.0, 1.0);
+    let mut depth = (travel * sin_entry).min(s.depth.max(0.0)).max(0.0) * (1.0 - 0.6 * flat_hit);
     // No more energy in the hole than the thing brought (a cone's worth of
     // lifted water, and of the atmosphere pushed back).
     let energy = 0.5 * s.mass.max(0.0) * speed * speed;
@@ -2242,11 +2276,15 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
     // crown is a few centimetres. Nothing from a thing too light to drive in.
     let shoulder = (WATER_DENSITY * normal * normal * r / SURFACE_TENSION).sqrt();
     let thrown = 0.8 * shoulder / (shoulder + 150.0) * normal * (1.0 - sealed) * (travel / r).min(1.0);
-    let sheet_speed = (3.5 * (cavity - r) / collapse).max(thrown);
+    // A FLAT face meeting the water squeezes the water under it out
+    // sideways, faster than it came down (Wagner's flat impact): a sheet
+    // of spray low and wide, not a crown.
+    let sheet_speed = (3.5 * (cavity - r) / collapse).max(thrown).max(1.3 * normal * flat_hit);
     // Steeply where there is water under the thing; flat from a puddle
-    // shallower than the thing is wide, which has nowhere to go but out.
+    // shallower than the thing is wide, which has nowhere to go but out --
+    // or from a flat face, which throws it out along the surface.
     let steep = smoothstep(0.3, 1.5, s.depth / r);
-    let sheet_angle = lerp(28.0f32, 68.0, steep).to_radians();
+    let sheet_angle = lerp(lerp(28.0f32, 68.0, steep), 14.0, flat_hit).to_radians();
     let plow = 0.9 * flat.length() * (1.0 - sealed);
     let weber = WATER_DENSITY * sheet_speed * sheet_speed * cavity / SURFACE_TENSION;
     let drop = (cavity / weber.max(1.0).sqrt()).clamp(1.5e-4, 4e-3);
@@ -2257,11 +2295,12 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
     let crown_seconds = aloft(up, air);
     // As many pieces as cover its rim, each wider than it is tall.
     let rim = 1.2 * cavity;
-    let petals = if crown_height > 0.004 && fine < 0.75 { ((TAU * rim / (1.6 * crown_height)).round() as usize).clamp(10, SPLASH_PETALS) } else { 0 };
+    let petals = if crown_height > 0.004 && fine < 0.75 && flat_hit < 0.5 { ((TAU * rim / (1.6 * crown_height)).round() as usize).clamp(10, SPLASH_PETALS) } else { 0 };
     // The rim's fingers, a drop or two from each; in churned water fewer hold
     // together.
     let fingers = TAU * cavity / (9.0 * drop.max(1.5e-3));
-    let drops = if sheet_speed > 0.15 { ((1.5 * fingers * (0.15 + 0.85 * (1.0 - fine)) * (0.4 + 0.6 * calm)).round() as usize).clamp(4, SPLASH_DROPS) } else { 0 };
+    // (A flat slap's sheet tears into twice the drops at once.)
+    let drops = if sheet_speed > 0.15 { ((1.5 * fingers * (0.15 + 0.85 * (1.0 - fine)) * (0.4 + 0.6 * calm) * (1.0 + flat_hit)).round() as usize).clamp(4, SPLASH_DROPS) } else { 0 };
     // The first, thin spray off the thing's shoulder: most of the thing's
     // own speed from a big one, less from one small enough for surface
     // tension to hold it back.
@@ -2281,7 +2320,9 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
     let white = broken.max(0.85 * (1.0 - calm)) * (1.0 - fine);
     let throws = sheet_speed > 0.15;
     let spray = if throws { ((1.5 + 9.0 * cavity.sqrt() * (1.0 - sealed) + 2.5 * sealed).round() as usize).clamp(3, 6) } else { 0 };
-    let froth = if throws && white > 0.4 { ((white * (6.0 + 4.0 * cavity.sqrt())).round() as usize).clamp(6, 9) } else { 0 };
+    // (White water from a body of sheet: not from a hand's slap into
+    // churned water, whose little water goes up as spray.)
+    let froth = if throws && white > 0.4 && (cavity > 0.1 || broken > 0.5) { ((white * (6.0 + 4.0 * cavity.sqrt())).round() as usize).clamp(6, 9) } else { 0 };
     let mist = if sealed > 0.05 { (2.0 + 6.0 * sealed).round() as usize } else { 0 };
 
     // THE RINGS (Cauchy-Poisson). The cavity and the rim it lifts are a
@@ -2312,7 +2353,9 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
     // Foam: over 1 the patch is white right across (`splash_rings`); under,
     // it is broken. More from a big cavity's collapse, from a sealed one's
     // (which is all air), from water already churned.
-    let foam = ((0.7 + 0.9 * smoothstep(0.03, 0.5, cavity) + 0.4 * sealed + 0.4 * (1.0 - calm)) * smoothstep(0.1, 0.6, sheet_speed)).min(0.65 + 0.3 * (1.0 - calm));
+    // (A small strike folds in little air -- a hand's slap leaves a few
+    // bubbles, gone in a moment -- a big one a patch.)
+    let foam = ((0.35 + 1.2 * smoothstep(0.03, 0.5, cavity) + 0.4 * sealed + 0.4 * (1.0 - calm)) * smoothstep(0.1, 0.6, sheet_speed) * (1.0 - 0.5 * flat_hit)).min(0.65 + 0.3 * (1.0 - calm));
     let foam_seconds = 1.2 + 3.0 * cavity.sqrt();
     let settle = (1.5 + 4.0 * cavity.sqrt()).min(6.0);
 
@@ -3192,6 +3235,10 @@ pub fn room_ambient(descs: &[ProbeDesc], world: Vec3) -> Vec3 {
     Vec3::new(l[0][0], l[0][1], l[0][2]) * 0.282_095
 }
 
+/// Metres under the terrain's surface over which a point past every room's box
+/// passes from the open air's light to a cave's (`room_ambient_now`).
+pub const UNDER_GROUND: (f32, f32) = (0.5, 2.0);
+
 /// [`room_ambient`] AT THE LEVEL'S TIME OF DAY. The room's light was baked
 /// under the photographed sky; at dusk the sky is a hundredth of that, the
 /// ground is lit by what the sky is now, and smoke and airborne water lit by
@@ -3202,7 +3249,9 @@ pub fn room_ambient(descs: &[ProbeDesc], world: Vec3) -> Vec3 {
 /// the daylight's share scaled to the hour, the lamps' kept) -- and the
 /// room's baked light takes the ratio of the photograph the point is in: the
 /// smallest room's that holds it, else the nearest. Empty: as baked.
-pub fn room_ambient_now(descs: &[ProbeDesc], world: Vec3, relit: &[f32]) -> Vec3 {
+/// `ground`: the terrain's heights, which tell the open air from a cave dug
+/// under them (below).
+pub fn room_ambient_now(descs: &[ProbeDesc], world: Vec3, relit: &[f32], ground: Option<&super::ground_map::HeightGrid>) -> Vec3 {
     let ratio = |i: usize| if relit.is_empty() { 1.0 } else { relit.get(i).copied().filter(|k| k.is_finite()).unwrap_or(1.0).max(0.0) };
     let baked = room_ambient(descs, world);
     let lit = || descs.iter().enumerate().filter(|(_, d)| d.room_light.is_some());
@@ -3220,13 +3269,21 @@ pub fn room_ambient_now(descs: &[ProbeDesc], world: Vec3, relit: &[f32]) -> Vec3
     // volume's nearest photograph (the volume whose photographs have no
     // distances: its box stands in for the sky), blended in over
     // `room_light::ROOM_EDGE` as `room_light_at` blends rooms.
+    // But past every box is not always the open air: a CAVE dug under the
+    // terrain has no box either, and its bonfire's smoke took the sky's light
+    // there, ten times its own, and stood pale grey in the dark (2026-10-14).
+    // Under the ground's surface -- metres of hill overhead -- the point keeps
+    // its nearest room's light as before; the half metre and more of the
+    // ramp lets a puff on a slope the grid's bilinear surface cuts stay open.
     let held = lit().map(|(_, d)| smoothstep(-super::room_light::ROOM_EDGE, 0.0, (world - d.min).min(d.max - world).min_element())).fold(0.0, f32::max);
+    let buried = ground.map_or(0.0, |g| smoothstep(UNDER_GROUND.0, UNDER_GROUND.1, g.at(world.x, world.z) - world.y));
+    let open_share = (1.0 - held) * (1.0 - buried);
     let outdoor = |v: u32| descs.iter().filter(|d| d.volume == v).all(|d| !d.has_depth);
     match lit().filter(|(_, d)| outdoor(d.volume)).min_by(near) {
-        Some((i, d)) if held < 1.0 => {
+        Some((i, d)) if open_share > 0.0 => {
             let l = d.room_light.unwrap_or_default();
             let open = Vec3::new(l[0][0], l[0][1], l[0][2]) * (0.282_095 * ratio(i));
-            now.lerp(open, 1.0 - held)
+            now.lerp(open, open_share)
         }
         _ => now,
     }
@@ -5420,8 +5477,8 @@ mod tests {
         if r[3] <= 0.0 || k <= 0.0 {
             return 0.0;
         }
-        let t = (from_rim / w[2].max(1e-6)).clamp(0.0, 1.0);
-        -r[3] * k * k * k * (-k * (w[1] + k * r[2] * 2.0 * RING_FILM_VISCOSITY)).exp() * t * t * (3.0 - 2.0 * t) / dist * ph.cos()
+        let t = (from_rim / w[2].max(1e-6)).min(1.0);
+        -r[3] * k * k * k * (-k * (w[1] + k * r[2] * 2.0 * RING_FILM_VISCOSITY)).exp() * t / dist * ph.cos()
     }
 
     /// THE RINGS on the water: each splash's own, leaving as its cavity is
@@ -5597,7 +5654,7 @@ mod tests {
         let shut = c.collapse as f64 + 0.1;
         assert!(foam(crate_box(), shut)[0] > 0.5 && foam(crate_box(), 2.0)[0] < 0.4 && foam(crate_box(), 4.3)[0] == 0.0, "{:?}", foam(crate_box(), 2.0));
         assert!(foam(crate_box(), 2.0)[2] > foam(crate_box(), shut)[2]);
-        assert!(foam(pebble(), 0.25)[0] > 0.4 && foam(pebble(), 1.8)[0] < 0.02);
+        assert!(foam(pebble(), 0.25)[0] > 0.2 && foam(pebble(), 1.8)[0] < 0.02, "{:?}", foam(pebble(), 0.25));
         // It spreads as it thins.
         assert!(foam(crate_box(), 2.0)[1] < foam(crate_box(), shut)[1]);
     }
@@ -6297,6 +6354,74 @@ mod tests {
         assert!(fire_glare(&emitter(EffectKind::Smoke), 30.0, Vec3::ZERO, Quat::IDENTITY).is_none());
     }
 
+    /// R2-1, THE DOOR ONTO THE MARBLE HALL: from the hallway, opening the
+    /// hall's door used to start its whole box of dust -- every mote within
+    /// seeing, worked out on the frame the door opened -- though only the
+    /// doorway's slice of the hall is in view. Now: shut, nothing; open, only
+    /// the motes the doorway shows (each the very mote drawn whole), weighed
+    /// by what they fill through it, and RAMPED IN over a few frames from the
+    /// opening, the same motes arriving in their fixed order.
+    #[test]
+    fn a_door_opening_onto_dust_works_out_only_what_its_doorway_shows_ramped_in() {
+        use super::super::portal_cull::CullRoom;
+        use super::super::uniforms::ProbePortal;
+        let head = Vec3::new(0.0, 1.6, 2.5);
+        let view = glam::Mat4::perspective_rh(1.6, 1.0, 0.05, 100.0) * glam::Mat4::look_at_rh(head, Vec3::new(0.0, 1.4, -3.0), Vec3::Y);
+        let views = [super::super::shadow::frustum_planes(view)];
+        let rooms = [
+            CullRoom { id: 1, min: Vec3::new(-1.5, -0.5, -0.5), max: Vec3::new(1.5, 3.5, 5.0), closed: true },
+            CullRoom { id: 2, min: Vec3::new(-8.0, -0.5, -14.0), max: Vec3::new(8.0, 6.0, -0.5), closed: true },
+        ];
+        let door = ProbePortal { min: Vec3::new(-0.6, 0.0, -0.7), max: Vec3::new(0.6, 2.1, -0.3), axis: 2, low: 2, high: 1, wall: None };
+        let dust = [EffectEmitter {
+            id: "hall_dust".into(),
+            position: Vec3::new(0.0, 1.5, -5.0),
+            extent: [Vec3::X * 7.5, Vec3::Y * 1.5, Vec3::Z * 4.4],
+            ..emitter(EffectKind::Dust)
+        }];
+        assert!(emitter_sight(&dust[0], &views, head, &rooms, &[]).is_empty(), "the door shut: out of sight");
+        let sight = vec![emitter_sight(&dust[0], &views, head, &rooms, &[door])];
+        assert!(!sight[0].is_empty(), "the door open: seen through it");
+        let at = seen_from(head);
+        let t = 50.0;
+        let run = |share: &dyn Fn(&EffectEmitter) -> f32, sight: &[Vec<seen::Eye>]| {
+            let shares = Shares { emitter: share, splash: &|_| 1.0, sight };
+            simulate_governed(&dust, &|_| true, &[], None, Some(&shares), t, &at)
+        };
+        let whole = run(&|_| 1.0, &[]);
+        let through = run(&|_| 1.0, &sight);
+        assert!(through.screened > 0 && (through.screened as f32) < 0.4 * whole.screened as f32, "{} of {} motes", through.screened, whole.screened);
+        let same = |a: &EffectInstance, b: &EffectInstance| bytemuck::bytes_of(a) == bytemuck::bytes_of(b);
+        for i in &through.instances {
+            assert!(whole.instances.iter().any(|w| same(w, i)), "a mote through the doorway is the mote drawn whole");
+        }
+        // Nothing the doorway shows is left out.
+        let shown = whole.instances.iter().filter(|w| sight[0].iter().any(|e| e.holds(centre(w), 0.0))).count();
+        let kept = through.instances.iter().filter(|w| sight[0].iter().any(|e| e.holds(centre(w), 0.0))).count();
+        assert_eq!(kept, shown, "every mote in the doorway's view is drawn");
+        // THE GOVERNOR from the opening frame: what it weighs is what the
+        // doorway shows, and the dust ramps in.
+        let lib = stack::EffectLibrary::default();
+        let mut set = stack::BurstSet::default();
+        let narrowed = governor_wants(&dust, &|_| true, &[], &set.splash_measured, head, &sight);
+        let open_room = governor_wants(&dust, &|_| true, &[], &set.splash_measured, head, &[vec![]]);
+        assert!(narrowed[0].count < 0.4 * governor_wants(&dust, &|_| true, &[], &set.splash_measured, head, &[])[0].count, "weighed through the doorway");
+        assert_eq!(open_room[0].fill, 0.0, "nothing in sight weighs nothing");
+        let mut shares = Vec::new();
+        for frame in 0..14 {
+            let now = t + frame as f64 / 72.0;
+            set.frame_with(&lib, now, &views, head, &narrowed);
+            shares.push(set.share_of(emitter_key(&dust[0])));
+        }
+        assert!((shares[0] - 0.1).abs() < 1e-6, "the opening frame works out a tenth: {shares:?}");
+        assert!(shares.windows(2).all(|w| w[1] >= w[0]) && shares[13] == 1.0, "{shares:?}");
+        let first = run(&|_| shares[0], &sight);
+        assert!(first.screened as f32 <= 0.2 * through.screened as f32 + 1.0, "{} of {}", first.screened, through.screened);
+        for i in &first.instances {
+            assert!(through.instances.iter().any(|w| same(w, i)), "the motes ramping in are the same motes");
+        }
+    }
+
     #[test]
     fn an_emitter_out_of_view_or_behind_a_shut_door_is_not_simulated() {
         use super::super::portal_cull::CullRoom;
@@ -6357,16 +6482,16 @@ mod tests {
         let (outdoors, indoors) = (Vec3::new(20.0, 1.0, 20.0), Vec3::splat(2.0));
         let baked = room_ambient(&descs, outdoors);
         assert!(baked.x > 0.0);
-        assert_eq!(room_ambient_now(&descs, outdoors, &[]), baked);
+        assert_eq!(room_ambient_now(&descs, outdoors, &[], None), baked);
         // Dusk: the outdoors' photograph at a hundredth, the hall's (lamps) at 0.8.
         let relit = [0.01, 0.8];
-        assert!((room_ambient_now(&descs, outdoors, &relit).x / baked.x - 0.01).abs() < 1e-4);
+        assert!((room_ambient_now(&descs, outdoors, &relit, None).x / baked.x - 0.01).abs() < 1e-4);
         let hall = room_ambient(&descs, indoors);
-        assert!((room_ambient_now(&descs, indoors, &relit).x / hall.x - 0.8).abs() < 1e-4, "the smallest room that holds the point is its room");
+        assert!((room_ambient_now(&descs, indoors, &relit, None).x / hall.x - 0.8).abs() < 1e-4, "the smallest room that holds the point is its room");
         // Past every box, the nearest photograph's; a ratio that is not a number, the bake's.
         let far = Vec3::new(-200.0, 0.0, -200.0);
-        assert!((room_ambient_now(&descs, far, &relit).x / room_ambient(&descs, far).x - 0.01).abs() < 1e-4);
-        assert_eq!(room_ambient_now(&descs, outdoors, &[f32::NAN, 1.0]), baked);
+        assert!((room_ambient_now(&descs, far, &relit, None).x / room_ambient(&descs, far).x - 0.01).abs() < 1e-4);
+        assert_eq!(room_ambient_now(&descs, outdoors, &[f32::NAN, 1.0], None), baked);
     }
 
     /// Past every box, out in the open, the light is the OUTDOOR volume's
@@ -6380,11 +6505,22 @@ mod tests {
         let descs = [photo(0, Vec3::new(0.0, -5.0, 0.0), Vec3::new(40.0, 20.0, 40.0), false, 2.0), photo(1, Vec3::new(-12.0, 0.0, -12.0), Vec3::new(-4.0, 4.0, -4.0), true, 0.05)];
         let pond = Vec3::new(-20.0, 0.0, -20.0);
         let open = 2.0 * 0.282_095;
-        assert!((room_ambient_now(&descs, pond, &[]).x - open).abs() < 1e-4, "{:?}", room_ambient_now(&descs, pond, &[]));
-        assert!((room_ambient_now(&descs, pond, &[0.5, 1.0]).x - 0.5 * open).abs() < 1e-4);
+        assert!((room_ambient_now(&descs, pond, &[], None).x - open).abs() < 1e-4, "{:?}", room_ambient_now(&descs, pond, &[], None));
+        assert!((room_ambient_now(&descs, pond, &[0.5, 1.0], None).x - 0.5 * open).abs() < 1e-4);
         // Inside the room, the room's; inside the outdoor box, the outdoors'.
-        assert!((room_ambient_now(&descs, Vec3::new(-8.0, 2.0, -8.0), &[]).x - 0.05 * 0.282_095).abs() < 1e-4);
-        assert!((room_ambient_now(&descs, Vec3::new(20.0, 1.0, 20.0), &[]).x - open).abs() < 1e-4);
+        assert!((room_ambient_now(&descs, Vec3::new(-8.0, 2.0, -8.0), &[], None).x - 0.05 * 0.282_095).abs() < 1e-4);
+        assert!((room_ambient_now(&descs, Vec3::new(20.0, 1.0, 20.0), &[], None).x - open).abs() < 1e-4);
+        // A CAVE dug under a hill past every box is not the open air: its
+        // bonfire's smoke stood pale grey in the sky's light (2026-10-14). A
+        // hill 14 m high west of x = -25 over a plain at 0.
+        let hill = super::super::ground_map::HeightGrid::sample(glam::Vec2::splat(-60.0), glam::Vec2::splat(60.0), 121, 121, |x, _| if x < -25.0 { 14.0 } else { 0.0 });
+        let in_cave = Vec3::new(-30.0, 0.5, -20.0);
+        let dim = room_ambient(&descs, in_cave).x;
+        assert!((room_ambient_now(&descs, in_cave, &[], Some(&hill)).x - dim).abs() < 1e-4, "the cave keeps its nearest room's light");
+        assert!(dim < 0.2 * open);
+        // The pond on the plain, and a puff on the hill's top, are open.
+        assert!((room_ambient_now(&descs, pond, &[], Some(&hill)).x - open).abs() < 1e-4);
+        assert!((room_ambient_now(&descs, Vec3::new(-30.0, 14.3, -20.0), &[], Some(&hill)).x - open).abs() < 1e-4);
     }
 
     #[test]

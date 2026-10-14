@@ -61,17 +61,25 @@ pub const QUEST_SHADOW_DIM: u32 = 1024;
 /// arrangement, and it paid for every brush to shadow one avatar.
 ///
 /// This map holds only what moves, over `SUN_DYNAMIC_RADIUS` around the
-/// player, so it is small and nearly empty: 512 over a 6 m box is 1.2 cm a
-/// texel, sharper than the level map, for 1 MB of depth and a pass with a
+/// player, so it is small and nearly empty: 512 over an 18 m box is 3.5 cm a
+/// texel for what stands away from the player, and its near tile holds the
+/// player at 0.59 cm (`SUN_NEAR_ZOOM`), for 1 MB of depth and a pass with a
 /// handful of draws in it.
 pub const SUN_DYNAMIC_DIM: u32 = 512;
 
 /// Half the side of the box the moving-objects sun map covers, in metres.
 ///
-/// An avatar is under 2 m tall and this sun's shadow of it is about as long
-/// again, so 3 m around the head holds the whole shadow with room to reach a
-/// held object at arm's length. Past it, a moving object casts no sun shadow.
-pub const SUN_DYNAMIC_RADIUS: f32 = 3.0;
+/// What moves within it casts a sun shadow; past it, nothing that moves does.
+/// The map is the sun's view, so it has to hold the CASTER, not its shadow.
+///
+/// 3 m until 2026-10-14, which held the player and what they hold and
+/// nothing else: a crate tossed into the pond cast no shadow until the
+/// player had walked to within about 3 m of it, and its shadow then appeared
+/// (headset 093004-093020). 9 m holds a prop the player is looking at across
+/// a pond or a room; the player's own shadow stays in the near tile at the
+/// detail it had (`SUN_NEAR_ZOOM` went 2 -> 6 with this), and a prop's, 3.5 cm
+/// a texel, is a dozen texels across a 40 cm crate.
+pub const SUN_DYNAMIC_RADIUS: f32 = 9.0;
 
 /// How many spot lights can cast a real-time shadow at once.
 ///
@@ -124,20 +132,21 @@ pub const MAX_BODY_TILES: usize = 2;
 /// characters', then the sun's near tile. See `SUN_DYNAMIC_DIM`.
 pub const SUN_ATLAS_TILES: u32 = 2 + MAX_CHARACTER_SHADOWS as u32;
 
-/// THE PLAYER'S OWN SUN SHADOW AT TWICE THE DETAIL: the near tile holds the
-/// middle half of the sun tile's box -- 1.5 m round the player's body -- at
-/// 0.59 cm a texel where the sun tile has 1.17, and the shader reads it
-/// wherever it holds the point (`sun_moving_visibility`). The sun tile still
-/// holds everything out to 3 m.
+/// THE PLAYER'S OWN SUN SHADOW AT SIX TIMES THE DETAIL: the near tile holds
+/// the middle sixth of the sun tile's box -- 1.5 m round the player's body --
+/// at 0.59 cm a texel where the sun tile has 3.5, and the shader reads it
+/// wherever it holds the point (`sun_moving_visibility`). The sun tile holds
+/// everything else that moves out to 9 m (`SUN_DYNAMIC_RADIUS`). Two, over a
+/// 3 m sun tile, until 2026-10-14: the same near tile.
 ///
 /// WHY HALF THE BOX IS ENOUGH: the map is the sun's view, so a caster and its
 /// shadow on the ground land on the SAME texel. The player's shadow can be as
 /// long as they are tall, but the map only has to hold the player: their whole
 /// body, arms raised, is inside 1.5 m of its middle seen along the sun.
 ///
-/// WHY EXACTLY TWO: the near matrix is the sun tile's scaled by two about its
-/// middle (`sun_near_matrix`), so a texel corner of the sun tile at `t` is at
-/// `2t - SUN_DYNAMIC_DIM / 2` in the near tile -- a texel corner there too.
+/// WHY A WHOLE NUMBER: the near matrix is the sun tile's scaled by it about
+/// its middle (`sun_near_matrix`), so a texel corner of the sun tile at `t` is
+/// at `6t - 5 SUN_DYNAMIC_DIM / 2` in the near tile -- a texel corner there too.
 /// The world stays snapped to the near tile's grid as it is to the sun tile's
 /// (`lights::dynamic_sun_matrix`), and the shader finds the near coordinates
 /// from the sun tile's with no matrix of its own.
@@ -147,7 +156,7 @@ pub const SUN_ATLAS_TILES: u32 = 2 + MAX_CHARACTER_SHADOWS as u32;
 /// much higher quality?" A 1.17 cm texel is eight display pixels at two metres
 /// on a Quest 3. The Quest filters the map linearly (logged at startup), so the
 /// kernel was not the fault: the texel was.
-pub const SUN_NEAR_ZOOM: f32 = 2.0;
+pub const SUN_NEAR_ZOOM: f32 = 6.0;
 
 /// The near tile's place in the row. See `SUN_NEAR_ZOOM`.
 pub const SUN_NEAR_TILE: u32 = 1 + MAX_CHARACTER_SHADOWS as u32;
@@ -3084,7 +3093,7 @@ mod render_tests {
     /// the near tile wherever the player stands, as on the sun tile's
     /// (`lights::dynamic_sun_matrix`) -- so a moving shadow's edge does not
     /// crawl in the near tile either -- and the near tile is the sun tile's
-    /// middle at twice the size, depth unchanged.
+    /// middle at `SUN_NEAR_ZOOM` times the size, depth unchanged.
     #[test]
     fn the_near_tile_is_the_middle_of_the_sun_tile_snapped_to_its_own_grid() {
         let dir = Vec3::new(0.4, -0.75, 0.3).normalize();
@@ -3108,8 +3117,8 @@ mod render_tests {
             let p = head + Vec3::new(0.37, -0.81, 0.52);
             let (w, nr) = (wide.project_point3(p), near.project_point3(p));
             assert!(
-                (nr.x - 2.0 * w.x).abs() < 1e-5
-                    && (nr.y - 2.0 * w.y).abs() < 1e-5
+                (nr.x - SUN_NEAR_ZOOM * w.x).abs() < 1e-5
+                    && (nr.y - SUN_NEAR_ZOOM * w.y).abs() < 1e-5
                     && (nr.z - w.z).abs() < 1e-6
             );
         }

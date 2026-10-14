@@ -206,7 +206,7 @@ pub fn asset(kind: EffectKind) -> EffectAsset {
                 vec![SpawnModule::Rate { per_second: 6.0, for_seconds: None }],
                 vec![
                     life(4.0, 6.0),
-                    InitModule::ShapeDisc { radius: 0.06 },
+                    InitModule::ShapeDisc { radius: 0.06, fills_object: false },
                     InitModule::ShapeCone { angle_deg: 10.0, about: About::Direction },
                     InitModule::Speed { value: range(0.15, 0.28) },
                     InitModule::Size { value: num(0.1) },
@@ -239,7 +239,7 @@ pub fn asset(kind: EffectKind) -> EffectAsset {
                 vec![SpawnModule::Rate { per_second: 5.0, for_seconds: None }],
                 vec![
                     life(1.2, 2.4),
-                    InitModule::ShapeDisc { radius: 0.06 },
+                    InitModule::ShapeDisc { radius: 0.06, fills_object: false },
                     InitModule::ShapeCone { angle_deg: 28.0, about: About::Direction },
                     InitModule::Speed { value: range(0.9, 1.8) },
                     InitModule::Size { value: num(0.005) },
@@ -449,7 +449,7 @@ impl Template {
                 InitModule::Size { value: Value::Number(s) } => p.size = (*s, *s),
                 InitModule::Speed { value } => p.speed = pair(value, "speed")?,
                 InitModule::Spin { rate, start } => p.spin = (*rate, *start),
-                InitModule::ShapeDisc { radius } => p.bed = *radius,
+                InitModule::ShapeDisc { radius, .. } => p.bed = *radius,
                 InitModule::SpotsLowDiscrepancy { radius } => (p.bed, spots) = (*radius, true),
                 InitModule::ShapeBox {} => boxed = true,
                 InitModule::ShapePoint {} => {}

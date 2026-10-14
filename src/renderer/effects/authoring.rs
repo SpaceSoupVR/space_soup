@@ -10,9 +10,14 @@
 //! WHAT EACH COST SCALES WITH (stated in every report):
 //! - instances: a burst's count, or a stream's rate x its longest life; at a
 //!   source's cap, times `max_live` for what outlives its event;
-//! - fill: instances x the mean drawn area at the reference view
-//!   ((2 x mean half size / distance x 604 px)^2, both eyes, times the
-//!   book's cutout share) -- so x size^2, x rate, x 1/distance^2;
+//! - fill: a burst's, instances x the mean drawn area at its reference
+//!   distance ((2 x mean half size / distance x 604 px)^2, both eyes, times
+//!   the book's cutout share) -- so x size^2, x rate, x 1/distance^2; a
+//!   placed effect's, SEEN: its box clipped to the view from its stated
+//!   view (standing `reference_distance` off its side), times its layers --
+//!   its particles' area over the box's (`effects::seen`), so x size^2,
+//!   x rate, and never more than the view. The frame's governor weighs the
+//!   same from the player's own eyes each frame;
 //! - shader: the variant's instructions (by the proxy x 1.87 until a headset
 //!   logs them), the same for every particle it draws;
 //! - lights: one live light per `light_pulse`, for its frames.
@@ -71,6 +76,7 @@ fn report_json(r: &Report) -> Value {
     json!({
         "emitters": r.emitters.iter().map(|e| json!({
             "name": e.name, "instances": e.instances, "longest_life": e.longest_life, "fill": e.fill, "stream": e.stream,
+            "area": e.area, "flat": e.flat, "points": e.points, "fills_disc": e.fills_disc,
         })).collect::<Vec<_>>(),
         "instances_per_burst": r.instances_per_burst,
         "fill_per_burst": r.fill_per_burst,
@@ -80,6 +86,12 @@ fn report_json(r: &Report) -> Value {
         "texture_bytes": r.texture_bytes,
         "reference_distance": r.reference_distance,
         "burst": r.burst,
+        "seen_from_side": r.seen_from_side,
+        "extent": { "lateral": r.extent.lateral, "below": r.extent.below, "above": r.extent.above },
+        "area_facing": r.area_facing,
+        "area_flat": r.area_flat,
+        "points": r.points,
+        "fills_disc": fills_disc(r),
         "over_budget": r.over_budget.as_ref().map(|(reason, what)| json!({ "reason": reason, "exceeds": what })),
     })
 }
@@ -145,6 +157,8 @@ pub fn limits_json() -> Value {
         "reference_placed": asset::REFERENCE_PLACED,
         "reference_focal_pixels": asset::REFERENCE_FOCAL_PIXELS,
         "reference_eyes": asset::REFERENCE_EYES,
+        "reference_tan": super::seen::REFERENCE_TAN,
+        "standing_eye": super::seen::STANDING_EYE,
         "max_curve_keys": asset::MAX_CURVE_KEYS,
         "max_inputs": asset::MAX_INPUTS,
         "scene_fill": LIMIT_SCENE_FILL,
@@ -205,23 +219,38 @@ pub struct SceneCost {
     pub over: Vec<String>,
 }
 
-/// What one placed effect costs: its stack's report at its cap, its fill x
-/// `scale`^2 x `rate` and its instances x `rate`; a box of dust (`density`,
-/// per cubic metre) its `volume`'s worth of motes at the 1.5 pixel floor.
-pub fn placed_cost(object: &str, position: [f32; 3], report: &Report, density: Option<f32>, scale: f32, rate: f32, volume: f32) -> PlacedCost {
+/// The radius of an effect's widest disc that fills its placed object.
+pub fn fills_disc(r: &Report) -> f32 {
+    r.emitters.iter().map(|e| e.fills_disc).fold(0.0, f32::max)
+}
+
+/// What one placed effect costs: its stack's report at its cap, its
+/// instances x `rate`, and its fill SEEN from its stated view (standing
+/// `reference_distance` off its side, `effects::seen`) with its sprites
+/// `scale` times the size and `rate` times as many -- a disc that fills its
+/// object stretched to the object's `footprint` (half widths across x and
+/// z), as many more particles as the footprint is wider; a box of dust
+/// (`density`, per cubic metre) its `volume`'s worth of motes at the 1.5
+/// pixel floor.
+pub fn placed_cost(object: &str, position: [f32; 3], report: &Report, density: Option<f32>, scale: f32, rate: f32, volume: f32, footprint: [f32; 2]) -> PlacedCost {
     let (scale, rate) = (scale.max(0.0), rate.max(0.0));
-    match density {
-        Some(d) => {
-            let n = (d * volume * rate).ceil() as u32;
-            PlacedCost { object: object.into(), position, fill: n as f32 * 1.5 * 1.5 * asset::REFERENCE_EYES / 1e6, instances: n }
-        }
-        None => PlacedCost {
-            object: object.into(),
-            position,
-            fill: report.fill_steady * scale * scale * rate,
-            instances: (report.instances_steady as f32 * rate).ceil() as u32,
-        },
+    if let Some(d) = density {
+        let n = (d * volume * rate).ceil() as u32;
+        return PlacedCost { object: object.into(), position, fill: n as f32 * 1.5 * 1.5 * asset::REFERENCE_EYES / 1e6, instances: n };
     }
+    let disc = fills_disc(report);
+    let stretched = disc > 0.0 && footprint[0] > 0.0 && footprint[1] > 0.0;
+    let more = if stretched { footprint[0] * footprint[1] / (disc * disc) } else { 1.0 };
+    let fill = if report.seen_from_side {
+        let e = report.extent;
+        let half = if stretched { [footprint[0] + e.lateral - disc, footprint[1] + e.lateral - disc] } else { [e.lateral; 2] };
+        let (lo, hi, eyes) = super::seen::stated_view_of(half, e.below, e.above, report.reference_distance);
+        let grown = scale * scale * rate * more;
+        super::seen::seen_fill(&eyes, lo, hi, report.area_facing * grown, report.area_flat * grown, report.points as f32 * rate * more)
+    } else {
+        report.fill_steady * scale * scale * rate
+    };
+    PlacedCost { object: object.into(), position, fill, instances: (report.instances_steady as f32 * rate * more).ceil() as u32 }
 }
 
 /// THE SCENE'S BUDGETS: the worst neighbourhood's fill against
@@ -267,7 +296,7 @@ pub fn kind_report(kind: EffectKind) -> (Report, Option<f32>) {
 
 /// THE SCENE CHECK the editor and a level load both run: `items` are a
 /// scene's placed effects, each `{ "object", "kind" | "asset", "position":
-/// [x,y,z] (world), "scale", "rate", "volume" }`; `assets` the effect
+/// [x,y,z] (world), "scale", "rate", "volume", "footprint": [x half, z half] }`; `assets` the effect
 /// assets by name (their JSON). An asset that is missing or refused is an
 /// issue of its own.
 pub fn scene_json(items: &Value, assets: &std::collections::HashMap<String, String>) -> Value {
@@ -296,7 +325,9 @@ pub fn scene_json(items: &Value, assets: &std::collections::HashMap<String, Stri
                 None => continue,
             }
         };
-        placed.push(placed_cost(&object, position, &report, density, f("scale", 1.0), f("rate", 1.0), f("volume", 0.0)));
+        let fp = &it["footprint"];
+        let footprint = [fp[0].as_f64().unwrap_or(0.0) as f32, fp[1].as_f64().unwrap_or(0.0) as f32];
+        placed.push(placed_cost(&object, position, &report, density, f("scale", 1.0), f("rate", 1.0), f("volume", 0.0), footprint));
     }
     let cost = scene_cost(placed);
     json!({

@@ -438,6 +438,9 @@ pub(crate) fn collect_node(
                     texture,
                     vertex_buffer,
                     index_buffer,
+                    // As `blended` above: what `load_primitive_texture` left see-through.
+                    blended: prim.material().alpha_mode() == gltf::material::AlphaMode::Blend
+                        || prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0) > 0.0,
                 });
             }
         }

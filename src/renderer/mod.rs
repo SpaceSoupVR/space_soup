@@ -42,6 +42,7 @@ pub mod ground_cuts;
 pub mod ground_horizon;
 pub mod ground_lod;
 pub mod water_runs;
+pub mod water_wake;
 pub mod static_brush;
 pub mod static_solid;
 pub mod ground_twins;
@@ -176,5 +177,14 @@ pub struct MeshInstance<'a> {
     /// A door's leaf: drawn into the lamps' moving casters' tiles as well as
     /// every map a model is drawn into. See `doors`.
     pub tile_caster: bool,
+    /// It can move: a body physics moves, a door or its lever, something held
+    /// or animated, a character. Only these go into the head-following
+    /// moving-objects SUN map. A model that never moves has its sun shadow in
+    /// the level's baked data at every distance; in that map it cast only
+    /// within the map's box of the player, so its shadow drew itself in and
+    /// faded as they walked (the cave's back mouth, headset 2026-10-14), and
+    /// it cost a shadow draw every frame. The lamps' and the torch's maps
+    /// take every model either way.
+    pub moves: bool,
 }
 

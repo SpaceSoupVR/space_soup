@@ -210,6 +210,12 @@ pub struct Levers {
     /// reads as its brightness (8 or more is white). The same instances and
     /// cutouts as the real draw. See `effects::overdraw_shader`.
     pub effects_overdraw: bool,
+    /// THE CAVE DUST A/B (default off): the dust motes placed in the cave's
+    /// bonfire chamber (the scene object `fx_cave_dust`, a dust box round
+    /// the fire, `quest_app::scene_effects::LEVER_GATED`) drawn. Off, as
+    /// shipped, the scene loads without them; on, to judge them on the
+    /// headset with the torch through them.
+    pub cave_dust: bool,
     /// The level's water -- its surfaces, their waves and, under SpaceWarp,
     /// their motion -- drawn. See `water_pipeline`.
     pub water: bool,
@@ -517,6 +523,27 @@ pub struct Levers {
     /// ON since 2026-10-13 (round 13): cave_back_exit -3.2 ms, cave_chamber
     /// -2.8, cave_back_out -0.2; the cave's mouth from outside unchanged.
     pub cave_first: bool,
+    /// THE SCENE PASS'S OPAQUE MODELS, CUBOIDS AND BODIES DRAWN WITHOUT
+    /// BLENDING, where they were drawn with it: the same pixels (an opaque
+    /// material writes alpha 1), but a blended draw that writes depth turns
+    /// Adreno's coarse depth (LRZ) off for the rest of the pass, and the
+    /// cuboids are drawn before the ground. Glass and a body's blended parts
+    /// stay blended, after the opaque ones. See
+    /// `mesh_pipeline::opaque_target`. ON since 2026-10-14 (not yet measured
+    /// on the headset: `--levers '{"opaque_models": false}'` is the A/B).
+    pub opaque_models: bool,
+    /// THE SKY BEFORE THE WATER, where it was drawn after it. The water is
+    /// blended AND writes depth, which turns Adreno's coarse depth (LRZ) off
+    /// for every draw after it in the pass -- the full-screen sky among them.
+    /// The sky only needed the water's depth to stay off it, and it need not:
+    /// the water multiplies what is behind it by `through`, which carries the
+    /// share of the bed DRAWN behind the pixel (`drawn`) -- 0 past the ground
+    /// map and at the lips where nothing is drawn, the only places the sky is
+    /// behind water -- so a sky drawn first is multiplied away there. Not
+    /// with the eye in a body (its veil and underside draw the sky's part).
+    /// See `render_frame` "THE SKY". 2026-10-14, LRZ audit; not yet measured
+    /// on the headset: `--levers '{"sky_before_water": false}'` is the A/B.
+    pub sky_before_water: bool,
     /// A BODY OF WATER IS DRAWN ONLY WHERE IT CAN BE SEEN: its index buffer,
     /// in the order it lies, in runs of consecutive triangles; the scene pass
     /// and the motion pass draw the runs some eye's view reaches (through a
@@ -624,6 +651,12 @@ pub struct Levers {
     pub gpu_sync: bool,
     /// Screen-space reflections. `None` leaves the in-headset switch alone.
     pub ssr: Option<bool>,
+    /// THE BRUSHES' DIAGNOSTIC VIEW: `"off"`, `"sources"` (red baked, green
+    /// probe, blue direct) or `"ssr"`. `None` leaves it as it is. The tester's
+    /// build gives the left stick's click to running (2026-10-14), which used
+    /// to toggle the sources view; this is how it is reached now, without a
+    /// developer build.
+    pub debug_view: Option<String>,
     /// Both eyes in one multiview scene pass. `None` leaves it as set.
     pub multiview: Option<bool>,
     /// MEASUREMENT ONLY -- the scene pass shades a quarter of the pixels. If
@@ -697,6 +730,7 @@ impl Default for Levers {
             muzzle_test: true,
             effect_variants: true,
             effects_overdraw: false,
+            cave_dust: false,
             water: true,
             underwater: true,
             weather: true,
@@ -738,6 +772,8 @@ impl Default for Levers {
             ground_horizon: true,
             ground_horizon_caves: true,
             cave_first: true,
+            opaque_models: true,
+            sky_before_water: true,
             water_runs: true,
             ground_buffers: true,
             brush_buffers: true,
@@ -751,6 +787,7 @@ impl Default for Levers {
             reader_edit: None,
             gpu_sync: false,
             ssr: None,
+            debug_view: None,
             multiview: None,
             half_viewport: false,
             direct_path: false,
@@ -865,6 +902,7 @@ impl Levers {
         flag("muzzle_test", self.muzzle_test, d.muzzle_test);
         flag("effect_variants", self.effect_variants, d.effect_variants);
         flag("effects_overdraw", self.effects_overdraw, d.effects_overdraw);
+        flag("cave_dust", self.cave_dust, d.cave_dust);
         flag("water", self.water, d.water);
         flag("underwater", self.underwater, d.underwater);
         flag("weather", self.weather, d.weather);
@@ -908,6 +946,9 @@ impl Levers {
         }
         if let Some(on) = self.ssr {
             out.push(format!("ssr={}", if on { "on" } else { "off" }));
+        }
+        if let Some(view) = &self.debug_view {
+            out.push(format!("debug_view={view}"));
         }
         if let Some(on) = self.multiview {
             out.push(format!("multiview={}", if on { "on" } else { "off" }));
@@ -958,6 +999,8 @@ impl Levers {
             ("ground_horizon", self.ground_horizon, d.ground_horizon),
             ("ground_horizon_caves", self.ground_horizon_caves, d.ground_horizon_caves),
             ("cave_first", self.cave_first, d.cave_first),
+            ("opaque_models", self.opaque_models, d.opaque_models),
+            ("sky_before_water", self.sky_before_water, d.sky_before_water),
             ("water_runs", self.water_runs, d.water_runs),
             ("ground_buffers", self.ground_buffers, d.ground_buffers),
             ("brush_buffers", self.brush_buffers, d.brush_buffers),
@@ -1062,6 +1105,19 @@ mod tests {
         assert!(!l.probe_trace && l.ssr == Some(true));
         assert_eq!(Levers { probe_trace: true, ssr: None, ..l.clone() }, Levers::default());
         assert_eq!(l.summary(), "no_probe_trace,ssr=on");
+    }
+
+    /// The sources view, reachable by the lever file now that the left
+    /// stick's click runs; and the opaque models' A/B.
+    #[test]
+    fn the_debug_view_and_opaque_models_are_levers() {
+        let l = Levers::parse(r#"{"debug_view": "sources", "opaque_models": false}"#).unwrap();
+        assert_eq!(l.debug_view.as_deref(), Some("sources"));
+        assert!(!l.opaque_models && Levers::default().opaque_models && Levers::default().debug_view.is_none());
+        assert_eq!(l.summary(), "debug_view=sources,no_opaque_models");
+        let s = Levers::parse(r#"{"sky_before_water": false}"#).unwrap();
+        assert!(!s.sky_before_water && Levers::default().sky_before_water);
+        assert_eq!(s.summary(), "no_sky_before_water");
     }
 
     /// The ground's levers are named against their defaults, whichever way

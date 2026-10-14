@@ -81,6 +81,10 @@ pub fn lightmap_bind_group_layout(device: &Device) -> BindGroupLayout {
 
 pub struct SolidPipeline {
     pub pipeline: RenderPipeline,
+    /// [`Self::pipeline`] with blending OFF, for a frame whose cuboids are
+    /// all opaque (`Levers::opaque_models`): the eye pass's alone. See
+    /// `mesh_pipeline::opaque_target`.
+    pub opaque: Option<RenderPipeline>,
     pub lightmap_layout: BindGroupLayout,
 }
 pub struct WirePipeline {
@@ -108,9 +112,10 @@ impl SolidPipeline {
         uniform_layout: &BindGroupLayout,
         samples: u32,
     ) -> Self {
-        Self::new_with_front_face(
+        // With its opaque twin: the eye pass's.
+        Self::build(
             device, format, uniform_layout, FrontFace::Ccw, samples,
-            crate::renderer::multiview::ViewMode::Mono,
+            crate::renderer::multiview::ViewMode::Mono, solid_shader(), true,
         )
     }
 
@@ -139,7 +144,7 @@ impl SolidPipeline {
     /// `None` if the shader no longer opens as `world_vertices` expects.
     pub fn new_mirror_world(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Option<Self> {
         let source = crate::renderer::terrain_pipeline::world_vertices(&solid_shader())?;
-        Some(Self::build(device, format, uniform_layout, FrontFace::Cw, 1, crate::renderer::multiview::ViewMode::Mono, source))
+        Some(Self::build(device, format, uniform_layout, FrontFace::Cw, 1, crate::renderer::multiview::ViewMode::Mono, source, false))
     }
 
     fn new_with_front_face(
@@ -150,7 +155,7 @@ impl SolidPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
-        Self::build(device, format, uniform_layout, front_face, samples, view, solid_shader())
+        Self::build(device, format, uniform_layout, front_face, samples, view, solid_shader(), false)
     }
 
     fn build(
@@ -161,6 +166,7 @@ impl SolidPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
         source: String,
+        opaque_twin: bool,
     ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("solid_shader"),
@@ -172,8 +178,8 @@ impl SolidPipeline {
             bind_group_layouts: &[Some(uniform_layout), Some(&lightmap_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("solid_pipeline"),
+        let build = |label: &str, targets: &[Option<ColorTargetState>]| device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -185,11 +191,7 @@ impl SolidPipeline {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState {
-                    format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets,
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
@@ -209,8 +211,14 @@ impl SolidPipeline {
             multiview_mask: view.mask(),
             cache: None,
         });
+        let pipeline = build(
+            "solid_pipeline",
+            &[Some(ColorTargetState { format, blend: Some(BlendState::ALPHA_BLENDING), write_mask: ColorWrites::ALL })],
+        );
+        let opaque = opaque_twin.then(|| build("solid_pipeline_opaque", &crate::renderer::mesh_pipeline::opaque_target(format)));
         Self {
             pipeline,
+            opaque,
             lightmap_layout,
         }
     }
@@ -275,6 +283,7 @@ impl SolidPipeline {
         });
         Self {
             pipeline,
+            opaque: None,
             lightmap_layout,
         }
     }

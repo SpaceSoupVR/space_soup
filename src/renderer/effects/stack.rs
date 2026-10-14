@@ -123,7 +123,8 @@ impl Val {
 /// record ([`P`]); the list runs in the stack's order.
 #[derive(Clone, Debug)]
 enum Step {
-    Disc(f32),
+    /// Its radius, and whether a placed effect's disc fills its object.
+    Disc(f32, bool),
     Lobes { lobes: u32, open: f32, rake: f32, skip_down: bool, side_pairs: u32, length: Val },
     Cone(f32, bool),
     Speed(Val),
@@ -193,6 +194,9 @@ pub struct Program {
     pub motion: MotionLayer,
     /// Born at the burst's second point (a weapon's ejection port).
     at_port: bool,
+    /// The radius of its disc where it fills a placed object's footprint
+    /// (`shape_disc` `fills_object`), 0 for none.
+    fills_disc: f32,
     /// How far any of its particles gets from where the burst was, metres.
     reach: f32,
     /// The longest one of its particles can still be drawn after the burst,
@@ -291,6 +295,11 @@ impl CompiledEffect {
     pub fn instances(&self) -> u32 {
         self.report.instances_per_burst
     }
+
+    /// The radius of its widest disc that fills a placed object, 0 for none.
+    pub fn fills_disc(&self) -> f32 {
+        self.programs.iter().map(|p| p.fills_disc).fold(0.0, f32::max)
+    }
 }
 
 fn compile_emitter(a: &EffectAsset, e: &EmitterDef, books: &[BookInfo]) -> Result<Program, String> {
@@ -329,9 +338,9 @@ fn compile_emitter(a: &EffectAsset, e: &EmitterDef, books: &[BookInfo]) -> Resul
             }
             InitModule::Spin { rate, start } => steps.push(Step::Spin { rate: *rate, start: *start }),
             InitModule::ShapePoint {} => {}
-            InitModule::ShapeDisc { radius } => {
+            InitModule::ShapeDisc { radius, fills_object } => {
                 extra += radius;
-                steps.push(Step::Disc(*radius));
+                steps.push(Step::Disc(*radius, *fills_object));
             }
             InitModule::ShapeCone { angle_deg, about } => steps.push(Step::Cone(*angle_deg, *about == asset::About::Up)),
             InitModule::ShapeLobes { lobes, open_deg, rake_deg, skip_down, side_pairs, length } => {
@@ -448,6 +457,7 @@ fn compile_emitter(a: &EffectAsset, e: &EmitterDef, books: &[BookInfo]) -> Resul
         soft,
         motion,
         at_port: e.at == asset::At::Port,
+        fills_disc: e.initialize.iter().find_map(|m| if let InitModule::ShapeDisc { radius, fills_object: true } = m { Some(*radius) } else { None }).unwrap_or(0.0),
         reach,
         seconds,
     })
@@ -455,6 +465,85 @@ fn compile_emitter(a: &EffectAsset, e: &EmitterDef, books: &[BookInfo]) -> Resul
 
 /// How much longer than its drawn length the most energetic shot's lobe is.
 const LOBE_ENERGY_MOST: f32 = 2.2;
+
+/// WHERE AN EMITTER'S PARTICLES GET TO from its origin, out to the side, down
+/// and up, its up the emitter's direction: [`compile_emitter`]'s travel bound
+/// taken apart by way -- a disc and a swirl go sideways, a launch along its
+/// cone, a fall along its acceleration, a level sheet's own size only
+/// sideways. The box an effect's fill is seen through (`seen`), and
+/// conservative as the reach is: drag, air and jitter at their most.
+pub(crate) fn emitter_extent(e: &EmitterDef) -> asset::Extent {
+    let (mut size_most, mut size_scale, mut speed_most, mut life_most) = (0.0f32, 1.0f32, 0.0f32, 0.0f32);
+    let (mut lateral, mut vertical) = (0.0f32, 0.0f32);
+    let mut cone: Option<f32> = None;
+    for m in &e.initialize {
+        match m {
+            InitModule::Life { value: LifeValue::Seconds(v) } => life_most = v.bounds().1,
+            InitModule::Size { value } => size_most = value.bounds().1,
+            InitModule::Speed { value } => speed_most = value.bounds().1,
+            InitModule::ShapeDisc { radius, .. } => lateral += radius,
+            InitModule::ShapeBox {} => {
+                lateral += 0.5;
+                vertical += 0.5;
+            }
+            InitModule::ShapeCone { angle_deg, .. } => cone = Some(*angle_deg),
+            InitModule::ShapeLobes { side_pairs, length, .. } => {
+                let l = 1.2 * length.bounds().1 * LOBE_ENERGY_MOST + 0.02 * *side_pairs as f32;
+                lateral += l;
+                vertical += l;
+            }
+            _ => {}
+        }
+    }
+    let (mut accel, mut drag) = (Vec3::ZERO, 0.0f32);
+    for m in &e.update {
+        match m {
+            UpdateModule::Ballistic { accel: a, drag: k } => (accel, drag) = (Vec3::from(*a), *k),
+            UpdateModule::Swirl { radius, .. } => lateral += radius,
+            UpdateModule::AirDrift { strength } => {
+                let air = air_reach(burst_air()) * strength;
+                lateral += air;
+                vertical += air;
+            }
+            UpdateModule::Jitter { reach, .. } => {
+                lateral += 1.8 * reach;
+                vertical += 0.6 * 1.8 * reach;
+            }
+            UpdateModule::SizeOverLife { to: Some(to), .. } => size_most = size_most.max(*to),
+            UpdateModule::SizeOverLife { value: Some(v), .. } => size_scale *= v.bounds().1.max(1.0),
+            UpdateModule::ByInput { target: UpdateTarget::Size, curve, .. } => size_scale *= curve.iter().map(|k| k[1]).fold(1.0f32, f32::max),
+            _ => {}
+        }
+    }
+    let (mut flat, mut streak_seconds) = (false, 0.0f32);
+    for m in &e.render {
+        if let RenderModule::Placement { mode, streak_seconds: s } = m {
+            flat = *mode == PlacementMode::Flat;
+            streak_seconds = if *mode == PlacementMode::Streak { *s } else { 0.0 };
+        }
+    }
+    let t = life_most;
+    let coast = if drag > 1e-4 { speed_most * (1.0 / drag).min(t) } else { speed_most * t };
+    let fall = |a: f32| if drag > 1e-4 { a / drag * t } else { 0.5 * a * t * t };
+    // A streak lies along its velocity: its launch, and the most its
+    // acceleration brings it to against its drag, sideways and up apart.
+    let terminal = |a: f32| if drag > 1e-4 { a / drag } else { a * t };
+    // A launch along its cone (along its direction without one); `about:
+    // up` is the world's up, which a placed effect's direction is.
+    let open = cone.unwrap_or(0.0).clamp(0.0, 180.0).to_radians();
+    let (up, down) = (coast, coast * (-open.cos()).max(0.0));
+    let side = coast * open.min(std::f32::consts::FRAC_PI_2).sin();
+    let size = 1.5 * size_most * size_scale;
+    let sheet_up = if flat { size * open.min(std::f32::consts::FRAC_PI_2).sin() } else { size };
+    let fall_side = fall(Vec3::new(accel.x, 0.0, accel.z).length());
+    let streak_side = streak_seconds * (speed_most * open.min(std::f32::consts::FRAC_PI_2).sin() + terminal(Vec3::new(accel.x, 0.0, accel.z).length()));
+    let streak_up = streak_seconds * (speed_most + terminal(accel.y.abs()));
+    asset::Extent {
+        lateral: lateral + side + fall_side + size + streak_side,
+        below: vertical + down + fall((-accel.y).max(0.0)) + sheet_up + streak_up,
+        above: vertical + up + fall(accel.y.max(0.0)) + sheet_up + streak_up,
+    }
+}
 
 /// THE EFFECTS A LEVEL CAN RAISE, compiled at load, by name.
 #[derive(Clone, Debug, Default)]
@@ -582,11 +671,37 @@ pub struct Placed {
     pub rate: f32,
     /// Linear (the scene's sRGB tint, decoded).
     pub tint: [f32; 3],
+    /// How much of the sky's sun reaches it, 0-1, found at load by a ray
+    /// toward the sun (`quest_app::scene_effects::find_sunlit`): 0 in a cave
+    /// or a room, 1 out in the open. Its particles are lit by the frame's
+    /// directional light times this, as a lamp would light them.
+    pub sunlit: f32,
+    /// Its object's footprint, half its width along the world's x and z,
+    /// metres: what a disc that fills its object (`shape_disc`
+    /// `fills_object`) spans, its rate grown with the area. 0 for none.
+    pub footprint: [f32; 2],
+}
+
+impl Placed {
+    /// The footprint, where it has one.
+    pub fn footprint(&self) -> Option<[f32; 2]> {
+        (self.footprint[0] > 0.0 && self.footprint[1] > 0.0).then_some(self.footprint)
+    }
+
+    /// How many times as many particles a disc of `radius` that fills its
+    /// object makes (its footprint's area over the disc's); 1 for one that
+    /// does not (`radius` 0) or an object with no footprint.
+    pub fn fills(&self, radius: f32) -> f32 {
+        match self.footprint() {
+            Some([x, z]) if radius > 0.0 => x * z / (radius * radius),
+            _ => 1.0,
+        }
+    }
 }
 
 impl Default for Placed {
     fn default() -> Self {
-        Self { scale: 1.0, rate: 1.0, tint: [1.0; 3] }
+        Self { scale: 1.0, rate: 1.0, tint: [1.0; 3], sunlit: 0.0, footprint: [0.0; 2] }
     }
 }
 
@@ -678,6 +793,12 @@ pub struct BurstSet {
     /// The governor's share of each placed emitter and splash it weighed
     /// last frame, by [`Want::key`]; what it did not weigh is whole.
     shares: std::collections::HashMap<u64, f32>,
+    /// The placed emitters it weighed last frame, by key. One it did not --
+    /// newly in sight, its door just opened -- RAMPS IN from none of its
+    /// particles, [`SHARE_STEP`] a frame, in its fixed order (`kept`): the
+    /// same particles it would draw whole, arriving over a few frames, not
+    /// its whole population worked out on the frame it was revealed.
+    weighed: std::collections::HashSet<u64>,
     /// Each splash's fill and instances as last drawn whole, by its key
     /// (`effects::simulate_governed` measures them): what it is weighed by
     /// on the next frame.
@@ -839,13 +960,13 @@ impl BurstSet {
             }
             drawn[i] = true;
             if l.lasting {
-                let near = (c.report.reference_distance / d.max(0.3)).powi(2);
-                // A placed one's sprites are `scale` times the size, its
-                // streams `rate` times as dense.
-                let grown = placed.scale * placed.scale * placed.rate;
-                let lasting: f32 = c.report.emitters.iter().filter(|e| e.longest_life > 0.0).map(|e| e.fill).sum();
-                let count: u32 = c.report.emitters.iter().filter(|e| e.longest_life > 0.0).map(|e| e.instances).sum();
-                wants.push((c.scalability.importance * 100.0 + pixels.max(1.0).log2(), (lasting * near * grown).min(3.0), count as f32 * placed.rate, i));
+                // WHAT IT FILLS IN THESE EYES (`seen`): its box clipped to
+                // each view, times its particles' layers. A placed one's
+                // sprites are `scale` times the size, its streams `rate`
+                // times as dense, and a disc that fills its object as many
+                // more as the footprint is wider.
+                let (fill, count) = l.seen_cost(c, views, head);
+                wants.push((c.scalability.importance * 100.0 + pixels.max(1.0).log2(), fill, count, i));
             }
         }
         let bursts = self.live.len();
@@ -889,7 +1010,8 @@ impl BurstSet {
                 l.share
             } else {
                 let w = &others[i - bursts];
-                let was = self.share_of(w.key);
+                let ramps = w.kind == WantKind::Emitter && !self.weighed.contains(&w.key);
+                let was = if ramps { 0.0 } else { self.share_of(w.key) };
                 let share = was + (target[i] - was).clamp(-SHARE_STEP, SHARE_STEP);
                 if share < 1.0 {
                     shares.insert(w.key, share);
@@ -903,8 +1025,10 @@ impl BurstSet {
             fill += f * share;
             count += n * share;
         }
-        // What was not weighed this frame (out of view) comes back whole.
+        // What was not weighed this frame (out of view) comes back whole --
+        // a placed emitter ramping in again when it is next in sight.
         self.shares = shares;
+        self.weighed = others.iter().filter(|w| w.kind == WantKind::Emitter && w.sheddable).map(|w| w.key).collect();
         // One out of view comes back whole when the frame has room for it.
         for (i, l) in self.live.iter_mut().enumerate() {
             if !drawn[i] {
@@ -988,6 +1112,61 @@ fn pulse_light(pulse: &LightPulse, intensity: f32, position: Vec3) -> Light {
 }
 
 impl LiveBurst {
+    /// WHAT ITS LASTING PARTICLES COST IN THESE EYES, as the governor weighs
+    /// it: the fill they make seen through `views` from `head` (`seen`: its
+    /// box clipped to each view, times their layers; both reference eyes
+    /// looking at it where no views are given) and how many they are. A
+    /// placed one's sprites are `scale` times the size, its streams `rate`
+    /// times as dense, and a disc that fills its object as many more as the
+    /// footprint is wider.
+    pub fn seen_cost(&self, c: &CompiledEffect, views: &[[glam::Vec4; 6]], head: Vec3) -> (f32, f32) {
+        let placed = self.standing.unwrap_or_default();
+        let (lo, hi) = self.seen_box(c);
+        let eyes: Vec<super::seen::Eye> = if views.is_empty() {
+            vec![super::seen::Eye::looking(head, 0.5 * (lo + hi)); asset::REFERENCE_EYES as usize]
+        } else {
+            views.iter().filter_map(|p| super::seen::Eye::from_planes(head, p)).collect()
+        };
+        let fills = placed.fills(c.fills_disc());
+        let grown = placed.scale * placed.scale * placed.rate * fills;
+        let lasting = || c.report.emitters.iter().filter(|e| e.longest_life > 0.0);
+        let facing: f32 = lasting().filter(|e| !e.flat).map(|e| e.area).sum();
+        let flat: f32 = lasting().filter(|e| e.flat).map(|e| e.area).sum();
+        let points: u32 = lasting().map(|e| e.points).sum();
+        let fill = super::seen::seen_fill(&eyes, lo, hi, facing * grown, flat * grown, points as f32 * placed.rate * fills);
+        let count: u32 = lasting().map(|e| e.instances).sum();
+        (fill, count as f32 * placed.rate * fills)
+    }
+
+    /// THE BOX ITS PARTICLES ARE SEEN THROUGH (`seen`), world frame: its
+    /// emitters' extent about where it is -- level with the world's up when
+    /// it stands upright (a placed effect, smoke rising), a cube of its
+    /// widest way otherwise -- a disc that fills its object widened to the
+    /// footprint.
+    fn seen_box(&self, c: &CompiledEffect) -> (Vec3, Vec3) {
+        let e = c.report.extent;
+        let placed = self.standing.unwrap_or_default();
+        let grow = placed.scale.max(1.0);
+        let (mut x, mut z) = (e.lateral, e.lateral);
+        if let (Some([fx, fz]), r) = (placed.footprint(), c.fills_disc()) {
+            if r > 0.0 {
+                x += fx - r;
+                z += fz - r;
+            }
+        }
+        let p = self.burst.position;
+        let (lo, hi) = if self.burst.direction.normalize_or_zero().y > 0.99 {
+            (p - Vec3::new(x, e.below, z) * grow, p + Vec3::new(x, e.above, z) * grow)
+        } else {
+            let m = x.max(z).max(e.below).max(e.above) * grow;
+            (p - Vec3::splat(m), p + Vec3::splat(m))
+        };
+        match self.burst.port {
+            Some((port, _)) => (lo.min(port - Vec3::splat(c.reach)), hi.max(port + Vec3::splat(c.reach))),
+            None => (lo, hi),
+        }
+    }
+
     /// When nothing of it is left, on the effects' clock.
     fn until(&self, c: &CompiledEffect) -> f64 {
         let Some(born) = self.born else { return f64::INFINITY };
@@ -1091,6 +1270,11 @@ struct Ctx<'a> {
     /// A placed effect's own scale and tint ([`Placed`]); 1 for a burst.
     scale: f32,
     tint: Vec3,
+    /// The sun as it reaches a placed effect ([`Placed::sunlit`]): its light
+    /// and the way toward it, player frame; none for a burst.
+    sun: Option<(Vec3, Vec3)>,
+    /// A placed effect's object footprint ([`Placed::footprint`]).
+    footprint: Option<[f32; 2]>,
 }
 
 /// The particle record a program's steps read and write.
@@ -1157,11 +1341,16 @@ impl Program {
         let player = |w: Vec3| at.yaw_inv * (w - at.offset);
         for step in &self.steps {
             match step {
-                Step::Disc(radius) => {
+                Step::Disc(radius, fills) => {
                     let r = radius * p.u[4].sqrt();
                     let side = cx.dir.any_orthonormal_vector();
                     let phi = p.u[5] * TAU;
-                    p.p0 += (side * phi.cos() + cx.dir.cross(side) * phi.sin()) * r;
+                    let mut off = (side * phi.cos() + cx.dir.cross(side) * phi.sin()) * r;
+                    // Stretched to the object's footprint (world x and z).
+                    if let (true, Some([fx, fz])) = (*fills && *radius > 0.0, cx.footprint) {
+                        off = Vec3::new(off.x * fx / radius, off.y, off.z * fz / radius);
+                    }
+                    p.p0 += off;
                     p.pos = p.p0;
                 }
                 Step::Lobes { lobes, open, rake, skip_down, side_pairs, length } => {
@@ -1298,6 +1487,9 @@ impl Program {
                         }
                     }
                     if let Some((c, d)) = cx.flash.as_ref().and_then(|f| lamp_at(f, centre)) {
+                        take(c, d);
+                    }
+                    if let Some((c, d)) = cx.sun {
                         take(c, d);
                     }
                     let a = *albedo * at.exposure;
@@ -1460,6 +1652,15 @@ pub(super) fn simulate_bursts(
             variation: Variation::default(),
         };
         let lamps: Vec<usize> = (0..at.lights.len()).filter(|&k| (at.reaches)(&stand_in, k)).collect();
+        // The sky's sun, where it reaches a placed effect (`lamp_at` leaves
+        // suns out: nothing else knows whether one reaches the particles).
+        let sun = (placed.sunlit > 0.0)
+            .then(|| at.lights.iter().find(|l| matches!(l.kind, LightKind::Directional) && l.intensity > 0.0))
+            .flatten()
+            .map(|l| {
+                let c = l.color.to_linear();
+                (Vec3::new(c[0], c[1], c[2]) * (l.intensity * placed.sunlit.min(1.0)), -l.direction.normalize_or_zero())
+            });
         let flash = c.pulse_of(l).map(|(pulse, energy)| {
             let intensity = pulse.intensity * energy * brief_light_scale(at.exposure);
             pulse_light(&pulse, intensity, at.yaw_inv * (l.burst.position + l.burst.direction * (0.4 * c.reach.min(0.2)) - at.offset))
@@ -1490,6 +1691,8 @@ pub(super) fn simulate_bursts(
                 ceiling: None,
                 scale: placed.scale,
                 tint: Vec3::from(placed.tint),
+                sun,
+                footprint: placed.footprint(),
             };
             let own_seed = hash64(seed ^ (k as u64 + 1).wrapping_mul(0x632b_e59b_d9b4_e019));
             // Each burst sheds in an order of its own: a row of them thinned
@@ -1526,7 +1729,7 @@ pub(super) fn simulate_bursts(
                     // A STREAM: particle `j` leaves `(j + phase) / rate`
                     // after the event, until the window closes or a later
                     // burst of the source takes the stream over.
-                    let rate = per_second * p.by(SpawnTarget::Rate, &l.burst.inputs) * placed.rate;
+                    let rate = per_second * p.by(SpawnTarget::Rate, &l.burst.inputs) * placed.rate * placed.fills(p.fills_disc);
                     if !(rate > 0.0) {
                         continue;
                     }
@@ -1847,7 +2050,7 @@ pub(crate) mod tests {
         let Some(lib) = shipped() else { return };
         let at = seen_from(Vec3::new(0.3, 1.5, 1.2), 1.0);
         for name in lib.names().map(str::to_string).collect::<Vec<_>>() {
-            let (mut moving, mut found) = (0, 0);
+            let (mut moving, mut found, mut seen) = (0, 0, 0);
             for seed in 0..12u64 {
                 let recoil = Vec3::new(0.1, 0.6, 1.5);
                 let b = EffectBurst { velocity: recoil, inputs: [0.6, 0.0, 0.0, 0.0], ..shot(&lib, &name, seed) };
@@ -1870,7 +2073,9 @@ pub(crate) mod tests {
                             assert_eq!(v, recoil, "{name}: a flash rides its muzzle");
                             continue;
                         }
-                        if v.length() < 0.005 {
+                        seen += 1;
+                        // (A millimetre a second: a pond's mist drifts at a few.)
+                        if v.length() < 0.001 {
                             continue;
                         }
                         moving += 1;
@@ -1880,9 +2085,9 @@ pub(crate) mod tests {
                     }
                 }
             }
-            // (Ten at least: pond_mist's puffs drift at 2-6 cm/s, most of them
-            // under the 5 mm/s counted here.)
-            assert!(moving >= 10, "{name}: {moving} moving");
+            // Ten at least, or all of them: a slow stream (pond_mist, one a
+            // second) has only a handful in the first 0.7 s after it starts.
+            assert!(moving >= 10.min(seen) && seen > 0, "{name}: {moving} of {seen} moving");
             assert!(found as f32 >= 0.95 * moving as f32, "{name}: {found} of {moving} found where their velocity took them");
         }
     }
@@ -2039,6 +2244,7 @@ pub(crate) mod tests {
         let (Some(rifle), Some(pistol), Some(quiet)) = (read("muzzle_556_a2"), read("muzzle_9mm_bare"), read("muzzle_suppressed")) else { return };
         // The effect authored in the editor (2026-10-14), placed as a scene's object places it.
         let steam = read("steam_vent").unwrap_or_default();
+        let mist = read("pond_mist").unwrap_or_default();
         let yaw = 0.4f32;
         let offset = Vec3::new(0.5, 0.0, -0.2);
         let lamp = Light {
@@ -2055,7 +2261,10 @@ pub(crate) mod tests {
             source_radius: 0.03,
             in_level_bake: true,
         };
-        let lights = [lamp];
+        // The sky's sun beside it: suns light only a placed effect the sun
+        // reaches (`Placed::sunlit`), the pond's mist here.
+        let sun = Light { kind: LightKind::Directional, direction: Vec3::new(0.3, -0.6, 0.7).normalize(), intensity: 3.0, color: crate::renderer::Color3(255, 244, 228, 255), range: 0.0, ..lamp };
+        let lights = [lamp, sun];
         let ambient = |_: Vec3| Vec3::new(0.05, 0.05, 0.06);
         let v3 = |v: Vec3| json!([v.x, v.y, v.z]);
         let mut cases = Vec::new();
@@ -2079,7 +2288,7 @@ pub(crate) mod tests {
                 vec![VENT],
                 1.2,
                 Vec3::new(0.0, 1.6, 2.0),
-                vec![(0, "test_vent", Vec3::new(0.2, 0.0, -0.5), Vec3::Y, None, [0.0; 4], 77, 0, Some(Placed { scale: 1.5, rate: 0.8, tint: [1.0, 0.9, 0.8] }))],
+                vec![(0, "test_vent", Vec3::new(0.2, 0.0, -0.5), Vec3::Y, None, [0.0; 4], 77, 0, Some(Placed { scale: 1.5, rate: 0.8, tint: [1.0, 0.9, 0.8], sunlit: 0.0, footprint: [0.0; 2] }))],
                 vec![0.0, 0.5, 30.0, 30.0 + 1.0 / 36.0, 700.25],
             ),
             ("muzzle_556_a2", vec![], 4.0, Vec3::new(0.0, 1.6, 0.0), vec![shot(0, "muzzle_556_a2", 5, 0.3)], vec![2.0, 2.0 + 1.0 / 72.0, 2.3, 3.0]),
@@ -2093,10 +2302,18 @@ pub(crate) mod tests {
                 vec![(0, "steam_vent", Vec3::new(0.0, 0.0, 0.0), Vec3::Y, None, [0.0; 4], 7, 0, Some(Placed::default()))],
                 vec![0.0, 1.0 / 36.0, 4.0, 30.0, 30.0 + 1.0 / 36.0],
             ),
+            (
+                "pond_mist",
+                vec![],
+                1.2,
+                Vec3::new(0.0, 1.6, 4.0),
+                vec![(0, "pond_mist", Vec3::new(0.0, -0.3, 0.0), Vec3::Y, None, [0.0; 4], 7, 0, Some(Placed { sunlit: 0.8, footprint: [6.0, 3.0], ..Placed::default() }))],
+                vec![0.0, 1.0 / 36.0, 12.0, 40.0],
+            ),
         ];
         for (name, extra, exposure, head, events, times) in specs {
             let mut texts: Vec<String> = extra.iter().map(|t| t.to_string()).collect();
-            texts.extend([&rifle, &pistol, &quiet, &steam].into_iter().filter(|t| t.contains(&format!("\"name\": \"{name}\""))).cloned());
+            texts.extend([&rifle, &pistol, &quiet, &steam, &mist].into_iter().filter(|t| t.contains(&format!("\"name\": \"{name}\""))).cloned());
             if texts.is_empty() {
                 continue; // (an effect not in this game/effects)
             }
@@ -2126,12 +2343,12 @@ pub(crate) mod tests {
                 "name": name,
                 "assets": texts,
                 "surroundings": { "head": v3(head), "offset": v3(offset), "yaw": yaw, "exposure": exposure, "ambient": [0.05, 0.05, 0.06],
-                    "lights": [{ "position": v3(lights[0].position), "direction": v3(lights[0].direction), "kind": "Point", "color": [255, 214, 170, 255],
-                        "intensity": lights[0].intensity, "range": lights[0].range, "source_radius": lights[0].source_radius }] },
+                    "lights": lights.iter().map(|l| json!({ "position": v3(l.position), "direction": v3(l.direction), "kind": format!("{:?}", l.kind), "color": [l.color.0, l.color.1, l.color.2, l.color.3],
+                        "intensity": l.intensity, "range": l.range, "source_radius": l.source_radius })).collect::<Vec<_>>() },
                 "events": events.iter().map(|e| json!({
                     "frame": e.0, "asset": e.1, "position": v3(e.2), "direction": v3(e.3), "port": e.4.map(|(p, d)| json!([v3(p), v3(d)])),
                     "inputs": e.5, "source": e.6.to_string(), "seed": e.7.to_string(), "velocity": [0.0, 0.2, 0.4], "up": v3(Vec3::new(0.1, 1.0, 0.0).normalize()),
-                    "placed": e.8.map(|p| json!({ "scale": p.scale, "rate": p.rate, "tint": p.tint })),
+                    "placed": e.8.map(|p| json!({ "scale": p.scale, "rate": p.rate, "tint": p.tint, "sunlit": p.sunlit, "footprint": p.footprint })),
                 })).collect::<Vec<_>>(),
                 "frames": frames,
             }));
@@ -2220,9 +2437,9 @@ pub(crate) mod tests {
             .collect();
         let mut set = BurstSet { budget: FrameBudget { fill: 1e9, instances: u32::MAX }, ..Default::default() };
         let step = |set: &mut BurstSet, time: f64, governed: bool| {
-            let wants = governor_wants(&emitters, &|_| true, &splashes, &set.splash_measured, head);
+            let wants = governor_wants(&emitters, &|_| true, &splashes, &set.splash_measured, head, &[]);
             let drawn = set.frame_with(&lib, time, &[], head, &wants);
-            let shares = Shares { emitter: &|e| set.share_of(emitter_key(e)), splash: &|s| set.share_of(splash_key(s)) };
+            let shares = Shares { emitter: &|e| set.share_of(emitter_key(e)), splash: &|s| set.share_of(splash_key(s)), sight: &[] };
             let f = simulate_governed(&emitters, &|_| true, &splashes, Some(&BurstFrame { lib: &lib, set, drawn: &drawn }), governed.then_some(&shares), time, &at);
             set.measured(&f.splash_costs);
             set.end_frame();
@@ -2233,7 +2450,7 @@ pub(crate) mod tests {
         for k in 0..12 {
             step(&mut set, 9.7 + k as f64 / 36.0, true);
         }
-        let wants = governor_wants(&emitters, &|_| true, &splashes, &set.splash_measured, head);
+        let wants = governor_wants(&emitters, &|_| true, &splashes, &set.splash_measured, head, &[]);
         let all: f32 = wants.iter().map(|w| w.count).sum();
         let smoke: f32 = wants.iter().filter(|w| w.kind == WantKind::Emitter && w.sheddable).map(|w| w.count).sum();
         set.budget.instances = (all - 0.5 * smoke) as u32;
@@ -2426,11 +2643,12 @@ pub(crate) mod tests {
                     let wet: Vec<Splash> = splashes.iter().copied().filter(|s| splash_seen(s, time, &views)).collect();
                     // THE WHOLE FRAME GOVERNED, as `render_frame` runs it:
                     // the placed emitters and splashes weighed with the bursts.
-                    let wants = crate::renderer::effects::governor_wants(&emitters, &|i| seen[i], &wet, &set.splash_measured, head);
+                    let wants = crate::renderer::effects::governor_wants(&emitters, &|i| seen[i], &wet, &set.splash_measured, head, &[]);
                     let drawn = set.frame_with(&lib, time, &views, head, &wants);
                     let shares = crate::renderer::effects::Shares {
                         emitter: &|e| set.share_of(crate::renderer::effects::emitter_key(e)),
                         splash: &|s| set.share_of(crate::renderer::effects::splash_key(s)),
+                        sight: &[],
                     };
                     let f = crate::renderer::effects::simulate_governed(
                         &emitters,
