@@ -668,6 +668,32 @@ pub enum RenderModule {
         #[serde(default)]
         play: Play,
     },
+    /// A HEIGHT-FOG SLAB, not particles: one layer over a box that fills its
+    /// placed object's footprint (`shape_disc` -- `fills_object` for a level's
+    /// pond or hollow, its radius in the editor), from its origin up
+    /// `height` metres. Its density, per metre of sight, is `density` at the
+    /// bottom and falls by e every `falloff` metres up (times a local
+    /// thickness: thin sheets, taller banks), gone well before its top; it
+    /// lies in the ellipse the box's footprint holds (size the object to the
+    /// water), thinning to nothing over `edge` metres in from its rim, and
+    /// ends where the scene's depth does (a bank, the shore), so it is soft
+    /// where it meets ground. Integrated along each pixel's line of sight,
+    /// so a grazing view sees it thicker, as a real layer is. Banks and
+    /// strands drift with `wind` (m/s, world), stretched along it, clear
+    /// water between; that motion is its SpaceWarp vectors. Its density is
+    /// also its object's `strength` and, while a time of day runs, the
+    /// hour's `effects::mist_conditions`. Lit as `light_cpu` (scatter) works
+    /// out: the room's or sky's even light, its lamps, and the sun by
+    /// `sunlit`.
+    SpriteFog {
+        density: f32,
+        height: f32,
+        falloff: f32,
+        #[serde(default)]
+        edge: f32,
+        #[serde(default)]
+        wind: [f32; 3],
+    },
     /// Fades into what it meets over this many metres.
     SoftDepth { metres: f32 },
     /// How SpaceWarp moves its pixels: `bright` for sharp bright layers,
@@ -859,6 +885,8 @@ pub struct EmitterCost {
     /// The radius of a disc that fills its placed object (`shape_disc`
     /// `fills_object`), 0 for none.
     pub fills_disc: f32,
+    /// A fog slab (`sprite_fog`): ONE layer over its box, whatever the view.
+    pub volume: bool,
 }
 
 /// WHERE AN EFFECT'S PARTICLES GET TO from its origin, metres, its up the
@@ -904,6 +932,8 @@ pub struct Report {
     pub area_facing: f32,
     pub area_flat: f32,
     pub points: u32,
+    /// Fog slabs: each one layer over the box.
+    pub volumes: u32,
     /// The reason it may exceed a budget, and the budget errors it then
     /// carries.
     pub over_budget: Option<(String, Vec<String>)>,
@@ -1017,7 +1047,7 @@ impl EffectAsset {
             let (lo, hi, eyes) = crate::renderer::effects::seen::stated_view(extent.lateral, extent.below, extent.above, reference);
             for c in costs.iter_mut() {
                 let (facing, flat) = if c.flat { (0.0, c.area) } else { (c.area, 0.0) };
-                c.fill = crate::renderer::effects::seen::seen_fill(&eyes, lo, hi, facing, flat, c.points as f32);
+                c.fill = crate::renderer::effects::seen::seen_fill(&eyes, lo, hi, facing, flat, c.points as f32, if c.volume { 1.0 } else { 0.0 });
             }
         }
         let instances_per_burst: u32 = costs.iter().map(|c| c.instances).sum();
@@ -1031,6 +1061,7 @@ impl EffectAsset {
         let area_facing: f32 = costs.iter().filter(|c| !c.flat).map(|c| c.area * held(c) as f32).sum();
         let area_flat: f32 = costs.iter().filter(|c| c.flat).map(|c| c.area * held(c) as f32).sum();
         let points: u32 = costs.iter().map(|c| c.points * held(c)).sum();
+        let volumes = costs.iter().filter(|c| c.volume).count() as u32;
         let texture_bytes: u64 = texture.iter().filter_map(|n| books.iter().find(|b| b.name == *n)).map(|b| b.bytes).sum();
         let mut over = |what: String| note(true, None, what);
         if instances_steady > self.budget.instances {
@@ -1084,6 +1115,7 @@ impl EffectAsset {
             area_facing,
             area_flat,
             points,
+            volumes,
             over_budget: self.over_budget.clone().map(|r| (r, over_budget)),
         })
     }
@@ -1245,15 +1277,37 @@ impl EffectAsset {
                         | RenderModule::SpriteBed { .. }
                         | RenderModule::SpriteScatter { .. }
                         | RenderModule::SpriteEmissive { .. }
+                        | RenderModule::SpriteFog { .. }
                 )
             })
             .collect();
+        let fog = sprites.first().and_then(|m| if let RenderModule::SpriteFog { density, height, falloff, edge, .. } = m { Some((*density, *height, *falloff, *edge)) } else { None });
         let placements: Vec<PlacementMode> = e.render.iter().filter_map(|m| if let RenderModule::Placement { mode, .. } = m { Some(*mode) } else { None }).collect();
         let motions: Vec<(&MotionLayer, &Option<String>)> = e.render.iter().filter_map(|m| if let RenderModule::Motion { layer, reason } = m { Some((layer, reason)) } else { None }).collect();
         let soft = e.render.iter().any(|m| matches!(m, RenderModule::SoftDepth { metres } if *metres > 0.0));
         for (what, n) in [("sprite", sprites.len()), ("placement", placements.len()), ("motion", motions.len())] {
+            if what == "placement" && fog.is_some() {
+                if n != 0 {
+                    bad("a fog slab (sprite_fog) is its box: it takes no placement".into());
+                }
+                continue;
+            }
             if n != 1 {
                 bad(format!("needs exactly one {what} module in render; it has {n}"));
+            }
+        }
+        if let Some((density, height, falloff, edge)) = fog {
+            if !(density > 0.0 && density <= 20.0 && height > 0.0 && falloff > 0.0 && edge >= 0.0) {
+                bad("sprite_fog: density over 0 (at most 20 a metre), height and falloff over 0, edge 0 or more".into());
+            }
+            if !e.update.iter().any(|m| matches!(m, UpdateModule::LightCpu { mode: LightMode::Scatter, .. })) {
+                bad("sprite_fog is lit as light_cpu (scatter) works out; the stack has none".into());
+            }
+            if !e.initialize.iter().any(|m| matches!(m, InitModule::ShapeDisc { radius, .. } if *radius > 0.0)) {
+                bad("sprite_fog spans its shape_disc (radius over 0; fills_object for a level's box)".into());
+            }
+            if !e.spawn.iter().any(|m| matches!(m, SpawnModule::Rate { .. })) {
+                bad("sprite_fog stands while its effect is placed: its spawn is a rate (one slab, whatever the rate)".into());
             }
         }
         if let Some((MotionLayer::None, reason)) = motions.first() {
@@ -1263,7 +1317,7 @@ impl EffectAsset {
         }
         let mut share = 1.0;
         let mut screened = false;
-        if let Some(sprite) = sprites.first() {
+        if let Some(sprite) = sprites.first().filter(|_| fog.is_none()) {
             let (book, wants) = match sprite {
                 RenderModule::SpritePlain { book } => (book, None),
                 RenderModule::SpriteSixway { book } => (book, Some(Channels::Sixway)),
@@ -1309,7 +1363,7 @@ impl EffectAsset {
                 bad("flame_sheets goes with sprite_flame, and coal_bed with sprite_bed".into());
             }
         }
-        if !soft && !matches!(placements.first(), Some(PlacementMode::Point | PlacementMode::Flat)) {
+        if !soft && fog.is_none() && !matches!(placements.first(), Some(PlacementMode::Point | PlacementMode::Flat)) {
             bad("a sprite that can touch geometry needs soft_depth, or it ends in a hard line where it meets a wall".into());
         }
         if screened && e.events.iter().any(|m| matches!(m, EventModule::LightPulse { .. })) && one_frame {
@@ -1342,6 +1396,7 @@ impl EffectAsset {
         // particles alive at once. Fill: each particle's mean drawn area at
         // the reference view, both eyes.
         let instances = match rate {
+            _ if fog.is_some() => 1.0,
             Some((per_second, for_seconds)) => (per_second * for_seconds.map_or(longest, |d| d.min(longest))).ceil().max(1.0),
             None => count,
         }
@@ -1383,7 +1438,7 @@ impl EffectAsset {
         // metres): what the frame's governor sees through.
         let point = matches!(placements.first(), Some(PlacementMode::Point));
         let metres = |px: f32| px * reference / REFERENCE_FOCAL_PIXELS;
-        let area = if point { 0.0 } else { instances as f32 * metres(across) * metres(along) * share };
+        let area = if point || fog.is_some() { 0.0 } else { instances as f32 * metres(across) * metres(along) * share };
         let fills_disc = e.initialize.iter().find_map(|m| if let InitModule::ShapeDisc { radius, fills_object: true } = m { Some(*radius) } else { None }).unwrap_or(0.0);
         EmitterCost {
             name: e.name.clone(),
@@ -1396,6 +1451,7 @@ impl EffectAsset {
             points: if point { instances } else { 0 },
             extent: crate::renderer::effects::stack::emitter_extent(e),
             fills_disc,
+            volume: fog.is_some(),
         }
     }
 }

@@ -64,7 +64,7 @@ fn channels(c: Channels) -> &'static str {
 /// function sizes a fragment entry reaches), in `FxVariant::ALL`'s order.
 /// The proxy is a test-only tool, so the numbers are pinned here and
 /// `the_variant_table_is_the_proxys` fails the moment a shader edit moves one.
-pub const VARIANT_PROXY: [usize; 8] = [436, 114, 160, 215, 142, 130, 105, 126];
+pub const VARIANT_PROXY: [usize; 9] = [436, 114, 160, 215, 142, 130, 105, 126, 472];
 
 /// A variant's size by the proxy, and as instructions estimated.
 pub fn variant_cost(v: FxVariant) -> (usize, f32) {
@@ -76,7 +76,7 @@ fn report_json(r: &Report) -> Value {
     json!({
         "emitters": r.emitters.iter().map(|e| json!({
             "name": e.name, "instances": e.instances, "longest_life": e.longest_life, "fill": e.fill, "stream": e.stream,
-            "area": e.area, "flat": e.flat, "points": e.points, "fills_disc": e.fills_disc,
+            "area": e.area, "flat": e.flat, "points": e.points, "fills_disc": e.fills_disc, "volume": e.volume,
         })).collect::<Vec<_>>(),
         "instances_per_burst": r.instances_per_burst,
         "fill_per_burst": r.fill_per_burst,
@@ -91,6 +91,7 @@ fn report_json(r: &Report) -> Value {
         "area_facing": r.area_facing,
         "area_flat": r.area_flat,
         "points": r.points,
+        "volumes": r.volumes,
         "fills_disc": fills_disc(r),
         "over_budget": r.over_budget.as_ref().map(|(reason, what)| json!({ "reason": reason, "exceeds": what })),
     })
@@ -124,6 +125,7 @@ pub fn check_json(text: &str) -> Value {
                         super::stack::Shade::Sixway => FxVariant::Sixway,
                         super::stack::Shade::Scatter | super::stack::Shade::Emissive { .. } => FxVariant::ScreenPlain,
                         super::stack::Shade::EmissiveHeat { .. } => FxVariant::ScreenHeat,
+                        super::stack::Shade::Fog { .. } => FxVariant::Fog,
                     };
                     let (proxy, instructions) = variant_cost(v);
                     json!({
@@ -246,7 +248,7 @@ pub fn placed_cost(object: &str, position: [f32; 3], report: &Report, density: O
         let half = if stretched { [footprint[0] + e.lateral - disc, footprint[1] + e.lateral - disc] } else { [e.lateral; 2] };
         let (lo, hi, eyes) = super::seen::stated_view_of(half, e.below, e.above, report.reference_distance);
         let grown = scale * scale * rate * more;
-        super::seen::seen_fill(&eyes, lo, hi, report.area_facing * grown, report.area_flat * grown, report.points as f32 * rate * more)
+        super::seen::seen_fill(&eyes, lo, hi, report.area_facing * grown, report.area_flat * grown, report.points as f32 * rate * more, report.volumes as f32)
     } else {
         report.fill_steady * scale * scale * rate
     };

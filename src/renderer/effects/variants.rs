@@ -42,6 +42,9 @@ pub enum FxVariant {
     ScreenPlain,
     /// Light through the heat ramp: a muzzle flash.
     ScreenHeat,
+    /// A height-fog slab (`sprite_fog`): its box integrated along each
+    /// pixel's line of sight, nothing of the sprites.
+    Fog,
 }
 
 /// The line of `fs_screen` that chooses a screened particle's light.
@@ -99,7 +102,7 @@ fn tail(s: &mut String, six: bool) {
 }
 
 impl FxVariant {
-    pub const ALL: [Self; 8] = [Self::Union, Self::Plain, Self::Sixway, Self::Flame, Self::Coals, Self::ScreenUnion, Self::ScreenPlain, Self::ScreenHeat];
+    pub const ALL: [Self; 9] = [Self::Union, Self::Plain, Self::Sixway, Self::Flame, Self::Coals, Self::ScreenUnion, Self::ScreenPlain, Self::ScreenHeat, Self::Fog];
 
     /// Its pipeline's label, which the headset's PIPESTATS are logged by.
     pub fn label(self) -> &'static str {
@@ -112,6 +115,7 @@ impl FxVariant {
             Self::ScreenUnion => "effects_screened_union",
             Self::ScreenPlain => "effects_screened",
             Self::ScreenHeat => "effects_screened_heat",
+            Self::Fog => "effects_over_fog",
         }
     }
 
@@ -136,6 +140,7 @@ impl FxVariant {
         match (screened, shade) {
             (true, s) if s > 3.5 => Self::ScreenHeat,
             (true, _) => Self::ScreenPlain,
+            (false, s) if s < -1.5 => Self::Fog,
             (false, s) if s > 2.5 => Self::Coals,
             (false, s) if s > 1.5 => Self::Flame,
             (false, s) if s > 0.5 => Self::Sixway,
@@ -147,20 +152,32 @@ impl FxVariant {
     pub fn shader(self) -> String {
         let mut s = effects_shader();
         match self {
-            Self::Union | Self::ScreenUnion => {}
+            // A fog slab is never drawn by the union (`runs`): it keeps
+            // its own shader, and the sprites' union carries none of it.
+            Self::Union => cut(&mut s, "fog"),
+            Self::ScreenUnion => {}
             Self::Plain | Self::Sixway => {
                 cut(&mut s, "coals");
                 cut(&mut s, "flame");
+                cut(&mut s, "fog");
                 tail(&mut s, self == Self::Sixway);
             }
             Self::Flame => {
                 cut(&mut s, "coals");
                 only(&mut s, "flame", "    if (in.layer.z > 1.5) {\n");
+                cut(&mut s, "fog");
                 cut_tail(&mut s);
             }
             Self::Coals => {
                 only(&mut s, "coals", "    if (in.layer.z > 2.5) {\n");
                 cut(&mut s, "flame");
+                cut(&mut s, "fog");
+                cut_tail(&mut s);
+            }
+            Self::Fog => {
+                cut(&mut s, "coals");
+                cut(&mut s, "flame");
+                only(&mut s, "fog", "    if (in.layer.z < -1.5) {\n");
                 cut_tail(&mut s);
             }
             Self::ScreenPlain => swap(&mut s, SCREEN_LIGHT, "    let light = in.colour.rgb;\n"),
@@ -249,15 +266,36 @@ pub fn runs(frame: &EffectFrame, use_variants: bool) -> (Vec<Run>, RunStats) {
     let (over, screened) = (frame.over, frame.screened);
     let mut out: Vec<Run> = Vec::new();
     let mut stats = RunStats::default();
-    if !use_variants {
-        if over > 0 {
-            out.push(Run { variant: FxVariant::Union, first: 0, count: over });
+    // A FOG SLAB keeps its own shader whatever else is merged: the union
+    // carries none of it. Its runs are cut out of any stretch drawn by the
+    // union (few: one slab a placed fog).
+    let fog = |i: u32| FxVariant::of(&frame.instances[i as usize], false) == FxVariant::Fog;
+    let union_of = |first: u32, end: u32, out: &mut Vec<Run>, stats: &mut RunStats| {
+        let mut start = first;
+        for i in first..end {
+            if fog(i) {
+                if i > start {
+                    stats.union_instances += i - start;
+                    out.push(Run { variant: FxVariant::Union, first: start, count: i - start });
+                }
+                match out.last_mut() {
+                    Some(r) if r.variant == FxVariant::Fog && r.first + r.count == i => r.count += 1,
+                    _ => out.push(Run { variant: FxVariant::Fog, first: i, count: 1 }),
+                }
+                start = i + 1;
+            }
         }
+        if end > start {
+            stats.union_instances += end - start;
+            out.push(Run { variant: FxVariant::Union, first: start, count: end - start });
+        }
+    };
+    if !use_variants {
+        union_of(0, over, &mut out, &mut stats);
         if screened > 0 {
             out.push(Run { variant: FxVariant::ScreenUnion, first: over, count: screened });
         }
         stats.draws = out.len() as u32;
-        stats.union_instances = over;
         return (out, stats);
     }
     let mut kinds: Vec<Run> = Vec::new();
@@ -284,8 +322,7 @@ pub fn runs(frame: &EffectFrame, use_variants: bool) -> (Vec<Run>, RunStats) {
             1 => out.push(kinds[from]),
             _ => {
                 let (first, end) = (kinds[from].first, kinds[to - 1].first + kinds[to - 1].count);
-                stats.union_instances += end - first;
-                out.push(Run { variant: FxVariant::Union, first, count: end - first });
+                union_of(first, end, out, stats);
             }
         };
         let mut next = 0;

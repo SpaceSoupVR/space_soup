@@ -2359,6 +2359,11 @@ impl XrRenderer {
     /// `Levers::opaque_models` is on. `None` -- draw with the blended one --
     /// with the lever off, in the stereo pass (which has none), or for a body
     /// traced wet as before. See `mesh_pipeline::opaque_target`.
+    /// The body's depth prepass, `[opaque part, see-through part]`, while
+    /// `Levers::body_prepass` is on; none in the stereo pass.
+    fn sp_body_prepass(&self, stereo: bool) -> Option<&[wgpu::RenderPipeline; 2]> {
+        (self.levers.body_prepass && !stereo).then_some(self.skinned_mesh_pipeline.prepass.as_ref()).flatten()
+    }
     fn sp_solid_opaque(&self, stereo: bool) -> Option<&wgpu::RenderPipeline> {
         (self.levers.opaque_models && !stereo).then_some(self.solid_pipeline.opaque.as_ref()).flatten()
     }

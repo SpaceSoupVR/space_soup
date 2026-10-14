@@ -256,9 +256,10 @@ pub fn layers(facing: f32, flat: f32, lo: Vec3, hi: Vec3, v: Vec3) -> f32 {
 }
 
 /// What a box of particles fills in these eyes, megapixel-layers: each eye's
-/// covered pixels times the layers along its line to the box's middle, and
-/// `points` the 1.5 pixel floor each where the box is in view at all.
-pub fn seen_fill(eyes: &[Eye], lo: Vec3, hi: Vec3, facing: f32, flat: f32, points: f32) -> f32 {
+/// covered pixels times the layers along its line to the box's middle,
+/// `points` the 1.5 pixel floor each where the box is in view at all, and
+/// `volumes` fog slabs (`sprite_fog`) one layer each over all it covers.
+pub fn seen_fill(eyes: &[Eye], lo: Vec3, hi: Vec3, facing: f32, flat: f32, points: f32, volumes: f32) -> f32 {
     let mid = 0.5 * (lo + hi);
     eyes.iter()
         .map(|e| {
@@ -267,7 +268,7 @@ pub fn seen_fill(eyes: &[Eye], lo: Vec3, hi: Vec3, facing: f32, flat: f32, point
                 return 0.0;
             }
             let v = (mid - e.at).try_normalize().unwrap_or(e.forward);
-            px * layers(facing, flat, lo, hi, v) + points.max(0.0) * POINT_PIXELS
+            px * (layers(facing, flat, lo, hi, v) + volumes.max(0.0)) + points.max(0.0) * POINT_PIXELS
         })
         .sum::<f32>()
         / 1e6
@@ -303,7 +304,7 @@ mod tests {
         let area = 0.5;
         let eye = Eye::looking(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO);
         let (lo, hi) = (Vec3::splat(-0.25), Vec3::splat(0.25));
-        let fill = seen_fill(&[eye], lo, hi, area, 0.0, 0.0);
+        let fill = seen_fill(&[eye], lo, hi, area, 0.0, 0.0, 0.0);
         // Each particle at 10 m: its area x (focal / distance)^2.
         let first = area * (REFERENCE_FOCAL_PIXELS / 10.0).powi(2) / 1e6;
         assert!((fill / first - 1.0).abs() < 0.08, "{fill} against {first}");

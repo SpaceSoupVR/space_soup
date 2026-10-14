@@ -167,7 +167,13 @@ pub enum Shade {
     Emissive { radiance: f32, colour: Vec3, own: bool },
     /// Screened: light through the heat ramp.
     EmissiveHeat { radiance: f32, colour: Vec3, own: bool },
+    /// Over: a height-fog slab (`sprite_fog`), one instance its whole box.
+    Fog { density: f32, height: f32, falloff: f32, edge: f32, wind: Vec3 },
 }
+
+/// `EffectInstance::params.w` of a fog slab: what the vertex stage builds its
+/// box's covering quad by and `fs_over` integrates it by (`variants::FxVariant::Fog`).
+pub const SHADE_FOG: f32 = -2.0;
 
 impl Shade {
     pub fn screened(&self) -> bool {
@@ -425,6 +431,11 @@ fn compile_emitter(a: &EffectAsset, e: &EmitterDef, books: &[BookInfo]) -> Resul
                 book = Some(find(b)?);
             }
             RenderModule::SpriteFlame { .. } | RenderModule::SpriteBed { .. } => return Err("sprite_flame and sprite_bed draw only the built-in templates' emitters".into()),
+            RenderModule::SpriteFog { density, height, falloff, edge, wind } => {
+                shade = Some(Shade::Fog { density: *density, height: *height, falloff: *falloff, edge: *edge, wind: Vec3::from(*wind) });
+                // (No book: the slab is drawn from its box.)
+                book = Some(books.first().copied().ok_or("no books")?);
+            }
             RenderModule::Placement { mode, streak_seconds: s } => (placement, streak_seconds) = (*mode, *s),
             RenderModule::Flipbook { play: p } => play = *p,
             RenderModule::SoftDepth { metres } => soft = *metres,
@@ -473,6 +484,11 @@ const LOBE_ENERGY_MOST: f32 = 2.2;
 /// sideways. The box an effect's fill is seen through (`seen`), and
 /// conservative as the reach is: drag, air and jitter at their most.
 pub(crate) fn emitter_extent(e: &EmitterDef) -> asset::Extent {
+    // A fog slab is its box: its disc across, its height up.
+    if let Some(height) = e.render.iter().find_map(|m| if let RenderModule::SpriteFog { height, .. } = m { Some(*height) } else { None }) {
+        let lateral = e.initialize.iter().find_map(|m| if let InitModule::ShapeDisc { radius, .. } = m { Some(*radius) } else { None }).unwrap_or(0.0);
+        return asset::Extent { lateral, below: 0.0, above: height };
+    }
     let (mut size_most, mut size_scale, mut speed_most, mut life_most) = (0.0f32, 1.0f32, 0.0f32, 0.0f32);
     let (mut lateral, mut vertical) = (0.0f32, 0.0f32);
     let mut cone: Option<f32> = None;
@@ -680,6 +696,10 @@ pub struct Placed {
     /// metres: what a disc that fills its object (`shape_disc`
     /// `fills_object`) spans, its rate grown with the area. 0 for none.
     pub footprint: [f32; 2],
+    /// How strong this one is, a multiple of its asset's: a fog slab's
+    /// density (`sprite_fog`), so one pond's mist can be thinner than
+    /// another's from the same asset. The scene effect's `intensity`.
+    pub strength: f32,
 }
 
 impl Placed {
@@ -701,7 +721,7 @@ impl Placed {
 
 impl Default for Placed {
     fn default() -> Self {
-        Self { scale: 1.0, rate: 1.0, tint: [1.0; 3], sunlit: 0.0, footprint: [0.0; 2] }
+        Self { scale: 1.0, rate: 1.0, tint: [1.0; 3], sunlit: 0.0, footprint: [0.0; 2], strength: 1.0 }
     }
 }
 
@@ -803,6 +823,11 @@ pub struct BurstSet {
     /// (`effects::simulate_governed` measures them): what it is weighed by
     /// on the next frame.
     pub splash_measured: std::collections::HashMap<u64, (f32, f32)>,
+    /// The hour, while a time of day runs (`XrRenderer::time_of_day_hour`),
+    /// set each frame: a fog slab's density follows the air's readiness for
+    /// mist at it ([`super::mist_conditions`]). `None`, a level's fixed sky,
+    /// keeps the density as authored.
+    pub mist_hour: Option<f32>,
 }
 
 /// The estimated fill of the bursts in view, megapixel-layers, and their
@@ -1133,9 +1158,10 @@ impl LiveBurst {
         let facing: f32 = lasting().filter(|e| !e.flat).map(|e| e.area).sum();
         let flat: f32 = lasting().filter(|e| e.flat).map(|e| e.area).sum();
         let points: u32 = lasting().map(|e| e.points).sum();
-        let fill = super::seen::seen_fill(&eyes, lo, hi, facing * grown, flat * grown, points as f32 * placed.rate * fills);
-        let count: u32 = lasting().map(|e| e.instances).sum();
-        (fill, count as f32 * placed.rate * fills)
+        let volumes = lasting().filter(|e| e.volume).count() as f32;
+        let fill = super::seen::seen_fill(&eyes, lo, hi, facing * grown, flat * grown, points as f32 * placed.rate * fills, volumes);
+        let count: u32 = lasting().filter(|e| !e.volume).map(|e| e.instances).sum();
+        (fill, count as f32 * placed.rate * fills + volumes)
     }
 
     /// THE BOX ITS PARTICLES ARE SEEN THROUGH (`seen`), world frame: its
@@ -1275,6 +1301,9 @@ struct Ctx<'a> {
     sun: Option<(Vec3, Vec3)>,
     /// A placed effect's object footprint ([`Placed::footprint`]).
     footprint: Option<[f32; 2]>,
+    /// A fog slab's density, as a multiple of its asset's: its object's
+    /// [`Placed::strength`] times the hour's [`super::mist_conditions`].
+    mist: f32,
 }
 
 /// The particle record a program's steps read and write.
@@ -1304,6 +1333,47 @@ struct P {
 }
 
 impl Program {
+    /// A FOG SLAB (`sprite_fog`) as the GPU draws it: one instance carrying its
+    /// box (centre and half sizes, player frame, its x the world's turned by
+    /// the yaw), its density, falloff and soft edge, its light (the room's or
+    /// sky's even light and its lamps at its middle, the sun by `sunlit` with
+    /// its way, for the shader's phase), its wind's drift so far and the
+    /// wind's way across it, and the wind as its motion (SpaceWarp). Its box
+    /// spans its object's footprint where its disc fills it, else its disc.
+    fn fog(&self, cx: &Ctx) -> Option<EffectInstance> {
+        let Shade::Fog { density, height, falloff, edge, wind } = self.shade else { return None };
+        let at = cx.at;
+        let radius = self.steps.iter().find_map(|s| if let Step::Disc(r, _) = s { Some(*r) } else { None }).unwrap_or(1.0);
+        let [hx, hz] = match (self.fills_disc > 0.0, cx.footprint) {
+            (true, Some(f)) => f,
+            _ => [radius, radius],
+        };
+        let centre = at.yaw_inv * (cx.origin + Vec3::Y * (0.5 * height) - at.offset);
+        let (g, albedo, share) = self.steps.iter().find_map(|s| if let Step::Light { g, albedo, ambient, .. } = s { Some((*g, *albedo, *ambient)) } else { None }).unwrap_or((0.5, Vec3::ONE, 1.0));
+        let mut even = cx.ambient * share;
+        for &li in cx.lamps {
+            if let Some((c, _)) = lamp_at(&at.lights[li], centre) {
+                even += c * (cx.own)(&at.lights[li]);
+            }
+        }
+        let a = albedo * at.exposure * cx.tint;
+        let (sun, toward) = cx.sun.unwrap_or((Vec3::ZERO, Vec3::Y));
+        let (even, sun) = (even * a, sun * a);
+        let x = at.yaw_inv * Vec3::X;
+        let speed = (wind.x * wind.x + wind.z * wind.z).sqrt();
+        let drift = ((speed as f64 * cx.time).rem_euclid(10_000.0)) as f32;
+        let moving = at.yaw_inv * wind;
+        Some(EffectInstance {
+            centre: [centre.x, centre.y, centre.z, edge],
+            colour: [even.x, even.y, even.z, density * cx.mist],
+            light: [sun.x, sun.y, sun.z, wind.z.atan2(wind.x)],
+            light_dir: [toward.x, toward.y, toward.z, 0.0],
+            axis: [hx, 0.5 * height, hz, falloff],
+            params: [x.z.atan2(x.x), g.clamp(0.0, 0.95), drift, SHADE_FOG],
+            motion: [moving.x, moving.y, moving.z, 0.0],
+        })
+    }
+
     /// One particle at `age` of its life, as the GPU draws it.
     fn particle(&self, cx: &Ctx, index: u32, age: f32, u: [f32; 12]) -> Option<EffectInstance> {
         use std::f32::consts::TAU;
@@ -1565,6 +1635,7 @@ impl Program {
                     }
                 }
             }
+            Shade::Fog { .. } => return None,
             Shade::Emissive { radiance, colour, own } | Shade::EmissiveHeat { radiance, colour, own } => {
                 // As the eye adapted to it sees it, or -- too brief for that --
                 // as the eye in this room does.
@@ -1693,6 +1764,7 @@ pub(super) fn simulate_bursts(
                 tint: Vec3::from(placed.tint),
                 sun,
                 footprint: placed.footprint(),
+                mist: placed.strength.max(0.0) * set.mist_hour.map_or(1.0, super::mist_conditions),
             };
             let own_seed = hash64(seed ^ (k as u64 + 1).wrapping_mul(0x632b_e59b_d9b4_e019));
             // Each burst sheds in an order of its own: a row of them thinned
@@ -1707,6 +1779,15 @@ pub(super) fn simulate_bursts(
                     over.push(((Vec3::from_slice(&inst.centre[..3]) - at.head).length_squared(), inst));
                 }
             };
+            // A FOG SLAB: one instance, its whole box, while it stands.
+            if let Shade::Fog { .. } = p.shade {
+                if l.share > 0.0 {
+                    if let Some(inst) = p.fog(&cx) {
+                        push(inst, &mut count);
+                    }
+                }
+                continue;
+            }
             match &p.spawn {
                 Spawn::Burst { count: n, .. } => {
                     let one_frame = p.life.is_none();
@@ -2050,7 +2131,7 @@ pub(crate) mod tests {
         let Some(lib) = shipped() else { return };
         let at = seen_from(Vec3::new(0.3, 1.5, 1.2), 1.0);
         for name in lib.names().map(str::to_string).collect::<Vec<_>>() {
-            let (mut moving, mut found, mut seen) = (0, 0, 0);
+            let (mut moving, mut found, mut seen, mut slabs) = (0, 0, 0, 0);
             for seed in 0..12u64 {
                 let recoil = Vec3::new(0.1, 0.6, 1.5);
                 let b = EffectBurst { velocity: recoil, inputs: [0.6, 0.0, 0.0, 0.0], ..shot(&lib, &name, seed) };
@@ -2073,6 +2154,15 @@ pub(crate) mod tests {
                             assert_eq!(v, recoil, "{name}: a flash rides its muzzle");
                             continue;
                         }
+                        if i.params[3] == SHADE_FOG {
+                            // A fog slab stands; its motion is its wind's drift
+                            // across it, which its texture follows.
+                            let c = lib.get(lib.id(&name).unwrap()).unwrap();
+                            let wind = c.programs.iter().find_map(|p| if let Shade::Fog { wind, .. } = p.shade { Some(wind) } else { None }).unwrap();
+                            assert!((v - at.yaw_inv * wind).length() < 1e-5, "{name}: its motion is its wind");
+                            slabs += 1;
+                            continue;
+                        }
                         seen += 1;
                         // (A millimetre a second: a pond's mist drifts at a few.)
                         if v.length() < 0.001 {
@@ -2087,9 +2177,54 @@ pub(crate) mod tests {
             }
             // Ten at least, or all of them: a slow stream (pond_mist, one a
             // second) has only a handful in the first 0.7 s after it starts.
-            assert!(moving >= 10.min(seen) && seen > 0, "{name}: {moving} of {seen} moving");
+            assert!(moving >= 10.min(seen) && (seen > 0 || slabs > 0), "{name}: {moving} of {seen} moving");
             assert!(found as f32 >= 0.95 * moving as f32, "{name}: {found} of {moving} found where their velocity took them");
         }
+    }
+
+    /// A FOG SLAB (`sprite_fog`, the pond's `pond_fog`): one instance however
+    /// long it stands, its box the object's footprint and its height, drawn by
+    /// the fog variant, and weighed by the governor as ONE layer over all its
+    /// box covers in the eyes -- not by any particle count. Its density is the
+    /// asset's times its object's strength, and times the hour's
+    /// `mist_conditions` while a time of day runs (none: as authored).
+    #[test]
+    fn a_fog_slab_is_one_instance_spanning_its_object_weighed_as_one_layer() {
+        let Some(text) = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/effects/pond_fog.json")).ok() else { return };
+        let mut lib = EffectLibrary::new();
+        lib.add(&EffectAsset::parse(&text).unwrap()).unwrap();
+        let id = lib.id("pond_fog").unwrap();
+        let head = Vec3::new(0.0, 1.6, 9.0);
+        let at = seen_from(head, 1.0);
+        let mut set = BurstSet::default();
+        set.place(&lib, id, Vec3::new(0.0, -0.37, 0.0), Vec3::Y, 3, Placed { footprint: [6.0, 3.0], sunlit: 1.0, strength: 0.5, ..Placed::default() });
+        let Shade::Fog { density, height, .. } = lib.get(id).unwrap().programs[0].shade else { panic!("pond_fog's program is its slab") };
+        for t in [0.0, 5.0, 300.0] {
+            let f = frame(&lib, &mut set, t, &at);
+            assert_eq!((f.over, f.screened), (1, 0), "one slab at {t} s");
+            let i = f.instances[0];
+            assert_eq!(i.params[3], SHADE_FOG);
+            assert_eq!(super::super::variants::FxVariant::of(&i, false), super::super::variants::FxVariant::Fog);
+            assert!((i.colour[3] - 0.5 * density).abs() < 1e-6, "half strength: {}", i.colour[3]);
+            assert!((i.axis[0] - 6.0).abs() < 1e-5 && (i.axis[2] - 3.0).abs() < 1e-5 && (i.axis[1] - 0.5 * height).abs() < 1e-5, "{:?}", i.axis);
+            assert!((i.centre[1] - (-0.37 + 0.5 * height)).abs() < 1e-5);
+        }
+        // The hour: thickest at dawn, all but gone at midday.
+        for (hour, k) in [(6.0, 1.0), (13.0, super::super::mist_conditions(13.0))] {
+            set.mist_hour = Some(hour);
+            let f = frame(&lib, &mut set, 301.0, &at);
+            assert!((f.instances[0].colour[3] - 0.5 * density * k).abs() < 1e-6, "at {hour}h");
+        }
+        assert!(super::super::mist_conditions(13.0) < 0.06);
+        set.mist_hour = None;
+        // Weighed as one layer over its box: twice the box's pixels, both eyes.
+        let l = set.live.iter().find(|l| l.standing.is_some()).unwrap();
+        let c = lib.get(id).unwrap();
+        let (fill, count) = l.seen_cost(c, &[], head);
+        let (lo, hi) = (Vec3::new(-6.0, -0.37, -3.0), Vec3::new(6.0, -0.37 + height, 3.0));
+        let px = super::super::seen::Eye::looking(head, 0.5 * (lo + hi)).pixels(lo, hi);
+        assert!((fill - 2.0 * px / 1e6).abs() < 1e-3, "{fill} against {}", 2.0 * px / 1e6);
+        assert_eq!(count, 1.0);
     }
 
     /// A BURST OUT OF SIGHT, OUT OF RANGE OR TOO SMALL TO SEE costs a bounds
@@ -2245,6 +2380,7 @@ pub(crate) mod tests {
         // The effect authored in the editor (2026-10-14), placed as a scene's object places it.
         let steam = read("steam_vent").unwrap_or_default();
         let mist = read("pond_mist").unwrap_or_default();
+        let fog = read("pond_fog").unwrap_or_default();
         let yaw = 0.4f32;
         let offset = Vec3::new(0.5, 0.0, -0.2);
         let lamp = Light {
@@ -2288,7 +2424,7 @@ pub(crate) mod tests {
                 vec![VENT],
                 1.2,
                 Vec3::new(0.0, 1.6, 2.0),
-                vec![(0, "test_vent", Vec3::new(0.2, 0.0, -0.5), Vec3::Y, None, [0.0; 4], 77, 0, Some(Placed { scale: 1.5, rate: 0.8, tint: [1.0, 0.9, 0.8], sunlit: 0.0, footprint: [0.0; 2] }))],
+                vec![(0, "test_vent", Vec3::new(0.2, 0.0, -0.5), Vec3::Y, None, [0.0; 4], 77, 0, Some(Placed { scale: 1.5, rate: 0.8, tint: [1.0, 0.9, 0.8], sunlit: 0.0, footprint: [0.0; 2], strength: 1.0 }))],
                 vec![0.0, 0.5, 30.0, 30.0 + 1.0 / 36.0, 700.25],
             ),
             ("muzzle_556_a2", vec![], 4.0, Vec3::new(0.0, 1.6, 0.0), vec![shot(0, "muzzle_556_a2", 5, 0.3)], vec![2.0, 2.0 + 1.0 / 72.0, 2.3, 3.0]),
@@ -2310,10 +2446,19 @@ pub(crate) mod tests {
                 vec![(0, "pond_mist", Vec3::new(0.0, -0.3, 0.0), Vec3::Y, None, [0.0; 4], 7, 0, Some(Placed { sunlit: 0.8, footprint: [6.0, 3.0], ..Placed::default() }))],
                 vec![0.0, 1.0 / 36.0, 12.0, 40.0],
             ),
+            (
+                // The height-fog slab, its box the object's footprint, drifting.
+                "pond_fog",
+                vec![],
+                1.2,
+                Vec3::new(0.0, 1.6, 6.0),
+                vec![(0, "pond_fog", Vec3::new(0.0, -0.37, 0.0), Vec3::Y, None, [0.0; 4], 7, 0, Some(Placed { sunlit: 0.8, footprint: [5.0, 3.5], ..Placed::default() }))],
+                vec![0.0, 1.0 / 36.0, 12.0, 400.5],
+            ),
         ];
         for (name, extra, exposure, head, events, times) in specs {
             let mut texts: Vec<String> = extra.iter().map(|t| t.to_string()).collect();
-            texts.extend([&rifle, &pistol, &quiet, &steam, &mist].into_iter().filter(|t| t.contains(&format!("\"name\": \"{name}\""))).cloned());
+            texts.extend([&rifle, &pistol, &quiet, &steam, &mist, &fog].into_iter().filter(|t| t.contains(&format!("\"name\": \"{name}\""))).cloned());
             if texts.is_empty() {
                 continue; // (an effect not in this game/effects)
             }
@@ -2348,7 +2493,7 @@ pub(crate) mod tests {
                 "events": events.iter().map(|e| json!({
                     "frame": e.0, "asset": e.1, "position": v3(e.2), "direction": v3(e.3), "port": e.4.map(|(p, d)| json!([v3(p), v3(d)])),
                     "inputs": e.5, "source": e.6.to_string(), "seed": e.7.to_string(), "velocity": [0.0, 0.2, 0.4], "up": v3(Vec3::new(0.1, 1.0, 0.0).normalize()),
-                    "placed": e.8.map(|p| json!({ "scale": p.scale, "rate": p.rate, "tint": p.tint, "sunlit": p.sunlit, "footprint": p.footprint })),
+                    "placed": e.8.map(|p| json!({ "scale": p.scale, "rate": p.rate, "tint": p.tint, "sunlit": p.sunlit, "footprint": p.footprint, "strength": p.strength })),
                 })).collect::<Vec<_>>(),
                 "frames": frames,
             }));
