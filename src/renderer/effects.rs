@@ -4918,58 +4918,58 @@ fn fx_depth_fade(in: VOut) -> f32 {
     return clamp((scene - in.at.w) / in.soft, 0.0, 1.0);
 }
 
-// A FOG SLAB'S PIXEL (`sprite_fog`): its density, `colour.a` a metre at the
-// box's bottom, along this pixel's line of sight from where it enters the box
-// to where it leaves it or meets the scene's depth (a bank, the shore: so it
-// thins to nothing where it meets them), in FOG_STEPS stretches. In each, its
-// density falls by e every `fog_b.w` metres up times a local thickness (a
-// streak stands a little taller than the layer), INTEGRATED
-// EXACTLY over the stretch, times what is there at the middle of its density
-// (near the water for a line looking down, so the strands stay sharp):
+// A FOG SLAB'S PIXEL (`sprite_fog`): MIST HOVERING IN TUFTS. Its box stands
+// on the water (its bottom the surface); along this pixel's line of sight,
+// from where it enters the box to where it leaves it or meets the scene's
+// depth (a bank, the shore), its density is summed over FOG_STEPS even
+// stretches, each read at its middle: `colour.a` a metre inside a tuft, times
 // - where it lies: the ellipse its box's footprint holds (a pond's water,
 //   the object sized to it), thinning to nothing `fog_a.w` metres in from its
-//   rim -- so the mist hugs the water and never climbs the bank;
-// - its wisps (`fx_fog_wisps`): an even layer with many fine streaks along
-//   the wind (`soft`, the wind's way across the box; `flicker`, how far it
-//   has drifted);
-// - its top: gone well before the box's (`1 - smoothstep` over its upper
-//   two-fifths), so no plane is ever seen.
+//   rim -- so the mist stays over the water;
+// - its tufts (`fx_fog_tuft`): a 3D billow noise, rounded about a band 3/8
+//   of the box up and `fog_b.w` metres either side of it, so the layer
+//   hovers (clear just over the water, soft bottom and top);
 // Seen through it, `1 - e^-depth` of what is behind is hidden. Lit by its even
 // light (`colour.rgb`) and the sun (`light`) through Henyey-Greenstein toward
 // it (`light_q`, `layer.y` its g), as `light_cpu` lights a mote
-// (`effects::henyey_greenstein`), the phase evening out as it thickens.
-const FOG_TILE: f32 = 0.3;
-const FOG_STRETCH: f32 = 5.0;
-const FOG_STEPS: i32 = 6;
+// (`effects::henyey_greenstein`), the phase evening out as it thickens, and
+// brighter at a tuft's top than under it (the sky above, the water below).
+const FOG_TILE: f32 = 0.42;
+const FOG_STEPS: i32 = 10;
 
-// Its wisps at a point of the box (its own frame) for the wind's way `wind`
-// and drift `drift`, over a stretch `blur` metres across the ground: x how
-// much is there, y how tall it stands (a multiple of its falloff). MOSTLY AN
-// EVEN LAYER (0.55 of the most everywhere) with many fine STREAKS along the
-// wind: the ridges of two noises FOG_TILE and 1.9 x that across the wind
-// (streaks some 0.3 to 1 m wide), FOG_STRETCH times longer along it, bent by
-// a gentle meander under a streak's width (no swirls) that also swells and
-// thins them by +-20%; a streak stands a little taller (0.85 to 1.25). A
-// streak finer than its stretch would be read at points too far apart --
-// straight stripes as they slide along the ray -- so the whole gives way to
-// its mean (FOG_MEAN, x its mist, y its height weighted by it): a long
-// grazing line of sight sees the layer averaged, as it would.
-const FOG_MEAN: vec2<f32> = vec2<f32>(0.89, 1.08);
-fn fx_fog_wisps(m: vec2<f32>, wind: vec2<f32>, drift: f32, blur: f32) -> vec2<f32> {
-    let a = vec2<f32>(dot(m, wind) - drift, dot(m, vec2<f32>(-wind.y, wind.x)));
-    let c = fx_fog_noise(vec2<f32>(a.x / (6.0 * FOG_STRETCH), a.y / 6.0) / FOG_TILE);
-    let y = a.y + 2.1 * FOG_TILE * (c - 0.5);
-    let n1 = fx_fog_noise(vec2<f32>(a.x / (FOG_STRETCH * FOG_TILE) + 3.0, y / FOG_TILE));
-    let n2 = fx_fog_noise(vec2<f32>(a.x / (1.9 * FOG_STRETCH * FOG_TILE) + 11.0, y / (1.9 * FOG_TILE) + 5.0));
-    let streak = smoothstep(0.35, 0.9, 0.55 * (1.0 - abs(2.0 * n1 - 1.0)) + 0.45 * (1.0 - abs(2.0 * n2 - 1.0)));
-    let wisp = vec2<f32>(0.55 + 0.9 * streak * (0.6 + 0.4 * c), 0.85 + 0.4 * streak);
-    return mix(wisp, FOG_MEAN, smoothstep(0.6, 2.0, blur / FOG_TILE));
+// A gyroid: smooth, isotropic enough once turned, and four trig vectors.
+fn fx_fog_gyroid(p: vec3<f32>) -> f32 {
+    return dot(sin(p), cos(p.yzx));
 }
 
-// Smooth, low-frequency and without a grid: two waves each warped by the
-// other's axis, in [0, 1]. Cheaper than lattice noise by half the proxy.
-fn fx_fog_noise(p: vec2<f32>) -> f32 {
-    return 0.5 + 0.25 * (sin(p.x * 1.7 + sin(p.y * 1.3)) + sin(p.y * 1.9 + 1.7 * sin(p.x * 0.9)));
+// HOW MUCH TUFT at a point `m` of the box (its own frame, `y` up from the
+// water), for a box `tall` metres high and a band `half` metres either side
+// of its middle, the wind's way `wind`, how far it has drifted `drift`, and a
+// stretch `blur` metres long: 0 to 1. Three gyroids turned off the grid:
+// - CLUSTERS 2.6x the tufts across (5x tall), where the tufts gather, the
+//   water clear between;
+// - TUFTS FOG_TILE across (puffs some 0.5 to 2 m), their domain bent by
+//   a slow warp so they round off and billow;
+// - FINE billows half again smaller, which give way to nothing over a
+//   stretch longer than they are (else they alias);
+// all drifting with the wind, and EVOLVING: the tufts' domain rises and the
+// warp turns as the drift goes on (1.2 per metre drifted, ~0.17 a second at
+// the pond's wind), so they slowly change shape as they go. Their sum, less
+// how far `y` is from the band's middle (squared, in bands), is cut by a
+// soft threshold: rounded tops and bottoms, clear gaps.
+const FOG_TURN: mat3x3<f32> = mat3x3<f32>(vec3<f32>(0.8, -0.6, 0.0), vec3<f32>(0.36, 0.48, 0.8), vec3<f32>(-0.48, -0.64, 0.6));
+fn fx_fog_tuft(m: vec3<f32>, tall: f32, half: f32, wind: vec2<f32>, drift: f32, blur: f32) -> f32 {
+    let t = 1.2 * drift;
+    let at = vec3<f32>(m.x - wind.x * drift, m.y, m.z - wind.y * drift);
+    let c = fx_fog_gyroid(FOG_TURN * vec3<f32>(at.x / (2.6 * FOG_TILE) + 1.0, at.y / (5.0 * FOG_TILE) + 0.2 * t, at.z / (2.6 * FOG_TILE) - 2.0));
+    var p = FOG_TURN * vec3<f32>(at.x / FOG_TILE, at.y / FOG_TILE + 0.3 * t, at.z / FOG_TILE);
+    p += 0.45 * sin(vec3<f32>(0.9 * p.y + 0.5 * t, 0.8 * p.z + 1.0, 0.7 * p.x - 0.4 * t));
+    let n1 = fx_fog_gyroid(p);
+    let n2 = fx_fog_gyroid(FOG_TURN * (2.3 * p.zxy + vec3<f32>(5.0, 0.6 * t, 3.0)));
+    let band = (m.y - 0.375 * tall) / max(half, 1e-3);
+    let n = 0.5 * n1 + 0.3 * n2 * (1.0 - smoothstep(0.3, 0.8, blur)) + 0.45 * c - band * band;
+    let guard = smoothstep(0.025 * tall, 0.125 * tall, m.y) * (1.0 - smoothstep(0.8 * tall, tall, m.y));
+    return guard * smoothstep(0.1, 0.95, n);
 }
 
 fn fx_fog(in: VOut) -> vec4<f32> {
@@ -5004,43 +5004,24 @@ fn fx_fog(in: VOut) -> vec4<f32> {
     if (t1 <= t0) {
         return vec4<f32>(0.0);
     }
-    let fall = max(in.fog_b.w, 0.01);
+    let half = max(in.fog_b.w, 0.01);
     let wind = vec2<f32>(cos(in.soft), sin(in.soft));
     let rim = in.fog_a.w / max(min(h.x, h.z), 1e-3);
-    // Stretches of EQUAL MIST, not equal length: for a line looking down
-    // they crowd into the few centimetres over the water that hold its mist
-    // (each a few centimetres across the ground, so its strands stay sharp);
-    // for a level one they are even. `u` of its mist (as its mean thickness
-    // has it) lies `-ln(1 - u (1 - e^-k)) / k` of the way along.
-    let len = t1 - t0;
-    let k = clamp(ld.y * len / (fall * FOG_MEAN.y), -30.0, 30.0);
-    let e = 1.0 - exp(-k);
-    let level = abs(k) < 1e-3;
-    var sa = 0.0;
+    let span = (t1 - t0) / f32(FOG_STEPS);
+    let blur = span / FOG_TILE;
     var depth = 0.0;
+    var top = 0.0;
     for (var i = 0; i < FOG_STEPS; i++) {
-        let u = f32(i + 1) / f32(FOG_STEPS);
-        let um = (f32(i) + 0.5) / f32(FOG_STEPS);
-        let sb = select(-log(max(1.0 - u * e, 1e-6)) / k, u, level);
-        let sm = select(-log(max(1.0 - um * e, 1e-6)) / k, um, level);
-        let ta = t0 + sa * len;
-        let span = (sb - sa) * len;
-        sa = sb;
-        // Read at the middle of its mist; blurred by how far it runs across
-        // the ground.
-        let m = lo + ld * (t0 + sm * len);
+        let m = lo + ld * (t0 + (f32(i) + 0.5) * span);
         let lies = 1.0 - smoothstep(1.0 - rim, 1.0, length(m.xz / max(h.xz, vec2<f32>(1e-3))));
-        let top = 1.0 - smoothstep(1.2 * h.y, 2.0 * h.y, m.y + h.y);
-        let wisp = fx_fog_wisps(m.xz, wind, in.flicker, span * length(ld.xz));
-        let f = fall * wisp.y;
-        let y = lo.y + h.y + ld.y * ta;
-        let dy = ld.y * span;
-        var seg = span * exp(-y / f);
-        if (abs(dy) > 1e-4 * f) {
-            seg = span * f / dy * (exp(-y / f) - exp(-(y + dy) / f));
-        }
-        depth += seg * lies * top * wisp.x;
+        let up = m.y + h.y;
+        let k = span * lies * fx_fog_tuft(vec3<f32>(m.x, up, m.z), 2.0 * h.y, half, wind, in.flicker, blur);
+        depth += k;
+        top += k * clamp(up / (1.5 * h.y), 0.0, 1.0);
     }
+    // Lit from above: a tuft's top a little brighter than the even light, its
+    // underside darker.
+    let lit = 0.7 + 0.45 * top / max(depth, 1e-6);
     depth *= in.colour.a;
     let alpha = 1.0 - exp(-depth);
     let g = in.layer.y;
@@ -5051,7 +5032,7 @@ fn fx_fog(in: VOut) -> vec4<f32> {
     let hg = min((1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * cosine, 1e-4), 1.5), 12.0);
     let g4 = 0.25 * g;
     let hg4 = (1.0 - g4 * g4) / pow(max(1.0 + g4 * g4 - 2.0 * g4 * cosine, 1e-4), 1.5);
-    let shown = aces_fitted(in.colour.rgb + in.light * mix(hg, hg4, alpha));
+    let shown = aces_fitted(lit * (in.colour.rgb + in.light * mix(hg, hg4, alpha)));
     return vec4<f32>(shown * alpha, alpha);
 }
 
