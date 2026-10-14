@@ -3637,6 +3637,114 @@ mod render_tests {
         assert_eq!(m.pass, spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range));
     }
 
+    /// An axis-aligned box's faces, each wound to face OUT (the shadow pass
+    /// culls back faces).
+    fn cuboid(lo: Vec3, hi: Vec3) -> (Vec<SolidVertex>, Vec<u32>) {
+        let (mut v, mut idx) = (Vec::new(), Vec::new());
+        for axis in 0..3 {
+            for side in [0.0f32, 1.0] {
+                let mut n = Vec3::ZERO;
+                n[axis] = if side > 0.5 { 1.0 } else { -1.0 };
+                let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+                let corner = |a: f32, b: f32| {
+                    let mut p = Vec3::ZERO;
+                    p[axis] = if side > 0.5 { hi[axis] } else { lo[axis] };
+                    p[u] = if a > 0.5 { hi[u] } else { lo[u] };
+                    p[w] = if b > 0.5 { hi[w] } else { lo[w] };
+                    p
+                };
+                let q = [corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0)];
+                let base = v.len() as u32;
+                for p in q {
+                    v.push(vertex(p.into(), n.into()));
+                }
+                let flip = (q[1] - q[0]).cross(q[2] - q[0]).dot(n) < 0.0;
+                let tri: [u32; 6] = if flip { [0, 2, 1, 0, 3, 2] } else { [0, 1, 2, 0, 2, 3] };
+                idx.extend(tri.iter().map(|t| base + t));
+            }
+        }
+        (v, idx)
+    }
+
+    /// THE PILLAR'S TORCH SHADOW ON THE HALL'S FAR CEILING IS WHERE THE RAYS
+    /// PUT IT. Headset 15:26 (2026-10-14): a thin dark line on the ceiling and
+    /// back wall beside the marble pillar, and a lighter strip by it. That is
+    /// the pillar's own shadow, seen nearly edge on because the torch is a hand
+    /// away from the eye, and the strip is the pillar's west face lit at
+    /// grazing -- NOT acne or a leak on a surface the light only grazes (13 deg
+    /// here). The hall's pillar, ceiling and back wall in the torch's own map
+    /// at the headset's tile size; ceiling points either side of the edge
+    /// (clear of the filter's penumbra) against the exact ray test.
+    #[test]
+    fn a_torchs_pillar_shadow_on_the_far_ceiling_is_where_the_rays_put_it() {
+        let pos = Vec3::new(-0.8, 1.25, -4.7);
+        let aim = Vec3::new(0.0, 1.9, -9.0);
+        let lamp = |intensity: f32| Light {
+            position: pos,
+            direction: (aim - pos).normalize(),
+            intensity,
+            ..torch(1.0, Some(0.02))
+        };
+        let (pmin, pmax) = (Vec3::new(-0.45, 0.0, -7.45), Vec3::new(0.45, 3.1, -6.55));
+        let mut caster = cuboid(pmin, pmax);
+        // The ceiling, its underside toward the torch, and the back wall.
+        for (lo, hi) in [(Vec3::new(-3.0, 3.4, -16.0), Vec3::new(3.0, 3.6, 4.0)), (Vec3::new(-3.0, 0.0, -16.2), Vec3::new(3.0, 3.4, -16.0))] {
+            let (v, i) = cuboid(lo, hi);
+            let base = caster.0.len() as u32;
+            caster.0.extend(v);
+            caster.1.extend(i.into_iter().map(|t| base + t));
+        }
+        let eye = Vec3::new(-1.0, 1.6, -4.6);
+        let blocked = |p: Vec3| {
+            // Slab test of the segment from the torch to `p` against the pillar.
+            let d = p - pos;
+            let (mut t0, mut t1) = (0.0f32, 1.0f32);
+            for k in 0..3 {
+                if d[k].abs() < 1e-6 {
+                    if pos[k] < pmin[k] || pos[k] > pmax[k] {
+                        return false;
+                    }
+                    continue;
+                }
+                let (a, b) = ((pmin[k] - pos[k]) / d[k], (pmax[k] - pos[k]) / d[k]);
+                t0 = t0.max(a.min(b));
+                t1 = t1.min(a.max(b));
+            }
+            t0 <= t1
+        };
+        for (z, xs) in [(-9.0f32, [-0.6f32, -0.3, 0.3, 0.9]), (-12.0, [-0.6, -0.3, 0.6, 1.2]), (-15.0, [-0.6, 0.0, 1.0, 1.5])] {
+            for x in xs {
+                let p = Vec3::new(x, 3.399, z);
+                let at = |light: Light, caster| Scene {
+                    lights: vec![light],
+                    caster,
+                    receiver_at: p,
+                    eye_offset: eye - p,
+                    normal: [0.0, -1.0, 0.0],
+                    shadow_dim: QUEST_SHADOW_DIM,
+                    ..floor_under_the_lamp()
+                };
+                let k = 30.0;
+                let unlit = shot!(at(lamp(0.0), None));
+                let open = shot!(at(lamp(k), None));
+                let lit = shot!(at(lamp(k), Some(caster.clone())));
+                let shadowed = blocked(p);
+                eprintln!(
+                    "CEILING z {z:5.1} x {x:5.2}: {}  unlit {:3} open {:3} with shadows {:3}",
+                    if shadowed { "SHADOW" } else { "lit   " },
+                    unlit[0], open[0], lit[0]
+                );
+                assert!(open[0] as i32 > unlit[0] as i32 + 8, "the torch does not reach ({x}, {z}): {open:?} against {unlit:?}");
+                let want = if shadowed { unlit } else { open };
+                assert!(
+                    (lit[0] as i32 - want[0] as i32).abs() <= 3,
+                    "ceiling ({x}, {z}) is {} by the rays but reads {lit:?} (open {open:?}, unlit {unlit:?})",
+                    if shadowed { "in the pillar's shadow" } else { "lit" },
+                );
+            }
+        }
+    }
+
 }
 
 
