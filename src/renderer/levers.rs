@@ -178,9 +178,11 @@ pub struct Levers {
     /// 16 = the player's own whole body, hidden from them (`mirror_only`),
     /// 32 = the rigid meshes' THIN parts (cords, chains, cage wires: see
     /// `mesh::thin_parts`; their solid triangles still cast), 64 = no
-    /// characters' tiles at all (the lamps without a spot slot); and 128
+    /// characters' tiles at all (the lamps without a spot slot); 128
     /// leaves nothing out but draws each spot tile with a scissor as well as
-    /// its viewport. 0, the shipped state, leaves nothing out.
+    /// its viewport; 256 = test_room's hall_pillar alone (the brush triangles
+    /// inside its box), every other brush kept. 0, the shipped state, leaves
+    /// nothing out.
     pub spot_caster_drop: u32,
     /// DIAGNOSIS: both eyes' finished images of the next frame, raw, to the
     /// app's files as `eyecapture_<n>.bin`, each time this changes to a new
