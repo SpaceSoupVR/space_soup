@@ -120,6 +120,23 @@ pub struct GroundInputs<'a> {
     pub settings: &'a TerrainMaterialUniform,
 }
 
+/// HOW FAR IN FROM THE MAP'S EDGE ITS PICTURE GOES OVER TO THE OPEN SHELF,
+/// where the ground lies under a sea (`settings.sea_line`): ONE colour all
+/// round, the mean over the outermost texels of the layers' mean colours as
+/// they lie, level, under the whole sky and the full sun.
+///
+/// WHY (headset, 2026-10-15). Past the map the water reads the bed's light by
+/// clamping to the map's last texel, so every texel of that row was drawn out
+/// to the horizon as a stripe: the island's shadow on the sea floor at the
+/// edge, its comb of lit and shaded ridges, the layers' texture
+/// (`LayerDetail`) -- 5-6 dark "pipes" running out to sea off the island's
+/// sides. Nothing beyond the map shades the shelf, its texture is no longer
+/// the map's to know, and it lies level, not on the rim's own slope. Under 8 m or more of water at test_room's edge;
+/// inside 3 m of the edge the water shows this picture, from 3 to 6 m it
+/// hands over to the drawn bed (`water_pipeline`, `smoothstep(3.0, 6.0,
+/// from_edge)`).
+pub const RIM_FADE_METRES: f32 = 4.0;
+
 /// The picture: `texels` row-major, x fastest, row 0 at `min.y` (world z).
 pub struct GroundMap {
     pub width: u32,
@@ -328,6 +345,7 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
     let sun = inputs.sun.map(|s| (Vec3::from(s.direction).normalize_or_zero(), Vec3::from(s.light_rgb)));
     let mut texels = Vec::with_capacity((size * size) as usize);
     let mut buried = Vec::with_capacity((size * size) as usize);
+    let mut rims: Vec<(usize, f32, Vec3)> = Vec::new();
     let mut top = f32::MIN;
     for j in 0..size {
         for i in 0..size {
@@ -359,11 +377,50 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
                 light += rgb * n.dot(to_sun).max(0.0) * sun_vis;
             }
             let rgb = albedo * light * (1.0 - F0);
+            // THE RIM UNDER A SEA (`RIM_FADE_METRES`): past the map's edge the
+            // water reads the bed by clamping to the map's last texel
+            // (`water_pipeline`'s `bed_at`, `underwater`'s `uw_bed`), so
+            // whatever runs along that row is drawn out to the horizon. Here
+            // the rim goes over to the open shelf: the layers' mean colours,
+            // level, under the whole sky and the full sun -- laid after the fill
+            // under buildings, which would otherwise carry a buried texel's
+            // neighbours back onto it.
+            let from_edge = (extent.x * uv.x.min(1.0 - uv.x)).min(extent.y * uv.y.min(1.0 - uv.y));
+            // (From the outermost texels' centres, which the clamp reads:
+            // those are wholly the shelf.)
+            let rim = (1.0 - smoothstep(0.5 * texel, RIM_FADE_METRES, from_edge)) * ((s.sea_line - y) * 20.0).clamp(0.0, 1.0);
+            if rim > 0.0 {
+                let level = layer_weights(inputs.settings, inputs.splat, uv, y, 0.0);
+                let mean: Vec3 = (0..4).map(|k| means[k] * level[k]).sum();
+                let soaked = (0..4).map(|k| level[k] * s.porosity[k]).sum::<f32>() * ((s.sea_line - y) * 20.0).clamp(0.0, 1.0);
+                let mean = mean + (mean.map(crate::renderer::weather::wet_albedo) - mean) * soaked;
+                // Lying as the shelf past the edge lies (`bed_at`: falling
+                // away at a gentle `SHELF_SLOPE`), level -- not on the slope
+                // the rim texel stands on, which along test_room's west edge
+                // is the island's flank turned from the sun.
+                let mut open = Vec3::from(inputs.sky.evaluate([0.0, 1.0, 0.0]));
+                if let Some((to_sun, rgb)) = sun {
+                    open += rgb * to_sun.y.max(0.0);
+                }
+                rims.push((texels.len(), rim, mean * open * (1.0 - F0)));
+            }
             top = top.max(y);
             texels.push([rgb.x, rgb.y, rgb.z, y]);
         }
     }
     fill_under_buildings(&mut texels, &mut buried, size as usize, size as usize);
+    // ONE shelf all round: the mean of the outermost texels' level colours.
+    // Each texel's own (a rock patch painted to the edge beside sand) would be
+    // drawn out to sea as a band as wide as the patch.
+    let ring: Vec<Vec3> = rims.iter().filter(|r| r.1 > 0.999).map(|r| r.2).collect();
+    if !ring.is_empty() {
+        let shelf = ring.iter().copied().sum::<Vec3>() / ring.len() as f32;
+        for (k, rim, _) in rims {
+            let t = &mut texels[k];
+            let rgb = Vec3::new(t[0], t[1], t[2]).lerp(shelf, rim);
+            (t[0], t[1], t[2]) = (rgb.x, rgb.y, rgb.z);
+        }
+    }
     GroundMap { width: size, height: size, texels, min: g.min, max: g.max, top }
 }
 
@@ -1098,6 +1155,77 @@ mod tests {
         let cliff = map.texels[5 * 10 + 8];
         assert!(plain[1] > plain[0], "the plain is the grass layer: {plain:?}");
         assert!(cliff[0] > cliff[1], "the cliff is the rock layer: {cliff:?}");
+    }
+
+    /// THE SEA FLOOR AT THE MAP'S EDGE CARRIES NO PATTERN TO DRAW OUT TO SEA.
+    /// The water reads the bed past the edge by clamping to the last texel,
+    /// so a row of the island's shadows (here: stripes of shadow across the
+    /// sea floor) or of the layer's texture there was drawn to the horizon as
+    /// long dark "pipes" (headset, 2026-10-15). Under a sea the outermost
+    /// texels are one colour along the edge -- the open shelf -- and ground
+    /// past `RIM_FADE_METRES` keeps its own picture. On dry ground the rim
+    /// is left as it is.
+    #[test]
+    fn the_sea_floor_at_the_maps_edge_is_one_colour_along_it() {
+        // Ridges running out to sea, as the island's flank has: the rim's
+        // own slope turns to and from the sun along the edge.
+        let g = HeightGrid::sample(Vec2::new(-10.0, -10.0), Vec2::new(10.0, 10.0), 81, 81, |x, _| -10.0 + 0.6 * (x * 1.7).sin());
+        let sun = SkySun { direction: [0.6, 0.8, 0.0], light_rgb: [4.0, 4.0, 4.0], texels: 1, energy_fraction: 0.5 };
+        // A textured layer: a checker the map carries at its grain.
+        let checker: Vec<u8> = (0..16).flat_map(|i| if (i % 4 + i / 4) % 2 == 0 { [40, 40, 40, 255] } else { [220, 220, 220, 255] }).collect();
+        let layers = [Some(TerrainImage { width: 4, height: 4, rgba: checker }), Some(TerrainImage { width: 1, height: 1, rgba: vec![60, 50, 30, 255] })];
+        // Painted: sediment-free ground, with a patch of the second layer
+        // reaching the near edge.
+        let splat = TerrainImage {
+            width: 4,
+            height: 4,
+            rgba: (0..16).flat_map(|i| if i == 1 { [0u8, 255, 0, 0] } else { [255u8, 0, 0, 0] }).collect(),
+        };
+        // Sun shadow stripes across the whole floor, along x: lit, shaded, ...
+        let occ_w = 16;
+        let occ = TerrainImage {
+            width: occ_w,
+            height: 1,
+            rgba: (0..occ_w).flat_map(|i| if i % 2 == 0 { [255u8, 255, 0, 0] } else { [255, 0, 0, 0] }).collect(),
+        };
+        let size = 64u32;
+        let built = |sea_line: f32| {
+            let mut s = TerrainMaterialUniform::default();
+            s.repeat = [1.5; 4];
+            s.sea_line = sea_line;
+            build(
+                &GroundInputs { heights: &g, sky: &sky(), sun: Some(&sun), sky_occlusion: Some(&occ), layers: &layers, splat: Some(&splat), settings: &s },
+                size,
+            )
+        };
+        let spread = |map: &GroundMap, row: u32| {
+            let r: Vec<f32> = (0..size).map(|i| map.texels[(row * size + i) as usize][0]).collect();
+            let (lo, hi) = r.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            (hi - lo) / hi.max(1e-6)
+        };
+        let sea = built(-1.4);
+        let dry = built(-1e9);
+        // The rows the clamp reads past each edge: one colour along them.
+        assert!(spread(&sea, 0) < 1e-4, "the near edge's row varies by {:.3} of its brightest", spread(&sea, 0));
+        assert!(spread(&sea, size - 1) < 1e-4, "the far edge's row varies by {:.3}", spread(&sea, size - 1));
+        // And the side edges, across the stripes: one colour, the same.
+        let side: Vec<f32> = (0..size).map(|j| sea.texels[(j * size) as usize][0]).collect();
+        let (lo, hi) = side.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        assert!(hi - lo < 1e-4 * hi, "a side edge varies by {:.3}", (hi - lo) / hi);
+        // One colour all round.
+        let far = sea.texels[(size * size - 1) as usize][0];
+        assert!((side[0] - sea.texels[0][0]).abs() < 1e-6 && (far - side[0]).abs() < 1e-4 * hi, "the edges differ: {} {far}", side[0]);
+        // Inside the rim the floor is its own picture: the stripes are there,
+        // as they are on dry ground.
+        let mid = size / 2;
+        let inner_spread = {
+            let r: Vec<f32> = (size / 4..size - size / 4).map(|i| sea.texels[(mid * size + i) as usize][0]).collect();
+            let (lo, hi) = r.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            (hi - lo) / hi
+        };
+        assert!(inner_spread > 0.3, "the floor's own shadows inside the rim: {inner_spread:.3}");
+        // Dry ground keeps its edge: the stripes reach it there.
+        assert!(spread(&dry, 0) > 0.3, "a dry rim is left as it is: {:.3}", spread(&dry, 0));
     }
 
     /// A painted splat map decides the layers, as it does in the terrain

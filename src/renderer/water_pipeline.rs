@@ -1302,6 +1302,13 @@ const OPEN_PATH: f32 = 12.0;
 const WALK_FIRST: f32 = 0.6;
 const WALK_GROWTH: f32 = 1.55;
 const WALK_STEPS: i32 = 6;
+// How deep under the ground the walk may find the line, in metres, and still
+// call its rising clear past it a lip: from all of it to none. The samples
+// of a pixel lie millimetres apart (centimetres at 100 m); a line a quarter
+// metre in is no grazing one. A straight ramp from 0.25 m (all of it) to 0.75
+// m (none): 2 a metre.
+const LIP_BURIED: f32 = 0.75;
+const LIP_RAMP: f32 = 2.0;
 // How steeply the sea floor falls away past the ground map's edge.
 const SHELF_SLOPE: f32 = 0.15;
 const FOAM_TILES: f32 = {foam_tiles};
@@ -1581,25 +1588,38 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         var gap = thickness;
         var met = false;
         var clears = 0.0;
+        var buried = 0.0;
         var step = WALK_FIRST;
         for (var i = 0; i < WALK_STEPS; i = i + 1) {{
             let t = flat * step;
             let at = p + down * t;
             let next_gap = at.y - bed_at(at).w;
-            if (met) {{
-                clears = max(clears, next_gap);
-            }}
             if (!met && next_gap <= 0.0) {{
                 met = true;
                 seen = walked + (t - walked) * gap / max(gap - next_gap, 1e-5);
             }}
+            if (met) {{
+                clears = max(clears, next_gap);
+            }}
+            // Every gap before the meet is above the ground, so the deepest
+            // is the same read unconditionally.
+            buried = min(buried, next_gap);
             walked = t;
             gap = next_gap;
             step = step * WALK_GROWTH;
         }}
         let seen_uv = ground_uv(p + down * seen);
         let from_edge = min(min(seen_uv.x, 1.0 - seen_uv.x) / camera.ground_params.z, min(seen_uv.y, 1.0 - seen_uv.y) / camera.ground_params.w);
-        drawn = (1.0 - smoothstep(0.0, 0.5, clears)) * (1.0 - smoothstep(2.0, 4.0, seen / max(flat, 1e-4))) * smoothstep(3.0, 6.0, from_edge);
+        // A LIP only where the line GRAZED the ground before rising clear of
+        // it: buried deeper than `LIP_BURIED`, the line went into a wall or
+        // a headland and out the far side under the water beyond, and the
+        // samples just above it are buried too -- the drawn face is what
+        // they show. Read as a lip, the foot of every narrow sea cliff
+        // handed over to the map's top-down picture, which smeared the
+        // cliff and the slope above it through the waves (headset,
+        // 2026-10-15, "a distorted reflection of the land").
+        let lip = smoothstep(0.0, 0.5, clears) * saturate((LIP_BURIED + buried) * LIP_RAMP);
+        drawn = (1.0 - lip) * (1.0 - smoothstep(2.0, 4.0, seen / max(flat, 1e-4))) * smoothstep(3.0, 6.0, from_edge);
     }}
     // Each colour of light is lost at its own rate, red first, on the light's
     // way down to the bed and the view's way back. What the water scatters
