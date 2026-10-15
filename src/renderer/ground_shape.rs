@@ -395,6 +395,70 @@ mod varyings {
 }
 
 #[cfg(test)]
+mod twins {
+    /// A STEP-1 RUN IS DRAWN BY A PIPELINE WITHOUT THE READ: every ground
+    /// reader and pass (each role, both builds, the slope twins, the
+    /// reflection pass's dedup, outdoor, nowhere and open twins, the
+    /// reader's spotless and baked twins, from world vertices too) builds
+    /// its `pipeline` -- what `TerrainPipeline::at(false)` and so a step-1
+    /// run draws by -- from a source with no `ground_shape_at` call, and its
+    /// `shaped` one with it; the weather's twins have none to drop. And
+    /// `by_step` gives every index of step 1 to the unshaped pipeline and
+    /// every index of the coarser lists to the shaped one.
+    #[test]
+    fn a_step_1_run_is_drawn_by_a_pipeline_without_the_shape_read() {
+        use crate::renderer::terrain_pipeline::{by_step, terrain_shader_built, twin_sources, TerrainRole};
+        const CALL: &str = "ground_shape_at(in.";
+        let mut checked = 0;
+        for role in [TerrainRole::Scene, TerrainRole::Read, TerrainRole::ProbePass] {
+            for painted in [false, true] {
+                let base = terrain_shader_built(role, painted);
+                let mut sources = vec![base.clone()];
+                sources.extend(crate::renderer::ground_twins::gentle_shader(&base));
+                sources.extend(crate::renderer::ground_twins::steep_shader(&base));
+                if role == TerrainRole::ProbePass {
+                    sources.extend(crate::renderer::ground_twins::dedup_pass_shader(&base));
+                } else {
+                    sources.push(crate::renderer::lights::without_spot_shadows(base.clone()));
+                    sources.push(crate::renderer::brush_pipeline::sun_reader_shader(base.clone(), crate::renderer::brush_pipeline::FaceSun::Baked));
+                }
+                let world: Vec<String> = sources.iter().filter_map(|s| crate::renderer::terrain_pipeline::world_vertices(s)).collect();
+                sources.extend(world);
+                for src in sources {
+                    assert!(src.contains(CALL), "{role:?}: a ground source without the read before the twins are made");
+                    let (plain, shaped) = twin_sources(src);
+                    assert!(!plain.contains(CALL), "{role:?}: the step-1 pipeline reads the shape");
+                    assert!(shaped.is_some_and(|s| s.contains(CALL)), "{role:?}: no shaped pipeline for the coarser lists");
+                    checked += 1;
+                }
+            }
+        }
+        for src in [
+            crate::renderer::terrain_pipeline::outdoor_pass_shader(),
+            crate::renderer::terrain_pipeline::nowhere_pass_shader(),
+            crate::renderer::terrain_pipeline::open_pass_shader(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let (plain, shaped) = twin_sources(src);
+            assert!(!plain.contains(CALL) && shaped.is_some_and(|s| s.contains(CALL)));
+            checked += 1;
+        }
+        let weathered = crate::renderer::weather::with_weather(&terrain_shader_built(TerrainRole::Read, true)).unwrap();
+        let (plain, shaped) = twin_sources(weathered);
+        assert!(!plain.contains(CALL) && shaped.is_none(), "the weather's twin is unshaped and has no shaped one");
+        assert!(checked >= 40, "{checked} sources");
+        // The cut where the coarser lists begin.
+        let parts = |first, len| by_step(first, len, 1000).collect::<Vec<_>>();
+        assert_eq!(parts(0, 999), vec![(0, 999, false)]);
+        assert_eq!(parts(990, 30), vec![(990, 10, false), (1000, 20, true)]);
+        assert_eq!(parts(1000, 30), vec![(1000, 30, true)]);
+        assert_eq!(by_step(5, 7, u32::MAX).collect::<Vec<_>>(), vec![(5, 7, false)], "no lists: all step 1");
+    }
+}
+
+#[cfg(test)]
 mod sizes {
     /// MEASUREMENT: what the shape read costs the dry gentle reader by the
     /// host proxy, function by function (`--ignored --nocapture`).

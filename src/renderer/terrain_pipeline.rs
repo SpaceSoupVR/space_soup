@@ -149,8 +149,44 @@ pub const WET_POROSITY: [f32; 4] = [0.85, 0.35, 0.7, 1.0];
 pub const WET_FILM: [f32; 4] = [0.12, 0.75, 0.3, 0.9];
 
 pub struct TerrainPipeline {
+    /// WITHOUT the step-1 shape read (`ground_shape::unshaped`): what a run
+    /// of step-1 triangles is drawn with. A step-1 triangle is the lattice
+    /// triangle, so its vertex normal is the shape there, exactly; and the
+    /// read compiled into a reader cost it even with its branch never taken
+    /// (Quest 3, 2026-10-15: cave_back_out 28.27 -> 25.61 ms with the read
+    /// dead-stripped, outdoors_field 18.42 -> 17.36 -- registers, not the
+    /// loads).
     pub pipeline: RenderPipeline,
+    /// WITH the read: what a run from the coarser lists is drawn with
+    /// ([`Self::at`]). `None` for a source without it (the weather's twins,
+    /// which are built unshaped).
+    pub shaped: Option<RenderPipeline>,
     pub material_layout: BindGroupLayout,
+}
+
+/// How many ground pipelines were built twice, shaped and not
+/// ([`TerrainPipeline::shaped`]): the start-up cost of the twins, logged.
+pub static SHAPED_TWINS_BUILT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A ground shader's two pipelines' sources ([`TerrainPipeline::shaped`]):
+/// the step-1 twin, without the shape read (`ground_shape::unshaped`), and
+/// the source as given when it reads the shape at all (`None` when it does
+/// not: the weather's twins).
+pub fn twin_sources(source: String) -> (String, Option<String>) {
+    match crate::renderer::ground_shape::unshaped(&source) {
+        Some(plain) => (plain, Some(source)),
+        None => (source, None),
+    }
+}
+
+/// A run of the ground's buffer `first..first + len` cut where the coarser
+/// lists begin (`coarse_from`, the buffer index of the first list index past
+/// step 1's): `(first, len, coarse)` of each part, step 1's first. The one
+/// rule every pass draws its ground by, so that a step-1 run is never drawn
+/// with a shaped pipeline and a coarse one never without.
+pub fn by_step(first: u32, len: u32, coarse_from: u32) -> impl Iterator<Item = (u32, u32, bool)> {
+    let cut = coarse_from.clamp(first, first + len);
+    [(first, cut - first, false), (cut, first + len - cut, true)].into_iter().filter(|p| p.1 > 0)
 }
 
 /// THE SCENE'S GROUND IS DRAWN WITHOUT BLENDING. Its shader writes alpha 1
@@ -192,6 +228,14 @@ pub fn world_vertices(src: &str) -> Option<String> {
 }
 
 impl TerrainPipeline {
+    /// The pipeline for a run from the coarser lists (`coarse`) or at step 1.
+    pub fn at(&self, coarse: bool) -> &RenderPipeline {
+        match (&self.shaped, coarse) {
+            (Some(shaped), true) => shaped,
+            _ => &self.pipeline,
+        }
+    }
+
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
         Self::new_multisampled(device, format, uniform_layout, 1)
     }
@@ -794,13 +838,39 @@ impl TerrainPipeline {
             // It writes the fix-up list: see `BrushPipeline::new_probe_pass_deferred`.
             source = source.replacen("@fragment fn fs_main(", "@fragment @early_depth_test(force) fn fs_main(", 1);
         }
+        let material_layout = material_bind_group_layout(device);
+        // The step-1 twin (no shape read) is `pipeline`; the source as given,
+        // when it reads the shape at all, is `shaped`.
+        let (plain, shaped) = twin_sources(source);
+        let pipeline = Self::compile(device, format, uniform_layout, samples, view, role, group2, group3, plain, label, front_face, &material_layout);
+        let shaped = shaped.map(|src| {
+            SHAPED_TWINS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self::compile(device, format, uniform_layout, samples, view, role, group2, group3, src, &format!("{label}_shaped"), front_face, &material_layout)
+        });
+        Self { pipeline, shaped, material_layout }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        role: TerrainRole,
+        group2: Option<&BindGroupLayout>,
+        group3: Option<&BindGroupLayout>,
+        source: String,
+        label: &str,
+        front_face: FrontFace,
+        material_layout: &BindGroupLayout,
+    ) -> RenderPipeline {
         // Audited: see `shader_checks`.
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("terrain_shader"),
             source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, view.shader(source)).into()),
         });
-        let material_layout = material_bind_group_layout(device);
-        let mut layouts = vec![Some(uniform_layout), Some(&material_layout)];
+        let mut layouts = vec![Some(uniform_layout), Some(material_layout)];
         if group2.is_some() || group3.is_some() {
             layouts.push(group2);
         }
@@ -860,8 +930,7 @@ impl TerrainPipeline {
             multiview_mask: view.mask(),
             cache: None,
         });
-
-        Self { pipeline, material_layout }
+        pipeline
     }
 }
 

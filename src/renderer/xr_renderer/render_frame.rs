@@ -1652,6 +1652,13 @@ impl XrRenderer {
         // The ground at step 1 is the first of its indices; a pass that
         // draws "the whole ground" draws those.
         let ground_step1 = self.ground_lod.borrow().as_ref().map(|l| l.level0_len()).filter(|n| *n > 0);
+        // Where the ground's coarser lists begin in the solid buffer: a run
+        // past it is drawn by a reader's SHAPED pipeline, one before it (step
+        // 1) by its unshaped twin (`TerrainPipeline::at`, `by_step`).
+        let ground_coarse_from: u32 = match (terrain_range, ground_step1) {
+            (Some((start, _)), Some(n)) => start + n,
+            _ => u32::MAX,
+        };
 
         // No spot casts this frame: the scene draws with its spotless twins.
         // See `XrRenderer::spotless_frame`. Nor any lit surface's light: the
@@ -3043,7 +3050,14 @@ impl XrRenderer {
                             pass.set_vertex_buffer(0, solid_vb.slice(..));
                             pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
                             if ground_partitioned {
+                                // A coarser list's chunk by the shaped pipeline (`TerrainPipeline::at`).
+                                let mut shaped_bound = false;
                                 for c in solid_chunks.iter().filter(|c| crate::renderer::shadow::chunk_seen(c, &planes)) {
+                                    let coarse = c.first_index >= ground_coarse_from;
+                                    if coarse != shaped_bound {
+                                        pass.set_pipeline(self.terrain_mirror.at(coarse));
+                                        shaped_bound = coarse;
+                                    }
                                     pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
                                 }
                             } else {
@@ -3470,7 +3484,14 @@ impl XrRenderer {
                                         if class != GROUND_FULL && twin.is_none() {
                                             continue;
                                         }
-                                        let mut bound = twin.is_none();
+                                        // The pipeline this class draws by --
+                                        // the pass (bound above) for the dry
+                                        // full class -- and which of its two
+                                        // is bound: `Some(coarse)`. A run of
+                                        // the coarser lists by its shaped
+                                        // pipeline (`TerrainPipeline::at`).
+                                        let drawn_by = twin.or(if wet { None } else { Some(terrain) });
+                                        let mut bound: Option<bool> = if twin.is_none() { Some(false) } else { None };
                                         // (Runs that touch in the buffer as
                                         // one draw: `ground_lod::merged`.)
                                         let class_runs = crate::renderer::ground_lod::merged(
@@ -3482,11 +3503,13 @@ impl XrRenderer {
                                                 }),
                                         );
                                         for (first, len) in class_runs {
-                                            if let (false, Some(twin)) = (bound, twin) {
-                                                pass.set_pipeline(&twin.pipeline);
-                                                bound = true;
+                                            for (first, len, coarse) in crate::renderer::terrain_pipeline::by_step(first, len, ground_coarse_from) {
+                                                if let (true, Some(p)) = (bound != Some(coarse), drawn_by) {
+                                                    pass.set_pipeline(p.at(coarse));
+                                                    bound = Some(coarse);
+                                                }
+                                                pass.draw_indexed(first..first + len, 0, 0..1);
                                             }
-                                            pass.draw_indexed(first..first + len, 0, 0..1);
                                         }
                                     }
                                 }
@@ -3804,11 +3827,18 @@ impl XrRenderer {
                                 // which drew a near cliff last. See `chunk_order`.
                                 // Past the first `near_walk` chunks drawn, the
                                 // rest reader by reader, still nearest first.
-                                let mixed = if terrain_in_probe_pass { &self.terrain_reader().pipeline } else { self.sp_terrain(stereo) };
+                                let mixed = if terrain_in_probe_pass { self.terrain_reader() } else { self.sp_terrain_twins(stereo) };
                                 let gentle = self.terrain_gentle.as_ref().filter(|_| gentle_split.is_some());
                                 let steep = self.terrain_steep.as_ref().filter(|_| steep_split.is_some());
-                                // Which reader is bound: 0 the mixed (bound above), 1 gentle, 2 steep.
-                                let mut bound = 0usize;
+                                // Which reader is bound: 0 the mixed (bound above), 1 gentle, 2 steep;
+                                // and whether its shaped pipeline, for a run
+                                // of the coarser lists (`TerrainPipeline::at`).
+                                let mut bound = (0usize, false);
+                                let reader = |which: usize, coarse: bool| match (which, gentle, steep) {
+                                    (1, Some(gentle), _) => gentle[twin].at(coarse),
+                                    (2, _, Some(steep)) => steep[twin].at(coarse),
+                                    _ => mixed.at(coarse),
+                                };
                                 // Each of a chunk's slope ranges: 0 the mixed, 1 gentle, 2 steep.
                                 let ranges = |k: usize, c: &crate::renderer::shadow::CasterChunk| {
                                     let g = if gentle.is_some() { gentle_of(k).min(c.index_count) } else { 0 };
@@ -3832,17 +3862,14 @@ impl XrRenderer {
                                         continue;
                                     }
                                     walked += 1;
+                                    let coarse = c.first_index >= ground_coarse_from;
                                     for (which, range) in ranges(k, c) {
                                         if range.is_empty() {
                                             continue;
                                         }
-                                        if bound != which {
-                                            pass.set_pipeline(match (which, gentle, steep) {
-                                                (1, Some(gentle), _) => &gentle[twin].pipeline,
-                                                (2, _, Some(steep)) => &steep[twin].pipeline,
-                                                _ => mixed,
-                                            });
-                                            bound = which;
+                                        if bound != (which, coarse) {
+                                            pass.set_pipeline(reader(which, coarse));
+                                            bound = (which, coarse);
                                         }
                                         pass.draw_indexed(c.first_index + range.start..c.first_index + range.end, 0, 0..1);
                                     }
@@ -3859,23 +3886,30 @@ impl XrRenderer {
                                         (c.first_index + range.start, range.end - range.start)
                                     }));
                                     for (first, len) in reader_runs {
-                                        if bound != which {
-                                            pass.set_pipeline(match (which, gentle, steep) {
-                                                (1, Some(gentle), _) => &gentle[twin].pipeline,
-                                                (2, _, Some(steep)) => &steep[twin].pipeline,
-                                                _ => mixed,
-                                            });
-                                            bound = which;
+                                        for (first, len, coarse) in crate::renderer::terrain_pipeline::by_step(first, len, ground_coarse_from) {
+                                            if bound != (which, coarse) {
+                                                pass.set_pipeline(reader(which, coarse));
+                                                bound = (which, coarse);
+                                            }
+                                            pass.draw_indexed(first..first + len, 0, 0..1);
                                         }
-                                        pass.draw_indexed(first..first + len, 0, 0..1);
                                     }
                                 }
                             } else {
+                                // (A coarser list's chunk by the shaped
+                                // pipeline: `TerrainPipeline::at`.)
+                                let mixed = if terrain_in_probe_pass { self.terrain_reader() } else { self.sp_terrain_twins(stereo) };
+                                let mut shaped_bound = false;
                                 for (k, c) in solid_chunks.iter().enumerate() {
                                     if terrain_chunk_visible(c) && !weathered(c) {
                                         let g = gentle_of(k).min(c.index_count);
                                         let end = c.index_count - steep_of(k).min(c.index_count - g);
                                         if g < end {
+                                            let coarse = c.first_index >= ground_coarse_from;
+                                            if coarse != shaped_bound {
+                                                pass.set_pipeline(mixed.at(coarse));
+                                                shaped_bound = coarse;
+                                            }
                                             pass.draw_indexed(c.first_index + g..c.first_index + end, 0, 0..1);
                                         }
                                         terrain_drawn += c.index_count;
@@ -3884,27 +3918,29 @@ impl XrRenderer {
                                     }
                                 }
                                 if let Some(gentle) = self.terrain_gentle.as_ref().filter(|_| gentle_split.is_some()) {
-                                    let mut bound = false;
+                                    let mut bound: Option<bool> = None;
                                     for (k, c) in solid_chunks.iter().enumerate() {
                                         let g = gentle_of(k).min(c.index_count);
                                         if g > 0 && terrain_chunk_visible(c) && !weathered(c) {
-                                            if !bound {
-                                                pass.set_pipeline(&gentle[twin].pipeline);
-                                                bound = true;
+                                            let coarse = c.first_index >= ground_coarse_from;
+                                            if bound != Some(coarse) {
+                                                pass.set_pipeline(gentle[twin].at(coarse));
+                                                bound = Some(coarse);
                                             }
                                             pass.draw_indexed(c.first_index..c.first_index + g, 0, 0..1);
                                         }
                                     }
                                 }
                                 if let Some(steep) = self.terrain_steep.as_ref().filter(|_| steep_split.is_some()) {
-                                    let mut bound = false;
+                                    let mut bound: Option<bool> = None;
                                     for (k, c) in solid_chunks.iter().enumerate() {
                                         let g = gentle_of(k).min(c.index_count);
                                         let st = steep_of(k).min(c.index_count - g);
                                         if st > 0 && terrain_chunk_visible(c) && !weathered(c) {
-                                            if !bound {
-                                                pass.set_pipeline(&steep[twin].pipeline);
-                                                bound = true;
+                                            let coarse = c.first_index >= ground_coarse_from;
+                                            if bound != Some(coarse) {
+                                                pass.set_pipeline(steep[twin].at(coarse));
+                                                bound = Some(coarse);
                                             }
                                             pass.draw_indexed(c.first_index + c.index_count - st..c.first_index + c.index_count, 0, 0..1);
                                         }
