@@ -12,6 +12,7 @@ use super::water_pipeline::{WaterPipeline, WaterUniform, WaterVertex};
 use super::water_waves::{WaveField, WaveParams};
 use super::{ground_map, icon, lights, mesh_pipeline, pipeline, uniforms};
 use super::{Camera, Cuboid, MeshInstance, WorldPanel};
+use spacesoup_graphics::mud::{MudMap, Walkers as MudWalkers};
 
 struct CuboidCacheEntry {
     snapshot: CuboidSnapshot,
@@ -36,6 +37,49 @@ struct DesktopWater {
     uniform: WaterUniform,
     waves: WaveField,
     bounds: (glam::Vec3, glam::Vec3),
+    mud: Option<MudBody>,
+}
+
+struct MudBody {
+    map: MudMap,
+    texture: Texture,
+    walkers: MudWalkers,
+}
+
+impl MudBody {
+    fn new(device: &Device, bounds: (glam::Vec3, glam::Vec3)) -> Self {
+        let map = MudMap::new(
+            [bounds.0.x, bounds.0.z],
+            [bounds.1.x, bounds.1.z],
+            spacesoup_graphics::mud::DEFAULT_TEXEL,
+            spacesoup_graphics::mud::MAX_SIDE,
+        );
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("water_mud_prints"),
+            size: Extent3d { width: map.width(), height: map.height(), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rg8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        Self { map, texture, walkers: MudWalkers::default() }
+    }
+
+    fn flush(&mut self, queue: &Queue) {
+        let Some([_, y0, _, y1]) = self.map.take_dirty() else { return };
+        if y1 <= y0 {
+            return;
+        }
+        let width = self.map.width();
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &self.texture, mip_level: 0, origin: Origin3d { x: 0, y: y0, z: 0 }, aspect: TextureAspect::All },
+            self.map.rows(y0, y1),
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 2), rows_per_image: Some(y1 - y0) },
+            Extent3d { width, height: y1 - y0, depth_or_array_layers: 1 },
+        );
+    }
 }
 
 pub struct DesktopGround {
@@ -202,6 +246,12 @@ impl Renderer {
             .iter()
             .filter(|(v, i, _, _)| !v.is_empty() && !i.is_empty())
             .map(|(verts, indices, uniform, params)| {
+                let bounds = super::water_pipeline::water_bounds(verts, params);
+                let mut uniform = *uniform;
+                let mud = (uniform.look[1] > 0.0).then(|| MudBody::new(&self.device, bounds));
+                if let Some(m) = mud.as_ref() {
+                    uniform.prints = m.map.placement();
+                }
                 let vertex_buffer = self.device.create_buffer_init(&util::BufferInitDescriptor {
                     label: Some("water_vb"),
                     contents: bytemuck::cast_slice(verts),
@@ -214,21 +264,23 @@ impl Renderer {
                 });
                 let uniform_buffer = self.device.create_buffer_init(&util::BufferInitDescriptor {
                     label: Some("water_uniform"),
-                    contents: bytemuck::bytes_of(uniform),
+                    contents: bytemuck::bytes_of(&uniform),
                     usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
                 });
                 let waves = WaveField::new(&self.device, &self.queue, *params);
                 waves.reprime();
-                let bind_groups = pipeline.bind_groups(&self.device, &uniform_buffer, &waves);
+                let mud_view = mud.as_ref().map(|m| m.texture.create_view(&TextureViewDescriptor::default()));
+                let bind_groups = pipeline.bind_groups_with(&self.device, &uniform_buffer, &waves, mud_view.as_ref().unwrap_or(&pipeline.default_mud));
                 DesktopWater {
                     vertex_buffer,
                     index_buffer,
                     uniform_buffer,
                     bind_groups,
                     index_count: indices.len() as u32,
-                    uniform: *uniform,
+                    uniform,
                     waves,
-                    bounds: super::water_pipeline::water_bounds(verts, params),
+                    bounds,
+                    mud,
                 }
             })
             .collect();
@@ -240,10 +292,41 @@ impl Renderer {
     }
 
     pub fn set_water_time(&mut self, seconds: f32) {
+        let dt = (seconds as f64 - self.water_seconds).clamp(0.0, 0.25) as f32;
         self.water_seconds = seconds as f64;
         for body in &mut self.water_bodies {
             body.uniform.set_time(self.water_seconds, body.waves.params.loop_seconds);
             self.queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
+            if let Some(m) = body.mud.as_mut() {
+                m.map.settle(dt);
+            }
+        }
+    }
+
+    pub fn walkers_on_mud(&mut self, walkers: &[(usize, glam::Vec3)]) {
+        let Some(ground) = self.ground.as_ref() else { return };
+        let present: Vec<usize> = walkers.iter().map(|w| w.0).collect();
+        for body in &mut self.water_bodies {
+            let Some(m) = body.mud.as_mut() else { continue };
+            let surface = body.uniform.extinction[3];
+            let (mut wading, mut prints) = (0, 0);
+            for (id, p) in walkers {
+                let in_mud = m.map.contains(p.x, p.z) && ground.heights.at(p.x, p.z) < surface - 0.01;
+                wading += in_mud as u32;
+                prints += m.walkers.step(&mut m.map, *id, [p.x, p.z], in_mud) as u32;
+            }
+            m.walkers.forget_absent(&present);
+            if prints > 0 {
+                log::info!("mud: {wading} wading, {prints} new print(s) on a {}x{} map", m.map.width(), m.map.height());
+            }
+        }
+    }
+
+    fn flush_mud(&mut self) {
+        for body in &mut self.water_bodies {
+            if let Some(m) = body.mud.as_mut() {
+                m.flush(&self.queue);
+            }
         }
     }
 
@@ -630,6 +713,7 @@ impl Renderer {
         overlay_cuboids: &[Cuboid],
     ) {
         self.ensure_ground_map();
+        self.flush_mud();
         let vp = camera.projection() * camera.view();
 
         let ranked = lights::rank_for_budget(lights, lights::MAX_LIGHTS);

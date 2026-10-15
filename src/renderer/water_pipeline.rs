@@ -103,6 +103,8 @@ pub struct WaterUniform {
     pub air: [f32; 4],
 
     pub look: [f32; 4],
+
+    pub prints: [f32; 4],
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -138,6 +140,7 @@ impl WaterUniform {
             rings: [[0.0; 4]; RINGS],
             air: [paws_calm(waves.wind_speed), o.swell.max(0.0), waves.wind_dir.cos(), waves.wind_dir.sin()],
             look: [o.gloss.clamp(0.0, 1.0), o.mud.clamp(0.0, 1.0), 0.0, 0.0],
+            prints: [0.0; 4],
         }
     }
 
@@ -153,6 +156,7 @@ pub struct WaterPipeline {
 
     pub waterline: RenderPipeline,
     pub material_layout: BindGroupLayout,
+    pub default_mud: TextureView,
 
     pub sampler: Sampler,
 
@@ -228,8 +232,21 @@ impl WaterPipeline {
                     ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
                 },
+                texture(6, ShaderStages::FRAGMENT, TextureViewDimension::D2),
             ],
         });
+        let default_mud = device
+            .create_texture(&TextureDescriptor {
+                label: Some("water_mud_none"),
+                size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rg8Unorm,
+                usage: TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&TextureViewDescriptor::default());
         let sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("water_waves_sampler"),
             address_mode_u: AddressMode::Repeat,
@@ -273,7 +290,7 @@ impl WaterPipeline {
             }
         }
 
-        Self { pipeline, ringless, waterline, material_layout, sampler, dual_source, inputs }
+        Self { pipeline, ringless, waterline, material_layout, sampler, dual_source, inputs, default_mud }
     }
 
     pub fn with_cut(&self, device: &Device, cut: &str) -> Option<RenderPipeline> {
@@ -281,6 +298,10 @@ impl WaterPipeline {
     }
 
     pub fn bind_groups(&self, device: &Device, uniform: &Buffer, waves: &WaveField) -> [BindGroup; 2] {
+        self.bind_groups_with(device, uniform, waves, &self.default_mud)
+    }
+
+    pub fn bind_groups_with(&self, device: &Device, uniform: &Buffer, waves: &WaveField, mud: &TextureView) -> [BindGroup; 2] {
         std::array::from_fn(|set| {
             device.create_bind_group(&BindGroupDescriptor {
                 label: Some("water_material"),
@@ -292,6 +313,7 @@ impl WaterPipeline {
                     BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&waves.curvature_views[set]) },
                     BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&waves.foam_view) },
                     BindGroupEntry { binding: 5, resource: BindingResource::Sampler(&self.sampler) },
+                    BindGroupEntry { binding: 6, resource: BindingResource::TextureView(mud) },
                 ],
             })
         })
@@ -330,6 +352,8 @@ pub(crate) const WATER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("env", &[("    let env = outdoor_radiance(", "    let env = vec3<f32>(0.0);\n    let env_unused = outdoor_radiance(")]),
 
     ("glint", &[("        glint = glint + radiance * WATER_PI * water_ggx(n, v, to_l, a2);\n", "")]),
+
+    ("prints", &[("    let colour = mix(shade, foam_light, froth_cover);", "    let colour = vec3<f32>(print.x, print.y, 0.15);")]),
 ];
 
 fn water_with_cut(device: &Device, inputs: &WaterInputs, dual_source: bool, cut: &str) -> Option<RenderPipeline> {
@@ -501,6 +525,7 @@ struct WaterMat {{
     rings: array<vec4<f32>, {rings}>,
     air: vec4<f32>,
     look: vec4<f32>,
+    prints: vec4<f32>,
 }}
 
 fn swash_count(still_depth: f32, xz: vec2<f32>, t: f32) -> f32 {{
@@ -718,6 +743,11 @@ const MUD_GRAIN_TILT: f32 = 0.15;
 const MUD_GRAIN_SHADE: f32 = 0.6;
 const MUD_ROUGH: f32 = 0.35;
 const MUD_SKY_SHARE: f32 = 0.5;
+const MUD_PRINT_STEP: f32 = 1.0;
+const MUD_PRINT_TILT: f32 = 0.6;
+const MUD_PRINT_DARK: f32 = 0.7;
+const MUD_PRINT_RIM: f32 = 0.9;
+const MUD_WET_GLOSS: f32 = 0.7;
 
 const SHELF_SLOPE: f32 = 0.15;
 const FOAM_TILES: f32 = {foam_tiles};
@@ -739,6 +769,7 @@ const RING_SECONDS: f32 = {ring_seconds};
 @group(1) @binding(3) var wave_curve: texture_2d_array<f32>;
 @group(1) @binding(4) var foam_tex: texture_2d<f32>;
 @group(1) @binding(5) var wave_samp: sampler;
+@group(1) @binding(6) var mud_tex: texture_2d<f32>;
 
 struct VIn {{
     @location(0) pos: vec3<f32>,
@@ -857,6 +888,19 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let grain = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES).r - 0.5;
     let grain_b = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES * 0.37 + vec2<f32>(0.5)).r - 0.5;
     tilt = tilt * (1.0 - MUD_FLATTEN * mud) + vec2<f32>(grain, grain_b) * MUD_GRAIN_TILT * mud;
+    var print = vec2<f32>(0.0);
+    var print_rim = 0.0;
+    let print_uv = (q - water.prints.xy) * water.prints.zw;
+    if (water.prints.z > 0.0 && all(print_uv > vec2<f32>(0.0)) && all(print_uv < vec2<f32>(1.0))) {{
+        print = textureSampleLevel(mud_tex, wave_samp, print_uv, 0.0).rg;
+        let e = water.prints.zw * MUD_PRINT_STEP;
+        let dx = textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(e.x, 0.0), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(e.x, 0.0), 0.0).r;
+        let dz = textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(0.0, e.y), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(0.0, e.y), 0.0).r;
+        tilt = tilt + vec2<f32>(dx, dz) * MUD_PRINT_TILT * mud;
+        print_rim = smoothstep(0.05, 0.5, length(vec2<f32>(dx, dz))) * (1.0 - print.x);
+    }}
+    let fresh = print.y * mud;
+    let wet_gloss = mix(water.look.x, 1.0, fresh * MUD_WET_GLOSS);
     let n = normalize(to_player_direction(vec3<f32>(-tilt.x, 1.0, -tilt.y)));
 
     let lost0 = water_lost(log2(max(span * WAVE_N / water.tiles.x, 1e-6))).x;
@@ -873,7 +917,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     r = normalize(r);
     ground_trace_coarsen = WATER_TRACE_COARSEN;
     let env = outdoor_radiance(p, normalize(to_world_direction(r)), r, rough, clamp(rough * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD));
-    let env_seen = env * water.look.x * select(1.0, 1.0 / WATER_PI, camera.sky_params.y < 0.5);
+    let env_seen = env * wet_gloss * select(1.0, 1.0 / WATER_PI, camera.sky_params.y < 0.5);
 
     var glint = vec3<f32>(0.0);
     var sunlight = vec3<f32>(0.0);
@@ -956,7 +1000,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     }}
 
     let sky_down = sky_irradiance(vec3<f32>(0.0, 1.0, 0.0));
-    let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud);
+    let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud) * (1.0 - MUD_PRINT_DARK * print.x * mud) * (1.0 + MUD_PRINT_RIM * print_rim * mud);
     let body = water.scatter.rgb * silt * (sky_irradiance(n) * mix(1.0, MUD_SKY_SHARE, mud) + sunlight * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0)) * (vec3<f32>(1.0) - t_view);
 
     let fine = 0.5 * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N * 0.25 / water.tiles.z));
@@ -1007,7 +1051,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
 
     let edge = smoothstep(0.0, water.scatter.w, thickness);
     let lip = smoothstep(0.0, 0.015, thickness);
-    let shade = (env_seen * fresnel + glint * water.look.x + (body + brighter) * (1.0 - fresnel)) * edge;
+    let shade = (env_seen * fresnel + glint * wet_gloss + (body + brighter) * (1.0 - fresnel)) * edge;
     let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge);
     let froth_cover = cover * lip;
     let colour = mix(shade, foam_light, froth_cover);
