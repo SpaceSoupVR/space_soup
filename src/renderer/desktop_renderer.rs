@@ -8,7 +8,9 @@ use super::lights::LightsUniform;
 use super::mesh::LoadedTexture;
 use super::shadow::{self, ShadowKind, ShadowMap};
 use super::uniforms::ShadowUpload;
-use super::{icon, lights, mesh_pipeline, pipeline, uniforms};
+use super::water_pipeline::{WaterPipeline, WaterUniform, WaterVertex};
+use super::water_waves::{WaveField, WaveParams};
+use super::{ground_map, icon, lights, mesh_pipeline, pipeline, uniforms};
 use super::{Camera, Cuboid, MeshInstance, WorldPanel};
 
 struct CuboidCacheEntry {
@@ -24,6 +26,26 @@ struct DesktopTerrain {
     ib: Buffer,
     index_count: u32,
 }
+
+struct DesktopWater {
+    vertex_buffer: Buffer,
+    index_buffer: Buffer,
+    uniform_buffer: Buffer,
+    bind_groups: [BindGroup; 2],
+    index_count: u32,
+    uniform: WaterUniform,
+    waves: WaveField,
+    bounds: (glam::Vec3, glam::Vec3),
+}
+
+pub struct DesktopGround {
+    pub heights: ground_map::HeightGrid,
+    pub layers: Vec<Option<super::terrain_pipeline::TerrainImage>>,
+    pub splat: Option<super::terrain_pipeline::TerrainImage>,
+    pub settings: super::terrain_pipeline::TerrainMaterialUniform,
+}
+
+pub const DESKTOP_GROUND_MAP_SIZE: u32 = 512;
 
 pub struct Renderer {
     pub device: Device,
@@ -67,6 +89,12 @@ pub struct Renderer {
     sky_dome: Option<super::sky::Sky>,
 
     pub sky_visible: bool,
+
+    water_pipeline: Option<WaterPipeline>,
+    water_bodies: Vec<DesktopWater>,
+    water_seconds: f64,
+    ground: Option<DesktopGround>,
+    ground_dirty: bool,
 }
 
 impl Renderer {
@@ -137,7 +165,156 @@ impl Renderer {
             sky_pipeline,
             sky_dome: None,
             sky_visible: true,
+            water_pipeline: None,
+            water_bodies: Vec::new(),
+            water_seconds: 0.0,
+            ground: None,
+            ground_dirty: false,
         }
+    }
+
+    pub fn set_ground(&mut self, ground: Option<DesktopGround>) {
+        self.ground = ground;
+        self.ground_dirty = true;
+    }
+
+    pub fn set_water(&mut self, bodies: &[(Vec<WaterVertex>, Vec<u32>, WaterUniform, WaveParams)]) {
+        self.ground_dirty = true;
+        if bodies.is_empty() {
+            self.water_bodies.clear();
+            return;
+        }
+        if self.water_pipeline.is_none() {
+            self.water_pipeline = Some(WaterPipeline::new(&self.device, self.format, &self.uniform_buf.layout, 1));
+        }
+        let pipeline = self.water_pipeline.as_ref().expect("made above");
+        self.water_bodies = bodies
+            .iter()
+            .filter(|(v, i, _, _)| !v.is_empty() && !i.is_empty())
+            .map(|(verts, indices, uniform, params)| {
+                let vertex_buffer = self.device.create_buffer_init(&util::BufferInitDescriptor {
+                    label: Some("water_vb"),
+                    contents: bytemuck::cast_slice(verts),
+                    usage: BufferUsages::VERTEX,
+                });
+                let index_buffer = self.device.create_buffer_init(&util::BufferInitDescriptor {
+                    label: Some("water_ib"),
+                    contents: bytemuck::cast_slice(indices),
+                    usage: BufferUsages::INDEX,
+                });
+                let uniform_buffer = self.device.create_buffer_init(&util::BufferInitDescriptor {
+                    label: Some("water_uniform"),
+                    contents: bytemuck::bytes_of(uniform),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                });
+                let waves = WaveField::new(&self.device, &self.queue, *params);
+                waves.reprime();
+                let bind_groups = pipeline.bind_groups(&self.device, &uniform_buffer, &waves);
+                DesktopWater {
+                    vertex_buffer,
+                    index_buffer,
+                    uniform_buffer,
+                    bind_groups,
+                    index_count: indices.len() as u32,
+                    uniform: *uniform,
+                    waves,
+                    bounds: super::water_pipeline::water_bounds(verts, params),
+                }
+            })
+            .collect();
+        log::info!("desktop water: {} body/bodies installed", self.water_bodies.len());
+    }
+
+    pub fn water_body_count(&self) -> usize {
+        self.water_bodies.len()
+    }
+
+    pub fn set_water_time(&mut self, seconds: f32) {
+        self.water_seconds = seconds as f64;
+        for body in &mut self.water_bodies {
+            body.uniform.set_time(self.water_seconds, body.waves.params.loop_seconds);
+            self.queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
+        }
+    }
+
+    pub fn sea_line(&self) -> f32 {
+        let Some(g) = self.ground.as_ref() else { return -1e9 };
+        let (min, max) = (g.heights.min, g.heights.max);
+        self.water_bodies
+            .iter()
+            .filter(|b| {
+                let (lo, hi) = b.bounds;
+                lo.x < min.x || hi.x > max.x || lo.z < min.y || hi.z > max.y
+            })
+            .map(|b| b.uniform.extinction[3])
+            .fold(-1e9, f32::max)
+    }
+
+    fn ensure_ground_map(&mut self) {
+        if !self.ground_dirty {
+            return;
+        }
+        self.ground_dirty = false;
+        let sea_line = self.sea_line();
+        let placement = match self.ground.as_ref() {
+            Some(g) => {
+                let started = std::time::Instant::now();
+                let (irradiance, sun) = match self.sky_dome.as_ref() {
+                    Some(s) => (s.irradiance, s.sun),
+                    None => (
+                        self.sky
+                            .as_ref()
+                            .map(|s| super::sky::SkyIrradiance { sh: s.sh.map(|v| [v[0] * s.intensity, v[1] * s.intensity, v[2] * s.intensity]) })
+                            .unwrap_or_else(|| super::sky::SkyIrradiance::flat(super::sky::AMBIENT)),
+                        None,
+                    ),
+                };
+                let map = ground_map::build(
+                    &ground_map::GroundInputs {
+                        heights: &g.heights,
+                        sky: &irradiance,
+                        sun: sun.as_ref(),
+                        sky_occlusion: None,
+                        layers: &g.layers,
+                        splat: g.splat.as_ref(),
+                        settings: &g.settings,
+                        sea_line,
+                    },
+                    DESKTOP_GROUND_MAP_SIZE,
+                );
+                let view = ground_map::upload(&self.device, &self.queue, &map);
+                let extent = map.max - map.min;
+                self.uniform_buf.set_ground_map(view);
+                log::info!(
+                    "desktop ground map: {}x{} over {:.0} x {:.0} m, sea line {:.2}, built in {} ms",
+                    map.width,
+                    map.height,
+                    extent.x,
+                    extent.y,
+                    sea_line,
+                    started.elapsed().as_millis()
+                );
+                Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top))
+            }
+            None => {
+                self.uniform_buf.set_ground_map(uniforms::default_ground_map(&self.device));
+                None
+            }
+        };
+        let mut probes = self.uniform_buf.probes();
+        probes.set_outdoors(None, None, placement);
+        let (probe_view, probe_sampler) = uniforms::default_probe_cube(&self.device);
+        self.uniform_buf.rebind_probes(
+            &self.device,
+            &self.lights_uniform,
+            self.shadow_map.sun_depth_view(),
+            self.shadow_map.sun_dynamic_depth_view(),
+            self.shadow_map.spot_depth_view(),
+            self.shadow_map.sampler(),
+            &probe_view,
+            &probe_sampler,
+            probes,
+        );
     }
 
     pub fn set_sky_panorama(
@@ -442,6 +619,7 @@ impl Renderer {
         lights: &[lights::Light],
         overlay_cuboids: &[Cuboid],
     ) {
+        self.ensure_ground_map();
         let vp = camera.projection() * camera.view();
 
         let ranked = lights::rank_for_budget(lights, lights::MAX_LIGHTS);
@@ -612,6 +790,10 @@ impl Renderer {
                 label: Some("frame"),
             });
 
+        for body in &self.water_bodies {
+            body.waves.update(&self.queue, &mut encoder, self.water_seconds);
+        }
+
         let solid_caster = (!solid_indices.is_empty())
             .then_some((&solid_vb, &solid_ib, solid_indices.len() as u32));
 
@@ -742,6 +924,17 @@ impl Renderer {
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(0..*count, 0, 0..1);
+                }
+            }
+
+            if let Some(wp) = self.water_pipeline.as_ref().filter(|_| !self.water_bodies.is_empty()) {
+                pass.set_pipeline(&wp.pipeline);
+                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                for body in &self.water_bodies {
+                    pass.set_bind_group(1, &body.bind_groups[body.waves.current()], &[]);
+                    pass.set_vertex_buffer(0, body.vertex_buffer.slice(..));
+                    pass.set_index_buffer(body.index_buffer.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..body.index_count, 0, 0..1);
                 }
             }
 
