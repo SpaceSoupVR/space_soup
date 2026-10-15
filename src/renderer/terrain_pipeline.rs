@@ -2282,6 +2282,7 @@ impl TerrainMaterial {
 
 }
 
+#[derive(Clone)]
 pub struct TerrainImage {
     pub width: u32,
     pub height: u32,
