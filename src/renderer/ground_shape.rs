@@ -118,7 +118,13 @@ impl GroundShape {
         let texels = (0..samples)
             .map(|i| {
                 let n = normals[i].try_normalize().unwrap_or(Vec3::Y);
-                let h = f32::from_bits((positions[i].y.to_bits() & !DIAGONAL_BIT) | if across[i] { DIAGONAL_BIT } else { 0 });
+                // A height of zero (or a denormal) would carry the bit as a
+                // DENORMAL, which a GPU may flush to zero on the way in: the
+                // cell would take the other triangle. The smallest normal
+                // number instead (1e-38 m), its sign kept.
+                let y = positions[i].y;
+                let y = if y.to_bits() & 0x7fff_ffff < f32::MIN_POSITIVE.to_bits() { f32::MIN_POSITIVE.copysign(y) } else { y };
+                let h = f32::from_bits((y.to_bits() & !DIAGONAL_BIT) | if across[i] { DIAGONAL_BIT } else { 0 });
                 [n.x, n.y, n.z, h]
             })
             .collect();
@@ -169,26 +175,42 @@ struct GroundShapeRead {
 // THE STEP-1 GROUND UNDER A PIXEL (`ground_shape`): the cell from the uv, the
 // triangle from the cell's diagonal, the normals blended as the rasterizer
 // blends a step-1 triangle's, and that triangle's own plane.
-fn ground_shape_at(uv: vec2<f32>, lattice: f32) -> GroundShapeRead {
+//
+// ONLY UNDER A COARSER TRIANGLE: `corner` is the drawn triangle's first
+// vertex (flat), whose lattice sample is even along x and z for every vertex
+// of a coarser step and odd along one of them for every step-1 triangle (the
+// step-1 lists put such a vertex first: `ground_lod::GroundLod::build_with`).
+// A step-1 triangle IS the lattice triangle: its interpolated vertex normal
+// is the step-1 normal, exactly, at every sample, edge pixels included --
+// so it reads nothing and the branch skips the four loads. (Read at the
+// pixel's centre an edge pixel took the NEIGHBOUR's normal: the crease moved
+// to the pixel grid. Centroid interpolation fixed that and cost 6 to 9 ms a
+// frame on the Quest 3: any centroid varying in a pipeline is a threshold
+// penalty there. 2026-10-15.)
+fn ground_shape_at(uv: vec2<f32>, corner: vec2<f32>, lattice: f32) -> GroundShapeRead {
     var r: GroundShapeRead;
-    r.shaped = (mat.shape.x > 0.0) & (lattice > 0.999);
-    let g = uv * mat.shape.xy;
-    let c = clamp(vec2<i32>(floor(g)), vec2<i32>(0), vec2<i32>(textureDimensions(ground_shape)) - 2);
-    let t = clamp(g - vec2<f32>(c), vec2<f32>(0.0), vec2<f32>(1.0));
-    let a = textureLoad(ground_shape, c, 0);
-    let b = textureLoad(ground_shape, c + vec2<i32>(1, 0), 0);
-    let d = textureLoad(ground_shape, c + vec2<i32>(0, 1), 0);
-    let e = textureLoad(ground_shape, c + vec2<i32>(1, 1), 0);
-    // The triangle's two edges along x and z, normal and height alike: its
-    // normal is a corner's plus `t` along them, and its plane falls by their
-    // heights' steps. `first`: the cell's diagonal runs from `a` to `e`.
-    let first = (bitcast<u32>(a.w) & 1u) == 0u;
-    let upper = select(t.x + t.y > 1.0, t.y > t.x, first);
-    let along_x = select(b - a, e - d, upper);
-    let along_z = select(e - b, d - a, first == upper);
-    let base = select(a.xyz, b.xyz + d.xyz - e.xyz, upper & !first);
-    r.n = base + along_x.xyz * t.x + along_z.xyz * t.y;
-    r.face = normalize(vec3<f32>(-along_x.w * mat.shape.z, 1.0, -along_z.w * mat.shape.w));
+    let k = vec2<u32>(round(corner * mat.shape.xy));
+    let coarse = all((k & vec2<u32>(1u)) == vec2<u32>(0u));
+    if ((mat.shape.x > 0.0) & (lattice > 0.999) & coarse) {
+        r.shaped = true;
+        let g = uv * mat.shape.xy;
+        let c = clamp(vec2<i32>(floor(g)), vec2<i32>(0), vec2<i32>(textureDimensions(ground_shape)) - 2);
+        let t = clamp(g - vec2<f32>(c), vec2<f32>(0.0), vec2<f32>(1.0));
+        let a = textureLoad(ground_shape, c, 0);
+        let b = textureLoad(ground_shape, c + vec2<i32>(1, 0), 0);
+        let d = textureLoad(ground_shape, c + vec2<i32>(0, 1), 0);
+        let e = textureLoad(ground_shape, c + vec2<i32>(1, 1), 0);
+        // The triangle's two edges along x and z, normal and height alike: its
+        // normal is a corner's plus `t` along them, and its plane falls by their
+        // heights' steps. `first`: the cell's diagonal runs from `a` to `e`.
+        let first = (bitcast<u32>(a.w) & 1u) == 0u;
+        let upper = select(t.x + t.y > 1.0, t.y > t.x, first);
+        let along_x = select(b - a, e - d, upper);
+        let along_z = select(e - b, d - a, first == upper);
+        let base = select(a.xyz, b.xyz + d.xyz - e.xyz, upper & !first);
+        r.n = base + along_x.xyz * t.x + along_z.xyz * t.y;
+        r.face = normalize(vec3<f32>(-along_x.w * mat.shape.z, 1.0, -along_z.w * mat.shape.w));
+    }
     return r;
 }
 "#;
@@ -197,7 +219,7 @@ fn ground_shape_at(uv: vec2<f32>, lattice: f32) -> GroundShapeRead {
 /// without it: what [`unshaped`] edits.
 pub const SHAPED_EDITS: &[(&str, &str)] = &[
     (
-        "    let shape = ground_shape_at(in.shape_uv, in.col.a);\n    let n = normalize(select(in.normal, to_player_direction(shape.n), shape.shaped));\n",
+        "    let shape = ground_shape_at(in.uv, in.corner, in.col.a);\n    let n = normalize(select(in.normal, to_player_direction(shape.n), shape.shaped));\n",
         "    let n = normalize(in.normal);\n",
     ),
     ("    let f = sample_frame(in.tex_pos, n, step_x, step_y, to_player_direction(shape.face), shape.shaped);", "    let f = sample_frame(in.tex_pos, n, step_x, step_y, n, false);"),
@@ -270,6 +292,18 @@ mod tests {
         assert!(worst.1 < 1e-4, "face off by {}", worst.1);
     }
 
+    /// A FLAT GROUND AT HEIGHT ZERO KEEPS ITS DIAGONALS: the bit rides on a
+    /// normal number, never a denormal a GPU may flush.
+    #[test]
+    fn a_height_of_zero_keeps_its_diagonal_bit_on_a_normal_number() {
+        let cells = 8;
+        let (positions, normals, triangles) = lattice(cells, &|x, z| if (x + z) > 0.0 { 0.0 } else { -0.0 });
+        let shape = GroundShape::build([cells, cells], [cells as f32; 2], &positions, &normals, &triangles).unwrap();
+        assert!(shape.texels.iter().all(|t| t[3].is_normal()), "a height carries the bit as a denormal");
+        assert!(shape.texels.iter().all(|t| t[3].abs() < 1e-30));
+        assert!(shape.texels.iter().any(|t| t[3].to_bits() & DIAGONAL_BIT != 0));
+    }
+
     /// A COARSER TRIANGLE READS THE GROUND UNDER IT: a step-2 triangle's
     /// middle reads the step-1 triangle there, not the blend of its own
     /// three corners.
@@ -308,7 +342,7 @@ mod varyings {
     /// EVERY GROUND READER'S VARYINGS FIT THE QUEST 3: no vertex output past
     /// location 14 (15 inter-stage locations; the host does not enforce it,
     /// the headset refuses the pipeline -- `effects::variants`' test of the
-    /// same name). The shape added `shape_uv` at location 5. Every role,
+    /// same name). The shape added `corner` (flat) at location 5. Every role,
     /// both builds, the slope twins and the weather's.
     #[test]
     fn every_ground_readers_varyings_fit_the_quest_3s_inter_stage_limit() {
@@ -339,6 +373,18 @@ mod varyings {
                             }
                         }
                         assert!(top < QUEST3_MAX_INTER_STAGE_LOCATIONS, "{role:?} writes location {top}; the Quest 3 stops at 14");
+                        // NO CENTROID on any ground varying: on the Quest 3
+                        // one centroid varying cost the ground's pipelines 6
+                        // to 9 ms a frame (2026-10-15; `brush_pipeline`'s
+                        // `the_brush_does_not_pay_for_centroid_interpolation`).
+                        if let wgpu::naga::TypeInner::Struct { members, .. } = &module.types[result.ty].inner {
+                            for m in members {
+                                if let Some(wgpu::naga::Binding::Location { sampling, .. }) = &m.binding {
+                                    assert_ne!(*sampling, Some(wgpu::naga::Sampling::Centroid), "{role:?}: `{}` is interpolated at the centroid", m.name.as_deref().unwrap_or("?"));
+                                }
+                            }
+                        }
+                        assert!(!src.contains(", centroid") && !src.contains("(centroid"), "{role:?}: a ground reader asks for centroid");
                         checked += 1;
                     }
                 }
@@ -365,13 +411,13 @@ mod sizes {
         // The face is dead in a gentle twin (its steep test is false): what
         // the compiler keeps of the read there.
         let faceless = |src: &str| {
-            let face = "    r.face = normalize(vec3<f32>(-along_x.w * mat.shape.z, 1.0, -along_z.w * mat.shape.w));";
+            let face = "        r.face = normalize(vec3<f32>(-along_x.w * mat.shape.z, 1.0, -along_z.w * mat.shape.w));";
             assert!(src.contains(face));
-            src.replace(face, "    r.face = vec3<f32>(0.0, 1.0, 0.0);")
+            src.replace(face, "        r.face = vec3<f32>(0.0, 1.0, 0.0);")
                 .replace("let along_x = select(b - a, e - d, upper);", "let along_x = vec4<f32>(select(b.xyz - a.xyz, e.xyz - d.xyz, upper), 0.0);")
                 .replace("let along_z = select(e - b, d - a, first == upper);", "let along_z = vec4<f32>(select(e.xyz - b.xyz, d.xyz - a.xyz, first == upper), 0.0);")
         };
-        let unshaped = |src: &str| src.replace("    let shape = ground_shape_at(in.shape_uv, in.col.a);\n", "    var shape: GroundShapeRead;\n");
+        let unshaped = |src: &str| src.replace("    let shape = ground_shape_at(in.uv, in.corner, in.col.a);\n", "    var shape: GroundShapeRead;\n");
         eprintln!("dry gentle: {} with the read; {} as the compiler keeps it (face dead); {} without it", total(&gentle), total(&faceless(&gentle)), total(&unshaped(&gentle)));
         for kinds in crate::renderer::weather::WeatherKinds::ALL {
             let w = crate::renderer::weather::with_weather_kinds(&gentle, kinds).unwrap();

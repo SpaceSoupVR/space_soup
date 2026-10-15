@@ -351,11 +351,13 @@ impl Lattice {
         let cross = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
         let v = |q: (usize, usize)| self.vertex(q.0, q.1);
         // The mesher's `[a, c, b]` of a cell turns this way.
-        if cross < 0 {
-            out.extend_from_slice(&[v(p[0]), v(p[1]), v(p[2])]);
-        } else {
-            out.extend_from_slice(&[v(p[0]), v(p[2]), v(p[1])]);
-        }
+        let t = if cross < 0 { [p[0], p[1], p[2]] } else { [p[0], p[2], p[1]] };
+        // First (the provoking vertex) a sample even along x and z where
+        // there is one: what tells the ground reader a triangle is no
+        // step-1 triangle (`ground_shape::WGSL`). Turned, not reflected.
+        let even = |q: (usize, usize)| self.xs[q.0] % 2 == 0 && self.zs[q.1] % 2 == 0;
+        let r = (0..3).find(|k| even(t[*k])).unwrap_or(0);
+        out.extend_from_slice(&[v(t[r]), v(t[(r + 1) % 3]), v(t[(r + 2) % 3])]);
     }
 }
 
@@ -663,7 +665,13 @@ impl GroundLod {
                     chunk
                 }
             };
-            whole0[chunk as usize].extend_from_slice(t);
+            // A lattice triangle with a sample odd along x or z FIRST (the
+            // provoking vertex; every cell's triangle has one): the ground
+            // reader knows a step-1 triangle by it and reads no shape there
+            // (`ground_shape::WGSL`). Turned, not reflected: the same winding.
+            let odd = |v: u32| v < grid_vertices && ((v % stride) % 2 == 1 || (v / stride) % 2 == 1);
+            let r = (0..3).find(|k| odd(t[*k])).unwrap_or(0);
+            whole0[chunk as usize].extend_from_slice(&[t[r], t[(r + 1) % 3], t[(r + 2) % 3]]);
         }
         if let Some(open) = input.open {
             for z in 0..cz {
@@ -2045,6 +2053,41 @@ pub(crate) mod tests {
     /// A HELD CHUNK (the weather's, `GroundLod::hold`) is at step 1 from
     /// anywhere, its neighbours differ from it by one level at most, and
     /// letting it go gives the tree back as it was.
+    /// THE PROVOKING VERTEX SAYS WHICH STEP A TRIANGLE IS (`ground_shape`):
+    /// every step-1 lattice triangle starts at a sample odd along x or z,
+    /// every coarser one at a sample even along both -- the flat `corner`
+    /// the ground reader reads the shape by -- and turning them kept every
+    /// triangle's winding.
+    #[test]
+    fn a_triangles_first_vertex_tells_step_1_from_coarser() {
+        let cells = 96;
+        let (positions, triangles, lod) = built(cells, 32, true);
+        let stride = cells + 1;
+        let even = |v: u32| (v % stride) % 2 == 0 && (v / stride) % 2 == 0;
+        let up = |t: &[u32]| {
+            let (a, b, c) = (positions[t[0] as usize], positions[t[1] as usize], positions[t[2] as usize]);
+            (b - a).cross(c - a).y
+        };
+        let sign = up(&triangles[0..3]).signum();
+        let n0 = lod.level0_len() as usize;
+        for (i, t) in lod.indices.chunks_exact(3).enumerate() {
+            assert_eq!(up(t).signum(), sign, "triangle {i} turned over");
+            if i * 3 < n0 {
+                assert!(!even(t[0]), "step-1 triangle {i} starts at an even sample");
+            }
+        }
+        // Each coarser node's whole list: every triangle starts even.
+        let mut coarse = 0;
+        for node in lod.nodes.iter().filter(|n| n.level > 0 && n.whole != NONE) {
+            let u = lod.units[node.whole as usize];
+            for t in lod.indices[u.first as usize..(u.first + u.count) as usize].chunks_exact(3) {
+                assert!(even(t[0]), "a step-{} triangle starts odd", 1 << node.level);
+                coarse += 1;
+            }
+        }
+        assert!(coarse > 100, "{coarse} coarser triangles");
+    }
+
     #[test]
     fn a_held_chunk_is_at_step_1_from_anywhere() {
         let (positions, triangles, mut lod) = built(1024, CHUNK_CELLS, true);
