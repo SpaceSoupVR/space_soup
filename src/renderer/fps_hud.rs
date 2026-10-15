@@ -21,7 +21,7 @@ pub const HEIGHT_PX: u32 = 144;
 /// to the left, where it can be read with a glance and stays out of the way.
 pub const WIDTH_M: f32 = 0.14;
 pub const HEIGHT_M: f32 = WIDTH_M * HEIGHT_PX as f32 / WIDTH_PX as f32;
-pub const POSITION: [f32; 3] = [-0.11, -0.11, -0.75];
+pub const POSITION: [f32; 3] = [-0.17, -0.16, -0.75];
 
 const SCALE: usize = 4;
 const MARGIN: usize = 16;
