@@ -59,7 +59,10 @@ use openxr as xr;
 
 /// Near and far planes of every eye projection (`Camera::xr_projection`).
 pub const NEAR_Z: f32 = 0.03;
-pub const FAR_Z: f32 = 1000.0;
+/// 1800 m: far enough that a 1.5 km map is not clipped to sky from one end.
+/// Depth is a 32-bit float from NEAR_Z, so this costs a little precision far
+/// out; nothing a player stands next to is affected.
+pub const FAR_Z: f32 = 1800.0;
 
 /// The motion vectors' format: signed half floats, as the spec recommends.
 pub const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;

@@ -253,7 +253,7 @@ impl LayeredMeshPipeline {
                 resource: buffer.as_entire_binding(),
             }],
         });
-        super::mesh_pipeline::ModelUniform { buffer, bind_group }
+        super::mesh_pipeline::ModelUniform { buffer, bind_group, last_plain: std::sync::Mutex::new(None) }
     }
 }
 

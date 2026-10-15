@@ -81,7 +81,12 @@ pub struct TerrainMaterialUniform {
     /// leaves it wet, over `wet_band` metres above it. Off far below.
     pub wet_line: f32,
     pub wet_band: f32,
-    pub _pad: f32,
+    /// THE GROUND'S RELIEF, in metres, by parallax occlusion: each layer's
+    /// height map (the green channel of its occlusion image, see
+    /// `load_terrain_ao`) is marched along the view so a rut's far wall
+    /// shows and its near wall hides, as it does on a real field. 0 turns
+    /// it off and skips every step; the Quest leaves it at 0.
+    pub parallax: f32,
 }
 
 impl Default for TerrainMaterialUniform {
@@ -99,7 +104,7 @@ impl Default for TerrainMaterialUniform {
             normal_strength: 1.0,
             wet_line: -1e9,
             wet_band: 1.0,
-            _pad: 0.0,
+            parallax: 0.0,
         }
     }
 }
@@ -862,7 +867,7 @@ struct Material {{
     normal_strength: f32,
     wet_line: f32,
     wet_band: f32,
-    pad2: f32,
+    parallax: f32,
 }}
 @group(1) @binding(3) var<uniform> mat: Material;
 @group(1) @binding(4) var splat_tex: texture_2d<f32>;
@@ -1038,11 +1043,82 @@ const CLIFF_WARP_M: f32 = 2.5;
 const CLIFF_BAND_WARP_M: f32 = 3.0;
 const CLIFF_BAND_SCALE_M: f32 = 7.0;
 
-fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> SampleFrame {{
+// The layers' blended height under a planar uv, 0 at the bottom of the
+// relief and 1 at the top, from the green of the occlusion array (see
+// `load_terrain_ao`). Explicit gradients, so it may be read inside the march.
+// The height of ONE layer -- the heaviest under the pixel. The march reads
+// it ten-odd times a pixel, so a blend of four here cost four times the
+// taps for a difference only visible at a paint boundary, where the relief
+// of the layer taking over is the right one to show anyway.
+fn layers_height(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, layer: i32) -> f32 {{
+    let r = max(mat.repeat[layer], 0.001);
+    return textureSampleGrad(ao_tex, layer_samp, uv / r, layer, ddx / r, ddy / r).g;
+}}
+
+// Which layer carries the most weight under the pixel.
+fn dominant_layer(w: vec4<f32>) -> i32 {{
+    var best = 0;
+    var bw = w.x;
+    if (w.y > bw) {{ best = 1; bw = w.y; }}
+    if (w.z > bw) {{ best = 2; bw = w.z; }}
+    if (w.w > bw) {{ best = 3; }}
+    return best;
+}}
+
+// THE GROUND'S RELIEF, by parallax occlusion. The view ray is marched down
+// into `relief` metres of height field in even steps of depth, and where it
+// first passes under the surface is where the eye really lands: the far
+// wall of a rut comes forward, its near wall hides, a clod's top covers the
+// ground behind it. Returns how far across the ground (metres) the sample
+// point moves. More steps at a grazing view, where the ray crosses more
+// ground per step and would otherwise step through thin ridges.
+fn parallax_shift(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, w: vec4<f32>, eye: vec3<f32>, relief: f32) -> vec2<f32> {{
+    let up = max(eye.y, 0.12);
+    let slide = -eye.xz / up;
+    let steps = mix(6.0, 14.0, 1.0 - up);
+    let layer = dominant_layer(w);
+    let layer_d = relief / steps;
+    let step_uv = slide * layer_d;
+    var cur_uv = uv;
+    var cur_depth = 0.0;
+    var surf = (1.0 - layers_height(cur_uv, ddx, ddy, layer)) * relief;
+    var prev_uv = uv;
+    var prev_depth = 0.0;
+    var prev_surf = surf;
+    for (var i = 0; i < 14; i++) {{
+        if (cur_depth >= surf || f32(i) >= steps) {{
+            break;
+        }}
+        prev_uv = cur_uv;
+        prev_depth = cur_depth;
+        prev_surf = surf;
+        cur_uv = cur_uv + step_uv;
+        cur_depth = cur_depth + layer_d;
+        surf = (1.0 - layers_height(cur_uv, ddx, ddy, layer)) * relief;
+    }}
+    // Where the ray crossed between the last two samples.
+    let after = surf - cur_depth;
+    let before = prev_surf - prev_depth;
+    let t = clamp(before / max(before - after, 1e-5), 0.0, 1.0);
+    return mix(prev_uv, cur_uv, t) - uv;
+}}
+
+// How far the relief is marched, in metres: fully to 18 m, gone by 30 m,
+// where a rut is under a pixel anyway and the normal map alone carries it.
+const PARALLAX_NEAR_M: f32 = 18.0;
+const PARALLAX_FAR_M: f32 = 30.0;
+
+fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32, w: vec4<f32>, eye: vec3<f32>, eye_dist: f32) -> SampleFrame {{
     var f: SampleFrame;
     f.planar_uv  = world.xz;
     f.planar_ddx = dpdx(world.xz);
     f.planar_ddy = dpdy(world.xz);
+    // The relief, on the gentle ground the planar projection covers.
+    let relief = mat.parallax * (1.0 - smoothstep(PARALLAX_NEAR_M, PARALLAX_FAR_M, eye_dist))
+        * select(1.0, 0.0, slope_deg >= mat.biplanar_start_deg);
+    if (relief > 0.0005) {{
+        f.planar_uv = f.planar_uv + parallax_shift(f.planar_uv, f.planar_ddx, f.planar_ddy, w, eye, relief);
+    }}
 
     // At unit repeat, so each layer divides rather than recomputing.
     let b = biplanar_axes(world, n, 1.0);
@@ -1258,7 +1334,10 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // axes: picked by the player-frame one, steep ground swapped its x and z
     // projections at every quarter turn (headset `outdoors_front-y90`,
     // 2026-10-01, the far bank).
-    let f = sample_frame(in.tex_pos, to_world_direction(n), slope_deg);
+    let f = sample_frame(
+        in.tex_pos, to_world_direction(n), slope_deg, w,
+        to_world_direction(normalize(cam_pos() - in.world_pos)), distance(in.world_pos, cam_pos()),
+    );
 
     // Blend the layers' normals by the same weights, then renormalise. Summing
     // unit vectors shortens the result wherever they disagree, and a shortened
@@ -3250,8 +3329,44 @@ pub fn load_terrain_rough(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
 pub fn load_terrain_ao(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
     TERRAIN_AO_FILES
         .iter()
-        .map(|name| TerrainImage::load(&dir.join(name)))
+        .zip(TERRAIN_DISPLACEMENT_FILES.iter())
+        .map(|(ao_name, d_name)| {
+            let ao = TerrainImage::load(&dir.join(ao_name));
+            let disp = TerrainImage::load(&dir.join(d_name));
+            with_height_in_green(ao, disp)
+        })
         .collect()
+}
+
+/// Each layer's height map, beside its occlusion: `<layer>_d.jpg`, a grey
+/// picture, bright where the surface stands proud. Optional, like the rest.
+pub const TERRAIN_DISPLACEMENT_FILES: [&str; 4] =
+    ["ground_d.jpg", "rock_d.jpg", "high_d.jpg", "sediment_d.jpg"];
+
+/// The occlusion image with the height map in its GREEN channel.
+///
+/// One array rather than a fifth: the occlusion image is a grey picture
+/// carried as RGBA, so its green and blue were copies of its red. Height
+/// rides in green, read by the shader's parallax march, and no bind group
+/// layout, pipeline or headset build changes. A layer with no height map
+/// gets full green -- "at the top" -- which the march leaves exactly where
+/// it is; a layer with a height map but no occlusion map gets white
+/// occlusion under it.
+pub fn with_height_in_green(ao: Option<TerrainImage>, disp: Option<TerrainImage>) -> Option<TerrainImage> {
+    let mut out = match (ao, &disp) {
+        (Some(ao), _) => ao,
+        (None, Some(d)) => solid_image([255, 255, 255], d.width, d.height),
+        (None, None) => return None,
+    };
+    let height = match disp {
+        Some(d) if d.width == out.width && d.height == out.height => d,
+        Some(d) => resample(&d, out.width, out.height),
+        None => solid_image([255, 255, 255], out.width, out.height),
+    };
+    for (px, h) in out.rgba.chunks_exact_mut(4).zip(height.rgba.chunks_exact(4)) {
+        px[1] = h[0];
+    }
+    Some(out)
 }
 
 /// The project's terrain material settings, from `settings.json` beside the
@@ -3300,6 +3415,9 @@ pub fn load_terrain_settings(dir: &std::path::Path) -> TerrainMaterialUniform {
     }
     if let Some(v) = raw.get("normal_strength").and_then(|v| v.as_f64()) {
         out.normal_strength = (v as f32).clamp(0.0, 4.0);
+    }
+    if let Some(v) = raw.get("parallax").and_then(|v| v.as_f64()) {
+        out.parallax = (v as f32).clamp(0.0, 0.5);
     }
     out
 }

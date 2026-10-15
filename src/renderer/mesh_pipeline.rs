@@ -287,7 +287,7 @@ impl MeshPipeline {
             }],
         });
 
-        ModelUniform { buffer, bind_group }
+        ModelUniform { buffer, bind_group, last_plain: std::sync::Mutex::new(None) }
     }
 }
 
@@ -309,6 +309,10 @@ pub const MODEL_WEATHER_OFFSET: u64 = 272;
 pub struct ModelUniform {
     pub buffer: Buffer,
     pub bind_group: BindGroup,
+    /// The matrix the plain `upload` last wrote, so a static mesh -- a
+    /// scattered tree, a placed prop -- costs no buffer write per frame.
+    /// Cleared by every richer upload, which writes more than the matrix.
+    pub last_plain: std::sync::Mutex<Option<[f32; 16]>>,
 }
 
 impl ModelUniform {
@@ -324,7 +328,16 @@ impl ModelUniform {
     /// The neutral, and what every caller that has no occlusion data wants: 1.0
     /// reproduces the shading meshes had before the term existed.
     pub fn upload(&self, queue: &Queue, model: glam::Mat4) {
+        let cols = model.to_cols_array();
+        if let Ok(last) = self.last_plain.lock() {
+            if *last == Some(cols) {
+                return;
+            }
+        }
         self.upload_with_sky(queue, model, 1.0);
+        if let Ok(mut last) = self.last_plain.lock() {
+            *last = Some(cols);
+        }
     }
 
     /// Upload the model matrix and how much sky reaches this object.
@@ -426,6 +439,9 @@ impl ModelUniform {
         thin_width: f32,
         own_scale: f32,
     ) {
+        if let Ok(mut last) = self.last_plain.lock() {
+            *last = None;
+        }
         let mut data = [0f32; (MODEL_WEATHER_OFFSET / 4) as usize];
         data[..16].copy_from_slice(&model.to_cols_array());
         data[16] = sky_vis.clamp(0.0, 1.0);
@@ -699,7 +715,7 @@ impl SkinnedMeshPipeline {
                 resource: buffer.as_entire_binding(),
             }],
         });
-        ModelUniform { buffer, bind_group }
+        ModelUniform { buffer, bind_group, last_plain: std::sync::Mutex::new(None) }
     }
 }
 
@@ -797,21 +813,30 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // asset was lit with; below 1 it is the surface's roughness (0 polished,
     // ~1 matte) and it shades as a material (see `shade_material`).
     let rough = textureSample(emissive_tex, samp, in.uv).a;
-    // The lamps and the sky, and the lit room round it: see `room_light`.
-    var lit: vec3<f32>;
-    if (rough >= 0.996) {{
-        lit = shade_with_sky(in.world_pos, n, model_u.params.x);
-    }} else {{
-        lit = shade_material(in.world_pos, n, rough, 1.0, model_u.params.x);
-    }}
-    lit = lit + room_irradiance(n);
     let tex_color = textureSample(tex, samp, in.uv);
+    // See-through texels -- the clear part of a leaf card -- leave nothing
+    // behind, not even depth: a tree in front must not hide the one behind.
+    if (tex_color.a < 0.35) {{
+        discard;
+    }}
+    // The lamps and the sky, and the lit room round it: see `room_light`. A
+    // material (gloss below 1) takes its albedo on the diffuse terms only, so
+    // a dark surface still shows the lamps' highlight -- see `MATERIAL_SHADE`.
+    var shaded: vec3<f32>;
+    if (rough >= 0.996) {{
+        shaded = tex_color.rgb * (shade_with_sky(in.world_pos, n, model_u.params.x) + room_irradiance(n));
+    }} else {{
+        shaded = shade_material_env(
+            in.world_pos, n, rough, 1.0, model_u.params.x, room_irradiance(n), vec4<f32>(0.5, 0.5, 0.5, 0.0),
+            tex_color.rgb, in.world_pos, n,
+        );
+    }}
     // WET IN THE RAIN (`weather`): water in the skin and cloth darkens them,
     // and a film of it glosses them -- its highlight and reflection from the
     // same lamps, sun, probes and sky as any surface (albedo black: the film
     // alone). A uniform branch: a dry body skips it.
     let wet = model_u.weather.x;
-    var rgb = tex_color.rgb * lit * (1.0 - 0.4 * wet);
+    var rgb = shaded * (1.0 - 0.4 * wet);
     if (wet > 0.0) {{
         rgb = rgb + wet * shade_material_env(
             in.world_pos, n, 0.3, 1.0, model_u.params.x, vec3<f32>(0.0), vec4<f32>(0.5, 0.5, 0.5, 0.0),
@@ -1139,6 +1164,28 @@ fn mesh_shader_variant(thin: bool) -> String {
     mesh_shader_variant_with(thin, thin)
 }
 
+/// How a mesh's pixel is lit, by its material's GLOSS -- the emissive mask's
+/// alpha, which every asset bakes to 1 unless a graphics profile asks the
+/// loader to honour the glTF roughness (`mesh::set_gltf_roughness`).
+///
+/// At 1 the surface takes the classic constant sheen every asset was lit
+/// with, exactly as before: the whole lit sum times the albedo. Below 1 it is
+/// a MATERIAL of that roughness, and its albedo lands on the diffuse terms
+/// only: the highlight on a black rifle is the lamp's colour, not black, which
+/// is the one thing that makes a dark object read as metal or polymer rather
+/// than a silhouette. The baked bounce and the room stand in as the local
+/// environment it reflects, as the brushes' materials do.
+const MATERIAL_SHADE: &str = r#"var colour: vec3<f32>;
+    if (mask.a >= 0.996) {
+        colour = tex_color.rgb * (shade_with_sky(in.world_pos, n, model_u.params.x * baked.a) + own_bulb_fill(in.world_pos, n) + baked.rgb + room_irradiance(n));
+    } else {
+        let env = baked.rgb + room_irradiance(n);
+        colour = shade_material_env(
+            in.world_pos, n, mask.a, 1.0, model_u.params.x * baked.a, env, vec4<f32>(0.5, 0.5, 0.5, 0.0),
+            tex_color.rgb, in.world_pos, n,
+        ) + tex_color.rgb * own_bulb_fill(in.world_pos, n);
+    }"#;
+
 /// `mesh_shader_variant`, the thin pass shaded with the mean over each
 /// fragment's reach (`thin_mean`, as shipped) or, to measure, from the normal
 /// interpolated at the fragment as before 2026-10-01.
@@ -1156,20 +1203,14 @@ fn mesh_shader_variant_with(thin: bool, thin_mean: bool) -> String {
     };
     // The thin pass shades with the mean over each fragment's reach: see
     // `THIN_SHADE`. The other variant's text is unchanged.
-    let (thin_shade, thin_span, lit, room) = if thin && thin_mean {
+    let (thin_shade, thin_span, shaded) = if thin && thin_mean {
         (
             THIN_SHADE,
             "\n    let thin_span = thin_span_at(in.fade, in.thin, in.world_pos);\n    let thin_m = thin_moments(thin_span);",
-            "thin_shade_with_sky(in.world_pos, thin_span, thin_m, model_u.params.x * baked.a) + thin_own_bulb_fill(in.world_pos, thin_span)",
-            "thin_room_irradiance(thin_m)",
+            "let colour = tex_color.rgb * (thin_shade_with_sky(in.world_pos, thin_span, thin_m, model_u.params.x * baked.a) + thin_own_bulb_fill(in.world_pos, thin_span) + baked.rgb + thin_room_irradiance(thin_m));",
         )
     } else {
-        (
-            "",
-            "",
-            "shade_with_sky(in.world_pos, n, model_u.params.x * baked.a) + own_bulb_fill(in.world_pos, n)",
-            "room_irradiance(n)",
-        )
+        ("", "", MATERIAL_SHADE)
     };
     format!(
         r#"
@@ -1331,8 +1372,12 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         st_3 = textureSample(lm_stationary, lm_sun_samp, uv2, 3);
     }}
     set_stationary_masks_exact(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
-    let lit = {lit};
     let tex_color = textureSample(tex, samp, in.uv);
+    // See-through texels (a leaf card's clear part) are cut out, so they
+    // write no depth and hide nothing behind them.
+    if (tex_color.a < 0.35) {{
+        discard;
+    }}
     // ADDED, NOT MULTIPLIED.
     //
     // This used to be a product, and a product cannot ADD light: a surface no
@@ -1359,11 +1404,12 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // factor x MASK x drive. Dropping the mask makes an entire lamp housing
     // glow because its one material declares emissiveFactor [1,1,1] and relies
     // on the texture to pick out the bulb.
-    let mask = textureSample(emissive_tex, samp, in.uv).rgb;
-    let glow = in.emissive * mask * model_u.params.y;
+    let mask = textureSample(emissive_tex, samp, in.uv);
+    let glow = in.emissive * mask.rgb * model_u.params.y;
     // The lit room round it, which the baked bounce -- an old per-object
     // estimate -- all but left out: see `room_light`.
-    return vec4<f32>(tonemap(tex_color.rgb * (lit + baked.rgb + {room}) + glow), tex_color.a{thin_fade});
+    {shaded}
+    return vec4<f32>(tonemap(colour + glow), tex_color.a{thin_fade});
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),

@@ -85,10 +85,65 @@ pub(crate) fn load_primitive_texture(
             clean_emissive_mask(&mut rgba);
             (rgba, w, h)
         }
-        None => (vec![255u8, 255, 255, 255], 1, 1),
+        // The mask's ALPHA is the material's gloss (see `material_gloss_alpha`):
+        // 255 keeps the classic sheen, less shades as that roughness.
+        None => (vec![255u8, 255, 255, material_gloss_alpha(pbr.roughness_factor(), gltf_roughness())], 1, 1),
     };
 
     create_mesh_material_texture(device, queue, layout, &base, &emissive)
+}
+
+/// Whether a glTF material's ROUGHNESS is honoured when a model loads.
+///
+/// The mesh shaders read a surface's gloss from its emissive mask's alpha: at
+/// 1 (255) the surface takes the classic constant sheen every asset was lit
+/// with; below it, it shades as a material of that roughness -- a polished
+/// receiver throws a tight highlight, a polymer grip a broad soft one. Every
+/// asset bakes 255 unless this is on, so nothing already shipped changes
+/// unless a graphics profile asks for it (`spacesoup_graphics`). Read when a
+/// primitive's material texture is made, so it applies to models loaded
+/// after it is set.
+static GLTF_ROUGHNESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_gltf_roughness(on: bool) {
+    GLTF_ROUGHNESS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn gltf_roughness() -> bool {
+    GLTF_ROUGHNESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The emissive mask's alpha for a material with no emissive texture: its
+/// roughness as the shader's gloss when `honour`, else the classic 255. A
+/// roughness of 1 is 255 either way -- fully matte shades as classic, which
+/// is what every untextured material did before.
+pub fn material_gloss_alpha(roughness: f32, honour: bool) -> u8 {
+    if !honour || !roughness.is_finite() {
+        return 255;
+    }
+    (roughness.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+#[cfg(test)]
+mod gloss_tests {
+    use super::material_gloss_alpha;
+
+    #[test]
+    fn off_or_matte_is_the_classic_sheen_and_on_is_the_roughness() {
+        assert_eq!(material_gloss_alpha(0.5, false), 255);
+        assert_eq!(material_gloss_alpha(1.0, true), 255);
+        assert_eq!(material_gloss_alpha(0.5, true), 128);
+        assert_eq!(material_gloss_alpha(0.3, true), 77);
+        assert_eq!(material_gloss_alpha(0.0, true), 0);
+        assert_eq!(material_gloss_alpha(f32::NAN, true), 255);
+    }
+
+    #[test]
+    fn a_half_rough_material_takes_the_shaders_material_path() {
+        // The shaders branch at 0.996 (254/255 is a material, 255 is classic).
+        assert!((material_gloss_alpha(0.7, true) as f32 / 255.0) < 0.996);
+        assert!((material_gloss_alpha(1.0, true) as f32 / 255.0) >= 0.996);
+    }
 }
 
 /// THE EMISSIVE MASK'S COMPRESSION NOISE, ZEROED (2026-09-30).

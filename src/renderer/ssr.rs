@@ -2355,8 +2355,11 @@ mod stereo_target_tests {
     }
 }
 
+#[cfg(test)]
 mod depth_resolve_tests {
-    
+    use super::tests::headless_gpu;
+    use super::*;
+    use wgpu::*;
 
     /// It must read EVERY sample, and take the nearest.
     #[test]
