@@ -582,6 +582,14 @@ struct GpuLight {
 /// shader); a reflection meeting the plane reads it there, so the torch's
 /// pool on a wall shows in the polished floor (`probe_surface_relit`) -- the
 /// photographs hold only the level's own light.
+///
+/// `near`..`far`: how far down the beam's axis (`forward`, from `lens`) the
+/// lit part of the plane lies -- the beam's landings on it, padded. A plane
+/// runs on for ever; the face the beam lit does not. Unbounded, the pillar's
+/// side lit a hand's width off claimed every reflected point within 5 cm of
+/// its plane: a thin dark line down the far wall, ceiling and floor where
+/// nothing stands (headset, 2026-10-14). `far` 0: unbounded, the claim as
+/// before (`Levers::pool_bounds` off).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LitSurface {
     pub normal: Vec3,
@@ -591,6 +599,8 @@ pub struct LitSurface {
     pub forward: Vec3,
     pub right: Vec3,
     pub tan_half: f32,
+    pub near: f32,
+    pub far: f32,
 }
 
 /// How many [`LitSurface`]s the shaders take: a pool map each, in the card
@@ -602,7 +612,8 @@ pub const LIT_SURFACE_VEC4S: usize = 5;
 
 /// The surfaces as the shader reads them, five vec4s each: the plane; the
 /// glass and the map's reach (0 ends the list); the beam's axis and the
-/// card-atlas texel row the maps start at; the map's across; the albedo. NONE
+/// card-atlas texel row the maps start at; the map's across and `near`; the
+/// albedo and `far`. NONE
 /// without that row: then no map is made this frame, and none may be read.
 /// See `lit_surface_at` and `pool_map_light` in the shader.
 fn pack_lit_surfaces(surfaces: &[LitSurface], pool_row: Option<u32>) -> [[f32; 4]; LIT_SURFACE_VEC4S * MAX_LIT_SURFACES] {
@@ -615,8 +626,8 @@ fn pack_lit_surfaces(surfaces: &[LitSurface], pool_row: Option<u32>) -> [[f32; 4
         out[at] = [s.normal.x, s.normal.y, s.normal.z, s.offset];
         out[at + 1] = [s.lens.x, s.lens.y, s.lens.z, s.tan_half];
         out[at + 2] = [s.forward.x, s.forward.y, s.forward.z, row as f32];
-        out[at + 3] = [s.right.x, s.right.y, s.right.z, 0.0];
-        out[at + 4] = [s.albedo.x, s.albedo.y, s.albedo.z, 0.0];
+        out[at + 3] = [s.right.x, s.right.y, s.right.z, s.near];
+        out[at + 4] = [s.albedo.x, s.albedo.y, s.albedo.z, s.far];
     }
     out
 }
@@ -5173,8 +5184,9 @@ fn probe_axis(k: u32) -> vec3<f32> {{
 // a lit plane -- the light cost the torch views 1.3-1.5 ms of the reflection
 // pass (headset A/B, 2026-10-06), and the ground's pass a register whatever
 // form it took. Nor deferred to the fix-up, whose list it filled to the cap
-// (277,000 records, half the pass, offline 2026-10-06). `d` is unused: the
-// map is the same light whichever way it is seen.
+// (277,000 records, half the pass, offline 2026-10-06). The map is the same
+// light whichever way it is seen; `d` only picks the plane the ray met
+// (`lit_surface_at`).
 //
 // READ WITH NO BRANCH but the frame's (no surface lit at all): every hit reads
 // a texel -- surface 0's map where it is on no lit plane -- and keeps it only
@@ -5190,7 +5202,7 @@ fn probe_surface_relit(h: vec3<f32>, d: vec3<f32>, roughness: f32, t: f32) -> ve
         return vec3<f32>(0.0);
     }}
     let p = to_player_space(h);
-    let k = lit_surface_at(p);
+    let k = lit_surface_at(p, to_player_direction(d));
     let at = max(k, 0) * LIT_SURFACE_VEC4S;
     let glass = lights.surfaces[at + 1];
     let axis = lights.surfaces[at + 2];
@@ -5270,21 +5282,37 @@ fn pool_map_light(k: i32, uv: vec2<f32>, texels: f32) -> vec3<f32> {{
     return lights.surfaces[at + 4].rgb * lit;
 }}
 
-// Which lit surface (`lights::LitSurface`) holds `p` (player frame): the
-// first on whose plane it lies within `LIT_SURFACE_TOLERANCE`; -1 for none.
-// One with no map (`w` 0: past the list's end) holds nothing. Where its light
-// falls on the plane is its map's to say. Every surface tested, last first,
-// with no early exit: a loop of fixed length over fixed places in the block,
-// which the compiler can unroll into reads it need not index. 2026-10-06:
-// finding the surface as a walk with a `break`, with nothing lit there, cost
-// the torch views 0.25-0.32 ms of the reflection pass (headset, cut
-// `def_cut_relight_found`).
-fn lit_surface_at(p: vec3<f32>) -> i32 {{
+// Which lit surface (`lights::LitSurface`) holds `p` (player frame), met by a
+// ray along `dp` (player frame): one on whose plane it lies within
+// `LIT_SURFACE_TOLERANCE`, as far down the beam as its lit part lies
+// (`near`..`far`), with the ray arriving on its front -- of those, the one
+// the ray meets most squarely, the first of equals; -1 for none. A plane runs
+// on past its face: the far wall's line through a pillar's side, lit a hand's
+// width off, was the pillar's, read at grazing -- a thin dark line where
+// nothing stands (2026-10-14). `far` 0: the first plane holding `p`, as
+// before. One with no map (`w` 0: past the list's end) holds nothing. Where
+// its light falls on the plane is its map's to say. Every surface tested,
+// last first, with no early exit: a loop of fixed length over fixed places in
+// the block, which the compiler can unroll into reads it need not index.
+// 2026-10-06: finding the surface as a walk with a `break`, with nothing lit
+// there, cost the torch views 0.25-0.32 ms of the reflection pass (headset,
+// cut `def_cut_relight_found`).
+fn lit_surface_at(p: vec3<f32>, dp: vec3<f32>) -> i32 {{
     var k = -1;
+    var best = 0.0;
     for (var j = MAX_LIT_SURFACES - 1; j >= 0; j = j - 1) {{
-        let plane = lights.surfaces[j * LIT_SURFACE_VEC4S];
-        let mapped = lights.surfaces[j * LIT_SURFACE_VEC4S + 1].w > 0.0;
-        k = select(k, j, mapped && abs(dot(plane.xyz, p) - plane.w) < LIT_SURFACE_TOLERANCE);
+        let at = j * LIT_SURFACE_VEC4S;
+        let plane = lights.surfaces[at];
+        let glass = lights.surfaces[at + 1];
+        let z = dot(p - glass.xyz, lights.surfaces[at + 2].xyz);
+        let near = lights.surfaces[at + 3].w;
+        let far = lights.surfaces[at + 4].w;
+        let bounded = far > 0.0;
+        let square = select(1.0, -dot(dp, plane.xyz), bounded);
+        let within = !bounded || (z >= near && z <= far);
+        let take = glass.w > 0.0 && abs(dot(plane.xyz, p) - plane.w) < LIT_SURFACE_TOLERANCE && within && square > 0.0 && square >= best;
+        k = select(k, j, take);
+        best = select(best, square, take);
     }}
     return k;
 }}
@@ -11056,6 +11084,8 @@ mod surface_relit_tests {
             forward: Vec3::NEG_Z,
             right: Vec3::X,
             tan_half: 26.25f32.to_radians().tan(),
+            near: 0.0,
+            far: 0.0,
         }
     }
 
@@ -11285,6 +11315,48 @@ fn relit_main(@builtin(global_invocation_id) id: vec3<u32>) {
         assert!(shadowed[0].max_element() < 1e-4, "a hand's shadow on the wall is in its reflection: {:?}", shadowed[0]);
         assert!(no_surface[0].max_element() < 1e-4, "no lit surface, no light: {:?}", no_surface[0]);
         assert!(baked[0].max_element() < 1e-4, "a lamp the bake saw is in the photographs already: {:?}", baked[0]);
+    }
+
+    /// A PILLAR'S SIDE LIT A HAND'S WIDTH OFF DOES NOT CLAIM THE FAR WALL
+    /// (headset, 2026-10-14: "a thin line of shadow ... nothing in the scene
+    /// between my flashlight and the wall"). The side's plane runs on to cross
+    /// the wall 3 m down the beam; where it does, the wall's reflected pool
+    /// read the side's map -- the beam at grazing, a tenth of the wall's light
+    /// -- a dark line down every polished surface that showed the wall. Bounded
+    /// to how far down the beam each lit part lies, and met from its front,
+    /// the wall's point is the wall's; the side still holds its own.
+    #[test]
+    fn a_lit_planes_far_reach_does_not_claim_the_wall_it_crosses() {
+        let glass = Vec3::new(0.0, 1.0, 0.0);
+        let lamp = beam(glass, Vec3::NEG_Z);
+        // The pillar's side, the plane x = 0.3 facing the glass, lit from
+        // 0.2 m to 1.5 m down the beam; first, as the brightest.
+        let side = LitSurface { normal: Vec3::NEG_X, offset: -0.3, near: 0.2, far: 1.5, ..wall() };
+        let far_wall = LitSurface { near: 2.0, far: 4.5, ..wall() };
+        let from_floor = Vec3::new(0.0, 0.5, -1.0).normalize();
+        let hits = [
+            // The wall where the side's plane crosses it, seen from the floor.
+            (Vec3::new(0.3, 1.0, -3.0), from_floor),
+            // The wall on the beam's axis.
+            (Vec3::new(0.0, 1.0, -3.0), from_floor),
+            // The side itself, 1 m down the beam, met from in front of it.
+            (Vec3::new(0.3, 1.0, -1.0), Vec3::new(1.0, 0.0, -0.2).normalize()),
+        ];
+        let Some(bounded) = relit_at(&[lamp], true, 1.0, &[side, far_wall], &hits) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let wall_alone = relit_at(&[lamp], true, 1.0, &[far_wall], &hits).unwrap();
+        let unbounded = relit_at(&[lamp], true, 1.0, &[LitSurface { far: 0.0, ..side }, LitSurface { far: 0.0, ..far_wall }], &hits).unwrap();
+        eprintln!("CROSSING: bounded {bounded:?}\n  wall alone {wall_alone:?}\n  unbounded {unbounded:?}");
+        let full = wall_alone[0].max_element();
+        assert!(full > 0.5 * ALBEDO.max_element() * expected_scale(), "the wall is lit there: {:?}", wall_alone[0]);
+        // The fault, as it was: the side's map read on the wall.
+        assert!(unbounded[0].max_element() < 0.3 * full, "unbounded, the side claims the wall: {:?}", unbounded[0]);
+        assert!((bounded[0] - wall_alone[0]).abs().max_element() < 0.01 * full, "the wall's point is the wall's: {:?}", bounded[0]);
+        assert!((bounded[1] - wall_alone[1]).abs().max_element() < 0.01 * full, "the axis as before: {:?}", bounded[1]);
+        assert!(bounded[2].max_element() > 0.05 * full, "the side keeps its own pool: {:?}", bounded[2]);
+        assert!((bounded[2] - unbounded[2]).abs().max_element() < 0.01 * bounded[2].max_element(), "and reads it as before");
     }
 }
 

@@ -261,6 +261,12 @@ pub struct Levers {
     /// glass glowing. The app hands them over (`quest_app::flashlight`); off,
     /// it hands none, and a torch shows in no reflection, as until 2026-10-02.
     pub torch_reflection: bool,
+    /// Each lit surface's pool, in reflections, held to the stretch of its
+    /// plane the beam lit and to rays meeting it from the front
+    /// (`lights::LitSurface::near`, `lit_surface_at`). Off, any reflected
+    /// point within 5 cm of a lit plane is that plane's, as until 2026-10-14:
+    /// a pillar's side lit close by drew a thin dark line down the far wall.
+    pub pool_bounds: bool,
     /// The eye's meter shown the pools the live lamps throw -- a torch close
     /// to a wall -- beside the probes' photographs
     /// (`lights::LightsUniform::set_pool_light`). Off, it meters the level's
@@ -776,6 +782,7 @@ impl Default for Levers {
             flashlight_bounce: true,
             surface_light_loop: true,
             torch_reflection: true,
+            pool_bounds: true,
             pool_metering: true,
             floor_mirror: false,
             reflection_blur: true,
@@ -953,6 +960,7 @@ impl Levers {
         flag("flashlight_bounce", self.flashlight_bounce, d.flashlight_bounce);
         flag("surface_light_loop", self.surface_light_loop, d.surface_light_loop);
         flag("torch_reflection", self.torch_reflection, d.torch_reflection);
+        flag("pool_bounds", self.pool_bounds, d.pool_bounds);
         flag("pool_metering", self.pool_metering, d.pool_metering);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("same_eyes", self.same_eyes, d.same_eyes);
