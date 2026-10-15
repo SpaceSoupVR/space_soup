@@ -4709,6 +4709,29 @@ struct Fx {
 struct Cutouts { corners: array<vec4<f32>, CUT_VEC4S> }
 @group(2) @binding(3) var<uniform> fx_cut: Cutouts;
 
+// THIS EYE's position, from its own camera: the point its view-projection
+// sends to clip x = y = w = 0 (rows 0, 1 and 3 of the matrix, solved by
+// Cramer's rule). Not `fx.head`, the middle of the eyes: a fog slab's rays
+// start here, so each eye integrates its own line of sight and the mist has
+// its true stereo depth -- from the middle eye both eyes saw the mist painted
+// on its quad, which sits at the near side of the slab's bounding sphere (a
+// quarter metre ahead from inside it: "rendering right in my eyes").
+fn fx_eye() -> vec3<f32> {
+    let m = camera.view_proj[view_slot];
+    let r0 = vec4<f32>(m[0].x, m[1].x, m[2].x, m[3].x);
+    let r1 = vec4<f32>(m[0].y, m[1].y, m[2].y, m[3].y);
+    let r3 = vec4<f32>(m[0].w, m[1].w, m[2].w, m[3].w);
+    let c13 = cross(r1.xyz, r3.xyz);
+    let c30 = cross(r3.xyz, r0.xyz);
+    let c01 = cross(r0.xyz, r1.xyz);
+    return -(r0.w * c13 + r1.w * c30 + r3.w * c01) / dot(r0.xyz, c13);
+}
+
+// Where a fog slab's pixel's mist is, density-weighted along its line of
+// sight (world), set by `fx_fog`: its motion twin moves the pixel as that
+// point moves, not as the quad it is drawn on.
+var<private> fx_fog_point: vec3<f32> = vec3<f32>(0.0);
+
 struct IIn {
     @location(0) centre: vec4<f32>,
     @location(1) colour: vec4<f32>,
@@ -4760,7 +4783,7 @@ fn fx_fog_vertex(vi: u32, inst: IIn) -> VOut {
     }
     let c = inst.centre.xyz;
     let r = length(inst.axis.xyz);
-    let eye = fx.head.xyz;
+    let eye = fx_eye();
     let d = length(c - eye);
     var mid = eye;
     var across = fx.right.xyz;
@@ -4973,7 +4996,7 @@ fn fx_fog_tuft(m: vec3<f32>, tall: f32, half: f32, wind: vec2<f32>, drift: f32, 
 }
 
 fn fx_fog(in: VOut) -> vec4<f32> {
-    let eye = fx.head.xyz;
+    let eye = fx_eye();
     let ray = in.world - eye;
     let t_quad = max(length(ray), 1e-6);
     let d = ray / t_quad;
@@ -5011,14 +5034,18 @@ fn fx_fog(in: VOut) -> vec4<f32> {
     let blur = span / FOG_TILE;
     var depth = 0.0;
     var top = 0.0;
+    var at_t = 0.0;
     for (var i = 0; i < FOG_STEPS; i++) {
-        let m = lo + ld * (t0 + (f32(i) + 0.5) * span);
+        let t = t0 + (f32(i) + 0.5) * span;
+        let m = lo + ld * t;
         let lies = 1.0 - smoothstep(1.0 - rim, 1.0, length(m.xz / max(h.xz, vec2<f32>(1e-3))));
         let up = m.y + h.y;
         let k = span * lies * fx_fog_tuft(vec3<f32>(m.x, up, m.z), 2.0 * h.y, half, wind, in.flicker, blur);
         depth += k;
         top += k * clamp(up / (1.5 * h.y), 0.0, 1.0);
+        at_t += k * t;
     }
+    fx_fog_point = eye + d * select(0.5 * (t0 + t1), at_t / depth, depth > 1e-6);
     // Lit from above: a tuft's top a little brighter than the even light, its
     // underside darker.
     let lit = 0.7 + 0.45 * top / max(depth, 1e-6);
@@ -5222,7 +5249,7 @@ pub fn motion_shader_of(source: String) -> String {
     let to = from + s[from..].find(end).expect("effects motion twin: the upright axes moved") + end.len();
     let upright = s[from..to].to_string();
     swap(&mut s, "@group(0) @binding(0) var<uniform> camera: Camera;", "", 1);
-    swap(&mut s, "camera.view_proj[view_slot]", "fx_motion_view()", 3);
+    swap(&mut s, "camera.view_proj[view_slot]", "fx_motion_view()", 4);
     swap(&mut s, "0.75 * fx.depth.w * ", "0.75 * fx.depth.w * fx_pixel_scale * ", 1);
     swap(&mut s, "@vertex fn vs_main(@builtin(vertex_index) vi: u32, inst: IIn) -> VOut", "fn fx_vertex(vi: u32, inst: IIn) -> VOut", 1);
     swap(&mut s, "@fragment fn fs_over(in: VOut) -> @location(0) vec4<f32>", "fn fx_over(in: VOut) -> vec4<f32>", 1);
@@ -5294,6 +5321,11 @@ struct FxMotionOut {{
     out.fog_a = n.fog_a;
     out.fog_b = n.fog_b;
     out.gas = vec4<f32>(0.0);
+    // A fog slab: how far its mist drifted since the previous frame (its
+    // pixel's motion is that point's, in `fs_fx_motion_over`).
+    if (inst.params.w < -1.5) {{
+        out.gas = vec4<f32>(motion.xyz * step, 0.0);
+    }}
     if (inst.params.w > 1.5 && inst.params.w < 2.5 && motion.w > 0.0) {{
         let height = 2.0 * inst.centre.w * max(abs(inst.params.z), 1.0);
         out.gas = cam.prev * vec4<f32>(fx_flame_along(inst) * height, 0.0);
@@ -5328,9 +5360,17 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
         let v = 1.0 - in.uv.y;
         prev = prev - in.gas * (v - fx_flame_v(v, in.stfb.w));
     }}
+    var curr = in.curr;
+    if (in.layer.z < -1.5) {{
+        // A fog slab moves as its mist does -- the point its pixel's mist is
+        // at, drifting with the wind -- not as the quad it is drawn on (a
+        // quarter metre ahead from inside it).
+        curr = cam.curr * vec4<f32>(fx_fog_point, 1.0);
+        prev = cam.prev * vec4<f32>(fx_fog_point - in.gas.xyz, 1.0);
+    }}
     let flame = in.layer.z > 1.5 && in.layer.z < 2.5;
     let w = layer_weight(shown.a, select({soft:?}, {bright:?}, flame));
-    return vec4<f32>(motion_of(in.curr, prev).xyz * w, w);
+    return vec4<f32>(motion_of(curr, prev).xyz * w, w);
 }}
 
 @fragment fn fs_fx_motion_screened(in: FxMotionOut) -> @location(0) vec4<f32> {{
@@ -5348,6 +5388,40 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FOG SLAB'S RAYS START AT THIS EYE: `fx_eye` (WGSL) finds the eye
+    /// from its own view-projection -- here the same rows and Cramer's rule
+    /// on a stereo pair's two cameras, which must come back as the two eyes,
+    /// not their middle -- and neither the slab's quad nor its integral reads
+    /// `fx.head` (the middle of the eyes, which painted the mist on its quad:
+    /// "rendering right in my eyes", 2026-10-14).
+    #[test]
+    fn a_fog_slab_integrates_from_each_eye_not_their_middle() {
+        let eye_of = |m: glam::Mat4| {
+            let r = |i: usize| m.row(i);
+            let (r0, r1, r3) = (r(0), r(1), r(3));
+            let c13 = r1.truncate().cross(r3.truncate());
+            let c30 = r3.truncate().cross(r0.truncate());
+            let c01 = r0.truncate().cross(r1.truncate());
+            -(r0.w * c13 + r1.w * c30 + r3.w * c01) / r0.truncate().dot(c13)
+        };
+        let proj = glam::Mat4::from_cols_array(&[0.9, 0.0, 0.0, 0.0, 0.0, 1.1, 0.0, 0.0, 0.08, -0.05, 0.0, -1.0, 0.0, 0.0, 0.03, 0.0]);
+        for (eye, at) in [(Vec3::new(-14.032, 1.6, -24.0), Vec3::new(-26.0, -0.4, -27.0)), (Vec3::new(-13.968, 1.6, -24.0), Vec3::new(-26.0, -0.4, -27.0)), (Vec3::new(3.0, -2.0, 7.5), Vec3::new(3.0, 5.0, 7.6))] {
+            let vp = proj * glam::Mat4::look_at_rh(eye, at, Vec3::Y);
+            assert!((eye_of(vp) - eye).length() < 1e-3, "{eye} came back as {}", eye_of(vp));
+        }
+        let src = effects_shader();
+        let body = |name: &str| {
+            let from = src.find(&format!("fn {name}(")).unwrap();
+            let to = from + src[from..].find("\n}\n").unwrap();
+            src[from..to].to_string()
+        };
+        for f in ["fx_fog_vertex", "fx_fog"] {
+            let b = body(f);
+            assert!(b.contains("fx_eye()") && !b.contains("fx.head"), "{f} must start its rays at this eye");
+        }
+        assert!(motion_shader().contains("curr = cam.curr * vec4<f32>(fx_fog_point, 1.0);"), "a fog slab's motion is its mist's");
+    }
 
     /// Mist is thickest at dawn, burnt off by mid-morning, all but gone in
     /// the afternoon, back by the evening and high all night; smooth, and the
