@@ -1184,7 +1184,7 @@ mod tests {
 
         let params = WaveParams { wind_speed: 8.0, fetch: 5000.0, ..WaveParams::default() };
         let waves = WaveField::new(&device, &queue, params);
-        let optics = WaterOptics { height: 0.0, shallow: [0.5; 3], deep: [0.05; 3], depth_scale: 4.0, shore_fade: 0.3, swash: 0.0, swell: 0.0 };
+        let optics = WaterOptics { height: 0.0, shallow: [0.5; 3], deep: [0.05; 3], depth_scale: 4.0, shore_fade: 0.3, swash: 0.0, swell: 0.0, gloss: 1.0, mud: 0.0 };
         let mut uniform = WaterUniform::new(&optics, &params);
         uniform.set_time(10.0, params.loop_seconds);
         let uniform = buffer("sea_uniform", bytemuck::bytes_of(&uniform), wgpu::BufferUsages::UNIFORM);

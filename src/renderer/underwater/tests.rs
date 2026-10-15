@@ -13,7 +13,7 @@ fn sea() -> WaterUniform {
         if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
     });
     WaterUniform::new(
-        &WaterOptics { height: -1.4, shallow: lin([130, 205, 210]), deep: lin([12, 52, 72]), depth_scale: 2.0, shore_fade: 0.2, swash: 0.22, swell: 0.0 },
+        &WaterOptics { height: -1.4, shallow: lin([130, 205, 210]), deep: lin([12, 52, 72]), depth_scale: 2.0, shore_fade: 0.2, swash: 0.22, swell: 0.0, gloss: 1.0, mud: 0.0 },
         &WaveParams::default(),
     )
 }
@@ -24,7 +24,7 @@ fn pond() -> WaterUniform {
         if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
     });
     WaterUniform::new(
-        &WaterOptics { height: -0.368, shallow: lin([150, 180, 130]), deep: lin([20, 34, 22]), depth_scale: 0.4, shore_fade: 0.12, swash: 0.0, swell: 0.015 },
+        &WaterOptics { height: -0.368, shallow: lin([150, 180, 130]), deep: lin([20, 34, 22]), depth_scale: 0.4, shore_fade: 0.12, swash: 0.0, swell: 0.015, gloss: 1.0, mud: 0.0 },
         &WaveParams::default(),
     )
 }

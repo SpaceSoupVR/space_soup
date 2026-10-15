@@ -101,6 +101,8 @@ pub struct WaterUniform {
     pub rings: [[f32; 4]; RINGS],
 
     pub air: [f32; 4],
+
+    pub look: [f32; 4],
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -117,6 +119,10 @@ pub struct WaterOptics {
     pub swash: f32,
 
     pub swell: f32,
+
+    pub gloss: f32,
+
+    pub mud: f32,
 }
 
 impl WaterUniform {
@@ -131,6 +137,7 @@ impl WaterUniform {
             lost: waves.lost_slope_variance(),
             rings: [[0.0; 4]; RINGS],
             air: [paws_calm(waves.wind_speed), o.swell.max(0.0), waves.wind_dir.cos(), waves.wind_dir.sin()],
+            look: [o.gloss.clamp(0.0, 1.0), o.mud.clamp(0.0, 1.0), 0.0, 0.0],
         }
     }
 
@@ -493,6 +500,7 @@ struct WaterMat {{
     lost: array<vec4<f32>, {mips}>,
     rings: array<vec4<f32>, {rings}>,
     air: vec4<f32>,
+    look: vec4<f32>,
 }}
 
 fn swash_count(still_depth: f32, xz: vec2<f32>, t: f32) -> f32 {{
@@ -704,6 +712,12 @@ const WALK_GROWTH: f32 = 1.55;
 const WALK_STEPS: i32 = 6;
 const LIP_BURIED: f32 = {lip_buried};
 const LIP_RAMP: f32 = {lip_ramp};
+const MUD_FLATTEN: f32 = 0.9;
+const MUD_GRAIN_TILES: f32 = 2.5;
+const MUD_GRAIN_TILT: f32 = 0.15;
+const MUD_GRAIN_SHADE: f32 = 0.6;
+const MUD_ROUGH: f32 = 0.35;
+const MUD_SKY_SHARE: f32 = 0.5;
 
 const SHELF_SLOPE: f32 = 0.15;
 const FOAM_TILES: f32 = {foam_tiles};
@@ -839,12 +853,16 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
 
     var ring_foam = 0.0;
     var ring_rough = 0.0;
-{ring_block}    let n = normalize(to_player_direction(vec3<f32>(-tilt.x, 1.0, -tilt.y)));
+{ring_block}    let mud = water.look.y;
+    let grain = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES).r - 0.5;
+    let grain_b = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES * 0.37 + vec2<f32>(0.5)).r - 0.5;
+    tilt = tilt * (1.0 - MUD_FLATTEN * mud) + vec2<f32>(grain, grain_b) * MUD_GRAIN_TILT * mud;
+    let n = normalize(to_player_direction(vec3<f32>(-tilt.x, 1.0, -tilt.y)));
 
     let lost0 = water_lost(log2(max(span * WAVE_N / water.tiles.x, 1e-6))).x;
     let lost1 = water_lost(log2(max(span * WAVE_N / water.tiles.y, 1e-6))).y;
     let lost2 = water_lost(log2(max(span * WAVE_N / water.tiles.z, 1e-6))).z;
-    let a2 = clamp((lost0 + lost1) * shoal * shoal + (lost2 + water.waves.x) * paws * paws + ring_rough, 4e-4, 1.0);
+    let a2 = clamp(max((lost0 + lost1) * shoal * shoal + (lost2 + water.waves.x) * paws * paws + ring_rough, MUD_ROUGH * mud), 4e-4, 1.0);
     let rough = sqrt(sqrt(a2));
 
     let v = normalize(cam_pos() - in.world_pos);
@@ -855,6 +873,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     r = normalize(r);
     ground_trace_coarsen = WATER_TRACE_COARSEN;
     let env = outdoor_radiance(p, normalize(to_world_direction(r)), r, rough, clamp(rough * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD));
+    let env_seen = env * water.look.x * select(1.0, 1.0 / WATER_PI, camera.sky_params.y < 0.5);
 
     var glint = vec3<f32>(0.0);
     var sunlight = vec3<f32>(0.0);
@@ -937,7 +956,8 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     }}
 
     let sky_down = sky_irradiance(vec3<f32>(0.0, 1.0, 0.0));
-    let body = water.scatter.rgb * (sky_down + sunlight) * (vec3<f32>(1.0) - t_view);
+    let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud);
+    let body = water.scatter.rgb * silt * (sky_irradiance(n) * mix(1.0, MUD_SKY_SHARE, mud) + sunlight * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0)) * (vec3<f32>(1.0) - t_view);
 
     let fine = 0.5 * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N * 0.25 / water.tiles.z));
     let mid = max(shoal, 0.6) * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N / water.tiles.y));
@@ -987,7 +1007,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
 
     let edge = smoothstep(0.0, water.scatter.w, thickness);
     let lip = smoothstep(0.0, 0.015, thickness);
-    let shade = (env * fresnel + glint + (body + brighter) * (1.0 - fresnel)) * edge;
+    let shade = (env_seen * fresnel + glint * water.look.x + (body + brighter) * (1.0 - fresnel)) * edge;
     let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge);
     let froth_cover = cover * lip;
     let colour = mix(shade, foam_light, froth_cover);
@@ -1139,7 +1159,7 @@ mod tests {
         let params = WaveParams { wind_speed: c.wind, fetch: 2000.0, ..Default::default() };
         let waves = WaveField::new(&device, &queue, params);
         let mut u = WaterUniform::new(
-            &WaterOptics { height: 0.0, shallow: c.shallow, deep: c.deep, depth_scale: 1.0, shore_fade: 0.25, swash: 0.0, swell: 0.0 },
+            &WaterOptics { height: 0.0, shallow: c.shallow, deep: c.deep, depth_scale: 1.0, shore_fade: 0.25, swash: 0.0, swell: 0.0, gloss: 1.0, mud: 0.0 },
             &params,
         );
         u.waves[2] = 0.0;
@@ -1425,7 +1445,7 @@ mod tests {
     #[test]
     fn white_seen_through_depth_scale_comes_out_shallow() {
 
-        let o = WaterOptics { height: 0.0, shallow: [0.3, 0.7, 0.75], deep: [0.0; 3], depth_scale: 2.0, shore_fade: 0.3, swash: 0.0, swell: 0.0 };
+        let o = WaterOptics { height: 0.0, shallow: [0.3, 0.7, 0.75], deep: [0.0; 3], depth_scale: 2.0, shore_fade: 0.3, swash: 0.0, swell: 0.0, gloss: 1.0, mud: 0.0 };
         let u = WaterUniform::new(&o, &WaveParams::default());
         for i in 0..3 {
             let seen = (-u.extinction[i] * o.depth_scale * (1.0 + LIGHT_PATH)).exp();

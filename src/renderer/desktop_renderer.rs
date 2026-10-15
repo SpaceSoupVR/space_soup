@@ -185,7 +185,17 @@ impl Renderer {
             return;
         }
         if self.water_pipeline.is_none() {
-            self.water_pipeline = Some(WaterPipeline::new(&self.device, self.format, &self.uniform_buf.layout, 1));
+            let mut made = WaterPipeline::new(&self.device, self.format, &self.uniform_buf.layout, 1);
+            if let Ok(cut) = std::env::var("DESKTOP_WATER_CUT") {
+                match made.with_cut(&self.device, &cut) {
+                    Some(p) => {
+                        log::info!("desktop water: drawing with the '{cut}' cut");
+                        made.pipeline = p;
+                    }
+                    None => log::warn!("desktop water: no cut named '{cut}'"),
+                }
+            }
+            self.water_pipeline = Some(made);
         }
         let pipeline = self.water_pipeline.as_ref().expect("made above");
         self.water_bodies = bodies
