@@ -1002,7 +1002,10 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         let seen_uv = ground_uv(p + down * seen);
         let from_edge = min(min(seen_uv.x, 1.0 - seen_uv.x) / camera.ground_params.z, min(seen_uv.y, 1.0 - seen_uv.y) / camera.ground_params.w);
         let lip = smoothstep(0.0, 0.5, clears) * saturate((LIP_BURIED + buried) * LIP_RAMP);
-        drawn = (1.0 - lip) * (1.0 - smoothstep(2.0, 4.0, seen / max(flat, 1e-4))) * smoothstep(3.0, 6.0, from_edge);
+        let map_span = min(1.0 / max(camera.ground_params.z, 1e-6), 1.0 / max(camera.ground_params.w, 1e-6));
+        let rim_in = min(3.0, 0.1 * map_span);
+        let rim_out = min(6.0, 0.2 * map_span);
+        drawn = (1.0 - lip) * (1.0 - smoothstep(2.0, 4.0, seen / max(flat, 1e-4))) * smoothstep(rim_in, rim_out, from_edge);
     }}
 
     let sky_down = sky_irradiance(vec3<f32>(0.0, 1.0, 0.0));
