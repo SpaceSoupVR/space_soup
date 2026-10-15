@@ -1873,12 +1873,34 @@ impl XrRenderer {
                         _ => (vb, ib, n, model),
                     })
                     .collect();
+                // 256: the brush triangles inside test_room's hall_pillar box
+                // left out, every other brush kept. Made each frame it is set.
+                let pillarless: Option<(wgpu::Buffer, u32)> = brush_geometry.filter(|_| !keep(256)).map(|(v, i)| {
+                    let to_world = if self.brush_world { glam::Mat4::IDENTITY } else { warp_world_to_player.inverse() };
+                    let (lo, hi) = (glam::Vec3::new(-0.46, -0.01, -7.46), glam::Vec3::new(0.46, 3.11, -6.54));
+                    let inside = |k: u32| {
+                        let p = to_world.transform_point3(glam::Vec3::from(v[k as usize].position));
+                        p.cmpge(lo).all() && p.cmple(hi).all()
+                    };
+                    let kept: Vec<u32> =
+                        i.chunks_exact(3).filter(|t| !t.iter().all(|&k| inside(k))).flatten().copied().collect();
+                    let ib = self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("brush_ib_pillarless"),
+                        contents: bytemuck::cast_slice(&kept),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                    (ib, kept.len() as u32)
+                });
+                let spot_brushes = match (&pillarless, brush_caster) {
+                    (Some((ib, n)), Some((vb, _, _))) => Some((vb, ib, *n)),
+                    _ => brush_caster,
+                };
                 drawn += self.shadow_map.record_spots(
                     &mut encoder,
                     shadow.spot_count as usize,
                     &spot_pass,
                     solid_caster.filter(|_| keep(1)),
-                    brush_caster.filter(|_| keep(2)),
+                    spot_brushes.filter(|_| keep(2)),
                     if keep(4) { &spot_meshes } else { &no_meshes },
                     if keep(4) { cull_bounds } else { &[] },
                     &spot_skinned,
