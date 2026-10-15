@@ -1,39 +1,18 @@
-//! THE DRIVER'S COMPILED SHADERS, KEPT BETWEEN LAUNCHES.
-//!
-//! Every launch used to compile every pipeline from SPIR-V again: about 50 s
-//! before the first probe loaded on the Quest 3 (2026-10-07), nearly all of it
-//! `vkCreateGraphicsPipelines`. A `VkPipelineCache` filled on one launch and
-//! handed back on the next lets the driver skip that work. The SpaceSoupVR
-//! wgpu fork builds every pipeline whose descriptor names no cache with a
-//! device-wide default (`wgpu_hal::vulkan::Device::set_default_pipeline_cache`),
-//! so no pipeline in the renderer has to be told about it.
-//!
-//! This module is the FILE: the driver's bytes behind a header of our own.
-//! Vulkan checks its own header too, but a file cut short by the app being
-//! killed mid-write, or bytes from another driver, are refused here before a
-//! driver ever parses them. The key also names the INSTALL, so a new build
-//! starts from nothing instead of carrying every old build's shaders forward
-//! (the driver keeps what it was given and adds to it, so a key-less file only
-//! grows). Pure bytes and paths: host-tested; the Vulkan half is in
-//! `xr_renderer::vulkan_interop`.
-
-/// What a cache file must say first.
 const MAGIC: [u8; 4] = *b"SSPC";
-/// Bumped when the layout below changes.
+
 const FORMAT: u32 = 1;
-/// MAGIC, FORMAT, payload length (u64), payload checksum (u64), key.
+
 const HEADER_LEN: usize = 4 + 4 + 8 + 8 + KEY_LEN;
 const KEY_LEN: usize = 4 + 4 + 4 + 16 + 8;
 
-/// Whose shaders a cache holds: the GPU, its driver, and this install.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CacheKey {
     pub vendor_id: u32,
     pub device_id: u32,
     pub driver_version: u32,
-    /// `VkPhysicalDeviceProperties::pipelineCacheUUID`.
+
     pub cache_uuid: [u8; 16],
-    /// See [`build_identity`].
+
     pub build: u64,
 }
 
@@ -49,7 +28,6 @@ impl CacheKey {
     }
 }
 
-/// FNV-1a, 64 bits: enough to tell a torn or foreign file from a whole one.
 fn checksum(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -59,7 +37,6 @@ fn checksum(bytes: &[u8]) -> u64 {
     h
 }
 
-/// The file for the driver's `data` under `key`.
 pub fn encode(key: &CacheKey, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + data.len());
     out.extend_from_slice(&MAGIC);
@@ -71,19 +48,17 @@ pub fn encode(key: &CacheKey, data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Why a cache file was not used.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused {
     NotACacheFile,
     OtherFormat(u32),
-    /// Cut short or padded: a write the app did not live to finish.
+
     WrongLength { said: u64, has: u64 },
     Corrupt,
-    /// Another GPU, driver, or build of the app.
+
     OtherKey,
 }
 
-/// The driver's bytes from a cache `file`, if it is whole and is `key`'s.
 pub fn decode<'a>(key: &CacheKey, file: &'a [u8]) -> Result<&'a [u8], Refused> {
     if file.len() < HEADER_LEN || file[0..4] != MAGIC {
         return Err(Refused::NotACacheFile);
@@ -108,26 +83,18 @@ pub fn decode<'a>(key: &CacheKey, file: &'a [u8]) -> Result<&'a [u8], Refused> {
     Ok(data)
 }
 
-/// Writes `bytes` to `path` whole or not at all: a temporary file renamed
-/// over it, so a launch killed mid-write leaves the last good cache.
 pub fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
 }
 
-/// This install of the app, as a number: the path, size and modification
-/// time of the file the running code was loaded from. Every install of an APK
-/// lands in a fresh directory, so a rebuild deployed over the last one reads
-/// as a new build. 0 when it cannot be found (the cache then still works, it
-/// just is not cleared by a new build).
 pub fn build_identity() -> u64 {
     loaded_from().map(|path| identity_of(&path)).unwrap_or(0)
 }
 
 fn identity_of(path: &str) -> u64 {
-    // An Android library loaded straight out of its APK is named
-    // "<apk>!/lib/<abi>/<lib>.so"; the APK is the file on disk.
+
     let file = path.split('!').next().unwrap_or(path);
     let mut id = path.as_bytes().to_vec();
     if let Ok(meta) = std::fs::metadata(file) {
@@ -141,7 +108,6 @@ fn identity_of(path: &str) -> u64 {
     checksum(&id)
 }
 
-/// The file this code was loaded from (`dladdr` on a function of ours).
 fn loaded_from() -> Option<String> {
     #[repr(C)]
     struct DlInfo {
@@ -222,7 +188,7 @@ mod tests {
         let a = build_identity();
         assert_ne!(a, 0, "dladdr found no file for the running code");
         assert_eq!(a, build_identity());
-        // A library inside an APK is named by the APK on disk.
+
         assert_eq!(identity_of("/nonexistent/base.apk!/lib/arm64-v8a/libx.so"), identity_of("/nonexistent/base.apk!/lib/arm64-v8a/libx.so"));
         assert_ne!(identity_of("/a/base.apk!/lib/x.so"), identity_of("/b/base.apk!/lib/x.so"));
     }

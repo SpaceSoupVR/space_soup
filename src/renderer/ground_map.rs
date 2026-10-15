@@ -1,62 +1,17 @@
-//! THE GROUND AS A REFLECTION SEES IT: one top-down picture of the terrain --
-//! what it looks like lit, and how high it is -- for a reflected ray that has
-//! left the rooms to land on.
-//!
-//! # Why the photographs could not do this
-//!
-//! A reflection that leaves the building meets either the ground or the sky.
-//! The level's one outdoor photograph is taken from above the roofs, on one
-//! side of the building, so the ground beside every other wall is hidden from
-//! it behind the building itself -- and that ground is exactly what the base of
-//! a polished wall, or a ceiling seen through a doorway, reflects. The trace
-//! instead ran the ray into the outdoor volume's BOX, whose floor lies metres
-//! under the terrain, and read the photograph toward that point: sunlit ground
-//! or roof. The shaded wall facing the lake glowed at its foot as if lit from
-//! underneath, and the ceiling mirrored the ground outside the front door as a
-//! blocky patchwork (headset, 2026-09-28).
-//!
-//! # What this is instead
-//!
-//! The terrain seen from straight above: RGB is the light it sends back, as the
-//! terrain shader lights it -- its layers' albedo, the sky through its baked sky
-//! visibility, the sun through its baked shadow -- and A is its height. A ray is
-//! marched against A until it passes below the ground and read from RGB there
-//! (`outdoor_radiance` in the lights block). Built at load from what the
-//! renderer already holds, so it cannot drift from the ground it describes, and
-//! it sees everything: nothing hides one patch of ground from a top-down view.
-//!
-//! The ground is rough enough that the light it returns barely depends on where
-//! it is seen from, which is what lets one picture serve every viewpoint.
-//! What it leaves out, deliberately: the layers' normal-map detail and texture
-//! grain (averaged into each layer's mean colour), the ground's own specular,
-//! and moving shadows. Buildings are not in it -- a reflection that should meet
-//! another building's wall outdoors passes behind it.
-
 use glam::{Vec2, Vec3};
 use wgpu::{Device, Queue, TextureView};
 
 use crate::renderer::sky::{SkyIrradiance, SkySun};
 use crate::renderer::terrain_pipeline::{TerrainImage, TerrainMaterialUniform, FALLBACK_LAYER_COLOURS};
 
-/// Texels a side. 110 m of test_room's terrain at 1024 is 11 cm a texel --
-/// finer than any baked shadow edge it carries -- for 8 MB of half floats.
 pub const GROUND_MAP_SIZE: u32 = 1024;
 
-/// Ground seeing less of the sky than this lies UNDER a building's floor --
-/// sealed in, where nothing sees it. Outdoor ground never does: at the foot of
-/// a wall half the sky is still overhead (test_room reads 0.54 there). See
-/// [`fill_under_buildings`].
 const BURIED_SKY_VIS: f32 = 0.05;
 
-/// How far, in texels, the ground around a building is carried in under it.
 const BURIED_FILL_TEXELS: usize = 8;
 
-/// A dielectric's normal-incidence reflectance: the share of light the ground's
-/// diffuse term gives up to its specular, as `shade_material_lamps` takes it.
 const F0: f32 = 0.04;
 
-/// The terrain's heights on a regular grid over its footprint, in world
-/// metres: sample `(i, j)` stands at `min + (i, j) * (max - min) / (size - 1)`.
 pub struct HeightGrid {
     pub min: Vec2,
     pub max: Vec2,
@@ -66,7 +21,7 @@ pub struct HeightGrid {
 }
 
 impl HeightGrid {
-    /// `height_at` sampled on a `width` x `height` grid spanning `min..max`.
+
     pub fn sample(min: Vec2, max: Vec2, width: u32, height: u32, height_at: impl Fn(f32, f32) -> f32) -> Self {
         let (w, h) = (width.max(2), height.max(2));
         let heights = (0..h)
@@ -79,7 +34,6 @@ impl HeightGrid {
         Self { min, max, width: w, height: h, heights }
     }
 
-    /// Height at world `(x, z)`, bilinear, clamped to the grid.
     pub fn at(&self, x: f32, z: f32) -> f32 {
         let fx = ((x - self.min.x) / (self.max.x - self.min.x)).clamp(0.0, 1.0) * (self.width - 1) as f32;
         let fz = ((z - self.min.y) / (self.max.y - self.min.y)).clamp(0.0, 1.0) * (self.height - 1) as f32;
@@ -92,8 +46,6 @@ impl HeightGrid {
         a + (b - a) * tz
     }
 
-    /// The ground's upward normal at `(x, z)`, by central differences over one
-    /// grid step.
     pub fn normal(&self, x: f32, z: f32) -> Vec3 {
         let dx = (self.max.x - self.min.x) / (self.width - 1) as f32;
         let dz = (self.max.y - self.min.y) / (self.height - 1) as f32;
@@ -103,31 +55,27 @@ impl HeightGrid {
     }
 }
 
-/// Everything the ground's light is made of, as the renderer holds it.
 pub struct GroundInputs<'a> {
     pub heights: &'a HeightGrid,
-    /// The sky's ambient, WITHOUT its sun. See `sky::Sky::irradiance`.
+
     pub sky: &'a SkyIrradiance,
-    /// The sky's sun, in world space. See `sky::Sky::sun`.
+
     pub sun: Option<&'a SkySun>,
-    /// The ground's baked map over the footprint: sky visibility in red, the
-    /// sun's shadow as a distance field in green and blue. See the terrain
-    /// shader's `ground_map`.
+
     pub sky_occlusion: Option<&'a TerrainImage>,
     pub layers: &'a [Option<TerrainImage>],
     pub splat: Option<&'a TerrainImage>,
     pub settings: &'a TerrainMaterialUniform,
 }
 
-/// The picture: `texels` row-major, x fastest, row 0 at `min.y` (world z).
 pub struct GroundMap {
     pub width: u32,
     pub height: u32,
-    /// RGB the light the ground sends back, A its world height.
+
     pub texels: Vec<[f32; 4]>,
     pub min: Vec2,
     pub max: Vec2,
-    /// The highest the ground rises: above it, a rising ray can only meet sky.
+
     pub top: f32,
 }
 
@@ -140,7 +88,6 @@ fn srgb_to_linear(c: u8) -> f32 {
     }
 }
 
-/// A layer's mean colour, linear: what its texture averages to from far off.
 fn layer_mean(layer: Option<&TerrainImage>, fallback: [u8; 3]) -> Vec3 {
     let Some(img) = layer.filter(|i| i.width > 0 && i.height > 0 && i.rgba.len() >= 4) else {
         return Vec3::new(srgb_to_linear(fallback[0]), srgb_to_linear(fallback[1]), srgb_to_linear(fallback[2]));
@@ -153,7 +100,6 @@ fn layer_mean(layer: Option<&TerrainImage>, fallback: [u8; 3]) -> Vec3 {
     sum / n.max(1) as f32
 }
 
-/// Bilinear RGBA of an 8-bit image at `uv` in 0..1, each channel 0..1.
 fn sample_rgba(img: &TerrainImage, uv: Vec2) -> [f32; 4] {
     let fx = (uv.x.clamp(0.0, 1.0) * img.width as f32 - 0.5).max(0.0);
     let fy = (uv.y.clamp(0.0, 1.0) * img.height as f32 - 0.5).max(0.0);
@@ -170,11 +116,6 @@ fn sample_rgba(img: &TerrainImage, uv: Vec2) -> [f32; 4] {
     out
 }
 
-/// Bilinear like [`sample_rgba`], but over OPEN ground only: a tap under a
-/// building's floor (red below [`BURIED_SKY_VIS`]) is left out and the rest
-/// renormalised, so the ground at a wall's foot reads the ground beside it and
-/// not a blend with the sealed dark under the floor. `None` when every tap is
-/// buried.
 fn sample_open(img: &TerrainImage, uv: Vec2) -> Option<[f32; 4]> {
     let fx = (uv.x.clamp(0.0, 1.0) * img.width as f32 - 0.5).max(0.0);
     let fy = (uv.y.clamp(0.0, 1.0) * img.height as f32 - 0.5).max(0.0);
@@ -201,14 +142,6 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The terrain shader's `layer_weights`, transcribed: the painted splat map
-/// when there is one, else rock by slope and high ground by height.
-///
-/// WHEN THERE IS ONE, as `TerrainMaterial::new` decides the shader's
-/// `use_splat` -- not by the settings' own `use_splat`, which only the
-/// material's copy has set: the renderer's stays 0. Read from it, the map
-/// coloured test_room's sand beach as grass, and so did every reflection of
-/// it and the water's view of the bed past the map's edge (2026-10-07).
 fn layer_weights(settings: &TerrainMaterialUniform, splat: Option<&TerrainImage>, uv: Vec2, world_y: f32, slope_deg: f32) -> [f32; 4] {
     if let Some(s) = splat {
         let w = sample_rgba(s, uv);
@@ -224,11 +157,6 @@ fn layer_weights(settings: &TerrainMaterialUniform, splat: Option<&TerrainImage>
     w
 }
 
-/// How much of the sky and of the sun reach the ground at `uv`, and whether
-/// it lies buried under a floor: the terrain shader's decode of its baked map,
-/// read over open ground only ([`sample_open`]). `(1, 1, false)` where there is
-/// no map -- the headset then shades that ground from the live shadow map,
-/// which knows no more about a building's shadow than this does.
 fn sky_and_sun(map: Option<&TerrainImage>, uv: Vec2) -> (f32, f32, bool) {
     let Some(map) = map.filter(|m| m.width > 0 && m.height > 0) else { return (1.0, 1.0, false) };
     let Some(t) = sample_open(map, uv) else { return (0.0, 0.0, true) };
@@ -242,7 +170,6 @@ fn sky_and_sun(map: Option<&TerrainImage>, uv: Vec2) -> (f32, f32, bool) {
     (sky_vis, smoothstep(-w, w, d), false)
 }
 
-/// The ground map for these inputs, `size` texels a side.
 pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
     let size = size.max(1);
     let g = inputs.heights;
@@ -263,7 +190,7 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
             let slope_deg = n.y.clamp(-1.0, 1.0).acos().to_degrees();
             let w = layer_weights(inputs.settings, inputs.splat, uv, y, slope_deg);
             let albedo = means[0] * w[0] + means[1] * w[1] + means[2] * w[2] + means[3] * w[3];
-            // Wet sand, as the terrain shader darkens it.
+
             let s = inputs.settings;
             let albedo = albedo * (1.0 - 0.45 * (1.0 - smoothstep(s.wet_line, s.wet_line + s.wet_band, y)));
             let (sky_vis, sun_vis, under_a_floor) = sky_and_sun(inputs.sky_occlusion, uv);
@@ -282,14 +209,6 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
     GroundMap { width: size, height: size, texels, min: g.min, max: g.max, top }
 }
 
-/// THE GROUND UNDER A BUILDING TAKES THE COLOUR OF THE GROUND AROUND IT.
-///
-/// Buried under a floor, it is black -- no sky, no sun -- and nothing ever sees
-/// it; but a texel's filter and every coarser mip reach across the wall line,
-/// and the black bled onto the sunlit grass at the building's foot: the ceiling
-/// mirrored the ground outside the front door with a dark band along the door
-/// (offline, 2026-09-28). Filled from outside inward, a texel ring at a time,
-/// as a lightmap's gutter is. The height is left as it is.
 fn fill_under_buildings(texels: &mut [[f32; 4]], buried: &mut [bool], w: usize, h: usize) {
     for _ in 0..BURIED_FILL_TEXELS {
         let mut filled = Vec::new();
@@ -330,40 +249,20 @@ fn fill_under_buildings(texels: &mut [[f32; 4]], buried: &mut [bool], w: usize, 
     }
 }
 
-/// Mip levels for a square of `size` texels.
 fn mip_levels(size: u32) -> u32 {
     32 - size.max(1).leading_zeros()
 }
 
-/// The trace's finest cells: level 4, sixteen texels a side -- 1.7 m on
-/// test_room. It reads the ground itself across one of these at
-/// [`GROUND_TRACE_READINGS`] points, 43 cm apart: one step of the height grid
-/// the map is built from (257 samples over 110 m), so between two readings the
-/// ground is a single smooth patch and the crossing is interpolated between
-/// them. Finer cells cost more steps for the same answers: over test_room-
-/// shaped hills (`fixtures::hills`), cells of 43 cm read three times took 8.7
-/// steps a ray (53 at worst) and 11.9 texture reads; these take 6.5 (36) and
-/// 11.0, and meet the ground at the same points (step_census, 2026-09-29).
 pub const GROUND_TRACE_FINEST_LEVEL: u32 = 4;
 
-/// Readings of the ground across a finest cell, its two sides included.
 pub const GROUND_TRACE_READINGS: u32 = 5;
 
-/// The level a trace starts from: 64 texels a side, 7 m on test_room. Rays
-/// off a building's walls take the fewest steps from here -- coarse enough to
-/// skip open field at once, fine enough not to spend their first steps coming
-/// down (levels 5 and 7 cost 7 and 1 percent more).
 pub const GROUND_TRACE_START_LEVEL: u32 = 6;
 
-/// The most cells a trace visits. The worst of 20,000 rays off test_room's
-/// walls takes 50; one that ran out would be read as passing over.
 pub const GROUND_TRACE_MAX_STEPS: u32 = 64;
 
-/// Metres over each cell's highest ground its level stores, so the GPU's
-/// filtering and half-float rounding cannot put a reading above it.
 const GROUND_MAX_MARGIN: f32 = 0.02;
 
-/// A half float's value back as a single: the exact value the GPU reads.
 pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = ((h >> 10) & 0x1f) as i32;
@@ -375,38 +274,25 @@ pub(crate) fn f16_to_f32(h: u16) -> f32 {
     }
 }
 
-/// `v` as the half float the upload writes (`sky::f32_to_f16` truncates).
 fn as_half(v: f32) -> f32 {
     f16_to_f32(crate::renderer::sky::f32_to_f16(v))
 }
 
-/// The smallest half float not below `v`: a bound stays a bound once stored.
 fn half_at_least(v: f32) -> f32 {
     let h = crate::renderer::sky::f32_to_f16(v);
     if f16_to_f32(h) >= v {
         return f16_to_f32(h);
     }
-    // Truncation lost the fraction: one step away from zero for a positive
-    // value, one step toward it for a negative one -- up, either way.
+
     f16_to_f32(if h & 0x8000 == 0 { h + 1 } else { h - 1 })
 }
 
-/// One level of the map as it is uploaded, in half-float values.
 pub struct GroundLevel {
     pub width: u32,
     pub height: u32,
     pub texels: Vec<[f32; 4]>,
 }
 
-/// EVERY LEVEL OF THE MAP, as the GPU holds it.
-///
-/// RGB is box-filtered down the chain, so a distant patch of ground is read
-/// averaged rather than aliased. A is the height at level 0, and above it the
-/// HIGHEST ground under each texel -- the bound that lets a trace skip a whole
-/// cell the ray passes over (see [`trace`]). Taken over every level-0 texel a
-/// bilinear read inside the cell can reach -- one beyond each side -- plus
-/// [`GROUND_MAX_MARGIN`], and rounded up: a bound that rounding put below the
-/// ground would let a ray through a hill.
 pub fn levels(map: &GroundMap) -> Vec<GroundLevel> {
     let count = mip_levels(map.width.max(map.height));
     let base = GroundLevel { width: map.width, height: map.height, texels: map.texels.iter().map(|t| t.map(as_half)).collect() };
@@ -431,8 +317,7 @@ pub fn levels(map: &GroundMap) -> Vec<GroundLevel> {
                         highest = highest.max(t[3]);
                     }
                     if level == 1 {
-                        // From level 0 itself, one texel wider on every side;
-                        // each coarser level is then the highest of its four.
+
                         highest = f32::MIN;
                         let (bw, bh) = (base.width as i64, base.height as i64);
                         for sy in 2 * y as i64 - 1..=2 * y as i64 + 2 {
@@ -453,9 +338,6 @@ pub fn levels(map: &GroundMap) -> Vec<GroundLevel> {
     out
 }
 
-/// The ground's height at `q`, in level-0 texels from the map's corner:
-/// bilinear between texel centres, clamped at the edges -- what the shader's
-/// `textureSampleLevel(ground_map, probe_samp, uv, 0.0).a` returns.
 fn height_at(base: &GroundLevel, q: Vec2) -> f32 {
     let (w, h) = (base.width as f32, base.height as f32);
     let fx = (q.x - 0.5).clamp(0.0, w - 1.0);
@@ -469,10 +351,6 @@ fn height_at(base: &GroundLevel, q: Vec2) -> f32 {
     a + (b - a) * ty
 }
 
-/// Where a trace ended: the distance to the ground along the ray, `None` for
-/// sky; how many cells it visited on the way, and how many texture reads
-/// that took -- a cell's highest ground each, and the readings of the ground
-/// itself in the finest ones.
 #[derive(Clone, Copy, Debug)]
 pub struct GroundTrace {
     pub t: Option<f32>,
@@ -480,29 +358,10 @@ pub struct GroundTrace {
     pub reads: u32,
 }
 
-/// THE GROUND A RAY MEETS, from `e` along unit `d` over `levels` placed at
-/// `min..max`: the shader's `ground_trace`, step for step.
-///
-/// A walk through the cells the ray crosses, coarse where it passes high over
-/// the ground and fine where it comes close. A cell whose highest ground stays
-/// below the ray on both sides is passed over whole, and the walk climbs a
-/// level once it leaves its parent; one the ray may touch is entered a level
-/// finer, from where the ray has come down to its highest ground. At the
-/// finest level the ground itself is read evenly from there to the cell's far
-/// side, and the crossing interpolated between the first reading below the
-/// ray and the one before it.
-///
-/// It replaced a march in doubling steps -- 12.5 cm out to 256 m -- that
-/// tested the ground at 32 m and next at 64 m, past test_room's edge, so the
-/// hills between were never tested: a reflection's horizon was the height of
-/// the ground 32 m out, it stepped wherever that reading changed hands, and it
-/// crawled as the head moved (headset, 2026-09-29).
 pub fn trace(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec3, d: Vec3) -> GroundTrace {
     trace_with(levels, min, max, top, e, d, TraceShape::SHIPPED)
 }
 
-/// How a trace walks: its finest level, the level it starts from, how many
-/// readings of the ground it takes across a finest cell, and its budget.
 #[derive(Clone, Copy, Debug)]
 pub struct TraceShape {
     pub finest: u32,
@@ -512,7 +371,7 @@ pub struct TraceShape {
 }
 
 impl TraceShape {
-    /// The shader's, from the `GROUND_TRACE_*` constants.
+
     pub const SHIPPED: Self = Self {
         finest: GROUND_TRACE_FINEST_LEVEL,
         start: GROUND_TRACE_START_LEVEL,
@@ -521,7 +380,6 @@ impl TraceShape {
     };
 }
 
-/// [`trace`] walked as `shape` says.
 pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec3, d: Vec3, shape: TraceShape) -> GroundTrace {
     let miss = GroundTrace { t: None, steps: 0, reads: 0 };
     let Some(base) = levels.first() else { return miss };
@@ -529,10 +387,10 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
     let scale = size / (max - min);
     let q0 = (Vec2::new(e.x, e.z) - min) * scale;
     let raw = Vec2::new(d.x, d.z) * scale;
-    // An axis the ray barely moves along never bounds a cell it is in.
+
     let dq = Vec2::new(if raw.x.abs() < 1e-6 { 1e-6 } else { raw.x }, if raw.y.abs() < 1e-6 { 1e-6 } else { raw.y });
     let inv = Vec2::ONE / dq;
-    // On the map, and below its highest ground.
+
     let ta = -q0 * inv;
     let tb = (Vec2::splat(size) - q0) * inv;
     let mut t_in = ta.min(tb).max_element().max(0.0);
@@ -548,15 +406,13 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
     let finest = (shape.finest as i32).min(top_level);
     let mut level = (shape.start as i32).clamp(finest, top_level);
     let ahead = Vec2::new(if dq.x > 0.0 { 1.0 } else { 0.0 }, if dq.y > 0.0 { 1.0 } else { 0.0 });
-    // A thousandth of a texel along the ray: a point on a border is in the
-    // cell ahead.
+
     let nudge = Vec2::new(dq.x.signum(), dq.y.signum()) * 1e-3;
     let gaps = shape.readings.max(2) - 1;
     let mut t = t_in;
     let mut steps = 0;
     let mut reads = 0;
-    // A ray that starts under the map's ground meets nothing until it has
-    // risen above it (`ground_trace_until`).
+
     let mut risen = false;
     while steps < shape.max_steps && t < t_out {
         steps += 1;
@@ -571,15 +427,14 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
         let y_out = e.y + d.y * t_exit;
         risen = risen || y_in > highest;
         if y_in.min(y_out) <= highest {
-            // Nothing in this cell before the ray is down to its highest ground.
+
             let t_top = if y_in > highest { t + (y_in - highest) / -d.y } else { t };
             if level > finest {
                 level -= 1;
                 t = t_top;
                 continue;
             }
-            // The ground itself, read evenly from there to the cell's far side;
-            // the crossing between the first reading below it and the one before.
+
             let at = |t: f32| e.y + d.y * t - height_at(base, q0 + dq * t);
             let span = (t_exit - t_top) / gaps as f32;
             reads += gaps + 1;
@@ -598,8 +453,7 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
                 f_prev = f;
             }
         }
-        // Over this cell: on to the next, a level coarser once it is in
-        // another parent.
+
         let next = ((q0 + dq * t_exit + nudge) / cell).floor();
         if (next * 0.5).floor() != (c * 0.5).floor() {
             level = (level + 1).min(top_level);
@@ -609,7 +463,6 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
     GroundTrace { t: None, steps, reads }
 }
 
-/// The map on the GPU: [`levels`] as half floats.
 pub fn upload(device: &Device, queue: &Queue, map: &GroundMap) -> TextureView {
     let chain = levels(map);
     let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -634,9 +487,6 @@ pub fn upload(device: &Device, queue: &Queue, map: &GroundMap) -> TextureView {
     tex.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-/// What is bound when a level has no ground: one texel, never read -- the
-/// shader is told there is no ground by a top of -1e30 (see
-/// `ProbeUpload::ground`).
 pub fn none(device: &Device, queue: &Queue) -> TextureView {
     upload(
         device,
@@ -652,20 +502,15 @@ pub fn none(device: &Device, queue: &Queue) -> TextureView {
     )
 }
 
-/// Ground, rays and a brute-force reference, for the trace's tests here and
-/// its GPU test in the lights block.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
 
-    /// test_room's ground in shape: flat for 25 m around the buildings, then
-    /// hills rising to 5-8 m by 50 m out.
     pub fn hills(x: f32, z: f32) -> f32 {
         let rise = smoothstep(25.0, 50.0, (x * x + z * z).sqrt());
         rise * (5.0 + 2.5 * (x * 0.13).sin() * (z * 0.11).cos() + (x * 0.37 + z * 0.23).sin())
     }
 
-    /// A map `size` texels a side over test_room's 110 m, heights only.
     pub fn height_map(size: u32, height_at: impl Fn(f32, f32) -> f32) -> GroundMap {
         let (min, max) = (Vec2::splat(-55.0), Vec2::splat(55.0));
         let g = HeightGrid::sample(min, max, 257, 257, height_at);
@@ -682,8 +527,6 @@ pub(crate) mod fixtures {
         GroundMap { width: size, height: size, texels, min, max, top }
     }
 
-    /// `n` rays off a building's walls: from 0-3.4 m up, anywhere within 12 m
-    /// of the middle, every way round, from 35 degrees down to 20 up.
     pub fn rays(n: usize, seed: u64) -> Vec<(Vec3, Vec3)> {
         let mut s = seed.max(1);
         let mut next = move || {
@@ -703,14 +546,10 @@ pub(crate) mod fixtures {
 
     pub struct Marched {
         pub t: Option<f32>,
-        /// How close the ray came to the ground without passing below it, or
-        /// how little it passed below before coming back out: what separates
-        /// a real disagreement from a ray that only grazes.
+
         pub graze: f32,
     }
 
-    /// The ground along the ray read every centimetre, to where it leaves
-    /// the map or rises above its top; the crossing interpolated.
     pub fn march(base: &GroundLevel, min: Vec2, max: Vec2, top: f32, e: Vec3, d: Vec3) -> Marched {
         let scale = base.width as f32 / (max - min);
         let at = |t: f32| {
@@ -732,7 +571,7 @@ pub(crate) mod fixtures {
             let f = at(t);
             if f <= 0.0 {
                 let hit = t - step + step * prev / (prev - f);
-                // How deep the ray goes over the next metre.
+
                 let deepest = (1..=100).map(|k| at(t + k as f32 * step)).fold(f, f32::min);
                 return Marched { t: Some(hit), graze: -deepest };
             }
@@ -754,13 +593,11 @@ mod tests {
 
     fn sky() -> SkyIrradiance {
         let mut s = SkyIrradiance::default();
-        // A uniform sky of radiance 1: band 0 only.
+
         s.sh[0] = [3.5449077; 3];
         s
     }
 
-    /// The terrain shader's rules, pinned to its text: this transcribes them,
-    /// and the reflection of the ground must be the ground the headset draws.
     #[test]
     fn the_transcribed_rules_are_the_terrain_shaders() {
         let src = crate::renderer::terrain_pipeline::terrain_shader_src();
@@ -788,9 +625,6 @@ mod tests {
         assert!((n - Vec3::new(-0.1, 1.0, -0.2).normalize()).length() < 1e-4, "{n:?}");
     }
 
-    /// Open flat ground under a uniform sky and an overhead sun returns its
-    /// albedo times what arrives -- and ground the baked map shadows from the
-    /// sun returns only the sky's share.
     #[test]
     fn ground_in_the_buildings_shadow_is_darker_by_exactly_the_sun() {
         let g = flat(0.0);
@@ -798,8 +632,7 @@ mod tests {
         let sun = SkySun { direction: [0.0, 1.0, 0.0], light_rgb: [4.0, 4.0, 4.0], texels: 1, energy_fraction: 0.5 };
         let grass = TerrainImage { width: 1, height: 1, rgba: vec![128, 128, 128, 255] };
         let layers = [Some(grass)];
-        // Left half fully sky-visible and sunlit (sun distance +range), right
-        // half fully sky-visible and in shadow (-range).
+
         let occ = TerrainImage {
             width: 2,
             height: 1,
@@ -817,15 +650,13 @@ mod tests {
         assert!((shaded - albedo * e * (1.0 - F0)).abs() < 1e-3, "shadowed ground {shaded}");
     }
 
-    /// The black ground under a floor must not bleed onto the grass outside:
-    /// the texels beside the wall line take the outside's colour.
     #[test]
     fn ground_under_a_building_takes_the_colour_around_it() {
         let g = flat(0.0);
         let s = TerrainMaterialUniform::default();
         let grass = TerrainImage { width: 1, height: 1, rgba: vec![128, 128, 128, 255] };
         let layers = [Some(grass)];
-        // Left half open sky and sun; right half sealed under a floor.
+
         let occ = TerrainImage {
             width: 4,
             height: 1,
@@ -837,8 +668,7 @@ mod tests {
         );
         let open = map.texels[0][0];
         assert!(open > 0.1);
-        // Up to the wall line and on under the floor, the open ground's colour:
-        // no dark band where the two meet.
+
         for t in &map.texels[..8] {
             assert!((t[0] - open).abs() < 0.02 * open, "{:?}", &map.texels[..8]);
         }
@@ -854,12 +684,9 @@ mod tests {
         }
     }
 
-    /// Wherever a bilinear read of the ground can land inside a coarse texel,
-    /// the ground is no higher than that texel says -- and not much lower,
-    /// or the trace would enter cells it has no need to.
     #[test]
     fn every_level_bounds_the_ground_under_it() {
-        // Bumpier than any real terrain, so a read between texels matters.
+
         let map = fixtures::height_map(64, |x, z| 3.0 * (x * 0.9).sin() * (z * 0.7).cos() + 0.5 * (x * 2.1 + z).sin());
         let chain = levels(&map);
         assert_eq!(chain.len(), 7);
@@ -877,8 +704,7 @@ mod tests {
                         }
                     }
                     assert!(highest <= bound, "level {l} texel ({x}, {y}): ground {highest} over bound {bound}");
-                    // No looser than the level-0 texels a read can reach --
-                    // one beyond each side -- plus the margin.
+
                     let span = 1i64 << l;
                     let mut reachable = f32::MIN;
                     for sy in y as i64 * span - 1..=(y as i64 + 1) * span {
@@ -894,11 +720,6 @@ mod tests {
         }
     }
 
-    /// A ray from a hollow finer than the map's texels -- a puddle, under the
-    /// map's ground there -- meets nothing until it has risen above it: it
-    /// went straight to the ground where it started, and a mirror puddle
-    /// showed the grass (headset, 2026-10-08). Rising away it meets nothing;
-    /// rising over a hill it still meets the hill.
     #[test]
     fn a_ray_from_under_the_maps_ground_meets_only_what_it_rises_to() {
         let map = fixtures::height_map(1024, fixtures::hills);
@@ -910,10 +731,10 @@ mod tests {
             let z = map.min.y + size.y * (0.1 + 0.8 * ((i * 91 % 400) as f32 / 400.0));
             let under = height_at(&chain[0], (Vec2::new(x, z) - map.min) * (chain[0].width as f32 / size)) - 0.05;
             let e = Vec3::new(x, under, z);
-            // Straight up: nothing above but the sky.
+
             let up = trace(&chain, map.min, map.max, map.top, e, Vec3::Y);
             assert!(up.t.is_none(), "from under the ground at {e}, straight up met {:?}", up.t);
-            // Nearly level: whatever it meets is past the point it rose clear.
+
             let d = Vec3::new(0.7, 0.05, 0.7).normalize();
             if let Some(t) = trace(&chain, map.min, map.max, map.top, e, d).t {
                 assert!(t > 0.05, "from under the ground at {e}, met it where it started ({t})");
@@ -923,9 +744,6 @@ mod tests {
         assert!(checked > 0, "no level ray met a hill");
     }
 
-    /// The trace against brute force: the same ground read every centimetre
-    /// along the ray. They must meet the ground at the same point, and differ
-    /// on hit or miss only for a ray that grazes it within a few centimetres.
     #[test]
     fn the_trace_meets_the_ground_where_a_fine_march_does() {
         let map = fixtures::height_map(1024, fixtures::hills);
@@ -955,9 +773,6 @@ mod tests {
         assert!(most < GROUND_TRACE_MAX_STEPS, "a ray used the whole budget ({most} steps)");
     }
 
-    /// The case that broke on the headset: flat ground to 40 m and a ridge
-    /// beyond it, and a ray from eye height rising just too slowly to clear
-    /// it. The old march read the ground at 32 m and next past the edge.
     #[test]
     fn a_ridge_between_32_and_64_metres_is_met() {
         let map = fixtures::height_map(1024, |x, _| if x > 40.0 { ((x - 40.0) * 0.8).min(4.0) } else { 0.0 });
@@ -974,7 +789,6 @@ mod tests {
         height_at(base, (Vec2::new(p.x, p.z) - map.min) * (base.width as f32 / (map.max - map.min)))
     }
 
-    /// Steep ground takes the rock layer, as the shader blends it by slope.
     #[test]
     fn a_cliff_is_rock_and_the_plain_is_grass() {
         let g = HeightGrid::sample(Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0), 11, 11, |x, _| if x > 5.0 { (x - 5.0) * 3.0 } else { 0.0 });
@@ -993,9 +807,6 @@ mod tests {
         assert!(cliff[0] > cliff[1], "the cliff is the rock layer: {cliff:?}");
     }
 
-    /// A painted splat map decides the layers, as it does in the terrain
-    /// shader -- with the settings as the renderer holds them, whose own
-    /// `use_splat` is never set.
     #[test]
     fn a_painted_splat_is_the_ground_maps_colour() {
         let g = HeightGrid::sample(Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0), 11, 11, |_, _| 0.0);
@@ -1007,7 +818,7 @@ mod tests {
             Some(TerrainImage { width: 1, height: 1, rgba: vec![0, 0, 255, 255] }),
             Some(TerrainImage { width: 1, height: 1, rgba: vec![255, 255, 0, 255] }),
         ];
-        // All sediment: the flat plain painted as a beach.
+
         let splat = TerrainImage { width: 2, height: 2, rgba: [0u8, 0, 0, 255].repeat(4) };
         let map = build(
             &GroundInputs { heights: &g, sky: &sky(), sun: None, sky_occlusion: None, layers: &layers, splat: Some(&splat), settings: &s },
@@ -1019,14 +830,10 @@ mod tests {
     }
 }
 
-/// THE MEASUREMENTS BEHIND `GROUND_TRACE_*`, run by hand:
-/// `cargo test --release --lib step_census -- --ignored --nocapture`.
 #[cfg(test)]
 mod step_census {
     use super::*;
 
-    /// Steps, texture reads and agreement with brute force, for several
-    /// finest levels, readings and starting levels.
     #[test]
     #[ignore]
     fn shapes() {
@@ -1057,8 +864,6 @@ mod step_census {
         }
     }
 
-    /// Where the shipped walk's steps go, by the ray's elevation: skims just
-    /// above the hills cost the most.
     #[test]
     #[ignore]
     fn steps_by_elevation() {

@@ -160,4 +160,3 @@ fn draw_speaker() -> Vec<u8> {
     }
     buf
 }
-

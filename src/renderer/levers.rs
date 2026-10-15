@@ -1,351 +1,143 @@
-//! RUNTIME LEVERS: switch a renderer feature off -- or force one on -- on the
-//! headset, while it runs, to see what it costs and what it does.
-//!
-//! # Why a file and not a build
-//!
-//! Every question of the form "is it the trace or the portals that costs the
-//! millisecond?" or "does the seam go away without the probe blend?" used to
-//! cost a build and a deploy per answer. A lever answers it in the time it
-//! takes to push a few bytes:
-//!
-//! ```text
-//! adb -s 2G0YC5ZG7706YV shell "echo '{\"probe_trace\": false}' > \
-//!     /sdcard/Android/data/com.example.questapp/files/levers.json"
-//! ```
-//!
-//! The app polls the file about once a second and hands every change to the
-//! renderer, and each `PERF` line names the levers it was measured under, so a
-//! number is never read against the wrong configuration. Delete the file (or
-//! write `{}`) to go back to the shipped state.
-//!
-//! # One set of switches for people and for the A/B schedule
-//!
-//! `perf_ab` cycles the same switches on its own: each phase is these levers
-//! with exactly one more thing off. So a lever and a phase can never disagree
-//! about what "no portals" means, and every feature added here is measurable by
-//! the schedule for free.
-//!
-//! Unknown names are an ERROR, not ignored: a lever misspelt in the middle of a
-//! headset session would otherwise measure nothing and look like a finding.
-//!
-//! # A viewpoint is a lever too
-//!
-//! `bench` pins the camera to a named place (see `bench`), so the same file
-//! that switches a feature off also says where the frame is measured from. A
-//! host script walks the views and the A/B schedule with the headset on a
-//! desk: `quest_app/bench.py`.
-
 use serde::Deserialize;
 
-/// Every switchable feature. The default is the shipped renderer.
-///
-/// `Clone`, not `Copy`: the bench viewpoint carries its name.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Levers {
-    /// Reflection probes at all. Off: surfaces reflect the sky's harmonics.
+
     pub probes: bool,
-    /// The exact reflection trace (rooms, doorways, proxies). Off: smooth
-    /// surfaces fall back to the box projection.
+
     pub probe_trace: bool,
-    /// What stands inside rooms -- the pillar, the lamps -- in the trace. Off:
-    /// reflections pass through them to the walls.
+
     pub reflection_proxies: bool,
-    /// The two-photograph blend across a room's cells. Off: every resident
-    /// probe is its own room, so no fragment reads two.
+
     pub probe_blend: bool,
-    /// Doorway portals: the blend across an opening, and the trace crossing
-    /// into the next room.
+
     pub portals: bool,
-    /// Every shadow pass and every shadow tap. Lights still shine, unshadowed.
+
     pub shadows: bool,
-    /// The moving-objects sun map. The static map and the baked mask stay.
+
     pub sun_dynamic: bool,
-    /// Each model left out of the shadow tiles its bounding sphere cannot
-    /// reach -- the moving-objects map's two sun tiles and each spot's (see
-    /// `shadow::sphere_in_frustum`). Lossless: the GPU clips those casters
-    /// whole, so off changes no texel, only what the passes cost.
+
     pub shadow_mesh_cull: bool,
-    /// The player's body posed ONCE a frame by a compute pass, and drawn into
-    /// the moving-objects map, the spot atlas and the cards as a rigid mesh of
-    /// those positions -- where each of those draws skinned every vertex again
-    /// (`skin_compute`). The same arithmetic, so the same shadows and cards.
+
     pub skin_once: bool,
-    /// In frames where no spot casts, the scene's brush readers and models
-    /// drawn by their SPOTLESS TWINS: the spots' shadow code left out, which
-    /// gives back the registers the tent took (`lights::without_spot_shadows`).
-    /// The same pixels: with no spot casting, every spot's test is false.
+
     pub spotless_shaders: bool,
-    /// In frames where no surface is lit by the torch, the probe pass and the
-    /// ground's drawn by their POOLLESS TWINS: the pool maps' lookup left out
-    /// (`lights::without_pool_maps`). The same pixels: with no lit surface,
-    /// every lookup adds nothing.
+
     pub poolless_shaders: bool,
-    /// DYNAMIC RESOLUTION: ask the runtime each frame for its size for the
-    /// eyes' layer (`XR_META_recommended_layer_resolution`), which Quest 3
-    /// makes the condition for GPU level 5. The eyes are still drawn at their
-    /// fixed size. Off: never asked.
+
     pub dynamic_resolution: bool,
-    /// The player's crisp shadows from the lamps lighting them most: a
-    /// characters-only tile of the shadow atlas each. Off, those lamps shadow
-    /// the player by the capsules alone. See `shadow::MAX_CHARACTER_SHADOWS`.
+
     pub character_shadows: bool,
-    /// The doors' shadows from the lamps: the lamps reaching a door near the
-    /// eye take moving casters' tiles that hold the door, so a closed leaf
-    /// stops the light its doorway was baked letting through. Off, a door
-    /// casts only in the sun's and the torch's maps. See `doors`.
+
     pub door_shadows: bool,
-    /// A shut door seals its doorway for portal culling: what lies beyond is
-    /// culled as if the doorway were wall. Off, doors cull nothing. See
-    /// `doors::shut_portals`.
+
     pub door_culling: bool,
-    /// The characters as capsules: their soft shadows, contact darkening and
-    /// reflections. Off, the shaders see no characters (and the characters'
-    /// shadow tiles go with them). See `uniforms::CapsuleUpload`.
+
     pub capsules: bool,
-    /// The live light loop, the sky's sun included. Baked light and probes stay.
+
     pub direct_lights: bool,
-    /// The STATIONARY lamps -- shaded live, shadowed from their baked masks.
-    /// MEASUREMENT: off, their light is in no lightmap, so it is simply gone.
+
     pub stationary_lights: bool,
-    /// Eye adaptation. Off: exposure is pinned at the scene's post setting.
+
     pub eye_adaptation: bool,
-    /// The light loop skips a lamp that cannot reach the pixel -- past its
-    /// range, or behind a wall by its baked mask -- before any of its maths.
-    /// Lossless: off changes no pixel, only what the frame costs.
+
     pub light_culling: bool,
-    /// Brush reflections from the half-resolution probe pass rather than
-    /// traced per pixel. See `brush_pipeline::probe_pass`. Mono scene passes.
+
     pub half_res_reflections: bool,
-    /// The brushes' depth drawn first in the scene pass, so nothing hidden
-    /// behind a wall or under a floor is shaded. See
-    /// `BrushPipeline::new_depth_prepass`. Lossless: off changes no pixel.
+
     pub depth_prepass: bool,
-    /// From inside a closed room, whatever lies outside the building -- the
-    /// terrain -- is drawn only where a doorway shows it. See `portal_cull`.
-    /// Lossless for a closed room: off changes no pixel.
+
     pub portal_culling: bool,
-    /// The single-eye probe pass leaves a traced hit's secondary lookups to
-    /// a compute pass over just the texels that need them. See
-    /// `probe_fixup`. Lossless: off changes no pixel.
+
     pub deferred_reflection_lookups: bool,
-    /// The ground's probe reflection made in the half-resolution probe pass
-    /// and read back, as the brushes' is, instead of traced per pixel in the
-    /// scene pass. See `TerrainPipeline::new_probe_pass`. Single eye, with
-    /// `deferred_reflection_lookups`.
+
     pub terrain_probe_pass: bool,
-    /// Reflections that leave the building meet the ground: the trace over
-    /// the ground map's heights. Off: they see only the sky. See
-    /// `ground_map::trace`.
+
     pub ground_trace: bool,
-    /// Fixed foveated rendering: how coarsely the edges of each eye's image
-    /// are shaded, where the headset has it. See `foveation`.
+
     pub foveation: crate::renderer::foveation::FoveationLevel,
-    /// APPLICATION SPACEWARP: motion vectors and depth with every frame, so
-    /// the compositor can make every other one. ON by default since
-    /// 2026-09-29, once its black frames were fixed: 36 frames a second are
-    /// rendered, a 27.8 ms budget. Meshes carry their own motion (previous
-    /// model, previous joints); cuboids, particles, water waves, reflections
-    /// and highlights move only with the camera. It also turns sharpening off
-    /// -- see `layer_settings::sharpening_for`. See `space_warp`.
+
     pub space_warp: bool,
-    /// DIAGNOSIS ONLY: SpaceWarp variants, as bits, to find what makes the
-    /// compositor's frames black (headset, 2026-09-29) without a rebuild per
-    /// guess. 1 = the motion pass draws nothing (cleared vectors and depth);
-    /// 2 = vectors written y DOWN (Vulkan's NDC; shipped is y up); 4 =
-    /// vectors zeroed (depth still drawn);
-    /// 8 = `appSpaceDeltaPose` the identity; 16 = `farZ` infinite; 64 = no
-    /// layer settings (sharpening) on the projection layer; 128 = views drawn
-    /// and submitted 5 cm right of the head, 256 = swaying +-5 cm -- head
-    /// motion for the compositor to correct, on a headset lying on a desk;
-    /// 512 = depth declared reversed; 1024 = depth declared 500 m .. 1 km;
-    /// 2048 = the depth image's stencil stored rather than discarded;
-    /// 4096 = the depth image cleared to 0 rather than 1;
-    /// 16384 = reflections move with their surface, as before 2026-09-29
-    /// (`space_warp`'s reflections section), to compare;
-    /// 32768 = the brushes write what the reflection motion READ instead of
-    /// motion -- reflected share, reach in metres, distance ratio;
-    /// 65536 = with 8192, the images also saved raw to the app's files
-    /// (`swdump.bin`, see `space_warp::Readback::read`);
-    /// 131072 = the motion pass unculled -- every brush and mesh in both
-    /// eyes, as before 2026-10-08 round 4 -- to price the cull;
-    /// 262144 = no particle motion (rain, snow, effects), to compare.
+
     pub space_warp_debug: u32,
-    /// DIAGNOSIS: both eyes' finished images of the next frame, raw, to the
-    /// app's files as `eyecapture_<n>.bin`, each time this changes to a new
-    /// nonzero `n` -- to see whether something differs between the eyes,
-    /// which no screenshot shows (the system's is one view). Needs the
-    /// `debug.spacesoup.eyecapture` property set to 1 before the app starts;
-    /// see `xr::vulkan::eye_capture_enabled`. `quest_app/bench.py
-    /// --eye-capture` drives it. Captures only: it changes nothing drawn, so
-    /// it is not in `summary`.
+
     pub eye_capture: u32,
-    /// Each lamp's terminator shaded over the pixel's footprint rather than at
-    /// its centre, so normal-mapped stone lit at a grazing angle does not
-    /// flip whole pixels between lit and black. See `lights::terminator_aa`.
+
     pub terminator_aa: bool,
-    /// The lamps' veils: each light source's glare, drawn where an HDR
-    /// framebuffer would have bloomed it. See `glare`.
+
     pub glare: bool,
-    /// How strong the veils are against `glare::VEIL_SHARE` of the CIE young
-    /// eye's: 1 as shipped.
+
     pub glare_strength: f32,
-    /// The level's effects -- fire, smoke, embers, dust -- simulated, lit and
-    /// drawn. See `effects`.
+
     pub effects: bool,
-    /// The level's water -- its surfaces, their waves and, under SpaceWarp,
-    /// their motion -- drawn. See `water_pipeline`.
+
     pub water: bool,
-    /// The view from under the water -- the veil, the surface's underside,
-    /// the waterline and the wet film -- when an eye is in it. Off, an eye
-    /// under the water sees the surface's top and an unfogged bed. See
-    /// `underwater`.
+
     pub underwater: bool,
-    /// The level's weather -- the ground's weather twins over its areas, and
-    /// the falling rain, snow and splashes -- drawn. Off draws the dry
-    /// ground's shaders everywhere and no particles. See `weather`.
+
     pub weather: bool,
-    /// Where a fixture's bulb meets the tone curve, exposed, when it would be
-    /// brighter: its own light -- the bulb's glow and its lamp on the inside
-    /// of its shade -- scaled as one, as an eye adapts to a lamp it looks into
-    /// (`tonemap::own_light_scale`). 16 as shipped, the bulb white and its
-    /// reflector graded down to the rim; 0 leaves it unscaled, the mouth one
-    /// white with the bulb lost in it, as until 2026-10-02.
+
     pub fixture_bulb_level: f32,
-    /// The player's flashlight throwing its light back off what its beam
-    /// lands on, as one more light standing at the lit patch. The renderer
-    /// draws it as any light; the app places it (`quest_app::flashlight_bounce`).
+
     pub flashlight_bounce: bool,
-    /// The lit surfaces' lights -- that bounce -- shaded by the scene readers
-    /// apart from the lamps, with none of the lamp loop's work for a shadow
-    /// or a highlight they never have (`lights::Light::is_surface_light`).
-    /// Off, they go through the lamp loop as before, the shaders unchanged.
+
     pub surface_light_loop: bool,
-    /// A carried torch in reflections, as its own capsules: its body, and its
-    /// glass glowing. The app hands them over (`quest_app::flashlight`); off,
-    /// it hands none, and a torch shows in no reflection, as until 2026-10-02.
+
     pub torch_reflection: bool,
-    /// The characters mirrored in the floor the player stands on, in place of
-    /// their capsules there. See `brush_pipeline::probe_pass::MIRROR_FORMAT`.
-    /// OFF as shipped: its pass and blur levels cost about 1 ms at GPU level 5
-    /// wherever a mirrored body could be in view -- which, with the Quest's
-    /// tall field of view, is most views (2026-09-30). On once they cost less.
+
     pub floor_mirror: bool,
-    /// A little blur on every reflection: each half-resolution reflection
-    /// texel averaged with its neighbours on the same surface, so reflected
-    /// edges and highlights stop crawling with the texel grid. See
-    /// `probe_blur`.
+
     pub reflection_blur: bool,
-    /// The player on cards: six views of their body drawn every frame, which
-    /// a reflection meeting them reads for their real outline and colours in
-    /// place of their capsules' one colour. See `character_cards`.
+
     pub character_cards: bool,
-    /// The thin pass's kernel unit, in eye pixels: a model's wires, chain
-    /// links and rims are drawn wider by the kernel's reach and each fragment
-    /// takes its share of their true light (see `mesh::thin_parts` and the
-    /// mesh shader's `thin_share`), so a wire a third of a pixel thick holds
-    /// its light as it moves, where 4x MSAA alone let it swing by a third. 0
-    /// draws them as they are, among the opaque parts. 1 as shipped: the
-    /// kernel then adds up to the same light wherever a wire falls, upright
-    /// or diagonal; more draws a wider band than the kernel needs (where
-    /// foveation shades a block of pixels as one fragment, the kernel is that
-    /// much wider); less cuts its tails. Until 2026-10-01 this was the drawn
-    /// width in pixels, 3 as shipped.
+
     pub thin_parts: f32,
-    /// MEASUREMENT: the thin pass shaded as it was before 2026-10-01, from
-    /// the normal interpolated at each fragment of the widened band, instead
-    /// of the mean over the stretch of the part each fragment's kernel
-    /// reaches (`mesh_pipeline::THIN_SHADE`). Single-eye passes.
+
     pub thin_shading_sampled: bool,
-    /// The CPU performance level asked of the runtime. `None` asks nothing,
-    /// as shipped: the app keeps the level it started at. See
-    /// `performance_level`.
+
     pub cpu_level: Option<crate::renderer::performance_level::PerformanceLevel>,
-    /// The GPU's, likewise. Play ran at GPU level 2 with nothing asked
-    /// (2026-09-29); this is the lever for when the game needs more.
+
     pub gpu_level: Option<crate::renderer::performance_level::PerformanceLevel>,
-    /// Metres past which the terrain's layer normal maps fade out; 0 keeps
-    /// them everywhere. See `terrain_pipeline` (`post_params.z`).
+
     pub terrain_detail_distance: f32,
-    /// MEASUREMENT: the right eye drawn from the LEFT eye's view -- its pose
-    /// and field of view -- so the two finished images must match texel for
-    /// texel; any difference is state one eye's passes keep and the other's
-    /// do not (user, 2026-09-30: "one eye pass that is not doing something the
-    /// same as the other"). Capture both with `bench.py --eye-capture`.
+
     pub same_eyes: bool,
-    /// MEASUREMENT: the probe pass drawn with one of its register cuts
-    /// (`brush_pipeline::DEFERRED_REGISTER_CUTS`, e.g. `def_cut_characters`)
-    /// -- what a part costs by its PRESENCE in the shader, which a runtime
-    /// switch cannot measure (the code stays compiled in). Mono passes. A cut
-    /// named `terrain_cut_...` is the ground's instead
-    /// (`terrain_pipeline::PROBE_PASS_REGISTER_CUTS`), the brushes' as shipped.
+
     pub pass_cut: Option<String>,
-    /// MEASUREMENT: the scene pass's brush likewise, with one of
-    /// `SCENE_REGISTER_CUTS` (e.g. `scene_cut_contact`). Mono passes.
+
     pub scene_cut: Option<String>,
-    /// MEASUREMENT: the reflection fix-up run with one of
-    /// `probe_fixup::FIXUP_CUTS` (e.g. `fixup_cut_rims`) -- what each kind of
-    /// record costs. Lossy: the cut lookups are not made.
+
     pub fixup_cut: Option<String>,
-    /// MEASUREMENT: the water drawn with one of `water_pipeline::WATER_CUTS`
-    /// (e.g. `breaker_face`) in place of its ringless shader -- what a part
-    /// costs by its presence and its work. Not the same picture.
+
     pub water_cut: Option<String>,
-    /// The ground's slope twins (`ground_twins`): its gentle triangles drawn
-    /// by the readers without the steep ground's code. Off draws every
-    /// triangle with the full readers. The same picture.
+
     pub slope_twins: bool,
-    /// The ground's probe pass with its repeated code written once
-    /// (`ground_twins::dedup_passes`). Off draws the pass as it was. The same
-    /// picture.
+
     pub pass_dedup: bool,
-    /// MEASUREMENT: the ground drawn by its full reader everywhere, with no
-    /// twin (`full`), or as it was before its layer reads became one loop
-    /// (`inlined`: reader and probe pass, no twin). The same picture as the
-    /// shipped readers. See `TerrainPipeline::new_probe_reader_twins`.
+
     pub terrain_reader: Option<String>,
-    /// MEASUREMENT: every scene reader -- the brushes' sun classes, their
-    /// spotless twins, the ground's four -- rebuilt with one of
-    /// `brush_pipeline::READER_EDITS` (e.g. `sky_walked`) and drawn in
-    /// place of the shipped ones, chosen per frame and per face as they are.
-    /// Two forms of one piece of reader code, priced against each other in
-    /// one session in the configuration that ships; `reader_edit_none` is
-    /// the control, rebuilt unedited. The same picture as the shipped readers.
+
     pub reader_edit: Option<String>,
-    /// MEASUREMENT: block on the GPU at the end of every frame, as the
-    /// renderer used to. Its wait is then exactly the GPU's time, which is
-    /// what the A/B schedule attributes costs with; shipped, the CPU prepares
-    /// the next frame while the GPU draws this one.
+
     pub gpu_sync: bool,
-    /// Screen-space reflections. `None` leaves the in-headset switch alone.
+
     pub ssr: Option<bool>,
-    /// Both eyes in one multiview scene pass. `None` leaves it as set.
+
     pub multiview: Option<bool>,
-    /// MEASUREMENT ONLY -- the scene pass shades a quarter of the pixels. If
-    /// the scene cost drops toward a quarter, the frame is fill-bound.
+
     pub half_viewport: bool,
-    /// MEASUREMENT ONLY -- straight to the swapchain: no offscreen copy, no eye
-    /// pass. Reflections that need the copy break.
+
     pub direct_path: bool,
-    /// Cycle `perf_ab`'s phases, one per `PERF` window, on top of these levers.
+
     pub ab_cycle: bool,
-    /// MEASUREMENT: the camera pinned to a named viewpoint instead of the
-    /// head. The app moves the rig and the renderer pins the tracked head;
-    /// see `bench`.
+
     pub bench: Option<crate::renderer::bench::BenchPose>,
-    /// THE TIME OF DAY'S HOUR, local solar time: setting it turns a level
-    /// with a photographed sky over to the time-of-day sky (its defaults,
-    /// north turned so the sun keeps the photograph's side) and pins the
-    /// clock there; a level that authors a time of day jumps to it. `None`
-    /// leaves the level's own clock. See `renderer::time_of_day`.
+
     pub time_of_day_hour: Option<f32>,
-    /// Real minutes a whole day takes, over the level's own: 0 freezes the
-    /// clock, 24 runs an hour a minute. With `time_of_day_hour`, the clock
-    /// runs on from that hour.
+
     pub time_of_day_minutes: Option<f32>,
-    /// The eye's night vision -- the Purkinje shift toward rod vision's
-    /// blue-grey under moonlight (`tonemap::night_vision`). Off for an A/B:
-    /// the shader's code stays; its amount is 0.
+
     pub night_vision: bool,
 }
 
@@ -425,7 +217,7 @@ impl Default for Levers {
 }
 
 impl Levers {
-    /// Parse a lever file. `{}` -- or an empty file -- is the shipped state.
+
     pub fn parse(text: &str) -> Result<Self, String> {
         if text.trim().is_empty() {
             return Ok(Self::default());
@@ -437,7 +229,6 @@ impl Levers {
         Ok(levers)
     }
 
-    /// These levers with the `perf_ab` phase's one extra switch applied.
     pub fn with_phase(self, phase: crate::renderer::perf_ab::Phase) -> Self {
         use crate::renderer::perf_ab::Phase;
         let mut l = self;
@@ -478,14 +269,10 @@ impl Levers {
         l
     }
 
-    /// The performance levels asked for, CPU then GPU, as
-    /// `performance_level::requests` takes them.
     pub fn performance_levels(&self) -> [Option<crate::renderer::performance_level::PerformanceLevel>; 2] {
         [self.cpu_level, self.gpu_level]
     }
 
-    /// What differs from the shipped state, for the `PERF` line: `-` when
-    /// nothing does.
     pub fn summary(&self) -> String {
         let d = Self::default();
         let mut out: Vec<String> = Vec::new();
@@ -613,11 +400,9 @@ impl Levers {
     }
 }
 
-/// A lever file, re-read when it changes.
 pub struct LeverFile {
     path: std::path::PathBuf,
-    /// The modification time and length last read; `None` before the first
-    /// read and while the file does not exist.
+
     seen: Option<(std::time::SystemTime, u64)>,
 }
 
@@ -630,9 +415,6 @@ impl LeverFile {
         &self.path
     }
 
-    /// `Some` when the file changed since the last call: the levers it now
-    /// holds, or why it could not be read. A file that disappears reads as the
-    /// shipped state, so deleting it undoes every lever.
     pub fn poll(&mut self) -> Option<Result<Levers, String>> {
         match std::fs::metadata(&self.path) {
             Ok(m) => {
@@ -674,8 +456,6 @@ mod tests {
         assert_eq!(l.summary(), "no_probe_trace,ssr=on");
     }
 
-    /// A clock request is named on every line measured under it, since it
-    /// moves every timing; a level the extension does not have is refused.
     #[test]
     fn a_performance_level_is_read_and_named() {
         use crate::renderer::performance_level::PerformanceLevel;
@@ -686,13 +466,11 @@ mod tests {
         assert!(Levers::parse(r#"{"gpu_level": "max"}"#).is_err());
     }
 
-    /// A misspelt lever measures nothing and would look like a finding.
     #[test]
     fn an_unknown_lever_is_an_error() {
         assert!(Levers::parse(r#"{"probe_tarce": false}"#).is_err());
     }
 
-    /// The viewpoint rides in the same file and is named on every line.
     #[test]
     fn a_bench_view_is_read_and_named() {
         let l = Levers::parse(r#"{"bench": {"name": "hall_back", "eye": [-1.3, 1.6, -14.5], "at": [0.4, 2.4, 3.7]}, "ab_cycle": true}"#)
@@ -702,8 +480,6 @@ mod tests {
         assert_eq!(l.summary(), "ab_cycle,bench=hall_back");
     }
 
-    /// A view that cannot be pinned -- a misspelt field, a name that would
-    /// split the summary, no direction -- is refused like a misspelt lever.
     #[test]
     fn a_bench_view_that_cannot_be_used_is_an_error() {
         for bad in [
@@ -716,8 +492,6 @@ mod tests {
         }
     }
 
-    /// Each phase is the levers with exactly one more thing switched, so the
-    /// schedule and a person flipping the same lever measure the same thing.
     #[test]
     fn each_phase_is_one_lever() {
         for p in Phase::ALL {

@@ -9,103 +9,37 @@ pub struct VkContext {
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub queue_family_index: u32,
-    /// Whether `VkPhysicalDeviceMultiviewFeatures::multiview` was ENABLED on
-    /// this device -- not merely supported by the hardware.
-    ///
-    /// The distinction matters because this renderer builds its own `VkDevice`
-    /// and hands it to wgpu through `device_from_raw`, which TRUSTS the feature
-    /// list it is given. Claiming `Features::MULTIVIEW` for a device that never
-    /// enabled it produces pipelines that validate and then misbehave on the
-    /// headset, with nothing on this side reporting a problem.
+
     pub multiview: bool,
-    /// Nanoseconds per timestamp tick, or `None` when this queue cannot
-    /// timestamp at all.
-    ///
-    /// Same rule as `multiview` above, for the same reason: `device_from_raw`
-    /// trusts whatever feature list it is handed, so `Features::TIMESTAMP_QUERY`
-    /// must be claimed only when the device really can do it. Timestamps are
-    /// core Vulkan rather than an extension, so what decides it is not a feature
-    /// bit but `timestampValidBits` on the QUEUE FAMILY -- a family can be a
-    /// perfectly good graphics queue and still report zero, and then every
-    /// timestamp written to it is silently meaningless rather than an error.
-    ///
-    /// `timestamp_period` is the scale: raw ticks mean nothing without it, and
-    /// it is not 1.0 on Adreno.
+
     pub timestamp_period_ns: Option<f32>,
-    /// Whether `shaderFloat16` was ENABLED (`VK_KHR_shader_float16_int8`):
-    /// `f16` ARITHMETIC in shaders. Same contract as `multiview` -- claimed to
-    /// wgpu as `Features::SHADER_F16` only when this is true.
-    ///
-    /// Arithmetic only. Adreno has no 16-bit uniform access
-    /// (`uniformAndStorageBuffer16BitAccess`, gpuweb#5006), so every buffer
-    /// stays 32-bit, and the SpaceSoupVR naga fork declares the 16-bit storage
-    /// capabilities only for buffers that really hold a 16-bit type.
+
     pub shader_f16: bool,
-    /// Whether ROBUST ACCESS is enabled: `robustBufferAccess`, and
-    /// `robustBufferAccess2` + `robustImageAccess2` (`VK_EXT_robustness2`).
-    /// Off: see `ENABLE_ROBUST_ACCESS`.
+
     pub robust_access: bool,
-    /// The device extensions enabled here -- handed to wgpu's
-    /// `device_from_raw`, which (in the SpaceSoupVR fork) trusts robust access
-    /// only when its extension is among them.
+
     pub enabled_extensions: Vec<&'static std::ffi::CStr>,
-    /// Whether FIXED FOVEATED RENDERING can run: `VK_EXT_fragment_density_map`
-    /// enabled with `fragmentDensityMap` and
-    /// `fragmentDensityMapNonSubsampledImages` -- the second is what lets a
-    /// foveated pass draw straight into the OpenXR swapchain's ordinary
-    /// images. See `renderer::foveation`.
+
     pub fragment_density_map: bool,
-    /// Whether `dualSrcBlend` was ENABLED: a fragment shader's second output
-    /// as a blend factor, which is how water tints what lies under it channel
-    /// by channel (`water_pipeline`). Same contract as `multiview`.
+
     pub dual_src_blend: bool,
 }
 
-/// Whether to switch on the device's robust buffer and image access.
-///
-/// OFF, MEASURED (Quest 3, 2026-09-28): on, it cost 0.2-1.7 ms of GPU a
-/// frame across the six benchmark views -- the hallway 1.73 ms. The shaders'
-/// own index clamps protect against the same out-of-range reads far more
-/// cheaply, and they are only compiled in when wgpu knows robust access is
-/// OFF: stock wgpu-hal assumed it was on for any device that SUPPORTS it,
-/// which is why `device_from_raw` is told, through `enabled_extensions`,
-/// exactly what this device has (the fork's patch to wgpu-hal).
 const ENABLE_ROBUST_ACCESS: bool = false;
 
-/// The Android system property that makes every pipeline report the driver's
-/// statistics for its shaders -- registers, instruction counts -- to the log,
-/// as `PIPESTATS` lines (the SpaceSoupVR wgpu fork's `wgpu-hal`). Off unless
-/// set; read once, when the device is created:
-///
-/// ```text
-/// adb -s <quest> shell setprop debug.spacesoup.pipestats 1
-/// ```
-///
-/// Measurement only: how many registers a shader holds decides how many waves
-/// of it a GPU core keeps in flight, and no other tool on this headset says.
 const PIPELINE_STATISTICS_PROPERTY: &std::ffi::CStr = c"debug.spacesoup.pipestats";
 
-/// The Android system property that lets the renderer copy its eye images
-/// out -- `Levers::eye_capture`. The colour swapchain is created able to be
-/// copied from only when it is set, so the shipped build never pays for it.
-/// Read once, when the renderer is created:
-///
-/// ```text
-/// adb -s <quest> shell setprop debug.spacesoup.eyecapture 1
-/// ```
 const EYE_CAPTURE_PROPERTY: &std::ffi::CStr = c"debug.spacesoup.eyecapture";
 
-/// Whether this run may copy its eye images out. See [`EYE_CAPTURE_PROPERTY`].
 pub(crate) fn eye_capture_enabled() -> bool {
     system_property(EYE_CAPTURE_PROPERTY).trim() == "1"
 }
 
-/// An Android system property's value; empty when unset.
 fn system_property(name: &std::ffi::CStr) -> String {
     extern "C" {
         fn __system_property_get(name: *const std::ffi::c_char, value: *mut std::ffi::c_char) -> std::ffi::c_int;
     }
-    // PROP_VALUE_MAX.
+
     let mut value = [0 as std::ffi::c_char; 92];
     let n = unsafe { __system_property_get(name.as_ptr(), value.as_mut_ptr()) };
     if n <= 0 {
@@ -165,12 +99,7 @@ impl VkContext {
             p_queue_priorities: queue_priorities.as_ptr(),
             ..Default::default()
         };
-        // MULTIVIEW: ask the physical device, then enable it if it says yes.
-        //
-        // Core in Vulkan 1.1, which the instance above requests, but a core
-        // FEATURE still has to be switched on explicitly at device creation --
-        // available and enabled are different things, and the failure mode for
-        // confusing them is a pipeline that builds and then renders one eye.
+
         let mut multiview_query = vk::PhysicalDeviceMultiviewFeatures::default();
         let mut f16_query = vk::PhysicalDeviceShaderFloat16Int8Features::default();
         let mut robustness2_query = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
@@ -202,12 +131,7 @@ impl VkContext {
             && robustness2_query.robust_image_access2 == vk::TRUE;
         let multiview_supported = multiview_query.multiview == vk::TRUE;
         info!("vulkan: dualSrcBlend {dual_src_blend}");
-        // ROBUST ACCESS, recorded: wgpu-hal decides from what the PHYSICAL
-        // device supports whether naga's shaders clamp their own buffer and
-        // image-load indices, on the assumption that it enabled the matching
-        // robustness features itself -- which it does for a device it creates,
-        // and which this device (built here, handed over by `device_from_raw`)
-        // does not. Logged so the headset says which of them it has.
+
         info!(
             "vulkan: robustBufferAccess {}, robustBufferAccess2 {}, robustImageAccess2 {}, robustImageAccess {} -- {}",
             robust_buffer_access_supported,
@@ -225,23 +149,6 @@ impl VkContext {
             if multiview_supported { "supported -- enabling" } else { "NOT supported" },
         );
 
-        // MESH SHADERS: asked once, answered permanently.
-        //
-        // Every plan that reaches for Nanite-style cluster rendering runs into
-        // the same unresolved question -- whether the Adreno 740 in this
-        // headset exposes `VK_EXT_mesh_shader` at all. The open-source Turnip
-        // driver described A7XX mesh shader support as a "distant future...
-        // maybe" item, Mesa's docs list no such extension, and no confirmation
-        // was found for Qualcomm's proprietary driver either. That is an
-        // absence of evidence, which is not the same as an answer.
-        //
-        // This makes it an answer. The device is right here and it knows; one
-        // enumeration at startup costs nothing and ends the speculation in the
-        // log rather than in another research round.
-        //
-        // NOTHING IS BUILT ON THE RESULT. The compute-culling + indirect-draw
-        // path works on any Vulkan 1.x hardware and is the plan either way, so
-        // this is a fact being recorded, not a branch being taken.
         let mesh_shader_supported = unsafe {
             vk_instance
                 .enumerate_device_extension_properties(physical_device)
@@ -260,10 +167,6 @@ impl VkContext {
             if mesh_shader_supported { "SUPPORTED" } else { "not supported" },
         );
 
-        // HALF-PRECISION ARITHMETIC: asked, then enabled, like multiview. The
-        // extension is core in Vulkan 1.2, but this device is created at 1.1,
-        // so it is named explicitly. The OpenXR runtime adds its own extensions
-        // to the list when it creates the device.
         let f16_extension_available = unsafe {
             vk_instance
                 .enumerate_device_extension_properties(physical_device)
@@ -277,11 +180,9 @@ impl VkContext {
         };
         let f16_supported = f16_extension_available
             && f16_query.shader_float16 == vk::TRUE
-            // MEASUREMENT: every shader at f32, from the next launch -- the
-            // half-precision maths' control in one build (`shader_precision`).
-            // `adb shell setprop debug.spacesoup.nof16 1`.
+
             && system_property(c"debug.spacesoup.nof16") != "1";
-        // PIPELINE STATISTICS, when asked for. See `PIPELINE_STATISTICS_PROPERTY`.
+
         let statistics_extension_available = unsafe {
             vk_instance
                 .enumerate_device_extension_properties(physical_device)
@@ -295,10 +196,7 @@ impl VkContext {
         };
         let capture_statistics =
             statistics_extension_available && system_property(PIPELINE_STATISTICS_PROPERTY) == "1";
-        // FIXED FOVEATED RENDERING: the density map extension and the two
-        // features it needs here, asked for only where the extension exists
-        // (a feature struct of an extension the device lacks is not valid to
-        // query). See `VkContext::fragment_density_map`.
+
         let fdm_extension_available = unsafe {
             vk_instance
                 .enumerate_device_extension_properties(physical_device)
@@ -323,8 +221,7 @@ impl VkContext {
         let fdm_supported = fdm_extension_available
             && fdm_query.fragment_density_map == vk::TRUE
             && fdm_query.fragment_density_map_non_subsampled_images == vk::TRUE
-            // DIAGNOSIS: no density map on any pass, from the next launch --
-            // `adb shell setprop debug.spacesoup.nofdm 1`.
+
             && system_property(c"debug.spacesoup.nofdm") != "1";
         info!(
             "vulkan: fragment density map: extension {}, map {}, dynamic {}, non-subsampled images {}, texel {}x{}..{}x{} -- {}",
@@ -361,9 +258,6 @@ impl VkContext {
         }
         let extensions: Vec<*const std::ffi::c_char> = enabled_extensions.iter().map(|e| e.as_ptr()).collect();
 
-        // The feature chain: multiview, then f16, then robustness2, each
-        // enabled only where supported. (A multiview struct with multiview
-        // off is harmless.)
         let mut robustness2_enable = vk::PhysicalDeviceRobustness2FeaturesEXT::default()
             .robust_buffer_access2(true)
             .robust_image_access2(true);
@@ -377,11 +271,11 @@ impl VkContext {
         if f16_supported || robust_access {
             multiview_enable.p_next = &mut f16_enable as *mut _ as *mut std::ffi::c_void;
             if !f16_supported {
-                // f16 off: skip its struct, keep robustness2 in the chain.
+
                 multiview_enable.p_next = &mut robustness2_enable as *mut _ as *mut std::ffi::c_void;
             }
         }
-        // Pipeline statistics, when asked for, at the head of the chain.
+
         let mut statistics_enable = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
             .pipeline_executable_info(true);
         statistics_enable.p_next = &mut multiview_enable as *mut _ as *mut std::ffi::c_void;
@@ -390,7 +284,7 @@ impl VkContext {
         } else {
             &mut multiview_enable as *mut _ as *mut std::ffi::c_void
         };
-        // The density map, when there is one, at the head of the chain.
+
         let mut fdm_enable = vk::PhysicalDeviceFragmentDensityMapFeaturesEXT::default()
             .fragment_density_map(true)
             .fragment_density_map_non_subsampled_images(true);
@@ -400,7 +294,7 @@ impl VkContext {
         } else {
             chain
         };
-        // `robustBufferAccess2` requires the core `robustBufferAccess` too.
+
         let core_features = vk::PhysicalDeviceFeatures::default()
             .robust_buffer_access(robust_access)
             .dual_src_blend(dual_src_blend);
@@ -429,7 +323,6 @@ impl VkContext {
 
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
-        // TIMESTAMPS: ask the queue family, not the feature list.
         let timestamp_period_ns = unsafe {
             let families = vk_instance
                 .get_physical_device_queue_family_properties(physical_device);
@@ -472,4 +365,3 @@ impl VkContext {
         })
     }
 }
-

@@ -1,45 +1,3 @@
-//! A LITTLE BLUR ON EVERY REFLECTION.
-//!
-//! The probe pass shades each reflection once per half-resolution texel, from
-//! one ray. Where what the rays meet changes within a texel -- a lamp's rim, a
-//! bulb's highlight, the edge of a fixture's reflection in a polished floor --
-//! the texel shows all of one or all of the other, and which one changes as
-//! the head moves: the reflections crawl and sparkle at their edges while the
-//! surfaces holding them stand still. The user, 2026-09-30: "what if we apply a
-//! little blur to ALL reflections ... it will help hide some of the artifact
-//! details we're still struggling with, like some jitter of light reflections,
-//! jitter of the light fixture reflections especially at its edges".
-//!
-//! So after the pass and its fix-up, each texel's reflection is averaged with
-//! its eight neighbours', 1-2-1 each way: the reconstruction filter one ray a
-//! texel never had. Only neighbours on the SAME SURFACE -- a neighbour's depth
-//! must continue this texel's plane, within twice its slope -- so a reflection
-//! never bleeds across a silhouette, as the reader's own test keeps it from
-//! doing (`probe_pass::READER_WGSL`). And only the COLOUR: each texel keeps its
-//! own coverage, so a rough tile beside a polished one (coverage 0, see
-//! `probe_pass::PASS_LIGHTING`) neither lends the polished one its emptiness
-//! nor takes a reflection it would throw away.
-//!
-//! And only neighbours of the SAME FACE: depth alone cannot see a convex
-//! corner, where the two faces meet at one depth. There the side face, seen
-//! nearly edge-on, took the front face's reflection and multiplied it by its
-//! own grazing Fresnel -- a bright green line down the marble pillar's corner
-//! on the headset, 2026-10-01. Each texel carries its face's code
-//! (`probe_pass::FACE_CODE_WGSL`) and a neighbour must match it; the plane's
-//! slope is read from matching neighbours only, so a corner no longer widens
-//! the depth test either. The ground writes no code and is blurred as before.
-//!
-//! Averaged as stored -- compressed by `1 / (1 + luminance)` -- so a lone
-//! bright texel is one voice among nine rather than a smear: Karis's weight,
-//! as the upsample and the mips use.
-//!
-//! WHAT IS NOT BLURRED: the surfaces. A texture blurred is a texture out of
-//! focus, which in a headset reads as poor eyesight, not as realism. Real
-//! materials blur what they REFLECT, by their roughness, and the probe pass
-//! already does that; this is the half-texel more every reflection gets
-//! whatever its roughness -- the micro-roughness even polished stone has --
-//! and its job is the texel grid.
-
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, CommandEncoder, ComputePipeline, Device,
@@ -49,40 +7,26 @@ use wgpu::{
 
 use super::brush_pipeline::probe_pass;
 
-/// Threads a side of one workgroup.
 const GROUP: u32 = 8;
 
-/// The filter, a thread a texel.
 pub fn compute_wgsl() -> String {
     format!(
         r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var src_depth: texture_depth_2d;
 @group(0) @binding(2) var dst: texture_storage_2d<rgba16float, write>;
-// Clamped at the edges: a texel's neighbours past the image are the edge's.
+
 @group(0) @binding(3) var src_linear: sampler;
 @group(0) @binding(4) var src_point: sampler;
-// The reach target: the faces' codes in G (see `probe_face_code`).
+
 @group(0) @binding(5) var src_code: texture_2d<f32>;
 
-// How far a depth may stray from the plane and still be the same surface, at
-// its steepest: a few steps of a 32-bit float just under 1, where the depths
-// of anything near are.
 const SAME_SURFACE_SLACK: f32 = 4e-7;
 
-// THE CHEAP READS, measured on the headset at GPU level 5 (2026-09-30): a
-// texel's nine colours and nine depths read one by one cost 0.26-0.39 ms an
-// eye, a pass bound by its fetches; staged in workgroup memory, 0.81 -- on
-// this GPU the texture cache beats it. So the nine depths come in four
-// gathers, and where all nine are one surface -- everywhere but along an
-// outline -- four bilinear reads at the texel's corners ARE the 1-2-1 kernel:
-// each averages the four texels round its corner, and the four together
-// weigh the centre four times, the sides twice and the corners once.
 fn same_surface(d: f32, d0: f32, off: vec2<f32>, slope: vec2<f32>) -> bool {{
     return abs(d - d0) <= 2.0 * dot(off, slope) + SAME_SURFACE_SLACK;
 }}
 
-// Neighbour `o` of `p`, weighed by `w`, if it is on `p`'s surface.
 fn neighbour(p: vec2<i32>, o: vec2<i32>, top: vec2<i32>, ok: bool, w: f32) -> vec4<f32> {{
     if (!ok) {{
         return vec4<f32>(0.0);
@@ -98,17 +42,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
         return;
     }}
     let c0 = textureLoad(src, p, 0);
-    // Nothing reflected here: as it is (an empty texel is clear too).
+
     if (c0.a <= 0.0) {{
         textureStore(dst, p, c0);
         return;
     }}
     let texel = 1.0 / vec2<f32>(size);
     let centre = (vec2<f32>(p) + vec2<f32>(0.5)) * texel;
-    // A gather at a texel corner returns the four texels round it as
-    // (-x,+y) (+x,+y) (+x,-y) (-x,-y): `ul.y` is this texel, `ul.x` its left,
-    // `ul.z` the one above, `ul.w` above-left; `ur.y` its right, `ur.z`
-    // above-right; `dl.x` below-left, `dl.y` below; `dr.y` below-right.
+
     let lo = vec2<f32>(-0.5);
     let ul = textureGather(src_depth, src_point, centre + lo * texel);
     let ur = textureGather(src_depth, src_point, centre + vec2<f32>(0.5, -0.5) * texel);
@@ -119,7 +60,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
         textureStore(dst, p, c0);
         return;
     }}
-    // The faces' codes, gathered as the depths are.
+
     let kul = textureGather(1, src_code, src_point, centre + lo * texel);
     let kur = textureGather(1, src_code, src_point, centre + vec2<f32>(0.5, -0.5) * texel);
     let kdl = textureGather(1, src_code, src_point, centre + vec2<f32>(-0.5, 0.5) * texel);
@@ -129,9 +70,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
     let f_r = probe_face_same(kur.y, k0);
     let f_u = probe_face_same(kul.z, k0);
     let f_d = probe_face_same(kdl.y, k0);
-    // The plane's slope each way: the gentler step of the sides on this face,
-    // so neither a silhouette nor a corner on one side widens the test on the
-    // other; none on this face either way, none that way.
+
     let none = 3.4e38;
     let steps = select(
         vec4<f32>(none),
@@ -153,13 +92,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
     let ok_dr = probe_face_same(kdr.y, k0) && same_surface(dr.y, d0, corner, slope);
     var sum: vec4<f32>;
     if (ok_l && ok_r && ok_u && ok_d && ok_ul && ok_ur && ok_dl && ok_dr) {{
-        // Premultiplied, so the filter's alpha is the coverage it weighed by.
+
         sum = textureSampleLevel(src, src_linear, centre + lo * texel, 0.0)
             + textureSampleLevel(src, src_linear, centre + vec2<f32>(0.5, -0.5) * texel, 0.0)
             + textureSampleLevel(src, src_linear, centre + vec2<f32>(-0.5, 0.5) * texel, 0.0)
             + textureSampleLevel(src, src_linear, centre + vec2<f32>(0.5) * texel, 0.0);
     }} else {{
-        // Along an outline: each neighbour on this surface, one by one.
+
         let top = size - vec2<i32>(1);
         sum = c0 * 4.0
             + neighbour(p, vec2<i32>(-1, 0), top, ok_l, 2.0)
@@ -171,7 +110,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
             + neighbour(p, vec2<i32>(-1, 1), top, ok_dl, 1.0)
             + neighbour(p, vec2<i32>(1, 1), top, ok_dr, 1.0);
     }}
-    // The coverage-weighted mean colour, at this texel's own coverage.
+
     textureStore(dst, p, vec4<f32>(sum.rgb / max(sum.a, 1e-6) * c0.a, c0.a));
 }}
 {}"#,
@@ -179,11 +118,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
     )
 }
 
-/// The blur's pipeline, and the layout of what one dispatch reads and writes.
 pub struct ProbeBlur {
     layout: BindGroupLayout,
     pipeline: ComputePipeline,
-    /// Linear and point, clamped at the edges. See `compute_wgsl`.
+
     samplers: [wgpu::Sampler; 2],
 }
 
@@ -284,9 +222,6 @@ impl ProbeBlur {
         }
     }
 
-    /// What the blur reads and writes for one single-eye probe pass target:
-    /// its colour, depth and faces' codes, into its blurred colour. `None` for a target
-    /// without one (the two-eye target, which no fix-up or blur follows).
     pub fn bind_group(&self, device: &Device, target: &probe_pass::Target) -> Option<BindGroup> {
         let soft = target.soft.as_ref()?;
         Some(self.bind_views(
@@ -298,8 +233,6 @@ impl ProbeBlur {
         ))
     }
 
-    /// The blur's bindings from the four views: colour and depth read, the
-    /// blurred colour written, the faces' codes read.
     fn bind_views(
         &self,
         device: &Device,
@@ -340,9 +273,6 @@ impl ProbeBlur {
         })
     }
 
-    /// Blurs one eye's reflections, after its probe pass and fix-up, before
-    /// the scene pass reads them through `Target::soft`'s bind group.
-    /// `timestamp_writes`: the pass timer's `blur_l`/`blur_r` slot.
     pub fn dispatch(
         &self,
         encoder: &mut CommandEncoder,
@@ -364,7 +294,6 @@ impl ProbeBlur {
 mod tests {
     use super::*;
 
-    /// f16 bits for the few exact values the test writes.
     fn half(v: f32) -> u16 {
         match v {
             0.0 => 0x0000,
@@ -392,18 +321,6 @@ mod tests {
         }
     }
 
-    /// THE BLUR ON ITS OWN, on a 16x16 target -- four workgroups -- holding
-    /// two surfaces: the left half a slanted plane (its depth steps 0.025 a
-    /// texel), the right half a flat one far behind it. A dark texel on the
-    /// left, its neighbours across a workgroup's edge, is averaged with them
-    /// 1-2-1 each way to exactly 7/16; one at the far half's edge, in the
-    /// corner of its group, takes nothing from the far half (5/12); a texel
-    /// beside the far half takes nothing from it; an empty texel stays empty,
-    /// and its neighbour keeps both its colour and its coverage rather than
-    /// averaging the emptiness in. And at the bottom of the slanted half, a
-    /// convex corner: two faces on one continuous depth, told apart only by
-    /// their codes -- neither takes the other's reflection, while the rest,
-    /// writing no code, blur as they always have.
     #[test]
     fn reflections_blur_along_their_surface_and_keep_their_coverage() {
         use wgpu::util::DeviceExt;
@@ -428,8 +345,7 @@ mod tests {
                 view_formats: &[],
             })
         };
-        // The colour: 0.5 on the left, 1 on the right, premultiplied; one
-        // dark texel, one empty one.
+
         let colour_at = |x: u32, y: u32| -> [f32; 4] {
             match (x, y) {
                 (3, 8) | (7, 7) => [0.25, 0.25, 0.25, 1.0],
@@ -462,7 +378,7 @@ mod tests {
             wgpu::util::TextureDataOrder::LayerMajor,
             bytemuck::cast_slice(&texels),
         );
-        // The codes: the corner's two faces below row 12, none elsewhere.
+
         let code_at = |x: u32, y: u32| -> [f32; 2] {
             match (x, y) {
                 (0..4, 12..) => [0.0, 529.0],
@@ -503,8 +419,7 @@ mod tests {
             probe_pass::FORMAT,
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
         );
-        // The depths, drawn: the left half from 0.4 to 0.6 across it, the
-        // right half at 0.9.
+
         let module = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("blur_test_depth"),
             source: ShaderSource::Wgsl(

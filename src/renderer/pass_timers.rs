@@ -1,52 +1,17 @@
-//! Per-pass GPU timing, so "the GPU is busy" can become "busy doing what".
-//!
-//! # Why this exists
-//!
-//! The renderer already times a whole frame: `FrameStats` records how long the
-//! render thread blocks in `device.poll(Wait)`. That number says the app is
-//! GPU-bound and nothing else. Acting on it means guessing which pass is
-//! expensive, and on this project that guess has been wrong three times running
-//! -- the ray-march length, a `pow()` in the shading, and the lightmap atlas
-//! size were each predicted to matter and each measured at zero.
-//!
-//! A timestamp written at the start and end of every pass costs one query pair
-//! per pass and settles it.
-//!
-//! # What it will not tell you
-//!
-//! On a TILE GPU the render pass is the unit of work, and passes do not
-//! necessarily execute in submission order or in isolation -- the driver may
-//! overlap them. Treat a pass's figure as its share of the frame rather than as
-//! a wall-clock interval, and trust the TOTAL only when it lands near the frame
-//! time the existing `FrameStats` already measures. When those two disagree
-//! badly, believe `FrameStats`: it is measuring something simpler.
-
-/// GPU timestamps around a fixed set of passes.
-///
-/// `None` from [`PassTimers::new`] means the device cannot timestamp, which is
-/// the normal case on a development machine and must never be an error: the
-/// renderer runs unchanged and simply reports no breakdown.
 pub struct PassTimers {
     set: wgpu::QuerySet,
-    /// `resolve_query_set` writes here; it cannot write to a mappable buffer.
+
     resolve: wgpu::Buffer,
-    /// ...so the results are copied here, which can be mapped.
+
     readback: wgpu::Buffer,
     labels: Vec<String>,
     period_ns: f32,
-    /// Slots handed out by `writes` since the last `resolve`.
+
     written: std::sync::atomic::AtomicU64,
-    /// The slots that were written in the frame `resolve` last captured.
-    ///
-    /// THIS is what decides whether a pass ran. The query values cannot: a pass
-    /// skipped this frame leaves the pair from the last frame it DID run, and
-    /// that stale pair has end > start and reads as a perfectly plausible
-    /// duration. It shipped that way once and reported 33 ms for an eye pass
-    /// that the frame never executed.
+
     resolved: std::sync::atomic::AtomicU64,
 }
 
-/// One pass's measured share of the frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PassTiming {
     pub label: String,
@@ -54,13 +19,12 @@ pub struct PassTiming {
 }
 
 impl PassTimers {
-    /// Two queries per label. `period_ns` scales raw ticks to nanoseconds and
-    /// is NOT 1.0 on the hardware this renderer targets.
+
     pub fn new(device: &wgpu::Device, labels: &[&str], period_ns: f32) -> Option<Self> {
         if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             return None;
         }
-        // 64, because which slots ran is a bitmask.
+
         if labels.is_empty() || labels.len() > 64 || period_ns <= 0.0 {
             return None;
         }
@@ -95,11 +59,6 @@ impl PassTimers {
         &self.labels
     }
 
-    /// Hand to a `RenderPassDescriptor`'s `timestamp_writes`.
-    ///
-    /// Returns `None` for an index this timer does not cover, so a caller that
-    /// adds a pass and forgets to widen `labels` gets an untimed pass rather
-    /// than a panic mid-frame or, worse, another pass's slot.
     #[must_use = "the timestamp writes must be ATTACHED to the render pass \
                   descriptor; calling this as a statement marks the slot live \
                   and records nothing, so it reports a confident 0.00 ms"]
@@ -115,8 +74,6 @@ impl PassTimers {
         })
     }
 
-    /// `writes` for a COMPUTE pass: the same slot bookkeeping, the compute
-    /// descriptor's type.
     #[must_use = "the timestamp writes must be ATTACHED to the compute pass \
                   descriptor; calling this as a statement marks the slot live \
                   and records nothing, so it reports a confident 0.00 ms"]
@@ -132,16 +89,6 @@ impl PassTimers {
         })
     }
 
-    /// The BEGINNING of a slot that spans SEVERAL passes, and the end of one.
-    ///
-    /// `writes` puts both timestamps on one pass, which cannot measure a block
-    /// of passes -- and the depth copy plus its pyramid is nine of them. Use
-    /// `span_start` on the first and `span_end` on the last; the slot then
-    /// covers everything between, including the gaps, which on a tile GPU is
-    /// exactly the cost worth knowing.
-    ///
-    /// Both halves must be recorded, or the slot reads a stale end against a
-    /// fresh beginning.
     #[must_use = "the timestamp writes must be ATTACHED to the render pass \
                   descriptor; calling this as a statement marks the slot live \
                   and records nothing, so it reports a confident 0.00 ms"]
@@ -171,7 +118,6 @@ impl PassTimers {
         })
     }
 
-    /// Record the resolve + copy. Call once per frame, after the last pass.
     pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
         use std::sync::atomic::Ordering::Relaxed;
         self.resolved.store(self.written.swap(0, Relaxed), Relaxed);
@@ -180,14 +126,6 @@ impl PassTimers {
         encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, (count as u64) * 8);
     }
 
-    /// Read the last resolved frame. Call AFTER the frame's work has completed
-    /// -- this renderer already blocks on `device.poll(Wait)`, so the natural
-    /// place is straight after that.
-    ///
-    /// A pass that never ran this frame reports zero rather than a wild number:
-    /// unwritten queries read back as whatever was there before, and a stale
-    /// pair can easily straddle a counter wrap and produce a plausible-looking
-    /// millisecond figure for a pass that was skipped entirely.
     pub fn read(&self, device: &wgpu::Device) -> Option<Vec<PassTiming>> {
         let slice = self.readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -220,15 +158,6 @@ impl PassTimers {
     }
 }
 
-/// One pass's duration from its query pair, or zero if it did not run.
-///
-/// `ran` is the bitmask of slots written in the resolved frame, and it is
-/// checked FIRST, before the ticks are even looked at. The ticks alone cannot
-/// tell a skipped pass from a real one: a pass skipped this frame keeps the pair
-/// from the last frame it ran, end > start and entirely plausible. That is the
-/// bug that reported 33 ms for an eye pass the direct-path frame never executed.
-/// An end at or before its start still reads as zero, for a slot that was never
-/// written at all.
 fn pass_ms(ran: u64, slot: usize, start: Option<u64>, end: Option<u64>, period_ns: f32) -> f32 {
     if slot >= 64 || ran & (1 << slot) == 0 {
         return 0.0;
@@ -239,11 +168,6 @@ fn pass_ms(ran: u64, slot: usize, start: Option<u64>, end: Option<u64>, period_n
     }
 }
 
-/// One line, ordered as submitted, with the total spelled out.
-///
-/// The total is printed because it is the check on the whole measurement: it
-/// should land near the `gpu_avg` that `FrameStats` reports independently, and
-/// when it does not, the breakdown is not to be trusted.
 pub fn format_breakdown(timings: &[PassTiming]) -> String {
     let total: f32 = timings.iter().map(|t| t.ms).sum();
     let parts: Vec<String> = timings
@@ -259,9 +183,7 @@ mod tests {
 
     #[test]
     fn a_device_without_the_feature_reports_no_timers_rather_than_failing() {
-        // The development-machine path, and the one that must never be an
-        // error: a renderer that refuses to start without GPU timestamps is
-        // worse than one that simply cannot break a frame down.
+
         let Some((device, _queue)) = crate::renderer::pipeline::tests::headless_gpu() else {
             eprintln!("skipping: no GPU adapter available");
             return;
@@ -278,32 +200,27 @@ mod tests {
 
     #[test]
     fn a_pass_index_past_the_end_is_refused_rather_than_aliasing_another_slot() {
-        // `writes()` returning the WRONG pass's query pair would silently
-        // attribute one pass's cost to another, which is the exact failure this
-        // module exists to stop.
+
         let labels = ["shadow", "scene", "eye"];
         for (i, _) in labels.iter().enumerate() {
             let (a, b) = ((i * 2) as u32, (i * 2 + 1) as u32);
             assert_ne!(a, b, "a pass must not share one query for start and end");
         }
-        // The bound itself, expressed without a GPU: three labels own indices
-        // 0..6, so pass 3 must have nowhere to write.
+
         assert_eq!(labels.len() * 2, 6);
     }
 
     #[test]
     fn a_skipped_pass_reads_zero_even_though_its_stale_pair_looks_real() {
-        // THE on-device bug, deterministically. Slot 1 did not run this frame
-        // (bit 1 clear) but still holds a valid pair from an earlier frame:
-        // end > start, 33 ms at a 1 ns period. It must read zero.
+
         let stale = (Some(1_000_000u64), Some(34_000_000u64));
         assert_eq!(pass_ms(0b01, 1, stale.0, stale.1, 1.0), 0.0, "a skipped pass reported its stale duration");
-        // The same pair on a slot that DID run is a real 33 ms.
+
         assert!((pass_ms(0b11, 1, stale.0, stale.1, 1.0) - 33.0).abs() < 1e-3);
-        // A slot that ran but has an end at or before its start still reads zero.
+
         assert_eq!(pass_ms(0b11, 1, Some(500), Some(400), 1.0), 0.0);
         assert_eq!(pass_ms(0b11, 1, Some(7), Some(7), 1.0), 0.0);
-        // The period is applied, not assumed to be 1.
+
         assert!((pass_ms(0b1, 0, Some(0), Some(1_000_000), 2.5) - 2.5).abs() < 1e-3);
     }
 
@@ -317,14 +234,7 @@ mod tests {
         assert!(line.contains("scene=30.25ms"), "{line}");
         assert!(line.contains("total=31.75ms"), "{line}");
     }
-    /// END TO END, on a real GPU: the timers must actually MEASURE.
-    ///
-    /// Every other test here is arithmetic. None of them would notice a query
-    /// set that was never bound, a `writes()` whose indices land in the wrong
-    /// slot, or a resolve that copies nothing -- the module would report a
-    /// confident 0.00ms for every pass and read as "this frame is free".
-    /// That is the exact shape of the failures this project keeps hitting, so
-    /// it is checked against hardware rather than reasoned about.
+
     #[test]
     fn a_heavier_pass_measures_longer_than_a_lighter_one() {
         let instance = wgpu::Instance::default();
@@ -346,9 +256,6 @@ mod tests {
             return;
         };
 
-        // A deliberately expensive fragment shader, so the two passes differ by
-        // FILL and not by luck. The loop is data-dependent on the position so a
-        // compiler cannot fold it away.
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pass_timer_load"),
             source: wgpu::ShaderSource::Wgsl(
@@ -414,16 +321,6 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let timers = PassTimers::new(&device, &["small", "large"], 1.0)
             .expect("a timestamping device must produce timers");
 
-        // ONE ENCODER AND ONE SUBMIT PER PASS, as the renderer does it (the scene
-        // and eye passes each get their own). Both passes in one command buffer
-        // is not how the timers are used, and on Apple M-series GPUs the second
-        // timestamp pair in a buffer intermittently fails to record -- this
-        // test failed 2 runs in 6 that way before it matched production.
-        //
-        // And the BEST reading over a few frames, per pass. A driver may drop a
-        // sample now and then; a query set that is never written reads zero on
-        // EVERY frame, so taking the maximum cannot hide the failure this test
-        // exists to catch.
         let mut best = [0.0f32; 2];
         let mut labels = Vec::new();
         for _frame in 0..5 {
@@ -466,16 +363,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
         assert_eq!(timings.len(), 2, "one timing per label");
         eprintln!("{}", format_breakdown(&timings));
-        // WHAT THIS MUST CATCH: a query set that is never written reads zero for
-        // EVERY pass on every frame. That is asserted unconditionally.
-        //
-        // What it must NOT fail on: the M-series Metal driver intermittently
-        // records nothing for one pass for a whole run -- measured 1 run in 8
-        // even with one encoder per pass and the best of five frames. That is
-        // the driver, not the timers (the Quest's Vulkan numbers are consistent:
-        // skipped passes read 0, running ones read real time, and the sum lands
-        // on `gpu_avg`). So the ordering check applies only when both passes
-        // actually produced a reading.
+
         assert!(
             timings.iter().any(|t| t.ms > 0.0),
             "no pass produced a reading -- the query set is not actually being written: {timings:?}",

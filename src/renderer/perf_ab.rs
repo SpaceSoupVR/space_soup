@@ -1,146 +1,70 @@
-//! A timed A/B schedule for finding where a frame's GPU time goes.
-//!
-//! Its own module, off the android-only renderer, for the same reason as
-//! `scene_pass_plan`: a decision compiled only for the headset is one no test on
-//! a development machine ever runs.
-//!
-//! # Why a schedule rather than a build per experiment
-//!
-//! Every experiment used to cost a build, a deploy and a headset session, so
-//! each hypothesis got tested one at a time -- and three in a row were wrong.
-//! This cycles the configurations on the `PERF` window boundary instead, so one
-//! session produces every comparison, each line labelled with what was switched
-//! off, all under the same thermal state and the same view.
-//!
-//! # What a phase switches
-//!
-//! A phase is the running `levers::Levers` with exactly one more thing off --
-//! see `Levers::with_phase` -- so the schedule and a person flipping a lever
-//! measure the same thing. `Levers::ab_cycle` runs the schedule without a
-//! build; `ENABLED` is the compile-time way.
-//!
-//! # Every phase is DELIBERATELY WRONG to look at
-//!
-//! These switches break rendering to measure it: half the image goes black, or
-//! reflections vanish. That is the price of measuring in place. `ENABLED` must
-//! be false in anything that is meant to be looked at.
-
-/// Whether the renderer cycles through `Phase`s at all.
-///
-/// Off except in a measurement build. See the module note: every phase but
-/// `Baseline` renders the scene incorrectly on purpose. Guarded by
-/// `the_ab_schedule_is_off`, because a build with this on looks broken every
-/// few seconds on a headset and looks like nothing at all in a diff.
 pub const ENABLED: bool = false;
 
-/// One configuration held for a whole `PERF` window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
-    /// As shipped. The reference every other phase is read against.
+
     Baseline,
-    /// The scene pass shades a quarter of the pixels. If the scene cost drops
-    /// toward a quarter, the frame is fill-bound and resolution or per-pixel
-    /// shading is the lever; if it barely moves, the cost is elsewhere --
-    /// vertex work, pass setup, or bandwidth.
+
     HalfViewport,
-    /// Forces the straight-to-swapchain path: no offscreen copy, no eye pass,
-    /// no stored multisampled depth, no per-frame mip chain. Reflections break.
-    /// Separates what the REFLECTIVE path costs from what the scene itself costs.
+
     DirectPath,
-    /// No reflection probes: the per-pixel probe search and cube samples skip.
+
     NoProbes,
-    /// No shadows: neither the shadow-map passes nor the per-pixel shadow taps.
-    /// The lights still shine, unshadowed, so what drops is shadowing alone.
+
     NoShadows,
-    /// No moving-objects sun map: its per-frame shadow pass and its per-pixel
-    /// taps. The static sun map and the baked mask stay.
+
     NoSunDynamic,
-    /// Every resident probe treated as its own room, so no fragment blends two
-    /// photographs: the cost of the second cube sample and its parallax.
+
     NoProbeBlend,
-    /// No doorway portals: the per-fragment portal loop finds nothing.
+
     NoPortals,
-    /// No live lights at all, the sky's sun included: the per-pixel light loop,
-    /// its shadow taps and the shadow passes. Baked light and probes remain.
+
     NoDirectLights,
-    /// No reflection trace: smooth surfaces fall back to the box projection.
-    /// The cost of tracing reflections through the rooms and doorways.
+
     NoProbeTrace,
-    /// No proxies in the trace: reflections pass through the pillar and the
-    /// lamps. The cost of what stands inside rooms.
+
     NoProxies,
-    /// No stationary lamps: the cost of shading them live with their baked
-    /// shadow masks. Their light is in no lightmap, so the room goes dark.
+
     NoStationary,
-    /// No light culling: every lamp's maths on every pixel, reachable or not.
-    /// What skipping lamps that cannot reach a pixel saves; the picture is
-    /// identical.
+
     NoLightCulling,
-    /// Reflections traced per pixel in the scene pass again, instead of by the
-    /// half-resolution probe pass. What that pass saves.
+
     FullResReflections,
-    /// No brush depth prepass: hidden surfaces are shaded again. What the
-    /// prepass saves.
+
     NoDepthPrepass,
-    /// The terrain drawn in full from inside a closed room again. What
-    /// doorway culling (`portal_cull`) saves.
+
     NoPortalCulling,
-    /// The probe pass making its secondary lookups itself again, instead of
-    /// leaving them to `probe_fixup`. What deferring them saves; the picture
-    /// is identical.
+
     InlineReflectionLookups,
-    /// The ground tracing its probe reflection per pixel in the scene pass
-    /// again, instead of in the half-resolution probe pass. What moving it
-    /// there saves.
+
     TerrainPerPixelReflections,
-    /// Reflections leaving the building see only the sky: the cost of tracing
-    /// them over the ground (`ground_map::trace`).
+
     NoGroundTrace,
-    /// Every pixel of the eye images shaded: what fixed foveated rendering
-    /// saves.
+
     NoFoveation,
-    /// No glare: the lamps' veils (`glare`) left undrawn. What they cost.
+
     NoGlare,
-    /// Each lamp's terminator back to the hard clamp at the pixel's centre
-    /// (`lights::terminator_aa` off): what filtering it over the footprint
-    /// costs.
+
     NoTerminatorAa,
-    /// The floor mirror ON: the characters mirrored in the floor instead of
-    /// their capsules there. Off as shipped, so this phase measures what
-    /// turning it on would cost.
+
     FloorMirror,
-    /// The reflections unblurred (`probe_blur` off): what the blur costs.
+
     NoReflectionBlur,
-    /// The player off cards (`character_cards` off), their reflection their
-    /// capsules again: what drawing and reading the cards costs.
+
     NoCharacterCards,
-    /// No flashlight bounce (`flashlight_bounce` off): the lights at the
-    /// patches the beam lands on left out. What they cost. Read by the app,
-    /// which places them, through `XrRenderer::frame_levers`.
+
     NoFlashlightBounce,
-    /// No torch in reflections (`torch_reflection` off): its capsules left
-    /// out of the frame's. What tracing it costs. Read by the app, which hands
-    /// them over, through `XrRenderer::frame_levers`.
+
     NoTorchReflection,
-    /// No effects (`effects` off): no flames, coals, smoke, embers or dust,
-    /// and no fire's light. What the level's effects cost. Read by the app,
-    /// which places the fires' lights, through `XrRenderer::frame_levers`.
+
     NoEffects,
-    /// No water (`water` off): no surfaces, no waves computed, no motion for
-    /// SpaceWarp. What the level's water costs.
+
     NoWater,
-    /// No weather (`weather` off): the dry ground's shaders over the weather
-    /// areas, and no rain, snow or splashes. What the level's weather costs.
+
     NoWeather,
-    /// No doors' lamp shadows (`door_shadows` off): the lamps near a door
-    /// keep no tile for it. What the doors' tiles cost.
+
     NoDoorShadows,
-    /// The time of day's clock stopped (`time_of_day_minutes` 0): no sky
-    /// refreshes, no static sun map redraws, no atlas, probe or ground map
-    /// relights. Run with the clock going (`time_of_day_hour` and
-    /// `time_of_day_minutes` set), it is what a running day costs over a
-    /// frozen one; without, it starts a frozen time of day, and is what the
-    /// time of day's sky costs over the photograph.
+
     TimeFrozen,
 }
 
@@ -180,12 +104,6 @@ impl Phase {
         Phase::TimeFrozen,
     ];
 
-    /// The phase for the frames of the `window`-th `PERF` window.
-    ///
-    /// Keyed on the window index rather than a frame count or a clock, so that
-    /// a phase covers EXACTLY the frames one `PERF` line averages. A phase that
-    /// changed mid-window would average two configurations into one number and
-    /// label it as one of them.
     pub fn for_window(window: u64) -> Phase {
         if !ENABLED {
             return Phase::Baseline;
@@ -193,8 +111,6 @@ impl Phase {
         Self::cycle_phase(window)
     }
 
-    /// The cycle, independent of `ENABLED`, so it stays tested while the
-    /// schedule is switched off.
     pub fn cycle_phase(window: u64) -> Phase {
         Self::ALL[(window % Self::ALL.len() as u64) as usize]
     }
@@ -254,8 +170,7 @@ mod tests {
     #[test]
     fn every_phase_is_visited_and_the_cycle_repeats() {
         if !ENABLED {
-            // Off: every window is the baseline. The cycle itself is checked
-            // through `cycle_phase`, which does not depend on the switch.
+
             assert!((0..8).all(|w| Phase::for_window(w) == Phase::Baseline));
         }
         let n = Phase::ALL.len() as u64;
@@ -264,9 +179,6 @@ mod tests {
         assert_eq!(first, Phase::ALL.to_vec(), "a phase was skipped or repeated within one cycle");
         assert_eq!(first, second, "the cycle did not repeat, so later lines cannot be matched to earlier ones");
     }
-
-    // That each phase switches exactly one thing is checked where the switches
-    // are: `levers::tests::each_phase_is_one_lever`.
 
     #[test]
     fn labels_are_distinct_so_log_lines_cannot_be_confused() {

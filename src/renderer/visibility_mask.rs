@@ -1,41 +1,17 @@
-//! THE LENSES' HIDDEN AREA (`XR_KHR_visibility_mask`): the part of each eye's
-//! image the headset never shows. The runtime gives it as triangles in the
-//! view's tangent plane -- x right, y up, on the plane z = -1 -- and drawn into
-//! depth before a pass it would let the GPU skip those pixels (plan A2,
-//! `docs/frame-budget-plan-2026-10-06.md`). This module measures what that is
-//! worth: the share of an eye's pixels the mask covers, and the share of the
-//! fragments the scene pass actually shades there, since foveation already
-//! shades the edges coarsely.
-//!
-//! Quest 3's runtime v209.91 lists the extension and gives no mask -- zero
-//! triangles hidden and visible, both eyes (deploy101-102, 2026-10-06);
-//! presumably its per-eye field of view is fitted to what the lenses show.
-//! quest_app logs the measurement at startup (`VISMASK`), so a runtime that
-//! starts giving one is seen.
-
 use crate::renderer::foveation::{centre_of_view, density_pattern, FoveationLevel, DENSITY_TEXEL};
 
-/// What a mask covers of one eye's image, 0..1.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaskShare {
-    /// Of the image's pixels.
+
     pub pixels: f32,
-    /// Of the fragments a pass shades at the foveation level: below `pixels`
-    /// wherever the mask lies in a coarsely shaded ring.
+
     pub fragments: f32,
 }
 
-/// The share of a `width` x `height` eye image, drawn through `fov`
-/// (OpenXR's angles in radians, left, right, up, down; left and down
-/// negative), that the triangles `indices` make of `vertices` cover -- the
-/// runtime's mask, `[x, y]` on the z = -1 plane. Pixels are counted at their
-/// centres, each once however many triangles reach it; fragments weigh each
-/// pixel by `level`'s density map, centred where the eye looks straight
-/// ahead, as `XrRenderer::apply_foveation` centres it.
 pub fn share(vertices: &[[f32; 2]], indices: &[u32], fov: [f32; 4], width: u32, height: u32, level: FoveationLevel) -> MaskShare {
     let (w, h) = (width.max(1), height.max(1));
     let [left, right, up, down] = fov.map(f32::tan);
-    // A vertex in pixels, x from the left edge, y down from the top.
+
     let to_pixel = |[x, y]: [f32; 2]| [(x - left) / (right - left) * w as f32, (up - y) / (up - down) * h as f32];
     let mut covered = vec![false; (w * h) as usize];
     for triangle in indices.chunks_exact(3) {
@@ -77,7 +53,6 @@ pub fn share(vertices: &[[f32; 2]], indices: &[u32], fov: [f32; 4], width: u32, 
     MaskShare { pixels: pixels as f32 / (w * h) as f32, fragments: (fragments / every_fragment.max(f64::MIN_POSITIVE)) as f32 }
 }
 
-/// Twice the signed area of `a`, `b`, `p`: which side of `a`-`b` `p` is on.
 fn edge(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
     (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
 }
@@ -86,11 +61,8 @@ fn edge(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
 mod tests {
     use super::*;
 
-    /// A symmetric 90-degree view: tangents -1..1 both ways.
     const FOV: [f32; 4] = [-std::f32::consts::FRAC_PI_4, std::f32::consts::FRAC_PI_4, std::f32::consts::FRAC_PI_4, -std::f32::consts::FRAC_PI_4];
 
-    /// Two triangles over the tangent rectangle from `x0` to `x1` across and
-    /// `y0` to `y1` up, in either winding.
     fn rect(x0: f32, x1: f32, y0: f32, y1: f32, flip: bool) -> (Vec<[f32; 2]>, Vec<u32>) {
         let vertices = vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
         let indices = if flip { vec![0, 2, 1, 0, 3, 2] } else { vec![0, 1, 2, 0, 2, 3] };
@@ -121,8 +93,7 @@ mod tests {
 
     #[test]
     fn a_mask_in_the_coarse_corners_saves_fewer_fragments_than_pixels() {
-        // The four corners, a density texel (32 pixels) each, past the Low
-        // level's full-density disc and its half-density ring.
+
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for (x0, x1, y0, y1) in [(-1.0, -0.75, -1.0, -0.75), (0.75, 1.0, -1.0, -0.75), (-1.0, -0.75, 0.75, 1.0), (0.75, 1.0, 0.75, 1.0)] {

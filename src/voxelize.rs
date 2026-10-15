@@ -392,4 +392,3 @@ fn box_corners(center: Vec3, half: Vec3) -> [Vec3; 8] {
         Vec3::new(p.x - h.x, p.y + h.y, p.z + h.z),
     ]
 }
-

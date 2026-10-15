@@ -30,32 +30,22 @@ pub struct Renderer {
     pub queue: Queue,
     solid_pipeline: pipeline::SolidPipeline,
     wire_pipeline: pipeline::WirePipeline,
-    /// Depth-ignoring highlight variant: see `render_with_overlay`.
+
     overlay_pipeline: pipeline::SolidPipeline,
-    /// The surface format, kept so pipelines can be rebuilt
-    /// (`set_cuboids_double_sided`) and off-screen thumbnail targets can
-    /// match the format the pipelines were built for.
+
     pub format: TextureFormat,
-    /// What the 3D pass clears to each frame.
+
     pub clear_color: wgpu::Color,
-    /// The scene's ground, when one is set: its splat-material pipeline,
-    /// material and geometry. See [`Renderer::set_terrain`].
+
     terrain: Option<DesktopTerrain>,
-    /// Whether the terrain draws this frame -- the editor hides the scene's
-    /// ground on its isolated stages (Prop Studio, Hands, Walk).
+
     pub terrain_visible: bool,
     mesh_pipeline: mesh_pipeline::MeshPipeline,
     skinned_mesh_pipeline: mesh_pipeline::SkinnedMeshPipeline,
     uniform_buf: uniforms::UniformBuffer,
     lights_uniform: LightsUniform,
     shadow_map: ShadowMap,
-    /// How wide a slice of the world the sun's shadow covers, in metres.
-    ///
-    /// One orthographic box rather than cascades: a single map stretched over a
-    /// whole level gives shadows too coarse to read, so this is deliberately a
-    /// box that FOLLOWS THE CAMERA and covers the near field well. Distant
-    /// geometry falls outside it and is treated as lit, which is a far better
-    /// failure than a hard line across the ground where the map ran out.
+
     sun_shadow_radius: f32,
     depth_texture: Texture,
     depth_view: TextureView,
@@ -66,21 +56,16 @@ pub struct Renderer {
     default_cuboid_lightmap: LoadedTexture,
     mesh_lightmaps: HashMap<String, LoadedTexture>,
     default_mesh_lightmap: LoadedTexture,
-    /// Caller-built line geometry drawn with the wire pipeline every frame
-    /// (an editor's grids and guides), on top of the cuboids' own edges.
+
     raw_wire: (Vec<WireVertex>, Vec<u32>),
-    /// The sky's light by facing, when the caller has one (a graphics
-    /// profile's daylight); `None` is the flat ambient every scene always had.
+
     pub sky: Option<uniforms::SkyUpload>,
-    /// How radiance becomes pixels: exposure and tone curve.
+
     pub post: uniforms::PostUpload,
-    /// The photographed sky behind the level, when the caller set one
-    /// (`set_sky_panorama`): drawn where nothing nearer was, after every
-    /// opaque draw, through the same tone curve as the geometry.
+
     sky_pipeline: super::sky::SkyPipeline,
     sky_dome: Option<super::sky::Sky>,
-    /// Whether the panorama draws this frame -- hidden on the editor's
-    /// isolated stages, like the terrain.
+
     pub sky_visible: bool,
 }
 
@@ -93,7 +78,7 @@ impl Renderer {
         height: u32,
     ) -> Self {
         let lights_uniform = LightsUniform::new(&device);
-        // Before the uniform buffer, which binds this one's depth textures.
+
         let shadow_map = ShadowMap::new(&device);
         let uniform_buf = uniforms::UniformBuffer::new(
             &device,
@@ -114,10 +99,7 @@ impl Renderer {
         let white_pixel = [255u8, 255, 255, 255];
         let default_cuboid_lightmap =
             create_lightmap_texture(&device, &queue, &solid_pipeline.lightmap_layout, &white_pixel, 1, 1, None);
-        // BLACK, not white: a mesh ADDS its lightmap now, like a brush, so its
-        // neutral is zero. The alpha stays opaque because that channel carries
-        // sky visibility and is multiplied -- the two neutrals sit at opposite
-        // ends of the range in the same texel.
+
         let default_mesh_lightmap = crate::renderer::brush_pipeline::default_brush_lightmap(
             &device,
             &queue,
@@ -158,13 +140,6 @@ impl Renderer {
         }
     }
 
-    /// Show a photographed sky behind the level, turned by `rotation_deg`
-    /// and scaled by `intensity`, and hand back the light it gives: the
-    /// ambient harmonics WITHOUT its sun, and the sun on its own as one
-    /// directional light (see `sky::Sky::sun`). The caller puts the ambient
-    /// in `self.sky` and the sun among the frame's lights, so the shadows
-    /// fall away from the sun that is visible in the picture. `None` takes
-    /// the sky down.
     pub fn set_sky_panorama(
         &mut self,
         pano: Option<&super::sky::Panorama>,
@@ -181,22 +156,15 @@ impl Renderer {
         self.sky_dome.is_some()
     }
 
-    /// Replace the line geometry drawn each frame (`indices` pair up into
-    /// line segments). Pass empty vectors to clear it.
     pub fn set_raw_wire(&mut self, vertices: Vec<WireVertex>, indices: Vec<u32>) {
         self.raw_wire = (vertices, indices);
     }
 
-    /// Editor nicety: render solid cuboids double-sided so a camera flown
-    /// inside one sees its interior instead of an x-ray hole.
     pub fn set_cuboids_double_sided(&mut self) {
         self.solid_pipeline =
             pipeline::SolidPipeline::new_double_sided(&self.device, self.format, &self.uniform_buf.layout);
     }
 
-    /// The scene's ground: world-space terrain geometry (splat UVs in `uv2`,
-    /// see the engine's terrain loader) with its four-layer splat material.
-    /// Replaces whatever terrain was set before; `clear_terrain` removes it.
     #[allow(clippy::too_many_arguments)]
     pub fn set_terrain(
         &mut self,
@@ -253,9 +221,6 @@ impl Renderer {
         self.terrain = None;
     }
 
-    /// Stream painted splat weights into the terrain's material. `false`
-    /// when no terrain is set or the sizes mismatch (rebuild via
-    /// `set_terrain` then).
     pub fn update_terrain_splat(&mut self, image: &super::terrain_pipeline::TerrainImage) -> bool {
         match self.terrain.as_ref() {
             Some(t) => t.material.update_splat(&self.queue, image),
@@ -263,9 +228,6 @@ impl Renderer {
         }
     }
 
-    /// Replace just the terrain's geometry -- the editor sculpting path,
-    /// which changes heights every frame of a stroke and must not pay for a
-    /// pipeline and material rebuild each time. No-op when no terrain is set.
     pub fn update_terrain_geometry(&mut self, vertices: &[SolidVertex], indices: &[u32]) {
         let Some(t) = self.terrain.as_mut() else { return };
         t.vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
@@ -281,9 +243,6 @@ impl Renderer {
         t.index_count = indices.len() as u32;
     }
 
-    /// Replace just the terrain's index buffer: the editor's level of detail
-    /// draws the same vertex grid with fewer triangles far from the camera,
-    /// so only the indices change as the camera moves. No-op without terrain.
     pub fn update_terrain_indices(&mut self, indices: &[u32]) {
         let Some(t) = self.terrain.as_mut() else { return };
         if indices.is_empty() {
@@ -351,8 +310,6 @@ impl Renderer {
         )
     }
 
-    /// This frame's depth, as drawn: a post pass reads it for its contact
-    /// shadow. Remade on every `resize`, so take it after one, not before.
     pub fn depth_view(&self) -> &TextureView {
         &self.depth_view
     }
@@ -389,10 +346,6 @@ impl Renderer {
         self.render_internal(target_view, camera, cuboids, meshes, &[], lights, &[]);
     }
 
-    /// Like `render_with_lights`, but `overlay_cuboids` draw in an extra
-    /// pass that ignores depth (see `pipeline::SolidPipeline::new_overlay`)
-    /// -- so they read on top of everything. Meant for a highlight overlay
-    /// (e.g. a skeleton), not real geometry.
     pub fn render_with_overlay(
         &mut self,
         target_view: &TextureView,
@@ -491,15 +444,6 @@ impl Renderer {
     ) {
         let vp = camera.projection() * camera.view();
 
-        // Which light casts which map. The first directional light is the sun,
-        // because a scene with two suns is not a thing. Spots take shadow layers
-        // in scene order until the budget runs out -- it used to be just the
-        // first one, so a room with two matching lamps had one casting a shadow
-        // and one not, which reads as a broken light rather than a full budget.
-        //
-        // Trimmed to the budget by INFLUENCE first, and here rather than later:
-        // the spot indices below point INTO this list, so reordering after they
-        // are chosen would aim each spot at another light's shadow map.
         let ranked = lights::rank_for_budget(lights, lights::MAX_LIGHTS);
         let lights: &[lights::Light] = &ranked;
 
@@ -512,17 +456,11 @@ impl Renderer {
             .take(shadow::MAX_SPOT_SHADOWS)
             .collect();
 
-        // The box follows the camera so its resolution is spent where the
-        // viewer is, and is pushed forward a little rather than centred on the
-        // eye -- half of a camera-centred box is always behind you.
         let focus = camera.position + camera.forward() * (self.sun_shadow_radius * 0.5);
         let sun_view_proj = sun
             .map(|l| shadow::directional_light_matrix(l.direction, focus, self.sun_shadow_radius))
             .unwrap_or(glam::Mat4::IDENTITY);
-        // The characters' tiles are the headset's; the desktop leaves them
-        // empty. See `shadow::MAX_CHARACTER_SHADOWS`.
-        // Drawn with one matrix and read with another when a spot has its own
-        // near plane -- see `shadow::spot_shadow_matrices`.
+
         let spot_matrices: Vec<shadow::SpotShadowMatrices> = spot_indices
             .iter()
             .map(|&i| shadow::spot_shadow_matrices(&lights[i], self.shadow_map.spot_tile_dim()))
@@ -531,8 +469,7 @@ impl Renderer {
         for (layer, mats) in spot_matrices.iter().enumerate() {
             spot_view_proj[layer] = mats.lookup;
         }
-        // Each shadow-casting light is told ITS layer, so the shader does not
-        // have to guess which one a given light belongs to.
+
         self.lights_uniform
             .upload_with_shadow_layers(&self.queue, lights, &spot_indices);
 
@@ -593,15 +530,11 @@ impl Renderer {
         }
 
         let mut draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> = Vec::new();
-        // Casters, gathered from the meshes ONLY. Panels are appended to
-        // `draws` further down and must not be in here: a floating UI panel
-        // casting a shadow across the floor is not a thing anyone wants.
+
         let mut shadow_draws: Vec<shadow::ShadowMeshDraw> = Vec::new();
         let mut skinned_draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> =
             Vec::new();
-        // The same primitives as casters. A character is the one caster whose
-        // silhouette changes every frame, and the first missing shadow anyone
-        // notices -- you can hold your own hand up in front of a lamp.
+
         let mut skinned_shadow_draws: Vec<shadow::ShadowSkinnedDraw> = Vec::new();
 
         for instance in meshes {
@@ -635,11 +568,7 @@ impl Renderer {
                     .and_then(|k| self.mesh_lightmaps.get(k))
                     .map(|t| &t.bind_group)
                     .unwrap_or(&self.default_mesh_lightmap.bind_group);
-                // A caster outside the sun's box cannot land a shadow in
-                // it: a wood of a thousand trees put every one through the
-                // depth pass for the few dozen near the camera. The box is
-                // `sun_shadow_radius` about `focus`; the mesh's own bounding
-                // radius keeps a big crown at the edge in.
+
                 let model = instance.mesh.model_matrix();
                 let centre = model.transform_point3(glam::Vec3::ZERO);
                 let scale = model.x_axis.length().max(model.y_axis.length()).max(model.z_axis.length());
@@ -653,9 +582,7 @@ impl Renderer {
                         &prim.texture.bind_group,
                         lightmap_bg,
                     ));
-                    // The ordinary vertex buffer, even for a layered mesh: the
-                    // depth pass reads position and nothing else, so a baked
-                    // cave casts through this path with no pipeline of its own.
+
                     if casts {
                         shadow_draws.push((
                             &prim.vertex_buffer,
@@ -685,15 +612,9 @@ impl Renderer {
                 label: Some("frame"),
             });
 
-        // Depth-only passes first, so the colour pass below samples a map built
-        // from THIS frame. Recorded into the same encoder rather than submitted
-        // separately: within one encoder wgpu orders the passes for us, and a
-        // second submit would only add a synchronisation point.
         let solid_caster = (!solid_indices.is_empty())
             .then_some((&solid_vb, &solid_ib, solid_indices.len() as u32));
-        // THE GROUND CASTS TOO: a rise shadows the dip behind it, which is
-        // most of what makes rolling ground read as rolling. Whole, not
-        // chunked -- correct, just not culled.
+
         let ground_caster = self
             .terrain
             .as_ref()
@@ -713,10 +634,9 @@ impl Renderer {
                     shadow.sun_view_proj,
                 );
         }
-        // One depth pass per shadow-casting spot. This is where the cost lives,
-        // which is why MAX_SPOT_SHADOWS is a budget rather than "all of them".
+
         for layer in 0..shadow.spot_count as usize {
-            // Drawn with the PASS matrix; the lookups read with `lookup`.
+
             let pass = spot_matrices[layer].pass;
             self.shadow_map.upload_light(&self.queue, ShadowKind::Spot(layer), pass);
             self.shadow_map.record(
@@ -731,8 +651,6 @@ impl Renderer {
             );
         }
 
-        // Overlay cuboids aren't cached (there are only ever a handful --
-        // a skeleton's worth -- and they're rebuilt every frame anyway).
         let (overlay_verts, overlay_indices, _) = super::cuboid::build_solid_mesh_with_ranges(overlay_cuboids);
         let overlay_vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("overlay_vb"),
@@ -784,8 +702,6 @@ impl Renderer {
                 }
             }
 
-            // The ground under everything else: its own pipeline (splat
-            // materials), the same camera/lights bind group.
             if let Some(t) = self.terrain.as_ref().filter(|_| self.terrain_visible) {
                 pass.set_pipeline(&t.pipeline.pipeline);
                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
@@ -829,10 +745,6 @@ impl Renderer {
                 }
             }
 
-            // THE SKY, after every opaque draw: at the far plane with a
-            // less-or-equal depth test, so it fills only where nothing was
-            // drawn. The panorama is scaled by `sky_params.x`, the
-            // intensity the caller put in `self.sky`.
             if let Some(sky) = self.sky_dome.as_ref().filter(|_| self.sky_visible) {
                 pass.set_pipeline(&self.sky_pipeline.pipeline);
                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
@@ -840,8 +752,6 @@ impl Renderer {
                 pass.draw(0..3, 0..1);
             }
 
-            // Last, so it reads on top of everything above (see
-            // `SolidPipeline::new_overlay`'s own doc comment).
             if !overlay_verts.is_empty() {
                 pass.set_pipeline(&self.overlay_pipeline.pipeline);
                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);

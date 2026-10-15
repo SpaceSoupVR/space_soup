@@ -92,4 +92,3 @@ impl Renderer {
         self.image_renderer.render(render_pass);
     }
 }
-

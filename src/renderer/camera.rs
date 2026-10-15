@@ -25,12 +25,6 @@ impl Camera {
         Mat4::from_rotation_translation(self.rotation, self.position).inverse()
     }
 
-    /// Where the camera is looking, in world space.
-    ///
-    /// -Z is forward, matching the right-handed convention `view` and
-    /// `perspective_rh` already use. Taking +Z here would aim the sun's shadow
-    /// box behind the viewer, which shows up as shadows that only appear when
-    /// you turn around.
     pub fn forward(&self) -> Vec3 {
         self.rotation * Vec3::NEG_Z
     }
@@ -122,4 +116,3 @@ mod tests {
         );
     }
 }
-

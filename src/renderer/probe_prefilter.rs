@@ -1,49 +1,9 @@
-//! The mip chain of a reflection-probe cube, prefiltered with the GGX lobe.
-//!
-//! WHY NOT A BOX FILTER. The chain used to be built by averaging 2x2 texels,
-//! face by face. That makes level N a picture of the room at 1/2^N resolution
-//! -- which is not what a surface of the roughness that picks level N reflects.
-//! A bright feature in the photograph (a spot-lit pillar, a lamp's floor pool)
-//! stays a small bright SQUARE at every level instead of spreading into the
-//! broad round lobe a rough wall actually shows, and each face is filtered
-//! alone so the blur stops dead at the cube seams. On the headset that was the
-//! soft light rectangles on the hall walls and ceiling that come and go with
-//! position: the lighting-sources view traced them to the probe, and they
-//! survived both the one-probe-per-room fix and the 128 px faces (2026-09-11).
-//!
-//! WHAT THIS DOES INSTEAD is the prefiltered environment map of Karis, "Real
-//! Shading in Unreal Engine 4" (2013) and Lagarde & de Rousiers, "Moving
-//! Frostbite to PBR" (2014): every texel of level N is the GGX-weighted
-//! integral of the environment around its direction, for the roughness the
-//! shader maps onto level N, under the usual N = V = R assumption. Samples are
-//! importance-sampled from the lobe and read from a box pyramid at a level
-//! matched to each sample's solid angle -- filtered importance sampling,
-//! Krivanek & Colbert, GPU Gems 3 ch. 20 -- so a few dozen samples give a
-//! smooth lobe with no sparkle. Directions are resolved on the whole sphere,
-//! so the lobe crosses a cube seam as if it were not there.
-//!
-//! It runs ONCE, when a level's probes load, on the CPU. It costs nothing per
-//! frame: the shader reads exactly the same texture it did before.
-
 use glam::Vec3;
 
-/// Roughness spread over the chain: level `n` is prefiltered for roughness
-/// `n / PROBE_ROUGHNESS_MIPS`.
-///
-/// MUST MATCH the WGSL constant of the same name in `lights.rs`, which picks
-/// the level as `roughness * PROBE_ROUGHNESS_MIPS`. If the two disagree, every
-/// surface reflects a lobe for a different roughness than its own.
-/// `the_chain_is_filtered_for_the_ramp_the_shader_reads` pins them together.
 pub const PROBE_ROUGHNESS_MIPS: f32 = 7.0;
 
-/// GGX samples per output texel.
-///
-/// Filtered importance sampling is what makes this few enough: each sample
-/// reads an area of the source the size of its own share of the lobe, so the
-/// samples overlap rather than point-sampling bright texels between them.
 const SAMPLES: u32 = 64;
 
-/// One cube level: six `res`x`res` faces of linear RGBA, in cube order.
 pub struct CubeLevel {
     pub res: u32,
     pub texels: Vec<[f32; 4]>,
@@ -55,15 +15,6 @@ impl CubeLevel {
     }
 }
 
-/// The direction a cube texel looks along.
-///
-/// A COPY of `space_soup_engine::reflection_probe::face_direction`, which the
-/// baker photographs each face with. `space_soup` ships to crates.io and cannot
-/// depend on the engine, so the bake crate's tests compare the two texel for
-/// texel (`the_renderer_reads_faces_the_way_the_baker_writes_them`).
-///
-/// Layer 0 is +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z; `u`, `v` run 0..1 across the
-/// face with image rows downward.
 pub fn texel_direction(face: usize, u: f32, v: f32) -> Vec3 {
     let a = 2.0 * u - 1.0;
     let b = 1.0 - 2.0 * v;
@@ -78,8 +29,6 @@ pub fn texel_direction(face: usize, u: f32, v: f32) -> Vec3 {
     d.normalize()
 }
 
-/// The face and 0..1 face coordinates a direction lands on. The inverse of
-/// [`texel_direction`].
 pub fn direction_to_face(d: Vec3) -> (usize, f32, f32) {
     let (ax, ay, az) = (d.x.abs(), d.y.abs(), d.z.abs());
     let (face, a, b) = if ax >= ay && ax >= az {
@@ -102,11 +51,6 @@ pub fn direction_to_face(d: Vec3) -> (usize, f32, f32) {
     (face, 0.5 * (a + 1.0), 0.5 * (1.0 - b))
 }
 
-/// Bilinear read of one level along a direction.
-///
-/// Clamped at the face edge rather than wrapped onto the neighbour face. The
-/// error is half a texel at a seam, and every read here is already one of
-/// dozens overlapping across it, so it does not survive into the result.
 fn sample_level(level: &CubeLevel, d: Vec3) -> [f32; 4] {
     let (face, u, v) = direction_to_face(d);
     let r = level.res;
@@ -126,7 +70,6 @@ fn sample_level(level: &CubeLevel, d: Vec3) -> [f32; 4] {
     out
 }
 
-/// Trilinear read of a box pyramid at a fractional level.
 fn sample_pyramid(pyramid: &[CubeLevel], d: Vec3, lod: f32) -> [f32; 4] {
     let top = (pyramid.len() - 1) as f32;
     let lod = lod.clamp(0.0, top);
@@ -145,12 +88,6 @@ fn sample_pyramid(pyramid: &[CubeLevel], d: Vec3, lod: f32) -> [f32; 4] {
     out
 }
 
-/// A plain 2x2 box pyramid, all the way to one texel a face.
-///
-/// Not what the shader samples -- the SOURCE the GGX samples read from, so a
-/// sample covering a wide solid angle reads an average over it instead of one
-/// texel. Averages in linear light, which is correct because probe texels are
-/// linear radiance.
 pub fn box_pyramid(base: CubeLevel) -> Vec<CubeLevel> {
     let mut levels = vec![base];
     while levels.last().unwrap().res > 1 {
@@ -178,25 +115,18 @@ pub fn box_pyramid(base: CubeLevel) -> Vec<CubeLevel> {
     levels
 }
 
-/// One precomputed GGX sample: its direction in the lobe's tangent space
-/// (normal along +Z), its cosine weight, and the pyramid level to read it at.
 struct LobeSample {
     dir: Vec3,
     weight: f32,
     lod: f32,
 }
 
-/// Van der Corput sequence: the second coordinate of a Hammersley point set.
 fn radical_inverse(bits: u32) -> f32 {
     bits.reverse_bits() as f32 * 2.328_306_4e-10
 }
 
-/// The GGX lobe for one roughness, as importance samples.
-///
-/// `base_res` is the resolution of pyramid level 0, which sets the solid angle
-/// one source texel covers.
 fn lobe_samples(roughness: f32, base_res: u32) -> Vec<LobeSample> {
-    // Perceptual roughness squared, the same alpha the direct-light BRDF uses.
+
     let alpha = (roughness * roughness).max(1e-4);
     let a2 = alpha * alpha;
     let texel_solid_angle = 4.0 * std::f32::consts::PI / (6.0 * (base_res * base_res) as f32);
@@ -208,13 +138,13 @@ fn lobe_samples(roughness: f32, base_res: u32) -> Vec<LobeSample> {
         let cos_h = ((1.0 - xi2) / (1.0 + (a2 - 1.0) * xi2)).sqrt();
         let sin_h = (1.0 - cos_h * cos_h).max(0.0).sqrt();
         let h = Vec3::new(sin_h * phi.cos(), sin_h * phi.sin(), cos_h);
-        // With N = V, the reflected direction is L = 2(N.H)H - N.
+
         let l = 2.0 * cos_h * h - Vec3::Z;
         let n_dot_l = l.z;
         if n_dot_l <= 0.0 {
             continue;
         }
-        // pdf(L) = D(H) (N.H) / (4 V.H), and N.H == V.H under N = V.
+
         let denom = cos_h * cos_h * (a2 - 1.0) + 1.0;
         let d = a2 / (std::f32::consts::PI * denom * denom);
         let pdf = d * 0.25;
@@ -225,7 +155,6 @@ fn lobe_samples(roughness: f32, base_res: u32) -> Vec<LobeSample> {
     out
 }
 
-/// The GGX-filtered radiance around `n`, for a precomputed lobe.
 fn filter_direction(pyramid: &[CubeLevel], lobe: &[LobeSample], n: Vec3) -> [f32; 4] {
     let up = if n.z.abs() < 0.999 { Vec3::Z } else { Vec3::X };
     let t = up.cross(n).normalize();
@@ -248,11 +177,6 @@ fn filter_direction(pyramid: &[CubeLevel], lobe: &[LobeSample], n: Vec3) -> [f32
     sum
 }
 
-/// The whole chain, largest first: level 0 is the photograph itself, every
-/// later level the GGX lobe for its roughness.
-///
-/// Faces are filtered on separate threads where the platform has them; the
-/// work is embarrassingly parallel and it happens while a level loads.
 pub fn prefiltered_chain(base: CubeLevel) -> Vec<CubeLevel> {
     let base_res = base.res;
     let pyramid = box_pyramid(base);
@@ -311,14 +235,12 @@ mod tests {
         CubeLevel { res, texels }
     }
 
-    /// A small bright disc around `centre`, `radius_deg` wide, on black.
     fn spot(res: u32, centre: Vec3, radius_deg: f32) -> CubeLevel {
         let c = centre.normalize();
         let cos_r = radius_deg.to_radians().cos();
         cube(res, move |d| if d.dot(c) >= cos_r { 50.0 } else { 0.0 })
     }
 
-    /// Rotate `v` by `deg` about `axis`.
     fn rotated(v: Vec3, axis: Vec3, deg: f32) -> Vec3 {
         glam::Quat::from_axis_angle(axis.normalize(), deg.to_radians()) * v
     }
@@ -341,8 +263,6 @@ mod tests {
         }
     }
 
-    /// Normalised weights: an evenly lit room reflects the same light at every
-    /// roughness. A level that came out darker would dim every rough surface.
     #[test]
     fn an_even_environment_stays_even_at_every_level() {
         let chain = prefiltered_chain(cube(16, |_| 2.0));
@@ -355,20 +275,12 @@ mod tests {
         }
     }
 
-    /// THE SQUARES. A bright spot must blur ROUND.
-    ///
-    /// Read the rough lobe at the same angle from the spot along a face axis
-    /// and along the face diagonal: a lobe is rotationally symmetric, so the
-    /// two must agree. The box chain it replaced does not -- which is asserted
-    /// too, so this test is known to tell the two apart.
     #[test]
     fn a_bright_spot_blurs_round_not_square() {
         let pyramid = box_pyramid(spot(64, Vec3::Z, 4.0));
         let lobe = lobe_samples(4.0 / PROBE_ROUGHNESS_MIPS, 64);
         let ggx = |d: Vec3| filter_direction(&pyramid, &lobe, d)[0];
-        // Level 3 at 20 degrees: the reads straddle a texel boundary, where a
-        // box level shows its squareness. (At level 4 and 14 degrees both land
-        // inside the same four texels and agree by construction.)
+
         let boxed = |d: Vec3| sample_pyramid(&pyramid, d, 3.0)[0];
         for deg in [8.0f32, 14.0] {
             let along_axis = rotated(Vec3::Z, Vec3::Y, deg);
@@ -391,7 +303,6 @@ mod tests {
         );
     }
 
-    /// A rougher level spreads the same light wider and dimmer.
     #[test]
     fn a_rougher_level_is_a_wider_lobe() {
         let pyramid = box_pyramid(spot(64, Vec3::Z, 4.0));
@@ -410,8 +321,6 @@ mod tests {
         }
     }
 
-    /// A spot ON a cube seam blurs onto both faces alike. Filtering each face
-    /// alone stopped the blur dead at the edge.
     #[test]
     fn a_spot_on_a_seam_blurs_evenly_onto_both_faces() {
         let seam = Vec3::new(1.0, 0.0, 1.0).normalize();
@@ -427,10 +336,6 @@ mod tests {
         }
     }
 
-    /// What one 128 px probe costs to prefilter, for judging load time.
-    ///
-    /// Ignored because a timing is not a pass/fail fact on a shared machine.
-    /// `cargo test --release --lib prefiltering_a_128px_probe -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn prefiltering_a_128px_probe() {
@@ -441,7 +346,6 @@ mod tests {
         assert_eq!(chain.len(), 8);
     }
 
-    /// The level the shader picks for a roughness is the level filtered for it.
     #[test]
     fn the_chain_is_filtered_for_the_ramp_the_shader_reads() {
         let code = super::super::lights::wgsl_lights_block(0, 1);

@@ -1,4 +1,3 @@
-
 use glam::{Quat, Vec3};
 use wgpu::*;
 
@@ -175,10 +174,7 @@ impl MirrorPipeline {
     pub fn create_model_uniform(&self, device: &Device) -> ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("mirror_model_uniform"),
-            // `MODEL_UNIFORM_SIZE`, not the 64 this shader reads: every
-            // buffer bound as a ModelUniform must be the same size, or an
-            // upload overruns whichever one was left behind -- which is a
-            // validation error at the first frame, not at build time.
+
             size: super::mesh_pipeline::MODEL_UNIFORM_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -197,10 +193,7 @@ impl MirrorPipeline {
     pub fn create_reflected_vp_uniform(&self, device: &Device) -> ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("mirror_reflected_vp_uniform"),
-            // `MODEL_UNIFORM_SIZE`, not the 64 this shader reads: every
-            // buffer bound as a ModelUniform must be the same size, or an
-            // upload overruns whichever one was left behind -- which is a
-            // validation error at the first frame, not at build time.
+
             size: super::mesh_pipeline::MODEL_UNIFORM_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -276,11 +269,6 @@ impl MirrorPipeline {
 
 fn mirror_shader() -> String {
     r#"
-// The FIRST 64 bytes of the shared scene uniform, which is an array of two
-// eye matrices. Declared as the array rather than as a lone mat4x4 so the slot
-// being read is written down: this pass is single-view and per-eye, and it
-// wants whichever eye is currently being drawn -- which the caller puts in
-// slot 0.
 struct CameraUniform { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 

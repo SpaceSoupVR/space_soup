@@ -36,7 +36,6 @@ fn vs_main(
     return out;
 }
 
-
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if in.vertex_position.x < in.bounds[0] || in.vertex_position.x > in.bounds[2] ||

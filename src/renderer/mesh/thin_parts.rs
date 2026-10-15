@@ -1,55 +1,14 @@
-//! THIN PARTS: the wires, chain links and rims of a model that can be finer
-//! than a pixel, kept from sparkling.
-//!
-//! A hanging lamp's cage is wire a few millimetres thick. From five metres it
-//! is a third of an eye pixel wide, and 4x MSAA catches a third of a pixel on
-//! zero, one or two of its four samples depending on exactly where the wire
-//! falls -- so a step of the head by a millimetre redraws it as dots, then
-//! dashes, then a line. Measured on the headset's own eye images (2026-10-01,
-//! `tools/reference/highlight_stability.py`, head moved 1 mm at a time): the
-//! reflections, floors and walls held still, and the bright cage wires of
-//! every lamp beyond a couple of metres were the shimmer that was left.
-//!
-//! The fix is the one Persson gave for phone wires ("Phone-wire AA", 2011):
-//! never draw a thin round part narrower than about two pixels, and fade it by
-//! the ratio of its true width to the width drawn. Its light per unit length
-//! is then exactly the true wire's, and two pixels of width meet the four
-//! samples steadily enough that a millimetre of head movement no longer
-//! decides whether the wire is there.
-//!
-//! What counts as thin is found from the mesh at load: the radius of
-//! curvature at each vertex (chord over the change of normal between welded
-//! neighbours -- exactly the radius on a circle), and a triangle is thin when
-//! all three corners are and the triangle itself is no wider than a few such
-//! radii. A tube, a chain link and the rolled rim of a shade pass; a flat
-//! plate whose corners sit on its thin rim does not, because the plate's own
-//! triangles are wide. The thin triangles are drawn separately (see
-//! `mesh_pipeline::MeshPipeline::thin_pipeline`) after everything opaque and
-//! the sky, so a faded wire blends over what is really behind it.
-
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 
 use super::vertex::MeshVertex;
 
-/// Thicker than this (a radius, metres) is never a thin part. At the far end
-/// of a 20 m room an eye pixel is about 4 cm, so a 2 cm-wide part is already
-/// half a pixel there; anything thicker has its samples to itself.
 pub const THIN_RADIUS_MAX: f32 = 0.01;
 
-/// A thin triangle is no wider (its least altitude) than this many radii of
-/// its corners. A tube's facets are about one radius wide; a plate's are as
-/// wide as the plate.
 pub const THIN_ALTITUDE_FACTOR: f32 = 4.0;
 
-/// Positions closer than this (metres) are one point of the surface: meshes
-/// are split at every UV seam and, with a lightmap, at every corner.
 const WELD: f32 = 1.0e-5;
 
-/// Per vertex, what the thin pass needs to widen it: the surface's normal
-/// there, averaged over every face that meets at the point (so the copies of a
-/// split vertex move together and the tube stays closed), and the part's
-/// radius there; 0 where the vertex is on no thin part.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct ThinVertex {
@@ -69,18 +28,16 @@ impl ThinVertex {
     }
 }
 
-/// A primitive's triangles, the thin ones apart.
 #[derive(Clone, Debug)]
 pub struct ThinSplit {
-    /// One per vertex of the primitive, in its order.
+
     pub vertices: Vec<ThinVertex>,
-    /// The triangles drawn as ever.
+
     pub solid: Vec<u32>,
-    /// The thin ones, drawn widened and faded.
+
     pub thin: Vec<u32>,
 }
 
-/// The split on the GPU.
 #[derive(Clone)]
 pub struct ThinParts {
     pub vertex_buffer: wgpu::Buffer,
@@ -100,8 +57,7 @@ impl ThinParts {
                 usage,
             })
         };
-        // An empty solid list still needs a buffer to bind: one dummy index,
-        // never drawn (count 0).
+
         let solid: &[u32] = if split.solid.is_empty() { &[0] } else { &split.solid };
         Self {
             vertex_buffer: buffer("thin_vb", bytemuck::cast_slice(&split.vertices), wgpu::BufferUsages::VERTEX),
@@ -113,7 +69,6 @@ impl ThinParts {
     }
 }
 
-/// The thin parts of one primitive, or `None` when it has none.
 pub fn split_thin_parts(vertices: &[MeshVertex], indices: &[u32]) -> Option<ThinSplit> {
     let tris: Vec<[usize; 3]> = indices
         .chunks_exact(3)
@@ -125,7 +80,6 @@ pub fn split_thin_parts(vertices: &[MeshVertex], indices: &[u32]) -> Option<Thin
     }
     let pos = |i: usize| glam::Vec3::from(vertices[i].position);
 
-    // Weld: one id per point of the surface.
     let mut ids: HashMap<[i64; 3], usize> = HashMap::new();
     let weld: Vec<usize> = (0..vertices.len())
         .map(|i| {
@@ -141,12 +95,6 @@ pub fn split_thin_parts(vertices: &[MeshVertex], indices: &[u32]) -> Option<Thin
         point[weld[i]] = pos(i);
     }
 
-    // The normal at each point: the faces round it, weighted by area -- the
-    // SHAPE's, not the shading's, since a smooth-shaded plate's corner normals
-    // lean out at 45 degrees and hide how thin its rim is. Turned to agree
-    // with the authored normals there: winding says which way a face points
-    // only in a right-handed frame, and a mirrored node (negative scale) or a
-    // left-handed one reverses it. Unturned, the widening pulled a wire IN.
     let mut normal = vec![glam::Vec3::ZERO; points];
     let mut authored = vec![glam::Vec3::ZERO; points];
     for t in &tris {
@@ -164,17 +112,12 @@ pub fn split_thin_parts(vertices: &[MeshVertex], indices: &[u32]) -> Option<Thin
             *n = -*n;
         }
     }
-    // A point where opposite faces meet (a double-sided sheet) has no
-    // direction to widen in: it is not round, whatever its curvature says.
+
     let flat: Vec<bool> = normal.iter().map(|n| n.length_squared() < 1e-24).collect();
     for n in normal.iter_mut() {
         *n = n.normalize_or_zero();
     }
 
-    // The radius of curvature at each point: chord over the change of normal,
-    // least over its edges. On a circle of radius R both are 2 sin(half the
-    // angle) times R and 1, so the ratio is R exactly, however coarse the
-    // facets. Along a straight tube the normal does not change: no bound.
     let mut radius = vec![f32::INFINITY; points];
     for t in &tris {
         for k in 0..3 {
@@ -200,7 +143,7 @@ pub fn split_thin_parts(vertices: &[MeshVertex], indices: &[u32]) -> Option<Thin
             let [a, b, c] = w.map(|i| point[i]);
             let twice_area = (b - a).cross(c - a).length();
             let longest = (b - a).length().max((c - b).length()).max((a - c).length());
-            // The least altitude is twice the area over the longest side.
+
             let least_altitude = twice_area / longest.max(1e-12);
             let widest = w.iter().map(|&i| radius[i]).fold(0.0f32, f32::max);
             least_altitude <= THIN_ALTITUDE_FACTOR * widest
@@ -232,9 +175,6 @@ mod tests {
         MeshVertex { position: p.into(), normal: n.into(), uv: [0.0; 2], uv2: [0.0; 2], emissive: 0, uv2_rect: MeshVertex::WHOLE_ATLAS }
     }
 
-    /// A closed-sided tube along y: `sides` facets round, `rings` rings.
-    /// `split`: every triangle gets its own three vertices, as a lightmapped
-    /// mesh's do.
     fn tube(radius: f32, length: f32, sides: usize, rings: usize, split: bool) -> (Vec<MeshVertex>, Vec<u32>) {
         let at = |s: usize, r: usize| {
             let a = s as f32 / sides as f32 * std::f32::consts::TAU;
@@ -282,7 +222,7 @@ mod tests {
     fn a_thick_pipe_and_a_round_bulb_are_not_thin() {
         let (v, i) = tube(0.03, 0.3, 12, 4, false);
         assert!(split_thin_parts(&v, &i).is_none(), "a 3 cm pipe has its samples to itself");
-        // A bulb: a 4.5 cm sphere.
+
         let (mut v, mut idx) = (Vec::new(), Vec::new());
         let (lat, lon) = (12, 16);
         for a in 0..=lat {
@@ -304,9 +244,7 @@ mod tests {
 
     #[test]
     fn a_thin_plate_keeps_its_faces_and_gives_up_its_rim() {
-        // A 30 cm square plate 3 mm thick, its normals averaged at the corners
-        // as an exporter's smooth shading leaves them: every corner sits on
-        // the thin rim, but the faces are 30 cm wide and must stay solid.
+
         let (h, t) = (0.15f32, 0.0015f32);
         let corners: Vec<Vec3> = [(-h, -t, -h), (h, -t, -h), (h, -t, h), (-h, -t, h), (-h, t, -h), (h, t, -h), (h, t, h), (-h, t, h)]
             .iter()
@@ -325,7 +263,7 @@ mod tests {
 
     #[test]
     fn a_chain_link_is_thin() {
-        // A torus: 6 mm round the middle, 1.5 mm thick.
+
         let (major, minor, a_n, b_n) = (0.006f32, 0.0015f32, 16, 8);
         let mut v = Vec::new();
         let mut idx = Vec::new();
@@ -351,10 +289,6 @@ mod tests {
     }
 }
 
-/// The real fixtures' thin parts, from the files the game ships. Skipped
-/// where the game directory is not beside this crate (it is published alone).
-/// `THIN_OBJ_DIR=<dir>` also writes each lamp's thin and solid triangles as
-/// OBJ, to look at.
 #[cfg(test)]
 mod shipped_lamps {
     use super::*;

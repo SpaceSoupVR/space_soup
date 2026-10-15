@@ -46,10 +46,7 @@ impl DynamicBuffer {
                 usage: self.buffer.usage(),
                 mapped_at_creation: true,
             });
-            // NOT INDEXED. Since wgpu 30 a mapped range may live in write-combined
-            // memory, which cannot be read back, so `BufferViewMut` no longer
-            // dereferences to a slice -- `slice()` hands out a write-only view
-            // instead.
+
             self.buffer
                 .slice(..)
                 .get_mapped_range_mut()
@@ -72,4 +69,3 @@ impl AsRef<Buffer> for DynamicBuffer {
         &self.buffer
     }
 }
-

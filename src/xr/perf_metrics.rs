@@ -1,25 +1,9 @@
-//! The runtime's own frame counters, from `XR_META_performance_metrics`.
-//!
-//! WHY. Every `PERF` number the renderer logs is measured from inside the
-//! app: CPU time to submit, and how long the GPU took to drain what was
-//! submitted. Neither says what the COMPOSITOR spent, whether the GPU was
-//! busy the whole frame or idling between our work and its own, or what
-//! clock it ran at -- and a change that moves the frame by a millisecond is
-//! read against all of that noise. The runtime keeps those counters itself
-//! and hands them over for the asking: app and compositor GPU/CPU time,
-//! GPU and CPU utilisation, dropped frames, and on newer runtimes the
-//! clocks. Logged on the same beat as `PERF`, so every window carries both.
-//!
-//! Gated on the runtime advertising the extension, exactly as the other
-//! optional extensions are: a runtime without it is asked for nothing.
-
 use log::info;
 use openxr as xr;
 use std::ptr;
 
-/// A counter the runtime exposes, resolved once to its path handle.
 struct Counter {
-    /// The path with the `/perfmetrics_meta/` prefix removed: `app/gpu_frametime`.
+
     short: String,
     path: xr::sys::Path,
 }
@@ -33,14 +17,12 @@ pub struct PerfMetrics {
 }
 
 impl PerfMetrics {
-    /// Enables the runtime's counters for `session`, or `None` when the
-    /// instance was created without the extension.
+
     pub fn new(instance: &xr::Instance, session: &xr::Session<xr::Vulkan>) -> Option<Self> {
         let fp = instance.exts().meta_performance_metrics?;
         let raw_instance = instance.as_raw();
         let raw_session = session.as_raw();
 
-        // The two-call idiom: how many, then the paths.
         let mut count = 0u32;
         let ok = unsafe {
             (fp.enumerate_performance_metrics_counter_paths)(raw_instance, 0, &mut count, ptr::null_mut())
@@ -85,8 +67,6 @@ impl PerfMetrics {
         Some(Self { fp, session: raw_session, counters })
     }
 
-    /// Every logged counter's current value. A counter the runtime declines
-    /// to answer this frame is left out rather than reported as zero.
     pub fn sample(&self) -> Vec<Sample> {
         self.counters
             .iter()
