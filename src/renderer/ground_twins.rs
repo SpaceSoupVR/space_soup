@@ -201,6 +201,19 @@ pub struct SlopeSplit {
     pub classes: Vec<[u32; 9]>,
     /// Indices of all, by ground class.
     pub class_totals: [u64; 3],
+    /// THE BLOCKS (`ground_lod::BLOCK_ORDER`): per chunk handed, where its
+    /// pieces start in `piece_runs` and how many (0: it lies whole in its own
+    /// range, as above). A chunk laid in a block is no longer one range: its
+    /// buckets lie each among its block's, and the tables above hold, past
+    /// the chunks', one entry a piece (`piece_runs`' third number).
+    pub piece_of: Vec<(u32, u8)>,
+    /// `[first, count, table entry, bucket]` of each piece, a chunk's in
+    /// bucket order. A piece is one bucket (slope class x ground class) of
+    /// one chunk.
+    pub piece_runs: Vec<[u32; 4]>,
+    /// Per chunk handed: the first index of the block it was laid in
+    /// (`u32::MAX`: none) -- what tells the frame which pieces lie together.
+    pub piece_block: Vec<u32>,
 }
 
 impl SlopeSplit {
@@ -263,6 +276,136 @@ impl SlopeSplit {
         Self::classed(verts, idx, chunks, threshold_deg, 0, &|_| 0)
     }
 
+    /// [`Self::classed`] for a ground whose first vertices are a LATTICE of
+    /// `lattice` cells (`ground_lod::GroundLod::lattice`; `None` or a zero:
+    /// none), as `ground_shape` reads it. A triangle of the lattice wider
+    /// than one cell -- a coarser list of `ground_lod` -- is shaded by the
+    /// step-1 ground under it (its normal and its face come from
+    /// `ground_shape`), so it takes the slope class of the step-1 cells it
+    /// and a cell round it cover ([`CellSlopes`]), not of its own corners.
+    #[allow(clippy::too_many_arguments)]
+    ///
+    /// `blocks`: per chunk handed, the block it is laid in with the chunks
+    /// beside it in the buffer that share its number, bucket by bucket
+    /// (`ground_lod::BLOCK_ORDER`, [`Self::piece_of`]); `u32::MAX` for a
+    /// chunk kept whole. `None`: every chunk whole.
+    #[allow(clippy::too_many_arguments)]
+    pub fn classed_on(
+        verts: &[SolidVertex],
+        idx: &[u32],
+        chunks: &[CasterChunk],
+        threshold_deg: f32,
+        class_key: u64,
+        class_of: &dyn Fn([[f32; 3]; 3]) -> usize,
+        lattice: Option<[u32; 2]>,
+        blocks: Option<&[u32]>,
+    ) -> Self {
+        let cover = lattice.and_then(|cells| CellSlopes::build(cells, verts, idx, threshold_deg));
+        let mut split = Self::classed_with(verts, idx, chunks, threshold_deg, class_key ^ lattice_key(lattice) ^ blocks_key(blocks), class_of, cover.as_ref());
+        if let Some(blocks) = blocks.filter(|b| b.len() == chunks.len()) {
+            split.lay_blocks(chunks, blocks);
+        }
+        split
+    }
+
+    /// The chunks of each block laid bucket by bucket (see `classed_on`):
+    /// bucket by bucket, and within one, chunk by chunk -- so a block drawn
+    /// whole is one run a bucket in the scene and the reflection pass alike,
+    /// and a chunk is up to nine pieces (a pass that draws chunks whole draws
+    /// a block cut by the frustum or the horizon as their pieces).
+    ///
+    /// (Laid slope class by slope class with each chunk's ground classes
+    /// within -- three pieces a chunk -- the reflection pass drew more runs
+    /// than with no blocks at all: 268 against 206 at the 625 hilltop, where
+    /// nine buckets draw 111. Measured 2026-10-14, `scale_bench budget`.)
+    fn lay_blocks(&mut self, chunks: &[CasterChunk], blocks: &[u32]) {
+        let real = chunks.len();
+        self.piece_of = vec![(0, 0); real];
+        self.piece_block = vec![u32::MAX; real];
+        // Per piece: its chunk, `[first, count, -, slope]`.
+        let mut laid: Vec<(usize, [u32; 4])> = Vec::new();
+        let mut k = 0usize;
+        while k < real {
+            let b = blocks[k];
+            if b == crate::renderer::ground_lod::SLIVER_RUN {
+                // One bucket, the full reader's (mixed slope, ground class 0):
+                // its triangles in any order are that bucket.
+                let count = chunks[k].index_count;
+                self.gentle_total -= self.gentle[k] as u64;
+                self.steep_total -= self.steep[k] as u64;
+                for (c, n) in self.classes[k].iter().enumerate() {
+                    self.class_totals[c % 3] -= *n as u64;
+                }
+                self.class_totals[0] += count as u64;
+                (self.gentle[k], self.steep[k]) = (0, 0);
+                self.classes[k] = [0, 0, 0, count, 0, 0, 0, 0, 0];
+                k += 1;
+                continue;
+            }
+            let mut e = k + 1;
+            while b != u32::MAX && e < real && blocks[e] == b && chunks[e].first_index == chunks[e - 1].first_index + chunks[e - 1].index_count {
+                e += 1;
+            }
+            let sorted = |u: usize| self.classes[u].iter().sum::<u32>() == chunks[u].index_count && self.gentle[u] + self.steep[u] <= chunks[u].index_count;
+            if b == u32::MAX || e - k < 2 || !(k..e).all(sorted) {
+                k = e;
+                continue;
+            }
+            let start = chunks[k].first_index as usize;
+            let end = (chunks[e - 1].first_index + chunks[e - 1].index_count) as usize;
+            let src = self.indices[start..end].to_vec();
+            let mut at = start;
+            laid.clear();
+            for bucket in 0..9 {
+                for u in k..e {
+                    let len = self.classes[u][bucket] as usize;
+                    if len == 0 {
+                        continue;
+                    }
+                    let off = chunks[u].first_index as usize - start + self.classes[u][..bucket].iter().sum::<u32>() as usize;
+                    self.indices[at..at + len].copy_from_slice(&src[off..off + len]);
+                    laid.push((u, [at as u32, len as u32, 0, bucket as u32]));
+                    at += len;
+                }
+            }
+            // Chunk by chunk, so a chunk's pieces are one stretch of the list.
+            laid.sort_by_key(|(u, p)| (*u, p[3]));
+            for u in k..e {
+                self.piece_of[u] = (self.piece_runs.len() as u32, 0);
+                self.piece_block[u] = start as u32;
+                for (_, p) in laid.iter().filter(|(v, _)| *v == u) {
+                    self.piece_runs.push(*p);
+                    self.piece_of[u].1 += 1;
+                }
+            }
+            k = e;
+        }
+        // Each piece's own entry in the tables, past the chunks': its bucket
+        // whole.
+        let n = self.piece_runs.len();
+        self.gentle.resize(real + n, 0);
+        self.steep.resize(real + n, 0);
+        self.classes.resize(real + n, [0; 9]);
+        for u in 0..real {
+            let (at, len) = self.piece_of[u];
+            for p in at as usize..at as usize + len as usize {
+                let id = real + p;
+                let [_, count, _, bucket] = self.piece_runs[p];
+                let bucket = bucket as usize;
+                self.classes[id][bucket] = count;
+                self.gentle[id] = if bucket < 3 { count } else { 0 };
+                self.steep[id] = if bucket >= 6 { count } else { 0 };
+                self.piece_runs[p][2] = id as u32;
+            }
+        }
+    }
+
+    /// The pieces, as `ground_lod::GroundLod::set_pieces` takes them; `None`
+    /// when no chunk was laid in a block.
+    pub fn pieces(&self) -> Option<crate::renderer::ground_lod::Pieces> {
+        (!self.piece_runs.is_empty()).then(|| crate::renderer::ground_lod::Pieces { of: self.piece_of.clone(), runs: self.piece_runs.clone(), block: self.piece_block.clone() })
+    }
+
     /// [`Self::new`], and within each slope class the triangles ordered by
     /// their GROUND CLASS: `class_of` a triangle's three positions (as
     /// `verts` holds them), 0, 1 or 2 -- anything else counts as 0.
@@ -274,6 +417,18 @@ impl SlopeSplit {
         threshold_deg: f32,
         class_key: u64,
         class_of: &dyn Fn([[f32; 3]; 3]) -> usize,
+    ) -> Self {
+        Self::classed_with(verts, idx, chunks, threshold_deg, class_key, class_of, None)
+    }
+
+    fn classed_with(
+        verts: &[SolidVertex],
+        idx: &[u32],
+        chunks: &[CasterChunk],
+        threshold_deg: f32,
+        class_key: u64,
+        class_of: &dyn Fn([[f32; 3]; 3]) -> usize,
+        cover: Option<&CellSlopes>,
     ) -> Self {
         let whole = [CasterChunk { first_index: 0, index_count: idx.len() as u32, min: glam::Vec3::ZERO, max: glam::Vec3::ZERO }];
         let ranges: &[CasterChunk] = if chunks.is_empty() { &whole } else { chunks };
@@ -301,12 +456,9 @@ impl SlopeSplit {
             for t in tris.chunks_exact(3) {
                 let n = [normal(t[0]), normal(t[1]), normal(t[2])];
                 let face_y = face_height([position(t[0]), position(t[1]), position(t[2])]);
-                let slope = if triangle_is_gentle(n, face_y, threshold_deg) {
-                    0
-                } else if triangle_is_steep(n, face_y, threshold_deg) {
-                    2
-                } else {
-                    1
+                let slope = match cover.and_then(|c| c.class_of_coarse([t[0], t[1], t[2]])) {
+                    Some(k) => k,
+                    None => slope_class(n, face_y, threshold_deg),
                 };
                 let class = match class_of([position(t[0]), position(t[1]), position(t[2])]) {
                     k @ 0..=2 => k,
@@ -340,6 +492,9 @@ impl SlopeSplit {
             steep_total,
             classes,
             class_totals,
+            piece_of: Vec::new(),
+            piece_runs: Vec::new(),
+            piece_block: Vec::new(),
         }
     }
 
@@ -352,6 +507,7 @@ impl SlopeSplit {
     /// It was made on the first FRAME that drew the ground, on the render
     /// thread: a hitch of 35 ms on test_room, 152 ms at 625 samples a side,
     /// 9.9 s at 2,049 (`docs/scale-audit-2026-10-13.md`, F12).
+    #[allow(clippy::too_many_arguments)]
     pub fn ensure(
         kept: &mut Option<SlopeSplit>,
         verts: &[SolidVertex],
@@ -360,12 +516,14 @@ impl SlopeSplit {
         threshold_deg: f32,
         class_key: u64,
         class_of: &dyn Fn([[f32; 3]; 3]) -> usize,
+        lattice: Option<[u32; 2]>,
+        blocks: Option<&[u32]>,
     ) -> Option<f64> {
-        if kept.as_ref().is_some_and(|s| s.is_for(verts, idx, chunks, threshold_deg, class_key)) {
+        if kept.as_ref().is_some_and(|s| s.is_for(verts, idx, chunks, threshold_deg, class_key ^ lattice_key(lattice) ^ blocks_key(blocks))) {
             return None;
         }
         let started = std::time::Instant::now();
-        *kept = Some(Self::classed(verts, idx, chunks, threshold_deg, class_key, class_of));
+        *kept = Some(Self::classed_on(verts, idx, chunks, threshold_deg, class_key, class_of, lattice, blocks));
         Some(started.elapsed().as_secs_f64() * 1000.0)
     }
 
@@ -397,6 +555,137 @@ impl SlopeSplit {
             at += len;
         }
         (runs, n)
+    }
+}
+
+/// A triangle's slope class from its own corners: 0 gentle
+/// ([`triangle_is_gentle`]), 2 steep ([`triangle_is_steep`]), 1 both kinds
+/// of pixel.
+fn slope_class(n: [[f32; 3]; 3], face_y: f32, threshold_deg: f32) -> usize {
+    if triangle_is_gentle(n, face_y, threshold_deg) {
+        0
+    } else if triangle_is_steep(n, face_y, threshold_deg) {
+        2
+    } else {
+        1
+    }
+}
+
+/// What the blocks add to a split's key: 0 for none.
+fn blocks_key(blocks: Option<&[u32]>) -> u64 {
+    let Some(blocks) = blocks.filter(|b| b.iter().any(|x| *x != u32::MAX)) else { return 0 };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (i, b) in blocks.iter().enumerate() {
+        h ^= (*b as u64) ^ ((i as u64) << 32);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h | 1
+}
+
+/// What a lattice's size adds to a split's key: 0 for none.
+fn lattice_key(lattice: Option<[u32; 2]>) -> u64 {
+    match lattice {
+        Some([x, z]) if x > 0 && z > 0 => 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(1 + x as u64 + ((z as u64) << 32)),
+        _ => 0,
+    }
+}
+
+/// THE STEP-1 SLOPE CLASSES OF A LATTICE'S CELLS, as counts over every
+/// rectangle of cells (summed-area tables), for the slope class of a coarser
+/// triangle that `ground_shape` shades by the step-1 ground under it: gentle
+/// only if every step-1 triangle under it and a cell round it is (an MSAA
+/// edge pixel's centre lies just outside its triangle), steep only if every
+/// one is, else both. A cell with no step-1 triangle drawn (a hole, ground
+/// under a floor) by the two triangles `ground_shape` reads there.
+pub struct CellSlopes {
+    cells: [u32; 2],
+    /// Counts of cells holding a pixel that is NOT gentle, and NOT steep,
+    /// over `[0, x) x [0, z)`, `(cells + 1)` a row.
+    not_gentle: Vec<u32>,
+    not_steep: Vec<u32>,
+}
+
+impl CellSlopes {
+    /// `None` when the vertices hold no lattice of `cells`.
+    pub fn build(cells: [u32; 2], verts: &[SolidVertex], idx: &[u32], threshold_deg: f32) -> Option<Self> {
+        let [cx, cz] = cells;
+        let stride = cx + 1;
+        let samples = (stride * (cz + 1)) as usize;
+        if cx == 0 || cz == 0 || verts.len() < samples {
+            return None;
+        }
+        // Bit 0: a gentle triangle, 1: mixed, 2: steep, in the cell.
+        let mut kinds = vec![0u8; (cx * cz) as usize];
+        let class = |t: [u32; 3]| {
+            let n = t.map(|v| verts[v as usize].normal);
+            slope_class(n, face_height(t.map(|v| verts[v as usize].position)), threshold_deg)
+        };
+        for t in idx.chunks_exact(3) {
+            let t = [t[0], t[1], t[2]];
+            if let Some((x0, z0, 1, 1)) = Self::span(stride, samples, t) {
+                kinds[(z0 * cx + x0) as usize] |= 1 << class(t);
+            }
+        }
+        for z in 0..cz {
+            for x in 0..cx {
+                let k = &mut kinds[(z * cx + x) as usize];
+                if *k == 0 {
+                    let (a, b, c, d) = (z * stride + x, z * stride + x + 1, (z + 1) * stride + x, (z + 1) * stride + x + 1);
+                    *k = (1 << class([a, d, b])) | (1 << class([a, c, d]));
+                }
+            }
+        }
+        let table = |hit: &dyn Fn(u8) -> bool| {
+            let mut sat = vec![0u32; ((cx + 1) * (cz + 1)) as usize];
+            for z in 0..cz {
+                let mut row = 0u32;
+                for x in 0..cx {
+                    row += hit(kinds[(z * cx + x) as usize]) as u32;
+                    sat[((z + 1) * (cx + 1) + x + 1) as usize] = sat[(z * (cx + 1) + x + 1) as usize] + row;
+                }
+            }
+            sat
+        };
+        Some(Self { cells, not_gentle: table(&|k| k & 0b110 != 0), not_steep: table(&|k| k & 0b011 != 0) })
+    }
+
+    /// A lattice triangle's first cell and its width and depth in cells;
+    /// `None` for one with a vertex off the lattice.
+    fn span(stride: u32, samples: usize, t: [u32; 3]) -> Option<(u32, u32, u32, u32)> {
+        if t.iter().any(|&v| v as usize >= samples) {
+            return None;
+        }
+        let at = t.map(|v| (v % stride, v / stride));
+        let x0 = at.iter().map(|a| a.0).min()?;
+        let z0 = at.iter().map(|a| a.1).min()?;
+        let x1 = at.iter().map(|a| a.0).max()?;
+        let z1 = at.iter().map(|a| a.1).max()?;
+        Some((x0, z0, x1 - x0, z1 - z0))
+    }
+
+    /// The slope class of a lattice triangle WIDER than one cell, from the
+    /// cells under it and one round them; `None` for a step-1 triangle or one
+    /// off the lattice (classed by its own corners).
+    pub fn class_of_coarse(&self, t: [u32; 3]) -> Option<usize> {
+        let [cx, cz] = self.cells;
+        let stride = cx + 1;
+        let (x0, z0, w, d) = Self::span(stride, (stride * (cz + 1)) as usize, t)?;
+        if w <= 1 && d <= 1 {
+            return None;
+        }
+        let (a, b) = (x0.saturating_sub(1), z0.saturating_sub(1));
+        let (c, e) = ((x0 + w + 1).min(cx), (z0 + d + 1).min(cz));
+        let count = |sat: &[u32]| {
+            let at = |x: u32, z: u32| sat[(z * (cx + 1) + x) as usize];
+            at(c, e) + at(a, b) - at(a, e) - at(c, b)
+        };
+        Some(if count(&self.not_gentle) == 0 {
+            0
+        } else if count(&self.not_steep) == 0 {
+            2
+        } else {
+            1
+        })
     }
 }
 
@@ -661,21 +950,21 @@ mod tests {
         let class_of = |c: [[f32; 3]; 3]| if c[0][0] < 60.0 { 1 } else { 2 };
         let mut kept = None;
         // The load.
-        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 77, &class_of).is_some());
+        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 77, &class_of, None, None).is_some());
         let made = kept.as_ref().unwrap().indices.clone();
         assert!(kept.as_ref().unwrap().has_classes());
         // Its frames: the chunks' boxes follow the rig, nothing else changes.
         for frame in 0..30 {
             let moved: Vec<CasterChunk> = chunks.iter().map(|c| CasterChunk { min: glam::Vec3::splat(frame as f32), ..*c }).collect();
-            assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &moved, 35.0, 77, &class_of).is_none(), "built again on frame {frame}");
+            assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &moved, 35.0, 77, &class_of, None, None).is_none(), "built again on frame {frame}");
         }
         assert_eq!(kept.as_ref().unwrap().indices, made);
         // Another probe table; another threshold; another ground.
-        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 78, &class_of).is_some());
-        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 78, &class_of).is_none());
-        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 30.0, 78, &class_of).is_some());
+        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 78, &class_of, None, None).is_some());
+        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 78, &class_of, None, None).is_none());
+        assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 30.0, 78, &class_of, None, None).is_some());
         let other: Vec<SolidVertex> = verts.iter().map(|v| { let mut o = *v; o.normal = [0.0, 1.0, 0.0]; o }).collect();
-        assert!(SlopeSplit::ensure(&mut kept, &other, &idx, &chunks, 30.0, 78, &class_of).is_some());
+        assert!(SlopeSplit::ensure(&mut kept, &other, &idx, &chunks, 30.0, 78, &class_of, None, None).is_some());
     }
 
     #[test]
@@ -859,6 +1148,101 @@ mod tests {
         }
         posed[0].normal = [0.7, 0.7, 0.0];
         assert!(!split.is_for(&posed, &idx, &chunks, 18.0, 0), "the ground itself changed");
+    }
+
+    /// THE BLOCKS (`ground_lod::BLOCK_ORDER`): each step-1 chunk's pieces
+    /// hold exactly its own triangles, each piece one bucket's, the level's
+    /// step-1 triangles are the ones they were, and a frame that sees every
+    /// chunk draws a block's chunks in one run a reader -- the scene pass's
+    /// draws fall by more than half.
+    #[test]
+    fn a_blocks_chunks_are_laid_bucket_by_bucket_and_drawn_as_their_pieces() {
+        use crate::renderer::ground_lod::{merged, tests::ground, GridInput, GroundLod};
+        let cells = 160; // 5 x 5 chunks: one whole block and the edges'
+        let (positions, triangles) = ground(cells, &|x, z| 6.0 * (x * 0.031).sin() * (z * 0.027).cos() + 2.0 * (x * 0.35).sin() * (z * 0.4).sin(), &|_, _| false);
+        let mut normals = vec![glam::Vec3::ZERO; positions.len()];
+        for t in triangles.chunks_exact(3) {
+            let f = (positions[t[1] as usize] - positions[t[0] as usize]).cross(positions[t[2] as usize] - positions[t[0] as usize]);
+            t.iter().for_each(|v| normals[*v as usize] += f);
+        }
+        let verts: Vec<SolidVertex> = positions
+            .iter()
+            .zip(&normals)
+            .map(|(p, n)| SolidVertex { position: p.to_array(), normal: n.normalize().to_array(), color: [1.0; 4], uv2: [0.0; 2], reflectivity: 0.0 })
+            .collect();
+        let mut lod = GroundLod::build(&GridInput { cells: [cells, cells], positions: &positions, triangles: &triangles, open: None, chunk_cells: 32, lists: false });
+        let chunks = lod.all_units();
+        let blocks = lod.blocks();
+        let threshold = 18.0;
+        let plain = SlopeSplit::classed_on(&verts, &lod.indices, &chunks, threshold, 0, &|_| 0, Some(lod.lattice), None);
+        let split = SlopeSplit::classed_on(&verts, &lod.indices, &chunks, threshold, 0, &|_| 0, Some(lod.lattice), Some(&blocks));
+        assert!(plain.piece_runs.is_empty());
+        assert!(split.steep_total > 0 && split.gentle_total > 0, "the hills have both kinds at {threshold} degrees");
+        let tri_set = |idx: &[u32]| {
+            let mut t: Vec<[u32; 3]> = idx.chunks_exact(3).map(|t| { let mut t = [t[0], t[1], t[2]]; t.sort(); t }).collect();
+            t.sort();
+            t
+        };
+        assert_eq!(tri_set(&split.indices), tri_set(&plain.indices), "the same triangles");
+        let real = chunks.len();
+        let mut laid = 0;
+        for (u, c) in chunks.iter().enumerate() {
+            let (at, n) = split.piece_of[u];
+            let own = &plain.indices[c.first_index as usize..(c.first_index + c.index_count) as usize];
+            if n == 0 {
+                assert_eq!(&split.indices[c.first_index as usize..(c.first_index + c.index_count) as usize], own);
+                continue;
+            }
+            laid += 1;
+            let mut held = Vec::new();
+            assert!(n <= 9, "a chunk is at most nine pieces");
+            for [first, count, id, bucket] in &split.piece_runs[at as usize..(at + n as u32) as usize] {
+                let (id, slope) = (*id as usize, *bucket as usize / 3);
+                assert_eq!(split.classes[id][*bucket as usize], *count);
+                assert!(id >= real);
+                let piece = &split.indices[*first as usize..(*first + *count) as usize];
+                held.extend_from_slice(piece);
+                // One slope class, whole: its count in the tables, and the
+                // class every triangle in it has.
+                assert_eq!(split.classes[id].iter().sum::<u32>(), *count);
+                assert_eq!(split.classes[id][slope * 3..slope * 3 + 3].iter().sum::<u32>(), *count);
+                assert_eq!(split.gentle[id], if slope == 0 { *count } else { 0 });
+                assert_eq!(split.steep[id], if slope == 2 { *count } else { 0 });
+                for t in piece.chunks_exact(3) {
+                    let n = [verts[t[0] as usize].normal, verts[t[1] as usize].normal, verts[t[2] as usize].normal];
+                    let f = face_height([verts[t[0] as usize].position, verts[t[1] as usize].position, verts[t[2] as usize].position]);
+                    assert_eq!(slope_class(n, f, threshold), slope);
+                }
+            }
+            assert_eq!(tri_set(&held), tri_set(own), "chunk {u}'s pieces are its triangles");
+        }
+        assert!(laid >= 16, "{laid} chunks laid in blocks");
+        // A frame seeing everything: the scene pass's draws, reader by reader.
+        let scene_draws = |split: &SlopeSplit, lod: &mut GroundLod| {
+            lod.set_pieces(split.pieces());
+            let f = lod.frame(glam::Vec3::new(0.0, 30.0, 0.0), &[], false, glam::Vec3::ZERO, 0.0, 0);
+            assert!(f.chunks.windows(2).all(|w| w[0].first_index < w[1].first_index), "by first index");
+            let mut all: Vec<u32> = f.chunks.iter().flat_map(|c| split.indices[c.first_index as usize..(c.first_index + c.index_count) as usize].iter().copied()).collect();
+            assert_eq!(tri_set(&all), tri_set(&plain.indices), "the frame draws every triangle once");
+            all.clear();
+            (0..3)
+                .map(|which| {
+                    merged(f.chunks.iter().zip(&f.units).map(|(c, u)| {
+                        let (g, st) = (split.gentle[*u as usize].min(c.index_count), split.steep[*u as usize]);
+                        let end = c.index_count - st.min(c.index_count - g);
+                        match which {
+                            0 => (c.first_index, g),
+                            1 => (c.first_index + g, end - g),
+                            _ => (c.first_index + end, c.index_count - end),
+                        }
+                    }))
+                    .len()
+                })
+                .sum::<usize>()
+        };
+        let (before, after) = (scene_draws(&plain, &mut lod), scene_draws(&split, &mut lod));
+        eprintln!("scene draws for {} chunks: {before} chunk by chunk, {after} block by block", chunks.len());
+        assert!(after * 2 < before, "{after} against {before}");
     }
 
     /// With ground classes: each chunk keeps its own triangles, its slope

@@ -96,6 +96,11 @@ pub struct TerrainMaterialUniform {
     /// lost its sheen and drew the hill's horizon across itself,
     /// `docs/weather-2026-10-07.md`).
     pub film: [f32; 4],
+    /// THE GROUND'S SHAPE (`ground_shape`): the cells its footprint uv runs
+    /// over along x and z, then one over the metres of a cell along each. All 0 where
+    /// the material has no shape bound: the ground then shades by its
+    /// interpolated vertex normals and its drawn triangles, as it did.
+    pub shape: [f32; 4],
 }
 
 impl Default for TerrainMaterialUniform {
@@ -118,6 +123,7 @@ impl Default for TerrainMaterialUniform {
             // and dry grass), sediment (sand).
             porosity: WET_POROSITY,
             film: WET_FILM,
+            shape: [0.0; 4],
         }
     }
 }
@@ -1381,6 +1387,19 @@ pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
                 },
                 count: None,
             },
+            // THE GROUND'S STEP-1 SHAPE (`ground_shape`): its normals and
+            // heights a texel a sample, loaded, never filtered. Always
+            // bound: a 1x1 placeholder and `mat.shape` 0 where there is none.
+            BindGroupLayoutEntry {
+                binding: 9,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -1412,6 +1431,7 @@ struct Material {{
     sea_line: f32,
     porosity: vec4<f32>,
     film: vec4<f32>,
+    shape: vec4<f32>,
 }}
 @group(1) @binding(3) var<uniform> mat: Material;
 @group(1) @binding(4) var splat_tex: texture_2d<f32>;
@@ -1437,6 +1457,7 @@ struct Material {{
 {lights_block}
 {biplanar_block}
 {whiteout_block}
+{shape_block}
 
 struct VIn  {{ @location(0) pos: vec3<f32>, @location(1) norm: vec3<f32>, @location(2) col: vec4<f32>, @location(3) uv2: vec2<f32> }}
 struct VOut {{
@@ -1452,6 +1473,13 @@ struct VOut {{
     // cuboid path uses for lightmap coordinates. Terrain is lit dynamically and
     // has no lightmap, so that slot was sitting at (0,0) doing nothing.
     @location(3) uv: vec2<f32>,
+    // The same uv where the pixel's coverage of its triangle is (CENTROID):
+    // where the ground's step-1 shape is read (`ground_shape`). At an MSAA
+    // edge pixel whose centre lies across the triangle's edge, the centre's
+    // uv reads the NEIGHBOUR's normal and plane -- the crease moved to the
+    // pixel grid, as jagged as no MSAA (2026-10-14, offline: lines of 20 to
+    // 94 levels along every crease of the cliffs).
+    @location(5) @interpolate(perspective, centroid) shape_uv: vec2<f32>,
 }}
 
 @vertex fn vs_main(v: VIn) -> VOut {{
@@ -1462,6 +1490,7 @@ struct VOut {{
     out.world_pos = v.pos;
     out.tex_pos   = to_world_space(v.pos);
     out.uv        = v.uv2;
+    out.shape_uv  = v.uv2;
     return out;
 }}
 
@@ -1629,7 +1658,9 @@ const MACRO_NEUTRAL: f32 = 0.5019608;
 // `n` is the interpolated normal, and `step_x` and `step_y` the position's
 // two screen steps -- all three in the player's frame, where the steps stay
 // small near the eye in a level of any size.
-fn sample_frame(world: vec3<f32>, n: vec3<f32>, step_x: vec3<f32>, step_y: vec3<f32>) -> SampleFrame {{
+// `shape_face`: the step-1 triangle's plane under the pixel, which stands for
+// the drawn one where `shaped` (`ground_shape`).
+fn sample_frame(world: vec3<f32>, n: vec3<f32>, step_x: vec3<f32>, step_y: vec3<f32>, shape_face: vec3<f32>, shaped: bool) -> SampleFrame {{
     var f: SampleFrame;
     let planar_uv  = world.xz;
     // THE WORLD POSITION'S TWO SCREEN GRADIENTS, taken once: every plane's
@@ -1650,7 +1681,7 @@ fn sample_frame(world: vec3<f32>, n: vec3<f32>, step_x: vec3<f32>, step_y: vec3<
     let across = cross(step_x, step_y);
     let along = dot(across, n);
     let across_len = inverseSqrt(max(dot(across, across), 1e-30));
-    let face = across * (sign(along) * across_len);
+    let face = select(across * (sign(along) * across_len), shape_face, shaped);
     // STEEP WHERE THE NORMAL OR THE TRIANGLE IS. The interpolated normal is
     // the light's; it is a blend of the faces round each vertex, and on a rise
     // one cell wide it reads twenty degrees gentler than the face it is drawn
@@ -1665,7 +1696,7 @@ fn sample_frame(world: vec3<f32>, n: vec3<f32>, step_x: vec3<f32>, step_y: vec3<
     // does not: at a cliff's foot and rim, on a one-cell step, along a ridge.
     // There the ground has a crease, and the picture changes plane on it.
     // In the world, as the planes are.
-    let agree = clamp((abs(along) * across_len - FACE_DIFFERS) * FACE_BAND, 0.0001, 1.0);
+    let agree = clamp((abs(dot(face, n)) - FACE_DIFFERS) * FACE_BAND, 0.0001, 1.0);
     let pn = to_world_direction(normalize(mix(face, n, agree)));
     // At unit repeat, so each layer divides rather than recomputing.
     let b = biplanar_axes(world, pn, 1.0);
@@ -1930,7 +1961,14 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     let step_x = dpdx(in.world_pos);
     let step_y = dpdy(in.world_pos);
     pixel_footprint = sqrt(length(step_x) * length(step_y));
-    let n = normalize(in.normal);
+    // THE STEP-1 GROUND UNDER THE PIXEL (`ground_shape`), at whatever step
+    // its triangle is drawn: the normal the step-1 triangle there blends,
+    // and that triangle's own plane -- so a coarser triangle of
+    // `ground_lod` is lit and textured as step 1 is. The interpolated
+    // normal and the drawn triangle where there is no shape, and on a
+    // cave's ground patch (its vertices' alpha 0).
+    let shape = ground_shape_at(in.shape_uv, in.col.a);
+    let n = normalize(select(in.normal, to_player_direction(shape.n), shape.shaped));
     set_pixel_long_step(n, normalize(cam_pos() - in.world_pos));
 
     // Slope straight from the normal: no derivative, no extra sampling.
@@ -1948,7 +1986,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // 2026-10-01, the far bank).
     // And by the triangle that is drawn, where it is not the surface the
     // interpolated normal describes (`sample_frame`).
-    let f = sample_frame(in.tex_pos, n, step_x, step_y);
+    let f = sample_frame(in.tex_pos, n, step_x, step_y, to_player_direction(shape.face), shape.shaped);
 
     // Blend the layers' normals by the same weights, then renormalise. Summing
     // unit vectors shortens the result wherever they disagree, and a shortened
@@ -2078,6 +2116,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
         stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
         biplanar_block = wgsl_biplanar_block(),
         whiteout_block = wgsl_whiteout_block(),
+        shape_block = super::ground_shape::WGSL,
         layer_reads = LAYER_READS,
     )
 }
@@ -3477,6 +3516,27 @@ impl TerrainMaterial {
         ao: &[Option<TerrainImage>],
         settings: TerrainMaterialUniform,
     ) -> Self {
+        Self::new_with_shape(device, queue, layout, layers, macro_image, splat, sky_occlusion, normals, rough, ao, settings, None)
+    }
+
+    /// [`Self::new`], with the ground's step-1 shape (`ground_shape`) for its
+    /// readers to take their normal and face from; `None` binds a
+    /// placeholder and leaves them on the vertices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_shape(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        layers: &[TerrainImage],
+        macro_image: &TerrainImage,
+        splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
+        normals: &[Option<TerrainImage>],
+        rough: &[Option<TerrainImage>],
+        ao: &[Option<TerrainImage>],
+        settings: TerrainMaterialUniform,
+        shape: Option<&super::ground_shape::GroundShape>,
+    ) -> Self {
         assert!(!layers.is_empty(), "terrain material needs at least one layer");
         let (w, h) = (layers[0].width, layers[0].height);
         assert!(
@@ -3804,6 +3864,31 @@ impl TerrainMaterial {
         let mut settings = settings;
         settings.use_splat = if splat.is_some() { 1.0 } else { 0.0 };
 
+        // THE GROUND'S SHAPE, or one texel and no shape.
+        let placeholder = super::ground_shape::GroundShape { size: [1, 1], texels: vec![[0.0, 1.0, 0.0, 0.0]], ..Default::default() };
+        let shape_image = shape.filter(|s| s.size[0] >= 2 && s.size[1] >= 2).unwrap_or(&placeholder);
+        settings.shape = match shape {
+            Some(s) if s.size[0] >= 2 && s.size[1] >= 2 => [s.uv_cells[0], s.uv_cells[1], 1.0 / s.cell[0], 1.0 / s.cell[1]],
+            _ => [0.0; 4],
+        };
+        let shape_extent = Extent3d { width: shape_image.size[0], height: shape_image.size[1], depth_or_array_layers: 1 };
+        let shape_tex = device.create_texture(&TextureDescriptor {
+            label: Some("terrain_ground_shape"),
+            size: shape_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba32Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &shape_tex, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            shape_image.bytes(),
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(16 * shape_image.size[0]), rows_per_image: Some(shape_image.size[1]) },
+            shape_extent,
+        );
+
         let uniform = device.create_buffer(&BufferDescriptor {
             label: Some("terrain_material_uniform"),
             size: std::mem::size_of::<TerrainMaterialUniform>() as u64,
@@ -3873,6 +3958,7 @@ impl TerrainMaterial {
                         }),
                     ),
                 },
+                BindGroupEntry { binding: 9, resource: BindingResource::TextureView(&shape_tex.create_view(&TextureViewDescriptor::default())) },
             ],
         });
 
@@ -3963,6 +4049,25 @@ impl TerrainMaterial {
         sky_occlusion: Option<&TerrainImage>,
         settings: TerrainMaterialUniform,
     ) -> Self {
+        Self::from_layers_with_shape(device, queue, layout, layers, normals, rough, ao, splat, sky_occlusion, settings, None)
+    }
+
+    /// [`Self::from_layers_with`], with the ground's step-1 shape: see
+    /// [`Self::new_with_shape`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_layers_with_shape(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        layers: &[Option<TerrainImage>],
+        normals: &[Option<TerrainImage>],
+        rough: &[Option<TerrainImage>],
+        ao: &[Option<TerrainImage>],
+        splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
+        settings: TerrainMaterialUniform,
+        shape: Option<&super::ground_shape::GroundShape>,
+    ) -> Self {
         let (w, h) = layers
             .iter()
             .flatten()
@@ -3987,7 +4092,7 @@ impl TerrainMaterial {
             })
             .collect();
 
-        Self::new(
+        Self::new_with_shape(
             device,
             queue,
             layout,
@@ -3999,6 +4104,7 @@ impl TerrainMaterial {
             rough,
             ao,
             settings,
+            shape,
         )
     }
 

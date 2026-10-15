@@ -41,6 +41,7 @@ pub mod weather;
 pub mod ground_cuts;
 pub mod ground_horizon;
 pub mod ground_lod;
+pub mod ground_shape;
 pub mod water_runs;
 pub mod water_wake;
 pub mod planar_water;

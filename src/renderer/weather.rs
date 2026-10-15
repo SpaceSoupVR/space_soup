@@ -656,7 +656,9 @@ const TERRAIN_APPLY: &str = "    // WEATHER: see `weather::with_weather`.
 /// its shading. `None` if the shader no longer has the lines it edits -- a
 /// test catches that (`every_ground_shader_takes_its_weather_twin`).
 pub fn with_weather(src: &str) -> Option<String> {
-    let mut s = src.to_string();
+    // Lit by its own vertices, not the ground's step-1 shape: see
+    // `ground_shape::unshaped`.
+    let mut s = crate::renderer::ground_shape::unshaped(src)?;
     let edits: [(&str, &str); 5] = [
         // The ground under still water: the map's, here (a shore's layer, and
         // an area's texels under the sea, are soaked there), not the line's.

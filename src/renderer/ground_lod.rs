@@ -65,6 +65,13 @@ pub const CHUNK_CELLS: u32 = 32;
 pub const MAX_LEVEL: usize = 4;
 /// A pixel of the headset, radians: the error a coarser level may show.
 pub const PIXEL_RAD: f32 = 1.2e-3;
+/// THE ERROR A COARSER LEVEL MAY SHOW, radians, as a level's load builds its
+/// tree: [`PIXEL_RAD`] unless changed (f32 bits). MEASUREMENT: how far a
+/// coarser ground may stand from step 1 before the picture changes, now that
+/// its light does not (`ground_shape`): the offline frame's `GROUND_LOD_MRAD`,
+/// the scale bench's `BUDGET_LOD_MRAD`, the headset's `adb shell setprop
+/// debug.spacesoup.groundlodmrad 2.4` before a launch.
+pub static TOLERANCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3a9d_4952);
 /// The cell the distances below were worked out for (test_room's), metres.
 pub const REFERENCE_CELL: f32 = 110.0 / 256.0;
 /// From how far a node at each level MAY be drawn whole, metres from the
@@ -82,11 +89,43 @@ pub const HYSTERESIS: f32 = 0.10;
 pub const BOX_SLACK: f32 = 1e-4;
 
 /// WHETHER A LEVEL'S LOAD BUILDS THE COARSER LISTS. Off: the index buffer is
-/// step 1's alone and the lever can do nothing. On
-/// (`adb shell setprop debug.spacesoup.groundlod 1` before a launch;
-/// `GROUND_LOD=1` for the offline frame): the lists are in the buffer (about
-/// 2.9 times the indices) and `Levers::ground_lod` draws by them.
-pub static LISTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// step 1's alone and the lever can do nothing. On (the default since
+/// 2026-10-14; `adb shell setprop debug.spacesoup.groundlod 0` before a
+/// launch turns it off; the offline frame and the budget harness set it from
+/// `GROUND_LOD` / `BUDGET_GROUND_LOD`): the lists are in the buffer (about
+/// 1.4 times step 1's indices with sliver borders) and `Levers::ground_lod`
+/// draws by them.
+pub static LISTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// THE SLOPE SPLIT LAYS A BLOCK OF CHUNKS BUCKET BY BUCKET (`true`): every
+/// gentle triangle of a block of [`BLOCK_CHUNKS`] x [`BLOCK_CHUNKS`] step-1
+/// chunks, chunk by chunk, then every mixed one, then every steep one (each
+/// by its ground class), where each chunk was its own gentle, mixed and steep
+/// runs. A block in view is then one run a reader -- three draws in the scene
+/// pass for 16 chunks, where they were up to 48 -- and a chunk is drawn as
+/// its pieces ([`GroundLod::frame`]). `false`: each chunk its own runs, as
+/// until 2026-10-14. Read when the split is made (a level's load):
+/// `adb shell setprop debug.spacesoup.groundblocks 0` before a launch.
+pub static BLOCK_ORDER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// A NODE BESIDE A COARSER ONE IS DRAWN WHOLE, ITS BORDER CLOSED BY SLIVERS
+/// (`true`): for each vertex of its edge the neighbour skips, the thin
+/// triangle between it and the neighbour's edge (`sliver_lists`, as chunks
+/// with holes always were) -- not by its core and four strips, one of them
+/// stitched. On shared vertices, so watertight the same way. A node is then
+/// its whole list, laid with its block's (`BLOCK_ORDER`), and a sliver run
+/// a stitched side: the ring of step-1 chunks round a coarser node was five
+/// runs a chunk, each split three ways by slope (the 625 hilltop drew 935
+/// scene draws with the lever on against 128 off). And the lists hold no
+/// cores or strips: about half the memory. Read when a level's tree is built.
+pub static SLIVER_BORDERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Chunks a side of a block ([`BLOCK_ORDER`]): 4, 55 m on test_room's cells.
+/// A block number that says: a sliver run, laid as ONE bucket -- the full
+/// reader's, slope and ground class alike -- so the stitched sides along one
+/// edge, which lie one after another, are one draw. They are a few thin
+/// triangles each.
+pub const SLIVER_RUN: u32 = u32::MAX - 1;
+pub const BLOCK_CHUNKS: u32 = 4;
 
 /// MEASUREMENT (the offline frame's `GROUND_ORDER=rows`): the chunks laid in
 /// the buffer row by row, as they were until 2026-10-13, not in Morton order
@@ -146,6 +185,9 @@ pub struct Node {
     pub split_under: f32,
     /// Whether it holds a hole cell or a triangle of a cave's ground patch.
     pub holes: bool,
+    /// Whether it holds a chunk held at step 1 ([`GroundLod::hold`]): never
+    /// drawn whole above level 0.
+    pub held: bool,
     /// Its border toward a coarser neighbour is closed by slivers beside its
     /// `whole` list, not by strips: a chunk with holes or a patch, or a node
     /// too narrow to have a ring.
@@ -180,9 +222,19 @@ pub struct GroundLod {
     top_lod: usize,
     /// Metres a cell.
     pub cell: f32,
+    /// THE SLOPE SPLIT'S PIECES (`ground_twins::SlopeSplit`, blocks): a
+    /// unit laid in a block is drawn as its pieces ([`Self::frame`]).
+    pub pieces: Pieces,
+    /// The step-1 lattice's cells along x and z ([`GridInput::cells`]): its
+    /// samples are the first vertices, row by row. `[0, 0]` for a ground that
+    /// is no lattice ([`Self::single`]).
+    pub lattice: [u32; 2],
     /// `Levers::ground_lod_strict`: no node whole nearer than its own error
     /// allows, at any distance ([`Self::set_strict`]).
     strict: bool,
+    /// The error a coarser level may show, radians ([`TOLERANCE`] at the
+    /// build).
+    pub tolerance: f32,
     // The frame's answers, and what a node did last time it was asked.
     frame: u32,
     stamp: Vec<u32>,
@@ -477,6 +529,7 @@ impl GroundLod {
             error: 0.0,
             split_under: 0.0,
             holes: false,
+            held: false,
             sliver: false,
             whole: if triangles.is_empty() { NONE } else { 0 },
             core: NONE,
@@ -499,6 +552,13 @@ impl GroundLod {
     /// THE CHUNKS, THE TREE AND THE LISTS of one ground. Linear in its
     /// samples; once a level.
     pub fn build(input: &GridInput) -> Self {
+        Self::build_with(input, SLIVER_BORDERS.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// [`Self::build`], every node's border toward a coarser neighbour
+    /// closed by its slivers (`slivers`, [`SLIVER_BORDERS`]) or by stitched
+    /// strips.
+    pub fn build_with(input: &GridInput, slivers: bool) -> Self {
         let [cx, cz] = input.cells;
         let stride = cx + 1;
         let grid_vertices = stride * (cz + 1);
@@ -540,6 +600,7 @@ impl GroundLod {
                         error: 0.0,
                         split_under: 0.0,
                         holes: false,
+                        held: false,
                         sliver: false,
                         whole: NONE,
                         core: NONE,
@@ -549,7 +610,9 @@ impl GroundLod {
                 }
             }
         }
-        let mut lod = Self { grids, nodes, top_lod, cell, ..Self::default() };
+        let tolerance = f32::from_bits(TOLERANCE.load(std::sync::atomic::Ordering::Relaxed));
+        let tolerance = if tolerance.is_finite() && tolerance > 0.0 { tolerance } else { PIXEL_RAD };
+        let mut lod = Self { grids, nodes, top_lod, cell, lattice: input.cells, tolerance, ..Self::default() };
 
         // ---- Step 1: every drawn triangle to its chunk, in the mesher's
         // order within it. A lattice triangle by its cell; any other (a
@@ -668,7 +731,14 @@ impl GroundLod {
             let height = |v: u32| pos(v).y;
             for l in 0..=top_lod.min(top_tree) {
                 let step = 1u32 << l;
-                for n in by_morton(&lod, l) {
+                // A level's whole lists first, in Morton order, so a block of
+                // its nodes is one stretch of the buffer (`BLOCK_ORDER`);
+                // then its borders.
+                let mut wholes: Vec<Vec<u32>> = Vec::new();
+                // The level's slivers, laid after it side by side (below).
+                let mut pending: Vec<(usize, [Vec<u32>; SIDES])> = Vec::new();
+                for pass in 0..2 {
+                for (at, n) in by_morton(&lod, l).into_iter().enumerate() {
                     let lat = Lattice::new(lod.nodes[n].cells, step, stride);
                     let (nx, nz) = lat.quads();
                     // A coarse quad's own two triangles, by the shorter diagonal.
@@ -684,35 +754,37 @@ impl GroundLod {
                     let coarse_present = |i: usize, j: usize| {
                         (lat.zs[j]..lat.zs[j + 1]).any(|z| (lat.xs[i]..lat.xs[i + 1]).any(|x| cell_drawn[(z * cx + x) as usize] != 0))
                     };
-                    let whole: Vec<u32> = if l == 0 {
-                        Vec::new() // in the buffer already
-                    } else {
-                        let mut out = Vec::with_capacity(nx * nz * 6);
-                        for j in 0..nz {
-                            for i in 0..nx {
-                                if coarse_present(i, j) {
-                                    coarse_quad(i, j, &mut out);
+                    if pass == 0 {
+                        let whole: Vec<u32> = if l == 0 {
+                            Vec::new() // in the buffer already
+                        } else {
+                            let mut out = Vec::with_capacity(nx * nz * 6);
+                            for j in 0..nz {
+                                for i in 0..nx {
+                                    if coarse_present(i, j) {
+                                        coarse_quad(i, j, &mut out);
+                                    }
                                 }
                             }
+                            out
+                        };
+                        if l > 0 {
+                            lod.nodes[n].whole = push(&mut indices, &mut units, n, &whole);
+                            lod.nodes[n].error = Self::error_of(&lat, &pos, &live);
                         }
-                        out
-                    };
-                    if l > 0 {
-                        lod.nodes[n].whole = push(&mut indices, &mut units, n, &whole);
-                        lod.nodes[n].error = Self::error_of(&lat, &pos, &live);
+                        wholes.push(whole);
+                        continue;
                     }
+                    let whole = std::mem::take(&mut wholes[at]);
                     // The top level has no coarser neighbour: no strips.
                     if l == top_lod {
                         continue;
                     }
                     let ringless = nx < 2 || nz < 2;
-                    if ringless || (l == 0 && lod.nodes[n].holes) {
+                    if slivers || ringless || (l == 0 && lod.nodes[n].holes) {
                         lod.nodes[n].sliver = true;
                         let of: &[u32] = if l == 0 { &whole0[n] } else { &whole };
-                        let slivers = sliver_lists(&lat, of);
-                        for k in 0..SIDES {
-                            lod.nodes[n].stitch[k] = push(&mut indices, &mut units, n, &slivers[k]);
-                        }
+                        pending.push((n, sliver_lists(&lat, of)));
                         continue;
                     }
                     let lists = if l == 0 {
@@ -748,6 +820,25 @@ impl GroundLod {
                     }
                     for k in 0..SIDES {
                         lod.nodes[n].stitch[k] = push(&mut indices, &mut units, n, &lists.stitch[k]);
+                    }
+                }
+                }
+                // THE SLIVERS SIDE BY SIDE, each side's along the line its
+                // nodes stand on: a west or east side's by column (x, then
+                // z), a south or north side's by row -- so the stitched sides
+                // along one straight edge of a coarser region are one
+                // stretch of the buffer, and one draw (`BLOCK_ORDER`'s
+                // sliver runs are one bucket each).
+                for k in 0..SIDES {
+                    let mut order: Vec<usize> = (0..pending.len()).collect();
+                    order.sort_by_key(|&i| {
+                        let at = lod.nodes[pending[i].0].at;
+                        if k < 2 { (at[0], at[1]) } else { (at[1], at[0]) }
+                    });
+                    for i in order {
+                        let n = pending[i].0;
+                        let list = std::mem::take(&mut pending[i].1[k]);
+                        lod.nodes[n].stitch[k] = push(&mut indices, &mut units, n, &list);
                     }
                 }
             }
@@ -828,10 +919,10 @@ impl GroundLod {
             let l = node.level as usize;
             self.nodes[n].split_under = if l == 0 {
                 0.0
-            } else if l > self.top_lod {
+            } else if l > self.top_lod || node.held {
                 f32::INFINITY
             } else {
-                let by_error = (node.error / PIXEL_RAD).min(if self.strict { f32::INFINITY } else { FORCED[l] * scale });
+                let by_error = (node.error / self.tolerance.max(1e-6)).min(if self.strict { f32::INFINITY } else { FORCED[l] * scale });
                 (BAND_START[l] * scale).max(by_error).max(if node.holes { HOLE_FLOOR } else { 0.0 })
             };
         }
@@ -1029,6 +1120,21 @@ impl GroundLod {
     }
 }
 
+/// THE PIECES A BLOCK'S CHUNKS ARE DRAWN AS (`ground_twins::SlopeSplit`'s
+/// blocks, [`BLOCK_ORDER`]). Empty: none.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Pieces {
+    /// Per unit: where its pieces start in `runs` and how many -- 0 for a
+    /// unit that lies whole in its own range.
+    pub of: Vec<(u32, u8)>,
+    /// `[first, count, id, bucket]` of each piece: its index range, its place
+    /// in the slope split's tables (past the units'), and which of the
+    /// unit's nine buckets it is.
+    pub runs: Vec<[u32; 4]>,
+    /// Per unit: the first index of its block (`u32::MAX`: none).
+    pub block: Vec<u32>,
+}
+
 /// THE FRAME'S GROUND FOR THE PASSES: what [`GroundLod::select`] chose, as
 /// chunks in the player's frame, with each one's unit (its place in the
 /// slope split's tables and the horizon's bounds) and its box in the world.
@@ -1046,17 +1152,120 @@ pub struct FrameGround {
 
 impl GroundLod {
     /// [`Self::select`] and [`Self::posed`] in one: the call a frame makes.
-    /// `frusta` in the WORLD.
+    /// `frusta` in the WORLD. A unit the slope split laid in a block
+    /// ([`Self::pieces`]) comes as its pieces, each with its own place in the
+    /// split's tables and its unit's box; all of them by first index.
     pub fn frame(&mut self, head: Vec3, frusta: &[[Vec4; 6]], lod: bool, offset: Vec3, yaw: f32, index_start: u32) -> FrameGround {
         let chosen = self.select(head, frusta, lod);
-        FrameGround {
-            chunks: self.posed(&chosen.units, offset, yaw, index_start),
-            world: chosen.units.iter().map(|u| self.world_box(*u)).collect(),
-            units: chosen.units,
-            error_rad: chosen.error_rad,
-            visited: chosen.visited,
-            lod: chosen.lod,
+        let mut chunks = self.posed(&chosen.units, offset, yaw, index_start);
+        let mut world: Vec<(Vec3, Vec3)> = chosen.units.iter().map(|u| self.world_box(*u)).collect();
+        let mut units = chosen.units;
+        if !self.pieces.runs.is_empty() && units.iter().any(|u| self.pieces.of.get(*u as usize).is_some_and(|p| p.1 > 0)) {
+            // A block's chosen chunks, bucket by bucket and chunk by chunk
+            // within one: the order its pieces lie in, so by first index
+            // without a sort. Cost: the units chosen.
+            let mut out_c: Vec<CasterChunk> = Vec::with_capacity(units.len() * 2);
+            let mut out_u: Vec<u32> = Vec::with_capacity(units.len() * 2);
+            let mut out_w: Vec<(Vec3, Vec3)> = Vec::with_capacity(units.len() * 2);
+            let mut group: Vec<usize> = Vec::with_capacity(16);
+            let pieces = &self.pieces;
+            let mut flush = |group: &mut Vec<usize>, out_c: &mut Vec<CasterChunk>, out_u: &mut Vec<u32>, out_w: &mut Vec<(Vec3, Vec3)>| {
+                for slope in 0..9u32 {
+                    for &i in group.iter() {
+                        let (at, n) = pieces.of[units[i] as usize];
+                        for [first, count, id, s] in &pieces.runs[at as usize..at as usize + n as usize] {
+                            if *s == slope {
+                                out_c.push(CasterChunk { first_index: first + index_start, index_count: *count, ..chunks[i] });
+                                out_u.push(*id);
+                                out_w.push(world[i]);
+                            }
+                        }
+                    }
+                }
+                group.clear();
+            };
+            let mut block = u32::MAX;
+            for i in 0..units.len() {
+                let u = units[i] as usize;
+                let b = match pieces.of.get(u) {
+                    Some(&(_, n)) if n > 0 => pieces.block[u],
+                    _ => u32::MAX,
+                };
+                if b != block || b == u32::MAX {
+                    flush(&mut group, &mut out_c, &mut out_u, &mut out_w);
+                }
+                block = b;
+                if b == u32::MAX {
+                    out_c.push(chunks[i]);
+                    out_u.push(units[i]);
+                    out_w.push(world[i]);
+                } else {
+                    group.push(i);
+                }
+            }
+            flush(&mut group, &mut out_c, &mut out_u, &mut out_w);
+            debug_assert!(out_c.windows(2).all(|w| w[0].first_index < w[1].first_index));
+            (chunks, units, world) = (out_c, out_u, out_w);
         }
+        FrameGround { chunks, world, units, error_rad: chosen.error_rad, visited: chosen.visited, lod: chosen.lod }
+    }
+
+    /// Per unit, the block the slope split may lay it in with its
+    /// neighbours ([`BLOCK_CHUNKS`] a side of step-1 chunks, consecutive in
+    /// the buffer by the Morton order), `u32::MAX` for none: a coarser
+    /// list's run, or with [`BLOCK_ORDER`] off.
+    pub fn blocks(&self) -> Vec<u32> {
+        let on = BLOCK_ORDER.load(std::sync::atomic::Ordering::Relaxed) && !ROW_ORDER.load(std::sync::atomic::Ordering::Relaxed);
+        self.units
+            .iter()
+            .enumerate()
+            .map(|(id, u)| {
+                let node = &self.nodes[u.node as usize];
+                if on && node.sliver && node.stitch.contains(&(id as u32)) {
+                    return SLIVER_RUN;
+                }
+                // A level's whole lists by its own blocks (`level` in the top bits).
+                let whole = node.whole != NONE && self.units.get(node.whole as usize).is_some_and(|w| w.first == u.first);
+                if on && whole && self.nodes.len() > 1 {
+                    ((node.level as u32) << 28) | (morton(node.at[0], node.at[1]) / (BLOCK_CHUNKS * BLOCK_CHUNKS))
+                } else {
+                    u32::MAX
+                }
+            })
+            .collect()
+    }
+
+    /// THE CHUNKS HELD AT STEP 1, whatever their distance: `held(unit)` of
+    /// each step-1 chunk's unit. Every node over one is never drawn whole,
+    /// and the tree stays restricted round it. For the chunks the weather
+    /// draws: its twins light the ground by its own vertices
+    /// (`ground_shape::unshaped`), which only step 1 draws as the shape. A
+    /// cost that follows the weather's areas, not the level. Works the
+    /// distances out again only when the held chunks change.
+    pub fn hold(&mut self, held: &dyn Fn(u32) -> bool) {
+        let n0 = self.grids.first().map_or(0, |g| (g.nx * g.nz) as usize);
+        let mut now = vec![false; self.nodes.len()];
+        for k in 0..n0.min(self.nodes.len()) {
+            let w = self.nodes[k].whole;
+            now[k] = w != NONE && held(w);
+        }
+        for n in n0..self.nodes.len() {
+            now[n] = self.children(n).into_iter().flatten().any(|c| now[c]);
+        }
+        if now.iter().zip(&self.nodes).any(|(h, node)| *h != node.held) {
+            for (node, h) in self.nodes.iter_mut().zip(now) {
+                node.held = h;
+            }
+            if self.has_lists() {
+                self.split_distances();
+            }
+        }
+    }
+
+    /// The pieces the slope split laid this ground's units in
+    /// ([`Self::pieces`]): `None` takes them away.
+    pub fn set_pieces(&mut self, pieces: Option<Pieces>) {
+        self.pieces = pieces.unwrap_or_default();
     }
 }
 
@@ -1113,6 +1322,13 @@ pub(crate) mod tests {
             }
         }
         (positions, triangles)
+    }
+
+    /// [`built`] with stitched strips, not slivers ([`SLIVER_BORDERS`] off).
+    fn built_strips(cells: u32, chunk_cells: u32) -> (Vec<Vec3>, Vec<u32>, GroundLod) {
+        let (positions, triangles) = hills(cells);
+        let lod = GroundLod::build_with(&GridInput { cells: [cells, cells], positions: &positions, triangles: &triangles, open: None, chunk_cells, lists: true }, false);
+        (positions, triangles, lod)
     }
 
     fn built(cells: u32, chunk_cells: u32, lists: bool) -> (Vec<Vec3>, Vec<u32>, GroundLod) {
@@ -1288,7 +1504,23 @@ pub(crate) mod tests {
     /// EACH CHUNK'S TRIANGLES AT EACH LEVEL: 2,048 / 512 / 128 / 32 / 8.
     #[test]
     fn a_chunk_has_2048_512_128_32_and_8_triangles_at_the_five_steps() {
-        let (_, _, lod) = built(1024, CHUNK_CELLS, true);
+        // With slivers: every node's whole list, and its slivers -- a node
+        // beside a coarser one keeps its whole list; the buffer is about 1.4
+        // times step 1's indices.
+        let (_, _, slivered) = built(1024, CHUNK_CELLS, true);
+        for (l, per_chunk) in [(0usize, 2048u32), (1, 512), (2, 128), (3, 32), (4, 8)] {
+            let g = slivered.grids[l];
+            for n in g.first..g.first + g.nx * g.nz {
+                let node = &slivered.nodes[n as usize];
+                assert_eq!(slivered.units[node.whole as usize].count / 3, per_chunk << (2 * l));
+                assert!(node.sliver || l == MAX_LEVEL);
+                assert_eq!(node.core, NONE);
+            }
+        }
+        let ratio = slivered.indices.len() as f64 / slivered.level0_len() as f64;
+        eprintln!("the buffer with slivers: {ratio:.3} times step 1's indices");
+        assert!((1.3..1.5).contains(&ratio), "{ratio}");
+        let (_, _, lod) = built_strips(1024, CHUNK_CELLS);
         for (l, per_chunk) in [(0usize, 2048u32), (1, 512), (2, 128), (3, 32), (4, 8)] {
             let g = lod.grids[l];
             for n in g.first..g.first + g.nx * g.nz {
@@ -1318,7 +1550,7 @@ pub(crate) mod tests {
     /// so does it with any of the sixteen choices of stitched sides.
     #[test]
     fn a_nodes_core_and_strips_cover_it_exactly_with_any_sides_stitched() {
-        let (positions, _, lod) = built(256, 8, true);
+        let (positions, _, lod) = built_strips(256, 8);
         for l in 0..MAX_LEVEL {
             let g = lod.grids[l];
             let node = &lod.nodes[(g.first + g.nx + 1) as usize];
@@ -1359,7 +1591,7 @@ pub(crate) mod tests {
     /// stitch is for).
     #[test]
     fn every_border_of_every_level_pair_and_side_is_watertight() {
-        let (positions, _, lod) = built(256, 8, true);
+        let (positions, _, lod) = built_strips(256, 8);
         let stride = 257u32;
         let list = |u: u32| {
             let unit = lod.units[u as usize];
@@ -1704,6 +1936,28 @@ pub(crate) mod tests {
 
     /// The horizon's lift: nothing with the lever off, a pixel of the far
     /// corner's distance for a pixel of error.
+    /// A HELD CHUNK (the weather's, `GroundLod::hold`) is at step 1 from
+    /// anywhere, its neighbours differ from it by one level at most, and
+    /// letting it go gives the tree back as it was.
+    #[test]
+    fn a_held_chunk_is_at_step_1_from_anywhere() {
+        let (positions, triangles, mut lod) = built(1024, CHUNK_CELLS, true);
+        let free: Vec<f32> = lod.nodes.iter().map(|n| n.split_under).collect();
+        let held_unit = lod.nodes[5].whole;
+        lod.hold(&|u| u == held_unit);
+        assert!(lod.nodes.iter().filter(|n| n.held).count() >= 2);
+        for head in [Vec3::new(2000.0, 50.0, 2000.0), Vec3::new(-500.0, 10.0, 200.0), Vec3::new(200.0, 30.0, 220.0)] {
+            let chosen = lod.select(head, &[], true);
+            assert!(chosen.nodes.iter().any(|(n, _)| *n == 5), "from {head} the held chunk is drawn itself");
+            let idx = drawn(&lod, &chosen);
+            assert_watertight(&positions, 1024, &idx, "held");
+        }
+        lod.hold(&|_| false);
+        let back: Vec<f32> = lod.nodes.iter().map(|n| n.split_under).collect();
+        assert_eq!(back, free);
+        let _ = triangles;
+    }
+
     #[test]
     fn a_box_is_lifted_by_the_error_at_its_far_corner() {
         let (lo, hi) = (Vec3::new(90.0, 0.0, -5.0), Vec3::new(100.0, 4.0, 5.0));

@@ -644,6 +644,9 @@ pub struct XrRenderer {
     /// ground map's grid. Bound after it as layers of one array; see
     /// `TerrainImage::with_stationary_masks`.
     terrain_stationary: Vec<crate::renderer::terrain_pipeline::TerrainImage>,
+    /// The ground's step-1 shape its readers take the normal and face from
+    /// (`ground_shape`); `None`: by the vertices, as before.
+    terrain_shape: Option<crate::renderer::ground_shape::GroundShape>,
     /// World x/z bounds the occlusion map spans, needed to turn a world
     /// position back into a texel. Kept beside the image because one is
     /// meaningless without the other.
@@ -1873,6 +1876,7 @@ impl XrRenderer {
             terrain_splat: None,
             terrain_sky_occlusion: None,
             terrain_stationary: Vec::new(),
+            terrain_shape: None,
             terrain_footprint: None,
             ground_occluder: None,
             ground_horizon: std::cell::RefCell::new(None),
@@ -2970,6 +2974,20 @@ impl XrRenderer {
         );
         // (World vertices are their own world positions.)
         let (offset, yaw) = if self.ground_world { (glam::Vec3::ZERO, 0.0) } else { (self.player.offset, self.player.yaw) };
+        let (lattice, blocks) = match self.ground_lod.get_mut().as_ref().filter(|l| l.units.len() == terrain_chunks.len()) {
+            Some(l) => {
+                let mut blocks = l.blocks();
+                if let Some(w) = self.weather.as_ref() {
+                    for (b, u) in blocks.iter_mut().zip(&l.units) {
+                        if w.weathered(u.first) {
+                            *b = u32::MAX;
+                        }
+                    }
+                }
+                (Some(l.lattice), Some(blocks))
+            }
+            None => (None, None),
+        };
         let built = crate::renderer::ground_twins::SlopeSplit::ensure(
             &mut self.slope_split,
             terrain_verts,
@@ -2978,7 +2996,21 @@ impl XrRenderer {
             threshold,
             level_ground.key,
             &|corners| level_ground.class_of_posed(offset, yaw, corners),
+            // The lattice its coarser lists are classed by (`ground_shape`).
+            lattice,
+            // Its step-1 chunks laid block by block, bucket by bucket
+            // (`ground_lod::BLOCK_ORDER`) -- but a chunk the weather draws by
+            // its first index keeps its own range.
+            blocks.as_deref(),
         );
+        // The pieces a block's chunks are drawn as, for the frame's choice
+        // of chunks (`GroundLod::frame`): handed whenever the split is new
+        // or the tree came without them (a level loaded again).
+        if let (Some(split), Some(lod)) = (self.slope_split.as_ref(), self.ground_lod.get_mut().as_mut()) {
+            if built.is_some() || lod.pieces.runs.len() != split.piece_runs.len() {
+                lod.set_pieces(split.pieces());
+            }
+        }
         if let (Some(ms), Some(split)) = (built, self.slope_split.as_ref()) {
             log::info!(
                 "SLOPES: {:.1}% of the ground's triangles are gentle (under {:.0} degrees), {:.1}% steep (over {:.0}) over {} chunk(s); {:.1}% out of doors, {:.1}% nowhere to the reflection pass; {:.1} ms, {when}",
@@ -3045,6 +3077,7 @@ impl XrRenderer {
         use crate::renderer::weather;
         if texels.is_empty() {
             self.weather = None;
+            self.hold_weathered_ground();
             return;
         }
         let device = &self.wgpu_device;
@@ -3089,6 +3122,19 @@ impl XrRenderer {
             torch: None,
             seconds: 0.0,
         });
+        self.hold_weathered_ground();
+    }
+
+    /// THE CHUNKS THE WEATHER DRAWS STAY AT STEP 1 (`GroundLod::hold`): its
+    /// twins light the ground by its own vertices (`ground_shape::unshaped`).
+    /// Asked when the weather or the ground's tree is handed over, never in
+    /// a frame.
+    fn hold_weathered_ground(&mut self) {
+        if let Some(l) = self.ground_lod.get_mut().as_mut() {
+            let firsts: Vec<u32> = l.units.iter().map(|u| u.first).collect();
+            let w = self.weather.as_ref();
+            l.hold(&|u| w.is_some_and(|w| firsts.get(u as usize).is_some_and(|f| w.weathered(*f))));
+        }
     }
 
     /// This frame's weather: its clock, each area's numbers, and -- when the
@@ -3346,6 +3392,18 @@ impl XrRenderer {
         self.rebuild_terrain_material();
     }
 
+    /// THE GROUND'S STEP-1 SHAPE (`ground_shape`), for the level's ground as
+    /// the frames are handed it: its readers then light and texture every
+    /// step of `ground_lod` as step 1. `None` for a level without ground (or
+    /// one that is not a lattice): by the vertices.
+    pub fn set_ground_shape(&mut self, shape: Option<crate::renderer::ground_shape::GroundShape>) {
+        let shape = shape.filter(|_| crate::renderer::ground_shape::ENABLED.load(std::sync::atomic::Ordering::Relaxed));
+        if self.terrain_shape != shape {
+            self.terrain_shape = shape;
+            self.rebuild_terrain_material();
+        }
+    }
+
     /// THE GROUND'S CHUNKS AND THE TREE OVER THEM (`ground_lod`), for the
     /// ground the frames are handed: its runs are the frame's
     /// `terrain_chunks`, entry for entry. The frame then draws the chunks its
@@ -3365,6 +3423,7 @@ impl XrRenderer {
             );
         }
         *self.ground_lod.get_mut() = lod;
+        self.hold_weathered_ground();
     }
 
     /// THE DRAWN GROUND AS WHAT IT HIDES (`Levers::ground_horizon`): built by
@@ -3746,7 +3805,7 @@ impl XrRenderer {
             (g, _) => g,
         };
         self.terrain_material =
-            crate::renderer::terrain_pipeline::TerrainMaterial::from_layers_with(
+            crate::renderer::terrain_pipeline::TerrainMaterial::from_layers_with_shape(
                 &self.wgpu_device,
                 &self.wgpu_queue,
                 &self.terrain_pipeline.material_layout,
@@ -3757,6 +3816,7 @@ impl XrRenderer {
                 self.terrain_splat.as_ref(),
                 ground.as_ref(),
                 self.terrain_settings,
+                self.terrain_shape.as_ref(),
             );
     }
 
