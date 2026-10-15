@@ -71,6 +71,7 @@ pub mod probe_blur;
 pub mod probe_fixup;
 pub mod pool_cards;
 pub mod foveation;
+pub mod fps_hud;
 pub mod visibility_mask;
 pub mod ground_map;
 pub mod proxy_cards;
