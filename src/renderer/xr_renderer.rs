@@ -2325,6 +2325,18 @@ impl XrRenderer {
         self.ground_dirty = true;
     }
 
+    pub fn sea_line(&self) -> f32 {
+        let Some(g) = self.ground_heights.as_ref() else { return -1e9 };
+        self.water_bodies
+            .iter()
+            .filter(|b| {
+                let (lo, hi) = b.bounds;
+                lo.x < g.min.x || hi.x > g.max.x || lo.z < g.min.y || hi.z > g.max.y
+            })
+            .map(|b| b.uniform.extinction[3])
+            .fold(-1e9, f32::max)
+    }
+
     pub fn ensure_ground_map(&mut self) {
         if !self.ground_dirty {
             return;
@@ -2347,6 +2359,7 @@ impl XrRenderer {
                 layers: &self.terrain_layers,
                 splat: self.terrain_splat.as_ref(),
                 settings: &self.terrain_settings,
+                sea_line: self.sea_line(),
             },
             crate::renderer::ground_map::GROUND_MAP_SIZE,
         );
@@ -2516,6 +2529,7 @@ impl XrRenderer {
                 }
             })
             .collect();
+        self.ground_dirty = true;
         log::info!(
             "water: {} body/bodies installed, {} blending",
             self.water_bodies.len(),

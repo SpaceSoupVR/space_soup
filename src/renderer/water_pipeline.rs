@@ -702,6 +702,8 @@ const OPEN_PATH: f32 = 12.0;
 const WALK_FIRST: f32 = 0.6;
 const WALK_GROWTH: f32 = 1.55;
 const WALK_STEPS: i32 = 6;
+const LIP_BURIED: f32 = {lip_buried};
+const LIP_RAMP: f32 = {lip_ramp};
 
 const SHELF_SLOPE: f32 = 0.15;
 const FOAM_TILES: f32 = {foam_tiles};
@@ -910,25 +912,28 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         var gap = thickness;
         var met = false;
         var clears = 0.0;
+        var buried = 0.0;
         var step = WALK_FIRST;
         for (var i = 0; i < WALK_STEPS; i = i + 1) {{
             let t = flat * step;
             let at = p + down * t;
             let next_gap = at.y - bed_at(at).w;
-            if (met) {{
-                clears = max(clears, next_gap);
-            }}
             if (!met && next_gap <= 0.0) {{
                 met = true;
                 seen = walked + (t - walked) * gap / max(gap - next_gap, 1e-5);
             }}
+            if (met) {{
+                clears = max(clears, next_gap);
+            }}
+            buried = min(buried, next_gap);
             walked = t;
             gap = next_gap;
             step = step * WALK_GROWTH;
         }}
         let seen_uv = ground_uv(p + down * seen);
         let from_edge = min(min(seen_uv.x, 1.0 - seen_uv.x) / camera.ground_params.z, min(seen_uv.y, 1.0 - seen_uv.y) / camera.ground_params.w);
-        drawn = (1.0 - smoothstep(0.0, 0.5, clears)) * (1.0 - smoothstep(2.0, 4.0, seen / max(flat, 1e-4))) * smoothstep(3.0, 6.0, from_edge);
+        let lip = smoothstep(0.0, 0.5, clears) * saturate((LIP_BURIED + buried) * LIP_RAMP);
+        drawn = (1.0 - lip) * (1.0 - smoothstep(2.0, 4.0, seen / max(flat, 1e-4))) * smoothstep(3.0, 6.0, from_edge);
     }}
 
     let sky_down = sky_irradiance(vec3<f32>(0.0, 1.0, 0.0));
@@ -1002,6 +1007,8 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         light_path = format!("{LIGHT_PATH:?}"),
         foam_tiles = format!("{FOAM_TILES:?}"),
         bed_albedo = format!("{BED_ALBEDO:?}"),
+        lip_buried = format!("{:?}", spacesoup_graphics::ground::LIP_BURIED),
+        lip_ramp = format!("{:?}", spacesoup_graphics::ground::LIP_RAMP),
         ring_block = ring_block,
         ring_speed = format!("{RING_SPEED:?}"),
         deep_skip = 0.5f32 / 255.0,
@@ -1402,6 +1409,17 @@ mod tests {
             let end = without.find("@fragment fn fs_main").unwrap();
             assert_eq!(format!("{}{}", &without[..start], &without[end..]), plain);
         }
+    }
+
+    #[test]
+    fn the_water_lip_counts_only_where_the_line_grazed_the_ground() {
+        let src = water_wgsl(false);
+        assert!(src.contains("let lip = smoothstep(0.0, 0.5, clears) * saturate((LIP_BURIED + buried) * LIP_RAMP);"));
+        assert!(src.contains("buried = min(buried, next_gap);"));
+        assert!(src.contains(&format!("const LIP_BURIED: f32 = {:?};", spacesoup_graphics::ground::LIP_BURIED)));
+        assert!(src.contains(&format!("const LIP_RAMP: f32 = {:?};", spacesoup_graphics::ground::LIP_RAMP)));
+        assert!((spacesoup_graphics::ground::lip(1.0, -0.2) - 1.0).abs() < 1e-6);
+        assert_eq!(spacesoup_graphics::ground::lip(1.0, -1.0), 0.0);
     }
 
     #[test]
