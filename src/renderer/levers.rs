@@ -624,13 +624,15 @@ pub struct Levers {
     /// 16 samples over the same vertices), borders stitched to the coarser
     /// neighbour (`ground_lod`). The reflection, scene, motion and spot
     /// shadow passes draw the one choice. Does nothing unless the level's
-    /// load built the lists (`adb shell setprop debug.spacesoup.groundlod 1`
-    /// before the launch).
+    /// load built the lists (`ground_lod::LISTS`, on unless
+    /// `adb shell setprop debug.spacesoup.groundlod 0` before the launch).
     ///
-    /// OFF: built 2026-10-13 with NO HEADSET. Offline it is watertight and
-    /// near the step-1 picture (`docs/ground-lod-status-2026-10-13.md`);
-    /// ridge shimmer under MSAA, SpaceWarp on a chunk as its step changes,
-    /// shadows, the cave mouth and wet cliffs have to be looked at first.
+    /// ON since 2026-10-14, offline evidence only: with the ground's step-1
+    /// shape read from a texture (`ground_shape`) the coarser ground shades
+    /// as step 1 does, and at the bench views no difference is visible
+    /// (`docs/ground-lod-status-2026-10-14.md`). Still to be looked at on the
+    /// headset: ridge shimmer under MSAA, SpaceWarp on a chunk as its step
+    /// changes, shadows, the cave mouth and wet cliffs.
     pub ground_lod: bool,
     /// WITH `ground_lod`: no node of the ground drawn coarser than its own
     /// error allows at ANY distance (a pixel, `ground_lod::PIXEL_RAD`). Off,
@@ -816,7 +818,7 @@ impl Default for Levers {
             ground_buffers: true,
             brush_buffers: true,
             cave_chunk_cull: false,
-            ground_lod: false,
+            ground_lod: true,
             ground_lod_strict: true,
             size_reach: 229,
             probe_prepass: false,

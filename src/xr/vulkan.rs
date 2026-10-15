@@ -302,14 +302,37 @@ impl VkContext {
         if let Ok(n) = system_property(c"debug.spacesoup.chunks").parse::<u32>() {
             crate::renderer::ground_horizon::CHUNKS_A_SIDE.store(n.min(64), std::sync::atomic::Ordering::Relaxed);
         }
-        // `adb shell setprop debug.spacesoup.groundlod 1` before a launch: a
-        // level's load builds the ground's coarser lists (about 2.8 times the
-        // ground's indices), for `Levers::ground_lod` to draw by. Without it
-        // the index buffer is step 1's alone and the lever does nothing. See
-        // `ground_lod::LISTS`.
-        if system_property(c"debug.spacesoup.groundlod") == "1" {
-            crate::renderer::ground_lod::LISTS.store(true, std::sync::atomic::Ordering::Relaxed);
-            log::info!("GROUNDLOD: the ground's coarser lists are built at load (lever `ground_lod` draws by them)");
+        // `adb shell setprop debug.spacesoup.groundlod 0` before a launch: a
+        // level's load builds no coarser lists (they are about 1.4 times the
+        // ground's step-1 indices), so `Levers::ground_lod` has nothing to
+        // draw by and the ground is step 1 everywhere. Unset, the lists are
+        // built (the default since 2026-10-14). See `ground_lod::LISTS`.
+        // MEASUREMENT: `adb shell setprop debug.spacesoup.groundlodmrad 2.4`
+        // before a launch: the error a coarser ground may show, milliradians
+        // (1.2, a pixel, unset). See `ground_lod::TOLERANCE`.
+        if let Ok(mrad) = system_property(c"debug.spacesoup.groundlodmrad").parse::<f32>() {
+            if mrad > 0.0 {
+                crate::renderer::ground_lod::TOLERANCE.store((mrad * 1e-3).to_bits(), std::sync::atomic::Ordering::Relaxed);
+                log::info!("GROUNDLOD: a coarser ground may stand {mrad} mrad from step 1");
+            }
+        }
+        // `adb shell setprop debug.spacesoup.groundshape 0` before a launch:
+        // the ground shaded by its vertices, no step-1 shape bound (the A/B
+        // of the shape's cost). See `ground_shape::ENABLED`.
+        if system_property(c"debug.spacesoup.groundshape") == "0" {
+            crate::renderer::ground_shape::ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("GROUNDSHAPE: off -- the ground shaded by its vertices");
+        }
+        // `adb shell setprop debug.spacesoup.groundblocks 0` before a launch:
+        // each step-1 chunk of the ground its own runs, as until 2026-10-14,
+        // not a block's chunks bucket by bucket. See `ground_lod::BLOCK_ORDER`.
+        if system_property(c"debug.spacesoup.groundblocks") == "0" {
+            crate::renderer::ground_lod::BLOCK_ORDER.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("GROUNDBLOCKS: off -- each chunk its own runs");
+        }
+        if system_property(c"debug.spacesoup.groundlod") == "0" {
+            crate::renderer::ground_lod::LISTS.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("GROUNDLOD: off -- no coarser lists built; the ground is step 1 everywhere");
         }
         // MEASUREMENT: `adb shell setprop debug.spacesoup.opaque 0` builds the
         // scene's ground pipelines WITH blending, as they were until
