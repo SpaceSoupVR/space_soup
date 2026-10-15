@@ -564,7 +564,7 @@ impl XrRenderer {
             let views: Vec<[glam::Vec4; 6]> = eye_views
                 .iter()
                 .map(|ev| {
-                    let vp = Camera::gl_to_wgpu_ndc(Camera::xr_projection(ev.fov, 0.03, 1000.0)) * Camera::xr_view(ev.pose);
+                    let vp = Camera::gl_to_wgpu_ndc(Camera::xr_projection(ev.fov, crate::renderer::space_warp::NEAR_Z, crate::renderer::space_warp::FAR_Z)) * Camera::xr_view(ev.pose);
                     crate::renderer::shadow::frustum_planes(vp * world_to_player)
                 })
                 .collect();
@@ -1040,7 +1040,7 @@ impl XrRenderer {
                 .iter()
                 .map(|ev| {
                     let mut planes = crate::renderer::shadow::frustum_planes(
-                        Camera::gl_to_wgpu_ndc(Camera::xr_projection(ev.fov, 0.03, 1000.0)) * Camera::xr_view(ev.pose),
+                        Camera::gl_to_wgpu_ndc(Camera::xr_projection(ev.fov, crate::renderer::space_warp::NEAR_Z, crate::renderer::space_warp::FAR_Z)) * Camera::xr_view(ev.pose),
                     );
                     planes[5] = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
                     planes
@@ -1696,7 +1696,7 @@ impl XrRenderer {
             let eyes: Vec<(glam::Vec3, glam::Mat4)> = eye_views
                 .iter()
                 .map(|ev| {
-                    let vp = Camera::gl_to_wgpu_ndc(Camera::xr_projection(ev.fov, 0.03, 1000.0))
+                    let vp = Camera::gl_to_wgpu_ndc(Camera::xr_projection(ev.fov, crate::renderer::space_warp::NEAR_Z, crate::renderer::space_warp::FAR_Z))
                         * Camera::xr_view(ev.pose);
                     (glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z), vp * world_to_player)
                 })
@@ -1816,7 +1816,7 @@ impl XrRenderer {
         for eye in 0..2usize {
             let ev = &eye_views[eye];
             let view = Camera::xr_view(ev.pose);
-            let proj = Camera::xr_projection(ev.fov, 0.03, 1000.0);
+            let proj = Camera::xr_projection(ev.fov, crate::renderer::space_warp::NEAR_Z, crate::renderer::space_warp::FAR_Z);
 
             if let Some(m) = &mirror {
                 let reflect = mirror::reflection_matrix(m.position, m.normal());

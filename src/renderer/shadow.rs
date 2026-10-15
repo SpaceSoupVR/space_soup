@@ -1598,6 +1598,39 @@ impl ShadowMap {
         solid_chunks: &[CasterChunk],
         light_view_proj: Mat4,
     ) -> u32 {
+        self.record_full(encoder, kind, solid, None, brushes, mesh_draws, skinned_draws, solid_chunks, light_view_proj)
+    }
+
+    /// [`record`](Self::record) with the ground as a caster as well: a second
+    /// buffer in the solid vertex layout (the desktop's terrain is built as
+    /// `SolidVertex`), drawn whole after the cuboids.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_with_ground(
+        &self,
+        encoder: &mut CommandEncoder,
+        kind: ShadowKind,
+        solid: Option<(&Buffer, &Buffer, u32)>,
+        ground: Option<(&Buffer, &Buffer, u32)>,
+        mesh_draws: &[ShadowMeshDraw],
+        skinned_draws: &[ShadowSkinnedDraw],
+        light_view_proj: Mat4,
+    ) -> u32 {
+        self.record_full(encoder, kind, solid, ground, None, mesh_draws, skinned_draws, &[], light_view_proj)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_full(
+        &self,
+        encoder: &mut CommandEncoder,
+        kind: ShadowKind,
+        solid: Option<(&Buffer, &Buffer, u32)>,
+        ground: Option<(&Buffer, &Buffer, u32)>,
+        brushes: Option<(&Buffer, &Buffer, u32)>,
+        mesh_draws: &[ShadowMeshDraw],
+        skinned_draws: &[ShadowSkinnedDraw],
+        solid_chunks: &[CasterChunk],
+        light_view_proj: Mat4,
+    ) -> u32 {
         let slot = self.slot(kind);
         let planes = frustum_planes(light_view_proj);
         let mut drawn_indices = 0u32;
@@ -1670,6 +1703,17 @@ impl ShadowMap {
                             drawn_indices += c.index_count;
                         }
                     }
+                }
+            }
+
+            if let Some((vb, ib, count)) = ground {
+                if count > 0 {
+                    pass.set_pipeline(&self.solid_pipeline);
+                    pass.set_bind_group(0, &slot.light_bind_group, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..count, 0, 0..1);
+                    drawn_indices += count;
                 }
             }
 

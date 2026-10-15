@@ -357,9 +357,13 @@ impl Sky {
 
         // `sky_lighting`, with the sun-free panorama kept for reflections: one
         // extraction, so the two cannot disagree about where the sun was.
-        let (irradiance, sun, without_sun) = match space_soup_sky::extract_sun(pano, rotation_deg, intensity) {
+        // From a copy no wider than 1 K: the lighting is low-frequency and
+        // projects the same from it, and a 4 K sky for the eye would
+        // otherwise cost sixteen times the work here at every scene load.
+        let light_pano = pano.for_lighting(1024);
+        let (irradiance, sun, without_sun) = match space_soup_sky::extract_sun(&light_pano, rotation_deg, intensity) {
             Some((sun, rest)) => (project_irradiance(&rest, rotation_deg, intensity), Some(sun), rest),
-            None => (project_irradiance(pano, rotation_deg, intensity), None, pano.clone()),
+            None => (project_irradiance(&light_pano, rotation_deg, intensity), None, light_pano.clone()),
         };
         let extra = SkyExtra::default();
         let extra_buffer = device.create_buffer(&BufferDescriptor {

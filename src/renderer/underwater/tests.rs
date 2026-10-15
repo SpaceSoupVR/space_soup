@@ -3,6 +3,7 @@ use crate::renderer::lights::LightsUniform;
 use crate::renderer::uniforms::test_support::scene_uniforms;
 use crate::renderer::uniforms::{PlayerUpload, PostUpload, ShadowUpload, SkyUpload};
 use crate::renderer::water_pipeline::WaterOptics;
+use crate::renderer::water_waves::WaveParams;
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 

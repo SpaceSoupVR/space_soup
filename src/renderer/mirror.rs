@@ -191,7 +191,7 @@ impl MirrorPipeline {
                 resource: buffer.as_entire_binding(),
             }],
         });
-        ModelUniform { buffer, bind_group }
+        ModelUniform { buffer, bind_group, last_plain: std::sync::Mutex::new(None) }
     }
 
     pub fn create_reflected_vp_uniform(&self, device: &Device) -> ModelUniform {
@@ -213,7 +213,7 @@ impl MirrorPipeline {
                 resource: buffer.as_entire_binding(),
             }],
         });
-        ModelUniform { buffer, bind_group }
+        ModelUniform { buffer, bind_group, last_plain: std::sync::Mutex::new(None) }
     }
 
     pub fn create_target(&self, device: &Device, format: TextureFormat, width: u32, height: u32) -> MirrorTarget {

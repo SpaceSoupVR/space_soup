@@ -69,6 +69,19 @@ pub struct Renderer {
     /// Caller-built line geometry drawn with the wire pipeline every frame
     /// (an editor's grids and guides), on top of the cuboids' own edges.
     raw_wire: (Vec<WireVertex>, Vec<u32>),
+    /// The sky's light by facing, when the caller has one (a graphics
+    /// profile's daylight); `None` is the flat ambient every scene always had.
+    pub sky: Option<uniforms::SkyUpload>,
+    /// How radiance becomes pixels: exposure and tone curve.
+    pub post: uniforms::PostUpload,
+    /// The photographed sky behind the level, when the caller set one
+    /// (`set_sky_panorama`): drawn where nothing nearer was, after every
+    /// opaque draw, through the same tone curve as the geometry.
+    sky_pipeline: super::sky::SkyPipeline,
+    sky_dome: Option<super::sky::Sky>,
+    /// Whether the panorama draws this frame -- hidden on the editor's
+    /// isolated stages, like the terrain.
+    pub sky_visible: bool,
 }
 
 impl Renderer {
@@ -96,6 +109,7 @@ impl Renderer {
         let mesh_pipeline = mesh_pipeline::MeshPipeline::new(&device, format, &uniform_buf.layout);
         let skinned_mesh_pipeline =
             mesh_pipeline::SkinnedMeshPipeline::new(&device, format, &uniform_buf.layout);
+        let sky_pipeline = super::sky::SkyPipeline::new(&device, format, &uniform_buf.layout, 1);
         let (depth_texture, depth_view) = Self::make_depth(&device, width, height);
         let white_pixel = [255u8, 255, 255, 255];
         let default_cuboid_lightmap =
@@ -136,7 +150,35 @@ impl Renderer {
             mesh_lightmaps: HashMap::new(),
             default_mesh_lightmap,
             raw_wire: (Vec::new(), Vec::new()),
+            sky: None,
+            post: uniforms::PostUpload::default(),
+            sky_pipeline,
+            sky_dome: None,
+            sky_visible: true,
         }
+    }
+
+    /// Show a photographed sky behind the level, turned by `rotation_deg`
+    /// and scaled by `intensity`, and hand back the light it gives: the
+    /// ambient harmonics WITHOUT its sun, and the sun on its own as one
+    /// directional light (see `sky::Sky::sun`). The caller puts the ambient
+    /// in `self.sky` and the sun among the frame's lights, so the shadows
+    /// fall away from the sun that is visible in the picture. `None` takes
+    /// the sky down.
+    pub fn set_sky_panorama(
+        &mut self,
+        pano: Option<&super::sky::Panorama>,
+        rotation_deg: f32,
+        intensity: f32,
+    ) -> Option<(super::sky::SkyIrradiance, Option<super::sky::SkySun>)> {
+        self.sky_dome = pano.map(|p| {
+            super::sky::Sky::new(&self.device, &self.queue, &self.sky_pipeline.layout, p, rotation_deg, intensity)
+        });
+        self.sky_dome.as_ref().map(|s| (s.irradiance, s.sun))
+    }
+
+    pub fn has_sky_panorama(&self) -> bool {
+        self.sky_dome.is_some()
     }
 
     /// Replace the line geometry drawn each frame (`indices` pair up into
@@ -239,6 +281,22 @@ impl Renderer {
         t.index_count = indices.len() as u32;
     }
 
+    /// Replace just the terrain's index buffer: the editor's level of detail
+    /// draws the same vertex grid with fewer triangles far from the camera,
+    /// so only the indices change as the camera moves. No-op without terrain.
+    pub fn update_terrain_indices(&mut self, indices: &[u32]) {
+        let Some(t) = self.terrain.as_mut() else { return };
+        if indices.is_empty() {
+            return;
+        }
+        t.ib = self.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("terrain_ib"),
+            contents: bytemuck::cast_slice(indices),
+            usage: BufferUsages::INDEX,
+        });
+        t.index_count = indices.len() as u32;
+    }
+
     pub fn set_cuboid_lightmap(&mut self, key: &str, rgba: &[u8], width: u32, height: u32) {
         let tex = create_lightmap_texture(&self.device, &self.queue, &self.solid_pipeline.lightmap_layout, rgba, width, height, None);
         self.cuboid_lightmaps.insert(key.to_string(), tex);
@@ -291,6 +349,12 @@ impl Renderer {
             width_m,
             height_m,
         )
+    }
+
+    /// This frame's depth, as drawn: a post pass reads it for its contact
+    /// shadow. Remade on every `resize`, so take it after one, not before.
+    pub fn depth_view(&self) -> &TextureView {
+        &self.depth_view
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -480,8 +544,10 @@ impl Renderer {
             sun_dynamic_view_proj: glam::Mat4::IDENTITY,
             sun_dynamic_enabled: false,
         };
-        self.uniform_buf
-            .upload(&self.queue, vp, camera.position, &shadow);
+        let sky = self.sky.clone().unwrap_or_else(uniforms::SkyUpload::none);
+        self.uniform_buf.upload_scene(
+            &self.queue, vp, camera.position, &shadow, &sky, &self.post, &uniforms::PlayerUpload::default(),
+        );
 
         let ((solid_verts, solid_indices, solid_ranges), (mut wire_verts, mut wire_indices)) =
             self.bake_cuboids(cuboids);
@@ -569,6 +635,15 @@ impl Renderer {
                     .and_then(|k| self.mesh_lightmaps.get(k))
                     .map(|t| &t.bind_group)
                     .unwrap_or(&self.default_mesh_lightmap.bind_group);
+                // A caster outside the sun's box cannot land a shadow in
+                // it: a wood of a thousand trees put every one through the
+                // depth pass for the few dozen near the camera. The box is
+                // `sun_shadow_radius` about `focus`; the mesh's own bounding
+                // radius keeps a big crown at the edge in.
+                let model = instance.mesh.model_matrix();
+                let centre = model.transform_point3(glam::Vec3::ZERO);
+                let scale = model.x_axis.length().max(model.y_axis.length()).max(model.z_axis.length());
+                let casts = (centre - focus).length() <= self.sun_shadow_radius * 1.5 + instance.mesh.bounding_radius * scale;
                 for prim in &instance.mesh.primitives {
                     draws.push((
                         &prim.vertex_buffer,
@@ -581,12 +656,14 @@ impl Renderer {
                     // The ordinary vertex buffer, even for a layered mesh: the
                     // depth pass reads position and nothing else, so a baked
                     // cave casts through this path with no pipeline of its own.
-                    shadow_draws.push((
-                        &prim.vertex_buffer,
-                        &prim.index_buffer,
-                        prim.indices.len() as u32,
-                        &instance.model.bind_group,
-                    ));
+                    if casts {
+                        shadow_draws.push((
+                            &prim.vertex_buffer,
+                            &prim.index_buffer,
+                            prim.indices.len() as u32,
+                            &instance.model.bind_group,
+                        ));
+                    }
                 }
             }
         }
@@ -614,20 +691,25 @@ impl Renderer {
         // second submit would only add a synchronisation point.
         let solid_caster = (!solid_indices.is_empty())
             .then_some((&solid_vb, &solid_ib, solid_indices.len() as u32));
+        // THE GROUND CASTS TOO: a rise shadows the dip behind it, which is
+        // most of what makes rolling ground read as rolling. Whole, not
+        // chunked -- correct, just not culled.
+        let ground_caster = self
+            .terrain
+            .as_ref()
+            .filter(|_| self.terrain_visible)
+            .map(|t| (&t.vb, &t.ib, t.index_count));
         if shadow.sun_enabled {
             self.shadow_map
                 .upload_light(&self.queue, ShadowKind::Sun, shadow.sun_view_proj);
             self.shadow_map
-                .record(
+                .record_with_ground(
                     &mut encoder,
                     ShadowKind::Sun,
                     solid_caster,
-                    None,
+                    ground_caster,
                     &shadow_draws,
                     &skinned_shadow_draws,
-                    // The desktop preview does not chunk its terrain, so it
-                    // draws whole. Correct, just not culled.
-                    &[],
                     shadow.sun_view_proj,
                 );
         }
@@ -745,6 +827,17 @@ impl Renderer {
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(0..*count, 0, 0..1);
                 }
+            }
+
+            // THE SKY, after every opaque draw: at the far plane with a
+            // less-or-equal depth test, so it fills only where nothing was
+            // drawn. The panorama is scaled by `sky_params.x`, the
+            // intensity the caller put in `self.sky`.
+            if let Some(sky) = self.sky_dome.as_ref().filter(|_| self.sky_visible) {
+                pass.set_pipeline(&self.sky_pipeline.pipeline);
+                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                pass.set_bind_group(1, &sky.bind_group, &[]);
+                pass.draw(0..3, 0..1);
             }
 
             // Last, so it reads on top of everything above (see
