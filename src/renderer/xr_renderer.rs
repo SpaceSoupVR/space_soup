@@ -17,6 +17,7 @@ use crate::renderer::{
 use crate::xr::{VkContext, XrContext};
 use std::collections::HashMap;
 
+mod fps_layer;
 mod ground_build;
 mod render_frame;
 mod time_of_day;
@@ -882,6 +883,9 @@ pub struct XrRenderer {
     recommendation_window: crate::renderer::dynamic_resolution::RecommendationWindow,
     /// Those counters summed over the window's measured frames.
     perf_metric_window: crate::perf_metrics_log::WindowMeans,
+    /// THE FRAME-RATE READOUT's layer while it is on (Y in play). See
+    /// `fps_hud`.
+    fps_layer: Option<fps_layer::FpsLayer>,
     /// Where each window is also written, one JSON line apiece: the host
     /// script's copy, which no ring buffer can drop. See `perf_record`.
     perf_log: Option<crate::perf_record::PerfLog>,
@@ -1986,6 +1990,7 @@ impl XrRenderer {
             ),
             recommendation_window: Default::default(),
             perf_metric_window: Default::default(),
+            fps_layer: None,
             perf_log: None,
             started_at: std::time::Instant::now(),
             pinned_head: None,
@@ -2855,6 +2860,49 @@ impl XrRenderer {
     /// `layer_settings::sharpening_for`.
     pub fn space_warp_running(&self) -> bool {
         self.space_warp.is_some() && self.levers.space_warp
+    }
+
+    /// THE FRAME-RATE READOUT on or off: a small panel the compositor draws
+    /// in front of the view (`fps_hud`). Its swapchain exists only while on.
+    pub fn set_fps_hud(&mut self, session: &xr::Session<xr::Vulkan>, on: bool) {
+        if !on {
+            self.fps_layer = None;
+            return;
+        }
+        if self.fps_layer.is_none() {
+            match fps_layer::FpsLayer::new(session, &self.wgpu_device) {
+                Ok(layer) => self.fps_layer = Some(layer),
+                Err(e) => log::warn!("fps readout: no layer ({e})"),
+            }
+        }
+    }
+
+    pub fn fps_hud_on(&self) -> bool {
+        self.fps_layer.is_some()
+    }
+
+    /// Once a frame after it is drawn, while the readout is on: counts the
+    /// frame, and twice a second redraws the panel with the runtime's GPU and
+    /// CPU times (`app/gpu_frametime`, `app/cpu_frametime`). `display_hz` is
+    /// the display's rate; the target is half of it under SpaceWarp.
+    pub fn fps_hud_frame(&mut self, display_hz: f64) {
+        if self.fps_layer.is_none() {
+            return;
+        }
+        let samples = self.perf_metrics.as_ref().map(|m| m.sample()).unwrap_or_default();
+        let counter = |name: &str| samples.iter().find(|s| s.short == name).map(|s| s.value);
+        let target = if self.space_warp_running() { display_hz / 2.0 } else { display_hz };
+        let (gpu, cpu) = (counter("app/gpu_frametime"), counter("app/cpu_frametime"));
+        let Some(layer) = self.fps_layer.as_mut() else { return };
+        if let Err(e) = layer.frame(&self.wgpu_device, &self.wgpu_queue, gpu, cpu, target) {
+            log::warn!("fps readout: update failed ({e}); off");
+            self.fps_layer = None;
+        }
+    }
+
+    /// The readout's layer to submit after the eyes', in the head's space.
+    pub fn fps_hud_layer<'a>(&'a self, view_space: &'a xr::Space) -> Option<xr::CompositionLayerQuad<'a, xr::Vulkan>> {
+        self.fps_layer.as_ref()?.layer(view_space)
     }
 
     /// DYNAMIC RESOLUTION, first step: ask the runtime its size for the eyes'
