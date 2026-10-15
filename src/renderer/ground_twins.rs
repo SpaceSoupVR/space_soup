@@ -1243,6 +1243,50 @@ mod tests {
         let (before, after) = (scene_draws(&plain, &mut lod), scene_draws(&split, &mut lod));
         eprintln!("scene draws for {} chunks: {before} chunk by chunk, {after} block by block", chunks.len());
         assert!(after * 2 < before, "{after} against {before}");
+
+        // THE PASSES THAT DRAW THE GROUND WHOLE (`ground_lod::Wholes`): a
+        // block the frame chose whole is one range, the triangles each drawn
+        // once; seen in part, the units seen and nothing else.
+        lod.set_pieces(split.pieces());
+        let f = lod.frame(glam::Vec3::new(0.0, 30.0, 0.0), &[], false, glam::Vec3::ZERO, 0.0, 0);
+        let drawn = |runs: &[(u32, u32)]| {
+            tri_set(&runs.iter().flat_map(|(first, n)| split.indices[*first as usize..(*first + *n) as usize].iter().copied()).collect::<Vec<u32>>())
+        };
+        let all = f.wholes.runs(&f.chunks, |_| true);
+        assert_eq!(all.len(), 1, "every chunk chosen: one range, {all:?}");
+        assert_eq!(drawn(&all), tri_set(&plain.indices), "every triangle once");
+        // The full block's units, as the frame's chunks.
+        let (mut p, mut m) = (0usize, 0usize);
+        let mut full: Option<(std::ops::Range<usize>, Vec<u32>)> = None;
+        for g in &f.wholes.groups {
+            if g[3] as usize - m == 16 {
+                full = Some((p..g[2] as usize, f.wholes.members[m..g[3] as usize].to_vec()));
+            }
+            (p, m) = (g[2] as usize, g[3] as usize);
+        }
+        let (pieces, members) = full.expect("a block of 16 chunks");
+        // A unit's triangles: its pieces (every piece carries its unit's box).
+        let own = |k: usize| -> Vec<[u32; 3]> {
+            drawn(&pieces.clone().filter(|q| f.chunks[*q].min == f.chunks[k].min).map(|q| (f.chunks[q].first_index, f.chunks[q].index_count)).collect::<Vec<_>>())
+        };
+        // One unit seen: its pieces alone.
+        let one = members[5] as usize;
+        let seen_one = |k: usize| pieces.contains(&k) && f.chunks[k].min == f.chunks[one].min;
+        let runs = f.wholes.runs(&f.chunks, seen_one);
+        assert_eq!(drawn(&runs), own(one), "one unit seen: its triangles");
+        // All but one seen: the block's range, one draw.
+        let skip = f.chunks[members[3] as usize].min;
+        let runs = f.wholes.runs(&f.chunks, |k| pieces.contains(&k) && f.chunks[k].min != skip);
+        assert_eq!(runs.len(), 1, "15 of 16 seen: the block's range");
+        // Half seen (every other unit, as a ridge cuts it): never more draws
+        // than the pieces made.
+        let half = |k: usize| pieces.contains(&k) && members.iter().position(|first| f.chunks[*first as usize].min == f.chunks[k].min).is_some_and(|j| j % 2 == 0);
+        let (new, old) = (f.wholes.runs(&f.chunks, half).len(), merged(f.chunks.iter().enumerate().filter(|(k, _)| half(*k)).map(|(_, c)| (c.first_index, c.index_count))).len());
+        assert!(new <= old, "{new} against {old}");
+        // No blocks: the chunks, as before.
+        lod.set_pieces(plain.pieces());
+        let f = lod.frame(glam::Vec3::new(0.0, 30.0, 0.0), &[], false, glam::Vec3::ZERO, 0.0, 0);
+        assert_eq!(f.wholes.runs(&f.chunks, |_| true), merged(f.chunks.iter().map(|c| (c.first_index, c.index_count))));
     }
 
     /// With ground classes: each chunk keeps its own triangles, its slope
