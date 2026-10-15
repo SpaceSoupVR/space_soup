@@ -1632,6 +1632,8 @@ impl XrRenderer {
         };
         // Whether the tree chose them (else: every chunk the frame was handed).
         let ground_selected = ground_frame.is_some();
+        // The same ground for the motion pass, which draws it whole: a block chosen whole is one range (`ground_lod::Wholes`).
+        let ground_wholes: crate::renderer::ground_lod::Wholes = ground_frame.as_ref().map(|f| f.wholes.clone()).unwrap_or_default();
         // Per chunk drawn: its place in the slope split's tables (and the
         // horizon's bounds), which were made over EVERY run of the buffer.
         let (solid_chunks, ground_units, ground_boxes, ground_error): (Vec<crate::renderer::shadow::CasterChunk>, Vec<u32>, Vec<(glam::Vec3, glam::Vec3)>, f32) =
@@ -4525,10 +4527,9 @@ impl XrRenderer {
                             // The ground's chunks from the world's slot
                             // where they are world vertices.
                             let slot = if self.ground_world { base + warp_per_eye - 1 } else { base };
-                            // (Chunks that touch in the buffer as one draw.)
-                            let seen = crate::renderer::ground_lod::merged(
-                                solid_chunks.iter().filter(|c| terrain_chunk_visible(c)).map(|c| (c.first_index, c.index_count)),
-                            );
+                            // (Chunks that touch in the buffer as one draw;
+                            // a block seen whole as its range: `Wholes::runs`.)
+                            let seen = ground_wholes.runs(&solid_chunks, |k| terrain_chunk_visible(&solid_chunks[k]));
                             for (first, count) in seen {
                                 draws.push(MotionDraw { slot, ..solid(first, count) });
                             }

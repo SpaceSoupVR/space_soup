@@ -225,6 +225,11 @@ pub struct GroundLod {
     /// THE SLOPE SPLIT'S PIECES (`ground_twins::SlopeSplit`, blocks): a
     /// unit laid in a block is drawn as its pieces ([`Self::frame`]).
     pub pieces: Pieces,
+    /// Per block of [`Self::pieces`], by its first index: `(first, count,
+    /// units)` -- its whole range and how many units lie in it. What lets a
+    /// pass that draws the ground whole draw a block as one range
+    /// ([`Wholes`]). Made by [`Self::set_pieces`].
+    block_spans: Vec<(u32, u32, u32)>,
     /// The step-1 lattice's cells along x and z ([`GridInput::cells`]): its
     /// samples are the first vertices, row by row. `[0, 0]` for a ground that
     /// is no lattice ([`Self::single`]).
@@ -1148,6 +1153,62 @@ pub struct FrameGround {
     pub error_rad: f32,
     pub visited: u32,
     pub lod: bool,
+    /// The same ground for the passes that draw it WHOLE (the SpaceWarp
+    /// motion pass, the sun's and the spots' shadows): see [`Wholes`].
+    pub wholes: Wholes,
+}
+
+/// THE GROUND FOR A PASS THAT DRAWS IT WHOLE: no reader a bucket, so a block
+/// whose every unit the frame chose is ONE range, wherever its pieces lie.
+///
+/// Laid bucket by bucket (`BLOCK_ORDER`), a chunk is up to nine pieces, and a
+/// pass that drew the frame's chunks by their pieces drew a block the frustum
+/// or the horizon cut as nine draws a run of its chunks: stress_2049's
+/// hilltop motion pass 131 draws before the blocks, 964 with them and the
+/// lever on (2026-10-14). [`Self::runs`] draws a chosen block as its range
+/// when the pass sees at least three quarters of its units (the rest the GPU
+/// clips, or the depth test drops behind the ridge that hid them) and as the
+/// pieces of the units it sees otherwise. A block only some of whose units
+/// were chosen (the rest at another step) is always its pieces: its range
+/// would draw the same ground twice.
+#[derive(Clone, Debug, Default)]
+pub struct Wholes {
+    /// Per group (a block's chosen units, or a unit in no block):
+    /// `[first, count, pieces_end, members_end]` -- its range drawn as one
+    /// (`count` 0: it may not be), and where its pieces in the frame's
+    /// `chunks` and its units in `members` end (each group starts where the
+    /// one before ended).
+    pub groups: Vec<[u32; 4]>,
+    /// Per unit chosen: the index in the frame's `chunks` of its first
+    /// piece, whose box (every piece of a unit has the unit's) a pass culls.
+    pub members: Vec<u32>,
+}
+
+impl Wholes {
+    /// THE RUNS A WHOLE-GROUND PASS DRAWS: `visible(k)` of the frame's chunk
+    /// `k` (in the pass's frustum, not behind the horizon), the runs that
+    /// touch in the buffer joined. Cost: the units chosen.
+    pub fn runs(&self, chunks: &[crate::renderer::shadow::CasterChunk], visible: impl Fn(usize) -> bool) -> Vec<(u32, u32)> {
+        if self.groups.is_empty() {
+            // No groups made (a frame not from `GroundLod::frame`): every chunk.
+            return merged(chunks.iter().enumerate().filter(|(k, _)| visible(*k)).map(|(_, c)| (c.first_index, c.index_count)));
+        }
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        let (mut p, mut m) = (0usize, 0usize);
+        for &[first, count, p_end, m_end] in &self.groups {
+            let members = &self.members[m..m_end as usize];
+            let seen = members.iter().filter(|k| visible(**k as usize)).count();
+            if seen > 0 {
+                if count > 0 && seen * 4 >= members.len() * 3 {
+                    out.push((first, count));
+                } else {
+                    out.extend((p..p_end as usize).filter(|k| visible(*k)).map(|k| (chunks[k].first_index, chunks[k].index_count)));
+                }
+            }
+            (p, m) = (p_end as usize, m_end as usize);
+        }
+        merged(out.into_iter())
+    }
 }
 
 impl GroundLod {
@@ -1160,6 +1221,7 @@ impl GroundLod {
         let mut chunks = self.posed(&chosen.units, offset, yaw, index_start);
         let mut world: Vec<(Vec3, Vec3)> = chosen.units.iter().map(|u| self.world_box(*u)).collect();
         let mut units = chosen.units;
+        let mut wholes = Wholes::default();
         if !self.pieces.runs.is_empty() && units.iter().any(|u| self.pieces.of.get(*u as usize).is_some_and(|p| p.1 > 0)) {
             // A block's chosen chunks, bucket by bucket and chunk by chunk
             // within one: the order its pieces lie in, so by first index
@@ -1169,12 +1231,22 @@ impl GroundLod {
             let mut out_w: Vec<(Vec3, Vec3)> = Vec::with_capacity(units.len() * 2);
             let mut group: Vec<usize> = Vec::with_capacity(16);
             let pieces = &self.pieces;
-            let mut flush = |group: &mut Vec<usize>, out_c: &mut Vec<CasterChunk>, out_u: &mut Vec<u32>, out_w: &mut Vec<(Vec3, Vec3)>| {
+            let spans = &self.block_spans;
+            let mut first_piece: Vec<u32> = Vec::with_capacity(16);
+            let mut flush = |group: &mut Vec<usize>, out_c: &mut Vec<CasterChunk>, out_u: &mut Vec<u32>, out_w: &mut Vec<(Vec3, Vec3)>, wholes: &mut Wholes| {
+                if group.is_empty() {
+                    return;
+                }
+                first_piece.clear();
+                first_piece.resize(group.len(), u32::MAX);
                 for slope in 0..9u32 {
-                    for &i in group.iter() {
+                    for (j, &i) in group.iter().enumerate() {
                         let (at, n) = pieces.of[units[i] as usize];
                         for [first, count, id, s] in &pieces.runs[at as usize..at as usize + n as usize] {
                             if *s == slope {
+                                if first_piece[j] == u32::MAX {
+                                    first_piece[j] = out_c.len() as u32;
+                                }
                                 out_c.push(CasterChunk { first_index: first + index_start, index_count: *count, ..chunks[i] });
                                 out_u.push(*id);
                                 out_w.push(world[i]);
@@ -1182,6 +1254,16 @@ impl GroundLod {
                         }
                     }
                 }
+                // The block's range, when the frame chose every unit in it.
+                let block = pieces.block[units[group[0]] as usize];
+                let whole = spans
+                    .binary_search_by_key(&block, |s| s.0)
+                    .ok()
+                    .map(|k| spans[k])
+                    .filter(|s| s.2 as usize == group.len())
+                    .map_or((0, 0), |s| (s.0 + index_start, s.1));
+                wholes.members.extend_from_slice(&first_piece);
+                wholes.groups.push([whole.0, whole.1, out_c.len() as u32, wholes.members.len() as u32]);
                 group.clear();
             };
             let mut block = u32::MAX;
@@ -1192,22 +1274,29 @@ impl GroundLod {
                     _ => u32::MAX,
                 };
                 if b != block || b == u32::MAX {
-                    flush(&mut group, &mut out_c, &mut out_u, &mut out_w);
+                    flush(&mut group, &mut out_c, &mut out_u, &mut out_w, &mut wholes);
                 }
                 block = b;
                 if b == u32::MAX {
+                    wholes.members.push(out_c.len() as u32);
                     out_c.push(chunks[i]);
                     out_u.push(units[i]);
                     out_w.push(world[i]);
+                    wholes.groups.push([chunks[i].first_index, chunks[i].index_count, out_c.len() as u32, wholes.members.len() as u32]);
                 } else {
                     group.push(i);
                 }
             }
-            flush(&mut group, &mut out_c, &mut out_u, &mut out_w);
+            flush(&mut group, &mut out_c, &mut out_u, &mut out_w, &mut wholes);
             debug_assert!(out_c.windows(2).all(|w| w[0].first_index < w[1].first_index));
             (chunks, units, world) = (out_c, out_u, out_w);
+        } else {
+            for (k, c) in chunks.iter().enumerate() {
+                wholes.members.push(k as u32);
+                wholes.groups.push([c.first_index, c.index_count, k as u32 + 1, k as u32 + 1]);
+            }
         }
-        FrameGround { chunks, world, units, error_rad: chosen.error_rad, visited: chosen.visited, lod: chosen.lod }
+        FrameGround { chunks, world, units, error_rad: chosen.error_rad, visited: chosen.visited, lod: chosen.lod, wholes }
     }
 
     /// Per unit, the block the slope split may lay it in with its
@@ -1266,6 +1355,23 @@ impl GroundLod {
     /// ([`Self::pieces`]): `None` takes them away.
     pub fn set_pieces(&mut self, pieces: Option<Pieces>) {
         self.pieces = pieces.unwrap_or_default();
+        // Each block's range and units: its units' ranges (laying moved the
+        // triangles, not the block's extent). Cost: the units.
+        let mut spans: Vec<(u32, u32, u32)> = Vec::new();
+        for (u, (_, n)) in self.pieces.of.iter().enumerate() {
+            let (Some(&b), Some(unit)) = (self.pieces.block.get(u), self.units.get(u)) else { continue };
+            if *n == 0 || b == u32::MAX {
+                continue;
+            }
+            match spans.binary_search_by_key(&b, |s| s.0) {
+                Ok(k) => {
+                    spans[k].1 += unit.count;
+                    spans[k].2 += 1;
+                }
+                Err(k) => spans.insert(k, (b, unit.count, 1)),
+            }
+        }
+        self.block_spans = spans;
     }
 }
 
