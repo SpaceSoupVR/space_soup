@@ -3189,7 +3189,10 @@ impl XrRenderer {
     /// The surfaces the live lamps' beams light this frame, for reflections to
     /// show their light. See `lights::LitSurface`.
     pub fn set_lit_surfaces(&self, surfaces: &[crate::renderer::lights::LitSurface]) {
-        self.lights_uniform.set_lit_surfaces(surfaces);
+        // `Levers::pool_bounds` off: every plane unbounded, as before.
+        let unbounded: Vec<crate::renderer::lights::LitSurface> =
+            surfaces.iter().map(|s| crate::renderer::lights::LitSurface { far: 0.0, ..*s }).collect();
+        self.lights_uniform.set_lit_surfaces(if self.levers.pool_bounds { surfaces } else { &unbounded });
     }
 
     /// The live lamps' pools as the eye's meter takes them, in the WORLD. See
