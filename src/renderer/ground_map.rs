@@ -3,6 +3,7 @@ use wgpu::{Device, Queue, TextureView};
 
 use crate::renderer::sky::{SkyIrradiance, SkySun};
 use crate::renderer::terrain_pipeline::{TerrainImage, TerrainMaterialUniform, FALLBACK_LAYER_COLOURS};
+use spacesoup_graphics::ground;
 
 pub const GROUND_MAP_SIZE: u32 = 1024;
 
@@ -66,6 +67,7 @@ pub struct GroundInputs<'a> {
     pub layers: &'a [Option<TerrainImage>],
     pub splat: Option<&'a TerrainImage>,
     pub settings: &'a TerrainMaterialUniform,
+    pub sea_line: f32,
 }
 
 pub struct GroundMap {
@@ -178,8 +180,17 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
         .map(|i| layer_mean(inputs.layers.get(i).and_then(|l| l.as_ref()), FALLBACK_LAYER_COLOURS[i]))
         .collect();
     let sun = inputs.sun.map(|s| (Vec3::from(s.direction).normalize_or_zero(), Vec3::from(s.light_rgb)));
+    let texel = (extent.x / size as f32).max(extent.y / size as f32);
+    let open_light = {
+        let mut open = Vec3::from(inputs.sky.evaluate([0.0, 1.0, 0.0]));
+        if let Some((to_sun, rgb)) = sun {
+            open += rgb * to_sun.y.max(0.0);
+        }
+        open
+    };
     let mut texels = Vec::with_capacity((size * size) as usize);
     let mut buried = Vec::with_capacity((size * size) as usize);
+    let mut rims: Vec<ground::Rim> = Vec::new();
     let mut top = f32::MIN;
     for j in 0..size {
         for i in 0..size {
@@ -201,11 +212,20 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
                 light += rgb * n.dot(to_sun).max(0.0) * sun_vis;
             }
             let rgb = albedo * light * (1.0 - F0);
+            let from_edge = ground::from_edge([uv.x, uv.y], [extent.x, extent.y]);
+            let rim = ground::rim_weight(from_edge, texel, inputs.sea_line, y);
+            if rim > 0.0 {
+                let level = layer_weights(inputs.settings, inputs.splat, uv, y, 0.0);
+                let mean: Vec3 = (0..4).map(|k| means[k] * level[k]).sum();
+                let mean = mean * (1.0 - 0.45 * (1.0 - smoothstep(s.wet_line, s.wet_line + s.wet_band, y)));
+                rims.push(ground::Rim { texel: texels.len(), weight: rim, level: mean * open_light * (1.0 - F0) });
+            }
             top = top.max(y);
             texels.push([rgb.x, rgb.y, rgb.z, y]);
         }
     }
     fill_under_buildings(&mut texels, &mut buried, size as usize, size as usize);
+    ground::one_shelf(&mut texels, &rims);
     GroundMap { width: size, height: size, texels, min: g.min, max: g.max, top }
 }
 
@@ -614,7 +634,7 @@ mod tests {
         assert!((g.at(5.0, 5.0) - 1.5).abs() < 1e-5);
         let s = TerrainMaterialUniform::default();
         let map = build(
-            &GroundInputs { heights: &g, sky: &sky(), sun: None, sky_occlusion: None, layers: &[], splat: None, settings: &s },
+            &GroundInputs { heights: &g, sky: &sky(), sun: None, sky_occlusion: None, layers: &[], splat: None, settings: &s, sea_line: -1e9 },
             8,
         );
         let t = map.texels[(3 * 8 + 5) as usize];
@@ -639,7 +659,7 @@ mod tests {
             rgba: vec![255, 255, 0, 0, 255, 0, 0, 0],
         };
         let map = build(
-            &GroundInputs { heights: &g, sky: &sky(), sun: Some(&sun), sky_occlusion: Some(&occ), layers: &layers, splat: None, settings: &s },
+            &GroundInputs { heights: &g, sky: &sky(), sun: Some(&sun), sky_occlusion: Some(&occ), layers: &layers, splat: None, settings: &s, sea_line: -1e9 },
             8,
         );
         let albedo = srgb_to_linear(128);
@@ -663,7 +683,7 @@ mod tests {
             rgba: vec![255, 255, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         };
         let map = build(
-            &GroundInputs { heights: &g, sky: &sky(), sun: None, sky_occlusion: Some(&occ), layers: &layers, splat: None, settings: &s },
+            &GroundInputs { heights: &g, sky: &sky(), sun: None, sky_occlusion: Some(&occ), layers: &layers, splat: None, settings: &s, sea_line: -1e9 },
             8,
         );
         let open = map.texels[0][0];
@@ -798,7 +818,7 @@ mod tests {
             Some(TerrainImage { width: 1, height: 1, rgba: vec![255, 0, 0, 255] }),
         ];
         let map = build(
-            &GroundInputs { heights: &g, sky: &sky(), sun: None, sky_occlusion: None, layers: &layers, splat: None, settings: &s },
+            &GroundInputs { heights: &g, sky: &sky(), sun: None, sky_occlusion: None, layers: &layers, splat: None, settings: &s, sea_line: -1e9 },
             10,
         );
         let plain = map.texels[5 * 10 + 1];
@@ -821,7 +841,7 @@ mod tests {
 
         let splat = TerrainImage { width: 2, height: 2, rgba: [0u8, 0, 0, 255].repeat(4) };
         let map = build(
-            &GroundInputs { heights: &g, sky: &sky(), sun: None, sky_occlusion: None, layers: &layers, splat: Some(&splat), settings: &s },
+            &GroundInputs { heights: &g, sky: &sky(), sun: None, sky_occlusion: None, layers: &layers, splat: Some(&splat), settings: &s, sea_line: -1e9 },
             10,
         );
         let t = map.texels[5 * 10 + 5];
@@ -882,5 +902,57 @@ mod step_census {
         for (el, (n, s, m, h)) in buckets {
             eprintln!("elev {el:>4}..{:>3}: rays {n:>5}  mean steps {:>5.1}  max {m:>3}  hit {:>3.0}%", el + 5, s as f32 / n as f32, 100.0 * h as f32 / n as f32);
         }
+    }
+
+    #[test]
+    fn the_sea_floor_at_the_maps_edge_is_one_colour_along_it() {
+        let g = HeightGrid::sample(Vec2::new(-10.0, -10.0), Vec2::new(10.0, 10.0), 81, 81, |x, _| -10.0 + 0.6 * (x * 1.7).sin());
+        let sun = SkySun { direction: [0.6, 0.8, 0.0], light_rgb: [4.0, 4.0, 4.0], texels: 1, energy_fraction: 0.5 };
+        let checker: Vec<u8> = (0..16).flat_map(|i| if (i % 4 + i / 4) % 2 == 0 { [40, 40, 40, 255] } else { [220, 220, 220, 255] }).collect();
+        let layers = [Some(TerrainImage { width: 4, height: 4, rgba: checker }), Some(TerrainImage { width: 1, height: 1, rgba: vec![60, 50, 30, 255] })];
+        let splat = TerrainImage {
+            width: 4,
+            height: 4,
+            rgba: (0..16).flat_map(|i| if i == 1 { [0u8, 255, 0, 0] } else { [255u8, 0, 0, 0] }).collect(),
+        };
+        let occ_w = 16;
+        let occ = TerrainImage {
+            width: occ_w,
+            height: 1,
+            rgba: (0..occ_w).flat_map(|i| if i % 2 == 0 { [255u8, 255, 0, 0] } else { [255, 0, 0, 0] }).collect(),
+        };
+        let size = 64u32;
+        let mut sky = SkyIrradiance::default();
+        sky.sh[0] = [3.5449077; 3];
+        let built = |sea_line: f32| {
+            let mut s = TerrainMaterialUniform::default();
+            s.repeat = [1.5; 4];
+            build(
+                &GroundInputs { heights: &g, sky: &sky, sun: Some(&sun), sky_occlusion: Some(&occ), layers: &layers, splat: Some(&splat), settings: &s, sea_line },
+                size,
+            )
+        };
+        let spread = |map: &GroundMap, row: u32| {
+            let r: Vec<f32> = (0..size).map(|i| map.texels[(row * size + i) as usize][0]).collect();
+            let (lo, hi) = r.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            (hi - lo) / hi.max(1e-6)
+        };
+        let sea = built(-1.4);
+        let dry = built(-1e9);
+        assert!(spread(&sea, 0) < 1e-4, "the near edge's row varies by {:.3} of its brightest", spread(&sea, 0));
+        assert!(spread(&sea, size - 1) < 1e-4, "the far edge's row varies by {:.3}", spread(&sea, size - 1));
+        let side: Vec<f32> = (0..size).map(|j| sea.texels[(j * size) as usize][0]).collect();
+        let (lo, hi) = side.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        assert!(hi - lo < 1e-4 * hi, "a side edge varies by {:.3}", (hi - lo) / hi);
+        let far = sea.texels[(size * size - 1) as usize][0];
+        assert!((side[0] - sea.texels[0][0]).abs() < 1e-6 && (far - side[0]).abs() < 1e-4 * hi, "the edges differ: {} {far}", side[0]);
+        let mid = size / 2;
+        let inner_spread = {
+            let r: Vec<f32> = (size / 4..size - size / 4).map(|i| sea.texels[(mid * size + i) as usize][0]).collect();
+            let (lo, hi) = r.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            (hi - lo) / hi
+        };
+        assert!(inner_spread > 0.3, "the floor's own shadows inside the rim: {inner_spread:.3}");
+        assert!(spread(&dry, 0) > 0.3, "a dry rim is left as it is: {:.3}", spread(&dry, 0));
     }
 }

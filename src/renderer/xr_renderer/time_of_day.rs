@@ -275,6 +275,7 @@ impl XrRenderer {
         let layers: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>> = self.terrain_layers.iter().map(|l| l.as_ref().map(copy)).collect();
         let splat = self.terrain_splat.as_ref().map(copy);
         let settings = self.terrain_settings;
+        let sea_line = self.sea_line();
         let (tx, rx) = mpsc::channel();
         self.tod.ground_from = Some((daylight, dir));
         self.tod.ground_build = Some(rx);
@@ -290,6 +291,7 @@ impl XrRenderer {
                         layers: &layers,
                         splat: splat.as_ref(),
                         settings: &settings,
+                        sea_line,
                     },
                     crate::renderer::ground_map::GROUND_MAP_SIZE,
                 );
