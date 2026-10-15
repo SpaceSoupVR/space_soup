@@ -15,7 +15,7 @@ pub(crate) fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Ve
             normal: [0.0, 0.0, 1.0],
             uv: [0.0, 1.0],
             uv2: [0.0, 1.0],
-            // A UI panel does not glow.
+
             emissive: MeshVertex::NO_EMISSIVE,
             uv2_rect: MeshVertex::WHOLE_ATLAS,
         },
@@ -24,7 +24,7 @@ pub(crate) fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Ve
             normal: [0.0, 0.0, 1.0],
             uv: [1.0, 1.0],
             uv2: [1.0, 1.0],
-            // A UI panel does not glow.
+
             emissive: MeshVertex::NO_EMISSIVE,
             uv2_rect: MeshVertex::WHOLE_ATLAS,
         },
@@ -33,7 +33,7 @@ pub(crate) fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Ve
             normal: [0.0, 0.0, 1.0],
             uv: [1.0, 0.0],
             uv2: [1.0, 0.0],
-            // A UI panel does not glow.
+
             emissive: MeshVertex::NO_EMISSIVE,
             uv2_rect: MeshVertex::WHOLE_ATLAS,
         },
@@ -42,7 +42,7 @@ pub(crate) fn quad_geometry(width_m: f32, height_m: f32) -> (Vec<MeshVertex>, Ve
             normal: [0.0, 0.0, 1.0],
             uv: [0.0, 0.0],
             uv2: [0.0, 0.0],
-            // A UI panel does not glow.
+
             emissive: MeshVertex::NO_EMISSIVE,
             uv2_rect: MeshVertex::WHOLE_ATLAS,
         },
@@ -234,4 +234,3 @@ impl WorldPanel {
         queue.submit(Some(encoder.finish()));
     }
 }
-

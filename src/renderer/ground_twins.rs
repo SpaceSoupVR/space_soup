@@ -1,53 +1,19 @@
-//! THE GROUND'S SLOPE TWINS: the ground's scene readers without the steep
-//! ground's code, drawn for the triangles no steep pixel can come from.
-//!
-//! WHY. The cliff texturing of 2026-10-08 -- the side planes' warp and bands,
-//! the colour's and the normal's second scale, the minor plane's normal near a
-//! 45-degree turn -- took every ground reader from 18-20 registers to 27
-//! (occupancy 62% -> 37%) and the full one to 3,665 instructions, past the
-//! Quest's instruction cache (wall #20), in every view of the ground, flat or
-//! not: outdoors_field drew in 21.7 ms against 13.2 on 10-06. All of it runs
-//! only where `slope_deg >= mat.biplanar_start_deg`. PIPESTATS of the readers
-//! with that test made false (`ground_cuts` `gentle`): 18 registers, 62%,
-//! 2,719 instructions for the outdoor one (build of 2026-10-08 10:44).
-//!
-//! THE SAME PICTURE. A pixel's slope is that of its interpolated normal, and
-//! the normalised blend of a triangle's vertex normals with positive weights
-//! lies in the cone they span: no steeper than its steepest vertex. So a
-//! triangle whose every vertex is gentler than the threshold, by a margin for
-//! the centre of an MSAA edge pixel just outside it, draws no steep pixel, and
-//! the twin -- the reader with that test false -- draws it as the reader does.
-//!
-//! HOW. Each terrain chunk's triangles are reordered once, its gentle ones
-//! first ([`SlopeSplit`]); the chunk keeps its range, so every other pass and
-//! test (shadows, culling, the weather's chunks) is unchanged, and the scene
-//! pass draws each chunk in two ranges, the gentle one with the twin.
-
 use crate::renderer::cuboid::SolidVertex;
 use crate::renderer::shadow::CasterChunk;
 use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainPipeline, TerrainRole};
 use wgpu::{BindGroupLayout, Device, TextureFormat};
 
-/// The ground shader's two steep tests, as `terrain_shader`'s `sample_frame`
-/// writes them, and the twin's.
 pub(crate) const GENTLE_EDITS: &[(&str, &str)] = &[
     ("    f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);\n", "    f.biplanar  = 0.0;\n"),
     ("    let steep = slope_deg >= mat.biplanar_start_deg;\n", "    let steep = false;\n"),
 ];
 
-/// Degrees under the threshold every vertex of a twin's triangle must be: room
-/// for the centre of an MSAA edge pixel, just outside the triangle, where its
-/// normal is extrapolated.
 pub const GENTLE_MARGIN_DEG: f32 = 5.0;
 
-/// `src` (any ground shader, any twin) without its steep code, or `None` when
-/// its steep tests are not there once each.
 pub fn gentle_shader(src: &str) -> Option<String> {
     crate::renderer::ground_cuts::with_cut(src, GENTLE_EDITS)
 }
 
-/// Whether a triangle with these vertex normals can draw no steep pixel under
-/// a `threshold_deg` slope (`TerrainMaterialUniform::biplanar_start_deg`).
 pub fn triangle_is_gentle(normals: [[f32; 3]; 3], threshold_deg: f32) -> bool {
     let limit = threshold_deg - GENTLE_MARGIN_DEG;
     if limit <= 0.0 {
@@ -60,25 +26,15 @@ pub fn triangle_is_gentle(normals: [[f32; 3]; 3], threshold_deg: f32) -> bool {
     })
 }
 
-/// The ground shader's two steep tests made true: the twin for triangles
-/// every pixel of which is steep (`ground_cuts` `steep`: 24 registers, 50%,
-/// against the reader's 27, 37%).
 pub(crate) const STEEP_EDITS: &[(&str, &str)] = &[
     ("    f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);\n", "    f.biplanar  = 1.0;\n"),
     ("    let steep = slope_deg >= mat.biplanar_start_deg;\n", "    let steep = true;\n"),
 ];
 
-/// `src` with only the steep ground's code, or `None` when its steep tests
-/// are not there once each.
 pub fn steep_shader(src: &str) -> Option<String> {
     crate::renderer::ground_cuts::with_cut(src, STEEP_EDITS)
 }
 
-/// Whether a triangle with these vertex normals can draw no gentle pixel.
-/// Not its gentlest vertex's slope: two steep normals leaning opposite ways
-/// blend to a level one. Every normal of the triangle (a blend of its
-/// vertices') lies within the cap round their mean as wide as the farthest of
-/// them, so its slope is at least the mean's less that width.
 pub fn triangle_is_steep(normals: [[f32; 3]; 3], threshold_deg: f32) -> bool {
     let unit = |n: [f32; 3]| {
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
@@ -96,28 +52,22 @@ pub fn triangle_is_steep(normals: [[f32; 3]; 3], threshold_deg: f32) -> bool {
     spread < 60.0 && slope - spread >= threshold_deg + GENTLE_MARGIN_DEG
 }
 
-/// THE TERRAIN'S INDICES WITH EACH CHUNK'S GENTLE TRIANGLES FIRST, and how
-/// many of each chunk's indices they are. Built once per terrain and
-/// threshold; `key` tells a new terrain from the one it was built for.
 pub struct SlopeSplit {
     key: (usize, usize, usize, usize, u32, u64),
-    /// The terrain's index buffer, reordered within each chunk.
+
     pub indices: Vec<u32>,
-    /// Per chunk, as handed: how many of its indices, from its first, are
-    /// gentle triangles'.
+
     pub gentle: Vec<u32>,
-    /// Gentle indices of all.
+
     pub gentle_total: u64,
-    /// Per chunk: how many of its indices, up to its last, are steep
-    /// triangles' (`triangle_is_steep`); the rest, between, are mixed.
+
     pub steep: Vec<u32>,
     pub steep_total: u64,
 }
 
 impl SlopeSplit {
     fn key_of(verts: &[SolidVertex], idx: &[u32], chunks: &[CasterChunk], threshold_deg: f32) -> (usize, usize, usize, usize, u32, u64) {
-        // A sample of the data as well as where it lies: a terrain loaded
-        // again can land at the same address.
+
         let mut h: u64 = 1469598103934665603;
         let mut mix = |v: u64| {
             h ^= v;
@@ -139,13 +89,10 @@ impl SlopeSplit {
         (verts.as_ptr() as usize, verts.len(), idx.as_ptr() as usize, idx.len(), threshold_deg.to_bits(), h)
     }
 
-    /// Whether this split is the one for this terrain.
     pub fn is_for(&self, verts: &[SolidVertex], idx: &[u32], chunks: &[CasterChunk], threshold_deg: f32) -> bool {
         self.key == Self::key_of(verts, idx, chunks, threshold_deg)
     }
 
-    /// `idx` with each chunk's gentle triangles first. No chunks: the whole
-    /// terrain as one.
     pub fn new(verts: &[SolidVertex], idx: &[u32], chunks: &[CasterChunk], threshold_deg: f32) -> Self {
         let whole = [CasterChunk { first_index: 0, index_count: idx.len() as u32, min: glam::Vec3::ZERO, max: glam::Vec3::ZERO }];
         let ranges: &[CasterChunk] = if chunks.is_empty() { &whole } else { chunks };
@@ -187,11 +134,6 @@ impl SlopeSplit {
     }
 }
 
-/// The ground's gentle scene readers, in the weather twins' order `[full,
-/// spotless, baked, baked_spotless]` (`XrRenderer::terrain_twin`), from the
-/// shaders the shipped ones are built from; `weathered` the weather's twin of
-/// each, with its group 2 and its kinds (`weather::with_weather_kinds`).
-/// `None` when the ground's steep tests are not there to take out.
 #[allow(clippy::too_many_arguments)]
 pub fn gentle_readers(
     device: &Device,
@@ -229,8 +171,6 @@ pub fn gentle_readers(
     built.try_into().ok()
 }
 
-/// The ground's steep-only scene readers, `[full, spotless, baked,
-/// baked_spotless]`, dry: for the triangles no gentle pixel comes from.
 pub fn steep_readers(
     device: &Device,
     format: TextureFormat,
@@ -263,12 +203,6 @@ pub fn steep_readers(
     built.try_into().ok()
 }
 
-/// THE GROUND'S PROBE PASS WITH ITS REPEATED CODE WRITTEN ONCE
-/// (`brush_pipeline::DEDUP_EDITS`: the same calls in the same order, the same
-/// picture to the byte), as `[pass, poolless]`, with the weather's twin of
-/// each when `weather` is its group 2. PIPESTATS 2026-10-08 10:59: the shipped
-/// pass 9,225 instructions, 26 registers, 37% occupancy; this 8,558, 23, 50%.
-/// `None` when the edits no longer match.
 pub fn dedup_passes(
     device: &Device,
     uniform_layout: &BindGroupLayout,
@@ -300,7 +234,6 @@ pub fn dedup_passes(
     built.try_into().ok()
 }
 
-/// The ground's probe pass `src` with [`crate::renderer::brush_pipeline::DEDUP_EDITS`].
 pub fn dedup_pass_shader(src: &str) -> Option<String> {
     crate::renderer::ground_cuts::with_cut(src, crate::renderer::brush_pipeline::DEDUP_EDITS)
 }
@@ -358,9 +291,9 @@ mod tests {
             [s * az.to_radians().cos(), c, s * az.to_radians().sin()]
         };
         assert!(triangle_is_steep([tilt(60.0, 0.0), tilt(62.0, 5.0), tilt(58.0, -5.0)], 18.0));
-        // Leaning opposite ways: their middle is level.
+
         assert!(!triangle_is_steep([tilt(40.0, 0.0), tilt(40.0, 180.0), tilt(40.0, 0.0)], 18.0));
-        // Within the margin over the threshold: mixed.
+
         assert!(!triangle_is_steep([tilt(22.0, 0.0), tilt(22.0, 0.0), tilt(22.0, 0.0)], 18.0));
         assert!(triangle_is_steep([tilt(24.0, 0.0), tilt(24.0, 0.0), tilt(24.0, 0.0)], 18.0));
     }
@@ -370,7 +303,7 @@ mod tests {
         let flat = [0.0, 1.0, 0.0];
         let steep = [0.7, 0.7, 0.0];
         let verts = vec![vertex(flat), vertex(flat), vertex(flat), vertex(steep), vertex(flat), vertex(flat)];
-        // Chunk 0: steep, flat. Chunk 1: flat, steep, flat.
+
         let idx = vec![3, 4, 5, 0, 1, 2, 0, 1, 2, 3, 4, 5, 1, 2, 0];
         let chunk = |first, count| CasterChunk { first_index: first, index_count: count, min: glam::Vec3::ZERO, max: glam::Vec3::ZERO };
         let chunks = [chunk(0, 6), chunk(6, 9)];

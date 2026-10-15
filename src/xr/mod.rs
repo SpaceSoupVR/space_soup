@@ -15,4 +15,3 @@ pub use perf_metrics::PerfMetrics;
 pub use perf_settings::PerfSettings;
 pub use recommended_resolution::RecommendedResolution;
 pub use vulkan::VkContext;
-

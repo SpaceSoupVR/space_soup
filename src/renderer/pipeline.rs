@@ -23,14 +23,7 @@ pub fn lightmap_bind_group_layout(device: &Device) -> BindGroupLayout {
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
-            // The bounce DIRECTION map, sharing the lightmap's layout texel for
-            // texel. Declared for every lightmap consumer, not only brushes:
-            // wgpu deduplicates structurally identical bind group layouts, and
-            // this renderer has already been bitten once by two layouts that
-            // looked interchangeable and quietly stopped being so -- the avatar
-            // stopped casting shadows and nothing errored. One layout, one
-            // shape, and shaders that do not want the map simply never sample
-            // it.
+
             BindGroupLayoutEntry {
                 binding: 2,
                 visibility: ShaderStages::FRAGMENT,
@@ -41,9 +34,7 @@ pub fn lightmap_bind_group_layout(device: &Device) -> BindGroupLayout {
                 },
                 count: None,
             },
-            // The brush SUN MASK and its sampler, on every lightmap for the
-            // same one-layout reason as the direction map above. Only the brush
-            // shader samples them; see `create_lightmap_texture_with_sun`.
+
             BindGroupLayoutEntry {
                 binding: 3,
                 visibility: ShaderStages::FRAGMENT,
@@ -60,11 +51,7 @@ pub fn lightmap_bind_group_layout(device: &Device) -> BindGroupLayout {
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
-            // The STATIONARY LAMPS' baked shadows: one RGBA layer per four
-            // lamps, a signed distance per channel, on the brush charts at
-            // `STATIONARY_MASK_SCALE` times the lightmap's density. Declared on
-            // every lightmap for the one-layout reason above; only the brush
-            // shader samples it, through the sun mask's sampler.
+
             BindGroupLayoutEntry {
                 binding: 5,
                 visibility: ShaderStages::FRAGMENT,
@@ -95,13 +82,6 @@ impl SolidPipeline {
         )
     }
 
-    /// Same pipeline, built for a multisampled target.
-    ///
-    /// A pipeline's sample count must equal that of the pass it runs in, and
-    /// wgpu will not let you mix them -- so a pipeline used in both the eye pass
-    /// and an offscreen 1x pass has to exist twice. `new` is the 1x form and
-    /// stays the default, which keeps every existing call site honest about
-    /// what it is drawing into.
     pub fn new_multisampled(
         device: &Device,
         format: TextureFormat,
@@ -114,7 +94,6 @@ impl SolidPipeline {
         )
     }
 
-    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
     pub fn new_multisampled_stereo(
         device: &Device,
         format: TextureFormat,
@@ -134,8 +113,6 @@ impl SolidPipeline {
         )
     }
 
-    /// Editor variant: no back-face culling, so a camera inside a cuboid
-    /// still sees its interior (SSStudio's scene editor).
     pub fn new_double_sided(
         device: &Device,
         format: TextureFormat,
@@ -144,8 +121,6 @@ impl SolidPipeline {
         Self::new_variant(device, format, uniform_layout, None, true)
     }
 
-    /// Highlight variant: no culling and no depth test, drawn last so a
-    /// selection/skeleton overlay reads through real geometry.
     pub fn new_overlay(
         device: &Device,
         format: TextureFormat,
@@ -275,16 +250,13 @@ impl SolidPipeline {
         }
     }
 
-    /// The reflective variant, drawn in the final 1x eye pass -- it SAMPLES the
-    /// scene texture, so it cannot run in the pass that produces it.
     pub fn new_ssr(
         device: &Device,
         format: TextureFormat,
         uniform_layout: &BindGroupLayout,
         ssr_camera_layout: &BindGroupLayout,
         ssr_scene_layout: &BindGroupLayout,
-        // Must match the scene target's depth sample count -- see
-        // `ssr::SsrPipelines::new_with_depth_samples`.
+
     ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("solid_ssr_shader"),
@@ -345,7 +317,6 @@ impl WirePipeline {
         Self::new_multisampled(device, format, uniform_layout, 1)
     }
 
-    /// See `SolidPipeline::new_multisampled`.
     pub fn new_multisampled(
 
         device: &Device,
@@ -356,7 +327,6 @@ impl WirePipeline {
         Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Mono)
     }
 
-    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
     pub fn new_multisampled_stereo(
 
         device: &Device,
@@ -426,10 +396,6 @@ impl WirePipeline {
 fn solid_shader() -> String {
     format!(
         r#"
-// Group 0 -- the camera, the lights and both shadow maps -- is declared by
-// `wgsl_lights_block` below, so there is one description of that layout rather
-// than one per shader.
-
 @group(1) @binding(0) var lm_tex: texture_2d<f32>;
 @group(1) @binding(1) var lm_samp: sampler;
 
@@ -456,7 +422,7 @@ struct VOut {{
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
-    // The baked lamps are in this lightmap. See `receiver_skips_baked`.
+
     receiver_skips_baked = true;
     let lit = shade(in.world_pos, n);
     let lightmap = textureSample(lm_tex, lm_samp, in.uv2).rgb;
@@ -470,10 +436,6 @@ struct VOut {{
 fn solid_ssr_shader() -> String {
     format!(
         r#"
-// Group 0 -- the camera, the lights and both shadow maps -- is declared by
-// `wgsl_lights_block` below, so there is one description of that layout rather
-// than one per shader.
-
 @group(1) @binding(0) var lm_tex: texture_2d<f32>;
 @group(1) @binding(1) var lm_samp: sampler;
 
@@ -510,13 +472,12 @@ struct VOut {{
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
-    // The baked lamps are in this lightmap. See `receiver_skips_baked`.
+
     receiver_skips_baked = true;
     let lit = shade(in.world_pos, n);
     let lightmap = textureSample(lm_tex, lm_samp, in.uv2).rgb;
     let base = in.col.rgb * lit * lightmap;
-    // A cuboid has no roughness map, so it reflects sharply and falls back to
-    // its own colour -- the behaviour it had before the chain existed.
+
     let reflected = ssr_reflect(in.world_pos, n, base, in.reflectivity, 0.0);
     return vec4<f32>(reflected, in.col.a);
 }}
@@ -526,27 +487,10 @@ struct VOut {{
     )
 }
 
-// This one keeps its own two-field struct rather than taking the whole of group
-// 0 from `wgsl_lights_block`: it never calls `shade`, and a uniform struct that
-// is a PREFIX of the buffer bound to it is legal. So it is unaffected by
-// anything the lighting block adds -- which is the point of the arrangement, and
-// also why a rename that swept through the shading shaders must not touch this
-// one. (It did, once. Nothing on this machine built the wire pipeline on a real
-// device, so it went unnoticed until a test did.)
 const WIRE_SHADER: &str = r#"
-// ONE MATRIX PER EYE, like every other scene shader, even though this one
-// carries no lights block. It used to declare a single `mat4x4` and read the
-// front of the buffer, which is the left eye's -- correct while both slots hold
-// the same matrix, and the RIGHT EYE DRAWN WITH THE LEFT EYE'S PROJECTION the
-// moment a multiview pass gives them different ones. In std140 an array of
-// mat4x4 is laid out as consecutive mat4x4, so slot 0 is the same bytes this
-// read before and the single-view path is unchanged.
 struct Uniforms { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> u: Uniforms;
-// DECLARED HERE because this shader carries no lights block, which is where
-// every other scene shader gets it. 0 is the left eye, which is what a
-// single-view pass wants; `as_multiview` assigns the real one per view and
-// leaves this declaration alone.
+
 var<private> view_slot: i32 = 0;
 
 struct VIn  { @location(0) pos: vec3<f32>, @location(1) col: vec4<f32> }
@@ -605,12 +549,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Everything the multisampled scene pass draws with, built at 4x.
-    ///
-    /// WGSL is compiled by naga at PIPELINE CREATION and a sample count is
-    /// validated there too, so a pipeline built for the wrong count fails here
-    /// rather than on a headset. This is the only place that happens before the
-    /// device does it.
     #[test]
     fn every_scene_pass_pipeline_builds_multisampled() {
         let Some((device, queue)) = headless_gpu() else {
@@ -622,9 +560,6 @@ pub(crate) mod tests {
         let (_shadows, u) =
             crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights_uniform);
 
-        // 4 only. WebGPU guarantees [1, 4] for a colour format and nothing
-        // else -- 2x needs an optional adapter feature, which is why
-        // `MsaaLevel` does not offer it. This test is where that was found.
         let err_scope_1 = device.push_error_scope(ErrorFilter::Validation);
         for samples in [4u32] {
             let _solid = SolidPipeline::new_multisampled(&device, format, &u.layout, samples);
@@ -649,14 +584,10 @@ pub(crate) mod tests {
                 &device, format, &u.layout, samples,
             );
 
-            // The scene target and the shaders that read its depth have to
-            // agree about the sample count, and a disagreement is a validation
-            // error rather than a wrong image -- so it belongs here.
             let ssr = SsrPipelines::new_with_depth_samples(&device, format, samples);
             let _target =
                 ssr.create_scene_target_multisampled(&device, format, 16, 16, samples);
-            // Single-sampled whatever the scene pass runs at: everything that
-            // reads depth now reads the resolved copy.
+
             let _ssr_solid = SolidPipeline::new_ssr(
                 &device,
                 format,
@@ -672,12 +603,6 @@ pub(crate) mod tests {
     }
 }
 
-/// Does multisampling actually antialias?
-///
-/// Building the pipelines proves they are legal. It says nothing about whether
-/// the resolve is wired up -- a resolve target left as `None`, or a target
-/// created at one sample count and a pipeline at another, produces a perfectly
-/// valid hard-edged image. So this renders a SLANTED edge and looks at it.
 #[cfg(test)]
 mod msaa_tests {
     use super::tests::headless_gpu;
@@ -688,7 +613,6 @@ mod msaa_tests {
 
     const SIZE: u32 = 32;
 
-    /// Draws one slanted triangle and returns the resolved image.
     fn edge(samples: u32) -> Option<Vec<[u8; 4]>> {
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
@@ -715,8 +639,6 @@ mod msaa_tests {
             None,
         );
 
-        // A triangle with one edge at a shallow angle -- the case where a
-        // staircase is most obvious and where averaging has the most to do.
         let v = |p: [f32; 3]| SolidVertex {
             position: p,
             normal: [0.0, 0.0, 1.0],
@@ -724,11 +646,7 @@ mod msaa_tests {
             uv2: [0.0, 0.0],
             reflectivity: 0.0,
         };
-        // A right triangle filling half the target, so the hypotenuse is a long
-        // slanted edge with plenty of interior either side of it. An earlier
-        // version used a thin sliver, where MSAA made almost every pixel
-        // partial -- so "how much is covered" moved for a reason that had
-        // nothing to do with the resolve, and both assertions below misfired.
+
         let verts = [
             v([-0.9, -0.9, 0.5]),
             v([0.9, -0.9, 0.5]),
@@ -755,7 +673,7 @@ mod msaa_tests {
             usage,
             view_formats: &[],
         };
-        // The resolved image, which is what anything downstream would sample.
+
         let resolved = device.create_texture(&desc(
             format,
             1,
@@ -844,17 +762,10 @@ mod msaa_tests {
         Some(out)
     }
 
-    /// The value a fully-covered pixel takes.
-    ///
-    /// Measured, not assumed: the surface is shaded, and with no lights in the
-    /// list that is the shader's ambient constant rather than white. Assuming
-    /// 255 made every interior pixel look "partial" and the first version of
-    /// this test asserted nothing at all.
     fn interior(img: &[[u8; 4]]) -> u8 {
         *img.iter().map(|p| &p[0]).max().unwrap_or(&0)
     }
 
-    /// Pixels neither background nor fully covered -- the edge itself.
     fn partial(img: &[[u8; 4]]) -> usize {
         let full = interior(img);
         img.iter()
@@ -862,21 +773,10 @@ mod msaa_tests {
             .count()
     }
 
-    /// Total coverage, as the sum of the channel over the whole image.
     fn mass(img: &[[u8; 4]]) -> u64 {
         img.iter().map(|p| p[0] as u64).sum()
     }
 
-    /// Where the coverage sits, weighted by how covered each pixel is.
-    ///
-    /// This is what the test below actually asserts on, and mass is not.
-    /// Coverage mass is only preserved by antialiasing IN EXPECTATION over
-    /// where the edges fall -- on a 32x32 target whose triangle has about a
-    /// hundred edge pixels against four hundred interior ones, a perfectly
-    /// correct resolve moves it by around a tenth, and an earlier version of
-    /// this test called that a failure. The centroid does not care: it pins
-    /// that the resolve produced the same shape in the same place, which is the
-    /// thing that actually goes wrong when a resolve target is misconfigured.
     fn centroid(img: &[[u8; 4]]) -> (f64, f64) {
         let mut sx = 0.0;
         let mut sy = 0.0;
@@ -899,8 +799,6 @@ mod msaa_tests {
         };
         let four = edge(4).expect("an adapter was already found");
 
-        // Without MSAA every pixel is in or out: the edge is a staircase of
-        // hard steps, and nothing lands in between.
         assert_eq!(
             partial(&one),
             0,
@@ -916,9 +814,7 @@ mod msaa_tests {
 
     #[test]
     fn the_resolved_image_still_covers_the_same_area() {
-        // MSAA must soften the EDGE, not shrink or move the triangle. A resolve
-        // wired to the wrong attachment can produce a plausible-looking blurry
-        // image of the wrong thing.
+
         let Some(one) = edge(1) else {
             eprintln!("skipping: no GPU adapter available");
             return;
@@ -931,9 +827,6 @@ mod msaa_tests {
             "the multisampled triangle is in a different place: ({ax:.2}, {ay:.2}) vs ({bx:.2}, {by:.2})",
         );
 
-        // And it is still there at all. A resolve pointed at the wrong
-        // attachment gives an empty image, which the centroid alone would not
-        // notice -- an empty image has a centroid too.
         let (a, b) = (mass(&one) as f64, mass(&four) as f64);
         assert!(
             b > a * 0.75 && b < a * 1.25,
@@ -942,9 +835,6 @@ mod msaa_tests {
     }
 }
 
-// Scene shader sources, for `multiview::every_scene_shader_survives_the_multiview_transform`.
-// Test-only: the gate has to see exactly the text each pipeline is built from,
-// and nothing on a development machine can build a multiview pipeline to check.
 #[cfg(test)]
 pub fn solid_shader_src() -> String {
     solid_shader()

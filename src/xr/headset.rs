@@ -64,4 +64,3 @@ impl Headset {
         Ok(false)
     }
 }
-

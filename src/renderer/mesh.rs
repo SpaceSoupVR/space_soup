@@ -22,27 +22,9 @@ pub use thin_parts::{split_thin_parts, ThinParts, ThinSplit, ThinVertex, THIN_AL
 
 use node::{ancestor_joint_and_baked_local, collect_node};
 
-/// A second UV set for a mesh's baked lighting, supplied by the caller.
-///
-/// WHY THE CALLER AND NOT THIS CRATE
-///
-/// Deciding where a triangle's lighting lives in an atlas is a decision the
-/// BAKER has to make identically, and the baker is not in this crate -- this
-/// one is a standalone renderer and does not know what a scene is. So the
-/// layout lives with the game engine that owns both ends of it, exactly as the
-/// brush atlas already does, and what arrives here is only the answer: three
-/// uv2 per triangle. Nothing in this file knows what a chart is.
-///
-/// `None`, or a primitive with no entry, is the ordinary case: the mesh keeps
-/// whatever uv2 it was authored with and binds whatever lightmap it was given.
 #[derive(Debug, Default, Clone)]
 pub struct MeshLightmapUv {
-    /// Keyed by (glTF node index, primitive index within that node's mesh).
-    ///
-    /// Each value holds one uv2 per triangle CORNER, in the primitive's own
-    /// index order -- so its length is the primitive's index count. Keyed by
-    /// node index rather than by traversal order because that is a property of
-    /// the file, and the producer of this map walked the document separately.
+
     pub per_primitive: HashMap<(usize, usize), Vec<[f32; 2]>>,
 }
 
@@ -125,12 +107,6 @@ impl GltfMesh {
         self.clone_with_independent_skin_excluding(device, excluded_joints, Vec3::Y, None)
     }
 
-    /// As above, and additionally dropping everything above `cutoff_height`.
-    ///
-    /// The cutoff is what removes the wearer's own neck. Joint exclusion alone
-    /// cannot: neck vertices are typically weighted mostly to Chest or Spine,
-    /// which have to stay because they are the torso the wearer looks down at.
-    /// See `SkinnedMeshPrimitive::excluding_joints_and_above`.
     pub fn clone_with_independent_skin_excluding(
         &self,
         device: &wgpu::Device,
@@ -140,8 +116,7 @@ impl GltfMesh {
     ) -> Self {
         let mut m = self.clone_with_independent_skin(device);
         if let Some(skin) = &mut m.skin {
-            // Bind-pose positions, so the cutoff is a fixed height on the model
-            // and does not swing about as the head turns.
+
             let bind_transforms = skin.hierarchical_transforms(&skin.joint_local_bind);
             let bind_pose_mats: Vec<Mat4> = skin
                 .inv_bind_mats
@@ -175,10 +150,7 @@ impl GltfMesh {
                 })
                 .collect();
             let after: usize = skin.primitives.iter().map(|p| p.indices.len()).sum();
-            // The one number that distinguishes "the cull is wrong" from "the
-            // cull did nothing". Every previous theory about the wearer's own
-            // body was argued from the geometry rather than measured, and each
-            // was wrong in a way this line would have shown immediately.
+
             log::info!(
                 "AVATARCULL joints={:?} cutoff={:?} along {:?}: {} -> {} indices ({} tris removed)",
                 excluded_joints.len(),
@@ -192,9 +164,6 @@ impl GltfMesh {
         m
     }
 
-    /// A single textured quad in the XZ-facing plane (+Z normal), centered on
-    /// the origin — the mesh a world-space UI panel renders as. `u`/`v` map
-    /// left→right / top→bottom of `texture`.
     pub fn textured_quad(
         device: &wgpu::Device,
         texture: std::sync::Arc<LoadedTexture>,
@@ -241,15 +210,6 @@ impl GltfMesh {
         }
     }
 
-    /// Loads a prop whose top-level mesh nodes should each be posable as a
-    /// "part": every mesh-bearing node becomes its own synthetic joint with
-    /// an identity inverse bind, so a caller can move parts (slide, bolt,
-    /// magazine) by writing that joint's matrix.
-    ///
-    /// Returns the mesh plus each joint's (name, bind-pose world transform)
-    /// in joint order, matching `update_joint_matrices`'s own joint order --
-    /// the caller composes `root * bind_world * own_animated_offset` per
-    /// part and passes the results straight through.
     pub fn load_parts(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -267,11 +227,6 @@ impl GltfMesh {
             }
         }
 
-        // Every mesh-bearing node becomes its own synthetic joint, in a
-        // stable (sorted) order -- registered up front, same two-pass
-        // approach `load_with_lightmap_uv` uses for orphan animation nodes,
-        // so a child's ancestor-joint lookup always finds its parent already
-        // mapped regardless of node declaration order.
         let mesh_nodes: std::collections::BTreeSet<usize> = all_nodes
             .iter()
             .filter(|n| n.mesh().is_some())
@@ -329,10 +284,7 @@ impl GltfMesh {
                 );
             }
         }
-        // Every mesh node was registered as a synthetic joint above, so
-        // `collect_node` never bakes and never falls back to a static
-        // primitive -- this would only be empty if the file had no
-        // mesh-bearing nodes at all.
+
         if skinned_prims.is_empty() {
             anyhow::bail!("no renderable mesh-bearing nodes found in {}", path.display());
         }
@@ -399,10 +351,6 @@ impl GltfMesh {
         Self::load_with_lightmap_uv(device, queue, layout, path, None)
     }
 
-    /// Historically forced every material opaque for avatars whose BLEND-mode
-    /// clothing read as see-through. This loader now draws blended materials
-    /// in their own ordered pass, so it simply loads -- kept for callers
-    /// written against the old API.
     pub fn load_all_opaque(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -412,14 +360,6 @@ impl GltfMesh {
         Self::load_with_lightmap_uv(device, queue, layout, path, None)
     }
 
-    /// As [`Self::load`], with a caller-supplied lightmap UV set.
-    ///
-    /// A primitive that has an entry in `lightmap_uv` is DE-INDEXED: adjacent
-    /// triangles land in unrelated parts of the atlas, so a vertex shared
-    /// between them has no single uv2 -- every edge is a chart seam. That costs
-    /// three vertices per triangle instead of roughly one, which is why the
-    /// caller decides which meshes are worth it rather than this crate deciding
-    /// for every mesh it ever loads.
     pub fn load_with_lightmap_uv(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -645,8 +585,7 @@ impl GltfMesh {
                 motion_bind_group: Default::default(),
                 joint_bind_group: None,
                 primitives: Vec::new(),
-                // Filled in by the bind-pose vertex walk below, which cannot
-                // run until the primitives are attached.
+
                 bind_stature: 0.0,
             })
         };
@@ -662,8 +601,6 @@ impl GltfMesh {
                 .collect();
             skin.update_joint_matrices(queue, &bind_pose_mats);
 
-            // One walk, two answers: the radius the culler wants and the
-            // stature the first-person eye placement wants.
             let mut lo = f32::INFINITY;
             let mut hi = f32::NEG_INFINITY;
             let skinned_radius = skin
@@ -676,10 +613,7 @@ impl GltfMesh {
                         .copied()
                         .unwrap_or(Mat4::IDENTITY);
                     let p = world.transform_point3(Vec3::from(v.position));
-                    // Along the MODEL's up axis, which for a glTF skin is +Y by
-                    // specification -- a Z-up authoring tool has to bake its own
-                    // correction into the export, so the file is always Y-up by
-                    // the time it reaches here.
+
                     lo = lo.min(p.y);
                     hi = hi.max(p.y);
                     p.length()

@@ -1,131 +1,29 @@
-//! Textured level geometry: walls, floors and stairs built from brushes.
-//!
-//! WHY BRUSHES DO NOT RIDE THE SOLID PIPELINE
-//!
-//! They did, and it was the right first step -- correct geometry, correct
-//! shading, one flat colour per object. What it cannot express is the thing a
-//! brush is FOR. A face carries a material id and a tile scale in metres, and a
-//! wall that is concrete where the author said concrete is most of what makes
-//! level geometry read as a place rather than as blocking volumes.
-//!
-//! ONE DRAW CALL, NOT ONE PER MATERIAL
-//!
-//! The material index is per VERTEX and every colour map lives in one texture
-//! array, so a level of twenty materials is a single draw. Sorting into a draw
-//! per material would be the obvious alternative and is the wrong trade on a
-//! Quest: draw calls are the scarce thing, and level geometry is exactly the
-//! case with many materials and no per-object state to change between them.
-//!
-//! TANGENTS COME FROM THE BRUSH, NOT FROM THE TRIANGLES
-//!
-//! Normal mapping needs a tangent frame, and the usual way to get one is to
-//! derive it from the triangles' uvs -- which is fiddly, degenerate on thin
-//! triangles, and an approximation of something this data already knows
-//! exactly. A brush face carries the u and v axes its uvs were generated from.
-//! Taking the tangent straight from those is both cheaper and exact.
-
 use bytemuck::{Pod, Zeroable};
 use wgpu::*;
 
 use super::lights::wgsl_lights_block;
 use super::terrain_pipeline::{resample, solid_image, TerrainImage};
 
-/// A brush vertex: geometry, its material, and the frame to light it in.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct BrushVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
-    /// The face's u axis. `w` carries the bitangent's handedness.
+
     pub tangent: [f32; 4],
-    /// Texture coordinate in TILES, not in 0..1 -- the face's scale is metres
-    /// per tile, so a 4m wall at scale 2 arrives here spanning 0..2 and the
-    /// sampler's repeat wrapping does the rest.
+
     pub uv: [f32; 2],
-    /// Which layer of the material array to sample.
+
     pub material: u32,
-    /// Multiplied over the sampled colour. Carries the object's authored colour,
-    /// which is the whole appearance for a face whose material is missing or
-    /// unassigned -- that case binds a white layer, so the tint is all there is.
+
     pub tint: [f32; 4],
-    /// Lightmap coordinate, 0..1 over this brush object's own baked atlas.
-    ///
-    /// A SECOND uv set. `uv` above is in tiles and deliberately shared between
-    /// faces so brickwork lines up across a corner; lighting needs one unshared
-    /// patch per face, or two walls sample each other's shadows. The layout is
-    /// decided by space_soup_engine::brush_lightmap, which the baker uses too.
+
     pub uv2: [f32; 2],
-    /// THE CENTRE OF THE FACE THIS VERTEX BELONGS TO, in world space.
-    ///
-    /// The same value on all three vertices of a triangle, so it interpolates
-    /// to itself and arrives in the fragment shader unchanged. It exists to
-    /// CHOOSE THE REFLECTION PROBE, and nothing else reads it.
-    ///
-    /// Why a face needs a position that is not the fragment's own: a room's
-    /// probe box IS its interior, so every wall, floor and ceiling fragment
-    /// lies exactly ON the box surface, where a containment test is a coin
-    /// toss. Two attempts to widen the test by a margin -- a constant, then a
-    /// per-pixel `fwidth` -- both failed on the headset (2026-09-19), because
-    /// the fragment position at a polygon edge is not reliably inside the
-    /// polygon at all: MSAA shades at the pixel centre, which can sit outside,
-    /// and the interpolated position is then EXTRAPOLATED past the edge.
-    ///
-    /// A face's centre is immune to all of it. It is deep inside the room by
-    /// construction, it is identical for every fragment of the face, so the
-    /// whole face agrees on one probe and no seam can appear between
-    /// neighbouring pixels. It is also strictly cheaper than what it replaces.
+
     pub face_centre: [f32; 3],
-    /// THE BOUNDS OF THIS FACE'S OWN LIGHTMAP FOOTPRINT: (min u, min v, max u,
-    /// max v) in atlas uv, identical on every vertex of the face.
-    ///
-    /// The fragment clamps `uv2` into it before sampling. Same reason the probe
-    /// parallax clamps into its box: with MSAA a pixel on a polygon edge is
-    /// shaded at its centre, which can sit outside the polygon, and the
-    /// interpolated uv2 is then EXTRAPOLATED past the face's patch in the
-    /// atlas -- into the gutter, or past it into a neighbouring chart.
-    ///
-    /// THE GUTTER CANNOT FIX THIS, and that is why it is a clamp. The lightmap
-    /// has no mips (`mip_level_count: 1`), so a distant pixel spans many atlas
-    /// texels and the overshoot is many texels wide; the gutter is 2. Measured
-    /// on the headset in the lighting-sources view: at every sample along a
-    /// ceiling seam the BAKED channel dropped 22-61 while direct barely moved
-    /// (2026-09-22).
-    ///
-    /// The face's own uv2 bounding box rather than the chart rect, because it
-    /// is strictly inside the chart and is already in hand where the vertices
-    /// are built -- no layout lookup, and correct even if charts are repacked.
+
     pub uv2_rect: [f32; 4],
-    /// HALF THE FACE'S EXTENT ALONG ITS OWN TANGENT AND BITANGENT, from
-    /// `face_centre`. Identical on every vertex of the face.
-    ///
-    /// The fragment clamps its interpolated position into this box before
-    /// taking a view direction. Same reason `uv2` is clamped into `uv2_rect`
-    /// and the probe is chosen by `face_centre`: with MSAA a pixel on a
-    /// polygon edge is shaded at its CENTRE, which can sit outside the
-    /// polygon, and every interpolated value arrives extrapolated past the
-    /// edge.
-    ///
-    /// WHY THIS ONE MATTERS ON A MIRROR AND NOT ON A WALL. `view_dir` comes
-    /// from the fragment position, and `cos_v` from `view_dir`. Fresnel is
-    /// `f0 + (f_max - f0) * pow(1 - cos_v, 5)`, whose slope near grazing is
-    /// about `5 * (f_max - f0)`. On Marble020 (roughness 0.048) `f_max` is
-    /// 0.952, so a `cos_v` error of 0.05 moves Fresnel by ~0.23 -- and the
-    /// probe is weighted by Fresnel. On a rough face `f_max` is 0.04 and the
-    /// same error moves it by 0.01, which is why the seam appears on polished
-    /// surfaces only. Measured on the headset: the probe channel is 0 across
-    /// the ceiling and spikes to ~26% on the seam row (2026-09-22).
-    ///
-    /// AND WHY THE ERROR IS BIG IN WORLD UNITS. The overshoot is about one
-    /// PIXEL, but at the grazing angles near a ceiling-wall junction one pixel
-    /// covers a long stretch of surface, so a sub-pixel error in screen space
-    /// is a large error in metres -- and `cos_v` is smallest exactly there,
-    /// where `pow(1 - cos_v, 5)` is steepest.
-    ///
-    /// AN EXTENT AND NOT A BOUNDING BOX, so it needs no transform. A world
-    /// AABB would have to be re-derived whenever the geometry is rotated into
-    /// the player's frame, and a rotated AABB is not an AABB. Two half-widths
-    /// in the face's own basis are invariant under that rotation, and the
-    /// basis (`normal`, `tangent`) is already transformed for other reasons.
+
     pub face_half_extent: [f32; 2],
 }
 
@@ -144,43 +42,19 @@ impl BrushVertex {
     }
 }
 
-/// The most materials one level may use at once.
-///
-/// A limit rather than a growing array because the array is one GPU allocation
-/// sized at build time, and a level that quietly exceeded it would drop the
-/// materials at the end -- silently, and only for whoever authored the
-/// twenty-fifth. Exceeding it logs and clamps, so it is diagnosable.
 pub const MAX_BRUSH_MATERIALS: usize = 24;
 
 pub struct BrushPipeline {
     pub pipeline: RenderPipeline,
     pub material_layout: BindGroupLayout,
-    /// Layout for group 2, a brush object's baked lighting.
+
     pub lightmap_layout: BindGroupLayout,
-    /// Its shader reads the photograph slots as push constants
-    /// (`with_push_scan`), so its pass must set them
-    /// (`UniformBuffer::probe_push`).
+
     pub reads_immediates: bool,
 }
 
-/// Roughness assumed for a material that ships no roughness map.
-///
-/// 0.55 in 0..1, so a plain surface has a soft, wide highlight rather than
-/// none. Deliberately not 1.0 (see `BrushMaterials::new`): 1.0 zeroes the
-/// specular term outright, turning "we don't know" into "guaranteed matte".
 pub const DEFAULT_ROUGHNESS: u8 = 140;
 
-/// The neutral lightmap for a brush that has not been baked.
-///
-/// BLACK with an OPAQUE alpha, and neither half is a detail. The RGB is ADDED
-/// to the shaded result rather than multiplied into it, so zero is the value
-/// that changes nothing -- the way white is for the mesh pipeline, which
-/// multiplies. The alpha is baked sky visibility and IS multiplied, so its
-/// neutral is 255: an unbaked brush means "no occlusion measured", which has to
-/// read as full sky rather than as a surface sealed inside a box.
-///
-/// The two neutrals are opposite ends of the range in the same texel, so a
-/// single "neutral colour" is wrong whichever one you pick.
 pub fn default_brush_lightmap(
     device: &Device,
     queue: &Queue,
@@ -191,90 +65,16 @@ pub fn default_brush_lightmap(
     )
 }
 
-/// Colour and normal maps for every material a scene's brushes use.
 pub struct BrushMaterials {
     pub bind_group: BindGroup,
-    /// Whether ANY of these materials is smooth enough to be worth reflecting.
-    ///
-    /// A gate on the whole reflective pass, not a per-pixel term -- the shader
-    /// still weights each fragment by its own roughness and Fresnel. This only
-    /// decides whether to run the pass at all, because doing so costs a
-    /// full-resolution offscreen copy of the scene and a second draw over every
-    /// brush face. A level built entirely from rock and grass should pay
-    /// neither, and keeps the cheaper straight-to-swapchain path.
+
     pub reflective: bool,
-    /// `material_uv_scales`, bound at 6.
+
     _uv_scales: wgpu::Buffer,
 }
 
-/// Roughness below which a material is worth reflecting the scene in.
-///
-/// Marble in this project measures 0.048 and is unmistakably a mirror; rock and
-/// gravel sit near 1.0. Anything between is a judgement, and this is set well
-/// clear of both so the decision is never marginal.
-/// The full mip chain for one material layer, smallest level last.
-///
-/// WHY THE BRUSH TEXTURES NEED THIS AT ALL
-///
-/// They were uploaded with `mip_level_count: 1` while the sampler asked for
-/// `mipmap_filter: Linear` -- a filter with one level to choose from, which is
-/// a silent no-op. A wall tiles its material several times across itself, so
-/// at a grazing angle a screen pixel covers dozens of texels and samples
-/// exactly one of them. The result is shimmering vertical banding down every
-/// surface seen edge-on, which reads as a reflection artefact and is not one:
-/// it is ordinary minification aliasing, and it survived every change to SSR
-/// because SSR was never involved.
-///
-/// COLOUR AVERAGES IN LINEAR SPACE
-///
-/// An sRGB texture's bytes are not proportional to light, so averaging four of
-/// them directly darkens every level -- a checkerboard of black and white
-/// averages to byte 128, which is 22% grey rather than 50%. Every mip would be
-/// darker than the one above it and a wall would visibly dim with distance.
-/// Normal, roughness and occlusion maps are NOT sRGB and must be averaged
-/// exactly as they are stored.
-/// The most extra roughness-squared the normal's lost variation may add.
-///
-/// Uncapped, a texel whose normals point in wildly different directions goes
-/// fully rough and its highlight disappears entirely. The same constant the
-/// runtime path uses, so the two agree about how far this is allowed to go.
 const NORMAL_VARIANCE_CLAMP: f32 = 0.18;
 
-/// Roughness mips that carry the variation the NORMAL MAP lost when IT was
-/// mipped.
-///
-/// WHY THIS IS A TEXTURE-PIPELINE JOB AND NOT A SHADER ONE. Mipping a normal
-/// map averages its normals, and shading is not linear in the normal -- the
-/// lighting of an averaged normal is not the average of the lighting. So a
-/// correctly-averaged normal mip still produces a highlight that pops in and
-/// out as the sampling point moves, which in a headset is the "fine detail
-/// vibrating at a distance" that head tracking drives every single frame.
-///
-/// Toksvig's observation is that the information is not actually lost: the
-/// LENGTH of the averaged (unnormalised) normal records how much the normals
-/// disagreed. |Na| = 1 means they all pointed the same way; shorter means they
-/// spread. That converts straight into variance, and variance is roughness.
-///
-/// `sigma2 = (1 - |Na|) / |Na|`, combined as `r' = sqrt(r^2 + min(2*sigma2, k))`.
-///
-/// ROUGHNESS VALUES DO NOT ADD. They combine in VARIANCE space, which is why
-/// this squares before summing and takes the root after -- adding the two
-/// roughnesses directly is a different and wrong number.
-///
-/// Level 0 is left EXACTLY alone: nothing has been averaged yet, so there is
-/// no lost variation to restore, and a close-up surface keeps precisely the
-/// roughness its author painted.
-///
-/// Zero runtime cost, which is the whole point of doing it here -- and unlike
-/// a per-pixel derivative it is correct PER MIP LEVEL, because each level gets
-/// the variance of exactly the normals that level averaged. Valve shipped this
-/// approach for VR specifically (Advanced VR Rendering, GDC 2015).
-///
-/// KNOWN GAP: anisotropic filtering can sample a HIGHER-resolution mip than
-/// the isotropic level, one that has had less correction applied, so shimmer
-/// can survive at grazing angles -- documented in the same Valve talk. The
-/// runtime derivative term in the brush shader covers that case and geometric
-/// (non-map) normal variation, which a texture bake cannot see at all.
 fn roughness_chain_with_normal_variance(
     rough: &TerrainImage,
     normal: Option<&TerrainImage>,
@@ -284,16 +84,10 @@ fn roughness_chain_with_normal_variance(
         return rough_levels;
     };
     if normal.width != rough.width || normal.height != rough.height {
-        // Different footprints cannot be matched texel for texel, and guessing
-        // a correspondence would apply one surface's variance to another's
-        // roughness. Leaving it alone is the honest failure.
+
         return rough_levels;
     }
 
-    // The normal map halved repeatedly in FLOAT, keeping the averaged vectors
-    // UNNORMALISED -- their shortening is the entire measurement. Doing this in
-    // f32 rather than re-reading the 8-bit mips avoids quantising twice, which
-    // is the precision problem the runtime form of Toksvig is known for.
     let mut w = normal.width;
     let mut h = normal.height;
     let mut vecs: Vec<[f32; 3]> = (0..(w * h) as usize)
@@ -330,20 +124,16 @@ fn roughness_chain_with_normal_variance(
 
         let lvl = &mut rough_levels[level];
         if lvl.width != w || lvl.height != h {
-            // The two chains fell out of step; stop rather than write variance
-            // into the wrong texels.
+
             break;
         }
         for i in 0..(w * h) as usize {
             let v = vecs[i];
             let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-            // A degenerate average (normals cancelling out) would divide by
-            // ~zero; clamp to the fully-spread answer instead of exploding.
+
             let sigma2 = if len > 1e-4 { (1.0 - len) / len } else { 1.0 };
             let kernel = (2.0 * sigma2).min(NORMAL_VARIANCE_CLAMP);
-            // Only the RED channel is read for roughness, but all three are
-            // written so the map stays greyscale and remains readable by eye
-            // in a debugger or an exported dump.
+
             let base = lvl.rgba[i * 4] as f32 / 255.0;
             let filtered = (base * base + kernel).clamp(0.0, 1.0).sqrt();
             let byte = (filtered * 255.0).round().clamp(0.0, 255.0) as u8;
@@ -376,9 +166,7 @@ pub(crate) fn mip_chain(img: &TerrainImage, srgb: bool) -> Vec<TerrainImage> {
         for y in 0..h {
             for x in 0..w {
                 for c in 0..4 {
-                    // ALPHA is never sRGB, even in an sRGB texture: the format
-                    // decodes RGB and leaves alpha linear, so encoding it here
-                    // would bend a channel nothing asked to be bent.
+
                     let linear = srgb && c < 3;
                     let mut sum = 0.0f32;
                     for (dx, dy) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
@@ -398,156 +186,26 @@ pub(crate) fn mip_chain(img: &TerrainImage, srgb: bool) -> Vec<TerrainImage> {
     levels
 }
 
-/// Diagnostic false-colour for the brush shader. MUST be false in any build
-/// that ships. See `brush_shader_with`.
 pub const BRUSH_LIGHT_DEBUG: bool = false;
 
-/// Paint every brush pixel by WHERE ITS LIGHT CAME FROM.
-///
-///   RED    runtime lights, after their shadow test
-///   GREEN  the baked lightmap's bounce
-///   BLUE   the reflection probe
-///
-/// A second diagnostic, for a second question the screenshots could not
-/// settle: light appearing in squares that correspond to no lamp. Three
-/// hypotheses were eliminated from source first -- probe cell boundaries (a
-/// blend did not remove them), lightmap atlas bleed (no mips, and a gutter),
-/// and shadow-caster culling (it uses the LIGHT's frustum, which is right) --
-/// so the next step is to look rather than guess a fourth time.
-///
-/// Must be `false` in anything shipped; `the_source_diagnostic_is_off` asserts
-/// it.
 pub const BRUSH_SOURCE_DEBUG: bool = false;
 
-/// Paint WHERE MSAA SHADES OUTSIDE THE POLYGON.
-///
-///   BLACK  the pixel centre lies inside the triangle -- ordinary interior
-///   RED    the centre lies outside it, so every interpolated attribute
-///          arriving at this fragment is EXTRAPOLATED past the face's edge
-///
-/// Red scales with how far outside the centre is, measured in PIXELS: full red
-/// is one pixel or more.
-///
-/// # Why this view exists
-///
-/// Nine fixes have been aimed at the thin lines along the ceiling-wall
-/// junctions, and each one clamped a different attribute that this mechanism
-/// corrupts -- the probe box test, the probe parallax position, `uv2`, the
-/// Fresnel normal. The mechanism itself is documented on
-/// `BrushVertex::face_centre` and is not in doubt; what is in doubt is whether
-/// it is what the user is still looking at. Patching one attribute per round
-/// cannot answer that, because there is one attribute per thing the shader
-/// interpolates.
-///
-/// This measures the mechanism directly instead of inferring it from a value.
-/// It works by interpolating the SAME varying twice -- once at the pixel
-/// centre, once at the centroid of the covered samples -- and painting their
-/// difference. The two agree exactly wherever the centre is covered, so any
-/// red pixel is a fragment MSAA shaded from outside its own polygon.
-///
-/// If the seam lines come back red, the cause is settled and the fix is
-/// centroid interpolation (or a per-face constant) rather than a tenth clamp.
-/// If the seam is black, every extrapolation hypothesis is dead at once.
-///
-/// Must be `false` in anything shipped; `the_edge_diagnostic_is_off` asserts it.
 pub const BRUSH_EDGE_DEBUG: bool = false;
 
-/// What the lighting-sources view paints when it is toggled on.
-///
-/// The sources view is the one debug view that is a RUNTIME toggle (left
-/// stick) and that works in both SSR states, because the reflective passes
-/// read the scene colour back rather than re-shading. A diagnostic that
-/// needs to be looked at on the headset belongs INSIDE it, not in front of
-/// it: an earlier build put one in front, which replaced both variants (so
-/// the stick toggled nothing) and painted black wherever SSR skipped the
-/// shading (2026-09-22). `a_debug_view_changes_only_the_shader_it_is_built_for`
-/// failed on that build and was misread as an expected failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourcesView {
-    /// Each source's SHARE of the total: red direct, green baked, blue probe.
-    /// Reads which term dominates, and cannot say whether a line where one
-    /// share rises is that term going up or another going down.
+
     Ratios,
-    /// The probe term's factors: red Fresnel / f_max, green probe.a, blue
-    /// spec_occ * probe_scale. Measured smooth across the front ceiling
-    /// junction (2026-09-22), which exonerated all three.
+
     ProbeFactors,
-    /// ABSOLUTE radiance, each channel through `x / (x + 0.05)` so a dim room
-    /// and a lit one both land mid-scale: red baked, green probe, blue direct.
-    ///
-    /// The discriminator `Ratios` cannot be: along the seam the probe's SHARE
-    /// rises, which is either the probe sample going UP or the baked term --
-    /// the dominant one, so the denominator -- going DOWN. Here a red dip and
-    /// a green spike are different pictures.
+
     Absolute,
 }
 
-/// See `SourcesView`. Only reached when the sources view is toggled on, so a
-/// build with this set to anything still renders normally until it is.
 pub const SOURCES_VIEW: SourcesView = SourcesView::Absolute;
 
-/// Interpolate the TWO varyings that feed the two channels measured to move at
-/// a seam -- `world_pos` and `uv2` -- at the centroid of the covered samples
-/// rather than at the pixel centre.
-///
-/// # Why two and not all nine
-///
-/// Centroid interpolation was tried once before, on every varying the brush
-/// has, and cost ~16 ms a frame on the headset -- more than the whole 13.9 ms
-/// budget, so it was reverted and `the_brush_does_not_pay_for_centroid_
-/// interpolation` was left behind to keep it out. That measurement is why this
-/// is not simply turned on everywhere.
-///
-/// It does not have to be everywhere. The lighting-sources view measured which
-/// channel actually moves across a seam: direct was flat at -0.3 while baked
-/// moved -31.5 and probe +24.8. Baked is addressed by `uv2`; probe parallax is
-/// addressed by `world_pos`. The rest do not need it:
-///
-///   `normal`, `tangent`  constant over a flat brush face, so centroid and
-///                        centre interpolate to the same value -- it would buy
-///                        nothing and cost the same as anything else
-///   `material`, `tint`,  already `flat`, which is immune by construction and
-///   `face_centre`,       cheaper than either smooth mode
-///   `uv2_rect`
-///   `uv`                 plane-consistent and tiling: extrapolating it walks
-///                        further along the same surface, which the repeat
-///                        sampler handles
-///
-/// # MEASURED, AND IT DOES NOT FIT. THE COST IS NOT PER-VARYING (2026-09-22)
-///
-/// The expectation above was that two varyings would cost a small fraction of
-/// what nine did. It was wrong, and wrong in the way that matters. Shipped to
-/// the headset with centroid on exactly `world_pos` and `uv2`:
-///
-///   PERF: cpu_avg=4.16ms | gpu_avg=33.38ms gpu_max=35.94ms | frame=38.30ms
-///
-/// against a scene that runs in the low twenties -- so roughly the same ~16 ms
-/// that centroid on ALL NINE varyings cost. Cutting nine to two bought nothing.
-///
-/// THE PENALTY IS A THRESHOLD, NOT A SLOPE. Asking for centroid on any varying
-/// at all appears to move the whole fragment shader onto a slower interpolation
-/// path, so the cost is paid once and the count is irrelevant. Anyone reading
-/// the old "~16 ms" and reasoning that a smaller slice would cost less is
-/// making the mistake this note exists to stop: there is no slice small enough.
-///
-/// So this stays `false`, and the remaining route to the same correctness is to
-/// make the baked and probe terms FACE-CONSTANT the way probe selection already
-/// is via `face_centre` -- `flat` is immune to extrapolation by construction
-/// and is cheaper than either smooth mode, so it pays nothing at all.
 pub const BRUSH_CENTROID_VARYINGS: bool = false;
 
-/// Which diagnostic the brushes are drawn with, chosen AT RUNTIME.
-///
-/// The build switches (`BRUSH_SOURCE_DEBUG`, `ssr::SSR_DEBUG`) need a rebuild
-/// and a deploy per question, and an artifact that only appears from one
-/// position in the headset cannot be pointed at from the host. So the debug
-/// pipelines are built once beside the shipped ones and swapped at draw time,
-/// and the player cycles them where the artifact is.
-///
-/// - `Sources`: red = direct light, green = baked bounce, blue = probe, by ratio.
-/// - `Ssr`: blue = too rough to march, red = ray left the frame, green = out of
-///   steps, magenta = faces the viewer (not marched), grey = a hit, shaded by
-///   how much of it survived the fades.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DebugView {
     #[default]
@@ -557,7 +215,7 @@ pub enum DebugView {
 }
 
 impl DebugView {
-    /// The next view in the cycle, wrapping back to `Off`.
+
     pub fn next(self) -> Self {
         match self {
             DebugView::Off => DebugView::Sources,
@@ -566,11 +224,6 @@ impl DebugView {
         }
     }
 
-    /// The tester's toggle: the normal picture and the lighting sources, and
-    /// nothing else. The SSR view is left out because it switches the
-    /// half-resolution probe pass off with it, so it does not show what
-    /// ships -- a tester who stepped into it saw 17-37 fps and reflections
-    /// that moved (found 2026-09-29).
     pub fn toggle_sources(self) -> Self {
         match self {
             DebugView::Off => DebugView::Sources,
@@ -581,21 +234,12 @@ impl DebugView {
 
 pub const SSR_ROUGHNESS_THRESHOLD: f32 = 0.35;
 
-/// Whether a roughness map is smooth enough to reflect.
-///
-/// Reads the MEAN, not the minimum: a mostly-matte surface with a few polished
-/// specks is not a mirror, and taking the minimum would turn the reflective
-/// pass on for a wall that shows nothing.
-///
-/// A material with NO roughness map is fully rough -- the same default the
-/// shader uses when the map is missing -- so an unauthored material never
-/// silently turns the pass on.
 pub fn roughness_is_reflective(rough: Option<&crate::renderer::terrain_pipeline::TerrainImage>) -> bool {
     let Some(img) = rough else { return false };
     if img.rgba.is_empty() {
         return false;
     }
-    // Red channel, which is where the shader reads roughness from.
+
     let sum: u64 = img.rgba.chunks_exact(4).map(|p| p[0] as u64).sum();
     let n = (img.rgba.len() / 4).max(1) as f64;
     let mean = (sum as f64 / n) / 255.0;
@@ -632,11 +276,7 @@ pub fn brush_material_bind_group_layout(device: &Device) -> BindGroupLayout {
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
-            // Roughness, then ambient occlusion. Separate arrays rather than
-            // channels of one packed map: the material library stores them as
-            // the separate greyscale files ambientCG ships, and packing them
-            // here would mean a second representation to keep in step with the
-            // editor, which samples the same two files.
+
             BindGroupLayoutEntry {
                 binding: 3,
                 visibility: ShaderStages::FRAGMENT,
@@ -657,15 +297,14 @@ pub fn brush_material_bind_group_layout(device: &Device) -> BindGroupLayout {
                 },
                 count: None,
             },
-            // A SECOND SAMPLER, FOR ROUGHNESS ONLY. See `brush_rough_sampler`.
+
             BindGroupLayoutEntry {
                 binding: 5,
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
-            // Each material's own proportions, for the vertex stage. See
-            // `material_uv_scales`.
+
             BindGroupLayoutEntry {
                 binding: 6,
                 visibility: ShaderStages::VERTEX,
@@ -680,16 +319,6 @@ pub fn brush_material_bind_group_layout(device: &Device) -> BindGroupLayout {
     })
 }
 
-/// EVERY MATERIAL AT ITS OWN PROPORTIONS, one scale a layer for the brush
-/// UVs: `u` as authored, `v` times the colour map's width over its height.
-///
-/// A face's UVs are in square tiles (`BrushFace::scale`), and a layer spans
-/// one tile whatever its shape, so a 1024x512 map -- Rock063, Bricks075A --
-/// drew every stone twice as tall as it is. With `v` scaled, the tile keeps
-/// its authored width and is as tall as the map says: nothing stretches. The
-/// texture array's own square layers do not matter to this; they change how
-/// many texels a layer has, not what shape it depicts. Missing maps are
-/// square.
 pub fn material_uv_scales(colours: &[Option<TerrainImage>]) -> [[f32; 4]; MAX_BRUSH_MATERIALS] {
     let mut out = [[1.0, 1.0, 0.0, 0.0]; MAX_BRUSH_MATERIALS];
     for (slot, img) in out.iter_mut().zip(colours) {
@@ -701,13 +330,7 @@ pub fn material_uv_scales(colours: &[Option<TerrainImage>]) -> [[f32; 4]; MAX_BR
 }
 
 impl BrushMaterials {
-    /// Build the material arrays.
-    ///
-    /// `colours` and `normals` are parallel and both are padded to
-    /// MAX_BRUSH_MATERIALS: every layer of a texture array shares one
-    /// allocation and must match in size, so a missing or differently-sized map
-    /// cannot simply be skipped. A missing colour becomes white (the vertex
-    /// tint then decides the look) and a missing normal becomes flat.
+
     pub fn new(
         device: &Device,
         queue: &Queue,
@@ -717,8 +340,7 @@ impl BrushMaterials {
         roughs: &[Option<TerrainImage>],
         aos: &[Option<TerrainImage>],
     ) -> Self {
-        // Sized from the first real map rather than from a constant, so a
-        // project of 2K materials is not downsampled to someone's guess.
+
         let (w, h) = colours
             .iter()
             .flatten()
@@ -737,9 +359,7 @@ impl BrushMaterials {
             h,
             None,
         );
-        // NOT sRGB. A normal map is a direction, not a colour, and decoding it
-        // through the sRGB curve bends every normal toward the surface -- which
-        // looks like weak lighting rather than like a format mistake.
+
         let normal_tex = Self::array_texture(
             device,
             queue,
@@ -752,22 +372,6 @@ impl BrushMaterials {
             None,
         );
 
-        // Not sRGB: these are measurements, not colours, and decoding them
-        // through the sRGB curve would skew every value toward the dark end.
-        //
-        // The roughness default is NOT white, and that is a deliberate change.
-        // White is 1.0, fully rough, and `spec_strength = SPEC_STRENGTH *
-        // (1 - r)` makes that EXACTLY ZERO -- so a material with no roughness
-        // map could not produce a highlight under any light, at any angle,
-        // ever. Three of the five materials in the test level were in that
-        // state, which is why "the specular isn't working" was true and not a
-        // matter of looking from the wrong place.
-        //
-        // "No measurement" is not "provably a perfect diffuser". A mid value is
-        // the honest default: most real surfaces are somewhat glossy, and a
-        // material that genuinely is matte can say so by shipping a map.
-        // THE ONE ARRAY THAT GETS THE NORMAL-VARIANCE BAKE. Its mips carry the
-        // variation the normal map lost when it was mipped, as extra roughness.
         let rough_tex = Self::array_texture(
             device, queue, "brush_rough_array", TextureFormat::Rgba8Unorm,
             roughs, [DEFAULT_ROUGHNESS, DEFAULT_ROUGHNESS, DEFAULT_ROUGHNESS], w, h,
@@ -780,41 +384,18 @@ impl BrushMaterials {
 
         let sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("brush_sampler"),
-            // Repeat, because the uv is in tiles: a wall covering six tiles of
-            // its material arrives with uv spanning 0..6 and clamping would
-            // smear the last pixel across five of them.
+
             address_mode_u: AddressMode::Repeat,
             address_mode_v: AddressMode::Repeat,
             address_mode_w: AddressMode::Repeat,
             mag_filter: FilterMode::Linear,
             min_filter: FilterMode::Linear,
             mipmap_filter: MipmapFilterMode::Linear,
-            // Anisotropy is what keeps a mipped wall SHARP at a grazing angle
-            // rather than merely un-aliased. Without it the sampler picks a mip
-            // for the worst axis and blurs the other one to match, so a wall
-            // stops shimmering and goes soft instead -- trading one grazing
-            // artefact for another.
+
             anisotropy_clamp: 8,
             ..Default::default()
         });
 
-        // ROUGHNESS IS SAMPLED TRILINEAR, NOT ANISOTROPIC, AND THAT IS THE POINT.
-        //
-        // The roughness mips carry the normal map's lost variation as extra
-        // roughness (see `roughness_chain_with_normal_variance`), so each mip
-        // level is only correct for the amount of averaging THAT level did.
-        // Anisotropic filtering breaks exactly that: at a grazing angle it
-        // fetches a HIGHER-resolution mip than the isotropic level, one that
-        // has had less variance folded in, so the surface goes back to
-        // shimmering precisely where a glancing view makes it worst. Valve
-        // documents this failure in the same talk that recommends the roughness
-        // mips (Advanced VR Rendering, GDC 2015).
-        //
-        // Trilinear takes the mip the footprint actually asks for. The price is
-        // a slightly over-smoothed roughness at grazing angles -- the highlight
-        // is a little broader than it should be -- which is the lesser evil
-        // against a shimmering one, and it is invisible next to the sharpness
-        // that COLOUR and NORMAL keep, since those still sample at 8x.
         let rough_sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("brush_rough_sampler"),
             address_mode_u: AddressMode::Repeat,
@@ -887,17 +468,10 @@ impl BrushMaterials {
             ],
         });
 
-        // Decided once, here, rather than per frame: the maps do not change
-        // between bakes and this walks every texel of every roughness map.
         let reflective = roughs.iter().any(|r| roughness_is_reflective(r.as_ref()));
         Self { bind_group, reflective, _uv_scales: uv_scales }
     }
 
-    /// A material array with nothing in it, for a scene that has no brushes.
-    ///
-    /// Bound anyway rather than left absent: an optional binding would mean two
-    /// pipeline layouts and two shaders that have to agree, which is a bigger
-    /// thing to keep right than one white texture.
     pub fn fallback(device: &Device, queue: &Queue, layout: &BindGroupLayout) -> Self {
         Self::new(device, queue, layout, &[], &[], &[], &[])
     }
@@ -912,14 +486,7 @@ impl BrushMaterials {
         fallback: [u8; 3],
         w: u32,
         h: u32,
-        // THE NORMAL MAPS, when this texture is the ROUGHNESS array.
-        //
-        // Passing them turns on the normal-variance bake -- see
-        // `roughness_chain_with_normal_variance`. Every other array passes
-        // None and keeps plain box-filtered mips. It lives here rather than in
-        // a separate function because the per-layer fill/resample logic below
-        // has to be applied identically to both arrays or the two chains would
-        // not line up texel for texel.
+
         normals_for_variance: Option<&[Option<TerrainImage>]>,
     ) -> Texture {
         let filled: Vec<TerrainImage> = (0..MAX_BRUSH_MATERIALS)
@@ -934,15 +501,10 @@ impl BrushMaterials {
             })
             .collect();
 
-        // One chain per layer, built on the CPU. These textures are uploaded
-        // from memory anyway, so a GPU blit pass would cost more code and more
-        // frame time than a handful of box filters at load.
         let chains: Vec<Vec<TerrainImage>> = match normals_for_variance {
             None => filled.iter().map(|img| mip_chain(img, format.is_srgb())).collect(),
             Some(normals) => {
-                // The normals go through the SAME fill/resample path, so layer
-                // i of this array and layer i of the normals describe the same
-                // material at the same resolution.
+
                 let normals_filled: Vec<Option<TerrainImage>> = (0..MAX_BRUSH_MATERIALS)
                     .map(|i| match normals.get(i).and_then(|x| x.as_ref()) {
                         Some(img) if img.width == w && img.height == h => Some(TerrainImage {
@@ -951,7 +513,7 @@ impl BrushMaterials {
                             rgba: img.rgba.clone(),
                         }),
                         Some(img) => Some(resample(img, w, h)),
-                        // No normal map means no lost variation to restore.
+
                         None => None,
                     })
                     .collect();
@@ -1008,8 +570,6 @@ impl BrushPipeline {
         )
     }
 
-    /// The scene-pass pipeline with blending OFF, for the `perf_ab` phase that
-    /// measures whether declaring blending on opaque walls costs fill.
     pub fn new_multisampled_opaque(
         device: &Device,
         format: TextureFormat,
@@ -1021,7 +581,6 @@ impl BrushPipeline {
         )
     }
 
-    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
     pub fn new_multisampled_opaque_stereo(
         device: &Device,
         format: TextureFormat,
@@ -1034,7 +593,6 @@ impl BrushPipeline {
         )
     }
 
-    /// The same for the lighting-sources diagnostic.
     pub fn new_multisampled_sources_stereo(
         device: &Device,
         format: TextureFormat,
@@ -1046,7 +604,6 @@ impl BrushPipeline {
         )
     }
 
-    /// The same for the blended scene-pass brush.
     pub fn new_multisampled_stereo(
         device: &Device,
         format: TextureFormat,
@@ -1059,8 +616,6 @@ impl BrushPipeline {
         )
     }
 
-    /// The scene-pass pipeline drawing the LIGHTING SOURCES diagnostic -- red
-    /// direct, green baked, blue probe, by ratio. See [`DebugView::Sources`].
     pub fn new_multisampled_sources(
         device: &Device,
         format: TextureFormat,
@@ -1071,8 +626,6 @@ impl BrushPipeline {
         )
     }
 
-    /// See `pipeline::SolidPipeline::new_multisampled` -- a pipeline's sample
-    /// count must match the pass it runs in, so a 4x eye pass needs its own.
     pub fn new_multisampled(
         device: &Device,
         format: TextureFormat,
@@ -1083,7 +636,6 @@ impl BrushPipeline {
         )
     }
 
-    /// The mirror pass draws a reflected world, which reverses every winding.
     pub fn new_mirror(
         device: &Device,
         format: TextureFormat,
@@ -1093,18 +645,12 @@ impl BrushPipeline {
         )
     }
 
-    /// The reflective variant, drawn over the blitted scene in the eye pass.
-    ///
-    /// FOUR bind groups exactly -- scene uniform, materials, lightmap, scene
-    /// colour+depth -- which is this hardware's limit. The cuboid form binds a
-    /// fifth for its own SSR camera; a brush cannot afford that, so this shares
-    /// the camera already in group 0.
     pub fn new_ssr(
         device: &Device,
         format: TextureFormat,
         uniform_layout: &BindGroupLayout,
         ssr_scene_layout: &BindGroupLayout,
-        // Must match the scene target's depth sample count.
+
     ) -> Self {
         Self::new_ssr_variant(
             device, format, uniform_layout, ssr_scene_layout,
@@ -1112,8 +658,6 @@ impl BrushPipeline {
         )
     }
 
-    /// The reflective pipeline drawing a diagnostic: the lighting sources for
-    /// [`DebugView::Sources`], the SSR false colour for [`DebugView::Ssr`].
     pub fn new_ssr_debug(
         device: &Device,
         format: TextureFormat,
@@ -1127,12 +671,6 @@ impl BrushPipeline {
         )
     }
 
-    /// THE REFLECTION TRACE pipeline: same geometry, same march, but it writes
-    /// radiance and confidence into the reflection buffer for the resolve to
-    /// filter. See `brush_shader_modes`.
-    ///
-    /// `format` is the reflection buffer's, not the swapchain's -- it carries
-    /// HDR radiance and wants more than 8 bits a channel.
     pub fn new_ssr_trace(
         device: &Device,
         format: TextureFormat,
@@ -1144,8 +682,6 @@ impl BrushPipeline {
         )
     }
 
-    /// The pass that puts the filtered reflection on the surface. See
-    /// [`SsrPath`].
     pub fn new_ssr_composite(
         device: &Device,
         format: TextureFormat,
@@ -1227,7 +763,7 @@ impl BrushPipeline {
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
-            // The eye pass is single-sampled: it draws over a resolved blit.
+
             multisample: MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -1266,10 +802,6 @@ impl BrushPipeline {
         )
     }
 
-    /// THE HALF-RESOLUTION PROBE PASS: the level's brushes drawn again at half
-    /// the eye's resolution, writing only their probe reflection. See
-    /// `probe_pass`. `Stereo` draws both eyes into the two layers of one
-    /// target, for the multiview scene pass.
     pub fn new_probe_pass(
         device: &Device,
         uniform_layout: &BindGroupLayout,
@@ -1278,14 +810,6 @@ impl BrushPipeline {
         Self::new_variant(device, probe_pass::FORMAT, uniform_layout, FrontFace::Ccw, 1, false, None, view, BrushProbe::Pass, None)
     }
 
-    /// THE SINGLE-EYE PROBE PASS THAT SHIPS: as [`Self::new_probe_pass`], with
-    /// the secondary lookups left to `fixups` (`probe_fixup`). Its fragments
-    /// write the record list, so their depth test is forced EARLY where the
-    /// device allows it: a shader with side effects is otherwise tested after
-    /// it runs, and every hidden fragment would be shaded.
-    ///
-    /// ITS PHOTOGRAPH SLOTS AS PUSH CONSTANTS where the device has them
-    /// (`with_push_scan`): exp64, hall_front, render 2.20 -> 1.84 ms an eye.
     pub fn new_probe_pass_deferred(
         device: &Device,
         uniform_layout: &BindGroupLayout,
@@ -1294,9 +818,6 @@ impl BrushPipeline {
         Self::probe_pass_deferred_from(device, uniform_layout, fixups, "brush_probe_pass_deferred", |source| source)
     }
 
-    /// The deferring probe pass's POOLLESS TWIN: [`Self::new_probe_pass_deferred`]
-    /// without the torch pool maps' lookup (`lights::without_pool_maps`), for
-    /// frames where no surface is lit. `Levers::poolless_shaders`.
     pub fn new_probe_pass_deferred_poolless(
         device: &Device,
         uniform_layout: &BindGroupLayout,
@@ -1337,10 +858,6 @@ impl BrushPipeline {
         )
     }
 
-    /// MEASUREMENT ONLY: the shipped probe pass with one of
-    /// `DEFERRED_REGISTER_CUTS` applied, to DRAW with (the `pass_cut` lever) --
-    /// so what a part costs by its presence is measured on the headset without
-    /// a build. `None` when `cut` names no entry or no longer matches.
     pub fn new_probe_pass_deferred_with_cut(
         device: &Device,
         uniform_layout: &BindGroupLayout,
@@ -1358,9 +875,7 @@ impl BrushPipeline {
         if device.features().contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
             src = src.replacen(FS_MAIN, "@fragment @early_depth_test(force) fn fs_main(", 1);
         }
-        // As shipped: the slots as push constants -- except in the cut that
-        // reads them from the camera block as before, and wherever a cut took
-        // the scan's reads out.
+
         if *label != SCAN_FROM_UNIFORMS {
             src = with_push_scan(device, src);
         }
@@ -1378,9 +893,6 @@ impl BrushPipeline {
         ))
     }
 
-    /// The scene pass's opaque brush, reading its probe reflection from that
-    /// pass through group 3 (`probe_pass::bind_group_layout`) instead of
-    /// tracing it per pixel.
     pub fn new_multisampled_probe_reader(
         device: &Device,
         format: TextureFormat,
@@ -1403,10 +915,6 @@ impl BrushPipeline {
         )
     }
 
-    /// The scene readers' SPOTLESS TWINS -- [`Self::new_multisampled_probe_reader`]
-    /// and its sunless and baked classes, in that order -- with the spots'
-    /// shadow maps never read (`lights::without_spot_shadows`), for frames
-    /// where no spot casts. `Levers::spotless_shaders`.
     pub fn new_spotless_probe_readers(
         device: &Device,
         format: TextureFormat,
@@ -1437,11 +945,6 @@ impl BrushPipeline {
         ]
     }
 
-    /// [`Self::new_multisampled_probe_reader`] for the brushes of one
-    /// [`FaceSun`] class: the same picture there, without the sun code those
-    /// faces can never run -- all of it (~350 instructions) where the sun
-    /// never reaches, the level's static sun map where the mask is baked
-    /// throughout. See [`SunFaces`].
     pub fn new_multisampled_probe_reader_for(
         device: &Device,
         format: TextureFormat,
@@ -1463,15 +966,6 @@ impl BrushPipeline {
         Self::from_source(device, format, uniform_layout, FrontFace::Ccw, samples, None, view, Some(probe_layout), label, source)
     }
 
-    /// MEASUREMENT: the brushes' scene readers with one of [`READER_EDITS`]:
-    /// the full, sunless and baked classes, then their spotless twins -- the
-    /// orders of [`Self::new_multisampled_probe_reader_for`] and
-    /// [`Self::new_spotless_probe_readers`]. `None` when `edit` names no entry
-    /// or one of its edits no longer matches. `Levers::reader_edit`.
-    ///
-    /// `edit@class` (`full`, `sunless` or `baked`) edits that class and its
-    /// spotless twin only, the rest drawn as shipped: one reader at the
-    /// instruction cache's edge priced alone (2026-10-06).
     pub fn new_edited_probe_readers(
         device: &Device,
         format: TextureFormat,
@@ -1527,8 +1021,7 @@ impl BrushPipeline {
             assert!(source.contains(FS_MAIN), "the fragment entry point moved");
             source = source.replacen(FS_MAIN, "@fragment @early_depth_test(force) fn fs_main(", 1);
         }
-        // Named by what it does, so a GPU profile or `PIPESTATS` line says
-        // which of them it is.
+
         let label = match probe {
             BrushProbe::Trace => "brush_pipeline",
             BrushProbe::Pass => "brush_probe_pass",
@@ -1538,12 +1031,6 @@ impl BrushPipeline {
         Self::from_source(device, format, uniform_layout, front_face, samples, blend, view, probe_layout, label, source)
     }
 
-    /// MEASUREMENT ONLY: the probe pass's shader with one part of it cut out
-    /// at a time (`PROBE_PASS_REGISTER_CUTS`), each built as a pipeline of its
-    /// own that nothing draws with, so the driver reports each one's
-    /// registers (`PIPESTATS`; see `shader_checks::PIPELINE_STATISTICS`). The
-    /// pass's occupancy is set by its register PEAK, and where the count
-    /// drops is where the peak was.
     pub fn log_probe_pass_register_cuts(device: &Device, uniform_layout: &BindGroupLayout) {
         let base = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Pass);
         for (label, edits) in PROBE_PASS_REGISTER_CUTS {
@@ -1576,11 +1063,6 @@ impl BrushPipeline {
         }
     }
 
-    /// MEASUREMENT ONLY: the scene pass's brush shader reading the probe pass,
-    /// with one of `SCENE_REGISTER_CUTS` applied -- to DRAW with, so an offline
-    /// render can say what a term contributes to a picture (the aliasing
-    /// test's attribution). `None` when `cut` names no entry or one of its
-    /// edits no longer matches the shader.
     pub fn new_multisampled_probe_reader_with_cut(
         device: &Device,
         format: TextureFormat,
@@ -1611,9 +1093,6 @@ impl BrushPipeline {
         ))
     }
 
-    /// MEASUREMENT ONLY: `log_probe_pass_register_cuts` for the scene pass's
-    /// brush shader -- the one reading the probe pass -- with the same
-    /// target, samples and group 3 as the one that ships.
     pub fn log_scene_register_cuts(
         device: &Device,
         format: TextureFormat,
@@ -1652,8 +1131,6 @@ impl BrushPipeline {
         }
     }
 
-    /// MEASUREMENT ONLY: `log_probe_pass_register_cuts` for the probe pass
-    /// that defers its secondary lookups -- the one that ships.
     pub fn log_deferred_register_cuts(
         device: &Device,
         uniform_layout: &BindGroupLayout,
@@ -1706,20 +1183,18 @@ impl BrushPipeline {
         label: &str,
         source: String,
     ) -> Self {
-        // A probe-pass shader writes the reach too. See `probe_pass::targets`.
+
         let reaches = source.contains(probe_pass::OUTPUT_SIGNATURE);
-        // The probe pass that ships reads its photograph slots as push
-        // constants (`with_push_scan`), and declares them.
+
         let reads_immediates = source.contains(IMMEDIATE_DECLARATION);
         let immediate_size = if reads_immediates { crate::renderer::uniforms::PROBE_PUSH_SIZE as u32 } else { 0 };
-        // Audited: see `shader_checks`.
+
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("brush_shader"),
             source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, view.shader(source)).into()),
         });
         let material_layout = brush_material_bind_group_layout(device);
-        // Shared with the mesh and cuboid pipelines: a lightmap is a lightmap,
-        // and three layouts that must stay identical is three chances to drift.
+
         let lightmap_layout = super::pipeline::lightmap_bind_group_layout(device);
         let mut layouts = vec![Some(uniform_layout), Some(&material_layout), Some(&lightmap_layout)];
         if let Some(l) = probe_layout {
@@ -1759,10 +1234,7 @@ impl BrushPipeline {
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
                 depth_write_enabled: Some(true),
-                // LessEqual, not Less: after the depth prepass the nearest
-                // brush's depth is already in the buffer, and its own shading
-                // must pass on EQUAL. Without a prepass the two differ only
-                // for coplanar brush faces. See `new_depth_prepass`.
+
                 depth_compare: Some(CompareFunction::LessEqual),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
@@ -1774,22 +1246,6 @@ impl BrushPipeline {
         Self { pipeline, material_layout, lightmap_layout, reads_immediates }
     }
 
-    /// THE DEPTH PREPASS: the level's brushes drawn first in the scene pass,
-    /// writing only depth, so everything drawn after -- the brushes' own
-    /// shading at LessEqual, the terrain, meshes -- is shaded only where it is
-    /// the nearest surface.
-    ///
-    /// Why: the first headset benchmark (2026-09-27) counted 17-34 M
-    /// fragments shaded a frame for 3.6 M pixels, and the hardware's
-    /// low-resolution depth rejected almost none -- the terrain is drawn
-    /// before the walls and floors that hide it, and one draw of the whole
-    /// level has no order. The frame is fragment-bound, so every hidden
-    /// fragment shaded is time.
-    ///
-    /// The brushes' own vertex stage with an `@invariant` position, so both
-    /// draws put a brush at the same depth to the bit. Its fragment stage does
-    /// nothing and writes no colour; only groups 0 and 1 (camera, material
-    /// proportions) are bound.
     pub fn new_depth_prepass(
         device: &Device,
         format: TextureFormat,
@@ -1797,7 +1253,7 @@ impl BrushPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
-        // Audited: see `shader_checks`.
+
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("brush_depth_prepass"),
             source: ShaderSource::Wgsl(
@@ -1849,34 +1305,10 @@ impl BrushPipeline {
     }
 }
 
-/// Whether the scene pass seals the cracks between brush faces.
-///
-/// CSG leaves T-junctions -- a face's corner lying partway along its
-/// neighbour's edge -- and the rasteriser can round the two edges differently,
-/// leaving single-pixel holes along the seam. Through them the eye sees
-/// whatever is behind the wall, usually the lit exterior, so every room edge
-/// wore a dotted WHITE line (headset, 2026-09-17; 408 T-junctions counted in
-/// `test_room` on 2026-09-10).
-///
-/// Repairing the triangulation removes them, but that repair made room edges
-/// sawtoothed on the headset for a reason never found (see
-/// `quest_app::brush_render::REPAIR_T_JUNCTIONS`). This instead draws the
-/// level's BACK faces, flat and dark, after its front faces. A brush solid is
-/// closed, so behind every crack there is a back face of that same solid a
-/// wall's thickness away; depth-tested normally, the back faces lose to every
-/// front face and survive only where the front faces left a hole. No geometry
-/// changes, so nothing about the triangles the repair disturbed is touched.
 pub const SEAL_BRUSH_CRACKS: bool = true;
 
-/// What a sealed crack shows: about the scene's clear colour, so a hole in a
-/// dark interior disappears instead of glowing.
 pub const CRACK_SEAL_COLOUR: [f32; 3] = [0.02, 0.02, 0.05];
 
-/// The brush back faces, drawn flat. See [`SEAL_BRUSH_CRACKS`].
-///
-/// Cheap by construction: it draws after the front faces, so early depth
-/// rejection discards almost every fragment before the one-line shader runs,
-/// and it binds only the scene uniform for the camera.
 pub struct BrushSealPipeline {
     pub pipeline: RenderPipeline,
 }
@@ -1892,7 +1324,6 @@ impl BrushSealPipeline {
         Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Mono)
     }
 
-    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
     pub fn new_stereo(
 
         device: &Device,
@@ -1932,13 +1363,12 @@ impl BrushSealPipeline {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                // No blending: a sealed crack is opaque.
+
                 targets: &[Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::ALL })],
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
-                // FRONT culled, so only the faces pointing away are drawn --
-                // the same winding the brush pipeline culls the other way.
+
                 cull_mode: Some(Face::Front),
                 front_face: FrontFace::Ccw,
                 polygon_mode: PolygonMode::Fill,
@@ -1981,89 +1411,32 @@ fn brush_shader() -> String {
     brush_shader_with(false)
 }
 
-/// The brush shader, optionally reflecting the scene it is drawn over.
-///
-/// `ssr` is true for the reflective variant. It shares
-/// the SCENE uniform's camera rather than binding its own, because a brush
-/// already spends three bind groups and this hardware allows four -- see
-/// `wgsl_ssr_block_shared_camera`.
-/// How far the baked sun mask's signed distance reaches either side of the
-/// shadow's edge, in mask texels. Red 0..255 maps to -this..+this; blue to a
-/// penumbra half-width of 0..this. The baker's
-/// `brush_lightmap::SUN_MASK_DISTANCE_TEXELS` must equal it -- the bake's
-/// `the_sun_mask_range_matches_the_renderer` holds the two together.
 pub const SUN_MASK_DISTANCE_TEXELS: f32 = 4.0;
 
-/// How far a STATIONARY lamp's mask distance reaches, in mask texels, and its
-/// penumbra: each lamp's pair of bytes decodes as the sun mask's red and blue.
-/// `space_soup_engine::brush_lightmap::STATIONARY_MASK_DISTANCE_TEXELS` must
-/// equal it, and the baker's `the_stationary_mask_range_matches_the_renderer`
-/// holds the two together.
 pub const STATIONARY_MASK_DISTANCE_TEXELS: f32 = 4.0;
 
-/// WHAT THE SKY'S SUN CAN DO AT EACH BRUSH FACE, read off the baked sun mask
-/// (`XrRenderer::set_brush_lightmap`), so each face can be drawn with the
-/// smallest scene reader that gives it the same picture. See [`FaceSun`].
-///
-/// WHY: the scene reader sits at the Quest's instruction-cache cliff. At 3,387
-/// instructions it drew hall_front in 16.3 ms; at 3,398 -- ten ALU more, the
-/// same registers and occupancy -- in 18.6, the brush draw 35% slower
-/// (headset, 2026-10-01). The cliff is the size of the shader, not of the path
-/// a pixel takes: code a pixel skips still counts. So code goes out of the
-/// shader, for the faces where it can never run.
-///
-/// MEASURED (headset, 2026-10-01, synced GPU): the readers compile to 3,050
-/// instructions (sunless), 3,257 (baked) and 3,398 (full). With every face of
-/// the shipped level on the first two, hall_front went 18.70 -> 16.48 ms,
-/// hall_back 16.54 -> 14.76, hallway 17.10 -> 14.84, brick_hall 17.83 ->
-/// 14.89, torch_pillar 16.43 -> 14.38. The baked reader has ~130 instructions
-/// of room under the cliff: spend them knowingly.
-///
-/// EXACT, not approximate: a face's class rests on every mask texel its pixels
-/// can read -- its `uv2_rect`, plus [`SUN_MASK_READ_REACH`] for the bilinear
-/// taps at the deepest mip the mask's sampler allows -- in the mask as the GPU
-/// holds it, which is [`dilate_sun_mask`]'s.
 pub struct SunFaces {
-    /// Summed-area tables, `(width + 1) x (height + 1)`: of the mask texels the
-    /// sun may reach (anything but baked and hidden), and of the texels with no
-    /// bake.
+
     reachable: Vec<u32>,
     unbaked: Vec<u32>,
     width: u32,
     height: u32,
 }
 
-/// Which scene reader a brush face takes. See [`SunFaces`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaceSun {
-    /// Every texel its pixels can read is baked (the baker's green >= 128,
-    /// which `pack_sun_mask_texel` turns into the shader's `sun_mask.g > 0.25`)
-    /// and fully hidden (red 0: a signed distance of -4 texels, at or past any
-    /// width the shader widens to -- the penumbra's at most 4, and `fwidth` of
-    /// a constant 0). There the shader's mask is exactly 0, the lamp pre-pass
-    /// culled every directional light, and the sun contributed exactly
-    /// nothing. Averaging such texels keeps both, so every mip of them is the
-    /// same. Drawn without the sun (`SKY_SUN_NEVER_REACHES`).
+
     Never,
-    /// Every texel it can read is baked, so every read -- any blend of them, at
-    /// any mip -- has green above a half, `receiver_sun_mask` is never the -1
-    /// of "no bake", and the level's static sun map is never sampled. Drawn
-    /// without that lookup (`SUN_MASK_EVERYWHERE`).
+
     Baked,
-    /// Anything else -- a face with no bake within reach. The full reader.
+
     Unbaked,
 }
 
-/// Mask texels round a face's patch that its pixels' reads can touch: a
-/// bilinear read at the deepest level the sampler allows,
-/// `SUN_MASK_MIP_LEVELS - 1` = 4, spans 2x2 texels of 16 -- at most 24 mask
-/// texels either side of the sample, which stays inside the patch.
 pub const SUN_MASK_READ_REACH: u32 = 32;
 
 impl SunFaces {
-    /// From the mask as the GPU holds it -- [`dilate_sun_mask`]'s RGBA, before
-    /// `pack_sun_mask_texel`; `None` for one that does not hold
-    /// `width x height` texels.
+
     pub fn from_mask(rgba: &[u8], width: u32, height: u32) -> Option<Self> {
         let (w, h) = (width as usize, height as usize);
         if w == 0 || h == 0 || rgba.len() < w * h * 4 {
@@ -2086,8 +1459,6 @@ impl SunFaces {
         Some(Self { reachable, unbaked, width, height })
     }
 
-    /// The class of the face whose patch is `uv2_rect` (atlas uv: min u, min v,
-    /// max u, max v).
     pub fn class_of(&self, uv2_rect: [f32; 4]) -> FaceSun {
         if !uv2_rect.iter().all(|c| c.is_finite()) {
             return FaceSun::Unbaked;
@@ -2114,12 +1485,9 @@ impl SunFaces {
         }
     }
 
-    /// `indices` (triangles of `vertices`) reordered by class -- the faces the
-    /// sun never reaches, then the baked ones, then the rest, each in its own
-    /// order -- with where the first two parts end.
     pub fn partition(&self, vertices: &[BrushVertex], indices: &[u32]) -> (Vec<u32>, [u32; 2]) {
         let mut parts: [Vec<u32>; 3] = [Vec::with_capacity(indices.len()), Vec::new(), Vec::new()];
-        // The faces' triangles arrive together; one table read a face.
+
         let mut last: Option<([f32; 4], FaceSun)> = None;
         for tri in indices.chunks_exact(3) {
             let rect = vertices.get(tri[0] as usize).map_or([f32::NAN; 4], |v| v.uv2_rect);
@@ -2142,20 +1510,6 @@ impl SunFaces {
     }
 }
 
-/// THE BRUSH SUN MASK WITH THE ATLAS'S EMPTY TEXELS FILLED from the charts
-/// beside them, out to [`SUN_MASK_READ_REACH`]: each takes the texel of the
-/// nearest baked one along its row, else along its column from those.
-///
-/// The empty atlas holds zeros -- "no bake" -- and a read near a chart packed
-/// beside it blends them in once it is deep enough in the mips: the chart's
-/// sun fades toward hidden, and where its green falls under a half the read
-/// stops counting as baked and the sun drops to the level's static map. Filled
-/// from the chart, the read stays the chart's own, as a chart's gutter keeps
-/// it at shallower levels. And it is what lets every face of a baked level be
-/// [`FaceSun::Baked`] or better: unfilled, the empty atlas lay within reach of
-/// nearly every chart, and 97% of the shipped level's brush area kept the full
-/// reader; filled, none -- 40% never reached, 60% baked (the shipped-level
-/// test in `quest_app::brush_render`).
 pub fn dilate_sun_mask(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     let (w, h) = (width as usize, height as usize);
     let mut px = rgba.to_vec();
@@ -2164,8 +1518,7 @@ pub fn dilate_sun_mask(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     }
     let reach = SUN_MASK_READ_REACH as usize;
     let filled = |px: &[u8], i: usize| px[i * 4 + 1] >= 128;
-    // ROWS: the nearer of the nearest baked texels left and right, found
-    // before any of the row is written.
+
     let mut left = vec![usize::MAX; w];
     let mut sources = Vec::new();
     for y in 0..h {
@@ -2200,10 +1553,7 @@ pub fn dilate_sun_mask(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
             px.copy_within((row + s) * 4..(row + s) * 4 + 4, (row + x) * 4);
         }
     }
-    // COLUMNS, from what the rows left, walked row by row so memory is read in
-    // order: the nearest filled texel above on the way down, below on the way
-    // up. Only unfilled texels are written, and every source is a filled one,
-    // so no texel is read after it changes.
+
     let mut above = vec![u8::MAX; w * h];
     let mut last = vec![usize::MAX; w];
     for y in 0..h {
@@ -2240,8 +1590,6 @@ pub fn dilate_sun_mask(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     px
 }
 
-/// The scene reader's source for the faces of one [`FaceSun`] class: the full
-/// reader with its sun switch for that class set. See [`SunFaces`].
 pub(crate) fn sun_reader_shader(source: String, class: FaceSun) -> String {
     let switch = match class {
         FaceSun::Never => "SKY_SUN_NEVER_REACHES",
@@ -2257,20 +1605,9 @@ fn brush_shader_with(ssr: bool) -> String {
     brush_shader_variant(ssr, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG)
 }
 
-/// The photograph slots declared as push constants, in place of
-/// `PROBE_MAX_SLOTS`'s line and after it. A pipeline whose shader holds it is
-/// laid out with `uniforms::PROBE_PUSH_SIZE` bytes of them (`from_source`), and
-/// its pass sets them (`render_frame`, `UniformBuffer::probe_push`).
 const IMMEDIATE_DECLARATION: &str =
     "const PROBE_MAX_SLOTS: i32 = 16;\nvar<immediate> probe_push: array<vec4<f32>, 16>;\n";
 
-/// THE PROBE PASS'S SCAN READING PUSH CONSTANTS: `lights::probe_nearest_two`'s
-/// two reads of each slot taken from `probe_push` -- sixteen `vec4` of centre
-/// and room, the same bytes the camera block holds there, so the same slots,
-/// order and picture. No uniform block reached constant memory in this shader,
-/// whatever its size or indexing (exp63); push constants live there by
-/// definition. exp64, hall_front: render 2.20 -> 1.84 ms an eye, against
-/// 1.60 with no choice made at all.
 const PUSH_SCAN: [(&str, &str); 2] = [
     ("const PROBE_MAX_SLOTS: i32 = 16;\n", IMMEDIATE_DECLARATION),
     (
@@ -2279,7 +1616,6 @@ const PUSH_SCAN: [(&str, &str); 2] = [
     ),
 ];
 
-/// `src` with [`PUSH_SCAN`], or `None` when it does not hold the scan's reads.
 fn push_scan(src: &str) -> Option<String> {
     if !PUSH_SCAN.iter().all(|(from, _)| src.contains(from)) {
         return None;
@@ -2287,8 +1623,6 @@ fn push_scan(src: &str) -> Option<String> {
     Some(PUSH_SCAN.iter().fold(src.to_string(), |s, (from, to)| s.replacen(from, to, 1)))
 }
 
-/// `src` reading its slots as push constants where `device` has them, and
-/// unchanged otherwise.
 fn with_push_scan(device: &Device, src: String) -> String {
     if !device.features().contains(wgpu::Features::IMMEDIATES) {
         return src;
@@ -2296,39 +1630,8 @@ fn with_push_scan(device: &Device, src: String) -> String {
     push_scan(&src).unwrap_or(src)
 }
 
-/// The deferred cut that reads the slots from the camera block, as the probe
-/// pass did until 2026-10-02: the push constants' price.
 const SCAN_FROM_UNIFORMS: &str = "def_scan_uniform";
 
-/// The brush shader with each diagnostic chosen by the caller.
-///
-/// The shipped shader is `brush_shader_with`, which reads the build switches;
-/// this exists so a debug pipeline can be built BESIDE it and chosen at runtime
-/// (see [`DebugView`]) without the shipped text changing by a byte.
-/// REFLECTIONS AT HALF RESOLUTION.
-///
-/// The probe reflection -- choosing the room's photographs, tracing the ray
-/// through rooms, doorways and what stands in them, reading the photographs
-/// that saw the hit -- was the most expensive thing the brush shader did:
-/// 18 ms of a 46 ms frame in the marble hall (headset A/B, 2026-09-27), more
-/// than everything else it lights. It is also the part whose DETAIL is
-/// bounded by something coarser than the screen: a 256-pixel probe texel spans
-/// about five screen pixels at the shipped render scale, so a reflection
-/// computed at every screen pixel resolves nothing the photographs hold.
-///
-/// So it has its own pass: the brushes drawn again at half the eye's
-/// resolution (a quarter of the pixels) with a shader that writes only the
-/// probe reflection -- `lights::probe_env_for_pass`, normalised and
-/// premultiplied by its coverage -- and the scene pass's brush shader reads it
-/// back (`BrushProbe::Read`), four texels around each pixel, keeping only those
-/// on the same surface by depth so a reflection never bleeds across a
-/// silhouette. Built with `PROBE_ENV_FROM_PASS`, that shader carries none of the
-/// trace, which also frees the registers the trace held.
-///
-/// Mono scene passes only for now; a stereo pass keeps tracing per pixel.
-/// `Levers::half_res_reflections` switches it off to measure it.
-/// MEASUREMENT ONLY: the DEFERRING probe pass (the one that ships) with one
-/// part cut out at a time -- see `BrushPipeline::log_deferred_register_cuts`.
 const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("def_cut_none", &[]),
     ("def_cut_rim_detect", &[("        if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
@@ -2344,21 +1647,14 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
         "def_cut_record",
         &[("            slot = probe_fixup_begin(hit, world_pos, d, dir, roughness, probe_lod, trace_room, recolour);", "            slot = -1;")],
     ),
-    // No beam's light on a lit surface in the pass's colours: what it costs
-    // the pass by its presence. See `lights::probe_surface_relit`.
+
     (
         "def_cut_relight",
         &[(crate::renderer::lights::SURFACE_RELIT_READ, ""), (crate::renderer::lights::SURFACE_RELIT_CALL, "")],
     ),
-    // The model cards' colour back in the pass, as before 2026-10-01 (the
-    // fix-up still colours those hits again, so the picture is the same): what
-    // the cards cost the pass by their presence. See `lights::probe_hit_carded`.
+
     ("def_cards_in_pass", &[("    if (model && !PROBE_SECONDARY_DEFERRED) {", "    if (model) {")]),
-    // ROLLED LOOPS: each fixed-count loop's bound made one the compiler cannot
-    // see through (a uniform that is never that large), so it cannot unroll
-    // it -- does the trace's size come from copies of its loop bodies? The
-    // room hops (3), a proxy's surface samples (5) and the field walk (32),
-    // the ground march (64 steps, 5 readings). Same picture.
+
     ("def_rolled_trace", &[(ROLL_TRACE_FROM, ROLL_TRACE_TO)]),
     ("def_rolled_proxy", &[(ROLL_SAMPLES_FROM, ROLL_SAMPLES_TO), (ROLL_FIELD_FROM, ROLL_FIELD_TO)]),
     ("def_rolled_ground", &[(ROLL_GROUND_FROM, ROLL_GROUND_TO), (ROLL_READINGS_FROM, ROLL_READINGS_TO)]),
@@ -2372,8 +1668,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             (ROLL_READINGS_FROM, ROLL_READINGS_TO),
         ],
     ),
-    // ...and the pass exactly as it was: no hit on cards recorded for the fix-up
-    // but those `PROBE_RETEST` marks. The picture before, to compare against.
+
     (
         "def_cards_before",
         &[
@@ -2384,10 +1679,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("def_cut_proxy_surface", &[("    if (s0 < 0) {\n        return 3.4e38;\n    }", "    if (true) {\n        return 3.4e38;\n    }")]),
     ("def_cut_escape_colour", &[("    if (h.escaped) {\n        col = probe_escape_colour(", "    if (false) {\n        col = probe_escape_colour(")]),
     ("def_cut_untraced", &[("    return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);", "    return own;")]),
-    // PRESENCE, not execution: code that runs for nothing while its lever is
-    // off still costs on this GPU (see `shader-code-size` in the notes). The
-    // floor mirror's blend (off as shipped), every character in the pass, and
-    // SpaceWarp's reach target.
+
     (
         "def_cut_floor_mirror",
         &[(
@@ -2409,11 +1701,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             "    return ProbePassOut(reflection, vec2<f32>(0.0, probe_face_code(n_geom)));",
         )],
     ),
-    // THE STAGES' SIZES, to split the pass along (2026-10-01: it misses the
-    // instruction cache three times as often as the scene reader over its
-    // cliff). The trace replaced by a hit read from a uniform, so nothing
-    // after it folds away; the hit's colour by its own fields; everything
-    // after the material reads by them.
+
     ("def_cut_trace", &[("    let hit = probe_trace(world_pos, d, trace_room, roughness);", STAGE_CUT_HIT)]),
     (
         "def_cut_colour",
@@ -2439,10 +1727,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             "    let reflection = vec4<f32>(face_pos * rough_aa, ao + baked.a + dot(baked.rgb, n));",
         )],
     ),
-    // THE HIT'S PHOTOGRAPHS READ IN TURN, as before 2026-10-01: the second's
-    // depth inside its branch, each colour after the weights that keep it.
-    // The same picture; what reading them together saves. See
-    // `lights::probe_hit_colour`.
+
     (
         "def_hit_serial",
         &[
@@ -2458,9 +1743,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             ),
         ],
     ),
-    // THE HIT'S PHOTOGRAPHS CHOSEN BY WALKING the two rooms' chains, as before
-    // 2026-10-01, in place of `lights::probe_nearest_two`'s fixed scan: the
-    // same two, so the same picture; what the walk's dependent reads cost.
+
     (
         "def_hit_walk",
         &[(
@@ -2500,30 +1783,24 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     }",
         )],
     ),
-    // THE HIT'S SCAN WRITTEN OUT, one block a slot, as shipped for a day: the
-    // same two photographs, so the same picture; whether the loop still wins.
+
     (
         "def_scan_unrolled",
         &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_unrolled(h, room, other);")],
     ),
-    // THE SCAN FROM A UNIFORM BLOCK OF ITS OWN (`lights::probe_select`): the
-    // same bytes bound twice, so the same picture; whether the driver keeps a
-    // small block read only at counted indices in constant memory.
+
     (
         "def_scan_const",
         &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_const(h, room, other);")],
     ),
-    // The same block, read written out, at fixed places.
+
     (
         "def_scan_const_unrolled",
         &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_const_unrolled(h, room, other);")],
     ),
-    // THE SLOTS FROM THE CAMERA BLOCK, as before 2026-10-02, in place of the
-    // push constants that ship (`PUSH_SCAN`): what they buy.
+
     (SCAN_FROM_UNIFORMS, &[]),
-    // THE SCAN'S READS, priced: the same loop and comparisons over made-up
-    // rooms and capture points, so no table is read. Not the same picture;
-    // what is left is what the choice costs with its data in registers.
+
     (
         "def_scan_noload",
         &[(
@@ -2531,9 +1808,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             "        let room = a;\n        let v = vec3<f32>(f32(i)) - p;",
         )],
     ),
-    // THE SCAN WITHOUT ITS STOP: all sixteen slots, those past the live count
-    // given a room no pixel is in. The same picture; whether a loop with no
-    // exit is scheduled better than one with a uniform one.
+
     (
         "def_scan_flat",
         &[(
@@ -2541,8 +1816,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             "        let room = select(-2.0, camera.probe_boxes[i * 3 + 2].w, i < count);",
         )],
     ),
-    // THE LOBE WIDENED FROM THE SHADING NORMAL'S DERIVATIVES again, as before
-    // 2026-10-01 (jitter plan, row 8): what the sharper reflections cost.
+
     (
         "def_rough_shading_n",
         &[(
@@ -2550,8 +1824,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             "    let rough_aa = specular_aa_roughness(rough, dpdx(n), dpdy(n));",
         )],
     ),
-    // THE CHOICE OF PHOTOGRAPHS, priced: the hit room's first two in place of
-    // the nearest two of both rooms'. Not the same picture.
+
     (
         "def_cut_slot_walk",
         &[(
@@ -2565,8 +1838,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     near.d1 = select(3.4e38, dot(cut_v1, cut_v1), near.s1 >= 0);",
         )],
     ),
-    // THE HIT'S TWO DEPTH READS, priced: texels that vouch for the point
-    // exactly. Close to the same picture where the photographs saw the hit.
+
     (
         "def_cut_hit_depth",
         &[(
@@ -2574,28 +1846,20 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             "    let depth0 = vec4<f32>(-normalize(v0), -length(v0));\n    let depth1 = vec4<f32>(-normalize(v1), -length(v1));",
         )],
     ),
-    // B2 (2026-10-06): WHAT RIDES THROUGH THE TRACE, held for after it. The
-    // face's code taken before the trace, so its normal is let go first: the
-    // same code.
+
     ("def_face_code_early", &[B2_FACE_CODE]),
-    // The reflected ray in the player's frame made again from the world's
-    // after the trace -- for the record, the colour and the capsules -- so
-    // only the world's rides through it: the same ray, to rounding.
+
     ("def_dir_from_d", &[B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR]),
     ("def_dir_and_code", &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR]),
-    // The characters and the record both gone: whether their two 26s (each
-    // alone) make the 24 of the next step. Not the same picture.
+
     ("def_cut_characters_record", &[B2_NO_CHARACTERS, B2_NO_RECORD]),
-    // The light the capsules are lit by held as one grey through the trace,
-    // not a colour: what the colour costs. Not the same picture.
+
     ("def_lit_grey", &[B2_LIT_GREY, B2_CAPSULE_GREY]),
     ("def_dir_code_grey", &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR_GREY, B2_LIT_GREY]),
-    // The reflection's blur level worked out after the trace, from the
-    // roughness the trace holds anyway: the same level.
+
     ("def_lod_late", &[B2_LOD_EARLY, B2_LOD_LATE]),
     ("def_dir_code_lod", &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE]),
-    // The texel the record and the floor mirror name, its x and y packed in one
-    // word through the trace: the same texel.
+
     ("def_fragment_packed", &[B2_FRAG_DECL, B2_FRAG_SET, B2_FRAG_MIRROR, B2_FRAG_RECORD]),
     (
         "def_b2_lossless",
@@ -2604,15 +1868,12 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             B2_FRAG_DECL, B2_FRAG_SET, B2_FRAG_MIRROR, B2_FRAG_RECORD,
         ],
     ),
-    // The face centre's world position, which only a miss uses after the
-    // trace (`probe_choose`), worked out again there from the face centre
-    // instead of held through it: the same position.
+
     (
         "def_dlc_volume_late",
         &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_VOLUME_LATE],
     ),
-    // MEASUREMENT ONLY: a miss choosing its photographs at the surface, not
-    // the face centre -- whether that held position is in the peak at all.
+
     (
         "def_dlc_miss_at_hit",
         &[
@@ -2620,10 +1881,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             B2_MISS_CHOICE_AT_HIT, B2_MISS_PORTALS_AT_HIT,
         ],
     ),
-    // B2, THE SECOND ROUND (2026-10-06 evening), all on `def_dir_code_lod`
-    // (25). The capsules lit grey and the mip level late each took one
-    // register off `def_dir_and_code` (26), and were never asked together.
-    // Not the same picture.
+
     (
         "def_dlc_grey",
         &[
@@ -2631,10 +1889,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             B2_LOD_LATE,
         ],
     ),
-    // The surface's position rides through the trace twice: in the world's
-    // frame for the record and a miss, in the player's for the capsules. The
-    // world's made again after it from the player's: the same position, to
-    // the bit.
+
     (
         "def_dlc_pos_late",
         &[
@@ -2642,8 +1897,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             B2_POS_LATE_SET, B2_POS_LATE_RECORD, B2_POS_LATE_CHOICE, B2_POS_LATE_NEAR, B2_POS_LATE_FAR, B2_POS_LATE_PORTALS,
         ],
     ),
-    // The capsules' light through the trace in two words, not three: the same
-    // light to f16's rounding.
+
     (
         "def_dlc_lit_half",
         &[
@@ -2659,7 +1913,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             B2_LIT_HALF_DECL, B2_LIT_HALF_SET, B2_LIT_HALF_RECORD, B2_LIT_HALF_CAPSULES,
         ],
     ),
-    // Every exact one together: `def_b2_lossless` with both.
+
     (
         "def_b2_all_exact",
         &[
@@ -2677,8 +1931,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             B2_POS_LATE_PORTALS,
         ],
     ),
-    // THE TRACE'S OWN WORKING SET, a part at a time on `def_dir_code_lod`:
-    // where the 25 is. None the same picture.
+
     (
         "def_dlc_no_far_rim",
         &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_NO_FAR_RIM],
@@ -2724,22 +1977,14 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
         "def_dlc_one_hop",
         &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_ONE_HOP],
     ),
-    // THE PASS'S REPEATED CODE, each written once (2026-10-06): the pass is
-    // 8,877 instructions, misses the instruction cache on 0.14% of them (the
-    // frame's worst draw) and keeps its ALU 20% busy, so a loop's bookkeeping
-    // is cheap here where a copy is not. Each the same picture, to the byte:
-    // the same calls in the same order. See `shader_inlining`.
-    // The sky behind a building and the sky alone, one lookup.
+
     ("def_dedup_sky", &[DEDUP_OUTDOOR_SKY]),
-    // The three photographs read through a doorway (one room, or both
-    // sides'), one read in a loop.
+
     ("def_dedup_portals", &[DEDUP_PORTAL_SAMPLES]),
-    // An untraced reflection's two photographs, one read in a loop.
+
     ("def_dedup_near_far", &[DEDUP_NEAR_FAR]),
     ("def_dedup_all", DEDUP_EDITS),
-    // B2, THE THIRD ROUND (2026-10-06 night): the doorway crossing, where the
-    // peak is. Each the same picture, to the bit. On the shipped pass alone,
-    // then on `def_b2_all_exact` (25).
+
     ("def_inv_per_use", &[B2_INV_FAR, B2_INV_SIDE, B2_INV_ENTER]),
     (
         "def_b2_inv_per_use",
@@ -2768,9 +2013,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             B2_LIT_HALF_CAPSULES, B2_INV_FAR, B2_INV_SIDE, B2_INV_ENTER, B2_RIM_REREAD,
         ],
     ),
-    // B2, THE FOURTH ROUND (build 122): the crossing's depth read asked only
-    // what it is for. On the shipped pass, and on `def_b2_all_exact`. The same
-    // picture.
+
     ("def_seen_texel_only", &[B2_SEEN_TEXEL_ONLY]),
     (
         "def_b2_seen_texel_only",
@@ -2781,17 +2024,13 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             B2_LIT_HALF_CAPSULES, B2_SEEN_TEXEL_ONLY,
         ],
     ),
-    // ... and the crossing's parts cut, on `def_dir_code_lod`: where its six
-    // registers are. Not the same picture.
+
     ("def_dlc_seen_uniform", &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_SEEN_UNIFORM]),
     ("def_dlc_no_side", &[B2_FACE_CODE, B2_RAY_DECL, B2_RAY_SET, B2_RECORD_DIR, B2_COLOUR_DIR, B2_CAPSULE_DIR, B2_LOD_EARLY, B2_LOD_LATE, B2_NO_SIDE]),
-    // B5 AS IT CAN SHIP TO BOTH PASSES: the sky and the untraced pair, each of
-    // which left the ground at 24 (build 121); not the doorway reads' loop,
-    // which took it to 27.
+
     ("def_dedup_sky_near_far", &[DEDUP_OUTDOOR_SKY, DEDUP_NEAR_FAR]),
 ];
-/// `def_dedup_all`'s edits, which the ground's probe pass takes too
-/// (`terrain_cut_dedup_all`).
+
 pub(crate) const DEDUP_EDITS: &[(&str, &str)] = &[DEDUP_OUTDOOR_SKY, DEDUP_PORTAL_SAMPLES, DEDUP_NEAR_FAR];
 pub(crate) const DEDUP_OUTDOOR_SKY: (&str, &str) = (
     "    if (b.x >= 0.0) {\n        let c = building_colour(e + d * b.x, i32(b.y), roughness, b.x);\n        probe_reach = b.x;\n        return c.rgb * c.a + sky_reflection(d, dir, lod) * (1.0 - c.a);\n    }\n    return sky_reflection(d, dir, lod);\n",
@@ -2799,7 +2038,7 @@ pub(crate) const DEDUP_OUTDOOR_SKY: (&str, &str) = (
 );
 pub(crate) const DEDUP_PORTAL_SAMPLES: (&str, &str) = (
     "        if (own_room == low_room || own_room == high_room) {
-            // One side is this surface's own room: blend toward the other.
+
             let other_room = select(low_room, high_room, own_room == low_room);
             let w_other = reach * select(1.0 - w_high, w_high, own_room == low_room);
             let other = probe_volume_sample(other_room, select_world, world_pos, d, lod);
@@ -2809,8 +2048,7 @@ pub(crate) const DEDUP_PORTAL_SAMPLES: (&str, &str) = (
             probe_brightness = mix(probe_brightness, volume_sample_brightness, w_other);
             return mix(own, other, w_other);
         }
-        // In the wall between them -- the jambs, the threshold -- neither side
-        // is this surface's room, so the doorway answers outright.
+
         let a = probe_volume_sample(low_room, select_world, world_pos, d, lod);
         let a_bright = volume_sample_brightness;
         let b = probe_volume_sample(high_room, select_world, world_pos, d, lod);
@@ -2873,7 +2111,6 @@ pub(crate) const DEDUP_NEAR_FAR: (&str, &str) = (
 ",
 );
 
-// The edits of B2's cuts, above.
 const B2_FACE_CODE: (&str, &str) = (
     "    let reflection = probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);\n    return ProbePassOut(reflection, vec2<f32>(probe_reach, probe_face_code(n_geom)));",
     "    let face_code = probe_face_code(n_geom);\n    let reflection = probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);\n    return ProbePassOut(reflection, vec2<f32>(probe_reach, face_code));",
@@ -2943,9 +2180,7 @@ const B2_CAPSULE_DIR_GREY: (&str, &str) = (
     "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, refl, roughness, env, probe);\n    }",
     "    if (probe_floor_mirror_here) {\n        probe = probe_floor_mirror_pass(probe, roughness);\n    } else {\n        probe = capsule_reflection(world_pos, to_player_direction(probe_ray_world), roughness, probe_capsule_lit, probe);\n    }",
 );
-// `def_dlc_pos_late`: `late_zero` is 0 from a uniform the compiler cannot see
-// through, so the positions made after the trace are not merged back into the
-// ones made before it.
+
 const B2_POS_LATE_SET: (&str, &str) = (
     "    let hit = probe_trace(world_pos, d, trace_room, roughness);\n",
     "    let hit = probe_trace(world_pos, d, trace_room, roughness);\n    let late_zero = vec3<f32>(f32(camera.post_params.z > 3.0e38));\n    let world_late = to_world_space(frag_pos + late_zero);\n    let select_late = to_world_space(select_pos + late_zero);\n    let volume_late = select(select_late, to_world_space(probe_volume_pos.xyz + late_zero), probe_volume_pos.w > 0.5);\n",
@@ -2968,7 +2203,7 @@ const B2_POS_LATE_PORTALS: (&str, &str) = (
     "    return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);",
     "    return probe_through_portals(own, own_room, select_late, world_late, d, probe_lod);",
 );
-// `def_dlc_lit_half`.
+
 const B2_LIT_HALF_DECL: (&str, &str) = (
     "var<private> probe_capsule_lit: vec3<f32> = vec3<f32>(0.0);\n",
     "var<private> probe_capsule_lit: vec3<f32> = vec3<f32>(0.0);\nvar<private> probe_capsule_lit_half: vec2<u32> = vec2<u32>(0u);\nfn probe_capsule_lit_read() -> vec3<f32> {\n    return vec3<f32>(unpack2x16float(probe_capsule_lit_half.x), unpack2x16float(probe_capsule_lit_half.y).x);\n}\n",
@@ -2985,7 +2220,7 @@ const B2_LIT_HALF_CAPSULES: (&str, &str) = (
     "        probe = capsule_reflection(world_pos, to_player_direction(probe_ray_world), roughness, env, probe);",
     "        probe = capsule_reflection(world_pos, to_player_direction(probe_ray_world), roughness, probe_capsule_lit_read(), probe);",
 );
-// The trace's parts, for `def_dlc_no_*`: each cut so what follows it stays.
+
 const B2_NO_FAR_RIM: (&str, &str) =
     ("        if (hit.rim < 0.0) {\n            let spread_far", "        if (false) {\n            let spread_far");
 const B2_NO_NEAR_RIM: (&str, &str) = ("        if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {", "        if (false) {");
@@ -3003,12 +2238,7 @@ const B2_NO_PROXIES: (&str, &str) = (
 const B2_NO_DOORWAY_START: (&str, &str) = ("    if (!in_room) {\n", "    if (false) {\n");
 const B2_NO_PORTALS: (&str, &str) = ("        let p = probe_portal_at(e, cur, axis);", "        let p = -1;");
 const B2_ONE_HOP: (&str, &str) = (ROLL_TRACE_FROM, "    for (var hop = 0; hop < 1; hop = hop + 1) {");
-// B2, THE THIRD ROUND: the trace's loop-carried reciprocal (`inv`, and the
-// `moving` it is chosen by) made again at each of its three uses in the loop,
-// each from its own opaque zero so the compiler cannot merge them back into
-// one value held round the loop -- the same `1.0 / d`, to the bit. And the
-// doorway's corners read again for the far rim, after the depth read they
-// were held across. See `def_dlc_no_portals` (19): the peak is in that block.
+
 const B2_INV_FAR: (&str, &str) = (
     "        let far = select(vec3<f32>(3.4e38), max((hi - hit.origin) * inv, (lo - hit.origin) * inv), moving);",
     "        let inv_far = select(vec3<f32>(3.4e38), 1.0 / (d + vec3<f32>(f32(camera.post_params.z > 3.0e38))), abs(d) > vec3<f32>(1e-6));\n        let far = select(vec3<f32>(3.4e38), max((hi - hit.origin) * inv_far, (lo - hit.origin) * inv_far), abs(d) > vec3<f32>(1e-6));",
@@ -3025,24 +2255,19 @@ const B2_RIM_REREAD: (&str, &str) = (
     "            let in_a = min(e2[a] - plo[a], phi[a] - e2[a]);\n            let in_b = min(e2[b] - plo[b], phi[b] - e2[b]);",
     "            let plo_far = camera.probe_portals[p * 3 + i32(camera.post_params.z > 3.3e38)].xyz;\n            let phi_far = camera.probe_portals[p * 3 + 1 + i32(camera.post_params.z > 3.3e38)].xyz;\n            let in_a = min(e2[a] - plo_far[a], phi_far[a] - e2[a]);\n            let in_b = min(e2[b] - plo_far[b], phi_far[b] - e2[b]);",
 );
-// B2, THE FOURTH ROUND: what the crossing's depth read is for. Only "the
-// photograph saw nothing this way" (`probe_seen_distance` < 0) is asked, which
-// is the texel alone -- no direction normalised, no distance divided out after
-// the read. The same answer for every texel, NaN included.
+
 const B2_SEEN_TEXEL_ONLY: (&str, &str) = (
     "        let escapes = probe_seen_distance(oslot, d) < 0.0;",
     "        let seen_texel = textureSampleLevel(probe_depth, probe_depth_samp, d, i32(camera.probe_boxes[oslot * 3].w), 0.0);\n        let escapes = dot(seen_texel.xyz, seen_texel.xyz) < 0.25 && !(seen_texel.w > 0.5);",
 );
-// DIAGNOSTICS, not the same picture: the crossing a part at a time.
+
 const B2_SEEN_UNIFORM: (&str, &str) = (
     "        let escapes = probe_seen_distance(oslot, d) < 0.0;",
     "        let escapes = other + 1.0 == camera.portal_params.z || camera.post_params.z > 3.0e38;",
 );
 const B2_NO_SIDE: (&str, &str) =
     ("        let t_side = t_exit + min(min(side.x, side.y), side.z);", "        let t_side = 3.4e38 + camera.post_params.z;");
-/// The fixed-count loops of the probe pass, and each with its bound hidden
-/// from the compiler: `post_params.z` is never past 3e38, so the count is the
-/// same. See `def_rolled_all`.
+
 const ROLL_TRACE_FROM: &str = "    for (var hop = 0; hop < PROBE_TRACE_ROOMS; hop = hop + 1) {";
 const ROLL_TRACE_TO: &str =
     "    for (var hop = 0; hop < PROBE_TRACE_ROOMS + i32(camera.post_params.z > 3.0e38); hop = hop + 1) {";
@@ -3058,8 +2283,6 @@ const ROLL_READINGS_FROM: &str = "            for (var k = 1; k < GROUND_TRACE_R
 const ROLL_READINGS_TO: &str =
     "            for (var k = 1; k < GROUND_TRACE_READINGS + i32(camera.post_params.z > 3.0e38); k = k + 1) {";
 
-/// `def_cut_trace`'s hit: every field from a uniform the compiler cannot see
-/// through, so the code that reads it all stays.
 const STAGE_CUT_HIT: &str = "    var hit: ProbeHit;
     hit.pos = world_pos + d * camera.post_params.z;
     hit.room = trace_room;
@@ -3076,22 +2299,16 @@ const STAGE_CUT_HIT: &str = "    var hit: ProbeHit;
     hit.edge_t = camera.post_params.z;
     hit.edge_code = i32(camera.post_params.w * 100.0) - 1;";
 
-/// The spots' tent counted to `shadow_params.w` where that is set, nine taps
-/// where it is not (as uploaded): see `scene_tent_opaque`.
 const SHADOW_TENT_OPAQUE: (&str, &str) = (
     "    for (var t = 0; t < 9; t = t + 1) {\n        let x = pcf_tent_tap_axis(",
     "    for (var t = 0; t < select(9, i32(camera.shadow_params.w), camera.shadow_params.w > 0.5); t = t + 1) {\n        let x = pcf_tent_tap_axis(",
 );
-/// A 3x3 box's outer loop likewise: see `scene_box_opaque`.
+
 const SHADOW_BOX_OPAQUE: (&str, &str) = (
     "    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {",
     "    for (var dx: i32 = -1; dx <= select(1, i32(camera.shadow_params.w), camera.shadow_params.w > 0.5); dx = dx + 1) {",
 );
 
-/// MEASUREMENT ONLY: the scene pass's brush shader (the one reading the probe
-/// pass) with one part cut out at a time -- see
-/// `BrushPipeline::log_scene_register_cuts`. Text edits of the generated WGSL;
-/// nothing draws with them.
 const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("scene_cut_none", &[]),
     ("scene_cut_lamp_loop", &[("    var todo = reaching;\n", "    var todo = 0u;\n")]),
@@ -3118,22 +2335,13 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             "    if (false) {\n        let h = normalize(l_dir + view_dir);\n        let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;\n        out.specular",
         )],
     ),
-    // THE SPOTS' SHADOWS, all of them: the spotless twin
-    // (`lights::without_spot_shadows`). Until 2026-10-02 this cut edited the
-    // first match of the spot test's line -- in `light_debug`, which the
-    // reader never calls -- and so measured nothing.
+
     ("scene_cut_spot_shadow", &[("const SPOT_SHADOWS: bool = true;", "const SPOT_SHADOWS: bool = false;")]),
-    // The spots' tent and the 3x3 boxes counted to a uniform the compiler
-    // cannot see -- `shadow_params.w`, 0 as uploaded, reading as the constant
-    // -- so it cannot write the loops out: whether they were, and what it
-    // cost the readers' size. The same taps and the same shadows. Measured
-    // (deploy112): 66, 23 and 89 instructions MORE than the full reader's
-    // 3,688. Counted to a constant they are the smaller code; the spots'
-    // shadow code is 286 instructions either way (`scene_cut_spot_shadow`).
+
     ("scene_tent_opaque", &[SHADOW_TENT_OPAQUE]),
     ("scene_box_opaque", &[SHADOW_BOX_OPAQUE, SHADOW_BOX_OPAQUE]),
     ("scene_shadow_loops_opaque", &[SHADOW_TENT_OPAQUE, SHADOW_BOX_OPAQUE, SHADOW_BOX_OPAQUE]),
-    // The sun's shadow, the level's and the moving things' both.
+
     (
         "scene_cut_sun_shadow",
         &[
@@ -3145,12 +2353,7 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             ("                    if (!SKY_SUN_NEVER_REACHES && map == SUN_MOVING_MAP) {", "                    if (false) {"),
         ],
     ),
-    // THE SHADOW MAPS READ AT THEIR OWN CALLS, as before 2026-10-06: the
-    // sun's moving things inside `sun_visibility`, a characters' tile in
-    // `character_shadow`, a spot's in `pcf_layer` -- a transform and a kernel
-    // each. The same lookups and shadows; against `scene_cut_none`, what
-    // reading every map at one place saves, and on the headset (where the
-    // offline frame has no shadows) the proof that the picture is the same.
+
     (
         "scene_moving_two_reads",
         &[
@@ -3168,20 +2371,15 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
             "            let cos_angle = dot(-l_dir, l.direction.xyz);\n        }\n    }\n\n    let aa = terminator_aa(dot(n, l_dir));\n    let ndotl = aa.x;\n    let radiance = l.color_intensity.rgb * l.color_intensity.a;\n    out.diffuse",
         )],
     ),
-    // DIAGNOSTIC: a spot's edge not averaged along the pixel's long step --
-    // the cone as it was before 2026-10-05. Not the same picture.
+
     ("scene_cut_spot_average", &[("const SPOT_EDGE_AVERAGE: bool = true;", "const SPOT_EDGE_AVERAGE: bool = false;")]),
-    // The upsample's four face tests in `READER_EDITS`' other two forms, here
-    // for their instruction counts and the offline picture. The same picture.
+
     ("scene_cut_face_same_loop", &[FACE_SAME_LOOP]),
     ("scene_cut_face_same_calls", &[FACE_SAME_CALLS]),
-    // The lamp loop by a wave-uniform index (`READER_EDITS`), and the same
-    // with the reach tests in it. The same picture.
+
     ("scene_cut_lamp_loop_uniform", &[LAMP_LOOP_UNIFORM]),
     ("scene_cut_lamp_loop_merged", &[LAMP_REACHES_FN, LAMP_WALK_NO_MASK, LAMP_LOOP_MERGED]),
-    // DIAGNOSTIC: the pixel's long step from the normal it shades with, a
-    // bump's, as it was until 2026-10-06 -- white specks past the pools' tips
-    // on stone. See `spot_long_step`. Not the same picture.
+
     ("scene_cut_spot_long_mapped", &[SPOT_LONG_MAPPED]),
     (
         "scene_cut_sky",
@@ -3196,93 +2394,56 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ),
     ("scene_cut_terminator_aa", &[("    terminator_width = terminator_width_of(length(tn));", "")]),
     ("scene_cut_contact", &[("    let contact = capsule_ambient(world_pos, n);", "    let contact = 1.0;")]),
-    // THE SPOTS' SHADOWS WITH THE BOX they had before 2026-10-01, in place of
-    // the tent (`lights::pcf_tile_tent_at`): the same nine taps. Against
-    // `scene_cut_none`, both the full reader.
+
     ("scene_box_spots", &[("    return pcf_tile_tent_lean_at(\n        tex,", "    return pcf_tile_at(\n        tex,")]),
-    // THE TENT WRITTEN OUT (`lights::pcf_tile_tent_unrolled_at`), as it
-    // shipped for a day: the same taps, weights and picture in more code.
+
     ("scene_tent_unrolled", &[("    return pcf_tile_tent_lean_at(\n        tex,", "    return pcf_tile_tent_unrolled_at(\n        tex,")]),
-    // THE TENT AS A LOOP OVER PICKED TAPS (`lights::pcf_tile_tent_at`), as it
-    // shipped until B1 -- the lean form (nothing per axis held across its loop)
-    // ships since -- and with its positions and weights at half precision
-    // (`pcf_tile_tent_half_at`): the same taps, for the registers.
+
     ("scene_tent_loop", &[("    return pcf_tile_tent_lean_at(\n        tex,", "    return pcf_tile_tent_at(\n        tex,")]),
     ("scene_tent_half", &[("    return pcf_tile_tent_lean_at(\n        tex,", "    return pcf_tile_tent_half_at(\n        tex,")]),
-    // THE WHOLE READER AT `f32`: its aliases no longer match the text
-    // `shader_precision::for_device` rewrites, so every `hf` stays `f32`.
-    // Against `scene_cut_none` in one build, the precision alone -- with
-    // `HALF_PRECISION` on; off as shipped since B1, this IS `scene_cut_none`.
+
     ("scene_all_f32", &[("alias hf = f32;\n", "alias hf = f32; // scene_all_f32\n")]),
 ];
 
-/// MEASUREMENT: text edits of every scene reader's generated WGSL -- the
-/// brushes' and the ground's alike -- that keep the picture and change the
-/// code, for `Levers::reader_edit`: an earlier form of one piece of reader
-/// code, drawn in place of the shipped readers with the same choice per frame
-/// and face, so the two forms are priced against each other in one session in
-/// the configuration that ships. `reader_edit_none` rebuilds them unedited,
-/// the control. Each find matches exactly once ([`with_reader_edit`]).
 pub(crate) const READER_EDITS: &[(&str, &[(&str, &str)])] = &[
     ("reader_edit_none", &[]),
-    // THE SKY WALKED, as builds 118-119 shipped it: one copy of its sum,
-    // walked over a two-bit mask for the normal and the mirror direction. The
-    // two calls it replaced were faster in every view (build 120).
+
     ("sky_walked", &[SKY_WALKED_DIFFUSE, SKY_WALKED_REFLECTION]),
-    // THE SUN'S MOVING MAP AT ITS FIXED ROW: its transform apart from the
-    // other maps', which are read at a row known only per lamp -- as before
-    // build 118, a second copy of the transform.
+
     ("sun_matrix_fixed", &[SUN_MATRIX_FIXED]),
-    // THE UPSAMPLE'S FOUR FACE TESTS, shipped since build 127 as one test on
-    // all four taps at once: as four inlined calls, as they were until then
-    // (`shader_inlining`: 68 proxy units, after the sky the readers' largest
-    // repeat; 0.05-1.2 ms slower, build 126), or in a loop the compiler is
-    // not told the count of. The same answer for every tap.
+
     ("face_same_calls", &[FACE_SAME_CALLS]),
     ("face_same_loop", &[FACE_SAME_LOOP]),
-    // THE SPOT'S LONG STEP FROM THE NORMAL SHADED WITH, a bump's, as it was
-    // until 2026-10-06 (`spot_long_step`): white specks past the pools on
-    // stone. Against the plane's step, which took the sunless brush reader
-    // from 19 registers to 20 (build 125). Not the same picture.
+
     ("spot_long_mapped", &[SPOT_LONG_MAPPED]),
-    // THE LAMP LOOP OVER EVERY LIVE LAMP IN TURN, skipping those this pixel's
-    // walk did not mark, instead of jumping to each marked one: the same lamps
-    // in the same order, so the same sum. The lamp's index is then the same
-    // in every lane, where `countTrailingZeros` of a per-pixel mask made each
-    // lamp's four uniform reads per-lane loads. The same picture.
+
     ("lamp_loop_uniform", &[LAMP_LOOP_UNIFORM]),
-    // THE SAME, WITH THE REACH TESTS IN THE LOOP: the walk before it finds only
-    // the nearest bulb, and the loop tests each lamp as the walk did before
-    // shading it, so no mask of reaching lamps is held through it -- the
-    // register `lamp_loop_uniform` added (19 -> 20 overall, build 127). The
-    // same lamps in the same order. The same picture.
+
     ("lamp_loop_merged", &[LAMP_REACHES_FN, LAMP_WALK_NO_MASK, LAMP_LOOP_MERGED]),
 ];
-/// `lamp_loop_merged`'s reach test: the walk's culling, verbatim, as a
-/// function of one lamp.
+
 const LAMP_REACHES_FN: (&str, &str) = (
     "fn shade_material_lamps(",
     "fn lamp_reaches(i: u32, world_pos: vec3<f32>, pixel_long: f32, culling: bool) -> bool {\n    let kind = lights.lights[i].params.z;\n    let to_lamp = lights.lights[i].position.xyz - world_pos;\n    let dist_sq = dot(to_lamp, to_lamp);\n    if (kind > 1.5 && SKY_SUN_NEVER_REACHES) {\n        return false;\n    }\n    if (culling) {\n        if (CULL_RANGE_FIRST && kind < 1.5 && dist_sq >= lights.lights[i].params.x * lights.lights[i].params.x) {\n            return false;\n        }\n        if (stationary_visibility_of(lights.lights[i].position.w) <= 0.0) {\n            return false;\n        }\n        if (kind < 1.5) {\n            let reach = lights.lights[i].params.x;\n            if (!CULL_RANGE_FIRST && dist_sq >= reach * reach) {\n                return false;\n            }\n            if (kind > 0.5) {\n                let cos_outer = lights.lights[i].params.y;\n                let authored = max(lights.lights[i].direction.w - cos_outer, 0.0001);\n                let inv_dist = inverseSqrt(max(dist_sq, 1e-6));\n                let at_most = SPOT_EDGE_MIN_PIXELS * pixel_footprint * inv_dist;\n                let widen = clamp(at_most - authored, 0.0, authored * (SPOT_EDGE_MAX_WIDEN - 1.0));\n                let zero_below = cos_outer - 0.5 * widen - select(0.0, 0.5 * pixel_long * inv_dist, SPOT_EDGE_AVERAGE) - 1e-4;\n                let along = -dot(to_lamp, lights.lights[i].direction.xyz);\n                let bound_sq = zero_below * zero_below * max(dist_sq, 1e-8);\n                let outside = select(\n                    along < 0.0 && along * along >= bound_sq,\n                    along <= 0.0 || along * along <= bound_sq,\n                    zero_below >= 0.0,\n                );\n                if (outside) {\n                    return false;\n                }\n            }\n        } else if (receiver_sun_mask == 0.0) {\n            return false;\n        }\n    }\n    return true;\n}\n\nfn shade_material_lamps(",
 );
-/// The walk keeps its nearest bulb and marks nothing.
+
 const LAMP_WALK_NO_MASK: (&str, &str) = ("        reaching = reaching | (1u << i);\n", "");
-/// The loop over every live lamp by a wave-uniform index, testing each.
+
 const LAMP_LOOP_MERGED: (&str, &str) = (
     LAMP_LOOP_UNIFORM.0,
     "    for (var i: u32 = surface_light_count(); i < live_light_count(); i = i + 1u) {\n        if (!lamp_reaches(i, world_pos, pixel_long, culling)) {\n            continue;\n        }\n        let l = lights.lights[i];\n",
 );
-/// The lamp loop's head as `shade_material_lamps` ships it, and as one walk
-/// over every live lamp by a wave-uniform index.
+
 const LAMP_LOOP_UNIFORM: (&str, &str) = (
     "    var todo = reaching;\n    loop {\n        if (todo == 0u) {\n            break;\n        }\n        let i = countTrailingZeros(todo);\n        todo = todo & (todo - 1u);\n        let l = lights.lights[i];\n",
     "    for (var i: u32 = surface_light_count(); i < live_light_count(); i = i + 1u) {\n        if ((reaching & (1u << i)) == 0u) {\n            continue;\n        }\n        let l = lights.lights[i];\n",
 );
-/// The spot's long step as `long_step_from_plane` writes it, and as it was.
+
 const SPOT_LONG_MAPPED: (&str, &str) = (
     "fn spot_long_step(vn: f32) -> f32 {\n    return pixel_long_step;\n}",
     "fn spot_long_step(vn: f32) -> f32 {\n    return pixel_footprint * inverseSqrt(max(abs(vn), SPOT_LONG_MIN_COS));\n}",
 );
-/// The upsample's face test as `probe_pass::READER_WGSL` ships it.
+
 const FACE_SAME_FROM: &str = "    let code_i = i32(code) - 1;\n    let codes_i = vec4<i32>(codes) - vec4<i32>(1);\n    let face_dx = abs(codes_i / vec4<i32>(32) - vec4<i32>(code_i / 32));\n    let face_dy = abs(codes_i % vec4<i32>(32) - vec4<i32>(code_i % 32));\n    let facing = (codes < vec4<f32>(0.5)) | vec4<bool>(code < 0.5) | ((face_dx <= vec4<i32>(2)) & (face_dy <= vec4<i32>(2)));\n";
 const FACE_SAME_LOOP: (&str, &str) = (
     FACE_SAME_FROM,
@@ -3305,8 +2466,6 @@ const SUN_MATRIX_FIXED: (&str, &str) = (
     "            var c = vec4<f32>(0.0);\n            if (map == SUN_MOVING_MAP) {\n                c = shadow_coords(world_pos, camera.moving_view_proj[SUN_MOVING_MAP]);\n            } else {\n                c = shadow_coords(world_pos, camera.moving_view_proj[map]);\n            }\n",
 );
 
-/// `src` with one of [`READER_EDITS`]: `None` when `edit` names no entry, or
-/// one of its finds does not match exactly once.
 pub(crate) fn with_reader_edit(src: String, edit: &str) -> Option<String> {
     let (_, edits) = READER_EDITS.iter().find(|(name, _)| *name == edit)?;
     let mut src = src;
@@ -3319,9 +2478,6 @@ pub(crate) fn with_reader_edit(src: String, edit: &str) -> Option<String> {
     Some(src)
 }
 
-/// MEASUREMENT ONLY: what `BrushPipeline::log_probe_pass_register_cuts` cuts
-/// out of the probe pass's shader, one pipeline each -- text edits of the
-/// generated WGSL. They change what the shader computes; nothing draws with them.
 const PROBE_PASS_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("cut_none", &[]),
     ("cut_edge_lookup", &[("    if (hit.edge_code >= 0 && edge_cover < 0.99) {\n", "    if (false) {\n")]),
@@ -3348,34 +2504,10 @@ pub mod probe_pass {
         TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDimension,
     };
 
-    /// Radiance and coverage: premultiplied RGB, coverage in A.
     pub const FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
-    /// THE REFLECTION'S REACH, the pass's second target: how far each texel's
-    /// reflected ray travelled to what it shows, in metres (`probe_reach`),
-    /// 0 where no brush was drawn. SpaceWarp reads it to move a reflected image
-    /// with the point it is an image of. See `space_warp::reflected_point`.
-    ///
-    /// And in G WHICH WAY THE TEXEL'S SURFACE FACES (`FACE_CODE_WGSL`), so the
-    /// scene pass and the blur never hand one face's reflection to another:
-    /// see `READER_WGSL`.
     pub const REACH_FORMAT: TextureFormat = TextureFormat::Rg16Float;
 
-    /// WHICH WAY A SURFACE FACES, as a code a half-resolution texel can carry
-    /// beside its reach: the geometric normal, octahedrally encoded (pole up,
-    /// so walls lie on the octahedron's waist and never on its fold) at 32
-    /// steps each way, plus one -- 0 is "unknown", and every code is an integer
-    /// a 16-bit float holds exactly.
-    ///
-    /// WHY. Depth cannot tell two faces apart where they meet: at a convex
-    /// corner both are continuous with the edge. The pillar's side, seen
-    /// almost edge-on, is a sliver one or two pixels wide that the
-    /// half-resolution pass all but misses; its pixels took the FRONT face's
-    /// texels -- the sunlit doorway behind the player, the lamp's pool on the
-    /// floor -- and multiplied them by the side's own grazing Fresnel, near 1:
-    /// a bright green line, then white specks, down the pillar's corner
-    /// (headset, 2026-10-01 01:00:07). The blur made it wider by blurring
-    /// the side's texels with the front's.
     pub(crate) const FACE_CODE_WGSL: &str = r#"
 fn probe_face_code(n: vec3<f32>) -> f32 {
     let a = n / max(abs(n.x) + abs(n.y) + abs(n.z), 1e-6);
@@ -3387,10 +2519,6 @@ fn probe_face_code(n: vec3<f32>) -> f32 {
     return 1.0 + q.x * 32.0 + q.y;
 }
 
-// Whether two codes are one surface's: within two steps each way, about 12
-// degrees -- a face is one code exactly, a curved surface's neighbours a step
-// or so apart -- or either unknown (a texel the terrain drew, which writes no
-// code: it is read as it always was).
 fn probe_face_same(a: f32, b: f32) -> bool {
     if (a < 0.5 || b < 0.5) {
         return true;
@@ -3402,52 +2530,28 @@ fn probe_face_same(a: f32, b: f32) -> bool {
 }
 "#;
 
-    /// THE CHARACTERS' FLOOR MIRROR, beside the pass in its target: the
-    /// characters -- the player's own body and everyone else's -- rendered
-    /// mirrored in the floor the player stands on, at the pass's resolution,
-    /// which the scene's brush shader lays over that floor's reflection
-    /// (`MIRROR_READ_WGSL`). A floor is a plane, so its reflection of anything
-    /// above it is exactly that thing seen through the plane, and a mesh drawn
-    /// mirrored is the character itself -- limbs, clothes, pose -- where the
-    /// trace's capsules were grey blobs of its mean colour (user, 2026-09-29:
-    /// "replacing the capsule reflections with a cheap mirror of just the
-    /// character"). Only characters are drawn: everything else in the room is
-    /// in the probes already, and the trace's reach says what stands in front
-    /// of them.
-    ///
-    /// The format: their radiance times [`MIRROR_EXPOSURE`], premultiplied
-    /// by coverage, with a short mip chain for a rough floor's blur.
     pub const MIRROR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
-    /// Levels of the mirror's blur: level k is 2^k texels of the pass across.
+
     pub const MIRROR_MIPS: u32 = 5;
-    /// The exposure the mirror pass renders at, through the untoned curve (a
-    /// clamp): radiance up to sixteen fits.
+
     pub const MIRROR_EXPOSURE: f32 = 1.0 / 16.0;
-    /// The mirror's plane in the PLAYER's frame: the floor the player stands
-    /// on, at their feet.
+
     pub const FLOOR_MIRROR_PLANE: f32 = 0.0;
-    /// `capsule_params.w` carries the plane this far above its height, so
-    /// that a zeroed uniform means no mirror.
+
     pub const FLOOR_MIRROR_BIAS: f32 = 4096.0;
-    /// The eye's near and far planes (`XrRenderer`'s `Camera::xr_projection`),
-    /// from which the reader turns the mirror's depth back into a distance.
+
     pub const EYE_NEAR: f32 = 0.03;
     pub const EYE_FAR: f32 = 1000.0;
 
-    /// What a probe-pass shader returns, and how a pipeline recognises one: a
-    /// shader built with it gets the reach target as well (`from_source`).
     pub const OUTPUT_SIGNATURE: &str = "-> ProbePassOut";
     pub(crate) const OUTPUT_WGSL: &str = r#"
 struct ProbePassOut {
     @location(0) reflection: vec4<f32>,
-    // The reach, and the face's code: see `REACH_FORMAT`.
+
     @location(1) reach: vec2<f32>,
 }
 "#;
 
-    /// The pass's two colour targets, for a pipeline that draws into it.
-    /// `reach` false leaves the second one unwritten -- the terrain, whose
-    /// ground reflects nothing SpaceWarp needs to move.
     pub fn targets(reach: bool) -> [Option<wgpu::ColorTargetState>; 2] {
         [
             Some(wgpu::ColorTargetState { format: FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL }),
@@ -3459,17 +2563,11 @@ struct ProbePassOut {
         ]
     }
 
-    /// Group 3 of the reading brush shader: the pass's colour and its depth,
-    /// a bilinear sampler for the colour and a point sampler to gather the
-    /// depths, and the reach target for its faces' codes. See `READER_WGSL`. The depth is the glare's too, which reads
-    /// it per vertex to find whether a wall hides a lamp (`glare`).
     pub fn bind_group_layout(device: &Device) -> BindGroupLayout {
         let texture = |binding: u32, sample_type: TextureSampleType| BindGroupLayoutEntry {
             binding,
             visibility: if binding == 1 { ShaderStages::VERTEX_FRAGMENT } else { ShaderStages::FRAGMENT },
-            // Arrays, one layer an eye: the reader picks its eye's layer with
-            // `view_slot`, which is 0 in a single-eye pass -- so one shader
-            // serves the per-eye and the two-eye scene pass alike.
+
             ty: BindingType::Texture { sample_type, view_dimension: TextureViewDimension::D2Array, multisampled: false },
             count: None,
         };
@@ -3491,41 +2589,32 @@ struct ProbePassOut {
         })
     }
 
-    /// A half-resolution probe pass's target -- one eye's, or both eyes' as
-    /// the two layers of one for the multiview scene pass -- and the bind
-    /// group the scene pass reads it through.
     pub struct Target {
         _color: Texture,
-        /// What the pass renders into: layer 0, or every layer when stereo.
+
         pub color_view: TextureView,
         _reach: Texture,
-        /// The reach target, rendered into as the colour is; for one eye also
-        /// what SpaceWarp's motion pass reads. See `REACH_FORMAT`.
+
         pub reach_view: TextureView,
         _depth: Texture,
         pub depth_view: TextureView,
         _mirror: Texture,
-        /// The characters' floor mirror, by layer and then level: level 0 is
-        /// what its pass renders into, the rest its blur. See `MIRROR_FORMAT`.
+
         pub mirror_levels: Vec<Vec<TextureView>>,
         _mirror_depth: Texture,
-        /// Its depth, a layer each.
+
         pub mirror_depth_views: Vec<TextureView>,
-        /// The first layer's mirror with its blur levels, and its reach alone:
-        /// what a single-eye probe pass and its fix-up read. See `probe_fixup`.
+
         pub mirror_view: TextureView,
         pub reach_single: TextureView,
         _samplers: [Sampler; 2],
         pub bind_group: BindGroup,
-        /// The colour blurred, for one eye: see `probe_blur`. `None` for two.
+
         pub soft: Option<Soft>,
         pub width: u32,
         pub height: u32,
     }
 
-    /// A single-eye target's reflections after `probe_blur`: what the blur
-    /// writes, and the scene pass's group 3 reading them in place of the
-    /// colour, with the same depth and samplers.
     pub struct Soft {
         _texture: Texture,
         pub write_view: TextureView,
@@ -3533,9 +2622,7 @@ struct ProbePassOut {
     }
 
     impl Target {
-        /// For eyes `eye_width` x `eye_height`: half each way, rounded up, so
-        /// the last column and row of pixels still have a texel. `layers` is 1
-        /// for one eye, 2 for both in one multiview pass.
+
         pub fn new(device: &Device, layout: &BindGroupLayout, eye_width: u32, eye_height: u32, layers: u32) -> Self {
             let (width, height) = (eye_width.div_ceil(2).max(1), eye_height.div_ceil(2).max(1));
             let layers = layers.max(1);
@@ -3551,8 +2638,7 @@ struct ProbePassOut {
                     view_formats: &[],
                 })
             };
-            // Storage as well, for one eye: `probe_fixup` writes the texels
-            // whose secondary lookups the pass deferred.
+
             let color = make(
                 "probe_pass_color",
                 FORMAT,
@@ -3560,9 +2646,7 @@ struct ProbePassOut {
             );
             let depth = make("probe_pass_depth", TextureFormat::Depth32Float, TextureUsages::empty());
             let reach = make("probe_pass_reach", REACH_FORMAT, TextureUsages::empty());
-            // Rendered into as a plain 2D view for one eye, as the array for
-            // two (a multiview pass takes its view count from it); read as
-            // the array either way.
+
             let attachment = |t: &Texture| {
                 t.create_view(&wgpu::TextureViewDescriptor {
                     dimension: Some(if layers > 1 { TextureViewDimension::D2Array } else { TextureViewDimension::D2 }),
@@ -3575,7 +2659,7 @@ struct ProbePassOut {
             let (color_view, depth_view) = (attachment(&color), attachment(&depth));
             let reach_view = attachment(&reach);
             let (color_array, depth_array, reach_array) = (array(&color), array(&depth), array(&reach));
-            // THE FLOOR MIRROR: its colour with its blur levels, and its depth.
+
             let mirror_mips = MIRROR_MIPS.min(width.min(height).max(1).ilog2() + 1);
             let mirror = device.create_texture(&TextureDescriptor {
                 label: Some("probe_pass_mirror"),
@@ -3584,9 +2668,7 @@ struct ProbePassOut {
                 sample_count: 1,
                 dimension: TextureDimension::D2,
                 format: MIRROR_FORMAT,
-                // COPY_SRC and COPY_DST so a test can fill a level and read
-                // its blur back. See `the_floor_mirrors_blur_levels_average_the_level_below`.
-                // STORAGE_BINDING: its blur levels are written by `MirrorMips`.
+
                 usage: TextureUsages::RENDER_ATTACHMENT
                     | TextureUsages::TEXTURE_BINDING
                     | TextureUsages::STORAGE_BINDING
@@ -3607,7 +2689,7 @@ struct ProbePassOut {
             };
             let mirror_levels = (0..layers).map(|l| (0..mirror_mips).map(|k| single(&mirror, l, k)).collect()).collect();
             let mirror_depth_views = (0..layers).map(|l| single(&mirror_depth, l, 0)).collect();
-            // The first layer whole, every level: what the probe pass samples.
+
             let mirror_view = mirror.create_view(&wgpu::TextureViewDescriptor {
                 dimension: Some(TextureViewDimension::D2),
                 base_array_layer: 0,
@@ -3615,7 +2697,7 @@ struct ProbePassOut {
                 ..Default::default()
             });
             let reach_single = single(&reach, 0, 0);
-            // Clamped at the edges, exactly as the four-texel path clamps.
+
             let sampler = |label: &str, filter: FilterMode| {
                 device.create_sampler(&SamplerDescriptor {
                     label: Some(label),
@@ -3641,8 +2723,7 @@ struct ProbePassOut {
                 })
             };
             let bind_group = reading("probe_pass_bg", &color_array);
-            // The blurred colour, for one eye: written by `probe_blur` after the
-            // fix-up, read by the scene pass in place of the colour.
+
             let soft = (layers == 1).then(|| {
                 let texture = make("probe_pass_soft", FORMAT, TextureUsages::STORAGE_BINDING);
                 let write_view = attachment(&texture);
@@ -3672,20 +2753,14 @@ struct ProbePassOut {
     }
 
     impl Target {
-        /// The floor mirror's colour texture, every layer and level.
+
         pub fn mirror_texture(&self) -> &Texture {
             &self._mirror
         }
     }
 
-    /// THE FLOOR MIRROR'S BLUR LEVELS, each the mean of the four texels of the
-    /// level below it -- one bilinear read at their shared corner -- so a rough
-    /// floor reads its characters as blurred as its lobe (`MIRROR_READ_WGSL`).
-    /// Premultiplied colour averages with its coverage, so an outline blurs
-    /// into what lies past it rather than into black.
     pub struct MirrorMips {
-        /// One pipeline and layout for each number of blur levels (1..=4),
-        /// since a storage binding per level cannot be left empty.
+
         variants: Vec<(wgpu::ComputePipeline, BindGroupLayout)>,
     }
 
@@ -3740,13 +2815,6 @@ struct ProbePassOut {
             Self { variants }
         }
 
-        /// Every level above the first of `levels` (one layer's), in ONE
-        /// compute dispatch: each workgroup takes a 32 x 32 block of the first
-        /// level and makes all four above it through workgroup memory. It
-        /// replaced a render pass per level -- eight a frame, whose fixed
-        /// cost was all they cost: 0.2 ms an eye on the headset (2026-09-30).
-        /// `size`: the first level's width and height; `timer`: a pass
-        /// timer's slot for the dispatch.
         pub fn record(
             &self,
             device: &Device,
@@ -3773,10 +2841,6 @@ struct ProbePassOut {
         }
     }
 
-    /// The blur levels' compute shader for `n` levels above the first: level k
-    /// is the mean of the four texels of level k-1 below it, exactly as one
-    /// bilinear read at their shared corner was. Premultiplied colour averages
-    /// with its coverage, so an outline blurs into what lies past it.
     fn mirror_mips_wgsl(n: usize) -> String {
         let mut s = String::from("@group(0) @binding(0) var level0: texture_2d<f32>;\n");
         for k in 1..=n {
@@ -3845,20 +2909,9 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
         s
     }
 
-    /// The pass's fragment body, after the brush shader's shared preamble
-    /// (footprint, albedo, normal mapping): the probe reflection for this
-    /// surface and nothing else, from the same inputs the scene pass hands
-    /// `shade_material_env`.
     pub(super) const PASS_LIGHTING: &str = r#"
     let rough = textureSample(mat_rough, mat_rough_samp, in.uv, i32(in.material)).r;
-    // WIDENED BY THE SURFACE'S CURVATURE, not its normal map's: the
-    // derivatives of the GEOMETRIC normal (Tokuyoshi & Kaplanyan, *Stable
-    // Geometric Specular Antialiasing with Projected-Space NDF Filtering*,
-    // JCGT 2021). The map's own variation is already in the roughness mips
-    // (`roughness_chain_with_normal_variance`), and the derivatives of a
-    // minified normal map are aliased themselves: widening by them made the
-    // lobe's width jump from quad to quad, which added aliasing in the scene
-    // shader (2026-09-30) and did here what it did there. Zero on a flat face.
+
     let rough_aa = specular_aa_roughness(rough, dpdx(n_geom), dpdy(n_geom));
     let ao = textureSample(mat_ao, mat_samp, in.uv, i32(in.material)).r;
     let lm_uv = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
@@ -3871,84 +2924,40 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
         + face_b * clamp(dot(face_d, face_b), -in.face_half_extent.y, in.face_half_extent.y);
     probe_volume_pos = vec4<f32>(in.face_centre, 1.0);
     probe_face_given = in.probe_face;
-    // NOTHING TO TRACE WHERE THE SCENE WILL NOT USE IT. From this roughness up
-    // the scene shader's reflection is the lightmap's own light alone -- the
-    // probe's answer is multiplied by `1 - lobe_is_hemispherical`, exactly 0
-    // (see `shade_material_env_part`) -- so the trace, the most expensive thing
-    // in the frame, was spent on rough brick and rock to be thrown away: 5.5 ms
-    // of brick_hall_diagonal's 16.1 (headset A/B, 2026-09-30). Decided on the
-    // roughness the scene shader uses (not the widened one this pass blurs
-    // by), after every implicit-derivative sample above; nothing is recorded
-    // for the fix-up, and coverage 0 reads as the lightmap's light.
+
     if (clamp(rough, 0.04, 1.0) >= PROBE_LOBE_HEMISPHERICAL) {
         return ProbePassOut(vec4<f32>(0.0), vec2<f32>(0.0, probe_face_code(n_geom)));
     }
     let reflection = probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);
     return ProbePassOut(reflection, vec2<f32>(probe_reach, probe_face_code(n_geom)));"#;
 
-    /// Group 3 and the read, appended to the scene pass's brush shader.
     pub(crate) const READER_WGSL: &str = r#"
 @group(3) @binding(0) var probe_pass_tex: texture_2d_array<f32>;
 @group(3) @binding(1) var probe_pass_depth: texture_depth_2d_array;
 @group(3) @binding(2) var probe_pass_linear: sampler;
 @group(3) @binding(3) var probe_pass_point: sampler;
-// The reach target, read for the faces' codes in G. See `FACE_CODE_WGSL`.
+
 @group(3) @binding(4) var probe_pass_code: texture_2d_array<f32>;
 
-// `probe_pass_compress` undone: the pass stores `c / (1 + luminance)`, so the
-// filter averages texels as a display shows them. See the lights block.
 fn probe_pass_expand(c: vec3<f32>) -> vec3<f32> {
     return c / max(1.0 - dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-3);
 }
 
-// THE HALF-RESOLUTION PROBE REFLECTION AT THIS PIXEL: the four pass texels
-// around it, weighted bilinearly and kept only where their depth is this
-// pixel's AND their face's code is this pixel's `code` -- the same surface --
-// so a reflection never bleeds across a silhouette, nor round a corner onto
-// the other face. `tolerance` is how far two depths may differ and still be one
-// surface, from this pixel's own depth slope. With no neighbour on this surface
-// (a sliver the half-resolution pass missed), the nearest in depth that faces
-// this way; with none facing this way, no reflection -- the room's own light
-// stands in, as it does on a rough tile -- and never another face's: a
-// grazing sliver multiplies what it borrows by a Fresnel near 1 (see
-// `FACE_CODE_WGSL`). The pass stores the reflection compressed
-// (`probe_pass_compress`) and premultiplied by its coverage, which is what
-// makes the weighted sum a correct filter; both are undone here.
-//
-// TWO READS WHERE IT CAN BE, EIGHT WHERE IT MUST. The four depths come in one
-// gather. When all four are this pixel's surface -- everywhere but along an
-// outline -- the weighted sum IS bilinear filtering, so the hardware's one
-// filtered read replaces four loads. Only along an edge are the texels loaded
-// and weighted one by one. Unrolled rather than looped over an index: a
-// dynamically indexed local array is the Adreno cliff that spills to memory.
-//
-// This eye's layer is `view_slot`: 0 in a single-eye pass, the view index in a
-// multiview one.
 fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32, code: f32) -> vec4<f32> {
     let dims = textureDimensions(probe_pass_tex);
-    // A full-resolution pixel centre at `pixel` is at `pixel * 0.5` in the
-    // half-resolution texel grid.
+
     let uv = pixel * 0.5 / vec2<f32>(dims);
-    // A gather returns the footprint as (0,1) (1,1) (1,0) (0,0) from its
-    // corner; `.wzxy` puts it in the order (0,0) (1,0) (0,1) (1,1).
+
     let gaps = abs(textureGather(probe_pass_depth, probe_pass_point, uv, view_slot) - vec4<f32>(depth)).wzxy;
     let codes = textureGather(1, probe_pass_code, probe_pass_point, uv, view_slot).wzxy;
-    // `probe_face_same` on all four taps as ONE vector test: the same answer
-    // for every tap, where four calls were inlined four times over (build 126:
-    // 186 fewer instructions in the full reader; torch_pendant 19.45 -> 18.24
-    // ms, no view slower).
+
     let code_i = i32(code) - 1;
     let codes_i = vec4<i32>(codes) - vec4<i32>(1);
     let face_dx = abs(codes_i / vec4<i32>(32) - vec4<i32>(code_i / 32));
     let face_dy = abs(codes_i % vec4<i32>(32) - vec4<i32>(code_i % 32));
     let facing = (codes < vec4<f32>(0.5)) | vec4<bool>(code < 0.5) | ((face_dx <= vec4<i32>(2)) & (face_dy <= vec4<i32>(2)));
     let same = facing & (gaps <= vec4<f32>(tolerance));
-    // The texel or blend this pixel takes, still compressed and premultiplied:
-    // undone once, below, whichever way it was read.
-    // (One expand rather than one per path: 18 instructions on the Quest. Off
-    // the device it moves one outline pixel of the offline hall by one level,
-    // a compiler folding the edge path's two divisions differently; with a
-    // return per path the picture is the same to the byte -- 2026-10-06.)
+
     var pre: vec4<f32>;
     if (all(same)) {
         pre = textureSampleLevel(probe_pass_tex, probe_pass_linear, uv, view_slot, 0.0);
@@ -3965,8 +2974,7 @@ fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32, code: f32) 
         let bilinear = vec4<f32>((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
         let w = select(vec4<f32>(0.0), bilinear, same);
         let weight = w.x + w.y + w.z + w.w;
-        // Ties go to the first in that order, as they always have; only a texel
-        // facing this way, and none -- no reflection -- if none does.
+
         let far = vec4<f32>(3.4e38);
         let near = select(far, gaps, facing);
         var nearest = vec4<f32>(0.0);
@@ -3982,10 +2990,6 @@ fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32, code: f32) 
 }
 "#;
 
-    /// `floor_mirror_linear_depth`: the eye's distance along its axis to a
-    /// point at depth `d` (0 near, 1 far) in the eye's own projection
-    /// (`Camera::xr_projection` at [`EYE_NEAR`], [`EYE_FAR`], put into wgpu's
-    /// depth range).
     pub(crate) fn eye_linear_depth_wgsl() -> String {
         format!(
             r#"
@@ -4006,13 +3010,6 @@ fn brush_shader_variant(ssr: bool, sources: bool, ssr_debug: bool) -> String {
     brush_shader_modes(ssr, sources, ssr_debug, SsrPath::Inline)
 }
 
-/// WHICH OF THE THREE REFLECTIVE SHADERS THIS IS.
-///
-/// `Inline` marches and blends in one pass, which is what has always shipped.
-/// The other two are the buffered path: `Trace` marches and writes radiance and
-/// confidence, a resolve filters it across pixels, and `Composite` reads the
-/// filtered result and blends. Splitting them is what makes the hit/miss cliff
-/// removable at all -- a fragment can see its own ray and nothing else.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum SsrPath {
     Inline,
@@ -4020,64 +3017,39 @@ pub enum SsrPath {
     Composite,
 }
 
-/// The brush shader, with the reflection TRACE as a fourth mode.
-///
-/// `trace` draws the same geometry the reflective pass draws, runs the same
-/// march, and writes RADIANCE AND CONFIDENCE instead of a shaded colour -- see
-/// `ssr::SsrOutput::Radiance`. It is a separate pipeline rather than a flag
-/// because the two have different fragment outputs, and it exists so the
-/// reflection can be filtered ACROSS pixels before anything looks at it, which
-/// is the only place the hit/miss cliff can be removed.
 fn brush_shader_modes(ssr: bool, sources: bool, ssr_debug: bool, path: SsrPath) -> String {
     brush_shader_probe(ssr, sources, ssr_debug, path, BrushProbe::Trace)
 }
 
-/// WHERE A BRUSH SHADER'S PROBE REFLECTION COMES FROM. See `probe_pass`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum BrushProbe {
-    /// Traced per pixel, in the shader that shades. What always shipped.
+
     Trace,
-    /// The half-resolution probe pass itself: shades nothing, writes only the
-    /// probe reflection. See `probe_pass`.
+
     Pass,
-    /// The same pass, leaving each traced hit's secondary lookups to
-    /// `probe_fixup` (group 3: the record list). What ships in the single-eye
-    /// pass. See `lights::PROBE_SECONDARY_DEFERRED`.
+
     PassDeferred,
-    /// The scene pass's brush, reading that pass instead of tracing.
+
     Read,
 }
 
-/// How the brush shader's fragment entry point begins -- where an attribute on
-/// it goes. See `BrushPipeline::new_probe_pass_deferred`.
 const FS_MAIN: &str = "@fragment fn fs_main(";
 
-/// `brush_shader_modes`, with the probe reflection's source. See `BrushProbe`.
 fn brush_shader_probe(ssr: bool, sources: bool, ssr_debug: bool, path: SsrPath, probe: BrushProbe) -> String {
-    // Both forms of the probe pass share everything but the deferral.
+
     let pass_like = matches!(probe, BrushProbe::Pass | BrushProbe::PassDeferred);
     let trace = path == SsrPath::Trace;
     let composite = path == SsrPath::Composite;
     let ssr_block = match (ssr, path) {
         (true, SsrPath::Trace) => crate::renderer::ssr::wgsl_ssr_block_shared_camera_radiance(3),
-        // No march at all: the composite only reads what the resolve wrote.
+
         (true, SsrPath::Composite) => crate::renderer::ssr::wgsl_ssr_composite_block(3),
         (true, SsrPath::Inline) => {
             crate::renderer::ssr::wgsl_ssr_block_shared_camera_debug(3, ssr_debug)
         }
         (false, _) => String::new(),
     };
-    // The reflective variant returns the scene reflected in this surface;
-    // the plain one returns the shaded colour unchanged.
-    // DIAGNOSTIC BUILD SWITCH. Off in every shipped build.
-    //
-    // Red   = punctual light arriving before shadowing.
-    // Green = the same after shadowing.
-    // So: yellow means lit, red means shadowed away, black means no light ever
-    // reached the shader. `test_room` renders black interiors while the
-    // arithmetic says the floor under a lamp should be blown out, and this is
-    // the only way to tell those three apart on a headset that cannot be
-    // pixel-read from the host.
+
     if BRUSH_LIGHT_DEBUG {
         return format!(
             r#"
@@ -4112,26 +3084,13 @@ struct VOut {{
             lights_block = wgsl_lights_block(0, 1),
         );
     }
-    // See `BRUSH_SOURCE_DEBUG`. Normalised so the three sources are compared
-    // by RATIO -- a dim room and a lit one read the same, and what shows is
-    // which term dominates rather than how bright the pixel is.
-    // See `BRUSH_EDGE_DEBUG`. Only emitted for the diagnostic, so a shipping
-    // build carries neither the extra varying nor the extra interpolation.
+
     let (edge_varying, edge_vs, edge_debug) = if BRUSH_EDGE_DEBUG {
         (
-            // THE SAME VALUE AS `world_pos`, interpolated at the centroid of
-            // the covered samples instead of at the pixel centre. The two are
-            // identical wherever the centre is inside the polygon, so their
-            // difference IS the extrapolation, with nothing else in it.
+
             "    @location(9) @interpolate(perspective, centroid) world_pos_centroid: vec3<f32>,\n",
             "    out.world_pos_centroid = v.pos;\n",
             r#"
-    // How far the pixel centre sits outside its own polygon, in PIXELS rather
-    // than metres -- so a near wall and a far one read the same and what shows
-    // is the geometry of the sampling, not the distance to it.
-    //
-    // `fwidth(world_pos)` is the world-space span of one pixel, which is the
-    // only honest unit to divide by here.
     let edge_delta = length(in.world_pos - in.world_pos_centroid);
     let edge_pixel = length(fwidth(in.world_pos));
     let edge_out = edge_delta / max(edge_pixel, 1e-6);
@@ -4153,98 +3112,26 @@ struct VOut {{
     } else {
         ""
     };
-    // REPLACES the normal tail rather than preceding it. Emitting a debug
-    // `return` in front of the real one leaves the real one unreachable, and
-    // naga rejects that -- caught by the pipeline-build tests, which is twice
-    // now that they have caught exactly this.
+
     let ssr_apply = if ssr {
         r#"
-    // SSR runs on the TONEMAPPED colour, because that is what the scene buffer
-    // it samples already holds -- reflecting a linear value into a tonemapped
-    // frame would make every reflection brighter than the thing reflected.
-    //
-    // Reflectivity is the material's own: smooth surfaces reflect and rough
-    // ones do not, weighted by Fresnel so a floor reflects hard at a grazing
-    // angle and barely at all underfoot. A fully rough face lands on zero and
-    // `ssr_reflect` returns immediately without marching.
-    // THE NEIGHBOURHOOD'S ROUGHNESS AND NORMAL DECIDE THE REFLECTION, not
-    // this texel's.
-    //
-    // Whether a pixel reflects, and where its ray goes, came from its own
-    // roughness texel and its own normal-map texel. On stone both vary texel
-    // to texel -- across the SSR threshold, and in direction -- so neighbouring
-    // pixels alternated between a screen-space hit, a miss and "too rough".
-    // The SSR false-colour view of the stone room (headset, 2026-09-11) was a
-    // per-pixel scatter of all three, and with no temporal accumulation to
-    // average it away that is sparkle.
-    //
-    // A coarse mip of the roughness map IS the neighbourhood's roughness, so a
-    // region takes one path. The normal keeps its detail only where the
-    // surface is smooth enough for detail to show in a reflection: polished
-    // marble keeps it, rough stone reflects along its face.
     let ssr_rough = textureSampleLevel(mat_rough, mat_rough_samp, in.uv, i32(in.material), 4.0).r;
     let ssr_n = normalize(mix(n_geom, n, 1.0 - smoothstep(0.1, 0.4, ssr_rough)));
     let ssr_view = normalize(cam_pos() - in.world_pos);
     let ssr_cos = clamp(dot(ssr_n, ssr_view), 0.0, 1.0);
     let ssr_fresnel = 0.04 + 0.96 * pow(1.0 - ssr_cos, 5.0);
-    // CAPPED, and no longer for the reason it first was.
-    //
-    // The original justification was that the reflection was SHARP whatever the
-    // surface roughness -- a single scene texel, so marble came back looking
-    // like chrome. That is fixed: the reflection is now read from a mip chosen
-    // by roughness. The cap stays as a deliberate conservatism while this is
-    // unverified on the headset, not as a correction for a missing blur, and it
-    // can be raised towards 1.0 -- a mirror-flat dielectric really does approach
-    // total reflection at a grazing angle.
+
     let reflectivity = clamp((1.0 - ssr_rough) * ssr_fresnel, 0.0, MAX_SSR_REFLECTIVITY);
-    // WHAT THIS SURFACE REFLECTS WHEN THE SCREEN CANNOT SAY.
-    //
-    // The shaded colour already contains a blurry environment reflection --
-    // the sky's harmonics plus the room's own bounce, Fresnel weighted. That
-    // is exactly the role a reflection probe plays, so it is handed in as the
-    // fallback: where a ray leaves the frame or hits nothing, the reflection
-    // softens back into the environment instead of disappearing.
-    //
-    // Previously the miss case returned the surface's own colour, so the edge
-    // of the screen was a hard line the reflection stopped at, and it moved
-    // with your head.
-    //
-    // READ FROM THE SCENE PASS, NOT SHADED AGAIN.
-    //
-    // This pass draws over a blit of the finished scene, and that scene pass
-    // already shaded this exact surface: every light, its shadow taps, the
-    // probe search and the lightmap. The fallback used to be `tonemap(c)` with
-    // `c` lit a second time here, so every visible reflective pixel paid for
-    // its lighting twice -- the eye pass measured 5 to 10 ms an eye in the
-    // marble hall (headset, 2026-09-11), in a frame whose budget is 13.9.
-    //
-    // The texel the blit wrote at this pixel IS that colour, already
-    // tonemapped and MSAA-resolved -- the same load the blit does, so the two
-    // cannot disagree. It also keeps anything the scene pass drew in front of
-    // the surface without writing depth, which a re-shade painted over.
-    "#
+"#
     } else {
         r#"
     return vec4<f32>(tonemap(c), albedo.a * in.tint.a);"#
     };
-    // THE LAST STATEMENT OF THE REFLECTIVE PATH, and the only thing the trace
-    // changes.
-    //
-    // Everything above it -- the normal, the roughness mip, the Fresnel term,
-    // `reflectivity` -- is the prep both modes need, and it is written ONCE.
-    // An earlier attempt gave the trace its own branch covering the whole
-    // block, which silently dropped the prep and left `ssr_n` undefined; naga
-    // caught it, but only because a test builds this pipeline.
+
     let ssr_tail = if !ssr {
         ""
     } else if composite {
-        // THE COMPOSITE. The reflection was traced and filtered already; all
-        // that is left is to decide how much of this pixel is reflection, which
-        // is its OWN reflectivity, and to hand the rest to the probe.
-        //
-        // `refl.a` is how much of the neighbourhood found anything, so the
-        // handover into the fallback is now a ramp rather than the cliff the
-        // headset showed as a comb along every silhouette.
+
         r#"
     let ssr_fallback = textureLoad(ssr_scene_color, vec2<i32>(in.clip.xy), 0).rgb;
     let refl = ssr_reflection_at(in.clip.xy);
@@ -4253,9 +3140,7 @@ struct VOut {{
         albedo.a * in.tint.a,
     );"#
     } else if trace {
-        // THE TRACE writes what the march found and how much to trust it, and
-        // nothing else: no fallback is read and no surface colour is written.
-        // `ssr_reflect` is already a `vec4` in this mode, so it IS the output.
+
         r#"
     return ssr_reflect(in.world_pos, ssr_n, vec3<f32>(0.0), reflectivity, ssr_rough);"#
     } else {
@@ -4267,10 +3152,7 @@ struct VOut {{
     );"#
     };
     let ssr_apply = format!("{ssr_apply}{ssr_tail}");
-    // THE SCENE PASS'S BRUSH WRITES HOW MUCH OF EACH PIXEL IS REFLECTION into
-    // alpha, which nothing blends with -- the reader's pipeline is opaque and
-    // the compositor ignores the eye image's alpha -- for SpaceWarp's motion
-    // pass to read back. See `lights::reflection_alpha`.
+
     let ssr_apply = if probe == BrushProbe::Read && !ssr {
         let plain = "    return vec4<f32>(tonemap(c), albedo.a * in.tint.a);";
         assert!(ssr_apply.contains(plain), "the brush shader's plain return moved");
@@ -4278,137 +3160,45 @@ struct VOut {{
     } else {
         ssr_apply
     };
-    // THE SHADING, unless this is the reflective pass drawing a shipped frame.
-    //
-    // That pass reads its surface colour back from the scene pass instead --
-    // see `ssr_fallback`. The lighting-sources diagnostic still shades here,
-    // because the sources it paints are recorded by `shade_material_env` as it
-    // runs and exist nowhere else.
+
     let lighting = if ssr && !sources {
         ""
     } else {
         r#"
     let rough = textureSample(mat_rough, mat_rough_samp, in.uv, i32(in.material)).r;
-    // NO RUNTIME SPECULAR ANTIALIASING HERE, measured (2026-09-30): the normal
-    // map's lost variation is already in the roughness mips (see
-    // `roughness_chain_with_normal_variance`), and widening further from the
-    // quad's derivatives of the normal -- `specular_aa_roughness`, as the probe
-    // pass and the terrain still do -- ADDED aliasing on every normal-mapped
-    // stone view against a 3x-supersampled reference: the derivatives of a
-    // minified normal map are aliased themselves, so the highlight's width
-    // jumped from quad to quad (hallway 0.601 -> 0.575, brick hall 0.896 ->
-    // 0.841 without it; widening from the map's own Toksvig length instead
-    // was worse still). `offline_frame::aliasing`.
+
     let rough_aa = rough;
-    // Each lamp's terminator across this pixel, from how much the normals
-    // under it disagree -- see `terminator_aa`.
+
     terminator_width = terminator_width_of(length(tn));
     let ao = textureSample(mat_ao, mat_samp, in.uv, i32(in.material)).r;
 
-    // RGB is baked direct+bounce and is ADDED; ALPHA is baked sky visibility
-    // and is MULTIPLIED into the sky term. The two neutral values differ --
-    // black adds nothing, 255 scales by one -- which is exactly what the
-    // unbaked default texture carries.
-    // CLAMPED INTO THIS FACE'S OWN PATCH. See `BrushVertex::uv2_rect`: an MSAA
-    // edge pixel's interpolated uv2 is extrapolated past the patch, and with no
-    // mips on the lightmap that overshoot is many atlas texels wide -- far past
-    // the 2-texel gutter. Sampling outside returns a neighbour's bake or the
-    // clear colour, which reads as a dotted line of darker pixels along every
-    // room seam, brightest where the baked contribution matters most.
     let lm_uv = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
     let baked = textureSample(lm_tex, lm_samp, lm_uv);
-    // The baked bounce is handed to the shading function as well as added:
-    // added because it is light arriving diffusely, and handed over because a
-    // shiny surface reflects the room that light came from. See
-    // `shade_material_env`.
-    // The direction map shares this atlas's layout exactly, so the same uv2
-    // addresses both. `shade_material_env` adds the bounce itself now, shaped
-    // by that direction -- adding it here as well would double it.
+
     let bdir = textureSample(lm_dir_tex, lm_samp, lm_uv);
-    // THE SKY SUN'S BAKED VISIBILITY, from the mask that rides with this
-    // atlas at four times its density -- same charts, same uv2, same clamp.
-    // Green marks a baked texel; the neutral mask an older bake leaves in its
-    // place has none, and then the sun falls back to the level's static map.
-    // Sampled here, in uniform control flow, like every texture above it.
+
     let sun_mask = textureSample(lm_sun_tex, lm_sun_samp, lm_uv);
-    // A SIGNED DISTANCE TO THE SHADOW'S EDGE, not a coverage.
-    //
-    // Coverage filtered bilinearly still draws the texel grid: a diagonal
-    // edge came out as a staircase of 3-6 cm steps across the doorway's sun
-    // patch (headset, 2026-09-25). Distances interpolate into a straight line,
-    // so the edge is rebuilt at 0 at any magnification. Its width is the
-    // sun's own penumbra (from how far the shadow's caster is) or one
-    // screen pixel, whichever is wider -- sharp where the caster is close,
-    // soft where it is far, and never aliased. An older coverage mask reads
-    // as distance 0 at half coverage, so it still works, only harder-edged.
-    //
-    // Green carries the rest (see `mesh::pack_sun_mask_texel`): under a half,
-    // no bake; from a half up, baked, with the penumbra's half-width across
-    // the upper half.
+
     let sun_d = (sun_mask.r - 0.5) * (2.0 * SUN_MASK_DISTANCE_TEXELS);
     let sun_pen = max(sun_mask.g - 0.5, 0.0) * (2.0 * SUN_MASK_DISTANCE_TEXELS);
     let sun_w = max(max(sun_pen, 0.5 * fwidth(sun_d)), 0.02);
     receiver_sun_mask = select(-1.0, smoothstep(-sun_w, sun_w, sun_d), sun_mask.g > 0.25);
-    // The baked lamps are in this atlas. See `receiver_skips_baked`.
+
     receiver_skips_baked = true;
-    // The albedo goes IN rather than being multiplied over the result: a
-    // dielectric's highlight is not tinted by its diffuse colour, and marble's
-    // 0.373 albedo was making every highlight nearly three times too dim.
-    // THE FRAGMENT'S POSITION, PUT BACK ON ITS OWN FACE.
-    //
-    // MSAA shades a pixel at its centre, which at a polygon edge can lie
-    // outside the polygon, and `world_pos` then arrives extrapolated past the
-    // edge. Every consumer of it inherits that, but only one AMPLIFIES it:
-    // `view_dir` feeds `cos_v`, and Fresnel's `pow(1 - cos_v, 5)` is steepest
-    // exactly at the grazing angles found along a ceiling-wall junction. On
-    // marble (`f_max` 0.952) that turns a sub-pixel position error into a
-    // ~26% swing in the probe term, which is the seam.
-    //
-    // Clamping into the face's own extent is a no-op for every interior pixel
-    // -- they are inside by construction -- and returns an edge pixel to the
-    // nearest point that is actually ON its face. Dropping the normal
-    // component puts it back on the face plane too, where it belongs.
-    //
-    // This is the same remedy as `face_centre` for probe selection and
-    // `uv2_rect` for the lightmap, and like those it is `flat`, so unlike
-    // centroid interpolation it costs nothing. (Centroid was measured at
-    // ~11 ms a frame for this same correction; see `BRUSH_CENTROID_VARYINGS`.)
+
     let face_t = normalize(in.tangent.xyz - n_geom * dot(n_geom, in.tangent.xyz));
     let face_b = cross(n_geom, face_t) * in.tangent.w;
     let face_d = in.world_pos - in.face_centre;
     let face_pos = in.face_centre
         + face_t * clamp(dot(face_d, face_t), -in.face_half_extent.x, in.face_half_extent.x)
         + face_b * clamp(dot(face_d, face_b), -in.face_half_extent.y, in.face_half_extent.y);
-    // THE PROBE IS CHOSEN FROM THIS PIXEL, not from the face's centre. A room
-    // now has a photograph per stretch of it (`bake::probe::MAX_CELL_EDGE`),
-    // and a 20 m wall choosing one of them for its whole length reflected the
-    // front of the hall at the back. Chosen per pixel, the two nearest hand
-    // over across `PROBE_BLEND_BAND`, which is continuous in position -- and
-    // `face_pos` is clamped onto the face, so an MSAA edge pixel chooses what
-    // its neighbours do, which is what the face centre was for.
-    // WHICH ROOM is a question about the FACE, and is answered from its
-    // centre; see `probe_volume_pos`. Per pixel, an MSAA sample on a ceiling
-    // seen edge-on is shaded at the pixel centre, which can extrapolate 10 cm
-    // past the far wall -- and the ceiling brush runs on over the wall top, so
-    // clamping onto the face does not bring it back. That one row of samples
-    // then took the OUTDOOR photograph (offline_frame, 2026-09-23).
+
     probe_volume_pos = vec4<f32>(in.face_centre, 1.0);
     let env_part = shade_material_env_part(
         face_pos, n, rough_aa, ao, baked.a, baked.rgb, bdir, albedo.rgb, face_pos,
         n_geom,
     );
-    // THE MASKS AFTER THE ENVIRONMENT, just before the lamps that read them:
-    // taken first, their eight visibilities rode through all of the
-    // environment's work, and that was the shader's register peak. See
-    // `MaterialEnvPart`.
-    // THE STATIONARY LAMPS' SHADOWS, rebuilt as the sun's is: per lamp a
-    // signed distance and the bulb's penumbra, two lamps a layer (red and
-    // green, blue and alpha), the edge put back at zero at any magnification
-    // and never narrower than a pixel. Away from a sharp edge the baker stores
-    // a lamp's visibility as a distance this smoothstep gives back exactly, so
-    // soft shadows and the faint bands of thin things come through the same
-    // code. Layers a level does not have are not fetched; the neutral mask an
-    // unbaked level carries reads fully lit. See `stationary_visibility`.
+
     let st_layers = textureNumLayers(lm_stationary);
     let st_0 = textureSample(lm_stationary, lm_sun_samp, lm_uv, 0);
     var st_1 = vec4<f32>(1.0);
@@ -4427,11 +3217,11 @@ struct VOut {{
     let lit = shade_material_lamps(env_part, face_pos, n, baked.rgb, albedo.rgb);
     let c = in.tint.rgb * lit;"#
     };
-    // THE HALF-RESOLUTION PROBE PASS. See `probe_pass`.
+
     let lighting: String = match probe {
         BrushProbe::Trace => lighting.to_string(),
         BrushProbe::Pass => probe_pass::PASS_LIGHTING.to_string(),
-        // The same, telling a deferred lookup's record which texel it is.
+
         BrushProbe::PassDeferred => {
             let given = "    probe_face_given = in.probe_face;\n";
             assert!(probe_pass::PASS_LIGHTING.contains(given), "the probe pass no longer hands in its face");
@@ -4457,20 +3247,14 @@ struct VOut {{
     };
     let src = format!(
         r#"
-// Group 0 -- the camera, the lights and both shadow maps -- is declared by
-// `wgsl_lights_block` below, so there is one description of that layout rather
-// than one per shader.
-
 @group(2) @binding(0) var lm_tex: texture_2d<f32>;
 @group(2) @binding(2) var lm_dir_tex: texture_2d<f32>;
 @group(2) @binding(1) var lm_samp: sampler;
 @group(2) @binding(3) var lm_sun_tex: texture_2d<f32>;
 @group(2) @binding(4) var lm_sun_samp: sampler;
-// How far the sun mask's signed distance reaches, in mask texels. See
-// `SUN_MASK_DISTANCE_TEXELS`.
+
 const SUN_MASK_DISTANCE_TEXELS: f32 = {sun_mask_range:?};
-// The stationary lamps' shadow masks, and their distance range. See
-// `STATIONARY_MASK_DISTANCE_TEXELS`.
+
 @group(2) @binding(5) var lm_stationary: texture_2d_array<f32>;
 const STATIONARY_MASK_DISTANCE_TEXELS: f32 = {stationary_range:?};
 
@@ -4479,11 +3263,9 @@ const STATIONARY_MASK_DISTANCE_TEXELS: f32 = {stationary_range:?};
 @group(1) @binding(2) var mat_samp: sampler;
 @group(1) @binding(3) var mat_rough: texture_2d_array<f32>;
 @group(1) @binding(4) var mat_ao: texture_2d_array<f32>;
-// Trilinear, so the roughness mip that carries the normal's variance is
-// the one actually fetched. See `brush_rough_sampler`.
+
 @group(1) @binding(5) var mat_rough_samp: sampler;
-// Each material's proportions: `u` as authored, `v` times its colour map's
-// width over height. See `material_uv_scales`.
+
 @group(1) @binding(6) var<uniform> mat_uv_scale: array<vec4<f32>, {max_materials}>;
 
 {lights_block}
@@ -4502,52 +3284,22 @@ struct VIn {{
     @location(9) face_half_extent: vec2<f32>,
 }}
 struct VOut {{
-    // INVARIANT: computed identically in every pipeline built from this
-    // vertex stage -- the depth prepass and the shading passes must put each
-    // brush at the same depth to the bit, or LessEqual fails where they
-    // differ in the last place and the surface flickers away.
+
     @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) tangent: vec4<f32>,
-    // NOT centroid. Centroid interpolation stopped MSAA edge pixels being
-    // shaded past the polygon, but the scene pass went from ~24 ms to ~40 ms
-    // for both eyes the moment it shipped (headset, 2026-09-17) -- and that
-    // was centroid on THIS ONE varying, so the cheap version is the one that
-    // was measured and rejected.
-    //
-    // TWO MARGIN FIXES WERE TRIED AND BOTH FAILED (headset, 2026-09-19): a
-    // constant `PROBE_BOX_MARGIN` scaled by render scale, then a margin
-    // widened per pixel by `fwidth(world_pos)`. The dotted line survived both
-    // at the same spacing, so "the fragment falls slightly outside its box"
-    // is NOT the mechanism, and both were reverted rather than left in as
-    // complexity that fixed nothing.
-    //
-    // What the sources view DOES show is that the seam pixels take far more
-    // PROBE than their neighbours -- sampled across the seam row, green
-    // (baked) drops while blue (probe) spikes 3x. So the fault is in probe
-    // SELECTION, and the fix is to stop selecting per fragment at all: see
-    // the per-face probe index below.
+
     @location(2) {centroid}world_pos: vec3<f32>,
     @location(3) uv: vec2<f32>,
-    // Flat: a material index is a choice, not a quantity, and interpolating it
-    // across a triangle that spans two materials would sample layer 1.5.
+
     @location(4) @interpolate(flat) material: u32,
     @location(5) tint: vec4<f32>,
     @location(6) {centroid}uv2: vec2<f32>,
-    // FLAT, and that is the entire fix. Every vertex of a face carries the
-    // same centre, so interpolation would be a no-op in exact arithmetic --
-    // but `flat` also makes it immune to the EXTRAPOLATION that happens when
-    // MSAA shades a pixel centre lying outside the polygon. That extrapolation
-    // is what broke probe selection at room seams, so a smoothly-interpolated
-    // copy of this value would inherit the very bug it exists to avoid.
+
     @location(7) @interpolate(flat) face_centre: vec3<f32>,
-    // FLAT, for the same reason the face centre is: the value is constant over
-    // the face, and a smoothly-interpolated copy would be EXTRAPOLATED at an
-    // edge pixel -- inheriting the very bug it exists to bound.
+
     @location(8) @interpolate(flat) uv2_rect: vec4<f32>,
-    // FLAT, like the other two per-face bounds beside it -- a smoothly
-    // interpolated copy would be extrapolated at the very pixels it exists to
-    // correct. See `BrushVertex::face_half_extent`.
+
     @location(9) @interpolate(flat) face_half_extent: vec2<f32>,
 {probe_face_varying}{edge_varying}}}
 
@@ -4560,7 +3312,7 @@ struct VOut {{
     out.face_centre = v.face_centre;
     out.uv2_rect  = v.uv2_rect;
     out.face_half_extent = v.face_half_extent;
-    // At the material's own proportions, so no map is stretched to its tile.
+
     out.uv        = v.uv * mat_uv_scale[min(v.material, {max_materials}u - 1u)].xy;
     out.uv2       = v.uv2;
     out.material  = v.material;
@@ -4568,62 +3320,24 @@ struct VOut {{
 {probe_face_vs}{edge_vs}    return out;
 }}
 
-// THE DEPTH PREPASS's fragment stage: nothing, with every colour write
-// masked. It exists only because a pass with a colour attachment takes a
-// pipeline with a matching colour target. See `BrushPipeline::new_depth_prepass`.
 @fragment fn fs_depth() -> @location(0) vec4<f32> {{
     return vec4<f32>(0.0);
 }}
 
 @fragment fn fs_main(in: VOut) -> {fs_return} {{
-    // See `pixel_footprint` in the lights block: taken here, in uniform
-    // control flow, so the light loop can keep a spot's edge a pixel wide.
-    //
-    // The GEOMETRIC MEAN of the two screen axes, not their sum: seen at a
-    // grazing angle one axis stretches to metres while the other stays a
-    // pixel, and the sum let that stretch widen a spot's pool across the floor.
+
     pixel_footprint = sqrt(length(dpdx(in.world_pos)) * length(dpdy(in.world_pos)));
     let albedo = textureSample(mat_color, mat_samp, in.uv, i32(in.material));
 
-    // Tangent frame from the brush face's own axes, re-orthogonalised against
-    // the interpolated normal so the two cannot drift apart.
     let n_geom = normalize(in.normal);
-    // A spot's edge is averaged over the patch of the FACE this pixel covers,
-    // not a bump's: see `spot_long_step`.
+
     set_pixel_long_step(n_geom, normalize(cam_pos() - in.world_pos));
     let t = normalize(in.tangent.xyz - n_geom * dot(n_geom, in.tangent.xyz));
     let b = cross(n_geom, t) * in.tangent.w;
     let tn = textureSample(mat_normal, mat_samp, in.uv, i32(in.material)).xyz * 2.0 - 1.0;
-    // GREEN IS THE IMAGE'S UP, WHICH IS -v HERE. Every installed map is
-    // OpenGL-style (ambientCG NormalGL: green = +Y = up in the picture), and
-    // wgpu samples v = 0 at the picture's TOP row, so up is DEcreasing v --
-    // while `b` above runs along INcreasing v (the face's v axis, `w` its
-    // handedness). Added with `+`, as it was until 2026-09-28, every bump was
-    // lit from the wrong side vertically: a crease under a ledge read as
-    // facing up, and the hallway's rock drew a black gash beside its sconce
-    // where a lit crease should be. `normal_maps_light_bumps_from_the_side_the_light_is_on`.
+
     let n = normalize(t * tn.x - b * tn.y + n_geom * tn.z);
 
-    // ADDED, not multiplied.
-    //
-    // The mesh pipeline multiplies its lightmap in, and multiplying cannot ADD
-    // light: a wall the lamp never reaches directly sits at the ambient floor
-    // and no amount of bounce can lift it, which is most of a real interior.
-    // Bounced light is light and belongs in the sum.
-    //
-    // Adding is only correct because a light is either baked or realtime and
-    // never both -- see LightMode. `shade` sees only the realtime ones, the
-    // texture carries only the baked ones, and the ambient term belongs solely
-    // to `shade`, which varies it by the direction the surface faces.
-    //
-    // An unbaked brush binds a BLACK texture, so this collapses to exactly the
-    // old behaviour. Black is the neutral value for a sum the way white is for
-    // a product, and binding the wrong one is a full stop of extra brightness
-    // on every surface.
-    // The material's own roughness and occlusion, so a polished surface and a
-    // matte one do not light identically. A material with no map gets white in
-    // both arrays, which is fully rough and fully unoccluded -- exactly how
-    // every brush looked before these existed.
 {lighting}{tail}
 }}
 "#,
@@ -4645,7 +3359,7 @@ struct VOut {{
         stationary_range = STATIONARY_MASK_DISTANCE_TEXELS,
         max_materials = MAX_BRUSH_MATERIALS,
         lighting = lighting,
-        // The probe pass writes its reach as well. See `probe_pass::OUTPUT_WGSL`.
+
         fs_return = if pass_like { "ProbePassOut" } else { "@location(0) vec4<f32>" },
         centroid = if BRUSH_CENTROID_VARYINGS {
             "@interpolate(perspective, centroid) "
@@ -4654,11 +3368,9 @@ struct VOut {{
         },
         edge_varying = edge_varying,
         edge_vs = edge_vs,
-        // THE PROBE PASS CHOOSES ITS ROOM PER FACE, in the vertex stage. See
-        // `probe_face_room`: the box tests against every resident probe were
-        // made per pixel for a result that is the same across the face.
+
         probe_face_varying = if pass_like {
-            "    // FLAT: the face's room. See `probe_face_room`.\n    @location(10) @interpolate(flat) probe_face: vec4<f32>,\n"
+            "    @location(10) @interpolate(flat) probe_face: vec4<f32>,\n"
         } else {
             ""
         },
@@ -4709,7 +3421,6 @@ mod tests {
     use crate::renderer::uniforms::ShadowUpload;
     use wgpu::util::DeviceExt;
 
-    /// A flat image of one colour, standing in for a material's colour map.
     fn flat(rgb: [u8; 3], size: u32) -> TerrainImage {
         TerrainImage {
             width: size,
@@ -4720,17 +3431,6 @@ mod tests {
         }
     }
 
-    /// A normal map that tilts every texel hard along +u.
-    ///
-    /// Encoded the way a normal map is: 0..255 mapping to -1..1, so 255 in red
-    /// is a full tilt toward the face's u axis and 128 is no tilt at all.
-    /// Tilted along the face's V axis, so the surface leans UP: green is the
-    /// picture's up (OpenGL maps), and the harness shows its picture upright.
-    ///
-    /// `tilted_normal` leans along U, which for a +Z face is world +X -- and a
-    /// surface tilted in X faces light arriving from +Y and from -Y exactly
-    /// alike. A test of "which side did the bounce come from" needs a normal
-    /// that can tell those apart, and this is it.
     fn tilted_normal_up(size: u32) -> TerrainImage {
         TerrainImage {
             width: size,
@@ -4747,12 +3447,6 @@ mod tests {
         }
     }
 
-    /// Draw one triangle of a brush and read the centre pixel back.
-    ///
-    /// Renders rather than merely building the pipeline. Creating the pipeline
-    /// proves the WGSL parses and nothing more -- it cannot tell whether the
-    /// right array layer was sampled, whether the tangent frame is the right way
-    /// round, or whether the normal map moves the shading at all.
     fn render_brush(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -4766,15 +3460,9 @@ mod tests {
         )
     }
 
-    /// A 2:1 MATERIAL KEEPS ITS PROPORTIONS (tracker 2.3): its tile is as wide
-    /// as authored and half as tall, so up a face it repeats twice as often as
-    /// a square one. Read at v = 0.4 of an authored tile, a square map is in
-    /// its top half; a 2:1 map is already at 0.8 of its own height, in its
-    /// bottom half. Before, every 1024x512 map -- the hallway rock, the
-    /// bricks -- drew every stone twice as tall as it is.
     #[test]
     fn a_two_to_one_material_is_not_stretched_to_its_tile() {
-        // Top half red, bottom half blue.
+
         let halves = |w: u32, h: u32| TerrainImage {
             width: w,
             height: h,
@@ -4802,32 +3490,12 @@ mod tests {
         assert_eq!(scales[MAX_BRUSH_MATERIALS - 1][..2], [1.0, 1.0], "past the list, square");
     }
 
-    /// Off to one side, so a normal tilted along u faces it differently from a
-    /// flat one. What the normal-map tests need.
     const SIDE_LIGHT: glam::Vec3 = glam::Vec3::new(4.0, 0.0, 2.0);
 
-    /// Straight down the view axis, so the half-vector lands on the normal and
-    /// the specular highlight is at its peak.
-    ///
-    /// What the ROUGHNESS tests need. With the side light both a mirror and a
-    /// matte surface come out with no highlight at all -- the matte one because
-    /// its strength is zero, the mirror because its lobe is a pinpoint the
-    /// sample misses -- so the two are identical and the test proves nothing.
     const HEAD_ON_LIGHT: glam::Vec3 = glam::Vec3::new(0.0, 0.0, 4.0);
 
-    /// The same, with roughness and ambient-occlusion arrays supplied.
-    ///
-    /// Empty slices fill with white -- fully rough, fully unoccluded -- which is
-    /// what every surface looked like before either map existed, so the older
-    /// tests measure exactly what they always did.
-    /// The neutral lightmap: adds nothing, and reports full sky visibility.
     const NEUTRAL_LM: [u8; 4] = [0, 0, 0, 255];
 
-    /// The material harness with the baked lightmap left neutral.
-    ///
-    /// Every material test predates the lightmap and must keep measuring what
-    /// it always did, so they all funnel through here rather than each carrying
-    /// a texel they do not care about.
     #[allow(clippy::too_many_arguments)]
     fn render_brush_material(
         material: u32,
@@ -4865,12 +3533,6 @@ mod tests {
         )
     }
 
-    /// `render_brush_baked`, with a baked bounce DIRECTION as well.
-    ///
-    /// Split rather than adding a parameter to the original because the neutral
-    /// direction has to stay the default: every existing test asserts absolute
-    /// pixel values, and they are only still meaningful if a test that says
-    /// nothing about direction gets exactly the shading it always got.
     #[allow(clippy::too_many_arguments)]
     fn render_brush_baked_dir(
         material: u32,
@@ -4891,12 +3553,6 @@ mod tests {
         )
     }
 
-    /// HALF-FLOAT LIGHT SHADES EXACTLY AS THE 8-BIT FORM OF THE SAME LIGHT.
-    ///
-    /// Every bake is now stored as half floats; an older one as sRGB bytes.
-    /// The same light in either must draw the same pixel, or re-baking a level
-    /// would shift its brightness. And light past 1.0, which the bytes clipped,
-    /// must now draw brighter than 1.0 does.
     #[test]
     fn half_float_and_srgb_lightmaps_of_the_same_light_draw_the_same() {
         let at = |lm: crate::renderer::mesh::LightmapLight| {
@@ -4905,7 +3561,7 @@ mod tests {
                 lm, crate::renderer::mesh::NEUTRAL_BOUNCE_DIRECTION, None, None,
             )
         };
-        // Byte 188 is sRGB for linear 0.5029.
+
         let Some(bytes) = at(crate::renderer::mesh::LightmapLight::Srgb8(&[188, 188, 188, 255])) else {
             eprintln!("skipping: no GPU adapter available");
             return;
@@ -4920,13 +3576,6 @@ mod tests {
         assert!(bright[1] > one[1], "light past 1.0 was clipped: {bright:?} vs {one:?}");
     }
 
-    /// THE SKY SUN ON A BRUSH IS ITS BAKED MASK.
-    ///
-    /// A black lightmap and the sky's sun head-on: with the mask at 0 the wall
-    /// is in the level's baked shadow and gets none of the sun; at 255 it gets
-    /// all of it; at half, about half. And a mask the baker never wrote (green
-    /// 0) must not read as shadow -- it falls back to the static map, which
-    /// this rig leaves off, so the sun arrives in full.
     #[test]
     fn the_sky_sun_on_a_brush_is_scaled_by_its_baked_mask() {
         let at = |mask: [u8; 4]| {
@@ -4951,11 +3600,6 @@ mod tests {
         );
     }
 
-    /// The same, with a reflection probe covering the surface.
-    ///
-    /// `probe` is the cube's flat colour and the world box it covers. `None`
-    /// binds the neutral cube, which is what every test that predates probes
-    /// wants -- and what an unbaked level gets.
     #[allow(clippy::too_many_arguments)]
     fn render_brush_probed(
         material: u32,
@@ -4977,9 +3621,6 @@ mod tests {
         )
     }
 
-    /// The whole harness. `sky_sun`, when set, lights the brush with the SKY's
-    /// sun alone -- head-on, flagged as the sky sun exactly as the frame
-    /// uploads it -- and binds that sun-mask texel beside the lightmap.
     #[allow(clippy::too_many_arguments)]
     fn render_brush_full(
         material: u32,
@@ -5002,7 +3643,6 @@ mod tests {
         )
     }
 
-    /// `render_brush_full` with the lightmap in either storage.
     #[allow(clippy::too_many_arguments)]
     fn render_brush_lit_by(
         material: u32,
@@ -5024,7 +3664,7 @@ mod tests {
 
         let lights = LightsUniform::new(&device);
         if sky_sun.is_some() {
-            // Travelling -z onto a +z-facing surface: N.L = 1.
+
             lights.upload_frame(
                 &queue,
                 &[Light {
@@ -5045,10 +3685,7 @@ mod tests {
                 true,
             );
         } else if lit {
-            // Off to one side, so a normal tilted along u faces it differently
-            // from a flat one. With an empty list `shade` returns the ambient
-            // constant whatever the normal, and a normal-map test on that rig
-            // would pass without the mapping doing anything.
+
             lights.upload(
                 &queue,
                 &[Light {
@@ -5069,9 +3706,7 @@ mod tests {
         } else {
             lights.upload(&queue, &[]);
         }
-        // `_probe_keep` holds the cube view and sampler alive: the scene bind
-        // group references them, and dropping them here would leave it
-        // pointing at freed resources.
+
         let (_shadows, uniforms, _probe_keep) = match probe {
             Some((colour, lo, hi)) => {
                 let (sh, u, v, samp) = crate::renderer::uniforms::test_support::scene_uniforms_with_probe(
@@ -5088,22 +3723,11 @@ mod tests {
 
         let pipeline = BrushPipeline::new(&device, format, &uniforms.layout);
         let materials =
-            // These tests are about the COLOUR and NORMAL path, so both new
-            // arrays are left empty: they fill with white, which is fully rough
-            // and fully unoccluded -- the shading every one of them was written
-            // against.
+
             BrushMaterials::new(
                 &device, &queue, &pipeline.material_layout, colours, normals, roughs, aos,
             );
 
-        // A triangle covering the viewport in clip space, facing +z, with the
-        // face's u axis along +x and its v axis DOWN the screen, handedness -1
-        // -- the frame a wall brush actually produces (`default_axes` for a +z
-        // face: u = +x, v = -y; `an_unauthored_box_has_one_consistent_handedness`
-        // pins the -1). So the picture stands the right way up, as on a real
-        // wall. Until 2026-09-28 this ran v UP the screen with handedness +1:
-        // consistent with itself, but upside down against every real wall, and
-        // it hid that the shader read green the wrong way round.
         let v = |p: [f32; 3], uv: [f32; 2]| BrushVertex {
             position: p,
             normal: [0.0, 0.0, 1.0],
@@ -5111,26 +3735,16 @@ mod tests {
             uv,
             material,
             tint,
-            // These tests are about the MATERIAL path, so every vertex samples
-            // the same lightmap texel and the harness binds a black one --
-            // additively neutral, so it changes none of their measurements.
+
             uv2: [0.5, 0.5],
-            // The probe is chosen from here. These fixtures have no probes
-            // bound, so any value behaves alike; the triangle's own centre is
-            // the honest one.
+
             face_centre: [1.0 / 3.0, 1.0 / 3.0, 0.0],
-            // The whole atlas: these fixtures bind a 1x1 lightmap, so any
-            // clamp is a no-op and the full range is the honest value.
+
             uv2_rect: [0.0, 0.0, 1.0, 1.0],
-            // NO CLAMP. These fixtures are about the material and the
-            // pipeline, not about edge extrapolation, and infinite extent is
-            // exactly the behaviour they measured before the clamp existed --
-            // so every expectation in them still means what it meant.
+
             face_half_extent: [f32::INFINITY; 2],
         };
-        // v falls as y rises, through the same v = 0.5 * uv_scale at the centre
-        // pixel it always read there, so every expectation keyed to the centre
-        // texel still means what it meant.
+
         let verts = [
             v([-1.0, -1.0, 0.0], [0.0, uv_scale]),
             v([3.0, -1.0, 0.0], [2.0 * uv_scale, uv_scale]),
@@ -5213,9 +3827,7 @@ mod tests {
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &uniforms.bind_group, &[]);
             pass.set_bind_group(1, &materials.bind_group, &[]);
-            // Neutral by default -- black adds nothing and alpha 255 leaves the
-            // sky term alone -- so these material tests measure the material
-            // path and nothing else.
+
             pass.set_bind_group(2, &lightmap.bind_group, &[]);
             pass.set_vertex_buffer(0, vb.slice(..));
             pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
@@ -5248,7 +3860,6 @@ mod tests {
         Some([data[c], data[c + 1], data[c + 2], data[c + 3]])
     }
 
-    /// Three materials, distinguishable by which channel dominates.
     fn palette() -> Vec<Option<TerrainImage>> {
         vec![
             Some(flat([200, 20, 20], 4)),
@@ -5259,10 +3870,7 @@ mod tests {
 
     #[test]
     fn a_face_samples_the_material_its_index_names() {
-        // The whole reason the index is per vertex: one draw call, many
-        // materials. If the array layer were ignored every wall in a level
-        // would come out the same colour, which reads as a texture-loading
-        // failure rather than as an indexing one.
+
         for (index, expected) in [(0u32, 0usize), (1, 1), (2, 2)] {
             let Some(px) = render_brush(index, &palette(), &[], [1.0; 4], 1.0, false) else {
                 eprintln!("skipping: no GPU adapter available");
@@ -5278,9 +3886,7 @@ mod tests {
 
     #[test]
     fn the_tint_multiplies_the_sampled_colour() {
-        // A face whose material is missing binds a white layer, so the tint is
-        // the entire appearance -- which is what keeps an unassigned brush
-        // looking like the colour its object was authored in.
+
         let Some(white) = render_brush(0, &[], &[], [1.0, 1.0, 1.0, 1.0], 1.0, false) else {
             eprintln!("skipping: no GPU adapter available");
             return;
@@ -5293,9 +3899,7 @@ mod tests {
 
     #[test]
     fn a_missing_normal_map_leaves_the_face_flat() {
-        // The fallback layer is 128,128,255 -- straight out of the surface. A
-        // fallback of zeros would decode to (-1,-1,-1) and light every
-        // untextured wall as though it faced away from everything.
+
         let Some(with_fallback) = render_brush(0, &palette(), &[], [1.0; 4], 1.0, true) else {
             eprintln!("skipping: no GPU adapter available");
             return;
@@ -5317,12 +3921,7 @@ mod tests {
 
     #[test]
     fn roughness_changes_the_specular_highlight() {
-        // THE POINT of the roughness map. Without it every surface in a level
-        // shades identically -- polished concrete lights exactly like rough
-        // brick -- and no work on the lighting can tell them apart.
-        //
-        // A smooth surface concentrates the same energy into a tighter,
-        // brighter highlight, so head on it must out-shine a matte one.
+
         let Some(matte) = render_brush_material(
             0, &palette(), &[None], &[Some(flat([255, 255, 255], 4))], &[], [1.0; 4], 1.0, true,
             HEAD_ON_LIGHT,
@@ -5347,15 +3946,7 @@ mod tests {
 
     #[test]
     fn a_missing_roughness_map_takes_the_documented_default() {
-        // SUPERSEDES a test that asserted a missing map must shade identically
-        // to an explicitly fully-rough one. That was written to protect levels
-        // already built from being relit, which was the right instinct and the
-        // wrong constant: roughness 1.0 zeroes the specular term outright, so
-        // the guarantee it locked in was "a material without a map can never
-        // shine". See `DEFAULT_ROUGHNESS`.
-        //
-        // The property still worth pinning is that the default is the DOCUMENTED
-        // one, so the constant and the texture cannot drift apart.
+
         let d = DEFAULT_ROUGHNESS;
         let Some(absent) = render_brush_material(
             0, &palette(), &[None], &[], &[], [1.0; 4], 1.0, true, HEAD_ON_LIGHT,
@@ -5376,9 +3967,7 @@ mod tests {
 
     #[test]
     fn ambient_occlusion_darkens_without_wiping_out_direct_light() {
-        // AO says how much of the SKY a crevice can see. Applying it to direct
-        // light as well would darken a surface a lamp is shining straight onto,
-        // which is a different effect and a wrong one.
+
         let Some(open) = render_brush_material(
             0, &palette(), &[None], &[], &[Some(flat([255, 255, 255], 4))], [1.0; 4], 1.0, true,
             HEAD_ON_LIGHT,
@@ -5403,14 +3992,7 @@ mod tests {
 
     #[test]
     fn baked_sky_visibility_darkens_the_ambient_term() {
-        // The lightmap's ALPHA is how much sky the texel can actually see. With
-        // it ignored, a wall sealed inside a room was lit by the sky as
-        // brightly as open ground -- which is why interiors looked flat and
-        // shadows looked weak: the shadow was cast, and a full-strength ambient
-        // term filled it straight back in.
-        //
-        // Unlit on purpose. The sky term is the whole measurement, and a lamp
-        // in the frame would swamp it.
+
         let Some(open) = render_brush_baked(
             0, &palette(), &[None], &[], &[], [1.0; 4], 1.0, false, SIDE_LIGHT, [0, 0, 0, 255],
         ) else {
@@ -5429,11 +4011,7 @@ mod tests {
 
     #[test]
     fn baked_rgb_still_adds_with_sky_visibility_at_zero() {
-        // The two channels of one texel have OPPOSITE neutrals, so the risk in
-        // reading both is that one gets applied to the other: multiplying the
-        // added bounce by visibility would make a fully-occluded texel unable
-        // to show any baked light at all, and a sealed room lit only by a baked
-        // lamp would come out black.
+
         let Some(dark) = render_brush_baked(
             0, &palette(), &[None], &[], &[], [1.0; 4], 1.0, false, SIDE_LIGHT, [0, 0, 0, 0],
         ) else {
@@ -5475,14 +4053,7 @@ mod tests {
 
     #[test]
     fn a_material_with_no_roughness_map_can_still_shine() {
-        // The regression that made "the specular isn't working" literally true:
-        // a missing roughness map defaulted to WHITE, which is fully rough, and
-        // spec_strength = SPEC_STRENGTH * (1 - r) is then exactly zero. No
-        // light, no angle and no material could produce a highlight.
-        //
-        // Head-on light, so the half-vector lands on the normal and the lobe is
-        // at its peak -- with the side light a matte and a mirror surface both
-        // read as nothing and the test proves nothing.
+
         let Some(matte) = render_brush_material(
             0, &palette(), &[None], &[Some(flat([255, 255, 255], 4))], &[], [1.0; 4], 1.0, true,
             HEAD_ON_LIGHT,
@@ -5503,17 +4074,7 @@ mod tests {
 
     #[test]
     fn a_polished_surface_reflects_more_of_the_sky_than_a_rough_one() {
-        // What makes polished stone read as polished. A punctual lamp can only
-        // ever put a small bright spot on a mirror; what a real floor shows is
-        // the room and sky around it. Marble020's roughness map averages 0.048
-        // -- near mirror -- and with no environment term it looked like matte
-        // stone however the highlight was tuned, because the thing it should
-        // have been reflecting was never sampled.
-        //
-        // Unlit on purpose: this is the environment term, and a lamp in frame
-        // would swamp it.
-        // Grazing, for the same reason as the sealed test below: at normal
-        // incidence Fresnel is 0.04 and this term is invisible.
+
         let Some(smooth) = render_brush_material(
             0, &palette(), &[Some(tilted_normal(4))], &[Some(flat([12, 12, 12], 4))], &[],
             [1.0; 4], 1.0, false, HEAD_ON_LIGHT,
@@ -5535,22 +4096,7 @@ mod tests {
 
     #[test]
     fn a_sealed_room_does_not_reflect_a_sky_it_cannot_see() {
-        // The occlusion the reflection has to respect. Without it every
-        // polished surface indoors glows with outdoor light -- the same class
-        // of bug as the unoccluded ambient that made interiors look flat, and
-        // it would undo that fix for exactly the shiniest surfaces.
-        //
-        // Compared SEALED-SMOOTH against SEALED-ROUGH, not sealed against open.
-        // Sealed-vs-open is dominated by the ambient term, which is occluded
-        // either way, so that comparison passes whether or not the REFLECTION
-        // respects occlusion and proves nothing about it. With the sky fully
-        // hidden, polish must make no difference at all.
-        // A HARD-TILTED normal, so the surface is seen at a grazing angle.
-        // Fresnel at normal incidence is 0.04 -- the reflection is about 2% of
-        // the frame there and disappears below a byte, so a head-on test cannot
-        // see this term at all whether it is occluded or not. Grazing is where
-        // Fresnel approaches 1, which is both where the effect matters visually
-        // and the only place a test can observe it.
+
         let sealed = |rough: u8| {
             render_brush_baked(
                 0, &palette(), &[Some(tilted_normal(4))],
@@ -5572,28 +4118,13 @@ mod tests {
 
     #[test]
     fn a_polished_surface_in_a_sealed_room_reflects_the_room_itself() {
-        // The complement of `a_sealed_room_does_not_reflect_a_sky_it_cannot_see`,
-        // and the half that was missing.
-        //
-        // That test pins what a reflection must NOT do: invent outdoor light in
-        // a room with no sky. Taken alone it is satisfied by a reflection term
-        // that is dead indoors -- which is what shipped, and it made a marble
-        // floor in a lit hall read as matte stone. A shiny floor in a dark room
-        // does show something: it shows the room.
-        //
-        // Sky visibility is still ZERO here. The only thing available to
-        // reflect is the baked bounce in RGB, so anything the polished surface
-        // shows over the matte one came from the room's own light.
-        //
-        // Grazing angle for the same reason as the sealed test: at normal
-        // incidence Fresnel is 0.04 and the whole term lands below a byte.
+
         let room_lit = |rough: u8| {
             render_brush_baked(
                 0, &palette(), &[Some(tilted_normal(4))],
                 &[Some(flat([rough, rough, rough], 4))], &[],
                 [1.0; 4], 1.0, false, HEAD_ON_LIGHT,
-                // Bright bounce, NO sky. The alpha is what the sealed test sets
-                // to zero, and it stays zero.
+
                 [180, 180, 180, 0],
             )
         };
@@ -5603,27 +4134,13 @@ mod tests {
         };
         let rough = room_lit(255).unwrap();
 
-        // MEASURED IN GREEN, not red, and that is the whole point.
-        //
-        // The albedo here is red; the room's bounce is white. A dielectric's
-        // reflection is NOT tinted by the surface it bounces off, so the room
-        // arrives in every channel while the surface's own diffuse arrives only
-        // in red. Green is therefore the part of the pixel that can only have
-        // come from the room.
-        //
-        // This test used to compare RED, which conflated the two -- and once
-        // the shading became energy-conserving, a polished surface gives up
-        // diffuse to gain specular, so its red went DOWN while it reflected
-        // more. It was measuring the surface's colour and calling it the
-        // reflection.
         let room = smooth[1] as i32 - rough[1] as i32;
         assert!(
             room > 2,
             "a polished surface in a lit but sealed room reflected no more of \
              that room than a matte one: {smooth:?} vs {rough:?}",
         );
-        // And it must not have got there by simply being brighter overall in a
-        // way a matte surface would match.
+
         let total = |p: [u8; 4]| p[0] as i32 + p[1] as i32 + p[2] as i32;
         assert!(
             total(smooth) > total(rough),
@@ -5634,45 +4151,26 @@ mod tests {
 
     #[test]
     fn bounced_light_falls_on_the_side_of_a_surface_it_came_from() {
-        // The point of the direction map. A flat irradiance lights a surface
-        // facing the lit wall and one facing away by exactly the same amount,
-        // which is why bounce made rooms brighter without making them read as
-        // lit: normal maps went dead wherever no lamp reached and corners lost
-        // their shape.
-        //
-        // Same bounce energy in both renders. The only difference is which way
-        // the light is coming from, so anything that separates them is the
-        // direction doing work.
-        //
-        // +Y and -Y, because the test surface faces +Z with a tilted normal:
-        // light arriving from above and from below must not shade alike.
+
         let lit_from = |dir: [u8; 4]| {
             render_brush_baked_dir(
-                // Tilted UP, not sideways: see `tilted_normal_up`. With the
-                // sideways tilt this test used, the surface faced +Y and -Y
-                // identically and the only thing separating the two renders was
-                // a sub-byte glossy term -- so it was passing on a rounding
-                // difference, and any change to the shading could silently
-                // collapse it. One did.
+
                 0, &palette(), &[Some(tilted_normal_up(4))],
                 &[Some(flat([200, 200, 200], 4))], &[],
                 [1.0; 4], 1.0, false, HEAD_ON_LIGHT,
-                // Sky visibility zero: a sealed room, so the only light in the
-                // frame is the bounce being steered.
+
                 [170, 170, 170, 0],
                 dir,
             )
         };
-        // Encoded as v * 0.5 + 0.5, and fully directional in the alpha.
+
         let from_above = lit_from([128, 255, 128, 255]);
         let Some(above) = from_above else {
             eprintln!("skipping: no GPU adapter available");
             return;
         };
         let below = lit_from([128, 0, 128, 255]).unwrap();
-        // A MARGIN, not mere inequality. `assert_ne!` on bytes passes on a
-        // one-unit rounding difference, which is indistinguishable from noise
-        // and is what this test was actually resting on.
+
         let gap = (above[0] as i32 - below[0] as i32).abs();
         assert!(
             gap > 4,
@@ -5688,10 +4186,7 @@ mod tests {
 
     #[test]
     fn a_bounce_with_no_direction_shades_exactly_as_it_always_did() {
-        // The compatibility guarantee. Directionality zero is the neutral
-        // value every unbaked and every pre-existing lightmap carries, and it
-        // has to reproduce the flat behaviour EXACTLY -- not approximately, or
-        // every absolute-value test in this file is measuring something new.
+
         let baked = [170u8, 170, 170, 0];
         let flat_render = render_brush_baked(
             0, &palette(), &[Some(tilted_normal(4))],
@@ -5702,7 +4197,7 @@ mod tests {
             eprintln!("skipping: no GPU adapter available");
             return;
         };
-        // A direction that is present but carries zero weight must change nothing.
+
         let weightless = render_brush_baked_dir(
             0, &palette(), &[Some(tilted_normal(4))],
             &[Some(flat([200, 200, 200], 4))], &[],
@@ -5717,10 +4212,7 @@ mod tests {
 
     #[test]
     fn an_unlit_sealed_room_still_reflects_nothing() {
-        // The guard on the test above: it must be the ROOM's light being
-        // reflected and not a constant that appeared in the term. With the
-        // bounce at zero and the sky at zero there is nothing to see, and
-        // polish must once again make no difference.
+
         let dark = |rough: u8| {
             render_brush_baked(
                 0, &palette(), &[Some(tilted_normal(4))],
@@ -5737,21 +4229,7 @@ mod tests {
 
     #[test]
     fn a_highlight_is_not_tinted_by_the_surface_colour() {
-        // A dielectric's specular is light that bounced STRAIGHT OFF the
-        // surface without entering it, so it comes back the colour of the lamp,
-        // not the colour of the material. A red marble floor has a white
-        // highlight.
-        //
-        // The shader used to return one combined value that the caller
-        // multiplied by albedo, which tinted the highlight too. On this
-        // project's marble -- albedo 0.373 -- that made every highlight nearly
-        // three times dimmer than it should be, and the surface read as having
-        // no shine at all, which is exactly how it was reported from the
-        // headset.
-        //
-        // Material 0 in `palette()` is saturated red with almost no green or
-        // blue, so any green or blue in the result can ONLY have come from an
-        // untinted highlight.
+
         let shine = |rough: u8| {
             render_brush_material(
                 0, &palette(), &[None],
@@ -5759,26 +4237,19 @@ mod tests {
                 [1.0; 4], 1.0, true, HEAD_ON_LIGHT,
             )
         };
-        // Near-mirror, so there is a highlight to find at all.
+
         let Some(px) = shine(12) else {
             eprintln!("skipping: no GPU adapter available");
             return;
         };
-        // The SAME surface, fully rough, so it has no highlight. Whatever green
-        // the polished one has that this one does not can only be specular.
-        //
-        // Measured against a matte control rather than an absolute threshold:
-        // the previous form asserted `px[1] > 8` and the value was 8, so it
-        // passed or failed on a single byte of a term the test does not
-        // actually care about. Any change to ambient anywhere tipped it.
+
         let matte = shine(255).unwrap();
         assert!(
             px[1] as i32 > matte[1] as i32 && px[2] as i32 > matte[2] as i32,
             "a polished red surface ({px:?}) carries no more green or blue than a \
              matte one ({matte:?}), so it has no untinted highlight at all",
         );
-        // And the highlight is NEUTRAL: it adds the lamp's colour, not the
-        // surface's. Green and blue must move together.
+
         let dg = px[1] as i32 - matte[1] as i32;
         let db = px[2] as i32 - matte[2] as i32;
         assert!(
@@ -5791,9 +4262,7 @@ mod tests {
 
     #[test]
     fn a_matte_surface_of_the_same_colour_has_no_such_highlight() {
-        // The guard on the test above: green and blue must come from the
-        // SPECULAR lobe, not from something that leaks on every surface. Fully
-        // rough kills the lobe, so the same red material must come back red.
+
         let Some(matte) = render_brush_material(
             0, &palette(), &[None],
             &[Some(flat([255, 255, 255], 4))], &[],
@@ -5814,12 +4283,7 @@ mod tests {
 
     #[test]
     fn a_near_mirror_still_produces_a_visible_highlight() {
-        // Marble020's roughness map averages 0.048. Before the lamp was given
-        // an area, that put the exponent on its clamp and the highlight was
-        // narrower than a pixel -- computed correctly, and invisible.
-        //
-        // Compared against a FULLY rough surface rather than an absolute value,
-        // so this measures the lobe rather than the brightness of the test rig.
+
         let Some(mirror) = render_brush_material(
             0, &palette(), &[None], &[Some(flat([12, 12, 12], 4))], &[], [1.0; 4], 1.0, true,
             HEAD_ON_LIGHT,
@@ -5841,10 +4305,7 @@ mod tests {
 
     #[test]
     fn a_normal_map_changes_the_shading() {
-        // Lit from one side, a surface tilted toward the light must come out
-        // brighter than a flat one. Without this the normal map could be bound,
-        // sampled, and multiplied by a tangent frame that discards it, and
-        // every other test here would still pass.
+
         let Some(flat_px) = render_brush(
             0,
             &palette(),
@@ -5868,19 +4329,6 @@ mod tests {
         );
     }
 
-    /// A NORMAL MAP'S "UP" FACES UP ON A WALL THAT SHOWS ITS PICTURE UPRIGHT.
-    ///
-    /// Stated as the physics, not as the shader's arithmetic: every installed
-    /// map is OpenGL-style, where green above 128 means "this texel faces the
-    /// TOP of the picture". On a wall whose picture stands the right way up
-    /// (the harness frame is a real wall's), a lamp ABOVE must light that texel
-    /// more than one whose green says it faces the bottom.
-    ///
-    /// Until 2026-09-28 the brush shader added green along +v -- DOWN the
-    /// picture in wgpu -- and lit every bump from the wrong side vertically;
-    /// the hallway rock drew a black gash beside its sconce (headset 21:46:25).
-    /// The existing tilt tests used red only, which both conventions share, and
-    /// the harness drew its picture upside down, so nothing could see it.
     #[test]
     fn normal_maps_light_bumps_from_the_side_the_light_is_on() {
         let tilted = |green: u8| TerrainImage {
@@ -5888,8 +4336,7 @@ mod tests {
             height: 4,
             rgba: (0..16).flat_map(|_| [128, green, 200, 255]).collect(),
         };
-        // Above the wall and in front of it. Dim, so no channel clips and the
-        // difference cannot vanish into saturation.
+
         let above = glam::Vec3::new(0.3, 1.5, 0.8);
         let grey = [Some(flat([90, 90, 90], 4))];
         let Some(faces_up) = render_brush_material(
@@ -5919,9 +4366,7 @@ mod tests {
 
     #[test]
     fn a_material_beyond_the_array_does_not_read_out_of_bounds() {
-        // A level that outgrew the array must draw something rather than
-        // sampling whatever is past the end. The loader clamps; this pins that
-        // the last layer is a real, bound layer rather than undefined.
+
         let Some(px) = render_brush(
             (MAX_BRUSH_MATERIALS - 1) as u32,
             &palette(),
@@ -5936,9 +4381,6 @@ mod tests {
         assert!(px[3] > 0, "the last layer must be bound and drawable: {px:?}");
     }
 
-    /// Four columns: black, red, black, blue. Needs spatial variation, because
-    /// a one-colour map samples identically whether the address mode repeats or
-    /// clamps -- which is how a vacuous version of the test below passed.
     fn striped() -> TerrainImage {
         let cols = [[0u8, 0, 0], [255, 0, 0], [0, 0, 0], [0, 0, 255]];
         let mut rgba = Vec::with_capacity(4 * 4 * 4);
@@ -5952,18 +4394,7 @@ mod tests {
 
     #[test]
     fn uv_beyond_one_repeats_rather_than_smearing() {
-        // The uv is in TILES: a 6m wall of a material tiling every metre spans
-        // uv 0..6. Clamping would stretch the last column across five of them,
-        // which looks like a broken texture rather than a wrong address mode.
-        //
-        // Asserted as a PROPERTY rather than by predicting where a pixel lands.
-        // Working out the exact uv of the centre pixel means re-deriving the
-        // rasteriser's sample position, and a first attempt at that produced a
-        // test that failed against a correct sampler. What is true without any
-        // of that arithmetic: past uv 1 a repeating sampler keeps moving through
-        // the columns, so different scales give different colours, while a
-        // clamping one is pinned to the edge column and gives one colour for
-        // every scale.
+
         let scales = [4.0f32, 5.0, 6.0, 7.0];
         let mut seen = std::collections::HashSet::new();
         for s in scales {
@@ -5980,25 +4411,12 @@ mod tests {
         );
     }
 
-    /// The probe, all the way through to a pixel.
-    ///
-    /// Everything upstream of this is covered by pure tests -- box projection,
-    /// face orientation, the capture. None of that proves the cube is bound,
-    /// that the shader reads the right binding, or that what it reads reaches
-    /// the surface. Building the pipeline proves only that the WGSL parses.
     mod probe_render {
         use super::*;
-        // The probe, all the way through to a pixel.
-        //
-        // Everything upstream of this is covered by pure tests -- box projection,
-        // face orientation, the capture. None of that proves the cube is bound,
-        // that the shader reads the right binding, or that what it reads reaches
-        // the surface. Building the pipeline proves only that the WGSL parses.
+
         use super::tests::*;
         use super::*;
 
-        /// A sealed room: no sky reaches the surface, so anything it reflects can
-        /// only have come from the probe.
         const SEALED: [u8; 4] = [0, 0, 0, 0];
 
         fn polished_wall(probe: Option<([u8; 4], glam::Vec3, glam::Vec3)>) -> Option<[u8; 4]> {
@@ -6006,9 +4424,7 @@ mod tests {
                 0,
                 &palette(),
                 &[Some(tilted_normal(4))],
-                // Smooth, so Fresnel gives the environment term something to work
-                // with. A fully rough surface reflects almost nothing by design and
-                // would make this test unable to fail.
+
                 &[Some(flat([12, 12, 12], 4))],
                 &[],
                 [1.0; 4],
@@ -6021,8 +4437,6 @@ mod tests {
             )
         }
 
-        /// The whole point: a probe puts the room onto a polished surface that has
-        /// no sky and no bounce to show.
         #[test]
         fn a_probe_lights_a_polished_surface_that_has_nothing_else_to_reflect() {
             let big = (glam::Vec3::splat(-50.0), glam::Vec3::splat(50.0));
@@ -6030,8 +4444,7 @@ mod tests {
                 eprintln!("skipping: no GPU adapter available");
                 return;
             };
-            // A strongly GREEN probe, because the surface's own albedo is red: the
-            // channel the probe arrives in is one the surface cannot produce.
+
             let with = polished_wall(Some(([0, 255, 0, 255], big.0, big.1))).unwrap();
             assert!(
                 with[1] as i32 - without[1] as i32 > 4,
@@ -6040,11 +4453,6 @@ mod tests {
             );
         }
 
-        /// A probe that does not contain the surface must not light it.
-        ///
-        /// This is what stops one room's reflection leaking into another, and it is
-        /// the half that a "does the cube reach the shader" test cannot check --
-        /// binding a cube and always sampling it would pass that one.
         #[test]
         fn a_probe_elsewhere_in_the_level_does_not_reach_this_surface() {
             let far = (glam::Vec3::new(500.0, 500.0, 500.0), glam::Vec3::new(600.0, 600.0, 600.0));
@@ -6060,11 +4468,6 @@ mod tests {
             );
         }
 
-        /// A rough surface must reflect the probe far less than a polished one.
-        ///
-        /// Without this, "the probe reaches the pixel" would be satisfied by a
-        /// probe added flat to every surface regardless of material -- which would
-        /// make every wall in the level glow with its room's colour.
         #[test]
         fn roughness_still_governs_how_much_of_the_probe_shows() {
             let big = (glam::Vec3::splat(-50.0), glam::Vec3::splat(50.0));
@@ -6086,23 +4489,6 @@ mod tests {
             );
         }
 
-        /// A MATTE surface must take nothing at all from the probe.
-        ///
-        /// The test above only asks that it take *less* than a polished one,
-        /// which a probe scaled by Fresnel satisfies while still painting the
-        /// room's fixtures onto every rough wall in the level. That is the
-        /// artefact: a lamp the probe photographed from its capture point,
-        /// arriving crisply on brick that cannot see the lamp at all -- the
-        /// "bright rectangles that come and go" as the resident probe changes.
-        ///
-        /// A probe carries no visibility information, so at the roughness where
-        /// the specular lobe is the whole hemisphere its answer is strictly
-        /// worse than the lightmap's, which was measured at this very texel.
-        /// The blend hands the rough end back to the bake, and this pins that:
-        /// the probe must make NO difference here.
-        ///
-        /// Bright bounce and no sky, so the surface is genuinely lit and the
-        /// comparison is between two lit pixels rather than two black ones.
         #[test]
         fn a_matte_surface_takes_nothing_from_the_probe() {
             let big = (glam::Vec3::splat(-50.0), glam::Vec3::splat(50.0));
@@ -6111,8 +4497,7 @@ mod tests {
                     0, &palette(), &[Some(tilted_normal(4))],
                     &[Some(flat([255, 255, 255], 4))], &[],
                     [1.0; 4], 1.0, false, HEAD_ON_LIGHT,
-                    // Bright bounce, no sky: `env` is what this surface should
-                    // be reflecting, and the probe is what it should not.
+
                     [180, 180, 180, 0],
                     crate::renderer::mesh::NEUTRAL_BOUNCE_DIRECTION, probe,
                 )
@@ -6121,8 +4506,7 @@ mod tests {
                 eprintln!("skipping: no GPU adapter available");
                 return;
             };
-            // Green again: the albedo is red, so green can only have come from
-            // the probe.
+
             let with = lit_matte(Some(([0, 255, 0, 255], big.0, big.1))).unwrap();
             assert_eq!(
                 without, with,
@@ -6140,14 +4524,6 @@ mod ssr_pipeline_tests {
     use crate::renderer::lights::LightsUniform;
     use crate::renderer::uniforms::test_support::scene_uniforms;
 
-    /// The reflective brush pipeline must actually BUILD.
-    ///
-    /// This is the only thing that checks it. WGSL is validated by naga at
-    /// pipeline creation, not by `cargo build`, and the bind group count is
-    /// checked at the same moment -- a brush spends three groups already, and
-    /// the cuboid form of SSR binds two more, which would put this at five and
-    /// over the limit this hardware guarantees. Nothing before this point would
-    /// have said so.
     #[test]
     fn the_reflective_brush_pipeline_builds_within_the_bind_group_limit() {
         let Some((device, queue)) = headless_gpu() else {
@@ -6157,17 +4533,7 @@ mod ssr_pipeline_tests {
         let _ = &queue;
         let lights = LightsUniform::new(&device);
         let (_shadows, uniforms) = scene_uniforms(&device, &lights);
-        // EVERY REFLECTIVE PIPELINE THE RENDERER BUILDS, at every sample count
-        // the scene pass runs at.
-        //
-        // It used to build only `new_ssr`, and only at the sample count the
-        // test chose. When the depth binding became single-sampled the test was
-        // updated and the RENDERER was not: it went on passing `samples > 1`,
-        // so all four of these failed to build on the headset, reflections
-        // stopped appearing, and the false-colour view came back as the
-        // ordinary picture. The parameter that allowed the mismatch is gone
-        // now; this builds the same set the renderer does so that a layout and
-        // a shader drifting apart fails here instead.
+
         for scene_samples in [1u32, 4] {
             let ssr = crate::renderer::ssr::SsrPipelines::new_with_depth_samples(
                 &device,
@@ -6190,23 +4556,14 @@ mod ssr_pipeline_tests {
                     view,
                 );
             }
-            // THE TRACE PIPELINE, against the reflection buffer's own format.
-            //
-            // This is the shape of failure that has cost this project the most:
-            // a rejected pipeline draws nothing, logs nothing on the device and
-            // makes the frame FASTER, which reads as a win. The trace shader
-            // has a different RETURN TYPE from every other variant -- `vec4`
-            // radiance-and-confidence rather than a blended `vec3` -- so if the
-            // substitution that produces it is wrong, naga rejects it here
-            // rather than on the headset.
+
             let _trace = BrushPipeline::new_ssr_trace(
                 &device,
                 crate::renderer::ssr::REFLECTION_FORMAT,
                 &uniforms.layout,
                 ssr.scene_texture_layout(),
             );
-            // And the pass that reads what it wrote. Same layout, different
-            // texture in binding 1 -- see `wgsl_ssr_composite_block`.
+
             let _composite = BrushPipeline::new_ssr_composite(
                 &device,
                 TextureFormat::Rgba8UnormSrgb,
@@ -6229,8 +4586,6 @@ mod ssr_pipeline_tests {
         }
     }
 
-    /// The runtime debug views: the shipped shader is untouched, and each
-    /// variant carries the diagnostic it is named for.
     #[test]
     fn a_debug_view_changes_only_the_shader_it_is_built_for() {
         assert!(!BRUSH_SOURCE_DEBUG && !crate::renderer::ssr::SSR_DEBUG, "a build switch is on");
@@ -6238,9 +4593,7 @@ mod ssr_pipeline_tests {
             assert_eq!(brush_shader_variant(ssr, false, false), brush_shader_with(ssr));
         }
         let sources = brush_shader_variant(false, true, false);
-        // WHICH sources picture depends on `SOURCES_VIEW`; that it paints the
-        // one selected, and that the shaders above are untouched by it, is
-        // the invariant.
+
         let marker = match SOURCES_VIEW {
             SourcesView::Ratios => "dbg_total",
             SourcesView::ProbeFactors => "dbg_probe_factors",
@@ -6259,11 +4612,6 @@ mod ssr_pipeline_tests {
         assert_eq!(DebugView::Ssr.toggle_sources(), DebugView::Off, "the tester's toggle must never reach the SSR view");
     }
 
-    /// The two-eye probe pass and the reader that samples its layers pass
-    /// naga once made multiview -- the only check a development machine can
-    /// make, since none can build a multiview pipeline. A failure on the
-    /// headset only switches half-resolution reflections off in stereo; see
-    /// `StereoProbePass` in the XR renderer.
     #[test]
     fn the_stereo_probe_pass_shaders_validate_as_multiview() {
         for (probe, sources) in [(BrushProbe::Pass, false), (BrushProbe::Read, BRUSH_SOURCE_DEBUG)] {
@@ -6276,18 +4624,13 @@ mod ssr_pipeline_tests {
         }
     }
 
-    /// THE FLOOR MIRROR'S DEPTH IS A DISTANCE AGAIN: points at known
-    /// distances down the eye's axis, put through the eye's own projection as
-    /// the mirror pass puts its characters, come back out of
-    /// `floor_mirror_linear_depth` -- on the GPU, the WGSL the reader runs.
     #[test]
     fn the_floor_mirrors_depth_turns_back_into_a_distance() {
         let Some((device, queue)) = headless_gpu() else {
             eprintln!("skipping: no GPU adapter available");
             return;
         };
-        // `Camera::xr_projection` is the headset's alone; its depth row is any
-        // GL perspective's at the same planes, which is all this reads.
+
         let proj = crate::renderer::camera::Camera::gl_to_wgpu_ndc(glam::Mat4::perspective_rh_gl(
             1.6,
             0.95,
@@ -6347,14 +4690,11 @@ mod ssr_pipeline_tests {
         let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         let back: Vec<f32> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
         for (z, got) in distances.iter().zip(&back) {
-            // f32 depth near 1 holds a far distance to a fraction of a percent.
+
             assert!((got - z).abs() < 0.002 * z + 1e-4, "{z} m came back {got}");
         }
     }
 
-    /// THE FLOOR MIRROR'S BLUR LEVELS AVERAGE: each texel of a level is the
-    /// mean of the four below it, premultiplied colour and coverage alike --
-    /// a checker of one covered texel in four comes out a quarter covered.
     #[test]
     fn the_floor_mirrors_blur_levels_average_the_level_below() {
         let Some((device, queue)) = headless_gpu() else {
@@ -6362,11 +4702,11 @@ mod ssr_pipeline_tests {
             return;
         };
         let layout = probe_pass::bind_group_layout(&device);
-        // A 16 x 16 eye: an 8 x 8 target, four levels.
+
         let target = probe_pass::Target::new(&device, &layout, 16, 16, 1);
         let levels = &target.mirror_levels[0];
         assert_eq!(levels.len(), 4);
-        // Level 0: one texel in each 2 x 2 block covered, white, the rest clear.
+
         let mut texels = vec![0u16; 8 * 8 * 4];
         let one = crate::renderer::sky::f32_to_f16(1.0);
         for y in (0..8).step_by(2) {
@@ -6385,7 +4725,7 @@ mod ssr_pipeline_tests {
         let mips = probe_pass::MirrorMips::new(&device);
         let mut enc = device.create_command_encoder(&Default::default());
         mips.record(&device, &mut enc, levels, (target.width, target.height), None);
-        // Level 1 (4 x 4) and level 3 (1 x 1) back.
+
         let read = |enc: &mut wgpu::CommandEncoder, level: u32, size: u32| {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
@@ -6409,7 +4749,7 @@ mod ssr_pipeline_tests {
             b.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         }
         let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-        // Half floats, as far as these values need: normal numbers and zero.
+
         let half_to_f32 = |h: u16| -> f32 {
             let exp = ((h >> 10) & 0x1f) as i32;
             let mant = (h & 0x3ff) as f32 / 1024.0;
@@ -6426,11 +4766,6 @@ mod ssr_pipeline_tests {
         }
     }
 
-    /// ALL FOUR LEVELS, AT ODD SIZES, as the headset has them (723 x 773):
-    /// every texel of every level the mean of the four below it, the last
-    /// odd row and column of each level left out as a bilinear read at the
-    /// shared corner left them out -- one compute dispatch against the mean
-    /// taken here on the CPU.
     #[test]
     fn the_floor_mirrors_blur_levels_at_odd_sizes_match_their_means() {
         let Some((device, queue)) = headless_gpu() else {
@@ -6492,7 +4827,7 @@ mod ssr_pipeline_tests {
             let mant = (h & 0x3ff) as f32 / 1024.0;
             if exp == 0 { mant * 2f32.powi(-14) } else { (1.0 + mant) * 2f32.powi(exp - 15) }
         };
-        // Level 0 as the GPU holds it, then each level from the one below.
+
         let mut below: Vec<f32> = texels.iter().map(|&h| half_to_f32(h)).collect();
         for k in 1..5 {
             let ((wb, _), (w, h)) = (dims[k - 1], dims[k]);
@@ -6515,15 +4850,6 @@ mod ssr_pipeline_tests {
         }
     }
 
-    /// THE UPSAMPLE IS THE DEPTH-AWARE BILINEAR FILTER, on a real device, at
-    /// every pixel: one filtered read inside a surface, texel by texel along
-    /// an edge -- across a vertical AND a horizontal step in depth, so a
-    /// gather read in the wrong order or a swapped axis weights the wrong
-    /// texels and fails. Checked against the four-texel sum on the CPU. And
-    /// across a CORNER: two faces on one continuous depth, told apart by their
-    /// codes alone -- a pixel takes only its own face's texels (a code within
-    /// the tolerance counts as its own), and where none of the four is its
-    /// face, nothing. The right half writes no code and is read as before.
     #[test]
     fn the_probe_upsample_is_the_depth_aware_bilinear_filter() {
         let Some((device, queue)) = headless_gpu() else {
@@ -6533,9 +4859,7 @@ mod ssr_pipeline_tests {
         const W: u32 = 64;
         const H: u32 = 32;
         const TOLERANCE: f32 = 0.0015;
-        // The half-resolution pass's picture, as a function of its texel: a
-        // colour ramp, a coverage that varies, and two steps in depth -- one
-        // down the middle, one across -- over a gentle slope inside each.
+
         const PATTERN: &str = r#"
 fn pass_colour(t: vec2<f32>) -> vec4<f32> {
     let a = 0.25 + 0.5 * fract(t.x * 0.37 + t.y * 0.11);
@@ -6544,24 +4868,20 @@ fn pass_colour(t: vec2<f32>) -> vec4<f32> {
 fn pass_depth(t: vec2<f32>) -> f32 {
     return 0.3 + 0.4 * step(16.0, t.x) + 0.15 * step(8.0, t.y) + 0.001 * t.y;
 }
-// The faces' codes: two faces meeting at texel column 8, where the depth runs
-// on unbroken; none on the right half.
+
 fn pass_code(t: vec2<f32>) -> f32 {
     if (t.x < 8.0) { return 529.0; }
     if (t.x < 16.0) { return 533.0; }
     return 0.0;
 }
-// A full-resolution pixel's own face: the first face one step off its own
-// code, the second exactly; a corner of the first facing neither; none on the
-// right half.
+
 fn pixel_code(p: vec2<f32>) -> f32 {
     if (p.x < 8.0 && p.y >= 28.0) { return 1.0; }
     if (p.x < 16.0) { return 530.0; }
     if (p.x < 32.0) { return 533.0; }
     return 0.0;
 }
-// A full-resolution pixel's own depth: its surface by its OWN position, the
-// slope interpolated between the half-resolution rows.
+
 fn pixel_depth(p: vec2<f32>) -> f32 {
     return 0.3 + 0.4 * step(32.0, p.x) + 0.15 * step(16.0, p.y) + 0.001 * (p.y * 0.5 - 0.5);
 }
@@ -6720,7 +5040,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         let got: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
         drop(data);
 
-        // The four-texel filter, on the CPU, from the same pattern.
         let step = |edge: f32, x: f32| if x >= edge { 1.0 } else { 0.0 };
         let colour = |t: [f32; 2]| {
             let a = 0.25 + 0.5 * (t[0] * 0.37 + t[1] * 0.11).fract();
@@ -6734,8 +5053,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
             [x, _] if x < 32.0 => 533.0,
             _ => 0.0f32,
         };
-        // `probe_face_same`: unknown matches anything; else within two steps
-        // each way of the code's 32 x 32 grid.
+
         let same_face = |a: f32, b: f32| {
             if a < 0.5 || b < 0.5 {
                 return true;
@@ -6779,8 +5097,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
                 let pre = if weight > 1e-4 { sum.map(|v| v / weight) } else { nearest };
                 let want = [pre[0] / pre[3].max(1e-4), pre[1] / pre[3].max(1e-4), pre[2] / pre[3].max(1e-4), pre[3]];
                 let i = ((y * W + x) * 4) as usize;
-                // The reader expands what it filtered (`probe_pass_expand`):
-                // compressed back, the filter is checked where it filters.
+
                 let luma = |c: &[f32]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
                 let shown = 1.0 + luma(&got[i..i + 3]);
                 let filtered = [got[i] / shown, got[i + 1] / shown, got[i + 2] / shown, got[i + 3]];
@@ -6791,10 +5108,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
                 }
             }
         }
-        // Both paths were exercised: most pixels one surface, a band along
-        // each step on the per-texel path; the corner's band, where the
-        // depth alone would have taken the other face, and its pixels facing
-        // none of the four.
+
         assert!(edges > 60 && edges < (W * H / 4) as usize, "{edges} edge pixels");
         assert!(corner >= 2 * H as usize, "{corner} pixels by the corner");
         assert!(facing_none >= 16, "{facing_none} pixels facing no texel");
@@ -6804,10 +5118,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         );
     }
 
-    /// Every measurement cut of the probe pass still finds its text in the
-    /// generated shader -- a cut that no longer applies would report the
-    /// uncut shader under its name -- and the result is valid WGSL. See
-    /// `BrushPipeline::log_probe_pass_register_cuts`.
     #[test]
     fn every_deferred_register_cut_applies_and_validates() {
         use wgpu::naga;
@@ -6816,8 +5126,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
             let mut src = base.clone();
             for (from, to) in edits.iter() {
                 assert!(src.contains(from), "{label}: `{from}` is not in the deferring probe pass");
-                // Once: an edit is made at the first match, and one also found
-                // earlier in the shader would cut something else.
+
                 assert_eq!(src.matches(from).count(), 1, "{label}: `{from}` is in the deferring probe pass more than once");
                 src = src.replacen(from, to, 1);
             }
@@ -6829,10 +5138,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         }
     }
 
-    /// THE SHIPPED PROBE PASS READS ITS SLOTS FROM PUSH CONSTANTS where the
-    /// device has them: the edit finds both its places in the deferring pass,
-    /// the result declares exactly the 256 bytes the pass sets, and it is valid
-    /// WGSL.
     #[test]
     fn the_probe_pass_reads_its_slots_from_push_constants() {
         use wgpu::naga;
@@ -6865,10 +5170,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         }
     }
 
-    /// Every `READER_EDITS` entry applies to the brushes' reader and the
-    /// ground's, each find exactly once, and leaves every sun class and twin
-    /// valid -- so the `reader_edit` lever never draws the shipped readers
-    /// while claiming an edit.
     #[test]
     fn every_reader_edit_applies_and_validates() {
         use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainRole};
@@ -6895,13 +5196,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         assert!(with_reader_edit(readers[0].1.clone(), "no_such_edit").is_none());
     }
 
-    /// THE SCENE SHADER SPREADS EACH LAMP'S TERMINATOR, from the normal map's
-    /// Toksvig length, and does NOT widen its roughness from the quad's
-    /// derivatives of the normal: against a 3x-supersampled reference that
-    /// widening added aliasing on every normal-mapped stone view, because the
-    /// derivatives of a minified normal map are aliased themselves
-    /// (`offline_frame::aliasing`, 2026-09-30). Both shaders that shade lamps
-    /// on brushes -- the scene pass's reader and the per-pixel tracer.
     #[test]
     fn the_scene_shader_spreads_the_terminator_and_takes_no_derivative_specular_aa() {
         for probe in [BrushProbe::Read, BrushProbe::Trace] {
@@ -6930,9 +5224,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         }
     }
 
-    /// THE HALF-RESOLUTION PROBE PASS AND THE BRUSH THAT READS IT build on a
-    /// real device -- WGSL is only validated at pipeline creation -- and the
-    /// reader is built without the trace. See `probe_pass`.
     #[test]
     fn the_probe_pass_pipelines_build_on_a_real_device() {
         let reader_src = brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Read);
@@ -6951,12 +5242,10 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
             &device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &layout, crate::renderer::multiview::ViewMode::Mono,
         );
         let target = probe_pass::Target::new(&device, &layout, 1445, 1546, 1);
-        // Both eyes' target builds too; its pipelines need multiview, which
-        // no development machine has -- see the naga check below.
+
         let _stereo = probe_pass::Target::new(&device, &layout, 1445, 1546, 2);
         assert_eq!((target.width, target.height), (723, 773));
-        // The pass that ships, which defers its secondary lookups, and the
-        // compute pass that makes them, writing into that target.
+
         let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, target.width * target.height);
         let _deferred = BrushPipeline::new_probe_pass_deferred(&device, &uniforms.layout, &fixups);
         let _poolless = BrushPipeline::new_probe_pass_deferred_poolless(&device, &uniforms.layout, &fixups);
@@ -6966,8 +5255,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         let deferred_src = brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::PassDeferred);
         assert!(deferred_src.contains("const PROBE_SECONDARY_DEFERRED: bool = true;"));
         assert!(deferred_src.contains("probe_fragment = in.clip;") && deferred_src.contains("atomicAdd(&probe_fixups.count"));
-        // Its poolless twin, for frames no torch lights: the pool maps' lookup
-        // and its use gone, and nothing else.
+
         let poolless = crate::renderer::lights::without_pool_maps(deferred_src.clone());
         assert!(deferred_src.contains("= probe_surface_relit(") && !poolless.contains("= probe_surface_relit("));
         assert_eq!(
@@ -6980,8 +5268,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
             .contains("const PROBE_SECONDARY_DEFERRED: bool = false;"));
     }
 
-    /// The debug pipelines must build on a real device, or pressing the button
-    /// on a headset is a crash rather than a diagnostic.
     #[test]
     fn the_debug_view_pipelines_build_on_a_real_device() {
         let Some((device, _queue)) = headless_gpu() else {
@@ -7010,9 +5296,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         }
     }
 
-    /// SSR decides by the NEIGHBOURHOOD, not the texel. See the note on
-    /// `ssr_rough` in the shader: per-texel decisions were the stone room's
-    /// sparkle.
     #[test]
     fn screen_space_reflection_follows_the_neighbourhood_not_the_texel() {
         let src = brush_shader_with(true);
@@ -7027,8 +5310,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         );
     }
 
-    /// The reflective pass must not light a surface the scene pass already lit.
-    /// See `ssr_fallback`: doing it twice was most of the eye pass's cost.
     #[test]
     fn the_reflective_pass_does_not_light_the_surface_a_second_time() {
         const LIGHTS: &str = "let lit = shade_material_lamps(";
@@ -7041,8 +5322,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
             let ssr_view = brush_shader_variant(true, false, true);
             assert!(!ssr_view.contains(LIGHTS), "the SSR view shades the surface again");
         }
-        // The scene pass is where the shading happens, and the sources view
-        // needs it because its colours are recorded while shading runs.
+
         assert!(brush_shader_variant(false, false, false).contains(LIGHTS), "the scene pass stopped lighting");
         assert!(
             brush_shader_variant(true, true, false).contains(LIGHTS),
@@ -7050,7 +5330,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         );
     }
 
-    /// Four groups is the whole budget, so the count is worth stating.
     #[test]
     fn the_reflective_brush_shader_binds_exactly_four_groups() {
         let src = brush_shader_with(true);
@@ -7066,7 +5345,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         );
     }
 
-    /// The plain variant must stay plain.
     #[test]
     fn the_ordinary_brush_shader_has_no_reflection_in_it() {
         let src = brush_shader();
@@ -7086,23 +5364,20 @@ mod reflectivity_tests {
 
     #[test]
     fn polished_marble_is_worth_reflecting() {
-        // Marble020 measures 0.048 -- byte 12 -- and is unmistakably a mirror.
+
         assert!(roughness_is_reflective(Some(&rough_map(12))));
     }
 
     #[test]
     fn rock_and_gravel_are_not() {
-        // Near 1.0. Turning the reflective pass on for these would pay a
-        // full-resolution scene copy and a second draw over every face to show
-        // nothing.
+
         assert!(!roughness_is_reflective(Some(&rough_map(230))));
         assert!(!roughness_is_reflective(Some(&rough_map(255))));
     }
 
     #[test]
     fn a_material_with_no_roughness_map_is_treated_as_fully_rough() {
-        // The same default the shader uses for a missing map. An unauthored
-        // material must never silently switch the pass on.
+
         assert!(!roughness_is_reflective(None));
     }
 
@@ -7114,9 +5389,7 @@ mod reflectivity_tests {
 
     #[test]
     fn the_mean_decides_not_the_shiniest_speck() {
-        // A mostly-matte wall with a few polished flecks is not a mirror.
-        // Taking the minimum would turn the pass on for a surface that shows
-        // nothing, which is the expensive direction to be wrong in.
+
         let mut mostly_rough = rough_map(240);
         mostly_rough.rgba[0] = 0;
         mostly_rough.rgba[4] = 0;
@@ -7128,7 +5401,6 @@ mod reflectivity_tests {
 mod bounce_softening_tests {
     use super::*;
 
-    /// The shaping factor, as the shader computes it.
     fn shaped(directionality: f32, n_dot_dir: f32) -> f32 {
         let d = directionality.clamp(0.0, 0.5);
         ((1.0 - d) + d * (n_dot_dir + 1.0)).max(0.0)
@@ -7136,12 +5408,7 @@ mod bounce_softening_tests {
 
     #[test]
     fn a_confident_direction_cannot_swing_the_bounce_a_hundredfold() {
-        // The measured cause of the reported squares. The baked directionality
-        // averages 0.79 on the test room, which UNCAPPED spans 0.21..1.79 and
-        // reaches 0.02..1.98 at the extremes -- while neighbouring texels were
-        // measured pointing in exactly opposite directions. One texel boundary
-        // could therefore cross almost the whole range, which reads as a hard
-        // bright-and-dark grid the size of a lightmap texel.
+
         let lo = shaped(1.0, -1.0);
         let hi = shaped(1.0, 1.0);
         assert!(hi / lo.max(1e-6) <= 3.1, "shaping still swings {:.1}x", hi / lo);
@@ -7149,16 +5416,13 @@ mod bounce_softening_tests {
 
     #[test]
     fn it_is_still_directional() {
-        // Capping the trust must not flatten the term into the constant it
-        // replaced -- the whole point is that a surface facing the bounce is
-        // lit more than one facing away.
+
         assert!(shaped(0.79, 1.0) > shaped(0.79, -1.0) * 2.0);
     }
 
     #[test]
     fn no_directionality_is_still_exactly_flat() {
-        // The compatibility guarantee for every lightmap baked before the
-        // direction map existed.
+
         for cos in [-1.0f32, -0.4, 0.0, 0.6, 1.0] {
             assert_eq!(shaped(0.0, cos), 1.0);
         }
@@ -7166,9 +5430,7 @@ mod bounce_softening_tests {
 
     #[test]
     fn the_reflection_is_not_a_mirror() {
-        // Marble reads as polished chrome when a sharp screen-space reflection
-        // is shown at full Fresnel strength, because nothing blurs it by the
-        // surface's roughness. Reported from the headset as "too reflective".
+
         let src = brush_shader_with(true);
         assert!(
             src.contains("MAX_SSR_REFLECTIVITY"),
@@ -7179,7 +5441,7 @@ mod bounce_softening_tests {
 
 #[cfg(test)]
 mod mip_chain_tests {
-    //! The mip chain the brush materials never had.
+
     use super::*;
 
     fn solid(w: u32, h: u32, px: [u8; 4]) -> TerrainImage {
@@ -7197,12 +5459,6 @@ mod mip_chain_tests {
         }
     }
 
-    /// THE sRGB trap. A flat colour must survive every level unchanged.
-    ///
-    /// Averaging sRGB bytes directly is the easy mistake and it does not show
-    /// up here -- a flat image averages to itself either way. It shows up in
-    /// `a_checkerboard_keeps_its_brightness` below. This one guards the other
-    /// direction: that the decode/encode round trip does not drift.
     #[test]
     fn a_flat_colour_survives_every_level() {
         for srgb in [true, false] {
@@ -7217,11 +5473,6 @@ mod mip_chain_tests {
         }
     }
 
-    /// Averaging sRGB bytes directly darkens every level.
-    ///
-    /// Black and white in equal measure is 50% of the light. In sRGB bytes
-    /// that is 188, not 128 -- and 128 is 22% grey. Get this wrong and every
-    /// wall visibly dims as it recedes.
     #[test]
     fn a_checkerboard_keeps_its_brightness() {
         let (w, h) = (64u32, 64u32);
@@ -7243,7 +5494,6 @@ mod mip_chain_tests {
         );
     }
 
-    /// Alpha is linear even inside an sRGB texture.
     #[test]
     fn alpha_is_never_gamma_encoded() {
         let (w, h) = (2u32, 2u32);
@@ -7257,14 +5507,10 @@ mod mip_chain_tests {
     }
 }
 
-/// The shading-source diagnostic must not ship.
 #[cfg(test)]
 mod source_debug_tests {
     use super::*;
 
-    /// A build with this on paints every brush surface in flat primaries. That
-    /// is obvious on a headset and invisible in a diff, so it is asserted
-    /// rather than remembered -- the same guard `SSR_DEBUG` carries.
     #[test]
     fn the_source_diagnostic_is_off() {
         assert!(
@@ -7274,8 +5520,6 @@ mod source_debug_tests {
         );
     }
 
-    /// And when it is on, it reaches the shader -- otherwise flipping the
-    /// switch produces a normal-looking build and wastes a headset session.
     #[test]
     fn the_switch_reaches_the_shader() {
         let src = brush_shader_with(true);
@@ -7288,26 +5532,18 @@ mod source_debug_tests {
         );
     }
 
-    /// The three terms are actually recorded where they are computed, or the
-    /// diagnostic paints a uniform colour and says nothing.
     #[test]
     fn every_source_is_recorded_at_its_own_term() {
         let lights = super::super::lights::wgsl_lights_block(0, 1);
         assert!(
-            // Occlusion and the roughness blend included deliberately. The
-            // diagnostic is answering "which term lit this pixel", so it has to
-            // record what the probe CONTRIBUTED, not what it sampled -- a probe
-            // whose contribution is entirely blended away should read black
-            // here, and pinning the raw sample would have painted it blue.
+
             lights.contains(
                 "dbg_probe = probe.rgb * clamp(probe.a, 0.0, 1.0) * spec_occ * probe_scale \
                  * (1.0 - lobe_is_hemispherical) * fresnel;",
             ),
             "the probe term is not recorded as the picture weights it",
         );
-        // WEIGHTED LIKE THE RETURN LINE: diffuse terms by albedo and
-        // (1 - Fresnel), the probe by Fresnel. Unweighted, the sources view
-        // painted walls blue that the probe barely lit (headset, 2026-09-17).
+
         assert!(
             lights.contains("let kd = albedo * (1.0 - fresnel);") && lights.contains("dbg_baked = bounce * kd;"),
             "the baked term is not recorded as the picture weights it",
@@ -7320,7 +5556,6 @@ mod source_debug_tests {
     }
 }
 
-/// The crack seal draws a brush's BACK faces and nothing it should not.
 #[cfg(test)]
 mod crack_seal_tests {
     use super::*;
@@ -7330,15 +5565,13 @@ mod crack_seal_tests {
     use crate::renderer::uniforms::ShadowUpload;
     use wgpu::util::DeviceExt;
 
-    /// One full-screen triangle through the seal pipeline, on white, with the
-    /// depth buffer cleared to `depth_clear`; returns the centre pixel.
     fn render_seal(facing_away: bool, z: f32, depth_clear: f32) -> Option<[u8; 4]> {
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
         let lights = LightsUniform::new(&device);
         lights.upload(&queue, &[]);
         let (_shadows, uniforms) = scene_uniforms(&device, &lights);
-        // Identity: vertex positions ARE clip coordinates.
+
         uniforms.upload(&queue, glam::Mat4::IDENTITY, TEST_EYE, &ShadowUpload::disabled());
         let pipeline = BrushSealPipeline::new(&device, format, &uniforms.layout, 1);
 
@@ -7352,14 +5585,10 @@ mod crack_seal_tests {
             uv2: [0.0, 0.0],
             face_centre: [1.0 / 3.0, 1.0 / 3.0, z],
             uv2_rect: [0.0, 0.0, 1.0, 1.0],
-            // NO CLAMP. These fixtures are about the material and the
-            // pipeline, not about edge extrapolation, and infinite extent is
-            // exactly the behaviour they measured before the clamp existed --
-            // so every expectation in them still means what it meant.
+
             face_half_extent: [f32::INFINITY; 2],
         };
-        // Counter-clockwise on screen faces the viewer, as the brush pipeline
-        // expects; reversing the order turns the same triangle away.
+
         let mut verts = vec![v(-1.0, -1.0), v(3.0, -1.0), v(-1.0, 3.0)];
         if facing_away {
             verts.swap(1, 2);
@@ -7449,8 +5678,6 @@ mod crack_seal_tests {
             && (px[2] as i32 - want(b)).abs() <= 2
     }
 
-    /// A face pointing AWAY is painted the seal colour -- that is the whole
-    /// mechanism: behind a crack there is only a back face.
     #[test]
     fn a_face_pointing_away_is_sealed() {
         let Some(px) = render_seal(true, 0.5, 1.0) else {
@@ -7460,8 +5687,6 @@ mod crack_seal_tests {
         assert!(is_seal(px), "a back face drew {px:?}, not the seal colour");
     }
 
-    /// A face pointing TOWARDS the viewer is left alone. Drawing front faces
-    /// dark would black out the level wherever the seal wins a depth tie.
     #[test]
     fn a_face_pointing_at_the_viewer_is_not_drawn() {
         let Some(px) = render_seal(false, 0.5, 1.0) else {
@@ -7471,10 +5696,6 @@ mod crack_seal_tests {
         assert_eq!(px, [255, 255, 255, 255], "the seal painted a front face: {px:?}");
     }
 
-    /// A back face BEHIND something already drawn loses the depth test. The
-    /// cleared depth stands in for the wall's front face: nearer than the back
-    /// face, so the seal must not show -- which is why the seal only appears
-    /// where the front faces left a hole.
     #[test]
     fn a_back_face_behind_the_wall_stays_hidden() {
         let Some(px) = render_seal(true, 0.6, 0.3) else {
@@ -7485,28 +5706,16 @@ mod crack_seal_tests {
     }
 }
 
-/// The brush's world position is NOT centroid-interpolated. See the note on
-/// `world_pos` in the shader: it nearly doubled the scene pass on the headset.
 #[cfg(test)]
 mod centroid_tests {
     #[test]
     fn the_brush_does_not_pay_for_centroid_interpolation() {
-        // The DIAGNOSTIC adds a centroid varying on purpose, and is not a
-        // build that ships -- `the_edge_diagnostic_is_off` is what catches one
-        // that escapes. Guarding here instead would let the diagnostic hide
-        // the very cost this test exists to keep out.
+
         if super::BRUSH_EDGE_DEBUG {
             return;
         }
         let src = super::brush_shader_with(false);
 
-        // A BUDGET, NOT A BAN. Centroid on every varying cost ~16 ms a frame
-        // on the headset, which is more than the whole budget; centroid on the
-        // two varyings that feed the two channels measured to move at a seam
-        // is a different proposition, and `BRUSH_CENTROID_VARYINGS` says which
-        // two and why. What must not come back is the version that was
-        // measured -- so this counts them and names them rather than forbidding
-        // the qualifier outright.
         let allowed: &[&str] = if super::BRUSH_CENTROID_VARYINGS {
             &["world_pos", "uv2"]
         } else {
@@ -7535,10 +5744,6 @@ mod centroid_tests {
         );
     }
 
-    /// The diagnostic replaces the brush's whole shading tail with false
-    /// colour, so a build that ships with it on renders the level in red and
-    /// black. Every value test in this file fails first, but they fail for
-    /// reasons that read like broken lighting; this one names the cause.
     #[test]
     fn the_edge_diagnostic_is_off() {
         assert!(
@@ -7561,13 +5766,6 @@ mod trace_shader_tests {
         src[i..].to_string()
     }
 
-    /// THE TRACE AND THE SHIPPED PASS MUST PREPARE THE RAY IDENTICALLY.
-    ///
-    /// They are different pipelines running different shaders over the same
-    /// geometry, and the whole design rests on them agreeing about where each
-    /// ray goes. The prep -- the roughness mip, the blended normal, the Fresnel
-    /// term, `reflectivity` -- decides that, so it is written once and shared.
-    /// If it is ever duplicated, this fails.
     #[test]
     fn the_trace_and_the_shipped_pass_share_the_ray_prep() {
         let (shipped, trace) = (fragment_of(false), fragment_of(true));
@@ -7587,8 +5785,6 @@ mod trace_shader_tests {
         }
     }
 
-    /// The composite applies the pixel's OWN reflectivity, and the trace does
-    /// not -- or it would be squared and every reflection would be far too dark.
     #[test]
     fn reflectivity_is_applied_exactly_once() {
         let trace = fragment_of(true);
@@ -7619,7 +5815,6 @@ mod trace_shader_tests {
         );
     }
 
-    /// The trace writes RADIANCE AND CONFIDENCE and nothing else.
     #[test]
     fn the_trace_writes_confidence_and_never_reads_the_fallback() {
         let trace = fragment_of(true);
@@ -7629,15 +5824,13 @@ mod trace_shader_tests {
             ),
             "the trace no longer returns the march's result directly:\n{trace}",
         );
-        // The fallback is the SURFACE's environment term. Baking it into the
-        // buffer would let the filter blur one surface's environment into its
-        // neighbour's, which is the artefact this whole pass exists to remove.
+
         assert!(
             !trace.contains("ssr_fallback"),
             "the trace reads the environment fallback; it must write only what \
              the march found, and leave the fallback to the composite",
         );
-        // And the shipped path must still do the blending it always did.
+
         let shipped = fragment_of(false);
         assert!(
             shipped.contains("let ssr_fallback = textureLoad(ssr_scene_color, vec2<i32>(in.clip.xy), 0).rgb;")
@@ -7647,9 +5840,6 @@ mod trace_shader_tests {
     }
 }
 
-// Scene shader sources, for `multiview::every_scene_shader_survives_the_multiview_transform`.
-// Test-only: the gate has to see exactly the text each pipeline is built from,
-// and nothing on a development machine can build a multiview pipeline to check.
 #[cfg(test)]
 pub fn brush_shader_src() -> String {
     brush_shader()
@@ -7668,13 +5858,11 @@ mod normal_variance_roughness_tests {
         TerrainImage { width: w, height: h, rgba: px.iter().copied().cycle().take((w * h * 4) as usize).collect() }
     }
 
-    /// A checkerboard of normals leaning hard in OPPOSITE directions. Averaging
-    /// two of these cancels most of the vector, which is the whole signal.
     fn opposing(w: u32, h: u32) -> TerrainImage {
         let mut rgba = Vec::with_capacity((w * h * 4) as usize);
         for y in 0..h {
             for x in 0..w {
-                // +x-leaning and -x-leaning tangent normals, alternating.
+
                 let lean = if (x + y) % 2 == 0 { 255u8 } else { 0u8 };
                 rgba.extend_from_slice(&[lean, 128, 128, 255]);
             }
@@ -7684,17 +5872,14 @@ mod normal_variance_roughness_tests {
 
     #[test]
     fn a_flat_normal_map_changes_the_roughness_not_at_all() {
-        // |Na| == 1 at every level, so sigma2 == 0 and there is nothing to add.
-        // This is the guard that the bake cannot quietly roughen every material
-        // in the game just by being switched on.
+
         let rough = solid(8, 8, [100, 100, 100, 255]);
         let flat = solid(8, 8, [128, 128, 255, 255]);
         let with = roughness_chain_with_normal_variance(&rough, Some(&flat));
         let without = roughness_chain_with_normal_variance(&rough, None);
         assert_eq!(with.len(), without.len());
         for (lvl, (a, b)) in with.iter().zip(without.iter()).enumerate() {
-            // One code value of slack: the flat map decodes to 0.00392 in z
-            // rather than exactly 1.0 because 128 is not exactly 0.5.
+
             for (i, (x, y)) in a.rgba.iter().zip(b.rgba.iter()).enumerate() {
                 assert!(
                     (*x as i32 - *y as i32).abs() <= 2,
@@ -7707,9 +5892,7 @@ mod normal_variance_roughness_tests {
 
     #[test]
     fn level_zero_is_never_touched() {
-        // Nothing has been averaged at level 0, so no variation has been lost.
-        // A surface seen up close must keep exactly the roughness authored for
-        // it -- and "up close" is where the player inspects a material.
+
         let rough = solid(8, 8, [60, 60, 60, 255]);
         let with = roughness_chain_with_normal_variance(&rough, Some(&opposing(8, 8)));
         assert_eq!(with[0].rgba, rough.rgba, "level 0 was modified");
@@ -7731,15 +5914,12 @@ mod normal_variance_roughness_tests {
 
     #[test]
     fn roughness_combines_in_variance_space_not_by_addition() {
-        // THE ARITHMETIC THIS IS EASY TO GET WRONG. Roughness values do not
-        // add; their SQUARES do. With base r and added variance k the answer is
-        // sqrt(r^2 + k) -- which for r = 60/255 and a saturated kernel is very
-        // different from r + something.
+
         let base_byte = 60u8;
         let rough = solid(4, 4, [base_byte, base_byte, base_byte, 255]);
         let with = roughness_chain_with_normal_variance(&rough, Some(&opposing(4, 4)));
         let r = base_byte as f32 / 255.0;
-        // Fully opposed normals saturate the clamp.
+
         let expected = ((r * r + NORMAL_VARIANCE_CLAMP).min(1.0)).sqrt();
         let expected_byte = (expected * 255.0).round() as u8;
         let got = with[1].rgba[0];
@@ -7747,7 +5927,7 @@ mod normal_variance_roughness_tests {
             (got as i32 - expected_byte as i32).abs() <= 2,
             "variance-space combine wrong: got {got}, expected ~{expected_byte}",
         );
-        // And emphatically NOT the naive sum, which would be a different number.
+
         let naive = ((r + NORMAL_VARIANCE_CLAMP).min(1.0) * 255.0).round() as u8;
         assert!(
             (got as i32 - naive as i32).abs() > 2,
@@ -7757,9 +5937,7 @@ mod normal_variance_roughness_tests {
 
     #[test]
     fn a_normal_map_of_a_different_size_is_refused_rather_than_guessed() {
-        // Matching texels between differently-sized maps would apply one
-        // surface's variance to another's roughness. Doing nothing is the
-        // honest failure, and silence here is preferable to a wrong bake.
+
         let rough = solid(8, 8, [90, 90, 90, 255]);
         let wrong_size = solid(4, 4, [255, 128, 128, 255]);
         let with = roughness_chain_with_normal_variance(&rough, Some(&wrong_size));
@@ -7771,9 +5949,7 @@ mod normal_variance_roughness_tests {
 
     #[test]
     fn the_added_roughness_is_capped() {
-        // Without the cap a texel whose normals fully cancel goes to 1.0 and
-        // loses its highlight completely -- trading a shimmer for a dead
-        // surface.
+
         assert!(NORMAL_VARIANCE_CLAMP < 0.25, "the cap is high enough to flatten highlights");
         let rough = solid(4, 4, [10, 10, 10, 255]);
         let with = roughness_chain_with_normal_variance(&rough, Some(&opposing(4, 4)));
@@ -7785,7 +5961,7 @@ mod normal_variance_roughness_tests {
 
 #[cfg(test)]
 mod roughness_sampler_tests {
-    /// Every `@group(1) @binding(N)` the brush shader declares.
+
     fn material_bindings(src: &str) -> Vec<u32> {
         let mut out: Vec<u32> = src
             .match_indices("@group(1) @binding(")
@@ -7799,11 +5975,6 @@ mod roughness_sampler_tests {
         out
     }
 
-    /// THE WHOLE POINT OF THE SECOND SAMPLER. Roughness must not be read
-    /// through the anisotropic one: aniso fetches a higher-resolution mip at
-    /// grazing angles, and a higher-resolution roughness mip has had LESS of
-    /// the normal's variance folded into it -- so the surface shimmers again
-    /// exactly where a glancing view makes it worst.
     #[test]
     fn roughness_is_read_through_the_trilinear_sampler() {
         let src = super::brush_shader_src();
@@ -7820,9 +5991,7 @@ mod roughness_sampler_tests {
                 "roughness is still being read through the anisotropic sampler: {bad}",
             );
         }
-        // COLOUR AND NORMAL MUST NOT FOLLOW IT. They keep 8x anisotropy --
-        // that is what stops a mipped wall going soft at a grazing angle, and
-        // only the ROUGHNESS map has a reason to give it up.
+
         for keep in ["textureSample(mat_color, mat_samp", "textureSample(mat_normal, mat_samp"] {
             assert!(
                 src.contains(keep),
@@ -7831,11 +6000,6 @@ mod roughness_sampler_tests {
         }
     }
 
-    /// The shader's group-1 bindings must be a contiguous run starting at 0.
-    ///
-    /// A gap means the layout and the shader have drifted, and that failure
-    /// surfaces at BIND GROUP CREATION on the device -- not at compile, and
-    /// not in any test that does not own a GPU. Cheap to assert from the text.
     #[test]
     fn the_material_bindings_have_no_holes() {
         let b = material_bindings(&super::brush_shader_src());
@@ -7858,8 +6022,6 @@ mod sun_faces_tests {
     const LIT: [u8; 4] = [9, 255, 40, 255];
     const UNBAKED: [u8; 4] = [0, 0, 0, 0];
 
-    /// A mask baked and hidden everywhere (the baker's red 0, green 255), with
-    /// `texels` set to `texel`.
     fn mask(texels: &[(u32, u32)], texel: [u8; 4]) -> Vec<u8> {
         let mut m: Vec<u8> = (0..W * H).flat_map(|_| [0u8, 255, 40, 255]).collect();
         for &(x, y) in texels {
@@ -7873,7 +6035,6 @@ mod sun_faces_tests {
         SunFaces::from_mask(m, W, H).unwrap()
     }
 
-    /// A patch 20 x 10 texels at (100, 50).
     fn patch() -> [f32; 4] {
         [100.0 / W as f32, 50.0 / H as f32, 120.0 / W as f32, 60.0 / H as f32]
     }
@@ -7890,33 +6051,32 @@ mod sun_faces_tests {
 
     #[test]
     fn a_texel_the_sun_reaches_within_the_border_makes_it_baked() {
-        // Lit (red above 0) 20 texels right of the patch: a deep mip reads it.
+
         assert_eq!(faces(&mask(&[(140, 55)], LIT)).class_of(patch()), FaceSun::Baked);
-        // Beyond the border no read of the patch's pixels reaches it.
+
         let far = mask(&[(120 + SUN_MASK_READ_REACH + 2, 55)], LIT);
         assert_eq!(faces(&far).class_of(patch()), FaceSun::Never);
     }
 
     #[test]
     fn an_unbaked_texel_within_reach_keeps_the_full_reader() {
-        // Green under a half is the neutral mask: the sun falls back to the
-        // level's static map there, so the shader still needs it.
+
         assert_eq!(faces(&mask(&[(110, 55)], [0, 100, 0, 255])).class_of(patch()), FaceSun::Unbaked);
         assert_eq!(faces(&mask(&[(140, 55)], UNBAKED)).class_of(patch()), FaceSun::Unbaked);
-        // A rect that is not one keeps it too.
+
         assert_eq!(faces(&mask(&[], UNBAKED)).class_of([f32::NAN; 4]), FaceSun::Unbaked);
     }
 
     #[test]
     fn the_border_covers_the_deepest_mip_the_sampler_reads() {
-        // A bilinear read at level L touches texels up to 1.5 * 2^L away.
+
         let deepest = crate::renderer::mesh::SUN_MASK_MIP_LEVELS - 1;
         assert!(SUN_MASK_READ_REACH as f32 >= 1.5 * (1u32 << deepest) as f32 + 1.0);
     }
 
     #[test]
     fn the_partition_keeps_each_parts_order() {
-        // Lit at (10, 10); unbaked at (200, 100).
+
         let mut m = mask(&[(10, 10)], [200, 255, 40, 255]);
         let i = ((100 * W + 200) * 4) as usize;
         m[i..i + 4].copy_from_slice(&UNBAKED);
@@ -7933,7 +6093,7 @@ mod sun_faces_tests {
 
     #[test]
     fn dilation_fills_the_empty_atlas_out_to_the_reach_from_the_nearest_chart_texel() {
-        // A chart: x 40..60, y 40..60, hidden except a lit column at x = 59.
+
         let mut m: Vec<u8> = (0..W * H).flat_map(|_| UNBAKED).collect();
         for y in 40..60 {
             for x in 40..60 {
@@ -7943,22 +6103,22 @@ mod sun_faces_tests {
             }
         }
         let d = dilate_sun_mask(&m, W, H);
-        // Along its rows: the nearest chart texel's value, either side.
+
         assert_eq!(texel(&d, 59 + SUN_MASK_READ_REACH, 50), LIT);
         assert_eq!(texel(&d, 40 - SUN_MASK_READ_REACH, 50), [0, 255, 40, 255]);
-        // Off its corners, within the reach on both axes.
+
         assert_eq!(texel(&d, 59 + 10, 40 - 10), LIT);
         assert_eq!(texel(&d, 40 - SUN_MASK_READ_REACH, 40 - SUN_MASK_READ_REACH), [0, 255, 40, 255]);
-        // Past the reach, left as it was.
+
         assert_eq!(texel(&d, 59 + SUN_MASK_READ_REACH + 1, 50), UNBAKED);
         assert_eq!(texel(&d, 45, 40 - SUN_MASK_READ_REACH - 1), UNBAKED);
-        // Every baked texel kept, and nothing else changed.
+
         for i in 0..(W * H) as usize {
             if m[i * 4 + 1] >= 128 {
                 assert_eq!(d[i * 4..i * 4 + 4], m[i * 4..i * 4 + 4]);
             }
         }
-        // So every face of the chart can read only baked texels.
+
         let inner = [41.0 / W as f32, 41.0 / H as f32, 50.0 / W as f32, 59.0 / H as f32];
         assert_eq!(faces(&m).class_of(inner), FaceSun::Unbaked);
         assert_eq!(faces(&d).class_of(inner), FaceSun::Baked);
@@ -7982,10 +6142,6 @@ mod sun_faces_tests {
         }
     }
 
-    /// WHERE THE SCENE READERS' INSTRUCTIONS COME FROM: each torch-view
-    /// reader's functions ranked by what their repeated inlined copies cost
-    /// (`shader_inlining`), the brushes' and the ground's. A measurement --
-    /// `cargo test --lib where_the_readers -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn where_the_readers_instructions_come_from() {
@@ -8003,8 +6159,6 @@ mod sun_faces_tests {
         }
     }
 
-    /// The same for the reflection passes as they ship: the brushes'
-    /// deferring pass and the ground's.
     #[test]
     #[ignore]
     fn where_the_probe_passes_instructions_come_from() {
@@ -8016,7 +6170,7 @@ mod sun_faces_tests {
         for (label, source) in passes {
             println!("{}", crate::renderer::shader_inlining::report(label, &source, "fs_main", 30));
         }
-        // And the brushes' pass with its repeated code written once.
+
         let (_, edits) = DEFERRED_REGISTER_CUTS.iter().find(|(label, _)| *label == "def_dedup_all").unwrap();
         let mut source = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
         for (from, to) in edits.iter() {
@@ -8028,16 +6182,7 @@ mod sun_faces_tests {
 
 #[cfg(test)]
 mod lightmap_clamp_tests {
-    /// THE MEASUREMENT THIS EXISTS FOR (headset, 2026-09-22). In the
-    /// lighting-sources view, every sample taken along a ceiling seam showed
-    /// the BAKED channel down 22-61 against its neighbours while direct barely
-    /// moved -- the lightmap read was failing at edge pixels, not the probe.
-    ///
-    /// An MSAA edge pixel is shaded at its centre, which can lie outside the
-    /// polygon, so its interpolated uv2 is EXTRAPOLATED past the face's patch
-    /// in the atlas. The gutter cannot bound that: the lightmap has no mips, so
-    /// a distant pixel spans many atlas texels and the overshoot is many texels
-    /// wide against a gutter of 2.
+
     #[test]
     fn both_lightmap_reads_use_the_clamped_uv() {
         let src = super::brush_shader_src();
@@ -8055,9 +6200,6 @@ mod lightmap_clamp_tests {
         );
     }
 
-    /// The rectangle must be FLAT. Interpolating it smoothly would extrapolate
-    /// it at exactly the edge pixels it exists to bound -- the bound would
-    /// inherit the bug.
     #[test]
     fn the_patch_rectangle_is_flat_interpolated() {
         let src = super::brush_shader_src();
@@ -8071,11 +6213,7 @@ mod lightmap_clamp_tests {
 
 #[cfg(test)]
 mod face_clamp_tests {
-    /// The clamp must reach `shade_material_env`, not merely be computed.
-    ///
-    /// A `face_pos` that is worked out and then not passed is the failure mode
-    /// this file has already seen once -- a callback declared, forwarded and
-    /// emitted by nothing compiles clean and leaves the feature unreachable.
+
     #[test]
     fn the_shading_position_is_the_clamped_one() {
         let src = super::brush_shader_with(false);
@@ -8090,9 +6228,6 @@ mod face_clamp_tests {
         );
     }
 
-    /// The ROOM is chosen from the face centre, the photograph within it per
-    /// pixel. An extrapolated edge sample on a grazing ceiling otherwise lands
-    /// past the far wall and takes the outdoor probe (offline_frame, 2026-09-23).
     #[test]
     fn the_room_is_chosen_from_the_face_centre() {
         let src = super::brush_shader_with(false);
@@ -8100,8 +6235,6 @@ mod face_clamp_tests {
         assert!(src.contains("bdir, albedo.rgb, face_pos,"));
     }
 
-    /// `flat`, or it inherits the extrapolation it exists to bound -- the same
-    /// mistake `face_centre` and `uv2_rect` each carry a note about.
     #[test]
     fn the_extent_is_flat_interpolated() {
         let src = super::brush_shader_with(false);

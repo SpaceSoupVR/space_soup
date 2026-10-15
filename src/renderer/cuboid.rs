@@ -484,4 +484,3 @@ mod cylinder_test {
         assert!(build_wire_mesh_one(&c).is_none());
     }
 }
-

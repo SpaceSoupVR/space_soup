@@ -1,137 +1,38 @@
-//! APPLICATION SPACEWARP (`XR_FB_space_warp`): the app renders every other
-//! frame, and the compositor makes the ones between from each eye's motion
-//! vectors and depth.
-//!
-//! Every frame the renderer draws the static world a second time, small --
-//! at the motion-vector size the runtime recommends -- into two more
-//! swapchains: how far each pixel moved on screen since the previous frame
-//! (`CurrNDC - PrevNDC`, the spec's definition, as Meta's own sample computes
-//! it: this frame's view-projection against the previous frame's), and its
-//! depth. Both ride on each eye's projection view as
-//! `XrCompositionLayerSpaceWarpInfoFB`.
-//!
-//! # What moves
-//!
-//! Vertices reach the GPU already in the player's frame, so a world point's
-//! previous clip position is `prev_view_proj * prev_world_to_player *
-//! player_to_world * v`: the head's motion AND locomotion are in the vectors,
-//! and `appSpaceDeltaPose` stays the identity.
-//!
-//! Meshes carry their own motion too: a rigid one by its previous model
-//! matrix, a skinned one -- the player's hands and body, other avatars -- by
-//! its previous joint palette (`GltfSkin::prev_joint_buffer`), skinned twice
-//! in the vertex shader. Water by its waves: its surface placed twice, from
-//! the wave field's set for this frame and the one for the last
-//! ([`MotionKind::Water`]). Layered meshes (caves) by their ordinary vertices,
-//! as [`MotionKind::Mesh`].
-//!
-//! # Reflections
-//!
-//! A reflection is not painted on the surface that shows it: in a mirror the
-//! room behind you is an image as far behind the glass as the room is in
-//! front of it, and it moves as that far-off point would. Moved with the wall,
-//! every reflection sat still on the wall for the synthesised frame and
-//! jumped on the next rendered one -- jitter on every polished floor and wall,
-//! and a doubled image while walking (headset, 2026-09-29).
-//!
-//! So the brushes are drawn with [`MotionKind::BrushReflect`] when the frame
-//! allows it: each pixel moves as a point along its view ray, beyond the
-//! surface by as much as the pixel's reflected image counts
-//! ([`reflection_motion_weight`], read from the eye image's alpha,
-//! `lights::reflection_alpha`) of how far the reflection reached (read from
-//! the probe pass, `probe_pass::REACH_FORMAT`). See [`reflected_point`]. The
-//! depth stays the surface's.
-//!
-//! # Conventions
-//!
-//! The vectors are in normalised device coordinates with y UP -- wgpu's own
-//! clip space, written as it comes -- z 0..1. Not Vulkan's y-down NDC, though
-//! these are Vulkan images: Meta's runtime takes Quest vectors "left-handed"
-//! (Unity's setting; only Android XR headsets take right-handed, y-down ones),
-//! and Godot's Vulkan renderer turns its y-down clip space back up before it
-//! writes them. The first build negated y; the pass never ran in normal play
-//! then (see `render_frame`), so nothing ever showed which way was right.
-//! Depth is the scene's: 0 at the near plane (3 cm), 1 at the far (1 km).
-
 use glam::Mat4;
 #[cfg(target_os = "android")]
 use openxr as xr;
 
-/// Near and far planes of every eye projection (`Camera::xr_projection`).
 pub const NEAR_Z: f32 = 0.03;
-/// 1800 m: far enough that a 1.5 km map is not clipped to sky from one end.
-/// Depth is a 32-bit float from NEAR_Z, so this costs a little precision far
-/// out; nothing a player stands next to is affected.
+
 pub const FAR_Z: f32 = 1800.0;
 
-/// The motion vectors' format: signed half floats, as the spec recommends.
 pub const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// One draw's two clip transforms, as the shader reads them: this frame's
-/// and the previous frame's, each already carrying the draw's model matrix.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MotionCamera {
     pub curr: [[f32; 4]; 4],
     pub prev: [[f32; 4]; 4],
-    /// x = the sign the vector's y is written with (+1: y up, see the module
-    /// docs; -1 only to diagnose); y = a scale on the whole vector (1; 0 only
-    /// to diagnose). zw unused.
+
     pub params: [f32; 4],
-    /// The eye, in the space the draw's vertices are in, for
-    /// [`MotionKind::BrushReflect`] and [`MotionKind::Water`] (the world).
-    /// w unused.
+
     pub eye: [f32; 4],
-    /// For [`MotionKind::BrushReflect`]: x, y = eye-image pixels per motion
-    /// pixel along each axis; z = 1 to move reflected images with what they
-    /// show, 0 to move every pixel with its surface; w = 1 to write, instead
-    /// of motion, what it read -- the reflected share, the reach in metres and
-    /// the distance ratio (DIAGNOSIS ONLY, `space_warp_debug` 32768).
-    /// For [`MotionKind::Water`]: x = seconds since the last frame's water,
-    /// for the shore's swash. yzw unused.
+
     pub reflect: [f32; 4],
 }
 
-/// The farthest a pixel's content is taken to be, in metres: the sky's
-/// reflection (`lights::PROBE_REACH_SKY`) moves as a point this far away.
 pub const MAX_REFLECTED_DISTANCE: f32 = 10000.0;
 
-/// HOW MUCH MORE CONTRAST A REFLECTED IMAGE CARRIES than the polished surface
-/// showing it: a room or a sky reflected varies by about half its brightness
-/// from place to place, lit wall to dark corner, doorway to frame; polished
-/// marble's own pattern by about a tenth (Marble020's colour map: 0.08 over a
-/// few texels, 0.11 over the whole). See [`reflection_motion_weight`].
 pub const REFLECTION_CONTRAST_RATIO: f32 = 5.0;
 
-/// HOW MUCH A PIXEL'S REFLECTED IMAGE COUNTS IN ITS MOTION, from its share of
-/// the pixel's brightness (`lights::reflected_image` over the whole).
-///
-/// One vector moves both layers, so one of them is always left behind by
-/// some of the difference between their motions. What shows is a layer's
-/// CONTRAST moved to the wrong place: weighting each layer's error by its
-/// contrast and minimising the sum of squares gives
-/// `(k s)^2 / ((k s)^2 + (1 - s)^2)`, with `s` the share and `k`
-/// [`REFLECTION_CONTRAST_RATIO`]. Weighting by brightness alone gave the
-/// doorway's reflection on the marble floor a fifth of the correction -- the
-/// sky there is a fifth of the pixel's light and nearly all of its detail
-/// (headset, 2026-09-29).
 pub fn reflection_motion_weight(share: f32) -> f32 {
     layer_motion_weight(share, REFLECTION_CONTRAST_RATIO)
 }
 
-/// Bytes between two draws' slots in the ring of [`MotionCamera`]s: the
-/// dynamic-offset alignment every device allows.
 pub const SLOT_STRIDE: u64 = 256;
 
-/// Slots in the ring, both eyes: the world and every mesh, per eye.
 pub const MAX_SLOTS: u32 = 256;
 
-/// What every motion shader opens with -- the SpaceWarp shader here and the
-/// particles' motion twins (`weather::motion_shader`,
-/// `effects::motion_shader`): the per-draw cameras (group 0, at a dynamic
-/// offset), `motion_of`, which turns two clip positions into the vector the
-/// compositor reads, and `layer_weight`, how much a see-through layer's own
-/// motion counts over what lies behind it ([`layer_motion_weight`]).
 pub fn motion_block() -> String {
     format!(
         r#"
@@ -145,9 +46,7 @@ struct MotionCamera {{
 @group(0) @binding(0) var<uniform> cam: MotionCamera;
 
 fn motion_of(curr: vec4<f32>, prev: vec4<f32>) -> vec4<f32> {{
-    // A point behind the previous frame's eye had no place on its screen:
-    // no motion is the least wrong answer, where dividing by a w near 0
-    // would write infinities for the compositor to sample.
+
     if (prev.w <= {min_w}) {{
         return vec4<f32>(0.0);
     }}
@@ -155,8 +54,6 @@ fn motion_of(curr: vec4<f32>, prev: vec4<f32>) -> vec4<f32> {{
     return vec4<f32>(d.x, d.y * cam.params.x, d.z, 0.0) * cam.params.y;
 }}
 
-// `layer_motion_weight`: a layer covering `share` of a pixel, carrying `k`
-// times the contrast of what is behind it.
 fn layer_weight(share: f32, k: f32) -> f32 {{
     let s = clamp(share, 0.0, 1.0);
     let layer = k * s;
@@ -169,15 +66,6 @@ fn layer_weight(share: f32, k: f32) -> f32 {{
     )
 }
 
-/// HOW MUCH A SEE-THROUGH LAYER'S OWN MOTION COUNTS in its pixel's, when it
-/// covers `share` of the pixel and carries `k` times the contrast of what is
-/// behind it: `(k s)^2 / ((k s)^2 + (1 - s)^2)`. One vector moves both
-/// layers, so one is always left behind; this puts the error where it shows
-/// least -- minimising each layer's contrast moved to the wrong place,
-/// squared. The reflections' rule ([`reflection_motion_weight`]) and the
-/// particles' (written over what is behind them, premultiplied, so a pixel's
-/// motion becomes `w * own + (1 - w) * behind`). See the round-4 table in
-/// `docs/perf-recovery-2026-10-08.md`.
 pub fn layer_motion_weight(share: f32, k: f32) -> f32 {
     let s = share.clamp(0.0, 1.0);
     let layer = k * s;
@@ -185,21 +73,10 @@ pub fn layer_motion_weight(share: f32, k: f32) -> f32 {
     layer * layer / (layer * layer + behind * behind).max(1e-12)
 }
 
-/// A BRIGHT, SHARP LAYER over a duller one -- a flame, an ember, a glinting
-/// mote, a rain streak or a flake against the room or the sky -- carries
-/// about as much more contrast as a reflected image over its polished surface
-/// ([`REFLECTION_CONTRAST_RATIO`]): its own motion wins once it covers a
-/// sixth of its pixel.
 pub const BRIGHT_LAYER_CONTRAST: f32 = REFLECTION_CONTRAST_RATIO;
-/// A SOFT LAYER -- smoke, a splash's crown and mist, a bed of coals -- is
-/// no sharper than what is behind it: its motion wins only where it hides
-/// more than half of it.
+
 pub const SOFT_LAYER_CONTRAST: f32 = 1.0;
 
-/// The shader: this frame's clip position against the previous frame's, as
-/// NDC, y flipped to Vulkan's. See the module docs. A skinned vertex is
-/// skinned twice, by this frame's joints and by the previous frame's, the
-/// same weighted sum the eye pass takes (`mesh_pipeline`).
 pub fn shader() -> String {
     format!(
         r#"
@@ -247,8 +124,6 @@ struct VOut {{
     return motion_of(in.curr, in.prev);
 }}
 
-// REFLECTIONS: the brushes again, each pixel moved as what it shows. See the
-// module docs and `reflected_point`, which this is held to.
 @group(1) @binding(0) var eye_image: texture_2d<f32>;
 @group(1) @binding(1) var reach_image: texture_2d<f32>;
 
@@ -264,9 +139,6 @@ struct VOutReflect {{
     return out;
 }}
 
-// What one eye-image pixel at `texel` says: how much its reflected image
-// counts in its motion (`lights::reflection_alpha`) and how far that image's
-// ray reached. The probe pass is half the eye image each way.
 fn reflect_inputs(texel: vec2<f32>) -> vec2<f32> {{
     let size = vec2<i32>(textureDimensions(eye_image));
     let e = clamp(vec2<i32>(texel), vec2<i32>(0), size - vec2<i32>(1));
@@ -275,10 +147,6 @@ fn reflect_inputs(texel: vec2<f32>) -> vec2<f32> {{
     let r = clamp(e / 2, vec2<i32>(0), reach_size - vec2<i32>(1));
     return vec2<f32>(weight, max(textureLoad(reach_image, r, 0).r, 0.0));
 }}
-
-// The ratio of a surface point's distance `d` from the eye to the distance
-// its pixel's content moves as: 1 for the surface, less as the image counts
-// for more and reaches further.
 
 fn reflect_ratio(texel: vec2<f32>, d: f32) -> f32 {{
     let i = reflect_inputs(texel);
@@ -290,10 +158,7 @@ fn reflect_ratio(texel: vec2<f32>, d: f32) -> f32 {{
     if (cam.reflect.z > 0.5) {{
         let to = in.pos - cam.eye.xyz;
         let d = max(length(to), 1e-3);
-        // FOUR of the eye pixels under this motion pixel, one in each
-        // quarter of its block: a highlight a few pixels wide still counts.
-        // Averaged as ratios -- inverse distances -- which is averaging the
-        // motions they make.
+
         let base = floor(in.clip.xy);
         let s = cam.reflect.xy;
         let ratio = 0.25 * (
@@ -311,11 +176,6 @@ fn reflect_ratio(texel: vec2<f32>, d: f32) -> f32 {{
     return motion_of(cam.curr * vec4<f32>(p, 1.0), cam.prev * vec4<f32>(p, 1.0));
 }}
 
-// WATER: its surface where it is drawn this frame and where it was drawn the
-// last -- the long waves from each frame's set of the wave field, the swash at
-// each frame's time -- so the compositor carries the waves on as they move.
-// Its vertices are in the WORLD: the two cameras carry each frame's way into
-// the player's frame, and `cam.eye` is the world eye. See `MotionKind::Water`.
 {surface}
 @group(1) @binding(0) var<uniform> water: WaterMat;
 @group(1) @binding(1) var wave_now: texture_2d_array<f32>;
@@ -331,7 +191,7 @@ fn reflect_ratio(texel: vec2<f32>, d: f32) -> f32 {{
     out.clip = cam.curr * vec4<f32>(now, 1.0);
     out.curr = out.clip;
     out.prev = cam.prev * vec4<f32>(last, 1.0);
-    // The horizon, held where the water's own pass holds it.
+
     if (out.clip.w > 0.0) {{
         out.clip.z = min(out.clip.z, out.clip.w * 0.999999);
     }}
@@ -347,20 +207,6 @@ fn reflect_ratio(texel: vec2<f32>, d: f32) -> f32 {{
     )
 }
 
-/// WHERE A PIXEL'S CONTENT IS, for its motion: the CPU reference the shader's
-/// `fs_reflect` is held to.
-///
-/// `p` is the surface the eye at `eye` sees; `weight` how much the pixel's
-/// reflected image counts in its motion ([`reflection_motion_weight`], read
-/// back from the eye image's alpha), `reach` how far past the surface the
-/// reflected ray went to what the image shows. A planar mirror's image of
-/// that thing is on the view ray, `reach` beyond `p` -- which moves on screen
-/// exactly as the thing's reflection does.
-///
-/// A pixel that is part surface and part image has one motion for both. Moving
-/// the eye moves a point on screen by an amount that goes as one over its
-/// distance, so blending the two layers' inverse distances by `weight`
-/// blends their motions by it.
 pub fn reflected_point(eye: glam::Vec3, p: glam::Vec3, weight: f32, reach: f32) -> glam::Vec3 {
     let to = p - eye;
     let d = to.length().max(1e-3);
@@ -369,25 +215,14 @@ pub fn reflected_point(eye: glam::Vec3, p: glam::Vec3, weight: f32, reach: f32) 
     eye + to / ratio.max(d / MAX_REFLECTED_DISTANCE)
 }
 
-/// Below this previous clip w a point counts as having been behind the eye.
 pub const MIN_PREV_W: f32 = 1e-4;
 
-/// The largest motion written, in NDC per axis: a point that crossed the
-/// whole screen in one frame gives the compositor nothing to extrapolate,
-/// and a half float saturates to infinity not far above.
 pub const MAX_NDC_MOTION: f32 = 2.0;
 
-/// The previous frame's clip transform for THIS frame's player-frame
-/// vertices: back to the world through this frame's player transform, into
-/// the previous frame's player frame, through the previous frame's camera.
-/// (A mesh needs none of this: its model matrix is already in each frame's
-/// own player frame, so its previous clip is `prev_view_proj * prev_model`.)
 pub fn previous_clip(prev_view_proj: Mat4, prev_world_to_player: Mat4, world_to_player: Mat4) -> Mat4 {
     prev_view_proj * prev_world_to_player * world_to_player.inverse()
 }
 
-/// The motion vector for a point at player-frame `p`, as the shader computes
-/// it: the CPU reference the tests hold the shader's arithmetic to.
 pub fn motion_vector(curr: Mat4, prev: Mat4, p: glam::Vec3) -> glam::Vec3 {
     let c = curr * p.extend(1.0);
     let q = prev * p.extend(1.0);
@@ -397,41 +232,20 @@ pub fn motion_vector(curr: Mat4, prev: Mat4, p: glam::Vec3) -> glam::Vec3 {
     (c.truncate() / c.w - q.truncate() / q.w).clamp(glam::Vec3::splat(-MAX_NDC_MOTION), glam::Vec3::splat(MAX_NDC_MOTION))
 }
 
-/// `appSpaceDeltaPose` as a rotation and a translation: the tracking space's
-/// pose in the world last frame, inverted, times this frame's --
-/// `Inv(prev) * curr`, as Meta's XrSpaceWarp sample builds it. The tracking
-/// space is where the player stands, its pose in the world
-/// `inverse(world_to_player)`, so the delta is
-/// `prev_world_to_player * inverse(world_to_player)`: walking forward a metre
-/// is a metre forward, turning is the turn.
 pub fn app_space_delta_rigid(prev_world_to_player: Mat4, world_to_player: Mat4) -> (glam::Quat, glam::Vec3) {
     let (_, rotation, translation) = (prev_world_to_player * world_to_player.inverse()).to_scale_rotation_translation();
     (rotation, translation)
 }
 
-/// A LOCOMOTION JUMP the compositor must not carry on: a snap turn or a
-/// teleport. Its frame's motion vectors hold the whole jump -- every pixel of
-/// a 45 degree snap thrown to [`MAX_NDC_MOTION`] -- and the frame synthesised
-/// from them threw the world on by half of that again, once at every snap,
-/// for players who turn by stick rather than by turning round (user,
-/// 2026-10-01: snap turns, smooth turns and physical turns must all hold).
-/// The spec's answer is `XR_COMPOSITION_LAYER_SPACE_WARP_INFO_FRAME_SKIP_BIT_FB`
-/// on that frame: no synthesis from it. Smooth turning and walking stay far
-/// under the bounds -- 180 degrees a second is 5 a frame at 36 frames a
-/// second, a sprint 0.1 m -- so only a jump skips.
 pub fn locomotion_jumped(prev_world_to_player: Mat4, world_to_player: Mat4) -> bool {
     let (r, t) = app_space_delta_rigid(prev_world_to_player, world_to_player);
     r.angle_between(glam::Quat::IDENTITY) > JUMP_TURN_DEGREES.to_radians() || t.length() > JUMP_METRES
 }
 
-/// How far locomotion may turn the player in one frame and still be motion:
-/// see [`locomotion_jumped`].
 pub const JUMP_TURN_DEGREES: f32 = 15.0;
 
-/// How far it may carry them: see [`locomotion_jumped`].
 pub const JUMP_METRES: f32 = 0.5;
 
-/// [`app_space_delta_rigid`] as the `XrPosef` the layer info carries.
 #[cfg(target_os = "android")]
 pub fn app_space_delta(prev_world_to_player: Mat4, world_to_player: Mat4) -> xr::Posef {
     let (r, t) = app_space_delta_rigid(prev_world_to_player, world_to_player);
@@ -441,47 +255,29 @@ pub fn app_space_delta(prev_world_to_player: Mat4, world_to_player: Mat4) -> xr:
     }
 }
 
-/// Which vertex layout a motion draw reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MotionKind {
     Brush,
-    /// The brushes, moving reflected images with what they show: group 1 is
-    /// the eye image and the probe pass's reach (`reflect_layout`). See the
-    /// module docs.
+
     BrushReflect,
     Solid,
     Mesh,
     Skinned,
-    /// A body of water, its vertices in the WORLD
-    /// (`water_pipeline::WaterVertex`), placed where its waves put it this
-    /// frame and last: group 1 is the body's uniform and the wave field's two
-    /// sets (`MotionPipelines::water_bind_group`).
+
     Water,
-    /// The falling rain and snow and their splashes (`weather`), each where
-    /// it falls this frame and where it fell the last, written over what is
-    /// behind it by [`layer_motion_weight`]: no vertex buffer, group 1 the
-    /// weather's own group. See `weather::motion_shader`.
+
     Weather,
-    /// The effects drawn over what is behind them -- smoke, flames, coals, a
-    /// splash's crown and mist -- and those screened over it -- embers, dust
-    /// motes, a splash's drops. Their instance buffer; group 1 the probe
-    /// pass's read group, group 2 the effects' own. See
-    /// `effects::motion_shader`.
+
     EffectsOver,
     EffectsScreened,
 }
 
-/// The motion-vector pipelines, one per vertex layout the eye pass draws
-/// with, each reading only what places a vertex; and the ring of per-draw
-/// cameras they share.
 pub struct MotionPipelines {
     pub camera_layout: wgpu::BindGroupLayout,
     pub joints_layout: wgpu::BindGroupLayout,
-    /// Group 1 of [`MotionKind::BrushReflect`]: the eye image this frame's
-    /// scene pass drew, and the probe pass's reach, each one eye's.
+
     pub reflect_layout: wgpu::BindGroupLayout,
-    /// Group 1 of [`MotionKind::Water`]: a body's uniform, the wave field's
-    /// set holding this frame's surface and the set holding the last's.
+
     pub water_layout: wgpu::BindGroupLayout,
     brush: wgpu::RenderPipeline,
     brush_reflect: wgpu::RenderPipeline,
@@ -492,8 +288,7 @@ pub struct MotionPipelines {
     weather: wgpu::RenderPipeline,
     effects_over: wgpu::RenderPipeline,
     effects_screened: wgpu::RenderPipeline,
-    /// Whether the depth format carries stencil (D24S8), which the pass then
-    /// clears too rather than leave for wgpu to zero on first use.
+
     stencil: bool,
 }
 
@@ -597,8 +392,7 @@ impl MotionPipelines {
                     })],
                 },
                 primitive: wgpu::PrimitiveState {
-                    // Both sides: the world's own winding differs by source,
-                    // and a motion vector has no front.
+
                     cull_mode: None,
                     ..Default::default()
                 },
@@ -667,14 +461,7 @@ impl MotionPipelines {
             size(std::mem::size_of::<crate::renderer::water_pipeline::WaterVertex>()),
             &water_attributes,
         );
-        // THE PARTICLES: drawn after everything opaque, tested against its
-        // depth and writing none -- what is behind a drop is still where the
-        // compositor reprojects the pixel from -- and blended premultiplied
-        // over the motion already there: a pixel moves by `w` of the
-        // particle's motion and `1 - w` of what is behind it
-        // ([`layer_motion_weight`]). Colour only: the vector's w is unused.
-        // Group layouts made again here are the renderer's own: wgpu keeps one
-        // of each, so their bind groups fit.
+
         let particle = |label: &str,
                         layouts: &[Option<&wgpu::BindGroupLayout>],
                         source: String,
@@ -771,9 +558,6 @@ impl MotionPipelines {
         }
     }
 
-    /// Group 1 of [`MotionKind::Water`] for one body: its uniform, the wave
-    /// field's set holding this frame's surface (`now`) and the set holding
-    /// the last frame's, and the sampler the water itself reads them with.
     pub fn water_bind_group(
         &self,
         device: &wgpu::Device,
@@ -794,9 +578,6 @@ impl MotionPipelines {
         })
     }
 
-    /// Group 1 of [`MotionKind::BrushReflect`] for one eye: `eye_image`, a
-    /// single-layer view of what the scene pass drew, and `reach`, the probe
-    /// pass's reach target for the same eye.
     pub fn reflect_bind_group(&self, device: &wgpu::Device, eye_image: &wgpu::TextureView, reach: &wgpu::TextureView) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("space_warp_reflect"),
@@ -823,25 +604,17 @@ impl MotionPipelines {
     }
 }
 
-/// One draw of the motion pass: its geometry, the ring slot of its two
-/// cameras, and its group 1 -- a skinned mesh's joints, the brushes'
-/// reflection inputs (`MotionPipelines::reflect_bind_group`), or a body of
-/// water's waves (`MotionPipelines::water_bind_group`).
 pub struct MotionDraw<'a> {
     pub kind: MotionKind,
     pub vertices: &'a wgpu::Buffer,
     pub indices: &'a wgpu::Buffer,
-    /// The first index and how many, of `indices`.
+
     pub first: u32,
     pub count: u32,
     pub slot: u32,
     pub joints: Option<&'a wgpu::BindGroup>,
 }
 
-/// One particle draw of the motion pass, after every [`MotionDraw`]:
-/// `vertices` a particle, `range` the instances, from `instances` (the
-/// effects') or none (the weather's, placed from their index alone), with
-/// group 1 and group 2 as its kind takes them.
 pub struct MotionParticles<'a> {
     pub kind: MotionKind,
     pub instances: Option<&'a wgpu::Buffer>,
@@ -851,8 +624,6 @@ pub struct MotionParticles<'a> {
     pub groups: [Option<&'a wgpu::BindGroup>; 2],
 }
 
-/// Draw one eye's motion vectors and depth into `motion` and `depth`: the
-/// opaque `draws`, then the `particles` over them.
 #[allow(clippy::too_many_arguments)]
 pub fn record(
     encoder: &mut wgpu::CommandEncoder,
@@ -885,8 +656,7 @@ pub fn record(
         }),
         ..Default::default()
     });
-    // A run of draws of one buffer -- the brushes' visible ranges -- binds
-    // it once.
+
     let mut bound: Option<(MotionKind, u32, *const wgpu::Buffer, *const wgpu::Buffer, Option<*const wgpu::BindGroup>)> = None;
     for d in draws.iter().filter(|d| d.count > 0 && d.slot < MAX_SLOTS) {
         if matches!(d.kind, MotionKind::Skinned | MotionKind::BrushReflect | MotionKind::Water) && d.joints.is_none() {
@@ -931,15 +701,8 @@ pub fn record(
     }
 }
 
-/// TRIANGLES A RUN when the brushes are cut into runs for the motion pass's
-/// cull ([`index_runs`]): small enough that a run is a few faces of one
-/// room, large enough that a level is a thousand runs or so.
 pub const RUN_TRIANGLES: usize = 64;
 
-/// THE BRUSHES' INDEX LIST IN RUNS of [`RUN_TRIANGLES`], each with the box
-/// round its triangles (`position` of each vertex index), in the frame the
-/// vertices are in. Consecutive brush triangles are faces of one brush, so a
-/// run is small in space and most of a level's runs are out of a view.
 pub fn index_runs(indices: &[u32], position: impl Fn(u32) -> glam::Vec3) -> Vec<crate::renderer::shadow::CasterChunk> {
     let per = RUN_TRIANGLES * 3;
     indices
@@ -958,11 +721,6 @@ pub fn index_runs(indices: &[u32], position: impl Fn(u32) -> glam::Vec3) -> Vec<
         .collect()
 }
 
-/// THE RANGES OF THE INDEX LIST ONE EYE CAN SEE: the runs whose box is not
-/// wholly behind one plane of its frustum (`shadow::frustum_planes`),
-/// neighbours merged into one range. LOSSLESS: the motion pipelines clip at
-/// every plane, so a triangle wholly outside one draws nothing anyway --
-/// what the cull saves is its vertices and its binning, per eye.
 pub fn visible_ranges(runs: &[crate::renderer::shadow::CasterChunk], planes: &[glam::Vec4; 6]) -> Vec<(u32, u32)> {
     let mut out: Vec<(u32, u32)> = Vec::new();
     for r in runs.iter().filter(|r| crate::renderer::shadow::aabb_in_frustum(planes, r.min, r.max)) {
@@ -974,7 +732,6 @@ pub fn visible_ranges(runs: &[crate::renderer::shadow::CasterChunk], planes: &[g
     out
 }
 
-/// The space warp info for one eye, as `XrCompositionLayerSpaceWarpInfoFB`.
 #[cfg(target_os = "android")]
 pub fn layer_info(
     motion: &xr::Swapchain<xr::Vulkan>,
@@ -1010,8 +767,6 @@ mod tests {
         proj * Mat4::from_rotation_translation(Quat::from_rotation_y(yaw), eye).inverse()
     }
 
-    /// The pipelines build: naga validates the shader only when a device
-    /// creates them.
     #[test]
     fn the_pipelines_build() {
         let Some((device, _queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
@@ -1025,13 +780,9 @@ mod tests {
         assert!(err.is_none(), "{err:?}");
     }
 
-    /// THE MOTION PASS'S CULL IS LOSSLESS: every triangle with a corner in
-    /// an eye's view is in that eye's ranges; the runs wholly behind it are
-    /// left out -- most of a level spread all round the head -- and the
-    /// ranges are merged and inside the list.
     #[test]
     fn the_motion_cull_keeps_every_triangle_in_view_and_drops_the_rest() {
-        // A ring of small walls round the head, a triangle pair a wall.
+
         let mut positions: Vec<Vec3> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         for k in 0..2000 {
@@ -1063,14 +814,11 @@ mod tests {
         assert!((kept as usize) < indices.len() / 2, "kept {kept} of {}", indices.len());
         assert!(ranges.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "ranges merged and in order");
         assert!(ranges.iter().all(|&(f, c)| (f + c) as usize <= indices.len()));
-        // Unculled, as `space_warp_debug` 131072 draws it: everything.
+
         let all = [glam::Vec4::new(0.0, 0.0, 0.0, 1.0); 6];
         assert_eq!(visible_ranges(&runs, &all), vec![(0, indices.len() as u32)]);
     }
 
-    /// HOW MUCH A PARTICLE MOVES ITS PIXEL: nothing where it covers nothing,
-    /// all of it where it covers all; a bright sharp layer wins at a sixth of
-    /// the pixel, a soft one at half; and more cover never counts for less.
     #[test]
     fn a_particle_moves_its_pixel_by_its_share() {
         for k in [BRIGHT_LAYER_CONTRAST, SOFT_LAYER_CONTRAST] {
@@ -1088,9 +836,6 @@ mod tests {
         assert_eq!(reflection_motion_weight(0.3), layer_motion_weight(0.3, REFLECTION_CONTRAST_RATIO));
     }
 
-    /// A hand moving right in front of a still head: its pixels move right,
-    /// through its own model matrix -- a mesh's previous clip is the previous
-    /// camera times its previous model, both in the previous player frame.
     #[test]
     fn a_moving_mesh_carries_its_own_motion() {
         let vp = view_proj(Vec3::new(0.0, 1.6, 0.0), 0.0);
@@ -1101,7 +846,6 @@ mod tests {
         assert!(mv.x > 0.05 && mv.y.abs() < 1e-4, "{mv}");
     }
 
-    /// A still head and a still player: nothing moves.
     #[test]
     fn nothing_moves_when_nothing_moves() {
         let vp = view_proj(Vec3::new(0.0, 1.6, 0.0), 0.0);
@@ -1111,7 +855,6 @@ mod tests {
         assert!(mv.length() < 1e-6, "{mv}");
     }
 
-    /// The head turning left: the world slides right on screen, +x.
     #[test]
     fn turning_left_slides_the_world_right() {
         let prev_vp = view_proj(Vec3::new(0.0, 1.6, 0.0), 0.0);
@@ -1120,7 +863,6 @@ mod tests {
         assert!(mv.x > 0.01 && mv.y.abs() < 1e-4, "{mv}");
     }
 
-    /// The head rising: the world drops on screen, which with y up is -y.
     #[test]
     fn rising_drops_the_world_down_the_image() {
         let prev_vp = view_proj(Vec3::new(0.0, 1.6, 0.0), 0.0);
@@ -1129,26 +871,17 @@ mod tests {
         assert!(mv.y < -0.01, "{mv}");
     }
 
-    /// Walking forward with the thumbstick (locomotion, not the head): the
-    /// vertices arrive in the NEW player frame, and the vector still says the
-    /// world came toward the eye -- a point ahead and to the right moves
-    /// further right.
     #[test]
     fn locomotion_is_in_the_vectors() {
         let vp = view_proj(Vec3::new(0.0, 1.6, 0.0), 0.0);
         let prev_w2p = Mat4::IDENTITY;
-        let w2p = Mat4::from_translation(Vec3::new(0.0, 0.0, 0.5)); // the player moved 0.5 m forward (-z)
+        let w2p = Mat4::from_translation(Vec3::new(0.0, 0.0, 0.5));
         let world = Vec3::new(1.0, 1.6, -4.0);
         let p = w2p.transform_point3(world);
         let mv = motion_vector(vp, previous_clip(vp, prev_w2p, w2p), p);
         assert!(mv.x > 0.005, "{mv}");
     }
 
-    /// A SMOOTH STICK TURN is in the vectors too: the head holds still in the
-    /// tracking space while the space turns under it, so nothing in the
-    /// camera moved, and every still point of the world must still be carried
-    /// across the screen exactly as far as the turn carried it. Five degrees
-    /// a frame (180 a second at 36), from anywhere, facing anywhere.
     #[test]
     fn a_smooth_stick_turn_is_in_the_vectors() {
         let w2p = |offset: Vec3, yaw: f32| Mat4::from_quat(Quat::from_rotation_y(yaw).inverse()) * Mat4::from_translation(-offset);
@@ -1161,20 +894,18 @@ mod tests {
             for turn in [5.0f32, -5.0] {
                 let prev_w2p = w2p(at, facing);
                 let now_w2p = w2p(at, facing + turn.to_radians());
-                // A still point a few metres ahead of the player, now.
+
                 let world = now_w2p.inverse().transform_point3(Vec3::new(0.8, 1.4, -4.0));
                 let p = now_w2p.transform_point3(world);
                 let mv = motion_vector(vp, previous_clip(vp, prev_w2p, now_w2p), p);
                 let moved = ndc(vp * now_w2p, world) - ndc(vp * prev_w2p, world);
                 assert!((mv - moved).length() < 1e-4, "turn {turn} at {at}: {mv} vs {moved}");
-                // Turning left (positive yaw) slides the world right.
+
                 assert!(mv.x * turn > 0.01, "turn {turn}: {mv}");
             }
         }
     }
 
-    /// `appSpaceDeltaPose` is where this frame's tracking space sits in last
-    /// frame's: half a metre forward is (0, 0, -0.5); a turn is the turn.
     #[test]
     fn the_delta_pose_is_the_locomotion() {
         let w2p = |offset: Vec3, yaw: f32| Mat4::from_quat(Quat::from_rotation_y(yaw).inverse()) * Mat4::from_translation(-offset);
@@ -1188,9 +919,6 @@ mod tests {
         assert!(r.angle_between(Quat::IDENTITY) < 1e-5 && t.length() < 1e-5, "{r} {t}");
     }
 
-    /// A SNAP TURN OR A TELEPORT IS A JUMP, and no extrapolation may cross it;
-    /// smooth turning and walking at any sensible speed are motion. Each from
-    /// anywhere, facing anywhere: the jump is the change, not the pose.
     #[test]
     fn snap_turns_and_teleports_skip_synthesis_and_smooth_motion_does_not() {
         let w2p = |offset: Vec3, yaw: f32| Mat4::from_quat(Quat::from_rotation_y(yaw).inverse()) * Mat4::from_translation(-offset);
@@ -1201,28 +929,24 @@ mod tests {
                 assert!(jump(Vec3::ZERO, snap), "a {snap} degree snap at {at} facing {facing}");
             }
             assert!(jump(Vec3::new(2.0, 0.0, -1.0), 0.0), "a teleport");
-            // Smooth turning: 180 degrees a second at 36 frames a second.
+
             assert!(!jump(Vec3::ZERO, 5.0) && !jump(Vec3::ZERO, -5.0), "a smooth turn");
-            // Walking and sprinting, turning as they go.
+
             assert!(!jump(Vec3::new(0.04, 0.0, -0.03), 2.0) && !jump(Vec3::new(0.1, 0.0, 0.0), -4.0), "walking");
             assert!(!jump(Vec3::ZERO, 0.0), "standing still");
         }
     }
 
-    /// A floor mirror: the image of a point it reflects lies on the view ray,
-    /// as far below the floor as the point is above it -- and that image, not
-    /// the floor, is what the reflection moves as.
     #[test]
     fn a_reflection_moves_as_the_image_of_what_it_shows() {
         let eye = Vec3::new(0.0, 1.6, 0.0);
         let thing = Vec3::new(0.5, 1.0, -6.0);
         let image = Vec3::new(thing.x, -thing.y, thing.z);
-        // Where the floor (y = 0) shows it: the view ray to the image.
+
         let p = eye + (image - eye) * (eye.y / (eye.y - image.y));
         let v = reflected_point(eye, p, 1.0, (thing - p).length());
         assert!((v - image).length() < 1e-4, "{v} vs {image}");
-        // Stepping 5 cm right, from where the frame was drawn: the reflection
-        // moves exactly as the image does, and measurably unlike the floor.
+
         let prev = view_proj(eye - Vec3::new(0.05, 0.0, 0.0), 0.0);
         let curr = view_proj(eye, 0.0);
         let truth = motion_vector(curr, prev, image);
@@ -1232,10 +956,6 @@ mod tests {
         assert!((with_floor - truth).truncate().length() > 0.002, "the floor alone was right: {with_floor} vs {truth}");
     }
 
-    /// The image's weight in a pixel's motion: none without a reflection, all
-    /// of it for a mirror, rising steadily between -- and already most of it
-    /// where a sky is a fifth of the light on polished marble, as the doorway's
-    /// reflection on the floor measured (headset, 2026-09-29).
     #[test]
     fn a_reflection_counts_by_its_contrast_not_its_brightness() {
         assert_eq!(reflection_motion_weight(0.0), 0.0);
@@ -1251,8 +971,6 @@ mod tests {
         assert!(reflection_motion_weight(0.05) < 0.1, "a faint reflection took over its surface");
     }
 
-    /// No reflected share, or a reflection that reaches nowhere: the surface.
-    /// And the sky's reach is far but finite.
     #[test]
     fn a_pixel_with_no_reflection_moves_with_its_surface() {
         let eye = Vec3::new(0.0, 1.6, 0.0);
@@ -1263,9 +981,6 @@ mod tests {
         assert!(sky.is_finite() && ((sky - eye).length() - MAX_REFLECTED_DISTANCE).abs() < 1.0, "{sky}");
     }
 
-    /// Half image, half surface: exactly halfway between the two layers'
-    /// motions on screen, because a step of the eye moves a point by one over
-    /// its distance and the blend is of inverse distances.
     #[test]
     fn a_half_reflected_pixel_moves_between_its_two_layers() {
         let eye = Vec3::new(0.0, 1.6, 0.0);
@@ -1280,9 +995,6 @@ mod tests {
         assert!((surface - image).length() > 1e-3, "the two layers moved alike: {surface} {image}");
     }
 
-    /// The shader moves a reflection as the CPU reference does: a wall 3 m
-    /// ahead, every pixel half an image 8 m beyond it, the eye stepping right
-    /// -- and with the switch off, as the wall.
     #[test]
     fn the_shader_moves_reflections_as_the_reference_does() {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
@@ -1297,8 +1009,6 @@ mod tests {
         let prev = view_proj(eye - Vec3::new(0.05, 0.0, 0.0), 0.0);
         let curr = view_proj(eye, 0.0);
 
-        // The eye image, four times the motion size, alpha 128: a share of
-        // 127/255. The reach, half the eye image, 8 m everywhere.
         let texture = |label, size: u32, format, bytes: &[u8]| {
             device
                 .create_texture_with_data(
@@ -1320,14 +1030,13 @@ mod tests {
         };
         let eye_bytes: Vec<u8> = (0..(4 * W) * (4 * W)).flat_map(|_| [0u8, 0, 0, 128]).collect();
         let eye_view = texture("eye", 4 * W, wgpu::TextureFormat::Rgba8UnormSrgb, &eye_bytes);
-        // The reach, 8 m, in R; no face's code in G.
+
         let reach_bytes: Vec<u8> = (0..(2 * W) * (2 * W))
             .flat_map(|_| [0x4800u16, 0].into_iter().flat_map(u16::to_le_bytes))
             .collect();
         let reach_view = texture("reach", 2 * W, crate::renderer::brush_pipeline::probe_pass::REACH_FORMAT, &reach_bytes);
         let reflect = pipelines.reflect_bind_group(&device, &eye_view, &reach_view);
 
-        // Two slots: reflections on, then off.
         let mut ring = vec![0u8; 2 * SLOT_STRIDE as usize];
         for (slot, on) in [(0usize, 1.0f32), (1, 0.0)] {
             let cam = MotionCamera {
@@ -1358,7 +1067,6 @@ mod tests {
             }],
         });
 
-        // The wall: a quad at z = -3 over the whole view, as brush vertices.
         let stride = std::mem::size_of::<crate::renderer::brush_pipeline::BrushVertex>();
         let mut vertices = vec![0u8; 4 * stride];
         for (i, (x, y)) in [(-10.0f32, -10.0f32), (10.0, -10.0), (10.0, 12.0), (-10.0, 12.0)].iter().enumerate() {
@@ -1434,7 +1142,6 @@ mod tests {
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "{err:?}");
 
-        // The wall point at the centre of pixel (32, 32), and what it moves as.
         let ndc = glam::Vec2::new((W / 2) as f32 + 0.5, (W / 2) as f32 + 0.5) / W as f32 * 2.0 - glam::Vec2::ONE;
         let ndc = glam::Vec2::new(ndc.x, -ndc.y);
         let inv = curr.inverse();
@@ -1450,10 +1157,6 @@ mod tests {
         assert!((want - want_plain).truncate().length() > 1e-3, "the test cannot tell them apart");
     }
 
-    /// Water moves as its waves do. With the camera still, a sea whose two
-    /// sets of the wave field hold one surface writes no motion; half a second
-    /// on, the same sea writes motion where its waves moved -- and its depth,
-    /// which the compositor reprojects it by.
     #[test]
     fn water_moves_as_its_waves_do() {
         use crate::renderer::water_pipeline::{WaterOptics, WaterUniform, WaterVertex};
@@ -1467,7 +1170,6 @@ mod tests {
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let pipelines = MotionPipelines::new(&device, wgpu::TextureFormat::Depth32Float);
 
-        // Open water 16 m across, half a metre a vertex, 30 m deep.
         let n = 33usize;
         let verts: Vec<WaterVertex> = (0..n * n)
             .map(|i| WaterVertex { position: [(i % n) as f32 * 0.5 - 8.0, 0.0, (i / n) as f32 * 0.5 - 16.0], depth: 30.0 })
@@ -1480,7 +1182,6 @@ mod tests {
         let vertices = buffer("sea", bytemuck::cast_slice(&verts), wgpu::BufferUsages::VERTEX);
         let index_buffer = buffer("sea_indices", bytemuck::cast_slice(&indices), wgpu::BufferUsages::INDEX);
 
-        // A fresh breeze over open water.
         let params = WaveParams { wind_speed: 8.0, fetch: 5000.0, ..WaveParams::default() };
         let waves = WaveField::new(&device, &queue, params);
         let optics = WaterOptics { height: 0.0, shallow: [0.5; 3], deep: [0.05; 3], depth_scale: 4.0, shore_fade: 0.3, swash: 0.0, swell: 0.0 };
@@ -1499,7 +1200,6 @@ mod tests {
             pipelines.water_bind_group(&device, &uniform, &waves.displacement_views[now], &waves.displacement_views[1 - now], &sampler)
         });
 
-        // A still camera 3 m up, looking out over the water.
         let eye = Vec3::new(0.0, 3.0, 1.0);
         let vp = Mat4::perspective_rh(1.5, 1.0, NEAR_Z, FAR_Z) * Mat4::look_at_rh(eye, Vec3::new(0.0, 0.0, -7.0), Vec3::Y);
         let target = |label, format, usage| {
@@ -1585,7 +1285,6 @@ mod tests {
             (motions, depths)
         };
 
-        // The first update writes both sets at one time: one surface twice.
         let step = |seconds: f64| {
             let mut encoder = device.create_command_encoder(&Default::default());
             waves.update(&queue, &mut encoder, seconds);
@@ -1593,7 +1292,7 @@ mod tests {
         };
         step(10.0);
         let (still, depth) = run(0.0);
-        // Half a second on: this frame's set moves on, the other keeps the last.
+
         step(10.5);
         let (moving, _) = run(0.5);
         let err = pollster::block_on(scope.pop());
@@ -1606,7 +1305,6 @@ mod tests {
         assert!(largest(&moving) > 1e-3, "the waves moved and the motion did not: {}", largest(&moving));
     }
 
-    /// A half float's value: enough of IEEE 754 binary16 for the test above.
     fn f16_to_f32(h: u16) -> f32 {
         let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
         let exp = ((h >> 10) & 0x1f) as i32;
@@ -1618,9 +1316,6 @@ mod tests {
         }
     }
 
-    /// A point that was behind last frame's eye writes no motion, and no
-    /// motion is ever larger than the whole screen: nothing the compositor
-    /// samples can be infinite.
     #[test]
     fn motion_is_always_finite() {
         let vp = view_proj(Vec3::new(0.0, 1.6, 0.0), 0.0);
@@ -1633,11 +1328,6 @@ mod tests {
     }
 }
 
-/// DIAGNOSIS ONLY: what the motion and depth images really hold after the
-/// motion pass, read straight back through Vulkan (wgpu will not copy a
-/// D24S8 depth aspect). The compositor behaved as if every depth it read was
-/// 0 whatever the pass cleared it to (desk test, 2026-09-29); this says
-/// whether the pass's depth is in the image at all. `space_warp_debug` 8192.
 #[cfg(target_os = "android")]
 pub struct Readback {
     device: ash::Device,
@@ -1686,10 +1376,6 @@ impl Readback {
         }
     }
 
-    /// Copy `layer` of both images back, wait, and describe them.
-    /// `save`: also write both images, raw, to this file -- a 16-byte header
-    /// (width, height, layer, whether depth is D24S8, each a little-endian
-    /// u32), the depth words, then the motion texels as four half floats.
     pub fn read(
         &self,
         depth: ash::vk::Image,

@@ -248,4 +248,3 @@ fn box_downsample(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: u
     }
     out
 }
-

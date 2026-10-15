@@ -15,26 +15,7 @@ pub struct SkinnedMeshPrimitive {
 }
 
 impl SkinnedMeshPrimitive {
-    /// Drop triangles belonging to `excluded_joints`, or sitting above
-    /// `cutoff_height` in the bind pose.
-    ///
-    /// WHY A HEIGHT CUTOFF AND NOT JUST JOINTS
-    ///
-    /// Joint exclusion drops a triangle when a vertex's DOMINANT joint is in
-    /// the set. That cannot remove the top of the neck, because those vertices
-    /// are often weighted mostly to Chest or Spine -- joints that must stay,
-    /// since they carry the torso the wearer is supposed to see when they look
-    /// down. So hiding Head, its descendants and Neck still leaves an open tube
-    /// of neck geometry whose rim sits near eye level, and the wearer looks
-    /// straight into the inside of their own throat.
-    ///
-    /// No set of joints fixes that; the geometry simply is not partitioned the
-    /// way the joints are. A plane is. Everything above the collar goes,
-    /// whatever it happens to be weighted to.
-    ///
-    /// `bind_positions` are the vertices already through their bind-pose joint
-    /// matrices, so the cutoff is a height on the MODEL, in model units, and
-    /// does not move when the head turns.
+
     pub(crate) fn excluding_joints_and_above(
         &self,
         device: &wgpu::Device,
@@ -79,9 +60,6 @@ impl SkinnedMeshPrimitive {
     }
 }
 
-/// Joints past this get no matrix and collapse to streaks. Rigs run well past
-/// a humanoid's count (the SCP-427-1 monster has 256 bones), so this holds
-/// them; the palette is a 64 KB-limited uniform, 256 x 64 B = 16 KB.
 pub const MAX_SKIN_JOINTS: usize = 256;
 
 #[derive(Clone)]
@@ -90,46 +68,17 @@ pub struct GltfAnimationPose {
     pub joint_transforms: Vec<Option<(Vec3, Quat, Vec3)>>,
 }
 
-/// A blend at or below this contributes nothing, so the clip is not holding the
-/// joint and must not shadow a later one. Well above f32 noise on a controller
-/// axis, well below any blend a player could mean.
 pub const IDLE_BLEND: f32 = 1e-4;
 
-/// How a clip combines with the ones before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClipBlendMode {
-    /// Takes the joint outright. The first active Override clip wins it, and
-    /// later Override clips on that joint are ignored.
+
     #[default]
     Override,
-    /// Adds its displacement from the bind pose on top of whatever the Override
-    /// layer produced. This is what lets recoil ride a cycling bolt: the cycle
-    /// says where the bolt is, recoil nudges it from there.
+
     Additive,
 }
 
-/// Pose every joint from several clips at once, in local space.
-///
-/// Highest-priority ACTIVE clip wins each joint: `targets` arrives in priority
-/// order (the scene's `part_animations` order), and the first clip that both
-/// drives this joint and is actually blended in takes it.
-///
-/// The idle check is the load-bearing part. Without it a clip claimed its joints
-/// at *any* blend, including 0.0 -- returning `lerp(bind, target, 0)`, the bind
-/// pose -- and returned early, so no later clip was ever consulted. A part
-/// appearing in two clips was therefore pinned at rest by whichever clip came
-/// first in the array, permanently and with nothing logged: add a `fire_cycle`
-/// that moves the bolt while `charging_handle` already does, and the bolt simply
-/// never moves. Authoring one part into several clips is normal and supported --
-/// different actions need different combinations of the same parts -- so a clip
-/// that is not contributing has to step aside.
-///
-/// Free-standing rather than a method because it is pure math over pose data;
-/// GltfSkin owns a wgpu::Buffer, and requiring a GPU to test a lerp is how this
-/// went unnoticed.
-///
-/// Clips are applied in two passes: the Override layer decides where a joint is,
-/// then Additive layers nudge it from there. See ClipBlendMode.
 pub fn blend_joint_local(
     joint_local_bind: &[(Vec3, Quat, Vec3)],
     animations: &[GltfAnimationPose],
@@ -144,7 +93,6 @@ pub fn blend_joint_local(
                     .and_then(|a| a.joint_transforms.get(ji).copied().flatten())
             };
 
-            // Base layer: the first active Override clip that drives this joint.
             let mut pose = bind;
             for &(clip, blend, mode) in targets {
                 let b = blend.clamp(0.0, 1.0);
@@ -160,10 +108,6 @@ pub fn blend_joint_local(
                 break;
             }
 
-            // Additive layers accumulate their offset FROM BIND on top of that.
-            // Offsets rather than absolute poses, so two additive clips compose
-            // instead of the last one erasing the others -- and so an additive
-            // clip means the same thing regardless of what the base is doing.
             for &(clip, blend, mode) in targets {
                 let b = blend.clamp(0.0, 1.0);
                 if b <= IDLE_BLEND || mode != ClipBlendMode::Additive {
@@ -171,12 +115,10 @@ pub fn blend_joint_local(
                 }
                 let Some(target) = target_for(clip) else { continue };
                 pose.0 += (target.0 - bind.0) * b;
-                // Rotation composes rather than adds: the delta from bind, scaled
-                // by the blend, applied to what we have.
+
                 let delta = target.1 * bind.1.inverse();
                 pose.1 = Quat::IDENTITY.slerp(delta, b) * pose.1;
-                // Scale is a ratio, so it multiplies. A bind scale component of 0
-                // has no meaningful ratio, so that axis is left alone.
+
                 for i in 0..3 {
                     if bind.2[i].abs() > f32::EPSILON {
                         let ratio = target.2[i] / bind.2[i];
@@ -199,30 +141,16 @@ pub struct GltfSkin {
     pub animations: Vec<GltfAnimationPose>,
 
     pub joint_buffer: wgpu::Buffer,
-    /// The joint matrices of the update before the last: the pose this skin
-    /// had a frame ago, for SpaceWarp's motion vectors (`space_warp`).
+
     pub prev_joint_buffer: wgpu::Buffer,
-    /// What `joint_buffer` holds now, so the next update can move it into
-    /// `prev_joint_buffer`. Shared by clones, as the buffers are.
+
     pub last_joints: std::sync::Arc<std::sync::Mutex<Option<Vec<[f32; 16]>>>>,
-    /// The motion pass's bind group (both palettes), made on first use.
+
     pub motion_bind_group: std::sync::Arc<std::sync::OnceLock<wgpu::BindGroup>>,
 
     pub joint_bind_group: Option<wgpu::BindGroup>,
     pub primitives: Vec<SkinnedMeshPrimitive>,
 
-    /// Total height of the skinned mesh in its bind pose, in model units.
-    ///
-    /// The character's STATURE -- sole to crown -- and the only measurement on
-    /// a humanoid rig that means the same thing on every model. Joint positions
-    /// do not: "Head" sits at the skull base on one rig and mid-skull on
-    /// another, and a rig may carry no eye joints at all, so anything derived
-    /// from a single joint is a guess about that rig's conventions.
-    ///
-    /// Exists so the first-person eye position can be placed anthropometrically
-    /// when the rig does not say where the eyes are. Measured along the model's
-    /// own up axis at load, from the same bind-pose vertex walk that produces
-    /// `bounding_radius`, so it costs nothing extra.
     pub bind_stature: f32,
 }
 
@@ -232,8 +160,7 @@ impl GltfSkin {
         for (i, mat) in skinned_mats.iter().enumerate().take(MAX_SKIN_JOINTS) {
             buf[i] = mat.to_cols_array();
         }
-        // The pose it replaces becomes the previous one -- the first update
-        // has none, and is its own.
+
         let mut last = self.last_joints.lock().unwrap_or_else(|e| e.into_inner());
         let prev: &[[f32; 16]] = last.as_deref().unwrap_or(&buf);
         queue.write_buffer(&self.prev_joint_buffer, 0, bytemuck::cast_slice(prev));
@@ -241,7 +168,6 @@ impl GltfSkin {
         *last = Some(buf.to_vec());
     }
 
-    /// Both palettes, as the motion pass binds them (`space_warp`).
     pub fn motion_bind_group(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> &wgpu::BindGroup {
         self.motion_bind_group.get_or_init(|| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -255,7 +181,6 @@ impl GltfSkin {
         })
     }
 
-    /// A joint buffer the size every skin's is.
     pub fn joint_buffer(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),

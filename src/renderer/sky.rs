@@ -1,77 +1,15 @@
-//! The sky: the background behind a level, and the ambient light in it.
-//!
-//! WHY BOTH JOBS BELONG TO ONE OBJECT
-//!
-//! An HDRI is one equirectangular panorama carrying real intensity rather than
-//! clamped colour, and it does the background and the lighting at once. That is
-//! the whole reason the format replaced a six-sided skybox: there, the sky was a
-//! picture behind the level and lit nothing, so "the lighting does not match the
-//! sky" was a permanent class of bug. Here they are the same data and cannot
-//! disagree.
-//!
-//! The editor has had this for a while. Nothing in the renderer, the client, the
-//! protocol or the server knew what a sky was, so a level authored against a
-//! panorama arrived on the headset with a dark blue clear colour behind it and a
-//! flat 0.6 ambient inside it.
-//!
-//! LIGHTING IS SPHERICAL HARMONICS, NOT A TEXTURE
-//!
-//! Diffuse irradiance from an environment is a very smooth function of the
-//! surface normal -- so smooth that nine coefficients reproduce it to within a
-//! percent or so, which is the standard result. Projecting once at load and
-//! evaluating in the shader costs about twenty instructions and NO texture
-//! fetch, against a cube sample per pixel for the obvious alternative.
-//!
-//! On a tile GPU that distinction is the whole argument. Bandwidth is the scarce
-//! resource; arithmetic is not. Nine `vec4`s in the uniform buffer we already
-//! bind cost nothing per pixel at all.
-//!
-//! Specular from the environment is deliberately absent. Doing it properly needs
-//! a prefiltered mip chain and a BRDF lookup, which is a real amount of memory
-//! and two more fetches per pixel, and the engine's Blinn-Phong highlight from
-//! actual lights already covers the case people notice.
-//!
-//! THE DIRECTION MAPPING IS MEASURED, NOT ASSUMED
-//!
-//! `direction_to_uv` below is pinned to the editor's: a sun at azimuth 34.3 and
-//! elevation 48 in the lobby's panorama lands on texel (609, 119), which is
-//! exactly the brightest texel in that file. Getting this wrong puts the light
-//! somewhere other than the visible sun, and a level lit from the wrong side
-//! looks like a lighting bug rather than a mapping one.
-
-//! Sky panorama loading and the environment it lights the scene with.
-//!
-//! The MODEL -- the panorama, the harmonics, and the projection between them --
-//! now lives in `space_soup_sky` so the baker evaluates exactly the same sky
-//! this shader does. Two implementations of one physical quantity is how a
-//! baked reflection ended up brighter than the surface it reflected.
-
 pub use space_soup_sky::{
     decode_radiance, project_irradiance, sky_lighting, uv_to_direction, Panorama, SkyIrradiance,
     SkySun,
 };
 pub use space_soup_sky::time_of_day::{AtlasLayers, LayerWeights, SkySnapshot, TimeOfDayParams, TimeOfDaySky};
 
-
 use wgpu::*;
 
 use super::lights::wgsl_lights_block;
 
-/// The flat ambient a scene without a sky gets, matching the shader constant.
 pub const AMBIENT: f32 = 0.6;
 
-
-
-
-
-
-/// Where a world direction lands in an equirectangular panorama.
-///
-/// MEASURED AGAINST THE EDITOR, not derived from a convention. The lobby's
-/// panorama has its sun at azimuth 34.3 / elevation 48 in world terms -- found
-/// by scanning the rendered sky for its brightest direction -- and this maps
-/// that to texel (609, 119), which is the brightest texel in the file itself.
-/// Two independent measurements of the same thing.
 pub fn direction_to_uv(d: [f32; 3]) -> [f32; 2] {
     let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
     let (x, y, z) = (d[0] / len, d[1] / len, d[2] / len);
@@ -80,27 +18,16 @@ pub fn direction_to_uv(d: [f32; 3]) -> [f32; 2] {
     [u, v]
 }
 
-
-
-
-
-
-/// Half-precision, for the panorama texture.
-///
-/// `Rgba16Float` rather than `Rgba8UnormSrgb`: a panorama carries values well
-/// above 1 and that is the entire point of it. Storing the background as sRGB
-/// bytes would clamp the sun to white and make the buffer disagree with the
-/// coefficients projected from the same file.
 pub fn f32_to_f16(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let mut exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let mant = bits & 0x7f_ffff;
     if exp >= 0x1f {
-        return sign | 0x7c00; // infinity, or a NaN flushed to one
+        return sign | 0x7c00;
     }
     if exp <= 0 {
-        return sign; // subnormal, flushed to zero
+        return sign;
     }
     if exp > 0x1e {
         exp = 0x1e;
@@ -108,47 +35,35 @@ pub fn f32_to_f16(v: f32) -> u16 {
     sign | ((exp as u16) << 10) | ((mant >> 13) as u16)
 }
 
-/// WHAT THE SKY SHADER DRAWS OVER THE PANORAMA in a time-of-day sky: the
-/// sun's and the moon's discs and the stars. All zero for a photographed sky,
-/// whose sun is in the picture and whose night never comes -- `mode.x` 0 is
-/// the shader's old path, exactly. Group 1, binding 2. World directions.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SkyExtra {
-    /// x: 1 = a time-of-day sky; y: what the panorama is multiplied by to read
-    /// engine units (it is stored normalised, see `SkySnapshot::panorama_scale`);
-    /// z: seconds, for the stars' twinkle; w: 1 = stars could show at all.
+
     pub mode: [f32; 4],
-    /// xyz toward the sun, w its angular radius.
+
     pub sun: [f32; 4],
-    /// The disc's centre radiance after the air (engine), w the limb darkening.
+
     pub sun_radiance: [f32; 4],
-    /// xyz toward the moon, w its angular radius.
+
     pub moon: [f32; 4],
-    /// The FULL moon's surface radiance after the air, w earthshine (a
-    /// fraction of it).
+
     pub moon_radiance: [f32; 4],
-    /// xyz the way the moon's lit side faces (toward the sun from the moon).
+
     pub moon_sunward: [f32; 4],
-    /// x a magnitude-0 star's illuminance (engine), y the faintest magnitude,
-    /// z how many stars to it on the whole sphere, w twinkle strength.
+
     pub stars: [f32; 4],
-    /// xyz the zenith's optical depth (what dims a star by `exp(-tau X)`).
+
     pub extinction: [f32; 4],
-    /// World -> celestial: rows, the celestial axes in the world. Row 2 is
-    /// the north celestial pole, which the moon's north follows.
+
     pub celestial: [[f32; 4]; 3],
 }
 
 impl SkyExtra {
-    /// What `snap` draws, `seconds` into the level (the twinkle's clock).
+
     pub fn from_snapshot(snap: &SkySnapshot, seconds: f32, zenith_depth: [f32; 3]) -> Self {
         let d = &snap.discs;
         let v4 = |v: [f32; 3], w: f32| [v[0], v[1], v[2], w];
-        // STARS ONLY WHEN THEY COULD SHOW: the brightest (magnitude -1.5)
-        // against the sky's mean, spread over a 0.05-degree pixel. By day the
-        // sky outshines it a thousandfold and the shader skips the field
-        // uniformly -- its whole cost.
+
         let mean_sky = 1.0 / snap.panorama_scale.max(1e-30);
         let px = (0.05f32).to_radians();
         let brightest = d.star_zero_point * 10f32.powf(0.6) / (2.0 * std::f32::consts::PI * (0.5 * px).powi(2));
@@ -167,43 +82,21 @@ impl SkyExtra {
     }
 }
 
-/// The panorama on the GPU, plus the coefficients projected from it.
 pub struct Sky {
     pub bind_group: BindGroup,
-    /// The ambient, WITHOUT the sun when the sky has one -- see `sun`.
+
     pub irradiance: SkyIrradiance,
-    /// The sky's sun, taken out of `irradiance` by `space_soup_sky::sky_lighting`
-    /// and handed back as one directional light, in WORLD space.
-    ///
-    /// Left in the harmonics, half this sky's light was a glow over the whole
-    /// sun-facing hemisphere: no shadow, no sunlit patch through a door, and
-    /// a surface facing away from it lit by the harmonics' ringing. The baker
-    /// splits the sky with the same function and bakes this sun into the
-    /// level's lightmaps, so the renderer shades it only on what has none.
-    /// The panorama the player SEES keeps its sun; only the lighting moves.
+
     pub sun: Option<SkySun>,
-    /// The sky REFLECTIONS show: the panorama without its sun, turned and
-    /// scaled as the scene shows it. `None` for no sky. See [`ReflectionSky`].
+
     pub reflection: Option<ReflectionSky>,
-    /// What the shader draws over the panorama; zero for a photographed sky.
-    /// See [`SkyExtra`].
+
     pub extra: SkyExtra,
     extra_buffer: Buffer,
     texture: Texture,
     sampler: Sampler,
 }
 
-/// THE SKY A REFLECTION SEES: the panorama with its sun taken out (the sun
-/// reaches every surface as a light, and its highlight is that light's --
-/// reflected here as well it would be counted twice), with the scene's
-/// rotation and intensity.
-///
-/// Reflections read it from a layer of the probe array, built at the probes'
-/// size by [`Self::cube_faces`] and blurred by the same GGX chain, so a rough
-/// surface blurs the sky exactly as much as a photograph. Until 2026-09-28 a
-/// reflection that left the building read the sky's nine harmonics instead: the
-/// floor mirrored the front door as a flat pale patch where the real sky has
-/// clouds (headset 21:46:20).
 #[derive(Clone)]
 pub struct ReflectionSky {
     pub pano: Panorama,
@@ -212,8 +105,7 @@ pub struct ReflectionSky {
 }
 
 impl ReflectionSky {
-    /// The sky reflections see for this panorama: its sun taken out exactly as
-    /// `sky_lighting` takes it out, so the two agree about where the sun was.
+
     pub fn new(pano: &Panorama, rotation_deg: f32, intensity: f32) -> Self {
         let pano = match space_soup_sky::extract_sun(pano, rotation_deg, intensity) {
             Some((_, rest)) => rest,
@@ -222,11 +114,9 @@ impl ReflectionSky {
         Self { pano, rotation_deg, intensity }
     }
 
-    /// Radiance toward WORLD direction `d`: bilinear, wrapping in longitude.
     pub fn radiance(&self, d: glam::Vec3) -> [f32; 3] {
         let (rc, rs) = (self.rotation_deg.to_radians().cos(), self.rotation_deg.to_radians().sin());
-        // The inverse of the rotation `project_irradiance` gives the picture:
-        // world back to panorama.
+
         let d = d.normalize_or_zero();
         let p = [rc * d.x - rs * d.z, d.y, rs * d.x + rc * d.z];
         let [u, v] = direction_to_uv(p);
@@ -250,10 +140,6 @@ impl ReflectionSky {
         out
     }
 
-    /// Six cube faces at `res`, RGBA half floats in the probe cube's layout
-    /// (`probe_prefilter::texel_direction`), ready for `prefilter_probe`. Each
-    /// texel averages a 2x2 of samples, so a panorama finer than the cube is
-    /// not aliased into it.
     pub fn cube_faces(&self, res: u32) -> Vec<u8> {
         let res = res.max(1);
         let mut out = Vec::with_capacity((res * res * 6 * 8) as usize);
@@ -344,9 +230,7 @@ impl Sky {
 
         let sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("sky_sampler"),
-            // REPEAT across u, clamp down v. A panorama wraps in longitude and
-            // emphatically does not in latitude -- wrapping there samples the
-            // sky when looking at the ground.
+
             address_mode_u: AddressMode::Repeat,
             address_mode_v: AddressMode::ClampToEdge,
             address_mode_w: AddressMode::ClampToEdge,
@@ -355,11 +239,6 @@ impl Sky {
             ..Default::default()
         });
 
-        // `sky_lighting`, with the sun-free panorama kept for reflections: one
-        // extraction, so the two cannot disagree about where the sun was.
-        // From a copy no wider than 1 K: the lighting is low-frequency and
-        // projects the same from it, and a 4 K sky for the eye would
-        // otherwise cost sixteen times the work here at every scene load.
         let light_pano = pano.for_lighting(1024);
         let (irradiance, sun, without_sun) = match space_soup_sky::extract_sun(&light_pano, rotation_deg, intensity) {
             Some((sun, rest)) => (project_irradiance(&rest, rotation_deg, intensity), Some(sun), rest),
@@ -400,16 +279,6 @@ impl Sky {
         })
     }
 
-    /// THE TIME OF DAY'S SKY AT ONE MOMENT, in place of whatever was shown:
-    /// the panorama (normalised, as `snap` stores it), the ambient, the ONE
-    /// directional light (the sun, or the moon after it), the sky reflections
-    /// see, and the discs and stars. Everything downstream -- the lights block,
-    /// the static sun map (redrawn when the direction moves), the meter, the
-    /// water's and the effects' sun -- reads these same fields, so nothing
-    /// else has to know the sky moved.
-    ///
-    /// `zenith_depth` is the atmosphere's optical depth straight up, which
-    /// dims the stars. Cheap: a 256 x 128 half-float upload and 176 bytes.
     pub fn apply_snapshot(&mut self, device: &Device, queue: &Queue, layout: &BindGroupLayout, snap: &SkySnapshot, seconds: f32, zenith_depth: [f32; 3]) {
         let pano = &snap.panorama;
         let size = self.texture.size();
@@ -434,7 +303,6 @@ impl Sky {
         queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
     }
 
-    /// The stars' twinkle clock, every frame: four bytes.
     pub fn set_clock(&mut self, queue: &Queue, seconds: f32) {
         if self.extra.mode[0] > 0.5 {
             self.extra.mode[2] = seconds;
@@ -442,11 +310,6 @@ impl Sky {
         }
     }
 
-    /// A scene with no sky: one black texel, and the flat ambient as before.
-    ///
-    /// Always bound, like terrain's placeholder layers. An optional binding
-    /// would mean two bind group layouts and therefore two pipelines, and this
-    /// costs one texel.
     pub fn none(device: &Device, queue: &Queue, layout: &BindGroupLayout, ambient: f32) -> Self {
         let mut s = Self::new(
             device,
@@ -458,13 +321,12 @@ impl Sky {
         );
         s.irradiance = SkyIrradiance::flat(ambient);
         s.sun = None;
-        // No sky to reflect: the flat ambient's harmonics answer instead.
+
         s.reflection = None;
         s
     }
 }
 
-/// A panorama into its half-float texture, the same size.
 fn write_panorama(queue: &Queue, texture: &Texture, pano: &Panorama) {
     let mut half = Vec::with_capacity((pano.width * pano.height * 4) as usize);
     for i in 0..(pano.width * pano.height) as usize {
@@ -510,7 +372,6 @@ impl SkyPipeline {
         Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Mono)
     }
 
-    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
     pub fn new_stereo(
 
         device: &Device,
@@ -546,7 +407,7 @@ impl SkyPipeline {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                // No vertex buffer: three vertices generated from their index.
+
                 buffers: &[],
             },
             fragment: Some(FragmentState {
@@ -568,14 +429,7 @@ impl SkyPipeline {
             },
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                // DRAWN LAST, AND WRITES NO DEPTH.
-                //
-                // The sky sits at the far plane and is only visible where
-                // nothing else was drawn, so it goes after the opaques with
-                // `LessEqual` and early-Z rejects every covered pixel. Drawing
-                // it FIRST would shade every one of those pixels and then throw
-                // the work away, which on a fill-limited tile GPU is the whole
-                // cost of the pass for nothing.
+
                 depth_write_enabled: Some(false),
                 depth_compare: Some(CompareFunction::LessEqual),
                 stencil: StencilState::default(),
@@ -590,21 +444,6 @@ impl SkyPipeline {
     }
 }
 
-/// Paint the sky SOLID MAGENTA, to find gaps in level geometry.
-///
-/// The seams along the front ceiling/wall junctions of test_room are dotted
-/// specks 5x brighter than the dark interior on either side of them (35/39/31
-/// against 7/6/4, normal view, 2026-09-22) -- brighter than anything lighting
-/// that corner. Either the sky is showing through pixel-sized gaps where the
-/// geometry does not quite meet, or something in the shading (the reflection
-/// probe, which photographed the bright doorway) is lighting those pixels.
-///
-/// The probe is baked offline and cannot turn magenta; the sky can. So a
-/// magenta speck on the junction is a HOLE, and a bright non-magenta one is
-/// shading. One look decides which of two very different fixes is needed.
-///
-/// Must be `false` in anything shipped; `the_crack_diagnostic_is_off` asserts
-/// it.
 pub const SKY_CRACK_DEBUG: bool = false;
 
 fn sky_shader() -> String {
@@ -612,12 +451,9 @@ fn sky_shader() -> String {
         r#"
 {lights_block}
 
-// Group 1: the panorama. Group 0 comes from the lights block above, which is
-// where `sky_uv` and the irradiance coefficients live.
 @group(1) @binding(0) var sky_tex: texture_2d<f32>;
 @group(1) @binding(1) var sky_samp: sampler;
 
-// What a time-of-day sky draws over its panorama. See `SkyExtra`.
 struct SkyExtra {{
     mode: vec4<f32>,
     sun: vec4<f32>,
@@ -636,7 +472,6 @@ struct VOut {{
     @location(0) ndc: vec2<f32>,
 }}
 
-// One oversized triangle covering the target, from the vertex index alone.
 @vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {{
     var p = array<vec2<f32>, 3>(
         vec2<f32>(-1.0, -1.0),
@@ -644,20 +479,16 @@ struct VOut {{
         vec2<f32>(-1.0, 3.0),
     );
     var out: VOut;
-    // z = 1: the far plane. With depth_compare LessEqual and no depth write,
-    // this passes only where nothing nearer was drawn.
+
     out.clip = vec4<f32>(p[vi], 1.0, 1.0);
     out.ndc = p[vi];
     return out;
 }}
 
 const SKY_PI: f32 = 3.14159265;
-// Star cells along a cube face's side, angle-even. A cell is ~0.6 degrees:
-// at the headset's ~0.05-degree pixels a star's footprint stays well inside
-// the 2 x 2 cells read round it.
+
 const STAR_CELLS: f32 = {star_cells:.1};
-// The moon's brightest part after exposure when the eye is on it: ACES puts
-// 2.0 at ~0.8, so the seas (0.6 of the highlands) still read. See `sky_moon`.
+
 const MOON_SEEN: f32 = 2.0;
 
 fn star_hash(x: u32, y: u32, z: u32) -> vec4<f32> {{
@@ -675,7 +506,6 @@ fn star_hash(x: u32, y: u32, z: u32) -> vec4<f32> {{
     return vec4<f32>(o >> vec4<u32>(8u)) / 16777216.0;
 }}
 
-// A point on face `face` at face coordinates `uv` (-1..1), as a direction.
 fn star_face_dir(face: u32, uv: vec2<f32>) -> vec3<f32> {{
     switch face {{
         case 0u: {{ return normalize(vec3<f32>(1.0, uv.x, uv.y)); }}
@@ -687,12 +517,6 @@ fn star_face_dir(face: u32, uv: vec2<f32>) -> vec3<f32> {{
     }}
 }}
 
-// THE STARS: a field fixed on the celestial sphere, as many to each magnitude
-// as the real sky has (x ~3 a magnitude to the limit), each drawn as a
-// Gaussian no narrower than half a pixel and carrying its whole light at any
-// size -- a star narrower than a pixel falls between pixel centres and
-// vanishes otherwise. Dimmed by the air (Kasten-Young airmass) and twinkling
-// only where the eye looks through a lot of it, near the horizon.
 fn sky_stars(d: vec3<f32>, px: f32) -> vec3<f32> {{
     let q = vec3<f32>(dot(sky_extra.celestial[0].xyz, d), dot(sky_extra.celestial[1].xyz, d), dot(sky_extra.celestial[2].xyz, d));
     let a = abs(q);
@@ -723,7 +547,7 @@ fn sky_stars(d: vec3<f32>, px: f32) -> vec3<f32> {{
             continue;
         }}
         let h = star_hash(u32(cell.x), u32(cell.y), face);
-        // The cell's solid angle: an angle-even cell over a cube face.
+
         let c = tan(((cell + 0.5) / STAR_CELLS * 2.0 - 1.0) * (SKY_PI * 0.25));
         let r2 = 1.0 + dot(c, c);
         let omega = cell_angle * cell_angle * (1.0 + c.x * c.x) * (1.0 + c.y * c.y) / (r2 * sqrt(r2));
@@ -731,14 +555,13 @@ fn sky_stars(d: vec3<f32>, px: f32) -> vec3<f32> {{
         if (h.x >= p) {{
             continue;
         }}
-        // Given a star, h.x / p is uniform: the magnitude from the counts,
-        // brighter ones rarer, none brighter than Sirius.
+
         let m = max(sky_extra.stars.y + log2(max(h.x / p, 1e-6)) * (0.30103 / 0.47), -1.5);
         let at = star_face_dir(face, tan(((cell + h.yz) / STAR_CELLS * 2.0 - 1.0) * (SKY_PI * 0.25)));
         let off = length(cross(q, at));
         let flux = sky_extra.stars.x * exp2(-1.3287712 * m);
         let spread = flux / (2.0 * SKY_PI * sigma * sigma) * exp(-off * off / (2.0 * sigma * sigma));
-        // Colour from a temperature drawn toward the sun-like middle.
+
         let t = h.w;
         let colour = mix(vec3<f32>(1.18, 0.95, 0.72), vec3<f32>(0.82, 0.92, 1.25), t * t * (3.0 - 2.0 * t));
         let tw = 1.0 + twinkle_depth * (0.6 * sin(sky_extra.mode.z * (11.0 + 7.0 * h.y) + 40.0 * h.z) + 0.4 * sin(sky_extra.mode.z * (23.0 + 9.0 * h.z) + 17.0 * h.y));
@@ -747,8 +570,6 @@ fn sky_stars(d: vec3<f32>, px: f32) -> vec3<f32> {{
     return sum * dimmed;
 }}
 
-// The moon's dark seas, as the near side shows them (selenographic latitude,
-// longitude, radius in degrees; lunar north up, east to the right).
 fn moon_albedo(p: vec3<f32>) -> f32 {{
     var maria = array<vec4<f32>, 11>(
         vec4<f32>(33.0, -16.0, 11.0, 0.5),
@@ -772,18 +593,13 @@ fn moon_albedo(p: vec3<f32>) -> f32 {{
         let ang = acos(clamp(dot(p, c), -1.0, 1.0)) * (180.0 / SKY_PI);
         a = a * (1.0 - m.w * (1.0 - smoothstep(m.z * 0.55, m.z, ang)));
     }}
-    // Tycho's bright rays, in the south.
+
     let ty = vec3<f32>(cos(-0.75) * sin(-0.19), sin(-0.75), cos(-0.75) * cos(-0.19));
     a = a + 0.25 * (1.0 - smoothstep(1.0, 4.0, acos(clamp(dot(p, ty), -1.0, 1.0)) * (180.0 / SKY_PI)));
-    // The disc's mean comes back to 1, so the light it sends is the
-    // measured light.
+
     return a * 1.18;
 }}
 
-// THE MOON: a sphere lit from `moon_sunward`, shaded Lommel-Seeliger (a dusty
-// surface: the full moon is a flat disc, not a ball), its seas, earthshine on
-// the dark part, both edges anti-aliased to the pixel. Returns (radiance,
-// coverage): what is behind it -- the stars -- is hidden by coverage.
 fn sky_moon(d: vec3<f32>, px: f32) -> vec4<f32> {{
     let m = sky_extra.moon.xyz;
     let rho = sky_extra.moon.w;
@@ -804,19 +620,13 @@ fn sky_moon(d: vec3<f32>, px: f32) -> vec4<f32> {{
     let lit = smoothstep(-e, e, mu0) * 2.0 * max(mu0, 0.0) / (max(mu0, 0.0) + mu + 1e-4);
     let albedo = moon_albedo(vec3<f32>(xy.x, xy.y, mu));
     let surface = sky_extra.moon_radiance.rgb * albedo * (lit + sky_extra.moon_radiance.w);
-    // THE EYE ON THE MOON: a small bright thing looked at is seen in its own
-    // light -- the eye adapts to it as to a lamp's bulb
-    // (`tonemap::bulb_adaptation`) -- so at night its seas show instead of a
-    // white dot ~2,000 times the adapted sky. Its brightest part is brought to
-    // `MOON_SEEN` after exposure, never brighter than it is. Only the disc:
-    // the moon's light on the scene is the directional light, unscaled.
+
     let rgb = sky_extra.moon_radiance.rgb;
     let peak = max(max(rgb.r, rgb.g), rgb.b) * 1.3 * max(camera.post_params.x, 0.0);
     let seen = min(1.0, MOON_SEEN / max(peak, 1e-12));
     return vec4<f32>(surface * cover * seen, cover);
 }}
 
-// THE SUN'S DISC, limb-darkened, after the air.
 fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
     let s = sky_extra.sun.xyz;
     let rho = sky_extra.sun.w;
@@ -832,26 +642,17 @@ fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
 }}
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
-    // The view ray, recovered by putting the pixel back through the inverse of
-    // view_proj. Two points on the ray rather than one, because the near point
-    // is where the eye is and the difference is the direction -- which is what
-    // makes this correct for an off-centre projection, and every headset's is.
+
     let near = cam_inv_view_proj() * vec4<f32>(in.ndc, 0.0, 1.0);
     let far  = cam_inv_view_proj() * vec4<f32>(in.ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w - near.xyz / near.w);
 
-    // That ray is in the PLAYER's frame, the one the camera's matrices are
-    // in; the panorama is pinned to the world. Turned back by the rig's yaw
-    // first, or a snap or stick turn carried the sky round with the player
-    // while the level and its lighting stayed put (headset, 2026-10-01).
     let world_dir = to_world_direction(dir);
-    // One pixel's angle, taken here, in uniform control flow.
+
     let px = max(length(dpdx(world_dir)), length(dpdy(world_dir)));
     let uv = sky_uv(world_dir);
     var radiance = textureSample(sky_tex, sky_samp, uv).rgb * camera.sky_params.x;
-    // A TIME-OF-DAY SKY: the panorama is stored normalised; the sun's and the
-    // moon's discs and the stars go over it. A photographed sky (mode 0) is
-    // exactly the old path.
+
     if (sky_extra.mode.x > 0.5) {{
         radiance = radiance * sky_extra.mode.y + sky_sun_disc(world_dir, px);
         let moon = sky_moon(world_dir, px);
@@ -861,10 +662,6 @@ fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
         }}
     }}
 
-    // The shared curve, the same one every lit surface uses. This pass used to
-    // run its own local Reinhard because nothing downstream tone mapped -- which
-    // meant the sky and the geometry in front of it disagreed about how
-    // highlights roll off, and the seam showed at the horizon.
     {sky_tail}
 }}
 "#,
@@ -878,13 +675,8 @@ fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
     )
 }
 
-/// Star cells along each cube face of the celestial sphere. See the shader's
-/// `sky_stars`; [`star_count_in_cells`] counts what it draws.
 pub const STAR_CELLS: f32 = 160.0;
 
-/// How many stars the shader's field holds over the whole sphere for a
-/// `star_count` -- its cells' chances summed, the CPU twin of `sky_stars`'s
-/// `p`, so the count the sky draws is the count the catalogue says.
 pub fn star_count_in_cells(star_count: f32) -> f32 {
     let n = STAR_CELLS as u32;
     let cell_angle = std::f32::consts::FRAC_PI_2 / STAR_CELLS;
@@ -905,16 +697,13 @@ pub fn star_count_in_cells(star_count: f32) -> f32 {
 mod tests {
     use super::*;
 
-    /// The shader's star field holds as many stars as the catalogue law asks
-    /// for: no cell is ever asked for more than one at the counts the sky uses
-    /// (9,100 naked-eye stars over ~154k cells), so none is lost.
     #[test]
     fn the_star_field_holds_the_catalogues_count() {
         for n in [100.0f32, 2_000.0, 9_100.0, 20_000.0] {
             let got = star_count_in_cells(n);
             assert!((got / n - 1.0).abs() < 0.01, "{n} stars asked, the field holds {got}");
         }
-        // Far past one a cell, the field saturates rather than inventing stars.
+
         let crowded = star_count_in_cells(1.0e7);
         assert!(crowded < 6.0 * STAR_CELLS * STAR_CELLS + 1.0, "{crowded}");
         assert!(sky_shader().contains(&format!("const STAR_CELLS: f32 = {:.1};", STAR_CELLS)));
@@ -942,16 +731,15 @@ mod tests {
             eprintln!("skipping: the lobby's sky is not installed");
             return;
         };
-        assert_eq!((pano.width, pano.height), (1024, 512));
-        assert_eq!(pano.rgb.len(), (1024 * 512 * 3) as usize);
+        assert_eq!(pano.width, pano.height * 2);
+        assert!(pano.width >= 1024);
+        assert_eq!(pano.rgb.len(), (pano.width * pano.height * 3) as usize);
         assert!(pano.rgb.iter().all(|v| v.is_finite() && *v >= 0.0));
     }
 
     #[test]
     fn a_panorama_carries_values_above_one() {
-        // The entire reason for the format. If a decode clamped -- or if this
-        // were loaded as 8-bit -- the sun would be the same brightness as a
-        // white cloud and the projection below would be meaningless.
+
         let Some(pano) = lobby_sky() else {
             eprintln!("skipping: the lobby's sky is not installed");
             return;
@@ -962,10 +750,7 @@ mod tests {
 
     #[test]
     fn the_suns_texel_is_where_the_direction_mapping_says_it_is() {
-        // THE PIN. The lobby's sun was measured in the running editor at
-        // azimuth 34.3, elevation 48 -- by scanning the rendered sky for its
-        // brightest direction. This asserts the mapping agrees, so the light
-        // the engine computes comes from where the sky visibly shows it.
+
         let Some(pano) = lobby_sky() else {
             eprintln!("skipping: the lobby's sky is not installed");
             return;
@@ -1002,19 +787,13 @@ mod tests {
 
     #[test]
     fn the_shipped_sky_lights_the_ground_from_above_and_from_its_sun() {
-        // END TO END on the file a level actually uses. The synthetic tests
-        // above prove the maths; this proves the maths applied to real data
-        // gives a sane answer, which is the part that would otherwise only be
-        // discovered by putting a headset on.
+
         let Some(pano) = lobby_sky() else {
             eprintln!("skipping: the lobby's sky is not installed");
             return;
         };
         let sh = project_irradiance(&pano, 0.0, 1.0);
 
-        // An outdoor panorama is far brighter above than below: a surface
-        // facing up must receive more than one facing down. If the latitude
-        // mapping were flipped this is the assertion that notices.
         let up = sh.evaluate([0.0, 1.0, 0.0]);
         let down = sh.evaluate([0.0, -1.0, 0.0]);
         assert!(
@@ -1022,8 +801,6 @@ mod tests {
             "the sky is not brighter above than below: up {up:?}, down {down:?}",
         );
 
-        // And it is brighter toward the sun than away from it. The lobby's sun
-        // is at azimuth 34.3, so a surface facing that way gets more.
         let a = 34.3f32.to_radians();
         let toward = sh.evaluate([a.sin(), 0.0, a.cos()]);
         let away = sh.evaluate([-a.sin(), 0.0, -a.cos()]);
@@ -1032,10 +809,6 @@ mod tests {
             "facing the sun ({toward:?}) is not brighter than facing away ({away:?})",
         );
 
-        // Sane magnitudes. A daylight HDRI should land the ambient somewhere
-        // usable rather than at 0.001 or at 40 -- both of which are what a
-        // missing or doubled normalisation looks like, and both of which read
-        // as "the sky does nothing" or "everything is white".
         assert!(
             up[0] > 0.05 && up[0] < 20.0,
             "upward irradiance {up:?} is not a plausible daylight value",
@@ -1066,10 +839,7 @@ mod tests {
 
     #[test]
     fn a_uniform_sky_gives_uniform_irradiance() {
-        // A sphere of constant radiance L lights every normal identically, and
-        // the value is L. Anything else means the solid-angle weighting or the
-        // normalisation is wrong -- both of which are easy to get subtly wrong
-        // and impossible to see in a screenshot.
+
         let pano = Panorama::solid([0.5, 0.5, 0.5], 64, 32);
         let sh = project_irradiance(&pano, 0.0, 1.0);
         for n in [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.3, -0.4, 0.9]] {
@@ -1085,11 +855,7 @@ mod tests {
 
     #[test]
     fn the_solid_angle_weighting_is_not_optional() {
-        // An equirectangular image gives the pole as many texels as the
-        // equator. Without the sin(theta) weight, a small bright cap overhead
-        // dominates the result; with it, it contributes in proportion to the
-        // solid angle it actually covers. So: a sky black everywhere except a
-        // narrow band at the very top must contribute only a little.
+
         let mut pano = Panorama::solid([0.0, 0.0, 0.0], 64, 32);
         for y in 0..2 {
             for x in 0..64 {
@@ -1110,10 +876,7 @@ mod tests {
 
     #[test]
     fn a_sky_bright_on_one_side_lights_that_side() {
-        // The whole point of using nine coefficients rather than one: the
-        // ambient term becomes DIRECTIONAL. A normal facing the bright half
-        // must receive more than one facing away, which a flat ambient cannot
-        // express at all.
+
         let mut pano = Panorama::solid([0.0, 0.0, 0.0], 64, 32);
         for y in 0..32 {
             for x in 0..32 {
@@ -1124,7 +887,7 @@ mod tests {
             }
         }
         let sh = project_irradiance(&pano, 0.0, 1.0);
-        // u < 0.5 is the lit half, which by direction_to_uv is -x.
+
         let lit = sh.evaluate([-1.0, 0.0, 0.0]);
         let dark = sh.evaluate([1.0, 0.0, 0.0]);
         assert!(
@@ -1135,10 +898,7 @@ mod tests {
 
     #[test]
     fn rotating_the_sky_moves_the_light_with_it() {
-        // `rotation_deg` exists so an author can put the sun where the level
-        // needs it. If the coefficients did not turn with the picture, the
-        // control would move the background and leave the lighting behind --
-        // exactly the mismatch an HDRI exists to prevent.
+
         let mut pano = Panorama::solid([0.0, 0.0, 0.0], 64, 32);
         for y in 0..32 {
             for x in 0..16 {
@@ -1168,9 +928,7 @@ mod tests {
 
     #[test]
     fn no_sky_evaluates_to_exactly_the_old_flat_ambient() {
-        // The compatibility claim. A level with no sky must render EXACTLY as
-        // it did before this existed, in every direction -- otherwise adding
-        // the feature silently re-lights every scene that does not use it.
+
         let flat = SkyIrradiance::flat(0.6);
         for n in [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [-0.5, 0.2, 0.8]] {
             let e = flat.evaluate(n);
@@ -1184,7 +942,7 @@ mod tests {
     fn half_precision_survives_the_range_a_sky_uses() {
         for v in [0.0f32, 0.5, 1.0, 12.5, 250.0, 6000.0] {
             let h = f32_to_f16(v);
-            // Reconstruct, the way the GPU will.
+
             let sign = (h >> 15) as u32;
             let exp = ((h >> 10) & 0x1f) as i32;
             let mant = (h & 0x3ff) as u32;
@@ -1205,33 +963,20 @@ mod tests {
     }
 }
 
-/// Rendering tests for the background pass.
-///
-/// The projection and the coefficients above are pure and tested without a GPU.
-/// What those cannot see is the shader: whether the view ray is reconstructed
-/// correctly, whether `sky_uv` in WGSL agrees with `direction_to_uv` in Rust,
-/// and whether the depth setup keeps the sky behind the level instead of over
-/// it. All three fail silently and look like art problems.
 #[cfg(test)]
 mod render_tests {
     use super::*;
     use crate::renderer::lights::LightsUniform;
     use crate::renderer::uniforms::{PlayerUpload, PostUpload, ShadowUpload, SkyUpload, UniformBuffer};
 
-    const SIZE: u32 = 9; // odd, so the centre texel is exactly at NDC (0, 0)
+    const SIZE: u32 = 9;
 
-    /// Red over one half of the longitude, blue over the other.
-    ///
-    /// A split rather than a gradient: it turns "is the shader looking the right
-    /// way" into a question with a categorical answer, which a smooth panorama
-    /// would blur into a judgement call.
     fn split_panorama() -> Panorama {
         let (w, h) = (64u32, 32u32);
         let mut rgb = Vec::with_capacity((w * h * 3) as usize);
         for _y in 0..h {
             for x in 0..w {
-                // Values above 1 so the Reinhard curve in the shader has
-                // something to do and the test notices if it is removed.
+
                 if x < w / 2 {
                     rgb.extend_from_slice(&[3.0, 0.0, 0.0]);
                 } else {
@@ -1242,19 +987,14 @@ mod render_tests {
         Panorama { width: w, height: h, rgb }
     }
 
-    /// Renders the sky looking along `dir` and returns the centre pixel.
     fn look(dir: [f32; 3], pano: &Panorama) -> Option<[u8; 4]> {
         look_turned(dir, pano, 0.0)
     }
 
-    /// The same, with the rig turned by `yaw`: `dir` is then the view in the
-    /// PLAYER's frame, as the headset's camera matrices give it.
     fn look_turned(dir: [f32; 3], pano: &Panorama, yaw: f32) -> Option<[u8; 4]> {
         render_centre(dir, yaw, 1.0, PostUpload::default(), |device, queue, layout| Sky::new(device, queue, layout, pano, 0.0, 1.0))
     }
 
-    /// The time-of-day sky of `snap` looking along `dir` through a lens
-    /// `fov` radians wide, at `exposure`: the centre pixel.
     fn look_at_snapshot(dir: [f32; 3], snap: &SkySnapshot, zenith: [f32; 3], fov: f32, exposure: f32) -> Option<[u8; 4]> {
         render_centre(dir, 0.0, fov, PostUpload { exposure, ..Default::default() }, |device, queue, layout| {
             let mut sky = Sky::none(device, queue, layout, AMBIENT);
@@ -1263,7 +1003,6 @@ mod render_tests {
         })
     }
 
-    /// Renders a sky looking along `dir` and returns the centre pixel.
     fn render_centre(
         dir: [f32; 3],
         yaw: f32,
@@ -1389,22 +1128,9 @@ mod render_tests {
 
     #[test]
     fn the_shader_samples_the_direction_the_cpu_mapping_says_it_should() {
-        // THE PIN BETWEEN THE TWO MAPPINGS. `sky_uv` in WGSL and
-        // `direction_to_uv` in Rust are separate implementations of one
-        // convention, and the coefficients are projected with the Rust one
-        // while the background is drawn with the WGSL one. If they disagree,
-        // a level is lit from somewhere other than where its sun is drawn --
-        // which reads as a lighting bug and is a mapping bug.
+
         let pano = split_panorama();
-        // Nudged off the axes on purpose. [0,0,1] lands on u=0.5 and [0,0,-1]
-        // on the u=0/1 wrap -- both exactly on a boundary of this two-colour
-        // fixture, where the sampler returns a 50/50 blend and "which channel
-        // dominates" has no defined answer. That went unnoticed for as long as
-        // the sky used a per-channel Reinhard, which maps an even red/blue
-        // blend to exactly equal bytes so the comparison came out false and the
-        // assertion passed by coincidence. ACES mixes channels, the tie broke,
-        // and the accident surfaced. These offsets put every sample about three
-        // texels inside a region.
+
         for dir in [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.3, 0.0, 1.0], [0.3, 0.0, -1.0]] {
             let px = shot!(look(dir, &pano));
             let uv = direction_to_uv(dir);
@@ -1421,12 +1147,6 @@ mod render_tests {
         }
     }
 
-    /// THE SKY STAYS WITH THE WORLD WHEN THE PLAYER TURNS. A snap or stick
-    /// turn changes only the rig's yaw: the camera then looks along the
-    /// player-frame direction, and the background must still show the sky
-    /// that lies that way in the world. On the headset the sun swung round
-    /// with every snap turn while the level stayed put (2026-10-01); the
-    /// offline frames that pin turning draw no sky, so nothing caught it.
     #[test]
     fn the_sky_stays_with_the_world_when_the_player_turns() {
         let pano = split_panorama();
@@ -1450,16 +1170,7 @@ mod render_tests {
 
     #[test]
     fn the_sky_is_tonemapped_rather_than_clipped() {
-        // The panorama carries pure red at 3.0, and ACES mixes channels: the
-        // green and blue that come back are made entirely by the colour
-        // matrices. That is a stronger signature than the red channel, which
-        // saturates for a fully-saturated primary this bright and so looks the
-        // same tone mapped as clipped.
-        //
-        // A hard clamp leaves G and B at exactly 0. The old local Reinhard,
-        // being per-channel, also left them at 0 and put red at ~191. Only a
-        // matrix-based curve puts light in the other two, so this now pins
-        // WHICH curve is running and not merely that one is.
+
         let px = shot!(look([-1.0, 0.0, 0.0], &split_panorama()));
         assert!(px[0] > 240, "red should be near the top of the range, got {px:?}");
         assert!(
@@ -1474,11 +1185,7 @@ mod render_tests {
 
     #[test]
     fn the_sky_only_fills_where_nothing_was_drawn() {
-        // It is drawn LAST at the far plane with no depth write, so early-Z
-        // rejects covered pixels rather than shading them and throwing the work
-        // away. Asserted by clearing depth to 0 -- as though the whole frame
-        // were already covered by nearer geometry -- and checking the clear
-        // colour survives.
+
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
             eprintln!("skipping: no GPU adapter available");
             return;
@@ -1538,8 +1245,7 @@ mod render_tests {
                 })],
                 depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                     view: &dv,
-                    // Everything already at the near plane: nothing of the sky
-                    // may pass the LessEqual test.
+
                     depth_ops: Some(Operations { load: LoadOp::Clear(0.0), store: StoreOp::Store }),
                     stencil_ops: None,
                 }),
@@ -1577,22 +1283,18 @@ mod render_tests {
         );
     }
 
-    /// THE TIME OF DAY'S SKY ON THE GPU (smoke test): the panorama, the
-    /// sun's and the moon's discs and the stars' branch run and land where
-    /// the CPU says. Noon's zenith is blue; at night the moon's disc is lit
-    /// against a black sky a few of its widths away.
     #[test]
     fn the_time_of_day_sky_draws_noon_and_the_moon() {
         let tod = TimeOfDaySky::new(TimeOfDayParams::default());
         let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
         let noon = tod.snapshot(12.0, 0.0);
-        // Linear target (Rgba8Unorm): the zenith is ~0.1 at exposure 1.
+
         let px = shot!(look_at_snapshot([0.0, 1.0, 0.0], &noon, zenith, 0.5, 4.0));
         assert!(px[2] > px[0] + 30 && px[2] > px[1] && px[2] > 60, "noon's zenith is not blue: {px:?}");
         let night = tod.snapshot(23.5, 0.0);
         let moon = night.moon.direction;
         assert!(moon[1] > 0.2, "the moon should be up at 23:30 in the defaults: {moon:?}");
-        // A 1.2 degree lens: the 0.52 degree disc fills the middle.
+
         let disc = shot!(look_at_snapshot(moon, &night, zenith, 0.02, 4.0));
         let m = glam::Vec3::from(moon);
         let beside = (m + m.cross(glam::Vec3::Y).normalize() * 0.05).normalize().to_array();
@@ -1603,7 +1305,7 @@ mod render_tests {
 
     #[test]
     fn the_pipeline_validates_multisampled_too() {
-        // It runs in the scene pass, which is 4x on the headset.
+
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
             eprintln!("skipping: no GPU adapter available");
             return;
@@ -1621,9 +1323,6 @@ mod render_tests {
     }
 }
 
-// Scene shader sources, for `multiview::every_scene_shader_survives_the_multiview_transform`.
-// Test-only: the gate has to see exactly the text each pipeline is built from,
-// and nothing on a development machine can build a multiview pipeline to check.
 #[cfg(test)]
 pub fn sky_shader_src() -> String {
     sky_shader()

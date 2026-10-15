@@ -1,77 +1,18 @@
-//! Meshes textured by per-vertex layer weights: caves, and anything else carved.
-//!
-//! WHAT THIS IS FOR
-//!
-//! The editor bakes a voxel-sculpted cave to a glTF mesh and paints each vertex
-//! with four blend weights over the project's terrain layers. Nothing rendered
-//! those weights: the mesh path samples ONE texture at a uv, a surface-nets mesh
-//! has no uv, and a cave with no baseColorTexture therefore drew as a flat grey
-//! blob however carefully it had been painted.
-//!
-//! THE SAME MATERIALS THE GROUND USES, DELIBERATELY
-//!
-//! This binds `terrain_pipeline`'s material bind group unchanged -- the same
-//! four layers, the same normal maps, the same metres-per-tile. A cave is a hole
-//! in the terrain, and the mouth of one is a place where cave rock and ground
-//! rock meet within a metre of each other. Giving caves their own material set
-//! would make matching them a permanent art chore that is impossible to get
-//! right, because the two would be sampled and tiled differently. Sharing the
-//! set makes them match by construction, and it means the layer indices the
-//! editor's picker offers are the same indices everywhere.
-//!
-//! WHY NOT JUST EXTEND THE MESH PIPELINE
-//!
-//! Because the mesh pipeline already uses all four bind groups (camera+lights,
-//! model, texture, lightmap) and Quest-class limits give us no fifth. This path
-//! needs the material array and does not need a lightmap -- a cave is lit
-//! dynamically, and baking one would defeat the point of being able to break it
-//! -- so it fits in three groups by dropping the binding it does not want.
-//!
-//! THE TWO HEAVIEST LAYERS, NOT ALL FOUR
-//!
-//! Terrain samples all four layers unconditionally because it must: the weights
-//! come from a texture and every fragment has to take the same path. Here the
-//! weights arrive per VERTEX, and a surface-nets vertex takes its weights from a
-//! vote among the solid voxels around it -- so they are one-hot almost
-//! everywhere and pairwise on a boundary. A third layer with any weight at all
-//! is rare and a fourth is essentially unheard of.
-//!
-//! So this ranks the weights and samples the top two, renormalised. Four layers
-//! biplanar with normal maps is sixteen texture fetches per pixel, which is not
-//! a thing a Quest 3 can afford on geometry that fills the view when you are
-//! standing inside it. Two is eight. The cost is that at a point where three
-//! layers genuinely meet, the third is dropped rather than faded -- a boundary
-//! one voxel wide, against a saving of half the shader.
-
 use bytemuck::{Pod, Zeroable};
 use wgpu::*;
 
 use super::material_wgsl::{wgsl_biplanar_block, wgsl_whiteout_block};
 
-/// A vertex of a layer-blended mesh.
-///
-/// No uv, on purpose: this geometry has none, and carrying a dead one would
-/// invite someone to author into it. See `material_wgsl` for what replaces it.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct LayeredVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
-    /// Blend weights over the four material layers, from the glTF `COLOR_0`.
+
     pub weights: [f32; 4],
-    /// What the editor measured on the rock, from the glTF `COLOR_1`, else
-    /// `[1, 0, 0, 1]`: red, how much of the sky this point sees (scales the
-    /// live ambient -- without it the back of a tunnel was lit by the whole
-    /// sky); green, soot from a fire below; blue, the wet band a sea leaves at
-    /// a mouth; alpha, the static sun the bake marched through the hill.
-    /// See the editor's caveSky.js.
+
     pub aux: [f32; 4],
-    /// The cave's COPY OF THE GROUND round a mouth: xy, where the vertex lies
-    /// on the terrain's maps (its footprint uv, glTF `TEXCOORD_0`); z, how
-    /// much of it is that copy (`TEXCOORD_1.x`, 0 on carved rock). Such a
-    /// fragment takes its layers from the terrain's splat and its sky and sun
-    /// from the terrain's baked ground map, so the join reads as one surface.
-    /// Zero for a cave baked before it existed: rock throughout, as before.
+
     pub ground: [f32; 4],
 }
 
@@ -103,9 +44,6 @@ impl LayeredMeshPipeline {
         Self::new_with_front_face(device, format, uniform_layout, material_layout, FrontFace::Ccw, 1, crate::renderer::multiview::ViewMode::Mono)
     }
 
-    /// See `pipeline::SolidPipeline::new_multisampled` -- a pipeline's sample
-    /// count must match the pass it runs in, so a 4x eye pass needs its own.
-    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
     pub fn new_multisampled_stereo(
         device: &Device,
         format: TextureFormat,
@@ -155,20 +93,6 @@ impl LayeredMeshPipeline {
             source: ShaderSource::Wgsl(view.shader(layered_mesh_shader()).into()),
         });
 
-        // Structurally identical to the mesh pipeline's model layout, which is
-        // what lets a cave reuse a `mesh_pipeline::ModelUniform` bind group:
-        // wgpu treats identical layout descriptors as compatible, so the two
-        // paths do not need to agree about who owns the layout.
-        //
-        // IDENTICAL MEANS FLAGS INCLUDED: it MUST match `mesh_model_bgl` in
-        // mesh_pipeline.rs exactly (see the same note on `shadow_model_bgl`
-        // in shadow.rs). When the mesh layout gained FRAGMENT and this one
-        // stayed VERTEX, the two stopped deduping: every cave draw on the
-        // headset was a validation error that invalidated the whole
-        // `ssr_scene` submit (2026-10-08). This shader's fragment stage does
-        // not read the uniform, so FRAGMENT is redundant to it and
-        // load-bearing anyway. `cave_draws_with_a_mesh_model_bind_group`
-        // holds it.
         let model_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("layered_mesh_model_bgl"),
             entries: &[BindGroupLayoutEntry {
@@ -210,10 +134,7 @@ impl LayeredMeshPipeline {
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
-                // NO CULLING. A cave is seen from the inside, and the surface
-                // between a chamber and the rock is one sheet of triangles --
-                // cull the back and a player standing in the chamber is looking
-                // at the void through the wall they came in by.
+
                 cull_mode: None,
                 front_face,
                 polygon_mode: PolygonMode::Fill,
@@ -237,10 +158,7 @@ impl LayeredMeshPipeline {
     pub fn create_model_uniform(&self, device: &Device) -> super::mesh_pipeline::ModelUniform {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("layered_mesh_model_uniform"),
-            // `MODEL_UNIFORM_SIZE`, not the 64 this shader reads: every
-            // buffer bound as a ModelUniform must be the same size, or an
-            // upload overruns whichever one was left behind -- which is a
-            // validation error at the first frame, not at build time.
+
             size: super::mesh_pipeline::MODEL_UNIFORM_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -260,13 +178,6 @@ impl LayeredMeshPipeline {
 fn layered_mesh_shader() -> String {
     format!(
         r#"
-// Group 0 -- the camera, the lights and both shadow maps -- is declared by
-// `wgsl_lights_block` below, so there is one description of that layout rather
-// than one per shader.
-
-// Group 1 is terrain's material bind group, bound here unchanged. `splat_tex`
-// is part of that layout and is deliberately not declared: a cave's weights come
-// from its vertices, and a binding a shader does not read costs nothing.
 @group(1) @binding(0) var layer_tex: texture_2d_array<f32>;
 @group(1) @binding(1) var layer_samp: sampler;
 @group(1) @binding(2) var macro_tex: texture_2d<f32>;
@@ -287,8 +198,7 @@ struct Material {{
     pad2: f32,
 }}
 @group(1) @binding(3) var<uniform> mat: Material;
-// The terrain's splat and baked ground map, for the cave's copy of the ground
-// round a mouth (`VIn.ground`): read as the terrain reads them.
+
 @group(1) @binding(4) var splat_tex: texture_2d<f32>;
 @group(1) @binding(5) var normal_tex: texture_2d_array<f32>;
 @group(1) @binding(6) var sky_occ_tex: texture_2d_array<f32>;
@@ -312,10 +222,10 @@ struct VIn {{
 struct VOut {{
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
-    // In the player's frame, as every position the shaders get: lighting.
+
     @location(1) world_pos: vec3<f32>,
     @location(2) weights: vec4<f32>,
-    // The same point in the WORLD: where the rock's textures are read.
+
     @location(3) tex_pos: vec3<f32>,
     @location(4) aux: vec4<f32>,
     @location(5) ground: vec4<f32>,
@@ -336,12 +246,6 @@ struct VOut {{
 
 struct TopTwo {{ a: i32, b: i32, wa: f32, wb: f32 }}
 
-// The two heaviest layers, renormalised so they sum to one.
-//
-// All-zero weights become layer 0 at full strength rather than black. That is
-// not defensive noise: a mesh with no COLOR_0 at all interpolates to zero here,
-// and the failure it would otherwise produce -- a cave rendering pure black --
-// looks exactly like a lighting bug and would be chased in the wrong place.
 fn top_two(w: vec4<f32>) -> TopTwo {{
     let total = w.x + w.y + w.z + w.w;
     let safe = select(vec4<f32>(1.0, 0.0, 0.0, 0.0), w, total > 0.0001);
@@ -371,20 +275,10 @@ fn layer_colour(layer: i32, b: Biplanar) -> vec3<f32> {{
     return mix(c_minor, c_major, b.w);
 }}
 
-// Biplanar normal mapping, which terrain deliberately does not do.
-//
-// Terrain samples its normal maps top-down only, because most of a map is flat
-// ground and the stretch on a cliff is a fair trade for four fewer fetches. A
-// cave has no flat majority -- it is ceiling and wall and floor in equal measure
-// -- so a top-down normal map would be stretched over most of what a player is
-// looking at, and the shading would read as smeared rather than as rock.
 fn layer_normal(layer: i32, b: Biplanar, n: vec3<f32>) -> vec3<f32> {{
     let p_major = textureSample(normal_tex, layer_samp, b.uv_major, layer).rgb;
     let p_minor = textureSample(normal_tex, layer_samp, b.uv_minor, layer).rgb;
 
-    // OpenGL convention: green is +Y in tangent space, matching the NormalGL
-    // maps the installer fetches. A DX map here lights every bump from the
-    // wrong side.
     var t_major = p_major * 2.0 - 1.0;
     var t_minor = p_minor * 2.0 - 1.0;
     t_major = vec3<f32>(t_major.xy * mat.normal_strength, t_major.z);
@@ -395,48 +289,19 @@ fn layer_normal(layer: i32, b: Biplanar, n: vec3<f32>) -> vec3<f32> {{
     return normalize(mix(n_minor, n_major, b.w));
 }}
 
-// Metres per tile for one layer.
-//
-// Through a local array rather than indexing `mat.repeat` directly: dynamic
-// indexing of a vector in the uniform address space is the kind of thing
-// backends disagree about, and this costs four moves.
 fn repeat_of(layer: i32) -> f32 {{
     var r = array<f32, 4>(mat.repeat.x, mat.repeat.y, mat.repeat.z, mat.repeat.w);
     return r[layer];
 }}
 
 @fragment fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {{
-    // Renormalised because interpolation across a triangle shortens a normal
-    // wherever its corners disagree, and a short normal darkens the surface.
+
     var n = normalize(in.normal);
 
-    // FACE THE VIEWER. Culling is off, so the far side of the sheet arrives with
-    // its normal pointing away from the eye; `shade` then finds every light
-    // behind the surface, returns ambient alone, and the chamber renders
-    // near-black from the inside. That is precisely the bug the editor preview
-    // hit, and it was only found by looking at a screenshot -- so the fix goes
-    // in the shader rather than in the mesher's choice of winding, where the
-    // next mesh to arrive wound the other way would reintroduce it.
-    //
-    // `front_facing` and not a dot against the camera: it is the rasteriser's
-    // own answer, needs no camera position in the uniform, and is right even
-    // where the interpolated normal has been bent away from the geometry.
     n = select(-n, n, front);
 
-    // THE ROCK'S TEXTURES LIE IN THE WORLD. Positions and normals arrive in
-    // the player's frame, turned by every snap and stick turn and shifted
-    // with the rig; read there, the layers slid under a walking player,
-    // swapped projection planes on a turn, and their bumps bent along the
-    // turned axes. So the layers are read at the world point, along the
-    // world's axes chosen by the world's normal, and the maps fold into that
-    // normal there; the finished normal turns back into the player's frame,
-    // where the lamps are. A turn is a rotation, so blending and normalising
-    // on either side of it are the same.
     let nw = to_world_direction(n);
 
-    // THE GROUND COPY takes the terrain's own layers: its splat, normalised as
-    // the terrain normalises it. Read unconditionally (a texture read under
-    // a branch on a varying would lose its derivatives) and blended in.
     let gb = clamp(in.ground.z, 0.0, 1.0);
     let splat_raw = textureSample(splat_tex, layer_samp, in.ground.xy);
     let splat_w = splat_raw / max(splat_raw.r + splat_raw.g + splat_raw.b + splat_raw.a, 0.001);
@@ -450,83 +315,45 @@ fn repeat_of(layer: i32) -> f32 {{
     bent = normalize(select(nw, bent, length(bent) > 0.0001));
     let shaded_n = to_player_direction(bent);
 
-    // Macro variation, sampled in the plane the surface faces rather than from
-    // above. A cave wall sampled top-down gets one macro value down its whole
-    // height, which is the one place the variation would do nothing at all.
     let mb = biplanar_axes(in.tex_pos, nw, mat.macro_repeat);
     let m = textureSample(macro_tex, layer_samp, mb.uv_major).r;
     var albedo = albedo_raw * (1.0 + (m - 0.5) * 2.0 * mat.macro_strength);
 
-    // DAMP ROCK. Deep in, where little sky reaches and air is still, rock is
-    // wet: darker, and more so toward the floor where water collects. The
-    // sky term is the measure of "deep in" (1 in the open, toward 0 inside),
-    // and the normal's facing tells floor from roof. At most a third darker,
-    // nothing in the open.
-    // A wall in the open sees half the sky (the other half is ground), so the
-    // damp starts below that: rock round a mouth stays the cliff's colour.
-    // The ground copy's sky is the terrain's baked one (the ground map's red).
     let ground_map = textureSample(sky_occ_tex, layer_samp, in.ground.xy, 0);
     let sky = mix(clamp(in.aux.x, 0.0, 1.0), ground_map.r, gb);
     let deep = 1.0 - smoothstep(0.08, 0.4, sky);
     let floorward = 0.6 + 0.4 * clamp(nw.y, 0.0, 1.0);
     albedo = albedo * (1.0 - 0.33 * deep * floorward);
-    // THE TIDE BAND at a sea mouth: rock below the splash line, wet and
-    // crusted dark olive-black (the Verrucaria band over barnacles), broken
-    // up by the macro texture so its upper edge is ragged, not ruled.
+
     let wet = clamp(in.aux.z * (0.75 + 0.5 * m), 0.0, 1.0);
     albedo = mix(albedo, albedo * vec3<f32>(0.30, 0.33, 0.27), 0.85 * wet);
-    // SOOT on the roof over a hearth.
+
     albedo = albedo * (1.0 - 0.8 * clamp(in.aux.y, 0.0, 1.0));
-    // WET SAND where the sea's wash reaches, exactly as the terrain darkens
-    // it, on the floors the wash runs over.
+
     let washed = 1.0 - smoothstep(mat.wet_line, mat.wet_line + mat.wet_band, in.tex_pos.y);
     albedo = albedo * (1.0 - 0.45 * washed * smoothstep(0.5, 0.8, nw.y));
 
-    // NO SUN WHERE NO SKY. A cave is one sheet of rock with nothing behind
-    // it, so the sun's map can leak a band of light where a wall meets the
-    // floor right under it -- inside a hill, where no sun reaches. A point
-    // that sees no sky cannot see the sun either, so the map's answer is
-    // gated by the measured sky (COLOR_1): untouched wherever the mouth
-    // shows any of the sky, and dark where it shows none.
     var sun_map = 1.0;
     if (camera.shadow_params.x > 0.5) {{
         sun_map = pcf(sun_shadow_tex, in.world_pos, camera.sun_view_proj);
     }}
-    // COLOR_1's alpha is the static sun the bake marched through the hill
-    // (caveSky.sunVisibility): the hill's own shadow, which the terrain round
-    // the cave takes from its baked map and the live map need not hold. The
-    // darker of the two answers, so neither doubles the other.
+
     let cave_sun = smoothstep(0.01, 0.08, sky) * min(sun_map, clamp(in.aux.w, 0.0, 1.0));
-    // The ground copy's sun is the terrain's baked shadow, rebuilt as the
-    // terrain rebuilds it (a signed distance in green, the penumbra in blue,
-    // alpha 0 when baked); a map baked before that leaves it on the live map.
+
     let ground_sun_d = (ground_map.g - 0.5) * (2.0 * {sun_range:?});
     let ground_sun_w = max(max(ground_map.b * {sun_range:?}, 0.5 * fwidth(ground_sun_d)), 0.02);
     let ground_sun = select(sun_map, smoothstep(-ground_sun_w, ground_sun_w, ground_sun_d), ground_map.a < 0.5);
     receiver_sun_mask = mix(cave_sun, ground_sun, gb);
 
     var lit = shade_with_sky(in.world_pos, shaded_n, sky);
-    // THE GROUND'S BOUNCE. The terrain and the brushes carry their bounce in
-    // baked maps; the cave is lit live and had none, so a rock face in the
-    // open read near-black beside the baked cliff it grows out of. What a
-    // face sees below the horizon is ground lit by the same sky: the sky's
-    // downward-facing light times a ground albedo, over the share of the
-    // hemisphere that looks down, and only where the rock is in the open
-    // (deep in, the floor that would bounce is itself dark).
+
     let up_p = to_player_direction(vec3<f32>(0.0, 1.0, 0.0));
     let downward = 0.5 - 0.5 * clamp(nw.y, -1.0, 1.0);
     lit = lit + sky_irradiance(up_p) * (GROUND_ALBEDO * downward * smoothstep(0.1, 0.45, sky) * (1.0 - gb));
     var colour = albedo * lit;
-    // THE GROUND COPY THROUGH THE GROUND'S OWN SHADING PATH: the terrain is
-    // shaded by `shade_material_env` (Fresnel, the probes' environment), and
-    // the sky term alone left the copy about a third darker than the sand it
-    // continues -- an outline of opened cells in every shadow. Taken only
-    // where the copy is, so the rock keeps its own path.
+
     let ground_rough = textureSample(rough_tex, layer_samp, in.tex_pos.xz / max(repeat_of(t.a), 0.001), t.a).r;
-    // THE FLOOR TOO: sand carried in from the beach is the same sand, so a
-    // floor is shaded as the ground is and darkens only by what it measures
-    // -- less sky, the sun's shadow, the damp -- not by changing shading
-    // model at the drip line, which drew a grey strip across every mouth.
+
     let as_ground_w = max(gb, smoothstep(0.6, 0.85, nw.y));
     if (as_ground_w > 0.0) {{
         let as_ground = shade_material_env(
@@ -538,14 +365,7 @@ fn repeat_of(layer: i32) -> f32 {{
     return vec4<f32>(tonemap(colour), 1.0);
 }}
 "#,
-        // THE CAVE TRACES NO REFLECTION OF ITS OWN. Built as a reader of the
-        // probe pass (`probe_from_pass`), whose answer it never sets, so
-        // `shade_material_env` keeps its baked and sky terms and compiles out
-        // the per-pixel probe trace, the model cards and the characters'
-        // capsules: those took the cave from 2,538 instructions to 30,863
-        // (25% occupancy) once its floors went through the ground's path
-        // (headset PIPESTATS, 2026-10-08), and a cave floor of wet sand and
-        // rough rock shows nothing they would add. See `cave_shader_size`.
+
         lights_block = super::lights::wgsl_lights_block_with(
             0, 1, super::lights::LightsBlockOptions { probe_from_pass: true, ..Default::default() },
         ),
@@ -567,15 +387,10 @@ mod tests {
     use crate::renderer::Color3;
     use wgpu::util::DeviceExt;
 
-    /// A one-texel image of one colour.
     fn solid(rgba: [u8; 4]) -> TerrainImage {
         TerrainImage { width: 1, height: 1, rgba: rgba.to_vec() }
     }
 
-    /// Two vertical bands, so a change of PROJECTION PLANE changes the sample.
-    ///
-    /// A solid layer cannot detect that at all -- it reads the same from every
-    /// plane -- so the biplanar test needs something with structure in it.
     fn banded(left: [u8; 4], right: [u8; 4]) -> TerrainImage {
         let mut rgba = Vec::with_capacity(4 * 4 * 4);
         for _y in 0..4 {
@@ -586,7 +401,6 @@ mod tests {
         TerrainImage { width: 4, height: 4, rgba }
     }
 
-    /// A normal map tilted hard in +u, for asserting that it reaches the shading.
     fn tilted_normal() -> TerrainImage {
         let mut rgba = Vec::new();
         for _ in 0..16 {
@@ -595,9 +409,6 @@ mod tests {
         TerrainImage { width: 4, height: 4, rgba }
     }
 
-    /// A ramp, red across and green down, sixteen texels each way, so any
-    /// change in where a layer is read -- the point or the plane -- changes
-    /// the colour.
     fn ramp() -> TerrainImage {
         let mut rgba = Vec::with_capacity(16 * 16 * 4);
         for y in 0..16u8 {
@@ -608,34 +419,23 @@ mod tests {
         TerrainImage { width: 16, height: 16, rgba }
     }
 
-    /// `solid` and `tilted_normal` at the ramp's size, as a texture array needs.
     fn sized(rgba: [u8; 4]) -> TerrainImage {
         TerrainImage { width: 16, height: 16, rgba: rgba.repeat(16 * 16) }
     }
 
-    /// What a render asks for. Grouped rather than passed as eight positional
-    /// arguments, which is how a harness ends up with call sites nobody can read.
-    /// Steep enough to be shaded as rock rather than as a floor (ny < 0.6).
     const WALLISH: [f32; 3] = [0.0, 0.55, 0.835];
 
     struct Shot {
         normal: [f32; 3],
         weights: [f32; 4],
-        /// World position of the whole quad. Biplanar uvs come from world space,
-        /// so moving the surface is how a test changes which texel it lands on.
+
         world: [f32; 3],
         lit: bool,
-        /// Where the light sits, when `lit`. Off to one side by default so that
-        /// tilting the surface changes how much light reaches it; a test of the
-        /// normal's SIGN needs it head-on instead.
+
         light_at: [f32; 3],
-        /// Wind the triangle the other way, reversing which side faces the eye.
+
         flipped: bool,
-        /// The player's turn (radians) and the rig's offset, as a frame hands
-        /// them over (`PlayerUpload`). Everything above stays where it is in
-        /// the WORLD -- the surface, its normal, the lamp and the eye -- and is
-        /// given to the shader in the player's frame; the camera turns back
-        /// with it, so the picture is the same world at any turn or offset.
+
         yaw: f32,
         offset: [f32; 3],
         layers: [TerrainImage; 4],
@@ -654,8 +454,7 @@ mod tests {
                 flipped: false,
                 yaw: 0.0,
                 offset: [0.0, 0.0, 0.0],
-                // Primaries, so a readback names the winning layer with no
-                // arithmetic: red, blue, green, white.
+
                 layers: [
                     solid([255, 0, 0, 255]),
                     solid([0, 0, 255, 255]),
@@ -664,10 +463,7 @@ mod tests {
                 ],
                 normals: [None, None, None, None],
                 settings: TerrainMaterialUniform {
-                    // Off unless a test asks for it: macro variation multiplies
-                    // the result by a value read from a texture, which would
-                    // make every colour assertion here depend on a second
-                    // texture's contents.
+
                     macro_strength: 0.0,
                     ..Default::default()
                 },
@@ -675,18 +471,10 @@ mod tests {
         }
     }
 
-    /// Renders one full-screen triangle through the real pipeline and returns
-    /// its centre pixel, or None when the machine has no GPU.
-    ///
-    /// `view_proj` is the identity, so the vertex positions ARE clip
-    /// coordinates and the triangle cannot land off-screen. The world position
-    /// the shader textures from is carried separately, which is what lets a
-    /// test move the surface through the tiling without moving it out of view.
     fn render(shot: Shot) -> Option<[u8; 4]> {
         let (device, queue) = terrain_pipeline::tests::headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
-        // World to the player's frame and back: turned by -yaw less the
-        // offset, as `to_player_space` in the shaders undoes.
+
         let offset = glam::Vec3::from(shot.offset);
         let turn = glam::Quat::from_rotation_y(shot.yaw);
         let to_player = glam::Mat4::from_quat(turn.inverse()) * glam::Mat4::from_translation(-offset);
@@ -706,9 +494,7 @@ mod tests {
                 direction: to_player.transform_vector3(glam::Vec3::new(0.0, -1.0, 0.0)),
                 kind: LightKind::Point,
                 color: Color3(255, 255, 255, 255),
-                // Dim on purpose. Ambient alone already puts a pure-red layer at
-                // 153 of 255, and a bright light clips the channel so that the
-                // difference under test vanishes into saturation.
+
                 intensity: 3.0,
                 range: 50.0,
                 cone_angle_deg: 180.0,
@@ -735,15 +521,6 @@ mod tests {
             shot.settings,
         );
 
-        // Where the quad SITS in world space, without moving it on screen.
-        //
-        // The shader takes its texture coordinates from the world position, so a
-        // test that wants a different texel has to move the surface -- but a
-        // surface moved in clip space leaves the 8x8 target and the readback is
-        // then just clear colour. So the model matrix translates by `world` and
-        // view_proj translates back: `clip` is unchanged, `world_pos` is not.
-        // Both by way of the player's frame, which the model matrix carries the
-        // surface (and its normal) into and the camera brings back from.
         let world = glam::Vec3::from(shot.world);
         let model = pipeline.create_model_uniform(&device);
         model.upload(&queue, to_player * glam::Mat4::from_translation(world));
@@ -866,7 +643,6 @@ mod tests {
         Some([data[at], data[at + 1], data[at + 2], data[at + 3]])
     }
 
-    /// Skip cleanly on a machine with no adapter, rather than failing.
     macro_rules! shot {
         ($s:expr) => {
             match render($s) {
@@ -879,14 +655,6 @@ mod tests {
         };
     }
 
-    /// THE ROCK STAYS ON THE ROCK WHEN THE PLAYER TURNS OR MOVES. A cave
-    /// reaches the shader, like everything, in the player's frame: turned by
-    /// every snap and stick turn and shifted with the rig. Its layers were
-    /// read at that frame's position and projected along that frame's axes,
-    /// so the rock's texture slid under a walking player and swapped planes
-    /// on a turn, and its bumps bent along the turned axes. The same wall,
-    /// lamp and eye in the world, at five turns and two rig offsets, must
-    /// give the same pixel.
     #[test]
     fn a_caves_rock_does_not_slide_or_turn_with_the_player() {
         use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
@@ -925,8 +693,7 @@ mod tests {
 
     #[test]
     fn a_vertex_weighted_to_one_layer_renders_that_layer() {
-        // THE CLAIM THE WHOLE PIPELINE EXISTS FOR: the weights the editor
-        // painted onto the mesh choose the material. Layer 1 is blue.
+
         let px = shot!(Shot { weights: [0.0, 1.0, 0.0, 0.0], ..Default::default() });
         assert!(px[2] > px[0], "layer 1 (blue) should have won, got {px:?}");
 
@@ -936,10 +703,7 @@ mod tests {
 
     #[test]
     fn two_layers_blend_rather_than_switching() {
-        // A hard switch between materials reads as a painted-on seam. Red and
-        // green at equal weight must produce both channels.
-        // On a WALL: a floor is shaded through the ground's path, whose
-        // untinted specular would put every channel in (`fs_main`).
+
         let px = shot!(Shot { weights: [0.5, 0.0, 0.5, 0.0], normal: WALLISH, ..Default::default() });
         assert!(px[0] > 8, "layer 0 vanished from the blend: {px:?}");
         assert!(px[1] > 8, "layer 2 vanished from the blend: {px:?}");
@@ -948,8 +712,7 @@ mod tests {
 
     #[test]
     fn weights_that_do_not_sum_to_one_still_blend_evenly() {
-        // The mesher normalises, but a hand-made file has no such guarantee and
-        // unnormalised weights must not blow out or black out the surface.
+
         let even = shot!(Shot { weights: [0.5, 0.0, 0.5, 0.0], ..Default::default() });
         let tiny = shot!(Shot { weights: [0.01, 0.0, 0.01, 0.0], ..Default::default() });
         for c in 0..3 {
@@ -962,18 +725,14 @@ mod tests {
 
     #[test]
     fn a_mesh_with_no_weights_at_all_renders_layer_zero() {
-        // A glTF with no COLOR_0 interpolates to zero here. Falling through to
-        // black would look exactly like a lighting bug and would be chased in
-        // the wrong place for an afternoon.
+
         let px = shot!(Shot { weights: [0.0, 0.0, 0.0, 0.0], ..Default::default() });
         assert!(px[0] > 8, "all-zero weights rendered black instead of layer 0: {px:?}");
     }
 
     #[test]
     fn only_the_two_heaviest_layers_are_sampled() {
-        // The documented trade, asserted rather than left as a comment: a third
-        // layer at low weight is dropped, not faded. Layer 2 is the only green
-        // one, so its absence is readable in a single channel.
+
         let px = shot!(Shot { weights: [0.5, 0.4, 0.1, 0.0], normal: WALLISH, ..Default::default() });
         assert!(px[0] > 8, "layer 0 should be present: {px:?}");
         assert!(px[2] > 8, "layer 1 should be present: {px:?}");
@@ -982,11 +741,7 @@ mod tests {
 
     #[test]
     fn the_projection_plane_follows_the_surface_normal() {
-        // Biplanar's whole purpose. The same world position, textured on a
-        // floor and on a wall, must land on different texels of a banded
-        // layer -- otherwise a cave wall is getting the ceiling's projection
-        // and the texture is smeared down it.
-        // Every layer 4x4: they share one D2Array, which cannot hold two sizes.
+
         let layers = || {
             [
                 banded([255, 0, 0, 255], [0, 0, 255, 255]),
@@ -995,7 +750,7 @@ mod tests {
                 banded([0, 255, 0, 255], [0, 255, 0, 255]),
             ]
         };
-        // A point whose x and z fall in different bands of the 4-texel tile.
+
         let world = [1.0, 0.0, 3.0];
         let floor = shot!(Shot {
             normal: [0.0, 1.0, 0.0],
@@ -1017,23 +772,10 @@ mod tests {
 
     #[test]
     fn a_fragment_seen_from_behind_is_shaded_as_though_it_faced_the_viewer() {
-        // Standing INSIDE a cave. Culling is off, so the far side of the sheet
-        // arrives with its normal pointing away; without the front-facing flip
-        // `shade` finds every light behind the surface and returns ambient
-        // alone. That is the near-black chamber the editor preview rendered,
-        // and it was only ever found by looking at a screenshot.
-        //
-        // Stated so that it does not depend on knowing WHICH winding the
-        // rasteriser calls front, because that answer involves wgpu's clip-space
-        // y and is exactly the sort of thing to get backwards in a comment:
-        // reversing the winding AND the authored normal must cancel out, and of
-        // the two windings exactly one must be lit.
+
         let shot = |normal: [f32; 3], flipped: bool| Shot {
             lit: true,
-            // Head-on, so the SIGN of the normal is the whole difference
-            // between lit and ambient. The default side-on light gives a normal
-            // of (0,0,1) a cosine of 0.14 either way, and the eight levels that
-            // separates would not survive a rounding change.
+
             light_at: [0.0, 0.0, 5.0],
             normal,
             flipped,
@@ -1049,10 +791,6 @@ mod tests {
             );
         }
 
-        // And the flip is doing something. Which of the two windings comes out
-        // lit is the rasteriser's convention and not this shader's claim, so
-        // the assertion is that they DIFFER -- which, with the equality above,
-        // pins the behaviour exactly.
         let away = shot!(shot([0.0, 0.0, 1.0], true));
         assert!(
             (toward[0] as i32 - away[0] as i32).abs() > 8,
@@ -1063,9 +801,7 @@ mod tests {
 
     #[test]
     fn a_normal_map_changes_the_shading() {
-        // Without a light in the list `shade` returns the ambient constant
-        // whatever the normal, so this test would pass with the normal mapping
-        // doing nothing at all. `lit: true` is load-bearing.
+
         let flat = shot!(Shot {
             lit: true,
             normals: [Some(solid([128, 128, 255, 255])), None, None, None],
@@ -1081,18 +817,7 @@ mod tests {
 
     #[test]
     fn a_normal_map_on_a_wall_tilts_along_the_wall_s_own_axes() {
-        // THE CLASSIC TRIPLANAR NORMAL BUG, which the other normal tests cannot
-        // see. Every projection needs its own swizzle -- on the y plane the
-        // map's u runs along world x, on the x plane it runs along world z --
-        // and using one swizzle for all three still passes a flat-map no-op
-        // test, still passes a "the map changed something" test on a floor, and
-        // lights every wall in the cave from the wrong side.
-        //
-        // So: a wall facing +x, with a map tilted hard in +u. Swizzled
-        // correctly, u is world z and the surface leans into z, which a light
-        // on +z and a light on -z disagree about. Swizzled as though it were the
-        // floor, the surface stays pointing along x and the two lights give the
-        // same answer.
+
         let wall = |light_at: [f32; 3]| Shot {
             lit: true,
             light_at,
@@ -1111,10 +836,7 @@ mod tests {
 
     #[test]
     fn a_flat_normal_map_is_a_true_no_op() {
-        // The fallback texel (128,128,255) unpacks to (0,0,1), so an unauthored
-        // normal set must cost its samples and change nothing. If it does not,
-        // every material without a normal map is shaded subtly wrong and there
-        // is nothing to compare it against.
+
         let none = shot!(Shot { lit: true, ..Default::default() });
         let flat = shot!(Shot {
             lit: true,
@@ -1129,10 +851,6 @@ mod tests {
         }
     }
 
-    /// Renders arbitrary geometry and returns the whole image, for the
-    /// end-to-end test below. Separate from `render` because that harness owns
-    /// its triangle on purpose -- every other test here wants a surface that
-    /// fills the target and never has to think about where a pixel landed.
     fn render_geometry(
         verts: &[LayeredVertex],
         indices: &[u32],
@@ -1142,9 +860,6 @@ mod tests {
         render_geometry_with(verts, indices, view_proj, size, false).map(|(img, _)| img)
     }
 
-    /// `render_geometry`, optionally binding the model uniform the way the
-    /// game does -- a `MeshPipeline` ModelUniform, not this pipeline's own --
-    /// and returning any validation error the draw raised.
     fn render_geometry_with(
         verts: &[LayeredVertex],
         indices: &[u32],
@@ -1222,9 +937,6 @@ mod tests {
         let target_view = target.create_view(&Default::default());
         let depth_view = depth.create_view(&Default::default());
 
-        // Rows are padded to 256 bytes, which is the copy alignment wgpu
-        // requires -- a target wider than 64 pixels would need more than one
-        // row's worth and the readback indexing below would be wrong.
         assert!(size * 4 <= 256, "row padding assumption broken");
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("e2e_readback"),
@@ -1298,8 +1010,6 @@ mod tests {
         Some((out, None))
     }
 
-    /// The cave's fragment shader by `shader_inlining`'s proxy -- run with
-    /// `--ignored --nocapture` to compare builds.
     #[test]
     #[ignore]
     fn cave_shader_size() {
@@ -1309,14 +1019,7 @@ mod tests {
 
     #[test]
     fn cave_draws_with_a_mesh_model_bind_group() {
-        // THE GAME'S BINDING, NOT THE TEST'S. A cave is drawn with a
-        // `MeshPipeline` ModelUniform, and that works only while this
-        // pipeline's model layout dedups with the mesh one -- flags
-        // included. When the mesh layout gained FRAGMENT and this stayed
-        // VERTEX, every cave draw on the headset was a validation error
-        // ("Entries with binding 0 differ in visibility") that threw away
-        // the whole `ssr_scene` submit (2026-10-08). The other tests bind
-        // this pipeline's own uniform, so they could not see it.
+
         let w = |n: [f32; 3], p: [f32; 3]| LayeredVertex {
             position: p,
             normal: n,
@@ -1342,11 +1045,7 @@ mod tests {
 
     #[test]
     fn the_editors_own_bake_renders_the_layers_it_painted() {
-        // END TO END, across both languages: the editor's glb writer, the
-        // engine's glTF loader, and this pipeline. The two halves are each
-        // tested on their own above, and neither can see the seam between them
-        // -- an attribute location that disagreed with the shader, or weights
-        // read into the wrong vertex, would pass everything else here.
+
         let Some((device, queue, tex_layout)) = crate::renderer::mesh::tests::headless_gpu() else {
             eprintln!("skipping: no GPU adapter available");
             return;
@@ -1358,8 +1057,6 @@ mod tests {
         let prim = &mesh.primitives[0];
         let layered = prim.layered.as_ref().expect("the fixture is marked layered");
 
-        // The fixture's triangle spans x,y in 0..1, so this maps it across the
-        // target: clip = (2x-1, 2y-1).
         const SIZE: u32 = 32;
         let view_proj = glam::Mat4::from_translation(glam::Vec3::new(-1.0, -1.0, 0.0))
             * glam::Mat4::from_scale(glam::Vec3::new(2.0, 2.0, 1.0));
@@ -1367,10 +1064,6 @@ mod tests {
             .expect("an adapter was already found");
         let px = |x: usize, y: usize| img[y * SIZE as usize + x];
 
-        // Corner 0 carries [1,0,0,0] -> layer 0, which the harness paints red.
-        // Corner 1 carries [0,1,0,0] -> layer 1, blue. Sampled a few pixels in
-        // from each so the assertion does not depend on whether the rasteriser
-        // covers the exact corner texel.
         let near_v0 = px(3, 28);
         let near_v1 = px(27, 29);
         assert!(
@@ -1385,11 +1078,7 @@ mod tests {
 
     #[test]
     fn both_winding_variants_of_the_pipeline_validate() {
-        // WGSL is compiled by naga at PIPELINE CREATION, not by cargo build, so
-        // a clean build says nothing about whether this shader is valid. The
-        // mirror variant is only ever built on the XR path, which does not
-        // compile on this machine at all -- so without this it would first be
-        // validated on a headset.
+
         let Some((device, queue)) = terrain_pipeline::tests::headless_gpu() else {
             eprintln!("skipping: no GPU adapter available");
             return;
@@ -1413,9 +1102,6 @@ mod tests {
     }
 }
 
-// Scene shader sources, for `multiview::every_scene_shader_survives_the_multiview_transform`.
-// Test-only: the gate has to see exactly the text each pipeline is built from,
-// and nothing on a development machine can build a multiview pipeline to check.
 #[cfg(test)]
 pub fn layered_mesh_shader_src() -> String {
     layered_mesh_shader()
