@@ -747,7 +747,9 @@ const MUD_PRINT_STEP: f32 = 1.0;
 const MUD_PRINT_TILT: f32 = 0.6;
 const MUD_PRINT_DARK: f32 = 0.7;
 const MUD_PRINT_RIM: f32 = 0.9;
-const MUD_WET_GLOSS: f32 = 0.7;
+const MUD_WET_GLOSS: f32 = 0.9;
+const MUD_POOL_GLOSS: f32 = 0.9;
+const MUD_SLUSH_RIPPLE: f32 = 0.8;
 
 const SHELF_SLOPE: f32 = 0.15;
 const FOAM_TILES: f32 = {foam_tiles};
@@ -887,20 +889,24 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
 {ring_block}    let mud = water.look.y;
     let grain = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES).r - 0.5;
     let grain_b = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES * 0.37 + vec2<f32>(0.5)).r - 0.5;
-    tilt = tilt * (1.0 - MUD_FLATTEN * mud) + vec2<f32>(grain, grain_b) * MUD_GRAIN_TILT * mud;
+    let wave_tilt = tilt;
     var print = vec2<f32>(0.0);
     var print_rim = 0.0;
+    var print_tilt = vec2<f32>(0.0);
     let print_uv = (q - water.prints.xy) * water.prints.zw;
     if (water.prints.z > 0.0 && all(print_uv > vec2<f32>(0.0)) && all(print_uv < vec2<f32>(1.0))) {{
         print = textureSampleLevel(mud_tex, wave_samp, print_uv, 0.0).rg;
         let e = water.prints.zw * MUD_PRINT_STEP;
         let dx = textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(e.x, 0.0), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(e.x, 0.0), 0.0).r;
         let dz = textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(0.0, e.y), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(0.0, e.y), 0.0).r;
-        tilt = tilt + vec2<f32>(dx, dz) * MUD_PRINT_TILT * mud;
+        print_tilt = vec2<f32>(dx, dz);
         print_rim = smoothstep(0.05, 0.5, length(vec2<f32>(dx, dz))) * (1.0 - print.x);
     }}
     let fresh = print.y * mud;
-    let wet_gloss = mix(water.look.x, 1.0, fresh * MUD_WET_GLOSS);
+    let pool = print.x * mud;
+    let wet = max(fresh * MUD_WET_GLOSS, pool * MUD_POOL_GLOSS);
+    let wet_gloss = mix(water.look.x, 1.0, wet);
+    tilt = wave_tilt * (1.0 - MUD_FLATTEN * mud * (1.0 - wet * MUD_SLUSH_RIPPLE)) + vec2<f32>(grain, grain_b) * MUD_GRAIN_TILT * mud * (1.0 - wet) + print_tilt * MUD_PRINT_TILT * mud;
     let n = normalize(to_player_direction(vec3<f32>(-tilt.x, 1.0, -tilt.y)));
 
     let lost0 = water_lost(log2(max(span * WAVE_N / water.tiles.x, 1e-6))).x;
