@@ -2424,6 +2424,14 @@ impl XrRenderer {
             _ => &self.terrain_pipeline.pipeline,
         }
     }
+    /// [`Self::sp_terrain`] with its shaped twin, for a run of the coarser
+    /// lists (`TerrainPipeline::at`).
+    fn sp_terrain_twins(&self, stereo: bool) -> &crate::renderer::terrain_pipeline::TerrainPipeline {
+        match (stereo, &self.stereo_pipelines) {
+            (true, Some(p)) => &p.terrain,
+            _ => &self.terrain_pipeline,
+        }
+    }
 
     /// The ground's reader for this frame, chosen as the brushes' are: its
     /// spotless twin when no spot casts (`spotless_frame`), its baked one when
@@ -3449,6 +3457,10 @@ impl XrRenderer {
     /// one that is not a lattice): by the vertices.
     pub fn set_ground_shape(&mut self, shape: Option<crate::renderer::ground_shape::GroundShape>) {
         let shape = shape.filter(|_| crate::renderer::ground_shape::ENABLED.load(std::sync::atomic::Ordering::Relaxed));
+        log::info!(
+            "GROUNDSHAPE: {} ground pipelines built with a shaped twin (runs of the coarser lists draw by it; step 1 by the unshaped one)",
+            crate::renderer::terrain_pipeline::SHAPED_TWINS_BUILT.load(std::sync::atomic::Ordering::Relaxed)
+        );
         if self.terrain_shape != shape {
             self.terrain_shape = shape;
             self.rebuild_terrain_material();
