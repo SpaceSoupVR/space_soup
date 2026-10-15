@@ -1473,13 +1473,11 @@ struct VOut {{
     // cuboid path uses for lightmap coordinates. Terrain is lit dynamically and
     // has no lightmap, so that slot was sitting at (0,0) doing nothing.
     @location(3) uv: vec2<f32>,
-    // The same uv where the pixel's coverage of its triangle is (CENTROID):
-    // where the ground's step-1 shape is read (`ground_shape`). At an MSAA
-    // edge pixel whose centre lies across the triangle's edge, the centre's
-    // uv reads the NEIGHBOUR's normal and plane -- the crease moved to the
-    // pixel grid, as jagged as no MSAA (2026-10-14, offline: lines of 20 to
-    // 94 levels along every crease of the cliffs).
-    @location(5) @interpolate(perspective, centroid) shape_uv: vec2<f32>,
+    // The drawn triangle's FIRST vertex's uv (flat): whether the triangle is
+    // a coarser step's, which alone reads the step-1 shape (`ground_shape`).
+    // NEVER centroid on a ground varying: on the Quest 3 one centroid varying
+    // cost the ground's pipelines 6 to 9 ms a frame (2026-10-15).
+    @location(5) @interpolate(flat) corner: vec2<f32>,
 }}
 
 @vertex fn vs_main(v: VIn) -> VOut {{
@@ -1490,7 +1488,7 @@ struct VOut {{
     out.world_pos = v.pos;
     out.tex_pos   = to_world_space(v.pos);
     out.uv        = v.uv2;
-    out.shape_uv  = v.uv2;
+    out.corner    = v.uv2;
     return out;
 }}
 
@@ -1696,7 +1694,7 @@ fn sample_frame(world: vec3<f32>, n: vec3<f32>, step_x: vec3<f32>, step_y: vec3<
     // does not: at a cliff's foot and rim, on a one-cell step, along a ridge.
     // There the ground has a crease, and the picture changes plane on it.
     // In the world, as the planes are.
-    let agree = clamp((abs(dot(face, n)) - FACE_DIFFERS) * FACE_BAND, 0.0001, 1.0);
+    let agree = clamp((select(abs(along) * across_len, abs(dot(shape_face, n)), shaped) - FACE_DIFFERS) * FACE_BAND, 0.0001, 1.0);
     let pn = to_world_direction(normalize(mix(face, n, agree)));
     // At unit repeat, so each layer divides rather than recomputing.
     let b = biplanar_axes(world, pn, 1.0);
@@ -1967,7 +1965,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // `ground_lod` is lit and textured as step 1 is. The interpolated
     // normal and the drawn triangle where there is no shape, and on a
     // cave's ground patch (its vertices' alpha 0).
-    let shape = ground_shape_at(in.shape_uv, in.col.a);
+    let shape = ground_shape_at(in.uv, in.corner, in.col.a);
     let n = normalize(select(in.normal, to_player_direction(shape.n), shape.shaped));
     set_pixel_long_step(n, normalize(cam_pos() - in.world_pos));
 
