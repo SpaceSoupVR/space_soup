@@ -750,6 +750,9 @@ const MUD_PRINT_RIM: f32 = 0.9;
 const MUD_WET_GLOSS: f32 = 0.9;
 const MUD_POOL_GLOSS: f32 = 0.9;
 const MUD_SLUSH_RIPPLE: f32 = 0.8;
+const MUD_WET_DARK: f32 = 0.35;
+const MUD_POOL_FROM: f32 = 0.05;
+const MUD_POOL_TO: f32 = 0.12;
 
 const SHELF_SLOPE: f32 = 0.15;
 const FOAM_TILES: f32 = {foam_tiles};
@@ -886,7 +889,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
 
     var ring_foam = 0.0;
     var ring_rough = 0.0;
-{ring_block}    let mud = water.look.y;
+{ring_block}    let mud = water.look.y * (1.0 - smoothstep(MUD_POOL_FROM, MUD_POOL_TO, thickness));
     let grain = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES).r - 0.5;
     let grain_b = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES * 0.37 + vec2<f32>(0.5)).r - 0.5;
     let wave_tilt = tilt;
@@ -1009,7 +1012,8 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     }}
 
     let sky_down = sky_irradiance(vec3<f32>(0.0, 1.0, 0.0));
-    let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud) * (1.0 - MUD_PRINT_DARK * print.x * mud) * (1.0 + MUD_PRINT_RIM * print_rim * mud);
+    let print_shade = (1.0 - MUD_PRINT_DARK * print.x * mud) * (1.0 + MUD_PRINT_RIM * print_rim * mud) * (1.0 - MUD_WET_DARK * fresh);
+    let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud) * print_shade;
     let body = water.scatter.rgb * silt * (sky_irradiance(n) * mix(1.0, MUD_SKY_SHARE, mud) + sunlight * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0)) * (vec3<f32>(1.0) - t_view);
 
     let fine = 0.5 * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N * 0.25 / water.tiles.z));
@@ -1061,7 +1065,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let edge = smoothstep(0.0, water.scatter.w, thickness);
     let lip = smoothstep(0.0, 0.015, thickness);
     let shade = (env_seen * fresnel + glint * wet_gloss + (body + brighter) * (1.0 - fresnel)) * edge;
-    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge);
+    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge) * print_shade;
     let froth_cover = cover * lip;
     let colour = mix(shade, foam_light, froth_cover);
 
