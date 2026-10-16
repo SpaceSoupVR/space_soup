@@ -26,6 +26,9 @@ struct DesktopTerrain {
     vb: Buffer,
     ib: Buffer,
     index_count: u32,
+    mud: Option<MudBody>,
+    splat: Option<super::terrain_pipeline::TerrainImage>,
+    mud_layer: i32,
 }
 
 struct DesktopWater {
@@ -37,25 +40,20 @@ struct DesktopWater {
     uniform: WaterUniform,
     waves: WaveField,
     bounds: (glam::Vec3, glam::Vec3),
-    mud: Option<MudBody>,
 }
 
 struct MudBody {
     map: MudMap,
     texture: Texture,
+    view: TextureView,
     walkers: MudWalkers,
 }
 
 impl MudBody {
-    fn new(device: &Device, bounds: (glam::Vec3, glam::Vec3)) -> Self {
-        let map = MudMap::new(
-            [bounds.0.x, bounds.0.z],
-            [bounds.1.x, bounds.1.z],
-            spacesoup_graphics::mud::DEFAULT_TEXEL,
-            spacesoup_graphics::mud::MAX_SIDE,
-        );
+    fn new(device: &Device, queue: &Queue, min: [f32; 2], max: [f32; 2]) -> Self {
+        let map = MudMap::new(min, max, spacesoup_graphics::mud::DEFAULT_TEXEL, spacesoup_graphics::mud::MAX_SIDE);
         let texture = device.create_texture(&TextureDescriptor {
-            label: Some("water_mud_prints"),
+            label: Some("terrain_deform"),
             size: Extent3d { width: map.width(), height: map.height(), depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
@@ -64,7 +62,14 @@ impl MudBody {
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        Self { map, texture, walkers: MudWalkers::default() }
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            map.bytes(),
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(map.width() * 2), rows_per_image: Some(map.height()) },
+            Extent3d { width: map.width(), height: map.height(), depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&TextureViewDescriptor::default());
+        Self { map, texture, view, walkers: MudWalkers::default() }
     }
 
     fn flush(&mut self, queue: &Queue) {
@@ -242,16 +247,15 @@ impl Renderer {
             self.water_pipeline = Some(made);
         }
         let pipeline = self.water_pipeline.as_ref().expect("made above");
+        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| m.map.placement()).unwrap_or([0.0; 4]);
+        let deform_view = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| &m.view);
         self.water_bodies = bodies
             .iter()
             .filter(|(v, i, _, _)| !v.is_empty() && !i.is_empty())
             .map(|(verts, indices, uniform, params)| {
                 let bounds = super::water_pipeline::water_bounds(verts, params);
                 let mut uniform = *uniform;
-                let mud = (uniform.look[1] > 0.0).then(|| MudBody::new(&self.device, bounds));
-                if let Some(m) = mud.as_ref() {
-                    uniform.prints = m.map.placement();
-                }
+                uniform.prints = placement;
                 let vertex_buffer = self.device.create_buffer_init(&util::BufferInitDescriptor {
                     label: Some("water_vb"),
                     contents: bytemuck::cast_slice(verts),
@@ -269,8 +273,7 @@ impl Renderer {
                 });
                 let waves = WaveField::new(&self.device, &self.queue, *params);
                 waves.reprime();
-                let mud_view = mud.as_ref().map(|m| m.texture.create_view(&TextureViewDescriptor::default()));
-                let bind_groups = pipeline.bind_groups_with(&self.device, &uniform_buffer, &waves, mud_view.as_ref().unwrap_or(&pipeline.default_mud));
+                let bind_groups = pipeline.bind_groups_with(&self.device, &uniform_buffer, &waves, deform_view.unwrap_or(&pipeline.default_mud));
                 DesktopWater {
                     vertex_buffer,
                     index_buffer,
@@ -280,7 +283,6 @@ impl Renderer {
                     uniform,
                     waves,
                     bounds,
-                    mud,
                 }
             })
             .collect();
@@ -297,36 +299,30 @@ impl Renderer {
         for body in &mut self.water_bodies {
             body.uniform.set_time(self.water_seconds, body.waves.params.loop_seconds);
             self.queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
-            if let Some(m) = body.mud.as_mut() {
-                m.map.settle(dt);
-            }
+        }
+        if let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) {
+            m.map.settle(dt);
         }
     }
 
     pub fn walkers_on_mud(&mut self, walkers: &[(usize, glam::Vec3)]) {
-        let Some(ground) = self.ground.as_ref() else { return };
         let present: Vec<usize> = walkers.iter().map(|w| w.0).collect();
-        for body in &mut self.water_bodies {
-            let Some(m) = body.mud.as_mut() else { continue };
-            let surface = body.uniform.extinction[3];
-            let (mut wading, mut prints) = (0, 0);
-            for (id, p) in walkers {
-                let in_mud = m.map.contains(p.x, p.z) && ground.heights.at(p.x, p.z) < surface - 0.01;
-                wading += in_mud as u32;
-                prints += m.walkers.step(&mut m.map, *id, [p.x, p.z], in_mud) as u32;
-            }
-            m.walkers.forget_absent(&present);
-            if prints > 0 {
-                log::info!("mud: {wading} wading, {prints} new print(s) on a {}x{} map", m.map.width(), m.map.height());
-            }
+        let weights: Vec<(usize, glam::Vec3, f32)> = walkers.iter().map(|(id, p)| (*id, *p, self.mud_weight_at(p.x, p.z))).collect();
+        let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) else { return };
+        let (mut wading, mut prints) = (0, 0);
+        for (id, p, weight) in weights {
+            wading += (weight >= spacesoup_graphics::mud::MUD_WEIGHT_FLOOR) as u32;
+            prints += m.walkers.step(&mut m.map, id, [p.x, p.z], weight) as u32;
+        }
+        m.walkers.forget_absent(&present);
+        if prints > 0 {
+            log::info!("mud: {wading} on mud, {prints} new print(s) on a {}x{} map", m.map.width(), m.map.height());
         }
     }
 
     fn flush_mud(&mut self) {
-        for body in &mut self.water_bodies {
-            if let Some(m) = body.mud.as_mut() {
-                m.flush(&self.queue);
-            }
+        if let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) {
+            m.flush(&self.queue);
         }
     }
 
@@ -449,6 +445,7 @@ impl Renderer {
     ) {
         if vertices.is_empty() || indices.is_empty() {
             self.terrain = None;
+            self.rebind_water();
             return;
         }
         let pipeline = super::terrain_pipeline::TerrainPipeline::new(
@@ -456,7 +453,22 @@ impl Renderer {
             self.format,
             &self.uniform_buf.layout,
         );
-        let material = super::terrain_pipeline::TerrainMaterial::from_layers_with(
+        let mud_layer = settings.mud_layer.round() as i32;
+        let mud = (mud_layer >= 0).then(|| {
+            let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+            for v in vertices {
+                lo = [lo[0].min(v.position[0]), lo[1].min(v.position[2])];
+                hi = [hi[0].max(v.position[0]), hi[1].max(v.position[2])];
+            }
+            MudBody::new(&self.device, &self.queue, lo, hi)
+        });
+        let mut settings = settings;
+        if let Some(m) = mud.as_ref() {
+            let [tx, tz] = m.map.texel_metres();
+            settings.deform_texel = tx.max(tz);
+            log::info!("terrain deform map: {}x{} at {:.3} m, mud layer {mud_layer}", m.map.width(), m.map.height(), settings.deform_texel);
+        }
+        let material = super::terrain_pipeline::TerrainMaterial::from_layers_deformed(
             &self.device,
             &self.queue,
             &pipeline.material_layout,
@@ -467,6 +479,7 @@ impl Renderer {
             splat,
             None,
             settings,
+            mud.as_ref().map(|m| &m.view),
         );
         let vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("terrain_vb"),
@@ -484,11 +497,48 @@ impl Renderer {
             vb,
             ib,
             index_count: indices.len() as u32,
+            mud,
+            splat: splat.cloned(),
+            mud_layer,
         });
+        self.rebind_water();
     }
 
     pub fn clear_terrain(&mut self) {
         self.terrain = None;
+        self.rebind_water();
+    }
+
+    fn rebind_water(&mut self) {
+        let Some(pipeline) = self.water_pipeline.as_ref() else { return };
+        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| m.map.placement()).unwrap_or([0.0; 4]);
+        let view = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| &m.view).unwrap_or(&pipeline.default_mud);
+        for body in &mut self.water_bodies {
+            body.uniform.prints = placement;
+            self.queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
+            body.bind_groups = pipeline.bind_groups_with(&self.device, &body.uniform_buffer, &body.waves, view);
+        }
+    }
+
+    fn mud_weight_at(&self, x: f32, z: f32) -> f32 {
+        let Some(t) = self.terrain.as_ref() else { return 0.0 };
+        let Some(m) = t.mud.as_ref() else { return 0.0 };
+        if t.mud_layer < 0 || !m.map.contains(x, z) {
+            return 0.0;
+        }
+        let Some(s) = t.splat.as_ref() else { return if t.mud_layer == 0 { 1.0 } else { 0.0 } };
+        let p = m.map.placement();
+        let u = ((x - p[0]) * p[2]).clamp(0.0, 1.0);
+        let v = ((z - p[1]) * p[3]).clamp(0.0, 1.0);
+        let ix = ((u * s.width as f32) as u32).min(s.width - 1);
+        let iz = ((v * s.height as f32) as u32).min(s.height - 1);
+        let k = ((iz * s.width + ix) * 4) as usize;
+        let w: Vec<f32> = (0..4).map(|c| s.rgba[k + c] as f32).collect();
+        let total: f32 = w.iter().sum();
+        if total <= 0.0 {
+            return 0.0;
+        }
+        w[t.mud_layer as usize] / total
     }
 
     pub fn update_terrain_splat(&mut self, image: &super::terrain_pipeline::TerrainImage) -> bool {

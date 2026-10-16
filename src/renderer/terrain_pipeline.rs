@@ -28,6 +28,11 @@ pub struct TerrainMaterialUniform {
     pub wet_band: f32,
 
     pub parallax: f32,
+
+    pub mud_layer: f32,
+    pub deform_metres: f32,
+    pub deform_texel: f32,
+    pub wet_dark: f32,
 }
 
 impl Default for TerrainMaterialUniform {
@@ -46,6 +51,10 @@ impl Default for TerrainMaterialUniform {
             wet_line: -1e9,
             wet_band: 1.0,
             parallax: 0.0,
+            mud_layer: -1.0,
+            deform_metres: 0.1,
+            deform_texel: 0.05,
+            wet_dark: 0.5,
         }
     }
 }
@@ -605,8 +614,18 @@ pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
             },
             BindGroupLayoutEntry {
                 binding: 1,
-                visibility: ShaderStages::FRAGMENT,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 9,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
                 count: None,
             },
             BindGroupLayoutEntry {
@@ -621,7 +640,7 @@ pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
             },
             BindGroupLayoutEntry {
                 binding: 3,
-                visibility: ShaderStages::FRAGMENT,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
                 ty: BindingType::Buffer {
                     ty: BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -675,7 +694,7 @@ pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
 
             BindGroupLayoutEntry {
                 binding: 4,
-                visibility: ShaderStages::FRAGMENT,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
                 ty: BindingType::Texture {
                     sample_type: TextureSampleType::Float { filterable: true },
                     view_dimension: TextureViewDimension::D2,
@@ -708,9 +727,39 @@ struct Material {{
     wet_line: f32,
     wet_band: f32,
     parallax: f32,
+    mud_layer: f32,
+    deform_metres: f32,
+    deform_texel: f32,
+    wet_dark: f32,
 }}
 @group(1) @binding(3) var<uniform> mat: Material;
 @group(1) @binding(4) var splat_tex: texture_2d<f32>;
+@group(1) @binding(9) var deform_tex: texture_2d<f32>;
+
+const DEFORM_FLAT: f32 = 128.0 / 255.0;
+const DEFORM_POOL_FROM: f32 = 0.35;
+const DEFORM_POOL_TO: f32 = 0.7;
+const DEFORM_NORMAL: f32 = 1.0;
+
+fn mud_weight_v(uv: vec2<f32>) -> f32 {{
+    if (mat.mud_layer < -0.5) {{
+        return 0.0;
+    }}
+    if (mat.use_splat > 0.5) {{
+        let s = textureSampleLevel(splat_tex, layer_samp, uv, 0.0);
+        let total = max(s.x + s.y + s.z + s.w, 0.001);
+        let w = select(select(select(s.x, s.y, mat.mud_layer > 0.5), s.z, mat.mud_layer > 1.5), s.w, mat.mud_layer > 2.5);
+        return clamp(w / total, 0.0, 1.0);
+    }}
+    return select(0.0, 1.0, mat.mud_layer < 0.5);
+}}
+
+fn mud_weight_f(w: vec4<f32>) -> f32 {{
+    if (mat.mud_layer < -0.5) {{
+        return 0.0;
+    }}
+    return select(select(select(w.x, w.y, mat.mud_layer > 0.5), w.z, mat.mud_layer > 1.5), w.w, mat.mud_layer > 2.5);
+}}
 @group(1) @binding(5) var normal_tex: texture_2d_array<f32>;
 @group(1) @binding(7) var rough_tex: texture_2d_array<f32>;
 @group(1) @binding(8) var ao_tex: texture_2d_array<f32>;
@@ -735,11 +784,14 @@ struct VOut {{
 
 @vertex fn vs_main(v: VIn) -> VOut {{
     var out: VOut;
-    out.clip      = cam_view_proj() * vec4<f32>(v.pos, 1.0);
+    var pos = v.pos;
+    let deform = textureSampleLevel(deform_tex, layer_samp, v.uv2, 0.0).r;
+    pos.y = pos.y + (deform - DEFORM_FLAT) * 2.0 * mat.deform_metres * mud_weight_v(v.uv2);
+    out.clip      = cam_view_proj() * vec4<f32>(pos, 1.0);
     out.col       = v.col;
     out.normal    = v.norm;
-    out.world_pos = v.pos;
-    out.tex_pos   = to_world_space(v.pos);
+    out.world_pos = pos;
+    out.tex_pos   = to_world_space(pos);
     out.uv        = v.uv2;
     return out;
 }}
@@ -1015,6 +1067,24 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
 
 {layer_reads}
     shaded_n = normalize(select(n, shaded_n, length(shaded_n) > 0.0001));
+
+    let mudw = mud_weight_f(w);
+    let deform = textureSampleLevel(deform_tex, layer_samp, in.uv, 0.0);
+    let sunk = max(DEFORM_FLAT - deform.r, 0.0) / DEFORM_FLAT * mudw;
+    let wet_zone = deform.g * mudw;
+    if (mudw > 0.001) {{
+        let e = 1.0 / vec2<f32>(textureDimensions(deform_tex));
+        let hx = textureSampleLevel(deform_tex, layer_samp, in.uv + vec2<f32>(e.x, 0.0), 0.0).r - textureSampleLevel(deform_tex, layer_samp, in.uv - vec2<f32>(e.x, 0.0), 0.0).r;
+        let hz = textureSampleLevel(deform_tex, layer_samp, in.uv + vec2<f32>(0.0, e.y), 0.0).r - textureSampleLevel(deform_tex, layer_samp, in.uv - vec2<f32>(0.0, e.y), 0.0).r;
+        let slope = vec2<f32>(hx, hz) * (2.0 * mat.deform_metres / max(2.0 * mat.deform_texel, 1e-4)) * mudw * DEFORM_NORMAL;
+        let bent = to_player_direction(normalize(vec3<f32>(-slope.x, 1.0, -slope.y)));
+        shaded_n = normalize(shaded_n + bent - to_player_direction(vec3<f32>(0.0, 1.0, 0.0)));
+    }}
+    let wet = clamp(max(wet_zone, sunk), 0.0, 1.0);
+    let pool = smoothstep(DEFORM_POOL_FROM, DEFORM_POOL_TO, sunk);
+    albedo = albedo * (1.0 - mat.wet_dark * wet) * (1.0 - 0.35 * pool);
+    rough_map = mix(rough_map, rough_map * (1.0 - 0.6 * wet), 1.0);
+    rough_map = mix(rough_map, 0.08, pool);
 
     let rough = specular_aa_roughness(clamp(rough_map, 0.0, 1.0), dpdx(shaded_n), dpdy(shaded_n));
 
@@ -1830,6 +1900,44 @@ impl TerrainMaterial {
         ao: &[Option<TerrainImage>],
         settings: TerrainMaterialUniform,
     ) -> Self {
+        Self::new_deformed(device, queue, layout, layers, macro_image, splat, sky_occlusion, normals, rough, ao, settings, None)
+    }
+
+    pub fn flat_deform_view(device: &Device, queue: &Queue) -> TextureView {
+        let tex = device.create_texture(&TextureDescriptor {
+            label: Some("terrain_deform_flat"),
+            size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rg8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            &[128, 0],
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(2), rows_per_image: Some(1) },
+            Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        tex.create_view(&TextureViewDescriptor::default())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_deformed(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        layers: &[TerrainImage],
+        macro_image: &TerrainImage,
+        splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
+        normals: &[Option<TerrainImage>],
+        rough: &[Option<TerrainImage>],
+        ao: &[Option<TerrainImage>],
+        settings: TerrainMaterialUniform,
+        deform: Option<&TextureView>,
+    ) -> Self {
         assert!(!layers.is_empty(), "terrain material needs at least one layer");
         let (w, h) = (layers[0].width, layers[0].height);
         assert!(
@@ -2100,10 +2208,19 @@ impl TerrainMaterial {
         });
         queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&settings));
 
+        let flat_deform;
+        let deform_view = match deform {
+            Some(v) => v,
+            None => {
+                flat_deform = Self::flat_deform_view(device, queue);
+                &flat_deform
+            }
+        };
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("terrain_material"),
             layout,
             entries: &[
+                BindGroupEntry { binding: 9, resource: BindingResource::TextureView(deform_view) },
                 BindGroupEntry {
                     binding: 0,
                     resource: BindingResource::TextureView(
@@ -2243,6 +2360,23 @@ impl TerrainMaterial {
         sky_occlusion: Option<&TerrainImage>,
         settings: TerrainMaterialUniform,
     ) -> Self {
+        Self::from_layers_deformed(device, queue, layout, layers, normals, rough, ao, splat, sky_occlusion, settings, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_layers_deformed(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        layers: &[Option<TerrainImage>],
+        normals: &[Option<TerrainImage>],
+        rough: &[Option<TerrainImage>],
+        ao: &[Option<TerrainImage>],
+        splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
+        settings: TerrainMaterialUniform,
+        deform: Option<&TextureView>,
+    ) -> Self {
         let (w, h) = layers
             .iter()
             .flatten()
@@ -2265,7 +2399,7 @@ impl TerrainMaterial {
             })
             .collect();
 
-        Self::new(
+        Self::new_deformed(
             device,
             queue,
             layout,
@@ -2277,6 +2411,7 @@ impl TerrainMaterial {
             rough,
             ao,
             settings,
+            deform,
         )
     }
 
@@ -2579,6 +2714,15 @@ pub fn load_terrain_settings(dir: &std::path::Path) -> TerrainMaterialUniform {
     }
     if let Some(v) = raw.get("parallax").and_then(|v| v.as_f64()) {
         out.parallax = (v as f32).clamp(0.0, 0.5);
+    }
+    if let Some(v) = raw.get("mud_layer").and_then(|v| v.as_i64()) {
+        out.mud_layer = if (0..4).contains(&v) { v as f32 } else { -1.0 };
+    }
+    if let Some(v) = raw.get("deform").and_then(|v| v.as_f64()) {
+        out.deform_metres = (v as f32).clamp(0.0, 0.5);
+    }
+    if let Some(v) = raw.get("wet_dark").and_then(|v| v.as_f64()) {
+        out.wet_dark = (v as f32).clamp(0.0, 1.0);
     }
     out
 }

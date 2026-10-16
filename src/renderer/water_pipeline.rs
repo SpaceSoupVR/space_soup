@@ -893,7 +893,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let grain = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES).r - 0.5;
     let grain_b = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES * 0.37 + vec2<f32>(0.5)).r - 0.5;
     let wave_tilt = tilt;
-    var print = vec2<f32>(0.0);
+    var print = vec2<f32>(128.0 / 255.0, 0.0);
     var print_rim = 0.0;
     var print_tilt = vec2<f32>(0.0);
     let print_uv = (q - water.prints.xy) * water.prints.zw;
@@ -902,11 +902,12 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         let e = water.prints.zw * MUD_PRINT_STEP;
         let dx = textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(e.x, 0.0), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(e.x, 0.0), 0.0).r;
         let dz = textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(0.0, e.y), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(0.0, e.y), 0.0).r;
-        print_tilt = vec2<f32>(dx, dz);
-        print_rim = smoothstep(0.05, 0.5, length(vec2<f32>(dx, dz))) * (1.0 - print.x);
+        print_tilt = -vec2<f32>(dx, dz);
+        print_rim = smoothstep(0.05, 0.5, length(vec2<f32>(dx, dz))) * max(print.x - 128.0 / 255.0, 0.0) * 2.0;
     }}
+    let sunk_p = max(128.0 / 255.0 - print.x, 0.0) * 2.0;
     let fresh = print.y * mud;
-    let pool = print.x * mud;
+    let pool = sunk_p * mud;
     let wet = max(fresh * MUD_WET_GLOSS, pool * MUD_POOL_GLOSS);
     let wet_gloss = mix(water.look.x, 1.0, wet);
     tilt = wave_tilt * (1.0 - MUD_FLATTEN * mud * (1.0 - wet * MUD_SLUSH_RIPPLE)) + vec2<f32>(grain, grain_b) * MUD_GRAIN_TILT * mud * (1.0 - wet) + print_tilt * MUD_PRINT_TILT * mud;
@@ -1012,7 +1013,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     }}
 
     let sky_down = sky_irradiance(vec3<f32>(0.0, 1.0, 0.0));
-    let print_shade = (1.0 - MUD_PRINT_DARK * print.x * mud) * (1.0 + MUD_PRINT_RIM * print_rim * mud) * (1.0 - MUD_WET_DARK * fresh);
+    let print_shade = (1.0 - MUD_PRINT_DARK * sunk_p * mud) * (1.0 + MUD_PRINT_RIM * print_rim * mud) * (1.0 - MUD_WET_DARK * fresh);
     let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud) * print_shade;
     let body = water.scatter.rgb * silt * (sky_irradiance(n) * mix(1.0, MUD_SKY_SHARE, mud) + sunlight * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0)) * (vec3<f32>(1.0) - t_view);
 
