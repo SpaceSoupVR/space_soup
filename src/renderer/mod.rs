@@ -18,6 +18,7 @@ pub mod glare;
 pub mod effects;
 pub mod particle;
 pub mod pipeline;
+pub mod particle_pipeline;
 pub mod profiler;
 pub mod shadow;
 pub mod space_warp;

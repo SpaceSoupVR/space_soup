@@ -139,6 +139,8 @@ pub struct Renderer {
 
     pub sky_visible: bool,
 
+    particle_pipeline: super::particle_pipeline::ParticlePipeline,
+    particles: Vec<super::particle_pipeline::ParticleInstance>,
     water_pipeline: Option<WaterPipeline>,
     water_bodies: Vec<DesktopWater>,
     water_seconds: f64,
@@ -172,6 +174,7 @@ impl Renderer {
         let skinned_mesh_pipeline =
             mesh_pipeline::SkinnedMeshPipeline::new(&device, format, &uniform_buf.layout);
         let sky_pipeline = super::sky::SkyPipeline::new(&device, format, &uniform_buf.layout, 1);
+        let particle_pipeline = super::particle_pipeline::ParticlePipeline::new(&device, format, &uniform_buf.layout);
         let (depth_texture, depth_view) = Self::make_depth(&device, width, height);
         let white_pixel = [255u8, 255, 255, 255];
         let default_cuboid_lightmap =
@@ -214,12 +217,18 @@ impl Renderer {
             sky_pipeline,
             sky_dome: None,
             sky_visible: true,
+            particle_pipeline,
+            particles: Vec::new(),
             water_pipeline: None,
             water_bodies: Vec::new(),
             water_seconds: 0.0,
             ground: None,
             ground_dirty: false,
         }
+    }
+
+    pub fn set_particles(&mut self, items: Vec<super::particle_pipeline::ParticleInstance>) {
+        self.particles = items;
     }
 
     pub fn set_ground(&mut self, ground: Option<DesktopGround>) {
@@ -764,6 +773,14 @@ impl Renderer {
     ) {
         self.ensure_ground_map();
         self.flush_mud();
+        {
+            let v = camera.view();
+            let right = glam::Vec3::new(v.x_axis.x, v.y_axis.x, v.z_axis.x).normalize_or_zero();
+            let up = glam::Vec3::new(v.x_axis.y, v.y_axis.y, v.z_axis.y).normalize_or_zero();
+            let items = std::mem::take(&mut self.particles);
+            self.particle_pipeline.upload(&self.device, &self.queue, right, up, &items);
+            self.particles = items;
+        }
         let vp = camera.projection() * camera.view();
 
         let ranked = lights::rank_for_budget(lights, lights::MAX_LIGHTS);
@@ -1088,6 +1105,7 @@ impl Renderer {
                 pass.set_bind_group(1, &sky.bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
+            self.particle_pipeline.draw(&mut pass, &self.uniform_buf.bind_group);
 
             if !overlay_verts.is_empty() {
                 pass.set_pipeline(&self.overlay_pipeline.pipeline);
