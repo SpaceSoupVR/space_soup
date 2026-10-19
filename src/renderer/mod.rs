@@ -6,6 +6,11 @@ mod desktop_renderer;
 pub mod icon;
 pub mod layer_settings;
 pub mod layered_mesh_pipeline;
+pub mod cave_twins;
+pub mod baked_cave;
+pub mod outdoor_pass;
+pub mod scene_cull;
+pub mod shader_opt;
 pub mod lights;
 pub mod material_wgsl;
 pub mod mesh;
@@ -16,6 +21,7 @@ pub mod dynamic_resolution;
 pub mod panel;
 pub mod glare;
 pub mod effects;
+pub mod effect_asset;
 pub mod particle;
 pub mod pipeline;
 pub mod profiler;
@@ -33,6 +39,14 @@ pub mod water_pipeline;
 pub mod underwater;
 pub mod weather;
 pub mod ground_cuts;
+pub mod ground_horizon;
+pub mod ground_lod;
+pub mod ground_shape;
+pub mod water_runs;
+pub mod water_wake;
+pub mod planar_water;
+pub mod static_brush;
+pub mod static_solid;
 pub mod ground_twins;
 pub mod uniforms;
 pub mod probe_prefilter;
@@ -49,12 +63,15 @@ pub mod doors;
 pub mod shader_precision;
 #[cfg(test)]
 pub(crate) mod shader_inlining;
+#[cfg(test)]
+pub(crate) mod shader_audit;
 pub mod skin_compute;
 pub mod water_waves;
 pub mod probe_blur;
 pub mod probe_fixup;
 pub mod pool_cards;
 pub mod foveation;
+pub mod fps_hud;
 pub mod visibility_mask;
 pub mod ground_map;
 pub mod proxy_cards;
@@ -163,5 +180,14 @@ pub struct MeshInstance<'a> {
     /// A door's leaf: drawn into the lamps' moving casters' tiles as well as
     /// every map a model is drawn into. See `doors`.
     pub tile_caster: bool,
+    /// It can move: a body physics moves, a door or its lever, something held
+    /// or animated, a character. Only these go into the head-following
+    /// moving-objects SUN map. A model that never moves has its sun shadow in
+    /// the level's baked data at every distance; in that map it cast only
+    /// within the map's box of the player, so its shadow drew itself in and
+    /// faded as they walked (the cave's back mouth, headset 2026-10-14), and
+    /// it cost a shadow draw every frame. The lamps' and the torch's maps
+    /// take every model either way.
+    pub moves: bool,
 }
 

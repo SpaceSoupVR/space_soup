@@ -124,7 +124,16 @@ pub fn reflection_motion_weight(share: f32) -> f32 {
 pub const SLOT_STRIDE: u64 = 256;
 
 /// Slots in the ring, both eyes: the world and every mesh, per eye.
-pub const MAX_SLOTS: u32 = 256;
+///
+/// 2,048 since 2026-10-13 (it was 256): a slot is a mesh DRAWN this frame --
+/// each has its own model matrix, moving or not -- and past the ring a mesh
+/// wrote NO motion, in silence, from the 127th model in the draw range
+/// (`docs/scale-audit-2026-10-13.md`, F11; every moving draw writes motion).
+/// The ring is one uniform buffer of this many [`SLOT_STRIDE`]s (512 kB) and
+/// a frame writes only the slots it uses, so its size costs nothing a frame;
+/// no shader knows it. A frame with more meshes than this still drops the
+/// rest, and says so (`XrRenderer`'s "SPACEWARP: ... no motion" error).
+pub const MAX_SLOTS: u32 = 2048;
 
 /// What every motion shader opens with -- the SpaceWarp shader here and the
 /// particles' motion twins (`weather::motion_shader`,
@@ -386,6 +395,18 @@ pub fn previous_clip(prev_view_proj: Mat4, prev_world_to_player: Mat4, world_to_
     prev_view_proj * prev_world_to_player * world_to_player.inverse()
 }
 
+/// A CAMERA SLOT FOR VERTICES IN THE WORLD -- the ground's chunks, the
+/// brushes (`brush_pipeline::WORLD_BRUSHES`): this frame's clip from the
+/// world, the previous frame's clip from the world (`prev`: its view
+/// projection and its world-to-player; `None` on the first frame: no motion),
+/// and the eye in the world, from `eye` in the player's frame. What the
+/// posed world's slot gives a posed copy of the same vertex -- `curr` and
+/// [`previous_clip`] -- with the posing moved into the two matrices.
+pub fn world_slot(curr: Mat4, prev: Option<(Mat4, Mat4)>, world_to_player: Mat4, eye: glam::Vec3) -> (Mat4, Mat4, glam::Vec3) {
+    let now = curr * world_to_player;
+    (now, prev.map_or(now, |(view_proj, w2p)| view_proj * w2p), world_to_player.inverse().transform_point3(eye))
+}
+
 /// The motion vector for a point at player-frame `p`, as the shader computes
 /// it: the CPU reference the tests hold the shader's arithmetic to.
 pub fn motion_vector(curr: Mat4, prev: Mat4, p: glam::Vec3) -> glam::Vec3 {
@@ -462,13 +483,13 @@ pub enum MotionKind {
     /// behind it by [`layer_motion_weight`]: no vertex buffer, group 1 the
     /// weather's own group. See `weather::motion_shader`.
     Weather,
-    /// The effects drawn over what is behind them -- smoke, flames, coals, a
-    /// splash's crown and mist -- and those screened over it -- embers, dust
-    /// motes, a splash's drops. Their instance buffer; group 1 the probe
-    /// pass's read group, group 2 the effects' own. See
-    /// `effects::motion_shader`.
-    EffectsOver,
-    EffectsScreened,
+    /// The effects: a run of their instances drawn by one shader variant
+    /// (`effects::variants`), by that variant's own twin -- those drawn over
+    /// what is behind them (smoke, flames, coals, a splash's crown and mist)
+    /// and those screened over it (embers, dust motes, a splash's drops, a
+    /// muzzle flash). Their instance buffer; group 1 the probe pass's read
+    /// group, group 2 the effects' own. See `effects::motion_shader_of`.
+    Effects(crate::renderer::effects::FxVariant),
 }
 
 /// The motion-vector pipelines, one per vertex layout the eye pass draws
@@ -490,8 +511,8 @@ pub struct MotionPipelines {
     skinned: wgpu::RenderPipeline,
     water: wgpu::RenderPipeline,
     weather: wgpu::RenderPipeline,
-    effects_over: wgpu::RenderPipeline,
-    effects_screened: wgpu::RenderPipeline,
+    /// One twin a variant of the effects' shader, by `FxVariant as usize`.
+    effects: Vec<wgpu::RenderPipeline>,
     /// Whether the depth format carries stencil (D24S8), which the pass then
     /// clears too rather than leave for wgpu to zero on first use.
     stencil: bool,
@@ -738,21 +759,14 @@ impl MotionPipelines {
         let effects_group = crate::renderer::effects::bind_group_layout(device);
         let effects_layouts = [Some(&camera_layout), Some(&probe_group), Some(&effects_group)];
         let instances = [Some(crate::renderer::effects::EffectInstance::motion_layout())];
-        let effects_source = crate::renderer::effects::motion_shader();
-        let effects_over = particle(
-            "space_warp_effects_over",
-            &effects_layouts,
-            effects_source.clone(),
-            ("vs_fx_motion", "fs_fx_motion_over"),
-            &instances,
-        );
-        let effects_screened = particle(
-            "space_warp_effects_screened",
-            &effects_layouts,
-            effects_source,
-            ("vs_fx_motion", "fs_fx_motion_screened"),
-            &instances,
-        );
+        // A twin a variant, each from its variant's own text.
+        let effects: Vec<wgpu::RenderPipeline> = crate::renderer::effects::FxVariant::ALL
+            .iter()
+            .map(|v| {
+                let (source, fragment) = v.motion_shader();
+                particle(&format!("space_warp_{}", v.label()), &effects_layouts, source, ("vs_fx_motion", fragment), &instances)
+            })
+            .collect();
         Self {
             camera_layout,
             joints_layout,
@@ -765,8 +779,7 @@ impl MotionPipelines {
             skinned,
             water,
             weather,
-            effects_over,
-            effects_screened,
+            effects,
             stencil: depth_format.has_stencil_aspect(),
         }
     }
@@ -817,8 +830,7 @@ impl MotionPipelines {
             MotionKind::Skinned => &self.skinned,
             MotionKind::Water => &self.water,
             MotionKind::Weather => &self.weather,
-            MotionKind::EffectsOver => &self.effects_over,
-            MotionKind::EffectsScreened => &self.effects_screened,
+            MotionKind::Effects(variant) => &self.effects[variant as usize],
         }
     }
 }
@@ -892,7 +904,7 @@ pub fn record(
         if matches!(d.kind, MotionKind::Skinned | MotionKind::BrushReflect | MotionKind::Water) && d.joints.is_none() {
             continue;
         }
-        if matches!(d.kind, MotionKind::Weather | MotionKind::EffectsOver | MotionKind::EffectsScreened) {
+        if matches!(d.kind, MotionKind::Weather | MotionKind::Effects(_)) {
             continue;
         }
         let key = (d.kind, d.slot, d.vertices as *const _, d.indices as *const _, d.joints.map(|j| j as *const _));
@@ -911,7 +923,7 @@ pub fn record(
     for p in particles.iter().filter(|p| !p.range.is_empty() && p.vertices > 0 && p.slot < MAX_SLOTS) {
         let wants = match p.kind {
             MotionKind::Weather => p.groups[0].is_some(),
-            MotionKind::EffectsOver | MotionKind::EffectsScreened => p.groups.iter().all(Option::is_some) && p.instances.is_some(),
+            MotionKind::Effects(_) => p.groups.iter().all(Option::is_some) && p.instances.is_some(),
             _ => false,
         };
         if !wants {
@@ -1003,6 +1015,84 @@ pub fn layer_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE GROUND IN THE WORLD MOVES AS THE GROUND POSED DID. Posed, a vertex
+    /// was `world_to_player * w` and went through this frame's camera and
+    /// `previous_clip`; in the world it is `w`, through the world's slot --
+    /// this frame's camera times this frame's world-to-player, and the last
+    /// frame's times the last frame's. Two matrices a frame, no posed copy of
+    /// either, and the same vector: while the rig walks, turns and the head
+    /// moves, near and far.
+    #[test]
+    fn a_world_vertex_through_the_worlds_slot_moves_as_its_posed_copy_did() {
+        let proj = Mat4::perspective_rh(1.6, 0.93, NEAR_Z, FAR_Z);
+        let frame = |offset: Vec3, yaw: f32, head: Vec3, look: f32| {
+            let world_to_player = Mat4::from_quat(glam::Quat::from_rotation_y(yaw).inverse()) * Mat4::from_translation(-offset);
+            let view = (Mat4::from_translation(head) * Mat4::from_rotation_y(look)).inverse();
+            (proj * view, world_to_player)
+        };
+        let (prev_vp, prev_w2p) = frame(Vec3::new(3.0, 0.2, -7.0), 0.40, Vec3::new(0.02, 1.6, 0.01), 0.10);
+        let (curr_vp, w2p) = frame(Vec3::new(3.04, 0.21, -7.03), 0.43, Vec3::new(0.03, 1.61, 0.0), 0.13);
+        let mut worst = 0.0f32;
+        for k in 0..400 {
+            let a = k as f32 * 0.7;
+            let w = Vec3::new(3.0 + a.sin() * (1.0 + k as f32 * 0.2), (k % 9) as f32 * 0.5 - 1.0, -7.0 - 2.0 - a.cos().abs() * (1.0 + k as f32 * 0.3));
+            // As it was: posed by the app, the world's first slot.
+            let posed = motion_vector(curr_vp, previous_clip(prev_vp, prev_w2p, w2p), w2p.transform_point3(w));
+            // As it is: the world's vertex, the slot the water has always had.
+            let world = motion_vector(curr_vp * w2p, prev_vp * prev_w2p, w);
+            worst = worst.max((posed - world).abs().max_element());
+        }
+        // Single precision's own noise through two more matrix products:
+        // under a hundredth of a motion pixel of SpaceWarp's 512-wide image.
+        assert!(worst < 4e-5, "the two differ by {worst} of NDC");
+    }
+
+    /// THE BRUSHES IN THE WORLD MOVE AS THEIR POSED COPIES DID, their
+    /// reflections with them: a world vertex through `world_slot` -- its two
+    /// matrices and the eye in the world -- gives the vector the posed
+    /// vertex gave through the posed world's slot, for the surface itself
+    /// (weight 0) and for a pixel that is part reflected image
+    /// (`reflected_point`: a point along the eye's ray, which a rigid frame
+    /// change carries with the eye and the surface). And with no previous
+    /// frame neither moves.
+    #[test]
+    fn a_world_brush_through_its_slot_moves_as_its_posed_copy_did_reflections_too() {
+        let proj = Mat4::perspective_rh(1.6, 0.93, NEAR_Z, FAR_Z);
+        let frame = |offset: Vec3, yaw: f32, head: Vec3, look: f32| {
+            let world_to_player = Mat4::from_quat(glam::Quat::from_rotation_y(yaw).inverse()) * Mat4::from_translation(-offset);
+            let view = (Mat4::from_translation(head) * Mat4::from_rotation_y(look)).inverse();
+            (proj * view, world_to_player, head)
+        };
+        let (prev_vp, prev_w2p, _) = frame(Vec3::new(113.0, 0.2, -47.0), 0.40, Vec3::new(0.02, 1.6, 0.01), 0.10);
+        let (curr_vp, w2p, eye) = frame(Vec3::new(113.04, 0.21, -47.03), 0.43, Vec3::new(0.03, 1.61, 0.0), 0.13);
+        let (curr, prev, world_eye) = world_slot(curr_vp, Some((prev_vp, prev_w2p)), w2p, eye);
+        assert!((w2p.transform_point3(world_eye) - eye).length() < 1e-4, "the eye in the world, taken back");
+        let (mut worst, mut seen) = (0.0f32, 0);
+        for k in 0..600 {
+            let a = k as f32 * 0.7;
+            // A wall some metres in front of a rig far from the world's origin.
+            let w = Vec3::new(113.0 + a.sin() * (1.0 + k as f32 * 0.05), (k % 9) as f32 * 0.4 - 0.5, -47.0 - 2.0 - a.cos().abs() * (1.0 + k as f32 * 0.05));
+            // On screen, as a drawn pixel is (a point beside the eye has a
+            // clip w near 0, and any two roundings of it differ by a lot).
+            let clip = curr * w.extend(1.0);
+            if clip.w < 0.5 || clip.x.abs() > clip.w || clip.y.abs() > clip.w {
+                continue;
+            }
+            seen += 1;
+            let (weight, reach) = ([0.0, 0.3, 1.0][k % 3], [0.0, 2.5, 40.0][(k / 3) % 3]);
+            let posed = motion_vector(curr_vp, previous_clip(prev_vp, prev_w2p, w2p), reflected_point(eye, w2p.transform_point3(w), weight, reach));
+            let world = motion_vector(curr, prev, reflected_point(world_eye, w, weight, reach));
+            worst = worst.max((posed - world).abs().max_element());
+        }
+        assert!(seen > 150, "{seen} points on screen");
+        // Single precision 113 m from the origin, through two more products:
+        // under a fortieth of a motion pixel of SpaceWarp's 512-wide image.
+        assert!(worst < 1e-4, "the two differ by {worst} of NDC");
+        // The first frame: nothing to move from.
+        let (curr, prev, _) = world_slot(curr_vp, None, w2p, eye);
+        assert_eq!(motion_vector(curr, prev, Vec3::new(113.0, 1.0, -50.0)), Vec3::ZERO);
+    }
     use glam::{Quat, Vec3};
 
     fn view_proj(eye: Vec3, yaw: f32) -> Mat4 {

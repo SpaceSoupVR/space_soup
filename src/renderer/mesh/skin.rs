@@ -12,6 +12,10 @@ pub struct SkinnedMeshPrimitive {
     pub texture: Arc<LoadedTexture>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
+    /// See-through, as `MeshPrimitive::blended` (a glTF `BLEND` material or
+    /// one with transmission): the eye pass draws it blended, after the
+    /// body's opaque parts. See `Levers::opaque_models`.
+    pub blended: bool,
 }
 
 impl SkinnedMeshPrimitive {
@@ -75,6 +79,7 @@ impl SkinnedMeshPrimitive {
             indices,
             texture: self.texture.clone(),
             vertex_buffer: self.vertex_buffer.clone(),
+            blended: self.blended,
         })
     }
 }

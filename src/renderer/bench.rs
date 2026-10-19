@@ -39,6 +39,15 @@ pub const SWAY_PERIOD_SECONDS: f32 = 4.0;
 /// The widest sway a pose may ask for, metres each way.
 pub const MAX_SWAY: f32 = 1.0;
 
+/// A walking pace, metres a second. See `BenchPose::path`.
+pub const WALK_SPEED: f32 = 1.4;
+
+/// How long a walk's turn-round at each end takes.
+pub const TURN_SECONDS: f32 = 2.0;
+
+/// How far ahead along its way a walking eye looks, metres.
+pub const LOOK_AHEAD: f32 = 1.0;
+
 /// The spacing given to the eyes when the runtime's own poses mean nothing.
 /// The adult average; the headset's is used whenever it is known.
 pub const FALLBACK_IPD: f32 = 0.063;
@@ -70,12 +79,52 @@ pub struct BenchPose {
     /// still.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sway: Option<f32>,
+    /// A WALK: the eye carried from `eye` through these points, world metres,
+    /// at [`Self::speed`], looking a metre ahead along its way; at the last it
+    /// turns round on the spot ([`TURN_SECONDS`]) and walks back, and again at
+    /// `eye`. The rig goes with it, so every frame is a new offset and, at a
+    /// bend or an end, a new yaw: what a player walking does to everything
+    /// the app poses for the rig. `at` is then only the still picture's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<Vec<[f32; 3]>>,
+    /// Metres a second along `path`. Absent: [`WALK_SPEED`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f32>,
+    /// A TURN ON THE SPOT: the view turned about the vertical at `eye`, this
+    /// many degrees a second (a held stick turns the rig so). Its pitch is
+    /// the still view's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spin: Option<f32>,
     /// The player's flashlight, held still for this view: its glass at `at`,
     /// aimed at `aim`, world metres, the torch drawn with it when `torch`.
     /// Absent: none, whatever the player last switched on -- a benchmark
     /// measures what it names. See quest_app's `flashlight`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flashlight: Option<BenchFlashlight>,
+    /// THE DOORS for this view, degrees from shut, in the scene's order (as
+    /// `DOORS=a,b,c,d` in the offline harness): held at these angles, or with
+    /// [`Self::door_swing`] swung from shut to them and back. Absent: as the
+    /// player and the server left them. See [`Self::door_angles_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doors: Option<Vec<f32>>,
+    /// Seconds for each door to swing from shut to its [`Self::doors`] angle
+    /// and back, smoothly (a player opening a door and letting it close):
+    /// a door that MOVES every frame, against the same angles held still.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub door_swing: Option<f32>,
+    /// A WALK FACING BACK: the eye turned to look where the walk came from,
+    /// so a [`Self::path`] is walked backward. Absent: forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backward: Option<bool>,
+    /// The eye's pitch, degrees (negative: down), in place of a walk's or a
+    /// turn's level look. Absent: theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitch: Option<f32>,
+    /// The player's own body drawn in this view (true), as the headset
+    /// draws it; absent, a pinned view leaves it out, as it always has (the
+    /// controllers on the desk would carry its hands into the view).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<bool>,
 }
 
 /// A flashlight a bench view holds still. See [`BenchPose::flashlight`].
@@ -92,6 +141,22 @@ pub struct BenchFlashlight {
 }
 
 impl BenchPose {
+    /// The doors' angles, degrees, `t` seconds into the view; none when it
+    /// names none. See [`Self::doors`].
+    pub fn door_angles_at(&self, t: f32) -> Option<Vec<f32>> {
+        let doors = self.doors.as_ref()?;
+        let k = match self.door_swing.filter(|s| *s > 0.0) {
+            Some(period) => 0.5 - 0.5 * (std::f32::consts::TAU * t / period).cos(),
+            None => 1.0,
+        };
+        Some(doors.iter().map(|a| a * k).collect())
+    }
+
+    /// Whether the rig is somewhere else from one frame to the next.
+    pub fn moves(&self) -> bool {
+        self.sway.is_some() || self.path.is_some() || self.spin.is_some()
+    }
+
     /// Why this pose cannot be used, if it cannot.
     pub fn problem(&self) -> Option<String> {
         if self.name.is_empty() || !self.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
@@ -105,6 +170,20 @@ impl BenchPose {
         }
         if self.rig_yaw.is_some_and(|y| !y.is_finite()) {
             return Some(format!("bench '{}' has a rig_yaw that is not a number", self.name));
+        }
+        if let Some(path) = &self.path {
+            if path.is_empty() || !path.iter().flatten().all(|v| v.is_finite()) {
+                return Some(format!("bench '{}' walks a path that is empty or has a coordinate that is not a number", self.name));
+            }
+            if walk_legs(self).iter().any(|(a, b)| (*b - *a).length() < 1e-3) {
+                return Some(format!("bench '{}' walks a path with two points in one place", self.name));
+            }
+        }
+        if self.speed.is_some_and(|s| !(s > 0.0 && s <= 10.0)) {
+            return Some(format!("bench '{}' walks at {:?} m/s: over 0, to 10", self.name, self.speed));
+        }
+        if self.spin.is_some_and(|s| !s.is_finite() || s.abs() > 360.0) {
+            return Some(format!("bench '{}' spins at {:?} degrees a second: to 360", self.name, self.spin));
         }
         if self.sway.is_some_and(|s| !(0.0..=MAX_SWAY).contains(&s)) {
             return Some(format!("bench '{}' sways by {:?} m: 0 to {MAX_SWAY} m", self.name, self.sway));
@@ -143,8 +222,7 @@ impl BenchRig {
     /// The rig `seconds` into a swaying pose's sway (`BenchPose::sway`); a
     /// still pose's at any time.
     pub fn for_pose_at(pose: &BenchPose, seconds: f32) -> Self {
-        let eye = Vec3::from(pose.eye) + sway_offset(pose, seconds);
-        let dir = (Vec3::from(pose.at) - eye).normalize_or(Vec3::NEG_Z);
+        let (eye, dir) = view_at(pose, seconds);
         // `from_rotation_y(yaw) * -Z` is `(-sin yaw, 0, -cos yaw)`. Straight up
         // or down has no heading at all; any yaw is then right, so zero.
         let yaw = if dir.x * dir.x + dir.z * dir.z > 1e-10 { (-dir.x).atan2(-dir.z) } else { 0.0 };
@@ -163,6 +241,89 @@ impl BenchRig {
             head_rotation: Quat::from_rotation_y(yaw - rig) * Quat::from_rotation_x(pitch),
         }
     }
+}
+
+/// The legs of a pose's walk, each from one point to the next, `eye` first.
+fn walk_legs(pose: &BenchPose) -> Vec<(Vec3, Vec3)> {
+    let mut points = vec![Vec3::from(pose.eye)];
+    points.extend(pose.path.iter().flatten().map(|p| Vec3::from(*p)));
+    points.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// Where along its legs a walker `metres` from the start is, and the leg's
+/// heading there; held at either end.
+fn along(legs: &[(Vec3, Vec3)], metres: f32) -> (Vec3, Vec3) {
+    let mut left = metres.max(0.0);
+    for (a, b) in legs {
+        let len = (*b - *a).length();
+        if left <= len {
+            return (a.lerp(*b, left / len.max(1e-6)), (*b - *a) / len.max(1e-6));
+        }
+        left -= len;
+    }
+    let (a, b) = legs[legs.len() - 1];
+    (b, (b - a).normalize_or(Vec3::NEG_Z))
+}
+
+/// A pose's eye and where it looks, `seconds` in: the still view's; a
+/// swaying one's (`BenchPose::sway`); a walker's along its path
+/// (`BenchPose::path`); or the still view turned (`BenchPose::spin`).
+pub fn view_at(pose: &BenchPose, seconds: f32) -> (Vec3, Vec3) {
+    let (eye, dir) = view_at_level(pose, seconds);
+    // Facing back along the walk, and pitched (`BenchPose::backward`, `pitch`).
+    let dir = if pose.backward == Some(true) { Vec3::new(-dir.x, dir.y, -dir.z) } else { dir };
+    let dir = match pose.pitch {
+        Some(deg) if deg.is_finite() => {
+            let level = Vec3::new(dir.x, 0.0, dir.z).normalize_or(Vec3::NEG_Z);
+            let p = deg.clamp(-89.0, 89.0).to_radians();
+            level * p.cos() + Vec3::Y * p.sin()
+        }
+        _ => dir,
+    };
+    (eye, dir)
+}
+
+fn view_at_level(pose: &BenchPose, seconds: f32) -> (Vec3, Vec3) {
+    let still_eye = Vec3::from(pose.eye);
+    let still = (Vec3::from(pose.at) - still_eye).normalize_or(Vec3::NEG_Z);
+    if pose.path.is_some() {
+        let legs = walk_legs(pose);
+        let length: f32 = legs.iter().map(|(a, b)| (*b - *a).length()).sum();
+        let speed = pose.speed.unwrap_or(WALK_SPEED);
+        let walk = length / speed;
+        // Out, turn, back, turn.
+        let t = seconds.max(0.0) % (2.0 * (walk + TURN_SECONDS));
+        let (out, t) = if t < walk + TURN_SECONDS { (true, t) } else { (false, t - walk - TURN_SECONDS) };
+        // Looking a metre ahead along the way rounds each bend into a turn.
+        let facing = |metres: f32, forward: bool| {
+            let (here, heading) = along(&legs, metres);
+            let ahead = along(&legs, metres + if forward { LOOK_AHEAD } else { -LOOK_AHEAD }).0;
+            let to = ahead - here;
+            let level = Vec3::new(to.x, 0.0, to.z);
+            let fallback = Vec3::new(heading.x, 0.0, heading.z) * if forward { 1.0 } else { -1.0 };
+            (if level.length() > 0.05 { level } else { fallback }).normalize_or(Vec3::NEG_Z)
+        };
+        if t < walk {
+            let metres = if out { t * speed } else { length - t * speed };
+            return (along(&legs, metres).0, facing(metres, out));
+        }
+        // Turning round at the end it has reached, the short way by yaw.
+        let end = if out { length } else { 0.0 };
+        let (from, to) = (facing(end, out), facing(end, !out));
+        let yaw = |d: Vec3| (-d.x).atan2(-d.z);
+        let mut delta = (yaw(to) - yaw(from)).rem_euclid(std::f32::consts::TAU);
+        if delta > std::f32::consts::PI + 1e-3 {
+            delta -= std::f32::consts::TAU;
+        }
+        let turned = yaw(from) + delta * (t - walk) / TURN_SECONDS;
+        return (along(&legs, end).0, Vec3::new(-turned.sin(), 0.0, -turned.cos()));
+    }
+    if let Some(spin) = pose.spin {
+        let turn = Quat::from_rotation_y(spin.to_radians() * seconds);
+        return (still_eye, turn * still);
+    }
+    let eye = still_eye + sway_offset(pose, seconds);
+    (eye, (Vec3::from(pose.at) - eye).normalize_or(Vec3::NEG_Z))
 }
 
 /// Where a swaying pose's eye has glided to, `seconds` in: along the level
@@ -220,8 +381,35 @@ pub fn pin_xr_views(views: &mut [openxr::View], located: bool, rig: &BenchRig) {
 mod tests {
     use super::*;
 
+    /// A walk walked backward looking down: the eye moves along the path as
+    /// a forward walk's does, facing the other way, pitched down.
+    #[test]
+    fn a_walk_can_be_walked_backward_looking_down() {
+        let fwd = BenchPose { path: Some(vec![[0.0, 1.6, -10.0]]), speed: Some(1.0), ..pose([0.0, 1.6, 0.0], [0.0, 1.6, -5.0]) };
+        let back = BenchPose { backward: Some(true), pitch: Some(-60.0), ..fwd.clone() };
+        let (e0, d0) = view_at(&fwd, 2.0);
+        let (e1, d1) = view_at(&back, 2.0);
+        assert!((e0 - e1).length() < 1e-6, "the same place on the walk");
+        assert!(d0.z < -0.9 && d1.z > 0.4, "facing back: {d0} {d1}");
+        assert!((d1.y - (-60f32).to_radians().sin()).abs() < 1e-5, "pitched down: {d1}");
+    }
+
+    /// A view's doors held open, or swung shut-open-shut over its period.
+    #[test]
+    fn a_views_doors_are_held_or_swung() {
+        let held = BenchPose { doors: Some(vec![80.0, -60.0]), ..pose([0.0; 3], [1.0; 3]) };
+        assert_eq!(held.door_angles_at(3.7), Some(vec![80.0, -60.0]));
+        let swung = BenchPose { door_swing: Some(4.0), ..held.clone() };
+        assert_eq!(swung.door_angles_at(0.0), Some(vec![0.0, 0.0]));
+        let half = swung.door_angles_at(2.0).unwrap();
+        assert!((half[0] - 80.0).abs() < 1e-3 && (half[1] + 60.0).abs() < 1e-3);
+        assert!(pose([0.0; 3], [1.0; 3]).door_angles_at(1.0).is_none());
+        let parsed: BenchPose = serde_json::from_str(r#"{"name":"d","eye":[0,1,0],"at":[1,1,0],"doors":[80,80],"door_swing":2.5}"#).unwrap();
+        assert_eq!(parsed.door_swing, Some(2.5));
+    }
+
     fn pose(eye: [f32; 3], at: [f32; 3]) -> BenchPose {
-        BenchPose { name: "t".into(), eye, at, rig_yaw: None, sway: None, flashlight: None }
+        BenchPose { name: "t".into(), eye, at, rig_yaw: None, sway: None, path: None, speed: None, spin: None, flashlight: None, doors: None, door_swing: None, backward: None, pitch: None, body: None }
     }
 
     /// Through the same transform the app puts every tracked pose through:
@@ -287,6 +475,75 @@ mod tests {
         assert_eq!(BenchRig::for_pose_at(&pose(eye, at), 1.3), BenchRig::for_pose(&pose(eye, at)), "a still pose moved");
         assert!(BenchPose { sway: Some(-0.1), ..pose(eye, at) }.problem().is_some());
         assert!(BenchPose { sway: Some(f32::NAN), ..pose(eye, at) }.problem().is_some());
+    }
+
+    /// A walker goes from its eye through its points at its speed, looking
+    /// along its way; turns round at the end; comes back; and the rig is
+    /// under it all the way, never jumping.
+    #[test]
+    fn a_walker_goes_out_and_back_along_its_path_and_the_rig_goes_with_it() {
+        let walker = BenchPose { path: Some(vec![[10.0, 1.6, 0.0], [10.0, 2.6, 10.0]]), speed: Some(2.0), ..pose([0.0, 1.6, 0.0], [5.0, 1.6, 0.0]) };
+        assert_eq!(walker.problem(), None);
+        assert!(walker.moves() && !pose([0.0; 3], [1.0; 3]).moves());
+        // 20.05 m of path at 2 m/s.
+        let length = 10.0 + (101.0f32).sqrt();
+        let walk = length / 2.0;
+        let (eye, dir) = view_at(&walker, 0.0);
+        assert!((eye - Vec3::new(0.0, 1.6, 0.0)).length() < 1e-5 && (dir - Vec3::X).length() < 1e-4, "{eye} {dir}");
+        // Half-way down the first leg, heading along it.
+        let (eye, dir) = view_at(&walker, 2.5);
+        assert!((eye - Vec3::new(5.0, 1.6, 0.0)).length() < 1e-4 && (dir - Vec3::X).length() < 1e-4);
+        // On the second leg, climbing, the view level along it.
+        let (eye, dir) = view_at(&walker, 5.0 + 2.5);
+        assert!(eye.x == 10.0 && eye.y > 1.6 && eye.z > 4.0 && (dir - Vec3::Z).length() < 1e-4, "{eye} {dir}");
+        // At the end, turned half-way round after half the turn.
+        let (eye, dir) = view_at(&walker, walk + TURN_SECONDS * 0.5);
+        assert!((eye - Vec3::new(10.0, 2.6, 10.0)).length() < 1e-3 && dir.z.abs() < 1e-3 && dir.y == 0.0, "{eye} {dir}");
+        // Walking back, facing back.
+        let (eye, dir) = view_at(&walker, walk + TURN_SECONDS + 1.0);
+        assert!(eye.z < 10.0 && eye.z > 7.5 && (dir + Vec3::Z).length() < 1e-3, "{eye} {dir}");
+        // A whole cycle on, where it began.
+        let (eye, _) = view_at(&walker, 2.0 * (walk + TURN_SECONDS));
+        assert!((eye - Vec3::new(0.0, 1.6, 0.0)).length() < 1e-2);
+        // Never a jump: a 90th of a second moves the head under 3 cm and
+        // turns the view under 3 degrees, the whole way round.
+        let mut last = view_at(&walker, 0.0);
+        let mut k = 1;
+        while (k as f32) / 90.0 < 2.0 * (walk + TURN_SECONDS) {
+            let now = view_at(&walker, k as f32 / 90.0);
+            assert!((now.0 - last.0).length() < 0.03, "a step of {} m at {k}", (now.0 - last.0).length());
+            assert!(now.1.angle_between(last.1).to_degrees() < 3.0, "a turn of {} degrees at {k}", now.1.angle_between(last.1).to_degrees());
+            assert!((now.1.length() - 1.0).abs() < 1e-4);
+            last = now;
+            k += 1;
+        }
+        // The rig stands under the head and faces its way.
+        let rig = BenchRig::for_pose_at(&walker, 2.5);
+        assert!((rig.offset - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-4);
+        assert!((Quat::from_rotation_y(rig.yaw) * Vec3::NEG_Z - Vec3::X).length() < 1e-4);
+        // What cannot be walked says so.
+        assert!(BenchPose { path: Some(vec![]), ..pose([0.0; 3], [1.0; 3]) }.problem().is_some());
+        assert!(BenchPose { path: Some(vec![[0.0; 3]]), ..pose([0.0; 3], [1.0; 3]) }.problem().is_some());
+        assert!(BenchPose { path: Some(vec![[1.0, 0.0, 0.0]]), speed: Some(0.0), ..pose([0.0; 3], [1.0; 3]) }.problem().is_some());
+    }
+
+    /// A spin turns the still view about the vertical where it stands.
+    #[test]
+    fn a_spin_turns_the_view_on_the_spot() {
+        let spinner = BenchPose { spin: Some(90.0), ..pose([3.0, 1.6, 4.0], [3.0, 0.6, 3.0]) };
+        assert_eq!(spinner.problem(), None);
+        assert!(spinner.moves());
+        let (eye0, dir0) = view_at(&spinner, 0.0);
+        let (eye1, dir1) = view_at(&spinner, 1.0);
+        assert_eq!(eye0, eye1);
+        assert!((dir0.y - dir1.y).abs() < 1e-6, "its pitch is kept");
+        // A quarter turn to the left (counter-clockwise from above) in a second.
+        let flat = |d: Vec3| Vec3::new(d.x, 0.0, d.z).normalize();
+        assert!((flat(dir1) - Quat::from_rotation_y(std::f32::consts::FRAC_PI_2) * flat(dir0)).length() < 1e-4);
+        let (a, b) = (BenchRig::for_pose_at(&spinner, 0.0), BenchRig::for_pose_at(&spinner, 1.0));
+        assert_eq!(a.offset, b.offset);
+        assert!(((b.yaw - a.yaw).rem_euclid(std::f32::consts::TAU) - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        assert!(BenchPose { spin: Some(f32::NAN), ..pose([0.0; 3], [1.0; 3]) }.problem().is_some());
     }
 
     #[test]

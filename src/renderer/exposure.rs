@@ -106,6 +106,57 @@ pub const ADAPT_DARKER_STOPS_PER_S: f32 = 1.5;
 const CENTRE_WEIGHT_FLOOR: f32 = 0.1;
 const CENTRE_WEIGHT_POWER: f32 = 4.0;
 
+/// IN DAYLIGHT UNDER OPEN SKY THE EYE DOES NOT FOLLOW THE GAZE (2026-10-14).
+///
+/// Centre-weighted, the meter re-exposed by 0.8 stops as the player turned on
+/// the beach by the sea cave, from the sun's half of the sky to the other
+/// (user: "eye adaptation seems to happen outdoors in the sunlight when you
+/// face the cliff ... and then turn to face out into the water"). A real eye
+/// in daylight barely moves as it turns: its field is nearly a hemisphere and
+/// the open sky fills a large part of it whichever way it looks. Adaptation
+/// is visible going into a cave or a building, and at night round a lamp --
+/// which is where the head IS, not where it points.
+///
+/// So the gaze's lobe is blended toward one that is the same every way the
+/// head turns (`Lobe`) by how open to the sky the place is (the share of the
+/// photographs' solid angle that saw sky, `ProbeMeter::open`; outside every
+/// probe, all of it) times how much the sky is daylight (`EyeAdaptation::day`).
+/// A room with a doorway, a cave, and any night keep the gaze lobe.
+///
+/// Open sky share ramp: a room whose photographs see the sky through a door
+/// or two stays gaze-weighted; a place under half the sky is outdoors.
+const OPEN_SKY_FROM: f32 = 0.08;
+const OPEN_SKY_TO: f32 = 0.3;
+/// Daylight ramp, on the mean luminance of the sky's upper half: across the
+/// eye's own change from cone to mixed vision -- about 6 to 60 cd/m2 at the
+/// time of day's ~25,000 cd/m2 per engine unit (late civil twilight). Above
+/// it the eye is photopic and turning does not re-expose; below it a lamp in
+/// the dark is what the eye follows.
+const DAY_SKY_FROM: f32 = REFERENCE_LUMINANCE / 2000.0;
+const DAY_SKY_TO: f32 = REFERENCE_LUMINANCE / 200.0;
+/// The gaze-free lobe: `floor + max(0, cos)^4` averaged over every azimuth the
+/// head may face with the gaze level, `floor + 3/16 (1 - y^2)^2` -- the same
+/// weight the centre lobe gives the horizon band, on average, so the open
+/// ground's calibration (`REFERENCE_LUMINANCE`) keeps its meaning.
+const FREE_LOBE_SCALE: f32 = 3.0 / 16.0;
+
+/// The meter's weight by direction: the gaze's centre lobe, blended by `free`
+/// (0..1) toward the lobe every heading shares.
+#[derive(Clone, Copy, Debug)]
+struct Lobe {
+    gaze: Vec3,
+    free: f32,
+}
+
+impl Lobe {
+    fn weight(&self, d: Vec3) -> f32 {
+        let centre = d.dot(self.gaze).max(0.0).powf(CENTRE_WEIGHT_POWER);
+        let level = 1.0 - d.y * d.y;
+        let free = FREE_LOBE_SCALE * level * level;
+        CENTRE_WEIGHT_FLOOR + centre + (free - centre) * self.free
+    }
+}
+
 /// Luminance floor for the log average, so a black texel cannot drag the
 /// geometric mean to zero.
 const LOG_FLOOR: f32 = 1e-4;
@@ -150,6 +201,8 @@ struct ProbeMeter {
     /// What each bin's luminance is made of, so a changed sky and a changed
     /// daylight can be metered without the pixels: see [`EyeAdaptation::relight`].
     parts: Vec<BinParts>,
+    /// The share of the photograph's solid angle that saw open sky (0..1).
+    open: f32,
 }
 
 /// One bin's luminance by source: the surfaces the photograph saw, the share
@@ -178,12 +231,38 @@ pub struct EyeAdaptation {
     /// The ceiling on exposure: [`MAX_EXPOSURE`], unless a time-of-day sky
     /// lets the night in (`set_max_exposure`).
     max_exposure: f32,
+    /// How much the sky is daylight, 0..1: see [`OPEN_SKY_FROM`].
+    day: f32,
 }
 
 impl EyeAdaptation {
     /// No probes: meters the sky alone.
     pub fn sky_only(sky: SkyIrradiance) -> Self {
-        Self { meters: Vec::new(), portals: Vec::new(), sky, adapted_log2: None, max_exposure: MAX_EXPOSURE }
+        let day = sky_daylight(&sky);
+        Self { meters: Vec::new(), portals: Vec::new(), sky, adapted_log2: None, max_exposure: MAX_EXPOSURE, day }
+    }
+
+    /// How far the meter at `head` is the same whichever way the head turns
+    /// (0: centre-weighted on the gaze, 1: the same every heading). See
+    /// [`OPEN_SKY_FROM`].
+    pub fn gaze_free_share(&self, head: Vec3) -> f32 {
+        match self.room_at(head) {
+            Some(room) => self.free_in(room, head),
+            None => self.day,
+        }
+    }
+
+    /// [`Self::gaze_free_share`] in `room`: its photographs' open sky, nearest
+    /// first, times the daylight.
+    fn free_in(&self, room: u32, head: Vec3) -> f32 {
+        let near = |m: &ProbeMeter| 1.0 / m.centre.distance_squared(head).max(NEAREST_PROBE_FLOOR);
+        let (mut open, mut total) = (0.0f32, 0.0f32);
+        for m in self.meters.iter().filter(|m| m.room == room) {
+            open += near(m) * m.open;
+            total += near(m);
+        }
+        let open = if total > 0.0 { open / total } else { 1.0 };
+        smoothstep(OPEN_SKY_FROM, OPEN_SKY_TO, open) * self.day
     }
 
     /// Reduce each probe -- `(faces, resolution, where and what it is)`, as
@@ -211,7 +290,8 @@ impl EyeAdaptation {
         if let Some(texels) = super::uniforms::decode_probe_texels(faces, res) {
             let lamps = lamps.and_then(|l| super::uniforms::decode_probe_texels(l, res));
             let (bins, parts) = bin_probe_parts(&texels, lamps.as_deref(), res, &self.sky);
-            self.meters.push(ProbeMeter { centre: desc.centre, min: desc.min, max: desc.max, room: desc.volume, bins, parts });
+            let open = open_sky(&texels, res);
+            self.meters.push(ProbeMeter { centre: desc.centre, min: desc.min, max: desc.max, room: desc.volume, bins, parts, open });
         }
     }
 
@@ -232,6 +312,7 @@ impl EyeAdaptation {
                 bin.1 = surface + part.sky * ratio;
             }
         }
+        self.day = sky_daylight(&sky);
         self.sky = sky;
     }
 
@@ -295,8 +376,10 @@ impl EyeAdaptation {
         let log = match self.room_at(head) {
             Some(room) => self.room_log(room, head, gaze, extra),
             None => {
+                // Outside every photograph: under the open sky.
+                let lobe = Lobe { gaze, free: self.day };
                 let samples: Vec<(f32, f32)> =
-                    sky_bins(&self.sky).into_iter().chain(extra.iter().copied()).map(|b| weighted(b, gaze, 1.0, self.log_floor())).collect();
+                    sky_bins(&self.sky).into_iter().chain(extra.iter().copied()).map(|b| weighted(b, &lobe, 1.0, self.log_floor())).collect();
                 band_log(samples)
             }
         };
@@ -326,12 +409,13 @@ impl EyeAdaptation {
     /// [`Self::meter_with`]). `None` for a room with no photographs.
     fn room_log(&self, room: u32, head: Vec3, gaze: Vec3, extra: &[(Vec3, f32, f32)]) -> Option<f32> {
         let mut samples = Vec::new();
-        if !self.photographs(room, head, gaze, 1.0, &mut samples) {
+        let lobe = Lobe { gaze, free: self.free_in(room, head) };
+        if !self.photographs(room, head, &lobe, 1.0, &mut samples) {
             return None;
         }
-        for (beyond, share) in self.windows(room, head, gaze) {
+        for (beyond, share) in self.windows(room, head, &lobe) {
             let mut through = Vec::new();
-            if self.photographs(beyond, head, gaze, 1.0, &mut through) {
+            if self.photographs(beyond, head, &lobe, 1.0, &mut through) {
                 // The room beyond as the opening frames it: its light, in the
                 // weight the opening has here.
                 let total: f32 = through.iter().map(|s| s.1).sum();
@@ -340,14 +424,14 @@ impl EyeAdaptation {
                 }
             }
         }
-        samples.extend(extra.iter().map(|&b| weighted(b, gaze, 1.0, self.log_floor())));
+        samples.extend(extra.iter().map(|&b| weighted(b, &lobe, 1.0, self.log_floor())));
         band_log(samples)
     }
 
     /// `room`'s photographs as weighted log-luminance samples, each probe's
     /// weight `scale` times its share of `1 / max(d^2, floor)`: the nearest
     /// counts most. False for a room with none.
-    fn photographs(&self, room: u32, head: Vec3, gaze: Vec3, scale: f32, out: &mut Vec<(f32, f32)>) -> bool {
+    fn photographs(&self, room: u32, head: Vec3, lobe: &Lobe, scale: f32, out: &mut Vec<(f32, f32)>) -> bool {
         let near = |m: &ProbeMeter| 1.0 / m.centre.distance_squared(head).max(NEAREST_PROBE_FLOOR);
         let total: f32 = self.meters.iter().filter(|m| m.room == room).map(near).sum();
         if total <= 0.0 {
@@ -355,7 +439,7 @@ impl EyeAdaptation {
         }
         for m in self.meters.iter().filter(|m| m.room == room) {
             let k = scale * near(m) / total;
-            out.extend(m.bins.iter().map(|&b| weighted(b, gaze, k, self.log_floor())));
+            out.extend(m.bins.iter().map(|&b| weighted(b, lobe, k, self.log_floor())));
         }
         true
     }
@@ -365,7 +449,7 @@ impl EyeAdaptation {
     /// photograph's bins, whose weights sum to about 2.5 for a whole view.
     /// The opening is taken at the far face of the doorway's box, so it
     /// fills the view as the head reaches it.
-    fn windows(&self, room: u32, head: Vec3, gaze: Vec3) -> Vec<(u32, f32)> {
+    fn windows(&self, room: u32, head: Vec3, lobe: &Lobe) -> Vec<(u32, f32)> {
         let mut out = Vec::new();
         for p in &self.portals {
             let a = p.axis.min(2) as usize;
@@ -393,7 +477,7 @@ impl EyeAdaptation {
             let mut middle = (p.min + p.max) * 0.5;
             middle[a] = plane;
             let toward = (middle - at).normalize_or_zero();
-            let share = omega * (CENTRE_WEIGHT_FLOOR + toward.dot(gaze).max(0.0).powf(CENTRE_WEIGHT_POWER));
+            let share = omega * lobe.weight(toward);
             if share > 0.0 {
                 out.push((beyond, share));
             }
@@ -439,11 +523,38 @@ pub fn exposure_for_up_to(luminance: f32, max: f32) -> f32 {
 /// surface is ~1e-8 engine units.
 const NIGHT_LOG_FLOOR: f32 = 1e-10;
 
-/// A bin as a weighted log-luminance sample: its solid angle, centre-weighted
-/// toward `gaze`, times `k`.
-fn weighted((d, lum, omega): (Vec3, f32, f32), gaze: Vec3, k: f32, floor: f32) -> (f32, f32) {
-    let w = k * omega * (CENTRE_WEIGHT_FLOOR + d.dot(gaze).max(0.0).powf(CENTRE_WEIGHT_POWER));
+/// A bin as a weighted log-luminance sample: its solid angle, weighted by
+/// `lobe`, times `k`.
+fn weighted((d, lum, omega): (Vec3, f32, f32), lobe: &Lobe, k: f32, floor: f32) -> (f32, f32) {
+    let w = k * omega * lobe.weight(d);
     (lum.max(floor).ln(), w)
+}
+
+/// The share of a photograph's solid angle that saw open sky (alpha < 1).
+fn open_sky(texels: &[[f32; 4]], res: u32) -> f32 {
+    let (mut open, mut total) = (0.0f32, 0.0f32);
+    for (i, t) in texels.iter().enumerate() {
+        let r = i as u32 % (res * res);
+        let (a, b) = (2.0 * ((r % res) as f32 + 0.5) / res as f32 - 1.0, 2.0 * ((r / res) as f32 + 0.5) / res as f32 - 1.0);
+        let omega = (1.0 + a * a + b * b).powf(-1.5);
+        open += (1.0 - t[3].clamp(0.0, 1.0)) * omega;
+        total += omega;
+    }
+    if total > 0.0 { open / total } else { 0.0 }
+}
+
+/// How much `sky` is daylight, 0..1, from the mean luminance of its upper
+/// half: see [`DAY_SKY_FROM`].
+fn sky_daylight(sky: &SkyIrradiance) -> f32 {
+    let (mut sum, mut omega) = (0.0f32, 0.0f32);
+    for (d, l, w) in sky_bins(sky) {
+        if d.y > 0.0 {
+            sum += l * w;
+            omega += w;
+        }
+    }
+    let mean = if omega > 0.0 { sum / omega } else { 0.0 };
+    smoothstep(DAY_SKY_FROM.ln(), DAY_SKY_TO.ln(), mean.max(1e-12).ln())
 }
 
 /// The solid angle of a rectangle `ahead` metres in front of a point, its
@@ -778,14 +889,92 @@ mod tests {
         assert!((eye.adapted_luminance().unwrap() / night - 1.0).abs() < 0.01);
     }
 
+    /// In a room, and under a night sky, what the head points at counts most.
     #[test]
     fn looking_at_the_bright_side_meters_brighter() {
-        // A sky twice as bright on +x as on -x.
-        let mut sky = SkyIrradiance::flat(0.2);
-        sky.sh[3] = [0.3, 0.3, 0.3]; // L11: the x band
-        let eye = EyeAdaptation::sky_only(sky);
+        // A room photographed twice as bright on +x as on -x, under a day sky.
+        let room = faces(16, |d| 0.05 * (1.0 + 0.5 * d.x));
+        let mut eye = EyeAdaptation::sky_only(SkyIrradiance::flat(0.5));
+        eye.add_probe(&room, 16, &desc(Vec3::ZERO, Vec3::splat(-5.0), Vec3::splat(5.0), 0, true));
         let toward = eye.meter(Vec3::ZERO, Vec3::X);
         let away = eye.meter(Vec3::ZERO, Vec3::NEG_X);
-        assert!(toward > away * 1.2, "centre-weighting ignored the gaze: {toward} vs {away}");
+        assert!(toward > away * 1.2, "centre-weighting ignored the gaze in a room: {toward} vs {away}");
+        // A night sky twice as bright on +x as on -x.
+        let mut night = SkyIrradiance::flat(2e-5);
+        night.sh[3] = [3e-5, 3e-5, 3e-5]; // L11: the x band
+        let mut eye = EyeAdaptation::sky_only(night);
+        eye.set_max_exposure(2e5);
+        let toward = eye.meter(Vec3::ZERO, Vec3::X);
+        let away = eye.meter(Vec3::ZERO, Vec3::NEG_X);
+        assert!(toward > away * 1.2, "centre-weighting ignored the gaze at night: {toward} vs {away}");
+    }
+
+    /// A probe's faces as `faces`, the texels whose direction `open` picks
+    /// seeing sky (alpha 0).
+    fn faces_open(res: u32, lum: impl Fn(Vec3) -> f32, open: impl Fn(Vec3) -> bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        for face in 0..6usize {
+            for y in 0..res {
+                for x in 0..res {
+                    let d = crate::renderer::probe_prefilter::texel_direction(
+                        face,
+                        (x as f32 + 0.5) / res as f32,
+                        (y as f32 + 0.5) / res as f32,
+                    );
+                    let (l, a) = if open(d) { (0.0, 0.0) } else { (lum(d), 1.0) };
+                    for v in [l, l, l, a] {
+                        out.extend_from_slice(&crate::renderer::sky::f32_to_f16(v).to_le_bytes());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// IN DAYLIGHT UNDER OPEN SKY, TURNING DOES NOT RE-EXPOSE: on the beach
+    /// by the sea cave the eye re-exposed 0.8 stops between facing the
+    /// sun's half of the sky and the other (user, 2026-10-14), outside every
+    /// photograph and inside the open ground's alike. Fails on the
+    /// centre-weighted meter.
+    #[test]
+    fn in_daylight_under_open_sky_turning_does_not_re_expose() {
+        // A day sky twice as bright on +x as on -x.
+        let mut sky = SkyIrradiance::flat(0.4);
+        sky.sh[3] = [0.6, 0.6, 0.6];
+        let outside = EyeAdaptation::sky_only(sky);
+        // Open ground: sky above, a dark cliff on -x, bright sand below.
+        let ground = faces_open(16, |d| if d.x < -0.5 { 0.03 } else { 0.3 }, |d| d.y > 0.0 && d.x > -0.5);
+        let mut open = EyeAdaptation::sky_only(sky);
+        open.add_probe(&ground, 16, &desc(Vec3::new(0.0, 2.0, 0.0), Vec3::splat(-20.0), Vec3::splat(20.0), 0, true));
+        assert!(open.gaze_free_share(Vec3::new(0.0, 1.6, 0.0)) > 0.99);
+        for (name, eye) in [("outside every probe", &outside), ("on open ground", &open)] {
+            let head = Vec3::new(0.0, 1.6, 0.0);
+            let looks: Vec<f32> = (0..16)
+                .map(|i| {
+                    let a = i as f32 * std::f32::consts::TAU / 16.0;
+                    eye.meter(head, Vec3::new(a.cos(), -0.1, a.sin()))
+                })
+                .collect();
+            let (lo, hi) = looks.iter().fold((f32::MAX, 0.0f32), |(lo, hi), &m| (lo.min(m), hi.max(m)));
+            assert!((hi / lo).log2() < 0.02, "{name}: {:.3} stops as the head turns: {looks:?}", (hi / lo).log2());
+            // And looking up or down a little changes it little.
+            let down = eye.meter(head, Vec3::new(1.0, -0.6, 0.0));
+            assert!((down / hi).log2().abs() < 0.3, "{name}: looking down {down} vs {hi}");
+        }
+    }
+
+    /// A ROOM THAT SEES THE SKY ONLY THROUGH A DOOR stays centre-weighted:
+    /// adaptation going into a building or a cave, and looking out of one,
+    /// is real.
+    #[test]
+    fn a_room_with_a_door_to_the_sky_still_follows_the_gaze() {
+        let mut sky = SkyIrradiance::flat(0.4);
+        sky.sh[3] = [0.6, 0.6, 0.6];
+        // A dim room whose +x wall has a door to the sky: 1.5% of its view.
+        let room = faces_open(16, |_| 0.01, |d| d.x > 0.9 && d.y.abs() < 0.12 && d.z.abs() < 0.12);
+        let mut eye = EyeAdaptation::sky_only(sky);
+        eye.add_probe(&room, 16, &desc(Vec3::ZERO, Vec3::splat(-5.0), Vec3::splat(5.0), 0, true));
+        assert!(eye.gaze_free_share(Vec3::ZERO) < 1e-3);
+        assert!(eye.meter(Vec3::ZERO, Vec3::X) > 2.0 * eye.meter(Vec3::ZERO, Vec3::NEG_X));
     }
 }

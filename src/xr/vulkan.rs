@@ -281,6 +281,95 @@ impl VkContext {
             // half-precision maths' control in one build (`shader_precision`).
             // `adb shell setprop debug.spacesoup.nof16 1`.
             && system_property(c"debug.spacesoup.nof16") != "1";
+        // MEASUREMENT: the ground's shaders pinned to the build with the
+        // weights' choice in it (`0`, the control) or to the painted build
+        // (`1`), from the next launch -- `adb shell setprop
+        // debug.spacesoup.painted 0`. Unset, the level decides. See
+        // `terrain_pipeline::GROUND_PAINTED`. `expect0` is not a pin: it
+        // overrides the app's guess with "unpainted", so a painted level
+        // rebuilds the ground's pipelines as it loads -- the rebuild
+        // (`XrRenderer::ground_for_level`) exercised on a level that would
+        // otherwise never take it.
+        match system_property(c"debug.spacesoup.painted").as_str() {
+            "0" => crate::renderer::terrain_pipeline::pin_ground_build(false),
+            "1" => crate::renderer::terrain_pipeline::pin_ground_build(true),
+            "expect0" => crate::renderer::terrain_pipeline::expect_painted_ground(false),
+            _ => {}
+        }
+        // MEASUREMENT: `adb shell setprop debug.spacesoup.chunks 16` cuts the
+        // ground into that many chunks a side from the next launch. See
+        // `ground_horizon::CHUNKS_A_SIDE`.
+        if let Ok(n) = system_property(c"debug.spacesoup.chunks").parse::<u32>() {
+            crate::renderer::ground_horizon::CHUNKS_A_SIDE.store(n.min(64), std::sync::atomic::Ordering::Relaxed);
+        }
+        // `adb shell setprop debug.spacesoup.groundlod 0` before a launch: a
+        // level's load builds no coarser lists (they are about 1.4 times the
+        // ground's step-1 indices), so `Levers::ground_lod` has nothing to
+        // draw by and the ground is step 1 everywhere. Unset, the lists are
+        // built (the default since 2026-10-14). See `ground_lod::LISTS`.
+        // MEASUREMENT: `adb shell setprop debug.spacesoup.groundlodmrad 2.4`
+        // before a launch: the error a coarser ground may show, milliradians
+        // (1.2, a pixel, unset). See `ground_lod::TOLERANCE`.
+        if let Ok(mrad) = system_property(c"debug.spacesoup.groundlodmrad").parse::<f32>() {
+            if mrad > 0.0 {
+                crate::renderer::ground_lod::TOLERANCE.store((mrad * 1e-3).to_bits(), std::sync::atomic::Ordering::Relaxed);
+                log::info!("GROUNDLOD: a coarser ground may stand {mrad} mrad from step 1");
+            }
+        }
+        // `adb shell setprop debug.spacesoup.groundshape 0` before a launch:
+        // the ground shaded by its vertices, no step-1 shape bound (the A/B
+        // of the shape's cost). See `ground_shape::ENABLED`.
+        if system_property(c"debug.spacesoup.groundshape") == "0" {
+            crate::renderer::ground_shape::ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("GROUNDSHAPE: off -- the ground shaded by its vertices");
+        }
+        // `adb shell setprop debug.spacesoup.groundblocks 0` before a launch:
+        // each step-1 chunk of the ground its own runs, as until 2026-10-14,
+        // not a block's chunks bucket by bucket. See `ground_lod::BLOCK_ORDER`.
+        if system_property(c"debug.spacesoup.groundblocks") == "0" {
+            crate::renderer::ground_lod::BLOCK_ORDER.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("GROUNDBLOCKS: off -- each chunk its own runs");
+        }
+        if system_property(c"debug.spacesoup.groundlod") == "0" {
+            crate::renderer::ground_lod::LISTS.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("GROUNDLOD: off -- no coarser lists built; the ground is step 1 everywhere");
+        }
+        // MEASUREMENT: `adb shell setprop debug.spacesoup.opaque 0` builds the
+        // scene's ground pipelines WITH blending, as they were until
+        // 2026-10-13, from the next launch. See `terrain_pipeline::OPAQUE_GROUND`.
+        if system_property(c"debug.spacesoup.opaque") == "0" {
+            crate::renderer::terrain_pipeline::OPAQUE_GROUND.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("OPAQUE: off -- the scene's ground is drawn with blending");
+        }
+        // THE GROUND IN THE WORLD, posed by its vertex shaders, unless
+        // `adb shell setprop debug.spacesoup.worldground 0` before a launch
+        // keeps the app posing every vertex as it did until 2026-10-13. Set
+        // here, before any ground pipeline is built. See
+        // `terrain_pipeline::WORLD_GROUND`.
+        let world_ground = system_property(c"debug.spacesoup.worldground") != "0";
+        // THE TORCH'S PUDDLE READERS WALK THE SKY, unless `adb shell setprop
+        // debug.spacesoup.torchskywalk 0` before a launch builds them with its
+        // two calls. See `ground_twins::TORCH_WEATHER_SKY_WALK`.
+        // THE WET BODY TRACED AS BEFORE: `adb shell setprop
+        // debug.spacesoup.bodyfilmtraced 1`. See `mesh_pipeline::SKINNED_FILM_TRACED`.
+        if system_property(c"debug.spacesoup.bodyfilmtraced") == "1" {
+            crate::renderer::mesh_pipeline::SKINNED_FILM_TRACED.store(true, std::sync::atomic::Ordering::Relaxed);
+            log::info!("BODYFILMTRACED: on -- the wet body traces the rooms' reflections");
+        }
+        if system_property(c"debug.spacesoup.torchskywalk") == "0" {
+            crate::renderer::ground_twins::TORCH_WEATHER_SKY_WALK.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("TORCHSKYWALK: off -- the torch-lit weather twins read the sky twice");
+        }
+        crate::renderer::terrain_pipeline::WORLD_GROUND.store(world_ground, std::sync::atomic::Ordering::Relaxed);
+        // THE BRUSHES IN THE WORLD, posed by their vertex shaders. Set here,
+        // before any brush pipeline is built. See
+        // `brush_pipeline::WORLD_BRUSHES` and [`WORLD_BRUSHES_BY_DEFAULT`].
+        let world_brushes = match system_property(c"debug.spacesoup.worldbrushes").as_str() {
+            "0" => false,
+            "1" => true,
+            _ => crate::renderer::static_brush::WORLD_BRUSHES_BY_DEFAULT,
+        };
+        crate::renderer::brush_pipeline::WORLD_BRUSHES.store(world_brushes, std::sync::atomic::Ordering::Relaxed);
         // PIPELINE STATISTICS, when asked for. See `PIPELINE_STATISTICS_PROPERTY`.
         let statistics_extension_available = unsafe {
             vk_instance

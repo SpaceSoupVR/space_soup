@@ -497,6 +497,11 @@ pub struct UniformBuffer {
     /// idle while the rest was recorded (2026-09-30).
     pub twin_buffer: Buffer,
     pub twin_bind_group: BindGroup,
+    /// A SECOND TWIN, the planar water mirror's (`planar_water`): its pass
+    /// is drawn in the same eye's encoder as the floor mirror's, and a write
+    /// lands before the encoder runs, so the two cannot share one buffer.
+    pub planar_buffer: Buffer,
+    pub planar_bind_group: BindGroup,
     /// Which reflection probes this scene has. See [`ProbeUpload`].
     probes: ProbeUpload,
     /// The probes' per-texel distances, bound at 8. Zero until a level with
@@ -561,6 +566,13 @@ impl UniformBuffer {
     /// player walked (headset, 2026-10-02). See [`push_slots`].
     pub fn probe_push(&self, probes: Option<&ProbeUpload>) -> [[f32; 4]; MAX_PROBES] {
         push_slots(probes.unwrap_or(&self.probes))
+    }
+
+    /// The probe table a pass's camera block is written with: `probes`, or --
+    /// `None` -- the table `set_probes` gave. For what the CPU decides from
+    /// the same table the shader reads (`outdoor_pass`).
+    pub fn probes_or_level<'a>(&'a self, probes: Option<&'a ProbeUpload>) -> &'a ProbeUpload {
+        probes.unwrap_or(&self.probes)
     }
 
     /// The probes the last [`Self::rebind_probes`] or [`Self::set_probes`] set.
@@ -830,6 +842,12 @@ impl UniformBuffer {
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let planar_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("uniform_buf_planar"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let group = |buffer: &Buffer, label: &str| {
             scene_bind_group(
                 device,
@@ -852,6 +870,7 @@ impl UniformBuffer {
         };
         let bind_group = group(&buffer, "uniform_bg");
         let twin_bind_group = group(&twin_buffer, "uniform_bg_twin");
+        let planar_bind_group = group(&planar_buffer, "uniform_bg_planar");
 
         Self {
             buffer,
@@ -859,6 +878,8 @@ impl UniformBuffer {
             bind_group,
             twin_buffer,
             twin_bind_group,
+            planar_buffer,
+            planar_bind_group,
             probes: ProbeUpload::default(),
             probe_depth_view,
             probe_depth_sampler,
@@ -1039,7 +1060,9 @@ impl UniformBuffer {
             // zeroed uniform does not make room 0 the outdoors. See `ProbeUpload`.
             portal_params: [
                 probes.portal_count as f32,
-                if probes.no_trace { 1.0 } else { 0.0 },
+                // y: 1 the trace off; -1 open ground reflecting the outdoors
+                // (`ProbeUpload::open_ground`); 0 neither.
+                probes.trace_word(),
                 dense.outdoor_volume + 1.0,
                 probes.building_count as f32,
             ],
@@ -1270,6 +1293,12 @@ pub struct ProbeUpload {
     /// Skip the probe depth trace this frame: `perf_ab` measures its cost by
     /// turning it off. Rides in `portal_params.y`, which was unused.
     pub no_trace: bool,
+    /// OPEN GROUND REFLECTS THE OUTDOORS (`Levers::open_reflections`): a
+    /// ground pixel in no room and no doorway is traced as out of doors
+    /// where it lies, instead of answering nothing. Rides in
+    /// `portal_params.y` as -1 (nothing while the trace is off). See
+    /// `PROBE_OPEN_GROUND` in the lights block.
+    pub open_ground: bool,
     /// How many of `proxies` are live. Never more than [`MAX_PROXIES`].
     pub proxy_count: u32,
     /// WHAT STANDS IN THE ROOMS NEAR THE PLAYER: `[centre.xyz, volume]`,
@@ -1605,6 +1634,21 @@ pub const NO_RESIDENT_ROOM: f32 = 1_000_000.0;
 /// Rows of [`Uniforms::probe_rooms`]: six blocks of sixteen entries.
 pub const ROOM_TABLE_ROWS: usize = 24;
 
+impl ProbeUpload {
+    /// What `portal_params.y` tells the reflection trace: 1 off (`no_trace`),
+    /// -1 on with open ground reflecting the outdoors (`open_ground`), 0 on.
+    /// Off wins: with no trace there is no outdoor answer to give.
+    pub fn trace_word(&self) -> f32 {
+        if self.no_trace {
+            1.0
+        } else if self.open_ground {
+            -1.0
+        } else {
+            0.0
+        }
+    }
+}
+
 impl Default for ProbeUpload {
     fn default() -> Self {
         Self {
@@ -1613,6 +1657,7 @@ impl Default for ProbeUpload {
             portal_count: 0,
             portals: [[[0.0; 4]; 3]; MAX_PORTALS],
             no_trace: false,
+            open_ground: false,
             proxy_count: 0,
             proxies: [[[0.0; 4]; 3]; MAX_PROXIES],
             outdoor_volume: -1.0,
@@ -2072,6 +2117,7 @@ impl UniformBuffer {
         };
         self.bind_group = group(&self.buffer, "uniform_bg");
         self.twin_bind_group = group(&self.twin_buffer, "uniform_bg_twin");
+        self.planar_bind_group = group(&self.planar_buffer, "uniform_bg_planar");
         self.probes = probes;
     }
 }

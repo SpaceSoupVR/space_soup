@@ -81,12 +81,34 @@ pub struct TerrainMaterialUniform {
     /// leaves it wet, over `wet_band` metres above it. Off far below.
     pub wet_line: f32,
     pub wet_band: f32,
+    /// UNDER STILL WATER: ground below this world y lies under a sea or a
+    /// lake's still surface and is soaked ([`SEA_LINE_WGSL`]). Off far below.
+    /// Above it a beach is wetted by the wash, which moves: that is the
+    /// weather's (`weather::AreaParams::shore`).
+    pub sea_line: f32,
+    /// WET GROUND, per layer (`weather::wet_ground`): how far soaking darkens
+    /// it, 0..1 -- how much of the wet-surface law it takes: open-grained sand
+    /// and soil all of it, dense rock a third.
+    pub porosity: [f32; 4],
+    /// And how much of it a film of water covers once it is soaked, 0..1: its
+    /// gloss. Packed sand and bare rock hold a film nearly all over; a lawn
+    /// hardly any, its blades standing through it (at 0.3 roughness a wet lawn
+    /// lost its sheen and drew the hill's horizon across itself,
+    /// `docs/weather-2026-10-07.md`).
+    pub film: [f32; 4],
+    /// THE GROUND'S SHAPE (`ground_shape`): the cells its footprint uv runs
+    /// over along x and z, then one over the metres of a cell along each. All 0 where
+    /// the material has no shape bound: the ground then shades by its
+    /// interpolated vertex normals and its drawn triangles, as it did.
+    pub shape: [f32; 4],
     /// THE GROUND'S RELIEF, in metres, by parallax occlusion: each layer's
     /// height map (the green channel of its occlusion image, see
     /// `load_terrain_ao`) is marched along the view so a rut's far wall
     /// shows and its near wall hides, as it does on a real field. 0 turns
     /// it off and skips every step; the Quest leaves it at 0.
     pub parallax: f32,
+    /// Pads the struct to the WGSL uniform's 16-byte size.
+    pub relief_pad: [f32; 3],
 }
 
 impl Default for TerrainMaterialUniform {
@@ -104,19 +126,216 @@ impl Default for TerrainMaterialUniform {
             normal_strength: 1.0,
             wet_line: -1e9,
             wet_band: 1.0,
+            sea_line: -1e9,
+            // By the layers' roles: ground (a lawn), rock, high ground (scree
+            // and dry grass), sediment (sand).
+            porosity: WET_POROSITY,
+            film: WET_FILM,
+            shape: [0.0; 4],
             parallax: 0.0,
+            relief_pad: [0.0; 3],
         }
     }
 }
 
+/// GROUND UNDER STILL WATER IS SOAKED: below `mat.sea_line`, darkened by the
+/// wet-surface law as far as its layers take water in (`weather::wet_albedo`,
+/// written as the weather's twin writes it, its numbers `weather::WET_BACK`
+/// and `WET_OUT` -- a test holds them equal), whole from five centimetres
+/// under the line. No film's gloss: there is no surface of air over it. The
+/// one line of the ground's shader that is the sea's; its weather twin takes
+/// it out, and reads the same from the shore's layer of the weather map
+/// (`weather::with_weather`).
+pub(crate) const SEA_LINE_WGSL: &str = "    // UNDER STILL WATER the ground is soaked: see `SEA_LINE_WGSL`.
+    let sea_in = dot(w, mat.porosity) * clamp((mat.sea_line - in.tex_pos.y) * 20.0, 0.0, 1.0);
+    let sea_back = 0.435 * albedo;
+    albedo = albedo * ((1.0 - sea_in * 0.446) + (sea_in * 0.554) * (sea_back * sea_back + sea_back));
+";
+
+/// The layers' response to water where `settings.json` gives none: by their
+/// roles -- ground (a lawn), rock, high ground (scree and dry grass), sediment
+/// (sand). See [`TerrainMaterialUniform::porosity`].
+pub const WET_POROSITY: [f32; 4] = [0.85, 0.35, 0.7, 1.0];
+pub const WET_FILM: [f32; 4] = [0.12, 0.75, 0.3, 0.9];
+
 pub struct TerrainPipeline {
+    /// WITHOUT the step-1 shape read (`ground_shape::unshaped`): what a run
+    /// of step-1 triangles is drawn with. A step-1 triangle is the lattice
+    /// triangle, so its vertex normal is the shape there, exactly; and the
+    /// read compiled into a reader cost it even with its branch never taken
+    /// (Quest 3, 2026-10-15: cave_back_out 28.27 -> 25.61 ms with the read
+    /// dead-stripped, outdoors_field 18.42 -> 17.36 -- registers, not the
+    /// loads).
     pub pipeline: RenderPipeline,
+    /// WITH the read: what a run from the coarser lists is drawn with
+    /// ([`Self::at`]). `None` for a source without it (the weather's twins,
+    /// which are built unshaped).
+    pub shaped: Option<RenderPipeline>,
     pub material_layout: BindGroupLayout,
 }
 
+/// THE GROUND'S RELIEF (parallax occlusion, `TerrainMaterialUniform::parallax`),
+/// for the DESKTOP renderer's ground only: `with_relief` adds it to a ground
+/// shader. The headset's readers are built without it, so its march costs
+/// them nothing compiled in.
+const RELIEF_WGSL: &str = r#"
+// The layers' blended height under a planar uv, 0 at the bottom of the
+// relief and 1 at the top, from the green of the occlusion array (see
+// `load_terrain_ao`). Explicit gradients, so it may be read inside the march.
+// The height of ONE layer -- the heaviest under the pixel. The march reads
+// it ten-odd times a pixel, so a blend of four here cost four times the
+// taps for a difference only visible at a paint boundary, where the relief
+// of the layer taking over is the right one to show anyway.
+fn layers_height(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, layer: i32) -> f32 {
+    let r = max(mat.repeat[layer], 0.001);
+    return textureSampleGrad(ao_tex, layer_samp, uv / r, layer, ddx / r, ddy / r).g;
+}
+
+// Which layer carries the most weight under the pixel.
+fn dominant_layer(w: vec4<f32>) -> i32 {
+    var best = 0;
+    var bw = w.x;
+    if (w.y > bw) { best = 1; bw = w.y; }
+    if (w.z > bw) { best = 2; bw = w.z; }
+    if (w.w > bw) { best = 3; }
+    return best;
+}
+
+// THE GROUND'S RELIEF, by parallax occlusion. The view ray is marched down
+// into `relief` metres of height field in even steps of depth, and where it
+// first passes under the surface is where the eye really lands: the far
+// wall of a rut comes forward, its near wall hides, a clod's top covers the
+// ground behind it. Returns how far across the ground (metres) the sample
+// point moves. More steps at a grazing view, where the ray crosses more
+// ground per step and would otherwise step through thin ridges.
+fn parallax_shift(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, w: vec4<f32>, eye: vec3<f32>, relief: f32) -> vec2<f32> {
+    let up = max(eye.y, 0.12);
+    let slide = -eye.xz / up;
+    let steps = mix(6.0, 14.0, 1.0 - up);
+    let layer = dominant_layer(w);
+    let layer_d = relief / steps;
+    let step_uv = slide * layer_d;
+    var cur_uv = uv;
+    var cur_depth = 0.0;
+    var surf = (1.0 - layers_height(cur_uv, ddx, ddy, layer)) * relief;
+    var prev_uv = uv;
+    var prev_depth = 0.0;
+    var prev_surf = surf;
+    for (var i = 0; i < 14; i++) {
+        if (cur_depth >= surf || f32(i) >= steps) {
+            break;
+        }
+        prev_uv = cur_uv;
+        prev_depth = cur_depth;
+        prev_surf = surf;
+        cur_uv = cur_uv + step_uv;
+        cur_depth = cur_depth + layer_d;
+        surf = (1.0 - layers_height(cur_uv, ddx, ddy, layer)) * relief;
+    }
+    // Where the ray crossed between the last two samples.
+    let after = surf - cur_depth;
+    let before = prev_surf - prev_depth;
+    let t = clamp(before / max(before - after, 1e-5), 0.0, 1.0);
+    return mix(prev_uv, cur_uv, t) - uv;
+}
+
+// How far the relief is marched, in metres: fully to 18 m, gone by 30 m,
+// where a rut is under a pixel anyway and the normal map alone carries it.
+const PARALLAX_NEAR_M: f32 = 18.0;
+const PARALLAX_FAR_M: f32 = 30.0;
+
+"#;
+
+/// A ground shader with [`RELIEF_WGSL`] in it: the march before
+/// `sample_frame` and the planar point it lands on handed to it. `None` if
+/// the shader no longer reads as expected.
+pub fn with_relief(src: &str) -> Option<String> {
+    let call = "    let f = sample_frame(in.tex_pos, n, step_x, step_y, to_player_direction(shape.face), shape.shaped);\n";
+    if src.matches(call).count() != 1 || src.matches("\nfn sample_frame(").count() != 1 {
+        return None;
+    }
+    let marched = "    let relief_ddx = dpdx(in.tex_pos.xz);\n    let relief_ddy = dpdy(in.tex_pos.xz);\n    var relief_pos = in.tex_pos;\n    let relief = mat.parallax * (1.0 - smoothstep(PARALLAX_NEAR_M, PARALLAX_FAR_M, distance(in.world_pos, cam_pos())))\n        * select(1.0, 0.0, slope_deg >= mat.biplanar_start_deg);\n    if (relief > 0.0005) {\n        let shift = parallax_shift(in.tex_pos.xz, relief_ddx, relief_ddy, w, to_world_direction(normalize(cam_pos() - in.world_pos)), relief);\n        relief_pos = vec3<f32>(relief_pos.x + shift.x, relief_pos.y, relief_pos.z + shift.y);\n    }\n    let f = sample_frame(relief_pos, n, step_x, step_y, to_player_direction(shape.face), shape.shaped);\n";
+    Some(src.replacen(call, marched, 1).replacen("\nfn sample_frame(", &format!("\n{RELIEF_WGSL}\nfn sample_frame("), 1))
+}
+
+/// How many ground pipelines were built twice, shaped and not
+/// ([`TerrainPipeline::shaped`]): the start-up cost of the twins, logged.
+pub static SHAPED_TWINS_BUILT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A ground shader's two pipelines' sources ([`TerrainPipeline::shaped`]):
+/// the step-1 twin, without the shape read (`ground_shape::unshaped`), and
+/// the source as given when it reads the shape at all (`None` when it does
+/// not: the weather's twins).
+pub fn twin_sources(source: String) -> (String, Option<String>) {
+    match crate::renderer::ground_shape::unshaped(&source) {
+        Some(plain) => (plain, Some(source)),
+        None => (source, None),
+    }
+}
+
+/// A run of the ground's buffer `first..first + len` cut where the coarser
+/// lists begin (`coarse_from`, the buffer index of the first list index past
+/// step 1's): `(first, len, coarse)` of each part, step 1's first. The one
+/// rule every pass draws its ground by, so that a step-1 run is never drawn
+/// with a shaped pipeline and a coarse one never without.
+pub fn by_step(first: u32, len: u32, coarse_from: u32) -> impl Iterator<Item = (u32, u32, bool)> {
+    let cut = coarse_from.clamp(first, first + len);
+    [(first, cut - first, false), (cut, first + len - cut, true)].into_iter().filter(|p| p.1 > 0)
+}
+
+/// THE SCENE'S GROUND IS DRAWN WITHOUT BLENDING. Its shader writes alpha 1
+/// (one `return`, a literal; `the_grounds_scene_shaders_write_alpha_one`), so
+/// a blend kept nothing of the target -- but a blended draw does not write
+/// the GPU's coarse depth, so nothing drawn after the ground was rejected
+/// there against it. Quest 3, 2026-10-13, one build launched both ways
+/// (`bench/shader_opt_1012/r13/opaque{0,1}.log`): cave_back_out 30.82 ->
+/// 25.77 ms, cave_mouth 31.72 -> 29.71, snow_hills -0.30, the other five
+/// views tried -0.0 to -0.12. `false` builds it blended as it always was:
+/// `adb shell setprop debug.spacesoup.opaque 0` before a launch on the
+/// headset, `OPAQUE_GROUND=0` in the offline harness. See `build_from_with`.
+pub static OPAQUE_GROUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// THE GROUND'S VERTICES ARE THE WORLD'S (`true`), posed into the player's
+/// frame by the vertex shader ([`world_vertices`]) -- where the app posed
+/// every vertex on the CPU and sent the whole ground to the GPU again on
+/// each frame the rig moved or turned (`docs/scale-audit-2026-10-13.md`, F1).
+/// Read when a ground pipeline is BUILT, so it is set once, before the
+/// renderer exists: the headset app sets it at launch (`xr::vulkan`;
+/// `adb shell setprop debug.spacesoup.worldground 0` keeps the old way), the
+/// offline harness by `WORLD_GROUND`. `false` here, so everything else that
+/// builds a ground pipeline -- the tests -- hands it posed vertices as before.
+pub static WORLD_GROUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A solid vertex shader's opening, and the same posing its vertex first:
+/// what [`world_vertices`] rewrites. The ground's shaders and the solid
+/// pipeline's (`pipeline::solid_shader`) open alike.
+const POSED_VERTEX: &str = "@vertex fn vs_main(v: VIn) -> VOut {\n    var out: VOut;\n";
+const WORLD_VERTEX: &str = "@vertex fn vs_main(w: VIn) -> VOut {\n    var out: VOut;\n    var v = w;\n    v.pos = to_player_space(w.pos);\n    v.norm = to_player_direction(w.norm);\n";
+
+/// `src` taking its vertices in the WORLD: position and normal are turned
+/// into the player's frame (`lights`' `to_player_space`, the inverse of the
+/// `to_world_space` every shader already has) before anything reads them, so
+/// all that follows is as it was for a vertex the app had posed. `None` if
+/// the shader does not open as the ground's does.
+pub fn world_vertices(src: &str) -> Option<String> {
+    (src.matches(POSED_VERTEX).count() == 1).then(|| src.replacen(POSED_VERTEX, WORLD_VERTEX, 1))
+}
+
 impl TerrainPipeline {
+    /// The pipeline for a run from the coarser lists (`coarse`) or at step 1.
+    pub fn at(&self, coarse: bool) -> &RenderPipeline {
+        match (&self.shaped, coarse) {
+            (Some(shaped), true) => shaped,
+            _ => &self.pipeline,
+        }
+    }
+
+    /// The DESKTOP renderer's ground: the scene reader with its relief
+    /// ([`with_relief`]), single-sampled, single-eye.
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
-        Self::new_multisampled(device, format, uniform_layout, 1)
+        let source = terrain_shader_for(TerrainRole::Scene);
+        let source = with_relief(&source).unwrap_or(source);
+        Self::build_from(device, format, uniform_layout, 1, crate::renderer::multiview::ViewMode::Mono, TerrainRole::Scene, None, source, "terrain_pipeline_desktop")
     }
 
     /// See `pipeline::SolidPipeline::new_multisampled` -- a pipeline's sample
@@ -276,6 +495,31 @@ impl TerrainPipeline {
         )
     }
 
+    /// DIAGNOSTIC: the ground's scene reader answering with one of
+    /// [`GROUND_DEBUG_VIEWS`] (`GROUND_DEBUG` in the offline frame). `None`
+    /// for a name that is not one.
+    pub fn new_debug_reader(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        view: &str,
+    ) -> Option<Self> {
+        let source = ground_debug_shader(&terrain_shader_for(TerrainRole::Read), view)?;
+        Some(Self::build_from(
+            device,
+            format,
+            uniform_layout,
+            samples,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::Read,
+            Some(probe_layout),
+            source,
+            "terrain_pipeline_read_debug",
+        ))
+    }
+
     /// MEASUREMENT: the ground's reader, its probe pass and that pass's
     /// poolless twin, in that order, with the layer reads inlined per layer as
     /// they were before the loop ([`with_inlined_layer_reads`]) -- drawn in the
@@ -358,6 +602,120 @@ impl TerrainPipeline {
             crate::renderer::lights::without_pool_maps(terrain_shader_for(TerrainRole::ProbePass)),
             "terrain_probe_pass_poolless",
         )
+    }
+
+    /// THE GROUND'S PROBE PASS'S OPEN-GROUND TWIN ([`open_pass_shader`]), for
+    /// the chunks the nowhere twin would draw, reflecting the outdoors; with
+    /// `weather_layout`, its weather twin. `None` when the shader's switch or
+    /// the weather's edits moved. `Levers::open_reflections`.
+    pub fn new_probe_pass_open(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        weather_layout: Option<&BindGroupLayout>,
+    ) -> Option<Self> {
+        let src = open_pass_shader()?;
+        let (src, label) = match weather_layout {
+            Some(_) => (crate::renderer::weather::with_weather(&src)?, "terrain_weather_probe_pass_open"),
+            None => (src, "terrain_probe_pass_open"),
+        };
+        Some(Self::build_from_with(
+            device,
+            crate::renderer::brush_pipeline::probe_pass::FORMAT,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::ProbePass,
+            weather_layout,
+            Some(fixups.pass_layout()),
+            src,
+            label,
+        ))
+    }
+
+    /// The weather's ground where water stands, mirroring the sky alone
+    /// ([`puddle_pass_shader`]). `None` when the shader's line or the
+    /// weather's edits no longer match.
+    pub fn new_probe_pass_puddle(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        weather_layout: &BindGroupLayout,
+    ) -> Option<Self> {
+        let src = crate::renderer::weather::with_weather(&puddle_pass_shader()?)?;
+        Some(Self::build_from_with(
+            device,
+            crate::renderer::brush_pipeline::probe_pass::FORMAT,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::ProbePass,
+            Some(weather_layout),
+            Some(fixups.pass_layout()),
+            src,
+            "terrain_weather_probe_pass_puddle",
+        ))
+    }
+
+    /// THE GROUND'S PROBE PASS'S NOWHERE TWIN ([`nowhere_pass_shader`]), for
+    /// the chunks of ground that touch no photograph's box and no doorway's
+    /// reach this frame (`outdoor_pass::NowhereFrame`); with `weather_layout`,
+    /// its weather twin. `None` when the shader's switch or the weather's
+    /// edits moved. `Levers::nowhere_pass`.
+    pub fn new_probe_pass_nowhere(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        weather_layout: Option<&BindGroupLayout>,
+    ) -> Option<Self> {
+        let src = nowhere_pass_shader()?;
+        let (src, label) = match weather_layout {
+            Some(_) => (crate::renderer::weather::with_weather(&src)?, "terrain_weather_probe_pass_nowhere"),
+            None => (src, "terrain_probe_pass_nowhere"),
+        };
+        Some(Self::build_from_with(
+            device,
+            crate::renderer::brush_pipeline::probe_pass::FORMAT,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::ProbePass,
+            weather_layout,
+            Some(fixups.pass_layout()),
+            src,
+            label,
+        ))
+    }
+
+    /// THE GROUND'S PROBE PASS'S OUTDOOR TWIN ([`outdoor_pass_shader`]), for
+    /// the chunks of ground every texel of which starts out of doors this frame
+    /// (`outdoor_pass::all_outdoors`); with `weather_layout`, its weather twin
+    /// (`weather::with_weather`), for those of them a weather area touches.
+    /// `None` when the shader's switch or the weather's edits moved.
+    /// `Levers::outdoor_pass`.
+    pub fn new_probe_pass_outdoors(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+        weather_layout: Option<&BindGroupLayout>,
+    ) -> Option<Self> {
+        let src = outdoor_pass_shader()?;
+        let (src, label) = match weather_layout {
+            Some(_) => (crate::renderer::weather::with_weather(&src)?, "terrain_weather_probe_pass_outdoors"),
+            None => (src, "terrain_probe_pass_outdoors"),
+        };
+        Some(Self::build_from_with(
+            device,
+            crate::renderer::brush_pipeline::probe_pass::FORMAT,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::ProbePass,
+            weather_layout,
+            Some(fixups.pass_layout()),
+            src,
+            label,
+        ))
     }
 
     /// MEASUREMENT: the ground's probe pass with the register cut `cut` (one of
@@ -527,20 +885,90 @@ impl TerrainPipeline {
         role: TerrainRole,
         group2: Option<&BindGroupLayout>,
         group3: Option<&BindGroupLayout>,
-        mut source: String,
+        source: String,
         label: &str,
     ) -> Self {
+        Self::build_faced(device, format, uniform_layout, samples, view, role, group2, group3, source, label, FrontFace::Ccw)
+    }
+
+    /// THE GROUND IN A PLANAR WATER MIRROR (`planar_water`): the scene's
+    /// ground, single-sampled and single-eye, with the winding a mirrored
+    /// view reverses taken as the front.
+    pub fn new_mirror(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
+        let source = terrain_shader_for(TerrainRole::Scene);
+        Self::build_faced(
+            device,
+            format,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            TerrainRole::Scene,
+            None,
+            None,
+            source,
+            "terrain_pipeline_mirror",
+            FrontFace::Cw,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_faced(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        role: TerrainRole,
+        group2: Option<&BindGroupLayout>,
+        group3: Option<&BindGroupLayout>,
+        mut source: String,
+        label: &str,
+        front_face: FrontFace,
+    ) -> Self {
+        if WORLD_GROUND.load(std::sync::atomic::Ordering::Relaxed) {
+            match world_vertices(&source) {
+                Some(world) => source = world,
+                // Drawn from world vertices it would stand in the wrong place.
+                None => log::error!("WORLD GROUND: the ground shader '{label}' does not open as expected; it reads its vertices as posed"),
+            }
+        }
         if role == TerrainRole::ProbePass && device.features().contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
             // It writes the fix-up list: see `BrushPipeline::new_probe_pass_deferred`.
             source = source.replacen("@fragment fn fs_main(", "@fragment @early_depth_test(force) fn fs_main(", 1);
         }
+        let material_layout = material_bind_group_layout(device);
+        // The step-1 twin (no shape read) is `pipeline`; the source as given,
+        // when it reads the shape at all, is `shaped`.
+        let (plain, shaped) = twin_sources(source);
+        let pipeline = Self::compile(device, format, uniform_layout, samples, view, role, group2, group3, plain, label, front_face, &material_layout);
+        let shaped = shaped.map(|src| {
+            SHAPED_TWINS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self::compile(device, format, uniform_layout, samples, view, role, group2, group3, src, &format!("{label}_shaped"), front_face, &material_layout)
+        });
+        Self { pipeline, shaped, material_layout }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        role: TerrainRole,
+        group2: Option<&BindGroupLayout>,
+        group3: Option<&BindGroupLayout>,
+        source: String,
+        label: &str,
+        front_face: FrontFace,
+        material_layout: &BindGroupLayout,
+    ) -> RenderPipeline {
         // Audited: see `shader_checks`.
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("terrain_shader"),
             source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, view.shader(source)).into()),
         });
-        let material_layout = material_bind_group_layout(device);
-        let mut layouts = vec![Some(uniform_layout), Some(&material_layout)];
+        let mut layouts = vec![Some(uniform_layout), Some(material_layout)];
         if group2.is_some() || group3.is_some() {
             layouts.push(group2);
         }
@@ -556,7 +984,12 @@ impl TerrainPipeline {
         // In the probe pass, both of its targets; the reach is left as the
         // brushes wrote it. See `probe_pass::targets`.
         let probe_targets = crate::renderer::brush_pipeline::probe_pass::targets(false);
-        let scene_target = [Some(ColorTargetState { format, blend: Some(BlendState::ALPHA_BLENDING), write_mask: ColorWrites::ALL })];
+        // The scene's ground is opaque -- its shader writes alpha 1 -- and
+        // was drawn with blending on until 2026-10-13. Without, it is the
+        // same colour (alpha 1 keeps nothing of what lay under it) and the
+        // ground writes the GPU's coarse depth. See `OPAQUE_GROUND`.
+        let blend = if OPAQUE_GROUND.load(std::sync::atomic::Ordering::Relaxed) { None } else { Some(BlendState::ALPHA_BLENDING) };
+        let scene_target = [Some(ColorTargetState { format, blend, write_mask: ColorWrites::ALL })];
         let targets: &[Option<ColorTargetState>] =
             if role == TerrainRole::ProbePass { &probe_targets } else { &scene_target };
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -580,7 +1013,7 @@ impl TerrainPipeline {
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
                 cull_mode: Some(Face::Back),
-                front_face: FrontFace::Ccw,
+                front_face,
                 polygon_mode: PolygonMode::Fill,
                 ..Default::default()
             },
@@ -595,8 +1028,7 @@ impl TerrainPipeline {
             multiview_mask: view.mask(),
             cache: None,
         });
-
-        Self { pipeline, material_layout }
+        pipeline
     }
 }
 
@@ -609,6 +1041,111 @@ pub struct TerrainWeatherTwins {
     pub pass_poolless: TerrainPipeline,
 }
 
+/// The switch [`outdoor_pass_shader`] turns: see `PROBE_ALL_OUTDOORS` in the
+/// lights block.
+const ALL_OUTDOORS_OFF: &str = "const PROBE_ALL_OUTDOORS: bool = false;";
+const ALL_OUTDOORS_ON: &str = "const PROBE_ALL_OUTDOORS: bool = true;";
+
+/// The switch [`nowhere_pass_shader`] turns: see `PROBE_NOWHERE` in the lights
+/// block.
+const NOWHERE_OFF: &str = "const PROBE_NOWHERE: bool = false;";
+const NOWHERE_ON: &str = "const PROBE_NOWHERE: bool = true;";
+
+/// The switch [`open_pass_shader`] turns: see `PROBE_OPEN_GROUND` in the
+/// lights block.
+const OPEN_GROUND_OFF: &str = "const PROBE_OPEN_GROUND: bool = false;";
+const OPEN_GROUND_ON: &str = "const PROBE_OPEN_GROUND: bool = true;";
+
+/// THE GROUND'S PROBE PASS FOR OPEN GROUND THAT REFLECTS THE OUTDOORS: the
+/// pass with `PROBE_OPEN_GROUND` set, for the same chunks as
+/// [`nowhere_pass_shader`] (`outdoor_pass::NowhereFrame::holds`). Ground
+/// smooth enough to trace shows the ground map, the buildings' outsides and
+/// the sky -- as ground inside the baked outdoor volume does -- where the
+/// full pass and the nowhere twin show nothing. `Levers::open_reflections`.
+/// `None` if the switch is not in the shader exactly once.
+pub(crate) fn open_pass_shader() -> Option<String> {
+    let src = terrain_shader_for(TerrainRole::ProbePass);
+    (src.matches(OPEN_GROUND_OFF).count() == 1).then(|| src.replacen(OPEN_GROUND_OFF, OPEN_GROUND_ON, 1))
+}
+
+/// The open ground's answer, and the sky alone in its place: what
+/// [`puddle_pass_shader`] rewrites.
+const OPEN_COLOUR: &str = "        let open_col = probe_escape_colour(world_pos, open_dir, dir, roughness, open_lod);";
+const OPEN_SKY_COLOUR: &str = "        let open_col = vec4<f32>(sky_reflection(open_dir, dir, open_lod), 1.0);";
+
+/// THE GROUND'S PROBE PASS FOR STANDING WATER BEYOND THE OUTDOOR VOLUME: the
+/// open-ground twin ([`open_pass_shader`]) answering with the SKY ALONE, at
+/// the lobe's blur -- no walk over the ground map for a hill, no buildings'
+/// outsides. A puddle then mirrors the sky it lies under and not the ridge
+/// behind it; the open twin's whole answer put the weather's pass past the
+/// Quest's instruction cache (3,755 instructions; rain_puddles_down +3.6 ms,
+/// 2026-10-13). `Levers::puddle_sky`. `None` if the line is not in the shader
+/// exactly once.
+pub(crate) fn puddle_pass_shader() -> Option<String> {
+    let src = open_pass_shader()?;
+    (src.matches(OPEN_COLOUR).count() == 1).then(|| src.replacen(OPEN_COLOUR, OPEN_SKY_COLOUR, 1))
+}
+
+/// THE GROUND'S PROBE PASS FOR GROUND IN NO PHOTOGRAPH'S BOX: the pass with
+/// `PROBE_NOWHERE` set, so the lookup answers "nothing" at once, as the full
+/// pass does for such ground after choosing among every photograph, starting
+/// a trace and walking the doorways -- and the pass is the ground's material
+/// and the characters' reflections alone. The same picture wherever
+/// `outdoor_pass::NowhereFrame::holds`, which is where it is drawn. `None` if
+/// the switch is not in the shader exactly once.
+pub(crate) fn nowhere_pass_shader() -> Option<String> {
+    let src = terrain_shader_for(TerrainRole::ProbePass);
+    (src.matches(NOWHERE_OFF).count() == 1).then(|| src.replacen(NOWHERE_OFF, NOWHERE_ON, 1))
+}
+
+/// THE GROUND'S PROBE PASS FOR GROUND THAT IS ALL OUT OF DOORS: the pass with
+/// `PROBE_ALL_OUTDOORS` set, so its reflection is the outdoor one alone -- the
+/// ground map's trace, the buildings' outsides, the sky -- and none of the
+/// rooms' machinery is compiled in. The same picture wherever
+/// `outdoor_pass::all_outdoors` holds, which is where it is drawn. `None` if
+/// the switch is not in the shader exactly once.
+///
+/// A surface too rough to trace takes the photographs' path in the full pass;
+/// here, the outdoor volume's photographs alone (`probe_outdoor_untraced`),
+/// which is all that path finds further from a doorway than its fades.
+pub(crate) fn outdoor_pass_shader() -> Option<String> {
+    let src = terrain_shader_for(TerrainRole::ProbePass);
+    if src.matches(ALL_OUTDOORS_OFF).count() != 1 {
+        return None;
+    }
+    let src = src.replacen(ALL_OUTDOORS_OFF, ALL_OUTDOORS_ON, 1);
+    // The sky read once where the outdoor answer has it twice -- behind a
+    // building and with none -- as the pass's dedup twin has it
+    // (`brush_pipeline::DEDUP_OUTDOOR_SKY`: the same picture to the byte).
+    let (from, to) = crate::renderer::brush_pipeline::DEDUP_OUTDOOR_SKY;
+    Some(if src.matches(from).count() == 1 { src.replacen(from, to, 1) } else { src })
+}
+
+/// MEASUREMENT ONLY (`terrain_cut_rough_skip`): nothing traced where the scene
+/// gives the reflection no share of its own texel, as the brushes' pass has it
+/// (`brush_pipeline::probe_pass::PASS_LIGHTING`) -- from this roughness up the
+/// scene shader multiplies the reflection by `1 - lobe_is_hemispherical`, 0
+/// (`shade_material_env_part`).
+///
+/// NOT THE SAME PICTURE, so not in the pass: the reflection is half the
+/// resolution each way, and a scene pixel a little smoother than its texel
+/// still reads the texel -- skipped, it reads the sky's and the lightmap's
+/// light in the trace's place. Offline, 2026-10-12: 1.1% of the front lawn's
+/// pixels and 1.9% of the field's differ, nearly all by one level of 255, the
+/// worst by 11 (docs/shader-optimization-2026-10-12.md). The cut says what the
+/// rough ground's reflection costs.
+///
+/// After `probe_fragment = in.clip`, which is where the weather twin puts its
+/// own code (`weather::with_weather`): wet ground is made smooth there, before
+/// this asks, so a puddle is still traced. And after every implicit-derivative
+/// sample, at the entry point's top level.
+pub(crate) const PASS_ROUGH_SKIP: &str =
+    "    if (clamp(rough, 0.04, 1.0) >= PROBE_LOBE_HEMISPHERICAL) {\n        return vec4<f32>(0.0);\n    }\n";
+
+/// Where [`PASS_ROUGH_SKIP`] goes, and the same with it in.
+const PASS_ROUGH_SKIP_AT: &str = "    probe_fragment = in.clip;\n    return probe_env_for_pass(\n";
+const PASS_ROUGH_SKIP_IN: &str = "    probe_fragment = in.clip;\n    if (clamp(rough, 0.04, 1.0) >= PROBE_LOBE_HEMISPHERICAL) {\n        return vec4<f32>(0.0);\n    }\n    return probe_env_for_pass(\n";
+
 /// MEASUREMENT ONLY: what `TerrainPipeline::log_probe_pass_register_cuts` cuts
 /// out of the ground's probe pass, one pipeline each -- text edits of the
 /// generated WGSL; `pass_cut` draws with one. 2026-10-06: the glass's gate
@@ -616,6 +1153,22 @@ pub struct TerrainWeatherTwins {
 /// capsules' answer was made (`lights::capsule_glass_beam`).
 const PROBE_PASS_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("terrain_cut_none", &[]),
+    // The rough ground not traced: what its reflection costs. Not the same
+    // picture -- see `PASS_ROUGH_SKIP`.
+    ("terrain_cut_rough_skip", &[(PASS_ROUGH_SKIP_AT, PASS_ROUGH_SKIP_IN)]),
+    // ALL OF THE GROUND BY ITS OUTDOOR TWIN (`outdoor_pass_shader`): for its
+    // statistics, and to draw a view of open ground with it alone -- on the
+    // headset by this lever, off it by `TERRAIN_PASS_CUT`. Not the same
+    // picture on ground in or beside a building.
+    ("terrain_cut_all_outdoors", &[(ALL_OUTDOORS_OFF, ALL_OUTDOORS_ON)]),
+    // ALL OF THE GROUND BY ITS NOWHERE TWIN (`nowhere_pass_shader`): for its
+    // statistics, and what the pass costs with no lookup at all. Not the same
+    // picture on ground inside a photograph's box.
+    ("terrain_cut_nowhere", &[(NOWHERE_OFF, NOWHERE_ON)]),
+    // ALL OF THE GROUND BY ITS OPEN-GROUND TWIN (`open_pass_shader`): for its
+    // statistics, and off the headset (`TERRAIN_PASS_CUT`) to see open ground's
+    // reflections on a whole view. Not the full pass's picture anywhere.
+    ("terrain_cut_open", &[(OPEN_GROUND_OFF, OPEN_GROUND_ON)]),
     // No gate: the glow as the capsules give it.
     (
         "terrain_cut_gate",
@@ -660,7 +1213,7 @@ fn terrain_lights_block(options: crate::renderer::lights::LightsBlockOptions) ->
     crate::renderer::lights::wgsl_lights_block_with(
         0,
         1,
-        crate::renderer::lights::LightsBlockOptions { cull_range_first: true, long_step_from_plane: true, ..options },
+        crate::renderer::lights::LightsBlockOptions { cull_range_first: true, long_step_from_plane: true, open_fallback: true, ..options },
     )
 }
 
@@ -679,10 +1232,172 @@ pub enum TerrainRole {
     ProbePass,
 }
 
+/// WHETHER THE GROUND'S SHADERS ARE BUILT FOR A PAINTED LEVEL: what
+/// [`terrain_shader_for`] hands every ground pipeline built from now on.
+///
+/// The ground's layer weights are the splat map's where the level has one
+/// (`mat.use_splat`, set by `TerrainMaterial::new`) and worked out from the
+/// slope where it has not -- and the shader as written works out both for
+/// every pixel and selects, because which it is arrives in a uniform. On a
+/// painted level the slope's weights, an `acos` among them, were computed and
+/// thrown away: 176 of the gentle reader's 2,719 instructions, 179 of the
+/// steep one's 3,010, 80 of the mixed one's 3,141, 93 of the pass's 9,215
+/// (PIPESTATS, 2026-10-12, `shader_opt`'s `splat_probe`).
+///
+/// So it is a fact of the BUILD, per level: the app says what it expects
+/// before the renderer exists ([`expect_painted_ground`], from the entry
+/// level's own file), and the renderer rebuilds the ground's pipelines when a
+/// level's material turns out otherwise ([`ground_build_moves`],
+/// `XrRenderer::set_terrain_splat`). With it set the shaders have the painted
+/// answer alone -- the same picture on a painted level; with it clear, the
+/// choice by the uniform, right for any level.
+///
+/// MEASUREMENT: `adb shell setprop debug.spacesoup.painted 0` (read once when
+/// the device is created) pins the build with the choice in it, the control;
+/// `1` pins the painted build whatever the level holds, which is the WRONG
+/// picture on an unpainted one ([`pin_ground_build`]).
+pub static GROUND_PAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a measurement pinned [`GROUND_PAINTED`]: levels no longer move it.
+static GROUND_BUILD_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the app expects of the level it is about to load, said before the
+/// renderer builds its pipelines so they are built once. A wrong guess costs
+/// one rebuild of the ground's pipelines when the level arrives, nothing else.
+pub fn expect_painted_ground(painted: bool) {
+    if !GROUND_BUILD_PINNED.load(std::sync::atomic::Ordering::Relaxed) {
+        GROUND_PAINTED.store(painted, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// MEASUREMENT: the ground's build held at `painted`, whatever levels load.
+pub fn pin_ground_build(painted: bool) {
+    GROUND_PAINTED.store(painted, std::sync::atomic::Ordering::Relaxed);
+    GROUND_BUILD_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What the ground's pipelines are to be built for, given what they are built
+/// for now, whether the level in hand has a splat map, and a measurement's
+/// pin: the level's fact unless pinned.
+pub fn ground_build_wanted(built_painted: bool, level_painted: bool, pinned: bool) -> bool {
+    if pinned { built_painted } else { level_painted }
+}
+
+/// A level with (or without) a splat map is in hand: sets [`GROUND_PAINTED`]
+/// to what its ground wants and says whether that MOVED it -- the ground's
+/// pipelines are then stale and the caller rebuilds them.
+pub fn ground_build_moves(level_painted: bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let built = GROUND_PAINTED.load(Relaxed);
+    let want = ground_build_wanted(built, level_painted, GROUND_BUILD_PINNED.load(Relaxed));
+    GROUND_PAINTED.store(want, Relaxed);
+    want != built
+}
+
+/// Where the ground chooses between its two sets of layer weights, and the
+/// painted choice alone.
+pub(crate) const PAINTED_FROM: &str = "    return select(derived, authored, mat.use_splat > 0.5);\n";
+pub(crate) const PAINTED_TO: &str = "    return authored;\n";
+
+/// `src` built for a painted level: see [`GROUND_PAINTED`]. `None` if the
+/// choice is not in the shader exactly once.
+pub(crate) fn painted_shader(src: &str) -> Option<String> {
+    (src.matches(PAINTED_FROM).count() == 1).then(|| src.replacen(PAINTED_FROM, PAINTED_TO, 1))
+}
+
+/// The ground reader's answer, which a diagnostic picture replaces.
+const GROUND_ANSWER: &str = "    return vec4<f32>(tonemap(in.col.rgb * lit), 1.0);\n";
+
+/// DIAGNOSTIC PICTURES of the ground's scene reader, for the offline frame
+/// (`GROUND_DEBUG=<name>`): each replaces the reader's answer with ONE
+/// quantity as a colour, so a fault seen on the ground can be traced to the
+/// term that draws it. One picture, one question.
+///
+/// - `albedo`: the layers' blended colour, unlit -- is the fault in the
+///   texturing or in the light?
+/// - `plane`: the plane the pixel is textured on, red / green / blue for the
+///   projection along x / y / z, dimmer as the second plane's share grows.
+/// - `stretch`: how much that plane STRETCHES the texture on the triangle
+///   actually drawn: white where a texel covers its own size, falling to
+///   black as it is pulled out, RED past four times (a streak).
+/// - `facet`: the drawn triangle's own slope against the slope the
+///   interpolated normal claims, as |difference| / 45 degrees.
+/// - `lod`: the colour read's mip level / 10 (white = the smallest mips).
+/// - `rough`: the roughness handed to the shading.
+/// - `weights`: the layer weights, ground / rock / high as red / green / blue.
+/// - `sky`, `sun`: the ground map's sky visibility and its baked sun mask.
+/// - `normal`, `shape`: the shaded (mapped) normal and the interpolated one,
+///   in the world, as colours.
+/// - `layer0` .. `layer2`: one layer's colour alone, as the frame reads it.
+/// - `ao`: the occlusion handed to the shading.
+///
+/// And `cut:<name>`: the LIT picture with one of `ground_cuts::GROUND_CUTS`
+/// taken out of the reader -- what that part draws. And
+/// `edit:<from>=><to>[;;<from>=><to>...]`: the lit picture with those exact
+/// text edits of the WGSL (each `from` once in the shader), to try a change
+/// of the reader on a picture without a build.
+pub const GROUND_DEBUG_VIEWS: &[(&str, &str)] = &[
+    ("albedo", "albedo"),
+    ("plane", "select(select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), f.detail_axis == 1u), vec3<f32>(1.0, 0.0, 0.0), f.detail_axis == 0u) * (2.0 * f.blend - 1.0 + 0.25)"),
+    (
+        "stretch",
+        "select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(dbg_face[f.detail_axis]), dbg_face[f.detail_axis] > 0.25)",
+    ),
+    ("facet", "vec3<f32>(abs(degrees(acos(clamp(dbg_face.y, 0.0, 1.0))) - slope_deg) / 45.0)"),
+    (
+        "lod",
+        "vec3<f32>(0.5 * log2(max(max(dot(f.detail_ddx, f.detail_ddx), dot(f.detail_ddy, f.detail_ddy)), 1e-12) * 512.0 * 512.0) / 10.0)",
+    ),
+    ("rough", "vec3<f32>(rough)"),
+    ("weights", "w.rgb"),
+    ("sky", "vec3<f32>(sky_vis)"),
+    ("sun", "vec3<f32>(receiver_sun_mask)"),
+    ("normal", "to_world_direction(shaded_n) * 0.5 + 0.5"),
+    ("shape", "to_world_direction(n) * 0.5 + 0.5"),
+    ("layer0", "layer_colour_at(0, f)"),
+    ("layer1", "layer_colour_at(1, f)"),
+    ("layer2", "layer_colour_at(2, f)"),
+    ("ao", "vec3<f32>(ao_map)"),
+];
+
+/// `src` (a ground scene shader) answering with one of
+/// [`GROUND_DEBUG_VIEWS`]; `None` for a name that is not one, or a shader
+/// whose answer is not where it is expected.
+pub fn ground_debug_shader(src: &str, view: &str) -> Option<String> {
+    if let Some(cut) = view.strip_prefix("cut:") {
+        let (_, edits) = crate::renderer::ground_cuts::GROUND_CUTS.iter().find(|(name, _)| *name == cut)?;
+        return crate::renderer::ground_cuts::with_cut(src, edits);
+    }
+    if let Some(edits) = view.strip_prefix("edit:") {
+        let edits: Vec<(&str, &str)> = edits.split(";;").map(|e| e.split_once("=>")).collect::<Option<_>>()?;
+        return crate::renderer::ground_cuts::with_cut(src, &edits);
+    }
+    let (_, colour) = GROUND_DEBUG_VIEWS.iter().find(|(name, _)| *name == view)?;
+    (src.matches(GROUND_ANSWER).count() == 1).then(|| {
+        src.replacen(
+            GROUND_ANSWER,
+            &format!(
+                "    let dbg_face = abs(normalize(cross(dpdx(in.tex_pos), dpdy(in.tex_pos))));\n    return vec4<f32>(clamp({colour}, vec3<f32>(0.0), vec3<f32>(1.0)) + 0.0 * lit, 1.0);\n"
+            ),
+            1,
+        )
+    })
+}
+
 /// The terrain shader for `role`: `terrain_shader`, with its reflection read
 /// from the probe pass or its fragment stage cut down to the reflection alone.
 pub fn terrain_shader_for(role: TerrainRole) -> String {
+    terrain_shader_built(role, GROUND_PAINTED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`terrain_shader_for`] for a level known to be `painted` or not: see
+/// [`GROUND_PAINTED`].
+pub fn terrain_shader_built(role: TerrainRole, painted: bool) -> String {
     let src = terrain_shader();
+    let src = match painted {
+        true => painted_shader(&src).unwrap_or(src),
+        false => src,
+    };
     if role == TerrainRole::Scene {
         return src;
     }
@@ -839,6 +1554,19 @@ pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
                 },
                 count: None,
             },
+            // THE GROUND'S STEP-1 SHAPE (`ground_shape`): its normals and
+            // heights a texel a sample, loaded, never filtered. Always
+            // bound: a 1x1 placeholder and `mat.shape` 0 where there is none.
+            BindGroupLayoutEntry {
+                binding: 9,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -867,6 +1595,10 @@ struct Material {{
     normal_strength: f32,
     wet_line: f32,
     wet_band: f32,
+    sea_line: f32,
+    porosity: vec4<f32>,
+    film: vec4<f32>,
+    shape: vec4<f32>,
     parallax: f32,
 }}
 @group(1) @binding(3) var<uniform> mat: Material;
@@ -893,6 +1625,7 @@ struct Material {{
 {lights_block}
 {biplanar_block}
 {whiteout_block}
+{shape_block}
 
 struct VIn  {{ @location(0) pos: vec3<f32>, @location(1) norm: vec3<f32>, @location(2) col: vec4<f32>, @location(3) uv2: vec2<f32> }}
 struct VOut {{
@@ -908,6 +1641,11 @@ struct VOut {{
     // cuboid path uses for lightmap coordinates. Terrain is lit dynamically and
     // has no lightmap, so that slot was sitting at (0,0) doing nothing.
     @location(3) uv: vec2<f32>,
+    // The drawn triangle's FIRST vertex's uv (flat): whether the triangle is
+    // a coarser step's, which alone reads the step-1 shape (`ground_shape`).
+    // NEVER centroid on a ground varying: on the Quest 3 one centroid varying
+    // cost the ground's pipelines 6 to 9 ms a frame (2026-10-15).
+    @location(5) @interpolate(flat) corner: vec2<f32>,
 }}
 
 @vertex fn vs_main(v: VIn) -> VOut {{
@@ -918,6 +1656,7 @@ struct VOut {{
     out.world_pos = v.pos;
     out.tex_pos   = to_world_space(v.pos);
     out.uv        = v.uv2;
+    out.corner    = v.uv2;
     return out;
 }}
 
@@ -1005,31 +1744,51 @@ fn layer_colour(layer: i32, world: vec3<f32>, n: vec3<f32>, slope_deg: f32) -> v
 //
 // The gradients are taken here, before any branch, and every projection scales
 // as 1/repeat -- so a per-layer repeat is a divide, never another derivative.
+//
+// ONE PLANE HELD, NOT THREE (2026-10-13). The frame carried the top-down
+// plane, the cliff's major plane and the detail maps' -- which is one or the
+// other of those two -- each with its two gradients: 18 floats across the
+// layer loop where a pixel only ever reads one of them (the top-down plane
+// when it is not steep, the major plane when it is). `detail_*` is that
+// plane; the colour reads it too. The same values in every read, and the
+// reader that draws triangles with both kinds of pixel holds what the steep
+// twin holds (`ground_twins`; `shader_opt::frame_was` is the frame as it was).
+//
+// TWO PLANES, EVERY MAP ON BOTH, ONE SHARE (2026-10-13, the headset's line
+// artifacts on steep ground). A steep pixel is read on the plane its surface
+// faces most (`detail_*`) and, only where a second plane faces it nearly as
+// much, on that one too (`minor_*`), the first by `blend` and the second by
+// the rest -- colour, normal, roughness and occlusion alike. Until then the
+// colour alone was blended and the other three changed plane along a line,
+// which drew the polygon the two normals' tie traces across a face as a
+// patch of another rock (the pale V on the scarp); and the share was the
+// plain ratio of the normal's two largest parts, which leaves a plane that
+// stretches the picture three times a third of the say.
 struct SampleFrame {{
-    planar_uv: vec2<f32>,
-    planar_ddx: vec2<f32>,
-    planar_ddy: vec2<f32>,
-    major_uv: vec2<f32>,
-    major_ddx: vec2<f32>,
-    major_ddy: vec2<f32>,
     minor_uv: vec2<f32>,
     minor_ddx: vec2<f32>,
     minor_ddy: vec2<f32>,
+    // The first plane's share of every map: 1 where it is read alone (all
+    // gentle ground, and steep ground away from a turn between two planes).
     blend: f32,
-    biplanar: f32,
-    // THE DETAIL MAPS' PROJECTION: normal, roughness, occlusion and macro.
-    // Top-down on gentle ground, as they always were; on steep ground the
-    // colour's MAJOR plane, the one the face looks along. Read top-down, a
-    // cliff took one texel row of each down its whole height -- the vertical
-    // streaks a near-vertical face showed (2026-10-08, the headland). One
-    // fetch either way, so the change costs selects and no taps; only the
-    // colour blends the minor plane in.
+    // The share of the SECOND SCALE in the first plane's colour and normal:
+    // a side plane's alone, and none at a tie, where the two planes must be
+    // read alike for the picture to be the same from either side of it.
+    second: f32,
+    // THE FIRST PLANE: top-down on gentle ground, as it always was; on steep
+    // ground the one the face looks along. Read top-down, a cliff took one
+    // texel row of each map down its whole height -- the vertical streaks a
+    // near-vertical face showed (2026-10-08, the headland).
     detail_uv: vec2<f32>,
     detail_ddx: vec2<f32>,
     detail_ddy: vec2<f32>,
     detail_axis: u32,
     // The macro variation, read once here (it steers the warp below).
     macro_value: f32,
+    // How the top plane's bumps are folded into the normal (`fold_bumps`):
+    // 1 where the triangle drawn is the surface the interpolated normal
+    // describes, 0 where the planes were chosen by the triangle instead.
+    fold: f32,
     minor_axis: u32,
 }}
 
@@ -1042,102 +1801,103 @@ const CLIFF_WARP_M: f32 = 2.5;
 // the bend changes (the macro map at this repeat).
 const CLIFF_BAND_WARP_M: f32 = 3.0;
 const CLIFF_BAND_SCALE_M: f32 = 7.0;
+// Whether the level's material carries a macro map (`sample_frame`).
+const GROUND_MACRO_MAP: bool = false;
 
-// The layers' blended height under a planar uv, 0 at the bottom of the
-// relief and 1 at the top, from the green of the occlusion array (see
-// `load_terrain_ao`). Explicit gradients, so it may be read inside the march.
-// The height of ONE layer -- the heaviest under the pixel. The march reads
-// it ten-odd times a pixel, so a blend of four here cost four times the
-// taps for a difference only visible at a paint boundary, where the relief
-// of the layer taking over is the right one to show anyway.
-fn layers_height(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, layer: i32) -> f32 {{
-    let r = max(mat.repeat[layer], 0.001);
-    return textureSampleGrad(ao_tex, layer_samp, uv / r, layer, ddx / r, ddy / r).g;
-}}
+// A plane has a share of a steep pixel only where the surface faces it more
+// than this: 1/sqrt(3), what all three face at once. So a plane is never read
+// where it would stretch the picture more than 1.73 times, and the plane left
+// out -- the third -- has no share to lose where it swaps with the second.
+const PLANE_TIE: f32 = 0.57735;
+// The first plane's share past which the second is not read at all.
+const PLANE_ALONE: f32 = 0.999;
+// How far the triangle drawn may turn from the interpolated normal before the
+// planes are chosen by the triangle instead: on any smooth ground the two
+// agree (their dot) within 6 degrees, and by 14 the triangle alone decides.
+// `FACE_BAND` is one over the width between.
+const FACE_DIFFERS: f32 = 0.9703;
+const FACE_BAND: f32 = 41.3;
+// What the macro variation reads where there is no macro map: the middle,
+// which changes nothing.
+const MACRO_NEUTRAL: f32 = 0.5019608;
 
-// Which layer carries the most weight under the pixel.
-fn dominant_layer(w: vec4<f32>) -> i32 {{
-    var best = 0;
-    var bw = w.x;
-    if (w.y > bw) {{ best = 1; bw = w.y; }}
-    if (w.z > bw) {{ best = 2; bw = w.z; }}
-    if (w.w > bw) {{ best = 3; }}
-    return best;
-}}
-
-// THE GROUND'S RELIEF, by parallax occlusion. The view ray is marched down
-// into `relief` metres of height field in even steps of depth, and where it
-// first passes under the surface is where the eye really lands: the far
-// wall of a rut comes forward, its near wall hides, a clod's top covers the
-// ground behind it. Returns how far across the ground (metres) the sample
-// point moves. More steps at a grazing view, where the ray crosses more
-// ground per step and would otherwise step through thin ridges.
-fn parallax_shift(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, w: vec4<f32>, eye: vec3<f32>, relief: f32) -> vec2<f32> {{
-    let up = max(eye.y, 0.12);
-    let slide = -eye.xz / up;
-    let steps = mix(6.0, 14.0, 1.0 - up);
-    let layer = dominant_layer(w);
-    let layer_d = relief / steps;
-    let step_uv = slide * layer_d;
-    var cur_uv = uv;
-    var cur_depth = 0.0;
-    var surf = (1.0 - layers_height(cur_uv, ddx, ddy, layer)) * relief;
-    var prev_uv = uv;
-    var prev_depth = 0.0;
-    var prev_surf = surf;
-    for (var i = 0; i < 14; i++) {{
-        if (cur_depth >= surf || f32(i) >= steps) {{
-            break;
-        }}
-        prev_uv = cur_uv;
-        prev_depth = cur_depth;
-        prev_surf = surf;
-        cur_uv = cur_uv + step_uv;
-        cur_depth = cur_depth + layer_d;
-        surf = (1.0 - layers_height(cur_uv, ddx, ddy, layer)) * relief;
-    }}
-    // Where the ray crossed between the last two samples.
-    let after = surf - cur_depth;
-    let before = prev_surf - prev_depth;
-    let t = clamp(before / max(before - after, 1e-5), 0.0, 1.0);
-    return mix(prev_uv, cur_uv, t) - uv;
-}}
-
-// How far the relief is marched, in metres: fully to 18 m, gone by 30 m,
-// where a rut is under a pixel anyway and the normal map alone carries it.
-const PARALLAX_NEAR_M: f32 = 18.0;
-const PARALLAX_FAR_M: f32 = 30.0;
-
-fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32, w: vec4<f32>, eye: vec3<f32>, eye_dist: f32) -> SampleFrame {{
+// `n` is the interpolated normal, and `step_x` and `step_y` the position's
+// two screen steps -- all three in the player's frame, where the steps stay
+// small near the eye in a level of any size.
+// `shape_face`: the step-1 triangle's plane under the pixel, which stands for
+// the drawn one where `shaped` (`ground_shape`).
+fn sample_frame(world: vec3<f32>, n: vec3<f32>, step_x: vec3<f32>, step_y: vec3<f32>, shape_face: vec3<f32>, shaped: bool) -> SampleFrame {{
     var f: SampleFrame;
-    f.planar_uv  = world.xz;
-    f.planar_ddx = dpdx(world.xz);
-    f.planar_ddy = dpdy(world.xz);
-    // The relief, on the gentle ground the planar projection covers.
-    let relief = mat.parallax * (1.0 - smoothstep(PARALLAX_NEAR_M, PARALLAX_FAR_M, eye_dist))
-        * select(1.0, 0.0, slope_deg >= mat.biplanar_start_deg);
-    if (relief > 0.0005) {{
-        f.planar_uv = f.planar_uv + parallax_shift(f.planar_uv, f.planar_ddx, f.planar_ddy, w, eye, relief);
-    }}
+    let planar_uv  = world.xz;
+    // THE WORLD POSITION'S TWO SCREEN GRADIENTS, taken once: every plane's
+    // are two of their components. Never the derivative of a uv a pixel
+    // CHOSE: across the line where the choice changes that is the difference
+    // of two unrelated coordinates, read as a gradient of metres a pixel, and
+    // every map drops to its smallest mip along it -- the one-pixel pale
+    // lines down a cliff (headset, 2026-10-13).
+    let world_ddx = dpdx(world);
+    let world_ddy = dpdy(world);
+    let planar_ddx = world_ddx.xz;
+    let planar_ddy = world_ddy.xz;
 
+    // THE DRAWN TRIANGLE'S OWN NORMAL, on `n`'s side: both steps lie in the
+    // triangle's plane, so their cross is its normal exactly, at a triangle's
+    // edge too. (A triangle seen so edge-on that the steps have no area
+    // between them has none, and the interpolated normal stands in below.)
+    let across = cross(step_x, step_y);
+    let along = dot(across, n);
+    let across_len = inverseSqrt(max(dot(across, across), 1e-30));
+    let face = select(across * (sign(along) * across_len), shape_face, shaped);
+    // STEEP WHERE THE NORMAL OR THE TRIANGLE IS. The interpolated normal is
+    // the light's; it is a blend of the faces round each vertex, and on a rise
+    // one cell wide it reads twenty degrees gentler than the face it is drawn
+    // on, and straight up along a knife ridge's crest, where the faces either
+    // side cancel. Asked alone, a ridge's top was "gentle" and took the
+    // top-down plane on seventy-degree faces: the picture pulled down each
+    // side's fall line, the herringbone along the crest.
+    let steep = min(n.y, face.y) <= cos(radians(mat.biplanar_start_deg));
+    // THE PLANES ARE CHOSEN BY THE SURFACE THAT IS DRAWN: the interpolated
+    // normal where the triangle agrees with it -- so on rounded ground the
+    // shares turn smoothly, with no facet -- and the triangle's own where it
+    // does not: at a cliff's foot and rim, on a one-cell step, along a ridge.
+    // There the ground has a crease, and the picture changes plane on it.
+    // In the world, as the planes are.
+    let agree = clamp((select(abs(along) * across_len, abs(dot(shape_face, n)), shaped) - FACE_DIFFERS) * FACE_BAND, 0.0001, 1.0);
+    let pn = to_world_direction(normalize(mix(face, n, agree)));
     // At unit repeat, so each layer divides rather than recomputing.
-    let b = biplanar_axes(world, n, 1.0);
-    f.major_uv  = b.uv_major;
-    f.major_ddx = dpdx(b.uv_major);
-    f.major_ddy = dpdy(b.uv_major);
+    let b = biplanar_axes(world, pn, 1.0);
+    let a = abs(pn);
+    let ma = max(a.x, max(a.y, a.z));
+    let me = a.x + a.y + a.z - ma - min(a.x, min(a.y, a.z));
+    // Each plane's share is how far the surface faces it PAST the three-way
+    // tie: the second plane's is nothing until then, and equal to the
+    // first's where the two tie.
+    let lead = ma - PLANE_TIE;
+    let share = (lead + 0.0001) / (lead + max(me - PLANE_TIE, 0.0) + 0.0001);
+    let major_ddx = select(select(world_ddx.xy, world_ddx.xz, b.axis_major == 1u), world_ddx.zy, b.axis_major == 0u);
+    let major_ddy = select(select(world_ddy.xy, world_ddy.xz, b.axis_major == 1u), world_ddy.zy, b.axis_major == 0u);
     f.minor_uv  = b.uv_minor;
-    f.minor_ddx = dpdx(b.uv_minor);
-    f.minor_ddy = dpdy(b.uv_minor);
-    f.blend     = b.w;
-    f.biplanar  = select(0.0, 1.0, slope_deg >= mat.biplanar_start_deg);
-    let steep = slope_deg >= mat.biplanar_start_deg;
-    f.detail_uv   = select(f.planar_uv, f.major_uv, steep);
-    f.detail_ddx  = select(f.planar_ddx, f.major_ddx, steep);
-    f.detail_ddy  = select(f.planar_ddy, f.major_ddy, steep);
+    f.minor_ddx = select(select(world_ddx.xy, world_ddx.xz, b.axis_minor == 1u), world_ddx.zy, b.axis_minor == 0u);
+    f.minor_ddy = select(select(world_ddy.xy, world_ddy.xz, b.axis_minor == 1u), world_ddy.zy, b.axis_minor == 0u);
+    f.blend     = select(1.0, share, steep);
+    f.detail_uv   = select(planar_uv, b.uv_major, steep);
+    f.detail_ddx  = select(planar_ddx, major_ddx, steep);
+    f.detail_ddy  = select(planar_ddy, major_ddy, steep);
     f.detail_axis = select(1u, b.axis_major, steep);
     f.minor_axis  = b.axis_minor;
-    let mr = max(mat.macro_repeat, 0.001);
-    f.macro_value = textureSampleGrad(macro_tex, layer_samp, f.detail_uv / mr, f.detail_ddx / mr, f.detail_ddy / mr).r;
+    f.fold        = select(1.0, agree, steep);
+    // THE MACRO VARIATION, where a level has a macro map. None has: every
+    // material is built with the one neutral texel (`TerrainMaterial::
+    // from_layers_with`), and every ground pixel paid a fetch here -- a cliff
+    // a second below -- to read the middle. `GROUND_MACRO_MAP` is the build
+    // with the reads in it, for the day a level brings a map.
+    f.macro_value = MACRO_NEUTRAL;
+    if (GROUND_MACRO_MAP) {{
+        let mr = max(mat.macro_repeat, 0.001);
+        f.macro_value = textureSampleGrad(macro_tex, layer_samp, f.detail_uv / mr, f.detail_ddx / mr, f.detail_ddy / mr).r;
+    }}
+    // The second scale: on a side plane, by how far it leads (`SampleFrame`).
+    f.second = select(0.0, (0.3 + 0.3 * f.macro_value) * clamp(4.0 * f.blend - 2.0, 0.0, 1.0), f.detail_axis != 1u);
     var warp = select(vec2<f32>(0.0), vec2<f32>(f.macro_value - 0.5, 0.4 - 0.8 * f.macro_value) * CLIFF_WARP_M, steep);
     // THE BANDS. The rock map is a scan of bedded rock, so it carries level
     // stripes, and tiled every 2 m up a 13 m face they read as strata laid
@@ -1148,61 +1908,109 @@ fn sample_frame(world: vec3<f32>, n: vec3<f32>, slope_deg: f32, w: vec4<f32>, ey
     // its fetch is skipped on the ground.
     if (steep) {{
         let ms = 1.0 / CLIFF_BAND_SCALE_M;
-        let m2 = textureSampleGrad(macro_tex, layer_samp, f.detail_uv * ms + vec2<f32>(0.31, 0.57), f.detail_ddx * ms, f.detail_ddy * ms).r;
+        var m2 = MACRO_NEUTRAL;
+        if (GROUND_MACRO_MAP) {{
+            m2 = textureSampleGrad(macro_tex, layer_samp, f.detail_uv * ms + vec2<f32>(0.31, 0.57), f.detail_ddx * ms, f.detail_ddy * ms).r;
+        }}
         warp = warp + vec2<f32>(0.35, 1.0) * (m2 - 0.5) * CLIFF_BAND_WARP_M;
     }}
-    f.major_uv  = f.major_uv + warp;
-    f.minor_uv  = f.minor_uv + warp;
-    f.detail_uv = f.detail_uv + warp;
+    // The side planes' alone: the top plane is read where gentle ground
+    // reads it, so nothing moves where steep ground begins.
+    f.minor_uv  = f.minor_uv + select(warp, vec2<f32>(0.0), f.minor_axis == 1u);
+    f.detail_uv = f.detail_uv + select(warp, vec2<f32>(0.0), f.detail_axis == 1u);
     return f;
 }}
 
 fn layer_colour_at(layer: i32, f: SampleFrame) -> vec3<f32> {{
     let r = max(mat.repeat[layer], 0.001);
-    if (f.biplanar < 0.5) {{
-        return textureSampleGrad(
-            layer_tex, layer_samp, f.planar_uv / r, layer,
-            f.planar_ddx / r, f.planar_ddy / r,
-        ).rgb;
-    }}
+    // The first plane (`SampleFrame`): top-down, and the whole colour, on
+    // gentle ground; on steep ground the plane the face looks along.
+    var c = textureSampleGrad(layer_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r).rgb;
     // TWO SCALES ON THE FACE THE CLIFF LOOKS ALONG, as for the normal: the
     // rock scan's level stripes, tiled every 2 m, read as strata at one even
     // pitch from the beach. A second read 2.3x larger and tilted 37 degrees
     // puts a second, unrelated pitch over the first, so no period shows.
-    let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
-    let s2 = 1.0 / (r * 2.3);
-    let c_major = mix(
-        textureSampleGrad(layer_tex, layer_samp, f.major_uv / r, layer, f.major_ddx / r, f.major_ddy / r).rgb,
-        textureSampleGrad(
-            layer_tex, layer_samp, rot * f.major_uv * s2 + vec2<f32>(0.37, 0.11), layer,
-            rot * f.major_ddx * s2, rot * f.major_ddy * s2,
-        ).rgb,
-        0.3 + 0.3 * f.macro_value,
-    );
-    let c_minor = textureSampleGrad(
-        layer_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r,
-    ).rgb;
-    return mix(c_minor, c_major, f.blend);
+    if (f.second > 0.0) {{
+        let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
+        let s2 = 1.0 / (r * 2.3);
+        c = mix(
+            c,
+            textureSampleGrad(
+                layer_tex, layer_samp, rot * f.detail_uv * s2 + vec2<f32>(0.37, 0.11), layer,
+                rot * f.detail_ddx * s2, rot * f.detail_ddy * s2,
+            ).rgb,
+            f.second,
+        );
+    }}
+    // The second plane, where it has a share.
+    if (f.blend < PLANE_ALONE) {{
+        c = mix(
+            textureSampleGrad(layer_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r).rgb,
+            c,
+            f.blend,
+        );
+    }}
+    return c;
 }}
 
 // Roughness and occlusion for one layer, sampled with the same frame and
 // gradients the normal uses so all four maps agree about which mip they are on.
 //
-// Planar only: both are low-frequency compared with colour, and a biplanar pair
-// for each would double the fetches on a fill-bound frame to move a value that
-// barely changes across the blend.
+// On the planes the colour is read on, by the same share: read on the first
+// alone they changed plane along the line where two planes tie, and a patch
+// of ground shone and shaded as another rock (`SampleFrame`). The second
+// plane's fetch is taken only where it has a share.
 fn layer_rough_at(layer: i32, f: SampleFrame) -> f32 {{
     let r = max(mat.repeat[layer], 0.001);
-    return textureSampleGrad(
+    var v = textureSampleGrad(
         rough_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r,
     ).r;
+    if (f.blend < PLANE_ALONE) {{
+        v = mix(textureSampleGrad(rough_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r).r, v, f.blend);
+    }}
+    return v;
 }}
 
 fn layer_ao_at(layer: i32, f: SampleFrame) -> f32 {{
     let r = max(mat.repeat[layer], 0.001);
-    return textureSampleGrad(
+    var v = textureSampleGrad(
         ao_tex, layer_samp, f.detail_uv / r, layer, f.detail_ddx / r, f.detail_ddy / r,
     ).r;
+    if (f.blend < PLANE_ALONE) {{
+        v = mix(textureSampleGrad(ao_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r).r, v, f.blend);
+    }}
+    return v;
+}}
+
+// ONE PLANE'S BUMPS FOLDED INTO THE SURFACE NORMAL, without leaning it.
+//
+// `whiteout` shortens only the normal's part along the plane's axis, by the
+// bump's z, and leaves the rest whole: the result leans away from the axis.
+// The grass map's bumps average z 0.63 (rock's 0.97), so on the top plane a
+// slope's mean normal was shaded half as steep again as it is, and on a side
+// plane as much too upright. Where the two planes met on one normal -- a
+// patch of the face chosen by the other plane, the level triangle at a bank's
+// foot beside the bank's own -- one side shaded dark and the other pale: the
+// pale V on the grass scarp (and, by their shape, the dark triangles in the
+// beach hill's shots), a straight line along the foot of every rise
+// (headset, 2026-10-13). It was never the
+// highlight: with the specular and the reflections off, and at roughness 1,
+// the V stayed.
+//
+// So a SIDE plane shortens the whole normal alike, and its bumps leave the
+// direction where it was. The TOP plane keeps the fold every gentle pixel has
+// always had -- level ground, where the two agree exactly, is most of every
+// level and shades as before -- wherever the triangle drawn is the surface
+// the interpolated normal describes (`keep` 1), and folds as a side plane
+// does where the planes were chosen by the triangle (`keep` 0): at a bank's
+// foot and rim, where the normal leans forty degrees over level ground.
+fn fold_bumps(axis: u32, tn: vec3<f32>, n: vec3<f32>, keep: f32) -> vec3<f32> {{
+    let z = abs(tn.z);
+    if (axis == 1u) {{
+        let g = mix(z, 1.0, keep);
+        return vec3<f32>(tn.x + g * n.x, z * n.y, g * n.z - tn.y);
+    }}
+    return n * z + select(vec3<f32>(tn.x, -tn.y, 0.0), vec3<f32>(0.0, -tn.y, tn.x), axis == 0u);
 }}
 
 fn layer_normal_at(layer: i32, n: vec3<f32>, f: SampleFrame) -> vec3<f32> {{
@@ -1229,17 +2037,20 @@ fn layer_normal_at(layer: i32, n: vec3<f32>, f: SampleFrame) -> vec3<f32> {{
     // variance. Nothing is lost by handing both back.
     var tn = packed * 2.0 - 1.0;
     tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
-    // A side plane (a cliff's) is folded in where its axes are -- the
-    // world's -- and turned back into the player's frame; the top plane keeps
-    // the bend it always had, so gentle ground shades exactly as before.
-    if (f.detail_axis != 1u) {{
-        // TWO SCALES ON A CLIFF. One normal map tiled down a long face showed
-        // its repeat as rows of the same chevron. A second read, 2.3x larger
-        // and turned 37 degrees, is mixed in: the two periods never line up,
-        // so the sum does not repeat within any face we have. Its bumps are
-        // turned back into the first read's axes before the mix, and the mix
-        // (which averages two unrelated patterns, so comes out short) is
-        // given back its strength. Steep faces only.
+    // The top plane read alone -- all gentle ground, and steep ground whose
+    // face still looks up -- keeps the bend it always had, so gentle ground
+    // shades exactly as before.
+    if (f.detail_axis == 1u && f.blend >= PLANE_ALONE) {{
+        return fold_bumps(1u, world_planar_bend(tn), n, f.fold);
+    }}
+    // TWO SCALES ON A CLIFF. One normal map tiled down a long face showed
+    // its repeat as rows of the same chevron. A second read, 2.3x larger
+    // and turned 37 degrees, is mixed in: the two periods never line up,
+    // so the sum does not repeat within any face we have. Its bumps are
+    // turned back into the first read's axes before the mix, and the mix
+    // (which averages two unrelated patterns, so comes out short) is
+    // given back its strength. A side plane's alone, by `f.second`.
+    if (f.second > 0.0) {{
         let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
         let s2 = 1.0 / (r * 2.3);
         let p2 = textureSampleGrad(
@@ -1248,26 +2059,24 @@ fn layer_normal_at(layer: i32, n: vec3<f32>, f: SampleFrame) -> vec3<f32> {{
         ).rgb;
         var t2 = p2 * 2.0 - 1.0;
         t2 = vec3<f32>(transpose(rot) * (t2.xy * mat.normal_strength), t2.z);
-        let k = 0.3 + 0.3 * f.macro_value;
-        tn = vec3<f32>(mix(tn.xy, t2.xy, k) * 1.3, mix(tn.z, t2.z, k));
-        let nw = to_world_direction(n);
-        var bent = whiteout(f.detail_axis, tn, nw);
-        // NEAR THE SWITCH between two side planes (a face turning through
-        // 45 degrees in plan), the minor plane's normal is blended in over a
-        // short band, so the bumps do not change direction along a line.
-        // Its fetch is taken only inside that band.
-        let w_major = 0.5 + 0.5 * smoothstep(0.5, 0.62, f.blend);
-        if (w_major < 0.999 && f.biplanar > 0.5) {{
-            let pm = textureSampleGrad(
-                normal_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r,
-            ).rgb;
-            var tm = pm * 2.0 - 1.0;
-            tm = vec3<f32>(tm.xy * mat.normal_strength, tm.z);
-            bent = bent * w_major + whiteout(f.minor_axis, tm, nw) * (1.0 - w_major);
-        }}
-        return to_player_direction(bent);
+        tn = vec3<f32>(mix(tn.xy, t2.xy, f.second) * (1.0 + 0.667 * f.second), mix(tn.z, t2.z, f.second));
     }}
-    return whiteout(1u, world_planar_bend(tn), n);
+    // Each plane's bumps are folded in where its axes are -- the world's --
+    // and the sum turned back into the player's frame.
+    let nw = to_world_direction(n);
+    var bent = fold_bumps(f.detail_axis, tn, nw, f.fold);
+    // THE SECOND PLANE'S, by its share, as the colour's: so the bumps do
+    // not change direction along a line where a face turns from one plane
+    // to the next. Its fetch is taken only where it has a share.
+    if (f.blend < PLANE_ALONE) {{
+        let pm = textureSampleGrad(
+            normal_tex, layer_samp, f.minor_uv / r, layer, f.minor_ddx / r, f.minor_ddy / r,
+        ).rgb;
+        var tm = pm * 2.0 - 1.0;
+        tm = vec3<f32>(tm.xy * mat.normal_strength, tm.z);
+        bent = mix(fold_bumps(f.minor_axis, tm, nw, f.fold), bent, f.blend);
+    }}
+    return to_player_direction(bent);
 }}
 
 
@@ -1318,7 +2127,14 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     let step_x = dpdx(in.world_pos);
     let step_y = dpdy(in.world_pos);
     pixel_footprint = sqrt(length(step_x) * length(step_y));
-    let n = normalize(in.normal);
+    // THE STEP-1 GROUND UNDER THE PIXEL (`ground_shape`), at whatever step
+    // its triangle is drawn: the normal the step-1 triangle there blends,
+    // and that triangle's own plane -- so a coarser triangle of
+    // `ground_lod` is lit and textured as step 1 is. The interpolated
+    // normal and the drawn triangle where there is no shape, and on a
+    // cave's ground patch (its vertices' alpha 0).
+    let shape = ground_shape_at(in.uv, in.corner, in.col.a);
+    let n = normalize(select(in.normal, to_player_direction(shape.n), shape.shaped));
     set_pixel_long_step(n, normalize(cam_pos() - in.world_pos));
 
     // Slope straight from the normal: no derivative, no extra sampling.
@@ -1334,10 +2150,9 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // axes: picked by the player-frame one, steep ground swapped its x and z
     // projections at every quarter turn (headset `outdoors_front-y90`,
     // 2026-10-01, the far bank).
-    let f = sample_frame(
-        in.tex_pos, to_world_direction(n), slope_deg, w,
-        to_world_direction(normalize(cam_pos() - in.world_pos)), distance(in.world_pos, cam_pos()),
-    );
+    // And by the triangle that is drawn, where it is not the surface the
+    // interpolated normal describes (`sample_frame`).
+    let f = sample_frame(in.tex_pos, n, step_x, step_y, to_player_direction(shape.face), shape.shaped);
 
     // Blend the layers' normals by the same weights, then renormalise. Summing
     // unit vectors shortens the result wherever they disagree, and a shortened
@@ -1386,10 +2201,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     // Along the face on a cliff, as the detail maps are: read in `sample_frame`.
     let m = f.macro_value;
     albedo = albedo * (1.0 + (m - 0.5) * 2.0 * mat.macro_strength);
-    // WET SAND where the sea's wash reaches: water in its pores darkens it to
-    // about half, damp fading out above.
-    albedo = albedo * (1.0 - 0.45 * (1.0 - smoothstep(mat.wet_line, mat.wet_line + mat.wet_band, in.tex_pos.y)));
-
+{sea_line}
     // Vertex colour survives as a tint, so the editor can still mark up ground
     // per-vertex without a second pipeline.
     // The ambient term is scaled by baked sky visibility BEFORE the lights are
@@ -1465,10 +2277,12 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
 }}
 "#,
         lights_block = terrain_lights_block(crate::renderer::lights::LightsBlockOptions::default()),
+        sea_line = SEA_LINE_WGSL,
         sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
         stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
         biplanar_block = wgsl_biplanar_block(),
         whiteout_block = wgsl_whiteout_block(),
+        shape_block = super::ground_shape::WGSL,
         layer_reads = LAYER_READS,
     )
 }
@@ -1699,6 +2513,22 @@ pub(crate) mod tests {
         const WORLD_SHIFT: glam::Vec3 = glam::Vec3::new(2.375, 0.625, 4.0);
         let offset = read + WORLD_SHIFT - glam::Quat::from_rotation_y(yaw) * read;
         let normal = (yaw_inv * glam::Vec3::from(normal)).to_array();
+        // THE QUAD LIES IN THE PLANE ITS NORMAL SAYS, through the pixel read:
+        // the ground's shader asks the triangle it is drawn on which way it
+        // faces (`sample_frame`), and a quad square to the eye carrying
+        // another surface's normal is a crease nothing on a level has. Its
+        // corners are placed so that `quad_view` puts them where they always
+        // were on screen, and the pixel read is the same point as before.
+        let plane_n = glam::Vec3::from(normal).try_normalize().unwrap_or(glam::Vec3::Z);
+        let plane_t = plane_n.any_orthonormal_vector();
+        let plane_b = plane_n.cross(plane_t);
+        let on_plane = |x: f32, y: f32| (read + plane_t * (x - read.x) + plane_b * (y - read.y)).to_array();
+        let quad_view = glam::Mat4::from_cols(
+            glam::Vec4::new(plane_t.x, plane_b.x, 0.0, 0.0),
+            glam::Vec4::new(plane_t.y, plane_b.y, 0.0, 0.0),
+            glam::Vec4::new(plane_t.z, plane_b.z, 0.0, 0.0),
+            glam::Vec4::new(read.x - plane_t.dot(read), read.y - plane_b.dot(read), 0.5, 1.0),
+        );
         let lit = light.is_some();
         let (device, queue) = headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
@@ -1710,12 +2540,13 @@ pub(crate) mod tests {
         // Both uniform buffers are created UNINITIALISED. Without writing them
         // view_proj is garbage -- the triangle lands somewhere arbitrary and the
         // readback is just clear colour -- and the light count is undefined.
-        // Identity view_proj means the vertex positions ARE clip coordinates,
-        // and an empty light list leaves the shader's AMBIENT term, which is all
-        // this test wants: it is asserting the splat blend, not the light rig.
+        // `quad_view` puts the quad's corners at the clip coordinates named
+        // below, and an empty light list leaves the shader's AMBIENT term,
+        // which is all this test wants: it is asserting the splat blend, not
+        // the light rig.
         uniforms.upload_scene(
             &queue,
-            glam::Mat4::IDENTITY,
+            quad_view,
             // The eye. Only specular reads it, and these tests assert the splat
             // blend -- so it goes straight out in front of the quad, where a
             // highlight lands symmetrically and cannot be mistaken for one of
@@ -1793,13 +2624,13 @@ pub(crate) mod tests {
             }
         };
 
-        // A quad filling clip space, carrying the normal under test. The vertex
-        // stage multiplies by view_proj, which defaults to identity here, so
-        // positions ARE clip coordinates.
+        // A quad filling clip space, carrying the normal under test and lying
+        // in its plane: the corners that `quad_view` sends to (-1, -1),
+        // (3, -1) and (-1, 3).
         let verts = [
-            vertex([-1.0, -1.0, 0.5], normal),
-            vertex([3.0, -1.0, 0.5], normal),
-            vertex([-1.0, 3.0, 0.5], normal),
+            vertex(on_plane(-1.0, -1.0), normal),
+            vertex(on_plane(3.0, -1.0), normal),
+            vertex(on_plane(-1.0, 3.0), normal),
         ];
         let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("test_vb"),
@@ -1885,6 +2716,426 @@ pub(crate) mod tests {
         let data = slice.get_mapped_range().unwrap();
         let centre = (SIZE / 2) as usize * 256 + (SIZE / 2) as usize * 4;
         Some([data[centre], data[centre + 1], data[centre + 2], data[centre + 3]])
+    }
+
+    /// The outdoor twin is the pass with its one switch turned, valid, and
+    /// much the smaller; the ground gives the lookup no face of its own (the
+    /// twin's reasoning starts from that).
+    #[test]
+    fn the_outdoor_twin_is_the_pass_with_its_switch_turned() {
+        use wgpu::naga;
+        let pass = terrain_shader_for(TerrainRole::ProbePass);
+        let twin = outdoor_pass_shader().expect("the outdoor switch moved");
+        let (sky_twice, sky_once) = crate::renderer::brush_pipeline::DEDUP_OUTDOOR_SKY;
+        assert_eq!(twin.replacen(ALL_OUTDOORS_ON, ALL_OUTDOORS_OFF, 1).replacen(sky_once, sky_twice, 1), pass);
+        assert!(twin.contains(sky_once), "the outdoor sky's two reads are no longer where the dedup edit expects them");
+        assert!(pass.contains("const PROBE_FACE_ALWAYS_GIVEN: bool = false;"));
+        assert!(!pass.contains("probe_face_given = ") && !pass.contains("probe_volume_pos = "));
+        let at = |s: &str, m: &str| s.find(m).unwrap_or_else(|| panic!("`{m}` is not in the shader"));
+        // The lookup's outdoor answer is asked before anything of the rooms'.
+        let env = &twin[at(&twin, "fn probe_environment(")..at(&twin, "fn probe_trace(")];
+        assert!(at(env, "    if (PROBE_ALL_OUTDOORS) {") < at(env, "    let hit = probe_trace(world_pos, d, trace_room, roughness);"));
+        assert!(at(env, "    if (PROBE_ALL_OUTDOORS) {") < at(env, "probe_choose(select_world, volume_world)"));
+        assert!(at(env, "    if (PROBE_ALL_OUTDOORS) {") < at(env, "probe_portal_holding(volume_world)"));
+        for (label, src) in [
+            ("twin", twin.clone()),
+            ("weather twin", crate::renderer::weather::with_weather(&twin).expect("the weather's edits moved")),
+        ] {
+            let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+        let size = |s: &str| -> usize {
+            crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum()
+        };
+        let (full, out) = (size(&pass), size(&twin));
+        println!("the ground's pass: {full} proxy units; its outdoor twin: {out}");
+        if std::env::var("TWIN_REPORT").is_ok() {
+            println!("{}", crate::renderer::shader_inlining::report("outdoor twin", &twin, "fs_main", 30));
+        }
+        // 2,162 of 4,165 with the untraced answer's two photographs in it
+        // (2026-10-12); the trace through the rooms alone is 1,500.
+        assert!(out * 5 < full * 3, "the outdoor twin is {out} of {full}: the rooms' code is still in it");
+        let Some((device, _queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let lights = LightsUniform::new(&device);
+        let (_shadows, uniforms) = crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, 1024);
+        let weather_layout = crate::renderer::weather::bind_group_layout(&device);
+        assert!(TerrainPipeline::new_probe_pass_outdoors(&device, &uniforms.layout, &fixups, None).is_some());
+        assert!(TerrainPipeline::new_probe_pass_outdoors(&device, &uniforms.layout, &fixups, Some(&weather_layout)).is_some());
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "the outdoor twins failed to build: {err:?}");
+    }
+
+    /// The painted build is each ground shader with its slope-driven weights
+    /// gone and nothing else changed: valid, the choice in every role's
+    /// shader exactly once, and what it keeps is what the choice returns on a
+    /// painted level. (The switch itself is not set here: tests share it.)
+    #[test]
+    fn the_painted_build_keeps_the_splats_weights_alone() {
+        use wgpu::naga;
+        assert!(!GROUND_PAINTED.load(std::sync::atomic::Ordering::Relaxed));
+        for role in [TerrainRole::Scene, TerrainRole::Read, TerrainRole::ProbePass] {
+            let src = terrain_shader_for(role);
+            let painted = painted_shader(&src).unwrap_or_else(|| panic!("{role:?}: the weights' choice moved"));
+            assert_eq!(painted.replacen(PAINTED_TO, PAINTED_FROM, 1), src);
+            let module = naga::front::wgsl::parse_str(&painted).unwrap_or_else(|e| panic!("{role:?}: {}", e.emit_to_string(&painted)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{role:?}: {e:?}"));
+            let size = |s: &str| -> usize {
+                crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum()
+            };
+            assert!(size(&painted) < size(&src), "{role:?}: nothing left the shader");
+        }
+        // `select(f, t, cond)` is `t` where `cond` holds, and the material sets
+        // the flag to 1 exactly when it was given a splat map.
+        assert!(PAINTED_FROM.contains("select(derived, authored, mat.use_splat > 0.5)"));
+    }
+
+    /// What the ground's pipelines are built for follows the level in hand,
+    /// unless a measurement pinned it.
+    #[test]
+    fn the_ground_is_built_for_the_level_unless_pinned() {
+        for built in [false, true] {
+            for level in [false, true] {
+                assert_eq!(ground_build_wanted(built, level, false), level, "built {built}, level {level}");
+                assert_eq!(ground_build_wanted(built, level, true), built, "pinned at {built}, level {level}");
+            }
+        }
+    }
+
+    /// Every twin the renderer builds of the ground's shaders takes the
+    /// painted build as it takes the one with the choice in it: each edit
+    /// still finds its text once, and what comes out validates. (The switch
+    /// itself is not set here: tests share it. `terrain_shader_built` is what
+    /// it selects.)
+    #[test]
+    fn every_ground_twin_takes_the_painted_build() {
+        use crate::renderer::brush_pipeline::{sun_reader_shader, FaceSun};
+        use crate::renderer::ground_twins::{dedup_pass_shader, gentle_shader, steep_shader};
+        use crate::renderer::lights::{without_pool_maps, without_spot_shadows};
+        use crate::renderer::weather::{with_weather, with_weather_kinds, WeatherKinds};
+        use wgpu::naga;
+        let read = terrain_shader_built(TerrainRole::Read, true);
+        let pass = terrain_shader_built(TerrainRole::ProbePass, true);
+        for (role, src) in [(TerrainRole::Read, &read), (TerrainRole::ProbePass, &pass)] {
+            assert_eq!(src.matches(PAINTED_TO).count(), 1, "{role:?}");
+            assert!(!src.contains(PAINTED_FROM), "{role:?}: the choice is still in the painted build");
+            assert_eq!(src.replacen(PAINTED_TO, PAINTED_FROM, 1), terrain_shader_built(role, false), "{role:?}");
+        }
+        let turned = |off: &str, on: &str| {
+            assert_eq!(pass.matches(off).count(), 1, "`{off}` is not in the painted pass once");
+            pass.replacen(off, on, 1)
+        };
+        let gentle = gentle_shader(&read).expect("gentle");
+        let steep = steep_shader(&read).expect("steep");
+        let dedup = dedup_pass_shader(&pass).expect("dedup");
+        let nowhere = turned(NOWHERE_OFF, NOWHERE_ON);
+        let outdoors = turned(ALL_OUTDOORS_OFF, ALL_OUTDOORS_ON);
+        let open = turned(OPEN_GROUND_OFF, OPEN_GROUND_ON);
+        let mut sources: Vec<(String, String)> = vec![
+            ("read baked spotless".into(), without_spot_shadows(sun_reader_shader(read.clone(), FaceSun::Baked))),
+            ("gentle baked spotless".into(), without_spot_shadows(sun_reader_shader(gentle.clone(), FaceSun::Baked))),
+            ("steep baked spotless".into(), without_spot_shadows(sun_reader_shader(steep.clone(), FaceSun::Baked))),
+            ("dedup poolless".into(), without_pool_maps(dedup.clone())),
+            ("nowhere".into(), nowhere.clone()),
+            ("outdoors".into(), outdoors.clone()),
+            ("open".into(), open.clone()),
+        ];
+        for (label, src) in [("read", &read), ("pass", &pass), ("dedup", &dedup), ("nowhere", &nowhere), ("outdoors", &outdoors), ("open", &open)] {
+            sources.push((format!("weather {label}"), with_weather(src).unwrap_or_else(|| panic!("{label}: the weather's edits moved"))));
+        }
+        for kinds in WeatherKinds::ALL {
+            let twin = with_weather_kinds(&gentle, kinds).unwrap_or_else(|| panic!("gentle {kinds:?}: the weather's edits moved"));
+            sources.push((format!("weather gentle {kinds:?}"), twin));
+        }
+        for (label, src) in &sources {
+            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+    }
+
+    /// The open-ground twin is the pass with its one switch turned: valid,
+    /// much smaller, the outdoor answer and nothing of the photographs', the
+    /// rooms' or the doorways' -- and it answers as the full pass does for a
+    /// surface in no room and no doorway once the frame says open ground
+    /// reflects (`ProbeUpload::open_ground`): escaped where it lies, coloured
+    /// by `probe_escape_colour`; nothing where too rough to trace.
+    /// The scene's ground is drawn without blending ([`OPAQUE_GROUND`]), which
+    /// is the picture a blend drew only while every reader's one answer has
+    /// alpha 1: the plain readers, the steep ones, and each with the weather.
+    #[test]
+    fn the_grounds_scene_shaders_write_alpha_one() {
+        use crate::renderer::weather::{with_weather, with_weather_kinds, WeatherKinds};
+        const ANSWER: &str = "return vec4<f32>(tonemap(in.col.rgb * lit), 1.0);";
+        let mut seen = 0;
+        for role in [TerrainRole::Scene, TerrainRole::Read] {
+            let plain = terrain_shader_for(role);
+            let mut sources = vec![plain.clone()];
+            sources.extend(crate::renderer::ground_twins::steep_shader(&plain));
+            for src in sources.clone() {
+                sources.extend(with_weather(&src));
+                sources.extend(WeatherKinds::ALL.iter().filter_map(|&k| with_weather_kinds(&src, k)));
+            }
+            for src in sources {
+                let main = &src[src.find("fn fs_main(").expect("the ground's fragment shader")..];
+                let main = &main[..main.find("\n}\n").expect("its end")];
+                let returns: Vec<&str> = main.lines().map(str::trim).filter(|l| l.starts_with("return ")).collect();
+                assert_eq!(returns, [ANSWER], "a ground reader answers with something a blend would not keep");
+                seen += 1;
+            }
+        }
+        assert!(seen >= 8, "{seen} readers looked at");
+    }
+
+    /// Every ground shader a frame may draw takes world vertices by the one
+    /// rewrite ([`world_vertices`]), and validates with it; so does the solid
+    /// pipeline's, which draws the ground into a mirror.
+    #[test]
+    fn every_ground_shader_takes_its_vertices_in_the_world() {
+        use crate::renderer::weather::{with_weather, with_weather_kinds, WeatherKinds};
+        let mut seen = 0;
+        for role in [TerrainRole::Scene, TerrainRole::Read, TerrainRole::ProbePass] {
+            let plain = terrain_shader_for(role);
+            let mut sources = vec![plain.clone()];
+            sources.extend(crate::renderer::ground_twins::steep_shader(&plain));
+            if role == TerrainRole::ProbePass {
+                sources.extend(nowhere_pass_shader());
+                sources.extend(open_pass_shader());
+                sources.extend(puddle_pass_shader());
+            }
+            for src in sources.clone() {
+                sources.extend(with_weather(&src));
+                sources.extend(WeatherKinds::ALL.iter().filter_map(|&k| with_weather_kinds(&src, k)));
+            }
+            for src in sources {
+                let world = world_vertices(&src).expect("a ground shader that does not open as the ground's does");
+                assert!(world.contains("v.pos = to_player_space(w.pos);") && world.contains("v.norm = to_player_direction(w.norm);"));
+                assert_eq!(world.matches("fn vs_main(").count(), 1);
+                // Nothing after the opening reads the world's vertex.
+                let body = &world[world.find("v.norm = to_player_direction(w.norm);").unwrap() + 40..];
+                let body = &body[..body.find("\n}\n").unwrap()];
+                assert!(!body.contains("w."), "the vertex shader reads the world's vertex past its posing");
+                seen += 1;
+            }
+        }
+        assert!(seen >= 12, "{seen} shaders looked at");
+        let validate = |label: &str, src: &str| {
+            use wgpu::naga;
+            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        };
+        validate("the ground reader from world vertices", &world_vertices(&terrain_shader_for(TerrainRole::Read)).unwrap());
+        validate("the ground's reflection pass from world vertices", &world_vertices(&terrain_shader_for(TerrainRole::ProbePass)).unwrap());
+        let solid = world_vertices(&crate::renderer::pipeline::solid_shader_src()).expect("the solid pipeline's shader opens as the ground's");
+        validate("the solid pipeline from world vertices", &solid);
+    }
+
+    /// The puddle twin is the open twin but for its answer, which is the sky
+    /// the open twin's own answer ends in; and it validates.
+    #[test]
+    fn the_puddle_twin_is_the_open_twin_answering_with_the_sky() {
+        use wgpu::naga;
+        let open = open_pass_shader().expect("the open-ground switch moved");
+        let puddle = puddle_pass_shader().expect("the open ground's answer moved");
+        assert_eq!(puddle.replacen(OPEN_SKY_COLOUR, OPEN_COLOUR, 1), open);
+        assert!(open.contains("    return sky_reflection(d, dir, lod);"), "the outdoors no longer ends in the sky");
+        let wet = crate::renderer::weather::with_weather(&puddle).expect("the weather's edits");
+        for src in [&puddle, &wet] {
+            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{e:?}"));
+        }
+    }
+
+    #[test]
+    fn the_open_twin_is_the_pass_with_its_switch_turned() {
+        use wgpu::naga;
+        let pass = terrain_shader_for(TerrainRole::ProbePass);
+        let twin = open_pass_shader().expect("the open-ground switch moved");
+        assert_eq!(twin.replacen(OPEN_GROUND_ON, OPEN_GROUND_OFF, 1), pass);
+        let at = |s: &str, m: &str| s.find(m).unwrap_or_else(|| panic!("`{m}` is not in the shader"));
+        let env = &twin[at(&twin, "fn probe_environment(")..at(&twin, "fn probe_outdoor_untraced(")];
+        let branch = at(env, "    if (PROBE_OPEN_GROUND) {");
+        for later in [
+            "    if (PROBE_NOWHERE) {",
+            "    if (PROBE_ALL_OUTDOORS) {",
+            "probe_portal_holding(volume_world)",
+            "probe_choose(select_world, volume_world)",
+            "    let hit = probe_trace(world_pos, d, trace_room, roughness);",
+        ] {
+            assert!(branch < at(env, later), "`{later}` comes before the open ground's answer");
+        }
+        let body = &env[branch..at(env, "    if (PROBE_NOWHERE) {")];
+        // The trace's own roughness test, then the escape from the surface
+        // itself in the full pass's direction and blur.
+        assert!(body.contains("if (roughness > PROBE_TRACE_MAX_ROUGHNESS) {"));
+        assert!(body.contains("let open_dir = normalize(world_dir);"));
+        assert!(body.contains("let open_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);"));
+        assert!(body.contains("probe_escape_colour(world_pos, open_dir, dir, roughness, open_lod)"));
+        assert!(env.contains("    let d = normalize(world_dir);"));
+        assert!(env.contains("    let probe_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);"));
+        // THE FULL PASS'S HALF: in the trace, where no room and no doorway
+        // holds the surface, under the table's word -- an escaped hit at the
+        // surface, which `probe_traced_colour` colours the same way.
+        let trace = &pass[at(&pass, "fn probe_trace_skipping(")..at(&pass, "fn ground_trace_until(")];
+        let holding = at(trace, "        let p = probe_portal_holding(world_pos);\n        if (p < 0) {\n            if (camera.portal_params.y < -0.5) {");
+        let fallback = &trace[holding..holding + at(&trace[holding..], "            return hit;\n        }\n")];
+        for line in ["hit.pos = world_pos;", "hit.found = true;", "hit.escaped = true;"] {
+            assert!(fallback.contains(line), "`{line}` is not in the open ground's hit");
+        }
+        assert!(at(trace, "if (roughness > PROBE_TRACE_MAX_ROUGHNESS || camera.portal_params.y > 0.5) {") < holding);
+        assert!(pass.contains("        col = probe_escape_colour(h.pos, d, sky_dir, roughness, lod);"));
+        // The ground's shaders alone: the brushes' pass keeps its text.
+        let brush = crate::renderer::brush_pipeline::brush_shader_src();
+        assert!(brush.contains("let p = probe_portal_holding(world_pos);"));
+        assert!(!brush.contains("camera.portal_params.y < -0.5"));
+        for (label, src) in [
+            ("twin", twin.clone()),
+            ("weather twin", crate::renderer::weather::with_weather(&twin).expect("the weather's edits moved")),
+        ] {
+            let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+        let size = |s: &str| -> usize {
+            crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum()
+        };
+        let (full, out) = (size(&pass), size(&twin));
+        println!("the ground's pass: {full} proxy units; its open-ground twin: {out}");
+        assert!(out * 5 < full * 3, "the open-ground twin is {out} of {full}: the rooms' machinery is still in it");
+        let Some((device, _queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let lights = LightsUniform::new(&device);
+        let (_shadows, uniforms) = crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, 1024);
+        let weather_layout = crate::renderer::weather::bind_group_layout(&device);
+        assert!(TerrainPipeline::new_probe_pass_open(&device, &uniforms.layout, &fixups, None).is_some());
+        assert!(TerrainPipeline::new_probe_pass_open(&device, &uniforms.layout, &fixups, Some(&weather_layout)).is_some());
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "the open-ground twins failed to build: {err:?}");
+    }
+
+    /// The nowhere twin is the pass with its one switch turned: valid, far
+    /// smaller, its lookup answering before anything of the photographs', the
+    /// rooms' or the doorways' -- and what it answers is what the full lookup
+    /// leaves when it finds nothing.
+    #[test]
+    fn the_nowhere_twin_is_the_pass_with_its_switch_turned() {
+        use wgpu::naga;
+        let pass = terrain_shader_for(TerrainRole::ProbePass);
+        let twin = nowhere_pass_shader().expect("the nowhere switch moved");
+        assert_eq!(twin.replacen(NOWHERE_ON, NOWHERE_OFF, 1), pass);
+        let at = |s: &str, m: &str| s.find(m).unwrap_or_else(|| panic!("`{m}` is not in the shader"));
+        let env = &twin[at(&twin, "fn probe_environment(")..at(&twin, "fn probe_outdoor_untraced(")];
+        let branch = at(env, "    if (PROBE_NOWHERE) {");
+        for later in [
+            "    if (PROBE_ALL_OUTDOORS) {",
+            "probe_portal_holding(volume_world)",
+            "probe_choose(select_world, volume_world)",
+            "    let hit = probe_trace(world_pos, d, trace_room, roughness);",
+            "    return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);",
+        ] {
+            assert!(branch < at(env, later), "`{later}` comes before the nowhere answer");
+        }
+        // What the full lookup leaves behind when it finds nothing: brightness
+        // 0 before the branch, the eye's distance in it, the reach untouched.
+        assert!(at(env, "    probe_brightness = 0.0;") < branch);
+        let body = &env[branch..branch + at(&env[branch..], "    }\n")];
+        assert!(body.contains("probe_eye_distance = distance(cam_pos(), frag_pos);"));
+        assert!(body.contains("let nothing = vec4<f32>(0.0);") && body.contains("return nothing;"));
+        assert!(!body.contains("probe_reach"));
+        for (label, src) in [
+            ("twin", twin.clone()),
+            ("weather twin", crate::renderer::weather::with_weather(&twin).expect("the weather's edits moved")),
+        ] {
+            let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+        let size = |s: &str| -> usize {
+            crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum()
+        };
+        let (full, out) = (size(&pass), size(&twin));
+        println!("the ground's pass: {full} proxy units; its nowhere twin: {out}");
+        // 1,495 of 4,165 (2026-10-12): the ground's own layers, the
+        // characters' capsules and the floor mirror.
+        assert!(out * 5 < full * 2, "the nowhere twin is {out} of {full}: the lookup is still in it");
+        if std::env::var("TWIN_REPORT").is_ok() {
+            println!("{}", crate::renderer::shader_inlining::report("nowhere twin", &twin, "fs_main", 20));
+        }
+        let Some((device, _queue)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let lights = LightsUniform::new(&device);
+        let (_shadows, uniforms) = crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let fixups = crate::renderer::probe_fixup::ProbeFixups::new(&device, &uniforms.layout, 1024);
+        let weather_layout = crate::renderer::weather::bind_group_layout(&device);
+        assert!(TerrainPipeline::new_probe_pass_nowhere(&device, &uniforms.layout, &fixups, None).is_some());
+        assert!(TerrainPipeline::new_probe_pass_nowhere(&device, &uniforms.layout, &fixups, Some(&weather_layout)).is_some());
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "the nowhere twins failed to build: {err:?}");
+    }
+
+    /// The ground's pass traces every texel, rough ones too -- skipping them is
+    /// not the same picture (`PASS_ROUGH_SKIP`) -- and the cut that prices the
+    /// rough ones' reflection puts the skip where the scene shader's own
+    /// weighting says it belongs: after the weather's code, which is what
+    /// makes wet ground smooth, from the roughness where a texel's own pixel
+    /// gives the reflection no share.
+    #[test]
+    fn the_rough_skip_is_a_cut_and_not_in_the_ground_pass() {
+        let pass = terrain_shader_for(TerrainRole::ProbePass);
+        assert!(!pass.contains(PASS_ROUGH_SKIP));
+        assert_eq!(PASS_ROUGH_SKIP_IN, PASS_ROUGH_SKIP_AT.replacen("    return", &format!("{PASS_ROUGH_SKIP}    return"), 1));
+        let (_, edits) = PROBE_PASS_REGISTER_CUTS.iter().find(|(l, _)| *l == "terrain_cut_rough_skip").unwrap();
+        let wet = crate::renderer::weather::with_weather(&pass).expect("the ground's weather twin no longer matches its shader");
+        assert!(wet.contains("    var rough = specular_aa_roughness("));
+        let at = |s: &str, m: &str| s.find(m).unwrap_or_else(|| panic!("`{m}` is not in the shader"));
+        for src in [&pass, &wet] {
+            assert_eq!(src.matches(edits[0].0).count(), 1);
+            let cut = src.replacen(edits[0].0, edits[0].1, 1);
+            assert_eq!(cut.matches(PASS_ROUGH_SKIP).count(), 1);
+            assert!(at(&cut, "    probe_fragment = in.clip;\n") < at(&cut, PASS_ROUGH_SKIP));
+            assert!(at(&cut, PASS_ROUGH_SKIP) < at(&cut, "    return probe_env_for_pass(\n        in.world_pos"));
+        }
+        // The three places the scene shader weighs the probe's answer, each by
+        // `1 - lobe_is_hemispherical`, which is 0 from the skip's roughness up.
+        let read = terrain_shader_for(TerrainRole::Read);
+        for line in [
+            "    let lobe_is_hemispherical = smoothstep(0.25, PROBE_LOBE_HEMISPHERICAL, r);",
+            "    let environment = mix(sharp, baseline, lobe_is_hemispherical);",
+            "    let image_weight = (1.0 - lobe_is_hemispherical) * clamp(probe.a, 0.0, 1.0);",
+            "    let r = clamp(roughness, 0.04, 1.0);",
+        ] {
+            assert!(read.contains(line), "the scene shader no longer has `{line}`");
+        }
+        let smoothstep = |lo: f32, hi: f32, x: f32| {
+            let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        for r in [0.75f32, 0.7500001, 0.8, 0.93, 1.0] {
+            assert_eq!(smoothstep(0.25, 0.75, r), 1.0, "{r}");
+        }
+        assert!(smoothstep(0.25, 0.75, 0.7499) < 1.0);
     }
 
     #[test]
@@ -2436,6 +3687,27 @@ impl TerrainMaterial {
         ao: &[Option<TerrainImage>],
         settings: TerrainMaterialUniform,
     ) -> Self {
+        Self::new_with_shape(device, queue, layout, layers, macro_image, splat, sky_occlusion, normals, rough, ao, settings, None)
+    }
+
+    /// [`Self::new`], with the ground's step-1 shape (`ground_shape`) for its
+    /// readers to take their normal and face from; `None` binds a
+    /// placeholder and leaves them on the vertices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_shape(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        layers: &[TerrainImage],
+        macro_image: &TerrainImage,
+        splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
+        normals: &[Option<TerrainImage>],
+        rough: &[Option<TerrainImage>],
+        ao: &[Option<TerrainImage>],
+        settings: TerrainMaterialUniform,
+        shape: Option<&super::ground_shape::GroundShape>,
+    ) -> Self {
         assert!(!layers.is_empty(), "terrain material needs at least one layer");
         let (w, h) = (layers[0].width, layers[0].height);
         assert!(
@@ -2763,6 +4035,31 @@ impl TerrainMaterial {
         let mut settings = settings;
         settings.use_splat = if splat.is_some() { 1.0 } else { 0.0 };
 
+        // THE GROUND'S SHAPE, or one texel and no shape.
+        let placeholder = super::ground_shape::GroundShape { size: [1, 1], texels: vec![[0.0, 1.0, 0.0, 0.0]], ..Default::default() };
+        let shape_image = shape.filter(|s| s.size[0] >= 2 && s.size[1] >= 2).unwrap_or(&placeholder);
+        settings.shape = match shape {
+            Some(s) if s.size[0] >= 2 && s.size[1] >= 2 => [s.uv_cells[0], s.uv_cells[1], 1.0 / s.cell[0], 1.0 / s.cell[1]],
+            _ => [0.0; 4],
+        };
+        let shape_extent = Extent3d { width: shape_image.size[0], height: shape_image.size[1], depth_or_array_layers: 1 };
+        let shape_tex = device.create_texture(&TextureDescriptor {
+            label: Some("terrain_ground_shape"),
+            size: shape_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba32Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &shape_tex, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            shape_image.bytes(),
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(16 * shape_image.size[0]), rows_per_image: Some(shape_image.size[1]) },
+            shape_extent,
+        );
+
         let uniform = device.create_buffer(&BufferDescriptor {
             label: Some("terrain_material_uniform"),
             size: std::mem::size_of::<TerrainMaterialUniform>() as u64,
@@ -2832,6 +4129,7 @@ impl TerrainMaterial {
                         }),
                     ),
                 },
+                BindGroupEntry { binding: 9, resource: BindingResource::TextureView(&shape_tex.create_view(&TextureViewDescriptor::default())) },
             ],
         });
 
@@ -2948,6 +4246,25 @@ impl TerrainMaterial {
         sky_occlusion: Option<&TerrainImage>,
         settings: TerrainMaterialUniform,
     ) -> Self {
+        Self::from_layers_with_shape(device, queue, layout, layers, normals, rough, ao, splat, sky_occlusion, settings, None)
+    }
+
+    /// [`Self::from_layers_with`], with the ground's step-1 shape: see
+    /// [`Self::new_with_shape`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_layers_with_shape(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        layers: &[Option<TerrainImage>],
+        normals: &[Option<TerrainImage>],
+        rough: &[Option<TerrainImage>],
+        ao: &[Option<TerrainImage>],
+        splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
+        settings: TerrainMaterialUniform,
+        shape: Option<&super::ground_shape::GroundShape>,
+    ) -> Self {
         let (w, h) = layers
             .iter()
             .flatten()
@@ -2972,7 +4289,7 @@ impl TerrainMaterial {
             })
             .collect();
 
-        Self::new(
+        Self::new_with_shape(
             device,
             queue,
             layout,
@@ -2984,6 +4301,7 @@ impl TerrainMaterial {
             rough,
             ao,
             settings,
+            shape,
         )
     }
 
@@ -3315,11 +4633,49 @@ pub fn load_terrain_layers(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
 /// A missing map is ordinary and not an error: that layer takes
 /// `DEFAULT_TERRAIN_ROUGHNESS`, which is what every layer used before these
 /// existed, so a project that has not authored them looks exactly as it did.
+///
+/// READ AS THE PROJECT READS THAT MATERIAL: a layer whose asset (`sources.json`
+/// beside the maps) has a `"roughness": {"min", "max"}` in the game's
+/// `material_overrides.json` takes it, as the brushes' copy of the same
+/// material does (`quest_app::brush_render::roughness_range`). The rock layer
+/// is Rock063, whose map ships at 0.33-0.59 -- wet, mirror-like stone, which is
+/// why the hallway's walls were given 0.55-1.0 (2026-09-29). The ground's copy
+/// never was: every cliff was the wet stone the walls had stopped being, bright
+/// sheen down the steep faces (headset, 2026-10-13), and every rock pixel under
+/// the probe pass's 0.75 took the reflection trace. Absent, a map is read as
+/// it is.
 pub fn load_terrain_rough(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
     TERRAIN_ROUGH_FILES
         .iter()
-        .map(|name| TerrainImage::load(&dir.join(name)))
+        .enumerate()
+        .map(|(layer, name)| {
+            let mut img = TerrainImage::load(&dir.join(name));
+            if let (Some(img), Some((lo, hi))) = (img.as_mut(), terrain_roughness_range(dir, layer)) {
+                for px in img.rgba.chunks_exact_mut(4) {
+                    for c in &mut px[..3] {
+                        *c = ((lo + (*c as f32 / 255.0) * (hi - lo)).clamp(0.0, 1.0) * 255.0).round() as u8;
+                    }
+                }
+                log::info!("terrain: layer {layer}'s roughness read as {lo:.2}..{hi:.2}");
+            }
+            img
+        })
         .collect()
+}
+
+/// What terrain layer `layer`'s roughness map's 0 and 1 stand for: its asset's
+/// entry in the game's `material_overrides.json` (the game folder is two up
+/// from the layer maps, `textures/terrain`), found through `sources.json`.
+pub fn terrain_roughness_range(dir: &std::path::Path, layer: usize) -> Option<(f32, f32)> {
+    let read = |path: std::path::PathBuf| -> Option<serde_json::Value> { serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok() };
+    let role = TERRAIN_LAYER_FILES.get(layer)?.strip_suffix(".jpg")?;
+    let sources = read(dir.join("sources.json"))?;
+    let id = sources.get(role)?.get("assetId")?.as_str()?;
+    let overrides = read(dir.parent()?.parent()?.join("material_overrides.json"))?;
+    let r = overrides.get(id)?.get("roughness")?;
+    let lo = r.get("min")?.as_f64()? as f32;
+    let hi = r.get("max")?.as_f64()? as f32;
+    (lo.is_finite() && hi.is_finite()).then_some((lo.clamp(0.0, 1.0), hi.clamp(0.0, 1.0)))
 }
 
 /// Load the four occlusion maps, per layer, falling back to none.
@@ -3418,6 +4774,16 @@ pub fn load_terrain_settings(dir: &std::path::Path) -> TerrainMaterialUniform {
     }
     if let Some(v) = raw.get("parallax").and_then(|v| v.as_f64()) {
         out.parallax = (v as f32).clamp(0.0, 0.5);
+    }
+    // How each layer takes water: see `TerrainMaterialUniform::porosity`.
+    for (key, into) in [("porosity", &mut out.porosity), ("film", &mut out.film)] {
+        if let Some(values) = raw.get(key).and_then(|r| r.as_array()) {
+            for (i, slot) in into.iter_mut().enumerate() {
+                if let Some(v) = values.get(i).and_then(|v| v.as_f64()) {
+                    *slot = (v as f32).clamp(0.0, 1.0);
+                }
+            }
+        }
     }
     out
 }
@@ -4018,6 +5384,45 @@ mod terrain_mip_tests {
 
     /// Every layer ships the full material set, so terrain is not a
     /// second-class surface next to a brush.
+    /// A layer's roughness is read through its asset's override, as the
+    /// brushes read the same material, and a layer with none as it is.
+    #[test]
+    fn a_layers_roughness_takes_its_materials_override() {
+        let game = std::env::temp_dir().join(format!("terrain_rough_{}", std::process::id()));
+        let dir = game.join("textures").join("terrain");
+        let _ = std::fs::remove_dir_all(&game);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sources.json"), r#"{"ground": {"assetId": "Grass005"}, "rock": {"assetId": "Rock063"}}"#).unwrap();
+        std::fs::write(game.join("material_overrides.json"), r#"{"Rock063": {"roughness": {"min": 0.55, "max": 1.0}}}"#).unwrap();
+        assert_eq!(super::terrain_roughness_range(&dir, 1), Some((0.55, 1.0)), "the rock layer is Rock063");
+        assert_eq!(super::terrain_roughness_range(&dir, 0), None, "grass has no override");
+        assert_eq!(super::terrain_roughness_range(&dir, 2), None, "a layer with no source");
+        // The map itself, remapped: 0.4 reads as 0.55 + 0.4 * 0.45 = 0.73.
+        let grey = image::RgbImage::from_pixel(4, 4, image::Rgb([102, 102, 102]));
+        grey.save(dir.join("rock_r.jpg")).unwrap();
+        grey.save(dir.join("ground_r.jpg")).unwrap();
+        let maps = super::load_terrain_rough(&dir);
+        let read = |m: &Option<super::TerrainImage>| m.as_ref().unwrap().rgba[0] as f32 / 255.0;
+        assert!((read(&maps[1]) - 0.73).abs() < 0.02, "rock read as {}", read(&maps[1]));
+        assert!((read(&maps[0]) - 0.4).abs() < 0.02, "grass read as {}", read(&maps[0]));
+        let _ = std::fs::remove_dir_all(&game);
+    }
+
+    /// The shipped rock reads as the hallway's walls read the same stone:
+    /// dry, its median 0.74 where the map's own is 0.43.
+    #[test]
+    fn the_shipped_cliffs_read_as_dry_rock() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/textures/terrain");
+        let Some(Some(rock)) = super::load_terrain_rough(&dir).into_iter().nth(1) else {
+            eprintln!("skipping: no terrain rock map");
+            return;
+        };
+        let mut v: Vec<u8> = rock.rgba.chunks_exact(4).map(|p| p[0]).collect();
+        v.sort_unstable();
+        let median = v[v.len() / 2] as f32 / 255.0;
+        assert!(median > 0.7, "the cliffs' rock reads at a median roughness of {median}: wet stone");
+    }
+
     #[test]
     fn every_layer_has_a_roughness_and_occlusion_file_name() {
         assert_eq!(super::TERRAIN_ROUGH_FILES.len(), super::TERRAIN_LAYER_FILES.len());
@@ -4058,5 +5463,263 @@ mod terrain_mip_tests {
                 );
             }
         }
+    }
+}
+
+/// STEEP SHAPES, as the ground's frame reads them (2026-10-13): a CPU
+/// transcription of how `sample_frame` chooses its planes and shares and how
+/// `layer_normal_at` folds a layer's bumps, run on the heightfield mesh of each
+/// shape the headset showed faults on -- with the old reading beside it, which
+/// each test must catch. Cells are test_room's (0.43 m), split on one diagonal,
+/// normals area-weighted as `terrain_render::vertex_normals` makes them.
+#[cfg(test)]
+mod steep_shapes_frame {
+    use glam::Vec3;
+
+    const CELL: f32 = 0.43;
+    const TIE: f32 = 0.57735;
+    const STEEP_COS: f32 = 0.95106; // cos 18 degrees, `biplanar_start_deg`
+    // The grass map's mean bump z (`ground_n.jpg`): what whiteout shortened.
+    const BUMP_Z: f32 = 0.63;
+
+    struct Mesh {
+        p: Vec<Vec3>,
+        n: Vec<Vec3>,
+        tris: Vec<[usize; 3]>,
+    }
+
+    fn mesh(size: usize, h: impl Fn(usize, usize) -> f32) -> Mesh {
+        let at = |i: usize, j: usize| i * size + j;
+        let p: Vec<Vec3> = (0..size * size).map(|k| Vec3::new((k % size) as f32 * CELL, h(k / size, k % size), (k / size) as f32 * CELL)).collect();
+        let mut tris = Vec::new();
+        for i in 0..size - 1 {
+            for j in 0..size - 1 {
+                tris.push([at(i, j), at(i + 1, j), at(i, j + 1)]);
+                tris.push([at(i, j + 1), at(i + 1, j), at(i + 1, j + 1)]);
+            }
+        }
+        let mut n = vec![Vec3::ZERO; p.len()];
+        for t in &tris {
+            let c = (p[t[1]] - p[t[0]]).cross(p[t[2]] - p[t[0]]);
+            let c = if c.y < 0.0 { -c } else { c };
+            for &v in t {
+                n[v] += c;
+            }
+        }
+        Mesh { p, n: n.into_iter().map(|v| v.normalize()).collect(), tris }
+    }
+
+    /// The five shapes: a one-cell wall, an 85-degree face over four cells, a
+    /// knife ridge, a cliff's foot onto level sand, and a stair of one-cell
+    /// steps.
+    fn shapes() -> Vec<(&'static str, Mesh)> {
+        let s = 12;
+        vec![
+            ("wall", mesh(s, |_, j| if j >= 6 { 13.0 } else { 0.0 })),
+            ("face85", mesh(s, |_, j| (j.clamp(4, 8) - 4) as f32 * CELL * 85f32.to_radians().tan())),
+            ("ridge", mesh(s, |_, j| (6.0 - (j as f32 - 6.0).abs() * CELL * 70f32.to_radians().tan()).max(0.0))),
+            ("foot", mesh(s, |_, j| (j.max(6) - 6) as f32 * CELL * 80f32.to_radians().tan())),
+            ("stair", mesh(s, |_, j| (j / 2) as f32 * 0.8)),
+        ]
+    }
+
+    /// The planes and their shares as the frame reads them: (axis, share)
+    /// pairs, and the top plane's fold.
+    fn planes_new(n: Vec3, face: Vec3) -> ([(usize, f32); 2], f32) {
+        let steep = n.y.min(face.y) <= STEEP_COS;
+        let agree = ((n.dot(face).abs() - 0.9703) * 41.3).clamp(0.0001, 1.0);
+        let pn = face.lerp(n, agree).normalize();
+        let (major, minor) = axes(pn);
+        let a = pn.abs();
+        let (ma, me) = (a[major], a[minor]);
+        let lead = ma - TIE;
+        let share = (lead + 0.0001) / (lead + (me - TIE).max(0.0) + 0.0001);
+        if !steep {
+            return ([(1, 1.0), (minor, 0.0)], 1.0);
+        }
+        ([(major, share), (minor, 1.0 - share)], agree)
+    }
+
+    /// As it was: the planes by the interpolated normal alone, steep by its
+    /// slope, the second plane by `ma / (ma + me)` in the colour only, and the
+    /// normal folded on the first plane alone.
+    fn planes_old(n: Vec3) -> ([(usize, f32); 2], [(usize, f32); 2]) {
+        let (major, minor) = axes(n);
+        if n.y > STEEP_COS {
+            return ([(1, 1.0), (minor, 0.0)], [(1, 1.0), (minor, 0.0)]);
+        }
+        let a = n.abs();
+        let w = a[major] / (a[major] + a[minor]);
+        ([(major, w), (minor, 1.0 - w)], [(major, 1.0), (minor, 0.0)])
+    }
+
+    fn axes(n: Vec3) -> (usize, usize) {
+        let a = n.abs();
+        let major = if a.y >= a.x && a.y >= a.z { 1 } else if a.x >= a.z { 0 } else { 2 };
+        let minor = (0..3).filter(|&k| k != major).max_by(|&i, &j| a[i].total_cmp(&a[j])).unwrap();
+        (major, minor)
+    }
+
+    /// A flat bump (its mean) folded on `axis`: `fold_bumps` and `whiteout`.
+    fn fold(axis: usize, n: Vec3, keep: f32) -> Vec3 {
+        if axis == 1 {
+            let g = BUMP_Z + (1.0 - BUMP_Z) * keep;
+            return Vec3::new(g * n.x, BUMP_Z * n.y, g * n.z);
+        }
+        n * BUMP_Z
+    }
+    fn whiteout(axis: usize, n: Vec3) -> Vec3 {
+        let mut v = n;
+        v[axis] *= BUMP_Z;
+        v
+    }
+
+    /// Points across each triangle (barycentric), with the triangle's own
+    /// normal and the interpolated one there.
+    fn samples(m: &Mesh) -> Vec<(usize, Vec3, Vec3, Vec3)> {
+        let mut out = Vec::new();
+        for (t, tri) in m.tris.iter().enumerate() {
+            let [a, b, c] = tri.map(|v| m.p[v]);
+            let face = (b - a).cross(c - a).normalize();
+            let face = if face.y < 0.0 { -face } else { face };
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.5, 0.0), (0.0, 0.5), (0.5, 0.5), (0.33, 0.33), (0.1, 0.1), (0.8, 0.1), (0.1, 0.8)] {
+                let w = 1.0 - u - v;
+                let pos = a * w + b * u + c * v;
+                let n = (m.n[tri[0]] * w + m.n[tri[1]] * u + m.n[tri[2]] * v).normalize();
+                out.push((t, pos, n, face));
+            }
+        }
+        out
+    }
+
+    /// The most a plane with any visible share (a tenth) stretches the picture
+    /// on the triangle it is drawn on: 1 / |face . axis|.
+    fn worst_stretch(planes: &[(usize, f32)], face: Vec3) -> f32 {
+        planes.iter().filter(|(_, s)| *s >= 0.1).map(|&(k, _)| 1.0 / face.abs()[k].max(0.01)).fold(1.0, f32::max)
+    }
+
+    /// M1: NO PLANE IS READ STRETCHED. The old reading, taking its planes from
+    /// the interpolated normal, pulled the picture out several times on every
+    /// shape (the herringbone, the comb teeth); the frame keeps every plane
+    /// with a share within 2.8 (the tie's 1.73, widened by the 14 degrees
+    /// over which the triangle takes over from the normal).
+    #[test]
+    fn no_plane_is_read_stretched_on_any_steep_shape() {
+        for (name, m) in shapes() {
+            let (mut new, mut old) = (1.0f32, 1.0f32);
+            for (_, _, n, face) in samples(&m) {
+                new = new.max(worst_stretch(&planes_new(n, face).0, face));
+                old = old.max(worst_stretch(&planes_old(n).0, face));
+            }
+            assert!(new <= 2.8, "{name}: a plane is read stretched {new:.1} times");
+            assert!(old > 3.0, "{name}: the old reading stretched only {old:.1} times -- the shape no longer tests anything");
+        }
+    }
+
+    /// M2: THE BUMPS SHADE ONE NORMAL ON EITHER SIDE OF ANY LINE. Where two
+    /// triangles meet, and where a plane takes over inside one, the mean
+    /// shading normal must not jump: the old reading turned it by up to
+    /// fifteen degrees at once (the pale V, the dark facets, the line along a
+    /// rise's foot).
+    #[test]
+    fn the_mean_shading_normal_never_jumps() {
+        let shade_new = |n: Vec3, face: Vec3| {
+            let (planes, keep) = planes_new(n, face);
+            planes.iter().map(|&(k, s)| fold(k, n, keep) * s).sum::<Vec3>().normalize()
+        };
+        let shade_old = |n: Vec3| {
+            let (_, normal) = planes_old(n);
+            whiteout(normal[0].0, n).normalize()
+        };
+        for (name, m) in shapes() {
+            let (mut new, mut old) = (0.0f32, 0.0f32);
+            // The same point seen from every triangle it lies on: a vertex,
+            // with that triangle's own normal and the shared interpolated one.
+            let pts = samples(&m);
+            for (i, &(ti, pi, ni, fi)) in pts.iter().enumerate() {
+                for &(tj, pj, nj, fj) in &pts[i + 1..] {
+                    if ti == tj || pi.distance(pj) > 1e-4 {
+                        continue;
+                    }
+                    new = new.max(shade_new(ni, fi).angle_between(shade_new(nj, fj)).to_degrees());
+                    old = old.max(shade_old(ni).angle_between(shade_old(nj)).to_degrees());
+                }
+            }
+            // And along a fine line up each shape (a row of edges, across the
+            // rise), where the old reading's plane flipped inside a triangle.
+            let k = |r: usize, c: usize| r * 12 + c;
+            let steps = 4000;
+            let along = |t: f32| {
+                let (j, f) = ((t as usize).min(10), t - (t as usize).min(10) as f32);
+                m.n[k(5, j)].lerp(m.n[k(5, j + 1)], f).normalize()
+            };
+            for step in 0..steps {
+                let (t0, t1) = (step as f32 * 11.0 / steps as f32, (step + 1) as f32 * 11.0 / steps as f32);
+                old = old.max(shade_old(along(t0)).angle_between(shade_old(along(t1))).to_degrees());
+            }
+            assert!(new < 1.0, "{name}: the shading normal jumps {new:.1} degrees across a line");
+            // (A smooth 85-degree face and a stair of 62-degree steps never
+            // cross a tie: their old fault was the stretch, above.)
+            if name != "face85" && name != "stair" {
+                assert!(old > 4.0, "{name}: the old reading jumped only {old:.1} degrees -- the shape no longer tests anything");
+            }
+        }
+    }
+
+    /// M3: no derivative of a coordinate a pixel CHOSE: every gradient the
+    /// frame hands the reads is two parts of the world position's own.
+    #[test]
+    fn the_frame_takes_no_derivative_of_a_chosen_coordinate() {
+        let src = super::terrain_shader();
+        let frame = src.split("fn sample_frame").nth(1).and_then(|s| s.split("\nfn ").next()).expect("sample_frame");
+        for (i, _) in frame.match_indices("dpdx(").chain(frame.match_indices("dpdy(")) {
+            assert!(frame[i + 5..].starts_with("world)"), "a derivative of something other than the world position: {}", &frame[i..i + 40]);
+        }
+    }
+
+    /// The twins' classes agree with the frame: a triangle whose own face is
+    /// steep is never drawn by the gentle twin, whatever its normals say --
+    /// the ridge's crest and the stair's treads, whose normals read gentle.
+    #[test]
+    fn a_steep_faced_triangle_is_never_gentle() {
+        for (name, m) in shapes() {
+            for tri in &m.tris {
+                let pos = tri.map(|v| m.p[v].to_array());
+                let face_y = crate::renderer::ground_twins::face_height(pos);
+                let normals = tri.map(|v| m.n[v].to_array());
+                if face_y <= STEEP_COS {
+                    assert!(!crate::renderer::ground_twins::triangle_is_gentle(normals, face_y, 18.0), "{name}: a steep face drawn gentle");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod relief_tests {
+    use super::*;
+
+    /// THE RELIEF IS THE DESKTOP'S ALONE: the headset's ground shaders carry
+    /// none of its march (code compiled in costs a Quest shader even when a
+    /// uniform skips it), and the desktop's carries it once and validates.
+    #[test]
+    fn only_the_desktop_ground_marches_the_relief() {
+        for role in [TerrainRole::Scene, TerrainRole::Read, TerrainRole::ProbePass] {
+            let src = terrain_shader_for(role);
+            assert!(!src.contains("parallax_shift"), "{role:?} carries the relief march");
+            let (plain, shaped) = twin_sources(src);
+            assert!(!plain.contains("parallax_shift"));
+            assert!(shaped.map_or(true, |s| !s.contains("parallax_shift")));
+        }
+        let desktop = with_relief(&terrain_shader_for(TerrainRole::Scene)).expect("the scene reader takes the relief");
+        assert_eq!(desktop.matches("fn parallax_shift(").count(), 1);
+        assert_eq!(desktop.matches("parallax_shift(in.tex_pos.xz").count(), 1);
+        let (plain, _) = twin_sources(desktop);
+        wgpu::naga::front::wgsl::parse_str(&plain).expect("the desktop ground parses");
+    }
+
+    #[test]
+    fn the_material_uniform_is_the_wgsl_structs_size() {
+        assert_eq!(std::mem::size_of::<TerrainMaterialUniform>() % 16, 0);
     }
 }

@@ -27,9 +27,10 @@
 //!
 //! The ground is rough enough that the light it returns barely depends on where
 //! it is seen from, which is what lets one picture serve every viewpoint.
-//! What it leaves out, deliberately: the layers' normal-map detail and texture
-//! grain (averaged into each layer's mean colour), the ground's own specular,
-//! and moving shadows. Buildings are not in it -- a reflection that should meet
+//! Its colour is each layer's texture filtered to the map's grain
+//! (`LayerDetail`), so a mirror of a rock face shows the rock's blocks. What it
+//! leaves out, deliberately: the layers' normal-map detail, texture grain finer
+//! than a texel, the ground's own specular, and moving shadows. Buildings are not in it -- a reflection that should meet
 //! another building's wall outdoors passes behind it.
 
 use glam::{Vec2, Vec3};
@@ -119,6 +120,23 @@ pub struct GroundInputs<'a> {
     pub settings: &'a TerrainMaterialUniform,
 }
 
+/// HOW FAR IN FROM THE MAP'S EDGE ITS PICTURE GOES OVER TO THE OPEN SHELF,
+/// where the ground lies under a sea (`settings.sea_line`): ONE colour all
+/// round, the mean over the outermost texels of the layers' mean colours as
+/// they lie, level, under the whole sky and the full sun.
+///
+/// WHY (headset, 2026-10-15). Past the map the water reads the bed's light by
+/// clamping to the map's last texel, so every texel of that row was drawn out
+/// to the horizon as a stripe: the island's shadow on the sea floor at the
+/// edge, its comb of lit and shaded ridges, the layers' texture
+/// (`LayerDetail`) -- 5-6 dark "pipes" running out to sea off the island's
+/// sides. Nothing beyond the map shades the shelf, its texture is no longer
+/// the map's to know, and it lies level, not on the rim's own slope. Under 8 m or more of water at test_room's edge;
+/// inside 3 m of the edge the water shows this picture, from 3 to 6 m it
+/// hands over to the drawn bed (`water_pipeline`, `smoothstep(3.0, 6.0,
+/// from_edge)`).
+pub const RIM_FADE_METRES: f32 = 4.0;
+
 /// The picture: `texels` row-major, x fastest, row 0 at `min.y` (world z).
 pub struct GroundMap {
     pub width: u32,
@@ -151,6 +169,74 @@ fn layer_mean(layer: Option<&TerrainImage>, fallback: [u8; 3]) -> Vec3 {
         sum += Vec3::new(srgb_to_linear(px[0]), srgb_to_linear(px[1]), srgb_to_linear(px[2]));
     }
     sum / n.max(1) as f32
+}
+
+/// A LAYER'S TEXTURE AT THE MAP'S GRAIN: its tile box-filtered, in linear
+/// light, to about one pixel a map texel (`repeat` metres a tile over
+/// `texel` metres a texel), so each texel reads what the terrain shader's
+/// texture averages to over it -- the rock's blocks and the sand's ripples
+/// where they are larger than a texel -- and never aliases. Its mean is the
+/// layer's mean. Without it the map was each layer's ONE mean colour, and a
+/// calm pond mirroring the rock slope behind it showed a flat tan smear: not
+/// water, an olive mound (2026-10-14).
+struct LayerDetail {
+    size: u32,
+    texels: Vec<Vec3>,
+}
+
+impl LayerDetail {
+    fn of(img: &TerrainImage, repeat: f32, texel: f32) -> Option<Self> {
+        if img.width == 0 || img.height == 0 || img.rgba.len() < (img.width * img.height * 4) as usize || repeat <= 0.0 || texel <= 0.0 {
+            return None;
+        }
+        let size = ((repeat / texel).round() as u32).clamp(1, img.width.min(img.height));
+        let mut texels = Vec::with_capacity((size * size) as usize);
+        for j in 0..size {
+            let (y0, y1) = (j * img.height / size, ((j + 1) * img.height / size).max(j * img.height / size + 1));
+            for i in 0..size {
+                let (x0, x1) = (i * img.width / size, ((i + 1) * img.width / size).max(i * img.width / size + 1));
+                let mut sum = Vec3::ZERO;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let k = ((y * img.width + x) * 4) as usize;
+                        sum += Vec3::new(srgb_to_linear(img.rgba[k]), srgb_to_linear(img.rgba[k + 1]), srgb_to_linear(img.rgba[k + 2]));
+                    }
+                }
+                texels.push(sum / ((y1 - y0) * (x1 - x0)) as f32);
+            }
+        }
+        Some(Self { size, texels })
+    }
+
+    /// Bilinear, the tile repeating, at `uv` in tiles.
+    fn at(&self, uv: Vec2) -> Vec3 {
+        let n = self.size as f32;
+        let f = (uv - uv.floor()) * n - Vec2::splat(0.5);
+        let (fx, fy) = (f.x.rem_euclid(n), f.y.rem_euclid(n));
+        let (x0, y0) = (fx.floor() as u32 % self.size, fy.floor() as u32 % self.size);
+        let (x1, y1) = ((x0 + 1) % self.size, (y0 + 1) % self.size);
+        let (tx, ty) = (fx - fx.floor(), fy - fy.floor());
+        let p = |x: u32, y: u32| self.texels[(y * self.size + x) as usize];
+        let a = p(x0, y0).lerp(p(x1, y0), tx);
+        let b = p(x0, y1).lerp(p(x1, y1), tx);
+        a.lerp(b, ty)
+    }
+
+    /// The layer's colour at a WORLD point with the ground's normal `n` there:
+    /// top-down on gentle ground, and on ground steeper than
+    /// `biplanar_start_deg` along the world's axes, each by how squarely the
+    /// ground faces it -- the terrain shader's biplanar projection
+    /// (`material_wgsl::biplanar_axes`), as a weighted blend of all three.
+    fn colour(&self, world: Vec3, n: Vec3, repeat: f32, steep: bool) -> Vec3 {
+        let r = repeat.max(1e-3);
+        if !steep {
+            return self.at(Vec2::new(world.x, world.z) / r);
+        }
+        let a = n.abs();
+        let w = Vec3::new(a.x.powi(4), a.y.powi(4), a.z.powi(4));
+        let w = w / (w.x + w.y + w.z).max(1e-6);
+        self.at(Vec2::new(world.z, world.y) / r) * w.x + self.at(Vec2::new(world.x, world.z) / r) * w.y + self.at(Vec2::new(world.x, world.y) / r) * w.z
+    }
 }
 
 /// Bilinear RGBA of an 8-bit image at `uv` in 0..1, each channel 0..1.
@@ -250,9 +336,16 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
     let means: Vec<Vec3> = (0..4)
         .map(|i| layer_mean(inputs.layers.get(i).and_then(|l| l.as_ref()), FALLBACK_LAYER_COLOURS[i]))
         .collect();
+    // Each layer's texture at the map's grain (`LayerDetail`), where it has one.
+    let texel = (extent.x / size as f32).max(extent.y / size as f32);
+    let details: Vec<Option<LayerDetail>> = (0..4)
+        .map(|i| inputs.layers.get(i).and_then(|l| l.as_ref()).and_then(|img| LayerDetail::of(img, inputs.settings.repeat[i], texel)))
+        .collect();
+    let steep_cos = inputs.settings.biplanar_start_deg.to_radians().cos();
     let sun = inputs.sun.map(|s| (Vec3::from(s.direction).normalize_or_zero(), Vec3::from(s.light_rgb)));
     let mut texels = Vec::with_capacity((size * size) as usize);
     let mut buried = Vec::with_capacity((size * size) as usize);
+    let mut rims: Vec<(usize, f32, Vec3)> = Vec::new();
     let mut top = f32::MIN;
     for j in 0..size {
         for i in 0..size {
@@ -262,10 +355,20 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
             let n = g.normal(x, z);
             let slope_deg = n.y.clamp(-1.0, 1.0).acos().to_degrees();
             let w = layer_weights(inputs.settings, inputs.splat, uv, y, slope_deg);
-            let albedo = means[0] * w[0] + means[1] * w[1] + means[2] * w[2] + means[3] * w[3];
-            // Wet sand, as the terrain shader darkens it.
+            let world = Vec3::new(x, y, z);
+            let albedo: Vec3 = (0..4)
+                .filter(|&k| w[k] > 1e-3)
+                .map(|k| match &details[k] {
+                    Some(d) => d.colour(world, n, inputs.settings.repeat[k], n.y < steep_cos) * w[k],
+                    None => means[k] * w[k],
+                })
+                .sum();
+            // Under still water, soaked, as the terrain shader has it
+            // (`terrain_pipeline::SEA_LINE_WGSL`). The wash above it moves,
+            // and this map is made once: a beach is here as it is dry.
             let s = inputs.settings;
-            let albedo = albedo * (1.0 - 0.45 * (1.0 - smoothstep(s.wet_line, s.wet_line + s.wet_band, y)));
+            let soaked = (0..4).map(|k| w[k] * s.porosity[k]).sum::<f32>() * ((s.sea_line - y) * 20.0).clamp(0.0, 1.0);
+            let albedo = albedo + (albedo.map(crate::renderer::weather::wet_albedo) - albedo) * soaked;
             let (sky_vis, sun_vis, under_a_floor) = sky_and_sun(inputs.sky_occlusion, uv);
             buried.push(under_a_floor);
             let e = inputs.sky.evaluate([n.x, n.y, n.z]);
@@ -274,11 +377,50 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
                 light += rgb * n.dot(to_sun).max(0.0) * sun_vis;
             }
             let rgb = albedo * light * (1.0 - F0);
+            // THE RIM UNDER A SEA (`RIM_FADE_METRES`): past the map's edge the
+            // water reads the bed by clamping to the map's last texel
+            // (`water_pipeline`'s `bed_at`, `underwater`'s `uw_bed`), so
+            // whatever runs along that row is drawn out to the horizon. Here
+            // the rim goes over to the open shelf: the layers' mean colours,
+            // level, under the whole sky and the full sun -- laid after the fill
+            // under buildings, which would otherwise carry a buried texel's
+            // neighbours back onto it.
+            let from_edge = (extent.x * uv.x.min(1.0 - uv.x)).min(extent.y * uv.y.min(1.0 - uv.y));
+            // (From the outermost texels' centres, which the clamp reads:
+            // those are wholly the shelf.)
+            let rim = (1.0 - smoothstep(0.5 * texel, RIM_FADE_METRES, from_edge)) * ((s.sea_line - y) * 20.0).clamp(0.0, 1.0);
+            if rim > 0.0 {
+                let level = layer_weights(inputs.settings, inputs.splat, uv, y, 0.0);
+                let mean: Vec3 = (0..4).map(|k| means[k] * level[k]).sum();
+                let soaked = (0..4).map(|k| level[k] * s.porosity[k]).sum::<f32>() * ((s.sea_line - y) * 20.0).clamp(0.0, 1.0);
+                let mean = mean + (mean.map(crate::renderer::weather::wet_albedo) - mean) * soaked;
+                // Lying as the shelf past the edge lies (`bed_at`: falling
+                // away at a gentle `SHELF_SLOPE`), level -- not on the slope
+                // the rim texel stands on, which along test_room's west edge
+                // is the island's flank turned from the sun.
+                let mut open = Vec3::from(inputs.sky.evaluate([0.0, 1.0, 0.0]));
+                if let Some((to_sun, rgb)) = sun {
+                    open += rgb * to_sun.y.max(0.0);
+                }
+                rims.push((texels.len(), rim, mean * open * (1.0 - F0)));
+            }
             top = top.max(y);
             texels.push([rgb.x, rgb.y, rgb.z, y]);
         }
     }
     fill_under_buildings(&mut texels, &mut buried, size as usize, size as usize);
+    // ONE shelf all round: the mean of the outermost texels' level colours.
+    // Each texel's own (a rock patch painted to the edge beside sand) would be
+    // drawn out to sea as a band as wide as the patch.
+    let ring: Vec<Vec3> = rims.iter().filter(|r| r.1 > 0.999).map(|r| r.2).collect();
+    if !ring.is_empty() {
+        let shelf = ring.iter().copied().sum::<Vec3>() / ring.len() as f32;
+        for (k, rim, _) in rims {
+            let t = &mut texels[k];
+            let rgb = Vec3::new(t[0], t[1], t[2]).lerp(shelf, rim);
+            (t[0], t[1], t[2]) = (rgb.x, rgb.y, rgb.z);
+        }
+    }
     GroundMap { width: size, height: size, texels, min: g.min, max: g.max, top }
 }
 
@@ -556,8 +698,8 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
     let mut steps = 0;
     let mut reads = 0;
     // A ray that starts under the map's ground meets nothing until it has
-    // risen above it (`ground_trace_until`).
-    let mut risen = false;
+    // risen above it -- unless it heads down (`ground_trace_until`).
+    let mut risen = d.y <= 0.0;
     while steps < shape.max_steps && t < t_out {
         steps += 1;
         reads += 1;
@@ -923,6 +1065,28 @@ mod tests {
         assert!(checked > 0, "no level ray met a hill");
     }
 
+    /// A ray heading DOWN from under the map's ground is in the ground: it
+    /// meets it where it starts, in the first cell's steps, rather than
+    /// walking its whole budget waiting to rise and answering the sky
+    /// (round 5, 2026-10-08).
+    #[test]
+    fn a_ray_heading_down_from_under_the_ground_meets_it_where_it_starts() {
+        let map = fixtures::height_map(1024, fixtures::hills);
+        let chain = levels(&map);
+        let size = map.max - map.min;
+        for i in 0..400 {
+            let x = map.min.x + size.x * (0.1 + 0.8 * ((i * 37 % 400) as f32 / 400.0));
+            let z = map.min.y + size.y * (0.1 + 0.8 * ((i * 91 % 400) as f32 / 400.0));
+            let under = height_at(&chain[0], (Vec2::new(x, z) - map.min) * (chain[0].width as f32 / size)) - 0.05;
+            let e = Vec3::new(x, under, z);
+            for d in [Vec3::new(0.7, -0.05, 0.7).normalize(), Vec3::new(-0.3, -0.6, 0.2).normalize(), Vec3::new(1.0, 0.0, 0.0)] {
+                let r = trace(&chain, map.min, map.max, map.top, e, d);
+                assert!(r.t.is_some_and(|t| t < 1e-3), "from under the ground at {e} along {d}: {:?}", r.t);
+                assert!(r.steps <= 4, "from under the ground at {e} along {d}: {} steps", r.steps);
+            }
+        }
+    }
+
     /// The trace against brute force: the same ground read every centimetre
     /// along the ray. They must meet the ground at the same point, and differ
     /// on hit or miss only for a ray that grazes it within a few centimetres.
@@ -991,6 +1155,77 @@ mod tests {
         let cliff = map.texels[5 * 10 + 8];
         assert!(plain[1] > plain[0], "the plain is the grass layer: {plain:?}");
         assert!(cliff[0] > cliff[1], "the cliff is the rock layer: {cliff:?}");
+    }
+
+    /// THE SEA FLOOR AT THE MAP'S EDGE CARRIES NO PATTERN TO DRAW OUT TO SEA.
+    /// The water reads the bed past the edge by clamping to the last texel,
+    /// so a row of the island's shadows (here: stripes of shadow across the
+    /// sea floor) or of the layer's texture there was drawn to the horizon as
+    /// long dark "pipes" (headset, 2026-10-15). Under a sea the outermost
+    /// texels are one colour along the edge -- the open shelf -- and ground
+    /// past `RIM_FADE_METRES` keeps its own picture. On dry ground the rim
+    /// is left as it is.
+    #[test]
+    fn the_sea_floor_at_the_maps_edge_is_one_colour_along_it() {
+        // Ridges running out to sea, as the island's flank has: the rim's
+        // own slope turns to and from the sun along the edge.
+        let g = HeightGrid::sample(Vec2::new(-10.0, -10.0), Vec2::new(10.0, 10.0), 81, 81, |x, _| -10.0 + 0.6 * (x * 1.7).sin());
+        let sun = SkySun { direction: [0.6, 0.8, 0.0], light_rgb: [4.0, 4.0, 4.0], texels: 1, energy_fraction: 0.5 };
+        // A textured layer: a checker the map carries at its grain.
+        let checker: Vec<u8> = (0..16).flat_map(|i| if (i % 4 + i / 4) % 2 == 0 { [40, 40, 40, 255] } else { [220, 220, 220, 255] }).collect();
+        let layers = [Some(TerrainImage { width: 4, height: 4, rgba: checker }), Some(TerrainImage { width: 1, height: 1, rgba: vec![60, 50, 30, 255] })];
+        // Painted: sediment-free ground, with a patch of the second layer
+        // reaching the near edge.
+        let splat = TerrainImage {
+            width: 4,
+            height: 4,
+            rgba: (0..16).flat_map(|i| if i == 1 { [0u8, 255, 0, 0] } else { [255u8, 0, 0, 0] }).collect(),
+        };
+        // Sun shadow stripes across the whole floor, along x: lit, shaded, ...
+        let occ_w = 16;
+        let occ = TerrainImage {
+            width: occ_w,
+            height: 1,
+            rgba: (0..occ_w).flat_map(|i| if i % 2 == 0 { [255u8, 255, 0, 0] } else { [255, 0, 0, 0] }).collect(),
+        };
+        let size = 64u32;
+        let built = |sea_line: f32| {
+            let mut s = TerrainMaterialUniform::default();
+            s.repeat = [1.5; 4];
+            s.sea_line = sea_line;
+            build(
+                &GroundInputs { heights: &g, sky: &sky(), sun: Some(&sun), sky_occlusion: Some(&occ), layers: &layers, splat: Some(&splat), settings: &s },
+                size,
+            )
+        };
+        let spread = |map: &GroundMap, row: u32| {
+            let r: Vec<f32> = (0..size).map(|i| map.texels[(row * size + i) as usize][0]).collect();
+            let (lo, hi) = r.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            (hi - lo) / hi.max(1e-6)
+        };
+        let sea = built(-1.4);
+        let dry = built(-1e9);
+        // The rows the clamp reads past each edge: one colour along them.
+        assert!(spread(&sea, 0) < 1e-4, "the near edge's row varies by {:.3} of its brightest", spread(&sea, 0));
+        assert!(spread(&sea, size - 1) < 1e-4, "the far edge's row varies by {:.3}", spread(&sea, size - 1));
+        // And the side edges, across the stripes: one colour, the same.
+        let side: Vec<f32> = (0..size).map(|j| sea.texels[(j * size) as usize][0]).collect();
+        let (lo, hi) = side.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        assert!(hi - lo < 1e-4 * hi, "a side edge varies by {:.3}", (hi - lo) / hi);
+        // One colour all round.
+        let far = sea.texels[(size * size - 1) as usize][0];
+        assert!((side[0] - sea.texels[0][0]).abs() < 1e-6 && (far - side[0]).abs() < 1e-4 * hi, "the edges differ: {} {far}", side[0]);
+        // Inside the rim the floor is its own picture: the stripes are there,
+        // as they are on dry ground.
+        let mid = size / 2;
+        let inner_spread = {
+            let r: Vec<f32> = (size / 4..size - size / 4).map(|i| sea.texels[(mid * size + i) as usize][0]).collect();
+            let (lo, hi) = r.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            (hi - lo) / hi
+        };
+        assert!(inner_spread > 0.3, "the floor's own shadows inside the rim: {inner_spread:.3}");
+        // Dry ground keeps its edge: the stripes reach it there.
+        assert!(spread(&dry, 0) > 0.3, "a dry rim is left as it is: {:.3}", spread(&dry, 0));
     }
 
     /// A painted splat map decides the layers, as it does in the terrain
@@ -1076,6 +1311,38 @@ mod step_census {
         }
         for (el, (n, s, m, h)) in buckets {
             eprintln!("elev {el:>4}..{:>3}: rays {n:>5}  mean steps {:>5.1}  max {m:>3}  hit {:>3.0}%", el + 5, s as f32 / n as f32, 100.0 * h as f32 / n as f32);
+        }
+    }
+}
+
+/// Where a reflection that starts UNDER the map's ground goes (a puddle's,
+/// round 5): steps by elevation, for rays from 3 cm under the ground against
+/// rays from on it. `cargo test --release --lib under_ground_census -- --ignored --nocapture`.
+#[cfg(test)]
+mod under_ground_census {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn steps_from_under_the_ground() {
+        let map = fixtures::height_map(1024, fixtures::hills);
+        let chain = levels(&map);
+        for under in [0.0f32, 0.03] {
+            let mut buckets = std::collections::BTreeMap::<i32, (u32, u32, u32, u32)>::new();
+            for (e, d) in fixtures::rays(20000, 5) {
+                let q = (Vec2::new(e.x, e.z) - map.min) / (map.max - map.min) * Vec2::new(chain[0].width as f32, chain[0].height as f32);
+                let e = Vec3::new(e.x, height_at(&chain[0], q) - under, e.z);
+                let r = trace(&chain, map.min, map.max, map.top, e, d);
+                let el = (d.y.asin().to_degrees() / 5.0).floor() as i32 * 5;
+                let b = buckets.entry(el).or_default();
+                b.0 += 1;
+                b.1 += r.steps;
+                b.2 = b.2.max(r.steps);
+                b.3 += r.t.is_some() as u32;
+            }
+            for (el, (n, s, m, h)) in buckets {
+                eprintln!("under {under}: elev {el:>4}..{:>3}: rays {n:>5}  mean steps {:>5.1}  max {m:>3}  hit {:>3.0}%", el + 5, s as f32 / n as f32, 100.0 * h as f32 / n as f32);
+            }
         }
     }
 }

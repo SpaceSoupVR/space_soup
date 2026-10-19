@@ -138,6 +138,39 @@ pub(crate) fn collect_node(
                 Vec::new()
             };
 
+            // A BAKED CAVE (`baked_cave`): the file says so, and carries its
+            // layer weights and what the bake measured in COLOR_0 and COLOR_1.
+            let baked_cave_meta = mesh
+                .extras()
+                .as_ref()
+                .and_then(|raw| crate::renderer::baked_cave::BakedCaveMeta::parse(raw.get()));
+            let baked_cave_colours: Option<(Vec<[u8; 4]>, Vec<[u8; 4]>)> = baked_cave_meta.as_ref().and_then(|_| {
+                let c0: Vec<[u8; 4]> = reader.read_colors(0)?.into_rgba_u8().collect();
+                let c1: Vec<[u8; 4]> = reader.read_colors(1).map(|c| c.into_rgba_u8().collect()).unwrap_or_default();
+                Some((c0, c1))
+            });
+            // And where it meets the ground: the terrain footprint's uv
+            // (TEXCOORD_2) and the ground's share of its lighting (COLOR_2's
+            // red). A file without them takes none of the ground's.
+            let baked_cave_ground: (Vec<[f32; 2]>, Vec<[u8; 4]>) = if baked_cave_colours.is_some() {
+                (
+                    reader.read_tex_coords(2).map(|t| t.into_f32().collect()).unwrap_or_default(),
+                    reader.read_colors(2).map(|c| c.into_rgba_u8().collect()).unwrap_or_default(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            // The planes its layers are read on: the rest of COLOR_2, and
+            // COLOR_3 (a cliff's). A file without COLOR_3 has neither.
+            let baked_cave_planes: Option<Vec<[u8; 4]>> =
+                if baked_cave_colours.is_some() { reader.read_colors(3).map(|c| c.into_rgba_u8().collect()) } else { None };
+            // The colour of its emissive paint (COLOR_4): only a cave that glows has one.
+            let baked_cave_glow: Option<Vec<[u8; 4]>> =
+                if baked_cave_colours.is_some() { reader.read_colors(4).map(|c| c.into_rgba_u8().collect()) } else { None };
+            // Its TEXCOORD_1 IS the lightmap's layout: nothing is generated
+            // for it, and nothing is split.
+            let lightmap = if baked_cave_colours.is_some() { None } else { lightmap };
+
             // The material's emissive colour, as the ARTIST authored it.
             //
             // This is what makes a lamp read correctly: the bulb's material is
@@ -233,11 +266,6 @@ pub(crate) fn collect_node(
                     contents: bytemuck::cast_slice(&vertices),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh_ib"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
                 let layered = layered_weights.map(|weights| {
                     // The layered buffer is drawn with the SAME index buffer as
                     // the shaded one, so it has to be split wherever that was.
@@ -277,7 +305,50 @@ pub(crate) fn collect_node(
                             contents: bytemuck::cast_slice(&lv),
                             usage: wgpu::BufferUsages::VERTEX,
                         });
-                    LayeredPrimitive { vertices: lv, vertex_buffer }
+                    // THE TRIANGLES BY CLASS, for the cave shader's twins: the
+                    // same triangles, reordered. See `cave_twins::partition`.
+                    let (by_class, twin_ends) = crate::renderer::cave_twins::partition(&lv, &indices);
+                    let bounds = lv.iter().fold([[f32::INFINITY; 3], [f32::NEG_INFINITY; 3]], |[lo, hi], v| {
+                        [
+                            [lo[0].min(v.position[0]), lo[1].min(v.position[1]), lo[2].min(v.position[2])],
+                            [hi[0].max(v.position[0]), hi[1].max(v.position[1]), hi[2].max(v.position[2])],
+                        ]
+                    });
+                    (LayeredPrimitive { vertices: lv, vertex_buffer, twin_ends, bounds }, by_class)
+                });
+                let (layered, mut indices) = match layered {
+                    Some((layered, by_class)) => (Some(layered), by_class),
+                    None => (None, indices),
+                };
+                let baked_cave = baked_cave_meta.as_ref().zip(baked_cave_colours.as_ref()).map(|(meta, (c0, c1))| {
+                    let cv: Vec<crate::renderer::baked_cave::BakedCaveVertex> = (0..positions.len())
+                        .map(|i| {
+                            crate::renderer::baked_cave::BakedCaveVertex::from_file(
+                                positions[i].into(),
+                                normals.get(i).copied().unwrap_or(Vec3::Y).into(),
+                                uv2s.get(i).copied().unwrap_or([0.0, 0.0]),
+                                // A short COLOR_0: layer 1 (rock), as the shader reads no weights.
+                                c0.get(i).copied().unwrap_or([0, 255, 0, 1 << 6]),
+                                // A file without COLOR_1: the whole sky and sun, dry, clean.
+                                c1.get(i).copied().unwrap_or([255, 255, 0, 0]),
+                                (
+                                    baked_cave_ground.0.get(i).copied().unwrap_or([0.0, 0.0]),
+                                    baked_cave_ground.1.get(i).map_or(0, |c| c[0]),
+                                ),
+                                baked_cave_planes.as_ref().and_then(|c3| {
+                                    let c2 = baked_cave_ground.1.get(i)?;
+                                    Some(([c2[1], c2[2], c2[3]], *c3.get(i)?))
+                                }),
+                                baked_cave_glow.as_ref().and_then(|g| g.get(i).copied()),
+                            )
+                        })
+                        .collect();
+                    crate::renderer::baked_cave::BakedCavePrimitive::new(device, cv, &mut indices, meta)
+                });
+                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mesh_ib"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
                 });
 
                 // See `MeshPrimitive::casts_shadow`. Half, because that is the
@@ -297,7 +368,7 @@ pub(crate) fn collect_node(
                     || prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0) > 0.0;
                 // See `thin_parts`. Not for a cave (drawn by the layered
                 // pipeline) nor glass (drawn see-through, after the thin pass).
-                let thin = if layered.is_none() && !blended {
+                let thin = if layered.is_none() && baked_cave.is_none() && !blended {
                     super::thin_parts::split_thin_parts(&vertices, &indices)
                         .map(|split| super::thin_parts::ThinParts::upload(device, &split))
                 } else {
@@ -310,6 +381,7 @@ pub(crate) fn collect_node(
                     vertex_buffer,
                     index_buffer,
                     layered,
+                    baked_cave,
                     casts_shadow,
                     blended,
                     thin,
@@ -366,6 +438,9 @@ pub(crate) fn collect_node(
                     texture,
                     vertex_buffer,
                     index_buffer,
+                    // As `blended` above: what `load_primitive_texture` left see-through.
+                    blended: prim.material().alpha_mode() == gltf::material::AlphaMode::Blend
+                        || prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0) > 0.0,
                 });
             }
         }

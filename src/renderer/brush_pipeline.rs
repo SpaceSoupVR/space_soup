@@ -152,6 +152,56 @@ impl BrushVertex {
 /// twenty-fifth. Exceeding it logs and clamps, so it is diagnosable.
 pub const MAX_BRUSH_MATERIALS: usize = 24;
 
+/// THE BRUSHES' VERTICES ARE THE WORLD'S (`true`), posed into the player's
+/// frame by the vertex shader ([`world_brush_vertices`]) -- where the app
+/// re-posed every brush vertex on the CPU on each frame the rig moved or
+/// turned and the frame sent all of them to two new GPU buffers every frame
+/// (`docs/scale-audit-2026-10-13.md`, F1's other half; `static_brush`). The
+/// ground's switch, for the rooms: see `terrain_pipeline::WORLD_GROUND`.
+///
+/// Read when a brush pipeline is BUILT, so it is set once, before the
+/// renderer exists: the headset app sets it at launch (`xr::vulkan`;
+/// `adb shell setprop debug.spacesoup.worldbrushes 0` keeps the old way), the
+/// offline harness by `WORLD_BRUSHES`. `false` here, so everything else that
+/// builds a brush pipeline -- the tests -- hands it posed vertices as before.
+pub static WORLD_BRUSHES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How the brush shader's vertex stage opens, and the same posing its vertex
+/// first: what [`world_brush_vertices`] rewrites.
+const POSED_BRUSH_VERTEX: &str = "@vertex fn vs_main(v: VIn) -> VOut {\n    var out: VOut;\n";
+const WORLD_BRUSH_VERTEX: &str = "@vertex fn vs_main(w: VIn) -> VOut {\n    var out: VOut;\n    var v = w;\n    v.pos = to_player_space(w.pos);\n    v.norm = to_player_direction(w.norm);\n    v.tangent = vec4<f32>(to_player_direction(w.tangent.xyz), w.tangent.w);\n    v.face_centre = to_player_space(w.face_centre);\n";
+/// The crack seal's vertex stage, which reads a position alone.
+const POSED_SEAL_VERTEX: &str = "return cam_view_proj() * vec4<f32>(pos, 1.0);";
+const WORLD_SEAL_VERTEX: &str = "return cam_view_proj() * vec4<f32>(to_player_space(pos), 1.0);";
+
+/// `src` taking its vertices in the WORLD: everything the app posed -- the
+/// position and the face's centre as points, the normal and the tangent as
+/// directions (`BrushGeometry::assemble`) -- is turned into the player's
+/// frame by `lights`' `to_player_space` / `to_player_direction` before
+/// anything reads it, so all that follows, the fragment stage with it, is as
+/// it was for a vertex the app had posed. `None` if the shader does not open
+/// as the brush shader does (`BRUSH_LIGHT_DEBUG`'s, which has no face centre).
+pub fn world_brush_vertices(src: &str) -> Option<String> {
+    (src.matches(POSED_BRUSH_VERTEX).count() == 1 && src.contains("@location(7) face_centre: vec3<f32>"))
+        .then(|| src.replacen(POSED_BRUSH_VERTEX, WORLD_BRUSH_VERTEX, 1))
+}
+
+/// A brush shader as its pipeline is built from it: [`world_brush_vertices`]
+/// of it where the brushes are kept in the world ([`WORLD_BRUSHES`]).
+fn in_the_brushes_frame(src: String) -> String {
+    if !WORLD_BRUSHES.load(std::sync::atomic::Ordering::Relaxed) {
+        return src;
+    }
+    match world_brush_vertices(&src) {
+        Some(world) => world,
+        None => {
+            // Drawn from world vertices it would stand in the wrong place.
+            log::error!("WORLD BRUSHES: a brush shader does not open as expected; it reads its vertices as posed");
+            src
+        }
+    }
+}
+
 pub struct BrushPipeline {
     pub pipeline: RenderPipeline,
     pub material_layout: BindGroupLayout,
@@ -1694,6 +1744,42 @@ impl BrushPipeline {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// MEASUREMENT ONLY: the brushes' bases of `shader_opt::OPTS` with every
+    /// candidate that applies, one pipeline each (`opt_<base>_<candidate>`),
+    /// for the PIPESTATS log. The ground's: `shader_opt::log_ground_opts`.
+    pub fn log_opts(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+    ) {
+        for (base, pass, src) in opt_bases() {
+            for opt in crate::renderer::shader_opt::OPTS {
+                let Some(mut source) = (opt.edit)(&src) else {
+                    continue;
+                };
+                if pass {
+                    source = with_push_scan(device, source);
+                }
+                let label = format!("opt_{base}_{}", opt.label);
+                let _ = Self::from_source(
+                    device,
+                    if pass { probe_pass::FORMAT } else { format },
+                    uniform_layout,
+                    FrontFace::Ccw,
+                    if pass { 1 } else { samples },
+                    None,
+                    crate::renderer::multiview::ViewMode::Mono,
+                    Some(if pass { fixups.pass_layout() } else { probe_layout }),
+                    &label,
+                    source,
+                );
+            }
+        }
+    }
+
     fn from_source(
         device: &Device,
         format: TextureFormat,
@@ -1797,6 +1883,46 @@ impl BrushPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
+        let targets = [Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::empty() })];
+        Self::depth_prepass_into(device, uniform_layout, samples, view, &targets, DepthBiasState::default(), "brush_depth_prepass")
+    }
+
+    /// THE SAME IN THE REFLECTION PASS (`Levers::probe_prepass`): the brushes'
+    /// depth into the half-resolution pass's own depth before its shader --
+    /// 8,600 instructions a pixel, the most expensive in the frame -- is run,
+    /// so a wall behind a wall, which one draw of the whole level may shade
+    /// first, is not traced. The pass's own targets, none written.
+    ///
+    /// PUSHED BACK A LITTLE ([`PROBE_PREPASS_BIAS`]): the pass's shader is
+    /// another program, and its depth for a wall is not this one's to the
+    /// bit -- laid exactly, the wall's own shading failed its depth test on
+    /// a screen-door of texels (offline, 2026-10-13: 93,000 pixels of
+    /// hall_back). Behind the bias the nearest wall always passes; a wall
+    /// within the bias behind it may be shaded too, and the pass's own depth
+    /// test then settles the two as it always did. The same picture as with
+    /// no prepass.
+    pub fn new_probe_depth_prepass(device: &Device, uniform_layout: &BindGroupLayout) -> Self {
+        let targets = probe_pass::targets(true).map(|t| t.map(|t| ColorTargetState { write_mask: ColorWrites::empty(), ..t }));
+        Self::depth_prepass_into(
+            device,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            &targets,
+            PROBE_PREPASS_BIAS,
+            "brush_probe_depth_prepass",
+        )
+    }
+
+    fn depth_prepass_into(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        targets: &[Option<ColorTargetState>],
+        bias: DepthBiasState,
+        label: &str,
+    ) -> Self {
         // Audited: see `shader_checks`.
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("brush_depth_prepass"),
@@ -1813,7 +1939,7 @@ impl BrushPipeline {
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("brush_depth_prepass"),
+            label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -1825,7 +1951,7 @@ impl BrushPipeline {
                 module: &shader,
                 entry_point: Some("fs_depth"),
                 compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::empty() })],
+                targets,
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
@@ -1839,7 +1965,7 @@ impl BrushPipeline {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(CompareFunction::Less),
                 stencil: StencilState::default(),
-                bias: DepthBiasState::default(),
+                bias,
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
             multiview_mask: view.mask(),
@@ -1848,6 +1974,11 @@ impl BrushPipeline {
         Self { pipeline, material_layout, lightmap_layout, reads_immediates: false }
     }
 }
+
+/// How far behind a wall the reflection pass's depth prepass lays it: a few
+/// of the depth buffer's steps, and twice the wall's own depth slope across a
+/// texel. See [`BrushPipeline::new_probe_depth_prepass`].
+pub const PROBE_PREPASS_BIAS: DepthBiasState = DepthBiasState { constant: 16, slope_scale: 2.0, clamp: 0.0 };
 
 /// Whether the scene pass seals the cracks between brush faces.
 ///
@@ -1961,6 +2092,15 @@ impl BrushSealPipeline {
 
 fn brush_seal_shader() -> String {
     let [r, g, b] = CRACK_SEAL_COLOUR;
+    let src = brush_seal_shader_posed(r, g, b);
+    if WORLD_BRUSHES.load(std::sync::atomic::Ordering::Relaxed) {
+        debug_assert_eq!(src.matches(POSED_SEAL_VERTEX).count(), 1);
+        return src.replacen(POSED_SEAL_VERTEX, WORLD_SEAL_VERTEX, 1);
+    }
+    src
+}
+
+fn brush_seal_shader_posed(r: f32, g: f32, b: f32) -> String {
     format!(
         r#"
 {lights_block}
@@ -2031,6 +2171,9 @@ pub struct SunFaces {
     unbaked: Vec<u32>,
     width: u32,
     height: u32,
+    /// Which mask this is, among every one made this run: what a split kept
+    /// across frames was made from (`static_brush`).
+    serial: u64,
 }
 
 /// Which scene reader a brush face takes. See [`SunFaces`].
@@ -2083,7 +2226,13 @@ impl SunFaces {
                 unbaked[here] = unbaked[above] + unbaked_row;
             }
         }
-        Some(Self { reachable, unbaked, width, height })
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Some(Self { reachable, unbaked, width, height, serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) })
+    }
+
+    /// Which mask this is: never 0, and another for every mask made.
+    pub fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// The class of the face whose patch is `uv2_rect` (atlas uv: min u, min v,
@@ -2240,6 +2389,30 @@ pub fn dilate_sun_mask(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     px
 }
 
+/// The brushes' hot shaders as generated, for `shader_audit`: the scene
+/// reader that draws most faces (baked sun, no spot casting) and the
+/// deferring reflection pass.
+#[cfg(test)]
+pub(crate) fn audit_sources() -> Vec<(&'static str, String)> {
+    let read = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+    vec![
+        ("brush_read_baked_spotless", crate::renderer::lights::without_spot_shadows(sun_reader_shader(read, FaceSun::Baked))),
+        ("brush_probe_pass_deferred", brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred)),
+    ]
+}
+
+/// The brushes' shaders `shader_opt`'s candidates are measured on, by label,
+/// with whether each is a probe pass: the reader that draws most faces (baked
+/// sun, no spot casting), the full reader, and the deferring reflection pass.
+pub(crate) fn opt_bases() -> Vec<(&'static str, bool, String)> {
+    let read = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+    vec![
+        ("bread", false, crate::renderer::lights::without_spot_shadows(sun_reader_shader(read.clone(), FaceSun::Baked))),
+        ("bfull", false, read),
+        ("bpass", true, brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred)),
+    ]
+}
+
 /// The scene reader's source for the faces of one [`FaceSun`] class: the full
 /// reader with its sun switch for that class set. See [`SunFaces`].
 pub(crate) fn sun_reader_shader(source: String, class: FaceSun) -> String {
@@ -2331,6 +2504,13 @@ const SCAN_FROM_UNIFORMS: &str = "def_scan_uniform";
 /// part cut out at a time -- see `BrushPipeline::log_deferred_register_cuts`.
 const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("def_cut_none", &[]),
+    // NOT THE PICTURE (the `pass_cut` lever draws with it): a carried torch's glass seen in the reflections from
+    // every way in front of it, outside its beam too, as until 2026-10-13
+    // (the patch of white speckle beside the pool). See `capsule_glass_beam`.
+    (
+        "def_glass_any_way",
+        &[("let into = select(1.0, s * s * (3.0 - 2.0 * s), lights.lights[i].params.z > 0.5);", "let into = 1.0;")],
+    ),
     ("def_cut_rim_detect", &[("        if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
     ("def_cut_edge_detect", &[("        if (hit.edge_code < 0 && proxy.edge >= 0) {", "        if (false) {")]),
     (
@@ -3214,6 +3394,26 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     // Against `scene_cut_none` in one build, the precision alone -- with
     // `HALF_PRECISION` on; off as shipped since B1, this IS `scene_cut_none`.
     ("scene_all_f32", &[("alias hf = f32;\n", "alias hf = f32; // scene_all_f32\n")]),
+    // DIAGNOSTIC, NOT THE PICTURE: each brush pixel RED where the reflection
+    // pass traces it -- its roughness, one mip coarser as the half-resolution
+    // pass reads it, under `PROBE_LOBE_HEMISPHERICAL` -- and GREEN where the
+    // pass skips it as too rough. Counted offline (`LINEAR=1 EXPOSURE=1`),
+    // what the trace is spent on and what a material's roughness decides
+    // (docs/specular-status-2026-10-13.md).
+    // NOT THE PICTURE: the lamps' highlight as it shipped until 2026-10-13, a
+    // fixed peak with no normalisation, Fresnel or n.l -- the sheen on rough
+    // stone under a torch. See `lights::lamp_highlight_share`.
+    (
+        "scene_highlight_uncapped",
+        &[("    out.specular = radiance * spec * atten * lamp_highlight_share(view_dir, h, ndotl, aa.y, shininess, spec_strength);", "    out.specular = radiance * spec * atten * aa.y;")],
+    ),
+    (
+        "scene_census_trace",
+        &[(
+            "    return vec4<f32>(tonemap(c), reflection_alpha(lit));",
+            "    let census = clamp(textureSampleBias(mat_rough, mat_rough_samp, in.uv, i32(in.material), 1.0).r, 0.04, 1.0) < PROBE_LOBE_HEMISPHERICAL;\n    return vec4<f32>(select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), census), 1.0);",
+        )],
+    ),
 ];
 
 /// MEASUREMENT: text edits of every scene reader's generated WGSL -- the
@@ -3308,6 +3508,10 @@ const SUN_MATRIX_FIXED: (&str, &str) = (
 /// `src` with one of [`READER_EDITS`]: `None` when `edit` names no entry, or
 /// one of its finds does not match exactly once.
 pub(crate) fn with_reader_edit(src: String, edit: &str) -> Option<String> {
+    // `opt_*`: `shader_opt`'s candidates, by label or all together.
+    if edit.starts_with("opt_") {
+        return crate::renderer::shader_opt::edit_named(&src, edit);
+    }
     let (_, edits) = READER_EDITS.iter().find(|(name, _)| *name == edit)?;
     let mut src = src;
     for (from, to) in edits.iter() {
@@ -4638,6 +4842,7 @@ struct VOut {{
                 card_tests_filtered: false,
                 card_relit: false,
                 long_step_from_plane: true,
+                open_fallback: false,
             },
         ),
         ssr_block = ssr_block,
@@ -4690,6 +4895,8 @@ struct VOut {{
             ssr_apply
         }
     );
+    // (Where the brushes are kept in the world, the vertex stage poses them.)
+    let src = in_the_brushes_frame(src);
     match probe {
         BrushProbe::Read => format!("{src}{}{}", probe_pass::READER_WGSL, probe_pass::FACE_CODE_WGSL),
         BrushProbe::Pass | BrushProbe::PassDeferred => {
@@ -6514,6 +6721,48 @@ mod ssr_pipeline_tests {
             below = got;
         }
     }
+
+    /// EVERY BRUSH SHADER TAKES ITS VERTICES IN THE WORLD when asked to: each
+    /// variant a pipeline is built from opens as `world_brush_vertices`
+    /// expects, the rewrite poses all four things the app posed (position,
+    /// normal, tangent, the face's centre) and nothing else of the source
+    /// changes -- the fragment stage, whose instruction count the Quest's
+    /// budget is about, is the same text -- and the result is valid WGSL.
+    #[test]
+    fn every_brush_shader_takes_its_vertices_in_the_world() {
+        let variants: Vec<(&str, String)> = vec![
+            ("trace", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Trace)),
+            ("sources", brush_shader_probe(false, true, false, SsrPath::Inline, BrushProbe::Trace)),
+            ("ssr", brush_shader_probe(true, false, false, SsrPath::Inline, BrushProbe::Trace)),
+            ("ssr trace", brush_shader_probe(true, false, false, SsrPath::Trace, BrushProbe::Trace)),
+            ("ssr composite", brush_shader_probe(true, false, false, SsrPath::Composite, BrushProbe::Trace)),
+            ("probe pass", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Pass)),
+            ("probe pass deferred", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::PassDeferred)),
+            ("probe reader", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Read)),
+        ];
+        for (name, posed) in variants {
+            if BRUSH_LIGHT_DEBUG {
+                assert!(world_brush_vertices(&posed).is_none());
+                continue;
+            }
+            let world = world_brush_vertices(&posed).unwrap_or_else(|| panic!("{name}: does not open as a brush shader"));
+            for line in ["v.pos = to_player_space(w.pos);", "v.norm = to_player_direction(w.norm);", "to_player_direction(w.tangent.xyz), w.tangent.w", "v.face_centre = to_player_space(w.face_centre);"] {
+                assert_eq!(world.matches(line).count(), 1, "{name}: {line}");
+            }
+            // Only the opening differs.
+            assert_eq!(world.replacen(WORLD_BRUSH_VERTEX, POSED_BRUSH_VERTEX, 1), posed, "{name}");
+            let from = posed.find("@fragment fn fs_main(").expect("a fragment stage");
+            assert!(world.ends_with(&posed[from..]), "{name}: the fragment stage changed");
+            naga::front::wgsl::parse_str(&world).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&world)));
+        }
+        // The crack seal, which reads a position alone.
+        let [r, g, b] = CRACK_SEAL_COLOUR;
+        let seal = brush_seal_shader_posed(r, g, b);
+        assert_eq!(seal.matches(POSED_SEAL_VERTEX).count(), 1);
+        let world = seal.replacen(POSED_SEAL_VERTEX, WORLD_SEAL_VERTEX, 1);
+        naga::front::wgsl::parse_str(&world).unwrap_or_else(|e| panic!("seal: {}", e.emit_to_string(&world)));
+    }
+
 
     /// THE UPSAMPLE IS THE DEPTH-AWARE BILINEAR FILTER, on a real device, at
     /// every pixel: one filtered read inside a surface, texel by texel along

@@ -232,6 +232,7 @@ impl GltfMesh {
                 casts_shadow: false,
                 blended: false,
                 thin: None,
+                baked_cave: None,
             }],
             skin: None,
             position: glam::Vec3::ZERO,

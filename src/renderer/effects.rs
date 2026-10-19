@@ -61,6 +61,14 @@ use wgpu::*;
 use super::lights::{Light, LightKind};
 use super::probe_stream::ProbeDesc;
 
+mod flash;
+pub mod authoring;
+pub mod seen;
+pub mod stack;
+pub mod templates;
+pub mod variants;
+pub use variants::FxVariant;
+
 /// What an emitter makes: one of a few presets, each a whole look.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EffectKind {
@@ -262,6 +270,7 @@ fn temperature(u: f32, v: &Variation) -> Vec3 {
 
 /// A kind's look and motion. Sizes are the quad's half size in metres at the
 /// emitter's scale 1.
+#[derive(Clone, Debug, PartialEq)]
 struct Preset {
     /// Particles a second; for dust, alive per cubic metre.
     rate: f32,
@@ -302,8 +311,32 @@ pub const FLAME_SECONDS: f32 = 2.4;
 pub const EMBER_LAYER: u32 = FIRE_FIRST + FIRE_FRAMES;
 pub const MOTE_LAYER: u32 = EMBER_LAYER + 1;
 pub const COALS_LAYER: u32 = MOTE_LAYER + 1;
+/// A splash's crown: `CROWN_VARIANTS` pieces of the sheet, each in
+/// `CROWN_FRAMES` stages of breaking up (`crown_frame`).
 pub const CROWN_LAYER: u32 = COALS_LAYER + 1;
-pub const ATLAS_LAYERS: u32 = CROWN_LAYER + 1;
+pub const CROWN_VARIANTS: u32 = 4;
+pub const CROWN_FRAMES: u32 = 3;
+/// A splash's jet, likewise (`jet_frame`).
+pub const JET_LAYER: u32 = CROWN_LAYER + CROWN_VARIANTS * CROWN_FRAMES;
+pub const JET_VARIANTS: u32 = 2;
+pub const JET_FRAMES: u32 = 3;
+/// A splash's spray, and its white water (`spray_frame`, `froth_frame`).
+pub const SPRAY_LAYER: u32 = JET_LAYER + JET_VARIANTS * JET_FRAMES;
+pub const SPRAY_VARIANTS: u32 = 2;
+pub const SPRAY_FRAMES: u32 = 3;
+pub const FROTH_LAYER: u32 = SPRAY_LAYER + SPRAY_VARIANTS * SPRAY_FRAMES;
+pub const FROTH_VARIANTS: u32 = 2;
+pub const FROTH_FRAMES: u32 = 3;
+/// A MUZZLE FLASH's jets (`flash::lobe_frame`: `FLASH_VARIANTS` of each of
+/// `FLASH_FRAMES` forms, its heat in red and its cover in alpha, its root at
+/// the bottom) and its core at the muzzle (`flash::core_frame`). Added after
+/// every older layer, so none of theirs moved.
+pub const FLASH_LAYER: u32 = FROTH_LAYER + FROTH_VARIANTS * FROTH_FRAMES;
+pub const FLASH_VARIANTS: u32 = 4;
+pub const FLASH_FRAMES: u32 = 3;
+pub const CORE_LAYER: u32 = FLASH_LAYER + FLASH_VARIANTS * FLASH_FRAMES;
+pub const CORE_VARIANTS: u32 = 2;
+pub const ATLAS_LAYERS: u32 = CORE_LAYER + CORE_VARIANTS;
 pub const ATLAS_SIZE: u32 = 128;
 const ATLAS_MIPS: u32 = 8;
 
@@ -358,103 +391,10 @@ pub const VERTICES_PER_PARTICLE: u32 = 24;
 /// were 18.
 const CONVEX: f32 = 0.35;
 
+/// A kind's preset: what its built-in template's stack compiles to
+/// (`templates`). The numbers live in the stack.
 fn preset(kind: EffectKind) -> Preset {
-    match kind {
-        EffectKind::Fire => Preset {
-            // Sheets of flame standing on the bed, each playing a stretch of
-            // the flipbook and fading in and out over it: the flames' motion
-            // is the book's, the base stays on the fuel.
-            rate: 9.0,
-            life: (0.9, 1.3),
-            speed: (0.0, 0.0),
-            spread_deg: 0.0,
-            bed: 0.15,
-            size: (0.145, 0.13),
-            drag: 0.0,
-            accel: Vec3::ZERO,
-            swirl: (0.0, 0.0),
-            spin: (0.0, 0.07),
-            streak: 0.0,
-            soft: 0.05,
-            frames: (FIRE_FIRST, FIRE_FRAMES),
-            phase_g: 0.0,
-            albedo: 0.0,
-        },
-        EffectKind::Smoke => Preset {
-            rate: 6.0,
-            life: (4.0, 6.0),
-            speed: (0.15, 0.28),
-            spread_deg: 10.0,
-            bed: 0.06,
-            size: (0.1, 0.55),
-            drag: 0.6,
-            accel: Vec3::new(0.0, 0.3, 0.0),
-            swirl: (0.14, 0.7),
-            spin: (0.2, std::f32::consts::PI),
-            streak: 0.0,
-            soft: 0.3,
-            frames: (0, SMOKE_FRAMES),
-            phase_g: 0.35,
-            albedo: 0.3,
-        },
-        EffectKind::Embers => Preset {
-            rate: 5.0,
-            life: (1.2, 2.4),
-            speed: (0.9, 1.8),
-            spread_deg: 28.0,
-            bed: 0.06,
-            size: (0.005, 0.003),
-            drag: 1.3,
-            accel: Vec3::new(0.0, -1.1, 0.0),
-            swirl: (0.06, 3.0),
-            spin: (0.0, 0.0),
-            streak: 0.035,
-            soft: 0.02,
-            frames: (EMBER_LAYER, 1),
-            phase_g: 0.0,
-            albedo: 0.0,
-        },
-        // One bed, drawn whole (`coals_instance`); only its look is here.
-        EffectKind::Coals => Preset {
-            rate: 0.0,
-            life: (1.0, 1.0),
-            speed: (0.0, 0.0),
-            spread_deg: 0.0,
-            bed: 0.0,
-            size: (COALS_HALF, COALS_HALF),
-            drag: 0.0,
-            accel: Vec3::ZERO,
-            swirl: (0.0, 0.0),
-            spin: (0.0, 0.0),
-            streak: 0.0,
-            soft: 0.0,
-            frames: (COALS_LAYER, 1),
-            phase_g: 0.0,
-            albedo: 0.0,
-        },
-        // A life is how long the eye keeps hold of one mote, not how long
-        // it is in the air: it is noticed as it tumbles into the light, held
-        // a few seconds and lost, while others are found elsewhere. Its
-        // motion is the room's air (`air_drift`) plus its own jitter and a
-        // slow settling; `swirl` is that jitter's reach and pace.
-        EffectKind::Dust => Preset {
-            rate: 90.0,
-            life: (3.5, 6.5),
-            speed: (0.0, 0.004),
-            spread_deg: 180.0,
-            bed: 0.0,
-            size: DUST_LIGHT_SIZE,
-            drag: 0.4,
-            accel: Vec3::new(0.0, -0.0012, 0.0),
-            swirl: (0.006, 0.8),
-            spin: (0.0, 0.0),
-            streak: 0.0,
-            soft: 0.02,
-            frames: (MOTE_LAYER, 1),
-            phase_g: 0.7,
-            albedo: 0.8,
-        },
-    }
+    templates::template(kind).preset.clone()
 }
 
 /// One particle as the GPU draws it: its cutout, fanned from
@@ -524,6 +464,16 @@ pub struct EffectFrame {
     pub instances: Vec<EffectInstance>,
     pub over: u32,
     pub screened: u32,
+    /// How many of the screened, at their end, are lit through the heat
+    /// ramp (`stack::SHADE_SCREEN_HEAT`): drawn by their own variant, so an
+    /// ember's or a mote's pixels carry none of a flash's code.
+    pub screened_heat: u32,
+    /// What the event bursts among them came to (`stack`).
+    pub bursts: stack::BurstCount,
+    /// Each splash drawn: its key, and its fill and instances whole
+    /// (`simulate_governed`), for the next frame's governor
+    /// (`stack::BurstSet::measured`).
+    pub splash_costs: Vec<(u64, f32, f32)>,
 }
 
 /// What lights the particles and where they are seen from.
@@ -656,6 +606,24 @@ fn henyey_greenstein(g: f32, travel: Vec3, to_eye: Vec3) -> f32 {
     let g2 = g * g;
     let d = (1.0 + g2 - 2.0 * g * cos_t).max(1e-4);
     ((1.0 - g2) / (d * d.sqrt())).min(12.0)
+}
+
+/// THE AIR'S READINESS FOR MIST at `hour` (0-24, the time of day's clock), a
+/// multiple of a fog slab's authored density (`sprite_fog`; the authored look
+/// is the dawn's). Mist over still water is radiation fog and steam fog: the
+/// ground and air cool all night under a clear sky while the water keeps its
+/// warmth, so it forms in the evening, thickens through the night, is
+/// thickest at and just after dawn (5 to 7:30, the coldest air), and the
+/// rising sun burns it off by mid-morning (10:30, a twentieth); it is all
+/// but gone through the warm afternoon and returns from about 17:00, at
+/// 0.8 of its dawn by 21:00. Eased between those points; wraps at 24.
+pub fn mist_conditions(hour: f32) -> f32 {
+    const AT: [(f32, f32); 7] = [(0.0, 0.85), (5.0, 1.0), (7.5, 1.0), (10.5, 0.05), (17.0, 0.05), (21.0, 0.8), (24.0, 0.85)];
+    let h = hour.rem_euclid(24.0);
+    let i = AT.iter().rposition(|&(t, _)| t <= h).unwrap_or(0).min(AT.len() - 2);
+    let ((t0, a), (t1, b)) = (AT[i], AT[i + 1]);
+    let x = ((h - t0) / (t1 - t0)).clamp(0.0, 1.0);
+    a + (b - a) * x * x * (3.0 - 2.0 * x)
 }
 
 /// Smooth noise along one axis, in [-1, 1]: a random slope at each whole
@@ -1204,6 +1172,226 @@ pub fn simulate_with(emitters: &[EffectEmitter], splashes: &[Splash], time: f64,
 /// hundred times too bright. Each particle is a function of the time, so one
 /// coming back into view is where it would have been.
 pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, splashes: &[Splash], time: f64, at: &Surroundings) -> EffectFrame {
+    simulate_all(emitters, seen, splashes, None, time, at)
+}
+
+/// [`simulate_seen`], with the event bursts in play (`stack::BurstSet`,
+/// already given this frame's clock by its `frame`): a shot's flash, its
+/// smoke. Lit as the emitters' particles are, and by a fire's own light as
+/// the eye adapted to the fire sees it.
+pub fn simulate_all(
+    emitters: &[EffectEmitter],
+    seen: &dyn Fn(usize) -> bool,
+    splashes: &[Splash],
+    bursts: Option<&stack::BurstFrame>,
+    time: f64,
+    at: &Surroundings,
+) -> EffectFrame {
+    simulate_governed(emitters, seen, splashes, bursts, None, time, at)
+}
+
+/// THE GOVERNOR'S SHARES of the placed emitters and the splashes
+/// (`stack::BurstSet::share_of` by [`emitter_key`] and [`splash_key`]): the
+/// share of each one's particles drawn, 1 for all of them.
+pub struct Shares<'a> {
+    pub emitter: &'a dyn Fn(&EffectEmitter) -> f32,
+    pub splash: &'a dyn Fn(&Splash) -> f32,
+    /// The eyes each emitter is seen through this frame, by its index
+    /// ([`emitter_sight`]: narrowed to the doorways it is seen through):
+    /// a box of motes works out only the motes they hold. Empty: no
+    /// emitter is narrowed (every mote within seeing is worked out).
+    pub sight: &'a [Vec<seen::Eye>],
+}
+
+/// The governor's key for a placed emitter: its object's id.
+pub fn emitter_key(e: &EffectEmitter) -> u64 {
+    hash64(id_hash(&e.id) ^ 0x51ac_ed00_e1u64)
+}
+
+/// The governor's key for a splash: its seed (`Splash::new` draws it from
+/// where and when it struck).
+pub fn splash_key(s: &Splash) -> u64 {
+    hash64(s.seed ^ 0x5b1a_54u64)
+}
+
+/// The share of the reference view's quad a particle's cutout covers, on
+/// average over the books: what [`instance_fill`] counts a quad at.
+const CUTOUT_MEAN: f32 = 0.6;
+
+/// WHAT ONE PARTICLE FILLS, megapixel-layers, both eyes at the reference
+/// view's pixels per radian (`effect_asset::REFERENCE_FOCAL_PIXELS`): its
+/// quad across (a streak's length along), at least the 1.5 pixel floor. What
+/// a splash is weighed by, measured from what it drew.
+pub fn instance_fill(i: &EffectInstance, head: Vec3) -> f32 {
+    use super::effect_asset::{REFERENCE_EYES, REFERENCE_FOCAL_PIXELS};
+    let d = (Vec3::from_slice(&i.centre[..3]) - head).length().max(0.05);
+    let across = (2.0 * i.centre[3] / d * REFERENCE_FOCAL_PIXELS).max(1.5);
+    let along = (i.light_dir[3] / d * REFERENCE_FOCAL_PIXELS).max(across);
+    across * along * CUTOUT_MEAN * REFERENCE_EYES / 1e6
+}
+
+/// What a kind's template costs a placed emitter of it, from its stack's
+/// report (`effect_asset::EffectAsset::check`): fill per live particle at
+/// the reference distance, that distance, its importance, and whether its
+/// particles are points (the 1.5 pixel floor at any distance).
+struct KindCost {
+    /// One live particle's drawn area within its cutout, square metres,
+    /// whatever the distance (`effect_asset::EmitterCost::area`), and
+    /// whether it lies level.
+    area_each: f32,
+    flat: bool,
+    importance: f32,
+    points: bool,
+    instances: f32,
+}
+
+fn kind_cost(kind: EffectKind) -> &'static KindCost {
+    static COSTS: std::sync::OnceLock<Vec<KindCost>> = std::sync::OnceLock::new();
+    let all = COSTS.get_or_init(|| {
+        EffectKind::ALL
+            .iter()
+            .map(|k| {
+                let a = templates::asset(*k);
+                let r = a.check(books()).unwrap_or_else(|e| panic!("the built-in {} template: {}", k.template_name(), e.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")));
+                let points = *k == EffectKind::Dust;
+                let area = r.area_facing + r.area_flat;
+                let area_each = if points || r.instances_steady == 0 { 0.0 } else { area / r.instances_steady as f32 };
+                KindCost { area_each, flat: r.area_flat > r.area_facing, importance: a.scalability.importance, points, instances: r.instances_steady as f32 }
+            })
+            .collect()
+    });
+    &all[EffectKind::ALL.iter().position(|k| *k == kind).expect("every kind is listed")]
+}
+
+/// WHAT THE GOVERNOR WEIGHS BESIDE THE BURSTS (`stack::BurstSet::frame_with`):
+/// each placed emitter `seen` keeps and each splash in `splashes`, with its
+/// estimated fill and instances this frame and its score. An emitter's are
+/// its live particles (the slot loop's count: rate x longest life, or its
+/// box's density -- only the share of the box in `sight`) and WHAT THEY FILL
+/// IN THE EYES THAT SEE IT (`seen::seen_fill`: its bounds clipped to each
+/// eye of `sight`, narrowed through doorways, times its particles' layers,
+/// each a particle of its template's area x `scale`^2); a fire's sheets and
+/// a bed of coals are counted and never shed. A splash's are what
+/// it drew whole last frame (`measured`, by [`splash_key`]); a new one is
+/// weighed from its second frame. WHAT IT COSTS: one entry per emitter in
+/// view and per splash, a few multiplies each.
+pub fn governor_wants(
+    emitters: &[EffectEmitter],
+    seen: &dyn Fn(usize) -> bool,
+    splashes: &[Splash],
+    measured: &std::collections::HashMap<u64, (f32, f32)>,
+    head_world: Vec3,
+    sight: &[Vec<seen::Eye>],
+) -> Vec<stack::Want> {
+    use super::effect_asset::REFERENCE_FOCAL_PIXELS;
+    let mut out = Vec::new();
+    for (index, e) in emitters.iter().enumerate() {
+        if !seen(index) || !(e.scale > 0.0) || !(e.rate > 0.0) {
+            continue;
+        }
+        let cost = kind_cost(e.kind);
+        let tpl = templates::template(e.kind);
+        let (count, sheddable) = match tpl.form {
+            templates::Form::Slots(s) => {
+                let p = &tpl.preset;
+                let v = e.variation.clamped();
+                let rate = e.rate * if s.density { p.rate * e.volume() / (0.5 * (p.life.0 + p.life.1)) } else { p.rate };
+                let slots = ((rate * life_range(p, &v).1).ceil()).clamp(1.0, MAX_SLOTS as f32);
+                // Motes past `DUST_SEEN_WITHIN` are never worked out: only
+                // the share of the box within it counts (27 points of it).
+                let eyes = sight.get(index);
+                let margin = mote_margin(e);
+                let within = if s.boxed && s.held {
+                    // Sampled over the part of the box within seeing (125
+                    // points of it, in the box's own frame), so a doorway's
+                    // slice of a hall is weighed as a slice.
+                    let ext = e.extent.map(|v| v.length().max(1e-4));
+                    let rel = head_world - e.position;
+                    let span: [(f32, f32); 3] = std::array::from_fn(|k| {
+                        let u = rel.dot(e.extent[k]) / (ext[k] * ext[k]);
+                        let r = DUST_SEEN_WITHIN / ext[k];
+                        ((u - r).max(-1.0), (u + r).min(1.0))
+                    });
+                    if span.iter().any(|(a, b)| a >= b) {
+                        0.0
+                    } else {
+                        let at = |k: usize, i: usize| span[k].0 + (span[k].1 - span[k].0) * (i as f32 + 0.5) / 5.0;
+                        let near = (0..125)
+                            .filter(|n| {
+                                let p0 = e.position + e.extent[0] * at(0, n % 5) + e.extent[1] * at(1, n / 5 % 5) + e.extent[2] * at(2, n / 25);
+                                p0.distance_squared(head_world) <= DUST_SEEN_WITHIN * DUST_SEEN_WITHIN
+                                    && eyes.map_or(true, |eyes| eyes.iter().any(|v| v.holds(p0, margin)))
+                            })
+                            .count();
+                        let part: f32 = span.iter().map(|(a, b)| (b - a) / 2.0).product();
+                        near as f32 / 125.0 * part
+                    }
+                } else {
+                    1.0
+                };
+                ((slots * within).ceil(), true)
+            }
+            _ => (cost.instances, false),
+        };
+        let (lo, hi) = emitter_bounds(e);
+        let d = (0.5 * (lo + hi)).distance(head_world).max(0.3);
+        let pixels = (hi - lo).length() / d * REFERENCE_FOCAL_PIXELS;
+        // What it fills in the eyes that see it (both reference eyes
+        // looking at it where none were given).
+        let looking = [seen::Eye::looking(head_world, 0.5 * (lo + hi)); 2];
+        let eyes: &[seen::Eye] = match sight.get(index) {
+            Some(v) => v,
+            None => &looking,
+        };
+        let area = if cost.points { 0.0 } else { count * cost.area_each * e.scale * e.scale };
+        let (facing, flat) = if cost.flat { (0.0, area) } else { (area, 0.0) };
+        let fill = seen::seen_fill(eyes, lo, hi, facing, flat, if cost.points { count } else { 0.0 }, 0.0);
+        out.push(stack::Want {
+            key: emitter_key(e),
+            score: cost.importance * 100.0 + pixels.max(1.0).log2(),
+            fill,
+            count,
+            sheddable,
+            kind: stack::WantKind::Emitter,
+        });
+    }
+    for s in splashes {
+        let (lo, hi) = splash_bounds(s);
+        let d = (0.5 * (lo + hi)).distance(head_world).max(0.3);
+        let pixels = (hi - lo).length() / d * REFERENCE_FOCAL_PIXELS;
+        let (fill, count) = measured.get(&splash_key(s)).copied().unwrap_or((0.0, 0.0));
+        out.push(stack::Want {
+            key: splash_key(s),
+            score: templates::water_entry_asset().scalability.importance * 100.0 + pixels.max(1.0).log2(),
+            fill,
+            count,
+            sheddable: true,
+            kind: stack::WantKind::Splash,
+        });
+    }
+    out
+}
+
+/// [`simulate_all`], with THE GOVERNOR'S SHARES of the placed emitters and
+/// splashes (`shares`; `None` draws every particle): a slot of a thinned
+/// emitter outside its share is skipped before it is worked out, and a
+/// thinned splash's pieces outside its share are not drawn -- in a fixed
+/// order each, so a falling share drops them one at a time and a rising one
+/// brings the same ones back. Sparser, never smaller or dimmer: every
+/// particle still drawn is the same bytes it would be whole. A fire's sheets,
+/// a bed of coals and an embers emitter's pops are never thinned.
+pub fn simulate_governed(
+    emitters: &[EffectEmitter],
+    seen: &dyn Fn(usize) -> bool,
+    splashes: &[Splash],
+    bursts: Option<&stack::BurstFrame>,
+    shares: Option<&Shares>,
+    time: f64,
+    at: &Surroundings,
+) -> EffectFrame {
+    let mut emitter_shed = 0u32;
+    let mut splash_shed = 0u32;
+    let mut splash_costs: Vec<(u64, f32, f32)> = Vec::new();
     let mut over: Vec<(f32, EffectInstance)> = Vec::new();
     let mut screened: Vec<EffectInstance> = Vec::new();
     let player = |p: Vec3| at.yaw_inv * (p - at.offset);
@@ -1228,44 +1416,53 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
         if !seen(index) {
             continue;
         }
-        match e.kind {
-            EffectKind::Coals => {
+        // ITS STACK, compiled (`templates`): the fused modules each draw
+        // their own way; the rest is the slot loop below, every choice in
+        // it one of the stack's modules.
+        let tpl = templates::template(e.kind);
+        let s = match tpl.form {
+            templates::Form::Bed => {
                 // Drawn before all it lies under: as the farthest of all.
                 let breath = coals_breath(e, emitters, time);
                 over.extend(coals_instance(e, time, at, &own, breath).map(|i| (f32::INFINITY, i)));
                 continue;
             }
-            EffectKind::Fire => {
+            templates::Form::Sheets => {
                 fire_instances(e, time, at, &mut over);
                 continue;
             }
-            EffectKind::Embers => ember_pops(e, time, at, &mut screened),
-            _ => {}
+            templates::Form::WaterEntry => continue,
+            templates::Form::Slots(s) => s,
+        };
+        if s.pops {
+            ember_pops(e, time, at, &mut screened);
         }
-        let p = preset(e.kind);
+        let p = &tpl.preset;
         let v = e.variation.clamped();
-        let rate = e.rate.max(0.0)
-            * match e.kind {
-                EffectKind::Dust => p.rate * e.volume() / (0.5 * (p.life.0 + p.life.1)),
-                _ => p.rate,
-            };
+        let rate = e.rate.max(0.0) * if s.density { p.rate * e.volume() / (0.5 * (p.life.0 + p.life.1)) } else { p.rate };
         if !(rate > 0.0) || !(e.scale > 0.0) {
             continue;
         }
-        let lives = life_range(&p, &v);
-        let speeds = speed_range(&p, &v);
+        let lives = life_range(p, &v);
+        let speeds = speed_range(p, &v);
         let slots = ((rate * lives.1).ceil() as usize).clamp(1, MAX_SLOTS);
         // Each slot respawns every `period`: never sooner than its longest
         // life, and the emitter as a whole at `rate`.
         let period = (slots as f64 / rate as f64).max(lives.1 as f64);
         let base = emitter_seed(e);
+        // The governor's share of its particles, and its own order of
+        // shedding them (`stack::kept`).
+        let share = shares.map_or(1.0, |sh| (sh.emitter)(e));
+        let sight = shares.and_then(|sh| sh.sight.get(index));
+        let margin = mote_margin(e);
+        let shed_phase = (hash64(base ^ 0x0de5_ead) >> 40) as f32 / (1u64 << 24) as f32;
         let tint = Vec3::from(e.tint);
         let ambient = (at.ambient)(e.position);
         let lamps: Vec<usize> = (0..at.lights.len()).filter(|&i| (at.reaches)(e, i)).collect();
         // Embers as the eye adapted to the fire sees them.
-        let glow = if e.kind == EffectKind::Embers { at.exposure * fire_adaptation(e, at) } else { at.exposure };
+        let glow = if s.own_light { at.exposure * fire_adaptation(e, at) } else { at.exposure };
         let up = e.direction.try_normalize().unwrap_or(Vec3::Y);
-        let air = (e.kind == EffectKind::Dust).then(|| air_waves(base));
+        let air = s.air.then(|| air_waves(base));
         for i in 0..slots {
             let since = time - i as f64 / rate as f64;
             let n = (since / period).floor();
@@ -1279,9 +1476,16 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
             }
             let t = age / life;
             let speed = lerp(speeds.0, speeds.1, u[1]) * e.scale.sqrt();
-            let p0 = if e.kind == EffectKind::Dust {
+            let p0 = if s.boxed {
                 let p0 = e.position + e.extent[0] * (2.0 * u[4] - 1.0) + e.extent[1] * (2.0 * u[5] - 1.0) + e.extent[2] * (2.0 * u[6] - 1.0);
-                if p0.distance_squared(head_world) > DUST_SEEN_WITHIN * DUST_SEEN_WITHIN {
+                // What the eye cannot hold that far off (`glint`) is not
+                // worked out at all.
+                if s.held && p0.distance_squared(head_world) > DUST_SEEN_WITHIN * DUST_SEEN_WITHIN {
+                    continue;
+                }
+                // Nor what no eye can see: through a doorway, only the motes
+                // its opening shows (`emitter_sight`).
+                if s.held && !sight.map_or(true, |eyes| eyes.iter().any(|v| v.holds(p0, margin))) {
                     continue;
                 }
                 p0
@@ -1292,6 +1496,12 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                 let phi = u[5] * std::f32::consts::TAU;
                 e.position + (side * phi.cos() + up.cross(side) * phi.sin()) * r
             };
+            // Outside the governor's share: left out before it is worked
+            // out (after the motes past seeing, which were never drawn).
+            if share < 1.0 && !stack::kept(i as u32, share, shed_phase) {
+                emitter_shed += 1;
+                continue;
+            }
             let dir = cone_direction(up, p.spread_deg, u[2], u[3]);
             let (mut pos, vel) = ballistic(p0, dir * speed, p.accel, p.drag, age);
             // Its velocity, for SpaceWarp: the throw's, and what carries it
@@ -1314,7 +1524,7 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                 pos += Vec3::new(swirl_a.cos(), 0.0, swirl_a.sin()) * swirl_r;
                 moving += swirl_motion(p.swirl.0 * v.turbulence * e.scale / life, swirl_r, p.swirl.1, swirl_a);
             }
-            let mut size = if e.kind == EffectKind::Dust {
+            let mut size = if s.log_size {
                 // Many faint, few bright (`DUST_LIGHT_SIZE`); spread over
                 // fewer or more octaves about its middle by `size_variation`.
                 let k = if v.size_variation == 1.0 { u[11] * u[11] } else { 1.0 / 3.0 + (u[11] * u[11] - 1.0 / 3.0) * v.size_variation };
@@ -1327,8 +1537,8 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
             // flattening and widening -- the layer that gathers under the
             // roof of a cave or a hall. Embers stop against it.
             if let Some(top) = e.ceiling {
-                match e.kind {
-                    EffectKind::Smoke => {
+                match s.ceiling {
+                    templates::Ceiling::Spread => {
                         let under = top - 0.6 * size;
                         let excess = pos.y - under;
                         if excess > 0.0 {
@@ -1342,13 +1552,13 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                             moving += Vec3::new(a.cos(), 0.0, a.sin()) * (0.9 * rise);
                         }
                     }
-                    EffectKind::Embers => {
+                    templates::Ceiling::Stop => {
                         if pos.y >= top - 0.02 {
                             pos.y = top - 0.02;
                             moving.y = moving.y.min(0.0);
                         }
                     }
-                    _ => {}
+                    templates::Ceiling::Open => {}
                 }
             }
             let spin_dir = if u[10] < 0.5 { -1.0 } else { 1.0 };
@@ -1368,15 +1578,15 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                 params: [rotation, frame, 0.0, 0.0],
                 motion: [moving.x, moving.y, moving.z, 0.0],
             };
-            match e.kind {
-                EffectKind::Embers => {
+            match s.shade {
+                templates::SlotShade::Ember => {
                     inst.colour = ember_colour(&v, tint, glow, age, t, u[11]);
                 }
-                EffectKind::Dust => {
+                templates::SlotShade::Scatter { ambient: seen } => {
                     // Only the light it scatters, each lamp's by its own
                     // angle to the eye; the room's even light hardly shows
                     // it (`DUST_AMBIENT_SEEN`).
-                    let mut scattered = ambient * DUST_AMBIENT_SEEN;
+                    let mut scattered = ambient * seen;
                     for &li in &lamps {
                         if let Some((c, d)) = lamp_at(&at.lights[li], centre) {
                             scattered += c * (own(&at.lights[li]) * henyey_greenstein(p.phase_g, -d, to_eye));
@@ -1385,15 +1595,15 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                     // Seen as the eye holds it: found as it turns into the
                     // light, flashing and dimming as it tumbles, then lost;
                     // and only where the eye could focus on it.
-                    let glint = mote_glint(age, lerp(0.35, 1.3, u[7]), id_hash("glint") ^ u[8].to_bits() as u64);
+                    let glint = if s.held { mote_glint(age, lerp(0.35, 1.3, u[7]), id_hash("glint") ^ u[8].to_bits() as u64) } else { 1.0 };
                     let c = scattered * p.albedo * tint * (at.exposure * glint * v.intensity);
                     let held = smoothstep(0.0, 0.2, t) * smoothstep(1.0, 0.7, t);
                     let d = (centre - at.head).length();
-                    let focus = smoothstep(DUST_NEAREST.0, DUST_NEAREST.1, d) * smoothstep(DUST_SEEN_WITHIN, 0.75 * DUST_SEEN_WITHIN, d);
+                    let focus = if s.held { smoothstep(DUST_NEAREST.0, DUST_NEAREST.1, d) * smoothstep(DUST_SEEN_WITHIN, 0.75 * DUST_SEEN_WITHIN, d) } else { 1.0 };
                     inst.colour = [c.x, c.y, c.z, held * focus];
                     inst.params[3] = -1.0;
                 }
-                EffectKind::Smoke => {
+                templates::SlotShade::Sixway { peak, rise, power } => {
                     let mut strongest: Option<(f32, Vec3, Vec3)> = None;
                     let mut rest = ambient;
                     for &li in &lamps {
@@ -1411,7 +1621,7 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                     }
                     let a = Vec3::splat(p.albedo) * tint * at.exposure;
                     let base = rest * a;
-                    let opacity = 0.55 * smoothstep(0.0, 0.1, t) * (1.0 - t).powf(1.4) * v.intensity;
+                    let opacity = peak * smoothstep(0.0, rise, t) * (1.0 - t).powf(power) * v.intensity;
                     inst.colour = [base.x, base.y, base.z, opacity];
                     if let Some((_, c, d)) = strongest {
                         let lit = c * a * henyey_greenstein(p.phase_g, -d, to_eye);
@@ -1420,13 +1630,11 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                     }
                     inst.params[3] = 1.0;
                 }
-                // Drawn above, each its own way.
-                EffectKind::Coals | EffectKind::Fire => unreachable!("coals and flames are drawn apart"),
             }
             if inst.colour[3] <= 0.0 {
                 continue;
             }
-            if e.kind.screened() {
+            if s.screened {
                 screened.push(inst);
             } else {
                 over.push(((centre - at.head).length_squared(), inst));
@@ -1434,7 +1642,37 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
         }
     }
     for s in splashes {
+        let (o0, s0) = (over.len(), screened.len());
         splash(s, time, at, &mut over, &mut screened);
+        // What it fills drawn whole: what it is weighed by next frame.
+        let key = splash_key(s);
+        let fill: f32 = over[o0..].iter().map(|(_, i)| i).chain(screened[s0..].iter()).map(|i| instance_fill(i, at.head)).sum();
+        splash_costs.push((key, fill, (over.len() - o0 + screened.len() - s0) as f32));
+        let share = shares.map_or(1.0, |sh| (sh.splash)(s));
+        if share < 1.0 {
+            let phase = uniforms(key)[0];
+            let mut j = 0u32;
+            let mut keep = |_: &EffectInstance| {
+                j += 1;
+                let kept = stack::kept(j - 1, share, phase);
+                splash_shed += !kept as u32;
+                kept
+            };
+            let tail: Vec<(f32, EffectInstance)> = over.drain(o0..).collect();
+            over.extend(tail.into_iter().filter(|(_, i)| keep(i)));
+            let tail: Vec<EffectInstance> = screened.drain(s0..).collect();
+            screened.extend(tail.into_iter().filter(|i| keep(i)));
+        }
+    }
+    let mut burst_count = bursts.map_or_else(Default::default, |b| stack::simulate_bursts(b, time, at, &own, &mut over, &mut screened));
+    burst_count.emitter_shed = emitter_shed;
+    burst_count.splash_shed = splash_shed;
+    // Those lit through the heat ramp last among the screened (which need
+    // no order), for their own draw. Stable: the rest keep theirs.
+    let hot = |i: &EffectInstance| i.params[3] == stack::SHADE_SCREEN_HEAT;
+    let screened_heat = screened.iter().filter(|i| hot(i)).count() as u32;
+    if screened_heat > 0 {
+        screened.sort_by_key(|i| hot(i));
     }
     // Back to front, so each puff lands over what is behind it.
     over.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -1442,6 +1680,9 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
         instances: Vec::with_capacity(over.len() + screened.len()),
         over: over.len() as u32,
         screened: screened.len() as u32,
+        screened_heat,
+        bursts: burst_count,
+        splash_costs,
     };
     frame.instances.extend(over.into_iter().map(|(_, i)| i));
     frame.instances.extend(screened);
@@ -1499,51 +1740,31 @@ pub fn emitter_seen(
     rooms: &[super::portal_cull::CullRoom],
     portals: &[super::uniforms::ProbePortal],
 ) -> bool {
+    !emitter_sight(e, views, head, rooms, portals).is_empty()
+}
+
+/// THE EYES AN EMITTER IS SEEN THROUGH this frame (`seen::sight`): each
+/// view holding its bounds (`emitter_bounds`), and from inside a closed room
+/// only through the open doorways that lead to its room, each view NARROWED
+/// to their openings. Empty: out of sight. So the room behind a door that
+/// opens is not simulated and weighed whole the moment it opens: its dust
+/// works out only the motes the doorway shows (`simulate_governed`), and the
+/// governor weighs its fill through the opening (`governor_wants`).
+pub fn emitter_sight(
+    e: &EffectEmitter,
+    views: &[[glam::Vec4; 6]],
+    head: Vec3,
+    rooms: &[super::portal_cull::CullRoom],
+    portals: &[super::uniforms::ProbePortal],
+) -> Vec<seen::Eye> {
     let (lo, hi) = emitter_bounds(e);
-    let in_view = views.iter().any(|planes| {
-        let mut unbounded = *planes;
-        unbounded[5] = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
-        super::shadow::aabb_in_frustum(&unbounded, lo, hi)
-    });
-    if !in_view {
-        return false;
-    }
-    let room_of = |p: Vec3| {
-        rooms
-            .iter()
-            .filter(|r| (r.min.cmplt(p) & p.cmplt(r.max)).all())
-            .min_by(|a, b| (a.max - a.min).element_product().total_cmp(&(b.max - b.min).element_product()))
-    };
-    let Some(start) = room_of(head).filter(|r| r.closed) else { return true };
-    let goal = room_of(e.position);
-    if goal.is_some_and(|g| g.id == start.id) {
-        return true;
-    }
-    // Rooms reached through open doorways, a doorway at a time.
-    let mut reached = vec![start.id];
-    let mut frontier = vec![start.id];
-    for _ in 0..super::portal_cull::MAX_DOORWAYS {
-        let mut next = Vec::new();
-        for p in portals {
-            for (from, to) in [(p.low, p.high), (p.high, p.low)] {
-                if frontier.contains(&from) && !reached.contains(&to) {
-                    reached.push(to);
-                    next.push(to);
-                }
-            }
-        }
-        match goal {
-            Some(g) if reached.contains(&g.id) => return true,
-            // Outdoors: any room not closed opens onto it.
-            None if reached.iter().any(|id| rooms.iter().any(|r| r.id == *id && !r.closed)) => return true,
-            _ => {}
-        }
-        if next.is_empty() {
-            return false;
-        }
-        frontier = next;
-    }
-    false
+    seen::sight(views, head, lo, hi, e.position, rooms, portals)
+}
+
+/// How far past a view a dust mote's spot may be and still drift into it:
+/// the air's carry and its own size (`emitter_bounds`' margin).
+fn mote_margin(e: &EffectEmitter) -> f32 {
+    0.25 * e.variation.clamped().turbulence + 0.05
 }
 
 /// A FIRE'S SHEETS as the GPU draws them (`fire_sheets`): upright, taller than
@@ -1686,31 +1907,76 @@ fn ember_pops(e: &EffectEmitter, time: f64, at: &Surroundings, screened: &mut Ve
     }
 }
 
-/// SOMETHING STRIKING WATER: a foot, a hand, a thrown thing. An event, not an
-/// emitter -- the client sees it happen (`quest_app::splashes`) and every
-/// particle it throws is a function of it and the time since, as an
+/// SOMETHING STRIKING WATER: a foot, a hand, a dropped thing, a bullet. An
+/// event, not an emitter -- the client sees it happen (`quest_app::splashes`)
+/// and every particle it throws is a function of it and the time since, as an
 /// emitter's are of the clock, so it needs no state either. In the WORLD's
 /// frame.
+///
+/// What it is given is what a splash is made by: how fast and at what angle
+/// the thing came in (`velocity`), how wide it is where it meets the water
+/// (`size`), how heavy (`mass`), and how deep the water is. Everything drawn
+/// is worked out from those ([`splash_shape`]); nothing is tuned per kind of
+/// thing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Splash {
     /// Where it struck the still surface.
     pub position: Vec3,
     /// When, on the clock it is simulated with.
     pub born: f64,
-    /// How fast what struck it was moving, m/s.
-    pub speed: f32,
-    /// How big what struck it was: its radius at the surface, metres.
+    /// How what struck was moving as it met the surface, m/s: its speed and
+    /// the angle it came in at.
+    pub velocity: Vec3,
+    /// How big what struck it was: the radius of its cross-section at the
+    /// surface, metres.
     pub size: f32,
+    /// Its mass, kilograms: with its speed, the energy it brought, and how
+    /// far it drives on under the surface before the water stops it.
+    pub mass: f32,
     /// How much of the sun reaches it, 0..1: the client's ray toward the sun.
     pub sunlit: f32,
     /// The still water's depth there, metres: how far the shore's swash
-    /// lifts it (`XrRenderer::add_splash`).
+    /// lifts it (`XrRenderer::add_splash`), and whether there is room under
+    /// it for a cavity.
     pub depth: f32,
+    /// How still the water it struck was: 1 untouched; toward 0 inside the
+    /// open cavity or the churned, aerated patch of a splash before it, where
+    /// there is no clean surface to lift a sheet from. Set by [`strike`].
+    pub calm: f32,
+    /// 1 where what struck is HELD in its own cavity and does not leave it
+    /// behind -- a leg, a hand, an arm reaching in: the water cannot close
+    /// over it, so no jet. 0 for anything that goes on down.
+    pub held: f32,
+    /// 1 where what struck met the water FLAT -- a palm slapped down, a
+    /// board, a belly flop: no crown, the water leaves sideways low and fast
+    /// as a sheet of spray, the crater is shallow and brief. 0 for a round
+    /// or pointed thing.
+    pub flat: f32,
     pub seed: u64,
 }
 
-/// How long a splash lasts, seconds: its highest drop falls back by then.
-pub const SPLASH_SECONDS: f32 = 1.6;
+impl Splash {
+    /// Something of radius `size` and `mass` meeting still, deep, sunlit,
+    /// untouched water at `position` with `velocity`. Set `depth` and
+    /// `sunlit` where they are known.
+    pub fn new(position: Vec3, born: f64, velocity: Vec3, size: f32, mass: f32) -> Self {
+        let seed = hash64(born.to_bits() ^ hash64((position.x.to_bits() as u64) << 32 | position.z.to_bits() as u64));
+        Self { position, born, velocity, size, mass, sunlit: 1.0, depth: 30.0, calm: 1.0, held: 0.0, flat: 0.0, seed }
+    }
+
+    /// A BULLET or any small fast thing meeting the water at `position`:
+    /// `diameter` its calibre in metres, `mass` in kilograms, `velocity` as it
+    /// struck. What a firearm calls where its shot's line meets a surface
+    /// (`space_soup_engine::rigid_physics::PhysicsWorld::water_hit`).
+    pub fn projectile(position: Vec3, born: f64, velocity: Vec3, diameter: f32, mass: f32) -> Self {
+        Self::new(position, born, velocity, 0.5 * diameter, mass)
+    }
+}
+
+/// The longest any splash's thrown water is in the air, seconds: a cap; each
+/// lasts as long as its own drops and jet take to fall back
+/// ([`SplashShape::seconds`]).
+pub const SPLASH_SECONDS: f32 = 3.0;
 
 /// Water drops' scattering: clear spheres absorb nothing and send most of the
 /// light that reaches them on forward, bent through them, mirroring a little
@@ -1721,28 +1987,577 @@ const DROP_PHASE_G: f32 = 0.55;
 /// One frame's travel at 72-90 Hz, seconds: a falling drop is a streak.
 const DROP_STREAK: f32 = 0.012;
 
-/// How strong a splash is, about 1 for a walking step into shallow water: the
-/// energy it throws, from its speed and the size of what struck.
-pub fn splash_strength(speed: f32, size: f32) -> f32 {
-    let v = (speed / 1.3).max(0.0);
-    (v * v * (size / 0.08).max(0.0)).min(12.0)
+// WATER AND AIR, SI units: what every part of a splash is worked out from.
+const WATER_DENSITY: f32 = 1000.0;
+const GRAVITY: f32 = 9.81;
+const SURFACE_TENSION: f32 = 0.072;
+const ATMOSPHERE: f32 = 101_325.0;
+/// The drag of a blunt thing driven through water (a bullet tumbles): its
+/// coefficient, on its cross-section.
+const BODY_DRAG: f32 = 0.8;
+/// A drop's drag in air per metre a second of its speed and per metre of its
+/// width: 3/4 x a sphere's coefficient (0.5) x air's density over water's. A
+/// 3 mm drop at 3 m/s loses speed at 0.45 a second; mist a fifth of a
+/// millimetre across stops within half a metre however fast it left.
+const DROP_DRAG: f32 = 4.5e-4;
+/// The speed at which the air rushing in behind a thing closes the splash
+/// over it at the surface, m/s: the cavity is then sealed and must open
+/// against the atmosphere, not only against the water's weight -- narrow, and
+/// shut in milliseconds -- and what is thrown is spray, not a sheet. Begins
+/// near 8 m/s for things centimetres across; complete by 40.
+const SEAL_SPEED: (f32, f32) = (8.0, 40.0);
+/// The most drops one splash draws; the rest of its water is in its crown,
+/// its jet and its mist.
+const SPLASH_DROPS: usize = 110;
+/// The most pieces a crown is drawn in: each at most three times as wide as
+/// it is tall, so a low wide crown takes more.
+const SPLASH_PETALS: usize = 14;
+/// A crown's sheet, as a share of its cavity's radius: a few tenths of a
+/// millimetre for a pebble's, millimetres for a crate's.
+const SHEET_THICKNESS: f32 = 0.01;
+/// The step a splash's sprites' velocities are taken over, seconds.
+const SPLASH_H: f32 = 1.0 / 256.0;
+/// THE RINGS' ENERGY: the share of a strike's energy (into the water, and a
+/// tenth of its skimming energy) that leaves as the ring of waves. Most of
+/// the rest goes into the crown, the jet, the bubbles and heat. Impacts put
+/// some 5-15 per cent of what they bring into waves (inferred from impact
+/// cratering in water); 10 per cent here. At 3 per cent (round 1) a thrown
+/// rock's first crest was 14 mm two cavity radii out and the user found the
+/// surface hardly raised for the splash's size (2026-10-14, fifth test).
+const RING_ENERGY_SHARE: f32 = 0.10;
+/// The steepest disturbance the rings can be made from: a depression no
+/// deeper than this share of its radius. Steeper, water breaks: the excess
+/// goes into white water, not waves. 0.6: the collapse's first crest at the
+/// rim (`RING_PEAK` of the source) is then a quarter of the cavity's radius
+/// at most -- the lip a cavity throws up as it closes -- where 0.4 held a
+/// thrown rock's to a sixth.
+const RING_STEEPEST: f32 = 0.6;
+/// The rings' source's edge, as a share of its cavity's radius: the
+/// spectrum's `exp(-k c)` (`splash_shape`).
+const RING_EDGE: f32 = 0.5;
+/// The train's height at its middle, as `RING_PEAK D a / r` (the Mexican
+/// hat's stationary phase gives 0.58; its sharp edge spreads the same energy
+/// over more lengths).
+const RING_PEAK: f32 = 0.4;
+/// How fast short ripples die on real water, m2/s: ten times pure water's
+/// viscosity, for the film every pond and sea carries (`exp(-2 nu k^2 t)`).
+pub const RING_FILM_VISCOSITY: f32 = 1.0e-5;
+/// The drops falling back are scattered over cells, one drop a cell at
+/// most, about a third of their band across: so many a metre, within these
+/// (see `water_pipeline::DROPS_BLOCK`). A drop's ring is kept inside its
+/// cell, so a smaller splash's are smaller and shorter-lived.
+pub const DROP_CELLS: (f32, f32) = (4.0, 24.0);
+
+/// WHAT A SPLASH IS, worked out from what struck ([`splash_shape`]). Lengths
+/// in metres, times in seconds, speeds in m/s.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SplashShape {
+    /// THE CAVITY the thing opens behind it: its radius at the surface...
+    pub cavity: f32,
+    /// ...how deep it reaches before it closes...
+    pub depth: f32,
+    /// ...and how long it takes to open and close again. Everything after
+    /// keeps this time: a big splash is a slow one.
+    pub collapse: f32,
+    /// 0..1: how far the cavity is sealed over at the surface (`SEAL_SPEED`).
+    pub sealed: f32,
+    /// 0..1: how much of what is thrown is too fine to see as drops -- spray.
+    pub fine: f32,
+    /// THE CROWN: the sheet the opening cavity lifts round its rim. How fast
+    /// it leaves, at what angle above the water, how high its rim gets and
+    /// for how long it is up, and how many pieces it is drawn as.
+    pub sheet_speed: f32,
+    pub sheet_angle: f32,
+    pub crown_height: f32,
+    pub crown_seconds: f32,
+    pub petals: usize,
+    /// THE DROPS the rim breaks into: their width, how many are drawn, and
+    /// how much faster than the sheet the fastest, finest of them leave --
+    /// the thin spray thrown as the thing first meets the water.
+    pub drop: f32,
+    pub drops: usize,
+    pub spray_speed: f32,
+    /// THE JET the closing cavity throws up from its middle (Worthington's):
+    /// how high, how wide at its foot (half), and when (`collapse` after the
+    /// strike). No height: none.
+    pub jet_height: f32,
+    pub jet_width: f32,
+    /// 0..1: how much of the sheet falls as WHITE WATER. A film of water
+    /// pulls itself back into its rim at the Taylor-Culick speed
+    /// `sqrt(2 sigma / (rho thickness))`: a pebble's thin crown is gone back
+    /// into its rim before it falls, and stays clear; a crate's, thick and
+    /// tall, cannot be, and comes down in pieces.
+    pub broken: f32,
+    /// 0..1: how WHITE what it throws is -- a broken sheet's white water, or
+    /// what a strike into water already churned and full of air throws
+    /// instead of a crown.
+    pub white: f32,
+    /// How many fans of SPRAY stand round its rim (`spray_frame`), and how
+    /// many pieces of WHITE WATER (`froth_frame`).
+    pub spray: usize,
+    pub froth: usize,
+    /// How much faster the sheet leaves AHEAD of a thing that struck at a
+    /// slant: a wading foot ploughs its water forward.
+    pub plow: f32,
+    /// How fast the thing struck, m/s: no body of water it throws leaves
+    /// faster (a little thin spray does).
+    pub struck: f32,
+    /// Puffs of mist: a sealed strike's plume.
+    pub mist: usize,
+    /// THE RINGS it sends out over the water: the length of the waves that
+    /// carry most of their energy, how fast that part of the train travels
+    /// (its group speed), and how high its first crest is two cavity radii
+    /// out. The train itself is dispersive (`splash_rings`): these are its
+    /// middle.
+    pub ring_wavelength: f32,
+    pub ring_speed: f32,
+    pub ring_height: f32,
+    /// The disturbance the rings are made from: the cavity's depression and
+    /// the rim round it, as a Mexican hat this deep at its middle, metres
+    /// (`RING_ENERGY_SHARE` of the strike's energy, no steeper than
+    /// `RING_STEEPEST`).
+    pub wave_source: f32,
+    /// Gravity as waves the train's length feel it, surface tension
+    /// included (`g (1 + sigma k^2 / rho g)` at its middle).
+    pub ring_gravity: f32,
+    /// When the train leaves: the cavity at its widest, the crown falling
+    /// back, seconds after the strike.
+    pub ring_release: f32,
+    /// THE DROPS FALLING BACK: how far from where it struck most of them
+    /// land, how wide the band is, when the first land, over how long, and
+    /// how many land on a square metre there. Each makes its own small ring.
+    pub drops_land: f32,
+    pub drops_band: f32,
+    pub drops_from: f32,
+    pub drops_over: f32,
+    pub drops_density: f32,
+    /// THE FOAM it leaves where it struck: how white (0..1), and how long
+    /// until the water there is still again -- which is also how long a
+    /// second strike finds it disturbed ([`strike`]).
+    pub foam: f32,
+    /// How long the foam takes to dissolve, seconds.
+    pub foam_seconds: f32,
+    pub settle: f32,
+    /// Which way it was travelling over the water, as long as the cosine of
+    /// the angle it came in at: none straight down, 1 skimming. What is
+    /// thrown leans this way.
+    pub forward: Vec3,
+    /// How much of its own sideways speed what it throws keeps, m/s.
+    pub carry: Vec3,
+    /// How long anything of it is in the air.
+    pub seconds: f32,
 }
 
-/// A splash's drops and spray at `time`.
+/// How high something thrown straight up at `up` m/s, slowed by the air at
+/// `k` a second, is after `t` seconds (below where it left, in the end).
 ///
-/// DROPS: thrown from a ring round where it struck at 40-85 degrees, each as
-/// fast as a share of the strike, falling under gravity with a little drag,
-/// gone when they reach the surface again. Streaked along their motion, lit
-/// by the sun (when the client found it in sight) and the light round them,
-/// screened like the embers. SPRAY: a few puffs of mist where it struck,
-/// thinning as they spread -- drawn over, as the smoke is.
-fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectInstance)>, screened: &mut Vec<EffectInstance>) {
+/// `up a1 - g (t - a1) / k` with `a1 = (1 - e^(-kt)) / k` -- which in single
+/// precision loses `t - a1` to rounding while `kt` is small, and a sprite's
+/// last moments with it (its landing time out by parts in ten thousand, its
+/// fade by parts in a hundred): so through `exp_m1`, and by its series where
+/// `kt` is under a twentieth.
+fn thrown_height(up: f32, k: f32, t: f32) -> f32 {
+    let x = k * t;
+    // (t - a1) / k = t^2 phi(x), phi(x) = (x - 1 + e^-x) / x^2.
+    let (a1, phi) = if x < 0.05 {
+        (t * (1.0 - x * (0.5 - x * (1.0 / 6.0 - x / 24.0))), 0.5 - x * (1.0 / 6.0 - x * (1.0 / 24.0 - x / 120.0)))
+    } else {
+        let e = (-x).exp_m1();
+        (-e / k, (x + e) / (x * x))
+    };
+    up * a1 - GRAVITY * t * t * phi
+}
+
+/// How long something thrown straight up at `up` m/s, slowed by the air at
+/// `k` a second, is in the air.
+fn aloft(up: f32, k: f32) -> f32 {
+    if up <= 0.0 {
+        return 0.0;
+    }
+    if k < 1e-3 {
+        return 2.0 * up / GRAVITY;
+    }
+    let apex = (up * k / GRAVITY).ln_1p() / k;
+    let (mut lo, mut hi) = (apex, apex + 2.0 * up / GRAVITY + 1.0 / k);
+    for _ in 0..24 {
+        let mid = 0.5 * (lo + hi);
+        if thrown_height(up, k, mid) > 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// How high it gets (see [`aloft`]).
+fn apex(up: f32, k: f32) -> f32 {
+    if up <= 0.0 {
+        return 0.0;
+    }
+    // up / k - g / k^2 ln(1 + y), y = up k / g: by its series while y is
+    // small, where the two terms are nearly equal.
+    let y = up * k / GRAVITY;
+    if y < 0.1 {
+        return up * up / GRAVITY * (0.5 - y * (1.0 / 3.0 - y * (0.25 - y * (0.2 - y / 6.0))));
+    }
+    up / k - GRAVITY / (k * k) * y.ln_1p()
+}
+
+/// THE SPLASH A STRIKE MAKES, from its speed, its angle, the size and mass of
+/// what struck and the water's depth -- one model for a pebble, a dropped
+/// pistol, a bullet, a wading foot and a crate.
+///
+/// THE CAVITY. A thing driven into water pushes it aside faster than it can
+/// close behind, and leaves a hole of air. Its drag does work on the water,
+/// `1/2 rho Cd A v^2` a metre, and the hole opens until the pressure holding
+/// it shut has taken that work up: the water's weight (`rho g a`) for a slow
+/// thing, the whole atmosphere besides for one fast enough to be sealed over
+/// (`SEAL_SPEED`). So a slow thing's cavity grows as the cube root of
+/// `v^2 R^2` -- as its Froude number's -- and a bullet's, held by a hundred
+/// kilopascals, stays a few centimetres wide. It closes in about the time
+/// water takes to fall in across it (Rayleigh's collapse), `1.83 a
+/// sqrt(rho / P)`: a tenth of a second for a pebble, half a second for a
+/// crate, milliseconds for a bullet. In that time the thing drives on,
+/// slowing as its mass allows (`2 m / (rho Cd A)` is the distance that takes
+/// its speed down by e): that is the cavity's depth, unless the bed is
+/// nearer. And the cavity cannot hold more energy than the thing brought:
+/// a light thing digs a smaller one.
+///
+/// THE CROWN is the sheet the opening wall lifts round its rim, leaving at
+/// about the wall's speed -- nothing for a thing lowered in, which opens no
+/// cavity -- steeply from deep water and flat from shallow, which has nowhere
+/// to go but out. Its rim beads into DROPS about the size surface tension
+/// holds together against the sheet's speed (a few millimetres; a fraction of
+/// one for a bullet's, which is mist), the fastest of them thin spray thrown
+/// at something like the thing's own speed, which the air stops.
+///
+/// THE JET is the closing cavity's rebound, thrown up its middle about as
+/// high as the cavity was deep, thin from a deep narrow cavity and a broad
+/// mound from a shallow bowl -- and none where the thing stays in its own
+/// cavity (a foot, a floating crate) or the water was too shallow to hold
+/// one.
+///
+/// RINGS leave at the cavity's rim, their waves a few cavity radii long and
+/// travelling at the speed water waves of that length do; FOAM is the air the
+/// collapse folded in.
+///
+/// (Duclaux et al. 2007 and Aristoff & Bush 2009 for cavities and their
+/// pinch-off; Gekle & Gordillo 2010 for the jet; Gilbarg & Anderson 1948 for
+/// the surface seal.)
+pub fn splash_shape(s: &Splash) -> SplashShape {
+    use std::f32::consts::{PI, TAU};
+    let speed = s.velocity.length();
+    let r = s.size.max(1e-3);
+    let calm = s.calm.clamp(0.0, 1.0);
+    let normal = s.velocity.y.abs();
+    let sin_entry = if speed > 1e-4 { (normal / speed).clamp(0.0, 1.0) } else { 1.0 };
+    let flat = Vec3::new(s.velocity.x, 0.0, s.velocity.z);
+    let forward = if speed > 1e-4 { flat / speed } else { Vec3::ZERO };
+    let sealed = smoothstep(SEAL_SPEED.0, SEAL_SPEED.1, speed);
+
+    // The cavity: a^2 P(a) = the drag's work a metre (over pi), from the
+    // thing's own width where it does none.
+    let pressure = |a: f32| WATER_DENSITY * GRAVITY * a + ATMOSPHERE * sealed;
+    let drive = 0.5 * WATER_DENSITY * BODY_DRAG * r * r * speed * speed + pressure(r) * r * r;
+    let mut cavity = r;
+    for _ in 0..24 {
+        cavity = 0.5 * (cavity + (drive / pressure(cavity)).sqrt());
+    }
+    let closes = |a: f32| 1.83 * a * (WATER_DENSITY / pressure(a)).sqrt();
+    // How far it drives on while its cavity is open.
+    let stops = 2.0 * s.mass.max(1e-5) / (WATER_DENSITY * BODY_DRAG * PI * r * r);
+    let travel = stops * (1.0 + speed * closes(cavity) / stops).ln();
+    // The wall is pushed out no further than the thing drove in: a cork
+    // stopped at the surface opens no cavity wider than itself.
+    cavity = r + (cavity - r).min(travel);
+    // A flat thing's crater is shallow: it stops in a hand's depth.
+    let flat_hit = s.flat.clamp(0.0, 1.0);
+    let mut depth = (travel * sin_entry).min(s.depth.max(0.0)).max(0.0) * (1.0 - 0.6 * flat_hit);
+    // No more energy in the hole than the thing brought (a cone's worth of
+    // lifted water, and of the atmosphere pushed back).
+    let energy = 0.5 * s.mass.max(0.0) * speed * speed;
+    let dug = PI * cavity * cavity * depth * (WATER_DENSITY * GRAVITY * depth / 12.0 + ATMOSPHERE * sealed / 3.0);
+    if dug > energy && dug > 0.0 {
+        let k = (energy / dug).powf(0.25);
+        cavity = (cavity * k).max(r);
+        depth *= k;
+    }
+    let collapse = closes(cavity).max(1e-3);
+    // Room under it for the cavity; and whether the thing leaves its cavity
+    // behind it, or stays in it.
+    let deep = smoothstep(0.5, 2.0, s.depth / cavity);
+    let passes = smoothstep(1.0, 2.5, depth / cavity);
+
+    // The crown.
+    // The wall's mean speed out is (a - r) in half the cavity's time; it
+    // starts faster than it ends, and the sheet leaves at its start. And
+    // the water a blunt thing throws off its shoulder as it goes in leaves
+    // at a share of the thing's own speed: a small share where the sheet is
+    // thin enough for surface tension to hold it back (a pebble's, a
+    // quarter), most of it for a thing a hand wide or more -- so a brick
+    // dropped a metre throws water most of the way back up, and a pebble's
+    // crown is a few centimetres. Nothing from a thing too light to drive in.
+    let shoulder = (WATER_DENSITY * normal * normal * r / SURFACE_TENSION).sqrt();
+    let thrown = 0.8 * shoulder / (shoulder + 150.0) * normal * (1.0 - sealed) * (travel / r).min(1.0);
+    // A FLAT face meeting the water squeezes the water under it out
+    // sideways, faster than it came down (Wagner's flat impact): a sheet
+    // of spray low and wide, not a crown.
+    let sheet_speed = (3.5 * (cavity - r) / collapse).max(thrown).max(1.3 * normal * flat_hit);
+    // Steeply where there is water under the thing; flat from a puddle
+    // shallower than the thing is wide, which has nowhere to go but out --
+    // or from a flat face, which throws it out along the surface.
+    let steep = smoothstep(0.3, 1.5, s.depth / r);
+    let sheet_angle = lerp(lerp(28.0f32, 68.0, steep), 14.0, flat_hit).to_radians();
+    let plow = 0.9 * flat.length() * (1.0 - sealed);
+    let weber = WATER_DENSITY * sheet_speed * sheet_speed * cavity / SURFACE_TENSION;
+    let drop = (cavity / weber.max(1.0).sqrt()).clamp(1.5e-4, 4e-3);
+    let fine = 1.0 - smoothstep(3e-4, 1e-3, drop);
+    let up = sheet_speed * sheet_angle.sin();
+    let air = DROP_DRAG * up / drop;
+    let crown_height = apex(up, air);
+    let crown_seconds = aloft(up, air);
+    // As many pieces as cover its rim, each wider than it is tall.
+    let rim = 1.2 * cavity;
+    let petals = if crown_height > 0.004 && fine < 0.75 && flat_hit < 0.5 { ((TAU * rim / (1.6 * crown_height)).round() as usize).clamp(10, SPLASH_PETALS) } else { 0 };
+    // The rim's fingers, a drop or two from each; in churned water fewer hold
+    // together.
+    let fingers = TAU * cavity / (9.0 * drop.max(1.5e-3));
+    // (A flat slap's sheet tears into twice the drops at once.)
+    let drops = if sheet_speed > 0.15 { ((1.5 * fingers * (0.15 + 0.85 * (1.0 - fine)) * (0.4 + 0.6 * calm) * (1.0 + flat_hit)).round() as usize).clamp(4, SPLASH_DROPS) } else { 0 };
+    // The first, thin spray off the thing's shoulder: most of the thing's
+    // own speed from a big one, less from one small enough for surface
+    // tension to hold it back.
+    let spray_speed = (0.5 + 0.75 * shoulder / (shoulder + 150.0)) * normal;
+
+    // The jet: only from a cavity with water under it that the thing has
+    // left, closing evenly -- which one opened in churned water does not.
+    // (Nearly half as high again as the cavity was deep: the rebound is
+    // thin, and goes further than the hole it came from. None round a leg.)
+    let jet_height = 1.4 * depth * passes * deep * calm * calm * (1.0 - s.held.clamp(0.0, 1.0));
+    let jet_width = (0.3 * cavity * (cavity / depth.max(1e-3)).sqrt()).clamp(0.08 * cavity, 0.45 * cavity);
+    let jet_seconds = 2.0 * (2.0 * jet_height / GRAVITY).sqrt();
+
+    // The sheet is about a hundredth of its cavity thick.
+    let retracts = (2.0 * SURFACE_TENSION / (WATER_DENSITY * SHEET_THICKNESS * cavity)).sqrt();
+    let broken = smoothstep(0.6, 2.5, crown_height / (retracts * crown_seconds.max(1e-3))) * (1.0 - fine);
+    let white = broken.max(0.85 * (1.0 - calm)) * (1.0 - fine);
+    let throws = sheet_speed > 0.15;
+    let spray = if throws { ((1.5 + 9.0 * cavity.sqrt() * (1.0 - sealed) + 2.5 * sealed).round() as usize).clamp(3, 6) } else { 0 };
+    // (White water from a body of sheet: not from a hand's slap into
+    // churned water, whose little water goes up as spray.)
+    let froth = if throws && white > 0.4 && (cavity > 0.1 || broken > 0.5) { ((white * (6.0 + 4.0 * cavity.sqrt())).round() as usize).clamp(6, 9) } else { 0 };
+    let mist = if sealed > 0.05 { (2.0 + 6.0 * sealed).round() as usize } else { 0 };
+
+    // THE RINGS (Cauchy-Poisson). The cavity and the rim it lifts are a
+    // depression with a raised edge and no water gained or lost -- about a
+    // Mexican hat `-D (1 - r^2/a^2) exp(-r^2/a^2)`, whose depth holds
+    // `RING_ENERGY_SHARE` of the energy that went in (`rho g pi a^2 D^2 /
+    // 8`), no steeper than water holds. Its edge is sharp -- the crown falls
+    // back along a rim a sheet thick -- so its spectrum runs on far past the
+    // hat's: `k^2 exp(-k c)` with `c` half the cavity's radius, its waves'
+    // heights peaking at `k = 3 / c`, a cavity radius long, with a long tail
+    // of shorter ones following them out. Every length runs out at its own
+    // group speed (`splash_rings`).
+    let into = 0.5 * s.mass.max(0.0) * (normal * normal + 0.1 * flat.length_squared());
+    let a = cavity.max(0.01);
+    let wave_source = ((8.0 * RING_ENERGY_SHARE * into / (WATER_DENSITY * GRAVITY * PI * a * a)).sqrt()).min(RING_STEEPEST * a)
+        * (0.3 + 0.7 * calm)
+        * (1.0 - 0.5 * sealed);
+    let k = 3.0 / (RING_EDGE * a);
+    let ring_wavelength = TAU / k;
+    let bond = SURFACE_TENSION * k * k / (WATER_DENSITY * GRAVITY);
+    let ring_gravity = GRAVITY * (1.0 + bond);
+    let ring_speed = 0.5 * (ring_gravity / k).sqrt();
+    // The stationary-phase train's height at radius r is `RING_PEAK D a / r`
+    // at its middle: its first crest two radii out.
+    let ring_height = 0.5 * RING_PEAK * wave_source;
+    let ring_release = 0.5 * collapse;
+
+    // Foam: over 1 the patch is white right across (`splash_rings`); under,
+    // it is broken. More from a big cavity's collapse, from a sealed one's
+    // (which is all air), from water already churned.
+    // (A small strike folds in little air -- a hand's slap leaves a few
+    // bubbles, gone in a moment -- a big one a patch.)
+    let foam = ((0.35 + 1.2 * smoothstep(0.03, 0.5, cavity) + 0.4 * sealed + 0.4 * (1.0 - calm)) * smoothstep(0.1, 0.6, sheet_speed) * (1.0 - 0.5 * flat_hit)).min(0.65 + 0.3 * (1.0 - calm));
+    let foam_seconds = 1.2 + 3.0 * cavity.sqrt();
+    let settle = (1.5 + 4.0 * cavity.sqrt()).min(6.0);
+
+    // A sheet keeps some of the thing's own way; spray thrown straight up by
+    // a sealed cavity keeps little.
+    let carry = (flat * 0.4).clamp_length_max(sheet_speed) * (1.0 - 0.8 * sealed);
+    // Its fastest drops' flight (the finest hang in the air long after they
+    // can be seen: not counted), its jet's, its crown's, its mist's.
+    let fastest = sheet_speed + spray_speed + plow;
+    let finest = (drop * (sheet_speed / fastest.max(1e-3)).clamp(0.08, 1.0)).max(1.5e-4);
+    // Its fans of spray: thrown with the sheet and some of the fast spray.
+    let fan = 1.25 * sheet_speed + 0.45 * spray_speed + plow;
+    let fan_seconds = if spray > 0 { aloft(fan * sheet_angle.sin(), DROP_DRAG * fan / (0.6 * drop)).min(2.5) + 0.25 * collapse } else { 0.0 };
+    let seconds = (0.5 * collapse + aloft(fastest * sheet_angle.sin(), DROP_DRAG * fastest / finest).min(2.5) * (1.0 - fine))
+        .max(collapse + jet_seconds + 0.1)
+        .max(if petals > 0 { 1.3 * crown_seconds + 0.2 * collapse } else { 0.0 })
+        .max(fan_seconds * (1.0 - sealed))
+        .max(0.6 * collapse + 0.5 + 1.2 * cavity.sqrt() + 0.4 * sealed)
+        .min(SPLASH_SECONDS);
+    // THE DROPS FALLING BACK, off the rim at the sheet's speed and angle:
+    // the crown's own pieces close in, the drops further out, most of them
+    // landing over most of a flight; the fans of spray are hundreds more.
+    let fly_k = DROP_DRAG * sheet_speed / drop;
+    let flight = aloft(up, fly_k);
+    let reach = sheet_speed * sheet_angle.cos() * if fly_k < 1e-4 { flight } else { (1.0 - (-fly_k * flight).exp()) / fly_k };
+    let drops_land = 1.1 * cavity + 0.7 * reach;
+    let drops_band = 0.3 * cavity + 0.5 * reach;
+    let drops_from = 0.25 * collapse + 0.6 * flight;
+    let drops_over = (0.8 * flight).max(0.15);
+    let falling = if throws { (drops as f32 * 3.0 + spray as f32 * 25.0) * (1.0 - fine) } else { 0.0 };
+    let drops_density = falling / (TAU * drops_land * 2.0 * drops_band).max(1e-3);
+    SplashShape {
+        cavity,
+        depth,
+        collapse,
+        sealed,
+        fine,
+        sheet_speed,
+        sheet_angle,
+        crown_height,
+        crown_seconds,
+        petals,
+        drop,
+        drops,
+        spray_speed,
+        jet_height,
+        jet_width,
+        broken,
+        white,
+        spray,
+        froth,
+        plow,
+        struck: speed,
+        mist,
+        ring_wavelength,
+        ring_speed,
+        ring_height,
+        wave_source,
+        ring_gravity,
+        ring_release,
+        drops_land,
+        drops_band,
+        drops_from,
+        drops_over,
+        drops_density,
+        foam,
+        foam_seconds,
+        settle,
+        forward,
+        carry,
+        seconds,
+    }
+}
+
+/// How far off any of a splash can still be a pixel across, metres: past it,
+/// nothing of it is simulated or drawn.
+pub fn splash_range(shape: &SplashShape) -> f32 {
+    (250.0 * (shape.cavity + shape.crown_height + shape.jet_height)).max(15.0)
+}
+
+/// The box (world, min and max) everything a splash throws stays in.
+pub fn splash_bounds(s: &Splash) -> (Vec3, Vec3) {
+    let shape = splash_shape(s);
+    let fastest = shape.sheet_speed + shape.spray_speed + shape.plow;
+    // Its biggest drops fly furthest; its mist and crown stay nearer.
+    let (up, out) = (fastest * shape.sheet_angle.sin(), fastest * shape.sheet_angle.cos() + shape.carry.length());
+    let slowed = DROP_DRAG / (1.6 * shape.drop);
+    let high = 1.3 * shape.crown_height.max(shape.jet_height).max(apex(up, slowed * fastest)).max(shape.sheet_speed / 3.0) + 2.0 * shape.cavity + 0.1;
+    let wide = 2.5 * shape.cavity + (out * shape.seconds).min(if slowed * out > 1e-3 { 1.0 / slowed } else { f32::MAX }).max(shape.sheet_speed / 3.0) + 0.1;
+    (s.position - Vec3::new(wide, 0.05, wide), s.position + Vec3::new(wide, high, wide))
+}
+
+/// Whether any of a splash can be in one of `views` (the eyes' frusta, in the
+/// WORLD's frame, their far plane ignored) at `time`: still in the air, and
+/// its box in sight. Its rings and foam are the water's, drawn there.
+pub fn splash_seen(s: &Splash, time: f64, views: &[[glam::Vec4; 6]]) -> bool {
     let age = (time - s.born) as f32;
-    let strength = splash_strength(s.speed, s.size);
-    if !(age >= 0.0 && age < SPLASH_SECONDS) || strength <= 0.01 {
+    if !(age >= 0.0 && age < SPLASH_SECONDS) {
+        return false;
+    }
+    let (lo, hi) = splash_bounds(s);
+    views.iter().any(|planes| {
+        let mut unbounded = *planes;
+        unbounded[5] = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+        super::shadow::aabb_in_frustum(&unbounded, lo, hi)
+    })
+}
+
+/// A NEW STRIKE joins those still spreading (`live`, oldest first, at most
+/// `kept`), and is told how still the water it met was.
+///
+/// Water that has just been struck is not a surface to splash from. While an
+/// earlier cavity is open there, the new thing falls into a hole: it lifts no
+/// sheet of its own and its own cavity cannot close into a jet. After that
+/// the patch is churned and full of air until it settles
+/// ([`SplashShape::settle`]): a strike there throws spray and foam, not a
+/// clean crown. Both count by how much of the new strike's footprint lies in
+/// the old one's, and by how big the old disturbance is against the new --
+/// a crate's patch swallows a pebble, a pebble's hardly troubles a crate.
+/// So three things dropped in one after another do not raise three crowns
+/// through each other; the first raises one, and the rest fall into what it
+/// left.
+pub fn strike(live: &mut Vec<Splash>, mut new: Splash, kept: usize) {
+    new.calm = 1.0;
+    let own = splash_shape(&new);
+    let mut calm = 1.0f32;
+    for old in live.iter() {
+        let age = (new.born - old.born) as f32;
+        if age < 0.0 {
+            continue;
+        }
+        let was = splash_shape(old);
+        if age > was.settle {
+            continue;
+        }
+        let apart = Vec3::new(new.position.x - old.position.x, 0.0, new.position.z - old.position.z).length();
+        let reach = 1.2 * was.cavity + own.cavity;
+        let within = 1.0 - smoothstep(0.5 * reach, reach, apart);
+        // An open hole, then churned water calming.
+        let churned = if age < was.collapse { 1.0 } else { 0.7 * (1.0 - smoothstep(0.0, was.settle - was.collapse, age - was.collapse)) };
+        let outweighs = (was.cavity / own.cavity).powi(2).min(1.0);
+        calm *= 1.0 - within * churned * outweighs;
+    }
+    new.calm = calm.clamp(0.0, 1.0);
+    if live.len() >= kept.max(1) {
+        live.remove(0);
+    }
+    live.push(new);
+}
+
+/// A splash's thrown water at `time`.
+///
+/// DROPS: thrown from the cavity's rim as the sheet rises, at about its
+/// angle, most at the sheet's speed and a few -- the finest -- much faster,
+/// each slowed by the air as its size has it, gone when it reaches the
+/// surface again. Streaked along their motion, lit by the sun (when the
+/// client found it in sight) and the light round them, screened like the
+/// embers. THE CROWN: the sheet itself, in pieces standing round the rim,
+/// each rising and falling back on its own throw and breaking up as it goes
+/// (`crown_frame`'s three stages). THE JET: a column up the middle once the
+/// cavity has closed, breaking into the beads that fall from its top
+/// (`jet_frame`). MIST: where the sheet was too fine to hold together.
+fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectInstance)>, screened: &mut Vec<EffectInstance>) {
+    use std::f32::consts::{FRAC_PI_2, PI, TAU};
+    let age = (time - s.born) as f32;
+    if !(age >= 0.0 && age < SPLASH_SECONDS) {
+        return;
+    }
+    let shape = splash_shape(s);
+    if age >= shape.seconds || shape.sheet_speed <= 0.02 {
         return;
     }
     let player = |p: Vec3| at.yaw_inv * (p - at.offset);
+    let head_world = at.yaw_inv.inverse() * at.head + at.offset;
+    let away = head_world.distance(s.position);
+    if away > splash_range(&shape) {
+        return;
+    }
     let ambient = (at.ambient)(s.position);
     let sun = at.lights.iter().find(|l| matches!(l.kind, LightKind::Directional) && l.intensity > 0.0).map(|l| {
         let c = l.color.to_linear();
@@ -1756,24 +2571,73 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         }
         c * at.exposure
     };
-    let gravity = Vec3::new(0.0, -9.81, 0.0);
-    let drops = ((40.0 * strength.sqrt()) as usize).clamp(6, 200);
-    for i in 0..drops {
-        let u = uniforms(hash64(s.seed ^ (i as u64).wrapping_mul(0x632be59bd9b4e019)));
-        let azimuth = u[0] * std::f32::consts::TAU;
+    // CLEAR WATER -- a sheet, a column -- is not lit like a white thing: it
+    // shows the sky off its face (Fresnel's share, more at a slant), the
+    // sun's glint where its curved face turns it to the eye, the sun's own
+    // light through it where it stands against the sun, and what is behind
+    // it through it (the blend, by one less its opacity). Drawn as one
+    // colour over `opacity`, so the colour is what it adds over the opacity.
+    // `face` is its face's normal in the world, either side.
+    let glassy = |centre: Vec3, face: Vec3, opacity: f32| -> Vec3 {
+        let to_eye = (at.head - centre).normalize_or_zero();
+        let f = at.yaw_inv * face.normalize_or(Vec3::Y);
+        let n = if f.dot(to_eye) < 0.0 { -f } else { f };
+        let cos_v = n.dot(to_eye).clamp(0.05, 1.0);
+        let fresnel = 0.02 + 0.98 * (1.0 - cos_v).powi(5);
+        let mut c = ambient * (0.15 + fresnel);
+        if let Some((to_sun, rgb)) = sun {
+            // A sheet's face is wavy: GGX at alpha 0.3, either face lit.
+            let h = (to_sun + to_eye).normalize_or_zero();
+            let nh = n.dot(h).abs();
+            let a2 = 0.09f32;
+            let d = a2 / (PI * (nh * nh * (a2 - 1.0) + 1.0).powi(2));
+            let glint = d * (0.02 + 0.98 * (1.0 - h.dot(to_eye).clamp(0.0, 1.0)).powi(5)) / (4.0 * cos_v);
+            c += rgb * (glint * n.dot(to_sun).abs() + 0.08 * henyey_greenstein(0.8, -to_sun, to_eye));
+        }
+        c * (at.exposure / opacity.max(0.05))
+    };
+    let gravity = Vec3::new(0.0, -GRAVITY, 0.0);
+    let calm = s.calm.clamp(0.0, 1.0);
+    let lean = shape.forward.length();
+    let toward = shape.forward.normalize_or_zero();
+    // Where it struck, a little the way it was going.
+    let middle = s.position + shape.forward * (0.4 * shape.cavity);
+    // How a sprite standing along the WORLD direction `axis` at the world
+    // point `p` is seen: the spin that lays its own up along it on screen (as
+    // the shader stands an upright one, its up the world's as far as the view
+    // allows), and how much of its length shows.
+    let seen_along = |p: Vec3, axis: Vec3| -> (f32, f32) {
+        let to_eye = (head_world - p).normalize_or(Vec3::Z);
+        let up_seen = Vec3::Y - to_eye * to_eye.y;
+        if up_seen.length_squared() < 1e-4 {
+            return (0.0, 1.0);
+        }
+        let u = up_seen.normalize();
+        let r = u.cross(to_eye);
+        let (ar, au) = (axis.dot(r), axis.dot(u));
+        (-ar.atan2(au), (ar * ar + au * au).sqrt())
+    };
+
+    // DROPS. Fewer far off, where one is a fraction of a pixel.
+    let shown = ((shape.drops as f32 * (8.0 / away.max(0.1)).min(1.0)).ceil() as usize).min(shape.drops);
+    for i in 0..shown {
+        let u = uniforms(hash64(s.seed ^ (i as u64 + 1).wrapping_mul(0x632be59bd9b4e019)));
+        let azimuth = u[0] * TAU;
         let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
-        let elevation = lerp(40.0f32, 85.0, u[1]).to_radians();
-        // The sheet a strike throws up leaves faster than what struck: a few
-        // drops up to half as fast again, most slower.
-        let launch = (s.speed * lerp(0.4, 1.6, u[2] * u[2])).clamp(0.3, 8.0);
-        let v0 = (out * elevation.cos() + Vec3::Y * elevation.sin()) * launch;
-        let p0 = s.position + out * (s.size * lerp(0.5, 1.1, u[3]));
-        let born_late = 0.06 * u[4];
-        let a = age - born_late;
+        let down_range = out.dot(toward) * lean;
+        // Most leave with the sheet; a few, thrown as the thing first met the
+        // water, far faster -- and those are the finest.
+        let ahead = down_range.max(0.0);
+        let launch = shape.sheet_speed * lerp(0.6, 1.0, u[6]) + shape.spray_speed * u[2] * u[2] * (1.0 + 0.8 * down_range).max(0.2) + shape.plow * ahead * ahead * u[6];
+        let width = (shape.drop * lerp(0.6, 1.6, u[5]) * (shape.sheet_speed / launch.max(1e-3)).clamp(0.08, 1.0)).max(1.5e-4);
+        let elevation = shape.sheet_angle * (1.0 - 0.45 * ahead) + (u[1] - 0.5) * 0.42;
+        let v0 = out * (elevation.cos() * launch) + Vec3::Y * (elevation.sin() * launch) + shape.carry * (u[7] * (0.5 + 0.5 * down_range));
+        let p0 = middle + out * (shape.cavity * lerp(0.8, 1.1, u[3]));
+        let a = age - 0.5 * shape.collapse * u[4];
         if a <= 0.0 {
             continue;
         }
-        let (pos, vel) = ballistic(p0, v0, gravity, 0.4, a);
+        let (pos, vel) = ballistic(p0, v0, gravity, DROP_DRAG * launch / width, a);
         if pos.y < s.position.y && vel.y < 0.0 {
             continue;
         }
@@ -1781,10 +2645,9 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         let axis = at.yaw_inv * vel.normalize_or(Vec3::Y);
         let moving = at.yaw_inv * vel;
         let c = lit(centre, DROP_ALBEDO, DROP_PHASE_G);
-        let radius = lerp(0.0015, 0.004, u[5]);
         screened.push(EffectInstance {
-            centre: [centre.x, centre.y, centre.z, radius],
-            colour: [c.x, c.y, c.z, 1.0 - smoothstep(0.75, 1.0, a / SPLASH_SECONDS)],
+            centre: [centre.x, centre.y, centre.z, 0.5 * width],
+            colour: [c.x, c.y, c.z, 1.0 - smoothstep(0.85, 1.0, age / shape.seconds)],
             light: [0.0; 4],
             light_dir: [0.0, 1.0, 0.0, vel.length() * DROP_STREAK],
             axis: [axis.x, axis.y, axis.z, 0.01],
@@ -1792,93 +2655,491 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
             motion: [moving.x, moving.y, moving.z, 0.0],
         });
     }
-    // THE CROWN: the body of the splash, the jets it throws up -- thousands
-    // of drops too small to draw one by one, close enough together to be
-    // thick: white as a cloud is, where each drop alone is clear. It rises as
-    // fast as the strike throws it, sags as it falls back, and thins.
-    let rise = ((1.2 * s.speed).powi(2) / (2.0 * 9.81)).clamp(0.04, 2.0);
-    let crown_life = (2.0 * (2.0 * rise / 9.81).sqrt()).clamp(0.3, 1.4);
-    let t = age / crown_life;
-    if t < 1.0 {
-        let u = uniforms(hash64(s.seed ^ 0xc80));
-        let half_at = |t: f32| 0.5 * (rise * smoothstep(0.0, 0.3, t) * (1.0 - 0.45 * smoothstep(0.45, 1.0, t))).max(s.size);
-        let half = half_at(t);
-        let centre = player(s.position + Vec3::Y * (half * 0.92));
-        // It stands on the water, its middle rising and sinking with it.
-        let lift = 0.92 * (half - half_at(t - MOTION_H / crown_life)) / MOTION_H;
-        let c = lit(centre, 0.95, 0.0);
-        let opacity = 0.85 * smoothstep(0.0, 0.04, t) * (1.0 - smoothstep(0.5, 1.0, t)) * strength.sqrt().clamp(0.35, 1.0);
-        over.push((
-            (centre - at.head).length_squared(),
-            EffectInstance {
-                centre: [centre.x, centre.y, centre.z, half],
-                colour: [c.x, c.y, c.z, opacity],
-                light: [0.0, 0.0, 0.0, 1.0],
-                light_dir: [0.0, 1.0, 0.0, 0.0],
-                axis: [0.0, 1.0, 0.0, 0.03],
-                params: [(2.0 * u[0] - 1.0) * 0.15, CROWN_LAYER as f32, if u[1] < 0.5 { -1.0 } else { 1.0 }, 0.0],
-                motion: [0.0, lift, 0.0, 0.0],
-            },
-        ));
+
+    // THE CROWN, in pieces round the rim: the sheet the opening cavity lifts,
+    // each piece thrown up and out on its own, wider than it is tall, leaning
+    // out as the sheet leaves, standing where it is in the world and
+    // overlapping its neighbours -- so the crown is a wall the whole way
+    // round, seen from any side and in each eye, not a card. No two pieces
+    // alike, nor two splashes: which of the textures, how high, how soon. It
+    // breaks up as it falls back (the texture's three stages) and thins: no
+    // sheet from water already churned. Ahead of a thing that struck at a
+    // slant it leaves faster and lower -- ploughed.
+    // And little of one too thick to hold together: that goes up white.
+    // A whole sheet is clear: a little over half covers what is behind it
+    // (its streaked film and beaded rim in the texture's alpha carry the
+    // rest); a breaking one goes up white.
+    let whole = (1.0 - shape.fine) * calm * (1.0 - 0.85 * shape.broken);
+    let crown_opacity = lerp(0.55, 0.92, shape.broken) * whole;
+    // (A sheet nearly all white water is drawn as that, below: a faint clear
+    // one behind it would be paid for and not seen.)
+    if shape.petals > 0 && crown_opacity > 0.2 {
+        let turn = uniforms(hash64(s.seed ^ 0xc80))[0] * TAU;
+        for k in 0..shape.petals {
+            let u = uniforms(hash64(s.seed ^ 0xc80 ^ (k as u64 + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
+            let azimuth = turn + TAU * (k as f32 + 0.5 * (u[0] - 0.5)) / shape.petals as f32;
+            let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
+            let down_range = out.dot(toward) * lean;
+            let ahead = down_range.max(0.0);
+            let angle = shape.sheet_angle * (1.0 - 0.45 * ahead);
+            let up = (shape.sheet_speed + shape.plow * ahead * ahead) * angle.sin() * lerp(0.8, 1.25, u[1]) * (1.0 + 0.6 * down_range.min(0.0)).max(0.3);
+            let air = DROP_DRAG * up / shape.drop;
+            let life = aloft(up, air).max(0.04);
+            let start = 0.2 * shape.collapse * u[2];
+            let t = (age - start) / life;
+            if !(t > 0.0 && t < 1.0) {
+                continue;
+            }
+            // The piece's axis: up and out at the sheet's angle.
+            let axis = (Vec3::Y * angle.sin() + out * angle.cos()).normalize();
+            let tangent = Vec3::new(-out.z, 0.0, out.x);
+            let place = |since: f32| -> (Vec3, f32, f32, f32) {
+                let since = since.clamp(0.0, life);
+                let high = thrown_height(up, air, since).max(0.0);
+                let long = high / angle.sin();
+                let rim = shape.cavity * (0.8 + 0.45 * smoothstep(0.0, 0.5 * shape.collapse, since)) + (0.3 * shape.carry.length() + 0.5 * shape.plow * angle.cos()) * since * ahead;
+                let centre = middle + out * rim + axis * (0.5 * long);
+                let (spin, shows) = seen_along(centre, axis);
+                let (_, across) = seen_along(centre, tangent);
+                let half = (0.5 * long * shows.max(0.2)).max(1e-4);
+                // Its whole place on the rim each side: it laps half of each
+                // neighbour, and their faded sides make one wall.
+                let wide = (2.0 * PI * rim / shape.petals as f32 * across.max(0.45)).min(6.0 * half).max(half);
+                (centre, half, wide / half, spin)
+            };
+            let since = age - start;
+            let (centre_w, half, aspect, spin) = place(since);
+            let moving = (place(since + 0.5 * SPLASH_H).0 - place(since - 0.5 * SPLASH_H).0) / SPLASH_H;
+            let centre = player(centre_w);
+            let moving = at.yaw_inv * moving;
+            // A wall of water shows the sky through and off it, the sun's
+            // glint on its face and the sun through it: clear while whole,
+            // white as it breaks (`glassy`).
+            let face = out * angle.sin() - Vec3::Y * angle.cos();
+            let c = glassy(centre, face, crown_opacity).lerp(lit(centre, 0.95, 0.15), shape.broken);
+            // A sheet too thick to draw back into its rim is in pieces sooner.
+            let stage = 1.999 * smoothstep(0.3 - 0.3 * shape.broken, 0.95 - 0.35 * shape.broken, t);
+            let variant = (u[3] * CROWN_VARIANTS as f32) as u32 % CROWN_VARIANTS;
+            let opacity = crown_opacity * smoothstep(0.0, 0.06, t) * (1.0 - smoothstep(0.8, 1.0, t));
+            over.push((
+                (centre - at.head).length_squared(),
+                EffectInstance {
+                    centre: [centre.x, centre.y, centre.z, half],
+                    colour: [c.x, c.y, c.z, opacity],
+                    light: [0.0, 0.0, 0.0, 1.0],
+                    light_dir: [0.0, 1.0, 0.0, 0.0],
+                    axis: [0.0, 1.0, 0.0, (0.25 * half).clamp(0.005, 0.03)],
+                    // Its texture lies on its side (`crown_frame`): a quarter
+                    // turn stands it up, and its length is then its width.
+                    params: [FRAC_PI_2 + spin, (CROWN_LAYER + variant * CROWN_FRAMES) as f32 + stage, aspect, 0.0],
+                    motion: [moving.x, moving.y, moving.z, 0.0],
+                },
+            ));
+        }
     }
-    // SPRAY: mist where it struck, rising a little and spreading.
-    let puffs = ((2.0 + 2.0 * strength.sqrt()) as usize).min(10);
-    for i in 0..puffs {
-        let u = uniforms(hash64(s.seed ^ 0x5bd1e995 ^ (i as u64).wrapping_mul(0x8cb92ba72f3d8dd7)));
-        let life = lerp(0.45, 0.9, u[0]) * strength.sqrt().clamp(0.7, 1.6);
-        if age >= life {
+
+    // SPRAY, and WHITE WATER: what the eye takes a splash for from across a
+    // pond. Hundreds of drops leave with the sheet and ahead of it, far too
+    // many and too small to draw one by one (the streaks above are the few
+    // that glint): they are drawn as FANS of them standing round the rim
+    // (`spray_frame`), each growing as its drops fly up and apart, thinning
+    // as they come down. A sheet too thick to hold together, and anything
+    // thrown from water already churned and full of air, goes up WHITE
+    // (`froth_frame`): tongues of it shoulder to shoulder round the rim,
+    // straight up, lower, denser, slower to fall -- facing the eye, each of
+    // them, so the ring of them is a body of white water from any side and
+    // never a fence of boards. A sealed strike's spray is not round a rim
+    // but up its middle, tall and narrow: a bullet's white needle.
+    struct Fan {
+        count: usize,
+        layer: u32,
+        variants: u32,
+        salt: u64,
+        /// How much of the fast spray's speed its front has, and how coarse
+        /// its drops are against the sheet's (the air stops fine ones).
+        fast: (f32, f32),
+        coarse: f32,
+        /// How much taller than wide.
+        tall: (f32, f32),
+        /// 1: standing straight up, not leaning out with the sheet.
+        stand: f32,
+        opacity: f32,
+        phase_g: f32,
+    }
+    let plume = shape.sealed;
+    let fans = [
+        Fan { count: shape.froth, layer: FROTH_LAYER, variants: FROTH_VARIANTS, salt: 0xf207, fast: (0.0, 0.05), coarse: 1.5, tall: (1.0, 1.15), stand: 1.0, opacity: 0.95 * shape.white, phase_g: 0.0 },
+        // (A fan's picture is of some hundreds of drops: a pebble's handful
+        // is a fainter one.)
+        // Spray is clear drops, each a lens: bright toward the sun, faint with
+        // it behind the eye (a strong forward lobe), not a white cloud.
+        Fan { count: shape.spray, layer: SPRAY_LAYER, variants: SPRAY_VARIANTS, salt: 0x5b7a, fast: (0.15, 0.45), coarse: 0.6, tall: (1.0, 1.5), stand: 0.0, opacity: 0.8 * (shape.drops as f32 / 60.0).clamp(0.45, 1.0).max(plume), phase_g: 0.55 },
+    ];
+    for fan in &fans {
+        if fan.opacity < 0.02 {
             continue;
         }
-        let t = age / life;
-        let azimuth = u[1] * std::f32::consts::TAU;
+        let turn = uniforms(hash64(s.seed ^ fan.salt))[0] * TAU;
+        for j in 0..fan.count {
+            let u = uniforms(hash64(s.seed ^ fan.salt ^ (j as u64 + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
+            let azimuth = turn + TAU * (j as f32 + 0.7 * (u[0] - 0.5)) / fan.count as f32;
+            let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
+            let down_range = out.dot(toward) * lean;
+            let ahead = down_range.max(0.0);
+            let open_launch = ((shape.sheet_speed * lerp(0.9, 1.25, u[1]) + shape.spray_speed * lerp(fan.fast.0, fan.fast.1, u[2]) + shape.plow * ahead * ahead) * (1.0 + 0.5 * down_range.min(0.0)).max(0.4)).min(0.9 * shape.struck);
+            // A plume's is as high as its jet, give or take.
+            let launch = lerp(open_launch, (2.0 * GRAVITY * shape.jet_height.max(0.3 * shape.depth)).sqrt() * lerp(0.6, 1.1, u[1]), plume);
+            let angle = lerp(shape.sheet_angle * (1.0 - 0.45 * ahead), 1.5, plume);
+            let up = launch * angle.sin();
+            // A cloud of spray carries its air with it; a sealed strike's
+            // goes up its own column.
+            let air = DROP_DRAG * launch / (fan.coarse * shape.drop) * (1.0 - plume) / 2.2;
+            let life = aloft(up, air).max(0.1);
+            let rises = if air < 1e-3 { up / GRAVITY } else { (up * air / GRAVITY).ln_1p() / air };
+            let start = 0.25 * shape.collapse * u[3] * (1.0 - plume) + 0.3 * shape.collapse * plume * u[3];
+            let since = age - start;
+            let t = since / life;
+            if !(t > 0.0 && t < 1.0) {
+                continue;
+            }
+            let leans = lerp(angle, FRAC_PI_2, fan.stand);
+            let axis = (Vec3::Y * leans.sin() + out * leans.cos()).normalize();
+            // (A big splash's fans are narrower for their height: its spray
+            // goes up more than out.)
+            let tall_by = lerp(fan.tall.0, fan.tall.1, u[4]) * (1.0 + 1.2 * plume) * (1.0 + 0.35 * (1.0 - fan.stand) * smoothstep(0.2, 0.7, shape.cavity));
+            let place = |since: f32| -> (Vec3, f32, f32) {
+                let since = since.clamp(0.0, life);
+                // Its front climbs to the top of its throw; then its drops
+                // rain back through it and it sinks as it thins.
+                let top = thrown_height(up, air, since.min(rises)).max(0.0);
+                let high = top * (1.0 - 0.4 * smoothstep(0.55, 1.0, since / life));
+                let long = high / leans.sin();
+                let rim = shape.cavity * (0.85 + 0.35 * smoothstep(0.0, 0.5 * shape.collapse, since)) * (1.0 - plume) * lerp(0.6 + 0.4 * u[5], 1.0, fan.stand);
+                let foot = middle + out * rim + (shape.carry * 0.3 + toward * (0.5 * shape.plow * angle.cos())) * (since * ahead * (1.0 - plume));
+                let centre = foot + axis * (0.5 * long);
+                let (spin, shows) = seen_along(centre, axis);
+                ((centre), (0.5 * long * shows.max(0.25)).max(1e-4), spin)
+            };
+            let (centre_w, tall, spin) = place(since);
+            let moving = at.yaw_inv * ((place(since + 0.5 * SPLASH_H).0 - place(since - 0.5 * SPLASH_H).0) / SPLASH_H);
+            let centre = player(centre_w);
+            let half = tall / tall_by;
+            let c = lit(centre, 0.97, fan.phase_g);
+            // White water falls back as a body; spray is apart at once.
+            let stage = 1.999 * smoothstep(lerp(0.12, 0.4, fan.stand), lerp(0.8, 0.97, fan.stand), t);
+            let variant = (u[6] * fan.variants as f32) as u32 % fan.variants;
+            let opacity = fan.opacity * lerp(0.8, 1.0, u[7]) * smoothstep(0.0, 0.05, t) * (1.0 - smoothstep(0.7, 1.0, t));
+            over.push((
+                (centre - at.head).length_squared(),
+                EffectInstance {
+                    centre: [centre.x, centre.y, centre.z, half],
+                    colour: [c.x, c.y, c.z, opacity],
+                    light: [0.0, 0.0, 0.0, 1.0],
+                    light_dir: [0.0, 1.0, 0.0, 0.0],
+                    axis: [0.0, 1.0, 0.0, (0.25 * half).clamp(0.005, 0.05)],
+                    params: [spin, (fan.layer + variant * 3) as f32 + stage, if u[8] < 0.5 { -tall_by } else { tall_by }, 0.0],
+                    motion: [moving.x, moving.y, moving.z, 0.0],
+                },
+            ));
+        }
+    }
+
+    // THE JET: once the cavity has closed, a column thrown up its middle,
+    // rising and falling back as one throw, necking and breaking into beads
+    // as it goes (the texture's three stages); its top beads fly on as drops.
+    let since_close = age - shape.collapse;
+    if shape.jet_height > 0.01 && since_close > 0.0 {
+        let throw = (2.0 * GRAVITY * shape.jet_height).sqrt();
+        let life = 2.0 * throw / GRAVITY;
+        let u = uniforms(hash64(s.seed ^ 0x6e7));
+        let axis = (Vec3::Y + shape.forward * 0.35 + Vec3::new(u[0] - 0.5, 0.0, u[1] - 0.5) * 0.12).normalize();
+        if since_close < life {
+            let place = |since: f32| -> (Vec3, f32, f32, f32) {
+                let since = since.clamp(0.0, life);
+                let high = (throw * since - 0.5 * GRAVITY * since * since).max(0.0);
+                let centre = middle + axis * (0.5 * high);
+                let (spin, shows) = seen_along(centre, axis);
+                let tall = (0.5 * high * shows.max(0.2)).max(1e-4);
+                // The column fills a quarter of its texture's width, and
+                // thins as it stretches.
+                let half = (2.0 * shape.jet_width * (1.0 - 0.4 * since / life)).min(tall).max(1e-4);
+                (centre, half, tall / half, spin)
+            };
+            let t = since_close / life;
+            let (centre_w, half, aspect, spin) = place(since_close);
+            let moving = at.yaw_inv * ((place(since_close + 0.5 * SPLASH_H).0 - place(since_close - 0.5 * SPLASH_H).0) / SPLASH_H);
+            let centre = player(centre_w);
+            let stage = 1.999 * smoothstep(0.3, 0.85, t);
+            let variant = (u[2] * JET_VARIANTS as f32) as u32 % JET_VARIANTS;
+            // A clear column, white only as it breaks into beads; a fine one
+            // (a bullet's) is spray, not a glassy column.
+            let opacity = lerp(0.6, 0.9, shape.fine.max(0.5 * t)) * smoothstep(0.0, 0.05, t) * (1.0 - smoothstep(0.85, 1.0, t));
+            // Round, it turns a face to the eye wherever it is seen from.
+            let face = (head_world - centre_w) * Vec3::new(1.0, 0.0, 1.0);
+            let c = glassy(centre, face, opacity).lerp(lit(centre, 0.95, 0.0), shape.fine.max(0.5 * t));
+            over.push((
+                (centre - at.head).length_squared(),
+                EffectInstance {
+                    centre: [centre.x, centre.y, centre.z, half],
+                    colour: [c.x, c.y, c.z, opacity],
+                    light: [0.0, 0.0, 0.0, 1.0],
+                    light_dir: [0.0, 1.0, 0.0, 0.0],
+                    axis: [0.0, 1.0, 0.0, (0.25 * half).clamp(0.005, 0.03)],
+                    params: [spin, (JET_LAYER + variant * JET_FRAMES) as f32 + stage, if u[3] < 0.5 { -aspect } else { aspect }, 0.0],
+                    motion: [moving.x, moving.y, moving.z, 0.0],
+                },
+            ));
+        }
+        // Its beads: let go from the column's top a third of the way up, the
+        // topmost the fastest.
+        let release = 0.35 * throw / GRAVITY;
+        for i in 0..3u64 {
+            let u = uniforms(hash64(s.seed ^ 0x6e7 ^ (i + 1).wrapping_mul(0x9e3779b97f4a7c15)));
+            let width = (shape.jet_width * lerp(0.5, 1.0, u[1])).clamp(0.002, 0.012) * (1.0 - 0.7 * shape.fine);
+            let v0 = axis * (throw * lerp(0.8, 1.12, u[0])) + Vec3::new(u[2] - 0.5, 0.0, u[3] - 0.5) * (0.12 * throw) + shape.carry * 0.2;
+            let (pos, vel) = ballistic(middle, v0, gravity, DROP_DRAG * throw / width, since_close);
+            if since_close < release || (pos.y < s.position.y && vel.y < 0.0) {
+                continue;
+            }
+            let centre = player(pos);
+            let dir = at.yaw_inv * vel.normalize_or(Vec3::Y);
+            let moving = at.yaw_inv * vel;
+            let c = lit(centre, DROP_ALBEDO, DROP_PHASE_G);
+            screened.push(EffectInstance {
+                centre: [centre.x, centre.y, centre.z, 0.5 * width],
+                colour: [c.x, c.y, c.z, 1.0],
+                light: [0.0; 4],
+                light_dir: [0.0, 1.0, 0.0, vel.length() * DROP_STREAK],
+                axis: [dir.x, dir.y, dir.z, 0.01],
+                params: [0.0, EMBER_LAYER as f32, 0.0, 0.0],
+                motion: [moving.x, moving.y, moving.z, 0.0],
+            });
+        }
+    }
+
+    // MIST: what a SEALED strike throws too fine to see as drops -- most of
+    // a bullet's splash. Its water goes straight up, a narrow PLUME that the
+    // air stops within a metre -- its finest spray lowest, its coarsest
+    // highest -- standing a moment where it struck and falling back as it
+    // fades. (An open strike's fine water is in its fans of spray.)
+    let mist_turn = uniforms(hash64(s.seed ^ 0x5bd1e995))[0] * TAU;
+    for i in 0..shape.mist {
+        let u = uniforms(hash64(s.seed ^ 0x5bd1e995 ^ (i as u64 + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
+        let begins = 0.6 * shape.collapse * u[6];
+        let life = (lerp(0.5, 1.0, u[0]) * (0.5 + 1.2 * shape.cavity.sqrt() + 0.4 * shape.sealed)).min(shape.seconds - begins);
+        let since = age - begins;
+        if !(since > 0.0 && since < life) {
+            continue;
+        }
+        let t = since / life;
+        // Round the rim in turn, each a little off its place: a few puffs
+        // thrown wherever chance has them are, one splash in a hundred, all
+        // on one side of it.
+        let azimuth = mist_turn + TAU * (i as f32 + 0.8 * (u[1] - 0.5)) / shape.mist as f32;
         let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
-        let v0 = out * lerp(0.2, 0.7, u[2]) * s.speed.sqrt() + Vec3::Y * lerp(0.3, 1.0, u[3]) * s.speed.sqrt();
-        let (pos, vel) = ballistic(s.position + out * s.size * 0.6, v0, Vec3::new(0.0, -2.0, 0.0), 3.0, age);
+        // Strung out by how coarse each part of it is: the coarser carries
+        // further before the air has it.
+        // (By the golden ratio, so that neighbours round the rim are not
+        // neighbours in this.)
+        let share = ((i as f32 + 1.0) * 0.618_034 + u[2] / shape.mist as f32).fract();
+        let launch = shape.sheet_speed * lerp(0.35, 1.0, share);
+        let width = shape.drop * lerp(0.35, 1.2, share);
+        let v0 = out * (launch * shape.sheet_angle.cos() * (1.0 - 0.9 * plume)) + Vec3::Y * (launch * lerp(shape.sheet_angle.sin() * 0.6, 1.0, plume)) + shape.carry * 0.3;
+        // A cloud of fine drops drags the air along with it: it goes about
+        // twice as far as one of its drops would alone.
+        let drag = (DROP_DRAG * launch / (2.2 * width)).max(3.0);
+        let (pos, vel) = ballistic(middle + out * (shape.cavity * 0.6 * (1.0 - plume)), v0, gravity, drag, since);
+        // As big as the spray it is: the crown's height and some of the
+        // cavity's width -- a plume's, half its narrow cavity's, and taller
+        // than wide.
+        let size = lerp(0.3 * shape.cavity + shape.crown_height, 0.45 * shape.cavity, plume) * lerp(0.7, 1.3, u[4]) * (0.5 + 1.7 * t);
         let floor = s.position.y + 0.02;
         let centre = player(pos.max(Vec3::new(f32::MIN, floor, f32::MIN)));
         let moving = at.yaw_inv * if pos.y < floor { vel * Vec3::new(1.0, 0.0, 1.0) } else { vel };
-        let size = s.size * lerp(0.7, 1.2, u[4]) * (0.6 + 1.6 * t) * strength.sqrt().clamp(0.6, 1.8);
         // Thick, its light is scattered many times over: as bright from any
         // side, so even (g = 0), not a single drop's forward lobe.
         let c = lit(centre, 0.95, 0.0);
-        let opacity = 0.3 * smoothstep(0.0, 0.06, t) * (1.0 - t).powf(1.4) * strength.sqrt().min(1.3).max(0.4);
-        let frame = SMOKE_FRAMES as f32 * (0.2 + 0.6 * t);
+        let opacity = (0.05 + 0.7 * shape.fine) * plume * smoothstep(0.0, 0.08, t) * (1.0 - t).powf(1.4);
+        let frame = SMOKE_FRAMES as f32 * (0.35 + 0.55 * t);
         over.push((
             (centre - at.head).length_squared(),
             EffectInstance {
                 centre: [centre.x, centre.y, centre.z, size],
                 colour: [c.x, c.y, c.z, opacity],
-                light: [0.0; 4],
+                light: [0.0, 0.0, 0.0, if plume > 0.5 { 1.0 } else { 0.0 }],
                 light_dir: [0.0, 1.0, 0.0, 0.0],
                 axis: [0.0, 1.0, 0.0, 0.05],
-                params: [(2.0 * u[5] - 1.0) * std::f32::consts::PI, frame.min((SMOKE_FRAMES - 1) as f32), 0.0, 0.0],
+                params: [if plume > 0.5 { 0.0 } else { (2.0 * u[5] - 1.0) * PI }, frame.min((SMOKE_FRAMES - 1) as f32), 1.0 + 1.3 * plume, 0.0],
                 motion: [moving.x, moving.y, moving.z, 0.0],
             },
         ));
     }
 }
 
-/// The newest splashes' rings on the water, as [`WaterUniform::rings`]
-/// takes them: world x, z, seconds since, and strength; strength 0 for none.
-/// Nearest the head first when there are more than fit.
+/// THE WATER'S SHARE OF THE SPLASHES, as [`WaterUniform`] takes it: for each
+/// of the `N` it draws, its ring train, the foam and the dimple or boil where
+/// it struck, and the drops falling back round it. `rings[i].w` 0: none, and
+/// none after it.
 ///
-/// [`WaterUniform::rings`]: super::water_pipeline::WaterUniform
-pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: Vec3) -> [[f32; 4]; N] {
-    let mut live: Vec<(f32, [f32; 4])> = splashes
+/// [`WaterUniform`]: super::water_pipeline::WaterUniform
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SplashRings<const N: usize> {
+    /// World x, z of where it struck; seconds since its ring train left
+    /// (`SplashShape::ring_release`; 0 before); the train's size, its
+    /// height `size k^3 exp(-k c) / r` (`SplashShape::wave_source`).
+    pub rings: [[f32; 4]; N],
+    /// A quarter of gravity as its waves feel it (`ring_gravity / 4`); the
+    /// spectrum's edge `c` (`RING_EDGE` of the cavity's radius);
+    /// the cavity's radius, the rim the train is measured from (inside it
+    /// are the dimple and the boil); and the dimple's slope a metre from its
+    /// middle -- negative: the boil's dome.
+    pub waves: [[f32; 4]; N],
+    /// The foam's whiteness; one over the square of the patch's radius; how
+    /// far it is drawn out into arcs; and over how long its drops land,
+    /// seconds.
+    pub pools: [[f32; 4]; N],
+    /// THE DROPS FALLING BACK: the radius they land round, one over the
+    /// square of the band's half-width, seconds since the first landed, and
+    /// how many cells a metre they are scattered over (`DROP_CELLS`), whole,
+    /// plus the share of them a drop lands in (0: none).
+    pub drops: [[f32; 4]; N],
+}
+
+/// The splashes' rings, foam, dimples and the drops falling back, on the
+/// water at `time` ([`SplashRings`]).
+///
+/// THE RING TRAIN leaves as the cavity is at its widest and its crown falls
+/// back. Every wavelength in the disturbance runs out at its own group
+/// speed, so at radius r and t seconds on the waves there are those whose
+/// group speed is r / t: for gravity waves `k = g t^2 / 4 r^2`, crests at
+/// phase `g t^2 / 4 r` (Cauchy and Poisson's ring waves; Lamb 1932 sec. 255).
+/// Long waves lead, short ones follow, crests are born at the back of the
+/// train and die at its front, and the train spreads and thins as it goes:
+/// its height at its middle falls as `0.58 D a / r`. The shader evaluates it
+/// per pixel (`water_pipeline::RING_BLOCK`); here are only its constants and
+/// its clock. Foam gathers as the cavity falls in; the cavity's middle then
+/// BOILS up as a low dome; and the crown's drops, landing round it, each
+/// make a ring of their own.
+///
+/// THE `N` THAT MATTER MOST to the eye are drawn -- by how steep and how near
+/// -- each scaled by how far it stands clear of the first one left out, so
+/// two that change places do it at nothing, and what a new splash crowds out
+/// is the faintest there is, sinking as the new one opens.
+pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: Vec3) -> SplashRings<N> {
+    use std::f32::consts::PI;
+    let mut live: Vec<(f32, [[f32; 4]; 4])> = splashes
         .iter()
         .filter_map(|s| {
             let age = (time - s.born) as f32;
-            (age >= 0.0 && age < super::water_pipeline::RING_SECONDS).then(|| {
-                ((s.position - head_world).length_squared(), [s.position.x, s.position.z, age, splash_strength(s.speed, s.size)])
-            })
+            if age < 0.0 {
+                return None;
+            }
+            let shape = splash_shape(s);
+            let lasts = ring_seconds(&shape);
+            if age >= lasts.max(shape.foam_seconds + shape.collapse) || shape.wave_source <= 0.0 && shape.foam <= 0.0 {
+                return None;
+            }
+            let a = shape.cavity.max(0.01);
+            let run = (age - shape.ring_release).max(0.0);
+            let fade = 1.0 - smoothstep(0.6 * lasts, lasts, age);
+            // Its size: `RING_PEAK D a / r` at the peak `k = 3 / c`, where
+            // the shader's `size k^3 exp(-k c) / r` is `size 27 e^-3 / c^3 / r`.
+            let c = RING_EDGE * a;
+            let size = RING_PEAK * shape.wave_source * a * c.powi(3) * (3.0f32).exp() / 27.0 * fade;
+            // How steep the train is now where it is steepest -- the shader's
+            // slope `size k^4 exp(-k c) / r` along it, at the radius each
+            // length has reached (`a + t sqrt(g / 4 k)`) -- for its weight.
+            let g4 = 0.25 * shape.ring_gravity;
+            let steep = [1.5f32, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0]
+                .iter()
+                .map(|m| {
+                    let k = m / c;
+                    let from_rim = run * (g4 / k).sqrt();
+                    size * k.powi(4) * (-k * (c + 2.0 * RING_FILM_VISCOSITY * k * run)).exp() * smoothstep(0.0, a, from_rim) / (a + from_rim)
+                })
+                .fold(0.0, f32::max);
+            // The cavity, open: a bowl a cavity's radius wide, as deep as it
+            // is (no deeper than wide: past that it is a hole, not a slope).
+            // Shut, the water it folded in BOILS up its middle -- a low dome,
+            // a quarter of its radius at most, rising and settling in about
+            // its own time.
+            let bowl = if age < shape.collapse {
+                0.5 * shape.depth.min(shape.cavity) * (PI * age / shape.collapse).sin().max(0.0)
+            } else {
+                let x = (age - shape.collapse) / (0.3 * shape.collapse + 0.15);
+                -0.25 * shape.depth.min(shape.cavity) * x * (1.0 - x).exp()
+            };
+            // THE FOAM: the air the collapse folds in, white as the cavity
+            // shuts, spreading, thinning to a broken patch and gone in a
+            // second or a few -- fresh water holds no foam -- drawn out into
+            // arcs along the waves that leave through it as it goes.
+            let foamed = (age - 0.3 * shape.collapse) / shape.foam_seconds;
+            let reach = shape.cavity * (1.0 + 0.9 * smoothstep(0.0, 1.0, foamed));
+            let foam = shape.foam * smoothstep(0.3 * shape.collapse, 0.9 * shape.collapse, age) * (1.0 - smoothstep(0.0, 1.0, foamed)).powf(1.5);
+            let streaked = 0.2 * smoothstep(0.1, 0.6, foamed);
+            // THE DROPS falling back, in their band and their while.
+            let landed = age - shape.drops_from;
+            let raining = landed < shape.drops_over + DROP_RING_SECONDS;
+            let cells = (3.0 / shape.drops_band.max(1e-3)).clamp(DROP_CELLS.0, DROP_CELLS.1).round();
+            let share = if raining { (shape.drops_density / (cells * cells)).min(1.0) } else { 0.0 };
+            let apart = (s.position - head_world).length();
+            // Nothing at the moment it lands -- no ring yet, no foam -- so it
+            // comes to matter as it opens, and what it crowds out sinks as it
+            // grows.
+            let rain = share * smoothstep(0.0, 0.05, landed) * (1.0 - smoothstep(shape.drops_over, shape.drops_over + DROP_RING_SECONDS, landed));
+            // (Coming to matter slowly over its first half second -- as the
+            // cube of its age -- so that one it crowds out of the drawn, when
+            // all `N` are taken, sinks over a tenth of a second or so rather
+            // than vanishing: it is crowded out when the newcomer outweighs
+            // it, and the newcomer's weight must grow by little in a frame.)
+            let weight = ring_weight(steep + 2.0 * bowl.abs() / reach + 0.05 * rain, foam, apart) * (age / 0.5).min(1.0).powi(3);
+            (weight > 0.0).then_some((
+                weight,
+                [
+                    [s.position.x, s.position.z, run, size.max(1e-12)],
+                    [0.25 * shape.ring_gravity, c, a, 2.0 * bowl / (reach * reach)],
+                    [foam, 1.0 / (reach * reach), streaked, shape.drops_over],
+                    [shape.drops_land, 1.0 / (shape.drops_band * shape.drops_band).max(1e-6), landed, if share > 0.0 { cells + 0.999 * share } else { 0.0 }],
+                ],
+            ))
         })
         .collect();
-    live.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut out = [[0.0; 4]; N];
-    for (o, (_, r)) in out.iter_mut().zip(live) {
-        *o = r;
+    live.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // The first left out: those kept stand clear of it, or sink toward it.
+    let cut = live.get(N).map_or(0.0, |l| l.0);
+    let mut out = SplashRings { rings: [[0.0; 4]; N], waves: [[0.0; 4]; N], pools: [[0.0; 4]; N], drops: [[0.0; 4]; N] };
+    for (i, (weight, [ring, wave, pool, drop])) in live.into_iter().take(N).enumerate() {
+        // Whole at three times the first left out's weight, nothing at it.
+        let keep = if cut > 0.0 { (0.5 * (weight / cut - 1.0)).clamp(0.0, 1.0) } else { 1.0 };
+        out.rings[i] = [ring[0], ring[1], ring[2], (ring[3] * keep).max(1e-12)];
+        out.waves[i] = [wave[0], wave[1], wave[2], wave[3] * keep];
+        out.pools[i] = [pool[0] * keep, pool[1], pool[2], pool[3]];
+        // (Its cells a metre whole, and the share of them a drop lands in
+        // its fraction: kept as the share.)
+        out.drops[i] = [drop[0], drop[1], drop[2], if drop[3] > 0.0 { drop[3].floor() + drop[3].fract() * keep } else { 0.0 }];
     }
     out
+}
+
+/// How much one splash's rings and foam matter to the eye at `head_world`.
+fn ring_weight(slope: f32, foam: f32, apart: f32) -> f32 {
+    (slope + 0.3 * foam) / (1.0 + apart / 4.0).powi(2)
+}
+
+/// How long one drop's own ring is seen, seconds (`water_pipeline::RING_BLOCK`).
+pub const DROP_RING_SECONDS: f32 = 0.45;
+
+/// How long a splash's rings are drawn: until the middle of its train is
+/// shallower than a slope of 1 in 300 -- no longer seen in a reflection --
+/// or [`RING_SECONDS`] at most.
+///
+/// [`RING_SECONDS`]: super::water_pipeline::RING_SECONDS
+pub fn ring_seconds(shape: &SplashShape) -> f32 {
+    let a = shape.cavity.max(0.01);
+    let k = 3.0 / (RING_EDGE * a);
+    // RING_PEAK D a / r * k falls to 1/300 at r = 300 RING_PEAK D a k.
+    let reach = 300.0 * RING_PEAK * shape.wave_source * a * k;
+    (shape.ring_release + reach / shape.ring_speed.max(1e-3)).clamp(1.0, super::water_pipeline::RING_SECONDS)
 }
 
 /// How strong a fire's light is at scale 1, in the lights block's units (the
@@ -1996,6 +3257,60 @@ pub fn fire_glare(e: &EffectEmitter, time: f64, offset: Vec3, yaw_inv: Quat) -> 
 pub fn room_ambient(descs: &[ProbeDesc], world: Vec3) -> Vec3 {
     let l = super::room_light::room_light_at(descs, world);
     Vec3::new(l[0][0], l[0][1], l[0][2]) * 0.282_095
+}
+
+/// Metres under the terrain's surface over which a point past every room's box
+/// passes from the open air's light to a cave's (`room_ambient_now`).
+pub const UNDER_GROUND: (f32, f32) = (0.5, 2.0);
+
+/// [`room_ambient`] AT THE LEVEL'S TIME OF DAY. The room's light was baked
+/// under the photographed sky; at dusk the sky is a hundredth of that, the
+/// ground is lit by what the sky is now, and smoke and airborne water lit by
+/// the bake stood white over it (splashes, 2026-10-13). `relit` is, by
+/// photograph in `descs`' order, how bright each is now over how bright it
+/// was photographed -- what the time of day already keeps for the
+/// reflections (`XrRenderer::probe_brightness` over the photographed mean:
+/// the daylight's share scaled to the hour, the lamps' kept) -- and the
+/// room's baked light takes the ratio of the photograph the point is in: the
+/// smallest room's that holds it, else the nearest. Empty: as baked.
+/// `ground`: the terrain's heights, which tell the open air from a cave dug
+/// under them (below).
+pub fn room_ambient_now(descs: &[ProbeDesc], world: Vec3, relit: &[f32], ground: Option<&super::ground_map::HeightGrid>) -> Vec3 {
+    let ratio = |i: usize| if relit.is_empty() { 1.0 } else { relit.get(i).copied().filter(|k| k.is_finite()).unwrap_or(1.0).max(0.0) };
+    let baked = room_ambient(descs, world);
+    let lit = || descs.iter().enumerate().filter(|(_, d)| d.room_light.is_some());
+    let size = |d: &ProbeDesc| (d.max - d.min).max(Vec3::ZERO).element_product();
+    let near = |a: &(usize, &ProbeDesc), b: &(usize, &ProbeDesc)| (a.1.centre - world).length_squared().total_cmp(&(b.1.centre - world).length_squared());
+    let inside = lit().filter(|(_, d)| (world - d.min).min(d.max - world).min_element() >= 0.0).min_by(|a, b| size(a.1).total_cmp(&size(b.1)));
+    let now = match inside.or_else(|| lit().min_by(near)) {
+        Some((i, _)) if !relit.is_empty() => baked * ratio(i),
+        _ => baked,
+    };
+    // OUT IN THE OPEN past every room's box -- the pond, the beach beyond the
+    // outdoor photographs' box -- the nearest photograph can be a ROOM's,
+    // and a splash or a mist there was lit as if indoors (a dark disc on a
+    // sunlit pond, 2026-10-14). There it is the open air's: the OUTDOOR
+    // volume's nearest photograph (the volume whose photographs have no
+    // distances: its box stands in for the sky), blended in over
+    // `room_light::ROOM_EDGE` as `room_light_at` blends rooms.
+    // But past every box is not always the open air: a CAVE dug under the
+    // terrain has no box either, and its bonfire's smoke took the sky's light
+    // there, ten times its own, and stood pale grey in the dark (2026-10-14).
+    // Under the ground's surface -- metres of hill overhead -- the point keeps
+    // its nearest room's light as before; the half metre and more of the
+    // ramp lets a puff on a slope the grid's bilinear surface cuts stay open.
+    let held = lit().map(|(_, d)| smoothstep(-super::room_light::ROOM_EDGE, 0.0, (world - d.min).min(d.max - world).min_element())).fold(0.0, f32::max);
+    let buried = ground.map_or(0.0, |g| smoothstep(UNDER_GROUND.0, UNDER_GROUND.1, g.at(world.x, world.z) - world.y));
+    let open_share = (1.0 - held) * (1.0 - buried);
+    let outdoor = |v: u32| descs.iter().filter(|d| d.volume == v).all(|d| !d.has_depth);
+    match lit().filter(|(_, d)| outdoor(d.volume)).min_by(near) {
+        Some((i, d)) if open_share > 0.0 => {
+            let l = d.room_light.unwrap_or_default();
+            let open = Vec3::new(l[0][0], l[0][1], l[0][2]) * (0.282_095 * ratio(i));
+            now.lerp(open, open_share)
+        }
+        _ => now,
+    }
 }
 
 /// Whether a lamp lights an emitter's particles: it hangs in the smallest
@@ -2509,58 +3824,373 @@ pub fn atlas_layers() -> Vec<Vec<u8>> {
     layers.push(dot_frame(6.0));
     layers.push(dot_frame(3.0));
     layers.push(coals_frame());
-    layers.push(crown_frame());
+    for variant in 0..CROWN_VARIANTS {
+        layers.extend((0..CROWN_FRAMES).map(|stage| crown_frame(variant, stage)));
+    }
+    for variant in 0..JET_VARIANTS {
+        layers.extend((0..JET_FRAMES).map(|stage| jet_frame(variant, stage)));
+    }
+    for variant in 0..SPRAY_VARIANTS {
+        layers.extend((0..SPRAY_FRAMES).map(|stage| spray_frame(variant, stage)));
+    }
+    for variant in 0..FROTH_VARIANTS {
+        layers.extend((0..FROTH_FRAMES).map(|stage| froth_frame(variant, stage)));
+    }
+    for variant in 0..FLASH_VARIANTS {
+        layers.extend((0..FLASH_FRAMES).map(|form| flash::lobe_frame(variant, form)));
+    }
+    layers.extend((0..CORE_VARIANTS).map(flash::core_frame));
     layers
 }
 
-/// A SPLASH'S CROWN, seen from the side: jets of water thrown up and out from
-/// where it struck, tapering as they thin, arcing over as they fall, each
-/// ending in the drop it breaks into, over a low dome of mist at the base.
-/// White in alpha (aerated water), its base on the bottom row's middle.
-fn crown_frame() -> Vec<u8> {
-    let n = ATLAS_SIZE as usize;
-    let mut clear = vec![1.0f32; n * n];
-    let mut splat = |cx: f32, cy: f32, r: f32, a: f32| {
-        let (x0, x1) = (((cx - 3.0 * r) * n as f32).floor().max(0.0) as usize, ((cx + 3.0 * r) * n as f32).ceil().min(n as f32) as usize);
-        let (y0, y1) = (((cy - 3.0 * r) * n as f32).floor().max(0.0) as usize, ((cy + 3.0 * r) * n as f32).ceil().min(n as f32) as usize);
+/// The share of its quad each layer's cutout covers: what a particle of it
+/// pays fill for. Kept from the first atlas made (`EffectsGpu::new`), or
+/// worked out when first asked.
+static CUTOUT_SHARES: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+
+fn cutout_shares_of(cut: &[[f32; 16]]) -> Vec<f32> {
+    cut.iter()
+        .map(|c| {
+            // The outline's area (shoelace) over the quad's 4.
+            let area: f32 = (0..8).map(|k| (c[2 * k] * c[2 * ((k + 1) % 8) + 1] - c[2 * ((k + 1) % 8)] * c[2 * k + 1]) * 0.5).sum();
+            (area.abs() / 4.0).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+/// THE BOOKS an effect asset can name (`effect_asset::BookInfo`): each a run
+/// of the atlas's layers, with what a particle of it fills and what it
+/// weighs. All made here from noise (`atlas_layers`); a baked book would
+/// join this list.
+pub fn books() -> &'static [super::effect_asset::BookInfo] {
+    use super::effect_asset::{BookInfo, Channels};
+    static BOOKS: std::sync::OnceLock<Vec<BookInfo>> = std::sync::OnceLock::new();
+    BOOKS.get_or_init(|| {
+        let shares = CUTOUT_SHARES.get_or_init(|| cutout_shares_of(&cutouts(&atlas_layers())));
+        let layer_bytes = (0..ATLAS_MIPS).map(|m| ((ATLAS_SIZE >> m).max(1) as u64).pow(2) * 4).sum::<u64>();
+        let book = |name, first: u32, frames: u32, variants: u32, channels, layers: u32| BookInfo {
+            name,
+            first_layer: first,
+            frames,
+            variants,
+            channels,
+            cutout_share: shares[first as usize..(first + frames * variants) as usize].iter().sum::<f32>() / (frames * variants) as f32,
+            bytes: layers as u64 * layer_bytes,
+        };
+        vec![
+            book("smoke", 0, SMOKE_FRAMES, 1, Channels::Sixway, 2 * SMOKE_FRAMES),
+            book("flame", FIRE_FIRST, FIRE_FRAMES, 1, Channels::HeatCover, FIRE_FRAMES),
+            book("ember", EMBER_LAYER, 1, 1, Channels::Alpha, 1),
+            book("mote", MOTE_LAYER, 1, 1, Channels::Alpha, 1),
+            book("coals", COALS_LAYER, 1, 1, Channels::Bed, 1),
+            book("crown", CROWN_LAYER, CROWN_FRAMES, CROWN_VARIANTS, Channels::Alpha, CROWN_FRAMES * CROWN_VARIANTS),
+            book("jet", JET_LAYER, JET_FRAMES, JET_VARIANTS, Channels::Alpha, JET_FRAMES * JET_VARIANTS),
+            book("spray", SPRAY_LAYER, SPRAY_FRAMES, SPRAY_VARIANTS, Channels::Alpha, SPRAY_FRAMES * SPRAY_VARIANTS),
+            book("froth", FROTH_LAYER, FROTH_FRAMES, FROTH_VARIANTS, Channels::Alpha, FROTH_FRAMES * FROTH_VARIANTS),
+            book("muzzle_flash", FLASH_LAYER, FLASH_FRAMES, FLASH_VARIANTS, Channels::HeatCover, FLASH_FRAMES * FLASH_VARIANTS),
+            book("muzzle_core", CORE_LAYER, 1, CORE_VARIANTS, Channels::HeatCover, CORE_VARIANTS),
+        ]
+    })
+}
+
+/// Dabs of cover laid one over another, on a square of clear: what a
+/// splash's textures are drawn with. `(x, y)` in 0..1, `y` down from the top;
+/// `r` a dab's radius, `a` how much of what shows through it it hides.
+struct Dabs {
+    clear: Vec<f32>,
+}
+
+impl Dabs {
+    fn new() -> Self {
+        Self { clear: vec![1.0; (ATLAS_SIZE * ATLAS_SIZE) as usize] }
+    }
+
+    /// A round drop of water: whole to its edge, which is a texel soft.
+    fn dab(&mut self, cx: f32, cy: f32, r: f32, a: f32) {
+        let n = ATLAS_SIZE as usize;
+        let soft = 1.0 / n as f32;
+        let r = r.max(0.5 * soft);
+        let reach = r + soft;
+        let (x0, x1) = (((cx - reach) * n as f32).floor().max(0.0) as usize, ((cx + reach) * n as f32).ceil().clamp(0.0, n as f32) as usize);
+        let (y0, y1) = (((cy - reach) * n as f32).floor().max(0.0) as usize, ((cy + reach) * n as f32).ceil().clamp(0.0, n as f32) as usize);
         for y in y0..y1 {
             for x in x0..x1 {
                 let (px, py) = ((x as f32 + 0.5) / n as f32, (y as f32 + 0.5) / n as f32);
-                let d2 = ((px - cx) * (px - cx) + (py - cy) * (py - cy)) / (r * r);
-                clear[y * n + x] *= 1.0 - a * (-d2 * 2.0).exp();
+                let d = ((px - cx) * (px - cx) + (py - cy) * (py - cy)).sqrt();
+                // Laid one over another along a line, they are a line of even
+                // cover, not a string of knots: the most any one hides.
+                let cover = a * (1.0 - smoothstep(r - soft, r + soft, d));
+                let c = &mut self.clear[y * n + x];
+                *c = c.min(1.0 - cover);
             }
         }
-    };
-    let base = (0.5f32, 0.95f32);
-    for j in 0..26u64 {
-        let u = uniforms(hash64(0xc0ffee ^ j.wrapping_mul(0x9e3779b97f4a7c15)));
-        // Most jets near upright, a few flung wide.
-        let lean = (2.0 * u[0] - 1.0) * (0.25 + 0.75 * u[1] * u[1]) * 1.1;
-        let len = lerp(0.4, 0.88, u[2]) * (1.0 - 0.3 * lean.abs());
-        let w0 = lerp(0.016, 0.03, u[3]);
-        let droop = 0.12 * u[4];
-        let mut tip = base;
-        for k in 0..48 {
-            let t = k as f32 / 47.0;
-            let x = base.0 + 0.8 * (lean.sin() * len * t + lean.signum() * droop * t * t);
-            let y = base.1 - lean.cos() * len * t * (1.0 - 0.25 * t * t);
-            splat(x, y, w0 * (1.0 - 0.65 * t), 0.55 * (1.0 - 0.35 * t));
-            tip = (x, y);
+    }
+
+    /// White in alpha: the dabs over `film(x, y)` -- a thin cover under them
+    /// -- faded to nothing by `edge(x, y)`. `on_its_side` lays the picture's
+    /// up along the texture's +x: a sprite drawn a quarter turn round then
+    /// stands it up, and may be drawn wider than it is tall (the shader
+    /// stretches a sprite only along its own up).
+    fn finish(self, film: impl Fn(f32, f32) -> f32, edge: impl Fn(f32, f32) -> f32, on_its_side: bool) -> Vec<u8> {
+        let n = ATLAS_SIZE as usize;
+        let mut out = vec![0u8; n * n * 4];
+        for y in 0..n {
+            for x in 0..n {
+                // The upright picture's texel this one shows.
+                let (ux, uy) = if on_its_side { (y, n - 1 - x) } else { (x, y) };
+                let (px, py) = ((ux as f32 + 0.5) / n as f32, (uy as f32 + 0.5) / n as f32);
+                let a = (1.0 - self.clear[uy * n + ux] * (1.0 - film(px, py).clamp(0.0, 1.0))) * edge(px, py);
+                out[(y * n + x) * 4..(y * n + x) * 4 + 4].copy_from_slice(&[255, 255, 255, (a.clamp(0.0, 1.0) * 255.0).round() as u8]);
+            }
         }
-        splat(tip.0, tip.1 - 0.02, w0 * 1.1, 0.8);
+        out
     }
-    for k in 0..40u64 {
-        let u = uniforms(hash64(0xd06e ^ k.wrapping_mul(0x632be59bd9b4e019)));
-        splat(base.0 + (2.0 * u[0] - 1.0) * 0.3, base.1 - 0.06 * u[1], lerp(0.03, 0.06, u[2]), 0.25);
+}
+
+/// A PIECE OF A SPLASH'S CROWN, seen from the side, in one of three stages
+/// of its breaking up -- which a piece is blended through as it rises and
+/// falls back. Stage 0, THE SHEET: a wall of water lifted from the surface.
+/// A film of water is clear, but it is not flat: it is thrown in streaks and
+/// ripples, and each catches the sky -- so from across a pond a crown is a
+/// pale, streaked curtain with a bright thick rim, not glass. The rim
+/// scallops into short fingers, each shedding a drop. Stage 1, BREAKING: the
+/// film torn into holes from its top, the rim in lengths, the fingers necked.
+/// Stage 2, DROPS: the rim and the fingers are beads, falling apart; of the
+/// film, threads. `variant` is which piece: no two alike, and a crown is
+/// several, each overlapping its neighbours, its sides fading into theirs --
+/// a wall the whole way round, not petals. On its side (`Dabs::finish`).
+fn crown_frame(variant: u32, stage: u32) -> Vec<u8> {
+    let seed = 0xc0ffee ^ ((variant as u64 + 1) << 20);
+    let stage = stage.min(2);
+    let mut d = Dabs::new();
+    let base = 0.98f32;
+    // The wall's top across the piece: scalloped, a little lower at its
+    // sides where the next piece takes over.
+    let rim = move |x: f32| {
+        let side = (2.0 * x - 1.0) * (2.0 * x - 1.0);
+        0.38 + 0.1 * noise1(x * 3.3, seed) + 0.045 * noise1(x * 9.0, seed ^ 7) + 0.07 * side
+    };
+    // The rim: water gathered along the sheet's edge.
+    for c in 0..110 {
+        let x = 0.01 + 0.98 * (c as f32 + 0.5) / 110.0;
+        let u = uniforms(hash64(seed ^ 0x71 ^ (c as u64).wrapping_mul(0x9e3779b97f4a7c15)));
+        // Thicker and thinner along it: where it is thick, a finger starts.
+        let thick = 0.024 + 0.011 * noise1(x * 9.0, seed ^ 0x33);
+        match stage {
+            0 => d.dab(x, rim(x), thick, 0.95),
+            // In lengths, parting where it was thin.
+            1 => {
+                if noise1(x * 9.0, seed ^ 0x33) > -0.4 {
+                    d.dab(x, rim(x) + 0.012, 0.9 * thick, 0.95);
+                }
+            }
+            // Beads, falling a little as they part.
+            _ => {
+                if c % 4 == 0 {
+                    d.dab(x + 0.012 * (u[0] - 0.5), rim(x) + 0.03 + 0.05 * u[1], lerp(0.011, 0.02, u[2]), 0.95);
+                }
+            }
+        }
     }
-    let mut out = vec![0u8; n * n * 4];
-    for (i, c) in clear.iter().enumerate() {
-        let (x, y) = ((i % n) as f32 / n as f32, (i / n) as f32 / n as f32);
-        // Nothing at the quad's sides or top: the cutout and the fade end it.
-        let edge = smoothstep(0.0, 0.04, x) * smoothstep(1.0, 0.96, x) * smoothstep(0.0, 0.04, y);
-        out[i * 4..i * 4 + 4].copy_from_slice(&[255, 255, 255, ((1.0 - c) * edge * 255.0).round() as u8]);
+    // Fingers: the rim's thick places thrown on ahead of it, short, each
+    // ending in the drop it sheds.
+    for f in 0..7u64 {
+        let u = uniforms(hash64(seed ^ 0xf1 ^ f.wrapping_mul(0x632be59bd9b4e019)));
+        let x0 = 0.06 + 0.88 * (f as f32 + 0.15 + 0.7 * u[0]) / 7.0;
+        let lean = (u[1] - 0.5) * 0.7;
+        let long = lerp(0.07, 0.2, u[2] * u[2]) * [1.0f32, 1.35, 1.6][stage as usize];
+        let wide = lerp(0.012, 0.02, u[3]);
+        let y0 = rim(x0);
+        let steps = 28;
+        for k in 0..=steps {
+            let t = k as f32 / steps as f32;
+            let (x, y) = (x0 + lean * long * t, y0 - long * t * (1.0 - 0.25 * t));
+            let neck = match stage {
+                0 => 1.0,
+                // Necking where it will part.
+                1 => 0.35 + 0.65 * (t * std::f32::consts::TAU + 6.0 * u[4]).cos().abs(),
+                // Parted: a bead or two.
+                _ => {
+                    if (t * 2.0 + u[4]).fract() < 0.22 {
+                        1.4
+                    } else {
+                        0.0
+                    }
+                }
+            };
+            if neck > 0.0 {
+                d.dab(x, y, wide * (1.0 - 0.45 * t) * neck, 0.95);
+            }
+        }
+        let tip = (x0 + lean * long, y0 - long * 0.75);
+        d.dab(tip.0, tip.1 - 0.008, wide * 1.4, 0.97);
+        // And those already shed, flying on.
+        for k in 0..2 * stage + 2 {
+            let v = uniforms(hash64(seed ^ 0xd0 ^ (f * 8 + k as u64).wrapping_mul(0x8cb92ba72f3d8dd7)));
+            d.dab(tip.0 + (v[0] - 0.5) * 0.16, (tip.1 - 0.03 - 0.22 * v[1] * v[1]).max(0.03), lerp(0.006, 0.012, v[2]), 0.95);
+        }
     }
-    out
+    // THE FILM under them: streaked the way it was thrown, each streak a
+    // ripple that catches the sky, thicker toward the rim it feeds and at
+    // its foot where it leaves the water; torn as it breaks.
+    let film = move |x: f32, y: f32| -> f32 {
+        if y < rim(x) || y > base {
+            return 0.0;
+        }
+        let up = 1.0 - (y - rim(x)) / (base - rim(x));
+        let warp = 0.5 * noise1(y * 4.0, seed ^ 0x52);
+        let streak = 0.5 + 0.5 * noise1(x * 21.0 + warp, seed ^ 0x51);
+        let fine = 0.5 + 0.5 * noise1(x * 55.0 + 2.0 * warp, seed ^ 0x53);
+        let under_rim = smoothstep(0.75, 1.0, up);
+        // Clearest where it leaves the water, thick and smooth; whiter up
+        // toward the rim, where it is thin, rippled and breaking.
+        let body = (0.13 + 0.42 * streak * streak * streak + 0.16 * fine * fine + 0.22 * under_rim) * (0.12 + 0.88 * smoothstep(0.0, 0.65, up));
+        match stage {
+            0 => body,
+            // Holes open from the top down.
+            1 => 0.8 * body * smoothstep(-0.25, 0.2, noise3(Vec3::new(x * 8.0, y * 6.0, 3.7), seed ^ 0x40) + 0.6 * (1.0 - up) - 0.25),
+            // Threads of it, falling.
+            _ => 0.55 * body * smoothstep(0.05, 0.4, noise3(Vec3::new(x * 12.0, y * 5.0, 9.1), seed ^ 0x41) + 0.35 * (1.0 - up) - 0.2),
+        }
+    };
+    // Its sides fade into the pieces beside it, its foot into the water.
+    d.finish(film, |x, y| smoothstep(0.0, 0.24, x) * smoothstep(1.0, 0.76, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.96, y), true)
+}
+
+/// SPRAY: the drops a splash throws, too many and too small to draw one by
+/// one -- a fan of them from where its foot stands on the water (the bottom
+/// row's middle), most along its axis, the fastest furthest. Stage 0, JUST
+/// THROWN: each a short streak along its flight, a breath of mist among them.
+/// Stage 1: apart, round. Stage 2: half of them down, the rest smaller. The
+/// sprite that shows it grows as they fly, which is what parts them.
+fn spray_frame(variant: u32, stage: u32) -> Vec<u8> {
+    let seed = 0x5b7a1 ^ ((variant as u64 + 1) << 20);
+    let stage = stage.min(2) as usize;
+    let mut d = Dabs::new();
+    let foot = (0.5f32, 0.975f32);
+    let count = [340u64, 340, 170][stage];
+    for i in 0..count {
+        let u = uniforms(hash64(seed ^ (i + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
+        // Either side of its axis, most near it.
+        let angle = (u[0] + u[1] - 1.0) * 0.8;
+        let far = [0.8f32, 0.93, 0.95][stage] * u[2].powf(0.55) * (1.0 - 0.3 * angle * angle);
+        let (sx, sy) = (angle.sin(), -angle.cos());
+        let (x, y) = (foot.0 + sx * far, foot.1 + sy * far);
+        // Few big, many small; the far ones are the small fast ones.
+        let r = lerp(0.0035, 0.012, u[3] * u[3] * u[3]) * (1.15 - 0.4 * far) * [1.0f32, 1.0, 0.8][stage];
+        if stage == 0 {
+            let long = lerp(0.03, 0.09, u[4]) * (0.4 + 0.6 * far);
+            for k in 0..6 {
+                let t = k as f32 / 5.0;
+                d.dab(x - sx * long * t, y - sy * long * t, r * (1.0 - 0.55 * t), 0.92);
+            }
+        } else {
+            d.dab(x, y + 0.03 * u[5] * (stage as f32 - 1.0), r, 0.92);
+        }
+    }
+    let haze = move |x: f32, y: f32| -> f32 {
+        let (dx, dy) = (x - foot.0, foot.1 - y);
+        let far = (dx * dx + dy * dy).sqrt();
+        let angle = dx.atan2(dy.max(1e-4));
+        let cone = (1.0 - (angle / 0.75) * (angle / 0.75)).max(0.0) * smoothstep(0.0, 0.08, far) * (1.0 - smoothstep(0.25, 0.8, far));
+        [0.2f32, 0.1, 0.0][stage] * cone * (0.55 + 0.45 * noise3(Vec3::new(x * 9.0, y * 9.0, 0.7), seed ^ 0x11))
+    };
+    d.finish(haze, |x, y| smoothstep(0.0, 0.04, x) * smoothstep(1.0, 0.96, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.985, y), false)
+}
+
+/// WHITE WATER IN THE AIR: what a sheet too thick to hold together is thrown
+/// as (`SplashShape::broken`), and what a strike into churned water throws
+/// -- water full of air, white the way a breaking wave is. One of the
+/// TONGUES of it that stand round the rim, shoulder to shoulder, where a
+/// clear crown would: upright, its foot on the bottom row, its sides fading
+/// into its neighbours'. Not a puff and not a sheet: thick at its foot,
+/// streaked the way it was thrown, lumpy, its top ragged -- tongues of it
+/// running ahead and shedding drops. Stage 0, THROWN: dense. Stage 1:
+/// thinning, holes opening from its top. Stage 2: shreds of it falling back,
+/// and drops.
+fn froth_frame(variant: u32, stage: u32) -> Vec<u8> {
+    let seed = 0xf207 ^ ((variant as u64 + 1) << 20);
+    let stage = stage.min(2) as usize;
+    let mut d = Dabs::new();
+    let base = 0.98f32;
+    // How high each tongue of it reaches, across the piece (y down).
+    let top = move |x: f32| {
+        let side = (2.0 * x - 1.0) * (2.0 * x - 1.0);
+        (0.34 + 0.26 * noise1(x * 3.7, seed) + 0.12 * noise1(x * 10.0, seed ^ 3) + 0.16 * side).clamp(0.06, 0.85)
+    };
+    // The drops its tongues shed, and more as it thins.
+    for i in 0..[60u64, 120, 150][stage] {
+        let u = uniforms(hash64(seed ^ 0xbead ^ (i + 1).wrapping_mul(0x632be59bd9b4e019)));
+        let x = 0.08 + 0.84 * u[0];
+        let reach = base - top(x);
+        let h = reach * lerp([0.85f32, 0.5, 0.15][stage], 1.25, u[2]);
+        d.dab(x, (base - h).max(0.02), lerp(0.005, 0.014, u[3] * u[3]), 0.92);
+    }
+    let body = move |x: f32, y: f32| -> f32 {
+        if y > base {
+            return 0.0;
+        }
+        let up = (base - y) / (base - top(x));
+        let lives = 1.0 - smoothstep(0.65, 1.0, up);
+        let warp = 0.6 * noise1(y * 3.0, seed ^ 0x21);
+        let streak = 0.5 + 0.5 * noise3(Vec3::new(x * 22.0 + warp, y * 4.0, 1.9), seed ^ 0x22);
+        let lumps = 0.5 + 0.5 * noise3(Vec3::new(x * 6.0, y * 6.0, 4.3), seed ^ 0x23);
+        let dense = [0.85f32 - 0.3 * up, 0.72 - 0.3 * up, 0.5 - 0.2 * up][stage];
+        // Its foot is in the foam it stands on, not a line across the water.
+        let a = lives * dense * (0.25 + 0.4 * streak + 0.5 * lumps) * smoothstep(0.0, 0.3, up);
+        match stage {
+            0 => a,
+            1 => a * smoothstep(-0.3, 0.2, noise3(Vec3::new(x * 7.0, y * 6.0, 7.7), seed ^ 0x24) + 0.5 - 0.8 * up),
+            _ => a * smoothstep(0.0, 0.35, noise3(Vec3::new(x * 9.0 + warp, y * 4.0, 2.2), seed ^ 0x25) + 0.25 - 0.35 * up),
+        }
+    };
+    d.finish(body, |x, y| smoothstep(0.0, 0.4, x) * smoothstep(1.0, 0.6, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.97, y), false)
+}
+
+/// A SPLASH'S JET, seen from the side, in three stages of ITS breaking up.
+/// Stage 0, A COLUMN: wide at its foot where it leaves the water, tapering,
+/// swelling a little along its length (the waist a column of water cannot
+/// keep from growing), a bead at its top. Stage 1, NECKED: the swellings
+/// grown, the waists thin. Stage 2, BEADS: parted, each swelling a drop,
+/// with small ones between. Its foot on the bottom row's middle; the column
+/// a quarter of the texture wide at its foot.
+fn jet_frame(variant: u32, stage: u32) -> Vec<u8> {
+    let seed = 0x1e7 ^ ((variant as u64 + 1) << 20);
+    let stage = stage.min(2);
+    let u = uniforms(hash64(seed));
+    let mut d = Dabs::new();
+    let swell = [0.12f32, 0.5, 1.0][stage as usize];
+    let waves = lerp(3.0, 4.5, u[0]);
+    let bend = |t: f32| 0.5 + 0.04 * noise1(t * 3.0, seed ^ 3) * t;
+    let steps = 180;
+    for k in 0..=steps {
+        let t = k as f32 / steps as f32;
+        let y = 0.97 - 0.84 * t;
+        let wave = (t * waves * std::f32::consts::TAU + 6.0 * u[1]).cos();
+        // Flared where it leaves the water, tapering to its top.
+        let body = 0.085 * (1.0 - 0.6 * t) * (1.0 + 0.7 * (1.0 - smoothstep(0.0, 0.1, t)));
+        let wide = match stage {
+            0 | 1 => body * (1.0 + swell * 0.8 * wave).max(0.15),
+            // Parted where the waists were; its foot sinking back.
+            _ => {
+                if t > 0.1 {
+                    body * (0.2 + 1.3 * wave).max(0.0)
+                } else {
+                    body * (1.0 - 7.0 * t).max(0.0)
+                }
+            }
+        };
+        if wide > 0.004 {
+            d.dab(bend(t), y, wide, 0.93);
+        }
+    }
+    // The bead at its top, and the small ones a parting column leaves.
+    d.dab(bend(1.0), 0.11, lerp(0.04, 0.055, u[2]), 0.95);
+    for k in 0..(3 * stage as u64) {
+        let v = uniforms(hash64(seed ^ 0x5a7 ^ k.wrapping_mul(0x9e3779b97f4a7c15)));
+        d.dab(0.5 + (v[0] - 0.5) * 0.16, lerp(0.15, 0.85, v[1]), lerp(0.008, 0.018, v[2]), 0.9);
+    }
+    d.finish(|_, _| 0.0, |x, y| smoothstep(0.0, 0.05, x) * smoothstep(1.0, 0.95, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.94, y), false)
 }
 
 /// The eight-sided outline round every texel of `alpha` (RGBA8, `ATLAS_SIZE`
@@ -2640,10 +4270,13 @@ pub fn cutouts(layers: &[Vec<u8>]) -> Vec<[f32; 16]> {
             let next = match l {
                 l if l < SMOKE_FRAMES - 1 => Some(l + 1),
                 l if (FIRE_FIRST..FIRE_FIRST + FIRE_FRAMES - 1).contains(&l) => Some(l + 1),
+                // A splash's crown, jet, spray and white water: each stage
+                // toward the next of its own variant (three stages each).
+                l if (CROWN_LAYER..FLASH_LAYER).contains(&l) && (l - CROWN_LAYER) % CROWN_FRAMES < CROWN_FRAMES - 1 => Some(l + 1),
                 _ => None,
             };
             let smeared: Vec<Vec<u8>> = match next {
-                Some(m) if l >= FIRE_FIRST => vec![flame_smear(&layers[l as usize], dt), flame_smear(&layers[m as usize], -dt)],
+                Some(m) if (FIRE_FIRST..FIRE_FIRST + FIRE_FRAMES).contains(&l) => vec![flame_smear(&layers[l as usize], dt), flame_smear(&layers[m as usize], -dt)],
                 _ => Vec::new(),
             };
             let mut with: Vec<&[u8]> = vec![&layers[l as usize]];
@@ -2790,6 +4423,16 @@ pub struct EffectsGpu {
     capacity: u64,
     over: u32,
     screened: u32,
+    /// The frame's draws: runs of its instances, each of one shader variant
+    /// (`variants::runs`).
+    runs: Vec<variants::Run>,
+    /// What those runs came to (`variants::RunStats`).
+    pub run_stats: variants::RunStats,
+    /// Draw each run with its own variant (as shipped), or everything with
+    /// the union shader (`Levers::effect_variants` off: the A/B).
+    pub use_variants: bool,
+    /// DEBUG: draw the overdraw view instead (`Levers::effects_overdraw`).
+    pub overdraw: bool,
 }
 
 impl EffectsGpu {
@@ -2817,6 +4460,7 @@ impl EffectsGpu {
             mapped_at_creation: false,
         });
         let cut: Vec<[f32; 16]> = cutouts(&layers);
+        let _ = CUTOUT_SHARES.set(cutout_shares_of(&cut));
         let cutouts = device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("effects_cutouts"),
             contents: bytemuck::cast_slice(&cut),
@@ -2834,7 +4478,20 @@ impl EffectsGpu {
         });
         let capacity = 256;
         let instances = Self::instance_buffer(device, capacity);
-        Self { _atlas: atlas, uniform, _cutouts: cutouts, bind_group, instances, capacity, over: 0, screened: 0 }
+        Self {
+            _atlas: atlas,
+            uniform,
+            _cutouts: cutouts,
+            bind_group,
+            instances,
+            capacity,
+            over: 0,
+            screened: 0,
+            runs: Vec::new(),
+            run_stats: Default::default(),
+            use_variants: true,
+            overdraw: false,
+        }
     }
 
     fn instance_buffer(device: &Device, capacity: u64) -> Buffer {
@@ -2858,6 +4515,7 @@ impl EffectsGpu {
         }
         self.over = frame.over;
         self.screened = frame.screened;
+        (self.runs, self.run_stats) = variants::runs(frame, self.use_variants);
     }
 
     /// This frame's view of them, for [`Self::draw`]: written apart from the
@@ -2867,11 +4525,11 @@ impl EffectsGpu {
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(uniform));
     }
 
-    /// What SpaceWarp's motion twin draws (`space_warp::MotionKind::
-    /// EffectsOver`): the instances, the group, and how many are drawn over
-    /// and how many screened.
-    pub fn motion_parts(&self) -> (&Buffer, &BindGroup, u32, u32) {
-        (&self.instances, &self.bind_group, self.over, self.screened)
+    /// What SpaceWarp's motion twins draw (`space_warp::MotionKind::
+    /// Effects`): the instances, the group, and the frame's runs, each drawn
+    /// by its own variant's twin.
+    pub fn motion_parts(&self) -> (&Buffer, &BindGroup, &[variants::Run]) {
+        (&self.instances, &self.bind_group, &self.runs)
     }
 
     /// Whether there is anything to draw this frame.
@@ -2890,13 +4548,14 @@ impl EffectsGpu {
         pass.set_bind_group(1, probe, &[]);
         pass.set_bind_group(2, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
-        if self.over > 0 {
-            pass.set_pipeline(&pipelines.over);
-            pass.draw(0..VERTICES_PER_PARTICLE, 0..self.over);
+        if self.overdraw {
+            pass.set_pipeline(&pipelines.overdraw);
+            pass.draw(0..VERTICES_PER_PARTICLE, 0..self.over + self.screened);
+            return;
         }
-        if self.screened > 0 {
-            pass.set_pipeline(&pipelines.screened);
-            pass.draw(0..VERTICES_PER_PARTICLE, self.over..self.over + self.screened);
+        for run in &self.runs {
+            pass.set_pipeline(&pipelines.variants[run.variant as usize]);
+            pass.draw(0..VERTICES_PER_PARTICLE, run.first..run.first + run.count);
         }
     }
 }
@@ -2907,8 +4566,12 @@ impl EffectsGpu {
 /// [`bind_group_layout`]. Mono and stereo twins, like every scene-pass
 /// pipeline. See `multiview`.
 pub struct EffectsPipeline {
-    pub over: RenderPipeline,
-    pub screened: RenderPipeline,
+    /// One pipeline a shader variant, by `FxVariant as usize`: each holds
+    /// only its own shading's code (`variants`).
+    pub variants: Vec<RenderPipeline>,
+    /// DEBUG: every particle a flat eighth of white, added
+    /// (`Levers::effects_overdraw`).
+    pub overdraw: RenderPipeline,
 }
 
 impl EffectsPipeline {
@@ -2943,10 +4606,9 @@ impl EffectsPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("effects_shader"),
-            source: ShaderSource::Wgsl(view.shader(effects_shader()).into()),
-        });
+        let module = |label: &str, source: String| {
+            device.create_shader_module(ShaderModuleDescriptor { label: Some(label), source: ShaderSource::Wgsl(view.shader(source).into()) })
+        };
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("effects_layout"),
             bind_group_layouts: &[Some(uniform_layout), Some(probe_layout), Some(effects_layout)],
@@ -2955,18 +4617,18 @@ impl EffectsPipeline {
         // Premultiplied over; screened as the glare is.
         let over = BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::OneMinusSrcAlpha, operation: BlendOperation::Add };
         let screen = BlendComponent { src_factor: BlendFactor::OneMinusDst, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
-        let build = |label: &str, fragment: &str, color: BlendComponent| {
+        let build = |label: &str, shader: &ShaderModule, fragment: &str, color: BlendComponent| {
             device.create_render_pipeline(&RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
                 vertex: VertexState {
-                    module: &shader,
+                    module: shader,
                     entry_point: Some("vs_main"),
                     compilation_options: PipelineCompilationOptions::default(),
                     buffers: &[Some(EffectInstance::layout())],
                 },
                 fragment: Some(FragmentState {
-                    module: &shader,
+                    module: shader,
                     entry_point: Some(fragment),
                     compilation_options: PipelineCompilationOptions::default(),
                     targets: &[Some(ColorTargetState {
@@ -2995,7 +4657,30 @@ impl EffectsPipeline {
                 cache: None,
             })
         };
-        Self { over: build("effects_over", "fs_over", over), screened: build("effects_screened", "fs_screen", screen) }
+        let added = BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
+        let variants = FxVariant::ALL
+            .iter()
+            .map(|v| {
+                let shader = module(v.label(), v.shader());
+                if v.screened() {
+                    build(v.label(), &shader, "fs_screen", screen)
+                } else {
+                    build(v.label(), &shader, "fs_over", over)
+                }
+            })
+            .collect();
+        if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
+            // MEASUREMENT: the union with one module cut at a time, built
+            // once for the PIPESTATS log (`effects_cut_<name>`): each
+            // module's cost is the union's less its cut's.
+            for (name, entry, _) in variants::EFFECT_MODULE_CUTS {
+                let Some(source) = variants::module_cut(name) else { continue };
+                let label = format!("effects_cut_{name}");
+                let _ = build(&label, &module(&label, source), entry, if *entry == "fs_screen" { screen } else { over });
+            }
+        }
+        let overdraw = build("effects_overdraw", &module("effects_overdraw", variants::overdraw_shader()), "fs_overdraw", added);
+        Self { variants, overdraw }
     }
 }
 
@@ -3024,6 +4709,29 @@ struct Fx {
 struct Cutouts { corners: array<vec4<f32>, CUT_VEC4S> }
 @group(2) @binding(3) var<uniform> fx_cut: Cutouts;
 
+// THIS EYE's position, from its own camera: the point its view-projection
+// sends to clip x = y = w = 0 (rows 0, 1 and 3 of the matrix, solved by
+// Cramer's rule). Not `fx.head`, the middle of the eyes: a fog slab's rays
+// start here, so each eye integrates its own line of sight and the mist has
+// its true stereo depth -- from the middle eye both eyes saw the mist painted
+// on its quad, which sits at the near side of the slab's bounding sphere (a
+// quarter metre ahead from inside it: "rendering right in my eyes").
+fn fx_eye() -> vec3<f32> {
+    let m = camera.view_proj[view_slot];
+    let r0 = vec4<f32>(m[0].x, m[1].x, m[2].x, m[3].x);
+    let r1 = vec4<f32>(m[0].y, m[1].y, m[2].y, m[3].y);
+    let r3 = vec4<f32>(m[0].w, m[1].w, m[2].w, m[3].w);
+    let c13 = cross(r1.xyz, r3.xyz);
+    let c30 = cross(r3.xyz, r0.xyz);
+    let c01 = cross(r0.xyz, r1.xyz);
+    return -(r0.w * c13 + r1.w * c30 + r3.w * c01) / dot(r0.xyz, c13);
+}
+
+// Where a fog slab's pixel's mist is, density-weighted along its line of
+// sight (world), set by `fx_fog`: its motion twin moves the pixel as that
+// point moves, not as the quad it is drawn on.
+var<private> fx_fog_point: vec3<f32> = vec3<f32>(0.0);
+
 struct IIn {
     @location(0) centre: vec4<f32>,
     @location(1) colour: vec4<f32>,
@@ -3050,9 +4758,68 @@ struct VOut {
     // the preset's, less one.
     @location(7) @interpolate(flat) time: f32,
     @location(8) @interpolate(flat) flicker: f32,
+    // A FOG SLAB: where on its covering quad (WORLD, the player's frame), its
+    // box's middle and soft edge, and its half sizes and falloff.
+    @location(9) world: vec3<f32>,
+    @location(10) @interpolate(flat) fog_a: vec4<f32>,
+    @location(11) @interpolate(flat) fog_b: vec4<f32>,
+}
+
+// A FOG SLAB'S COVERING QUAD (`stack::Program::fog`): square across the line
+// to its box's middle, at the near side of the box's bounding sphere and as
+// wide as the sphere's outline there -- every pixel the box can cover and few
+// more. No part of the box is nearer the eye than the quad, so the depth test
+// hides it only where something hides all of the box behind it. From inside
+// the sphere: the whole view, just in front of the eye. Eight triangles, as
+// a sprite's, round an octagon holding the outline's circle.
+fn fx_fog_vertex(vi: u32, inst: IIn) -> VOut {
+    var out: VOut;
+    let tri = vi / 3u;
+    let k = vi % 3u;
+    var corner = vec2<f32>(0.0);
+    if (k != 0u) {
+        let a = f32((tri + k - 1u) % 8u) * 0.78539816;
+        corner = vec2<f32>(cos(a), sin(a)) * 1.0824;
+    }
+    let c = inst.centre.xyz;
+    let r = length(inst.axis.xyz);
+    let eye = fx_eye();
+    let d = length(c - eye);
+    var mid = eye;
+    var across = fx.right.xyz;
+    var along = fx.up.xyz;
+    var reach = 1.0;
+    if (d > r * 1.02) {
+        let f = (c - eye) / d;
+        let s = d - r;
+        mid = eye + f * s;
+        reach = s * r / sqrt(d * d - r * r);
+        across = normalize(select(cross(f, vec3<f32>(0.0, 1.0, 0.0)), cross(f, vec3<f32>(1.0, 0.0, 0.0)), abs(f.y) > 0.99));
+        along = cross(across, f);
+    } else {
+        mid = eye + normalize(cross(fx.up.xyz, fx.right.xyz)) * 0.25;
+    }
+    let world = mid + (across * corner.x + along * corner.y) * reach;
+    out.clip = camera.view_proj[view_slot] * vec4<f32>(world, 1.0);
+    out.at = out.clip;
+    out.world = world;
+    out.uv = corner;
+    out.colour = inst.colour;
+    out.light = inst.light.xyz;
+    out.light_q = inst.light_dir.xyz;
+    out.layer = vec3<f32>(0.0, inst.params.y, inst.params.w);
+    out.soft = inst.light.w;
+    out.time = inst.params.x;
+    out.flicker = inst.params.z;
+    out.fog_a = inst.centre;
+    out.fog_b = inst.axis;
+    return out;
 }
 
 @vertex fn vs_main(@builtin(vertex_index) vi: u32, inst: IIn) -> VOut {
+    if (inst.params.w < -1.5) {
+        return fx_fog_vertex(vi, inst);
+    }
     var out: VOut;
     // Eight triangles fanned from its middle to its cutout's eight corners.
     let tri = vi / 3u;
@@ -3174,6 +4941,128 @@ fn fx_depth_fade(in: VOut) -> f32 {
     return clamp((scene - in.at.w) / in.soft, 0.0, 1.0);
 }
 
+// A FOG SLAB'S PIXEL (`sprite_fog`): MIST HOVERING IN TUFTS. Its box stands
+// on the water (its bottom the surface); along this pixel's line of sight,
+// from where it enters the box to where it leaves it or meets the scene's
+// depth (a bank, the shore), its density is summed over FOG_STEPS even
+// stretches, each read at its middle: `colour.a` a metre inside a tuft, times
+// - where it lies: the ellipse its box's footprint holds (a pond's water,
+//   the object sized to it), thinning to nothing `fog_a.w` metres in from its
+//   rim -- so the mist stays over the water;
+// - its tufts (`fx_fog_tuft`): a 3D billow noise, rounded about a band 3/8
+//   of the box up and `fog_b.w` metres either side of it, so the layer
+//   hovers (clear just over the water, soft bottom and top);
+// Seen through it, `1 - e^-depth` of what is behind is hidden. Lit by its even
+// light (`colour.rgb`) and the sun (`light`) through Henyey-Greenstein toward
+// it (`light_q`, `layer.y` its g), as `light_cpu` lights a mote
+// (`effects::henyey_greenstein`), the phase evening out as it thickens, and
+// brighter at a tuft's top than under it (the sky above, the water below).
+const FOG_TILE: f32 = 0.42;
+const FOG_STEPS: i32 = 10;
+
+// A gyroid: smooth, isotropic enough once turned, and four trig vectors.
+fn fx_fog_gyroid(p: vec3<f32>) -> f32 {
+    return dot(sin(p), cos(p.yzx));
+}
+
+// HOW MUCH TUFT at a point `m` of the box (its own frame, `y` up from the
+// water), for a box `tall` metres high and a band `half` metres either side
+// of its middle, the wind's way `wind`, how far it has drifted `drift`, and a
+// stretch `blur` metres long: 0 to 1. Three gyroids turned off the grid:
+// - CLUSTERS 2.6x the tufts across (5x tall), where the tufts gather, the
+//   water clear between;
+// - TUFTS FOG_TILE across (puffs some 0.5 to 2 m), their domain bent by
+//   a slow warp so they round off and billow;
+// - FINE billows half again smaller, which give way to nothing over a
+//   stretch longer than they are (else they alias);
+// all drifting with the wind, and EVOLVING: the tufts' domain rises and the
+// warp turns as the drift goes on (1.2 per metre drifted, ~0.17 a second at
+// the pond's wind), so they slowly change shape as they go. Their sum, less
+// how far `y` is from the band's middle (squared, in bands), is cut by a
+// soft threshold: rounded tops and bottoms, clear gaps.
+const FOG_TURN: mat3x3<f32> = mat3x3<f32>(vec3<f32>(0.8, -0.6, 0.0), vec3<f32>(0.36, 0.48, 0.8), vec3<f32>(-0.48, -0.64, 0.6));
+fn fx_fog_tuft(m: vec3<f32>, tall: f32, half: f32, wind: vec2<f32>, drift: f32, blur: f32) -> f32 {
+    let t = 1.2 * drift;
+    let at = vec3<f32>(m.x - wind.x * drift, m.y, m.z - wind.y * drift);
+    let c = fx_fog_gyroid(FOG_TURN * vec3<f32>(at.x / (2.6 * FOG_TILE) + 1.0, at.y / (5.0 * FOG_TILE) + 0.2 * t, at.z / (2.6 * FOG_TILE) - 2.0));
+    var p = FOG_TURN * vec3<f32>(at.x / FOG_TILE, at.y / FOG_TILE + 0.3 * t, at.z / FOG_TILE);
+    p += 0.45 * sin(vec3<f32>(0.9 * p.y + 0.5 * t, 0.8 * p.z + 1.0, 0.7 * p.x - 0.4 * t));
+    let n1 = fx_fog_gyroid(p);
+    let n2 = fx_fog_gyroid(FOG_TURN * (2.3 * p.zxy + vec3<f32>(5.0, 0.6 * t, 3.0)));
+    let band = (m.y - 0.375 * tall) / max(half, 1e-3);
+    let n = 0.5 * n1 + 0.3 * n2 * (1.0 - smoothstep(0.3, 0.8, blur)) + 0.45 * c - band * band;
+    let guard = smoothstep(0.025 * tall, 0.125 * tall, m.y) * (1.0 - smoothstep(0.8 * tall, tall, m.y));
+    return guard * smoothstep(0.1, 0.95, n);
+}
+
+fn fx_fog(in: VOut) -> vec4<f32> {
+    let eye = fx_eye();
+    let ray = in.world - eye;
+    let t_quad = max(length(ray), 1e-6);
+    let d = ray / t_quad;
+    var t_far = 1e6;
+    if (fx.depth.z > 0.5 && in.at.w > 0.0) {
+        let ndc = in.at.xyz / in.at.w;
+        let size = vec2<f32>(textureDimensions(probe_pass_depth));
+        let texel = clamp(vec2<i32>(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
+        let z = textureLoad(probe_pass_depth, texel, view_slot, 0);
+        if (z < 1.0) {
+            let n = fx.depth.x;
+            let f = fx.depth.y;
+            t_far = t_quad * (n * f / (f - z * (f - n))) / in.at.w;
+        }
+    }
+    // The box's own axes: the world's x and z, turned as the player's frame is.
+    let bx = vec3<f32>(cos(in.time), 0.0, sin(in.time));
+    let bz = vec3<f32>(-bx.z, 0.0, bx.x);
+    let o = eye - in.fog_a.xyz;
+    let lo = vec3<f32>(dot(o, bx), o.y, dot(o, bz));
+    let ld = vec3<f32>(dot(d, bx), d.y, dot(d, bz));
+    let h = in.fog_b.xyz;
+    let inv = 1.0 / select(ld, vec3<f32>(1e-6), abs(ld) < vec3<f32>(1e-6));
+    let ta = (-h - lo) * inv;
+    let tb = (h - lo) * inv;
+    let t0 = max(max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z)), 0.0);
+    let t1 = min(min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z)), t_far);
+    if (t1 <= t0) {
+        return vec4<f32>(0.0);
+    }
+    let half = max(in.fog_b.w, 0.01);
+    let wind = vec2<f32>(cos(in.soft), sin(in.soft));
+    let rim = in.fog_a.w / max(min(h.x, h.z), 1e-3);
+    let span = (t1 - t0) / f32(FOG_STEPS);
+    let blur = span / FOG_TILE;
+    var depth = 0.0;
+    var top = 0.0;
+    var at_t = 0.0;
+    for (var i = 0; i < FOG_STEPS; i++) {
+        let t = t0 + (f32(i) + 0.5) * span;
+        let m = lo + ld * t;
+        let lies = 1.0 - smoothstep(1.0 - rim, 1.0, length(m.xz / max(h.xz, vec2<f32>(1e-3))));
+        let up = m.y + h.y;
+        let k = span * lies * fx_fog_tuft(vec3<f32>(m.x, up, m.z), 2.0 * h.y, half, wind, in.flicker, blur);
+        depth += k;
+        top += k * clamp(up / (1.5 * h.y), 0.0, 1.0);
+        at_t += k * t;
+    }
+    fx_fog_point = eye + d * select(0.5 * (t0 + t1), at_t / depth, depth > 1e-6);
+    // Lit from above: a tuft's top a little brighter than the even light, its
+    // underside darker.
+    let lit = 0.7 + 0.45 * top / max(depth, 1e-6);
+    depth *= in.colour.a;
+    let alpha = 1.0 - exp(-depth);
+    let g = in.layer.y;
+    let cosine = dot(d, in.light_q);
+    // Light scattered more than once forgets its way: as the mist thickens
+    // its phase goes from the droplets' own (g) toward a quarter of it -- so
+    // a bank of mist with the sun behind the eye is white, not grey.
+    let hg = min((1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * cosine, 1e-4), 1.5), 12.0);
+    let g4 = 0.25 * g;
+    let hg4 = (1.0 - g4 * g4) / pow(max(1.0 + g4 * g4 - 2.0 * g4 * cosine, 1e-4), 1.5);
+    let shown = aces_fitted(lit * (in.colour.rgb + in.light * mix(hg, hg4, alpha)));
+    return vec4<f32>(shown * alpha, alpha);
+}
+
 // A flame's light by its heat, `hottest` at heat 1: black through deep red,
 // orange and amber to pale yellow, brightening steeply (`flame_colour`).
 fn fx_flame(hottest: vec3<f32>, heat: f32) -> vec3<f32> {
@@ -3209,6 +5098,7 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
     let fade = fx_depth_fade(in);
     let layer = i32(in.layer.x);
     let next = select(layer, layer + 1, in.layer.y > 0.0);
+    // <fx:coals>
     if (in.layer.z > 2.5) {
         // A BED OF COALS: red how hot each coal is, green its char's albedo,
         // blue its own phase of flicker. Its glow as its fire's flames are
@@ -3220,6 +5110,8 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
         let shown = aces_fitted(fx_flame(in.colour.rgb, b.r * flicker) + in.light * b.g);
         return vec4<f32>(shown * alpha, alpha);
     }
+    // </fx:coals>
+    // <fx:flame>
     if (in.layer.z > 1.5) {
         let v = 1.0 - in.uv.y;
         let was = vec2<f32>(in.uv.x, 1.0 - fx_flame_v(v, in.layer.y * FLAME_DT));
@@ -3259,6 +5151,12 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
         let covers = alpha * FLAME_COVER * clamp(max(shown.r, max(shown.g, shown.b)), 0.0, 1.0);
         return vec4<f32>(shown * alpha + root, covers);
     }
+    // </fx:flame>
+    // <fx:fog>
+    if (in.layer.z < -1.5) {
+        return fx_fog(in);
+    }
+    // </fx:fog>
     let six = in.layer.z > 0.5;
     let back = select(layer, layer + SMOKE_BACK, six);
     let back_next = select(next, next + SMOKE_BACK, six);
@@ -3280,7 +5178,10 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
     let next = select(layer, layer + 1, in.layer.y > 0.0);
     let t = mix(textureSample(fx_atlas, fx_samp, in.uv, layer), textureSample(fx_atlas, fx_samp, in.uv, next), in.layer.y);
     let strength = in.colour.a * t.a * fx_depth_fade(in);
-    return vec4<f32>(aces_fitted(in.colour.rgb * strength), 0.0);
+    // A FLASH (shade 4): its light by its book's own heat, through the
+    // flame's ramp -- white-yellow core, orange body, red thin edges.
+    let light = select(in.colour.rgb, fx_flame(in.colour.rgb, t.r), in.layer.z > 3.5);
+    return vec4<f32>(aces_fitted(light * strength), 0.0);
 }
 "#
         .replace("CUT_VEC4S", &(ATLAS_LAYERS * 4).to_string())
@@ -3331,7 +5232,13 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
 ///   velocity, soft layers (`SOFT_LAYER_CONTRAST`) -- they move themselves
 ///   only where they hide most of what is behind.
 pub fn motion_shader() -> String {
-    let mut s = effects_shader();
+    motion_shader_of(effects_shader())
+}
+
+/// [`motion_shader`] of one of the effects shader's variants
+/// (`FxVariant::shader`): the same checked changes to that text.
+pub fn motion_shader_of(source: String) -> String {
+    let mut s = source;
     let swap = |s: &mut String, from: &str, to: &str, n: usize| {
         assert_eq!(s.matches(from).count(), n, "effects motion twin: `{from}` moved in the effects' shader");
         *s = s.replace(from, to);
@@ -3342,7 +5249,7 @@ pub fn motion_shader() -> String {
     let to = from + s[from..].find(end).expect("effects motion twin: the upright axes moved") + end.len();
     let upright = s[from..to].to_string();
     swap(&mut s, "@group(0) @binding(0) var<uniform> camera: Camera;", "", 1);
-    swap(&mut s, "camera.view_proj[view_slot]", "fx_motion_view()", 2);
+    swap(&mut s, "camera.view_proj[view_slot]", "fx_motion_view()", 4);
     swap(&mut s, "0.75 * fx.depth.w * ", "0.75 * fx.depth.w * fx_pixel_scale * ", 1);
     swap(&mut s, "@vertex fn vs_main(@builtin(vertex_index) vi: u32, inst: IIn) -> VOut", "fn fx_vertex(vi: u32, inst: IIn) -> VOut", 1);
     swap(&mut s, "@fragment fn fs_over(in: VOut) -> @location(0) vec4<f32>", "fn fx_over(in: VOut) -> vec4<f32>", 1);
@@ -3376,15 +5283,18 @@ struct FxMotionOut {{
     @location(3) @interpolate(flat) light_q: vec3<f32>,
     @location(4) @interpolate(flat) layer: vec3<f32>,
     @location(5) at: vec4<f32>,
-    @location(6) @interpolate(flat) soft: f32,
-    @location(7) @interpolate(flat) time: f32,
-    @location(8) @interpolate(flat) flicker: f32,
-    @location(9) curr: vec4<f32>,
-    @location(10) prev: vec4<f32>,
-    // A flame: its height's way up in the previous clip space, and the book
-    // seconds its gas rose since the previous frame.
-    @location(11) @interpolate(flat) gas: vec4<f32>,
-    @location(12) @interpolate(flat) book: f32,
+    // soft, time, flicker, and (a flame) the book seconds its gas rose since
+    // the previous frame -- one slot, because the Quest 3 allows 15
+    // inter-stage locations (0-14) and the host far more: at 16 every
+    // effects motion pipeline was refused on the headset only.
+    @location(6) @interpolate(flat) stfb: vec4<f32>,
+    @location(7) curr: vec4<f32>,
+    @location(8) prev: vec4<f32>,
+    // A flame: its height's way up in the previous clip space.
+    @location(9) @interpolate(flat) gas: vec4<f32>,
+    @location(10) world: vec3<f32>,
+    @location(11) @interpolate(flat) fog_a: vec4<f32>,
+    @location(12) @interpolate(flat) fog_b: vec4<f32>,
 }}
 
 @vertex fn vs_fx_motion(@builtin(vertex_index) vi: u32, inst: IIn, @location(6) motion: vec4<f32>) -> FxMotionOut {{
@@ -3404,17 +5314,22 @@ struct FxMotionOut {{
     out.light_q = n.light_q;
     out.layer = n.layer;
     out.at = n.at;
-    out.soft = n.soft;
-    out.time = n.time;
-    out.flicker = n.flicker;
+    out.stfb = vec4<f32>(n.soft, n.time, n.flicker, 0.0);
     out.curr = n.clip;
     out.prev = b.clip;
+    out.world = n.world;
+    out.fog_a = n.fog_a;
+    out.fog_b = n.fog_b;
     out.gas = vec4<f32>(0.0);
-    out.book = 0.0;
+    // A fog slab: how far its mist drifted since the previous frame (its
+    // pixel's motion is that point's, in `fs_fx_motion_over`).
+    if (inst.params.w < -1.5) {{
+        out.gas = vec4<f32>(motion.xyz * step, 0.0);
+    }}
     if (inst.params.w > 1.5 && inst.params.w < 2.5 && motion.w > 0.0) {{
         let height = 2.0 * inst.centre.w * max(abs(inst.params.z), 1.0);
         out.gas = cam.prev * vec4<f32>(fx_flame_along(inst) * height, 0.0);
-        out.book = motion.w * step;
+        out.stfb.w = motion.w * step;
     }}
     return out;
 }}
@@ -3428,23 +5343,34 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
     v.light_q = in.light_q;
     v.layer = in.layer;
     v.at = in.at;
-    v.soft = in.soft;
-    v.time = in.time;
-    v.flicker = in.flicker;
+    v.soft = in.stfb.x;
+    v.time = in.stfb.y;
+    v.flicker = in.stfb.z;
+    v.world = in.world;
+    v.fog_a = in.fog_a;
+    v.fog_b = in.fog_b;
     return v;
 }}
 
 @fragment fn fs_fx_motion_over(in: FxMotionOut) -> @location(0) vec4<f32> {{
     let shown = fx_over(fx_vout(in));
     var prev = in.prev;
-    if (in.book > 0.0) {{
+    if (in.stfb.w > 0.0) {{
         // Where this height's gas was: lower, as it rose.
         let v = 1.0 - in.uv.y;
-        prev = prev - in.gas * (v - fx_flame_v(v, in.book));
+        prev = prev - in.gas * (v - fx_flame_v(v, in.stfb.w));
+    }}
+    var curr = in.curr;
+    if (in.layer.z < -1.5) {{
+        // A fog slab moves as its mist does -- the point its pixel's mist is
+        // at, drifting with the wind -- not as the quad it is drawn on (a
+        // quarter metre ahead from inside it).
+        curr = cam.curr * vec4<f32>(fx_fog_point, 1.0);
+        prev = cam.prev * vec4<f32>(fx_fog_point - in.gas.xyz, 1.0);
     }}
     let flame = in.layer.z > 1.5 && in.layer.z < 2.5;
     let w = layer_weight(shown.a, select({soft:?}, {bright:?}, flame));
-    return vec4<f32>(motion_of(in.curr, prev).xyz * w, w);
+    return vec4<f32>(motion_of(curr, prev).xyz * w, w);
 }}
 
 @fragment fn fs_fx_motion_screened(in: FxMotionOut) -> @location(0) vec4<f32> {{
@@ -3462,6 +5388,60 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FOG SLAB'S RAYS START AT THIS EYE: `fx_eye` (WGSL) finds the eye
+    /// from its own view-projection -- here the same rows and Cramer's rule
+    /// on a stereo pair's two cameras, which must come back as the two eyes,
+    /// not their middle -- and neither the slab's quad nor its integral reads
+    /// `fx.head` (the middle of the eyes, which painted the mist on its quad:
+    /// "rendering right in my eyes", 2026-10-14).
+    #[test]
+    fn a_fog_slab_integrates_from_each_eye_not_their_middle() {
+        let eye_of = |m: glam::Mat4| {
+            let r = |i: usize| m.row(i);
+            let (r0, r1, r3) = (r(0), r(1), r(3));
+            let c13 = r1.truncate().cross(r3.truncate());
+            let c30 = r3.truncate().cross(r0.truncate());
+            let c01 = r0.truncate().cross(r1.truncate());
+            -(r0.w * c13 + r1.w * c30 + r3.w * c01) / r0.truncate().dot(c13)
+        };
+        let proj = glam::Mat4::from_cols_array(&[0.9, 0.0, 0.0, 0.0, 0.0, 1.1, 0.0, 0.0, 0.08, -0.05, 0.0, -1.0, 0.0, 0.0, 0.03, 0.0]);
+        for (eye, at) in [(Vec3::new(-14.032, 1.6, -24.0), Vec3::new(-26.0, -0.4, -27.0)), (Vec3::new(-13.968, 1.6, -24.0), Vec3::new(-26.0, -0.4, -27.0)), (Vec3::new(3.0, -2.0, 7.5), Vec3::new(3.0, 5.0, 7.6))] {
+            let vp = proj * glam::Mat4::look_at_rh(eye, at, Vec3::Y);
+            assert!((eye_of(vp) - eye).length() < 1e-3, "{eye} came back as {}", eye_of(vp));
+        }
+        let src = effects_shader();
+        let body = |name: &str| {
+            let from = src.find(&format!("fn {name}(")).unwrap();
+            let to = from + src[from..].find("\n}\n").unwrap();
+            src[from..to].to_string()
+        };
+        for f in ["fx_fog_vertex", "fx_fog"] {
+            let b = body(f);
+            assert!(b.contains("fx_eye()") && !b.contains("fx.head"), "{f} must start its rays at this eye");
+        }
+        assert!(motion_shader().contains("curr = cam.curr * vec4<f32>(fx_fog_point, 1.0);"), "a fog slab's motion is its mist's");
+    }
+
+    /// Mist is thickest at dawn, burnt off by mid-morning, all but gone in
+    /// the afternoon, back by the evening and high all night; smooth, and the
+    /// same either side of midnight.
+    #[test]
+    fn mist_follows_the_hour_thick_at_dawn_gone_by_midday() {
+        assert_eq!(mist_conditions(6.0), 1.0);
+        assert!(mist_conditions(10.5) <= 0.05 + 1e-6);
+        assert!(mist_conditions(14.0) < 0.06);
+        assert!((mist_conditions(21.0) - 0.8).abs() < 1e-6);
+        assert!(mist_conditions(2.0) > 0.85 && mist_conditions(23.0) > 0.8);
+        assert!(mist_conditions(9.0) < 0.6 && mist_conditions(9.0) > 0.3, "burning off: {}", mist_conditions(9.0));
+        assert!((mist_conditions(24.0) - mist_conditions(0.0)).abs() < 1e-6 && (mist_conditions(-1.0) - mist_conditions(23.0)).abs() < 1e-6);
+        let mut last = mist_conditions(0.0);
+        for k in 1..=2400 {
+            let m = mist_conditions(k as f32 * 0.01);
+            assert!((m - last).abs() < 0.01, "a step at {}: {last} -> {m}", k as f32 * 0.01);
+            last = m;
+        }
+    }
 
     fn emitter(kind: EffectKind) -> EffectEmitter {
         EffectEmitter {
@@ -3569,35 +5549,209 @@ mod tests {
         }
     }
 
+    /// A foot set down in the shallows at a walk.
     fn step_splash(born: f64) -> Splash {
-        Splash { position: Vec3::new(0.0, 0.0, 0.0), born, speed: 1.3, size: 0.08, sunlit: 1.0, depth: 0.3, seed: 11 }
+        Splash { depth: 0.3, seed: 11, ..Splash::new(Vec3::ZERO, born, Vec3::new(0.0, -2.2, 0.0), 0.05, 3.0) }
+    }
+
+    /// The things the strips show: a pebble, a pistol-sized thing and a crate
+    /// dropped in (from 1 m, 1 m and 2 m), a 9 mm bullet fired down into it at
+    /// 45 degrees, and a wading foot.
+    fn pebble() -> Splash {
+        Splash { depth: 2.0, seed: 3, ..Splash::new(Vec3::ZERO, 0.0, Vec3::new(0.0, -4.4, 0.0), 0.015, 0.035) }
+    }
+    fn pistol() -> Splash {
+        Splash { size: 0.07, mass: 0.9, ..pebble() }
+    }
+    fn crate_box() -> Splash {
+        Splash { velocity: Vec3::new(0.0, -6.3, 0.0), size: 0.4, mass: 30.0, ..pebble() }
+    }
+    fn bullet() -> Splash {
+        Splash { depth: 2.0, seed: 5, ..Splash::projectile(Vec3::ZERO, 0.0, Vec3::new(247.0, -247.0, 0.0), 0.009, 0.008) }
+    }
+    fn foot() -> Splash {
+        Splash { depth: 0.2, seed: 9, ..Splash::new(Vec3::ZERO, 0.0, Vec3::new(-2.3, -1.1, 0.0), 0.05, 3.0) }
     }
 
     #[test]
     fn a_splash_throws_drops_that_rise_fall_back_and_are_gone() {
         let at = seen_from(Vec3::new(0.0, 1.6, 2.0));
-        let s = [step_splash(10.0)];
+        let s = [pistol()];
+        let s = [Splash { born: 10.0, ..s[0] }];
+        let shape = splash_shape(&s[0]);
         let count = |t: f64| simulate_with(&[], &s, t, &at).screened;
         assert_eq!(count(9.9), 0, "nothing before it struck");
         assert!(count(10.15) >= 12, "drops in the air: {}", count(10.15));
-        assert_eq!(count(10.0 + SPLASH_SECONDS as f64 + 0.01), 0, "all fallen back");
+        assert_eq!(count(10.0 + shape.seconds as f64 + 0.01), 0, "all fallen back");
+        assert!(shape.seconds <= SPLASH_SECONDS);
         // Every drop is above the surface, and some rise a hand high.
         let f = simulate_with(&[], &s, 10.2, &at);
         let ys: Vec<f32> = f.instances[f.over as usize..].iter().map(|i| i.centre[1]).collect();
         assert!(ys.iter().all(|&y| y >= -1e-3), "{ys:?}");
         assert!(ys.iter().cloned().fold(0.0, f32::max) > 0.05, "{ys:?}");
-        assert!(f.over >= 2, "spray where it struck");
+        assert!(f.over >= 5, "its crown, in pieces: {}", f.over);
+    }
+
+    /// THE SCALING LAWS. A slow thing's cavity is held shut by the water's
+    /// weight, so it grows as the cube root of the drag's work -- as
+    /// (v R)^(2/3) -- and everything keeps the time water takes to fall
+    /// across it, the root of its size: a big splash is a slow one.
+    #[test]
+    fn a_cavity_grows_as_its_froude_number_and_a_bigger_splash_is_slower() {
+        // Heavy, so the thing's energy is not what limits it.
+        let heavy = |speed: f32, size: f32| Splash { velocity: Vec3::new(0.0, -speed, 0.0), size, mass: 1e4 * size.powi(3), ..pebble() };
+        let (a, b) = (splash_shape(&heavy(3.0, 0.05)), splash_shape(&heavy(6.0, 0.05)));
+        // Twice the speed, well past the thing's own width: 2^(2/3) = 1.59.
+        let grows = (b.cavity - 0.02) / (a.cavity - 0.02);
+        assert!((1.45..1.75).contains(&grows), "cavity {} -> {} ({grows})", a.cavity, b.cavity);
+        // The same Froude number at four times the size: four times the
+        // cavity, twice as slow; its sheet at least twice as fast and its
+        // crown at least four times as high -- and more, since what the
+        // bigger thing throws off its shoulder surface tension holds back
+        // less.
+        let (small, big) = (splash_shape(&heavy(3.0, 0.03)), splash_shape(&heavy(6.0, 0.12)));
+        assert!((big.cavity / small.cavity - 4.0).abs() < 0.2, "{} vs {}", big.cavity, small.cavity);
+        assert!((big.collapse / small.collapse - 2.0).abs() < 0.1, "{} vs {}", big.collapse, small.collapse);
+        assert!((1.9..5.0).contains(&(big.sheet_speed / small.sheet_speed)), "{} vs {}", big.sheet_speed, small.sheet_speed);
+        assert!((3.4..25.0).contains(&(big.crown_height / small.crown_height)), "{} vs {}", big.crown_height, small.crown_height);
+        // A pebble's sheet leaves at about a quarter of the pebble's speed;
+        // a crate's at over half the crate's.
+        let (p, c) = (splash_shape(&pebble()), splash_shape(&crate_box()));
+        assert!((0.18..0.32).contains(&(p.sheet_speed / 4.4)) && (0.5..0.8).contains(&(c.sheet_speed / 6.3)), "{} {}", p.sheet_speed, c.sheet_speed);
+        assert!(big.ring_wavelength > 3.5 * small.ring_wavelength && big.ring_speed > 1.5 * small.ring_speed);
+        // Lowered in, nothing: no cavity past its own width, no sheet.
+        let lowered = splash_shape(&heavy(0.05, 0.05));
+        // (Its rings are a fraction of a millimetre: the water it pushes
+        // aside as it settles.)
+        assert!(lowered.sheet_speed < 0.02 && lowered.cavity < 0.0501 && lowered.ring_height < 1e-3, "{lowered:?}");
+        let at = seen_from(Vec3::new(0.0, 1.6, 2.0));
+        assert_eq!(simulate_with(&[], &[heavy(0.05, 0.05)], 0.1, &at).instances.len(), 0);
+    }
+
+    /// WHAT STRUCK DECIDES WHAT IS SEEN, each from the one model: a pebble a
+    /// small crown and a thin jet; a crate a wide low wall of water, slower,
+    /// and no jet (it stays in its own cavity); a bullet a sealed cavity a
+    /// few centimetres wide, shut in milliseconds, its water thrown as mist
+    /// and a thin tall jet; a wading foot a low splash thrown ahead of it.
+    #[test]
+    fn a_pebble_a_crate_a_bullet_and_a_foot_each_splash_as_what_they_are() {
+        let (p, g, c, b, f) = (splash_shape(&pebble()), splash_shape(&pistol()), splash_shape(&crate_box()), splash_shape(&bullet()), splash_shape(&foot()));
+        // In order of size: cavity, time, crown, rings.
+        assert!(p.cavity < g.cavity && g.cavity < c.cavity, "{} {} {}", p.cavity, g.cavity, c.cavity);
+        assert!(p.collapse < g.collapse && g.collapse < c.collapse);
+        assert!(p.crown_height < g.crown_height && g.crown_height < c.crown_height);
+        assert!(p.ring_wavelength < g.ring_wavelength && g.ring_wavelength < c.ring_wavelength);
+        assert!((0.02..0.08).contains(&p.cavity) && (0.1..0.25).contains(&g.cavity) && (0.5..1.0).contains(&c.cavity));
+        // The pebble and the pistol leave their cavities behind and it throws
+        // a jet; the crate floats in its own.
+        assert!(p.jet_height > 0.08 && p.jet_width < 0.012, "{p:?}");
+        assert!(g.jet_height > 0.1 && g.jet_width > p.jet_width);
+        assert_eq!(c.jet_height, 0.0, "{c:?}");
+        // The bullet: sealed, narrow for its speed, quick, fine, tall and thin.
+        assert!(b.sealed > 0.99 && b.cavity < 0.1 && b.collapse < 0.02, "{b:?}");
+        assert!(b.fine > 0.95 && b.drop < 5e-4 && b.petals == 0);
+        assert!(b.jet_height > 0.5 && b.jet_width < 0.015 && b.mist >= 4, "{b:?}");
+        assert!(p.sealed == 0.0 && p.fine == 0.0 && p.drop > 1.5e-3);
+        // The foot: low, and leaning the way it was going.
+        assert!(f.crown_height < 0.1 && f.jet_height < 0.15, "{f:?}");
+        assert!(f.forward.x < -0.8 && f.carry.x < -0.5);
+        // Shallow water holds no cavity: no jet, and its sheet goes out flat.
+        let ankle = splash_shape(&Splash { depth: 0.03, ..pistol() });
+        assert!(ankle.jet_height < 0.01 && ankle.sheet_angle < g.sheet_angle - 0.4, "{ankle:?}");
+        // A light thing of the same size and speed digs less.
+        let cork = splash_shape(&Splash { mass: 0.02, ..pistol() });
+        assert!(cork.cavity < 0.8 * g.cavity && cork.crown_height < 0.5 * g.crown_height, "{} vs {}", cork.cavity, g.cavity);
     }
 
     #[test]
     fn a_harder_strike_throws_more_and_higher() {
         let at = seen_from(Vec3::new(0.0, 1.6, 2.0));
-        let soft = [step_splash(0.0)];
-        let hard = [Splash { speed: 4.0, size: 0.15, ..step_splash(0.0) }];
-        let (a, b) = (simulate_with(&[], &soft, 0.25, &at), simulate_with(&[], &hard, 0.25, &at));
-        let top = |f: &EffectFrame| f.instances[f.over as usize..].iter().map(|i| i.centre[1]).fold(0.0, f32::max);
+        let soft = [pebble()];
+        let hard = [pistol()];
+        let (a, b) = (simulate_with(&[], &soft, 0.12, &at), simulate_with(&[], &hard, 0.12, &at));
+        let top = |f: &EffectFrame| f.instances[..f.over as usize].iter().map(|i| i.centre[1] + i.centre[3]).fold(0.0, f32::max);
         assert!(b.screened > 2 * a.screened, "{} vs {}", b.screened, a.screened);
-        assert!(top(&b) > 2.0 * top(&a), "{} vs {}", top(&b), top(&a));
+        assert!(top(&b) > 1.3 * top(&a), "{} vs {}", top(&b), top(&a));
+        let (p, g) = (splash_shape(&pebble()), splash_shape(&pistol()));
+        assert!(g.crown_height > 1.8 * p.crown_height && g.spray >= p.spray, "{} vs {}", g.crown_height, p.crown_height);
+    }
+
+    /// What a foot throws goes the way the foot was going.
+    #[test]
+    fn a_glancing_strike_throws_its_water_ahead() {
+        let at = seen_from(Vec3::new(0.0, 1.6, 2.0));
+        let f = simulate_with(&[], &[foot()], 0.12, &at);
+        let drops = &f.instances[f.over as usize..];
+        assert!(drops.len() >= 8, "{}", drops.len());
+        let ahead = drops.iter().map(|d| d.motion[0]).sum::<f32>() / drops.len() as f32;
+        assert!(ahead < -0.15, "the drops' mean speed along its way: {ahead}");
+    }
+
+    /// The same strike is the same splash at every moment, and another seed
+    /// is another splash: no two alike.
+    #[test]
+    fn a_splash_is_the_same_every_time_and_no_two_are_alike() {
+        let at = seen_from(Vec3::new(0.0, 1.6, 2.0));
+        let a = simulate_with(&[], &[pistol()], 0.1, &at);
+        let b = simulate_with(&[], &[pistol()], 0.1, &at);
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&a.instances), bytemuck::cast_slice::<_, u8>(&b.instances));
+        let other = simulate_with(&[], &[Splash { seed: 4, ..pistol() }], 0.1, &at);
+        assert_eq!(a.over, other.over);
+        let crown = |f: &EffectFrame| -> Vec<[f32; 4]> { f.instances[..f.over as usize].iter().filter(|i| i.params[1] >= CROWN_LAYER as f32).map(|i| i.params).collect() };
+        let (ca, cb) = (crown(&a), crown(&other));
+        assert!(ca.len() >= 5 && ca != cb, "another seed's crown is other pieces, turned otherwise");
+        let moved = a.instances.iter().zip(&other.instances).filter(|(x, y)| (Vec3::from_slice(&x.centre[..3]) - Vec3::from_slice(&y.centre[..3])).length() > 0.01).count();
+        assert!(moved * 2 > a.instances.len(), "{moved} of {} moved", a.instances.len());
+    }
+
+    /// BACK TO BACK. A second strike into the first's open cavity, or into
+    /// the churned patch it leaves, does not raise a second clean crown and
+    /// jet through the first: it is told the water was not still (`strike`),
+    /// and throws spray. Far enough off, or long enough after, it is a
+    /// splash like the first. And a pebble does not trouble a crate.
+    #[test]
+    fn a_strike_into_disturbed_water_raises_no_second_crown() {
+        let at = seen_from(Vec3::new(0.0, 1.6, 2.5));
+        let first = pistol();
+        let second = |after: f64, apart: f32| {
+            let mut live = vec![first];
+            strike(&mut live, Splash { born: after, position: Vec3::new(apart, 0.0, 0.0), seed: 21, ..pistol() }, 48);
+            live[1]
+        };
+        let shape = splash_shape(&first);
+        let into_the_hole = second(0.5 * shape.collapse as f64, 0.03);
+        assert!(into_the_hole.calm < 0.05, "{}", into_the_hole.calm);
+        let churned = second(shape.collapse as f64 + 0.3, 0.03);
+        assert!((0.25..0.7).contains(&churned.calm), "{}", churned.calm);
+        assert!(second(0.1, 2.0).calm == 1.0 && second(shape.settle as f64 + 0.1, 0.0).calm == 1.0);
+        // What it throws: no pieces of crown, no jet; fewer drops, lower
+        // rings. But not nothing: spray still, the water it throws white
+        // with the air already in it, and more foam where it struck.
+        let (calm, rough) = (splash_shape(&first), splash_shape(&into_the_hole));
+        assert_eq!(rough.jet_height, 0.0);
+        assert!(rough.drops < calm.drops && rough.ring_height < 0.5 * calm.ring_height);
+        assert!(calm.froth == 0 && rough.froth >= 6 && rough.white > 0.8 && rough.spray >= 3 && rough.foam > calm.foam, "{rough:?}");
+        let pieces = |s: Splash, layers: std::ops::Range<u32>| {
+            let f = simulate_with(&[], &[Splash { born: 0.0, ..s }], 0.08, &at);
+            f.instances[..f.over as usize].iter().filter(|i| layers.contains(&(i.params[1] as u32)) && i.colour[3] > 0.02).count()
+        };
+        assert!(pieces(first, CROWN_LAYER..JET_LAYER) >= 5 && pieces(into_the_hole, CROWN_LAYER..JET_LAYER) == 0);
+        assert!(pieces(first, FROTH_LAYER..ATLAS_LAYERS) == 0 && pieces(into_the_hole, FROTH_LAYER..ATLAS_LAYERS) >= 4);
+        assert!(pieces(into_the_hole, SPRAY_LAYER..FROTH_LAYER) >= 2);
+        // A pebble into a crate's patch is swallowed; a crate onto a
+        // pebble's hardly notices.
+        let mut live = vec![crate_box()];
+        strike(&mut live, Splash { born: 0.2, ..pebble() }, 48);
+        assert!(live[1].calm < 0.05);
+        let mut live = vec![pebble()];
+        strike(&mut live, Splash { born: 0.05, ..crate_box() }, 48);
+        assert!(live[1].calm > 0.95, "{}", live[1].calm);
+        // No more than are kept, the oldest gone first.
+        let mut live = Vec::new();
+        for k in 0..60 {
+            strike(&mut live, Splash { born: k as f64, ..pebble() }, 48);
+        }
+        assert!(live.len() == 48 && live[0].born == 12.0);
     }
 
     #[test]
@@ -3607,25 +5761,289 @@ mod tests {
         let dark = |_: Vec3| Vec3::ZERO;
         let s = [step_splash(0.0)];
         let mean = |head: Vec3| {
-            let f = simulate_with(&[], &s, 0.2, &Surroundings { lights: &sun, ambient: &dark, ..seen_from(head) });
+            let f = simulate_with(&[], &s, 0.1, &Surroundings { lights: &sun, ambient: &dark, ..seen_from(head) });
             let drops = &f.instances[f.over as usize..];
+            assert!(drops.len() >= 6);
             drops.iter().map(|i| i.colour[0]).sum::<f32>() / drops.len().max(1) as f32
         };
         let (into, away) = (mean(Vec3::new(0.0, 0.6, 3.0)), mean(Vec3::new(0.0, 0.6, -3.0)));
         assert!(into > 3.0 * away, "into the sun {into}, with it behind {away}");
         let shaded = [Splash { sunlit: 0.0, ..step_splash(0.0) }];
-        let f = simulate_with(&[], &shaded, 0.2, &Surroundings { lights: &sun, ambient: &dark, ..seen_from(Vec3::new(0.0, 0.6, 3.0)) });
+        let f = simulate_with(&[], &shaded, 0.1, &Surroundings { lights: &sun, ambient: &dark, ..seen_from(Vec3::new(0.0, 0.6, 3.0)) });
         assert!(f.instances.iter().all(|i| i.colour[0] < 1e-6), "a shaded splash has no sun in it");
     }
 
+    /// The height a splash's ring train draws at `dist` from where it struck,
+    /// as `water_pipeline::RING_BLOCK` works it out: the CPU's twin of the
+    /// shader's line, for the tests.
+    fn ring_drawn(r: [f32; 4], w: [f32; 4], dist: f32) -> f32 {
+        let from_rim = (dist - w[2]).max(1e-4);
+        let ph = w[0] * r[2] * r[2] / from_rim;
+        let k = ph / from_rim;
+        if r[3] <= 0.0 || k <= 0.0 {
+            return 0.0;
+        }
+        let t = (from_rim / w[2].max(1e-6)).min(1.0);
+        -r[3] * k * k * k * (-k * (w[1] + k * r[2] * 2.0 * RING_FILM_VISCOSITY)).exp() * t / dist * ph.cos()
+    }
+
+    /// THE RINGS on the water: each splash's own, leaving as its cavity is
+    /// at its widest -- not at the strike -- from its rim; a DISPERSIVE
+    /// train, long waves leading and shorter ones following, so its crests
+    /// crowd together toward the middle and spread apart outward, and it
+    /// thins as it spreads; bigger from a bigger thing. The dimple while the
+    /// cavity is open, the boil after. Of more than the water draws, the
+    /// ones that matter most to the eye, the next sinking away rather than
+    /// vanishing as another lands.
     #[test]
-    fn the_nearest_live_rings_go_to_the_water() {
-        let s: Vec<Splash> = (0..6).map(|k| Splash { position: Vec3::new(k as f32, 0.0, 0.0), ..step_splash(1.0) }).collect();
-        let r = splash_rings::<4>(&s, 2.0, Vec3::new(5.0, 1.6, 0.0));
-        assert_eq!(r.map(|r| r[0]), [5.0, 4.0, 3.0, 2.0]);
-        assert!((r[0][2] - 1.0).abs() < 1e-6 && r[0][3] > 0.5);
-        let gone = splash_rings::<4>(&s, 1.0 + super::super::water_pipeline::RING_SECONDS as f64 + 0.1, Vec3::ZERO);
-        assert!(gone.iter().all(|r| r[3] == 0.0));
+    fn the_rings_that_matter_most_go_to_the_water_and_none_pops() {
+        let head = Vec3::new(0.0, 1.6, 0.0);
+        let shape = splash_shape(&pistol());
+        // Nothing has left before the cavity is at its widest.
+        let early = splash_rings::<4>(&[pistol()], 0.9 * shape.ring_release as f64, head);
+        assert_eq!(early.rings[0][2], 0.0);
+        assert!((0..400).all(|i| ring_drawn(early.rings[0], early.waves[0], 0.01 * i as f32) == 0.0));
+        let one = splash_rings::<4>(&[pistol()], 1.0, head);
+        assert!(one.rings[0][3] > 0.0 && one.rings[1][3] == 0.0, "{one:?}");
+        assert!((one.rings[0][2] - (1.0 - shape.ring_release)).abs() < 1e-5);
+        assert!((one.waves[0][0] - 0.25 * shape.ring_gravity).abs() < 1e-5 && one.waves[0][2] == shape.cavity);
+        assert!(one.pools[0][0] > 0.05, "foam where it struck: {one:?}");
+        // THE TRAIN at 3 s: its crests, inside out. Their spacing grows
+        // outward (dispersion) and the crests' heights fall far out. (A
+        // gravity train's crests are as many as `t sqrt(g k)` turns over its
+        // band: two at one second, six at three.)
+        let three = splash_rings::<4>(&[pistol()], 3.0, head);
+        let profile: Vec<f32> = (0..3000).map(|i| ring_drawn(three.rings[0], three.waves[0], 0.001 * i as f32)).collect();
+        let most = profile.iter().fold(0.0f32, |m, h| m.max(h.abs()));
+        let crests: Vec<usize> = (1..2999).filter(|&i| profile[i] > profile[i - 1] && profile[i] >= profile[i + 1] && profile[i] > 0.01 * most).collect();
+        assert!(crests.len() >= 4, "a train of crests, not one: {crests:?}");
+        let gaps: Vec<usize> = crests.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|g| g[1] >= g[0]), "crests further apart outward: {gaps:?}");
+        let highest = crests.iter().copied().max_by(|a, b| profile[*a].total_cmp(&profile[*b])).unwrap();
+        assert!(profile[*crests.last().unwrap()] < profile[highest] && highest > crests[0], "{crests:?}");
+        // Each crest runs out through the train: a crest a moment later is
+        // further out.
+        let later = splash_rings::<4>(&[pistol()], 3.02, head);
+        let next = (crests[1]..3000).find(|&i| ring_drawn(later.rings[0], later.waves[0], 0.001 * i as f32) > ring_drawn(later.rings[0], later.waves[0], 0.001 * (i - 1) as f32) && ring_drawn(later.rings[0], later.waves[0], 0.001 * i as f32) >= ring_drawn(later.rings[0], later.waves[0], 0.001 * (i + 1) as f32));
+        assert!(next.is_some_and(|n| n > crests[1]));
+        // The cavity's dimple while it is open, its boil (a dome) after.
+        let open = splash_rings::<4>(&[pistol()], 0.5 * shape.collapse as f64, head);
+        let boil = splash_rings::<4>(&[pistol()], (shape.collapse + 0.1) as f64, head);
+        assert!(open.waves[0][3] > 1.0 && boil.waves[0][3] < 0.0, "{open:?} {boil:?}");
+        // Bigger: a wider rim, a bigger train.
+        let big = splash_rings::<4>(&[crate_box()], 1.0, head);
+        let (crate_shape, small) = (splash_shape(&crate_box()), splash_shape(&pebble()));
+        assert!(big.waves[0][2] > one.waves[0][2] && crate_shape.ring_height > shape.ring_height && shape.ring_height > small.ring_height, "{} {} {}", crate_shape.ring_height, shape.ring_height, small.ring_height);
+        assert!(crate_shape.ring_wavelength > shape.ring_wavelength && crate_shape.ring_speed > shape.ring_speed);
+        // All gone in the end.
+        let gone = splash_rings::<4>(&[pistol(), crate_box()], super::super::water_pipeline::RING_SECONDS as f64 + 0.1, head);
+        assert!(gone.rings.iter().all(|r| r[3] == 0.0));
+        // A WADER, a step every half second for five seconds: at no moment
+        // does what the water DRAWS jump -- not as a step lands, not as the
+        // oldest is crowded out of the six drawn. The heights along a line
+        // through the steps, and the foam, sampled every 5 ms, move by no
+        // more than the crests' own running does (a crest moves a sixth of a
+        // radian in 5 ms; one splash crowded out at once was half the peak).
+        const N: usize = super::super::water_pipeline::RINGS;
+        let steps: Vec<Splash> =
+            (0..10).map(|k| Splash { born: 0.5 * k as f64, position: Vec3::new(0.3 * (k % 2) as f32, 0.0, 0.65 * k as f32), seed: k as u64, ..foot() }).collect();
+        let drawn = |t: f64| {
+            let r = splash_rings::<N>(&steps, t, Vec3::new(0.0, 1.6, 3.0));
+            let line: Vec<f32> = (0..160)
+                .map(|j| {
+                    let p = glam::Vec2::new(0.6, -0.5 + 0.045 * j as f32);
+                    (0..N).map(|i| ring_drawn(r.rings[i], r.waves[i], (p - glam::Vec2::new(r.rings[i][0], r.rings[i][1])).length())).sum::<f32>()
+                })
+                .collect();
+            (line, r.pools.iter().map(|x| x[0]).sum::<f32>(), r.rings.iter().filter(|x| x[3] > 1e-9).count())
+        };
+        let peak = (0..1100).map(|k| drawn(0.005 * k as f64).0.iter().fold(0.0f32, |m, h| m.max(h.abs()))).fold(0.0, f32::max);
+        assert!(peak > 1e-4, "{peak}");
+        assert!((0..1100).any(|k| drawn(0.005 * k as f64).2 == N), "the wader fills the water's rings");
+        for k in 0..1100 {
+            let (a, b) = (drawn(0.005 * k as f64), drawn(0.005 * (k + 1) as f64));
+            let jump = a.0.iter().zip(&b.0).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+            assert!(jump < 0.2 * peak, "heights jump at {} s: {jump} of {peak}", 0.005 * k as f64);
+            // (Foam comes as its cavity shuts, in a tenth of a second.)
+            assert!((a.1 - b.1).abs() < 0.1, "foam jumps at {} s: {} -> {}", 0.005 * k as f64, a.1, b.1);
+        }
+    }
+
+    /// A splash far off, or out of sight, costs nothing.
+    #[test]
+    fn a_splash_out_of_range_or_out_of_sight_is_not_drawn() {
+        let near = seen_from(Vec3::new(0.0, 1.6, 3.0));
+        assert!(simulate_with(&[], &[pebble()], 0.1, &near).instances.len() > 5);
+        let far = seen_from(Vec3::new(0.0, 1.6, 200.0));
+        assert_eq!(simulate_with(&[], &[pebble()], 0.1, &far).instances.len(), 0);
+        // A crate's can be seen from much further.
+        assert!(simulate_with(&[], &[crate_box()], 0.2, &far).instances.len() > 5);
+        // Fewer drops drawn the further it is.
+        let mid = seen_from(Vec3::new(0.0, 1.6, 30.0));
+        assert!(simulate_with(&[], &[pistol()], 0.1, &mid).screened * 2 < simulate_with(&[], &[pistol()], 0.1, &near).screened);
+        // In a view looking at it, and not in one looking away.
+        let planes = |at: Vec3| {
+            let vp = glam::Mat4::perspective_rh(1.5, 1.0, 0.03, 1000.0) * glam::Mat4::look_at_rh(Vec3::new(0.0, 1.6, 3.0), at, Vec3::Y);
+            super::super::shadow::frustum_planes(vp)
+        };
+        assert!(splash_seen(&pistol(), 0.1, &[planes(Vec3::ZERO)]));
+        assert!(!splash_seen(&pistol(), 0.1, &[planes(Vec3::new(0.0, 1.6, 9.0))]));
+        assert!(!splash_seen(&pistol(), SPLASH_SECONDS as f64 + 0.1, &[planes(Vec3::ZERO)]));
+        // Everything it throws stays in its box.
+        for s in [pebble(), pistol(), crate_box(), bullet(), foot()] {
+            let (lo, hi) = splash_bounds(&s);
+            for k in 1..40 {
+                let f = simulate_with(&[], &[s], 0.05 * k as f64, &near);
+                for i in &f.instances {
+                    let p = Vec3::from_slice(&i.centre[..3]);
+                    assert!(p.cmpge(lo - Vec3::splat(0.05)).all() && p.cmple(hi + Vec3::splat(0.05)).all(), "{p:?} outside {lo:?}..{hi:?} at {} s", 0.05 * k as f32);
+                }
+            }
+        }
+    }
+
+    /// A LOOK AT A SPLASH'S TEXTURES: `OUT=dir cargo test --release --lib
+    /// save_the_splash_textures -- --ignored` writes `splash_textures.png`,
+    /// the crown's pieces (a row a stage, stood up as they are drawn) and the
+    /// jet's, white over dark water.
+    #[test]
+    #[ignore]
+    fn save_the_splash_textures() {
+        let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
+        let n = ATLAS_SIZE as usize;
+        let cols = (CROWN_VARIANTS + JET_VARIANTS + SPRAY_VARIANTS + FROTH_VARIANTS) as usize;
+        let (w, h) = (cols * n, 3 * n);
+        let mut sheet = vec![0u8; w * h * 4];
+        for stage in 0..3u32 {
+            for c in 0..cols as u32 {
+                let (layer, on_its_side) = if c < CROWN_VARIANTS {
+                    (crown_frame(c, stage), true)
+                } else if c < CROWN_VARIANTS + JET_VARIANTS {
+                    (jet_frame(c - CROWN_VARIANTS, stage), false)
+                } else if c < CROWN_VARIANTS + JET_VARIANTS + SPRAY_VARIANTS {
+                    (spray_frame(c - CROWN_VARIANTS - JET_VARIANTS, stage), false)
+                } else {
+                    (froth_frame(c - CROWN_VARIANTS - JET_VARIANTS - SPRAY_VARIANTS, stage), false)
+                };
+                for y in 0..n {
+                    for x in 0..n {
+                        // Stood up: the stored texel that shows at (x, y).
+                        let (sx, sy) = if on_its_side { (n - 1 - y, x) } else { (x, y) };
+                        let a = layer[(sy * n + sx) * 4 + 3] as f32 / 255.0;
+                        let o = ((stage as usize * n + y) * w + c as usize * n + x) * 4;
+                        let over = |under: f32| ((under * (1.0 - a) + a).powf(1.0 / 2.2) * 255.0) as u8;
+                        sheet[o..o + 4].copy_from_slice(&[over(0.01), over(0.03), over(0.05), 255]);
+                    }
+                }
+            }
+        }
+        image::save_buffer(out.join("splash_textures.png"), &sheet, w as u32, h as u32, image::ExtendedColorType::Rgba8).expect("textures");
+    }
+
+    /// WHITE WATER. A crate's sheet is too thick to draw back into its rim
+    /// and comes down white, in tongues round the rim; a pebble's and a
+    /// pistol's hold together and are clear. And the foam each leaves is
+    /// whitest for a moment -- a patch broken into clumps, never a flat white
+    /// disc (2026-10-14) -- then thinner, then gone -- in a second or two for
+    /// a pebble, three or four for a crate.
+    #[test]
+    fn a_crate_throws_white_water_and_foam_dissolves() {
+        let (p, g, c) = (splash_shape(&pebble()), splash_shape(&pistol()), splash_shape(&crate_box()));
+        assert!(p.broken == 0.0 && p.froth == 0 && g.froth == 0, "{} {}", p.froth, g.froth);
+        assert!(c.broken > 0.6 && c.froth >= 6 && c.white > 0.6, "{c:?}");
+        assert!(p.foam_seconds < g.foam_seconds && g.foam_seconds < c.foam_seconds);
+        assert!((1.2..2.2).contains(&p.foam_seconds) && (3.0..4.5).contains(&c.foam_seconds));
+        let head = Vec3::new(0.0, 1.6, 3.0);
+        let foam = |s: Splash, t: f64| splash_rings::<4>(&[s], t, head).pools[0];
+        // The crate's: over 1 as its cavity shuts, under a half two seconds
+        // on, gone by four; drawn out along its rings more as it goes.
+        let shut = c.collapse as f64 + 0.1;
+        assert!(foam(crate_box(), shut)[0] > 0.5 && foam(crate_box(), 2.0)[0] < 0.4 && foam(crate_box(), 4.3)[0] == 0.0, "{:?}", foam(crate_box(), 2.0));
+        assert!(foam(crate_box(), 2.0)[2] > foam(crate_box(), shut)[2]);
+        assert!(foam(pebble(), 0.25)[0] > 0.2 && foam(pebble(), 1.8)[0] < 0.02, "{:?}", foam(pebble(), 0.25));
+        // It spreads as it thins.
+        assert!(foam(crate_box(), 2.0)[1] < foam(crate_box(), shut)[1]);
+    }
+
+    /// A LEG OR A HAND stays in the cavity it opens: the water cannot shut
+    /// over it, and throws no jet. All else of its splash is the same.
+    #[test]
+    fn what_is_held_in_its_cavity_throws_no_jet() {
+        let free = Splash { depth: 0.6, ..foot() };
+        let held = Splash { held: 1.0, ..free };
+        let (a, b) = (splash_shape(&free), splash_shape(&held));
+        assert!(a.jet_height > 0.05 && b.jet_height == 0.0, "{} {}", a.jet_height, b.jet_height);
+        assert!(a.cavity == b.cavity && a.sheet_speed == b.sheet_speed && a.spray == b.spray);
+    }
+
+    /// THE CAUSAL CHAIN of each of the strikes the user threw on the
+    /// headset (2026-10-14), in numbers: `cargo test --release --lib
+    /// print_the_causal_chain -- --ignored --nocapture`.
+    pub(crate) fn user_strikes() -> [(&'static str, Splash); 6] {
+        let at = |v: Vec3, r: f32, m: f32, depth: f32| Splash { depth, seed: 11, ..Splash::new(Vec3::ZERO, 0.0, v, r, m) };
+        [
+            ("pebble 0.1 kg dropped 1 m", at(Vec3::new(0.0, -4.43, 0.0), 0.021, 0.1, 1.5)),
+            ("fist rock 1 kg thrown", at(Vec3::new(6.0, -6.0, 0.0), 0.045, 1.0, 1.5)),
+            ("boulder 8 kg dropped 1.5 m", at(Vec3::new(0.0, -5.4, 0.0), 0.09, 8.0, 1.5)),
+            ("boulder 8 kg thrown", at(Vec3::new(4.0, -6.0, 0.0), 0.09, 8.0, 1.5)),
+            ("crate 5 kg thrown", at(Vec3::new(3.0, -4.0, 0.0), 0.22, 5.0, 1.5)),
+            ("crate 5 kg bobbing", Splash { held: 1.0, ..at(Vec3::new(0.0, -0.25, 0.0), 0.22, 5.0, 1.5) }),
+        ]
+    }
+
+    #[test]
+    #[ignore]
+    fn print_the_causal_chain() {
+        for (name, s) in user_strikes() {
+            let c = splash_shape(&s);
+            eprintln!(
+                "{name}: cavity {:.3} m wide x {:.3} deep, open {:.0} ms; crown {:.2} m/s at {:.0} deg, {:.3} m high for {:.2} s, broken {:.2}; jet {:.3} m at {:.0} ms; \
+                 RINGS leave at {:.0} ms from a {:.1} mm deep source: middle {:.3} m long at {:.2} m/s, first crest {:.1} mm, seen {:.1} s; \
+                 drops land {:.2} m out (band {:.2}) from {:.0} ms over {:.0} ms, {:.0} a m2; foam {:.2} for {:.1} s",
+                c.cavity, c.depth, c.collapse * 1e3, c.sheet_speed, c.sheet_angle.to_degrees(), c.crown_height, c.crown_seconds, c.broken,
+                c.jet_height, c.collapse * 1e3, c.ring_release * 1e3, c.wave_source * 1e3, c.ring_wavelength, c.ring_speed, c.ring_height * 1e3,
+                ring_seconds(&c), c.drops_land, c.drops_band, c.drops_from * 1e3, c.drops_over * 1e3, c.drops_density, c.foam, c.foam_seconds,
+            );
+        }
+    }
+
+    /// WHAT EACH COSTS: `cargo test --release --lib print_the_splashes --
+    /// --ignored --nocapture` prints, for each of the things in the strips,
+    /// its shape and, seen from 3 m, the most instances it draws at once,
+    /// the most quad area (square metres) and how much of that lies within
+    /// the sprites' cutouts -- what is rasterised.
+    #[test]
+    #[ignore]
+    fn print_the_splashes() {
+        let at = seen_from(Vec3::new(0.0, 1.6, 3.0));
+        // Each layer's cutout as a share of its quad (shoelace, in -1..1).
+        let share: Vec<f32> = cutouts(&atlas_layers())
+            .iter()
+            .map(|c| {
+                let p: Vec<[f32; 2]> = (0..8).map(|k| [c[2 * k], c[2 * k + 1]]).collect();
+                (0..8).map(|k| p[k][0] * p[(k + 1) % 8][1] - p[(k + 1) % 8][0] * p[k][1]).sum::<f32>().abs() / 8.0
+            })
+            .collect();
+        for (name, s) in [("pebble", pebble()), ("pistol", pistol()), ("bullet", bullet()), ("foot", foot()), ("crate", crate_box())] {
+            let shape = splash_shape(&s);
+            let (mut most, mut most_over, mut area, mut drawn) = (0u32, 0u32, 0.0f32, 0.0f32);
+            for k in 0..600 {
+                let f = simulate_with(&[], &[s], 0.005 * k as f64, &at);
+                most = most.max(f.over + f.screened);
+                most_over = most_over.max(f.over);
+                let a: f32 = f.instances[..f.over as usize].iter().map(|i| 4.0 * i.centre[3] * i.centre[3] * i.params[2].abs().max(1.0)).sum();
+                area = area.max(a);
+                // What is drawn of each quad: its cutout's share of it.
+                let d: f32 = f.instances[..f.over as usize].iter().map(|i| 4.0 * i.centre[3] * i.centre[3] * i.params[2].abs().max(1.0) * share[(i.params[1] as usize).min(share.len() - 1)]).sum();
+                drawn = drawn.max(d);
+            }
+            eprintln!(
+                "{name:7} cavity {:.3} m x {:.3} deep, closes in {:.3} s, sealed {:.2}; sheet {:.2} m/s at {:.0} deg, crown {:.3} m for {:.2} s in {} pieces, broken {:.2}; drops {} of {:.2} mm (fine {:.2}), spray +{:.1} m/s; jet {:.3} m high, {:.3} wide; mist {}; rings {:.2} m long at {:.2} m/s, {:.1} mm high; foam {:.2}, settles {:.1} s; lasts {:.2} s | most instances {most} ({most_over} over), quads {area:.3} m2, drawn within their cutouts {drawn:.3} m2",
+                shape.cavity, shape.depth, shape.collapse, shape.sealed, shape.sheet_speed, shape.sheet_angle.to_degrees(), shape.crown_height,
+                shape.crown_seconds, shape.petals, shape.broken, shape.drops, shape.drop * 1e3, shape.fine, shape.spray_speed, shape.jet_height, shape.jet_width,
+                shape.mist, shape.ring_wavelength, shape.ring_speed, shape.ring_height * 1e3, shape.foam, shape.settle, shape.seconds,
+            );
+        }
     }
 
     #[test]
@@ -4242,6 +6660,74 @@ mod tests {
         assert!(fire_glare(&emitter(EffectKind::Smoke), 30.0, Vec3::ZERO, Quat::IDENTITY).is_none());
     }
 
+    /// R2-1, THE DOOR ONTO THE MARBLE HALL: from the hallway, opening the
+    /// hall's door used to start its whole box of dust -- every mote within
+    /// seeing, worked out on the frame the door opened -- though only the
+    /// doorway's slice of the hall is in view. Now: shut, nothing; open, only
+    /// the motes the doorway shows (each the very mote drawn whole), weighed
+    /// by what they fill through it, and RAMPED IN over a few frames from the
+    /// opening, the same motes arriving in their fixed order.
+    #[test]
+    fn a_door_opening_onto_dust_works_out_only_what_its_doorway_shows_ramped_in() {
+        use super::super::portal_cull::CullRoom;
+        use super::super::uniforms::ProbePortal;
+        let head = Vec3::new(0.0, 1.6, 2.5);
+        let view = glam::Mat4::perspective_rh(1.6, 1.0, 0.05, 100.0) * glam::Mat4::look_at_rh(head, Vec3::new(0.0, 1.4, -3.0), Vec3::Y);
+        let views = [super::super::shadow::frustum_planes(view)];
+        let rooms = [
+            CullRoom { id: 1, min: Vec3::new(-1.5, -0.5, -0.5), max: Vec3::new(1.5, 3.5, 5.0), closed: true },
+            CullRoom { id: 2, min: Vec3::new(-8.0, -0.5, -14.0), max: Vec3::new(8.0, 6.0, -0.5), closed: true },
+        ];
+        let door = ProbePortal { min: Vec3::new(-0.6, 0.0, -0.7), max: Vec3::new(0.6, 2.1, -0.3), axis: 2, low: 2, high: 1, wall: None };
+        let dust = [EffectEmitter {
+            id: "hall_dust".into(),
+            position: Vec3::new(0.0, 1.5, -5.0),
+            extent: [Vec3::X * 7.5, Vec3::Y * 1.5, Vec3::Z * 4.4],
+            ..emitter(EffectKind::Dust)
+        }];
+        assert!(emitter_sight(&dust[0], &views, head, &rooms, &[]).is_empty(), "the door shut: out of sight");
+        let sight = vec![emitter_sight(&dust[0], &views, head, &rooms, &[door])];
+        assert!(!sight[0].is_empty(), "the door open: seen through it");
+        let at = seen_from(head);
+        let t = 50.0;
+        let run = |share: &dyn Fn(&EffectEmitter) -> f32, sight: &[Vec<seen::Eye>]| {
+            let shares = Shares { emitter: share, splash: &|_| 1.0, sight };
+            simulate_governed(&dust, &|_| true, &[], None, Some(&shares), t, &at)
+        };
+        let whole = run(&|_| 1.0, &[]);
+        let through = run(&|_| 1.0, &sight);
+        assert!(through.screened > 0 && (through.screened as f32) < 0.4 * whole.screened as f32, "{} of {} motes", through.screened, whole.screened);
+        let same = |a: &EffectInstance, b: &EffectInstance| bytemuck::bytes_of(a) == bytemuck::bytes_of(b);
+        for i in &through.instances {
+            assert!(whole.instances.iter().any(|w| same(w, i)), "a mote through the doorway is the mote drawn whole");
+        }
+        // Nothing the doorway shows is left out.
+        let shown = whole.instances.iter().filter(|w| sight[0].iter().any(|e| e.holds(centre(w), 0.0))).count();
+        let kept = through.instances.iter().filter(|w| sight[0].iter().any(|e| e.holds(centre(w), 0.0))).count();
+        assert_eq!(kept, shown, "every mote in the doorway's view is drawn");
+        // THE GOVERNOR from the opening frame: what it weighs is what the
+        // doorway shows, and the dust ramps in.
+        let lib = stack::EffectLibrary::default();
+        let mut set = stack::BurstSet::default();
+        let narrowed = governor_wants(&dust, &|_| true, &[], &set.splash_measured, head, &sight);
+        let open_room = governor_wants(&dust, &|_| true, &[], &set.splash_measured, head, &[vec![]]);
+        assert!(narrowed[0].count < 0.4 * governor_wants(&dust, &|_| true, &[], &set.splash_measured, head, &[])[0].count, "weighed through the doorway");
+        assert_eq!(open_room[0].fill, 0.0, "nothing in sight weighs nothing");
+        let mut shares = Vec::new();
+        for frame in 0..14 {
+            let now = t + frame as f64 / 72.0;
+            set.frame_with(&lib, now, &views, head, &narrowed);
+            shares.push(set.share_of(emitter_key(&dust[0])));
+        }
+        assert!((shares[0] - 0.1).abs() < 1e-6, "the opening frame works out a tenth: {shares:?}");
+        assert!(shares.windows(2).all(|w| w[1] >= w[0]) && shares[13] == 1.0, "{shares:?}");
+        let first = run(&|_| shares[0], &sight);
+        assert!(first.screened as f32 <= 0.2 * through.screened as f32 + 1.0, "{} of {}", first.screened, through.screened);
+        for i in &first.instances {
+            assert!(through.instances.iter().any(|w| same(w, i)), "the motes ramping in are the same motes");
+        }
+    }
+
     #[test]
     fn an_emitter_out_of_view_or_behind_a_shut_door_is_not_simulated() {
         use super::super::portal_cull::CullRoom;
@@ -4288,6 +6774,59 @@ mod tests {
         let (lo, hi) = with.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
         assert!(hi > 1.03 * lo && hi < 1.25 * alone && lo > 0.8 * alone, "{lo} to {hi}, alone {alone}");
         assert!((0..50).map(|k| glow(&[bed.clone()], 50.0 + k as f64 * 0.05)).all(|g| g == alone), "alone it does not");
+    }
+
+    /// The effects' ambient follows the time of day: the baked light of the
+    /// room a point is in, by how bright that room's photograph is now over
+    /// how it was photographed -- outdoors at dusk a hundredth, a lamplit room
+    /// nearly what it was -- and as baked when no time of day runs.
+    #[test]
+    fn the_rooms_ambient_follows_the_time_of_day() {
+        let level = [[1.0f32; 3]; 9];
+        let room = |volume: u32, lo: Vec3, hi: Vec3| ProbeDesc { centre: 0.5 * (lo + hi), min: lo, max: hi, volume, has_depth: true, room_light: Some(level) };
+        let descs = [room(0, Vec3::splat(-50.0), Vec3::splat(50.0)), room(1, Vec3::ZERO, Vec3::splat(4.0))];
+        let (outdoors, indoors) = (Vec3::new(20.0, 1.0, 20.0), Vec3::splat(2.0));
+        let baked = room_ambient(&descs, outdoors);
+        assert!(baked.x > 0.0);
+        assert_eq!(room_ambient_now(&descs, outdoors, &[], None), baked);
+        // Dusk: the outdoors' photograph at a hundredth, the hall's (lamps) at 0.8.
+        let relit = [0.01, 0.8];
+        assert!((room_ambient_now(&descs, outdoors, &relit, None).x / baked.x - 0.01).abs() < 1e-4);
+        let hall = room_ambient(&descs, indoors);
+        assert!((room_ambient_now(&descs, indoors, &relit, None).x / hall.x - 0.8).abs() < 1e-4, "the smallest room that holds the point is its room");
+        // Past every box, the nearest photograph's; a ratio that is not a number, the bake's.
+        let far = Vec3::new(-200.0, 0.0, -200.0);
+        assert!((room_ambient_now(&descs, far, &relit, None).x / room_ambient(&descs, far).x - 0.01).abs() < 1e-4);
+        assert_eq!(room_ambient_now(&descs, outdoors, &[f32::NAN, 1.0], None), baked);
+    }
+
+    /// Past every box, out in the open, the light is the OUTDOOR volume's
+    /// (its photographs have no distances), not that of whichever room's
+    /// photograph is nearest -- the pond past the outdoor box was lit as if
+    /// indoors (2026-10-14).
+    #[test]
+    fn out_in_the_open_past_every_box_the_light_is_the_outdoors() {
+        let photo = |volume: u32, lo: Vec3, hi: Vec3, depth: bool, v: f32| ProbeDesc { centre: 0.5 * (lo + hi), min: lo, max: hi, volume, has_depth: depth, room_light: Some([[v; 3]; 9]) };
+        // A sunlit outdoors (box x, z 0..40) and a dim room nearer the pond.
+        let descs = [photo(0, Vec3::new(0.0, -5.0, 0.0), Vec3::new(40.0, 20.0, 40.0), false, 2.0), photo(1, Vec3::new(-12.0, 0.0, -12.0), Vec3::new(-4.0, 4.0, -4.0), true, 0.05)];
+        let pond = Vec3::new(-20.0, 0.0, -20.0);
+        let open = 2.0 * 0.282_095;
+        assert!((room_ambient_now(&descs, pond, &[], None).x - open).abs() < 1e-4, "{:?}", room_ambient_now(&descs, pond, &[], None));
+        assert!((room_ambient_now(&descs, pond, &[0.5, 1.0], None).x - 0.5 * open).abs() < 1e-4);
+        // Inside the room, the room's; inside the outdoor box, the outdoors'.
+        assert!((room_ambient_now(&descs, Vec3::new(-8.0, 2.0, -8.0), &[], None).x - 0.05 * 0.282_095).abs() < 1e-4);
+        assert!((room_ambient_now(&descs, Vec3::new(20.0, 1.0, 20.0), &[], None).x - open).abs() < 1e-4);
+        // A CAVE dug under a hill past every box is not the open air: its
+        // bonfire's smoke stood pale grey in the sky's light (2026-10-14). A
+        // hill 14 m high west of x = -25 over a plain at 0.
+        let hill = super::super::ground_map::HeightGrid::sample(glam::Vec2::splat(-60.0), glam::Vec2::splat(60.0), 121, 121, |x, _| if x < -25.0 { 14.0 } else { 0.0 });
+        let in_cave = Vec3::new(-30.0, 0.5, -20.0);
+        let dim = room_ambient(&descs, in_cave).x;
+        assert!((room_ambient_now(&descs, in_cave, &[], Some(&hill)).x - dim).abs() < 1e-4, "the cave keeps its nearest room's light");
+        assert!(dim < 0.2 * open);
+        // The pond on the plain, and a puff on the hill's top, are open.
+        assert!((room_ambient_now(&descs, pond, &[], Some(&hill)).x - open).abs() < 1e-4);
+        assert!((room_ambient_now(&descs, Vec3::new(-30.0, 14.3, -20.0), &[], Some(&hill)).x - open).abs() < 1e-4);
     }
 
     #[test]
@@ -4507,9 +7046,22 @@ mod tests {
                 ..emitter(EffectKind::Dust)
             },
         ];
-        let splashes = [Splash { position: Vec3::new(-1.0, 0.0, 1.0), born: 9.8, speed: 2.5, size: 0.08, sunlit: 1.0, depth: 0.3, seed: 7 }];
+        // One of each thing a splash can be, so the port's every branch is
+        // held: a dropped weight; a pebble's clear crown and thin jet; a
+        // bullet's sealed plume; a wading foot's plough (held: no jet); a
+        // crate's white water; a strike into water already churned, in shade.
+        let splashes = [
+            Splash { depth: 0.3, seed: 7, ..Splash::new(Vec3::new(-1.0, 0.0, 1.0), 9.8, Vec3::new(0.0, -2.5, 0.0), 0.08, 3.0) },
+            Splash { depth: 2.0, seed: 3, ..Splash::new(Vec3::new(1.5, 0.0, 1.5), 9.85, Vec3::new(0.0, -4.4, 0.0), 0.015, 0.035) },
+            Splash { depth: 2.0, seed: 5, ..Splash::projectile(Vec3::new(-2.5, 0.0, 0.5), 9.9, Vec3::new(247.0, -247.0, 0.0), 0.009, 0.008) },
+            Splash { depth: 0.2, held: 1.0, seed: 9, ..Splash::new(Vec3::new(0.5, 0.0, 2.0), 9.85, Vec3::new(-2.3, -1.1, 0.4), 0.07, 3.0) },
+            Splash { depth: 0.5, seed: 13, ..Splash::new(Vec3::new(-3.0, 0.0, -1.0), 9.7, Vec3::new(0.0, -6.3, 0.0), 0.4, 30.0) },
+            Splash { depth: 1.0, calm: 0.15, sunlit: 0.4, seed: 21, ..Splash::new(Vec3::new(2.5, 0.0, -0.5), 9.9, Vec3::new(0.0, -4.4, 0.0), 0.07, 0.9) },
+        ];
         let mut frames = Vec::new();
-        for (time, yaw, offset) in [(10.0f64, 0.0f32, Vec3::ZERO), (10.35, 0.0, Vec3::ZERO), (23.7, 0.9, Vec3::new(1.0, 0.0, -2.0))] {
+        for (time, yaw, offset) in
+            [(10.0f64, 0.0f32, Vec3::ZERO), (10.35, 0.0, Vec3::ZERO), (10.2, 0.9, Vec3::new(1.0, 0.0, -2.0)), (23.7, 0.9, Vec3::new(1.0, 0.0, -2.0))]
+        {
             let head = Vec3::new(0.3, 1.6, 3.0);
             let at = Surroundings { head, offset, yaw_inv: Quat::from_rotation_y(-yaw), lights: &lights, ambient: &ambient, exposure: 1.3, ..seen_from(head) };
             let f = simulate_with(&emitters, &splashes, time, &at);
@@ -4542,12 +7094,13 @@ mod tests {
                 },
             })).collect::<Vec<_>>(),
             "splashes": splashes.iter().map(|s| serde_json::json!({
-                "position": s.position.to_array(), "born": s.born, "speed": s.speed, "size": s.size, "sunlit": s.sunlit, "depth": s.depth, "seed": s.seed.to_string(),
+                "position": s.position.to_array(), "born": s.born, "velocity": s.velocity.to_array(), "size": s.size, "mass": s.mass,
+                "sunlit": s.sunlit, "depth": s.depth, "calm": s.calm, "held": s.held, "seed": s.seed.to_string(),
             })).collect::<Vec<_>>(),
             "frames": frames,
         });
         std::fs::write(out.join("effects_golden.json"), serde_json::to_string(&golden).unwrap()).expect("golden");
-        eprintln!("wrote the atlas ({} layers), cutouts and {} golden frames to {}", layers.len(), 3, out.display());
+        eprintln!("wrote the atlas ({} layers), cutouts and {} golden frames to {}", layers.len(), golden["frames"].as_array().map_or(0, |f| f.len()), out.display());
     }
 
     /// A LOOK AT THE TEXTURES: `OUT=dir cargo test --release --lib
@@ -4968,7 +7521,9 @@ mod tests {
             ("embers", 7.3, 1e-3, Box::new(|t| simulate(std::slice::from_ref(&embers), t, &at))),
             ("dust", 20.0, 0.01, Box::new(|t| simulate(std::slice::from_ref(&dust), t, &at))),
             ("smoke", 9.0, 1e-3, Box::new(|t| simulate(std::slice::from_ref(&smoke), t, &at))),
-            ("splash", 0.25, 1e-3, Box::new(|t| simulate_with(&[], &[step_splash(0.0)], t, &at))),
+            ("splash", 0.1, 1e-3, Box::new(|t| simulate_with(&[], &[pistol()], t, &at))),
+            ("splash's jet", 0.33, 1e-3, Box::new(|t| simulate_with(&[], &[pistol()], t, &at))),
+            ("bullet's splash", 0.2, 1e-3, Box::new(|t| simulate_with(&[], &[bullet()], t, &at))),
         ];
         for (label, t, h, frame) in &cases {
             let (found, moving) = check(label, *t, *h, frame.as_ref(), false);

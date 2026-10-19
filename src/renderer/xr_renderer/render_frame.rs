@@ -26,6 +26,9 @@ struct MeshDraw<'a> {
     count: u32,
     thin: Option<&'a crate::renderer::mesh::ThinParts>,
     blended: bool,
+    /// Its mesh's bounding sphere where the model matrix puts it (player
+    /// frame), for the scene pass's cull. See `scene_cull`.
+    bound: glam::Vec4,
 }
 
 /// A layered draw needs no texture bind group: every layered mesh in a scene
@@ -35,6 +38,13 @@ type LayeredDraw<'a> = (
     &'a wgpu::Buffer,
     &'a wgpu::Buffer,
     u32,
+    // Where its triangle classes end, when its model keeps the vertical the
+    // classes were found under. See `cave_twins`.
+    Option<[u32; 4]>,
+    // Its box where its model puts it, player frame
+    // (`cave_twins::placed_box`): for the reflection pass's occluder and the
+    // scene pass's cull.
+    (glam::Vec3, glam::Vec3),
 );
 
 type SkinnedDraw<'a> = (
@@ -44,7 +54,34 @@ type SkinnedDraw<'a> = (
     &'a wgpu::Buffer,
     &'a wgpu::Buffer,
     u32,
+    // See-through (`SkinnedMeshPrimitive::blended`): the eye pass draws it
+    // blended, after the opaque parts. See `Levers::opaque_models`.
+    bool,
 );
+
+/// One frame of `wgpu::hal::vulkan::DRAW_LOG`: set from here to the end of
+/// the frame's recording, whichever way it is left.
+struct DrawLogFrame(bool);
+
+impl DrawLogFrame {
+    fn begin() -> Self {
+        let on = crate::renderer::levers::DRAW_LOG_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if on {
+            log::warn!("DRAWLOG frame start");
+            wgpu::hal::vulkan::DRAW_LOG.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Self(on)
+    }
+}
+
+impl Drop for DrawLogFrame {
+    fn drop(&mut self) {
+        if self.0 {
+            wgpu::hal::vulkan::DRAW_LOG.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::warn!("DRAWLOG frame end");
+        }
+    }
+}
 
 fn push_mesh_draws<'a>(
     instance: &'a MeshInstance,
@@ -52,6 +89,7 @@ fn push_mesh_draws<'a>(
     mesh_draws: &mut Vec<MeshDraw<'a>>,
     skinned_draws: &mut Vec<SkinnedDraw<'a>>,
     layered_draws: &mut Vec<LayeredDraw<'a>>,
+    baked_cave_draws: &mut Vec<crate::renderer::baked_cave::BakedCaveDraw<'a>>,
 ) {
     if let Some(skin) = &instance.mesh.skin {
         if let Some(joint_bg) = &skin.joint_bind_group {
@@ -63,6 +101,7 @@ fn push_mesh_draws<'a>(
                     &prim.vertex_buffer,
                     &prim.index_buffer,
                     prim.indices.len() as u32,
+                    prim.blended,
                 ));
             }
         }
@@ -77,7 +116,26 @@ fn push_mesh_draws<'a>(
                     &layered.vertex_buffer,
                     &prim.index_buffer,
                     prim.indices.len() as u32,
+                    crate::renderer::cave_twins::keeps_vertical(instance.mesh.model_matrix())
+                        .then_some(layered.twin_ends),
+                    crate::renderer::cave_twins::placed_box(instance.mesh.model_matrix(), layered.bounds),
                 ));
+                continue;
+            }
+            // A baked cave, by its own pipeline and in its chunks (`baked_cave`).
+            if let Some(cave) = &prim.baked_cave {
+                let placed = instance.mesh.model_matrix();
+                baked_cave_draws.push(crate::renderer::baked_cave::BakedCaveDraw {
+                    model: &instance.model.bind_group,
+                    lightmap: lightmap_bg,
+                    vertices: &cave.vertex_buffer,
+                    indices: &prim.index_buffer,
+                    index_count: prim.indices.len() as u32,
+                    chunks: &cave.chunks,
+                    emissive: cave.emissive,
+                    placed,
+                    bounds: crate::renderer::cave_twins::placed_box(placed, cave.bounds),
+                });
                 continue;
             }
             mesh_draws.push(MeshDraw {
@@ -89,6 +147,7 @@ fn push_mesh_draws<'a>(
                 count: prim.indices.len() as u32,
                 thin: prim.thin.as_ref(),
                 blended: prim.blended,
+                bound: crate::renderer::shadow::mesh_caster_bound(&instance.mesh),
             });
         }
     }
@@ -144,6 +203,8 @@ impl XrRenderer {
         mirror: Option<MirrorSurface>,
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
+        // MEASUREMENT: this frame's draws logged, when `Levers::draw_log` asked.
+        let _draw_log = DrawLogFrame::begin();
         // THE TIME OF DAY first: everything below reads the sky, its light
         // and the brush atlas it relights. See `xr_renderer::time_of_day`.
         self.update_time_of_day();
@@ -262,8 +323,13 @@ impl XrRenderer {
         let cam_up = head_rot * glam::Vec3::Y;
         let view_dir = head_rot * glam::Vec3::NEG_Z;
 
+        // (Timed, with the bytes it sends: `WindowRecord::cpu`.)
+        let geometry_clock = std::time::Instant::now();
         let (mut solid_verts, mut solid_idx, mut solid_ranges) =
             build_solid_mesh_with_ranges(cuboids);
+        // The ground, when it is kept on the GPU rather than appended to the
+        // frame's solid mesh (`Levers::ground_buffers`).
+        let mut kept_ground: Option<(&[SolidVertex], &[u32])> = None;
 
         // Terrain appends into the SAME buffers as the cuboids -- the terrain
         // pipeline takes SolidVertex too, so one vertex buffer serves both and
@@ -285,51 +351,86 @@ impl XrRenderer {
                 // terrain, so the scene pass can draw them with the ground's
                 // slope twins. The same triangles in each chunk's range, so
                 // every other pass is unchanged. See `ground_twins`.
-                let threshold = self.terrain_settings.biplanar_start_deg;
-                if self.terrain_gentle.is_some()
-                    && !self.slope_split.as_ref().is_some_and(|s| s.is_for(terrain_verts, terrain_idx, terrain_chunks, threshold))
-                {
-                    let started = std::time::Instant::now();
-                    let split = crate::renderer::ground_twins::SlopeSplit::new(terrain_verts, terrain_idx, terrain_chunks, threshold);
-                    log::info!(
-                        "SLOPES: {:.1}% of the ground's triangles are gentle (under {:.0} degrees), {:.1}% steep (over {:.0}) over {} chunk(s), {:.1} ms",
-                        100.0 * split.gentle_total as f64 / terrain_idx.len().max(1) as f64,
-                        threshold - crate::renderer::ground_twins::GENTLE_MARGIN_DEG,
-                        100.0 * split.steep_total as f64 / terrain_idx.len().max(1) as f64,
-                        threshold + crate::renderer::ground_twins::GENTLE_MARGIN_DEG,
-                        split.gentle.len(),
-                        started.elapsed().as_secs_f64() * 1000.0,
-                    );
-                    self.slope_split = Some(split);
-                }
+                // ... AND, WITHIN EACH SLOPE CLASS, BY WHAT THE REFLECTION PASS
+                // MAY DRAW A TRIANGLE WITH -- its outdoor twin, its nowhere
+                // twin, or the pass itself -- from the level's whole probe
+                // table, in the world's frame. See `outdoor_pass::LevelGround`.
+                // MADE AT THE LEVEL'S LOAD (`XrRenderer::prepare_ground`, the
+                // same call): a frame finds it made, and makes it here only
+                // when the ground or the probe table is another since.
+                self.prepare_ground(terrain_verts, terrain_idx, terrain_chunks, "in a frame");
                 let terrain_idx: &[u32] = match &self.slope_split {
                     Some(split) if self.terrain_gentle.is_some() => &split.indices,
                     _ => terrain_idx,
                 };
-                let base = solid_verts.len() as u32;
-                let index_start = solid_idx.len() as u32;
-                solid_verts.extend_from_slice(terrain_verts);
-                solid_idx.extend(terrain_idx.iter().map(|i| i + base));
-                solid_ranges.push((None, index_start, terrain_idx.len() as u32, 0.0));
-                terrain_range = Some((index_start, terrain_idx.len() as u32));
+                if self.levers.ground_buffers {
+                    // FIRST in buffers that outlive the frame, its indices its
+                    // own: the cuboids' ranges move past it. See `static_solid`.
+                    terrain_range = crate::renderer::static_solid::ranges_after_ground(&mut solid_ranges, terrain_idx.len() as u32);
+                    kept_ground = Some((terrain_verts, terrain_idx));
+                } else {
+                    let base = solid_verts.len() as u32;
+                    let index_start = solid_idx.len() as u32;
+                    solid_verts.extend_from_slice(terrain_verts);
+                    solid_idx.extend(terrain_idx.iter().map(|i| i + base));
+                    solid_ranges.push((None, index_start, terrain_idx.len() as u32, 0.0));
+                    terrain_range = Some((index_start, terrain_idx.len() as u32));
+                }
             }
         }
+        // The solid buffers: kept, and written where they changed; or, with
+        // the lever off, made new from the whole of it as they always were.
+        let mut uploaded: u64 = 0;
+        let (solid_vb, solid_ib, solid_index_count, solid_any) = if self.levers.ground_buffers {
+            let (gv, gi) = kept_ground.unwrap_or((&[], &[]));
+            let written = crate::renderer::static_solid::StaticSolid::update(
+                &mut self.static_solid,
+                &self.wgpu_device,
+                &self.wgpu_queue,
+                kept_ground,
+                // World vertices are the same for every pose: written once.
+                if self.ground_world { (glam::Vec3::ZERO, 0.0) } else { (self.player.offset, self.player.yaw) },
+                &solid_verts,
+                &solid_idx,
+            );
+            uploaded += written.bytes();
+            let kept = self.static_solid.as_ref().expect("update leaves the buffers");
+            (
+                kept.vertices.clone(),
+                kept.indices.clone(),
+                (gi.len() + solid_idx.len()) as u32,
+                gv.len() + solid_verts.len() > 0,
+            )
+        } else {
+            self.static_solid = None;
+            uploaded += std::mem::size_of_val(solid_verts.as_slice()) as u64 + std::mem::size_of_val(solid_idx.as_slice()) as u64;
+            (
+                self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("solid_vb"),
+                    contents: bytemuck::cast_slice(&solid_verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("solid_ib"),
+                    contents: bytemuck::cast_slice(&solid_idx),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+                solid_idx.len() as u32,
+                !solid_verts.is_empty(),
+            )
+        };
         // Terrain indices were rebased into the shared solid buffer, so the
         // chunk offsets have to move with them. Using the raw offsets here
         // would draw whatever happened to sit at that position in the combined
         // buffer -- cuboids, or nothing.
-        let solid_chunks: Vec<crate::renderer::shadow::CasterChunk> = match terrain_range {
-            Some((index_start, _)) => terrain_chunks
-                .iter()
-                .map(|c| crate::renderer::shadow::CasterChunk {
-                    first_index: c.first_index + index_start,
-                    ..*c
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-        let (solid_verts, solid_idx, solid_ranges) = (solid_verts, solid_idx, solid_ranges);
-
+        // (`solid_chunks` is made further down, with the frame's frusta in
+        // hand: it is the ground's chunks THIS FRAME DRAWS, not all of them.)
+        // Whether the ground came in chunks at all. NOT "are any drawn this
+        // frame": a frame that looks at the sky draws none, and must not fall
+        // back to the whole index range -- which holds every chunk, and with
+        // the coarser lists built the same ground several times over.
+        let ground_partitioned = terrain_range.is_some() && !terrain_chunks.is_empty();
+        let solid_ranges = solid_ranges;
         // Empty when the scene has no brushes, or when every one of them has
         // been shot away -- both are ordinary, and both mean no draw rather
         // than a zero-length one.
@@ -339,47 +440,63 @@ impl XrRenderer {
         // part with the smallest reader that gives it the same picture. Every
         // other pass draws the whole range, where the order changes nothing.
         // See `SunFaces`.
+        //
+        // KEPT ACROSS FRAMES (`Levers::brush_buffers`): the split, the two
+        // buffers and the motion pass's runs are made again only when the
+        // brushes handed over are not the ones they were made from -- once a
+        // level where the app hands them over in the world. See
+        // `static_brush`. Off: every frame, as it was.
         let partitioned = match (&self.sun_faces, brush_geometry) {
-            (Some(faces), Some((v, i))) => Some(faces.partition(v, i)),
+            (Some(faces), Some((v, i))) if !self.levers.brush_buffers => Some(faces.partition(v, i)),
             _ => None,
         };
-        let brush_sun_ends = partitioned.as_ref().map_or([0, 0], |(_, ends)| *ends);
-        let brush_buffers = brush_geometry.map(|(v, i)| {
-            let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
-            (
-                self.wgpu_device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("brush_vb"),
-                        contents: bytemuck::cast_slice(v),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                self.wgpu_device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("brush_ib"),
-                        contents: bytemuck::cast_slice(i),
-                        usage: wgpu::BufferUsages::INDEX,
-                    }),
-                i.len() as u32,
-            )
-        });
+        let mut brush_sun_ends = partitioned.as_ref().map_or([0, 0], |(_, ends)| *ends);
+        let brush_buffers = match brush_geometry {
+            Some((v, i)) if self.levers.brush_buffers => {
+                // World vertices are the same for every pose: made once.
+                let pose = if self.brush_world { (glam::Vec3::ZERO, 0.0) } else { (self.player.offset, self.player.yaw) };
+                uploaded += crate::renderer::static_brush::StaticBrushes::update(
+                    &mut self.static_brushes,
+                    &self.wgpu_device,
+                    v,
+                    i,
+                    pose,
+                    self.sun_faces.as_ref(),
+                );
+                let kept = self.static_brushes.as_ref().expect("update leaves the buffers");
+                brush_sun_ends = kept.sun_ends;
+                Some((kept.vertices.clone(), kept.indices.clone(), kept.index_count))
+            }
+            Some((v, i)) => {
+                self.static_brushes = None;
+                let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
+                uploaded += std::mem::size_of_val(v) as u64 + std::mem::size_of_val(i) as u64;
+                Some((
+                    self.wgpu_device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("brush_vb"),
+                            contents: bytemuck::cast_slice(v),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        }),
+                    self.wgpu_device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("brush_ib"),
+                            contents: bytemuck::cast_slice(i),
+                            usage: wgpu::BufferUsages::INDEX,
+                        }),
+                    i.len() as u32,
+                ))
+            }
+            None => {
+                self.static_brushes = None;
+                None
+            }
+        };
+        let brush_sun_ends = brush_sun_ends;
         let (wire_verts, wire_idx) = build_wire_mesh(cuboids);
         let (particle_verts, particle_idx) =
             particle::build_particle_mesh(particles, beams, cam_right, cam_up, view_dir);
 
-        let solid_vb = self
-            .wgpu_device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("solid_vb"),
-                contents: bytemuck::cast_slice(&solid_verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let solid_ib = self
-            .wgpu_device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("solid_ib"),
-                contents: bytemuck::cast_slice(&solid_idx),
-                usage: wgpu::BufferUsages::INDEX,
-            });
         let wire_vb = self
             .wgpu_device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -408,6 +525,12 @@ impl XrRenderer {
                 contents: bytemuck::cast_slice(&particle_idx),
                 usage: wgpu::BufferUsages::INDEX,
             });
+        uploaded += std::mem::size_of_val(wire_verts.as_slice()) as u64
+            + std::mem::size_of_val(wire_idx.as_slice()) as u64
+            + std::mem::size_of_val(particle_verts.as_slice()) as u64
+            + std::mem::size_of_val(particle_idx.as_slice()) as u64;
+        self.note_cpu("geometry_ms", geometry_clock.elapsed().as_secs_f64() * 1e3);
+        self.note_cpu("upload_mb", uploaded as f64 / 1_048_576.0);
 
         let head = glam::Vec3::new(
             eye_views[0].pose.position.x,
@@ -488,6 +611,8 @@ impl XrRenderer {
             } else {
                 Vec::new()
             };
+            // And the pools the live lamps throw: a torch close to a wall.
+            let fires: Vec<_> = fires.into_iter().chain(self.lights_uniform.pool_light()).collect();
             let mut eye = self.eye.borrow_mut();
             let mut metered = eye.meter_with(head_world, gaze, &fires);
             // Under the water the eye adapts to the water's own light, which
@@ -521,7 +646,9 @@ impl XrRenderer {
         // frame's display time, lit by this frame's lamps in their emitter's
         // room and by the room's baked light, and drawn after the glass. Here,
         // before the frame's draws borrow the renderer. See `effects`.
-        let mut effects_drawn = effects_on && !(self.effect_emitters.is_empty() && self.splashes.is_empty()) && self.effects_gpu.is_some();
+        let mut effects_drawn =
+            effects_on && !(self.effect_emitters.is_empty() && self.splashes.is_empty() && self.bursts.live.is_empty()) && self.effects_gpu.is_some();
+        self.last_exposure = post.exposure;
         if effects_drawn {
             let yaw = glam::Quat::from_rotation_y(self.player.yaw);
             let (offset, descs) = (self.player.offset, &self.room_descs);
@@ -536,7 +663,14 @@ impl XrRenderer {
             let reaches = |e: &crate::renderer::effects::EffectEmitter, i: usize| {
                 crate::renderer::effects::lamp_in_room(descs, e.position, yaw * lights[i].position + offset)
             };
-            let ambient = |world: glam::Vec3| crate::renderer::effects::room_ambient(descs, world);
+            // The rooms' baked light as the time of day has it now: each
+            // photograph's brightness over what it was photographed at.
+            let relit: Vec<f32> = match self.tod.runtime {
+                Some(_) => self.tod.probe_means.iter().zip(&self.probe_brightness).map(|(m, now)| if m.0 > 0.0 { now / m.0 } else { 1.0 }).collect(),
+                None => Vec::new(),
+            };
+            let ground = self.ground_heights.as_ref();
+            let ambient = |world: glam::Vec3| crate::renderer::effects::room_ambient_now(descs, world, &relit, ground);
             let at = crate::renderer::effects::Surroundings {
                 head: mid_eye,
                 offset,
@@ -575,22 +709,56 @@ impl XrRenderer {
             };
             let rooms: &[crate::renderer::portal_cull::CullRoom] = if lv.portal_culling { &self.cull_rooms } else { &[] };
             let head_world = yaw * mid_eye + offset;
+            // A splash out of both eyes' sight throws nothing to draw.
+            let splashes: Vec<crate::renderer::effects::Splash> =
+                splashes.into_iter().filter(|s| crate::renderer::effects::splash_seen(s, now, &views)).collect();
             self.effect_seen_until.resize(self.effect_emitters.len(), f64::NEG_INFINITY);
+            // Each one's SIGHT: the eyes it is seen through, narrowed to the
+            // doorways it is seen through (`effects::emitter_sight`).
+            let mut sight: Vec<Vec<crate::renderer::effects::seen::Eye>> = Vec::with_capacity(self.effect_emitters.len());
             for (e, until) in self.effect_emitters.iter().zip(self.effect_seen_until.iter_mut()) {
-                if crate::renderer::effects::emitter_seen(e, &views, head_world, rooms, &portals) {
+                let eyes = crate::renderer::effects::emitter_sight(e, &views, head_world, rooms, &portals);
+                if !eyes.is_empty() {
                     *until = now + crate::renderer::effects::EMITTER_HOLD;
                 }
+                sight.push(eyes);
             }
             let held = &self.effect_seen_until;
             let seen = |i: usize| held.get(i).map_or(true, |&t| now <= t);
-            if (0..self.effect_emitters.len()).any(|i| seen(i)) || !splashes.is_empty() {
-                let frame = crate::renderer::effects::simulate_seen(&self.effect_emitters, &seen, &splashes, now, &at);
+            // The event bursts: given this frame's clock, culled by their
+            // travel bounds, thinned if the frame is over (`BurstSet::frame`).
+            // The placed emitters and splashes in view are weighed with them
+            // by the one governor: far and small shed first, whatever kind.
+            let wants = crate::renderer::effects::governor_wants(&self.effect_emitters, &seen, &splashes, &self.bursts.splash_measured, head_world, &sight);
+            // A fog slab's density follows the hour while a time of day runs.
+            self.bursts.mist_hour = self.time_of_day_hour();
+            let bursts_drawn = self.bursts.frame_with(&self.effect_library, now, &views, head_world, &wants);
+            if (0..self.effect_emitters.len()).any(|i| seen(i)) || !splashes.is_empty() || bursts_drawn.contains(&true) {
+                let bursts = crate::renderer::effects::stack::BurstFrame { lib: &self.effect_library, set: &self.bursts, drawn: &bursts_drawn };
+                let set = &self.bursts;
+                let shares = crate::renderer::effects::Shares {
+                    emitter: &|e| set.share_of(crate::renderer::effects::emitter_key(e)),
+                    splash: &|s| set.share_of(crate::renderer::effects::splash_key(s)),
+                    sight: &sight,
+                };
+                let frame = crate::renderer::effects::simulate_governed(&self.effect_emitters, &seen, &splashes, Some(&bursts), Some(&shares), now, &at);
+                self.burst_count = frame.bursts;
+                self.bursts.measured(&frame.splash_costs);
+                let (s, c) = (&self.bursts.stats, &frame.bursts);
+                if self.shadow_diag_frames.get() % 180 == 0 && (s.fill_wanted > s.fill + 1e-4 || s.instances_wanted > s.instances + 0.5) {
+                    log::info!(
+                        "EFFECTS GOVERNOR fill {:.2} of {:.2} wanted, instances {:.0} of {:.0} | thinned bursts {} emitters {} splashes {} | shed bursts {} emitters {} splashes {} | frames governed {}",
+                        s.fill, s.fill_wanted, s.instances, s.instances_wanted, s.thinned, s.emitters_thinned, s.splashes_thinned, c.shed, c.emitter_shed, c.splash_shed, s.frames_governed
+                    );
+                }
                 if let Some(gpu) = self.effects_gpu.as_mut() {
+                    (gpu.use_variants, gpu.overdraw) = (lv.effect_variants, lv.effects_overdraw);
                     gpu.upload(&self.wgpu_device, &self.wgpu_queue, &frame);
                 }
             } else {
                 effects_drawn = false;
             }
+            self.bursts.end_frame();
         }
 
         // THE WEATHER'S VIEW: the head, its axes, the sky's and sun's light,
@@ -658,6 +826,7 @@ impl XrRenderer {
         let mut mesh_draws: Vec<MeshDraw> = Vec::new();
         let mut skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut layered_draws: Vec<LayeredDraw> = Vec::new();
+        let mut baked_cave_draws: Vec<crate::renderer::baked_cave::BakedCaveDraw> = Vec::new();
         // Depth-pass casters. The ordinary vertex buffer even for a layered
         // mesh -- a depth pass reads position and nothing else, so a baked cave
         // casts here with no pipeline of its own.
@@ -665,6 +834,13 @@ impl XrRenderer {
         // Each caster's bounding sphere, entry for entry, so a shadow tile can
         // leave out the models it cannot reach. See `shadow::ShadowMeshBound`.
         let mut shadow_bounds: Vec<crate::renderer::shadow::ShadowMeshBound> = Vec::new();
+        // Which of `shadow_casters` never move, so are never in the
+        // moving-objects SUN map (see where it is recorded, and
+        // `MeshInstance::moves`).
+        let mut level_casters: Vec<bool> = Vec::new();
+        // Each caster's triangles without its thin parts, where it has any
+        // (`Levers::spot_caster_drop` 32).
+        let mut caster_solid_only: Vec<Option<(&wgpu::Buffer, u32)>> = Vec::new();
         // Which of `shadow_casters` are doors, for the lamps' moving casters'
         // tiles. See `MeshInstance::tile_caster`.
         let mut tile_meshes: Vec<usize> = Vec::new();
@@ -685,11 +861,12 @@ impl XrRenderer {
             // The lit room round it, turned into the player's frame its
             // normals are in. See `room_light`. A door leaf reads it in front
             // of the face the eye sees (`doors::light_point`).
+            let eye_world = glam::Quat::from_rotation_y(self.player.yaw) * mid_eye + self.player.offset;
             let light_at = if instance.tile_caster {
-                let eye_world = glam::Quat::from_rotation_y(self.player.yaw) * mid_eye + self.player.offset;
                 crate::renderer::doors::light_point(&self.doors, world, eye_world)
             } else {
-                world
+                // A door's frame or lever reads the room the eye is in too.
+                crate::renderer::doors::doorway_light_point(&self.doors, world, eye_world)
             };
             let room = crate::renderer::room_light::turned_to_player(
                 &crate::renderer::room_light::room_light_at(&self.room_descs, light_at),
@@ -730,6 +907,7 @@ impl XrRenderer {
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(
                 instance, lightmap_bg, &mut mesh_draws, &mut skinned_draws, &mut layered_draws,
+                &mut baked_cave_draws,
             );
             if instance.mesh.skin.is_none() {
                 let bound = crate::renderer::shadow::mesh_caster_bound(&instance.mesh);
@@ -743,7 +921,9 @@ impl XrRenderer {
                         prim.indices.len() as u32,
                         &instance.model.bind_group,
                     ));
+                    caster_solid_only.push(prim.thin.as_ref().map(|t| (&t.solid_index_buffer, t.solid_count)));
                     shadow_bounds.push(bound);
+                    level_casters.push(!instance.moves);
                 }
             }
         }
@@ -755,13 +935,17 @@ impl XrRenderer {
         // a shadow that belongs to nobody.
         let mut skinned_casters: Vec<crate::renderer::shadow::ShadowSkinnedDraw> = skinned_draws
             .iter()
-            .map(|(model_bg, _tex, joint_bg, vb, ib, count)| {
+            .map(|(model_bg, _tex, joint_bg, vb, ib, count, _)| {
                 (*vb, *ib, *count, *model_bg, *joint_bg)
             })
             .collect();
 
+        // Where the player's own whole body starts in the skinned and posed
+        // casters (`Levers::spot_caster_drop`).
+        let skinned_mirror_from = skinned_casters.len();
         let mut mirror_only_skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut mirror_only_layered_draws: Vec<LayeredDraw> = Vec::new();
+        let mut mirror_only_baked_caves: Vec<crate::renderer::baked_cave::BakedCaveDraw> = Vec::new();
         for instance in mirror_only_meshes {
             // Lit as the same mesh in view would be: it is the same body. The
             // open sky this gave them made a body in the floor brighter than
@@ -788,6 +972,7 @@ impl XrRenderer {
                 &mut mirror_only_mesh_draws,
                 &mut mirror_only_skinned_draws,
                 &mut mirror_only_layered_draws,
+                &mut mirror_only_baked_caves,
             );
             // HIDDEN FROM ITS OWNER, NOT FROM THE SUN. A mirror-only mesh is
             // the player's own head: left out of their view so they do not see
@@ -803,14 +988,16 @@ impl XrRenderer {
                         prim.indices.len() as u32,
                         &instance.model.bind_group,
                     ));
+                    caster_solid_only.push(prim.thin.as_ref().map(|t| (&t.solid_index_buffer, t.solid_count)));
                     shadow_bounds.push(bound);
+                    level_casters.push(false);
                 }
             }
         }
         skinned_casters.extend(
             mirror_only_skinned_draws
                 .iter()
-                .map(|(model_bg, _tex, joint_bg, vb, ib, count)| (*vb, *ib, *count, *model_bg, *joint_bg)),
+                .map(|(model_bg, _tex, joint_bg, vb, ib, count, _)| (*vb, *ib, *count, *model_bg, *joint_bg)),
         );
         // POSED ONCE (`Levers::skin_once`): each of those primitives posed by
         // one compute pass at the head of the shadow encoder, and drawn into
@@ -820,8 +1007,12 @@ impl XrRenderer {
         let mut posed_live: Vec<(wgpu::Buffer, wgpu::Buffer)> = Vec::new();
         let mut posed: Vec<(crate::renderer::skin_compute::Posed, &wgpu::Buffer, u32, &wgpu::BindGroup)> = Vec::new();
         let mut posed_cache = self.posed_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut posed_mirror_from = usize::MAX;
         if self.levers.skin_once {
-            for instance in meshes.iter().chain(mirror_only_meshes.iter()) {
+            for (k, instance) in meshes.iter().chain(mirror_only_meshes.iter()).enumerate() {
+                if k == meshes.len() {
+                    posed_mirror_from = posed.len();
+                }
                 let Some(skin) = &instance.mesh.skin else {
                     continue;
                 };
@@ -841,6 +1032,7 @@ impl XrRenderer {
                 }
             }
         }
+        let posed_mirror_from = posed_mirror_from.min(posed.len());
         posed_cache.keep_only(&posed_live);
         drop(posed_cache);
         let posed_casters: Vec<crate::renderer::shadow::ShadowMeshDraw> =
@@ -1176,8 +1368,18 @@ impl XrRenderer {
             if stale {
                 let world_view_proj = crate::renderer::lights::static_sun_matrix(
                     world_dir,
-                    brushes.map(|(v, _)| v.iter().map(|b| b.position)),
-                    terrain.map(|(v, _)| v.iter().map(|t| t.position)),
+                    // (World vertices: taken into the player's frame, as
+                    // the ground's below.)
+                    brushes.map(|(v, _)| {
+                        let world = self.brush_world;
+                        v.iter().map(move |b| if world { warp_world_to_player.transform_point3(glam::Vec3::from(b.position)).to_array() } else { b.position })
+                    }),
+                    // (World vertices: taken into the player's frame, which
+                    // the matrix beside them takes back out.)
+                    terrain.map(|(v, _)| {
+                        let world = self.ground_world;
+                        v.iter().map(move |t| if world { warp_world_to_player.transform_point3(glam::Vec3::from(t.position)).to_array() } else { t.position })
+                    }),
                     player_to_world,
                 );
                 *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj });
@@ -1211,7 +1413,11 @@ impl XrRenderer {
             Vec::new()
         };
         let has_body = fx.capsules && self.player.capsules.group_count > 0;
-        let character_tiles: Vec<(usize, glam::Mat4)> = if fx.shadows && fx.character_shadows && (has_body || !door_casters.is_empty()) {
+        let character_tiles: Vec<(usize, glam::Mat4)> = if fx.shadows
+            && fx.character_shadows
+            && self.levers.spot_caster_drop & 64 == 0
+            && (has_body || !door_casters.is_empty())
+        {
             let b = self.player.capsules.groups[0];
             let (centre, radius) = (glam::Vec3::new(b[0], b[1], b[2]), b[3]);
             let lamps: Vec<crate::renderer::shadow::CharacterLamp> = lights
@@ -1393,6 +1599,67 @@ impl XrRenderer {
             sun_dynamic_enabled: dynamic_sun.is_some(),
         };
 
+        // THE GROUND'S CHUNKS THIS FRAME DRAWS (`ground_lod`): asked of the
+        // quadtree over them with every frustum that draws ground this frame
+        // -- each eye's, each spot's shadow, and the sun's when its map is
+        // drawn every frame -- in the WORLD, where the chunks' boxes stand
+        // still. One list for the reflection, scene, motion and shadow
+        // passes, so they draw the same ground at the same step; each still
+        // culls it by its own frustum. Their boxes are posed here, for the
+        // chunks chosen only. With `Levers::ground_lod` off (or no lists
+        // built) every chunk is at step 1, as it always was.
+        //
+        // Terrain indices were rebased into the shared solid buffer, so the
+        // chunk offsets move with them (`index_start`).
+        let ground_head = {
+            let n = eye_views.len().max(1) as f32;
+            let mid = eye_views.iter().fold(glam::Vec3::ZERO, |sum, v| sum + glam::Vec3::new(v.pose.position.x, v.pose.position.y, v.pose.position.z)) / n;
+            glam::Quat::from_rotation_y(self.player.yaw) * mid + self.player.offset
+        };
+        let ground_frame: Option<crate::renderer::ground_lod::FrameGround> = match (terrain_range, self.ground_lod.borrow_mut().as_mut()) {
+            (Some((index_start, _)), Some(lod)) if ground_partitioned && lod.units.len() == terrain_chunks.len() => {
+                let world_planes = |m: glam::Mat4| crate::renderer::shadow::frustum_planes(m * warp_world_to_player);
+                let frusta: Vec<[glam::Vec4; 6]> = eye_views
+                    .iter()
+                    .map(|v| world_planes(Camera::gl_to_wgpu_ndc(Camera::xr_projection(v.fov, 0.03, 1000.0)) * Camera::xr_view(v.pose)))
+                    .chain(spot_matrices.iter().map(|m| world_planes(m.pass)))
+                    .chain((shadow.sun_enabled && static_sun.is_none()).then(|| world_planes(shadow.sun_view_proj)))
+                    .collect();
+                lod.set_strict(self.levers.ground_lod_strict);
+                Some(lod.frame(ground_head, &frusta, self.levers.ground_lod, self.player.offset, self.player.yaw, index_start))
+            }
+            _ => None,
+        };
+        // Whether the tree chose them (else: every chunk the frame was handed).
+        let ground_selected = ground_frame.is_some();
+        // The same ground for the motion pass, which draws it whole: a block chosen whole is one range (`ground_lod::Wholes`).
+        let ground_wholes: crate::renderer::ground_lod::Wholes = ground_frame.as_ref().map(|f| f.wholes.clone()).unwrap_or_default();
+        // Per chunk drawn: its place in the slope split's tables (and the
+        // horizon's bounds), which were made over EVERY run of the buffer.
+        let (solid_chunks, ground_units, ground_boxes, ground_error): (Vec<crate::renderer::shadow::CasterChunk>, Vec<u32>, Vec<(glam::Vec3, glam::Vec3)>, f32) =
+            match (ground_frame, terrain_range) {
+                (Some(f), _) => (f.chunks, f.units, f.world, f.error_rad),
+                // No tree handed over: every chunk, as the app posed it.
+                (None, Some((index_start, _))) => (
+                    terrain_chunks.iter().map(|c| crate::renderer::shadow::CasterChunk { first_index: c.first_index + index_start, ..*c }).collect(),
+                    Vec::new(),
+                    Vec::new(),
+                    0.0,
+                ),
+                (None, None) => (Vec::new(), Vec::new(), Vec::new(), 0.0),
+            };
+        let unit_of = |k: usize| ground_units.get(k).map_or(k, |u| *u as usize);
+        // The ground at step 1 is the first of its indices; a pass that
+        // draws "the whole ground" draws those.
+        let ground_step1 = self.ground_lod.borrow().as_ref().map(|l| l.level0_len()).filter(|n| *n > 0);
+        // Where the ground's coarser lists begin in the solid buffer: a run
+        // past it is drawn by a reader's SHAPED pipeline, one before it (step
+        // 1) by its unshaped twin (`TerrainPipeline::at`, `by_step`).
+        let ground_coarse_from: u32 = match (terrain_range, ground_step1) {
+            (Some((start, _)), Some(n)) => start + n,
+            _ => u32::MAX,
+        };
+
         // No spot casts this frame: the scene draws with its spotless twins.
         // See `XrRenderer::spotless_frame`. Nor any lit surface's light: the
         // twins shade none apart (`lights::without_spot_shadows`).
@@ -1405,8 +1672,21 @@ impl XrRenderer {
         // A static sun map is recorded only when it went stale.
         let record_sun = shadow.sun_enabled && static_sun.is_none_or(|(_, stale)| stale);
         if record_sun || shadow.sun_dynamic_enabled || shadow.spot_count > 0 || !character_tiles.is_empty() {
-            let solid_caster = (!solid_idx.is_empty())
-                .then_some((&solid_vb, &solid_ib, solid_idx.len() as u32));
+            // (In chunks, and none of them in any frustum this frame: no
+            // ground to cast. An empty list would mean "draw it whole".)
+            let solid_caster = (solid_index_count > 0 && !(ground_partitioned && solid_chunks.is_empty()))
+                .then_some((&solid_vb, &solid_ib, solid_index_count));
+            // The ground's chunks, where they are world vertices, are posed
+            // by this matrix in every shadow pass below.
+            // The brushes the same, where they are world vertices
+            // (`brush_pipeline::WORLD_BRUSHES`): one matrix poses both.
+            let world_ground_cast = self.ground_world && terrain_range.is_some();
+            let world_brush_cast = self.brush_world && brush_buffers.is_some();
+            if world_ground_cast || world_brush_cast {
+                self.ground_model.upload(&self.wgpu_queue, warp_world_to_player);
+            }
+            self.shadow_map.set_solid_world(world_ground_cast.then_some(&self.ground_model.bind_group), false);
+            self.shadow_map.set_brush_world(world_brush_cast.then_some(&self.ground_model.bind_group));
             let brush_caster = brush_buffers
                 .as_ref()
                 .map(|(vb, ib, count)| (vb, ib, *count));
@@ -1465,10 +1745,29 @@ impl XrRenderer {
                 // holds cuboids, which can move. `record` draws only the
                 // terrain chunks when it is given any, so without them the
                 // buffer is left out rather than frozen into the map.
-                let solid_caster = if static_sun.is_some() && solid_chunks.is_empty() {
+                // A STATIC map outlives the frame and the head's place: its
+                // ground is every chunk the sun's box reaches, at step 1 --
+                // asked of the tree with the sun's frustum alone, whatever
+                // the eyes see and whatever `Levers::ground_lod` says.
+                let sun_chunks: Option<Vec<crate::renderer::shadow::CasterChunk>> = match (static_sun.is_some() && ground_selected, terrain_range, self.ground_lod.borrow_mut().as_mut()) {
+                    (true, Some((index_start, _)), Some(lod)) => Some(
+                        lod.frame(
+                            ground_head,
+                            &[crate::renderer::shadow::frustum_planes(shadow.sun_view_proj * warp_world_to_player)],
+                            false,
+                            self.player.offset,
+                            self.player.yaw,
+                            index_start,
+                        )
+                        .chunks,
+                    ),
+                    _ => None,
+                };
+                let sun_ground: &[crate::renderer::shadow::CasterChunk] = sun_chunks.as_deref().unwrap_or(&solid_chunks);
+                let solid_caster = if sun_ground.is_empty() && (static_sun.is_some() || ground_partitioned) {
                     None
                 } else {
-                    solid_caster
+                    (solid_index_count > 0).then_some((&solid_vb, &solid_ib, solid_index_count))
                 };
                 let no_meshes: [crate::renderer::shadow::ShadowMeshDraw; 0] = [];
                 let no_skinned: [crate::renderer::shadow::ShadowSkinnedDraw; 0] = [];
@@ -1489,7 +1788,7 @@ impl XrRenderer {
                     brush_caster,
                     mesh_casters,
                     skinned,
-                    &solid_chunks,
+                    sun_ground,
                     shadow.sun_view_proj,
                 );
                 if static_sun.is_some() {
@@ -1511,13 +1810,33 @@ impl XrRenderer {
                 for (k, (_, tile)) in character_tiles.iter().enumerate() {
                     self.shadow_map.upload_light(&self.wgpu_queue, crate::renderer::shadow::ShadowKind::Character(k), *tile);
                 }
+                // NOTHING STILL IN THE MOVING-OBJECTS SUN MAP. It follows the
+                // head, so a model that never moves -- the cave's rock first --
+                // cast its sun shadow only within its box of the player, and
+                // the shadow drew itself in and faded as they walked (the back
+                // mouth's jamb across its floor tongue, headset 081923-081935,
+                // 095001-095034). A still model's sun is in the level's baked
+                // data at any distance. A bound no tile reaches leaves it out
+                // here and nowhere else: the lamps' and the torch's maps still
+                // take it. See `MeshInstance::moves`.
+                let moving_bounds: Vec<crate::renderer::shadow::ShadowMeshBound> = level_casters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &level)| {
+                        if level {
+                            glam::Vec4::new(0.0, -1.0e9, 0.0, 0.0)
+                        } else {
+                            cull_bounds.get(i).copied().unwrap_or(glam::Vec4::new(0.0, 0.0, 0.0, f32::INFINITY))
+                        }
+                    })
+                    .collect();
                 drawn += self.shadow_map.record_moving(
                     &mut encoder,
                     shadow.sun_dynamic_enabled,
                     shadow.sun_dynamic_view_proj,
                     &character_tiles.iter().map(|(_, m)| *m).collect::<Vec<_>>(),
                     &shadow_casters,
-                    cull_bounds,
+                    &moving_bounds,
                     frame_skinned_casters,
                     &posed_casters,
                     &tile_meshes,
@@ -1537,17 +1856,65 @@ impl XrRenderer {
                 );
             }
             if shadow.spot_count > 0 {
+                // DIAGNOSIS: caster classes left out of the spot tiles. See
+                // `Levers::spot_caster_drop`; 0 leaves every list as it is.
+                let drop = self.levers.spot_caster_drop;
+                let keep = |bit: u32| drop & bit == 0;
+                self.shadow_map.set_tile_scissor(!keep(128));
+                let spot_posed: Vec<crate::renderer::shadow::ShadowMeshDraw> = posed_casters
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| if *i < posed_mirror_from { keep(8) } else { keep(16) })
+                    .map(|(_, d)| *d)
+                    .collect();
+                let spot_skinned: Vec<crate::renderer::shadow::ShadowSkinnedDraw> = frame_skinned_casters
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| if *i < skinned_mirror_from { keep(8) } else { keep(16) })
+                    .map(|(_, d)| *d)
+                    .collect();
+                let no_meshes: [crate::renderer::shadow::ShadowMeshDraw; 0] = [];
+                let spot_meshes: Vec<crate::renderer::shadow::ShadowMeshDraw> = shadow_casters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(vb, ib, n, model))| match caster_solid_only.get(i).copied().flatten() {
+                        Some((solid, count)) if !keep(32) => (vb, solid, count, model),
+                        _ => (vb, ib, n, model),
+                    })
+                    .collect();
+                // 256: the brush triangles inside test_room's hall_pillar box
+                // left out, every other brush kept. Made each frame it is set.
+                let pillarless: Option<(wgpu::Buffer, u32)> = brush_geometry.filter(|_| !keep(256)).map(|(v, i)| {
+                    let to_world = if self.brush_world { glam::Mat4::IDENTITY } else { warp_world_to_player.inverse() };
+                    let (lo, hi) = (glam::Vec3::new(-0.46, -0.01, -7.46), glam::Vec3::new(0.46, 3.11, -6.54));
+                    let inside = |k: u32| {
+                        let p = to_world.transform_point3(glam::Vec3::from(v[k as usize].position));
+                        p.cmpge(lo).all() && p.cmple(hi).all()
+                    };
+                    let kept: Vec<u32> =
+                        i.chunks_exact(3).filter(|t| !t.iter().all(|&k| inside(k))).flatten().copied().collect();
+                    let ib = self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("brush_ib_pillarless"),
+                        contents: bytemuck::cast_slice(&kept),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                    (ib, kept.len() as u32)
+                });
+                let spot_brushes = match (&pillarless, brush_caster) {
+                    (Some((ib, n)), Some((vb, _, _))) => Some((vb, ib, *n)),
+                    _ => brush_caster,
+                };
                 drawn += self.shadow_map.record_spots(
                     &mut encoder,
                     shadow.spot_count as usize,
                     &spot_pass,
-                    solid_caster,
-                    brush_caster,
-                    &shadow_casters,
-                    cull_bounds,
-                    frame_skinned_casters,
-                    &posed_casters,
-                    &solid_chunks,
+                    solid_caster.filter(|_| keep(1)),
+                    spot_brushes.filter(|_| keep(2)),
+                    if keep(4) { &spot_meshes } else { &no_meshes },
+                    if keep(4) { cull_bounds } else { &[] },
+                    &spot_skinned,
+                    &spot_posed,
+                    if keep(1) { &solid_chunks } else { &[] },
                 );
             }
             if diag {
@@ -1646,10 +2013,22 @@ impl XrRenderer {
         // clip is the previous camera times its previous model matrix -- both
         // in the previous player frame, so nothing else is needed. See
         // `space_warp`.
+        // (More meshes drawn than the ring has slots: the rest write no
+        // motion. Said once a second, never in silence.)
+        let warp_mesh_room = crate::renderer::space_warp::MAX_SLOTS as usize / 2 - 3;
+        if meshes.len() > warp_mesh_room && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some()) && self.shadow_diag_frames.get() % 36 == 0 {
+            log::error!(
+                "SPACEWARP: {} meshes drawn and {warp_mesh_room} motion slots an eye: {} mesh(es) write no motion vectors this frame",
+                meshes.len(),
+                meshes.len() - warp_mesh_room,
+            );
+        }
         let warp_meshes: Vec<(&MeshInstance, glam::Mat4, glam::Mat4)> = match self.space_warp.as_ref() {
             Some(sw) if sw.acquired.is_some() => meshes
                 .iter()
-                .take(crate::renderer::space_warp::MAX_SLOTS as usize / 2 - 2)
+                // (An eye's slots: the posed world, these, the brushes' in
+                // the world, the water's and ground's in the world.)
+                .take(warp_mesh_room)
                 .map(|m| {
                     let model = m.mesh.model_matrix();
                     let prev = sw.prev_models.get(&m.model.buffer).copied().unwrap_or(model);
@@ -1673,9 +2052,21 @@ impl XrRenderer {
         let brush_motion_ranges: Option<[Vec<(u32, u32)>; 2]> =
             match (warp_cull && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some()), brush_geometry) {
                 (true, Some((v, i))) => {
-                    let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
-                    let runs = crate::renderer::space_warp::index_runs(i, |k| glam::Vec3::from(v[k as usize].position));
-                    Some(std::array::from_fn(|e| crate::renderer::space_warp::visible_ranges(&runs, &warp_planes[e])))
+                    // The runs' boxes are in the frame the vertices are in:
+                    // the eye's planes in the world for world vertices.
+                    let planes = |e: usize| match self.brush_world {
+                        true => crate::renderer::shadow::frustum_planes(warp_view_proj[e] * warp_world_to_player),
+                        false => warp_planes[e],
+                    };
+                    match self.static_brushes.as_ref().filter(|_| self.levers.brush_buffers) {
+                        // Kept with the buffers: no index is walked.
+                        Some(kept) => Some(std::array::from_fn(|e| crate::renderer::space_warp::visible_ranges(&kept.runs, &planes(e)))),
+                        None => {
+                            let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
+                            let runs = crate::renderer::space_warp::index_runs(i, |k| glam::Vec3::from(v[k as usize].position));
+                            Some(std::array::from_fn(|e| crate::renderer::space_warp::visible_ranges(&runs, &planes(e))))
+                        }
+                    }
                 }
                 _ => None,
             };
@@ -1685,10 +2076,113 @@ impl XrRenderer {
         let warp_steps = self.space_warp.as_ref().and_then(|sw| sw.prev_clocks).map_or((0.0, 0.0), |(w, f)| {
             (((warp_clocks.0 - w).clamp(0.0, 0.1)) as f32, ((warp_clocks.1 - f).clamp(0.0, 0.1)) as f32)
         });
+        // THE GROUND AND THE WATER THE GROUND HIDES from both eyes this frame
+        // (`Levers::ground_horizon`): a flag for each chunk, in the chunks'
+        // order, and one for each body of water. One horizon for both
+        // eyes, kept while the head stays within its reach. Only while the
+        // ground is drawn, and only for the chunks it was built for.
+        // THE HOLES ARE PLUGGED where every cave drawn is a baked one -- a
+        // closed sheet joined to the ground along its mouths -- so the ground
+        // is hidden from inside a cave and behind its mouth too
+        // (`ground_horizon`'s second rule; `Levers::ground_horizon_caves`).
+        // And each body's runs (`Levers::water_runs`): by the second rule too
+        // where a run lies clear of every cave's box, so is in no cave's air.
+        let mut horizon_runs: Vec<Vec<bool>> = Vec::new();
+        // Each drawn chunk's box in the WORLD: the frame's own choice's, or
+        // (no tree handed over) the bounds the horizon was set with, when
+        // they are these chunks'.
+        let horizon_boxes: Option<Vec<(glam::Vec3, glam::Vec3)>> = match (&self.ground_occluder, terrain_range) {
+            _ if !self.levers.ground_horizon => None,
+            (Some(_), Some(_)) if ground_selected => Some(ground_boxes.clone()),
+            (Some((_, bounds)), Some((index_start, _)))
+                if bounds.len() == solid_chunks.len() && bounds.iter().zip(&solid_chunks).all(|((first, _), c)| first + index_start == c.first_index) =>
+            {
+                Some(bounds.iter().map(|(_, b)| *b).collect())
+            }
+            _ => None,
+        };
+        let (horizon_hidden, horizon_water): (Vec<bool>, Vec<bool>) = match (&self.ground_occluder, horizon_boxes) {
+            (Some((ground, _)), Some(boxes)) => {
+                let yaw = glam::Quat::from_rotation_y(self.player.yaw);
+                let to_world = |p: glam::Vec3| yaw * p + self.player.offset;
+                let eyes: Vec<glam::Vec3> = eye_views
+                    .iter()
+                    .map(|ev| to_world(glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z)))
+                    .collect();
+                let caves: Vec<(glam::Vec3, glam::Vec3)> = if self.levers.ground_horizon_caves && layered_draws.is_empty() {
+                    baked_cave_draws
+                        .iter()
+                        .map(|d| {
+                            let corners = (0..8).map(|i| {
+                                to_world(glam::Vec3::new(
+                                    if i & 1 == 0 { d.bounds.0.x } else { d.bounds.1.x },
+                                    if i & 2 == 0 { d.bounds.0.y } else { d.bounds.1.y },
+                                    if i & 4 == 0 { d.bounds.0.z } else { d.bounds.1.z },
+                                ))
+                            });
+                            corners.fold(
+                                (glam::Vec3::splat(f32::INFINITY), glam::Vec3::splat(f32::NEG_INFINITY)),
+                                |(lo, hi), p| (lo.min(p), hi.max(p)),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                // WITH THE GROUND DRAWN COARSER (`Levers::ground_lod`) a ridge
+                // may stand a little under the step-1 ridge the horizon was
+                // built from: what is asked after is raised by as much as
+                // that could show (`ground_lod::lifted`; nothing, lever off).
+                let lift_eye = eyes.first().copied().unwrap_or(glam::Vec3::ZERO);
+                let lift = |lo: glam::Vec3, hi: glam::Vec3| crate::renderer::ground_lod::lifted(ground_error, lift_eye, lo, hi);
+                // (In a cell: the frame's draws hold the renderer by now.)
+                let mut held = self.ground_horizon.borrow_mut();
+                *held = crate::renderer::ground_horizon::for_eyes(held.take(), ground, &eyes, &caves);
+                match held.as_mut() {
+                    Some(h) => {
+                        if self.levers.water_runs && fx.water {
+                            const CLEAR: f32 = 2.0;
+                            horizon_runs = self
+                                .water_bodies
+                                .iter()
+                                .map(|b| {
+                                    b.runs
+                                        .iter()
+                                        .map(|r| {
+                                            let (lo, hi) = crate::renderer::water_runs::bounds_for(r, &eyes);
+                                            let in_a_caves_box = caves.iter().any(|(clo, chi)| {
+                                                lo.cmple(*chi + CLEAR).all() && hi.cmpge(*clo - CLEAR).all()
+                                            });
+                                            let hi = lift(lo, hi);
+                                            if in_a_caves_box { h.hides(ground, lo, hi) } else { h.hides_ground(ground, lo, hi) }
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+                        }
+                        (
+                            boxes.iter().map(|(lo, hi)| h.hides_ground(ground, *lo, lift(*lo, *hi))).collect(),
+                            // (As high as its far skirt is lifted: `water_runs::lifted`.)
+                            self.water_bodies
+                                .iter()
+                                .map(|b| {
+                                    let (lo, hi) = crate::renderer::water_runs::lifted(b.bounds, &eyes);
+                                    h.hides(ground, lo, lift(lo, hi))
+                                })
+                                .collect(),
+                        )
+                    }
+                    None => (Vec::new(), Vec::new()),
+                }
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
         // WHICH BODIES OF WATER EITHER EYE SEES this frame: only theirs are
         // the waves moved and the surfaces drawn. In the world, where their
         // bounds are, and through the doorways from inside a closed room, as
         // the ground is. See `water_pipeline::water_seen`.
+        let mut planar_shares: Vec<Option<f32>> = Vec::new();
+        let mut planar_rects_all: Vec<[Option<[f32; 4]>; 2]> = Vec::new();
         if fx.water && !self.water_bodies.is_empty() {
             let yaw = glam::Quat::from_rotation_y(self.player.yaw);
             let world_to_player =
@@ -1726,8 +2220,29 @@ impl XrRenderer {
             } else {
                 None
             };
-            for body in &self.water_bodies {
-                let seen = crate::renderer::water_pipeline::water_seen(body.bounds, &views, doorways.as_deref());
+            let world_eyes: Vec<glam::Vec3> = eyes.iter().map(|(pos, _)| yaw * *pos + self.player.offset).collect();
+            for (i, body) in self.water_bodies.iter().enumerate() {
+                let seen = crate::renderer::water_pipeline::water_seen(body.bounds, &views, doorways.as_deref())
+                    && !horizon_water.get(i).copied().unwrap_or(false);
+                // THE RUNS OF IT SOME EYE SEES (`Levers::water_runs`), or all
+                // of it; none seen is the body unseen.
+                let ranges = if !seen {
+                    Vec::new()
+                } else if self.levers.water_runs {
+                    let behind = horizon_runs.get(i);
+                    crate::renderer::water_runs::seen_ranges(&body.runs, |k, r| {
+                        !behind.and_then(|b| b.get(k)).copied().unwrap_or(false)
+                            && crate::renderer::water_pipeline::water_seen(
+                                crate::renderer::water_runs::bounds_for(r, &world_eyes),
+                                &views,
+                                doorways.as_deref(),
+                            )
+                    })
+                } else {
+                    vec![0..body.index_count]
+                };
+                let seen = seen && !ranges.is_empty();
+                *body.ranges.borrow_mut() = ranges;
                 // Back in sight: its next update writes both sets, so
                 // SpaceWarp does not see the surface leap.
                 if seen && !body.seen.get() {
@@ -1735,18 +2250,63 @@ impl XrRenderer {
                 }
                 body.seen.set(seen);
             }
+            // THE PLANAR WATER MIRROR'S CANDIDATES: each body authored as a
+            // mirror, seen, with both eyes above it -- its rectangle in each
+            // eye and its share of the view, the larger eye's. See
+            // `planar_water`.
+            if self.levers.planar_water {
+                for body in &self.water_bodies {
+                    let (lo, hi) = crate::renderer::planar_water::surface_box(body.bounds, body.uniform.extinction[3]);
+                    let rects: [Option<[f32; 4]>; 2] =
+                        std::array::from_fn(|i| eyes.get(i).and_then(|(_, clip)| crate::renderer::planar_water::screen_rect(*clip, lo, hi)));
+                    let above = world_eyes.iter().all(|e| e.y > body.uniform.extinction[3]);
+                    let share = (body.uniform.mirror[0] > 0.5 && body.seen.get() && above)
+                        .then(|| rects.iter().flatten().map(|r| crate::renderer::planar_water::share(*r)).fold(0.0, f32::max));
+                    planar_shares.push(share);
+                    planar_rects_all.push(rects);
+                }
+            }
         } else {
             for body in &self.water_bodies {
                 body.seen.set(false);
             }
         }
+        // THE FRAME'S ONE PLANAR MIRROR (`Levers::planar_water`): the flagged
+        // body covering the most of the view, held with hysteresis; none with
+        // an eye in the water, in a two-eye pass, or under a water cut.
+        let planar_allowed = self.levers.planar_water
+            && fx.water
+            && !self.stereo_scene()
+            && self.water_cut_pipeline.is_none()
+            && eyes_in_water.iter().all(Option::is_none);
+        let planar_body = {
+            let mut choice = self.planar_choice.get();
+            let body = choice.choose(if planar_allowed { &planar_shares } else { &[] });
+            self.planar_choice.set(choice);
+            body
+        };
+        let planar_rects: [Option<[f32; 4]>; 2] =
+            planar_body.and_then(|b| planar_rects_all.get(b).copied()).unwrap_or([None; 2]);
         // The water's slot follows the meshes': one for every body, as its
         // vertices are in the WORLD and its cameras carry each frame's way
         // into the player's frame. See `space_warp::MotionKind::Water`.
         let warp_water = fx.water
             && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some())
             && self.water_bodies.iter().any(|b| b.seen.get() && b.motion_groups.is_some());
-        let warp_per_eye = 1 + warp_meshes.len() as u32 + warp_water as u32;
+        // The ground's chunks, where its vertices are the world's, take the
+        // same slot as the water: this frame's and the last frame's clip
+        // from the WORLD -- two matrices, and no posed copy of either frame.
+        let warp_world = warp_water || (self.ground_world && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some()));
+        // The brushes, where their vertices are the world's, take a slot of
+        // their own after the meshes': the world's two matrices, as the
+        // ground's, WITH the eye and pixel scale their reflections move by --
+        // the eye in the world, where the water's slot carries its clock
+        // there. See `space_warp::MotionKind::BrushReflect`.
+        let warp_brush_world = self.brush_world
+            && brush_buffers.is_some()
+            && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some());
+        let warp_brush_slot = 1 + warp_meshes.len() as u32;
+        let warp_per_eye = 1 + warp_meshes.len() as u32 + warp_brush_world as u32 + warp_world as u32;
         // REFLECTIONS MOVE AS WHAT THEY SHOW wherever this frame can say what
         // that is: a single-eye scene pass drawn straight into the eye image,
         // whose alpha holds each pixel's reflected share, with the probe pass
@@ -1798,7 +2358,11 @@ impl XrRenderer {
                 for (i, (_, model, prev)) in warp_meshes.iter().enumerate() {
                     put(base + 1 + i, curr * *model, prev_view_proj * *prev, [0.0; 4], [0.0; 4]);
                 }
-                if warp_water {
+                if warp_brush_world {
+                    let (c, p, world_eye) = crate::renderer::space_warp::world_slot(curr, sw.prev.map(|(vps, w2p)| (vps[eye], w2p)), warp_world_to_player, glam::Vec3::new(e.x, e.y, e.z));
+                    put(base + warp_brush_slot as usize, c, p, [world_eye.x, world_eye.y, world_eye.z, 1.0], reflect);
+                }
+                if warp_world {
                     let prev_water = sw.prev.map_or(curr * warp_world_to_player, |(vps, w2p)| vps[eye] * w2p);
                     let world_eye = warp_world_to_player.inverse().transform_point3(glam::Vec3::new(e.x, e.y, e.z));
                     put(
@@ -1867,14 +2431,36 @@ impl XrRenderer {
                         ..Default::default()
                     });
 
-                    if !solid_verts.is_empty() {
+                    if solid_any {
                         pass.set_pipeline(&self.mirror_solid_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_vertex_buffer(0, solid_vb.slice(..));
                         pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
                         for (lightmap_key, index_start, count, _reflectivity) in &solid_ranges {
+                            // The ground, where its vertices are the world's,
+                            // by the pipeline that poses them.
+                            let world = (self.ground_world && terrain_range == Some((*index_start, *count)))
+                                .then_some(self.mirror_solid_world.as_ref())
+                                .flatten();
+                            if self.ground_world && terrain_range == Some((*index_start, *count)) && world.is_none() {
+                                continue;
+                            }
+                            if let Some(world) = world {
+                                pass.set_pipeline(&world.pipeline);
+                                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                            }
                             pass.set_bind_group(1, self.cuboid_lightmap_bg(lightmap_key.as_deref()), &[]);
-                            pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
+                            // (The ground: its step-1 indices, the first of
+                            // its range -- not the coarser lists after them.)
+                            let count = match ground_step1 {
+                                Some(step1) if terrain_range == Some((*index_start, *count)) => step1.min(*count),
+                                _ => *count,
+                            };
+                            pass.draw_indexed(*index_start..*index_start + count, 0, 0..1);
+                            if world.is_some() {
+                                pass.set_pipeline(&self.mirror_solid_pipeline.pipeline);
+                                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                            }
                         }
                     }
                     if let Some((vb, ib, count)) = &brush_buffers {
@@ -1901,7 +2487,7 @@ impl XrRenderer {
                         pass.set_pipeline(&self.layered_mesh_mirror_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
-                        for (model_bg, vb, ib, count) in
+                        for (model_bg, vb, ib, count, _, _) in
                             layered_draws.iter().chain(mirror_only_layered_draws.iter())
                         {
                             pass.set_bind_group(2, *model_bg, &[]);
@@ -1910,6 +2496,12 @@ impl XrRenderer {
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
                     }
+                    self.baked_cave_pipelines.draw_mirror(
+                        &mut pass,
+                        &self.uniform_buf.bind_group,
+                        &self.terrain_material.bind_group,
+                        baked_cave_draws.iter().chain(mirror_only_baked_caves.iter()),
+                    );
                     let all_mesh_draws = mesh_draws.iter().chain(mirror_only_mesh_draws.iter());
                     let all_skinned_draws =
                         skinned_draws.iter().chain(mirror_only_skinned_draws.iter());
@@ -1933,7 +2525,7 @@ impl XrRenderer {
                         // mirror target.
                         pass.set_pipeline(&self.skinned_mesh_mirror_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in all_skinned_draws {
+                        for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in all_skinned_draws {
                             pass.set_bind_group(1, *model_bg, &[]);
                             pass.set_bind_group(2, *tex_bg, &[]);
                             pass.set_bind_group(3, *joint_bg, &[]);
@@ -1956,6 +2548,42 @@ impl XrRenderer {
                 }
                 self.wgpu_queue.submit(Some(encoder.finish()));
             }
+
+            // THE PLANAR WATER MIRROR, this eye's: the eye mirrored in the
+            // frame's mirror body, in the planar twin's uniforms, lit as seen
+            // from there and kept linear at `HEADROOM` of the exposure (the
+            // water's tone curve is the only one applied); and the body's
+            // lane saying what undoes that. Drawn in this eye's own encoder
+            // below, as the floor mirror is. See `planar_water`.
+            let planar_eye = planar_body.zip(planar_rects[eye]).map(|(b, rect)| {
+                let body = &self.water_bodies[b];
+                let surface = body.uniform.extinction[3] - self.player.offset.y;
+                let (mirror_vp, mirror_eye) = crate::renderer::planar_water::mirror_camera(view, proj, surface);
+                let planar_post = crate::renderer::uniforms::PostUpload {
+                    exposure: post.exposure * crate::renderer::planar_water::HEADROOM,
+                    tonemap: crate::renderer::tonemap::ToneMapping::None,
+                    night_vision: 0.0,
+                    ..post
+                };
+                self.uniform_buf.write_scene_stereo_to(
+                    &self.wgpu_queue,
+                    &self.uniform_buf.planar_buffer,
+                    [mirror_vp; 2],
+                    [mirror_eye; 2],
+                    &shadow,
+                    &sky_upload,
+                    &planar_post,
+                    &frame_player,
+                    None,
+                );
+                let lane = crate::renderer::planar_water::uniform_lane(true, true, post.exposure, false);
+                self.wgpu_queue.write_buffer(
+                    &body.uniform_buffer,
+                    std::mem::offset_of!(crate::renderer::water_pipeline::WaterUniform, mirror) as u64,
+                    bytemuck::cast_slice(&lane),
+                );
+                (b, mirror_vp, mirror_eye, rect)
+            });
 
             // THE CHARACTERS MIRRORED IN THE FLOOR, this eye's: the uniforms
             // their pass draws with, in the scene uniforms' twin -- the pass
@@ -2063,6 +2691,9 @@ impl XrRenderer {
                     upload.portal_count = 0;
                 }
                 upload.no_trace = !fx.probe_trace;
+                // Ground past the baked outdoor volume reflects the outdoors
+                // (`Levers::open_reflections`). See `PROBE_OPEN_GROUND`.
+                upload.open_ground = self.levers.open_reflections;
                 if !fx.reflection_proxies {
                     upload.proxy_count = 0;
                 }
@@ -2146,6 +2777,37 @@ impl XrRenderer {
             // into) is seen from within it, not through a doorway: always drawn.
             let player_to_world = glam::Mat4::from_translation(self.player.offset)
                 * glam::Mat4::from_quat(glam::Quat::from_rotation_y(self.player.yaw));
+            // THE MODELS A CLOSED ROOM'S WALLS HIDE (`Levers::model_rooms`):
+            // each eye's room and what its doorways show; `None` unless every
+            // eye this pass draws is inside a closed room.
+            let model_rooms: Option<Vec<crate::renderer::portal_cull::RoomView>> =
+                if self.levers.model_rooms && fx.portal_culling && !self.cull_rooms.is_empty() {
+                    let world_to_player = player_to_world.inverse();
+                    let eyes: Vec<(glam::Vec3, glam::Mat4)> = if stereo {
+                        both_cam_pos.iter().copied().zip(both_view_proj.iter().copied()).collect()
+                    } else {
+                        vec![(cam_pos, eye_view_proj)]
+                    };
+                    eyes.into_iter()
+                        .map(|(pos, vp)| {
+                            crate::renderer::portal_cull::room_view(
+                                player_to_world.transform_point3(pos),
+                                vp * world_to_player,
+                                vp,
+                                &self.cull_rooms,
+                                &open_portals,
+                            )
+                        })
+                        .collect()
+                } else {
+                    None
+                };
+            let room_shows = |bound: glam::Vec4| {
+                model_rooms.as_ref().map_or(true, |views| {
+                    let world = player_to_world.transform_point3(bound.truncate());
+                    views.iter().any(|v| v.shows(world, bound, crate::renderer::scene_cull::MARGIN))
+                })
+            };
             let in_closed_room = |c: &crate::renderer::shadow::CasterChunk| {
                 let corners = (0..8).map(|i| {
                     player_to_world.transform_point3(glam::Vec3::new(
@@ -2163,15 +2825,41 @@ impl XrRenderer {
             // WHETHER A TERRAIN CHUNK IS DRAWN this eye: in the view, and, from
             // inside a closed room, seen through a doorway. One rule for the
             // scene pass and the probe pass, which must draw the same ground.
+            // THE GROUND'S CHUNKS NEAREST THIS EYE FIRST (`Levers::ground_near_first`),
+            // so the ground in front has its depth down before the ground
+            // behind it is drawn and hidden pixels are never shaded: the
+            // ground's readers are the scene pass's dearest pixels, and its
+            // chunks were drawn in the order they lie in the buffer -- a cliff
+            // five metres off after every ridge behind it. The same picture:
+            // opaque, depth-tested, and no two of a heightfield's triangles
+            // share a pixel's depth.
+            let chunk_order: Vec<usize> = {
+                let mut order: Vec<usize> = (0..solid_chunks.len()).collect();
+                if self.levers.ground_near_first || self.levers.ground_near_chunks > 0 {
+                    let near = |k: usize| crate::renderer::scene_cull::distance_squared_to_box(cam_pos, solid_chunks[k].min, solid_chunks[k].max);
+                    order.sort_by(|&a, &b| near(a).total_cmp(&near(b)));
+                }
+                order
+            };
+            let ordered_chunks = || chunk_order.iter().map(|&k| (k, &solid_chunks[k]));
+            // Asked once a chunk for this eye, and not behind the ground
+            // (`horizon_hidden`); every pass below reads the answer.
+            let chunk_visible: Vec<bool> = solid_chunks
+                .iter()
+                .enumerate()
+                .map(|(k, c)| {
+                    // THE TESTED HELPER, not a second copy of the rule. An inline
+                    // `any` here would be the shipped behaviour while the tests
+                    // exercised something else that merely looked the same.
+                    let through_a_doorway = match &outdoor_frusta {
+                        None => true,
+                        Some(f) => crate::renderer::shadow::chunk_seen(c, f) || in_closed_room(c),
+                    };
+                    crate::renderer::shadow::chunk_seen(c, &cull_planes) && through_a_doorway && !horizon_hidden.get(k).copied().unwrap_or(false)
+                })
+                .collect();
             let terrain_chunk_visible = |c: &crate::renderer::shadow::CasterChunk| {
-                // THE TESTED HELPER, not a second copy of the rule. An inline
-                // `any` here would be the shipped behaviour while the tests
-                // exercised something else that merely looked the same.
-                let through_a_doorway = match &outdoor_frusta {
-                    None => true,
-                    Some(f) => crate::renderer::shadow::chunk_seen(c, f) || in_closed_room(c),
-                };
-                crate::renderer::shadow::chunk_seen(c, &cull_planes) && through_a_doorway
+                solid_chunks.binary_search_by_key(&c.first_index, |s| s.first_index).is_ok_and(|k| chunk_visible[k])
             };
             let probes_arg =
                 if !fx.probes { Some(&no_probes) } else { resident.as_ref() };
@@ -2325,6 +3013,144 @@ impl XrRenderer {
                         );
                     }
                 }
+                // THE PLANAR WATER MIRROR, this eye's image of the scene
+                // mirrored in the frame's mirror body, before the scene pass
+                // reads it: scissored to the body's rectangle, its ground by
+                // the chunks the mirrored view sees, models only within
+                // `MODEL_REACH`, then the sky. Every winding is reversed, so
+                // the mirror pipelines draw it. See `planar_water`.
+                if let Some((_, mirror_vp, _, rect)) = planar_eye {
+                    use crate::renderer::planar_water;
+                    let target = &self.planar_targets[eye];
+                    let planes = [crate::renderer::shadow::frustum_planes(mirror_vp)];
+                    let (sx, sy, sw, sh) = planar_water::scissor(rect, self.planar_size.0, self.planar_size.1);
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("planar_water"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &target.color_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &target.depth_view,
+                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+                    if sw > 0 && sh > 0 {
+                        pass.set_scissor_rect(sx, sy, sw, sh);
+                        let group = &self.uniform_buf.planar_bind_group;
+                        // The ground, by the chunks the mirrored view sees.
+                        if let Some((index_start, count)) = terrain_range {
+                            pass.set_pipeline(&self.terrain_mirror.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                            pass.set_vertex_buffer(0, solid_vb.slice(..));
+                            pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                            if ground_partitioned {
+                                // A coarser list's chunk by the shaped pipeline (`TerrainPipeline::at`).
+                                let mut shaped_bound = false;
+                                for c in solid_chunks.iter().filter(|c| crate::renderer::shadow::chunk_seen(c, &planes)) {
+                                    let coarse = c.first_index >= ground_coarse_from;
+                                    if coarse != shaped_bound {
+                                        pass.set_pipeline(self.terrain_mirror.at(coarse));
+                                        shaped_bound = coarse;
+                                    }
+                                    pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                }
+                            } else {
+                                let count = ground_step1.map_or(count, |step1| step1.min(count));
+                                pass.draw_indexed(index_start..index_start + count, 0, 0..1);
+                            }
+                        }
+                        // The level's solids, the ground's range left to the above.
+                        if solid_any {
+                            pass.set_pipeline(&self.mirror_solid_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_vertex_buffer(0, solid_vb.slice(..));
+                            pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                            for (lightmap_key, index_start, count, _) in &solid_ranges {
+                                if terrain_range == Some((*index_start, *count)) {
+                                    continue;
+                                }
+                                pass.set_bind_group(1, self.cuboid_lightmap_bg(lightmap_key.as_deref()), &[]);
+                                pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
+                            }
+                        }
+                        if let Some((vb, ib, count)) = &brush_buffers {
+                            pass.set_pipeline(&self.brush_mirror_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
+                            pass.set_bind_group(2, self.brush_lightmap_bg(), &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
+                        // Rocks and caves: the landscape, by their boxes.
+                        let layered: Vec<&LayeredDraw> = layered_draws
+                            .iter()
+                            .chain(mirror_only_layered_draws.iter())
+                            .filter(|d| crate::renderer::scene_cull::sees_box(&planes, d.5))
+                            .collect();
+                        if !layered.is_empty() {
+                            pass.set_pipeline(&self.layered_mesh_mirror_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                            for (model_bg, vb, ib, count, _, _) in layered {
+                                pass.set_bind_group(2, *model_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
+                        }
+                        self.baked_cave_pipelines.draw_mirror(
+                            &mut pass,
+                            group,
+                            &self.terrain_material.bind_group,
+                            baked_cave_draws
+                                .iter()
+                                .chain(mirror_only_baked_caves.iter())
+                                .filter(|d| crate::renderer::scene_cull::sees_box(&planes, d.bounds)),
+                        );
+                        // Models near enough to matter, and the characters.
+                        let near_model = |d: &&MeshDraw| {
+                            crate::renderer::scene_cull::sees(&planes, d.bound)
+                                && (d.bound.truncate() - cam_pos).length() - d.bound.w < planar_water::MODEL_REACH
+                        };
+                        let models: Vec<&MeshDraw> = mesh_draws.iter().chain(mirror_only_mesh_draws.iter()).filter(near_model).collect();
+                        if !models.is_empty() {
+                            pass.set_pipeline(&self.mirror_mesh_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            for d in models {
+                                pass.set_bind_group(1, d.model, &[]);
+                                pass.set_bind_group(2, d.texture, &[]);
+                                pass.set_bind_group(3, d.lightmap, &[]);
+                                pass.set_vertex_buffer(0, d.vertices.slice(..));
+                                pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..d.count, 0, 0..1);
+                            }
+                        }
+                        if !skinned_draws.is_empty() || !mirror_only_skinned_draws.is_empty() {
+                            pass.set_pipeline(&self.skinned_mesh_mirror_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in skinned_draws.iter().chain(mirror_only_skinned_draws.iter()) {
+                                pass.set_bind_group(1, *model_bg, &[]);
+                                pass.set_bind_group(2, *tex_bg, &[]);
+                                pass.set_bind_group(3, *joint_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
+                        }
+                        // The sky, last: what nothing covers.
+                        pass.set_pipeline(&self.sky_mirror_pipeline.pipeline);
+                        pass.set_bind_group(0, group, &[]);
+                        pass.set_bind_group(1, &self.sky.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                }
                 // THE CHARACTERS MIRRORED IN THE FLOOR, into this eye's probe
                 // pass target before its pass lays them over the floor: drawn
                 // with the twin's uniforms, then blurred. Single-eye only: the
@@ -2352,7 +3178,7 @@ impl XrRenderer {
                         });
                         pass.set_pipeline(&self.floor_mirror_skinned.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.twin_bind_group, &[]);
-                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in skinned_draws.iter().chain(mirror_only_skinned_draws.iter()) {
+                        for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in skinned_draws.iter().chain(mirror_only_skinned_draws.iter()) {
                             pass.set_bind_group(1, *model_bg, &[]);
                             pass.set_bind_group(2, *tex_bg, &[]);
                             pass.set_bind_group(3, *joint_bg, &[]);
@@ -2421,6 +3247,45 @@ impl XrRenderer {
                             timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(8 + eye)),
                             ..Default::default()
                         });
+                        // THE CAVE'S DEPTH FIRST, so the brushes and the
+                        // ground behind its rock are not traced here for
+                        // pixels the scene shows as rock: for a cave the eye
+                        // is in. From outside, the hill round it already hides
+                        // what lies behind, and its depth cost 0.2 ms
+                        // (cave_mouth, 2026-10-08). Single-eye only. See
+                        // `cave_twins`.
+                        if let (Some(t), false, true) = (&self.cave_twins, stereo, self.levers.cave_occluder) {
+                            let inside = |(lo, hi): &(glam::Vec3, glam::Vec3)| cam_pos.cmpge(*lo).all() && cam_pos.cmple(*hi).all();
+                            if layered_draws.iter().any(|d| inside(&d.5)) {
+                                pass.set_pipeline(&t.occluder);
+                                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                                pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                                for (model_bg, vb, ib, count, _, _) in layered_draws.iter().filter(|d| inside(&d.5)) {
+                                    pass.set_bind_group(2, *model_bg, &[]);
+                                    pass.set_vertex_buffer(0, vb.slice(..));
+                                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                    pass.draw_indexed(0..*count, 0, 0..1);
+                                }
+                            }
+                        }
+                        // A baked cave's, the same way (`baked_cave`).
+                        if !stereo && self.levers.cave_occluder {
+                            self.baked_cave_pipelines.draw_occluders(
+                                &mut pass, &self.uniform_buf.bind_group, &baked_cave_draws, cam_pos,
+                                // Its chunks in view only (`Levers::cave_chunk_cull`).
+                                (self.levers.cave_chunk_cull && self.levers.scene_cull).then_some(&cull_planes[..]),
+                            );
+                        }
+                        // THE BRUSHES' DEPTH FIRST (`Levers::probe_prepass`), so
+                        // the pass's shader runs on the nearest wall alone.
+                        if !stereo && self.levers.probe_prepass {
+                            pass.set_pipeline(&self.brush_probe_depth_prepass.pipeline);
+                            pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                            pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
                         pass.set_pipeline(&probe_pipeline.pipeline);
                         // Its photograph slots, as push constants: THIS eye's
                         // table, the one its camera block was just written with.
@@ -2467,23 +3332,185 @@ impl XrRenderer {
                                     && self.terrain_inlined.is_none()
                                     && self.weather.as_ref().is_some_and(|w| w.weathered(c.first_index - index_start))
                             };
-                            if solid_chunks.is_empty() {
+                            // THE GROUND THAT IS ALL OUT OF DOORS with the pass's
+                            // outdoor twin: the same reflection, without the
+                            // rooms' machinery compiled in. Which chunks, from
+                            // this pass's own probe table. See `outdoor_pass`.
+                            let outdoor_twins = self
+                                .terrain_outdoor_passes
+                                .as_ref()
+                                .filter(|_| self.levers.outdoor_pass && self.terrain_cut_pipeline.is_none() && self.terrain_inlined.is_none());
+                            let outdoor_frame = outdoor_twins.and_then(|_| {
+                                crate::renderer::outdoor_pass::OutdoorFrame::new(self.uniform_buf.probes_or_level(probes_arg))
+                            });
+                            // THE GROUND IN NO PHOTOGRAPH'S BOX with the pass's
+                            // nowhere twin: the lookup's "nothing" at once.
+                            // See `outdoor_pass::NowhereFrame`.
+                            let nowhere_twins = self
+                                .terrain_nowhere_passes
+                                .as_ref()
+                                .filter(|_| self.levers.nowhere_pass && self.terrain_cut_pipeline.is_none() && self.terrain_inlined.is_none());
+                            // ... OR, WHERE OPEN GROUND REFLECTS THE OUTDOORS
+                            // this frame, with the pass's open-ground twin: what
+                            // the full pass draws there under the same word of
+                            // the table (`ProbeUpload::open_ground`), without
+                            // its lookup. The same chunks.
+                            let open_ground = {
+                                let table = self.uniform_buf.probes_or_level(probes_arg);
+                                table.open_ground && !table.no_trace
+                            };
+                            let nowhere_twins = match self.terrain_open_passes.as_ref() {
+                                Some(open) if open_ground && self.terrain_cut_pipeline.is_none() && self.terrain_inlined.is_none() => Some(open),
+                                // No twin for it: the full pass draws it, right.
+                                None if open_ground => None,
+                                _ => nowhere_twins,
+                            };
+                            let nowhere_frame = nowhere_twins
+                                .map(|_| crate::renderer::outdoor_pass::NowhereFrame::new(self.uniform_buf.probes_or_level(probes_arg)));
+                            let nowhere = |c: &crate::renderer::shadow::CasterChunk| {
+                                nowhere_frame.as_ref().is_some_and(|f| {
+                                    let (lo, hi) =
+                                        crate::renderer::outdoor_pass::world_box(self.player.offset, self.player.yaw, c.min, c.max);
+                                    f.holds(lo, hi)
+                                })
+                            };
+                            // (A chunk nowhere is not in the outdoor volume: the two never both hold.)
+                            let outdoors = |c: &crate::renderer::shadow::CasterChunk| {
+                                outdoor_frame.as_ref().is_some_and(|f| {
+                                    let (lo, hi) =
+                                        crate::renderer::outdoor_pass::world_box(self.player.offset, self.player.yaw, c.min, c.max);
+                                    f.holds(lo, hi)
+                                })
+                            };
+                            // WHAT OF CHUNK `k` EACH GROUND CLASS DRAWS: all of
+                            // it where its bounds and this frame's table put
+                            // the whole chunk in one class, as before; else its
+                            // triangles' runs by their own classes, which the
+                            // level's whole table gave them (`LevelGround`) --
+                            // a class whose twin this frame lacks to the full
+                            // pass. `(first index, count)` runs, and how many.
+                            let class_split = self.slope_split.as_ref().filter(|s| {
+                                self.levers.ground_classes
+                                    && self.terrain_gentle.is_some()
+                                    && s.has_classes()
+                                    && self.terrain_cut_pipeline.is_none()
+                                    && self.terrain_inlined.is_none()
+                            });
+                            let outdoor_twins = outdoor_twins.filter(|_| outdoor_frame.is_some());
+                            let (outdoors_drawn, nowhere_drawn) = (outdoor_twins.is_some(), nowhere_twins.is_some());
+                            use crate::renderer::outdoor_pass::{GROUND_FULL, GROUND_NOWHERE, GROUND_OUTDOORS};
+                            let runs = |k: usize, c: &crate::renderer::shadow::CasterChunk, class: usize| -> ([(u32, u32); 4], usize) {
+                                let whole = ([(c.first_index, c.index_count), (0, 0), (0, 0), (0, 0)], 1);
+                                let none = ([(0, 0); 4], 0);
+                                let chunks_class = if nowhere(c) {
+                                    GROUND_NOWHERE
+                                } else if outdoors(c) {
+                                    GROUND_OUTDOORS
+                                } else {
+                                    GROUND_FULL
+                                };
+                                match (chunks_class, class_split) {
+                                    (GROUND_FULL, Some(split)) => {
+                                        let pick = [
+                                            class == GROUND_FULL,
+                                            if outdoors_drawn { class == GROUND_OUTDOORS } else { class == GROUND_FULL },
+                                            if nowhere_drawn { class == GROUND_NOWHERE } else { class == GROUND_FULL },
+                                        ];
+                                        let (mut r, n) = split.class_ranges(unit_of(k), pick);
+                                        r[..n].iter_mut().for_each(|run| run.0 += c.first_index);
+                                        (r, n)
+                                    }
+                                    (found, _) if found == class => whole,
+                                    _ => none,
+                                }
+                            };
+                            if !ground_partitioned {
                                 pass.draw_indexed(index_start..index_start + count, 0, 0..1);
                             } else {
-                                for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && !weathered(c)) {
-                                    pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
-                                }
-                                if let Some(w) = self.weather.as_ref().filter(|_| solid_chunks.iter().any(|c| weathered(c))) {
-                                    let dedup = w.dedup_passes.as_ref().filter(|_| self.levers.pass_dedup);
-                                    pass.set_pipeline(match (dedup, poolless) {
-                                        (Some([_, p]), true) => &p.pipeline,
-                                        (Some([p, _]), false) => &p.pipeline,
-                                        (None, true) => &w.twins.pass_poolless.pipeline,
-                                        (None, false) => &w.twins.pass.pipeline,
-                                    });
-                                    pass.set_bind_group(2, &w.maps.bind_group, &[]);
-                                    for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && weathered(c)) {
-                                        pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                // The dry ground, then the weather's, each: the
+                                // pass itself, its nowhere (or open-ground)
+                                // twin, its outdoor twin.
+                                for wet in [false, true] {
+                                    let weather = self.weather.as_ref().filter(|_| wet && solid_chunks.iter().any(|c| weathered(c)));
+                                    if wet {
+                                        let Some(w) = weather else { continue };
+                                        let dedup = w.dedup_passes.as_ref().filter(|_| self.levers.pass_dedup);
+                                        pass.set_pipeline(match (dedup, poolless) {
+                                            (Some([_, p]), true) => &p.pipeline,
+                                            (Some([p, _]), false) => &p.pipeline,
+                                            (None, true) => &w.twins.pass_poolless.pipeline,
+                                            (None, false) => &w.twins.pass.pipeline,
+                                        });
+                                        pass.set_bind_group(2, &w.maps.bind_group, &[]);
+                                    }
+                                    let which = wet as usize;
+                                    // The weather's ground beyond the outdoor
+                                    // volume by the open-ground twin: a film
+                                    // of water and a puddle mirror the sky
+                                    // (`Levers::wet_reflections`).
+                                    let wet_open = self.terrain_open_passes.as_ref().filter(|_| wet && self.levers.wet_reflections && nowhere_twins.is_some());
+                                    // ... OR THE SKY ALONE IN IT, by the twin
+                                    // that fits the cache (`Levers::wet_sky`),
+                                    // and then only in the chunks that hold a
+                                    // film or a puddle this frame.
+                                    let wet_sky = self.terrain_puddle_pass.as_ref().filter(|_| wet && self.levers.wet_sky && nowhere_twins.is_some());
+                                    // WHICH WEATHER CHUNKS MIRROR
+                                    // (`Some(true)`), the rest keeping the
+                                    // nowhere twin (`Some(false)`): where
+                                    // water stands (`Levers::puddle_reflections`),
+                                    // else -- under `wet_sky` -- where a film
+                                    // or a puddle lies; all of them otherwise.
+                                    let mirror = wet_sky.or(wet_open.map(|t| &t[1]));
+                                    let pick: Option<u8> = match (mirror.is_some(), self.levers.puddle_reflections, wet_sky.is_some()) {
+                                        (true, true, _) => Some(0),
+                                        (true, false, true) => Some(1),
+                                        _ => None,
+                                    };
+                                    let mirrors = |c: &crate::renderer::shadow::CasterChunk| {
+                                        use crate::renderer::weather::WeatherKinds::{Both, Snowless};
+                                        let first = c.first_index - index_start;
+                                        self.weather.as_ref().is_some_and(|w| match pick {
+                                            Some(0) => matches!(w.kinds_of(first), Both | Snowless),
+                                            _ => w.films_of(first),
+                                        })
+                                    };
+                                    let nowhere = nowhere_twins.map(|t| &t[which]);
+                                    for (class, twin, only) in [
+                                        (GROUND_FULL, None, None),
+                                        (GROUND_NOWHERE, mirror.or(nowhere), pick.map(|_| true)),
+                                        (GROUND_NOWHERE, nowhere.filter(|_| pick.is_some()), Some(false)),
+                                        (GROUND_OUTDOORS, outdoor_twins.map(|t| &t[which]), None),
+                                    ] {
+                                        if class != GROUND_FULL && twin.is_none() {
+                                            continue;
+                                        }
+                                        // The pipeline this class draws by --
+                                        // the pass (bound above) for the dry
+                                        // full class -- and which of its two
+                                        // is bound: `Some(coarse)`. A run of
+                                        // the coarser lists by its shaped
+                                        // pipeline (`TerrainPipeline::at`).
+                                        let drawn_by = twin.or(if wet { None } else { Some(terrain) });
+                                        let mut bound: Option<bool> = if twin.is_none() { Some(false) } else { None };
+                                        // (Runs that touch in the buffer as
+                                        // one draw: `ground_lod::merged`.)
+                                        let class_runs = crate::renderer::ground_lod::merged(
+                                            ordered_chunks()
+                                                .filter(|(_, c)| terrain_chunk_visible(c) && weathered(c) == wet && !only.is_some_and(|want| mirrors(c) != want))
+                                                .flat_map(|(k, c)| {
+                                                    let (r, n) = runs(k, c, class);
+                                                    r.into_iter().take(n)
+                                                }),
+                                        );
+                                        for (first, len) in class_runs {
+                                            for (first, len, coarse) in crate::renderer::terrain_pipeline::by_step(first, len, ground_coarse_from) {
+                                                if let (true, Some(p)) = (bound != Some(coarse), drawn_by) {
+                                                    pass.set_pipeline(p.at(coarse));
+                                                    bound = Some(coarse);
+                                                }
+                                                pass.draw_indexed(first..first + len, 0, 0..1);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2680,9 +3707,47 @@ impl XrRenderer {
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(0..*count, 0, 0..1);
                     }
+                    // THE BODY'S DEPTH, before anything it hides is shaded:
+                    // its opaque parts, then its see-through ones where their
+                    // texture is wholly opaque. See `Levers::body_prepass`.
+                    if let (Some([plain, texels]), false) = (self.sp_body_prepass(stereo), skinned_draws.is_empty()) {
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        for see_through in [false, true] {
+                            pass.set_pipeline(if see_through { texels } else { plain });
+                            for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in skinned_draws.iter().filter(|d| d.6 == see_through) {
+                                pass.set_bind_group(1, *model_bg, &[]);
+                                pass.set_bind_group(2, *tex_bg, &[]);
+                                pass.set_bind_group(3, *joint_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
+                        }
+                    }
 
-                    if !solid_verts.is_empty() {
-                        pass.set_pipeline(self.sp_solid(stereo));
+                    // A BAKED CAVE THE EYE IS INSIDE, BEFORE THE GROUND its rock
+                    // hides (`Levers::cave_first`); the others after the brushes.
+                    if self.levers.cave_first && baked_cave_draws.iter().any(|d| d.holds(cam_pos)) {
+                        self.baked_cave_pipelines.draw_scene(
+                            &mut pass,
+                            &self.uniform_buf.bind_group,
+                            &self.terrain_material.bind_group,
+                            &baked_cave_draws,
+                            self.levers.scene_cull.then_some(&cull_planes[..]),
+                            self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed),
+                            stereo,
+                            Some((cam_pos, true)),
+                        );
+                    }
+                    if solid_any {
+                        // Without blending when every cuboid is opaque, so
+                        // they write the coarse depth everything after them
+                        // is rejected by. See `Levers::opaque_models`.
+                        let cuboids_opaque = cuboids
+                            .iter()
+                            .all(|c| matches!(c.style, crate::renderer::cuboid::CuboidStyle::Wireframe) || c.color.3 == 255);
+                        let solid_opaque = self.sp_solid_opaque(stereo).filter(|_| cuboids_opaque);
+                        pass.set_pipeline(solid_opaque.unwrap_or(self.sp_solid(stereo)));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_vertex_buffer(0, solid_vb.slice(..));
                         pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -2740,54 +3805,145 @@ impl XrRenderer {
                             (Some(split), Some(_)) if terrain_in_probe_pass && self.slope_twins_on() => Some(&split.gentle),
                             _ => None,
                         };
-                        let gentle_of = |k: usize| gentle_split.and_then(|g| g.get(k).copied()).unwrap_or(0);
+                        let gentle_of = |k: usize| gentle_split.and_then(|g| g.get(unit_of(k)).copied()).unwrap_or(0);
                         // And its steep ones -- the last `steep_of` -- with the
                         // steep twin, when there is one.
                         let steep_split: Option<&[u32]> = match (&self.slope_split, &self.terrain_steep) {
                             (Some(split), Some(_)) if gentle_split.is_some() => Some(&split.steep),
                             _ => None,
                         };
-                        let steep_of = |k: usize| steep_split.and_then(|g| g.get(k).copied()).unwrap_or(0);
+                        let steep_of = |k: usize| steep_split.and_then(|g| g.get(unit_of(k)).copied()).unwrap_or(0);
                         let twin = self.terrain_twin();
-                        if solid_chunks.is_empty() {
+                        if !ground_partitioned {
                             pass.draw_indexed(index_start..index_start + count, 0, 0..1);
                         } else {
-                            for (k, c) in solid_chunks.iter().enumerate() {
-                                if terrain_chunk_visible(c) && !weathered(c) {
-                                    let g = gentle_of(k).min(c.index_count);
-                                    let end = c.index_count - steep_of(k).min(c.index_count - g);
-                                    if g < end {
-                                        pass.draw_indexed(c.first_index + g..c.first_index + end, 0, 0..1);
+                            // How many of the nearest chunks are walked that way:
+                            // all of them, or `Levers::ground_near_chunks`.
+                            let near_walk = if self.levers.ground_near_first { usize::MAX } else { self.levers.ground_near_chunks as usize };
+                            if near_walk > 0 || self.levers.ground_steep_first {
+                                // ONE WALK, NEAREST CHUNK FIRST, each chunk's three
+                                // slope ranges by their own readers -- not all the
+                                // mixed, then all the gentle, then all the steep,
+                                // which drew a near cliff last. See `chunk_order`.
+                                // Past the first `near_walk` chunks drawn, the
+                                // rest reader by reader, still nearest first.
+                                let mixed = if terrain_in_probe_pass { self.terrain_reader() } else { self.sp_terrain_twins(stereo) };
+                                let gentle = self.terrain_gentle.as_ref().filter(|_| gentle_split.is_some());
+                                let steep = self.terrain_steep.as_ref().filter(|_| steep_split.is_some());
+                                // Which reader is bound: 0 the mixed (bound above), 1 gentle, 2 steep;
+                                // and whether its shaped pipeline, for a run
+                                // of the coarser lists (`TerrainPipeline::at`).
+                                let mut bound = (0usize, false);
+                                let reader = |which: usize, coarse: bool| match (which, gentle, steep) {
+                                    (1, Some(gentle), _) => gentle[twin].at(coarse),
+                                    (2, _, Some(steep)) => steep[twin].at(coarse),
+                                    _ => mixed.at(coarse),
+                                };
+                                // Each of a chunk's slope ranges: 0 the mixed, 1 gentle, 2 steep.
+                                let ranges = |k: usize, c: &crate::renderer::shadow::CasterChunk| {
+                                    let g = if gentle.is_some() { gentle_of(k).min(c.index_count) } else { 0 };
+                                    let st = if steep.is_some() { steep_of(k).min(c.index_count - g) } else { 0 };
+                                    let end = c.index_count - st;
+                                    [(1usize, 0..g), (0, g..end), (2, end..c.index_count)]
+                                };
+                                let mut far: Vec<(usize, &crate::renderer::shadow::CasterChunk)> = Vec::new();
+                                let mut walked = 0usize;
+                                for (k, c) in ordered_chunks() {
+                                    if !terrain_chunk_visible(c) {
+                                        terrain_culled += c.index_count;
+                                        continue;
+                                    }
+                                    if weathered(c) {
+                                        continue;
                                     }
                                     terrain_drawn += c.index_count;
-                                } else if !terrain_chunk_visible(c) {
-                                    terrain_culled += c.index_count;
-                                }
-                            }
-                            if let Some(gentle) = self.terrain_gentle.as_ref().filter(|_| gentle_split.is_some()) {
-                                let mut bound = false;
-                                for (k, c) in solid_chunks.iter().enumerate() {
-                                    let g = gentle_of(k).min(c.index_count);
-                                    if g > 0 && terrain_chunk_visible(c) && !weathered(c) {
-                                        if !bound {
-                                            pass.set_pipeline(&gentle[twin].pipeline);
-                                            bound = true;
+                                    if walked >= near_walk {
+                                        far.push((k, c));
+                                        continue;
+                                    }
+                                    walked += 1;
+                                    let coarse = c.first_index >= ground_coarse_from;
+                                    for (which, range) in ranges(k, c) {
+                                        if range.is_empty() {
+                                            continue;
                                         }
-                                        pass.draw_indexed(c.first_index..c.first_index + g, 0, 0..1);
+                                        if bound != (which, coarse) {
+                                            pass.set_pipeline(reader(which, coarse));
+                                            bound = (which, coarse);
+                                        }
+                                        pass.draw_indexed(c.first_index + range.start..c.first_index + range.end, 0, 0..1);
                                     }
                                 }
-                            }
-                            if let Some(steep) = self.terrain_steep.as_ref().filter(|_| steep_split.is_some()) {
-                                let mut bound = false;
-                                for (k, c) in solid_chunks.iter().enumerate() {
-                                    let g = gentle_of(k).min(c.index_count);
-                                    let st = steep_of(k).min(c.index_count - g);
-                                    if st > 0 && terrain_chunk_visible(c) && !weathered(c) {
-                                        if !bound {
-                                            pass.set_pipeline(&steep[twin].pipeline);
-                                            bound = true;
+                                // The chunks beyond: gentle, mixed, steep, each nearest
+                                // first -- or what stands up first, steep, mixed,
+                                // gentle (`Levers::ground_steep_first`).
+                                // (A reader's runs that touch in the buffer --
+                                // a block of chunks that are all its own --
+                                // as one draw: `ground_lod::merged`.)
+                                for which in crate::renderer::ground_twins::reader_order(self.levers.ground_steep_first) {
+                                    let reader_runs = crate::renderer::ground_lod::merged(far.iter().map(|(k, c)| {
+                                        let range = ranges(*k, c)[match which { 1 => 0, 0 => 1, _ => 2 }].1.clone();
+                                        (c.first_index + range.start, range.end - range.start)
+                                    }));
+                                    for (first, len) in reader_runs {
+                                        for (first, len, coarse) in crate::renderer::terrain_pipeline::by_step(first, len, ground_coarse_from) {
+                                            if bound != (which, coarse) {
+                                                pass.set_pipeline(reader(which, coarse));
+                                                bound = (which, coarse);
+                                            }
+                                            pass.draw_indexed(first..first + len, 0, 0..1);
                                         }
-                                        pass.draw_indexed(c.first_index + c.index_count - st..c.first_index + c.index_count, 0, 0..1);
+                                    }
+                                }
+                            } else {
+                                // (A coarser list's chunk by the shaped
+                                // pipeline: `TerrainPipeline::at`.)
+                                let mixed = if terrain_in_probe_pass { self.terrain_reader() } else { self.sp_terrain_twins(stereo) };
+                                let mut shaped_bound = false;
+                                for (k, c) in solid_chunks.iter().enumerate() {
+                                    if terrain_chunk_visible(c) && !weathered(c) {
+                                        let g = gentle_of(k).min(c.index_count);
+                                        let end = c.index_count - steep_of(k).min(c.index_count - g);
+                                        if g < end {
+                                            let coarse = c.first_index >= ground_coarse_from;
+                                            if coarse != shaped_bound {
+                                                pass.set_pipeline(mixed.at(coarse));
+                                                shaped_bound = coarse;
+                                            }
+                                            pass.draw_indexed(c.first_index + g..c.first_index + end, 0, 0..1);
+                                        }
+                                        terrain_drawn += c.index_count;
+                                    } else if !terrain_chunk_visible(c) {
+                                        terrain_culled += c.index_count;
+                                    }
+                                }
+                                if let Some(gentle) = self.terrain_gentle.as_ref().filter(|_| gentle_split.is_some()) {
+                                    let mut bound: Option<bool> = None;
+                                    for (k, c) in solid_chunks.iter().enumerate() {
+                                        let g = gentle_of(k).min(c.index_count);
+                                        if g > 0 && terrain_chunk_visible(c) && !weathered(c) {
+                                            let coarse = c.first_index >= ground_coarse_from;
+                                            if bound != Some(coarse) {
+                                                pass.set_pipeline(gentle[twin].at(coarse));
+                                                bound = Some(coarse);
+                                            }
+                                            pass.draw_indexed(c.first_index..c.first_index + g, 0, 0..1);
+                                        }
+                                    }
+                                }
+                                if let Some(steep) = self.terrain_steep.as_ref().filter(|_| steep_split.is_some()) {
+                                    let mut bound: Option<bool> = None;
+                                    for (k, c) in solid_chunks.iter().enumerate() {
+                                        let g = gentle_of(k).min(c.index_count);
+                                        let st = steep_of(k).min(c.index_count - g);
+                                        if st > 0 && terrain_chunk_visible(c) && !weathered(c) {
+                                            let coarse = c.first_index >= ground_coarse_from;
+                                            if bound != Some(coarse) {
+                                                pass.set_pipeline(steep[twin].at(coarse));
+                                                bound = Some(coarse);
+                                            }
+                                            pass.draw_indexed(c.first_index + c.index_count - st..c.first_index + c.index_count, 0, 0..1);
+                                        }
                                     }
                                 }
                             }
@@ -2795,18 +3951,49 @@ impl XrRenderer {
                                 // The gentle triangles by the twin for what
                                 // their areas hold, when there are twins.
                                 let gentle_w = |k: usize| if w.gentle.is_empty() { 0 } else { gentle_of(k) };
+                                // A chunk that holds no standing water and no
+                                // snow -- a beach's washed chunks with the cliff
+                                // over them -- draws its mixed and its steep
+                                // triangles by the wet-only twins, which fit
+                                // the instruction cache where the full weather
+                                // reader does not (`Levers::wet_steep_twins`,
+                                // `ground_twins::wet_readers`).
+                                let wet = w.wet.as_ref().filter(|_| self.levers.wet_steep_twins && !w.gentle.is_empty());
+                                let wet_only = |c: &crate::renderer::shadow::CasterChunk| {
+                                    wet.is_some() && w.kinds_of(c.first_index - index_start) == crate::renderer::weather::WeatherKinds::WetOnly
+                                };
                                 pass.set_pipeline(&self.terrain_weather_reader(w).pipeline);
                                 pass.set_bind_group(2, &w.maps.bind_group, &[]);
-                                for (k, c) in solid_chunks.iter().enumerate().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
+                                for (k, c) in ordered_chunks().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
                                     let g = gentle_w(k).min(c.index_count);
-                                    if g < c.index_count {
+                                    if g < c.index_count && !wet_only(c) {
                                         pass.draw_indexed(c.first_index + g..c.first_index + c.index_count, 0, 0..1);
                                     }
                                     terrain_drawn += c.index_count;
                                 }
+                                if let Some(wet) = wet {
+                                    // 0 the mixed range by the mixed twin, 1 the
+                                    // steep range by the steep one.
+                                    for which in 0..2 {
+                                        let mut bound = false;
+                                        for (k, c) in ordered_chunks().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c) && wet_only(c)) {
+                                            let g = gentle_w(k).min(c.index_count);
+                                            let end = c.index_count - steep_of(k).min(c.index_count - g);
+                                            let range = if which == 0 { g..end } else { end..c.index_count };
+                                            if range.is_empty() {
+                                                continue;
+                                            }
+                                            if !bound {
+                                                pass.set_pipeline(&wet[which][twin].pipeline);
+                                                bound = true;
+                                            }
+                                            pass.draw_indexed(c.first_index + range.start..c.first_index + range.end, 0, 0..1);
+                                        }
+                                    }
+                                }
                                 for kinds in crate::renderer::weather::WeatherKinds::ALL {
                                     let mut bound = false;
-                                    for (k, c) in solid_chunks.iter().enumerate().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
+                                    for (k, c) in ordered_chunks().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
                                         let g = gentle_w(k).min(c.index_count);
                                         if g == 0 || w.kinds_of(c.first_index - index_start) != kinds {
                                             continue;
@@ -2829,9 +4016,11 @@ impl XrRenderer {
                             };
                             log::info!(
                                 "TERRAINCULL: drew {terrain_drawn} of {total} indices \
-                                 ({pct:.1}% culled) over {} chunks, {} frustum(s)",
+                                 ({pct:.1}% culled) over {} chunks, {} frustum(s); {} chunk(s) and {} water behind the ground",
                                 solid_chunks.len(),
                                 cull_planes.len(),
+                                horizon_hidden.iter().filter(|h| **h).count(),
+                                horizon_water.iter().filter(|h| **h).count(),
                             );
                         }
                     }
@@ -2880,6 +4069,11 @@ impl XrRenderer {
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
                     }
+                    // THE MODELS THIS PASS'S EYES CAN SEE INTO: the rest are not
+                    // drawn (`scene_cull`).
+                    let scene_cull = self.levers.scene_cull;
+                    let mesh_seen =
+                        |d: &MeshDraw| !scene_cull || (crate::renderer::scene_cull::sees(&cull_planes, d.bound) && room_shows(d.bound));
                     if !layered_draws.is_empty() {
                         // One material bind for the batch: every cave in a scene
                         // blends the same four terrain layers, so the only thing
@@ -2887,12 +4081,41 @@ impl XrRenderer {
                         pass.set_pipeline(self.sp_layered(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
-                        for (model_bg, vb, ib, count) in &layered_draws {
+                        // BY ITS SHADER'S TWINS in the single-eye pass: each
+                        // triangle class by the twin without the path its
+                        // pixels never take. See `cave_twins`.
+                        let twins = self.cave_twins.as_ref().filter(|_| !stereo && self.levers.cave_twins);
+                        for (model_bg, vb, ib, count, ends, bounds) in &layered_draws {
+                            if self.levers.scene_cull && !crate::renderer::scene_cull::sees_box(&cull_planes, *bounds) {
+                                continue;
+                            }
                             pass.set_bind_group(2, *model_bg, &[]);
                             pass.set_vertex_buffer(0, vb.slice(..));
                             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..*count, 0, 0..1);
+                            match (twins, ends) {
+                                (Some(t), Some(ends)) if ends[3] == *count => {
+                                    t.draw(&mut pass, self.sp_layered(stereo), *ends)
+                                }
+                                _ => {
+                                    pass.set_pipeline(self.sp_layered(stereo));
+                                    pass.draw_indexed(0..*count, 0, 0..1);
+                                }
+                            }
                         }
+                    }
+                    // THE BAKED CAVES, the chunks this pass's eyes can see into
+                    // (those not drawn before the ground: `Levers::cave_first`).
+                    if !baked_cave_draws.is_empty() {
+                        self.baked_cave_pipelines.draw_scene(
+                            &mut pass,
+                            &self.uniform_buf.bind_group,
+                            &self.terrain_material.bind_group,
+                            &baked_cave_draws,
+                            self.levers.scene_cull.then_some(&cull_planes[..]),
+                            self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed),
+                            stereo,
+                            self.levers.cave_first.then_some((cam_pos, false)),
+                        );
                     }
                     if !wire_verts.is_empty() {
                         pass.set_pipeline(self.sp_wire(stereo));
@@ -2902,12 +4125,13 @@ impl XrRenderer {
                         pass.draw_indexed(0..wire_idx.len() as u32, 0, 0..1);
                     }
                     if !mesh_draws.is_empty() {
-                        pass.set_pipeline(self.sp_mesh(stereo));
+                        // Without blending: see `Levers::opaque_models`.
+                        pass.set_pipeline(self.sp_mesh_opaque(stereo).unwrap_or(self.sp_mesh(stereo)));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         // The opaque parts. A primitive with thin parts draws
                         // the rest here and those in the thin pass, after the
                         // sky; glass waits for that too.
-                        for d in mesh_draws.iter().filter(|d| !d.blended) {
+                        for d in mesh_draws.iter().filter(|d| !d.blended && mesh_seen(d)) {
                             let (ib, count) = match (d.thin, thin_pass) {
                                 (Some(t), true) => (&t.solid_index_buffer, t.solid_count),
                                 _ => (d.indices, d.count),
@@ -2924,16 +4148,49 @@ impl XrRenderer {
                         }
                     }
                     if !skinned_draws.is_empty() {
-                        pass.set_pipeline(self.sp_skinned(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in &skinned_draws {
-                            pass.set_bind_group(1, *model_bg, &[]);
-                            pass.set_bind_group(2, *tex_bg, &[]);
-                            pass.set_bind_group(3, *joint_bg, &[]);
-                            pass.set_vertex_buffer(0, vb.slice(..));
-                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..*count, 0, 0..1);
+                        // A body's opaque parts without blending, then its
+                        // see-through ones (the boy's hair and clothing
+                        // extras) blended over them; with the lever off, all
+                        // blended in the order they came, as before. See
+                        // `Levers::opaque_models`.
+                        // Each run: which parts (`None`: all), and with what.
+                        let blended_body = self.sp_skinned(stereo);
+                        let runs: [Option<(Option<bool>, &wgpu::RenderPipeline)>; 2] = match self.sp_skinned_opaque(stereo) {
+                            Some(opaque) => [Some((Some(false), opaque)), Some((Some(true), blended_body))],
+                            None => [Some((None, blended_body)), None],
+                        };
+                        for (which, pipeline) in runs.into_iter().flatten() {
+                            let mut set = false;
+                            for (model_bg, tex_bg, joint_bg, vb, ib, count, blended) in &skinned_draws {
+                                if which.is_some_and(|w| w != *blended) {
+                                    continue;
+                                }
+                                if !set {
+                                    pass.set_pipeline(pipeline);
+                                    set = true;
+                                }
+                                pass.set_bind_group(1, *model_bg, &[]);
+                                pass.set_bind_group(2, *tex_bg, &[]);
+                                pass.set_bind_group(3, *joint_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
                         }
+                    }
+                    // THE SKY BEFORE THE WATER (`Levers::sky_before_water`):
+                    // the water's blended depth-writing draw turns Adreno's LRZ
+                    // off for the rest of the pass, and the sky is the biggest
+                    // draw after it. Where the sky is behind water the water
+                    // multiplies it away (`through` carries `drawn`, 0 there).
+                    // Not with the eye in a body: see below.
+                    let sky_first = self.levers.sky_before_water && eye_in_water.is_none();
+                    if sky_first {
+                        pass.set_pipeline(self.sp_sky(stereo));
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.sky.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
                     }
                     // WATER LAST of the world geometry, and that ordering is
                     // the whole reason it looks right: it tints what is
@@ -2971,12 +4228,28 @@ impl XrRenderer {
                                 continue;
                             }
                             // Along a waterline, its twin that leaves the
-                            // view under the line to the underwater one.
-                            pass.set_pipeline(if eyes_body { &self.water_pipeline.waterline } else { self.sp_water(stereo) });
+                            // view under the line to the underwater one. The
+                            // frame's planar mirror, its mirror twin over
+                            // this eye's image (`planar_water`).
+                            if planar_eye.is_some_and(|p| p.0 == i) {
+                                pass.set_pipeline(self.water_pipeline.mirrored_for_rings(&body.uniform.rings[0], &body.uniform.ring_drops));
+                                pass.set_bind_group(2, &self.planar_groups[eye], &[]);
+                            } else {
+                                pass.set_pipeline(if eyes_body { &self.water_pipeline.waterline } else { self.sp_water(stereo) });
+                            }
                             pass.set_bind_group(1, &body.bind_groups[body.waves.current()], &[]);
                             pass.set_vertex_buffer(0, body.vertex_buffer.slice(..));
                             pass.set_index_buffer(body.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..body.index_count, 0, 0..1);
+                            // The eye's own body whole (its waterline's twin
+                            // and the view under it are cut by the eye, not
+                            // by what it sees); another's by its seen runs.
+                            if eyes_body {
+                                pass.draw_indexed(0..body.index_count, 0, 0..1);
+                            } else {
+                                for range in body.ranges.borrow().iter() {
+                                    pass.draw_indexed(range.clone(), 0, 0..1);
+                                }
+                            }
                         }
                     }
                     // THE SKY, after every opaque and before anything blended.
@@ -2989,7 +4262,7 @@ impl XrRenderer {
                     // blended and have to land on top of it.
                     // Not from wholly under the water: it shows only through
                     // the surface, whose underside draws it.
-                    if !wholly_under {
+                    if !wholly_under && !sky_first {
                         pass.set_pipeline(self.sp_sky(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.sky.bind_group, &[]);
@@ -3019,7 +4292,7 @@ impl XrRenderer {
                     if thin_pass {
                         pass.set_pipeline(self.sp_mesh_thin(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for d in mesh_draws.iter().filter(|d| !d.blended) {
+                        for d in mesh_draws.iter().filter(|d| !d.blended && mesh_seen(d)) {
                             let Some(t) = d.thin else { continue };
                             pass.set_bind_group(1, d.model, &[]);
                             pass.set_bind_group(2, d.texture, &[]);
@@ -3037,7 +4310,7 @@ impl XrRenderer {
                     if mesh_draws.iter().any(|d| d.blended) {
                         pass.set_pipeline(self.sp_mesh(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for d in mesh_draws.iter().filter(|d| d.blended) {
+                        for d in mesh_draws.iter().filter(|d| d.blended && mesh_seen(d)) {
                             pass.set_bind_group(1, d.model, &[]);
                             pass.set_bind_group(2, d.texture, &[]);
                             pass.set_bind_group(3, d.lightmap, &[]);
@@ -3259,7 +4532,9 @@ impl XrRenderer {
                     let reflect_group = sw.reflect_groups.get(image_index).map(|g| &g[eye]).filter(|_| warp_reflections);
                     if let Some((vb, ib, n)) = brush_buffers.as_ref() {
                         let kind = if reflect_group.is_some() { MotionKind::BrushReflect } else { MotionKind::Brush };
-                        let brush = |first: u32, count: u32| MotionDraw { kind, vertices: vb, indices: ib, first, count, slot: base, joints: reflect_group };
+                        // From their own slot where they are world vertices.
+                        let slot = if warp_brush_world { base + warp_brush_slot } else { base };
+                        let brush = |first: u32, count: u32| MotionDraw { kind, vertices: vb, indices: ib, first, count, slot, joints: reflect_group };
                         match brush_motion_ranges.as_ref() {
                             Some(ranges) => draws.extend(ranges[eye].iter().map(|&(first, count)| brush(first, count))),
                             None => draws.push(brush(0, *n)),
@@ -3277,13 +4552,25 @@ impl XrRenderer {
                         joints: None,
                     };
                     match terrain_range {
-                        Some((start, _)) if !solid_chunks.is_empty() => {
-                            draws.push(solid(0, start));
-                            for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c)) {
-                                draws.push(solid(c.first_index, c.index_count));
+                        Some((start, count)) if ground_partitioned => {
+                            // The cuboids lie before the ground's indices, or
+                            // after them (`Levers::ground_buffers`).
+                            for (first, n) in [(0, start), (start + count, solid_index_count.saturating_sub(start + count))] {
+                                if n > 0 {
+                                    draws.push(solid(first, n));
+                                }
+                            }
+                            // The ground's chunks from the world's slot
+                            // where they are world vertices.
+                            let slot = if self.ground_world { base + warp_per_eye - 1 } else { base };
+                            // (Chunks that touch in the buffer as one draw;
+                            // a block seen whole as its range: `Wholes::runs`.)
+                            let seen = ground_wholes.runs(&solid_chunks, |k| terrain_chunk_visible(&solid_chunks[k]));
+                            for (first, count) in seen {
+                                draws.push(MotionDraw { slot, ..solid(first, count) });
                             }
                         }
-                        _ => draws.push(solid(0, solid_idx.len() as u32)),
+                        _ => draws.push(solid(0, solid_index_count)),
                     }
                     for (i, (inst, _, _)) in warp_meshes.iter().enumerate() {
                         let slot = base + 1 + i as u32;
@@ -3294,6 +4581,10 @@ impl XrRenderer {
                                 crate::renderer::shadow::mesh_caster_bound(&inst.mesh),
                             )
                         {
+                            continue;
+                        }
+                        // Nor a model the room's walls hide, as the scene pass.
+                        if inst.mesh.skin.is_none() && !room_shows(crate::renderer::shadow::mesh_caster_bound(&inst.mesh)) {
                             continue;
                         }
                         if let Some(skin) = &inst.mesh.skin {
@@ -3316,30 +4607,51 @@ impl XrRenderer {
                             // compositor moved its pixels by the ridge's outer
                             // face behind them, and the cave smeared.
                             for prim in inst.mesh.primitives.iter() {
-                                draws.push(MotionDraw {
-                                    kind: MotionKind::Mesh,
-                                    vertices: &prim.vertex_buffer,
-                                    indices: &prim.index_buffer,
-                                    first: 0,
-                                    count: prim.indices.len() as u32,
-                                    slot,
-                                    joints: None,
-                                });
+                                // A BAKED CAVE IN THE CHUNKS THIS EYE SEES
+                                // (`Levers::cave_chunk_cull`), as the scene
+                                // pass draws it: its index buffer is in its
+                                // chunks' order. Lossless, as the cull above:
+                                // the GPU clipped the rest.
+                                let runs = match &prim.baked_cave {
+                                    Some(cave) if warp_cull && self.levers.cave_chunk_cull => {
+                                        crate::renderer::baked_cave::visible_ranges(
+                                            &cave.chunks,
+                                            inst.mesh.model_matrix(),
+                                            Some(std::slice::from_ref(&warp_planes[eye])),
+                                            None,
+                                        )
+                                    }
+                                    _ => vec![0..prim.indices.len() as u32],
+                                };
+                                for run in runs {
+                                    draws.push(MotionDraw {
+                                        kind: MotionKind::Mesh,
+                                        vertices: &prim.vertex_buffer,
+                                        indices: &prim.index_buffer,
+                                        first: run.start,
+                                        count: run.end - run.start,
+                                        slot,
+                                        joints: None,
+                                    });
+                                }
                             }
                         }
                     }
                     if warp_water {
                         for body in self.water_bodies.iter().filter(|b| b.seen.get()) {
                             let Some(groups) = &body.motion_groups else { continue };
-                            draws.push(MotionDraw {
-                                kind: MotionKind::Water,
-                                vertices: &body.vertex_buffer,
-                                indices: &body.index_buffer,
-                                first: 0,
-                                count: body.index_count,
-                                slot: base + warp_per_eye - 1,
-                                joints: Some(&groups[body.waves.current()]),
-                            });
+                            // Its seen runs, as the scene pass drew them.
+                            for range in body.ranges.borrow().iter() {
+                                draws.push(MotionDraw {
+                                    kind: MotionKind::Water,
+                                    vertices: &body.vertex_buffer,
+                                    indices: &body.index_buffer,
+                                    first: range.start,
+                                    count: range.end - range.start,
+                                    slot: base + warp_per_eye - 1,
+                                    joints: Some(&groups[body.waves.current()]),
+                                });
+                            }
                         }
                     }
                     // THE PARTICLES, over all that: the effects and the weather,
@@ -3351,16 +4663,13 @@ impl XrRenderer {
                     let mut particles: Vec<MotionParticles> = Vec::new();
                     if self.levers.space_warp_debug & 262144 == 0 {
                         if let (true, Some(gpu)) = (effects_drawn, self.effects_gpu.as_ref()) {
-                            let (instances, group, over, screened) = gpu.motion_parts();
-                            for (kind, range) in [
-                                (MotionKind::EffectsOver, 0..over),
-                                (MotionKind::EffectsScreened, over..over + screened),
-                            ] {
+                            let (instances, group, runs) = gpu.motion_parts();
+                            for run in runs {
                                 particles.push(MotionParticles {
-                                    kind,
+                                    kind: MotionKind::Effects(run.variant),
                                     instances: Some(instances),
                                     vertices: crate::renderer::effects::VERTICES_PER_PARTICLE,
-                                    range,
+                                    range: run.first..run.first + run.count,
                                     slot: base,
                                     groups: [Some(probe_read_group), Some(group)],
                                 });
@@ -3619,6 +4928,14 @@ impl XrRenderer {
         let _ = self.wgpu_device.poll(wait);
         let gpu_time = gpu_wait_start.elapsed();
         let outcome = self.frame_stats.record(cpu_time, gpu_time, std::time::Instant::now());
+        // What the frame's parts reported of their own CPU work: summed over
+        // the measured frames, as the averages are.
+        if outcome.measured {
+            for (part, value) in &self.cpu_frame {
+                *self.cpu_window.entry(part).or_default() += value;
+            }
+        }
+        self.cpu_frame.clear();
         // The runtime's counters, every measured frame, so the window carries
         // their average rather than the one frame that closed it.
         if outcome.measured {
@@ -3630,6 +4947,10 @@ impl XrRenderer {
         // which stalls the render thread; doing that every frame would make the
         // instrument change the thing it is measuring.
         if let Some(stats) = outcome.closed {
+            let cpu_parts: std::collections::BTreeMap<String, f64> = std::mem::take(&mut self.cpu_window)
+                .into_iter()
+                .map(|(part, sum)| (part.to_string(), sum / stats.frames.max(1) as f64))
+                .collect();
             let cycling = crate::renderer::perf_ab::ENABLED || self.levers.ab_cycle;
             // Labelled with the phase these frames ran under. The window just
             // logged was ALL one phase, because the phase only advances here --
@@ -3702,6 +5023,7 @@ impl XrRenderer {
                     fps: stats.fps,
                     pass: breakdown.iter().flatten().map(|t| (t.label.clone(), t.ms)).collect(),
                     xr: counters.iter().map(|c| (c.short.clone(), c.value)).collect(),
+                    cpu: cpu_parts,
                 };
                 log.write(record.to_line());
             }

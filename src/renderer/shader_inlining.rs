@@ -250,7 +250,7 @@ impl Live<'_> {
 }
 
 /// A condition's value where constants alone decide it.
-fn const_bool(module: &Module, arena: &Arena<Expression>, h: Handle<Expression>) -> Option<bool> {
+pub(super) fn const_bool(module: &Module, arena: &Arena<Expression>, h: Handle<Expression>) -> Option<bool> {
     match arena[h] {
         Expression::Literal(Literal::Bool(b)) => Some(b),
         Expression::Constant(c) => const_bool(module, &module.global_expressions, module.constants[c].init),

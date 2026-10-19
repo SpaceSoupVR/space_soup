@@ -61,17 +61,25 @@ pub const QUEST_SHADOW_DIM: u32 = 1024;
 /// arrangement, and it paid for every brush to shadow one avatar.
 ///
 /// This map holds only what moves, over `SUN_DYNAMIC_RADIUS` around the
-/// player, so it is small and nearly empty: 512 over a 6 m box is 1.2 cm a
-/// texel, sharper than the level map, for 1 MB of depth and a pass with a
+/// player, so it is small and nearly empty: 512 over an 18 m box is 3.5 cm a
+/// texel for what stands away from the player, and its near tile holds the
+/// player at 0.59 cm (`SUN_NEAR_ZOOM`), for 1 MB of depth and a pass with a
 /// handful of draws in it.
 pub const SUN_DYNAMIC_DIM: u32 = 512;
 
 /// Half the side of the box the moving-objects sun map covers, in metres.
 ///
-/// An avatar is under 2 m tall and this sun's shadow of it is about as long
-/// again, so 3 m around the head holds the whole shadow with room to reach a
-/// held object at arm's length. Past it, a moving object casts no sun shadow.
-pub const SUN_DYNAMIC_RADIUS: f32 = 3.0;
+/// What moves within it casts a sun shadow; past it, nothing that moves does.
+/// The map is the sun's view, so it has to hold the CASTER, not its shadow.
+///
+/// 3 m until 2026-10-14, which held the player and what they hold and
+/// nothing else: a crate tossed into the pond cast no shadow until the
+/// player had walked to within about 3 m of it, and its shadow then appeared
+/// (headset 093004-093020). 9 m holds a prop the player is looking at across
+/// a pond or a room; the player's own shadow stays in the near tile at the
+/// detail it had (`SUN_NEAR_ZOOM` went 2 -> 6 with this), and a prop's, 3.5 cm
+/// a texel, is a dozen texels across a 40 cm crate.
+pub const SUN_DYNAMIC_RADIUS: f32 = 9.0;
 
 /// How many spot lights can cast a real-time shadow at once.
 ///
@@ -124,20 +132,21 @@ pub const MAX_BODY_TILES: usize = 2;
 /// characters', then the sun's near tile. See `SUN_DYNAMIC_DIM`.
 pub const SUN_ATLAS_TILES: u32 = 2 + MAX_CHARACTER_SHADOWS as u32;
 
-/// THE PLAYER'S OWN SUN SHADOW AT TWICE THE DETAIL: the near tile holds the
-/// middle half of the sun tile's box -- 1.5 m round the player's body -- at
-/// 0.59 cm a texel where the sun tile has 1.17, and the shader reads it
-/// wherever it holds the point (`sun_moving_visibility`). The sun tile still
-/// holds everything out to 3 m.
+/// THE PLAYER'S OWN SUN SHADOW AT SIX TIMES THE DETAIL: the near tile holds
+/// the middle sixth of the sun tile's box -- 1.5 m round the player's body --
+/// at 0.59 cm a texel where the sun tile has 3.5, and the shader reads it
+/// wherever it holds the point (`sun_moving_visibility`). The sun tile holds
+/// everything else that moves out to 9 m (`SUN_DYNAMIC_RADIUS`). Two, over a
+/// 3 m sun tile, until 2026-10-14: the same near tile.
 ///
 /// WHY HALF THE BOX IS ENOUGH: the map is the sun's view, so a caster and its
 /// shadow on the ground land on the SAME texel. The player's shadow can be as
 /// long as they are tall, but the map only has to hold the player: their whole
 /// body, arms raised, is inside 1.5 m of its middle seen along the sun.
 ///
-/// WHY EXACTLY TWO: the near matrix is the sun tile's scaled by two about its
-/// middle (`sun_near_matrix`), so a texel corner of the sun tile at `t` is at
-/// `2t - SUN_DYNAMIC_DIM / 2` in the near tile -- a texel corner there too.
+/// WHY A WHOLE NUMBER: the near matrix is the sun tile's scaled by it about
+/// its middle (`sun_near_matrix`), so a texel corner of the sun tile at `t` is
+/// at `6t - 5 SUN_DYNAMIC_DIM / 2` in the near tile -- a texel corner there too.
 /// The world stays snapped to the near tile's grid as it is to the sun tile's
 /// (`lights::dynamic_sun_matrix`), and the shader finds the near coordinates
 /// from the sun tile's with no matrix of its own.
@@ -147,7 +156,7 @@ pub const SUN_ATLAS_TILES: u32 = 2 + MAX_CHARACTER_SHADOWS as u32;
 /// much higher quality?" A 1.17 cm texel is eight display pixels at two metres
 /// on a Quest 3. The Quest filters the map linearly (logged at startup), so the
 /// kernel was not the fault: the texel was.
-pub const SUN_NEAR_ZOOM: f32 = 2.0;
+pub const SUN_NEAR_ZOOM: f32 = 6.0;
 
 /// The near tile's place in the row. See `SUN_NEAR_ZOOM`.
 pub const SUN_NEAR_TILE: u32 = 1 + MAX_CHARACTER_SHADOWS as u32;
@@ -976,8 +985,19 @@ pub struct ShadowMap {
     spot_array_view: TextureView,
     /// Side of one tile in texels; the atlas is `SPOT_ATLAS_COLS` of these.
     spot_tile_dim: u32,
+    /// DIAGNOSIS: each spot tile drawn with a scissor as well as its viewport
+    /// (`Levers::spot_caster_drop` 128), to rule out a tile's casters
+    /// reaching its neighbour's texels.
+    tile_scissor: std::cell::Cell<bool>,
     sampler: Sampler,
     solid_pipeline: RenderPipeline,
+    /// The solid pipeline for vertices in the WORLD -- the ground, where it
+    /// is kept so (`terrain_pipeline::WORLD_GROUND`): `vs_mesh` over solid
+    /// vertices, posed by the model matrix in [`Self::solid_world`].
+    solid_world_pipeline: RenderPipeline,
+    /// The player's frame from the world, as a model's uniform, when the
+    /// ground's chunks are world vertices this frame. See `set_solid_world`.
+    solid_world: std::cell::RefCell<Option<(BindGroup, bool)>>,
     mesh_pipeline: RenderPipeline,
     skinned_pipeline: RenderPipeline,
     /// A skinned caster posed once this frame (`skin_compute`), drawn as a
@@ -987,6 +1007,13 @@ pub struct ShadowMap {
     /// different stride -- the shader is `vs_solid`, unchanged, because a depth
     /// pass reads position and nothing else.
     brush_pipeline: RenderPipeline,
+    /// The brush pipeline for vertices in the WORLD -- the rooms, where they
+    /// are kept so (`brush_pipeline::WORLD_BRUSHES`): `vs_mesh` over brush
+    /// vertices, posed by the model matrix in [`Self::brush_world`].
+    brush_world_pipeline: RenderPipeline,
+    /// The player's frame from the world, as a model's uniform, when the
+    /// brushes are world vertices this frame. See `set_brush_world`.
+    brush_world: std::cell::RefCell<Option<BindGroup>>,
 }
 
 impl ShadowMap {
@@ -1125,6 +1152,35 @@ impl ShadowMap {
             bind_group_layouts: &[Some(&light_layout), Some(&model_layout)],
             immediate_size: 0,
         });
+        // As the solid pipeline in everything but where its vertices are.
+        let solid_world_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("shadow_solid_world_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_mesh"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(SolidVertex::layout())],
+            },
+            fragment: None,
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: Some(Face::Back),
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
+                stencil: StencilState::default(),
+                bias,
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let mesh_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("shadow_mesh_pipeline"),
             layout: Some(&mesh_layout),
@@ -1251,6 +1307,36 @@ impl ShadowMap {
             cache: None,
         });
 
+        // As the brush pipeline in everything but where its vertices are.
+        let brush_world_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("shadow_brush_world_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_mesh"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(super::brush_pipeline::BrushVertex::layout())],
+            },
+            fragment: None,
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: Some(Face::Back),
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
+                stencil: StencilState::default(),
+                bias,
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let sun = ShadowSlot::new(device, &light_layout, "sun_shadow_depth", dim);
         // ONE 2D atlas, `SPOT_ATLAS_COLS` tiles a side, so every spot's depth
         // is filled by moving the viewport inside a single render pass. Same
@@ -1297,12 +1383,17 @@ impl ShadowMap {
             _spot_texture: spot_texture,
             spot_array_view,
             spot_tile_dim: dim,
+            tile_scissor: Default::default(),
             sampler,
             solid_pipeline,
+            solid_world_pipeline,
+            solid_world: Default::default(),
             mesh_pipeline,
             skinned_pipeline,
             posed_pipeline,
             brush_pipeline,
+            brush_world_pipeline,
+            brush_world: Default::default(),
         }
     }
 
@@ -1342,6 +1433,10 @@ impl ShadowMap {
 
     /// Side of one spot tile in texels, which a spot's lookup bias is
     /// measured in. See `spot_shadow_matrices`.
+    pub fn set_tile_scissor(&self, on: bool) {
+        self.tile_scissor.set(on);
+    }
+
     pub fn spot_tile_dim(&self) -> u32 {
         self.spot_tile_dim
     }
@@ -1369,6 +1464,40 @@ impl ShadowMap {
         // Its near tile's with it: always the same box, twice the detail.
         if kind == ShadowKind::SunDynamic {
             self.upload_light(queue, ShadowKind::SunNear, sun_near_matrix(view_proj));
+        }
+    }
+
+    /// THE GROUND'S CHUNKS ARE WORLD VERTICES (`Some`: the player's frame
+    /// from the world, as a mesh's model uniform) or posed ones (`None`), for
+    /// every pass recorded from here on. `whole`: so is the solid buffer
+    /// drawn whole, with no chunks handed (a harness whose solid buffer is
+    /// the ground alone); on the headset that buffer holds the frame's
+    /// posed cuboids too, and only the chunks are the world's.
+    pub fn set_solid_world(&self, model: Option<&BindGroup>, whole: bool) {
+        *self.solid_world.borrow_mut() = model.map(|m| (m.clone(), whole));
+    }
+
+    /// THE BRUSHES ARE WORLD VERTICES (`Some`: the player's frame from the
+    /// world, as a mesh's model uniform) or posed ones (`None`), for every
+    /// pass recorded from here on. See `brush_pipeline::WORLD_BRUSHES`.
+    pub fn set_brush_world(&self, model: Option<&BindGroup>) {
+        *self.brush_world.borrow_mut() = model.cloned();
+    }
+
+    /// The brush pipeline for a pass, with its group 1 where it has one.
+    fn brush_pipeline_now(&self) -> (&RenderPipeline, Option<BindGroup>) {
+        match self.brush_world.borrow().clone() {
+            Some(model) => (&self.brush_world_pipeline, Some(model)),
+            None => (&self.brush_pipeline, None),
+        }
+    }
+
+    /// The solid pipeline for a pass's solids, with its group 1 where it has
+    /// one: the world's when what is drawn is world vertices.
+    fn solid_pipeline_for(&self, chunks: bool) -> (&RenderPipeline, Option<BindGroup>) {
+        match self.solid_world.borrow().clone().filter(|(_, whole)| chunks || *whole) {
+            Some((model, _)) => (&self.solid_world_pipeline, Some(model)),
+            None => (&self.solid_pipeline, None),
         }
     }
 
@@ -1400,6 +1529,7 @@ impl ShadowMap {
         solid_chunks: &[CasterChunk],
     ) -> u32 {
         let mut drawn = 0u32;
+        let (solid_pipeline, solid_model) = self.solid_pipeline_for(!solid_chunks.is_empty());
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("spot_shadow_atlas_pass"),
             color_attachments: &[],
@@ -1415,6 +1545,10 @@ impl ShadowMap {
             let (col, row) = spot_tile(layer);
             let d = self.spot_tile_dim as f32;
             pass.set_viewport(col as f32 * d, row as f32 * d, d, d, 0.0, 1.0);
+            if self.tile_scissor.get() {
+                let t = self.spot_tile_dim;
+                pass.set_scissor_rect(col as u32 * t, row as u32 * t, t, t);
+            }
             // Per-spot frustum culling still applies -- it is worth less than
             // merging the passes was, but it is not worth nothing, and it is
             // already paid for.
@@ -1423,28 +1557,37 @@ impl ShadowMap {
 
             if let Some((vb, ib, total)) = solid {
                 if total > 0 {
-                    pass.set_pipeline(&self.solid_pipeline);
+                    pass.set_pipeline(solid_pipeline);
                     pass.set_bind_group(0, light_bg, &[]);
+                    if let Some(model) = &solid_model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     if solid_chunks.is_empty() {
                         pass.draw_indexed(0..total, 0, 0..1);
                         drawn += total;
                     } else {
-                        for c in solid_chunks {
-                            if !aabb_in_frustum(&planes, c.min, c.max) {
-                                continue;
-                            }
-                            pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
-                            drawn += c.index_count;
+                        // (Chunks that touch in the buffer -- a block of the
+                        // chunk grid -- as one draw: `ground_lod::merged`.)
+                        let runs = crate::renderer::ground_lod::merged(
+                            solid_chunks.iter().filter(|c| aabb_in_frustum(&planes, c.min, c.max)).map(|c| (c.first_index, c.index_count)),
+                        );
+                        for (first, count) in runs {
+                            pass.draw_indexed(first..first + count, 0, 0..1);
+                            drawn += count;
                         }
                     }
                 }
             }
             if let Some((vb, ib, total)) = brushes {
                 if total > 0 {
-                    pass.set_pipeline(&self.brush_pipeline);
+                    let (pipeline, model) = self.brush_pipeline_now();
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, light_bg, &[]);
+                    if let Some(model) = &model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(0..total, 0, 0..1);
@@ -1646,6 +1789,7 @@ impl ShadowMap {
             // A tile of the moving-objects map. See `SUN_ATLAS_TILES`.
             ShadowKind::Character(_) | ShadowKind::SunNear => self.sun_dynamic.depth_view.as_ref().expect("the dynamic sun owns its own depth target"),
         };
+        let (solid_pipeline, solid_model) = self.solid_pipeline_for(!solid_chunks.is_empty());
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("shadow_pass"),
             color_attachments: &[],
@@ -1680,8 +1824,11 @@ impl ShadowMap {
 
             if let Some((vb, ib, count)) = solid {
                 if count > 0 {
-                    pass.set_pipeline(&self.solid_pipeline);
+                    pass.set_pipeline(solid_pipeline);
                     pass.set_bind_group(0, &slot.light_bind_group, &[]);
+                    if let Some(model) = &solid_model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     if solid_chunks.is_empty() {
@@ -1691,16 +1838,12 @@ impl ShadowMap {
                         pass.draw_indexed(0..count, 0, 0..1);
                         drawn_indices += count;
                     } else {
-                        for c in solid_chunks {
-                            if !aabb_in_frustum(&planes, c.min, c.max) {
-                                continue;
-                            }
-                            pass.draw_indexed(
-                                c.first_index..c.first_index + c.index_count,
-                                0,
-                                0..1,
-                            );
-                            drawn_indices += c.index_count;
+                        let runs = crate::renderer::ground_lod::merged(
+                            solid_chunks.iter().filter(|c| aabb_in_frustum(&planes, c.min, c.max)).map(|c| (c.first_index, c.index_count)),
+                        );
+                        for (first, count) in runs {
+                            pass.draw_indexed(first..first + count, 0, 0..1);
+                            drawn_indices += count;
                         }
                     }
                 }
@@ -1719,8 +1862,12 @@ impl ShadowMap {
 
             if let Some((vb, ib, count)) = brushes {
                 if count > 0 {
-                    pass.set_pipeline(&self.brush_pipeline);
+                    let (pipeline, model) = self.brush_pipeline_now();
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &slot.light_bind_group, &[]);
+                    if let Some(model) = &model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(0..count, 0, 0..1);
@@ -3003,7 +3150,7 @@ mod render_tests {
     /// the near tile wherever the player stands, as on the sun tile's
     /// (`lights::dynamic_sun_matrix`) -- so a moving shadow's edge does not
     /// crawl in the near tile either -- and the near tile is the sun tile's
-    /// middle at twice the size, depth unchanged.
+    /// middle at `SUN_NEAR_ZOOM` times the size, depth unchanged.
     #[test]
     fn the_near_tile_is_the_middle_of_the_sun_tile_snapped_to_its_own_grid() {
         let dir = Vec3::new(0.4, -0.75, 0.3).normalize();
@@ -3027,8 +3174,8 @@ mod render_tests {
             let p = head + Vec3::new(0.37, -0.81, 0.52);
             let (w, nr) = (wide.project_point3(p), near.project_point3(p));
             assert!(
-                (nr.x - 2.0 * w.x).abs() < 1e-5
-                    && (nr.y - 2.0 * w.y).abs() < 1e-5
+                (nr.x - SUN_NEAR_ZOOM * w.x).abs() < 1e-5
+                    && (nr.y - SUN_NEAR_ZOOM * w.y).abs() < 1e-5
                     && (nr.z - w.z).abs() < 1e-6
             );
         }
@@ -3545,6 +3692,114 @@ mod render_tests {
         let m = spot_shadow_matrices(&l, 1024);
         assert_eq!(m.pass, m.lookup);
         assert_eq!(m.pass, spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range));
+    }
+
+    /// An axis-aligned box's faces, each wound to face OUT (the shadow pass
+    /// culls back faces).
+    fn cuboid(lo: Vec3, hi: Vec3) -> (Vec<SolidVertex>, Vec<u32>) {
+        let (mut v, mut idx) = (Vec::new(), Vec::new());
+        for axis in 0..3 {
+            for side in [0.0f32, 1.0] {
+                let mut n = Vec3::ZERO;
+                n[axis] = if side > 0.5 { 1.0 } else { -1.0 };
+                let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+                let corner = |a: f32, b: f32| {
+                    let mut p = Vec3::ZERO;
+                    p[axis] = if side > 0.5 { hi[axis] } else { lo[axis] };
+                    p[u] = if a > 0.5 { hi[u] } else { lo[u] };
+                    p[w] = if b > 0.5 { hi[w] } else { lo[w] };
+                    p
+                };
+                let q = [corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0)];
+                let base = v.len() as u32;
+                for p in q {
+                    v.push(vertex(p.into(), n.into()));
+                }
+                let flip = (q[1] - q[0]).cross(q[2] - q[0]).dot(n) < 0.0;
+                let tri: [u32; 6] = if flip { [0, 2, 1, 0, 3, 2] } else { [0, 1, 2, 0, 2, 3] };
+                idx.extend(tri.iter().map(|t| base + t));
+            }
+        }
+        (v, idx)
+    }
+
+    /// THE PILLAR'S TORCH SHADOW ON THE HALL'S FAR CEILING IS WHERE THE RAYS
+    /// PUT IT. Headset 15:26 (2026-10-14): a thin dark line on the ceiling and
+    /// back wall beside the marble pillar, and a lighter strip by it. That is
+    /// the pillar's own shadow, seen nearly edge on because the torch is a hand
+    /// away from the eye, and the strip is the pillar's west face lit at
+    /// grazing -- NOT acne or a leak on a surface the light only grazes (13 deg
+    /// here). The hall's pillar, ceiling and back wall in the torch's own map
+    /// at the headset's tile size; ceiling points either side of the edge
+    /// (clear of the filter's penumbra) against the exact ray test.
+    #[test]
+    fn a_torchs_pillar_shadow_on_the_far_ceiling_is_where_the_rays_put_it() {
+        let pos = Vec3::new(-0.8, 1.25, -4.7);
+        let aim = Vec3::new(0.0, 1.9, -9.0);
+        let lamp = |intensity: f32| Light {
+            position: pos,
+            direction: (aim - pos).normalize(),
+            intensity,
+            ..torch(1.0, Some(0.02))
+        };
+        let (pmin, pmax) = (Vec3::new(-0.45, 0.0, -7.45), Vec3::new(0.45, 3.1, -6.55));
+        let mut caster = cuboid(pmin, pmax);
+        // The ceiling, its underside toward the torch, and the back wall.
+        for (lo, hi) in [(Vec3::new(-3.0, 3.4, -16.0), Vec3::new(3.0, 3.6, 4.0)), (Vec3::new(-3.0, 0.0, -16.2), Vec3::new(3.0, 3.4, -16.0))] {
+            let (v, i) = cuboid(lo, hi);
+            let base = caster.0.len() as u32;
+            caster.0.extend(v);
+            caster.1.extend(i.into_iter().map(|t| base + t));
+        }
+        let eye = Vec3::new(-1.0, 1.6, -4.6);
+        let blocked = |p: Vec3| {
+            // Slab test of the segment from the torch to `p` against the pillar.
+            let d = p - pos;
+            let (mut t0, mut t1) = (0.0f32, 1.0f32);
+            for k in 0..3 {
+                if d[k].abs() < 1e-6 {
+                    if pos[k] < pmin[k] || pos[k] > pmax[k] {
+                        return false;
+                    }
+                    continue;
+                }
+                let (a, b) = ((pmin[k] - pos[k]) / d[k], (pmax[k] - pos[k]) / d[k]);
+                t0 = t0.max(a.min(b));
+                t1 = t1.min(a.max(b));
+            }
+            t0 <= t1
+        };
+        for (z, xs) in [(-9.0f32, [-0.6f32, -0.3, 0.3, 0.9]), (-12.0, [-0.6, -0.3, 0.6, 1.2]), (-15.0, [-0.6, 0.0, 1.0, 1.5])] {
+            for x in xs {
+                let p = Vec3::new(x, 3.399, z);
+                let at = |light: Light, caster| Scene {
+                    lights: vec![light],
+                    caster,
+                    receiver_at: p,
+                    eye_offset: eye - p,
+                    normal: [0.0, -1.0, 0.0],
+                    shadow_dim: QUEST_SHADOW_DIM,
+                    ..floor_under_the_lamp()
+                };
+                let k = 30.0;
+                let unlit = shot!(at(lamp(0.0), None));
+                let open = shot!(at(lamp(k), None));
+                let lit = shot!(at(lamp(k), Some(caster.clone())));
+                let shadowed = blocked(p);
+                eprintln!(
+                    "CEILING z {z:5.1} x {x:5.2}: {}  unlit {:3} open {:3} with shadows {:3}",
+                    if shadowed { "SHADOW" } else { "lit   " },
+                    unlit[0], open[0], lit[0]
+                );
+                assert!(open[0] as i32 > unlit[0] as i32 + 8, "the torch does not reach ({x}, {z}): {open:?} against {unlit:?}");
+                let want = if shadowed { unlit } else { open };
+                assert!(
+                    (lit[0] as i32 - want[0] as i32).abs() <= 3,
+                    "ceiling ({x}, {z}) is {} by the rays but reads {lit:?} (open {open:?}, unlit {unlit:?})",
+                    if shadowed { "in the pillar's shadow" } else { "lit" },
+                );
+            }
+        }
     }
 
 }

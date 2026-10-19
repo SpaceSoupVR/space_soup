@@ -582,6 +582,14 @@ struct GpuLight {
 /// shader); a reflection meeting the plane reads it there, so the torch's
 /// pool on a wall shows in the polished floor (`probe_surface_relit`) -- the
 /// photographs hold only the level's own light.
+///
+/// `near`..`far`: how far down the beam's axis (`forward`, from `lens`) the
+/// lit part of the plane lies -- the beam's landings on it, padded. A plane
+/// runs on for ever; the face the beam lit does not. Unbounded, the pillar's
+/// side lit a hand's width off claimed every reflected point within 5 cm of
+/// its plane: a thin dark line down the far wall, ceiling and floor where
+/// nothing stands (headset, 2026-10-14). `far` 0: unbounded, the claim as
+/// before (`Levers::pool_bounds` off).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LitSurface {
     pub normal: Vec3,
@@ -591,6 +599,8 @@ pub struct LitSurface {
     pub forward: Vec3,
     pub right: Vec3,
     pub tan_half: f32,
+    pub near: f32,
+    pub far: f32,
 }
 
 /// How many [`LitSurface`]s the shaders take: a pool map each, in the card
@@ -602,7 +612,8 @@ pub const LIT_SURFACE_VEC4S: usize = 5;
 
 /// The surfaces as the shader reads them, five vec4s each: the plane; the
 /// glass and the map's reach (0 ends the list); the beam's axis and the
-/// card-atlas texel row the maps start at; the map's across; the albedo. NONE
+/// card-atlas texel row the maps start at; the map's across and `near`; the
+/// albedo and `far`. NONE
 /// without that row: then no map is made this frame, and none may be read.
 /// See `lit_surface_at` and `pool_map_light` in the shader.
 fn pack_lit_surfaces(surfaces: &[LitSurface], pool_row: Option<u32>) -> [[f32; 4]; LIT_SURFACE_VEC4S * MAX_LIT_SURFACES] {
@@ -615,8 +626,8 @@ fn pack_lit_surfaces(surfaces: &[LitSurface], pool_row: Option<u32>) -> [[f32; 4
         out[at] = [s.normal.x, s.normal.y, s.normal.z, s.offset];
         out[at + 1] = [s.lens.x, s.lens.y, s.lens.z, s.tan_half];
         out[at + 2] = [s.forward.x, s.forward.y, s.forward.z, row as f32];
-        out[at + 3] = [s.right.x, s.right.y, s.right.z, 0.0];
-        out[at + 4] = [s.albedo.x, s.albedo.y, s.albedo.z, 0.0];
+        out[at + 3] = [s.right.x, s.right.y, s.right.z, s.near];
+        out[at + 4] = [s.albedo.x, s.albedo.y, s.albedo.z, s.far];
     }
     out
 }
@@ -672,6 +683,11 @@ pub struct LightsUniform {
     /// index, or `usize::MAX` for none. Uploaded as each light's shadow layer,
     /// `MAX_SPOT_SHADOWS + k` (`character_shadow_tile` in the shader).
     tile_lamps: std::cell::Cell<[usize; super::shadow::MAX_CHARACTER_SHADOWS]>,
+    /// What the live lamps' pools put in front of the eye this frame, in the
+    /// WORLD, as the eye's meter takes light the probes' photographs never
+    /// saw: (direction from the head, luminance, solid angle). See
+    /// [`Self::set_pool_light`].
+    pool_light: std::cell::RefCell<Vec<(Vec3, f32, f32)>>,
 }
 
 impl LightsUniform {
@@ -691,7 +707,27 @@ impl LightsUniform {
             surfaces: std::cell::Cell::new([None; MAX_LIT_SURFACES]),
             pool_row: std::cell::Cell::new(None),
             tile_lamps: std::cell::Cell::new([usize::MAX; super::shadow::MAX_CHARACTER_SHADOWS]),
+            pool_light: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// THE POOLS THE LIVE LAMPS THROW, AS THE EYE SEES THEM: samples for
+    /// `exposure::EyeAdaptation::meter_with`, (direction from the head,
+    /// luminance, solid angle) in the WORLD, from where a beam lands
+    /// (`quest_app::flashlight_bounce::Landings::meter_samples`). The
+    /// photographs the meter reads hold the level's own light only, so
+    /// without these a torch a hand's width from a wall was drawn at the dark
+    /// room's exposure, its pool flat white (2026-10-13). Read by the frame's
+    /// meter; `&[]` for none.
+    pub fn set_pool_light(&self, samples: &[(Vec3, f32, f32)]) {
+        let mut held = self.pool_light.borrow_mut();
+        held.clear();
+        held.extend_from_slice(samples);
+    }
+
+    /// What [`Self::set_pool_light`] last set.
+    pub fn pool_light(&self) -> Vec<(Vec3, f32, f32)> {
+        self.pool_light.borrow().clone()
     }
 
     /// The lights holding the moving casters' tiles, tile by tile: `lamps[k]`
@@ -1007,6 +1043,10 @@ pub struct LightsBlockOptions {
     /// pixel, rather than from the normal it shades with. See
     /// `spot_long_step`.
     pub long_step_from_plane: bool,
+    /// A surface in no room and no doorway reflects the outdoors from where
+    /// it lies when the frame says so (`ProbeUpload::open_ground`), instead
+    /// of nothing: the ground's shaders. See `PROBE_OPEN_GROUND`.
+    pub open_fallback: bool,
 }
 
 /// HOW MANY OF THE PROBE PASS'S OWN PIXELS A REFLECTED EDGE IS SOFTENED
@@ -1032,7 +1072,21 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
         card_tests_filtered,
         card_relit,
         long_step_from_plane,
+        open_fallback,
     } = options;
+    // Written only where asked for, so every other shader keeps its code
+    // exactly. OPEN GROUND, per pixel: what `PROBE_OPEN_GROUND` says of a whole
+    // draw. A surface in no room that no doorway holds starts no trace -- and,
+    // with `portal_params.y` under 0 (`ProbeUpload::open_ground`), is out of
+    // doors already, as a surface in the outdoor volume is: escaped where it
+    // lies, to be coloured by `probe_escape_colour` like any ray that left the
+    // rooms. So the full pass draws ground that straddles the baked volume's
+    // edge as the open-ground twin draws ground past it.
+    let open_fallback_code = if open_fallback {
+        "            if (camera.portal_params.y < -0.5) {\n                hit.pos = world_pos;\n                hit.found = true;\n                hit.escaped = true;\n                return hit;\n            }\n"
+    } else {
+        ""
+    };
     // Written as asked, so every shader that sets no plane keeps its code
     // exactly. See `spot_long_step`.
     let spot_long_step_fn = if long_step_from_plane {
@@ -1865,7 +1919,21 @@ fn capsule_reflection(p: vec3<f32>, d: vec3<f32>, roughness: f32, lit: vec3<f32>
 // mirror at `p` are one line, so the shadow on the wall and the image in it
 // now go together. Its beam is the shadowed spot standing at the glass
 // (`flashlight::torch_capsules` puts the glass on the beam's origin); a point
-// outside its map, or a glass with no shadowed beam, sees it whole.
+// outside its map, or a glass with no shadowed beam, is not shadowed.
+//
+// AND ONLY AS FAR AS THE BEAM SHINES TOWARD `p` (2026-10-13). A torch's glass
+// is bright only into its beam: seen from outside the cone it sends nothing
+// that way -- the glass's radiance toward `p` is the beam's intensity toward
+// `p` over the glass's area, so its image in a mirror at `p` falls off with
+// the beam's own cone, full in the hot spot, nothing past the spill. Without
+// this the glass was drawn at its full drive toward every direction in front
+// of it, and "outside its map" -- every point outside the cone -- saw it
+// whole: on rough stone a hand's width from a wall that put a patch of hard
+// white speckle beside the torch's pool, at the mirror point between the eye
+// and the hand, and seen along the wall a white streak (headset, 2026-10-13;
+// offline: the patch is in the probe pass's answer alone and goes with
+// `TORCH=0`). Its light reaching `p` and its image seen from `p` are one
+// line: the same cone the lamp loop lights `p` with, unwidened.
 //
 // ASKED LAST, inside `capsule_reflection` once its answer is made: asked
 // while that answer's colour, cover and light were still held -- at the end
@@ -1879,10 +1947,18 @@ fn capsule_glass_beam(p: vec3<f32>, glass: vec3<f32>) -> f32 {{
         if (dot(apart, apart) >= GLASS_ON_ITS_BEAM * GLASS_ON_ITS_BEAM) {{
             continue;
         }}
+        // The beam's cone toward `p`, as `surface_lights` ramps a cone: 1 for
+        // a point light, which shines every way.
+        let to_p = p - lights.lights[i].position.xyz;
+        let cos_p = dot(to_p, lights.lights[i].direction.xyz) * inverseSqrt(max(dot(to_p, to_p), 1e-12));
+        let cos_outer = lights.lights[i].params.y;
+        let s = clamp((cos_p - cos_outer) / max(lights.lights[i].direction.w - cos_outer, 1e-4), 0.0, 1.0);
+        let into = select(1.0, s * s * (3.0 - 2.0 * s), lights.lights[i].params.z > 0.5);
         let layer = i32(lights.lights[i].params.w);
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
-            return pcf_layer_tap(spot_shadow_tex, layer, p, spot_view_proj(layer));
+            return into * pcf_layer_tap(spot_shadow_tex, layer, p, spot_view_proj(layer));
         }}
+        return into;
     }}
     return 1.0;
 }}
@@ -2046,6 +2122,46 @@ const PROBE_FACE_ALWAYS_GIVEN: bool = {probe_face_always};
 // for `probe_fixup` (`probe_fixup_begin` and `_finish`) -- the ray's part the
 // moment the trace ends, so it is not carried through the colour lookup.
 const PROBE_SECONDARY_DEFERRED: bool = {defer_secondary};
+// WHETHER EVERY SURFACE THIS SHADER DRAWS STARTS OUT OF DOORS: in the outdoor
+// volume, in no room and no doorway, with the trace on -- which the CPU knows
+// of a whole chunk of ground from its bounds (`outdoor_pass::all_outdoors`).
+// `probe_environment` then answers with the one thing it would find on its
+// way through the rooms' machinery: the trace starts in the outdoor volume
+// and leaves it where it starts, so the reflection is `probe_escape_colour`
+// from the surface itself (too rough to trace, the photographs of the outdoor
+// volume: `probe_outdoor_untraced`). A constant, so the ground's outdoor twin
+// (`terrain_pipeline::outdoor_pass_shader`) carries none of that machinery --
+// the choice of photographs, the walk through rooms and doorways, their rims,
+// what stands in them, the fix-up's records -- nor the registers it holds.
+const PROBE_ALL_OUTDOORS: bool = false;
+// NOWHERE, by the caller's word: every texel of the draw lies in no
+// photograph's box and beyond every doorway's fades -- which the CPU knows of
+// a whole chunk of ground from its bounds and the frame's probe table
+// (`outdoor_pass::NowhereFrame`). `probe_environment` then answers what it
+// would have found: no room to start a trace in and no doorway holding the
+// surface (`probe_trace_skipping` returns at once), no photograph chosen, no
+// doorway near enough to blend one in -- nothing, coverage 0, and the scene
+// shader lights the surface from the sky and its lightmap. A constant, so
+// the ground's twin for such chunks (`terrain_pipeline::nowhere_pass_shader`)
+// has none of the lookup compiled in: only the characters' reflections.
+//
+// That is most of this level's ground: the baked outdoor volume is the box
+// round the buildings, and the hills, the beach and the cave lie outside it.
+const PROBE_NOWHERE: bool = false;
+// OPEN GROUND, by the caller's word: every texel of the draw is NOWHERE as
+// above -- in no photograph's box, beyond every doorway -- and reflects what
+// lies out of doors all the same: the ground map's trace, the buildings'
+// outsides, the sky (`probe_escape_colour`), which is what ground inside the
+// baked outdoor volume shows and needs nothing of that volume (the ground map
+// and the buildings' boxes cover the level; no photograph is read). Until
+// 2026-10-13 such ground reflected nothing -- a puddle on the far lawn showed
+// the sky's flat light where its neighbour inside the volume mirrored the
+// hills. Too rough to trace, it still answers nothing: the volume's
+// photographs, which rough ground inside it blends, are not this ground's.
+// A constant, so the ground's twin for it (`terrain_pipeline::open_pass_shader`,
+// `Levers::open_reflections`) has the outdoor answer and none of the rooms'
+// machinery. NOT the full pass's picture: more than it.
+const PROBE_OPEN_GROUND: bool = false;
 // A MODEL CARD'S TRUST, FILTERED: each of the four texels round the point
 // tested on its own and the verdicts blended, as percentage-closer filtering
 // blends a shadow map's -- where one test on blended texels averaged a facing
@@ -2703,6 +2819,33 @@ fn terminator_width_of(normal_length: f32) -> f32 {{
     return min(sqrt(1.5 * sigma2), TERMINATOR_MAX_WIDTH);
 }}
 
+// HOW MUCH OF A LAMP'S HIGHLIGHT A SURFACE MAY SEND BACK, as a factor on
+// `spec_strength` (2026-10-13): the highlight as shipped, `spec_strength` x
+// the facing share, but never more than an energy-conserving one gives --
+// Blinn-Phong normalised for its exponent, `(s + 8) / 8` (Akenine-Moller et
+// al.), times Schlick's Fresnel at the half vector from a dielectric's 4%,
+// times the box-filtered `n . l` the diffuse half takes (the lamps' units are
+// E/pi, so the pi of the BRDF's normalisation cancels).
+//
+// WHY A CAP AND NOT A REPLACEMENT. The shipped highlight has neither the
+// normalisation nor the Fresnel nor the `n . l`: a fixed peak, `0.35 (1 - r)`,
+// whatever the lobe's width. That is about right for a narrow lobe -- marble's
+// exponent is at its 320 clamp, where the normalised peak is five times
+// higher still, so the cap leaves it exactly as it was -- and far too much for
+// a wide one: rough stone a hand's width from a torch, its lobe widened by the
+// source size to an exponent of 1-3, spread a fixed 0.07-0.2 of the light
+// over the whole pool as a sheen. Measured on the brick hall's wall at 0.6 m
+// against Cycles with the same maps and spot: the highlight was 11.6% of the
+// pool's light where the path tracer's specular is 1.1% (`docs/
+// specular-status-2026-10-13.md`), the stone reading wet. Capped, every
+// highlight is at most what physics allows and never brighter than it was.
+fn lamp_highlight_share(view_dir: vec3<f32>, h: vec3<f32>, nl: f32, facing: f32, shininess: f32, spec_strength: f32) -> f32 {{
+    let g = 1.0 - clamp(dot(view_dir, h), 0.0, 1.0);
+    let g2 = g * g;
+    let fresnel = 0.04 + 0.96 * (g2 * g2 * g);
+    return min(facing, fresnel * (shininess + 8.0) * 0.125 * nl / max(spec_strength, 1e-4));
+}}
+
 fn light_contribution_split(
     l: Light,
     world_pos: vec3<f32>,
@@ -2755,7 +2898,7 @@ fn light_contribution_split(
     if (aa.y > 0.0 && atten > 0.0 && l.params.w > -1.5) {{
         let h = normalize(l_dir + view_dir);
         let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;
-        out.specular = radiance * spec * atten * aa.y;
+        out.specular = radiance * spec * atten * lamp_highlight_share(view_dir, h, ndotl, aa.y, shininess, spec_strength);
     }}
     return out;
 }}
@@ -3335,6 +3478,50 @@ fn probe_environment(
     let volume_world = select(select_world, to_world_space(probe_volume_pos.xyz), probe_volume_pos.w > 0.5);
     let world_dir = to_world_direction(dir);
     probe_brightness = 0.0;
+    // OUT OF DOORS, by the caller's word (`PROBE_ALL_OUTDOORS`): what the code
+    // below does for a surface in the outdoor volume alone, with nothing else
+    // compiled in. There `probe_choose` returns that volume's room, the trace
+    // starts in it (its origin the surface, inside its box) and leaves at once
+    // (`cur + 1.0 == camera.portal_params.z`, at t = 0), nothing is deferred,
+    // and `probe_traced_colour` colours the escape and adds its 0 to the reach.
+    // The same expressions as below, so the same values.
+    if (PROBE_OPEN_GROUND) {{
+        // The outdoor answer from the surface itself, as `PROBE_ALL_OUTDOORS`
+        // has it below for ground smooth enough to trace; nothing for the rest,
+        // as `PROBE_NOWHERE`. (Names of its own: the passes' cuts find the
+        // lines below by their text, once.)
+        probe_eye_distance = distance(cam_pos(), frag_pos);
+        if (roughness > PROBE_TRACE_MAX_ROUGHNESS) {{
+            let unlit = vec4<f32>(0.0);
+            return unlit;
+        }}
+        let open_dir = normalize(world_dir);
+        let open_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);
+        let open_col = probe_escape_colour(world_pos, open_dir, dir, roughness, open_lod);
+        return open_col;
+    }}
+    if (PROBE_NOWHERE) {{
+        // As the code below leaves them when it finds nothing: the brightness
+        // 0 (set above), the reach untouched, the eye's distance set.
+        probe_eye_distance = distance(cam_pos(), frag_pos);
+        let nothing = vec4<f32>(0.0);
+        return nothing;
+    }}
+    if (PROBE_ALL_OUTDOORS) {{
+        // (`away` and `away_lod`, not `d` and `probe_lod`: the deferring pass's
+        // cuts find the lines below by their text, once.)
+        let away = normalize(world_dir);
+        let away_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);
+        probe_eye_distance = distance(cam_pos(), frag_pos);
+        // TOO ROUGH TO TRACE (`probe_trace_skipping`'s own test, and the
+        // trace's switch is the caller's word too): the photographs, as below.
+        if (roughness > PROBE_TRACE_MAX_ROUGHNESS) {{
+            return probe_outdoor_untraced(probe_choose(select_world, volume_world), world_pos, away, away_lod);
+        }}
+        let col = probe_escape_colour(world_pos, away, dir, roughness, away_lod);
+        probe_reach = 0.0 + probe_reach;
+        return col;
+    }}
     let face_given = PROBE_FACE_ALWAYS_GIVEN || probe_face_given.w > 0.5;
     // Whether a doorway's carve holds the face: also the face's, so also given.
     var in_doorway = false;
@@ -3464,6 +3651,41 @@ fn probe_environment(
         }}
     }}
     return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);
+}}
+
+// OPEN GROUND TOO ROUGH TO TRACE (`PROBE_ALL_OUTDOORS`): the end of
+// `probe_environment` for a surface no doorway is near -- the nearest
+// photograph of its room, blended with the runner-up across the band between
+// them, each corrected from its own capture point -- and nothing of the
+// doorways, which `probe_through_portals` passes by from further than its
+// fades (`outdoor_pass::OutdoorFrame` keeps the twin's ground that far). The
+// same operations in the same order as there, under names of its own: the
+// passes' measurement cuts find that code by its text, once
+// (`lights::tests::the_outdoor_twins_rough_answer_is_the_full_pass_s`).
+fn probe_outdoor_untraced(pick: ProbeChoice, world_pos: vec3<f32>, away: vec3<f32>, away_lod: f32) -> vec4<f32> {{
+    var mine = vec4<f32>(0.0);
+    if (pick.best >= 0) {{
+        var share = 1.0;
+        if (pick.second >= 0) {{
+            let apart = sqrt(pick.second_dist) - sqrt(pick.best_dist);
+            share = 0.5 + 0.5 * smoothstep(0.0, PROBE_BLEND_BAND, apart);
+        }}
+        let near_dir = probe_parallax_direction(world_pos, away, pick.best);
+        let near_layer = i32(camera.probe_boxes[pick.best * 3].w);
+        let near_photo = textureSampleLevel(probe_cube, probe_samp, near_dir, near_layer, away_lod);
+        probe_brightness = camera.probe_boxes[pick.best * 3 + 1].w;
+        mine = near_photo;
+        if (pick.second >= 0) {{
+            let far_photo_dir = probe_parallax_direction(world_pos, away, pick.second);
+            let far_photo = textureSampleLevel(
+                probe_cube, probe_samp, far_photo_dir, i32(camera.probe_boxes[pick.second * 3].w), away_lod
+            );
+            // The brightness blends with the same weight as the photographs it describes.
+            probe_brightness = mix(camera.probe_boxes[pick.second * 3 + 1].w, camera.probe_boxes[pick.best * 3 + 1].w, share);
+            mine = mix(far_photo, near_photo, share);
+        }}
+    }}
+    return mine;
 }}
 
 // As far as the probe is used at all: `shade_material_env` fades it into the
@@ -4332,7 +4554,7 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
         // reflection around every doorway (headset, 2026-09-26).
         let p = probe_portal_holding(world_pos);
         if (p < 0) {{
-            return hit;
+{open_fallback_code}            return hit;
         }}
         let axis = i32(camera.probe_portals[p * 3].w);
         let plo = camera.probe_portals[p * 3].xyz;
@@ -4621,7 +4843,12 @@ fn ground_trace_until(e: vec3<f32>, d: vec3<f32>, t_max: f32) -> f32 {{
     // texels, where a puddle lies -- meets nothing until it has risen above
     // it: before, it met the ground where it started and a mirror puddle
     // showed the grass under it, a flat dark-green pool (headset, 2026-10-08).
-    var risen = false;
+    // A ray heading DOWN from under it is in the ground already and meets it
+    // where it starts, as before that: waiting for it to rise walked every
+    // such ray to the end of its 64 steps (61 on average, against 9-20 for a
+    // rising one; `under_ground_census`) to answer the sky -- for a ray
+    // pointed into the ground (round 5, 2026-10-08).
+    var risen = d.y <= 0.0;
     for (var steps = 0; steps < GROUND_TRACE_MAX_STEPS && t < t_out; steps = steps + 1) {{
         let cell = f32(1u << u32(level));
         let last = floor(size / cell) - 1.0;
@@ -4957,8 +5184,9 @@ fn probe_axis(k: u32) -> vec3<f32> {{
 // a lit plane -- the light cost the torch views 1.3-1.5 ms of the reflection
 // pass (headset A/B, 2026-10-06), and the ground's pass a register whatever
 // form it took. Nor deferred to the fix-up, whose list it filled to the cap
-// (277,000 records, half the pass, offline 2026-10-06). `d` is unused: the
-// map is the same light whichever way it is seen.
+// (277,000 records, half the pass, offline 2026-10-06). The map is the same
+// light whichever way it is seen; `d` only picks the plane the ray met
+// (`lit_surface_at`).
 //
 // READ WITH NO BRANCH but the frame's (no surface lit at all): every hit reads
 // a texel -- surface 0's map where it is on no lit plane -- and keeps it only
@@ -4974,7 +5202,7 @@ fn probe_surface_relit(h: vec3<f32>, d: vec3<f32>, roughness: f32, t: f32) -> ve
         return vec3<f32>(0.0);
     }}
     let p = to_player_space(h);
-    let k = lit_surface_at(p);
+    let k = lit_surface_at(p, to_player_direction(d));
     let at = max(k, 0) * LIT_SURFACE_VEC4S;
     let glass = lights.surfaces[at + 1];
     let axis = lights.surfaces[at + 2];
@@ -5054,21 +5282,37 @@ fn pool_map_light(k: i32, uv: vec2<f32>, texels: f32) -> vec3<f32> {{
     return lights.surfaces[at + 4].rgb * lit;
 }}
 
-// Which lit surface (`lights::LitSurface`) holds `p` (player frame): the
-// first on whose plane it lies within `LIT_SURFACE_TOLERANCE`; -1 for none.
-// One with no map (`w` 0: past the list's end) holds nothing. Where its light
-// falls on the plane is its map's to say. Every surface tested, last first,
-// with no early exit: a loop of fixed length over fixed places in the block,
-// which the compiler can unroll into reads it need not index. 2026-10-06:
-// finding the surface as a walk with a `break`, with nothing lit there, cost
-// the torch views 0.25-0.32 ms of the reflection pass (headset, cut
-// `def_cut_relight_found`).
-fn lit_surface_at(p: vec3<f32>) -> i32 {{
+// Which lit surface (`lights::LitSurface`) holds `p` (player frame), met by a
+// ray along `dp` (player frame): one on whose plane it lies within
+// `LIT_SURFACE_TOLERANCE`, as far down the beam as its lit part lies
+// (`near`..`far`), with the ray arriving on its front -- of those, the one
+// the ray meets most squarely, the first of equals; -1 for none. A plane runs
+// on past its face: the far wall's line through a pillar's side, lit a hand's
+// width off, was the pillar's, read at grazing -- a thin dark line where
+// nothing stands (2026-10-14). `far` 0: the first plane holding `p`, as
+// before. One with no map (`w` 0: past the list's end) holds nothing. Where
+// its light falls on the plane is its map's to say. Every surface tested,
+// last first, with no early exit: a loop of fixed length over fixed places in
+// the block, which the compiler can unroll into reads it need not index.
+// 2026-10-06: finding the surface as a walk with a `break`, with nothing lit
+// there, cost the torch views 0.25-0.32 ms of the reflection pass (headset,
+// cut `def_cut_relight_found`).
+fn lit_surface_at(p: vec3<f32>, dp: vec3<f32>) -> i32 {{
     var k = -1;
+    var best = 0.0;
     for (var j = MAX_LIT_SURFACES - 1; j >= 0; j = j - 1) {{
-        let plane = lights.surfaces[j * LIT_SURFACE_VEC4S];
-        let mapped = lights.surfaces[j * LIT_SURFACE_VEC4S + 1].w > 0.0;
-        k = select(k, j, mapped && abs(dot(plane.xyz, p) - plane.w) < LIT_SURFACE_TOLERANCE);
+        let at = j * LIT_SURFACE_VEC4S;
+        let plane = lights.surfaces[at];
+        let glass = lights.surfaces[at + 1];
+        let z = dot(p - glass.xyz, lights.surfaces[at + 2].xyz);
+        let near = lights.surfaces[at + 3].w;
+        let far = lights.surfaces[at + 4].w;
+        let bounded = far > 0.0;
+        let square = select(1.0, -dot(dp, plane.xyz), bounded);
+        let within = !bounded || (z >= near && z <= far);
+        let take = glass.w > 0.0 && abs(dot(plane.xyz, p) - plane.w) < LIT_SURFACE_TOLERANCE && within && square > 0.0 && square >= best;
+        k = select(k, j, take);
+        best = select(best, square, take);
     }}
     return k;
 }}
@@ -7249,6 +7493,53 @@ mod probe_blend_tests {
         assert!(env.contains("return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);"));
     }
 
+    /// `probe_outdoor_untraced` is the end of `probe_environment` -- the
+    /// photographs' blend -- under names of its own, and stays so: the two are
+    /// compared with the names mapped back and the comments and spacing out.
+    /// And the outdoor branch asks it by the trace's own roughness test.
+    #[test]
+    fn the_outdoor_twins_rough_answer_is_the_full_pass_s() {
+        let code = shader();
+        let bare = |text: &str| -> String {
+            text.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .flat_map(|l| l.chars())
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let at = |hay: &str, needle: &str| hay.find(needle).unwrap_or_else(|| panic!("missing: {needle}"));
+        let env = &code[at(&code, "fn probe_environment(")..at(&code, "fn probe_outdoor_untraced(")];
+        let full = &env[at(env, "    var own = vec4<f32>(0.0);")..at(env, "    return probe_through_portals(own")];
+        let full = bare(full).replace("varown_room=-1.0;", "").replace("own_room=best_room;", "");
+        let twin = &code[at(&code, "fn probe_outdoor_untraced(")..];
+        let twin = &twin[at(twin, "    var mine = vec4<f32>(0.0);")..at(twin, "    return mine;")];
+        let mut twin = bare(twin);
+        for (mine, theirs) in [
+            ("pick.second_dist", "second_dist"),
+            ("pick.best_dist", "best_dist"),
+            ("pick.second", "second"),
+            ("pick.best", "best"),
+            ("far_photo_dir", "far_dir"),
+            ("far_photo", "far"),
+            ("near_photo", "near"),
+            ("near_dir", "sample_dir"),
+            ("near_layer", "layer"),
+            ("away_lod", "probe_lod"),
+            ("away", "d"),
+            ("apart", "gap"),
+            ("share", "band"),
+            ("mine", "own"),
+        ] {
+            twin = twin.replace(mine, theirs);
+        }
+        assert_eq!(twin, full);
+        // Asked where the trace would give up, by its test.
+        assert!(code.contains("if (roughness > PROBE_TRACE_MAX_ROUGHNESS || camera.portal_params.y > 0.5) {"));
+        let branch = &env[at(env, "    if (PROBE_ALL_OUTDOORS) {")..at(env, "    let face_given = ")];
+        assert!(at(branch, "if (roughness > PROBE_TRACE_MAX_ROUGHNESS) {") < at(branch, "probe_escape_colour("));
+        assert!(branch.contains("return probe_outdoor_untraced(probe_choose(select_world, volume_world), world_pos, away, away_lod);"));
+    }
+
     /// The doorway blend's reach is generated from the Rust constants.
     #[test]
     fn the_portal_fades_come_from_the_constants() {
@@ -7911,7 +8202,7 @@ mod baked_gloss_tests {
             "let sigma2 = max(1.0 - normal_length - 0.01, 0.0) / max(normal_length, 1e-3);",
             "return min(sqrt(1.5 * sigma2), TERMINATOR_MAX_WIDTH);",
             "let aa = terminator_aa(dot(n, l_dir));",
-            "out.specular = radiance * spec * atten * aa.y;",
+            "out.specular = radiance * spec * atten * lamp_highlight_share(view_dir, h, ndotl, aa.y, shininess, spec_strength);",
         ] {
             assert!(code.contains(line), "the lights block no longer has `{line}`");
         }
@@ -9499,6 +9790,144 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
+/// A LAMP'S HIGHLIGHT IS NEVER MORE THAN PHYSICS ALLOWS (2026-10-13), run on
+/// the GPU through `light_contribution_split` as the scene readers call it:
+/// rough stone a hand's width from a torch, its lobe widened as the readers
+/// widen it, sends back a normalised Blinn-Phong's share at a dielectric's
+/// Fresnel -- a few percent of the light, where it sent a fixed 0.14 (the
+/// brick hall's wall read wet under the torch, headset 2026-10-13) -- while
+/// marble's narrow lobe, and every highlight at all, keeps what it had.
+#[cfg(test)]
+mod highlight_cap_tests {
+    use glam::Vec3;
+    use wgpu::util::DeviceExt;
+    use wgpu::{BindGroupDescriptor, BindGroupEntry, BufferDescriptor, BufferUsages, ShaderModuleDescriptor, ShaderSource};
+
+    /// `(diffuse, specular)` red of a white point lamp of intensity 1 at
+    /// `lamp`, lighting a surface at the origin facing +z, seen from `eye`,
+    /// with the highlight's exponent and strength given as the readers give
+    /// them.
+    fn split(cases: &[(Vec3, Vec3, f32, f32)]) -> Option<Vec<(f32, f32)>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let code = format!(
+            "{}\n
+@group(1) @binding(0) var<storage, read> q: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+@compute @workgroup_size(1)
+fn split_main(@builtin(global_invocation_id) id: vec3<u32>) {{
+    var l: Light;
+    l.position = vec4<f32>(q[id.x * 2u].xyz, -1.0);
+    l.direction = vec4<f32>(0.0, 0.0, -1.0, 1.0);
+    l.color_intensity = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    l.params = vec4<f32>(100.0, -1.0, 0.0, -1.0);
+    let eye = q[id.x * 2u + 1u].xyz;
+    let c = light_contribution_split(l, vec3<f32>(0.0), vec3<f32>(0.0, 0.0, 1.0), normalize(eye), q[id.x * 2u].w, q[id.x * 2u + 1u].w);
+    out[id.x] = vec4<f32>(c.diffuse.r, c.specular.r, 0.0, 0.0);
+}}
+",
+            super::wgsl_lights_block(0, 1)
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("split_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let lights_uniform = super::LightsUniform::new(&device);
+        lights_uniform.upload_frame(&queue, &[], &[], false);
+        let packed: Vec<[f32; 4]> =
+            cases.iter().flat_map(|(lamp, eye, s, k)| [[lamp.x, lamp.y, lamp.z, *s], [eye.x, eye.y, eye.z, *k]]).collect();
+        let q = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&packed),
+            usage: BufferUsages::STORAGE,
+        });
+        let size = (cases.len() * 16) as u64;
+        let out = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST, mapped_at_creation: false });
+        let g0 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[BindGroupEntry { binding: 1, resource: lights_uniform.buffer().as_entire_binding() }],
+        });
+        let g1 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[BindGroupEntry { binding: 0, resource: q.as_entire_binding() }, BindGroupEntry { binding: 1, resource: out.as_entire_binding() }],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups(cases.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let got: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+        Some(got.iter().map(|c| (c[0], c[1])).collect())
+    }
+
+    /// The readers' lobe for roughness `r` with the nearest bulb `d` away:
+    /// `shade_material_lamps`' widening and exponent, and its strength.
+    fn lobe(r: f32, d: f32) -> (f32, f32) {
+        const LIGHT_SOURCE_RADIUS: f32 = 0.35;
+        let alpha = r * r;
+        let widened = (alpha + LIGHT_SOURCE_RADIUS / (2.0 * d.max(0.05))).clamp(alpha, 1.0);
+        ((2.0 / (widened * widened) - 2.0).clamp(1.0, 320.0), 0.35 * (1.0 - r))
+    }
+
+    #[test]
+    fn a_highlight_is_never_more_than_physics_allows() {
+        // The lamp 0.6 m off, seen from beside it at the mirror angle (the
+        // eye where the torch-holding hand's head is) and from 40 degrees.
+        let lamp = Vec3::new(0.15, 0.0, 0.6);
+        let mirror = Vec3::new(-0.15, 0.0, 0.6);
+        let aside = Vec3::new(-0.6 * 40f32.to_radians().sin(), 0.0, 0.6 * 40f32.to_radians().cos());
+        let (stone_s, stone_k) = lobe(0.6, 0.6);
+        let (marble_s, marble_k) = lobe(0.048, 3.0);
+        let (marble_near_s, marble_near_k) = lobe(0.048, 0.6);
+        let cases = [
+            (lamp, mirror, stone_s, stone_k),
+            (lamp, aside, stone_s, stone_k),
+            (lamp * 5.0, mirror * 5.0, marble_s, marble_k),
+            (lamp, mirror, marble_near_s, marble_near_k),
+        ];
+        let Some(got) = split(&cases) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        for (c, (d, s)) in cases.iter().zip(&got) {
+            eprintln!("exponent {:6.1} strength {:.3}: diffuse {d:.4} highlight {s:.4} ({:.1}% of the diffuse light)", c.2, c.3, 100.0 * s / d);
+        }
+        // What shipped: the peak `pow(n.h, s) * strength` on the share facing
+        // the lamp (1 here), times the falloff the diffuse has over its n.l.
+        let shipped = |k: usize| {
+            let (l, e, s, st) = cases[k];
+            let h = (l.normalize() + e.normalize()).normalize();
+            let nl = l.normalize().z;
+            got[k].0 / nl * h.z.powf(s) * st
+        };
+        // ROUGH STONE AT THE TORCH: a normalised lobe, Fresnel 4% at the
+        // mirror angle -- (2.7 + 8) / 8 x 0.04 x n.l: about a fifteenth of
+        // the 0.14 it sent before, in proportion to the light it takes.
+        let stone = got[0].1 / got[0].0;
+        assert!(stone < 0.07, "rough stone's highlight at the torch: {stone} of its diffuse light");
+        assert!(got[0].1 < 0.5 * shipped(0), "and well under what shipped: {} against {}", got[0].1, shipped(0));
+        assert!(got[1].1 <= got[0].1, "and less off the mirror angle");
+        // MARBLE across a room keeps its highlight exactly; beside a torch,
+        // its lobe widened, it may lose some but never gains.
+        assert!((got[2].1 - shipped(2)).abs() <= 1e-4 * shipped(2).max(1e-6), "marble across the room: {} against {}", got[2].1, shipped(2));
+        assert!(got[3].1 <= shipped(3) * (1.0 + 1e-4) && got[3].1 > 0.2 * shipped(3), "marble beside a torch: {} against {}", got[3].1, shipped(3));
+    }
+}
+
 /// A SPOT'S POOL SEEN EDGE-ON, as `spot_cone` draws it: test_room's corner
 /// spot (34 degrees, a 16-degree core) 0.85 m from the wall it lights, the
 /// wall seen from 15 m down the hall at about 5 degrees, where a pixel spans
@@ -10101,7 +10530,7 @@ fn ambient_main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// and `CapsuleGroup::surfaces`.
 #[cfg(test)]
 mod capsule_reflection_tests {
-    use glam::Vec3;
+    use glam::{Quat, Vec3};
     use wgpu::util::DeviceExt;
     use wgpu::{
         BindGroupDescriptor, BindGroupEntry, BindingResource, BufferDescriptor, BufferUsages, ShaderModuleDescriptor,
@@ -10523,16 +10952,72 @@ fn seen_main(@builtin(global_invocation_id) id: vec3<u32>) {
             "GLASS PAST ITS BEAM: whole {whole:?}\n  shadowed {shadowed:?}\n  lit {lit:?}\n  another lamp {elsewhere:?}\n  no layer {unlayered:?}"
         );
         for (i, what) in [(0, "head on"), (1, "off the axis")] {
+            // As much as the beam shines toward the point (`beam_toward`):
+            // the second point is just past the hot spot's edge.
+            let k = beam_toward(&lamp, rays[i].0);
+            assert!(k > 0.99, "{what}: inside the hot spot, or all but: {k}");
             assert!(whole[i][0] > 1.0, "{what}: the capsules give the glass a glow: {:?}", whole[i]);
             assert!(shadowed[i].iter().all(|g| *g < 1e-4), "{what}: the shadowed point still sees the glass: {:?}", shadowed[i]);
             for c in 0..3 {
-                assert!(near(lit[i][c], whole[i][c], 1e-3 * whole[i][c]), "{what}: a lit point sees all of it: {:?}", lit[i]);
+                assert!(near(lit[i][c], whole[i][c] * k, 1e-3 * whole[i][c]), "{what}: a lit point sees all of it: {:?}", lit[i]);
                 assert_eq!(elsewhere[i][c], whole[i][c], "{what}: a lamp elsewhere is not its beam");
-                assert_eq!(unlayered[i][c], whole[i][c], "{what}: a beam with no shadow layer");
+                assert!(near(unlayered[i][c], whole[i][c] * k, 1e-3 * whole[i][c]), "{what}: a beam with no shadow layer: {:?}", unlayered[i]);
             }
         }
-        assert!(whole[2][0] > 1.0, "off to the side the glass still shows: {:?}", whole[2]);
-        assert_eq!(shadowed[2], whole[2], "outside the beam's map nothing is known to hide it");
+        // 80 degrees off the beam: with no beam known, the capsules' glow; with
+        // its beam, NONE -- the glass sends nothing that way, map or no map
+        // (until 2026-10-13 it showed whole there: a white patch of speckle
+        // beside the torch's pool on rough stone).
+        assert!(whole[2][0] > 1.0, "with no beam known the glass shows: {:?}", whole[2]);
+        assert!(shadowed[2].iter().all(|g| *g == 0.0), "outside its beam the glass sends nothing: {:?}", shadowed[2]);
+        assert!(unlayered[2].iter().all(|g| *g == 0.0), "outside its beam, shadow layer or not: {:?}", unlayered[2]);
+        assert_eq!(elsewhere[2], whole[2], "a lamp elsewhere is not its beam");
+    }
+
+    /// The share of `lamp`'s light that leaves it toward `p`: its cone's
+    /// smoothstep in the cosine, the shader's `capsule_glass_beam` ramp.
+    fn beam_toward(lamp: &super::Light, p: Vec3) -> f32 {
+        let cos_p = (p - lamp.position).normalize().dot(lamp.direction.normalize());
+        let (outer, inner) = lamp.cone_cosines();
+        let s = ((cos_p - outer) / (inner - outer).max(1e-4)).clamp(0.0, 1.0);
+        s * s * (3.0 - 2.0 * s)
+    }
+
+    /// A TORCH'S GLASS SHOWS IN A MIRROR ONLY AS FAR AS ITS BEAM SHINES THERE
+    /// (2026-10-13): a mirror point that looks back at the glass from inside
+    /// the hot spot sees it whole, one on the cone's ramp sees the ramp's
+    /// share of it, and one outside the spill sees nothing -- the patch of
+    /// white speckle the headset showed beside the pool, on stone a hand's
+    /// width from the torch, was the glass seen from outside its beam.
+    #[test]
+    fn a_glass_shows_in_a_mirror_only_into_its_beam() {
+        let glass = Vec3::new(0.0, 1.0, 0.0);
+        let groups = [torch(glass, Vec3::NEG_Z)];
+        let lamp = beam(glass, Vec3::NEG_Z);
+        // Points 1 m from the glass at these angles off the beam, each
+        // looking straight back at it.
+        let angles = [0.0f32, 6.0, 14.0, 20.0, 26.0, 40.0, 80.0];
+        let rays: Vec<(Vec3, Vec3, f32)> = angles
+            .iter()
+            .map(|a| {
+                let p = glass + Quat::from_rotation_y(a.to_radians()) * Vec3::NEG_Z;
+                (p, (glass - p).normalize(), 0.002)
+            })
+            .collect();
+        let Some(whole) = seen_past_the_beam(&groups, &rays, &[], false, 1.0) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let seen = seen_past_the_beam(&groups, &rays, &[lamp], false, 1.0).unwrap();
+        for (k, a) in angles.iter().enumerate() {
+            let share = beam_toward(&lamp, rays[k].0);
+            eprintln!("{a:>4} deg off the beam: share {share:.4}, glow {:.3} of {:.3}", seen[k][0], whole[k][0]);
+            assert!(whole[k][0] > 1.0, "{a} deg: the capsules give the glass a glow: {:?}", whole[k]);
+            assert!(near(seen[k][0], whole[k][0] * share, 1e-3 * whole[k][0]), "{a} deg: {:?} against {} x {share}", seen[k], whole[k][0]);
+        }
+        assert!(seen[0][0] > 0.999 * whole[0][0], "on the axis the glass shows whole");
+        assert!(seen[2][0] > 0.05 * whole[2][0] && seen[2][0] < 0.95 * whole[2][0], "on the ramp, part of it");
+        assert!(seen[4..].iter().all(|g| g[0] == 0.0), "past the spill (25 degrees), none: {:?}", &seen[4..]);
     }
 
     /// A CAPSULE KEEPS WHAT IT IS past one left out of the upload.
@@ -10599,6 +11084,8 @@ mod surface_relit_tests {
             forward: Vec3::NEG_Z,
             right: Vec3::X,
             tan_half: 26.25f32.to_radians().tan(),
+            near: 0.0,
+            far: 0.0,
         }
     }
 
@@ -10828,6 +11315,48 @@ fn relit_main(@builtin(global_invocation_id) id: vec3<u32>) {
         assert!(shadowed[0].max_element() < 1e-4, "a hand's shadow on the wall is in its reflection: {:?}", shadowed[0]);
         assert!(no_surface[0].max_element() < 1e-4, "no lit surface, no light: {:?}", no_surface[0]);
         assert!(baked[0].max_element() < 1e-4, "a lamp the bake saw is in the photographs already: {:?}", baked[0]);
+    }
+
+    /// A PILLAR'S SIDE LIT A HAND'S WIDTH OFF DOES NOT CLAIM THE FAR WALL
+    /// (headset, 2026-10-14: "a thin line of shadow ... nothing in the scene
+    /// between my flashlight and the wall"). The side's plane runs on to cross
+    /// the wall 3 m down the beam; where it does, the wall's reflected pool
+    /// read the side's map -- the beam at grazing, a tenth of the wall's light
+    /// -- a dark line down every polished surface that showed the wall. Bounded
+    /// to how far down the beam each lit part lies, and met from its front,
+    /// the wall's point is the wall's; the side still holds its own.
+    #[test]
+    fn a_lit_planes_far_reach_does_not_claim_the_wall_it_crosses() {
+        let glass = Vec3::new(0.0, 1.0, 0.0);
+        let lamp = beam(glass, Vec3::NEG_Z);
+        // The pillar's side, the plane x = 0.3 facing the glass, lit from
+        // 0.2 m to 1.5 m down the beam; first, as the brightest.
+        let side = LitSurface { normal: Vec3::NEG_X, offset: -0.3, near: 0.2, far: 1.5, ..wall() };
+        let far_wall = LitSurface { near: 2.0, far: 4.5, ..wall() };
+        let from_floor = Vec3::new(0.0, 0.5, -1.0).normalize();
+        let hits = [
+            // The wall where the side's plane crosses it, seen from the floor.
+            (Vec3::new(0.3, 1.0, -3.0), from_floor),
+            // The wall on the beam's axis.
+            (Vec3::new(0.0, 1.0, -3.0), from_floor),
+            // The side itself, 1 m down the beam, met from in front of it.
+            (Vec3::new(0.3, 1.0, -1.0), Vec3::new(1.0, 0.0, -0.2).normalize()),
+        ];
+        let Some(bounded) = relit_at(&[lamp], true, 1.0, &[side, far_wall], &hits) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let wall_alone = relit_at(&[lamp], true, 1.0, &[far_wall], &hits).unwrap();
+        let unbounded = relit_at(&[lamp], true, 1.0, &[LitSurface { far: 0.0, ..side }, LitSurface { far: 0.0, ..far_wall }], &hits).unwrap();
+        eprintln!("CROSSING: bounded {bounded:?}\n  wall alone {wall_alone:?}\n  unbounded {unbounded:?}");
+        let full = wall_alone[0].max_element();
+        assert!(full > 0.5 * ALBEDO.max_element() * expected_scale(), "the wall is lit there: {:?}", wall_alone[0]);
+        // The fault, as it was: the side's map read on the wall.
+        assert!(unbounded[0].max_element() < 0.3 * full, "unbounded, the side claims the wall: {:?}", unbounded[0]);
+        assert!((bounded[0] - wall_alone[0]).abs().max_element() < 0.01 * full, "the wall's point is the wall's: {:?}", bounded[0]);
+        assert!((bounded[1] - wall_alone[1]).abs().max_element() < 0.01 * full, "the axis as before: {:?}", bounded[1]);
+        assert!(bounded[2].max_element() > 0.05 * full, "the side keeps its own pool: {:?}", bounded[2]);
+        assert!((bounded[2] - unbounded[2]).abs().max_element() < 0.01 * bounded[2].max_element(), "and reads it as before");
     }
 }
 

@@ -9,9 +9,32 @@ pub struct MeshPipeline {
     /// `thin_parts`. Drawn after everything opaque and the sky, from the
     /// primitive's `ThinParts`, with its `ThinVertex` buffer in slot 1.
     pub thin_pipeline: RenderPipeline,
+    /// [`Self::pipeline`] with blending OFF, for the scene pass's opaque
+    /// parts (`Levers::opaque_models`): built by the eye pass's mono
+    /// constructors only. See [`opaque_target`].
+    pub opaque: Option<RenderPipeline>,
     pub texture_layout: BindGroupLayout,
     pub model_layout: BindGroupLayout,
     pub lightmap_layout: BindGroupLayout,
+}
+
+/// THE SCENE PASS'S MODELS, CUBOIDS AND BODIES ARE DRAWN WITHOUT BLENDING
+/// where what they draw is opaque (Round 2, 2026-10-14; the research lead on
+/// LRZ). Their pipelines were all built with `ALPHA_BLENDING`, although an
+/// opaque material writes alpha 1 (`mesh::texture::load_primitive_texture`
+/// forces it at decode; a cuboid's colour is 255): the same pixels, but on
+/// Adreno a blended draw that writes depth leaves the coarse depth (LRZ)
+/// unwritten -- the driver turns it off for the rest of the pass -- so the
+/// ground, brushes, models and water after it were not rejected against
+/// it. The cuboids are drawn FIRST of the colour draws, before the ground.
+/// The ground had the same fault, fixed 2026-10-13 (`OPAQUE_GROUND`:
+/// cave_back_out -5 ms). Glass, a body's blended parts and the thin pass
+/// stay blended, and are drawn after everything opaque.
+///
+/// A blend-off twin beside each blended pipeline, chosen per frame by
+/// `Levers::opaque_models` (on), so one launch measures both.
+pub fn opaque_target(format: TextureFormat) -> [Option<ColorTargetState>; 1] {
+    [Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::ALL })]
 }
 
 impl MeshPipeline {
@@ -36,7 +59,11 @@ impl MeshPipeline {
         camera_layout: &BindGroupLayout,
         samples: u32,
     ) -> Self {
-        Self::new_with_front_face(device, format, camera_layout, FrontFace::Ccw, samples, crate::renderer::multiview::ViewMode::Mono)
+        // With its opaque twin: the eye pass's. See `opaque_target`.
+        Self::new_edited(
+            device, format, camera_layout, FrontFace::Ccw, samples, crate::renderer::multiview::ViewMode::Mono, true,
+            &|src| src, ("mesh_pipeline", "mesh_thin_pipeline"), true,
+        )
     }
 
     pub fn new_mirror(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
@@ -74,7 +101,7 @@ impl MeshPipeline {
         view: crate::renderer::multiview::ViewMode,
         thin_mean: bool,
 ) -> Self {
-        Self::new_edited(device, format, camera_layout, front_face, samples, view, thin_mean, &|src| src, ("mesh_pipeline", "mesh_thin_pipeline"))
+        Self::new_edited(device, format, camera_layout, front_face, samples, view, thin_mean, &|src| src, ("mesh_pipeline", "mesh_thin_pipeline"), false)
     }
 
     /// [`Self::new_multisampled`]'s SPOTLESS TWIN: the spots' shadow maps
@@ -91,6 +118,7 @@ impl MeshPipeline {
             true,
             &crate::renderer::lights::without_spot_shadows,
             ("mesh_pipeline_spotless", "mesh_thin_pipeline_spotless"),
+            true,
         )
     }
 
@@ -121,6 +149,7 @@ impl MeshPipeline {
                 true,
                 &edit,
                 (label, &thin_label),
+                false,
             );
         }
     }
@@ -136,6 +165,7 @@ impl MeshPipeline {
         thin_mean: bool,
         edit: &dyn Fn(String) -> String,
         (label, thin_label): (&str, &str),
+        opaque_twin: bool,
     ) -> Self {
         // Through `shader_precision`, as the scene readers: at half precision
         // where the device has it and `HALF_PRECISION` is on (off as shipped).
@@ -210,7 +240,7 @@ impl MeshPipeline {
             immediate_size: 0,
         });
 
-        let build = |label: &str, shader: &ShaderModule, buffers: &[Option<VertexBufferLayout>]| device.create_render_pipeline(&RenderPipelineDescriptor {
+        let build_with = |label: &str, shader: &ShaderModule, buffers: &[Option<VertexBufferLayout>], blend: Option<BlendState>| device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
@@ -225,7 +255,7 @@ impl MeshPipeline {
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    blend,
                     write_mask: ColorWrites::ALL,
                 })],
             }),
@@ -247,7 +277,11 @@ impl MeshPipeline {
             multiview_mask: view.mask(),
             cache: None,
         });
+        let build = |label: &str, shader: &ShaderModule, buffers: &[Option<VertexBufferLayout>]| {
+            build_with(label, shader, buffers, Some(BlendState::ALPHA_BLENDING))
+        };
         let pipeline = build(label, &shader, &[Some(MeshVertex::layout())]);
+        let opaque = opaque_twin.then(|| build_with(&format!("{label}_opaque"), &shader, &[Some(MeshVertex::layout())], None));
         let thin_shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("mesh_thin_shader"),
             source: ShaderSource::Wgsl(
@@ -263,6 +297,7 @@ impl MeshPipeline {
         Self {
             pipeline,
             thin_pipeline,
+            opaque,
             texture_layout,
             model_layout,
             lightmap_layout,
@@ -299,8 +334,9 @@ impl MeshPipeline {
 /// EVERY buffer that is ever bound as a `ModelUniform` is this size -- the
 /// mirror's and the caves' too, whose shaders read only the matrix -- so no
 /// upload can overrun one left behind. Then the WEATHER on it, one vec4
-/// (16; x how wet it is, 0..1), written apart from the rest
-/// ([`ModelUniform::set_wetness`]) so an upload of the others leaves it be.
+/// (16; x how wet it is, 0..1; y the grab glow, 0..1), written apart from
+/// the rest ([`ModelUniform::set_wetness`], [`ModelUniform::set_highlight`])
+/// so an upload of the others leaves it be.
 pub const MODEL_UNIFORM_SIZE: u64 = 288;
 /// Where [`MODEL_UNIFORM_SIZE`]'s weather vec4 starts: after what
 /// `upload_lit_bulb_scaled` writes.
@@ -320,7 +356,15 @@ impl ModelUniform {
     /// rain (`weather`). Its diffuse darkens and a film of water glosses it,
     /// lit as any surface is. Kept until set again.
     pub fn set_wetness(&self, queue: &Queue, wet: f32) {
-        queue.write_buffer(&self.buffer, MODEL_WEATHER_OFFSET, bytemuck::cast_slice(&[wet.clamp(0.0, 1.0), 0.0, 0.0, 0.0]));
+        queue.write_buffer(&self.buffer, MODEL_WEATHER_OFFSET, bytemuck::cast_slice(&[wet.clamp(0.0, 1.0)]));
+    }
+
+    /// THE GRAB GLOW on this model, 0 (none: the default, and what every
+    /// model but a hand's choice has) to 1: see `grab_highlight` in the mesh
+    /// shader. Kept until set again; the weather vec4's y, which no other
+    /// upload writes.
+    pub fn set_highlight(&self, queue: &Queue, level: f32) {
+        queue.write_buffer(&self.buffer, MODEL_WEATHER_OFFSET + 4, bytemuck::cast_slice(&[level.clamp(0.0, 1.0)]));
     }
 
     /// Upload the model matrix with FULL sky visibility.
@@ -505,6 +549,12 @@ const VOLUME_WALK: &str = "    var pick = -1;
         }
     }";
 
+/// The mesh shader's grab glow, as it reads in the shader: see
+/// `grab_highlight`.
+const GRAB_GLOW_BRANCH: &str = "    if (grab_glow > 0.0) {
+        out = grab_highlight(out, n, in.world_pos, grab_glow);
+    }";
+
 /// MEASUREMENT ONLY: the scene pass's mesh shader with one part changed at a
 /// time -- see [`MeshPipeline::log_register_cuts`]. 2026-10-02: the spots'
 /// tent and the per-pixel scan together took `mesh_pipeline` from 19
@@ -512,6 +562,8 @@ const VOLUME_WALK: &str = "    var pick = -1;
 /// shader walks its room's chain (exp64); `scan` is every slot looked at.
 const MESH_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("mesh_cut_none", &[]),
+    // The shader as it was before the grab glow (2026-10-14).
+    ("mesh_no_grab_glow", &[(GRAB_GLOW_BRANCH, "")]),
     ("mesh_box_spots", &[(TENT_CALL, "    return pcf_tile_at(\n        tex,")]),
     // The tent's loop over picked taps, as it shipped until B1.
     ("mesh_tent_loop", &[(TENT_CALL, "    return pcf_tile_tent_at(\n        tex,")]),
@@ -532,7 +584,62 @@ pub struct SkinnedMeshPipeline {
     pub texture_layout: BindGroupLayout,
     pub model_layout: BindGroupLayout,
     pub skin_joint_layout: BindGroupLayout,
+    /// What the twins are built with ([`Self::with_body_twins`]).
+    layout: PipelineLayout,
+    format: TextureFormat,
+    samples: u32,
+    view: crate::renderer::multiview::ViewMode,
+    /// THE BODY'S TWINS, for the scene pass: `[dry, wet]`. See
+    /// [`skinned_body_twin`].
+    pub body_twins: Option<[RenderPipeline; 2]>,
+    /// The same twins with blending OFF, for a body's opaque parts
+    /// (`Levers::opaque_models`; see [`opaque_target`]).
+    pub opaque_twins: Option<[RenderPipeline; 2]>,
+    /// THE BODY'S DEPTH PREPASS, `[opaque part, see-through part]`
+    /// (`Levers::body_prepass`): the body's depth laid at the start of the
+    /// scene pass, so the ground, brushes and models it hides are not shaded
+    /// under it, and its own shading runs once a pixel -- not for the skin
+    /// and then again for the clothes over it. A see-through part writes
+    /// depth only where its texture is wholly opaque (`fs_depth_opaque_texels`).
+    pub prepass: Option<[RenderPipeline; 2]>,
 }
+
+/// THE PLAYER'S BODY, DRY OR WET, as its own shader each (Round 2,
+/// 2026-10-14: lag looking down at the body, worst in the rain).
+///
+/// The skinned shader's wet film (`weather`) called `shade_material_env`,
+/// the full reflection -- the rooms' photographs, the trace through their
+/// doorways, the proxies' fields, the models' cards -- inlined into a body's
+/// pixel: 15,137 units by the inlining proxy where the dry path is 889
+/// (`skinned_shader_sizes`). Past the Quest's instruction cache many times
+/// over when wet, and its registers held by the dry path too, since one
+/// shader is allocated for its largest branch.
+///
+/// DRY: the wet branch compiled out -- the same pixels, every frame a body
+/// is not wet. WET: the film's reflection from the sky and the lamps (their
+/// highlights in the film, what makes skin read wet) and the characters'
+/// own, without the rooms' machinery (`PROBE_NOWHERE`): 2,763 units. With
+/// [`SKINNED_FILM_TRACED`] the wet body is drawn as before.
+///
+/// BOTH: the material branch (a gloss below 1, `MATERIAL_SHADE`) compiled
+/// out -- the body has no glossy material, and that branch inlines the same
+/// full reflection into a body's pixel, dry or wet.
+pub(crate) fn skinned_body_twin(src: &str, wet: bool) -> Option<String> {
+    let edit = if wet {
+        ("const PROBE_NOWHERE: bool = false;", "const PROBE_NOWHERE: bool = true;")
+    } else {
+        ("    if (wet > 0.0) {", "    if (false) {")
+    };
+    let classic = ("    if (rough >= 0.996) {", "    if (true) {");
+    (src.matches(edit.0).count() == 1 && src.matches(classic.0).count() == 1)
+        .then(|| src.replacen(edit.0, edit.1, 1).replacen(classic.0, classic.1, 1))
+}
+
+/// THE WET BODY TRACED AS BEFORE (`false`: the lean film of
+/// [`skinned_body_twin`]). Read when a frame picks the body's pipeline: `adb
+/// shell setprop debug.spacesoup.bodyfilmtraced 1` before a launch for the
+/// A/B.
+pub static SKINNED_FILM_TRACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl SkinnedMeshPipeline {
     pub fn new(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
@@ -653,23 +760,128 @@ impl SkinnedMeshPipeline {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("skinned_mesh_pipeline"),
-            layout: Some(&layout),
+        let pipeline = Self::build(device, &layout, &shader, "skinned_mesh_pipeline", format, samples, view, Some(BlendState::ALPHA_BLENDING));
+
+        Self {
+            pipeline,
+            texture_layout,
+            model_layout,
+            skin_joint_layout,
+            layout,
+            format,
+            samples,
+            view,
+            body_twins: None,
+            opaque_twins: None,
+            prepass: None,
+        }
+    }
+
+    /// This pipeline with the body's dry and wet twins built beside it (see
+    /// [`skinned_body_twin`]): for the scene pass's skinned draws.
+    pub fn with_body_twins(mut self, device: &Device) -> Self {
+        let src = skinned_mesh_shader();
+        // Each shader twice: blended, and opaque (see `opaque_target`).
+        let twin = |wet: bool, label: &str| {
+            let edited = skinned_body_twin(&src, wet)?;
+            let shader = device.create_shader_module(ShaderModuleDescriptor {
+                label: Some(label),
+                source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, self.view.shader(edited)).into()),
+            });
+            let blended = Self::build(device, &self.layout, &shader, label, self.format, self.samples, self.view, Some(BlendState::ALPHA_BLENDING));
+            let opaque = Self::build(device, &self.layout, &shader, &format!("{label}_opaque"), self.format, self.samples, self.view, None);
+            Some((blended, opaque))
+        };
+        match (twin(false, "skinned_mesh_dry"), twin(true, "skinned_mesh_wet_lean")) {
+            (Some((dry, dry_opaque)), Some((wet, wet_opaque))) => {
+                self.body_twins = Some([dry, wet]);
+                self.opaque_twins = Some([dry_opaque, wet_opaque]);
+            }
+            _ => log::warn!("skinned body twins: the shader's edits no longer match; the body draws with the one shader"),
+        }
+        // The prepass: the dry twin's module (its vertex stage is every
+        // twin's, to the character), depth only.
+        if let Some(dry) = skinned_body_twin(&src, false) {
+            let shader = device.create_shader_module(ShaderModuleDescriptor {
+                label: Some("skinned_body_prepass"),
+                source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, self.view.shader(dry)).into()),
+            });
+            let depth = |label: &str, entry: &str| {
+                Self::build_entry(device, &self.layout, &shader, label, self.format, self.samples, self.view, None, entry, ColorWrites::empty())
+            };
+            self.prepass = Some([
+                depth("skinned_body_prepass", "fs_depth"),
+                depth("skinned_body_prepass_texels", "fs_depth_opaque_texels"),
+            ]);
+        }
+        self
+    }
+
+    /// The scene pass's pipeline for a body's OPAQUE parts, `wet` or dry:
+    /// [`Self::for_body`]'s twin with blending off, or `None` where there is
+    /// none (the wet body traced as before draws blended, as it was).
+    pub fn for_opaque_body(&self, wet: bool) -> Option<&RenderPipeline> {
+        match &self.opaque_twins {
+            Some([dry, _]) if !wet => Some(dry),
+            Some([_, lean]) if !SKINNED_FILM_TRACED.load(std::sync::atomic::Ordering::Relaxed) => Some(lean),
+            _ => None,
+        }
+    }
+
+    /// The scene pass's pipeline for a body `wet` or dry this frame.
+    pub fn for_body(&self, wet: bool) -> &RenderPipeline {
+        match &self.body_twins {
+            Some([dry, _]) if !wet => dry,
+            Some([_, lean]) if !SKINNED_FILM_TRACED.load(std::sync::atomic::Ordering::Relaxed) => lean,
+            _ => &self.pipeline,
+        }
+    }
+
+    fn build(
+        device: &Device,
+        layout: &PipelineLayout,
+        shader: &ShaderModule,
+        label: &str,
+        format: TextureFormat,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        blend: Option<BlendState>,
+    ) -> RenderPipeline {
+        Self::build_entry(device, layout, shader, label, format, samples, view, blend, "fs_main", ColorWrites::ALL)
+    }
+
+    /// [`Self::build`] with another fragment entry and colour mask: the
+    /// depth prepass's (`fs_depth`, nothing written but depth).
+    #[allow(clippy::too_many_arguments)]
+    fn build_entry(
+        device: &Device,
+        layout: &PipelineLayout,
+        shader: &ShaderModule,
+        label: &str,
+        format: TextureFormat,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        blend: Option<BlendState>,
+        fragment_entry: &str,
+        write_mask: ColorWrites,
+    ) -> RenderPipeline {
+        device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
             vertex: VertexState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
                 buffers: &[Some(SkinnedMeshVertex::layout())],
             },
             fragment: Some(FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
+                module: shader,
+                entry_point: Some(fragment_entry),
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
+                    blend,
+                    write_mask,
                 })],
             }),
             primitive: PrimitiveState {
@@ -682,21 +894,18 @@ impl SkinnedMeshPipeline {
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(CompareFunction::Less),
+                // LessEqual: after the body's depth prepass its own shading
+                // passes at the depth the prepass laid (`prepass`; the
+                // position is `@invariant`). Without one, the same as Less
+                // but for exactly coincident triangles.
+                depth_compare: Some(CompareFunction::LessEqual),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
             multiview_mask: view.mask(),
             cache: None,
-        });
-
-        Self {
-            pipeline,
-            texture_layout,
-            model_layout,
-            skin_joint_layout,
-        }
+        })
     }
 
     pub fn create_model_uniform(&self, device: &Device) -> ModelUniform {
@@ -769,7 +978,9 @@ struct VIn {{
 }}
 
 struct VOut {{
-    @builtin(position) clip: vec4<f32>,
+    // INVARIANT: the body's depth prepass and its shading put a vertex at
+    // the same depth to the bit. See `SkinnedMeshPipeline::prepass`.
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) uv:     vec2<f32>,
     @location(2) world_pos: vec3<f32>,
@@ -844,6 +1055,23 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         );
     }}
     return vec4<f32>(tonemap(rgb), tex_color.a);
+}}
+
+// THE BODY'S DEPTH PREPASS (`SkinnedMeshPipeline::prepass`): depth only.
+@fragment
+fn fs_depth() -> @location(0) vec4<f32> {{
+    return vec4<f32>(0.0);
+}}
+
+// The same for a see-through part: only where its texture is wholly
+// opaque, so a pixel it only partly covers keeps what lies behind it, to
+// be blended over as before.
+@fragment
+fn fs_depth_opaque_texels(in: VOut) -> @location(0) vec4<f32> {{
+    if (textureSample(tex, samp, in.uv).a < 0.999) {{
+        discard;
+    }}
+    return vec4<f32>(0.0);
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
@@ -1221,7 +1449,9 @@ fn mesh_shader_variant_with(thin: bool, thin_mean: bool) -> String {
 // `bulb`: a fixture's own lamp -- [position, range], [beam direction, cos of
 // the outer half-angle], [radiance, cos of the inner] -- with its mask marker
 // in `params.z`. See `own_bulb_fill`.
-struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9>, bulb: array<vec4<f32>, 3> }}
+// `weather`: y the grab glow (`ModelUniform::set_highlight`); x is the
+// skinned shader's wetness, which this one does not read.
+struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9>, bulb: array<vec4<f32>, 3>, weather: vec4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
 {room_light}
 
@@ -1336,6 +1566,20 @@ fn vs_main(v: VIn) -> VOut {{
 }}
 
 {thin_fn}{thin_shade}
+// THE GRAB GLOW: what a hand's grip will take when it closes (quest_app
+// `grab_reach`, `space_soup_engine::grab_target`). Laid over the finished,
+// tonemapped colour -- display-referred, so it reads the same in a sunlit
+// field and a dark hall, whatever the exposure -- as a cool tint over the
+// whole thing and a bright rim where it turns away from the eye. No lamp
+// lights a thing that colour, and its level breathes slowly (the CPU's
+// `GlowFade`), so it is not taken for the object's own light. `k` 0..1.
+const GRAB_GLOW_COLOUR: vec3<f32> = vec3<f32>(0.62, 0.86, 1.0);
+fn grab_highlight(c: vec3<f32>, n: vec3<f32>, world_pos: vec3<f32>, k: f32) -> vec3<f32> {{
+    let f = 1.0 - abs(dot(n, normalize(cam_pos() - world_pos)));
+    let rim = f * f * f;
+    return mix(c, GRAB_GLOW_COLOUR, k * (0.16 + 0.64 * rim));
+}}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);{thin_span}
@@ -1409,7 +1653,13 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     // The lit room round it, which the baked bounce -- an old per-object
     // estimate -- all but left out: see `room_light`.
     {shaded}
-    return vec4<f32>(tonemap(colour + glow), tex_color.a{thin_fade});
+    var out = tonemap(colour + glow);
+    // A uniform branch: every model but the one a hand will take skips it.
+    let grab_glow = model_u.weather.y;
+    if (grab_glow > 0.0) {{
+        out = grab_highlight(out, n, in.world_pos, grab_glow);
+    }}
+    return vec4<f32>(out, tex_color.a{thin_fade});
 }}
 "#,
         lights_block = wgsl_lights_block(0, 1),
@@ -1879,6 +2129,7 @@ mod tests {
         let pipeline = MeshPipeline::new(&device, format, &uniforms.layout);
         let model = pipeline.create_model_uniform(&device);
         model.upload_lit_bulb(&queue, glam::Mat4::IDENTITY, sky_vis, drive, room, own, 0.0);
+        model.set_highlight(&queue, TEST_HIGHLIGHT.with(|h| h.get()));
 
         // Mid grey base, with a WHITE emissive mask so this measures the
         // factor and the drive. The mask itself is covered separately.
@@ -2550,6 +2801,140 @@ mod tests {
     }
 
     const NONE: [f32; 3] = [0.0, 0.0, 0.0];
+
+    thread_local! {
+        /// The grab glow `render_mesh_room_with` draws its model with.
+        static TEST_HIGHLIGHT: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    }
+
+    /// THE GRAB GLOW READS IN THE DARK AND IN DAYLIGHT, as a cool tint, and a
+    /// model at zero is drawn as before: what a hand will take is lit, and
+    /// nothing else changes.
+    #[test]
+    fn the_grab_glow_reads_in_the_dark_and_in_daylight() {
+        let bright = |glow: f32| {
+            TEST_HIGHLIGHT.with(|h| h.set(glow));
+            let px = render_mesh_stationary(NONE, 0.0, true, 1.0, [255; 4], [0, 0, 0, 255], [200, 200, 200, 255], None, 60.0);
+            TEST_HIGHLIGHT.with(|h| h.set(0.0));
+            px
+        };
+        let dark = |glow: f32| {
+            TEST_HIGHLIGHT.with(|h| h.set(glow));
+            let px = render_mesh_sky(NONE, 0.0, false, 0.0);
+            TEST_HIGHLIGHT.with(|h| h.set(0.0));
+            px
+        };
+        let Some(dark_plain) = dark(0.0) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let (dark_lit, day_plain, day_lit) = (dark(1.0).unwrap(), bright(0.0).unwrap(), bright(1.0).unwrap());
+        eprintln!("dark {dark_plain:?} -> {dark_lit:?}; daylight {day_plain:?} -> {day_lit:?}");
+        // In the dark: a cool glow where there was black.
+        assert!(dark_lit[2] >= dark_plain[2] + 24 && dark_lit[2] > dark_lit[0], "dark: {dark_plain:?} -> {dark_lit:?}");
+        // In daylight on a near-white face: still shifted to the glow's hue.
+        assert!(day_plain[0] > 200, "the daylight case is not bright: {day_plain:?}");
+        assert!(day_lit[0] + 6 <= day_plain[0] && day_lit[2] >= day_lit[0], "daylight: {day_plain:?} -> {day_lit:?}");
+        // At zero, nothing: the same pixel as a model never lit.
+        assert_eq!(dark(0.0).unwrap(), dark_plain);
+    }
+
+    /// THE BODY'S TWINS: the dry one is the shader with its wet branch
+    /// compiled out (the same pixels at wet 0), the wet one the shader with
+    /// the rooms' reflection machinery out; both validate, and the wet one is
+    /// under a fifth of the traced one by the inlining proxy.
+    #[test]
+    fn the_bodys_dry_and_wet_twins_validate_and_are_lean() {
+        let total = |s: &str| -> usize { crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|r| r.own * r.copies).sum() };
+        let src = skinned_mesh_shader();
+        let (dry, wet) = (skinned_body_twin(&src, false).expect("dry"), skinned_body_twin(&src, true).expect("wet"));
+        for (label, s) in [("dry", &dry), ("wet", &wet)] {
+            let module = wgpu::naga::front::wgsl::parse_str(s).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(s)));
+            wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+        let (d, w, full) = (total(&dry), total(&wet), total(&src));
+        eprintln!("skinned fs_main by the proxy: dry {d}, wet {w}, traced {full}");
+        assert!(d < 1200 && w * 5 < full, "dry {d}, wet {w}, traced {full}");
+    }
+
+    /// THE OPAQUE TWINS (`Levers::opaque_models`) build beside the blended
+    /// pipelines, for the eye pass's mono pipelines only, and validate; the
+    /// mirror's keep none. And what makes them the same pixels: an opaque
+    /// model's shader returns its texture's alpha, which the decode forces to
+    /// 1, and a cuboid's its colour's.
+    #[test]
+    fn the_scene_passs_opaque_twins_build_beside_the_blended_pipelines() {
+        assert!(mesh_shader().contains("return vec4<f32>(out, tex_color.a);"), "the mesh shader's alpha moved");
+        assert!(crate::renderer::pipeline::solid_shader_src().contains("return vec4<f32>(in.col.rgb * lit * lightmap, in.col.a);"));
+        let Some((device, _queue)) = crate::renderer::pipeline::tests::headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let lights = crate::renderer::lights::LightsUniform::new(&device);
+        let (_shadows, uniforms) = crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
+        let format = TextureFormat::Rgba8UnormSrgb;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mesh = MeshPipeline::new_multisampled(&device, format, &uniforms.layout, 4);
+        let spotless = MeshPipeline::new_multisampled_spotless(&device, format, &uniforms.layout, 4);
+        let mirror = MeshPipeline::new_mirror(&device, format, &uniforms.layout);
+        let body = SkinnedMeshPipeline::new_multisampled(&device, format, &uniforms.layout, 4).with_body_twins(&device);
+        let solid = crate::renderer::pipeline::SolidPipeline::new_multisampled(&device, format, &uniforms.layout, 4);
+        let mirror_solid = crate::renderer::pipeline::SolidPipeline::new_mirror(&device, format, &uniforms.layout);
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "an opaque twin failed to build: {err:?}");
+        assert!(mesh.opaque.is_some() && spotless.opaque.is_some() && solid.opaque.is_some());
+        assert!(mirror.opaque.is_none() && mirror_solid.opaque.is_none());
+        assert!(body.for_opaque_body(false).is_some() && body.for_opaque_body(true).is_some());
+        // The body's depth prepass, built and validated with them; its
+        // position is invariant, so the shading passes at LessEqual.
+        assert!(body.prepass.is_some(), "the body's depth prepass was not built");
+        let src = skinned_mesh_shader();
+        assert!(src.contains("@builtin(position) @invariant clip"));
+        for twin in [skinned_body_twin(&src, false).unwrap(), skinned_body_twin(&src, true).unwrap()] {
+            let vs = |s: &str| s[s.find("fn vs_main").unwrap()..s.find("@fragment").unwrap()].to_string();
+            assert_eq!(vs(&twin), vs(&src), "a twin's vertex stage differs from the prepass's");
+        }
+    }
+
+    /// MEASUREMENT (Round 2, 2026-10-14: lag looking down at the body in
+    /// the rain): the player's skinned shader by the inlining proxy, dry
+    /// (its wet branch cut) and wet, beside the static mesh shader.
+    /// `cargo test --release --lib skinned_shader_sizes -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn skinned_shader_sizes() {
+        let total = |s: &str| -> usize { crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|r| r.own * r.copies).sum() };
+        let skinned = skinned_mesh_shader();
+        let wet_from = "    if (wet > 0.0) {";
+        let i = skinned.find(wet_from).expect("the wet branch");
+        let j = i + skinned[i..].find("\n    }}\n").map(|k| k + 6).unwrap_or(0);
+        let _ = j;
+        let dry = skinned.replacen("    if (wet > 0.0) {", "    if (false) {", 1);
+        eprintln!("skinned fs_main: dry path {} (wet branch compiled out), with the wet branch {}; static mesh {}", total(&dry), total(&skinned), total(&mesh_shader()));
+        let lean = skinned.replacen("const PROBE_NOWHERE: bool = false;", "const PROBE_NOWHERE: bool = true;", 1);
+        eprintln!("skinned fs_main, the wet film with no rooms' reflection machinery (PROBE_NOWHERE): {}", total(&lean));
+        eprintln!("{}", crate::renderer::shader_inlining::report("skinned lean", &lean, "fs_main", 12));
+    }
+
+    /// THE GRAB GLOW COSTS A MODEL NOTHING UNTIL IT IS LIT: behind a uniform
+    /// branch on its own uniform, in every mesh shader the scene draws with;
+    /// and what it adds, by the inlining proxy (PIPESTATS on the headset:
+    /// the `mesh_no_grab_glow` cut).
+    #[test]
+    fn the_grab_glow_is_behind_a_uniform_branch_and_small() {
+        for (label, src) in [("mesh", mesh_shader()), ("thin", mesh_shader_variant_with(true, true))] {
+            assert!(src.contains(GRAB_GLOW_BRANCH), "{label}: the glow is not behind its branch");
+            assert!(src.contains("let grab_glow = model_u.weather.y;"), "{label}");
+            let total = |s: &str| -> usize {
+                crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|r| r.own * r.copies).sum()
+            };
+            let (with, without) = (total(&src), total(&src.replacen(GRAB_GLOW_BRANCH, "", 1)));
+            eprintln!("{label} fs_main by the proxy: {without} without the grab glow, {with} with it (+{})", with - without);
+            assert!(with - without <= 40, "{label}: the glow grew the shader by {}", with - without);
+        }
+    }
     const RED_BULB: [f32; 3] = [0.9, 0.1, 0.05];
 
     #[test]

@@ -150,9 +150,28 @@ impl LayeredMeshPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
 ) -> Self {
+        Self::build(device, format, uniform_layout, material_layout, front_face, samples, view, layered_mesh_shader(), None, "layered_mesh_pipeline")
+    }
+
+    /// The pipeline from a given cave shader source and cull mode: the
+    /// shipped one (`layered_mesh_shader`, no culling), or one of its twins,
+    /// each drawing the faces of its triangle class (`cave_twins`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        material_layout: &BindGroupLayout,
+        front_face: FrontFace,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        source: String,
+        cull_mode: Option<Face>,
+        label: &str,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("layered_mesh_shader"),
-            source: ShaderSource::Wgsl(view.shader(layered_mesh_shader()).into()),
+            source: ShaderSource::Wgsl(view.shader(source).into()),
         });
 
         // Structurally identical to the mesh pipeline's model layout, which is
@@ -190,7 +209,7 @@ impl LayeredMeshPipeline {
         });
 
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("layered_mesh_pipeline"),
+            label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -202,9 +221,16 @@ impl LayeredMeshPipeline {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
+                // OPAQUE, NOT BLENDED: the shader writes alpha 1, so blending
+                // changed no pixel. (Made opaque in the hope it would let the
+                // draw write the Adreno's low-resolution depth; the headset's
+                // per-draw trace still reports LRZ `TestEnabled` only for it,
+                // and its fragment count did not move -- 1.35 M an eye at
+                // cave_chamber, which is about the screen: little overdraw.
+                // 2026-10-08.)
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    blend: None,
                     write_mask: ColorWrites::ALL,
                 })],
             }),
@@ -213,8 +239,10 @@ impl LayeredMeshPipeline {
                 // NO CULLING. A cave is seen from the inside, and the surface
                 // between a chamber and the rock is one sheet of triangles --
                 // cull the back and a player standing in the chamber is looking
-                // at the void through the wall they came in by.
-                cull_mode: None,
+                // at the void through the wall they came in by. (A twin culls
+                // one side of a triangle class whose other side another twin
+                // draws: `cave_twins`.)
+                cull_mode,
                 front_face,
                 polygon_mode: PolygonMode::Fill,
                 ..Default::default()
@@ -257,7 +285,7 @@ impl LayeredMeshPipeline {
     }
 }
 
-fn layered_mesh_shader() -> String {
+pub(crate) fn layered_mesh_shader() -> String {
     format!(
         r#"
 // Group 0 -- the camera, the lights and both shadow maps -- is declared by

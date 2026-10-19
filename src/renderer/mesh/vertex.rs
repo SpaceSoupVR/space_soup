@@ -169,6 +169,12 @@ impl SkinnedMeshVertex {
 pub struct LayeredPrimitive {
     pub vertices: Vec<LayeredVertex>,
     pub vertex_buffer: wgpu::Buffer,
+    /// Where each triangle class ends in the (reordered) index buffer:
+    /// rock, ground in front, ground behind, mixed. See `cave_twins`.
+    pub twin_ends: [u32; 4],
+    /// The box round its vertices, in the model's frame: whether an eye is in
+    /// the cave, for its depth in the reflection pass (`cave_twins`).
+    pub bounds: [[f32; 3]; 2],
 }
 
 #[derive(Clone)]
@@ -182,6 +188,9 @@ pub struct MeshPrimitive {
     /// to do it with. Both, because a mesh that asks and does not supply would
     /// otherwise render as a single flat layer with no clue why.
     pub layered: Option<LayeredPrimitive>,
+    /// Present when the file is a baked cave (`renderer::baked_cave`): the
+    /// same triangles and index buffer, as the vertices its pipeline draws.
+    pub baked_cave: Option<crate::renderer::baked_cave::BakedCavePrimitive>,
     /// Whether this primitive belongs in a shadow map.
     ///
     /// False for glass. A shadow map is BINARY -- a fragment either occludes or
