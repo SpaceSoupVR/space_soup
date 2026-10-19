@@ -1,36 +1,7 @@
-//! THE GROUND'S PIPELINES AS A SET, so they can be built again for a level
-//! whose ground is not what the last build assumed.
-//!
-//! Whether a level's ground is PAINTED (has a splat map) is a fact of the
-//! level, and the ground's shaders are built for it
-//! (`terrain_pipeline::GROUND_PAINTED`): a painted level's carry none of the
-//! slope-driven layer weights -- 176 of the gentle reader's 2,719
-//! instructions, an `acos` among them, that every pixel computed and threw
-//! away while "painted" arrived in a uniform. The renderer exists before any
-//! level does, so the first build goes by what the app expects
-//! (`terrain_pipeline::expect_painted_ground`); `set_terrain_splat` then asks
-//! [`XrRenderer::ground_for_level`], which builds the set again only when the
-//! level's material says otherwise (a level change between a painted and an
-//! unpainted level, or a wrong guess).
-//!
-//! The SAME PICTURE either way: the painted build is each shader with
-//! `select(derived, authored, mat.use_splat > 0.5)` written as `authored`,
-//! which is what the select returns when the material was given a splat map
-//! (`terrain_pipeline::tests::the_painted_build_keeps_the_splats_weights_alone`,
-//! `every_ground_twin_takes_the_painted_build`).
-//!
-//! Not rebuilt: the ground's `Scene`-role pipelines (`terrain_pipeline`, the
-//! stereo family's), which no shipped frame draws with and whose material
-//! layout every ground bind group was made from -- they keep the choice in
-//! them, right for any level -- and the cave's own shaders, which are not the
-//! ground's.
-
 use super::XrRenderer;
 use crate::renderer::terrain_pipeline::{TerrainPipeline, TerrainWeatherTwins};
 use wgpu::{BindGroupLayout, Device, TextureFormat};
 
-/// Every ground pipeline a shipped frame draws with, built from
-/// `terrain_shader_for` as `GROUND_PAINTED` stands.
 pub(super) struct GroundSet {
     pub pass: TerrainPipeline,
     pub pass_poolless: TerrainPipeline,
@@ -38,8 +9,7 @@ pub(super) struct GroundSet {
     pub outdoor_passes: Option<[TerrainPipeline; 2]>,
     pub nowhere_passes: Option<[TerrainPipeline; 2]>,
     pub open_passes: Option<[TerrainPipeline; 2]>,
-    /// The weather's open twin answering with the sky alone
-    /// (`Levers::puddle_sky`).
+
     pub puddle_pass: Option<TerrainPipeline>,
     pub reader: TerrainPipeline,
     pub reader_twins: [TerrainPipeline; 3],
@@ -60,7 +30,7 @@ impl GroundSet {
         let pass_poolless = TerrainPipeline::new_probe_pass_poolless(device, uniform_layout, fixups);
         let dedup_passes = crate::renderer::ground_twins::dedup_passes(device, uniform_layout, fixups, None);
         let weather_layout = crate::renderer::weather::bind_group_layout(device);
-        // `[dry, weather]` of each of the pass's twins by where the ground lies.
+
         let pair = |build: &dyn Fn(Option<&BindGroupLayout>) -> Option<TerrainPipeline>| {
             build(None).zip(build(Some(&weather_layout))).map(|(plain, wet)| [plain, wet])
         };
@@ -96,10 +66,6 @@ impl GroundSet {
     }
 }
 
-/// The weather's ground pipelines: the twins, the gentle readers' twins by
-/// what the ground holds (empty when they did not build), the pass's dedup
-/// twins, and the mixed and steep readers' wet-only twins. See
-/// `XrRenderer::set_weather`.
 pub(super) fn weather_ground(
     device: &Device,
     format: TextureFormat,
@@ -111,7 +77,7 @@ pub(super) fn weather_ground(
 ) -> (TerrainWeatherTwins, Vec<[TerrainPipeline; 4]>, Option<[TerrainPipeline; 2]>, Option<[[TerrainPipeline; 4]; 2]>) {
     use crate::renderer::weather;
     let twins = TerrainPipeline::new_weather_twins(device, format, uniform_layout, samples, probe_pass_layout, fixups, weather_layout);
-    // The gentle readers' twins, by what the ground holds. See `ground_twins`.
+
     let gentle: Vec<[TerrainPipeline; 4]> = weather::WeatherKinds::ALL
         .iter()
         .map_while(|kinds| {
@@ -123,8 +89,7 @@ pub(super) fn weather_ground(
     }
     let gentle = if gentle.len() == weather::WeatherKinds::ALL.len() { gentle } else { Vec::new() };
     let dedup_passes = crate::renderer::ground_twins::dedup_passes(device, uniform_layout, fixups, Some(weather_layout));
-    // The mixed and steep readers' wet-only twins, for chunks that hold no
-    // standing water and no snow. See `ground_twins::wet_readers`.
+
     let wet = crate::renderer::ground_twins::wet_readers(device, format, uniform_layout, samples, probe_pass_layout, weather_layout);
     if wet.is_none() {
         log::warn!("WEATHER: the ground's wet-only mixed and steep twins did not build; its full weather reader draws them");
@@ -133,10 +98,7 @@ pub(super) fn weather_ground(
 }
 
 impl XrRenderer {
-    /// A level's ground material is in hand (`set_terrain_splat`): the
-    /// ground's pipelines built again if they were built for the other kind
-    /// of ground. Nothing, and no cost, when they already match -- which is
-    /// every launch whose entry level the app guessed right.
+
     pub(super) fn ground_for_level(&mut self) {
         let painted = self.terrain_splat.is_some();
         if !crate::renderer::terrain_pipeline::ground_build_moves(painted) {
@@ -158,8 +120,7 @@ impl XrRenderer {
         self.terrain_reader_twins = set.reader_twins;
         self.terrain_gentle = set.gentle;
         self.terrain_steep = set.steep;
-        // Measurement pipelines built for the other ground: dropped, so the
-        // lever that asked for one builds it again.
+
         self.terrain_cut_pipeline = None;
         self.terrain_inlined = None;
         if self.weather.is_some() {

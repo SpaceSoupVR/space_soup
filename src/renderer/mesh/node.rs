@@ -57,9 +57,7 @@ pub(crate) fn collect_node(
     layout: &wgpu::BindGroupLayout,
     force_static: bool,
     node_to_joint: &HashMap<usize, usize>,
-    // The caller-supplied lightmap UV set. `None` means the mesh keeps
-    // whatever uv2 it was authored with, which for almost every asset is none
-    // at all -- and a 1x1 lightmap does not care where it is sampled.
+
     lightmap: Option<&super::MeshLightmapUv>,
     static_out: &mut Vec<MeshPrimitive>,
     skinned_out: &mut Vec<SkinnedMeshPrimitive>,
@@ -120,26 +118,18 @@ pub(crate) fn collect_node(
             let texture = load_primitive_texture(&prim, images, device, queue, layout);
             let texture = Arc::new(texture);
 
-            // Layer weights, when the file both asks for layered shading and
-            // carries them. Read here rather than in the `bake` arm below
-            // because the reader borrows the primitive, and a cave is always
-            // static anyway -- nothing has ever rigged one.
             let layered_weights: Option<Vec<[f32; 4]>> = if wants_layered_shading(&mesh) {
                 reader.read_colors(0).map(|c| c.into_rgba_f32().collect())
             } else {
                 None
             };
-            // And what the editor measured on the rock (COLOR_1): sky seen,
-            // soot, tide band. Absent: the whole sky and nothing else, as
-            // before it existed.
+
             let layered_aux: Vec<[f32; 4]> = if layered_weights.is_some() {
                 reader.read_colors(1).map(|c| c.into_rgba_f32().collect()).unwrap_or_default()
             } else {
                 Vec::new()
             };
 
-            // A BAKED CAVE (`baked_cave`): the file says so, and carries its
-            // layer weights and what the bake measured in COLOR_0 and COLOR_1.
             let baked_cave_meta = mesh
                 .extras()
                 .as_ref()
@@ -149,9 +139,7 @@ pub(crate) fn collect_node(
                 let c1: Vec<[u8; 4]> = reader.read_colors(1).map(|c| c.into_rgba_u8().collect()).unwrap_or_default();
                 Some((c0, c1))
             });
-            // And where it meets the ground: the terrain footprint's uv
-            // (TEXCOORD_2) and the ground's share of its lighting (COLOR_2's
-            // red). A file without them takes none of the ground's.
+
             let baked_cave_ground: (Vec<[f32; 2]>, Vec<[u8; 4]>) = if baked_cave_colours.is_some() {
                 (
                     reader.read_tex_coords(2).map(|t| t.into_f32().collect()).unwrap_or_default(),
@@ -160,64 +148,29 @@ pub(crate) fn collect_node(
             } else {
                 (Vec::new(), Vec::new())
             };
-            // The planes its layers are read on: the rest of COLOR_2, and
-            // COLOR_3 (a cliff's). A file without COLOR_3 has neither.
+
             let baked_cave_planes: Option<Vec<[u8; 4]>> =
                 if baked_cave_colours.is_some() { reader.read_colors(3).map(|c| c.into_rgba_u8().collect()) } else { None };
-            // The colour of its emissive paint (COLOR_4): only a cave that glows has one.
+
             let baked_cave_glow: Option<Vec<[u8; 4]>> =
                 if baked_cave_colours.is_some() { reader.read_colors(4).map(|c| c.into_rgba_u8().collect()) } else { None };
-            // Its TEXCOORD_1 IS the lightmap's layout: nothing is generated
-            // for it, and nothing is split.
+
             let lightmap = if baked_cave_colours.is_some() { None } else { lightmap };
 
-            // The material's emissive colour, as the ARTIST authored it.
-            //
-            // This is what makes a lamp read correctly: the bulb's material is
-            // emissive and the housing's is not, so switching the light on lights
-            // the bulb rather than the whole fixture. An asset with no emissive
-            // material is unaffected -- glTF's default emissiveFactor is black.
-            //
-            // KHR_materials_emissive_strength is folded in here rather than
-            // stored separately: it is a multiplier on the same colour, and
-            // keeping them apart would mean carrying a second per-vertex value
-            // to say something the first one can already express.
             let emissive = {
                 let m = prim.material();
                 let f = m.emissive_factor();
-                // KHR_materials_emissive_strength is not exposed by this gltf
-                // version, so the factor is taken as authored. An asset that
-                // needs a brighter bulb than 1.0 says so through the light's
-                // own intensity, which drives this per object anyway.
+
                 let strength = 1.0f32;
                 MeshVertex::pack_emissive([f[0] * strength, f[1] * strength, f[2] * strength])
             };
 
             if bake {
-                // A LIGHTMAPPED MESH IS DE-INDEXED.
-                //
-                // Adjacent triangles land in unrelated parts of the atlas, so a
-                // vertex shared between them has no single uv2 -- every edge is
-                // a chart seam. Splitting is what an unwrapper does at a seam;
-                // here it is every corner, which for a prop costs three
-                // vertices per triangle instead of roughly one.
-                //
-                // The GENERATED uv2 wins over any the asset happens to carry.
-                // The baker cannot read an artist's second UV set -- it derives
-                // the layout from the geometry -- so honouring an authored one
-                // here would mean the renderer sampling a chart the baker never
-                // wrote to, which is a black model rather than an error.
-                // Which source vertex each split corner came from, so any
-                // other per-vertex stream can be split the same way. Empty when
-                // the mesh was not split.
+
                 let mut split_corners: Vec<usize> = Vec::new();
                 let split = lightmap
                     .and_then(|lm| lm.per_primitive.get(&(node.index(), prim.index())))
-                    // One uv2 per index, or the map is describing different
-                    // geometry from the one loaded here -- a stale bake, a
-                    // re-exported asset -- and using it would scatter this
-                    // mesh's lighting. Falling back is the safe answer and
-                    // shows up as a flat model rather than a shredded one.
+
                     .filter(|corner_uv| corner_uv.len() == indices.len())
                     .map(|corner_uv| {
                         let mut v = Vec::with_capacity(indices.len());
@@ -225,8 +178,7 @@ pub(crate) fn collect_node(
                         for (c, &idx) in indices.iter().enumerate() {
                             let i = idx as usize;
                             from.push(i);
-                            // The triangle's own chart, which its pixels'
-                            // `uv2` is clamped into (see `uv2_rect`).
+
                             let t = c - c % 3;
                             let rect = match corner_uv.get(t..t + 3) {
                                 Some(&[a, b, d]) => MeshVertex::uv2_rect_of([a, b, d]),
@@ -267,12 +219,7 @@ pub(crate) fn collect_node(
                     usage: wgpu::BufferUsages::VERTEX,
                 });
                 let layered = layered_weights.map(|weights| {
-                    // The layered buffer is drawn with the SAME index buffer as
-                    // the shaded one, so it has to be split wherever that was.
-                    // Leaving it indexed by the original vertex count while the
-                    // indices count corners reads far off the end of it -- and
-                    // the failure is silent garbage on the GPU rather than a
-                    // bounds check.
+
                     let source: Vec<usize> = if split_corners.is_empty() {
                         (0..positions.len()).collect()
                     } else {
@@ -283,15 +230,10 @@ pub(crate) fn collect_node(
                         .map(|&i| LayeredVertex {
                             position: positions.get(i).copied().unwrap_or(Vec3::ZERO).into(),
                             normal: normals.get(i).copied().unwrap_or(Vec3::Y).into(),
-                            // A vertex past the end of a short COLOR_0 gets
-                            // layer 0 rather than nothing: the shader reads
-                            // all-zero weights as layer 0 too, so the two
-                            // agree instead of one of them rendering black.
+
                             weights: weights.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]),
                             aux: layered_aux.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 1.0]),
-                            // The ground copy: terrain uv (TEXCOORD_0) and
-                            // how much of the vertex it is (TEXCOORD_1.x).
-                            // A file without them reads 0: rock throughout.
+
                             ground: {
                                 let uv = uvs.get(i).copied().unwrap_or([0.0, 0.0]);
                                 let b = uv2s.get(i).map(|u| u[0]).unwrap_or(0.0);
@@ -305,8 +247,7 @@ pub(crate) fn collect_node(
                             contents: bytemuck::cast_slice(&lv),
                             usage: wgpu::BufferUsages::VERTEX,
                         });
-                    // THE TRIANGLES BY CLASS, for the cave shader's twins: the
-                    // same triangles, reordered. See `cave_twins::partition`.
+
                     let (by_class, twin_ends) = crate::renderer::cave_twins::partition(&lv, &indices);
                     let bounds = lv.iter().fold([[f32::INFINITY; 3], [f32::NEG_INFINITY; 3]], |[lo, hi], v| {
                         [
@@ -327,9 +268,9 @@ pub(crate) fn collect_node(
                                 positions[i].into(),
                                 normals.get(i).copied().unwrap_or(Vec3::Y).into(),
                                 uv2s.get(i).copied().unwrap_or([0.0, 0.0]),
-                                // A short COLOR_0: layer 1 (rock), as the shader reads no weights.
+
                                 c0.get(i).copied().unwrap_or([0, 255, 0, 1 << 6]),
-                                // A file without COLOR_1: the whole sky and sun, dry, clean.
+
                                 c1.get(i).copied().unwrap_or([255, 255, 0, 0]),
                                 (
                                     baked_cave_ground.0.get(i).copied().unwrap_or([0.0, 0.0]),
@@ -351,23 +292,16 @@ pub(crate) fn collect_node(
                     usage: wgpu::BufferUsages::INDEX,
                 });
 
-                // See `MeshPrimitive::casts_shadow`. Half, because that is the
-                // honest rounding of a continuous transmission onto a binary
-                // shadow map: a surface that lets more light through than it
-                // stops is better modelled as not stopping it. A material with
-                // no transmission -- which is nearly all of them -- is
-                // unaffected and casts exactly as it always did.
                 let casts_shadow = casts_shadow(
                     prim.material()
                         .transmission()
                         .map(|t| t.transmission_factor())
                         .unwrap_or(0.0),
                 );
-                // What `texture::load_primitive_texture` draws see-through.
+
                 let blended = prim.material().alpha_mode() == gltf::material::AlphaMode::Blend
                     || prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0) > 0.0;
-                // See `thin_parts`. Not for a cave (drawn by the layered
-                // pipeline) nor glass (drawn see-through, after the thin pass).
+
                 let thin = if layered.is_none() && baked_cave.is_none() && !blended {
                     super::thin_parts::split_thin_parts(&vertices, &indices)
                         .map(|split| super::thin_parts::ThinParts::upload(device, &split))
@@ -423,8 +357,7 @@ pub(crate) fn collect_node(
                 let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("skinned_mesh_vb"),
                     contents: bytemuck::cast_slice(&vertices),
-                    // STORAGE too: read by the pass that poses it once a frame
-                    // (`skin_compute`).
+
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
                 });
                 let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -438,7 +371,7 @@ pub(crate) fn collect_node(
                     texture,
                     vertex_buffer,
                     index_buffer,
-                    // As `blended` above: what `load_primitive_texture` left see-through.
+
                     blended: prim.material().alpha_mode() == gltf::material::AlphaMode::Blend
                         || prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0) > 0.0,
                 });
@@ -466,30 +399,10 @@ pub(crate) fn collect_node(
     }
 }
 
-/// Whether a surface transmitting `transmission` of the light belongs in a
-/// shadow map. See `MeshPrimitive::casts_shadow`.
-///
-/// Half, because that is the honest rounding of a continuous transmission onto
-/// a BINARY shadow map: a surface that lets more light through than it stops is
-/// better modelled as not stopping it. A material with no transmission -- which
-/// is nearly all of them -- is unaffected and casts exactly as it always did.
-///
-/// Its own function so the threshold can be tested without a glTF fixture, and
-/// so there is one place to change if translucent shadows ever arrive.
 pub(crate) fn casts_shadow(transmission: f32) -> bool {
     transmission <= 0.5
 }
 
-/// Whether a mesh asked to be shaded from its per-vertex layer weights.
-///
-/// Declared by the FILE, in `extras`, rather than by the scene object that
-/// happens to reference it. A cave bake is a cave bake wherever it is placed,
-/// and putting the flag in the scene would mean carrying it through the engine
-/// schema, the wire protocol and the client to say something the mesh already
-/// knows.
-///
-/// Not inferred from "has COLOR_0 and no baseColorTexture", which would silently
-/// render an artist's vertex-coloured model as cave rock.
 fn wants_layered_shading(mesh: &gltf::Mesh) -> bool {
     let Some(raw) = mesh.extras().as_ref() else {
         return false;
@@ -503,32 +416,21 @@ fn wants_layered_shading(mesh: &gltf::Mesh) -> bool {
         == Some("layered")
 }
 
-
 #[cfg(test)]
 mod shadow_caster_tests {
     use super::casts_shadow;
 
-    /// The hanging lamp's envelope: `KHR_materials_transmission` 1.0, invisible
-    /// to the eye, and as a shadow caster it sealed its own bulb in -- measured
-    /// at 100% of the bulb's downward light blocked, against 2% for the opaque
-    /// housing around it. Both rooms in `test_room` rendered black because of
-    /// it, and the lamp still glowed, which made it read as a lighting problem
-    /// rather than a shadow one.
     #[test]
     fn clear_glass_does_not_cast_a_shadow() {
         assert!(!casts_shadow(1.0));
     }
 
-    /// Everything else is unchanged. glTF's default transmission is 0, so this
-    /// is every material in every asset that has never heard of the extension.
     #[test]
     fn an_ordinary_material_casts_exactly_as_before() {
         assert!(casts_shadow(0.0));
         assert!(casts_shadow(0.1));
     }
 
-    /// A binary shadow map has to round, and it rounds at the halfway point:
-    /// a surface stopping most of the light still casts.
     #[test]
     fn partial_transmission_rounds_to_the_nearer_answer() {
         assert!(casts_shadow(0.4), "blocks 60% of the light -- it casts");

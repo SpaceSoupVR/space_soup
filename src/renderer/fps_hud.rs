@@ -1,24 +1,10 @@
-//! THE FRAME-RATE READOUT: a small panel in front of the player's view with
-//! the frames a second the app is making, and what the runtime says the app's
-//! GPU and CPU spent on each. Toggled in play (the Y button).
-//!
-//! Drawn by the COMPOSITOR as its own quad layer (`xr_renderer::fps_layer`),
-//! not into the eye images: it is sharp whatever the eyes' resolution, SpaceWarp
-//! never extrapolates it (so it writes no motion vectors), and it costs the
-//! frame nothing but a small upload twice a second.
-//!
-//! This half is what can be tested on the host: the meter and the picture.
-
 use std::time::{Duration, Instant};
 
-/// How often the numbers change: often enough to follow, slow enough to read.
 pub const UPDATE_EVERY: Duration = Duration::from_millis(500);
 
-/// The panel's pixels: three lines of the 5x7 font at `SCALE`.
 pub const WIDTH_PX: u32 = 320;
 pub const HEIGHT_PX: u32 = 144;
-/// Its size and place in VIEW space (metres; x right, y up, -z ahead): low and
-/// to the left, where it can be read with a glance and stays out of the way.
+
 pub const WIDTH_M: f32 = 0.14;
 pub const HEIGHT_M: f32 = WIDTH_M * HEIGHT_PX as f32 / WIDTH_PX as f32;
 pub const POSITION: [f32; 3] = [-0.17, -0.16, -0.75];
@@ -28,20 +14,17 @@ const MARGIN: usize = 16;
 const LINE_HEIGHT: usize = 7 * SCALE + 12;
 const ADVANCE: usize = 6 * SCALE;
 
-/// One window's numbers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reading {
-    /// Frames the app made a second.
+
     pub fps: f64,
-    /// The rate it is aiming at: the display's, or half of it under SpaceWarp.
+
     pub target_fps: f64,
-    /// The runtime's `app/gpu_frametime` and `app/cpu_frametime`, averaged
-    /// (`None` without `XR_META_performance_metrics`).
+
     pub gpu_ms: Option<f64>,
     pub cpu_ms: Option<f64>,
 }
 
-/// Counts frames and averages the runtime's counters between updates.
 #[derive(Default)]
 pub struct FpsMeter {
     start: Option<Instant>,
@@ -51,13 +34,10 @@ pub struct FpsMeter {
 }
 
 impl FpsMeter {
-    /// One frame made at `now`, with the runtime's counters for it if it has
-    /// them (`app/gpu_frametime`, `app/cpu_frametime`, in milliseconds). On
-    /// the frame that closes a window, that window's reading.
+
     pub fn frame(&mut self, now: Instant, gpu_ms: Option<f64>, cpu_ms: Option<f64>, target_fps: f64) -> Option<Reading> {
         let Some(start) = self.start else {
-            // The first frame only starts the clock: a window counts the
-            // frames that END in it.
+
             self.start = Some(now);
             return None;
         };
@@ -84,8 +64,6 @@ impl FpsMeter {
     }
 }
 
-/// The readout's lines and the colour of each (sRGB), the frame rate's by how
-/// close it is to the target: green at it, amber a little under, red well under.
 pub fn lines(r: &Reading) -> [(String, [u8; 3]); 3] {
     let ms = |v: Option<f64>| v.map_or("--".to_string(), |v| format!("{v:.1}"));
     let share = if r.target_fps > 0.0 { r.fps / r.target_fps } else { 1.0 };
@@ -103,13 +81,10 @@ pub fn lines(r: &Reading) -> [(String, [u8; 3]); 3] {
     ]
 }
 
-/// The panel as RGBA8 (sRGB, premultiplied alpha, rows top first): a dark
-/// translucent card with the lines on it.
 pub fn picture(lines: &[(String, [u8; 3])]) -> Vec<u8> {
     let (w, h) = (WIDTH_PX as usize, HEIGHT_PX as usize);
     let mut px = vec![0u8; w * h * 4];
-    // The card: black at 60%, its corners rounded. Premultiplied, so black
-    // is zeros whatever its alpha.
+
     let radius = 14.0f32;
     for y in 0..h {
         for x in 0..w {
@@ -145,8 +120,6 @@ pub fn picture(lines: &[(String, [u8; 3])]) -> Vec<u8> {
     px
 }
 
-/// A 5x7 glyph, one row a byte (bit 4 the left column); `None` for a space or
-/// anything the readout never writes.
 fn glyph(ch: char) -> Option<[u8; 7]> {
     Some(match ch {
         '0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
@@ -183,7 +156,7 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(m.frame(t0, Some(99.0), None, 36.0), None, "the first frame only starts the clock");
         let mut reading = None;
-        // 36 a second: a frame every 1/36 s until half a second has passed.
+
         for i in 1..=18 {
             let at = t0 + Duration::from_secs_f64(i as f64 / 36.0);
             if let Some(r) = m.frame(at, Some(20.0 + i as f64 % 2.0), Some(5.0), 36.0) {
@@ -225,9 +198,9 @@ mod tests {
         assert!(MARGIN + 3 * LINE_HEIGHT <= HEIGHT_PX as usize);
         let px = picture(&lines(&r));
         assert_eq!(px.len(), (WIDTH_PX * HEIGHT_PX * 4) as usize);
-        // Premultiplied: no channel above its alpha anywhere.
+
         assert!(px.chunks(4).all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]));
-        // The corner is clear, the card's middle dark, and the text drawn.
+
         assert_eq!(px[3], 0);
         assert!(px.chunks(4).any(|p| p == [235, 235, 235, 255]));
     }

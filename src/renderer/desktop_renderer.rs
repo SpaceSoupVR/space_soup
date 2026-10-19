@@ -8,8 +8,11 @@ use super::lights::LightsUniform;
 use super::mesh::LoadedTexture;
 use super::shadow::{self, ShadowKind, ShadowMap};
 use super::uniforms::ShadowUpload;
-use super::{icon, lights, mesh_pipeline, pipeline, uniforms};
+use super::water_pipeline::{WaterPipeline, WaterUniform, WaterVertex};
+use super::water_waves::{WaveField, WaveParams};
+use super::{ground_map, icon, lights, mesh_pipeline, pipeline, uniforms};
 use super::{Camera, Cuboid, MeshInstance, WorldPanel};
+use spacesoup_graphics::mud::{MudMap, Walkers as MudWalkers};
 
 struct CuboidCacheEntry {
     snapshot: CuboidSnapshot,
@@ -23,39 +26,97 @@ struct DesktopTerrain {
     vb: Buffer,
     ib: Buffer,
     index_count: u32,
+    mud: Option<MudBody>,
+    splat: Option<super::terrain_pipeline::TerrainImage>,
+    mud_layer: i32,
 }
+
+struct DesktopWater {
+    vertex_buffer: Buffer,
+    index_buffer: Buffer,
+    uniform_buffer: Buffer,
+    bind_groups: [BindGroup; 2],
+    index_count: u32,
+    uniform: WaterUniform,
+    waves: WaveField,
+    bounds: (glam::Vec3, glam::Vec3),
+}
+
+struct MudBody {
+    map: MudMap,
+    texture: Texture,
+    view: TextureView,
+    walkers: MudWalkers,
+}
+
+impl MudBody {
+    fn new(device: &Device, queue: &Queue, min: [f32; 2], max: [f32; 2]) -> Self {
+        let map = MudMap::new(min, max, spacesoup_graphics::mud::DEFAULT_TEXEL, spacesoup_graphics::mud::MAX_SIDE);
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("terrain_deform"),
+            size: Extent3d { width: map.width(), height: map.height(), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rg8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            map.bytes(),
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(map.width() * 2), rows_per_image: Some(map.height()) },
+            Extent3d { width: map.width(), height: map.height(), depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&TextureViewDescriptor::default());
+        Self { map, texture, view, walkers: MudWalkers::default() }
+    }
+
+    fn flush(&mut self, queue: &Queue) {
+        let Some([_, y0, _, y1]) = self.map.take_dirty() else { return };
+        if y1 <= y0 {
+            return;
+        }
+        let width = self.map.width();
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &self.texture, mip_level: 0, origin: Origin3d { x: 0, y: y0, z: 0 }, aspect: TextureAspect::All },
+            self.map.rows(y0, y1),
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 2), rows_per_image: Some(y1 - y0) },
+            Extent3d { width, height: y1 - y0, depth_or_array_layers: 1 },
+        );
+    }
+}
+
+pub struct DesktopGround {
+    pub heights: ground_map::HeightGrid,
+    pub layers: Vec<Option<super::terrain_pipeline::TerrainImage>>,
+    pub splat: Option<super::terrain_pipeline::TerrainImage>,
+    pub settings: super::terrain_pipeline::TerrainMaterialUniform,
+}
+
+pub const DESKTOP_GROUND_MAP_SIZE: u32 = 512;
 
 pub struct Renderer {
     pub device: Device,
     pub queue: Queue,
     solid_pipeline: pipeline::SolidPipeline,
     wire_pipeline: pipeline::WirePipeline,
-    /// Depth-ignoring highlight variant: see `render_with_overlay`.
+
     overlay_pipeline: pipeline::SolidPipeline,
-    /// The surface format, kept so pipelines can be rebuilt
-    /// (`set_cuboids_double_sided`) and off-screen thumbnail targets can
-    /// match the format the pipelines were built for.
+
     pub format: TextureFormat,
-    /// What the 3D pass clears to each frame.
+
     pub clear_color: wgpu::Color,
-    /// The scene's ground, when one is set: its splat-material pipeline,
-    /// material and geometry. See [`Renderer::set_terrain`].
+
     terrain: Option<DesktopTerrain>,
-    /// Whether the terrain draws this frame -- the editor hides the scene's
-    /// ground on its isolated stages (Prop Studio, Hands, Walk).
+
     pub terrain_visible: bool,
     mesh_pipeline: mesh_pipeline::MeshPipeline,
     skinned_mesh_pipeline: mesh_pipeline::SkinnedMeshPipeline,
     uniform_buf: uniforms::UniformBuffer,
     lights_uniform: LightsUniform,
     shadow_map: ShadowMap,
-    /// How wide a slice of the world the sun's shadow covers, in metres.
-    ///
-    /// One orthographic box rather than cascades: a single map stretched over a
-    /// whole level gives shadows too coarse to read, so this is deliberately a
-    /// box that FOLLOWS THE CAMERA and covers the near field well. Distant
-    /// geometry falls outside it and is treated as lit, which is a far better
-    /// failure than a hard line across the ground where the map ran out.
+
     sun_shadow_radius: f32,
     depth_texture: Texture,
     depth_view: TextureView,
@@ -66,22 +127,25 @@ pub struct Renderer {
     default_cuboid_lightmap: LoadedTexture,
     mesh_lightmaps: HashMap<String, LoadedTexture>,
     default_mesh_lightmap: LoadedTexture,
-    /// Caller-built line geometry drawn with the wire pipeline every frame
-    /// (an editor's grids and guides), on top of the cuboids' own edges.
+
     raw_wire: (Vec<WireVertex>, Vec<u32>),
-    /// The sky's light by facing, when the caller has one (a graphics
-    /// profile's daylight); `None` is the flat ambient every scene always had.
+
     pub sky: Option<uniforms::SkyUpload>,
-    /// How radiance becomes pixels: exposure and tone curve.
+
     pub post: uniforms::PostUpload,
-    /// The photographed sky behind the level, when the caller set one
-    /// (`set_sky_panorama`): drawn where nothing nearer was, after every
-    /// opaque draw, through the same tone curve as the geometry.
+
     sky_pipeline: super::sky::SkyPipeline,
     sky_dome: Option<super::sky::Sky>,
-    /// Whether the panorama draws this frame -- hidden on the editor's
-    /// isolated stages, like the terrain.
+
     pub sky_visible: bool,
+
+    particle_pipeline: super::particle_pipeline::ParticlePipeline,
+    particles: Vec<super::particle_pipeline::ParticleInstance>,
+    water_pipeline: Option<WaterPipeline>,
+    water_bodies: Vec<DesktopWater>,
+    water_seconds: f64,
+    ground: Option<DesktopGround>,
+    ground_dirty: bool,
 }
 
 impl Renderer {
@@ -93,7 +157,7 @@ impl Renderer {
         height: u32,
     ) -> Self {
         let lights_uniform = LightsUniform::new(&device);
-        // Before the uniform buffer, which binds this one's depth textures.
+
         let shadow_map = ShadowMap::new(&device);
         let uniform_buf = uniforms::UniformBuffer::new(
             &device,
@@ -110,14 +174,12 @@ impl Renderer {
         let skinned_mesh_pipeline =
             mesh_pipeline::SkinnedMeshPipeline::new(&device, format, &uniform_buf.layout);
         let sky_pipeline = super::sky::SkyPipeline::new(&device, format, &uniform_buf.layout, 1);
+        let particle_pipeline = super::particle_pipeline::ParticlePipeline::new(&device, format, &uniform_buf.layout);
         let (depth_texture, depth_view) = Self::make_depth(&device, width, height);
         let white_pixel = [255u8, 255, 255, 255];
         let default_cuboid_lightmap =
             create_lightmap_texture(&device, &queue, &solid_pipeline.lightmap_layout, &white_pixel, 1, 1, None);
-        // BLACK, not white: a mesh ADDS its lightmap now, like a brush, so its
-        // neutral is zero. The alpha stays opaque because that channel carries
-        // sky visibility and is multiplied -- the two neutrals sit at opposite
-        // ends of the range in the same texel.
+
         let default_mesh_lightmap = crate::renderer::brush_pipeline::default_brush_lightmap(
             &device,
             &queue,
@@ -155,16 +217,218 @@ impl Renderer {
             sky_pipeline,
             sky_dome: None,
             sky_visible: true,
+            particle_pipeline,
+            particles: Vec::new(),
+            water_pipeline: None,
+            water_bodies: Vec::new(),
+            water_seconds: 0.0,
+            ground: None,
+            ground_dirty: false,
         }
     }
 
-    /// Show a photographed sky behind the level, turned by `rotation_deg`
-    /// and scaled by `intensity`, and hand back the light it gives: the
-    /// ambient harmonics WITHOUT its sun, and the sun on its own as one
-    /// directional light (see `sky::Sky::sun`). The caller puts the ambient
-    /// in `self.sky` and the sun among the frame's lights, so the shadows
-    /// fall away from the sun that is visible in the picture. `None` takes
-    /// the sky down.
+    pub fn set_particles(&mut self, items: Vec<super::particle_pipeline::ParticleInstance>) {
+        self.particles = items;
+    }
+
+    pub fn set_ground(&mut self, ground: Option<DesktopGround>) {
+        self.ground = ground;
+        self.ground_dirty = true;
+    }
+
+    pub fn set_water(&mut self, bodies: &[(Vec<WaterVertex>, Vec<u32>, WaterUniform, WaveParams)]) {
+        self.ground_dirty = true;
+        if bodies.is_empty() {
+            self.water_bodies.clear();
+            return;
+        }
+        if self.water_pipeline.is_none() {
+            let mut made = WaterPipeline::new(&self.device, self.format, &self.uniform_buf.layout, 1);
+            if let Ok(cut) = std::env::var("DESKTOP_WATER_CUT") {
+                match made.with_cut(&self.device, &cut) {
+                    Some(p) => {
+                        log::info!("desktop water: drawing with the '{cut}' cut");
+                        made.pipeline = p;
+                    }
+                    None => log::warn!("desktop water: no cut named '{cut}'"),
+                }
+            }
+            self.water_pipeline = Some(made);
+        }
+        let pipeline = self.water_pipeline.as_ref().expect("made above");
+        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| m.map.placement()).unwrap_or([0.0; 4]);
+        let deform_view = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| &m.view);
+        self.water_bodies = bodies
+            .iter()
+            .filter(|(v, i, _, _)| !v.is_empty() && !i.is_empty())
+            .map(|(verts, indices, uniform, params)| {
+                let bounds = super::water_pipeline::water_bounds(verts, params);
+                let mut uniform = *uniform;
+                uniform.prints = placement;
+                let vertex_buffer = self.device.create_buffer_init(&util::BufferInitDescriptor {
+                    label: Some("water_vb"),
+                    contents: bytemuck::cast_slice(verts),
+                    usage: BufferUsages::VERTEX,
+                });
+                let index_buffer = self.device.create_buffer_init(&util::BufferInitDescriptor {
+                    label: Some("water_ib"),
+                    contents: bytemuck::cast_slice(indices),
+                    usage: BufferUsages::INDEX,
+                });
+                let uniform_buffer = self.device.create_buffer_init(&util::BufferInitDescriptor {
+                    label: Some("water_uniform"),
+                    contents: bytemuck::bytes_of(&uniform),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                });
+                let waves = WaveField::new(&self.device, &self.queue, *params);
+                waves.reprime();
+                let bind_groups = pipeline.bind_groups_with(&self.device, &uniform_buffer, &waves, deform_view.unwrap_or(&pipeline.default_mud));
+                DesktopWater {
+                    vertex_buffer,
+                    index_buffer,
+                    uniform_buffer,
+                    bind_groups,
+                    index_count: indices.len() as u32,
+                    uniform,
+                    waves,
+                    bounds,
+                }
+            })
+            .collect();
+        log::info!("desktop water: {} body/bodies installed", self.water_bodies.len());
+    }
+
+    pub fn water_body_count(&self) -> usize {
+        self.water_bodies.len()
+    }
+
+    pub fn set_water_time(&mut self, seconds: f32) {
+        let dt = (seconds as f64 - self.water_seconds).clamp(0.0, 0.25) as f32;
+        self.water_seconds = seconds as f64;
+        for body in &mut self.water_bodies {
+            body.uniform.set_time(self.water_seconds, body.waves.params.loop_seconds);
+            self.queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
+        }
+        if let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) {
+            m.map.settle(dt);
+        }
+    }
+
+    /// A blast scars the ground: a crater of `radius` metres, sunk `depth`
+    /// (0..1 of a full footprint) scaled by how muddy the ground is there, the
+    /// scar soaked dark. Returns that mud weight so the caller can size the
+    /// thrown-up mist.
+    pub fn blast_on_mud(&mut self, at: glam::Vec3, radius: f32, depth: f32) -> f32 {
+        let weight = self.mud_weight_at(at.x, at.z);
+        if weight > 0.0 {
+            if let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) {
+                m.map.crater([at.x, at.z], radius, depth * weight);
+            }
+        }
+        weight
+    }
+
+    pub fn walkers_on_mud(&mut self, walkers: &[(usize, glam::Vec3)]) {
+        let present: Vec<usize> = walkers.iter().map(|w| w.0).collect();
+        let weights: Vec<(usize, glam::Vec3, f32)> = walkers.iter().map(|(id, p)| (*id, *p, self.mud_weight_at(p.x, p.z))).collect();
+        let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) else { return };
+        let (mut wading, mut prints) = (0, 0);
+        for (id, p, weight) in weights {
+            wading += (weight >= spacesoup_graphics::mud::MUD_WEIGHT_FLOOR) as u32;
+            prints += m.walkers.step(&mut m.map, id, [p.x, p.z], weight) as u32;
+        }
+        m.walkers.forget_absent(&present);
+        if prints > 0 {
+            log::info!("mud: {wading} on mud, {prints} new print(s) on a {}x{} map", m.map.width(), m.map.height());
+        }
+    }
+
+    fn flush_mud(&mut self) {
+        if let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) {
+            m.flush(&self.queue);
+        }
+    }
+
+    pub fn sea_line(&self) -> f32 {
+        let Some(g) = self.ground.as_ref() else { return -1e9 };
+        let (min, max) = (g.heights.min, g.heights.max);
+        self.water_bodies
+            .iter()
+            .filter(|b| {
+                let (lo, hi) = b.bounds;
+                lo.x < min.x || hi.x > max.x || lo.z < min.y || hi.z > max.y
+            })
+            .map(|b| b.uniform.extinction[3])
+            .fold(-1e9, f32::max)
+    }
+
+    fn ensure_ground_map(&mut self) {
+        if !self.ground_dirty {
+            return;
+        }
+        self.ground_dirty = false;
+        let sea_line = self.sea_line();
+        let placement = match self.ground.as_ref() {
+            Some(g) => {
+                let started = std::time::Instant::now();
+                let (irradiance, sun) = match self.sky_dome.as_ref() {
+                    Some(s) => (s.irradiance, s.sun),
+                    None => (
+                        self.sky
+                            .as_ref()
+                            .map(|s| super::sky::SkyIrradiance { sh: s.sh.map(|v| [v[0] * s.intensity, v[1] * s.intensity, v[2] * s.intensity]) })
+                            .unwrap_or_else(|| super::sky::SkyIrradiance::flat(super::sky::AMBIENT)),
+                        None,
+                    ),
+                };
+                let map = ground_map::build(
+                    &ground_map::GroundInputs {
+                        heights: &g.heights,
+                        sky: &irradiance,
+                        sun: sun.as_ref(),
+                        sky_occlusion: None,
+                        layers: &g.layers,
+                        splat: g.splat.as_ref(),
+                        settings: &g.settings,
+                        sea_line,
+                    },
+                    DESKTOP_GROUND_MAP_SIZE,
+                );
+                let view = ground_map::upload(&self.device, &self.queue, &map);
+                let extent = map.max - map.min;
+                self.uniform_buf.set_ground_map(view);
+                log::info!(
+                    "desktop ground map: {}x{} over {:.0} x {:.0} m, sea line {:.2}, built in {} ms",
+                    map.width,
+                    map.height,
+                    extent.x,
+                    extent.y,
+                    sea_line,
+                    started.elapsed().as_millis()
+                );
+                Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top))
+            }
+            None => {
+                self.uniform_buf.set_ground_map(uniforms::default_ground_map(&self.device));
+                None
+            }
+        };
+        let mut probes = self.uniform_buf.probes();
+        probes.set_outdoors(None, None, placement);
+        let (probe_view, probe_sampler) = uniforms::default_probe_cube(&self.device);
+        self.uniform_buf.rebind_probes(
+            &self.device,
+            &self.lights_uniform,
+            self.shadow_map.sun_depth_view(),
+            self.shadow_map.sun_dynamic_depth_view(),
+            self.shadow_map.spot_depth_view(),
+            self.shadow_map.sampler(),
+            &probe_view,
+            &probe_sampler,
+            probes,
+        );
+    }
+
     pub fn set_sky_panorama(
         &mut self,
         pano: Option<&super::sky::Panorama>,
@@ -181,22 +445,15 @@ impl Renderer {
         self.sky_dome.is_some()
     }
 
-    /// Replace the line geometry drawn each frame (`indices` pair up into
-    /// line segments). Pass empty vectors to clear it.
     pub fn set_raw_wire(&mut self, vertices: Vec<WireVertex>, indices: Vec<u32>) {
         self.raw_wire = (vertices, indices);
     }
 
-    /// Editor nicety: render solid cuboids double-sided so a camera flown
-    /// inside one sees its interior instead of an x-ray hole.
     pub fn set_cuboids_double_sided(&mut self) {
         self.solid_pipeline =
             pipeline::SolidPipeline::new_double_sided(&self.device, self.format, &self.uniform_buf.layout);
     }
 
-    /// The scene's ground: world-space terrain geometry (splat UVs in `uv2`,
-    /// see the engine's terrain loader) with its four-layer splat material.
-    /// Replaces whatever terrain was set before; `clear_terrain` removes it.
     #[allow(clippy::too_many_arguments)]
     pub fn set_terrain(
         &mut self,
@@ -211,6 +468,7 @@ impl Renderer {
     ) {
         if vertices.is_empty() || indices.is_empty() {
             self.terrain = None;
+            self.rebind_water();
             return;
         }
         let pipeline = super::terrain_pipeline::TerrainPipeline::new(
@@ -218,7 +476,22 @@ impl Renderer {
             self.format,
             &self.uniform_buf.layout,
         );
-        let material = super::terrain_pipeline::TerrainMaterial::from_layers_with(
+        let mud_layer = settings.mud_layer.round() as i32;
+        let mud = (mud_layer >= 0).then(|| {
+            let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+            for v in vertices {
+                lo = [lo[0].min(v.position[0]), lo[1].min(v.position[2])];
+                hi = [hi[0].max(v.position[0]), hi[1].max(v.position[2])];
+            }
+            MudBody::new(&self.device, &self.queue, lo, hi)
+        });
+        let mut settings = settings;
+        if let Some(m) = mud.as_ref() {
+            let [tx, tz] = m.map.texel_metres();
+            settings.deform_texel = tx.max(tz);
+            log::info!("terrain deform map: {}x{} at {:.3} m, mud layer {mud_layer}", m.map.width(), m.map.height(), settings.deform_texel);
+        }
+        let material = super::terrain_pipeline::TerrainMaterial::from_layers_deformed(
             &self.device,
             &self.queue,
             &pipeline.material_layout,
@@ -229,6 +502,7 @@ impl Renderer {
             splat,
             None,
             settings,
+            mud.as_ref().map(|m| &m.view),
         );
         let vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("terrain_vb"),
@@ -246,16 +520,50 @@ impl Renderer {
             vb,
             ib,
             index_count: indices.len() as u32,
+            mud,
+            splat: splat.cloned(),
+            mud_layer,
         });
+        self.rebind_water();
     }
 
     pub fn clear_terrain(&mut self) {
         self.terrain = None;
+        self.rebind_water();
     }
 
-    /// Stream painted splat weights into the terrain's material. `false`
-    /// when no terrain is set or the sizes mismatch (rebuild via
-    /// `set_terrain` then).
+    fn rebind_water(&mut self) {
+        let Some(pipeline) = self.water_pipeline.as_ref() else { return };
+        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| m.map.placement()).unwrap_or([0.0; 4]);
+        let view = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| &m.view).unwrap_or(&pipeline.default_mud);
+        for body in &mut self.water_bodies {
+            body.uniform.prints = placement;
+            self.queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
+            body.bind_groups = pipeline.bind_groups_with(&self.device, &body.uniform_buffer, &body.waves, view);
+        }
+    }
+
+    fn mud_weight_at(&self, x: f32, z: f32) -> f32 {
+        let Some(t) = self.terrain.as_ref() else { return 0.0 };
+        let Some(m) = t.mud.as_ref() else { return 0.0 };
+        if t.mud_layer < 0 || !m.map.contains(x, z) {
+            return 0.0;
+        }
+        let Some(s) = t.splat.as_ref() else { return if t.mud_layer == 0 { 1.0 } else { 0.0 } };
+        let p = m.map.placement();
+        let u = ((x - p[0]) * p[2]).clamp(0.0, 1.0);
+        let v = ((z - p[1]) * p[3]).clamp(0.0, 1.0);
+        let ix = ((u * s.width as f32) as u32).min(s.width - 1);
+        let iz = ((v * s.height as f32) as u32).min(s.height - 1);
+        let k = ((iz * s.width + ix) * 4) as usize;
+        let w: Vec<f32> = (0..4).map(|c| s.rgba[k + c] as f32).collect();
+        let total: f32 = w.iter().sum();
+        if total <= 0.0 {
+            return 0.0;
+        }
+        w[t.mud_layer as usize] / total
+    }
+
     pub fn update_terrain_splat(&mut self, image: &super::terrain_pipeline::TerrainImage) -> bool {
         match self.terrain.as_ref() {
             Some(t) => t.material.update_splat(&self.queue, image),
@@ -263,9 +571,6 @@ impl Renderer {
         }
     }
 
-    /// Replace just the terrain's geometry -- the editor sculpting path,
-    /// which changes heights every frame of a stroke and must not pay for a
-    /// pipeline and material rebuild each time. No-op when no terrain is set.
     pub fn update_terrain_geometry(&mut self, vertices: &[SolidVertex], indices: &[u32]) {
         let Some(t) = self.terrain.as_mut() else { return };
         t.vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
@@ -281,9 +586,6 @@ impl Renderer {
         t.index_count = indices.len() as u32;
     }
 
-    /// Replace just the terrain's index buffer: the editor's level of detail
-    /// draws the same vertex grid with fewer triangles far from the camera,
-    /// so only the indices change as the camera moves. No-op without terrain.
     pub fn update_terrain_indices(&mut self, indices: &[u32]) {
         let Some(t) = self.terrain.as_mut() else { return };
         if indices.is_empty() {
@@ -351,8 +653,6 @@ impl Renderer {
         )
     }
 
-    /// This frame's depth, as drawn: a post pass reads it for its contact
-    /// shadow. Remade on every `resize`, so take it after one, not before.
     pub fn depth_view(&self) -> &TextureView {
         &self.depth_view
     }
@@ -389,10 +689,6 @@ impl Renderer {
         self.render_internal(target_view, camera, cuboids, meshes, &[], lights, &[]);
     }
 
-    /// Like `render_with_lights`, but `overlay_cuboids` draw in an extra
-    /// pass that ignores depth (see `pipeline::SolidPipeline::new_overlay`)
-    /// -- so they read on top of everything. Meant for a highlight overlay
-    /// (e.g. a skeleton), not real geometry.
     pub fn render_with_overlay(
         &mut self,
         target_view: &TextureView,
@@ -489,17 +785,18 @@ impl Renderer {
         lights: &[lights::Light],
         overlay_cuboids: &[Cuboid],
     ) {
+        self.ensure_ground_map();
+        self.flush_mud();
+        {
+            let v = camera.view();
+            let right = glam::Vec3::new(v.x_axis.x, v.y_axis.x, v.z_axis.x).normalize_or_zero();
+            let up = glam::Vec3::new(v.x_axis.y, v.y_axis.y, v.z_axis.y).normalize_or_zero();
+            let items = std::mem::take(&mut self.particles);
+            self.particle_pipeline.upload(&self.device, &self.queue, right, up, &items);
+            self.particles = items;
+        }
         let vp = camera.projection() * camera.view();
 
-        // Which light casts which map. The first directional light is the sun,
-        // because a scene with two suns is not a thing. Spots take shadow layers
-        // in scene order until the budget runs out -- it used to be just the
-        // first one, so a room with two matching lamps had one casting a shadow
-        // and one not, which reads as a broken light rather than a full budget.
-        //
-        // Trimmed to the budget by INFLUENCE first, and here rather than later:
-        // the spot indices below point INTO this list, so reordering after they
-        // are chosen would aim each spot at another light's shadow map.
         let ranked = lights::rank_for_budget(lights, lights::MAX_LIGHTS);
         let lights: &[lights::Light] = &ranked;
 
@@ -512,17 +809,11 @@ impl Renderer {
             .take(shadow::MAX_SPOT_SHADOWS)
             .collect();
 
-        // The box follows the camera so its resolution is spent where the
-        // viewer is, and is pushed forward a little rather than centred on the
-        // eye -- half of a camera-centred box is always behind you.
         let focus = camera.position + camera.forward() * (self.sun_shadow_radius * 0.5);
         let sun_view_proj = sun
             .map(|l| shadow::directional_light_matrix(l.direction, focus, self.sun_shadow_radius))
             .unwrap_or(glam::Mat4::IDENTITY);
-        // The characters' tiles are the headset's; the desktop leaves them
-        // empty. See `shadow::MAX_CHARACTER_SHADOWS`.
-        // Drawn with one matrix and read with another when a spot has its own
-        // near plane -- see `shadow::spot_shadow_matrices`.
+
         let spot_matrices: Vec<shadow::SpotShadowMatrices> = spot_indices
             .iter()
             .map(|&i| shadow::spot_shadow_matrices(&lights[i], self.shadow_map.spot_tile_dim()))
@@ -531,8 +822,7 @@ impl Renderer {
         for (layer, mats) in spot_matrices.iter().enumerate() {
             spot_view_proj[layer] = mats.lookup;
         }
-        // Each shadow-casting light is told ITS layer, so the shader does not
-        // have to guess which one a given light belongs to.
+
         self.lights_uniform
             .upload_with_shadow_layers(&self.queue, lights, &spot_indices);
 
@@ -593,15 +883,11 @@ impl Renderer {
         }
 
         let mut draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> = Vec::new();
-        // Casters, gathered from the meshes ONLY. Panels are appended to
-        // `draws` further down and must not be in here: a floating UI panel
-        // casting a shadow across the floor is not a thing anyone wants.
+
         let mut shadow_draws: Vec<shadow::ShadowMeshDraw> = Vec::new();
         let mut skinned_draws: Vec<(&Buffer, &Buffer, u32, &BindGroup, &BindGroup, &BindGroup)> =
             Vec::new();
-        // The same primitives as casters. A character is the one caster whose
-        // silhouette changes every frame, and the first missing shadow anyone
-        // notices -- you can hold your own hand up in front of a lamp.
+
         let mut skinned_shadow_draws: Vec<shadow::ShadowSkinnedDraw> = Vec::new();
 
         for instance in meshes {
@@ -635,11 +921,7 @@ impl Renderer {
                     .and_then(|k| self.mesh_lightmaps.get(k))
                     .map(|t| &t.bind_group)
                     .unwrap_or(&self.default_mesh_lightmap.bind_group);
-                // A caster outside the sun's box cannot land a shadow in
-                // it: a wood of a thousand trees put every one through the
-                // depth pass for the few dozen near the camera. The box is
-                // `sun_shadow_radius` about `focus`; the mesh's own bounding
-                // radius keeps a big crown at the edge in.
+
                 let model = instance.mesh.model_matrix();
                 let centre = model.transform_point3(glam::Vec3::ZERO);
                 let scale = model.x_axis.length().max(model.y_axis.length()).max(model.z_axis.length());
@@ -653,9 +935,7 @@ impl Renderer {
                         &prim.texture.bind_group,
                         lightmap_bg,
                     ));
-                    // The ordinary vertex buffer, even for a layered mesh: the
-                    // depth pass reads position and nothing else, so a baked
-                    // cave casts through this path with no pipeline of its own.
+
                     if casts {
                         shadow_draws.push((
                             &prim.vertex_buffer,
@@ -685,15 +965,13 @@ impl Renderer {
                 label: Some("frame"),
             });
 
-        // Depth-only passes first, so the colour pass below samples a map built
-        // from THIS frame. Recorded into the same encoder rather than submitted
-        // separately: within one encoder wgpu orders the passes for us, and a
-        // second submit would only add a synchronisation point.
+        for body in &self.water_bodies {
+            body.waves.update(&self.queue, &mut encoder, self.water_seconds);
+        }
+
         let solid_caster = (!solid_indices.is_empty())
             .then_some((&solid_vb, &solid_ib, solid_indices.len() as u32));
-        // THE GROUND CASTS TOO: a rise shadows the dip behind it, which is
-        // most of what makes rolling ground read as rolling. Whole, not
-        // chunked -- correct, just not culled.
+
         let ground_caster = self
             .terrain
             .as_ref()
@@ -713,10 +991,9 @@ impl Renderer {
                     shadow.sun_view_proj,
                 );
         }
-        // One depth pass per shadow-casting spot. This is where the cost lives,
-        // which is why MAX_SPOT_SHADOWS is a budget rather than "all of them".
+
         for layer in 0..shadow.spot_count as usize {
-            // Drawn with the PASS matrix; the lookups read with `lookup`.
+
             let pass = spot_matrices[layer].pass;
             self.shadow_map.upload_light(&self.queue, ShadowKind::Spot(layer), pass);
             self.shadow_map.record(
@@ -731,8 +1008,6 @@ impl Renderer {
             );
         }
 
-        // Overlay cuboids aren't cached (there are only ever a handful --
-        // a skeleton's worth -- and they're rebuilt every frame anyway).
         let (overlay_verts, overlay_indices, _) = super::cuboid::build_solid_mesh_with_ranges(overlay_cuboids);
         let overlay_vb = self.device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("overlay_vb"),
@@ -784,8 +1059,6 @@ impl Renderer {
                 }
             }
 
-            // The ground under everything else: its own pipeline (splat
-            // materials), the same camera/lights bind group.
             if let Some(t) = self.terrain.as_ref().filter(|_| self.terrain_visible) {
                 pass.set_pipeline(&t.pipeline.pipeline);
                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
@@ -829,19 +1102,25 @@ impl Renderer {
                 }
             }
 
-            // THE SKY, after every opaque draw: at the far plane with a
-            // less-or-equal depth test, so it fills only where nothing was
-            // drawn. The panorama is scaled by `sky_params.x`, the
-            // intensity the caller put in `self.sky`.
+            if let Some(wp) = self.water_pipeline.as_ref().filter(|_| !self.water_bodies.is_empty()) {
+                pass.set_pipeline(&wp.pipeline);
+                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                for body in &self.water_bodies {
+                    pass.set_bind_group(1, &body.bind_groups[body.waves.current()], &[]);
+                    pass.set_vertex_buffer(0, body.vertex_buffer.slice(..));
+                    pass.set_index_buffer(body.index_buffer.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..body.index_count, 0, 0..1);
+                }
+            }
+
             if let Some(sky) = self.sky_dome.as_ref().filter(|_| self.sky_visible) {
                 pass.set_pipeline(&self.sky_pipeline.pipeline);
                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                 pass.set_bind_group(1, &sky.bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
+            self.particle_pipeline.draw(&mut pass, &self.uniform_buf.bind_group);
 
-            // Last, so it reads on top of everything above (see
-            // `SolidPipeline::new_overlay`'s own doc comment).
             if !overlay_verts.is_empty() {
                 pass.set_pipeline(&self.overlay_pipeline.pipeline);
                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);

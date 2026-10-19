@@ -1,25 +1,3 @@
-//! WHAT A HOT SHADER COMPUTES PER PIXEL THAT IS NOT PER PIXEL, and where its
-//! costly built-ins are (tests only; `docs/shader-optimization-2026-10-12.md`).
-//!
-//! Two reports over a shader's LIVE code (constant branches followed as the
-//! compiler follows them, each function weighted by the copies inlining
-//! makes -- see `shader_inlining`):
-//!
-//! - [`hoistable`]: every maximal expression whose inputs are only uniforms,
-//!   constants and loop counters -- the same for every pixel of a draw, or
-//!   for every pixel at one light of a loop -- with its source text, the
-//!   operations it costs by `shader_inlining`'s proxy, and the special
-//!   functions in it. Each is work a CPU could do once a frame (or once a
-//!   light) and hand over in a uniform. A value read only under such an
-//!   expression is found the same way.
-//! - [`specials`]: the special-function instructions (reciprocal, square
-//!   roots, powers, exponentials, trigonometry) each function's live code
-//!   asks for, by kind, times its copies.
-//!
-//! Proxies read from the source, as `shader_inlining` is: the compiler folds
-//! and shares as it likes, so a candidate counts only once the pipeline
-//! statistics move (the handoff's acceptance rule 2).
-
 use naga::valid::{Capabilities, FunctionInfo, ValidationFlags, Validator};
 use naga::{
     AddressSpace, BinaryOperator, Block, Expression, Function, Handle, LocalVariable, MathFunction, Module, Statement,
@@ -28,7 +6,6 @@ use naga::{
 use std::collections::{BTreeMap, HashMap};
 use wgpu::naga;
 
-/// How often a value changes: never, once a draw (uniforms), or by pixel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Rate {
     Constant,
@@ -36,18 +13,17 @@ pub(crate) enum Rate {
     Pixel,
 }
 
-/// One per-draw (or per-light) expression a shader evaluates per pixel.
 pub(crate) struct Hoistable {
     pub function: String,
-    /// Copies of the function inlining makes.
+
     pub copies: usize,
-    /// Its source text.
+
     pub text: String,
-    /// Operations in it, by `shader_inlining`'s proxy.
+
     pub ops: usize,
-    /// Special functions in it (see [`special_of`]).
+
     pub special: usize,
-    /// Inside a loop: per iteration (per light), not per frame.
+
     pub in_loop: bool,
 }
 
@@ -57,9 +33,9 @@ struct Walk<'a> {
     info: &'a FunctionInfo,
     args: &'a [Rate],
     locals: HashMap<Handle<LocalVariable>, Rate>,
-    /// Call results, by the result expression.
+
     results: HashMap<Handle<Expression>, Rate>,
-    /// Live emitted expressions, and whether each is inside a loop.
+
     emitted: Vec<(Handle<Expression>, bool)>,
     calls: Vec<(Handle<Function>, Vec<Rate>)>,
     returned: Rate,
@@ -100,7 +76,7 @@ impl Walk<'_> {
     }
 
     fn store(&mut self, pointer: Handle<Expression>, value: Rate) {
-        // The variable under the pointer, through any indexing.
+
         let mut p = pointer;
         let mut rate = value;
         loop {
@@ -122,9 +98,6 @@ impl Walk<'_> {
         }
     }
 
-    /// Walks live statements under `control` (the rate of the conditions
-    /// that decide whether they run). Returns whether the block always ends
-    /// the function, and whether it can leave early by a pixel's choice.
     fn walk(&mut self, block: &Block, mut control: Rate, in_loop: bool, record: bool) -> (bool, bool) {
         let mut leaves = false;
         for statement in block.iter() {
@@ -180,8 +153,7 @@ impl Walk<'_> {
                     }
                 }
                 Statement::Loop { body, continuing, break_if } => {
-                    // The counter's own step runs at the loop's rate; what a
-                    // pixel's early exit leaves behind is the body's affair.
+
                     let (_, _) = self.walk(body, control, true, record);
                     self.walk(continuing, control, true, record);
                     if let Some(b) = break_if {
@@ -230,13 +202,12 @@ thread_local! {
     static INFO: std::cell::RefCell<Option<naga::valid::ModuleInfo>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The rate of what `f` returns when called with arguments at `args`.
 fn function_rate(module: &Module, f: Handle<Function>, args: &[Rate], rates: &mut HashMap<(Handle<Function>, Vec<Rate>), Rate>) -> Rate {
     let key = (f, args.to_vec());
     if let Some(&r) = rates.get(&key) {
         return r;
     }
-    // Recursion is not WGSL; a placeholder all the same.
+
     rates.insert(key.clone(), Rate::Pixel);
     let r = INFO.with(|info| {
         let info = info.borrow();
@@ -279,12 +250,12 @@ fn analyse(
         changed: true,
         rates,
     };
-    // Local variables' rates to a fixed point, then once more to record.
+
     let mut rounds = 0;
     while w.changed && rounds < 16 {
         w.changed = false;
         w.returned = Rate::Constant;
-        // A local's initialiser.
+
         for (v, var) in function.local_variables.iter() {
             if let Some(init) = var.init {
                 let r = w.rate(init);
@@ -312,7 +283,6 @@ fn width(module: &Module, info: &FunctionInfo, h: Handle<Expression>) -> usize {
     }
 }
 
-/// `shader_inlining`'s proxy for one expression's operations.
 fn ops_of(module: &Module, function: &Function, info: &FunctionInfo, h: Handle<Expression>) -> usize {
     match function.expressions[h] {
         Expression::Binary { .. } | Expression::Unary { .. } | Expression::Select { .. } | Expression::As { .. } => width(module, info, h),
@@ -332,12 +302,6 @@ fn ops_of(module: &Module, function: &Function, info: &FunctionInfo, h: Handle<E
     }
 }
 
-/// The special-function instructions one expression asks for, by kind: what
-/// the Adreno's statistics count as "complex" -- a reciprocal, a square root
-/// or its inverse, a power, an exponential or logarithm, trigonometry. A
-/// division by a constant is a multiply and counts nothing; `normalize`,
-/// `length` and `distance` are one (inverse) square root; `pow` is a
-/// logarithm and an exponential a component.
 pub(crate) fn special_of(module: &Module, function: &Function, info: &FunctionInfo, h: Handle<Expression>) -> Option<(&'static str, usize)> {
     let is_const = |e: Handle<Expression>| {
         matches!(function.expressions[e], Expression::Literal(_) | Expression::Constant(_) | Expression::ZeroValue(_))
@@ -398,8 +362,6 @@ fn parse(src: &str) -> (Module, naga::valid::ModuleInfo) {
     (module, info)
 }
 
-/// Everything live from `entry`, as `(function or None for the entry point,
-/// its argument rates, copies, analysis)`.
 fn reach<'m>(module: &'m Module, info: &naga::valid::ModuleInfo, entry: &str) -> Vec<(Option<Handle<Function>>, usize, Analysed)> {
     let index = module.entry_points.iter().position(|e| e.name == entry).unwrap_or_else(|| panic!("no entry point {entry}"));
     INFO.with(|slot| *slot.borrow_mut() = Some(info.clone()));
@@ -407,7 +369,7 @@ fn reach<'m>(module: &'m Module, info: &naga::valid::ModuleInfo, entry: &str) ->
     let ep = &module.entry_points[index].function;
     let ep_args = vec![Rate::Pixel; ep.arguments.len()];
     let top = analyse(module, ep, info.get_entry_point(index), &ep_args, &mut rates);
-    // Copies of each (function, argument rates), down the live call tree.
+
     let mut copies: BTreeMap<(usize, Vec<u8>), (Handle<Function>, Vec<Rate>, usize)> = BTreeMap::new();
     let mut stack = top.calls.clone();
     let mut done: HashMap<(Handle<Function>, Vec<Rate>), Vec<(Handle<Function>, Vec<Rate>)>> = HashMap::new();
@@ -424,8 +386,6 @@ fn reach<'m>(module: &'m Module, info: &naga::valid::ModuleInfo, entry: &str) ->
     out
 }
 
-/// Every maximal per-draw (or per-light) expression `entry`'s live code
-/// evaluates per pixel, the costliest first.
 pub(crate) fn hoistable(src: &str, entry: &str) -> Vec<Hoistable> {
     let (module, info) = parse(src);
     let index = module.entry_points.iter().position(|e| e.name == entry).unwrap();
@@ -438,11 +398,11 @@ pub(crate) fn hoistable(src: &str, entry: &str) -> Vec<Hoistable> {
         let rate: HashMap<Handle<Expression>, (Rate, bool)> = a.emitted.iter().map(|&(h, l, r)| (h, (r, l))).collect();
         let weighted = |h: Handle<Expression>| ops_of(&module, function, finfo, h) > 0;
         let uniform = |h: Handle<Expression>| rate.get(&h).is_some_and(|&(r, _)| r == Rate::Uniform);
-        // Uniform-rate weighted expressions that feed another one are part of it.
+
         let mut inner: std::collections::HashSet<Handle<Expression>> = Default::default();
         for &(h, _, r) in &a.emitted {
             if r == Rate::Uniform {
-                // Children through weightless wrappers (loads, swizzles, composes) too.
+
                 let mut stack = children(function, h);
                 while let Some(c) = stack.pop() {
                     if uniform(c) {
@@ -457,7 +417,7 @@ pub(crate) fn hoistable(src: &str, entry: &str) -> Vec<Hoistable> {
             if r != Rate::Uniform || inner.contains(&h) {
                 continue;
             }
-            // Its whole subtree's cost.
+
             let (mut ops, mut special) = (0, 0);
             let mut seen: std::collections::HashSet<Handle<Expression>> = Default::default();
             let mut stack = vec![h];
@@ -474,13 +434,11 @@ pub(crate) fn hoistable(src: &str, entry: &str) -> Vec<Hoistable> {
             if ops == 0 || !(weighted(h) || special > 0) {
                 continue;
             }
-            // A condition (a loop's bound) is not work worth handing over.
+
             if matches!(*finfo[h].ty.inner_with(&module.types), TypeInner::Scalar(s) | TypeInner::Vector { scalar: s, .. } if s.kind == naga::ScalarKind::Bool) {
                 continue;
             }
-            // Its source: the expression's own text where the span covers it
-            // (operators), its whole line where the span is only a built-in's
-            // name.
+
             let span = function.expressions.get_span(h);
             let own = span.to_range().and_then(|r| src.get(r.clone()).map(|t| (r, t)));
             let text = match own {
@@ -503,8 +461,6 @@ pub(crate) fn hoistable(src: &str, entry: &str) -> Vec<Hoistable> {
     out
 }
 
-/// The special functions `entry`'s live code asks for: per function, its
-/// copies and its count of each kind; and each kind's total.
 pub(crate) fn specials(src: &str, entry: &str) -> (Vec<(String, usize, BTreeMap<&'static str, usize>)>, BTreeMap<&'static str, usize>) {
     let (module, info) = parse(src);
     let index = module.entry_points.iter().position(|e| e.name == entry).unwrap();
@@ -522,7 +478,7 @@ pub(crate) fn specials(src: &str, entry: &str) -> (Vec<(String, usize, BTreeMap<
                 *own.entry(kind).or_insert(0) += n;
             }
         }
-        // The same function at several argument rates is the same code.
+
         for (k, n) in own {
             let e = row.1.entry(k).or_insert(0);
             *e = (*e).max(n);
@@ -542,7 +498,6 @@ pub(crate) fn specials(src: &str, entry: &str) -> (Vec<(String, usize, BTreeMap<
     (out, total)
 }
 
-/// Both reports as text.
 pub(crate) fn report(label: &str, src: &str, entry: &str, rows: usize) -> String {
     let mut out = format!("== {label}\n");
     let (by_fn, total) = specials(src, entry);
@@ -574,9 +529,6 @@ pub(crate) fn report(label: &str, src: &str, entry: &str, rows: usize) -> String
 mod tests {
     use super::*;
 
-    /// THE AUDIT of the hot shaders: each one's generated source and both
-    /// reports, written under `docs/bench/shader_opt_1012/audit/`.
-    /// `cargo test --lib audit_the_hot_shaders -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn audit_the_hot_shaders() {
@@ -646,26 +598,26 @@ fn up() -> vec3<f32> {
     fn a_uniforms_sine_and_a_lights_square_are_found_and_a_pixels_are_not() {
         let h = hoistable(SRC, "fs_main");
         let text = |needle: &str| h.iter().find(|e| e.text.contains(needle));
-        // The yaw's sine and cosine, in each of `turn`'s copies.
+
         let s = text("sin(camera.yaw)").expect("the sine");
         assert_eq!((s.function.as_str(), s.special), ("turn", 1));
         assert!(text("cos(camera.yaw)").is_some());
-        // The tint's power: per draw.
+
         assert!(text("pow(camera.tint.x, 2.2)").is_some_and(|e| e.special == 2 && !e.in_loop));
-        // `up()` turns a constant: the whole of that copy of `turn` is per draw.
+
         assert!(h.iter().any(|e| e.function == "turn" && e.copies == 1 && e.text.starts_with("vec3<f32>(c * d.x")));
-        // A loop's bound is not listed.
+
         assert!(text("i < camera.count").is_none());
-        // A light's range squared: per light.
+
         assert!(text("camera.lights[i].w * camera.lights[i].w").is_some_and(|e| e.in_loop));
-        // Nothing that reads the pixel's normal is.
+
         assert!(h.iter().all(|e| !e.text.starts_with("normalize") && !e.text.starts_with("dot") && !e.text.starts_with("exp")), "{:?}", h.iter().map(|e| &e.text).collect::<Vec<_>>());
     }
 
     #[test]
     fn special_functions_are_counted_by_kind_and_copy() {
         let (rows, total) = specials(SRC, "fs_main");
-        // `turn` three times (two from the entry point, one through `up`).
+
         let turn = rows.iter().find(|(n, _, _)| n == "turn").expect("turn");
         assert_eq!(turn.1, 3);
         assert_eq!(total["sin/cos"], 6);

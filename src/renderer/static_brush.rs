@@ -1,55 +1,8 @@
-//! THE BRUSHES' VERTICES AND INDICES KEPT ON THE GPU (`Levers::brush_buffers`).
-//!
-//! The frame drew the level's brushes -- the rooms' walls, floors and
-//! ceilings -- from a vertex and an index buffer it made NEW every frame, and
-//! before making them it split every triangle by what the sun can do at its
-//! face (`SunFaces::partition`) and, with SpaceWarp on, cut the whole index
-//! list into runs with a box each for the motion pass's cull
-//! (`space_warp::index_runs`): all of it for every brush of the level, every
-//! frame, standing or walking -- 0.08 MB a frame on test_room, 1.06 MB at
-//! 1,025 samples a side (`docs/scale-fixes-status-2026-10-13.md`). The ground
-//! got out of that first (`static_solid`); this is the same for the rooms.
-//!
-//! Here the two buffers, the split's two ends and the runs live across frames
-//! and are made again only when what they were made from changes:
-//!
-//! - other vertices or indices: another slice, another length, other contents
-//!   at the places sampled, or [`StaticBrushes::forget`] (a brush hidden or
-//!   shown, another level);
-//! - the rig somewhere else, WHEN THE APP POSES THE VERTICES. Where it hands
-//!   them over in the world (`brush_pipeline::WORLD_BRUSHES`) the rig is no
-//!   part of the key and a level's brushes are sent once;
-//! - another sun mask (`SunFaces::serial`), which decides the split.
-//!
-//! The bytes on the GPU are the bytes the frame used to send, and every draw
-//! takes the same triangles in the same order. The same picture.
-//!
-//! WHAT IT COSTS NOW: a frame that changes nothing reads 61 sampled vertices
-//! and 61 sampled indices -- the same at any level size. A change (rare: a
-//! wall shot away, a scene load) costs what a frame used to: the brushes of
-//! the level, once. The runs are still walked a frame by the motion pass's
-//! cull (`space_warp::visible_ranges`): a box a run of 64 triangles, so one
-//! sixty-fourth of the level's brush triangles -- 3 on test_room; a level
-//! with a hundred thousand brush triangles wants them in a grid.
-
 use crate::renderer::brush_pipeline::{BrushVertex, SunFaces};
 use crate::renderer::shadow::CasterChunk;
 
-/// WHETHER A LAUNCH HANDS THE BRUSHES OVER IN THE WORLD when nothing says
-/// otherwise (`adb shell setprop debug.spacesoup.worldbrushes 0` / `1`
-/// before a launch; `WORLD_BRUSHES=0` / `1` in the offline harness).
-///
-/// ON since 2026-10-13, on the offline comparison alone -- NOT YET MEASURED ON
-/// THE HEADSET: with the rig unturned 85 of the 87 bench views are the same
-/// bytes as with posed brushes (the other two, the cave's, differ from one
-/// run of themselves to the next); with it turned 37 degrees a view differs
-/// in 0.002 to 2.2% of its pixels by one level and in at most 30 pixels by
-/// more than two -- less than the app's own posing differs from itself when
-/// the turn is 37.00001 degrees
-/// (`docs/scale-fixes-status-2026-10-13.md`, step 2).
 pub const WORLD_BRUSHES_BY_DEFAULT: bool = true;
 
-/// Places sampled into a key. See `static_solid`.
 const SAMPLES: usize = 61;
 
 fn mix(h: u64, v: u32) -> u64 {
@@ -61,17 +14,16 @@ fn samples(len: usize) -> impl Iterator<Item = usize> {
     (0..n).map(move |k| if n > 1 { k * (len - 1) / (n - 1) } else { 0 })
 }
 
-/// What the brushes on the GPU were made from.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BrushKey {
     vertices_at: usize,
     vertices: usize,
     indices_at: usize,
     indices: usize,
-    /// The rig the app posed them for, bit for bit; zeros for world vertices.
+
     pose: [u32; 4],
     sampled: u64,
-    /// `SunFaces::serial` of the mask the split was made by; 0 for none.
+
     sun_mask: u64,
 }
 
@@ -98,11 +50,6 @@ pub fn brush_key(vertices: &[BrushVertex], indices: &[u32], pose: (glam::Vec3, f
     }
 }
 
-/// What a frame draws the brushes by, worked out from their triangles: the
-/// index list as it goes to the GPU -- split by sun class where there is a
-/// mask, as handed over where there is none -- where the split's first two
-/// parts end, and the list in runs with their boxes, in the frame the
-/// vertices are in. Exactly what the frame worked out every frame.
 pub struct Prepared {
     pub indices: Vec<u32>,
     pub sun_ends: [u32; 2],
@@ -118,25 +65,19 @@ pub fn prepare(vertices: &[BrushVertex], indices: &[u32], sun_faces: Option<&Sun
     Prepared { indices, sun_ends, runs }
 }
 
-/// The two buffers and what goes with them, kept across frames.
 pub struct StaticBrushes {
     pub vertices: wgpu::Buffer,
     pub indices: wgpu::Buffer,
     pub index_count: u32,
-    /// Where the faces the sun never reaches end, and the baked ones after
-    /// them (`SunFaces::partition`); zeros with no mask.
+
     pub sun_ends: [u32; 2],
-    /// The index list in runs, for the motion pass's cull, in the frame the
-    /// vertices are in.
+
     pub runs: Vec<CasterChunk>,
     key: Option<BrushKey>,
 }
 
 impl StaticBrushes {
-    /// This frame's brushes onto the GPU, if they are not there already.
-    /// `pose`: the rig the app posed the vertices for -- zeros for vertices
-    /// in the world, which are the same for every rig. Returns the bytes
-    /// sent this frame: 0 for a frame that changed nothing.
+
     pub fn update(
         kept: &mut Option<StaticBrushes>,
         device: &wgpu::Device,
@@ -171,10 +112,6 @@ impl StaticBrushes {
         bytes
     }
 
-    /// Forget what the brushes were made from: the next frame makes them
-    /// again whatever it is handed. For whoever changes the brushes in place
-    /// (a brush hidden or shown can leave the slice, its length and every
-    /// sampled vertex as they were).
     pub fn forget(kept: &mut Option<StaticBrushes>) {
         if let Some(k) = kept {
             k.key = None;
@@ -186,8 +123,6 @@ impl StaticBrushes {
 mod tests {
     use super::*;
 
-    /// `n` quads in a row along x, two triangles each, each with its own
-    /// lightmap patch.
     fn wall(n: usize, lift: f32) -> (Vec<BrushVertex>, Vec<u32>) {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
@@ -212,11 +147,10 @@ mod tests {
         let (v, i) = wall(300, 0.0);
         let key = brush_key(&v, &i, (glam::Vec3::ZERO, 0.0), None);
         assert_eq!(key, brush_key(&v, &i, (glam::Vec3::ZERO, 0.0), None), "the same slices, the same rig");
-        // A posed copy follows the rig; world vertices are handed over with
-        // zeros whatever the rig does, so they are the first line again.
+
         assert_ne!(key, brush_key(&v, &i, (glam::Vec3::new(0.5, 0.0, 0.0), 0.0), None), "the rig moved");
         assert_ne!(key, brush_key(&v, &i, (glam::Vec3::ZERO, 0.1), None), "the rig turned");
-        // Other contents in the same allocation, at the same length.
+
         let (mut moved, _) = wall(300, 0.0);
         let at = v.as_ptr();
         let mut same_place = v;
@@ -225,11 +159,10 @@ mod tests {
         }
         assert_eq!(same_place.as_ptr(), at);
         assert_ne!(key, brush_key(&same_place, &i, (glam::Vec3::ZERO, 0.0), None), "other vertices where the old ones were");
-        // Another length.
+
         assert_ne!(key, brush_key(&same_place[..same_place.len() - 4], &i[..i.len() - 6], (glam::Vec3::ZERO, 0.0), None));
     }
 
-    /// A mask whose left half the sun never reaches, baked throughout.
     fn mask(width: u32, height: u32) -> SunFaces {
         let mut rgba = vec![0u8; (width * height * 4) as usize];
         for y in 0..height {
@@ -252,8 +185,6 @@ mod tests {
         assert_ne!(key, brush_key(&v, &i, (glam::Vec3::ZERO, 0.0), None), "no mask");
     }
 
-    /// WHAT IS KEPT IS WHAT THE FRAME WORKED OUT EVERY FRAME: the split
-    /// `SunFaces::partition` gives, and the runs of THAT list.
     #[test]
     fn what_is_kept_is_what_the_frame_made_every_frame() {
         let (v, i) = wall(2048, 0.0);
@@ -267,22 +198,17 @@ mod tests {
         for (a, b) in made.runs.iter().zip(&runs) {
             assert_eq!((a.first_index, a.index_count, a.min, a.max), (b.first_index, b.index_count, b.min, b.max));
         }
-        // The same triangles, each once.
+
         let mut all: Vec<[u32; 3]> = made.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
         let mut was: Vec<[u32; 3]> = i.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
         all.sort_unstable();
         was.sort_unstable();
         assert_eq!(all, was);
-        // No mask: the list as handed over, one part.
+
         let plain = prepare(&v, &i, None);
         assert_eq!((plain.indices.as_slice(), plain.sun_ends), (i.as_slice(), [0, 0]));
     }
 
-    /// A LEVEL'S BRUSHES ARE SENT ONCE, however many frames follow and
-    /// however far the rig walks, when they are handed over in the world --
-    /// and every frame it moves when the app poses them (the old way, which
-    /// this is measured against). A larger level than test_room: 20,000
-    /// triangles.
     #[test]
     fn a_large_levels_brushes_are_sent_once_in_the_world_and_every_moving_frame_posed() {
         let Some((device, _queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
@@ -296,12 +222,12 @@ mod tests {
         assert_eq!(first, (world.len() * std::mem::size_of::<BrushVertex>() + indices.len() * 4) as u64);
         let mut sent_world = 0u64;
         for _frame in 0..50 {
-            // The rig walks; world vertices are handed over with no rig.
+
             sent_world += StaticBrushes::update(&mut kept, &device, &world, &indices, (glam::Vec3::ZERO, 0.0), Some(&faces));
         }
         assert_eq!(sent_world, 0, "world brushes re-sent on a frame that changed nothing");
         assert_eq!(kept.as_ref().unwrap().index_count as usize, indices.len());
-        // Posed by the app: the same slice re-posed in place for each rig.
+
         let mut posed = world.clone();
         let mut kept = None;
         let mut sent_posed = 0u64;
@@ -313,7 +239,7 @@ mod tests {
             sent_posed += StaticBrushes::update(&mut kept, &device, &posed, &indices, (offset, 0.0), Some(&faces));
         }
         assert_eq!(sent_posed, 50 * first, "posed brushes follow the rig: sent on every frame it moved");
-        // Forgotten: made again once, whatever is handed over.
+
         StaticBrushes::forget(&mut kept);
         assert_eq!(StaticBrushes::update(&mut kept, &device, &posed, &indices, (glam::Vec3::new(0.98, 0.0, 0.0), 0.0), Some(&faces)), first);
     }

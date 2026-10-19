@@ -1,4 +1,3 @@
-
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use wgpu::*;
@@ -123,8 +122,6 @@ impl ParticlePipeline {
         Self::new_multisampled(device, format, uniform_layout, 1)
     }
 
-    /// See `pipeline::SolidPipeline::new_multisampled` -- a pipeline's sample
-    /// count must match the pass it runs in, so a 4x eye pass needs its own.
     pub fn new_multisampled(
 
         device: &Device,
@@ -135,7 +132,6 @@ impl ParticlePipeline {
         Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Mono)
     }
 
-    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
     pub fn new_multisampled_stereo(
 
         device: &Device,
@@ -203,8 +199,6 @@ impl ParticlePipeline {
     }
 }
 
-/// This eye's camera by `view_slot`, which a stereo pass sets per view; see
-/// `multiview`.
 pub(crate) fn particle_shader() -> String {
     r#"
 var<private> view_slot: i32 = 0;
@@ -233,4 +227,3 @@ struct VOut {
 "#
     .to_string()
 }
-

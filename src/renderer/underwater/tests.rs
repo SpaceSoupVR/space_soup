@@ -7,14 +7,13 @@ use crate::renderer::water_waves::WaveParams;
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-/// The test_room sea and pond, as `water_render::build` makes them.
 fn sea() -> WaterUniform {
     let lin = |c: [u8; 3]| c.map(|v| {
         let s = v as f32 / 255.0;
         if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
     });
     WaterUniform::new(
-        &WaterOptics { height: -1.4, shallow: lin([130, 205, 210]), deep: lin([12, 52, 72]), depth_scale: 2.0, shore_fade: 0.2, swash: 0.22, swell: 0.0 },
+        &WaterOptics { height: -1.4, shallow: lin([130, 205, 210]), deep: lin([12, 52, 72]), depth_scale: 2.0, shore_fade: 0.2, swash: 0.22, swell: 0.0, gloss: 1.0, mud: 0.0 },
         &WaveParams::default(),
     )
 }
@@ -25,7 +24,7 @@ fn pond() -> WaterUniform {
         if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
     });
     WaterUniform::new(
-        &WaterOptics { height: -0.368, shallow: lin([150, 180, 130]), deep: lin([20, 34, 22]), depth_scale: 0.4, shore_fade: 0.12, swash: 0.0, swell: 0.015 },
+        &WaterOptics { height: -0.368, shallow: lin([150, 180, 130]), deep: lin([20, 34, 22]), depth_scale: 0.4, shore_fade: 0.12, swash: 0.0, swell: 0.015, gloss: 1.0, mud: 0.0 },
         &WaveParams::default(),
     )
 }
@@ -46,7 +45,7 @@ fn light(sun: Option<Vec3>) -> UnderUniform {
 fn snells_window_is_ninety_seven_degrees_across() {
     let half = window_half_angle_deg(IOR_RGB[1]);
     assert!((half - 48.6).abs() < 0.2, "{half}");
-    // Red sees out a little wider than blue: the fringe.
+
     assert!(window_half_angle_deg(IOR_RGB[0]) > window_half_angle_deg(IOR_RGB[2]));
 }
 
@@ -71,9 +70,6 @@ fn a_low_sun_comes_into_the_water_within_the_window() {
     assert!(refracted_sun(Vec3::new(1.0, -0.1, 0.0)).is_none());
 }
 
-/// Looking straight down into deep water from just under the surface, the
-/// sky's share is the water's own colour under the sky -- what the surface
-/// shows from above -- so the line between the two does not jump.
 #[test]
 fn deep_water_under_the_sky_is_the_waters_colour_from_above() {
     let w = sea();
@@ -83,7 +79,6 @@ fn deep_water_under_the_sky_is_the_waters_colour_from_above() {
     assert!((s - want).length() < 1e-4 * want.length().max(1e-3), "{s} vs {want}");
 }
 
-/// The closed form against a plain sum along the ray.
 #[test]
 fn the_closed_form_matches_the_integral() {
     let w = pond();
@@ -105,14 +100,13 @@ fn the_closed_form_matches_the_integral() {
     }
 }
 
-/// Red goes first: through ten metres of the sea a white thing is blue-green.
 #[test]
 fn red_is_lost_first() {
     let w = sea();
     let k = Vec3::from_slice(&w.extinction[..3]);
     let t = Vec3::new((-k.x * 10.0).exp(), (-k.y * 10.0).exp(), (-k.z * 10.0).exp());
     assert!(t.x < 0.1 * t.y && t.x < 0.1 * t.z, "{t}");
-    // And the pond hides a metre of itself far more than the sea does.
+
     let kp = Vec3::from_slice(&pond().extinction[..3]);
     assert!(kp.y > 5.0 * k.y);
 }
@@ -124,7 +118,7 @@ fn the_water_darkens_with_depth() {
     let at = |d| in_water_luminance(&w, &u, d);
     assert!(at(0.2) > at(2.0) && at(2.0) > at(8.0), "{} {} {}", at(0.2), at(2.0), at(8.0));
     assert!(at(8.0) > 0.0);
-    // The meter goes between the air's and the water's in stops.
+
     assert_eq!(meter_in_water(0.4, 0.1, 0.0), 0.4);
     assert!((meter_in_water(0.4, 0.1, 1.0) - 0.1).abs() < 1e-6);
     assert!((meter_in_water(0.4, 0.1, 0.5) - 0.2).abs() < 1e-5);
@@ -140,7 +134,7 @@ fn an_eye_is_above_on_or_under_the_surface() {
     assert_eq!(at(1.2), EyeWater::Above);
     assert_eq!(at(-0.368), EyeWater::Waterline);
     assert_eq!(at(-0.65), EyeWater::Under);
-    // Over dry ground there is no water to be under.
+
     assert_eq!(eye_water(&w, -0.2, reach, Vec3::new(-26.0, -2.0, -26.0)), EyeWater::Above);
 }
 
@@ -163,14 +157,10 @@ fn the_film_shows_only_for_a_moment_after_surfacing() {
     assert_eq!(s.update(EyeWater::Above, 2.0), Some(0.0));
     assert!(s.update(EyeWater::Above, 2.5).is_some_and(|a| (a - 0.5).abs() < 1e-6));
     assert_eq!(s.update(EyeWater::Above, 2.0 + FILM_SECONDS as f64 + 0.01), None);
-    // Back under and out again: a fresh film.
+
     s.update(EyeWater::Waterline, 5.0);
     assert_eq!(s.update(EyeWater::Above, 6.0), Some(0.0));
 }
-
-// ---------------------------------------------------------------------------
-// On the GPU
-// ---------------------------------------------------------------------------
 
 fn gpu(dual: bool) -> Option<(Device, Queue)> {
     let instance = Instance::default();
@@ -188,10 +178,6 @@ fn gpu(dual: bool) -> Option<(Device, Queue)> {
 
 const SIZE: u32 = 16;
 
-/// One frame from an eye at `eye` looking along `look`: the buffer cleared
-/// to `behind`, the probe pass's depth and the scene's at `geometry_z` (1:
-/// nothing), the veil drawn -- or, with `surface_at`, the underside of a
-/// still surface at that height instead. Every pixel, row by row.
 fn frame(dual: bool, w: WaterUniform, eye: Vec3, look: Vec3, behind: [f64; 3], geometry_z: f32, surface_at: Option<f32>) -> Option<Vec<[u8; 4]>> {
     let (device, queue) = gpu(dual)?;
     let format = TextureFormat::Rgba8Unorm;
@@ -251,7 +237,7 @@ fn frame(dual: bool, w: WaterUniform, eye: Vec3, look: Vec3, behind: [f64; 3], g
     let mut encoder = device.create_command_encoder(&Default::default());
     waves.update(&queue, &mut encoder, 12.0);
     {
-        // The probe pass's depth: the geometry, everywhere.
+
         encoder.begin_render_pass(&RenderPassDescriptor {
             label: None,
             color_attachments: &[],
@@ -274,7 +260,7 @@ fn frame(dual: bool, w: WaterUniform, eye: Vec3, look: Vec3, behind: [f64; 3], g
             })],
             depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                 view: &dv,
-                // The scene's geometry a hair behind the probe pass's.
+
                 depth_ops: Some(Operations { load: LoadOp::Clear((geometry_z + 1e-5).min(1.0)), store: StoreOp::Discard }),
                 stencil_ops: None,
             }),
@@ -307,7 +293,6 @@ fn centre(image: &[[u8; 4]]) -> [u8; 4] {
     image[(SIZE / 2 * SIZE + SIZE / 2) as usize]
 }
 
-/// Depth of a point `metres` straight ahead, for the tests' camera.
 fn depth_at(metres: f32) -> f32 {
     let c = Mat4::perspective_rh(1.6, 1.0, 0.03, 100.0) * glam::Vec4::new(0.0, 0.0, -metres, 1.0);
     c.z / c.w
@@ -325,8 +310,6 @@ fn every_pipeline_builds_and_draws() {
     }
 }
 
-/// White three metres off in the sea comes through blue-green; ten metres
-/// off, less of it and bluer; with nothing there, the water's own colour.
 #[test]
 fn white_through_the_sea_goes_blue_green_with_distance() {
     let eye = Vec3::new(0.0, -4.0, 0.0);
@@ -339,7 +322,6 @@ fn white_through_the_sea_goes_blue_green_with_distance() {
     assert!(o[0] < 40 && o[2] > o[0], "nothing there: the water: {o:?}");
 }
 
-/// The pond hides the same white in a metre or two.
 #[test]
 fn the_pond_is_murky() {
     let eye = Vec3::new(-26.0, -0.7, -26.0);
@@ -349,14 +331,12 @@ fn the_pond_is_murky() {
     assert!(sum(centre(&pond_px)) + 150 < sum(centre(&sea_px)), "{:?} vs {:?}", centre(&pond_px), centre(&sea_px));
 }
 
-/// Looking straight up through a calm surface the sky shows (Snell's window);
-/// at the edge of the view, past the critical angle, the dark water mirrored.
 #[test]
 fn looking_up_shows_the_window_and_round_it_the_mirror() {
     let eye = Vec3::new(0.0, -3.0, 0.0);
     let Some(image) = frame(true, sea(), eye, Vec3::Y, [0.0; 3], 1.0, Some(-1.4)) else { return };
     let up = centre(&image);
-    // 80 degrees field each way: the corners look ~66 degrees off vertical.
+
     let corner = image[0];
     let sum = |p: [u8; 4]| p[0] as u32 + p[1] as u32 + p[2] as u32;
     assert!(sum(up) > sum(corner) + 60, "window {up:?} vs mirror {corner:?}");

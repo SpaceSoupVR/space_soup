@@ -1,8 +1,3 @@
-//! The `XRPERF` log line: what the runtime's frame counters look like once
-//! written down. Pure, so it is tested on a development machine; the
-//! Android-only `xr::perf_metrics` fills it from `XR_META_performance_metrics`.
-
-/// How a counter is measured, as the runtime typed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
     Generic,
@@ -12,31 +7,25 @@ pub enum Unit {
     Hertz,
 }
 
-/// One sampled counter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sample {
-    /// The counter's path without its `/perfmetrics_meta/` prefix.
+
     pub short: String,
     pub value: f64,
     pub unit: Unit,
 }
 
-/// `/perfmetrics_meta/app/gpu_frametime` -> `app/gpu_frametime`.
 pub fn short_name(path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
     trimmed.strip_prefix("perfmetrics_meta/").unwrap_or(trimmed).to_string()
 }
 
-/// The per-core CPU utilisations are left out: a Quest 3 has eight, the
-/// average is logged, and eight more numbers a line would bury the ones
-/// that decide anything.
 pub fn worth_logging(short: &str) -> bool {
     let per_core =
         short.starts_with("device/cpu") && short.as_bytes().get(10).is_some_and(|b| b.is_ascii_digit());
     !per_core
 }
 
-/// `XRPERF: app/gpu_frametime=12.34ms compositor/gpu_frametime=1.20ms ...`
 pub fn format_line(samples: &[Sample]) -> String {
     let mut out = String::from("XRPERF:");
     for s in samples {
@@ -55,14 +44,6 @@ pub fn format_line(samples: &[Sample]) -> String {
     out
 }
 
-/// Every counter over the frames of one `PERF` window.
-///
-/// A counter read once, on the frame a window closes, is ONE frame, and one
-/// frame of a GPU-bound scene sits easily a millisecond either side of the
-/// window it stands for -- the size of most of the effects being measured.
-/// Times, rates and percentages are summed every measured frame and averaged
-/// at the close; counts and sizes are left at their last value, which is what
-/// a running total means.
 #[derive(Default)]
 pub struct WindowMeans {
     counters: Vec<(String, Unit, f64, u32)>,
@@ -86,7 +67,6 @@ impl WindowMeans {
         }
     }
 
-    /// The window's values, and a fresh start for the next one.
     pub fn take(&mut self) -> Vec<Sample> {
         let out = self
             .counters
@@ -117,8 +97,7 @@ mod tests {
         };
         w.add(&frame(10.0, 1.0));
         w.add(&frame(14.0, 3.0));
-        // A counter the runtime declined one frame is averaged over the frames
-        // it answered, not diluted by a zero.
+
         w.add(&[Sample { short: "app/gpu_frametime".into(), value: 12.0, unit: Unit::Milliseconds }]);
         let out = w.take();
         assert_eq!(out[0].value, 12.0, "{out:?}");

@@ -1,74 +1,24 @@
-//! THE WAKE: the water a hand, a leg or a floating thing pushes aside as it
-//! moves, as one continuous surface -- a bow wave ahead of it, a V of waves
-//! spreading behind a fast one, ripples trailing -- not a chain of splashes.
-//!
-//! A small interactive HEIGHTFIELD centred on the player (`WAKE_N` texels of
-//! `WAKE_DX`: 4.8 m square), stepped on the CPU each frame and read by the
-//! water's shader (`water_pipeline`, binding 6) for its slope and the
-//! caustics' curvature, on top of the waves and the splashes' rings: one
-//! surface. PhysX has no water surface to give us this (its PBD fluids are
-//! volumes of particles, not in our physx-rs fork's build, and far too costly
-//! on a Quest); every engine that does this does it this way.
-//!
-//! THE EQUATION. The linear wave equation with Boussinesq's dispersion,
-//! `(1 - alpha lap) h_tt = g D lap h`, `alpha = D^2 / 3`: long waves run at
-//! `sqrt(g D)` (0.7 m/s for `WAKE_DEPTH` 5 cm, as a wave 30 cm long does in
-//! deep water), shorter ones slower -- down to about 0.3 m/s at the grid's
-//! finest, near the 0.23 m/s that is the slowest any ripple on real water
-//! runs. So a thing moving slower than its waves makes only a swell round
-//! it, and a faster one a V that narrows with its speed: the wake follows
-//! speed with no rule of its own. The `(1 - alpha lap)` is solved by
-//! `WAKE_JACOBI` Jacobi sweeps (spectral radius 0.57: converged to 6 %).
-//! Ripples die by a film viscosity on the vertical speed, everything by a
-//! slow drag, and a sponge round the edge drinks what leaves: nothing comes
-//! back off the grid's edge (a pond's bank does not reflect either).
-//!
-//! THE SOURCES. A thing at the waterline displaces its submerged volume
-//! `V`; moving across, it carries that volume with it -- `h_t += -(v . grad)
-//! (V G)`, `G` a Gaussian its own width: water rises ahead, falls behind.
-//! Moving down or up through the surface it pushes water out round it or
-//! draws it in (a ring of zero net volume). Still, it does nothing.
-//!
-//! COST is fixed: `WAKE_N^2` (9,216) cells, two steps a frame at most, a
-//! 74 KB upload -- whatever the level's size -- and nothing at all once no
-//! source has touched the water for `WAKE_REST` and the last wave is under a
-//! hundredth of a millimetre (`WakeField::step` returns false; the shader's
-//! `water.wake.w` is 0).
-//!
-//! The grid moves with the player a whole texel at a time, its waves left
-//! where they are in the world. It is shading, not geometry: the water's
-//! vertices are half a metre apart and could not carry it, and SpaceWarp's
-//! motion vectors are the surface's; the wake's crests are moved only by
-//! being redrawn each app frame (as the rings' are).
-
 use glam::{IVec2, Vec2, Vec3};
 
-/// Texels a side, and metres a texel: 4.8 m round the player.
 pub const WAKE_N: usize = 96;
 pub const WAKE_DX: f32 = 0.05;
-/// The depth whose shallow-water speed is the longest waves': `sqrt(g D)`.
+
 pub const WAKE_DEPTH: f32 = 0.05;
 const GRAVITY: f32 = 9.81;
 const WAKE_JACOBI: usize = 6;
-/// The film's viscosity on the vertical speed, m2/s: a 5 cm ripple lives
-/// about a second, a 30 cm wave many.
+
 const WAKE_FILM: f32 = 1.5e-4;
-/// Drag on everything, per second, and the sponge's at the grid's edge
-/// over its outer `WAKE_SPONGE` texels.
+
 const WAKE_DRAG: f32 = 0.25;
 const WAKE_SPONGE: usize = 10;
 const WAKE_SPONGE_DRAG: f32 = 6.0;
-/// The longest step, seconds: two half steps at 36 Hz.
+
 const WAKE_STEP: f32 = 1.0 / 60.0;
-/// Seconds with no source in the water before the field may rest.
+
 pub const WAKE_REST: f32 = 4.0;
-/// The most a source raises or lowers the water in one second, metres: a
-/// cap on a body thrown through the field.
+
 const WAKE_MOST: f32 = 0.6;
 
-/// Something in the water, this frame: where it crosses the surface (world;
-/// y is the surface), how fast it is moving, how wide it is there (its
-/// radius), and how deep it reaches below the surface.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WakeSource {
     pub position: Vec3,
@@ -82,7 +32,7 @@ pub struct WakeField {
     u: Vec<f32>,
     a: Vec<f32>,
     rhs: Vec<f32>,
-    /// The world cell of texel (0, 0).
+
     origin: IVec2,
     quiet: f32,
     resting: bool,
@@ -96,19 +46,16 @@ impl Default for WakeField {
 }
 
 impl WakeField {
-    /// The cell a world x, z lies in.
+
     fn cell_of(p: Vec2) -> IVec2 {
         (p / WAKE_DX).floor().as_ivec2()
     }
 
-    /// For the water's shader (`WaterUniform::wake`): the world x, z of the
-    /// grid's corner, one over its side, and 1 while it holds anything.
     pub fn uniform(&self) -> [f32; 4] {
         let corner = self.origin.as_vec2() * WAKE_DX;
         [corner.x, corner.y, 1.0 / (WAKE_N as f32 * WAKE_DX), if self.resting { 0.0 } else { 1.0 }]
     }
 
-    /// The height at a world x, z (nearest texel), metres: for tests.
     pub fn height_at(&self, p: Vec2) -> f32 {
         let c = Self::cell_of(p) - self.origin;
         if c.x < 0 || c.y < 0 || c.x >= WAKE_N as i32 || c.y >= WAKE_N as i32 {
@@ -117,13 +64,10 @@ impl WakeField {
         self.h[c.y as usize * WAKE_N + c.x as usize]
     }
 
-    /// Whether it holds nothing and is not stepped.
     pub fn is_resting(&self) -> bool {
         self.resting
     }
 
-    /// Move the grid so `centre` (world x, z) is in its middle, a whole
-    /// texel at a time, keeping the waves where they are in the world.
     fn follow(&mut self, centre: Vec2) {
         let want = Self::cell_of(centre) - IVec2::splat(WAKE_N as i32 / 2);
         let d = want - self.origin;
@@ -150,8 +94,6 @@ impl WakeField {
         shift(&mut self.u);
     }
 
-    /// One frame: follow `centre`, push the water by `sources`, and step
-    /// `dt` seconds. False when it rests (nothing to upload or draw).
     pub fn step(&mut self, dt: f32, centre: Vec2, sources: &[WakeSource]) -> bool {
         self.follow(centre);
         let dt = dt.clamp(0.0, 0.1);
@@ -176,8 +118,6 @@ impl WakeField {
         true
     }
 
-    /// THE SOURCES, for `dt`: each moves its submerged volume with it, and
-    /// pushes water out round it going down (draws it in coming up).
     fn push(&mut self, dt: f32, sources: &[WakeSource]) {
         let n = WAKE_N as i32;
         for s in sources {
@@ -201,10 +141,9 @@ impl WakeField {
                     let x = (self.origin + IVec2::new(i, j)).as_vec2() * WAKE_DX + Vec2::splat(0.5 * WAKE_DX) - centre;
                     let r2 = x.length_squared();
                     let g = norm * (-0.5 * r2 / s2).exp();
-                    // Carried across: -(v . grad)(V G) = V (v . x) / sigma^2 G.
+
                     let mut rate = volume * across.dot(x) / s2 * g;
-                    // Down through the surface: out of the middle, round it
-                    // (zero net volume: narrow minus wide).
+
                     let wide = 0.25 * norm * (-0.5 * r2 / w2).exp();
                     rate -= down * std::f32::consts::PI * s.radius * s.radius * (g - wide);
                     let k = (j * n + i) as usize;
@@ -214,7 +153,6 @@ impl WakeField {
         }
     }
 
-    /// THE WAVES, for `dt`.
     fn wave(&mut self, dt: f32) {
         let n = WAKE_N;
         let inv = 1.0 / (WAKE_DX * WAKE_DX);
@@ -233,7 +171,7 @@ impl WakeField {
                 self.rhs[j * n + i] = c2 * lap(&self.h, i, j) + WAKE_FILM * lap(&self.u, i, j);
             }
         }
-        // (1 - alpha lap) a = rhs, by Jacobi sweeps from last step's a.
+
         let diag = 1.0 + 4.0 * alpha * inv;
         for _ in 0..WAKE_JACOBI {
             let prev = self.a.clone();
@@ -269,9 +207,6 @@ impl WakeField {
         }
     }
 
-    /// What the shader reads, `WAKE_N^2` texels of four half floats: the
-    /// slope along x and z, and the negated curvature along x and z (the
-    /// caustics' `curve`), central differences.
     pub fn texels(&self) -> Vec<u16> {
         let n = WAKE_N;
         let mut out = vec![0u16; n * n * 4];
@@ -291,14 +226,12 @@ impl WakeField {
     }
 }
 
-/// An f32 as IEEE half-precision bits (round to nearest, clamped to the
-/// largest finite half).
 pub fn f16_bits(x: f32) -> u16 {
     let b = x.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
     let a = x.abs();
     if !(a >= 6.1035156e-5) {
-        // Subnormal or zero.
+
         return sign | ((a / 5.9604645e-8).round() as u16).min(0x3ff);
     }
     if a >= 65504.0 {
@@ -307,7 +240,7 @@ pub fn f16_bits(x: f32) -> u16 {
     let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
     let m = b & 0x7f_ffff;
     let mut h = ((e as u32) << 10) | (m >> 13);
-    // Round half up on the dropped bits.
+
     if m & 0x1000 != 0 {
         h += 1;
     }
@@ -322,9 +255,6 @@ mod tests {
         WakeSource { position: Vec3::new(at.x, 0.0, at.y), velocity: v, radius: 0.045, depth: 0.06 }
     }
 
-    /// Still in the water, nothing; moving across it, a bow wave rises
-    /// ahead and the water falls behind; then it all spreads and dies, and
-    /// the field rests.
     #[test]
     fn a_hand_drawn_through_the_water_pushes_a_bow_and_leaves_a_wake_that_dies() {
         let mut w = WakeField::default();
@@ -333,7 +263,7 @@ mod tests {
             assert!(w.step(dt, Vec2::ZERO, &[hand(Vec2::ZERO, Vec3::ZERO)]));
         }
         assert!(w.h.iter().all(|x| x.abs() < 1e-9), "a still hand makes no waves");
-        // Drawn along +x at 0.8 m/s for a second.
+
         let mut p = Vec2::new(-0.4, 0.0);
         for _ in 0..36 {
             p.x += 0.8 * dt;
@@ -342,12 +272,11 @@ mod tests {
         let ahead = w.height_at(p + Vec2::new(0.06, 0.0));
         let behind = w.height_at(p - Vec2::new(0.06, 0.0));
         assert!(ahead > 1e-4 && behind < ahead, "bow {ahead} behind {behind}");
-        // A V: well behind it, the water is disturbed off the line more than
-        // it is ahead of the bow.
+
         let wide = (0..20).map(|k| w.height_at(p + Vec2::new(-0.5, 0.05 * k as f32 - 0.5)).abs()).fold(0.0, f32::max);
         let far_ahead = (0..20).map(|k| w.height_at(p + Vec2::new(0.6, 0.05 * k as f32 - 0.5)).abs()).fold(0.0, f32::max);
         assert!(wide > 3.0 * far_ahead && wide > 1e-4, "wake {wide} ahead {far_ahead}");
-        // Out of the water: it spreads, dies, and the field rests.
+
         let mut steps = 0;
         while w.step(dt, Vec2::ZERO, &[]) {
             steps += 1;
@@ -356,8 +285,6 @@ mod tests {
         assert!(w.is_resting() && w.uniform()[3] == 0.0);
     }
 
-    /// A faster hand's waves trail in a narrower V (and a slow one's spread
-    /// round it): the wake follows speed with no rule of its own.
     #[test]
     fn a_faster_hand_leaves_a_narrower_v() {
         let spread = |speed: f32| {
@@ -369,8 +296,7 @@ mod tests {
                 p.x += speed * dt;
                 w.step(dt, Vec2::ZERO, &[hand(p, Vec3::new(speed, 0.0, 0.0))]);
             }
-            // Behind it, how far off its line the disturbance lies for how
-            // far behind: the wedge's slope, weighted by the waves' height.
+
             let (mut off, mut back) = (0.0f32, 0.0f32);
             for j in 0..WAKE_N {
                 for i in 0..WAKE_N {
@@ -388,8 +314,6 @@ mod tests {
         assert!(fast < slow, "fast {fast} slow {slow}");
     }
 
-    /// The grid follows the player a texel at a time, the waves staying put
-    /// in the world, and the edge drinks what reaches it.
     #[test]
     fn the_grid_follows_the_player_and_its_waves_stay_put() {
         let mut w = WakeField::default();

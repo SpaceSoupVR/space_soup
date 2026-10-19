@@ -1,72 +1,26 @@
-//! THE GROUND'S SLOPE TWINS: the ground's scene readers without the steep
-//! ground's code, drawn for the triangles no steep pixel can come from.
-//!
-//! WHY. The cliff texturing of 2026-10-08 -- the side planes' warp and bands,
-//! the colour's and the normal's second scale, the minor plane's normal near a
-//! 45-degree turn -- took every ground reader from 18-20 registers to 27
-//! (occupancy 62% -> 37%) and the full one to 3,665 instructions, past the
-//! Quest's instruction cache (wall #20), in every view of the ground, flat or
-//! not: outdoors_field drew in 21.7 ms against 13.2 on 10-06. All of it runs
-//! only where `slope_deg >= mat.biplanar_start_deg`. PIPESTATS of the readers
-//! with that test made false (`ground_cuts` `gentle`): 18 registers, 62%,
-//! 2,719 instructions for the outdoor one (build of 2026-10-08 10:44).
-//!
-//! THE SAME PICTURE. A pixel is steep where its interpolated normal is, or
-//! where the triangle it is drawn on is (`terrain_pipeline`'s `sample_frame`:
-//! the interpolated normal reads level along a knife ridge's crest). The
-//! normalised blend of a triangle's vertex normals with positive weights lies
-//! in the cone they span: no steeper than its steepest vertex. So a triangle
-//! whose every vertex AND whose own plane is gentler than the threshold, by a
-//! margin for the centre of an MSAA edge pixel just outside it, draws no steep
-//! pixel, and the twin -- the reader with that test false -- draws it as the
-//! reader does.
-//!
-//! HOW. Each terrain chunk's triangles are reordered once, its gentle ones
-//! first ([`SlopeSplit`]); the chunk keeps its range, so every other pass and
-//! test (shadows, culling, the weather's chunks) is unchanged, and the scene
-//! pass draws each chunk in two ranges, the gentle one with the twin.
-
 use crate::renderer::cuboid::SolidVertex;
 use crate::renderer::shadow::CasterChunk;
 use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainPipeline, TerrainRole};
 use wgpu::{BindGroupLayout, Device, TextureFormat};
 
-/// The ground shader's steep test, as `terrain_shader`'s `sample_frame`
-/// writes it.
 pub(crate) const STEEP_TEST: &str = "    let steep = min(n.y, face.y) <= cos(radians(mat.biplanar_start_deg));\n";
 
-/// The steep test and the twin's.
-/// The top plane's fold where the frame says how (`fold_bumps`): on gentle
-/// ground always the fold it always had, written so, so that the gentle
-/// twins carry none of the steep frame's arithmetic.
 pub(crate) const FOLD_KEEP: &str = "        let g = mix(z, 1.0, keep);\n";
 pub(crate) const FOLD_KEPT: &str = "        let g = 1.0;\n";
 pub(crate) const GENTLE_EDITS: &[(&str, &str)] = &[(STEEP_TEST, "    let steep = false;\n"), (FOLD_KEEP, FOLD_KEPT)];
 
-/// Degrees under the threshold every vertex of a twin's triangle must be: room
-/// for the centre of an MSAA edge pixel, just outside the triangle, where its
-/// normal is extrapolated.
 pub const GENTLE_MARGIN_DEG: f32 = 5.0;
 
-/// `src` (any ground shader, any twin) without its steep code, or `None` when
-/// its steep tests are not there once each.
 pub fn gentle_shader(src: &str) -> Option<String> {
     crate::renderer::ground_cuts::with_cut(src, GENTLE_EDITS)
 }
 
-/// The height (the slope's cosine) of the plane a triangle with these corners
-/// lies in, whichever way it is wound; 1 for a triangle with no area, which
-/// draws no pixel.
 pub fn face_height(positions: [[f32; 3]; 3]) -> f32 {
     use glam::Vec3;
     let [a, b, c] = positions.map(Vec3::from);
     (b - a).cross(c - a).try_normalize().map_or(1.0, |n| n.y.abs())
 }
 
-/// Whether a triangle with these vertex normals, lying in a plane of height
-/// `face_y` ([`face_height`]), can draw no steep pixel under a `threshold_deg`
-/// slope (`TerrainMaterialUniform::biplanar_start_deg`): a pixel is steep
-/// where its interpolated normal is or where its triangle is.
 pub fn triangle_is_gentle(normals: [[f32; 3]; 3], face_y: f32, threshold_deg: f32) -> bool {
     let limit = threshold_deg - GENTLE_MARGIN_DEG;
     if limit <= 0.0 {
@@ -80,57 +34,27 @@ pub fn triangle_is_gentle(normals: [[f32; 3]; 3], face_y: f32, threshold_deg: f3
         })
 }
 
-/// The ground shader's two steep tests made true: the twin for triangles
-/// every pixel of which is steep (`ground_cuts` `steep`: 24 registers, 50%,
-/// against the reader's 27, 37%).
 pub(crate) const STEEP_EDITS: &[(&str, &str)] = &[(STEEP_TEST, "    let steep = true;\n")];
 
-/// `src` with only the steep ground's code, or `None` when its steep tests
-/// are not there once each.
 pub fn steep_shader(src: &str) -> Option<String> {
     crate::renderer::ground_cuts::with_cut(src, STEEP_EDITS)
 }
 
-/// Whether a triangle with these vertex normals, lying in a plane of height
-/// `face_y` ([`face_height`]), can draw no gentle pixel: its own plane is
-/// steep, which makes every pixel of it steep, or no blend of its normals is
-/// gentle.
-/// Not its gentlest vertex's slope: two steep normals leaning opposite ways
-/// blend to a level one. A pixel's normal is a blend of the vertices' with
-/// positive weights -- a point of the spherical triangle they span -- so the
-/// triangle is steep when the most level point of that triangle is: the
-/// straight-up direction if it lies inside, else the most level point of an
-/// edge (where the edge's great circle passes nearest straight up, when that
-/// is between its ends; else an end).
-///
-/// (Until 2026-10-13 the bound was the cap round the normals' mean as wide as
-/// the farthest of them: its slope less that width. Right, and far from
-/// tight on a face that turns in plan -- normals strung along one latitude
-/// span a wide cap and a thin triangle. The exact bound moves 1.4% of
-/// test_room's ground from the reader for both kinds of pixel to the steep
-/// twin: 156,873 of its 386,040 indices (40.6%) against 39.2%.)
 pub fn triangle_is_steep(normals: [[f32; 3]; 3], face_y: f32, threshold_deg: f32) -> bool {
     let limit = threshold_deg + GENTLE_MARGIN_DEG;
     limit < 90.0 && (face_y <= limit.to_radians().cos() || steepest_bound_y(normals).is_some_and(|max_y| max_y <= limit.to_radians().cos()))
 }
 
-/// The greatest `y` (the cosine of the least slope) any normalised blend of
-/// these normals with positive weights can have, or `None` where that cannot
-/// be bounded below 1: a zero normal, normals spread so wide their blends pass
-/// near zero, or straight up among the blends.
 fn steepest_bound_y(normals: [[f32; 3]; 3]) -> Option<f32> {
     use glam::Vec3;
     let unit = |n: [f32; 3]| Vec3::from(n).try_normalize();
     let (a, b, c) = (unit(normals[0])?, unit(normals[1])?, unit(normals[2])?);
     let mean = (a + b + c).try_normalize()?;
-    // Within 60 degrees of their mean: a proper triangle on the sphere, far
-    // from the blends that cancel.
+
     if a.dot(mean).min(b.dot(mean)).min(c.dot(mean)) <= 0.5 {
         return None;
     }
-    // Straight up strictly inside the triangle: some pixel is level. (On an
-    // edge, or in a triangle too thin to have an inside, the edges below
-    // find it: their great circle passes through straight up.)
+
     let up = Vec3::Y;
     let sides = [up.dot(a.cross(b)), up.dot(b.cross(c)), up.dot(c.cross(a))];
     const EDGE: f32 = 1e-6;
@@ -141,15 +65,14 @@ fn steepest_bound_y(normals: [[f32; 3]; 3]) -> Option<f32> {
     let edge = |p: Vec3, q: Vec3| {
         let ends = p.y.max(q.y);
         let Some(m) = p.cross(q).try_normalize() else { return ends };
-        // The great circle's point nearest straight up, and whether it lies
-        // between the ends.
+
         let g = up - m * up.dot(m);
         let len = g.length();
         if len < 1e-6 {
             return ends;
         }
         let g = g / len;
-        // A little past each end counts as between: the bound only grows.
+
         if p.cross(g).dot(m) >= -1e-4 && g.cross(q).dot(m) >= -1e-4 {
             ends.max(len)
         } else {
@@ -159,80 +82,46 @@ fn steepest_bound_y(normals: [[f32; 3]; 3]) -> Option<f32> {
     Some(edge(a, b).max(edge(b, c)).max(edge(c, a)))
 }
 
-/// The order the scene pass draws a chunk's three slope ranges' readers in
-/// when it walks the chunks reader by reader -- 0 the reader for triangles
-/// with both kinds of pixel, 1 the gentle twin, 2 the steep twin. What stands
-/// up first under `Levers::ground_steep_first`: a cliff hides the slopes
-/// behind it, level ground hides next to nothing.
 pub fn reader_order(steep_first: bool) -> [usize; 3] {
     if steep_first { [2, 0, 1] } else { [1, 0, 2] }
 }
 
-/// How far a sampled normal's height may move and the ground still be the
-/// ground the split was built for: far over what a pose's arithmetic leaves
-/// (a few parts in ten million), far under what another ground's differs by.
 pub const HEIGHT_TOLERANCE: f32 = 1e-4;
 
-/// THE TERRAIN'S INDICES WITH EACH CHUNK'S GENTLE TRIANGLES FIRST, and how
-/// many of each chunk's indices they are. Built once per terrain and
-/// threshold; `key` tells a new terrain from the one it was built for.
 pub struct SlopeSplit {
     key: (usize, usize, usize, usize, u32, u64),
-    /// The sampled normals' heights the split was built from (`heights_of`).
+
     heights: Vec<f32>,
-    /// The terrain's index buffer, reordered within each chunk.
+
     pub indices: Vec<u32>,
-    /// Per chunk, as handed: how many of its indices, from its first, are
-    /// gentle triangles'.
+
     pub gentle: Vec<u32>,
-    /// Gentle indices of all.
+
     pub gentle_total: u64,
-    /// Per chunk: how many of its indices, up to its last, are steep
-    /// triangles' (`triangle_is_steep`); the rest, between, are mixed.
+
     pub steep: Vec<u32>,
     pub steep_total: u64,
-    /// Per chunk: how many indices each of its nine BUCKETS holds, in the
-    /// order they lie in the chunk's range -- the slope class major (gentle,
-    /// mixed, steep), the triangle's GROUND CLASS minor (0, 1, 2: what the
-    /// reflection pass may draw it with, `outdoor_pass::LevelGround`). So the
-    /// scene pass's three slope ranges are as they were, and the reflection
-    /// pass draws a ground class as at most three runs a chunk
-    /// ([`Self::class_ranges`]). All in class 0 without a classifier.
+
     pub classes: Vec<[u32; 9]>,
-    /// Indices of all, by ground class.
+
     pub class_totals: [u64; 3],
-    /// THE BLOCKS (`ground_lod::BLOCK_ORDER`): per chunk handed, where its
-    /// pieces start in `piece_runs` and how many (0: it lies whole in its own
-    /// range, as above). A chunk laid in a block is no longer one range: its
-    /// buckets lie each among its block's, and the tables above hold, past
-    /// the chunks', one entry a piece (`piece_runs`' third number).
+
     pub piece_of: Vec<(u32, u8)>,
-    /// `[first, count, table entry, bucket]` of each piece, a chunk's in
-    /// bucket order. A piece is one bucket (slope class x ground class) of
-    /// one chunk.
+
     pub piece_runs: Vec<[u32; 4]>,
-    /// Per chunk handed: the first index of the block it was laid in
-    /// (`u32::MAX`: none) -- what tells the frame which pieces lie together.
+
     pub piece_block: Vec<u32>,
 }
 
 impl SlopeSplit {
     fn key_of(verts: &[SolidVertex], idx: &[u32], chunks: &[CasterChunk], threshold_deg: f32, class_key: u64) -> (usize, usize, usize, usize, u32, u64) {
-        // A sample of the data as well as where it lies: a terrain loaded
-        // again can land at the same address. Of what a POSE leaves alone --
-        // the indices here, and the normals' heights in `heights_of` -- and
-        // not the positions: the app hands the ground posed into the player's
-        // frame, so a sampled height changed with every step up or down a
-        // slope, and the split (128,680 triangles sorted) was built again on
-        // each such frame.
+
         let mut h: u64 = 1469598103934665603 ^ class_key;
         let mut mix = |v: u64| {
             h ^= v;
             h = h.wrapping_mul(1099511628211);
         };
-        // A sample of the chunks, as of the indices: with chunks of a fixed
-        // size (and the coarser lists' runs among them) there are tens of
-        // thousands on a large level, and this is asked every frame.
+
         mix(chunks.len() as u64);
         for c in chunks.iter().step_by((chunks.len() / 997).max(1)) {
             mix(c.first_index as u64);
@@ -245,22 +134,11 @@ impl SlopeSplit {
         (verts.as_ptr() as usize, verts.len(), idx.as_ptr() as usize, idx.len(), threshold_deg.to_bits(), h)
     }
 
-    /// A sample of the normals' heights, which a turn about the vertical
-    /// keeps -- to its last bits only: the app's turn leaves each a few ulps
-    /// different from one yaw to the next. COMPARED WITHIN A TOLERANCE
-    /// ([`HEIGHT_TOLERANCE`]), not hashed: rounded into a hash (to a part in
-    /// 8,192, until 2026-10-13) some sample of a thousand always lay on a
-    /// rounding's edge, the key changed on about every other frame the rig
-    /// turned, and the whole split was built again each time -- 33 to 42 ms
-    /// of the render thread on the Quest, 400 times in 14 windows of a
-    /// walking bench view. That was the lag as played.
     fn heights_of(verts: &[SolidVertex]) -> Vec<f32> {
         let step = (verts.len() / 997).max(1);
         verts.iter().step_by(step).map(|v| v.normal[1]).collect()
     }
 
-    /// Whether this split is the one for this terrain and these ground
-    /// classes (`class_key`: 0 for none).
     pub fn is_for(&self, verts: &[SolidVertex], idx: &[u32], chunks: &[CasterChunk], threshold_deg: f32, class_key: u64) -> bool {
         if self.key != Self::key_of(verts, idx, chunks, threshold_deg, class_key) {
             return false;
@@ -270,25 +148,12 @@ impl SlopeSplit {
         self.heights.len() == now.len() && self.heights.iter().all(|was| now.next().is_some_and(|is| (is - was).abs() <= HEIGHT_TOLERANCE))
     }
 
-    /// `idx` with each chunk's gentle triangles first. No chunks: the whole
-    /// terrain as one.
     pub fn new(verts: &[SolidVertex], idx: &[u32], chunks: &[CasterChunk], threshold_deg: f32) -> Self {
         Self::classed(verts, idx, chunks, threshold_deg, 0, &|_| 0)
     }
 
-    /// [`Self::classed`] for a ground whose first vertices are a LATTICE of
-    /// `lattice` cells (`ground_lod::GroundLod::lattice`; `None` or a zero:
-    /// none), as `ground_shape` reads it. A triangle of the lattice wider
-    /// than one cell -- a coarser list of `ground_lod` -- is shaded by the
-    /// step-1 ground under it (its normal and its face come from
-    /// `ground_shape`), so it takes the slope class of the step-1 cells it
-    /// and a cell round it cover ([`CellSlopes`]), not of its own corners.
     #[allow(clippy::too_many_arguments)]
-    ///
-    /// `blocks`: per chunk handed, the block it is laid in with the chunks
-    /// beside it in the buffer that share its number, bucket by bucket
-    /// (`ground_lod::BLOCK_ORDER`, [`Self::piece_of`]); `u32::MAX` for a
-    /// chunk kept whole. `None`: every chunk whole.
+
     #[allow(clippy::too_many_arguments)]
     pub fn classed_on(
         verts: &[SolidVertex],
@@ -308,28 +173,17 @@ impl SlopeSplit {
         split
     }
 
-    /// The chunks of each block laid bucket by bucket (see `classed_on`):
-    /// bucket by bucket, and within one, chunk by chunk -- so a block drawn
-    /// whole is one run a bucket in the scene and the reflection pass alike,
-    /// and a chunk is up to nine pieces (a pass that draws chunks whole draws
-    /// a block cut by the frustum or the horizon as their pieces).
-    ///
-    /// (Laid slope class by slope class with each chunk's ground classes
-    /// within -- three pieces a chunk -- the reflection pass drew more runs
-    /// than with no blocks at all: 268 against 206 at the 625 hilltop, where
-    /// nine buckets draw 111. Measured 2026-10-14, `scale_bench budget`.)
     fn lay_blocks(&mut self, chunks: &[CasterChunk], blocks: &[u32]) {
         let real = chunks.len();
         self.piece_of = vec![(0, 0); real];
         self.piece_block = vec![u32::MAX; real];
-        // Per piece: its chunk, `[first, count, -, slope]`.
+
         let mut laid: Vec<(usize, [u32; 4])> = Vec::new();
         let mut k = 0usize;
         while k < real {
             let b = blocks[k];
             if b == crate::renderer::ground_lod::SLIVER_RUN {
-                // One bucket, the full reader's (mixed slope, ground class 0):
-                // its triangles in any order are that bucket.
+
                 let count = chunks[k].index_count;
                 self.gentle_total -= self.gentle[k] as u64;
                 self.steep_total -= self.steep[k] as u64;
@@ -368,7 +222,7 @@ impl SlopeSplit {
                     at += len;
                 }
             }
-            // Chunk by chunk, so a chunk's pieces are one stretch of the list.
+
             laid.sort_by_key(|(u, p)| (*u, p[3]));
             for u in k..e {
                 self.piece_of[u] = (self.piece_runs.len() as u32, 0);
@@ -380,8 +234,7 @@ impl SlopeSplit {
             }
             k = e;
         }
-        // Each piece's own entry in the tables, past the chunks': its bucket
-        // whole.
+
         let n = self.piece_runs.len();
         self.gentle.resize(real + n, 0);
         self.steep.resize(real + n, 0);
@@ -400,16 +253,10 @@ impl SlopeSplit {
         }
     }
 
-    /// The pieces, as `ground_lod::GroundLod::set_pieces` takes them; `None`
-    /// when no chunk was laid in a block.
     pub fn pieces(&self) -> Option<crate::renderer::ground_lod::Pieces> {
         (!self.piece_runs.is_empty()).then(|| crate::renderer::ground_lod::Pieces { of: self.piece_of.clone(), runs: self.piece_runs.clone(), block: self.piece_block.clone() })
     }
 
-    /// [`Self::new`], and within each slope class the triangles ordered by
-    /// their GROUND CLASS: `class_of` a triangle's three positions (as
-    /// `verts` holds them), 0, 1 or 2 -- anything else counts as 0.
-    /// `class_key` names the classifier, for [`Self::is_for`].
     pub fn classed(
         verts: &[SolidVertex],
         idx: &[u32],
@@ -446,12 +293,12 @@ impl SlopeSplit {
             if end > idx.len() || (end - start) % 3 != 0 {
                 gentle.push(0);
                 steep.push(0);
-                // Unsorted: all of it the full pass's.
+
                 classes.push([c.index_count, 0, 0, 0, 0, 0, 0, 0, 0]);
                 continue;
             }
             let tris = &idx[start..end];
-            // Nine buckets: slope class * 3 + ground class.
+
             let mut buckets: [Vec<u32>; 9] = Default::default();
             for t in tris.chunks_exact(3) {
                 let n = [normal(t[0]), normal(t[1]), normal(t[2])];
@@ -498,15 +345,6 @@ impl SlopeSplit {
         }
     }
 
-    /// THE SPLIT FOR THIS GROUND, MADE IF `kept` IS NOT IT: the one call
-    /// both the level's load and the frame make, so the load's split is the
-    /// frame's -- a frame that finds it made does nothing but compare a
-    /// thousand samples ([`Self::is_for`]). Returns the milliseconds a build
-    /// took, `None` when `kept` stood.
-    ///
-    /// It was made on the first FRAME that drew the ground, on the render
-    /// thread: a hitch of 35 ms on test_room, 152 ms at 625 samples a side,
-    /// 9.9 s at 2,049 (`docs/scale-audit-2026-10-13.md`, F12).
     #[allow(clippy::too_many_arguments)]
     pub fn ensure(
         kept: &mut Option<SlopeSplit>,
@@ -527,17 +365,10 @@ impl SlopeSplit {
         Some(started.elapsed().as_secs_f64() * 1000.0)
     }
 
-    /// Whether any triangle has a ground class of its own (1 or 2).
     pub fn has_classes(&self) -> bool {
         self.class_totals[1] + self.class_totals[2] > 0
     }
 
-    /// The runs of chunk `k`'s range -- `(offset from its first index, index
-    /// count)`, in order, neighbours merged -- that hold the triangles of the
-    /// ground classes `pick`ed, and how many: at most three for one class
-    /// (one a slope class), four for two (the first and the last, whose
-    /// buckets meet across the slope classes). The three classes' runs tile
-    /// the chunk's range exactly.
     pub fn class_ranges(&self, k: usize, pick: [bool; 3]) -> ([(u32, u32); 4], usize) {
         let mut runs = [(0u32, 0u32); 4];
         let mut n = 0usize;
@@ -558,9 +389,6 @@ impl SlopeSplit {
     }
 }
 
-/// A triangle's slope class from its own corners: 0 gentle
-/// ([`triangle_is_gentle`]), 2 steep ([`triangle_is_steep`]), 1 both kinds
-/// of pixel.
 fn slope_class(n: [[f32; 3]; 3], face_y: f32, threshold_deg: f32) -> usize {
     if triangle_is_gentle(n, face_y, threshold_deg) {
         0
@@ -571,7 +399,6 @@ fn slope_class(n: [[f32; 3]; 3], face_y: f32, threshold_deg: f32) -> usize {
     }
 }
 
-/// What the blocks add to a split's key: 0 for none.
 fn blocks_key(blocks: Option<&[u32]>) -> u64 {
     let Some(blocks) = blocks.filter(|b| b.iter().any(|x| *x != u32::MAX)) else { return 0 };
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -582,7 +409,6 @@ fn blocks_key(blocks: Option<&[u32]>) -> u64 {
     h | 1
 }
 
-/// What a lattice's size adds to a split's key: 0 for none.
 fn lattice_key(lattice: Option<[u32; 2]>) -> u64 {
     match lattice {
         Some([x, z]) if x > 0 && z > 0 => 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(1 + x as u64 + ((z as u64) << 32)),
@@ -590,23 +416,15 @@ fn lattice_key(lattice: Option<[u32; 2]>) -> u64 {
     }
 }
 
-/// THE STEP-1 SLOPE CLASSES OF A LATTICE'S CELLS, as counts over every
-/// rectangle of cells (summed-area tables), for the slope class of a coarser
-/// triangle that `ground_shape` shades by the step-1 ground under it: gentle
-/// only if every step-1 triangle under it and a cell round it is (an MSAA
-/// edge pixel's centre lies just outside its triangle), steep only if every
-/// one is, else both. A cell with no step-1 triangle drawn (a hole, ground
-/// under a floor) by the two triangles `ground_shape` reads there.
 pub struct CellSlopes {
     cells: [u32; 2],
-    /// Counts of cells holding a pixel that is NOT gentle, and NOT steep,
-    /// over `[0, x) x [0, z)`, `(cells + 1)` a row.
+
     not_gentle: Vec<u32>,
     not_steep: Vec<u32>,
 }
 
 impl CellSlopes {
-    /// `None` when the vertices hold no lattice of `cells`.
+
     pub fn build(cells: [u32; 2], verts: &[SolidVertex], idx: &[u32], threshold_deg: f32) -> Option<Self> {
         let [cx, cz] = cells;
         let stride = cx + 1;
@@ -614,7 +432,7 @@ impl CellSlopes {
         if cx == 0 || cz == 0 || verts.len() < samples {
             return None;
         }
-        // Bit 0: a gentle triangle, 1: mixed, 2: steep, in the cell.
+
         let mut kinds = vec![0u8; (cx * cz) as usize];
         let class = |t: [u32; 3]| {
             let n = t.map(|v| verts[v as usize].normal);
@@ -649,8 +467,6 @@ impl CellSlopes {
         Some(Self { cells, not_gentle: table(&|k| k & 0b110 != 0), not_steep: table(&|k| k & 0b011 != 0) })
     }
 
-    /// A lattice triangle's first cell and its width and depth in cells;
-    /// `None` for one with a vertex off the lattice.
     fn span(stride: u32, samples: usize, t: [u32; 3]) -> Option<(u32, u32, u32, u32)> {
         if t.iter().any(|&v| v as usize >= samples) {
             return None;
@@ -663,9 +479,6 @@ impl CellSlopes {
         Some((x0, z0, x1 - x0, z1 - z0))
     }
 
-    /// The slope class of a lattice triangle WIDER than one cell, from the
-    /// cells under it and one round them; `None` for a step-1 triangle or one
-    /// off the lattice (classed by its own corners).
     pub fn class_of_coarse(&self, t: [u32; 3]) -> Option<usize> {
         let [cx, cz] = self.cells;
         let stride = cx + 1;
@@ -689,29 +502,8 @@ impl CellSlopes {
     }
 }
 
-/// THE TORCH'S PUDDLE READERS WALK THE SKY (`true`): the weather's gentle
-/// twins a frame draws while a spot casts -- the player's torch in the rain
-/// -- take the sky as ONE copy walked over the normal and the mirror
-/// direction (`brush_pipeline::READER_EDITS`' `sky_walked`, as builds
-/// 118-119 shipped every reader), not two inlined calls. Same picture.
-///
-/// WHY (2026-10-14, headset: "lag ... looking down at the rain puddle
-/// ripples", and with the torch casting the hand's shadow in the rain).
-/// Reading the spots' shadows adds 190 proxy units to every weather gentle
-/// twin (`weather::tests::torch_wetness_reader_sizes`): the puddle reader
-/// (`terrain_weather_snowless_gentle_read_baked`) goes from about 3,205
-/// instructions to about 3,460, past the instruction cache's 3,387, on the
-/// view's dearest draw (9.35 ms full-screen at rain_puddles_down). The sky's
-/// second copy is 101 units (about 136 instructions): walked, it is back
-/// under. The walk lost to two calls in readers UNDER the edge (build 120),
-/// so the spotless twins -- every frame with no torch -- keep the calls.
-/// Read when the readers are BUILT: `adb shell setprop
-/// debug.spacesoup.torchskywalk 0` before a launch builds them as before.
 pub static TORCH_WEATHER_SKY_WALK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// `src`, a weather twin a torch-lit frame draws, with its sky walked when
-/// [`TORCH_WEATHER_SKY_WALK`] says so (unchanged if the edit no longer
-/// matches).
 pub(crate) fn torch_weather_twin(src: String) -> String {
     if !TORCH_WEATHER_SKY_WALK.load(std::sync::atomic::Ordering::Relaxed) {
         return src;
@@ -722,11 +514,6 @@ pub(crate) fn torch_weather_twin(src: String) -> String {
     })
 }
 
-/// The ground's gentle scene readers, in the weather twins' order `[full,
-/// spotless, baked, baked_spotless]` (`XrRenderer::terrain_twin`), from the
-/// shaders the shipped ones are built from; `weathered` the weather's twin of
-/// each, with its group 2 and its kinds (`weather::with_weather_kinds`).
-/// `None` when the ground's steep tests are not there to take out.
 #[allow(clippy::too_many_arguments)]
 pub fn gentle_readers(
     device: &Device,
@@ -747,7 +534,7 @@ pub fn gentle_readers(
         let (src, label) = match weather {
             Some((_, kinds)) => {
                 let twin = crate::renderer::weather::with_weather_kinds(&src, kinds)?;
-                // The spots' shadows read: see `TORCH_WEATHER_SKY_WALK`.
+
                 let twin = if suffix.ends_with("spotless") { twin } else { torch_weather_twin(twin) };
                 (twin, format!("terrain_weather{kind}_gentle_read{suffix}"))
             }
@@ -769,23 +556,6 @@ pub fn gentle_readers(
     built.try_into().ok()
 }
 
-/// THE WET-ONLY TWINS OF THE GROUND'S MIXED AND STEEP SCENE READERS, `[mixed,
-/// steep]`, each `[full, spotless, baked, baked_spotless]`: the weather's
-/// twin with no standing water's code and no snow's
-/// (`weather::WeatherKinds::WetOnly`), for the triangles that are not gentle
-/// in a chunk that holds neither -- a beach's washed chunks with the cliff
-/// over them, a rained-on slope that cannot pool.
-///
-/// WHY. Such a chunk's gentle triangles had a wet-only twin and the rest drew
-/// the weather's full reader, snow and puddles and all: 3,820 instructions,
-/// past the instruction cache (3,387), where the dry steep twin they drew
-/// before the shore's wetness is 2,831. Measured 2026-10-13 on the Quest:
-/// cave_mouth +3.8 ms, beach_south +1.8, shore +0.9 from that alone. These
-/// are about 3,270 by the host proxy (2,183 x the same ratio), under the edge;
-/// to be confirmed on the headset. `Levers::wet_steep_twins`.
-///
-/// `None` when the ground's steep tests are not there to take out, or the
-/// weather's edits no longer match a reader.
 pub fn wet_readers(
     device: &Device,
     format: TextureFormat,
@@ -820,8 +590,6 @@ pub fn wet_readers(
     both.try_into().ok()
 }
 
-/// The ground's steep-only scene readers, `[full, spotless, baked,
-/// baked_spotless]`, dry: for the triangles no gentle pixel comes from.
 pub fn steep_readers(
     device: &Device,
     format: TextureFormat,
@@ -854,12 +622,6 @@ pub fn steep_readers(
     built.try_into().ok()
 }
 
-/// THE GROUND'S PROBE PASS WITH ITS REPEATED CODE WRITTEN ONCE
-/// (`brush_pipeline::DEDUP_EDITS`: the same calls in the same order, the same
-/// picture to the byte), as `[pass, poolless]`, with the weather's twin of
-/// each when `weather` is its group 2. PIPESTATS 2026-10-08 10:59: the shipped
-/// pass 9,225 instructions, 26 registers, 37% occupancy; this 8,558, 23, 50%.
-/// `None` when the edits no longer match.
 pub fn dedup_passes(
     device: &Device,
     uniform_layout: &BindGroupLayout,
@@ -891,7 +653,6 @@ pub fn dedup_passes(
     built.try_into().ok()
 }
 
-/// The ground's probe pass `src` with [`crate::renderer::brush_pipeline::DEDUP_EDITS`].
 pub fn dedup_pass_shader(src: &str) -> Option<String> {
     crate::renderer::ground_cuts::with_cut(src, crate::renderer::brush_pipeline::DEDUP_EDITS)
 }
@@ -915,11 +676,6 @@ mod tests {
         SolidVertex { position: [0.0; 3], normal: n, color: [1.0; 4], uv2: [0.0; 2], reflectivity: 0.0 }
     }
 
-    /// THE SPLIT MADE AT A LEVEL'S LOAD IS THE ONE ITS FRAMES FIND: `ensure`
-    /// builds it once -- sorting a ground larger than test_room's, 320,000
-    /// triangles -- and every later call for the same ground, as each frame
-    /// makes, builds nothing. Another probe table (its key), another
-    /// threshold or another ground builds it again, once.
     #[test]
     fn the_split_made_at_load_is_the_one_the_frames_find() {
         let n = 401usize;
@@ -949,17 +705,17 @@ mod tests {
             .collect();
         let class_of = |c: [[f32; 3]; 3]| if c[0][0] < 60.0 { 1 } else { 2 };
         let mut kept = None;
-        // The load.
+
         assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 77, &class_of, None, None).is_some());
         let made = kept.as_ref().unwrap().indices.clone();
         assert!(kept.as_ref().unwrap().has_classes());
-        // Its frames: the chunks' boxes follow the rig, nothing else changes.
+
         for frame in 0..30 {
             let moved: Vec<CasterChunk> = chunks.iter().map(|c| CasterChunk { min: glam::Vec3::splat(frame as f32), ..*c }).collect();
             assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &moved, 35.0, 77, &class_of, None, None).is_none(), "built again on frame {frame}");
         }
         assert_eq!(kept.as_ref().unwrap().indices, made);
-        // Another probe table; another threshold; another ground.
+
         assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 78, &class_of, None, None).is_some());
         assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 35.0, 78, &class_of, None, None).is_none());
         assert!(SlopeSplit::ensure(&mut kept, &verts, &idx, &chunks, 30.0, 78, &class_of, None, None).is_some());
@@ -992,15 +748,12 @@ mod tests {
         assert!(!triangle_is_gentle([flat, tilt(13.1), flat], 1.0, 18.0));
         assert!(!triangle_is_gentle([flat, flat, [0.0, 0.0, 0.0]], 1.0, 18.0));
         assert!(!triangle_is_gentle([flat, flat, flat], 1.0, 4.0));
-        // ITS OWN PLANE COUNTS: a knife ridge's crest carries level normals
-        // on faces that stand at seventy degrees.
+
         assert!(triangle_is_gentle([flat, flat, flat], 12.9f32.to_radians().cos(), 18.0));
         assert!(!triangle_is_gentle([flat, flat, flat], 13.1f32.to_radians().cos(), 18.0));
         assert!(!triangle_is_gentle([flat, flat, flat], 70.0f32.to_radians().cos(), 18.0));
     }
 
-    /// A triangle's plane from its corners, whichever way it is wound; a
-    /// triangle with no area is level (it draws nothing).
     #[test]
     fn a_triangles_own_height_is_its_planes() {
         let level = [[0.0, 2.0, 0.0], [1.0, 2.0, 0.0], [0.0, 2.0, 1.0]];
@@ -1013,10 +766,6 @@ mod tests {
         assert_eq!(face_height([[1.0; 3]; 3]), 1.0);
     }
 
-    /// THE BOUND HOLDS AND IS TIGHT: over random triangles of normals, no
-    /// blend with positive weights is more level than the bound says, and
-    /// some blend comes within a degree of it. And the case the cap bound
-    /// left out: a cliff turning in plan, its normals along one latitude.
     #[test]
     fn the_steep_bound_is_the_most_level_blend() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -1052,7 +801,7 @@ mod tests {
             if triangle_is_steep(n, 1.0, 18.0) {
                 steep += 1;
                 assert!(most_level.acos().to_degrees() >= 23.0 - 0.01);
-                // What the cap round the mean said of the same triangle.
+
                 let u = n.map(|v| glam::Vec3::from(v).normalize());
                 let m = (u[0] + u[1] + u[2]).normalize();
                 let spread = u.iter().map(|v| v.dot(m).clamp(-1.0, 1.0).acos().to_degrees()).fold(0.0f32, f32::max);
@@ -1063,15 +812,14 @@ mod tests {
         }
         assert!(bounded > 2000 && steep > 500, "{bounded} bounded, {steep} steep");
         assert!(cap_missed > 50, "the cap's bound left out {cap_missed}");
-        // A face 60 degrees steep turning 70 degrees in plan across a triangle.
+
         let turning = [dir(60.0, 0.0), dir(60.0, 35.0), dir(60.0, 70.0)];
         assert!(triangle_is_steep(turning, 1.0, 18.0));
-        // Straight up among the blends: never.
+
         assert!(!triangle_is_steep([dir(40.0, 0.0), dir(40.0, 120.0), dir(40.0, 240.0)], 1.0, 18.0));
         assert!(steepest_bound_y([dir(30.0, 0.0), dir(30.0, 100.0), dir(30.0, 200.0)]).is_none());
     }
 
-    /// Either order draws each of the three readers once.
     #[test]
     fn the_readers_are_each_drawn_once_in_either_order() {
         for steep_first in [false, true] {
@@ -1089,13 +837,12 @@ mod tests {
             [s * az.to_radians().cos(), c, s * az.to_radians().sin()]
         };
         assert!(triangle_is_steep([tilt(60.0, 0.0), tilt(62.0, 5.0), tilt(58.0, -5.0)], 1.0, 18.0));
-        // Leaning opposite ways: their middle is level.
+
         assert!(!triangle_is_steep([tilt(40.0, 0.0), tilt(40.0, 180.0), tilt(40.0, 0.0)], 1.0, 18.0));
-        // Within the margin over the threshold: mixed.
+
         assert!(!triangle_is_steep([tilt(22.0, 0.0), tilt(22.0, 0.0), tilt(22.0, 0.0)], 1.0, 18.0));
         assert!(triangle_is_steep([tilt(24.0, 0.0), tilt(24.0, 0.0), tilt(24.0, 0.0)], 1.0, 18.0));
-        // A steep plane makes every pixel steep, whatever its normals say:
-        // the faces under a ridge's level crest.
+
         let level = [0.0, 1.0, 0.0];
         assert!(triangle_is_steep([level, level, level], 24.0f32.to_radians().cos(), 18.0));
         assert!(!triangle_is_steep([level, level, level], 22.0f32.to_radians().cos(), 18.0));
@@ -1106,7 +853,7 @@ mod tests {
         let flat = [0.0, 1.0, 0.0];
         let steep = [0.7, 0.7, 0.0];
         let verts = vec![vertex(flat), vertex(flat), vertex(flat), vertex(steep), vertex(flat), vertex(flat)];
-        // Chunk 0: steep, flat. Chunk 1: flat, steep, flat.
+
         let idx = vec![3, 4, 5, 0, 1, 2, 0, 1, 2, 3, 4, 5, 1, 2, 0];
         let chunk = |first, count| CasterChunk { first_index: first, index_count: count, min: glam::Vec3::ZERO, max: glam::Vec3::ZERO };
         let chunks = [chunk(0, 6), chunk(6, 9)];
@@ -1118,16 +865,15 @@ mod tests {
         assert!(s.is_for(&verts, &idx, &chunks, 18.0, 0));
         assert!(!s.is_for(&verts, &idx, &chunks, 20.0, 0));
         assert!(!s.is_for(&verts, &idx, &chunks, 18.0, 7), "another classifier's split");
-        // No classifier: every triangle the full pass's, one run a chunk.
+
         assert!(!s.has_classes());
         assert_eq!(s.class_ranges(1, [true, false, false]), ([(0, 9), (0, 0), (0, 0), (0, 0)], 1));
         assert_eq!(s.class_ranges(1, [false, true, true]).1, 0);
-        // The pose is not the terrain: the same ground, posed a step up.
+
         let moved: Vec<SolidVertex> = verts.iter().map(|v| SolidVertex { position: [v.position[0], v.position[1] - 0.3, v.position[2]], ..*v }).collect();
         let again = SlopeSplit::new(&moved, &idx, &chunks, 18.0);
         assert_eq!(again.indices, s.indices);
-        // ... and, where the app posed it into the same buffer, the same split:
-        // nothing to build again.
+
         let mut posed = verts.clone();
         let split = SlopeSplit::new(&posed, &idx, &chunks, 18.0);
         for v in posed.iter_mut() {
@@ -1135,8 +881,7 @@ mod tests {
             v.normal[1] += 1e-7;
         }
         assert!(split.is_for(&posed, &idx, &chunks, 18.0, 0));
-        // ... at EVERY turn of the rig: a thousand yaws, each leaving the
-        // normals' heights their last bits different, and none a new ground.
+
         let world = posed.clone();
         for k in 0..1000 {
             let turn = glam::Quat::from_rotation_y(k as f32 * 0.0123);
@@ -1150,15 +895,10 @@ mod tests {
         assert!(!split.is_for(&posed, &idx, &chunks, 18.0, 0), "the ground itself changed");
     }
 
-    /// THE BLOCKS (`ground_lod::BLOCK_ORDER`): each step-1 chunk's pieces
-    /// hold exactly its own triangles, each piece one bucket's, the level's
-    /// step-1 triangles are the ones they were, and a frame that sees every
-    /// chunk draws a block's chunks in one run a reader -- the scene pass's
-    /// draws fall by more than half.
     #[test]
     fn a_blocks_chunks_are_laid_bucket_by_bucket_and_drawn_as_their_pieces() {
         use crate::renderer::ground_lod::{merged, tests::ground, GridInput, GroundLod};
-        let cells = 160; // 5 x 5 chunks: one whole block and the edges'
+        let cells = 160;
         let (positions, triangles) = ground(cells, &|x, z| 6.0 * (x * 0.031).sin() * (z * 0.027).cos() + 2.0 * (x * 0.35).sin() * (z * 0.4).sin(), &|_, _| false);
         let mut normals = vec![glam::Vec3::ZERO; positions.len()];
         for t in triangles.chunks_exact(3) {
@@ -1202,8 +942,7 @@ mod tests {
                 assert!(id >= real);
                 let piece = &split.indices[*first as usize..(*first + *count) as usize];
                 held.extend_from_slice(piece);
-                // One slope class, whole: its count in the tables, and the
-                // class every triangle in it has.
+
                 assert_eq!(split.classes[id].iter().sum::<u32>(), *count);
                 assert_eq!(split.classes[id][slope * 3..slope * 3 + 3].iter().sum::<u32>(), *count);
                 assert_eq!(split.gentle[id], if slope == 0 { *count } else { 0 });
@@ -1217,7 +956,7 @@ mod tests {
             assert_eq!(tri_set(&held), tri_set(own), "chunk {u}'s pieces are its triangles");
         }
         assert!(laid >= 16, "{laid} chunks laid in blocks");
-        // A frame seeing everything: the scene pass's draws, reader by reader.
+
         let scene_draws = |split: &SlopeSplit, lod: &mut GroundLod| {
             lod.set_pieces(split.pieces());
             let f = lod.frame(glam::Vec3::new(0.0, 30.0, 0.0), &[], false, glam::Vec3::ZERO, 0.0, 0);
@@ -1244,9 +983,6 @@ mod tests {
         eprintln!("scene draws for {} chunks: {before} chunk by chunk, {after} block by block", chunks.len());
         assert!(after * 2 < before, "{after} against {before}");
 
-        // THE PASSES THAT DRAW THE GROUND WHOLE (`ground_lod::Wholes`): a
-        // block the frame chose whole is one range, the triangles each drawn
-        // once; seen in part, the units seen and nothing else.
         lod.set_pieces(split.pieces());
         let f = lod.frame(glam::Vec3::new(0.0, 30.0, 0.0), &[], false, glam::Vec3::ZERO, 0.0, 0);
         let drawn = |runs: &[(u32, u32)]| {
@@ -1255,7 +991,7 @@ mod tests {
         let all = f.wholes.runs(&f.chunks, |_| true);
         assert_eq!(all.len(), 1, "every chunk chosen: one range, {all:?}");
         assert_eq!(drawn(&all), tri_set(&plain.indices), "every triangle once");
-        // The full block's units, as the frame's chunks.
+
         let (mut p, mut m) = (0usize, 0usize);
         let mut full: Option<(std::ops::Range<usize>, Vec<u32>)> = None;
         for g in &f.wholes.groups {
@@ -1265,34 +1001,29 @@ mod tests {
             (p, m) = (g[2] as usize, g[3] as usize);
         }
         let (pieces, members) = full.expect("a block of 16 chunks");
-        // A unit's triangles: its pieces (every piece carries its unit's box).
+
         let own = |k: usize| -> Vec<[u32; 3]> {
             drawn(&pieces.clone().filter(|q| f.chunks[*q].min == f.chunks[k].min).map(|q| (f.chunks[q].first_index, f.chunks[q].index_count)).collect::<Vec<_>>())
         };
-        // One unit seen: its pieces alone.
+
         let one = members[5] as usize;
         let seen_one = |k: usize| pieces.contains(&k) && f.chunks[k].min == f.chunks[one].min;
         let runs = f.wholes.runs(&f.chunks, seen_one);
         assert_eq!(drawn(&runs), own(one), "one unit seen: its triangles");
-        // All but one seen: the block's range, one draw.
+
         let skip = f.chunks[members[3] as usize].min;
         let runs = f.wholes.runs(&f.chunks, |k| pieces.contains(&k) && f.chunks[k].min != skip);
         assert_eq!(runs.len(), 1, "15 of 16 seen: the block's range");
-        // Half seen (every other unit, as a ridge cuts it): never more draws
-        // than the pieces made.
+
         let half = |k: usize| pieces.contains(&k) && members.iter().position(|first| f.chunks[*first as usize].min == f.chunks[k].min).is_some_and(|j| j % 2 == 0);
         let (new, old) = (f.wholes.runs(&f.chunks, half).len(), merged(f.chunks.iter().enumerate().filter(|(k, _)| half(*k)).map(|(_, c)| (c.first_index, c.index_count))).len());
         assert!(new <= old, "{new} against {old}");
-        // No blocks: the chunks, as before.
+
         lod.set_pieces(plain.pieces());
         let f = lod.frame(glam::Vec3::new(0.0, 30.0, 0.0), &[], false, glam::Vec3::ZERO, 0.0, 0);
         assert_eq!(f.wholes.runs(&f.chunks, |_| true), merged(f.chunks.iter().map(|c| (c.first_index, c.index_count))));
     }
 
-    /// With ground classes: each chunk keeps its own triangles, its slope
-    /// ranges are what they were without the classes, every run of a class
-    /// holds triangles of that class alone, and the three classes' runs tile
-    /// the chunk.
     #[test]
     fn the_ground_classes_sort_within_the_slope_classes_and_tile_each_chunk() {
         let mut seed = 11u64;
@@ -1301,7 +1032,7 @@ mod tests {
             ((seed >> 33) as f32) / (1u64 << 31) as f32
         };
         let tilt = |deg: f32| [deg.to_radians().sin(), deg.to_radians().cos(), 0.0];
-        // One vertex a triangle corner, its x the triangle's class times ten.
+
         let mut verts = Vec::new();
         let mut idx = Vec::new();
         let tris = 300usize;
@@ -1332,7 +1063,7 @@ mod tests {
                 keys
             };
             assert_eq!(sorted(&s.indices[a..b]), sorted(&idx[a..b]), "chunk {k} lost or gained a triangle");
-            // The slope ranges hold the triangles they held.
+
             let (g, st) = (s.gentle[k] as usize, s.steep[k] as usize);
             assert_eq!(sorted(&s.indices[a..a + g]), sorted(&plain.indices[a..a + g]));
             assert_eq!(sorted(&s.indices[b - st..b]), sorted(&plain.indices[b - st..b]));
@@ -1347,13 +1078,13 @@ mod tests {
                     }
                     covered[o as usize..(o + len) as usize].iter_mut().for_each(|x| *x += 1);
                 }
-                // In order, and not touching: neighbours were merged.
+
                 for w in runs[..n].windows(2) {
                     assert!(w[0].0 + w[0].1 < w[1].0);
                 }
             }
             assert!(covered.iter().all(|&x| x == 1), "chunk {k}: the classes' runs do not tile it");
-            // Two classes together, and all three: fewer runs, the same indices.
+
             let (all, n) = s.class_ranges(k, [true; 3]);
             assert_eq!((n, all[0]), (1, (0, c.index_count)));
             let (two, n2) = s.class_ranges(k, [true, false, true]);

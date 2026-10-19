@@ -1,82 +1,35 @@
-//! THE CAVE IN SHADER TWINS, and the cave's depth in the reflection pass.
-//!
-//! WHY
-//!
-//! The cave shader shades rock (`shade_with_sky`, the ground's bounce) and,
-//! on floors and on its copy of the ground round a mouth, the ground's own
-//! path (`shade_material_env`), mixed by `as_ground_w`. With both in one
-//! shader it is about 4,950 instructions (the inlining proxy, 2,646 x 1.87),
-//! far past the Quest 3's instruction-cache cliff (~3,387): the headset's
-//! per-draw trace put the cave draw at 0.047% I$ miss and 6.8 clocks a
-//! fragment against the ground's 3.0 at the same ALU a fragment (cave_mouth,
-//! 2026-10-08), the single heaviest draw of every cave view.
-//!
-//! WHAT
-//!
-//! Each triangle is classified at load by the extremes its interpolated
-//! normal and ground share can take ([`classify`]):
-//! - [`CaveClass::Rock`]: `as_ground_w` is 0 on both of its faces, so it is
-//!   drawn by the twin without the ground's path ([`CavePath::Rock`]).
-//! - [`CaveClass::GroundFront`] / [`CaveClass::GroundBack`]: a floor (or a
-//!   roof) whose facing side has `as_ground_w` 1, drawn there by the twin
-//!   without the rock's path ([`CavePath::Ground`]) culling the other face,
-//!   which the full shader draws culling this one. Each pixel is drawn by
-//!   exactly one of the two.
-//! - [`CaveClass::Mixed`]: the full shader, as shipped.
-//!
-//! The same picture: a twin leaves out only code its pixels never run. The
-//! bounds allow interpolation weights down to -[`EXTRAPOLATION`], since a
-//! multisampled edge pixel is shaded at its centre, which can lie outside the
-//! triangle (`model-lightmap-reads-leave-their-chart`).
-//!
-//! THE OCCLUDER
-//!
-//! The reflection (probe) pass draws the brushes and the ground and never
-//! drew the cave, so the ground behind a cave wall was traced there for
-//! pixels the scene shows as rock (2,272 ALU a fragment on the ground's
-//! probe pass). [`CaveTwins::occluder`] draws the cave's depth first in that
-//! pass. Its texels then hold the cave's depth, which is what the scene pass
-//! sees there too.
-
 use glam::{Mat4, Vec3};
 use wgpu::*;
 
 use super::layered_mesh_pipeline::{layered_mesh_shader, LayeredMeshPipeline, LayeredVertex};
 
-/// Interpolation weights an edge pixel may take, below zero: a pixel centre
-/// up to half a triangle beyond its edge. A triangle smaller than about one
-/// and a half pixels can reach further; at such a size the cave's normals,
-/// smooth across neighbours, have not turned through a band's width.
 pub const EXTRAPOLATION: f32 = 0.5;
 
-/// Where the cave shader's floor test starts and ends: `smoothstep(0.6, 0.85, nw.y)`.
 const GROUND_FROM: f32 = 0.6;
 const GROUND_FULL: f32 = 0.85;
 
-/// Which of the cave shader's paths a triangle's pixels can take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaveClass {
-    /// Never the ground's path, on either face.
+
     Rock,
-    /// Only the ground's path on its front face (normals up).
+
     GroundFront,
-    /// Only the ground's path on its back face (normals down).
+
     GroundBack,
-    /// Anything else: the full shader.
+
     Mixed,
 }
 
-/// A twin of the cave shader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CavePath {
-    /// The rock's path alone.
+
     Rock,
-    /// The ground's path alone.
+
     Ground,
 }
 
 fn closest_to_origin(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
-    // Ericson, Real-Time Collision Detection 5.1.5, for the point p = 0.
+
     let ab = b - a;
     let ac = c - a;
     let ap = -a;
@@ -113,7 +66,6 @@ fn closest_to_origin(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
     a + ab * (vb * denom) + ac * (vc * denom)
 }
 
-/// The corners of what weights down to -`k` reach from three values.
 fn widened<T: Copy + std::ops::Add<Output = T> + std::ops::Sub<Output = T> + std::ops::Mul<f32, Output = T>>(
     v: [T; 3],
     k: f32,
@@ -123,17 +75,13 @@ fn widened<T: Copy + std::ops::Add<Output = T> + std::ops::Sub<Output = T> + std
     v.map(|x| c + (x - c) * s)
 }
 
-/// The class of one triangle, from its corners' normals and ground shares
-/// (`LayeredVertex::normal`, `ground[2]`), in a frame whose y is the world's
-/// (see [`keeps_vertical`]).
 pub fn classify(normals: [Vec3; 3], ground: [f32; 3]) -> CaveClass {
     let n = widened(normals, EXTRAPOLATION);
     let g = widened(ground, EXTRAPOLATION);
-    // |p| over the widened triangle: largest at a corner (convex), smallest
-    // at its point nearest the origin.
+
     let longest = n.iter().map(|v| v.length()).fold(0.0f32, f32::max);
     let nearest = closest_to_origin(n[0], n[1], n[2]).length();
-    // y is linear over it: its extremes are at the corners.
+
     let y_min = n.iter().map(|v| v.y).fold(f32::INFINITY, f32::min);
     let y_max = n.iter().map(|v| v.y).fold(f32::NEG_INFINITY, f32::max);
     let no_ground_copy = g.iter().all(|&z| z <= 0.0);
@@ -149,9 +97,6 @@ pub fn classify(normals: [Vec3; 3], ground: [f32; 3]) -> CaveClass {
     CaveClass::Mixed
 }
 
-/// The triangles reordered by class -- rock, ground in front, ground behind,
-/// mixed -- and where each class ends. The same triangles, each wound as
-/// before, so every other pass drawing the index buffer is unchanged.
 pub fn partition(vertices: &[LayeredVertex], indices: &[u32]) -> (Vec<u32>, [u32; 4]) {
     let mut classes: [Vec<u32>; 4] = Default::default();
     for tri in indices.chunks_exact(3) {
@@ -177,14 +122,11 @@ pub fn partition(vertices: &[LayeredVertex], indices: &[u32]) -> (Vec<u32>, [u32
         out.extend_from_slice(c);
         ends[k] = out.len() as u32;
     }
-    // A trailing partial triangle, if any, stays at the end, undrawn as before.
+
     out.extend_from_slice(&indices[indices.len() - indices.len() % 3..]);
     (out, ends)
 }
 
-/// Whether a model matrix keeps a normal's world height share: a turn about
-/// the vertical, a uniform positive scale and a move -- which is what the
-/// classes were found under. Anything else draws the full shader.
 pub fn keeps_vertical(m: Mat4) -> bool {
     let (x, y, z) = (m.x_axis.truncate(), m.y_axis.truncate(), m.z_axis.truncate());
     let s = y.y;
@@ -199,8 +141,6 @@ pub fn keeps_vertical(m: Mat4) -> bool {
         && m.determinant() > 0.0
 }
 
-/// A model-frame box `[min, max]` placed by `m`: the box round its eight
-/// corners.
 pub fn placed_box(m: Mat4, b: [[f32; 3]; 2]) -> (Vec3, Vec3) {
     (0..8).fold((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(lo, hi), i| {
         let c = Vec3::new(b[(i & 1)][0], b[(i >> 1) & 1][1], b[(i >> 2) & 1][2]);
@@ -209,9 +149,6 @@ pub fn placed_box(m: Mat4, b: [[f32; 3]; 2]) -> (Vec3, Vec3) {
     })
 }
 
-/// One substitution in the cave shader's text: `None` when the line is no
-/// longer there (the shader changed), so the twin is not built rather than
-/// built wrong. A test holds every substitution to matching.
 fn substitute(src: String, from: &str, to: &str) -> Option<String> {
     src.contains(from).then(|| src.replacen(from, to, 1))
 }
@@ -222,14 +159,12 @@ const ROCK_BOUNCE: &str =
     "    lit = lit + sky_irradiance(up_p) * (GROUND_ALBEDO * downward * smoothstep(0.1, 0.45, sky) * (1.0 - gb));";
 const GROUND_MIX: &str = "        colour = mix(colour, as_ground, as_ground_w);";
 
-/// The cave shader's text for a twin.
 pub fn twin_source(path: CavePath) -> Option<String> {
     let src = layered_mesh_shader();
     match path {
-        // `as_ground_w` is 0 on every pixel: the ground's path never runs.
+
         CavePath::Rock => substitute(src, GROUND_BRANCH, "    if (false) {"),
-        // `as_ground_w` is 1 on every pixel: the rock's colour is mixed in
-        // at weight 0.
+
         CavePath::Ground => {
             let src = substitute(src, ROCK_LIT, "    var lit = vec3<f32>(0.0);")?;
             let src = substitute(src, ROCK_BOUNCE, "")?;
@@ -238,13 +173,10 @@ pub fn twin_source(path: CavePath) -> Option<String> {
     }
 }
 
-/// The cave shader with a fragment stage that writes nothing: depth only.
 pub fn occluder_source() -> String {
     format!("{}\n@fragment fn fs_depth() {{}}\n", layered_mesh_shader())
 }
 
-/// The twins' pipelines for the single-eye scene pass, and the cave's
-/// depth-only pipeline for the reflection pass.
 pub struct CaveTwins {
     rock: LayeredMeshPipeline,
     ground_front: LayeredMeshPipeline,
@@ -255,7 +187,7 @@ pub struct CaveTwins {
 }
 
 impl CaveTwins {
-    /// `None` when a twin's substitution no longer matches the cave shader.
+
     pub fn new(
         device: &Device,
         format: TextureFormat,
@@ -282,8 +214,6 @@ impl CaveTwins {
         Some(Self { rock, ground_front, ground_back, full_cull_front, full_cull_back, occluder })
     }
 
-    /// The cave's depth in the reflection pass: its targets, written by
-    /// nothing; its depth, as that pass's other draws test it.
     fn occluder_pipeline(
         device: &Device,
         uniform_layout: &BindGroupLayout,
@@ -336,9 +266,6 @@ impl CaveTwins {
         })
     }
 
-    /// One cave's draws by class, `ends` from [`partition`], with its
-    /// buffers and groups 0-2 bound by the caller; `full` is the shipped
-    /// pipeline, for the mixed triangles.
     pub fn draw<'a>(&'a self, pass: &mut RenderPass<'a>, full: &'a RenderPipeline, ends: [u32; 4]) {
         let [rock, front, back, mixed] = ends;
         let draws: [(&RenderPipeline, std::ops::Range<u32>); 6] = [
@@ -368,23 +295,19 @@ mod tests {
 
     #[test]
     fn a_wall_is_rock_a_floor_is_ground_and_a_bend_is_mixed() {
-        // A wall: normals near horizontal.
+
         assert_eq!(classify([v(1.0, 0.1, 0.0), v(1.0, 0.0, 0.1), v(1.0, -0.1, 0.0)], [0.0; 3]), CaveClass::Rock);
-        // The same wall with a share of the ground copy: mixed.
+
         assert_eq!(classify([v(1.0, 0.1, 0.0), v(1.0, 0.0, 0.1), v(1.0, -0.1, 0.0)], [0.0, 0.2, 0.0]), CaveClass::Mixed);
-        // A floor, and a roof.
+
         assert_eq!(classify([v(0.0, 1.0, 0.05), v(0.05, 1.0, 0.0), v(0.0, 1.0, -0.05)], [0.0; 3]), CaveClass::GroundFront);
         assert_eq!(classify([v(0.0, -1.0, 0.05), v(0.05, -1.0, 0.0), v(0.0, -1.0, -0.05)], [0.0; 3]), CaveClass::GroundBack);
-        // A bend from wall to floor crosses the band.
+
         assert_eq!(classify([v(1.0, 0.2, 0.0), v(0.3, 1.0, 0.0), v(1.0, 0.2, 0.3)], [0.0; 3]), CaveClass::Mixed);
-        // Opposite normals: their mean can be anything.
+
         assert_eq!(classify([v(1.0, 0.0, 0.0), v(-1.0, 0.0, 0.0), v(0.0, 0.0, 1.0)], [0.0; 3]), CaveClass::Mixed);
     }
 
-    /// THE CLASS HOLDS WHEREVER A PIXEL CAN READ THE TRIANGLE: sampled
-    /// densely over weights down to -EXTRAPOLATION, the shader's own
-    /// `as_ground_w` is 0 on a rock triangle (both faces) and 1 on the
-    /// facing side of a ground one.
     #[test]
     fn every_pixel_of_a_class_takes_its_twins_path() {
         let smooth = |x: f32| {
@@ -477,9 +400,6 @@ mod tests {
         assert!(!keeps_vertical(Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0))));
     }
 
-    /// The substitutions still match the cave shader, and each twin is
-    /// smaller by what it leaves out. Run with `--ignored --nocapture` for
-    /// the inlining proxy's sizes.
     #[test]
     fn the_twins_are_the_cave_shader_less_one_path() {
         let rock = twin_source(CavePath::Rock).expect("the rock twin's substitution matches");
@@ -496,9 +416,6 @@ mod tests {
         }
     }
 
-    /// The cave's scene pipelines are opaque (no blending): that changes no
-    /// pixel only while every return of their fragment stage writes alpha 1.
-    /// The ground's too, should it be made opaque.
     #[test]
     fn opaque_scene_shaders_write_alpha_one() {
         use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainRole};
@@ -521,8 +438,6 @@ mod tests {
         }
     }
 
-    /// Every twin and the occluder build on a device: WGSL is compiled at
-    /// pipeline creation, and these are only drawn on the headset's path.
     #[test]
     fn the_twins_and_the_occluder_build() {
         let Some((device, _queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
@@ -540,8 +455,6 @@ mod tests {
         }
     }
 
-    /// How the shipped cave's triangles fall into the classes, by area.
-    /// `cargo test --lib shipped_cave_classes -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn shipped_cave_classes() {

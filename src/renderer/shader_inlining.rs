@@ -1,52 +1,25 @@
-//! WHERE A SHADER'S SIZE COMES FROM, measured from its source (tests only).
-//!
-//! The Quest's compiler inlines every function at every call, so a function
-//! called from three places is three copies in the binary -- and past ~3,387
-//! instructions a scene reader falls off the instruction cache (wall #20).
-//! The pipeline statistics give a whole shader's count; this gives its parts:
-//! for each function an entry point reaches, its own size, how many copies
-//! inlining makes of it, and what all but one of those copies cost -- the
-//! instructions that sharing it would buy back.
-//!
-//! Only LIVE code counts: a branch on a constant (`if (!PROBE_ENV_FROM_PASS)`,
-//! `SPOT_SHADOWS && ...`) is followed only where the constant lets it run, as
-//! the compiler deletes the rest -- and with it every call made only from
-//! there.
-//!
-//! A proxy, not the compiler's count. Own size is the arithmetic and texture
-//! operations a function's live code emits, a vector operation once per
-//! component and the costlier built-ins at what they expand to; moves, uniform
-//! reads, calls and control flow count nothing, and the compiler folds and
-//! schedules as it likes. Compare a reader's total with its pipeline
-//! statistics before trusting the ranking.
-
 use wgpu::naga;
 use naga::valid::{Capabilities, FunctionInfo, ValidationFlags, Validator};
 use naga::{Arena, BinaryOperator, Block, Expression, Function, Handle, Literal, LocalVariable, MathFunction, Module, Statement, TypeInner, UnaryOperator};
 use std::collections::HashMap;
 
-/// One function in [`inlined_sizes`].
 pub(crate) struct Inlined {
     pub name: String,
-    /// Its live body's operations, by the proxy above.
+
     pub own: usize,
-    /// How many copies inlining makes: one per live call path from the entry
-    /// point.
+
     pub copies: usize,
-    /// Where those copies are made: each function calling it, with the copies
-    /// its calls make.
+
     pub callers: Vec<(String, usize)>,
 }
 
 impl Inlined {
-    /// What every copy past the first costs.
+
     pub fn repeated(&self) -> usize {
         self.own * self.copies.saturating_sub(1)
     }
 }
 
-/// Every function `entry` reaches in `src`, the entry point's own body first
-/// (one copy).
 pub(crate) fn inlined_sizes(src: &str, entry: &str) -> Vec<Inlined> {
     let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(src)));
     let info = Validator::new(ValidationFlags::all(), Capabilities::all())
@@ -58,7 +31,6 @@ pub(crate) fn inlined_sizes(src: &str, entry: &str) -> Vec<Inlined> {
         .position(|e| e.name == entry)
         .unwrap_or_else(|| panic!("no entry point {entry}"));
 
-    // Each function's live calls (one entry per call site) and own size.
     let mut functions: HashMap<Handle<Function>, (Vec<Handle<Function>>, usize)> = HashMap::new();
     for (handle, function) in module.functions.iter() {
         let mut live = Live { module: &module, function, info: &info[handle], calls: Vec::new(), own: 0, temps: HashMap::new() };
@@ -108,8 +80,6 @@ pub(crate) fn inlined_sizes(src: &str, entry: &str) -> Vec<Inlined> {
     rows
 }
 
-/// The total; the `rows` functions whose repeated copies cost most; then the
-/// `rows` largest by all their copies.
 pub(crate) fn report(label: &str, src: &str, entry: &str, rows: usize) -> String {
     let mut all = inlined_sizes(src, entry);
     let total: usize = all.iter().map(|r| r.own * r.copies).sum();
@@ -129,24 +99,18 @@ pub(crate) fn report(label: &str, src: &str, entry: &str, rows: usize) -> String
     out
 }
 
-/// One function's live code: what it calls and what it emits.
 struct Live<'a> {
     module: &'a Module,
     function: &'a Function,
     info: &'a FunctionInfo,
     calls: Vec<Handle<Function>>,
     own: usize,
-    /// What the live code stores in each of naga's short-circuit temporaries
-    /// -- the unnamed `var` it makes of a runtime `a && b` or `a || b`, set on
-    /// each side of an `if` -- where constants decide it.
+
     temps: HashMap<Handle<LocalVariable>, Option<bool>>,
 }
 
 impl Live<'_> {
-    /// Walks `block`'s live statements; true when it always ends the
-    /// function (a `return` or a discard on every live path), so whatever
-    /// follows it is dead -- as after `if (PROBE_SECONDARY_DEFERRED) { ...
-    /// return col; }`.
+
     fn walk(&mut self, block: &Block) -> bool {
         for statement in block.iter() {
             let ends = match statement {
@@ -205,7 +169,6 @@ impl Live<'_> {
         }
     }
 
-    /// A condition's value where constants decide it, through the temporaries.
     fn condition(&self, h: Handle<Expression>) -> Option<bool> {
         match self.function.expressions[h] {
             Expression::Load { pointer } => self.temp(pointer).and_then(|v| self.temps.get(&v).copied().flatten()),
@@ -249,7 +212,6 @@ impl Live<'_> {
     }
 }
 
-/// A condition's value where constants alone decide it.
 pub(super) fn const_bool(module: &Module, arena: &Arena<Expression>, h: Handle<Expression>) -> Option<bool> {
     match arena[h] {
         Expression::Literal(Literal::Bool(b)) => Some(b),

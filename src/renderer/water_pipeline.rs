@@ -1,119 +1,41 @@
-//! Standing water and the open sea.
-//!
-//! WHAT MAKES WATER READ AS WATER
-//!
-//! In order of how much it matters on a headset:
-//!
-//! 1. **Fresnel.** Water is nearly clear looking straight down and nearly a
-//!    mirror at a glancing angle -- why a lake shows you its bed at your feet
-//!    and the sky at the far bank. What it mirrors is the world: the sky, the
-//!    hills round it and the buildings on its shore (`outdoor_radiance` in the
-//!    lights block), not a tint.
-//! 2. **Real waves.** The surface is the FFT wave field of `water_waves`: the
-//!    sea a wind of so many metres a second raises over so many metres of
-//!    open water. Near the eye its long waves move the surface itself, so in
-//!    stereo the swell has depth; everywhere its slopes are the normals, and
-//!    what its mip levels average away comes back as roughness, so the far
-//!    water is a soft sheen rather than aliased glitter.
-//! 3. **Light inside the water.** Each colour of light is lost at its own rate
-//!    on the way down to the bed and back up -- red first -- so a sandy bed
-//!    goes green-blue and then disappears into the water's own colour, the
-//!    light it scatters back. `shallow` is authored as a colour, and turned
-//!    into those rates here.
-//!
-//! WHY THE BED IS TINTED BY A SECOND BLEND SOURCE
-//!
-//! Seeing the bed through the water means attenuating what is already in the
-//! colour buffer, by a different amount per channel. One alpha cannot do that:
-//! it greys the sand instead of turning it blue-green. Reading the scene
-//! colour back would, but on a tile GPU that means ending the pass, resolving
-//! and copying -- the most expensive thing a transparent surface can ask for.
-//! Dual-source blending does it in the blend unit: the shader's second output
-//! is the factor the bed is multiplied by. Where the device lacks it, the same
-//! shader blends with one alpha, the mean of the three.
-//!
-//! WHY THE DEPTH COMES FROM THE GROUND MAP
-//!
-//! The bed's height under each pixel is read from the ground map the lights
-//! block already binds -- not from the depth buffer, which a tile GPU would
-//! have to resolve. Past the map's edge -- past the terrain, under a sea's
-//! skirt -- the sea floor runs on down from the edge, and nothing is drawn
-//! under the water there: what the view meets out there is lit by the shader
-//! itself, as light as the map's edge, rather than shown through by the blend.
-//! Taking it to be bottomless instead drew the line where a view first left
-//! the map as a hard edge between turquoise and navy. The vertices carry depth
-//! for a level with no map.
-//!
-//! WHY IT WRITES DEPTH
-//!
-//! The sky is drawn after the world, wherever depth is still clear, and a sea
-//! runs past the terrain to the horizon over nothing: without depth the sky
-//! would paint over it. SpaceWarp reprojects by depth too, and the surface is
-//! what is seen. What lies under the water is drawn before it, so nothing
-//! that should show through is lost.
-
 use wgpu::*;
 
 use crate::renderer::lights::wgsl_lights_block;
 use crate::renderer::water_waves::{WaveField, WaveParams, MIPS, N as WAVE_N};
 
-/// One vertex of the water surface, as the GPU sees it: in the WORLD, posed
-/// into the player's frame by the vertex shader. A surface the player walks
-/// round is never re-uploaded.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WaterVertex {
     pub position: [f32; 3],
-    /// Metres from the still surface down to the ground: negative on a beach.
+
     pub depth: f32,
 }
 
-/// How many times the depth, on average, the bed's light crosses on its way
-/// DOWN to the bed: light from the sky arrives at every angle, not only from
-/// overhead. Its way back up to the eye is the view's own path.
 pub const LIGHT_PATH: f32 = 1.15;
-/// Seconds between breakers on a beach. Divides the waves' 240 s loop, so the
-/// whole sea repeats as one.
+
 pub const SWASH_PERIOD: f32 = 8.0;
-/// How much later in its period a breaker reaches water a metre shallower:
-/// the speed they roll in at.
+
 const SWASH_LEAD: f32 = 0.45;
-/// THE BREAKERS' SHAPE. A wave rolling in grows as the water shoals until it
-/// is as high as the depth can hold (`BREAK_RATIO` of it, McCowan's 0.78),
-/// then breaks and runs on as a bore no higher than that. At its tallest it is
-/// `BREAKER_PER_SWASH` times the beach's swash. Its face toward the shore is
-/// steep (a Gaussian `BREAKER_FRONT` of a period wide), its back long and
-/// gentle (`BREAKER_BACK`); on the cove's 1-in-9 sand a period is about 20 m.
-/// Before this the shore's waves only lifted the water as a sheet, and a
-/// breaker was a white line on a flat surface.
+
 const BREAKER_PER_SWASH: f32 = 1.8;
 const BREAK_RATIO: f32 = 0.78;
-/// THE BREAKERS IN SETS, NOT ONE LINE (user, Checkpoint 51: "the big wave
-/// coming in shore seems ... too connected all the way across the water").
-/// Where a breaker arrives along the shore wanders by up to about a third of
-/// a period -- three incommensurate along-shore waves, each drifting by whole
-/// turns of the loop -- so the crest curves, its break point travels along it
-/// (peels), and neighbouring sections break at different moments.
-/// `(k x, k z, share of a period, offset, turns a loop)`.
+
 const SWASH_ALONG: [(f32, f32, f32, f32, f32); 3] =
     [(0.047, 0.031, 0.14, 0.0, 1.0), (-0.083, 0.059, 0.09, 1.7, -2.0), (0.151, -0.112, 0.08, 4.1, 3.0)];
-/// Its height by the wave: sets of bigger waves and lulls between (whole
-/// turns over the loop's waves), times sections of the shore some 25-30 m
-/// long that run bigger or smaller, drifting. The biggest are the breaker as
-/// it was; the least break nowhere.
+
 const SWASH_SET_TURNS: f32 = 4.0;
 const SWASH_SECTION: (f32, f32, f32, f32) = (0.21, -0.13, -0.11, 0.17);
-/// Swashes a loop of the waves' clock (240 s / `SWASH_PERIOD`).
+
 fn swashes_a_loop() -> f32 {
     crate::renderer::water_waves::WaveParams::default().loop_seconds / SWASH_PERIOD
 }
-/// Where the breaker is (`swash_count`): its count of periods, unwrapped.
+
 fn swash_count(t: f32, still_depth: f32, xz: glam::Vec2) -> f32 {
     let w0 = 2.0 * std::f32::consts::PI / crate::renderer::water_waves::WaveParams::default().loop_seconds;
     let along: f32 = SWASH_ALONG.iter().map(|&(kx, kz, a, o, n)| a * (xz.dot(glam::Vec2::new(kx, kz)) + o + n * w0 * t).sin()).sum();
     t / SWASH_PERIOD + still_depth * SWASH_LEAD + along
 }
-/// How big this breaker is here (`breaker_amp`), 0..1.
+
 fn breaker_amp(t: f32, xz: glam::Vec2, count: f32) -> f32 {
     let w0 = 2.0 * std::f32::consts::PI / crate::renderer::water_waves::WaveParams::default().loop_seconds;
     let set = 0.6 + 0.4 * (2.0 * std::f32::consts::PI * SWASH_SET_TURNS / swashes_a_loop() * count + 0.7).sin();
@@ -122,40 +44,26 @@ fn breaker_amp(t: f32, xz: glam::Vec2, count: f32) -> f32 {
     let section = 0.5 + 0.5 * (xz.dot(glam::Vec2::new(ax, az)) + inner + 3.0 * w0 * t).sin();
     set * (0.45 + 0.55 * section)
 }
-/// The breaker's face toward the shore, in periods: a ROUNDED crest on most
-/// waves (`BREAKER_FRONT_ROUND`), steepening to a lip (`BREAKER_FRONT`) only
-/// on the biggest of a set (`breaker_amp` over `BREAKER_LIP_FROM`). Every
-/// wave had the lip's 0.035 and a 0.07 back: a crest eight times as sharp in
-/// front as behind, a pinched ridge on every wave (user, Checkpoint 52).
+
 const BREAKER_FRONT: f32 = 0.04;
 const BREAKER_FRONT_ROUND: f32 = 0.08;
 const BREAKER_LIP_FROM: f32 = 0.8;
 const BREAKER_BACK: f32 = 0.1;
-/// `breaker_front` in [`surface_wgsl`]: the face's width for a breaker `amp` big.
+
 fn breaker_front(amp: f32) -> f32 {
     let t = ((amp - BREAKER_LIP_FROM) / (1.0 - BREAKER_LIP_FROM)).clamp(0.0, 1.0);
     BREAKER_FRONT_ROUND + (BREAKER_FRONT - BREAKER_FRONT_ROUND) * t * t * (3.0 - 2.0 * t)
 }
-/// Metres from the eye over which a sea's skirt is raised to the eye's own
-/// height, so its far edge meets the sky AT the horizon. Left level, the edge
-/// lay a few ten-thousandths of a radian below it, where the sky draws its
-/// dark ground: a sliver under a pixel, which MSAA showed as a dashed line
-/// along the horizon that crawled as the head moved (headset, 2026-10-07).
+
 const HORIZON_LIFT: (f32, f32) = (4000.0, 15000.0);
-/// CAT'S PAWS: how far the ripples fall in the lulls between gusts, by the
-/// wind. In light airs over a pond or a sheltered cove gusts roughen drifting
-/// patches while the lulls lie glassy; by a fresh breeze (6 m/s and more) the
-/// whole surface stays rippled and there are none.
+
 fn paws_calm(wind_speed: f32) -> f32 {
     let t = ((wind_speed - 2.0) / 4.0).clamp(0.0, 1.0);
     0.15 + 0.85 * t * t * (3.0 - 2.0 * t)
 }
-/// THE SWELL'S WAVES (`WaterDef::swell`): wavelength, metres, way off the
-/// wind, radians, and share of the height. Each runs at deep water's own
-/// speed for its length, rounded to whole turns in the waves' loop.
+
 const SWELL: [(f32, f32, f32); 3] = [(4.3, 0.0, 0.5), (2.9, 0.55, 0.3), (2.1, -0.7, 0.2)];
-/// Swell wave `i` as WGSL: its `k` vector in the wind's frame, `omega`, and
-/// share.
+
 fn swell_wgsl(i: usize) -> String {
     let w0 = 2.0 * std::f32::consts::PI / crate::renderer::water_waves::WaveParams::default().loop_seconds;
     let (length, turn, share) = SWELL[i];
@@ -163,97 +71,72 @@ fn swell_wgsl(i: usize) -> String {
     let omega = ((9.81 * k).sqrt() / w0).round() * w0;
     format!("vec4<f32>({:?}, {:?}, {:?}, {:?})", k * turn.cos(), k * turn.sin(), omega, share)
 }
-/// Foam's bubbles repeat this many times a metre.
+
 const FOAM_TILES: f32 = 1.0 / 3.0;
-/// What the bed gives back of the sunlight the waves gather onto it: sand.
+
 const BED_ALBEDO: f32 = 0.45;
-/// Metres from the eye within which the waves move the surface itself; past
-/// it they are normals alone. A wave a hand high is a few pixels at forty
-/// metres.
+
 pub const WAVE_REACH: f32 = 40.0;
 
-/// SPLASH RINGS: the splashes' ripples spreading over the surface
-/// (`effects::splash_rings`), each a short train of waves as long and as
-/// fast as what struck raises -- centimetres and a walking pace from a
-/// pebble, a metre and faster from a crate -- widening and dying away, with
-/// the foam and the dimple where it struck. The `RINGS` that matter most to
-/// the eye are drawn.
 pub const RINGS: usize = 6;
-/// The longest any splash's rings are drawn, seconds
-/// (`effects::ring_seconds`).
+
 pub const RING_SECONDS: f32 = 8.0;
 
-/// Per-body optics and the waves' state, as the shader takes them.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WaterUniform {
-    /// xyz: each channel's light lost per metre of water, as exp(-k d);
-    /// w: the still surface's height, world y.
+
     pub extinction: [f32; 4],
-    /// xyz: deep water's own colour, linear; w: the shore fade, metres.
+
     pub scatter: [f32; 4],
-    /// xyz: the wave cascades' tile sides, metres; w: seconds, wrapped to the
-    /// waves' loop.
+
     pub tiles: [f32; 4],
-    /// x: the slope variance of the ripples no cascade holds; y: how high the
-    /// shore's waves run, metres; z: `WAVE_REACH`, 0 for a surface the waves
-    /// never move; w: `SWASH_PERIOD`.
+
     pub waves: [f32; 4],
-    /// Per mip level of the wave textures, the slope variance each cascade's
-    /// level averages away. See `WaveParams::lost_slope_variance`.
+
     pub lost: [[f32; 4]; MIPS as usize],
-    /// Splashes' ring trains, as `effects::SplashRings` has them: world x,
-    /// z, seconds since the train left, its size (0: none, and none after
-    /// it). See `RINGS`.
+
     pub rings: [[f32; 4]; RINGS],
-    /// Each train's gravity / 4, its spectrum's width with its damping, the
-    /// radius inside which it is not drawn, and the dimple's (or the boil's)
-    /// slope a metre out.
+
     pub ring_waves: [[f32; 4]; RINGS],
-    /// Each one's foam: its whiteness, 1 / reach^2, its arcs, and over how
-    /// long its drops land.
+
     pub ring_pools: [[f32; 4]; RINGS],
-    /// Each one's drops falling back: the radius they land round, 1 / the
-    /// band's half-width^2, seconds since the first landed, the share of
-    /// cells a drop lands in.
+
     pub ring_drops: [[f32; 4]; RINGS],
-    /// x: how far the ripples fall in the lulls between gusts (1: no lulls;
-    /// see `paws_calm`); y: the swell, metres; zw: the wind's way, x and z.
+
     pub air: [f32; 4],
-    /// THE WAKE round the player (`water_wake::WakeField::uniform`): the
-    /// world x, z of its grid's corner, one over its side, 1 while it holds
-    /// anything.
+
     pub wake: [f32; 4],
-    /// THE PLANAR MIRROR (`planar_water`): x 1 when the body is authored as a
-    /// mirror (`WaterDef::mirror`); y 1 while it is this frame's mirror; z
-    /// what turns the mirror image's values back into radiance (one over the
-    /// exposure it was drawn at); w 1 when the image is drawn flipped left to
-    /// right (the offline harness's, which keeps the winding that way).
+
     pub mirror: [f32; 4],
+    pub look: [f32; 4],
+
+    pub prints: [f32; 4],
 }
 
-/// A body's optics as authored, in linear light.
 #[derive(Copy, Clone, Debug)]
 pub struct WaterOptics {
-    /// The still surface, world y.
+
     pub height: f32,
-    /// A white bed seen straight down through `depth_scale` metres of water.
+
     pub shallow: [f32; 3],
-    /// The light the water itself scatters back: its colour when too deep to
-    /// see through.
+
     pub deep: [f32; 3],
     pub depth_scale: f32,
     pub shore_fade: f32,
-    /// How high the shore's waves run up a beach, metres.
+
     pub swash: f32,
-    /// Metres the surface heaves in long slow undulations (`WaterDef::swell`).
+
     pub swell: f32,
+
+    pub gloss: f32,
+
+    pub mud: f32,
 }
 
 impl WaterUniform {
     pub fn new(o: &WaterOptics, waves: &WaveParams) -> Self {
-        // Straight down, the bed's light crosses the depth 1 + LIGHT_PATH
-        // times; this is the loss per metre that makes white look `shallow`.
+
         let k = |c: f32| -c.clamp(1e-4, 1.0).ln() / (o.depth_scale.max(0.01) * (1.0 + LIGHT_PATH));
         Self {
             extinction: [k(o.shallow[0]), k(o.shallow[1]), k(o.shallow[2]), o.height],
@@ -268,10 +151,11 @@ impl WaterUniform {
             air: [paws_calm(waves.wind_speed), o.swell.max(0.0), waves.wind_dir.cos(), waves.wind_dir.sin()],
             wake: [0.0; 4],
             mirror: [0.0; 4],
+            look: [o.gloss.clamp(0.0, 1.0), o.mud.clamp(0.0, 1.0), 0.0, 0.0],
+            prints: [0.0; 4],
         }
     }
 
-    /// The splashes on this surface (`effects::splash_rings`).
     pub fn set_rings(&mut self, r: &crate::renderer::effects::SplashRings<RINGS>) {
         self.rings = r.rings;
         self.ring_waves = r.waves;
@@ -279,8 +163,6 @@ impl WaterUniform {
         self.ring_drops = r.drops;
     }
 
-    /// The shore's waves' time, wrapped to the wave field's loop so they
-    /// repeat with it.
     pub fn set_time(&mut self, seconds: f64, loop_seconds: f32) {
         self.tiles[3] = seconds.rem_euclid(loop_seconds.max(1.0) as f64) as f32;
     }
@@ -288,33 +170,26 @@ impl WaterUniform {
 
 pub struct WaterPipeline {
     pub pipeline: RenderPipeline,
-    /// The same without the splashes' rings: see `RING_BLOCK`.
+
     pub ringless: RenderPipeline,
-    /// The same with the drops falling back round a splash: see `DROPS_BLOCK`.
+
     pub raining: RenderPipeline,
-    /// THE WATERLINE TWIN, drawn only while an eye straddles the surface:
-    /// the same surface and shading, leaving out every pixel whose view
-    /// starts under the water -- the underwater view's, split from this one
-    /// along the same line (`underwater`). See `water_line_wgsl`.
+
     pub waterline: RenderPipeline,
-    /// THE MIRROR TWINS -- ringless, ringed, raining -- for the body that is
-    /// this frame's planar mirror (`planar_water`): what the water mirrors is
-    /// read from the scene drawn mirrored in its surface (group 2,
-    /// [`Self::mirror_group`]) where the others march the ground map.
+
     pub mirrored: [RenderPipeline; 3],
     pub mirror_layout: BindGroupLayout,
     mirror_sampler: Sampler,
     pub material_layout: BindGroupLayout,
-    /// The waves' and the foam's: repeating, filtered between mip levels.
+    pub default_mud: TextureView,
+
     pub sampler: Sampler,
-    /// Whether the bed is tinted channel by channel (dual-source blending) or
-    /// by one alpha. See the module notes.
+
     pub dual_source: bool,
-    /// THE WAKE's texture (`water_wake`): every body's material reads this
-    /// one, which `XrRenderer` writes each frame the wake moves.
+
     pub wake_texture: Texture,
     wake_view: TextureView,
-    /// Its layout, target and blending, for a cut built later.
+
     inputs: WaterInputs,
 }
 
@@ -329,7 +204,6 @@ impl WaterPipeline {
         Self::new_with(device, format, camera_layout, samples, crate::renderer::multiview::ViewMode::Mono, dual)
     }
 
-    /// The same, drawing BOTH EYES in one pass. See `multiview::ViewMode`.
     pub fn new_stereo(
         device: &Device,
         format: TextureFormat,
@@ -340,7 +214,6 @@ impl WaterPipeline {
         Self::new_with(device, format, camera_layout, samples, crate::renderer::multiview::ViewMode::Stereo, dual)
     }
 
-    /// Whether this device can blend by a second source.
     pub fn device_blends_two(device: &Device) -> bool {
         device.features().contains(Features::DUAL_SOURCE_BLENDING)
     }
@@ -376,7 +249,7 @@ impl WaterPipeline {
                     },
                     count: None,
                 },
-                // The fragments' too, for the waterline twin's test (`water_line_wgsl`).
+
                 texture(1, ShaderStages::VERTEX_FRAGMENT, TextureViewDimension::D2Array),
                 texture(2, ShaderStages::FRAGMENT, TextureViewDimension::D2Array),
                 texture(3, ShaderStages::FRAGMENT, TextureViewDimension::D2Array),
@@ -388,8 +261,21 @@ impl WaterPipeline {
                     count: None,
                 },
                 texture(6, ShaderStages::FRAGMENT, TextureViewDimension::D2),
+                texture(7, ShaderStages::FRAGMENT, TextureViewDimension::D2),
             ],
         });
+        let default_mud = device
+            .create_texture(&TextureDescriptor {
+                label: Some("water_mud_none"),
+                size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rg8Unorm,
+                usage: TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&TextureViewDescriptor::default());
         let sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("water_waves_sampler"),
             address_mode_u: AddressMode::Repeat,
@@ -406,8 +292,6 @@ impl WaterPipeline {
             immediate_size: 0,
         });
 
-        // dst * second source + first: the bed tinted, then the light the
-        // water adds. Without the feature, premultiplied alpha.
         let blend = if dual_source {
             BlendState {
                 color: BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::Src1, operation: BlendOperation::Add },
@@ -461,7 +345,7 @@ impl WaterPipeline {
         .map(|(src, label)| build_water(device, &mirror_pipeline_layout, format, blend, samples, view, mirrored_wgsl(&src), label));
         let inputs = (layout, format, blend, samples, view);
         if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
-            // MEASUREMENT: each cut built once, for the PIPESTATS log.
+
             for (cut, _) in WATER_CUTS {
                 let _ = water_with_cut(device, &inputs, dual_source, cut);
             }
@@ -479,10 +363,9 @@ impl WaterPipeline {
             view_formats: &[],
         });
         let wake_view = wake_texture.create_view(&TextureViewDescriptor::default());
-        Self { pipeline, raining, ringless, waterline, mirrored, mirror_layout, mirror_sampler, material_layout, sampler, dual_source, wake_texture, wake_view, inputs }
+        Self { pipeline, raining, ringless, waterline, mirrored, mirror_layout, mirror_sampler, material_layout, sampler, dual_source, wake_texture, wake_view, inputs, default_mud }
     }
 
-    /// Write the wake's texels (`water_wake::WakeField::texels`).
     pub fn write_wake(&self, queue: &Queue, texels: &[u16]) {
         let n = crate::renderer::water_wake::WAKE_N as u32;
         queue.write_texture(
@@ -493,9 +376,6 @@ impl WaterPipeline {
         );
     }
 
-    /// THE TWIN TO DRAW for these splashes (`WaterUniform::set_rings`):
-    /// ringless while no ring is spreading, raining while any splash's drops
-    /// are landing, ringed otherwise.
     pub fn for_rings(&self, rings: &[f32; 4], drops: &[[f32; 4]; RINGS]) -> &RenderPipeline {
         if drops.iter().any(|d| d[3] > 0.0) {
             &self.raining
@@ -506,7 +386,6 @@ impl WaterPipeline {
         }
     }
 
-    /// The mirror twin to draw for these splashes, as [`Self::for_rings`].
     pub fn mirrored_for_rings(&self, rings: &[f32; 4], drops: &[[f32; 4]; RINGS]) -> &RenderPipeline {
         if drops.iter().any(|d| d[3] > 0.0) {
             &self.mirrored[2]
@@ -517,7 +396,6 @@ impl WaterPipeline {
         }
     }
 
-    /// The mirror twins' group 2 over a mirror image (`planar_water`).
     pub fn mirror_group(&self, device: &Device, view: &TextureView) -> BindGroup {
         device.create_bind_group(&BindGroupDescriptor {
             label: Some("water_mirror"),
@@ -529,16 +407,15 @@ impl WaterPipeline {
         })
     }
 
-    /// MEASUREMENT: the ringless water with one of [`WATER_CUTS`], to draw in
-    /// its place (`Levers::water_cut`). `None` for a cut it does not have, or
-    /// one whose text no longer matches.
     pub fn with_cut(&self, device: &Device, cut: &str) -> Option<RenderPipeline> {
         water_with_cut(device, &self.inputs, self.dual_source, cut)
     }
 
-    /// A body's material, once for each of the wave field's two sets: draw
-    /// with `[waves.current()]`.
     pub fn bind_groups(&self, device: &Device, uniform: &Buffer, waves: &WaveField) -> [BindGroup; 2] {
+        self.bind_groups_with(device, uniform, waves, &self.default_mud)
+    }
+
+    pub fn bind_groups_with(&self, device: &Device, uniform: &Buffer, waves: &WaveField, mud: &TextureView) -> [BindGroup; 2] {
         std::array::from_fn(|set| {
             device.create_bind_group(&BindGroupDescriptor {
                 label: Some("water_material"),
@@ -551,31 +428,17 @@ impl WaterPipeline {
                     BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&waves.foam_view) },
                     BindGroupEntry { binding: 5, resource: BindingResource::Sampler(&self.sampler) },
                     BindGroupEntry { binding: 6, resource: BindingResource::TextureView(&self.wake_view) },
+                    BindGroupEntry { binding: 7, resource: BindingResource::TextureView(mud) },
                 ],
             })
         })
     }
 }
 
-/// The most a wave's tilt may move the mirror image's read from one pixel
-/// to the next, in the image's texels, before the tilt is scaled down: far
-/// off, ripples finer than a pixel moved it many texels a pixel and the
-/// grass bank mirrored as a sparkle of noise (offline, 2026-10-14); near,
-/// where a ripple spans pixels, the tilt is kept whole.
 const MIRROR_JUMP: f32 = 2.0;
 
-/// The line of the water's shader that finds what it mirrors, which the
-/// mirror twins replace.
 const ENV_LINE: &str = "    let env = outdoor_radiance(p, normalize(to_world_direction(r)), r, rough, clamp(rough * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD));";
 
-/// A MIRROR TWIN of a water shader (`planar_water`): what it mirrors read
-/// from the scene drawn mirrored in the still surface -- the rock face and
-/// the sky behind a calm pond as sharp as they stand -- where the ground
-/// map's top-down picture smeared a steep face into a streak (2026-10-14).
-/// The reflected ray is followed as far as the eye is from the point, its
-/// end mirrored in the surface and found on the screen: where a flat surface
-/// mirrors, that is the pixel itself; a wave's tilt moves it as it moves the
-/// reflection. Read at full sharpness: a mirror body is a calm one.
 pub(crate) fn mirrored_wgsl(src: &str) -> String {
     assert_eq!(src.matches(ENV_LINE).count(), 1, "the water's reflection line moved");
     let planar = "    let reach = r * clamp(distance(cam_pos(), in.world_pos), 1.0, 30.0);
@@ -598,61 +461,55 @@ pub(crate) fn mirrored_wgsl(src: &str) -> String {
     )
 }
 
-/// What a water pipeline is built from besides its source.
 type WaterInputs = (PipelineLayout, TextureFormat, BlendState, u32, crate::renderer::multiview::ViewMode);
 
-/// MEASUREMENT ONLY: parts of the water's fragment stage, each cut out by a
-/// text edit of the ringless shader -- what each costs by its presence and
-/// its work (`Levers::water_cut`), and in instructions and registers
-/// (PIPESTATS `water_cut_<name>`). Not the same picture.
 pub(crate) const WATER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("none", &[]),
-    // The breaker's face, its slope from the phase over the bed map.
+
     (
         "breaker_face",
         &[("    if (water.waves.y > 0.0 && still_depth > 0.0 && still_depth < 2.8) {\n        let breaker_count", "    if (false) {\n        let breaker_count")],
     ),
-    // The swell's tilt.
+
     ("swell", &[("        tilt = tilt + water.air.y * smoothstep(0.15, 0.6, still_depth) * swell_at(q, water.tiles.w).yz;\n", "")]),
-    // Cat's paws: even ripples everywhere.
+
     ("paws", &[("    let paws = mix(water.air.x, 1.0, smoothstep(-0.6, 0.7, lull));", "    let paws = 1.0;")]),
-    // The third cascade's curvature in the caustics.
+
     ("c2", &[("    let c2 = textureSampleBias(wave_curve, wave_samp, q / water.tiles.z, 2, 2.0) * paws;", "    let c2 = vec4<f32>(0.0);")]),
-    // The caustics altogether.
+
     ("caustics", &[("    let caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, 5.0, thickness)));", "    let caustic = 1.0;")]),
-    // The breakers' and the wash's foam.
+
     ("surf", &[("    if (water.waves.y > 0.0) {\n        let count = swash_count(still_depth, q, water.tiles.w);", "    if (false) {\n        let count = swash_count(still_depth, q, water.tiles.w);")]),
-    // The walk to the drawn bed: the map's picture everywhere.
+
     ("walk", &[("    if (on_map && bed_shows) {\n        let flat", "    if (false) {\n        let flat")]),
-    // The deep water's skip of the walk and the picture taken out: the water
-    // as it was before it.
+
     ("no_deep_skip", &[("    let bed_shows = max(max(t_view.x * t_light.x, t_view.y * t_light.y), t_view.z * t_light.z) >= DEEP_SKIP
         || smoothstep(0.0, water.scatter.w, thickness) < 1.0;", "    let bed_shows = true;")]),
-    // The map's picture of the bed.
+
     ("beyond", &[("    if (drawn < 1.0 && bed_shows) {\n        beyond", "    if (false) {\n        beyond")]),
-    // The refracted path's second read of the bed.
+
     ("refract", &[("    if (has_map) {\n        let closing", "    if (false) {\n        let closing")]),
-    // The reflection: the ground's trace and the probes.
+
     ("env", &[("    let env = outdoor_radiance(", "    let env = vec3<f32>(0.0);\n    let env_unused = outdoor_radiance(")]),
-    // What it mirrors alone, at full weight, and nothing through it: the
-    // reflection's source as the water reads it (the pond's olive mound,
-    // 2026-10-14). And the Fresnel weight alone, as grey.
+
     (
         "env_only",
         &[
-            ("    let shade = (env * fresnel + glint + (body + brighter) * (1.0 - fresnel)) * edge;", "    let shade = env;"),
-            ("    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge);", "    let under = vec3<f32>(0.0);"),
+            ("    let shade = (env_seen * fresnel + glint * wet_gloss + (body + brighter) * (1.0 - fresnel)) * edge;", "    let shade = env_seen;"),
+            ("    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge) * print_shade;", "    let under = vec3<f32>(0.0);"),
         ],
     ),
     (
         "fresnel_only",
         &[
-            ("    let shade = (env * fresnel + glint + (body + brighter) * (1.0 - fresnel)) * edge;", "    let shade = vec3<f32>(fresnel);"),
-            ("    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge);", "    let under = vec3<f32>(0.0);"),
+            ("    let shade = (env_seen * fresnel + glint * wet_gloss + (body + brighter) * (1.0 - fresnel)) * edge;", "    let shade = vec3<f32>(fresnel);"),
+            ("    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge) * print_shade;", "    let under = vec3<f32>(0.0);"),
         ],
     ),
-    // The sun's glint (its lights loop's GGX).
+
     ("glint", &[("        glint = glint + radiance * WATER_PI * water_ggx(n, v, to_l, a2);\n", "")]),
+
+    ("prints", &[("    let colour = mix(shade, foam_light, froth_cover);", "    let colour = vec3<f32>(print.x, print.y, 0.15);")]),
 ];
 
 fn water_with_cut(device: &Device, inputs: &WaterInputs, dual_source: bool, cut: &str) -> Option<RenderPipeline> {
@@ -705,16 +562,13 @@ fn build_water(
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
-                // NO BACK-FACE CULLING. A crest folding over, or a camera that
-                // has waded in, sees the surface's back -- and a culled surface
-                // simply vanishes there.
+
                 cull_mode: None,
                 ..Default::default()
             },
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                // WRITES depth: see the module notes. Everything meant to be
-                // seen through the water is drawn before it.
+
                 depth_write_enabled: Some(true),
                 depth_compare: Some(CompareFunction::Less),
                 stencil: Default::default(),
@@ -726,13 +580,8 @@ fn build_water(
         })
 }
 
-/// Metres a body's waves may carry its surface from its still vertices,
-/// beyond twice their significant height: the long waves' sideways push and
-/// the shore's swash. Generous, because it only widens a box that culls.
 const WAVE_ALLOWANCE: f32 = 2.0;
 
-/// The world box a body's surface can reach: its vertices, as far as its waves
-/// can move them. See [`water_seen`].
 pub fn water_bounds(verts: &[WaterVertex], waves: &WaveParams) -> (glam::Vec3, glam::Vec3) {
     let (lo, hi) = verts.iter().fold(
         (glam::Vec3::splat(f32::INFINITY), glam::Vec3::splat(f32::NEG_INFINITY)),
@@ -745,18 +594,6 @@ pub fn water_bounds(verts: &[WaterVertex], waves: &WaveParams) -> (glam::Vec3, g
     (lo - reach, hi + reach)
 }
 
-/// WHETHER A BODY OF WATER IS SEEN this frame -- whether its waves are worth
-/// moving and its surface worth drawing: its `bounds` ([`water_bounds`]) in
-/// one of `views`, each eye's frustum, and from inside a closed room in one of
-/// `doorways` (`portal_cull::outdoor_frusta`; `None` when nothing can be
-/// culled that way). All in the world, where the bounds are.
-///
-/// The far planes are no limit: a sea's skirt runs on past them, drawn held
-/// just inside (`vs_main`'s horizon). Out of sight, the waves' compute alone
-/// cost a millisecond and more a frame (Quest 3, 2026-10-07).
-///
-/// A helper rather than a test written into the frame, which only the headset
-/// builds: see `shadow::chunk_seen`.
 pub fn water_seen(
     bounds: (glam::Vec3, glam::Vec3),
     views: &[[glam::Vec4; 6]],
@@ -770,11 +607,6 @@ pub fn water_seen(
     views.iter().any(meets) && doorways.map_or(true, |d| d.iter().any(meets))
 }
 
-/// How far the shore's swash lifts the surface at a world `xz` over still
-/// water `still_depth` deep, at the uniform's time: `swash_phase` and
-/// `swash_rise` in [`surface_wgsl`], on the CPU, so a splash sits on the
-/// water drawn rather than under it -- in a breaker's wash the drawn surface
-/// stands a hand or more above the still one.
 pub fn swash_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
     let swash = u.waves[1];
     if swash <= 0.0 {
@@ -788,7 +620,7 @@ pub fn swash_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
     let phase = count.rem_euclid(1.0);
     let amp = breaker_amp(u.tiles[3], xz, count);
     let rise = smooth(0.0, 0.16, phase) * (1.0 - smooth(0.16, 0.92, phase));
-    // The breaker (`breaker_height`, `breaker_profile`).
+
     let grown = BREAKER_PER_SWASH * swash * amp * (1.0 - smooth(1.2, 2.8, still_depth));
     let height = grown.min(BREAK_RATIO * still_depth.max(0.0));
     let s = phase - phase.round();
@@ -798,39 +630,18 @@ pub fn swash_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
     swash * (1.0 - smooth(0.3, 1.5, still_depth)) * rise * (0.5 + 0.5 * amp) + height * profile + swell_lift(u, still_depth, xz)
 }
 
-/// How much further up a beach the wash wets the sand than the water's own
-/// surface rises (`swash_rise` at its peak): the sheet runs on up the slope,
-/// and the sand above it draws water up.
 pub const SHORE_RUN_UP: f32 = 1.3;
-/// Metres of height above the wet line over which the sand goes from soaked
-/// to dry: on the cove's 1-in-9 beach nearly two metres, the upper metre of it damp and matte.
+
 pub const SHORE_BAND: f32 = 0.2;
-/// How fast the wet line sinks back down a beach after a wave, metres of
-/// height a second: the film drains into the sand from the top (about half a
-/// metre of a 1-in-9 beach between one wave and the next).
+
 pub const SHORE_CREEP: f32 = 0.007;
-/// The waves back that can still hold the line up.
+
 const SHORE_WAVES: usize = 4;
 
-/// The most [`shore_wet_line`] is, for a shore of this `swash`.
 pub fn shore_wet_line_most(swash: f32) -> f32 {
     SHORE_RUN_UP * swash.max(0.0) + SHORE_BAND
 }
 
-/// THE WET LINE ON A BEACH: the height above the still surface up to which
-/// the sea's wash has the sand at a world `xz` wet now, at the waves' clock
-/// `t` (seconds, as `WaterUniform::tiles[3]`), for a shore whose swash is
-/// `swash` metres; [`SHORE_BAND`] over that the sand is dry.
-///
-/// No state: the breakers are a closed form of the clock (`swash_count`,
-/// `breaker_amp`), so which waves have run up here, how high each ran and
-/// how long ago are too. Each of the last few reached [`SHORE_RUN_UP`] times
-/// its own rise -- bigger in a set, and in the sections of the shore that run
-/// bigger -- and since then its line has sunk at [`SHORE_CREEP`]; the wave
-/// coming in now has reached as far as it has risen. The line is the highest
-/// of them: it jumps up the beach with a big wave, creeps back between waves,
-/// lies higher where the bigger sections break, and is never below the still
-/// water's edge.
 pub fn shore_wet_line(t: f32, swash: f32, xz: glam::Vec2) -> f32 {
     if swash <= 0.0 {
         return SHORE_BAND;
@@ -839,14 +650,13 @@ pub fn shore_wet_line(t: f32, swash: f32, xz: glam::Vec2) -> f32 {
         let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     };
-    // The wash is highest this far into a period (`swash_rise`).
+
     const PEAK: f32 = 0.16;
     let count = swash_count(t, 0.0, xz);
     let phase = count.rem_euclid(1.0);
     let mut line = 0.0f32;
     for back in 0..SHORE_WAVES {
-        // Periods since this wave was at its highest, and how big it was
-        // then: one size a wave, whenever it is asked.
+
         let since = phase - PEAK + back as f32;
         let amp = breaker_amp(t - since * SWASH_PERIOD, xz, count - since);
         let ran = SHORE_RUN_UP * swash * (0.5 + 0.5 * amp);
@@ -856,7 +666,6 @@ pub fn shore_wet_line(t: f32, swash: f32, xz: glam::Vec2) -> f32 {
     line + SHORE_BAND
 }
 
-/// The swell's lift (`swell_at` in [`surface_wgsl`]) on the CPU.
 fn swell_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
     if u.air[1] <= 0.0 {
         return 0.0;
@@ -874,25 +683,15 @@ fn swell_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
             share * (kv.dot(xz) - omega * u.tiles[3] + i as f32 * 2.1).sin()
         })
         .sum();
-    // Still at the shoreline: lifted there, the edge stood out of the bank.
+
     let t = ((still_depth - 0.15) / 0.45).clamp(0.0, 1.0);
     u.air[1] * height * t * t * (3.0 - 2.0 * t)
 }
 
-/// THE SURFACE THE WATER DRAWS, as WGSL for every shader that places it:
-/// [`WaterUniform`] as `WaterMat`, and the shore's swash. The including shader
-/// declares `water: WaterMat` and a filtering `wave_samp`, and makes its
-/// surface functions with [`surface_fn_wgsl`].
-///
-/// Shared rather than copied because SpaceWarp's motion pass (`space_warp`)
-/// places this same surface at this frame and the last: the motion the
-/// compositor is told has to be the motion drawn.
-/// One turn over the waves' loop, radians a second.
 fn loop_rate() -> f32 {
     2.0 * std::f32::consts::PI / crate::renderer::water_waves::WaveParams::default().loop_seconds
 }
 
-/// `SWASH_ALONG`'s term `i` as WGSL of `xz` and `t`.
 fn along_wgsl(i: usize) -> String {
     let (kx, kz, a, o, n) = SWASH_ALONG[i];
     format!("{a:?} * sin(dot(xz, vec2<f32>({kx:?}, {kz:?})) + {o:?} + {:?} * t)", n * loop_rate())
@@ -922,13 +721,10 @@ struct WaterMat {{
     air: vec4<f32>,
     wake: vec4<f32>,
     mirror: vec4<f32>,
+    look: vec4<f32>,
+    prints: vec4<f32>,
 }}
 
-// THE SHORE'S WAVES. Each breaker rolls in toward the beach -- a point a
-// metre deeper meets it `SWASH_LEAD` of a period sooner -- and arrives a
-// little unevenly along the shore. 0 is its crest.
-// It wanders along the shore (`SWASH_ALONG`): `swash_count` is the phase
-// unwrapped, a count of periods.
 fn swash_count(still_depth: f32, xz: vec2<f32>, t: f32) -> f32 {{
     let along = {along0} + {along1} + {along2};
     return t / water.waves.w + still_depth * SWASH_LEAD + along;
@@ -937,8 +733,6 @@ fn swash_phase(still_depth: f32, xz: vec2<f32>, t: f32) -> f32 {{
     return fract(swash_count(still_depth, xz, t));
 }}
 
-// How big this breaker is here, 0..1: sets and lulls by the wave, sections of
-// the shore bigger or smaller (`breaker_amp`).
 fn breaker_amp(xz: vec2<f32>, t: f32, count: f32) -> f32 {{
     let sets = 0.6 + 0.4 * sin({set_rate:?} * count + 0.7);
     let inner = 1.1 * sin(dot(xz, vec2<f32>({bx:?}, {bz:?})) + {w2:?} * t);
@@ -946,21 +740,15 @@ fn breaker_amp(xz: vec2<f32>, t: f32, count: f32) -> f32 {{
     return sets * (0.45 + 0.55 * section);
 }}
 
-// Its wash: quickly up the sand, slowly back down it.
 fn swash_rise(phase: f32) -> f32 {{
     return smoothstep(0.0, 0.16, phase) * (1.0 - smoothstep(0.16, 0.92, phase));
 }}
 
-// THE BREAKER over still water `still_depth` deep: as high as it has grown
-// shoaling in, no higher than the water there can hold.
 fn breaker_height(still_depth: f32, amp: f32) -> f32 {{
     let grown = BREAKER_PER_SWASH * water.waves.y * amp * (1.0 - smoothstep(1.2, 2.8, still_depth));
     return min(grown, BREAK_RATIO * max(still_depth, 0.0));
 }}
 
-// Its shape about its crest, 1 there, by the swash's phase: steep ahead of it
-// (toward the shore, where the phase is still to come), long behind it, and
-// level at the crest itself so the light does not crease along it.
 fn breaker_profile(phase: f32, amp: f32) -> f32 {{
     let s = phase - round(phase);
     let b = s / BREAKER_BACK;
@@ -968,12 +756,10 @@ fn breaker_profile(phase: f32, amp: f32) -> f32 {{
     return select(exp(-(s * s) / (f * f)), (1.0 + b) * exp(-b), s > 0.0);
 }}
 
-// The face's width: rounded, a lip only on the biggest (`breaker_front`).
 fn breaker_front(amp: f32) -> f32 {{
     return mix(BREAKER_FRONT_ROUND, BREAKER_FRONT, smoothstep(BREAKER_LIP_FROM, 1.0, amp));
 }}
 
-// Its rate of change with the phase.
 fn breaker_profile_slope(phase: f32, amp: f32) -> f32 {{
     let s = phase - round(phase);
     let b = s / BREAKER_BACK;
@@ -981,9 +767,6 @@ fn breaker_profile_slope(phase: f32, amp: f32) -> f32 {{
     return select(-2.0 * s / (f * f) * exp(-(s * s) / (f * f)), -b / BREAKER_BACK * exp(-b), s > 0.0);
 }}
 
-// THE SWELL at a world xz and time: its height, per metre of `air.y`, and its
-// slope along x and z.
-// Written out wave by wave: a loop over a local array spills on Adreno.
 fn swell_wave(w: vec4<f32>, xz: vec2<f32>, t: f32, offset: f32) -> vec3<f32> {{
     let along = water.air.zw;
     let k = along * w.x + vec2<f32>(-along.y, along.x) * w.y;
@@ -1019,22 +802,12 @@ fn swell_at(xz: vec2<f32>, t: f32) -> vec3<f32> {{
     )
 }
 
-/// A WGSL function `name(pos, depth, eye, t) -> vec3<f32>`: where the water
-/// draws the still-surface point `pos`, `depth` metres above the ground, at
-/// time `t` (`WaterMat.tiles.w`'s clock), seen from `eye` in the world --
-/// moved by the long waves in the texture `disp` and by the shore's swash.
-///
-/// One function per texture rather than a texture argument: nothing else in
-/// the renderer passes a texture to a function, and the headset's shader
-/// compiler is where a failure would be silent.
 pub fn surface_fn_wgsl(name: &str, disp: &str) -> String {
     format!(
         r#"
 fn {name}(pos: vec3<f32>, depth: f32, eye: vec3<f32>, t: f32) -> vec3<f32> {{
     var p = pos;
-    // THE LONG WAVES MOVE THE SURFACE, near the eye, and die away into the
-    // shallows. The two longer cascades: the third's are a hand's width,
-    // which the normals carry.
+
     let reach = water.waves.z;
     let near = select(0.0, 1.0 - smoothstep(reach * 0.6, reach, distance(pos.xz, eye.xz)), reach > 0.0);
     let open = near * smoothstep(0.0, 1.2, depth);
@@ -1053,7 +826,7 @@ fn {name}(pos: vec3<f32>, depth: f32, eye: vec3<f32>, t: f32) -> vec3<f32> {{
     if (water.air.y > 0.0) {{
         p.y = p.y + water.air.y * swell_at(pos.xz, t).x * near * smoothstep(0.15, 0.6, depth);
     }}
-    // THE HORIZON: a sea's far skirt raised to the eye's height (`HORIZON_LIFT`).
+
     let far = distance(pos.xz, eye.xz);
     p.y = mix(p.y, max(p.y, eye.y), smoothstep({lift0}, {lift1}, far));
     return p;
@@ -1064,10 +837,6 @@ fn {name}(pos: vec3<f32>, depth: f32, eye: vec3<f32>, t: f32) -> vec3<f32> {{
     )
 }
 
-/// The rings' loop (`RINGS`), left out of the RINGLESS twin: drawn while no
-/// splash's rings are spreading -- nearly always -- the water does not pay
-/// for code it skips, which on the headset cost about a millisecond at the
-/// shore (bench 2026-10-07_2155).
 const RING_BLOCK: &str = r#"    var ring_curve = vec3<f32>(0.0);
     if (water.rings[0].w > 0.0) {
         for (var i = 0; i < RINGS_N; i = i + 1) {
@@ -1080,14 +849,7 @@ const RING_BLOCK: &str = r#"    var ring_curve = vec3<f32>(0.0);
             let d = q - r.xy;
             let dist = max(length(d), 1e-4);
             let outward = d / dist;
-            // THE RING TRAIN (`effects::splash_rings`): here and now, the
-            // waves whose group speed brought them here -- k = g t^2 / 4 r^2,
-            // crests at phase g t^2 / 4 r -- as high as the disturbance's
-            // spectrum made them (k^3 exp(-k c) / r, damped as short waves
-            // are, 2 nu k^2 t): long waves lead, short ones follow, the crests run
-            // out through the train. Measured from the cavity's rim, where
-            // the disturbance is (`wv.z`, its radius): inside it are the
-            // dimple and the boil.
+
             let from_rim = max(dist - wv.z, 1e-4);
             let ph = wv.x * r.z * r.z / from_rim;
             let k = ph / from_rim;
@@ -1095,34 +857,21 @@ const RING_BLOCK: &str = r#"    var ring_curve = vec3<f32>(0.0);
             let steep = r.w * k * k * k * k * exp(-k * (wv.y + k * r.z * RING_FILM_DAMPING)) * min(from_rim / wv.z, 1.0) / dist;
             let s = sin(ph);
             tilt = tilt - outward * (steep * resolved * s);
-            // Its crests gather the sun on the bed under them, its troughs
-            // spread it: caustic rings, in clear water the rings' clearest
-            // sign.
+
             ring_curve = ring_curve - (k * steep * resolved * cos(ph)) * vec3<f32>(outward.x * outward.x, outward.y * outward.y, outward.x * outward.y);
-            // Too fine for the pixel, its slopes roughen the water instead:
-            // far off, a ring is a band of duller or sparklier water.
+
             ring_rough = ring_rough + 0.5 * steep * steep * (1.0 - resolved);
-            // Where it struck: the cavity's dimple while it is open, the boil
-            // after, and the foam it leaves, drawn out into arcs along the
-            // waves leaving through it as it dissolves (`pool.z`).
+
             let bowl = exp(-dist * dist * pool.y);
             tilt = tilt + d * (wv.w * bowl);
-            // (Its arcs along the leaving waves, `pool.z`, were cut
-            // 2026-10-14 to make room for the wake under the cache: 8.)
+
             ring_foam = ring_foam + pool.x * bowl;
 DROPS_FALLING_BACK        }
     }
 "#;
 
-/// THE DROPS FALLING BACK round a splash, each with its own small ring
-/// (`effects::SplashRings::drops`): drawn only by the RAINING twin, while a
-/// splash's drops are landing -- a second or so of each -- since its code
-/// (about 75 by the proxy) would take the ringed twin past the instruction
-/// cache for the whole of every ring's life (`ring_size_tests`).
 const DROPS_BLOCK: &str = r#"            // THE DROPS FALLING BACK round it, each making its own small ring
-            // where it lands: one drop at most a cell (`effects::DROP_CELLS`, so many a metre),
-            // at a place and a moment of its own in the band and the while
-            // they land over.
+
             let dr = water.ring_drops[i];
             if (dr.w > 0.0) {
                 let cells = floor(dr.w);
@@ -1141,68 +890,30 @@ const DROPS_BLOCK: &str = r#"            // THE DROPS FALLING BACK round it, eac
             }
 "#;
 
-/// A SPLASH'S FOAM over the water (the ringed twin only): not the lace a
-/// whitecap leaves -- the brightest bubble walls, a hard net -- but a soft
-/// patch, white right across where there is a lot of it and broken into
-/// clumps where there is less: the foam's own texture read finer
-/// (`RING_FOAM_TILES` of it a metre) and nearly two mips coarse, so its
-/// bubbles' walls are blurred into their cells and no line of it is left,
-/// and the clumps it breaks into are a few centimetres across. (Read round
-/// the splash by angle, to draw the clumps out along the rings, it pinched
-/// into spokes at the middle; the rings' own waves draw the foam into arcs
-/// instead, in `RING_BLOCK`.) Several splashes' foam together is no whiter
-/// than one's.
 const RING_COVER: &str = r#"    let ring_grain = textureSampleBias(foam_tex, wave_samp, q * RING_FOAM_TILES, 1.7).r;
     cover = max(cover, clamp(min(ring_foam, 1.2) * (0.75 + RING_FOAM_CONTRAST * (ring_grain - RING_FOAM_MEAN)) - 0.2, 0.0, 1.0));
 "#;
 
-/// ONE DROP'S RING, falling back from a splash (`RING_BLOCK`): a drop a few
-/// millimetres across leaves capillary ripples about 1.5 cm long, running
-/// out at about 0.3 m/s and gone in a few tenths of a second -- sooner where
-/// its cell is small (the fade is a rate per cell a metre), so it never
-/// reaches its cell's edge; how steep they start -- a drop's crater and the
-/// first ripple round it are steep (0.25 was not seen on the pond from
-/// 1.2 m offline, 0.6 and 1.5 barely; 3.0 drew them plainly, small rings
-/// catching the light: `docs/splash-realism-2026-10-14/drop_rings_close_*`) -- and the train's
-/// width (`1 / 2 sigma^2`, sigma 8 mm).
 const DROP_RING_SPEED: f32 = 0.3;
 const DROP_RING_FADE: f32 = 1.4;
 const DROP_RING_WIDTH: f32 = 7800.0;
 const DROP_RING_K: f32 = 420.0;
 const DROP_RING_SLOPE: f32 = 3.0;
 
-/// How many times a metre the foam texture repeats under a splash's foam,
-/// and how hard it is broken about its mean. (1.9 and 3.0 until 2026-10-14:
-/// within a metre and a half the cells were 5 cm leopard spots with black
-/// water between -- the user's 'lace' -- so finer and softer: bubbles in
-/// clumps a centimetre or two across.)
 const RING_FOAM_TILES: f32 = 4.0;
-/// The blurred foam texture's mean, and how hard a splash's foam is broken
-/// about it.
+
 const RING_FOAM_MEAN: f32 = 0.35;
 const RING_FOAM_CONTRAST: f32 = 1.6;
-
 
 fn water_wgsl(dual: bool) -> String {
     water_wgsl_with(dual, true)
 }
 
-/// THE WATERLINE TWIN's shader: the water's, its rings and all, with one test
-/// before it returns -- whether the pixel's view starts under the surface
-/// where it crosses the near plane, by the same surface and in the same steps
-/// as `underwater`'s veil (`uw_surface_y`). The two then split the view along
-/// one line. Tested against the drawn triangles instead, the two disagreed by
-/// a few millimetres at the near plane -- the grid's flat triangles against
-/// the waves' own surface -- and a band under the line showed the water's top
-/// over an already fogged bed (offline, 2026-10-08).
 const WATER_LINE_VIEW: &str = "    let t_view = exp(-k * path);";
 const WATER_LINE_RISING: &str = "    let t_view = select(exp(-k * path), vec3<f32>(0.0), down.y > 0.0);";
 
 fn water_line_wgsl(dual: bool) -> String {
     const TEST: &str = r#"
-// Whether the view through this pixel starts under the surface: see
-// `water_line_wgsl`. The surface across the near plane as a plane through
-// its height at the eye, as `underwater`'s `uw_line_plane` finds it.
 fn water_line_y(xz: vec2<f32>, eye: vec3<f32>) -> f32 {
     let surface = water.extinction.w;
     var depth = 30.0;
@@ -1225,22 +936,17 @@ fn water_line_under(player: vec3<f32>) -> bool {
     let plane = vec3<f32>(h0, (hx - h0) * 10.0, (hz - h0) * 10.0);
     return plane.x + dot(start.xz - eye.xz, plane.yz) - start.y > 0.0;
 }
-
 "#;
     let src = water_wgsl_with(dual, true);
     assert_eq!(src.matches("@fragment fn fs_main").count(), 1);
     assert_eq!(src.matches("    return FsOut(").count(), 1);
     assert_eq!(src.matches(WATER_LINE_VIEW).count(), 1);
-    // And a view that RISES into the water -- from the air in a trough into
-    // the face of the wave ahead, which only an eye inside the waves' height
-    // has -- meets nothing drawn behind it, and showed the clear colour
-    // through the surface: it sees the water's own light alone.
+
     src.replacen("@fragment fn fs_main", &format!("{TEST}@fragment fn fs_main"), 1)
         .replacen(WATER_LINE_VIEW, WATER_LINE_RISING, 1)
         .replacen("    return FsOut(", "    if (water_line_under(in.world_pos)) {\n        discard;\n    }\n    return FsOut(", 1)
 }
 
-/// The water's shader with the drops falling back as well (`DROPS_BLOCK`).
 fn water_wgsl_raining(dual: bool) -> String {
     water_wgsl_parts(dual, true, true)
 }
@@ -1280,7 +986,7 @@ fn water_wgsl_parts(dual: bool, rings: bool, drops: bool) -> String {
     let ret = if dual {
         "return FsOut(vec4<f32>(tonemap(colour) + beyond, 1.0), vec4<f32>(through, 1.0));"
     } else {
-        // One alpha for every channel: the bed greys rather than tinting.
+
         "return FsOut(vec4<f32>(tonemap(colour) + beyond, 1.0 - dot(through, vec3<f32>(1.0 / 3.0))));"
     };
     format!(
@@ -1292,30 +998,37 @@ const WATER_MIPS: i32 = {mips};
 const WAVE_N: f32 = {wave_n};
 const LIGHT_PATH: f32 = {light_path};
 const IOR_WATER: f32 = 1.333;
-// A view that never meets the floor -- over a drop it cannot follow -- is
-// taken to cross this many times the water a flat bed would have put in its
-// way: enough that nothing shows through.
+
 const OPEN_PATH: f32 = 12.0;
-// The eye's straight line walked to the bed drawn behind a pixel: its first
-// step, how much longer each is than the last, and how many -- in lengths of
-// the line's way to a flat bed at this depth.
+
 const WALK_FIRST: f32 = 0.6;
 const WALK_GROWTH: f32 = 1.55;
 const WALK_STEPS: i32 = 6;
-// How deep under the ground the walk may find the line, in metres, and still
-// call its rising clear past it a lip: from all of it to none. The samples
-// of a pixel lie millimetres apart (centimetres at 100 m); a line a quarter
-// metre in is no grazing one. A straight ramp from 0.25 m (all of it) to 0.75
-// m (none): 2 a metre.
-const LIP_BURIED: f32 = 0.75;
-const LIP_RAMP: f32 = 2.0;
-// How steeply the sea floor falls away past the ground map's edge.
+const LIP_BURIED: f32 = {lip_buried};
+const LIP_RAMP: f32 = {lip_ramp};
+const MUD_FLATTEN: f32 = 0.9;
+const MUD_GRAIN_TILES: f32 = 2.5;
+const MUD_GRAIN_TILT: f32 = 0.15;
+const MUD_GRAIN_SHADE: f32 = 0.6;
+const MUD_ROUGH: f32 = 0.35;
+const MUD_SKY_SHARE: f32 = 0.5;
+const MUD_PRINT_STEP: f32 = 1.0;
+const MUD_PRINT_TILT: f32 = 0.6;
+const MUD_PRINT_DARK: f32 = 0.7;
+const MUD_PRINT_RIM: f32 = 0.9;
+const MUD_WET_GLOSS: f32 = 0.9;
+const MUD_POOL_GLOSS: f32 = 0.9;
+const MUD_SLUSH_RIPPLE: f32 = 0.8;
+const MUD_WET_DARK: f32 = 0.35;
+const MUD_POOL_FROM: f32 = 0.05;
+const MUD_POOL_TO: f32 = 0.12;
+
+
 const SHELF_SLOPE: f32 = 0.15;
 const FOAM_TILES: f32 = {foam_tiles};
 const BED_ALBEDO: f32 = {bed_albedo};
 const WATER_TRACE_COARSEN: i32 = 2;
-// Under this share of the bed's light reaching the eye, the bed is not looked
-// for: half an 8-bit level of the brightest the display shows.
+
 const DEEP_SKIP: f32 = {deep_skip:?};
 const CAUSTIC_CONTRAST: f32 = 0.6;
 const CAUSTIC_MURK: f32 = 1.0;
@@ -1328,6 +1041,7 @@ const PAWS_RATE: vec2<f32> = vec2<f32>(0.1308997, 0.0785398);
 @group(1) @binding(4) var foam_tex: texture_2d<f32>;
 @group(1) @binding(5) var wave_samp: sampler;
 @group(1) @binding(6) var wake_tex: texture_2d<f32>;
+@group(1) @binding(7) var mud_tex: texture_2d<f32>;
 
 struct VIn {{
     @location(0) pos: vec3<f32>,
@@ -1335,16 +1049,13 @@ struct VIn {{
 }}
 struct VOut {{
     @builtin(position) clip: vec4<f32>,
-    // The surface point in the PLAYER's frame, for the eye and the lights.
+
     @location(0) world_pos: vec3<f32>,
-    // Metres from the still surface down to the ground, at the vertex.
+
     @location(1) depth: f32,
-    // The same point in the WORLD, waves and all: what the bed and the
-    // reflection are found from.
+
     @location(2) tex_pos: vec3<f32>,
-    // Where on the still surface the point started, world x/z: the waves' own
-    // coordinates. Sampled where it moved to, a crest would read the slope of
-    // the water it was pushed over.
+
     @location(3) rest: vec2<f32>,
 }}
 
@@ -1354,8 +1065,7 @@ struct VOut {{
     let p = water_surface(v.pos, v.depth, to_world_space(cam_pos()), water.tiles.w);
     let player = to_player_space(p);
     out.clip = cam_view_proj() * vec4<f32>(player, 1.0);
-    // THE HORIZON. A sea's skirt runs on past the far plane; held just inside
-    // it, the water meets the sky instead of stopping a sliver short of it.
+
     if (out.clip.w > 0.0) {{
         out.clip.z = min(out.clip.z, out.clip.w * 0.999999);
     }}
@@ -1366,8 +1076,6 @@ struct VOut {{
     return out;
 }}
 
-// THE BED at a point: xyz the light it sends back, w its height. The ground
-// map's, and past its edge the edge's own, running on down at `SHELF_SLOPE`.
 fn bed_at(at: vec3<f32>) -> vec4<f32> {{
     let uv = ground_uv(at);
     let half_texel = 0.5 / vec2<f32>(textureDimensions(ground_map));
@@ -1376,8 +1084,6 @@ fn bed_at(at: vec3<f32>) -> vec4<f32> {{
     return vec4<f32>(g.rgb, g.a - SHELF_SLOPE * length((uv - edge) / camera.ground_params.zw));
 }}
 
-// The slope variance a level of the wave textures has averaged away, between
-// levels as the filtering blends them.
 fn water_lost(lod: f32) -> vec4<f32> {{
     let l = clamp(lod, 0.0, f32(WATER_MIPS - 1));
     let i = i32(floor(l));
@@ -1385,7 +1091,6 @@ fn water_lost(lod: f32) -> vec4<f32> {{
     return mix(water.lost[i], water.lost[j], l - f32(i));
 }}
 
-// GGX, its Smith visibility and Schlick's Fresnel for water, times n.l.
 fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let nl = max(dot(n, l), 0.0);
     let h = normalize(l + v);
@@ -1401,33 +1106,24 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
 {output}
 
 @fragment fn fs_main(in: VOut) -> FsOut {{
-    // The waves' coordinates, and how many metres of them a pixel spans:
-    // taken first, while every fragment of the quad is still running.
+
     let q = in.rest;
     let span = max(length(dpdx(q)), length(dpdy(q)));
     let s0 = textureSample(wave_slope, wave_samp, q / water.tiles.x, 0);
     let s1 = textureSample(wave_slope, wave_samp, q / water.tiles.y, 1);
-    // CAT'S PAWS: the wind never blows evenly over water. Gusts roughen
-    // drifting patches of it while the lulls between lie glassy, and the
-    // ripples (the third cascade, and the ones too short for any) come and go
-    // with them -- the look of a real pond or bay, where an even field of
-    // ripples everywhere read as busy. Rates whole turns in the waves' loop.
+
     let lull = sin(dot(q, vec2<f32>(0.47, 0.31)) + water.tiles.w * PAWS_RATE.x + 1.6 * sin(dot(q, vec2<f32>(-0.27, 0.58)) - water.tiles.w * PAWS_RATE.y));
     let paws = mix(water.air.x, 1.0, smoothstep(-0.6, 0.7, lull));
     let s2 = textureSample(wave_slope, wave_samp, q / water.tiles.z, 2) * paws;
     let c0 = textureSample(wave_curve, wave_samp, q / water.tiles.x, 0);
     let c1 = textureSample(wave_curve, wave_samp, q / water.tiles.y, 1);
-    // The third cascade's curvature two levels coarse: its waves of 15-29 cm
-    // net the bed as a beach's caustics do; the finger-width ripples under
-    // that only made a crawling speckle (`curve` below).
+
     let c2 = textureSampleBias(wave_curve, wave_samp, q / water.tiles.z, 2, 2.0) * paws;
     let bubbles = textureSample(foam_tex, wave_samp, q * FOAM_TILES).r;
 
     let p = in.tex_pos;
     let surface = water.extinction.w;
-    // THE BED under this pixel, from the ground map -- the shore is as fine
-    // as the map, not the grid -- and on past its edge (`bed_at`); from the
-    // vertices where there is no map.
+
     let has_map = camera.sky_params.w > 0.5;
     let uv = ground_uv(p);
     let on_map = has_map && all(uv > vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0));
@@ -1435,18 +1131,11 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let still_depth = surface - bed;
     let thickness = max(p.y - bed, 0.0);
 
-    // THE SURFACE'S SLOPE, all three cascades. The long waves die away into
-    // the shallows as they break; the ripples stay. Tessendorf's sideways
-    // push sharpens the crests: the slope over the push's own stretch.
     let shoal = smoothstep(0.0, 1.2, still_depth);
     let slope = (s0.xy + s1.xy) * shoal + s2.xy;
     let push = vec2<f32>(1.0) + (s0.zw + s1.zw) * shoal + s2.zw;
     var tilt = slope / max(push, vec2<f32>(0.25));
-    // THE BREAKER'S FACE, here rather than from the vertices: the grid is
-    // most of a metre, the steep face less. Its slope is the profile's along
-    // the phase, times how fast the phase changes across the ground -- taken
-    // over half a metre of the bed map, which is smooth where the grid's own
-    // depth would crease at every triangle.
+
     if (water.air.y > 0.0) {{
         tilt = tilt + water.air.y * smoothstep(0.15, 0.6, still_depth) * swell_at(q, water.tiles.w).yz;
     }}
@@ -1464,45 +1153,54 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         let breaker_size = breaker_amp(q, water.tiles.w, breaker_count);
         tilt = tilt + breaker_height(still_depth, breaker_size) * breaker_profile_slope(breaker_phase, breaker_size) * across;
     }}
-    // THE WAKE round the player (`water_wake`): the water hands, legs and
-    // floating things push aside as they move -- bow, V and trailing
-    // ripples -- its slope and its curvature for the caustics. Only on the
-    // grid (the sampler repeats; its edge is a still sponge, so the cut does
-    // not show), nothing while it rests.
+
     let wake_uv = (q - water.wake.xy) * water.wake.z;
     let wake = textureSample(wake_tex, wave_samp, wake_uv);
     let wake_in = select(0.0, water.wake.w, all(abs(wake_uv - vec2<f32>(0.5)) < vec2<f32>(0.47)));
     tilt = tilt + wake.xy * wake_in;
-    // SPLASHES' RINGS, and the foam each leaves where it struck. A ring's
-    // train is gone where a pixel spans half its wavelength: further off it
-    // would only alias.
+
     var ring_foam = 0.0;
     var ring_rough = 0.0;
-{ring_block}    let n = normalize(to_player_direction(vec3<f32>(-tilt.x, 1.0, -tilt.y)));
-    // ROUGHNESS: every wave the filtering averaged away at this pixel's span,
-    // and the ripples too short for any cascade. Slope variance is GGX's
-    // alpha squared.
+{ring_block}    let mud = water.look.y * (1.0 - smoothstep(MUD_POOL_FROM, MUD_POOL_TO, thickness));
+    let grain = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES).r - 0.5;
+    let grain_b = textureSample(foam_tex, wave_samp, q * MUD_GRAIN_TILES * 0.37 + vec2<f32>(0.5)).r - 0.5;
+    let wave_tilt = tilt;
+    var print = vec2<f32>(128.0 / 255.0, 0.0);
+    var print_rim = 0.0;
+    var print_tilt = vec2<f32>(0.0);
+    let print_uv = (q - water.prints.xy) * water.prints.zw;
+    if (water.prints.z > 0.0 && all(print_uv > vec2<f32>(0.0)) && all(print_uv < vec2<f32>(1.0))) {{
+        print = textureSampleLevel(mud_tex, wave_samp, print_uv, 0.0).rg;
+        let e = water.prints.zw * MUD_PRINT_STEP;
+        let dx = textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(e.x, 0.0), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(e.x, 0.0), 0.0).r;
+        let dz = textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(0.0, e.y), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(0.0, e.y), 0.0).r;
+        print_tilt = -vec2<f32>(dx, dz);
+        print_rim = smoothstep(0.05, 0.5, length(vec2<f32>(dx, dz))) * max(print.x - 128.0 / 255.0, 0.0) * 2.0;
+    }}
+    let sunk_p = max(128.0 / 255.0 - print.x, 0.0) * 2.0;
+    let fresh = print.y * mud;
+    let pool = sunk_p * mud;
+    let wet = max(fresh * MUD_WET_GLOSS, pool * MUD_POOL_GLOSS);
+    let wet_gloss = mix(water.look.x, 1.0, wet);
+    tilt = wave_tilt * (1.0 - MUD_FLATTEN * mud * (1.0 - wet * MUD_SLUSH_RIPPLE)) + vec2<f32>(grain, grain_b) * MUD_GRAIN_TILT * mud * (1.0 - wet) + print_tilt * MUD_PRINT_TILT * mud;
+    let n = normalize(to_player_direction(vec3<f32>(-tilt.x, 1.0, -tilt.y)));
+
     let lost0 = water_lost(log2(max(span * WAVE_N / water.tiles.x, 1e-6))).x;
     let lost1 = water_lost(log2(max(span * WAVE_N / water.tiles.y, 1e-6))).y;
     let lost2 = water_lost(log2(max(span * WAVE_N / water.tiles.z, 1e-6))).z;
-    let a2 = clamp((lost0 + lost1) * shoal * shoal + (lost2 + water.waves.x) * paws * paws + ring_rough, 4e-4, 1.0);
+    let a2 = clamp(max((lost0 + lost1) * shoal * shoal + (lost2 + water.waves.x) * paws * paws + ring_rough, MUD_ROUGH * mud), 4e-4, 1.0);
     let rough = sqrt(sqrt(a2));
 
     let v = normalize(cam_pos() - in.world_pos);
     let fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
 
-    // WHAT IT MIRRORS: the ground, the buildings and the sky, as every
-    // outdoor reflection sees them. A ray the waves tilt below the horizon is
-    // held just above it.
     var r = reflect(-v, n);
     r.y = max(r.y, 0.002);
     r = normalize(r);
     ground_trace_coarsen = WATER_TRACE_COARSEN;
     let env = outdoor_radiance(p, normalize(to_world_direction(r)), r, rough, clamp(rough * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD));
+    let env_seen = env * wet_gloss * select(1.0, 1.0 / WATER_PI, camera.sky_params.y < 0.5);
 
-    // THE SUN'S GLINT, and the lights the game adds as it runs -- the torch.
-    // A level's own lamps are in its bake; what they shed on water is left to
-    // the reflections.
     var glint = vec3<f32>(0.0);
     var sunlight = vec3<f32>(0.0);
     for (var i = 0u; i < lights.count.x; i = i + 1u) {{
@@ -1531,16 +1229,6 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         sunlight = sunlight + radiance * max(to_l.y, 0.0);
     }}
 
-    // THE VIEW'S WAY THROUGH THE WATER to the bed: REFRACTED at the surface,
-    // the way the bed's light really comes -- however low the eye looks, down
-    // within 49 degrees of straight down, so it crosses about as much water
-    // as the depth there and the colour follows the depth's contours. Along
-    // the eye's STRAIGHT line instead (the line the bed behind this pixel was
-    // drawn along), a view skimming a floor that falls away stopped meeting it
-    // all at once, and the water broke from turquoise to navy in one pixel.
-    // Bent by the still surface, not the ripples: theirs would make the
-    // colour crawl. Met where a flat bed would have been, then along the line
-    // through the gap the floor's fall there leaves.
     let down = normalize(to_world_direction(-v));
     let cos_i = max(-down.y, 0.0);
     let sin_t = sqrt(max(1.0 - cos_i * cos_i, 0.0)) / IOR_WATER;
@@ -1555,26 +1243,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         path = select(first * OPEN_PATH, first * thickness / max(closing, 1e-4), closing * OPEN_PATH > thickness);
     }}
     let bed_depth = max(surface - p.y + cos_t * path, 0.0);
-    // HOW MUCH OF THE BED IS THE ONE DRAWN BEHIND THIS PIXEL, for the blend to
-    // show through, and how much the ground map's picture of it, lit here
-    // (`beyond`). The drawn one where the eye's straight line -- walked over
-    // the map in lengthening steps -- meets the ground squarely, on the map.
-    // At a LIP -- the line skimming a floor that falls away, or meeting the
-    // near face of a ridge and rising clear of the floor again past it -- the
-    // samples of the pixel just above the line pass over to nothing drawn at
-    // all, and the blend showed whatever the eye image was cleared to: a
-    // dotted line along the floor's horizon. Near the map's edge the same,
-    // and past it nothing is drawn -- the terrain stops a few metres inside
-    // the map, so the hand-over starts 6 m in (from 2 m, a dotted line of the
-    // clear colour ran across the sea along the edge, 2026-10-07). All of
-    // them hand over to the map's picture, which the drawn bed only adds its
-    // grain to.
-    // What reaches the eye from the bed at most -- the water's loss down to
-    // it and back -- read here, before the walk: where it is under half an
-    // 8-bit level, neither the drawn bed nor the map's picture of it can
-    // show, and the walk and the picture are skipped (`DEEP_SKIP`; 2026-10-08,
-    // the walk was 1.2 ms of the beach's water and most of the sea in view is
-    // that deep).
+
     let k = water.extinction.xyz;
     let t_view = exp(-k * path);
     let t_light = exp(-k * (bed_depth * LIGHT_PATH));
@@ -1601,8 +1270,6 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
             if (met) {{
                 clears = max(clears, next_gap);
             }}
-            // Every gap before the meet is above the ground, so the deepest
-            // is the same read unconditionally.
             buried = min(buried, next_gap);
             walked = t;
             gap = next_gap;
@@ -1610,33 +1277,18 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         }}
         let seen_uv = ground_uv(p + down * seen);
         let from_edge = min(min(seen_uv.x, 1.0 - seen_uv.x) / camera.ground_params.z, min(seen_uv.y, 1.0 - seen_uv.y) / camera.ground_params.w);
-        // A LIP only where the line GRAZED the ground before rising clear of
-        // it: buried deeper than `LIP_BURIED`, the line went into a wall or
-        // a headland and out the far side under the water beyond, and the
-        // samples just above it are buried too -- the drawn face is what
-        // they show. Read as a lip, the foot of every narrow sea cliff
-        // handed over to the map's top-down picture, which smeared the
-        // cliff and the slope above it through the waves (headset,
-        // 2026-10-15, "a distorted reflection of the land").
         let lip = smoothstep(0.0, 0.5, clears) * saturate((LIP_BURIED + buried) * LIP_RAMP);
-        drawn = (1.0 - lip) * (1.0 - smoothstep(2.0, 4.0, seen / max(flat, 1e-4))) * smoothstep(3.0, 6.0, from_edge);
+        let map_span = min(1.0 / max(camera.ground_params.z, 1e-6), 1.0 / max(camera.ground_params.w, 1e-6));
+        let rim_in = min(3.0, 0.1 * map_span);
+        let rim_out = min(6.0, 0.2 * map_span);
+        drawn = (1.0 - lip) * (1.0 - smoothstep(2.0, 4.0, seen / max(flat, 1e-4))) * smoothstep(rim_in, rim_out, from_edge);
     }}
-    // Each colour of light is lost at its own rate, red first, on the light's
-    // way down to the bed and the view's way back. What the water scatters
-    // back is its own colour, lit by the sky and the sun.
-    let sky_down = sky_irradiance(vec3<f32>(0.0, 1.0, 0.0));
-    let body = water.scatter.rgb * (sky_down + sunlight) * (vec3<f32>(1.0) - t_view);
 
-    // CAUSTICS: the waves gather the sun's light on the bed under their
-    // troughs and spread it under their crests -- the refracted rays' spread,
-    // from the surface's curvature, at this depth. Blurred away in deep water.
-    // Only waves long enough to focus at a beach's depths pattern the bed:
-    // ripples a finger wide focus within centimetres, and deeper their
-    // overlapping folds and the sun's half-degree disc even their light out.
-    // Gathered from them too, the bed was a dense crawling speckle in every
-    // shallow (headset, 2026-10-07); the third cascade is read two levels
-    // coarse (`c2`). And a net finer than a few pixels only crawls: each
-    // cascade fades as a pixel spans its cells.
+    let sky_down = sky_irradiance(vec3<f32>(0.0, 1.0, 0.0));
+    let print_shade = (1.0 - MUD_PRINT_DARK * sunk_p * mud) * (1.0 + MUD_PRINT_RIM * print_rim * mud) * (1.0 - MUD_WET_DARK * fresh);
+    let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud) * print_shade;
+    let body = water.scatter.rgb * silt * (sky_irradiance(n) * mix(1.0, MUD_SKY_SHARE, mud) + sunlight * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0)) * (vec3<f32>(1.0) - t_view);
+
     let fine = 0.5 * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N * 0.25 / water.tiles.z));
     let mid = max(shoal, 0.6) * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N / water.tiles.y));
     let curve = c0.xyz * (0.5 * shoal) + c1.xyz * mid + c2.xyz * fine + vec3<f32>(wake.zw * wake_in, 0.0){ring_curve};
@@ -1644,15 +1296,10 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let jx = 1.0 - focus * curve.x;
     let jz = 1.0 - focus * curve.y;
     let jxz = focus * curve.z;
-    // Smoothly capped where the surface focuses it: a hard cap drew flat
-    // plateaus with sharp rims where the long waves come to a focus.
+
     let det = jx * jz - jxz * jxz;
     let gather = inverseSqrt(det * det + 0.0625);
-    // Past the waves' first focus the bed is lit by several folds of the
-    // surface at once, so it never falls as dark between the bright lines as
-    // one fold's spread says: a real net is bright threads over sand lit
-    // nearly evenly (`CAUSTIC_CONTRAST`).
-    // Murky water scatters the light on its way down and blurs the net away.
+
     let murk = exp(-(water.extinction.x + water.extinction.y + water.extinction.z) * (1.0 / 3.0) * thickness * CAUSTIC_MURK);
     let caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, 5.0, thickness)));
     let sun_on_bed = BED_ALBEDO * sunlight * t_light;
@@ -1661,21 +1308,14 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let brighter = max(caustic - 1.0, 0.0) * sun_on_bed * t_view;
     let dimmer = 1.0 + min(caustic - 1.0, 0.0) * sun_share;
 
-    // FOAM: whitecaps where the waves fold (kept as they fade, in the wave
-    // field), and on a beach the breakers' white line rolling in, the wash's
-    // leading edge up the sand and a lace where the water thins out. A little
-    // foam is the brightest bubble walls; a lot fills the cells.
     let caps = max(c0.w, c1.w) * shoal;
     var surf = 0.0;
     if (water.waves.y > 0.0) {{
         let count = swash_count(still_depth, q, water.tiles.w);
         let phase = fract(count);
-        // A breaker does not break all along its length at once: patches of
-        // it, drifting.
+
         let patchy = 0.5 + 0.5 * sin(dot(q, vec2<f32>(0.41, 0.17)) + 1.3 * sin(dot(q, vec2<f32>(-0.23, 0.37)) + water.tiles.w * 0.0785398));
-        // WHITE WATER where the breaker has grown as high as the depth can
-        // hold: its crest spilling first, then, broken, its whole face and a
-        // trail of foam left behind it. Clear green face before that.
+
         let s = phase - round(phase);
         let amp = breaker_amp(q, water.tiles.w, count);
         let grown = BREAKER_PER_SWASH * water.waves.y * amp * (1.0 - smoothstep(1.2, 2.8, still_depth));
@@ -1687,7 +1327,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         let breaker = max(spilling, broken * max(face, 0.65 * trail)) * mix(0.3, 1.0, patchy);
         let wash = smoothstep(0.0, 0.04, phase) * (1.0 - smoothstep(0.08, 0.4, phase))
             * (1.0 - smoothstep(0.0, 0.25, thickness)) * (1.0 - smoothstep(0.0, 0.6, still_depth))
-            // a small wave's wash is a thin lace, not the big one's white band
+
             * smoothstep(0.1, 0.75, amp);
         surf = max(breaker, wash) + 0.18 * patchy * (1.0 - smoothstep(0.0, 0.2, thickness));
     }}
@@ -1695,17 +1335,13 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     var cover = clamp((bubbles - (1.0 - froth)) * 4.0, 0.0, 1.0) * smoothstep(0.0, 0.05, froth);
 {ring_cover}    let foam_light = 0.8 * (sky_irradiance(n) + sunlight);
 
-    // THE SHORELINE fades in over `shore_fade` of depth rather than ending
-    // in the line where the surface meets the ground. Foam keeps to the lip.
     let edge = smoothstep(0.0, water.scatter.w, thickness);
     let lip = smoothstep(0.0, 0.015, thickness);
-    let shade = (env * fresnel + glint + (body + brighter) * (1.0 - fresnel)) * edge;
-    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge);
+    let shade = (env_seen * fresnel + glint * wet_gloss + (body + brighter) * (1.0 - fresnel)) * edge;
+    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge) * print_shade;
     let froth_cover = cover * lip;
     let colour = mix(shade, foam_light, froth_cover);
-    // The map's picture of the bed where the view meets it, shown as the blend
-    // shows the drawn one: its light, as the display has it, through the
-    // water.
+
     var beyond = vec3<f32>(0.0);
     if (drawn < 1.0 && bed_shows) {{
         beyond = under * tonemap(bed_at(p + refracted * path).xyz) * ((1.0 - drawn) * (1.0 - froth_cover));
@@ -1721,6 +1357,8 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         light_path = format!("{LIGHT_PATH:?}"),
         foam_tiles = format!("{FOAM_TILES:?}"),
         bed_albedo = format!("{BED_ALBEDO:?}"),
+        lip_buried = format!("{:?}", spacesoup_graphics::ground::LIP_BURIED),
+        lip_ramp = format!("{:?}", spacesoup_graphics::ground::LIP_RAMP),
         ring_block = ring_block,
         ring_curve = if rings { " + ring_curve" } else { "" },
         ring_cover = ring_cover,
@@ -1742,8 +1380,6 @@ mod tests {
     use glam::Vec3;
     use wgpu::util::DeviceExt;
 
-    /// A device, asking for dual-source blending when `dual` -- `None` when
-    /// there is no GPU, or it cannot.
     fn gpu(dual: bool) -> Option<(Device, Queue)> {
         let instance = Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
@@ -1764,20 +1400,18 @@ mod tests {
         .ok()
     }
 
-    /// One frame of water over a flat-coloured bed.
     #[derive(Clone, Copy)]
     struct Case {
         dual: bool,
-        /// Metres of water over the bed.
+
         depth: f32,
         eye: Vec3,
-        /// Where the player stands. The vertices move with them, so the
-        /// screen is the same and only the patch of world under it changes.
+
         walked: Vec3,
         wind: f32,
-        /// The colour already in the buffer, 0..1: what lies under the water.
+
         bed: [f64; 3],
-        /// The sun's direction of travel, when there is one.
+
         sun: Option<Vec3>,
         shallow: [f32; 3],
         deep: [f32; 3],
@@ -1797,15 +1431,12 @@ mod tests {
         }
     }
 
-    /// Straight down onto the surface.
     const OVERHEAD: Vec3 = Vec3::new(0.0, 8.0, 0.5);
-    /// Almost along it, which is where Fresnel takes over.
+
     const GRAZING: Vec3 = Vec3::new(0.0, 0.05, 40.0);
-    /// Thirty degrees down onto it: where a wave's tilt moves the reflectance
-    /// most, and so what lies under the water shows its slopes.
+
     const DOWN_THE_SLOPE: Vec3 = Vec3::new(0.0, 3.0, 5.7);
 
-    /// Draw the water and read the centre pixel.
     fn render(c: &Case) -> Option<[u8; 4]> {
         let image = render_image(c)?;
         Some(image[(SIZE / 2 * SIZE + SIZE / 2) as usize])
@@ -1813,13 +1444,6 @@ mod tests {
 
     const SIZE: u32 = 8;
 
-    /// Draw the water and read every pixel, row by row.
-    ///
-    /// view_proj is identity, so a vertex posed into the player's frame IS
-    /// its clip position: the triangle covers the screen, at clip depth 0.5,
-    /// and its centre pixel is the world point (0, 0, 0.5) plus the walk.
-    /// The water is shaded as a still surface at y = 0 over a bed `depth`
-    /// below it -- from the vertices, as there is no ground map.
     fn render_image(c: &Case) -> Option<Vec<[u8; 4]>> {
         let (device, queue) = gpu(c.dual)?;
         let format = TextureFormat::Rgba8Unorm;
@@ -1841,8 +1465,7 @@ mod tests {
         });
         lights.upload(&queue, &sun.into_iter().collect::<Vec<_>>());
         let (_shadows, uniforms) = scene_uniforms(&device, &lights);
-        // The eye in the PLAYER's frame, as the headset gives it: it walks
-        // with them.
+
         uniforms.upload_scene(
             &queue,
             glam::Mat4::IDENTITY,
@@ -1864,10 +1487,10 @@ mod tests {
         let params = WaveParams { wind_speed: c.wind, fetch: 2000.0, ..Default::default() };
         let waves = WaveField::new(&device, &queue, params);
         let mut u = WaterUniform::new(
-            &WaterOptics { height: 0.0, shallow: c.shallow, deep: c.deep, depth_scale: 1.0, shore_fade: 0.25, swash: 0.0, swell: 0.0 },
+            &WaterOptics { height: 0.0, shallow: c.shallow, deep: c.deep, depth_scale: 1.0, shore_fade: 0.25, swash: 0.0, swell: 0.0, gloss: 1.0, mud: 0.0 },
             &params,
         );
-        u.waves[2] = 0.0; // the surface stays put: the pixel tests read the shading
+        u.waves[2] = 0.0;
         let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("water_test_uniform"),
             contents: bytemuck::bytes_of(&u),
@@ -1965,8 +1588,6 @@ mod tests {
         )
     }
 
-    /// How much of a white bed shows through, per channel: the pixel over
-    /// white less the pixel over black, so the water's own light cancels.
     fn shows_through(c: Case) -> Option<[i32; 3]> {
         let white = render(&Case { bed: [1.0; 3], ..c })?;
         let black = render(&Case { bed: [0.0; 3], ..c })?;
@@ -1977,7 +1598,6 @@ mod tests {
         c[0] + c[1] + c[2]
     }
 
-    /// Both blend paths, where the GPU has them.
     fn each_path(test: impl Fn(bool)) {
         for dual in [false, true] {
             if gpu(dual).is_none() {
@@ -1990,8 +1610,7 @@ mod tests {
 
     #[test]
     fn the_water_shader_compiles_and_draws() {
-        // WGSL is validated at PIPELINE CREATION, not at cargo build: a bad
-        // field accessor compiles clean and dies on the device.
+
         each_path(|dual| {
             let px = render(&Case { eye: GRAZING, ..case(dual) }).unwrap();
             assert!(px[0] as u32 + px[1] as u32 + px[2] as u32 > 0, "water drew nothing over a black bed ({dual}): {px:?}");
@@ -2000,8 +1619,7 @@ mod tests {
 
     #[test]
     fn deep_water_hides_the_bed() {
-        // The bed's light is lost on its way through: at 20 cm the sand is
-        // plain, at 8 m it is gone into the water's own colour.
+
         each_path(|dual| {
             let shallow = shows_through(Case { depth: 0.2, ..case(dual) }).unwrap();
             let deep = shows_through(Case { depth: 8.0, ..case(dual) }).unwrap();
@@ -2011,8 +1629,7 @@ mod tests {
 
     #[test]
     fn the_bed_takes_the_waters_colour_channel_by_channel() {
-        // What one alpha cannot do: red is lost first, so white sand under a
-        // metre of sea water goes blue-green rather than grey.
+
         let Some(through) = gpu(true).and_then(|_| shows_through(case(true))) else {
             eprintln!("skipping: no GPU with dual-source blending");
             return;
@@ -2025,7 +1642,7 @@ mod tests {
 
     #[test]
     fn a_grazing_view_shows_less_of_the_bed() {
-        // Fresnel: clear at your feet, a mirror at the far bank.
+
         each_path(|dual| {
             let down = shows_through(Case { depth: 0.3, ..case(dual) }).unwrap();
             let across = shows_through(Case { depth: 0.3, eye: GRAZING, ..case(dual) }).unwrap();
@@ -2035,9 +1652,7 @@ mod tests {
 
     #[test]
     fn the_shoreline_fades_out_rather_than_ending_in_a_line() {
-        // Water millimetres deep leaves the bed as it was: otherwise it meets
-        // the ground along a hard edge that flickers, being a geometric
-        // intersection sampled per pixel.
+
         each_path(|dual| {
             let brink = render(&Case { depth: 0.001, bed: [0.6; 3], ..case(dual) }).unwrap();
             let body = render(&Case { depth: 2.0, bed: [0.6; 3], ..case(dual) }).unwrap();
@@ -2049,11 +1664,7 @@ mod tests {
 
     #[test]
     fn the_waves_belong_to_the_world_not_the_player() {
-        // The level is drawn in the PLAYER's frame. Waves read from that frame
-        // would follow the player about. Here the player and the vertices walk
-        // together, so the screen is unchanged and only the patch of world
-        // under the pixel differs: world waves must change it, player-frame
-        // ones could not.
+
         each_path(|dual| {
             let c = Case { wind: 9.0, eye: DOWN_THE_SLOPE, bed: [1.0; 3], ..case(dual) };
             let here = render_image(&c).unwrap();
@@ -2064,8 +1675,7 @@ mod tests {
 
     #[test]
     fn waves_change_the_surface() {
-        // The wave field has to reach the shading: with it dropped this still
-        // draws, and reads as ice.
+
         each_path(|dual| {
             let c = Case { eye: DOWN_THE_SLOPE, bed: [1.0; 3], ..case(dual) };
             let calm = render_image(&c).unwrap();
@@ -2076,9 +1686,7 @@ mod tests {
 
     #[test]
     fn the_sun_glints_where_the_water_mirrors_it() {
-        // Looking straight down at still water, a sun overhead is mirrored
-        // into the eye; one low in the side is not. Deep, dark water, so the
-        // glint is what differs.
+
         each_path(|dual| {
             let c = Case { depth: 20.0, ..case(dual) };
             let mirrored = render(&Case { sun: Some(Vec3::NEG_Y), ..c }).unwrap();
@@ -2088,13 +1696,10 @@ mod tests {
         });
     }
 
-    /// The waterline twin is the water's own shader with one test added
-    /// before it returns: the surface drawn above the line is the surface
-    /// drawn everywhere else, and the ordinary pipelines carry none of it.
     #[test]
     fn the_breakers_come_in_sets_and_sections_and_loop_seamlessly() {
         let loop_s = crate::renderer::water_waves::WaveParams::default().loop_seconds;
-        // Seamless: a whole loop on, the same breaker everywhere.
+
         for x in [-20.0f32, 0.0, 13.0, 41.0] {
             let xz = glam::Vec2::new(x, 30.0);
             let a = (swash_count(17.0, 1.1, xz).rem_euclid(1.0), breaker_amp(17.0, xz, swash_count(17.0, 1.1, xz)));
@@ -2102,9 +1707,7 @@ mod tests {
             assert!((a.0 - b.0).abs() < 1e-3 || (a.0 - b.0).abs() > 0.999, "{a:?} {b:?}");
             assert!((a.1 - b.1).abs() < 2e-3, "{a:?} {b:?}");
         }
-        // Not one line: along 60 m of shore, at one moment, the crest's
-        // phase spreads by a good share of a period and its height by more
-        // than half.
+
         let (mut lo, mut hi, mut amp_lo, mut amp_hi) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
         for i in 0..61 {
             let xz = glam::Vec2::new(-30.0 + i as f32, 30.0);
@@ -2117,7 +1720,7 @@ mod tests {
         }
         assert!(hi - lo > 0.15, "the crest arrives together: {lo}..{hi}");
         assert!(amp_hi - amp_lo > 0.3, "the crest is one height: {amp_lo}..{amp_hi}");
-        // The shader's terms are the CPU's.
+
         let src = surface_wgsl();
         for i in 0..3 {
             assert!(src.contains(&along_wgsl(i)));
@@ -2141,10 +1744,6 @@ mod tests {
         }
     }
 
-    /// EVERY WATER TWIN -- ringless, ringed, raining, waterline and the three
-    /// planar-mirror twins -- validates, and writes no vertex output past
-    /// location 14: the Quest 3 stops there and a twin past it fails to build
-    /// on the headset only (2026-10-14).
     #[test]
     fn every_water_twin_validates_and_fits_the_quest_3s_inter_stage_limit() {
         const QUEST3_MAX_INTER_STAGE_LOCATIONS: u32 = 15;
@@ -2187,8 +1786,6 @@ mod tests {
         }
     }
 
-    /// The mirror twin reads the mirror image where the others march the
-    /// ground map, and nothing else changes.
     #[test]
     fn the_mirror_twin_reads_the_image_in_place_of_the_ground_map() {
         let plain = water_wgsl_with(false, true);
@@ -2207,16 +1804,12 @@ mod tests {
             let without = line
                 .replacen("    if (water_line_under(in.world_pos)) {\n        discard;\n    }\n", "", 1)
                 .replacen(WATER_LINE_RISING, WATER_LINE_VIEW, 1);
-            let start = without.find("\n// Whether the view through this pixel starts under").unwrap();
+            let start = without.find("\nfn water_line_y(").unwrap();
             let end = without.find("@fragment fn fs_main").unwrap();
             assert_eq!(format!("{}{}", &without[..start], &without[end..]), plain);
         }
     }
 
-    /// THE WET LINE on a beach: never below the still water's edge nor above
-    /// the highest a wave can run; it jumps up with a wave and creeps back
-    /// down after it; it is not level along the shore; it repeats with the
-    /// waves' loop; and a still lake has none.
     #[test]
     fn the_wet_line_follows_the_waves_up_and_creeps_back() {
         let swash = 0.22;
@@ -2227,12 +1820,12 @@ mod tests {
         assert!(samples.iter().all(|&l| l >= SHORE_BAND && l <= most + 1e-5), "outside {SHORE_BAND}..{most}");
         let (lo, hi) = samples.iter().fold((f32::MAX, f32::MIN), |(a, b), &l| (a.min(l), b.max(l)));
         assert!(hi - lo > 0.3 * swash, "the line hardly moves: {lo}..{hi}");
-        // It never sinks faster than it creeps (it only ever jumps UP).
+
         let fall = samples.windows(2).map(|p| p[0] - p[1]).fold(f32::MIN, f32::max);
         assert!(fall <= SHORE_CREEP * 0.1 * 1.5 + 2e-3, "the line dropped {fall} m in a tenth of a second");
         let rise = samples.windows(2).map(|p| p[1] - p[0]).fold(f32::MIN, f32::max);
         assert!(rise > 10.0 * SHORE_CREEP * 0.1, "no wave ever lifts it");
-        // Not level along the shore: sections 25-30 m long run bigger.
+
         let along: Vec<f32> = (0..40).map(|k| shore_wet_line(57.0, swash, glam::Vec2::new(k as f32 * 2.0, 31.0))).collect();
         let (a, b) = along.iter().fold((f32::MAX, f32::MIN), |(a, b), &l| (a.min(l), b.max(l)));
         assert!(b - a > 0.1 * swash, "level along 80 m of shore: {a}..{b}");
@@ -2243,11 +1836,20 @@ mod tests {
     }
 
     #[test]
+    fn the_water_lip_counts_only_where_the_line_grazed_the_ground() {
+        let src = water_wgsl(false);
+        assert!(src.contains("let lip = smoothstep(0.0, 0.5, clears) * saturate((LIP_BURIED + buried) * LIP_RAMP);"));
+        assert!(src.contains("buried = min(buried, next_gap);"));
+        assert!(src.contains(&format!("const LIP_BURIED: f32 = {:?};", spacesoup_graphics::ground::LIP_BURIED)));
+        assert!(src.contains(&format!("const LIP_RAMP: f32 = {:?};", spacesoup_graphics::ground::LIP_RAMP)));
+        assert!((spacesoup_graphics::ground::lip(1.0, -0.2) - 1.0).abs() < 1e-6);
+        assert_eq!(spacesoup_graphics::ground::lip(1.0, -1.0), 0.0);
+    }
+
+    #[test]
     fn white_seen_through_depth_scale_comes_out_shallow() {
-        // The authored colour is what a white bed looks like straight down
-        // through `depth_scale` metres: down and back up, as the shader takes
-        // the light's two paths.
-        let o = WaterOptics { height: 0.0, shallow: [0.3, 0.7, 0.75], deep: [0.0; 3], depth_scale: 2.0, shore_fade: 0.3, swash: 0.0, swell: 0.0 };
+
+        let o = WaterOptics { height: 0.0, shallow: [0.3, 0.7, 0.75], deep: [0.0; 3], depth_scale: 2.0, shore_fade: 0.3, swash: 0.0, swell: 0.0, gloss: 1.0, mud: 0.0 };
         let u = WaterUniform::new(&o, &WaveParams::default());
         for i in 0..3 {
             let seen = (-u.extinction[i] * o.depth_scale * (1.0 + LIGHT_PATH)).exp();
@@ -2256,26 +1858,11 @@ mod tests {
     }
 }
 
-// Scene shader sources, for `multiview::every_scene_shader_survives_the_multiview_transform`.
-// Test-only: the gate has to see exactly the text each pipeline is built from,
-// and nothing on a development machine can build a multiview pipeline to check.
 #[cfg(test)]
 pub fn water_shader_src() -> String {
     water_wgsl(false)
 }
 
-/// THE RINGS' CODE IS SMALL: what a splash's rings, foam, dimple and boil
-/// add to the water's shader, by the host's instruction proxy
-/// (`shader_inlining`), against the Quest's instruction cache (about 3,387
-/// instructions; the ringless water was 3,220 by PIPESTATS, 2026-10-12, at
-/// 2,305 by the proxy: 1.40 a proxy instruction). The ringed twin is drawn
-/// whenever a splash's rings are spreading -- seconds of each -- so it is
-/// held under the cache: 2,424 by the proxy at most. 2026-10-14: the
-/// dispersive train (k = g t^2 / 4 r^2, its spectrum, its damping) and its
-/// caustics take the rings to 96 over the ringless twin (75 before, with one
-/// wavelength and one speed a ring). The drops falling back (75 more) are
-/// in the RAINING twin only, drawn while drops land: that one is past the
-/// cache, for a second or so of each splash.
 #[cfg(test)]
 mod ring_size_tests {
     use super::*;
@@ -2294,9 +1881,6 @@ mod ring_size_tests {
         assert!(raining > ringed && raining - ringed <= 90, "the drops' rings: {} by the proxy", raining - ringed);
     }
 
-    /// What each part of the rings' loop costs by the proxy: the loop with
-    /// one part taken out at a time. `cargo test --release --lib
-    /// what_each_part_of_the_rings_costs -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn what_each_part_of_the_rings_costs() {
@@ -2334,7 +1918,6 @@ mod seen_tests {
     use crate::renderer::shadow::frustum_planes;
     use glam::{Mat4, Vec3};
 
-    /// An eye at the origin looking down -z, 90 degrees wide, out to 100 m.
     fn view() -> [glam::Vec4; 6] {
         frustum_planes(
             Mat4::perspective_rh_gl(90f32.to_radians(), 1.0, 0.1, 100.0)
@@ -2356,8 +1939,7 @@ mod seen_tests {
 
     #[test]
     fn water_past_the_far_plane_is_still_seen() {
-        // A lake two kilometres out, held inside the far plane as the sea's
-        // skirt is.
+
         assert!(water_seen(pond(Vec3::new(0.0, -1.0, -2000.0)), &[view()], None));
     }
 

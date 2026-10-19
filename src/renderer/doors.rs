@@ -1,59 +1,30 @@
-//! DOORS AS THE RENDERER SEES THEM: each leaf where it hangs this frame, and
-//! whether it seals its doorway.
-//!
-//! A door is never baked (`space_soup_engine::door`): the lightmaps, the lamp
-//! masks and the probe photographs hold the level with its doorways open. So
-//! the renderer adds what a door changes, live:
-//!
-//! - its SHADOWS: the leaf is a mesh drawn like any other model (lit by its
-//!   room's baked light and the lamps), drawn into the sun's moving-objects
-//!   map and the torch's spot slot as every model is, and -- the part a baked
-//!   level needs -- into a moving casters' tile for each lamp reaching it
-//!   (`shadow::moving_caster_tiles`), whose shadow takes away the light a
-//!   closed leaf stops: the spill of the lamps beyond it through its doorway,
-//!   narrowing to a wedge as it closes;
-//! - its CULLING: a shut doorway is a wall to `portal_cull`, so what lies
-//!   past it -- the outdoors seen through the next room -- is not drawn
-//!   (`shut_portals`).
-//!
-//! The app hands the doors over each frame (`XrRenderer::set_doors`), in the
-//! WORLD, as the server last placed them or as the local hand is pushing them.
-
 use glam::{Quat, Vec3};
 
 use crate::renderer::uniforms::{ProbePortal, ProbeProxy};
 
-/// One door leaf this frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DoorView {
-    /// The leaf's eight corners where it stands now, world.
+
     pub corners: [Vec3; 8],
-    /// The leaf's centre when closed, world: which doorway it hangs in.
+
     pub closed_centre: Vec3,
-    /// Within `space_soup_engine::door::SHUT_DEG` of closed.
+
     pub shut: bool,
-    /// The leaf's rotation now, and closed, world.
+
     pub rotation: Quat,
     pub closed_rotation: Quat,
 }
 
 impl DoorView {
-    /// The corners in the player's frame, where the shadow tiles are fitted:
-    /// `yaw_inv * (world - offset)`, as every bit of geometry is sent.
+
     pub fn corners_in(&self, offset: Vec3, yaw: f32) -> [Vec3; 8] {
         let yaw_inv = Quat::from_rotation_y(-yaw);
         self.corners.map(|c| yaw_inv * (c - offset))
     }
 }
 
-/// How far outside a doorway's box a leaf's closed centre may sit and still
-/// hang in it, metres: a leaf hung on the wall's face stands proud of a carve
-/// cut exactly through the wall.
 const IN_DOORWAY: f32 = 0.1;
 
-/// WHICH DOORWAYS ARE SHUT: `portals[i]` is shut when at least one door hangs
-/// in it and every door hanging in it is shut -- a double door with one leaf
-/// ajar is open. A doorway with no door is never shut.
 pub fn shut_portals(portals: &[ProbePortal], doors: &[DoorView]) -> Vec<bool> {
     portals
         .iter()
@@ -65,25 +36,13 @@ pub fn shut_portals(portals: &[ProbePortal], doors: &[DoorView]) -> Vec<bool> {
         .collect()
 }
 
-/// How far in front of a leaf's seen face it reads its room's light, metres:
-/// past the doorway's blend between the rooms either side (`room_light`
-/// ramps over about a quarter metre beyond a doorway's box, and the box holds
-/// the wall's thickness).
 pub const LIGHT_READ_OUT: f32 = 0.6;
 
-/// WHERE A LEAF READS ITS ROOM'S LIGHT. A model takes the baked light of the
-/// room it stands in (`room_light::room_light_at` at its centre); a shut leaf
-/// stands IN its doorway, where that light is the blend of the rooms either
-/// side -- so the face toward a dark room glowed with the bright one's light.
-/// The eye sees one face of a leaf (it is a board), so the leaf reads its
-/// light `LIGHT_READ_OUT` in front of the face toward `eye`: the room that
-/// face looks into. `centre` and `eye` are world; a centre no door stands at
-/// is returned as it is.
 pub fn light_point(doors: &[DoorView], centre: Vec3, eye: Vec3) -> Vec3 {
     let Some(d) = doors.iter().find(|d| (d.corners.iter().sum::<Vec3>() / 8.0 - centre).length() < 0.05) else {
         return centre;
     };
-    // The leaf's thin axis: the shortest of the three edges from a corner.
+
     let c = d.corners;
     let normal = [c[1] - c[0], c[2] - c[0], c[4] - c[0]]
         .into_iter()
@@ -94,22 +53,9 @@ pub fn light_point(doors: &[DoorView], centre: Vec3, eye: Vec3) -> Vec3 {
     centre + normal * (side * LIGHT_READ_OUT)
 }
 
-/// How far off a doorway's wall plane, and along it from a leaf's closed
-/// centre, a model stands IN the doorway (`doorway_light_point`), metres: the
-/// frames' and the lever's centres lie within a wall's half thickness of the
-/// plane and a leaf's width of a leaf.
 const DOORWAY_DEPTH: f32 = 0.3;
 const DOORWAY_REACH: f32 = 1.2;
 
-/// WHERE A MODEL STANDING IN A DOORWAY READS ITS ROOM'S LIGHT: a door's
-/// frame, its lever. At its centre -- the doorway's middle -- that light is
-/// the blend of the rooms either side, mostly the smaller's, so the marble
-/// hall's side of a frame took the hallway's light and drew as one flat
-/// olive slab (headset, 2026-10-14). The eye sees the face toward it, so the
-/// model reads `LIGHT_READ_OUT` into the room on the eye's side of the
-/// doorway, as a leaf does (`light_point`). The doorway's plane is a shut
-/// leaf's: its thin axis turned back to its closed pose. `centre` and `eye`
-/// are world; a centre in no doorway is returned as it is.
 pub fn doorway_light_point(doors: &[DoorView], centre: Vec3, eye: Vec3) -> Vec3 {
     for d in doors {
         let c = d.corners;
@@ -129,11 +75,6 @@ pub fn doorway_light_point(doors: &[DoorView], centre: Vec3, eye: Vec3) -> Vec3 
     centre
 }
 
-/// THE DOORS' REFLECTION PROXIES AS THE LEAVES HANG NOW: `rest` with each
-/// door's proxies (`space_soup_engine::reflection_proxy::door_proxies`, a
-/// model's box at the leaf's closed pose) turned about the hinge with their
-/// leaf. A proxy is a door's when its centre is the door's closed centre.
-/// Everything else is as it was.
 pub fn posed_proxies(rest: &[ProbeProxy], doors: &[DoorView]) -> Vec<ProbeProxy> {
     rest.iter()
         .map(|p| {
@@ -149,7 +90,6 @@ pub fn posed_proxies(rest: &[ProbeProxy], doors: &[DoorView]) -> Vec<ProbeProxy>
         .collect()
 }
 
-/// The doorways portal culling may walk through: every one but the shut.
 pub fn open_portals(portals: &[ProbePortal], shut: &[bool]) -> Vec<ProbePortal> {
     portals.iter().zip(shut.iter().chain(std::iter::repeat(&false))).filter(|(_, s)| !**s).map(|(p, _)| *p).collect()
 }
@@ -179,7 +119,7 @@ mod tests {
         assert_eq!(shut_portals(&p, &[leaf(-3.39, true), leaf(-2.61, true)]), vec![true]);
         assert_eq!(shut_portals(&p, &[leaf(-3.39, true), leaf(-2.61, false)]), vec![false], "one leaf ajar opens it");
         assert_eq!(shut_portals(&p, &[]), vec![false], "no door, no seal");
-        // A door elsewhere does not seal this doorway.
+
         let far = DoorView { closed_centre: Vec3::new(10.15, 1.1, -3.39), ..leaf(0.0, true) };
         assert_eq!(shut_portals(&p, &[far]), vec![false]);
         assert!(open_portals(&p, &[true]).is_empty());
@@ -192,12 +132,10 @@ mod tests {
         let c = d.corners_in(Vec3::new(1.0, 0.0, 0.0), std::f32::consts::FRAC_PI_2)[0];
         assert!((c - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-6);
         let c = d.corners_in(Vec3::ZERO, std::f32::consts::FRAC_PI_2)[0];
-        // A quarter turn of the rig: the world's +x lies along the player's +z.
+
         assert!((c - Vec3::new(0.0, 1.0, 1.0)).length() < 1e-5, "{c}");
     }
 
-    /// A shut leaf in a doorway across x = 2.85 reads its light in the room
-    /// on the eye's side, whichever side that is; anything else as it was.
     #[test]
     fn a_leaf_reads_the_light_of_the_room_its_seen_face_looks_into() {
         let centre = Vec3::new(2.85, 1.1, -3.39);
@@ -219,9 +157,6 @@ mod tests {
         assert_eq!(light_point(&d, elsewhere, Vec3::ZERO), elsewhere);
     }
 
-    /// A frame in the same doorway -- its centre the doorway's middle, half
-    /// a leaf from the leaf -- reads the room on the eye's side too, with the
-    /// leaf open or shut; a model off the doorway as it was.
     #[test]
     fn a_frame_in_a_doorway_reads_the_light_of_the_room_the_eye_is_in() {
         let centre = Vec3::new(2.85, 1.1, -3.39);
@@ -237,7 +172,7 @@ mod tests {
         let frame = Vec3::new(2.85, 1.1, -3.0);
         let hall_eye = Vec3::new(-1.0, 1.6, -3.0);
         let hallway_eye = Vec3::new(6.0, 1.6, -3.0);
-        // Open 60 degrees about the hinge at z -3.77: the leaf's thin axis turned.
+
         let turn = Quat::from_rotation_y(60f32.to_radians());
         let pin = Vec3::new(2.85, 0.0, -3.77);
         let open = shut.map(|p| pin + turn * (p - pin));
@@ -252,8 +187,6 @@ mod tests {
         }
     }
 
-    /// A door's proxy turns with its leaf about the hinge; anything else
-    /// stays put.
     #[test]
     fn a_doors_reflection_proxy_turns_with_its_leaf() {
         let closed = Vec3::new(2.85, 1.1, -3.39);
@@ -283,10 +216,6 @@ mod tests {
         assert_eq!(posed[1], pillar);
     }
 
-    /// PORTAL CULLING WITH A DOOR: from the hallway (closed) looking back
-    /// through its doorway, across the hall (closed) and out of a doorway in
-    /// the hall's far wall, the lawn beyond is drawn while the hallway's door
-    /// stands open, and nothing outside is drawn once both its leaves are shut.
     #[test]
     fn a_shut_door_hides_what_its_doorway_showed() {
         use crate::renderer::portal_cull::{outdoor_frusta, CullRoom};
@@ -302,8 +231,7 @@ mod tests {
             doorway(Vec3::new(-3.4, 0.0, -3.8), Vec3::new(-2.9, 2.2, -2.2), 0, 9, 0),
             doorway(Vec3::new(2.5, 0.0, -3.8), Vec3::new(3.1, 2.2, -2.2), 0, 0, 1),
         ];
-        // From the hallway, back through its doorway and across the hall to
-        // the lawn beyond the hall's west door, in line with it.
+
         let eye = Vec3::new(5.5, 1.6, -3.0);
         let at = Vec3::new(-10.0, 1.2, -3.0);
         let cam = Mat4::perspective_rh(1.8, 1.0, 0.05, 200.0) * Mat4::look_at_rh(eye, at, Vec3::Y);

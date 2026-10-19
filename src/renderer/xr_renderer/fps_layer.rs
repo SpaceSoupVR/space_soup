@@ -1,7 +1,3 @@
-//! The frame-rate readout's quad layer: its own small swapchain, written by
-//! upload when the numbers change and handed to the compositor beside the eye
-//! layer every frame while it is on. What it shows: `renderer::fps_hud`.
-
 use ash::vk::{self, Handle};
 use openxr as xr;
 
@@ -11,8 +7,7 @@ pub(super) struct FpsLayer {
     swapchain: xr::Swapchain<xr::Vulkan>,
     images: Vec<wgpu::Texture>,
     meter: fps_hud::FpsMeter,
-    /// Whether an image has been released yet: until then there is nothing
-    /// to submit.
+
     ready: bool,
 }
 
@@ -20,9 +15,7 @@ impl FpsLayer {
     pub(super) fn new(session: &xr::Session<xr::Vulkan>, device: &wgpu::Device) -> Result<Self, Box<dyn std::error::Error>> {
         let swapchain = session.create_swapchain(&xr::SwapchainCreateInfo {
             create_flags: xr::SwapchainCreateFlags::EMPTY,
-            // TRANSFER_DST: the picture is uploaded, not drawn. COLOR_ATTACHMENT:
-            // the image is handed back in the layout the runtime expects by an
-            // empty pass (see `update`). SAMPLED: the compositor reads it.
+
             usage_flags: xr::SwapchainUsageFlags::TRANSFER_DST
                 | xr::SwapchainUsageFlags::COLOR_ATTACHMENT
                 | xr::SwapchainUsageFlags::SAMPLED,
@@ -51,8 +44,6 @@ impl FpsLayer {
         Ok(Self { swapchain, images, meter: Default::default(), ready: false })
     }
 
-    /// One frame made; on the frame that closes a window, the picture is
-    /// redrawn into the next swapchain image.
     pub(super) fn frame(
         &mut self,
         device: &wgpu::Device,
@@ -73,9 +64,7 @@ impl FpsLayer {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(fps_hud::WIDTH_PX * 4), rows_per_image: None },
             wgpu::Extent3d { width: fps_hud::WIDTH_PX, height: fps_hud::HEIGHT_PX, depth_or_array_layers: 1 },
         );
-        // An EMPTY pass that keeps what the upload wrote: it leaves the image
-        // in COLOR_ATTACHMENT_OPTIMAL, the layout a colour swapchain image
-        // must be released in. The upload alone would leave TRANSFER_DST.
+
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fps_layer") });
         drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -94,8 +83,6 @@ impl FpsLayer {
         Ok(())
     }
 
-    /// The layer to submit after the eyes', in `view_space` (the head's), or
-    /// `None` before its first picture.
     pub(super) fn layer<'a>(&'a self, view_space: &'a xr::Space) -> Option<xr::CompositionLayerQuad<'a, xr::Vulkan>> {
         if !self.ready {
             return None;

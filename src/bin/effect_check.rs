@@ -1,16 +1,3 @@
-//! THE ENGINE'S EFFECT VALIDATOR, for the editor's backend
-//! (`scene_editor_web/effect_check.py`): the same `EffectAsset::check` and
-//! compiler a level load runs, answering in JSON
-//! (`space_soup::renderer::effects::authoring`).
-//!
-//! - `effect_check serve`: one JSON request a line on stdin, one JSON answer
-//!   a line on stdout, until stdin closes (`authoring::answer`: ops `check`,
-//!   `books`, `templates`, `limits`, `scene`, `ping`). The books' cutouts
-//!   are worked out once, at the first request that needs them.
-//! - `effect_check check <file.json>`: one asset's verdict; exit 1 if refused.
-//! - `effect_check books | templates | limits`: as `serve` answers them.
-//!
-//! Build: `cargo build --release --bin effect_check` in space_soup.
 use space_soup::renderer::effects::authoring;
 use std::io::{BufRead, Write};
 

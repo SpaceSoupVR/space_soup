@@ -1,29 +1,3 @@
-//! THE BUILT-IN TEMPLATES: fire, coals, smoke, embers, dust and a strike
-//! into water, each AS A STACK (`effect_asset::EffectAsset`) -- the same
-//! data an authored effect is, so the editor shows and checks them as it
-//! does a muzzle flash, and a scene's `kind` is shorthand for one.
-//!
-//! WHAT A STACK COMPILES TO HERE is a [`Template`]: the numbers
-//! (`Preset`) and the choices (`Form`) the placed emitters' slot loop runs
-//! (`effects::simulate_all`). Nothing about a kind is written in that loop
-//! any more: where a particle is born, what carries it, how it is sized,
-//! what a ceiling does to it, how it is lit and which draw it joins are
-//! each a module the stack has or has not.
-//!
-//! - DECOMPOSED (every number and choice the stack's): smoke, embers'
-//!   stream, dust.
-//! - FUSED (one module that is the whole of it, with the stack's numbers
-//!   where the code reads a preset's): a fire's sheets (`flame_sheets`), a
-//!   bed of coals (`coal_bed`), an embers emitter's pops (`pops`), and what
-//!   a strike into water throws (`water_entry`, one emitter a part, its
-//!   burst count the most of that part there can be). Their fixed numbers
-//!   are stated in the stack and REFUSED if they differ from the engine's,
-//!   so a stack never says what is not drawn.
-//!
-//! WHAT IT MUST MAKE is today's particles, bit for bit: the test holds the
-//! loop as it was written before the stacks (`tests::legacy`) and compares
-//! every instance's bytes.
-
 use super::{Preset, EffectKind, COALS_GLOW, COALS_HALF, COALS_LAYER, DUST_AMBIENT_SEEN, DUST_LIGHT_SIZE, EMBER_LAYER, EMBER_POPS, EMBER_RADIANCE, FIRE_BED, FIRE_FIRST, FIRE_FRAMES, FIRE_LEVEL, FIRE_RADIANCE, MOTE_LAYER, SMOKE_FRAMES, SPLASH_DROPS, SPLASH_PETALS, SPLASH_SECONDS, DROP_PHASE_G, DROP_STREAK};
 use crate::renderer::effect_asset::{
     Adapt, Budget, EffectAsset, EmitterDef, InitModule, LifeValue, LightMode, LogSquaredValue, MotionLayer, PlacementMode, Play, RangeValue, RenderModule, Scalability, SeedPolicy, SpawnModule,
@@ -31,7 +5,6 @@ use crate::renderer::effect_asset::{
 };
 use glam::Vec3;
 
-/// A stack compiled for a placed emitter.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Template {
     pub name: String,
@@ -39,73 +12,61 @@ pub struct Template {
     pub(super) form: Form,
 }
 
-/// Which loop draws it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Form {
-    /// `flame_sheets`: a fire's sheets (`fire_instances`).
+
     Sheets,
-    /// `coal_bed`: one bed (`coals_instance`).
+
     Bed,
-    /// The slot loop, by these choices.
+
     Slots(Slots),
-    /// `water_entry`: an event's, not a placed emitter's (`splash`).
+
     WaterEntry,
 }
 
-/// The slot loop's choices, each a module the stack has or has not.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Slots {
-    /// `density`: alive per cubic metre of the emitter's box, not a second.
+
     pub density: bool,
-    /// `shape_box`: born anywhere in that box; else on the bed's disc.
+
     pub boxed: bool,
-    /// `air_drift` + `jitter`: carried by the room's air; else `swirl`.
+
     pub air: bool,
-    /// A `log_squared` size held for life; else eased to `size_over_life`.
+
     pub log_size: bool,
     pub ceiling: Ceiling,
     pub shade: SlotShade,
-    /// `pops`: bursts of sparks besides the stream.
+
     pub pops: bool,
-    /// `adapt_own_light`: seen as the eye adapted to its fire sees it.
+
     pub own_light: bool,
-    /// `glint`: found, held and lost by the eye -- tumbling into the light,
-    /// in focus, within reach.
+
     pub held: bool,
-    /// Drawn screened (light only) or over what is behind, sorted.
+
     pub screened: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Ceiling {
     Open,
-    /// `ceiling_spread`.
+
     Spread,
-    /// `ceiling_stop`.
+
     Stop,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum SlotShade {
-    /// `light_cpu` sixway + `sprite_sixway`, thinning by `puff_fade`.
+
     Sixway { peak: f32, rise: f32, power: f32 },
-    /// `light_cpu` scatter + `sprite_scatter`; the share of the room's even
-    /// light it is seen by.
+
     Scatter { ambient: f32 },
-    /// `ember_glow` + `sprite_emissive`.
+
     Ember,
 }
 
-/// The books a template's sprite can name: first layer and frames. (The
-/// whole list, with what each fills and weighs, is `effects::books`, which
-/// needs the atlas made; the test holds the two together.)
 const BOOK_LAYERS: [(&str, u32, u32); 5] = [("smoke", 0, SMOKE_FRAMES), ("flame", FIRE_FIRST, FIRE_FRAMES), ("ember", EMBER_LAYER, 1), ("mote", MOTE_LAYER, 1), ("coals", COALS_LAYER, 1)];
 
-/// The most of each part one strike into water can throw
-/// (`effects::splash_shape`'s clamps; the drops with the jet's three beads)
-/// and the largest half size anything up to a 120 kg body dropped from 4 m
-/// gives it, metres (`tests::a_strike_into_water_stays_inside_its_stacks_counts`
-/// holds both).
 pub const WATER_PARTS: [(WaterPart, u32, f32); 6] = [
     (WaterPart::Drops, SPLASH_DROPS as u32 + 3, 0.006),
     (WaterPart::Crown, SPLASH_PETALS as u32, 0.32),
@@ -115,11 +76,10 @@ pub const WATER_PARTS: [(WaterPart, u32, f32); 6] = [
     (WaterPart::Mist, 8, 1.5),
 ];
 
-/// Strikes the renderer keeps alive at once (`XrRenderer::add_splash`).
 pub const WATER_KEPT: u32 = 48;
 
 impl EffectKind {
-    /// Its template's name, which is the kind's as a scene writes it.
+
     pub fn template_name(self) -> &'static str {
         match self {
             Self::Fire => "fire",
@@ -151,7 +111,7 @@ fn motion(layer: MotionLayer) -> RenderModule {
 fn emitter(name: &str, spawn: Vec<SpawnModule>, initialize: Vec<InitModule>, update: Vec<UpdateModule>, render: Vec<RenderModule>) -> EmitterDef {
     EmitterDef { name: name.into(), at: At::Origin, spawn, initialize, update, render, events: Vec::new() }
 }
-/// A placed emitter's asset: one of it alive, costed 2.5 m away.
+
 fn placed(name: &str, emitters: Vec<EmitterDef>, importance: f32, fill: f32, instances: u32) -> EffectAsset {
     EffectAsset {
         name: name.into(),
@@ -166,16 +126,11 @@ fn placed(name: &str, emitters: Vec<EmitterDef>, importance: f32, fill: f32, ins
     }
 }
 
-/// A KIND'S STACK. The numbers are the ones its preset held.
 pub fn asset(kind: EffectKind) -> EffectAsset {
     use std::f32::consts::PI;
     let name = kind.template_name();
     match kind {
-        // Sheets of flame standing on the bed, each playing a stretch of the
-        // book and handing over on the fire's beat. Its lamp, its glare and
-        // its place in the meter are the engine's still (`fire_light`,
-        // `fire_glare`, `meter_samples`): lasting lights are not an event
-        // module yet.
+
         EffectKind::Fire => placed(
             name,
             vec![emitter(
@@ -264,7 +219,7 @@ pub fn asset(kind: EffectKind) -> EffectAsset {
             0.05,
             40,
         ),
-        // One bed, drawn whole.
+
         EffectKind::Coals => placed(
             name,
             vec![emitter(
@@ -278,9 +233,7 @@ pub fn asset(kind: EffectKind) -> EffectAsset {
             0.2,
             1,
         ),
-        // A life is how long the eye keeps hold of one mote, not how long
-        // it is in the air: it is noticed as it tumbles into the light, held
-        // a few seconds and lost, while others are found elsewhere.
+
         EffectKind::Dust => placed(
             name,
             vec![emitter(
@@ -321,18 +274,12 @@ impl Reasoned for RenderModule {
     }
 }
 
-/// A STRIKE INTO WATER's stack: an event's. Its inputs are what struck --
-/// its radius at the surface (`size`, m), its `mass` (kg) and how fast it
-/// came in (`speed`, m/s; the angle is the event's direction) -- and every
-/// part's count, size and timing follow from them (`effects::splash_shape`).
-/// Two strikes close together do not stack: the second meets disturbed
-/// water and raises no crown of its own (`effects::strike`).
 pub fn water_entry_asset() -> EffectAsset {
     let part = |name: &str, part: WaterPart, book: &str, mode: PlacementMode, soft: f32, layer: MotionLayer| {
         let (_, count, half) = WATER_PARTS.iter().copied().find(|p| p.0 == part).expect("every part is listed");
         let mut update = vec![UpdateModule::WaterEntry { part }];
         let sprite = if part == WaterPart::Drops {
-            // Lit by the sun and the room, by the angle to the eye.
+
             update.push(UpdateModule::LightCpu { mode: LightMode::Scatter, phase_g: DROP_PHASE_G, albedo: [1.0; 3], ambient: 1.0 });
             RenderModule::SpriteScatter { book: book.into() }
         } else {
@@ -371,13 +318,10 @@ pub fn water_entry_asset() -> EffectAsset {
     }
 }
 
-/// Every built-in template's stack: the five kinds and the strike into
-/// water. What the editor lists beside the authored effects.
 pub fn assets() -> Vec<EffectAsset> {
     EffectKind::ALL.iter().map(|k| asset(*k)).chain([water_entry_asset()]).collect()
 }
 
-/// A kind's template, compiled once.
 pub(super) fn template(kind: EffectKind) -> &'static Template {
     static BUILT: std::sync::OnceLock<Vec<Template>> = std::sync::OnceLock::new();
     let all = BUILT.get_or_init(|| EffectKind::ALL.iter().map(|k| Template::compile(&asset(*k)).unwrap_or_else(|e| panic!("the built-in {} template: {e}", k.template_name()))).collect());
@@ -385,11 +329,7 @@ pub(super) fn template(kind: EffectKind) -> &'static Template {
 }
 
 impl Template {
-    /// COMPILE A STACK for a placed emitter: its numbers and its choices.
-    /// A module this loop cannot run (a burst's lobes, a curve where the
-    /// closed form takes a number) is an error naming it, and so is a fused
-    /// module's number the engine does not draw. Structure and budgets are
-    /// `EffectAsset::check`'s, which needs the books.
+
     pub fn compile(a: &EffectAsset) -> Result<Self, String> {
         let name = a.name.clone();
         let blank = Preset {
@@ -580,13 +520,10 @@ mod tests {
     use crate::renderer::effect_asset::Report;
     use glam::Quat;
 
-    /// The presets as they were written before the stacks held them.
     fn legacy_preset(kind: EffectKind) -> Preset {
         match kind {
             EffectKind::Fire => Preset {
-                // Sheets of flame standing on the bed, each playing a stretch of
-                // the flipbook and fading in and out over it: the flames' motion
-                // is the book's, the base stays on the fuel.
+
                 rate: 9.0,
                 life: (0.9, 1.3),
                 speed: (0.0, 0.0),
@@ -637,7 +574,7 @@ mod tests {
                 phase_g: 0.0,
                 albedo: 0.0,
             },
-            // One bed, drawn whole (`coals_instance`); only its look is here.
+
             EffectKind::Coals => Preset {
                 rate: 0.0,
                 life: (1.0, 1.0),
@@ -655,11 +592,7 @@ mod tests {
                 phase_g: 0.0,
                 albedo: 0.0,
             },
-            // A life is how long the eye keeps hold of one mote, not how long
-            // it is in the air: it is noticed as it tumbles into the light, held
-            // a few seconds and lost, while others are found elsewhere. Its
-            // motion is the room's air (`air_drift`) plus its own jitter and a
-            // slow settling; `swirl` is that jitter's reach and pace.
+
             EffectKind::Dust => Preset {
                 rate: 90.0,
                 life: (3.5, 6.5),
@@ -680,21 +613,13 @@ mod tests {
         }
     }
 
-    /// THE LOOP AS IT WAS before the stacks, kind by kind: what the stacks
-    /// must make, bit for bit. (Its fused kinds call the same functions the
-    /// stacks do; what holds those is that the stacks compile to the same
-    /// presets.)
     fn legacy(emitters: &[EffectEmitter], time: f64, at: &Surroundings) -> EffectFrame {
         let seen = |_: usize| true;
         let mut over: Vec<(f32, EffectInstance)> = Vec::new();
         let mut screened: Vec<EffectInstance> = Vec::new();
         let player = |p: Vec3| at.yaw_inv * (p - at.offset);
         let head_world = at.yaw_inv.inverse() * at.head + at.offset;
-        // A FIRE'S OWN LIGHT on smoke and motes is seen as its flames are, by the
-        // eye adapted to the fire: lit at the room's exposure, the smoke over a
-        // fire burned white above flames a hundred times dimmer than it is. Found
-        // among the frame's lights near where `fire_light` hangs it -- it sways
-        // with the flames, and the client may hang it on another clock's moment.
+
         let fires: Vec<(Vec3, f32, f32)> = emitters
             .iter()
             .filter(|e| fire_burns(e))
@@ -712,7 +637,7 @@ mod tests {
             }
             match e.kind {
                 EffectKind::Coals => {
-                    // Drawn before all it lies under: as the farthest of all.
+
                     let breath = coals_breath(e, emitters, time);
                     over.extend(coals_instance(e, time, at, &own, breath).map(|i| (f32::INFINITY, i)));
                     continue;
@@ -737,14 +662,13 @@ mod tests {
             let lives = life_range(&p, &v);
             let speeds = speed_range(&p, &v);
             let slots = ((rate * lives.1).ceil() as usize).clamp(1, MAX_SLOTS);
-            // Each slot respawns every `period`: never sooner than its longest
-            // life, and the emitter as a whole at `rate`.
+
             let period = (slots as f64 / rate as f64).max(lives.1 as f64);
             let base = emitter_seed(e);
             let tint = Vec3::from(e.tint);
             let ambient = (at.ambient)(e.position);
             let lamps: Vec<usize> = (0..at.lights.len()).filter(|&i| (at.reaches)(e, i)).collect();
-            // Embers as the eye adapted to the fire sees them.
+
             let glow = if e.kind == EffectKind::Embers { at.exposure * fire_adaptation(e, at) } else { at.exposure };
             let up = e.direction.try_normalize().unwrap_or(Vec3::Y);
             let air = (e.kind == EffectKind::Dust).then(|| air_waves(base));
@@ -768,7 +692,7 @@ mod tests {
                     }
                     p0
                 } else {
-                    // A disc across the emitter's direction.
+
                     let r = p.bed * e.scale * u[4].sqrt();
                     let side = up.any_orthonormal_vector();
                     let phi = u[5] * std::f32::consts::TAU;
@@ -776,13 +700,10 @@ mod tests {
                 };
                 let dir = cone_direction(up, p.spread_deg, u[2], u[3]);
                 let (mut pos, vel) = ballistic(p0, dir * speed, p.accel, p.drag, age);
-                // Its velocity, for SpaceWarp: the throw's, and what carries it
-                // besides, each as its own term moves.
+
                 let mut moving = vel;
                 if let Some(air) = &air {
-                    // Carried by the room's air with its neighbours, and jostled
-                    // on its own by the smallest eddies -- a wander that never
-                    // retraces itself, where a sum of sines drew loops.
+
                     pos += (air_drift(air, p0, time) - air_drift(air, p0, time - age as f64)) * v.turbulence;
                     let seed = base ^ (i as u64).wrapping_mul(0x632be59bd9b4e019) ^ (n as i64 as u64);
                     let wander = |jitter: f32| Vec3::new(noise1(jitter, seed), 0.6 * noise1(jitter, seed ^ 1), noise1(jitter, seed ^ 2)) * (p.swirl.0 * v.turbulence);
@@ -797,17 +718,13 @@ mod tests {
                     moving += swirl_motion(p.swirl.0 * v.turbulence * e.scale / life, swirl_r, p.swirl.1, swirl_a);
                 }
                 let mut size = if e.kind == EffectKind::Dust {
-                    // Many faint, few bright (`DUST_LIGHT_SIZE`); spread over
-                    // fewer or more octaves about its middle by `size_variation`.
+
                     let k = if v.size_variation == 1.0 { u[11] * u[11] } else { 1.0 / 3.0 + (u[11] * u[11] - 1.0 / 3.0) * v.size_variation };
                     p.size.0 * (p.size.1 / p.size.0).powf(k) * e.scale
                 } else {
                     lerp(p.size.0, p.size.1, smoothstep(0.0, 1.0, t)) * e.scale * size_spread(u[8], &v)
                 };
-                // UNDER A CEILING smoke cannot keep rising: what would have
-                // risen past it is turned sideways and spreads out beneath it,
-                // flattening and widening -- the layer that gathers under the
-                // roof of a cave or a hall. Embers stop against it.
+
                 if let Some(top) = e.ceiling {
                     match e.kind {
                         EffectKind::Smoke => {
@@ -818,7 +735,7 @@ mod tests {
                                 pos.y = under - 0.15 * size * (1.0 - (-excess).exp());
                                 pos += Vec3::new(a.cos(), 0.0, a.sin()) * (0.9 * excess);
                                 size *= 1.0 + 0.5 * excess.min(2.0);
-                                // What still rises is turned out under it.
+
                                 let rise = moving.y;
                                 moving.y = 0.15 * size * (-excess).exp() * -rise;
                                 moving += Vec3::new(a.cos(), 0.0, a.sin()) * (0.9 * rise);
@@ -855,18 +772,14 @@ mod tests {
                         inst.colour = ember_colour(&v, tint, glow, age, t, u[11]);
                     }
                     EffectKind::Dust => {
-                        // Only the light it scatters, each lamp's by its own
-                        // angle to the eye; the room's even light hardly shows
-                        // it (`DUST_AMBIENT_SEEN`).
+
                         let mut scattered = ambient * DUST_AMBIENT_SEEN;
                         for &li in &lamps {
                             if let Some((c, d)) = lamp_at(&at.lights[li], centre) {
                                 scattered += c * (own(&at.lights[li]) * henyey_greenstein(p.phase_g, -d, to_eye));
                             }
                         }
-                        // Seen as the eye holds it: found as it turns into the
-                        // light, flashing and dimming as it tumbles, then lost;
-                        // and only where the eye could focus on it.
+
                         let glint = mote_glint(age, lerp(0.35, 1.3, u[7]), id_hash("glint") ^ u[8].to_bits() as u64);
                         let c = scattered * p.albedo * tint * (at.exposure * glint * v.intensity);
                         let held = smoothstep(0.0, 0.2, t) * smoothstep(1.0, 0.7, t);
@@ -902,7 +815,7 @@ mod tests {
                         }
                         inst.params[3] = 1.0;
                     }
-                    // Drawn above, each its own way.
+
                     EffectKind::Coals | EffectKind::Fire => unreachable!("coals and flames are drawn apart"),
                 }
                 if inst.colour[3] <= 0.0 {
@@ -973,7 +886,7 @@ mod tests {
                 "{:<8} {:>3} instances, fill {:.3} megapixel-layers at {} m (budget {} / {})",
                 a.name, report.instances_steady, report.fill_steady, report.reference_distance, a.budget.instances, a.budget.fill_megapixel_layers
             );
-            // The stack is the preset, to the bit; and it survives its file.
+
             assert_eq!(Template::compile(&a).unwrap().preset, legacy_preset(kind), "{}", a.name);
             let again = EffectAsset::parse(&a.to_json()).unwrap();
             assert_eq!(again, a, "{}", a.name);
@@ -989,10 +902,6 @@ mod tests {
         assert_eq!(assets().len(), 6);
     }
 
-    /// The same bytes as the loop that was: every kind, alone and together,
-    /// under a ceiling, scaled, thinned, tinted, varied every way a scene
-    /// can vary it, lit by a lamp and by a fire's own light, seen from a
-    /// turned and moved player, at moments from the first frame to hours in.
     #[test]
     fn the_stacks_make_todays_particles_bit_for_bit() {
         let varied = Variation { intensity: 1.7, size_variation: 2.1, life_variation: 0.4, speed_variation: 2.5, temperature_variation: 0.6, flicker: 2.0, flicker_rate: 1.8, turbulence: 2.6, seed: 77 };
@@ -1003,7 +912,7 @@ mod tests {
             scenes.push(vec![EffectEmitter { ceiling: Some(1.1), scale: 1.6, rate: 0.7, tint: [0.9, 0.8, 1.1], variation: varied, direction: Vec3::new(0.2, 1.0, 0.1), ..e.clone() }]);
             scenes.push(vec![EffectEmitter { rate: 3.0, scale: 0.5, id: "another".into(), ..e }]);
         }
-        // A campfire: its bed, flames, smoke and sparks, with dust in the room.
+
         let at_fire = Vec3::new(1.0, 0.0, -2.0);
         scenes.push(
             [EffectKind::Coals, EffectKind::Fire, EffectKind::Smoke, EffectKind::Embers, EffectKind::Dust]
@@ -1035,8 +944,6 @@ mod tests {
         assert!(compared > 5000, "the comparison drew {compared} particles");
     }
 
-    /// A stack says what is drawn: its numbers reach the loop, and one it
-    /// cannot honour is refused by name.
     #[test]
     fn a_stacks_numbers_are_the_loops_and_what_it_cannot_run_is_refused() {
         let mut thick = asset(EffectKind::Smoke);
@@ -1051,15 +958,15 @@ mod tests {
         let t = Template::compile(&thick).unwrap();
         assert_eq!(t.preset.drag, 0.9);
         assert!(matches!(t.form, Form::Slots(Slots { shade: SlotShade::Sixway { peak, .. }, .. }) if peak == 0.8));
-        // A fused module's number the engine does not draw.
+
         let mut hot = asset(EffectKind::Fire);
         hot.emitters[0].update[1] = UpdateModule::FlameSheets { radiance: 90.0 };
         assert!(Template::compile(&hot).unwrap_err().contains("flame_sheets radiance"));
-        // Smoke lit as dust is: no such draw.
+
         let mut wrong = asset(EffectKind::Smoke);
         wrong.emitters[0].update.retain(|m| !matches!(m, UpdateModule::PuffFade { .. }));
         assert!(Template::compile(&wrong).is_err());
-        // A strike's stack may not promise more drops than a strike throws.
+
         let mut wet = water_entry_asset();
         wet.emitters[0].spawn = vec![SpawnModule::Burst { count: Value::Number(500.0), chance: 1.0 }];
         assert!(Template::compile(&wet).unwrap_err().contains("at most"));
@@ -1082,10 +989,6 @@ mod tests {
         }
     }
 
-    /// Whatever strikes -- a grain to a crate, dropped or fired, straight
-    /// down or skimming, into calm or churned water, held or let go -- no
-    /// part of its splash is more than its stack's emitter says, and the
-    /// whole of it is inside the stack's budget at the stack's distance.
     #[test]
     fn a_strike_into_water_stays_inside_its_stacks_counts() {
         let at = Surroundings { head: Vec3::new(0.0, 1.6, 2.5), offset: Vec3::ZERO, yaw_inv: Quat::IDENTITY, lights: &[], reaches: &every, ambient: &dim, exposure: 1.0 };
@@ -1105,7 +1008,7 @@ mod tests {
         };
         for (size, mass) in [(0.003, 0.0005), (0.0045, 0.008), (0.015, 0.035), (0.05, 3.0), (0.07, 0.9), (0.15, 8.0), (0.4, 30.0), (0.6, 120.0)] {
             for velocity in [Vec3::new(0.0, -1.0, 0.0), Vec3::new(0.0, -4.4, 0.0), Vec3::new(-2.3, -1.1, 0.0), Vec3::new(0.0, -9.0, 0.0), Vec3::new(247.0, -247.0, 0.0), Vec3::new(0.0, -800.0, 0.0)] {
-                // Nothing heavy arrives at a bullet's speed.
+
                 if mass > 1.0 && velocity.length() > 12.0 {
                     continue;
                 }
@@ -1121,8 +1024,7 @@ mod tests {
                             let slot = WATER_PARTS.iter().position(|p| p.0 == part).unwrap();
                             counts[slot] += 1;
                             most[slot].1 = most[slot].1.max(i.centre[3]);
-                            // As the validator costs a sprite: its square at
-                            // the distance it is, both eyes.
+
                             let away = (Vec3::new(i.centre[0], i.centre[1], i.centre[2]) - at.head).length().max(0.35);
                             let across = (2.0 * i.centre[3] / away * crate::renderer::effect_asset::REFERENCE_FOCAL_PIXELS).max(1.5);
                             let tall = if part == WaterPart::Drops { 1.0 } else { i.params[2].abs().max(1.0) };
@@ -1149,8 +1051,7 @@ mod tests {
         assert!(most_instances as u32 <= report.instances_per_burst);
         assert!(most_fill <= report.fill_per_burst, "{most_fill} drawn, the stack's cost says at most {}", report.fill_per_burst);
     }
-    /// The templates' stacks as files, for the editor and for reading:
-    /// `OUT=dir cargo test --release --lib export_the_templates -- --ignored`.
+
     #[test]
     #[ignore]
     fn export_the_templates() {

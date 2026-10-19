@@ -1,33 +1,20 @@
-//! DYNAMIC RESOLUTION: what the runtime recommends for the eyes' layer each
-//! frame (`xr::recommended_resolution`, Android only), kept here where a
-//! development machine's tests run it.
-//!
-//! First step (cortex wall #16): ask every frame and draw the eyes at their
-//! fixed size whatever the answer -- asking is what Quest 3 grants GPU level 5
-//! for -- and log each window's answers beside the clock the runtime chose, so
-//! one bench says both whether the level comes and what size the runtime would
-//! have had us draw.
-
-/// One window's answers, for the `DYNRES` line.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RecommendationWindow {
-    /// Frames asked.
+
     pub asked: u32,
-    /// Answers with a recommendation (`isValid`).
+
     pub valid: u32,
-    /// Calls the runtime refused, and the last refusal's code.
+
     pub errors: u32,
     pub last_error: i32,
-    /// The latest recommendation, and the smallest and largest of the window,
-    /// each as (width, height) of one view.
+
     pub last: Option<(u32, u32)>,
     pub smallest: Option<(u32, u32)>,
     pub largest: Option<(u32, u32)>,
 }
 
 impl RecommendationWindow {
-    /// One frame's answer: `Ok(None)` when the runtime had no recommendation,
-    /// `Err(code)` when it refused the call.
+
     pub fn add(&mut self, answer: Result<Option<(u32, u32)>, i32>) {
         self.asked += 1;
         match answer {
@@ -50,14 +37,10 @@ impl RecommendationWindow {
         }
     }
 
-    /// The window so far, starting a new one.
     pub fn take(&mut self) -> Self {
         std::mem::take(self)
     }
 
-    /// The `DYNRES` line: what was asked and answered, against `drawn`, the
-    /// size each eye was drawn at; the recommendation as a share of it too,
-    /// since that is the render scale the runtime wanted.
     pub fn format_line(&self, drawn: (u32, u32)) -> String {
         let size = |s: Option<(u32, u32)>| s.map_or("-".to_string(), |(w, h)| format!("{w}x{h}"));
         let scale = |s: Option<(u32, u32)>| {

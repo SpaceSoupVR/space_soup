@@ -1,46 +1,3 @@
-//! THE PLAYER ON CARDS, EVERY FRAME: six pictures of their body, one looking in
-//! through each face of a box round it, from which a reflection that meets the
-//! player takes their real colours and outline instead of a capsule's one mean
-//! colour (user, 2026-09-30: "build the character probe"). The capsules stay
-//! as the cheap test for whether a reflected ray passes a body at all; where
-//! one does, the cards say what it shows. See `character_card_look` and
-//! `capsule_reflection` in the lights block.
-//!
-//! The fixtures' cards are baked (`proxy_cards`); a body moves, so its cards
-//! are drawn each frame -- six orthographic views of the player's own
-//! mirror-only mesh, a few thousand pixels in all -- into a small target,
-//! given their blur levels by the floor mirror's mip pass (`MirrorMips`), and
-//! copied into the rows the card atlas keeps for them
-//! (`proxy_cards::atlas_with_characters`). The probe pass already samples that
-//! atlas and is at its sampled-texture limit, so the cards could not have a
-//! texture of their own.
-//!
-//! WHAT A CARD HOLDS: the body's ALBEDO, premultiplied by coverage, with the
-//! coverage in alpha -- not its lit colour. A capsule's reflection is lit by
-//! the light arriving at the reflecting surface, and the cards are read the
-//! same way, so the same light falls on both and switching between them
-//! changes the shape and the colours and nothing else. Coverage averages
-//! through the blur levels, so a body seen far off, or in a rough surface,
-//! fades at its outline as the footprint says rather than as a capsule
-//! blurred by a fixed 15 cm.
-//!
-//! THE CARDS' FRAME is the fixtures' convention, so one lookup reads both
-//! kinds of row alike: card `2a` looks in through the box's `+a` face and
-//! `2a + 1` through its `-a` face; `u` runs along axis `a + 1` and `v` along
-//! `a + 2`, `v = 0` the top row; the depth is 0 at the face a card looks
-//! through. The box is round the body's capsules and SQUARE TO THE WORLD, not
-//! to the player's frame, which turns with every snap or smooth turn of the
-//! rig. A reflection that shows the player to themselves leaves the
-//! reflecting surface square to it -- you see yourself where the mirror is
-//! nearest you -- and walls and floors are square to the world, so their
-//! rays meet the body along a card's axis and one card shows it exactly. A
-//! box square to the rig put the back wall's rays at 45 degrees to its cards
-//! after one snap turn: two orthographic views half each, the body twice,
-//! 20 cm apart -- crisp at load, smeared from the first turn on (headset,
-//! 2026-10-01: "the player reflection looked really bad then and it stayed
-//! bad after that"). A real turn of the body needs nothing: the cards draw
-//! the body as it stands.
-
 use glam::{Mat4, Vec3, Vec4};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
@@ -55,42 +12,19 @@ use super::mesh_pipeline::SkinnedMeshPipeline;
 use super::proxy_cards::CARD_FACES;
 use super::uniforms::{CapsuleUpload, CAPSULES_PER_GROUP};
 
-/// How far past the body's capsules the box reaches: clothes and hands stand
-/// a little outside them.
 pub const CARD_BOX_MARGIN: f32 = 0.06;
 
-/// Blur levels a character's cards carry above the first, as `MirrorMips`
-/// makes them: the most a reflection reads them at (`CHARACTER_CARD_MAX_LOD`
-/// in the lights block). Level 4 of a 64-texel card is a 16th of the body
-/// across, as soft as any reflection of it needs.
 pub const CARD_MIPS: u32 = MIRROR_MIPS;
 
-/// Bytes between one card's matrix and the next in the uniform: the
-/// dynamic-offset alignment every device allows.
 const CARD_STRIDE: u64 = 256;
 
-/// THE BODY AS THE CARDS NEED IT: its vertices clustered `cell` apart in its
-/// bind pose, and the triangles that collapse, or repeat one already kept,
-/// dropped. Two vertices merge only if they share a cell, their strongest
-/// joint -- else a limb would be tied to what it passes -- and their UV island
-/// (the triangles they are connected through), else a triangle would stretch
-/// its texture across the atlas from one island to another: a box's corners
-/// merged gave its side the front's colour. Every cluster in a cell stands at
-/// the mean of ALL the cell's vertices, so the two sides of a UV seam, kept
-/// apart, still meet; a cluster's UV is its own members' mean.
-///
-/// The avatar is 24,634 vertices and 33,894 triangles: drawn six times into
-/// cards 64 texels across, nearly every triangle was smaller than a texel,
-/// and the six views cost 0.56 ms a frame on the headset (2026-10-01). At a
-/// texel of its height it is about a third of that, and the cards cannot
-/// show the difference.
 pub fn simplify(
     vertices: &[SkinnedMeshVertex],
     indices: &[u32],
     cell: f32,
 ) -> (Vec<SkinnedMeshVertex>, Vec<u32>) {
     use std::collections::{HashMap, HashSet};
-    // The UV islands: the vertices one triangle or a chain of them joins.
+
     let mut parent: Vec<u32> = (0..vertices.len() as u32).collect();
     fn root(parent: &mut [u32], mut i: u32) -> u32 {
         while parent[i as usize] != i {
@@ -167,44 +101,32 @@ pub fn simplify(
     (out, tris)
 }
 
-/// One primitive of a body as the cards draw it: the bind groups the lit
-/// pass draws it with, and its vertices as loaded.
 #[derive(Clone, Copy)]
 pub struct CardPart<'a> {
     pub model: &'a BindGroup,
     pub texture: &'a BindGroup,
     pub joints: &'a BindGroup,
-    /// The buffer `joints` binds: what the posing pass reads (`skin_compute`).
+
     pub joint_buffer: &'a Buffer,
-    /// The primitive's own vertex buffer: which simplified copy is its.
+
     pub source: &'a Buffer,
     pub vertices: &'a [SkinnedMeshVertex],
     pub indices: &'a [u32],
 }
 
-/// A primitive's [`simplify`]d copy on the GPU, and its index count.
 struct CardMesh {
     vertices: Buffer,
     indices: Buffer,
     count: u32,
     vertex_count: u32,
-    /// Its copy posed once a frame (`skin_compute`), and the joint buffer
-    /// that poses it.
+
     posed: Option<(Buffer, crate::renderer::skin_compute::Posed)>,
 }
 
-/// The turn from the player's frame -- what the capsules and the body are
-/// drawn in -- to the cards' own, square to the world, for a rig turned by
-/// `yaw` (`PlayerUpload::yaw`). Only a turn: the cards' centre stays in the
-/// player's frame. The shaders' `to_world_direction`.
 pub fn card_turn(yaw: f32) -> glam::Quat {
     glam::Quat::from_rotation_y(yaw)
 }
 
-/// The box round character `g`'s capsules, padded by [`CARD_BOX_MARGIN`] and
-/// square to the world for a rig turned by `yaw` (see the module notes): its
-/// centre in the player's frame, and its half size along the world's axes.
-/// `None` for a character with none.
 pub fn card_box(capsules: &CapsuleUpload, g: usize, yaw: f32) -> Option<(Vec3, Vec3)> {
     if g >= capsules.group_count as usize {
         return None;
@@ -230,16 +152,11 @@ pub fn card_box(capsules: &CapsuleUpload, g: usize, yaw: f32) -> Option<(Vec3, V
     Some((turn.inverse() * ((lo + hi) * 0.5), ((hi - lo) * 0.5).max(Vec3::splat(0.05))))
 }
 
-/// Card `k`'s view of the box `centre`, `half` for a rig turned by `yaw` (see
-/// [`card_box`]): a point in the player's frame to the card's clip space --
-/// x = 2u - 1, y = 1 - 2v, z = the depth from the face it looks through. See
-/// the module notes.
 pub fn card_matrix(k: usize, centre: Vec3, half: Vec3, yaw: f32) -> Mat4 {
     let turn = card_turn(yaw);
     square_card_matrix(k, turn * centre, half) * Mat4::from_quat(turn)
 }
 
-/// [`card_matrix`] in the cards' own frame.
 fn square_card_matrix(k: usize, centre: Vec3, half: Vec3) -> Mat4 {
     let (a, from_plus) = (k / 2, k % 2 == 0);
     let (a1, a2) = ((a + 1) % 3, (a + 2) % 3);
@@ -255,9 +172,6 @@ fn square_card_matrix(k: usize, centre: Vec3, half: Vec3) -> Mat4 {
     Mat4::from_cols(x, y, z, Vec4::W).transpose()
 }
 
-/// The six views' shader: the body posed exactly as the lit pass poses it,
-/// each fragment its albedo with full coverage. The body's own texture's
-/// cut-outs are cut out.
 fn shader() -> String {
     format!(
         r#"
@@ -300,9 +214,6 @@ fn vs_main(v: VIn) -> VOut {{
     return out;
 }}
 
-// A body posed once this frame (`skin_compute`): its posed position IS
-// `vs_main`'s `skinned_p`, so the same expression follows; the uv still comes
-// from the simplified copy.
 struct PosedIn {{
     @location(0) skinned_p: vec4<f32>,
     @location(2) uv:        vec2<f32>,
@@ -328,30 +239,24 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     )
 }
 
-/// One character's cards: the target their six views are drawn into, its
-/// blur levels, and the pass that draws them.
 pub struct CharacterCards {
     resolution: u32,
     target: Texture,
-    /// Level 0 drawn into and read by the blur; then the blur levels.
+
     levels: Vec<TextureView>,
     _depth: Texture,
     depth_view: TextureView,
     pipeline: RenderPipeline,
-    /// The same views of a body posed once this frame (`skin_compute`): its
-    /// posed positions in slot 0, its uv from the simplified copy in slot 1.
+
     posed_pipeline: RenderPipeline,
     matrices: Buffer,
     matrices_group: BindGroup,
-    /// Each body primitive's simplified copy, by the primitive's own vertex
-    /// buffer: made the first frame it is drawn, dropped the first it is not.
+
     meshes: std::sync::Mutex<std::collections::HashMap<Buffer, CardMesh>>,
 }
 
 impl CharacterCards {
-    /// Cards `resolution` texels across, drawn with `skinned`'s model,
-    /// texture and joint layouts -- the bind groups every skinned draw
-    /// already has.
+
     pub fn new(device: &Device, resolution: u32, skinned: &SkinnedMeshPipeline) -> Self {
         Self::with_layouts(
             device,
@@ -364,9 +269,6 @@ impl CharacterCards {
         )
     }
 
-    /// [`Self::new`] with the model, texture and joint layouts given: the
-    /// shader reads a model's matrix, its colour texture and sampler (its
-    /// first two bindings) and its joints.
     pub fn with_layouts(
         device: &Device,
         resolution: u32,
@@ -474,7 +376,7 @@ impl CharacterCards {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            // Both sides: a card may look at a limb from inside its outline.
+
             primitive: wgpu::PrimitiveState {
                 cull_mode: None,
                 ..Default::default()
@@ -490,8 +392,7 @@ impl CharacterCards {
             multiview_mask: None,
             cache: None,
         });
-        // The posed body's: no joints, and its uv from the simplified copy,
-        // 24 bytes into each `SkinnedMeshVertex`.
+
         let posed_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("character_cards_posed"),
             bind_group_layouts: &[Some(&card_layout), Some(model), Some(texture)],
@@ -555,9 +456,6 @@ impl CharacterCards {
         self.resolution
     }
 
-    /// THE CARDS AS LAST DRAWN, their first level read back: `(width, height,
-    /// texels)`, linear RGBA row after row, the six cards side by side. Waits
-    /// on the GPU -- for a test or a diagnosis, never a frame.
     pub fn read_back(
         &self,
         device: &Device,
@@ -620,11 +518,6 @@ impl CharacterCards {
         Ok((width, height, texels))
     }
 
-    /// Draws the six cards of the body `parts` in the box `centre`, `half` for
-    /// a rig turned by `yaw` ([`card_box`]), from each part's [`simplify`]d
-    /// copy; blurs them; and copies every level into `atlas`'s `row`
-    /// (`proxy_cards::CardAtlas::character_rows`). `timer`: a pass timer's
-    /// slot for the drawing and the next for the blur levels.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
@@ -643,9 +536,7 @@ impl CharacterCards {
         let mut meshes = self.meshes.lock().unwrap_or_else(|e| e.into_inner());
         meshes.retain(|source, _| parts.iter().any(|part| part.source == source));
         if parts.iter().any(|part| !meshes.contains_key(part.source)) {
-            // A texel of the card the body fills, in its bind pose's own
-            // units: the whole body's longest side over the card's texels --
-            // the same for every part, small ones included.
+
             let (lo, hi) = parts.iter().flat_map(|part| part.vertices).fold(
                 (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
                 |(lo, hi), v| {
@@ -668,7 +559,7 @@ impl CharacterCards {
                     vertices: wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor {
                         label: Some("character_card_mesh_vb"),
                         contents: bytemuck::cast_slice(&vertices),
-                        // STORAGE too: posed once a frame (`skin_compute`).
+
                         usage: BufferUsages::VERTEX | BufferUsages::STORAGE,
                     }),
                     indices: wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor {
@@ -683,9 +574,7 @@ impl CharacterCards {
                 });
             }
         }
-        // POSED ONCE (`skin_compute`): each part's simplified copy posed by
-        // one compute pass, then drawn on all six cards as a rigid mesh of
-        // those positions, where each card skinned it again.
+
         if let Some(skin) = skin {
             for part in parts {
                 if let Some(mesh) = meshes.get_mut(part.source) {
@@ -797,12 +686,6 @@ impl CharacterCards {
 mod tests {
     use super::*;
 
-    /// The cards' frame is the fixtures': card 2a looks in through the +a
-    /// face, u along a + 1, v along a + 2 from the top, depth 0 at the face
-    /// it looks through -- what `probe_card_colour` and
-    /// `character_card_look` both read by -- along the WORLD's axes however
-    /// the rig is turned: a point placed by the world's axes round the box
-    /// lands where it would with the rig unturned.
     #[test]
     fn each_card_sees_the_box_as_the_lookup_reads_it() {
         let (centre, half) = (Vec3::new(1.0, 2.0, -3.0), Vec3::new(0.4, 0.9, 0.3));
@@ -810,15 +693,13 @@ mod tests {
             .into_iter()
             .flat_map(|yaw| (0..CARD_FACES).map(move |k| (yaw, k)))
         {
-            // The box's centre in the player's frame; the rest is laid out
-            // from it along the world's axes.
+
             let turn = card_turn(yaw);
             let centre_seen = turn.inverse() * centre;
             let (a, plus) = (k / 2, k % 2 == 0);
             let (a1, a2) = ((a + 1) % 3, (a + 2) % 3);
             let m = card_matrix(k, centre_seen, half, yaw);
-            // A point at (u, v) = (0.25, 0.75) of the card, on the face it
-            // looks through and on the far one.
+
             let mut on_face = centre;
             on_face[a1] += (0.25 - 0.5) * 2.0 * half[a1];
             on_face[a2] += (0.75 - 0.5) * 2.0 * half[a2];
@@ -845,18 +726,12 @@ mod tests {
         }
     }
 
-    /// A box-shaped body -- 0.4 m wide, 1.6 m tall, 0.2 m deep -- its front
-    /// (+z) red, back green, sides blue, top and bottom white, all from one
-    /// four-texel texture.
     fn box_body() -> (Vec<SkinnedMeshVertex>, Vec<u32>) {
         let (mut verts, mut index) = (Vec::new(), Vec::new());
         add_box(Vec3::new(-0.2, 0.0, -0.1), Vec3::new(0.2, 1.6, 0.1), &mut verts, &mut index);
         (verts, index)
     }
 
-    /// The box body standing on legs: below 0.6 m it is 0.16 m wide, so down
-    /// there the view from above (the torso's top) is wider than the view
-    /// from the front -- as shoulders and arms are over a person's legs.
     fn legged_body() -> (Vec<SkinnedMeshVertex>, Vec<u32>) {
         let (mut verts, mut index) = (Vec::new(), Vec::new());
         add_box(Vec3::new(-0.2, 0.6, -0.1), Vec3::new(0.2, 1.6, 0.1), &mut verts, &mut index);
@@ -864,7 +739,6 @@ mod tests {
         (verts, index)
     }
 
-    /// A box from `lo` to `hi`, coloured as `box_body`'s.
     fn add_box(lo: Vec3, hi: Vec3, verts: &mut Vec<SkinnedMeshVertex>, index: &mut Vec<u32>) {
         for (a, sign) in [
             (2usize, 1.0f32),
@@ -901,17 +775,6 @@ mod tests {
         }
     }
 
-    /// END TO END ON THE GPU: the box body, on legs, drawn onto its cards by `record`
-    /// -- its blur levels made and copied into an atlas's character rows --
-    /// and read back by `capsule_reflection` in the lights block, with one
-    /// capsule standing for the body -- with the rig unturned and turned
-    /// (the body and the rays square to the world, given to the shaders in
-    /// the player's frame, as a snap turn leaves them). A ray meeting a side
-    /// takes that side's colour; a ray the capsule's soft edge reaches but the body does not
-    /// takes nothing; a ray between two axes mixes their two views; a
-    /// footprint wider than a texel reads the outline as blurred; and a ray
-    /// slanting down past the legs takes nothing from the torso's top seen
-    /// from above (the marble pillar's ghost, headset 2026-10-01).
     #[test]
     fn a_reflection_meeting_the_player_shows_the_side_it_meets() {
         use crate::renderer::brush_pipeline::probe_pass::MirrorMips;
@@ -976,8 +839,6 @@ mod tests {
             (64, vec![0])
         );
 
-        // The body square to the world, and the rig turned under it as snap
-        // and smooth turns leave it: every turn shows the same reflection.
         for yaw in [0.0f32, std::f32::consts::FRAC_PI_4, -std::f32::consts::FRAC_PI_2, 2.5] {
             let mut model = vec![0.0f32; 56];
             model[..16].copy_from_slice(&Mat4::from_quat(card_turn(yaw).inverse()).to_cols_array());
@@ -1058,7 +919,6 @@ mod tests {
                 usage: BufferUsages::VERTEX,
             });
 
-            // One capsule down the body's middle, fatter than it front to back.
             let mut caps = CapsuleUpload::default();
             caps.group_count = 1;
             caps.groups[0] = [0.0, 0.8, 0.0, 0.8];
@@ -1091,8 +951,7 @@ mod tests {
                 None,
             );
             queue.submit([enc.finish()]);
-            // The cards themselves: each one's middle the side it looks at, its
-            // corners empty -- the body is narrower than its box.
+
             let (w, h, texels) = cards.read_back(&device, &queue).unwrap();
             assert_eq!((w, h), (6 * 64, 64));
             let at = |card: u32, x: u32, y: u32| texels[(y * w + card * 64 + x) as usize];
@@ -1126,10 +985,10 @@ mod tests {
     @compute @workgroup_size(1)
     fn look_main(@builtin(global_invocation_id) id: vec3<u32>) {
         pixel_footprint = rays[id.x * 2u].w;
-        // Lit by pi: the reflection is then the albedo it shows.
+
         out[id.x] = capsule_reflection(rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz), 0.0, vec3<f32>(3.14159265), vec4<f32>(0.0));
     }
-    "#
+"#
             );
             let module = device.create_shader_module(ShaderModuleDescriptor {
                 label: None,
@@ -1143,28 +1002,25 @@ mod tests {
                 compilation_options: Default::default(),
                 cache: None,
             });
-            // (from, direction, pixel footprint)
+
             let rays: [(Vec3, Vec3, f32); 9] = [
                 (Vec3::new(0.0, 0.8, 2.0), Vec3::NEG_Z, 0.0),
                 (Vec3::new(0.0, 0.8, -2.0), Vec3::Z, 0.0),
                 (Vec3::new(2.0, 0.8, 0.0), Vec3::NEG_X, 0.0),
-                // Inside the capsule's soft edge, outside the body.
+
                 (Vec3::new(0.3, 0.8, 2.0), Vec3::NEG_Z, 0.0),
-                // Over the body's head, inside its box and its capsule's edge.
+
                 (Vec3::new(0.0, 1.63, 2.0), Vec3::NEG_Z, 0.0),
-                // Between two axes: the front's view and the side's, half each.
+
                 (Vec3::new(2.0, 0.8, 2.0), Vec3::new(-1.0, 0.0, -1.0), 0.0),
-                // At the body's edge with a footprint of a few texels.
+
                 (Vec3::new(0.2, 0.8, 2.0), Vec3::NEG_Z, 0.05),
-                // Down and back past the legs, as a floor or a pillar in front
-                // of the player reflects them: inside the capsule and the
-                // torso's top seen from above, outside the legs seen from the
-                // front.
+
                 (Vec3::new(0.15, 1.3, 1.0), Vec3::new(0.0, -1.0, -1.0), 0.0),
-                // The same slant through the legs.
+
                 (Vec3::new(0.0, 1.3, 1.0), Vec3::new(0.0, -1.0, -1.0), 0.0),
             ];
-            // Given in the world; in the player's frame, as the shaders get them.
+
             let to_player = card_turn(yaw).inverse();
             let packed: Vec<[f32; 4]> = rays
                 .iter()
@@ -1195,7 +1051,7 @@ mod tests {
                 mapped_at_creation: false,
             });
             let (_, samp) = crate::renderer::uniforms::default_probe_cube(&device);
-            // No lamps, so no glass's beam to look past (`capsule_glass_beam`).
+
             let lights_uniform = crate::renderer::lights::LightsUniform::new(&device);
             let shadow_map = crate::renderer::shadow::ShadowMap::with_dimension(&device, 64);
             let g0 = device.create_bind_group(&BindGroupDescriptor {
@@ -1312,10 +1168,6 @@ mod tests {
         }
     }
 
-    /// What clustering must keep: a box's faces, each its own UV island,
-    /// stay apart (each corner one vertex a face, all three at one place);
-    /// two faces bound to different joints share nothing even where they
-    /// touch; and a fan of triangles finer than a cell collapses to nothing.
     #[test]
     fn simplifying_keeps_islands_and_joints_apart() {
         let (verts, index) = box_body();
@@ -1325,8 +1177,7 @@ mod tests {
             let twins = v.iter().filter(|o| o.position == w.position).count();
             assert_eq!(twins, 3, "a corner is three faces' vertices at one place: {:?}", w.position);
         }
-        // Two quads at one place, one on joint 0 and one on joint 1, each
-        // fine enough to collapse to a point were they one island.
+
         let quad = |joint: u32, x: f32| -> Vec<SkinnedMeshVertex> {
             [[x, 0.0, 0.0], [x + 0.2, 0.0, 0.0], [x + 0.2, 0.2, 0.0], [x, 0.2, 0.0]]
                 .map(|p| SkinnedMeshVertex { position: p, normal: [0.0, 0.0, 1.0], uv: [0.0; 2], joint_ids: [joint, 0, 0, 0], joint_weights: [1.0, 0.0, 0.0, 0.0] })
@@ -1338,7 +1189,7 @@ mod tests {
         let (v, i) = simplify(&both, &tris, 0.05);
         assert_eq!(v.len(), 8, "no vertex shared between the joints");
         assert_eq!(i.len(), 12);
-        // A fan of 16 slivers inside one cell.
+
         let fan: Vec<SkinnedMeshVertex> = (0..18)
             .map(|k| {
                 let a = k as f32 * 0.3;
@@ -1350,8 +1201,6 @@ mod tests {
         assert_eq!((v.len(), i.len()), (1, 0), "smaller than a cell: gone");
     }
 
-    /// The box holds every capsule with the margin, and a character with no
-    /// capsules has none.
     #[test]
     fn the_box_holds_the_body_with_its_margin() {
         let mut caps = CapsuleUpload::default();
@@ -1379,9 +1228,7 @@ mod tests {
                 < 1e-5,
             "{hi}"
         );
-        // The rig turned a quarter: the arm along the player's +x lies along
-        // the world's -z, and the box is square to the world round it, its
-        // centre still given in the player's frame.
+
         let quarter = std::f32::consts::FRAC_PI_2;
         let (c, h) = card_box(&caps, 0, quarter).unwrap();
         let world_c = card_turn(quarter) * c;
@@ -1393,9 +1240,6 @@ mod tests {
         );
     }
 
-    /// POSED ONCE, THE SAME CARDS: the legged body bent at a joint, drawn onto
-    /// its six cards skinned per card and posed once by `skin_compute`, reads
-    /// back the same, texel for texel.
     #[test]
     fn a_body_posed_once_draws_the_cards_it_drew_skinned() {
         use crate::renderer::brush_pipeline::probe_pass::MirrorMips;
@@ -1438,7 +1282,7 @@ mod tests {
             contents: bytemuck::cast_slice(&model),
             usage: BufferUsages::UNIFORM,
         });
-        // The torso on joint 0, turned and lifted; the legs on joint 1, swung.
+
         let mut joints: Vec<f32> = (0..MAX_SKIN_JOINTS).flat_map(|_| Mat4::IDENTITY.to_cols_array()).collect();
         joints[..16].copy_from_slice(
             &(Mat4::from_translation(Vec3::new(0.05, 0.1, 0.0)) * Mat4::from_rotation_y(0.4)).to_cols_array(),

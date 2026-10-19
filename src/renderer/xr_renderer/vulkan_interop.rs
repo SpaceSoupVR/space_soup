@@ -15,10 +15,7 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
         None,
         vec![],
         wgpu::InstanceFlags::empty(),
-        // NEW IN wgpu 28: how close to the memory budget the allocator may run
-        // before it starts evicting. The default is what wgpu uses for a device
-        // it creates itself, and this device is an ordinary one -- it is shared
-        // with OpenXR rather than constrained differently.
+
         wgpu::MemoryBudgetThresholds::default(),
         false,
         None,
@@ -28,88 +25,39 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
         .expose_adapter(vk.physical_device)
         .ok_or("wgpu: failed to expose physical device")?;
 
-    // Claim MULTIVIEW only when the device actually enabled it.
-    //
-    // `device_from_raw` believes whatever it is told: this renderer builds its
-    // own `VkDevice`, so wgpu cannot check. Claiming a feature that was never
-    // switched on gets pipelines that pass validation here and go wrong on the
-    // headset -- exactly the class of failure that is invisible on a
-    // development machine, where wgpu runs on Metal and has no multiview at all.
     let mut features = if vk.multiview {
         wgpu::Features::MULTIVIEW
     } else {
         wgpu::Features::empty()
     };
-    // Same contract as MULTIVIEW: claimed only because `VkContext` asked the
-    // queue family whether it can actually timestamp. Without this the renderer
-    // can measure the whole frame and nothing inside it, which is how three
-    // successive guesses about where GPU time goes all turned out wrong.
+
     if vk.timestamp_period_ns.is_some() {
         features |= wgpu::Features::TIMESTAMP_QUERY;
     }
-    // HALF-PRECISION ARITHMETIC, on the same contract: `VkContext` enabled
-    // `shaderFloat16` itself, or this is not claimed. Stock wgpu would also
-    // want 16-bit uniform access for it, which Adreno lacks; our naga fork
-    // asks for that only where a buffer holds a 16-bit type, and no buffer
-    // here does. See `VkContext::shader_f16`.
+
     if vk.shader_f16 {
         features |= wgpu::Features::SHADER_F16;
     }
-    // DUAL-SOURCE BLENDING, on the same contract: `VkContext` switched
-    // `dualSrcBlend` on itself. Without it the water blends by one alpha and
-    // the bed under it greys rather than turning blue-green.
+
     if vk.dual_src_blend {
         features |= wgpu::Features::DUAL_SOURCE_BLENDING;
     }
-    // MULTISAMPLE_ARRAY: the feature that makes MULTIVIEW USABLE HERE AT ALL.
-    //
-    // WebGPU forbids a texture that is both multisampled and layered -- wgpu
-    // refuses one with "Multisampled texture depth or array layers must be 1".
-    // A multiview pass draws into the LAYERS of one attachment, and this
-    // renderer runs the scene pass at 4x MSAA, so before wgpu 28 the two were
-    // mutually exclusive and multiview could not be had without giving up
-    // antialiasing. Vulkan itself has always allowed it; the restriction was
-    // WebGPU's.
-    //
-    // wgpu 28 added this feature to lift it, on Vulkan. That is the whole
-    // reason this renderer moved from wgpu 25 to 28.
-    // See https://github.com/gfx-rs/wgpu/pull/8571.
-    //
-    // Asked of the ADAPTER rather than assumed, on the same contract as
-    // MULTIVIEW above: `device_from_raw` believes whatever it is told, and a
-    // claimed feature that the driver does not have is a texture that fails to
-    // create at startup rather than a warning.
+
     let multisample_array = exposed
         .features
         .contains(wgpu::Features::MULTISAMPLE_ARRAY);
     if multisample_array {
         features |= wgpu::Features::MULTISAMPLE_ARRAY;
     }
-    // EARLY FRAGMENT TESTS on demand: SPIR-V's `EarlyFragmentTests`, core
-    // Vulkan, needs nothing enabled. The probe pass that defers its lookups
-    // writes a storage buffer, and a fragment shader with side effects is
-    // otherwise depth-tested AFTER it runs -- every hidden fragment shaded in
-    // full. See `BrushPipeline::new_probe_pass_deferred`. Asked of the adapter,
-    // on the same contract as the rest.
+
     if exposed.features.contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) {
         features |= wgpu::Features::SHADER_EARLY_DEPTH_TEST;
     }
-    // 16-BIT UNORM TEXTURES: what a moment shadow map is stored in -- four
-    // moments of depth quantised to 64 bits a texel (Peters & Klein, I3D
-    // 2015), for the lights that move. Claimed where the adapter has it, on the
-    // same contract as the rest. The log says what the format can do here,
-    // since a moving light's map needs it rendered into at 4x, resolved and
-    // filtered (docs/quest3-research-2026-10-01.md §2, row 2).
+
     if exposed.features.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
         features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
     }
-    // PUSH CONSTANTS ("immediates" since wgpu 28): 256 bytes on the Quest 3
-    // (`maxPushConstantsSize`, see `log_driver_offer`). They live in the
-    // constant file, where a table indexed by a loop counter might be read
-    // without the memory path every uniform block took: the probe pass reads
-    // its photograph slots from them (`brush_pipeline::PUSH_SCAN`; exp64,
-    // -0.36 ms an eye). Claimed where the adapter
-    // has it, on the same contract as the rest, with its limit below.
+
     if exposed.features.contains(wgpu::Features::IMMEDIATES) {
         features |= wgpu::Features::IMMEDIATES;
     }
@@ -134,68 +82,28 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
         if vk.multiview && multisample_array { "AVAILABLE" } else { "unavailable" },
     );
 
-    // THE LIMITS ARE DECIDED ONCE, here, because since wgpu 30 they are passed
-    // to `device_from_raw` AS WELL AS to the device descriptor below, and the
-    // two disagreeing is a device that validates against one set and runs
-    // against another. Read off `exposed` rather than the wgpu adapter, which
-    // does not exist yet -- it is the same physical device either way, and
-    // `exposed` is moved into `create_adapter_from_hal` further down.
     let limits = wgpu::Limits {
         max_texture_dimension_2d: exposed.capabilities.limits.max_texture_dimension_2d,
-        // A FEATURE IS NOT ENOUGH; THE LIMIT HAS TO ALLOW IT TOO.
-        //
-        // `max_multiview_view_count` defaults to ZERO in every stock limit set,
-        // including `downlevel_defaults`. So a device can report MULTIVIEW,
-        // build every stereo pipeline without complaint, and then reject the
-        // pass itself with "Multiview view count limit violated" -- which is a
-        // scene that never draws, over which the eye pass keeps compositing
-        // live, so one eye looks frozen under moving content (2026-09-19).
-        //
-        // AT LEAST 2, because the ADAPTER REPORTS 0 and is wrong about this
-        // device.
-        //
-        // wgpu's adapter fills that limit from its own feature detection, and
-        // this renderer builds its own `VkDevice` -- so wgpu never saw the
-        // multiview feature get enabled and left the limit at its default of
-        // zero. Measured on the headset: "multiview yes ... AVAILABLE" and
-        // "max_multiview_view_count = 0" in consecutive log lines.
-        //
-        // Two is not a guess. `VkContext` asked the physical device directly
-        // (`VkPhysicalDeviceMultiviewFeatures::multiview`) and enabled it at
-        // device creation; the Vulkan spec's floor for `maxMultiviewViewCount`
-        // once multiview is supported is 6. The adapter's own number is kept
-        // when it is larger, in case a future wgpu learns to see it.
+
         max_multiview_view_count: exposed
             .capabilities
             .limits
             .max_multiview_view_count
             .max(crate::renderer::multiview::STEREO_VIEWS),
-        // THE HARDWARE'S ARRAY-LAYER LIMIT, not wgpu's default of 256.
-        //
-        // 256 layers is 42 cubes, and that number sat in the probe code as a
-        // "hardware" ceiling on how many reflection probes a level could have.
-        // It was never the hardware: Adreno 740 reports maxImageArrayLayers =
-        // 2048 (vulkan.gpuinfo.org), and it is the most common value on
-        // Android. The probe pool is sized from this at load
-        // (`probe_stream::pool_size`), so the log line below is the device
-        // itself confirming what it allows.
+
         max_texture_array_layers: exposed
             .capabilities
             .limits
             .max_texture_array_layers
             .max(wgpu::Limits::downlevel_defaults().max_texture_array_layers),
-        // THE SCENE SHADERS' TEXTURES: 17 in the brush shader that reads the
-        // probe pass, one over WebGPU's portable 16. As many as the scene asks
-        // for (`uniforms::scene_limits`), as far as the device allows -- and
-        // the Adreno's Vulkan allows far more.
+
         max_sampled_textures_per_shader_stage: exposed
             .capabilities
             .limits
             .max_sampled_textures_per_shader_stage
             .min(crate::renderer::uniforms::SCENE_SAMPLED_TEXTURES)
             .max(wgpu::Limits::downlevel_defaults().max_sampled_textures_per_shader_stage),
-        // A FEATURE IS NOT ENOUGH, as for multiview: every stock limit set
-        // allows no push constants at all.
+
         max_immediate_size: if features.contains(wgpu::Features::IMMEDIATES) {
             exposed.capabilities.limits.max_immediate_size
         } else {
@@ -213,10 +121,7 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
     let open_device = exposed.adapter.device_from_raw(
         vk.device.clone(),
         None,
-        // WHAT THIS DEVICE REALLY HAS. The SpaceSoupVR fork's wgpu-hal trusts
-        // robust access only when its extension is listed here; stock wgpu-hal
-        // trusted the physical device's support, and compiled every shader
-        // without its bounds checks on a device with robust access off.
+
         &vk.enabled_extensions,
         features,
         &limits,
@@ -240,11 +145,6 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
     Ok((device, queue))
 }
 
-/// WHAT THIS DRIVER OFFERS, whether or not wgpu exposes it: the limits that
-/// decide where a small uniform table can live (push constants, inline uniform
-/// blocks), and every device extension. We own a wgpu fork, so an extension
-/// the driver has is something we can build on (`docs/quest3-research-...`);
-/// this is the list to plan from, read once at startup.
 unsafe fn log_driver_offer(vk: &VkContext) {
     let props = unsafe { vk.instance.get_physical_device_properties(vk.physical_device) };
     let l = &props.limits;
@@ -296,10 +196,6 @@ pub(super) unsafe fn import_vk_image_as_wgpu(
     }
 }
 
-/// Whether this device renders depth into `format` with optimal tiling --
-/// and so whether wgpu's `Depth24PlusStencil8` IS `D24_UNORM_S8_UINT` here
-/// (wgpu falls back to `D32_SFLOAT_S8_UINT` where it is not, and an imported
-/// D24S8 image would then be viewed as the wrong format).
 pub(super) fn supports_depth_attachment(device: &wgpu::Device, format: vk::Format) -> bool {
     use wgpu::hal::vulkan as hvk;
     let Some(hal_device) = (unsafe { device.as_hal::<hvk::Api>() }) else {
@@ -314,10 +210,6 @@ pub(super) fn supports_depth_attachment(device: &wgpu::Device, format: vk::Forma
     props.optimal_tiling_features.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
 }
 
-/// Whether this device filters `format` linearly when sampled. A shadow
-/// map's comparison sampler asks for Linear; where the format cannot, the
-/// driver may return each texel's test unfiltered, and every shadow edge comes
-/// out in texel-sized squares however wide the kernel.
 pub(super) fn filters_linearly(device: &wgpu::Device, format: vk::Format) -> bool {
     use wgpu::hal::vulkan as hvk;
     let Some(hal_device) = (unsafe { device.as_hal::<hvk::Api>() }) else {
@@ -334,8 +226,6 @@ pub(super) fn filters_linearly(device: &wgpu::Device, format: vk::Format) -> boo
         .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
 }
 
-/// [`import_vk_image_as_wgpu`] with its usages given: a depth swapchain's
-/// image is a depth target, not a colour one.
 pub(super) unsafe fn import_vk_image_as_wgpu_with(
     device: &wgpu::Device,
     image: vk::Image,
@@ -346,10 +236,6 @@ pub(super) unsafe fn import_vk_image_as_wgpu_with(
 ) -> wgpu::Texture {
     use wgpu::hal::vulkan as hvk;
 
-    // A METHOD ON THE HAL DEVICE since wgpu 28, not a free function. Getting
-    // at it is `as_hal`, which returns `None` on any backend but Vulkan -- and
-    // this whole module only exists on the headset, where the backend is
-    // Vulkan by construction.
     let hal_device = device
         .as_hal::<hvk::Api>()
         .expect("wgpu: the XR renderer requires the Vulkan backend");
@@ -371,12 +257,10 @@ pub(super) unsafe fn import_vk_image_as_wgpu_with(
             view_formats: vec![],
         },
         None,
-        // EXTERNAL: this image belongs to the OpenXR swapchain. Telling wgpu it
-        // owns the memory would have it freed underneath the runtime.
+
         hvk::TextureMemory::External,
     );
-    // Released before the texture is handed back, so nothing holds a borrow of
-    // the device across the call below.
+
     drop(hal_device);
 
     device.create_texture_from_hal::<hvk::Api>(
@@ -395,23 +279,13 @@ pub(super) unsafe fn import_vk_image_as_wgpu_with(
             usage,
             view_formats: &[],
         },
-        // UNINITIALIZED: a freshly acquired swapchain image holds nothing we
-        // are entitled to read, and the scene pass clears it. Claiming it
-        // already held colour would let wgpu skip a transition the runtime
-        // expects.
+
         wgpu::TextureUses::UNINITIALIZED,
     )
 }
 
-/// When the pipeline cache is written back, in seconds after the renderer is
-/// made: once startup has built most pipelines, once a scene has been played
-/// in, and once more for those built late. Written only when it has grown.
 const PIPELINE_CACHE_SAVES_S: [u64; 3] = [45, 180, 600];
 
-/// THE DRIVER'S COMPILED SHADERS FROM THE LAST LAUNCH, for every pipeline
-/// built from here on (see `pipeline_cache_file`). Must run before the
-/// renderer's pipelines are created; a thread writes the cache back as it
-/// fills. The cache lives as long as the process: it is never destroyed.
 pub(super) unsafe fn start_pipeline_cache(vk: &VkContext, device: &wgpu::Device) {
     use crate::renderer::pipeline_cache_file as file;
     use wgpu::hal::vulkan as hvk;
@@ -441,8 +315,7 @@ pub(super) unsafe fn start_pipeline_cache(vk: &VkContext, device: &wgpu::Device)
     let create = |data: &[u8]| unsafe {
         vk.device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(data), None)
     };
-    // A driver that refuses the bytes it wrote last time still gets a cache
-    // to fill this time.
+
     let cache = match create(initial).or_else(|_| create(&[])) {
         Ok(cache) => cache,
         Err(e) => {
@@ -484,10 +357,6 @@ pub(super) unsafe fn start_pipeline_cache(vk: &VkContext, device: &wgpu::Device)
     }
 }
 
-/// FIXED FOVEATED RENDERING from here on: every render pass carries a density
-/// map, full density unless it draws into a registered eye target (the
-/// SpaceSoupVR wgpu fork; see `foveation`). Must run before ANY pipeline is
-/// created -- a pipeline made earlier is incompatible with every pass after.
 pub(super) unsafe fn enable_foveation(device: &wgpu::Device) -> bool {
     use wgpu::hal::vulkan as hvk;
     let Some(hal) = (unsafe { device.as_hal::<hvk::Api>() }) else { return false };
@@ -500,8 +369,6 @@ pub(super) unsafe fn enable_foveation(device: &wgpu::Device) -> bool {
     }
 }
 
-/// Density maps for `patterns` (`(width, height, texels)`), written and ready;
-/// their indices, or `None` if the device refused them.
 pub(super) unsafe fn add_foveation_maps(device: &wgpu::Device, patterns: &[(u32, u32, Vec<u8>)]) -> Option<Vec<usize>> {
     use wgpu::hal::vulkan as hvk;
     let hal = unsafe { device.as_hal::<hvk::Api>() }?;
@@ -518,7 +385,6 @@ pub(super) unsafe fn add_foveation_maps(device: &wgpu::Device, patterns: &[(u32,
     }
 }
 
-/// A pass drawing into `view` gets density map `map`, or full density.
 pub(super) unsafe fn set_foveation_target(device: &wgpu::Device, view: &wgpu::TextureView, map: Option<usize>) {
     use wgpu::hal::vulkan as hvk;
     let Some(hal) = (unsafe { device.as_hal::<hvk::Api>() }) else { return };

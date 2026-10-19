@@ -1,75 +1,21 @@
-//! THE GROUND'S SHAPE AS A TEXTURE: its step-1 vertex normals and heights,
-//! read by the ground's shaders at the pixel's place on the ground, so a
-//! COARSER triangle (`ground_lod`'s steps 2 to 16) is lit and textured as the
-//! step-1 ground under it is.
-//!
-//! WHY (`docs/ground-lod-status-2026-10-13.md`, "what is left" 1). The ground
-//! was lit by its INTERPOLATED VERTEX NORMALS and textured on the planes its
-//! DRAWN TRIANGLE faced (`terrain_pipeline`'s `sample_frame`). A triangle of
-//! step 2 spans four of step 1 and interpolates three normals where step 1
-//! interpolated nine: within a pixel of the same surface, the light along a
-//! plateau's rim still moved by more than 20 levels in 766 pixels of the
-//! hilltop of stress_625. Both come from here now, for every triangle of the
-//! lattice at any step:
-//!
-//! - the NORMAL: the step-1 triangle under the pixel, found by the cell and
-//!   the cell's own diagonal, and its three vertex normals blended by the
-//!   pixel's place in it -- exactly what the rasterizer blends for a step-1
-//!   triangle, so step 1 draws the picture it drew;
-//! - the FACE: that step-1 triangle's own plane, from its three heights --
-//!   what `cross(dpdx, dpdy)` gives on a step-1 triangle.
-//!
-//! ONE TEXEL A SAMPLE, `Rgba32Float`: the vertex normal in x, y, z and the
-//! height in w, whose lowest bit is the diagonal of the cell whose lowest
-//! corner the sample is ([`DIAGONAL_BIT`]; a height a part in eight million
-//! off). Read by FOUR loads, the cell's corners: blending them is then three
-//! multiply-adds a corner. (Packed into 8 bytes, two gathers and an unpack
-//! a corner, it was 193 proxy units on every ground reader -- the dry
-//! readers 2,047 -> 2,240, the torch's puddle reader past its 2,600 --
-//! where this is a third of that.) 16 bytes a sample: 1 MB on test_room,
-//! 6.3 MB at 625 samples, 67 MB at 2,049 (its vertex buffer is 218 MB);
-//! sectors cut both.
-//!
-//! WHICH TRIANGLES: the lattice's. A vertex of a cave's ground patch (after the
-//! lattice in the vertex buffer) is marked by its colour's alpha, 0, and a
-//! triangle touching one keeps its interpolated normal and its drawn face
-//! ([`WGSL`]'s `shaped`), as before.
-
 use glam::Vec3;
 
-/// THE GROUND'S READERS TAKE THEIR NORMAL AND FACE FROM THE SHAPE (`true`).
-/// `false`: the renderer binds no shape and they shade by the vertices as
-/// before 2026-10-14 -- the A/B of its cost (`adb shell setprop
-/// debug.spacesoup.groundshape 0` before a launch). The readers carry the
-/// read either way (`mat.shape` 0 skips nothing but its effect).
 pub static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Set in the lowest bit of a texel's height: the cell whose LOWEST corner
-/// (smallest x and z) this sample is, is split along the diagonal between
-/// its other two corners (`(ix + 1, iz)` to `(ix, iz + 1)`); clear for the
-/// one through this sample.
 pub const DIAGONAL_BIT: u32 = 1;
 
-/// The ground's step-1 shape, a texel a sample, row `iz`, column `ix`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GroundShape {
-    /// Texels a side: the lattice's samples, `cells + 1`.
+
     pub size: [u32; 2],
-    /// Metres a cell, along x and z.
+
     pub cell: [f32; 2],
-    /// Cells the ground's footprint uv runs over, along x and z: the uv of a
-    /// sample is its index over these (the footprint can be a hair longer
-    /// than the cells meshed, `Heightfield::meshed_cells`).
+
     pub uv_cells: [f32; 2],
-    /// `[x, y, z, height]` a texel, row-major (the height's lowest bit
-    /// [`DIAGONAL_BIT`]).
+
     pub texels: Vec<[f32; 4]>,
 }
 
-/// The blend weights of a cell's four corners `(00, 10, 01, 11)` -- x first --
-/// at `t` (the place in the cell, 0..1 each way), for the cell's diagonal:
-/// the step-1 triangle the place lies in, and the place's barycentric weights
-/// in it. `through_first`: the diagonal from corner 00 to 11.
 pub fn corner_weights(t: [f32; 2], through_first: bool) -> [f32; 4] {
     let [tx, ty] = t;
     if through_first {
@@ -81,11 +27,7 @@ pub fn corner_weights(t: [f32; 2], through_first: bool) -> [f32; 4] {
 }
 
 impl GroundShape {
-    /// The shape of a ground meshed as a lattice of `cells`, its samples the
-    /// first `(cells[0] + 1) * (cells[1] + 1)` of `positions` (sample
-    /// `(ix, iz)` at `iz * (cells[0] + 1) + ix`) with `normals` beside them,
-    /// drawn as `triangles`. `uv_cells`: [`Self::uv_cells`]. `None` for a
-    /// ground with no cell, or too few positions.
+
     pub fn build(cells: [u32; 2], uv_cells: [f32; 2], positions: &[Vec3], normals: &[Vec3], triangles: &[u32]) -> Option<Self> {
         let [nx, nz] = cells;
         let size = [nx + 1, nz + 1];
@@ -94,11 +36,7 @@ impl GroundShape {
             return None;
         }
         let cell = [(positions[nx as usize].x - positions[0].x) / nx as f32, (positions[(nz * size[0]) as usize].z - positions[0].z) / nz as f32];
-        // EACH CELL'S DIAGONAL, as its drawn triangles have it: a triangle of
-        // the lattice within one cell holds one of the two diagonals' ends.
-        // A cell with none drawn (a hole, ground under a floor) keeps the one
-        // through its first sample; only a coarser step draws there, over
-        // the same normals.
+
         let mut across = vec![false; samples];
         for t in triangles.chunks_exact(3) {
             if t.iter().any(|&v| v as usize >= samples) {
@@ -118,10 +56,7 @@ impl GroundShape {
         let texels = (0..samples)
             .map(|i| {
                 let n = normals[i].try_normalize().unwrap_or(Vec3::Y);
-                // A height of zero (or a denormal) would carry the bit as a
-                // DENORMAL, which a GPU may flush to zero on the way in: the
-                // cell would take the other triangle. The smallest normal
-                // number instead (1e-38 m), its sign kept.
+
                 let y = positions[i].y;
                 let y = if y.to_bits() & 0x7fff_ffff < f32::MIN_POSITIVE.to_bits() { f32::MIN_POSITIVE.copysign(y) } else { y };
                 let h = f32::from_bits((y.to_bits() & !DIAGONAL_BIT) | if across[i] { DIAGONAL_BIT } else { 0 });
@@ -131,13 +66,10 @@ impl GroundShape {
         Some(Self { size, cell, uv_cells, texels })
     }
 
-    /// The texels as bytes, for an `Rgba32Float` texture.
     pub fn bytes(&self) -> &[u8] {
         bytemuck::cast_slice(&self.texels)
     }
 
-    /// What the shader reads at footprint uv `uv`: the normal (normalised)
-    /// and the face, both in the world. The CPU twin of [`WGSL`].
     pub fn at(&self, uv: [f32; 2]) -> (Vec3, Vec3) {
         let g = [uv[0] * self.uv_cells[0], uv[1] * self.uv_cells[1]];
         let c = [g[0].floor().clamp(0.0, (self.size[0] - 2) as f32), g[1].floor().clamp(0.0, (self.size[1] - 2) as f32)];
@@ -156,13 +88,6 @@ impl GroundShape {
     }
 }
 
-/// THE SHADER'S READ, for the ground's material group (binding 9; the uv's
-/// cells and one over the cell sizes in `mat.shape`, [`crate::renderer::terrain_pipeline::
-/// TerrainMaterialUniform::shape`]). `ground_shape_at(uv, lattice)`: the
-/// normal and face at footprint uv `uv` in the WORLD, `shaped` false where
-/// the material has no shape or the triangle touches a vertex off the lattice
-/// (`lattice`, the vertex colour's alpha, under 1). Handed to
-/// `terrain_shader`'s `format!` as an argument, so in single braces.
 pub const WGSL: &str = r#"
 @group(1) @binding(9) var ground_shape: texture_2d<f32>;
 
@@ -172,21 +97,6 @@ struct GroundShapeRead {
     shaped: bool,
 }
 
-// THE STEP-1 GROUND UNDER A PIXEL (`ground_shape`): the cell from the uv, the
-// triangle from the cell's diagonal, the normals blended as the rasterizer
-// blends a step-1 triangle's, and that triangle's own plane.
-//
-// ONLY UNDER A COARSER TRIANGLE: `corner` is the drawn triangle's first
-// vertex (flat), whose lattice sample is even along x and z for every vertex
-// of a coarser step and odd along one of them for every step-1 triangle (the
-// step-1 lists put such a vertex first: `ground_lod::GroundLod::build_with`).
-// A step-1 triangle IS the lattice triangle: its interpolated vertex normal
-// is the step-1 normal, exactly, at every sample, edge pixels included --
-// so it reads nothing and the branch skips the four loads. (Read at the
-// pixel's centre an edge pixel took the NEIGHBOUR's normal: the crease moved
-// to the pixel grid. Centroid interpolation fixed that and cost 6 to 9 ms a
-// frame on the Quest 3: any centroid varying in a pipeline is a threshold
-// penalty there. 2026-10-15.)
 fn ground_shape_at(uv: vec2<f32>, corner: vec2<f32>, lattice: f32) -> GroundShapeRead {
     var r: GroundShapeRead;
     let k = vec2<u32>(round(corner * mat.shape.xy));
@@ -200,9 +110,7 @@ fn ground_shape_at(uv: vec2<f32>, corner: vec2<f32>, lattice: f32) -> GroundShap
         let b = textureLoad(ground_shape, c + vec2<i32>(1, 0), 0);
         let d = textureLoad(ground_shape, c + vec2<i32>(0, 1), 0);
         let e = textureLoad(ground_shape, c + vec2<i32>(1, 1), 0);
-        // The triangle's two edges along x and z, normal and height alike: its
-        // normal is a corner's plus `t` along them, and its plane falls by their
-        // heights' steps. `first`: the cell's diagonal runs from `a` to `e`.
+
         let first = (bitcast<u32>(a.w) & 1u) == 0u;
         let upper = select(t.x + t.y > 1.0, t.y > t.x, first);
         let along_x = select(b - a, e - d, upper);
@@ -215,8 +123,6 @@ fn ground_shape_at(uv: vec2<f32>, corner: vec2<f32>, lattice: f32) -> GroundShap
 }
 "#;
 
-/// The ground reader's two lines that take the shape, and the same lines
-/// without it: what [`unshaped`] edits.
 pub const SHAPED_EDITS: &[(&str, &str)] = &[
     (
         "    let shape = ground_shape_at(in.uv, in.corner, in.col.a);\n    let n = normalize(select(in.normal, to_player_direction(shape.n), shape.shaped));\n",
@@ -225,17 +131,6 @@ pub const SHAPED_EDITS: &[(&str, &str)] = &[
     ("    let f = sample_frame(in.tex_pos, n, step_x, step_y, to_player_direction(shape.face), shape.shaped);", "    let f = sample_frame(in.tex_pos, n, step_x, step_y, n, false);"),
 ];
 
-/// A ground shader (any role or twin) WITHOUT the shape: lit by its
-/// interpolated normals and textured by its drawn triangles, as before
-/// 2026-10-14, and none of the read's code in it. `None` if the lines are not
-/// there once each.
-///
-/// THE WEATHER'S TWINS ARE BUILT SO (`weather::with_weather`): its snow lifts
-/// the vertices off the shape the texture holds, and its gentle twins were at
-/// the instruction cache's edge before the read (the puddles' about 3,350 of
-/// 3,387; the read is about 110 proxy units more). A chunk the weather draws
-/// is therefore held at step 1 (`ground_lod::GroundLod::hold`), where the two
-/// are one picture.
 pub fn unshaped(src: &str) -> Option<String> {
     crate::renderer::ground_cuts::with_cut(src, SHAPED_EDITS)
 }
@@ -244,8 +139,6 @@ pub fn unshaped(src: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// A lattice of `cells`, 0.43 m cells, heights `h`, meshed as the
-    /// mesher meshes it (the shorter diagonal), with area-weighted normals.
     fn lattice(cells: u32, h: &dyn Fn(f32, f32) -> f32) -> (Vec<Vec3>, Vec<Vec3>, Vec<u32>) {
         let (positions, triangles) = crate::renderer::ground_lod::tests::ground(cells, h, &|_, _| false);
         let mut normals = vec![Vec3::ZERO; positions.len()];
@@ -259,10 +152,6 @@ mod tests {
         (positions, normals.into_iter().map(|n| n.normalize_or(Vec3::Y)).collect(), triangles)
     }
 
-    /// AT STEP 1 THE READ IS THE RASTERIZER'S BLEND: at every place inside
-    /// every triangle of a rough lattice, the shape's normal is the
-    /// triangle's three vertex normals blended by the place's barycentric
-    /// weights, and its face is the triangle's own plane.
     #[test]
     fn inside_every_step_1_triangle_the_read_is_its_vertex_blend_and_its_plane() {
         let h = |x: f32, z: f32| 3.0 * (x * 0.37).sin() * (z * 0.21).cos() + 0.8 * (x * 1.9 + z * 2.3).sin();
@@ -292,8 +181,6 @@ mod tests {
         assert!(worst.1 < 1e-4, "face off by {}", worst.1);
     }
 
-    /// A FLAT GROUND AT HEIGHT ZERO KEEPS ITS DIAGONALS: the bit rides on a
-    /// normal number, never a denormal a GPU may flush.
     #[test]
     fn a_height_of_zero_keeps_its_diagonal_bit_on_a_normal_number() {
         let cells = 8;
@@ -304,16 +191,13 @@ mod tests {
         assert!(shape.texels.iter().any(|t| t[3].to_bits() & DIAGONAL_BIT != 0));
     }
 
-    /// A COARSER TRIANGLE READS THE GROUND UNDER IT: a step-2 triangle's
-    /// middle reads the step-1 triangle there, not the blend of its own
-    /// three corners.
     #[test]
     fn a_coarser_triangle_reads_the_step_1_ground_under_it() {
         let h = |x: f32, z: f32| if x > -18.0 { 1.5 } else { 0.0 } + 0.1 * z + 0.3 * (z * 3.1).sin();
         let cells = 8;
         let (positions, normals, triangles) = lattice(cells, &h);
         let shape = GroundShape::build([cells, cells], [cells as f32; 2], &positions, &normals, &triangles).unwrap();
-        // The middle of the 2 x 2 cells from sample (4, 0): sample (5, 1).
+
         let mid = 1 * (cells + 1) + 5;
         let uv = [5.0 / cells as f32, 1.0 / cells as f32];
         let (n, _) = shape.at(uv);
@@ -330,7 +214,7 @@ mod tests {
                 let x = w[1] + w[3];
                 let z = w[2] + w[3];
                 assert!((x - t[0]).abs() < 1e-6 && (z - t[1]).abs() < 1e-6, "{first} {t:?} -> {w:?}");
-                // The corner off the triangle has no say.
+
                 assert!(if first { w[1] == 0.0 || w[2] == 0.0 } else { w[0] == 0.0 || w[3] == 0.0 });
             }
         }
@@ -339,11 +223,7 @@ mod tests {
 
 #[cfg(test)]
 mod varyings {
-    /// EVERY GROUND READER'S VARYINGS FIT THE QUEST 3: no vertex output past
-    /// location 14 (15 inter-stage locations; the host does not enforce it,
-    /// the headset refuses the pipeline -- `effects::variants`' test of the
-    /// same name). The shape added `corner` (flat) at location 5. Every role,
-    /// both builds, the slope twins and the weather's.
+
     #[test]
     fn every_ground_readers_varyings_fit_the_quest_3s_inter_stage_limit() {
         use crate::renderer::terrain_pipeline::{terrain_shader_built, TerrainRole};
@@ -373,10 +253,7 @@ mod varyings {
                             }
                         }
                         assert!(top < QUEST3_MAX_INTER_STAGE_LOCATIONS, "{role:?} writes location {top}; the Quest 3 stops at 14");
-                        // NO CENTROID on any ground varying: on the Quest 3
-                        // one centroid varying cost the ground's pipelines 6
-                        // to 9 ms a frame (2026-10-15; `brush_pipeline`'s
-                        // `the_brush_does_not_pay_for_centroid_interpolation`).
+
                         if let wgpu::naga::TypeInner::Struct { members, .. } = &module.types[result.ty].inner {
                             for m in members {
                                 if let Some(wgpu::naga::Binding::Location { sampling, .. }) = &m.binding {
@@ -396,15 +273,7 @@ mod varyings {
 
 #[cfg(test)]
 mod twins {
-    /// A STEP-1 RUN IS DRAWN BY A PIPELINE WITHOUT THE READ: every ground
-    /// reader and pass (each role, both builds, the slope twins, the
-    /// reflection pass's dedup, outdoor, nowhere and open twins, the
-    /// reader's spotless and baked twins, from world vertices too) builds
-    /// its `pipeline` -- what `TerrainPipeline::at(false)` and so a step-1
-    /// run draws by -- from a source with no `ground_shape_at` call, and its
-    /// `shaped` one with it; the weather's twins have none to drop. And
-    /// `by_step` gives every index of step 1 to the unshaped pipeline and
-    /// every index of the coarser lists to the shaped one.
+
     #[test]
     fn a_step_1_run_is_drawn_by_a_pipeline_without_the_shape_read() {
         use crate::renderer::terrain_pipeline::{by_step, terrain_shader_built, twin_sources, TerrainRole};
@@ -449,7 +318,7 @@ mod twins {
         let (plain, shaped) = twin_sources(weathered);
         assert!(!plain.contains(CALL) && shaped.is_none(), "the weather's twin is unshaped and has no shaped one");
         assert!(checked >= 40, "{checked} sources");
-        // The cut where the coarser lists begin.
+
         let parts = |first, len| by_step(first, len, 1000).collect::<Vec<_>>();
         assert_eq!(parts(0, 999), vec![(0, 999, false)]);
         assert_eq!(parts(990, 30), vec![(990, 10, false), (1000, 20, true)]);
@@ -460,8 +329,7 @@ mod twins {
 
 #[cfg(test)]
 mod sizes {
-    /// MEASUREMENT: what the shape read costs the dry gentle reader by the
-    /// host proxy, function by function (`--ignored --nocapture`).
+
     #[test]
     #[ignore]
     fn shape_read_sizes() {
@@ -472,8 +340,7 @@ mod sizes {
             crate::renderer::brush_pipeline::FaceSun::Baked,
         ));
         let total = |src: &str| crate::renderer::shader_inlining::inlined_sizes(src, "fs_main").iter().map(|f| f.own * f.copies).sum::<usize>();
-        // The face is dead in a gentle twin (its steep test is false): what
-        // the compiler keeps of the read there.
+
         let faceless = |src: &str| {
             let face = "        r.face = normalize(vec3<f32>(-along_x.w * mat.shape.z, 1.0, -along_z.w * mat.shape.w));";
             assert!(src.contains(face));

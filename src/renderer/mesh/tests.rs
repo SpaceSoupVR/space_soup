@@ -48,25 +48,8 @@
         assert!(er.angle_between(r2) < 1e-3, "expected rotation {er:?}, got {r2:?}");
     }
 
-    /// A Python 3 that actually runs.
-    ///
-    /// The fixture work here goes through scene_editor_web/gltf_animation.py, so
-    /// this test needs an interpreter. `python3` is not on PATH on a stock
-    /// Windows box -- the name resolves to a Microsoft Store stub that prints an
-    /// advert and exits non-zero -- so try `python` too, and verify it really
-    /// runs rather than trusting the name. Skips like the GPU check above when
-    /// there is none, because a missing dev tool is not a renderer regression.
     fn python_bin() -> Option<String> {
-        // Probe with the import this test actually performs, not with stdlib
-        // modules every interpreter has. The old probe asked for
-        // `json,struct,pathlib`, which macOS's system Python 3.9 passes happily
-        // -- and then the test failed inside gltf_animation.py, so a version
-        // mismatch surfaced as "stripping existing clips failed" rather than as
-        // a skip. A probe that does not ask for what the test needs turns an
-        // unmet prerequisite into a red test.
-        //
-        // The project venv comes first because that is the interpreter the web
-        // editor itself runs under, so it is the one whose behaviour matters.
+
         let script_dir = workspace_root().join("scene_editor_web");
         let venv = workspace_root().join("scene_editor_web/venv/bin/python");
         let probe = format!(
@@ -107,20 +90,11 @@
         let original_path = workspace_root().join("game/models/m4a1.glb");
         let script_dir = workspace_root().join("scene_editor_web");
 
-        // Work on a private copy, and strip whatever clips the shared asset
-        // currently carries so the "before" half of this test is controlled here.
-        //
-        // This used to assert that game/models/m4a1.glb itself had no orphan
-        // animations. That was true when written and stopped being true the moment
-        // an animator saved a real clip into it, which turned this red for reasons
-        // that have nothing to do with node promotion. A renderer test must not
-        // depend on the current contents of a hand-edited shared model.
         let work_dir = std::env::temp_dir().join(format!("m4a1_fixture_{}", std::process::id()));
         std::fs::create_dir_all(&work_dir).expect("create fixture dir");
         let test_path = work_dir.join("m4a1.glb");
         std::fs::copy(&original_path, &test_path).expect("copy fixture");
-        // The clips reference external _anim_*.bin buffers, so the copy needs them
-        // too or stripping (and loading) hits a missing file.
+
         for entry in std::fs::read_dir(original_path.parent().unwrap()).expect("read models dir").flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with("m4a1_anim_") && name.ends_with(".bin") {
@@ -200,11 +174,6 @@
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
     }
 
-    /// The fixtures are written by the EDITOR'S OWN glb writer, not by anything
-    /// here. A fixture hand-built in Rust would prove that Rust reads what Rust
-    /// writes, which is not the risk -- the risk is the two languages disagreeing
-    /// about the file. Regenerate with `caveGlb.js`'s `buildCaveGlb` if the
-    /// writer changes; a fixture that stopped matching is the news.
     #[test]
     fn a_cave_bake_loads_its_per_vertex_layer_weights() {
         let Some((device, queue, layout)) = headless_gpu() else {
@@ -221,14 +190,10 @@
             .expect("a mesh marked `shading: layered` should carry layered vertices");
         assert_eq!(layered.vertices.len(), prim.vertices.len());
 
-        // A different layer wins at each corner, so this fails if the weights
-        // are read but land on the wrong vertices -- which a "some weights are
-        // present" assertion would not notice.
         assert_eq!(layered.vertices[0].weights, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(layered.vertices[1].weights, [0.0, 1.0, 0.0, 0.0]);
         assert_eq!(layered.vertices[2].weights, [0.0, 0.0, 0.5, 0.5]);
 
-        // Same geometry as the textured form, since it is the same mesh.
         for i in 0..3 {
             assert_eq!(layered.vertices[i].position, prim.vertices[i].position);
             assert_eq!(layered.vertices[i].normal, prim.vertices[i].normal);
@@ -237,9 +202,7 @@
 
     #[test]
     fn a_model_with_vertex_colours_but_no_marker_is_not_layered() {
-        // The same file with `extras` removed. Vertex colours alone must NOT
-        // opt a model in: an artist's vertex-coloured prop would otherwise
-        // render as cave rock, textured from the terrain's material array.
+
         let Some((device, queue, layout)) = headless_gpu() else {
             eprintln!("skipping: no GPU adapter available in this environment");
             return;
@@ -297,10 +260,7 @@
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                // Must mirror `mesh_texture_bgl` exactly, emissive mask
-                // included: this layout stands in for the real one, and a
-                // stand-in that has drifted tests a pipeline that does not
-                // exist.
+
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -346,10 +306,6 @@
         }
     }
 
-    /// The player's body has see-through parts -- the boy's
-    /// `Facials_Hair_Clothing_Extra` is a glTF BLEND material -- and the
-    /// eye pass draws them blended after the opaque ones
-    /// (`Levers::opaque_models`); the hands have none.
     #[test]
     fn a_bodys_see_through_parts_are_marked_blended() {
         let Some((device, queue, layout)) = headless_gpu() else {
@@ -369,11 +325,6 @@
 
     use crate::renderer::mesh::skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, IDLE_BLEND};
 
-    // ── Multi-clip blending ──────────────────────────────────────────────────
-    //
-    // Pure pose math, so no GPU: blend_joint_local is deliberately free-standing
-    // for exactly this reason.
-
     fn pose(name: &str, entries: Vec<(usize, Vec3)>, joints: usize) -> GltfAnimationPose {
         let mut joint_transforms = vec![None; joints];
         for (ji, t) in entries {
@@ -382,13 +333,12 @@
         GltfAnimationPose { name: name.to_string(), joint_transforms }
     }
 
-    /// bolt = joint 0, charging handle = joint 1, trigger = joint 2.
     fn two_clips_sharing_the_bolt() -> (Vec<(Vec3, Quat, Vec3)>, Vec<GltfAnimationPose>) {
         let bind = vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE); 3];
         let animations = vec![
-            // clip 0: charging_handle -- moves the bolt AND the handle
+
             pose("charging_handle", vec![(0, Vec3::new(-1.0, 0.0, 0.0)), (1, Vec3::new(-2.0, 0.0, 0.0))], 3),
-            // clip 1: fire_cycle -- moves the bolt only, a different distance
+
             pose("fire_cycle", vec![(0, Vec3::new(-0.5, 0.0, 0.0))], 3),
         ];
         (bind, animations)
@@ -397,7 +347,7 @@
     #[test]
     fn an_idle_clip_does_not_shadow_an_active_one_sharing_a_joint() {
         let (bind, anims) = two_clips_sharing_the_bolt();
-        // charging_handle is listed first and is fully idle; fire_cycle is driving.
+
         let local = blend_joint_local(&bind, &anims, &[(0, 0.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Override)]);
         assert_eq!(
             local[0].0,
@@ -416,7 +366,7 @@
     #[test]
     fn a_joint_only_one_clip_drives_is_unaffected_by_priority() {
         let (bind, anims) = two_clips_sharing_the_bolt();
-        // The handle is only in clip 0, so it moves even though clip 1 is louder.
+
         let local = blend_joint_local(&bind, &anims, &[(0, 1.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Override)]);
         assert_eq!(local[1].0, Vec3::new(-2.0, 0.0, 0.0));
     }
@@ -442,8 +392,6 @@
         assert!((local[0].0.x - -0.25).abs() < 1e-6, "got {:?}", local[0].0);
     }
 
-    // Guards the threshold itself: a blend just above IDLE_BLEND must still count,
-    // or a slow pull would drop frames near the start of its travel.
     #[test]
     fn a_blend_just_above_the_idle_threshold_counts() {
         let (bind, anims) = two_clips_sharing_the_bolt();
@@ -451,15 +399,10 @@
         assert!(local[0].0.x < 0.0, "a small but real blend must move the joint, got {:?}", local[0].0);
     }
 
-    // ── Additive layering ────────────────────────────────────────────────────
-    //
-    // The case this exists for: recoil riding a cycling bolt. The Override layer
-    // says where the bolt is; recoil nudges it from there.
-
     #[test]
     fn an_additive_clip_adds_to_the_override_layer() {
         let (bind, anims) = two_clips_sharing_the_bolt();
-        // clip 0 puts the bolt at -1.0; clip 1 additively offsets by -0.5.
+
         let local = blend_joint_local(
             &bind, &anims,
             &[(0, 1.0, ClipBlendMode::Override), (1, 1.0, ClipBlendMode::Additive)],
@@ -477,8 +420,6 @@
         assert!((local[0].0.x - -1.25).abs() < 1e-6, "got {:?}", local[0].0);
     }
 
-    // Without an Override layer an additive clip still works, offsetting bind --
-    // so a recoil clip is meaningful on its own, not only on top of something.
     #[test]
     fn an_additive_clip_works_with_no_override_layer() {
         let (bind, anims) = two_clips_sharing_the_bolt();
@@ -486,8 +427,6 @@
         assert!((local[0].0.x - -0.5).abs() < 1e-6, "got {:?}", local[0].0);
     }
 
-    // Two additive clips must compose. Storing absolute poses instead of offsets
-    // would make the last one erase the first.
     #[test]
     fn two_additive_clips_compose_rather_than_replace() {
         let bind = vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE); 3];
@@ -514,8 +453,6 @@
         assert_eq!(with_idle[0].0, without[0].0);
     }
 
-    // Every existing clip is Override, so the default must reproduce exactly what
-    // the runtime did before layering existed.
     #[test]
     fn override_is_the_default_and_behaves_as_before() {
         assert_eq!(ClipBlendMode::default(), ClipBlendMode::Override);

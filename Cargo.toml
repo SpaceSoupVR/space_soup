@@ -14,24 +14,22 @@ name       = "space_soup"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-# The sky model, shared with the baker so the two cannot drift. Tiny and
-# renderer-agnostic by design -- see the crate docs.
+
 space_soup_sky = { path = "../space_soup_sky" }
+spacesoup_graphics = { path = "../spacesoup_graphics" }
 wgpu        = { version = "30.0.1", optional = true }
 bytemuck    = { version = "1.21.0", optional = true, features = ["derive"] }
 glam        = { version = "0.29", features = ["serde"] }
 serde       = { version = "1.0", features = ["derive"] }
 serde_json  = "1.0"
-# `extras` is off by default and turns `Extras` from a Void into the raw JSON.
-# A cave bake declares its own shading there -- see mesh/node.rs.
+
 gltf        = { version = "1.4", features = ["extras", "KHR_materials_transmission"] }
 anyhow      = "1.0"
 image       = { package = "image", version = "0.25.5" }
 fontdue     = "0.9.3"
 lazy_static = "1.5.0"
 log         = "0.4"
-# BOTH TARGETS. The XR renderer is Android-only and needs it to read a wgpu
-# error scope at startup -- see the stereo pipeline guard in `xr_renderer`.
+
 pollster    = "0.3"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
@@ -43,9 +41,7 @@ ndk-glue       = { version = "0.7" }
 ndk            = { version = "0.7" }
 openxr         = { version = "0.18", features = ["loaded"] }
 ash            = { version = "0.38", default-features = false, features = ["linked"] }
-# `TextureSelector`, which wgpu does not re-export: SpaceWarp's motion pass
-# hands one eye's layer of the eye image back to the compositor as an
-# attachment (`CommandEncoder::transition_resources`).
+
 wgpu-types     = "30.0.1"
 
 [features]
@@ -54,12 +50,6 @@ canvas   = ["renderer"]
 renderer = ["dep:wgpu", "dep:bytemuck"]
 voxelize = []
 
-# THE SPACESOUPVR FORK OF wgpu 30.0.1 (github.com/SpaceSoupVR/wgpu, branch
-# `spacesoup/v30.0.1`), cloned beside this repo as `../wgpu`. Every crate from
-# that repo is patched together: patching naga alone would pull in a second
-# copy of `naga-types`. What the fork changes is in its SPACESOUP.md; first,
-# naga declares the 16-bit STORAGE capabilities only for buffers that hold a
-# 16-bit type, so `f16` arithmetic works on Adreno (gpuweb#5006).
 [patch.crates-io]
 naga = { path = "../wgpu/naga" }
 naga-types = { path = "../wgpu/naga-types" }
