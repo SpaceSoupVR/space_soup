@@ -3463,7 +3463,7 @@ impl XrRenderer {
                     }
                     let wholly_under = matches!(eye_in_water, Some((_, EyeWater::Under)));
                     if fx.water && self.water_bodies.iter().any(|b| b.seen.get()) {
-                        pass.set_pipeline(self.sp_water(stereo));
+                        pass.set_pipeline(self.sp_water(stereo, crate::renderer::water_pipeline::WaterMud::Prints));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         for (i, body) in self.water_bodies.iter().enumerate().filter(|(_, b)| b.seen.get()) {
                             let eyes_body = eye_in_water.is_some_and(|(b, _)| b == i);
@@ -3472,10 +3472,11 @@ impl XrRenderer {
                             }
 
                             if planar_eye.is_some_and(|p| p.0 == i) {
-                                pass.set_pipeline(self.water_pipeline.mirrored_for_rings(&body.uniform.rings[0], &body.uniform.ring_drops));
+                                pass.set_pipeline(self.water_pipeline.mirrored_for_rings(&body.uniform.rings[0], &body.uniform.ring_drops, crate::renderer::water_pipeline::WaterMud::of(&body.uniform)));
                                 pass.set_bind_group(2, &self.planar_groups[eye], &[]);
                             } else {
-                                pass.set_pipeline(if eyes_body { &self.water_pipeline.waterline } else { self.sp_water(stereo) });
+                                let mud = crate::renderer::water_pipeline::WaterMud::of(&body.uniform);
+                                pass.set_pipeline(if eyes_body { self.water_pipeline.waterline_for(mud) } else { self.sp_water(stereo, mud) });
                             }
                             pass.set_bind_group(1, &body.bind_groups[body.waves.current()], &[]);
                             pass.set_vertex_buffer(0, body.vertex_buffer.slice(..));

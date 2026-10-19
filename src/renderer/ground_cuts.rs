@@ -69,7 +69,7 @@ pub(crate) const GROUND_CUTS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     ("wx_rings", &[("        if (at.area.x > 0.0 && at.area.y < 0.5 && s.water > 0.0) {", "        if (false) {")]),
-    ("wx_noise", &[("    let fine = 0.65 * wx_noise(p.xz * 3.1) + 0.35 * wx_noise(p.xz * 9.7);", "    let fine = 0.5;")]),
+    ("wx_noise", &[("        fine = fine + select(0.65, 0.35, k == 1u) * wx_noise(p.xz * select(3.1, 9.7, k == 1u));", "        fine = 0.5;")]),
 ];
 
 pub(crate) fn ground_cut_bases() -> Vec<(&'static str, TerrainRole, bool, String)> {

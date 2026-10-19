@@ -101,7 +101,10 @@ impl XrRenderer {
 
     pub(super) fn ground_for_level(&mut self) {
         let painted = self.terrain_splat.is_some();
-        if !crate::renderer::terrain_pipeline::ground_build_moves(painted) {
+        // The ground reads its deform map only once the headset stamps one; with
+        // the flat map it binds today, the deformless build draws the same pixels.
+        let muddy = false;
+        if !crate::renderer::terrain_pipeline::ground_build_moves(painted, muddy) {
             return;
         }
         let started = std::time::Instant::now();

@@ -375,7 +375,13 @@ fn wx_ripple_layer(q: vec2<f32>, t: f32, seed: u32) -> vec2<f32> {{
     return select(vec2<f32>(0.0), d / max(r, 1e-4) * wave, r > 1e-4);
 }}
 fn wx_ripples(xz: vec2<f32>, t: f32) -> vec2<f32> {{
-    return 0.35 * (wx_ripple_layer(xz / 0.35, t, 0u) + wx_ripple_layer(xz / 0.35 + vec2<f32>(0.5), t + 0.37, 17u));
+    // The two layers through one copy of the layer: the first's offsets are 0.
+    var sum = vec2<f32>(0.0);
+    for (var k = 0u; k < 2u; k = k + 1u) {{
+        let o = f32(k);
+        sum = sum + wx_ripple_layer(xz / 0.35 + vec2<f32>(0.5 * o), t + 0.37 * o, 17u * k);
+    }}
+    return 0.35 * sum;
 }}
 
 struct WxSurface {{
@@ -394,7 +400,10 @@ fn wx_surface(p: vec3<f32>, n: vec3<f32>, view: vec3<f32>, footprint: f32) -> Wx
     let at = wx_at(p);
     let open = wx_open(p.y, at.m.w);
     let up = smoothstep(0.55, 0.9, n.y);
-    let fine = 0.65 * wx_noise(p.xz * 3.1) + 0.35 * wx_noise(p.xz * 9.7);
+    var fine = 0.0;
+    for (var k = 0u; k < 2u; k = k + 1u) {{
+        fine = fine + select(0.65, 0.35, k == 1u) * wx_noise(p.xz * select(3.1, 9.7, k == 1u));
+    }}
 
     let damp = select(at.m.x, clamp((mat.sea_line + at.m.x - p.y) * {shore_fade:?}, 0.0, 1.0), at.area.y > 1.5);
 
@@ -1552,7 +1561,9 @@ mod tests {
                 let wet = with_weather_kinds(&src, WeatherKinds::WetOnly).unwrap_or_else(|| panic!("no wet-only twin of the {name}{twin} reader"));
                 validate(&format!("wet-only {name}{twin}"), &wet);
                 let full = with_weather(&src).unwrap();
-                assert!(size(&wet) + 300 < size(&full), "wet-only {name}{twin}: {} against the full twin's {}", size(&wet), size(&full));
+                // 250: the ripples' two layers now share one copy (`wx_ripples`), so
+                // the code this twin drops is ~50 smaller than when this was 300.
+                assert!(size(&wet) + 250 < size(&full), "wet-only {name}{twin}: {} against the full twin's {}", size(&wet), size(&full));
             }
         }
     }

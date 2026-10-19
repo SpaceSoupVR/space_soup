@@ -186,7 +186,7 @@ impl TerrainPipeline {
     }
 
     pub fn new(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Self {
-        let source = terrain_shader_for(TerrainRole::Scene);
+        let source = terrain_shader_built_mud(TerrainRole::Scene, GROUND_PAINTED.load(std::sync::atomic::Ordering::Relaxed), true);
         let source = with_relief(&source).unwrap_or(source);
         Self::build_from(device, format, uniform_layout, 1, crate::renderer::multiview::ViewMode::Mono, TerrainRole::Scene, None, source, "terrain_pipeline_desktop")
     }
@@ -911,6 +911,81 @@ pub enum TerrainRole {
 
 pub static GROUND_PAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the level's ground is built with its deform map read (mud prints,
+/// wet zones, puddles). Without a stamped map every deform term is zero, so
+/// the ground is built without that code ([`deformless`]), which would
+/// otherwise cost by its presence in every ground pixel.
+pub static GROUND_MUDDY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The deform map as the ground and the water read it: per texel the height
+/// and the wetness in their 0..255 steps (128 flat), then the height's change
+/// across the texel each way, `h[x+1] - h[x-1]` and `h[z+1] - h[z-1]`,
+/// wrapping as the sampler does. Bilinear filtering is linear, so the filtered
+/// difference is the difference of the filtered heights one texel either side:
+/// the slope the ground took from four more reads, in the one it already
+/// makes. Half floats hold every one of those integers exactly.
+pub const DEFORM_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
+pub const DEFORM_TEXEL_BYTES: u32 = 8;
+pub const DEFORM_FLAT_TEXEL: [u8; 2] = [128, 0];
+
+/// A small integer as a half float, exactly (|n| <= 2048).
+fn half_of_int(n: i32) -> u16 {
+    if n == 0 {
+        return 0;
+    }
+    let sign = if n < 0 { 0x8000 } else { 0 };
+    let m = n.unsigned_abs();
+    let e = 31 - m.leading_zeros();
+    sign | (((e + 15) as u16) << 10) | (((m << (10 - e)) & 0x3ff) as u16)
+}
+
+/// Rows `from..to` of the deform map's GPU texels from its `[height, wet]`
+/// bytes, `width` x `height` row-major.
+pub fn deform_rows(bytes: &[u8], width: u32, height: u32, from: u32, to: u32) -> Vec<u16> {
+    let (w, h) = (width as usize, height as usize);
+    let at = |x: usize, z: usize| bytes[2 * (z * w + x)] as i32;
+    let mut out = Vec::with_capacity(4 * w * (to - from) as usize);
+    for z in from as usize..to as usize {
+        for x in 0..w {
+            let i = 2 * (z * w + x);
+            let dx = at((x + 1) % w, z) - at((x + w - 1) % w, z);
+            let dz = at(x, (z + 1) % h) - at(x, (z + h - 1) % h);
+            out.extend([half_of_int(bytes[i] as i32), half_of_int(bytes[i + 1] as i32), half_of_int(dx), half_of_int(dz)]);
+        }
+    }
+    out
+}
+
+/// The rows to send after `from..to` changed: their neighbours either way
+/// carry slopes that read them, the first and last rows each other's.
+pub fn deform_rows_touched(from: u32, to: u32, height: u32) -> Vec<(u32, u32)> {
+    let mut runs = vec![(from.saturating_sub(1), (to + 1).min(height))];
+    if from == 0 && height > 1 {
+        runs.push((height - 1, height));
+    }
+    if to >= height && height > 1 {
+        runs.push((0, 1));
+    }
+    runs
+}
+
+pub(crate) const DEFORM_VERTEX: &str = "    let deform = textureSampleLevel(deform_tex, layer_samp, v.uv2, 0.0).r * DEFORM_UNIT;\n    pos.y = pos.y + (deform - DEFORM_FLAT) * 2.0 * mat.deform_metres * mud_weight_v(v.uv2);\n";
+pub(crate) const DEFORM_FRAGMENT_FROM: &str = "    let mudw = mud_weight_f(w);\n";
+pub(crate) const DEFORM_FRAGMENT_TO: &str = "    rough_map = mix(rough_map, 0.08, pool);\n";
+
+/// The ground without its deform map: a flat map moves no vertex, and sinks,
+/// wets, tilts and pools nothing.
+pub fn deformless(src: &str) -> Option<String> {
+    if src.matches(DEFORM_VERTEX).count() != 1 || src.matches(DEFORM_FRAGMENT_FROM).count() != 1 || src.matches(DEFORM_FRAGMENT_TO).count() != 1 {
+        return None;
+    }
+    let mut s = src.replacen(DEFORM_VERTEX, "", 1);
+    let from = s.find(DEFORM_FRAGMENT_FROM)?;
+    let to = s.find(DEFORM_FRAGMENT_TO)? + DEFORM_FRAGMENT_TO.len();
+    s.replace_range(from..to, "");
+    Some(s)
+}
+
 static GROUND_BUILD_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn expect_painted_ground(painted: bool) {
@@ -928,12 +1003,13 @@ pub fn ground_build_wanted(built_painted: bool, level_painted: bool, pinned: boo
     if pinned { built_painted } else { level_painted }
 }
 
-pub fn ground_build_moves(level_painted: bool) -> bool {
+pub fn ground_build_moves(level_painted: bool, level_muddy: bool) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     let built = GROUND_PAINTED.load(Relaxed);
     let want = ground_build_wanted(built, level_painted, GROUND_BUILD_PINNED.load(Relaxed));
     GROUND_PAINTED.store(want, Relaxed);
-    want != built
+    let was_muddy = GROUND_MUDDY.swap(level_muddy, Relaxed);
+    want != built || was_muddy != level_muddy
 }
 
 pub(crate) const PAINTED_FROM: &str = "    return select(derived, authored, mat.use_splat > 0.5);\n";
@@ -995,7 +1071,15 @@ pub fn terrain_shader_for(role: TerrainRole) -> String {
 }
 
 pub fn terrain_shader_built(role: TerrainRole, painted: bool) -> String {
+    terrain_shader_built_mud(role, painted, GROUND_MUDDY.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn terrain_shader_built_mud(role: TerrainRole, painted: bool, muddy: bool) -> String {
     let src = terrain_shader();
+    let src = match muddy {
+        true => src,
+        false => deformless(&src).expect("the ground's deform reads are not where `deformless` takes them out"),
+    };
     let src = match painted {
         true => painted_shader(&src).unwrap_or(src),
         false => src,
@@ -1200,6 +1284,7 @@ struct Material {{
 @group(1) @binding(10) var deform_tex: texture_2d<f32>;
 
 const DEFORM_FLAT: f32 = 128.0 / 255.0;
+const DEFORM_UNIT: f32 = 1.0 / 255.0;
 const DEFORM_POOL_FROM: f32 = 0.35;
 const DEFORM_POOL_TO: f32 = 0.7;
 const DEFORM_NORMAL: f32 = 1.0;
@@ -1251,7 +1336,7 @@ struct VOut {{
 @vertex fn vs_main(v: VIn) -> VOut {{
     var out: VOut;
     var pos = v.pos;
-    let deform = textureSampleLevel(deform_tex, layer_samp, v.uv2, 0.0).r;
+    let deform = textureSampleLevel(deform_tex, layer_samp, v.uv2, 0.0).r * DEFORM_UNIT;
     pos.y = pos.y + (deform - DEFORM_FLAT) * 2.0 * mat.deform_metres * mud_weight_v(v.uv2);
     out.clip      = cam_view_proj() * vec4<f32>(pos, 1.0);
     out.col       = v.col;
@@ -1538,21 +1623,18 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
 
 
     let mudw = mud_weight_f(w);
-    let deform = textureSampleLevel(deform_tex, layer_samp, in.uv, 0.0);
+    let deform = textureSampleLevel(deform_tex, layer_samp, in.uv, 0.0) * DEFORM_UNIT;
     let sunk = max(DEFORM_FLAT - deform.r, 0.0) / DEFORM_FLAT * mudw;
     let wet_zone = deform.g * mudw;
     if (mudw > 0.001) {{
-        let e = 1.0 / vec2<f32>(textureDimensions(deform_tex));
-        let hx = textureSampleLevel(deform_tex, layer_samp, in.uv + vec2<f32>(e.x, 0.0), 0.0).r - textureSampleLevel(deform_tex, layer_samp, in.uv - vec2<f32>(e.x, 0.0), 0.0).r;
-        let hz = textureSampleLevel(deform_tex, layer_samp, in.uv + vec2<f32>(0.0, e.y), 0.0).r - textureSampleLevel(deform_tex, layer_samp, in.uv - vec2<f32>(0.0, e.y), 0.0).r;
-        let slope = vec2<f32>(hx, hz) * (2.0 * mat.deform_metres / max(2.0 * mat.deform_texel, 1e-4)) * mudw * DEFORM_NORMAL;
+        let slope = deform.ba * (2.0 * mat.deform_metres / max(2.0 * mat.deform_texel, 1e-4)) * mudw * DEFORM_NORMAL;
         let bent = to_player_direction(normalize(vec3<f32>(-slope.x, 1.0, -slope.y)));
         shaded_n = normalize(shaded_n + bent - to_player_direction(vec3<f32>(0.0, 1.0, 0.0)));
     }}
     let wet = clamp(max(wet_zone, sunk), 0.0, 1.0);
     let pool = smoothstep(DEFORM_POOL_FROM, DEFORM_POOL_TO, sunk);
     albedo = albedo * (1.0 - mat.wet_dark * wet) * (1.0 - 0.35 * pool);
-    rough_map = mix(rough_map, rough_map * (1.0 - 0.6 * wet), 1.0);
+    rough_map = rough_map * (1.0 - 0.6 * wet);
     rough_map = mix(rough_map, 0.08, pool);
     let rough = specular_aa_roughness(clamp(rough_map, 0.0, 1.0), dpdx(shaded_n), dpdy(shaded_n));
 
@@ -2800,14 +2882,14 @@ impl TerrainMaterial {
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: TextureFormat::Rg8Unorm,
+            format: DEFORM_FORMAT,
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
         queue.write_texture(
             TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
-            &[128, 0],
-            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(2), rows_per_image: Some(1) },
+            bytemuck::cast_slice(&deform_rows(&[crate::renderer::terrain_pipeline::DEFORM_FLAT_TEXEL[0], 0], 1, 1, 0, 1)),
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(DEFORM_TEXEL_BYTES), rows_per_image: Some(1) },
             Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
         );
         tex.create_view(&TextureViewDescriptor::default())
@@ -4483,5 +4565,221 @@ mod relief_tests {
     #[test]
     fn the_material_uniform_is_the_wgsl_structs_size() {
         assert_eq!(std::mem::size_of::<TerrainMaterialUniform>() % 16, 0);
+    }
+}
+
+#[cfg(test)]
+mod mud_build_tests {
+    use super::*;
+    use wgpu::naga;
+
+    fn half_to_f32(h: u16) -> f32 {
+        let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let e = ((h >> 10) & 0x1f) as i32;
+        let m = (h & 0x3ff) as f32;
+        match e {
+            0 => sign * m * 2f32.powi(-24),
+            _ => sign * (1.0 + m / 1024.0) * 2f32.powi(e - 15),
+        }
+    }
+
+    fn validate(label: &str, src: &str) {
+        let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(src)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+    }
+
+    fn total(s: &str) -> usize {
+        crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum()
+    }
+
+    #[test]
+    fn the_deform_map_holds_every_step_and_slope_exactly() {
+        for n in -2048..=2048 {
+            assert_eq!(half_to_f32(half_of_int(n)), n as f32, "{n}");
+        }
+        // 3 x 2: heights 10 20 40 / 70 110 160, wet 1..6.
+        let bytes: Vec<u8> = [10u8, 20, 40, 70, 110, 160].iter().enumerate().flat_map(|(i, h)| [*h, i as u8 + 1]).collect();
+        let rows = deform_rows(&bytes, 3, 2, 0, 2);
+        let texel = |x: usize, z: usize| -> [f32; 4] { std::array::from_fn(|c| half_to_f32(rows[4 * (z * 3 + x) + c])) };
+        assert_eq!(texel(0, 0), [10.0, 1.0, (20 - 40) as f32, (70 - 70) as f32], "x wraps to the last column, z to the last row");
+        assert_eq!(texel(1, 1), [110.0, 5.0, (160 - 70) as f32, (20 - 20) as f32]);
+        assert_eq!(deform_rows_touched(0, 1, 5), vec![(0, 2), (4, 5)]);
+        assert_eq!(deform_rows_touched(2, 3, 5), vec![(1, 4)]);
+        assert_eq!(deform_rows_touched(3, 5, 5), vec![(2, 5), (0, 1)]);
+    }
+
+    #[test]
+    fn every_ground_source_builds_with_and_without_its_deform_map() {
+        let deform_reads = |s: &str| s.matches("textureSampleLevel(deform_tex").count();
+        for painted in [false, true] {
+            for role in [TerrainRole::Scene, TerrainRole::Read, TerrainRole::ProbePass] {
+                let muddy = terrain_shader_built_mud(role, painted, true);
+                let plain = terrain_shader_built_mud(role, painted, false);
+                assert_eq!(deform_reads(&muddy), 2, "{role:?}: one read for the vertex, one for the pixel");
+                assert_eq!(deform_reads(&plain), 0, "{role:?}");
+                validate(&format!("{role:?} muddy"), &muddy);
+                validate(&format!("{role:?} deformless"), &plain);
+                assert!(crate::renderer::weather::with_weather(&muddy).is_some(), "{role:?}: the weather's edits miss the muddy ground");
+            }
+        }
+    }
+
+    #[test]
+    fn the_muddy_ground_stays_under_the_readers_caps() {
+        use crate::renderer::ground_twins::{gentle_shader, torch_weather_twin};
+        use crate::renderer::weather::{with_weather_kinds, WeatherKinds};
+        let baked = |src: String| crate::renderer::brush_pipeline::sun_reader_shader(src, crate::renderer::brush_pipeline::FaceSun::Baked);
+        let gentle = baked(gentle_shader(&terrain_shader_built_mud(TerrainRole::Read, true, true)).unwrap());
+        let puddles = torch_weather_twin(with_weather_kinds(&gentle, WeatherKinds::ALL[1]).unwrap());
+        validate("muddy torch puddle reader", &puddles);
+        let pass = terrain_shader_built_mud(TerrainRole::ProbePass, false, true);
+        let nowhere = pass.replacen(NOWHERE_OFF, NOWHERE_ON, 1);
+        let (full, out) = (total(&pass), total(&nowhere));
+        eprintln!("muddy: torch puddle reader {}, probe pass {full}, its nowhere twin {out}", total(&puddles));
+        assert!(total(&puddles) <= 2600, "the muddy torch puddle reader is {} by the proxy", total(&puddles));
+        // The nowhere twin's job is to drop the probe lookup; the mud is in the
+        // pass and the twin alike, so the twin must drop the same lookup it drops
+        // from the deformless pass (whose share the nowhere test bounds).
+        let plain = terrain_shader_built_mud(TerrainRole::ProbePass, false, false);
+        let plain_nowhere = plain.replacen(NOWHERE_OFF, NOWHERE_ON, 1);
+        assert_eq!(full - out, total(&plain) - total(&plain_nowhere), "the muddy nowhere twin keeps part of the lookup");
+    }
+
+    /// The slope stored beside each height, filtered once, against the four
+    /// filtered heights a texel either side it replaces, on a map of random
+    /// heights (the worst case: every texel a step).
+    #[test]
+    fn one_slope_read_is_the_four_height_reads() {
+        let Some((device, queue)) = super::tests::headless_gpu() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let (w, h) = (37u32, 23u32);
+        let mut seed = 12345u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 24) as u8
+        };
+        let bytes: Vec<u8> = (0..w * h * 2).map(|_| next()).collect();
+        let texture = |format: TextureFormat, data: &[u8], bpr: u32| {
+            let t = device.create_texture(&TextureDescriptor {
+                label: None,
+                size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                TexelCopyTextureInfo { texture: &t, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+                data,
+                TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
+                Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            t.create_view(&TextureViewDescriptor::default())
+        };
+        let old = texture(TextureFormat::Rg8Unorm, &bytes, w * 2);
+        let rows = deform_rows(&bytes, w, h, 0, h);
+        let new = texture(DEFORM_FORMAT, bytemuck::cast_slice(&rows), w * DEFORM_TEXEL_BYTES);
+        let sampler = device.create_sampler(&SamplerDescriptor {
+            address_mode_u: AddressMode::Repeat,
+            address_mode_v: AddressMode::Repeat,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+        const N: u32 = 4096;
+        let out = device.create_buffer(&BufferDescriptor { label: None, size: N as u64 * 32, usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read = device.create_buffer(&BufferDescriptor { label: None, size: N as u64 * 32, usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST, mapped_at_creation: false });
+        let src = format!(
+            "
+@group(0) @binding(0) var old_map: texture_2d<f32>;
+@group(0) @binding(1) var new_map: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+@group(0) @binding(3) var<storage, read_write> out: array<vec4<f32>>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
+    let i = id.x;
+    if (i >= {N}u) {{ return; }}
+    let uv = vec2<f32>(fract(f32(i) * 0.6180339887), fract(f32(i) * 0.7548776662 + 0.1));
+    let e = 1.0 / vec2<f32>(textureDimensions(old_map));
+    let hx = textureSampleLevel(old_map, samp, uv + vec2<f32>(e.x, 0.0), 0.0).r - textureSampleLevel(old_map, samp, uv - vec2<f32>(e.x, 0.0), 0.0).r;
+    let hz = textureSampleLevel(old_map, samp, uv + vec2<f32>(0.0, e.y), 0.0).r - textureSampleLevel(old_map, samp, uv - vec2<f32>(0.0, e.y), 0.0).r;
+    let o = textureSampleLevel(old_map, samp, uv, 0.0);
+    let n = textureSampleLevel(new_map, samp, uv, 0.0) * {unit:?};
+    out[2u * i] = vec4<f32>(hx, hz, n.b, n.a);
+    out[2u * i + 1u] = vec4<f32>(uv, o.r - n.r, o.g - n.g);
+}}
+",
+            unit = 1.0f32 / 255.0
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(src.into()) });
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let group = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&old) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&new) },
+                BindGroupEntry { binding: 2, resource: BindingResource::Sampler(&sampler) },
+                BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        {
+            let mut pass = enc.begin_compute_pass(&ComputePassDescriptor::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(N / 64, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, N as u64 * 32);
+        queue.submit([enc.finish()]);
+        let slice = read.slice(..);
+        slice.map_async(MapMode::Read, |_| {});
+        device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+        let data = slice.get_mapped_range().unwrap();
+        let rows: &[[f32; 4]] = bytemuck::cast_slice(&data);
+        // The exact answer: bilinear heights, wrapping, a texel either side.
+        let height = |x: i64, z: i64| bytes[2 * (z.rem_euclid(h as i64) as usize * w as usize + x.rem_euclid(w as i64) as usize)] as f64 / 255.0;
+        let bilinear = |u: f64, v: f64| {
+            let (x, z) = (u * w as f64 - 0.5, v * h as f64 - 0.5);
+            let (x0, z0) = (x.floor(), z.floor());
+            let (fx, fz) = (x - x0, z - z0);
+            let (x0, z0) = (x0 as i64, z0 as i64);
+            (height(x0, z0) * (1.0 - fx) + height(x0 + 1, z0) * fx) * (1.0 - fz) + (height(x0, z0 + 1) * (1.0 - fx) + height(x0 + 1, z0 + 1) * fx) * fz
+        };
+        let (ex, ez) = (1.0 / w as f64, 1.0 / h as f64);
+        let (mut four, mut one, mut level) = (0f64, 0f64, 0f64);
+        for pair in rows.chunks_exact(2) {
+            let (got, at) = (pair[0], pair[1]);
+            let (u, v) = (at[0] as f64, at[1] as f64);
+            let exact = [bilinear(u + ex, v) - bilinear(u - ex, v), bilinear(u, v + ez) - bilinear(u, v - ez)];
+            four = four.max((got[0] as f64 - exact[0]).abs()).max((got[1] as f64 - exact[1]).abs());
+            one = one.max((got[2] as f64 - exact[0]).abs()).max((got[3] as f64 - exact[1]).abs());
+            level = level.max((at[2] as f64).abs()).max((at[3] as f64).abs());
+        }
+        eprintln!(
+            "worst slope error against exact bilinear, in 8-bit steps: four reads {:.4}, one read {:.4}; height/wet against the 8-bit map {:.4}",
+            four * 255.0,
+            one * 255.0,
+            level * 255.0
+        );
+        // One read of the stored slope must be no further from the exact slope
+        // than the four reads it replaces (the filter's weight precision
+        // bounds both), and the height and wetness must read as they did.
+        assert!(one <= four * 1.05 + 1e-5, "one read {one} vs four {four}");
+        assert!(level * 255.0 < 0.1, "height/wet moved {level}");
     }
 }

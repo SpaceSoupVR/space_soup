@@ -1978,7 +1978,7 @@ impl XrRenderer {
         }
     }
 
-    fn sp_water(&self, stereo: bool) -> &wgpu::RenderPipeline {
+    fn sp_water(&self, stereo: bool, mud: crate::renderer::water_pipeline::WaterMud) -> &wgpu::RenderPipeline {
         let ringing = self.water_bodies.iter().any(|b| b.uniform.rings[0][3] > 0.0);
         let w = match (stereo, &self.stereo_pipelines) {
             (true, Some(p)) => &p.water,
@@ -1988,12 +1988,12 @@ impl XrRenderer {
             return cut;
         }
         if !ringing {
-            return &w.ringless;
+            return w.ringless_for(mud);
         }
 
         match self.water_bodies.iter().find(|b| b.uniform.ring_drops.iter().any(|d| d[3] > 0.0)) {
-            Some(b) => w.for_rings(&b.uniform.rings[0], &b.uniform.ring_drops),
-            None => &w.pipeline,
+            Some(b) => w.for_rings(&b.uniform.rings[0], &b.uniform.ring_drops, mud),
+            None => w.pipeline_for(mud),
         }
     }
     fn sp_sky(&self, stereo: bool) -> &wgpu::RenderPipeline {
@@ -2928,6 +2928,12 @@ impl XrRenderer {
                 }
             })
             .collect();
+        for mud in self.water_bodies.iter().map(|b| crate::renderer::water_pipeline::WaterMud::of(&b.uniform)) {
+            self.water_pipeline.ensure_mud(&self.wgpu_device, mud);
+            if let Some(p) = self.stereo_pipelines.as_mut() {
+                p.water.ensure_mud(&self.wgpu_device, mud);
+            }
+        }
         self.ground_dirty = true;
         log::info!(
             "water: {} body/bodies installed, {} blending",

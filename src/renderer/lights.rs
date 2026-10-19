@@ -923,6 +923,15 @@ fn sky_irradiance(n: vec3<f32>) -> vec3<f32> {{
     e = e + camera.sky_sh[8].rgb * (0.546274 * (x * x - y * y)) * 0.25;
     return max(e, vec3<f32>(0.0));
 }}
+
+fn sky_irradiance_up() -> vec3<f32> {{
+    var e = vec3<f32>(0.0);
+    e = e + camera.sky_sh[0].rgb * 0.282095 * 1.0;
+    e = e + camera.sky_sh[1].rgb * (0.488603 * 1.0) * 0.6666667;
+    e = e + camera.sky_sh[6].rgb * (0.315392 * (3.0 * 0.0 * 0.0 - 1.0)) * 0.25;
+    e = e + camera.sky_sh[8].rgb * (0.546274 * (0.0 * 0.0 - 1.0 * 1.0)) * 0.25;
+    return max(e, vec3<f32>(0.0));
+}}
 const SPEC_STRENGTH: f32 = 0.35;
 const SHININESS: f32 = 32.0;
 
@@ -1082,9 +1091,18 @@ fn character_card_look(g: i32, p: vec3<f32>, d: vec3<f32>, t: f32, lobe: f32, ey
     let lod = clamp(log2(max(2.0 * footprint / texel, 1.0)), 0.0, CHARACTER_CARD_MAX_LOD);
     let row = (centre.w - 1.0) * res;
     let k = w * w;
-    let across_x = character_card_at(select(1.0, 0.0, w.x < 0.0), uvw.yz, row, res, lod, dims);
-    let across_y = character_card_at(select(3.0, 2.0, w.y < 0.0), uvw.zx, row, res, lod, dims);
-    let across_z = character_card_at(select(5.0, 4.0, w.z < 0.0), uvw.xy, row, res, lod, dims);
+    // The three cards through one copy of the read, in the same order.
+    var across_x = vec4<f32>(0.0);
+    var across_y = vec4<f32>(0.0);
+    var across_z = vec4<f32>(0.0);
+    for (var a = 0u; a < 3u; a = a + 1u) {{
+        let side = select(select(w.z, w.y, a == 1u), w.x, a == 0u);
+        let uv = select(select(uvw.xy, uvw.zx, a == 1u), uvw.yz, a == 0u);
+        let card = character_card_at(f32(2u * a) + select(1.0, 0.0, side < 0.0), uv, row, res, lod, dims);
+        across_x = select(across_x, card, a == 0u);
+        across_y = select(across_y, card, a == 1u);
+        across_z = select(across_z, card, a == 2u);
+    }}
 
     let cover = min(across_x.a, min(across_y.a, across_z.a));
     let seen = k.x * across_x + k.y * across_y + k.z * across_z;

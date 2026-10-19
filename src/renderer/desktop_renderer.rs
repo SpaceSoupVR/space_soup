@@ -58,14 +58,14 @@ impl MudBody {
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: TextureFormat::Rg8Unorm,
+            format: super::terrain_pipeline::DEFORM_FORMAT,
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
         queue.write_texture(
             TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
-            map.bytes(),
-            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(map.width() * 2), rows_per_image: Some(map.height()) },
+            bytemuck::cast_slice(&super::terrain_pipeline::deform_rows(map.bytes(), map.width(), map.height(), 0, map.height())),
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(map.width() * super::terrain_pipeline::DEFORM_TEXEL_BYTES), rows_per_image: Some(map.height()) },
             Extent3d { width: map.width(), height: map.height(), depth_or_array_layers: 1 },
         );
         let view = texture.create_view(&TextureViewDescriptor::default());
@@ -77,13 +77,15 @@ impl MudBody {
         if y1 <= y0 {
             return;
         }
-        let width = self.map.width();
-        queue.write_texture(
-            TexelCopyTextureInfo { texture: &self.texture, mip_level: 0, origin: Origin3d { x: 0, y: y0, z: 0 }, aspect: TextureAspect::All },
-            self.map.rows(y0, y1),
-            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 2), rows_per_image: Some(y1 - y0) },
-            Extent3d { width, height: y1 - y0, depth_or_array_layers: 1 },
-        );
+        let (width, height) = (self.map.width(), self.map.height());
+        for (from, to) in super::terrain_pipeline::deform_rows_touched(y0, y1, height) {
+            queue.write_texture(
+                TexelCopyTextureInfo { texture: &self.texture, mip_level: 0, origin: Origin3d { x: 0, y: from, z: 0 }, aspect: TextureAspect::All },
+                bytemuck::cast_slice(&super::terrain_pipeline::deform_rows(self.map.bytes(), width, height, from, to)),
+                TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * super::terrain_pipeline::DEFORM_TEXEL_BYTES), rows_per_image: Some(to - from) },
+                Extent3d { width, height: to - from, depth_or_array_layers: 1 },
+            );
+        }
     }
 }
 
