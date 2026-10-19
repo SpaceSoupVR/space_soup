@@ -314,6 +314,20 @@ impl Renderer {
         }
     }
 
+    /// A blast scars the ground: a crater of `radius` metres, sunk `depth`
+    /// (0..1 of a full footprint) scaled by how muddy the ground is there, the
+    /// scar soaked dark. Returns that mud weight so the caller can size the
+    /// thrown-up mist.
+    pub fn blast_on_mud(&mut self, at: glam::Vec3, radius: f32, depth: f32) -> f32 {
+        let weight = self.mud_weight_at(at.x, at.z);
+        if weight > 0.0 {
+            if let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) {
+                m.map.crater([at.x, at.z], radius, depth * weight);
+            }
+        }
+        weight
+    }
+
     pub fn walkers_on_mud(&mut self, walkers: &[(usize, glam::Vec3)]) {
         let present: Vec<usize> = walkers.iter().map(|w| w.0).collect();
         let weights: Vec<(usize, glam::Vec3, f32)> = walkers.iter().map(|(id, p)| (*id, *p, self.mud_weight_at(p.x, p.z))).collect();
