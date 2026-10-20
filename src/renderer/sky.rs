@@ -74,12 +74,11 @@ pub struct SkyExtra {
 
 impl SkyExtra {
     pub fn set_clouds(&mut self, f: Option<&CloudFrame>) {
+        // `cloud_scale` is the cloud maps' (`Sky::step_clouds`).
         let Some(f) = f else {
-            self.cloud_scale = [0.0; 4];
             return;
         };
         let p = &f.params;
-        self.cloud_scale = [f.tile_inv[0], f.tile_inv[1], f.tile_inv[2], p.coverage];
         self.set_cloud_offsets(f);
         self.cloud_misc[2] = f.sigma_column;
         self.cloud_misc[3] = p.altitude_m + 0.5 * p.thickness_m;
@@ -263,6 +262,7 @@ pub struct Sky {
     /// The volumetric clouds' sky map and shadow, made with the first
     /// clouded snapshot.
     cloud_sky: Option<CloudSky>,
+    night: NightMaps,
     /// Bound in the map's place while there is none: clear, all sky.
     cloud_texture: Texture,
     cloud_sampler: Sampler,
@@ -439,8 +439,63 @@ pub fn sky_bind_group_layout(device: &Device) -> BindGroupLayout {
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
+            night_entry(5),
+            night_entry(6),
+            night_entry(7),
         ],
     })
+}
+
+fn night_entry(binding: u32) -> BindGroupLayoutEntry {
+    BindGroupLayoutEntry {
+        binding,
+        visibility: ShaderStages::FRAGMENT,
+        ty: BindingType::Texture { sample_type: TextureSampleType::Float { filterable: true }, view_dimension: TextureViewDimension::D2, multisampled: false },
+        count: None,
+    }
+}
+
+/// THE NIGHT SKY'S MAPS (`space_soup_sky::night_sky`): the catalogue's
+/// stars in their cells, the moon's face, the Milky Way.
+struct NightMaps {
+    views: [TextureView; 3],
+}
+
+impl NightMaps {
+    fn new(device: &Device, queue: &Queue) -> Self {
+        use space_soup_sky::night_sky as ns;
+        static CELLS: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        static MILKY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let cells = CELLS.get_or_init(|| ns::star_cells(STAR_CELLS as u32).into_iter().flatten().collect());
+        let milky = MILKY.get_or_init(|| ns::MILKY_WAY_MAP.chunks_exact(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect());
+        let n = STAR_CELLS as u32;
+        let make = |label: &str, w: u32, h: u32, bytes: &[u8]| {
+            let t = device.create_texture(&TextureDescriptor {
+                label: Some(label),
+                size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8Unorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                TexelCopyTextureInfo { texture: &t, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+                bytes,
+                TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+                Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            t.create_view(&TextureViewDescriptor::default())
+        };
+        Self {
+            views: [
+                make("sky_star_cells", n, n * 12, cells),
+                make("sky_moon", ns::MOON_SIZE.0, ns::MOON_SIZE.1, ns::MOON_MAP),
+                make("sky_milky_way", ns::MILKY_WAY_SIZE.0, ns::MILKY_WAY_SIZE.1, milky),
+            ],
+        }
+    }
 }
 
 fn cloud_dummy(device: &Device, queue: &Queue) -> Texture {
@@ -522,6 +577,7 @@ impl Sky {
         });
         queue.write_buffer(&extra_buffer, 0, bytemuck::bytes_of(&extra));
         let cloud_texture = cloud_dummy(device, queue);
+        let night = NightMaps::new(device, queue);
         let cloud_sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("sky_cloud_sampler"),
             address_mode_u: AddressMode::Repeat,
@@ -532,7 +588,7 @@ impl Sky {
             mipmap_filter: MipmapFilterMode::Linear,
             ..Default::default()
         });
-        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer, &clouds_view(&None, &cloud_texture), &cloud_sampler);
+        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer, &clouds_view(&None, &cloud_texture), &cloud_sampler, &night);
 
         Self {
             bind_group,
@@ -546,6 +602,7 @@ impl Sky {
             clouds: None,
             cloud_shadow: CloudShadow::default(),
             cloud_sky: None,
+            night,
             cloud_texture,
             cloud_sampler,
             eye_xz: [0.0, 0.0],
@@ -562,7 +619,8 @@ impl Sky {
         self.clouds.is_some() && self.cloud_sky.is_some()
     }
 
-    fn bind(device: &Device, layout: &BindGroupLayout, texture: &Texture, sampler: &Sampler, extra: &Buffer, cloud_view: &TextureView, cloud_sampler: &Sampler) -> BindGroup {
+    #[allow(clippy::too_many_arguments)]
+    fn bind(device: &Device, layout: &BindGroupLayout, texture: &Texture, sampler: &Sampler, extra: &Buffer, cloud_view: &TextureView, cloud_sampler: &Sampler, night: &NightMaps) -> BindGroup {
         let view = texture.create_view(&TextureViewDescriptor::default());
         device.create_bind_group(&BindGroupDescriptor {
             label: Some("sky_bg"),
@@ -573,6 +631,9 @@ impl Sky {
                 BindGroupEntry { binding: 2, resource: extra.as_entire_binding() },
                 BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&cloud_view) },
                 BindGroupEntry { binding: 4, resource: BindingResource::Sampler(cloud_sampler) },
+                BindGroupEntry { binding: 5, resource: BindingResource::TextureView(&night.views[0]) },
+                BindGroupEntry { binding: 6, resource: BindingResource::TextureView(&night.views[1]) },
+                BindGroupEntry { binding: 7, resource: BindingResource::TextureView(&night.views[2]) },
             ],
         })
     }
@@ -632,7 +693,7 @@ impl Sky {
                 usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &self.cloud_sampler);
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &self.cloud_sampler, &self.night);
         }
         write_panorama(queue, &self.texture, pano);
         let new_field = match (&snap.cloud_field, &self.clouds) {
@@ -647,7 +708,7 @@ impl Sky {
                     None => self.cloud_sky = Some(CloudSky::new(device, queue, field, &CloudNoise::shared())),
                 }
             }
-            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &self.cloud_sampler);
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &self.cloud_sampler, &self.night);
         }
         let kept = self.clouds.as_ref().map(|c| c.model.clone());
         self.clouds = match (snap.clouds, &snap.cloud_field) {
@@ -775,6 +836,8 @@ impl Sky {
         self.extra.cloud_misc[0] = d[0];
         self.extra.cloud_misc[1] = d[1];
         self.extra.cloud_misc[2] = d[2];
+        let k = gpu.display_scales();
+        self.extra.cloud_scale = [k[0], k[1], 0.0, 0.0];
         queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
     }
 
@@ -975,6 +1038,9 @@ struct SkyExtra {{
     celestial: array<vec4<f32>, 3>,
 }}
 @group(1) @binding(2) var<uniform> sky_extra: SkyExtra;
+@group(1) @binding(5) var star_cells: texture_2d<f32>;
+@group(1) @binding(6) var moon_map: texture_2d<f32>;
+@group(1) @binding(7) var milky_way: texture_2d<f32>;
 
 struct VOut {{
     @builtin(position) clip: vec4<f32>,
@@ -1026,6 +1092,30 @@ fn star_face_dir(face: u32, uv: vec2<f32>) -> vec3<f32> {{
     }}
 }}
 
+// A star's colour from its B - V (Ballesteros 2012's temperature, then
+// Planck's law at 610, 550 and 465 nm over 550), held to unit luminance and
+// taken halfway to white: at night the eye sees star colours weakly.
+fn star_colour(bv: f32) -> vec3<f32> {{
+    let temp = 4600.0 * (1.0 / (0.92 * bv + 1.7) + 1.0 / (0.92 * bv + 0.62));
+    let k = 1.4388e7 / temp;
+    let g = exp(k / 550.0) - 1.0;
+    let p = vec3<f32>(pow(550.0 / 610.0, 5.0) * g / (exp(k / 610.0) - 1.0), 1.0, pow(550.0 / 465.0, 5.0) * g / (exp(k / 465.0) - 1.0));
+    let c = p / dot(p, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return mix(vec3<f32>(1.0), c, 0.5);
+}}
+
+const MILKY_WAY_SCALE: f32 = {milky_way_scale:?};
+
+// The Milky Way at celestial direction q (NASA Deep Star Maps, its bright
+// stars the catalogue's): radiance per a magnitude-0 star's illuminance.
+fn sky_milky_way(q: vec3<f32>) -> vec3<f32> {{
+    let ra = atan2(q.y, q.x);
+    let dec = asin(clamp(q.z, -1.0, 1.0));
+    let uv = vec2<f32>(fract(0.5 - ra / (2.0 * SKY_PI)), 0.5 - dec / SKY_PI);
+    let c = textureSampleLevel(milky_way, sky_samp, uv, 0.0).rgb;
+    return pow(c, vec3<f32>(2.2)) * (sky_extra.stars.x * MILKY_WAY_SCALE);
+}}
+
 fn sky_stars(d: vec3<f32>, px: f32) -> vec3<f32> {{
     let q = vec3<f32>(dot(sky_extra.celestial[0].xyz, d), dot(sky_extra.celestial[1].xyz, d), dot(sky_extra.celestial[2].xyz, d));
     let a = abs(q);
@@ -1048,66 +1138,39 @@ fn sky_stars(d: vec3<f32>, px: f32) -> vec3<f32> {{
     let airmass = 1.0 / (d.y + 0.025 * exp(-11.0 * d.y));
     let dimmed = exp(-sky_extra.extinction.xyz * airmass);
     let twinkle_depth = clamp((airmass - 2.5) / 10.0, 0.0, 0.6) * sky_extra.stars.w;
-    let cell_angle = (SKY_PI * 0.5) / STAR_CELLS;
     var sum = vec3<f32>(0.0);
+    let lim = sky_extra.stars.y;
     for (var k = 0; k < 4; k = k + 1) {{
         let cell = base + vec2<f32>(f32(k & 1), f32(k >> 1u));
         if (any(cell < vec2<f32>(0.0)) || any(cell >= vec2<f32>(STAR_CELLS))) {{
             continue;
         }}
-        let h = star_hash(u32(cell.x), u32(cell.y), face);
-
-        let c = tan(((cell + 0.5) / STAR_CELLS * 2.0 - 1.0) * (SKY_PI * 0.25));
-        let r2 = 1.0 + dot(c, c);
-        let omega = cell_angle * cell_angle * (1.0 + c.x * c.x) * (1.0 + c.y * c.y) / (r2 * sqrt(r2));
-        let p = sky_extra.stars.z * omega / (4.0 * SKY_PI);
-        if (h.x >= p) {{
-            continue;
+        for (var second = 0u; second < 2u; second = second + 1u) {{
+            let t = textureLoad(star_cells, vec2<i32>(i32(cell.x), i32(cell.y) + i32((face + 6u * second) * u32(STAR_CELLS))), 0);
+            if (t.z <= 0.0) {{
+                break;
+            }}
+            // The catalogue's star: its magnitude, faded out round the
+            // night's limiting magnitude (the light pollution's).
+            let m = (t.z * 255.0 - 1.0) / 25.0 - 2.0;
+            let fade = 1.0 - smoothstep(lim - 0.5, lim + 0.5, m);
+            if (fade <= 0.0) {{
+                continue;
+            }}
+            let place = (t.xy * 255.0 + 0.5) / 256.0;
+            let at = star_face_dir(face, tan(((cell + place) / STAR_CELLS * 2.0 - 1.0) * (SKY_PI * 0.25)));
+            let off = length(cross(q, at));
+            let flux = sky_extra.stars.x * exp2(-1.3287712 * m) * fade;
+            let spread = flux / (2.0 * SKY_PI * sigma * sigma) * exp(-off * off / (2.0 * sigma * sigma));
+            let h = star_hash(u32(cell.x), u32(cell.y), face + 6u * second);
+            let tw = 1.0 + twinkle_depth * (0.6 * sin(sky_extra.mode.z * (11.0 + 7.0 * h.y) + 40.0 * h.z) + 0.4 * sin(sky_extra.mode.z * (23.0 + 9.0 * h.z) + 17.0 * h.y));
+            sum = sum + spread * star_colour(t.w * 2.55 - 0.5) * tw;
         }}
-
-        let m = max(sky_extra.stars.y + log2(max(h.x / p, 1e-6)) * (0.30103 / 0.47), -1.5);
-        let at = star_face_dir(face, tan(((cell + h.yz) / STAR_CELLS * 2.0 - 1.0) * (SKY_PI * 0.25)));
-        let off = length(cross(q, at));
-        let flux = sky_extra.stars.x * exp2(-1.3287712 * m);
-        let spread = flux / (2.0 * SKY_PI * sigma * sigma) * exp(-off * off / (2.0 * sigma * sigma));
-
-        let t = h.w;
-        let colour = mix(vec3<f32>(1.18, 0.95, 0.72), vec3<f32>(0.82, 0.92, 1.25), t * t * (3.0 - 2.0 * t));
-        let tw = 1.0 + twinkle_depth * (0.6 * sin(sky_extra.mode.z * (11.0 + 7.0 * h.y) + 40.0 * h.z) + 0.4 * sin(sky_extra.mode.z * (23.0 + 9.0 * h.z) + 17.0 * h.y));
-        sum = sum + spread * colour * tw;
     }}
+    sum = sum + sky_milky_way(q);
     return sum * dimmed;
 }}
 
-fn moon_albedo(p: vec3<f32>) -> f32 {{
-    var maria = array<vec4<f32>, 11>(
-        vec4<f32>(33.0, -16.0, 11.0, 0.5),
-        vec4<f32>(18.0, -57.0, 19.0, 0.45),
-        vec4<f32>(28.0, 17.0, 7.0, 0.5),
-        vec4<f32>(8.5, 31.0, 8.0, 0.5),
-        vec4<f32>(17.0, 59.0, 5.0, 0.55),
-        vec4<f32>(-8.0, 51.0, 6.5, 0.45),
-        vec4<f32>(-21.0, -17.0, 7.0, 0.4),
-        vec4<f32>(-24.0, -39.0, 4.0, 0.45),
-        vec4<f32>(56.0, 1.0, 6.0, 0.35),
-        vec4<f32>(-15.0, 35.0, 4.0, 0.45),
-        vec4<f32>(0.0, -30.0, 9.0, 0.3),
-    );
-    var a = 1.0;
-    for (var i = 0; i < 11; i = i + 1) {{
-        let m = maria[i];
-        let la = m.x * (SKY_PI / 180.0);
-        let lo = m.y * (SKY_PI / 180.0);
-        let c = vec3<f32>(cos(la) * sin(lo), sin(la), cos(la) * cos(lo));
-        let ang = acos(clamp(dot(p, c), -1.0, 1.0)) * (180.0 / SKY_PI);
-        a = a * (1.0 - m.w * (1.0 - smoothstep(m.z * 0.55, m.z, ang)));
-    }}
-
-    let ty = vec3<f32>(cos(-0.75) * sin(-0.19), sin(-0.75), cos(-0.75) * cos(-0.19));
-    a = a + 0.25 * (1.0 - smoothstep(1.0, 4.0, acos(clamp(dot(p, ty), -1.0, 1.0)) * (180.0 / SKY_PI)));
-
-    return a * 1.18;
-}}
 
 const SUN_LIMB_U: vec3<f32> = vec3<f32>({limb_r:?}, {limb_g:?}, {limb_b:?});
 const SUN_LIMB_BAKED: f32 = {limb_baked:?};
@@ -1196,10 +1259,22 @@ fn sky_moon(d: vec3<f32>, px: f32) -> vec4<f32> {{
     let e = px / rho;
     let cover = 1.0 - smoothstep(1.0 - e, 1.0 + e, r);
     let mu = sqrt(max(1.0 - min(r * r, 1.0), 0.0));
-    let n = right * xy.x + up * xy.y - m * mu;
+    // The moon's own face (LRO): x east, y north, z toward the eye.
+    let p = vec3<f32>(xy.x, xy.y, mu);
+    let lat = asin(clamp(p.y, -1.0, 1.0));
+    let lon = atan2(p.x, p.z);
+    let face = textureSampleLevel(moon_map, sky_samp, vec2<f32>(lon / (2.0 * SKY_PI) + 0.5, 0.5 - lat / SKY_PI), 0.0);
+    // Its relief (LOLA) tilts the ground toward the sun or away, which the
+    // terminator shows.
+    let slope = (face.gb - 0.5) * 0.25;
+    let east = vec3<f32>(cos(lon), 0.0, -sin(lon));
+    let north = vec3<f32>(-sin(lat) * sin(lon), cos(lat), -sin(lat) * cos(lon));
+    let pn = normalize(p - slope.x * east - slope.y * north);
+    let n = right * pn.x + up * pn.y - m * pn.z;
     let mu0 = dot(n, sky_extra.moon_sunward.xyz);
     let lit = smoothstep(-e, e, mu0) * 2.0 * max(mu0, 0.0) / (max(mu0, 0.0) + mu + 1e-4);
-    let albedo = moon_albedo(vec3<f32>(xy.x, xy.y, mu));
+    let tint = (face.a - 0.5) * 0.5;
+    let albedo = face.r * 2.0 * vec3<f32>(1.0 - 0.5 * tint, 1.0, 1.0 + 0.5 * tint);
     let surface = sky_extra.moon_radiance.rgb * albedo * (lit + sky_extra.moon_radiance.w);
 
     let rgb = sky_extra.moon_radiance.rgb;
@@ -1265,6 +1340,7 @@ fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
 "#,
         lights_block = wgsl_lights_block(0, 1),
         star_cells = STAR_CELLS,
+        milky_way_scale = space_soup_sky::night_sky::milky_way_scale(),
         limb_r = SUN_LIMB_U[0],
         limb_g = SUN_LIMB_U[1],
         limb_b = SUN_LIMB_U[2],
@@ -1314,8 +1390,10 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
     }}
     let el = asin(clamp(dir.y, 0.0, 1.0));
     let uv = vec2<f32>(atan2(dir.x, dir.z) / (2.0 * SKY_PI) + 0.5, pow(el / (0.5 * SKY_PI), 1.0 / CLOUD_PACK));
-    let a = textureSampleLevel(cloud_maps, cloud_samp, uv, i32(sky_extra.cloud_misc.x), 0.0);
-    let b = textureSampleLevel(cloud_maps, cloud_samp, uv, i32(sky_extra.cloud_misc.y), 0.0);
+    var a = textureSampleLevel(cloud_maps, cloud_samp, uv, i32(sky_extra.cloud_misc.x), 0.0);
+    var b = textureSampleLevel(cloud_maps, cloud_samp, uv, i32(sky_extra.cloud_misc.y), 0.0);
+    a = vec4<f32>(a.rgb * sky_extra.cloud_scale.x, a.a);
+    b = vec4<f32>(b.rgb * sky_extra.cloud_scale.y, b.a);
     let c = mix(a, b, sky_extra.cloud_misc.z);
     return vec4<f32>(sky * c.a + c.rgb, c.a);
 }}
@@ -1337,37 +1415,14 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
     out
 }
 
-pub const STAR_CELLS: f32 = 160.0;
-
-pub fn star_count_in_cells(star_count: f32) -> f32 {
-    let n = STAR_CELLS as u32;
-    let cell_angle = std::f32::consts::FRAC_PI_2 / STAR_CELLS;
-    let mut sum = 0.0f64;
-    for y in 0..n {
-        for x in 0..n {
-            let c = |i: u32| ((i as f32 + 0.5) / STAR_CELLS * 2.0 - 1.0) * std::f32::consts::FRAC_PI_4;
-            let (cx, cy) = (c(x).tan(), c(y).tan());
-            let r2 = 1.0 + cx * cx + cy * cy;
-            let omega = cell_angle * cell_angle * (1.0 + cx * cx) * (1.0 + cy * cy) / (r2 * r2.sqrt());
-            sum += (star_count * omega / (4.0 * std::f32::consts::PI)).min(1.0) as f64;
-        }
-    }
-    (sum * 6.0) as f32
-}
+pub const STAR_CELLS: f32 = 256.0;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_star_field_holds_the_catalogues_count() {
-        for n in [100.0f32, 2_000.0, 9_100.0, 20_000.0] {
-            let got = star_count_in_cells(n);
-            assert!((got / n - 1.0).abs() < 0.01, "{n} stars asked, the field holds {got}");
-        }
-
-        let crowded = star_count_in_cells(1.0e7);
-        assert!(crowded < 6.0 * STAR_CELLS * STAR_CELLS + 1.0, "{crowded}");
+    fn the_shader_reads_the_star_cells_at_their_size() {
         assert!(sky_shader().contains(&format!("const STAR_CELLS: f32 = {:.1};", STAR_CELLS)));
     }
 

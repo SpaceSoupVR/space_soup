@@ -32,7 +32,8 @@ pub const MAP_PACK: f32 = 1.5;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CloudSkyUniform {
-    /// World x, altitude, world z of the eye the map is seen from.
+    /// World x, altitude, world z of the eye the map is seen from; w the
+    /// scale the map's light is stored at (`CloudSky::encode` sets it).
     pub eye: [f32; 4],
     /// Toward the light (the sun, or the moon after it), unit.
     pub light_dir: [f32; 4],
@@ -106,6 +107,10 @@ pub struct CloudSky {
     next_row: u32,
     /// No map drawn yet: the first is drawn whole.
     fresh: bool,
+    /// Each map's light is stored over the light it was drawn under: a
+    /// night's radiances (1e-8) fell among half floats' subnormals and the
+    /// clouds came out banded and fringed red.
+    scales: [f32; 3],
 }
 
 fn weather_texture(device: &Device, queue: &Queue, field: &CloudField) -> Texture {
@@ -269,6 +274,7 @@ impl CloudSky {
             build: 1,
             next_row: 0,
             fresh: true,
+            scales: [1.0; 3],
         }
     }
 
@@ -305,17 +311,30 @@ impl CloudSky {
         [self.prev as f32, self.cur as f32, self.next_row as f32 / MAP_HEIGHT as f32]
     }
 
+    /// The radiance one stored unit of the shown maps stands for: the last
+    /// whole map's, the newest's.
+    pub fn display_scales(&self) -> [f32; 2] {
+        [1.0 / self.scales[self.prev as usize], 1.0 / self.scales[self.cur as usize]]
+    }
+
     /// ONE FRAME'S CLOUDS: the next slice of the sky map (the whole map when
     /// `whole`, or when none is drawn yet), and the ground's shadow into
     /// `shadow` when given.
     pub fn encode(&mut self, encoder: &mut CommandEncoder, queue: &Queue, u: &CloudSkyUniform, shadow: Option<&TextureView>, whole: bool) {
-        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(u));
         let rows = MAP_HEIGHT / MAP_SLICES;
         let (target, from, to) = if self.fresh || whole {
             (self.cur, 0, MAP_HEIGHT)
         } else {
             (self.build, self.next_row, (self.next_row + rows).min(MAP_HEIGHT))
         };
+        // A map keeps the scale its first slice was drawn at.
+        if from == 0 {
+            let peak = (0..3).map(|c| u.light[c] + u.amb_sky[c]).fold(0.0f32, f32::max);
+            self.scales[target as usize] = 1.0 / peak.max(1e-20);
+        }
+        let mut u = *u;
+        u.eye[3] = self.scales[target as usize];
+        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&u));
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("cloud_sky_map"),
@@ -698,7 +717,7 @@ fn map_dir(uv: vec2<f32>) -> vec3<f32> {
             seen = seen + w;
         }
     }
-    return vec4<f32>(rgb, 1.0 - seen);
+    return vec4<f32>(rgb * u.eye.w, 1.0 - seen);
 }
 
 // THE GROUND'S SHADOW: the light every layer lets through toward the light
