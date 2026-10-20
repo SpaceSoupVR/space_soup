@@ -148,11 +148,41 @@ pub fn apparent_sine(true_sine: f32) -> f32 {
 }
 
 use space_soup_sky::clouds::{CloudField, CloudFrame};
+use space_soup_sky::cloud_layers::{self as cloud_layers, CloudLayer, CloudModel, CloudNoise, LAYERS};
+use crate::renderer::cloud_sky::{CloudSky, CloudSkyUniform};
 
 pub struct SkyClouds {
     pub field: std::sync::Arc<CloudField>,
     pub frame: CloudFrame,
     pub sun_clear: Option<SkySun>,
+    /// The layers' coverage made to mean area (`CloudModel`), kept while
+    /// the scene's cloud parameters stay the same.
+    pub model: std::sync::Arc<CloudModel>,
+    pub seconds: f64,
+    /// The layers where they are now (`Sky::tick`).
+    pub layers: [CloudLayer; LAYERS],
+}
+
+/// The level's share of the clear light through the clouds: their direct
+/// transmittance averaged over a 3 x 3 grid `LEVEL_SUN_HALF_M` round the
+/// level's middle, for what is lit as a whole (probes, lightmaps, effects).
+pub fn level_transmittance(layers: &[CloudLayer; LAYERS], field: &CloudField, dir: [f32; 3]) -> f32 {
+    let noise = CloudNoise::shared();
+    let h = space_soup_sky::clouds::LEVEL_SUN_HALF_M;
+    let d = unit3(dir);
+    let mut sum = 0.0;
+    for j in 0..3 {
+        for i in 0..3 {
+            let xz = [(i as f32 - 1.0) * h, (j as f32 - 1.0) * h];
+            sum += cloud_layers::transmittance_toward(layers, &noise, field, xz, 0.0, d);
+        }
+    }
+    sum / 9.0
+}
+
+fn unit3(d: [f32; 3]) -> [f32; 3] {
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+    d.map(|v| v / len)
 }
 
 /// Metres a side of the clouds' shadow map round the eye: 16 m texels at
@@ -161,9 +191,9 @@ pub const CLOUD_SHADOW_EXTENT_M: f32 = 1024.0;
 /// The map's centre moves in steps this long, so it need not be rebuilt
 /// every metre walked.
 pub const CLOUD_SHADOW_SNAP_M: f32 = 128.0;
-/// Rows built a frame: the whole map every 8 frames (~0.1 s at 72 Hz),
-/// 512 cloud lookups a frame instead of 4096 at once.
-pub const CLOUD_SHADOW_ROWS_PER_FRAME: u32 = 8;
+/// Frames between the CPU's estimates of the shadow map's mean (the light
+/// on ground past its edge): a dozen columns of the twin each time.
+pub const CLOUD_SHADOW_MEAN_FRAMES: u32 = 16;
 /// The share of the sun's flux on level ground a cloud that hides it whole
 /// scatters down from its base. Under a cumulus the ground takes some
 /// 25-35% of the clear sky's global light (direct gone, diffuse up); the
@@ -202,19 +232,14 @@ pub fn cloud_map_border(texels: &mut [u8], size: u32) -> f32 {
     mean
 }
 
-/// The clouds' shadow on the ground, built a slice of rows a frame
-/// (`Sky::step_cloud_shadow`) and shown when whole.
+/// The clouds' shadow on the ground, drawn on the GPU every frame from the
+/// clouds overhead (`Sky::step_clouds`).
 #[derive(Default)]
 pub struct CloudShadow {
-    shown: Vec<u8>,
-    building: Vec<u8>,
-    shown_centre: Option<[f32; 2]>,
-    shown_mean: f32,
-    build_centre: Option<[f32; 2]>,
-    next_row: u32,
-    /// The shown map changed since `take_cloud_shadow_upload`.
-    dirty: bool,
-    /// Read this frame: the clouds are up, the sun is above them, and the
+    centre: Option<[f32; 2]>,
+    mean: f32,
+    frames: u32,
+    /// Read this frame: the clouds are up, the light is above them, and the
     /// lever is on.
     active: bool,
 }
@@ -235,8 +260,14 @@ pub struct Sky {
 
     pub clouds: Option<SkyClouds>,
     pub cloud_shadow: CloudShadow,
+    /// The volumetric clouds' sky map and shadow, made with the first
+    /// clouded snapshot.
+    cloud_sky: Option<CloudSky>,
+    /// Bound in the map's place while there is none: clear, all sky.
     cloud_texture: Texture,
     cloud_sampler: Sampler,
+    /// Where the eye was last frame (world x, z), for the halos' clouds.
+    eye_xz: [f32; 2],
 
     /// The time of day's way from the last snapshot to the newest: drawn
     /// and lit between them, frame by frame (`Sky::tick`), so the sky's
@@ -397,7 +428,7 @@ pub fn sky_bind_group_layout(device: &Device) -> BindGroupLayout {
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Texture {
                     sample_type: TextureSampleType::Float { filterable: true },
-                    view_dimension: TextureViewDimension::D2,
+                    view_dimension: TextureViewDimension::D2Array,
                     multisampled: false,
                 },
                 count: None,
@@ -412,28 +443,32 @@ pub fn sky_bind_group_layout(device: &Device) -> BindGroupLayout {
     })
 }
 
-fn cloud_texture(device: &Device, queue: &Queue, field: Option<&CloudField>) -> Texture {
-    let mips = field.map(|f| f.mips()).unwrap_or_else(|| vec![(1, vec![0, 0, 0, 255])]);
-    let size = mips[0].0;
+fn cloud_dummy(device: &Device, queue: &Queue) -> Texture {
     let texture = device.create_texture(&TextureDescriptor {
-        label: Some("sky_clouds"),
-        size: Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-        mip_level_count: mips.len() as u32,
+        label: Some("sky_clouds_none"),
+        size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8Unorm,
+        format: TextureFormat::Rgba16Float,
         usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    for (level, (s, bytes)) in mips.iter().enumerate() {
-        queue.write_texture(
-            TexelCopyTextureInfo { texture: &texture, mip_level: level as u32, origin: Origin3d::ZERO, aspect: TextureAspect::All },
-            bytes,
-            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(s * 4), rows_per_image: Some(*s) },
-            Extent3d { width: *s, height: *s, depth_or_array_layers: 1 },
-        );
-    }
+    let clear: [u16; 4] = [0, 0, 0, f32_to_f16(1.0)];
+    queue.write_texture(
+        TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+        bytemuck::cast_slice(&clear),
+        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: Some(1) },
+        Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+    );
     texture
+}
+
+fn clouds_view(cloud_sky: &Option<CloudSky>, dummy: &Texture) -> TextureView {
+    match cloud_sky {
+        Some(c) => c.maps_view().clone(),
+        None => dummy.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..Default::default() }),
+    }
 }
 
 impl Sky {
@@ -486,18 +521,18 @@ impl Sky {
             mapped_at_creation: false,
         });
         queue.write_buffer(&extra_buffer, 0, bytemuck::bytes_of(&extra));
-        let cloud_texture = cloud_texture(device, queue, None);
+        let cloud_texture = cloud_dummy(device, queue);
         let cloud_sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("sky_cloud_sampler"),
             address_mode_u: AddressMode::Repeat,
-            address_mode_v: AddressMode::Repeat,
-            address_mode_w: AddressMode::Repeat,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
             mag_filter: FilterMode::Linear,
             min_filter: FilterMode::Linear,
             mipmap_filter: MipmapFilterMode::Linear,
             ..Default::default()
         });
-        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer, &cloud_texture, &cloud_sampler);
+        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer, &clouds_view(&None, &cloud_texture), &cloud_sampler);
 
         Self {
             bind_group,
@@ -510,8 +545,10 @@ impl Sky {
             sampler,
             clouds: None,
             cloud_shadow: CloudShadow::default(),
+            cloud_sky: None,
             cloud_texture,
             cloud_sampler,
+            eye_xz: [0.0, 0.0],
             blend: None,
         }
     }
@@ -522,12 +559,11 @@ impl Sky {
     }
 
     pub fn has_clouds(&self) -> bool {
-        self.clouds.is_some()
+        self.clouds.is_some() && self.cloud_sky.is_some()
     }
 
-    fn bind(device: &Device, layout: &BindGroupLayout, texture: &Texture, sampler: &Sampler, extra: &Buffer, clouds: &Texture, cloud_sampler: &Sampler) -> BindGroup {
+    fn bind(device: &Device, layout: &BindGroupLayout, texture: &Texture, sampler: &Sampler, extra: &Buffer, cloud_view: &TextureView, cloud_sampler: &Sampler) -> BindGroup {
         let view = texture.create_view(&TextureViewDescriptor::default());
-        let cloud_view = clouds.create_view(&TextureViewDescriptor::default());
         device.create_bind_group(&BindGroupDescriptor {
             label: Some("sky_bg"),
             layout,
@@ -596,7 +632,7 @@ impl Sky {
                 usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &self.cloud_texture, &self.cloud_sampler);
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &self.cloud_sampler);
         }
         write_panorama(queue, &self.texture, pano);
         let new_field = match (&snap.cloud_field, &self.clouds) {
@@ -605,11 +641,23 @@ impl Sky {
             _ => false,
         };
         if new_field {
-            self.cloud_texture = cloud_texture(device, queue, snap.cloud_field.as_deref());
-            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &self.cloud_texture, &self.cloud_sampler);
+            if let Some(field) = snap.cloud_field.as_deref() {
+                match self.cloud_sky.as_mut() {
+                    Some(c) => c.set_weather(device, queue, field),
+                    None => self.cloud_sky = Some(CloudSky::new(device, queue, field, &CloudNoise::shared())),
+                }
+            }
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &self.cloud_sampler);
         }
+        let kept = self.clouds.as_ref().map(|c| c.model.clone());
         self.clouds = match (snap.clouds, &snap.cloud_field) {
-            (Some(frame), Some(field)) => Some(SkyClouds { field: field.clone(), frame: frame.at(seconds as f64), sun_clear: snap.light_clear }),
+            (Some(frame), Some(field)) => {
+                let model = kept
+                    .filter(|m| m.params == frame.params)
+                    .unwrap_or_else(|| std::sync::Arc::new(CloudModel::new(&frame.params, &CloudNoise::shared())));
+                let secs = seconds as f64;
+                Some(SkyClouds { field: field.clone(), frame: frame.at(secs), sun_clear: snap.light_clear, layers: model.layers(secs), model, seconds: secs })
+            }
             _ => None,
         };
         self.sun = snap.light;
@@ -646,7 +694,9 @@ impl Sky {
         }
         self.extra.mode[2] = seconds;
         if let Some(c) = self.clouds.as_mut() {
-            c.frame = c.frame.at(seconds as f64);
+            c.seconds = seconds as f64;
+            c.frame = c.frame.at(c.seconds);
+            c.layers = c.model.layers(c.seconds);
             self.extra.set_cloud_offsets(&c.frame);
         }
         let blending = self.blend.as_mut().is_some_and(|b| {
@@ -674,56 +724,58 @@ impl Sky {
 
     fn dim_sun_by_clouds(&mut self) {
         let Some(c) = &self.clouds else { return };
-        let through = c.frame.light_transmittance_over(&c.field, [0.0, 0.0], space_soup_sky::clouds::LEVEL_SUN_HALF_M, space_soup_sky::clouds::LEVEL_SUN_SAMPLES);
+        let through = c.sun_clear.map_or(1.0, |l| level_transmittance(&c.layers, &c.field, l.direction));
         self.sun = c.sun_clear.map(|l| SkySun { light_rgb: l.light_rgb.map(|v| v * through), ..l });
         // The glare round the sun and the moon goes as the clouds cover them
-        // (`sky_halo_through` in the cloud shader).
-        let toward = |v: [f32; 4]| c.frame.transmittance_along(&c.field, [0.0, 0.0], [v[0], v[1], v[2]]);
+        // from the eye (`sky_halo_through` in the cloud shader).
+        let noise = CloudNoise::shared();
+        let eye = self.eye_xz;
+        let toward = |v: [f32; 4]| cloud_layers::transmittance_toward(&c.layers, &noise, &c.field, eye, 0.0, unit3([v[0], v[1], v[2]]));
         self.extra.cloud_sky[3] = toward(self.extra.sun);
         self.extra.cloud_ground[3] = toward(self.extra.moon);
     }
 
-    /// One frame of the clouds' shadow map round `eye_xz` (world x, z):
-    /// the next `CLOUD_SHADOW_ROWS_PER_FRAME` rows toward the clear sun, the
-    /// whole map at once when none is shown yet. `on` false (the lever, or
-    /// no auto light) leaves the level's sun dimmed as a whole.
-    pub fn step_cloud_shadow(&mut self, eye_xz: [f32; 2], on: bool) {
-        let size = crate::renderer::uniforms::CLOUD_SHADOW_SIZE;
-        let n = (size * size) as usize;
-        let cs = &mut self.cloud_shadow;
-        let light = self.clouds.as_ref().and_then(|c| c.sun_clear.map(|s| (c, s)));
-        let Some((c, sun)) = light.filter(|(c, s)| on && c.frame.params.coverage > 0.0 && s.direction[1] > 0.0) else {
-            cs.active = false;
+    /// ONE FRAME OF THE CLOUDS (`CloudSky`): the next slice of the sky map
+    /// seen from `eye` (world), and -- when `shadow` is given and `on` (the
+    /// lever, the clouds up, the light above them) -- their shadow on the
+    /// ground round it. `whole` draws the whole map at once (a still).
+    pub fn step_clouds(&mut self, device: &Device, queue: &Queue, eye: [f32; 3], on: bool, shadow: Option<&TextureView>, whole: bool) {
+        self.eye_xz = [eye[0], eye[2]];
+        let (Some(c), Some(gpu)) = (self.clouds.as_ref(), self.cloud_sky.as_mut()) else {
+            self.cloud_shadow.active = false;
             return;
         };
-        let snap = |v: f32| (v / CLOUD_SHADOW_SNAP_M).round() * CLOUD_SHADOW_SNAP_M;
-        let centre = [snap(eye_xz[0]), snap(eye_xz[1])];
-        if cs.build_centre != Some(centre) || cs.building.len() != n {
-            cs.build_centre = Some(centre);
-            cs.building.resize(n, 255);
-            cs.next_row = 0;
-        }
-        let rows = if cs.shown_centre.is_none() || !cs.active { size } else { CLOUD_SHADOW_ROWS_PER_FRAME };
-        let end = (cs.next_row + rows).min(size);
-        let d = sun.direction;
-        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
-        c.frame.shadow_rows(&c.field, centre, CLOUD_SHADOW_EXTENT_M, size, d.map(|v| v / len), cs.next_row..end, &mut cs.building);
-        cs.next_row = end;
-        if end >= size {
-            std::mem::swap(&mut cs.shown, &mut cs.building);
-            cs.shown_centre = Some(centre);
-            cs.shown_mean = cloud_map_border(&mut cs.shown, size);
-            cs.dirty = true;
-            cs.next_row = 0;
-            cs.building.resize(n, 255);
-        }
-        cs.active = cs.shown_centre.is_some();
-    }
-
-    /// The shown map's texels when they changed since the last call.
-    pub fn take_cloud_shadow_upload(&mut self) -> Option<&[u8]> {
         let cs = &mut self.cloud_shadow;
-        (cs.active && std::mem::take(&mut cs.dirty)).then_some(&cs.shown[..])
+        let light = c.sun_clear.filter(|s| on && c.frame.params.coverage > 0.0 && s.direction[1] > 0.0);
+        let snap = |v: f32| (v / CLOUD_SHADOW_SNAP_M).round() * CLOUD_SHADOW_SNAP_M;
+        let centre = [snap(eye[0]), snap(eye[2])];
+        if let Some(sun) = light {
+            if cs.centre != Some(centre) || cs.frames % CLOUD_SHADOW_MEAN_FRAMES == 0 {
+                let noise = CloudNoise::shared();
+                let d = unit3(sun.direction);
+                let mut sum = 0.0;
+                for j in 0..4 {
+                    for i in 0..4 {
+                        let at = |k: i32| (k as f32 - 1.5) / 4.0 * CLOUD_SHADOW_EXTENT_M;
+                        sum += cloud_layers::transmittance_toward(&c.layers, &noise, &c.field, [centre[0] + at(i), centre[1] + at(j)], eye[1], d);
+                    }
+                }
+                cs.mean = sum / 16.0;
+            }
+            cs.frames = cs.frames.wrapping_add(1);
+            cs.centre = Some(centre);
+        }
+        cs.active = light.is_some() && shadow.is_some();
+        let f = &c.frame;
+        let u = CloudSkyUniform::new(&c.layers, eye, f.light_dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean);
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("clouds") });
+        gpu.encode(&mut encoder, queue, &u, shadow.filter(|_| cs.active), whole);
+        queue.submit(Some(encoder.finish()));
+        let d = gpu.display();
+        self.extra.cloud_misc[0] = d[0];
+        self.extra.cloud_misc[1] = d[1];
+        self.extra.cloud_misc[2] = d[2];
+        queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
     }
 
     /// Where the shown map lies (`Uniforms::cloud_map`) for the player's
@@ -731,7 +783,7 @@ impl Sky {
     pub fn cloud_map(&self, yaw: f32, offset: [f32; 3]) -> [[f32; 4]; 3] {
         let cs = &self.cloud_shadow;
         let sun = self.clouds.as_ref().and_then(|c| c.sun_clear);
-        match (cs.shown_centre.filter(|_| cs.active), sun) {
+        match (cs.centre.filter(|_| cs.active), sun) {
             (Some(c), Some(sun)) => cloud_map_for(c, &sun, yaw, offset),
             _ => [[0.0; 4]; 3],
         }
@@ -743,9 +795,7 @@ impl Sky {
     pub fn sun_at(&self, xz: [f32; 2]) -> Option<SkySun> {
         let clear = self.clouds.as_ref().filter(|_| self.cloud_shadow.active).and_then(|c| c.sun_clear.map(|s| (c, s)));
         let Some((c, s)) = clear else { return self.sun };
-        let d = s.direction;
-        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
-        let t = c.frame.transmittance_along(&c.field, xz, d.map(|v| v / len));
+        let t = cloud_layers::transmittance_toward(&c.layers, &CloudNoise::shared(), &c.field, xz, 0.0, unit3(s.direction));
         Some(SkySun { light_rgb: s.light_rgb.map(|v| v * t), ..s })
     }
 
@@ -1248,111 +1298,30 @@ pub fn sky_cloud_shader() -> String {
         ),
         (
             "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n",
-            "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n@group(1) @binding(3) var cloud_tex: texture_2d<f32>;\n@group(1) @binding(4) var cloud_samp: sampler;\n".to_string(),
+            "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n@group(1) @binding(3) var cloud_maps: texture_2d_array<f32>;\n@group(1) @binding(4) var cloud_samp: sampler;\n".to_string(),
         ),
         (
             "@fragment fn fs_main(",
             format!(
-                r#"const CLOUD_EARTH: f32 = {earth:.1};
-const CLOUD_EROSION: f32 = {erosion:?};
-const CLOUD_MAX_SLANT: f32 = {slant:?};
-const CLOUD_TAP_REACH: f32 = {reach:?};
-const CLOUD_MIN_LIGHT_Y: f32 = {min_ly:?};
-const CLOUD_OCT_A: f32 = {oa:?};
-const CLOUD_OCT_B: f32 = {ob:?};
-const CLOUD_OCT_C: f32 = {oc:?};
-const CLOUD_FORWARD_G: f32 = {fg:?};
-const CLOUD_BACK_G: f32 = {bg:?};
-const CLOUD_BACK_SHARE: f32 = {bs:?};
-const CLOUD_DIFFUSE_K: f32 = {dk:?};
-const CLOUD_HAZE: f32 = {haze:e};
-const CLOUD_EDGE_SOFT: f32 = {edge:?};
-const CLOUD_TAP_NEAR: f32 = {near:?};
-const CLOUD_LIGHT_W0: f32 = {w0:?};
-const CLOUD_LIGHT_W1: f32 = {w1:?};
-const CLOUD_LIGHT_W2: f32 = {w2:?};
-const CLOUD_POWDER_K: f32 = {powder:?};
+                r#"const CLOUD_PACK: f32 = {pack:?};
 
-fn cloud_hg(g: f32, c: f32) -> f32 {{
-    let g2 = g * g;
-    return (1.0 - g2) / (4.0 * SKY_PI * pow(max(1.0 + g2 - 2.0 * g * c, 1e-6), 1.5));
-}}
-
-fn cloud_phase(s: f32, c: f32) -> f32 {{
-    return (1.0 - CLOUD_BACK_SHARE) * cloud_hg(CLOUD_FORWARD_G * s, c) + CLOUD_BACK_SHARE * cloud_hg(CLOUD_BACK_G * s, c);
-}}
-
-fn cloud_density(xz: vec2<f32>) -> f32 {{
-    let cover = sky_extra.cloud_scale.w;
-    let a = textureSample(cloud_tex, cloud_samp, xz * sky_extra.cloud_scale.x + sky_extra.cloud_offset.xy).r;
-    let b = textureSample(cloud_tex, cloud_samp, xz * sky_extra.cloud_scale.y + sky_extra.cloud_offset.zw).g;
-    let detail = textureSample(cloud_tex, cloud_samp, xz * sky_extra.cloud_scale.z + sky_extra.cloud_misc.xy).b;
-    let s = 0.5 * (a + b);
-    let base = select(1.0 - 2.0 * (1.0 - s) * (1.0 - s), 2.0 * s * s, s < 0.5);
-    let d = clamp((base - (1.0 - cover)) / max(cover, 1e-4), 0.0, 1.0);
-    return d * (1.0 - CLOUD_EROSION * detail * (1.0 - d));
-}}
-
-fn cloud_edge(d: f32) -> f32 {{
-    let t = clamp(d / CLOUD_EDGE_SOFT, 0.0, 1.0);
-    return d * t * t * (3.0 - 2.0 * t);
-}}
-
+// The volumetric clouds (`cloud_sky.rs`): the sky map's last whole build
+// blending into its newest, rgb their light and a how much sky shows past
+// them, haze and all.
 fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
-    let mu = max(dir.y, 1e-4);
-    let h = sky_extra.cloud_misc.w;
-    let cc = h * (2.0 * CLOUD_EARTH + h);
-    let rm = CLOUD_EARTH * mu;
-    let t = cc / (sqrt(rm * rm + cc) + rm);
-    let eye = to_world_space(cam_pos());
-    let xz = eye.xz + dir.xz * t;
-    let sigma = sky_extra.cloud_misc.z;
-    let d = cloud_density(xz);
-    let de = cloud_edge(d);
-    let tau_v = sigma * de * min(1.0 / mu, CLOUD_MAX_SLANT);
-    let l = sky_extra.cloud_light_dir.xyz;
-    let ly = max(l.y, CLOUD_MIN_LIGHT_Y);
-    let thick = sky_extra.cloud_light_dir.w;
-    let off = l.xz / ly * (0.5 * thick);
-    let tap = off * min(1.0, CLOUD_TAP_REACH * thick / max(length(off), 1e-6));
-    let path = CLOUD_LIGHT_W0 * de + CLOUD_LIGHT_W1 * cloud_edge(cloud_density(xz + CLOUD_TAP_NEAR * tap)) + CLOUD_LIGHT_W2 * cloud_edge(cloud_density(xz + tap));
-    let tau_l = sigma * path * min(0.5 / ly, CLOUD_MAX_SLANT);
-    let cv = dot(dir, l);
-    let tau_c = sigma * de;
-    let powder = 1.0 - exp(-CLOUD_POWDER_K * tau_c);
-    let oct = (cloud_phase(1.0, cv) * exp(-tau_l)
-        + CLOUD_OCT_A * cloud_phase(CLOUD_OCT_C, cv) * exp(-CLOUD_OCT_B * tau_l)
-        + CLOUD_OCT_A * CLOUD_OCT_A * cloud_phase(CLOUD_OCT_C * CLOUD_OCT_C, cv) * exp(-CLOUD_OCT_B * CLOUD_OCT_B * tau_l))
-        * (powder + (1.0 - powder) * (0.5 + 0.5 * cv));
-    let td_l = 1.0 / (1.0 + CLOUD_DIFFUSE_K * 2.0 * tau_l);
-    let td_c = 1.0 / (1.0 + CLOUD_DIFFUSE_K * tau_c);
-    let light = sky_extra.cloud_light.rgb * (max(l.y, 0.0) * td_l / SKY_PI + oct)
-        + sky_extra.cloud_sky.rgb * td_c + sky_extra.cloud_ground.rgb * (1.0 - td_c);
-    let alpha = (1.0 - exp(-tau_v)) * select(0.0, 1.0, dir.y > 0.0);
-    let a = alpha * exp(-t * CLOUD_HAZE);
-    return vec4<f32>(sky * (1.0 - a) + a * light, 1.0 - alpha);
+    if (dir.y <= 0.0) {{
+        return vec4<f32>(sky, 1.0);
+    }}
+    let el = asin(clamp(dir.y, 0.0, 1.0));
+    let uv = vec2<f32>(atan2(dir.x, dir.z) / (2.0 * SKY_PI) + 0.5, pow(el / (0.5 * SKY_PI), 1.0 / CLOUD_PACK));
+    let a = textureSampleLevel(cloud_maps, cloud_samp, uv, i32(sky_extra.cloud_misc.x), 0.0);
+    let b = textureSampleLevel(cloud_maps, cloud_samp, uv, i32(sky_extra.cloud_misc.y), 0.0);
+    let c = mix(a, b, sky_extra.cloud_misc.z);
+    return vec4<f32>(sky * c.a + c.rgb, c.a);
 }}
 
 @fragment fn fs_main("#,
-                earth = c::EARTH_RADIUS_M,
-                erosion = c::EROSION,
-                slant = c::MAX_SLANT,
-                reach = c::LIGHT_TAP_REACH,
-                min_ly = c::MIN_LIGHT_Y,
-                oa = c::OCTAVE_A,
-                ob = c::OCTAVE_B,
-                oc = c::OCTAVE_C,
-                fg = c::PHASE_FORWARD_G,
-                bg = c::PHASE_BACK_G,
-                bs = c::PHASE_BACK_SHARE,
-                dk = 0.75 * (1.0 - c::DIFFUSE_G),
-                haze = c::HAZE_PER_M,
-                edge = c::EDGE_SOFT,
-                near = c::LIGHT_TAP_NEAR,
-                w0 = c::LIGHT_WEIGHTS[0],
-                w1 = c::LIGHT_WEIGHTS[1],
-                w2 = c::LIGHT_WEIGHTS[2],
-                powder = c::POWDER_K,
+                pack = crate::renderer::cloud_sky::MAP_PACK,
             ),
         ),
         (
@@ -2019,6 +1988,7 @@ mod render_tests {
         render_centre_with(dir, 0.0, fov, post, move |device, queue, layout| {
             let mut sky = Sky::none(device, queue, layout, AMBIENT);
             sky.apply_snapshot(device, queue, layout, &snap, 0.0, zenith);
+            sky.step_clouds(device, queue, [0.0, 0.0, 0.0], false, None, true);
             sky
         }, twin)
     }
@@ -2034,45 +2004,35 @@ mod render_tests {
         }
     }
 
+    /// The sky shader shows the cloud map: the clear sky's own pixels in
+    /// the gaps, and cloud -- not sky -- where the map holds one. (The
+    /// clouds' density is held to its CPU twin by `cloud_sky`'s test.)
     #[test]
-    fn the_cloud_shader_draws_what_the_cpu_twin_computes() {
-        let (snap, zenith) = cloud_snapshot(0.7);
-        let frame = snap.clouds.expect("clouds in the snapshot").at(0.0);
-        let field = snap.cloud_field.clone().unwrap();
+    fn the_cloud_shader_shows_cloud_where_the_map_has_it_and_sky_between() {
+        let (snap, zenith) = cloud_snapshot(0.5);
         let mut clear_snap = snap.clone();
         clear_snap.clouds = None;
         clear_snap.cloud_field = None;
-        let pano = ReflectionSky { pano: snap.panorama_engine(), rotation_deg: 0.0, intensity: 1.0 };
-        let linear = |e: f32| PostUpload { exposure: e, tonemap: crate::renderer::tonemap::ToneMapping::None, ..Default::default() };
-        let (mut compared, mut through_cloud) = (0, 0);
+        let post = PostUpload { exposure: 4.0, ..Default::default() };
+        let (mut gaps, mut clouds) = (0, 0);
         for i in 0..24 {
             let a = i as f32 * 0.61;
-            let up = 0.45 + 0.5 * ((i * 7) % 11) as f32 / 11.0;
+            let up = 0.35 + 0.6 * ((i * 7) % 11) as f32 / 11.0;
             let h = (1.0 - up * up).sqrt();
             let d = glam::Vec3::new(h * a.cos(), up, h * a.sin()).normalize();
-            if d.dot(glam::Vec3::from(snap.discs.sun_dir)) > 0.995 {
+            if d.dot(glam::Vec3::from(snap.discs.sun_dir)) > 0.99 {
                 continue;
             }
-            let (guess, tau) = frame.shade(&field, [0.0, 0.0], d.to_array(), pano.radiance(d));
-            let e = 0.6 / guess.iter().cloned().fold(1e-9f32, f32::max);
-            let sky8 = shot!(snap_px(d.to_array(), &clear_snap, zenith, 0.01, linear(e), false));
-            let got = shot!(snap_px(d.to_array(), &snap, zenith, 0.01, linear(e), false));
-            if sky8.iter().take(3).any(|&v| v >= 250) {
-                continue;
-            }
-            let sky_lin = [0, 1, 2].map(|c| sky8[c] as f32 / 255.0 / e);
-            let (want, _) = frame.shade(&field, [0.0, 0.0], d.to_array(), sky_lin);
-            for c in 0..3 {
-                let w = (want[c] * e * 255.0).clamp(0.0, 255.0);
-                assert!((w - got[c] as f32).abs() <= 6.0, "{d:?} channel {c}: CPU {w:.1}, GPU {} (tau {tau:.2})", got[c]);
-            }
-            compared += 1;
-            if tau > 0.5 {
-                through_cloud += 1;
+            let sky = shot!(snap_px(d.to_array(), &clear_snap, zenith, 0.01, post, false));
+            let got = shot!(snap_px(d.to_array(), &snap, zenith, 0.01, post, false));
+            let diff = (0..3).map(|c| (sky[c] as i32 - got[c] as i32).abs()).max().unwrap();
+            if diff <= 2 {
+                gaps += 1;
+            } else if diff >= 20 {
+                clouds += 1;
             }
         }
-        assert!(compared >= 12, "only {compared} directions compared");
-        assert!(through_cloud >= 3, "only {through_cloud} of them looked through cloud");
+        assert!(gaps >= 3 && clouds >= 3, "{gaps} gaps and {clouds} clouds in 24 directions");
     }
 
     #[test]

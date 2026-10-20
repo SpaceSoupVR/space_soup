@@ -513,11 +513,15 @@ impl XrRenderer {
                 [[0.0; 4]; 2 * crate::renderer::uniforms::ROOM_EXPOSURE_ROOMS]
             };
             drop(eye);
-            // The clouds' shadows, a slice of the map a frame.
-            self.sky.step_cloud_shadow([head_world.x, head_world.z], self.levers.cloud_shadows);
-            if let Some(texels) = self.sky.take_cloud_shadow_upload() {
-                self.uniform_buf.write_cloud_shadow(&self.wgpu_queue, texels);
-            }
+            // The clouds: a slice of their sky map, and their shadow.
+            self.sky.step_clouds(
+                &self.wgpu_device,
+                &self.wgpu_queue,
+                head_world.to_array(),
+                self.levers.cloud_shadows,
+                Some(self.uniform_buf.cloud_shadow_view()),
+                false,
+            );
             crate::renderer::uniforms::PostUpload {
                 exposure: self.post.exposure * if self.auto_exposure { auto } else { 1.0 },
                 terrain_detail_distance: self.levers.terrain_detail_distance,

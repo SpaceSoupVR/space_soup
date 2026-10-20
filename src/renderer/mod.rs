@@ -33,6 +33,7 @@ pub mod tonemap;
 pub mod exposure;
 pub mod probe_stream;
 pub mod room_light;
+pub mod cloud_sky;
 pub mod sky;
 pub mod time_of_day;
 pub mod ssr;

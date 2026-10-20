@@ -596,7 +596,7 @@ impl UniformBuffer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let cloud_shadow_view = cloud_shadow.create_view(&wgpu::TextureViewDescriptor::default());
@@ -655,6 +655,11 @@ impl UniformBuffer {
             cloud_shadow,
             cloud_shadow_view,
         }
+    }
+
+    /// Where the clouds draw their shadow (`Sky::step_clouds`).
+    pub fn cloud_shadow_view(&self) -> &TextureView {
+        &self.cloud_shadow_view
     }
 
     /// The clouds' shadow map, `CLOUD_SHADOW_SIZE` squared, row by row (z),
