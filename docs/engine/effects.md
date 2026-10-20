@@ -40,6 +40,8 @@ made in the editor, runs optimised on the Quest 3, and loses no realism.
 - One shader variant per shading kind (`FxVariant`), each with its SpaceWarp motion twin.
   The union shader holds every kind. Each variant is cut from it with the `// <fx:NAME>` /
   `// </fx:NAME>` markers (see [README.md](README.md): **these comment lines are code**).
+- `Lump` (shade 5, `// <fx:lump>`) draws a mud clump from its normal sprite. It must sit
+  ahead of the coals block, whose test is `layer.z > 2.5`.
 - `EFFECT_MODULE_CUTS` / `module_cut` cut unused modules the same way.
 - `runs` groups the frame's particles into draws within `MAX_OVER_RUNS`.
 - Guards:
@@ -78,6 +80,9 @@ their motion twins. A draw without them smears in synthesised frames.
 - Crown, spray and foam; a strike into disturbed water raises no second crown.
 - Rings go to the water (`the_rings_that_matter_most_go_to_the_water_and_none_pops`): see
   [water.md](water.md).
+- **Mud splashes** are splashes with `mud` above 0: craters, thrown clumps and spray, and
+  pats where they land. See [mud-and-deform.md](mud-and-deform.md). They make no rings and
+  take no part in a water strike's calm.
 
 ## Fire
 

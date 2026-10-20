@@ -19,6 +19,8 @@ pub enum FxVariant {
     ScreenHeat,
 
     Fog,
+
+    Lump,
 }
 
 const SCREEN_LIGHT: &str = "    let light = select(in.colour.rgb, fx_flame(in.colour.rgb, t.r), in.layer.z > 3.5);\n";
@@ -71,7 +73,7 @@ fn tail(s: &mut String, six: bool) {
 }
 
 impl FxVariant {
-    pub const ALL: [Self; 9] = [Self::Union, Self::Plain, Self::Sixway, Self::Flame, Self::Coals, Self::ScreenUnion, Self::ScreenPlain, Self::ScreenHeat, Self::Fog];
+    pub const ALL: [Self; 10] = [Self::Union, Self::Plain, Self::Sixway, Self::Flame, Self::Coals, Self::ScreenUnion, Self::ScreenPlain, Self::ScreenHeat, Self::Fog, Self::Lump];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -84,6 +86,7 @@ impl FxVariant {
             Self::ScreenPlain => "effects_screened",
             Self::ScreenHeat => "effects_screened_heat",
             Self::Fog => "effects_over_fog",
+            Self::Lump => "effects_over_lump",
         }
     }
 
@@ -105,6 +108,7 @@ impl FxVariant {
             (true, s) if s > 3.5 => Self::ScreenHeat,
             (true, _) => Self::ScreenPlain,
             (false, s) if s < -1.5 => Self::Fog,
+            (false, s) if s > 4.5 => Self::Lump,
             (false, s) if s > 2.5 => Self::Coals,
             (false, s) if s > 1.5 => Self::Flame,
             (false, s) if s > 0.5 => Self::Sixway,
@@ -119,27 +123,38 @@ impl FxVariant {
             Self::Union => cut(&mut s, "fog"),
             Self::ScreenUnion => {}
             Self::Plain | Self::Sixway => {
+                cut(&mut s, "lump");
                 cut(&mut s, "coals");
                 cut(&mut s, "flame");
                 cut(&mut s, "fog");
                 tail(&mut s, self == Self::Sixway);
             }
             Self::Flame => {
+                cut(&mut s, "lump");
                 cut(&mut s, "coals");
                 only(&mut s, "flame", "    if (in.layer.z > 1.5) {\n");
                 cut(&mut s, "fog");
                 cut_tail(&mut s);
             }
             Self::Coals => {
+                cut(&mut s, "lump");
                 only(&mut s, "coals", "    if (in.layer.z > 2.5) {\n");
                 cut(&mut s, "flame");
                 cut(&mut s, "fog");
                 cut_tail(&mut s);
             }
             Self::Fog => {
+                cut(&mut s, "lump");
                 cut(&mut s, "coals");
                 cut(&mut s, "flame");
                 only(&mut s, "fog", "    if (in.layer.z < -1.5) {\n");
+                cut_tail(&mut s);
+            }
+            Self::Lump => {
+                only(&mut s, "lump", "    if (in.layer.z > 4.5) {\n");
+                cut(&mut s, "coals");
+                cut(&mut s, "flame");
+                cut(&mut s, "fog");
                 cut_tail(&mut s);
             }
             Self::ScreenPlain => swap(&mut s, SCREEN_LIGHT, "    let light = in.colour.rgb;\n"),
@@ -155,6 +170,7 @@ impl FxVariant {
 
 pub const EFFECT_MODULE_CUTS: &[(&str, &str, &str)] = &[
     ("none", "fs_over", "nothing: the union"),
+    ("lump", "fs_over", "sprite_lump: a mud clump's normal read, sun, sheen"),
     ("coals", "fs_over", "sprite_bed: the bed of coals"),
     ("flame", "fs_over", "sprite_flame: the heat ramp, the flow-blended frames, the erosion"),
     ("sixway", "fs_over", "sprite_sixway: the back layers' two reads and the six-side weights (what is left is sprite_plain)"),
@@ -168,6 +184,7 @@ pub fn module_cut(name: &str) -> Option<String> {
     let mut s = effects_shader();
     match name {
         "none" | "screen_none" => {}
+        "lump" => cut(&mut s, "lump"),
         "coals" => cut(&mut s, "coals"),
         "flame" => cut(&mut s, "flame"),
         "sixway" => tail(&mut s, false),

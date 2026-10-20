@@ -19,6 +19,13 @@ use super::terrain_pipeline::{deform_rows, deform_rows_touched, TerrainImage, DE
 /// load, a pause) does not relax every print at once.
 pub const MAX_SETTLE_STEP: f32 = 0.25;
 
+/// Metres of sinking or piling as the map's print depths: a full print
+/// (`PRINT_SINK` steps of the 127.5 either side of flat) sinks
+/// `deform_metres * PRINT_SINK / 127.5` (`DEFORM_VERTEX`).
+pub fn print_depths(metres: f32, deform_metres: f32) -> f32 {
+    metres / (deform_metres.max(1e-4) * spacesoup_graphics::mud::PRINT_SINK / 127.5)
+}
+
 pub struct MudBody {
     pub map: MudMap,
     pub texture: Texture,
@@ -117,6 +124,28 @@ impl MudBody {
             self.map.crater([at.x, at.z], radius, depth * weight);
         }
         weight
+    }
+
+    /// A MUD SPLASH'S CRATER, dug when it is raised
+    /// (`effects::mud_splash::crater`), scaled by the mud there.
+    /// `deform_metres` is the ground's `TerrainMaterialUniform::deform_metres`.
+    pub fn splash_crater(&mut self, s: &crate::renderer::effects::Splash, splat: Option<&TerrainImage>, mud_layer: i32, deform_metres: f32) {
+        let ([x, z], radius, depth) = crate::renderer::effects::mud_splash::crater(s);
+        let weight = self.weight_at(splat, mud_layer, x, z);
+        if weight > 0.0 && radius > 0.0 {
+            self.map.crater([x, z], radius, print_depths(depth, deform_metres) * weight);
+        }
+    }
+
+    /// Clumps come down (`effects::mud_splash::MudLandings::take`): each a
+    /// pat of mud where it lands, scaled by the mud there; none off it.
+    pub fn land(&mut self, landings: &[crate::renderer::effects::mud_splash::Landing], splat: Option<&TerrainImage>, mud_layer: i32, deform_metres: f32) {
+        for l in landings {
+            let weight = self.weight_at(splat, mud_layer, l.centre[0], l.centre[1]);
+            if weight >= spacesoup_graphics::mud::MUD_WEIGHT_FLOOR {
+                self.map.deposit(l.centre, l.radius, l.heading, l.stretch, print_depths(l.height, deform_metres) * weight, weight);
+            }
+        }
     }
 
     /// How much of the ground at world (`x`, `z`) is the mud layer, 0..1: the

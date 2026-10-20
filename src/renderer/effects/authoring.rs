@@ -27,7 +27,7 @@ fn channels(c: Channels) -> &'static str {
     }
 }
 
-pub const VARIANT_PROXY: [usize; 9] = [436, 114, 160, 215, 142, 130, 105, 126, 462];
+pub const VARIANT_PROXY: [usize; 10] = [541, 114, 160, 215, 142, 130, 105, 126, 462, 150];
 
 pub fn variant_cost(v: FxVariant) -> (usize, f32) {
     let proxy = VARIANT_PROXY[FxVariant::ALL.iter().position(|x| *x == v).expect("every variant is listed")];

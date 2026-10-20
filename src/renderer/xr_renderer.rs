@@ -508,6 +508,9 @@ pub struct XrRenderer {
     effect_seen_until: Vec<f64>,
 
     splashes: Vec<crate::renderer::effects::Splash>,
+    /// Where the mud splashes' clumps are still to come down
+    /// (`effects::mud_splash`), on the splashes' clock.
+    mud_landings: crate::renderer::effects::mud_splash::MudLandings,
 
     water_wake: crate::renderer::water_wake::WakeField,
     wake_sources: Vec<crate::renderer::water_wake::WakeSource>,
@@ -1516,6 +1519,7 @@ impl XrRenderer {
             effect_emitters: Vec::new(),
             effect_seen_until: Vec::new(),
             splashes: Vec::new(),
+            mud_landings: Default::default(),
             water_wake: Default::default(),
             wake_sources: Vec::new(),
             effect_library: Default::default(),
@@ -2707,6 +2711,17 @@ impl XrRenderer {
         self.mud.as_mut().map_or(0.0, |m| m.blast(self.terrain_splat.as_ref(), layer, at, radius, depth))
     }
 
+    /// The ground at world (`x`, `z`) where it is mud: its height and how much
+    /// of it is the mud layer (0..1), for what decides that something struck
+    /// mud (`effects::Splash::mud`). None off the ground or off the mud.
+    pub fn mud_ground(&self, x: f32, z: f32) -> Option<(f32, f32)> {
+        let layer = self.terrain_settings.mud_layer.round() as i32;
+        let m = self.mud.as_ref()?;
+        let g = self.ground_heights.as_ref()?;
+        let weight = m.weight_at(self.terrain_splat.as_ref(), layer, x, z);
+        (weight >= spacesoup_graphics::mud::MUD_WEIGHT_FLOOR).then(|| (g.at(x, z), weight))
+    }
+
     /// Whether the ground draws with its deform map read (`GROUND_MUDDY`).
     pub(crate) fn ground_is_muddy(&self) -> bool {
         self.mud.is_some()
@@ -2930,7 +2945,15 @@ impl XrRenderer {
     pub fn add_splash(&mut self, mut splash: crate::renderer::effects::Splash) {
         const KEPT: usize = 48;
 
-        if let Some(b) = self.water_bodies.iter().find(|b| (b.uniform.extinction[3] - splash.position.y).abs() < 0.05) {
+        if splash.mud > 0.0 {
+            // The crater now; each clump's pat when it comes down
+            // (`set_water_time`).
+            let layer = self.terrain_settings.mud_layer.round() as i32;
+            if let Some(m) = self.mud.as_mut() {
+                m.splash_crater(&splash, self.terrain_splat.as_ref(), layer, self.terrain_settings.deform_metres);
+            }
+            self.mud_landings.add(&splash);
+        } else if let Some(b) = self.water_bodies.iter().find(|b| (b.uniform.extinction[3] - splash.position.y).abs() < 0.05) {
             let xz = glam::Vec2::new(splash.position.x, splash.position.z);
             splash.position.y += crate::renderer::water_pipeline::swash_lift(&b.uniform, splash.depth, xz);
         }
@@ -3029,6 +3052,13 @@ impl XrRenderer {
         let lasts = crate::renderer::effects::SPLASH_SECONDS.max(crate::renderer::water_pipeline::RING_SECONDS) as f64;
         self.splashes.retain(|s| now - s.born < lasts && s.born <= now + 1.0);
         let rings = crate::renderer::effects::splash_rings(&self.splashes, now, self.player.offset);
+        let landed = self.mud_landings.take(now);
+        if !landed.is_empty() {
+            let layer = self.terrain_settings.mud_layer.round() as i32;
+            if let Some(m) = self.mud.as_mut() {
+                m.land(&landed, self.terrain_splat.as_ref(), layer, self.terrain_settings.deform_metres);
+            }
+        }
 
         if !self.water_bodies.is_empty() {
             let centre = glam::Vec2::new(self.player.offset.x, self.player.offset.z);

@@ -6,6 +6,7 @@ use super::lights::{Light, LightKind};
 use super::probe_stream::ProbeDesc;
 
 mod flash;
+pub mod mud_splash;
 pub mod authoring;
 pub mod seen;
 pub mod stack;
@@ -229,8 +230,15 @@ pub const FLASH_VARIANTS: u32 = 4;
 pub const FLASH_FRAMES: u32 = 3;
 pub const CORE_LAYER: u32 = FLASH_LAYER + FLASH_VARIANTS * FLASH_FRAMES;
 pub const CORE_VARIANTS: u32 = 2;
-pub const ATLAS_LAYERS: u32 = CORE_LAYER + CORE_VARIANTS;
+/// Mud clumps: each a clod's normal and cover (`mud_splash::lump_frame`).
+pub const MUD_LAYER: u32 = CORE_LAYER + CORE_VARIANTS;
+pub const MUD_VARIANTS: u32 = 4;
+pub const ATLAS_LAYERS: u32 = MUD_LAYER + MUD_VARIANTS;
 pub const ATLAS_SIZE: u32 = 128;
+/// A mud lump's wet sheen: its peak (over the mud's albedo, so a thin water
+/// film's 3% reflectance against an albedo of about 0.1) and its sharpness.
+const LUMP_SHEEN: f32 = 1.0;
+const LUMP_GLOSS: f32 = 40.0;
 const ATLAS_MIPS: u32 = 8;
 
 const MAX_SLOTS: usize = 2048;
@@ -1455,13 +1463,22 @@ pub struct Splash {
 
     pub flat: f32,
     pub seed: u64,
+
+    /// MUD, not water: how wet the mud struck is, 0 (water, every splash
+    /// before mud had them) to 1 (slurry). A mud splash throws clumps and
+    /// spray and leaves a crater and spatter in the mud map
+    /// (`mud_splash`, docs/engine/mud-and-deform.md).
+    pub mud: f32,
+    /// A BLAST in the mud, not a strike: the energy that went into the
+    /// ground, joules (`Splash::mud_blast`). 0 for anything thrown or shot.
+    pub blast: f32,
 }
 
 impl Splash {
 
     pub fn new(position: Vec3, born: f64, velocity: Vec3, size: f32, mass: f32) -> Self {
         let seed = hash64(born.to_bits() ^ hash64((position.x.to_bits() as u64) << 32 | position.z.to_bits() as u64));
-        Self { position, born, velocity, size, mass, sunlit: 1.0, depth: 30.0, calm: 1.0, held: 0.0, flat: 0.0, seed }
+        Self { position, born, velocity, size, mass, sunlit: 1.0, depth: 30.0, calm: 1.0, held: 0.0, flat: 0.0, seed, mud: 0.0, blast: 0.0 }
     }
 
     pub fn projectile(position: Vec3, born: f64, velocity: Vec3, diameter: f32, mass: f32) -> Self {
@@ -1784,6 +1801,9 @@ pub fn splash_range(shape: &SplashShape) -> f32 {
 }
 
 pub fn splash_bounds(s: &Splash) -> (Vec3, Vec3) {
+    if s.mud > 0.0 {
+        return mud_splash::bounds(s);
+    }
     let shape = splash_shape(s);
     let fastest = shape.sheet_speed + shape.spray_speed + shape.plow;
 
@@ -1809,11 +1829,19 @@ pub fn splash_seen(s: &Splash, time: f64, views: &[[glam::Vec4; 6]]) -> bool {
 
 pub fn strike(live: &mut Vec<Splash>, mut new: Splash, kept: usize) {
     new.calm = 1.0;
+    if new.mud > 0.0 {
+        // Mud keeps no churned surface for the next strike to land in.
+        if live.len() >= kept.max(1) {
+            live.remove(0);
+        }
+        live.push(new);
+        return;
+    }
     let own = splash_shape(&new);
     let mut calm = 1.0f32;
     for old in live.iter() {
         let age = (new.born - old.born) as f32;
-        if age < 0.0 {
+        if age < 0.0 || old.mud > 0.0 {
             continue;
         }
         let was = splash_shape(old);
@@ -1839,6 +1867,10 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
     use std::f32::consts::{FRAC_PI_2, PI, TAU};
     let age = (time - s.born) as f32;
     if !(age >= 0.0 && age < SPLASH_SECONDS) {
+        return;
+    }
+    if s.mud > 0.0 {
+        mud_splash::draw(s, time, at, over);
         return;
     }
     let shape = splash_shape(s);
@@ -2219,7 +2251,8 @@ pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: 
         .iter()
         .filter_map(|s| {
             let age = (time - s.born) as f32;
-            if age < 0.0 {
+            // Mud makes no rings.
+            if age < 0.0 || s.mud > 0.0 {
                 return None;
             }
             let shape = splash_shape(s);
@@ -2852,6 +2885,7 @@ pub fn atlas_layers() -> Vec<Vec<u8>> {
         layers.extend((0..FLASH_FRAMES).map(|form| flash::lobe_frame(variant, form)));
     }
     layers.extend((0..CORE_VARIANTS).map(flash::core_frame));
+    layers.extend((0..MUD_VARIANTS).map(mud_splash::lump_frame));
     layers
 }
 
@@ -3911,6 +3945,18 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
     let fade = fx_depth_fade(in);
     let layer = i32(in.layer.x);
     let next = select(layer, layer + 1, in.layer.y > 0.0);
+    // <fx:lump>
+    if (in.layer.z > 4.5) {
+        let m = textureSampleGrad(fx_atlas, fx_samp, in.uv, layer, gx, gy);
+        let n = normalize(m.rgb * 2.0 - vec3<f32>(1.0));
+        let ndl = max(dot(n, in.light_q), 0.0);
+        let h = normalize(in.light_q + vec3<f32>(0.0, 0.0, 1.0));
+        let sheen = LUMP_SHEEN * pow(max(dot(n, h), 0.0), LUMP_GLOSS) * ndl;
+        let cover = clamp(in.colour.a * m.a * fade, 0.0, 1.0);
+        let mud = aces_fitted(in.colour.rgb * (0.6 + 0.4 * n.z) + in.light * (ndl + sheen));
+        return vec4<f32>(mud * cover, cover);
+    }
+    // </fx:lump>
     // <fx:coals>
     if (in.layer.z > 2.5) {
 
@@ -3986,6 +4032,8 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
         .replace("FLAME_EROSION", &format!("{FLAME_EROSION:?}"))
         .replace("BLUE_ROOT", &format!("{BLUE_ROOT:?}"))
         .replace("CONVEX", &format!("{CONVEX:?}"))
+        .replace("LUMP_SHEEN", &format!("{LUMP_SHEEN:?}"))
+        .replace("LUMP_GLOSS", &format!("{LUMP_GLOSS:?}"))
         .replace("LIFT_FROM", &format!("{LIFT_FROM:?}"))
         .replace("LIFT_TO", &format!("{LIFT_TO:?}"))
         .replace("BURN_OUT", &format!("{BURN_OUT:?}"))
@@ -5864,8 +5912,24 @@ mod tests {
         ];
         let fire_lights: Vec<Light> = emitters.iter().filter_map(|e| fire_light(e, time, Vec3::ZERO, Quat::IDENTITY)).collect();
         let faint = |_: Vec3| Vec3::splat(0.02);
-        let at = Surroundings { head: eye, lights: &fire_lights, ambient: &faint, exposure: 4.0, ..seen_from(eye) };
-        let frame = simulate(&emitters, time, &at);
+        // MUD=crate|rock|bullet|blast draws that mud splash alone, in
+        // daylight, EFFECTS_TIME seconds after the strike.
+        let mud = std::env::var("MUD").ok().map(|kind| match kind.as_str() {
+            "rock" => Splash { seed: 5, ..Splash::mud(Vec3::ZERO, 0.0, Vec3::new(0.0, -6.3, 0.0), 0.05, 1.0, 1.0) },
+            "bullet" => Splash { seed: 7, ..Splash::mud_projectile(Vec3::ZERO, 0.0, Vec3::new(280.0, -280.0, 0.0), 0.009, 0.008, 1.0) },
+            "blast" => Splash { seed: 9, ..Splash::mud_blast(Vec3::ZERO, 0.0, 1.0, 1.0) },
+            _ => Splash { seed: 3, ..Splash::mud(Vec3::ZERO, 0.0, Vec3::new(0.0, -6.3, 0.0), 0.25, 30.0, 1.0) },
+        });
+        let sun = [Light { kind: LightKind::Directional, direction: Vec3::new(0.4, -0.7, -0.6).normalize(), intensity: 3.0, ..lamp() }];
+        let sky = |_: Vec3| Vec3::new(0.35, 0.4, 0.5);
+        let at = match mud {
+            Some(_) => Surroundings { head: eye, lights: &sun, ambient: &sky, exposure: 1.0, ..seen_from(eye) },
+            None => Surroundings { head: eye, lights: &fire_lights, ambient: &faint, exposure: 4.0, ..seen_from(eye) },
+        };
+        let frame = match &mud {
+            Some(s) => simulate_with(&[], std::slice::from_ref(s), time, &at),
+            None => simulate(&emitters, time, &at),
+        };
         eprintln!("{} over, {} screened", frame.over, frame.screened);
         gpu.upload(&device, &queue, &frame);
         let forward = (at_point - eye).normalize();
@@ -5903,7 +5967,7 @@ mod tests {
                     view: &colour_view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: Operations { load: LoadOp::Clear(Color { r: 0.015, g: 0.015, b: 0.018, a: 1.0 }), store: StoreOp::Store },
+                    ops: Operations { load: LoadOp::Clear(if mud.is_some() { Color { r: 0.25, g: 0.3, b: 0.36, a: 1.0 } } else { Color { r: 0.015, g: 0.015, b: 0.018, a: 1.0 } }), store: StoreOp::Store },
                 })],
                 depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                     view: &depth_view,

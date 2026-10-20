@@ -79,6 +79,81 @@ A ground with no stamped map would still pay for the deform code in every pixel 
 - `MudBody::weight_at` is the CPU twin of the shader's `mud_weight_v`: a print is scaled
   by how much of the ground under the foot is the mud layer.
 
+## Mud splashes (`effects::mud_splash`, 2026-10-19)
+
+Something heavy dropped into wet mud, a bullet striking it, or a blast in it throws mud
+and leaves its mark. A mud splash is a `Splash` with `mud` above 0 (the wetness, 0..1),
+so it rides everything a water splash does: the governor, the view cull, the renderer's
+list and its clock.
+
+**Raising one:**
+
+- `Splash::mud(position, born, velocity, radius, mass, wetness)`: a thing striking mud.
+- `Splash::mud_projectile(..., diameter, mass, wetness)`: a bullet.
+- `Splash::mud_blast(position, born, crater_radius, wetness)`: a blast told by its crater
+  (as `BurstSpec::crater_radius_m`). The energy is found from the crater law turned
+  round (`blast_energy`).
+- The headset raises them for things landing in mud (`space_soup_app::mud_splashes::MudWatch`,
+  which asks `XrRenderer::mud_ground`). Shots and blasts need the server to tell of them, as
+  it tells of water entries: **not wired yet**.
+- `XrRenderer::add_splash` digs the crater at once (`MudBody::splash_crater`) and queues
+  every clump's landing (`MudLandings`). `set_water_time` stamps each landing as its time
+  comes (`MudBody::land`), so it runs every frame now, on levels with no water too.
+
+**What it is (`mud_shape`):** cratering scaling laws, not tuning by eye.
+
+- **Crater.** The smaller of the gravity-regime `0.9 (E / rho g)^(1/4)` and the
+  strength-regime `0.8 (E / 3 tau)^(1/3)`, blended. Depth is 0.42 of the radius.
+  - A strike gives the ground 15% of its drag work over its first 3 radii. A bullet keeps
+    going with most of its energy; a crate gives up all of its own.
+  - Yield stress runs from 2,000 Pa (stiff) to 60 Pa (slurry) by wetness.
+- **Ejecta.** 35% of the bowl is thrown. Speed is `0.7 sqrt(g R + 3 tau / rho) (x / R)^(-1/0.55)`
+  from x = 0.3 R to the rim, capped at half the striker's speed. The inner throws leave
+  first.
+- **Clumps.** Size is `4 tau / (rho v^2)` (a Weber number against the yield stress),
+  clamped from 2.5 mm to 0.3 R. Wet mud flung fast is spray; stiff mud and slow throws are
+  clods. Wet mud strings out into ligaments (`LIGAMENT`).
+- **No splash** below the bearing capacity: the push into the mud must pass about
+  `9 tau` (`BEARING`). A crate set down gently only dents it.
+- **A glancing strike** leans its ejecta downrange.
+
+`a_crate_a_rock_a_bullet_and_a_blast_each_splash_mud_as_what_they_are` holds each to the
+ranges seen in life:
+
+| | crater | fastest throw | highest clump | pieces |
+|---|---|---|---|---|
+| 30 kg crate at 6.3 m/s | 0.28 m | 3.2 m/s | 0.5 m | 90 clumps, 8 kg |
+| 1 kg rock at 6.3 m/s | 0.09 m | 3.2 m/s | 0.45 m | 16 clumps |
+| 9 mm round at 400 m/s, 45 degrees | 0.13 m | 7.2 m/s | 2.1 m | 62 clumps and 57 specks |
+| blast with a 1 m crater | 1.0 m | 19.7 m/s | 6.5 m | 90 clumps (each about 2 across) and 60 specks |
+
+**Drawing.** Each clump is a lump (`SHADE_LUMP`, `FxVariant::Lump`).
+
+- One atlas read of a clod's normal (`MUD_LAYER`, 4 variants, `lump_frame`).
+- It is lit by the sun with a wet sheen, and by the room's light. A tumbling clump keeps
+  its lit side to the sun, because the light is expressed in the sprite's own turned axes.
+- It carries its velocity for SpaceWarp.
+- Cost: 150 by the proxy for the variant (about 280 instructions). The union grew from 436
+  to 541.
+
+**Landings.**
+
+- Every clump comes down where its flight says, and is stamped there by
+  `MudMap::deposit`. A pat 1.6 times the clump across and a quarter of it high is piled
+  onto whatever is there, smeared along the way it flew. Spray only wets.
+- `every_piece_stays_within_its_splashs_bounds_and_lands_where_it_vanishes` holds the
+  drawn flight and the pat to the same place.
+- Flights use `mud_splash::flight`, not `effects::ballistic`. At a big clump's small drag,
+  `ballistic`'s `(1 - e^-kt) / k` cancels in f32 and the fall came out a fifth short.
+
+**Not yet:**
+
+- The server telling of shots and blasts into mud.
+- The mud's own colour (`MUD_ALBEDO` is one wet brown for every level).
+- Running feet throwing mud.
+- ssstudio still draws its own desktop mist ring for blasts (`particles.burst`) rather
+  than this.
+
 ## Open
 
 - **The water print gradient step.** The water's gradient is taken at
