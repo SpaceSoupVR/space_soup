@@ -36,6 +36,7 @@ check for others: list every string literal in the code that contains `//`.
 | [lighting-and-reflections.md](lighting-and-reflections.md) | Torch pools, opaque twins, the body prepass, character cards, grab glow, the FPS readout |
 | [sky-and-clouds.md](sky-and-clouds.md) | The simulated sky, the cloud layer, its CPU twin and shader twin, the per-frame sun dimming |
 | [sky-research-games-2026-10-20.md](sky-research-games-2026-10-20.md) | What shipped games do for skies and clouds (Nubis, Tsushima/Yōtei, Frostbite, UE5, RDR2, HDRP), gaps against ours, ranked recommendations with Quest 3 cost estimates |
+| [soulframe-sky-and-sun-glare-2026-10-20.md](soulframe-sky-and-sun-glare-2026-10-20.md) | What is public about Soulframe's sky, day/night and weather; how games and research do sun glare; a Quest-sized sun veil, per-eye visibility and pupil squint for ours |
 | [caves.md](caves.md) | Cave twins, the baked cave shader, cave chunk culling |
 | [porting-across-the-comment-strip.md](porting-across-the-comment-strip.md) | How engine-foundations was merged onto main after the strip, and how to repeat it |
 
