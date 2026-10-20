@@ -76,6 +76,12 @@ pub struct Levers {
 
     pub muzzle_test: bool,
 
+    /// THE MUD TEST, dev only: the right hand's A raises a mud splash where
+    /// its aim meets mud ground, B steps through a dropped crate, a bullet and
+    /// a blast (`space_soup_app::mud_test`). Takes A and B from the muzzle
+    /// test while on. Off.
+    pub mud_test: bool,
+
     pub effect_variants: bool,
 
     pub effects_overdraw: bool,
@@ -262,6 +268,7 @@ impl Default for Levers {
             glare_strength: 1.0,
             effects: true,
             muzzle_test: true,
+            mud_test: false,
             effect_variants: true,
             effects_overdraw: false,
             cave_dust: false,
@@ -433,6 +440,7 @@ impl Levers {
         flag("glare", self.glare, d.glare);
         flag("effects", self.effects, d.effects);
         flag("muzzle_test", self.muzzle_test, d.muzzle_test);
+        flag("mud_test", self.mud_test, d.mud_test);
         flag("effect_variants", self.effect_variants, d.effect_variants);
         flag("effects_overdraw", self.effects_overdraw, d.effects_overdraw);
         flag("cave_dust", self.cave_dust, d.cave_dust);
