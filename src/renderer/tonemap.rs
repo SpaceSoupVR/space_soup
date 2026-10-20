@@ -95,11 +95,16 @@ pub fn wgsl_tonemap_block() -> String {
         wgsl_aces_block(),
         format!(
             r#"
-fn tonemap(color: vec3<f32>) -> vec3<f32> {{
-    var exposed = color * max(camera.post_params.x, 0.0);
+// The room-local adaptation of what this pixel shows (`room_local_exposure`):
+// 1 but where a brush or model fragment sets it from its vertices.
+var<private> local_exposure: f32 = 1.0;
 
+fn tonemap(color: vec3<f32>) -> vec3<f32> {{
+    var exposed = color * (max(camera.post_params.x, 0.0) * local_exposure);
+
+    // A room drawn at its own adaptation is seen by cones: no rods' tint.
     let rods = max(dot(exposed, vec3<f32>({w0:?}, {w1:?}, {w2:?})), 0.0) * vec3<f32>({t0:?}, {t1:?}, {t2:?});
-    exposed = mix(exposed, rods, camera.proxy_params.y);
+    exposed = mix(exposed, rods, camera.proxy_params.y * smoothstep(0.05, 1.0, local_exposure));
     if (camera.post_params.y > 0.5) {{
         return clamp(exposed, vec3<f32>(0.0), vec3<f32>(1.0));
     }}

@@ -59,7 +59,27 @@ pub struct Uniforms {
     pub capsule_params: [f32; 4],
 
     pub character_cards: [[f32; 4]; 2 * super::proxy_cards::CHARACTER_CARD_SETS],
+
+    pub room_exposure: RoomExposure,
+
+    /// The clouds' shadow map for a player-space point p:
+    /// uv = (a px + b pz, c px + d pz) + (u0, v0) from `[a, b, c, d]`,
+    /// `[u0, v0, 0, 0]`, then `[fill rgb, on]`; read only when `on` > 0.
+    /// `fill` is the light a cloud's base gives the ground under it where
+    /// it hides the sun whole (`cloud_fill` in the lights block).
+    pub cloud_map: [[f32; 4]; 3],
 }
+
+/// Texels a side of the clouds' shadow map (`UniformBuffer::write_cloud_shadow`).
+pub const CLOUD_SHADOW_SIZE: u32 = 64;
+
+/// Boxes -- closed rooms and their doorways -- drawn at the room's own local
+/// adaptation (`room_local_exposure` in the lights block): at most this many,
+/// a pair of rows each.
+pub const ROOM_EXPOSURE_ROOMS: usize = 8;
+/// Per room: `[min.x, min.y, min.z, factor]`, `[max.x, max.y, max.z, band]`,
+/// world space; factor 0 is an empty row.
+pub type RoomExposure = [[f32; 4]; 2 * ROOM_EXPOSURE_ROOMS];
 
 pub const MAX_BUILDINGS: usize = 8;
 
@@ -194,6 +214,12 @@ pub struct PostUpload {
     pub reflection_share: bool,
 
     pub night_vision: f32,
+
+    /// The rooms seen at their own adaptation; see `RoomExposure`.
+    pub rooms: RoomExposure,
+
+    /// Where the clouds' shadow map lies; see `Uniforms::cloud_map`.
+    pub cloud_map: [[f32; 4]; 3],
 }
 
 impl Default for PostUpload {
@@ -205,6 +231,8 @@ impl Default for PostUpload {
             terrain_detail_distance: 0.0,
             reflection_share: false,
             night_vision: 0.0,
+            rooms: [[0.0; 4]; 2 * ROOM_EXPOSURE_ROOMS],
+            cloud_map: [[0.0; 4]; 3],
         }
     }
 }
@@ -278,6 +306,9 @@ pub struct UniformBuffer {
     proxy_field_view: TextureView,
 
     proxy_card_view: TextureView,
+
+    cloud_shadow: Texture,
+    cloud_shadow_view: TextureView,
 }
 
 impl UniformBuffer {
@@ -333,6 +364,7 @@ fn scene_bind_group(
     ground_view: &TextureView,
     proxy_field_view: &TextureView,
     proxy_card_view: &TextureView,
+    cloud_shadow_view: &TextureView,
 ) -> BindGroup {
     device.create_bind_group(&BindGroupDescriptor {
         label: Some(label),
@@ -351,6 +383,7 @@ fn scene_bind_group(
             BindGroupEntry { binding: 10, resource: BindingResource::TextureView(ground_view) },
             BindGroupEntry { binding: 11, resource: BindingResource::TextureView(proxy_field_view) },
             BindGroupEntry { binding: 12, resource: BindingResource::TextureView(proxy_card_view) },
+            BindGroupEntry { binding: 14, resource: BindingResource::TextureView(cloud_shadow_view) },
             BindGroupEntry {
                 binding: 13,
                 resource: BindingResource::Buffer(BufferBinding {
@@ -539,12 +572,34 @@ impl UniformBuffer {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let (probe_depth_view, probe_depth_sampler) = default_probe_depth(device);
         let ground_view = default_ground_map(device);
         let proxy_field_view = super::proxy_field::none(device);
         let proxy_card_view = super::proxy_cards::none(device);
+        // Read only once written and switched on (`Uniforms::cloud_map`).
+        let cloud_shadow = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cloud_shadow_map"),
+            size: wgpu::Extent3d { width: CLOUD_SHADOW_SIZE, height: CLOUD_SHADOW_SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let cloud_shadow_view = cloud_shadow.create_view(&wgpu::TextureViewDescriptor::default());
 
         let twin_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("uniform_buf_twin"),
@@ -576,6 +631,7 @@ impl UniformBuffer {
                 &ground_view,
                 &proxy_field_view,
                 &proxy_card_view,
+                &cloud_shadow_view,
             )
         };
         let bind_group = group(&buffer, "uniform_bg");
@@ -596,7 +652,20 @@ impl UniformBuffer {
             ground_view,
             proxy_field_view,
             proxy_card_view,
+            cloud_shadow,
+            cloud_shadow_view,
         }
+    }
+
+    /// The clouds' shadow map, `CLOUD_SHADOW_SIZE` squared, row by row (z),
+    /// 0 = no light through.
+    pub fn write_cloud_shadow(&self, queue: &Queue, texels: &[u8]) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.cloud_shadow, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            texels,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(CLOUD_SHADOW_SIZE), rows_per_image: Some(CLOUD_SHADOW_SIZE) },
+            wgpu::Extent3d { width: CLOUD_SHADOW_SIZE, height: CLOUD_SHADOW_SIZE, depth_or_array_layers: 1 },
+        );
     }
 
     pub fn upload(&self, queue: &Queue, view_proj: Mat4, camera_pos: Vec3, shadow: &ShadowUpload) {
@@ -757,6 +826,8 @@ impl UniformBuffer {
                 },
             ],
             character_cards: player.capsules.cards,
+            room_exposure: post.rooms,
+            cloud_map: post.cloud_map,
             post_params: [
                 post.exposure,
                 match post.tonemap {
@@ -1533,6 +1604,7 @@ impl UniformBuffer {
                 &self.ground_view,
                 &self.proxy_field_view,
                 &self.proxy_card_view,
+                &self.cloud_shadow_view,
             )
         };
         self.bind_group = group(&self.buffer, "uniform_bg");

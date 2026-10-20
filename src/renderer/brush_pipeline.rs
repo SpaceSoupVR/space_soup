@@ -3445,6 +3445,8 @@ struct VOut {{
     @location(8) @interpolate(flat) uv2_rect: vec4<f32>,
 
     @location(9) @interpolate(flat) face_half_extent: vec2<f32>,
+
+    @location(11) room_near: f32,
 {probe_face_varying}{edge_varying}}}
 
 @vertex fn vs_main(v: VIn) -> VOut {{
@@ -3461,6 +3463,7 @@ struct VOut {{
     out.uv2       = v.uv2;
     out.material  = v.material;
     out.tint      = v.tint;
+    out.room_near = room_near(to_world_space(v.pos));
 {probe_face_vs}{edge_vs}    return out;
 }}
 
@@ -3470,6 +3473,9 @@ struct VOut {{
 
 @fragment fn fs_main(in: VOut) -> {fs_return} {{
 
+    if (in.room_near > 0.0) {{
+        local_exposure = room_local_exposure(to_world_space(in.world_pos));
+    }}
     pixel_footprint = sqrt(length(dpdx(in.world_pos)) * length(dpdy(in.world_pos)));
     let albedo = textureSample(mat_color, mat_samp, in.uv, i32(in.material));
 

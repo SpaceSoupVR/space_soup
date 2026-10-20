@@ -72,6 +72,15 @@ pub struct Levers {
 
     pub glare_strength: f32,
 
+    /// Closed rooms seen from outside drawn at their own adaptation
+    /// (`EyeAdaptation::room_exposure`).
+    pub room_exposure: bool,
+
+    /// The clouds' shadows drawn per pixel, sweeping over the ground with
+    /// the wind (`Sky::step_cloud_shadow`); off dims the whole level's sun
+    /// at once, by the clouds over its middle.
+    pub cloud_shadows: bool,
+
     pub effects: bool,
 
     pub muzzle_test: bool,
@@ -266,6 +275,8 @@ impl Default for Levers {
             terminator_aa: true,
             glare: true,
             glare_strength: 1.0,
+            room_exposure: true,
+            cloud_shadows: true,
             effects: true,
             muzzle_test: true,
             mud_test: false,
@@ -438,6 +449,8 @@ impl Levers {
         flag("ground_trace", self.ground_trace, d.ground_trace);
         flag("space_warp", self.space_warp, d.space_warp);
         flag("glare", self.glare, d.glare);
+        flag("room_exposure", self.room_exposure, d.room_exposure);
+        flag("cloud_shadows", self.cloud_shadows, d.cloud_shadows);
         flag("effects", self.effects, d.effects);
         flag("muzzle_test", self.muzzle_test, d.muzzle_test);
         flag("mud_test", self.mud_test, d.mud_test);

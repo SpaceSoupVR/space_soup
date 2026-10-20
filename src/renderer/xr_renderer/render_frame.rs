@@ -491,6 +491,7 @@ impl XrRenderer {
 
             let fires: Vec<_> = fires.into_iter().chain(self.lights_uniform.pool_light()).collect();
             let mut eye = self.eye.borrow_mut();
+            eye.set_local_rooms(self.auto_exposure && self.levers.room_exposure);
             let mut metered = eye.meter_with(head_world, gaze, &fires);
 
             if let Some((b, state)) = eyes_in_water[0].or(eyes_in_water[1]) {
@@ -504,10 +505,25 @@ impl XrRenderer {
             }
 
             let night_vision = self.tod_night_vision(eye.adapted_luminance());
+            // Closed rooms seen from outside at their own adaptation (lever
+            // `room_exposure` off draws every room at the eye's).
+            let rooms = if self.auto_exposure && self.levers.room_exposure {
+                eye.room_exposure(head_world, auto)
+            } else {
+                [[0.0; 4]; 2 * crate::renderer::uniforms::ROOM_EXPOSURE_ROOMS]
+            };
+            drop(eye);
+            // The clouds' shadows, a slice of the map a frame.
+            self.sky.step_cloud_shadow([head_world.x, head_world.z], self.levers.cloud_shadows);
+            if let Some(texels) = self.sky.take_cloud_shadow_upload() {
+                self.uniform_buf.write_cloud_shadow(&self.wgpu_queue, texels);
+            }
             crate::renderer::uniforms::PostUpload {
                 exposure: self.post.exposure * if self.auto_exposure { auto } else { 1.0 },
                 terrain_detail_distance: self.levers.terrain_detail_distance,
                 night_vision,
+                rooms,
+                cloud_map: self.sky.cloud_map(self.player.yaw, self.player.offset.to_array()),
                 ..self.post
             }
         };
@@ -629,7 +645,9 @@ impl XrRenderer {
             });
             let yaw = glam::Quat::from_rotation_y(self.player.yaw);
             let head_world = yaw * mid_eye + self.player.offset;
-            let (sky, sun) = crate::renderer::weather::particle_light(&self.sky.irradiance, self.sky.sun.as_ref());
+            let head_w = glam::Quat::from_rotation_y(self.player.yaw) * mid_eye + self.player.offset;
+            let weather_sun = self.sky.sun_at([head_w.x, head_w.z]);
+            let (sky, sun) = crate::renderer::weather::particle_light(&self.sky.irradiance, weather_sun.as_ref());
             let ground = self.terrain_footprint.map(|(lo, hi)| ([lo.x, lo.z], [hi.x, hi.z]));
             let frame = [self.player.offset.x, self.player.offset.y, self.player.offset.z, self.player.yaw];
             if let Some(w) = self.weather.as_mut() {
@@ -936,8 +954,18 @@ impl XrRenderer {
                     }
                 }
             }
+            // A lamp in a room drawn at the room's adaptation glares at it too.
+            let yaw = glam::Quat::from_rotation_y(self.player.yaw);
+            let glare_sources: Vec<crate::renderer::glare::GlareSource> = self
+                .glare_sources
+                .iter()
+                .map(|s| crate::renderer::glare::GlareSource {
+                    radiance: s.radiance * crate::renderer::exposure::room_factor_at(&post.rooms, yaw * s.position + self.player.offset),
+                    ..s.clone()
+                })
+                .collect();
             crate::renderer::glare::build_glare(
-                &self.glare_sources,
+                &glare_sources,
                 [eye_at(&eye_views[0]), eye_at(&eye_views[1])],
                 cam_right,
                 cam_up,
@@ -994,8 +1022,9 @@ impl XrRenderer {
             glam::Quat::from_rotation_y(self.player.yaw),
             self.player.offset,
         );
+        let sky_direct = self.sky.sun_direct();
         let sky_sun = crate::renderer::lights::sky_sun_light(
-            self.sky.sun.as_ref(),
+            sky_direct.as_ref(),
             lights,
             glam::Quat::from_rotation_y(self.player.yaw).inverse(),
         );

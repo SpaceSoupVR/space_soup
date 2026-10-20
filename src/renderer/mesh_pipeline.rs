@@ -796,6 +796,7 @@ struct VOut {{
     @location(0) normal: vec3<f32>,
     @location(1) uv:     vec2<f32>,
     @location(2) world_pos: vec3<f32>,
+    @location(3) room_near: f32,
 }}
 
 @vertex
@@ -821,12 +822,16 @@ fn vs_main(v: VIn) -> VOut {{
     out.normal    = (model_u.model * skinned_n).xyz;
     out.uv        = v.uv;
     out.world_pos = world_pos.xyz;
+    out.room_near = room_near(to_world_space(world_pos.xyz));
     return out;
 }}
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
+    if (in.room_near > 0.0) {{
+        local_exposure = room_local_exposure(to_world_space(in.world_pos));
+    }}
 
     capsule_receiver = false;
 
@@ -1216,6 +1221,7 @@ struct VOut {{
     @location(4) @interpolate(flat) emissive: vec3<f32>,
     {thin_out}
     @location(6) @interpolate(flat) uv2_rect: vec4<f32>,
+    @location(8) room_near: f32,
 }}
 
 @vertex
@@ -1230,6 +1236,7 @@ fn vs_main(v: VIn) -> VOut {{
     out.uv2       = v.uv2;
     out.emissive  = unpack_emissive(v.emissive);
     out.uv2_rect  = v.uv2_rect;
+    out.room_near = room_near(to_world_space(world_pos.xyz));
     return out;
 }}
 
@@ -1244,6 +1251,9 @@ fn grab_highlight(c: vec3<f32>, n: vec3<f32>, world_pos: vec3<f32>, k: f32) -> v
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
+    if (in.room_near > 0.0) {{
+        local_exposure = room_local_exposure(to_world_space(in.world_pos));
+    }}
     let n = normalize(in.normal);{thin_span}
 
     let uv2 = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);

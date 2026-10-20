@@ -681,6 +681,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let proxy_field_tex = binding_index + 10;
     let proxy_card_tex = binding_index + 11;
     let probe_select_binding = binding_index + 12;
+    let cloud_shadow_binding = binding_index + 13;
     let probe_select_rows = 3 * crate::renderer::uniforms::MAX_PROBES;
     let proxy_field_rows = crate::renderer::proxy_field::MAX_PROXY_FIELDS * 3;
     let proxy_card_rows = crate::renderer::uniforms::MAX_PROXIES / 4;
@@ -690,6 +691,9 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let capsules_per_group = crate::renderer::uniforms::CAPSULES_PER_GROUP;
     let character_card_sets = super::proxy_cards::CHARACTER_CARD_SETS;
     let character_card_rows = 2 * character_card_sets;
+    let room_exposure_rooms = crate::renderer::uniforms::ROOM_EXPOSURE_ROOMS;
+    let room_exposure_rows = 2 * room_exposure_rooms;
+    let room_near = 1.5f32;
     let character_card_max_lod = (super::character_cards::CARD_MIPS - 1) as f32;
     let pool_maps_across = super::pool_cards::POOL_MAPS_ACROSS;
     let reflection_contrast = format!("{:?}", crate::renderer::space_warp::REFLECTION_CONTRAST_RATIO);
@@ -830,6 +834,10 @@ struct Camera {{
     capsule_params: vec4<f32>,
 
     character_cards: array<vec4<f32>, {character_card_rows}>,
+
+    room_exposure: array<vec4<f32>, {room_exposure_rows}>,
+
+    cloud_map: array<vec4<f32>, 3>,
 }}
 
 fn to_world_direction(d: vec3<f32>) -> vec3<f32> {{
@@ -864,6 +872,42 @@ fn to_player_space(w: vec3<f32>) -> vec3<f32> {{
 @group({group_index}) @binding(0) var<uniform> camera: Camera;
 {tonemap_block}
 
+// LOCAL ADAPTATION by room: a closed room seen from outside it -- and its
+// doorways -- is drawn at the eye's exposure times its row's factor
+// (`uniforms::RoomExposure`), so a lit hall seen from the night stays
+// readable while the night stays night. Rows come in pairs, (min, factor)
+// and (max, band); a factor of 0 is an empty row. Asked per pixel, and only
+// where a vertex was near a box (`room_near`).
+fn room_local_exposure(p: vec3<f32>) -> f32 {{
+    var e = 1.0;
+    for (var i = 0u; i < {room_exposure_rooms}u; i = i + 1u) {{
+        let lo = camera.room_exposure[2u * i];
+        let hi = camera.room_exposure[2u * i + 1u];
+        if (lo.w <= 0.0) {{
+            break;
+        }}
+        let inside = min(min(min(p.x - lo.x, hi.x - p.x), min(p.y - lo.y, hi.y - p.y)), min(p.z - lo.z, hi.z - p.z));
+        e = min(e, pow(lo.w, clamp((inside + hi.w) / max(hi.w, 1e-3), 0.0, 1.0)));
+    }}
+    return e;
+}}
+
+// 1 for a vertex within ROOM_NEAR of a room's box, else 0: carried to the
+// fragment, which asks `room_local_exposure` only where it is above 0.
+fn room_near(p: vec3<f32>) -> f32 {{
+    for (var i = 0u; i < {room_exposure_rooms}u; i = i + 1u) {{
+        let lo = camera.room_exposure[2u * i];
+        let hi = camera.room_exposure[2u * i + 1u];
+        if (lo.w <= 0.0) {{
+            break;
+        }}
+        if (lo.w < 1.0 && all(p > lo.xyz - vec3<f32>({room_near:?})) && all(p < hi.xyz + vec3<f32>({room_near:?}))) {{
+            return 1.0;
+        }}
+    }}
+    return 0.0;
+}}
+
 struct Light {{
     position: vec4<f32>,
     direction: vec4<f32>,
@@ -896,6 +940,8 @@ struct Lights {{
 @group({group_index}) @binding({proxy_field_tex}) var proxy_field: texture_3d<f32>;
 
 @group({group_index}) @binding({proxy_card_tex}) var proxy_cards: texture_2d<f32>;
+
+@group({group_index}) @binding({cloud_shadow_binding}) var cloud_shadow_map: texture_2d<f32>;
 
 @group({group_index}) @binding({probe_select_binding}) var<uniform> probe_select: array<vec4<f32>, {probe_select_rows}>;
 
@@ -1403,7 +1449,27 @@ fn sun_level_visibility(world_pos: vec3<f32>) -> f32 {{
     }} else if (camera.shadow_params.x > 0.5) {{
         vis = pcf(sun_shadow_tex, world_pos, camera.sun_view_proj);
     }}
-    return vis;
+    return vis * cloud_sun_shadow(world_pos);
+}}
+
+// The light the clouds let through to this point (`Uniforms::cloud_map`):
+// their shadows sweep over the ground with the wind.
+fn cloud_sun_shadow(p: vec3<f32>) -> f32 {{
+    if (camera.cloud_map[2].w <= 0.0) {{
+        return 1.0;
+    }}
+    let m = camera.cloud_map[0];
+    let uv = vec2<f32>(m.x * p.x + m.y * p.z, m.z * p.x + m.w * p.z) + camera.cloud_map[1].xy;
+    return textureSampleLevel(cloud_shadow_map, probe_samp, uv, 0.0).r;
+}}
+
+// What a cloud overhead scatters down in place of the sun it hides: its
+// base glows, so ground in a cloud's shadow is lit from above, brighter
+// than by the clear sky alone and with its relief still reading
+// (`Uniforms::cloud_map`).
+fn cloud_fill(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
+    // No test for the map being off: its fill is then zero.
+    return camera.cloud_map[2].xyz * ((1.0 - cloud_sun_shadow(p)) * (0.5 + 0.5 * n.y));
 }}
 
 fn sun_moving_visibility(world_pos: vec3<f32>) -> f32 {{
@@ -3722,6 +3788,7 @@ fn shade_material_env_part(
     if (occ > 0.0) {{
         diffuse = sky_irradiance(n) * occ;
     }}
+    diffuse = diffuse + cloud_fill(world_pos, n) * occ;
     var specular = vec3<f32>(0.0);
 
     let env_n = normalize(mix(n, geom_n, smoothstep(0.1, 0.4, r)));
@@ -4006,7 +4073,7 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
     let view_dir = normalize(cam_pos() - world_pos);
     let flash_idx = u32(camera.shadow_params.z);
 
-    var lit = hf3(min(sky_irradiance(n) * clamp(sky_vis, 0.0, 1.0) * capsule_ambient(world_pos, n), vec3<f32>(HF_MAX)));
+    var lit = hf3(min((sky_irradiance(n) + cloud_fill(world_pos, n)) * clamp(sky_vis, 0.0, 1.0) * capsule_ambient(world_pos, n), vec3<f32>(HF_MAX)));
     for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
         let l = lights.lights[i];
         let arriving = light_contribution(l, world_pos, n, view_dir);

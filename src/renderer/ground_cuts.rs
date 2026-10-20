@@ -4,7 +4,7 @@ use wgpu::{BindGroupLayout, Device, TextureFormat};
 pub(crate) const GROUND_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("none", &[]),
 
-    ("purkinje", &[("    exposed = mix(exposed, rods, camera.proxy_params.y);\n", "")]),
+    ("purkinje", &[("    exposed = mix(exposed, rods, camera.proxy_params.y * smoothstep(0.05, 1.0, local_exposure));\n", "")]),
 
     (
         "gentle",

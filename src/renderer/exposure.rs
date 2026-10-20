@@ -28,9 +28,25 @@ pub const ADAPT_NIGHT_STOPS_PER_S: f32 = 0.3;
 pub const BRIGHT_VIEW_RATIO: f32 = 12.0;
 /// The doorway's share of the view (steradians, by the meter's lobe) from
 /// which the cap starts: a 1.6 x 2.2 m door at ~34 m...
+/// The same with closed rooms drawn at their own adaptation (`local_rooms`):
+/// the room reads by itself, so the pull is only the eye's simultaneous range
+/// (about three decades). At 12 it blacked the moonlit ground out round the
+/// door from 12 m (exposure x70,000 -> x520).
+pub const BRIGHT_VIEW_RATIO_LOCAL: f32 = 1000.0;
 pub const BRIGHT_VIEW_FROM_SR: f32 = 0.003;
 /// ...to where it holds in full (the same door at ~6.6 m).
 pub const BRIGHT_VIEW_TO_SR: f32 = 0.08;
+
+/// LOCAL ADAPTATION BY ROOM: a closed room seen from outside it is drawn at
+/// up to this many times the exposure an eye inside it has -- a little
+/// brighter, as a dark-adapted eye sees a lit room -- and never brighter than
+/// the eye's own. With one exposure for the whole view a lit hall seen from
+/// the night was either a white sheet or blacked the night out (headset,
+/// 2026-10-20).
+pub const ROOM_SEEN_BRIGHTER: f32 = 2.5;
+/// How far outside a room's or doorway's box its adaptation fades out,
+/// metres: per pixel, so the edge is the opening's outline.
+pub const ROOM_EXPOSURE_BAND: f32 = 0.05;
 
 const CENTRE_WEIGHT_FLOOR: f32 = 0.1;
 const CENTRE_WEIGHT_POWER: f32 = 4.0;
@@ -91,8 +107,25 @@ struct BinParts {
     sky_ref: f32,
 }
 
+/// A closed room's box and the luminance its own eye adapts to (`band_log`
+/// over its photographs, every direction), for drawing it at that adaptation
+/// when seen from outside (`EyeAdaptation::room_exposure`).
+#[derive(Clone, Copy, Debug)]
+struct ClosedRoom {
+    room: u32,
+    min: Vec3,
+    max: Vec3,
+    luminance: f32,
+}
+
 pub struct EyeAdaptation {
     meters: Vec<ProbeMeter>,
+
+    closed_rooms: Vec<ClosedRoom>,
+
+    /// Closed rooms are drawn at their own adaptation (`room_exposure`), so
+    /// the light seen into one through a doorway is not metered.
+    local_rooms: bool,
 
     portals: Vec<ProbePortal>,
 
@@ -109,7 +142,7 @@ impl EyeAdaptation {
 
     pub fn sky_only(sky: SkyIrradiance) -> Self {
         let day = sky_daylight(&sky);
-        Self { meters: Vec::new(), portals: Vec::new(), sky, adapted_log2: None, max_exposure: MAX_EXPOSURE, day }
+        Self { meters: Vec::new(), closed_rooms: Vec::new(), local_rooms: false, portals: Vec::new(), sky, adapted_log2: None, max_exposure: MAX_EXPOSURE, day }
     }
 
     pub fn gaze_free_share(&self, head: Vec3) -> f32 {
@@ -148,7 +181,65 @@ impl EyeAdaptation {
             let (bins, parts) = bin_probe_parts(&texels, lamps.as_deref(), res, &self.sky);
             let open = open_sky(&texels, res);
             self.meters.push(ProbeMeter { centre: desc.centre, min: desc.min, max: desc.max, room: desc.volume, bins, parts, open });
+            self.find_closed_rooms();
         }
+    }
+
+    /// The rooms no sky shows into, each with the luminance an eye inside it
+    /// adapts to. Rebuilt when the photographs or their light change.
+    fn find_closed_rooms(&mut self) {
+        let mut rooms: Vec<u32> = self.meters.iter().map(|m| m.room).collect();
+        rooms.sort_unstable();
+        rooms.dedup();
+        self.closed_rooms = rooms
+            .into_iter()
+            .filter_map(|room| {
+                let own: Vec<&ProbeMeter> = self.meters.iter().filter(|m| m.room == room).collect();
+                if own.iter().any(|m| m.open >= OPEN_SKY_FROM) {
+                    return None;
+                }
+                let (min, max) = own.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), m| (lo.min(m.min), hi.max(m.max)));
+                let centre = own.iter().map(|m| m.centre).sum::<Vec3>() / own.len() as f32;
+                let lobe = Lobe { gaze: Vec3::Z, free: 1.0 };
+                let mut samples = Vec::new();
+                self.photographs(room, centre, &lobe, 1.0, &mut samples);
+                Some(ClosedRoom { room, min, max, luminance: band_log(samples)?.exp() })
+            })
+            .collect();
+    }
+
+    /// The rows of `uniforms::RoomExposure` for an eye at `head` exposed at
+    /// `exposure`: each closed room near it drawn at no more than
+    /// `ROOM_SEEN_BRIGHTER` times the exposure an eye inside it would have,
+    /// and never brighter than the eye's own. Continuous: walking in, the
+    /// eye's exposure meets the room's and the factor reaches 1 by itself.
+    pub fn room_exposure(&self, head: Vec3, exposure: f32) -> super::uniforms::RoomExposure {
+        use super::uniforms::ROOM_EXPOSURE_ROOMS;
+        let mut rows = [[0.0f32; 4]; 2 * ROOM_EXPOSURE_ROOMS];
+        if !(exposure > 0.0) {
+            return rows;
+        }
+        let mut rooms = self.closed_rooms.clone();
+        let gap = |lo: Vec3, hi: Vec3| (head.clamp(lo, hi) - head).length_squared();
+        rooms.sort_by(|a, b| gap(a.min, a.max).total_cmp(&gap(b.min, b.max)));
+        rooms.truncate(ROOM_EXPOSURE_ROOMS / 2);
+        let factor = |r: &ClosedRoom| (ROOM_SEEN_BRIGHTER * exposure_for_up_to(r.luminance, self.max_exposure) / exposure).clamp(1e-6, 1.0);
+        // Each room, then its doorways: a doorway's jamb is lit by the room
+        // and belongs to its adaptation, or it drew white round the opening.
+        let mut boxes: Vec<(Vec3, Vec3, f32)> = rooms.iter().map(|r| (r.min, r.max, factor(r))).collect();
+        for p in &self.portals {
+            let inside = rooms.iter().find(|r| r.room == p.low || r.room == p.high);
+            let both = rooms.iter().filter(|r| r.room == p.low || r.room == p.high).count() == 2;
+            if let (Some(r), false) = (inside, both) {
+                boxes.push((p.min, p.max, factor(r)));
+            }
+        }
+        boxes.sort_by(|a, b| gap(a.0, a.1).total_cmp(&gap(b.0, b.1)));
+        for (i, (lo, hi, f)) in boxes.into_iter().take(ROOM_EXPOSURE_ROOMS).enumerate() {
+            rows[2 * i] = [lo.x, lo.y, lo.z, f];
+            rows[2 * i + 1] = [hi.x, hi.y, hi.z, ROOM_EXPOSURE_BAND];
+        }
+        rows
     }
 
     pub fn relight(&mut self, sky: SkyIrradiance, daylight: f32) {
@@ -165,6 +256,12 @@ impl EyeAdaptation {
         }
         self.day = sky_daylight(&sky);
         self.sky = sky;
+        self.find_closed_rooms();
+    }
+
+    /// Whether closed rooms are drawn at their own adaptation; see `local_rooms`.
+    pub fn set_local_rooms(&mut self, on: bool) {
+        self.local_rooms = on;
     }
 
     pub fn set_max_exposure(&mut self, max: f32) {
@@ -250,13 +347,21 @@ impl EyeAdaptation {
                 let total: f32 = through.iter().map(|s| s.1).sum();
                 if total > 0.0 {
                     bright.push((through.iter().map(|(l, w)| l * w).sum::<f32>() / total, seen_sr));
-                    samples.extend(through.into_iter().map(|(l, w)| (l, w * share / total)));
+                    // A room drawn at its own adaptation lights only its own
+                    // pixels: metered, its doorway's light blacked out the
+                    // moonlit ground round the door from 12 m (exposure
+                    // x70,000 -> x520).
+                    let local = self.local_rooms && self.closed_rooms.iter().any(|c| c.room == beyond);
+                    if !local {
+                        samples.extend(through.into_iter().map(|(l, w)| (l, w * share / total)));
+                    }
                 }
             }
         }
         samples.extend(extra.iter().map(|&b| weighted(b, &lobe, 1.0, self.log_floor())));
         let log = band_log(samples)?;
-        Some(bright.into_iter().fold(log, |log, (seen, share)| log + bright_view_pull(seen, share, log)))
+        let ratio = if self.local_rooms { BRIGHT_VIEW_RATIO_LOCAL } else { BRIGHT_VIEW_RATIO };
+        Some(bright.into_iter().fold(log, |log, (seen, share)| log + bright_view_pull(seen, share, log, ratio)))
     }
 
     fn photographs(&self, room: u32, head: Vec3, lobe: &Lobe, scale: f32, out: &mut Vec<(f32, f32)>) -> bool {
@@ -354,9 +459,24 @@ fn night_adapted_log2() -> f32 {
 /// How far (natural log) a lit room seen at log luminance `seen`, through a
 /// doorway filling `seen_sr` of the view, raises a meter reading `log`: up to
 /// within `BRIGHT_VIEW_RATIO` of it, by how much of the view it fills.
-fn bright_view_pull(seen: f32, seen_sr: f32, log: f32) -> f32 {
+/// The factor `room_local_exposure` gives a point, on the CPU: for what is
+/// drawn with its exposure set there (the lamps' glare).
+pub fn room_factor_at(rows: &super::uniforms::RoomExposure, p: Vec3) -> f32 {
+    let mut e = 1.0f32;
+    for pair in rows.chunks_exact(2) {
+        let (lo, hi) = (pair[0], pair[1]);
+        if lo[3] <= 0.0 {
+            break;
+        }
+        let inside = (p.x - lo[0]).min(hi[0] - p.x).min(p.y - lo[1]).min(hi[1] - p.y).min(p.z - lo[2]).min(hi[2] - p.z);
+        e = e.min(lo[3].powf(((inside + hi[3]) / hi[3].max(1e-3)).clamp(0.0, 1.0)));
+    }
+    e
+}
+
+fn bright_view_pull(seen: f32, seen_sr: f32, log: f32, ratio: f32) -> f32 {
     let held = smoothstep(BRIGHT_VIEW_FROM_SR.ln(), BRIGHT_VIEW_TO_SR.ln(), seen_sr.max(1e-9).ln());
-    held * (seen - BRIGHT_VIEW_RATIO.ln() - log).max(0.0)
+    held * (seen - ratio.ln() - log).max(0.0)
 }
 
 fn weighted((d, lum, omega): (Vec3, f32, f32), lobe: &Lobe, k: f32, floor: f32) -> (f32, f32) {
@@ -631,6 +751,32 @@ mod tests {
         assert!(near >= 0.2 / BRIGHT_VIEW_RATIO * 0.99, "near the door the eye sits within reach of the hall: {near}");
         assert!(far < 0.2 / BRIGHT_VIEW_RATIO / 10.0, "a far door hardly moves the night eye: {far}");
         assert!(away < near / 10.0, "looking away keeps the night: {away} vs {near}");
+    }
+
+    #[test]
+    fn a_lit_room_seen_from_the_night_is_drawn_at_its_own_adaptation_and_its_doorway_with_it() {
+        let (hall, night) = (faces(16, |_| 0.2), faces_open(16, |_| 1e-5, |d| d.y > 0.0));
+        let a = desc(Vec3::new(0.0, 1.5, -5.0), Vec3::new(-3.0, 0.0, -10.0), Vec3::new(3.0, 3.0, 0.0), 0, true);
+        let out = desc(Vec3::new(0.0, 5.0, 20.0), Vec3::new(-50.0, -5.0, 0.0), Vec3::new(50.0, 50.0, 60.0), 1, false);
+        let mut eye = EyeAdaptation::from_probes(&[(&hall, 16, a), (&night, 16, out)], SkyIrradiance::flat(1e-5));
+        eye.set_max_exposure(2.0e5);
+        let door = ProbePortal { min: Vec3::new(-0.8, 0.0, 0.0), max: Vec3::new(0.8, 2.2, 0.4), axis: 2, low: 0, high: 1, wall: None };
+        eye.set_portals(&[door]);
+        eye.set_local_rooms(true);
+        let night_eye = exposure_for_up_to(eye.meter(Vec3::new(0.0, 1.6, 20.0), Vec3::NEG_Z), 2.0e5);
+        let rows = eye.room_exposure(Vec3::new(0.0, 1.6, 20.0), night_eye);
+        let inside_hall = room_factor_at(&rows, Vec3::new(0.0, 1.0, -5.0));
+        let hall_eye = exposure_for_up_to(0.2, 2.0e5);
+        assert!((night_eye * inside_hall / hall_eye - ROOM_SEEN_BRIGHTER).abs() < 0.3, "the hall at {} of its own eye", night_eye * inside_hall / hall_eye);
+        assert!((room_factor_at(&rows, Vec3::new(0.0, 1.0, 0.2)) - inside_hall).abs() < 1e-6, "the doorway's jamb with the hall");
+        assert_eq!(room_factor_at(&rows, Vec3::new(2.0, 1.0, 0.3)), 1.0, "the wall's outside face beside the door keeps the night eye");
+        assert_eq!(room_factor_at(&rows, Vec3::new(0.0, 0.0, 10.0)), 1.0, "the yard keeps the night eye");
+        // Inside, the eye is the hall's: nothing changes.
+        let inner = exposure_for_up_to(eye.meter(Vec3::new(0.0, 1.6, -5.0), Vec3::NEG_Z), 2.0e5);
+        assert_eq!(room_factor_at(&eye.room_exposure(Vec3::new(0.0, 1.6, -5.0), inner), Vec3::new(0.0, 1.0, -5.0)), 1.0);
+        // Its light through the doorway no longer meters the night eye.
+        let near = eye.meter(Vec3::new(0.0, 1.6, 6.0), Vec3::NEG_Z);
+        assert!(near < 0.2 / BRIGHT_VIEW_RATIO / 10.0, "the yard by the door keeps the night: {near}");
     }
 
     #[test]

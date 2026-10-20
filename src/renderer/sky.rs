@@ -155,6 +155,70 @@ pub struct SkyClouds {
     pub sun_clear: Option<SkySun>,
 }
 
+/// Metres a side of the clouds' shadow map round the eye: 16 m texels at
+/// `CLOUD_SHADOW_SIZE` 64, finer than a cloud's soft edge.
+pub const CLOUD_SHADOW_EXTENT_M: f32 = 1024.0;
+/// The map's centre moves in steps this long, so it need not be rebuilt
+/// every metre walked.
+pub const CLOUD_SHADOW_SNAP_M: f32 = 128.0;
+/// Rows built a frame: the whole map every 8 frames (~0.1 s at 72 Hz),
+/// 512 cloud lookups a frame instead of 4096 at once.
+pub const CLOUD_SHADOW_ROWS_PER_FRAME: u32 = 8;
+/// The share of the sun's flux on level ground a cloud that hides it whole
+/// scatters down from its base. Under a cumulus the ground takes some
+/// 25-35% of the clear sky's global light (direct gone, diffuse up); the
+/// clear sky's own share is already in the ambient, and this lifts the shade
+/// from 1/5.2 of full sun (sky alone, measured at 14 h) to about 1/3.6
+/// (0.12 gave 1/4.2: the fill is occluded as the sky is).
+pub const CLOUD_FILL: f32 = 0.16;
+
+/// `Uniforms::cloud_map` for a map centred on `centre` (world x, z) under a
+/// clear light `sun`, read from player space: world = R(yaw) p + offset,
+/// R taking (x, z) to (c x + s z, -s x + c z).
+pub fn cloud_map_for(centre: [f32; 2], sun: &SkySun, yaw: f32, offset: [f32; 3]) -> [[f32; 4]; 3] {
+    let e = 1.0 / CLOUD_SHADOW_EXTENT_M;
+    let h = 0.5 * CLOUD_SHADOW_EXTENT_M;
+    let (s, c) = yaw.sin_cos();
+    let o = [(offset[0] - (centre[0] - h)) * e, (offset[2] - (centre[1] - h)) * e];
+    let d = sun.direction;
+    let up = d[1].max(0.0) / (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+    let f = sun.light_rgb.map(|v| v * up * CLOUD_FILL);
+    [[c * e, s * e, -s * e, c * e], [o[0], o[1], 0.0, 0.0], [f[0], f[1], f[2], 1.0]]
+}
+
+/// The map's outer ring set to its average, so ground past the map (which
+/// the clamped sampler reads at the edge) takes the average light, never
+/// one row's patch smeared to the horizon.
+pub fn cloud_map_border(texels: &mut [u8], size: u32) -> f32 {
+    let mean = texels.iter().map(|&v| v as f32).sum::<f32>() / (255.0 * texels.len().max(1) as f32);
+    let m = (mean * 255.0).round() as u8;
+    for j in 0..size {
+        for i in 0..size {
+            if i == 0 || j == 0 || i + 1 == size || j + 1 == size {
+                texels[(j * size + i) as usize] = m;
+            }
+        }
+    }
+    mean
+}
+
+/// The clouds' shadow on the ground, built a slice of rows a frame
+/// (`Sky::step_cloud_shadow`) and shown when whole.
+#[derive(Default)]
+pub struct CloudShadow {
+    shown: Vec<u8>,
+    building: Vec<u8>,
+    shown_centre: Option<[f32; 2]>,
+    shown_mean: f32,
+    build_centre: Option<[f32; 2]>,
+    next_row: u32,
+    /// The shown map changed since `take_cloud_shadow_upload`.
+    dirty: bool,
+    /// Read this frame: the clouds are up, the sun is above them, and the
+    /// lever is on.
+    active: bool,
+}
+
 pub struct Sky {
     pub bind_group: BindGroup,
 
@@ -170,6 +234,7 @@ pub struct Sky {
     sampler: Sampler,
 
     pub clouds: Option<SkyClouds>,
+    pub cloud_shadow: CloudShadow,
     cloud_texture: Texture,
     cloud_sampler: Sampler,
 
@@ -444,6 +509,7 @@ impl Sky {
             texture,
             sampler,
             clouds: None,
+            cloud_shadow: CloudShadow::default(),
             cloud_texture,
             cloud_sampler,
             blend: None,
@@ -615,6 +681,83 @@ impl Sky {
         let toward = |v: [f32; 4]| c.frame.transmittance_along(&c.field, [0.0, 0.0], [v[0], v[1], v[2]]);
         self.extra.cloud_sky[3] = toward(self.extra.sun);
         self.extra.cloud_ground[3] = toward(self.extra.moon);
+    }
+
+    /// One frame of the clouds' shadow map round `eye_xz` (world x, z):
+    /// the next `CLOUD_SHADOW_ROWS_PER_FRAME` rows toward the clear sun, the
+    /// whole map at once when none is shown yet. `on` false (the lever, or
+    /// no auto light) leaves the level's sun dimmed as a whole.
+    pub fn step_cloud_shadow(&mut self, eye_xz: [f32; 2], on: bool) {
+        let size = crate::renderer::uniforms::CLOUD_SHADOW_SIZE;
+        let n = (size * size) as usize;
+        let cs = &mut self.cloud_shadow;
+        let light = self.clouds.as_ref().and_then(|c| c.sun_clear.map(|s| (c, s)));
+        let Some((c, sun)) = light.filter(|(c, s)| on && c.frame.params.coverage > 0.0 && s.direction[1] > 0.0) else {
+            cs.active = false;
+            return;
+        };
+        let snap = |v: f32| (v / CLOUD_SHADOW_SNAP_M).round() * CLOUD_SHADOW_SNAP_M;
+        let centre = [snap(eye_xz[0]), snap(eye_xz[1])];
+        if cs.build_centre != Some(centre) || cs.building.len() != n {
+            cs.build_centre = Some(centre);
+            cs.building.resize(n, 255);
+            cs.next_row = 0;
+        }
+        let rows = if cs.shown_centre.is_none() || !cs.active { size } else { CLOUD_SHADOW_ROWS_PER_FRAME };
+        let end = (cs.next_row + rows).min(size);
+        let d = sun.direction;
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+        c.frame.shadow_rows(&c.field, centre, CLOUD_SHADOW_EXTENT_M, size, d.map(|v| v / len), cs.next_row..end, &mut cs.building);
+        cs.next_row = end;
+        if end >= size {
+            std::mem::swap(&mut cs.shown, &mut cs.building);
+            cs.shown_centre = Some(centre);
+            cs.shown_mean = cloud_map_border(&mut cs.shown, size);
+            cs.dirty = true;
+            cs.next_row = 0;
+            cs.building.resize(n, 255);
+        }
+        cs.active = cs.shown_centre.is_some();
+    }
+
+    /// The shown map's texels when they changed since the last call.
+    pub fn take_cloud_shadow_upload(&mut self) -> Option<&[u8]> {
+        let cs = &mut self.cloud_shadow;
+        (cs.active && std::mem::take(&mut cs.dirty)).then_some(&cs.shown[..])
+    }
+
+    /// Where the shown map lies (`Uniforms::cloud_map`) for the player's
+    /// `yaw` and `offset`; zeros when it is not read.
+    pub fn cloud_map(&self, yaw: f32, offset: [f32; 3]) -> [[f32; 4]; 3] {
+        let cs = &self.cloud_shadow;
+        let sun = self.clouds.as_ref().and_then(|c| c.sun_clear);
+        match (cs.shown_centre.filter(|_| cs.active), sun) {
+            (Some(c), Some(sun)) => cloud_map_for(c, &sun, yaw, offset),
+            _ => [[0.0; 4]; 3],
+        }
+    }
+
+    /// The sun as the clouds over `xz` (world) let it through: what the
+    /// falling weather round the head is lit by while the shadow map is
+    /// read, so snow in a cloud's shadow does not glow in the level's sun.
+    pub fn sun_at(&self, xz: [f32; 2]) -> Option<SkySun> {
+        let clear = self.clouds.as_ref().filter(|_| self.cloud_shadow.active).and_then(|c| c.sun_clear.map(|s| (c, s)));
+        let Some((c, s)) = clear else { return self.sun };
+        let d = s.direction;
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+        let t = c.frame.transmittance_along(&c.field, xz, d.map(|v| v / len));
+        Some(SkySun { light_rgb: s.light_rgb.map(|v| v * t), ..s })
+    }
+
+    /// The sun the lit shaders take: the clear one while the shadow map
+    /// dims it per pixel, else the one dimmed by the clouds over the level.
+    pub fn sun_direct(&self) -> Option<SkySun> {
+        if self.cloud_shadow.active {
+            if let Some(c) = &self.clouds {
+                return c.sun_clear;
+            }
+        }
+        self.sun
     }
 
     pub fn none(device: &Device, queue: &Queue, layout: &BindGroupLayout, ambient: f32) -> Self {
