@@ -3,7 +3,7 @@ use std::sync::{mpsc, Arc};
 use super::XrRenderer;
 use crate::renderer::probe_stream::{FixedFaces, ProbeDesc, ProbeSource};
 use crate::renderer::time_of_day::{
-    relight_probe_faces, relit_probe_source, ClockOverride, Prepared, ProbeDaylight, TimeOfDayRuntime, NIGHT_MAX_EXPOSURE,
+    building_daylight_faces, relit_probe_source, ClockOverride, Prepared, ProbeDaylight, TimeOfDayRuntime, NIGHT_MAX_EXPOSURE,
     PROBE_RELIGHT_ANGLE_COS, PROBE_RELIGHT_RATIO,
 };
 use space_soup_sky::time_of_day::{AtlasLayers, TimeOfDayParams};
@@ -434,8 +434,7 @@ impl XrRenderer {
                 let lamp = lamps.get(i).filter(|l| l.len() == faces.len()).cloned().map(Arc::new);
                 let relit = match (&lamp, k == 1.0) {
                     (_, true) => faces.clone(),
-                    (Some(l), false) => relight_probe_faces(&faces, l, k),
-                    (None, false) => relight_probe_faces(&faces, &vec![0u8; faces.len()], k),
+                    (l, false) => building_daylight_faces(&faces, l.as_deref().map_or(&[][..], |l| l.as_slice()), k),
                 };
                 self.tod.buildings.push((Arc::new(faces), lamp));
                 (lo, hi, relit)
@@ -472,8 +471,7 @@ impl XrRenderer {
                 Box::new(move || {
                     Some(match (&lamps, daylight == 1.0) {
                         (_, true) => full.to_vec(),
-                        (Some(l), false) => relight_probe_faces(&full, l, daylight),
-                        (None, false) => relight_probe_faces(&full, &vec![0u8; full.len()], daylight),
+                        (l, false) => building_daylight_faces(&full, l.as_deref().map_or(&[][..], |l| l.as_slice()), daylight),
                     })
                 })
             })

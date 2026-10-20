@@ -8,7 +8,7 @@ pub const REFRESH_HOURS: f32 = 0.02;
 
 pub const RELIGHT_STEP: f32 = 0.03;
 
-pub const NIGHT_MAX_EXPOSURE: f32 = 2.0e5;
+pub const NIGHT_MAX_EXPOSURE: f32 = 1.0e6;
 
 pub const PROBE_RELIGHT_RATIO: f32 = 1.25;
 
@@ -25,6 +25,26 @@ pub fn relight_probe_faces(full: &[u8], lamps: &[u8], daylight: f32) -> Vec<u8> 
             let a = f16_to_f32(u16::from_le_bytes([f[2 * c], f[2 * c + 1]]));
             let b = f16_to_f32(u16::from_le_bytes([l[2 * c], l[2 * c + 1]]));
             let v = if c == 3 { a } else { b + (a - b).max(0.0) * daylight };
+            out.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// A BUILDING'S OUTSIDE under the hour, from its daylight alone: `(full -
+/// lamps) * daylight`, alpha kept. Its lamps-only photograph is the inside
+/// (lit through doorways, and the hallway's through its walls), which every
+/// wall reflecting a neighbour showed at night as a lit stone face
+/// (2026-10-20). A building's outside takes almost none of its lamps' light.
+pub fn building_daylight_faces(full: &[u8], lamps: &[u8], daylight: f32) -> Vec<u8> {
+    use super::uniforms::{f16_to_f32, f32_to_f16};
+    let mut out = Vec::with_capacity(full.len());
+    for (k, f) in full.chunks_exact(8).enumerate() {
+        let l = lamps.get(k * 8..k * 8 + 8);
+        for c in 0..4 {
+            let a = f16_to_f32(u16::from_le_bytes([f[2 * c], f[2 * c + 1]]));
+            let b = l.map_or(0.0, |l| f16_to_f32(u16::from_le_bytes([l[2 * c], l[2 * c + 1]])));
+            let v = if c == 3 { a } else { (a - b).max(0.0) * daylight };
             out.extend_from_slice(&f32_to_f16(v).to_le_bytes());
         }
     }
@@ -261,6 +281,20 @@ mod tests {
         assert_eq!(source(0).unwrap(), full);
         daylight.set(0.0);
         assert_eq!(read(&source(0).unwrap()), read(&lamps));
+    }
+
+    /// A building's outside keeps only its daylight: dark at night however
+    /// its lamps light the inside, and with no lamps photograph the whole.
+    #[test]
+    fn a_buildings_outside_is_dark_at_night_whatever_its_lamps() {
+        use crate::renderer::uniforms::{f16_to_f32, f32_to_f16};
+        let texel = |v: [f32; 4]| v.iter().flat_map(|x| f32_to_f16(*x).to_le_bytes()).collect::<Vec<u8>>();
+        let read = |b: &[u8]| -> Vec<f32> { b.chunks_exact(2).map(|p| f16_to_f32(u16::from_le_bytes([p[0], p[1]]))).collect() };
+        let full = texel([1.0, 0.5, 0.25, 0.75]);
+        let lamps = texel([0.25, 0.25, 0.25, 0.75]);
+        assert_eq!(read(&building_daylight_faces(&full, &lamps, 0.0)), vec![0.0, 0.0, 0.0, 0.75]);
+        assert_eq!(read(&building_daylight_faces(&full, &lamps, 0.5)), vec![0.375, 0.125, 0.0, 0.75]);
+        assert_eq!(read(&building_daylight_faces(&full, &[], 0.5)), vec![0.5, 0.25, 0.125, 0.75]);
     }
 
     fn hdri_like() -> (SkyIrradiance, SkySun) {

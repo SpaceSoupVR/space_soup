@@ -438,9 +438,22 @@ pub fn exposure_for(luminance: f32) -> f32 {
 
 pub fn exposure_for_up_to(luminance: f32, max: f32) -> f32 {
     let floor = if max > MAX_EXPOSURE { NIGHT_LOG_FLOOR } else { LOG_FLOOR };
-    let ratio = REFERENCE_LUMINANCE / luminance.max(floor);
-    ratio.powf(ADAPTATION_STRENGTH).clamp(MIN_EXPOSURE, max)
+    let luminance = luminance.max(floor);
+    let indoor = (REFERENCE_LUMINANCE / luminance).powf(ADAPTATION_STRENGTH);
+    if max > MAX_EXPOSURE && indoor > MAX_EXPOSURE {
+        // Past the indoor range, on from where it ends (`NIGHT_ADAPTATION_STRENGTH`).
+        let knee = REFERENCE_LUMINANCE / MAX_EXPOSURE.powf(1.0 / ADAPTATION_STRENGTH);
+        return (MAX_EXPOSURE * (knee / luminance).powf(NIGHT_ADAPTATION_STRENGTH)).clamp(MIN_EXPOSURE, max);
+    }
+    indoor.clamp(MIN_EXPOSURE, max)
 }
+
+/// THE DARK-ADAPTED EYE takes in more of the night than the day's partial
+/// adaptation: past the indoor range (`MAX_EXPOSURE`) exposure follows the
+/// luminance at this power. At 0.8 throughout, moonlit ground (about 0.17
+/// lux) drew four stops under the day and the user found the moon's and
+/// stars' light too low (2026-10-20); this lifts it about 1.6 stops.
+pub const NIGHT_ADAPTATION_STRENGTH: f32 = 0.9;
 
 const NIGHT_LOG_FLOOR: f32 = 1e-10;
 
@@ -845,6 +858,19 @@ mod tests {
 
         assert_eq!(exposure_for(1e-6), MAX_EXPOSURE);
         assert!(exposure_for_up_to(1e-6, 1e5) > 1e4);
+    }
+
+    /// Past the indoor range the dark-adapted eye takes in more: the curve
+    /// runs on unbroken from `MAX_EXPOSURE`, lifts moonlit ground by more
+    /// than a stop and a half, and leaves the indoor range as it was.
+    #[test]
+    fn the_night_eye_adapts_further_than_the_day_eye() {
+        let knee = REFERENCE_LUMINANCE / MAX_EXPOSURE.powf(1.0 / ADAPTATION_STRENGTH);
+        assert!((exposure_for_up_to(knee * 0.999, 1e6) / exposure_for_up_to(knee * 1.001, 1e6) - 1.0).abs() < 0.01, "a step at the knee");
+        let moonlit = 3.5e-7;
+        let day_curve = (REFERENCE_LUMINANCE / moonlit).powf(ADAPTATION_STRENGTH);
+        assert!(exposure_for_up_to(moonlit, 1e6) > 3.0 * day_curve, "{} vs {day_curve}", exposure_for_up_to(moonlit, 1e6));
+        assert_eq!(exposure_for_up_to(0.05, 1e6), exposure_for(0.05), "the indoor range is untouched");
     }
 
     #[test]
