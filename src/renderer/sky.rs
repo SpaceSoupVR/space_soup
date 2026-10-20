@@ -1408,6 +1408,31 @@ pub fn sky_cloud_shader() -> String {
             format!(
                 r#"const CLOUD_PACK: f32 = {pack:?};
 
+// A sky map read through a cubic B-spline, in four bilinear taps (Sigg and
+// Hadwiger 2005): smooth to its second derivative, so no texel's square
+// shows at a cloud's edge however far the headset magnifies the map.
+fn sky_cloud_map(uv: vec2<f32>, layer: i32) -> vec4<f32> {{
+    let size = vec2<f32>(textureDimensions(cloud_maps, 0));
+    let p = uv * size - 0.5;
+    let i = floor(p);
+    let f = p - i;
+    let f2 = f * f;
+    let f3 = f2 * f;
+    let w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    let w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    let w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    let w3 = f3 / 6.0;
+    let g0 = w0 + w1;
+    let g1 = w2 + w3;
+    let c0 = (i + 0.5 - 1.0 + w1 / g0) / size;
+    let c1 = (i + 0.5 + 1.0 + w3 / g1) / size;
+    let s00 = textureSampleLevel(cloud_maps, cloud_samp, vec2<f32>(c0.x, c0.y), layer, 0.0);
+    let s10 = textureSampleLevel(cloud_maps, cloud_samp, vec2<f32>(c1.x, c0.y), layer, 0.0);
+    let s01 = textureSampleLevel(cloud_maps, cloud_samp, vec2<f32>(c0.x, c1.y), layer, 0.0);
+    let s11 = textureSampleLevel(cloud_maps, cloud_samp, vec2<f32>(c1.x, c1.y), layer, 0.0);
+    return g0.y * (g0.x * s00 + g1.x * s10) + g1.y * (g0.x * s01 + g1.x * s11);
+}}
+
 // The volumetric clouds (`cloud_sky.rs`): the sky map's last whole build
 // blending into its newest, rgb their light and a how much sky shows past
 // them, haze and all.
@@ -1417,8 +1442,8 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
     }}
     let el = asin(clamp(dir.y, 0.0, 1.0));
     let uv = vec2<f32>(atan2(dir.x, dir.z) / (2.0 * SKY_PI) + 0.5, pow(el / (0.5 * SKY_PI), 1.0 / CLOUD_PACK));
-    var a = textureSampleLevel(cloud_maps, cloud_samp, uv, i32(sky_extra.cloud_misc.x), 0.0);
-    var b = textureSampleLevel(cloud_maps, cloud_samp, uv, i32(sky_extra.cloud_misc.y), 0.0);
+    var a = sky_cloud_map(uv, i32(sky_extra.cloud_misc.x));
+    var b = sky_cloud_map(uv, i32(sky_extra.cloud_misc.y));
     a = vec4<f32>(a.rgb * sky_extra.cloud_scale.x, a.a);
     b = vec4<f32>(b.rgb * sky_extra.cloud_scale.y, b.a);
     let c = mix(a, b, sky_extra.cloud_misc.z);

@@ -20,12 +20,15 @@ use space_soup_sky::cloud_layers::{self as cl, CloudLayer, CloudNoise, LAYERS, N
 use space_soup_sky::clouds::{self as c, CloudField, CLOUD_TILE};
 use wgpu::*;
 
-/// The sky map: 0.35 deg a texel round the horizon.
-pub const MAP_WIDTH: u32 = 1024;
-pub const MAP_HEIGHT: u32 = 384;
-/// Frames to a whole map: 16 rows, 16 k rays a frame; a map every 0.33 s
-/// at 72 Hz, while a 12 m/s wind moves a cloud 1.5 km up 0.15 deg.
-pub const MAP_SLICES: u32 = 24;
+/// The sky map: 0.18 deg a texel round the horizon, about 4.5 of the
+/// Quest 3's pixels. At 0.35 deg (1024 x 384) the headset showed the
+/// texels' squares at cloud edges (2026-10-20); the sky shader reads it
+/// through a cubic B-spline, so no texel's square is drawn.
+pub const MAP_WIDTH: u32 = 2048;
+pub const MAP_HEIGHT: u32 = 768;
+/// Frames to a whole map: 16 rows, 32 k rays a frame; a map every 0.67 s
+/// at 72 Hz, while a 12 m/s wind moves a cloud 1.5 km up 0.3 deg.
+pub const MAP_SLICES: u32 = 48;
 /// Rows are packed toward the horizon: elevation = 90 deg * v^MAP_PACK.
 pub const MAP_PACK: f32 = 1.5;
 
@@ -393,7 +396,8 @@ impl CloudSky {
 /// twinned line for line, then the map and shadow entry points.
 pub fn cloud_sky_shader() -> String {
     let f = |v: f32| format!("{v:?}");
-    let steps = |s: [u32; 3]| format!("array<u32, 3>({}u, {}u, {}u)", s[0], s[1], s[2]);
+    let means = CloudNoise::shared().channel_means();
+    let steps = |s: [u32; 3]| format!("vec3<u32>({}u, {}u, {}u)", s[0], s[1], s[2]);
     CLOUD_SKY_WGSL
         .replace("{EARTH}", &format!("{:.1}", c::EARTH_RADIUS_M))
         .replace("{DETAIL_RATIO}", &f(cl::DETAIL_RATIO))
@@ -421,6 +425,10 @@ pub fn cloud_sky_shader() -> String {
         .replace("{KIND_ALTO}", &f(cl::KIND_ALTOCUMULUS))
         .replace("{HIGH_SHADE_FILL}", &f(cl::HIGH_SHADE_FILL))
         .replace("{SHADOW_SIZE}", &f(crate::renderer::uniforms::CLOUD_SHADOW_SIZE as f32))
+        .replace("{NOISE_TEXELS}", &f(NOISE_SIZE as f32))
+        .replace("{MEAN_A}", &f(means[3]))
+        .replace("{MEAN_B}", &f(means[2]))
+        .replace("{MEAN_FINE}", &f(0.625 * means[1] + 0.25 * means[2] + 0.125 * means[3]))
 }
 
 const CLOUD_SKY_WGSL: &str = r#"
@@ -465,6 +473,12 @@ const KIND_STRATO: f32 = {KIND_STRATO};
 const KIND_CIRRUS: f32 = {KIND_CIRRUS};
 const KIND_ALTO: f32 = {KIND_ALTO};
 const HIGH_SHADE_FILL: f32 = {HIGH_SHADE_FILL};
+const NOISE_TEXELS: f32 = {NOISE_TEXELS};
+const VIEW_STEPS: vec3<u32> = {VIEW_STEPS};
+const SHADOW_STEPS: vec3<u32> = {SHADOW_STEPS};
+const MEAN_A: f32 = {MEAN_A};
+const MEAN_B: f32 = {MEAN_B};
+const MEAN_FINE: f32 = {MEAN_FINE};
 
 @vertex fn vs_full(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
@@ -500,7 +514,29 @@ fn height_profile(kind: f32, h: f32, cover: f32) -> f32 {
     return smoothstep(0.0, 0.2, h) * (1.0 - smoothstep(0.45, 0.9, h));
 }
 
-fn density(k: u32, xz: vec2<f32>, alt: f32, detail: bool) -> f32 {
+// The noise at `s`. For the sky map (`eased`), between texels on a
+// smoothstep rather than a straight line: a shape cut at a threshold from a
+// trilinear field keeps a corner at every texel face, and an altocumulus
+// puff a few texels wide came out as a square (2026-10-20). One tap; the
+// light and the ground's shadow keep the trilinear field their CPU twin
+// reads.
+fn noise_at(s: vec3<f32>, eased: bool) -> vec4<f32> {
+    if (!eased) {
+        return textureSampleLevel(noise_tex, samp, s, 0.0);
+    }
+    let p = s * NOISE_TEXELS + 0.5;
+    let i = floor(p);
+    let f = p - i;
+    let g = f * f * (3.0 - 2.0 * f);
+    return textureSampleLevel(noise_tex, samp, (i + g - 0.5) / NOISE_TEXELS, 0.0);
+}
+
+// `foot`: the metres one sky-map texel spans where this sample is (0 for
+// the light and the ground's shadow, which keep every octave). Detail finer
+// than that cannot be drawn, only aliased -- near the horizon it came out
+// as rows of specks and stripes (headset, 2026-10-20) -- so the octaves it
+// outgrows give way to their means, which keeps the coverage as it was.
+fn density(k: u32, xz: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
     let a = lv(k, 0u);
     let h = (alt - a.x) / max(a.y - a.x, 1.0);
     if (h < 0.0 || h > 1.0) {
@@ -512,8 +548,12 @@ fn density(k: u32, xz: vec2<f32>, alt: f32, detail: bool) -> f32 {
     }
     let si = lv(k, 1u).x;
     let s = vec3<f32>(xz.x * si, alt * si, xz.y * si) + lv(k, 2u).xyz;
-    let n = textureSampleLevel(noise_tex, samp, s, 0.0);
-    let low = 0.625 * n.g + 0.25 * n.b + 0.125 * n.a;
+    let n = noise_at(s, detail);
+    // The footprint in the shape noise's texels.
+    let r = foot * NOISE_TEXELS * si;
+    let fine_a = smoothstep(0.25, 0.5, r);
+    let fine_b = smoothstep(0.5, 1.0, r);
+    let low = 0.625 * n.g + 0.25 * mix(n.b, MEAN_B, fine_b) + 0.125 * mix(n.a, MEAN_A, fine_a);
     let base = clamp((n.r - (low - 1.0)) / (2.0 - low), 0.0, 1.0);
     let shape = base * height_profile(lv(k, 1u).y, h, cover);
     let th = threshold(k, cover);
@@ -522,8 +562,13 @@ fn density(k: u32, xz: vec2<f32>, alt: f32, detail: bool) -> f32 {
         return 0.0;
     }
     if (detail) {
-        let q = textureSampleLevel(noise_tex, samp, s * DETAIL_RATIO, 0.0);
-        let fine = 0.625 * q.g + 0.25 * q.b + 0.125 * q.a;
+        // The erosion noise is DETAIL_RATIO times finer still.
+        let gone = smoothstep(0.25, 0.5, r * DETAIL_RATIO);
+        var fine = MEAN_FINE;
+        if (gone < 1.0) {
+            let q = noise_at(s * DETAIL_RATIO, true);
+            fine = mix(0.625 * q.g + 0.25 * q.b + 0.125 * q.a, MEAN_FINE, gone);
+        }
         let e = fine + (1.0 - 2.0 * fine) * smoothstep(0.1, 0.6, h);
         let cut = DETAIL_EROSION * e;
         d = clamp((d - cut) / (1.0 - cut), 0.0, 1.0);
@@ -589,7 +634,6 @@ fn transmittance_toward(xz: vec2<f32>, alt: f32, dir: vec3<f32>) -> f32 {
     if (mu <= 0.02) {
         return 1.0;
     }
-    var steps = {SHADOW_STEPS};
     var tau = 0.0;
     for (var k = 0u; k < 4u; k = k + 1u) {
         if (!layer_on(k)) {
@@ -610,14 +654,21 @@ fn transmittance_toward(xz: vec2<f32>, alt: f32, dir: vec3<f32>) -> f32 {
         if (t0 < 0.0 || t1 < 0.0) {
             continue;
         }
-        let n = steps[min(k, 2u)];
+        let n = pick_steps(k, SHADOW_STEPS);
         let dt = min(t1 - t0, MAX_MARCH) / f32(n);
         for (var i = 0u; i < n; i = i + 1u) {
             let t = t0 + (f32(i) + 0.5) * dt;
-            tau = tau + density(k, xz + dir.xz * t, altitude_along(alt, mu, t), false) * dt;
+            tau = tau + density(k, xz + dir.xz * t, altitude_along(alt, mu, t), false, 0.0) * dt;
         }
     }
     return exp(-tau);
+}
+
+// Steps for layer k from a vec3 of counts, by select: an array indexed at
+// run time is a local array on Adreno, in scratch memory (memory
+// `adreno-local-array-cliff`: 0.9-1.6 ms in sky_irradiance).
+fn pick_steps(k: u32, s: vec3<u32>) -> u32 {
+    return select(select(s.z, s.y, k == 1u), s.x, k == 0u);
 }
 
 fn hg(g: f32, c: f32) -> f32 {
@@ -637,24 +688,29 @@ fn light_tau(k: u32, xz: vec2<f32>, alt: f32) -> f32 {
     let thick = max(a.y - a.x, 100.0);
     var tau = 0.0;
     var last = 0.0;
-    var reach = array<f32, 4>(0.05, 0.15, 0.35, 0.8);
     let taps = select(2u, 4u, lv(k, 1u).y == KIND_CUMULUS);
     for (var i = 0u; i < taps; i = i + 1u) {
-        let r = reach[i + 4u - taps] * thick;
+        let j = i + 4u - taps;
+        let r = select(select(select(0.8, 0.35, j == 2u), 0.15, j == 1u), 0.05, j == 0u) * thick;
         let p = vec3<f32>(xz.x, alt, xz.y) + l * r;
-        tau = tau + density(k, p.xz, p.y, false) * (r - last);
+        tau = tau + density(k, p.xz, p.y, false, 0.0) * (r - last);
         last = r;
     }
     return tau;
 }
 
-// The light a sample in layer k sends toward the eye per unit extinction.
-fn in_scatter(k: u32, alt: f32, tau_l: f32, cv: f32, d: f32) -> vec3<f32> {
+// The three octaves' phases toward the light: one ray keeps one angle to
+// it, so `fs_map` works them out once, not at every sample.
+fn octave_phases(cv: f32) -> vec3<f32> {
+    return vec3<f32>(phase(1.0, cv), OCT_A * phase(OCT_C, cv), OCT_A * OCT_A * phase(OCT_C * OCT_C, cv));
+}
+
+// The light a sample in layer k sends toward the eye per unit extinction;
+// `ph` the ray's `octave_phases`.
+fn in_scatter(k: u32, alt: f32, tau_l: f32, cv: f32, ph: vec3<f32>, d: f32) -> vec3<f32> {
     let a = lv(k, 0u);
     let h = clamp((alt - a.x) / max(a.y - a.x, 1.0), 0.0, 1.0);
-    var oct = phase(1.0, cv) * exp(-tau_l)
-        + OCT_A * phase(OCT_C, cv) * exp(-OCT_B * tau_l)
-        + OCT_A * OCT_A * phase(OCT_C * OCT_C, cv) * exp(-OCT_B * OCT_B * tau_l);
+    var oct = ph.x * exp(-tau_l) + ph.y * exp(-OCT_B * tau_l) + ph.z * exp(-OCT_B * OCT_B * tau_l);
     // Beer-powder, mild and only away from the sun: thin outer parts have
     // built up less scattered light.
     let powder = 1.0 - exp(-POWDER_K * (2.0 * tau_l + 40.0 * d));
@@ -665,11 +721,13 @@ fn in_scatter(k: u32, alt: f32, tau_l: f32, cv: f32, d: f32) -> vec3<f32> {
     return u.light.rgb * (oct + deep) + amb;
 }
 
-// Where in its step each sample sits. Per-texel jitter (even interleaved
-// gradient noise) left a dot pattern the display's magnification showed;
-// the steps' middle, with enough steps, leaves no grain and no bands.
+// Where in its step a sample sits: interleaved gradient noise, 0..1. Used
+// only where the steps are long beside the shape's features (`fs_map`):
+// the steps' middle, shared by every texel, marched long low rays through
+// the same slabs of noise and drew them as stripes; up close it is still
+// the middle, whose jitter showed as dots before the display filtered.
 fn cloud_hash(p: vec2<f32>) -> f32 {
-    return 0.5;
+    return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
 }
 
 fn map_dir(uv: vec2<f32>) -> vec3<f32> {
@@ -687,8 +745,12 @@ fn map_dir(uv: vec2<f32>) -> vec3<f32> {
     let alt = u.eye.y;
     let eye = u.eye.xz;
     let cv = dot(dir, u.light_dir.xyz);
-    let jitter = cloud_hash(pos.xy);
-    var steps = {VIEW_STEPS};
+    let hash = cloud_hash(pos.xy);
+    let ph = octave_phases(cv);
+    // The angle one texel spans: across (azimuth, narrowing up the sky)
+    // or along (elevation, packed toward the horizon), whichever is wider.
+    let v = pos.y / size.y;
+    let texel = max(2.0 * PI * sqrt(max(1.0 - mu * mu, 0.0)) / size.x, 0.5 * PI * PACK * pow(max(v, 1e-3), PACK - 1.0) / size.y);
     var trans = 1.0;
     var seen = 0.0;
     var rgb = vec3<f32>(0.0);
@@ -702,15 +764,19 @@ fn map_dir(uv: vec2<f32>) -> vec3<f32> {
         if (t0 < 0.0 || t1 < 0.0) {
             continue;
         }
-        let n = steps[k];
+        let n = pick_steps(k, VIEW_STEPS);
         let dt = min(t1 - t0, MAX_MARCH) / f32(n);
+        // A step longer than the shape's texels samples it, not integrates
+        // it: there each texel's samples sit at their own place in the step.
+        let along = 0.25 * dt * NOISE_TEXELS * lv(k, 1u).x;
+        let jitter = 0.5 + (hash - 0.5) * smoothstep(0.5, 2.0, along);
         for (var i = 0u; i < n; i = i + 1u) {
             let t = t0 + (f32(i) + jitter) * dt;
             let p_alt = altitude_along(alt, mu, t);
             let xz = eye + dir.xz * t;
-            let d = density(k, xz, p_alt, true);
+            let d = density(k, xz, p_alt, true, max(t * texel, 0.25 * dt));
             if (d > 0.0) {
-                let s = in_scatter(k, p_alt, light_tau(k, xz, p_alt), cv, d);
+                let s = in_scatter(k, p_alt, light_tau(k, xz, p_alt), cv, ph, d);
                 let ts = exp(-d * dt);
                 let w = trans * (1.0 - ts) * exp(-t * HAZE);
                 rgb = rgb + w * s;
