@@ -160,6 +160,8 @@ pub struct SkyClouds {
     pub seconds: f64,
     /// The layers where they are now (`Sky::tick`).
     pub layers: [CloudLayer; LAYERS],
+    /// The light is the moon's (the sun is down).
+    pub light_is_moon: bool,
 }
 
 /// The level's share of the clear light through the clouds: their direct
@@ -268,6 +270,12 @@ pub struct Sky {
     cloud_sampler: Sampler,
     /// Where the eye was last frame (world x, z), for the halos' clouds.
     eye_xz: [f32; 2],
+    /// Toward the clouds' light (the sun, or the moon) THIS frame, from the
+    /// astronomy `Sky::tick` runs every frame. The snapshot's direction steps
+    /// 0.6 deg every 2 s, and at 19 deg up that slid every cloud's shadow
+    /// tens of metres in one frame: the beach lost its sun at once
+    /// (headset, 2026-10-20 16:55:57).
+    light_now: Option<[f32; 3]>,
 
     /// The time of day's way from the last snapshot to the newest: drawn
     /// and lit between them, frame by frame (`Sky::tick`), so the sky's
@@ -602,6 +610,7 @@ impl Sky {
             clouds: None,
             cloud_shadow: CloudShadow::default(),
             cloud_sky: None,
+            light_now: None,
             night,
             cloud_texture,
             cloud_sampler,
@@ -717,7 +726,15 @@ impl Sky {
                     .filter(|m| m.params == frame.params)
                     .unwrap_or_else(|| std::sync::Arc::new(CloudModel::new(&frame.params, &CloudNoise::shared())));
                 let secs = seconds as f64;
-                Some(SkyClouds { field: field.clone(), frame: frame.at(secs), sun_clear: snap.light_clear, layers: model.layers(secs), model, seconds: secs })
+                Some(SkyClouds {
+                    field: field.clone(),
+                    frame: frame.at(secs),
+                    sun_clear: snap.light_clear,
+                    layers: model.layers(secs),
+                    model,
+                    seconds: secs,
+                    light_is_moon: snap.light_is_moon,
+                })
             }
             _ => None,
         };
@@ -778,14 +795,16 @@ impl Sky {
             self.extra.moon_sunward = v4(a.moon_sunward, 0.0);
             let m = &a.celestial_to_world;
             self.extra.celestial = [v4(m[0], 0.0), v4(m[1], 0.0), v4(m[2], 0.0)];
+            self.light_now = self.clouds.as_ref().map(|c| if c.light_is_moon { a.moon } else { a.sun });
         }
         self.dim_sun_by_clouds();
         queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
     }
 
     fn dim_sun_by_clouds(&mut self) {
+        let Some(dir) = self.cloud_light_dir() else { return };
         let Some(c) = &self.clouds else { return };
-        let through = c.sun_clear.map_or(1.0, |l| level_transmittance(&c.layers, &c.field, l.direction));
+        let through = level_transmittance(&c.layers, &c.field, dir);
         self.sun = c.sun_clear.map(|l| SkySun { light_rgb: l.light_rgb.map(|v| v * through), ..l });
         // The glare round the sun and the moon goes as the clouds cover them
         // from the eye (`sky_halo_through` in the cloud shader).
@@ -796,24 +815,32 @@ impl Sky {
         self.extra.cloud_ground[3] = toward(self.extra.moon);
     }
 
+    /// Toward the clouds' light now: this frame's astronomy when it has
+    /// run, else the snapshot's.
+    pub fn cloud_light_dir(&self) -> Option<[f32; 3]> {
+        let c = self.clouds.as_ref()?;
+        Some(unit3(self.light_now.or(c.sun_clear.map(|s| s.direction)).unwrap_or(c.frame.light_dir)))
+    }
+
     /// ONE FRAME OF THE CLOUDS (`CloudSky`): the next slice of the sky map
     /// seen from `eye` (world), and -- when `shadow` is given and `on` (the
     /// lever, the clouds up, the light above them) -- their shadow on the
     /// ground round it. `whole` draws the whole map at once (a still).
     pub fn step_clouds(&mut self, device: &Device, queue: &Queue, eye: [f32; 3], on: bool, shadow: Option<&TextureView>, whole: bool) {
         self.eye_xz = [eye[0], eye[2]];
-        let (Some(c), Some(gpu)) = (self.clouds.as_ref(), self.cloud_sky.as_mut()) else {
+        let dir = self.cloud_light_dir();
+        let (Some(c), Some(gpu), Some(dir)) = (self.clouds.as_ref(), self.cloud_sky.as_mut(), dir) else {
             self.cloud_shadow.active = false;
             return;
         };
         let cs = &mut self.cloud_shadow;
-        let light = c.sun_clear.filter(|s| on && c.frame.params.coverage > 0.0 && s.direction[1] > 0.0);
+        let light = c.sun_clear.filter(|_| on && c.frame.params.coverage > 0.0 && dir[1] > 0.0);
         let snap = |v: f32| (v / CLOUD_SHADOW_SNAP_M).round() * CLOUD_SHADOW_SNAP_M;
         let centre = [snap(eye[0]), snap(eye[2])];
-        if let Some(sun) = light {
+        if light.is_some() {
             if cs.centre != Some(centre) || cs.frames % CLOUD_SHADOW_MEAN_FRAMES == 0 {
                 let noise = CloudNoise::shared();
-                let d = unit3(sun.direction);
+                let d = dir;
                 let mut sum = 0.0;
                 for j in 0..4 {
                     for i in 0..4 {
@@ -828,7 +855,7 @@ impl Sky {
         }
         cs.active = light.is_some() && shadow.is_some();
         let f = &c.frame;
-        let u = CloudSkyUniform::new(&c.layers, eye, f.light_dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean);
+        let u = CloudSkyUniform::new(&c.layers, eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean);
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("clouds") });
         gpu.encode(&mut encoder, queue, &u, shadow.filter(|_| cs.active), whole);
         queue.submit(Some(encoder.finish()));
@@ -858,7 +885,8 @@ impl Sky {
     pub fn sun_at(&self, xz: [f32; 2]) -> Option<SkySun> {
         let clear = self.clouds.as_ref().filter(|_| self.cloud_shadow.active).and_then(|c| c.sun_clear.map(|s| (c, s)));
         let Some((c, s)) = clear else { return self.sun };
-        let t = cloud_layers::transmittance_toward(&c.layers, &CloudNoise::shared(), &c.field, xz, 0.0, unit3(s.direction));
+        let dir = self.cloud_light_dir().unwrap_or(s.direction);
+        let t = cloud_layers::transmittance_penumbra(&c.layers, &CloudNoise::shared(), &c.field, xz, 0.0, dir);
         Some(SkySun { light_rgb: s.light_rgb.map(|v| v * t), ..s })
     }
 
@@ -1361,7 +1389,6 @@ fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
 }
 
 pub fn sky_cloud_shader() -> String {
-    use space_soup_sky::clouds as c;
     let src = sky_shader();
     let edits: [(&str, String); 5] = [
         (
@@ -2036,6 +2063,64 @@ mod render_tests {
         let tod = TimeOfDaySky::new(TimeOfDayParams { start_hour: 13.0, clouds, ..Default::default() });
         let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
         (tod.snapshot(13.0, 0.0), zenith)
+    }
+
+    /// A new time-of-day snapshot must not change the light the lit shaders
+    /// take: on the headset (2026-10-20, 16:55:57) the whole beach lost its
+    /// sun in the frame a snapshot landed. Prints the light per frame
+    /// either side of one.
+    #[test]
+    fn a_snapshot_landing_does_not_step_the_suns_light() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let layout = sky_bind_group_layout(&device);
+        let clouds = space_soup_sky::clouds::CloudParams { coverage: 0.45, ..Default::default() };
+        let tod = TimeOfDaySky::new(TimeOfDayParams { start_hour: 17.6, clouds, ..Default::default() });
+        let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
+        let mut sky = Sky::none(&device, &queue, &layout, AMBIENT);
+        let size = crate::renderer::uniforms::CLOUD_SHADOW_SIZE;
+        let shadow = device.create_texture(&TextureDescriptor {
+            label: None,
+            size: Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R8Unorm,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = shadow.create_view(&Default::default());
+        let eye = [3.0f32, 1.6, 22.0];
+        let mut secs = 600.0f32;
+        let hour = |s: f32| 17.6 + (s - 600.0) * 0.02;
+        sky.apply_snapshot_blended(&device, &queue, &layout, &tod.snapshot(hour(secs), 0.0), secs, zenith, 0.0);
+        let mut seen: Vec<(f32, f32, f32, f32)> = Vec::new();
+        for frame in 0..300 {
+            let dt = 1.0 / 72.0;
+            secs += dt;
+            if frame == 150 {
+                sky.apply_snapshot_blended(&device, &queue, &layout, &tod.snapshot(hour(secs), 0.0), secs, zenith, 2.0);
+            }
+            let params = TimeOfDayParams { start_hour: 17.6, clouds, ..Default::default() };
+            let astro = space_soup_sky::time_of_day::Astronomy::at(&params, hour(secs), 0.0);
+            sky.tick(&queue, secs, dt, Some(&astro));
+            sky.step_clouds(&device, &queue, eye, true, Some(&view), false);
+            let direct = sky.sun_direct().map_or(0.0, |s| s.light_rgb[1]);
+            let level = sky.sun.map_or(0.0, |s| s.light_rgb[1]);
+            let c = sky.clouds.as_ref().unwrap();
+            let t = space_soup_sky::cloud_layers::transmittance_penumbra(&c.layers, &CloudNoise::shared(), &c.field, [eye[0], eye[2]], eye[1], sky.cloud_light_dir().unwrap());
+            seen.push((secs, direct, level, t));
+        }
+        // The change in the light reaching the eye as a share of the clear
+        // sun's, frame to frame (a relative change blows up in deep shade).
+        let worst = seen.windows(2).map(|w| (w[1].1 * w[1].3 - w[0].1 * w[0].3).abs() / w[0].1.max(1e-9)).enumerate().fold((0, 0.0f32), |a, (i, v)| if v > a.1 { (i, v) } else { a });
+        let full: f32 = seen.windows(2).map(|w| (w[1].3 - w[0].3).abs()).sum();
+        eprintln!("the light at the eye travelled {full:.2} (sum of |change|) over {} frames", seen.len());
+        for (i, s) in seen.iter().enumerate().filter(|(i, _)| (*i as i32 - 150).abs() <= 2 || (*i as i32 - worst.0 as i32).abs() <= 4) {
+            eprintln!("frame {i}: direct {:.4} level {:.4} through at eye {:.4}", s.1, s.2, s.3);
+        }
+        eprintln!("worst frame-to-frame change of the light on the eye: {:.3} at frame {}", worst.1, worst.0);
+        // A shade sweeping in over 2 s at 72 Hz moves 0.007 a frame.
+        assert!(worst.1 < 0.02, "the light on the eye steps by {:.3} at frame {}", worst.1, worst.0);
     }
 
     fn snap_px(dir: [f32; 3], snap: &SkySnapshot, zenith: [f32; 3], fov: f32, post: PostUpload, twin: bool) -> Option<[u8; 4]> {

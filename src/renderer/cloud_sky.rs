@@ -401,6 +401,7 @@ pub fn cloud_sky_shader() -> String {
         .replace("{EDGE_GAIN}", &f(cl::EDGE_GAIN))
         .replace("{MAX_MARCH}", &f(cl::MAX_MARCH_M))
         .replace("{CIRRUS_TAU}", &f(cl::CIRRUS_TAU))
+        .replace("{SUN_RADIUS}", &f(cl::SHADOW_DISC_RAD))
         .replace("{CIRRUS_STRETCH}", &f(cl::CIRRUS_STRETCH))
         .replace("{EXTINCTION}", &f(c::EXTINCTION_PER_M))
         .replace("{VIEW_STEPS}", &steps(cl::VIEW_STEPS))
@@ -417,6 +418,8 @@ pub fn cloud_sky_shader() -> String {
         .replace("{KIND_CUMULUS}", &f(cl::KIND_CUMULUS))
         .replace("{KIND_STRATO}", &f(cl::KIND_STRATOCUMULUS))
         .replace("{KIND_CIRRUS}", &f(cl::KIND_CIRRUS))
+        .replace("{KIND_ALTO}", &f(cl::KIND_ALTOCUMULUS))
+        .replace("{HIGH_SHADE_FILL}", &f(cl::HIGH_SHADE_FILL))
         .replace("{SHADOW_SIZE}", &f(crate::renderer::uniforms::CLOUD_SHADOW_SIZE as f32))
 }
 
@@ -445,6 +448,7 @@ const DETAIL_EROSION: f32 = {DETAIL_EROSION};
 const EDGE_GAIN: f32 = {EDGE_GAIN};
 const MAX_MARCH: f32 = {MAX_MARCH};
 const CIRRUS_TAU: f32 = {CIRRUS_TAU};
+const SUN_RADIUS: f32 = {SUN_RADIUS};
 const CIRRUS_STRETCH: f32 = {CIRRUS_STRETCH};
 const EXTINCTION: f32 = {EXTINCTION};
 const OCT_A: f32 = {OCT_A};
@@ -459,6 +463,8 @@ const PACK: f32 = {PACK};
 const KIND_CUMULUS: f32 = {KIND_CUMULUS};
 const KIND_STRATO: f32 = {KIND_STRATO};
 const KIND_CIRRUS: f32 = {KIND_CIRRUS};
+const KIND_ALTO: f32 = {KIND_ALTO};
+const HIGH_SHADE_FILL: f32 = {HIGH_SHADE_FILL};
 
 @vertex fn vs_full(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
@@ -566,6 +572,16 @@ fn layer_on(k: u32) -> bool {
     return a.z > 0.0 && a.w > 0.0;
 }
 
+// A high thin layer's depth toward the light as the ground feels it: its
+// coverage, not its cells (`cloud_layers::high_layer_tau`).
+fn high_layer_tau(k: u32, xz: vec2<f32>, slant: f32) -> f32 {
+    let a = lv(k, 0u);
+    if (lv(k, 1u).y == KIND_CIRRUS) {
+        return a.z * HIGH_SHADE_FILL * CIRRUS_TAU * min(a.w / EXTINCTION, 2.0) * slant;
+    }
+    return local_coverage(k, xz) * HIGH_SHADE_FILL * a.w * (a.y - a.x) * slant;
+}
+
 // The column's direct transmittance toward dir from xz at alt, every layer
 // (`cloud_layers::transmittance_toward`).
 fn transmittance_toward(xz: vec2<f32>, alt: f32, dir: vec3<f32>) -> f32 {
@@ -580,12 +596,13 @@ fn transmittance_toward(xz: vec2<f32>, alt: f32, dir: vec3<f32>) -> f32 {
             continue;
         }
         let a = lv(k, 0u);
-        if (lv(k, 1u).y == KIND_CIRRUS) {
+        let kind = lv(k, 1u).y;
+        if (kind == KIND_CIRRUS || kind == KIND_ALTO) {
             let t = shell_distance(alt, a.x, mu);
             if (t < 0.0) {
                 continue;
             }
-            tau = tau + cirrus_tau(k, xz + dir.xz * t) * min(1.0 / mu, 8.0);
+            tau = tau + high_layer_tau(k, xz + dir.xz * t, min(1.0 / mu, 8.0));
             continue;
         }
         let t0 = shell_distance(alt, a.x, mu);
@@ -730,7 +747,19 @@ fn map_dir(uv: vec2<f32>) -> vec3<f32> {
     }
     let step = u.shadow.z / size;
     let xz = u.shadow.xy - 0.5 * u.shadow.z + pos.xy * step;
-    return vec4<f32>(transmittance_toward(xz, u.shadow.w, u.light_dir.xyz));
+    // Four rays across the light's disc: the penumbra
+    // (`cloud_layers::transmittance_penumbra`).
+    let l = u.light_dir.xyz;
+    let up = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(l.y) < 0.9);
+    let a = normalize(cross(l, up));
+    let b = cross(l, a);
+    var sum = 0.0;
+    for (var k = 0u; k < 4u; k = k + 1u) {
+        let ang = (f32(k) + 0.5) * 0.5 * PI;
+        let d = normalize(l + SUN_RADIUS * 0.7 * (cos(ang) * a + sin(ang) * b));
+        sum = sum + transmittance_toward(xz, u.shadow.w, d);
+    }
+    return vec4<f32>(0.25 * sum);
 }
 "#;
 
@@ -802,7 +831,7 @@ mod tests {
         for j in 1..size - 1 {
             for i in 1..size - 1 {
                 let xz = [centre[0] - 0.5 * extent + (i as f32 + 0.5) * step, centre[1] - 0.5 * extent + (j as f32 + 0.5) * step];
-                let cpu = space_soup_sky::cloud_layers::transmittance_toward(&layers, &noise, &field, xz, 2.0, dir);
+                let cpu = space_soup_sky::cloud_layers::transmittance_penumbra(&layers, &noise, &field, xz, 2.0, dir);
                 let gpu = texels[(j * size + i) as usize] as f32 / 255.0;
                 worst = worst.max((cpu - gpu).abs());
                 sum += (cpu - gpu).abs();
