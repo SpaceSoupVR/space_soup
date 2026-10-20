@@ -2911,46 +2911,26 @@ impl TerrainMaterial {
         shape: Option<&super::ground_shape::GroundShape>,
         deform: Option<&TextureView>,
     ) -> Self {
-        assert!(!layers.is_empty(), "terrain material needs at least one layer");
-        let (w, h) = (layers[0].width, layers[0].height);
-        assert!(
-            layers.iter().all(|l| l.width == w && l.height == h),
-            "all terrain layers must share one size to live in a D2Array",
-        );
+        let arrays = TerrainLayerArrays::from_images(device, queue, layers, normals, rough, ao);
+        Self::with_arrays(device, queue, layout, &arrays, macro_image, splat, sky_occlusion, settings, shape, deform)
+    }
 
-        let mip_level_count = mip_levels_for(w, h);
-        let array = device.create_texture(&TextureDescriptor {
-            label: Some("terrain_layers"),
-            size: Extent3d { width: w, height: h, depth_or_array_layers: 4 },
-            mip_level_count,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8UnormSrgb,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        for slot in 0..4 {
-            let src = layers.get(slot).unwrap_or_else(|| layers.last().unwrap());
-            let chain = mip_chain(&src.rgba, w, h, mip_level_count);
-            for (level, (data, lw, lh)) in chain.iter().enumerate() {
-                queue.write_texture(
-                    TexelCopyTextureInfo {
-                        texture: &array,
-                        mip_level: level as u32,
-                        origin: Origin3d { x: 0, y: 0, z: slot as u32 },
-                        aspect: TextureAspect::All,
-                    },
-                    data,
-                    TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(4 * lw),
-                        rows_per_image: Some(*lh),
-                    },
-                    Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
-                );
-            }
-        }
-
+    /// A material over layer arrays already on the GPU ([`TerrainLayerArrays`]):
+    /// what a renderer rebuilds when the splat, the settings, the ground's
+    /// shape or the mud map change, without uploading the layers again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_arrays(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        arrays: &TerrainLayerArrays,
+        macro_image: &TerrainImage,
+        splat: Option<&TerrainImage>,
+        sky_occlusion: Option<&TerrainImage>,
+        settings: TerrainMaterialUniform,
+        shape: Option<&super::ground_shape::GroundShape>,
+        deform: Option<&TextureView>,
+    ) -> Self {
         let macro_tex = device.create_texture(&TextureDescriptor {
             label: Some("terrain_macro"),
             size: Extent3d { width: macro_image.width, height: macro_image.height, depth_or_array_layers: 1 },
@@ -2977,113 +2957,6 @@ impl TerrainMaterial {
             },
             Extent3d { width: macro_image.width, height: macro_image.height, depth_or_array_layers: 1 },
         );
-
-        let normal_array = device.create_texture(&TextureDescriptor {
-            label: Some("terrain_normals"),
-            size: Extent3d { width: w, height: h, depth_or_array_layers: 4 },
-            mip_level_count,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        for slot in 0..4 {
-            let flat = solid_image(FLAT_NORMAL, w, h);
-            let src = match normals.get(slot).and_then(|n| n.as_ref()) {
-                Some(img) if img.width == w && img.height == h => img.clone_image(),
-                Some(img) => resample(img, w, h),
-                None => flat,
-            };
-
-            let chain = mip_chain_linear(&src.rgba, w, h, mip_level_count);
-            for (level, (data, lw, lh)) in chain.iter().enumerate() {
-                queue.write_texture(
-                    TexelCopyTextureInfo {
-                        texture: &normal_array,
-                        mip_level: level as u32,
-                        origin: Origin3d { x: 0, y: 0, z: slot as u32 },
-                        aspect: TextureAspect::All,
-                    },
-                    data,
-                    TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(4 * lw),
-                        rows_per_image: Some(*lh),
-                    },
-                    Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
-                );
-            }
-        }
-
-        let mut rough_arr = Vec::with_capacity(4);
-        let mut ao_arr = Vec::with_capacity(4);
-        for slot in 0..4 {
-            let pick = |src: &[Option<TerrainImage>], fallback: u8| -> TerrainImage {
-                match src.get(slot).and_then(|x| x.as_ref()) {
-                    Some(img) if img.width == w && img.height == h => img.clone_image(),
-                    Some(img) => resample(img, w, h),
-                    None => solid_image([fallback; 3], w, h),
-                }
-            };
-            rough_arr.push(pick(rough, DEFAULT_TERRAIN_ROUGHNESS));
-            ao_arr.push(pick(ao, 255));
-        }
-
-        let data_array = |label: &str| {
-            device.create_texture(&TextureDescriptor {
-                label: Some(label),
-                size: Extent3d { width: w, height: h, depth_or_array_layers: 4 },
-                mip_level_count,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba8Unorm,
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                view_formats: &[],
-            })
-        };
-        let rough_array = data_array("terrain_rough");
-        let ao_array = data_array("terrain_ao");
-
-        for slot in 0..4 {
-            let normal_src = match normals.get(slot).and_then(|n| n.as_ref()) {
-                Some(img) if img.width == w && img.height == h => img.clone_image(),
-                Some(img) => resample(img, w, h),
-                None => solid_image(FLAT_NORMAL, w, h),
-            };
-            let chains = [
-                (
-                    &rough_array,
-                    roughness_chain_with_normal_variance(
-                        &rough_arr[slot].rgba,
-                        &normal_src.rgba,
-                        w,
-                        h,
-                        mip_level_count,
-                    ),
-                ),
-                (&ao_array, mip_chain_linear(&ao_arr[slot].rgba, w, h, mip_level_count)),
-            ];
-            for (tex, chain) in chains {
-                for (level, (data, lw, lh)) in chain.iter().enumerate() {
-                    queue.write_texture(
-                        TexelCopyTextureInfo {
-                            texture: tex,
-                            mip_level: level as u32,
-                            origin: Origin3d { x: 0, y: 0, z: slot as u32 },
-                            aspect: TextureAspect::All,
-                        },
-                        data,
-                        TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(4 * lw),
-                            rows_per_image: Some(*lh),
-                        },
-                        Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
-                    );
-                }
-            }
-        }
 
         let sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("terrain_sampler"),
@@ -3218,15 +3091,7 @@ impl TerrainMaterial {
             layout,
             entries: &[
                 BindGroupEntry { binding: 10, resource: BindingResource::TextureView(deform_view) },
-                BindGroupEntry {
-                    binding: 0,
-                    resource: BindingResource::TextureView(
-                        &array.create_view(&TextureViewDescriptor {
-                            dimension: Some(TextureViewDimension::D2Array),
-                            ..Default::default()
-                        }),
-                    ),
-                },
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&arrays.albedo) },
                 BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&sampler) },
                 BindGroupEntry {
                     binding: 2,
@@ -3241,15 +3106,7 @@ impl TerrainMaterial {
                         &splat_tex.create_view(&TextureViewDescriptor::default()),
                     ),
                 },
-                BindGroupEntry {
-                    binding: 5,
-                    resource: BindingResource::TextureView(
-                        &normal_array.create_view(&TextureViewDescriptor {
-                            dimension: Some(TextureViewDimension::D2Array),
-                            ..Default::default()
-                        }),
-                    ),
-                },
+                BindGroupEntry { binding: 5, resource: BindingResource::TextureView(&arrays.normals) },
                 BindGroupEntry {
                     binding: 6,
                     resource: BindingResource::TextureView(&sky_occ_tex.create_view(&TextureViewDescriptor {
@@ -3257,24 +3114,8 @@ impl TerrainMaterial {
                         ..Default::default()
                     })),
                 },
-                BindGroupEntry {
-                    binding: 7,
-                    resource: BindingResource::TextureView(
-                        &rough_array.create_view(&TextureViewDescriptor {
-                            dimension: Some(TextureViewDimension::D2Array),
-                            ..Default::default()
-                        }),
-                    ),
-                },
-                BindGroupEntry {
-                    binding: 8,
-                    resource: BindingResource::TextureView(
-                        &ao_array.create_view(&TextureViewDescriptor {
-                            dimension: Some(TextureViewDimension::D2Array),
-                            ..Default::default()
-                        }),
-                    ),
-                },
+                BindGroupEntry { binding: 7, resource: BindingResource::TextureView(&arrays.rough) },
+                BindGroupEntry { binding: 8, resource: BindingResource::TextureView(&arrays.ao) },
                 BindGroupEntry { binding: 9, resource: BindingResource::TextureView(&shape_tex.create_view(&TextureViewDescriptor::default())) },
             ],
         });
@@ -3417,20 +3258,8 @@ impl TerrainMaterial {
             .next()
             .unwrap_or((1, 1));
 
-        let filled: Vec<TerrainImage> = FALLBACK_LAYER_COLOURS
-            .iter()
-            .enumerate()
-            .map(|(i, rgb)| match layers.get(i).and_then(|l| l.as_ref()) {
-
-                Some(img) if img.width == w && img.height == h => TerrainImage {
-                    width: img.width,
-                    height: img.height,
-                    rgba: img.rgba.clone(),
-                },
-                Some(img) => resample(img, w, h),
-                None => solid_image(*rgb, w, h),
-            })
-            .collect();
+        let _ = (w, h);
+        let filled = filled_layers(layers);
 
         Self::new_full(
             device,
@@ -3662,6 +3491,285 @@ impl TerrainImage {
             rgba: decoded.into_raw(),
         })
     }
+}
+
+/// The four layers' colours at one size -- the largest layer's, so a set
+/// mixing a 1K grass with a 2K mud keeps the mud's detail -- a missing one
+/// its fallback colour: what the layer arrays are built from
+/// (`TerrainMaterial::from_layers_full`).
+pub fn filled_layers(layers: &[Option<TerrainImage>]) -> Vec<TerrainImage> {
+    let (w, h) = layers.iter().flatten().map(|l| (l.width, l.height)).max_by_key(|(w, h)| w * h).unwrap_or((1, 1));
+    FALLBACK_LAYER_COLOURS
+        .iter()
+        .enumerate()
+        .map(|(i, rgb)| match layers.get(i).and_then(|l| l.as_ref()) {
+            Some(img) if img.width == w && img.height == h => img.clone_image(),
+            Some(img) => resample(img, w, h),
+            None => solid_image(*rgb, w, h),
+        })
+        .collect()
+}
+
+/// The four arrays of a ground's layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerMap {
+    Albedo,
+    Normal,
+    Rough,
+    Ao,
+}
+
+impl LayerMap {
+    pub const ALL: [Self; 4] = [Self::Albedo, Self::Normal, Self::Rough, Self::Ao];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Albedo => "albedo",
+            Self::Normal => "normal",
+            Self::Rough => "rough",
+            Self::Ao => "ao",
+        }
+    }
+
+    /// Colour is stored in sRGB; everything else is data.
+    pub fn srgb(self) -> bool {
+        self == Self::Albedo
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Albedo => "terrain_layers",
+            Self::Normal => "terrain_normals",
+            Self::Rough => "terrain_rough",
+            Self::Ao => "terrain_ao",
+        }
+    }
+}
+
+/// Every mip of one layer of one map, as the arrays hold it. `layers` is
+/// [`filled_layers`]; the rest as loaded (`load_terrain_normals` and the
+/// others), fitted to the layers' size or filled with their defaults. The one
+/// filtering both the RGBA upload and the ASTC encoder (`bin/terrain_astc`)
+/// use, so a compressed set is that upload, encoded.
+pub fn layer_mips(map: LayerMap, slot: usize, layers: &[TerrainImage], normals: &[Option<TerrainImage>], rough: &[Option<TerrainImage>], ao: &[Option<TerrainImage>]) -> Vec<(Vec<u8>, u32, u32)> {
+    let (w, h) = (layers[0].width, layers[0].height);
+    let levels = mip_levels_for(w, h);
+    let fit = |src: &[Option<TerrainImage>], fallback: [u8; 3]| -> TerrainImage {
+        match src.get(slot).and_then(|x| x.as_ref()) {
+            Some(img) if img.width == w && img.height == h => img.clone_image(),
+            Some(img) => resample(img, w, h),
+            None => solid_image(fallback, w, h),
+        }
+    };
+    match map {
+        LayerMap::Albedo => mip_chain(&layers.get(slot).unwrap_or_else(|| layers.last().unwrap()).rgba, w, h, levels),
+        LayerMap::Normal => mip_chain_linear(&fit(normals, FLAT_NORMAL).rgba, w, h, levels),
+        LayerMap::Rough => roughness_chain_with_normal_variance(&fit(rough, [DEFAULT_TERRAIN_ROUGHNESS; 3]).rgba, &fit(normals, FLAT_NORMAL).rgba, w, h, levels),
+        LayerMap::Ao => mip_chain_linear(&fit(ao, [255; 3]).rgba, w, h, levels),
+    }
+}
+
+/// THE GROUND'S LAYER ARRAYS on the GPU -- colour, normal, roughness, and
+/// occlusion with height -- four layers each with every mip. Built once per
+/// texture set and shared by every material rebuild
+/// ([`TerrainMaterial::with_arrays`]): rebuilding them with the material put
+/// four 2K arrays' uploads, mip work and copies on every splat, settings and
+/// mud-map change, and a 2K set's load past the Quest 3's memory (2026-10-20).
+/// From the layer images ([`Self::from_images`]), or from a set encoded ahead
+/// as ASTC ([`Self::from_astc`], `bin/terrain_astc`): 8 bits a texel against
+/// 32, and no decoding on the headset.
+pub struct TerrainLayerArrays {
+    pub albedo: TextureView,
+    pub normals: TextureView,
+    pub rough: TextureView,
+    pub ao: TextureView,
+    pub size: [u32; 2],
+    pub compressed: bool,
+}
+
+/// The file an encoded set keeps one map in: `<set>/astc/<map>.ssastc`.
+pub fn astc_path(set: &std::path::Path, map: LayerMap) -> std::path::PathBuf {
+    set.join("astc").join(format!("{}.ssastc", map.name()))
+}
+
+const ASTC_MAGIC: &[u8; 8] = b"SSASTC1\0";
+
+/// One map of an encoded set: a D2 array's every layer and mip, as ASTC
+/// blocks of `block` texels (16 bytes each).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AstcArray {
+    pub block: [u8; 2],
+    pub srgb: bool,
+    pub width: u32,
+    pub height: u32,
+    pub levels: u32,
+    /// `[layer][level]`, each level's blocks row by row.
+    pub data: Vec<Vec<Vec<u8>>>,
+}
+
+impl AstcArray {
+    /// The bytes one level of one layer holds.
+    pub fn level_bytes(block: [u8; 2], width: u32, height: u32, level: u32) -> usize {
+        let (w, h) = ((width >> level).max(1), (height >> level).max(1));
+        (w.div_ceil(block[0] as u32) * h.div_ceil(block[1] as u32) * 16) as usize
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(ASTC_MAGIC);
+        out.extend_from_slice(&[self.block[0], self.block[1], self.srgb as u8, 0]);
+        for v in [self.width, self.height, self.levels, self.data.len() as u32] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for layer in &self.data {
+            for level in layer {
+                out.extend_from_slice(&(level.len() as u32).to_le_bytes());
+                out.extend_from_slice(level);
+            }
+        }
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let head = bytes.get(..28).ok_or("too short for its header")?;
+        if &head[..8] != ASTC_MAGIC {
+            return Err("not an SSASTC1 file".into());
+        }
+        let block = [head[8], head[9]];
+        if !matches!(block, [4, 4] | [5, 5] | [6, 6] | [8, 8]) {
+            return Err(format!("block {block:?} is not one this reads"));
+        }
+        let word = |i: usize| u32::from_le_bytes(head[12 + 4 * i..16 + 4 * i].try_into().unwrap());
+        let (width, height, levels, layers) = (word(0), word(1), word(2), word(3));
+        if width == 0 || height == 0 || levels == 0 || levels > mip_levels_for(width, height) || layers == 0 || layers > 16 {
+            return Err(format!("{width}x{height}, {levels} levels, {layers} layers is not an array"));
+        }
+        let mut at = 28;
+        let mut data = Vec::with_capacity(layers as usize);
+        for _ in 0..layers {
+            let mut chain = Vec::with_capacity(levels as usize);
+            for level in 0..levels {
+                let len = u32::from_le_bytes(bytes.get(at..at + 4).ok_or("cut short")?.try_into().unwrap()) as usize;
+                if len != Self::level_bytes(block, width, height, level) {
+                    return Err(format!("level {level} is {len} bytes, not {}", Self::level_bytes(block, width, height, level)));
+                }
+                chain.push(bytes.get(at + 4..at + 4 + len).ok_or("cut short")?.to_vec());
+                at += 4 + len;
+            }
+            data.push(chain);
+        }
+        Ok(Self { block, srgb: head[10] != 0, width, height, levels, data })
+    }
+
+    fn format(&self) -> Option<TextureFormat> {
+        let block = match self.block {
+            [4, 4] => AstcBlock::B4x4,
+            [5, 5] => AstcBlock::B5x5,
+            [6, 6] => AstcBlock::B6x6,
+            [8, 8] => AstcBlock::B8x8,
+            _ => return None,
+        };
+        Some(TextureFormat::Astc { block, channel: if self.srgb { AstcChannel::UnormSrgb } else { AstcChannel::Unorm } })
+    }
+}
+
+fn array_view(texture: &Texture) -> TextureView {
+    texture.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..Default::default() })
+}
+
+impl TerrainLayerArrays {
+    /// Upload the layer images, every mip of each made here ([`layer_mips`]).
+    pub fn from_images(device: &Device, queue: &Queue, layers: &[TerrainImage], normals: &[Option<TerrainImage>], rough: &[Option<TerrainImage>], ao: &[Option<TerrainImage>]) -> Self {
+        assert!(!layers.is_empty(), "terrain material needs at least one layer");
+        let (w, h) = (layers[0].width, layers[0].height);
+        assert!(layers.iter().all(|l| l.width == w && l.height == h), "all terrain layers must share one size to live in a D2Array");
+        let mip_level_count = mip_levels_for(w, h);
+        let make = |map: LayerMap| {
+            let texture = device.create_texture(&TextureDescriptor {
+                label: Some(map.label()),
+                size: Extent3d { width: w, height: h, depth_or_array_layers: 4 },
+                mip_level_count,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: if map.srgb() { TextureFormat::Rgba8UnormSrgb } else { TextureFormat::Rgba8Unorm },
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            for slot in 0..4 {
+                for (level, (data, lw, lh)) in layer_mips(map, slot, layers, normals, rough, ao).iter().enumerate() {
+                    queue.write_texture(
+                        TexelCopyTextureInfo { texture: &texture, mip_level: level as u32, origin: Origin3d { x: 0, y: 0, z: slot as u32 }, aspect: TextureAspect::All },
+                        data,
+                        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * lw), rows_per_image: Some(*lh) },
+                        Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
+                    );
+                }
+            }
+            array_view(&texture)
+        };
+        Self { albedo: make(LayerMap::Albedo), normals: make(LayerMap::Normal), rough: make(LayerMap::Rough), ao: make(LayerMap::Ao), size: [w, h], compressed: false }
+    }
+
+    /// Upload a set encoded ahead (`<set>/astc/*.ssastc`, `bin/terrain_astc`).
+    /// None when the device has no ASTC, or a map is missing, unreadable or
+    /// unlike the others: the caller then uploads the images.
+    pub fn from_astc(device: &Device, queue: &Queue, set: &std::path::Path) -> Option<Self> {
+        if !device.features().contains(Features::TEXTURE_COMPRESSION_ASTC) {
+            return None;
+        }
+        let mut views = Vec::with_capacity(4);
+        let mut size = None;
+        for map in LayerMap::ALL {
+            let path = astc_path(set, map);
+            let bytes = std::fs::read(&path).ok()?;
+            let a = AstcArray::from_bytes(&bytes).map_err(|e| log::warn!("terrain: {}: {e}", path.display())).ok()?;
+            if a.srgb != map.srgb() || a.data.len() != 4 || a.levels != mip_levels_for(a.width, a.height) || size.is_some_and(|s| s != [a.width, a.height]) {
+                log::warn!("terrain: {} does not fit the set", path.display());
+                return None;
+            }
+            size = Some([a.width, a.height]);
+            let format = a.format()?;
+            let texture = device.create_texture(&TextureDescriptor {
+                label: Some(map.label()),
+                size: Extent3d { width: a.width, height: a.height, depth_or_array_layers: 4 },
+                mip_level_count: a.levels,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let (bw, bh) = (a.block[0] as u32, a.block[1] as u32);
+            for (slot, chain) in a.data.iter().enumerate() {
+                for (level, data) in chain.iter().enumerate() {
+                    let (w, h) = ((a.width >> level).max(1), (a.height >> level).max(1));
+                    let (cols, rows) = (w.div_ceil(bw), h.div_ceil(bh));
+                    queue.write_texture(
+                        TexelCopyTextureInfo { texture: &texture, mip_level: level as u32, origin: Origin3d { x: 0, y: 0, z: slot as u32 }, aspect: TextureAspect::All },
+                        data,
+                        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(cols * 16), rows_per_image: Some(rows) },
+                        Extent3d { width: cols * bw, height: rows * bh, depth_or_array_layers: 1 },
+                    );
+                }
+            }
+            views.push(array_view(&texture));
+        }
+        let size = size?;
+        let mut views = views.into_iter();
+        Some(Self { albedo: views.next()?, normals: views.next()?, rough: views.next()?, ao: views.next()?, size, compressed: true })
+    }
+}
+
+/// A layer's colour at no more than `side` texels a side, filtered as its
+/// mips are: what the CPU keeps of a layer (the ground map reads it) once the
+/// arrays are on the GPU.
+pub fn small_copy(img: &TerrainImage, side: u32) -> TerrainImage {
+    if img.width <= side && img.height <= side {
+        return img.clone_image();
+    }
+    let chain = mip_chain(&img.rgba, img.width, img.height, mip_levels_for(img.width, img.height));
+    let (rgba, width, height) = chain.into_iter().find(|(_, w, h)| *w <= side && *h <= side).expect("a 1x1 mip at the end");
+    TerrainImage { width, height, rgba }
 }
 
 pub const TERRAIN_LAYER_FILES: [&str; 4] = ["ground.jpg", "rock.jpg", "high.jpg", "sediment.jpg"];
@@ -4238,42 +4346,47 @@ mod terrain_material_parity_tests {
 #[cfg(test)]
 mod terrain_mip_tests {
 
+    /// Every map of every layer is a full mip chain -- a single level makes
+    /// distant ground point-sample full-resolution normals and shimmer -- each
+    /// filtered as what it is: colour sRGB-correct, normals and occlusion
+    /// linear, roughness widened by the normals' spread. The one chain both the
+    /// RGBA upload and the ASTC encoder take (`layer_mips`).
     #[test]
-    fn the_normal_array_is_created_with_a_mip_chain() {
-        let src = include_str!("terrain_pipeline.rs");
-        let i = src.find(r#"label: Some("terrain_normals")"#).expect("normal array is gone");
-        let window = &src[i..i + 400];
-        assert!(
-            window.contains("mip_level_count,"),
-            "terrain_normals is back to a single mip level; distant ground will \
-             point-sample full-resolution normals and shimmer",
+    fn every_layer_map_is_a_full_chain_filtered_as_what_it_holds() {
+        use super::*;
+        let (w, h) = (16, 16);
+        let noisy = |seed: u32| TerrainImage { width: w, height: h, rgba: (0..w * h * 4).map(|i| ((i * 37 + seed * 101) % 251) as u8).collect() };
+        let layers = filled_layers(&[Some(noisy(1)), None, None, None]);
+        let (normals, rough, ao) = (vec![Some(noisy(2))], vec![Some(noisy(3))], vec![Some(noisy(4))]);
+        let levels = mip_levels_for(w, h) as usize;
+        for map in LayerMap::ALL {
+            let chain = layer_mips(map, 0, &layers, &normals, &rough, &ao);
+            assert_eq!(chain.len(), levels, "{map:?} lost its mip chain");
+        }
+        assert_eq!(layer_mips(LayerMap::Albedo, 0, &layers, &normals, &rough, &ao), mip_chain(&layers[0].rgba, w, h, levels as u32));
+        assert_eq!(layer_mips(LayerMap::Normal, 0, &layers, &normals, &rough, &ao), mip_chain_linear(&normals[0].as_ref().unwrap().rgba, w, h, levels as u32));
+        assert_eq!(layer_mips(LayerMap::Ao, 0, &layers, &normals, &rough, &ao), mip_chain_linear(&ao[0].as_ref().unwrap().rgba, w, h, levels as u32));
+        assert_eq!(
+            layer_mips(LayerMap::Rough, 0, &layers, &normals, &rough, &ao),
+            roughness_chain_with_normal_variance(&rough[0].as_ref().unwrap().rgba, &normals[0].as_ref().unwrap().rgba, w, h, levels as u32),
         );
-        assert!(
-            !window.contains("mip_level_count: 1"),
-            "terrain_normals explicitly requests one mip level",
-        );
+        assert_ne!(mip_chain(&layers[0].rgba, w, h, 2)[1], mip_chain_linear(&layers[0].rgba, w, h, 2)[1], "the colour chain must not be the linear one");
+        // A layer with no maps takes the defaults: a flat normal, the default
+        // roughness, no occlusion.
+        let flat = layer_mips(LayerMap::Normal, 2, &layers, &normals, &rough, &ao);
+        assert_eq!(&flat[0].0[..3], &FLAT_NORMAL);
+        assert_eq!(layer_mips(LayerMap::Ao, 2, &layers, &normals, &rough, &ao)[0].0[0], 255);
+        assert!(LayerMap::ALL.iter().all(|m| m.srgb() == (*m == LayerMap::Albedo)), "only colour is sRGB; a measurement array must be linear");
     }
 
+    /// A set mixing sizes is built at its LARGEST layer's size, wherever that
+    /// layer sits: a 2K mud in slot 2 beside 1K grass keeps its 2K detail.
     #[test]
-    fn the_data_arrays_are_mipped_and_linear() {
-        let src = include_str!("terrain_pipeline.rs");
-        let i = src.find("let data_array = |label: &str|").expect("data arrays are gone");
-        let window = &src[i..i + 600];
-        assert!(
-            window.contains("mip_level_count,") && !window.contains("mip_level_count: 1"),
-            "the roughness/occlusion arrays lost their mip chain",
-        );
-        assert!(
-            window.contains("TextureFormat::Rgba8Unorm") && !window.contains("Rgba8UnormSrgb"),
-            "a measurement array is being created as sRGB",
-        );
-
-        assert!(
-            src.contains("roughness_chain_with_normal_variance(")
-                && src.contains("mip_chain_linear(&ao_arr[slot].rgba"),
-            "roughness is no longer baked with the normal's variance, or AO is \
-             no longer a plain linear chain",
-        );
+    fn mixed_layer_sizes_are_built_at_the_largest() {
+        use super::*;
+        let img = |side: u32| TerrainImage { width: side, height: side, rgba: vec![128; (side * side * 4) as usize] };
+        let layers = filled_layers(&[Some(img(8)), Some(img(8)), Some(img(32)), None]);
+        assert!(layers.iter().all(|l| (l.width, l.height) == (32, 32)), "{:?}", layers.iter().map(|l| l.width).collect::<Vec<_>>());
     }
 
     #[test]
@@ -4320,17 +4433,6 @@ mod terrain_mip_tests {
             assert_eq!(super::TERRAIN_ROUGH_FILES[i], format!("{stem}_r.jpg"));
             assert_eq!(super::TERRAIN_AO_FILES[i], format!("{stem}_ao.jpg"));
         }
-    }
-
-    #[test]
-    fn the_normal_chain_is_built_linear() {
-        let src = include_str!("terrain_pipeline.rs");
-        let i = src.find(r#"label: Some("terrain_normals")"#).expect("normal array is gone");
-        let window = &src[i..i + 1600];
-        assert!(
-            window.contains("mip_chain_linear(&src.rgba, w, h, mip_level_count)"),
-            "the normal mip chain is not the linear one",
-        );
     }
 
     #[test]
@@ -4781,5 +4883,66 @@ mod mud_build_tests {
         // bounds both), and the height and wetness must read as they did.
         assert!(one <= four * 1.05 + 1e-5, "one read {one} vs four {four}");
         assert!(level * 255.0 < 0.1, "height/wet moved {level}");
+    }
+}
+
+#[cfg(test)]
+mod astc_layer_tests {
+    use super::*;
+
+    fn array(srgb: bool, side: u32) -> AstcArray {
+        let levels = mip_levels_for(side, side);
+        let data = (0..4u8).map(|layer| (0..levels).map(|l| vec![layer; AstcArray::level_bytes([4, 4], side, side, l)]).collect()).collect();
+        AstcArray { block: [4, 4], srgb, width: side, height: side, levels, data }
+    }
+
+    #[test]
+    fn an_encoded_array_reads_back_as_written_and_a_wrong_one_is_refused() {
+        let a = array(true, 16);
+        assert_eq!(AstcArray::from_bytes(&a.to_bytes()), Ok(a.clone()));
+        // 16x16 in 4x4 blocks: 16 blocks, then 4, then 1 and 1 (a 2x2 and a
+        // 1x1 level still take a whole block).
+        assert_eq!((0..5).map(|l| AstcArray::level_bytes([4, 4], 16, 16, l) / 16).collect::<Vec<_>>(), [16, 4, 1, 1, 1]);
+        let mut bytes = a.to_bytes();
+        bytes.truncate(bytes.len() - 3);
+        assert!(AstcArray::from_bytes(&bytes).is_err(), "cut short");
+        assert!(AstcArray::from_bytes(b"not one").is_err());
+        let mut odd = a.clone();
+        odd.data[1][0].pop();
+        assert!(AstcArray::from_bytes(&odd.to_bytes()).is_err(), "a level of the wrong size");
+    }
+
+    /// The upload is the risk: a wrong row pitch or copy size for a block
+    /// format is a validation error, and on the headset those are silent.
+    #[test]
+    fn an_encoded_set_uploads_with_no_validation_error_where_the_gpu_reads_astc() {
+        let instance = Instance::default();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&RequestAdapterOptions::default())) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let set = std::env::temp_dir().join(format!("ss_astc_set_{}", std::process::id()));
+        std::fs::create_dir_all(set.join("astc")).unwrap();
+        for map in LayerMap::ALL {
+            std::fs::write(astc_path(&set, map), array(map.srgb(), 64).to_bytes()).unwrap();
+        }
+        let (plain, plain_queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor::default())).unwrap();
+        assert!(TerrainLayerArrays::from_astc(&plain, &plain_queue, &set).is_none(), "no ASTC asked of the device, none used");
+        if !adapter.features().contains(Features::TEXTURE_COMPRESSION_ASTC) {
+            eprintln!("this GPU reads no ASTC: the upload is not tried");
+            let _ = std::fs::remove_dir_all(&set);
+            return;
+        }
+        let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor { required_features: Features::TEXTURE_COMPRESSION_ASTC, ..Default::default() })).unwrap();
+        let scope = device.push_error_scope(ErrorFilter::Validation);
+        let arrays = TerrainLayerArrays::from_astc(&device, &queue, &set).expect("the set loads");
+        queue.submit(None);
+        let error = pollster::block_on(scope.pop());
+        assert!(error.is_none(), "{error:?}");
+        assert!(arrays.compressed && arrays.size == [64, 64]);
+        // A map unlike the others is refused, not half used.
+        std::fs::write(astc_path(&set, LayerMap::Rough), array(false, 32).to_bytes()).unwrap();
+        assert!(TerrainLayerArrays::from_astc(&device, &queue, &set).is_none());
+        let _ = std::fs::remove_dir_all(&set);
     }
 }

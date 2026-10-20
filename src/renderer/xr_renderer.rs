@@ -290,6 +290,12 @@ struct StereoScenePipelines {
     effects: crate::renderer::effects::EffectsPipeline,
 }
 
+/// The most texels a side the CPU keeps of a ground layer's colour once its
+/// arrays are on the GPU: the ground map's reads (`ground_map::build`) need
+/// no more, and a 2K set's four full copies were 64 MB, copied again on every
+/// ground-map build.
+pub const TERRAIN_CPU_SIDE: u32 = 512;
+
 pub struct XrRenderer {
     pub swapchain: xr::Swapchain<xr::Vulkan>,
     pub width: u32,
@@ -437,6 +443,11 @@ pub struct XrRenderer {
     terrain_normals: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
     terrain_rough: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
     terrain_ao: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
+    /// The layers on the GPU, built once per texture set and shared by every
+    /// material rebuild (`TerrainLayerArrays`). With them, `terrain_layers`
+    /// keeps only small colour copies (for the ground map) and the other maps
+    /// none.
+    terrain_arrays: Option<std::sync::Arc<crate::renderer::terrain_pipeline::TerrainLayerArrays>>,
     terrain_splat: Option<crate::renderer::terrain_pipeline::TerrainImage>,
 
     terrain_sky_occlusion: Option<crate::renderer::terrain_pipeline::TerrainImage>,
@@ -1473,6 +1484,7 @@ impl XrRenderer {
             terrain_normals: vec![None, None, None, None],
             terrain_rough: vec![None, None, None, None],
             terrain_ao: vec![None, None, None, None],
+            terrain_arrays: None,
             terrain_splat: None,
             terrain_sky_occlusion: None,
             terrain_stationary: Vec::new(),
@@ -1726,7 +1738,7 @@ impl XrRenderer {
     ) {
         use crate::renderer::uniforms::{ProbeUpload, MAX_PROBES};
 
-        self.room_descs = descs.clone();
+        self.tod_set_room_photographs(descs.clone());
         log::info!(
             "room light: {} of {} photograph(s) carry their room's light for the models",
             descs.iter().filter(|d| d.room_light.is_some()).count(),
@@ -3149,10 +3161,38 @@ impl XrRenderer {
         rough: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
         ao: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
     ) {
-        self.terrain_layers = layers;
-        self.terrain_normals = normals;
-        self.terrain_rough = rough;
-        self.terrain_ao = ao;
+        use crate::renderer::terrain_pipeline::{filled_layers, small_copy, TerrainLayerArrays};
+        let arrays = TerrainLayerArrays::from_images(&self.wgpu_device, &self.wgpu_queue, &filled_layers(&layers), &normals, &rough, &ao);
+        self.keep_terrain_arrays(arrays, &layers.iter().map(|l| l.as_ref().map(|l| small_copy(l, TERRAIN_CPU_SIDE))).collect::<Vec<_>>());
+    }
+
+    /// THE GROUND'S MATERIALS from a texture set's folder: its encoded ASTC
+    /// arrays where it has them and the GPU reads them, else its images.
+    /// Either way only small colour copies stay in memory. Returns whether the
+    /// set was ASTC.
+    pub fn set_terrain_texture_set(&mut self, set: &std::path::Path) -> bool {
+        use crate::renderer::terrain_pipeline::{load_terrain_ao, load_terrain_layers, load_terrain_normals, load_terrain_rough, small_copy, TerrainLayerArrays};
+        let colours: Vec<_> = load_terrain_layers(set).into_iter().map(|l| l.map(|l| small_copy(&l, TERRAIN_CPU_SIDE))).collect();
+        match TerrainLayerArrays::from_astc(&self.wgpu_device, &self.wgpu_queue, set) {
+            Some(arrays) => {
+                log::info!("terrain: {}x{} ASTC layers from {}", arrays.size[0], arrays.size[1], set.display());
+                self.keep_terrain_arrays(arrays, &colours);
+                true
+            }
+            None => {
+                log::info!("terrain: no ASTC set in {} (or no ASTC on this GPU): uploading its images", set.display());
+                self.set_terrain_layers(load_terrain_layers(set), load_terrain_normals(set), load_terrain_rough(set), load_terrain_ao(set));
+                false
+            }
+        }
+    }
+
+    fn keep_terrain_arrays(&mut self, arrays: crate::renderer::terrain_pipeline::TerrainLayerArrays, colours: &[Option<crate::renderer::terrain_pipeline::TerrainImage>]) {
+        self.terrain_arrays = Some(std::sync::Arc::new(arrays));
+        self.terrain_layers = colours.iter().map(|c| c.as_ref().map(|c| crate::renderer::terrain_pipeline::TerrainImage { width: c.width, height: c.height, rgba: c.rgba.clone() })).collect();
+        self.terrain_normals = vec![None, None, None, None];
+        self.terrain_rough = vec![None, None, None, None];
+        self.terrain_ao = vec![None, None, None, None];
         self.rebuild_terrain_material();
     }
 
@@ -3199,8 +3239,20 @@ impl XrRenderer {
             }
             (g, _) => g,
         };
-        self.terrain_material =
-            crate::renderer::terrain_pipeline::TerrainMaterial::from_layers_full(
+        self.terrain_material = match self.terrain_arrays.as_ref() {
+            Some(arrays) => crate::renderer::terrain_pipeline::TerrainMaterial::with_arrays(
+                &self.wgpu_device,
+                &self.wgpu_queue,
+                &self.terrain_pipeline.material_layout,
+                arrays,
+                &crate::renderer::terrain_pipeline::solid_image([128, 128, 128], 1, 1),
+                self.terrain_splat.as_ref(),
+                ground.as_ref(),
+                self.terrain_settings,
+                self.terrain_shape.as_ref(),
+                self.mud.as_ref().map(|m| &m.view),
+            ),
+            None => crate::renderer::terrain_pipeline::TerrainMaterial::from_layers_full(
                 &self.wgpu_device,
                 &self.wgpu_queue,
                 &self.terrain_pipeline.material_layout,
@@ -3213,7 +3265,8 @@ impl XrRenderer {
                 self.terrain_settings,
                 self.terrain_shape.as_ref(),
                 self.mud.as_ref().map(|m| &m.view),
-            );
+            ),
+        };
         if mud_moved {
             self.rebind_water_mud();
             self.ground_for_level();

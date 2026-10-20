@@ -99,8 +99,12 @@ impl SkyExtra {
 
 
     pub fn from_snapshot(snap: &SkySnapshot, seconds: f32, zenith_depth: [f32; 3]) -> Self {
+        use space_soup_sky::time_of_day as tod;
         let d = &snap.discs;
         let v4 = |v: [f32; 3], w: f32| [v[0], v[1], v[2], w];
+        // The moon's illuminance at the eye per unit of `moon_radiance` (the
+        // full disc's): its solid angle times its phase's share (the halo).
+        let moon_halo = std::f32::consts::PI * tod::MOON_ANGULAR_RADIUS.powi(2) * tod::moon_phase_brightness(snap.astro.moon_phase_angle);
 
         let mean_sky = 1.0 / snap.panorama_scale.max(1e-30);
         let px = (0.05f32).to_radians();
@@ -109,16 +113,38 @@ impl SkyExtra {
         Self {
             mode: [1.0, 1.0 / snap.panorama_scale.max(1e-30), seconds, if stars_show { 1.0 } else { 0.0 }],
             sun: v4(d.sun_dir, space_soup_sky::time_of_day::SUN_ANGULAR_RADIUS),
-            sun_radiance: v4(d.sun_radiance, 0.6),
+            sun_radiance: v4(d.sun_radiance, apparent_sine(d.sun_dir[1])),
             moon: v4(d.moon_dir, space_soup_sky::time_of_day::MOON_ANGULAR_RADIUS),
             moon_radiance: v4(d.moon_radiance, d.earthshine),
             moon_sunward: v4(d.moon_sunward, 0.0),
             stars: [d.star_zero_point, d.limiting_magnitude, d.star_count, 1.0],
-            extinction: v4(zenith_depth, 0.0),
+            extinction: v4(zenith_depth, moon_halo),
             celestial: [v4(d.celestial_rows[0], 0.0), v4(d.celestial_rows[1], 0.0), v4(d.celestial_rows[2], 0.0)],
             ..Default::default()
         }
     }
+}
+
+/// Linear limb darkening of the sun, I(mu)/I(1) = 1 - u (1 - mu), per
+/// channel: Neckel and Labs' u near 650, 550 and 450 nm. One grey u gave a
+/// flat white disc; real suns are dimmer and redder at the edge.
+pub const SUN_LIMB_U: [f32; 3] = [0.52, 0.62, 0.75];
+/// The limb coefficient `TimeOfDaySky` normalises `sun_radiance` by.
+pub const SUN_LIMB_BAKED: f32 = 0.6;
+/// How far from a sun or moon its glare reaches, degrees.
+pub const HALO_DEGREES: f32 = 20.0;
+/// How far outside its true radius a disc is looked for: refraction lifts a
+/// disc on the horizon by up to 35' (0.6 deg).
+pub const DISC_REACH: f32 = 0.012;
+
+/// The apparent elevation's sine for a true one (`sky_refraction`'s twin):
+/// Bennett's refraction for the true altitude, which is close enough to
+/// where the disc is drawn to anchor its reddening.
+pub fn apparent_sine(true_sine: f32) -> f32 {
+    let el = true_sine.clamp(-1.0, 1.0).asin();
+    let h = el.to_degrees().max(-1.5);
+    let r = (1.0 / 60.0f32).to_radians() / (h + 7.31 / (h + 4.4)).to_radians().tan();
+    (el + r).sin()
 }
 
 use space_soup_sky::clouds::{CloudField, CloudFrame};
@@ -146,6 +172,58 @@ pub struct Sky {
     pub clouds: Option<SkyClouds>,
     cloud_texture: Texture,
     cloud_sampler: Sampler,
+
+    /// The time of day's way from the last snapshot to the newest: drawn
+    /// and lit between them, frame by frame (`Sky::tick`), so the sky's
+    /// colour and the light it gives never step at a snapshot.
+    blend: Option<SkyBlend>,
+}
+
+/// Two time-of-day snapshots and how far the sky is from one to the other.
+/// Panoramas in engine units (the snapshot's normalised panorama over its
+/// scale), so two of very different brightness mix in the light they hold.
+struct SkyBlend {
+    width: u32,
+    height: u32,
+    from_pano: Vec<f32>,
+    to_pano: Vec<f32>,
+    from_scale: f32,
+    to_scale: f32,
+    from_irradiance: SkyIrradiance,
+    to_irradiance: SkyIrradiance,
+    from_sun: Option<[f32; 3]>,
+    to_sun: Option<SkySun>,
+    /// 0 at the last snapshot, 1 at the newest.
+    t: f32,
+    /// Real seconds the blend takes: the clock's time between snapshots.
+    seconds: f32,
+}
+
+impl SkyBlend {
+    fn scale(&self, t: f32) -> f32 {
+        (self.from_scale.max(1e-30).ln() * (1.0 - t) + self.to_scale.max(1e-30).ln() * t).exp()
+    }
+
+    /// The panorama at `t`, normalised by the blended scale as a snapshot's is.
+    fn panorama(&self, t: f32) -> Panorama {
+        let s = self.scale(t);
+        let rgb = self.from_pano.iter().zip(&self.to_pano).map(|(a, b)| (a + (b - a) * t) * s).collect();
+        Panorama { width: self.width, height: self.height, rgb }
+    }
+
+    fn irradiance(&self, t: f32) -> SkyIrradiance {
+        let (a, b) = (&self.from_irradiance.sh, &self.to_irradiance.sh);
+        SkyIrradiance { sh: std::array::from_fn(|i| std::array::from_fn(|c| a[i][c] + (b[i][c] - a[i][c]) * t)) }
+    }
+
+    /// The light (clear of clouds) at `t`: the newest snapshot's direction,
+    /// the colour between the two. The direction steps with the snapshots, as
+    /// the static sun shadow re-records only then.
+    fn sun(&self, t: f32) -> Option<SkySun> {
+        let to = self.to_sun?;
+        let from = self.from_sun.unwrap_or([0.0; 3]);
+        Some(SkySun { light_rgb: std::array::from_fn(|c| from[c] + (to.light_rgb[c] - from[c]) * t), ..to })
+    }
 }
 
 #[derive(Clone)]
@@ -368,7 +446,13 @@ impl Sky {
             clouds: None,
             cloud_texture,
             cloud_sampler,
+            blend: None,
         }
+    }
+
+    /// How far the sky is through its blend to the newest snapshot, 0..1.
+    pub fn blend_progress(&self) -> f32 {
+        self.blend.as_ref().map_or(1.0, |b| b.t)
     }
 
     pub fn has_clouds(&self) -> bool {
@@ -391,8 +475,49 @@ impl Sky {
         })
     }
 
+    /// The newest time-of-day snapshot, blended into from where the sky is
+    /// now over `blend_seconds` (`Sky::tick`); 0 shows it at once.
     pub fn apply_snapshot(&mut self, device: &Device, queue: &Queue, layout: &BindGroupLayout, snap: &SkySnapshot, seconds: f32, zenith_depth: [f32; 3]) {
-        let pano = &snap.panorama;
+        self.apply_snapshot_blended(device, queue, layout, snap, seconds, zenith_depth, 0.0);
+    }
+
+    pub fn apply_snapshot_blended(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        snap: &SkySnapshot,
+        seconds: f32,
+        zenith_depth: [f32; 3],
+        blend_seconds: f32,
+    ) {
+        let engine = |p: &Panorama, scale: f32| p.rgb.iter().map(|v| v / scale.max(1e-30)).collect::<Vec<f32>>();
+        let to_pano = engine(&snap.panorama, snap.panorama_scale);
+        let from = self.blend.as_ref().filter(|b| b.width == snap.panorama.width && b.height == snap.panorama.height && blend_seconds > 0.0).map(|b| {
+            let t = b.t.min(1.0);
+            let s = b.scale(t);
+            (engine(&b.panorama(t), s), s, b.irradiance(t), b.sun(t).map(|l| l.light_rgb))
+        });
+        let (from_pano, from_scale, from_irradiance, from_sun) = match from {
+            Some(f) => f,
+            None => (to_pano.clone(), snap.panorama_scale, snap.irradiance, snap.light_clear.map(|l| l.light_rgb)),
+        };
+        self.blend = Some(SkyBlend {
+            width: snap.panorama.width,
+            height: snap.panorama.height,
+            from_pano,
+            to_pano,
+            from_scale,
+            to_scale: snap.panorama_scale,
+            from_irradiance,
+            to_irradiance: snap.irradiance,
+            from_sun,
+            to_sun: snap.light_clear,
+            t: if blend_seconds > 0.0 { 0.0 } else { 1.0 },
+            seconds: blend_seconds,
+        });
+        let shown = self.blend.as_ref().map(|b| b.panorama(b.t)).unwrap_or_else(|| snap.panorama.clone());
+        let pano = &shown;
         let size = self.texture.size();
         if size.width != pano.width || size.height != pano.height {
             self.texture = device.create_texture(&TextureDescriptor {
@@ -421,33 +546,75 @@ impl Sky {
             (Some(frame), Some(field)) => Some(SkyClouds { field: field.clone(), frame: frame.at(seconds as f64), sun_clear: snap.light_clear }),
             _ => None,
         };
-        self.irradiance = snap.irradiance;
         self.sun = snap.light;
         self.reflection = Some(ReflectionSky { pano: snap.reflection_engine(), rotation_deg: 0.0, intensity: 1.0 });
         self.extra = SkyExtra::from_snapshot(snap, seconds, zenith_depth);
         self.extra.set_clouds(self.clouds.as_ref().map(|c| &c.frame));
+        self.take_blend();
         self.dim_sun_by_clouds();
         queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
     }
 
-    pub fn set_clock(&mut self, queue: &Queue, seconds: f32) {
-        if self.extra.mode[0] > 0.5 {
-            self.extra.mode[2] = seconds;
-            queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra.mode));
-            if let Some(c) = self.clouds.as_mut() {
-                c.frame = c.frame.at(seconds as f64);
-                self.extra.set_cloud_offsets(&c.frame);
-                let at = std::mem::offset_of!(SkyExtra, cloud_offset) as u64;
-                queue.write_buffer(&self.extra_buffer, at, bytemuck::cast_slice(&[self.extra.cloud_offset, self.extra.cloud_misc]));
-                self.dim_sun_by_clouds();
-            }
+    /// The light and the panorama scale where the blend stands now.
+    fn take_blend(&mut self) {
+        let Some(b) = self.blend.as_ref() else { return };
+        let t = b.t.min(1.0);
+        self.irradiance = b.irradiance(t);
+        if let Some(c) = self.clouds.as_mut() {
+            c.sun_clear = b.sun(t);
         }
+        if self.clouds.is_none() {
+            self.sun = b.sun(t).or(self.sun);
+        }
+        self.extra.mode[1] = 1.0 / b.scale(t).max(1e-30);
+    }
+
+    /// ONE FRAME of the time of day's sky: the clock (cloud drift, twinkle),
+    /// the blend toward the newest snapshot, and -- when `astro` is given --
+    /// the sun, moon and stars where they are THIS frame, so they glide
+    /// instead of stepping at each snapshot (0.3 deg, ~7 headset pixels,
+    /// once a second at a 20-minute day; user, 2026-10-20).
+    pub fn tick(&mut self, queue: &Queue, seconds: f32, dt: f32, astro: Option<&space_soup_sky::time_of_day::Astronomy>) {
+        if self.extra.mode[0] <= 0.5 {
+            return;
+        }
+        self.extra.mode[2] = seconds;
+        if let Some(c) = self.clouds.as_mut() {
+            c.frame = c.frame.at(seconds as f64);
+            self.extra.set_cloud_offsets(&c.frame);
+        }
+        let blending = self.blend.as_mut().is_some_and(|b| {
+            let was = b.t;
+            b.t = if b.seconds > 0.0 { (b.t + dt.max(0.0) / b.seconds).min(1.0) } else { 1.0 };
+            b.t != was
+        });
+        if blending {
+            if let Some(b) = self.blend.as_ref() {
+                write_panorama(queue, &self.texture, &b.panorama(b.t));
+            }
+            self.take_blend();
+        }
+        if let Some(a) = astro {
+            let v4 = |v: [f32; 3], w: f32| [v[0], v[1], v[2], w];
+            self.extra.sun = v4(a.sun, self.extra.sun[3]);
+            self.extra.moon = v4(a.moon, self.extra.moon[3]);
+            self.extra.moon_sunward = v4(a.moon_sunward, 0.0);
+            let m = &a.celestial_to_world;
+            self.extra.celestial = [v4(m[0], 0.0), v4(m[1], 0.0), v4(m[2], 0.0)];
+        }
+        self.dim_sun_by_clouds();
+        queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
     }
 
     fn dim_sun_by_clouds(&mut self) {
         let Some(c) = &self.clouds else { return };
-        let through = c.frame.light_transmittance(&c.field, [0.0, 0.0]);
+        let through = c.frame.light_transmittance_over(&c.field, [0.0, 0.0], space_soup_sky::clouds::LEVEL_SUN_HALF_M, space_soup_sky::clouds::LEVEL_SUN_SAMPLES);
         self.sun = c.sun_clear.map(|l| SkySun { light_rgb: l.light_rgb.map(|v| v * through), ..l });
+        // The glare round the sun and the moon goes as the clouds cover them
+        // (`sky_halo_through` in the cloud shader).
+        let toward = |v: [f32; 4]| c.frame.transmittance_along(&c.field, [0.0, 0.0], [v[0], v[1], v[2]]);
+        self.extra.cloud_sky[3] = toward(self.extra.sun);
+        self.extra.cloud_ground[3] = toward(self.extra.moon);
     }
 
     pub fn none(device: &Device, queue: &Queue, layout: &BindGroupLayout, ambient: f32) -> Self {
@@ -749,17 +916,89 @@ fn moon_albedo(p: vec3<f32>) -> f32 {{
     return a * 1.18;
 }}
 
+const SUN_LIMB_U: vec3<f32> = vec3<f32>({limb_r:?}, {limb_g:?}, {limb_b:?});
+const SUN_LIMB_BAKED: f32 = {limb_baked:?};
+const HALO_SHARE: f32 = {halo_share:?};
+const HALO_DEGREES: f32 = {halo_degrees:?};
+const HALO_COS: f32 = {halo_cos:?};
+const HALO_CIE: vec3<f32> = vec3<f32>({cie_1:?}, {cie_2:?}, {cie_3:?});
+const DISC_REACH: f32 = {disc_reach:?};
+
+fn sky_cie(th2: f32) -> f32 {{
+    let inv = inverseSqrt(max(th2, 1e-6));
+    return inv * (HALO_CIE.x + inv * (HALO_CIE.y + inv * HALO_CIE.z));
+}}
+
+// The glare round a sun or moon: the eye's veil (CIE 146, the lamps' curve
+// and share, `glare::cie_veil`) out to HALO_DEGREES, windowed to zero there.
+// Per unit of the source's illuminance at the eye.
+fn sky_halo(d: vec3<f32>, toward: vec3<f32>, core_deg: f32) -> f32 {{
+    let c = dot(d, toward);
+    if (c < HALO_COS) {{
+        return 0.0;
+    }}
+    let th = acos(clamp(c, -1.0, 1.0)) * (180.0 / SKY_PI);
+    let core2 = core_deg * core_deg;
+    return HALO_SHARE * max(sky_cie(th * th + core2) - sky_cie(HALO_DEGREES * HALO_DEGREES + core2), 0.0);
+}}
+
+// How much of the sun (x) and the moon (y) the clouds let through; the cloud
+// shader reads it from its uniforms.
+fn sky_halo_through() -> vec2<f32> {{
+    return vec2<f32>(1.0, 1.0);
+}}
+
+// Air mass along an apparent elevation's sine, as the stars use it.
+fn sky_air(y: f32) -> f32 {{
+    let h = max(y, -0.02);
+    return 1.0 / (h + 0.025 * exp(-11.0 * h));
+}}
+
+// Refraction at an apparent elevation (radians), Bennett 1982: 34' at the
+// horizon, 5' at 10 deg.
+fn sky_refraction(el: f32) -> f32 {{
+    let h = max(el * (180.0 / SKY_PI), -1.5);
+    return (SKY_PI / 180.0 / 60.0) / tan((h + 7.31 / (h + 4.4)) * (SKY_PI / 180.0));
+}}
+
+// The true direction a pixel at apparent direction `d` sees: refraction
+// lifts everything near the horizon, the lower limb of a setting sun most,
+// so the disc comes out flattened.
+fn sky_true_dir(d: vec3<f32>) -> vec3<f32> {{
+    let el = asin(clamp(d.y, -1.0, 1.0));
+    let e2 = el - sky_refraction(el);
+    let k = cos(e2) / max(cos(el), 1e-4);
+    return vec3<f32>(d.x * k, sin(e2), d.z * k);
+}}
+
+fn sky_apparent(s: vec3<f32>) -> vec3<f32> {{
+    let el = asin(clamp(s.y, -1.0, 1.0));
+    let e2 = el + sky_refraction(el);
+    let k = cos(e2) / max(cos(el), 1e-4);
+    return vec3<f32>(s.x * k, sin(e2), s.z * k);
+}}
+
 fn sky_moon(d: vec3<f32>, px: f32) -> vec4<f32> {{
     let m = sky_extra.moon.xyz;
     let rho = sky_extra.moon.w;
-    let along = dot(d, m);
-    if (along < cos(rho + 3.0 * px) || m.y < -0.02) {{
+    if (dot(d, m) < HALO_COS || m.y < -0.05) {{
         return vec4<f32>(0.0);
     }}
+    let seen_at = sky_apparent(m);
+    let risen = smoothstep(-rho, rho, seen_at.y);
+    let halo = sky_extra.moon_radiance.rgb * sky_extra.extinction.w * risen * sky_halo_through().y
+        * sky_halo(d, seen_at, max(rho * (180.0 / SKY_PI), 0.5));
+    if (dot(d, m) < cos(rho + DISC_REACH + 3.0 * px)) {{
+        return vec4<f32>(halo, 0.0);
+    }}
+    let dt = sky_true_dir(d);
     let pole = sky_extra.celestial[2].xyz;
     let up = normalize(pole - m * dot(pole, m));
     let right = cross(m, up);
-    let xy = vec2<f32>(dot(d, right), dot(d, up)) / sin(rho);
+    let xy = vec2<f32>(dot(dt, right), dot(dt, up)) / sin(rho);
+    if (dot(dt, m) < 0.0) {{
+        return vec4<f32>(halo, 0.0);
+    }}
     let r = length(xy);
     let e = px / rho;
     let cover = 1.0 - smoothstep(1.0 - e, 1.0 + e, r);
@@ -773,21 +1012,38 @@ fn sky_moon(d: vec3<f32>, px: f32) -> vec4<f32> {{
     let rgb = sky_extra.moon_radiance.rgb;
     let peak = max(max(rgb.r, rgb.g), rgb.b) * 1.3 * max(camera.post_params.x, 0.0);
     let seen = min(1.0, MOON_SEEN / max(peak, 1e-12));
-    return vec4<f32>(surface * cover * seen, cover);
+    return vec4<f32>(surface * cover * seen + halo, cover);
 }}
 
+// The sun: its disc -- limb-darkened per channel (Neckel and Labs: the edge
+// dimmer and redder), reddened across itself by the air mass near the
+// horizon, lifted and flattened by refraction -- and its glare.
+// `sun_radiance` is the disc's mean radiance through the air at the
+// snapshot's apparent elevation, whose sine is its `.w`.
 fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
     let s = sky_extra.sun.xyz;
     let rho = sky_extra.sun.w;
-    let along = dot(d, s);
-    if (along < cos(rho + 3.0 * px)) {{
+    if (dot(d, s) < HALO_COS) {{
         return vec3<f32>(0.0);
     }}
-    let r = length(cross(d, s)) / sin(rho);
+    let seen_at = sky_apparent(s);
+    let risen = smoothstep(-rho, rho, seen_at.y);
+    let e_sun = sky_extra.sun_radiance.rgb * (SKY_PI * rho * rho * (1.0 - SUN_LIMB_BAKED / 3.0));
+    var out = e_sun * (risen * sky_halo_through().x * sky_halo(d, seen_at, max(rho * (180.0 / SKY_PI), 0.5)));
+    if (dot(d, s) < cos(rho + DISC_REACH + 3.0 * px)) {{
+        return out;
+    }}
+    let dt = sky_true_dir(d);
+    if (dot(dt, s) < 0.0) {{
+        return out;
+    }}
+    let r = length(cross(dt, s)) / sin(rho);
     let e = px / rho;
     let cover = 1.0 - smoothstep(1.0 - e, 1.0 + e, r);
     let mu = sqrt(max(1.0 - min(r * r, 1.0), 0.0));
-    return sky_extra.sun_radiance.rgb * (1.0 - sky_extra.sun_radiance.w * (1.0 - mu)) * cover;
+    let limb = (1.0 - SUN_LIMB_U * (1.0 - mu)) * ((1.0 - SUN_LIMB_BAKED / 3.0) / (1.0 - SUN_LIMB_U / 3.0));
+    let redden = exp(clamp(-sky_extra.extinction.xyz * (sky_air(d.y) - sky_air(sky_extra.sun_radiance.w)), vec3<f32>(-4.0), vec3<f32>(4.0)));
+    return out + sky_extra.sun_radiance.rgb * limb * redden * cover;
 }}
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
@@ -816,6 +1072,17 @@ fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
 "#,
         lights_block = wgsl_lights_block(0, 1),
         star_cells = STAR_CELLS,
+        limb_r = SUN_LIMB_U[0],
+        limb_g = SUN_LIMB_U[1],
+        limb_b = SUN_LIMB_U[2],
+        limb_baked = SUN_LIMB_BAKED,
+        halo_share = super::glare::VEIL_SHARE,
+        halo_degrees = HALO_DEGREES,
+        halo_cos = HALO_DEGREES.to_radians().cos(),
+        cie_1 = super::glare::CIE_TERMS[0],
+        cie_2 = super::glare::CIE_TERMS[1],
+        cie_3 = super::glare::CIE_TERMS[2],
+        disc_reach = DISC_REACH,
         sky_tail = if SKY_CRACK_DEBUG {
             "return vec4<f32>(1.0, 0.0, 1.0, 1.0);"
         } else {
@@ -827,7 +1094,11 @@ fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
 pub fn sky_cloud_shader() -> String {
     use space_soup_sky::clouds as c;
     let src = sky_shader();
-    let edits: [(&str, String); 4] = [
+    let edits: [(&str, String); 5] = [
+        (
+            "fn sky_halo_through() -> vec2<f32> {\n    return vec2<f32>(1.0, 1.0);\n}",
+            "fn sky_halo_through() -> vec2<f32> {\n    return vec2<f32>(sky_extra.cloud_sky.w, sky_extra.cloud_ground.w);\n}".to_string(),
+        ),
         (
             "    celestial: array<vec4<f32>, 3>,\n}",
             "    celestial: array<vec4<f32>, 3>,\n    cloud_scale: vec4<f32>,\n    cloud_offset: vec4<f32>,\n    cloud_misc: vec4<f32>,\n    cloud_light_dir: vec4<f32>,\n    cloud_light: vec4<f32>,\n    cloud_sky: vec4<f32>,\n    cloud_ground: vec4<f32>,\n}".to_string(),
@@ -852,6 +1123,12 @@ const CLOUD_BACK_G: f32 = {bg:?};
 const CLOUD_BACK_SHARE: f32 = {bs:?};
 const CLOUD_DIFFUSE_K: f32 = {dk:?};
 const CLOUD_HAZE: f32 = {haze:e};
+const CLOUD_EDGE_SOFT: f32 = {edge:?};
+const CLOUD_TAP_NEAR: f32 = {near:?};
+const CLOUD_LIGHT_W0: f32 = {w0:?};
+const CLOUD_LIGHT_W1: f32 = {w1:?};
+const CLOUD_LIGHT_W2: f32 = {w2:?};
+const CLOUD_POWDER_K: f32 = {powder:?};
 
 fn cloud_hg(g: f32, c: f32) -> f32 {{
     let g2 = g * g;
@@ -873,6 +1150,11 @@ fn cloud_density(xz: vec2<f32>) -> f32 {{
     return d * (1.0 - CLOUD_EROSION * detail * (1.0 - d));
 }}
 
+fn cloud_edge(d: f32) -> f32 {{
+    let t = clamp(d / CLOUD_EDGE_SOFT, 0.0, 1.0);
+    return d * t * t * (3.0 - 2.0 * t);
+}}
+
 fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
     let mu = max(dir.y, 1e-4);
     let h = sky_extra.cloud_misc.w;
@@ -883,19 +1165,24 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
     let xz = eye.xz + dir.xz * t;
     let sigma = sky_extra.cloud_misc.z;
     let d = cloud_density(xz);
-    let tau_v = sigma * d * min(1.0 / mu, CLOUD_MAX_SLANT);
+    let de = cloud_edge(d);
+    let tau_v = sigma * de * min(1.0 / mu, CLOUD_MAX_SLANT);
     let l = sky_extra.cloud_light_dir.xyz;
     let ly = max(l.y, CLOUD_MIN_LIGHT_Y);
     let thick = sky_extra.cloud_light_dir.w;
     let off = l.xz / ly * (0.5 * thick);
     let tap = off * min(1.0, CLOUD_TAP_REACH * thick / max(length(off), 1e-6));
-    let tau_l = sigma * cloud_density(xz + tap) * min(0.5 / ly, CLOUD_MAX_SLANT);
+    let path = CLOUD_LIGHT_W0 * de + CLOUD_LIGHT_W1 * cloud_edge(cloud_density(xz + CLOUD_TAP_NEAR * tap)) + CLOUD_LIGHT_W2 * cloud_edge(cloud_density(xz + tap));
+    let tau_l = sigma * path * min(0.5 / ly, CLOUD_MAX_SLANT);
     let cv = dot(dir, l);
-    let oct = cloud_phase(1.0, cv) * exp(-tau_l)
+    let tau_c = sigma * de;
+    let powder = 1.0 - exp(-CLOUD_POWDER_K * tau_c);
+    let oct = (cloud_phase(1.0, cv) * exp(-tau_l)
         + CLOUD_OCT_A * cloud_phase(CLOUD_OCT_C, cv) * exp(-CLOUD_OCT_B * tau_l)
-        + CLOUD_OCT_A * CLOUD_OCT_A * cloud_phase(CLOUD_OCT_C * CLOUD_OCT_C, cv) * exp(-CLOUD_OCT_B * CLOUD_OCT_B * tau_l);
-    let td_l = 1.0 / (1.0 + CLOUD_DIFFUSE_K * tau_l);
-    let td_c = 1.0 / (1.0 + CLOUD_DIFFUSE_K * sigma * d);
+        + CLOUD_OCT_A * CLOUD_OCT_A * cloud_phase(CLOUD_OCT_C * CLOUD_OCT_C, cv) * exp(-CLOUD_OCT_B * CLOUD_OCT_B * tau_l))
+        * (powder + (1.0 - powder) * (0.5 + 0.5 * cv));
+    let td_l = 1.0 / (1.0 + CLOUD_DIFFUSE_K * 2.0 * tau_l);
+    let td_c = 1.0 / (1.0 + CLOUD_DIFFUSE_K * tau_c);
     let light = sky_extra.cloud_light.rgb * (max(l.y, 0.0) * td_l / SKY_PI + oct)
         + sky_extra.cloud_sky.rgb * td_c + sky_extra.cloud_ground.rgb * (1.0 - td_c);
     let alpha = (1.0 - exp(-tau_v)) * select(0.0, 1.0, dir.y > 0.0);
@@ -917,6 +1204,12 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
                 bs = c::PHASE_BACK_SHARE,
                 dk = 0.75 * (1.0 - c::DIFFUSE_G),
                 haze = c::HAZE_PER_M,
+                edge = c::EDGE_SOFT,
+                near = c::LIGHT_TAP_NEAR,
+                w0 = c::LIGHT_WEIGHTS[0],
+                w1 = c::LIGHT_WEIGHTS[1],
+                w2 = c::LIGHT_WEIGHTS[2],
+                powder = c::POWDER_K,
             ),
         ),
         (

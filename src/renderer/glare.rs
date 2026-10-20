@@ -11,6 +11,10 @@ const CIE_AGE: f32 = 1.0 + 0.4 * 0.4 * 0.4 * 0.4;
 const CIE_SQUARE: f32 = 5.0 * CIE_AGE;
 const CIE_LINEAR: f32 = 0.1 * 0.5 * CIE_AGE;
 
+/// `cie_veil`'s 1/theta, 1/theta^2 and 1/theta^3 terms, for the sky
+/// shader's sun and moon halos (`sky::sky_shader`).
+pub const CIE_TERMS: [f32; 3] = [CIE_LINEAR, CIE_SQUARE, CIE_CUBE];
+
 const VEIL_FLOOR: f32 = 0.02;
 
 pub const HALO_CAP: f32 = 0.04;

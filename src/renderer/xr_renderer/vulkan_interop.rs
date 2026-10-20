@@ -61,6 +61,12 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
     if exposed.features.contains(wgpu::Features::IMMEDIATES) {
         features |= wgpu::Features::IMMEDIATES;
     }
+    // The ground's layers are encoded ahead as ASTC where the game ships them
+    // so (`TerrainLayerArrays::from_astc`): a quarter of the memory.
+    if exposed.features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC) {
+        features |= wgpu::Features::TEXTURE_COMPRESSION_ASTC;
+    }
+    log::info!("wgpu: ASTC {}", if features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC) { "yes" } else { "NO" });
     {
         use wgpu::hal::Adapter as _;
         let rgba16 = exposed.adapter.texture_format_capabilities(wgpu::TextureFormat::Rgba16Unorm);

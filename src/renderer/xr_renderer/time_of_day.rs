@@ -51,6 +51,18 @@ pub(super) struct TodState {
     pub probe_resolution: u32,
 
     pub probe_from: Option<(f32, [f32; 3])>,
+
+    /// The photographs as baked; `room_descs` is them with each room's
+    /// light relit to the time of day (`room_light::relit`).
+    pub room_full: Vec<ProbeDesc>,
+    /// Each photograph's room light by the lamps alone, beside `room_full`.
+    pub room_lamps: Vec<Option<crate::renderer::room_light::RoomLight>>,
+
+    /// When the last snapshot was applied: the next one blends in over the
+    /// time between them (`Sky::apply_snapshot_blended`).
+    pub last_apply: Option<std::time::Instant>,
+    /// The daylight the blend starts from, beside `daylight` it goes to.
+    pub daylight_from: f32,
 }
 
 const GROUND_RATIO: f32 = 1.5;
@@ -122,6 +134,7 @@ impl XrRenderer {
 
     fn stop_time_of_day(&mut self) {
         self.tod.runtime = None;
+        self.tod.last_apply = None;
         if let Some((pano, rotation, intensity)) = self.tod.photographed.take() {
             let keep = (pano.clone(), rotation, intensity);
             self.sky = crate::renderer::sky::Sky::new(&self.wgpu_device, &self.wgpu_queue, &self.sky_pipeline.layout, &pano, rotation, intensity);
@@ -136,6 +149,7 @@ impl XrRenderer {
             eye.relight(self.sky.irradiance, 1.0);
         }
         self.relight_probes(1.0, None);
+        self.tod_relight_rooms(1.0);
         self.set_sun_off_bake(false);
         self.ground_dirty = true;
         self.tod.ground_from = None;
@@ -211,18 +225,32 @@ impl XrRenderer {
         let Some(rt) = self.tod.runtime.as_mut() else { return };
         let prepared = rt.advance(dt, lever);
         let seconds = rt.seconds() as f32;
+        // Where the sun, moon and stars are THIS frame (cheap trig): they
+        // glide rather than stepping at each snapshot.
+        let astro = space_soup_sky::time_of_day::Astronomy::at(&rt.params, rt.hour(), rt.params.days_at(rt.seconds()));
         if let Some(p) = prepared {
             self.apply_time_of_day(p);
-        } else {
-            self.sky.set_clock(&self.wgpu_queue, seconds);
         }
+        self.sky.tick(&self.wgpu_queue, seconds, dt, Some(&astro));
+        // The models' room light follows the blend too (`room_light::relit`).
+        let t = self.sky.blend_progress();
+        self.tod_relight_rooms(self.tod.daylight_from + (self.tod.daylight - self.tod.daylight_from) * t);
         self.poll_ground_rebuild();
     }
 
     fn apply_time_of_day(&mut self, p: Prepared) {
         let Some(rt) = self.tod.runtime.as_ref() else { return };
         let (seconds, zenith) = (rt.seconds() as f32, rt.zenith_depth);
-        self.sky.apply_snapshot(&self.wgpu_device, &self.wgpu_queue, &self.sky_pipeline.layout, &p.snapshot, seconds, zenith);
+        // Blended in over the time since the last snapshot (none for the first).
+        let now = std::time::Instant::now();
+        let blend = self.tod.last_apply.replace(now).map_or(0.0, |t| now.duration_since(t).as_secs_f32().clamp(0.25, 4.0));
+        self.tod.daylight_from = if blend > 0.0 {
+            let t = self.sky.blend_progress();
+            self.tod.daylight_from + (self.tod.daylight - self.tod.daylight_from) * t
+        } else {
+            p.daylight
+        };
+        self.sky.apply_snapshot_blended(&self.wgpu_device, &self.wgpu_queue, &self.sky_pipeline.layout, &p.snapshot, seconds, zenith, blend);
         self.tod.daylight = p.daylight;
         self.eye.borrow_mut().relight(self.sky.irradiance, p.daylight);
         if let (Some(chain), Some(lm)) = (p.atlas.as_ref(), self.brush_lightmap.as_ref()) {
@@ -322,9 +350,42 @@ impl XrRenderer {
         }
     }
 
-    pub fn set_probe_lamps(&mut self, lamps: Option<ProbeSource>, building_lamps: Vec<Vec<u8>>) {
+    /// The probes by the lamps alone: their photographs, the buildings' and
+    /// each photograph's room light (`room_lamps`, one per probe, in order).
+    pub fn set_probe_lamps(
+        &mut self,
+        lamps: Option<ProbeSource>,
+        building_lamps: Vec<Vec<u8>>,
+        room_lamps: Vec<Option<crate::renderer::room_light::RoomLight>>,
+    ) {
         self.tod.probe_lamps = lamps;
         self.tod.building_lamps = building_lamps;
+        self.tod.room_lamps = room_lamps;
+    }
+
+    /// The photographs the models take their room light from, baked.
+    pub(super) fn tod_set_room_photographs(&mut self, descs: Vec<ProbeDesc>) {
+        self.tod.room_full = descs;
+        let k = if self.tod.runtime.is_some() { self.tod.daylight } else { 1.0 };
+        self.tod_relight_rooms(k);
+    }
+
+    /// Every room's light for the models at `daylight` (`room_light::relit`):
+    /// cheap (27 floats a photograph), so it follows each snapshot.
+    pub(super) fn tod_relight_rooms(&mut self, daylight: f32) {
+        let lamps = (self.tod.room_lamps.len() == self.tod.room_full.len()).then_some(&self.tod.room_lamps);
+        self.room_descs = self
+            .tod
+            .room_full
+            .iter()
+            .enumerate()
+            .map(|(i, d)| ProbeDesc {
+                room_light: d.room_light.map(|full| {
+                    crate::renderer::room_light::relit(&full, lamps.and_then(|l| l[i].as_ref()), daylight)
+                }),
+                ..*d
+            })
+            .collect();
     }
 
     pub(super) fn tod_probe_source(&self, full: ProbeSource) -> ProbeSource {

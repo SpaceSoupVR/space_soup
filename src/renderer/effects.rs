@@ -2416,7 +2416,7 @@ pub fn fire_glare(e: &EffectEmitter, time: f64, offset: Vec3, yaw_inv: Quat) -> 
 }
 
 pub fn room_ambient(descs: &[ProbeDesc], world: Vec3) -> Vec3 {
-    let l = super::room_light::room_light_at(descs, world);
+    let l = super::room_light::room_light_at_or_nearest(descs, world);
     Vec3::new(l[0][0], l[0][1], l[0][2]) * 0.282_095
 }
 
