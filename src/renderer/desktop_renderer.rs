@@ -12,7 +12,7 @@ use super::water_pipeline::{WaterPipeline, WaterUniform, WaterVertex};
 use super::water_waves::{WaveField, WaveParams};
 use super::{ground_map, icon, lights, mesh_pipeline, pipeline, uniforms};
 use super::{Camera, Cuboid, MeshInstance, WorldPanel};
-use spacesoup_graphics::mud::{MudMap, Walkers as MudWalkers};
+use super::mud_map::MudBody;
 
 struct CuboidCacheEntry {
     snapshot: CuboidSnapshot,
@@ -40,53 +40,6 @@ struct DesktopWater {
     uniform: WaterUniform,
     waves: WaveField,
     bounds: (glam::Vec3, glam::Vec3),
-}
-
-struct MudBody {
-    map: MudMap,
-    texture: Texture,
-    view: TextureView,
-    walkers: MudWalkers,
-}
-
-impl MudBody {
-    fn new(device: &Device, queue: &Queue, min: [f32; 2], max: [f32; 2]) -> Self {
-        let map = MudMap::new(min, max, spacesoup_graphics::mud::DEFAULT_TEXEL, spacesoup_graphics::mud::MAX_SIDE);
-        let texture = device.create_texture(&TextureDescriptor {
-            label: Some("terrain_deform"),
-            size: Extent3d { width: map.width(), height: map.height(), depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: super::terrain_pipeline::DEFORM_FORMAT,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
-            bytemuck::cast_slice(&super::terrain_pipeline::deform_rows(map.bytes(), map.width(), map.height(), 0, map.height())),
-            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(map.width() * super::terrain_pipeline::DEFORM_TEXEL_BYTES), rows_per_image: Some(map.height()) },
-            Extent3d { width: map.width(), height: map.height(), depth_or_array_layers: 1 },
-        );
-        let view = texture.create_view(&TextureViewDescriptor::default());
-        Self { map, texture, view, walkers: MudWalkers::default() }
-    }
-
-    fn flush(&mut self, queue: &Queue) {
-        let Some([_, y0, _, y1]) = self.map.take_dirty() else { return };
-        if y1 <= y0 {
-            return;
-        }
-        let (width, height) = (self.map.width(), self.map.height());
-        for (from, to) in super::terrain_pipeline::deform_rows_touched(y0, y1, height) {
-            queue.write_texture(
-                TexelCopyTextureInfo { texture: &self.texture, mip_level: 0, origin: Origin3d { x: 0, y: from, z: 0 }, aspect: TextureAspect::All },
-                bytemuck::cast_slice(&super::terrain_pipeline::deform_rows(self.map.bytes(), width, height, from, to)),
-                TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * super::terrain_pipeline::DEFORM_TEXEL_BYTES), rows_per_image: Some(to - from) },
-                Extent3d { width, height: to - from, depth_or_array_layers: 1 },
-            );
-        }
-    }
 }
 
 pub struct DesktopGround {
@@ -321,25 +274,15 @@ impl Renderer {
     /// scar soaked dark. Returns that mud weight so the caller can size the
     /// thrown-up mist.
     pub fn blast_on_mud(&mut self, at: glam::Vec3, radius: f32, depth: f32) -> f32 {
-        let weight = self.mud_weight_at(at.x, at.z);
-        if weight > 0.0 {
-            if let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) {
-                m.map.crater([at.x, at.z], radius, depth * weight);
-            }
-        }
-        weight
+        let Some(t) = self.terrain.as_mut() else { return 0.0 };
+        let Some(m) = t.mud.as_mut() else { return 0.0 };
+        m.blast(t.splat.as_ref(), t.mud_layer, at, radius, depth)
     }
 
     pub fn walkers_on_mud(&mut self, walkers: &[(usize, glam::Vec3)]) {
-        let present: Vec<usize> = walkers.iter().map(|w| w.0).collect();
-        let weights: Vec<(usize, glam::Vec3, f32)> = walkers.iter().map(|(id, p)| (*id, *p, self.mud_weight_at(p.x, p.z))).collect();
-        let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) else { return };
-        let (mut wading, mut prints) = (0, 0);
-        for (id, p, weight) in weights {
-            wading += (weight >= spacesoup_graphics::mud::MUD_WEIGHT_FLOOR) as u32;
-            prints += m.walkers.step(&mut m.map, id, [p.x, p.z], weight) as u32;
-        }
-        m.walkers.forget_absent(&present);
+        let Some(t) = self.terrain.as_mut() else { return };
+        let Some(m) = t.mud.as_mut() else { return };
+        let (wading, prints) = m.walk(walkers, t.splat.as_ref(), t.mud_layer);
         if prints > 0 {
             log::info!("mud: {wading} on mud, {prints} new print(s) on a {}x{} map", m.map.width(), m.map.height());
         }
@@ -489,8 +432,7 @@ impl Renderer {
         });
         let mut settings = settings;
         if let Some(m) = mud.as_ref() {
-            let [tx, tz] = m.map.texel_metres();
-            settings.deform_texel = tx.max(tz);
+            settings.deform_texel = m.texel_metres();
             log::info!("terrain deform map: {}x{} at {:.3} m, mud layer {mud_layer}", m.map.width(), m.map.height(), settings.deform_texel);
         }
         let material = super::terrain_pipeline::TerrainMaterial::from_layers_deformed(
@@ -543,27 +485,6 @@ impl Renderer {
             self.queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
             body.bind_groups = pipeline.bind_groups_with(&self.device, &body.uniform_buffer, &body.waves, view);
         }
-    }
-
-    fn mud_weight_at(&self, x: f32, z: f32) -> f32 {
-        let Some(t) = self.terrain.as_ref() else { return 0.0 };
-        let Some(m) = t.mud.as_ref() else { return 0.0 };
-        if t.mud_layer < 0 || !m.map.contains(x, z) {
-            return 0.0;
-        }
-        let Some(s) = t.splat.as_ref() else { return if t.mud_layer == 0 { 1.0 } else { 0.0 } };
-        let p = m.map.placement();
-        let u = ((x - p[0]) * p[2]).clamp(0.0, 1.0);
-        let v = ((z - p[1]) * p[3]).clamp(0.0, 1.0);
-        let ix = ((u * s.width as f32) as u32).min(s.width - 1);
-        let iz = ((v * s.height as f32) as u32).min(s.height - 1);
-        let k = ((iz * s.width + ix) * 4) as usize;
-        let w: Vec<f32> = (0..4).map(|c| s.rgba[k + c] as f32).collect();
-        let total: f32 = w.iter().sum();
-        if total <= 0.0 {
-            return 0.0;
-        }
-        w[t.mud_layer as usize] / total
     }
 
     pub fn update_terrain_splat(&mut self, image: &super::terrain_pipeline::TerrainImage) -> bool {

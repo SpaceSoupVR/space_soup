@@ -446,6 +446,9 @@ pub struct XrRenderer {
     terrain_shape: Option<crate::renderer::ground_shape::GroundShape>,
 
     terrain_footprint: Option<(glam::Vec3, glam::Vec3)>,
+    /// The ground's mud prints (`mud_map`), while the level's ground has a mud
+    /// layer: stamped by `walkers_on_mud`, read by the ground and the water.
+    mud: Option<crate::renderer::mud_map::MudBody>,
 
     ground_occluder: Option<(crate::renderer::ground_horizon::GroundOccluder, Vec<(u32, (glam::Vec3, glam::Vec3))>)>,
     ground_horizon: std::cell::RefCell<Option<crate::renderer::ground_horizon::Horizon>>,
@@ -1472,6 +1475,7 @@ impl XrRenderer {
             terrain_stationary: Vec::new(),
             terrain_shape: None,
             terrain_footprint: None,
+            mud: None,
             ground_occluder: None,
             ground_horizon: std::cell::RefCell::new(None),
             ground_lod: std::cell::RefCell::new(None),
@@ -2634,6 +2638,78 @@ impl XrRenderer {
     pub fn set_terrain_heights(&mut self, heights: Option<crate::renderer::ground_map::HeightGrid>) {
         self.ground_heights = heights;
         self.ground_dirty = true;
+        if self.mud_map_wanted() != self.mud.as_ref().map(|m| (m.map.min(), m.map.max())) {
+            self.rebuild_terrain_material();
+        }
+    }
+
+    /// The footprint a mud map should span: the height grid's, while the
+    /// ground's material names a mud layer (`TerrainMaterialUniform::mud_layer`).
+    fn mud_map_wanted(&self) -> Option<([f32; 2], [f32; 2])> {
+        let layer = self.terrain_settings.mud_layer.round() as i32;
+        let g = self.ground_heights.as_ref().filter(|_| (0..4).contains(&layer))?;
+        Some(([g.min.x, g.min.y], [g.max.x, g.max.y]))
+    }
+
+    /// Make, keep or drop the mud map for what the level wants. True when it
+    /// changed, so the ground, its build and the water must rebind.
+    fn ensure_mud_map(&mut self) -> bool {
+        match (self.mud_map_wanted(), self.mud.as_ref()) {
+            (Some((lo, hi)), Some(m)) if m.spans(lo, hi) => false,
+            (Some((lo, hi)), _) => {
+                let m = crate::renderer::mud_map::MudBody::new(&self.wgpu_device, &self.wgpu_queue, lo, hi);
+                log::info!("MUD: a {}x{} deform map at {:.3} m over the ground", m.map.width(), m.map.height(), m.texel_metres());
+                self.mud = Some(m);
+                true
+            }
+            (None, None) => false,
+            (None, Some(_)) => {
+                self.mud = None;
+                true
+            }
+        }
+    }
+
+    /// The water bodies read the same map for prints under their film.
+    fn rebind_water_mud(&mut self) {
+        let placement = self.mud.as_ref().map_or([0.0; 4], |m| m.map.placement());
+        for body in &mut self.water_bodies {
+            body.uniform.prints = placement;
+            self.wgpu_queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
+            let view = self.mud.as_ref().map_or(&self.water_pipeline.default_mud, |m| &m.view);
+            body.bind_groups = self.water_pipeline.bind_groups_with(&self.wgpu_device, &body.uniform_buffer, &body.waves, view);
+        }
+        for mud in self.water_bodies.iter().map(|b| crate::renderer::water_pipeline::WaterMud::of(&b.uniform)).collect::<Vec<_>>() {
+            self.water_pipeline.ensure_mud(&self.wgpu_device, mud);
+            if let Some(p) = self.stereo_pipelines.as_mut() {
+                p.water.ensure_mud(&self.wgpu_device, mud);
+            }
+        }
+    }
+
+    /// Step the walkers (`id`, world position of the feet) over the mud and
+    /// send what changed; walkers not listed are forgotten. Call once a frame,
+    /// with the local player and every other one (`spacesoup_graphics::mud`).
+    pub fn walkers_on_mud(&mut self, walkers: &[(usize, glam::Vec3)]) {
+        let layer = self.terrain_settings.mud_layer.round() as i32;
+        let Some(m) = self.mud.as_mut() else { return };
+        let (wading, prints) = m.walk(walkers, self.terrain_splat.as_ref(), layer);
+        m.tick(&self.wgpu_queue);
+        if prints > 0 {
+            log::info!("MUD: {wading} on mud, {prints} new print(s)");
+        }
+    }
+
+    /// A blast scars the mud: a crater of `radius` metres sunk `depth` (0..1 of
+    /// a footprint), scaled by the mud there, which it returns.
+    pub fn blast_on_mud(&mut self, at: glam::Vec3, radius: f32, depth: f32) -> f32 {
+        let layer = self.terrain_settings.mud_layer.round() as i32;
+        self.mud.as_mut().map_or(0.0, |m| m.blast(self.terrain_splat.as_ref(), layer, at, radius, depth))
+    }
+
+    /// Whether the ground draws with its deform map read (`GROUND_MUDDY`).
+    pub(crate) fn ground_is_muddy(&self) -> bool {
+        self.mud.is_some()
     }
 
     pub fn sea_line(&self) -> f32 {
@@ -2928,13 +3004,8 @@ impl XrRenderer {
                 }
             })
             .collect();
-        for mud in self.water_bodies.iter().map(|b| crate::renderer::water_pipeline::WaterMud::of(&b.uniform)) {
-            self.water_pipeline.ensure_mud(&self.wgpu_device, mud);
-            if let Some(p) = self.stereo_pipelines.as_mut() {
-                p.water.ensure_mud(&self.wgpu_device, mud);
-            }
-        }
         self.ground_dirty = true;
+        self.rebind_water_mud();
         log::info!(
             "water: {} body/bodies installed, {} blending",
             self.water_bodies.len(),
@@ -3066,6 +3137,10 @@ impl XrRenderer {
     fn rebuild_terrain_material(&mut self) {
 
         self.ground_dirty = true;
+        let mud_moved = self.ensure_mud_map();
+        if let Some(m) = self.mud.as_ref() {
+            self.terrain_settings.deform_texel = m.texel_metres();
+        }
 
         let ground = match (&self.terrain_sky_occlusion, self.terrain_stationary.is_empty()) {
             (Some(map), false) => Some(map.with_stationary_masks(&self.terrain_stationary).unwrap_or_else(|| {
@@ -3095,7 +3170,7 @@ impl XrRenderer {
             (g, _) => g,
         };
         self.terrain_material =
-            crate::renderer::terrain_pipeline::TerrainMaterial::from_layers_with_shape(
+            crate::renderer::terrain_pipeline::TerrainMaterial::from_layers_full(
                 &self.wgpu_device,
                 &self.wgpu_queue,
                 &self.terrain_pipeline.material_layout,
@@ -3107,7 +3182,12 @@ impl XrRenderer {
                 ground.as_ref(),
                 self.terrain_settings,
                 self.terrain_shape.as_ref(),
+                self.mud.as_ref().map(|m| &m.view),
             );
+        if mud_moved {
+            self.rebind_water_mud();
+            self.ground_for_level();
+        }
     }
 
     pub fn cleanup(&self) {}

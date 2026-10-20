@@ -3,6 +3,7 @@ pub mod camera;
 pub mod character_cards;
 pub mod cuboid;
 mod desktop_renderer;
+pub mod mud_map;
 pub mod icon;
 pub mod layer_settings;
 pub mod layered_mesh_pipeline;
