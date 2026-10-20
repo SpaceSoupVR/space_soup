@@ -2002,8 +2002,8 @@ impl XrRenderer {
     }
     fn sp_sky(&self, stereo: bool) -> &wgpu::RenderPipeline {
         match (stereo, &self.stereo_pipelines) {
-            (true, Some(p)) => &p.sky.pipeline,
-            _ => &self.sky_pipeline.pipeline,
+            (true, Some(p)) => p.sky.pick(&self.sky),
+            _ => self.sky_pipeline.pick(&self.sky),
         }
     }
     fn sp_brush_seal(&self, stereo: bool) -> &wgpu::RenderPipeline {

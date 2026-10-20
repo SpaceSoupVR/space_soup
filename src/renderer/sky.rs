@@ -56,9 +56,47 @@ pub struct SkyExtra {
     pub extinction: [f32; 4],
 
     pub celestial: [[f32; 4]; 3],
+
+    pub cloud_scale: [f32; 4],
+
+    pub cloud_offset: [f32; 4],
+
+    pub cloud_misc: [f32; 4],
+
+    pub cloud_light_dir: [f32; 4],
+
+    pub cloud_light: [f32; 4],
+
+    pub cloud_sky: [f32; 4],
+
+    pub cloud_ground: [f32; 4],
 }
 
 impl SkyExtra {
+    pub fn set_clouds(&mut self, f: Option<&CloudFrame>) {
+        let Some(f) = f else {
+            self.cloud_scale = [0.0; 4];
+            return;
+        };
+        let p = &f.params;
+        self.cloud_scale = [f.tile_inv[0], f.tile_inv[1], f.tile_inv[2], p.coverage];
+        self.set_cloud_offsets(f);
+        self.cloud_misc[2] = f.sigma_column;
+        self.cloud_misc[3] = p.altitude_m + 0.5 * p.thickness_m;
+        self.cloud_light_dir = [f.light_dir[0], f.light_dir[1], f.light_dir[2], p.thickness_m];
+        let v4 = |v: [f32; 3]| [v[0], v[1], v[2], 0.0];
+        self.cloud_light = v4(f.light_irradiance);
+        self.cloud_sky = v4(f.ambient_sky);
+        self.cloud_ground = v4(f.ambient_ground);
+    }
+
+    pub fn set_cloud_offsets(&mut self, f: &CloudFrame) {
+        let o = f.offsets;
+        self.cloud_offset = [o[0][0], o[0][1], o[1][0], o[1][1]];
+        self.cloud_misc[0] = o[2][0];
+        self.cloud_misc[1] = o[2][1];
+    }
+
 
     pub fn from_snapshot(snap: &SkySnapshot, seconds: f32, zenith_depth: [f32; 3]) -> Self {
         let d = &snap.discs;
@@ -78,8 +116,17 @@ impl SkyExtra {
             stars: [d.star_zero_point, d.limiting_magnitude, d.star_count, 1.0],
             extinction: v4(zenith_depth, 0.0),
             celestial: [v4(d.celestial_rows[0], 0.0), v4(d.celestial_rows[1], 0.0), v4(d.celestial_rows[2], 0.0)],
+            ..Default::default()
         }
     }
+}
+
+use space_soup_sky::clouds::{CloudField, CloudFrame};
+
+pub struct SkyClouds {
+    pub field: std::sync::Arc<CloudField>,
+    pub frame: CloudFrame,
+    pub sun_clear: Option<SkySun>,
 }
 
 pub struct Sky {
@@ -95,6 +142,10 @@ pub struct Sky {
     extra_buffer: Buffer,
     texture: Texture,
     sampler: Sampler,
+
+    pub clouds: Option<SkyClouds>,
+    cloud_texture: Texture,
+    cloud_sampler: Sampler,
 }
 
 #[derive(Clone)]
@@ -198,8 +249,48 @@ pub fn sky_bind_group_layout(device: &Device) -> BindGroupLayout {
                 },
                 count: None,
             },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
+}
+
+fn cloud_texture(device: &Device, queue: &Queue, field: Option<&CloudField>) -> Texture {
+    let mips = field.map(|f| f.mips()).unwrap_or_else(|| vec![(1, vec![0, 0, 0, 255])]);
+    let size = mips[0].0;
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("sky_clouds"),
+        size: Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        mip_level_count: mips.len() as u32,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (level, (s, bytes)) in mips.iter().enumerate() {
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &texture, mip_level: level as u32, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            bytes,
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(s * 4), rows_per_image: Some(*s) },
+            Extent3d { width: *s, height: *s, depth_or_array_layers: 1 },
+        );
+    }
+    texture
 }
 
 impl Sky {
@@ -252,7 +343,18 @@ impl Sky {
             mapped_at_creation: false,
         });
         queue.write_buffer(&extra_buffer, 0, bytemuck::bytes_of(&extra));
-        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer);
+        let cloud_texture = cloud_texture(device, queue, None);
+        let cloud_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("sky_cloud_sampler"),
+            address_mode_u: AddressMode::Repeat,
+            address_mode_v: AddressMode::Repeat,
+            address_mode_w: AddressMode::Repeat,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer, &cloud_texture, &cloud_sampler);
 
         Self {
             bind_group,
@@ -263,11 +365,19 @@ impl Sky {
             extra_buffer,
             texture,
             sampler,
+            clouds: None,
+            cloud_texture,
+            cloud_sampler,
         }
     }
 
-    fn bind(device: &Device, layout: &BindGroupLayout, texture: &Texture, sampler: &Sampler, extra: &Buffer) -> BindGroup {
+    pub fn has_clouds(&self) -> bool {
+        self.clouds.is_some()
+    }
+
+    fn bind(device: &Device, layout: &BindGroupLayout, texture: &Texture, sampler: &Sampler, extra: &Buffer, clouds: &Texture, cloud_sampler: &Sampler) -> BindGroup {
         let view = texture.create_view(&TextureViewDescriptor::default());
+        let cloud_view = clouds.create_view(&TextureViewDescriptor::default());
         device.create_bind_group(&BindGroupDescriptor {
             label: Some("sky_bg"),
             layout,
@@ -275,6 +385,8 @@ impl Sky {
                 BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&view) },
                 BindGroupEntry { binding: 1, resource: BindingResource::Sampler(sampler) },
                 BindGroupEntry { binding: 2, resource: extra.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&cloud_view) },
+                BindGroupEntry { binding: 4, resource: BindingResource::Sampler(cloud_sampler) },
             ],
         })
     }
@@ -293,13 +405,28 @@ impl Sky {
                 usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer);
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &self.cloud_texture, &self.cloud_sampler);
         }
         write_panorama(queue, &self.texture, pano);
+        let new_field = match (&snap.cloud_field, &self.clouds) {
+            (Some(f), Some(c)) => !std::sync::Arc::ptr_eq(f, &c.field),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if new_field {
+            self.cloud_texture = cloud_texture(device, queue, snap.cloud_field.as_deref());
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &self.cloud_texture, &self.cloud_sampler);
+        }
+        self.clouds = match (snap.clouds, &snap.cloud_field) {
+            (Some(frame), Some(field)) => Some(SkyClouds { field: field.clone(), frame: frame.at(seconds as f64), sun_clear: snap.light_clear }),
+            _ => None,
+        };
         self.irradiance = snap.irradiance;
         self.sun = snap.light;
-        self.reflection = Some(ReflectionSky { pano: snap.panorama_engine(), rotation_deg: 0.0, intensity: 1.0 });
+        self.reflection = Some(ReflectionSky { pano: snap.reflection_engine(), rotation_deg: 0.0, intensity: 1.0 });
         self.extra = SkyExtra::from_snapshot(snap, seconds, zenith_depth);
+        self.extra.set_clouds(self.clouds.as_ref().map(|c| &c.frame));
+        self.dim_sun_by_clouds();
         queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
     }
 
@@ -307,7 +434,20 @@ impl Sky {
         if self.extra.mode[0] > 0.5 {
             self.extra.mode[2] = seconds;
             queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra.mode));
+            if let Some(c) = self.clouds.as_mut() {
+                c.frame = c.frame.at(seconds as f64);
+                self.extra.set_cloud_offsets(&c.frame);
+                let at = std::mem::offset_of!(SkyExtra, cloud_offset) as u64;
+                queue.write_buffer(&self.extra_buffer, at, bytemuck::cast_slice(&[self.extra.cloud_offset, self.extra.cloud_misc]));
+                self.dim_sun_by_clouds();
+            }
         }
+    }
+
+    fn dim_sun_by_clouds(&mut self) {
+        let Some(c) = &self.clouds else { return };
+        let through = c.frame.light_transmittance(&c.field, [0.0, 0.0]);
+        self.sun = c.sun_clear.map(|l| SkySun { light_rgb: l.light_rgb.map(|v| v * through), ..l });
     }
 
     pub fn none(device: &Device, queue: &Queue, layout: &BindGroupLayout, ambient: f32) -> Self {
@@ -358,6 +498,8 @@ fn write_panorama(queue: &Queue, texture: &Texture, pano: &Panorama) {
 
 pub struct SkyPipeline {
     pub pipeline: RenderPipeline,
+
+    pub clouded: RenderPipeline,
     pub layout: BindGroupLayout,
 }
 
@@ -389,10 +531,6 @@ impl SkyPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("sky_shader"),
-            source: ShaderSource::Wgsl(view.shader(sky_shader()).into()),
-        });
         let layout = sky_bind_group_layout(device);
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("sky_layout"),
@@ -400,8 +538,13 @@ impl SkyPipeline {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("sky_pipeline"),
+        let build = |label: &str, src: String| {
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some(label),
+            source: ShaderSource::Wgsl(view.shader(src).into()),
+        });
+        device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some(label),
             layout: Some(&pipeline_layout),
             vertex: VertexState {
                 module: &shader,
@@ -438,9 +581,15 @@ impl SkyPipeline {
             multisample: MultisampleState { count: samples, ..Default::default() },
             multiview_mask: view.mask(),
             cache: None,
-        });
+        })
+        };
+        let pipeline = build("sky_pipeline", sky_shader());
+        let clouded = build("sky_clouds_pipeline", sky_cloud_shader());
+        Self { pipeline, clouded, layout }
+    }
 
-        Self { pipeline, layout }
+    pub fn pick(&self, sky: &Sky) -> &RenderPipeline {
+        if sky.has_clouds() { &self.clouded } else { &self.pipeline }
     }
 }
 
@@ -673,6 +822,114 @@ fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
             "return vec4<f32>(tonemap(radiance), 1.0);"
         },
     )
+}
+
+pub fn sky_cloud_shader() -> String {
+    use space_soup_sky::clouds as c;
+    let src = sky_shader();
+    let edits: [(&str, String); 4] = [
+        (
+            "    celestial: array<vec4<f32>, 3>,\n}",
+            "    celestial: array<vec4<f32>, 3>,\n    cloud_scale: vec4<f32>,\n    cloud_offset: vec4<f32>,\n    cloud_misc: vec4<f32>,\n    cloud_light_dir: vec4<f32>,\n    cloud_light: vec4<f32>,\n    cloud_sky: vec4<f32>,\n    cloud_ground: vec4<f32>,\n}".to_string(),
+        ),
+        (
+            "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n",
+            "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n@group(1) @binding(3) var cloud_tex: texture_2d<f32>;\n@group(1) @binding(4) var cloud_samp: sampler;\n".to_string(),
+        ),
+        (
+            "@fragment fn fs_main(",
+            format!(
+                r#"const CLOUD_EARTH: f32 = {earth:.1};
+const CLOUD_EROSION: f32 = {erosion:?};
+const CLOUD_MAX_SLANT: f32 = {slant:?};
+const CLOUD_TAP_REACH: f32 = {reach:?};
+const CLOUD_MIN_LIGHT_Y: f32 = {min_ly:?};
+const CLOUD_OCT_A: f32 = {oa:?};
+const CLOUD_OCT_B: f32 = {ob:?};
+const CLOUD_OCT_C: f32 = {oc:?};
+const CLOUD_FORWARD_G: f32 = {fg:?};
+const CLOUD_BACK_G: f32 = {bg:?};
+const CLOUD_BACK_SHARE: f32 = {bs:?};
+const CLOUD_DIFFUSE_K: f32 = {dk:?};
+const CLOUD_HAZE: f32 = {haze:e};
+
+fn cloud_hg(g: f32, c: f32) -> f32 {{
+    let g2 = g * g;
+    return (1.0 - g2) / (4.0 * SKY_PI * pow(max(1.0 + g2 - 2.0 * g * c, 1e-6), 1.5));
+}}
+
+fn cloud_phase(s: f32, c: f32) -> f32 {{
+    return (1.0 - CLOUD_BACK_SHARE) * cloud_hg(CLOUD_FORWARD_G * s, c) + CLOUD_BACK_SHARE * cloud_hg(CLOUD_BACK_G * s, c);
+}}
+
+fn cloud_density(xz: vec2<f32>) -> f32 {{
+    let cover = sky_extra.cloud_scale.w;
+    let a = textureSample(cloud_tex, cloud_samp, xz * sky_extra.cloud_scale.x + sky_extra.cloud_offset.xy).r;
+    let b = textureSample(cloud_tex, cloud_samp, xz * sky_extra.cloud_scale.y + sky_extra.cloud_offset.zw).g;
+    let detail = textureSample(cloud_tex, cloud_samp, xz * sky_extra.cloud_scale.z + sky_extra.cloud_misc.xy).b;
+    let s = 0.5 * (a + b);
+    let base = select(1.0 - 2.0 * (1.0 - s) * (1.0 - s), 2.0 * s * s, s < 0.5);
+    let d = clamp((base - (1.0 - cover)) / max(cover, 1e-4), 0.0, 1.0);
+    return d * (1.0 - CLOUD_EROSION * detail * (1.0 - d));
+}}
+
+fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
+    let mu = max(dir.y, 1e-4);
+    let h = sky_extra.cloud_misc.w;
+    let cc = h * (2.0 * CLOUD_EARTH + h);
+    let rm = CLOUD_EARTH * mu;
+    let t = cc / (sqrt(rm * rm + cc) + rm);
+    let eye = to_world_space(cam_pos());
+    let xz = eye.xz + dir.xz * t;
+    let sigma = sky_extra.cloud_misc.z;
+    let d = cloud_density(xz);
+    let tau_v = sigma * d * min(1.0 / mu, CLOUD_MAX_SLANT);
+    let l = sky_extra.cloud_light_dir.xyz;
+    let ly = max(l.y, CLOUD_MIN_LIGHT_Y);
+    let thick = sky_extra.cloud_light_dir.w;
+    let off = l.xz / ly * (0.5 * thick);
+    let tap = off * min(1.0, CLOUD_TAP_REACH * thick / max(length(off), 1e-6));
+    let tau_l = sigma * cloud_density(xz + tap) * min(0.5 / ly, CLOUD_MAX_SLANT);
+    let cv = dot(dir, l);
+    let oct = cloud_phase(1.0, cv) * exp(-tau_l)
+        + CLOUD_OCT_A * cloud_phase(CLOUD_OCT_C, cv) * exp(-CLOUD_OCT_B * tau_l)
+        + CLOUD_OCT_A * CLOUD_OCT_A * cloud_phase(CLOUD_OCT_C * CLOUD_OCT_C, cv) * exp(-CLOUD_OCT_B * CLOUD_OCT_B * tau_l);
+    let td_l = 1.0 / (1.0 + CLOUD_DIFFUSE_K * tau_l);
+    let td_c = 1.0 / (1.0 + CLOUD_DIFFUSE_K * sigma * d);
+    let light = sky_extra.cloud_light.rgb * (max(l.y, 0.0) * td_l / SKY_PI + oct)
+        + sky_extra.cloud_sky.rgb * td_c + sky_extra.cloud_ground.rgb * (1.0 - td_c);
+    let alpha = (1.0 - exp(-tau_v)) * select(0.0, 1.0, dir.y > 0.0);
+    let a = alpha * exp(-t * CLOUD_HAZE);
+    return vec4<f32>(sky * (1.0 - a) + a * light, 1.0 - alpha);
+}}
+
+@fragment fn fs_main("#,
+                earth = c::EARTH_RADIUS_M,
+                erosion = c::EROSION,
+                slant = c::MAX_SLANT,
+                reach = c::LIGHT_TAP_REACH,
+                min_ly = c::MIN_LIGHT_Y,
+                oa = c::OCTAVE_A,
+                ob = c::OCTAVE_B,
+                oc = c::OCTAVE_C,
+                fg = c::PHASE_FORWARD_G,
+                bg = c::PHASE_BACK_G,
+                bs = c::PHASE_BACK_SHARE,
+                dk = 0.75 * (1.0 - c::DIFFUSE_G),
+                haze = c::HAZE_PER_M,
+            ),
+        ),
+        (
+            "        radiance = radiance * sky_extra.mode.y + sky_sun_disc(world_dir, px);\n        let moon = sky_moon(world_dir, px);\n        radiance = radiance + moon.rgb;\n        if (sky_extra.mode.w > 0.5 && world_dir.y > 0.0) {\n            radiance = radiance + sky_stars(world_dir, px) * (1.0 - moon.a);\n        }",
+            "        let cloud = sky_clouds(world_dir, radiance * sky_extra.mode.y);\n        radiance = cloud.rgb + sky_sun_disc(world_dir, px) * cloud.a;\n        let moon = sky_moon(world_dir, px);\n        radiance = radiance + moon.rgb * cloud.a;\n        if (sky_extra.mode.w > 0.5 && world_dir.y > 0.0) {\n            radiance = radiance + sky_stars(world_dir, px) * (1.0 - moon.a) * cloud.a;\n        }".to_string(),
+        ),
+    ];
+    let mut out = src;
+    for (from, to) in edits {
+        assert_eq!(out.matches(from).count(), 1, "sky_cloud_shader: the sky shader no longer holds `{}`", from.lines().next().unwrap_or(""));
+        out = out.replacen(from, &to, 1);
+    }
+    out
 }
 
 pub const STAR_CELLS: f32 = 160.0;
@@ -1010,6 +1267,17 @@ mod render_tests {
         post: PostUpload,
         make_sky: impl FnOnce(&Device, &Queue, &BindGroupLayout) -> Sky,
     ) -> Option<[u8; 4]> {
+        render_centre_with(dir, yaw, fov, post, make_sky, false)
+    }
+
+    fn render_centre_with(
+        dir: [f32; 3],
+        yaw: f32,
+        fov: f32,
+        post: PostUpload,
+        make_sky: impl FnOnce(&Device, &Queue, &BindGroupLayout) -> Sky,
+        force_cloud_twin: bool,
+    ) -> Option<[u8; 4]> {
         let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
         let format = TextureFormat::Rgba8Unorm;
 
@@ -1082,7 +1350,7 @@ mod render_tests {
                 multiview_mask: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_pipeline(if force_cloud_twin { &pipeline.clouded } else { pipeline.pick(&sky) });
             pass.set_bind_group(0, &uniforms.bind_group, &[]);
             pass.set_bind_group(1, &sky.bind_group, &[]);
             pass.draw(0..3, 0..1);
@@ -1303,6 +1571,86 @@ mod render_tests {
         assert!(sky[0].max(sky[1]).max(sky[2]) < 10, "the sky beside the moon is lit: {sky:?}");
     }
 
+    fn cloud_snapshot(coverage: f32) -> (SkySnapshot, [f32; 3]) {
+        let clouds = space_soup_sky::clouds::CloudParams { coverage, ..Default::default() };
+        let tod = TimeOfDaySky::new(TimeOfDayParams { start_hour: 13.0, clouds, ..Default::default() });
+        let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
+        (tod.snapshot(13.0, 0.0), zenith)
+    }
+
+    fn snap_px(dir: [f32; 3], snap: &SkySnapshot, zenith: [f32; 3], fov: f32, post: PostUpload, twin: bool) -> Option<[u8; 4]> {
+        let snap = snap.clone();
+        render_centre_with(dir, 0.0, fov, post, move |device, queue, layout| {
+            let mut sky = Sky::none(device, queue, layout, AMBIENT);
+            sky.apply_snapshot(device, queue, layout, &snap, 0.0, zenith);
+            sky
+        }, twin)
+    }
+
+    #[test]
+    fn the_cloud_twin_with_no_clouds_draws_the_clear_skys_pixels() {
+        let (clear, zenith) = cloud_snapshot(0.0);
+        for dir in [[0.0, 1.0, 0.0], [0.6, 0.3, 0.2], [-0.2, 0.05, 1.0], [0.0, -0.5, 1.0]] {
+            let post = PostUpload { exposure: 4.0, ..Default::default() };
+            let a = shot!(snap_px(dir, &clear, zenith, 0.5, post, false));
+            let b = shot!(snap_px(dir, &clear, zenith, 0.5, post, true));
+            assert_eq!(a, b, "the cloud twin changes a clear sky at {dir:?}");
+        }
+    }
+
+    #[test]
+    fn the_cloud_shader_draws_what_the_cpu_twin_computes() {
+        let (snap, zenith) = cloud_snapshot(0.7);
+        let frame = snap.clouds.expect("clouds in the snapshot").at(0.0);
+        let field = snap.cloud_field.clone().unwrap();
+        let mut clear_snap = snap.clone();
+        clear_snap.clouds = None;
+        clear_snap.cloud_field = None;
+        let pano = ReflectionSky { pano: snap.panorama_engine(), rotation_deg: 0.0, intensity: 1.0 };
+        let linear = |e: f32| PostUpload { exposure: e, tonemap: crate::renderer::tonemap::ToneMapping::None, ..Default::default() };
+        let (mut compared, mut through_cloud) = (0, 0);
+        for i in 0..24 {
+            let a = i as f32 * 0.61;
+            let up = 0.45 + 0.5 * ((i * 7) % 11) as f32 / 11.0;
+            let h = (1.0 - up * up).sqrt();
+            let d = glam::Vec3::new(h * a.cos(), up, h * a.sin()).normalize();
+            if d.dot(glam::Vec3::from(snap.discs.sun_dir)) > 0.995 {
+                continue;
+            }
+            let (guess, tau) = frame.shade(&field, [0.0, 0.0], d.to_array(), pano.radiance(d));
+            let e = 0.6 / guess.iter().cloned().fold(1e-9f32, f32::max);
+            let sky8 = shot!(snap_px(d.to_array(), &clear_snap, zenith, 0.01, linear(e), false));
+            let got = shot!(snap_px(d.to_array(), &snap, zenith, 0.01, linear(e), false));
+            if sky8.iter().take(3).any(|&v| v >= 250) {
+                continue;
+            }
+            let sky_lin = [0, 1, 2].map(|c| sky8[c] as f32 / 255.0 / e);
+            let (want, _) = frame.shade(&field, [0.0, 0.0], d.to_array(), sky_lin);
+            for c in 0..3 {
+                let w = (want[c] * e * 255.0).clamp(0.0, 255.0);
+                assert!((w - got[c] as f32).abs() <= 6.0, "{d:?} channel {c}: CPU {w:.1}, GPU {} (tau {tau:.2})", got[c]);
+            }
+            compared += 1;
+            if tau > 0.5 {
+                through_cloud += 1;
+            }
+        }
+        assert!(compared >= 12, "only {compared} directions compared");
+        assert!(through_cloud >= 3, "only {through_cloud} of them looked through cloud");
+    }
+
+    #[test]
+    fn an_overcast_noon_zenith_is_grey_not_blue() {
+        let (clear, zenith) = cloud_snapshot(0.0);
+        let (over, _) = cloud_snapshot(1.0);
+        let post = PostUpload { exposure: 4.0, ..Default::default() };
+        let blue = shot!(snap_px([0.0, 1.0, 0.0], &clear, zenith, 0.5, post, false));
+        let grey = shot!(snap_px([0.0, 1.0, 0.0], &over, zenith, 0.5, post, false));
+        let tint = |p: [u8; 4]| p[2] as f32 - p[0] as f32;
+        assert!(tint(blue) > 30.0, "the clear zenith is not blue: {blue:?}");
+        assert!(tint(grey) < 0.4 * tint(blue), "the overcast zenith stays blue: {grey:?} vs {blue:?}");
+    }
+
     #[test]
     fn the_pipeline_validates_multisampled_too() {
 
@@ -1326,4 +1674,15 @@ mod render_tests {
 #[cfg(test)]
 pub fn sky_shader_src() -> String {
     sky_shader()
+}
+
+#[cfg(test)]
+mod cloud_size_tests {
+    #[test]
+    fn the_cloud_twin_stays_small() {
+        let clear: usize = crate::renderer::shader_inlining::inlined_sizes(&super::sky_shader(), "fs_main").iter().map(|r| r.own * r.copies).sum();
+        let clouded: usize = crate::renderer::shader_inlining::inlined_sizes(&super::sky_cloud_shader(), "fs_main").iter().map(|r| r.own * r.copies).sum();
+        eprintln!("sky fs_main by the proxy: clear {clear}, with clouds {clouded}");
+        assert!(clouded < clear + 400, "the cloud code adds {} (283 when written, 2026-10-19)", clouded - clear);
+    }
 }

@@ -34,6 +34,7 @@ check for others: list every string literal in the code that contains `//`.
 | [water.md](water.md) | Planar mirror, wake, rings and drops, the waterline twin, the mud twins, the sea shelf and lip |
 | [effects.md](effects.md) | Effects as data, variants and their markers, motion twins, the governor, mist and fog slabs, splashes |
 | [lighting-and-reflections.md](lighting-and-reflections.md) | Torch pools, opaque twins, the body prepass, character cards, grab glow, the FPS readout |
+| [sky-and-clouds.md](sky-and-clouds.md) | The simulated sky, the cloud layer, its CPU twin and shader twin, the per-frame sun dimming |
 | [caves.md](caves.md) | Cave twins, the baked cave shader, cave chunk culling |
 | [porting-across-the-comment-strip.md](porting-across-the-comment-strip.md) | How engine-foundations was merged onto main after the strip, and how to repeat it |
 

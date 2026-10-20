@@ -1037,7 +1037,7 @@ impl Renderer {
             }
 
             if let Some(sky) = self.sky_dome.as_ref().filter(|_| self.sky_visible) {
-                pass.set_pipeline(&self.sky_pipeline.pipeline);
+                pass.set_pipeline(self.sky_pipeline.pick(sky));
                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                 pass.set_bind_group(1, &sky.bind_group, &[]);
                 pass.draw(0..3, 0..1);
