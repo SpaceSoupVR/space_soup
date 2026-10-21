@@ -1398,6 +1398,14 @@ pub const SEAL_BRUSH_CRACKS: bool = true;
 
 pub const CRACK_SEAL_COLOUR: [f32; 3] = [0.02, 0.02, 0.05];
 
+/// THE SEAL NEVER TIES A FACE. Behind a convex edge whose other face is turned
+/// away, the seal draws that face's back over the same pixels at all but the
+/// front face's depth, and rounding let it win in dots along the edge: grey
+/// specks down door jambs and building corners, more on the headset than on a
+/// desktop GPU (2026-10-20). Pushed back, it still fills a real crack, where
+/// only open space lies in front of it.
+pub const SEAL_DEPTH_BIAS: DepthBiasState = DepthBiasState { constant: 16, slope_scale: 2.0, clamp: 0.0 };
+
 pub struct BrushSealPipeline {
     pub pipeline: RenderPipeline,
 }
@@ -1423,6 +1431,13 @@ impl BrushSealPipeline {
         Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Stereo)
     }
 
+    /// The seal in `colour` instead of `CRACK_SEAL_COLOUR`: one no shading
+    /// can produce (magenta) makes every crack in the brushes countable in a
+    /// frame, since only a hole in the surface shows the seal (2026-10-20).
+    pub fn new_coloured(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout, samples: u32, colour: [f32; 3]) -> Self {
+        Self::build(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Mono, brush_seal_shader_in(colour))
+    }
+
     fn new_with_view(
         device: &Device,
         format: TextureFormat,
@@ -1430,9 +1445,20 @@ impl BrushSealPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
+        Self::build(device, format, uniform_layout, samples, view, brush_seal_shader())
+    }
+
+    fn build(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        source: String,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("brush_seal_shader"),
-            source: ShaderSource::Wgsl(view.shader(brush_seal_shader()).into()),
+            source: ShaderSource::Wgsl(view.shader(source).into()),
         });
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("brush_seal_layout"),
@@ -1468,7 +1494,7 @@ impl BrushSealPipeline {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(CompareFunction::Less),
                 stencil: StencilState::default(),
-                bias: DepthBiasState::default(),
+                bias: SEAL_DEPTH_BIAS,
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
             multiview_mask: view.mask(),
@@ -1479,7 +1505,10 @@ impl BrushSealPipeline {
 }
 
 fn brush_seal_shader() -> String {
-    let [r, g, b] = CRACK_SEAL_COLOUR;
+    brush_seal_shader_in(CRACK_SEAL_COLOUR)
+}
+
+fn brush_seal_shader_in([r, g, b]: [f32; 3]) -> String {
     let src = brush_seal_shader_posed(r, g, b);
     if WORLD_BRUSHES.load(std::sync::atomic::Ordering::Relaxed) {
         debug_assert_eq!(src.matches(POSED_SEAL_VERTEX).count(), 1);
@@ -1493,7 +1522,7 @@ fn brush_seal_shader_posed(r: f32, g: f32, b: f32) -> String {
         r#"
 {lights_block}
 
-@vertex fn vs_main(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {{
+@vertex fn vs_main(@location(0) pos: vec3<f32>) -> @builtin(position) @invariant vec4<f32> {{
     return cam_view_proj() * vec4<f32>(pos, 1.0);
 }}
 
@@ -3209,7 +3238,7 @@ struct VIn {{
     @location(6) uv2: vec2<f32>,
 }}
 struct VOut {{
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) world_pos: vec3<f32>,
 }}
@@ -5892,6 +5921,19 @@ mod crack_seal_tests {
             return;
         };
         assert_eq!(px, [255, 255, 255, 255], "a back face behind the wall showed through: {px:?}");
+    }
+
+    /// A BACK FACE A HAIR IN FRONT OF THE WALL STILL LOSES: where a face meets
+    /// its turned-away neighbour, the two depths differ only by rounding, and
+    /// the unbiased seal won in dots down every such edge (`SEAL_DEPTH_BIAS`,
+    /// 2026-10-20). Fails with the bias at zero.
+    #[test]
+    fn a_back_face_within_rounding_of_the_wall_stays_hidden() {
+        let Some(px) = render_seal(true, 0.5, 0.5 + 4e-7) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        assert_eq!(px, [255, 255, 255, 255], "the seal won a tie with the wall: {px:?}");
     }
 }
 

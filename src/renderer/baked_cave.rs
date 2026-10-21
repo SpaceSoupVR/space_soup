@@ -368,7 +368,7 @@ fn material_struct() -> String {
 }
 
 const ONE_VERTEX: &str = r#"struct VOut {
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
 
     @location(1) world_pos: vec3<f32>,
@@ -454,7 +454,7 @@ const ONE_LAYERS: &str = r#"    // The layers, each read ONCE, on the triangle's
 "#;
 
 const OWN_VERTEX: &str = r#"struct VOut {
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
 
     @location(1) world_pos: vec3<f32>,
@@ -544,7 +544,7 @@ const OWN_LAYERS_TAIL: &str = r#"    bent = normalize(select(nw, bent, dot(bent,
 "#;
 
 const CLIFF_VERTEX: &str = r#"struct VOut {
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
 
     @location(1) world_pos: vec3<f32>,
@@ -851,7 +851,7 @@ fn occluder_shader() -> String {
 struct ModelUniform {{ model: mat4x4<f32> }}
 @group(2) @binding(0) var<uniform> model_u: ModelUniform;
 {lights_block}
-@vertex fn vs_main(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {{
+@vertex fn vs_main(@location(0) pos: vec3<f32>) -> @builtin(position) @invariant vec4<f32> {{
     return cam_view_proj() * (model_u.model * vec4<f32>(pos, 1.0));
 }}
 @fragment fn fs_depth() {{}}

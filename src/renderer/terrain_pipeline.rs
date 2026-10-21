@@ -1321,7 +1321,7 @@ fn mud_weight_f(w: vec4<f32>) -> f32 {{
 
 struct VIn  {{ @location(0) pos: vec3<f32>, @location(1) norm: vec3<f32>, @location(2) col: vec4<f32>, @location(3) uv2: vec2<f32> }}
 struct VOut {{
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) col: vec4<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) world_pos: vec3<f32>,

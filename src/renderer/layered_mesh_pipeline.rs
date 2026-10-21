@@ -237,7 +237,7 @@ struct VIn {{
 }}
 
 struct VOut {{
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
 
     @location(1) world_pos: vec3<f32>,

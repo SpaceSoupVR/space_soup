@@ -1201,7 +1201,7 @@ struct VIn {{
     @location(1) depth: f32,
 }}
 struct VOut {{
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position) @invariant clip: vec4<f32>,
 
     @location(0) world_pos: vec3<f32>,
 
