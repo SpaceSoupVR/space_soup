@@ -101,6 +101,7 @@ pub struct Renderer {
     water_seconds: f64,
     ground: Option<DesktopGround>,
     ground_dirty: bool,
+    effects: Option<super::desktop_effects::DesktopEffects>,
 }
 
 impl Renderer {
@@ -179,11 +180,48 @@ impl Renderer {
             water_seconds: 0.0,
             ground: None,
             ground_dirty: false,
+            effects: None,
         }
     }
 
     pub fn set_particles(&mut self, items: Vec<super::particle_pipeline::ParticleInstance>) {
         self.particles = items;
+    }
+
+    fn effects_made(&mut self) -> &mut super::desktop_effects::DesktopEffects {
+        let (device, queue, format, layout) = (&self.device, &self.queue, self.format, &self.uniform_buf.layout);
+        self.effects.get_or_insert_with(|| super::desktop_effects::DesktopEffects::new(device, queue, format, layout))
+    }
+
+    /// The scene's effect emitters, in world space, as the headset is given
+    /// them. The effects pipelines are made on the first that is not empty.
+    pub fn set_effects(&mut self, emitters: Vec<super::effects::EffectEmitter>) {
+        if emitters.is_empty() && self.effects.is_none() {
+            return;
+        }
+        self.effects_made().set_emitters(emitters);
+    }
+
+    pub fn set_effect_library(&mut self, library: super::effects::stack::EffectLibrary) {
+        if library.is_empty() && self.effects.is_none() {
+            return;
+        }
+        self.effects_made().set_library(library);
+    }
+
+    /// The scene's placed effect assets; call after `set_effect_library`.
+    pub fn place_effects(&mut self, placed: &[super::effects::stack::PlacedEffect]) {
+        if placed.is_empty() && self.effects.is_none() {
+            return;
+        }
+        self.effects_made().place(placed);
+    }
+
+    /// The effects' clock in seconds, and the hour of day the mist reads.
+    pub fn set_effects_time(&mut self, seconds: f64, hour: Option<f32>) {
+        if let Some(fx) = self.effects.as_mut() {
+            (fx.seconds, fx.hour) = (seconds, hour);
+        }
     }
 
     pub fn set_ground(&mut self, ground: Option<DesktopGround>) {
@@ -594,6 +632,9 @@ impl Renderer {
         let (t, v) = Self::make_depth(&self.device, width, height);
         self.depth_texture = t;
         self.depth_view = v;
+        if let Some(fx) = self.effects.as_mut() {
+            fx.depth_moved();
+        }
     }
 
     pub fn render(&mut self, target_view: &TextureView, camera: &Camera, cuboids: &[Cuboid]) {
@@ -769,6 +810,16 @@ impl Renderer {
         self.uniform_buf.upload_scene(
             &self.queue, vp, camera.position, &shadow, &sky, &self.post, &uniforms::PlayerUpload::default(),
         );
+
+        let effects_drawn = match self.effects.as_mut() {
+            Some(fx) => {
+                // The open sky's light, as the headset's effects take it outdoors.
+                let dc = sky.sh[0];
+                let ambient = glam::Vec3::new(dc[0], dc[1], dc[2]) * (0.282_095 * sky.intensity);
+                fx.simulate(&self.device, &self.queue, camera, self.height, lights, ambient, self.post.exposure)
+            }
+            None => false,
+        };
 
         let ((solid_verts, solid_indices, solid_ranges), (mut wire_verts, mut wire_indices)) =
             self.bake_cuboids(cuboids);
@@ -1051,6 +1102,44 @@ impl Renderer {
                 pass.draw(0..3, 0..1);
             }
             self.particle_pipeline.draw(&mut pass, &self.uniform_buf.bind_group);
+        }
+
+        if let (true, Some(fx)) = (effects_drawn, self.effects.as_mut()) {
+            // Depth is held read-only so the shader can read it for soft edges.
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("effects_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            fx.draw(&self.device, &mut pass, &self.uniform_buf.bind_group, &self.depth_texture);
+        }
+
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("overlay_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(Operations { load: LoadOp::Load, store: StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
 
             if !overlay_verts.is_empty() {
                 pass.set_pipeline(&self.overlay_pipeline.pipeline);

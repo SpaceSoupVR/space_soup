@@ -2,6 +2,7 @@ pub mod brush_pipeline;
 pub mod camera;
 pub mod character_cards;
 pub mod cuboid;
+mod desktop_effects;
 mod desktop_renderer;
 pub mod mud_map;
 pub mod icon;
