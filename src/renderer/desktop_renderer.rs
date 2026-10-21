@@ -191,6 +191,14 @@ impl Renderer {
         self.ground_dirty = true;
     }
 
+    /// The ground's heights alone, after a sculpt: its look stays as it was.
+    pub fn set_ground_heights(&mut self, heights: ground_map::HeightGrid) {
+        if let Some(g) = self.ground.as_mut() {
+            g.heights = heights;
+            self.ground_dirty = true;
+        }
+    }
+
     pub fn set_water(&mut self, bodies: &[(Vec<WaterVertex>, Vec<u32>, WaterUniform, WaveParams)]) {
         self.ground_dirty = true;
         if bodies.is_empty() {
