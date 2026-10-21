@@ -238,6 +238,12 @@ pub struct StaticSunShadow {
     pub signature: ((usize, usize), (usize, usize), [u32; 3]),
 
     pub world_view_proj: glam::Mat4,
+
+    /// The level's world bounds the map is fitted to (`static_sun_bounds`),
+    /// kept while the geometry is: they do not depend on the sun, and
+    /// walking every vertex again at each of the clock's steps took the
+    /// render thread's time once a second.
+    pub bounds: (Vec3, Vec3),
 }
 
 pub const STATIC_SUN_MARGIN: f32 = 0.5;
@@ -248,6 +254,15 @@ pub fn static_sun_matrix(
     ground: Option<impl Iterator<Item = [f32; 3]>>,
     player_to_world: glam::Mat4,
 ) -> glam::Mat4 {
+    static_sun_matrix_in(world_dir, static_sun_bounds(brushes, ground, player_to_world))
+}
+
+/// The world bounds `static_sun_matrix` fits its map to.
+pub fn static_sun_bounds(
+    brushes: Option<impl Iterator<Item = [f32; 3]>>,
+    ground: Option<impl Iterator<Item = [f32; 3]>>,
+    player_to_world: glam::Mat4,
+) -> (Vec3, Vec3) {
     let bounds = |points: &mut dyn Iterator<Item = [f32; 3]>| {
         let mut lo = Vec3::splat(f32::INFINITY);
         let mut hi = Vec3::splat(f32::NEG_INFINITY);
@@ -261,7 +276,11 @@ pub fn static_sun_matrix(
     let found = brushes
         .and_then(|mut b| bounds(&mut b))
         .or_else(|| ground.and_then(|mut g| bounds(&mut g)));
-    let (lo, hi) = found.unwrap_or((Vec3::splat(-10.0), Vec3::splat(10.0)));
+    found.unwrap_or((Vec3::splat(-10.0), Vec3::splat(10.0)))
+}
+
+/// The static sun map along `world_dir` over world bounds `(lo, hi)`.
+pub fn static_sun_matrix_in(world_dir: Vec3, (lo, hi): (Vec3, Vec3)) -> glam::Mat4 {
     let centre = (lo + hi) * 0.5;
     let radius = (hi - lo).length() * 0.5 * (1.0 + STATIC_SUN_MARGIN) + 1.0;
     crate::renderer::shadow::directional_light_matrix(world_dir, centre, radius)
@@ -692,6 +711,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let character_card_sets = super::proxy_cards::CHARACTER_CARD_SETS;
     let character_card_rows = 2 * character_card_sets;
     let room_exposure_rooms = crate::renderer::uniforms::ROOM_EXPOSURE_ROOMS;
+    let room_reach_pixels = crate::renderer::exposure::ROOM_REACH_PIXELS;
     let room_exposure_rows = 2 * room_exposure_rooms;
     let room_near = 1.5f32;
     let character_card_max_lod = (super::character_cards::CARD_MIPS - 1) as f32;
@@ -877,8 +897,13 @@ fn to_player_space(w: vec3<f32>) -> vec3<f32> {{
 // (`uniforms::RoomExposure`), so a lit hall seen from the night stays
 // readable while the night stays night. Rows come in pairs, (min, factor)
 // and (max, band); a factor of 0 is an empty row. Asked per pixel, and only
-// where a vertex was near a box (`room_near`).
-fn room_local_exposure(p: vec3<f32>) -> f32 {{
+// where a vertex was near a box (`room_near`). `reach`: how far past its
+// triangle an MSAA edge sample may be shaded, which counts as inside -- a
+// sliver seen edge-on carried its samples tens of centimetres out of the
+// room and drew a white line at night (2026-10-20).
+const ROOM_REACH_PIXELS: f32 = {room_reach_pixels:?};
+
+fn room_local_exposure(p: vec3<f32>, reach: f32) -> f32 {{
     var e = 1.0;
     for (var i = 0u; i < {room_exposure_rooms}u; i = i + 1u) {{
         let lo = camera.room_exposure[2u * i];
@@ -886,7 +911,7 @@ fn room_local_exposure(p: vec3<f32>) -> f32 {{
         if (lo.w <= 0.0) {{
             break;
         }}
-        let inside = min(min(min(p.x - lo.x, hi.x - p.x), min(p.y - lo.y, hi.y - p.y)), min(p.z - lo.z, hi.z - p.z));
+        let inside = min(min(min(p.x - lo.x, hi.x - p.x), min(p.y - lo.y, hi.y - p.y)), min(p.z - lo.z, hi.z - p.z)) + reach;
         e = min(e, pow(lo.w, clamp((inside + hi.w) / max(hi.w, 1e-3), 0.0, 1.0)));
     }}
     return e;

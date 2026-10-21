@@ -47,6 +47,19 @@ pub const ROOM_SEEN_BRIGHTER: f32 = 2.5;
 /// How far outside a room's or doorway's box its adaptation fades out,
 /// metres: per pixel, so the edge is the opening's outline.
 pub const ROOM_EXPOSURE_BAND: f32 = 0.05;
+/// How far past a room's or doorway's box its adaptation holds whole before
+/// the band, metres. An MSAA edge pixel is shaded where the triangle's
+/// values carry it, past the polygon: a corner's fell a centimetre or two
+/// outside the box, half into the band, and at night -- the eye exposed a
+/// hundred times the room -- drew white lines down every seam until the
+/// player walked in (headset, 2026-10-20 19:26). Rooms only, and it stays
+/// inside any wall, so a room's outer face keeps the eye's exposure.
+pub const ROOM_EXPOSURE_MARGIN: f32 = 0.1;
+/// Pixels of the surface's own footprint a fragment counts as inside a box
+/// by (`room_local_exposure`'s `reach`): an MSAA edge sample is shaded up to
+/// most of a pixel past its triangle, far past the margin on a sliver seen
+/// edge-on. On the headset a box's outline moves by at most this much.
+pub const ROOM_REACH_PIXELS: f32 = 0.75;
 
 const CENTRE_WEIGHT_FLOOR: f32 = 0.1;
 const CENTRE_WEIGHT_POWER: f32 = 4.0;
@@ -226,7 +239,11 @@ impl EyeAdaptation {
         let factor = |r: &ClosedRoom| (ROOM_SEEN_BRIGHTER * exposure_for_up_to(r.luminance, self.max_exposure) / exposure).clamp(1e-6, 1.0);
         // Each room, then its doorways: a doorway's jamb is lit by the room
         // and belongs to its adaptation, or it drew white round the opening.
-        let mut boxes: Vec<(Vec3, Vec3, f32)> = rooms.iter().map(|r| (r.min, r.max, factor(r))).collect();
+        // A room's box grows by the margin: its walls' outer faces lie a wall
+        // away. A doorway's does not: the outer wall round the opening lies
+        // in its front face's plane, and grew a black frame round the door.
+        let m = Vec3::splat(ROOM_EXPOSURE_MARGIN);
+        let mut boxes: Vec<(Vec3, Vec3, f32)> = rooms.iter().map(|r| (r.min - m, r.max + m, factor(r))).collect();
         for p in &self.portals {
             let inside = rooms.iter().find(|r| r.room == p.low || r.room == p.high);
             let both = rooms.iter().filter(|r| r.room == p.low || r.room == p.high).count() == 2;

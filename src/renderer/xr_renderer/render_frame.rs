@@ -182,6 +182,9 @@ impl XrRenderer {
         let image_index = self.swapchain.acquire_image()? as usize;
         self.swapchain.wait_image(xr::Duration::INFINITE)?;
         let cpu_start = std::time::Instant::now();
+        // Each submit's time, logged for a frame far over budget: the window
+        // averages hid the hangs the headset showed (user, 2026-10-20).
+        let mut laps: Vec<(u32, std::time::Instant)> = Vec::with_capacity(8);
 
         let (view_flags, mut eye_views) =
             session.locate_views(xr::ViewConfigurationType::PRIMARY_STEREO, time, stage)?;
@@ -1140,8 +1143,11 @@ impl XrRenderer {
             sky_sun.is_some(),
         );
 
+        // The static map is drawn along the snapshot's direction, so once a
+        // snapshot; the light itself glides (`Sky::sun_direct`).
+        let stepped = self.sky.sun_stepped().map(|s| -glam::Vec3::from(s.direction));
         let static_sun = sun.filter(|_| sky_sun.is_some()).map(|l| {
-            let world_dir = glam::Quat::from_rotation_y(self.player.yaw) * l.direction;
+            let world_dir = stepped.unwrap_or(glam::Quat::from_rotation_y(self.player.yaw) * l.direction);
             let signature = (
                 brushes.map(|(v, i)| (v.len(), i.len())).unwrap_or((0, 0)),
                 terrain.map(|(v, i)| (v.len(), i.len())).unwrap_or((0, 0)),
@@ -1149,9 +1155,12 @@ impl XrRenderer {
             );
             let mut cache = self.static_sun_shadow.borrow_mut();
             let stale = cache.as_ref().is_none_or(|c| c.signature != signature);
-            if stale {
-                let world_view_proj = crate::renderer::lights::static_sun_matrix(
-                    world_dir,
+            let kept = cache.as_ref().filter(|c| (c.signature.0, c.signature.1) == (signature.0, signature.1)).map(|c| c.bounds);
+            if let (true, Some(bounds)) = (stale, kept) {
+                let world_view_proj = crate::renderer::lights::static_sun_matrix_in(world_dir, bounds);
+                *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj, bounds });
+            } else if stale {
+                let bounds = crate::renderer::lights::static_sun_bounds(
 
                     brushes.map(|(v, _)| {
                         let world = self.brush_world;
@@ -1164,7 +1173,8 @@ impl XrRenderer {
                     }),
                     player_to_world,
                 );
-                *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj });
+                let world_view_proj = crate::renderer::lights::static_sun_matrix_in(world_dir, bounds);
+                *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj, bounds });
             }
             (cache.as_ref().unwrap().world_view_proj * player_to_world, stale)
         });
@@ -1457,6 +1467,7 @@ impl XrRenderer {
 
             let cull_bounds: &[crate::renderer::shadow::ShadowMeshBound] =
                 if self.levers.shadow_mesh_cull { &shadow_bounds } else { &[] };
+            let record_t0 = std::time::Instant::now();
             if record_sun {
 
                 let sun_chunks: Option<Vec<crate::renderer::shadow::CasterChunk>> = match (static_sun.is_some() && ground_selected, terrain_range, self.ground_lod.borrow_mut().as_mut()) {
@@ -1502,7 +1513,8 @@ impl XrRenderer {
                     shadow.sun_view_proj,
                 );
                 if static_sun.is_some() {
-                    log::info!("SUNSHADOW static map recorded ({drawn} indices)");
+                    let ms = record_t0.elapsed().as_secs_f32() * 1000.0;
+                    log::info!("SUNSHADOW static map recorded ({drawn} indices, {ms:.1} ms cpu)");
                 }
             }
 
@@ -1649,6 +1661,7 @@ impl XrRenderer {
                 );
             }
             self.wgpu_queue.submit(Some(encoder.finish()));
+            laps.push((line!(), std::time::Instant::now()));
         }
 
         let reflective_brushes = self.brush_materials.reflective && brush_geometry.is_some();
@@ -2130,6 +2143,7 @@ impl XrRenderer {
                     }
                 }
                 self.wgpu_queue.submit(Some(encoder.finish()));
+                laps.push((line!(), std::time::Instant::now()));
             }
 
             let planar_eye = planar_body.zip(planar_rects[eye]).map(|(b, rect)| {
@@ -2247,7 +2261,14 @@ impl XrRenderer {
             };
             let resident = match (resident, self.probe_stream.borrow_mut().as_mut()) {
                 (Some(mut upload), Some(stream)) => {
+                    // Relit probe cubes land here every two seconds; timed for the
+                    // hangs the headset showed while the clock ran (2026-10-20).
+                    let t0 = std::time::Instant::now();
                     stream.resolve(&self.wgpu_queue, &mut upload);
+                    let ms = t0.elapsed().as_secs_f32() * 1000.0;
+                    if ms > 2.0 {
+                        log::info!("TODTIME probe uploads {ms:.1} ms");
+                    }
                     Some(upload)
                 }
                 (resident, _) => resident,
@@ -3609,6 +3630,7 @@ impl XrRenderer {
 
                 if stereo && eye == 0 {
                     self.wgpu_queue.submit(Some(encoder.finish()));
+                    laps.push((line!(), std::time::Instant::now()));
                     encoder = self.wgpu_device.create_command_encoder(
                         &wgpu::CommandEncoderDescriptor { label: Some("ssr_eye_after_stereo") },
                     );
@@ -3690,6 +3712,7 @@ impl XrRenderer {
                 }
                 }
                 self.wgpu_queue.submit(Some(encoder.finish()));
+                laps.push((line!(), std::time::Instant::now()));
             }
 
             if let Some(sw) = self.space_warp.as_ref() {
@@ -3868,6 +3891,7 @@ impl XrRenderer {
                         );
                     }
                     self.wgpu_queue.submit(Some(encoder.finish()));
+                    laps.push((line!(), std::time::Instant::now()));
 
                     if self.levers.space_warp_debug & 8192 != 0 && eye == 0 {
                         if let Some(rb) = sw.readback.as_ref() {
@@ -3980,6 +4004,7 @@ impl XrRenderer {
             }
 
             self.wgpu_queue.submit(Some(encoder.finish()));
+            laps.push((line!(), std::time::Instant::now()));
 
         }
 
@@ -4038,6 +4063,15 @@ impl XrRenderer {
         }
 
         let cpu_time = cpu_start.elapsed();
+        if cpu_time.as_secs_f32() > 0.025 {
+            let mut at = cpu_start;
+            let parts: Vec<String> = laps.iter().map(|&(line, t)| {
+                let s = format!("{line}:{:.1}", t.duration_since(at).as_secs_f32() * 1000.0);
+                at = t;
+                s
+            }).collect();
+            log::info!("FRAMESPIKE cpu {:.1} ms, ms up to each submit: {} rest:{:.1}", cpu_time.as_secs_f32() * 1000.0, parts.join(" "), at.elapsed().as_secs_f32() * 1000.0);
+        }
         let gpu_wait_start = std::time::Instant::now();
 
         let wait = if self.levers.gpu_sync {

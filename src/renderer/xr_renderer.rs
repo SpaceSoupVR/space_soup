@@ -583,7 +583,7 @@ pub struct XrRenderer {
 
     ground_dirty: bool,
 
-    ground_load_build: Option<(std::sync::mpsc::Receiver<crate::renderer::ground_map::GroundMap>, std::time::Instant)>,
+    ground_load_build: Option<(std::sync::mpsc::Receiver<crate::renderer::ground_map::PreparedGround>, std::time::Instant)>,
 
     ground_placement: Option<([f32; 4], f32)>,
 
@@ -2767,8 +2767,8 @@ impl XrRenderer {
             self.ground_load_build = self.ground_map_worker("ground_map").map(|rx| (rx, std::time::Instant::now()));
         }
         let Some((rx, started)) = self.ground_load_build.as_ref() else { return };
-        let map = match rx.try_recv() {
-            Ok(map) => map,
+        let ground = match rx.try_recv() {
+            Ok(ground) => ground,
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.ground_load_build = None;
@@ -2777,7 +2777,8 @@ impl XrRenderer {
         };
         let started = *started;
         self.ground_load_build = None;
-        let view = crate::renderer::ground_map::upload(&self.wgpu_device, &self.wgpu_queue, &map);
+        let view = crate::renderer::ground_map::upload_prepared(&self.wgpu_device, &self.wgpu_queue, &ground);
+        let map = &ground.map;
         let extent = map.max - map.min;
         self.ground_placement = Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top));
         self.uniform_buf.set_ground_map(view);

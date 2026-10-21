@@ -3473,8 +3473,9 @@ struct VOut {{
 
 @fragment fn fs_main(in: VOut) -> {fs_return} {{
 
+    let room_reach = ROOM_REACH_PIXELS * max(length(dpdx(in.world_pos)), length(dpdy(in.world_pos)));
     if (in.room_near > 0.0) {{
-        local_exposure = room_local_exposure(to_world_space(in.world_pos));
+        local_exposure = room_local_exposure(to_world_space(in.world_pos), room_reach);
     }}
     pixel_footprint = sqrt(length(dpdx(in.world_pos)) * length(dpdy(in.world_pos)));
     let albedo = textureSample(mat_color, mat_samp, in.uv, i32(in.material));

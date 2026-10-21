@@ -829,8 +829,9 @@ fn vs_main(v: VIn) -> VOut {{
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
+    let room_reach = ROOM_REACH_PIXELS * max(length(dpdx(in.world_pos)), length(dpdy(in.world_pos)));
     if (in.room_near > 0.0) {{
-        local_exposure = room_local_exposure(to_world_space(in.world_pos));
+        local_exposure = room_local_exposure(to_world_space(in.world_pos), room_reach);
     }}
 
     capsule_receiver = false;
@@ -1251,8 +1252,9 @@ fn grab_highlight(c: vec3<f32>, n: vec3<f32>, world_pos: vec3<f32>, k: f32) -> v
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
+    let room_reach = ROOM_REACH_PIXELS * max(length(dpdx(in.world_pos)), length(dpdy(in.world_pos)));
     if (in.room_near > 0.0) {{
-        local_exposure = room_local_exposure(to_world_space(in.world_pos));
+        local_exposure = room_local_exposure(to_world_space(in.world_pos), room_reach);
     }}
     let n = normalize(in.normal);{thin_span}
 

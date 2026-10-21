@@ -36,7 +36,7 @@ pub(super) struct TodState {
     pub last_tick: Option<std::time::Instant>,
 
     pub ground_from: Option<(f32, [f32; 3])>,
-    pub ground_build: Option<mpsc::Receiver<crate::renderer::ground_map::GroundMap>>,
+    pub ground_build: Option<mpsc::Receiver<crate::renderer::ground_map::PreparedGround>>,
 
     pub daylight: f32,
 
@@ -228,14 +228,35 @@ impl XrRenderer {
         // Where the sun, moon and stars are THIS frame (cheap trig): they
         // glide rather than stepping at each snapshot.
         let astro = space_soup_sky::time_of_day::Astronomy::at(&rt.params, rt.hour(), rt.params.days_at(rt.seconds()));
+        let t0 = std::time::Instant::now();
+        let applied = prepared.is_some();
         if let Some(p) = prepared {
             self.apply_time_of_day(p);
         }
+        let t1 = std::time::Instant::now();
         self.sky.tick(&self.wgpu_queue, seconds, dt, Some(&astro));
         // The models' room light follows the blend too (`room_light::relit`).
         let t = self.sky.blend_progress();
         self.tod_relight_rooms(self.tod.daylight_from + (self.tod.daylight - self.tod.daylight_from) * t);
+        let t2 = std::time::Instant::now();
+        let ground = self.tod.ground_build.is_some();
         self.poll_ground_rebuild();
+        let t3 = std::time::Instant::now();
+        // The time of day's share of the render thread, where it is felt:
+        // the headset hung for a tenth of a second every few seconds while
+        // the clock ran (user, 2026-10-20).
+        let ms = |a: std::time::Instant, b: std::time::Instant| b.duration_since(a).as_secs_f32() * 1000.0;
+        if ms(t0, t3) > 3.0 {
+            log::info!(
+                "TODTIME {:.1} ms: apply {:.1}{} tick {:.1} ground {:.1}{}",
+                ms(t0, t3),
+                ms(t0, t1),
+                if applied { "" } else { " (none)" },
+                ms(t1, t2),
+                ms(t2, t3),
+                if ground && self.tod.ground_build.is_none() { " (uploaded)" } else { "" },
+            );
+        }
     }
 
     fn apply_time_of_day(&mut self, p: Prepared) {
@@ -250,12 +271,25 @@ impl XrRenderer {
         } else {
             p.daylight
         };
+        let a0 = std::time::Instant::now();
         self.sky.apply_snapshot_blended(&self.wgpu_device, &self.wgpu_queue, &self.sky_pipeline.layout, &p.snapshot, seconds, zenith, blend);
         self.tod.daylight = p.daylight;
+        let a1 = std::time::Instant::now();
         self.eye.borrow_mut().relight(self.sky.irradiance, p.daylight);
+        let a2 = std::time::Instant::now();
+        let atlas_bytes: usize = p.atlas.as_ref().map_or(0, |c| c.iter().map(|m| m.0.len()).sum());
         if let (Some(chain), Some(lm)) = (p.atlas.as_ref(), self.brush_lightmap.as_ref()) {
             crate::renderer::mesh::write_lightmap_mips(&self.wgpu_queue, &lm.texture, chain);
         }
+        let a3 = std::time::Instant::now();
+        let ms = |a: std::time::Instant, b: std::time::Instant| b.duration_since(a).as_secs_f32() * 1000.0;
+        log::info!(
+            "TODTIME apply: sky {:.1} eye {:.1} atlas {:.1} ms ({} kB)",
+            ms(a0, a1),
+            ms(a1, a2),
+            ms(a2, a3),
+            atlas_bytes / 1024,
+        );
         if self.shadow_diag_frames.get() % 120 == 0 || p.atlas.is_some() {
             log::info!(
                 "TIMEOFDAY {:.3} h: {} up {:.1} deg, daylight x{:.3e}, sky x{:.3e} sun x{:.3e}{}",
@@ -295,7 +329,7 @@ impl XrRenderer {
         self.tod.ground_build = Some(rx);
     }
 
-    pub(super) fn ground_map_worker(&self, name: &str) -> Option<mpsc::Receiver<crate::renderer::ground_map::GroundMap>> {
+    pub(super) fn ground_map_worker(&self, name: &str) -> Option<mpsc::Receiver<crate::renderer::ground_map::PreparedGround>> {
         let h = self.ground_heights.as_ref()?;
         let copy = |i: &crate::renderer::terrain_pipeline::TerrainImage| crate::renderer::terrain_pipeline::TerrainImage {
             width: i.width,
@@ -327,7 +361,7 @@ impl XrRenderer {
                     },
                     crate::renderer::ground_map::GROUND_MAP_SIZE,
                 );
-                let _ = tx.send(map);
+                let _ = tx.send(crate::renderer::ground_map::prepare(map));
             })
             .ok()?;
         Some(rx)
@@ -336,9 +370,10 @@ impl XrRenderer {
     fn poll_ground_rebuild(&mut self) {
         let Some(rx) = self.tod.ground_build.as_ref() else { return };
         match rx.try_recv() {
-            Ok(map) => {
+            Ok(ground) => {
                 self.tod.ground_build = None;
-                let view = crate::renderer::ground_map::upload(&self.wgpu_device, &self.wgpu_queue, &map);
+                let view = crate::renderer::ground_map::upload_prepared(&self.wgpu_device, &self.wgpu_queue, &ground);
+                let map = &ground.map;
                 let extent = map.max - map.min;
                 self.ground_placement = Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top));
                 self.uniform_buf.set_ground_map(view);

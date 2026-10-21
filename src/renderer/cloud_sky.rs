@@ -409,6 +409,8 @@ pub fn cloud_sky_shader() -> String {
         .replace("{CIRRUS_STRETCH}", &f(cl::CIRRUS_STRETCH))
         .replace("{EXTINCTION}", &f(c::EXTINCTION_PER_M))
         .replace("{VIEW_STEPS}", &steps(cl::VIEW_STEPS))
+        .replace("{VIEW_STEPS_MOST}", &format!("{}u", cl::VIEW_STEPS_MOST))
+        .replace("{VIEW_STEP_TEXELS}", &f(cl::VIEW_STEP_TEXELS))
         .replace("{SHADOW_STEPS}", &steps(cl::SHADOW_STEPS))
         .replace("{OCT_A}", &f(c::OCTAVE_A))
         .replace("{OCT_B}", &f(c::OCTAVE_B))
@@ -475,6 +477,8 @@ const KIND_ALTO: f32 = {KIND_ALTO};
 const HIGH_SHADE_FILL: f32 = {HIGH_SHADE_FILL};
 const NOISE_TEXELS: f32 = {NOISE_TEXELS};
 const VIEW_STEPS: vec3<u32> = {VIEW_STEPS};
+const VIEW_STEPS_MOST: u32 = {VIEW_STEPS_MOST};
+const VIEW_STEP_TEXELS: f32 = {VIEW_STEP_TEXELS};
 const SHADOW_STEPS: vec3<u32> = {SHADOW_STEPS};
 const MEAN_A: f32 = {MEAN_A};
 const MEAN_B: f32 = {MEAN_B};
@@ -721,15 +725,6 @@ fn in_scatter(k: u32, alt: f32, tau_l: f32, cv: f32, ph: vec3<f32>, d: f32) -> v
     return u.light.rgb * (oct + deep) + amb;
 }
 
-// Where in its step a sample sits: interleaved gradient noise, 0..1. Used
-// only where the steps are long beside the shape's features (`fs_map`):
-// the steps' middle, shared by every texel, marched long low rays through
-// the same slabs of noise and drew them as stripes; up close it is still
-// the middle, whose jitter showed as dots before the display filtered.
-fn cloud_hash(p: vec2<f32>) -> f32 {
-    return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
-}
-
 fn map_dir(uv: vec2<f32>) -> vec3<f32> {
     let el = 0.5 * PI * pow(clamp(uv.y, 0.0, 1.0), PACK);
     let az = (uv.x - 0.5) * 2.0 * PI;
@@ -745,7 +740,10 @@ fn map_dir(uv: vec2<f32>) -> vec3<f32> {
     let alt = u.eye.y;
     let eye = u.eye.xz;
     let cv = dot(dir, u.light_dir.xyz);
-    let hash = cloud_hash(pos.xy);
+    // Every sample at its step's middle: no jitter. With nothing averaging
+    // the map over time, a jitter is drawn as its own pattern (the headset
+    // showed it as a fine hatching through every cloud, 2026-10-20); the
+    // steps are short enough instead (`VIEW_STEPS_MOST`).
     let ph = octave_phases(cv);
     // The angle one texel spans: across (azimuth, narrowing up the sky)
     // or along (elevation, packed toward the horizon), whichever is wider.
@@ -764,14 +762,13 @@ fn map_dir(uv: vec2<f32>) -> vec3<f32> {
         if (t0 < 0.0 || t1 < 0.0) {
             continue;
         }
-        let n = pick_steps(k, VIEW_STEPS);
-        let dt = min(t1 - t0, MAX_MARCH) / f32(n);
-        // A step longer than the shape's texels samples it, not integrates
-        // it: there each texel's samples sit at their own place in the step.
-        let along = 0.25 * dt * NOISE_TEXELS * lv(k, 1u).x;
-        let jitter = 0.5 + (hash - 0.5) * smoothstep(0.5, 2.0, along);
+        let len = min(t1 - t0, MAX_MARCH);
+        let base = pick_steps(k, VIEW_STEPS);
+        let stride = VIEW_STEP_TEXELS / (NOISE_TEXELS * lv(k, 1u).x);
+        let n = clamp(u32(ceil(len / stride)), base, max(base, VIEW_STEPS_MOST));
+        let dt = len / f32(n);
         for (var i = 0u; i < n; i = i + 1u) {
-            let t = t0 + (f32(i) + jitter) * dt;
+            let t = t0 + (f32(i) + 0.5) * dt;
             let p_alt = altitude_along(alt, mu, t);
             let xz = eye + dir.xz * t;
             let d = density(k, xz, p_alt, true, max(t * texel, 0.25 * dt));

@@ -320,3 +320,27 @@ Meta sources:
 - Ritschel 2009's exact aperture components and FFT details (PDF 403). I cite the abstract only.
 - On our side: that `SkyIrradiance::radiance` contains no sun lobe that the meter could see. This was read from `exposure.rs`, not run.
 - On our side: the fragment-storage and atomics support on the Quest adapter, which item B needs.
+
+---
+
+## 5. Reference frames from the user (2026-10-20)
+The user supplied nine Soulframe screenshots: a misty pond at low sun, a high sun with shafts, the sun behind thin cloud, a sunset, a rainy night, dense fog, a pink sunset, and two night skies. They settle some questions from section 4 and the user's decisions settle others.
+
+**User decisions:** slightly exaggerated sun and camera glare are wanted; there is no squint (drop `squint_stops`) and there are no lashes or lid shading. Every draw writes SpaceWarp motion vectors.
+
+**What the frames show:**
+1. **Haze makes every shot.** Each daytime frame is depth layered: tree planes and towers fade into a sun-coloured haze. Near the sun the haze is a bright forward-scattering glow that fills a large part of the sky and surrounds silhouettes. Much of what reads as "glare" is in-scattering in the medium, not a lens effect.
+2. **Shafts** appear wherever the sun is behind trees or cloud edges (high sun, misty pond). They are volumetric shadowing in that haze.
+3. **Camera glare:** a horizontal streak through the sun, a soft wide bloom, and one ghost on the line from the sun through the screen centre (sun behind thin cloud). There is no starburst.
+4. **Clouds:** cumulus with bright sunlit or backlit rims and darker bases. At night the clouds are moonlit blue and clearly volumetric against the stars.
+5. **Night:** a stylised Milky Way, much brighter and more saturated than the real one (teal dust, orange core), with bloomed bright stars. The sky is brighter than the ground.
+6. **Weather:** rain at night has a strong teal grade, long rain streaks at several depths and warm torches against it. Fog is a blue-grey medium where the sky and the fog are the same colour and the trees at middle distance are half gone.
+7. **Grade by time and weather:** purple dawn, gold sunset, teal rain night, grey-blue fog.
+
+**Our gaps, read from source on 2026-10-20:**
+- Geometry has no aerial perspective or distance fog at all. `fog`, `mist` and `haze` occur only in the cloud map (`HAZE_PER_M`, applied to clouds), the effect slabs and the lamp glare veil. The terrain and brush pipelines have none. This is the largest single difference from these frames, and it moves step 4 (one medium for fog and sky haze) ahead of the cloud refinements.
+- There are no shafts and no colour grade. The cloud phase is `phase` in `cloud_sky.rs` and the effects use `henyey_greenstein`.
+
+**Stereo rule for camera glare:** an effect is placed in a direction, not at a screen position. A ghost "through the screen centre" sits at a different place in each eye and reads as an object at a wrong depth. Defined as a world direction (the sun direction reflected about the head's forward axis), it is the same in both eyes and sits at infinity. The streak is defined in head space, horizontal to the head. Both then move with the sky in the motion pass.
+
+**Motion vectors:** haze and shafts are part of the medium in front of a surface, so they take that pixel's surface or sky motion. The glare overlay chooses per pixel which motion wins, as reflections already do.

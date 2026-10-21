@@ -554,25 +554,48 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
     GroundTrace { t: None, steps, reads }
 }
 
+/// A ground map's texture bytes, every mip already in f16: what the worker
+/// hands the render thread. Building the chain there took 80-130 ms of the
+/// headset's render thread at every relight, felt as a hang every few
+/// seconds while the clock ran (2026-10-20). `map` keeps the placement; its
+/// texels are dropped.
+pub struct PreparedGround {
+    pub map: GroundMap,
+    pub mips: Vec<(u32, u32, Vec<u16>)>,
+}
+
+pub fn prepare(mut map: GroundMap) -> PreparedGround {
+    let mips = levels(&map)
+        .iter()
+        .map(|level| (level.width, level.height, level.texels.iter().flat_map(|t| t.map(crate::renderer::sky::f32_to_f16)).collect()))
+        .collect();
+    map.texels = Vec::new();
+    PreparedGround { map, mips }
+}
+
 pub fn upload(device: &Device, queue: &Queue, map: &GroundMap) -> TextureView {
-    let chain = levels(map);
+    let map = GroundMap { texels: map.texels.clone(), ..*map };
+    upload_prepared(device, queue, &prepare(map))
+}
+
+pub fn upload_prepared(device: &Device, queue: &Queue, ground: &PreparedGround) -> TextureView {
+    let map = &ground.map;
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("ground_map"),
         size: wgpu::Extent3d { width: map.width, height: map.height, depth_or_array_layers: 1 },
-        mip_level_count: chain.len() as u32,
+        mip_level_count: ground.mips.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    for (mip, level) in chain.iter().enumerate() {
-        let bytes: Vec<u16> = level.texels.iter().flat_map(|t| t.map(crate::renderer::sky::f32_to_f16)).collect();
+    for (mip, (width, height, bytes)) in ground.mips.iter().enumerate() {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: mip as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            bytemuck::cast_slice(&bytes),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(level.width * 8), rows_per_image: Some(level.height) },
-            wgpu::Extent3d { width: level.width, height: level.height, depth_or_array_layers: 1 },
+            bytemuck::cast_slice(bytes),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 8), rows_per_image: Some(*height) },
+            wgpu::Extent3d { width: *width, height: *height, depth_or_array_layers: 1 },
         );
     }
     tex.create_view(&wgpu::TextureViewDescriptor::default())

@@ -276,6 +276,14 @@ pub struct Sky {
     /// tens of metres in one frame: the beach lost its sun at once
     /// (headset, 2026-10-20 16:55:57).
     light_now: Option<[f32; 3]>,
+    /// Toward the light the scene is lit by (the snapshot's sun, or its
+    /// moon) THIS frame, clouds or not: what the lit shaders take
+    /// (`sun_direct`). The snapshot's own direction steps once a snapshot,
+    /// and a sharp glint on the water jumped with it, a pulse across the
+    /// sea every second (headset, 2026-10-20 19:24).
+    light_glide: Option<[f32; 3]>,
+    /// Whether the snapshot's light is the moon.
+    light_is_moon: bool,
 
     /// The time of day's way from the last snapshot to the newest: drawn
     /// and lit between them, frame by frame (`Sky::tick`), so the sky's
@@ -611,6 +619,8 @@ impl Sky {
             cloud_shadow: CloudShadow::default(),
             cloud_sky: None,
             light_now: None,
+            light_glide: None,
+            light_is_moon: false,
             night,
             cloud_texture,
             cloud_sampler,
@@ -739,6 +749,7 @@ impl Sky {
             _ => None,
         };
         self.sun = snap.light;
+        self.light_is_moon = snap.light_is_moon;
         self.reflection = Some(ReflectionSky { pano: snap.reflection_engine(), rotation_deg: 0.0, intensity: 1.0 });
         self.extra = SkyExtra::from_snapshot(snap, seconds, zenith_depth);
         self.extra.set_clouds(self.clouds.as_ref().map(|c| &c.frame));
@@ -768,6 +779,7 @@ impl Sky {
     /// once a second at a 20-minute day; user, 2026-10-20).
     pub fn tick(&mut self, queue: &Queue, seconds: f32, dt: f32, astro: Option<&space_soup_sky::time_of_day::Astronomy>) {
         if self.extra.mode[0] <= 0.5 {
+            self.light_glide = None;
             return;
         }
         self.extra.mode[2] = seconds;
@@ -796,6 +808,7 @@ impl Sky {
             let m = &a.celestial_to_world;
             self.extra.celestial = [v4(m[0], 0.0), v4(m[1], 0.0), v4(m[2], 0.0)];
             self.light_now = self.clouds.as_ref().map(|c| if c.light_is_moon { a.moon } else { a.sun });
+            self.light_glide = Some(if self.light_is_moon { a.moon } else { a.sun });
         }
         self.dim_sun_by_clouds();
         queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
@@ -892,7 +905,16 @@ impl Sky {
 
     /// The sun the lit shaders take: the clear one while the shadow map
     /// dims it per pixel, else the one dimmed by the clouds over the level.
+    /// It points where the light is this frame (`light_glide`).
     pub fn sun_direct(&self) -> Option<SkySun> {
+        let glide = |s: SkySun| SkySun { direction: self.light_glide.unwrap_or(s.direction), ..s };
+        self.sun_stepped().map(glide)
+    }
+
+    /// The same light pointing where the newest snapshot put it: what the
+    /// static sun map is drawn along, so it is drawn again once a snapshot
+    /// rather than every frame.
+    pub fn sun_stepped(&self) -> Option<SkySun> {
         if self.cloud_shadow.active {
             if let Some(c) = &self.clouds {
                 return c.sun_clear;
