@@ -904,6 +904,12 @@ impl Sky {
         queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
     }
 
+    /// How hard the clouds over `xz` (world) rain, 0..1
+    /// (`space_soup_sky::precipitation`); None with no clouds in the sky.
+    pub fn precipitation_at(&self, xz: [f32; 2]) -> Option<f32> {
+        self.clouds.as_ref().map(|c| space_soup_sky::precipitation::precipitation_at(&c.layers, c.weather(), xz))
+    }
+
     /// Where the shown map lies (`Uniforms::cloud_map`) for the player's
     /// `yaw` and `offset`; zeros when it is not read.
     pub fn cloud_map(&self, yaw: f32, offset: [f32; 3]) -> [[f32; 4]; 3] {

@@ -1998,6 +1998,12 @@ impl XrRenderer {
         }
     }
 
+    /// How hard the sky's clouds rain over `xz` (world), 0..1; None with no
+    /// clouds (`Sky::precipitation_at`).
+    pub fn sky_precipitation_at(&self, xz: [f32; 2]) -> Option<f32> {
+        self.sky.precipitation_at(xz)
+    }
+
     fn sp_water(&self, stereo: bool, mud: crate::renderer::water_pipeline::WaterMud) -> &wgpu::RenderPipeline {
         let ringing = self.water_bodies.iter().any(|b| b.uniform.rings[0][3] > 0.0);
         let w = match (stereo, &self.stereo_pipelines) {
