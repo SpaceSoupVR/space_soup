@@ -575,7 +575,11 @@ pub(crate) const WATER_CUTS: &[(&str, &[(&str, &str)])] = &[
 
     ("c2", &[("    let c2 = textureSampleBias(wave_curve, wave_samp, q / water.tiles.z, 2, 2.0) * paws;", "    let c2 = vec4<f32>(0.0);")]),
 
-    ("caustics", &[("    let caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, 5.0, thickness)));", "    let caustic = 1.0;")]),
+    // The caustic sum everywhere, deep water too: the shader as it was before
+// the sum was skipped from CAUSTIC_DEEPEST down (the test that the skip
+// changes no pixel draws with it).
+("caustics_everywhere", &[("    if (thickness < CAUSTIC_DEEPEST) {", "    if (true) {")]),
+("caustics", &[("        caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, CAUSTIC_DEEPEST, thickness)));", "        caustic = 1.0;")]),
 
     ("surf", &[("    if (water.waves.y > 0.0) {\n        let count = swash;", "    if (false) {\n        let count = swash;")]),
 
@@ -615,7 +619,7 @@ pub(crate) const WATER_CUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "deep",
         &[
-            ("    let caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, 5.0, thickness)));", "    let caustic = 1.0;"),
+            ("        caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, CAUSTIC_DEEPEST, thickness)));", "        caustic = 1.0;"),
             ("    if (on_map && bed_shows) {\n        let flat", "    if (false) {\n        let flat"),
             ("    if (drawn < 1.0 && bed_shows) {\n        bed_seen", "    if (false) {\n        bed_seen"),
             ("    if (has_map) {\n        let closing", "    if (false) {\n        let closing"),
@@ -1236,6 +1240,8 @@ const WATER_TRACE_COARSEN: i32 = 2;
 const DEEP_SKIP: f32 = {deep_skip:?};
 const CAUSTIC_CONTRAST: f32 = 0.6;
 const CAUSTIC_MURK: f32 = 1.0;
+// The thickness of water from which no caustic shows.
+const CAUSTIC_DEEPEST: f32 = 5.0;
 const PAWS_RATE: vec2<f32> = vec2<f32>(0.1308997, 0.0785398);
 {surface}
 @group(1) @binding(0) var<uniform> water: WaterMat;
@@ -1394,7 +1400,41 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let wet_gloss = mix(water.look.x, 1.0, wet);
     tilt = wave_tilt * (1.0 - MUD_FLATTEN * mud * (1.0 - wet * MUD_SLUSH_RIPPLE)) + vec2<f32>(grain, grain_b) * MUD_GRAIN_TILT * mud * (1.0 - wet) + print_tilt * MUD_PRINT_TILT * mud;
     let n = normalize(to_player_direction(vec3<f32>(-tilt.x, 1.0, -tilt.y)));
+    // The waves' curvature and whitecaps, folded as soon as the normal is
+    // built: the three curvature texels then die here, not at the caustics
+    // near the end, and the shading between carries one vec3 for them
+    // instead of three vec4s (the caustics' registers were 17% of the draw).
+    let fine = 0.5 * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N * 0.25 / water.tiles.z));
+    let mid = max(shoal, 0.6) * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N / water.tiles.y));
+    let curve = c0.xyz * (0.5 * shoal) + c1.xyz * mid + c2.xyz * fine + vec3<f32>(wake.zw * wake_in, 0.0){ring_curve};
+    let caps = max(c0.w, c1.w) * shoal;
+    // The surf and the foam's cover, from the same early values: the swash and
+    // the bubbles die here too, before the reflection and the lights.
+    var surf = 0.0;
+    if (water.waves.y > 0.0) {{
+        let count = swash;
+        let phase = fract(count);
 
+        let patchy = 0.5 + 0.5 * sin(dot(q, vec2<f32>(0.41, 0.17)) + 1.3 * sin(dot(q, vec2<f32>(-0.23, 0.37)) + water.tiles.w * 0.0785398));
+
+        let s = phase - round(phase);
+        let amp = swash_amp;
+        let grown = BREAKER_PER_SWASH * water.waves.y * amp * (1.0 - smoothstep(1.2, 2.8, still_depth));
+        let holds = grown / max(BREAK_RATIO * still_depth, 1e-3);
+        let spilling = smoothstep(0.75, 1.0, holds) * exp(-(s - 0.008) * (s - 0.008) / (0.012 * 0.012));
+        let broken = smoothstep(1.0, 1.4, holds) * smoothstep(-0.02, 0.1, still_depth);
+        let face = exp(-(s + 0.012) * (s + 0.012) / (0.03 * 0.03));
+        let trail = select(0.0, exp(-s / 0.05), s > 0.0);
+        let breaker = max(spilling, broken * max(face, 0.65 * trail)) * mix(0.3, 1.0, patchy);
+        let wash = smoothstep(0.0, 0.04, phase) * (1.0 - smoothstep(0.08, 0.4, phase))
+            * (1.0 - smoothstep(0.0, 0.25, thickness)) * (1.0 - smoothstep(0.0, 0.6, still_depth))
+
+            * smoothstep(0.1, 0.75, amp);
+        surf = max(breaker, wash) + 0.18 * patchy * (1.0 - smoothstep(0.0, 0.2, thickness));
+    }}
+    let froth = clamp(caps + surf, 0.0, 1.0);
+    var cover = clamp((bubbles - (1.0 - froth)) * 4.0, 0.0, 1.0) * smoothstep(0.0, 0.05, froth);
+{ring_cover}
     let lost0 = water_lost(log2(max(span * WAVE_N / water.tiles.x, 1e-6))).x;
     let lost1 = water_lost(log2(max(span * WAVE_N / water.tiles.y, 1e-6))).y;
     let lost2 = water_lost(log2(max(span * WAVE_N / water.tiles.z, 1e-6))).z;
@@ -1500,51 +1540,31 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud) * print_shade;
     let body = water.scatter.rgb * silt * (sky_n * mix(1.0, MUD_SKY_SHARE, mud) + sunlight * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0)) * (vec3<f32>(1.0) - t_view);
 
-    let fine = 0.5 * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N * 0.25 / water.tiles.z));
-    let mid = max(shoal, 0.6) * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N / water.tiles.y));
-    let curve = c0.xyz * (0.5 * shoal) + c1.xyz * mid + c2.xyz * fine + vec3<f32>(wake.zw * wake_in, 0.0){ring_curve};
-    let focus = thickness * (1.0 - 1.0 / IOR_WATER);
-    let jx = 1.0 - focus * curve.x;
-    let jz = 1.0 - focus * curve.y;
-    let jxz = focus * curve.z;
+    // THE CAUSTICS only where they can show. From CAUSTIC_DEEPEST of water
+    // down their contrast is zero (the smoothstep below is 1 there), so the
+    // sum is skipped and `caustic` keeps exactly the 1.0 it would have come
+    // to. Open sea is all of that, and it was 17% of the water draw's clocks
+    // at day_sea (2026-10-21).
+    var caustic = 1.0;
+    if (thickness < CAUSTIC_DEEPEST) {{
+        let focus = thickness * (1.0 - 1.0 / IOR_WATER);
+        let jx = 1.0 - focus * curve.x;
+        let jz = 1.0 - focus * curve.y;
+        let jxz = focus * curve.z;
 
-    let det = jx * jz - jxz * jxz;
-    let gather = inverseSqrt(det * det + 0.0625);
+        let det = jx * jz - jxz * jxz;
+        let gather = inverseSqrt(det * det + 0.0625);
 
-    let murk = exp(-(water.extinction.x + water.extinction.y + water.extinction.z) * (1.0 / 3.0) * thickness * CAUSTIC_MURK);
-    let caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, 5.0, thickness)));
+        let murk = exp(-(water.extinction.x + water.extinction.y + water.extinction.z) * (1.0 / 3.0) * thickness * CAUSTIC_MURK);
+        caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, CAUSTIC_DEEPEST, thickness)));
+    }}
     let sun_on_bed = BED_ALBEDO * sunlight * t_light;
     let sky_on_bed = BED_ALBEDO * sky_down * t_light;
     let sun_share = dot(sun_on_bed, vec3<f32>(1.0)) / max(dot(sun_on_bed + sky_on_bed, vec3<f32>(1.0)), 1e-4);
     let brighter = max(caustic - 1.0, 0.0) * sun_on_bed * t_view;
     let dimmer = 1.0 + min(caustic - 1.0, 0.0) * sun_share;
 
-    let caps = max(c0.w, c1.w) * shoal;
-    var surf = 0.0;
-    if (water.waves.y > 0.0) {{
-        let count = swash;
-        let phase = fract(count);
-
-        let patchy = 0.5 + 0.5 * sin(dot(q, vec2<f32>(0.41, 0.17)) + 1.3 * sin(dot(q, vec2<f32>(-0.23, 0.37)) + water.tiles.w * 0.0785398));
-
-        let s = phase - round(phase);
-        let amp = swash_amp;
-        let grown = BREAKER_PER_SWASH * water.waves.y * amp * (1.0 - smoothstep(1.2, 2.8, still_depth));
-        let holds = grown / max(BREAK_RATIO * still_depth, 1e-3);
-        let spilling = smoothstep(0.75, 1.0, holds) * exp(-(s - 0.008) * (s - 0.008) / (0.012 * 0.012));
-        let broken = smoothstep(1.0, 1.4, holds) * smoothstep(-0.02, 0.1, still_depth);
-        let face = exp(-(s + 0.012) * (s + 0.012) / (0.03 * 0.03));
-        let trail = select(0.0, exp(-s / 0.05), s > 0.0);
-        let breaker = max(spilling, broken * max(face, 0.65 * trail)) * mix(0.3, 1.0, patchy);
-        let wash = smoothstep(0.0, 0.04, phase) * (1.0 - smoothstep(0.08, 0.4, phase))
-            * (1.0 - smoothstep(0.0, 0.25, thickness)) * (1.0 - smoothstep(0.0, 0.6, still_depth))
-
-            * smoothstep(0.1, 0.75, amp);
-        surf = max(breaker, wash) + 0.18 * patchy * (1.0 - smoothstep(0.0, 0.2, thickness));
-    }}
-    let froth = clamp(caps + surf, 0.0, 1.0);
-    var cover = clamp((bubbles - (1.0 - froth)) * 4.0, 0.0, 1.0) * smoothstep(0.0, 0.05, froth);
-{ring_cover}    let foam_light = 0.8 * (sky_n + sunlight);
+    let foam_light = 0.8 * (sky_n + sunlight);
 
     let edge = smoothstep(0.0, water.scatter.w, thickness);
     let lip = smoothstep(0.0, 0.015, thickness);
@@ -1650,6 +1670,8 @@ mod tests {
         mud: f32,
         lean: Option<WaterMud>,
         lopsided_sky: bool,
+        /// A `WATER_CUTS` variant drawn in place of the shader.
+        cut: Option<&'static str>,
     }
 
     fn case(dual: bool) -> Case {
@@ -1666,6 +1688,7 @@ mod tests {
             mud: 0.0,
             lean: None,
             lopsided_sky: false,
+            cut: None,
         }
     }
 
@@ -1808,7 +1831,8 @@ mod tests {
                 multiview_mask: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(c.lean.map_or(&pipeline.pipeline, |mud| pipeline.pipeline_for(mud)));
+            let cut = c.cut.map(|name| pipeline.with_cut(&device, name).expect("the cut builds"));
+            pass.set_pipeline(cut.as_ref().unwrap_or_else(|| c.lean.map_or(&pipeline.pipeline, |mud| pipeline.pipeline_for(mud))));
             pass.set_bind_group(0, &uniforms.bind_group, &[]);
             pass.set_bind_group(1, &groups[waves.current()], &[]);
             pass.set_vertex_buffer(0, vb.slice(..));
@@ -1879,6 +1903,45 @@ mod tests {
         eprintln!("{drawn} views byte-identical");
     }
 
+
+    #[test]
+    fn deep_water_skips_the_caustic_sum_and_draws_the_same_pixels() {
+        let mut drawn = 0;
+        for dual in [false, true] {
+            for (eye, wind, depth) in [(OVERHEAD, 9.0, 4.0), (OVERHEAD, 9.0, 5.0), (OVERHEAD, 6.0, 7.5), (GRAZING, 6.0, 12.0), (DOWN_THE_SLOPE, 12.0, 6.0)] {
+                let c = Case { eye, wind, depth, sun: Some(Vec3::new(0.3, -1.0, 0.2)), lopsided_sky: true, ..case(dual) };
+                let Some(skipped) = render_image(&c) else { return };
+                let summed = render_image(&Case { cut: Some("caustics_everywhere"), ..c }).unwrap();
+                assert_eq!(skipped, summed, "dual {dual}, eye {eye}, wind {wind}, depth {depth}");
+                drawn += 1;
+            }
+            // The control: in shallow water the caustics show, so taking them
+            // out must change the picture -- these views can see them.
+            let shallow = Case { eye: OVERHEAD, wind: 9.0, depth: 1.0, sun: Some(Vec3::new(0.3, -1.0, 0.2)), lopsided_sky: true, ..case(dual) };
+            assert_ne!(render_image(&shallow).unwrap(), render_image(&Case { cut: Some("caustics"), ..shallow }).unwrap(), "dual {dual}: no caustic to see");
+        }
+        eprintln!("{drawn} views byte-identical");
+    }
+
+    /// Writes a set of views to `$WATER_DUMP` (one file per path), for
+    /// comparing a rewrite of the shader with the shader before it.
+    #[test]
+    #[ignore]
+    fn dump_water_views() {
+        let Ok(out) = std::env::var("WATER_DUMP") else { return };
+        for dual in [false, true] {
+            let mut bytes = Vec::new();
+            for (eye, wind, depth, mud) in [
+                (OVERHEAD, 9.0, 0.3, 0.0), (OVERHEAD, 9.0, 1.0, 0.0), (OVERHEAD, 6.0, 3.0, 0.0), (OVERHEAD, 6.0, 7.0, 0.0),
+                (GRAZING, 6.0, 2.0, 0.0), (GRAZING, 12.0, 12.0, 0.0), (DOWN_THE_SLOPE, 12.0, 0.05, 0.0), (DOWN_THE_SLOPE, 4.0, 1.5, 0.6),
+            ] {
+                let c = Case { eye, wind, depth, mud, sun: Some(Vec3::new(0.3, -1.0, 0.2)), lopsided_sky: true, ..case(dual) };
+                let Some(img) = render_image(&c) else { return };
+                bytes.extend(img.iter().flatten());
+            }
+            std::fs::write(format!("{out}.{dual}"), bytes).unwrap();
+        }
+    }
 
     #[test]
     fn the_water_shader_compiles_and_draws() {
