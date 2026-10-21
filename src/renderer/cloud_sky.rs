@@ -14,9 +14,15 @@
 //! The ground's shadow map (`UniformBuffer::cloud_shadow`, read per pixel by
 //! `cloud_sun_shadow`) is drawn from the same density every frame, so the
 //! shadows sweeping over the ground are the clouds overhead.
+//!
+//! Where each cloud is comes from its layer's population
+//! (`space_soup_sky::cloud_population`): the live clouds are splatted into
+//! an envelope map per layer once a second of cloud time (`set_population`,
+//! `fs_splat`), and the march reads it where it read the weather.
 
-pub use space_soup_sky::{cloud_layers, clouds};
+pub use space_soup_sky::{cloud_layers, cloud_population, clouds};
 use space_soup_sky::cloud_layers::{self as cl, CloudLayer, CloudNoise, LAYERS, NOISE_SIZE};
+use space_soup_sky::cloud_population::{self as cp, CloudPopulation, ENVELOPE_SIZE, POPULATED};
 use space_soup_sky::clouds::{self as c, CloudField, CLOUD_TILE};
 use wgpu::*;
 
@@ -48,7 +54,7 @@ pub struct CloudSkyUniform {
     pub amb_ground: [f32; 4],
     /// The shadow map's centre x, z, extent, and the ground's altitude.
     pub shadow: [f32; 4],
-    pub layers: [[[f32; 4]; 8]; LAYERS],
+    pub layers: [[[f32; 4]; 9]; LAYERS],
 }
 
 impl CloudSkyUniform {
@@ -91,9 +97,35 @@ pub fn map_uv(d: [f32; 3]) -> [f32; 2] {
     [d[0].atan2(d[2]) / std::f32::consts::TAU + 0.5, (el / std::f32::consts::FRAC_PI_2).powf(1.0 / MAP_PACK)]
 }
 
+/// Mips of each envelope, down to 1 texel: the march reads the one its
+/// sample's footprint spans. Read at the top level everywhere, the 2048 x 768
+/// map's slice cost 4.1 ms on the Quest (bench 2026-10-21, against well under
+/// 0.4 ms before the populations): rays toward the horizon stride across an
+/// 8 MB map, a cache miss a sample.
+pub const ENVELOPE_MIPS: u32 = ENVELOPE_SIZE.ilog2() + 1;
+
 pub struct CloudSky {
     noise: Texture,
     weather: Texture,
+    /// The populated layers' envelopes (`cloud_population`), one array
+    /// layer each, and what draws them.
+    envelope: Texture,
+    envelope_layers: [TextureView; POPULATED],
+    envelope_sampler: Sampler,
+    splat_pipeline: RenderPipeline,
+    /// [layer][mip] views and the passes that average each mip from the one
+    /// above it.
+    envelope_mip_views: Vec<Vec<TextureView>>,
+    mip_pipeline: RenderPipeline,
+    mip_bind_groups: Vec<Vec<BindGroup>>,
+    splat_uniform: Buffer,
+    splat_bind_group: BindGroup,
+    splats: Option<Buffer>,
+    splat_ranges: [std::ops::Range<u32>; POPULATED],
+    /// The population generation the envelopes hold, and whether a newer
+    /// one is waiting to be drawn.
+    envelope_generation: u64,
+    envelope_pending: bool,
     maps: Texture,
     map_layers: [TextureView; 3],
     array_view: TextureView,
@@ -138,6 +170,11 @@ fn weather_texture(device: &Device, queue: &Queue, field: &CloudField) -> Textur
 
 impl CloudSky {
     pub fn new(device: &Device, queue: &Queue, field: &CloudField, noise: &CloudNoise) -> Self {
+        Self::with_shader(device, queue, field, noise, cloud_sky_shader())
+    }
+
+    /// `new` with the marcher's source given, for measuring a variant.
+    pub(crate) fn with_shader(device: &Device, queue: &Queue, field: &CloudField, noise: &CloudNoise, source: String) -> Self {
         let n = NOISE_SIZE;
         let noise_tex = device.create_texture(&TextureDescriptor {
             label: Some("cloud_noise"),
@@ -213,7 +250,153 @@ impl CloudSky {
                 tex(1, TextureViewDimension::D3),
                 tex(2, TextureViewDimension::D2),
                 BindGroupLayoutEntry { binding: 3, visibility: ShaderStages::FRAGMENT, ty: BindingType::Sampler(SamplerBindingType::Filtering), count: None },
+                tex(4, TextureViewDimension::D2Array),
+                BindGroupLayoutEntry { binding: 5, visibility: ShaderStages::FRAGMENT, ty: BindingType::Sampler(SamplerBindingType::Filtering), count: None },
             ],
+        });
+        let envelope = device.create_texture(&TextureDescriptor {
+            label: Some("cloud_envelope"),
+            size: Extent3d { width: ENVELOPE_SIZE, height: ENVELOPE_SIZE, depth_or_array_layers: POPULATED as u32 },
+            mip_level_count: ENVELOPE_MIPS,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba16Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let envelope_mip_views: Vec<Vec<TextureView>> = (0..POPULATED as u32)
+            .map(|i| {
+                (0..ENVELOPE_MIPS)
+                    .map(|m| {
+                        envelope.create_view(&TextureViewDescriptor {
+                            label: Some("cloud_envelope_mip"),
+                            dimension: Some(TextureViewDimension::D2),
+                            base_array_layer: i,
+                            array_layer_count: Some(1),
+                            base_mip_level: m,
+                            mip_level_count: Some(1),
+                            ..Default::default()
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        let envelope_layers: [TextureView; POPULATED] = std::array::from_fn(|i| envelope_mip_views[i][0].clone());
+        let envelope_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("cloud_envelope_sampler"),
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        // Each mip the average of the one above: a linear read at the shared
+        // corner of four texels.
+        let mip_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("cloud_envelope_mip_bgl"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture { sample_type: TextureSampleType::Float { filterable: true }, view_dimension: TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                BindGroupLayoutEntry { binding: 1, visibility: ShaderStages::FRAGMENT, ty: BindingType::Sampler(SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let mip_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("cloud_envelope_mip_sampler"),
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+        let mip_bind_groups: Vec<Vec<BindGroup>> = envelope_mip_views
+            .iter()
+            .map(|views| {
+                views[..views.len() - 1]
+                    .iter()
+                    .map(|v| {
+                        device.create_bind_group(&BindGroupDescriptor {
+                            label: Some("cloud_envelope_mip_bg"),
+                            layout: &mip_layout,
+                            entries: &[BindGroupEntry { binding: 0, resource: BindingResource::TextureView(v) }, BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&mip_sampler) }],
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        let mip_shader = device.create_shader_module(ShaderModuleDescriptor { label: Some("cloud_envelope_mip"), source: ShaderSource::Wgsl(ENVELOPE_MIP_WGSL.into()) });
+        let mip_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("cloud_envelope_mip_layout"),
+            bind_group_layouts: &[Some(&mip_layout)],
+            immediate_size: 0,
+        });
+        let mip_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("cloud_envelope_mip"),
+            layout: Some(&mip_pipeline_layout),
+            vertex: VertexState { module: &mip_shader, entry_point: Some("vs_full"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(FragmentState {
+                module: &mip_shader,
+                entry_point: Some("fs_mip"),
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState { format: TextureFormat::Rgba16Float, blend: None, write_mask: ColorWrites::ALL })],
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let splat_uniform = device.create_buffer(&BufferDescriptor {
+            label: Some("cloud_splat_uniform"),
+            size: (16 * (POPULATED + 1)) as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let splat_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("cloud_splat_bgl"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
+                ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }],
+        });
+        let splat_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("cloud_splat_bg"),
+            layout: &splat_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: splat_uniform.as_entire_binding() }],
+        });
+        let splat_shader = device.create_shader_module(ShaderModuleDescriptor { label: Some("cloud_splat"), source: ShaderSource::Wgsl(cloud_splat_shader().into()) });
+        let splat_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("cloud_splat_layout"),
+            bind_group_layouts: &[Some(&splat_layout)],
+            immediate_size: 0,
+        });
+        let add = BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
+        let splat_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("cloud_splat"),
+            layout: Some(&splat_pipeline_layout),
+            vertex: VertexState {
+                module: &splat_shader,
+                entry_point: Some("vs_splat"),
+                compilation_options: Default::default(),
+                buffers: &[Some(VertexBufferLayout {
+                    array_stride: 32,
+                    step_mode: VertexStepMode::Instance,
+                    attributes: &vertex_attr_array![0 => Float32x4, 1 => Float32x4],
+                })],
+            },
+            fragment: Some(FragmentState {
+                module: &splat_shader,
+                entry_point: Some("fs_splat"),
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState { format: TextureFormat::Rgba16Float, blend: Some(BlendState { color: add, alpha: add }), write_mask: ColorWrites::ALL })],
+            }),
+            primitive: PrimitiveState { topology: PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
         });
         // Clear sky until a map is drawn: a map never drawn reads black.
         let mut enc = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("cloud_sky_clear") });
@@ -233,8 +416,8 @@ impl CloudSky {
             });
         }
         queue.submit(Some(enc.finish()));
-        let bind_group = Self::bind(device, &layout, &uniform, &noise_tex, &weather, &sampler);
-        let shader = device.create_shader_module(ShaderModuleDescriptor { label: Some("cloud_sky"), source: ShaderSource::Wgsl(cloud_sky_shader().into()) });
+        let bind_group = Self::bind(device, &layout, &uniform, &noise_tex, &weather, &sampler, &envelope, &envelope_sampler);
+        let shader = device.create_shader_module(ShaderModuleDescriptor { label: Some("cloud_sky"), source: ShaderSource::Wgsl(source.into()) });
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("cloud_sky_layout"),
             bind_group_layouts: &[Some(&layout)],
@@ -263,6 +446,19 @@ impl CloudSky {
         Self {
             noise: noise_tex,
             weather,
+            envelope,
+            envelope_layers,
+            envelope_sampler,
+            splat_pipeline,
+            envelope_mip_views,
+            mip_pipeline,
+            mip_bind_groups,
+            splat_uniform,
+            splat_bind_group,
+            splats: None,
+            splat_ranges: std::array::from_fn(|_| 0..0),
+            envelope_generation: 0,
+            envelope_pending: false,
             maps,
             map_layers,
             array_view,
@@ -281,9 +477,11 @@ impl CloudSky {
         }
     }
 
-    fn bind(device: &Device, layout: &BindGroupLayout, uniform: &Buffer, noise: &Texture, weather: &Texture, sampler: &Sampler) -> BindGroup {
+    #[allow(clippy::too_many_arguments)]
+    fn bind(device: &Device, layout: &BindGroupLayout, uniform: &Buffer, noise: &Texture, weather: &Texture, sampler: &Sampler, envelope: &Texture, envelope_sampler: &Sampler) -> BindGroup {
         let nv = noise.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D3), ..Default::default() });
         let wv = weather.create_view(&Default::default());
+        let ev = envelope.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..Default::default() });
         device.create_bind_group(&BindGroupDescriptor {
             label: Some("cloud_sky_bg"),
             layout,
@@ -292,6 +490,8 @@ impl CloudSky {
                 BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&nv) },
                 BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&wv) },
                 BindGroupEntry { binding: 3, resource: BindingResource::Sampler(sampler) },
+                BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&ev) },
+                BindGroupEntry { binding: 5, resource: BindingResource::Sampler(envelope_sampler) },
             ],
         })
     }
@@ -299,8 +499,42 @@ impl CloudSky {
     /// A new weather field (a new sky's seed).
     pub fn set_weather(&mut self, device: &Device, queue: &Queue, field: &CloudField) {
         self.weather = weather_texture(device, queue, field);
-        self.bind_group = Self::bind(device, &self.layout, &self.uniform, &self.noise, &self.weather, &self.sampler);
+        self.bind_group = Self::bind(device, &self.layout, &self.uniform, &self.noise, &self.weather, &self.sampler, &self.envelope, &self.envelope_sampler);
         self.fresh = true;
+    }
+
+    /// THE POPULATION'S LIVE CLOUDS, to be splatted into the envelopes at the
+    /// next `encode` -- once per generation, so once a second of cloud time
+    /// (`cloud_population::UPDATE_S`).
+    pub fn set_population(&mut self, device: &Device, queue: &Queue, population: &CloudPopulation) {
+        if population.generation() == self.envelope_generation {
+            return;
+        }
+        self.envelope_generation = population.generation();
+        let mut data: Vec<[f32; 8]> = Vec::new();
+        let mut consts = [[0.0f32; 4]; POPULATED + 1];
+        for k in 0..POPULATED {
+            let (splats, c) = population.splats(k);
+            let start = data.len() as u32;
+            data.extend(splats.iter().map(|s| s.gpu()));
+            self.splat_ranges[k] = start..data.len() as u32;
+            consts[k] = c.gpu();
+        }
+        consts[POPULATED] = [cp::ENVELOPE_TEXEL_M, cp::ENVELOPE_EXTENT_M as f32, 0.0, 0.0];
+        queue.write_buffer(&self.splat_uniform, 0, bytemuck::cast_slice(&consts));
+        let bytes = (data.len() * 32) as u64;
+        if bytes > 0 {
+            if self.splats.as_ref().is_none_or(|b| b.size() < bytes) {
+                self.splats = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("cloud_splats"),
+                    size: (bytes + bytes / 2).max(64 * 1024),
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            queue.write_buffer(self.splats.as_ref().unwrap(), 0, bytemuck::cast_slice(&data));
+        }
+        self.envelope_pending = true;
     }
 
     /// The maps the sky shader reads (`texture_2d_array`).
@@ -324,6 +558,51 @@ impl CloudSky {
     /// `whole`, or when none is drawn yet), and the ground's shadow into
     /// `shadow` when given.
     pub fn encode(&mut self, encoder: &mut CommandEncoder, queue: &Queue, u: &CloudSkyUniform, shadow: Option<&TextureView>, whole: bool) {
+        if self.envelope_pending {
+            self.envelope_pending = false;
+            for k in 0..POPULATED {
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("cloud_envelope"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &self.envelope_layers[k],
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Clear(Color::TRANSPARENT), store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                    occlusion_query_set: None,
+                });
+                let range = self.splat_ranges[k].clone();
+                if let (Some(buf), false) = (self.splats.as_ref(), range.is_empty()) {
+                    pass.set_pipeline(&self.splat_pipeline);
+                    pass.set_bind_group(0, &self.splat_bind_group, &[]);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..4, range);
+                }
+            }
+            for k in 0..POPULATED {
+                for m in 1..ENVELOPE_MIPS as usize {
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("cloud_envelope_mip"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &self.envelope_mip_views[k][m],
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: Operations { load: LoadOp::Clear(Color::TRANSPARENT), store: StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        multiview_mask: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.mip_pipeline);
+                    pass.set_bind_group(0, &self.mip_bind_groups[k][m - 1], &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+        }
         let rows = MAP_HEIGHT / MAP_SLICES;
         let (target, from, to) = if self.fresh || whole {
             (self.cur, 0, MAP_HEIGHT)
@@ -431,11 +710,110 @@ pub fn cloud_sky_shader() -> String {
         .replace("{MEAN_A}", &f(means[3]))
         .replace("{MEAN_B}", &f(means[2]))
         .replace("{MEAN_FINE}", &f(0.625 * means[1] + 0.25 * means[2] + 0.125 * means[3]))
+        .replace("{MERGE_LIFT}", &f(cp::MERGE_LIFT))
+        .replace("{COVER_CEIL}", &f(cp::COVER_CEIL))
+        .replace("{OVERCAST0}", &f(cp::OVERCAST[0]))
+        .replace("{OVERCAST1}", &f(cp::OVERCAST[1]))
+        .replace("{FAR_PHASE}", &f(cp::FAR_PHASE))
+        .replace("{FAR_BLEND0}", &f(cp::FAR_BLEND[0]))
+        .replace("{FAR_BLEND1}", &f(cp::FAR_BLEND[1]))
+        .replace("{POPULATED}", &format!("{}u", POPULATED))
+        .replace("{ENVELOPE_TEXEL}", &f(cp::ENVELOPE_TEXEL_M))
+        .replace("{ENVELOPE_TOP_MIP}", &f((ENVELOPE_MIPS - 1) as f32))
 }
+
+/// The envelope pass: each live cloud a square around its profile, added
+/// into its layer's map (`cloud_population::splat_value`, line for line).
+pub fn cloud_splat_shader() -> String {
+    CLOUD_SPLAT_WGSL
+        .replace("{LUMP0}", &format!("{:?}", cp::LUMP[0]))
+        .replace("{LUMP1}", &format!("{:?}", cp::LUMP[1]))
+        .replace("{POPULATED}", &POPULATED.to_string())
+}
+
+const ENVELOPE_MIP_WGSL: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@vertex fn vs_full(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment fn fs_mip(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = vec2<f32>(textureDimensions(src));
+    // This texel's centre is the corner its four sources share.
+    return textureSampleLevel(src, samp, 2.0 * floor(pos.xy) / size + 1.0 / size, 0.0);
+}
+"#;
+
+const CLOUD_SPLAT_WGSL: &str = r#"
+struct SplatUniform {
+    // Per layer: wind x, z, sqrt(stretch), gain; then texel m, extent m.
+    layers: array<vec4<f32>, {POPULATED}>,
+    misc: vec4<f32>,
+}
+@group(0) @binding(0) var<uniform> su: SplatUniform;
+
+const LUMP0: f32 = {LUMP0};
+const LUMP1: f32 = {LUMP1};
+
+struct SplatOut {
+    @builtin(position) pos: vec4<f32>,
+    // Centre x, z (map m), radius, strength.
+    @location(0) @interpolate(flat) a: vec4<f32>,
+    // Top, phase, sin and cos of the outline's turn.
+    @location(1) @interpolate(flat) b: vec4<f32>,
+    // Wind x, z, sqrt(stretch), gain.
+    @location(2) @interpolate(flat) c: vec4<f32>,
+}
+
+@vertex fn vs_splat(@builtin(vertex_index) vi: u32, @location(0) a: vec4<f32>, @location(1) b: vec4<f32>) -> SplatOut {
+    let c = su.layers[u32(b.w)];
+    let bound = a.z * max(c.z, 1.0 / c.z) * (1.0 + LUMP0 + LUMP1);
+    let corner = vec2<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u)) * 2.0 - 1.0;
+    let uv = (a.xy + corner * bound) / su.misc.y;
+    var out: SplatOut;
+    out.pos = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    out.a = a;
+    out.b = vec4<f32>(b.x, b.y, sin(b.z), cos(b.z));
+    out.c = c;
+    return out;
+}
+
+@fragment fn fs_splat(in: SplatOut) -> @location(0) vec4<f32> {
+    // The texel's centre, in map metres.
+    let p = in.pos.xy * su.misc.x;
+    let d = p - in.a.xy;
+    let wind = in.c.xy;
+    let al = d.x * wind.x + d.y * wind.y;
+    let ac = -d.x * wind.y + d.y * wind.x;
+    let qx = al / (in.a.z * in.c.z);
+    let qz = ac * in.c.z / in.a.z;
+    let r2 = qx * qx + qz * qz;
+    let reach = 1.0 + LUMP0 + LUMP1;
+    if (r2 >= reach * reach) {
+        return vec4<f32>(0.0);
+    }
+    let len = max(sqrt(r2), 1e-6);
+    let sn = in.b.z;
+    let cs = in.b.w;
+    let c1 = (qx * cs - qz * sn) / len;
+    let s1 = (qx * sn + qz * cs) / len;
+    let lump = 1.0 + LUMP0 * (4.0 * c1 * c1 * c1 - 3.0 * c1) + LUMP1 * (2.0 * s1 * c1);
+    let x2 = r2 / (lump * lump);
+    if (x2 >= 1.0) {
+        return vec4<f32>(0.0);
+    }
+    let bb = 1.0 - x2;
+    let w = in.a.w * in.c.w * bb * bb;
+    return vec4<f32>(w, w * in.b.x, w * in.b.y, w * w);
+}
+"#;
 
 const CLOUD_SKY_WGSL: &str = r#"
 struct Layer {
-    v: array<vec4<f32>, 8>,
+    v: array<vec4<f32>, 9>,
 }
 struct CloudSkyUniform {
     eye: vec4<f32>,
@@ -450,6 +828,8 @@ struct CloudSkyUniform {
 @group(0) @binding(1) var noise_tex: texture_3d<f32>;
 @group(0) @binding(2) var weather_tex: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
+@group(0) @binding(4) var env_tex: texture_2d_array<f32>;
+@group(0) @binding(5) var env_samp: sampler;
 
 const PI: f32 = 3.14159265;
 const EARTH: f32 = {EARTH};
@@ -483,6 +863,16 @@ const SHADOW_STEPS: vec3<u32> = {SHADOW_STEPS};
 const MEAN_A: f32 = {MEAN_A};
 const MEAN_B: f32 = {MEAN_B};
 const MEAN_FINE: f32 = {MEAN_FINE};
+const MERGE_LIFT: f32 = {MERGE_LIFT};
+const COVER_CEIL: f32 = {COVER_CEIL};
+const OVERCAST0: f32 = {OVERCAST0};
+const OVERCAST1: f32 = {OVERCAST1};
+const FAR_PHASE: f32 = {FAR_PHASE};
+const FAR_BLEND0: f32 = {FAR_BLEND0};
+const FAR_BLEND1: f32 = {FAR_BLEND1};
+const POPULATED: u32 = {POPULATED};
+const ENVELOPE_TEXEL: f32 = {ENVELOPE_TEXEL};
+const ENVELOPE_TOP_MIP: f32 = {ENVELOPE_TOP_MIP};
 
 @vertex fn vs_full(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
@@ -508,9 +898,53 @@ fn local_coverage(k: u32, xz: vec2<f32>) -> f32 {
     return clamp(lv(k, 0u).z + (w - 0.5) * lv(k, 1u).w, 0.0, 1.0);
 }
 
-fn height_profile(kind: f32, h: f32, cover: f32) -> f32 {
+// The weather's mean where there is no population map: coverage, the top
+// from it, the fallback's phase, unmerged (`EnvelopeSample::far`).
+fn envelope_far(k: u32, xz: vec2<f32>) -> vec4<f32> {
+    let c = local_coverage(k, xz);
+    return vec4<f32>(c, 0.3 + 0.7 * c, FAR_PHASE, 0.0);
+}
+
+// One envelope texel's sums as coverage, column top, phase and merge
+// (`EnvelopeSample::of`).
+fn envelope_of(e: vec4<f32>) -> vec4<f32> {
+    if (e.x <= 1e-4) {
+        return vec4<f32>(0.0, 0.0, FAR_PHASE, 0.0);
+    }
+    let cover = clamp(e.x, 0.0, 1.0);
+    let merge = clamp(1.0 - e.w / (e.x * e.x), 0.0, 1.0);
+    let top = min(e.y / e.x * (0.35 + 0.65 * sqrt(cover)) * (1.0 + MERGE_LIFT * merge), 1.0);
+    return vec4<f32>(cover, top, clamp(e.z / e.x, 0.0, 1.0), merge);
+}
+
+// THE LAYER'S ENVELOPE at xz: its population's map, giving way to the
+// weather's mean toward the map's edge (`cloud_layers::envelope`).
+fn envelope(k: u32, xz: vec2<f32>, foot: f32) -> vec4<f32> {
+    let m = lv(k, 8u);
+    if (k >= POPULATED || m.z <= 0.0) {
+        return envelope_far(k, xz);
+    }
+    let uv = xz * m.z + m.xy;
+    let t = smoothstep(FAR_BLEND0, FAR_BLEND1, 2.0 * max(abs(uv.x - 0.5), abs(uv.y - 0.5)));
+    if (t >= 1.0) {
+        return envelope_far(k, xz);
+    }
+    // The mip the sample's footprint spans (`ENVELOPE_MIPS`).
+    let lod = clamp(log2(max(foot, ENVELOPE_TEXEL) / ENVELOPE_TEXEL), 0.0, ENVELOPE_TOP_MIP);
+    var near = envelope_of(textureSampleLevel(env_tex, env_samp, uv, k, lod));
+    // Cores below the ceiling, both giving way to a sheet toward an overcast
+    // (`EnvelopeSample::under`).
+    let c = lv(k, 0u).z;
+    let o = smoothstep(OVERCAST0, OVERCAST1, c);
+    near.x = max(min(near.x, COVER_CEIL + (1.0 - COVER_CEIL) * o), o * c);
+    if (t <= 0.0) {
+        return near;
+    }
+    return mix(near, envelope_far(k, xz), t);
+}
+
+fn height_profile(kind: f32, h: f32, top: f32) -> f32 {
     if (kind == KIND_CUMULUS) {
-        let top = 0.3 + 0.7 * cover;
         return smoothstep(0.0, 0.06, h) * (1.0 - smoothstep(0.5 * top, top, h));
     } else if (kind == KIND_STRATO) {
         return smoothstep(0.0, 0.15, h) * (1.0 - smoothstep(0.5, 0.95, h));
@@ -546,7 +980,8 @@ fn density(k: u32, xz: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
     if (h < 0.0 || h > 1.0) {
         return 0.0;
     }
-    let cover = local_coverage(k, xz);
+    let env = envelope(k, xz, foot);
+    let cover = env.x;
     if (cover <= 0.0) {
         return 0.0;
     }
@@ -559,7 +994,7 @@ fn density(k: u32, xz: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
     let fine_b = smoothstep(0.5, 1.0, r);
     let low = 0.625 * n.g + 0.25 * mix(n.b, MEAN_B, fine_b) + 0.125 * mix(n.a, MEAN_A, fine_a);
     let base = clamp((n.r - (low - 1.0)) / (2.0 - low), 0.0, 1.0);
-    let shape = base * height_profile(lv(k, 1u).y, h, cover);
+    let shape = base * height_profile(lv(k, 1u).y, h, env.y);
     let th = threshold(k, cover);
     var d = clamp((shape - th) / max(1.0 - th, 1e-3), 0.0, 1.0);
     if (d <= 0.0) {
@@ -574,7 +1009,7 @@ fn density(k: u32, xz: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
             fine = mix(0.625 * q.g + 0.25 * q.b + 0.125 * q.a, MEAN_FINE, gone);
         }
         let e = fine + (1.0 - 2.0 * fine) * smoothstep(0.1, 0.6, h);
-        let cut = DETAIL_EROSION * e;
+        let cut = DETAIL_EROSION * (0.8 + 0.5 * env.z) * e;
         d = clamp((d - cut) / (1.0 - cut), 0.0, 1.0);
     }
     return min(d * EDGE_GAIN, 1.0) * a.w;
@@ -628,7 +1063,7 @@ fn high_layer_tau(k: u32, xz: vec2<f32>, slant: f32) -> f32 {
     if (lv(k, 1u).y == KIND_CIRRUS) {
         return a.z * HIGH_SHADE_FILL * CIRRUS_TAU * min(a.w / EXTINCTION, 2.0) * slant;
     }
-    return local_coverage(k, xz) * HIGH_SHADE_FILL * a.w * (a.y - a.x) * slant;
+    return envelope(k, xz, 0.0).x * HIGH_SHADE_FILL * a.w * (a.y - a.x) * slant;
 }
 
 // The column's direct transmittance toward dir from xz at alt, every layer
@@ -686,7 +1121,7 @@ fn phase(s: f32, c: f32) -> f32 {
 
 // The light's optical depth from a point in layer k toward it: taps out
 // through the layer, nearer ones closer together.
-fn light_tau(k: u32, xz: vec2<f32>, alt: f32) -> f32 {
+fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {
     let l = u.light_dir.xyz;
     let a = lv(k, 0u);
     let thick = max(a.y - a.x, 100.0);
@@ -697,7 +1132,7 @@ fn light_tau(k: u32, xz: vec2<f32>, alt: f32) -> f32 {
         let j = i + 4u - taps;
         let r = select(select(select(0.8, 0.35, j == 2u), 0.15, j == 1u), 0.05, j == 0u) * thick;
         let p = vec3<f32>(xz.x, alt, xz.y) + l * r;
-        tau = tau + density(k, p.xz, p.y, false, 0.0) * (r - last);
+        tau = tau + density(k, p.xz, p.y, false, foot) * (r - last);
         last = r;
     }
     return tau;
@@ -771,9 +1206,10 @@ fn map_dir(uv: vec2<f32>) -> vec3<f32> {
             let t = t0 + (f32(i) + 0.5) * dt;
             let p_alt = altitude_along(alt, mu, t);
             let xz = eye + dir.xz * t;
-            let d = density(k, xz, p_alt, true, max(t * texel, 0.25 * dt));
+            let foot = max(t * texel, 0.25 * dt);
+            let d = density(k, xz, p_alt, true, foot);
             if (d > 0.0) {
-                let s = in_scatter(k, p_alt, light_tau(k, xz, p_alt), cv, ph, d);
+                let s = in_scatter(k, p_alt, light_tau(k, xz, p_alt, foot), cv, ph, d);
                 let ts = exp(-d * dt);
                 let w = trans * (1.0 - ts) * exp(-t * HAZE);
                 rgb = rgb + w * s;
@@ -925,5 +1361,129 @@ mod tests {
             let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
             assert!((0..3).all(|k| (back[k] - d[k] / l).abs() < 1e-4), "{d:?} -> {back:?}");
         }
+    }
+
+    /// What a whole sky map costs on this machine's GPU, with the layers'
+    /// populations and with the weather's mean alone (`--ignored`).
+    #[test]
+    #[ignore]
+    fn time_the_sky_map() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = CloudParams { coverage: 0.45, ..Default::default() };
+        let t = 20_000.0;
+        let base = cloud_sky_shader();
+        let variant = |name: &str| -> String {
+            match name {
+                "no light taps" => base.replace("fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {", "fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {\n    if (true) { return 0.0; }"),
+                "no detail" => base.replace("let d = density(k, xz, p_alt, true, foot);", "let d = density(k, xz, p_alt, false, foot);"),
+                "half steps" => base.replace(&format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST), &format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST / 2)),
+                _ => base.clone(),
+            }
+        };
+        for (populated, name) in [(false, "as built"), (true, "as built"), (true, "no light taps"), (true, "no detail"), (true, "half steps")] {
+            let src = variant(name);
+            assert!(name == "as built" || src != base, "variant {name} changed nothing");
+            let mut population = CloudPopulation::new();
+            let mut layers = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise).layers(t);
+            let mut sky = CloudSky::with_shader(&device, &queue, &field, &noise, src);
+            if populated {
+                population.update(&params, &field, t);
+                population.place(&mut layers, t);
+                sky.set_population(&device, &queue, &population);
+            }
+            let u = CloudSkyUniform::new(&layers, [10.0, 2.0, 5.0], [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
+            let run = |sky: &mut CloudSky, n: u32| {
+                let start = std::time::Instant::now();
+                for _ in 0..n {
+                    let mut enc = device.create_command_encoder(&Default::default());
+                    sky.encode(&mut enc, &queue, &u, None, true);
+                    queue.submit(Some(enc.finish()));
+                }
+                device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+                start.elapsed().as_secs_f64() * 1000.0 / n as f64
+            };
+            run(&mut sky, 2);
+            let ms = run(&mut sky, 10);
+            eprintln!("{name}, populated {populated}: a whole map {ms:.2} ms, a slice {:.3} ms", ms / MAP_SLICES as f64);
+        }
+    }
+
+    /// THE ENVELOPES ARE THE POPULATION'S: each layer's splatted map against
+    /// the CPU twin's texels, then the shadow the populated clouds cast
+    /// against the twin's columns.
+    #[test]
+    fn the_gpu_envelopes_match_their_twin() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let scope = device.push_error_scope(ErrorFilter::Validation);
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = CloudParams { coverage: 0.5, ..Default::default() };
+        let t = 20_000.0;
+        let mut population = CloudPopulation::new();
+        population.update(&params, &field, t);
+        let mut layers = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise).layers(t);
+        population.place(&mut layers, t);
+        let mut sky = CloudSky::new(&device, &queue, &field, &noise);
+        sky.set_population(&device, &queue, &population);
+        let size = crate::renderer::uniforms::CLOUD_SHADOW_SIZE;
+        let shadow = device.create_texture(&TextureDescriptor {
+            label: None,
+            size: Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R8Unorm,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let sun = [0.35f32, 0.85, 0.4];
+        let (centre, extent) = ([120.0f32, -40.0], 4096.0);
+        let u = CloudSkyUniform::new(&layers, [10.0, 2.0, 5.0], sun, [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], centre, extent, 0.5);
+        let mut enc = device.create_command_encoder(&Default::default());
+        sky.encode(&mut enc, &queue, &u, Some(&shadow.create_view(&Default::default())), true);
+        queue.submit(Some(enc.finish()));
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            panic!("the envelope passes do not validate: {e}");
+        }
+        let n = ENVELOPE_SIZE;
+        for k in 0..POPULATED {
+            let map = read_back(&device, &queue, &sky.envelope, k as u32, n, n, 8);
+            let (mut worst, mut covered, mut seen) = (0.0f32, 0, 0);
+            for j in (0..n).step_by(5) {
+                for i in (0..n).step_by(3) {
+                    let at = ((j * n + i) * 8) as usize;
+                    let gpu = [0, 1, 2, 3].map(|c| half(&map[at + 2 * c..at + 2 * c + 2]));
+                    let cpu = population.texel(k, i as i32, j as i32);
+                    for c in 0..4 {
+                        worst = worst.max((gpu[c] - cpu[c]).abs() / (1.0 + cpu[c].abs()));
+                    }
+                    covered += (cpu[0] > 0.05) as u32;
+                    seen += 1;
+                }
+            }
+            eprintln!("layer {k}: {} splats, worst relative difference {worst:.5}, {covered} of {seen} texels clouded", population.splats(k).0.len());
+            assert!(worst < 4e-3, "layer {k}'s envelope is not the twin's: {worst}");
+            assert!(covered > seen / 20, "layer {k} has almost no clouds: {covered} of {seen}");
+        }
+        let texels = read_back(&device, &queue, &shadow, 0, size, size, 1);
+        let dir = { let l = (sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]).sqrt(); sun.map(|v| v / l) };
+        let weather = space_soup_sky::cloud_layers::CloudWeather::new(&field, Some(&population));
+        let step = extent / size as f32;
+        let (mut worst, mut sum, mut count, mut shaded) = (0.0f32, 0.0f32, 0, 0);
+        for j in (1..size - 1).step_by(2) {
+            for i in (1..size - 1).step_by(2) {
+                let xz = [centre[0] - 0.5 * extent + (i as f32 + 0.5) * step, centre[1] - 0.5 * extent + (j as f32 + 0.5) * step];
+                let cpu = space_soup_sky::cloud_layers::transmittance_penumbra(&layers, &noise, weather, xz, 2.0, dir);
+                let gpu = texels[(j * size + i) as usize] as f32 / 255.0;
+                worst = worst.max((cpu - gpu).abs());
+                sum += (cpu - gpu).abs();
+                count += 1;
+                shaded += (gpu < 0.5) as u32;
+            }
+        }
+        eprintln!("populated shadow vs twin: mean |diff| {:.4}, worst {worst:.3}; {shaded} of {count} shaded", sum / count as f32);
+        assert!(sum / (count as f32) < 0.02 && worst < 0.25, "the populated shadow is not the twin's: mean {}, worst {worst}", sum / count as f32);
     }
 }

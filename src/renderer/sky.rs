@@ -147,7 +147,8 @@ pub fn apparent_sine(true_sine: f32) -> f32 {
 }
 
 use space_soup_sky::clouds::{CloudField, CloudFrame};
-use space_soup_sky::cloud_layers::{self as cloud_layers, CloudLayer, CloudModel, CloudNoise, LAYERS};
+use space_soup_sky::cloud_layers::{self as cloud_layers, CloudLayer, CloudModel, CloudNoise, CloudWeather, LAYERS};
+use space_soup_sky::cloud_population::CloudPopulation;
 use crate::renderer::cloud_sky::{CloudSky, CloudSkyUniform};
 
 pub struct SkyClouds {
@@ -162,12 +163,28 @@ pub struct SkyClouds {
     pub layers: [CloudLayer; LAYERS],
     /// The light is the moon's (the sun is down).
     pub light_is_moon: bool,
+    /// Every cloud of the populated layers (`cloud_population`), carried
+    /// from snapshot to snapshot while the weather field stays.
+    pub population: CloudPopulation,
+}
+
+impl SkyClouds {
+    /// What the CPU's rays read the clouds from.
+    pub fn weather(&self) -> CloudWeather<'_> {
+        CloudWeather::new(&self.field, Some(&self.population))
+    }
+
+    /// The population at `seconds`, and the layers placed over its maps.
+    fn settle(&mut self) {
+        self.population.update(&self.model.params, &self.field, self.seconds);
+        self.population.place(&mut self.layers, self.seconds);
+    }
 }
 
 /// The level's share of the clear light through the clouds: their direct
 /// transmittance averaged over a 3 x 3 grid `LEVEL_SUN_HALF_M` round the
 /// level's middle, for what is lit as a whole (probes, lightmaps, effects).
-pub fn level_transmittance(layers: &[CloudLayer; LAYERS], field: &CloudField, dir: [f32; 3]) -> f32 {
+pub fn level_transmittance(layers: &[CloudLayer; LAYERS], weather: CloudWeather, dir: [f32; 3]) -> f32 {
     let noise = CloudNoise::shared();
     let h = space_soup_sky::clouds::LEVEL_SUN_HALF_M;
     let d = unit3(dir);
@@ -175,7 +192,7 @@ pub fn level_transmittance(layers: &[CloudLayer; LAYERS], field: &CloudField, di
     for j in 0..3 {
         for i in 0..3 {
             let xz = [(i as f32 - 1.0) * h, (j as f32 - 1.0) * h];
-            sum += cloud_layers::transmittance_toward(layers, &noise, field, xz, 0.0, d);
+            sum += cloud_layers::transmittance_toward(layers, &noise, weather, xz, 0.0, d);
         }
     }
     sum / 9.0
@@ -730,13 +747,14 @@ impl Sky {
             self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &self.cloud_sampler, &self.night);
         }
         let kept = self.clouds.as_ref().map(|c| c.model.clone());
+        let population = self.clouds.as_mut().filter(|_| !new_field).map(|c| std::mem::take(&mut c.population)).unwrap_or_default();
         self.clouds = match (snap.clouds, &snap.cloud_field) {
             (Some(frame), Some(field)) => {
                 let model = kept
                     .filter(|m| m.params == frame.params)
                     .unwrap_or_else(|| std::sync::Arc::new(CloudModel::new(&frame.params, &CloudNoise::shared())));
                 let secs = seconds as f64;
-                Some(SkyClouds {
+                let mut c = SkyClouds {
                     field: field.clone(),
                     frame: frame.at(secs),
                     sun_clear: snap.light_clear,
@@ -744,7 +762,10 @@ impl Sky {
                     model,
                     seconds: secs,
                     light_is_moon: snap.light_is_moon,
-                })
+                    population,
+                };
+                c.settle();
+                Some(c)
             }
             _ => None,
         };
@@ -787,6 +808,7 @@ impl Sky {
             c.seconds = seconds as f64;
             c.frame = c.frame.at(c.seconds);
             c.layers = c.model.layers(c.seconds);
+            c.settle();
             self.extra.set_cloud_offsets(&c.frame);
         }
         let blending = self.blend.as_mut().is_some_and(|b| {
@@ -817,13 +839,13 @@ impl Sky {
     fn dim_sun_by_clouds(&mut self) {
         let Some(dir) = self.cloud_light_dir() else { return };
         let Some(c) = &self.clouds else { return };
-        let through = level_transmittance(&c.layers, &c.field, dir);
+        let through = level_transmittance(&c.layers, c.weather(), dir);
         self.sun = c.sun_clear.map(|l| SkySun { light_rgb: l.light_rgb.map(|v| v * through), ..l });
         // The glare round the sun and the moon goes as the clouds cover them
         // from the eye (`sky_halo_through` in the cloud shader).
         let noise = CloudNoise::shared();
         let eye = self.eye_xz;
-        let toward = |v: [f32; 4]| cloud_layers::transmittance_toward(&c.layers, &noise, &c.field, eye, 0.0, unit3([v[0], v[1], v[2]]));
+        let toward = |v: [f32; 4]| cloud_layers::transmittance_toward(&c.layers, &noise, c.weather(), eye, 0.0, unit3([v[0], v[1], v[2]]));
         self.extra.cloud_sky[3] = toward(self.extra.sun);
         self.extra.cloud_ground[3] = toward(self.extra.moon);
     }
@@ -858,7 +880,7 @@ impl Sky {
                 for j in 0..4 {
                     for i in 0..4 {
                         let at = |k: i32| (k as f32 - 1.5) / 4.0 * CLOUD_SHADOW_EXTENT_M;
-                        sum += cloud_layers::transmittance_toward(&c.layers, &noise, &c.field, [centre[0] + at(i), centre[1] + at(j)], eye[1], d);
+                        sum += cloud_layers::transmittance_toward(&c.layers, &noise, c.weather(), [centre[0] + at(i), centre[1] + at(j)], eye[1], d);
                     }
                 }
                 cs.mean = sum / 16.0;
@@ -869,6 +891,7 @@ impl Sky {
         cs.active = light.is_some() && shadow.is_some();
         let f = &c.frame;
         let u = CloudSkyUniform::new(&c.layers, eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean);
+        gpu.set_population(device, queue, &c.population);
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("clouds") });
         gpu.encode(&mut encoder, queue, &u, shadow.filter(|_| cs.active), whole);
         queue.submit(Some(encoder.finish()));
@@ -899,7 +922,7 @@ impl Sky {
         let clear = self.clouds.as_ref().filter(|_| self.cloud_shadow.active).and_then(|c| c.sun_clear.map(|s| (c, s)));
         let Some((c, s)) = clear else { return self.sun };
         let dir = self.cloud_light_dir().unwrap_or(s.direction);
-        let t = cloud_layers::transmittance_penumbra(&c.layers, &CloudNoise::shared(), &c.field, xz, 0.0, dir);
+        let t = cloud_layers::transmittance_penumbra(&c.layers, &CloudNoise::shared(), c.weather(), xz, 0.0, dir);
         Some(SkySun { light_rgb: s.light_rgb.map(|v| v * t), ..s })
     }
 
@@ -2154,7 +2177,7 @@ mod render_tests {
             let direct = sky.sun_direct().map_or(0.0, |s| s.light_rgb[1]);
             let level = sky.sun.map_or(0.0, |s| s.light_rgb[1]);
             let c = sky.clouds.as_ref().unwrap();
-            let t = space_soup_sky::cloud_layers::transmittance_penumbra(&c.layers, &CloudNoise::shared(), &c.field, [eye[0], eye[2]], eye[1], sky.cloud_light_dir().unwrap());
+            let t = space_soup_sky::cloud_layers::transmittance_penumbra(&c.layers, &CloudNoise::shared(), c.weather(), [eye[0], eye[2]], eye[1], sky.cloud_light_dir().unwrap());
             seen.push((secs, direct, level, t));
         }
         // The change in the light reaching the eye as a share of the clear

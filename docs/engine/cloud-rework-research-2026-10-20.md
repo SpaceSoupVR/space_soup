@@ -1,5 +1,24 @@
 # Clouds that live: evolution, real cloud-field statistics, a server weather model, and a cheaper far field (2026-10-20)
 
+> **Status, 2026-10-21: items 2-4 of §6 are built** (client side, stateless
+> from the seed, so the server's later `Option` stream is a drop-in):
+> `space_soup_sky/src/cloud_population.rs` draws each volumetric layer's
+> clouds per (cell, epoch), thinned by the weather's local coverage, sized
+> n(D) ∝ D^-3, lives growing with size, each growing, maturing and decaying
+> (`life_shape`). The live clouds are splatted once a second of cloud time
+> into a 1024² RGBA16F envelope per layer over 128 km in its wind frame
+> (`cloud_sky.rs` `fs_splat`; R profile, G x top, B x phase, A squared for
+> merging), which `density` reads where it read the weather; past the map
+> the weather's mean takes over (`far_share`). Merged clouds rise
+> (`MERGE_LIFT`), cores keep the noise's breaks (`COVER_CEIL`), erosion
+> follows life phase. Guarded by tests: D^-3 sizes, coverage asked vs drawn
+> (within 0.02), no step in a second, the sky renewed in half an hour, no
+> correlation at the noise tile (0.19), a weather turn keeps the clouds up,
+> and the GPU envelope and shadow against the CPU twin (0.3% / 0.001).
+> Still open: items 1 (server weather field), 5-8 (empty-space skipping,
+> distance bands, aerial perspective, accumulation), 10, and Cb/rain from
+> the population. CPU: an update is 0.3-0.5 ms on the Mac, once a second.
+
 Scope: research only. No code was changed. This report builds on
 `sky-research-games-2026-10-20.md` (the "games doc", ranked items R0-R17) and
 `sky-realism-research.md` (the plan). Everything those two cover is not
