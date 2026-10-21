@@ -1600,7 +1600,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn shipped() -> Option<EffectLibrary> {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/effects");
+        let dir = crate::test_game_dir().join("effects");
         if !dir.is_dir() {
             eprintln!("skipping: no {}", dir.display());
             return None;
@@ -1647,7 +1647,7 @@ pub(crate) mod tests {
 
     #[test]
     fn every_effect_asset_validates_and_its_overrides_are_listed() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/effects");
+        let dir = crate::test_game_dir().join("effects");
         let (assets, failed) = EffectAsset::load_dir(&dir);
         assert!(failed.is_empty(), "{}", failed.iter().map(|(p, e)| format!("{}: {e}", p.display())).collect::<Vec<_>>().join("\n"));
         let mut overrides = Vec::new();
@@ -1895,7 +1895,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_fog_slab_is_one_instance_spanning_its_object_weighed_as_one_layer() {
-        let Some(text) = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/effects/pond_fog.json")).ok() else { return };
+        let Some(text) = std::fs::read_to_string(crate::test_game_dir().join("effects/pond_fog.json")).ok() else { return };
         let mut lib = EffectLibrary::new();
         lib.add(&EffectAsset::parse(&text).unwrap()).unwrap();
         let id = lib.id("pond_fog").unwrap();
@@ -2067,7 +2067,7 @@ pub(crate) mod tests {
     fn the_editors_stack_fixtures_are_current() {
         use serde_json::json;
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scene_editor_web/frontend/src/lib/__effect_stack_fixtures.json");
-        let game = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/effects");
+        let game = crate::test_game_dir().join("effects");
         let read = |name: &str| std::fs::read_to_string(game.join(format!("{name}.json"))).ok();
         let (Some(rifle), Some(pistol), Some(quiet)) = (read("muzzle_556_a2"), read("muzzle_9mm_bare"), read("muzzle_suppressed")) else { return };
 

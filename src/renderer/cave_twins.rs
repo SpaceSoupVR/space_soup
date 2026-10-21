@@ -458,7 +458,7 @@ mod tests {
     #[test]
     #[ignore]
     fn shipped_cave_classes() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../game/models/caves/cave.glb");
+        let path = &crate::test_game_dir().join("models/caves/cave.glb");
         let (doc, buffers, _) = gltf::import(path).expect("the shipped cave");
         let mut area = [0.0f64; 5];
         let mut count = [0usize; 5];

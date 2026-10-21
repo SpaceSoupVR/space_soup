@@ -4413,7 +4413,7 @@ mod terrain_mip_tests {
 
     #[test]
     fn the_shipped_cliffs_read_as_dry_rock() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/textures/terrain");
+        let dir = crate::test_game_dir().join("textures/terrain");
         let Some(Some(rock)) = super::load_terrain_rough(&dir).into_iter().nth(1) else {
             eprintln!("skipping: no terrain rock map");
             return;

@@ -336,7 +336,7 @@ mod shipped_lamps {
 
     #[test]
     fn the_lamps_thin_parts_are_a_small_share_of_them() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/models/lights");
+        let root = crate::test_game_dir().join("models/lights");
         for name in ["hanging_industrial_lamp/hanging_industrial_lamp_1k.gltf", "industrial_wall_sconce/industrial_wall_sconce_1k.gltf"] {
             let path = root.join(name);
             if !path.exists() {

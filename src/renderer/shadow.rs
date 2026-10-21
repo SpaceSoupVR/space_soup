@@ -2659,8 +2659,7 @@ mod render_tests {
     }
 
     fn lamp_path() -> Option<std::path::PathBuf> {
-        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../game/models/lights/hanging_industrial_lamp/hanging_industrial_lamp_1k.gltf");
+        let p = crate::test_game_dir().join("models/lights/hanging_industrial_lamp/hanging_industrial_lamp_1k.gltf");
         p.is_file().then_some(p)
     }
 
