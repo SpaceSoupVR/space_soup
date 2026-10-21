@@ -228,18 +228,31 @@ impl Worker {
     fn prepare(&mut self, hour: f32, days: f64, force: bool) -> Prepared {
         let snapshot = self.sky.snapshot(hour, days);
         let weights = LayerWeights::between(&self.baked_sky, self.baked_sun.as_ref(), &snapshot.irradiance, snapshot.light.as_ref());
+        let weights = match &self.layers {
+            Some(layers) => weights.with_keys(layers, snapshot.light.as_ref()),
+            None => weights,
+        };
         let daylight = daylight_share(&self.baked_sky, self.baked_sun.as_ref(), &snapshot);
         let moved = |a: &LayerWeights, b: &LayerWeights| {
             let far = |x: f32, y: f32| {
                 let (x, y) = (x.max(1e-9), y.max(1e-9));
                 (x / y).max(y / x) > 1.0 + RELIGHT_STEP && (x - y).abs() > 1e-7
             };
-            (0..3).any(|c| far(a.sky[c], b.sky[c]) || far(a.sun[c], b.sun[c]))
+            // Between keyframes, a step along the arc moves the bounce too.
+            let keyed = match (a.key, b.key) {
+                (Some(x), Some(y)) => {
+                    (x.a, x.b) != (y.a, y.b) && (x.a, x.b) != (y.b, y.a)
+                        || (x.t - y.t).abs() > RELIGHT_STEP
+                        || (0..3).any(|c| far(x.light[c], y.light[c]))
+                }
+                (x, y) => x.is_some() != y.is_some(),
+            };
+            keyed || (0..3).any(|c| far(a.sky[c], b.sky[c]) || far(a.sun[c], b.sun[c]))
         };
         let atlas = match &self.layers {
             Some(layers) if force || self.sent.as_ref().is_none_or(|s| moved(s, &weights)) => {
                 self.sent = Some(weights);
-                Some(crate::renderer::mesh::lightmap_mips_f16(&layers.combine(weights.sky, weights.sun), layers.width, layers.height))
+                Some(crate::renderer::mesh::lightmap_mips_f16(&layers.relit(&weights), layers.width, layers.height))
             }
             _ => None,
         };
@@ -353,6 +366,7 @@ mod tests {
             lamps: vec![0.01; 16],
             sky: vec![0.2; 16],
             sun: vec![0.5; 16],
+            sun_keys: Vec::new(),
         });
         let params = TimeOfDayParams::default();
         let ts = Arc::new(TimeOfDaySky::new(params));
@@ -360,5 +374,45 @@ mod tests {
         assert!(w.prepare(15.0, 0.0, true).atlas.is_some());
         assert!(w.prepare(15.0, 0.0, false).atlas.is_none(), "same light, no upload");
         assert!(w.prepare(3.0, 0.0, false).atlas.is_some(), "night relights");
+    }
+
+    /// With sun keyframes the bounce follows the sun along the day: at a key
+    /// the atlas holds that key's bounce, and walking on to the next relights
+    /// toward it.
+    #[test]
+    fn the_sun_bounce_walks_its_keyframes() {
+        use space_soup_sky::time_of_day::{sun_key_hours, SunKey};
+        let (sky, sun) = hdri_like();
+        let params = TimeOfDayParams::default();
+        let hours = sun_key_hours(&params, 4);
+        let flat = |v: f32| vec![v, v, v, 1.0, v, v, v, 1.0, v, v, v, 1.0, v, v, v, 1.0];
+        let layers = Arc::new(AtlasLayers {
+            width: 2,
+            height: 2,
+            lamps: vec![0.0; 16],
+            sky: vec![0.0; 16],
+            sun: flat(0.5),
+            sun_keys: hours.iter().enumerate().map(|(i, (h, d))| SunKey::from_rgba(*h, *d, &flat(1.0 + i as f32))).collect(),
+        });
+        let ts = Arc::new(TimeOfDaySky::new(params));
+        let mut w = Worker { sky: ts.clone(), baked_sky: sky, baked_sun: Some(sun), layers: Some(layers), sent: None };
+        let at = |w: &mut Worker, h: f32| {
+            let p = w.prepare(h, 0.0, true);
+            let light = p.snapshot.light.unwrap().light_rgb;
+            (p.weights.key.unwrap(), light)
+        };
+        let (k1, _) = at(&mut w, hours[1].0);
+        let on = if k1.t < 0.5 { k1.a } else { k1.b };
+        assert!(on == 1 && (k1.t < 0.02 || k1.t > 0.98), "{k1:?}");
+        let (k, _) = at(&mut w, 0.5 * (hours[1].0 + hours[2].0));
+        assert!([k.a, k.b].contains(&1) && [k.a, k.b].contains(&2) && (k.t - 0.5).abs() < 0.15, "{k:?}");
+        let prepared = w.prepare(0.5 * (hours[1].0 + hours[2].0), 0.0, true);
+        let lit = crate::renderer::mesh::lightmap_mips_f16(
+            &w.layers.as_ref().unwrap().relit(&prepared.weights),
+            2,
+            2,
+        );
+        assert!(prepared.atlas.is_some() && !lit.is_empty());
+        assert!(w.prepare(0.5 * (hours[1].0 + hours[2].0) + 0.5, 0.0, false).atlas.is_some(), "half an hour on relights");
     }
 }

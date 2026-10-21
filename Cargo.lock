@@ -2044,6 +2044,7 @@ name = "space_soup_sky"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "half",
  "image",
 ]
 
