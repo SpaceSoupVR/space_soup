@@ -492,10 +492,12 @@ impl XrRenderer {
                 Vec::new()
             };
 
-            let fires: Vec<_> = fires.into_iter().chain(self.lights_uniform.pool_light()).collect();
+            // The torch's pool, which the eye adapts to as it looks into it
+            // (`EyeAdaptation::meter_with_pool`).
+            let pool = self.lights_uniform.pool_light();
             let mut eye = self.eye.borrow_mut();
             eye.set_local_rooms(self.auto_exposure && self.levers.room_exposure);
-            let mut metered = eye.meter_with(head_world, gaze, &fires);
+            let mut metered = eye.meter_with_pool(head_world, gaze, &fires, &pool);
 
             if let Some((b, state)) = eyes_in_water[0].or(eyes_in_water[1]) {
                 let u = &self.water_bodies[b].uniform;

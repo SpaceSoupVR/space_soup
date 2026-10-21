@@ -57,6 +57,33 @@ fn breaker_front(amp: f32) -> f32 {
 
 const HORIZON_LIFT: (f32, f32) = (4000.0, 15000.0);
 
+/// How far above the eye the far skirt is lifted, as a slope (rise over
+/// distance): 3 mrad, about three eye-buffer pixels above the horizon, so the
+/// mesh's own edge always falls where the sea is already fully transparent
+/// (`HORIZON_IN_FS`). Lifted only to the eye, its edge sat within a pixel of
+/// the true horizon and its triangles drew it, stair-stepped and crawling
+/// (headset sunset, 2026-10-20).
+const HORIZON_CLEAR: f32 = 0.003;
+
+/// The Earth's radius, for the sea's horizon: below the eye by
+/// sqrt(2 h / R) radians from a height h (0.8 mrad from 2 m).
+const EARTH_RADIUS: f32 = 6.371e6;
+
+/// THE SEA'S HORIZON, DRAWN PER PIXEL. The water's coverage of its pixel
+/// against the true horizon of a curved sea, from the pixel's own ray (`v`,
+/// toward the eye: any point drawn at a pixel lies on that ray, lifted skirt
+/// or not, and the player frame turns only about the vertical, so `-v.y` is
+/// the ray's world elevation) and its angular size (`fwidth`): a filtered
+/// straight edge, the
+/// same at every head pose, so it neither steps nor crawls. Blended onto the
+/// sky already drawn beneath it (`Levers::sky_before_water`); from below the
+/// surface it is 1.
+const HORIZON_IN_FS: &str = r#"
+    let horizon_up = cam_pos().y + camera.player_frame.y - water.extinction.w;
+    let horizon_dip = -sqrt(2.0 * max(horizon_up, 0.0) / EARTH_RADIUS);
+    let horizon = select(1.0, saturate(0.5 + (horizon_dip + v.y) / max(fwidth(v.y), 1e-6)), horizon_up > 0.0);
+"#;
+
 fn paws_calm(wind_speed: f32) -> f32 {
     let t = ((wind_speed - 2.0) / 4.0).clamp(0.0, 1.0);
     0.15 + 0.85 * t * t * (3.0 - 2.0 * t)
@@ -899,12 +926,13 @@ fn {name}(pos: vec3<f32>, depth: f32, eye: vec3<f32>, t: f32) -> vec3<f32> {{
     }}
 
     let far = distance(pos.xz, eye.xz);
-    p.y = mix(p.y, max(p.y, eye.y), smoothstep({lift0}, {lift1}, far));
+    p.y = mix(p.y, max(p.y, eye.y + {clear} * far), smoothstep({lift0}, {lift1}, far));
     return p;
 }}
 "#,
         lift0 = format!("{:?}", HORIZON_LIFT.0),
         lift1 = format!("{:?}", HORIZON_LIFT.1),
+        clear = format!("{HORIZON_CLEAR:?}"),
     )
 }
 
@@ -1136,12 +1164,12 @@ fn water_wgsl_parts(dual: bool, rings: bool, drops: bool) -> String {
         "struct FsOut {\n    @location(0) colour: vec4<f32>,\n}"
     };
     let ret = if dual {
-        "return FsOut(vec4<f32>(mapped + beyond, 1.0), vec4<f32>(through, 1.0));"
+        "return FsOut(vec4<f32>((mapped + beyond) * horizon, 1.0), vec4<f32>(through * horizon + vec3<f32>(1.0 - horizon), 1.0));"
     } else {
 
-        "return FsOut(vec4<f32>(mapped + beyond, 1.0 - dot(through, vec3<f32>(1.0 / 3.0))));"
+        "return FsOut(vec4<f32>((mapped + beyond) * horizon, (1.0 - dot(through, vec3<f32>(1.0 / 3.0))) * horizon));"
     };
-    format!(
+    let src = format!(
         r#"{enable}
 {lights_block}
 
@@ -1351,7 +1379,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let rough = sqrt(sqrt(a2));
 
     let v = normalize(cam_pos() - in.world_pos);
-    let fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+{horizon}    let fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
 
     var r = reflect(-v, n);
     r.y = max(r.y, 0.002);
@@ -1523,6 +1551,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
 }}
 "#,
         enable = if dual { "enable dual_source_blending;" } else { "" },
+        horizon = HORIZON_IN_FS.replace("EARTH_RADIUS", &format!("{EARTH_RADIUS:?}")),
         lights_block = wgsl_lights_block(0, 1),
         mips = MIPS,
         wave_n = format!("{:.1}", WAVE_N as f32),
@@ -1539,7 +1568,14 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         ret = ret,
         surface = surface_wgsl(),
         surface_fn = surface_fn_wgsl("water_surface", "wave_disp"),
-    )
+    );
+    // The sky reflection once, not in both of `outdoor_radiance`'s ways out:
+    // the ground's outdoor pass ships with the same edit. Bought the room the
+    // sea's horizon needed under the instruction cache (2,442 -> 2,323 by the
+    // proxy, 2026-10-21).
+    let (from, to) = crate::renderer::brush_pipeline::DEDUP_OUTDOOR_SKY;
+    assert_eq!(src.matches(from).count(), 1, "the water lost outdoor_radiance's two ways out");
+    src.replacen(from, to, 1)
 }
 
 #[cfg(test)]

@@ -34,6 +34,14 @@ pub const BRIGHT_VIEW_RATIO: f32 = 12.0;
 /// door from 12 m (exposure x70,000 -> x520).
 pub const BRIGHT_VIEW_RATIO_LOCAL: f32 = 1000.0;
 pub const BRIGHT_VIEW_FROM_SR: f32 = 0.003;
+/// LOCAL ADAPTATION TO ONE'S OWN TORCH: looking into its pool, the eye
+/// adapts to what it lights, so the pool sits at most this many times above
+/// the adaptation (about a stop and a half: lit, with its texture, not white),
+/// and outside the beam the night goes black. The pool was metered as a share
+/// of the view among the dark, which a log average cannot follow: on the
+/// moonlit grass it stayed 11 stops under the pool, a white disc (headset,
+/// 2026-10-21).
+pub const POOL_VIEW_RATIO: f32 = 3.0;
 /// ...to where it holds in full (the same door at ~6.6 m).
 pub const BRIGHT_VIEW_TO_SR: f32 = 0.08;
 
@@ -303,6 +311,26 @@ impl EyeAdaptation {
 
     pub fn meter(&self, head: Vec3, gaze: Vec3) -> f32 {
         self.meter_with(head, gaze, &[])
+    }
+
+    /// `meter_with`, and a torch's pool (`(direction, luminance, solid angle)`
+    /// seen from the head) the eye adapts to as far as it looks at it
+    /// (`POOL_VIEW_RATIO`).
+    pub fn meter_with_pool(&self, head: Vec3, gaze: Vec3, extra: &[(Vec3, f32, f32)], pool: &[(Vec3, f32, f32)]) -> f32 {
+        let all: Vec<_> = extra.iter().chain(pool).copied().collect();
+        let metered = self.meter_with(head, gaze, &all);
+        let gaze = gaze.normalize_or_zero();
+        let (mut log_sum, mut seen) = (0.0f32, 0.0f32);
+        for &(d, lum, omega) in pool {
+            let w = omega * in_view(d, gaze);
+            log_sum += lum.max(self.log_floor()).ln() * w;
+            seen += w;
+        }
+        if seen <= 0.0 {
+            return metered;
+        }
+        let log = metered.max(self.log_floor()).ln();
+        (log + bright_view_pull(log_sum / seen, seen, log, POOL_VIEW_RATIO)).exp()
     }
 
     pub fn meter_with(&self, head: Vec3, gaze: Vec3, extra: &[(Vec3, f32, f32)]) -> f32 {
@@ -857,6 +885,30 @@ mod tests {
         assert_eq!(eye.meter_with(head, gaze, &[]), alone);
         let lit = eye.meter_with(head, gaze, &[(gaze, 0.5, 1.5)]);
         assert!(lit > 5.0 * alone, "{lit} vs {alone}");
+    }
+
+    /// A NIGHT EYE LOOKING INTO ITS TORCH'S POOL adapts to it: the pool, a
+    /// fifth of the view, ends within `POOL_VIEW_RATIO` of the meter, where a
+    /// log average over the dark left it 11 stops over. Looking away, the eye
+    /// is the night's again, and a pool off to the side pulls it only a part.
+    #[test]
+    fn a_night_eye_adapts_to_the_pool_it_looks_into() {
+        let mut eye = EyeAdaptation::sky_only(SkyIrradiance::flat(1e-5));
+        eye.set_max_exposure(1e6);
+        let (head, gaze) = (Vec3::ZERO, Vec3::NEG_Z);
+        let pool_lum = 0.35;
+        let pool: Vec<(Vec3, f32, f32)> = (0..8).map(|i| {
+            let a = i as f32 * std::f32::consts::TAU / 8.0;
+            (Vec3::new(0.2 * a.cos(), 0.2 * a.sin(), -1.0).normalize(), pool_lum, 0.59 / 8.0)
+        }).collect();
+        let dark = eye.meter_with(head, gaze, &pool);
+        let pulled = eye.meter_with_pool(head, gaze, &[], &pool);
+        assert!(pool_lum / dark > 30.0, "the log average alone leaves the pool five stops and more over: {dark}");
+        assert!((pool_lum / pulled - POOL_VIEW_RATIO).abs() < 0.05 * POOL_VIEW_RATIO, "looked into, the pool sits a ratio over: {pulled}");
+        let away = eye.meter_with_pool(head, Vec3::Z, &[], &pool);
+        assert!((away - eye.meter_with(head, Vec3::Z, &pool)).abs() <= 1e-9, "looking away, no pull: {away}");
+        let aside = eye.meter_with_pool(head, Vec3::new(-0.6, 0.0, -0.8), &[], &pool);
+        assert!(aside > eye.meter_with(head, Vec3::new(-0.6, 0.0, -0.8), &pool) && aside < pulled, "aside, a part: {aside}");
     }
 
     #[test]
