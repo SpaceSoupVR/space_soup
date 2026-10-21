@@ -217,6 +217,32 @@ impl Renderer {
         self.effects_made().place(placed);
     }
 
+    /// Adds an effect asset to the library, or replaces the one of its name
+    /// (an editor's unsaved version): what places or fires it takes the new
+    /// version on its next frame.
+    pub fn put_effect(&mut self, asset: &super::effect_asset::EffectAsset) -> Result<super::effects::stack::EffectId, Vec<super::effect_asset::Issue>> {
+        self.effects_made().put(asset)
+    }
+
+    pub fn effect_id(&self, name: &str) -> Option<super::effects::stack::EffectId> {
+        self.effects.as_ref().and_then(|fx| fx.id(name))
+    }
+
+    pub fn add_burst(&mut self, burst: super::effects::stack::EffectBurst) {
+        self.effects_made().add_burst(burst);
+    }
+
+    /// The effect particles drawn last frame: over, and screened.
+    pub fn effects_counts(&self) -> (u32, u32) {
+        self.effects.as_ref().map_or((0, 0), |fx| fx.counts())
+    }
+
+    pub fn set_effects_overdraw(&mut self, on: bool) {
+        if let Some(fx) = self.effects.as_mut() {
+            fx.set_overdraw(on);
+        }
+    }
+
     /// The effects' clock in seconds, and the hour of day the mist reads.
     pub fn set_effects_time(&mut self, seconds: f64, hour: Option<f32>) {
         if let Some(fx) = self.effects.as_mut() {

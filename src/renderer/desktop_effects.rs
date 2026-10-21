@@ -90,6 +90,30 @@ impl DesktopEffects {
         }
     }
 
+    /// Adds `asset` to the library, or replaces the one of its name: its
+    /// placements and bursts take the new version on their next frame.
+    pub fn put(&mut self, asset: &super::effect_asset::EffectAsset) -> Result<stack::EffectId, Vec<super::effect_asset::Issue>> {
+        self.library.add(asset)
+    }
+
+    pub fn id(&self, name: &str) -> Option<stack::EffectId> {
+        self.library.id(name)
+    }
+
+    pub fn add_burst(&mut self, burst: stack::EffectBurst) {
+        self.bursts.add(&self.library, burst);
+    }
+
+    /// The particles drawn last frame: over, and screened.
+    pub fn counts(&self) -> (u32, u32) {
+        if self.drawn { self.gpu.counts() } else { (0, 0) }
+    }
+
+    /// Draws every particle as one additive layer: overdraw as heat.
+    pub fn set_overdraw(&mut self, on: bool) {
+        self.gpu.overdraw = on;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.emitters.is_empty() && self.bursts.live.is_empty()
     }

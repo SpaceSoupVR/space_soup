@@ -8,6 +8,7 @@ use super::probe_stream::ProbeDesc;
 mod flash;
 pub mod mud_splash;
 pub mod authoring;
+pub mod catalog;
 pub mod seen;
 pub mod stack;
 pub mod templates;
@@ -3485,6 +3486,11 @@ impl EffectsGpu {
 
     pub fn any(&self) -> bool {
         self.over + self.screened > 0
+    }
+
+    /// The particles uploaded last: drawn over, and screened.
+    pub fn counts(&self) -> (u32, u32) {
+        (self.over, self.screened)
     }
 
     pub fn draw(&self, pass: &mut RenderPass<'_>, pipelines: &EffectsPipeline, camera: &BindGroup, probe: &BindGroup) {
