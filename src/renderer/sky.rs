@@ -70,6 +70,13 @@ pub struct SkyExtra {
     pub cloud_sky: [f32; 4],
 
     pub cloud_ground: [f32; 4],
+    /// How the two shown cloud maps are carried to now (`CloudSky::display_flow`):
+    /// the last whole map's, the newest's.
+    pub cloud_flow: [[f32; 4]; 2],
+    /// Each cloud layer's height and wind, lowest first (`cloud_sky::flow_winds`).
+    pub cloud_winds: [[f32; 4]; 4],
+    /// x: the eye's altitude the maps are carried for.
+    pub cloud_eye: [f32; 4],
 }
 
 impl SkyExtra {
@@ -284,7 +291,15 @@ pub struct Sky {
     night: NightMaps,
     /// Bound in the map's place while there is none: clear, all sky.
     cloud_texture: Texture,
+    /// And in the heights' place.
+    alt_texture: Texture,
     cloud_sampler: Sampler,
+    /// Counts the bind groups made, so a user of the maps knows to bind again.
+    bind_serial: u64,
+    /// The moment and the eye the map being built holds the sky at.
+    cloud_build: Option<(f64, [f32; 3])>,
+    /// The cloud clock's step at the last tick, seconds.
+    cloud_dt: f32,
     /// Where the eye was last frame (world x, z), for the halos' clouds.
     eye_xz: [f32; 2],
     /// Toward the clouds' light (the sun, or the moon) THIS frame, from the
@@ -475,6 +490,17 @@ pub fn sky_bind_group_layout(device: &Device) -> BindGroupLayout {
             night_entry(5),
             night_entry(6),
             night_entry(7),
+            // The cloud maps' heights (`CloudSky::alts_view`).
+            BindGroupLayoutEntry {
+                binding: 8,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -559,6 +585,46 @@ fn clouds_view(cloud_sky: &Option<CloudSky>, dummy: &Texture) -> TextureView {
     }
 }
 
+/// Bound in the heights' place while there is no map: 0, nothing to carry.
+fn alt_dummy(device: &Device, queue: &Queue) -> Texture {
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("sky_cloud_alts_none"),
+        size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R16Float,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+        &[0u8, 0],
+        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(2), rows_per_image: Some(1) },
+        Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+    );
+    texture
+}
+
+fn alts_view(cloud_sky: &Option<CloudSky>, dummy: &Texture) -> TextureView {
+    match cloud_sky {
+        Some(c) => c.alts_view().clone(),
+        None => dummy.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..Default::default() }),
+    }
+}
+
+/// What SpaceWarp's sky pass reads the clouds' motion from (`sky_motion`).
+pub struct SkyMotionSource {
+    /// Changes whenever the maps bound change.
+    pub key: u64,
+    pub maps: TextureView,
+    pub alts: TextureView,
+    /// The newest map's layer; the cloud clock's seconds since last frame;
+    /// the eye's altitude; 1 with clouds up.
+    pub misc: [f32; 4],
+    pub winds: [[f32; 4]; 4],
+}
+
 impl Sky {
     pub fn new(
         device: &Device,
@@ -610,6 +676,7 @@ impl Sky {
         });
         queue.write_buffer(&extra_buffer, 0, bytemuck::bytes_of(&extra));
         let cloud_texture = cloud_dummy(device, queue);
+        let alt_texture = alt_dummy(device, queue);
         let night = NightMaps::new(device, queue);
         let cloud_sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("sky_cloud_sampler"),
@@ -621,7 +688,7 @@ impl Sky {
             mipmap_filter: MipmapFilterMode::Linear,
             ..Default::default()
         });
-        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer, &clouds_view(&None, &cloud_texture), &cloud_sampler, &night);
+        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer, &clouds_view(&None, &cloud_texture), &alts_view(&None, &alt_texture), &cloud_sampler, &night);
 
         Self {
             bind_group,
@@ -640,7 +707,11 @@ impl Sky {
             light_is_moon: false,
             night,
             cloud_texture,
+            alt_texture,
             cloud_sampler,
+            bind_serial: 0,
+            cloud_build: None,
+            cloud_dt: 0.0,
             eye_xz: [0.0, 0.0],
             blend: None,
         }
@@ -655,8 +726,20 @@ impl Sky {
         self.clouds.is_some() && self.cloud_sky.is_some()
     }
 
+    /// What SpaceWarp's sky pass moves the clouds' pixels by: the newest map,
+    /// its heights and the winds, and the cloud clock's last step.
+    pub fn motion_source(&self) -> SkyMotionSource {
+        SkyMotionSource {
+            key: self.bind_serial,
+            maps: clouds_view(&self.cloud_sky, &self.cloud_texture),
+            alts: alts_view(&self.cloud_sky, &self.alt_texture),
+            misc: [self.extra.cloud_misc[1], self.cloud_dt, self.extra.cloud_eye[0], if self.has_clouds() { 1.0 } else { 0.0 }],
+            winds: self.extra.cloud_winds,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn bind(device: &Device, layout: &BindGroupLayout, texture: &Texture, sampler: &Sampler, extra: &Buffer, cloud_view: &TextureView, cloud_sampler: &Sampler, night: &NightMaps) -> BindGroup {
+    fn bind(device: &Device, layout: &BindGroupLayout, texture: &Texture, sampler: &Sampler, extra: &Buffer, cloud_view: &TextureView, alt_view: &TextureView, cloud_sampler: &Sampler, night: &NightMaps) -> BindGroup {
         let view = texture.create_view(&TextureViewDescriptor::default());
         device.create_bind_group(&BindGroupDescriptor {
             label: Some("sky_bg"),
@@ -670,6 +753,7 @@ impl Sky {
                 BindGroupEntry { binding: 5, resource: BindingResource::TextureView(&night.views[0]) },
                 BindGroupEntry { binding: 6, resource: BindingResource::TextureView(&night.views[1]) },
                 BindGroupEntry { binding: 7, resource: BindingResource::TextureView(&night.views[2]) },
+                BindGroupEntry { binding: 8, resource: BindingResource::TextureView(alt_view) },
             ],
         })
     }
@@ -729,7 +813,8 @@ impl Sky {
                 usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &self.cloud_sampler, &self.night);
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &alts_view(&self.cloud_sky, &self.alt_texture), &self.cloud_sampler, &self.night);
+            self.bind_serial += 1;
         }
         write_panorama(queue, &self.texture, pano);
         let new_field = match (&snap.cloud_field, &self.clouds) {
@@ -743,8 +828,10 @@ impl Sky {
                     Some(c) => c.set_weather(device, queue, field),
                     None => self.cloud_sky = Some(CloudSky::new(device, queue, field, &CloudNoise::shared())),
                 }
+                self.cloud_build = None;
             }
-            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &self.cloud_sampler, &self.night);
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &alts_view(&self.cloud_sky, &self.alt_texture), &self.cloud_sampler, &self.night);
+            self.bind_serial += 1;
         }
         let kept = self.clouds.as_ref().map(|c| c.model.clone());
         let population = self.clouds.as_mut().filter(|_| !new_field).map(|c| std::mem::take(&mut c.population)).unwrap_or_default();
@@ -805,6 +892,7 @@ impl Sky {
         }
         self.extra.mode[2] = seconds;
         if let Some(c) = self.clouds.as_mut() {
+            self.cloud_dt = (seconds as f64 - c.seconds).clamp(0.0, 0.25) as f32;
             c.seconds = seconds as f64;
             c.frame = c.frame.at(c.seconds);
             c.layers = c.model.layers(c.seconds);
@@ -891,9 +979,23 @@ impl Sky {
         cs.active = light.is_some() && shadow.is_some();
         let f = &c.frame;
         let u = CloudSkyUniform::new(&c.layers, eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean);
+        // A map holds the sky at one moment, seen from one eye, through all
+        // its slices; the sky shader carries it on from there. A map begun
+        // now is shown most two builds from now, so it is of then.
+        let now = c.seconds;
+        if gpu.starts_map(whole) || self.cloud_build.is_none() {
+            let at = if whole || gpu.is_fresh() { now } else { now + gpu.map_lead() };
+            self.cloud_build = Some((at, eye));
+        }
+        let (at, build_eye) = self.cloud_build.unwrap_or((now, eye));
+        // The layers at the map's moment, placed over the envelopes as they
+        // are now (their origin can move at any update).
+        let mut layers = c.model.layers(at);
+        c.population.place(&mut layers, at);
+        let m = CloudSkyUniform::new(&layers, build_eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean);
         gpu.set_population(device, queue, &c.population);
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("clouds") });
-        gpu.encode(&mut encoder, queue, &u, shadow.filter(|_| cs.active), whole);
+        gpu.encode_at(&mut encoder, queue, &m, &u, shadow.filter(|_| cs.active), whole, now, at);
         queue.submit(Some(encoder.finish()));
         let d = gpu.display();
         self.extra.cloud_misc[0] = d[0];
@@ -901,6 +1003,9 @@ impl Sky {
         self.extra.cloud_misc[2] = d[2];
         let k = gpu.display_scales();
         self.extra.cloud_scale = [k[0], k[1], 0.0, 0.0];
+        self.extra.cloud_flow = gpu.display_flow(now, eye);
+        self.extra.cloud_winds = crate::renderer::cloud_sky::flow_winds(&c.model.params, &c.layers);
+        self.extra.cloud_eye = [eye[1], 0.0, 0.0, 0.0];
         queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
     }
 
@@ -1448,16 +1553,16 @@ pub fn sky_cloud_shader() -> String {
         ),
         (
             "    celestial: array<vec4<f32>, 3>,\n}",
-            "    celestial: array<vec4<f32>, 3>,\n    cloud_scale: vec4<f32>,\n    cloud_offset: vec4<f32>,\n    cloud_misc: vec4<f32>,\n    cloud_light_dir: vec4<f32>,\n    cloud_light: vec4<f32>,\n    cloud_sky: vec4<f32>,\n    cloud_ground: vec4<f32>,\n}".to_string(),
+            "    celestial: array<vec4<f32>, 3>,\n    cloud_scale: vec4<f32>,\n    cloud_offset: vec4<f32>,\n    cloud_misc: vec4<f32>,\n    cloud_light_dir: vec4<f32>,\n    cloud_light: vec4<f32>,\n    cloud_sky: vec4<f32>,\n    cloud_ground: vec4<f32>,\n    cloud_flow: array<vec4<f32>, 2>,\n    cloud_winds: array<vec4<f32>, 4>,\n    cloud_eye: vec4<f32>,\n}".to_string(),
         ),
         (
             "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n",
-            "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n@group(1) @binding(3) var cloud_maps: texture_2d_array<f32>;\n@group(1) @binding(4) var cloud_samp: sampler;\n".to_string(),
+            "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n@group(1) @binding(3) var cloud_maps: texture_2d_array<f32>;\n@group(1) @binding(4) var cloud_samp: sampler;\n@group(1) @binding(8) var cloud_alts: texture_2d_array<f32>;\n".to_string(),
         ),
         (
             "@fragment fn fs_main(",
             format!(
-                r#"const CLOUD_PACK: f32 = {pack:?};
+                r#"{flow}
 
 // A sky map read through a cubic B-spline, in four bilinear taps (Sigg and
 // Hadwiger 2005): smooth to its second derivative, so no texel's square
@@ -1486,15 +1591,30 @@ fn sky_cloud_map(uv: vec2<f32>, layer: i32) -> vec4<f32> {{
 
 // The volumetric clouds (`cloud_sky.rs`): the sky map's last whole build
 // blending into its newest, rgb their light and a how much sky shows past
-// them, haze and all.
+// them, haze and all. Each map is read where it holds what is here now:
+// the cloud seen along `dir`, at the newest map's height for it, carried
+// back on that height's wind to the map's moment and seen from the map's
+// eye (`cloud_sky::advected_uv`).
 fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
     if (dir.y <= 0.0) {{
         return vec4<f32>(sky, 1.0);
     }}
-    let el = asin(clamp(dir.y, 0.0, 1.0));
-    let uv = vec2<f32>(atan2(dir.x, dir.z) / (2.0 * SKY_PI) + 0.5, pow(el / (0.5 * SKY_PI), 1.0 / CLOUD_PACK));
-    var a = sky_cloud_map(uv, i32(sky_extra.cloud_misc.x));
-    var b = sky_cloud_map(uv, i32(sky_extra.cloud_misc.y));
+    let uv = cloud_map_uv(dir);
+    var uva = uv;
+    var uvb = uv;
+    let alt = textureSampleLevel(cloud_alts, cloud_samp, uv, i32(sky_extra.cloud_misc.y), 0.0).r;
+    if (alt > 0.0) {{
+        let w = sky_extra.cloud_winds;
+        let wv = cloud_flow_wind(alt, w[0], w[1], w[2], w[3]);
+        let v = vec3<f32>(wv.x, 0.0, wv.y);
+        let p = dir * cloud_flow_distance(sky_extra.cloud_eye.x, alt, dir.y);
+        let fa = sky_extra.cloud_flow[0];
+        let fb = sky_extra.cloud_flow[1];
+        uva = cloud_map_uv(p + fa.xyz - v * fa.w);
+        uvb = cloud_map_uv(p + fb.xyz - v * fb.w);
+    }}
+    var a = sky_cloud_map(uva, i32(sky_extra.cloud_misc.x));
+    var b = sky_cloud_map(uvb, i32(sky_extra.cloud_misc.y));
     a = vec4<f32>(a.rgb * sky_extra.cloud_scale.x, a.a);
     b = vec4<f32>(b.rgb * sky_extra.cloud_scale.y, b.a);
     let c = mix(a, b, sky_extra.cloud_misc.z);
@@ -1502,7 +1622,7 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
 }}
 
 @fragment fn fs_main("#,
-                pack = crate::renderer::cloud_sky::MAP_PACK,
+                flow = crate::renderer::cloud_sky::cloud_flow_wgsl(),
             ),
         ),
         (

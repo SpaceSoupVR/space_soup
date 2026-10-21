@@ -11,6 +11,19 @@
 //! Its cost is fixed by the map, not by the eyes or the screen
 //! (`docs/engine/sky-realism-research.md` 4.5).
 //!
+//! THE CLOUDS DRIFT EVERY FRAME (2026-10-21). A map is drawn of the sky at
+//! one moment and from one eye (`CloudSky::encode_at`'s `map_time`), and
+//! keeps beside its light the height of what it shows (`alts`). The sky
+//! shader carries each map from then and there to here and now: every part
+//! of a cloud on its own height's wind (`advected_uv`), so tops and bases
+//! shear as real ones do, and walking under them moves them as parallax.
+//! Before, the sky moved only by a dissolve from one map to the next. A map
+//! now has to follow only what the wind cannot: shapes growing, merging and
+//! thinning, and the light. That changes slowly, so maps are drawn half as
+//! often as before, and the two blended are both where the clouds are now,
+//! so the change reads as a morph rather than a double image. SpaceWarp's
+//! sky pixels move the same way (`sky_motion`).
+//!
 //! The ground's shadow map (`UniformBuffer::cloud_shadow`, read per pixel by
 //! `cloud_sun_shadow`) is drawn from the same density every frame, so the
 //! shadows sweeping over the ground are the clouds overhead.
@@ -32,9 +45,16 @@ use wgpu::*;
 /// through a cubic B-spline, so no texel's square is drawn.
 pub const MAP_WIDTH: u32 = 2048;
 pub const MAP_HEIGHT: u32 = 768;
-/// Frames to a whole map: 16 rows, 32 k rays a frame; a map every 0.67 s
-/// at 72 Hz, while a 12 m/s wind moves a cloud 1.5 km up 0.3 deg.
-pub const MAP_SLICES: u32 = 48;
+/// Frames to a whole map: 8 rows, 16 k rays a frame; a map every 1.3 s at
+/// 72 Hz (2.7 s under SpaceWarp's 36). Half the rays of the 48 slices
+/// before the maps were carried by the wind: the drift is drawn every frame
+/// anyway, and a cumulus changes shape over minutes.
+pub const MAP_SLICES: u32 = 96;
+/// A texel with no cloud keeps the height of the lowest layer that is up,
+/// at this weight against what it holds: a filtered read across a cloud's
+/// edge then blends heights, never a height with nothing (which would carry
+/// the edge on the wind of half its height).
+pub const ALT_FILL_WEIGHT: f32 = 0.02;
 /// Rows are packed toward the horizon: elevation = 90 deg * v^MAP_PACK.
 pub const MAP_PACK: f32 = 1.5;
 
@@ -97,6 +117,86 @@ pub fn map_uv(d: [f32; 3]) -> [f32; 2] {
     [d[0].atan2(d[2]) / std::f32::consts::TAU + 0.5, (el / std::f32::consts::FRAC_PI_2).powf(1.0 / MAP_PACK)]
 }
 
+/// Metres from an eye at `eye_alt` along a direction rising `mu` to the
+/// altitude `alt`, over the curved earth (`cloud_flow_distance`'s twin).
+pub fn flow_distance(eye_alt: f32, alt: f32, mu: f32) -> f32 {
+    let earth = c::EARTH_RADIUS_M;
+    let r = earth + eye_alt;
+    let k = (alt - eye_alt).max(0.0) * (2.0 * earth + alt + eye_alt);
+    let rm = r * mu.max(0.0);
+    k / ((rm * rm + k).sqrt() + rm).max(1e-3)
+}
+
+/// The wind at altitude `alt` (x, z, m/s): between the layers' own
+/// (`flow_winds`, by height), held past the lowest and the highest
+/// (`cloud_flow_wind`'s twin).
+pub fn flow_wind(alt: f32, winds: &[[f32; 4]; LAYERS]) -> [f32; 2] {
+    let mut v = [winds[0][1], winds[0][2]];
+    for k in 1..LAYERS {
+        let t = ((alt - winds[k - 1][0]) / (winds[k][0] - winds[k - 1][0]).max(1.0)).clamp(0.0, 1.0);
+        v = [v[0] + (winds[k][1] - v[0]) * t, v[1] + (winds[k][2] - v[1]) * t];
+    }
+    v
+}
+
+/// Each layer's middle height and its wind (x, z, m/s), lowest first: what
+/// the sky shader and SpaceWarp move the maps' clouds by.
+pub fn flow_winds(p: &space_soup_sky::clouds::CloudParams, layers: &[CloudLayer; LAYERS]) -> [[f32; 4]; LAYERS] {
+    let mut w: [[f32; 4]; LAYERS] = std::array::from_fn(|k| {
+        let (dir, v) = cl::layer_wind(p, k);
+        [0.5 * (layers[k].base_m + layers[k].top_m), (dir[0] * v) as f32, (dir[1] * v) as f32, 0.0]
+    });
+    w.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    w
+}
+
+/// WHERE A MAP HOLDS WHAT IS SEEN ALONG `dir` NOW: the cloud there, at
+/// `alt` (the map's height), as it was `age` seconds ago on its height's
+/// wind and seen from where the map's eye was (`eye_delta` = the eye now
+/// less the map's). The sky shader's lookup (`sky_clouds`).
+pub fn advected_uv(dir: [f32; 3], alt: f32, eye_alt: f32, winds: &[[f32; 4]; LAYERS], eye_delta: [f32; 3], age: f32) -> [f32; 2] {
+    let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt().max(1e-6);
+    let d = dir.map(|v| v / len);
+    if alt <= 0.0 || d[1] <= 0.0 {
+        return map_uv(d);
+    }
+    let t = flow_distance(eye_alt, alt, d[1]);
+    let v = flow_wind(alt, winds);
+    map_uv([d[0] * t + eye_delta[0] - v[0] * age, d[1] * t + eye_delta[1], d[2] * t + eye_delta[2] - v[1] * age])
+}
+
+/// The lookup and the wind the sky shader and SpaceWarp's sky share
+/// (`map_uv`, `flow_distance`, `flow_wind`, line for line).
+pub fn cloud_flow_wgsl() -> String {
+    CLOUD_FLOW_WGSL.replace("{EARTH}", &format!("{:.1}", c::EARTH_RADIUS_M)).replace("{PACK}", &format!("{MAP_PACK:?}"))
+}
+
+const CLOUD_FLOW_WGSL: &str = r#"
+const CLOUD_FLOW_EARTH: f32 = {EARTH};
+const CLOUD_FLOW_PACK: f32 = {PACK};
+
+fn cloud_map_uv(d: vec3<f32>) -> vec2<f32> {
+    let n = normalize(d);
+    let el = asin(clamp(n.y, 0.0, 1.0));
+    return vec2<f32>(atan2(n.x, n.z) / 6.28318531 + 0.5, pow(el / 1.57079633, 1.0 / CLOUD_FLOW_PACK));
+}
+
+fn cloud_flow_distance(eye_alt: f32, alt: f32, mu: f32) -> f32 {
+    let r = CLOUD_FLOW_EARTH + eye_alt;
+    let k = max(alt - eye_alt, 0.0) * (2.0 * CLOUD_FLOW_EARTH + alt + eye_alt);
+    let rm = r * max(mu, 0.0);
+    return k / max(sqrt(rm * rm + k) + rm, 1e-3);
+}
+
+fn cloud_flow_wind(alt: f32, w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, w3: vec4<f32>) -> vec2<f32> {
+    var v = w0.yz;
+    v = mix(v, w1.yz, clamp((alt - w0.x) / max(w1.x - w0.x, 1.0), 0.0, 1.0));
+    v = mix(v, w2.yz, clamp((alt - w1.x) / max(w2.x - w1.x, 1.0), 0.0, 1.0));
+    v = mix(v, w3.yz, clamp((alt - w2.x) / max(w3.x - w2.x, 1.0), 0.0, 1.0));
+    return v;
+}
+"#;
+
 /// Mips of each envelope, down to 1 texel: the march reads the one its
 /// sample's footprint spans. Read at the top level everywhere, the 2048 x 768
 /// map's slice cost 4.1 ms on the Quest (bench 2026-10-21, against well under
@@ -129,10 +229,19 @@ pub struct CloudSky {
     maps: Texture,
     map_layers: [TextureView; 3],
     array_view: TextureView,
+    /// Beside each map, the height of what it shows (R16F, metres): what
+    /// the wind it is carried on is read by.
+    alts: Texture,
+    alt_layers: [TextureView; 3],
+    alt_view: TextureView,
     sampler: Sampler,
     uniform: Buffer,
     layout: BindGroupLayout,
     bind_group: BindGroup,
+    /// The ground's shadow is of the clouds NOW, while a map holds them at
+    /// its own moment: a uniform and a bind group of its own.
+    shadow_uniform: Buffer,
+    shadow_bind_group: BindGroup,
     map_pipeline: RenderPipeline,
     shadow_pipeline: RenderPipeline,
     /// The map shown last, the one shown now, and the one being built.
@@ -146,6 +255,12 @@ pub struct CloudSky {
     /// night's radiances (1e-8) fell among half floats' subnormals and the
     /// clouds came out banded and fringed red.
     scales: [f32; 3],
+    /// The cloud time each map holds the sky at, and the eye it is seen from.
+    times: [f64; 3],
+    eyes: [[f32; 3]; 3],
+    /// Seconds a map takes to build, as measured, and when the last began.
+    period: f64,
+    last_start: Option<f64>,
 }
 
 fn weather_texture(device: &Device, queue: &Queue, field: &CloudField) -> Texture {
@@ -217,6 +332,30 @@ impl CloudSky {
             dimension: Some(TextureViewDimension::D2Array),
             ..Default::default()
         });
+        let alts = device.create_texture(&TextureDescriptor {
+            label: Some("cloud_sky_alts"),
+            size: Extent3d { width: MAP_WIDTH, height: MAP_HEIGHT, depth_or_array_layers: 3 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R16Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let alt_layers: [TextureView; 3] = std::array::from_fn(|i| {
+            alts.create_view(&TextureViewDescriptor {
+                label: Some("cloud_sky_alt"),
+                dimension: Some(TextureViewDimension::D2),
+                base_array_layer: i as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
+        let alt_view = alts.create_view(&TextureViewDescriptor {
+            label: Some("cloud_sky_alts"),
+            dimension: Some(TextureViewDimension::D2Array),
+            ..Default::default()
+        });
         let sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("cloud_noise_sampler"),
             address_mode_u: AddressMode::Repeat,
@@ -226,12 +365,16 @@ impl CloudSky {
             min_filter: FilterMode::Linear,
             ..Default::default()
         });
-        let uniform = device.create_buffer(&BufferDescriptor {
-            label: Some("cloud_sky_uniform"),
-            size: std::mem::size_of::<CloudSkyUniform>() as u64,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let uniform_of = |label| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<CloudSkyUniform>() as u64,
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let uniform = uniform_of("cloud_sky_uniform");
+        let shadow_uniform = uniform_of("cloud_shadow_uniform");
         let tex = |binding, dim| BindGroupLayoutEntry {
             binding,
             visibility: ShaderStages::FRAGMENT,
@@ -398,16 +541,17 @@ impl CloudSky {
             multiview_mask: None,
             cache: None,
         });
-        // Clear sky until a map is drawn: a map never drawn reads black.
+        // Clear sky until a map is drawn: a map never drawn reads black. Its
+        // heights read 0: nothing to carry.
         let mut enc = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("cloud_sky_clear") });
-        for view in &map_layers {
+        for (view, clear) in map_layers.iter().map(|v| (v, Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 })).chain(alt_layers.iter().map(|v| (v, Color::TRANSPARENT))) {
             enc.begin_render_pass(&RenderPassDescriptor {
                 label: Some("cloud_sky_clear"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: Operations { load: LoadOp::Clear(Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }), store: StoreOp::Store },
+                    ops: Operations { load: LoadOp::Clear(clear), store: StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -417,13 +561,15 @@ impl CloudSky {
         }
         queue.submit(Some(enc.finish()));
         let bind_group = Self::bind(device, &layout, &uniform, &noise_tex, &weather, &sampler, &envelope, &envelope_sampler);
+        let shadow_bind_group = Self::bind(device, &layout, &shadow_uniform, &noise_tex, &weather, &sampler, &envelope, &envelope_sampler);
         let shader = device.create_shader_module(ShaderModuleDescriptor { label: Some("cloud_sky"), source: ShaderSource::Wgsl(source.into()) });
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("cloud_sky_layout"),
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = |label: &str, entry: &str, format: TextureFormat| {
+        let pipeline = |label: &str, entry: &str, formats: &[TextureFormat]| {
+            let targets: Vec<Option<ColorTargetState>> = formats.iter().map(|&format| Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::ALL })).collect();
             device.create_render_pipeline(&RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
@@ -432,7 +578,7 @@ impl CloudSky {
                     module: &shader,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
-                    targets: &[Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::ALL })],
+                    targets: &targets,
                 }),
                 primitive: PrimitiveState::default(),
                 depth_stencil: None,
@@ -441,8 +587,8 @@ impl CloudSky {
                 cache: None,
             })
         };
-        let map_pipeline = pipeline("cloud_sky_map", "fs_map", TextureFormat::Rgba16Float);
-        let shadow_pipeline = pipeline("cloud_sky_shadow", "fs_shadow", TextureFormat::R8Unorm);
+        let map_pipeline = pipeline("cloud_sky_map", "fs_map", &[TextureFormat::Rgba16Float, TextureFormat::R16Float]);
+        let shadow_pipeline = pipeline("cloud_sky_shadow", "fs_shadow", &[TextureFormat::R8Unorm]);
         Self {
             noise: noise_tex,
             weather,
@@ -462,10 +608,15 @@ impl CloudSky {
             maps,
             map_layers,
             array_view,
+            alts,
+            alt_layers,
+            alt_view,
             sampler,
             uniform,
             layout,
             bind_group,
+            shadow_uniform,
+            shadow_bind_group,
             map_pipeline,
             shadow_pipeline,
             prev: 0,
@@ -474,6 +625,10 @@ impl CloudSky {
             next_row: 0,
             fresh: true,
             scales: [1.0; 3],
+            times: [0.0; 3],
+            eyes: [[0.0; 3]; 3],
+            period: MAP_SLICES as f64 / 72.0,
+            last_start: None,
         }
     }
 
@@ -500,6 +655,7 @@ impl CloudSky {
     pub fn set_weather(&mut self, device: &Device, queue: &Queue, field: &CloudField) {
         self.weather = weather_texture(device, queue, field);
         self.bind_group = Self::bind(device, &self.layout, &self.uniform, &self.noise, &self.weather, &self.sampler, &self.envelope, &self.envelope_sampler);
+        self.shadow_bind_group = Self::bind(device, &self.layout, &self.shadow_uniform, &self.noise, &self.weather, &self.sampler, &self.envelope, &self.envelope_sampler);
         self.fresh = true;
     }
 
@@ -542,6 +698,47 @@ impl CloudSky {
         &self.array_view
     }
 
+    /// The maps and their heights, for tests that read them back.
+    #[cfg(test)]
+    pub(crate) fn textures(&self) -> (&Texture, &Texture) {
+        (&self.maps, &self.alts)
+    }
+
+    /// The heights beside the maps (`texture_2d_array`, R16F metres).
+    pub fn alts_view(&self) -> &TextureView {
+        &self.alt_view
+    }
+
+    /// Whether the next `encode_at` begins a map (and so takes its moment).
+    pub fn starts_map(&self, whole: bool) -> bool {
+        self.fresh || whole || self.next_row == 0
+    }
+
+    /// No map is drawn yet: the first is drawn whole, of the sky now.
+    pub fn is_fresh(&self) -> bool {
+        self.fresh
+    }
+
+    /// How far ahead of the clock a map begun now should hold the sky: two
+    /// builds, when it is half way through being shown (it rises over the
+    /// build after its own and falls over the next), so the shapes on
+    /// screen are neither behind nor ahead of the clock on average.
+    pub fn map_lead(&self) -> f64 {
+        2.0 * self.period
+    }
+
+    /// What the sky shader carries the two shown maps by (last whole,
+    /// newest): the eye now less each map's (xyz), and the seconds from each
+    /// map's moment to `now` (w), held within a few builds of it so a clock
+    /// that jumps carries nothing off the sky.
+    pub fn display_flow(&self, now: f64, eye: [f32; 3]) -> [[f32; 4]; 2] {
+        let reach = 4.0 * self.period + 1.0;
+        [self.prev, self.cur].map(|i| {
+            let e = self.eyes[i as usize];
+            [eye[0] - e[0], eye[1] - e[1], eye[2] - e[2], (now - self.times[i as usize]).clamp(-reach, reach) as f32]
+        })
+    }
+
     /// The layers the sky shader blends between and how far: the last whole
     /// map, the newest, and the share of the next one built.
     pub fn display(&self) -> [f32; 3] {
@@ -554,10 +751,18 @@ impl CloudSky {
         [1.0 / self.scales[self.prev as usize], 1.0 / self.scales[self.cur as usize]]
     }
 
-    /// ONE FRAME'S CLOUDS: the next slice of the sky map (the whole map when
-    /// `whole`, or when none is drawn yet), and the ground's shadow into
-    /// `shadow` when given.
+    /// `encode_at` with one uniform for the map and the shadow, at time 0.
     pub fn encode(&mut self, encoder: &mut CommandEncoder, queue: &Queue, u: &CloudSkyUniform, shadow: Option<&TextureView>, whole: bool) {
+        self.encode_at(encoder, queue, u, u, shadow, whole, 0.0, 0.0);
+    }
+
+    /// ONE FRAME'S CLOUDS: the next slice of the sky map (the whole map when
+    /// `whole`, or when none is drawn yet) from `map` -- the sky at
+    /// `map_time`, seen from its eye, the same for every slice of one map --
+    /// and the ground's shadow into `shadow` when given, from `now_u`: the
+    /// clouds at `now`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_at(&mut self, encoder: &mut CommandEncoder, queue: &Queue, map: &CloudSkyUniform, now_u: &CloudSkyUniform, shadow: Option<&TextureView>, whole: bool, now: f64, map_time: f64) {
         if self.envelope_pending {
             self.envelope_pending = false;
             for k in 0..POPULATED {
@@ -609,23 +814,31 @@ impl CloudSky {
         } else {
             (self.build, self.next_row, (self.next_row + rows).min(MAP_HEIGHT))
         };
-        // A map keeps the scale its first slice was drawn at.
+        // A map keeps the scale its first slice was drawn at, and its moment.
         if from == 0 {
-            let peak = (0..3).map(|c| u.light[c] + u.amb_sky[c]).fold(0.0f32, f32::max);
+            let peak = (0..3).map(|c| map.light[c] + map.amb_sky[c]).fold(0.0f32, f32::max);
             self.scales[target as usize] = 1.0 / peak.max(1e-20);
+            self.times[target as usize] = map_time;
+            self.eyes[target as usize] = [map.eye[0], map.eye[1], map.eye[2]];
+            if !(self.fresh || whole) {
+                if let Some(s) = self.last_start {
+                    self.period = (0.5 * self.period + 0.5 * (now - s)).clamp(0.05, 30.0);
+                }
+                self.last_start = Some(now);
+            }
         }
-        let mut u = *u;
+        let mut u = *map;
         u.eye[3] = self.scales[target as usize];
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&u));
+        queue.write_buffer(&self.shadow_uniform, 0, bytemuck::bytes_of(now_u));
         {
+            let ops = Operations { load: LoadOp::Load, store: StoreOp::Store };
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("cloud_sky_map"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &self.map_layers[target as usize],
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
-                })],
+                color_attachments: &[
+                    Some(RenderPassColorAttachment { view: &self.map_layers[target as usize], depth_slice: None, resolve_target: None, ops }),
+                    Some(RenderPassColorAttachment { view: &self.alt_layers[target as usize], depth_slice: None, resolve_target: None, ops }),
+                ],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 multiview_mask: None,
@@ -665,7 +878,7 @@ impl CloudSky {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.shadow_pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(0, &self.shadow_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
     }
@@ -720,6 +933,7 @@ pub fn cloud_sky_shader() -> String {
         .replace("{POPULATED}", &format!("{}u", POPULATED))
         .replace("{ENVELOPE_TEXEL}", &f(cp::ENVELOPE_TEXEL_M))
         .replace("{ENVELOPE_TOP_MIP}", &f((ENVELOPE_MIPS - 1) as f32))
+        .replace("{ALT_FILL_WEIGHT}", &f(ALT_FILL_WEIGHT))
 }
 
 /// The envelope pass: each live cloud a square around its profile, added
@@ -873,6 +1087,7 @@ const FAR_BLEND1: f32 = {FAR_BLEND1};
 const POPULATED: u32 = {POPULATED};
 const ENVELOPE_TEXEL: f32 = {ENVELOPE_TEXEL};
 const ENVELOPE_TOP_MIP: f32 = {ENVELOPE_TOP_MIP};
+const ALT_FILL_WEIGHT: f32 = {ALT_FILL_WEIGHT};
 
 @vertex fn vs_full(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
@@ -1168,7 +1383,12 @@ fn map_dir(uv: vec2<f32>) -> vec3<f32> {
 
 // THE SKY MAP: the clouds' light toward the eye along this texel's
 // direction (rgb) and how much of the sky beyond shows (a), haze included.
-@fragment fn fs_map(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+struct MapOut {
+    @location(0) light: vec4<f32>,
+    @location(1) alt: vec4<f32>,
+}
+
+@fragment fn fs_map(@builtin(position) pos: vec4<f32>) -> MapOut {
     let size = vec2<f32>(u.amb_sky.w, u.light.w);
     let dir = map_dir(pos.xy / size);
     let mu = dir.y;
@@ -1187,6 +1407,14 @@ fn map_dir(uv: vec2<f32>) -> vec3<f32> {
     var trans = 1.0;
     var seen = 0.0;
     var rgb = vec3<f32>(0.0);
+    // The height of what is seen, by its share of the light (`alts`).
+    var height = 0.0;
+    var fill = 0.0;
+    for (var k = 0u; k < 4u; k = k + 1u) {
+        if (fill == 0.0 && layer_on(k)) {
+            fill = 0.5 * (lv(k, 0u).x + lv(k, 0u).y);
+        }
+    }
     for (var k = 0u; k < 3u; k = k + 1u) {
         if (!layer_on(k) || trans < 0.01) {
             continue;
@@ -1214,6 +1442,7 @@ fn map_dir(uv: vec2<f32>) -> vec3<f32> {
                 let w = trans * (1.0 - ts) * exp(-t * HAZE);
                 rgb = rgb + w * s;
                 seen = seen + w;
+                height = height + w * p_alt;
                 trans = trans * ts;
                 if (trans < 0.01) {
                     break;
@@ -1231,9 +1460,13 @@ fn map_dir(uv: vec2<f32>) -> vec3<f32> {
             let w = trans * alpha * exp(-t * HAZE);
             rgb = rgb + w * s;
             seen = seen + w;
+            height = height + w * lv(3u, 0u).x;
         }
     }
-    return vec4<f32>(rgb * u.eye.w, 1.0 - seen);
+    var out: MapOut;
+    out.light = vec4<f32>(rgb * u.eye.w, 1.0 - seen);
+    out.alt = vec4<f32>((height + ALT_FILL_WEIGHT * fill) / (seen + ALT_FILL_WEIGHT), 0.0, 0.0, 0.0);
+    return out;
 }
 
 // THE GROUND'S SHADOW: the light every layer lets through toward the light
@@ -1408,6 +1641,90 @@ mod tests {
             let ms = run(&mut sky, 10);
             eprintln!("{name}, populated {populated}: a whole map {ms:.2} ms, a slice {:.3} ms", ms / MAP_SLICES as f64);
         }
+    }
+
+    /// A map's texel read between its four nearest, as the GPU's linear
+    /// sampler does: wrapping round in azimuth, held at the horizon and the
+    /// zenith.
+    fn bilinear(texels: &[f32], uv: [f32; 2]) -> f32 {
+        let (w, h) = (MAP_WIDTH as i32, MAP_HEIGHT as i32);
+        let x = uv[0] * w as f32 - 0.5;
+        let y = (uv[1] * h as f32 - 0.5).clamp(0.0, (h - 1) as f32);
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let at = |i: i32, j: i32| texels[(j.clamp(0, h - 1) * w + i.rem_euclid(w)) as usize];
+        let (i, j) = (x0 as i32, y0 as i32);
+        let top = at(i, j) + (at(i + 1, j) - at(i, j)) * fx;
+        let bottom = at(i, j + 1) + (at(i + 1, j + 1) - at(i, j + 1)) * fx;
+        top + (bottom - top) * fy
+    }
+
+    /// A map drawn of the sky one moment and from one eye, then each frame
+    /// moved from there to here and now (wind, walking), shows the clouds
+    /// where a map drawn here and now has them -- far nearer than the old map
+    /// left where it was -- and the heights beside it are the layers'.
+    #[test]
+    fn a_map_carried_on_its_winds_shows_the_clouds_where_a_new_map_has_them() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let scope = device.push_error_scope(ErrorFilter::Validation);
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = CloudParams { coverage: 0.5, ..Default::default() };
+        let model = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise);
+        let mut population = CloudPopulation::new();
+        let mut draw = |t: f64, eye: [f32; 3]| {
+            population.update(&params, &field, t);
+            let mut layers = model.layers(t);
+            population.place(&mut layers, t);
+            let mut sky = CloudSky::new(&device, &queue, &field, &noise);
+            sky.set_population(&device, &queue, &population);
+            let u = CloudSkyUniform::new(&layers, eye, [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
+            let mut enc = device.create_command_encoder(&Default::default());
+            sky.encode_at(&mut enc, &queue, &u, &u, None, true, t, t);
+            queue.submit(Some(enc.finish()));
+            let layer = sky.display()[1] as u32;
+            let map = read_back(&device, &queue, &sky.maps, layer, MAP_WIDTH, MAP_HEIGHT, 8);
+            let alts = read_back(&device, &queue, &sky.alts, layer, MAP_WIDTH, MAP_HEIGHT, 2);
+            let n = (MAP_WIDTH * MAP_HEIGHT) as usize;
+            let alpha: Vec<f32> = (0..n).map(|i| half(&map[i * 8 + 6..i * 8 + 8])).collect();
+            let alt: Vec<f32> = (0..n).map(|i| half(&alts[i * 2..i * 2 + 2])).collect();
+            (alpha, alt, layers)
+        };
+        let (t0, t1) = (20_000.0, 20_015.0);
+        let (e0, e1) = ([10.0f32, 2.0, 5.0], [130.0f32, 2.0, -80.0]);
+        let (old, _, _) = draw(t0, e0);
+        let (new, new_alt, layers) = draw(t1, e1);
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            panic!("the cloud passes do not validate: {e}");
+        }
+        let winds = flow_winds(&params, &layers);
+        assert!(winds.windows(2).all(|w| w[0][0] <= w[1][0]), "winds not by height: {winds:?}");
+        let delta = [e1[0] - e0[0], e1[1] - e0[1], e1[2] - e0[2]];
+        let (mut carried, mut left, mut n) = (0.0f32, 0.0f32, 0);
+        let lo = layers.iter().map(|l| l.base_m).fold(f32::MAX, f32::min);
+        let hi = layers.iter().map(|l| l.top_m).fold(0.0, f32::max);
+        let mut heights_ok = true;
+        for j in (MAP_HEIGHT / 4..MAP_HEIGHT * 15 / 16).step_by(7) {
+            for i in (0..MAP_WIDTH).step_by(11) {
+                let uv = [(i as f32 + 0.5) / MAP_WIDTH as f32, (j as f32 + 0.5) / MAP_HEIGHT as f32];
+                let want = bilinear(&new, uv);
+                let alt = bilinear(&new_alt, uv);
+                heights_ok &= alt == 0.0 || (alt >= lo - 1.0 && alt <= hi + 1.0);
+                let moved = advected_uv(map_dir(uv), alt, e1[1], &winds, delta, (t1 - t0) as f32);
+                let still = bilinear(&old, uv);
+                if (want - still).abs() < 0.02 && want > 0.98 {
+                    continue;
+                }
+                carried += (bilinear(&old, moved) - want).abs();
+                left += (still - want).abs();
+                n += 1;
+            }
+        }
+        let (carried, left) = (carried / n as f32, left / n as f32);
+        eprintln!("{n} directions: the old map carried is off by {carried:.4}, left where it was {left:.4}");
+        assert!(heights_ok, "a map height lies outside the layers' {lo}..{hi}");
+        assert!(n > 500, "too few clouded directions: {n}");
+        assert!(carried < 0.35 * left, "carrying the map does not follow the clouds: {carried} vs {left}");
     }
 
     /// THE ENVELOPES ARE THE POPULATION'S: each layer's splatted map against

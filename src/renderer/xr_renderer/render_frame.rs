@@ -1941,6 +1941,33 @@ impl XrRenderer {
             && self.levers.space_warp_debug & 16384 == 0;
 
         post.reflection_share = warp_reflections && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some());
+        // The sky's motion (`sky_motion`); lever space_warp_debug 131072 leaves
+        // the sky at zero motion as before, for a desk A/B.
+        let mut warp_sky_group: Option<wgpu::BindGroup> = None;
+        if let Some(sw) = self.space_warp.as_ref().filter(|sw| sw.acquired.is_some() && self.levers.space_warp_debug & 131072 == 0) {
+            let src = self.sky.motion_source();
+            for eye in 0..2usize {
+                let (c, p, world_eye) = crate::renderer::space_warp::world_slot(
+                    warp_view_proj[eye],
+                    sw.prev.map(|(vps, w2p)| (vps[eye], w2p)),
+                    warp_world_to_player,
+                    {
+                        let e = eye_views[eye.min(eye_views.len() - 1)].pose.position;
+                        glam::Vec3::new(e.x, e.y, e.z)
+                    },
+                );
+                let dbg = self.levers.space_warp_debug;
+                let cam = crate::renderer::space_warp::MotionCamera {
+                    curr: c.to_cols_array_2d(),
+                    prev: p.to_cols_array_2d(),
+                    params: [if dbg & 2 != 0 { -1.0 } else { 1.0 }, if dbg & 4 != 0 { 0.0 } else { 1.0 }, warp_steps.0, warp_steps.1],
+                    eye: [world_eye.x, world_eye.y, world_eye.z, 1.0],
+                    reflect: [0.0; 4],
+                };
+                sw.pipelines.sky.write(&self.wgpu_queue, eye, &cam, &crate::renderer::sky_motion::flow_for(c, sw.size, &src));
+            }
+            warp_sky_group = Some(sw.pipelines.sky.group(&self.wgpu_device, &src));
+        }
         if let Some(sw) = self.space_warp.as_ref().filter(|sw| sw.acquired.is_some()) {
             use crate::renderer::space_warp::{previous_clip, MotionCamera, SLOT_STRIDE};
             let stride = SLOT_STRIDE as usize;
@@ -3878,6 +3905,7 @@ impl XrRenderer {
                         &sw.depth_targets[d][eye].view,
                         &draws,
                         &particles,
+                        warp_sky_group.as_ref().filter(|_| self.levers.space_warp_debug & 1 == 0).map(|g| sw.pipelines.sky.draw(g, eye)),
                         self.levers.space_warp_debug & 2048 != 0,
                         if self.levers.space_warp_debug & 4096 != 0 { 0.0 } else { 1.0 },
                     );

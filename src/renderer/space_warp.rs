@@ -293,6 +293,9 @@ pub struct MotionPipelines {
 
     effects: Vec<wgpu::RenderPipeline>,
 
+    /// Every pixel nothing nearer covers (`sky_motion`).
+    pub sky: crate::renderer::sky_motion::SkyMotion,
+
     stencil: bool,
 }
 
@@ -550,6 +553,7 @@ impl MotionPipelines {
             water,
             weather,
             effects,
+            sky: crate::renderer::sky_motion::SkyMotion::new(device, depth_format),
             stencil: depth_format.has_stencil_aspect(),
         }
     }
@@ -628,6 +632,7 @@ pub fn record(
     depth: &wgpu::TextureView,
     draws: &[MotionDraw],
     particles: &[MotionParticles],
+    sky: Option<crate::renderer::sky_motion::SkyDraw>,
     stencil_store: bool,
     depth_clear: f32,
 ) {
@@ -672,6 +677,13 @@ pub fn record(
             bound = Some(key);
         }
         pass.draw_indexed(d.first..d.first + d.count, 0, 0..1);
+    }
+    // The sky where nothing covers it, under the particles' blended motion.
+    // At the far plane, so only over a depth cleared to it.
+    if let Some(s) = sky.filter(|_| depth_clear >= 1.0) {
+        pass.set_pipeline(s.pipeline);
+        pass.set_bind_group(0, s.group, &s.offsets);
+        pass.draw(0..3, 0..1);
     }
     for p in particles.iter().filter(|p| !p.range.is_empty() && p.vertices > 0 && p.slot < MAX_SLOTS) {
         let wants = match p.kind {
@@ -1175,7 +1187,7 @@ mod tests {
                 slot,
                 joints: Some(&reflect),
             };
-            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], &[], false, 1.0);
+            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], &[], None, false, 1.0);
             encoder.copy_texture_to_buffer(
                 motion.as_image_copy(),
                 wgpu::TexelCopyBufferInfo {
@@ -1315,7 +1327,7 @@ mod tests {
                 joints: Some(&groups[waves.current()]),
             };
             let depth_view = depth.create_view(&Default::default());
-            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], &[], false, 1.0);
+            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], &[], None, false, 1.0);
             for (texture, back, bytes, aspect) in
                 [(&motion, &motion_back, 8, wgpu::TextureAspect::All), (&depth, &depth_back, 4, wgpu::TextureAspect::DepthOnly)]
             {

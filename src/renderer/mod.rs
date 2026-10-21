@@ -36,6 +36,7 @@ pub mod probe_stream;
 pub mod room_light;
 pub mod cloud_sky;
 pub mod sky;
+pub mod sky_motion;
 pub mod time_of_day;
 pub mod ssr;
 pub mod terrain_pipeline;
