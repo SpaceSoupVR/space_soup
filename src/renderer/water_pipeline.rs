@@ -607,6 +607,29 @@ pub(crate) const WATER_CUTS: &[(&str, &[(&str, &str)])] = &[
 
     ("glint", &[("        glint = glint + radiance * WATER_PI * water_ggx(n, v, to_l, a2);\n", "")]),
 
+    // What open sea never shows, all at once (no caustic, walk, view beyond,
+    // refraction, surf or breaker): 28 -> 20 registers, 37% -> 50%
+    // occupancy, 3430 -> 2559 instructions, and the same frame time at
+    // day_sea (23.9 vs 23.6 / 24.6 ms, 2026-10-21) -- the water is held up by
+    // neither, so a deep-water twin was not kept.
+    (
+        "deep",
+        &[
+            ("    let caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, 5.0, thickness)));", "    let caustic = 1.0;"),
+            ("    if (on_map && bed_shows) {\n        let flat", "    if (false) {\n        let flat"),
+            ("    if (drawn < 1.0 && bed_shows) {\n        bed_seen", "    if (false) {\n        bed_seen"),
+            ("    if (has_map) {\n        let closing", "    if (false) {\n        let closing"),
+            ("    if (water.waves.y > 0.0) {\n        let count = swash;", "    if (false) {\n        let count = swash;"),
+            ("    if (water.waves.y > 0.0 && still_depth > 0.0 && still_depth < 2.8) {\n        let breaker_count", "    if (false) {\n        let breaker_count"),
+        ],
+    ),
+
+    // Nothing shaded: what the water's mesh, raster and blend cost alone
+    // (the driver strips everything after a constant return). day_sea:
+    // 14.3-16.0 ms against 11.9-12.3 with no water and 23.6-27.2 shipped
+    // (2026-10-21): the water's cost is its fragment shading.
+    ("flat", &[("    let q = in.rest;\n    let span = ", "    if (true) {\n        var flat: FsOut;\n        return flat;\n    }\n    let q = in.rest;\n    let span = ")]),
+
     ("prints", &[("    let colour = mix(shade, foam_light, froth_cover);", "    let colour = vec3<f32>(print.x, print.y, 0.15);")]),
 ];
 
