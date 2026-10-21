@@ -37,6 +37,11 @@ pub struct WindowRecord {
 
     #[serde(default)]
     pub cpu: BTreeMap<String, f64>,
+
+    /// The time of day's clock at the window's end (hours), when it runs: a
+    /// sweep through sunset is read window by window against it.
+    #[serde(default)]
+    pub hour: Option<f32>,
 }
 
 impl WindowRecord {
@@ -121,6 +126,7 @@ mod tests {
             pass: [("scene0".to_string(), 12.0f32)].into_iter().collect(),
             xr: [("app/gpu_frametime".to_string(), 31.2)].into_iter().collect(),
             cpu: [("pose_ms".to_string(), 1.5)].into_iter().collect(),
+            hour: Some(18.5),
         }
     }
 

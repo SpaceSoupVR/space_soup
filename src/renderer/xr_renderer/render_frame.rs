@@ -4198,6 +4198,7 @@ impl XrRenderer {
                     pass: breakdown.iter().flatten().map(|t| (t.label.clone(), t.ms)).collect(),
                     xr: counters.iter().map(|c| (c.short.clone(), c.value)).collect(),
                     cpu: cpu_parts,
+                    hour: self.time_of_day_hour(),
                 };
                 log.write(record.to_line());
             }

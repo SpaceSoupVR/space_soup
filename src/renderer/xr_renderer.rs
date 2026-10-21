@@ -786,6 +786,8 @@ impl XrRenderer {
         session: &xr::Session<xr::Vulkan>,
         msaa: MsaaLevel,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // The clouds' population a second ahead, off the render thread.
+        crate::renderer::cloud_worker::enable();
         let view_configs = xr_ctx.instance.enumerate_view_configuration_views(
             xr_ctx.system,
             xr::ViewConfigurationType::PRIMARY_STEREO,

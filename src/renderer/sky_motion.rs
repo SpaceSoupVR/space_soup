@@ -331,7 +331,7 @@ mod tests {
         crate::renderer::sky::SkyMotionSource {
             key: 1,
             maps: one(wgpu::TextureFormat::Rgba16Float, &clear),
-            alts: one(wgpu::TextureFormat::R16Float, &[0, 0]),
+            alts: one(wgpu::TextureFormat::Rg16Float, &[0, 0, 0x00, 0x3c]),
             misc: [0.0; 4],
             winds: [[0.0; 4]; 4],
         }
@@ -405,7 +405,7 @@ mod tests {
         }
         let (maps, alts) = sky.textures();
         let map = read(&device, &queue, maps, layer as u32, MAP_WIDTH, MAP_HEIGHT, 8);
-        let alt = read(&device, &queue, alts, layer as u32, MAP_WIDTH, MAP_HEIGHT, 2);
+        let alt = read(&device, &queue, alts, layer as u32, MAP_WIDTH, MAP_HEIGHT, 4);
         let texel = |uv: [f32; 2], f: &dyn Fn(usize) -> f32| {
             let x = ((uv[0] * MAP_WIDTH as f32) as u32).min(MAP_WIDTH - 1);
             let y = ((uv[1] * MAP_HEIGHT as f32) as u32).min(MAP_HEIGHT - 1);
@@ -420,7 +420,7 @@ mod tests {
                 }
                 let uv = cs::map_uv(d.to_array());
                 let a = texel(uv, &|k| half(&map[k * 8 + 6..]));
-                let h = texel(uv, &|k| half(&alt[k * 2..]));
+                let h = texel(uv, &|k| half(&alt[k * 4..]));
                 let g = got[(j * W + i) as usize];
                 if a > 0.995 {
                     gaps += 1;

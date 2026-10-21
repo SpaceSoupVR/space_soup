@@ -181,9 +181,24 @@ impl SkyClouds {
         CloudWeather::new(&self.field, Some(&self.population))
     }
 
-    /// The population at `seconds`, and the layers placed over its maps.
-    fn settle(&mut self) {
-        self.population.update(&self.model.params, &self.field, self.seconds);
+    /// The population at `seconds`, and the layers placed over its maps:
+    /// the worker's when there is one -- the first too, which took 1.7 s on
+    /// the headset's render thread (2026-10-21); until it comes the layers
+    /// read the weather's mean, as past the map -- and `warm` the rays whose
+    /// tiles it should fill.
+    fn settle(&mut self, worker: Option<&mut crate::renderer::cloud_worker::CloudWorker>, warm: Vec<([f32; 2], f32, [f32; 3])>) {
+        match worker {
+            Some(w) => {
+                let (params, field, model) = (self.model.params, self.field.clone(), self.model.clone());
+                let ask = |seconds| crate::renderer::cloud_worker::Request { params, field, model, seconds, warm };
+                if let Some(frame) = w.poll(self.seconds, ask) {
+                    self.population = frame;
+                }
+            }
+            _ => {
+                self.population.update(&self.model.params, &self.field, self.seconds);
+            }
+        }
         self.population.place(&mut self.layers, self.seconds);
     }
 }
@@ -321,6 +336,9 @@ pub struct Sky {
     /// and lit between them, frame by frame (`Sky::tick`), so the sky's
     /// colour and the light it gives never step at a snapshot.
     blend: Option<SkyBlend>,
+    /// The clouds' population drawn a second ahead off the render thread,
+    /// when the app asked for it (`cloud_worker::enable`).
+    cloud_worker: Option<crate::renderer::cloud_worker::CloudWorker>,
 }
 
 /// Two time-of-day snapshots and how far the sky is from one to the other.
@@ -585,7 +603,8 @@ fn clouds_view(cloud_sky: &Option<CloudSky>, dummy: &Texture) -> TextureView {
     }
 }
 
-/// Bound in the heights' place while there is no map: 0, nothing to carry.
+/// Bound in the heights' place while there is no map: 0, nothing to carry,
+/// and nothing in the way (transmittance 1).
 fn alt_dummy(device: &Device, queue: &Queue) -> Texture {
     let texture = device.create_texture(&TextureDescriptor {
         label: Some("sky_cloud_alts_none"),
@@ -593,14 +612,14 @@ fn alt_dummy(device: &Device, queue: &Queue) -> Texture {
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        format: TextureFormat::R16Float,
+        format: TextureFormat::Rg16Float,
         usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         view_formats: &[],
     });
     queue.write_texture(
         TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
-        &[0u8, 0],
-        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(2), rows_per_image: Some(1) },
+        &[0u8, 0, 0x00, 0x3c],
+        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
         Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
     );
     texture
@@ -714,6 +733,7 @@ impl Sky {
             cloud_dt: 0.0,
             eye_xz: [0.0, 0.0],
             blend: None,
+            cloud_worker: None,
         }
     }
 
@@ -833,6 +853,14 @@ impl Sky {
             self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &alts_view(&self.cloud_sky, &self.alt_texture), &self.cloud_sampler, &self.night);
             self.bind_serial += 1;
         }
+        // A new weather field starts the worker's births over.
+        if new_field {
+            self.cloud_worker = None;
+        }
+        if crate::renderer::cloud_worker::enabled() && self.cloud_worker.is_none() {
+            self.cloud_worker = Some(crate::renderer::cloud_worker::CloudWorker::new());
+        }
+        let warm = self.cloud_warm_rays();
         let kept = self.clouds.as_ref().map(|c| c.model.clone());
         let population = self.clouds.as_mut().filter(|_| !new_field).map(|c| std::mem::take(&mut c.population)).unwrap_or_default();
         self.clouds = match (snap.clouds, &snap.cloud_field) {
@@ -851,7 +879,7 @@ impl Sky {
                     light_is_moon: snap.light_is_moon,
                     population,
                 };
-                c.settle();
+                c.settle(self.cloud_worker.as_mut(), warm);
                 Some(c)
             }
             _ => None,
@@ -891,12 +919,13 @@ impl Sky {
             return;
         }
         self.extra.mode[2] = seconds;
+        let warm = self.cloud_warm_rays();
         if let Some(c) = self.clouds.as_mut() {
             self.cloud_dt = (seconds as f64 - c.seconds).clamp(0.0, 0.25) as f32;
             c.seconds = seconds as f64;
             c.frame = c.frame.at(c.seconds);
             c.layers = c.model.layers(c.seconds);
-            c.settle();
+            c.settle(self.cloud_worker.as_mut(), warm);
             self.extra.set_cloud_offsets(&c.frame);
         }
         let blending = self.blend.as_mut().is_some_and(|b| {
@@ -940,6 +969,25 @@ impl Sky {
 
     /// Toward the clouds' light now: this frame's astronomy when it has
     /// run, else the snapshot's.
+    /// The rays toward the light the render thread casts through the clouds
+    /// (`dim_sun_by_clouds`, the shadow's mean in `step_clouds`), for the
+    /// worker to warm the population's tiles along.
+    fn cloud_warm_rays(&self) -> Vec<([f32; 2], f32, [f32; 3])> {
+        let Some(dir) = self.cloud_light_dir() else { return Vec::new() };
+        let h = space_soup_sky::clouds::LEVEL_SUN_HALF_M;
+        let mut rays: Vec<([f32; 2], f32, [f32; 3])> = (0..9).map(|k| ([((k % 3) as f32 - 1.0) * h, ((k / 3) as f32 - 1.0) * h], 0.0, dir)).collect();
+        let v3 = |v: [f32; 4]| unit3([v[0], v[1], v[2]]);
+        rays.push((self.eye_xz, 0.0, v3(self.extra.sun)));
+        rays.push((self.eye_xz, 0.0, v3(self.extra.moon)));
+        if let Some(centre) = self.cloud_shadow.centre {
+            let at = |k: i32| (k as f32 - 1.5) / 4.0 * CLOUD_SHADOW_EXTENT_M;
+            for k in 0..16 {
+                rays.push(([centre[0] + at(k % 4), centre[1] + at(k / 4)], self.extra.cloud_eye[0], dir));
+            }
+        }
+        rays
+    }
+
     pub fn cloud_light_dir(&self) -> Option<[f32; 3]> {
         let c = self.clouds.as_ref()?;
         Some(unit3(self.light_now.or(c.sun_clear.map(|s| s.direction)).unwrap_or(c.frame.light_dir)))
@@ -994,6 +1042,8 @@ impl Sky {
         c.population.place(&mut layers, at);
         let m = CloudSkyUniform::new(&layers, build_eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean);
         gpu.set_population(device, queue, &c.population);
+        let winds = crate::renderer::cloud_sky::flow_winds(&c.model.params, &c.layers);
+        gpu.set_winds(winds);
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("clouds") });
         gpu.encode_at(&mut encoder, queue, &m, &u, shadow.filter(|_| cs.active), whole, now, at);
         queue.submit(Some(encoder.finish()));
@@ -1004,7 +1054,7 @@ impl Sky {
         let k = gpu.display_scales();
         self.extra.cloud_scale = [k[0], k[1], 0.0, 0.0];
         self.extra.cloud_flow = gpu.display_flow(now, eye);
-        self.extra.cloud_winds = crate::renderer::cloud_sky::flow_winds(&c.model.params, &c.layers);
+        self.extra.cloud_winds = winds;
         self.extra.cloud_eye = [eye[1], 0.0, 0.0, 0.0];
         queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
     }
@@ -1418,7 +1468,8 @@ fn sky_apparent(s: vec3<f32>) -> vec3<f32> {{
     return vec3<f32>(s.x * k, sin(e2), s.z * k);
 }}
 
-fn sky_moon(d: vec3<f32>, px: f32) -> vec4<f32> {{
+// `k`: the share of the disc (not its halo) that comes through (clouds).
+fn sky_moon(d: vec3<f32>, px: f32, k: f32) -> vec4<f32> {{
     let m = sky_extra.moon.xyz;
     let rho = sky_extra.moon.w;
     if (dot(d, m) < HALO_COS || m.y < -0.05) {{
@@ -1464,7 +1515,7 @@ fn sky_moon(d: vec3<f32>, px: f32) -> vec4<f32> {{
     let rgb = sky_extra.moon_radiance.rgb;
     let peak = max(max(rgb.r, rgb.g), rgb.b) * 1.3 * max(camera.post_params.x, 0.0);
     let seen = min(1.0, MOON_SEEN / max(peak, 1e-12));
-    return vec4<f32>(surface * cover * seen + halo, cover);
+    return vec4<f32>(surface * cover * seen * k + halo, cover);
 }}
 
 // The sun: its disc -- limb-darkened per channel (Neckel and Labs: the edge
@@ -1472,7 +1523,7 @@ fn sky_moon(d: vec3<f32>, px: f32) -> vec4<f32> {{
 // horizon, lifted and flattened by refraction -- and its glare.
 // `sun_radiance` is the disc's mean radiance through the air at the
 // snapshot's apparent elevation, whose sine is its `.w`.
-fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
+fn sky_sun_disc(d: vec3<f32>, px: f32, k: f32) -> vec3<f32> {{
     let s = sky_extra.sun.xyz;
     let rho = sky_extra.sun.w;
     if (dot(d, s) < HALO_COS) {{
@@ -1495,7 +1546,7 @@ fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
     let mu = sqrt(max(1.0 - min(r * r, 1.0), 0.0));
     let limb = (1.0 - SUN_LIMB_U * (1.0 - mu)) * ((1.0 - SUN_LIMB_BAKED / 3.0) / (1.0 - SUN_LIMB_U / 3.0));
     let redden = exp(clamp(-sky_extra.extinction.xyz * (sky_air(d.y) - sky_air(sky_extra.sun_radiance.w)), vec3<f32>(-4.0), vec3<f32>(4.0)));
-    return out + sky_extra.sun_radiance.rgb * limb * redden * cover;
+    return out + sky_extra.sun_radiance.rgb * limb * redden * cover * k;
 }}
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
@@ -1511,8 +1562,8 @@ fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
     var radiance = textureSample(sky_tex, sky_samp, uv).rgb * camera.sky_params.x;
 
     if (sky_extra.mode.x > 0.5) {{
-        radiance = radiance * sky_extra.mode.y + sky_sun_disc(world_dir, px);
-        let moon = sky_moon(world_dir, px);
+        radiance = radiance * sky_extra.mode.y + sky_sun_disc(world_dir, px, 1.0);
+        let moon = sky_moon(world_dir, px, 1.0);
         radiance = radiance + moon.rgb;
         if (sky_extra.mode.w > 0.5 && world_dir.y > 0.0) {{
             radiance = radiance + sky_stars(world_dir, px) * (1.0 - moon.a);
@@ -1595,6 +1646,14 @@ fn sky_cloud_map(uv: vec2<f32>, layer: i32) -> vec4<f32> {{
 // the cloud seen along `dir`, at the newest map's height for it, carried
 // back on that height's wind to the map's moment and seen from the map's
 // eye (`cloud_sky::advected_uv`).
+// How much of a disc behind the clouds comes through: the map's alpha is
+// haze-weighted (a far cloud fades into the air, and the air's own glow is
+// in the sky behind), but a cloud blocks the sun however far off it is.
+// Near the horizon the alpha read 1 behind thick cloud and the sun shone
+// through it (headset, 2026-10-21). Read only near a disc (`alts` .g), as
+// the share of the alpha a disc gets.
+var<private> cloud_through: f32 = 1.0;
+
 fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
     if (dir.y <= 0.0) {{
         return vec4<f32>(sky, 1.0);
@@ -1618,6 +1677,13 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
     a = vec4<f32>(a.rgb * sky_extra.cloud_scale.x, a.a);
     b = vec4<f32>(b.rgb * sky_extra.cloud_scale.y, b.a);
     let c = mix(a, b, sky_extra.cloud_misc.z);
+    if (max(dot(dir, sky_extra.sun.xyz), dot(dir, sky_extra.moon.xyz)) > 0.9995) {{
+        let ta = textureSampleLevel(cloud_alts, cloud_samp, uva, i32(sky_extra.cloud_misc.x), 0.0).g;
+        let tb = textureSampleLevel(cloud_alts, cloud_samp, uvb, i32(sky_extra.cloud_misc.y), 0.0).g;
+        // As a share of the alpha, which it never exceeds: both are read at
+        // the same uv (test `a_far_cloud_the_haze_hides_still_blocks_the_sun`).
+        cloud_through = mix(ta, tb, sky_extra.cloud_misc.z) / max(c.a, 1e-4);
+    }}
     return vec4<f32>(sky * c.a + c.rgb, c.a);
 }}
 
@@ -1626,8 +1692,8 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
             ),
         ),
         (
-            "        radiance = radiance * sky_extra.mode.y + sky_sun_disc(world_dir, px);\n        let moon = sky_moon(world_dir, px);\n        radiance = radiance + moon.rgb;\n        if (sky_extra.mode.w > 0.5 && world_dir.y > 0.0) {\n            radiance = radiance + sky_stars(world_dir, px) * (1.0 - moon.a);\n        }",
-            "        let cloud = sky_clouds(world_dir, radiance * sky_extra.mode.y);\n        radiance = cloud.rgb + sky_sun_disc(world_dir, px) * cloud.a;\n        let moon = sky_moon(world_dir, px);\n        radiance = radiance + moon.rgb * cloud.a;\n        if (sky_extra.mode.w > 0.5 && world_dir.y > 0.0) {\n            radiance = radiance + sky_stars(world_dir, px) * (1.0 - moon.a) * cloud.a;\n        }".to_string(),
+            "        radiance = radiance * sky_extra.mode.y + sky_sun_disc(world_dir, px, 1.0);\n        let moon = sky_moon(world_dir, px, 1.0);\n        radiance = radiance + moon.rgb;\n        if (sky_extra.mode.w > 0.5 && world_dir.y > 0.0) {\n            radiance = radiance + sky_stars(world_dir, px) * (1.0 - moon.a);\n        }",
+            "        let cloud = sky_clouds(world_dir, radiance * sky_extra.mode.y);\n        radiance = cloud.rgb + sky_sun_disc(world_dir, px, cloud_through) * cloud.a;\n        let moon = sky_moon(world_dir, px, cloud_through);\n        radiance = radiance + moon.rgb * cloud.a;\n        if (sky_extra.mode.w > 0.5 && world_dir.y > 0.0) {\n            radiance = radiance + sky_stars(world_dir, px) * (1.0 - moon.a) * cloud.a;\n        }".to_string(),
         ),
     ];
     let mut out = src;
@@ -1647,6 +1713,88 @@ mod tests {
     #[test]
     fn the_shader_reads_the_star_cells_at_their_size() {
         assert!(sky_shader().contains(&format!("const STAR_CELLS: f32 = {:.1};", STAR_CELLS)));
+    }
+
+    /// WHAT THE CLOUDS COST THE RENDER THREAD a frame, as `Sky::tick` and
+    /// `step_clouds` spend it on the CPU: the layers, the population's update
+    /// and the rays toward the light, over two minutes of 72 Hz frames.
+    /// The headset logged ticks of 5-55 ms about once a second and 120-160
+    /// ms now and then (TODTIME, 2026-10-21): a dropped frame each second.
+    /// `--ignored`.
+    #[test]
+    #[ignore]
+    fn time_the_clouds_on_the_render_thread() {
+        use space_soup_sky::cloud_layers::CloudModel;
+        use space_soup_sky::cloud_population::CloudPopulation;
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = space_soup_sky::clouds::CloudParams { coverage: 0.45, wind_speed: 12.0, ..Default::default() };
+        let model = CloudModel::new(&params, &noise);
+        let built = std::time::Instant::now();
+        let _again = CloudModel::new(&params, &noise);
+        eprintln!("CLOUDTICK a CloudModel takes {:.1} ms", built.elapsed().as_secs_f64() * 1000.0);
+        let mut population = CloudPopulation::new();
+        let t0 = 20_000.0;
+        let started = std::time::Instant::now();
+        population.update(&params, &field, t0);
+        let first = started.elapsed().as_secs_f64() * 1000.0;
+        let (mut worst, mut worst_update, mut worst_rays, mut over) = (0.0f64, 0.0f64, 0.0f64, 0u32);
+        let frames = 72 * 120;
+        for f in 0..frames {
+            let t = t0 + f as f64 / 72.0;
+            let a = std::time::Instant::now();
+            let mut layers = model.layers(t);
+            population.update(&params, &field, t);
+            population.place(&mut layers, t);
+            let b = std::time::Instant::now();
+            let w = CloudWeather::new(&field, Some(&population));
+            let dir = [0.4, 0.5, 0.3];
+            let _ = level_transmittance(&layers, w, dir);
+            let _ = cloud_layers::transmittance_toward(&layers, &noise, w, [3.0, 4.0], 0.0, unit3(dir));
+            let _ = cloud_layers::transmittance_toward(&layers, &noise, w, [3.0, 4.0], 0.0, unit3([-0.4, 0.5, -0.3]));
+            if f % CLOUD_SHADOW_MEAN_FRAMES as usize == 0 {
+                for k in 0..16 {
+                    let _ = cloud_layers::transmittance_toward(&layers, &noise, w, [(k % 4) as f32 * 1000.0, (k / 4) as f32 * 1000.0], 0.0, unit3(dir));
+                }
+            }
+            let c = std::time::Instant::now();
+            let (u, r, all) = ((b - a).as_secs_f64() * 1000.0, (c - b).as_secs_f64() * 1000.0, (c - a).as_secs_f64() * 1000.0);
+            worst = worst.max(all);
+            worst_update = worst_update.max(u);
+            worst_rays = worst_rays.max(r);
+            over += (all > 2.0) as u32;
+        }
+        eprintln!("CLOUDTICK first update {first:.1} ms; over {frames} frames the worst {worst:.2} ms (update {worst_update:.2}, rays {worst_rays:.2}), {over} frames over 2 ms");
+        // The same with the worker drawing each second ahead (`cloud_worker`),
+        // in real time so it has the second it is given.
+        let field = std::sync::Arc::new(field);
+        let model = std::sync::Arc::new(model);
+        let mut worker = crate::renderer::cloud_worker::CloudWorker::new();
+        let (mut worst, mut over, mut swaps) = (0.0f64, 0u32, 0u32);
+        let start = std::time::Instant::now();
+        let real = 72 * 20;
+        for f in 0..real {
+            while start.elapsed().as_secs_f64() < f as f64 / 72.0 {
+                std::thread::yield_now();
+            }
+            let t = t0 + 200.0 + f as f64 / 72.0;
+            let a = std::time::Instant::now();
+            let mut layers = model.layers(t);
+            let dir = [0.4, 0.5, 0.3];
+            let warm: Vec<([f32; 2], f32, [f32; 3])> = (0..9).map(|k| ([((k % 3) as f32 - 1.0) * 150.0, ((k / 3) as f32 - 1.0) * 150.0], 0.0, unit3(dir))).collect();
+            let ask = |seconds| crate::renderer::cloud_worker::Request { params, field: field.clone(), model: model.clone(), seconds, warm };
+            if let Some(frame) = worker.poll(t, ask) {
+                population = frame;
+                swaps += 1;
+            }
+            population.place(&mut layers, t);
+            let w = CloudWeather::new(&field, Some(&population));
+            let _ = level_transmittance(&layers, w, dir);
+            let all = a.elapsed().as_secs_f64() * 1000.0;
+            worst = worst.max(all);
+            over += (all > 2.0) as u32;
+        }
+        eprintln!("CLOUDTICK with the worker: {real} frames in real time, {swaps} populations swapped in, the worst {worst:.2} ms, {over} frames over 2 ms");
     }
 
     #[test]
@@ -2415,6 +2563,11 @@ mod cloud_size_tests {
         let clear: usize = crate::renderer::shader_inlining::inlined_sizes(&super::sky_shader(), "fs_main").iter().map(|r| r.own * r.copies).sum();
         let clouded: usize = crate::renderer::shader_inlining::inlined_sizes(&super::sky_cloud_shader(), "fs_main").iter().map(|r| r.own * r.copies).sum();
         eprintln!("sky fs_main by the proxy: clear {clear}, with clouds {clouded}");
-        assert!(clouded < clear + 400, "the cloud code adds {} (283 when written, 2026-10-19)", clouded - clear);
+        // A budget of ours, not the cliff: the I-cache cliff measured on this
+        // proxy is near 2424 (water), and the clouded sky is ~1316 in all.
+        // 400 -> 420 on 2026-10-21 for the discs' own cloud transmittance
+        // (+17, read only near a disc), which put the sun back behind far
+        // cloud on the horizon.
+        assert!(clouded < clear + 420, "the cloud code adds {} (283 when written, 2026-10-19; 401 on 2026-10-21)", clouded - clear);
     }
 }

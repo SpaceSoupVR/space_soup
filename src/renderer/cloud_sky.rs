@@ -57,6 +57,23 @@ pub const MAP_SLICES: u32 = 96;
 pub const ALT_FILL_WEIGHT: f32 = 0.02;
 /// Rows are packed toward the horizon: elevation = 90 deg * v^MAP_PACK.
 pub const MAP_PACK: f32 = 1.5;
+/// THE MAPS ACCUMULATE (2026-10-21). Each map's samples sit at their own
+/// fraction of the step (`HISTORY_JITTER` apart, every texel alike, so
+/// neighbouring rays still read neighbouring noise), and a map built from a
+/// slice keeps this share of its own march and the rest of the newest map,
+/// carried to its moment and eye on the winds (`advected_uv`). The fixed
+/// sample planes of one march drew a wood grain through every cloud; across
+/// maps the planes move, so the grain averages out over about 1 / share maps
+/// (a few seconds), long before a shape changes.
+pub const HISTORY_NEW: f32 = 0.3;
+/// Where the old and new maps disagree by this much of the sky showing (a
+/// cloud born, or uncovered by the eye moving), the new march is taken
+/// alone (from the first to the second): history is for the grain, not for
+/// keeping a cloud.
+pub const HISTORY_REJECT: [f32; 2] = [0.2, 0.5];
+/// One map's sample fraction to the next: the golden ratio's, so any run of
+/// maps spreads its samples evenly through the step.
+pub const HISTORY_JITTER: f32 = 0.618_034;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -74,7 +91,7 @@ pub struct CloudSkyUniform {
     pub amb_ground: [f32; 4],
     /// The shadow map's centre x, z, extent, and the ground's altitude.
     pub shadow: [f32; 4],
-    pub layers: [[[f32; 4]; 9]; LAYERS],
+    pub layers: [[[f32; 4]; 10]; LAYERS],
 }
 
 impl CloudSkyUniform {
@@ -244,6 +261,16 @@ pub struct CloudSky {
     shadow_bind_group: BindGroup,
     map_pipeline: RenderPipeline,
     shadow_pipeline: RenderPipeline,
+    /// What a map slice accumulates over (`HISTORY_NEW`): the carry from the
+    /// newest whole map to the one being built, and a bind group per map
+    /// to read (each map's own layer views, so the layer written is never
+    /// the one read).
+    history_uniform: Buffer,
+    history_groups: [BindGroup; 3],
+    /// The winds the maps are carried on (`flow_winds`), and how many maps
+    /// have been begun (the jitter's index).
+    winds: [[f32; 4]; LAYERS],
+    maps_begun: u32,
     /// The map shown last, the one shown now, and the one being built.
     prev: u32,
     cur: u32,
@@ -258,6 +285,11 @@ pub struct CloudSky {
     /// The cloud time each map holds the sky at, and the eye it is seen from.
     times: [f64; 3],
     eyes: [[f32; 3]; 3],
+    /// Each map's uniform as its first slice took it: every slice of one map
+    /// draws the same light, ambient and eye. A light refreshed mid-build
+    /// (the time-of-day snapshot, about once a second) split a map into
+    /// bands of rows lit two ways (research 2026-10-21, cause (c)).
+    map_uniforms: [CloudSkyUniform; 3],
     /// Seconds a map takes to build, as measured, and when the last began.
     period: f64,
     last_start: Option<f64>,
@@ -338,7 +370,7 @@ impl CloudSky {
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: TextureFormat::R16Float,
+            format: TextureFormat::Rg16Float,
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -562,17 +594,52 @@ impl CloudSky {
         queue.submit(Some(enc.finish()));
         let bind_group = Self::bind(device, &layout, &uniform, &noise_tex, &weather, &sampler, &envelope, &envelope_sampler);
         let shadow_bind_group = Self::bind(device, &layout, &shadow_uniform, &noise_tex, &weather, &sampler, &envelope, &envelope_sampler);
+        let history_uniform = device.create_buffer(&BufferDescriptor {
+            label: Some("cloud_history_uniform"),
+            size: std::mem::size_of::<[[f32; 4]; 6]>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let history_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("cloud_history_bgl"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                tex(1, TextureViewDimension::D2),
+                tex(2, TextureViewDimension::D2),
+            ],
+        });
+        let history_groups: [BindGroup; 3] = std::array::from_fn(|i| {
+            device.create_bind_group(&BindGroupDescriptor {
+                label: Some("cloud_history_bg"),
+                layout: &history_layout,
+                entries: &[
+                    BindGroupEntry { binding: 0, resource: history_uniform.as_entire_binding() },
+                    BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&map_layers[i]) },
+                    BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&alt_layers[i]) },
+                ],
+            })
+        });
         let shader = device.create_shader_module(ShaderModuleDescriptor { label: Some("cloud_sky"), source: ShaderSource::Wgsl(source.into()) });
-        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        let map_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("cloud_sky_map_layout"),
+            bind_group_layouts: &[Some(&layout), Some(&history_layout)],
+            immediate_size: 0,
+        });
+        let shadow_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("cloud_sky_layout"),
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = |label: &str, entry: &str, formats: &[TextureFormat]| {
+        let pipeline = |label: &str, entry: &str, formats: &[TextureFormat], pipeline_layout: &PipelineLayout| {
             let targets: Vec<Option<ColorTargetState>> = formats.iter().map(|&format| Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::ALL })).collect();
             device.create_render_pipeline(&RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&pipeline_layout),
+                layout: Some(pipeline_layout),
                 vertex: VertexState { module: &shader, entry_point: Some("vs_full"), compilation_options: Default::default(), buffers: &[] },
                 fragment: Some(FragmentState {
                     module: &shader,
@@ -587,8 +654,8 @@ impl CloudSky {
                 cache: None,
             })
         };
-        let map_pipeline = pipeline("cloud_sky_map", "fs_map", &[TextureFormat::Rgba16Float, TextureFormat::R16Float]);
-        let shadow_pipeline = pipeline("cloud_sky_shadow", "fs_shadow", &[TextureFormat::R8Unorm]);
+        let map_pipeline = pipeline("cloud_sky_map", "fs_map", &[TextureFormat::Rgba16Float, TextureFormat::Rg16Float], &map_layout);
+        let shadow_pipeline = pipeline("cloud_sky_shadow", "fs_shadow", &[TextureFormat::R8Unorm], &shadow_layout);
         Self {
             noise: noise_tex,
             weather,
@@ -619,6 +686,10 @@ impl CloudSky {
             shadow_bind_group,
             map_pipeline,
             shadow_pipeline,
+            history_uniform,
+            history_groups,
+            winds: [[0.0; 4]; LAYERS],
+            maps_begun: 0,
             prev: 0,
             cur: 0,
             build: 1,
@@ -627,6 +698,7 @@ impl CloudSky {
             scales: [1.0; 3],
             times: [0.0; 3],
             eyes: [[0.0; 3]; 3],
+            map_uniforms: [CloudSkyUniform::default(); 3],
             period: MAP_SLICES as f64 / 72.0,
             last_start: None,
         }
@@ -667,15 +739,29 @@ impl CloudSky {
             return;
         }
         self.envelope_generation = population.generation();
-        let mut data: Vec<[f32; 8]> = Vec::new();
         let mut consts = [[0.0f32; 4]; POPULATED + 1];
-        for k in 0..POPULATED {
-            let (splats, c) = population.splats(k);
-            let start = data.len() as u32;
-            data.extend(splats.iter().map(|s| s.gpu()));
-            self.splat_ranges[k] = start..data.len() as u32;
-            consts[k] = c.gpu();
+        for (k, c) in consts.iter_mut().take(POPULATED).enumerate() {
+            *c = population.splats(k).1.gpu();
         }
+        // Packed on the worker (`CloudPopulation::frame`) when it drew them;
+        // here otherwise.
+        let own;
+        let data: &[[f32; 8]] = match population.packed() {
+            Some((data, ranges)) => {
+                self.splat_ranges = ranges.clone();
+                data
+            }
+            None => {
+                let mut v: Vec<[f32; 8]> = Vec::new();
+                for k in 0..POPULATED {
+                    let start = v.len() as u32;
+                    v.extend(population.splats(k).0.iter().map(|s| s.gpu()));
+                    self.splat_ranges[k] = start..v.len() as u32;
+                }
+                own = v;
+                &own
+            }
+        };
         consts[POPULATED] = [cp::ENVELOPE_TEXEL_M, cp::ENVELOPE_EXTENT_M as f32, 0.0, 0.0];
         queue.write_buffer(&self.splat_uniform, 0, bytemuck::cast_slice(&consts));
         let bytes = (data.len() * 32) as u64;
@@ -688,7 +774,7 @@ impl CloudSky {
                     mapped_at_creation: false,
                 }));
             }
-            queue.write_buffer(self.splats.as_ref().unwrap(), 0, bytemuck::cast_slice(&data));
+            queue.write_buffer(self.splats.as_ref().unwrap(), 0, bytemuck::cast_slice(data));
         }
         self.envelope_pending = true;
     }
@@ -707,6 +793,13 @@ impl CloudSky {
     /// The heights beside the maps (`texture_2d_array`, R16F metres).
     pub fn alts_view(&self) -> &TextureView {
         &self.alt_view
+    }
+
+    /// The winds the maps are carried on (`flow_winds`): what a map being
+    /// built carries the newest one to its own moment by. Taken as a map
+    /// begins.
+    pub fn set_winds(&mut self, winds: [[f32; 4]; LAYERS]) {
+        self.winds = winds;
     }
 
     /// Whether the next `encode_at` begins a map (and so takes its moment).
@@ -763,7 +856,11 @@ impl CloudSky {
     /// clouds at `now`.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_at(&mut self, encoder: &mut CommandEncoder, queue: &Queue, map: &CloudSkyUniform, now_u: &CloudSkyUniform, shadow: Option<&TextureView>, whole: bool, now: f64, map_time: f64) {
-        if self.envelope_pending {
+        // A new population is splatted only as a map begins, so one map is
+        // built from one population top to bottom; re-splatted mid-build it
+        // held bands of rows from two (research 2026-10-21, cause (c)). The
+        // ground's shadow reads the same envelopes, so it changes with it.
+        if self.envelope_pending && self.starts_map(whole) {
             self.envelope_pending = false;
             for k in 0..POPULATED {
                 let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -820,6 +917,7 @@ impl CloudSky {
             self.scales[target as usize] = 1.0 / peak.max(1e-20);
             self.times[target as usize] = map_time;
             self.eyes[target as usize] = [map.eye[0], map.eye[1], map.eye[2]];
+            self.map_uniforms[target as usize] = *map;
             if !(self.fresh || whole) {
                 if let Some(s) = self.last_start {
                     self.period = (0.5 * self.period + 0.5 * (now - s)).clamp(0.05, 30.0);
@@ -827,7 +925,29 @@ impl CloudSky {
                 self.last_start = Some(now);
             }
         }
-        let mut u = *map;
+        // What this map accumulates over: the newest whole map, unless it is
+        // drawn whole (nothing is), or the clock has jumped between the two.
+        let carry = !(self.fresh || whole);
+        let history = if carry { self.cur } else { (target + 1) % 3 };
+        if from == 0 {
+            let (t, h) = (target as usize, history as usize);
+            let age = self.times[t] - self.times[h];
+            let take = carry && age.abs() <= 4.0 * self.period + 1.0;
+            let jitter = if carry { (0.5 + self.maps_begun as f32 * HISTORY_JITTER).fract() } else { 0.5 };
+            self.maps_begun = self.maps_begun.wrapping_add(1);
+            let (et, eh) = (self.eyes[t], self.eyes[h]);
+            let w = &self.winds;
+            let carried: [[f32; 4]; 6] = [
+                [et[0] - eh[0], et[1] - eh[1], et[2] - eh[2], age as f32],
+                w[0],
+                w[1],
+                w[2],
+                w[3],
+                [if take { HISTORY_NEW } else { 1.0 }, self.scales[t] / self.scales[h], jitter, et[1]],
+            ];
+            queue.write_buffer(&self.history_uniform, 0, bytemuck::cast_slice(&carried));
+        }
+        let mut u = self.map_uniforms[target as usize];
         u.eye[3] = self.scales[target as usize];
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&u));
         queue.write_buffer(&self.shadow_uniform, 0, bytemuck::bytes_of(now_u));
@@ -846,6 +966,7 @@ impl CloudSky {
             });
             pass.set_pipeline(&self.map_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(1, &self.history_groups[history as usize], &[]);
             pass.set_scissor_rect(0, from, MAP_WIDTH, to - from);
             pass.draw(0..3, 0..1);
         }
@@ -894,6 +1015,15 @@ pub fn cloud_sky_shader() -> String {
         .replace("{EARTH}", &format!("{:.1}", c::EARTH_RADIUS_M))
         .replace("{DETAIL_RATIO}", &f(cl::DETAIL_RATIO))
         .replace("{DETAIL_EROSION}", &f(cl::DETAIL_EROSION))
+        .replace("{CHURN_WARP}", &f(cl::CHURN_WARP))
+        .replace("{CHURN_PULSE}", &f(cl::CHURN_PULSE))
+        .replace("{THERMAL_S}", &f(cl::THERMAL_S))
+        .replace("{TURRET_S}", &f(cl::TURRET_S))
+        .replace("{RISE_EDGE}", &f(cl::RISE_EDGE))
+        .replace("{RISE_CORE}", &f(cl::RISE_CORE))
+        .replace("{WARP_GAIN0}", &f(cl::WARP_GAIN[0]))
+        .replace("{WARP_GAIN1}", &f(cl::WARP_GAIN[1]))
+        .replace("{SHEAR_MOMENTUM}", &f(cl::SHEAR_MOMENTUM))
         .replace("{EDGE_GAIN}", &f(cl::EDGE_GAIN))
         .replace("{MAX_MARCH}", &f(cl::MAX_MARCH_M))
         .replace("{CIRRUS_TAU}", &f(cl::CIRRUS_TAU))
@@ -934,6 +1064,9 @@ pub fn cloud_sky_shader() -> String {
         .replace("{ENVELOPE_TEXEL}", &f(cp::ENVELOPE_TEXEL_M))
         .replace("{ENVELOPE_TOP_MIP}", &f((ENVELOPE_MIPS - 1) as f32))
         .replace("{ALT_FILL_WEIGHT}", &f(ALT_FILL_WEIGHT))
+        .replace("{HISTORY_REJECT0}", &f(HISTORY_REJECT[0]))
+        .replace("{HISTORY_REJECT1}", &f(HISTORY_REJECT[1]))
+        + &cloud_flow_wgsl()
 }
 
 /// The envelope pass: each live cloud a square around its profile, added
@@ -1027,7 +1160,7 @@ struct SplatOut {
 
 const CLOUD_SKY_WGSL: &str = r#"
 struct Layer {
-    v: array<vec4<f32>, 9>,
+    v: array<vec4<f32>, 10>,
 }
 struct CloudSkyUniform {
     eye: vec4<f32>,
@@ -1044,11 +1177,35 @@ struct CloudSkyUniform {
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var env_tex: texture_2d_array<f32>;
 @group(0) @binding(5) var env_samp: sampler;
+// The map slices accumulate over (`HISTORY_NEW`), and how it is carried.
+struct History {
+    // The built map's eye less the history's (xyz); seconds between them (w).
+    flow: vec4<f32>,
+    winds: array<vec4<f32>, 4>,
+    // The new march's share (1: no history), the built map's light scale over
+    // the history's, the samples' fraction of their step, the built eye's
+    // altitude.
+    misc: vec4<f32>,
+}
+@group(1) @binding(0) var<uniform> hist: History;
+@group(1) @binding(1) var hist_light: texture_2d<f32>;
+@group(1) @binding(2) var hist_alt: texture_2d<f32>;
 
 const PI: f32 = 3.14159265;
+const HISTORY_REJECT0: f32 = {HISTORY_REJECT0};
+const HISTORY_REJECT1: f32 = {HISTORY_REJECT1};
 const EARTH: f32 = {EARTH};
 const DETAIL_RATIO: f32 = {DETAIL_RATIO};
 const DETAIL_EROSION: f32 = {DETAIL_EROSION};
+const CHURN_WARP: f32 = {CHURN_WARP};
+const CHURN_PULSE: f32 = {CHURN_PULSE};
+const THERMAL_S: f32 = {THERMAL_S};
+const TURRET_S: f32 = {TURRET_S};
+const RISE_EDGE: f32 = {RISE_EDGE};
+const RISE_CORE: f32 = {RISE_CORE};
+const WARP_GAIN0: f32 = {WARP_GAIN0};
+const WARP_GAIN1: f32 = {WARP_GAIN1};
+const SHEAR_MOMENTUM: f32 = {SHEAR_MOMENTUM};
 const EDGE_GAIN: f32 = {EDGE_GAIN};
 const MAX_MARCH: f32 = {MAX_MARCH};
 const CIRRUS_TAU: f32 = {CIRRUS_TAU};
@@ -1180,7 +1337,13 @@ fn noise_at(s: vec3<f32>, eased: bool) -> vec4<f32> {
     let p = s * NOISE_TEXELS + 0.5;
     let i = floor(p);
     let f = p - i;
-    let g = f * f * (3.0 - 2.0 * f);
+    // Eased across (x, z) only: up the layer (y) a smoothstep's zero slope
+    // at every texel face terraced the density into flat strata 62.5 m
+    // apart, which the boil dragged up through every cloud as lines
+    // (research 2026-10-21, cause (a)). Straight in y, the shapes keep
+    // their round puffs and lose the terraces.
+    let e = f * f * (3.0 - 2.0 * f);
+    let g = vec3<f32>(e.x, f.y, e.z);
     return textureSampleLevel(noise_tex, samp, (i + g - 0.5) / NOISE_TEXELS, 0.0);
 }
 
@@ -1189,11 +1352,18 @@ fn noise_at(s: vec3<f32>, eased: bool) -> vec4<f32> {
 // than that cannot be drawn, only aliased -- near the horizon it came out
 // as rows of specks and stripes (headset, 2026-10-20) -- so the octaves it
 // outgrows give way to their means, which keeps the coverage as it was.
-fn density(k: u32, xz: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
+fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
     let a = lv(k, 0u);
     let h = (alt - a.x) / max(a.y - a.x, 1.0);
     if (h < 0.0 || h > 1.0) {
         return 0.0;
+    }
+    // The column leans downwind with height (`cloud_layers::shear_tilt`).
+    let sh = lv(k, 9u);
+    var xz = xz_in;
+    if (sh.w > 0.0 && sh.z > 0.0) {
+        let z = h * (a.y - a.x);
+        xz = xz - sh.xy * (SHEAR_MOMENTUM * min(sh.z * z * z / (2.0 * sh.w), z));
     }
     let env = envelope(k, xz, foot);
     let cover = env.x;
@@ -1219,12 +1389,37 @@ fn density(k: u32, xz: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
         // The erosion noise is DETAIL_RATIO times finer still.
         let gone = smoothstep(0.25, 0.5, r * DETAIL_RATIO);
         var fine = MEAN_FINE;
+        // Each cloud's own thermals (`cloud_layers::convection`): its age
+        // from its phase, the detail rising through one thermal and starting
+        // again where its weight is 0.
+        let age = env.z * lv(k, 8u).w;
+        let p = clamp(env.x, 0.0, 1.0);
+        let cyc = age / THERMAL_S + 0.5 * p;
+        let ci = floor(cyc);
+        let cf = cyc - ci;
+        let sw = sin(3.14159265 * cf);
+        let window = sw * sw;
         if (gone < 1.0) {
-            let q = noise_at(s * DETAIL_RATIO, true);
-            fine = mix(0.625 * q.g + 0.25 * q.b + 0.125 * q.a, MEAN_FINE, gone);
+            // The churn (`cloud_layers::churn_warp`): the shape noise's lower
+            // octaves as a vector field, turned with the layer's churn, its
+            // reach growing as the cloud decays.
+            let turn = 6.28318531 * lv(k, 2u).w;
+            let c = cos(turn);
+            let sn = sin(turn);
+            let w = n.gba - vec3<f32>(0.5);
+            let gain = WARP_GAIN0 + (WARP_GAIN1 - WARP_GAIN0) * smoothstep(0.6, 1.0, env.z);
+            let warp = vec3<f32>(w.x * c - w.z * sn, w.y, w.x * sn + w.z * c) * (CHURN_WARP * gain);
+            let wr = sh.w * (0.5 + env.y) * (RISE_EDGE + RISE_CORE * p);
+            let up = wr * THERMAL_S * cf * si * DETAIL_RATIO;
+            let rise = vec3<f32>(fract(ci * 0.618034), -up, fract(ci * 0.414214));
+            let q = noise_at(s * DETAIL_RATIO + warp + rise, true);
+            let raw = 0.625 * q.g + 0.25 * q.b + 0.125 * q.a;
+            fine = mix(MEAN_FINE + (raw - MEAN_FINE) * window, MEAN_FINE, gone);
         }
         let e = fine + (1.0 - 2.0 * fine) * smoothstep(0.1, 0.6, h);
-        let cut = DETAIL_EROSION * (0.8 + 0.5 * env.z) * e;
+        // The turrets swell and ebb on each cloud's own age.
+        let pulse = 1.0 + CHURN_PULSE * sin((age / TURRET_S + 2.0 * n.g) * 6.28318531);
+        let cut = min(DETAIL_EROSION * (0.8 + 0.5 * env.z) * e * pulse, 0.95);
         d = clamp((d - cut) / (1.0 - cut), 0.0, 1.0);
     }
     return min(d * EDGE_GAIN, 1.0) * a.w;
@@ -1395,10 +1590,12 @@ struct MapOut {
     let alt = u.eye.y;
     let eye = u.eye.xz;
     let cv = dot(dir, u.light_dir.xyz);
-    // Every sample at its step's middle: no jitter. With nothing averaging
-    // the map over time, a jitter is drawn as its own pattern (the headset
-    // showed it as a fine hatching through every cloud, 2026-10-20); the
-    // steps are short enough instead (`VIEW_STEPS_MOST`).
+    // Every sample at one fraction of its step, the same for every texel of
+    // a map (`HISTORY_JITTER`): a jitter per texel, with nothing averaging
+    // it, was drawn as a fine hatching through every cloud on the headset
+    // (2026-10-20). One per map moves the sample planes as a whole, and the
+    // accumulation below averages the planes' grain away.
+    let jitter = hist.misc.z;
     let ph = octave_phases(cv);
     // The angle one texel spans: across (azimuth, narrowing up the sky)
     // or along (elevation, packed toward the horizon), whichever is wider.
@@ -1427,11 +1624,22 @@ struct MapOut {
         }
         let len = min(t1 - t0, MAX_MARCH);
         let base = pick_steps(k, VIEW_STEPS);
-        let stride = VIEW_STEP_TEXELS / (NOISE_TEXELS * lv(k, 1u).x);
-        let n = clamp(u32(ceil(len / stride)), base, max(base, VIEW_STEPS_MOST));
-        let dt = len / f32(n);
+        // WHOLE STEPS OF ONE STRIDE FROM THE LAYER'S ENTRY, AND A SHORT LAST
+        // ONE. Split evenly into ceil(len / stride), every ray with the same
+        // count sampled the same heights of the layer, and where the count
+        // rose by one between rows every sample plane jumped: lines along
+        // the horizon every few rows (research 2026-10-21, cause (b)). Now
+        // the samples lie where the ray's own distance puts them, and a
+        // longer ray only grows its last step.
+        let stride = clamp(VIEW_STEP_TEXELS / (NOISE_TEXELS * lv(k, 1u).x), len / f32(max(base, VIEW_STEPS_MOST)), len / f32(base));
+        let whole = floor(len / stride);
+        let n = u32(whole) + 1u;
         for (var i = 0u; i < n; i = i + 1u) {
-            let t = t0 + (f32(i) + 0.5) * dt;
+            let dt = select(stride, len - whole * stride, i + 1u == n);
+            if (dt <= 0.0) {
+                break;
+            }
+            let t = t0 + f32(i) * stride + jitter * dt;
             let p_alt = altitude_along(alt, mu, t);
             let xz = eye + dir.xz * t;
             let foot = max(t * texel, 0.25 * dt);
@@ -1461,11 +1669,30 @@ struct MapOut {
             rgb = rgb + w * s;
             seen = seen + w;
             height = height + w * lv(3u, 0u).x;
+            trans = trans * (1.0 - alpha);
         }
     }
+    var light = vec4<f32>(rgb * u.eye.w, 1.0 - seen);
+    // .g: the clouds' own transmittance, no haze -- what a disc behind them
+    // gets (`cloud_through` in the sky shader).
+    let h = (height + ALT_FILL_WEIGHT * fill) / (seen + ALT_FILL_WEIGHT);
+    var alts = vec2<f32>(h, trans);
+    // THE NEWEST MAP, CARRIED HERE: what this texel shows, where that map
+    // held it (the sky shader's own carry, `sky_clouds`), mixed in.
+    if (hist.misc.x < 1.0) {
+        let wv = cloud_flow_wind(h, hist.winds[0], hist.winds[1], hist.winds[2], hist.winds[3]);
+        let p = dir * cloud_flow_distance(hist.misc.w, h, max(dir.y, 0.0));
+        var huv = cloud_map_uv(p + hist.flow.xyz - vec3<f32>(wv.x, 0.0, wv.y) * hist.flow.w);
+        huv.y = clamp(huv.y, 0.5 / size.y, 1.0 - 0.5 / size.y);
+        let old = textureSampleLevel(hist_light, samp, huv, 0.0);
+        let old_alts = textureSampleLevel(hist_alt, samp, huv, 0.0).rg;
+        let w = mix(hist.misc.x, 1.0, smoothstep(HISTORY_REJECT0, HISTORY_REJECT1, abs(old.a - light.a)));
+        light = mix(vec4<f32>(old.rgb * hist.misc.y, old.a), light, w);
+        alts = mix(old_alts, alts, w);
+    }
     var out: MapOut;
-    out.light = vec4<f32>(rgb * u.eye.w, 1.0 - seen);
-    out.alt = vec4<f32>((height + ALT_FILL_WEIGHT * fill) / (seen + ALT_FILL_WEIGHT), 0.0, 0.0, 0.0);
+    out.light = light;
+    out.alt = vec4<f32>(alts, 0.0, 0.0);
     return out;
 }
 
@@ -1676,6 +1903,11 @@ mod tests {
             population.update(&params, &field, t);
             let mut layers = model.layers(t);
             population.place(&mut layers, t);
+            // The churn held at the first map's turn: this measures the
+            // carrying, not the shapes' own change (`churn_warp`).
+            for (l, held) in layers.iter_mut().zip(model.layers(20_000.0)) {
+                l.churn = held.churn;
+            }
             let mut sky = CloudSky::new(&device, &queue, &field, &noise);
             sky.set_population(&device, &queue, &population);
             let u = CloudSkyUniform::new(&layers, eye, [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
@@ -1684,10 +1916,10 @@ mod tests {
             queue.submit(Some(enc.finish()));
             let layer = sky.display()[1] as u32;
             let map = read_back(&device, &queue, &sky.maps, layer, MAP_WIDTH, MAP_HEIGHT, 8);
-            let alts = read_back(&device, &queue, &sky.alts, layer, MAP_WIDTH, MAP_HEIGHT, 2);
+            let alts = read_back(&device, &queue, &sky.alts, layer, MAP_WIDTH, MAP_HEIGHT, 4);
             let n = (MAP_WIDTH * MAP_HEIGHT) as usize;
             let alpha: Vec<f32> = (0..n).map(|i| half(&map[i * 8 + 6..i * 8 + 8])).collect();
-            let alt: Vec<f32> = (0..n).map(|i| half(&alts[i * 2..i * 2 + 2])).collect();
+            let alt: Vec<f32> = (0..n).map(|i| half(&alts[i * 4..i * 4 + 2])).collect();
             (alpha, alt, layers)
         };
         let (t0, t1) = (20_000.0, 20_015.0);
@@ -1725,6 +1957,196 @@ mod tests {
         assert!(heights_ok, "a map height lies outside the layers' {lo}..{hi}");
         assert!(n > 500, "too few clouded directions: {n}");
         assert!(carried < 0.35 * left, "carrying the map does not follow the clouds: {carried} vs {left}");
+    }
+
+    /// THE MAPS ACCUMULATE TOWARD THE CLOUDS, NOT TOWARD THEIR MARCH: a still
+    /// sky built map after map (`HISTORY_NEW`, the samples moved by
+    /// `HISTORY_JITTER` each map) lands nearer a march four times finer than
+    /// one map drawn whole does. The difference left in one map is the wood
+    /// grain of its fixed sample planes.
+    #[test]
+    fn maps_built_one_after_another_settle_on_a_finer_march() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = CloudParams { coverage: 0.6, ..Default::default() };
+        let model = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise);
+        let mut population = CloudPopulation::new();
+        let t = 20_000.0;
+        population.update(&params, &field, t);
+        let mut layers = model.layers(t);
+        population.place(&mut layers, t);
+        let u = CloudSkyUniform::new(&layers, [0.0, 2.0, 0.0], [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
+        let base = cloud_sky_shader();
+        let fine = base
+            .replace(&format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST), &format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST * 4))
+            .replace(&format!("const VIEW_STEP_TEXELS: f32 = {:?};", cl::VIEW_STEP_TEXELS), &format!("const VIEW_STEP_TEXELS: f32 = {:?};", cl::VIEW_STEP_TEXELS / 4.0));
+        assert_ne!(fine, base, "the finer march changed nothing");
+        // Each map's alpha and red, read back.
+        let draw = |src: String, maps: u32| -> Vec<[f32; 2]> {
+            let mut sky = CloudSky::with_shader(&device, &queue, &field, &noise, src);
+            sky.set_population(&device, &queue, &population);
+            let mut now = 0.0;
+            let mut enc = device.create_command_encoder(&Default::default());
+            sky.encode_at(&mut enc, &queue, &u, &u, None, true, now, t);
+            queue.submit(Some(enc.finish()));
+            for _ in 0..maps * MAP_SLICES {
+                now += 1.0 / 72.0;
+                let mut enc = device.create_command_encoder(&Default::default());
+                sky.encode_at(&mut enc, &queue, &u, &u, None, false, now, t);
+                queue.submit(Some(enc.finish()));
+            }
+            let map = read_back(&device, &queue, &sky.maps, sky.display()[1] as u32, MAP_WIDTH, MAP_HEIGHT, 8);
+            (0..(MAP_WIDTH * MAP_HEIGHT) as usize).map(|i| [half(&map[i * 8 + 6..i * 8 + 8]), half(&map[i * 8..i * 8 + 2])]).collect()
+        };
+        let coarse = |k: u32| {
+            base.replace(&format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST), &format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST / k))
+                .replace(&format!("const VIEW_STEP_TEXELS: f32 = {:?};", cl::VIEW_STEP_TEXELS), &format!("const VIEW_STEP_TEXELS: f32 = {:?};", cl::VIEW_STEP_TEXELS * k as f32))
+        };
+        let reference = draw(fine, 0);
+        let once = draw(base.clone(), 0);
+        let half_settled = draw(coarse(2), 8);
+        let third_settled = draw(coarse(3), 8);
+        let settled = draw(base, 8);
+        let off = |m: &[[f32; 2]], c: usize| {
+            let (mut sum, mut n) = (0.0f64, 0u32);
+            for j in 0..MAP_HEIGHT {
+                let up = map_dir([0.5, (j as f32 + 0.5) / MAP_HEIGHT as f32])[1];
+                if !(0.035..0.85).contains(&up) {
+                    continue;
+                }
+                for i in 0..MAP_WIDTH {
+                    let k = (j * MAP_WIDTH + i) as usize;
+                    if reference[k][0] < 0.98 {
+                        sum += (m[k][c] - reference[k][c]).abs() as f64;
+                        n += 1;
+                    }
+                }
+            }
+            sum / n.max(1) as f64
+        };
+        let (once_a, settled_a, once_r, settled_r) = (off(&once, 0), off(&settled, 0), off(&once, 1), off(&settled, 1));
+        eprintln!("ACCUMULATION off a march 4x finer: alpha {once_a:.5} once, {settled_a:.5} settled; red {once_r:.5} once, {settled_r:.5} settled");
+        eprintln!(
+            "ACCUMULATION with fewer steps, settled: half alpha {:.5} red {:.5}; a third alpha {:.5} red {:.5}",
+            off(&half_settled, 0),
+            off(&half_settled, 1),
+            off(&third_settled, 0),
+            off(&third_settled, 1)
+        );
+        assert!(settled_a < 0.7 * once_a, "alpha: settled {settled_a:.5} against once {once_a:.5}");
+        assert!(settled_r < 0.7 * once_r, "light: settled {settled_r:.5} against once {once_r:.5}");
+    }
+
+    /// NO LINES ACROSS THE SKY: a line parallel to the horizon moves every
+    /// column of a map row together, where cloud edges do not line up round
+    /// the whole sky. Each low row's change from the row below, averaged
+    /// signed round the azimuth, is printed against the mean unsigned change
+    /// (`BANDING` the worst ratio): the strata and step-plane jumps of the
+    /// march stood out as rows far above it (research 2026-10-21).
+    #[test]
+    fn the_sky_map_has_no_rows_lined_across_the_sky() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let mut worst = 0.0f32;
+        for coverage in [0.4f32, 0.6, 0.8] {
+            let params = CloudParams { coverage, ..Default::default() };
+            let model = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise);
+            let mut population = CloudPopulation::new();
+            let t = 20_000.0;
+            population.update(&params, &field, t);
+            let mut layers = model.layers(t);
+            population.place(&mut layers, t);
+            let mut sky = CloudSky::new(&device, &queue, &field, &noise);
+            sky.set_population(&device, &queue, &population);
+            let u = CloudSkyUniform::new(&layers, [0.0, 2.0, 0.0], [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
+            let mut enc = device.create_command_encoder(&Default::default());
+            sky.encode_at(&mut enc, &queue, &u, &u, None, true, t, t);
+            queue.submit(Some(enc.finish()));
+            let map = read_back(&device, &queue, &sky.maps, sky.display()[1] as u32, MAP_WIDTH, MAP_HEIGHT, 8);
+            let alpha = |i: u32, j: u32| half(&map[((j * MAP_WIDTH + i) * 8 + 6) as usize..((j * MAP_WIDTH + i) * 8 + 8) as usize]);
+            let rows: Vec<u32> = (0..MAP_HEIGHT - 1)
+                .filter(|&j| {
+                    let up = map_dir([0.5, (j as f32 + 0.5) / MAP_HEIGHT as f32])[1];
+                    (0.035..0.5).contains(&up)
+                })
+                .collect();
+            let signed: Vec<f32> = rows.iter().map(|&j| (0..MAP_WIDTH).map(|i| alpha(i, j + 1) - alpha(i, j)).sum::<f32>() / MAP_WIDTH as f32).collect();
+            let unsigned: f32 = rows.iter().map(|&j| (0..MAP_WIDTH).map(|i| (alpha(i, j + 1) - alpha(i, j)).abs()).sum::<f32>() / MAP_WIDTH as f32).sum::<f32>() / rows.len() as f32;
+            let peak = signed.iter().map(|v| v.abs()).fold(0.0, f32::max);
+            // Inside cloud edges, the curvature up the sky against across it:
+            // stripes along the horizon raise the first.
+            let (mut up_c, mut across_c, mut m) = (0.0f32, 0.0f32, 0u32);
+            for &j in rows.iter().filter(|&&j| j > 0) {
+                for i in 1..MAP_WIDTH - 1 {
+                    let a = alpha(i, j);
+                    if !(0.1..0.9).contains(&a) {
+                        continue;
+                    }
+                    up_c += (alpha(i, j + 1) - 2.0 * a + alpha(i, j - 1)).abs();
+                    across_c += (alpha(i + 1, j) - 2.0 * a + alpha(i - 1, j)).abs();
+                    m += 1;
+                }
+            }
+            eprintln!(
+                "BANDING coverage {coverage}: worst row {:.4} against a mean change {:.4} ({:.2}x) over {} rows; STRIPES curvature up {:.5} across {:.5} ({:.3}) at {m} edge texels",
+                peak, unsigned, peak / unsigned.max(1e-6), rows.len(), up_c / m.max(1) as f32, across_c / m.max(1) as f32, up_c / across_c.max(1e-6)
+            );
+            worst = worst.max(peak / unsigned.max(1e-6));
+        }
+        eprintln!("BANDING worst {worst:.2}");
+    }
+
+    /// A cloud far down the sky fades into the haze in the map's alpha, but
+    /// still blocks a disc behind it: the heights' .g is the clouds' own
+    /// transmittance, never more than the alpha, and low in the sky it is
+    /// far less where the alpha reads nearly clear (the sun shone through
+    /// clouds on the horizon, headset 2026-10-21).
+    #[test]
+    fn a_far_cloud_the_haze_hides_still_blocks_the_sun() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let scope = device.push_error_scope(ErrorFilter::Validation);
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = CloudParams { coverage: 0.8, ..Default::default() };
+        let model = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise);
+        let mut population = CloudPopulation::new();
+        let t = 20_000.0;
+        population.update(&params, &field, t);
+        let mut layers = model.layers(t);
+        population.place(&mut layers, t);
+        let mut sky = CloudSky::new(&device, &queue, &field, &noise);
+        sky.set_population(&device, &queue, &population);
+        let u = CloudSkyUniform::new(&layers, [0.0, 2.0, 0.0], [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
+        let mut enc = device.create_command_encoder(&Default::default());
+        sky.encode_at(&mut enc, &queue, &u, &u, None, true, t, t);
+        queue.submit(Some(enc.finish()));
+        let layer = sky.display()[1] as u32;
+        let map = read_back(&device, &queue, &sky.maps, layer, MAP_WIDTH, MAP_HEIGHT, 8);
+        let alts = read_back(&device, &queue, &sky.alts, layer, MAP_WIDTH, MAP_HEIGHT, 4);
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            panic!("the cloud passes do not validate: {e}");
+        }
+        let (mut above, mut hidden_low, mut hidden_high) = (0, 0, 0);
+        for j in 0..MAP_HEIGHT {
+            for i in 0..MAP_WIDTH {
+                let k = (j * MAP_WIDTH + i) as usize;
+                let alpha = half(&map[k * 8 + 6..k * 8 + 8]);
+                let through = half(&alts[k * 4 + 2..k * 4 + 4]);
+                if through > alpha + 2e-3 {
+                    above += 1;
+                }
+                if alpha > 0.9 && through < 0.3 {
+                    let up = map_dir([(i as f32 + 0.5) / MAP_WIDTH as f32, (j as f32 + 0.5) / MAP_HEIGHT as f32])[1];
+                    if up < 0.1 { hidden_low += 1 } else { hidden_high += 1 }
+                }
+            }
+        }
+        eprintln!("haze-cleared but cloud-blocked texels: {hidden_low} low, {hidden_high} high; {above} with more through than the alpha");
+        assert_eq!(above, 0, "{above} texels let more through a disc than the sky");
+        assert!(hidden_low > 100, "no far cloud the haze clears: {hidden_low}");
+        assert!(hidden_high < hidden_low / 10, "haze clears cloud high in the sky: {hidden_high} vs {hidden_low}");
     }
 
     /// THE ENVELOPES ARE THE POPULATION'S: each layer's splatted map against
@@ -1768,19 +2190,33 @@ mod tests {
         for k in 0..POPULATED {
             let map = read_back(&device, &queue, &sky.envelope, k as u32, n, n, 8);
             let (mut worst, mut covered, mut seen) = (0.0f32, 0, 0);
+            let mut worst_at = (0usize, 0.0f32, 0.0f32);
+            let mut worst_saturated = 0.0f32;
             for j in (0..n).step_by(5) {
                 for i in (0..n).step_by(3) {
                     let at = ((j * n + i) * 8) as usize;
                     let gpu = [0, 1, 2, 3].map(|c| half(&map[at + 2 * c..at + 2 * c + 2]));
                     let cpu = population.texel(k, i as i32, j as i32);
+                    // Where several clouds' cores stack (a clustered field's
+                    // sums reach 7 and more) the GPU adds them in half floats,
+                    // 0.004 a step at 4-8, and the march clamps the cover to 1
+                    // there anyway: those texels are held to the twin loosely.
+                    let saturated = cpu[0] > 2.0;
                     for c in 0..4 {
-                        worst = worst.max((gpu[c] - cpu[c]).abs() / (1.0 + cpu[c].abs()));
+                        let d = (gpu[c] - cpu[c]).abs() / (1.0 + cpu[c].abs());
+                        if saturated {
+                            worst_saturated = worst_saturated.max(d);
+                        } else if d > worst {
+                            worst = d;
+                            worst_at = (c, cpu[c], gpu[c]);
+                        }
                     }
                     covered += (cpu[0] > 0.05) as u32;
                     seen += 1;
                 }
             }
-            eprintln!("layer {k}: {} splats, worst relative difference {worst:.5}, {covered} of {seen} texels clouded", population.splats(k).0.len());
+            eprintln!("layer {k}: {} splats, worst relative difference {worst:.5} (channel {}, twin {:.4}, gpu {:.4}), {worst_saturated:.5} where the cover is saturated, {covered} of {seen} texels clouded", population.splats(k).0.len(), worst_at.0, worst_at.1, worst_at.2);
+            assert!(worst_saturated < 1e-2, "layer {k}'s saturated cores are off the twin by {worst_saturated}");
             assert!(worst < 4e-3, "layer {k}'s envelope is not the twin's: {worst}");
             assert!(covered > seen / 20, "layer {k} has almost no clouds: {covered} of {seen}");
         }
