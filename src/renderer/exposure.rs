@@ -175,7 +175,21 @@ impl EyeAdaptation {
         }
     }
 
+    /// How open to the sky the place round the head is, 0 (a closed room)
+    /// to 1 (outdoors, or a room whose probes see the sky), whatever the
+    /// hour: what `Sky::set_cloud_build_every` is chosen by.
+    pub fn sky_open_at(&self, head: Vec3) -> f32 {
+        match self.room_at(head) {
+            Some(room) => self.open_in(room, head),
+            None => 1.0,
+        }
+    }
+
     fn free_in(&self, room: u32, head: Vec3) -> f32 {
+        self.open_in(room, head) * self.day
+    }
+
+    fn open_in(&self, room: u32, head: Vec3) -> f32 {
         let near = |m: &ProbeMeter| 1.0 / m.centre.distance_squared(head).max(NEAREST_PROBE_FLOOR);
         let (mut open, mut total) = (0.0f32, 0.0f32);
         for m in self.meters.iter().filter(|m| m.room == room) {
@@ -183,7 +197,7 @@ impl EyeAdaptation {
             total += near(m);
         }
         let open = if total > 0.0 { open / total } else { 1.0 };
-        smoothstep(OPEN_SKY_FROM, OPEN_SKY_TO, open) * self.day
+        smoothstep(OPEN_SKY_FROM, OPEN_SKY_TO, open)
     }
 
     pub fn from_probes(probes: &[(&[u8], u32, ProbeDesc)], sky: SkyIrradiance) -> Self {

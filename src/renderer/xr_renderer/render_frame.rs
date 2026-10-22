@@ -138,6 +138,11 @@ fn push_mesh_draws<'a>(
     }
 }
 
+/// A room whose open-sky share is under this (`EyeAdaptation::sky_open_at`)
+/// builds its sky map every `CLOSED_ROOM_CLOUD_EVERY`th frame.
+const CLOSED_ROOM_SKY: f32 = 0.25;
+const CLOSED_ROOM_CLOUD_EVERY: u32 = 4;
+
 impl XrRenderer {
     pub fn render_frame(
         &mut self,
@@ -518,10 +523,14 @@ impl XrRenderer {
             } else {
                 [[0.0; 4]; 2 * crate::renderer::uniforms::ROOM_EXPOSURE_ROOMS]
             };
+            // In a closed room the sky map is built at a quarter of the rate
+            // (`Sky::set_cloud_build_every`).
+            let sky_open = eye.sky_open_at(head_world);
             drop(eye);
             // The clouds: a slice of their sky map, and their shadow.
             let clouds_at = std::time::Instant::now();
             if self.levers.clouds {
+                self.sky.set_cloud_build_every(if sky_open < CLOSED_ROOM_SKY { CLOSED_ROOM_CLOUD_EVERY } else { 1 });
                 self.sky.step_clouds(
                 &self.wgpu_device,
                 &self.wgpu_queue,
@@ -1532,7 +1541,15 @@ impl XrRenderer {
                 );
                 if static_sun.is_some() {
                     let ms = record_t0.elapsed().as_secs_f32() * 1000.0;
-                    log::info!("SUNSHADOW static map recorded ({drawn} indices, {ms:.1} ms cpu)");
+                    // Along which sun, by elevation and azimuth, against the
+                    // light's own this frame: a map ever recorded behind the
+                    // one before shows as shadows stepping back.
+                    let ang = |d: Option<glam::Vec3>| d.map_or([0.0, 0.0], |d| [d.y.clamp(-1.0, 1.0).asin().to_degrees(), d.x.atan2(d.z).to_degrees()]);
+                    let (rec, glide) = (ang(stepped.map(|v| -v)), ang(self.sky.sun_direct().map(|s| glam::Vec3::from(s.direction))));
+                    log::info!(
+                        "SUNSHADOW static map recorded ({drawn} indices, {ms:.1} ms cpu) along sun {:.3}/{:.3} deg, light {:.3}/{:.3} deg",
+                        rec[0], rec[1], glide[0], glide[1]
+                    );
                 }
             }
 

@@ -1029,7 +1029,11 @@ impl CloudSky {
             let (t, h) = (target as usize, history as usize);
             let age = self.times[t] - self.times[h];
             let take = carry && age.abs() <= 4.0 * self.period + 1.0;
-            let jitter = if carry { (0.5 + self.maps_begun as f32 * HISTORY_JITTER).fract() } else { 0.5 };
+            // The sample fraction moves map to map only while the maps
+            // accumulate: unaveraged, a new fraction each map changed the far
+            // clouds at every swap, a flicker along the horizon (user,
+            // 2026-10-22; `a_still_sky_holds_still_at_the_horizon_from_map_to_map`).
+            let jitter = if carry && HISTORY_NEW < 1.0 { (0.5 + self.maps_begun as f32 * HISTORY_JITTER).fract() } else { 0.5 };
             self.maps_begun = self.maps_begun.wrapping_add(1);
             let (et, eh) = (self.eyes[t], self.eyes[h]);
             let w = &self.winds;
@@ -2432,6 +2436,15 @@ pub(crate) mod tests {
         let n = 4 * MAP_SLICES;
         let alone = run(&mut sky, None, n);
         let with = run(&mut sky, Some(&view), n);
+        // The same frame with no march (the passes, their targets, the
+        // prefilter and the submit): what a slice costs before its rays.
+        let bare_src = cloud_sky_shader().replace("for (var k = 0u; k < 3u; k = k + 1u) {\n        if (!layer_on(k) || trans < 0.01) {", "for (var k = 0u; k < 0u; k = k + 1u) {\n        if (!layer_on(k) || trans < 0.01) {");
+        assert_ne!(bare_src, cloud_sky_shader(), "the bare variant changed nothing");
+        let mut bare = CloudSky::with_shader(&device, &queue, &field, &noise, bare_src);
+        bare.set_population(&device, &queue, &population);
+        run(&mut bare, None, MAP_SLICES);
+        let bare_ms = run(&mut bare, None, n);
+        eprintln!("a frame's clouds with no march: {bare_ms:.3} ms");
         let empty = {
             let start = std::time::Instant::now();
             for _ in 0..n {
@@ -2623,11 +2636,11 @@ pub(crate) mod tests {
                 std::fs::write(format!("{dir}/ghost_{name}.pgm"), out).unwrap();
             }
         }
-        assert!(off < 0.03, "the accumulated map is off the sky of its moment by {off:.5}");
+        assert!(off < 0.01, "the accumulated map is off the sky of its moment by {off:.5}");
         // With the history (`HISTORY_NEW` 0.3): off by 0.0399, 8.9% ghosts;
-        // without, 0.0109 and 0.80% -- what a map at another sample fraction
-        // differs by in the thinnest wisps (a still sky accumulated: 1.6%).
-        assert!(ghost_share < 0.012, "{ghosts} clear texels hold a cloud the sky has not");
+        // without, 0.0109 and 0.80% while each map sampled at its own
+        // fraction; at one fraction for every map, 0 and 0.
+        assert!(ghost_share < 0.002, "{ghosts} clear texels hold a cloud the sky has not");
     }
 
     /// How near one map of each march variant comes to a march four times
@@ -2696,6 +2709,60 @@ pub(crate) mod tests {
             let (r, rg) = score(&m, 1);
             eprintln!("VARIANT refine {refine} bisect {bisect}: alpha off {a:.5} grain {ag:.5}; red off {r:.5} grain {rg:.5}");
         }
+    }
+
+    /// A STILL SKY BUILT MAP AFTER MAP STAYS STILL near the horizon, where a
+    /// ray crosses kilometres of cloud in strides of hundreds of metres: the
+    /// display cross-fades from each map to the next, so any change between
+    /// two maps of one sky is a flicker (user, 2026-10-22: a line flickering
+    /// just above the sea's horizon).
+    #[test]
+    fn a_still_sky_holds_still_at_the_horizon_from_map_to_map() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = CloudParams { coverage: 0.45, ..Default::default() };
+        let model = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise);
+        let mut population = CloudPopulation::new();
+        let t = 20_000.0;
+        population.update(&params, &field, t);
+        let mut layers = model.layers(t);
+        population.place(&mut layers, t);
+        let u = CloudSkyUniform::new(&layers, [0.0, 2.0, 0.0], [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
+        let mut sky = CloudSky::new(&device, &queue, &field, &noise);
+        sky.set_population(&device, &queue, &population);
+        let mut now = 0.0;
+        let mut maps: Vec<Vec<f32>> = Vec::new();
+        let mut enc = device.create_command_encoder(&Default::default());
+        sky.encode_at(&mut enc, &queue, &u, &u, None, true, now, t);
+        queue.submit(Some(enc.finish()));
+        for _ in 0..3 {
+            for _ in 0..MAP_SLICES {
+                now += 1.0 / 72.0;
+                let mut enc = device.create_command_encoder(&Default::default());
+                sky.encode_at(&mut enc, &queue, &u, &u, None, false, now, t);
+                queue.submit(Some(enc.finish()));
+            }
+            let map = read_back(&device, &queue, &sky.maps, sky.display()[1] as u32, MAP_WIDTH, MAP_HEIGHT, 8);
+            maps.push((0..(MAP_WIDTH * MAP_HEIGHT) as usize).map(|i| half(&map[i * 8 + 6..i * 8 + 8])).collect());
+        }
+        let (mut change, mut n) = (0.0f64, 0u32);
+        for j in 0..MAP_HEIGHT {
+            let up = map_dir([0.5, (j as f32 + 0.5) / MAP_HEIGHT as f32])[1];
+            if !(0.0..0.06).contains(&up) {
+                continue;
+            }
+            for i in 0..MAP_WIDTH {
+                let k = (j * MAP_WIDTH + i) as usize;
+                for w in maps.windows(2) {
+                    change += (w[1][k] - w[0][k]).abs() as f64;
+                    n += 1;
+                }
+            }
+        }
+        let change = change / n.max(1) as f64;
+        eprintln!("HORIZON a still sky's map to the next, within 3.4 deg of the horizon: alpha moves {change:.5}");
+        assert!(change < 1e-4, "a still sky's horizon changes by {change:.5} from map to map");
     }
 
     /// ONE MAP IS ALREADY NEAR A MARCH FOUR TIMES FINER, AND THE MAPS

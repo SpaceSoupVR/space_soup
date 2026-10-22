@@ -313,6 +313,9 @@ pub struct Sky {
     bind_serial: u64,
     /// The moment and the eye the map being built holds the sky at.
     cloud_build: Option<(f64, [f32; 3])>,
+    /// A slice of the sky map every this many `step_clouds` (1: every
+    /// frame), and the frames counted toward it (`set_cloud_build_every`).
+    cloud_every: (u32, u32),
     /// The cloud clock's step at the last tick, seconds.
     cloud_dt: f32,
     /// The last `step_clouds`' CPU stages, ms: shadow mean, layers placed,
@@ -735,6 +738,7 @@ impl Sky {
             cloud_sampler,
             bind_serial: 0,
             cloud_build: None,
+            cloud_every: (1, 0),
             cloud_dt: 0.0,
             cloud_laps: [0.0; 5],
             aerosol_per_m: space_soup_sky::time_of_day::AEROSOL_PER_M,
@@ -1024,6 +1028,19 @@ impl Sky {
         format!("mean {:.1} layers {:.1} population {:.1} encode {:.1} submit {:.1}", l[0], l[1], l[2], l[3], l[4])
     }
 
+    /// Build a slice of the sky map every `n`th frame only. Inside a closed
+    /// room the sky shows through a window or a door at most, and a map
+    /// carried on its winds for four times as long still holds the clouds
+    /// where they are; the hall's frames were the ones over budget with the
+    /// clouds on (headset, 2026-10-22).
+    pub fn set_cloud_build_every(&mut self, n: u32) {
+        let n = n.max(1);
+        if n != self.cloud_every.0 {
+            log::info!("CLOUDRATE a slice of the sky map every {n} frame(s)");
+        }
+        self.cloud_every.0 = n;
+    }
+
     /// ONE FRAME OF THE CLOUDS (`CloudSky`): the next slice of the sky map
     /// seen from `eye` (world), and -- when `shadow` is given and `on` (the
     /// lever, the clouds up, the light above them) -- their shadow on the
@@ -1046,6 +1063,9 @@ impl Sky {
         let light = c.sun_clear.filter(|_| on && c.frame.params.coverage > 0.0 && dir[1] > 0.0);
         let snap = |v: f32| (v / CLOUD_SHADOW_SNAP_M).round() * CLOUD_SHADOW_SNAP_M;
         let centre = [snap(eye[0]), snap(eye[2])];
+        // The ground's shadow is drawn about this centre: one that moves
+        // builds this frame, so the shadow never stands a snap off.
+        let shadow_moved = cs.centre != Some(centre);
         if light.is_some() {
             if cs.centre != Some(centre) || cs.frames % CLOUD_SHADOW_MEAN_FRAMES == 0 {
                 let noise = CloudNoise::shared();
@@ -1070,25 +1090,32 @@ impl Sky {
         // its slices; the sky shader carries it on from there. A map begun
         // now is shown most two builds from now, so it is of then.
         let now = c.seconds;
-        if gpu.starts_map(whole) || self.cloud_build.is_none() {
+        // A frame that builds no slice still carries the shown maps on (the
+        // uniforms below) and keeps the ground's shadow it last drew.
+        let (every, count) = self.cloud_every;
+        self.cloud_every.1 = count.wrapping_add(1);
+        let build = whole || gpu.is_fresh() || every <= 1 || count % every == 0 || (shadow_moved && cs.active);
+        if build && (gpu.starts_map(whole) || self.cloud_build.is_none()) {
             let at = if whole || gpu.is_fresh() { now } else { now + gpu.map_lead() };
             self.cloud_build = Some((at, eye));
         }
-        let (at, build_eye) = self.cloud_build.unwrap_or((now, eye));
-        // The layers at the map's moment, placed over the envelopes as they
-        // are now (their origin can move at any update).
-        let mut layers = c.model.layers(at);
-        c.population.place(&mut layers, at);
-        let m = CloudSkyUniform::new(&layers, build_eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean).with_aerosol(self.aerosol_per_m);
-        mark(1);
-        gpu.set_population(device, queue, &c.population);
-        mark(2);
         let winds = crate::renderer::cloud_sky::flow_winds(&c.model.params, &c.layers);
-        gpu.set_winds(winds);
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("clouds") });
-        gpu.encode_at(&mut encoder, queue, &m, &u, shadow.filter(|_| cs.active), whole, now, at);
-        mark(3);
-        queue.submit(Some(encoder.finish()));
+        if build {
+            let (at, build_eye) = self.cloud_build.unwrap_or((now, eye));
+            // The layers at the map's moment, placed over the envelopes as
+            // they are now (their origin can move at any update).
+            let mut layers = c.model.layers(at);
+            c.population.place(&mut layers, at);
+            let m = CloudSkyUniform::new(&layers, build_eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean).with_aerosol(self.aerosol_per_m);
+            mark(1);
+            gpu.set_population(device, queue, &c.population);
+            mark(2);
+            gpu.set_winds(winds);
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("clouds") });
+            gpu.encode_at(&mut encoder, queue, &m, &u, shadow.filter(|_| cs.active), whole, now, at);
+            mark(3);
+            queue.submit(Some(encoder.finish()));
+        }
         mark(4);
         self.cloud_laps = laps;
         let d = gpu.display();
