@@ -1182,6 +1182,7 @@ pub fn cloud_sky_shader() -> String {
         .replace("{MEAN_FINE}", &f(0.625 * means[1] + 0.25 * means[2] + 0.125 * means[3]))
         .replace("{MERGE_LIFT}", &f(cp::MERGE_LIFT))
         .replace("{COVER_CEIL}", &f(cp::COVER_CEIL))
+        .replace("{CUMULUS_COVER_CEIL}", &f(cp::CUMULUS_COVER_CEIL))
         .replace("{OVERCAST0}", &f(cp::OVERCAST[0]))
         .replace("{OVERCAST1}", &f(cp::OVERCAST[1]))
         .replace("{FAR_PHASE}", &f(cp::FAR_PHASE))
@@ -1433,6 +1434,7 @@ const MEAN_B: f32 = {MEAN_B};
 const MEAN_FINE: f32 = {MEAN_FINE};
 const MERGE_LIFT: f32 = {MERGE_LIFT};
 const COVER_CEIL: f32 = {COVER_CEIL};
+const CUMULUS_COVER_CEIL: f32 = {CUMULUS_COVER_CEIL};
 const OVERCAST0: f32 = {OVERCAST0};
 const OVERCAST1: f32 = {OVERCAST1};
 const FAR_PHASE: f32 = {FAR_PHASE};
@@ -1509,7 +1511,8 @@ fn envelope(k: u32, xz: vec2<f32>, foot: f32) -> vec4<f32> {
     // (`EnvelopeSample::under`).
     let c = lv(k, 0u).z;
     let o = smoothstep(OVERCAST0, OVERCAST1, c);
-    near.x = max(min(near.x, COVER_CEIL + (1.0 - COVER_CEIL) * o), o * c);
+    let ceil = select(COVER_CEIL, CUMULUS_COVER_CEIL, lv(k, 1u).y == KIND_CUMULUS);
+    near.x = max(min(near.x, ceil + (1.0 - ceil) * o), o * c);
     if (t <= 0.0) {
         return near;
     }
