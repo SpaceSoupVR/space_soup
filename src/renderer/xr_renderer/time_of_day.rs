@@ -384,7 +384,14 @@ impl XrRenderer {
                 self.ground_placement = Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top));
                 self.uniform_buf.set_ground_map(view);
                 self.rebind_scene_group();
-                log::info!("TIMEOFDAY ground map relit");
+                // The sun it was lit along, against the static map's
+                // (`SUNSHADOW`): what reflections of the ground show.
+                let d = self.tod.ground_from.map_or([0.0, -1.0, 0.0], |(_, d)| d);
+                log::info!(
+                    "TIMEOFDAY ground map relit along sun {:.3}/{:.3} deg",
+                    d[1].clamp(-1.0, 1.0).asin().to_degrees(),
+                    d[0].atan2(d[2]).to_degrees()
+                );
             }
             Err(mpsc::TryRecvError::Disconnected) => self.tod.ground_build = None,
             Err(mpsc::TryRecvError::Empty) => {}
