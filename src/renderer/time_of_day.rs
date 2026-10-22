@@ -8,9 +8,43 @@ pub const REFRESH_HOURS: f32 = 0.02;
 
 pub const RELIGHT_STEP: f32 = 0.03;
 
-pub const NIGHT_MAX_EXPOSURE: f32 = 1.0e6;
+/// The night eye's widest opening: past what starlight alone asks
+/// (`exposure::DEEP_NIGHT_LUMINANCE`, about x1.4e7), so the adaptation curve
+/// decides it, not the cap. At 1e6 a moonless night drew black (2026-10-22).
+pub const NIGHT_MAX_EXPOSURE: f32 = 1.0e8;
 
 pub const PROBE_RELIGHT_RATIO: f32 = 1.25;
+
+/// The brightest texel a relit atlas is stored at, in half floats: room
+/// below f16's 65504 for the mips' averages to stay finite.
+pub const ATLAS_PEAK: f32 = 16384.0;
+
+/// HOW MANY STOPS BRIGHTER A RELIT ATLAS IS STORED, so its brightest texel
+/// sits near `ATLAS_PEAK`: whole stops, so the scale moves no mantissa bit.
+/// Under a new moon the daylight layers are x4e-9 of the bake's, below f16's
+/// smallest (6e-8), and the atlas stored exactly zero however far the eye
+/// opened (2026-10-22); stored brighter, starlight keeps its texels. Never
+/// dimmer than as baked. Alpha (sky visibility) is not light, and is left.
+pub fn atlas_stops(rgba: &[f32]) -> f32 {
+    let peak = rgba.chunks_exact(4).map(|p| p[0].max(p[1]).max(p[2])).fold(0.0f32, f32::max);
+    if !(peak > 0.0) {
+        return 0.0;
+    }
+    (ATLAS_PEAK / peak).log2().floor().clamp(0.0, 100.0)
+}
+
+/// `rgba`'s light (not its alpha) `stops` brighter.
+pub fn scale_atlas(rgba: &mut [f32], stops: f32) {
+    if stops == 0.0 {
+        return;
+    }
+    let k = stops.exp2();
+    for p in rgba.chunks_exact_mut(4) {
+        for v in &mut p[..3] {
+            *v *= k;
+        }
+    }
+}
 
 pub const PROBE_RELIGHT_ANGLE_COS: f32 = 0.9986;
 
@@ -99,6 +133,9 @@ pub struct Prepared {
     pub daylight: f32,
 
     pub atlas: Option<Vec<(Vec<u8>, u32, u32)>>,
+    /// The stops `atlas` was stored brighter by (`atlas_stops`); the brushes
+    /// read it back down by as many (`PostUpload::atlas_stops`).
+    pub atlas_stops: f32,
 }
 
 struct Request {
@@ -249,14 +286,17 @@ impl Worker {
             };
             keyed || (0..3).any(|c| far(a.sky[c], b.sky[c]) || far(a.sun[c], b.sun[c]))
         };
-        let atlas = match &self.layers {
+        let (atlas, atlas_stops) = match &self.layers {
             Some(layers) if force || self.sent.as_ref().is_none_or(|s| moved(s, &weights)) => {
                 self.sent = Some(weights);
-                Some(crate::renderer::mesh::lightmap_mips_f16(&layers.relit(&weights), layers.width, layers.height))
+                let mut relit = layers.relit(&weights);
+                let stops = atlas_stops(&relit);
+                scale_atlas(&mut relit, stops);
+                (Some(crate::renderer::mesh::lightmap_mips_f16(&relit, layers.width, layers.height)), stops)
             }
-            _ => None,
+            _ => (None, 0.0),
         };
-        Prepared { snapshot, weights, daylight, atlas }
+        Prepared { snapshot, weights, daylight, atlas, atlas_stops }
     }
 }
 

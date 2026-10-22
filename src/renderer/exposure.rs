@@ -488,7 +488,10 @@ pub fn exposure_for_up_to(luminance: f32, max: f32) -> f32 {
     if max > MAX_EXPOSURE && indoor > MAX_EXPOSURE {
         // Past the indoor range, on from where it ends (`NIGHT_ADAPTATION_STRENGTH`).
         let knee = REFERENCE_LUMINANCE / MAX_EXPOSURE.powf(1.0 / ADAPTATION_STRENGTH);
-        return (MAX_EXPOSURE * (knee / luminance).powf(NIGHT_ADAPTATION_STRENGTH)).clamp(MIN_EXPOSURE, max);
+        let night = MAX_EXPOSURE * (knee / luminance.max(DEEP_NIGHT_LUMINANCE)).powf(NIGHT_ADAPTATION_STRENGTH);
+        // Darker than a bright moon, the eye follows less (`DEEP_NIGHT_ADAPTATION_STRENGTH`).
+        let deep = (DEEP_NIGHT_LUMINANCE / luminance).max(1.0).powf(DEEP_NIGHT_ADAPTATION_STRENGTH);
+        return (night * deep).clamp(MIN_EXPOSURE, max);
     }
     indoor.clamp(MIN_EXPOSURE, max)
 }
@@ -500,7 +503,17 @@ pub fn exposure_for_up_to(luminance: f32, max: f32) -> f32 {
 /// stars' light too low (2026-10-20); this lifts it about 1.6 stops.
 pub const NIGHT_ADAPTATION_STRENGTH: f32 = 0.9;
 
-const NIGHT_LOG_FLOOR: f32 = 1e-10;
+/// THE DEEP NIGHT: the metered luminance (engine units) under which the eye
+/// follows the dark only at `DEEP_NIGHT_ADAPTATION_STRENGTH` -- about 1.3
+/// stops under the full moon's open ground (3.8e-7 metered offline at 23:30).
+/// So a half moon reads darker than a full one, and the open beach under
+/// starlight alone about 3 stops under the full moon's (offline, 23:30):
+/// dark, still walkable without the torch (user, 2026-10-22). At 0.65 it
+/// read 3.7 stops under, the ground barely there; capped at x1e6, black.
+pub const DEEP_NIGHT_LUMINANCE: f32 = 1.5e-7;
+pub const DEEP_NIGHT_ADAPTATION_STRENGTH: f32 = 0.8;
+
+const NIGHT_LOG_FLOOR: f32 = 1e-12;
 
 /// The adapted luminance (log2) below which the eye is past the indoor
 /// range: where `exposure_for` reaches `MAX_EXPOSURE`.

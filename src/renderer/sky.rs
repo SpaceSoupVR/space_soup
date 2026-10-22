@@ -19,20 +19,10 @@ pub fn direction_to_uv(d: [f32; 3]) -> [f32; 2] {
 }
 
 pub fn f32_to_f16(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let mut exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    let mant = bits & 0x7f_ffff;
-    if exp >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if exp <= 0 {
-        return sign;
-    }
-    if exp > 0x1e {
-        exp = 0x1e;
-    }
-    sign | ((exp as u16) << 10) | ((mant >> 13) as u16)
+    // Keeps the subnormals (down to 6e-8): this flushed everything under
+    // f16's smallest normal, 6.1e-5, to zero, so moonlit and starlit texels
+    // of the relit atlas and the ground map stored black (2026-10-22).
+    crate::renderer::uniforms::f32_to_f16(v)
 }
 
 #[repr(C)]

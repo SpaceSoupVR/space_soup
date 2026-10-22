@@ -541,6 +541,7 @@ impl XrRenderer {
                 night_vision,
                 rooms,
                 cloud_map: self.sky.cloud_map(self.player.yaw, self.player.offset.to_array()),
+                atlas_stops: self.tod.atlas_stops,
                 ..self.post
             }
         };

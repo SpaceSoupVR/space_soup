@@ -3088,7 +3088,7 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
     let rough_aa = specular_aa_roughness(rough, dpdx(n_geom), dpdy(n_geom));
     let ao = textureSample(mat_ao, mat_samp, in.uv, i32(in.material)).r;
     let lm_uv = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
-    let baked = textureSample(lm_tex, lm_samp, lm_uv);
+    let baked = textureSample(lm_tex, lm_samp, lm_uv) * vec4<f32>(vec3<f32>(exp2(-camera.proxy_params.z)), 1.0);
     let face_t = normalize(in.tangent.xyz - n_geom * dot(n_geom, in.tangent.xyz));
     let face_b = cross(n_geom, face_t) * in.tangent.w;
     let face_d = in.world_pos - in.face_centre;
@@ -3346,7 +3346,7 @@ struct VOut {{
     let ao = textureSample(mat_ao, mat_samp, in.uv, i32(in.material)).r;
 
     let lm_uv = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
-    let baked = textureSample(lm_tex, lm_samp, lm_uv);
+    let baked = textureSample(lm_tex, lm_samp, lm_uv) * vec4<f32>(vec3<f32>(exp2(-camera.proxy_params.z)), 1.0);
 
     let bdir = textureSample(lm_dir_tex, lm_samp, lm_uv);
 

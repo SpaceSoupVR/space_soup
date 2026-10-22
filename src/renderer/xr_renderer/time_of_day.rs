@@ -63,6 +63,9 @@ pub(super) struct TodState {
     pub last_apply: Option<std::time::Instant>,
     /// The daylight the blend starts from, beside `daylight` it goes to.
     pub daylight_from: f32,
+    /// The stops the brush atlas on the GPU is stored brighter by
+    /// (`time_of_day::atlas_stops`); 0 for the shipped atlas.
+    pub atlas_stops: f32,
 }
 
 const GROUND_RATIO: f32 = 1.5;
@@ -143,6 +146,7 @@ impl XrRenderer {
         if let (Some((atlas, w, h)), Some(lm)) = (self.tod.shipped_atlas.as_ref(), self.brush_lightmap.as_ref()) {
             crate::renderer::mesh::write_lightmap_mips(&self.wgpu_queue, &lm.texture, &crate::renderer::mesh::lightmap_mips_f16(atlas, *w, *h));
         }
+        self.tod.atlas_stops = 0.0;
         {
             let mut eye = self.eye.borrow_mut();
             eye.set_max_exposure(crate::renderer::exposure::MAX_EXPOSURE);
@@ -184,6 +188,7 @@ impl XrRenderer {
 
     pub(super) fn tod_brush_atlas_changed(&mut self, shipped: Option<(Vec<f32>, u32, u32)>) {
         self.tod.shipped_atlas = shipped;
+        self.tod.atlas_stops = 0.0;
         self.tod.sunless = None;
         if self.tod.off_bake {
             self.tod.sun_faces_baked = self.sun_faces.take();
@@ -280,6 +285,7 @@ impl XrRenderer {
         let atlas_bytes: usize = p.atlas.as_ref().map_or(0, |c| c.iter().map(|m| m.0.len()).sum());
         if let (Some(chain), Some(lm)) = (p.atlas.as_ref(), self.brush_lightmap.as_ref()) {
             crate::renderer::mesh::write_lightmap_mips(&self.wgpu_queue, &lm.texture, chain);
+            self.tod.atlas_stops = p.atlas_stops;
         }
         let a3 = std::time::Instant::now();
         let ms = |a: std::time::Instant, b: std::time::Instant| b.duration_since(a).as_secs_f32() * 1000.0;

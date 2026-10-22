@@ -220,6 +220,10 @@ pub struct PostUpload {
 
     /// Where the clouds' shadow map lies; see `Uniforms::cloud_map`.
     pub cloud_map: [[f32; 4]; 3],
+
+    /// The stops the brush atlas is stored brighter by
+    /// (`time_of_day::atlas_stops`); the brushes read it this much down.
+    pub atlas_stops: f32,
 }
 
 impl Default for PostUpload {
@@ -233,6 +237,7 @@ impl Default for PostUpload {
             night_vision: 0.0,
             rooms: [[0.0; 4]; 2 * ROOM_EXPOSURE_ROOMS],
             cloud_map: [[0.0; 4]; 3],
+            atlas_stops: 0.0,
         }
     }
 }
@@ -811,7 +816,7 @@ impl UniformBuffer {
             ],
             probe_portals: dense.portals,
 
-            proxy_params: [probes.proxy_count as f32, post.night_vision, 0.0, 0.0],
+            proxy_params: [probes.proxy_count as f32, post.night_vision, post.atlas_stops, 0.0],
             probe_proxies: dense.proxies,
             probe_rooms: room_tables,
             ground_params: dense.ground,
