@@ -672,6 +672,9 @@ mod tests {
             let glow = if e.kind == EffectKind::Embers { at.exposure * fire_adaptation(e, at) } else { at.exposure };
             let up = e.direction.try_normalize().unwrap_or(Vec3::Y);
             let air = (e.kind == EffectKind::Dust).then(|| air_waves(base));
+            // (The drift's clocks once a frame, as `simulate_governed` reads
+            // them since 2026-10-22.)
+            let clocks = air.as_ref().map(|w| air_clocks(w, time));
             for i in 0..slots {
                 let since = time - i as f64 / rate as f64;
                 let n = (since / period).floor();
@@ -702,14 +705,14 @@ mod tests {
                 let (mut pos, vel) = ballistic(p0, dir * speed, p.accel, p.drag, age);
 
                 let mut moving = vel;
-                if let Some(air) = &air {
-
-                    pos += (air_drift(air, p0, time) - air_drift(air, p0, time - age as f64)) * v.turbulence;
+                if let (Some(air), Some(clocks)) = (&air, &clocks) {
+                    let now = air_drift_back(air, clocks, p0, 0.0);
+                    pos += (now - air_drift_back(air, clocks, p0, age)) * v.turbulence;
                     let seed = base ^ (i as u64).wrapping_mul(0x632be59bd9b4e019) ^ (n as i64 as u64);
                     let wander = |jitter: f32| Vec3::new(noise1(jitter, seed), 0.6 * noise1(jitter, seed ^ 1), noise1(jitter, seed ^ 2)) * (p.swirl.0 * v.turbulence);
                     let jitter = age * p.swirl.1;
                     pos += wander(jitter);
-                    moving += (air_drift(air, p0, time) - air_drift(air, p0, time - MOTION_H as f64)) * (v.turbulence / MOTION_H)
+                    moving += (now - air_drift_back(air, clocks, p0, MOTION_H)) * (v.turbulence / MOTION_H)
                         + (wander(jitter) - wander((age - MOTION_H) * p.swirl.1)) / MOTION_H;
                 } else {
                     let swirl_r = p.swirl.0 * v.turbulence * t * e.scale;

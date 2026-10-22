@@ -396,9 +396,38 @@ fn swirl_motion(growth: f32, radius: f32, turn: f32, angle: f32) -> Vec3 {
 }
 
 fn lamp_at(l: &Light, p: Vec3) -> Option<(Vec3, Vec3)> {
+    lamp_seen_at(&lamp_seen(l, 1.0)?, p)
+}
+
+/// A lamp as the motes read it, worked out once a frame instead of once a
+/// mote: its linear colour (three `powf`), its cone's cosines and the fire
+/// adaptation share `own` (`simulate_governed`). Dust spent 0.94 ms of the
+/// Quest's CPU a frame on 893 motes, ~1 us a mote, most of it here and in
+/// `air_drift`'s clocks (`time_a_frames_effects`).
+struct LampSeen {
+    position: Vec3,
+    range: f32,
+    colour: Vec3,
+    intensity: f32,
+    source_radius: f32,
+    /// A spot's (cos outer, cos inner, unit direction).
+    spot: Option<(f32, f32, Vec3)>,
+    own: f32,
+}
+
+fn lamp_seen(l: &Light, own: f32) -> Option<LampSeen> {
     if matches!(l.kind, LightKind::Directional) || l.intensity <= 0.0 {
         return None;
     }
+    let c = l.color.to_linear();
+    let spot = matches!(l.kind, LightKind::Spot).then(|| {
+        let (cos_outer, cos_inner) = l.cone_cosines();
+        (cos_outer, cos_inner, l.direction.normalize_or_zero())
+    });
+    Some(LampSeen { position: l.position, range: l.range, colour: Vec3::new(c[0], c[1], c[2]), intensity: l.intensity, source_radius: l.source_radius, spot, own })
+}
+
+fn lamp_seen_at(l: &LampSeen, p: Vec3) -> Option<(Vec3, Vec3)> {
     let to = l.position - p;
     let d = to.length();
     if d >= l.range || d < 1e-5 {
@@ -409,17 +438,14 @@ fn lamp_at(l: &Light, p: Vec3) -> Option<(Vec3, Vec3)> {
     let window = (1.0 - x * x * x * x).clamp(0.0, 1.0);
     let near = super::glare::LAMP_RADIUS;
     let atten = window * window / (d * d + l.source_radius * l.source_radius).max(near * near);
-    let cone = if matches!(l.kind, LightKind::Spot) {
-        let (cos_outer, cos_inner) = l.cone_cosines();
-        smoothstep(cos_outer, cos_inner, (-dir).dot(l.direction.normalize_or_zero()))
-    } else {
-        1.0
+    let cone = match l.spot {
+        Some((cos_outer, cos_inner, axis)) => smoothstep(cos_outer, cos_inner, (-dir).dot(axis)),
+        None => 1.0,
     };
     if cone <= 0.0 {
         return None;
     }
-    let c = l.color.to_linear();
-    Some((Vec3::new(c[0], c[1], c[2]) * (l.intensity * atten * cone), dir))
+    Some((l.colour * (l.intensity * atten * cone), dir))
 }
 
 fn luminance(c: Vec3) -> f32 {
@@ -487,10 +513,19 @@ fn air_waves(seed: u64) -> [AirWave; 6] {
 }
 
 fn air_drift(waves: &[AirWave; 6], p: Vec3, time: f64) -> Vec3 {
-    waves.iter().fold(Vec3::ZERO, |sum, a| {
-        let clock = (a.w as f64 * time).rem_euclid(std::f64::consts::TAU) as f32;
-        sum + a.across * (a.reach * (a.k.dot(p) + clock + a.phase).sin())
-    })
+    air_drift_back(waves, &air_clocks(waves, time), p, 0.0)
+}
+
+/// Each wave's phase at `time`, wrapped in f64 once a frame: `air_drift`
+/// took the f64 remainder six times for each of four reads a mote.
+fn air_clocks(waves: &[AirWave; 6], time: f64) -> [f32; 6] {
+    std::array::from_fn(|i| (waves[i].w as f64 * time).rem_euclid(std::f64::consts::TAU) as f32)
+}
+
+/// `air_drift` at the clocks' time less `back` seconds (a mote's age, a
+/// motion step: seconds, small enough for f32).
+fn air_drift_back(waves: &[AirWave; 6], clocks: &[f32; 6], p: Vec3, back: f32) -> Vec3 {
+    waves.iter().zip(clocks).fold(Vec3::ZERO, |sum, (a, clock)| sum + a.across * (a.reach * (a.k.dot(p) + (clock - a.w * back) + a.phase).sin()))
 }
 
 fn air_reach(waves: &[AirWave; 6]) -> f32 {
@@ -1052,11 +1087,16 @@ pub fn simulate_governed(
         let shed_phase = (hash64(base ^ 0x0de5_ead) >> 40) as f32 / (1u64 << 24) as f32;
         let tint = Vec3::from(e.tint);
         let ambient = (at.ambient)(e.position);
-        let lamps: Vec<usize> = (0..at.lights.len()).filter(|&i| (at.reaches)(e, i)).collect();
+        let lamps: Vec<LampSeen> = (0..at.lights.len())
+            .filter(|&i| (at.reaches)(e, i))
+            .filter_map(|i| lamp_seen(&at.lights[i], own(&at.lights[i])))
+            .collect();
+        let glint_seed = id_hash("glint");
 
         let glow = if s.own_light { at.exposure * fire_adaptation(e, at) } else { at.exposure };
         let up = e.direction.try_normalize().unwrap_or(Vec3::Y);
         let air = s.air.then(|| air_waves(base));
+        let clocks = air.as_ref().map(|w| air_clocks(w, time));
         for i in 0..slots {
             let since = time - i as f64 / rate as f64;
             let n = (since / period).floor();
@@ -1097,14 +1137,14 @@ pub fn simulate_governed(
             let (mut pos, vel) = ballistic(p0, dir * speed, p.accel, p.drag, age);
 
             let mut moving = vel;
-            if let Some(air) = &air {
-
-                pos += (air_drift(air, p0, time) - air_drift(air, p0, time - age as f64)) * v.turbulence;
+            if let (Some(air), Some(clocks)) = (&air, &clocks) {
+                let now = air_drift_back(air, clocks, p0, 0.0);
+                pos += (now - air_drift_back(air, clocks, p0, age)) * v.turbulence;
                 let seed = base ^ (i as u64).wrapping_mul(0x632be59bd9b4e019) ^ (n as i64 as u64);
                 let wander = |jitter: f32| Vec3::new(noise1(jitter, seed), 0.6 * noise1(jitter, seed ^ 1), noise1(jitter, seed ^ 2)) * (p.swirl.0 * v.turbulence);
                 let jitter = age * p.swirl.1;
                 pos += wander(jitter);
-                moving += (air_drift(air, p0, time) - air_drift(air, p0, time - MOTION_H as f64)) * (v.turbulence / MOTION_H)
+                moving += (now - air_drift_back(air, clocks, p0, MOTION_H)) * (v.turbulence / MOTION_H)
                     + (wander(jitter) - wander((age - MOTION_H) * p.swirl.1)) / MOTION_H;
             } else {
                 let swirl_r = p.swirl.0 * v.turbulence * t * e.scale;
@@ -1169,13 +1209,13 @@ pub fn simulate_governed(
                 templates::SlotShade::Scatter { ambient: seen } => {
 
                     let mut scattered = ambient * seen;
-                    for &li in &lamps {
-                        if let Some((c, d)) = lamp_at(&at.lights[li], centre) {
-                            scattered += c * (own(&at.lights[li]) * henyey_greenstein(p.phase_g, -d, to_eye));
+                    for l in &lamps {
+                        if let Some((c, d)) = lamp_seen_at(l, centre) {
+                            scattered += c * (l.own * henyey_greenstein(p.phase_g, -d, to_eye));
                         }
                     }
 
-                    let glint = if s.held { mote_glint(age, lerp(0.35, 1.3, u[7]), id_hash("glint") ^ u[8].to_bits() as u64) } else { 1.0 };
+                    let glint = if s.held { mote_glint(age, lerp(0.35, 1.3, u[7]), glint_seed ^ u[8].to_bits() as u64) } else { 1.0 };
                     let c = scattered * p.albedo * tint * (at.exposure * glint * v.intensity);
                     let held = smoothstep(0.0, 0.2, t) * smoothstep(1.0, 0.7, t);
                     let d = (centre - at.head).length();
@@ -1186,9 +1226,9 @@ pub fn simulate_governed(
                 templates::SlotShade::Sixway { peak, rise, power } => {
                     let mut strongest: Option<(f32, Vec3, Vec3)> = None;
                     let mut rest = ambient;
-                    for &li in &lamps {
-                        let Some((c, d)) = lamp_at(&at.lights[li], centre) else { continue };
-                        let c = c * own(&at.lights[li]);
+                    for l in &lamps {
+                        let Some((c, d)) = lamp_seen_at(l, centre) else { continue };
+                        let c = c * l.own;
                         let y = luminance(c);
                         match strongest {
                             Some((sy, _, _)) if sy >= y => rest += c,
