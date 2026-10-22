@@ -1413,6 +1413,7 @@ const GLOW_GAIN: f32 = {GLOW_GAIN};
 const GLOW_G: f32 = {GLOW_G};
 const GLOW_DECAY: f32 = {GLOW_DECAY};
 const GLOW_NEAR: f32 = {GLOW_NEAR};
+const LIGHT_EVERY: u32 = 2u;
 const PACK: f32 = {PACK};
 const KIND_CUMULUS: f32 = {KIND_CUMULUS};
 const KIND_STRATO: f32 = {KIND_STRATO};
@@ -1910,6 +1911,12 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
         var t = t0 + jitter * stride;
         var hold = 0u;
         var steps = 0u;
+        // The light toward the sun, marched every LIGHT_EVERY-th fine step in
+        // cloud and kept between (its depth changes over hundreds of metres,
+        // a fine step is tens): a third of the map's cost was these taps.
+        var lit_for = 0u;
+        var tau_kept = 0.0;
+        var near_kept = 0.0;
         loop {
             if (t >= t_end || steps >= MARCH_CAP) {
                 break;
@@ -1928,7 +1935,14 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
             }
             if (d > 0.0) {
                 hold = REFINE_HOLD * REFINE;
-                let s = in_scatter(k, p_alt, light_tau(k, xz, p_alt, foot), cv, ph, glow, d);
+                if (lit_for == 0u) {
+                    tau_kept = light_tau(k, xz, p_alt, foot);
+                    near_kept = light_near;
+                    lit_for = LIGHT_EVERY;
+                }
+                lit_for = lit_for - 1u;
+                light_near = near_kept;
+                let s = in_scatter(k, p_alt, tau_kept, cv, ph, glow, d);
                 let ts = exp(-d * dt);
                 let w = trans * (1.0 - ts) * haze_through(t, mu);
                 rgb = rgb + w * s;
@@ -1940,6 +1954,7 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
                 }
             } else if (fine) {
                 hold = hold - 1u;
+                lit_for = 0u;
             }
             t = t + dt;
         }
@@ -2271,11 +2286,12 @@ pub(crate) mod tests {
                 "no light taps" => base.replace("fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {", "fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {\n    if (true) { return 0.0; }"),
                 "no detail" => base.replace("let d = density(k, xz, p_alt, true, foot);", "let d = density(k, xz, p_alt, false, foot);"),
                 "no refine" => base.replace("const REFINE: u32 = 4u;", "const REFINE: u32 = 1u;"),
+                "light every step" => base.replace("const LIGHT_EVERY: u32 = 2u;", "const LIGHT_EVERY: u32 = 1u;"),
                 "half steps" => base.replace(&format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST), &format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST / 2)),
                 _ => base.clone(),
             }
         };
-        for (populated, name) in [(false, "as built"), (true, "as built"), (true, "no refine"), (true, "no light taps"), (true, "no detail"), (true, "half steps")] {
+        for (populated, name) in [(false, "as built"), (true, "as built"), (true, "no refine"), (true, "light every step"), (true, "no light taps"), (true, "no detail"), (true, "half steps")] {
             let src = variant(name);
             assert!(name == "as built" || src != base, "variant {name} changed nothing");
             let mut population = CloudPopulation::new();
