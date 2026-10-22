@@ -1160,6 +1160,7 @@ pub fn cloud_sky_shader() -> String {
         .replace("{GLOW_GAIN}", &f(c::CLOUD_GLOW[0]))
         .replace("{GLOW_G}", &f(c::CLOUD_GLOW[1]))
         .replace("{GLOW_DECAY}", &f(c::CLOUD_GLOW[2]))
+        .replace("{GLOW_NEAR}", &f(c::CLOUD_GLOW_NEAR))
         .replace("{FORWARD_G}", &f(c::PHASE_FORWARD_G))
         .replace("{BACK_G}", &f(c::PHASE_BACK_G))
         .replace("{BACK_SHARE}", &f(c::PHASE_BACK_SHARE))
@@ -1411,6 +1412,7 @@ const POWDER_SHARE: f32 = 0.35;
 const GLOW_GAIN: f32 = {GLOW_GAIN};
 const GLOW_G: f32 = {GLOW_G};
 const GLOW_DECAY: f32 = {GLOW_DECAY};
+const GLOW_NEAR: f32 = {GLOW_NEAR};
 const PACK: f32 = {PACK};
 const KIND_CUMULUS: f32 = {KIND_CUMULUS};
 const KIND_STRATO: f32 = {KIND_STRATO};
@@ -1755,8 +1757,13 @@ fn phase(s: f32, c: f32) -> f32 {
 // the fatter body the erosion carves, and against a path-traced reference
 // a cumulus's sunlight came out 3-10 times too dark (2026-10-21,
 // `tools/reference/cloud_reference.py`).
+// The optical depth of the first ~200 m toward the light, from the last
+// `light_tau` (a cumulus's first two taps; 0 for the two-tap layers): how
+// deep in its own lobe a sample sits, which the glow dims with (`GLOW_NEAR`).
+var<private> light_near: f32 = 0.0;
 fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {
     let l = u.light_dir.xyz;
+    light_near = 0.0;
     let a = lv(k, 0u);
     let thick = max(a.y - a.x, 100.0);
     var tau = 0.0;
@@ -1768,6 +1775,9 @@ fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {
         let p = vec3<f32>(xz.x, alt, xz.y) + l * r;
         tau = tau + density(k, p.xz, p.y, true, foot) * (r - last);
         last = r;
+        if (j == 1u) {
+            light_near = tau;
+        }
     }
     return tau;
 }
@@ -1787,7 +1797,7 @@ fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {
 fn in_scatter(k: u32, alt: f32, tau_l: f32, cv: f32, ph: f32, glow: f32, d: f32) -> vec3<f32> {
     let a = lv(k, 0u);
     let h = clamp((alt - a.x) / max(a.y - a.x, 1.0), 0.0, 1.0);
-    var lit = ph * exp(-tau_l) + glow * exp(-GLOW_DECAY * tau_l);
+    var lit = ph * exp(-tau_l) + glow * exp(-GLOW_DECAY * tau_l - GLOW_NEAR * light_near);
     // Beer-powder, mild and only away from the sun: thin outer parts have
     // built up less scattered light.
     let powder = 1.0 - exp(-POWDER_K * (2.0 * tau_l + 40.0 * d));
