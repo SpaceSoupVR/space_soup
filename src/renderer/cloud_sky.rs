@@ -56,7 +56,7 @@ pub const MAP_SLICES: u32 = 96;
 /// the edge on the wind of half its height).
 pub const ALT_FILL_WEIGHT: f32 = 0.02;
 /// Rows are packed toward the horizon: elevation = 90 deg * v^MAP_PACK.
-pub const MAP_PACK: f32 = 1.5;
+pub const MAP_PACK: f32 = 1.15;
 /// THE MAPS ACCUMULATE (2026-10-21). Each map's samples sit at their own
 /// fraction of the step (`HISTORY_JITTER` apart, every texel alike, so
 /// neighbouring rays still read neighbouring noise), and a map built from a
@@ -1117,6 +1117,7 @@ pub fn cloud_sky_shader() -> String {
         .replace("{DETAIL_RATIO}", &f(cl::DETAIL_RATIO))
         .replace("{DETAIL_EROSION}", &f(cl::DETAIL_EROSION))
         .replace("{CHURN_WARP}", &f(cl::CHURN_WARP))
+        .replace("{SHAPE_OCTAVES}", &cl::SHAPE_OCTAVES.map(f).join(", "))
         .replace("{CHURN_PULSE}", &f(cl::CHURN_PULSE))
         .replace("{CHURN_FAST}", &f(cl::CHURN_FAST))
         .replace("{CHURN_FAST_SHARE}", &f(cl::CHURN_FAST_SHARE))
@@ -1127,6 +1128,10 @@ pub fn cloud_sky_shader() -> String {
         .replace("{WARP_GAIN0}", &f(cl::WARP_GAIN[0]))
         .replace("{WARP_GAIN1}", &f(cl::WARP_GAIN[1]))
         .replace("{SHEAR_MOMENTUM}", &f(cl::SHEAR_MOMENTUM))
+        .replace("{SHEAR_LEAN_MAX}", &f(cl::SHEAR_LEAN_MAX))
+        .replace("{EDGE_FRINGE}", &f(cl::EDGE_FRINGE))
+        .replace("{EDGE_FRINGE_D}", &f(cl::EDGE_FRINGE_D))
+        .replace("{EDGE_AGEING}", &f(cl::EDGE_AGEING))
         .replace("{EDGE_GAIN}", &f(cl::EDGE_GAIN))
         .replace("{MAX_MARCH}", &f(cl::MAX_MARCH_M))
         .replace("{CIRRUS_TAU}", &f(cl::CIRRUS_TAU))
@@ -1338,6 +1343,7 @@ const EARTH: f32 = {EARTH};
 const DETAIL_RATIO: f32 = {DETAIL_RATIO};
 const DETAIL_EROSION: f32 = {DETAIL_EROSION};
 const CHURN_WARP: f32 = {CHURN_WARP};
+const SHAPE_OCTAVES: vec3<f32> = vec3<f32>({SHAPE_OCTAVES});
 const CHURN_PULSE: f32 = {CHURN_PULSE};
 const CHURN_FAST: f32 = {CHURN_FAST};
 const CHURN_FAST_SHARE: f32 = {CHURN_FAST_SHARE};
@@ -1348,6 +1354,10 @@ const RISE_CORE: f32 = {RISE_CORE};
 const WARP_GAIN0: f32 = {WARP_GAIN0};
 const WARP_GAIN1: f32 = {WARP_GAIN1};
 const SHEAR_MOMENTUM: f32 = {SHEAR_MOMENTUM};
+const SHEAR_LEAN_MAX: f32 = {SHEAR_LEAN_MAX};
+const EDGE_FRINGE: f32 = {EDGE_FRINGE};
+const EDGE_FRINGE_D: f32 = {EDGE_FRINGE_D};
+const EDGE_AGEING: f32 = {EDGE_AGEING};
 const EDGE_GAIN: f32 = {EDGE_GAIN};
 const MAX_MARCH: f32 = {MAX_MARCH};
 const CIRRUS_TAU: f32 = {CIRRUS_TAU};
@@ -1509,7 +1519,7 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
     var xz = xz_in;
     if (sh.w > 0.0 && sh.z > 0.0) {
         let z = h * (a.y - a.x);
-        xz = xz - sh.xy * (SHEAR_MOMENTUM * min(sh.z * z * z / (2.0 * sh.w), z));
+        xz = xz - sh.xy * min(SHEAR_MOMENTUM * sh.z * z * z / (2.0 * sh.w), SHEAR_LEAN_MAX * z);
     }
     let env = envelope(k, xz, foot);
     let cover = env.x;
@@ -1523,7 +1533,7 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
     let r = foot * NOISE_TEXELS * si;
     let fine_a = smoothstep(0.25, 0.5, r);
     let fine_b = smoothstep(0.5, 1.0, r);
-    let low = 0.625 * n.g + 0.25 * mix(n.b, MEAN_B, fine_b) + 0.125 * mix(n.a, MEAN_A, fine_a);
+    let low = SHAPE_OCTAVES.x * n.g + SHAPE_OCTAVES.y * mix(n.b, MEAN_B, fine_b) + SHAPE_OCTAVES.z * mix(n.a, MEAN_A, fine_a);
     let base = clamp((n.r - (low - 1.0)) / (2.0 - low), 0.0, 1.0);
     let shape = base * height_profile(lv(k, 1u).y, h, env.y);
     let th = threshold(k, cover);
@@ -1574,7 +1584,10 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
         let cut = min(DETAIL_EROSION * (0.8 + 0.5 * env.z) * e * pulse, 0.95);
         d = clamp((d - cut) / (1.0 - cut), 0.0, 1.0);
     }
-    return min(d * EDGE_GAIN, 1.0) * a.w;
+    // Frayed at the fringe and thinned with age (`cloud_layers::edge_gain`).
+    let fringe = EDGE_FRINGE + (1.0 - EDGE_FRINGE) * smoothstep(0.0, EDGE_FRINGE_D, d);
+    let ageing = 1.0 - EDGE_AGEING * smoothstep(0.6, 1.0, env.z);
+    return min(d * EDGE_GAIN * fringe * ageing, 1.0) * a.w;
 }
 
 fn cirrus_tau(k: u32, xz: vec2<f32>) -> f32 {
