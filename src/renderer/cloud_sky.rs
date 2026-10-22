@@ -74,6 +74,14 @@ pub const HISTORY_REJECT: [f32; 2] = [0.2, 0.5];
 /// One map's sample fraction to the next: the golden ratio's, so any run of
 /// maps spreads its samples evenly through the step.
 pub const HISTORY_JITTER: f32 = 0.618_034;
+/// THE MAP IS PREFILTERED so the display's cubic B-spline (`sky_cloud_map`,
+/// four bilinear taps) passes through its samples instead of blurring them:
+/// the B-spline's inverse, sqrt(3) (sqrt(3) - 2)^|k|, cut at two texels and
+/// renormalised, per axis. The B-spline alone took a cumulus edge's
+/// response at half Nyquist to 0.66 (sigma 0.58 texel, about 2.6 headset
+/// pixels; research `realistic-sky-research-2026-10-21` §3.1); with this
+/// 0.98. Run once per map row, a band behind the march.
+pub const PREFILTER: [f32; 3] = [1.645, -0.441, 0.118];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -246,6 +254,11 @@ pub struct CloudSky {
     maps: Texture,
     map_layers: [TextureView; 3],
     array_view: TextureView,
+    /// The march's own texels, before the prefilter (`PREFILTER`).
+    raw: Texture,
+    raw_view: TextureView,
+    prefilter_pipeline: RenderPipeline,
+    prefilter_group: BindGroup,
     /// Beside each map, the height of what it shows (R16F, metres): what
     /// the wind it is carried on is read by.
     alts: Texture,
@@ -358,6 +371,56 @@ impl CloudSky {
                 array_layer_count: Some(1),
                 ..Default::default()
             })
+        });
+        // What the march writes, before the prefilter turns it into a map
+        // (`PREFILTER`): one layer, each row read again while the next
+        // slice is marched.
+        let raw = device.create_texture(&TextureDescriptor {
+            label: Some("cloud_sky_raw"),
+            size: Extent3d { width: MAP_WIDTH, height: MAP_HEIGHT, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba16Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let raw_view = raw.create_view(&TextureViewDescriptor::default());
+        let prefilter_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("cloud_prefilter_bgl"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture { sample_type: TextureSampleType::Float { filterable: false }, view_dimension: TextureViewDimension::D2, multisampled: false },
+                count: None,
+            }],
+        });
+        let prefilter_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("cloud_prefilter_bg"),
+            layout: &prefilter_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&raw_view) }],
+        });
+        let prefilter_shader = device.create_shader_module(ShaderModuleDescriptor { label: Some("cloud_prefilter"), source: ShaderSource::Wgsl(prefilter_shader().into()) });
+        let prefilter_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("cloud_prefilter_layout"),
+            bind_group_layouts: &[Some(&prefilter_layout)],
+            immediate_size: 0,
+        });
+        let prefilter_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("cloud_prefilter"),
+            layout: Some(&prefilter_pipeline_layout),
+            vertex: VertexState { module: &prefilter_shader, entry_point: Some("vs_full"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(FragmentState {
+                module: &prefilter_shader,
+                entry_point: Some("fs_prefilter"),
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState { format: TextureFormat::Rgba16Float, blend: None, write_mask: ColorWrites::ALL })],
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
         });
         let array_view = maps.create_view(&TextureViewDescriptor {
             label: Some("cloud_sky_maps"),
@@ -675,6 +738,10 @@ impl CloudSky {
             maps,
             map_layers,
             array_view,
+            raw,
+            raw_view,
+            prefilter_pipeline,
+            prefilter_group,
             alts,
             alt_layers,
             alt_view,
@@ -788,6 +855,13 @@ impl CloudSky {
     #[cfg(test)]
     pub(crate) fn textures(&self) -> (&Texture, &Texture) {
         (&self.maps, &self.alts)
+    }
+
+    /// The march's texels before the prefilter: the last map's, row for
+    /// row what the CPU twin computes. For tests.
+    #[cfg(test)]
+    pub(crate) fn raw(&self) -> &Texture {
+        &self.raw
     }
 
     /// The heights beside the maps (`texture_2d_array`, R16F metres).
@@ -956,7 +1030,7 @@ impl CloudSky {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("cloud_sky_map"),
                 color_attachments: &[
-                    Some(RenderPassColorAttachment { view: &self.map_layers[target as usize], depth_slice: None, resolve_target: None, ops }),
+                    Some(RenderPassColorAttachment { view: &self.raw_view, depth_slice: None, resolve_target: None, ops }),
                     Some(RenderPassColorAttachment { view: &self.alt_layers[target as usize], depth_slice: None, resolve_target: None, ops }),
                 ],
                 depth_stencil_attachment: None,
@@ -968,6 +1042,33 @@ impl CloudSky {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_bind_group(1, &self.history_groups[history as usize], &[]);
             pass.set_scissor_rect(0, from, MAP_WIDTH, to - from);
+            pass.draw(0..3, 0..1);
+        }
+        // The prefilter reads two rows either side: the band before this
+        // slice is whole now, and the last slice takes its own band too.
+        let whole_map = self.fresh || whole;
+        let (f0, f1) = if whole_map {
+            (0, MAP_HEIGHT)
+        } else {
+            (from.saturating_sub(rows), if to >= MAP_HEIGHT { MAP_HEIGHT } else { from })
+        };
+        if f1 > f0 {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("cloud_sky_prefilter"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &self.map_layers[target as usize],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.prefilter_pipeline);
+            pass.set_bind_group(0, &self.prefilter_group, &[]);
+            pass.set_scissor_rect(0, f0, MAP_WIDTH, f1 - f0);
             pass.draw(0..3, 0..1);
         }
         if self.fresh || whole {
@@ -1071,6 +1172,43 @@ pub fn cloud_sky_shader() -> String {
 
 /// The envelope pass: each live cloud a square around its profile, added
 /// into its layer's map (`cloud_population::splat_value`, line for line).
+/// The prefilter (`PREFILTER`): the march's texels, 5 x 5, into a map row
+/// band, wrapping round the sky and clamped at its rows' ends.
+pub fn prefilter_shader() -> String {
+    let w = PREFILTER;
+    let sum = w[0] + 2.0 * (w[1] + w[2]);
+    format!(
+        r#"@group(0) @binding(0) var raw: texture_2d<f32>;
+const W0: f32 = {:.6};
+const W1: f32 = {:.6};
+const W2: f32 = {:.6};
+@vertex fn vs_full(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+}}
+@fragment fn fs_prefilter(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{
+    let size = vec2<i32>(textureDimensions(raw));
+    let c = vec2<i32>(pos.xy);
+    var w = array<f32, 5>(W2, W1, W0, W1, W2);
+    var sum = vec4<f32>(0.0);
+    for (var j = 0; j < 5; j = j + 1) {{
+        let y = clamp(c.y + j - 2, 0, size.y - 1);
+        var row = vec4<f32>(0.0);
+        for (var i = 0; i < 5; i = i + 1) {{
+            let x = (c.x + i - 2 + size.x) % size.x;
+            row = row + w[i] * textureLoad(raw, vec2<i32>(x, y), 0);
+        }}
+        sum = sum + w[j] * row;
+    }}
+    return vec4<f32>(max(sum.rgb, vec3<f32>(0.0)), clamp(sum.a, 0.0, 1.0));
+}}
+"#,
+        w[0] / sum,
+        w[1] / sum,
+        w[2] / sum
+    )
+}
+
 pub fn cloud_splat_shader() -> String {
     CLOUD_SPLAT_WGSL
         .replace("{LUMP0}", &format!("{:?}", cp::LUMP[0]))
@@ -1583,6 +1721,34 @@ struct MapOut {
     @location(1) alt: vec4<f32>,
 }
 
+// The newest map read as the display reads it (`sky_cloud_map`): a cubic
+// B-spline over a prefiltered map (`PREFILTER`) passes through its
+// samples, where one bilinear tap per carry blurred the history a little
+// more each map it was carried through.
+fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
+    let p = uv * size - 0.5;
+    let i = floor(p);
+    let f = p - i;
+    let f2 = f * f;
+    let f3 = f2 * f;
+    let w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    let w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    let w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    let w3 = f3 / 6.0;
+    let g0 = w0 + w1;
+    let g1 = w2 + w3;
+    let c0 = (i + 0.5 - 1.0 + w1 / g0) / size;
+    var c1 = (i + 0.5 + 1.0 + w3 / g1) / size;
+    let y0 = clamp(c0.y, 0.5 / size.y, 1.0 - 0.5 / size.y);
+    let y1 = clamp(c1.y, 0.5 / size.y, 1.0 - 0.5 / size.y);
+    let s00 = textureSampleLevel(hist_light, samp, vec2<f32>(c0.x, y0), 0.0);
+    let s10 = textureSampleLevel(hist_light, samp, vec2<f32>(c1.x, y0), 0.0);
+    let s01 = textureSampleLevel(hist_light, samp, vec2<f32>(c0.x, y1), 0.0);
+    let s11 = textureSampleLevel(hist_light, samp, vec2<f32>(c1.x, y1), 0.0);
+    let v = g0.y * (g0.x * s00 + g1.x * s10) + g1.y * (g0.x * s01 + g1.x * s11);
+    return vec4<f32>(max(v.rgb, vec3<f32>(0.0)), clamp(v.a, 0.0, 1.0));
+}
+
 @fragment fn fs_map(@builtin(position) pos: vec4<f32>) -> MapOut {
     let size = vec2<f32>(u.amb_sky.w, u.light.w);
     let dir = map_dir(pos.xy / size);
@@ -1684,7 +1850,7 @@ struct MapOut {
         let p = dir * cloud_flow_distance(hist.misc.w, h, max(dir.y, 0.0));
         var huv = cloud_map_uv(p + hist.flow.xyz - vec3<f32>(wv.x, 0.0, wv.y) * hist.flow.w);
         huv.y = clamp(huv.y, 0.5 / size.y, 1.0 - 0.5 / size.y);
-        let old = textureSampleLevel(hist_light, samp, huv, 0.0);
+        let old = hist_bspline(huv, size);
         let old_alts = textureSampleLevel(hist_alt, samp, huv, 0.0).rg;
         let w = mix(hist.misc.x, 1.0, smoothstep(HISTORY_REJECT0, HISTORY_REJECT1, abs(old.a - light.a)));
         light = mix(vec4<f32>(old.rgb * hist.misc.y, old.a), light, w);
@@ -2123,7 +2289,10 @@ mod tests {
         sky.encode_at(&mut enc, &queue, &u, &u, None, true, t, t);
         queue.submit(Some(enc.finish()));
         let layer = sky.display()[1] as u32;
-        let map = read_back(&device, &queue, &sky.maps, layer, MAP_WIDTH, MAP_HEIGHT, 8);
+        // The march's own alpha: the prefilter's lobes may lift a map's a
+        // hair past the heights' .g beside a hard edge, which the sky shader
+        // cancels (it weighs a disc by .g / a times a).
+        let map = read_back(&device, &queue, sky.raw(), 0, MAP_WIDTH, MAP_HEIGHT, 8);
         let alts = read_back(&device, &queue, &sky.alts, layer, MAP_WIDTH, MAP_HEIGHT, 4);
         if let Some(e) = pollster::block_on(scope.pop()) {
             panic!("the cloud passes do not validate: {e}");
