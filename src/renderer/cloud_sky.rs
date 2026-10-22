@@ -1197,6 +1197,11 @@ pub fn cloud_sky_shader() -> String {
         .replace("{MERGE_LIFT}", &f(cp::MERGE_LIFT))
         .replace("{COVER_CEIL}", &f(cp::COVER_CEIL))
         .replace("{CUMULUS_COVER_CEIL}", &f(cp::CUMULUS_COVER_CEIL))
+        .replace("{CUMULUS_DOME0}", &f(cl::CUMULUS_DOME[0]))
+        .replace("{CUMULUS_DOME1}", &f(cl::CUMULUS_DOME[1]))
+        .replace("{CUMULUS_NOISE}", &f(cl::CUMULUS_NOISE))
+        .replace("{CUMULUS_BASE_MEAN}", &f(cl::CUMULUS_BASE_MEAN))
+        .replace("{CUMULUS_SOFT}", &f(cl::CUMULUS_SOFT))
         .replace("{OVERCAST0}", &f(cp::OVERCAST[0]))
         .replace("{OVERCAST1}", &f(cp::OVERCAST[1]))
         .replace("{FAR_PHASE}", &f(cp::FAR_PHASE))
@@ -1452,6 +1457,11 @@ const MEAN_FINE: f32 = {MEAN_FINE};
 const MERGE_LIFT: f32 = {MERGE_LIFT};
 const COVER_CEIL: f32 = {COVER_CEIL};
 const CUMULUS_COVER_CEIL: f32 = {CUMULUS_COVER_CEIL};
+const CUMULUS_DOME0: f32 = {CUMULUS_DOME0};
+const CUMULUS_DOME1: f32 = {CUMULUS_DOME1};
+const CUMULUS_NOISE: f32 = {CUMULUS_NOISE};
+const CUMULUS_BASE_MEAN: f32 = {CUMULUS_BASE_MEAN};
+const CUMULUS_SOFT: f32 = {CUMULUS_SOFT};
 const OVERCAST0: f32 = {OVERCAST0};
 const OVERCAST1: f32 = {OVERCAST1};
 const FAR_PHASE: f32 = {FAR_PHASE};
@@ -1514,8 +1524,13 @@ fn envelope_of(e: vec4<f32>) -> vec4<f32> {
 
 // THE LAYER'S ENVELOPE at xz: its population's map, giving way to the
 // weather's mean toward the map's edge (`cloud_layers::envelope`).
+// How much of the last `envelope` was the population's map (1) rather
+// than the weather's mean (0): `EnvelopeSample::near`.
+var<private> env_near: f32 = 0.0;
+
 fn envelope(k: u32, xz: vec2<f32>, foot: f32) -> vec4<f32> {
     let m = lv(k, 8u);
+    env_near = 0.0;
     if (k >= POPULATED || m.z <= 0.0) {
         return envelope_far(k, xz);
     }
@@ -1524,6 +1539,7 @@ fn envelope(k: u32, xz: vec2<f32>, foot: f32) -> vec4<f32> {
     if (t >= 1.0) {
         return envelope_far(k, xz);
     }
+    env_near = 1.0 - t;
     // The mip the sample's footprint spans (`ENVELOPE_MIPS`).
     let lod = clamp(log2(max(foot, ENVELOPE_TEXEL) / ENVELOPE_TEXEL), 0.0, ENVELOPE_TOP_MIP);
     var near = envelope_of(textureSampleLevel(env_tex, env_samp, uv, k, lod));
@@ -1582,6 +1598,14 @@ fn detile(s: vec2<f32>, ph: vec4<f32>) -> vec2<f32> {
     return 0.5 * DETILE_REACH * vec2<f32>(a + b, c + d);
 }
 
+// A populated cumulus's shape (`cloud_layers::cumulus_shape`, line for line).
+fn cumulus_shape(cover: f32, h: f32, top: f32, base: f32) -> f32 {
+    let r = h / max(top, 0.05);
+    let level = CUMULUS_DOME0 + CUMULUS_DOME1 * r * r * r;
+    let field = cover - level + CUMULUS_NOISE * (base - CUMULUS_BASE_MEAN);
+    return clamp(field / CUMULUS_SOFT, 0.0, 1.0) * smoothstep(0.0, 0.06, h) * (1.0 - smoothstep(0.85, 1.0, h));
+}
+
 // `foot`: the metres one sky-map texel spans where this sample is (0 for
 // the light and the ground's shadow, which keep every octave). Detail finer
 // than that cannot be drawn, only aliased -- near the horizon it came out
@@ -1619,6 +1643,9 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
     let shape = base * height_profile(lv(k, 1u).y, h, env.y);
     let th = threshold(k, cover);
     var d = clamp((shape - th) / max(1.0 - th, 1e-3), 0.0, 1.0);
+    if (lv(k, 1u).y == KIND_CUMULUS && env_near > 0.0) {
+        d = d + (cumulus_shape(cover, h, env.y, base) - d) * env_near;
+    }
     if (d <= 0.0) {
         return 0.0;
     }
