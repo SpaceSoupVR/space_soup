@@ -630,6 +630,12 @@ pub struct XrRenderer {
 
     fps_layer: Option<fps_layer::FpsLayer>,
 
+    /// The sky map's build rate from the GPU frame time.
+    cloud_pace: crate::renderer::cloud_pace::CloudPace,
+
+    /// The compositor's display rate, Hz (`note_display_hz`).
+    display_hz: f64,
+
     perf_log: Option<crate::perf_record::PerfLog>,
 
     started_at: std::time::Instant,
@@ -1603,6 +1609,8 @@ impl XrRenderer {
             recommendation_window: Default::default(),
             perf_metric_window: Default::default(),
             fps_layer: None,
+            cloud_pace: Default::default(),
+            display_hz: 72.0,
             perf_log: None,
             started_at: std::time::Instant::now(),
             pinned_head: None,
@@ -2333,6 +2341,14 @@ impl XrRenderer {
 
     pub fn fps_hud_on(&self) -> bool {
         self.fps_layer.is_some()
+    }
+
+    /// The display rate the compositor predicts for this frame, Hz: what the
+    /// frame budget is taken from (`cloud_pace`).
+    pub fn note_display_hz(&mut self, display_hz: f64) {
+        if display_hz.is_finite() && display_hz > 0.0 {
+            self.display_hz = display_hz;
+        }
     }
 
     pub fn fps_hud_frame(&mut self, display_hz: f64) {

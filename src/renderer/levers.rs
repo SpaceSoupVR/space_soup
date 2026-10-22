@@ -85,6 +85,10 @@ pub struct Levers {
     /// (`Sky::step_clouds`); off keeps the last map and its shadow as they
     /// were, to price the build on the headset (2026-10-22).
     pub clouds: bool,
+    /// The sky map's build slowed (up to a slice every fourth frame) while
+    /// the headset's GPU frame time is over budget (`cloud_pace`); off
+    /// builds a slice every frame outside closed rooms, to price it.
+    pub cloud_pace: bool,
 
     pub effects: bool,
 
@@ -283,6 +287,7 @@ impl Default for Levers {
             room_exposure: true,
             cloud_shadows: true,
             clouds: true,
+            cloud_pace: true,
             effects: true,
             muzzle_test: true,
             mud_test: false,
@@ -458,6 +463,7 @@ impl Levers {
         flag("room_exposure", self.room_exposure, d.room_exposure);
         flag("cloud_shadows", self.cloud_shadows, d.cloud_shadows);
         flag("clouds", self.clouds, d.clouds);
+        flag("cloud_pace", self.cloud_pace, d.cloud_pace);
         flag("effects", self.effects, d.effects);
         flag("muzzle_test", self.muzzle_test, d.muzzle_test);
         flag("mud_test", self.mud_test, d.mud_test);

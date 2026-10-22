@@ -34,6 +34,7 @@ pub mod tonemap;
 pub mod exposure;
 pub mod probe_stream;
 pub mod room_light;
+pub mod cloud_pace;
 pub mod cloud_sky;
 pub mod cloud_worker;
 pub mod sky;

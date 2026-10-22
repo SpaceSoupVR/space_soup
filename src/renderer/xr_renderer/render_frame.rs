@@ -530,7 +530,21 @@ impl XrRenderer {
             // The clouds: a slice of their sky map, and their shadow.
             let clouds_at = std::time::Instant::now();
             if self.levers.clouds {
-                self.sky.set_cloud_build_every(if sky_open < CLOSED_ROOM_SKY { CLOSED_ROOM_CLOUD_EVERY } else { 1 });
+                // And slower while the frame is over budget (`cloud_pace`).
+                let room = if sky_open < CLOSED_ROOM_SKY { CLOSED_ROOM_CLOUD_EVERY } else { 1 };
+                let gpu_ms = self.perf_metrics.as_ref().and_then(|m| m.value("app/gpu_frametime")).map(|v| v as f32);
+                let hz = if self.space_warp_running() { self.display_hz / 2.0 } else { self.display_hz };
+                let was = self.cloud_pace.every();
+                let paced = self.cloud_pace.step(gpu_ms, (1000.0 / hz) as f32);
+                if paced != was {
+                    log::info!(
+                        "CLOUDPACE every {paced} frame(s): gpu {:.1} ms smoothed in a {:.1} ms frame",
+                        self.cloud_pace.smoothed().unwrap_or(0.0),
+                        1000.0 / hz
+                    );
+                }
+                let paced = if self.levers.cloud_pace { paced } else { 1 };
+                self.sky.set_cloud_build_every(room.max(paced));
                 self.sky.step_clouds(
                 &self.wgpu_device,
                 &self.wgpu_queue,
