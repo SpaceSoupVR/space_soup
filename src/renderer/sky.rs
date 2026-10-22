@@ -234,6 +234,8 @@ pub const CLOUD_SHADOW_SNAP_M: f32 = 128.0;
 /// Frames between the CPU's estimates of the shadow map's mean (the light
 /// on ground past its edge): a dozen columns of the twin each time.
 pub const CLOUD_SHADOW_MEAN_FRAMES: u32 = 16;
+/// Frames to one draw of the clouds' shadow on the ground (`step_clouds`).
+pub const CLOUD_SHADOW_EVERY: u32 = 4;
 /// The share of the sun's flux on level ground a cloud that hides it whole
 /// scatters down from its base. Under a cumulus the ground takes some
 /// 25-35% of the clear sky's global light (direct gone, diffuse up); the
@@ -1082,6 +1084,7 @@ impl Sky {
             cs.frames = cs.frames.wrapping_add(1);
             cs.centre = Some(centre);
         }
+        let was_active = cs.active;
         cs.active = light.is_some() && shadow.is_some();
         mark(0);
         let f = &c.frame;
@@ -1112,7 +1115,11 @@ impl Sky {
             mark(2);
             gpu.set_winds(winds);
             let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("clouds") });
-            gpu.encode_at(&mut encoder, queue, &m, &u, shadow.filter(|_| cs.active), whole, now, at);
+            // The ground's shadow every CLOUD_SHADOW_EVERY-th frame, or when
+            // its centre moves: 16 m texels, and the clouds cross a metre in
+            // those frames (0.33 ms a draw on the Quest).
+            let draw_shadow = shadow_moved || !was_active || cs.frames % CLOUD_SHADOW_EVERY == 0;
+            gpu.encode_at(&mut encoder, queue, &m, &u, shadow.filter(|_| cs.active && draw_shadow), whole, now, at);
             mark(3);
             queue.submit(Some(encoder.finish()));
         }
