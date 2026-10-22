@@ -231,8 +231,9 @@ pub const CLOUD_SHADOW_EXTENT_M: f32 = 1024.0;
 /// The map's centre moves in steps this long, so it need not be rebuilt
 /// every metre walked.
 pub const CLOUD_SHADOW_SNAP_M: f32 = 128.0;
-/// Frames between the CPU's estimates of the shadow map's mean (the light
-/// on ground past its edge): a dozen columns of the twin each time.
+/// Frames over which the CPU renews its estimate of the shadow map's mean
+/// (the light on ground past its edge): its 16 columns of the twin, one a
+/// frame (`step_clouds`).
 pub const CLOUD_SHADOW_MEAN_FRAMES: u32 = 16;
 /// Frames to one draw of the clouds' shadow on the ground (`step_clouds`).
 pub const CLOUD_SHADOW_EVERY: u32 = 4;
@@ -274,12 +275,15 @@ pub fn cloud_map_border(texels: &mut [u8], size: u32) -> f32 {
     mean
 }
 
-/// The clouds' shadow on the ground, drawn on the GPU every frame from the
-/// clouds overhead (`Sky::step_clouds`).
+/// The clouds' shadow on the ground, drawn on the GPU every
+/// `CLOUD_SHADOW_EVERY`th frame from the clouds overhead (`Sky::step_clouds`).
 #[derive(Default)]
 pub struct CloudShadow {
     centre: Option<[f32; 2]>,
     mean: f32,
+    /// The light through at the 16 points the mean is of, one renewed a
+    /// frame (`step_clouds`); `None` until all are first drawn.
+    samples: Option<[f32; 16]>,
     frames: u32,
     /// Read this frame: the clouds are up, the light is above them, and the
     /// lever is on.
@@ -1069,18 +1073,20 @@ impl Sky {
         // builds this frame, so the shadow never stands a snap off.
         let shadow_moved = cs.centre != Some(centre);
         if light.is_some() {
-            if cs.centre != Some(centre) || cs.frames % CLOUD_SHADOW_MEAN_FRAMES == 0 {
-                let noise = CloudNoise::shared();
-                let d = dir;
-                let mut sum = 0.0;
-                for j in 0..4 {
-                    for i in 0..4 {
-                        let at = |k: i32| (k as f32 - 1.5) / 4.0 * CLOUD_SHADOW_EXTENT_M;
-                        sum += cloud_layers::transmittance_toward(&c.layers, &noise, c.weather(), [centre[0] + at(i), centre[1] + at(j)], eye[1], d);
-                    }
-                }
-                cs.mean = sum / 16.0;
-            }
+            // THE MEAN LIGHT THROUGH, ONE POINT A FRAME. All 16 rays at
+            // once took 3.0-3.6 ms of the Quest's render thread every 16th
+            // frame and whenever the centre moved (`time_the_clouds_on_the_
+            // render_thread`): a hitch five times a second. One a frame is
+            // ~0.2 ms, and the mean trails the sky by 16 frames.
+            let noise = CloudNoise::shared();
+            let ray = |n: usize| {
+                let at = |k: usize| (k as f32 - 1.5) / 4.0 * CLOUD_SHADOW_EXTENT_M;
+                cloud_layers::transmittance_toward(&c.layers, &noise, c.weather(), [centre[0] + at(n % 4), centre[1] + at(n / 4)], eye[1], dir)
+            };
+            let samples = cs.samples.get_or_insert_with(|| std::array::from_fn(ray));
+            let n = cs.frames as usize % CLOUD_SHADOW_MEAN_FRAMES as usize;
+            samples[n] = ray(n);
+            cs.mean = samples.iter().sum::<f32>() / 16.0;
             cs.frames = cs.frames.wrapping_add(1);
             cs.centre = Some(centre);
         }
@@ -1822,6 +1828,8 @@ mod tests {
         population.update(&params, &field, t0);
         let first = started.elapsed().as_secs_f64() * 1000.0;
         let (mut worst, mut worst_update, mut worst_rays, mut over) = (0.0f64, 0.0f64, 0.0f64, 0u32);
+        let mut worst_mean = 0.0f64;
+        let (mut sum_level, mut sum_halo) = (0.0f64, 0.0f64);
         let frames = 72 * 120;
         for f in 0..frames {
             let t = t0 + f as f64 / 72.0;
@@ -1832,14 +1840,18 @@ mod tests {
             let b = std::time::Instant::now();
             let w = CloudWeather::new(&field, Some(&population));
             let dir = [0.4, 0.5, 0.3];
+            let l0 = std::time::Instant::now();
             let _ = level_transmittance(&layers, w, dir);
+            let l1 = std::time::Instant::now();
             let _ = cloud_layers::transmittance_toward(&layers, &noise, w, [3.0, 4.0], 0.0, unit3(dir));
             let _ = cloud_layers::transmittance_toward(&layers, &noise, w, [3.0, 4.0], 0.0, unit3([-0.4, 0.5, -0.3]));
-            if f % CLOUD_SHADOW_MEAN_FRAMES as usize == 0 {
-                for k in 0..16 {
-                    let _ = cloud_layers::transmittance_toward(&layers, &noise, w, [(k % 4) as f32 * 1000.0, (k / 4) as f32 * 1000.0], 0.0, unit3(dir));
-                }
-            }
+            sum_level += (l1 - l0).as_secs_f64() * 1000.0;
+            sum_halo += l1.elapsed().as_secs_f64() * 1000.0;
+            // The shadow's mean, one of its 16 points a frame (`step_clouds`).
+            let m = std::time::Instant::now();
+            let k = f % CLOUD_SHADOW_MEAN_FRAMES as usize;
+            let _ = cloud_layers::transmittance_toward(&layers, &noise, w, [(k % 4) as f32 * 1000.0, (k / 4) as f32 * 1000.0], 0.0, unit3(dir));
+            worst_mean = worst_mean.max(m.elapsed().as_secs_f64() * 1000.0);
             let c = std::time::Instant::now();
             let (u, r, all) = ((b - a).as_secs_f64() * 1000.0, (c - b).as_secs_f64() * 1000.0, (c - a).as_secs_f64() * 1000.0);
             worst = worst.max(all);
@@ -1847,7 +1859,7 @@ mod tests {
             worst_rays = worst_rays.max(r);
             over += (all > 2.0) as u32;
         }
-        eprintln!("CLOUDTICK first update {first:.1} ms; over {frames} frames the worst {worst:.2} ms (update {worst_update:.2}, rays {worst_rays:.2}), {over} frames over 2 ms");
+        eprintln!("CLOUDTICK first update {first:.1} ms; over {frames} frames the worst {worst:.2} ms (update {worst_update:.2}, rays {worst_rays:.2}, of which the mean's ray {worst_mean:.2}), {over} frames over 2 ms; a frame's level light {:.3} ms, halo rays {:.3} ms on average", sum_level / frames as f64, sum_halo / frames as f64);
         // The same with the worker drawing each second ahead (`cloud_worker`),
         // in real time so it has the second it is given.
         let field = std::sync::Arc::new(field);
