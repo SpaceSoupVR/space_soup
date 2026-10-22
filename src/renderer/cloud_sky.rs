@@ -55,7 +55,11 @@ pub const MAP_SLICES: u32 = 96;
 /// edge then blends heights, never a height with nothing (which would carry
 /// the edge on the wind of half its height).
 pub const ALT_FILL_WEIGHT: f32 = 0.02;
-/// Rows are packed toward the horizon: elevation = 90 deg * v^MAP_PACK.
+/// Rows are packed toward the horizon: elevation = 90 deg * v^MAP_PACK. At
+/// 1.5 the rows near the horizon were three times finer than the map's
+/// columns there and those near the zenith three times coarser; 1.15 keeps
+/// both within about 1.5 (2026-10-21; it did not cause the overhead smear,
+/// the shear's lean did -- `SHEAR_LEAN_MAX`). Not yet seen on the headset.
 pub const MAP_PACK: f32 = 1.15;
 /// THE MAPS ACCUMULATE (2026-10-21). Each map's samples sit at their own
 /// fraction of the step (`HISTORY_JITTER` apart, every texel alike, so
