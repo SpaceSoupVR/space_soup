@@ -1049,6 +1049,8 @@ struct Ctx<'a> {
     at: &'a Surroundings<'a>,
     own: &'a dyn Fn(&Light) -> f32,
     time: f64,
+    /// The room air's clocks at `time`, wrapped once a frame (`air_clocks`).
+    air_clocks: [f32; 6],
     origin: Vec3,
     dir: Vec3,
     up: Vec3,
@@ -1234,9 +1236,9 @@ impl Program {
                 }
                 Step::AirDrift(strength) => {
                     let air = burst_air();
-                    let here = air_drift(air, p.p0, cx.time);
-                    p.pos += (here - air_drift(air, p.p0, cx.time - p.age as f64)) * *strength;
-                    p.moving += (here - air_drift(air, p.p0, cx.time - MOTION_H as f64)) * (*strength / MOTION_H);
+                    let here = air_drift_back(air, &cx.air_clocks, p.p0, 0.0);
+                    p.pos += (here - air_drift_back(air, &cx.air_clocks, p.p0, p.age)) * *strength;
+                    p.moving += (here - air_drift_back(air, &cx.air_clocks, p.p0, MOTION_H)) * (*strength / MOTION_H);
                 }
                 Step::Jitter { reach, pace } => {
                     let seed = hash64(p.u[7].to_bits() as u64 ^ (p.u[9].to_bits() as u64) << 32);
@@ -1491,6 +1493,7 @@ pub(super) fn simulate_bursts(
                 continue;
             }
             let cx = Ctx {
+            air_clocks: air_clocks(burst_air(), time),
                 at,
                 own,
                 time,
