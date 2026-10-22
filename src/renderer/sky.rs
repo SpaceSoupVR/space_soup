@@ -175,6 +175,16 @@ pub struct SkyClouds {
     pub population: CloudPopulation,
 }
 
+/// The clouds' clock at `real` seconds of the day: real time times the
+/// scene's `time_scale`, as the snapshot's cloud frame is built
+/// (`TimeOfDayParams::cloud_seconds`). Until 2026-10-22 nothing applied it
+/// here, so the headset's clouds ran at real speed whatever was authored,
+/// and every snapshot's frame was set back to real time at the next tick
+/// (user: the clouds "do not noticeably move").
+fn cloud_clock(frame: &CloudFrame, real: f64) -> f64 {
+    real * frame.params.clamped().time_scale as f64
+}
+
 impl SkyClouds {
     /// What the CPU's rays read the clouds from.
     pub fn weather(&self) -> CloudWeather<'_> {
@@ -315,6 +325,11 @@ pub struct Sky {
     cloud_build: Option<(f64, [f32; 3])>,
     /// The cloud clock's step at the last tick, seconds.
     cloud_dt: f32,
+    /// The last `step_clouds`' CPU stages, ms: shadow mean, layers placed,
+    /// population upload, encode, submit (CLOUDTIME on the headset).
+    cloud_laps: [f32; 5],
+    /// The haze the clouds are seen through (`SkySnapshot::aerosol_per_m`).
+    aerosol_per_m: f32,
     /// Where the eye was last frame (world x, z), for the halos' clouds.
     eye_xz: [f32; 2],
     /// Toward the clouds' light (the sun, or the moon) THIS frame, from the
@@ -731,6 +746,8 @@ impl Sky {
             bind_serial: 0,
             cloud_build: None,
             cloud_dt: 0.0,
+            cloud_laps: [0.0; 5],
+            aerosol_per_m: space_soup_sky::time_of_day::AEROSOL_PER_M,
             eye_xz: [0.0, 0.0],
             blend: None,
             cloud_worker: None,
@@ -868,7 +885,7 @@ impl Sky {
                 let model = kept
                     .filter(|m| m.params == frame.params)
                     .unwrap_or_else(|| std::sync::Arc::new(CloudModel::new(&frame.params, &CloudNoise::shared())));
-                let secs = seconds as f64;
+                let secs = cloud_clock(&frame, seconds as f64);
                 let mut c = SkyClouds {
                     field: field.clone(),
                     frame: frame.at(secs),
@@ -886,6 +903,7 @@ impl Sky {
         };
         self.sun = snap.light;
         self.light_is_moon = snap.light_is_moon;
+        self.aerosol_per_m = snap.aerosol_per_m;
         self.reflection = Some(ReflectionSky { pano: snap.reflection_engine(), rotation_deg: 0.0, intensity: 1.0 });
         self.extra = SkyExtra::from_snapshot(snap, seconds, zenith_depth);
         self.extra.set_clouds(self.clouds.as_ref().map(|c| &c.frame));
@@ -921,9 +939,10 @@ impl Sky {
         self.extra.mode[2] = seconds;
         let warm = self.cloud_warm_rays();
         if let Some(c) = self.clouds.as_mut() {
-            self.cloud_dt = (seconds as f64 - c.seconds).clamp(0.0, 0.25) as f32;
+            let now = cloud_clock(&c.frame, seconds as f64);
+            self.cloud_dt = (now - c.seconds).clamp(0.0, 0.25 * c.frame.params.clamped().time_scale.max(1.0) as f64) as f32;
             let before = c.seconds;
-            c.seconds = seconds as f64;
+            c.seconds = now;
             c.frame = c.frame.at(c.seconds);
             c.layers = c.model.layers(c.seconds);
             c.settle(self.cloud_worker.as_mut(), warm);
@@ -1009,12 +1028,25 @@ impl Sky {
         Some(unit3(self.light_now.or(c.sun_clear.map(|s| s.direction)).unwrap_or(c.frame.light_dir)))
     }
 
+    /// The last `step_clouds`' CPU stages, for the headset's log.
+    pub fn cloud_step_laps(&self) -> String {
+        let l = self.cloud_laps;
+        format!("mean {:.1} layers {:.1} population {:.1} encode {:.1} submit {:.1}", l[0], l[1], l[2], l[3], l[4])
+    }
+
     /// ONE FRAME OF THE CLOUDS (`CloudSky`): the next slice of the sky map
     /// seen from `eye` (world), and -- when `shadow` is given and `on` (the
     /// lever, the clouds up, the light above them) -- their shadow on the
     /// ground round it. `whole` draws the whole map at once (a still).
     pub fn step_clouds(&mut self, device: &Device, queue: &Queue, eye: [f32; 3], on: bool, shadow: Option<&TextureView>, whole: bool) {
         self.eye_xz = [eye[0], eye[2]];
+        let mut lap = std::time::Instant::now();
+        let mut laps = [0.0f32; 5];
+        let mut mark = |i: usize| {
+            let now = std::time::Instant::now();
+            laps[i] = now.duration_since(lap).as_secs_f32() * 1000.0;
+            lap = now;
+        };
         let dir = self.cloud_light_dir();
         let (Some(c), Some(gpu), Some(dir)) = (self.clouds.as_ref(), self.cloud_sky.as_mut(), dir) else {
             self.cloud_shadow.active = false;
@@ -1041,8 +1073,9 @@ impl Sky {
             cs.centre = Some(centre);
         }
         cs.active = light.is_some() && shadow.is_some();
+        mark(0);
         let f = &c.frame;
-        let u = CloudSkyUniform::new(&c.layers, eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean);
+        let u = CloudSkyUniform::new(&c.layers, eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean).with_aerosol(self.aerosol_per_m);
         // A map holds the sky at one moment, seen from one eye, through all
         // its slices; the sky shader carries it on from there. A map begun
         // now is shown most two builds from now, so it is of then.
@@ -1056,13 +1089,18 @@ impl Sky {
         // are now (their origin can move at any update).
         let mut layers = c.model.layers(at);
         c.population.place(&mut layers, at);
-        let m = CloudSkyUniform::new(&layers, build_eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean);
+        let m = CloudSkyUniform::new(&layers, build_eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean).with_aerosol(self.aerosol_per_m);
+        mark(1);
         gpu.set_population(device, queue, &c.population);
+        mark(2);
         let winds = crate::renderer::cloud_sky::flow_winds(&c.model.params, &c.layers);
         gpu.set_winds(winds);
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("clouds") });
         gpu.encode_at(&mut encoder, queue, &m, &u, shadow.filter(|_| cs.active), whole, now, at);
+        mark(3);
         queue.submit(Some(encoder.finish()));
+        mark(4);
+        self.cloud_laps = laps;
         let d = gpu.display();
         self.extra.cloud_misc[0] = d[0];
         self.extra.cloud_misc[1] = d[1];
@@ -2423,6 +2461,69 @@ mod render_tests {
         let tod = TimeOfDaySky::new(TimeOfDayParams { start_hour: 13.0, clouds, ..Default::default() });
         let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
         (tod.snapshot(13.0, 0.0), zenith)
+    }
+
+    /// THE SKY'S CLOUDS THROUGH TEN MINUTES of test_room's: each map built
+    /// whole at that moment, its share of cloud above 10 deg printed (the
+    /// offline frames lost every cumulus past ~200 s, 2026-10-22).
+    #[test]
+    #[ignore]
+    fn print_the_sky_maps_cloud_through_ten_minutes() {
+        use crate::renderer::cloud_sky::tests::{half, read_back};
+        use crate::renderer::cloud_sky::{MAP_HEIGHT, MAP_WIDTH};
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let layout = sky_bind_group_layout(&device);
+        let clouds = space_soup_sky::clouds::CloudParams { coverage: 0.45, altitude_m: 1200.0, wind_speed: 16.0, weather_minutes: 15.0, storms: 0.35, time_scale: 2.5, kinds: [1.0, 1.0, 0.0, 1.0], ..Default::default() };
+        let params = TimeOfDayParams { start_hour: 15.0, day_minutes: 0.0, clouds, ..Default::default() };
+        let tod = TimeOfDaySky::new(params);
+        let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
+        let snap = tod.snapshot(15.0, 0.0);
+        for i in 0..16 {
+            let secs = i as f32 * 40.0;
+            let mut sky = Sky::none(&device, &queue, &layout, AMBIENT);
+            sky.apply_snapshot(&device, &queue, &layout, &snap, secs, zenith);
+            sky.step_clouds(&device, &queue, [0.0, 1.6, 12.0], false, None, true);
+            let gpu = sky.cloud_sky.as_ref().unwrap();
+            let map = read_back(&device, &queue, gpu.textures().0, gpu.display()[1] as u32, MAP_WIDTH, MAP_HEIGHT, 8);
+            let rows = (MAP_HEIGHT / 9)..MAP_HEIGHT;
+            let (mut cloud, mut n) = (0usize, 0usize);
+            for y in rows {
+                for x in (0..MAP_WIDTH).step_by(4) {
+                    let i = (y * MAP_WIDTH + x) as usize;
+                    n += 1;
+                    if half(&map[i * 8 + 6..i * 8 + 8]) < 0.5 {
+                        cloud += 1;
+                    }
+                }
+            }
+            let c = sky.clouds.as_ref().unwrap();
+            eprintln!("{secs:4.0} s (cloud clock {:.0} s): {:.1}% cloud, {} cumulus, envelope {:?}", c.seconds, 100.0 * cloud as f32 / n as f32, c.population.splats(1).0.len(), c.layers[1].envelope);
+        }
+    }
+
+    /// THE AUTHORED CLOUD SPEED REACHES THEIR CLOCK: at `time_scale` 3 the
+    /// clouds are three times as far through their day as at 1 after the
+    /// same real seconds, at a tick and at a snapshot landing alike. Nothing
+    /// applied it before 2026-10-22: the headset logged "population of
+    /// 80.0 s" after 80 s with 2.5 authored.
+    #[test]
+    fn the_clouds_run_at_their_authored_speed() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let layout = sky_bind_group_layout(&device);
+        let run = |time_scale: f32| {
+            let clouds = space_soup_sky::clouds::CloudParams { coverage: 0.45, time_scale, ..Default::default() };
+            let params = TimeOfDayParams { start_hour: 13.0, day_minutes: 20.0, clouds, ..Default::default() };
+            let tod = TimeOfDaySky::new(params);
+            let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
+            let mut sky = Sky::none(&device, &queue, &layout, AMBIENT);
+            sky.apply_snapshot(&device, &queue, &layout, &tod.snapshot(13.0, 0.0), 0.0, zenith);
+            sky.tick(&queue, 10.0, 0.1, None);
+            let ticked = sky.clouds.as_ref().unwrap().seconds;
+            sky.apply_snapshot(&device, &queue, &layout, &tod.snapshot(13.2, params.days_at(10.0)), 10.0, zenith);
+            (ticked, sky.clouds.as_ref().unwrap().seconds)
+        };
+        assert_eq!(run(1.0), (10.0, 10.0));
+        assert_eq!(run(3.0), (30.0, 30.0));
     }
 
     /// THE HEADSET'S CLOUDS OVER TWENTY REAL SECONDS: the worker on, a

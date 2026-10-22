@@ -93,7 +93,8 @@ pub struct CloudSkyUniform {
     /// World x, altitude, world z of the eye the map is seen from; w the
     /// scale the map's light is stored at (`CloudSky::encode` sets it).
     pub eye: [f32; 4],
-    /// Toward the light (the sun, or the moon after it), unit.
+    /// Toward the light (the sun, or the moon after it), unit; w the
+    /// aerosol's extinction at the ground per metre (`with_aerosol`).
     pub light_dir: [f32; 4],
     /// The light's irradiance; w the map's rows.
     pub light: [f32; 4],
@@ -103,7 +104,7 @@ pub struct CloudSkyUniform {
     pub amb_ground: [f32; 4],
     /// The shadow map's centre x, z, extent, and the ground's altitude.
     pub shadow: [f32; 4],
-    pub layers: [[[f32; 4]; 10]; LAYERS],
+    pub layers: [[[f32; 4]; 11]; LAYERS],
 }
 
 impl CloudSkyUniform {
@@ -122,13 +123,20 @@ impl CloudSkyUniform {
         let len = (light_dir[0] * light_dir[0] + light_dir[1] * light_dir[1] + light_dir[2] * light_dir[2]).sqrt().max(1e-6);
         Self {
             eye: [eye[0], eye[1], eye[2], 0.0],
-            light_dir: [light_dir[0] / len, light_dir[1] / len, light_dir[2] / len, 0.0],
+            light_dir: [light_dir[0] / len, light_dir[1] / len, light_dir[2] / len, space_soup_sky::time_of_day::AEROSOL_PER_M],
             light: [light[0], light[1], light[2], MAP_HEIGHT as f32],
             amb_sky: [amb_sky[0], amb_sky[1], amb_sky[2], MAP_WIDTH as f32],
             amb_ground: [amb_ground[0], amb_ground[1], amb_ground[2], shadow_mean],
             shadow: [shadow_centre[0], shadow_centre[1], shadow_extent, eye[1]],
             layers: std::array::from_fn(|k| layers[k].gpu()),
         }
+    }
+
+    /// The haze the clouds are seen through: the aerosol's extinction at the
+    /// ground per metre (`SkySnapshot::aerosol_per_m`; turbidity 1's without).
+    pub fn with_aerosol(mut self, per_m: f32) -> Self {
+        self.light_dir[3] = per_m;
+        self
     }
 }
 
@@ -1133,6 +1141,9 @@ pub fn cloud_sky_shader() -> String {
         .replace("{WARP_GAIN1}", &f(cl::WARP_GAIN[1]))
         .replace("{SHEAR_MOMENTUM}", &f(cl::SHEAR_MOMENTUM))
         .replace("{SHEAR_LEAN_MAX}", &f(cl::SHEAR_LEAN_MAX))
+        .replace("{DETILE_REACH}", &f(cl::DETILE_REACH))
+        .replace("{DETILE_WAVES}", &cl::DETILE_WAVES.map(f).join(", "))
+        .replace("{DETILE_DIRS}", &cl::DETILE_DIRS.map(|d| format!("vec2<f32>({}, {})", f(d[0]), f(d[1]))).join(", "))
         .replace("{EDGE_FRINGE}", &f(cl::EDGE_FRINGE))
         .replace("{EDGE_FRINGE_D}", &f(cl::EDGE_FRINGE_D))
         .replace("{EDGE_AGEING}", &f(cl::EDGE_AGEING))
@@ -1153,6 +1164,9 @@ pub fn cloud_sky_shader() -> String {
         .replace("{BACK_G}", &f(c::PHASE_BACK_G))
         .replace("{BACK_SHARE}", &f(c::PHASE_BACK_SHARE))
         .replace("{HAZE}", &format!("{:e}", c::HAZE_PER_M))
+        .replace("{AEROSOL_HEIGHT}", &f(space_soup_sky::time_of_day::AEROSOL_HEIGHT_M))
+        .replace("{AIR_HAZE}", &format!("{:e}", space_soup_sky::time_of_day::AIR_HAZE_PER_M))
+        .replace("{AIR_HAZE_HEIGHT}", &f(space_soup_sky::time_of_day::AIR_HAZE_HEIGHT_M))
         .replace("{POWDER_K}", &f(c::POWDER_K))
         .replace("{PACK}", &f(MAP_PACK))
         .replace("{KIND_CUMULUS}", &f(cl::KIND_CUMULUS))
@@ -1309,7 +1323,7 @@ struct SplatOut {
 
 const CLOUD_SKY_WGSL: &str = r#"
 struct Layer {
-    v: array<vec4<f32>, 10>,
+    v: array<vec4<f32>, 11>,
 }
 struct CloudSkyUniform {
     eye: vec4<f32>,
@@ -1359,6 +1373,9 @@ const WARP_GAIN0: f32 = {WARP_GAIN0};
 const WARP_GAIN1: f32 = {WARP_GAIN1};
 const SHEAR_MOMENTUM: f32 = {SHEAR_MOMENTUM};
 const SHEAR_LEAN_MAX: f32 = {SHEAR_LEAN_MAX};
+const DETILE_REACH: f32 = {DETILE_REACH};
+const DETILE_WAVES: vec4<f32> = vec4<f32>({DETILE_WAVES});
+const DETILE_DIRS: array<vec2<f32>, 4> = array<vec2<f32>, 4>({DETILE_DIRS});
 const EDGE_FRINGE: f32 = {EDGE_FRINGE};
 const EDGE_FRINGE_D: f32 = {EDGE_FRINGE_D};
 const EDGE_AGEING: f32 = {EDGE_AGEING};
@@ -1372,6 +1389,23 @@ const FORWARD_G: f32 = {FORWARD_G};
 const BACK_G: f32 = {BACK_G};
 const BACK_SHARE: f32 = {BACK_SHARE};
 const HAZE: f32 = {HAZE};
+const AEROSOL_HEIGHT: f32 = {AEROSOL_HEIGHT};
+const AIR_HAZE: f32 = {AIR_HAZE};
+const AIR_HAZE_HEIGHT: f32 = {AIR_HAZE_HEIGHT};
+
+// THE HAZE BETWEEN THE EYE AND A CLOUD `t` metres along a ray rising at `mu`
+// (2026-10-22): the aerosol (`u.light_dir.w` at the ground) and the air
+// thinning with height, through a flat atmosphere -- the depth of
+// sigma0 exp(-s mu / H) from 0 to t. One haze for every distance had near
+// clouds and those at the horizon equally clear, so the cumulus 30 km off
+// stood crisp and white in a carpet down to the sea where the photographed
+// sky's fade into a pale horizon.
+fn haze_through(t: f32, mu: f32) -> f32 {
+    let m = max(mu, 1e-3);
+    let depth = u.light_dir.w * AEROSOL_HEIGHT / m * (1.0 - exp(-t * m / AEROSOL_HEIGHT))
+        + AIR_HAZE * AIR_HAZE_HEIGHT / m * (1.0 - exp(-t * m / AIR_HAZE_HEIGHT));
+    return exp(-depth);
+}
 const POWDER_K: f32 = {POWDER_K};
 const POWDER_SHARE: f32 = 0.35;
 const GLOW_GAIN: f32 = {GLOW_GAIN};
@@ -1405,6 +1439,10 @@ const POPULATED: u32 = {POPULATED};
 const ENVELOPE_TEXEL: f32 = {ENVELOPE_TEXEL};
 const ENVELOPE_TOP_MIP: f32 = {ENVELOPE_TOP_MIP};
 const ALT_FILL_WEIGHT: f32 = {ALT_FILL_WEIGHT};
+// The clouds' transmittance over which a disc behind them fades in
+// (`fs_map`'s `through`): none below 3%, all of it from 30%.
+const DISC_THROUGH0: f32 = 0.03;
+const DISC_THROUGH1: f32 = 0.3;
 
 @vertex fn vs_full(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
@@ -1507,6 +1545,17 @@ fn noise_at(s: vec3<f32>, eased: bool) -> vec4<f32> {
     return textureSampleLevel(noise_tex, samp, (i + g - 0.5) / NOISE_TEXELS, 0.0);
 }
 
+// The shape noise's lookup shifted off its tile's lattice, `s` world x, z
+// in tiles, `ph` the layer's phases (`cloud_layers::detile`, line for line).
+fn detile(s: vec2<f32>, ph: vec4<f32>) -> vec2<f32> {
+    let w = 6.28318531 / DETILE_WAVES;
+    let a = sin(dot(s, DETILE_DIRS[0]) * w.x + ph.x);
+    let b = sin(dot(s, DETILE_DIRS[1]) * w.y + ph.y);
+    let c = sin(dot(s, DETILE_DIRS[2]) * w.z + ph.z);
+    let d = sin(dot(s, DETILE_DIRS[3]) * w.w + ph.w);
+    return 0.5 * DETILE_REACH * vec2<f32>(a + b, c + d);
+}
+
 // `foot`: the metres one sky-map texel spans where this sample is (0 for
 // the light and the ground's shadow, which keep every octave). Detail finer
 // than that cannot be drawn, only aliased -- near the horizon it came out
@@ -1531,7 +1580,9 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
         return 0.0;
     }
     let si = lv(k, 1u).x;
-    let s = vec3<f32>(xz.x * si, alt * si, xz.y * si) + lv(k, 2u).xyz;
+    let s0 = vec3<f32>(xz.x * si, alt * si, xz.y * si) + lv(k, 2u).xyz;
+    let u = detile(xz * si, lv(k, 10u));
+    let s = vec3<f32>(s0.x + u.x, s0.y, s0.z + u.y);
     let n = noise_at(s, detail);
     // The footprint in the shape noise's texels.
     let r = foot * NOISE_TEXELS * si;
@@ -1869,7 +1920,7 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
                 hold = REFINE_HOLD * REFINE;
                 let s = in_scatter(k, p_alt, light_tau(k, xz, p_alt, foot), cv, ph, glow, d);
                 let ts = exp(-d * dt);
-                let w = trans * (1.0 - ts) * exp(-t * HAZE);
+                let w = trans * (1.0 - ts) * haze_through(t, mu);
                 rgb = rgb + w * s;
                 seen = seen + w;
                 height = height + w * p_alt;
@@ -1890,7 +1941,7 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
             let tau = cirrus_tau(3u, eye + dir.xz * t) * min(1.0 / max(mu, 1e-3), 8.0);
             let alpha = 1.0 - exp(-tau);
             let s = u.light.rgb * (0.7 * hg(0.85, cv) + 0.3 * hg(0.2, cv)) + u.amb_sky.rgb * 0.8;
-            let w = trans * alpha * exp(-t * HAZE);
+            let w = trans * alpha * haze_through(t, mu);
             rgb = rgb + w * s;
             seen = seen + w;
             height = height + w * lv(3u, 0u).x;
@@ -1901,7 +1952,17 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
     // .g: the clouds' own transmittance, no haze -- what a disc behind them
     // gets (`cloud_through` in the sky shader).
     let h = (height + ALT_FILL_WEIGHT * fill) / (seen + ALT_FILL_WEIGHT);
-    var alts = vec2<f32>(h, trans);
+    // The march stops once less than 1% gets through, and the 1% it left
+    // let the sun's disc -- some 1e5 times the cloud -- shine through thick
+    // cumulus as a white dot (user: the sun and moon shone "as if they are in
+    // front of the cloud", 2026-10-22). Past that point the cloud only goes
+    // on, so a disc behind it gets nothing. Nor does it through a cumulus
+    // edge of optical depth 3-4: a few per cent of the sun is still 1e3
+    // times the cloud, a hard white dot, where a real edge reads as a
+    // silver lining and no disc -- the forward scatter that swamps it is
+    // finer than this map. The disc fades in through thinner cloud.
+    let through = trans * smoothstep(DISC_THROUGH0, DISC_THROUGH1, trans);
+    var alts = vec2<f32>(h, through);
     // THE NEWEST MAP, CARRIED HERE: what this texel shows, where that map
     // held it (the sky shader's own carry, `sky_clouds`), mixed in.
     if (hist.misc.x < 1.0) {
@@ -1948,11 +2009,11 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
 "#;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use space_soup_sky::clouds::CloudParams;
 
-    fn read_back(device: &Device, queue: &Queue, texture: &Texture, layer: u32, width: u32, height: u32, bytes_per_texel: u32) -> Vec<u8> {
+    pub(crate) fn read_back(device: &Device, queue: &Queue, texture: &Texture, layer: u32, width: u32, height: u32, bytes_per_texel: u32) -> Vec<u8> {
         let row = (width * bytes_per_texel).div_ceil(256) * 256;
         let buf = device.create_buffer(&BufferDescriptor { label: None, size: (row * height) as u64, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
         let mut enc = device.create_command_encoder(&Default::default());
@@ -1969,7 +2030,7 @@ mod tests {
         (0..height).flat_map(|y| data[(y * row) as usize..(y * row + width * bytes_per_texel) as usize].to_vec()).collect()
     }
 
-    fn half(b: &[u8]) -> f32 {
+    pub(crate) fn half(b: &[u8]) -> f32 {
         let h = u16::from_le_bytes([b[0], b[1]]);
         let (s, e, m) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
         let v = if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
@@ -2399,7 +2460,9 @@ mod tests {
             off(&third_settled, 0),
             off(&third_settled, 1)
         );
-        assert!(once_a < 0.016 && settled_a < 0.016, "alpha: once {once_a:.5}, settled {settled_a:.5}");
+        // (0.0157 settled when set; 0.0163 once the shape noise was untiled,
+        // `cloud_layers::detile`, its stretch a little finer than the march.)
+        assert!(once_a < 0.018 && settled_a < 0.018, "alpha: once {once_a:.5}, settled {settled_a:.5}");
         assert!(settled_a < 1.5 * once_a && settled_r < 1.5 * once_r, "accumulating moved off the finer march: alpha {once_a:.5} -> {settled_a:.5}, light {once_r:.5} -> {settled_r:.5}");
     }
 

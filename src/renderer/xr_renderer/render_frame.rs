@@ -520,7 +520,9 @@ impl XrRenderer {
             };
             drop(eye);
             // The clouds: a slice of their sky map, and their shadow.
-            self.sky.step_clouds(
+            let clouds_at = std::time::Instant::now();
+            if self.levers.clouds {
+                self.sky.step_clouds(
                 &self.wgpu_device,
                 &self.wgpu_queue,
                 head_world.to_array(),
@@ -528,6 +530,11 @@ impl XrRenderer {
                 Some(self.uniform_buf.cloud_shadow_view()),
                 false,
             );
+            }
+            let clouds_ms = clouds_at.elapsed().as_secs_f32() * 1000.0;
+            if clouds_ms > 3.0 {
+                log::info!("CLOUDTIME {clouds_ms:.1} ms: {}", self.sky.cloud_step_laps());
+            }
             crate::renderer::uniforms::PostUpload {
                 exposure: self.post.exposure * if self.auto_exposure { auto } else { 1.0 },
                 terrain_detail_distance: self.levers.terrain_detail_distance,

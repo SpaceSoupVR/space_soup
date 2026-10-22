@@ -81,6 +81,11 @@ pub struct Levers {
     /// at once, by the clouds over its middle.
     pub cloud_shadows: bool,
 
+    /// The volumetric clouds' sky map built a slice a frame
+    /// (`Sky::step_clouds`); off keeps the last map and its shadow as they
+    /// were, to price the build on the headset (2026-10-22).
+    pub clouds: bool,
+
     pub effects: bool,
 
     pub muzzle_test: bool,
@@ -277,6 +282,7 @@ impl Default for Levers {
             glare_strength: 1.0,
             room_exposure: true,
             cloud_shadows: true,
+            clouds: true,
             effects: true,
             muzzle_test: true,
             mud_test: false,
@@ -451,6 +457,7 @@ impl Levers {
         flag("glare", self.glare, d.glare);
         flag("room_exposure", self.room_exposure, d.room_exposure);
         flag("cloud_shadows", self.cloud_shadows, d.cloud_shadows);
+        flag("clouds", self.clouds, d.clouds);
         flag("effects", self.effects, d.effects);
         flag("muzzle_test", self.muzzle_test, d.muzzle_test);
         flag("mud_test", self.mud_test, d.mud_test);
