@@ -2466,7 +2466,7 @@ const SHADOW_BOX_OPAQUE: (&str, &str) = (
     "    for (var dx: i32 = -1; dx <= select(1, i32(camera.shadow_params.w), camera.shadow_params.w > 0.5); dx = dx + 1) {",
 );
 
-const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
+pub(crate) const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("scene_cut_none", &[]),
     ("scene_cut_lamp_loop", &[("    var todo = reaching;\n", "    var todo = 0u;\n")]),
     (

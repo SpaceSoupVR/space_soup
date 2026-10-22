@@ -1050,6 +1050,13 @@ pub fn ground_debug_shader(src: &str, view: &str) -> Option<String> {
         let (_, edits) = crate::renderer::ground_cuts::GROUND_CUTS.iter().find(|(name, _)| *name == cut)?;
         return crate::renderer::ground_cuts::with_cut(src, edits);
     }
+    // `scene:<cut>`: one of the brushes' scene cuts
+    // (`brush_pipeline::SCENE_REGISTER_CUTS`), where its lines are the
+    // ground's too -- the light loops both readers share.
+    if let Some(cut) = view.strip_prefix("scene:") {
+        let (_, edits) = crate::renderer::brush_pipeline::SCENE_REGISTER_CUTS.iter().find(|(name, _)| *name == cut)?;
+        return crate::renderer::ground_cuts::with_cut(src, edits);
+    }
     if let Some(edits) = view.strip_prefix("edit:") {
         let edits: Vec<(&str, &str)> = edits.split(";;").map(|e| e.split_once("=>")).collect::<Option<_>>()?;
         return crate::renderer::ground_cuts::with_cut(src, &edits);
