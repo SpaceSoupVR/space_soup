@@ -2319,6 +2319,62 @@ pub(crate) mod tests {
         }
     }
 
+    /// What one headset frame's clouds cost: the next slice as `step_clouds`
+    /// draws it, alone and with the ground's shadow (`--ignored`).
+    #[test]
+    #[ignore]
+    fn time_a_frames_clouds() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = CloudParams { coverage: 0.45, ..Default::default() };
+        let t = 20_000.0;
+        let mut population = CloudPopulation::new();
+        let mut layers = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise).layers(t);
+        population.update(&params, &field, t);
+        population.place(&mut layers, t);
+        let mut sky = CloudSky::new(&device, &queue, &field, &noise);
+        sky.set_population(&device, &queue, &population);
+        let size = crate::renderer::uniforms::CLOUD_SHADOW_SIZE;
+        let shadow = device.create_texture(&TextureDescriptor {
+            label: None,
+            size: Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R8Unorm,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = shadow.create_view(&Default::default());
+        let u = CloudSkyUniform::new(&layers, [10.0, 2.0, 5.0], [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
+        let mut frame = 0u32;
+        let mut run = |sky: &mut CloudSky, shadow: Option<&TextureView>, n: u32| {
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                frame += 1;
+                let mut enc = device.create_command_encoder(&Default::default());
+                sky.encode_at(&mut enc, &queue, &u, &u, shadow, false, frame as f64 / 36.0, frame as f64 / 36.0);
+                queue.submit(Some(enc.finish()));
+                device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+            }
+            start.elapsed().as_secs_f64() * 1000.0 / n as f64
+        };
+        run(&mut sky, None, MAP_SLICES);
+        let n = 4 * MAP_SLICES;
+        let alone = run(&mut sky, None, n);
+        let with = run(&mut sky, Some(&view), n);
+        let empty = {
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                queue.submit(Some(device.create_command_encoder(&Default::default()).finish()));
+                device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+            }
+            start.elapsed().as_secs_f64() * 1000.0 / n as f64
+        };
+        eprintln!("a frame's clouds: slice {alone:.3} ms, slice + ground shadow {with:.3} ms, an empty submit {empty:.3} ms");
+    }
+
     /// A map's texel read between its four nearest, as the GPU's linear
     /// sampler does: wrapping round in azimuth, held at the horizon and the
     /// zenith.
