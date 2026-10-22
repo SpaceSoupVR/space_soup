@@ -14,6 +14,9 @@ use super::{ground_map, icon, lights, mesh_pipeline, pipeline, uniforms};
 use super::{Camera, Cuboid, MeshInstance, WorldPanel};
 use super::mud_map::MudBody;
 
+mod day;
+pub use day::DayLight;
+
 struct CuboidCacheEntry {
     snapshot: CuboidSnapshot,
     solid: Option<(Vec<SolidVertex>, Vec<u32>)>,
@@ -102,6 +105,8 @@ pub struct Renderer {
     ground: Option<DesktopGround>,
     ground_dirty: bool,
     effects: Option<super::desktop_effects::DesktopEffects>,
+    /// The time of day on the sky dome (`set_time_of_day`).
+    day: Option<day::DesktopDay>,
 }
 
 impl Renderer {
@@ -181,6 +186,7 @@ impl Renderer {
             ground: None,
             ground_dirty: false,
             effects: None,
+            day: None,
         }
     }
 
@@ -452,6 +458,9 @@ impl Renderer {
         rotation_deg: f32,
         intensity: f32,
     ) -> Option<(super::sky::SkyIrradiance, Option<super::sky::SkySun>)> {
+        // A new photograph: a day running on the old one starts again from it.
+        self.day = None;
+        self.post.cloud_map = [[0.0; 4]; 3];
         self.sky_dome = pano.map(|p| {
             super::sky::Sky::new(&self.device, &self.queue, &self.sky_pipeline.layout, p, rotation_deg, intensity)
         });

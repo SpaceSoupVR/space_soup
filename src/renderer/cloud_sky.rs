@@ -1118,6 +1118,8 @@ pub fn cloud_sky_shader() -> String {
         .replace("{DETAIL_EROSION}", &f(cl::DETAIL_EROSION))
         .replace("{CHURN_WARP}", &f(cl::CHURN_WARP))
         .replace("{CHURN_PULSE}", &f(cl::CHURN_PULSE))
+        .replace("{CHURN_FAST}", &f(cl::CHURN_FAST))
+        .replace("{CHURN_FAST_SHARE}", &f(cl::CHURN_FAST_SHARE))
         .replace("{THERMAL_S}", &f(cl::THERMAL_S))
         .replace("{TURRET_S}", &f(cl::TURRET_S))
         .replace("{RISE_EDGE}", &f(cl::RISE_EDGE))
@@ -1135,9 +1137,9 @@ pub fn cloud_sky_shader() -> String {
         .replace("{VIEW_STEPS_MOST}", &format!("{}u", cl::VIEW_STEPS_MOST))
         .replace("{VIEW_STEP_TEXELS}", &f(cl::VIEW_STEP_TEXELS))
         .replace("{SHADOW_STEPS}", &steps(cl::SHADOW_STEPS))
-        .replace("{OCT_A}", &f(c::OCTAVE_A))
-        .replace("{OCT_B}", &f(c::OCTAVE_B))
-        .replace("{OCT_C}", &f(c::OCTAVE_C))
+        .replace("{GLOW_GAIN}", &f(c::CLOUD_GLOW[0]))
+        .replace("{GLOW_G}", &f(c::CLOUD_GLOW[1]))
+        .replace("{GLOW_DECAY}", &f(c::CLOUD_GLOW[2]))
         .replace("{FORWARD_G}", &f(c::PHASE_FORWARD_G))
         .replace("{BACK_G}", &f(c::PHASE_BACK_G))
         .replace("{BACK_SHARE}", &f(c::PHASE_BACK_SHARE))
@@ -1337,6 +1339,8 @@ const DETAIL_RATIO: f32 = {DETAIL_RATIO};
 const DETAIL_EROSION: f32 = {DETAIL_EROSION};
 const CHURN_WARP: f32 = {CHURN_WARP};
 const CHURN_PULSE: f32 = {CHURN_PULSE};
+const CHURN_FAST: f32 = {CHURN_FAST};
+const CHURN_FAST_SHARE: f32 = {CHURN_FAST_SHARE};
 const THERMAL_S: f32 = {THERMAL_S};
 const TURRET_S: f32 = {TURRET_S};
 const RISE_EDGE: f32 = {RISE_EDGE};
@@ -1350,14 +1354,15 @@ const CIRRUS_TAU: f32 = {CIRRUS_TAU};
 const SUN_RADIUS: f32 = {SUN_RADIUS};
 const CIRRUS_STRETCH: f32 = {CIRRUS_STRETCH};
 const EXTINCTION: f32 = {EXTINCTION};
-const OCT_A: f32 = {OCT_A};
-const OCT_B: f32 = {OCT_B};
-const OCT_C: f32 = {OCT_C};
 const FORWARD_G: f32 = {FORWARD_G};
 const BACK_G: f32 = {BACK_G};
 const BACK_SHARE: f32 = {BACK_SHARE};
 const HAZE: f32 = {HAZE};
 const POWDER_K: f32 = {POWDER_K};
+const POWDER_SHARE: f32 = 0.35;
+const GLOW_GAIN: f32 = {GLOW_GAIN};
+const GLOW_G: f32 = {GLOW_G};
+const GLOW_DECAY: f32 = {GLOW_DECAY};
 const PACK: f32 = {PACK};
 const KIND_CUMULUS: f32 = {KIND_CUMULUS};
 const KIND_STRATO: f32 = {KIND_STRATO};
@@ -1368,6 +1373,9 @@ const NOISE_TEXELS: f32 = {NOISE_TEXELS};
 const VIEW_STEPS: vec3<u32> = {VIEW_STEPS};
 const VIEW_STEPS_MOST: u32 = {VIEW_STEPS_MOST};
 const VIEW_STEP_TEXELS: f32 = {VIEW_STEP_TEXELS};
+const REFINE: u32 = 4u;
+const REFINE_HOLD: u32 = 2u;
+const MARCH_CAP: u32 = 512u;
 const SHADOW_STEPS: vec3<u32> = {SHADOW_STEPS};
 const MEAN_A: f32 = {MEAN_A};
 const MEAN_B: f32 = {MEAN_B};
@@ -1546,7 +1554,13 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
             let sn = sin(turn);
             let w = n.gba - vec3<f32>(0.5);
             let gain = WARP_GAIN0 + (WARP_GAIN1 - WARP_GAIN0) * smoothstep(0.6, 1.0, env.z);
-            let warp = vec3<f32>(w.x * c - w.z * sn, w.y, w.x * sn + w.z * c) * (CHURN_WARP * gain);
+            // And the fast churn's (`CHURN_FAST`): the octaves in another
+            // order, turning CHURN_FAST times as fast.
+            let fturn = turn * CHURN_FAST;
+            let fc = cos(fturn);
+            let fs = sin(fturn);
+            let v = w.zxy * CHURN_FAST_SHARE;
+            let warp = vec3<f32>(w.x * c - w.z * sn + v.x * fc - v.z * fs, w.y + v.y, w.x * sn + w.z * c + v.x * fs + v.z * fc) * (CHURN_WARP * gain);
             let wr = sh.w * (0.5 + env.y) * (RISE_EDGE + RISE_CORE * p);
             let up = wr * THERMAL_S * cf * si * DETAIL_RATIO;
             let rise = vec3<f32>(fract(ci * 0.618034), -up, fract(ci * 0.414214));
@@ -1668,7 +1682,11 @@ fn phase(s: f32, c: f32) -> f32 {
 }
 
 // The light's optical depth from a point in layer k toward it: taps out
-// through the layer, nearer ones closer together.
+// through the layer, nearer ones closer together. THE TAPS READ THE CLOUD
+// AS IT IS DRAWN, eroded edges and all: read without the detail they met
+// the fatter body the erosion carves, and against a path-traced reference
+// a cumulus's sunlight came out 3-10 times too dark (2026-10-21,
+// `tools/reference/cloud_reference.py`).
 fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {
     let l = u.light_dir.xyz;
     let a = lv(k, 0u);
@@ -1680,32 +1698,34 @@ fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {
         let j = i + 4u - taps;
         let r = select(select(select(0.8, 0.35, j == 2u), 0.15, j == 1u), 0.05, j == 0u) * thick;
         let p = vec3<f32>(xz.x, alt, xz.y) + l * r;
-        tau = tau + density(k, p.xz, p.y, false, foot) * (r - last);
+        tau = tau + density(k, p.xz, p.y, true, foot) * (r - last);
         last = r;
     }
     return tau;
 }
 
-// The three octaves' phases toward the light: one ray keeps one angle to
-// it, so `fs_map` works them out once, not at every sample.
-fn octave_phases(cv: f32) -> vec3<f32> {
-    return vec3<f32>(phase(1.0, cv), OCT_A * phase(OCT_C, cv), OCT_A * OCT_A * phase(OCT_C * OCT_C, cv));
-}
-
-// The light a sample in layer k sends toward the eye per unit extinction;
-// `ph` the ray's `octave_phases`.
-fn in_scatter(k: u32, alt: f32, tau_l: f32, cv: f32, ph: vec3<f32>, d: f32) -> vec3<f32> {
+// The light a sample in layer k sends toward the eye per unit extinction:
+// the sun's light scattered once (`ph`, the ray's phase toward it, worked
+// out once per ray), and the glow of all the higher orders (`glow`, the
+// same).
+//
+// THE GLOW (2026-10-21, against Cycles with every order of scattering, Mie
+// droplets): the light scattered many times is a smooth glow over a
+// cloud's body, thrown somewhat forward and hardly dimmed by the depth
+// toward the sun -- 91-95% of what is seen of a cumulus from the side or
+// with the sun behind. The octave approximation it replaces (Wrenninge)
+// kept a fraction of it and made every cumulus grey: 0.25-0.35 of the
+// reference's light where this is 0.82-0.93 (`CLOUD_GLOW`).
+fn in_scatter(k: u32, alt: f32, tau_l: f32, cv: f32, ph: f32, glow: f32, d: f32) -> vec3<f32> {
     let a = lv(k, 0u);
     let h = clamp((alt - a.x) / max(a.y - a.x, 1.0), 0.0, 1.0);
-    var oct = ph.x * exp(-tau_l) + ph.y * exp(-OCT_B * tau_l) + ph.z * exp(-OCT_B * OCT_B * tau_l);
+    var lit = ph * exp(-tau_l) + glow * exp(-GLOW_DECAY * tau_l);
     // Beer-powder, mild and only away from the sun: thin outer parts have
     // built up less scattered light.
     let powder = 1.0 - exp(-POWDER_K * (2.0 * tau_l + 40.0 * d));
-    oct = oct * mix(1.0, powder, 0.35 * (1.0 - cv));
-    // The light scattered deep inside, which the octaves leave out.
-    let deep = max(u.light_dir.y, 0.0) * exp(-0.25 * tau_l) * 0.06;
+    lit = lit * mix(1.0, powder, POWDER_SHARE * (1.0 - cv));
     let amb = u.amb_sky.rgb * (0.45 + 0.55 * h) + u.amb_ground.rgb * (0.35 * (1.0 - h));
-    return u.light.rgb * (oct + deep) + amb;
+    return u.light.rgb * lit + amb;
 }
 
 fn map_dir(uv: vec2<f32>) -> vec3<f32> {
@@ -1762,7 +1782,8 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
     // (2026-10-20). One per map moves the sample planes as a whole, and the
     // accumulation below averages the planes' grain away.
     let jitter = hist.misc.z;
-    let ph = octave_phases(cv);
+    let ph = phase(1.0, cv);
+    let glow = GLOW_GAIN * hg(GLOW_G, cv);
     // The angle one texel spans: across (azimuth, narrowing up the sky)
     // or along (elevation, packed toward the horizon), whichever is wider.
     let v = pos.y / size.y;
@@ -1790,28 +1811,46 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
         }
         let len = min(t1 - t0, MAX_MARCH);
         let base = pick_steps(k, VIEW_STEPS);
-        // WHOLE STEPS OF ONE STRIDE FROM THE LAYER'S ENTRY, AND A SHORT LAST
-        // ONE. Split evenly into ceil(len / stride), every ray with the same
-        // count sampled the same heights of the layer, and where the count
-        // rose by one between rows every sample plane jumped: lines along
-        // the horizon every few rows (research 2026-10-21, cause (b)). Now
-        // the samples lie where the ray's own distance puts them, and a
-        // longer ray only grows its last step.
+        // STEPS OF ONE STRIDE FROM THE LAYER'S ENTRY, AND A SHORT LAST ONE.
+        // Split evenly into ceil(len / stride), every ray with the same count
+        // sampled the same heights of the layer, and where the count rose by
+        // one between rows every sample plane jumped: lines along the horizon
+        // every few rows (research 2026-10-21, cause (b)). Now the samples
+        // lie where the ray's own distance puts them, and a longer ray only
+        // grows its last step.
         let stride = clamp(VIEW_STEP_TEXELS / (NOISE_TEXELS * lv(k, 1u).x), len / f32(max(base, VIEW_STEPS_MOST)), len / f32(base));
-        let whole = floor(len / stride);
-        let n = u32(whole) + 1u;
-        for (var i = 0u; i < n; i = i + 1u) {
-            let dt = select(stride, len - whole * stride, i + 1u == n);
-            if (dt <= 0.0) {
+        // COARSE THROUGH THE AIR, FINE THROUGH THE CLOUD (2026-10-21): the
+        // stride's sample planes showed in every cloud as ribbed stripes
+        // (offline against a path-traced reference: gone at a quarter of
+        // the stride). A coarse sample that finds cloud steps back to the
+        // last empty one and comes in again at a REFINE-th of the stride,
+        // and the march stays fine while it is in cloud and for
+        // REFINE_HOLD strides after, so the cloud is sampled four times as
+        // finely and the empty sky as before.
+        let fine_dt = stride / f32(REFINE);
+        let t_end = t0 + len;
+        var t = t0 + jitter * stride;
+        var hold = 0u;
+        var steps = 0u;
+        loop {
+            if (t >= t_end || steps >= MARCH_CAP) {
                 break;
             }
-            let t = t0 + f32(i) * stride + jitter * dt;
+            steps = steps + 1u;
+            let fine = hold > 0u;
+            let dt = min(select(stride, fine_dt, fine), t_end - t);
             let p_alt = altitude_along(alt, mu, t);
             let xz = eye + dir.xz * t;
             let foot = max(t * texel, 0.25 * dt);
             let d = density(k, xz, p_alt, true, foot);
+            if (d > 0.0 && !fine) {
+                t = max(t - stride, t0) + jitter * fine_dt;
+                hold = REFINE_HOLD * REFINE;
+                continue;
+            }
             if (d > 0.0) {
-                let s = in_scatter(k, p_alt, light_tau(k, xz, p_alt, foot), cv, ph, d);
+                hold = REFINE_HOLD * REFINE;
+                let s = in_scatter(k, p_alt, light_tau(k, xz, p_alt, foot), cv, ph, glow, d);
                 let ts = exp(-d * dt);
                 let w = trans * (1.0 - ts) * exp(-t * HAZE);
                 rgb = rgb + w * s;
@@ -1821,7 +1860,10 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
                 if (trans < 0.01) {
                     break;
                 }
+            } else if (fine) {
+                hold = hold - 1u;
             }
+            t = t + dt;
         }
     }
     // Cirrus: ice, a thin sheet, its light thrown forward.
@@ -1989,6 +2031,142 @@ mod tests {
         }
     }
 
+    /// ONE CUMULUS LAYER FOR A PATH-TRACED REFERENCE (`--ignored`): the sky
+    /// map as the headset builds it, lit by the sun alone (irradiance 1, no
+    /// sky or ground light), and the same layer's extinction as a grid of
+    /// voxels read from the CPU twin, for `tools/reference/cloud_reference.py`
+    /// to render in Cycles under the same sun. `$OUT/cloud_map.f32` (rgb as
+    /// radiance, a = transmittance; rows from the horizon up),
+    /// `$OUT/cloud_grid.f32` ([x][y][z], per metre) and `$OUT/cloud.json`.
+    /// `SUN_EL` / `SUN_AZ` degrees (35, 0: toward +z), `VOXEL` metres (20),
+    /// `REACH` metres either side of the eye (7000).
+    #[test]
+    #[ignore]
+    fn export_a_cumulus_for_a_path_traced_reference() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
+        let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (el, az) = (env("SUN_EL", 35.0).to_radians(), env("SUN_AZ", 0.0).to_radians());
+        let sun = [az.sin() * el.cos(), el.sin(), az.cos() * el.cos()];
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = CloudParams { coverage: 0.45, altitude_m: 1200.0, wind_speed: 16.0, time_scale: 2.5, ..Default::default() };
+        let t = 20_000.0;
+        let mut population = CloudPopulation::new();
+        let mut layers = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise).layers(t);
+        population.update(&params, &field, t);
+        population.place(&mut layers, t);
+        // One layer alone: `LAYER=k`, the cumulus by default.
+        let k = std::env::var("LAYER").ok().and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| layers.iter().position(|l| l.kind == space_soup_sky::cloud_layers::KIND_CUMULUS).unwrap_or(0));
+        for (i, l) in layers.iter_mut().enumerate() {
+            if i != k {
+                l.sigma = 0.0;
+            }
+        }
+        let eye = [0.0f32, 2.0, 0.0];
+        let u = CloudSkyUniform::new(&layers, eye, sun, [1.0; 3], [0.0; 3], [0.0; 3], [0.0, 0.0], 4096.0, 0.5);
+        let maps: u32 = std::env::var("MAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let build_map = |src: String, file: &str| {
+            let scope = device.push_error_scope(ErrorFilter::Validation);
+            let mut sky = CloudSky::with_shader(&device, &queue, &field, &noise, src);
+            sky.set_population(&device, &queue, &population);
+            let mut enc = device.create_command_encoder(&Default::default());
+            sky.encode(&mut enc, &queue, &u, None, true);
+            queue.submit(Some(enc.finish()));
+            // `MAPS=n`: then n maps more, a slice a frame, each carrying the
+            // last as the headset's do (`HISTORY_NEW`).
+            for _ in 0..maps * MAP_SLICES {
+                let mut enc = device.create_command_encoder(&Default::default());
+                sky.encode(&mut enc, &queue, &u, None, false);
+                queue.submit(Some(enc.finish()));
+            }
+            if let Some(e) = pollster::block_on(scope.pop()) {
+                panic!("{file}: the cloud passes do not validate: {e}");
+            }
+            let map = read_back(&device, &queue, &sky.maps, sky.display()[1] as u32, MAP_WIDTH, MAP_HEIGHT, 8);
+            let scale = sky.display_scales()[1];
+            let mut texels = Vec::with_capacity((MAP_WIDTH * MAP_HEIGHT * 4) as usize);
+            for i in 0..(MAP_WIDTH * MAP_HEIGHT) as usize {
+                for c in 0..4 {
+                    let v = half(&map[i * 8 + 2 * c..i * 8 + 2 * c + 2]);
+                    texels.push(if c < 3 { v * scale } else { v });
+                }
+            }
+            std::fs::write(out.join(file), bytemuck::cast_slice(&texels)).unwrap();
+        };
+        // `FITS=file.json`: {"name": {"CONST": value, ...}, ...} -- the map
+        // again with those shader constants, as `cloud_map_<name>.f32`, and
+        // no grid (`cloud_reference.py --fits`).
+        if let Ok(fits) = std::env::var("FITS") {
+            let fits: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(fits).unwrap()).unwrap();
+            for (name, consts) in &fits {
+                let mut src = cloud_sky_shader();
+                for (k, v) in consts.as_object().unwrap() {
+                    // "__replace": [[from, to], ...] -- source edits.
+                    if k == "__replace" {
+                        for pair in v.as_array().unwrap() {
+                            let (from, to) = (pair[0].as_str().unwrap(), pair[1].as_str().unwrap());
+                            assert!(src.contains(from), "{name}: no {from:?} in the shader");
+                            src = src.replace(from, to);
+                        }
+                        continue;
+                    }
+                    let at = src.find(&format!("const {k}: ")).unwrap_or_else(|| panic!("no constant {k}"));
+                    let eq = at + src[at..].find("= ").unwrap() + 2;
+                    let end = at + src[at..].find(';').unwrap();
+                    let value = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        v => v.as_f64().unwrap().to_string(),
+                    };
+                    src.replace_range(eq..end, &value);
+                }
+                build_map(src, &format!("cloud_map_{name}.f32"));
+            }
+            eprintln!("{} fitted maps", fits.len());
+            return;
+        }
+        build_map(cloud_sky_shader(), "cloud_map.f32");
+
+        let l = &layers[k];
+        let (voxel, reach) = (env("VOXEL", 20.0), env("REACH", 7000.0));
+        let (nx, ny) = ((2.0 * reach / voxel) as usize, ((l.top_m - l.base_m) / voxel).ceil() as usize + 1);
+        let weather = space_soup_sky::cloud_layers::CloudWeather::new(&field, Some(&population));
+        // `DETAIL=0`: the cloud bodies without their eroded edges, which a
+        // grid of voxels resolves (and `"__replace"` the map's to match).
+        let detail = std::env::var("DETAIL").as_deref() != Ok("0");
+        let mut grid = vec![0.0f32; nx * ny * nx];
+        let started = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for (ix, slab) in grid.chunks_mut(ny * nx).enumerate() {
+                let weather = weather;
+                let noise = &noise;
+                s.spawn(move || {
+                    let x = -reach + (ix as f32 + 0.5) * voxel;
+                    for iy in 0..ny {
+                        let y = l.base_m + iy as f32 * voxel;
+                        for iz in 0..nx {
+                            let z = -reach + (iz as f32 + 0.5) * voxel;
+                            slab[iy * nx + iz] = space_soup_sky::cloud_layers::density(l, noise, weather, [x, z], y, detail);
+                        }
+                    }
+                });
+            }
+        });
+        std::fs::write(out.join("cloud_grid.f32"), bytemuck::cast_slice(&grid)).unwrap();
+        let filled = grid.iter().filter(|&&d| d > 0.0).count();
+        let meta = serde_json::json!({
+            "eye": eye, "sun": sun, "sun_irradiance": 1.0,
+            "map": { "width": MAP_WIDTH, "height": MAP_HEIGHT, "pack": MAP_PACK },
+            "grid": { "origin": [-reach, l.base_m, -reach], "voxel": voxel, "dims": [nx, ny, nx] },
+            "haze_per_m": space_soup_sky::clouds::HAZE_PER_M,
+            "phase": { "forward_g": space_soup_sky::clouds::PHASE_FORWARD_G, "back_g": space_soup_sky::clouds::PHASE_BACK_G, "back_share": space_soup_sky::clouds::PHASE_BACK_SHARE },
+            "layer": { "index": k, "kind": l.kind, "coverage": l.coverage, "base_m": l.base_m, "top_m": l.top_m, "sigma": l.sigma },
+        });
+        std::fs::write(out.join("cloud.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+        eprintln!("cumulus {nx}x{ny}x{nx} voxels of {voxel} m, {filled} in cloud, built in {:.1} s; base {} top {} sigma {}", started.elapsed().as_secs_f32(), l.base_m, l.top_m, l.sigma);
+    }
+
     /// What a whole sky map costs on this machine's GPU, with the layers'
     /// populations and with the weather's mean alone (`--ignored`).
     #[test]
@@ -2004,11 +2182,12 @@ mod tests {
             match name {
                 "no light taps" => base.replace("fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {", "fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {\n    if (true) { return 0.0; }"),
                 "no detail" => base.replace("let d = density(k, xz, p_alt, true, foot);", "let d = density(k, xz, p_alt, false, foot);"),
+                "no refine" => base.replace("const REFINE: u32 = 4u;", "const REFINE: u32 = 1u;"),
                 "half steps" => base.replace(&format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST), &format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST / 2)),
                 _ => base.clone(),
             }
         };
-        for (populated, name) in [(false, "as built"), (true, "as built"), (true, "no light taps"), (true, "no detail"), (true, "half steps")] {
+        for (populated, name) in [(false, "as built"), (true, "as built"), (true, "no refine"), (true, "no light taps"), (true, "no detail"), (true, "half steps")] {
             let src = variant(name);
             assert!(name == "as built" || src != base, "variant {name} changed nothing");
             let mut population = CloudPopulation::new();
@@ -2125,11 +2304,14 @@ mod tests {
         assert!(carried < 0.35 * left, "carrying the map does not follow the clouds: {carried} vs {left}");
     }
 
-    /// THE MAPS ACCUMULATE TOWARD THE CLOUDS, NOT TOWARD THEIR MARCH: a still
-    /// sky built map after map (`HISTORY_NEW`, the samples moved by
-    /// `HISTORY_JITTER` each map) lands nearer a march four times finer than
-    /// one map drawn whole does. The difference left in one map is the wood
-    /// grain of its fixed sample planes.
+    /// ONE MAP IS ALREADY NEAR A MARCH FOUR TIMES FINER, AND THE MAPS
+    /// ACCUMULATED KEEP IT: the stride's sample planes were the wood grain
+    /// of one map (alpha off by 0.0236, 0.0123 after eight maps of
+    /// `HISTORY_NEW`); since the march goes fine through the cloud
+    /// (`REFINE`, 2026-10-21) one map is off by 0.0076 at the old extinction
+    /// and 0.0136 at a cumulus's real one (`EXTINCTION_PER_M` 0.06, three
+    /// times the optical depth a step), under 0.016 either way, and a still
+    /// sky built map after map stays there.
     #[test]
     fn maps_built_one_after_another_settle_on_a_finer_march() {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
@@ -2200,8 +2382,8 @@ mod tests {
             off(&third_settled, 0),
             off(&third_settled, 1)
         );
-        assert!(settled_a < 0.7 * once_a, "alpha: settled {settled_a:.5} against once {once_a:.5}");
-        assert!(settled_r < 0.7 * once_r, "light: settled {settled_r:.5} against once {once_r:.5}");
+        assert!(once_a < 0.016 && settled_a < 0.016, "alpha: once {once_a:.5}, settled {settled_a:.5}");
+        assert!(settled_a < 1.5 * once_a && settled_r < 1.5 * once_r, "accumulating moved off the finer march: alpha {once_a:.5} -> {settled_a:.5}, light {once_r:.5} -> {settled_r:.5}");
     }
 
     /// NO LINES ACROSS THE SKY: a line parallel to the horizon moves every

@@ -90,7 +90,7 @@ pub const RENDER_SCALE: f32 = 0.7;
 
 pub use camera::Camera;
 pub use cuboid::{Cuboid, CuboidShape, CuboidStyle};
-pub use desktop_renderer::{DesktopGround, Renderer};
+pub use desktop_renderer::{DayLight, DesktopGround, Renderer};
 pub use icon::{billboard_rotation, IconAssets, IconKind};
 pub use lights::{Light, LightKind};
 pub use mesh::{load_clips_for, GltfClip, GltfMesh, MeshLightmapUv};
