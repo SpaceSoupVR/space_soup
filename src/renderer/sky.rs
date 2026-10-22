@@ -922,10 +922,26 @@ impl Sky {
         let warm = self.cloud_warm_rays();
         if let Some(c) = self.clouds.as_mut() {
             self.cloud_dt = (seconds as f64 - c.seconds).clamp(0.0, 0.25) as f32;
+            let before = c.seconds;
             c.seconds = seconds as f64;
             c.frame = c.frame.at(c.seconds);
             c.layers = c.model.layers(c.seconds);
             c.settle(self.cloud_worker.as_mut(), warm);
+            // Whether the clouds' clock and population move on the headset,
+            // every ten seconds of it (user: "the clouds don't seem to move
+            // at all", 2026-10-21).
+            if (before / 10.0).floor() != (c.seconds / 10.0).floor() {
+                let n: Vec<usize> = (0..space_soup_sky::cloud_population::POPULATED).map(|k| c.population.splats(k).0.len()).collect();
+                log::info!(
+                    "CLOUDCLOCK {:.1} s: population of {:.1} s, generation {}, splats {:?}, worker {}, layer 1 shift {:?}",
+                    c.seconds,
+                    c.population.seconds(),
+                    c.population.generation(),
+                    n,
+                    self.cloud_worker.is_some(),
+                    c.layers.get(1).map(|l| l.offset),
+                );
+            }
             self.extra.set_cloud_offsets(&c.frame);
         }
         let blending = self.blend.as_mut().is_some_and(|b| {
@@ -2407,6 +2423,65 @@ mod render_tests {
         let tod = TimeOfDaySky::new(TimeOfDayParams { start_hour: 13.0, clouds, ..Default::default() });
         let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
         (tod.snapshot(13.0, 0.0), zenith)
+    }
+
+    /// THE HEADSET'S CLOUDS OVER TWENTY REAL SECONDS: the worker on, a
+    /// snapshot landing every second as the headset's clock lands them, and
+    /// a tick and a map slice every 72nd of a second. Prints the population's
+    /// clock and generation and where layer 1's first clouds stand, to tell a
+    /// still sky from a slow one (user, 2026-10-21: "the clouds don't seem
+    /// to move at all"). Turns the worker on for the whole process, so run it
+    /// alone: `--ignored --exact`.
+    #[test]
+    #[ignore]
+    fn the_headsets_clouds_move_with_the_worker() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        crate::renderer::cloud_worker::enable();
+        let layout = sky_bind_group_layout(&device);
+        let clouds = space_soup_sky::clouds::CloudParams { coverage: 0.45, wind_speed: 12.0, weather_minutes: 15.0, storms: 0.35, ..Default::default() };
+        let params = TimeOfDayParams { start_hour: 16.5, day_minutes: 20.0, clouds, ..Default::default() };
+        let tod = TimeOfDaySky::new(params);
+        let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
+        let mut sky = Sky::none(&device, &queue, &layout, AMBIENT);
+        let eye = [0.0f32, 1.6, 12.0];
+        let hour = |s: f32| 16.5 + s * 24.0 / (20.0 * 60.0);
+        let start = std::time::Instant::now();
+        let (mut last_apply, mut secs) = (-1.0f32, 0.0f32);
+        let mut gens = std::collections::BTreeSet::new();
+        let mut first: Option<[f32; 2]> = None;
+        for frame in 0..72 * 20 {
+            while start.elapsed().as_secs_f32() < frame as f32 / 72.0 {
+                std::thread::yield_now();
+            }
+            let dt = 1.0 / 72.0;
+            secs += dt;
+            if secs - last_apply >= 1.0 {
+                let blend = if last_apply < 0.0 { 0.0 } else { 1.0 };
+                sky.apply_snapshot_blended(&device, &queue, &layout, &tod.snapshot(hour(secs), 0.0), secs, zenith, blend);
+                last_apply = secs;
+            }
+            let astro = space_soup_sky::time_of_day::Astronomy::at(&params, hour(secs), 0.0);
+            sky.tick(&queue, secs, dt, Some(&astro));
+            sky.step_clouds(&device, &queue, eye, true, None, false);
+            let c = sky.clouds.as_ref().unwrap();
+            gens.insert(c.population.generation());
+            let (splats, _) = c.population.splats(1);
+            let at = splats.first().map(|s| [s.x, s.z]);
+            if frame % 144 == 0 {
+                eprintln!(
+                    "{secs:5.1} s: population of {:.1} s, generation {}, {} cumulus, first at {:?}",
+                    c.population.seconds(),
+                    c.population.generation(),
+                    splats.len(),
+                    at
+                );
+            }
+            if first.is_none() {
+                first = at;
+            }
+        }
+        eprintln!("{} populations shown over 20 s", gens.len());
+        assert!(gens.len() >= 10, "the sky took only {} populations in 20 s", gens.len());
     }
 
     /// A new time-of-day snapshot must not change the light the lit shaders

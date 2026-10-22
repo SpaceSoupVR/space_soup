@@ -184,7 +184,7 @@ impl XrRenderer {
         let cpu_start = std::time::Instant::now();
         // Each submit's time, logged for a frame far over budget: the window
         // averages hid the hangs the headset showed (user, 2026-10-20).
-        let mut laps: Vec<(u32, std::time::Instant)> = Vec::with_capacity(8);
+        let mut laps: Vec<(u32, std::time::Instant)> = Vec::with_capacity(16);
 
         let (view_flags, mut eye_views) =
             session.locate_views(xr::ViewConfigurationType::PRIMARY_STEREO, time, stage)?;
@@ -429,6 +429,7 @@ impl XrRenderer {
             eye_views[0].pose.position.z,
         );
 
+        laps.push((line!(), std::time::Instant::now()));
         let effects_on = self.frame_levers().effects;
 
         use crate::renderer::underwater::EyeWater;
@@ -542,6 +543,7 @@ impl XrRenderer {
             0.5 * (at(&eye_views[0]) + at(&eye_views[eye_views.len() - 1]))
         };
 
+        laps.push((line!(), std::time::Instant::now()));
         let mut effects_drawn =
             effects_on && !(self.effect_emitters.is_empty() && self.splashes.is_empty() && self.bursts.live.is_empty()) && self.effects_gpu.is_some();
         self.last_exposure = post.exposure;
@@ -646,6 +648,7 @@ impl XrRenderer {
             self.bursts.end_frame();
         }
 
+        laps.push((line!(), std::time::Instant::now()));
         let weather_on = self.frame_levers().weather && self.weather.is_some();
         if weather_on {
             let pixel = eye_views.first().map_or(0.0, |v| {
@@ -696,6 +699,7 @@ impl XrRenderer {
             }
         }
 
+        laps.push((line!(), std::time::Instant::now()));
         let thin_width = match eye_views.first() {
             Some(v) if self.levers.thin_parts > 0.0 => {
                 let f = v.fov;
@@ -913,6 +917,7 @@ impl XrRenderer {
             (vb, ib, idx.len() as u32)
         });
 
+        laps.push((line!(), std::time::Instant::now()));
         let sky_upload =
             crate::renderer::uniforms::SkyUpload::from(&self.sky.irradiance);
 
@@ -1023,6 +1028,7 @@ impl XrRenderer {
                 },
             );
         }
+        laps.push((line!(), std::time::Instant::now()));
         let no_shadow_phase = !fx.shadows;
         let want_sun = self.shadow_quality != ShadowQuality::Off && !no_shadow_phase;
         let want_spot = self.shadow_quality == ShadowQuality::SunAndSpot && !no_shadow_phase;
@@ -1333,6 +1339,7 @@ impl XrRenderer {
             frame_player.capsules.cards[1] = [half.x, half.y, half.z, 0.0];
         }
 
+        laps.push((line!(), std::time::Instant::now()));
         let spot_matrices: Vec<crate::renderer::shadow::SpotShadowMatrices> = spot_indices
             .iter()
             .map(|&i| crate::renderer::shadow::spot_shadow_matrices(&lights[i], self.shadow_map.spot_tile_dim()))
@@ -1362,6 +1369,7 @@ impl XrRenderer {
             sun_dynamic_enabled: dynamic_sun.is_some(),
         };
 
+        laps.push((line!(), std::time::Instant::now()));
         let ground_head = {
             let n = eye_views.len().max(1) as f32;
             let mid = eye_views.iter().fold(glam::Vec3::ZERO, |sum, v| sum + glam::Vec3::new(v.pose.position.x, v.pose.position.y, v.pose.position.z)) / n;
