@@ -512,6 +512,7 @@ fn air_waves(seed: u64) -> [AirWave; 6] {
     })
 }
 
+#[cfg(test)]
 fn air_drift(waves: &[AirWave; 6], p: Vec3, time: f64) -> Vec3 {
     air_drift_back(waves, &air_clocks(waves, time), p, 0.0)
 }
