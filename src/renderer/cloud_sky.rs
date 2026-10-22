@@ -69,7 +69,17 @@ pub const MAP_PACK: f32 = 1.15;
 /// sample planes of one march drew a wood grain through every cloud; across
 /// maps the planes move, so the grain averages out over about 1 / share maps
 /// (a few seconds), long before a shape changes.
-pub const HISTORY_NEW: f32 = 0.3;
+///
+/// NOW 1: NO HISTORY (2026-10-22). Since the march goes fine through cloud
+/// (`REFINE`) one map is as near a march four times finer as the
+/// accumulated ones (alpha 0.0076 once, 0.0090 settled), and under a moving,
+/// churning sky the history left copies of the edges where the clouds had
+/// been: 8.9% of the sky a fresh map has clear held cloud, 0.8% without
+/// history (`maps_accumulated_under_a_moving_sky_hold_no_ghost_edges`; user
+/// on the headset: edges "duplicated in repeats that look wispy, like a
+/// photoshop brush was drug from the cloud edge outward"). At 1 the map pass
+/// skips the history's five taps a texel.
+pub const HISTORY_NEW: f32 = 1.0;
 /// Where the old and new maps disagree by this much of the sky showing (a
 /// cloud born, or uncovered by the eye moving), the new march is taken
 /// alone (from the first to the second): history is for the grain, not for
@@ -1427,6 +1437,9 @@ const VIEW_STEPS_MOST: u32 = {VIEW_STEPS_MOST};
 const VIEW_STEP_TEXELS: f32 = {VIEW_STEP_TEXELS};
 const REFINE: u32 = 4u;
 const REFINE_HOLD: u32 = 2u;
+// Halvings that find a cloud's surface between the empty sample and the
+// first in cloud (`fs_map`).
+const ENTRY_BISECT: u32 = 2u;
 const MARCH_CAP: u32 = 512u;
 const SHADOW_STEPS: vec3<u32> = {SHADOW_STEPS};
 const MEAN_A: f32 = {MEAN_A};
@@ -1445,9 +1458,12 @@ const ENVELOPE_TEXEL: f32 = {ENVELOPE_TEXEL};
 const ENVELOPE_TOP_MIP: f32 = {ENVELOPE_TOP_MIP};
 const ALT_FILL_WEIGHT: f32 = {ALT_FILL_WEIGHT};
 // The clouds' transmittance over which a disc behind them fades in
-// (`fs_map`'s `through`): none below 3%, all of it from 30%.
-const DISC_THROUGH0: f32 = 0.03;
-const DISC_THROUGH1: f32 = 0.3;
+// (`fs_map`'s `through`): none below 25%, all of it from 85%. From 3% the
+// whole disc showed through a cloud's edge (headset, 2026-10-22): the sun
+// is ~1e5 the cloud, so even a third of it reads as the bare disc. Now an
+// edge that thins over the disc shows only the part of it in clear sky.
+const DISC_THROUGH0: f32 = 0.25;
+const DISC_THROUGH1: f32 = 0.85;
 
 @vertex fn vs_full(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
@@ -1920,6 +1936,15 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
         var lit_for = 0u;
         var tau_kept = 0.0;
         var near_kept = 0.0;
+        // The last empty sample: where a fine march into cloud came from;
+        // and the halvings left of a search for the surface (`ENTRY_BISECT`),
+        // between `lo` (empty) and `hi` (in cloud, density `d_hi`).
+        var empty_t = t0;
+        var was_empty = true;
+        var bis = 0u;
+        var lo = 0.0;
+        var hi = 0.0;
+        var d_hi = 0.0;
         loop {
             if (t >= t_end || steps >= MARCH_CAP) {
                 break;
@@ -1927,14 +1952,52 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
             steps = steps + 1u;
             let fine = hold > 0u;
             let dt = min(select(stride, fine_dt, fine), t_end - t);
-            let p_alt = altitude_along(alt, mu, t);
-            let xz = eye + dir.xz * t;
             let foot = max(t * texel, 0.25 * dt);
-            let d = density(k, xz, p_alt, true, foot);
-            if (d > 0.0 && !fine) {
-                t = max(t - stride, t0) + jitter * fine_dt;
+            // One density a pass round the loop, the search's included: a
+            // second call site doubled the shader and tripled the map's
+            // cost on the Quest (1.33 -> 4.28 ms a slice, 2026-10-22).
+            let at = select(t, 0.5 * (lo + hi), bis > 0u);
+            var d = density(k, eye + dir.xz * at, altitude_along(alt, mu, at), true, foot);
+            // THE MARCH STEPS FROM THE CLOUD'S OWN SURFACE (2026-10-22). Its
+            // first sample in cloud lay anywhere in a fine step past the
+            // surface, set by the ray's distance alone, and at a cumulus's
+            // extinction (an optical depth near 1 a step) that sample is
+            // most of what the eye sees: the surfaces came out hatched with
+            // the sample shells (headset, user: "striation"). Found to a
+            // quarter of a step between the empty sample and this one, the
+            // march goes on from there, so neighbouring rays sample a cloud
+            // alike wherever it stands.
+            if (bis > 0u) {
+                if (d > 0.0) {
+                    hi = at;
+                    d_hi = d;
+                } else {
+                    lo = at;
+                }
+                bis = bis - 1u;
+                if (bis > 0u) {
+                    continue;
+                }
+                t = hi;
+                d = d_hi;
+            } else if (d > 0.0 && !fine) {
+                empty_t = max(t - stride, t0);
+                was_empty = true;
+                t = empty_t + jitter * fine_dt;
                 hold = REFINE_HOLD * REFINE;
                 continue;
+            } else if (d > 0.0 && was_empty && ENTRY_BISECT > 0u) {
+                lo = empty_t;
+                hi = t;
+                d_hi = d;
+                bis = ENTRY_BISECT;
+                continue;
+            }
+            let p_alt = altitude_along(alt, mu, t);
+            let xz = eye + dir.xz * t;
+            was_empty = d <= 0.0;
+            if (was_empty) {
+                empty_t = t;
             }
             if (d > 0.0) {
                 hold = REFINE_HOLD * REFINE;
@@ -2287,14 +2350,16 @@ pub(crate) mod tests {
         let variant = |name: &str| -> String {
             match name {
                 "no light taps" => base.replace("fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {", "fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {\n    if (true) { return 0.0; }"),
-                "no detail" => base.replace("let d = density(k, xz, p_alt, true, foot);", "let d = density(k, xz, p_alt, false, foot);"),
+                "no detail" => base.replace("altitude_along(alt, mu, at), true, foot);", "altitude_along(alt, mu, at), false, foot);"),
+                "no entry bisection" => base.replace("const ENTRY_BISECT: u32 = 2u;", "const ENTRY_BISECT: u32 = 0u;"),
+                "three halvings" => base.replace("const ENTRY_BISECT: u32 = 2u;", "const ENTRY_BISECT: u32 = 3u;"),
                 "no refine" => base.replace("const REFINE: u32 = 4u;", "const REFINE: u32 = 1u;"),
                 "light every step" => base.replace("const LIGHT_EVERY: u32 = 2u;", "const LIGHT_EVERY: u32 = 1u;"),
                 "half steps" => base.replace(&format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST), &format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST / 2)),
                 _ => base.clone(),
             }
         };
-        for (populated, name) in [(false, "as built"), (true, "as built"), (true, "no refine"), (true, "light every step"), (true, "no light taps"), (true, "no detail"), (true, "half steps")] {
+        for (populated, name) in [(false, "as built"), (true, "as built"), (true, "no entry bisection"), (true, "three halvings"), (true, "no refine"), (true, "light every step"), (true, "no light taps"), (true, "no detail"), (true, "half steps")] {
             let src = variant(name);
             assert!(name == "as built" || src != base, "variant {name} changed nothing");
             let mut population = CloudPopulation::new();
@@ -2465,6 +2530,172 @@ pub(crate) mod tests {
         assert!(heights_ok, "a map height lies outside the layers' {lo}..{hi}");
         assert!(n > 500, "too few clouded directions: {n}");
         assert!(carried < 0.35 * left, "carrying the map does not follow the clouds: {carried} vs {left}");
+    }
+
+    /// MAPS ACCUMULATED UNDER A MOVING, CHANGING SKY ARE THE SKY OF THEIR
+    /// MOMENT: built slice by slice as `Sky::step_clouds` builds them (each
+    /// map of a moment two builds ahead, the clouds churning, the winds
+    /// carrying them, test_room's 2.5x clock at SpaceWarp's 36 Hz), the
+    /// newest map against one drawn fresh at its moment. A history carried
+    /// to the wrong place, or kept where a cloud has gone, leaves copies of
+    /// the edges beside them (user, 2026-10-22: edges "duplicated in repeats
+    /// that look wispy"). `GHOST_DUMP=dir` writes both maps' alpha as PGM.
+    #[test]
+    fn maps_accumulated_under_a_moving_sky_hold_no_ghost_edges() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = CloudParams { coverage: 0.45, time_scale: 2.5, ..Default::default() };
+        let model = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise);
+        let mut population = CloudPopulation::new();
+        let eye = [10.0f32, 2.0, 5.0];
+        let uniform_at = |population: &mut CloudPopulation, at: f64| {
+            population.update(&params, &field, at);
+            let mut layers = model.layers(at);
+            population.place(&mut layers, at);
+            let u = CloudSkyUniform::new(&layers, eye, [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
+            (u, flow_winds(&params, &layers))
+        };
+        let t0 = 20_000.0;
+        let dt = 2.5 / 36.0;
+        let mut sky = CloudSky::new(&device, &queue, &field, &noise);
+        let mut now = t0;
+        let mut at = t0;
+        let mut m = uniform_at(&mut population, at);
+        let maps = 10;
+        let mut frame = 0;
+        while frame < maps * MAP_SLICES + 1 || sky.display()[2] != 0.0 {
+            if sky.starts_map(false) {
+                at = if sky.is_fresh() { now } else { now + sky.map_lead() };
+                m = uniform_at(&mut population, at);
+            }
+            sky.set_population(&device, &queue, &population);
+            sky.set_winds(m.1);
+            let mut enc = device.create_command_encoder(&Default::default());
+            sky.encode_at(&mut enc, &queue, &m.0, &m.0, None, false, now, at);
+            queue.submit(Some(enc.finish()));
+            now += dt;
+            frame += 1;
+        }
+        let newest = sky.display()[1] as u32;
+        let moment = sky.times[newest as usize];
+        let alpha_of = |sky: &CloudSky, layer: u32| -> Vec<f32> {
+            let map = read_back(&device, &queue, &sky.maps, layer, MAP_WIDTH, MAP_HEIGHT, 8);
+            (0..(MAP_WIDTH * MAP_HEIGHT) as usize).map(|i| half(&map[i * 8 + 6..i * 8 + 8])).collect()
+        };
+        let acc = alpha_of(&sky, newest);
+        let mut fresh = CloudSky::new(&device, &queue, &field, &noise);
+        // The population the newest map was drawn from, as it stands.
+        let (u, winds) = uniform_at(&mut population, moment);
+        fresh.set_population(&device, &queue, &population);
+        fresh.set_winds(winds);
+        let mut enc = device.create_command_encoder(&Default::default());
+        fresh.encode_at(&mut enc, &queue, &u, &u, None, true, moment, moment);
+        queue.submit(Some(enc.finish()));
+        let want = alpha_of(&fresh, fresh.display()[1] as u32);
+        let (mut off, mut n, mut ghosts, mut clear) = (0.0f64, 0u32, 0u32, 0u32);
+        for j in 0..MAP_HEIGHT {
+            let up = map_dir([0.5, (j as f32 + 0.5) / MAP_HEIGHT as f32])[1];
+            if !(0.035..0.85).contains(&up) {
+                continue;
+            }
+            for i in 0..MAP_WIDTH {
+                let k = (j * MAP_WIDTH + i) as usize;
+                if want[k] < 0.98 || acc[k] < 0.98 {
+                    off += (acc[k] - want[k]).abs() as f64;
+                    n += 1;
+                }
+                if want[k] > 0.99 {
+                    clear += 1;
+                    if acc[k] < 0.93 {
+                        ghosts += 1;
+                    }
+                }
+            }
+        }
+        let off = off / n.max(1) as f64;
+        let ghost_share = ghosts as f64 / clear.max(1) as f64;
+        eprintln!("MOVING SKY after {frame} frames (moment {:.1} s on): alpha off by {off:.5} over {n} texels; ghosts {ghosts} of {clear} clear ({:.4}%)", moment - t0, 100.0 * ghost_share);
+        if let Ok(dir) = std::env::var("GHOST_DUMP") {
+            for (name, a) in [("acc", &acc), ("fresh", &want)] {
+                let mut out = format!("P5\n{MAP_WIDTH} {MAP_HEIGHT}\n255\n").into_bytes();
+                out.extend(a.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8));
+                std::fs::write(format!("{dir}/ghost_{name}.pgm"), out).unwrap();
+            }
+        }
+        assert!(off < 0.03, "the accumulated map is off the sky of its moment by {off:.5}");
+        // With the history (`HISTORY_NEW` 0.3): off by 0.0399, 8.9% ghosts;
+        // without, 0.0109 and 0.80% -- what a map at another sample fraction
+        // differs by in the thinnest wisps (a still sky accumulated: 1.6%).
+        assert!(ghost_share < 0.012, "{ghosts} clear texels hold a cloud the sky has not");
+    }
+
+    /// How near one map of each march variant comes to a march four times
+    /// finer, and how much of its error is fine-grained (the hatching): the
+    /// error's own detail, |e - blur(e)|, a texel's 3x3 mean (`--ignored`).
+    #[test]
+    #[ignore]
+    fn march_variants_against_a_finer_march() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = CloudParams { coverage: 0.45, ..Default::default() };
+        let model = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise);
+        let mut population = CloudPopulation::new();
+        let t = 20_000.0;
+        population.update(&params, &field, t);
+        let mut layers = model.layers(t);
+        population.place(&mut layers, t);
+        let u = CloudSkyUniform::new(&layers, [0.0, 2.0, 0.0], [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
+        let base = cloud_sky_shader();
+        let draw = |src: String| -> Vec<[f32; 2]> {
+            let mut sky = CloudSky::with_shader(&device, &queue, &field, &noise, src);
+            sky.set_population(&device, &queue, &population);
+            let mut enc = device.create_command_encoder(&Default::default());
+            sky.encode_at(&mut enc, &queue, &u, &u, None, true, 0.0, t);
+            queue.submit(Some(enc.finish()));
+            let map = read_back(&device, &queue, &sky.raw, 0, MAP_WIDTH, MAP_HEIGHT, 8);
+            (0..(MAP_WIDTH * MAP_HEIGHT) as usize).map(|i| [half(&map[i * 8 + 6..i * 8 + 8]), half(&map[i * 8..i * 8 + 2])]).collect()
+        };
+        let with = |refine: u32, bisect: u32, finer: u32| {
+            base.replace("const REFINE: u32 = 4u;", &format!("const REFINE: u32 = {refine}u;"))
+                .replace("const ENTRY_BISECT: u32 = 2u;", &format!("const ENTRY_BISECT: u32 = {bisect}u;"))
+                .replace(&format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST), &format!("const VIEW_STEPS_MOST: u32 = {}u;", cl::VIEW_STEPS_MOST * finer))
+                .replace(&format!("const VIEW_STEP_TEXELS: f32 = {:?};", cl::VIEW_STEP_TEXELS), &format!("const VIEW_STEP_TEXELS: f32 = {:?};", cl::VIEW_STEP_TEXELS / finer as f32))
+        };
+        let reference = draw(with(4, 3, 4));
+        let (w, h) = (MAP_WIDTH as usize, MAP_HEIGHT as usize);
+        let score = |m: &[[f32; 2]], c: usize| {
+            let e = |i: usize, j: usize| m[j * w + i][c] - reference[j * w + i][c];
+            let (mut off, mut grain, mut n) = (0.0f64, 0.0f64, 0u32);
+            for j in 1..h - 1 {
+                let up = map_dir([0.5, (j as f32 + 0.5) / h as f32])[1];
+                if !(0.035..0.85).contains(&up) {
+                    continue;
+                }
+                for i in 1..w - 1 {
+                    if reference[j * w + i][0] >= 0.98 {
+                        continue;
+                    }
+                    let mut mean = 0.0;
+                    for dj in 0..3 {
+                        for di in 0..3 {
+                            mean += e(i + di - 1, j + dj - 1);
+                        }
+                    }
+                    off += e(i, j).abs() as f64;
+                    grain += (e(i, j) - mean / 9.0).abs() as f64;
+                    n += 1;
+                }
+            }
+            (off / n as f64, grain / n as f64)
+        };
+        for (refine, bisect) in [(4, 0), (4, 2), (4, 3), (3, 3), (2, 3), (2, 2), (1, 3)] {
+            let m = draw(with(refine, bisect, 1));
+            let (a, ag) = score(&m, 0);
+            let (r, rg) = score(&m, 1);
+            eprintln!("VARIANT refine {refine} bisect {bisect}: alpha off {a:.5} grain {ag:.5}; red off {r:.5} grain {rg:.5}");
+        }
     }
 
     /// ONE MAP IS ALREADY NEAR A MARCH FOUR TIMES FINER, AND THE MAPS

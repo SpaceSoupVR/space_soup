@@ -1512,6 +1512,11 @@ fn sky_apparent(s: vec3<f32>) -> vec3<f32> {{
     return vec3<f32>(s.x * k, sin(e2), s.z * k);
 }}
 
+// The moon's halo against the sun's (`sky_halo`): at the sun's share the
+// full moon wore a glare near the sun's, 15 degrees across in the night eye
+// (headset, 2026-10-22).
+const MOON_HALO: f32 = 0.3;
+
 // `k`: the share of the disc (not its halo) that comes through (clouds).
 fn sky_moon(d: vec3<f32>, px: f32, k: f32) -> vec4<f32> {{
     let m = sky_extra.moon.xyz;
@@ -1521,7 +1526,7 @@ fn sky_moon(d: vec3<f32>, px: f32, k: f32) -> vec4<f32> {{
     }}
     let seen_at = sky_apparent(m);
     let risen = smoothstep(-rho, rho, seen_at.y);
-    let halo = sky_extra.moon_radiance.rgb * sky_extra.extinction.w * risen * sky_halo_through().y
+    let halo = MOON_HALO * sky_extra.moon_radiance.rgb * sky_extra.extinction.w * risen * sky_halo_through().y
         * sky_halo(d, seen_at, max(rho * (180.0 / SKY_PI), 0.5));
     if (dot(d, m) < cos(rho + DISC_REACH + 3.0 * px)) {{
         return vec4<f32>(halo, 0.0);

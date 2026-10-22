@@ -19,7 +19,9 @@ pub const ADAPT_DARKER_STOPS_PER_S: f32 = 1.5;
 /// How fast the eye keeps adapting to the dark once past the indoor range
 /// (`MAX_EXPOSURE`): rods take minutes where cones take seconds, so stepping
 /// out of a lit hall into the night leaves the eye night-blind for a while.
-pub const ADAPT_NIGHT_STOPS_PER_S: f32 = 0.3;
+/// At 0.3 the moonlit yard (14 stops past the hall) took ~47 s and read as
+/// never coming back (user, 2026-10-22); at 1.2 it is back in ~12 s.
+pub const ADAPT_NIGHT_STOPS_PER_S: f32 = 1.2;
 
 /// LOCAL ADAPTATION to a lit room seen through a doorway: the eye adapts in
 /// part to what it looks at, so it never sits more than this many times darker
@@ -857,14 +859,14 @@ mod tests {
         eye.update(REFERENCE_LUMINANCE / 14.0, 0.016);
         let start = eye.adapted_luminance().unwrap().log2();
         for _ in 0..10 {
-            eye.update(1e-6, 1.0);
+            eye.update(1e-6, 0.25);
         }
         let after = eye.adapted_luminance().unwrap().log2();
-        let indoor_part = start - night_adapted_log2();
-        let night_part = 10.0 - indoor_part / ADAPT_DARKER_STOPS_PER_S;
+        let indoor_part = (start - night_adapted_log2()).min(2.5 * ADAPT_DARKER_STOPS_PER_S);
+        let night_part = 2.5 - indoor_part / ADAPT_DARKER_STOPS_PER_S;
         let want = start - indoor_part - night_part * ADAPT_NIGHT_STOPS_PER_S;
-        assert!((after - want).abs() < 0.2, "10 s from a lit room into the night: {after} vs {want}");
-        assert!(after > 1e-6f32.log2() + 5.0, "still far from night-adapted after 10 s");
+        assert!((after - want).abs() < 0.2, "2.5 s from a lit room into the night: {after} vs {want}");
+        assert!(after > 1e-6f32.log2() + 2.0, "night-adapted within 2.5 s");
     }
 
     #[test]
