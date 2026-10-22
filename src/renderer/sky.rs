@@ -1866,6 +1866,7 @@ mod tests {
         let model = std::sync::Arc::new(model);
         let mut worker = crate::renderer::cloud_worker::CloudWorker::new();
         let (mut worst, mut over, mut swaps) = (0.0f64, 0u32, 0u32);
+        let mut worst_at = (0usize, 0.0f64, 0.0f64, 0.0f64);
         let start = std::time::Instant::now();
         let real = 72 * 20;
         for f in 0..real {
@@ -1878,18 +1879,26 @@ mod tests {
             let dir = [0.4, 0.5, 0.3];
             let warm: Vec<([f32; 2], f32, [f32; 3])> = (0..9).map(|k| ([((k % 3) as f32 - 1.0) * 150.0, ((k / 3) as f32 - 1.0) * 150.0], 0.0, unit3(dir))).collect();
             let ask = |seconds| crate::renderer::cloud_worker::Request { params, field: field.clone(), model: model.clone(), seconds, warm };
+            let p0 = std::time::Instant::now();
             if let Some(frame) = worker.poll(t, ask) {
                 population = frame;
                 swaps += 1;
             }
+            let p1 = std::time::Instant::now();
             population.place(&mut layers, t);
             let w = CloudWeather::new(&field, Some(&population));
             let _ = level_transmittance(&layers, w, dir);
             let all = a.elapsed().as_secs_f64() * 1000.0;
+            if all > worst {
+                worst_at = (f, (p0 - a).as_secs_f64() * 1000.0, (p1 - p0).as_secs_f64() * 1000.0, p1.elapsed().as_secs_f64() * 1000.0);
+            }
             worst = worst.max(all);
             over += (all > 2.0) as u32;
         }
-        eprintln!("CLOUDTICK with the worker: {real} frames in real time, {swaps} populations swapped in, the worst {worst:.2} ms, {over} frames over 2 ms");
+        eprintln!(
+            "CLOUDTICK with the worker: {real} frames in real time, {swaps} populations swapped in, the worst {worst:.2} ms (frame {}: layers {:.2}, poll and swap {:.2}, place and light {:.2}), {over} frames over 2 ms",
+            worst_at.0, worst_at.1, worst_at.2, worst_at.3
+        );
     }
 
     #[test]
