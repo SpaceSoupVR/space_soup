@@ -26,7 +26,15 @@ fn up_to_date(path: &Path, source: u64) -> bool {
 }
 
 fn encode_model(glb: &Path, astcenc: &Path, quality: &str, force: bool) -> Result<(), String> {
-    let (doc, _buffers, images) = gltf::import(glb).map_err(|e| format!("{}: {e}", glb.display()))?;
+    // A model the importer refuses is one the game cannot load either: noted,
+    // not a failure, so one such file does not stop a deploy's encoding.
+    let (doc, _buffers, images) = match gltf::import(glb) {
+        Ok(i) => i,
+        Err(e) => {
+            println!("{}: skipped, it does not import ({e})", glb.display());
+            return Ok(());
+        }
+    };
     let dir = model_astc_dir(glb);
     let scratch = std::env::temp_dir().join(format!("model_astc_{}", std::process::id()));
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
