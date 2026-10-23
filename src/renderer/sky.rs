@@ -353,6 +353,9 @@ pub struct Sky {
     /// The clouds' population drawn a second ahead off the render thread,
     /// when the app asked for it (`cloud_worker::enable`).
     cloud_worker: Option<crate::renderer::cloud_worker::CloudWorker>,
+    /// Whether the clouds have had a population of their own yet: the first
+    /// is made here, before the first map, not on the worker.
+    clouds_populated: bool,
 }
 
 /// Two time-of-day snapshots and how far the sky is from one to the other.
@@ -751,6 +754,7 @@ impl Sky {
             eye_xz: [0.0, 0.0],
             blend: None,
             cloud_worker: None,
+            clouds_populated: false,
         }
     }
 
@@ -896,7 +900,18 @@ impl Sky {
                     light_is_moon: snap.light_is_moon,
                     population,
                 };
-                c.settle(self.cloud_worker.as_mut(), warm);
+                // THE FIRST POPULATION BEFORE THE FIRST MAP (2026-10-23, user:
+                // "the sky was much less dense, and then all of the sudden it was
+                // filled"). Left to the worker, the first maps were drawn from
+                // the weather's mean, a sparser sky, and the population's own
+                // cross-faded in seconds later. This is the level's load, where
+                // its 1.7 s on this thread cost nothing played.
+                if self.clouds_populated {
+                    c.settle(self.cloud_worker.as_mut(), warm);
+                } else {
+                    c.settle(None, warm);
+                    self.clouds_populated = true;
+                }
                 Some(c)
             }
             _ => None,
