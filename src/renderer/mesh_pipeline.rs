@@ -843,12 +843,13 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         discard;
     }}
 
+    let rough_aa = specular_aa_roughness(rough, dpdx(n), dpdy(n));
     var shaded: vec3<f32>;
     if (rough >= 0.996) {{
         shaded = tex_color.rgb * (shade_with_sky(in.world_pos, n, model_u.params.x) + room_irradiance(n));
     }} else {{
         shaded = shade_material_env(
-            in.world_pos, n, rough, 1.0, model_u.params.x, room_irradiance(n), vec4<f32>(0.5, 0.5, 0.5, 0.0),
+            in.world_pos, n, rough_aa, 1.0, model_u.params.x, room_irradiance(n), vec4<f32>(0.5, 0.5, 0.5, 0.0),
             tex_color.rgb, in.world_pos, n,
         );
     }}
@@ -1122,12 +1123,16 @@ fn mesh_shader_variant(thin: bool) -> String {
 }
 
 const MATERIAL_SHADE: &str = r#"var colour: vec3<f32>;
+    // Specular AA as the brushes and the ground have it: the roughness
+    // widened by how fast the normal turns across the pixel, so a glossy
+    // prop's highlight does not sparkle (2026-10-23).
+    let rough_aa = specular_aa_roughness(mask.a, dpdx(n), dpdy(n));
     if (mask.a >= 0.996) {
         colour = tex_color.rgb * (shade_with_sky(in.world_pos, n, model_u.params.x * baked.a) + own_bulb_fill(in.world_pos, n) + baked.rgb + room_irradiance(n));
     } else {
         let env = baked.rgb + room_irradiance(n);
         colour = shade_material_env(
-            in.world_pos, n, mask.a, 1.0, model_u.params.x * baked.a, env, vec4<f32>(0.5, 0.5, 0.5, 0.0),
+            in.world_pos, n, rough_aa, 1.0, model_u.params.x * baked.a, env, vec4<f32>(0.5, 0.5, 0.5, 0.0),
             tex_color.rgb, in.world_pos, n,
         ) + tex_color.rgb * own_bulb_fill(in.world_pos, n);
     }"#;
