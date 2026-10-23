@@ -2192,6 +2192,10 @@ impl XrRenderer {
             self.wgpu_queue.write_buffer(&sw.cameras, 0, &bytes);
         }
 
+        // The reflection history's state, carried through the eyes here and
+        // stored after them: the draw lists borrow `self` until then.
+        let mut reflection_parity = self.reflection_parity;
+        let mut reflection_prev = self.reflection_prev;
         for eye in 0..2usize {
             let ev = &eye_views[eye];
             let view = Camera::xr_view(ev.pose);
@@ -3190,10 +3194,10 @@ impl XrRenderer {
                             );
                         }
                         if let Some((groups, _)) = blur {
-                            let prev = self.reflection_prev[eye].filter(|_| self.levers.reflection_history);
+                            let prev = reflection_prev[eye].filter(|_| self.levers.reflection_history);
                             let history = crate::renderer::probe_blur::HistoryUniform::new(eye_view_proj, warp_world_to_player, prev, cam_pos);
                             self.probe_blur.write_history(&self.wgpu_queue, groups, &history);
-                            let k = self.reflection_parity[eye];
+                            let k = reflection_parity[eye];
                             self.probe_blur.dispatch(
                                 &mut encoder,
                                 &groups.groups[k],
@@ -3202,10 +3206,10 @@ impl XrRenderer {
                                     .as_ref()
                                     .and_then(|t| t.compute_writes(16 + eye)),
                             );
-                            self.reflection_parity[eye] = 1 - k;
-                            self.reflection_prev[eye] = Some((eye_view_proj, warp_world_to_player, dyn_scale));
+                            reflection_parity[eye] = 1 - k;
+                            reflection_prev[eye] = Some((eye_view_proj, warp_world_to_player, dyn_scale));
                         } else {
-                            self.reflection_prev[eye] = None;
+                            reflection_prev[eye] = None;
                         }
                 }
                 }
@@ -4223,6 +4227,8 @@ impl XrRenderer {
             laps.push((line!(), std::time::Instant::now()));
 
         }
+        self.reflection_parity = reflection_parity;
+        self.reflection_prev = reflection_prev;
 
         if let Some(sw) = self.space_warp.as_mut() {
             if sw.acquired.is_some() {
