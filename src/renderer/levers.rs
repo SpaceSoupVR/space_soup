@@ -174,6 +174,12 @@ pub struct Levers {
     pub floor_mirror: bool,
 
     pub reflection_blur: bool,
+    /// The reflections carried from frame to frame and averaged
+    /// (`probe_blur::History`): from mid distance a lamp cage's wires and
+    /// other sub-pixel bright parts of a reflection came out whole or not at
+    /// all in each texel and danced as the head moved. Off: each frame's
+    /// reflections alone, as before 2026-10-23.
+    pub reflection_history: bool,
 
     pub character_cards: bool,
 
@@ -371,6 +377,7 @@ impl Default for Levers {
             pool_metering: true,
             floor_mirror: false,
             reflection_blur: true,
+            reflection_history: true,
             character_cards: true,
             thin_parts: 1.0,
             thin_shading_sampled: false,
@@ -559,6 +566,7 @@ impl Levers {
         flag("terminator_aa", self.terminator_aa, d.terminator_aa);
         flag("floor_mirror", self.floor_mirror, d.floor_mirror);
         flag("reflection_blur", self.reflection_blur, d.reflection_blur);
+        flag("reflection_history", self.reflection_history, d.reflection_history);
         flag("character_cards", self.character_cards, d.character_cards);
         flag("flashlight_bounce", self.flashlight_bounce, d.flashlight_bounce);
         flag("surface_light_loop", self.surface_light_loop, d.surface_light_loop);

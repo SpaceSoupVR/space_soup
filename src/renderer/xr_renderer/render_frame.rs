@@ -3189,16 +3189,23 @@ impl XrRenderer {
                                 self.pass_timers.as_ref().and_then(|t| t.compute_writes(10 + eye)),
                             );
                         }
-                        if let Some((group, _)) = blur {
-
+                        if let Some((groups, _)) = blur {
+                            let prev = self.reflection_prev[eye].filter(|_| self.levers.reflection_history);
+                            let history = crate::renderer::probe_blur::HistoryUniform::new(eye_view_proj, warp_world_to_player, prev, cam_pos);
+                            self.probe_blur.write_history(&self.wgpu_queue, groups, &history);
+                            let k = self.reflection_parity[eye];
                             self.probe_blur.dispatch(
                                 &mut encoder,
-                                group,
+                                &groups.groups[k],
                                 (t.width, t.height),
                                 self.pass_timers
                                     .as_ref()
                                     .and_then(|t| t.compute_writes(16 + eye)),
                             );
+                            self.reflection_parity[eye] = 1 - k;
+                            self.reflection_prev[eye] = Some((eye_view_proj, warp_world_to_player, dyn_scale));
+                        } else {
+                            self.reflection_prev[eye] = None;
                         }
                 }
                 }

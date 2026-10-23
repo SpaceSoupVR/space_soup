@@ -358,7 +358,12 @@ pub struct XrRenderer {
     probe_fixup_passes: [wgpu::BindGroup; 2],
 
     probe_blur: crate::renderer::probe_blur::ProbeBlur,
-    probe_blur_groups: [Option<wgpu::BindGroup>; 2],
+    probe_blur_groups: [Option<crate::renderer::probe_blur::BlurGroups>; 2],
+    /// Each eye's view-projection, player frame and dynamic resolution scale
+    /// when its reflections were last blurred, and which history it reads
+    /// next (`probe_blur::History`).
+    reflection_prev: [Option<(glam::Mat4, glam::Mat4, f32)>; 2],
+    reflection_parity: [usize; 2],
 
     character_cards: Option<crate::renderer::character_cards::CharacterCards>,
 
@@ -978,7 +983,7 @@ impl XrRenderer {
         let probe_fixup_passes: [wgpu::BindGroup; 2] =
             std::array::from_fn(|eye| probe_fixups.pass_bind_group_for(&wgpu_device, &probe_pass_targets[eye]));
         let probe_blur = crate::renderer::probe_blur::ProbeBlur::new(&wgpu_device);
-        let probe_blur_groups: [Option<wgpu::BindGroup>; 2] = std::array::from_fn(|eye| {
+        let probe_blur_groups: [Option<crate::renderer::probe_blur::BlurGroups>; 2] = std::array::from_fn(|eye| {
             probe_blur.bind_group(&wgpu_device, &probe_pass_targets[eye])
         });
         let brush_probe_pass_poolless_pipeline = crate::renderer::brush_pipeline::BrushPipeline::new_probe_pass_deferred_poolless(
@@ -1455,6 +1460,8 @@ impl XrRenderer {
             probe_fixup_passes,
             probe_blur,
             probe_blur_groups,
+            reflection_prev: [None; 2],
+            reflection_parity: [0; 2],
             character_cards: None,
             skin_compute,
             posed_cache: Default::default(),
