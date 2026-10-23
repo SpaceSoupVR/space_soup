@@ -533,7 +533,11 @@ impl XrRenderer {
                 // And slower while the frame is over budget (`cloud_pace`).
                 let room = if sky_open < CLOSED_ROOM_SKY { CLOSED_ROOM_CLOUD_EVERY } else { 1 };
                 let gpu_ms = self.perf_metrics.as_ref().and_then(|m| m.value("app/gpu_frametime")).map(|v| v as f32);
-                let hz = if self.space_warp_running() { self.display_hz / 2.0 } else { self.display_hz };
+                // The app's own frame: under SpaceWarp every other display
+                // frame -- unless the runtime already predicts the app's period,
+                // which it does as SpaceWarp runs (CLOUDPACE read a 55.6 ms
+                // frame, 2026-10-22), so a rate under 60 Hz is taken as it is.
+                let hz = if self.space_warp_running() && self.display_hz > 60.0 { self.display_hz / 2.0 } else { self.display_hz };
                 let was = self.cloud_pace.every();
                 let paced = self.cloud_pace.step(gpu_ms, (1000.0 / hz) as f32);
                 if paced != was {
