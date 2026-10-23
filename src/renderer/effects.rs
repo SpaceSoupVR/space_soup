@@ -321,6 +321,7 @@ pub struct EffectFrame {
     pub splash_costs: Vec<(u64, f32, f32)>,
 }
 
+#[derive(Clone, Copy)]
 pub struct Surroundings<'a> {
 
     pub head: Vec3,
@@ -334,6 +335,18 @@ pub struct Surroundings<'a> {
 
     pub ambient: &'a dyn Fn(Vec3) -> Vec3,
     pub exposure: f32,
+    /// The room-local adaptation at a world point (`exposure::room_factor_at`):
+    /// an effect in a closed room is drawn at the room's adaptation, as its
+    /// walls are. None: every effect at `exposure`.
+    pub room: Option<&'a dyn Fn(Vec3) -> f32>,
+}
+
+impl<'a> Surroundings<'a> {
+    /// These surroundings for an effect at `world`: the exposure of the room
+    /// it is in.
+    pub fn at_point(&self, world: Vec3) -> Self {
+        Self { exposure: self.exposure * self.room.map_or(1.0, |r| r(world)), ..*self }
+    }
 }
 
 fn hash64(mut x: u64) -> u64 {
@@ -1050,6 +1063,7 @@ pub fn simulate_governed(
         if !seen(index) {
             continue;
         }
+        let at = &at.at_point(e.position);
 
         let tpl = templates::template(e.kind);
         let s = match tpl.form {
@@ -1264,7 +1278,7 @@ pub fn simulate_governed(
     }
     for s in splashes {
         let (o0, s0) = (over.len(), screened.len());
-        splash(s, time, at, &mut over, &mut screened);
+        splash(s, time, &at.at_point(s.position), &mut over, &mut screened);
 
         let key = splash_key(s);
         let fill: f32 = over[o0..].iter().map(|(_, i)| i).chain(screened[s0..].iter()).map(|i| instance_fill(i, at.head)).sum();
@@ -4313,7 +4327,7 @@ mod tests {
     }
 
     fn seen_from(head: Vec3) -> Surroundings<'static> {
-        Surroundings { head, offset: Vec3::ZERO, yaw_inv: Quat::IDENTITY, lights: &[], reaches: &every, ambient: &dim, exposure: 1.0 }
+        Surroundings { head, offset: Vec3::ZERO, yaw_inv: Quat::IDENTITY, lights: &[], reaches: &every, ambient: &dim, exposure: 1.0, room: None }
     }
 
     fn lamp() -> Light {

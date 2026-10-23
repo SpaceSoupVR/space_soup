@@ -103,6 +103,10 @@ pub struct Levers {
     /// in the maps it shared the lower clouds' carry wind and warped where
     /// they crossed). Off: no cirrus, to time it.
     pub sky_cirrus: bool,
+    /// From a lit closed room the eye adapts part of the way toward the night
+    /// through a doorway it looks at, the room held at its own adaptation
+    /// (`exposure::DOOR_LEAN`, 2026-10-23). Off: metered on the room alone.
+    pub door_lean: bool,
     /// The reflection probes relit on the GPU at every frame's daylight
     /// (`ProbeStream::new_smooth`), not rebuilt on the CPU at 25% steps; off
     /// is the stepped relight. Read when the level's probes load. Costs two
@@ -364,6 +368,7 @@ impl Default for Levers {
             cloud_pace: true,
             cloud_history_tight: true,
             sky_cirrus: true,
+            door_lean: true,
             smooth_probes: true,
             smooth_sun_shadow: true,
             smooth_ground: true,
@@ -565,6 +570,7 @@ impl Levers {
         flag("cloud_pace", self.cloud_pace, d.cloud_pace);
         flag("cloud_history_tight", self.cloud_history_tight, d.cloud_history_tight);
         flag("sky_cirrus", self.sky_cirrus, d.sky_cirrus);
+        flag("door_lean", self.door_lean, d.door_lean);
         flag("smooth_probes", self.smooth_probes, d.smooth_probes);
         flag("smooth_sun_shadow", self.smooth_sun_shadow, d.smooth_sun_shadow);
         flag("smooth_ground", self.smooth_ground, d.smooth_ground);

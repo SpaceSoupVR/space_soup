@@ -153,6 +153,7 @@ impl DesktopEffects {
             reaches: &every,
             ambient: &ambient,
             exposure,
+            room: None,
         };
 
         self.seen_until.resize(self.emitters.len(), f64::NEG_INFINITY);

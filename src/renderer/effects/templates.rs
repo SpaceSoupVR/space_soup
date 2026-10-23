@@ -932,7 +932,7 @@ mod tests {
         let (mut compared, mut bytes) = (0usize, 0usize);
         for scene in &scenes {
             for (head, offset, yaw_inv, exposure, lights) in views {
-                let at = Surroundings { head, offset, yaw_inv, lights, reaches: &every, ambient: &dim, exposure };
+                let at = Surroundings { head, offset, yaw_inv, lights, reaches: &every, ambient: &dim, exposure, room: None };
                 for time in [0.0, 0.37, 5.21, 20.0, 1234.567, 86_400.25] {
                     let (was, is) = (legacy(scene, time, &at), simulate(scene, time, &at));
                     assert_eq!((was.over, was.screened), (is.over, is.screened), "{:?} at {time}", scene[0].kind);
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn a_strike_into_water_stays_inside_its_stacks_counts() {
-        let at = Surroundings { head: Vec3::new(0.0, 1.6, 2.5), offset: Vec3::ZERO, yaw_inv: Quat::IDENTITY, lights: &[], reaches: &every, ambient: &dim, exposure: 1.0 };
+        let at = Surroundings { head: Vec3::new(0.0, 1.6, 2.5), offset: Vec3::ZERO, yaw_inv: Quat::IDENTITY, lights: &[], reaches: &every, ambient: &dim, exposure: 1.0, room: None };
         let mut most = [(0u32, 0.0f32); 6];
         let (mut most_instances, mut most_fill, mut strikes) = (0usize, 0.0f32, 0);
         let shares: Vec<f32> = books().iter().map(|b| b.cutout_share).collect();

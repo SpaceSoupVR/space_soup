@@ -571,7 +571,10 @@ impl XrRenderer {
                 let water = crate::renderer::underwater::in_water_luminance(u, &under_base, u.extinction[3] - head_world.y);
                 metered = crate::renderer::underwater::meter_in_water(metered, water, crate::renderer::underwater::eye_share(state));
             }
-            let auto = eye.update(metered, dt);
+            // Leaning toward a doorway's night from a lit closed room
+            // (`EyeAdaptation::door_lean`, lever `door_lean`).
+            let lean = if self.auto_exposure && self.levers.door_lean { eye.door_lean(head_world, gaze, metered) } else { 0.0 };
+            let auto = eye.update_leaning(metered, lean, dt);
             if self.shadow_diag_frames.get() % 120 == 0 {
                 log::info!("EXPOSURE meter {metered:.4} -> x{auto:.2} (auto {})", self.auto_exposure);
             }
@@ -675,6 +678,12 @@ impl XrRenderer {
             };
             let ground = self.ground_heights.as_ref();
             let ambient = |world: glam::Vec3| crate::renderer::effects::room_ambient_now(descs, world, &relit, ground);
+            // An effect in a closed room at the room's adaptation, as its walls
+            // and its lamps' glare are: the eye's alone blew out a lit room's
+            // fire and dust seen from the night (and from inside it, once the
+            // eye leans toward the doorway's night).
+            let room_rows = post.rooms;
+            let room = move |world: glam::Vec3| crate::renderer::exposure::room_factor_at(&room_rows, world);
             let at = crate::renderer::effects::Surroundings {
                 head: mid_eye,
                 offset,
@@ -683,6 +692,7 @@ impl XrRenderer {
                 reaches: &reaches,
                 ambient: &ambient,
                 exposure: post.exposure,
+                room: Some(&room),
             };
 
             let now = time.as_nanos() as f64 * 1e-9;

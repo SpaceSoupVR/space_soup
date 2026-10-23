@@ -1599,7 +1599,7 @@ pub(crate) mod tests {
         Vec3::splat(0.1)
     }
     fn seen_from(head: Vec3, exposure: f32) -> Surroundings<'static> {
-        Surroundings { head, offset: Vec3::ZERO, yaw_inv: Quat::IDENTITY, lights: &[], reaches: &every, ambient: &dim, exposure }
+        Surroundings { head, offset: Vec3::ZERO, yaw_inv: Quat::IDENTITY, lights: &[], reaches: &every, ambient: &dim, exposure, room: None }
     }
 
     pub(crate) fn shipped() -> Option<EffectLibrary> {
@@ -2161,7 +2161,7 @@ pub(crate) mod tests {
             for t in &texts {
                 lib.add(&EffectAsset::parse(t).unwrap()).unwrap();
             }
-            let at = Surroundings { head, offset, yaw_inv: Quat::from_rotation_y(-yaw), lights: &lights, reaches: &every, ambient: &ambient, exposure };
+            let at = Surroundings { head, offset, yaw_inv: Quat::from_rotation_y(-yaw), lights: &lights, reaches: &every, ambient: &ambient, exposure, room: None };
             let mut set = BurstSet::default();
             let mut frames = Vec::new();
             for (k, time) in times.iter().enumerate() {
