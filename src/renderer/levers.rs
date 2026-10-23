@@ -245,6 +245,13 @@ pub struct Levers {
     pub ground_buffers: bool,
 
     pub brush_buffers: bool,
+    /// The brushes' material arrays uploaded as ASTC encoded ahead
+    /// (`bin/brush_astc`, `BrushMaterials::from_astc`) where every material
+    /// in the level has an encoding of the images it loaded: a quarter of
+    /// the memory and no mips built at load. Without them, or on a GPU with
+    /// no ASTC, the images are uploaded as before; off always uploads them.
+    /// Read when a level's materials load.
+    pub brush_astc: bool,
 
     pub cave_chunk_cull: bool,
 
@@ -396,6 +403,7 @@ impl Default for Levers {
             water_runs: true,
             ground_buffers: true,
             brush_buffers: true,
+            brush_astc: true,
             cave_chunk_cull: false,
             ground_lod: true,
             ground_lod_strict: true,
@@ -655,6 +663,7 @@ impl Levers {
             ("water_runs", self.water_runs, d.water_runs),
             ("ground_buffers", self.ground_buffers, d.ground_buffers),
             ("brush_buffers", self.brush_buffers, d.brush_buffers),
+            ("brush_astc", self.brush_astc, d.brush_astc),
             ("cave_chunk_cull", self.cave_chunk_cull, d.cave_chunk_cull),
             ("ground_lod", self.ground_lod, d.ground_lod),
             ("ground_lod_strict", self.ground_lod_strict, d.ground_lod_strict),

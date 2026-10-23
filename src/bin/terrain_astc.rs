@@ -15,13 +15,10 @@
 //! unless `--force`. Dev tooling: the game ships the `.ssastc` files, and
 //! nothing on the headset needs `astcenc`.
 
-use space_soup::renderer::terrain_pipeline::{astc_path, filled_layers, layer_mips, load_terrain_ao, load_terrain_layers, load_terrain_normals, load_terrain_rough, AstcArray, LayerMap};
+use space_soup::renderer::terrain_pipeline::{astc_path, astcenc_level, filled_layers, layer_mips, load_terrain_ao, load_terrain_layers, load_terrain_normals, load_terrain_rough, AstcArray, LayerMap, ASTC_BLOCK};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-const BLOCK: [u8; 2] = [4, 4];
-/// astcenc's .astc files start with a 16-byte header before the blocks.
-const ASTC_HEADER: usize = 16;
+const BLOCK: [u8; 2] = ASTC_BLOCK;
 
 fn newest_source(set: &Path) -> Option<std::time::SystemTime> {
     std::fs::read_dir(set)
@@ -35,31 +32,6 @@ fn newest_source(set: &Path) -> Option<std::time::SystemTime> {
 fn stale(set: &Path) -> bool {
     let Some(source) = newest_source(set) else { return true };
     LayerMap::ALL.iter().any(|m| std::fs::metadata(astc_path(set, *m)).and_then(|m| m.modified()).map_or(true, |t| t < source))
-}
-
-fn encode_level(astcenc: &Path, quality: &str, srgb: bool, rgba: &[u8], w: u32, h: u32, scratch: &Path) -> Result<Vec<u8>, String> {
-    let png = scratch.join("level.png");
-    let out = scratch.join("level.astc");
-    image::save_buffer(&png, rgba, w, h, image::ExtendedColorType::Rgba8).map_err(|e| format!("write {}: {e}", png.display()))?;
-    let status = Command::new(astcenc)
-        .arg(if srgb { "-cs" } else { "-cl" })
-        .arg(&png)
-        .arg(&out)
-        .arg(format!("{}x{}", BLOCK[0], BLOCK[1]))
-        .arg(format!("-{quality}"))
-        .arg("-silent")
-        .status()
-        .map_err(|e| format!("run {}: {e}", astcenc.display()))?;
-    if !status.success() {
-        return Err(format!("astcenc failed on a {w}x{h} level ({status})"));
-    }
-    let bytes = std::fs::read(&out).map_err(|e| format!("read {}: {e}", out.display()))?;
-    let blocks = bytes.get(ASTC_HEADER..).ok_or("astcenc wrote no blocks")?.to_vec();
-    let want = AstcArray::level_bytes(BLOCK, w, h, 0);
-    if blocks.len() != want {
-        return Err(format!("a {w}x{h} level came out {} bytes, not {want}", blocks.len()));
-    }
-    Ok(blocks)
 }
 
 fn encode_set(set: &Path, astcenc: &Path, quality: &str) -> Result<(), String> {
@@ -83,7 +55,7 @@ fn encode_set(set: &Path, astcenc: &Path, quality: &str) -> Result<(), String> {
         for slot in 0..4 {
             let chain = layer_mips(map, slot, &filled, &normals, &rough, &ao);
             levels = chain.len() as u32;
-            data.push(chain.iter().map(|(rgba, lw, lh)| encode_level(astcenc, quality, map.srgb(), rgba, *lw, *lh, &scratch)).collect::<Result<Vec<_>, _>>()?);
+            data.push(chain.iter().map(|(rgba, lw, lh)| astcenc_level(astcenc, quality, map.srgb(), rgba, *lw, *lh, &scratch)).collect::<Result<Vec<_>, _>>()?);
         }
         let array = AstcArray { block: BLOCK, srgb: map.srgb(), width: w, height: h, levels, data };
         let bytes = array.to_bytes();

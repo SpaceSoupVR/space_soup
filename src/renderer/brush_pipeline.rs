@@ -356,6 +356,75 @@ pub fn material_uv_scales(colours: &[Option<TerrainImage>]) -> [[f32; 4]; MAX_BR
     out
 }
 
+/// One of the four maps a brush material binds, in the bind group's order.
+/// Its name is the source file's stem in a material's folder
+/// (`materials/<id>/color.jpg`) and the encoded file's (`bin/brush_astc`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrushMap {
+    Colour,
+    Normal,
+    Rough,
+    Ao,
+}
+
+impl BrushMap {
+    pub const ALL: [Self; 4] = [Self::Colour, Self::Normal, Self::Rough, Self::Ao];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Colour => "color",
+            Self::Normal => "normal",
+            Self::Rough => "rough",
+            Self::Ao => "ao",
+        }
+    }
+
+    /// Colour is stored in sRGB; everything else is data.
+    pub fn srgb(self) -> bool {
+        self == Self::Colour
+    }
+
+    /// What a material with no map of this kind holds: white, a flat normal,
+    /// the default roughness, no occlusion.
+    pub fn fallback(self) -> [u8; 3] {
+        match self {
+            Self::Colour | Self::Ao => [255, 255, 255],
+            Self::Normal => [128, 128, 255],
+            Self::Rough => [DEFAULT_ROUGHNESS; 3],
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Colour => "brush_colour_array",
+            Self::Normal => "brush_normal_array",
+            Self::Rough => "brush_rough_array",
+            Self::Ao => "brush_ao_array",
+        }
+    }
+}
+
+/// The size every layer of a scene's material arrays has: its first colour
+/// map's. The others are resampled to it.
+pub fn brush_array_size(colours: &[Option<TerrainImage>]) -> (u32, u32) {
+    colours.iter().flatten().map(|i| (i.width, i.height)).next().unwrap_or((1, 1))
+}
+
+/// Every mip of one material's map as its array layer holds it at `w`x`h`:
+/// the map fitted to that size (resampled, or the map's fallback where the
+/// material has none), then filtered -- sRGB-correct for colour, roughness
+/// widened by its normal map's variance. The one filtering both the RGBA
+/// upload and the ASTC encoder (`bin/brush_astc`) use, so an encoded
+/// material is that upload, compressed. `normal` is read for roughness only.
+pub fn brush_layer_mips(map: BrushMap, image: Option<&TerrainImage>, normal: Option<&TerrainImage>, w: u32, h: u32) -> Vec<TerrainImage> {
+    let fit = |img: &TerrainImage| if img.width == w && img.height == h { img.clone() } else { resample(img, w, h) };
+    let filled = image.map(fit).unwrap_or_else(|| solid_image(map.fallback(), w, h));
+    match map {
+        BrushMap::Rough => roughness_chain_with_normal_variance(&filled, normal.map(fit).as_ref()),
+        _ => mip_chain(&filled, map.srgb()),
+    }
+}
+
 impl BrushMaterials {
 
     pub fn new(
@@ -367,47 +436,26 @@ impl BrushMaterials {
         roughs: &[Option<TerrainImage>],
         aos: &[Option<TerrainImage>],
     ) -> Self {
+        let (w, h) = brush_array_size(colours);
+        let textures = BrushMap::ALL.map(|map| {
+            let images = match map {
+                BrushMap::Colour => colours,
+                BrushMap::Normal => normals,
+                BrushMap::Rough => roughs,
+                BrushMap::Ao => aos,
+            };
+            Self::array_texture(device, queue, map, images, normals, w, h)
+        });
+        Self::with_arrays(device, layout, &textures, colours, roughs)
+    }
 
-        let (w, h) = colours
-            .iter()
-            .flatten()
-            .map(|i| (i.width, i.height))
-            .next()
-            .unwrap_or((1, 1));
-
-        let colour_tex = Self::array_texture(
-            device,
-            queue,
-            "brush_colour_array",
-            TextureFormat::Rgba8UnormSrgb,
-            colours,
-            [255, 255, 255],
-            w,
-            h,
-            None,
-        );
-
-        let normal_tex = Self::array_texture(
-            device,
-            queue,
-            "brush_normal_array",
-            TextureFormat::Rgba8Unorm,
-            normals,
-            [128, 128, 255],
-            w,
-            h,
-            None,
-        );
-
-        let rough_tex = Self::array_texture(
-            device, queue, "brush_rough_array", TextureFormat::Rgba8Unorm,
-            roughs, [DEFAULT_ROUGHNESS, DEFAULT_ROUGHNESS, DEFAULT_ROUGHNESS], w, h,
-            Some(normals),
-        );
-        let ao_tex = Self::array_texture(
-            device, queue, "brush_ao_array", TextureFormat::Rgba8Unorm,
-            aos, [255, 255, 255], w, h, None,
-        );
+    /// The bind group over finished arrays (colour, normal, roughness,
+    /// occlusion), from images ([`Self::new`]) or encoded blocks
+    /// (`brush_astc::BrushMaterials::from_astc`). `colours` and `roughs` are
+    /// the images either way: each material's tiling aspect and whether any
+    /// is polished enough to reflect are read from them.
+    pub(crate) fn with_arrays(device: &Device, layout: &BindGroupLayout, textures: &[Texture; 4], colours: &[Option<TerrainImage>], roughs: &[Option<TerrainImage>]) -> Self {
+        let [colour_tex, normal_tex, rough_tex, ao_tex] = textures;
 
         let sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("brush_sampler"),
@@ -503,58 +551,25 @@ impl BrushMaterials {
         Self::new(device, queue, layout, &[], &[], &[], &[])
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn array_texture(
+    /// One map's array, every layer's mips made by [`brush_layer_mips`].
+    /// `normals` widen the roughness map's mips.
+    pub(crate) fn array_texture(
         device: &Device,
         queue: &Queue,
-        label: &str,
-        format: TextureFormat,
+        map: BrushMap,
         images: &[Option<TerrainImage>],
-        fallback: [u8; 3],
+        normals: &[Option<TerrainImage>],
         w: u32,
         h: u32,
-
-        normals_for_variance: Option<&[Option<TerrainImage>]>,
     ) -> Texture {
-        let filled: Vec<TerrainImage> = (0..MAX_BRUSH_MATERIALS)
-            .map(|i| match images.get(i).and_then(|x| x.as_ref()) {
-                Some(img) if img.width == w && img.height == h => TerrainImage {
-                    width: img.width,
-                    height: img.height,
-                    rgba: img.rgba.clone(),
-                },
-                Some(img) => resample(img, w, h),
-                None => solid_image(fallback, w, h),
-            })
+        let chains: Vec<Vec<TerrainImage>> = (0..MAX_BRUSH_MATERIALS)
+            .map(|i| brush_layer_mips(map, images.get(i).and_then(|x| x.as_ref()), normals.get(i).and_then(|x| x.as_ref()), w, h))
             .collect();
-
-        let chains: Vec<Vec<TerrainImage>> = match normals_for_variance {
-            None => filled.iter().map(|img| mip_chain(img, format.is_srgb())).collect(),
-            Some(normals) => {
-
-                let normals_filled: Vec<Option<TerrainImage>> = (0..MAX_BRUSH_MATERIALS)
-                    .map(|i| match normals.get(i).and_then(|x| x.as_ref()) {
-                        Some(img) if img.width == w && img.height == h => Some(TerrainImage {
-                            width: img.width,
-                            height: img.height,
-                            rgba: img.rgba.clone(),
-                        }),
-                        Some(img) => Some(resample(img, w, h)),
-
-                        None => None,
-                    })
-                    .collect();
-                filled
-                    .iter()
-                    .zip(normals_filled.iter())
-                    .map(|(r, n)| roughness_chain_with_normal_variance(r, n.as_ref()))
-                    .collect()
-            }
-        };
         let mip_level_count = chains.first().map(|c| c.len() as u32).unwrap_or(1);
+        let format = if map.srgb() { TextureFormat::Rgba8UnormSrgb } else { TextureFormat::Rgba8Unorm };
 
         let tex = device.create_texture(&TextureDescriptor {
-            label: Some(label),
+            label: Some(map.label()),
             size: Extent3d {
                 width: w,
                 height: h,

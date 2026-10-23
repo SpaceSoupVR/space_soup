@@ -1,3 +1,4 @@
+pub mod brush_astc;
 pub mod brush_pipeline;
 pub mod camera;
 pub mod character_cards;

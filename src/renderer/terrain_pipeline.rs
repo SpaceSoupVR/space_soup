@@ -3668,7 +3668,7 @@ impl AstcArray {
         Ok(Self { block, srgb: head[10] != 0, width, height, levels, data })
     }
 
-    fn format(&self) -> Option<TextureFormat> {
+    pub fn format(&self) -> Option<TextureFormat> {
         let block = match self.block {
             [4, 4] => AstcBlock::B4x4,
             [5, 5] => AstcBlock::B5x5,
@@ -3678,6 +3678,41 @@ impl AstcArray {
         };
         Some(TextureFormat::Astc { block, channel: if self.srgb { AstcChannel::UnormSrgb } else { AstcChannel::Unorm } })
     }
+}
+
+/// The block every encoder here writes: 4x4, the finest ASTC has, so
+/// normals keep their detail.
+pub const ASTC_BLOCK: [u8; 2] = [4, 4];
+
+/// One level of one layer encoded by ARM's `astcenc` in [`ASTC_BLOCK`]s:
+/// colour as sRGB, the rest linear. Dev tooling for the encoders
+/// (`bin/terrain_astc`, `bin/brush_astc`); nothing on the headset runs it.
+/// `scratch` is a folder for its image in and blocks out.
+pub fn astcenc_level(astcenc: &std::path::Path, quality: &str, srgb: bool, rgba: &[u8], w: u32, h: u32, scratch: &std::path::Path) -> Result<Vec<u8>, String> {
+    // astcenc's .astc files start with a 16-byte header before the blocks.
+    const ASTC_HEADER: usize = 16;
+    let png = scratch.join("level.png");
+    let out = scratch.join("level.astc");
+    ::image::save_buffer(&png, rgba, w, h, ::image::ExtendedColorType::Rgba8).map_err(|e| format!("write {}: {e}", png.display()))?;
+    let status = std::process::Command::new(astcenc)
+        .arg(if srgb { "-cs" } else { "-cl" })
+        .arg(&png)
+        .arg(&out)
+        .arg(format!("{}x{}", ASTC_BLOCK[0], ASTC_BLOCK[1]))
+        .arg(format!("-{quality}"))
+        .arg("-silent")
+        .status()
+        .map_err(|e| format!("run {}: {e}", astcenc.display()))?;
+    if !status.success() {
+        return Err(format!("astcenc failed on a {w}x{h} level ({status})"));
+    }
+    let bytes = std::fs::read(&out).map_err(|e| format!("read {}: {e}", out.display()))?;
+    let blocks = bytes.get(ASTC_HEADER..).ok_or("astcenc wrote no blocks")?.to_vec();
+    let want = AstcArray::level_bytes(ASTC_BLOCK, w, h, 0);
+    if blocks.len() != want {
+        return Err(format!("a {w}x{h} level came out {} bytes, not {want}", blocks.len()));
+    }
+    Ok(blocks)
 }
 
 fn array_view(texture: &Texture) -> TextureView {

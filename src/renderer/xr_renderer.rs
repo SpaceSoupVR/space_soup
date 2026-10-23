@@ -3226,6 +3226,43 @@ impl XrRenderer {
         );
     }
 
+    /// THE BRUSHES' MATERIALS from the game's material library, with the
+    /// images loaded from it: `ids` in layer order, each `materials_dir/<id>`.
+    /// As [`Self::set_brush_materials`], except that where the `brush_astc`
+    /// lever is on, the GPU reads ASTC and every material has an encoding
+    /// of these very images at this array's size (`bin/brush_astc`), those
+    /// blocks are uploaded instead: a quarter of the memory, and no mips
+    /// built here. One log line says which, and why not. Returns whether
+    /// they were.
+    pub fn set_brush_materials_from(
+        &mut self,
+        materials_dir: &std::path::Path,
+        ids: &[String],
+        colours: &[crate::renderer::terrain_pipeline::TerrainImage],
+        normals: &[Option<crate::renderer::terrain_pipeline::TerrainImage>],
+        roughs: &[Option<crate::renderer::terrain_pipeline::TerrainImage>],
+        aos: &[Option<crate::renderer::terrain_pipeline::TerrainImage>],
+    ) -> bool {
+        let refused = if !self.levers.brush_astc {
+            "the brush_astc lever is off".to_string()
+        } else {
+            let folders: Vec<_> = ids.iter().map(|id| Some(materials_dir.join(id))).collect();
+            let colours: Vec<_> = colours.iter().cloned().map(Some).collect();
+            match crate::renderer::brush_pipeline::BrushMaterials::from_astc(&self.wgpu_device, &self.wgpu_queue, &self.brush_pipeline.material_layout, &folders, &colours, normals, roughs, aos) {
+                Ok(materials) => {
+                    let (w, h) = crate::renderer::brush_pipeline::brush_array_size(&colours);
+                    log::info!("brush materials [{}]: ASTC at {w}x{h}", ids.join(", "));
+                    self.brush_materials = materials;
+                    return true;
+                }
+                Err(why) => why,
+            }
+        };
+        log::info!("brush materials [{}]: RGBA ({refused})", ids.join(", "));
+        self.set_brush_materials(colours, normals, roughs, aos);
+        false
+    }
+
     pub fn set_terrain_layers(
         &mut self,
         layers: Vec<Option<crate::renderer::terrain_pipeline::TerrainImage>>,
