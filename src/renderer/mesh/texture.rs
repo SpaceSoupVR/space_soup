@@ -22,7 +22,11 @@ pub(crate) fn load_primitive_texture(
     // images; the RGBA upload, with its mips built here, otherwise.
     let dir = MODEL_ASTC.with(|d| d.borrow().clone());
     let upload = |map: ModelMap, label: &str, px: &(Vec<u8>, u32, u32)| {
-        dir.as_deref().and_then(|d| astc_texture(device, queue, label, &model_astc_path(d, material.index(), map), px)).unwrap_or_else(|| upload_mipped(device, queue, label, px))
+        let astc = dir.as_deref().and_then(|d| astc_texture(device, queue, label, &model_astc_path(d, material.index(), map), px));
+        if px.1 * px.2 > 1 {
+            MODEL_ASTC_COUNT.with(|c| c.set((c.get().0 + astc.is_some() as u32, c.get().1 + 1)));
+        }
+        astc.unwrap_or_else(|| upload_mipped(device, queue, label, px))
     };
     let base_tex = upload(ModelMap::Base, "gltf_base_color", &base);
     let emissive_tex = upload(ModelMap::Emissive, "gltf_emissive", &emissive);
@@ -148,20 +152,27 @@ pub fn model_mips(px: &(Vec<u8>, u32, u32)) -> Vec<crate::renderer::terrain_pipe
 thread_local! {
     /// The `.astc` folder of the model this thread is loading (`model_astc_scope`).
     static MODEL_ASTC: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// The scope's maps of more than one texel: (uploaded as ASTC, all).
+    static MODEL_ASTC_COUNT: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// While it lives, the materials this thread loads look for their
 /// encodings beside `glb` (`model_astc_dir`).
-pub struct ModelAstcScope(Option<std::path::PathBuf>);
+pub struct ModelAstcScope(Option<std::path::PathBuf>, (u32, u32), std::path::PathBuf);
 
 pub fn model_astc_scope(glb: &std::path::Path) -> ModelAstcScope {
-    ModelAstcScope(MODEL_ASTC.with(|d| d.replace(Some(model_astc_dir(glb)))))
+    let counts = MODEL_ASTC_COUNT.with(|c| c.replace((0, 0)));
+    ModelAstcScope(MODEL_ASTC.with(|d| d.replace(Some(model_astc_dir(glb)))), counts, glb.to_path_buf())
 }
 
 impl Drop for ModelAstcScope {
     fn drop(&mut self) {
         let was = self.0.take();
         MODEL_ASTC.with(|d| *d.borrow_mut() = was);
+        let (astc, all) = MODEL_ASTC_COUNT.with(|c| c.replace(self.1));
+        if all > 0 {
+            log::info!("model ASTC {}: {astc} of {all} map(s) as ASTC", self.2.file_name().unwrap_or_default().to_string_lossy());
+        }
     }
 }
 
