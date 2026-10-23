@@ -123,6 +123,12 @@ pub struct Levers {
     /// pixels: by construction no switch is visible (part 1, model LODs).
     pub model_lods: bool,
     pub model_lod_pixels: f32,
+    /// Dynamic resolution: the eye drawn at a share of its targets, down a
+    /// step after three frames over 90% of the frame, up after 60 under 75%,
+    /// never under `dynres_min` (`dynamic_resolution`; part 2, item 4). Off
+    /// by default: A/B before turning on.
+    pub dynres: bool,
+    pub dynres_min: f32,
 
     pub effects: bool,
 
@@ -332,6 +338,8 @@ impl Default for Levers {
             frame_governor: false,
             model_lods: true,
             model_lod_pixels: 0.5,
+            dynres: false,
+            dynres_min: 0.75,
             effects: true,
             muzzle_test: true,
             mud_test: false,
@@ -523,6 +531,7 @@ impl Levers {
         flag("smooth_ground", self.smooth_ground, d.smooth_ground);
         flag("frame_governor", self.frame_governor, d.frame_governor);
         flag("model_lods", self.model_lods, d.model_lods);
+        flag("dynres", self.dynres, d.dynres);
         flag("effects", self.effects, d.effects);
         flag("muzzle_test", self.muzzle_test, d.muzzle_test);
         flag("mud_test", self.mud_test, d.mud_test);
@@ -574,6 +583,9 @@ impl Levers {
         }
         if self.thin_parts != d.thin_parts {
             out.push(format!("thin_parts={}", self.thin_parts));
+        }
+        if self.dynres_min != d.dynres_min {
+            out.push(format!("dynres_min={}", self.dynres_min));
         }
         if self.model_lod_pixels != d.model_lod_pixels {
             out.push(format!("model_lod_pixels={}", self.model_lod_pixels));

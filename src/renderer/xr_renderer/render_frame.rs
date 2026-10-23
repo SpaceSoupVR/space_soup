@@ -206,6 +206,26 @@ impl XrRenderer {
         }
 
         let foveation = self.frame_levers().foveation;
+        // DYNAMIC RESOLUTION (`dynamic_resolution`): this frame's share of the
+        // eye targets, from the GPU time against the app's frame period.
+        let dyn_scale = if self.levers.dynres {
+            let now = std::time::Instant::now();
+            let dt = self.dynres_tick.replace(now).map_or(0.0, |t| now.duration_since(t).as_secs_f32().min(0.25));
+            let gpu_ms = self.perf_metrics.as_ref().and_then(|m| m.value("app/gpu_frametime")).map(|v| v as f32);
+            let hz = if self.space_warp_running() && self.display_hz > 60.0 { self.display_hz / 2.0 } else { self.display_hz };
+            let was = self.frame_scale;
+            let scale = self.dynres.step(gpu_ms, (1000.0 / hz) as f32, dt, self.levers.dynres_min);
+            if scale != was {
+                log::info!("DYNRES scale {scale:.2} (gpu {:.1} ms in a {:.1} ms frame)", gpu_ms.unwrap_or(0.0), 1000.0 / hz);
+            }
+            scale
+        } else {
+            self.dynres.reset();
+            1.0
+        };
+        self.frame_scale = dyn_scale;
+        let fold = crate::renderer::dynamic_resolution::fold(dyn_scale);
+        let scaled = |w: u32, h: u32| crate::renderer::dynamic_resolution::rect(w, h, dyn_scale);
         self.apply_foveation(foveation);
 
         let tracked_poses: Option<Vec<xr::Posef>> = located.then(|| eye_views.iter().map(|v| v.pose).collect());
@@ -795,7 +815,7 @@ impl XrRenderer {
         self.mesh_lods.poll(&self.wgpu_device);
         let pixels_per_radian = {
             let f = eye_views[0].fov;
-            self.width.max(1) as f32 / (f.angle_right.tan() - f.angle_left.tan()).max(1e-3)
+            dyn_scale * self.width.max(1) as f32 / (f.angle_right.tan() - f.angle_left.tan()).max(1e-3)
         };
         let lod_on = self.levers.model_lods;
         let lod_pixels = self.levers.model_lod_pixels;
@@ -2139,8 +2159,8 @@ impl XrRenderer {
 
                 let e = eye_views[eye.min(eye_views.len() - 1)].pose.position;
                 let reflect = [
-                    self.width as f32 / sw.size.0.max(1) as f32,
-                    self.height as f32 / sw.size.1.max(1) as f32,
+                    dyn_scale * self.width as f32 / sw.size.0.max(1) as f32,
+                    dyn_scale * self.height as f32 / sw.size.1.max(1) as f32,
                     if warp_reflections { 1.0 } else { 0.0 },
                     if dbg & 32768 != 0 { 1.0 } else { 0.0 },
                 ];
@@ -2179,7 +2199,7 @@ impl XrRenderer {
                 let world_plane = mirror::world_plane_equation(m.position, m.normal());
                 let eye_plane = mirror::plane_to_eye_space(mirror_view.inverse(), world_plane);
                 let mirror_proj = mirror::oblique_near_clip(proj, eye_plane);
-                let mirror_view_proj = Camera::gl_to_wgpu_ndc(mirror_proj) * mirror_view;
+                let mirror_view_proj = fold * Camera::gl_to_wgpu_ndc(mirror_proj) * mirror_view;
 
                 let mirror_eye = mirror_view.inverse().transform_point3(glam::Vec3::ZERO);
                 self.uniform_buf.upload_scene(
@@ -2218,6 +2238,7 @@ impl XrRenderer {
                         }),
                         ..Default::default()
                     });
+                    if dyn_scale < 1.0 { let (w, h) = scaled(self.width, self.height); pass.set_scissor_rect(0, 0, w, h); }
 
                     if solid_any {
                         pass.set_pipeline(&self.mirror_solid_pipeline.pipeline);
@@ -2325,6 +2346,7 @@ impl XrRenderer {
                 let body = &self.water_bodies[b];
                 let surface = body.uniform.extinction[3] - self.player.offset.y;
                 let (mirror_vp, mirror_eye) = crate::renderer::planar_water::mirror_camera(view, proj, surface);
+                let mirror_vp = fold * mirror_vp;
                 let planar_post = crate::renderer::uniforms::PostUpload {
                     exposure: post.exposure * crate::renderer::planar_water::HEADROOM,
                     tonemap: crate::renderer::tonemap::ToneMapping::None,
@@ -2356,7 +2378,7 @@ impl XrRenderer {
                 let floor_view = view
                     * mirror::reflection_matrix(glam::Vec3::new(0.0, probe_pass::FLOOR_MIRROR_PLANE, 0.0), glam::Vec3::Y);
                 let floor_proj = Camera::xr_projection(ev.fov, probe_pass::EYE_NEAR, probe_pass::EYE_FAR);
-                let floor_view_proj = Camera::gl_to_wgpu_ndc(floor_proj) * floor_view;
+                let floor_view_proj = fold * Camera::gl_to_wgpu_ndc(floor_proj) * floor_view;
                 let floor_eye = floor_view.inverse().transform_point3(glam::Vec3::ZERO);
 
                 let floor_post = crate::renderer::uniforms::PostUpload {
@@ -2377,12 +2399,12 @@ impl XrRenderer {
                 );
             }
 
-            let eye_view_proj = Camera::gl_to_wgpu_ndc(proj) * view;
+            let eye_view_proj = fold * Camera::gl_to_wgpu_ndc(proj) * view;
             let cam_pos = glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
 
             let both_view_proj: [glam::Mat4; 2] = std::array::from_fn(|i| {
                 let v = &eye_views[i];
-                Camera::gl_to_wgpu_ndc(Camera::xr_projection(v.fov, 0.03, 1000.0))
+                fold * Camera::gl_to_wgpu_ndc(Camera::xr_projection(v.fov, 0.03, 1000.0))
                     * Camera::xr_view(v.pose)
             });
             let both_cam_pos: [glam::Vec3; 2] = std::array::from_fn(|i| {
@@ -2709,6 +2731,8 @@ impl XrRenderer {
                     use crate::renderer::planar_water;
                     let target = &self.planar_targets[eye];
                     let planes = [crate::renderer::shadow::frustum_planes(mirror_vp)];
+                    let s = dyn_scale;
+                    let rect = [s * rect[0] + s - 1.0, s * rect[1] + 1.0 - s, s * rect[2] + s - 1.0, s * rect[3] + 1.0 - s];
                     let (sx, sy, sw, sh) = planar_water::scissor(rect, self.planar_size.0, self.planar_size.1);
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("planar_water"),
@@ -2858,6 +2882,7 @@ impl XrRenderer {
                             timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(12 + eye)),
                             ..Default::default()
                         });
+                        if dyn_scale < 1.0 { let (w, h) = scaled(target.width, target.height); pass.set_scissor_rect(0, 0, w, h); }
                         pass.set_pipeline(&self.floor_mirror_skinned.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.twin_bind_group, &[]);
                         for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in skinned_draws.iter().chain(mirror_only_skinned_draws.iter()) {
@@ -2926,6 +2951,7 @@ impl XrRenderer {
                             timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(8 + eye)),
                             ..Default::default()
                         });
+                        if dyn_scale < 1.0 { let (w, h) = scaled(t.width, t.height); pass.set_scissor_rect(0, 0, w, h); }
 
                         if let (Some(t), false, true) = (&self.cave_twins, stereo, self.levers.cave_occluder) {
                             let inside = |(lo, hi): &(glam::Vec3, glam::Vec3)| cam_pos.cmpge(*lo).all() && cam_pos.cmple(*hi).all();
@@ -3252,6 +3278,7 @@ impl XrRenderer {
                         timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(eye * 2)),
                         ..Default::default()
                     });
+                    if dyn_scale < 1.0 { let (w, h) = scaled(self.width, self.height); pass.set_scissor_rect(0, 0, w, h); }
 
                     if fx.half_viewport {
                         pass.set_viewport(0.0, 0.0, (self.width / 2) as f32, (self.height / 2) as f32, 0.0, 1.0);
@@ -4401,9 +4428,9 @@ impl XrRenderer {
                             .image_array_index(i as u32)
                             .image_rect(xr::Rect2Di {
                                 offset: xr::Offset2Di { x: 0, y: 0 },
-                                extent: xr::Extent2Di {
-                                    width: self.width as i32,
-                                    height: self.height as i32,
+                                extent: {
+                                    let (w, h) = crate::renderer::dynamic_resolution::rect(self.width, self.height, self.frame_scale);
+                                    xr::Extent2Di { width: w as i32, height: h as i32 }
                                 },
                             }),
                     );

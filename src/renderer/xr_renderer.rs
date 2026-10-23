@@ -28,9 +28,10 @@ struct FoveationState {
 
     probe_size: (u32, u32),
 
-    maps: HashMap<crate::renderer::foveation::FoveationLevel, [usize; 4]>,
+    maps: HashMap<(crate::renderer::foveation::FoveationLevel, u32), [usize; 4]>,
 
-    applied: Option<crate::renderer::foveation::FoveationLevel>,
+    /// The level and dynamic-resolution step the targets carry now.
+    applied: Option<(crate::renderer::foveation::FoveationLevel, u32)>,
 }
 
 struct SpaceWarpState {
@@ -645,6 +646,12 @@ pub struct XrRenderer {
 
     /// Model LODs, built off the render thread (`mesh_lod::LodCache`).
     mesh_lods: crate::renderer::mesh_lod::LodCache,
+
+    /// Dynamic resolution (`dynamic_resolution`): the controller, when it
+    /// last stepped, and the share of the eye targets this frame draws.
+    dynres: crate::renderer::dynamic_resolution::ScaleController,
+    dynres_tick: Option<std::time::Instant>,
+    frame_scale: f32,
     gpu_spike_logged: Option<std::time::Instant>,
 
     /// The compositor's display rate, Hz (`note_display_hz`).
@@ -1629,6 +1636,9 @@ impl XrRenderer {
             thermal: Default::default(),
             over_budget: 0,
             mesh_lods: Default::default(),
+            dynres: Default::default(),
+            dynres_tick: None,
+            frame_scale: 1.0,
             gpu_spike_logged: None,
             display_hz: 72.0,
             perf_log: None,
@@ -3342,30 +3352,32 @@ impl XrRenderer {
 impl XrRenderer {
 
     fn apply_foveation(&mut self, level: crate::renderer::foveation::FoveationLevel) {
-        use crate::renderer::foveation::{centre_of_view, density_pattern, FoveationLevel};
+        use crate::renderer::foveation::{centre_of_view, FoveationLevel};
+        let step = crate::renderer::dynamic_resolution::step_of(self.frame_scale);
+        let scale = self.frame_scale;
         let Some(state) = self.foveation.as_mut() else { return };
-        if state.applied == Some(level) {
+        if state.applied == Some((level, step)) {
             return;
         }
         let Some(fov) = self.last_fov else { return };
         let maps = if level == FoveationLevel::Off {
             None
         } else {
-            if !state.maps.contains_key(&level) {
+            if !state.maps.contains_key(&(level, step)) {
                 let centres: Vec<(f32, f32)> =
                     fov.iter().map(|f| centre_of_view(f.angle_left, f.angle_right, f.angle_up, f.angle_down)).collect();
                 let patterns: Vec<_> = [state.eye_size, state.probe_size]
                     .iter()
-                    .flat_map(|&(w, h)| centres.iter().map(move |&c| density_pattern(w, h, c, level)))
+                    .flat_map(|&(w, h)| centres.iter().map(move |&c| crate::renderer::foveation::density_pattern_scaled(w, h, c, level, scale)))
                     .collect();
 
                 match unsafe { vulkan_interop::add_foveation_maps(&self.wgpu_device, &patterns) } {
                     Some(ids) if ids.len() == 4 => {
-                        state.maps.insert(level, [ids[0], ids[1], ids[2], ids[3]]);
+                        state.maps.insert((level, step), [ids[0], ids[1], ids[2], ids[3]]);
                     }
                     _ => {
 
-                        state.applied = Some(level);
+                        state.applied = Some((level, step));
                         return;
                     }
                 }
@@ -3378,7 +3390,7 @@ impl XrRenderer {
                     .collect();
                 info!("foveation: {} maps {}x{} texels, centres {}", level.label(), patterns[0].0, patterns[0].1, centres.join(" "));
             }
-            state.maps.get(&level).copied()
+            state.maps.get(&(level, step)).copied()
         };
         for targets in &self.eye_targets {
             for (eye, target) in targets.iter().enumerate() {
@@ -3388,7 +3400,7 @@ impl XrRenderer {
         for (eye, target) in self.probe_pass_targets.iter().enumerate() {
             unsafe { vulkan_interop::set_foveation_target(&self.wgpu_device, &target.color_view, maps.map(|m| m[2 + eye])) };
         }
-        state.applied = Some(level);
-        info!("foveation: {}", level.label());
+        state.applied = Some((level, step));
+        info!("foveation: {} at scale {scale:.2}", level.label());
     }
 }
