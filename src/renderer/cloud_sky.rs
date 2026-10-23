@@ -1378,6 +1378,7 @@ pub fn cloud_sky_shader() -> String {
     let f = |v: f32| format!("{v:?}");
     let means = CloudNoise::shared().channel_means();
     let steps = |s: [u32; 3]| format!("vec3<u32>({}u, {}u, {}u)", s[0], s[1], s[2]);
+    let mie = c::mie_phase_fit(c::CLOUD_DROPLET_UM);
     CLOUD_SKY_WGSL
         .replace("{EARTH}", &format!("{:.1}", c::EARTH_RADIUS_M))
         .replace("{DETAIL_RATIO}", &f(cl::DETAIL_RATIO))
@@ -1426,9 +1427,13 @@ pub fn cloud_sky_shader() -> String {
         .replace("{GLOW_G}", &f(c::CLOUD_GLOW[1]))
         .replace("{GLOW_DECAY}", &f(c::CLOUD_GLOW[2]))
         .replace("{GLOW_NEAR}", &f(c::CLOUD_GLOW_NEAR))
-        .replace("{FORWARD_G}", &f(c::PHASE_FORWARD_G))
-        .replace("{BACK_G}", &f(c::PHASE_BACK_G))
-        .replace("{BACK_SHARE}", &f(c::PHASE_BACK_SHARE))
+        .replace("{GLOW_SLAB}", &f(c::CLOUD_GLOW_SLAB))
+        .replace("{GLOW_BACK}", &f(c::CLOUD_GLOW_BACK[0]))
+        .replace("{GLOW_BACK_G}", &f(c::CLOUD_GLOW_BACK[1]))
+        .replace("{MIE_HG_G}", &f(mie[0]))
+        .replace("{MIE_D_G}", &f(mie[1]))
+        .replace("{MIE_D_ALPHA}", &f(mie[2]))
+        .replace("{MIE_D_W}", &f(mie[3]))
         .replace("{HAZE}", &format!("{:e}", c::HAZE_PER_M))
         .replace("{AEROSOL_HEIGHT}", &f(space_soup_sky::time_of_day::AEROSOL_HEIGHT_M))
         .replace("{AIR_HAZE}", &format!("{:e}", space_soup_sky::time_of_day::AIR_HAZE_PER_M))
@@ -1689,9 +1694,10 @@ const SUN_RADIUS: f32 = {SUN_RADIUS};
 const CIRRUS_STRETCH: f32 = {CIRRUS_STRETCH};
 const CIRRUS_IN_MAP: bool = false;
 const EXTINCTION: f32 = {EXTINCTION};
-const FORWARD_G: f32 = {FORWARD_G};
-const BACK_G: f32 = {BACK_G};
-const BACK_SHARE: f32 = {BACK_SHARE};
+const MIE_HG_G: f32 = {MIE_HG_G};
+const MIE_D_G: f32 = {MIE_D_G};
+const MIE_D_ALPHA: f32 = {MIE_D_ALPHA};
+const MIE_D_W: f32 = {MIE_D_W};
 const HAZE: f32 = {HAZE};
 const AEROSOL_HEIGHT: f32 = {AEROSOL_HEIGHT};
 const AIR_HAZE: f32 = {AIR_HAZE};
@@ -1716,6 +1722,9 @@ const GLOW_GAIN: f32 = {GLOW_GAIN};
 const GLOW_G: f32 = {GLOW_G};
 const GLOW_DECAY: f32 = {GLOW_DECAY};
 const GLOW_NEAR: f32 = {GLOW_NEAR};
+const GLOW_SLAB: f32 = {GLOW_SLAB};
+const GLOW_BACK: f32 = {GLOW_BACK};
+const GLOW_BACK_G: f32 = {GLOW_BACK_G};
 const LIGHT_EVERY: u32 = 2u;
 const PACK: f32 = {PACK};
 const KIND_CUMULUS: f32 = {KIND_CUMULUS};
@@ -2077,8 +2086,11 @@ fn hg(g: f32, c: f32) -> f32 {
     return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * c, 1e-6), 1.5));
 }
 
-fn phase(s: f32, c: f32) -> f32 {
-    return (1.0 - BACK_SHARE) * hg(FORWARD_G * s, c) + BACK_SHARE * hg(BACK_G * s, c);
+// Water droplets' single scattering: a diffraction lobe and a Draine lobe
+// (`clouds::mie_phase`, `CLOUD_DROPLET_UM`).
+fn phase(c: f32) -> f32 {
+    let draine = hg(MIE_D_G, c) * (1.0 + MIE_D_ALPHA * c * c) / (1.0 + MIE_D_ALPHA * (1.0 + 2.0 * MIE_D_G * MIE_D_G) / 3.0);
+    return (1.0 - MIE_D_W) * hg(MIE_HG_G, c) + MIE_D_W * draine;
 }
 
 // The light's optical depth from a point in layer k toward it: taps out
@@ -2091,6 +2103,9 @@ fn phase(s: f32, c: f32) -> f32 {
 // `light_tau` (a cumulus's first two taps; 0 for the two-tap layers): how
 // deep in its own lobe a sample sits, which the glow dims with (`GLOW_NEAR`).
 var<private> light_near: f32 = 0.0;
+// The glow's share of the last `in_scatter` (rgb), which the march sums
+// apart to dim by its column's depth (`GLOW_SLAB`).
+var<private> glow_out: vec3<f32> = vec3<f32>(0.0);
 fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {
     let l = u.light_dir.xyz;
     light_near = 0.0;
@@ -2127,11 +2142,13 @@ fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {
 fn in_scatter(k: u32, alt: f32, tau_l: f32, cv: f32, ph: f32, glow: f32, d: f32) -> vec3<f32> {
     let a = lv(k, 0u);
     let h = clamp((alt - a.x) / max(a.y - a.x, 1.0), 0.0, 1.0);
-    var lit = ph * exp(-tau_l) + glow * exp(-GLOW_DECAY * tau_l - GLOW_NEAR * light_near);
+    let gl = glow * exp(-GLOW_DECAY * tau_l - GLOW_NEAR * light_near);
     // Beer-powder, mild and only away from the sun: thin outer parts have
     // built up less scattered light.
     let powder = 1.0 - exp(-POWDER_K * (2.0 * tau_l + 40.0 * d));
-    lit = lit * mix(1.0, powder, POWDER_SHARE * (1.0 - cv));
+    let pw = mix(1.0, powder, POWDER_SHARE * (1.0 - cv));
+    let lit = (ph * exp(-tau_l) + gl) * pw;
+    glow_out = u.light.rgb * gl * pw;
     let amb = u.amb_sky.rgb * (0.45 + 0.55 * h) + u.amb_ground.rgb * (0.35 * (1.0 - h));
     return u.light.rgb * lit + amb;
 }
@@ -2214,8 +2231,8 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
     // (2026-10-20). One per map moves the sample planes as a whole, and the
     // accumulation below averages the planes' grain away.
     let jitter = hist.misc.z;
-    let ph = phase(1.0, cv);
-    let glow = GLOW_GAIN * hg(GLOW_G, cv);
+    let ph = phase(cv);
+    let glow = GLOW_GAIN * mix(hg(GLOW_G, cv), hg(GLOW_BACK_G, cv), GLOW_BACK);
     // The angle one texel spans: across (azimuth, narrowing up the sky)
     // or along (elevation, packed toward the horizon), whichever is wider.
     let v = pos.y / size.y;
@@ -2273,6 +2290,10 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
         // cloud and kept between (its depth changes over hundreds of metres,
         // a fine step is tens): a third of the map's cost was these taps.
         var lit_for = 0u;
+        // The glow this layer's samples sent and the depth they lay in
+        // (`GLOW_SLAB`).
+        var glow_k = vec3<f32>(0.0);
+        var tau_k = 0.0;
         var tau_kept = 0.0;
         var near_kept = 0.0;
         // The last empty sample: where a fine march into cloud came from;
@@ -2351,6 +2372,8 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
                 let ts = exp(-d * dt);
                 let w = trans * (1.0 - ts) * haze_through(t, mu);
                 rgb = rgb + w * s;
+                glow_k = glow_k + w * glow_out;
+                tau_k = tau_k + d * dt;
                 seen = seen + w;
                 height = height + w * p_alt;
                 wind = wind + w * lw;
@@ -2364,6 +2387,12 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
             }
             t = t + dt;
         }
+        // THE GLOW GOES WITH THE COLUMN'S DEPTH (`clouds::CLOUD_GLOW_SLAB`):
+        // a slab's reflectance over its opacity. A cloud's outline, a thin
+        // column, sent as much of it per unit opacity as its body and drew
+        // as a bright rim (user, at night, 2026-10-23).
+        let slab = GLOW_SLAB * tau_k / (2.0 + GLOW_SLAB * tau_k) / max(1.0 - exp(-tau_k), 1e-4);
+        rgb = rgb + (slab - 1.0) * glow_k;
     }
     // Cirrus: ice, a thin sheet, its light thrown forward. DRAWN BY THE SKY
     // SHADER, per pixel, at its own wind (`sky::sky_cirrus`, 2026-10-23):
@@ -2699,7 +2728,7 @@ pub(crate) mod tests {
             "map": { "width": MAP_WIDTH, "height": MAP_HEIGHT, "pack": MAP_PACK },
             "grid": { "origin": [-reach, l.base_m, -reach], "voxel": voxel, "dims": [nx, ny, nx] },
             "haze_per_m": space_soup_sky::clouds::HAZE_PER_M,
-            "phase": { "forward_g": space_soup_sky::clouds::PHASE_FORWARD_G, "back_g": space_soup_sky::clouds::PHASE_BACK_G, "back_share": space_soup_sky::clouds::PHASE_BACK_SHARE },
+            "phase": { "mie_diameter_um": space_soup_sky::clouds::CLOUD_DROPLET_UM, "peak_g_max": space_soup_sky::clouds::CLOUD_MIE_PEAK_G_MAX },
             "layer": { "index": k, "kind": l.kind, "coverage": l.coverage, "base_m": l.base_m, "top_m": l.top_m, "sigma": l.sigma },
         });
         std::fs::write(out.join("cloud.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
