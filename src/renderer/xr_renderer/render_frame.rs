@@ -613,7 +613,7 @@ impl XrRenderer {
                 {
                     use crate::renderer::cloud_sky::{HISTORY_REJECT, HISTORY_REJECT_WIDE};
                     let above = if self.levers.cloud_history_tight { HISTORY_REJECT } else { HISTORY_REJECT_WIDE };
-                    self.sky.set_cloud_history_reject(above, HISTORY_REJECT_WIDE);
+                    self.sky.set_cloud_history_reject(above, HISTORY_REJECT_WIDE, self.levers.cloud_history_tight);
                 }
                 self.sky.step_clouds(
                 &self.wgpu_device,

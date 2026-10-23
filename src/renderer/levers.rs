@@ -95,8 +95,9 @@ pub struct Levers {
     pub cloud_pace: bool,
     /// A cloud map's history let go where it and the new march disagree by
     /// 0.03 to 0.1 of the sky showing (`cloud_sky::HISTORY_REJECT`: no ghost
-    /// fringes at changing edges); off lets it go only at 0.2 to 0.5, as
-    /// before 2026-10-22.
+    /// fringes at changing edges), and where it differs by 15-35% of the
+    /// cloud there (`HISTORY_REJECT_SHARE`: no ghost rims in clear sky); off
+    /// lets it go only at 0.2 to 0.5, as before 2026-10-22.
     pub cloud_history_tight: bool,
     /// The reflection probes relit on the GPU at every frame's daylight
     /// (`ProbeStream::new_smooth`), not rebuilt on the CPU at 25% steps; off

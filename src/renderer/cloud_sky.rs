@@ -98,6 +98,18 @@ pub const HISTORY_REJECT_WIDE: [f32; 2] = [0.2, 0.5];
 /// between maps, so they leave no ghost to cut. Below `HISTORY_HORIZON_UP`
 /// .0 (the sine of the elevation) the wide pair holds, above .1 the tight.
 pub const HISTORY_HORIZON_UP: [f32; 2] = [0.06, 0.15];
+/// AND AS A SHARE OF THE CLOUD THERE: a ghost's soft rim over clear sky
+/// differs from the new march by under the tight pair (0.05 of the sky
+/// showing), so each older map left its cloud's outline in the clear sky,
+/// stacked like contour lines (headset video 2026-10-23 00:55). Taken over
+/// the more cloud of the two (at least `HISTORY_SHARE_FLOOR`), that rim
+/// differs by all of itself, while the grain inside a cloud (0.008 of 0.5)
+/// is under 2%. From the first share to the second the new march is taken
+/// alone; above the horizon only, as the tight pair. Faint rims (over 2% of
+/// cloud where a fresh map has none, `maps_accumulated_..._no_ghost_edges`)
+/// 6.9% -> 1.6% of the clear sky; grain and the horizon unchanged.
+pub const HISTORY_REJECT_SHARE: [f32; 2] = [0.15, 0.35];
+pub const HISTORY_SHARE_FLOOR: f32 = 0.02;
 /// The history is carried a second time by the altitude the old map holds
 /// (`hist_carry`), and that carry kept where the old map agrees with itself
 /// there to this share of the altitude.
@@ -323,6 +335,8 @@ pub struct CloudSky {
     /// Where history is let go above the horizon and at it (`HISTORY_REJECT`,
     /// `HISTORY_REJECT_WIDE`), or what `set_history_reject` gave.
     history_reject: [f32; 4],
+    /// `HISTORY_REJECT_SHARE` and its floor, or zeros (off).
+    history_share: [f32; 4],
     /// The winds the maps are carried on (`flow_winds`), and how many maps
     /// have been begun (the jitter's index).
     winds: [[f32; 4]; LAYERS],
@@ -702,7 +716,7 @@ impl CloudSky {
         let shadow_bind_group = Self::bind(device, &layout, &shadow_uniform, &noise_tex, &weather, &sampler, &envelope, &envelope_sampler);
         let history_uniform = device.create_buffer(&BufferDescriptor {
             label: Some("cloud_history_uniform"),
-            size: std::mem::size_of::<[[f32; 4]; 7]>() as u64,
+            size: std::mem::size_of::<[[f32; 4]; 8]>() as u64,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -799,6 +813,7 @@ impl CloudSky {
             history_uniform,
             history_groups,
             history_reject: [HISTORY_REJECT[0], HISTORY_REJECT[1], HISTORY_REJECT_WIDE[0], HISTORY_REJECT_WIDE[1]],
+            history_share: [HISTORY_REJECT_SHARE[0], HISTORY_REJECT_SHARE[1], HISTORY_SHARE_FLOOR, 1.0],
             winds: [[0.0; 4]; LAYERS],
             maps_begun: 0,
             prev: 0,
@@ -924,6 +939,12 @@ impl CloudSky {
     /// and at it (`HISTORY_HORIZON_UP`); taken as a map begins.
     pub fn set_history_reject(&mut self, above: [f32; 2], horizon: [f32; 2]) {
         self.history_reject = [above[0], above[1], horizon[0], horizon[1]];
+    }
+
+    /// Whether history is also let go by its share of the cloud
+    /// (`HISTORY_REJECT_SHARE`); taken as a map begins.
+    pub fn set_history_share(&mut self, on: bool) {
+        self.history_share = if on { [HISTORY_REJECT_SHARE[0], HISTORY_REJECT_SHARE[1], HISTORY_SHARE_FLOOR, 1.0] } else { [0.0; 4] };
     }
 
     /// Whether the next `encode_at` begins a map (and so takes its moment).
@@ -1065,7 +1086,7 @@ impl CloudSky {
             self.maps_begun = self.maps_begun.wrapping_add(1);
             let (et, eh) = (self.eyes[t], self.eyes[h]);
             let w = &self.winds;
-            let carried: [[f32; 4]; 7] = [
+            let carried: [[f32; 4]; 8] = [
                 [et[0] - eh[0], et[1] - eh[1], et[2] - eh[2], age as f32],
                 w[0],
                 w[1],
@@ -1073,6 +1094,7 @@ impl CloudSky {
                 w[3],
                 [if take { HISTORY_NEW } else { 1.0 }, self.scales[t] / self.scales[h], jitter, et[1]],
                 self.history_reject,
+                self.history_share,
             ];
             queue.write_buffer(&self.history_uniform, 0, bytemuck::cast_slice(&carried));
         }
@@ -1399,6 +1421,9 @@ struct History {
     // Where old and new disagree from (x) and to (y), the new march is
     // taken alone (`HISTORY_REJECT`); at the horizon from z to w.
     reject: vec4<f32>,
+    // And by the share of the cloud it differs by: from (x) to (y), over at
+    // least (z) of cloud; on (w).
+    share: vec4<f32>,
 }
 @group(1) @binding(0) var<uniform> hist: History;
 @group(1) @binding(1) var hist_light: texture_2d<f32>;
@@ -2126,8 +2151,12 @@ fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
             }
         }
         let old = hist_bspline(huv, size);
-        let reject = mix(hist.reject.zw, hist.reject.xy, smoothstep(HISTORY_HORIZON_UP0, HISTORY_HORIZON_UP1, dir.y));
-        let w = mix(hist.misc.x, 1.0, smoothstep(reject.x, reject.y, abs(old.a - light.a)));
+        let above = smoothstep(HISTORY_HORIZON_UP0, HISTORY_HORIZON_UP1, dir.y);
+        let reject = mix(hist.reject.zw, hist.reject.xy, above);
+        let apart = abs(old.a - light.a);
+        let cloud = max(1.0 - min(old.a, light.a), hist.share.z);
+        let let_go = max(smoothstep(reject.x, reject.y, apart), hist.share.w * above * smoothstep(hist.share.x, hist.share.y, apart / cloud));
+        let w = mix(hist.misc.x, 1.0, let_go);
         light = mix(vec4<f32>(old.rgb * hist.misc.y, old.a), light, w);
         alts = mix(old_alts, alts, w);
     }
@@ -2667,6 +2696,9 @@ pub(crate) mod tests {
         queue.submit(Some(enc.finish()));
         let want = alpha_of(&fresh, fresh.display()[1] as u32);
         let (mut off, mut n, mut ghosts, mut clear) = (0.0f64, 0u32, 0u32, 0u32);
+        // Faint: a rim the ghost count above does not see, as in the
+        // headset video (2026-10-23): over 2% of cloud where there is none.
+        let (mut faint, mut clearest) = (0u32, 0u32);
         for j in 0..MAP_HEIGHT {
             let up = map_dir([0.5, (j as f32 + 0.5) / MAP_HEIGHT as f32])[1];
             if !(0.035..0.85).contains(&up) {
@@ -2684,10 +2716,18 @@ pub(crate) mod tests {
                         ghosts += 1;
                     }
                 }
+                if want[k] > 0.995 {
+                    clearest += 1;
+                    if acc[k] < 0.98 {
+                        faint += 1;
+                    }
+                }
             }
         }
         let off = off / n.max(1) as f64;
         let ghost_share = ghosts as f64 / clear.max(1) as f64;
+        let faint_share = faint as f64 / clearest.max(1) as f64;
+        eprintln!("MOVING SKY faint rims: {faint} of {clearest} clear ({:.4}%)", 100.0 * faint_share);
         eprintln!("MOVING SKY after {frame} frames (moment {:.1} s on): alpha off by {off:.5} over {n} texels; ghosts {ghosts} of {clear} clear ({:.4}%)", moment - t0, 100.0 * ghost_share);
         if let Ok(dir) = std::env::var("GHOST_DUMP") {
             for (name, a) in [("acc", &acc), ("fresh", &want)] {
