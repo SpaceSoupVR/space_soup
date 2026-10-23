@@ -17,6 +17,23 @@ pub(crate) fn load_primitive_texture(
     layout: &wgpu::BindGroupLayout,
 ) -> LoadedTexture {
     let material = prim.material();
+    let (base, emissive) = material_images(&material, images);
+    // Encoded ahead (`bin/model_astc`) where the encoding is of these very
+    // images; the RGBA upload, with its mips built here, otherwise.
+    let dir = MODEL_ASTC.with(|d| d.borrow().clone());
+    let upload = |map: ModelMap, label: &str, px: &(Vec<u8>, u32, u32)| {
+        dir.as_deref().and_then(|d| astc_texture(device, queue, label, &model_astc_path(d, material.index(), map), px)).unwrap_or_else(|| upload_mipped(device, queue, label, px))
+    };
+    let base_tex = upload(ModelMap::Base, "gltf_base_color", &base);
+    let emissive_tex = upload(ModelMap::Emissive, "gltf_emissive", &emissive);
+    material_bind(device, layout, base_tex, emissive_tex)
+}
+
+/// A material's two maps as the mesh shaders read them, RGBA8 sRGB: the
+/// base colour (alpha forced opaque, cut for MASK, kept for BLEND) and the
+/// emissive mask with the roughness in its alpha. What `load_primitive_texture`
+/// uploads and `bin/model_astc` encodes.
+pub fn material_images(material: &gltf::Material, images: &[gltf::image::Data]) -> ((Vec<u8>, u32, u32), (Vec<u8>, u32, u32)) {
     let pbr = material.pbr_metallic_roughness();
 
     let transmission = material
@@ -68,8 +85,130 @@ pub(crate) fn load_primitive_texture(
 
         None => (vec![255u8, 255, 255, material_gloss_alpha(pbr.roughness_factor(), gltf_roughness())], 1, 1),
     };
+    (base, emissive)
+}
 
-    create_mesh_material_texture(device, queue, layout, &base, &emissive)
+/// The two maps of a model's material (`material_images`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelMap {
+    Base,
+    Emissive,
+}
+
+impl ModelMap {
+    pub const ALL: [ModelMap; 2] = [ModelMap::Base, ModelMap::Emissive];
+    pub fn name(self) -> &'static str {
+        match self {
+            ModelMap::Base => "base",
+            ModelMap::Emissive => "emissive",
+        }
+    }
+}
+
+/// MODELS' MAPS AS ASTC (2026-10-23): 8 bits a texel against 32, and no
+/// mips built on the headset, as the brushes' and the ground's are. A model
+/// `models/x.glb` keeps them in `models/x.astc/`, one file a material and
+/// map (`m<index>` or `default` for a primitive with none).
+pub fn model_astc_dir(glb: &std::path::Path) -> std::path::PathBuf {
+    glb.with_extension("astc")
+}
+
+pub fn model_astc_path(dir: &std::path::Path, material: Option<usize>, map: ModelMap) -> std::path::PathBuf {
+    let m = material.map_or_else(|| "default".to_string(), |i| format!("m{i}"));
+    dir.join(format!("{m}_{}.ssastc", map.name()))
+}
+
+/// Bump when `material_images` or `upload_mipped`'s mips change: every
+/// encoding made before then is stale.
+const MODEL_FILTER_VERSION: u64 = 1;
+
+/// What one map is made from, as one number (FNV-1a over 8-byte words, as
+/// `brush_astc::source_fingerprint`): the loader recomputes it from the
+/// images it loaded, so an encoding is used only for its own content.
+pub fn model_image_fingerprint(map: ModelMap, px: &(Vec<u8>, u32, u32)) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (MODEL_FILTER_VERSION << 8) ^ map as u64;
+    let mut fold = |word: u64| h = (h ^ word).wrapping_mul(PRIME);
+    fold(((px.1 as u64) << 32) | px.2 as u64);
+    for c in px.0.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..c.len()].copy_from_slice(c);
+        fold(u64::from_le_bytes(word));
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^ (h >> 33)
+}
+
+/// Every mip `upload_mipped` uploads of `px`: what the encoder encodes.
+pub fn model_mips(px: &(Vec<u8>, u32, u32)) -> Vec<crate::renderer::terrain_pipeline::TerrainImage> {
+    crate::renderer::brush_pipeline::mip_chain(&crate::renderer::terrain_pipeline::TerrainImage { width: px.1, height: px.2, rgba: px.0.clone() }, true)
+}
+
+thread_local! {
+    /// The `.astc` folder of the model this thread is loading (`model_astc_scope`).
+    static MODEL_ASTC: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While it lives, the materials this thread loads look for their
+/// encodings beside `glb` (`model_astc_dir`).
+pub struct ModelAstcScope(Option<std::path::PathBuf>);
+
+pub fn model_astc_scope(glb: &std::path::Path) -> ModelAstcScope {
+    ModelAstcScope(MODEL_ASTC.with(|d| d.replace(Some(model_astc_dir(glb)))))
+}
+
+impl Drop for ModelAstcScope {
+    fn drop(&mut self) {
+        let was = self.0.take();
+        MODEL_ASTC.with(|d| *d.borrow_mut() = was);
+    }
+}
+
+/// `px` as the encoding at `path`, when the device reads ASTC and the file
+/// is an encoding of exactly `px` (its fingerprint) with every mip.
+fn astc_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, path: &std::path::Path, px: &(Vec<u8>, u32, u32)) -> Option<wgpu::Texture> {
+    use crate::renderer::terrain_pipeline::mip_levels_for;
+    if !device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC) || px.1 % 4 != 0 || px.2 % 4 != 0 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let map = if path.to_string_lossy().ends_with("_base.ssastc") { ModelMap::Base } else { ModelMap::Emissive };
+    let enc = match crate::renderer::brush_astc::BrushAstc::from_bytes(&bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("model ASTC {}: {e}", path.display());
+            return None;
+        }
+    };
+    let a = &enc.array;
+    if enc.source != model_image_fingerprint(map, px) || (a.width, a.height) != (px.1, px.2) || !a.srgb || a.levels != mip_levels_for(px.1, px.2) {
+        log::info!("model ASTC {}: stale, the RGBA path instead", path.display());
+        return None;
+    }
+    let format = a.format()?;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: a.width, height: a.height, depth_or_array_layers: 1 },
+        mip_level_count: a.levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let (bw, bh) = (a.block[0] as u32, a.block[1] as u32);
+    for (level, data) in a.data[0].iter().enumerate() {
+        let (lw, lh) = ((a.width >> level).max(1), (a.height >> level).max(1));
+        let (cols, rows) = (lw.div_ceil(bw), lh.div_ceil(bh));
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: level as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(cols * 16), rows_per_image: Some(rows) },
+            wgpu::Extent3d { width: cols * bw, height: rows * bh, depth_or_array_layers: 1 },
+        );
+    }
+    Some(texture)
 }
 
 /// A MASK material's texel alpha, cut at its `cutoff` (0..1): kept whole or
@@ -218,9 +357,10 @@ pub fn create_mesh_material_texture(
     emissive: &(Vec<u8>, u32, u32),
 ) -> LoadedTexture {
     let make = |label: &str, px: &(Vec<u8>, u32, u32)| upload_mipped(device, queue, label, px);
+    material_bind(device, layout, make("gltf_base_color", base), make("gltf_emissive", emissive))
+}
 
-    let base_tex = make("gltf_base_color", base);
-    let emissive_tex = make("gltf_emissive", emissive);
+fn material_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, base_tex: wgpu::Texture, emissive_tex: wgpu::Texture) -> LoadedTexture {
     let view = base_tex.create_view(&Default::default());
     let emissive_view = emissive_tex.create_view(&Default::default());
 
