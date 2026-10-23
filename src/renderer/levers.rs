@@ -277,6 +277,13 @@ pub struct Levers {
     pub probe_prepass: bool,
 
     pub model_rooms: bool,
+    /// The lamps a closed room's walls hide from both eyes left out of the
+    /// frame's lights, as `model_rooms` leaves out models: a lamp counts if
+    /// its reach touches the eye's room or shows through one of its open
+    /// doorways (`portal_cull::RoomView::shows`), so nothing it lights is in
+    /// view. It frees the budget (`MAX_LIGHTS`) and the meshes' and ground's
+    /// lamp loops in levels of many rooms (2026-10-23).
+    pub light_rooms: bool,
 
     pub terrain_reader: Option<String>,
 
@@ -425,6 +432,7 @@ impl Default for Levers {
             size_reach: 229,
             probe_prepass: false,
             model_rooms: false,
+            light_rooms: true,
             terrain_reader: None,
             reader_edit: None,
             gpu_sync: false,
@@ -686,6 +694,7 @@ impl Levers {
             ("ground_lod_strict", self.ground_lod_strict, d.ground_lod_strict),
             ("probe_prepass", self.probe_prepass, d.probe_prepass),
             ("model_rooms", self.model_rooms, d.model_rooms),
+            ("light_rooms", self.light_rooms, d.light_rooms),
         ] {
             if on != default {
                 out.push(if on { name.to_string() } else { format!("no_{name}") });

@@ -247,6 +247,9 @@ mod tests {
         assert!(shows(Vec3::new(0.0, 1.0, 12.0), 0.5), "a lamp on the lawn, straight out of the door");
         assert!(!shows(Vec3::new(8.0, 1.0, 12.0), 0.5), "one on the lawn behind the hall's front wall");
         assert!(!shows(Vec3::new(-9.0, 2.0, 0.0), 0.5), "one behind the hall's far side wall");
+        // A lamp's bound is its reach (`Levers::light_rooms`): one behind that
+        // wall whose light reaches into the hall is kept.
+        assert!(shows(Vec3::new(-9.0, 2.0, 0.0), 6.0), "a lamp behind the wall reaching into the hall");
 
         let in_hallway = Vec3::new(4.7, 0.9, -1.5);
         let turned = camera(eye, Vec3::new(10.0, 1.6, -3.0));

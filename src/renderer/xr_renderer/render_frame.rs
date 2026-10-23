@@ -1210,11 +1210,38 @@ impl XrRenderer {
                     planes
                 })
                 .collect();
+            // What each eye sees past a closed room's walls (`Levers::light_rooms`):
+            // none when either eye stands in no closed room.
+            let rooms: Option<Vec<crate::renderer::portal_cull::RoomView>> = if self.levers.light_rooms && fx.portal_culling && !self.cull_rooms.is_empty() {
+                let portals = if fx.door_culling { crate::renderer::doors::open_portals(&self.probe_portals, &self.shut_portals) } else { self.probe_portals.clone() };
+                let world_to_player = player_to_world.inverse();
+                eye_views
+                    .iter()
+                    .map(|ev| {
+                        let vp = Camera::gl_to_wgpu_ndc(Camera::xr_projection(ev.fov, crate::renderer::space_warp::NEAR_Z, crate::renderer::space_warp::FAR_Z)) * Camera::xr_view(ev.pose);
+                        let pos = glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
+                        crate::renderer::portal_cull::room_view(player_to_world.transform_point3(pos), vp * world_to_player, vp, &self.cull_rooms, &portals)
+                    })
+                    .collect()
+            } else {
+                None
+            };
             let seen = |l: &Light| {
                 l.in_level_bake
                     || l.kind == crate::renderer::LightKind::Directional
-                    || views.iter().any(|v| crate::renderer::shadow::sphere_in_frustum(v, l.position.extend(l.range.max(0.0))))
+                    || (views.iter().any(|v| crate::renderer::shadow::sphere_in_frustum(v, l.position.extend(l.range.max(0.0))))
+                        && rooms.as_ref().is_none_or(|rs| {
+                            let reach = l.position.extend(l.range.max(0.0));
+                            rs.iter().any(|r| r.shows(player_to_world.transform_point3(l.position), reach, crate::renderer::scene_cull::MARGIN))
+                        }))
             };
+            let walled = rooms.as_ref().map_or(0, |_| {
+                lights.iter().filter(|l| !seen(l) && views.iter().any(|v| crate::renderer::shadow::sphere_in_frustum(v, l.position.extend(l.range.max(0.0))))).count()
+            });
+            if walled != self.light_rooms_log.get() {
+                log::info!("LIGHTROOMS {walled} lamp(s) behind the room's walls left out of {}", lights.len());
+                self.light_rooms_log.set(walled);
+            }
             if lights.iter().all(seen) {
                 lights
             } else {

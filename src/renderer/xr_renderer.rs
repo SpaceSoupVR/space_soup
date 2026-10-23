@@ -675,6 +675,8 @@ pub struct XrRenderer {
     shadow_spot_incumbents: std::cell::RefCell<Vec<usize>>,
 
     shadow_slot_log: std::cell::RefCell<Vec<usize>>,
+    /// How many lamps `Levers::light_rooms` left out last frame (`LIGHTROOMS`).
+    light_rooms_log: std::cell::Cell<usize>,
 
     character_shadow_held: std::cell::RefCell<Vec<glam::Vec3>>,
 
@@ -1655,6 +1657,7 @@ impl XrRenderer {
             baked_lights: Vec::new(),
             shadow_spot_incumbents: std::cell::RefCell::new(Vec::new()),
             shadow_slot_log: std::cell::RefCell::new(Vec::new()),
+            light_rooms_log: std::cell::Cell::new(0),
             character_shadow_held: std::cell::RefCell::new(Vec::new()),
             static_sun_shadow: std::cell::RefCell::new(None),
             multiview_scene: false,
