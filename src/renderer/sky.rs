@@ -2827,6 +2827,7 @@ mod render_tests {
         let (mut last_apply, mut secs) = (-1.0f32, 0.0f32);
         let mut last: Option<(Vec<[f32; 4]>, f64)> = None;
         let (mut medians, mut backs, mut worst_spread) = (Vec::new(), 0usize, 0.0f32);
+        let mut pops: Vec<(f32, usize, usize, f32)> = Vec::new();
         for frame in 0..(hz * seconds) as usize {
             while start.elapsed().as_secs_f32() < frame as f32 / hz {
                 std::thread::yield_now();
@@ -2845,6 +2846,24 @@ mod render_tests {
             let g = show(&sky);
             if let Some((prev, then)) = last.take().filter(|_| secs > 4.0) {
                 let age = (now - then) as f32;
+                // POPS: points whose cloud changes by more than 5% of the sky
+                // in one frame, followed on their wind (a cloud growing over
+                // two minutes changes a thousandth a frame).
+                let (mut appear, mut vanish) = (0usize, 0usize);
+                for j in 0..rows {
+                    for i in 0..cols {
+                        let here = g[(j * cols + i) as usize];
+                        if here[1] <= 0.0 {
+                            continue;
+                        }
+                        let uv = [((i * STEP) as f32 + 0.5) / MAP_WIDTH as f32, ((row0 + j) as f32 + 0.5) / MAP_HEIGHT as f32];
+                        let back = grid_of(advected_uv(map_dir(uv), here[1], eye[1], [here[2], here[3]], [0.0; 3], age));
+                        let change = here[0] - read(&prev, back);
+                        appear += usize::from(change < -0.05);
+                        vanish += usize::from(change > 0.05);
+                    }
+                }
+                pops.push((secs, appear, vanish, sky.cloud_sky.as_ref().unwrap().display()[2]));
                 let mut shifts = Vec::new();
                 for pj in (0..rows.saturating_sub(16)).step_by(16) {
                     for pi in (0..cols).step_by(32) {
@@ -2902,6 +2921,11 @@ mod render_tests {
             }
             last = Some((g, now));
         }
+        for (t, a, v, z) in pops.iter().filter(|p| p.1 + p.2 > 0) {
+            eprintln!("POP {t:6.2} s  build {z:.2}: {a} points gained over 5% cloud in a frame, {v} lost it");
+        }
+        let (appear, vanish): (usize, usize) = pops.iter().fold((0, 0), |s, p| (s.0 + p.1, s.1 + p.2));
+        eprintln!("POP summary: {appear} sudden gains, {vanish} sudden losses over {} frames of {} points", pops.len(), cols * rows);
         let mean = medians.iter().sum::<f32>() / medians.len().max(1) as f32;
         eprintln!("SHOWN summary: {} frames, median shift mean {mean:+.3} texels, {backs} frames with the median below -0.15; worst patch spread {worst_spread:.1}", medians.len());
         assert!(worst_spread <= 0.25, "the shown clouds jump (p90 - p10 of {worst_spread:.1} texels in one frame)");
