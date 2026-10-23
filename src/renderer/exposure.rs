@@ -185,8 +185,13 @@ impl EyeAdaptation {
         }
     }
 
+    /// How far the meter's lobe ignores the gaze in `room`: by how open to
+    /// the sky the place is, day or night. At night it followed the gaze,
+    /// and turning under the moon re-exposed by about a stop (user,
+    /// 2026-10-23: "a lot of unnecessary eye adaptation"); the night eye
+    /// follows where the head is. Rooms and caves still follow the gaze.
     fn free_in(&self, room: u32, head: Vec3) -> f32 {
-        self.open_in(room, head) * self.day
+        self.open_in(room, head)
     }
 
     fn open_in(&self, room: u32, head: Vec3) -> f32 {
@@ -370,7 +375,7 @@ impl EyeAdaptation {
             Some(room) => self.room_log(room, head, gaze, extra),
             None => {
 
-                let lobe = Lobe { gaze, free: self.day };
+                let lobe = Lobe { gaze, free: 1.0 };
                 let samples: Vec<(f32, f32)> =
                     sky_bins(&self.sky).into_iter().chain(extra.iter().copied()).map(|b| weighted(b, &lobe, 1.0, self.log_floor())).collect();
                 band_log(samples)
@@ -415,6 +420,12 @@ impl EyeAdaptation {
                     let local = self.local_rooms && self.closed_rooms.iter().any(|c| c.room == beyond);
                     if !local {
                         samples.extend(through.into_iter().map(|(l, w)| (l, w * share / total)));
+                    } else {
+                        // Nor does it pull the night eye toward it: it can
+                        // no longer wash out, and the pull re-exposed the
+                        // moonlit yard by up to 4.5 stops each time a doorway
+                        // came into view (headset, 2026-10-23: x22k-x267k).
+                        bright.pop();
                     }
                 }
             }
@@ -516,8 +527,11 @@ pub fn exposure_for_up_to(luminance: f32, max: f32) -> f32 {
 /// adaptation: past the indoor range (`MAX_EXPOSURE`) exposure follows the
 /// luminance at this power. At 0.8 throughout, moonlit ground (about 0.17
 /// lux) drew four stops under the day and the user found the moon's and
-/// stars' light too low (2026-10-20); this lifts it about 1.6 stops.
-pub const NIGHT_ADAPTATION_STRENGTH: f32 = 0.9;
+/// stars' light too low (2026-10-20); 0.9 lifted it about 1.6 stops. The
+/// moonlit yard's brightest, x267k, was "almost too bright" (user,
+/// 2026-10-23), and with the lobe gaze-free it reached x294k at 01:00; at
+/// 0.875 it is x150-220k from 22:30 to 01:00 (offline, `METER_GAZE`).
+pub const NIGHT_ADAPTATION_STRENGTH: f32 = 0.875;
 
 /// THE DEEP NIGHT: the metered luminance (engine units) under which the eye
 /// follows the dark only at `DEEP_NIGHT_ADAPTATION_STRENGTH` -- about 1.3
@@ -937,7 +951,9 @@ mod tests {
         let away = eye.meter_with_pool(head, Vec3::Z, &[], &pool);
         assert!((away - eye.meter_with(head, Vec3::Z, &pool)).abs() <= 1e-9, "looking away, no pull: {away}");
         let aside = eye.meter_with_pool(head, Vec3::new(-0.6, 0.0, -0.8), &[], &pool);
-        assert!(aside > eye.meter_with(head, Vec3::new(-0.6, 0.0, -0.8), &pool) && aside < pulled, "aside, a part: {aside}");
+        // Under the open night sky the meter no longer follows the gaze, so a
+        // pool still well in view pulls as much as looked into.
+        assert!(aside > eye.meter_with(head, Vec3::new(-0.6, 0.0, -0.8), &pool) && aside <= pulled * 1.001, "aside, no more: {aside}");
     }
 
     #[test]
@@ -960,14 +976,14 @@ mod tests {
 
     /// Past the indoor range the dark-adapted eye takes in more: the curve
     /// runs on unbroken from `MAX_EXPOSURE`, lifts moonlit ground by more
-    /// than a stop and a half, and leaves the indoor range as it was.
+    /// than a stop, and leaves the indoor range as it was.
     #[test]
     fn the_night_eye_adapts_further_than_the_day_eye() {
         let knee = REFERENCE_LUMINANCE / MAX_EXPOSURE.powf(1.0 / ADAPTATION_STRENGTH);
         assert!((exposure_for_up_to(knee * 0.999, 1e6) / exposure_for_up_to(knee * 1.001, 1e6) - 1.0).abs() < 0.01, "a step at the knee");
         let moonlit = 3.5e-7;
         let day_curve = (REFERENCE_LUMINANCE / moonlit).powf(ADAPTATION_STRENGTH);
-        assert!(exposure_for_up_to(moonlit, 1e6) > 3.0 * day_curve, "{} vs {day_curve}", exposure_for_up_to(moonlit, 1e6));
+        assert!(exposure_for_up_to(moonlit, 1e6) > 2.0 * day_curve, "{} vs {day_curve}", exposure_for_up_to(moonlit, 1e6));
         assert_eq!(exposure_for_up_to(0.05, 1e6), exposure_for(0.05), "the indoor range is untouched");
     }
 
@@ -988,6 +1004,8 @@ mod tests {
         assert!((eye.adapted_luminance().unwrap() / night - 1.0).abs() < 0.01);
     }
 
+    /// In a room the meter follows the gaze; under the open night sky it
+    /// does not (2026-10-23), as under the day's.
     #[test]
     fn looking_at_the_bright_side_meters_brighter() {
 
@@ -1004,7 +1022,7 @@ mod tests {
         eye.set_max_exposure(2e5);
         let toward = eye.meter(Vec3::ZERO, Vec3::X);
         let away = eye.meter(Vec3::ZERO, Vec3::NEG_X);
-        assert!(toward > away * 1.2, "centre-weighting ignored the gaze at night: {toward} vs {away}");
+        assert!((toward / away - 1.0).abs() < 1e-3, "turning under the night sky re-exposed: {toward} vs {away}");
     }
 
     fn faces_open(res: u32, lum: impl Fn(Vec3) -> f32, open: impl Fn(Vec3) -> bool) -> Vec<u8> {
