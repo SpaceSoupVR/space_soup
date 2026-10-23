@@ -2526,15 +2526,28 @@ pub(crate) const FACE_LAMPS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The scene readers walk each face's lamps (`FACE_LAMPS`). Measured on the
+/// Quest 3 offline (2026-10-23, hall_back, one eye): the scene pass fell
+/// 8.04 -> 7.83 ms, with the image the same as the full walk's to within
+/// run-to-run noise.
+pub const FACE_LAMP_LISTS: bool = true;
+
+fn with_face_lamps(mut src: String) -> String {
+    for (from, to) in FACE_LAMPS {
+        assert!(src.contains(from), "the face lamp lists no longer find `{from}`");
+        src = src.replacen(from, to, 1);
+    }
+    src
+}
+
 pub(crate) const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("scene_cut_none", &[]),
-    ("scene_face_lamps", FACE_LAMPS),
     ("scene_cut_lamp_loop", &[("    var todo = reaching;\n", "    var todo = 0u;\n")]),
     (
         "scene_cut_lamps",
         &[(
-            "i < live_light_count(); i = i + 1u) {\n        let kind = lights.lights[i].params.z;\n        let to_lamp",
-            "i < 0u; i = i + 1u) {\n        let kind = lights.lights[i].params.z;\n        let to_lamp",
+            "    var face_todo = face_lamp_mask & ",
+            "    var face_todo = 0u & face_lamp_mask & ",
         )],
     ),
     ("scene_cut_stationary", &[("    set_stationary_masks(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);\n", "")]),
@@ -3647,7 +3660,10 @@ struct VOut {{
 
     let src = in_the_brushes_frame(src);
     match probe {
-        BrushProbe::Read => format!("{src}{}{}", probe_pass::READER_WGSL, probe_pass::FACE_CODE_WGSL),
+        BrushProbe::Read => {
+            let src = if FACE_LAMP_LISTS { with_face_lamps(src) } else { src };
+            format!("{src}{}{}", probe_pass::READER_WGSL, probe_pass::FACE_CODE_WGSL)
+        }
         BrushProbe::Pass | BrushProbe::PassDeferred => {
             format!("{src}{}{}", probe_pass::OUTPUT_WGSL, probe_pass::FACE_CODE_WGSL)
         }
