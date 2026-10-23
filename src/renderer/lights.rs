@@ -3680,8 +3680,9 @@ fn probe_mix_bright(a: vec4<f32>, b: vec4<f32>, k: f32) -> vec4<f32> {{
 }}
 
 fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32, d: vec3<f32>) -> vec4<f32> {{
-
-    let near = probe_nearest_two(h, room, other);
+    // Unrolled: the same two nearest, 0.2-0.4 ms less in the hall views on
+    // the Quest than the loop (2026-10-23, the `def_scan_rolled` cut times it).
+    let near = probe_nearest_two_unrolled(h, room, other);
     let s0 = near.s0;
     let s1 = near.s1;
     let d0 = near.d0;

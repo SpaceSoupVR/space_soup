@@ -1934,7 +1934,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "def_hit_walk",
         &[(
-            "    let near = probe_nearest_two(h, room, other);
+            "    let near = probe_nearest_two_unrolled(h, room, other);
     let s0 = near.s0;
     let s1 = near.s1;
     let d0 = near.d0;
@@ -1972,18 +1972,18 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ),
 
     (
-        "def_scan_unrolled",
-        &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_unrolled(h, room, other);")],
+        "def_scan_rolled",
+        &[("    let near = probe_nearest_two_unrolled(h, room, other);", "    let near = probe_nearest_two(h, room, other);")],
     ),
 
     (
         "def_scan_const",
-        &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_const(h, room, other);")],
+        &[("    let near = probe_nearest_two_unrolled(h, room, other);", "    let near = probe_nearest_two_const(h, room, other);")],
     ),
 
     (
         "def_scan_const_unrolled",
-        &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_const_unrolled(h, room, other);")],
+        &[("    let near = probe_nearest_two_unrolled(h, room, other);", "    let near = probe_nearest_two_const_unrolled(h, room, other);")],
     ),
 
     (SCAN_FROM_UNIFORMS, &[]),
@@ -2015,7 +2015,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "def_cut_slot_walk",
         &[(
-            "    let near = probe_nearest_two(h, room, other);",
+            "    let near = probe_nearest_two_unrolled(h, room, other);",
             "    var near: ProbeNearest;
     near.s0 = probe_room_slot(room);
     near.s1 = select(-1, probe_slot_next(near.s0), near.s0 >= 0);
