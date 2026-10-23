@@ -224,6 +224,11 @@ pub struct PostUpload {
     /// The stops the brush atlas is stored brighter by
     /// (`time_of_day::atlas_stops`); the brushes read it this much down.
     pub atlas_stops: f32,
+    /// The stops the ground map's light is read brighter by: from the
+    /// daylight it was built at to the frame's (`Levers::smooth_ground`),
+    /// so reflections of the ground follow the hour between its rebuilds
+    /// rather than stepping x1.5 at each. 0 reads it as built.
+    pub ground_stops: f32,
 }
 
 impl Default for PostUpload {
@@ -238,6 +243,7 @@ impl Default for PostUpload {
             rooms: [[0.0; 4]; 2 * ROOM_EXPOSURE_ROOMS],
             cloud_map: [[0.0; 4]; 3],
             atlas_stops: 0.0,
+            ground_stops: 0.0,
         }
     }
 }
@@ -816,7 +822,7 @@ impl UniformBuffer {
             ],
             probe_portals: dense.portals,
 
-            proxy_params: [probes.proxy_count as f32, post.night_vision, post.atlas_stops, 0.0],
+            proxy_params: [probes.proxy_count as f32, post.night_vision, post.atlas_stops, post.ground_stops],
             probe_proxies: dense.proxies,
             probe_rooms: room_tables,
             ground_params: dense.ground,

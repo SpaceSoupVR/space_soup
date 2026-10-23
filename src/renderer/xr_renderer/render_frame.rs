@@ -569,6 +569,10 @@ impl XrRenderer {
                 rooms,
                 cloud_map: self.sky.cloud_map(self.player.yaw, self.player.offset.to_array()),
                 atlas_stops: self.tod.atlas_stops,
+                ground_stops: match (self.levers.smooth_ground, self.tod.ground_lit) {
+                    (true, Some(built)) if built > 0.0 && self.tod.daylight_now > 0.0 => (self.tod.daylight_now / built).log2().clamp(-30.0, 30.0),
+                    _ => 0.0,
+                },
                 ..self.post
             }
         };

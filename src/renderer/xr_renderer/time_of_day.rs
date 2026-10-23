@@ -66,6 +66,12 @@ pub(super) struct TodState {
     /// The stops the brush atlas on the GPU is stored brighter by
     /// (`time_of_day::atlas_stops`); 0 for the shipped atlas.
     pub atlas_stops: f32,
+    /// The daylight the ground map on the GPU was built at (None: not built
+    /// under the clock), and the one the build under way is.
+    pub ground_lit: Option<f32>,
+    pub ground_pending: f32,
+    /// The daylight of this frame, blended between snapshots.
+    pub daylight_now: f32,
 }
 
 const GROUND_RATIO: f32 = 1.5;
@@ -157,6 +163,7 @@ impl XrRenderer {
         self.set_sun_off_bake(false);
         self.ground_dirty = true;
         self.tod.ground_from = None;
+        self.tod.ground_lit = None;
         log::info!("TIMEOFDAY off: the photographed sky again");
     }
 
@@ -244,6 +251,7 @@ impl XrRenderer {
         let t = self.sky.blend_progress();
         let daylight_now = self.tod.daylight_from + (self.tod.daylight - self.tod.daylight_from) * t;
         self.tod_relight_rooms(daylight_now);
+        self.tod.daylight_now = daylight_now;
         // Relit on the GPU, the probes follow the same blend
         // (`ProbeStream::relight`, at the frame's `probe_daylight`), and so
         // does the brightness the reflections are matched by.
@@ -340,6 +348,7 @@ impl XrRenderer {
     fn start_ground_rebuild(&mut self, daylight: f32, dir: [f32; 3]) {
         let Some(rx) = self.ground_map_worker("tod_ground_map") else { return };
         self.tod.ground_from = Some((daylight, dir));
+        self.tod.ground_pending = daylight;
         self.tod.ground_build = Some(rx);
     }
 
@@ -386,6 +395,7 @@ impl XrRenderer {
         match rx.try_recv() {
             Ok(ground) => {
                 self.tod.ground_build = None;
+                self.tod.ground_lit = Some(self.tod.ground_pending);
                 let view = crate::renderer::ground_map::upload_prepared(&self.wgpu_device, &self.wgpu_queue, &ground);
                 let map = &ground.map;
                 let extent = map.max - map.min;

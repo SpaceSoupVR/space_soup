@@ -2791,6 +2791,7 @@ impl XrRenderer {
             self.ground_dirty = false;
 
             self.tod.ground_build = None;
+            self.tod.ground_lit = None;
             if self.ground_heights.is_none() {
                 self.ground_load_build = None;
                 if self.ground_placement.take().is_some() {

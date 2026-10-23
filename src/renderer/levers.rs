@@ -99,6 +99,11 @@ pub struct Levers {
     /// degrees it moves (`STATIC_SUN_REDRAW_COS`); off draws it once a
     /// snapshot along the snapshot's sun, as before 2026-10-22.
     pub smooth_sun_shadow: bool,
+    /// The ground map's light (what reflections of the ground and the
+    /// water's bed show) read at the frame's daylight between its rebuilds,
+    /// which come at x1.5 or 3 degrees (`PostUpload::ground_stops`); off
+    /// reads it as built, stepping at each.
+    pub smooth_ground: bool,
 
     pub effects: bool,
 
@@ -300,6 +305,7 @@ impl Default for Levers {
             cloud_pace: true,
             smooth_probes: true,
             smooth_sun_shadow: true,
+            smooth_ground: true,
             effects: true,
             muzzle_test: true,
             mud_test: false,
@@ -478,6 +484,7 @@ impl Levers {
         flag("cloud_pace", self.cloud_pace, d.cloud_pace);
         flag("smooth_probes", self.smooth_probes, d.smooth_probes);
         flag("smooth_sun_shadow", self.smooth_sun_shadow, d.smooth_sun_shadow);
+        flag("smooth_ground", self.smooth_ground, d.smooth_ground);
         flag("effects", self.effects, d.effects);
         flag("muzzle_test", self.muzzle_test, d.muzzle_test);
         flag("mud_test", self.mud_test, d.mud_test);

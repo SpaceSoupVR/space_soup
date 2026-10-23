@@ -1291,7 +1291,7 @@ fn bed_at(at: vec3<f32>) -> vec4<f32> {{
     let half_texel = 0.5 / vec2<f32>(textureDimensions(ground_map));
     let edge = clamp(uv, half_texel, vec2<f32>(1.0) - half_texel);
     let g = textureSampleLevel(ground_map, probe_samp, edge, 0.0);
-    return vec4<f32>(g.rgb, g.a - SHELF_SLOPE * length((uv - edge) / camera.ground_params.zw));
+    return vec4<f32>(g.rgb * exp2(camera.proxy_params.w), g.a - SHELF_SLOPE * length((uv - edge) / camera.ground_params.zw));
 }}
 
 fn water_lost(lod: f32) -> vec4<f32> {{

@@ -3148,7 +3148,7 @@ fn outdoor_radiance(e: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, 
             let texel = 1.0 / max(camera.ground_params.z * f32(textureDimensions(ground_map, 0).x), 1e-6);
             let spread = max(t * probe_lobe_tan(roughness), 1e-4);
             let ground_lod = clamp(log2(spread / texel), 0.0, 12.0);
-            return textureSampleLevel(ground_map, probe_samp, ground_uv(e + d * t), ground_lod).rgb;
+            return textureSampleLevel(ground_map, probe_samp, ground_uv(e + d * t), ground_lod).rgb * exp2(camera.proxy_params.w);
         }}
     }}
     if (b.x >= 0.0) {{
