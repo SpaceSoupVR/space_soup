@@ -1869,6 +1869,11 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     // coarsely; those pixels take the probe cube as rough ones do.
     ("def_cut_fovea30", &[(PROBE_TRACE_CALL, FOVEA_30)]),
     ("def_cut_fovea45", &[(PROBE_TRACE_CALL, FOVEA_45)]),
+    // THE TRACE ONLY ON SMOOTH SURFACES (the AAA doc's rank 2, from
+    // Frostbite's < 0.2): past these roughnesses a surface reads the probe
+    // cube through its box instead of walking the rooms.
+    ("def_cut_trace_max05", &[("const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.75;", "const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.5;")]),
+    ("def_cut_trace_max03", &[("const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.75;", "const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.3;")]),
     (
         "def_cut_colour",
         &[(
@@ -2475,8 +2480,39 @@ const SHADOW_BOX_OPAQUE: (&str, &str) = (
     "    for (var dx: i32 = -1; dx <= select(1, i32(camera.shadow_params.w), camera.shadow_params.w > 0.5); dx = dx + 1) {",
 );
 
+/// PER-FACE LAMP LISTS (the AAA doc's rank 3, without splitting the draw):
+/// the vertex stage marks, per face, the lamps whose range reaches the
+/// face's rectangle (its centre plus the length of its half extent, which
+/// bounds every shading point: `face_pos` is clamped to the rectangle), and
+/// the lamp loop walks only those. Per-pixel range culling still runs on
+/// the ones walked, so nothing a pixel receives changes, save the highlight
+/// widening's nearest-lamp distance, which now ignores lamps out of reach.
+pub(crate) const FACE_LAMPS: &[(&str, &str)] = &[
+    (
+        "struct VOut {\n",
+        "var<private> face_lamp_mask: u32 = 0xffffffffu;\nstruct VOut {\n",
+    ),
+    (
+        "    @location(11) room_near: f32,\n",
+        "    @location(11) room_near: f32,\n    @location(12) @interpolate(flat) face_lamps: u32,\n",
+    ),
+    (
+        "    out.room_near = room_near(to_world_space(v.pos));\n",
+        "    out.room_near = room_near(to_world_space(v.pos));\n    var face_lamps = 0u;\n    let face_r = length(v.face_half_extent);\n    for (var k: u32 = 0u; k < lights.count.x; k = k + 1u) {\n        let reach = lights.lights[k].params.x + face_r;\n        let off = lights.lights[k].position.xyz - v.face_centre;\n        if (lights.lights[k].params.z > 1.5 || dot(off, off) < reach * reach) {\n            face_lamps = face_lamps | (1u << k);\n        }\n    }\n    out.face_lamps = face_lamps;\n",
+    ),
+    (
+        "    probe_volume_pos = vec4<f32>(in.face_centre, 1.0);\n    let env_part = shade_material_env_part(",
+        "    probe_volume_pos = vec4<f32>(in.face_centre, 1.0);\n    face_lamp_mask = in.face_lamps;\n    let env_part = shade_material_env_part(",
+    ),
+    (
+        "    for (var i: u32 = surface_light_count(); i < live_light_count(); i = i + 1u) {\n        let kind = lights.lights[i].params.z;\n        let to_lamp",
+        "    var face_todo = face_lamp_mask & ((1u << live_light_count()) - 1u) & ~((1u << surface_light_count()) - 1u);\n    loop {\n        if (face_todo == 0u) {\n            break;\n        }\n        let i = countTrailingZeros(face_todo);\n        face_todo = face_todo & (face_todo - 1u);\n        let kind = lights.lights[i].params.z;\n        let to_lamp",
+    ),
+];
+
 pub(crate) const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("scene_cut_none", &[]),
+    ("scene_face_lamps", FACE_LAMPS),
     ("scene_cut_lamp_loop", &[("    var todo = reaching;\n", "    var todo = 0u;\n")]),
     (
         "scene_cut_lamps",

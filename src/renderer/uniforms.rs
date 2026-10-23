@@ -457,7 +457,9 @@ impl UniformBuffer {
                 },
                 BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+                    // The vertex stage too: a face's lamp list
+                    // (`brush_pipeline::FACE_LAMPS`).
+                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
