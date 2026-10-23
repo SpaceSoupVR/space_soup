@@ -2699,6 +2699,12 @@ mod render_tests {
         let layout = sky_bind_group_layout(&device);
         let mut clouds = space_soup_sky::clouds::CloudParams { coverage: 0.35, wind_speed: 16.0, weather_minutes: 15.0, storms: 0.35, time_scale: 2.5, altitude_m: 1200.0, ..Default::default() };
         clouds.kinds = [1.0, 1.0, 0.0, 1.0];
+        // `SHOWN_KINDS=0,0,0,1`: one layer alone (the cirrus).
+        if let Ok(k) = std::env::var("SHOWN_KINDS") {
+            for (i, v) in k.split(',').filter_map(|v| v.trim().parse::<f32>().ok()).take(4).enumerate() {
+                clouds.kinds[i] = v;
+            }
+        }
         let params = TimeOfDayParams { start_hour: 16.5, day_minutes: 20.0, turbidity: 12.0, clouds, ..Default::default() };
         let tod = TimeOfDaySky::new(params);
         let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
