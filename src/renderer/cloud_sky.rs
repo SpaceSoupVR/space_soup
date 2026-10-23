@@ -1092,7 +1092,15 @@ impl CloudSky {
                 w[1],
                 w[2],
                 w[3],
-                [if take { HISTORY_NEW } else { 1.0 }, self.scales[t] / self.scales[h], jitter, et[1]],
+                // The history carried as it is, a share of its own map's
+                // light: a cloud's light follows the light it is lit by, so
+                // that is what this map's would be. Converted to the old
+                // map's absolute light (`scales[t] / scales[h]`), each map
+                // kept 70% of the last map's radiance while the dusk dimmed
+                // the sky 1e5 times; past 1.43 times a map the sum grew, and
+                // the night's exposure drew the day's clouds blown white
+                // through the night (headset, 2026-10-23).
+                [if take { HISTORY_NEW } else { 1.0 }, 1.0, jitter, et[1]],
                 self.history_reject,
                 self.history_share,
             ];
@@ -1424,9 +1432,9 @@ struct History {
     // The built map's eye less the history's (xyz); seconds between them (w).
     flow: vec4<f32>,
     winds: array<vec4<f32>, 4>,
-    // The new march's share (1: no history), the built map's light scale over
-    // the history's, the samples' fraction of their step, the built eye's
-    // altitude.
+    // The new march's share (1: no history), what the history's light is
+    // multiplied by (1: carried as a share of its own map's light), the
+    // samples' fraction of their step, the built eye's altitude.
     misc: vec4<f32>,
     // Where old and new disagree from (x) and to (y), the new march is
     // taken alone (`HISTORY_REJECT`); at the horizon from z to w.
@@ -2702,7 +2710,15 @@ pub(crate) mod tests {
         let mut m = uniform_at(&mut population, at);
         let maps = 10;
         let mut frame = 0;
-        while frame < maps * MAP_SLICES + 1 || sky.display()[2] != 0.0 {
+        // A slice every `GHOST_EVERY` frames (1), as the headset's pacing
+        // does when the map runs over its budget (`CLOUDRATE`).
+        let every: u32 = std::env::var("GHOST_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        while frame < maps * MAP_SLICES * every + 1 || sky.display()[2] != 0.0 {
+            if frame % every != 0 {
+                now += dt;
+                frame += 1;
+                continue;
+            }
             if sky.starts_map(false) {
                 at = if sky.is_fresh() { now } else { now + sky.map_lead() };
                 m = uniform_at(&mut population, at);
@@ -2902,6 +2918,64 @@ pub(crate) mod tests {
         let change = change / n.max(1) as f64;
         eprintln!("HORIZON a still sky's map to the next, within 3.4 deg of the horizon: alpha moves {change:.5}");
         assert!(change < 1e-4, "a still sky's horizon changes by {change:.5} from map to map");
+    }
+
+    /// A DIMMING SKY LEAVES NO DAY IN THE HISTORY: maps accumulated while the
+    /// light falls 4 times a map (a dusk sped up) come out as a fresh map
+    /// under the last light does, each read as a share of its own map's
+    /// light. Carried as absolute light, the day's clouds outlived the dusk
+    /// and the night's exposure blew them white (headset, 2026-10-23).
+    #[test]
+    fn a_dimming_sky_keeps_no_day_light_in_the_history() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let params = CloudParams { coverage: 0.6, ..Default::default() };
+        let model = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise);
+        let mut population = CloudPopulation::new();
+        let t = 20_000.0;
+        population.update(&params, &field, t);
+        let mut layers = model.layers(t);
+        population.place(&mut layers, t);
+        let lit = |f: f32| {
+            let s = |v: [f32; 3]| v.map(|c| c * f);
+            CloudSkyUniform::new(&layers, [0.0, 2.0, 0.0], [0.35, 0.85, 0.4], s([3.0, 2.9, 2.7]), s([0.4, 0.5, 0.7]), s([0.2, 0.2, 0.15]), [0.0, 0.0], 4096.0, 0.5)
+        };
+        const MAPS: u32 = 8;
+        let last = 0.25f32.powi(MAPS as i32);
+        let draw = |dim: bool| -> Vec<[f32; 2]> {
+            let mut sky = CloudSky::with_shader(&device, &queue, &field, &noise, cloud_sky_shader());
+            sky.set_population(&device, &queue, &population);
+            let mut now = 0.0;
+            let first = if dim { lit(1.0) } else { lit(last) };
+            let mut enc = device.create_command_encoder(&Default::default());
+            sky.encode_at(&mut enc, &queue, &first, &first, None, true, now, t);
+            queue.submit(Some(enc.finish()));
+            if dim {
+                for i in 0..MAPS * MAP_SLICES {
+                    let u = lit(0.25f32.powi((i / MAP_SLICES + 1) as i32));
+                    now += 1.0 / 72.0;
+                    let mut enc = device.create_command_encoder(&Default::default());
+                    sky.encode_at(&mut enc, &queue, &u, &u, None, false, now, t);
+                    queue.submit(Some(enc.finish()));
+                }
+            }
+            let map = read_back(&device, &queue, &sky.maps, sky.display()[1] as u32, MAP_WIDTH, MAP_HEIGHT, 8);
+            (0..(MAP_WIDTH * MAP_HEIGHT) as usize).map(|i| [half(&map[i * 8 + 6..i * 8 + 8]), half(&map[i * 8..i * 8 + 2])]).collect()
+        };
+        let (dimmed, fresh) = (draw(true), draw(false));
+        let (mut a, mut b, mut n) = (0.0f64, 0.0f64, 0u32);
+        for (d, f) in dimmed.iter().zip(&fresh) {
+            if f[0] < 0.9 {
+                a += d[1] as f64;
+                b += f[1] as f64;
+                n += 1;
+            }
+        }
+        let ratio = a / b.max(1e-12);
+        eprintln!("DIMMING: {n} cloud texels, the dimmed history's light {ratio:.3} of a fresh map's under the last light");
+        assert!(n > 1000, "too little cloud: {n}");
+        assert!((ratio - 1.0).abs() < 0.15, "the history kept the day's light: {ratio:.3} of a fresh map's");
     }
 
     /// ONE MAP IS ALREADY NEAR A MARCH FOUR TIMES FINER, AND THE MAPS

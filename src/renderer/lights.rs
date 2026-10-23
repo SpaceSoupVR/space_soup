@@ -228,7 +228,11 @@ pub fn dynamic_sun_matrix(world_dir: Vec3, head_world: Vec3) -> glam::Mat4 {
     let centre = head_world - Vec3::Y * 0.9;
     let m = directional_light_matrix(world_dir, centre, SUN_DYNAMIC_RADIUS);
     let half = SUN_DYNAMIC_DIM as f32 * 0.5;
-    let o = m.project_point3(Vec3::ZERO);
+    // Snapped to hold the player's pivot on a texel corner, not the world's
+    // origin: redrawn each frame along the gliding sun, a point 30 m from
+    // the origin crept 0.12 texel a frame at a 20-minute day, and the
+    // shadows' stairs crawled (`static_sun_pivot`, 2026-10-23).
+    let o = m.project_point3(static_sun_pivot(head_world));
     let snap = |v: f32| (v * half).round() / half - v;
     glam::Mat4::from_translation(Vec3::new(snap(o.x), snap(o.y), 0.0)) * m
 }
@@ -285,6 +289,46 @@ pub fn static_sun_bounds(
 /// slides through the filter instead of stepping. At a 20-minute day that
 /// is a redraw about every third of a second (every 12 frames at 36 fps).
 pub const STATIC_SUN_REDRAW_COS: f32 = 0.999_998_5;
+
+/// THE STATIC MAP TURNS ABOUT THE PLAYER (2026-10-23, user: the shadows,
+/// the terrain's too, "dancing ... in circular cycles instead of smoothly
+/// sliding"). Turned 0.1 degrees about the level's middle at each redraw
+/// (`STATIC_SUN_REDRAW_COS`), a point r metres from it moved r x 1.7 mm
+/// across the map's texels -- 10 cm, two texels, 60 m out -- so every redraw
+/// cut each shadow edge's stair at a new phase. Turned about `pivot` with the
+/// map's box snapped to whole texels around it, a point near the pivot keeps
+/// its place on the texels, and its shadow moves only as the sun does. The
+/// pivot is the player's place on a grid of `STATIC_SUN_PIVOT_CELL` metres,
+/// so walking does not move it.
+pub const STATIC_SUN_PIVOT_CELL: f32 = 8.0;
+
+/// The pivot `static_sun_matrix_about` turns about for a player at `at`.
+pub fn static_sun_pivot(at: Vec3) -> Vec3 {
+    (at / STATIC_SUN_PIVOT_CELL).floor() * STATIC_SUN_PIVOT_CELL + Vec3::splat(0.5 * STATIC_SUN_PIVOT_CELL)
+}
+
+/// `static_sun_matrix_in` turned about `pivot` on a map `dim` texels wide:
+/// the same box and depth range, shifted under a whole number of texels so
+/// the pivot sits on a texel corner.
+pub fn static_sun_matrix_about(world_dir: Vec3, (lo, hi): (Vec3, Vec3), pivot: Vec3, dim: u32) -> glam::Mat4 {
+    let centre = (lo + hi) * 0.5;
+    let radius = (hi - lo).length() * 0.5 * (1.0 + STATIC_SUN_MARGIN) + 1.0;
+    let d = match world_dir.normalize_or_zero() {
+        Vec3::ZERO => Vec3::NEG_Y,
+        n => n,
+    };
+    let up = if d.dot(Vec3::Y).abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let dist = 2.0 * (radius + (centre - pivot).length());
+    let view = glam::Mat4::look_at_rh(pivot - d * dist, pivot, up);
+    let c = view.transform_point3(centre);
+    let texel = 2.0 * radius / dim.max(1) as f32;
+    let left = ((c.x - radius) / texel).floor() * texel;
+    let bottom = ((c.y - radius) / texel).floor() * texel;
+    // The depth range `directional_light_matrix` gives: from 2 radii before
+    // the middle to one past it, so the biases mean what they did.
+    let proj = glam::Mat4::orthographic_rh(left, left + 2.0 * radius, bottom, bottom + 2.0 * radius, -c.z - 2.0 * radius, -c.z + radius);
+    proj * view
+}
 
 /// The static sun map along `world_dir` over world bounds `(lo, hi)`.
 pub fn static_sun_matrix_in(world_dir: Vec3, (lo, hi): (Vec3, Vec3)) -> glam::Mat4 {
@@ -4163,6 +4207,66 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
 }}
 "#
     )
+}
+
+#[cfg(test)]
+mod static_sun_pivot_tests {
+    use super::*;
+
+    /// Where `p` falls within its texel of a map `dim` wide, x and y.
+    fn phase(m: glam::Mat4, p: Vec3, dim: u32) -> glam::Vec2 {
+        let n = m.project_point3(p);
+        let t = (glam::Vec2::new(n.x, n.y) * 0.5 + 0.5) * dim as f32;
+        t - t.floor()
+    }
+
+    fn worst_phase_step(at: impl Fn(Vec3) -> glam::Mat4, near: Vec3, dim: u32) -> f32 {
+        // The sun gliding 0.1 degrees a redraw, twenty redraws.
+        let dirs: Vec<Vec3> = (0..21)
+            .map(|i| {
+                let a = (35.0f32 + 0.1 * i as f32).to_radians();
+                Vec3::new(a.cos() * 0.6, -a.sin(), a.cos() * 0.8).normalize()
+            })
+            .collect();
+        let pts: Vec<Vec3> = (0..9).map(|k| near + Vec3::new((k % 3) as f32 * 3.0 - 3.0, 0.0, (k / 3) as f32 * 3.0 - 3.0)).collect();
+        let mut worst = 0.0f32;
+        for w in dirs.windows(2) {
+            let (a, b) = (at(w[0]), at(w[1]));
+            let _ = b;
+            for &p in &pts {
+                let d = phase(at(w[1]), p, dim) - phase(a, p, dim);
+                // Across a texel's wrap the step is the short way round.
+                let d = d - d.round();
+                worst = worst.max(d.abs().max_element());
+            }
+        }
+        worst
+    }
+
+    /// A SHADOW NEAR THE PLAYER HOLDS ITS TEXELS as the sun glides: from one
+    /// 0.1-degree redraw to the next, points within a few metres of the
+    /// player keep their place within a texel to a small share of one,
+    /// where the map turned about the level's middle moved them a texel
+    /// or more (the "dancing" shadows, headset 2026-10-23).
+    #[test]
+    fn the_static_map_turns_about_the_player_and_holds_its_texels() {
+        let bounds = (Vec3::new(-60.0, -5.0, -60.0), Vec3::new(60.0, 20.0, 60.0));
+        let dim = 1024;
+        let player = Vec3::new(41.0, 1.7, 33.0);
+        let pivot = static_sun_pivot(player);
+        let about = worst_phase_step(|d| static_sun_matrix_about(d, bounds, pivot, dim), player, dim);
+        let middle = worst_phase_step(|d| static_sun_matrix_in(d, bounds), player, dim);
+        eprintln!("STATIC SUN phase step near the player: {about:.4} texel turned about it, {middle:.4} about the middle");
+        assert!(about < 0.15, "turned about the player, a point near it moves {about:.3} texel a redraw");
+        assert!(middle > 2.0 * about, "the test does not see the old map's drift ({middle:.3} vs {about:.3})");
+        // The whole level stays on the map and within its depth.
+        let m = static_sun_matrix_about(Vec3::new(0.3, -0.8, 0.5).normalize(), bounds, pivot, dim);
+        for k in 0..8 {
+            let c = Vec3::new(if k & 1 == 0 { bounds.0.x } else { bounds.1.x }, if k & 2 == 0 { bounds.0.y } else { bounds.1.y }, if k & 4 == 0 { bounds.0.z } else { bounds.1.z });
+            let n = m.project_point3(c);
+            assert!(n.x.abs() <= 1.0 && n.y.abs() <= 1.0 && (0.0..=1.0).contains(&n.z), "corner {c} falls off the map at {n}");
+        }
+    }
 }
 
 #[cfg(test)]

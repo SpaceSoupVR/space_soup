@@ -1022,6 +1022,11 @@ impl ShadowMap {
         self.spot_tile_dim
     }
 
+    /// The static sun map's width in texels: the same `dim` as a spot tile.
+    pub fn sun_dim(&self) -> u32 {
+        self.spot_tile_dim
+    }
+
     pub fn sampler(&self) -> &Sampler {
         &self.sampler
     }
@@ -2491,10 +2496,11 @@ mod render_tests {
                 let c = m.project_point3(p);
                 (glam::Vec2::new(c.x, c.y) * 0.5 + glam::Vec2::splat(0.5)) * n
             };
-            let o = texel_of(near, Vec3::ZERO);
+            // The player's pivot sits on the grid (`lights::static_sun_pivot`).
+            let o = texel_of(near, crate::renderer::lights::static_sun_pivot(head));
             assert!(
                 (o - o.round()).abs().max_element() < 2e-3,
-                "the world's origin is off the near tile's grid at {o:?}, player at {head}",
+                "the player's pivot is off the near tile's grid at {o:?}, player at {head}",
             );
             let p = head + Vec3::new(0.37, -0.81, 0.52);
             let (w, nr) = (wide.project_point3(p), near.project_point3(p));
@@ -2524,7 +2530,7 @@ mod render_tests {
         for (name, m) in tiles {
             let planes = frustum_planes(m);
             let (mut kept, mut culled) = (0, 0);
-            for _ in 0..2000 {
+            for _ in 0..3000 {
                 let centre = head + Vec3::new(rand() - 0.5, rand() - 0.5, rand() - 0.5) * 16.0;
                 let sphere = centre.extend(0.05 + rand() * 1.5);
                 let inside = sphere_in_frustum(&planes, sphere);

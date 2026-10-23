@@ -1318,8 +1318,17 @@ impl XrRenderer {
             let mut cache = self.static_sun_shadow.borrow_mut();
             let stale = cache.as_ref().is_none_or(|c| c.signature != signature);
             let kept = cache.as_ref().filter(|c| (c.signature.0, c.signature.1) == (signature.0, signature.1)).map(|c| c.bounds);
+            // Turned about the player (`lights::static_sun_matrix_about`) when
+            // it glides; a snapshot's map keeps the level's middle.
+            let pivot = crate::renderer::lights::static_sun_pivot(player_to_world.transform_point3(head));
+            let sun_dim = self.shadow_map.sun_dim();
+            let fit = |bounds| if self.levers.smooth_sun_shadow {
+                crate::renderer::lights::static_sun_matrix_about(world_dir, bounds, pivot, sun_dim)
+            } else {
+                crate::renderer::lights::static_sun_matrix_in(world_dir, bounds)
+            };
             if let (true, Some(bounds)) = (stale, kept) {
-                let world_view_proj = crate::renderer::lights::static_sun_matrix_in(world_dir, bounds);
+                let world_view_proj = fit(bounds);
                 *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj, bounds });
             } else if stale {
                 let bounds = crate::renderer::lights::static_sun_bounds(
@@ -1335,7 +1344,7 @@ impl XrRenderer {
                     }),
                     player_to_world,
                 );
-                let world_view_proj = crate::renderer::lights::static_sun_matrix_in(world_dir, bounds);
+                let world_view_proj = fit(bounds);
                 *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj, bounds });
             }
             (cache.as_ref().unwrap().world_view_proj * player_to_world, stale)
