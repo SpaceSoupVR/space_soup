@@ -2339,7 +2339,7 @@ impl XrRenderer {
 
     pub fn ab_phase(&self) -> crate::renderer::perf_ab::Phase {
         if crate::renderer::perf_ab::ENABLED || self.levers.ab_cycle {
-            crate::renderer::perf_ab::Phase::cycle_phase(self.perf_windows)
+            crate::renderer::perf_ab::Phase::cycle_phase_among(self.perf_windows, self.levers.ab_only.as_deref())
         } else {
             crate::renderer::perf_ab::Phase::Baseline
         }

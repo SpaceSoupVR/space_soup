@@ -1,5 +1,9 @@
 use serde::Deserialize;
 
+/// `Phase::LightCutoff`'s cutoff when the lever has none: displayed
+/// brightness 0.02, under a tenth of the darkest tone the eye reads.
+pub const TRIAL_LIGHT_CUTOFF: f32 = 0.02;
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Levers {
@@ -260,6 +264,9 @@ pub struct Levers {
     pub direct_path: bool,
 
     pub ab_cycle: bool,
+    /// With `ab_cycle`, only these phases (labels, comma separated, e.g.
+    /// "baseline,no_smooth_shadow,light_cutoff,fovea30,fovea45").
+    pub ab_only: Option<String>,
 
     pub bench: Option<crate::renderer::bench::BenchPose>,
 
@@ -389,6 +396,7 @@ impl Default for Levers {
             half_viewport: false,
             direct_path: false,
             ab_cycle: false,
+            ab_only: None,
             bench: None,
             time_of_day_hour: None,
             time_of_day_minutes: None,
@@ -446,6 +454,15 @@ impl Levers {
             Phase::NoWeather => l.weather = false,
             Phase::NoDoorShadows => l.door_shadows = false,
             Phase::TimeFrozen => l.time_of_day_minutes = Some(0.0),
+            Phase::NoSmoothShadow => l.smooth_sun_shadow = false,
+            Phase::NoSmoothGround => l.smooth_ground = false,
+            Phase::LightCutoff => {
+                if l.light_cutoff <= 0.0 {
+                    l.light_cutoff = TRIAL_LIGHT_CUTOFF;
+                }
+            }
+            Phase::Fovea30 => l.pass_cut = Some("def_cut_fovea30".into()),
+            Phase::Fovea45 => l.pass_cut = Some("def_cut_fovea45".into()),
         }
         l
     }
@@ -523,6 +540,9 @@ impl Levers {
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
         flag("ab_cycle", self.ab_cycle, d.ab_cycle);
+        if let Some(only) = &self.ab_only {
+            out.push(format!("ab_only={only}"));
+        }
         if self.foveation != d.foveation {
             out.push(format!("foveation={}", self.foveation.label()));
         }
