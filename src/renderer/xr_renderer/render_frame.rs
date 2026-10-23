@@ -610,6 +610,11 @@ impl XrRenderer {
                 }
                 let paced = if self.levers.cloud_pace { paced } else { 1 };
                 self.sky.set_cloud_build_every(room.max(paced));
+                self.sky.set_cloud_history_reject(if self.levers.cloud_history_tight {
+                    crate::renderer::cloud_sky::HISTORY_REJECT
+                } else {
+                    crate::renderer::cloud_sky::HISTORY_REJECT_WIDE
+                });
                 self.sky.step_clouds(
                 &self.wgpu_device,
                 &self.wgpu_queue,

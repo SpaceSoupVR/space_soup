@@ -1034,6 +1034,13 @@ impl Sky {
         format!("mean {:.1} layers {:.1} population {:.1} encode {:.1} submit {:.1}", l[0], l[1], l[2], l[3], l[4])
     }
 
+    /// Where the cloud maps' history is let go (`CloudSky::set_history_reject`).
+    pub fn set_cloud_history_reject(&mut self, reject: [f32; 2]) {
+        if let Some(gpu) = self.cloud_sky.as_mut() {
+            gpu.set_history_reject(reject);
+        }
+    }
+
     /// Build a slice of the sky map every `n`th frame only. Inside a closed
     /// room the sky shows through a window or a door at most, and a map
     /// carried on its winds for four times as long still holds the clouds

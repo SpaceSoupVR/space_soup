@@ -93,6 +93,11 @@ pub struct Levers {
     /// the headset's GPU frame time is over budget (`cloud_pace`); off
     /// builds a slice every frame outside closed rooms, to price it.
     pub cloud_pace: bool,
+    /// A cloud map's history let go where it and the new march disagree by
+    /// 0.03 to 0.1 of the sky showing (`cloud_sky::HISTORY_REJECT`: no ghost
+    /// fringes at changing edges); off lets it go only at 0.2 to 0.5, as
+    /// before 2026-10-22.
+    pub cloud_history_tight: bool,
     /// The reflection probes relit on the GPU at every frame's daylight
     /// (`ProbeStream::new_smooth`), not rebuilt on the CPU at 25% steps; off
     /// is the stepped relight. Read when the level's probes load. Costs two
@@ -338,6 +343,7 @@ impl Default for Levers {
             cloud_shadows: true,
             clouds: true,
             cloud_pace: true,
+            cloud_history_tight: true,
             smooth_probes: true,
             smooth_sun_shadow: true,
             smooth_ground: true,
@@ -534,6 +540,7 @@ impl Levers {
         flag("cloud_shadows", self.cloud_shadows, d.cloud_shadows);
         flag("clouds", self.clouds, d.clouds);
         flag("cloud_pace", self.cloud_pace, d.cloud_pace);
+        flag("cloud_history_tight", self.cloud_history_tight, d.cloud_history_tight);
         flag("smooth_probes", self.smooth_probes, d.smooth_probes);
         flag("smooth_sun_shadow", self.smooth_sun_shadow, d.smooth_sun_shadow);
         flag("smooth_ground", self.smooth_ground, d.smooth_ground);

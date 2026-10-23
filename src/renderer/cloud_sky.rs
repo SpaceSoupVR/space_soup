@@ -80,8 +80,21 @@ pub const HISTORY_NEW: f32 = 0.3;
 /// Where the old and new maps disagree by this much of the sky showing (a
 /// cloud born, or uncovered by the eye moving), the new march is taken
 /// alone (from the first to the second): history is for the grain, not for
-/// keeping a cloud.
-pub const HISTORY_REJECT: [f32; 2] = [0.2, 0.5];
+/// keeping a cloud. Before 2026-10-22 this was [0.2, 0.5]: a cloud edge
+/// whose shape had changed between the maps kept 70% of the old edge, a
+/// ghost fringe (`maps_accumulated_under_a_moving_sky_hold_no_ghost_edges`:
+/// 8.9% of the edge texels; [0.03, 0.1]: 0.94%), and the grain the history
+/// is for is under 0.008 of alpha since the refined march, so it still
+/// averages (`maps_built_one_after_another_settle_on_a_finer_march`).
+/// `HISTORY_REJECT_WIDE` is the old pair, for comparing
+/// (`Levers::cloud_history_tight`).
+pub const HISTORY_REJECT: [f32; 2] = [0.03, 0.1];
+pub const HISTORY_REJECT_WIDE: [f32; 2] = [0.2, 0.5];
+/// The history is carried a second time by the altitude the old map holds
+/// (`hist_carry`), and that carry kept where the old map agrees with itself
+/// there to this share of the altitude.
+pub const HISTORY_REFETCH: bool = true;
+pub const HISTORY_ALT_AGREE: f32 = 0.1;
 /// One map's sample fraction to the next: the golden ratio's, so any run of
 /// maps spreads its samples evenly through the step.
 pub const HISTORY_JITTER: f32 = 0.618_034;
@@ -299,6 +312,8 @@ pub struct CloudSky {
     /// the one read).
     history_uniform: Buffer,
     history_groups: [BindGroup; 3],
+    /// `HISTORY_REJECT`, or the pair `set_history_reject` gave.
+    history_reject: [f32; 2],
     /// The winds the maps are carried on (`flow_winds`), and how many maps
     /// have been begun (the jitter's index).
     winds: [[f32; 4]; LAYERS],
@@ -678,7 +693,7 @@ impl CloudSky {
         let shadow_bind_group = Self::bind(device, &layout, &shadow_uniform, &noise_tex, &weather, &sampler, &envelope, &envelope_sampler);
         let history_uniform = device.create_buffer(&BufferDescriptor {
             label: Some("cloud_history_uniform"),
-            size: std::mem::size_of::<[[f32; 4]; 6]>() as u64,
+            size: std::mem::size_of::<[[f32; 4]; 7]>() as u64,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -774,6 +789,7 @@ impl CloudSky {
             shadow_pipeline,
             history_uniform,
             history_groups,
+            history_reject: HISTORY_REJECT,
             winds: [[0.0; 4]; LAYERS],
             maps_begun: 0,
             prev: 0,
@@ -893,6 +909,12 @@ impl CloudSky {
     /// begins.
     pub fn set_winds(&mut self, winds: [[f32; 4]; LAYERS]) {
         self.winds = winds;
+    }
+
+    /// Where a map's history is let go (`HISTORY_REJECT`); taken as a map
+    /// begins.
+    pub fn set_history_reject(&mut self, reject: [f32; 2]) {
+        self.history_reject = reject;
     }
 
     /// Whether the next `encode_at` begins a map (and so takes its moment).
@@ -1034,13 +1056,14 @@ impl CloudSky {
             self.maps_begun = self.maps_begun.wrapping_add(1);
             let (et, eh) = (self.eyes[t], self.eyes[h]);
             let w = &self.winds;
-            let carried: [[f32; 4]; 6] = [
+            let carried: [[f32; 4]; 7] = [
                 [et[0] - eh[0], et[1] - eh[1], et[2] - eh[2], age as f32],
                 w[0],
                 w[1],
                 w[2],
                 w[3],
                 [if take { HISTORY_NEW } else { 1.0 }, self.scales[t] / self.scales[h], jitter, et[1]],
+                [self.history_reject[0], self.history_reject[1], 0.0, 0.0],
             ];
             queue.write_buffer(&self.history_uniform, 0, bytemuck::cast_slice(&carried));
         }
@@ -1203,8 +1226,8 @@ pub fn cloud_sky_shader() -> String {
         .replace("{ENVELOPE_TEXEL}", &f(cp::ENVELOPE_TEXEL_M))
         .replace("{ENVELOPE_TOP_MIP}", &f((ENVELOPE_MIPS - 1) as f32))
         .replace("{ALT_FILL_WEIGHT}", &f(ALT_FILL_WEIGHT))
-        .replace("{HISTORY_REJECT0}", &f(HISTORY_REJECT[0]))
-        .replace("{HISTORY_REJECT1}", &f(HISTORY_REJECT[1]))
+        .replace("{HISTORY_REFETCH}", if HISTORY_REFETCH { "true" } else { "false" })
+        .replace("{HISTORY_ALT_AGREE}", &f(HISTORY_ALT_AGREE))
         + &cloud_flow_wgsl()
 }
 
@@ -1362,14 +1385,17 @@ struct History {
     // the history's, the samples' fraction of their step, the built eye's
     // altitude.
     misc: vec4<f32>,
+    // Where old and new disagree from (x) and to (y), the new march is
+    // taken alone (`HISTORY_REJECT`).
+    reject: vec4<f32>,
 }
 @group(1) @binding(0) var<uniform> hist: History;
 @group(1) @binding(1) var hist_light: texture_2d<f32>;
 @group(1) @binding(2) var hist_alt: texture_2d<f32>;
 
 const PI: f32 = 3.14159265;
-const HISTORY_REJECT0: f32 = {HISTORY_REJECT0};
-const HISTORY_REJECT1: f32 = {HISTORY_REJECT1};
+const HISTORY_REFETCH: bool = {HISTORY_REFETCH};
+const HISTORY_ALT_AGREE: f32 = {HISTORY_ALT_AGREE};
 const EARTH: f32 = {EARTH};
 const DETAIL_RATIO: f32 = {DETAIL_RATIO};
 const DETAIL_EROSION: f32 = {DETAIL_EROSION};
@@ -1869,6 +1895,17 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(max(v.rgb, vec3<f32>(0.0)), clamp(v.a, 0.0, 1.0));
 }
 
+// Where the newest map held what this texel shows, if it lies at altitude
+// `h`: carried back along that altitude's wind (`advected_uv`).
+fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
+    let size = vec2<f32>(u.amb_sky.w, u.light.w);
+    let wv = cloud_flow_wind(h, hist.winds[0], hist.winds[1], hist.winds[2], hist.winds[3]);
+    let p = dir * cloud_flow_distance(hist.misc.w, h, max(dir.y, 0.0));
+    var huv = cloud_map_uv(p + hist.flow.xyz - vec3<f32>(wv.x, 0.0, wv.y) * hist.flow.w);
+    huv.y = clamp(huv.y, 0.5 / size.y, 1.0 - 0.5 / size.y);
+    return huv;
+}
+
 @fragment fn fs_map(@builtin(position) pos: vec4<f32>) -> MapOut {
     let size = vec2<f32>(u.amb_sky.w, u.light.w);
     let dir = map_dir(pos.xy / size);
@@ -2059,13 +2096,24 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
     // THE NEWEST MAP, CARRIED HERE: what this texel shows, where that map
     // held it (the sky shader's own carry, `sky_clouds`), mixed in.
     if (hist.misc.x < 1.0) {
-        let wv = cloud_flow_wind(h, hist.winds[0], hist.winds[1], hist.winds[2], hist.winds[3]);
-        let p = dir * cloud_flow_distance(hist.misc.w, h, max(dir.y, 0.0));
-        var huv = cloud_map_uv(p + hist.flow.xyz - vec3<f32>(wv.x, 0.0, wv.y) * hist.flow.w);
-        huv.y = clamp(huv.y, 0.5 / size.y, 1.0 - 0.5 / size.y);
+        var huv = hist_carry(dir, h);
+        var old_alts = textureSampleLevel(hist_alt, samp, huv, 0.0).rg;
+        // CARRIED BY ITS OWN ALTITUDE (R1, cloud research 2026-10-22): the
+        // first carry moves the old map by this march's altitude, which at an
+        // edge is the wrong cloud's (or the empty sky's fill), so the old
+        // cloud was fetched from where it no longer is and left a ghost
+        // copy beside the new edge. Carried again by the altitude the old map
+        // holds there, it lands where that cloud has moved to.
+        if (HISTORY_REFETCH) {
+            let again = hist_carry(dir, old_alts.r);
+            let again_alts = textureSampleLevel(hist_alt, samp, again, 0.0).rg;
+            if (abs(again_alts.r - old_alts.r) < HISTORY_ALT_AGREE * max(old_alts.r, 1.0)) {
+                huv = again;
+                old_alts = again_alts;
+            }
+        }
         let old = hist_bspline(huv, size);
-        let old_alts = textureSampleLevel(hist_alt, samp, huv, 0.0).rg;
-        let w = mix(hist.misc.x, 1.0, smoothstep(HISTORY_REJECT0, HISTORY_REJECT1, abs(old.a - light.a)));
+        let w = mix(hist.misc.x, 1.0, smoothstep(hist.reject.x, hist.reject.y, abs(old.a - light.a)));
         light = mix(vec4<f32>(old.rgb * hist.misc.y, old.a), light, w);
         alts = mix(old_alts, alts, w);
     }
@@ -2552,7 +2600,6 @@ pub(crate) mod tests {
     /// the edges beside them (user, 2026-10-22: edges "duplicated in repeats
     /// that look wispy"). `GHOST_DUMP=dir` writes both maps' alpha as PGM.
     #[test]
-    #[ignore = "open again since HISTORY_NEW went back to 0.3 (2026-10-22 evening): the no-history fix regressed the look"]
     fn maps_accumulated_under_a_moving_sky_hold_no_ghost_edges() {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         let field = CloudField::build(7);
@@ -2635,11 +2682,13 @@ pub(crate) mod tests {
                 std::fs::write(format!("{dir}/ghost_{name}.pgm"), out).unwrap();
             }
         }
-        assert!(off < 0.01, "the accumulated map is off the sky of its moment by {off:.5}");
-        // With the history (`HISTORY_NEW` 0.3): off by 0.0399, 8.9% ghosts;
-        // without, 0.0109 and 0.80% while each map sampled at its own
-        // fraction; at one fraction for every map, 0 and 0.
-        assert!(ghost_share < 0.002, "{ghosts} clear texels hold a cloud the sky has not");
+        // With the history (`HISTORY_NEW` 0.3) let go at 0.2 to 0.5: off by
+        // 0.0399, 8.9% ghosts; at `HISTORY_REJECT` 0.03 to 0.1, 0.0188 and
+        // 0.94%. Without history, 0.0109 and 0.80% while each map sampled at
+        // its own fraction (but bands on the headset); at one fraction for
+        // every map, 0 and 0.
+        assert!(off < 0.025, "the accumulated map is off the sky of its moment by {off:.5}");
+        assert!(ghost_share < 0.015, "{ghosts} clear texels hold a cloud the sky has not");
     }
 
     /// How near one map of each march variant comes to a march four times
