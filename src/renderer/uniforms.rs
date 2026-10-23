@@ -68,6 +68,12 @@ pub struct Uniforms {
     /// `fill` is the light a cloud's base gives the ground under it where
     /// it hides the sun whole (`cloud_fill` in the lights block).
     pub cloud_map: [[f32; 4]; 3],
+
+    /// The static sun's newer map (layer `sun_blend.z`) while the sun glides,
+    /// and [its share, the older map's layer, its layer, 0]; the older map
+    /// is `sun_view_proj` (`lights::SunPair`, `sun_static_visibility`).
+    pub sun_next_view_proj: [[f32; 4]; 4],
+    pub sun_blend: [f32; 4],
 }
 
 /// Texels a side of the clouds' shadow map (`UniformBuffer::write_cloud_shadow`).
@@ -272,6 +278,11 @@ impl SkyUpload {
 pub struct ShadowUpload {
     pub sun_view_proj: Mat4,
 
+    /// The newer static map and [its share, older layer, its layer, 0]
+    /// (`Uniforms::sun_blend`); share 0 reads the older alone.
+    pub sun_next_view_proj: Mat4,
+    pub sun_blend: [f32; 4],
+
     pub sun_dynamic_view_proj: Mat4,
 
     pub sun_dynamic_enabled: bool,
@@ -287,6 +298,8 @@ impl ShadowUpload {
     pub fn disabled() -> Self {
         Self {
             sun_view_proj: Mat4::IDENTITY,
+            sun_next_view_proj: Mat4::IDENTITY,
+            sun_blend: [0.0; 4],
             sun_dynamic_view_proj: Mat4::IDENTITY,
             sun_dynamic_enabled: false,
             spot_view_proj: [Mat4::IDENTITY; SHADOW_MATRICES],
@@ -472,7 +485,7 @@ impl UniformBuffer {
                     visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Texture {
                         sample_type: TextureSampleType::Depth,
-                        view_dimension: TextureViewDimension::D2,
+                        view_dimension: TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -846,6 +859,8 @@ impl UniformBuffer {
             character_cards: player.capsules.cards,
             room_exposure: post.rooms,
             cloud_map: post.cloud_map,
+            sun_next_view_proj: shadow.sun_next_view_proj.to_cols_array_2d(),
+            sun_blend: shadow.sun_blend,
             post_params: [
                 post.exposure,
                 match post.tonemap {

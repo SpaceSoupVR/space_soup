@@ -248,6 +248,11 @@ pub struct StaticSunShadow {
     /// walking every vertex again at each of the clock's steps took the
     /// render thread's time once a second.
     pub bounds: (Vec3, Vec3),
+
+    /// While the light glides: the two maps' turn (`SunPair`) and each
+    /// layer's world view-projection.
+    pub pair: Option<SunPair>,
+    pub layers: [glam::Mat4; 2],
 }
 
 pub const STATIC_SUN_MARGIN: f32 = 0.5;
@@ -301,6 +306,65 @@ pub const STATIC_SUN_REDRAW_COS: f32 = 0.999_998_5;
 /// pivot is the player's place on a grid of `STATIC_SUN_PIVOT_CELL` metres,
 /// so walking does not move it.
 pub const STATIC_SUN_PIVOT_CELL: f32 = 8.0;
+
+/// THE STATIC SUN'S TWO MAPS while the light glides (`Levers::smooth_sun_shadow`,
+/// `sun_static_visibility` in the lights block). Each time the sun has
+/// gone `STATIC_SUN_REDRAW_COS` past the newer map, the older is drawn
+/// again along the sun as it is and becomes the newer. Between, the maps
+/// are blended by how far the sun has gone past the newer, so the shadows
+/// shown trail the sun by one step and creep on with it: just before a
+/// redraw they are the newer map's whole, and just after it the same map
+/// is the older at share 0.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SunPair {
+    /// Each layer's sun (the direction toward it); `newest` the newer's
+    /// layer, `alone` while only it holds a map.
+    pub dirs: [Vec3; 2],
+    pub newest: usize,
+    pub alone: bool,
+}
+
+/// What one frame of a `SunPair` does: the layer to draw along the sun now,
+/// if any; the older and newer layers shown, and the newer's share.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SunPairFrame {
+    pub record: Option<usize>,
+    pub older: usize,
+    pub newer: usize,
+    pub share: f32,
+}
+
+impl SunPair {
+    /// The angle of one redraw step, radians.
+    pub fn step_angle() -> f32 {
+        (1.0 - STATIC_SUN_REDRAW_COS * STATIC_SUN_REDRAW_COS).sqrt().asin()
+    }
+
+    /// The frame for a sun toward `sun` (unit); `pair` None (or a sun more
+    /// than two steps off, a jump of the clock) starts over with one map.
+    pub fn frame(pair: &mut Option<SunPair>, sun: Vec3) -> SunPairFrame {
+        let step = Self::step_angle();
+        // Angles this small from the cross product: 1 - cos is under 2e-6
+        // at a step, and f32's cos reads it to a few per cent.
+        let apart = |a: Vec3, b: Vec3| if a.dot(b) <= 0.0 { std::f32::consts::PI } else { a.cross(b).length().min(1.0).asin() };
+        let Some(p) = pair.as_mut().filter(|p| apart(p.dirs[p.newest], sun) <= 2.0 * step) else {
+            *pair = Some(SunPair { dirs: [sun; 2], newest: 0, alone: true });
+            return SunPairFrame { record: Some(0), older: 0, newer: 0, share: 0.0 };
+        };
+        let gone = apart(p.dirs[p.newest], sun);
+        if gone >= step {
+            let layer = 1 - p.newest;
+            p.dirs[layer] = sun;
+            p.newest = layer;
+            p.alone = false;
+            return SunPairFrame { record: Some(layer), older: 1 - layer, newer: layer, share: 0.0 };
+        }
+        if p.alone {
+            return SunPairFrame { record: None, older: p.newest, newer: p.newest, share: 0.0 };
+        }
+        SunPairFrame { record: None, older: 1 - p.newest, newer: p.newest, share: (gone / step).clamp(0.0, 1.0) }
+    }
+}
 
 /// The pivot `static_sun_matrix_about` turns about for a player at `at`.
 pub fn static_sun_pivot(at: Vec3) -> Vec3 {
@@ -939,6 +1003,9 @@ struct Camera {{
     room_exposure: array<vec4<f32>, {room_exposure_rows}>,
 
     cloud_map: array<vec4<f32>, 3>,
+
+    sun_next_view_proj: mat4x4<f32>,
+    sun_blend: vec4<f32>,
 }}
 
 fn to_world_direction(d: vec3<f32>) -> vec3<f32> {{
@@ -1029,7 +1096,7 @@ struct Lights {{
     surfaces: array<vec4<f32>, {lit_surface_vec4s}>,
 }}
 @group({group_index}) @binding({binding_index}) var<uniform> lights: Lights;
-@group({group_index}) @binding({shadow_tex}) var sun_shadow_tex: texture_depth_2d;
+@group({group_index}) @binding({shadow_tex}) var sun_shadow_tex: texture_depth_2d_array;
 
 @group({group_index}) @binding({sun_dynamic_tex}) var sun_dynamic_shadow_tex: texture_depth_2d;
 @group({group_index}) @binding({shadow_samp}) var shadow_samp: sampler_comparison;
@@ -1540,6 +1607,37 @@ fn pcf(tex: texture_depth_2d, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>
     return sum / 9.0;
 }}
 
+// `pcf` on one layer of an array.
+fn pcf_array(tex: texture_depth_2d_array, layer: i32, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
+    let c = shadow_coords(world_pos, light_view_proj);
+    if (c.w < 0.5) {{ return 1.0; }}
+    let texel = 1.0 / vec2<f32>(textureDimensions(tex));
+    var sum = 0.0;
+    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
+        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
+            let off = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum = sum + textureSampleCompareLevel(tex, shadow_samp, c.xy + off, layer, c.z);
+        }}
+    }}
+    return sum / 9.0;
+}}
+
+// THE STATIC SUN MAPS (`lights::SunPair`): while the sun glides, the older
+// and the newer map, blended by how far the sun has gone past the newer.
+// One map redrawn each 0.1 degrees moved every long shadow a texel at each
+// redraw, on a light grid turned a little each time: the edges danced in a
+// cycle (user, headset, 2026-10-23: "updating in a cyclical dancing
+// pattern instead of ... a slow smooth creep"). Blended, an edge creeps
+// from the one map's place to the other's.
+fn sun_static_visibility(world_pos: vec3<f32>) -> f32 {{
+    let b = camera.sun_blend;
+    let older = pcf_array(sun_shadow_tex, i32(b.y + 0.5), world_pos, camera.sun_view_proj);
+    if (b.x <= 0.0) {{
+        return older;
+    }}
+    return mix(older, pcf_array(sun_shadow_tex, i32(b.z + 0.5), world_pos, camera.sun_next_view_proj), b.x);
+}}
+
 fn sun_visibility(l: Light, world_pos: vec3<f32>) -> f32 {{
     var vis = sun_level_visibility(world_pos);
     if (vis > 0.0 && l.position.w > 0.5 && camera.shadow_params.z > 0.5) {{
@@ -1553,7 +1651,7 @@ fn sun_level_visibility(world_pos: vec3<f32>) -> f32 {{
     if (SUN_MASK_EVERYWHERE || receiver_sun_mask >= 0.0) {{
         vis = receiver_sun_mask;
     }} else if (camera.shadow_params.x > 0.5) {{
-        vis = pcf(sun_shadow_tex, world_pos, camera.sun_view_proj);
+        vis = sun_static_visibility(world_pos);
     }}
     return vis * cloud_sun_shadow(world_pos);
 }}
@@ -4207,6 +4305,55 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
 }}
 "#
     )
+}
+
+#[cfg(test)]
+mod sun_pair_tests {
+    use super::*;
+
+    /// The sun the shown maps stand for (the older's and the newer's by the
+    /// newer's share) creeps on with the light, one step behind it, and
+    /// never jumps at a redraw or steps back.
+    #[test]
+    fn the_shown_sun_creeps_after_the_light_without_a_jump() {
+        let step = SunPair::step_angle();
+        let mut pair = None;
+        let mut shown_last: Option<f32> = None;
+        let (mut redraws, mut worst_jump, mut worst_lag) = (0, 0.0f32, 0.0f32);
+        let per_frame = step / 37.0;
+        for f in 0..2000 {
+            let a = 0.3 + f as f32 * per_frame;
+            let sun = Vec3::new(a.cos(), a.sin(), 0.0);
+            let fr = SunPair::frame(&mut pair, sun);
+            redraws += fr.record.is_some() as u32;
+            let p = pair.unwrap();
+            let angle = |v: Vec3| v.y.atan2(v.x);
+            let shown = angle(p.dirs[fr.older]) + (angle(p.dirs[fr.newer]) - angle(p.dirs[fr.older])) * fr.share;
+            if let Some(last) = shown_last {
+                let moved = shown - last;
+                assert!(moved >= -1e-6, "frame {f}: the shown sun stepped back by {moved}");
+                worst_jump = worst_jump.max(moved);
+            }
+            if f > 40 {
+                worst_lag = worst_lag.max(a - shown);
+            }
+            shown_last = Some(shown);
+        }
+        eprintln!("SUNPAIR {redraws} redraws; the shown sun moved at most {:.2} frames' light a frame and trailed by at most {:.2} steps", worst_jump / per_frame, worst_lag / step);
+        assert!(worst_jump < 1.6 * per_frame, "the shown sun jumped {} of a frame's {per_frame}", worst_jump);
+        assert!(worst_lag < 1.1 * step, "the shown sun trails by {} steps", worst_lag / step);
+        assert!((redraws as f32 - 2000.0 / 37.0).abs() < 3.0, "{redraws} redraws");
+    }
+
+    /// A clock that jumps starts the pair over: one map, along the sun.
+    #[test]
+    fn a_jump_of_the_clock_starts_over_with_one_map() {
+        let mut pair = None;
+        SunPair::frame(&mut pair, Vec3::Y);
+        SunPair::frame(&mut pair, Vec3::new(0.01, 1.0, 0.0).normalize());
+        let fr = SunPair::frame(&mut pair, Vec3::new(0.5, 1.0, 0.0).normalize());
+        assert_eq!(fr, SunPairFrame { record: Some(0), older: 0, newer: 0, share: 0.0 });
+    }
 }
 
 #[cfg(test)]

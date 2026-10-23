@@ -605,6 +605,12 @@ impl ShadowSlot {
 
 pub struct ShadowMap {
     sun: ShadowSlot,
+    /// The static sun's second map (layer 1 of `sun`'s texture), drawn
+    /// ahead of the first while the sun glides (`lights::SunPair`), and
+    /// which of the two `ShadowKind::Sun` draws into.
+    sun_next: ShadowSlot,
+    sun_layer: std::cell::Cell<u32>,
+    sun_array_view: TextureView,
 
     sun_dynamic: ShadowSlot,
 
@@ -936,7 +942,10 @@ impl ShadowMap {
             cache: None,
         });
 
-        let sun = ShadowSlot::new(device, &light_layout, "sun_shadow_depth", dim);
+        let sun = ShadowSlot::new_layered(device, &light_layout, "sun_shadow_depth", dim, 2, 0);
+        let sun_texture = sun._depth_texture.clone().expect("the sun owns its own depth target");
+        let sun_next = ShadowSlot::from_texture(device, &light_layout, &sun_texture, 1);
+        let sun_array_view = sun_texture.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..Default::default() });
 
         let spot_texture = device.create_texture(&TextureDescriptor {
             label: Some("spot_shadow_atlas"),
@@ -964,6 +973,9 @@ impl ShadowMap {
 
         Self {
             sun,
+            sun_next,
+            sun_layer: std::cell::Cell::new(0),
+            sun_array_view,
             sun_dynamic,
             spots,
             characters,
@@ -1002,8 +1014,15 @@ impl ShadowMap {
         drawn
     }
 
+    /// Both static sun maps, as the lights block binds them (`sun_shadow_tex`).
     pub fn sun_depth_view(&self) -> &TextureView {
-        self.sun.depth_view.as_ref().expect("the sun owns its own depth target")
+        &self.sun_array_view
+    }
+
+    /// Which static sun map (0 or 1) `ShadowKind::Sun` draws into and
+    /// uploads the light of (`lights::SunPair`).
+    pub fn set_sun_layer(&self, layer: u32) {
+        self.sun_layer.set(layer.min(1));
     }
 
     pub fn sun_dynamic_depth_view(&self) -> &TextureView {
@@ -1033,7 +1052,7 @@ impl ShadowMap {
 
     fn slot(&self, kind: ShadowKind) -> &ShadowSlot {
         match kind {
-            ShadowKind::Sun => &self.sun,
+            ShadowKind::Sun => if self.sun_layer.get() == 1 { &self.sun_next } else { &self.sun },
             ShadowKind::SunDynamic => &self.sun_dynamic,
             ShadowKind::SunNear => &self.sun_near,
             ShadowKind::Spot(i) => &self.spots[i.min(MAX_SPOT_SHADOWS - 1)],
@@ -1936,6 +1955,8 @@ mod render_tests {
             spot_count: spot_indices.len() as u32,
             sun_dynamic_view_proj: sun_view_proj,
             sun_dynamic_enabled: scene.shadows_on && sun.is_some() && scene.sky_sun_dynamic,
+            sun_next_view_proj: Mat4::IDENTITY,
+            sun_blend: [0.0; 4],
         };
 
         let world = scene.receiver_at;

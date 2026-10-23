@@ -106,8 +106,9 @@ pub struct Levers {
     /// usage (2026-10-22).
     pub smooth_probes: bool,
     /// The static sun map drawn along the gliding sun, again each 0.1
-    /// degrees it moves (`STATIC_SUN_REDRAW_COS`); off draws it once a
-    /// snapshot along the snapshot's sun, as before 2026-10-22.
+    /// degrees it moves (`STATIC_SUN_REDRAW_COS`), as two maps blended by
+    /// the sun's way between them (`lights::SunPair`, 2026-10-23); off draws
+    /// one once a snapshot along the snapshot's sun, as before 2026-10-22.
     pub smooth_sun_shadow: bool,
     /// The ground map's light (what reflections of the ground and the
     /// water's bed show) read at the frame's daylight between its rebuilds,

@@ -352,7 +352,7 @@ fn repeat_of(layer: i32) -> f32 {{
 
     var sun_map = 1.0;
     if (camera.shadow_params.x > 0.5) {{
-        sun_map = pcf(sun_shadow_tex, in.world_pos, camera.sun_view_proj);
+        sun_map = sun_static_visibility(in.world_pos);
     }}
 
     let cave_sun = smoothstep(0.01, 0.08, sky) * min(sun_map, clamp(in.aux.w, 0.0, 1.0));

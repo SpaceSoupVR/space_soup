@@ -840,6 +840,8 @@ impl Renderer {
             spot_count: spot_indices.len() as u32,
             sun_dynamic_view_proj: glam::Mat4::IDENTITY,
             sun_dynamic_enabled: false,
+            sun_next_view_proj: glam::Mat4::IDENTITY,
+            sun_blend: [0.0; 4],
         };
         let sky = self.sky.clone().unwrap_or_else(uniforms::SkyUpload::none);
         self.uniform_buf.upload_scene(

@@ -1297,25 +1297,29 @@ impl XrRenderer {
         // off the map's: shadows slide on with the sun rather than jumping a
         // texel at each snapshot (user's colleague, 2026-10-22: "the light
         // and shadow changes step").
-        let stepped = if self.levers.smooth_sun_shadow {
-            self.sky.sun_direct().map(|s| -glam::Vec3::from(s.direction)).map(|glide| {
-                let held = self.static_sun_shadow.borrow().as_ref().map(|c| glam::Vec3::from_array(c.signature.2.map(f32::from_bits)));
-                match held {
-                    Some(h) if h.dot(glide) >= crate::renderer::lights::STATIC_SUN_REDRAW_COS => h,
-                    _ => glide,
-                }
-            })
-        } else {
-            self.sky.sun_stepped().map(|s| -glam::Vec3::from(s.direction))
-        };
+        // Two maps then, blended by the sun's way between redraws
+        // (`lights::SunPair`), so the shadows creep on with it.
+        let glide = if self.levers.smooth_sun_shadow { self.sky.sun_direct().map(|s| -glam::Vec3::from(s.direction)) } else { None };
+        let stepped = if self.levers.smooth_sun_shadow { glide } else { self.sky.sun_stepped().map(|s| -glam::Vec3::from(s.direction)) };
+        // The pair's frame, and the newer and older maps (player space).
+        let mut sun_pair: Option<(crate::renderer::lights::SunPairFrame, glam::Mat4)> = None;
         let static_sun = sun.filter(|_| sky_sun.is_some()).map(|l| {
-            let world_dir = stepped.unwrap_or(glam::Quat::from_rotation_y(self.player.yaw) * l.direction);
-            let signature = (
+            let mut cache = self.static_sun_shadow.borrow_mut();
+            let geometry = (
                 brushes.map(|(v, i)| (v.len(), i.len())).unwrap_or((0, 0)),
                 terrain.map(|(v, i)| (v.len(), i.len())).unwrap_or((0, 0)),
-                world_dir.to_array().map(f32::to_bits),
             );
-            let mut cache = self.static_sun_shadow.borrow_mut();
+            let pair_frame = glide.map(|g| {
+                let mut pair = cache.as_ref().filter(|c| (c.signature.0, c.signature.1) == geometry).and_then(|c| c.pair);
+                let fr = crate::renderer::lights::SunPair::frame(&mut pair, g);
+                (fr, pair.expect("a pair's frame leaves a pair"))
+            });
+            let world_dir = match pair_frame {
+                Some((_, p)) => p.dirs[p.newest],
+                None => stepped.unwrap_or(glam::Quat::from_rotation_y(self.player.yaw) * l.direction),
+            };
+            let signature = (geometry.0, geometry.1, world_dir.to_array().map(f32::to_bits));
+            let (pair_was, layers_were) = cache.as_ref().map_or((None, [glam::Mat4::IDENTITY; 2]), |c| (c.pair, c.layers));
             let stale = cache.as_ref().is_none_or(|c| c.signature != signature);
             let kept = cache.as_ref().filter(|c| (c.signature.0, c.signature.1) == (signature.0, signature.1)).map(|c| c.bounds);
             // Turned about the player (`lights::static_sun_matrix_about`) when
@@ -1329,7 +1333,7 @@ impl XrRenderer {
             };
             if let (true, Some(bounds)) = (stale, kept) {
                 let world_view_proj = fit(bounds);
-                *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj, bounds });
+                *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj, bounds, pair: pair_was, layers: layers_were });
             } else if stale {
                 let bounds = crate::renderer::lights::static_sun_bounds(
 
@@ -1345,9 +1349,24 @@ impl XrRenderer {
                     player_to_world,
                 );
                 let world_view_proj = fit(bounds);
-                *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj, bounds });
+                *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj, bounds, pair: pair_was, layers: layers_were });
             }
-            (cache.as_ref().unwrap().world_view_proj * player_to_world, stale)
+            let c = cache.as_mut().unwrap();
+            if let Some((mut fr, p)) = pair_frame {
+                // A map is drawn whenever the newer's sun changed; the pair
+                // says into which layer.
+                if stale && fr.record.is_none() {
+                    fr.record = Some(p.newest);
+                }
+                if let Some(layer) = fr.record {
+                    c.layers[layer] = c.world_view_proj;
+                }
+                c.pair = Some(p);
+                sun_pair = Some((fr, c.layers[fr.newer] * player_to_world));
+                return (c.layers[fr.older] * player_to_world, stale);
+            }
+            c.pair = None;
+            (c.world_view_proj * player_to_world, stale)
         });
 
         let dynamic_sun = static_sun.and(sun).filter(|_| fx.sun_dynamic).map(|l| {
@@ -1530,6 +1549,14 @@ impl XrRenderer {
             spot_count: spot_indices.len() as u32,
             sun_dynamic_view_proj: dynamic_sun.unwrap_or(glam::Mat4::IDENTITY),
             sun_dynamic_enabled: dynamic_sun.is_some(),
+            sun_next_view_proj: sun_pair.map_or(glam::Mat4::IDENTITY, |(_, newer)| newer),
+            sun_blend: sun_pair.map_or([0.0; 4], |(fr, _)| [fr.share, fr.older as f32, fr.newer as f32, 0.0]),
+        };
+        // The static map drawn this frame and the layer it goes to: the
+        // pair's newer while the light glides, else the one map.
+        let (sun_record_view_proj, sun_record_layer) = match sun_pair {
+            Some((fr, newer)) => (newer, fr.record.unwrap_or(fr.newer) as u32),
+            None => (shadow.sun_view_proj, 0),
         };
 
         laps.push((line!(), std::time::Instant::now()));
@@ -1647,7 +1674,7 @@ impl XrRenderer {
                     (true, Some((index_start, _)), Some(lod)) => Some(
                         lod.frame(
                             ground_head,
-                            &[crate::renderer::shadow::frustum_planes(shadow.sun_view_proj * warp_world_to_player)],
+                            &[crate::renderer::shadow::frustum_planes(sun_record_view_proj * warp_world_to_player)],
                             false,
                             self.player.offset,
                             self.player.yaw,
@@ -1670,10 +1697,11 @@ impl XrRenderer {
                 } else {
                     (&shadow_casters[..], &skinned_casters[..])
                 };
+                self.shadow_map.set_sun_layer(sun_record_layer);
                 self.shadow_map.upload_light(
                     &self.wgpu_queue,
                     crate::renderer::shadow::ShadowKind::Sun,
-                    shadow.sun_view_proj,
+                    sun_record_view_proj,
                 );
                 drawn += self.shadow_map.record(
                     &mut encoder,
@@ -1683,7 +1711,7 @@ impl XrRenderer {
                     mesh_casters,
                     skinned,
                     sun_ground,
-                    shadow.sun_view_proj,
+                    sun_record_view_proj,
                 );
                 // Drawn every 0.1 degrees when smooth: logged with the diagnostics.
                 if static_sun.is_some() && (!self.levers.smooth_sun_shadow || diag) {
