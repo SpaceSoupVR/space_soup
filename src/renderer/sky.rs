@@ -1789,16 +1789,23 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
     let uv = cloud_map_uv(dir);
     var uva = uv;
     var uvb = uv;
+    // Each map carried on its OWN height and wind for what it shows here
+    // (`fs_map`, alts .r and .ba). Both carried on the newest map's, the
+    // older map's carry changed at every swap, when the newest became a
+    // different map: its clouds jumped up to 0.4 degrees, back and forth,
+    // once a build (user, 2026-10-23: "a small backstep every 1 second";
+    // `the_shown_clouds_ride_their_wind_frame_by_frame`).
     let here = textureSampleLevel(cloud_alts, cloud_samp, uv, i32(sky_extra.cloud_misc.y), 0.0);
-    let alt = here.r;
-    if (alt > 0.0) {{
-        // The wind what the map shows here rides (`fs_map`, alts .ba).
-        let v = vec3<f32>(here.b, 0.0, here.a);
-        let p = dir * cloud_flow_distance(sky_extra.cloud_eye.x, alt, dir.y);
+    let older = textureSampleLevel(cloud_alts, cloud_samp, uv, i32(sky_extra.cloud_misc.x), 0.0);
+    if (older.r > 0.0) {{
         let fa = sky_extra.cloud_flow[0];
+        let p = dir * cloud_flow_distance(sky_extra.cloud_eye.x, older.r, dir.y);
+        uva = cloud_map_uv(p + fa.xyz - vec3<f32>(older.b, 0.0, older.a) * fa.w);
+    }}
+    if (here.r > 0.0) {{
         let fb = sky_extra.cloud_flow[1];
-        uva = cloud_map_uv(p + fa.xyz - v * fa.w);
-        uvb = cloud_map_uv(p + fb.xyz - v * fb.w);
+        let p = dir * cloud_flow_distance(sky_extra.cloud_eye.x, here.r, dir.y);
+        uvb = cloud_map_uv(p + fb.xyz - vec3<f32>(here.b, 0.0, here.a) * fb.w);
     }}
     var a = sky_cloud_map(uva, i32(sky_extra.cloud_misc.x));
     var b = sky_cloud_map(uvb, i32(sky_extra.cloud_misc.y));
@@ -2672,6 +2679,232 @@ mod render_tests {
         }
         eprintln!("{} populations shown over 20 s", gens.len());
         assert!(gens.len() >= 10, "the sky took only {} populations in 20 s", gens.len());
+    }
+
+    /// WHAT THE SKY SHADER SHOWS, FRAME BY FRAME, against the wind: the
+    /// headset's loop (the worker on, a snapshot each second, test_room's
+    /// clouds on its 2.5x clock at SpaceWarp's 36 Hz), and after each frame
+    /// the sky shader's own lookup (`sky_clouds`: both shown maps carried,
+    /// read bicubically, blended) over a band of the sky. Per edge patch,
+    /// the shift along the wind that best lays this frame's clouds on the
+    /// last frame's carried one frame on: 0 when the shown clouds ride their
+    /// wind, below 0 where they fall back (user, 2026-10-23, after the carry
+    /// fixes: "still had the back step"). Prints `SHOWN` per frame and a
+    /// summary. Turns the worker on for the process: `--ignored --exact`.
+    #[test]
+    #[ignore]
+    fn the_shown_clouds_ride_their_wind_frame_by_frame() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        crate::renderer::cloud_worker::enable();
+        let layout = sky_bind_group_layout(&device);
+        let mut clouds = space_soup_sky::clouds::CloudParams { coverage: 0.35, wind_speed: 16.0, weather_minutes: 15.0, storms: 0.35, time_scale: 2.5, altitude_m: 1200.0, ..Default::default() };
+        clouds.kinds = [1.0, 1.0, 0.0, 1.0];
+        let params = TimeOfDayParams { start_hour: 16.5, day_minutes: 20.0, turbidity: 12.0, clouds, ..Default::default() };
+        let tod = TimeOfDaySky::new(params);
+        let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
+        let mut sky = Sky::none(&device, &queue, &layout, AMBIENT);
+        let eye = [0.0f32, 1.6, 12.0];
+        let hz: f32 = std::env::var("SHOWN_HZ").ok().and_then(|v| v.parse().ok()).unwrap_or(36.0);
+        let seconds: f32 = std::env::var("SHOWN_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(16.0);
+        let hour = |s: f32| 16.5 + s * 24.0 / (20.0 * 60.0);
+
+        // The band shown: every STEP-th column, rows from 8 to 50 degrees up.
+        use crate::renderer::cloud_sky::{advected_uv, map_dir, map_uv, MAP_HEIGHT, MAP_WIDTH};
+        const STEP: u32 = 2;
+        let row_of = |deg: f32| ((deg.to_radians() / std::f32::consts::FRAC_PI_2).powf(1.0 / crate::renderer::cloud_sky::MAP_PACK) * MAP_HEIGHT as f32) as u32;
+        let (row0, row1) = (row_of(8.0), row_of(50.0));
+        let (cols, rows) = (MAP_WIDTH / STEP, row1 - row0);
+        let shader = sky_cloud_shader();
+        let cubic = {
+            let start = shader.find("fn sky_cloud_map(").unwrap();
+            let end = start + shader[start..].find("\n}\n").unwrap() + 2;
+            shader[start..end].to_string()
+        };
+        let source = format!(
+            "@group(0) @binding(0) var cloud_maps: texture_2d_array<f32>;
+             @group(0) @binding(1) var cloud_samp: sampler;
+             @group(0) @binding(2) var cloud_alts: texture_2d_array<f32>;
+             struct Shown {{ flow: array<vec4<f32>, 2>, misc: vec4<f32>, eye: vec4<f32>, grid: vec4<f32> }}
+             @group(0) @binding(3) var<uniform> shown: Shown;
+             @group(0) @binding(4) var<storage, read_write> out: array<vec4<f32>>;
+             {flow}
+             {cubic}
+             const SHARED_ALTS: bool = {shared};
+             @compute @workgroup_size(64)
+             fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
+                 let cols = u32(shown.grid.x);
+                 if (id.x >= cols * u32(shown.grid.z)) {{ return; }}
+                 let uv = vec2<f32>((f32(id.x % cols) * shown.grid.w + 0.5) / {w:.1}, (shown.grid.y + f32(id.x / cols) + 0.5) / {h:.1});
+                 let el = 1.57079633 * pow(uv.y, CLOUD_FLOW_PACK);
+                 let az = (uv.x - 0.5) * 6.28318531;
+                 let dir = vec3<f32>(sin(az) * cos(el), sin(el), cos(az) * cos(el));
+                 var uva = uv;
+                 var uvb = uv;
+                 // As `sky_clouds`; `SHOWN_SHARED_ALTS=1` carries both maps on
+                 // the newest's heights and winds, as before 2026-10-23.
+                 let here = textureSampleLevel(cloud_alts, cloud_samp, uv, i32(shown.misc.y), 0.0);
+                 let older = select(textureSampleLevel(cloud_alts, cloud_samp, uv, i32(shown.misc.x), 0.0), here, SHARED_ALTS);
+                 if (older.r > 0.0) {{
+                     let p = dir * cloud_flow_distance(shown.eye.x, older.r, dir.y);
+                     uva = cloud_map_uv(p + shown.flow[0].xyz - vec3<f32>(older.b, 0.0, older.a) * shown.flow[0].w);
+                 }}
+                 if (here.r > 0.0) {{
+                     let p = dir * cloud_flow_distance(shown.eye.x, here.r, dir.y);
+                     uvb = cloud_map_uv(p + shown.flow[1].xyz - vec3<f32>(here.b, 0.0, here.a) * shown.flow[1].w);
+                 }}
+                 let a = sky_cloud_map(uva, i32(shown.misc.x)).a;
+                 let b = sky_cloud_map(uvb, i32(shown.misc.y)).a;
+                 out[id.x] = vec4<f32>(mix(a, b, shown.misc.z), here.r, here.b, here.a);
+             }}",
+            flow = crate::renderer::cloud_sky::cloud_flow_wgsl(),
+            shared = std::env::var("SHOWN_SHARED_ALTS").is_ok(),
+            w = MAP_WIDTH as f32,
+            h = MAP_HEIGHT as f32,
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: Some("shown_clouds"), source: ShaderSource::Wgsl(source.into()) });
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        let n = (cols * rows) as usize;
+        let size = (n * 16) as u64;
+        let out_buf = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read_buf = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST, mapped_at_creation: false });
+        let uni = device.create_buffer(&BufferDescriptor { label: None, size: 80, usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false });
+        let samp = device.create_sampler(&SamplerDescriptor {
+            address_mode_u: AddressMode::Repeat,
+            address_mode_v: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+        let show = |sky: &Sky| -> Vec<[f32; 4]> {
+            let gpu = sky.cloud_sky.as_ref().unwrap();
+            let e = &sky.extra;
+            let mut u = [0.0f32; 20];
+            u[0..4].copy_from_slice(&e.cloud_flow[0]);
+            u[4..8].copy_from_slice(&e.cloud_flow[1]);
+            u[8..12].copy_from_slice(&e.cloud_misc);
+            u[12..16].copy_from_slice(&e.cloud_eye);
+            u[16..20].copy_from_slice(&[cols as f32, row0 as f32, rows as f32, STEP as f32]);
+            queue.write_buffer(&uni, 0, bytemuck::cast_slice(&u));
+            let bind = device.create_bind_group(&BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    BindGroupEntry { binding: 0, resource: BindingResource::TextureView(gpu.maps_view()) },
+                    BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&samp) },
+                    BindGroupEntry { binding: 2, resource: BindingResource::TextureView(gpu.alts_view()) },
+                    BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
+                    BindGroupEntry { binding: 4, resource: out_buf.as_entire_binding() },
+                ],
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
+            }
+            enc.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, size);
+            queue.submit(Some(enc.finish()));
+            read_buf.slice(..).map_async(MapMode::Read, |_| {});
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let v: Vec<[f32; 4]> = bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().unwrap()).to_vec();
+            read_buf.unmap();
+            v
+        };
+        // The shown grid's coordinate of a map uv, and a bilinear read of it.
+        let grid_of = |uv: [f32; 2]| [(uv[0] * MAP_WIDTH as f32 - 0.5) / STEP as f32, uv[1] * MAP_HEIGHT as f32 - row0 as f32 - 0.5];
+        let read = |g: &[[f32; 4]], p: [f32; 2]| -> f32 {
+            let (x0, y0) = (p[0].floor(), p[1].floor().clamp(0.0, (rows - 2) as f32));
+            let (fx, fy) = (p[0] - x0, (p[1] - y0).clamp(0.0, 1.0));
+            let at = |i: i32, j: i32| g[(j.clamp(0, rows as i32 - 1) as u32 * cols + i.rem_euclid(cols as i32) as u32) as usize][0];
+            let (i, j) = (x0 as i32, y0 as i32);
+            let top = at(i, j) + (at(i + 1, j) - at(i, j)) * fx;
+            let bottom = at(i, j + 1) + (at(i + 1, j + 1) - at(i, j + 1)) * fx;
+            top + (bottom - top) * fy
+        };
+
+        let start = std::time::Instant::now();
+        let (mut last_apply, mut secs) = (-1.0f32, 0.0f32);
+        let mut last: Option<(Vec<[f32; 4]>, f64)> = None;
+        let (mut medians, mut backs, mut worst_spread) = (Vec::new(), 0usize, 0.0f32);
+        for frame in 0..(hz * seconds) as usize {
+            while start.elapsed().as_secs_f32() < frame as f32 / hz {
+                std::thread::yield_now();
+            }
+            let dt = 1.0 / hz;
+            secs += dt;
+            if secs - last_apply >= 1.0 {
+                let blend = if last_apply < 0.0 { 0.0 } else { 1.0 };
+                sky.apply_snapshot_blended(&device, &queue, &layout, &tod.snapshot(hour(secs), 0.0), secs, zenith, blend);
+                last_apply = secs;
+            }
+            let astro = space_soup_sky::time_of_day::Astronomy::at(&params, hour(secs), 0.0);
+            sky.tick(&queue, secs, dt, Some(&astro));
+            sky.step_clouds(&device, &queue, eye, true, None, false);
+            let now = sky.clouds.as_ref().unwrap().seconds;
+            let g = show(&sky);
+            if let Some((prev, then)) = last.take().filter(|_| secs > 4.0) {
+                let age = (now - then) as f32;
+                let mut shifts = Vec::new();
+                for pj in (0..rows.saturating_sub(16)).step_by(16) {
+                    for pi in (0..cols).step_by(32) {
+                        let mut texels = Vec::new();
+                        let (mut lo, mut hi) = (1.0f32, 0.0f32);
+                        for j in pj..pj + 16 {
+                            for i in pi..pi + 32 {
+                                let here = g[(j * cols + i) as usize];
+                                let uv = [((i * STEP) as f32 + 0.5) / MAP_WIDTH as f32, ((row0 + j) as f32 + 0.5) / MAP_HEIGHT as f32];
+                                let back = grid_of(advected_uv(map_dir(uv), here[1], eye[1], [here[2], here[3]], [0.0; 3], age));
+                                let p = [i as f32, j as f32];
+                                let mut fwd = [p[0] - back[0], p[1] - back[1]];
+                                if fwd[0] > cols as f32 / 2.0 {
+                                    fwd[0] -= cols as f32;
+                                } else if fwd[0] < -(cols as f32) / 2.0 {
+                                    fwd[0] += cols as f32;
+                                }
+                                let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1]).sqrt();
+                                if here[1] <= 0.0 || len < 1e-4 {
+                                    continue;
+                                }
+                                lo = lo.min(here[0]);
+                                hi = hi.max(here[0]);
+                                texels.push((here[0], back, [fwd[0] / len, fwd[1] / len]));
+                            }
+                        }
+                        if hi - lo < 0.3 || texels.len() < 256 {
+                            continue;
+                        }
+                        let cost = |s: f32| -> f32 { texels.iter().map(|&(w, b, f)| (read(&prev, [b[0] - s * f[0], b[1] - s * f[1]]) - w).abs()).sum() };
+                        let mut best = (cost(0.0), 0.0f32);
+                        for k in -40..=40 {
+                            let s = k as f32 * 0.1;
+                            let c = cost(s);
+                            if c < best.0 {
+                                best = (c, s);
+                            }
+                        }
+                        shifts.push(best.1);
+                    }
+                }
+                if !shifts.is_empty() {
+                    shifts.sort_by(f32::total_cmp);
+                    let q = |f: f32| shifts[((shifts.len() - 1) as f32 * f) as usize];
+                    let med = q(0.5);
+                    backs += usize::from(med < -0.15);
+                    worst_spread = worst_spread.max(q(0.9) - q(0.1));
+                    medians.push(med);
+                    let d = sky.cloud_sky.as_ref().unwrap().display();
+                    eprintln!(
+                        "SHOWN {secs:6.2} s  map {:.0}->{:.0} at {:.2}  gen {}  {} patches: shift p10 {:+.1} median {:+.2} p90 {:+.1}",
+                        d[0], d[1], d[2], sky.clouds.as_ref().unwrap().population.generation(), shifts.len(), q(0.1), med, q(0.9)
+                    );
+                }
+            }
+            last = Some((g, now));
+        }
+        let mean = medians.iter().sum::<f32>() / medians.len().max(1) as f32;
+        eprintln!("SHOWN summary: {} frames, median shift mean {mean:+.3} texels, {backs} frames with the median below -0.15; worst patch spread {worst_spread:.1}", medians.len());
+        assert!(worst_spread <= 0.25, "the shown clouds jump (p90 - p10 of {worst_spread:.1} texels in one frame)");
     }
 
     /// A new time-of-day snapshot must not change the light the lit shaders
