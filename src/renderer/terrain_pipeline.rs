@@ -4782,7 +4782,10 @@ mod mud_build_tests {
         let nowhere = pass.replacen(NOWHERE_OFF, NOWHERE_ON, 1);
         let (full, out) = (total(&pass), total(&nowhere));
         eprintln!("muddy: torch puddle reader {}, probe pass {full}, its nowhere twin {out}", total(&puddles));
-        assert!(total(&puddles) <= 2600, "the muddy torch puddle reader is {} by the proxy", total(&puddles));
+        // +31 on 2,600: the four-tap box PCF, which the proxy counts as larger
+        // than the unrolled nine-tap loop it replaced (water_pipeline's
+        // `WATER_CAP` has the Quest timings; rain_puddles_down 16.58 -> 16.40 ms).
+        assert!(total(&puddles) <= 2600 + 31, "the muddy torch puddle reader is {} by the proxy", total(&puddles));
         // The nowhere twin's job is to drop the probe lookup; the mud is in the
         // pass and the twin alike, so the twin must drop the same lookup it drops
         // from the deformless pass (whose share the nowhere test bounds).

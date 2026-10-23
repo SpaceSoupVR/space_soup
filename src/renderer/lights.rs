@@ -1607,17 +1607,42 @@ fn pcf(tex: texture_depth_2d, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>
     return sum / 9.0;
 }}
 
+// THE 3x3 BOX PCF IN FOUR TAPS. Nine compare taps a texel apart weigh the
+// four texels under them, along an axis, 1-t, 1, 1, t (t the fraction of
+// the centre, in texels from the first texel's centre). Two bilinear taps
+// placed so they weigh 1-t : 1 and 1 : t give exactly those weights, so two
+// by two taps carry the nine's filter. `pcf_box_taps` gives, for both axes
+// at once, the two taps' places in texels (`a`, `b`) and weights. Clamping
+// each tap into a tile, as `pcf_tile_at` does, stays exact for a tile of
+// whole texels: a clamped tap reads the edge texel alone, which is what the
+// nine's taps past the edge read too.
+struct PcfBoxTaps {{
+    a: vec2<f32>,
+    b: vec2<f32>,
+    wa: vec2<f32>,
+    wb: vec2<f32>,
+}}
+fn pcf_box_taps(p: vec2<f32>) -> PcfBoxTaps {{
+    let i = floor(p);
+    let t = p - i;
+    return PcfBoxTaps(i - 0.5 + 1.0 / (2.0 - t), i + 1.5 + t / (1.0 + t), 2.0 - t, 1.0 + t);
+}}
+
 // `pcf` on one layer of an array.
 fn pcf_array(tex: texture_depth_2d_array, layer: i32, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
     let c = shadow_coords(world_pos, light_view_proj);
     if (c.w < 0.5) {{ return 1.0; }}
-    let texel = 1.0 / vec2<f32>(textureDimensions(tex));
+    return pcf_array_at(tex, layer, c.xyz);
+}}
+
+fn pcf_array_at(tex: texture_depth_2d_array, layer: i32, c: vec3<f32>) -> f32 {{
+    let dim = vec2<f32>(textureDimensions(tex));
+    let q = pcf_box_taps(c.xy * dim - vec2<f32>(0.5));
     var sum = 0.0;
-    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
-        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
-            let off = vec2<f32>(f32(dx), f32(dy)) * texel;
-            sum = sum + textureSampleCompareLevel(tex, shadow_samp, c.xy + off, layer, c.z);
-        }}
+    for (var k = 0; k < 4; k = k + 1) {{
+        let second = vec2<bool>((k & 1) == 1, k >= 2);
+        let w = select(q.wa, q.wb, second);
+        sum += w.x * w.y * textureSampleCompareLevel(tex, shadow_samp, select(q.a, q.b, second) / dim, layer, c.z);
     }}
     return sum / 9.0;
 }}
@@ -1844,23 +1869,17 @@ fn pcf_tile(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, world_pos: 
     return pcf_tile_at(tex, tile, grid, c.xyz);
 }}
 
+// The 3x3 box in four taps (`pcf_box_taps`), each kept inside the tile.
 fn pcf_tile_at(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, c: vec3<f32>) -> f32 {{
-
     let tile_texel = grid / vec2<f32>(textureDimensions(tex));
-
-    let guard = tile_texel * 0.5;
-    let lo = guard;
-    let hi = vec2<f32>(1.0) - guard;
-
+    let lo = tile_texel * 0.5;
+    let hi = vec2<f32>(1.0) - lo;
+    let q = pcf_box_taps(c.xy / tile_texel - vec2<f32>(0.5));
     var sum = 0.0;
-    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
-        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
-
-            let off = vec2<f32>(f32(dx), f32(dy)) * tile_texel;
-            let local = clamp(c.xy + off, lo, hi);
-            let uv = (local + tile) / grid;
-            sum = sum + textureSampleCompareLevel(tex, shadow_samp, uv, c.z);
-        }}
+    for (var k = 0; k < 4; k = k + 1) {{
+        let second = vec2<bool>((k & 1) == 1, k >= 2);
+        let w = select(q.wa, q.wb, second);
+        sum += w.x * w.y * pcf_tent_tap(tex, tile, grid, select(q.a, q.b, second) * tile_texel, lo, hi, c.z);
     }}
     return sum / 9.0;
 }}
@@ -8627,5 +8646,174 @@ fn tent_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let (max, mean) = spread(&got, 2);
         eprintln!("lean at f16 (f32 maths): max {max:.2e}, mean {mean:.2e}");
         assert!(max <= 2e-3, "lean: max {max}");
+    }
+}
+
+#[cfg(test)]
+mod pcf_four_tap_tests {
+    use super::*;
+
+    /// One WGSL function of the lights block, by name, to its closing brace.
+    fn wgsl_fn(src: &str, name: &str) -> String {
+        let start = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("no fn {name} in the lights block"));
+        let open = start + src[start..].find('{').unwrap();
+        let mut depth = 0;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[start..=open + i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("fn {name} does not close");
+    }
+
+    /// The four-tap box (`pcf_box_taps`) gives what the nine taps a texel
+    /// apart gave, on a whole map, on a tile of an atlas (clamped at the
+    /// tile's edges) and on a layer of an array, at every place including
+    /// past the edges.
+    #[test]
+    fn four_taps_filter_as_the_nine_did() {
+        let instance = wgpu::Instance::default();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        let (w, h) = (38u32, 29u32); // tiles of whole texels, as an atlas has
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pcf_test_depth"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 2 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut seed = 0x2545_f491u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        // Blocky depths, so edges run through the map as shadow edges do.
+        let depths: Vec<u16> = (0..w * h * 2).map(|_| if next() % 3 == 0 { 20_000 } else { 45_000 }).collect();
+        queue.write_texture(
+            texture.as_image_copy(),
+            bytemuck::cast_slice(&depths),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 2), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 2 },
+        );
+        let flat = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: 0, array_layer_count: Some(1), ..Default::default() });
+        let array = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+
+        let block = wgsl_lights_block(0, 0);
+        let taps_struct = &block[block.find("struct PcfBoxTaps").unwrap()..];
+        let taps_struct = &taps_struct[..=taps_struct.find('}').unwrap()];
+        let shipped = ["pcf_box_taps", "pcf_tent_tap", "pcf_tile_at", "pcf_array_at"].map(|n| wgsl_fn(&block, n)).join("\n");
+        let shipped = format!("{taps_struct}\n{shipped}");
+        let source = format!(
+            "@group(0) @binding(0) var flat_tex: texture_depth_2d;
+             @group(0) @binding(1) var array_tex: texture_depth_2d_array;
+             @group(0) @binding(2) var shadow_samp: sampler_comparison;
+             @group(0) @binding(3) var<storage, read> places: array<vec4<f32>>;
+             @group(0) @binding(4) var<storage, read_write> out: array<vec4<f32>>;
+             {shipped}
+             fn nine_tile(tile: vec2<f32>, grid: vec2<f32>, c: vec3<f32>) -> f32 {{
+                 let tile_texel = grid / vec2<f32>(textureDimensions(flat_tex));
+                 let lo = tile_texel * 0.5;
+                 let hi = vec2<f32>(1.0) - lo;
+                 var sum = 0.0;
+                 for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
+                     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
+                         let local = clamp(c.xy + vec2<f32>(f32(dx), f32(dy)) * tile_texel, lo, hi);
+                         sum = sum + textureSampleCompareLevel(flat_tex, shadow_samp, (local + tile) / grid, c.z);
+                     }}
+                 }}
+                 return sum / 9.0;
+             }}
+             fn nine_array(c: vec3<f32>) -> f32 {{
+                 let texel = 1.0 / vec2<f32>(textureDimensions(array_tex));
+                 var sum = 0.0;
+                 for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
+                     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
+                         sum = sum + textureSampleCompareLevel(array_tex, shadow_samp, c.xy + vec2<f32>(f32(dx), f32(dy)) * texel, 1, c.z);
+                     }}
+                 }}
+                 return sum / 9.0;
+             }}
+             @compute @workgroup_size(64)
+             fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
+                 if (id.x >= arrayLength(&places)) {{ return; }}
+                 let c = places[id.x].xyz;
+                 let atlas = vec2<f32>(2.0, 1.0);
+                 out[id.x * 3u] = vec4<f32>(nine_tile(vec2<f32>(0.0), vec2<f32>(1.0), c), pcf_tile_at(flat_tex, vec2<f32>(0.0), vec2<f32>(1.0), c), 0.0, 0.0);
+                 out[id.x * 3u + 1u] = vec4<f32>(nine_tile(vec2<f32>(1.0, 0.0), atlas, c), pcf_tile_at(flat_tex, vec2<f32>(1.0, 0.0), atlas, c), 0.0, 0.0);
+                 out[id.x * 3u + 2u] = vec4<f32>(nine_array(c), pcf_array_at(array_tex, 1, c), 0.0, 0.0);
+             }}"
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pcf_four_tap"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+        // Places over the whole map and a texel and a half past every edge.
+        let places: Vec<[f32; 4]> = (0..4096)
+            .map(|_| {
+                let r = |n: u32| (n % 100_000) as f32 / 100_000.0;
+                [r(next()) * 1.2 - 0.1, r(next()) * 1.2 - 0.1, 0.3 + r(next()) * 0.4, 0.0]
+            })
+            .collect();
+        use wgpu::util::DeviceExt;
+        let places_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&places), usage: wgpu::BufferUsages::STORAGE });
+        let out_size = (places.len() * 3 * 16) as u64;
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: out_size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: out_size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&flat) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&array) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: places_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: out_buf.as_entire_binding() },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups((places.len() as u32).div_ceil(64), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, out_size);
+        queue.submit([encoder.finish()]);
+        read_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let out: Vec<[f32; 4]> = bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().unwrap()).to_vec();
+        let mut worst = [0.0f32; 3];
+        let mut partial = 0;
+        for (i, o) in out.iter().enumerate() {
+            worst[i % 3] = worst[i % 3].max((o[0] - o[1]).abs());
+            partial += (o[0] > 0.01 && o[0] < 0.99) as usize;
+        }
+        println!("four taps against nine, worst difference: whole map {:.5}, atlas tile {:.5}, array layer {:.5}; {partial} of {} filtered values partial", worst[0], worst[1], worst[2], out.len());
+        assert!(partial > out.len() / 4, "the places should fall on shadow edges, not only in light or shade");
+        // The sampler's bilinear weights are fixed point (8 fraction bits on
+        // common GPUs), so both filters are exact only to about 1/256 a tap.
+        for (what, d) in ["whole map", "atlas tile", "array layer"].iter().zip(worst) {
+            assert!(d < 1.0 / 64.0, "{what}: four taps differ from nine by {d}");
+        }
     }
 }

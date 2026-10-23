@@ -2209,12 +2209,19 @@ mod ring_size_tests {
         let (ringed, ringless) = (total(true), total(false));
         eprintln!("water by the proxy: ringed {ringed}, ringless {ringless}, the rings {}", ringed - ringless);
         assert!(ringed > ringless, "the ringed twin has the rings in it");
-        assert!(ringed <= 2424, "the ringed twin is past the instruction cache: {ringed} by the proxy (2,424 at most)");
+        // 2,424 was the cap; +89 is the four-tap box PCF (`lights::pcf_box_taps`,
+        // 2026-10-23). The proxy counts a loop's body once, so the nine-tap
+        // loop it replaced read as smaller, but the driver unrolls a 3x3 loop
+        // of constant bounds: on the Quest the four taps made the water views
+        // faster (beach_south 13.89 -> 13.58 ms, pond 14.80 -> 14.69), not
+        // slower as a crossed cliff would.
+        const WATER_CAP: usize = 2424 + 89;
+        assert!(ringed <= WATER_CAP, "the ringed twin is past the instruction cache: {ringed} by the proxy ({WATER_CAP} at most)");
         for mud in WaterMud::ALL {
             let twin = water_for_mud(&water_wgsl_with(false, true), mud).unwrap_or_else(|| panic!("{mud:?}: the mud edits moved"));
             let size: usize = inlined_sizes(&twin, "fs_main").iter().map(|r| r.own * r.copies).sum();
             eprintln!("ringed {mud:?}: {size}");
-            assert!(size <= 2424, "the ringed {mud:?} twin is past the instruction cache: {size} by the proxy");
+            assert!(size <= WATER_CAP, "the ringed {mud:?} twin is past the instruction cache: {size} by the proxy");
         }
         assert!(ringed - ringless <= 110, "the rings' loop grew: {} by the proxy", ringed - ringless);
         let raining: usize = inlined_sizes(&water_wgsl_raining(false), "fs_main").iter().map(|r| r.own * r.copies).sum();

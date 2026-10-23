@@ -2492,8 +2492,8 @@ const SHADOW_TENT_OPAQUE: (&str, &str) = (
 );
 
 const SHADOW_BOX_OPAQUE: (&str, &str) = (
-    "    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {",
-    "    for (var dx: i32 = -1; dx <= select(1, i32(camera.shadow_params.w), camera.shadow_params.w > 0.5); dx = dx + 1) {",
+    "    for (var k = 0; k < 4; k = k + 1) {\n        let second",
+    "    for (var k = 0; k < select(4, i32(camera.shadow_params.w), camera.shadow_params.w > 0.5); k = k + 1) {\n        let second",
 );
 
 /// PER-FACE LAMP LISTS (the AAA doc's rank 3, without splitting the draw):
