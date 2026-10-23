@@ -2931,6 +2931,10 @@ mod render_tests {
             }
             let astro = space_soup_sky::time_of_day::Astronomy::at(&params, hour(secs), 0.0);
             sky.tick(&queue, secs, dt, Some(&astro));
+            // `SHOWN_NO_HISTORY=1`: every map its own march alone, the history let go.
+            if std::env::var("SHOWN_NO_HISTORY").is_ok() {
+                sky.set_cloud_history_reject([0.0, 1e-6], [0.0, 1e-6], true);
+            }
             sky.step_clouds(&device, &queue, eye, true, None, false);
             let now = sky.clouds.as_ref().unwrap().seconds;
             let g = show(&sky);

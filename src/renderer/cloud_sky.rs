@@ -1485,15 +1485,30 @@ const W2: f32 = {:.6};
     let c = vec2<i32>(pos.xy);
     var w = array<f32, 5>(W2, W1, W0, W1, W2);
     var sum = vec4<f32>(0.0);
+    var lo = vec4<f32>(1e30);
+    var hi = vec4<f32>(-1e30);
     for (var j = 0; j < 5; j = j + 1) {{
         let y = clamp(c.y + j - 2, 0, size.y - 1);
         var row = vec4<f32>(0.0);
         for (var i = 0; i < 5; i = i + 1) {{
             let x = (c.x + i - 2 + size.x) % size.x;
-            row = row + w[i] * textureLoad(raw, vec2<i32>(x, y), 0);
+            let t = textureLoad(raw, vec2<i32>(x, y), 0);
+            row = row + w[i] * t;
+            if (abs(i - 2) <= 1 && abs(j - 2) <= 1) {{
+                lo = min(lo, t);
+                hi = max(hi, t);
+            }}
         }}
         sum = sum + w[j] * row;
     }}
+    // NO RINGING (2026-10-23): the sharpening's lobes overshot at a cloud's
+    // edge, and two texels out into clear sky they left the cloud's light
+    // over sky that showed whole -- a lit outline over nothing, unblended,
+    // brightest against the night sky (user, headset: the clouds' "entire
+    // outer wispy layer outline lit unblended") and in rings round holes.
+    // Held within its 3 x 3 neighbours a texel keeps the sharpening along
+    // smooth gradients and cannot step past either side of an edge.
+    sum = clamp(sum, lo, hi);
     return vec4<f32>(max(sum.rgb, vec3<f32>(0.0)), clamp(sum.a, 0.0, 1.0));
 }}
 "#,
