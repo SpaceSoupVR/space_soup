@@ -1522,6 +1522,13 @@ fn star_colour(bv: f32) -> vec3<f32> {{
 }}
 
 const MILKY_WAY_SCALE: f32 = {milky_way_scale:?};
+// A star's core at most this far past white (exposed, before the curve),
+// and its glare beyond: STAR_GLOW (exposed) per doubling past it, falling
+// off over STAR_GLOW_PX pixels and gone by STAR_GLOW_REACH_PX.
+const STAR_CORE_PEAK: f32 = 2.0;
+const STAR_GLOW: f32 = 0.12;
+const STAR_GLOW_PX: f32 = 1.0;
+const STAR_GLOW_REACH_PX: f32 = 4.0;
 
 // The Milky Way at celestial direction q (NASA Deep Star Maps, its bright
 // stars the catalogue's): radiance per a magnitude-0 star's illuminance.
@@ -1552,6 +1559,10 @@ fn sky_stars(d: vec3<f32>, px: f32) -> vec3<f32> {{
     let f = (w * 0.5 + 0.5) * STAR_CELLS;
     let base = floor(f - 0.5);
     let sigma = max(0.5 * px, 1.5e-4);
+    let exposure = max(camera.post_params.x, 1e-30);
+    // The glow stays inside the cells read here: under half a cell (equal
+    // angles, 90 deg / STAR_CELLS) from its star.
+    let reach = min(STAR_GLOW_REACH_PX * px, 0.4 * (SKY_PI * 0.5) / STAR_CELLS);
     let airmass = 1.0 / (d.y + 0.025 * exp(-11.0 * d.y));
     let dimmed = exp(-sky_extra.extinction.xyz * airmass);
     let twinkle_depth = clamp((airmass - 2.5) / 10.0, 0.0, 0.6) * sky_extra.stars.w;
@@ -1578,7 +1589,19 @@ fn sky_stars(d: vec3<f32>, px: f32) -> vec3<f32> {{
             let at = star_face_dir(face, tan(((cell + place) / STAR_CELLS * 2.0 - 1.0) * (SKY_PI * 0.25)));
             let off = length(cross(q, at));
             let flux = sky_extra.stars.x * exp2(-1.3287712 * m) * fade;
-            let spread = flux / (2.0 * SKY_PI * sigma * sigma) * exp(-off * off / (2.0 * sigma * sigma));
+            // A POINT, HOWEVER BRIGHT (2026-10-23, user: some stars "a bit too
+            // big"). All of a bright star in one Gaussian ran its peak far past
+            // white, and the clipped plateau widened with its brightness to a
+            // disc 3-4 pixels across. Its core is held to STAR_CORE_PEAK past
+            // white at the eye's exposure; the rest reads as the eye's glare,
+            // a glow growing with the log of how far past it was.
+            let core = min(flux, STAR_CORE_PEAK * 2.0 * SKY_PI * sigma * sigma / exposure);
+            var spread = core / (2.0 * SKY_PI * sigma * sigma) * exp(-off * off / (2.0 * sigma * sigma));
+            if (flux > core) {{
+                let r = off / max(px, 1e-7);
+                let fall = max(1.0 - off / reach, 0.0);
+                spread = spread + STAR_GLOW * log2(flux / core) / exposure * exp(-r / STAR_GLOW_PX) * fall * fall;
+            }}
             let h = star_hash(u32(cell.x), u32(cell.y), face + 6u * second);
             let tw = 1.0 + twinkle_depth * (0.6 * sin(sky_extra.mode.z * (11.0 + 7.0 * h.y) + 40.0 * h.z) + 0.4 * sin(sky_extra.mode.z * (23.0 + 9.0 * h.z) + 17.0 * h.y));
             sum = sum + spread * star_colour(t.w * 2.55 - 0.5) * tw;
