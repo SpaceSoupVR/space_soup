@@ -304,6 +304,8 @@ pub struct CloudSky {
     /// one is waiting to be drawn.
     envelope_generation: u64,
     envelope_pending: bool,
+    /// Whether the last `encode_at` splatted the envelopes (`CLOUDSUBMIT`).
+    splatted: bool,
     maps: Texture,
     map_layers: [TextureView; 3],
     array_view: TextureView,
@@ -793,6 +795,7 @@ impl CloudSky {
             splat_ranges: std::array::from_fn(|_| 0..0),
             envelope_generation: 0,
             envelope_pending: false,
+            splatted: false,
             maps,
             map_layers,
             array_view,
@@ -953,6 +956,11 @@ impl CloudSky {
         self.fresh || whole || self.next_row == 0
     }
 
+    /// Whether the last `encode_at` splatted the envelopes.
+    pub fn splatted(&self) -> bool {
+        self.splatted
+    }
+
     /// No map is drawn yet: the first is drawn whole, of the sky now.
     pub fn is_fresh(&self) -> bool {
         self.fresh
@@ -1006,7 +1014,8 @@ impl CloudSky {
         // built from one population top to bottom; re-splatted mid-build it
         // held bands of rows from two (research 2026-10-21, cause (c)). The
         // ground's shadow reads the same envelopes, so it changes with it.
-        if self.envelope_pending && self.starts_map(whole) {
+        self.splatted = self.envelope_pending && self.starts_map(whole);
+        if self.splatted {
             self.envelope_pending = false;
             for k in 0..POPULATED {
                 let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {

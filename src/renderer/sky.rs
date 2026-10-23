@@ -1148,9 +1148,25 @@ impl Sky {
             // its centre moves: 16 m texels, and the clouds cross a metre in
             // those frames (0.33 ms a draw on the Quest).
             let draw_shadow = shadow_moved || !was_active || cs.frames % CLOUD_SHADOW_EVERY == 0;
+            let began = gpu.starts_map(whole);
             gpu.encode_at(&mut encoder, queue, &m, &u, shadow.filter(|_| cs.active && draw_shadow), whole, now, at);
             mark(3);
-            queue.submit(Some(encoder.finish()));
+            let t = std::time::Instant::now();
+            let commands = encoder.finish();
+            let finish_ms = t.elapsed().as_secs_f32() * 1000.0;
+            queue.submit(Some(commands));
+            // The headset showed this submit at 10-28 ms every ~20 s
+            // (CLOUDTIME, 2026-10-23), a dropped frame each: named here.
+            let submit_ms = t.elapsed().as_secs_f32() * 1000.0 - finish_ms;
+            if finish_ms + submit_ms > 8.0 {
+                let splats: usize = (0..crate::renderer::cloud_sky::cloud_population::POPULATED).map(|k| c.population.splats(k).0.len()).sum();
+                log::info!(
+                    "CLOUDSUBMIT finish {finish_ms:.1} ms, submit {submit_ms:.1} ms; envelopes splatted {}, ground shadow {}, map begun {}, {splats} splats",
+                    gpu.splatted(),
+                    draw_shadow && cs.active,
+                    began,
+                );
+            }
         }
         mark(4);
         self.cloud_laps = laps;
