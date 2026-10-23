@@ -23,11 +23,20 @@ pub(crate) fn load_primitive_texture(
         .transmission()
         .map(|t| t.transmission_factor())
         .unwrap_or(0.0);
+    // MASK (foliage cards, grates, fences): cut where the material says.
+    // Forced opaque with the rest, each drew as its whole quad (2026-10-23).
+    let mask = (material.alpha_mode() == gltf::material::AlphaMode::Mask).then(|| material.alpha_cutoff().unwrap_or(0.5));
     let force_opaque =
-        material.alpha_mode() != gltf::material::AlphaMode::Blend && transmission <= 0.0;
+        mask.is_none() && material.alpha_mode() != gltf::material::AlphaMode::Blend && transmission <= 0.0;
 
     let base = match pbr.base_color_texture() {
-        Some(info) => decode_image(&images[info.texture().source().index()], force_opaque),
+        Some(info) => {
+            let mut px = decode_image(&images[info.texture().source().index()], force_opaque);
+            if let Some(cutoff) = mask {
+                px.0.chunks_exact_mut(4).for_each(|p| p[3] = mask_alpha(p[3], cutoff));
+            }
+            px
+        }
         None => {
             let c = pbr.base_color_factor();
             (
@@ -35,7 +44,9 @@ pub(crate) fn load_primitive_texture(
                     (c[0] * 255.0) as u8,
                     (c[1] * 255.0) as u8,
                     (c[2] * 255.0) as u8,
-                    if force_opaque {
+                    if let Some(cutoff) = mask {
+                        mask_alpha((c[3].clamp(0.0, 1.0) * 255.0).round() as u8, cutoff)
+                    } else if force_opaque {
                         255
                     } else {
 
@@ -59,6 +70,13 @@ pub(crate) fn load_primitive_texture(
     };
 
     create_mesh_material_texture(device, queue, layout, &base, &emissive)
+}
+
+/// A MASK material's texel alpha, cut at its `cutoff` (0..1): kept whole or
+/// gone, so the mesh shaders' fixed alpha test (`tex_color.a < 0.35`) cuts
+/// it where glTF says, and its mips average to the share of it kept.
+pub fn mask_alpha(a: u8, cutoff: f32) -> u8 {
+    if a as f32 >= cutoff.clamp(0.0, 1.0) * 255.0 { 255 } else { 0 }
 }
 
 static GLTF_ROUGHNESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -90,6 +108,16 @@ mod gloss_tests {
         assert_eq!(material_gloss_alpha(0.3, true), 77);
         assert_eq!(material_gloss_alpha(0.0, true), 0);
         assert_eq!(material_gloss_alpha(f32::NAN, true), 255);
+    }
+
+    #[test]
+    fn a_mask_material_is_cut_at_its_own_cutoff() {
+        use super::mask_alpha;
+        assert_eq!(mask_alpha(128, 0.5), 255);
+        assert_eq!(mask_alpha(127, 0.5), 0);
+        assert_eq!(mask_alpha(60, 0.2), 255, "a low cutoff keeps what the shader's 0.35 alone would cut");
+        assert_eq!(mask_alpha(200, 0.9), 0, "a high one cuts what it would keep");
+        assert_eq!(mask_alpha(0, 0.0), 255);
     }
 
     #[test]
