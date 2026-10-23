@@ -1231,6 +1231,7 @@ pub fn cloud_sky_shader() -> String {
         .replace("{EDGE_FRINGE_D}", &f(cl::EDGE_FRINGE_D))
         .replace("{EDGE_AGEING}", &f(cl::EDGE_AGEING))
         .replace("{EDGE_GAIN}", &f(cl::EDGE_GAIN))
+        .replace("{EDGE_AGEING_DEPTH}", &f(cl::EDGE_AGEING_DEPTH))
         .replace("{MAX_MARCH}", &f(cl::MAX_MARCH_M))
         .replace("{CIRRUS_TAU}", &f(cl::CIRRUS_TAU))
         .replace("{SUN_RADIUS}", &f(cl::SHADOW_DISC_RAD))
@@ -1485,6 +1486,7 @@ const EDGE_FRINGE: f32 = {EDGE_FRINGE};
 const EDGE_FRINGE_D: f32 = {EDGE_FRINGE_D};
 const EDGE_AGEING: f32 = {EDGE_AGEING};
 const EDGE_GAIN: f32 = {EDGE_GAIN};
+const EDGE_AGEING_DEPTH: f32 = {EDGE_AGEING_DEPTH};
 const MAX_MARCH: f32 = {MAX_MARCH};
 const CIRRUS_TAU: f32 = {CIRRUS_TAU};
 const SUN_RADIUS: f32 = {SUN_RADIUS};
@@ -1771,9 +1773,9 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
         let cut = min(DETAIL_EROSION * (0.8 + 0.5 * env.z) * e * pulse, 0.95) * (1.0 - smoothstep(0.0, ERODE_DEPTH, d));
         d = clamp((d - cut) / (1.0 - cut), 0.0, 1.0);
     }
-    // Frayed at the fringe and thinned with age (`cloud_layers::edge_gain`).
+    // Frayed at the fringe, and at its margins with age (`cloud_layers::edge_gain`).
     let fringe = EDGE_FRINGE + (1.0 - EDGE_FRINGE) * smoothstep(0.0, EDGE_FRINGE_D, d);
-    let ageing = 1.0 - EDGE_AGEING * smoothstep(0.6, 1.0, env.z);
+    let ageing = 1.0 - EDGE_AGEING * smoothstep(0.6, 1.0, env.z) * (1.0 - smoothstep(0.0, EDGE_AGEING_DEPTH, d));
     return min(d * EDGE_GAIN * fringe * ageing, 1.0) * a.w;
 }
 
