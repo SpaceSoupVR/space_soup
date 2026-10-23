@@ -242,7 +242,15 @@ impl XrRenderer {
         self.sky.tick(&self.wgpu_queue, seconds, dt, Some(&astro));
         // The models' room light follows the blend too (`room_light::relit`).
         let t = self.sky.blend_progress();
-        self.tod_relight_rooms(self.tod.daylight_from + (self.tod.daylight - self.tod.daylight_from) * t);
+        let daylight_now = self.tod.daylight_from + (self.tod.daylight - self.tod.daylight_from) * t;
+        self.tod_relight_rooms(daylight_now);
+        // Relit on the GPU, the probes follow the same blend
+        // (`ProbeStream::relight`, at the frame's `probe_daylight`), and so
+        // does the brightness the reflections are matched by.
+        if self.probe_stream.get_mut().as_ref().is_some_and(|s| s.smooth()) {
+            self.tod.probe_daylight.set(daylight_now);
+            self.tod_probe_brightness();
+        }
         let t2 = std::time::Instant::now();
         let ground = self.tod.ground_build.is_some();
         self.poll_ground_rebuild();

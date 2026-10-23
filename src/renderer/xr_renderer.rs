@@ -1756,7 +1756,8 @@ impl XrRenderer {
         );
 
         let mut eye = self.tod_meter_probes(&descs, resolution, &source);
-        let source = self.tod_probe_source(source);
+        let smooth = self.levers.smooth_probes;
+        let source = if smooth { source } else { self.tod_probe_source(source) };
 
         eye.set_portals(&portals);
         *self.eye.borrow_mut() = eye;
@@ -1771,16 +1772,26 @@ impl XrRenderer {
                 self.tod_take_buildings(pending).into_iter().map(|(lo, hi, f)| ((lo, hi), f)).unzip()
             };
         self.probe_buildings = buildings;
-        let stream = crate::renderer::probe_stream::ProbeStream::new_with_extras(
-            &self.wgpu_device,
-            &self.wgpu_queue,
-            resolution,
-            descs.len(),
-            source,
-            depth,
-            sky_faces,
-            building_faces,
-        );
+        let stream = if smooth {
+            let smooth = crate::renderer::probe_stream::SmoothSources {
+                lamps: self.tod.probe_lamps.clone(),
+                buildings: self.tod.buildings.iter().map(|(f, l)| (f.to_vec(), l.as_deref().cloned())).collect(),
+                daylight: self.tod.probe_daylight.get(),
+            };
+            drop(building_faces);
+            crate::renderer::probe_stream::ProbeStream::new_smooth(&self.wgpu_device, &self.wgpu_queue, resolution, descs.len(), source, depth, sky_faces, smooth)
+        } else {
+            crate::renderer::probe_stream::ProbeStream::new_with_extras(
+                &self.wgpu_device,
+                &self.wgpu_queue,
+                resolution,
+                descs.len(),
+                source,
+                depth,
+                sky_faces,
+                building_faces,
+            )
+        };
 
         self.probe_outdoor_volume = crate::renderer::probe_stream::outdoor_volume(&descs);
 

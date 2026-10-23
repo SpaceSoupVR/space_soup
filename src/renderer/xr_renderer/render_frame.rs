@@ -2345,6 +2345,7 @@ impl XrRenderer {
                     // hangs the headset showed while the clock ran (2026-10-20).
                     let t0 = std::time::Instant::now();
                     stream.resolve(&self.wgpu_queue, &mut upload);
+                    stream.relight(&self.wgpu_device, &self.wgpu_queue, self.tod.probe_daylight.get());
                     let ms = t0.elapsed().as_secs_f32() * 1000.0;
                     if ms > 2.0 {
                         log::info!("TODTIME probe uploads {ms:.1} ms");

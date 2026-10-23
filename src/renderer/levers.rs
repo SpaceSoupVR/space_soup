@@ -89,6 +89,12 @@ pub struct Levers {
     /// the headset's GPU frame time is over budget (`cloud_pace`); off
     /// builds a slice every frame outside closed rooms, to price it.
     pub cloud_pace: bool,
+    /// The reflection probes relit on the GPU at every frame's daylight
+    /// (`ProbeStream::new_smooth`), not rebuilt on the CPU at 25% steps; off
+    /// is the stepped relight. Read when the level's probes load. Costs two
+    /// more cube arrays (2 x 51 MB at 256 px) and the probe array a storage
+    /// usage (2026-10-22).
+    pub smooth_probes: bool,
 
     pub effects: bool,
 
@@ -288,6 +294,7 @@ impl Default for Levers {
             cloud_shadows: true,
             clouds: true,
             cloud_pace: true,
+            smooth_probes: true,
             effects: true,
             muzzle_test: true,
             mud_test: false,
@@ -464,6 +471,7 @@ impl Levers {
         flag("cloud_shadows", self.cloud_shadows, d.cloud_shadows);
         flag("clouds", self.clouds, d.clouds);
         flag("cloud_pace", self.cloud_pace, d.cloud_pace);
+        flag("smooth_probes", self.smooth_probes, d.smooth_probes);
         flag("effects", self.effects, d.effects);
         flag("muzzle_test", self.muzzle_test, d.muzzle_test);
         flag("mud_test", self.mud_test, d.mud_test);
