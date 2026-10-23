@@ -90,6 +90,14 @@ pub const HISTORY_NEW: f32 = 0.3;
 /// (`Levers::cloud_history_tight`).
 pub const HISTORY_REJECT: [f32; 2] = [0.03, 0.1];
 pub const HISTORY_REJECT_WIDE: [f32; 2] = [0.2, 0.5];
+/// BUT NOT AT THE HORIZON: there a step of the march spans kilometres, one
+/// map's grain is larger than the tight pair, and letting it go there
+/// shows each map's own sample fraction, the horizon's flicker line (a
+/// still sky's horizon, map to map: 0.0045 wide, 0.0085 tight; 0.0113 with
+/// no history, the line the user saw). Far clouds move a pixel or less
+/// between maps, so they leave no ghost to cut. Below `HISTORY_HORIZON_UP`
+/// .0 (the sine of the elevation) the wide pair holds, above .1 the tight.
+pub const HISTORY_HORIZON_UP: [f32; 2] = [0.06, 0.15];
 /// The history is carried a second time by the altitude the old map holds
 /// (`hist_carry`), and that carry kept where the old map agrees with itself
 /// there to this share of the altitude.
@@ -312,8 +320,9 @@ pub struct CloudSky {
     /// the one read).
     history_uniform: Buffer,
     history_groups: [BindGroup; 3],
-    /// `HISTORY_REJECT`, or the pair `set_history_reject` gave.
-    history_reject: [f32; 2],
+    /// Where history is let go above the horizon and at it (`HISTORY_REJECT`,
+    /// `HISTORY_REJECT_WIDE`), or what `set_history_reject` gave.
+    history_reject: [f32; 4],
     /// The winds the maps are carried on (`flow_winds`), and how many maps
     /// have been begun (the jitter's index).
     winds: [[f32; 4]; LAYERS],
@@ -789,7 +798,7 @@ impl CloudSky {
             shadow_pipeline,
             history_uniform,
             history_groups,
-            history_reject: HISTORY_REJECT,
+            history_reject: [HISTORY_REJECT[0], HISTORY_REJECT[1], HISTORY_REJECT_WIDE[0], HISTORY_REJECT_WIDE[1]],
             winds: [[0.0; 4]; LAYERS],
             maps_begun: 0,
             prev: 0,
@@ -911,10 +920,10 @@ impl CloudSky {
         self.winds = winds;
     }
 
-    /// Where a map's history is let go (`HISTORY_REJECT`); taken as a map
-    /// begins.
-    pub fn set_history_reject(&mut self, reject: [f32; 2]) {
-        self.history_reject = reject;
+    /// Where a map's history is let go above the horizon (`HISTORY_REJECT`)
+    /// and at it (`HISTORY_HORIZON_UP`); taken as a map begins.
+    pub fn set_history_reject(&mut self, above: [f32; 2], horizon: [f32; 2]) {
+        self.history_reject = [above[0], above[1], horizon[0], horizon[1]];
     }
 
     /// Whether the next `encode_at` begins a map (and so takes its moment).
@@ -1063,7 +1072,7 @@ impl CloudSky {
                 w[2],
                 w[3],
                 [if take { HISTORY_NEW } else { 1.0 }, self.scales[t] / self.scales[h], jitter, et[1]],
-                [self.history_reject[0], self.history_reject[1], 0.0, 0.0],
+                self.history_reject,
             ];
             queue.write_buffer(&self.history_uniform, 0, bytemuck::cast_slice(&carried));
         }
@@ -1226,6 +1235,8 @@ pub fn cloud_sky_shader() -> String {
         .replace("{ENVELOPE_TEXEL}", &f(cp::ENVELOPE_TEXEL_M))
         .replace("{ENVELOPE_TOP_MIP}", &f((ENVELOPE_MIPS - 1) as f32))
         .replace("{ALT_FILL_WEIGHT}", &f(ALT_FILL_WEIGHT))
+        .replace("{HISTORY_HORIZON_UP0}", &f(HISTORY_HORIZON_UP[0]))
+        .replace("{HISTORY_HORIZON_UP1}", &f(HISTORY_HORIZON_UP[1]))
         .replace("{HISTORY_REFETCH}", if HISTORY_REFETCH { "true" } else { "false" })
         .replace("{HISTORY_ALT_AGREE}", &f(HISTORY_ALT_AGREE))
         + &cloud_flow_wgsl()
@@ -1386,7 +1397,7 @@ struct History {
     // altitude.
     misc: vec4<f32>,
     // Where old and new disagree from (x) and to (y), the new march is
-    // taken alone (`HISTORY_REJECT`).
+    // taken alone (`HISTORY_REJECT`); at the horizon from z to w.
     reject: vec4<f32>,
 }
 @group(1) @binding(0) var<uniform> hist: History;
@@ -1395,6 +1406,8 @@ struct History {
 
 const PI: f32 = 3.14159265;
 const HISTORY_REFETCH: bool = {HISTORY_REFETCH};
+const HISTORY_HORIZON_UP0: f32 = {HISTORY_HORIZON_UP0};
+const HISTORY_HORIZON_UP1: f32 = {HISTORY_HORIZON_UP1};
 const HISTORY_ALT_AGREE: f32 = {HISTORY_ALT_AGREE};
 const EARTH: f32 = {EARTH};
 const DETAIL_RATIO: f32 = {DETAIL_RATIO};
@@ -2113,7 +2126,8 @@ fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
             }
         }
         let old = hist_bspline(huv, size);
-        let w = mix(hist.misc.x, 1.0, smoothstep(hist.reject.x, hist.reject.y, abs(old.a - light.a)));
+        let reject = mix(hist.reject.zw, hist.reject.xy, smoothstep(HISTORY_HORIZON_UP0, HISTORY_HORIZON_UP1, dir.y));
+        let w = mix(hist.misc.x, 1.0, smoothstep(reject.x, reject.y, abs(old.a - light.a)));
         light = mix(vec4<f32>(old.rgb * hist.misc.y, old.a), light, w);
         alts = mix(old_alts, alts, w);
     }
@@ -2684,7 +2698,7 @@ pub(crate) mod tests {
         }
         // With the history (`HISTORY_NEW` 0.3) let go at 0.2 to 0.5: off by
         // 0.0399, 8.9% ghosts; at `HISTORY_REJECT` 0.03 to 0.1, 0.0188 and
-        // 0.94%. Without history, 0.0109 and 0.80% while each map sampled at
+        // 0.94%, and 0.0200 and 1.07% with the horizon kept wide. Without history, 0.0109 and 0.80% while each map sampled at
         // its own fraction (but bands on the headset); at one fraction for
         // every map, 0 and 0.
         assert!(off < 0.025, "the accumulated map is off the sky of its moment by {off:.5}");
@@ -2765,7 +2779,7 @@ pub(crate) mod tests {
     /// two maps of one sky is a flicker (user, 2026-10-22: a line flickering
     /// just above the sea's horizon).
     #[test]
-    #[ignore = "open again since HISTORY_NEW went back to 0.3 (2026-10-22 evening): the no-history fix regressed the look"]
+    #[ignore = "open: with the golden jitter a still sky's horizon moves 0.0045 a map (0.0113 with no history, the line the user saw); 0 needs one fraction, which banded the clouds (2026-10-22)"]
     fn a_still_sky_holds_still_at_the_horizon_from_map_to_map() {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         let field = CloudField::build(7);

@@ -1035,9 +1035,9 @@ impl Sky {
     }
 
     /// Where the cloud maps' history is let go (`CloudSky::set_history_reject`).
-    pub fn set_cloud_history_reject(&mut self, reject: [f32; 2]) {
+    pub fn set_cloud_history_reject(&mut self, above: [f32; 2], horizon: [f32; 2]) {
         if let Some(gpu) = self.cloud_sky.as_mut() {
-            gpu.set_history_reject(reject);
+            gpu.set_history_reject(above, horizon);
         }
     }
 
