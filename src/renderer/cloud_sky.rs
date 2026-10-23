@@ -1193,6 +1193,16 @@ pub fn cloud_sky_shader() -> String {
         .replace("{EARTH}", &format!("{:.1}", c::EARTH_RADIUS_M))
         .replace("{DETAIL_RATIO}", &f(cl::DETAIL_RATIO))
         .replace("{DETAIL_EROSION}", &f(cl::DETAIL_EROSION))
+        .replace("{CU_SOLID0}", &f(cl::CU_SOLID[0]))
+        .replace("{CU_SOLID1}", &f(cl::CU_SOLID[1]))
+        .replace("{CU_CORE_FULL}", &f(cl::CU_CORE_FULL))
+        .replace("{CU_BASE_CURL}", &f(cl::CU_BASE_CURL))
+        .replace("{CU_LOBE}", &f(cl::CU_LOBE))
+        .replace("{CU_TURRET}", &f(cl::CU_TURRET))
+        .replace("{CU_BASE_LUMP}", &f(cl::CU_BASE_LUMP))
+        .replace("{CU_LOBE_MEAN}", &f(cl::CU_LOBE_MEAN))
+        .replace("{CU_TOP_FADE}", &f(cl::CU_TOP_FADE))
+        .replace("{ERODE_DEPTH}", &f(cl::ERODE_DEPTH))
         .replace("{CHURN_WARP}", &f(cl::CHURN_WARP))
         .replace("{SHAPE_OCTAVES}", &cl::SHAPE_OCTAVES.map(f).join(", "))
         .replace("{CHURN_PULSE}", &f(cl::CHURN_PULSE))
@@ -1437,6 +1447,16 @@ const HISTORY_ALT_AGREE: f32 = {HISTORY_ALT_AGREE};
 const EARTH: f32 = {EARTH};
 const DETAIL_RATIO: f32 = {DETAIL_RATIO};
 const DETAIL_EROSION: f32 = {DETAIL_EROSION};
+const CU_SOLID0: f32 = {CU_SOLID0};
+const CU_SOLID1: f32 = {CU_SOLID1};
+const CU_CORE_FULL: f32 = {CU_CORE_FULL};
+const CU_BASE_CURL: f32 = {CU_BASE_CURL};
+const CU_LOBE: f32 = {CU_LOBE};
+const CU_TURRET: f32 = {CU_TURRET};
+const CU_BASE_LUMP: f32 = {CU_BASE_LUMP};
+const CU_LOBE_MEAN: f32 = {CU_LOBE_MEAN};
+const CU_TOP_FADE: f32 = {CU_TOP_FADE};
+const ERODE_DEPTH: f32 = {ERODE_DEPTH};
 const CHURN_WARP: f32 = {CHURN_WARP};
 const SHAPE_OCTAVES: vec3<f32> = vec3<f32>({SHAPE_OCTAVES});
 const CHURN_PULSE: f32 = {CHURN_PULSE};
@@ -1559,7 +1579,7 @@ fn local_coverage(k: u32, xz: vec2<f32>) -> f32 {
 // from it, the fallback's phase, unmerged (`EnvelopeSample::far`).
 fn envelope_far(k: u32, xz: vec2<f32>) -> vec4<f32> {
     let c = local_coverage(k, xz);
-    return vec4<f32>(c, 0.3 + 0.7 * c, FAR_PHASE, 0.0);
+    return vec4<f32>(c, 0.3 + 0.7 * c, FAR_PHASE, c);
 }
 
 // One envelope texel's sums as coverage, column top, phase and merge
@@ -1571,7 +1591,8 @@ fn envelope_of(e: vec4<f32>) -> vec4<f32> {
     let cover = clamp(e.x, 0.0, 1.0);
     let merge = clamp(1.0 - e.w / (e.x * e.x), 0.0, 1.0);
     let top = min(e.y / e.x * (0.35 + 0.65 * sqrt(cover)) * (1.0 + MERGE_LIFT * merge), 1.0);
-    return vec4<f32>(cover, top, clamp(e.z / e.x, 0.0, 1.0), merge);
+    // The fourth is the summed strength before the clamp (`EnvelopeSample::core`).
+    return vec4<f32>(cover, top, clamp(e.z / e.x, 0.0, 1.0), e.x);
 }
 
 // THE LAYER'S ENVELOPE at xz: its population's map, giving way to the
@@ -1678,8 +1699,23 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
     let fine_b = smoothstep(0.5, 1.0, r);
     let low = SHAPE_OCTAVES.x * n.g + SHAPE_OCTAVES.y * mix(n.b, MEAN_B, fine_b) + SHAPE_OCTAVES.z * mix(n.a, MEAN_A, fine_a);
     let base = clamp((n.r - (low - 1.0)) / (2.0 - low), 0.0, 1.0);
-    let shape = base * height_profile(lv(k, 1u).y, h, env.y);
-    let th = threshold(k, cover);
+    var shape = base;
+    var tc = cover;
+    if (lv(k, 1u).y == KIND_CUMULUS) {
+        // A dome on the clouds' summed strength, lobed (`cloud_layers::cumulus_column`).
+        let lob = 0.5 * n.g + 0.3 * n.b + 0.2 * n.a - CU_LOBE_MEAN;
+        let q = clamp(env.w * (1.0 + CU_LOBE * lob) / CU_CORE_FULL, 0.0, 1.0);
+        let t = env.y * sqrt(q) * (1.0 + CU_TURRET * lob);
+        let b = CU_BASE_CURL * t * (1.0 - q) + CU_BASE_LUMP * lob;
+        shape = shape * smoothstep(b, b + 0.04, h) * (1.0 - smoothstep(t - CU_TOP_FADE, t, h));
+        // Filled in as the core rises (`cloud_layers::cumulus_cover`).
+        let lo = min(cover, CU_SOLID0);
+        let solid = lo + (cover - lo) * smoothstep(CU_SOLID0, CU_SOLID1, env.w);
+        tc = solid + (cover - solid) * clamp((cover - CUMULUS_COVER_CEIL) / max(1.0 - CUMULUS_COVER_CEIL, 1e-3), 0.0, 1.0);
+    } else {
+        shape = shape * height_profile(lv(k, 1u).y, h, env.y);
+    }
+    let th = threshold(k, tc);
     var d = clamp((shape - th) / max(1.0 - th, 1e-3), 0.0, 1.0);
     if (d <= 0.0) {
         return 0.0;
@@ -1724,7 +1760,7 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
         let e = fine + (1.0 - 2.0 * fine) * smoothstep(0.1, 0.6, h);
         // The turrets swell and ebb on each cloud's own age.
         let pulse = 1.0 + CHURN_PULSE * sin((age / TURRET_S + 2.0 * n.g) * 6.28318531);
-        let cut = min(DETAIL_EROSION * (0.8 + 0.5 * env.z) * e * pulse, 0.95);
+        let cut = min(DETAIL_EROSION * (0.8 + 0.5 * env.z) * e * pulse, 0.95) * (1.0 - smoothstep(0.0, ERODE_DEPTH, d));
         d = clamp((d - cut) / (1.0 - cut), 0.0, 1.0);
     }
     // Frayed at the fringe and thinned with age (`cloud_layers::edge_gain`).
@@ -2949,7 +2985,13 @@ pub(crate) mod tests {
         // (0.0157 settled when set; 0.0163 once the shape noise was untiled,
         // `cloud_layers::detile`, its stretch a little finer than the march.)
         assert!(once_a < 0.018 && settled_a < 0.018, "alpha: once {once_a:.5}, settled {settled_a:.5}");
-        assert!(settled_a < 1.5 * once_a && settled_r < 1.5 * once_r, "accumulating moved off the finer march: alpha {once_a:.5} -> {settled_a:.5}, light {once_r:.5} -> {settled_r:.5}");
+        // Or under half the settled error this was set at: vapour-soft edges
+        // (`cloud_layers::EDGE_GAIN`, 2026-10-23) shrank the single map's error
+        // to 0.0047, and 1.5 of that is stricter than the settled sky ever was.
+        assert!(
+            (settled_a < 1.5 * once_a || settled_a < 0.008) && (settled_r < 1.5 * once_r || settled_r < 0.0025),
+            "accumulating moved off the finer march: alpha {once_a:.5} -> {settled_a:.5}, light {once_r:.5} -> {settled_r:.5}"
+        );
     }
 
     /// NO LINES ACROSS THE SKY: a line parallel to the horizon moves every
