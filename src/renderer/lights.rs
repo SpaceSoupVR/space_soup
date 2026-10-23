@@ -279,6 +279,13 @@ pub fn static_sun_bounds(
     found.unwrap_or((Vec3::splat(-10.0), Vec3::splat(10.0)))
 }
 
+/// How far the gliding sun moves before the static map is drawn again along
+/// it (`Levers::smooth_sun_shadow`): 0.1 degrees, which moves the shadow of a
+/// 10 m wall by 1.7 cm, under half of the map's 4.5 cm texel, so the edge
+/// slides through the filter instead of stepping. At a 20-minute day that
+/// is a redraw about every third of a second (every 12 frames at 36 fps).
+pub const STATIC_SUN_REDRAW_COS: f32 = 0.999_998_5;
+
 /// The static sun map along `world_dir` over world bounds `(lo, hi)`.
 pub fn static_sun_matrix_in(world_dir: Vec3, (lo, hi): (Vec3, Vec3)) -> glam::Mat4 {
     let centre = (lo + hi) * 0.5;

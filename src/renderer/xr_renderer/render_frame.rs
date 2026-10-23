@@ -1187,8 +1187,23 @@ impl XrRenderer {
         );
 
         // The static map is drawn along the snapshot's direction, so once a
-        // snapshot; the light itself glides (`Sky::sun_direct`).
-        let stepped = self.sky.sun_stepped().map(|s| -glam::Vec3::from(s.direction));
+        // snapshot; the light itself glides (`Sky::sun_direct`). Under
+        // `Levers::smooth_sun_shadow` it is drawn along the gliding light
+        // instead, again each time that has moved `STATIC_SUN_REDRAW_COS`
+        // off the map's: shadows slide on with the sun rather than jumping a
+        // texel at each snapshot (user's colleague, 2026-10-22: "the light
+        // and shadow changes step").
+        let stepped = if self.levers.smooth_sun_shadow {
+            self.sky.sun_direct().map(|s| -glam::Vec3::from(s.direction)).map(|glide| {
+                let held = self.static_sun_shadow.borrow().as_ref().map(|c| glam::Vec3::from_array(c.signature.2.map(f32::from_bits)));
+                match held {
+                    Some(h) if h.dot(glide) >= crate::renderer::lights::STATIC_SUN_REDRAW_COS => h,
+                    _ => glide,
+                }
+            })
+        } else {
+            self.sky.sun_stepped().map(|s| -glam::Vec3::from(s.direction))
+        };
         let static_sun = sun.filter(|_| sky_sun.is_some()).map(|l| {
             let world_dir = stepped.unwrap_or(glam::Quat::from_rotation_y(self.player.yaw) * l.direction);
             let signature = (
@@ -1557,7 +1572,8 @@ impl XrRenderer {
                     sun_ground,
                     shadow.sun_view_proj,
                 );
-                if static_sun.is_some() {
+                // Drawn every 0.1 degrees when smooth: logged with the diagnostics.
+                if static_sun.is_some() && (!self.levers.smooth_sun_shadow || diag) {
                     let ms = record_t0.elapsed().as_secs_f32() * 1000.0;
                     // Along which sun, by elevation and azimuth, against the
                     // light's own this frame: a map ever recorded behind the

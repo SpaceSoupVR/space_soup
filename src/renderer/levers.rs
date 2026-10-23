@@ -95,6 +95,10 @@ pub struct Levers {
     /// more cube arrays (2 x 51 MB at 256 px) and the probe array a storage
     /// usage (2026-10-22).
     pub smooth_probes: bool,
+    /// The static sun map drawn along the gliding sun, again each 0.1
+    /// degrees it moves (`STATIC_SUN_REDRAW_COS`); off draws it once a
+    /// snapshot along the snapshot's sun, as before 2026-10-22.
+    pub smooth_sun_shadow: bool,
 
     pub effects: bool,
 
@@ -295,6 +299,7 @@ impl Default for Levers {
             clouds: true,
             cloud_pace: true,
             smooth_probes: true,
+            smooth_sun_shadow: true,
             effects: true,
             muzzle_test: true,
             mud_test: false,
@@ -472,6 +477,7 @@ impl Levers {
         flag("clouds", self.clouds, d.clouds);
         flag("cloud_pace", self.cloud_pace, d.cloud_pace);
         flag("smooth_probes", self.smooth_probes, d.smooth_probes);
+        flag("smooth_sun_shadow", self.smooth_sun_shadow, d.smooth_sun_shadow);
         flag("effects", self.effects, d.effects);
         flag("muzzle_test", self.muzzle_test, d.muzzle_test);
         flag("mud_test", self.mud_test, d.mud_test);
