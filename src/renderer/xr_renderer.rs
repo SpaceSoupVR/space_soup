@@ -633,6 +633,17 @@ pub struct XrRenderer {
     /// The sky map's build rate from the GPU frame time.
     cloud_pace: crate::renderer::cloud_pace::CloudPace,
 
+    /// Native frames or SpaceWarp, from the GPU frame time
+    /// (`Levers::frame_governor`), and when it last stepped.
+    frame_governor: crate::renderer::frame_governor::FrameGovernor,
+    governor_tick: Option<std::time::Instant>,
+
+    /// The headset's heat (`thermal`), frames over budget this window, and
+    /// when a GPU spike was last logged (`GPUSPIKE`, once a second at most).
+    thermal: crate::thermal::Thermal,
+    over_budget: u64,
+    gpu_spike_logged: Option<std::time::Instant>,
+
     /// The compositor's display rate, Hz (`note_display_hz`).
     display_hz: f64,
 
@@ -1610,6 +1621,11 @@ impl XrRenderer {
             perf_metric_window: Default::default(),
             fps_layer: None,
             cloud_pace: Default::default(),
+            frame_governor: Default::default(),
+            governor_tick: None,
+            thermal: Default::default(),
+            over_budget: 0,
+            gpu_spike_logged: None,
             display_hz: 72.0,
             perf_log: None,
             started_at: std::time::Instant::now(),
@@ -2334,7 +2350,7 @@ impl XrRenderer {
     }
 
     pub fn space_warp_running(&self) -> bool {
-        self.space_warp.is_some() && self.levers.space_warp
+        self.space_warp.is_some() && self.levers.space_warp && !(self.levers.frame_governor && self.frame_governor.native())
     }
 
     pub fn set_fps_hud(&mut self, session: &xr::Session<xr::Vulkan>, on: bool) {
@@ -2352,6 +2368,12 @@ impl XrRenderer {
 
     pub fn fps_hud_on(&self) -> bool {
         self.fps_layer.is_some()
+    }
+
+    /// The runtime's `XR_EXT_performance_settings` event: a domain's
+    /// sub-domain went to `level` (normal / warning / impaired).
+    pub fn note_perf_settings(&mut self, domain: &str, sub_domain: &str, level: &str) {
+        self.thermal.note_xr(domain, sub_domain, level);
     }
 
     /// The display rate the compositor predicts for this frame, Hz: what the

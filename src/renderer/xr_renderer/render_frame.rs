@@ -248,9 +248,44 @@ impl XrRenderer {
             Camera::gl_to_wgpu_ndc(Camera::xr_projection(v.fov, crate::renderer::space_warp::NEAR_Z, crate::renderer::space_warp::FAR_Z))
                 * Camera::xr_view(v.pose)
         });
+        // Native frames while the GPU has room for them (`frame_governor`).
+        if self.levers.frame_governor && self.space_warp.is_some() && self.levers.space_warp {
+            let now = std::time::Instant::now();
+            let dt = self.governor_tick.replace(now).map_or(0.0, |t| now.duration_since(t).as_secs_f32().min(0.25));
+            let gpu_ms = self.perf_metrics.as_ref().and_then(|m| m.value("app/gpu_frametime")).map(|v| v as f32);
+            // The panel's own rate: under SpaceWarp the runtime may predict
+            // the app's half rate instead.
+            let panel_hz = if self.display_hz <= 60.0 && !self.frame_governor.native() { self.display_hz * 2.0 } else { self.display_hz };
+            let was = self.frame_governor.native();
+            let native = self.frame_governor.step(gpu_ms, (1000.0 / panel_hz) as f32, dt);
+            if native != was {
+                log::info!(
+                    "FRAMEGOVERNOR {}: gpu {:.1} ms smoothed, panel {:.0} Hz",
+                    if native { "native frames" } else { "back to SpaceWarp" },
+                    self.frame_governor.smoothed().unwrap_or(0.0),
+                    panel_hz
+                );
+            }
+        } else if self.frame_governor.native() {
+            self.frame_governor.reset();
+        }
+        let warp_on = self.space_warp_running();
+        // Frames over budget, and a line for each GPU spike (2x the app's
+        // period, once a second at most): the colleague's plan part 2, item 3.
+        if let Some(gpu) = self.perf_metrics.as_ref().and_then(|m| m.value("app/gpu_frametime")).map(|v| v as f32) {
+            let hz = if warp_on && self.display_hz > 60.0 { self.display_hz / 2.0 } else { self.display_hz };
+            let period = (1000.0 / hz) as f32;
+            if gpu > 1.5 * period {
+                self.over_budget += 1;
+            }
+            if gpu > 2.0 * period && self.gpu_spike_logged.is_none_or(|t| t.elapsed().as_secs_f32() >= 1.0) {
+                self.gpu_spike_logged = Some(std::time::Instant::now());
+                log::info!("GPUSPIKE gpu {gpu:.1} ms in a {period:.1} ms frame, heat {:?}, levers {}", self.thermal.state(), self.levers.summary());
+            }
+        }
         if let Some(sw) = self.space_warp.as_mut() {
             sw.acquired = None;
-            if self.levers.space_warp {
+            if warp_on {
                 let m = sw.motion.acquire_image()? as usize;
                 sw.motion.wait_image(xr::Duration::INFINITE)?;
                 let d = sw.depth.acquire_image()? as usize;
@@ -1180,6 +1215,7 @@ impl XrRenderer {
             crate::renderer::lights::append_baked(lights, &self.baked_lights, crate::renderer::lights::MAX_LIGHTS)
         };
         self.lights_uniform.set_culling(fx.light_culling);
+        self.lights_uniform.set_cutoff(if self.levers.light_cutoff > 0.0 { self.levers.light_cutoff / post.exposure.max(1e-12) } else { 0.0 });
         self.lights_uniform.set_terminator_aa(fx.terminator_aa);
         self.lights_uniform.set_surface_lights_apart(fx.surface_light_loop);
         self.lights_uniform.upload_frame_split(
@@ -4247,6 +4283,11 @@ impl XrRenderer {
                     self.debug_view
                 );
             }
+            let heat_was = self.thermal.state().clone();
+            self.thermal.poll();
+            if *self.thermal.state() != heat_was {
+                log::info!("THERMAL {:?}", self.thermal.state());
+            }
             if let Some(log) = &self.perf_log {
                 let cycle_len = crate::renderer::perf_ab::Phase::ALL.len() as u64;
                 let record = crate::perf_record::WindowRecord {
@@ -4271,10 +4312,13 @@ impl XrRenderer {
                     xr: counters.iter().map(|c| (c.short.clone(), c.value)).collect(),
                     cpu: cpu_parts,
                     hour: self.time_of_day_hour(),
+                    thermal: self.thermal.state().clone(),
+                    over_budget: self.over_budget,
                 };
                 log.write(record.to_line());
             }
             self.perf_window_index += 1;
+            self.over_budget = 0;
             if self.perf_warmup {
                 self.perf_warmup = false;
             } else {

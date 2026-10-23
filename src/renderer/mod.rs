@@ -35,6 +35,7 @@ pub mod exposure;
 pub mod probe_stream;
 pub mod room_light;
 pub mod cloud_pace;
+pub mod frame_governor;
 pub mod cloud_sky;
 pub mod cloud_worker;
 pub mod sky;

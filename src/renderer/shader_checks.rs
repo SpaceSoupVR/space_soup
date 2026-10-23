@@ -23,8 +23,35 @@ pub fn runtime_checks(checks: AuditedChecks) -> wgpu::ShaderRuntimeChecks {
     }
 }
 
+/// THE AUDITED SHADERS' CHECKS FOR THIS RUN, over `AUDITED_CHECKS`: the
+/// Quest's `debug.spacesoup.shaderchecks` property (`all` / `none`), read
+/// when the device is made, to A/B naga's injected bounds checks in the hot
+/// loops (the AAA doc's M4 / rank 9). `none` trusts every index in the
+/// brush, terrain and fix-up shaders, and robust access is off on the
+/// headset, so an out-of-range read is undefined: an A/B only.
+pub static CHECKS_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `all` or `none` from a property's text; anything else keeps the audit.
+pub fn set_checks_override(text: &str) -> Option<AuditedChecks> {
+    let (code, checks) = match text.trim() {
+        "all" => (1, Some(AuditedChecks::All)),
+        "none" => (2, Some(AuditedChecks::None)),
+        _ => (0, None),
+    };
+    CHECKS_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+    checks
+}
+
+pub fn audited_checks() -> AuditedChecks {
+    match CHECKS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => AuditedChecks::All,
+        2 => AuditedChecks::None,
+        _ => AUDITED_CHECKS,
+    }
+}
+
 pub fn audited_shader_module(device: &wgpu::Device, desc: wgpu::ShaderModuleDescriptor<'_>) -> wgpu::ShaderModule {
-    match AUDITED_CHECKS {
+    match audited_checks() {
         AuditedChecks::All => device.create_shader_module(desc),
 
         checks => unsafe { device.create_shader_module_trusted(desc, runtime_checks(checks)) },

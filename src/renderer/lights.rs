@@ -430,6 +430,10 @@ pub struct LightsUniform {
     tile_lamps: std::cell::Cell<[usize; super::shadow::MAX_CHARACTER_SHADOWS]>,
 
     pool_light: std::cell::RefCell<Vec<(Vec3, f32, f32)>>,
+
+    /// The radiance a lamp's reach ends at (`effective_range`); 0 keeps
+    /// every lamp's authored range.
+    cutoff: std::cell::Cell<f32>,
 }
 
 impl LightsUniform {
@@ -450,7 +454,14 @@ impl LightsUniform {
             pool_row: std::cell::Cell::new(None),
             tile_lamps: std::cell::Cell::new([usize::MAX; super::shadow::MAX_CHARACTER_SHADOWS]),
             pool_light: std::cell::RefCell::new(Vec::new()),
+            cutoff: std::cell::Cell::new(0.0),
         }
+    }
+
+    /// Lamps reach only as far as their light stays above `radiance`
+    /// (`Levers::light_cutoff` over the frame's exposure); 0 is off.
+    pub fn set_cutoff(&self, radiance: f32) {
+        self.cutoff.set(if radiance.is_finite() { radiance.max(0.0) } else { 0.0 });
     }
 
     pub fn set_pool_light(&self, samples: &[(Vec3, f32, f32)]) {
@@ -538,7 +549,7 @@ impl LightsUniform {
         spot_layers: &[usize],
         sun_is_baked: bool,
     ) {
-        let mut gpu = pack_lights(lights, live, spot_layers, sun_is_baked, self.culling.get());
+        let mut gpu = pack_lights(lights, live, spot_layers, sun_is_baked, self.culling.get(), self.cutoff.get());
         for (k, &l) in self.tile_lamps.get().iter().enumerate() {
 
             if let Some(slot) = gpu.lights.get_mut(l).filter(|s| s.params[3] == -1.0) {
@@ -561,7 +572,26 @@ pub const SURFACE_LIGHT: f32 = -2.0;
 
 pub const SURFACE_LIGHT_MIN_BAND: f32 = 0.5;
 
-fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_baked: bool, culling: bool) -> GpuLights {
+/// LIGHTS CULLED BY BRIGHTNESS, NOT ONLY RANGE (colleague's plan part 2,
+/// item 5): where a point or spot lamp's inverse-square light falls under
+/// `cutoff` radiance, clamped to its authored range. A dim lamp at the edge
+/// of a long range otherwise costs every pixel inside it the same as a bright
+/// one. The shader's window, (1 - (d/r)^4)^2, is drawn over this reach, so
+/// the light ends smoothly there. Lamps with a baked mask, surface lights and
+/// the sun keep their range.
+pub fn effective_range(l: &Light, cutoff: f32) -> f32 {
+    if cutoff <= 0.0 || l.kind == LightKind::Directional || l.mask_channel.is_some() || l.is_surface_light() {
+        return l.range;
+    }
+    let c = l.color.to_linear();
+    let peak = l.intensity.max(0.0) * c[0].max(c[1]).max(c[2]);
+    (peak / cutoff).sqrt().clamp(LAMP_RADIUS_M, l.range.max(LAMP_RADIUS_M))
+}
+
+/// The shader's `LAMP_RADIUS` floor under a lamp's distance, in metres.
+const LAMP_RADIUS_M: f32 = 0.05;
+
+fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_baked: bool, culling: bool, cutoff: f32) -> GpuLights {
     {
         let count = lights.len().min(MAX_LIGHTS);
         let surface = lights.iter().take(live.min(count)).take_while(|l| l.is_surface_light()).count();
@@ -593,7 +623,7 @@ fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_bake
                 direction: [l.direction.x, l.direction.y, l.direction.z, cos_inner],
                 color_intensity: [color[0], color[1], color[2], l.intensity],
                 params: [
-                    l.range,
+                    effective_range(l, cutoff),
                     cos_outer,
                     kind,
                     if l.casts_shadow() { -1.0 } else { SURFACE_LIGHT - l.source_radius.max(0.0) },
@@ -4220,6 +4250,33 @@ mod shadow_slot_tests {
     }
 
     #[test]
+    fn a_lamps_reach_ends_where_its_light_falls_under_the_cutoff() {
+        let lamp = Light {
+            position: Vec3::ZERO,
+            direction: Vec3::NEG_Y,
+            kind: LightKind::Point,
+            color: crate::renderer::Color3(255, 200, 150, 255),
+            intensity: 4.0,
+            range: 20.0,
+            cone_angle_deg: 180.0,
+            inner_cone_angle_deg: 0.0,
+            mask_channel: None,
+            shadow_near: None,
+            source_radius: 0.0,
+            in_level_bake: false,
+        };
+        assert_eq!(effective_range(&lamp, 0.0), 20.0, "off keeps the range");
+        let r = effective_range(&lamp, 0.04);
+        assert!(r < 20.0 && r > 0.0, "{r}");
+        assert!(effective_range(&Light { intensity: 1.0, ..lamp }, 0.04) < r, "a dimmer lamp reaches less far");
+        assert!(effective_range(&Light { intensity: 1e9, ..lamp }, 0.04) <= 20.0, "never past its range");
+        let c = lamp.color.to_linear();
+        let peak = 4.0 * c[0].max(c[1]).max(c[2]);
+        assert!((peak / (r * r) - 0.04).abs() < 1e-3, "the light at the reach is the cutoff");
+        assert_eq!(effective_range(&Light { mask_channel: Some(0), ..lamp }, 0.04), 20.0, "a baked mask keeps its range");
+    }
+
+    #[test]
     fn a_light_whose_shadow_begins_past_its_range_casts_none() {
         let spot = Light {
             position: Vec3::ZERO,
@@ -4241,7 +4298,7 @@ mod shadow_slot_tests {
         let surface = Light { shadow_near: Some(f32::INFINITY), ..spot };
         assert!(!surface.casts_shadow());
 
-        let gpu = pack_lights(&[spot, surface], 2, &[], false, true);
+        let gpu = pack_lights(&[spot, surface], 2, &[], false, true, 0.0);
         assert_eq!(gpu.lights[0].params[3], -1.0);
         assert_eq!(gpu.lights[1].params[3], SURFACE_LIGHT);
         assert!(SURFACE_LIGHT < -1.5, "below the shader's test");
@@ -4252,6 +4309,7 @@ mod shadow_slot_tests {
             &[],
             false,
             true,
+            0.0,
         );
         assert_eq!(wide.lights[0].params[3], SURFACE_LIGHT - 0.6);
         assert_eq!(wide.lights[1].params[3], -1.0);
@@ -4316,9 +4374,9 @@ mod budget_tests {
         assert_eq!(rank_for_budget_indices(&ls, 3), vec![1, 2, 0]);
         assert_eq!(rank_for_budget_indices(&ls, 2), vec![2, 0]);
         let ranked = rank_for_budget(&ls, MAX_LIGHTS);
-        assert_eq!(pack_lights(&ranked, 4, &[], false, true).surface_lights[0], 2);
-        assert_eq!(pack_lights(&[lamp, bounce], 2, &[], false, true).surface_lights[0], 0, "only a leading run");
-        assert_eq!(pack_lights(&[bounce, lamp], 0, &[], false, true).surface_lights[0], 0, "never a baked tail");
+        assert_eq!(pack_lights(&ranked, 4, &[], false, true, 0.0).surface_lights[0], 2);
+        assert_eq!(pack_lights(&[lamp, bounce], 2, &[], false, true, 0.0).surface_lights[0], 0, "only a leading run");
+        assert_eq!(pack_lights(&[bounce, lamp], 0, &[], false, true, 0.0).surface_lights[0], 0, "never a baked tail");
 
         let src = wgsl_lights_block(0, 1);
         assert!(src.contains(SURFACE_LIGHTS_ON));
@@ -5409,11 +5467,11 @@ mod baked_light_split_tests {
     #[test]
     fn the_upload_says_where_the_baked_tail_starts() {
         let lights: Vec<Light> = (0..5).map(|i| point(i as f32, 1.0)).collect();
-        let gpu = pack_lights(&lights, 2, &[], false, true);
+        let gpu = pack_lights(&lights, 2, &[], false, true, 0.0);
         assert_eq!(gpu.count[0], 5);
         assert_eq!(gpu.count[1], 2);
 
-        let gpu = pack_lights(&lights, 5, &[], false, true);
+        let gpu = pack_lights(&lights, 5, &[], false, true, 0.0);
         assert_eq!(gpu.count[1], 5);
     }
 

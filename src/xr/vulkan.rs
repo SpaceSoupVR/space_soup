@@ -295,6 +295,9 @@ impl VkContext {
             info!("vulkan: pipeline statistics ON -- every pipeline logs PIPESTATS");
         }
         crate::renderer::shader_checks::PIPELINE_STATISTICS.store(capture_statistics, std::sync::atomic::Ordering::Relaxed);
+        if let Some(checks) = crate::renderer::shader_checks::set_checks_override(&system_property(c"debug.spacesoup.shaderchecks")) {
+            info!("vulkan: shader checks overridden to {checks:?} (debug.spacesoup.shaderchecks)");
+        }
         info!(
             "vulkan: shaderFloat16 {}",
             if f16_supported { "supported -- enabling" } else { "NOT supported" },

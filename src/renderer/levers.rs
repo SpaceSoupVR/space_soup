@@ -104,6 +104,16 @@ pub struct Levers {
     /// which come at x1.5 or 3 degrees (`PostUpload::ground_stops`); off
     /// reads it as built, stepping at each.
     pub smooth_ground: bool,
+    /// The displayed brightness (radiance times the eye's exposure) a
+    /// lamp's reach ends at (`lights::effective_range`): a dim lamp with a
+    /// long range stops costing the pixels its light barely reaches. 0 is
+    /// off (colleague's plan part 2, item 5; A/B before turning on).
+    pub light_cutoff: f32,
+    /// Native frames (no SpaceWarp synthesis) whenever the GPU time holds
+    /// under 75% of the display period for 5 s, back to SpaceWarp once over
+    /// 90% for a quarter second (`frame_governor`; the AAA doc's rank 11).
+    /// Off by default: A/B before turning on.
+    pub frame_governor: bool,
 
     pub effects: bool,
 
@@ -306,6 +316,8 @@ impl Default for Levers {
             smooth_probes: true,
             smooth_sun_shadow: true,
             smooth_ground: true,
+            light_cutoff: 0.0,
+            frame_governor: false,
             effects: true,
             muzzle_test: true,
             mud_test: false,
@@ -485,6 +497,7 @@ impl Levers {
         flag("smooth_probes", self.smooth_probes, d.smooth_probes);
         flag("smooth_sun_shadow", self.smooth_sun_shadow, d.smooth_sun_shadow);
         flag("smooth_ground", self.smooth_ground, d.smooth_ground);
+        flag("frame_governor", self.frame_governor, d.frame_governor);
         flag("effects", self.effects, d.effects);
         flag("muzzle_test", self.muzzle_test, d.muzzle_test);
         flag("mud_test", self.mud_test, d.mud_test);
@@ -533,6 +546,9 @@ impl Levers {
         }
         if self.thin_parts != d.thin_parts {
             out.push(format!("thin_parts={}", self.thin_parts));
+        }
+        if self.light_cutoff != d.light_cutoff {
+            out.push(format!("light_cutoff={}", self.light_cutoff));
         }
         if self.terrain_detail_distance != d.terrain_detail_distance {
             out.push(format!("terrain_detail={}", self.terrain_detail_distance));

@@ -1784,6 +1784,10 @@ fn with_push_scan(device: &Device, src: String) -> String {
 
 const SCAN_FROM_UNIFORMS: &str = "def_scan_uniform";
 
+const PROBE_TRACE_CALL: &str = "    return probe_trace_skipping(world_pos, d, room, roughness, -1);";
+const FOVEA_30: &str = "    let fwd = normalize(vec3<f32>(cam_view_proj()[0].w, cam_view_proj()[1].w, cam_view_proj()[2].w));\n    let fovea = dot(normalize(world_pos - cam_pos()), fwd) > 0.866;\n    return probe_trace_skipping(world_pos, d, room, select(2.0, roughness, fovea), -1);";
+const FOVEA_45: &str = "    let fwd = normalize(vec3<f32>(cam_view_proj()[0].w, cam_view_proj()[1].w, cam_view_proj()[2].w));\n    let fovea = dot(normalize(world_pos - cam_pos()), fwd) > 0.707;\n    return probe_trace_skipping(world_pos, d, room, select(2.0, roughness, fovea), -1);";
+
 const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("def_cut_none", &[]),
 
@@ -1860,6 +1864,11 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ),
 
     ("def_cut_trace", &[("    let hit = probe_trace(world_pos, d, trace_room, roughness);", STAGE_CUT_HIT)]),
+    // FOVEATED TRACE LOD (the AAA doc's rank 5): no trace past 30 or 45
+    // degrees off the eye's axis, where the density map already shades
+    // coarsely; those pixels take the probe cube as rough ones do.
+    ("def_cut_fovea30", &[(PROBE_TRACE_CALL, FOVEA_30)]),
+    ("def_cut_fovea45", &[(PROBE_TRACE_CALL, FOVEA_45)]),
     (
         "def_cut_colour",
         &[(

@@ -8,6 +8,7 @@ pub mod voxelize;
 
 pub mod perf_metrics_log;
 pub mod perf_record;
+pub mod thermal;
 
 #[cfg(target_os = "android")]
 pub mod xr;
