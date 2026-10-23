@@ -65,11 +65,12 @@ struct SkyFlow {{
     if (flow.misc.w > 0.5 && dir.y > 0.0) {{
         let uv = cloud_map_uv(dir);
         let layer = i32(flow.misc.x);
-        let alt = textureSampleLevel(cloud_alts, cloud_samp, uv, layer, 0.0).r;
+        let here = textureSampleLevel(cloud_alts, cloud_samp, uv, layer, 0.0);
+        let alt = here.r;
         let cover = 1.0 - textureSampleLevel(cloud_maps, cloud_samp, uv, layer, 0.0).a;
         if (alt > 0.0 && cover > 0.0) {{
-            let w = flow.winds;
-            let v = cloud_flow_wind(alt, w[0], w[1], w[2], w[3]);
+            // The wind the map stores for what it shows here (`fs_map`).
+            let v = here.ba;
             let p = dir * cloud_flow_distance(flow.misc.z, alt, dir.y) - vec3<f32>(v.x, 0.0, v.y) * flow.misc.y;
             back = normalize(mix(dir, normalize(p), layer_weight(cover, {contrast:?})));
         }}
@@ -331,7 +332,7 @@ mod tests {
         crate::renderer::sky::SkyMotionSource {
             key: 1,
             maps: one(wgpu::TextureFormat::Rgba16Float, &clear),
-            alts: one(wgpu::TextureFormat::Rg16Float, &[0, 0, 0x00, 0x3c]),
+            alts: one(wgpu::TextureFormat::Rgba16Float, &[0, 0, 0x00, 0x3c, 0, 0, 0, 0]),
             misc: [0.0; 4],
             winds: [[0.0; 4]; 4],
         }
@@ -383,6 +384,7 @@ mod tests {
         let eye = Vec3::new(10.0, 2.0, 5.0);
         let mut sky = CloudSky::new(&device, &queue, &field, &noise);
         sky.set_population(&device, &queue, &population);
+        sky.set_winds(cs::flow_winds(&params, &layers));
         let u = CloudSkyUniform::new(&layers, eye.to_array(), [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
         let mut enc = device.create_command_encoder(&Default::default());
         sky.encode(&mut enc, &queue, &u, None, true);
@@ -405,7 +407,7 @@ mod tests {
         }
         let (maps, alts) = sky.textures();
         let map = read(&device, &queue, maps, layer as u32, MAP_WIDTH, MAP_HEIGHT, 8);
-        let alt = read(&device, &queue, alts, layer as u32, MAP_WIDTH, MAP_HEIGHT, 4);
+        let alt = read(&device, &queue, alts, layer as u32, MAP_WIDTH, MAP_HEIGHT, 8);
         let texel = |uv: [f32; 2], f: &dyn Fn(usize) -> f32| {
             let x = ((uv[0] * MAP_WIDTH as f32) as u32).min(MAP_WIDTH - 1);
             let y = ((uv[1] * MAP_HEIGHT as f32) as u32).min(MAP_HEIGHT - 1);
@@ -420,13 +422,13 @@ mod tests {
                 }
                 let uv = cs::map_uv(d.to_array());
                 let a = texel(uv, &|k| half(&map[k * 8 + 6..]));
-                let h = texel(uv, &|k| half(&alt[k * 4..]));
+                let h = texel(uv, &|k| half(&alt[k * 8..]));
                 let g = got[(j * W + i) as usize];
                 if a > 0.995 {
                     gaps += 1;
                     still += (g.length() < 1e-3) as u32;
                 } else if a < 0.1 && h > 0.0 {
-                    let v = cs::flow_wind(h, &winds);
+                    let v = [texel(uv, &|k| half(&alt[k * 8 + 4..])), texel(uv, &|k| half(&alt[k * 8 + 6..]))];
                     let p = d * cs::flow_distance(eye.y, h, d.y) - Vec3::new(v[0], 0.0, v[1]) * dt;
                     let back = d.lerp(p.normalize(), layer_motion_weight(1.0 - a, crate::renderer::space_warp::BRIGHT_LAYER_CONTRAST)).normalize();
                     let want = ndc_of(curr, d) - ndc_of(curr, back);

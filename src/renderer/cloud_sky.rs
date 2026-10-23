@@ -144,7 +144,7 @@ pub struct CloudSkyUniform {
     pub amb_ground: [f32; 4],
     /// The shadow map's centre x, z, extent, and the ground's altitude.
     pub shadow: [f32; 4],
-    pub layers: [[[f32; 4]; 11]; LAYERS],
+    pub layers: [[[f32; 4]; 12]; LAYERS],
 }
 
 impl CloudSkyUniform {
@@ -216,29 +216,30 @@ pub fn flow_wind(alt: f32, winds: &[[f32; 4]; LAYERS]) -> [f32; 2] {
     v
 }
 
-/// Each layer's middle height and its wind (x, z, m/s), lowest first: what
-/// the sky shader and SpaceWarp move the maps' clouds by.
+/// Each layer's middle height, its wind (x, z, m/s) and its index, lowest
+/// first. The map stores the wind of what each texel shows (`fs_map`, alts
+/// .ba, by `layer_wind` on the index); the height's wind between these is
+/// only the CPU twin's fallback.
 pub fn flow_winds(p: &space_soup_sky::clouds::CloudParams, layers: &[CloudLayer; LAYERS]) -> [[f32; 4]; LAYERS] {
     let mut w: [[f32; 4]; LAYERS] = std::array::from_fn(|k| {
         let (dir, v) = cl::layer_wind(p, k);
-        [0.5 * (layers[k].base_m + layers[k].top_m), (dir[0] * v) as f32, (dir[1] * v) as f32, 0.0]
+        [0.5 * (layers[k].base_m + layers[k].top_m), (dir[0] * v) as f32, (dir[1] * v) as f32, k as f32]
     });
     w.sort_by(|a, b| a[0].total_cmp(&b[0]));
     w
 }
 
 /// WHERE A MAP HOLDS WHAT IS SEEN ALONG `dir` NOW: the cloud there, at
-/// `alt` (the map's height), as it was `age` seconds ago on its height's
-/// wind and seen from where the map's eye was (`eye_delta` = the eye now
-/// less the map's). The sky shader's lookup (`sky_clouds`).
-pub fn advected_uv(dir: [f32; 3], alt: f32, eye_alt: f32, winds: &[[f32; 4]; LAYERS], eye_delta: [f32; 3], age: f32) -> [f32; 2] {
+/// `alt` (the map's height), as it was `age` seconds ago on its wind `v`
+/// (the map's alts .ba) and seen from where the map's eye was (`eye_delta`
+/// = the eye now less the map's). The sky shader's lookup (`sky_clouds`).
+pub fn advected_uv(dir: [f32; 3], alt: f32, eye_alt: f32, v: [f32; 2], eye_delta: [f32; 3], age: f32) -> [f32; 2] {
     let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt().max(1e-6);
     let d = dir.map(|v| v / len);
     if alt <= 0.0 || d[1] <= 0.0 {
         return map_uv(d);
     }
     let t = flow_distance(eye_alt, alt, d[1]);
-    let v = flow_wind(alt, winds);
     map_uv([d[0] * t + eye_delta[0] - v[0] * age, d[1] * t + eye_delta[1], d[2] * t + eye_delta[2] - v[1] * age])
 }
 
@@ -490,7 +491,7 @@ impl CloudSky {
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: TextureFormat::Rg16Float,
+            format: TextureFormat::Rgba16Float,
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -774,7 +775,7 @@ impl CloudSky {
                 cache: None,
             })
         };
-        let map_pipeline = pipeline("cloud_sky_map", "fs_map", &[TextureFormat::Rgba16Float, TextureFormat::Rg16Float], &map_layout);
+        let map_pipeline = pipeline("cloud_sky_map", "fs_map", &[TextureFormat::Rgba16Float, TextureFormat::Rgba16Float], &map_layout);
         let shadow_pipeline = pipeline("cloud_sky_shadow", "fs_shadow", &[TextureFormat::R8Unorm], &shadow_layout);
         Self {
             noise: noise_tex,
@@ -1411,7 +1412,7 @@ struct SplatOut {
 
 const CLOUD_SKY_WGSL: &str = r#"
 struct Layer {
-    v: array<vec4<f32>, 11>,
+    v: array<vec4<f32>, 12>,
 }
 struct CloudSkyUniform {
     eye: vec4<f32>,
@@ -1784,11 +1785,12 @@ fn cirrus_tau(k: u32, xz: vec2<f32>) -> f32 {
     let along = xz.x * wd.x + xz.y * wd.y;
     let across = -xz.x * wd.y + xz.y * wd.x;
     let s = lv(k, 1u).z * 10.0;
-    let uv = vec2<f32>(along * s / CIRRUS_STRETCH, across * s) + lv(k, 3u).xy;
+    let o = lv(k, 11u);
+    let uv = vec2<f32>(along * s / CIRRUS_STRETCH, across * s) + o.xy;
     let f = textureSampleLevel(weather_tex, samp, uv, 0.0);
     let g = textureSampleLevel(weather_tex, samp, uv * 3.0 + vec2<f32>(0.37, 0.71), 0.0);
     let n = 0.45 * f.g + 0.3 * f.b + 0.25 * g.b;
-    let tuft = textureSampleLevel(weather_tex, samp, xz * lv(k, 1u).z * 2.0 + lv(k, 3u).yx, 0.0).r;
+    let tuft = textureSampleLevel(weather_tex, samp, vec2<f32>(along, across) * lv(k, 1u).z * 2.0 + o.zw, 0.0).r;
     let c = lv(k, 0u).z;
     let d = clamp((n - (1.0 - c)) / max(c, 1e-3), 0.0, 1.0) * smoothstep(0.35, 0.7, tuft);
     return d * d * CIRRUS_TAU * min(lv(k, 0u).w / EXTINCTION, 2.0);
@@ -1979,11 +1981,24 @@ fn hist_bspline(uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(max(v.rgb, vec3<f32>(0.0)), clamp(v.a, 0.0, 1.0));
 }
 
+// Layer k's own wind (x, z): `flow_winds` holds each layer's index in .w.
+fn layer_wind(k: u32) -> vec2<f32> {
+    var v = hist.winds[0].yz;
+    for (var i = 1u; i < 4u; i = i + 1u) {
+        if (u32(hist.winds[i].w + 0.5) == k) {
+            v = hist.winds[i].yz;
+        }
+    }
+    if (u32(hist.winds[0].w + 0.5) == k) {
+        v = hist.winds[0].yz;
+    }
+    return v;
+}
+
 // Where the newest map held what this texel shows, if it lies at altitude
-// `h`: carried back along that altitude's wind (`advected_uv`).
-fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
+// `h` and rides the wind `wv`: carried back along it (`advected_uv`).
+fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
     let size = vec2<f32>(u.amb_sky.w, u.light.w);
-    let wv = cloud_flow_wind(h, hist.winds[0], hist.winds[1], hist.winds[2], hist.winds[3]);
     let p = dir * cloud_flow_distance(hist.misc.w, h, max(dir.y, 0.0));
     var huv = cloud_map_uv(p + hist.flow.xyz - vec3<f32>(wv.x, 0.0, wv.y) * hist.flow.w);
     huv.y = clamp(huv.y, 0.5 / size.y, 1.0 - 0.5 / size.y);
@@ -2012,12 +2027,16 @@ fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
     var trans = 1.0;
     var seen = 0.0;
     var rgb = vec3<f32>(0.0);
-    // The height of what is seen, by its share of the light (`alts`).
+    // The height of what is seen and the wind it rides, by its share of
+    // the light (`alts`).
     var height = 0.0;
+    var wind = vec2<f32>(0.0);
     var fill = 0.0;
+    var fill_wind = vec2<f32>(0.0);
     for (var k = 0u; k < 4u; k = k + 1u) {
         if (fill == 0.0 && layer_on(k)) {
             fill = 0.5 * (lv(k, 0u).x + lv(k, 0u).y);
+            fill_wind = layer_wind(k);
         }
     }
     for (var k = 0u; k < 3u; k = k + 1u) {
@@ -2031,6 +2050,7 @@ fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
             continue;
         }
         let len = min(t1 - t0, MAX_MARCH);
+        let lw = layer_wind(k);
         let base = pick_steps(k, VIEW_STEPS);
         // STEPS OF ONE STRIDE FROM THE LAYER'S ENTRY, AND A SHORT LAST ONE.
         // Split evenly into ceil(len / stride), every ray with the same count
@@ -2137,6 +2157,7 @@ fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
                 rgb = rgb + w * s;
                 seen = seen + w;
                 height = height + w * p_alt;
+                wind = wind + w * lw;
                 trans = trans * ts;
                 if (trans < 0.01) {
                     break;
@@ -2159,6 +2180,7 @@ fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
             rgb = rgb + w * s;
             seen = seen + w;
             height = height + w * lv(3u, 0u).x;
+            wind = wind + w * layer_wind(3u);
             trans = trans * (1.0 - alpha);
         }
     }
@@ -2166,6 +2188,13 @@ fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
     // .g: the clouds' own transmittance, no haze -- what a disc behind them
     // gets (`cloud_through` in the sky shader).
     let h = (height + ALT_FILL_WEIGHT * fill) / (seen + ALT_FILL_WEIGHT);
+    // THE WIND WHAT IS SEEN RIDES, not the height's (2026-10-23). Carried on
+    // a wind blended between the layers' middles by height, a cumulus seen
+    // low in its layer rode half the stratocumulus's wind, ran ahead of or
+    // behind itself through a map and was pulled back by the next: the
+    // clouds stepped "3 forward, 1-2 back" (user, headset). Each layer's
+    // own wind, by its share of the light, is how what this texel shows moves.
+    let hv = (wind + ALT_FILL_WEIGHT * fill_wind) / (seen + ALT_FILL_WEIGHT);
     // The march stops once less than 1% gets through, and the 1% it left
     // let the sun's disc -- some 1e5 times the cloud -- shine through thick
     // cumulus as a white dot (user: the sun and moon shone "as if they are in
@@ -2176,12 +2205,12 @@ fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
     // silver lining and no disc -- the forward scatter that swamps it is
     // finer than this map. The disc fades in through thinner cloud.
     let through = trans * smoothstep(DISC_THROUGH0, DISC_THROUGH1, trans);
-    var alts = vec2<f32>(h, through);
+    var alts = vec4<f32>(h, through, hv);
     // THE NEWEST MAP, CARRIED HERE: what this texel shows, where that map
     // held it (the sky shader's own carry, `sky_clouds`), mixed in.
     if (hist.misc.x < 1.0) {
-        var huv = hist_carry(dir, h);
-        var old_alts = textureSampleLevel(hist_alt, samp, huv, 0.0).rg;
+        var huv = hist_carry(dir, h, hv);
+        var old_alts = textureSampleLevel(hist_alt, samp, huv, 0.0);
         // CARRIED BY ITS OWN ALTITUDE (R1, cloud research 2026-10-22): the
         // first carry moves the old map by this march's altitude, which at an
         // edge is the wrong cloud's (or the empty sky's fill), so the old
@@ -2189,8 +2218,8 @@ fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
         // copy beside the new edge. Carried again by the altitude the old map
         // holds there, it lands where that cloud has moved to.
         if (HISTORY_REFETCH) {
-            let again = hist_carry(dir, old_alts.r);
-            let again_alts = textureSampleLevel(hist_alt, samp, again, 0.0).rg;
+            let again = hist_carry(dir, old_alts.r, old_alts.ba);
+            let again_alts = textureSampleLevel(hist_alt, samp, again, 0.0);
             if (abs(again_alts.r - old_alts.r) < HISTORY_ALT_AGREE * max(old_alts.r, 1.0)) {
                 huv = again;
                 old_alts = again_alts;
@@ -2208,7 +2237,7 @@ fn hist_carry(dir: vec3<f32>, h: f32) -> vec2<f32> {
     }
     var out: MapOut;
     out.light = light;
-    out.alt = vec4<f32>(alts, 0.0, 0.0);
+    out.alt = alts;
     return out;
 }
 
@@ -2631,22 +2660,24 @@ pub(crate) mod tests {
             }
             let mut sky = CloudSky::new(&device, &queue, &field, &noise);
             sky.set_population(&device, &queue, &population);
+            sky.set_winds(flow_winds(&params, &layers));
             let u = CloudSkyUniform::new(&layers, eye, [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
             let mut enc = device.create_command_encoder(&Default::default());
             sky.encode_at(&mut enc, &queue, &u, &u, None, true, t, t);
             queue.submit(Some(enc.finish()));
             let layer = sky.display()[1] as u32;
             let map = read_back(&device, &queue, &sky.maps, layer, MAP_WIDTH, MAP_HEIGHT, 8);
-            let alts = read_back(&device, &queue, &sky.alts, layer, MAP_WIDTH, MAP_HEIGHT, 4);
+            let alts = read_back(&device, &queue, &sky.alts, layer, MAP_WIDTH, MAP_HEIGHT, 8);
             let n = (MAP_WIDTH * MAP_HEIGHT) as usize;
             let alpha: Vec<f32> = (0..n).map(|i| half(&map[i * 8 + 6..i * 8 + 8])).collect();
-            let alt: Vec<f32> = (0..n).map(|i| half(&alts[i * 4..i * 4 + 2])).collect();
+            let alt: Vec<[f32; 3]> = (0..n).map(|i| [0, 4, 6].map(|o| half(&alts[i * 8 + o..i * 8 + o + 2]))).collect();
             (alpha, alt, layers)
         };
         let (t0, t1) = (20_000.0, 20_015.0);
         let (e0, e1) = ([10.0f32, 2.0, 5.0], [130.0f32, 2.0, -80.0]);
         let (old, _, _) = draw(t0, e0);
         let (new, new_alt, layers) = draw(t1, e1);
+        let new_alt: [Vec<f32>; 3] = std::array::from_fn(|c| new_alt.iter().map(|t| t[c]).collect());
         if let Some(e) = pollster::block_on(scope.pop()) {
             panic!("the cloud passes do not validate: {e}");
         }
@@ -2661,9 +2692,9 @@ pub(crate) mod tests {
             for i in (0..MAP_WIDTH).step_by(11) {
                 let uv = [(i as f32 + 0.5) / MAP_WIDTH as f32, (j as f32 + 0.5) / MAP_HEIGHT as f32];
                 let want = bilinear(&new, uv);
-                let alt = bilinear(&new_alt, uv);
+                let [alt, vx, vz] = [0, 1, 2].map(|c| bilinear(&new_alt[c], uv));
                 heights_ok &= alt == 0.0 || (alt >= lo - 1.0 && alt <= hi + 1.0);
-                let moved = advected_uv(map_dir(uv), alt, e1[1], &winds, delta, (t1 - t0) as f32);
+                let moved = advected_uv(map_dir(uv), alt, e1[1], [vx, vz], delta, (t1 - t0) as f32);
                 let still = bilinear(&old, uv);
                 if (want - still).abs() < 0.02 && want > 0.98 {
                     continue;
@@ -2678,6 +2709,126 @@ pub(crate) mod tests {
         assert!(heights_ok, "a map height lies outside the layers' {lo}..{hi}");
         assert!(n > 500, "too few clouded directions: {n}");
         assert!(carried < 0.35 * left, "carrying the map does not follow the clouds: {carried} vs {left}");
+    }
+
+    /// HOW FAR THE SHOWN CLOUDS STEP BACK at a map swap: a map one build
+    /// old, carried to the next map's moment as the sky shader carries it,
+    /// against that next map, patch by patch. The shift that best lays one
+    /// on the other is how far a cloud jumps while the display blends from
+    /// the old map to the new (user, 2026-10-23: "3 steps forward, 1-2 steps
+    /// back"). `STEP_DT` the build (cloud s, 6.7: a slice a frame at 36 Hz,
+    /// 2.5x clock), `STEP_WIND=height` carries on the height's wind as before,
+    /// `STEP_POP=hold` keeps one population (no drift, no growth),
+    /// `STEP_CHURN=hold` holds the churn, `STEP_KINDS=0,0,0,1` the kinds.
+    /// Carried on the height's wind with the cirrus creeping on the
+    /// weather's: median 0.71 texels, p90 4.03, the cirrus alone 2.5 (and
+    /// its best shift took 66% of the misfit). On each texel's own wind with
+    /// the cirrus on its wind: median 0.50, p90 1.50, cirrus 0; what is left
+    /// is the clouds' own drift and growth (0 with the population held).
+    /// `--ignored`.
+    #[test]
+    #[ignore]
+    fn carried_maps_step_back_by() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
+        let field = CloudField::build(7);
+        let noise = CloudNoise::shared();
+        let mut params = CloudParams { coverage: 0.35, wind_speed: 16.0, time_scale: 2.5, ..Default::default() };
+        params.kinds = [1.0, 1.0, 0.0, 1.0];
+        if let Some(k) = std::env::var("STEP_KINDS").ok() {
+            let v: Vec<f32> = k.split(',').map(|x| x.parse().unwrap()).collect();
+            params.kinds = [v[0], v[1], v[2], v[3]];
+        }
+        let model = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise);
+        let env = |k: &str| std::env::var(k).ok();
+        let dt: f64 = env("STEP_DT").and_then(|v| v.parse().ok()).unwrap_or(6.7);
+        let hold_pop = env("STEP_POP").is_some();
+        let hold_churn = env("STEP_CHURN").is_some();
+        let by_height = env("STEP_WIND").is_some();
+        let mut population = CloudPopulation::new();
+        let eye = [10.0f32, 2.0, 5.0];
+        let t0 = 20_000.0;
+        let mut draw = |t: f64| {
+            if !hold_pop || population.generation() == 0 {
+                population.update(&params, &field, t);
+            }
+            let mut layers = model.layers(t);
+            population.place(&mut layers, t);
+            if hold_churn {
+                for (l, held) in layers.iter_mut().zip(model.layers(t0)) {
+                    l.churn = held.churn;
+                }
+            }
+            let mut sky = CloudSky::new(&device, &queue, &field, &noise);
+            sky.set_population(&device, &queue, &population);
+            sky.set_winds(flow_winds(&params, &layers));
+            let u = CloudSkyUniform::new(&layers, eye, [0.35, 0.85, 0.4], [3.0, 2.9, 2.7], [0.4, 0.5, 0.7], [0.2, 0.2, 0.15], [0.0, 0.0], 4096.0, 0.5);
+            let mut enc = device.create_command_encoder(&Default::default());
+            sky.encode_at(&mut enc, &queue, &u, &u, None, true, t, t);
+            queue.submit(Some(enc.finish()));
+            let layer = sky.display()[1] as u32;
+            let map = read_back(&device, &queue, &sky.maps, layer, MAP_WIDTH, MAP_HEIGHT, 8);
+            let alts = read_back(&device, &queue, &sky.alts, layer, MAP_WIDTH, MAP_HEIGHT, 8);
+            let n = (MAP_WIDTH * MAP_HEIGHT) as usize;
+            let alpha: Vec<f32> = (0..n).map(|i| half(&map[i * 8 + 6..i * 8 + 8])).collect();
+            let ch: [Vec<f32>; 3] = [0, 4, 6].map(|o| (0..n).map(|i| half(&alts[i * 8 + o..i * 8 + o + 2])).collect());
+            (alpha, ch, flow_winds(&params, &layers))
+        };
+        let (old, _, _) = draw(t0);
+        let (new, alt, winds) = draw(t0 + dt);
+        const P: i32 = 32;
+        let (mut shifts, mut gains) = (Vec::new(), Vec::new());
+        let mut mean = [0.0f64; 2];
+        for pj in (MAP_HEIGHT as i32 / 8..MAP_HEIGHT as i32 * 7 / 8).step_by(P as usize) {
+            for pi in (0..MAP_WIDTH as i32).step_by(P as usize) {
+                let mut texels = Vec::new();
+                let (mut lo, mut hi) = (1.0f32, 0.0f32);
+                for j in pj..pj + P {
+                    for i in pi..pi + P {
+                        let uv = [(i as f32 + 0.5) / MAP_WIDTH as f32, (j as f32 + 0.5) / MAP_HEIGHT as f32];
+                        let want = bilinear(&new, uv);
+                        let h = bilinear(&alt[0], uv);
+                        let v = if by_height { flow_wind(h, &winds) } else { [bilinear(&alt[1], uv), bilinear(&alt[2], uv)] };
+                        let from = advected_uv(map_dir(uv), h, eye[1], v, [0.0; 3], dt as f32);
+                        lo = lo.min(want);
+                        hi = hi.max(want);
+                        texels.push((want, from));
+                    }
+                }
+                // Only patches holding a cloud's edge say where it is.
+                if hi - lo < 0.3 {
+                    continue;
+                }
+                let cost = |sx: f32, sy: f32| -> f32 {
+                    texels.iter().map(|&(w, f)| (bilinear(&old, [f[0] + sx / MAP_WIDTH as f32, f[1] + sy / MAP_HEIGHT as f32]) - w).abs()).sum()
+                };
+                let zero = cost(0.0, 0.0);
+                let mut best = (zero, 0.0f32, 0.0f32);
+                for a in -16..=16 {
+                    for b in -16..=16 {
+                        let (sx, sy) = (a as f32 * 0.5, b as f32 * 0.5);
+                        let c = cost(sx, sy);
+                        if c < best.0 {
+                            best = (c, sx, sy);
+                        }
+                    }
+                }
+                shifts.push((best.1 * best.1 + best.2 * best.2).sqrt());
+                gains.push(1.0 - best.0 / zero.max(1e-6));
+                mean[0] += best.1 as f64;
+                mean[1] += best.2 as f64;
+            }
+        }
+        let n = shifts.len();
+        shifts.sort_by(f32::total_cmp);
+        gains.sort_by(f32::total_cmp);
+        let q = |v: &[f32], f: f32| v[((v.len() - 1) as f32 * f) as usize];
+        eprintln!(
+            "STEPBACK dt {dt} s{}{}{}: {n} edge patches; shift (texels, 0.18 deg) median {:.2} p75 {:.2} p90 {:.2} max {:.2}; mean ({:.2}, {:.2}); the best shift cuts the misfit by median {:.0}%",
+            if by_height { " height-wind" } else { "" },
+            if hold_pop { " pop-held" } else { "" },
+            if hold_churn { " churn-held" } else { "" },
+            q(&shifts, 0.5), q(&shifts, 0.75), q(&shifts, 0.9), shifts[n - 1], mean[0] / n as f64, mean[1] / n as f64, 100.0 * q(&gains, 0.5)
+        );
     }
 
     /// MAPS ACCUMULATED UNDER A MOVING, CHANGING SKY ARE THE SKY OF THEIR
@@ -3159,7 +3310,7 @@ pub(crate) mod tests {
         // hair past the heights' .g beside a hard edge, which the sky shader
         // cancels (it weighs a disc by .g / a times a).
         let map = read_back(&device, &queue, sky.raw(), 0, MAP_WIDTH, MAP_HEIGHT, 8);
-        let alts = read_back(&device, &queue, &sky.alts, layer, MAP_WIDTH, MAP_HEIGHT, 4);
+        let alts = read_back(&device, &queue, &sky.alts, layer, MAP_WIDTH, MAP_HEIGHT, 8);
         if let Some(e) = pollster::block_on(scope.pop()) {
             panic!("the cloud passes do not validate: {e}");
         }
@@ -3168,7 +3319,7 @@ pub(crate) mod tests {
             for i in 0..MAP_WIDTH {
                 let k = (j * MAP_WIDTH + i) as usize;
                 let alpha = half(&map[k * 8 + 6..k * 8 + 8]);
-                let through = half(&alts[k * 4 + 2..k * 4 + 4]);
+                let through = half(&alts[k * 8 + 2..k * 8 + 4]);
                 if through > alpha + 2e-3 {
                     above += 1;
                 }

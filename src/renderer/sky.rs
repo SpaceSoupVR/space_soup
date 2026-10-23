@@ -629,14 +629,14 @@ fn alt_dummy(device: &Device, queue: &Queue) -> Texture {
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        format: TextureFormat::Rg16Float,
+        format: TextureFormat::Rgba16Float,
         usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         view_formats: &[],
     });
     queue.write_texture(
         TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
-        &[0u8, 0, 0x00, 0x3c],
-        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+        &[0u8, 0, 0x00, 0x3c, 0, 0, 0, 0],
+        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: Some(1) },
         Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
     );
     texture
@@ -1773,11 +1773,11 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
     let uv = cloud_map_uv(dir);
     var uva = uv;
     var uvb = uv;
-    let alt = textureSampleLevel(cloud_alts, cloud_samp, uv, i32(sky_extra.cloud_misc.y), 0.0).r;
+    let here = textureSampleLevel(cloud_alts, cloud_samp, uv, i32(sky_extra.cloud_misc.y), 0.0);
+    let alt = here.r;
     if (alt > 0.0) {{
-        let w = sky_extra.cloud_winds;
-        let wv = cloud_flow_wind(alt, w[0], w[1], w[2], w[3]);
-        let v = vec3<f32>(wv.x, 0.0, wv.y);
+        // The wind what the map shows here rides (`fs_map`, alts .ba).
+        let v = vec3<f32>(here.b, 0.0, here.a);
         let p = dir * cloud_flow_distance(sky_extra.cloud_eye.x, alt, dir.y);
         let fa = sky_extra.cloud_flow[0];
         let fb = sky_extra.cloud_flow[1];
