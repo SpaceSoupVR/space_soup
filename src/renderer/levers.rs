@@ -118,6 +118,11 @@ pub struct Levers {
     /// 90% for a quarter second (`frame_governor`; the AAA doc's rank 11).
     /// Off by default: A/B before turning on.
     pub frame_governor: bool,
+    /// Models drawn from their coarsest LOD whose error (x
+    /// `mesh_lod::ERROR_MARGIN`) projects under `model_lod_pixels` eye
+    /// pixels: by construction no switch is visible (part 1, model LODs).
+    pub model_lods: bool,
+    pub model_lod_pixels: f32,
 
     pub effects: bool,
 
@@ -325,6 +330,8 @@ impl Default for Levers {
             smooth_ground: true,
             light_cutoff: 0.0,
             frame_governor: false,
+            model_lods: true,
+            model_lod_pixels: 0.5,
             effects: true,
             muzzle_test: true,
             mud_test: false,
@@ -515,6 +522,7 @@ impl Levers {
         flag("smooth_sun_shadow", self.smooth_sun_shadow, d.smooth_sun_shadow);
         flag("smooth_ground", self.smooth_ground, d.smooth_ground);
         flag("frame_governor", self.frame_governor, d.frame_governor);
+        flag("model_lods", self.model_lods, d.model_lods);
         flag("effects", self.effects, d.effects);
         flag("muzzle_test", self.muzzle_test, d.muzzle_test);
         flag("mud_test", self.mud_test, d.mud_test);
@@ -566,6 +574,9 @@ impl Levers {
         }
         if self.thin_parts != d.thin_parts {
             out.push(format!("thin_parts={}", self.thin_parts));
+        }
+        if self.model_lod_pixels != d.model_lod_pixels {
+            out.push(format!("model_lod_pixels={}", self.model_lod_pixels));
         }
         if self.light_cutoff != d.light_cutoff {
             out.push(format!("light_cutoff={}", self.light_cutoff));

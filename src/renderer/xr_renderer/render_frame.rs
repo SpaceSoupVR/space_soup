@@ -70,8 +70,13 @@ impl Drop for DrawLogFrame {
     }
 }
 
+/// A primitive's LOD for this frame: its index buffer and count, or None
+/// for the full mesh (`mesh_lod`).
+type LodPick = Option<(wgpu::Buffer, u32)>;
+
 fn push_mesh_draws<'a>(
     instance: &'a MeshInstance,
+    picks: &'a [LodPick],
     lightmap_bg: &'a wgpu::BindGroup,
     mesh_draws: &mut Vec<MeshDraw<'a>>,
     skinned_draws: &mut Vec<SkinnedDraw<'a>>,
@@ -93,7 +98,8 @@ fn push_mesh_draws<'a>(
             }
         }
     } else {
-        for prim in &instance.mesh.primitives {
+        for (k, prim) in instance.mesh.primitives.iter().enumerate() {
+            let pick = picks.get(k).and_then(Option::as_ref);
 
             if let Some(layered) = &prim.layered {
                 layered_draws.push((
@@ -128,8 +134,8 @@ fn push_mesh_draws<'a>(
                 texture: &prim.texture.bind_group,
                 lightmap: lightmap_bg,
                 vertices: &prim.vertex_buffer,
-                indices: &prim.index_buffer,
-                count: prim.indices.len() as u32,
+                indices: pick.map_or(&prim.index_buffer, |p| &p.0),
+                count: pick.map_or(prim.indices.len() as u32, |p| p.1),
                 thin: prim.thin.as_ref(),
                 blended: prim.blended,
                 bound: crate::renderer::shadow::mesh_caster_bound(&instance.mesh),
@@ -784,6 +790,36 @@ impl XrRenderer {
             _ => 0.0,
         };
         let thin_pass = thin_width > 0.0;
+        // Each model's LOD for this frame, from the middle of the eyes: the
+        // coarsest whose error stays under `model_lod_pixels` (`mesh_lod`).
+        self.mesh_lods.poll(&self.wgpu_device);
+        let pixels_per_radian = {
+            let f = eye_views[0].fov;
+            self.width.max(1) as f32 / (f.angle_right.tan() - f.angle_left.tan()).max(1e-3)
+        };
+        let lod_on = self.levers.model_lods;
+        let lod_pixels = self.levers.model_lod_pixels;
+        let mut pick_lods = |instance: &MeshInstance| -> Vec<LodPick> {
+            if !lod_on || instance.mesh.skin.is_some() {
+                return Vec::new();
+            }
+            let m = &instance.mesh;
+            let scale = m.scale.abs().max_element();
+            let distance = ((m.position - mid_eye).length() - m.bounding_radius * scale).max(0.05);
+            m.primitives
+                .iter()
+                .map(|p| {
+                    if p.layered.is_some() || p.baked_cave.is_some() || p.thin.is_some() || p.blended {
+                        return None;
+                    }
+                    let lods = self.mesh_lods.lods(&p.index_buffer, || p.vertices.iter().map(|v| glam::Vec3::from(v.position)).collect(), &p.indices);
+                    let errors: Vec<f32> = lods.iter().map(|l| l.error * crate::renderer::mesh_lod::ERROR_MARGIN).collect();
+                    crate::renderer::mesh_lod::pick(&errors, scale, distance, pixels_per_radian, lod_pixels).map(|k| (lods[k].buffer.clone(), lods[k].count))
+                })
+                .collect()
+        };
+        let lod_picks: Vec<Vec<LodPick>> = meshes.iter().map(&mut pick_lods).collect();
+        let mirror_lod_picks: Vec<Vec<LodPick>> = mirror_only_meshes.iter().map(&mut pick_lods).collect();
         let mut mesh_draws: Vec<MeshDraw> = Vec::new();
         let mut skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut layered_draws: Vec<LayeredDraw> = Vec::new();
@@ -800,7 +836,7 @@ impl XrRenderer {
         let mut tile_meshes: Vec<usize> = Vec::new();
 
         let mut glare_adapted = vec![false; self.glare_sources.len()];
-        for instance in meshes {
+        for (mi, instance) in meshes.iter().enumerate() {
 
             let world = glam::Quat::from_rotation_y(self.player.yaw)
                 * instance.mesh.position
@@ -850,19 +886,20 @@ impl XrRenderer {
             );
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(
-                instance, lightmap_bg, &mut mesh_draws, &mut skinned_draws, &mut layered_draws,
+                instance, &lod_picks[mi], lightmap_bg, &mut mesh_draws, &mut skinned_draws, &mut layered_draws,
                 &mut baked_cave_draws,
             );
             if instance.mesh.skin.is_none() {
                 let bound = crate::renderer::shadow::mesh_caster_bound(&instance.mesh);
-                for prim in instance.mesh.primitives.iter().filter(|p| p.casts_shadow) {
+                for (k, prim) in instance.mesh.primitives.iter().enumerate().filter(|(_, p)| p.casts_shadow) {
                     if instance.tile_caster {
                         tile_meshes.push(shadow_casters.len());
                     }
+                    let pick = lod_picks[mi].get(k).and_then(Option::as_ref);
                     shadow_casters.push((
                         &prim.vertex_buffer,
-                        &prim.index_buffer,
-                        prim.indices.len() as u32,
+                        pick.map_or(&prim.index_buffer, |p| &p.0),
+                        pick.map_or(prim.indices.len() as u32, |p| p.1),
                         &instance.model.bind_group,
                     ));
                     caster_solid_only.push(prim.thin.as_ref().map(|t| (&t.solid_index_buffer, t.solid_count)));
@@ -885,7 +922,7 @@ impl XrRenderer {
         let mut mirror_only_skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut mirror_only_layered_draws: Vec<LayeredDraw> = Vec::new();
         let mut mirror_only_baked_caves: Vec<crate::renderer::baked_cave::BakedCaveDraw> = Vec::new();
-        for instance in mirror_only_meshes {
+        for (mi, instance) in mirror_only_meshes.iter().enumerate() {
 
             let world = glam::Quat::from_rotation_y(self.player.yaw) * instance
                 .mesh.position
@@ -905,6 +942,7 @@ impl XrRenderer {
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(
                 instance,
+                &mirror_lod_picks[mi],
                 lightmap_bg,
                 &mut mirror_only_mesh_draws,
                 &mut mirror_only_skinned_draws,
@@ -914,11 +952,12 @@ impl XrRenderer {
 
             if instance.mesh.skin.is_none() {
                 let bound = crate::renderer::shadow::mesh_caster_bound(&instance.mesh);
-                for prim in instance.mesh.primitives.iter().filter(|p| p.casts_shadow) {
+                for (k, prim) in instance.mesh.primitives.iter().enumerate().filter(|(_, p)| p.casts_shadow) {
+                    let pick = mirror_lod_picks[mi].get(k).and_then(Option::as_ref);
                     shadow_casters.push((
                         &prim.vertex_buffer,
-                        &prim.index_buffer,
-                        prim.indices.len() as u32,
+                        pick.map_or(&prim.index_buffer, |p| &p.0),
+                        pick.map_or(prim.indices.len() as u32, |p| p.1),
                         &instance.model.bind_group,
                     ));
                     caster_solid_only.push(prim.thin.as_ref().map(|t| (&t.solid_index_buffer, t.solid_count)));

@@ -642,6 +642,9 @@ pub struct XrRenderer {
     /// when a GPU spike was last logged (`GPUSPIKE`, once a second at most).
     thermal: crate::thermal::Thermal,
     over_budget: u64,
+
+    /// Model LODs, built off the render thread (`mesh_lod::LodCache`).
+    mesh_lods: crate::renderer::mesh_lod::LodCache,
     gpu_spike_logged: Option<std::time::Instant>,
 
     /// The compositor's display rate, Hz (`note_display_hz`).
@@ -1625,6 +1628,7 @@ impl XrRenderer {
             governor_tick: None,
             thermal: Default::default(),
             over_budget: 0,
+            mesh_lods: Default::default(),
             gpu_spike_logged: None,
             display_hz: 72.0,
             perf_log: None,
