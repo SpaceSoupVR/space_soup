@@ -99,6 +99,10 @@ pub struct Levers {
     /// cloud there (`HISTORY_REJECT_SHARE`: no ghost rims in clear sky); off
     /// lets it go only at 0.2 to 0.5, as before 2026-10-22.
     pub cloud_history_tight: bool,
+    /// The cirrus, drawn per pixel by the sky shader (`sky_cirrus`, 2026-10-23:
+    /// in the maps it shared the lower clouds' carry wind and warped where
+    /// they crossed). Off: no cirrus, to time it.
+    pub sky_cirrus: bool,
     /// The reflection probes relit on the GPU at every frame's daylight
     /// (`ProbeStream::new_smooth`), not rebuilt on the CPU at 25% steps; off
     /// is the stepped relight. Read when the level's probes load. Costs two
@@ -359,6 +363,7 @@ impl Default for Levers {
             clouds: true,
             cloud_pace: true,
             cloud_history_tight: true,
+            sky_cirrus: true,
             smooth_probes: true,
             smooth_sun_shadow: true,
             smooth_ground: true,
@@ -509,6 +514,7 @@ impl Levers {
             }
             Phase::Fovea30 => l.pass_cut = Some("def_cut_fovea30".into()),
             Phase::Fovea45 => l.pass_cut = Some("def_cut_fovea45".into()),
+            Phase::NoReflectionHistory => l.reflection_history = false,
         }
         l
     }
@@ -558,6 +564,7 @@ impl Levers {
         flag("clouds", self.clouds, d.clouds);
         flag("cloud_pace", self.cloud_pace, d.cloud_pace);
         flag("cloud_history_tight", self.cloud_history_tight, d.cloud_history_tight);
+        flag("sky_cirrus", self.sky_cirrus, d.sky_cirrus);
         flag("smooth_probes", self.smooth_probes, d.smooth_probes);
         flag("smooth_sun_shadow", self.smooth_sun_shadow, d.smooth_sun_shadow);
         flag("smooth_ground", self.smooth_ground, d.smooth_ground);

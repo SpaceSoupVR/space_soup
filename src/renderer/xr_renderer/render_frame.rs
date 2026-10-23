@@ -623,6 +623,9 @@ impl XrRenderer {
                 Some(self.uniform_buf.cloud_shadow_view()),
                 false,
             );
+                if !self.levers.sky_cirrus {
+                    self.sky.hide_cirrus(&self.wgpu_queue);
+                }
             }
             let clouds_ms = clouds_at.elapsed().as_secs_f32() * 1000.0;
             if clouds_ms > 3.0 {

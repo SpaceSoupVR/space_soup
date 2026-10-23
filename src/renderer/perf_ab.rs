@@ -75,10 +75,13 @@ pub enum Phase {
     LightCutoff,
     Fovea30,
     Fovea45,
+    /// The reflections' history off (`Levers::reflection_history`), against
+    /// the floor's warp by the marble room's doorway (user, 2026-10-23).
+    NoReflectionHistory,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 37] = [
+    pub const ALL: [Phase; 38] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -116,6 +119,7 @@ impl Phase {
         Phase::LightCutoff,
         Phase::Fovea30,
         Phase::Fovea45,
+        Phase::NoReflectionHistory,
     ];
 
     pub fn for_window(window: u64) -> Phase {
@@ -182,6 +186,7 @@ impl Phase {
             Phase::LightCutoff => "light_cutoff",
             Phase::Fovea30 => "fovea30",
             Phase::Fovea45 => "fovea45",
+            Phase::NoReflectionHistory => "no_reflection_history",
         }
     }
 }

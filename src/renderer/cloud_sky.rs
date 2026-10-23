@@ -249,6 +249,103 @@ pub fn cloud_flow_wgsl() -> String {
     CLOUD_FLOW_WGSL.replace("{EARTH}", &format!("{:.1}", c::EARTH_RADIUS_M)).replace("{PACK}", &format!("{MAP_PACK:?}"))
 }
 
+/// THE CIRRUS, PER PIXEL IN THE SKY SHADER (2026-10-23): `fs_map`'s cirrus
+/// (`cirrus_tau` and its light) line for line, drawn at the eye's position
+/// and the layer's offset now, so it rides its own wind exactly and never
+/// shares a map texel, or that texel's carry wind, with the clouds in front
+/// (`CIRRUS_IN_MAP`). Reads `sky_extra.cirrus` (`Sky::step_clouds`) and the
+/// baked field (`cirrus_texture`); returns the light it adds and its haze-weighted
+/// alpha, and leaves its own clear share (no haze) in `cirrus_clear`.
+pub fn cirrus_sky_wgsl() -> String {
+    let f = |v: f32| format!("{v:?}");
+    CIRRUS_SKY_WGSL
+        .replace("{EARTH}", &format!("{:.1}", c::EARTH_RADIUS_M))
+        .replace("{CIRRUS_TAU}", &f(cl::CIRRUS_TAU))
+        .replace("{CIRRUS_STRETCH}", &f(cl::CIRRUS_STRETCH))
+        .replace("{EXTINCTION}", &f(c::EXTINCTION_PER_M))
+        .replace("{AEROSOL_HEIGHT}", &f(space_soup_sky::time_of_day::AEROSOL_HEIGHT_M))
+        .replace("{AIR_HAZE}", &format!("{:e}", space_soup_sky::time_of_day::AIR_HAZE_PER_M))
+        .replace("{AIR_HAZE_HEIGHT}", &f(space_soup_sky::time_of_day::AIR_HAZE_HEIGHT_M))
+}
+
+const CIRRUS_SKY_WGSL: &str = r#"
+const CIRRUS_EARTH: f32 = {EARTH};
+const CIRRUS_SKY_TAU: f32 = {CIRRUS_TAU};
+const CIRRUS_SKY_STRETCH: f32 = {CIRRUS_STRETCH};
+const CIRRUS_EXTINCTION: f32 = {EXTINCTION};
+const CIRRUS_AEROSOL_HEIGHT: f32 = {AEROSOL_HEIGHT};
+const CIRRUS_AIR_HAZE: f32 = {AIR_HAZE};
+const CIRRUS_AIR_HAZE_HEIGHT: f32 = {AIR_HAZE_HEIGHT};
+
+var<private> cirrus_clear: f32 = 1.0;
+
+fn cirrus_hg(g: f32, c: f32) -> f32 {
+    let g2 = g * g;
+    return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(1.0 + g2 - 2.0 * g * c, 1e-6), 1.5));
+}
+
+// The level of the weather field one pixel's footprint on the sheet spans,
+// at `per_m` texels a metre: the geometric mean of its width (px t) and its
+// length, stretched where the ray grazes the sheet (mu_s at the sheet).
+fn cirrus_lod(foot_m: f32, per_m: f32) -> f32 {
+    return max(log2(max(foot_m * per_m, 1.0)), 0.0);
+}
+
+// The sky shader's twin of `fs_map`'s cirrus (`cirrus_tau`, `haze_through`,
+// `shell_distance`); `px` the pixel's angle.
+fn sky_cirrus(dir: vec3<f32>, px: f32) -> vec4<f32> {
+    cirrus_clear = 1.0;
+    let a = sky_extra.cirrus[0];
+    let e = sky_extra.cirrus[5];
+    let mu = dir.y;
+    if (a.z <= 0.0 || a.w <= 0.0 || a.x <= e.y || mu <= -0.2) {
+        return vec4<f32>(0.0);
+    }
+    let r = CIRRUS_EARTH + e.y;
+    let cc = (a.x - e.y) * (2.0 * CIRRUS_EARTH + a.x + e.y);
+    let rm = r * mu;
+    let disc = rm * rm + cc;
+    if (disc < 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let t = cc / max(sqrt(disc) + rm, 1e-3);
+    let xz = e.xz + dir.xz * t;
+    let wd = sky_extra.cirrus[2].zw;
+    let along = xz.x * wd.x + xz.y * wd.y;
+    let across = -xz.x * wd.y + xz.y * wd.x;
+    let inv = sky_extra.cirrus[1].z;
+    let s = inv * 10.0;
+    let o = sky_extra.cirrus[3];
+    let mu_s = clamp((rm + t) / (CIRRUS_EARTH + a.x), 0.02, 1.0);
+    let foot = px * t * inverseSqrt(mu_s);
+    let uv = vec2<f32>(along * s / CIRRUS_SKY_STRETCH, across * s) + o.xy;
+    let size = f32(textureDimensions(cirrus_tex, 0).x);
+    let n = textureSampleLevel(cirrus_tex, cirrus_samp, uv, cirrus_lod(foot, s * size)).r;
+    let c = a.z;
+    let sheet = clamp((n - (1.0 - c)) / max(c, 1e-3), 0.0, 1.0);
+    if (sheet <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    // The tufts, at their own scale and offset.
+    let tuft = textureSampleLevel(cirrus_tex, cirrus_samp, vec2<f32>(along, across) * inv * 2.0 + o.zw, cirrus_lod(foot, 2.0 * inv * size)).g;
+    let d = sheet * smoothstep(0.35, 0.7, tuft);
+    if (d <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let tau = d * d * CIRRUS_SKY_TAU * min(a.w / CIRRUS_EXTINCTION, 2.0) * min(1.0 / max(mu, 1e-3), 8.0);
+    let alpha = 1.0 - exp(-tau);
+    let l = sky_extra.cirrus[4];
+    let cv = dot(dir, l.xyz);
+    let light = sky_extra.cloud_light.rgb * (0.7 * cirrus_hg(0.85, cv) + 0.3 * cirrus_hg(0.2, cv)) + sky_extra.cloud_sky.rgb * 0.8;
+    let m = max(mu, 1e-3);
+    let depth = l.w * CIRRUS_AEROSOL_HEIGHT / m * (1.0 - exp(-t * m / CIRRUS_AEROSOL_HEIGHT))
+        + CIRRUS_AIR_HAZE * CIRRUS_AIR_HAZE_HEIGHT / m * (1.0 - exp(-t * m / CIRRUS_AIR_HAZE_HEIGHT));
+    let w = alpha * exp(-depth);
+    cirrus_clear = 1.0 - alpha;
+    return vec4<f32>(light * w, w);
+}
+"#;
+
 const CLOUD_FLOW_WGSL: &str = r#"
 const CLOUD_FLOW_EARTH: f32 = {EARTH};
 const CLOUD_FLOW_PACK: f32 = {PACK};
@@ -285,6 +382,7 @@ pub const ENVELOPE_MIPS: u32 = ENVELOPE_SIZE.ilog2() + 1;
 pub struct CloudSky {
     noise: Texture,
     weather: Texture,
+    cirrus: Texture,
     /// The populated layers' envelopes (`cloud_population`), one array
     /// layer each, and what draws them.
     envelope: Texture,
@@ -388,6 +486,71 @@ fn weather_texture(device: &Device, queue: &Queue, field: &CloudField) -> Textur
     t
 }
 
+/// The cirrus field's texels a side: three times the weather's, for the
+/// octave `cirrus_tau` reads at three times its scale.
+pub const CIRRUS_TEX: u32 = 3 * CLOUD_TILE;
+
+/// THE CIRRUS'S FIELD, BAKED FOR THE SKY SHADER (2026-10-23), `CIRRUS_TEX`
+/// a side over one weather tile (`sky_cirrus`):
+/// - .r the sheet: the noise `cirrus_tau` sums from three weather taps,
+///   0.45 g + 0.3 b at uv and 0.25 b at 3 uv + (0.37, 0.71) -- periodic over
+///   the tile, so baked over it;
+/// - .g the tufts: the weather's r.
+///
+/// Every sky pixel reads the sheet, and the tufts and the light only where it
+/// leaves any cirrus. Three RGBA8 taps a pixel cost the Quest +1.4 ms of the
+/// full-sky view and one RG16F tap +0.7, so it is two bytes a texel. One
+/// texture, as the desktop effects pass's fragment stage is at the 16
+/// sampled textures a stage wgpu grants by default. Mipped, as a pixel near
+/// the horizon spans many texels.
+pub fn cirrus_texture(device: &Device, queue: &Queue, field: &CloudField) -> Texture {
+    let n = CIRRUS_TEX;
+    let mut levels = 1;
+    while (n >> (levels - 1)) % 2 == 0 && (n >> levels) >= 3 {
+        levels += 1;
+    }
+    let t = device.create_texture(&TextureDescriptor {
+        label: Some("cloud_cirrus"),
+        size: Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+        mip_level_count: levels,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rg8Unorm,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut level: Vec<[f32; 2]> = (0..(n * n) as usize)
+        .map(|i| {
+            let uv = [((i % n as usize) as f32 + 0.5) / n as f32, ((i / n as usize) as f32 + 0.5) / n as f32];
+            let f = field.fetch(uv);
+            let g = field.fetch([uv[0] * 3.0 + 0.37, uv[1] * 3.0 + 0.71]);
+            [0.45 * f[1] + 0.3 * f[2] + 0.25 * g[2], f[0]]
+        })
+        .collect();
+    for mip in 0..levels {
+        let w = (n >> mip) as usize;
+        let bytes: Vec<u8> = level.iter().flat_map(|v| v.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)).collect();
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &t, mip_level: mip, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            &bytes,
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w as u32 * 2), rows_per_image: Some(w as u32) },
+            Extent3d { width: w as u32, height: w as u32, depth_or_array_layers: 1 },
+        );
+        if mip + 1 < levels {
+            let h = w / 2;
+            level = (0..h * h)
+                .map(|i| {
+                    let (x, y) = (i % h, i / h);
+                    let at = |dx: usize, dy: usize| level[(2 * y + dy) * w + 2 * x + dx];
+                    let q = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
+                    [q.iter().map(|v| v[0]).sum::<f32>() / 4.0, q.iter().map(|v| v[1]).sum::<f32>() / 4.0]
+                })
+                .collect();
+        }
+    }
+    t
+}
+
 impl CloudSky {
     pub fn new(device: &Device, queue: &Queue, field: &CloudField, noise: &CloudNoise) -> Self {
         Self::with_shader(device, queue, field, noise, cloud_sky_shader())
@@ -413,6 +576,7 @@ impl CloudSky {
             Extent3d { width: n, height: n, depth_or_array_layers: n },
         );
         let weather = weather_texture(device, queue, field);
+        let cirrus = cirrus_texture(device, queue, field);
         let maps = device.create_texture(&TextureDescriptor {
             label: Some("cloud_sky_maps"),
             size: Extent3d { width: MAP_WIDTH, height: MAP_HEIGHT, depth_or_array_layers: 3 },
@@ -782,6 +946,7 @@ impl CloudSky {
         Self {
             noise: noise_tex,
             weather,
+            cirrus,
             envelope,
             envelope_layers,
             envelope_sampler,
@@ -856,6 +1021,7 @@ impl CloudSky {
     /// A new weather field (a new sky's seed).
     pub fn set_weather(&mut self, device: &Device, queue: &Queue, field: &CloudField) {
         self.weather = weather_texture(device, queue, field);
+        self.cirrus = cirrus_texture(device, queue, field);
         self.bind_group = Self::bind(device, &self.layout, &self.uniform, &self.noise, &self.weather, &self.sampler, &self.envelope, &self.envelope_sampler);
         self.shadow_bind_group = Self::bind(device, &self.layout, &self.shadow_uniform, &self.noise, &self.weather, &self.sampler, &self.envelope, &self.envelope_sampler);
         self.fresh = true;
@@ -925,6 +1091,11 @@ impl CloudSky {
     #[cfg(test)]
     pub(crate) fn raw(&self) -> &Texture {
         &self.raw
+    }
+
+    /// The cirrus's field (`cirrus_texture`, `sky_cirrus` in the sky shader).
+    pub fn cirrus_view(&self) -> TextureView {
+        self.cirrus.create_view(&TextureViewDescriptor::default())
     }
 
     /// The heights beside the maps (`texture_2d_array`, R16F metres).
@@ -1501,6 +1672,7 @@ const MAX_MARCH: f32 = {MAX_MARCH};
 const CIRRUS_TAU: f32 = {CIRRUS_TAU};
 const SUN_RADIUS: f32 = {SUN_RADIUS};
 const CIRRUS_STRETCH: f32 = {CIRRUS_STRETCH};
+const CIRRUS_IN_MAP: bool = false;
 const EXTINCTION: f32 = {EXTINCTION};
 const FORWARD_G: f32 = {FORWARD_G};
 const BACK_G: f32 = {BACK_G};
@@ -2178,8 +2350,14 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
             t = t + dt;
         }
     }
-    // Cirrus: ice, a thin sheet, its light thrown forward.
-    if (layer_on(3u) && trans > 0.01) {
+    // Cirrus: ice, a thin sheet, its light thrown forward. DRAWN BY THE SKY
+    // SHADER, per pixel, at its own wind (`sky::sky_cirrus`, 2026-10-23):
+    // in the map its light shared the texels of the clouds in front, whose
+    // carry wind (alts .ba) is the light-weighted sum of both, so where it
+    // crossed a cumulus both were carried 0.14-0.75 deg off their own winds
+    // over a map's life and snapped back at the next (`SHOWN_WIND_MIX`; user:
+    // "the shaders compete and make a weird distortion").
+    if (CIRRUS_IN_MAP && layer_on(3u) && trans > 0.01) {
         let t = shell_distance(alt, lv(3u, 0u).x, mu);
         if (t >= 0.0) {
             let tau = cirrus_tau(3u, eye + dir.xz * t) * min(1.0 / max(mu, 1e-3), 8.0);

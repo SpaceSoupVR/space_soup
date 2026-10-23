@@ -67,6 +67,11 @@ pub struct SkyExtra {
     pub cloud_winds: [[f32; 4]; 4],
     /// x: the eye's altitude the maps are carried for.
     pub cloud_eye: [f32; 4],
+    /// The cirrus, drawn per pixel (`cloud_sky::cirrus_sky_wgsl`): its
+    /// layer's rows 0, 1, 3 and 11 of `CloudSkyUniform::layers`, now; the
+    /// clouds' light direction and the aerosol per metre; the eye (world x,
+    /// altitude, z). Zero, it is not drawn.
+    pub cirrus: [[f32; 4]; 6],
 }
 
 impl SkyExtra {
@@ -319,6 +324,8 @@ pub struct Sky {
     /// And in the heights' place.
     alt_texture: Texture,
     cloud_sampler: Sampler,
+    /// Repeat, mipped: the cirrus's weather field (`sky_cirrus`).
+    cirrus_sampler: Sampler,
     /// Counts the bind groups made, so a user of the maps knows to bind again.
     bind_serial: u64,
     /// The moment and the eye the map being built holds the sky at.
@@ -540,6 +547,23 @@ pub fn sky_bind_group_layout(device: &Device) -> BindGroupLayout {
                 },
                 count: None,
             },
+            // The cirrus's baked field (`CloudSky::cirrus_view`).
+            BindGroupLayoutEntry {
+                binding: 9,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 10,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
@@ -646,6 +670,13 @@ fn alt_dummy(device: &Device, queue: &Queue) -> Texture {
     texture
 }
 
+fn cirrus_view(cloud_sky: &Option<CloudSky>, dummy: &Texture) -> TextureView {
+    match cloud_sky {
+        Some(c) => c.cirrus_view(),
+        None => dummy.create_view(&TextureViewDescriptor::default()),
+    }
+}
+
 fn alts_view(cloud_sky: &Option<CloudSky>, dummy: &Texture) -> TextureView {
     match cloud_sky {
         Some(c) => c.alts_view().clone(),
@@ -728,7 +759,16 @@ impl Sky {
             mipmap_filter: MipmapFilterMode::Linear,
             ..Default::default()
         });
-        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer, &clouds_view(&None, &cloud_texture), &alts_view(&None, &alt_texture), &cloud_sampler, &night);
+        let cirrus_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("sky_cirrus_sampler"),
+            address_mode_u: AddressMode::Repeat,
+            address_mode_v: AddressMode::Repeat,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer, &clouds_view(&None, &cloud_texture), &alts_view(&None, &alt_texture), &cloud_sampler, &night, (&cirrus_view(&None, &cloud_texture), &cirrus_sampler));
 
         Self {
             bind_group,
@@ -749,6 +789,7 @@ impl Sky {
             cloud_texture,
             alt_texture,
             cloud_sampler,
+            cirrus_sampler,
             bind_serial: 0,
             cloud_build: None,
             cloud_every: (1, 0),
@@ -784,7 +825,7 @@ impl Sky {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn bind(device: &Device, layout: &BindGroupLayout, texture: &Texture, sampler: &Sampler, extra: &Buffer, cloud_view: &TextureView, alt_view: &TextureView, cloud_sampler: &Sampler, night: &NightMaps) -> BindGroup {
+    fn bind(device: &Device, layout: &BindGroupLayout, texture: &Texture, sampler: &Sampler, extra: &Buffer, cloud_view: &TextureView, alt_view: &TextureView, cloud_sampler: &Sampler, night: &NightMaps, cirrus: (&TextureView, &Sampler)) -> BindGroup {
         let view = texture.create_view(&TextureViewDescriptor::default());
         device.create_bind_group(&BindGroupDescriptor {
             label: Some("sky_bg"),
@@ -799,6 +840,8 @@ impl Sky {
                 BindGroupEntry { binding: 6, resource: BindingResource::TextureView(&night.views[1]) },
                 BindGroupEntry { binding: 7, resource: BindingResource::TextureView(&night.views[2]) },
                 BindGroupEntry { binding: 8, resource: BindingResource::TextureView(alt_view) },
+                BindGroupEntry { binding: 9, resource: BindingResource::TextureView(cirrus.0) },
+                BindGroupEntry { binding: 10, resource: BindingResource::Sampler(cirrus.1) },
             ],
         })
     }
@@ -858,7 +901,7 @@ impl Sky {
                 usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &alts_view(&self.cloud_sky, &self.alt_texture), &self.cloud_sampler, &self.night);
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &alts_view(&self.cloud_sky, &self.alt_texture), &self.cloud_sampler, &self.night, (&cirrus_view(&self.cloud_sky, &self.cloud_texture), &self.cirrus_sampler));
             self.bind_serial += 1;
         }
         write_panorama(queue, &self.texture, pano);
@@ -875,7 +918,7 @@ impl Sky {
                 }
                 self.cloud_build = None;
             }
-            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &alts_view(&self.cloud_sky, &self.alt_texture), &self.cloud_sampler, &self.night);
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &alts_view(&self.cloud_sky, &self.alt_texture), &self.cloud_sampler, &self.night, (&cirrus_view(&self.cloud_sky, &self.cloud_texture), &self.cirrus_sampler));
             self.bind_serial += 1;
         }
         // A new weather field starts the worker's births over.
@@ -1078,6 +1121,13 @@ impl Sky {
         self.cloud_every.0 = n;
     }
 
+    /// The sky without its cirrus until the next `step_clouds` (the offline
+    /// harness's `NO_CIRRUS`, to time it).
+    pub fn hide_cirrus(&mut self, queue: &Queue) {
+        self.extra.cirrus = Default::default();
+        queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
+    }
+
     /// ONE FRAME OF THE CLOUDS (`CloudSky`): the next slice of the sky map
     /// seen from `eye` (world), and -- when `shadow` is given and `on` (the
     /// lever, the clouds up, the light above them) -- their shadow on the
@@ -1187,6 +1237,8 @@ impl Sky {
         self.extra.cloud_flow = gpu.display_flow(now, eye);
         self.extra.cloud_winds = winds;
         self.extra.cloud_eye = [eye[1], 0.0, 0.0, 0.0];
+        let ci = &u.layers[3];
+        self.extra.cirrus = [ci[0], ci[1], ci[3], ci[11], [dir[0], dir[1], dir[2], self.aerosol_per_m], [eye[0], eye[1], eye[2], 0.0]];
         queue.write_buffer(&self.extra_buffer, 0, bytemuck::bytes_of(&self.extra));
     }
 
@@ -1740,16 +1792,17 @@ pub fn sky_cloud_shader() -> String {
         ),
         (
             "    celestial: array<vec4<f32>, 3>,\n}",
-            "    celestial: array<vec4<f32>, 3>,\n    cloud_scale: vec4<f32>,\n    cloud_offset: vec4<f32>,\n    cloud_misc: vec4<f32>,\n    cloud_light_dir: vec4<f32>,\n    cloud_light: vec4<f32>,\n    cloud_sky: vec4<f32>,\n    cloud_ground: vec4<f32>,\n    cloud_flow: array<vec4<f32>, 2>,\n    cloud_winds: array<vec4<f32>, 4>,\n    cloud_eye: vec4<f32>,\n}".to_string(),
+            "    celestial: array<vec4<f32>, 3>,\n    cloud_scale: vec4<f32>,\n    cloud_offset: vec4<f32>,\n    cloud_misc: vec4<f32>,\n    cloud_light_dir: vec4<f32>,\n    cloud_light: vec4<f32>,\n    cloud_sky: vec4<f32>,\n    cloud_ground: vec4<f32>,\n    cloud_flow: array<vec4<f32>, 2>,\n    cloud_winds: array<vec4<f32>, 4>,\n    cloud_eye: vec4<f32>,\n    cirrus: array<vec4<f32>, 6>,\n}".to_string(),
         ),
         (
             "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n",
-            "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n@group(1) @binding(3) var cloud_maps: texture_2d_array<f32>;\n@group(1) @binding(4) var cloud_samp: sampler;\n@group(1) @binding(8) var cloud_alts: texture_2d_array<f32>;\n".to_string(),
+            "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n@group(1) @binding(3) var cloud_maps: texture_2d_array<f32>;\n@group(1) @binding(4) var cloud_samp: sampler;\n@group(1) @binding(8) var cloud_alts: texture_2d_array<f32>;\n@group(1) @binding(9) var cirrus_tex: texture_2d<f32>;\n@group(1) @binding(10) var cirrus_samp: sampler;\n".to_string(),
         ),
         (
             "@fragment fn fs_main(",
             format!(
                 r#"{flow}
+{cirrus}
 
 // A sky map read through a cubic B-spline, in four bilinear taps (Sigg and
 // Hadwiger 2005): smooth to its second derivative, so no texel's square
@@ -1790,10 +1843,14 @@ fn sky_cloud_map(uv: vec2<f32>, layer: i32) -> vec4<f32> {{
 // the share of the alpha a disc gets.
 var<private> cloud_through: f32 = 1.0;
 
-fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
+fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>, px: f32) -> vec4<f32> {{
     if (dir.y <= 0.0) {{
         return vec4<f32>(sky, 1.0);
     }}
+    // The cirrus behind every lower cloud, per pixel at its own wind
+    // (`sky_cirrus`); the maps hold none of it.
+    let ci = sky_cirrus(dir, px);
+    let behind = sky * (1.0 - ci.a) + ci.rgb;
     let uv = cloud_map_uv(dir);
     var uva = uv;
     var uvb = uv;
@@ -1825,18 +1882,19 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>) -> vec4<f32> {{
         let tb = textureSampleLevel(cloud_alts, cloud_samp, uvb, i32(sky_extra.cloud_misc.y), 0.0).g;
         // As a share of the alpha, which it never exceeds: both are read at
         // the same uv (test `a_far_cloud_the_haze_hides_still_blocks_the_sun`).
-        cloud_through = mix(ta, tb, sky_extra.cloud_misc.z) / max(c.a, 1e-4);
+        cloud_through = mix(ta, tb, sky_extra.cloud_misc.z) * cirrus_clear / max(c.a * (1.0 - ci.a), 1e-4);
     }}
-    return vec4<f32>(sky * c.a + c.rgb, c.a);
+    return vec4<f32>(behind * c.a + c.rgb, c.a * (1.0 - ci.a));
 }}
 
 @fragment fn fs_main("#,
                 flow = crate::renderer::cloud_sky::cloud_flow_wgsl(),
+                cirrus = crate::renderer::cloud_sky::cirrus_sky_wgsl(),
             ),
         ),
         (
             "        radiance = radiance * sky_extra.mode.y + sky_sun_disc(world_dir, px, 1.0);\n        let moon = sky_moon(world_dir, px, 1.0);\n        radiance = radiance + moon.rgb;\n        if (sky_extra.mode.w > 0.5 && world_dir.y > 0.0) {\n            radiance = radiance + sky_stars(world_dir, px) * (1.0 - moon.a);\n        }",
-            "        let cloud = sky_clouds(world_dir, radiance * sky_extra.mode.y);\n        radiance = cloud.rgb + sky_sun_disc(world_dir, px, cloud_through) * cloud.a;\n        let moon = sky_moon(world_dir, px, cloud_through);\n        radiance = radiance + moon.rgb * cloud.a;\n        if (sky_extra.mode.w > 0.5 && world_dir.y > 0.0) {\n            radiance = radiance + sky_stars(world_dir, px) * (1.0 - moon.a) * cloud.a;\n        }".to_string(),
+            "        let cloud = sky_clouds(world_dir, radiance * sky_extra.mode.y, px);\n        radiance = cloud.rgb + sky_sun_disc(world_dir, px, cloud_through) * cloud.a;\n        let moon = sky_moon(world_dir, px, cloud_through);\n        radiance = radiance + moon.rgb * cloud.a;\n        if (sky_extra.mode.w > 0.5 && world_dir.y > 0.0) {\n            radiance = radiance + sky_stars(world_dir, px) * (1.0 - moon.a) * cloud.a;\n        }".to_string(),
         ),
     ];
     let mut out = src;
@@ -2876,6 +2934,26 @@ mod render_tests {
             sky.step_clouds(&device, &queue, eye, true, None, false);
             let now = sky.clouds.as_ref().unwrap().seconds;
             let g = show(&sky);
+            // MIXED WINDS: texels whose carry wind lies between the layers'
+            // own (alts .ba is the light-weighted sum), and how far such a
+            // texel's cloud is carried off its own layer's over the newest
+            // map's age, in degrees seen from the eye (`SHOWN_WIND_MIX=1`).
+            if std::env::var("SHOWN_WIND_MIX").is_ok() && frame % (hz as usize) == 0 {
+                let winds = sky.extra.cloud_winds;
+                let age = sky.extra.cloud_flow[1][3].abs();
+                let (mut seen, mut mixed, mut degs) = (0usize, 0usize, Vec::new());
+                for p in g.iter().filter(|p| p[1] > 0.0 && p[0] < 0.9) {
+                    seen += 1;
+                    let off = winds.iter().map(|w| ((p[2] - w[1]).powi(2) + (p[3] - w[2]).powi(2)).sqrt()).fold(f32::MAX, f32::min);
+                    if off > 1.0 {
+                        mixed += 1;
+                        degs.push((off * age / (p[1] - eye[1]).max(100.0)).atan().to_degrees());
+                    }
+                }
+                degs.sort_by(|a, b| a.total_cmp(b));
+                let q = |f: f32| degs.get(((degs.len() as f32 * f) as usize).min(degs.len().saturating_sub(1))).copied().unwrap_or(0.0);
+                eprintln!("WINDMIX {secs:5.1} s: {mixed} of {seen} cloud texels carried on a mixed wind; off their layer by p50 {:.2} p90 {:.2} max {:.2} deg over {age:.1} s", q(0.5), q(0.9), q(1.0));
+            }
             if png_at.iter().any(|&t| t > secs - dt && t <= secs) {
                 let rgb = shown_rgb.borrow();
                 let cloudy: Vec<&[f32; 4]> = rgb.iter().filter(|p| p[3] < 0.5).collect();
@@ -3141,7 +3219,9 @@ mod cloud_size_tests {
         // proxy is near 2424 (water), and the clouded sky is ~1316 in all.
         // 400 -> 420 on 2026-10-21 for the discs' own cloud transmittance
         // (+17, read only near a disc), which put the sun back behind far
-        // cloud on the horizon.
-        assert!(clouded < clear + 420, "the cloud code adds {} (283 when written, 2026-10-19; 401 on 2026-10-21)", clouded - clear);
+        // cloud on the horizon. 420 -> 600 on 2026-10-23 for the cirrus drawn
+        // here per pixel (+171, `sky_cirrus`), off the maps where it shared
+        // the lower clouds' carry wind; ~1490 in all, still far under 2424.
+        assert!(clouded < clear + 600, "the cloud code adds {} (283 when written, 2026-10-19; 401 on 2026-10-21; 572 on 2026-10-23)", clouded - clear);
     }
 }
