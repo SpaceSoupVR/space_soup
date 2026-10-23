@@ -22,6 +22,16 @@ pub const ADAPT_DARKER_STOPS_PER_S: f32 = 1.5;
 /// At 0.3 the moonlit yard (14 stops past the hall) took ~47 s and read as
 /// never coming back (user, 2026-10-22); at 1.2 it is back in ~12 s.
 pub const ADAPT_NIGHT_STOPS_PER_S: f32 = 1.2;
+/// FAST FIRST, SLOW LAST (2026-10-23): the rates above are floors. Each
+/// way the eye also closes this share of the stops still to go each second
+/// (a time constant, s), as the pupil and the cones do in seconds and the
+/// rods after. At constant rates the marble room to the moonlit yard (17
+/// stops) left the yard more than five stops under for nine seconds, then
+/// brought it all back in the last two or three: "you must use a flashlight
+/// to see anything for about 10-20 seconds, and then the adaptation kicks
+/// in and you very quickly can see" (user, headset).
+pub const ADAPT_DARKER_TAU_S: f32 = 2.0;
+pub const ADAPT_BRIGHTER_TAU_S: f32 = 1.0;
 
 /// LOCAL ADAPTATION to a lit room seen through a doorway: the eye adapts in
 /// part to what it looks at, so it never sits more than this many times darker
@@ -489,14 +499,20 @@ impl EyeAdaptation {
         let dt = dt.max(0.0);
         let current = match self.adapted_log2 {
             None => target,
-            Some(c) if target > c => (c + ADAPT_BRIGHTER_STOPS_PER_S * dt).min(target),
+            Some(c) if target > c => {
+                let rate = ADAPT_BRIGHTER_STOPS_PER_S.max((target - c) / ADAPT_BRIGHTER_TAU_S);
+                (c + rate * dt).min(target)
+            }
             Some(c) => {
                 // Cones down to the night threshold, rods past it; a step that
                 // crosses it spends the rest of its time at the rods' rate.
+                // Either way at least the gap's share (`ADAPT_DARKER_TAU_S`).
                 let night = night_adapted_log2();
-                let fast_time = ((c - night).max(0.0) / ADAPT_DARKER_STOPS_PER_S).min(dt);
-                let fast = c - ADAPT_DARKER_STOPS_PER_S * fast_time;
-                (fast - ADAPT_NIGHT_STOPS_PER_S * (dt - fast_time)).max(target).min(c)
+                let gap = (c - target) / ADAPT_DARKER_TAU_S;
+                let cones = ADAPT_DARKER_STOPS_PER_S.max(gap);
+                let fast_time = ((c - night).max(0.0) / cones).min(dt);
+                let fast = c - cones * fast_time;
+                (fast - ADAPT_NIGHT_STOPS_PER_S.max(gap) * (dt - fast_time)).max(target).min(c)
             }
         };
         self.adapted_log2 = Some(current);
@@ -892,9 +908,26 @@ mod tests {
         let after = eye.adapted_luminance().unwrap().log2();
         let indoor_part = (start - night_adapted_log2()).min(2.5 * ADAPT_DARKER_STOPS_PER_S);
         let night_part = 2.5 - indoor_part / ADAPT_DARKER_STOPS_PER_S;
-        let want = start - indoor_part - night_part * ADAPT_NIGHT_STOPS_PER_S;
-        assert!((after - want).abs() < 0.2, "2.5 s from a lit room into the night: {after} vs {want}");
-        assert!(after > 1e-6f32.log2() + 2.0, "night-adapted within 2.5 s");
+        let constant = start - indoor_part - night_part * ADAPT_NIGHT_STOPS_PER_S;
+        let gap = start - 1e-6f32.log2();
+        assert!(after < constant - 2.0, "faster than the constant rates: {after} vs {constant}");
+        assert!(after - 1e-6f32.log2() < gap * (-2.5 / ADAPT_DARKER_TAU_S).exp() * 1.05, "at least the gap's share a second");
+        assert!(after > 1e-6f32.log2() + 1.0, "not night-adapted within 2.5 s");
+        // The marble room (17 stops over the moonlit yard) to within two
+        // exposure stops of the yard in under six seconds, none of it a jump.
+        let mut eye = EyeAdaptation::sky_only(SkyIrradiance::flat(0.3));
+        eye.set_max_exposure(2.0e5);
+        let (room, yard) = (0.06f32, 0.06f32 / 2f32.powi(17));
+        eye.update(room, 0.016);
+        let full = exposure_for_up_to(yard, 2.0e5);
+        let (mut t, mut last) = (0.0f32, eye.update(room, 0.0));
+        while exposure_for_up_to(eye.adapted_luminance().unwrap(), 2.0e5) < full / 4.0 {
+            let e = eye.update(yard, 1.0 / 72.0);
+            assert!(e / last < 1.12, "a step of {} in one frame", e / last);
+            last = e;
+            t += 1.0 / 72.0;
+            assert!(t < 6.0, "still two stops under the yard after {t} s");
+        }
     }
 
     #[test]
