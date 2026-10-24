@@ -575,6 +575,7 @@ impl XrRenderer {
             // (`EyeAdaptation::door_lean`, lever `door_lean`).
             let lean = if self.auto_exposure && self.levers.door_lean { eye.door_lean(head_world, gaze, metered) } else { 0.0 };
             let auto = eye.update_leaning(metered, lean, dt);
+            eye.see_rooms_from(head_world, auto);
             if self.shadow_diag_frames.get() % 120 == 0 {
                 log::info!("EXPOSURE meter {metered:.4} -> x{auto:.2} (auto {})", self.auto_exposure);
             }
