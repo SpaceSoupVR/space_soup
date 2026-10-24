@@ -77,6 +77,25 @@ pub const MAP_PACK: f32 = 1.15;
 /// flat stepped bands on the headset (user, video 21:29: "horrible"). Until
 /// the ghosts are fixed another way, the map accumulates as before.
 pub const HISTORY_NEW: f32 = 0.3;
+
+/// A MAP'S HISTORY GOES WHILE ITS LIGHT CHANGES FAST (2026-10-23). Kept as a
+/// share of each channel's light (`CloudSky::scales`), the history assumes a
+/// cloud's sunlit and sky-lit parts dim together, which holds by day and by
+/// night but not in the seconds at dusk when the sun's light falls 1e3 times
+/// under a steady sky: carried through them, the clouds' red came out 0.18
+/// (mean |log|) off the map drawn alone, where letting it go is exact. Over
+/// this change of any channel's light from the history's map to this one
+/// (natural log, [none let go, all]), the history is let go.
+pub const HISTORY_LIGHT_LET_GO: [f32; 2] = [0.1, 0.4];
+
+/// How much of a map's history to let go for the change of light between
+/// the two maps' scales (`HISTORY_LIGHT_LET_GO`).
+fn light_let_go(now: &[f32; 3], then: &[f32; 3]) -> f32 {
+    let change = (0..3).map(|c| (now[c] / then[c].max(1e-30)).max(1e-30).ln().abs()).fold(0.0f32, f32::max);
+    let [a, b] = HISTORY_LIGHT_LET_GO;
+    let x = ((change - a) / (b - a)).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
 /// Where the old and new maps disagree by this much of the sky showing (a
 /// cloud born, or uncovered by the eye moving), the new march is taken
 /// alone (from the first to the second): history is for the grain, not for
@@ -452,7 +471,7 @@ pub struct CloudSky {
     /// Each map's light is stored over the light it was drawn under: a
     /// night's radiances (1e-8) fell among half floats' subnormals and the
     /// clouds came out banded and fringed red.
-    scales: [f32; 3],
+    scales: [[f32; 3]; 3],
     /// The cloud time each map holds the sky at, and the eye it is seen from.
     times: [f64; 3],
     eyes: [[f32; 3]; 3],
@@ -990,7 +1009,7 @@ impl CloudSky {
             build: 1,
             next_row: 0,
             fresh: true,
-            scales: [1.0; 3],
+            scales: [[1.0; 3]; 3],
             times: [0.0; 3],
             eyes: [[0.0; 3]; 3],
             map_uniforms: [CloudSkyUniform::default(); 3],
@@ -1165,8 +1184,9 @@ impl CloudSky {
 
     /// The radiance one stored unit of the shown maps stands for: the last
     /// whole map's, the newest's.
-    pub fn display_scales(&self) -> [f32; 2] {
-        [1.0 / self.scales[self.prev as usize], 1.0 / self.scales[self.cur as usize]]
+    pub fn display_scales(&self) -> [[f32; 3]; 2] {
+        let inv = |s: [f32; 3]| s.map(|v| 1.0 / v);
+        [inv(self.scales[self.prev as usize]), inv(self.scales[self.cur as usize])]
     }
 
     /// `encode_at` with one uniform for the map and the shadow, at time 0.
@@ -1239,8 +1259,14 @@ impl CloudSky {
         };
         // A map keeps the scale its first slice was drawn at, and its moment.
         if from == 0 {
-            let peak = (0..3).map(|c| map.light[c] + map.amb_sky[c]).fold(0.0f32, f32::max);
-            self.scales[target as usize] = 1.0 / peak.max(1e-20);
+            // EACH CHANNEL BY ITS OWN LIGHT (2026-10-23): one scale, the
+            // brightest channel of the sun and the sky, was the sun's red at
+            // dusk, which fell 1e3 times in seconds while the sky's blue held;
+            // a map's history, kept as a share of its own scale, then drew the
+            // sky-lit bodies far too dark and the edges the history let go
+            // at their own light -- a white rim round every cloud (user,
+            // headset at twilight). At dusk red follows the sun, blue the sky.
+            self.scales[target as usize] = std::array::from_fn(|c| 1.0 / (map.light[c] + map.amb_sky[c]).max(1e-20));
             self.times[target as usize] = map_time;
             self.eyes[target as usize] = [map.eye[0], map.eye[1], map.eye[2]];
             self.map_uniforms[target as usize] = *map;
@@ -1263,7 +1289,9 @@ impl CloudSky {
             // accumulate: unaveraged, a new fraction each map changed the far
             // clouds at every swap, a flicker along the horizon (user,
             // 2026-10-22; `a_still_sky_holds_still_at_the_horizon_from_map_to_map`).
-            let jitter = if carry && HISTORY_NEW < 1.0 { (0.5 + self.maps_begun as f32 * HISTORY_JITTER).fract() } else { 0.5 };
+            // Held too while the light lets the history go (`HISTORY_LIGHT_LET_GO`).
+            let light_go = light_let_go(&self.scales[t], &self.scales[h]);
+            let jitter = if carry && HISTORY_NEW < 1.0 && light_go < 0.5 { (0.5 + self.maps_begun as f32 * HISTORY_JITTER).fract() } else { 0.5 };
             self.maps_begun = self.maps_begun.wrapping_add(1);
             let (et, eh) = (self.eyes[t], self.eyes[h]);
             let w = &self.winds;
@@ -1281,14 +1309,17 @@ impl CloudSky {
                 // the sky 1e5 times; past 1.43 times a map the sum grew, and
                 // the night's exposure drew the day's clouds blown white
                 // through the night (headset, 2026-10-23).
-                [if take { HISTORY_NEW } else { 1.0 }, 1.0, jitter, et[1]],
+                //
+                // .y: the history let go as the light it was lit by changes
+                // (`HISTORY_LIGHT_LET_GO`).
+                [if take { HISTORY_NEW } else { 1.0 }, light_go, jitter, et[1]],
                 self.history_reject,
                 self.history_share,
             ];
             queue.write_buffer(&self.history_uniform, 0, bytemuck::cast_slice(&carried));
         }
         let mut u = self.map_uniforms[target as usize];
-        u.eye[3] = self.scales[target as usize];
+        u.eye[3] = 1.0;
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&u));
         queue.write_buffer(&self.shadow_uniform, 0, bytemuck::bytes_of(now_u));
         {
@@ -2415,7 +2446,8 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
             trans = trans * (1.0 - alpha);
         }
     }
-    var light = vec4<f32>(rgb * u.eye.w, 1.0 - seen);
+    // A share of each channel's light (`CloudSky::scales`).
+    var light = vec4<f32>(rgb / max(u.light.rgb + u.amb_sky.rgb, vec3<f32>(1e-20)), 1.0 - seen);
     // .g: the clouds' own transmittance, no haze -- what a disc behind them
     // gets (`cloud_through` in the sky shader).
     let h = (height + ALT_FILL_WEIGHT * fill) / (seen + ALT_FILL_WEIGHT);
@@ -2462,8 +2494,8 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
         let apart = abs(old.a - light.a);
         let cloud = max(1.0 - min(old.a, light.a), hist.share.z);
         let let_go = max(smoothstep(reject.x, reject.y, apart), hist.share.w * above * smoothstep(hist.share.x, hist.share.y, apart / cloud));
-        let w = mix(hist.misc.x, 1.0, let_go);
-        light = mix(vec4<f32>(old.rgb * hist.misc.y, old.a), light, w);
+        let w = mix(hist.misc.x, 1.0, max(let_go, hist.misc.y));
+        light = mix(old, light, w);
         alts = mix(old_alts, alts, w);
     }
     var out: MapOut;
@@ -2658,7 +2690,7 @@ pub(crate) mod tests {
             for i in 0..(MAP_WIDTH * MAP_HEIGHT) as usize {
                 for c in 0..4 {
                     let v = half(&map[i * 8 + 2 * c..i * 8 + 2 * c + 2]);
-                    texels.push(if c < 3 { v * scale } else { v });
+                    texels.push(if c < 3 { v * scale[c] } else { v });
                 }
             }
             std::fs::write(out.join(file), bytemuck::cast_slice(&texels)).unwrap();

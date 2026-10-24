@@ -47,7 +47,11 @@ pub struct SkyExtra {
 
     pub celestial: [[f32; 4]; 3],
 
+    /// The two shown cloud maps' light per unit stored, each channel its own
+    /// (`CloudSky::scales`): the last whole map's (rgb) ...
     pub cloud_scale: [f32; 4],
+    /// ... and the newest's.
+    pub cloud_scale_new: [f32; 4],
 
     pub cloud_offset: [f32; 4],
 
@@ -1233,7 +1237,8 @@ impl Sky {
         self.extra.cloud_misc[1] = d[1];
         self.extra.cloud_misc[2] = d[2];
         let k = gpu.display_scales();
-        self.extra.cloud_scale = [k[0], k[1], 0.0, 0.0];
+        self.extra.cloud_scale = [k[0][0], k[0][1], k[0][2], 0.0];
+        self.extra.cloud_scale_new = [k[1][0], k[1][1], k[1][2], 0.0];
         self.extra.cloud_flow = gpu.display_flow(now, eye);
         self.extra.cloud_winds = winds;
         self.extra.cloud_eye = [eye[1], 0.0, 0.0, 0.0];
@@ -1815,7 +1820,7 @@ pub fn sky_cloud_shader() -> String {
         ),
         (
             "    celestial: array<vec4<f32>, 3>,\n}",
-            "    celestial: array<vec4<f32>, 3>,\n    cloud_scale: vec4<f32>,\n    cloud_offset: vec4<f32>,\n    cloud_misc: vec4<f32>,\n    cloud_light_dir: vec4<f32>,\n    cloud_light: vec4<f32>,\n    cloud_sky: vec4<f32>,\n    cloud_ground: vec4<f32>,\n    cloud_flow: array<vec4<f32>, 2>,\n    cloud_winds: array<vec4<f32>, 4>,\n    cloud_eye: vec4<f32>,\n    cirrus: array<vec4<f32>, 6>,\n}".to_string(),
+            "    celestial: array<vec4<f32>, 3>,\n    cloud_scale: vec4<f32>,\n    cloud_scale_new: vec4<f32>,\n    cloud_offset: vec4<f32>,\n    cloud_misc: vec4<f32>,\n    cloud_light_dir: vec4<f32>,\n    cloud_light: vec4<f32>,\n    cloud_sky: vec4<f32>,\n    cloud_ground: vec4<f32>,\n    cloud_flow: array<vec4<f32>, 2>,\n    cloud_winds: array<vec4<f32>, 4>,\n    cloud_eye: vec4<f32>,\n    cirrus: array<vec4<f32>, 6>,\n}".to_string(),
         ),
         (
             "@group(1) @binding(2) var<uniform> sky_extra: SkyExtra;\n",
@@ -1897,8 +1902,8 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>, px: f32) -> vec4<f32> {{
     }}
     var a = sky_cloud_map(uva, i32(sky_extra.cloud_misc.x));
     var b = sky_cloud_map(uvb, i32(sky_extra.cloud_misc.y));
-    a = vec4<f32>(a.rgb * sky_extra.cloud_scale.x, a.a);
-    b = vec4<f32>(b.rgb * sky_extra.cloud_scale.y, b.a);
+    a = vec4<f32>(a.rgb * sky_extra.cloud_scale.rgb, a.a);
+    b = vec4<f32>(b.rgb * sky_extra.cloud_scale_new.rgb, b.a);
     let c = mix(a, b, sky_extra.cloud_misc.z);
     if (max(dot(dir, sky_extra.sun.xyz), dot(dir, sky_extra.moon.xyz)) > 0.9995) {{
         let ta = textureSampleLevel(cloud_alts, cloud_samp, uva, i32(sky_extra.cloud_misc.x), 0.0).g;
@@ -2824,7 +2829,7 @@ mod render_tests {
             "@group(0) @binding(0) var cloud_maps: texture_2d_array<f32>;
              @group(0) @binding(1) var cloud_samp: sampler;
              @group(0) @binding(2) var cloud_alts: texture_2d_array<f32>;
-             struct Shown {{ flow: array<vec4<f32>, 2>, misc: vec4<f32>, eye: vec4<f32>, grid: vec4<f32>, scale: vec4<f32> }}
+             struct Shown {{ flow: array<vec4<f32>, 2>, misc: vec4<f32>, eye: vec4<f32>, grid: vec4<f32>, scale: vec4<f32>, scale_new: vec4<f32> }}
              @group(0) @binding(3) var<uniform> shown: Shown;
              @group(0) @binding(4) var<storage, read_write> out: array<vec4<f32>>;
              @group(0) @binding(5) var<storage, read_write> out_rgb: array<vec4<f32>>;
@@ -2858,7 +2863,7 @@ mod render_tests {
                  let a = ma.a;
                  let b = mb.a;
                  out[id.x] = vec4<f32>(mix(a, b, shown.misc.z), here.r, here.b, here.a);
-                 out_rgb[id.x] = vec4<f32>(mix(ma.rgb * shown.scale.x, mb.rgb * shown.scale.y, shown.misc.z), mix(a, b, shown.misc.z));
+                 out_rgb[id.x] = vec4<f32>(mix(ma.rgb * shown.scale.rgb, mb.rgb * shown.scale_new.rgb, shown.misc.z), mix(a, b, shown.misc.z));
              }}",
             flow = crate::renderer::cloud_sky::cloud_flow_wgsl(),
             shared = std::env::var("SHOWN_SHARED_ALTS").is_ok(),
@@ -2874,7 +2879,7 @@ mod render_tests {
         let rgb_buf = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
         let rgb_read = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST, mapped_at_creation: false });
         let shown_rgb: std::cell::RefCell<Vec<[f32; 4]>> = Default::default();
-        let uni = device.create_buffer(&BufferDescriptor { label: None, size: 96, usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false });
+        let uni = device.create_buffer(&BufferDescriptor { label: None, size: 112, usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false });
         let samp = device.create_sampler(&SamplerDescriptor {
             address_mode_u: AddressMode::Repeat,
             address_mode_v: AddressMode::ClampToEdge,
@@ -2885,8 +2890,9 @@ mod render_tests {
         let show = |sky: &Sky| -> Vec<[f32; 4]> {
             let gpu = sky.cloud_sky.as_ref().unwrap();
             let e = &sky.extra;
-            let mut u = [0.0f32; 24];
+            let mut u = [0.0f32; 28];
             u[20..24].copy_from_slice(&e.cloud_scale);
+            u[24..28].copy_from_slice(&e.cloud_scale_new);
             u[0..4].copy_from_slice(&e.cloud_flow[0]);
             u[4..8].copy_from_slice(&e.cloud_flow[1]);
             u[8..12].copy_from_slice(&e.cloud_misc);
