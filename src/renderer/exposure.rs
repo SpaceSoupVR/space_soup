@@ -33,6 +33,21 @@ pub const ADAPT_NIGHT_STOPS_PER_S: f32 = 1.2;
 pub const ADAPT_DARKER_TAU_S: f32 = 2.0;
 pub const ADAPT_BRIGHTER_TAU_S: f32 = 1.0;
 
+/// THE RODS KEEP THEIR DARK ADAPTATION THROUGH A SHORT LOOK AT LIGHT
+/// (2026-10-23, user, headset: walking out of the lit room "something at the
+/// threshold is forgetting how much adaptation has already happened"). With
+/// one adaptation state a few seconds in the room took the eye from x180000
+/// to x500, and out in the night it climbed back at the rods' rate, black
+/// for ~8 s. The rods' sensitivity is a pigment bleached by light over time
+/// (a dose), not reset by it: after seconds of indoor light it returns in
+/// seconds, after minutes it takes the rods' minutes. So the eye keeps the
+/// darkest adaptation the rods still hold (`rod_log2`), which rises toward a
+/// brighter adaptation at this many stops a second, and back down to it the
+/// eye goes at `ADAPT_REGAIN_TAU_S` -- the retina's gain; at 1 s a 4 s look at a lit room still left the yard x829 of x10243 1.5 s out.
+pub const ROD_BLEACH_STOPS_PER_S: f32 = 0.25;
+/// The time constant (s) of the way back down to the rods' held adaptation.
+pub const ADAPT_REGAIN_TAU_S: f32 = 0.5;
+
 /// LOCAL ADAPTATION to a lit room seen through a doorway: the eye adapts in
 /// part to what it looks at, so it never sits more than this many times darker
 /// than a lit room filling enough of the view. Without it a night-adapted eye
@@ -182,6 +197,9 @@ pub struct EyeAdaptation {
     /// it (`room_exposure`), so leaning toward the yard does not light it up.
     room_adapted_log2: Option<f32>,
 
+    /// The darkest adaptation the rods still hold (`ROD_BLEACH_STOPS_PER_S`).
+    rod_log2: Option<f32>,
+
     max_exposure: f32,
 
     day: f32,
@@ -191,7 +209,7 @@ impl EyeAdaptation {
 
     pub fn sky_only(sky: SkyIrradiance) -> Self {
         let day = sky_daylight(&sky);
-        Self { meters: Vec::new(), closed_rooms: Vec::new(), local_rooms: false, portals: Vec::new(), sky, adapted_log2: None, room_adapted_log2: None, max_exposure: MAX_EXPOSURE, day }
+        Self { meters: Vec::new(), closed_rooms: Vec::new(), local_rooms: false, portals: Vec::new(), sky, adapted_log2: None, room_adapted_log2: None, rod_log2: None, max_exposure: MAX_EXPOSURE, day }
     }
 
     pub fn gaze_free_share(&self, head: Vec3) -> f32 {
@@ -586,10 +604,19 @@ impl EyeAdaptation {
     /// for the room's own pixels (`room_exposure`).
     pub fn update_leaning(&mut self, metered: f32, lean: f32, dt: f32) -> f32 {
         let floor = self.log_floor();
-        let room = Self::adapt(self.room_adapted_log2, metered.max(floor).log2(), dt);
+        let rod = self.rod_log2;
+        // The room's own pixels follow its meter at the cones' rates; the
+        // rods' regain is the eye's, for the night it steps back into.
+        let room = Self::adapt(self.room_adapted_log2, metered.max(floor).log2(), dt, None);
         self.room_adapted_log2 = Some(room);
-        let current = Self::adapt(self.adapted_log2, (metered * lean.min(0.0).exp()).max(floor).log2(), dt);
+        let current = Self::adapt(self.adapted_log2, (metered * lean.min(0.0).exp()).max(floor).log2(), dt, rod);
         self.adapted_log2 = Some(current);
+        // Bleached as far as a dose of light takes them, never past the eye.
+        let darkest = current.min(room);
+        self.rod_log2 = Some(match rod {
+            Some(r) if r < darkest => (r + ROD_BLEACH_STOPS_PER_S * dt.max(0.0)).min(darkest),
+            _ => darkest,
+        });
         exposure_for_up_to(current.exp2(), self.max_exposure)
     }
 
@@ -598,13 +625,21 @@ impl EyeAdaptation {
         self.room_adapted_log2.map(|l| exposure_for_up_to(l.exp2(), self.max_exposure))
     }
 
-    fn adapt(adapted: Option<f32>, target: f32, dt: f32) -> f32 {
+    fn adapt(adapted: Option<f32>, target: f32, dt: f32, rod: Option<f32>) -> f32 {
         let dt = dt.max(0.0);
         match adapted {
             None => target,
             Some(c) if target > c => {
                 let rate = ADAPT_BRIGHTER_STOPS_PER_S.max((target - c) / ADAPT_BRIGHTER_TAU_S);
                 (c + rate * dt).min(target)
+            }
+            // Back down to what the rods still hold: the pupil and the
+            // retina's gain, in about half a second (`ROD_BLEACH_STOPS_PER_S`).
+            Some(c) if rod.is_some_and(|r| r < c) => {
+                let r = rod.unwrap_or(c);
+                let regained = r + (c - r) * (-dt.max(0.0) / ADAPT_REGAIN_TAU_S).exp();
+                let rest = Self::adapt(Some(c), target, dt, None);
+                regained.min(rest).max(target)
             }
             Some(c) => {
                 // Cones down to the night threshold, rods past it; a step that
@@ -1034,6 +1069,34 @@ mod tests {
             last = now;
         }
         assert!(last.0 > night_eye / 2.0, "outside, the yard at x{} of x{night_eye}", last.0);
+    }
+
+    /// A night-adapted eye that looks into a lit room for a few seconds sees
+    /// the night again a second or two after, as the rods kept their
+    /// adaptation; one that stayed minutes in the room is night-blind a while.
+    #[test]
+    fn a_short_look_at_a_lit_room_leaves_the_rods_their_night() {
+        let dt = 1.0 / 72.0;
+        let run = |room_s: f32| {
+            let mut eye = EyeAdaptation::sky_only(SkyIrradiance::flat(1e-5));
+            eye.set_max_exposure(2.0e5);
+            let mut e = 0.0;
+            for _ in 0..(120.0 / dt) as usize {
+                e = eye.update(1e-5, dt);
+            }
+            let night = e;
+            for _ in 0..(room_s / dt) as usize {
+                eye.update(0.2, dt);
+            }
+            for _ in 0..(1.5 / dt) as usize {
+                e = eye.update(1e-5, dt);
+            }
+            (e, night)
+        };
+        let (short, night) = run(4.0);
+        assert!(short > night / 4.0, "1.5 s out of a 4 s look at the room: x{short} of the night's x{night}");
+        let (long, _) = run(240.0);
+        assert!(long < night / 16.0, "1.5 s out of four minutes in the room: x{long} of the night's x{night}");
     }
 
     #[test]
