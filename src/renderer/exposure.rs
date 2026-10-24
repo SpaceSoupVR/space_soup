@@ -210,6 +210,10 @@ pub struct EyeAdaptation {
     /// seen at (`see_rooms_from`): what `room_adapted_log2` follows there.
     room_seen_log2: Option<f32>,
 
+    /// The closed room last stood in and the eye's target (natural log) its
+    /// doorway's lean gave there, held out through the door (`door_lean`).
+    door_hold: std::cell::Cell<Option<(u32, f32)>>,
+
     max_exposure: f32,
 
     day: f32,
@@ -219,7 +223,7 @@ impl EyeAdaptation {
 
     pub fn sky_only(sky: SkyIrradiance) -> Self {
         let day = sky_daylight(&sky);
-        Self { meters: Vec::new(), closed_rooms: Vec::new(), local_rooms: false, portals: Vec::new(), sky, adapted_log2: None, room_adapted_log2: None, rod_log2: None, room_seen_log2: None, max_exposure: MAX_EXPOSURE, day }
+        Self { meters: Vec::new(), closed_rooms: Vec::new(), local_rooms: false, portals: Vec::new(), sky, adapted_log2: None, room_adapted_log2: None, rod_log2: None, room_seen_log2: None, door_hold: std::cell::Cell::new(None), max_exposure: MAX_EXPOSURE, day }
     }
 
     pub fn gaze_free_share(&self, head: Vec3) -> f32 {
@@ -453,20 +457,37 @@ impl EyeAdaptation {
 
     /// How far (natural log, <= 0) the eye at `head` leans from `metered`
     /// toward the darker open beyond a doorway of the closed room it stands
-    /// in (`DOOR_LEAN`); 0 in the open, or with local rooms off. Through a
-    /// doorway's handover it gives way, gone at the doorway's plane, where
-    /// the meter has taken half of the open (`meter_with`).
+    /// in (`DOOR_LEAN`); 0 in the open, or with local rooms off.
+    ///
+    /// OUT THROUGH THE DOOR THE LEAN IS HELD (2026-10-24, user: walking out
+    /// "still goes black for a second even if some adaptation had started").
+    /// It gave way across the handover's inner half, gone at the doorway's
+    /// plane -- where the meter still held most of the lit room, as a share
+    /// of light -- so the eye's target rose toward the room's for a few
+    /// frames and it adapted brighter, the yard black just as it was
+    /// reached. Now the lean is whole up to the plane, and the target it
+    /// gave there (`door_hold`) eases into the meter across the handover's
+    /// outer half, where the yard has the meter by its end.
     pub fn door_lean(&self, head: Vec3, gaze: Vec3, metered: f32) -> f32 {
         if !self.local_rooms {
+            self.door_hold.set(None);
             return 0.0;
         }
-        let Some(room) = self.room_at(head) else { return 0.0 };
         let closed = |r: u32| self.closed_rooms.iter().any(|c| c.room == r);
-        if !closed(room) {
-            return 0.0;
-        }
-        let lobe = Lobe { gaze: gaze.normalize_or_zero(), free: self.free_in(room, head) };
         let here = metered.max(self.log_floor()).ln();
+        let Some(room) = self.room_at(head).filter(|&r| closed(r)) else {
+            let Some((left, held)) = self.door_hold.get() else { return 0.0 };
+            let out = self.out_through(left, head);
+            if out <= 0.0 {
+                self.door_hold.set(None);
+                return 0.0;
+            }
+            // Never brighter than held: the meter there can still hold more
+            // of the lit room than the yard.
+            let target = (held + (here - held) * smoothstep(0.5, 1.0, out)).min(held);
+            return (target - here).min(0.0);
+        };
+        let lobe = Lobe { gaze: gaze.normalize_or_zero(), free: self.free_in(room, head) };
         let mut lean = 0.0f32;
         for (beyond, _, seen_sr) in self.windows(room, head, &lobe) {
             if closed(beyond) {
@@ -481,7 +502,8 @@ impl EyeAdaptation {
                 lean = lean.min(DOOR_LEAN * (seen_sr / DOOR_FULL_SR).min(1.0) * (out - here));
             }
         }
-        lean * (1.0 - smoothstep(0.0, 0.5, self.out_through(room, head)))
+        self.door_hold.set(Some((room, here + lean)));
+        lean
     }
 
     /// How far through a doorway out of `room` the head is: 0 inside, 0.5 at
@@ -1111,10 +1133,14 @@ mod tests {
         // Out through the door at a walk: no step in either, and the yard
         // the night eye's soon after.
         let mut z = -3.0f32;
+        let seen = last.0;
         while z < 4.0 {
             z += 1.4 * dt;
             let now = step(&mut eye, Vec3::new(0.0, 1.6, z));
             assert!((now.0 / last.0).max(last.0 / now.0) < 1.15, "the yard stepped x{} at z {z}", now.0 / last.0);
+            // Never darker than it was seen through the door (headset,
+            // 2026-10-24: "still goes black for a second").
+            assert!(now.0 > seen / 1.2, "the yard went dark: x{} of the x{seen} it was seen at, at z {z}", now.0);
             assert!((now.1 / last.1).max(last.1 / now.1) < 1.15, "the hall stepped x{} at z {z}", now.1 / last.1);
             last = now;
         }
