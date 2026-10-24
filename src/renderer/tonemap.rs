@@ -46,8 +46,25 @@ pub const SCOTOPIC_WEIGHTS: [f32; 3] = [-0.0714, 0.6447, 0.4267];
 
 pub const NIGHT_TINT: [f32; 3] = [1.04, 0.96, 1.26];
 
+/// THE RODS SEE THE NIGHT DIM, not only grey and blue (user, 2026-10-23:
+/// the night and its clouds far too bright; "yes for darkening the night like
+/// what rod vision sees"). Scotopic vision reads a moonlit scene as dark,
+/// desaturated, blue-shifted and low in contrast (Jensen et al. 2000, "A
+/// Physically-Based Night Sky Model"; Thompson, Shirley & Ferwerda 2002), and
+/// the eye's partial adaptation (`NIGHT_ADAPTATION_STRENGTH`) lifted ours to
+/// a dusk. The rods' share of a pixel is drawn at this much of its light:
+/// about a stop darker at the deepest night (share `NIGHT_VISION_MAX`),
+/// two thirds of one under the moon. Folded into the tint, so it costs the
+/// shaders nothing; lever `night_vision` off draws the cones' night.
+pub const ROD_SIGNAL: f32 = 0.4;
+
+/// `NIGHT_TINT` at the rods' signal (`ROD_SIGNAL`).
+pub fn rod_tint() -> [f32; 3] {
+    NIGHT_TINT.map(|t| t * ROD_SIGNAL)
+}
+
 pub fn night_vision(color: Vec3, night: f32) -> Vec3 {
-    let rods = color.dot(Vec3::from(SCOTOPIC_WEIGHTS)).max(0.0) * Vec3::from(NIGHT_TINT);
+    let rods = color.dot(Vec3::from(SCOTOPIC_WEIGHTS)).max(0.0) * Vec3::from(rod_tint());
     color + (rods - color) * night.clamp(0.0, 1.0)
 }
 
@@ -112,7 +129,7 @@ fn tonemap(color: vec3<f32>) -> vec3<f32> {{
 }}
 "#,
             w0 = SCOTOPIC_WEIGHTS[0], w1 = SCOTOPIC_WEIGHTS[1], w2 = SCOTOPIC_WEIGHTS[2],
-            t0 = NIGHT_TINT[0], t1 = NIGHT_TINT[1], t2 = NIGHT_TINT[2],
+            t0 = rod_tint()[0], t1 = rod_tint()[1], t2 = rod_tint()[2],
         )
     )
 }
@@ -323,17 +340,18 @@ mod tests {
         assert_eq!(night_vision(c, 0.0), c);
         let white = night_vision(Vec3::ONE, 1.0);
         let lum = |v: Vec3| v.dot(Vec3::new(0.2126, 0.7152, 0.0722));
-        assert!((lum(white) - 1.0).abs() < 0.02, "{white}");
+        assert!((lum(white) - ROD_SIGNAL).abs() < 0.02, "the rods see white at their signal: {white}");
+        assert!(white.z > white.x * 1.15, "and bluer: {white}");
 
         let red = lum(night_vision(Vec3::new(1.0, 0.0, 0.0), 1.0));
         let blue = lum(night_vision(Vec3::new(0.0, 0.0, 1.0), 1.0));
-        assert!(red < 0.01 && blue > 0.3, "{red} {blue}");
+        assert!(red < 0.01 && blue > 0.3 * ROD_SIGNAL, "{red} {blue}");
         assert!(night_vision_for(100.0) == 0.0);
         assert!((night_vision_for(1e-4) - NIGHT_VISION_MAX).abs() < 1e-6);
         let moonlit = night_vision_for(0.03);
         assert!(moonlit > 0.4 && moonlit < NIGHT_VISION_MAX, "{moonlit}");
         let wgsl = wgsl_tonemap_block();
-        for v in SCOTOPIC_WEIGHTS.iter().chain(NIGHT_TINT.iter()) {
+        for v in SCOTOPIC_WEIGHTS.iter().chain(rod_tint().iter()) {
             assert!(wgsl.contains(&format!("{v:?}")), "{v} never reached the shader");
         }
         assert!(wgsl.contains("camera.proxy_params.y"));
