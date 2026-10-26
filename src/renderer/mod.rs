@@ -58,6 +58,8 @@ pub mod planar_water;
 pub mod static_brush;
 pub mod static_solid;
 pub mod ground_twins;
+#[cfg(target_os = "macos")]
+pub mod macos_window;
 pub mod uniforms;
 pub mod probe_prefilter;
 pub mod multiview;
@@ -100,6 +102,11 @@ pub use lights::{Light, LightKind};
 pub use mesh::{load_clips_for, GltfClip, GltfMesh, MeshLightmapUv};
 pub use mirror::MirrorSurface;
 pub use panel::WorldPanel;
+#[cfg(target_os = "macos")]
+pub use macos_window::{
+    configure_macos_window, install_window_vibrancy, MacosWindowChrome, VibrancyMaterial,
+    WindowAppearance, MACOS_TITLEBAR_PT,
+};
 pub use particle::{Beam, Particle, ParticlePipeline, ParticleVertex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
