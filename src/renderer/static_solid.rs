@@ -19,7 +19,7 @@ pub struct IndexKey {
 }
 
 fn mix(h: u64, v: u32) -> u64 {
-    (h ^ v as u64).wrapping_mul(0x0000_0100_0000_01B3)
+    (h ^ u64::from(v)).wrapping_mul(0x0000_0100_0000_01B3)
 }
 
 fn samples(len: usize) -> impl Iterator<Item = usize> {
@@ -207,7 +207,7 @@ mod tests {
     fn other_ground_in_the_same_slice_is_written() {
         let mut g = ground(5000, 0.0);
         let before = vertex_key(&g, Vec3::ZERO, 0.0);
-        for v in g.iter_mut() {
+        for v in &mut g {
             v.position[1] += 3.0;
         }
         assert_ne!(before, vertex_key(&g, Vec3::ZERO, 0.0));

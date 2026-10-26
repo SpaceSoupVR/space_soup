@@ -272,7 +272,7 @@ pub fn runs(frame: &EffectFrame, use_variants: bool) -> (Vec<Run>, RunStats) {
         let mut by_size: Vec<usize> = (0..kinds.len()).collect();
         by_size.sort_by(|a, b| kinds[*b].count.cmp(&kinds[*a].count).then(a.cmp(b)));
         let mut keep = by_size[..anchors].to_vec();
-        keep.sort();
+        keep.sort_unstable();
         let stretch = |from: usize, to: usize, out: &mut Vec<Run>, stats: &mut RunStats| match to - from {
             0 => {}
             1 => out.push(kinds[from]),
@@ -368,7 +368,7 @@ mod tests {
 
             let body = &src[src.find(&format!("fn {}(", v.entry())).unwrap()..];
             let body = &body[..body.find("\n}\n").unwrap()];
-            let fetches = body.matches("textureSample").count() + if body.contains("fx_depth_fade(in)") { 1 } else { 0 };
+            let fetches = body.matches("textureSample").count() + usize::from(body.contains("fx_depth_fade(in)"));
             eprintln!("{:<24} {:>6} {:>9.0} {:>7}  {:.0}%", v.label(), p, p as f32 * PROXY_TO_INSTRUCTIONS, fetches, 100.0 * p as f32 / against as f32);
             assert!(p <= against, "{v:?} is larger than the union");
             assert!(p as f32 * PROXY_TO_INSTRUCTIONS <= LIMIT_INSTRUCTIONS, "{v:?}: {p} by the proxy is over the limit");

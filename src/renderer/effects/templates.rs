@@ -653,7 +653,7 @@ mod tests {
             let v = e.variation.clamped();
             let rate = e.rate.max(0.0)
                 * match e.kind {
-                    EffectKind::Dust => p.rate * e.volume() / (0.5 * (p.life.0 + p.life.1)),
+                    EffectKind::Dust => p.rate * e.volume() / f32::midpoint(p.life.0, p.life.1),
                     _ => p.rate,
                 };
             if !(rate > 0.0) || !(e.scale > 0.0) {
@@ -663,7 +663,7 @@ mod tests {
             let speeds = speed_range(&p, &v);
             let slots = ((rate * lives.1).ceil() as usize).clamp(1, MAX_SLOTS);
 
-            let period = (slots as f64 / rate as f64).max(lives.1 as f64);
+            let period = (slots as f64 / f64::from(rate)).max(f64::from(lives.1));
             let base = emitter_seed(e);
             let tint = Vec3::from(e.tint);
             let ambient = (at.ambient)(e.position);
@@ -676,7 +676,7 @@ mod tests {
             // them since 2026-10-22.)
             let clocks = air.as_ref().map(|w| air_clocks(w, time));
             for i in 0..slots {
-                let since = time - i as f64 / rate as f64;
+                let since = time - i as f64 / f64::from(rate);
                 let n = (since / period).floor();
                 let age = (since - n * period) as f32;
                 let u = uniforms(hash64(
@@ -744,12 +744,11 @@ mod tests {
                                 moving += Vec3::new(a.cos(), 0.0, a.sin()) * (0.9 * rise);
                             }
                         }
-                        EffectKind::Embers => {
-                            if pos.y >= top - 0.02 {
+                        EffectKind::Embers
+                            if pos.y >= top - 0.02 => {
                                 pos.y = top - 0.02;
                                 moving.y = moving.y.min(0.0);
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -783,7 +782,7 @@ mod tests {
                             }
                         }
 
-                        let glint = mote_glint(age, lerp(0.35, 1.3, u[7]), id_hash("glint") ^ u[8].to_bits() as u64);
+                        let glint = mote_glint(age, lerp(0.35, 1.3, u[7]), id_hash("glint") ^ u64::from(u[8].to_bits()));
                         let c = scattered * p.albedo * tint * (at.exposure * glint * v.intensity);
                         let held = smoothstep(0.0, 0.2, t) * smoothstep(1.0, 0.7, t);
                         let d = (centre - at.head).length();
@@ -884,7 +883,7 @@ mod tests {
         }
         for kind in EffectKind::ALL {
             let a = asset(kind);
-            let report: Report = a.check(books).unwrap_or_else(|e| panic!("{}: {}", a.name, e.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")));
+            let report: Report = a.check(books).unwrap_or_else(|e| panic!("{}: {}", a.name, e.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join("; ")));
             println!(
                 "{:<8} {:>3} instances, fill {:.3} megapixel-layers at {} m (budget {} / {})",
                 a.name, report.instances_steady, report.fill_steady, report.reference_distance, a.budget.instances, a.budget.fill_megapixel_layers
@@ -897,7 +896,7 @@ mod tests {
             assert_eq!(matches!(template(kind).form, Form::Slots(s) if s.screened), kind.screened());
         }
         let water = water_entry_asset();
-        let report = water.check(books).unwrap_or_else(|e| panic!("water_entry: {}", e.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")));
+        let report = water.check(books).unwrap_or_else(|e| panic!("water_entry: {}", e.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join("; ")));
         println!("water_entry {} instances at most, fill {:.3} megapixel-layers at {} m at most", report.instances_per_burst, report.fill_per_burst, report.reference_distance);
         let (why, over) = report.over_budget.expect("a strike's stack is over a burst's budget, and says why");
         println!("  over budget ({} lines): {why}", over.len());
@@ -1019,7 +1018,7 @@ mod tests {
                     let s = Splash { calm, held, depth, seed: 3 + strikes, ..Splash::new(Vec3::ZERO, 0.0, velocity, size, mass) };
                     strikes += 1;
                     for step in 0..40 {
-                        let f = simulate_with(&[], &[s], 0.01 + step as f64 * SPLASH_SECONDS as f64 / 40.0, &at);
+                        let f = simulate_with(&[], &[s], 0.01 + f64::from(step) * f64::from(SPLASH_SECONDS) / 40.0, &at);
                         let mut counts = [0u32; 6];
                         let mut fill = 0.0;
                         for (k, i) in f.instances.iter().enumerate() {

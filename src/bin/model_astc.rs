@@ -1,4 +1,4 @@
-//! MODEL_ASTC: encode the game's models' material maps as ASTC, ahead, so
+//! `MODEL_ASTC`: encode the game's models' material maps as ASTC, ahead, so
 //! the headset uploads them as they are -- 8 bits a texel against 32 -- with
 //! no mips built at load (`mesh::texture`'s `astc_texture`).
 //!
@@ -50,7 +50,7 @@ fn encode_model(glb: &Path, astcenc: &Path, quality: &str, force: bool) -> Resul
             let (base, emissive) = material_images(&material, &images);
             for (map, px) in [(ModelMap::Base, &base), (ModelMap::Emissive, &emissive)] {
                 let (w, h) = (px.1, px.2);
-                if w * h <= 1 || w % ASTC_BLOCK[0] as u32 != 0 || h % ASTC_BLOCK[1] as u32 != 0 {
+                if w * h <= 1 || w % u32::from(ASTC_BLOCK[0]) != 0 || h % u32::from(ASTC_BLOCK[1]) != 0 {
                     continue;
                 }
                 let path = model_astc_path(&dir, material.index(), map);

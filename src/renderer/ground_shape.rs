@@ -88,7 +88,7 @@ impl GroundShape {
     }
 }
 
-pub const WGSL: &str = r#"
+pub const WGSL: &str = r"
 @group(1) @binding(9) var ground_shape: texture_2d<f32>;
 
 struct GroundShapeRead {
@@ -121,7 +121,7 @@ fn ground_shape_at(uv: vec2<f32>, corner: vec2<f32>, lattice: f32) -> GroundShap
     }
     return r;
 }
-"#;
+";
 
 pub const SHAPED_EDITS: &[(&str, &str)] = &[
     (
@@ -198,7 +198,7 @@ mod tests {
         let (positions, normals, triangles) = lattice(cells, &h);
         let shape = GroundShape::build([cells, cells], [cells as f32; 2], &positions, &normals, &triangles).unwrap();
 
-        let mid = 1 * (cells + 1) + 5;
+        let mid = (cells + 1) + 5;
         let uv = [5.0 / cells as f32, 1.0 / cells as f32];
         let (n, _) = shape.at(uv);
         assert!((n - normals[mid as usize]).length() < 1e-5, "{n} against the sample's own {}", normals[mid as usize]);

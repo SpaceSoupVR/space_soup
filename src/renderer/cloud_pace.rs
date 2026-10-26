@@ -6,7 +6,7 @@
 //! where they are and only renews their shape more slowly. When the frame is
 //! over budget that is the cheapest time to buy back: in the user's live
 //! session (2026-10-22, 239 windows of `XRPERF`) frames dropped from a mean
-//! `app/gpu_frametime` of about 22 ms in a 27.7 ms SpaceWarp period (11 drops
+//! `app/gpu_frametime` of about 22 ms in a 27.7 ms `SpaceWarp` period (11 drops
 //! a 3.5 s window at 20-22 ms, 16 at 22-24, 26 at 24-26, 36 at 26-28), and
 //! half the windows were past it.
 

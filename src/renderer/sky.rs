@@ -181,7 +181,7 @@ pub struct SkyClouds {
 /// and every snapshot's frame was set back to real time at the next tick
 /// (user: the clouds "do not noticeably move").
 fn cloud_clock(frame: &CloudFrame, real: f64) -> f64 {
-    real * frame.params.clamped().time_scale as f64
+    real * f64::from(frame.params.clamped().time_scale)
 }
 
 impl SkyClouds {
@@ -276,7 +276,7 @@ pub fn cloud_map_for(centre: [f32; 2], sun: &SkySun, yaw: f32, offset: [f32; 3])
 /// the clamped sampler reads at the edge) takes the average light, never
 /// one row's patch smeared to the horizon.
 pub fn cloud_map_border(texels: &mut [u8], size: u32) -> f32 {
-    let mean = texels.iter().map(|&v| v as f32).sum::<f32>() / (255.0 * texels.len().max(1) as f32);
+    let mean = texels.iter().map(|&v| f32::from(v)).sum::<f32>() / (255.0 * texels.len().max(1) as f32);
     let m = (mean * 255.0).round() as u8;
     for j in 0..size {
         for i in 0..size {
@@ -688,7 +688,7 @@ fn alts_view(cloud_sky: &Option<CloudSky>, dummy: &Texture) -> TextureView {
     }
 }
 
-/// What SpaceWarp's sky pass reads the clouds' motion from (`sky_motion`).
+/// What `SpaceWarp`'s sky pass reads the clouds' motion from (`sky_motion`).
 pub struct SkyMotionSource {
     /// Changes whenever the maps bound change.
     pub key: u64,
@@ -816,7 +816,7 @@ impl Sky {
         self.clouds.is_some() && self.cloud_sky.is_some()
     }
 
-    /// What SpaceWarp's sky pass moves the clouds' pixels by: the newest map,
+    /// What `SpaceWarp`'s sky pass moves the clouds' pixels by: the newest map,
     /// its heights and the winds, and the cloud clock's last step.
     pub fn motion_source(&self) -> SkyMotionSource {
         SkyMotionSource {
@@ -838,7 +838,7 @@ impl Sky {
                 BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&view) },
                 BindGroupEntry { binding: 1, resource: BindingResource::Sampler(sampler) },
                 BindGroupEntry { binding: 2, resource: extra.as_entire_binding() },
-                BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&cloud_view) },
+                BindGroupEntry { binding: 3, resource: BindingResource::TextureView(cloud_view) },
                 BindGroupEntry { binding: 4, resource: BindingResource::Sampler(cloud_sampler) },
                 BindGroupEntry { binding: 5, resource: BindingResource::TextureView(&night.views[0]) },
                 BindGroupEntry { binding: 6, resource: BindingResource::TextureView(&night.views[1]) },
@@ -891,7 +891,7 @@ impl Sky {
             t: if blend_seconds > 0.0 { 0.0 } else { 1.0 },
             seconds: blend_seconds,
         });
-        let shown = self.blend.as_ref().map(|b| b.panorama(b.t)).unwrap_or_else(|| snap.panorama.clone());
+        let shown = self.blend.as_ref().map_or_else(|| snap.panorama.clone(), |b| b.panorama(b.t));
         let pano = &shown;
         let size = self.texture.size();
         if size.width != pano.width || size.height != pano.height {
@@ -940,7 +940,7 @@ impl Sky {
                 let model = kept
                     .filter(|m| m.params == frame.params)
                     .unwrap_or_else(|| std::sync::Arc::new(CloudModel::new(&frame.params, &CloudNoise::shared())));
-                let secs = cloud_clock(&frame, seconds as f64);
+                let secs = cloud_clock(&frame, f64::from(seconds));
                 let mut c = SkyClouds {
                     field: field.clone(),
                     frame: frame.at(secs),
@@ -1009,8 +1009,8 @@ impl Sky {
         self.extra.mode[2] = seconds;
         let warm = self.cloud_warm_rays();
         if let Some(c) = self.clouds.as_mut() {
-            let now = cloud_clock(&c.frame, seconds as f64);
-            self.cloud_dt = (now - c.seconds).clamp(0.0, 0.25 * c.frame.params.clamped().time_scale.max(1.0) as f64) as f32;
+            let now = cloud_clock(&c.frame, f64::from(seconds));
+            self.cloud_dt = (now - c.seconds).clamp(0.0, 0.25 * f64::from(c.frame.params.clamped().time_scale.max(1.0))) as f32;
             let before = c.seconds;
             c.seconds = now;
             c.frame = c.frame.at(c.seconds);
@@ -1209,7 +1209,7 @@ impl Sky {
             // The ground's shadow every CLOUD_SHADOW_EVERY-th frame, or when
             // its centre moves: 16 m texels, and the clouds cross a metre in
             // those frames (0.33 ms a draw on the Quest).
-            let draw_shadow = shadow_moved || !was_active || cs.frames % CLOUD_SHADOW_EVERY == 0;
+            let draw_shadow = shadow_moved || !was_active || cs.frames.is_multiple_of(CLOUD_SHADOW_EVERY);
             let began = gpu.starts_map(whole);
             gpu.encode_at(&mut encoder, queue, &m, &u, shadow.filter(|_| cs.active && draw_shadow), whole, now, at);
             mark(3);
@@ -1941,7 +1941,7 @@ mod tests {
 
     #[test]
     fn the_shader_reads_the_star_cells_at_their_size() {
-        assert!(sky_shader().contains(&format!("const STAR_CELLS: f32 = {:.1};", STAR_CELLS)));
+        assert!(sky_shader().contains(&format!("const STAR_CELLS: f32 = {STAR_CELLS:.1};")));
     }
 
     /// WHAT THE CLOUDS COST THE RENDER THREAD a frame, as `Sky::tick` and
@@ -1997,7 +1997,7 @@ mod tests {
             worst = worst.max(all);
             worst_update = worst_update.max(u);
             worst_rays = worst_rays.max(r);
-            over += (all > 2.0) as u32;
+            over += u32::from(all > 2.0);
         }
         eprintln!("CLOUDTICK first update {first:.1} ms; over {frames} frames the worst {worst:.2} ms (update {worst_update:.2}, rays {worst_rays:.2}, of which the mean's ray {worst_mean:.2}), {over} frames over 2 ms; a frame's level light {:.3} ms, halo rays {:.3} ms on average", sum_level / frames as f64, sum_halo / frames as f64);
         // The same with the worker drawing each second ahead (`cloud_worker`),
@@ -2033,7 +2033,7 @@ mod tests {
                 worst_at = (f, (p0 - a).as_secs_f64() * 1000.0, (p1 - p0).as_secs_f64() * 1000.0, p1.elapsed().as_secs_f64() * 1000.0);
             }
             worst = worst.max(all);
-            over += (all > 2.0) as u32;
+            over += u32::from(all > 2.0);
         }
         eprintln!(
             "CLOUDTICK with the worker: {real} frames in real time, {swaps} populations swapped in, the worst {worst:.2} ms (frame {}: layers {:.2}, poll and swap {:.2}, place and light {:.2}), {over} frames over 2 ms",
@@ -2076,7 +2076,7 @@ mod tests {
             eprintln!("skipping: the lobby's sky is not installed");
             return;
         };
-        let peak = pano.rgb.iter().cloned().fold(0.0f32, f32::max);
+        let peak = pano.rgb.iter().copied().fold(0.0f32, f32::max);
         assert!(peak > 100.0, "peak radiance {peak} is too low to be HDR");
     }
 
@@ -2275,9 +2275,9 @@ mod tests {
         for v in [0.0f32, 0.5, 1.0, 12.5, 250.0, 6000.0] {
             let h = f32_to_f16(v);
 
-            let sign = (h >> 15) as u32;
-            let exp = ((h >> 10) & 0x1f) as i32;
-            let mant = (h & 0x3ff) as u32;
+            let sign = u32::from(h >> 15);
+            let exp = i32::from((h >> 10) & 0x1f);
+            let mant = u32::from(h & 0x3ff);
             let back = if exp == 0 {
                 0.0
             } else {
@@ -2299,7 +2299,7 @@ mod tests {
 mod render_tests {
     use super::*;
     use crate::renderer::lights::LightsUniform;
-    use crate::renderer::uniforms::{PlayerUpload, PostUpload, ShadowUpload, SkyUpload, UniformBuffer};
+    use crate::renderer::uniforms::{PlayerUpload, PostUpload, ShadowUpload, SkyUpload};
 
     const SIZE: u32 = 9;
 
@@ -2401,7 +2401,7 @@ mod render_tests {
         let depth_view = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: None,
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -2571,7 +2571,7 @@ mod render_tests {
         let dv = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: None,
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -2653,7 +2653,7 @@ mod render_tests {
         (tod.snapshot(13.0, 0.0), zenith)
     }
 
-    /// THE SKY'S CLOUDS THROUGH TEN MINUTES of test_room's: each map built
+    /// THE SKY'S CLOUDS THROUGH TEN MINUTES of `test_room`'s: each map built
     /// whole at that moment, its share of cloud above 10 deg printed (the
     /// offline frames lost every cumulus past ~200 s, 2026-10-22).
     #[test]
@@ -2776,8 +2776,8 @@ mod render_tests {
     }
 
     /// WHAT THE SKY SHADER SHOWS, FRAME BY FRAME, against the wind: the
-    /// headset's loop (the worker on, a snapshot each second, test_room's
-    /// clouds on its 2.5x clock at SpaceWarp's 36 Hz), and after each frame
+    /// headset's loop (the worker on, a snapshot each second, `test_room`'s
+    /// clouds on its 2.5x clock at `SpaceWarp`'s 36 Hz), and after each frame
     /// the sky shader's own lookup (`sky_clouds`: both shown maps carried,
     /// read bicubically, blended) over a band of the sky. Per edge patch,
     /// the shift along the wind that best lays this frame's clouds on the
@@ -2814,7 +2814,7 @@ mod render_tests {
         let png_at: Vec<f32> = std::env::var("SHOWN_PNG_AT").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
 
         // The band shown: every STEP-th column, rows from 8 to 50 degrees up.
-        use crate::renderer::cloud_sky::{advected_uv, map_dir, map_uv, MAP_HEIGHT, MAP_WIDTH};
+        use crate::renderer::cloud_sky::{advected_uv, map_dir, MAP_HEIGHT, MAP_WIDTH};
         const STEP: u32 = 2;
         let row_of = |deg: f32| ((deg.to_radians() / std::f32::consts::FRAC_PI_2).powf(1.0 / crate::renderer::cloud_sky::MAP_PACK) * MAP_HEIGHT as f32) as u32;
         let (row0, row1) = (row_of(8.0), row_of(50.0));
@@ -2983,7 +2983,7 @@ mod render_tests {
                         degs.push((off * age / (p[1] - eye[1]).max(100.0)).atan().to_degrees());
                     }
                 }
-                degs.sort_by(|a, b| a.total_cmp(b));
+                degs.sort_by(f32::total_cmp);
                 let q = |f: f32| degs.get(((degs.len() as f32 * f) as usize).min(degs.len().saturating_sub(1))).copied().unwrap_or(0.0);
                 eprintln!("WINDMIX {secs:5.1} s: {mixed} of {seen} cloud texels carried on a mixed wind; off their layer by p50 {:.2} p90 {:.2} max {:.2} deg over {age:.1} s", q(0.5), q(0.9), q(1.0));
             }
@@ -2993,7 +2993,7 @@ mod render_tests {
                 let mean = cloudy.iter().fold([0.0f32; 3], |m, p| [m[0] + p[0], m[1] + p[1], m[2] + p[2]]).map(|v| v / cloudy.len().max(1) as f32);
                 let sky_rgb = mean.map(|v| v * 0.8);
                 let mut lums: Vec<f32> = rgb.iter().map(|p| p[0] + p[1] + p[2] + p[3] * (sky_rgb[0] + sky_rgb[1] + sky_rgb[2])).collect();
-                lums.sort_by(|a, b| a.total_cmp(b));
+                lums.sort_by(f32::total_cmp);
                 let white = lums[(lums.len() as f32 * 0.995) as usize].max(1e-12) / 3.0;
                 let mut img = image::RgbImage::new(cols, rows);
                 for j in 0..rows {
@@ -3194,7 +3194,7 @@ mod render_tests {
             }
             let sky = shot!(snap_px(d.to_array(), &clear_snap, zenith, 0.01, post, false));
             let got = shot!(snap_px(d.to_array(), &snap, zenith, 0.01, post, false));
-            let diff = (0..3).map(|c| (sky[c] as i32 - got[c] as i32).abs()).max().unwrap();
+            let diff = (0..3).map(|c| (i32::from(sky[c]) - i32::from(got[c])).abs()).max().unwrap();
             if diff <= 2 {
                 gaps += 1;
             } else if diff >= 20 {
@@ -3211,7 +3211,7 @@ mod render_tests {
         let post = PostUpload { exposure: 4.0, ..Default::default() };
         let blue = shot!(snap_px([0.0, 1.0, 0.0], &clear, zenith, 0.5, post, false));
         let grey = shot!(snap_px([0.0, 1.0, 0.0], &over, zenith, 0.5, post, false));
-        let tint = |p: [u8; 4]| p[2] as f32 - p[0] as f32;
+        let tint = |p: [u8; 4]| f32::from(p[2]) - f32::from(p[0]);
         assert!(tint(blue) > 30.0, "the clear zenith is not blue: {blue:?}");
         assert!(tint(grey) < 0.4 * tint(blue), "the overcast zenith stays blue: {grey:?} vs {blue:?}");
     }

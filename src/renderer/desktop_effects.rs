@@ -166,7 +166,7 @@ impl DesktopEffects {
             sight.push(eyes);
         }
         let held = &self.seen_until;
-        let seen = |i: usize| held.get(i).map_or(true, |&t| now <= t);
+        let seen = |i: usize| held.get(i).is_none_or(|&t| now <= t);
         let wants = effects::governor_wants(&self.emitters, &seen, &[], &self.bursts.splash_measured, head, &sight);
 
         self.bursts.mist_hour = self.hour;
@@ -279,13 +279,13 @@ mod tests {
         let camera = Camera { position: Vec3::new(0.0, 0.6, 2.0), rotation: Quat::IDENTITY, ..Camera::new(1.0) };
         // A second of fire, so the flames have risen.
         for step in 0..30 {
-            renderer.set_effects_time(step as f64 / 30.0, None);
+            renderer.set_effects_time(f64::from(step) / 30.0, None);
             renderer.render(&view, &camera, &[]);
         }
         let row = (w * 4).div_ceil(256) * 256;
         let readback = device.create_buffer(&BufferDescriptor {
             label: None,
-            size: (row * h) as u64,
+            size: u64::from(row * h),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });

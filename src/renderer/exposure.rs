@@ -138,7 +138,7 @@ const DOORWAY_HANDOVER: f32 = 0.5;
 /// its door sat 14.6 stops under (x7.4 inside, x183,000 outside at 23:00).
 /// Looking at a doorway out of a closed room into the open, the eye adapts
 /// this share of the way (in log) toward the night beyond, in proportion to
-/// how much of the view the doorway fills (all of it from DOOR_FULL_SR), and
+/// how much of the view the doorway fills (all of it from `DOOR_FULL_SR`), and
 /// the room itself stays drawn at its own adaptation (`room_adapted_log2`).
 pub const DOOR_LEAN: f32 = 0.92;
 pub const DOOR_FULL_SR: f32 = 0.08;
@@ -442,15 +442,12 @@ impl EyeAdaptation {
                 }
             }
         }
-        let log = match self.room_at(head) {
-            Some(room) => self.room_log(room, head, gaze, extra),
-            None => {
+        let log = if let Some(room) = self.room_at(head) { self.room_log(room, head, gaze, extra) } else {
 
-                let lobe = Lobe { gaze, free: 1.0 };
-                let samples: Vec<(f32, f32)> =
-                    sky_bins(&self.sky).into_iter().chain(extra.iter().copied()).map(|b| weighted(b, &lobe, 1.0, self.log_floor())).collect();
-                band_log(samples)
-            }
+            let lobe = Lobe { gaze, free: 1.0 };
+            let samples: Vec<(f32, f32)> =
+                sky_bins(&self.sky).into_iter().chain(extra.iter().copied()).map(|b| weighted(b, &lobe, 1.0, self.log_floor())).collect();
+            band_log(samples)
         };
         log.map_or(REFERENCE_LUMINANCE, f32::exp)
     }
@@ -560,14 +557,14 @@ impl EyeAdaptation {
                     // moonlit ground round the door from 12 m (exposure
                     // x70,000 -> x520).
                     let local = self.local_rooms && self.closed_rooms.iter().any(|c| c.room == beyond);
-                    if !local {
-                        samples.extend(through.into_iter().map(|(l, w)| (l, w * share / total)));
-                    } else {
+                    if local {
                         // Nor does it pull the night eye toward it: it can
                         // no longer wash out, and the pull re-exposed the
                         // moonlit yard by up to 4.5 stops each time a doorway
                         // came into view (headset, 2026-10-23: x22k-x267k).
                         bright.pop();
+                    } else {
+                        samples.extend(through.into_iter().map(|(l, w)| (l, w * share / total)));
                     }
                 }
             }
@@ -721,14 +718,14 @@ pub fn exposure_for(luminance: f32) -> f32 {
 fn adapted_log2_for(exposure: f32, max: f32) -> f32 {
     let (mut lo, mut hi) = (NIGHT_LOG_FLOOR.log2(), 16.0f32);
     for _ in 0..40 {
-        let mid = 0.5 * (lo + hi);
+        let mid = f32::midpoint(lo, hi);
         if exposure_for_up_to(mid.exp2(), max) > exposure {
             lo = mid;
         } else {
             hi = mid;
         }
     }
-    0.5 * (lo + hi)
+    f32::midpoint(lo, hi)
 }
 
 pub fn exposure_for_up_to(luminance: f32, max: f32) -> f32 {
@@ -1116,7 +1113,7 @@ mod tests {
         let night_eye = exposure_for_up_to(eye.meter(Vec3::new(0.0, 1.6, 20.0), Vec3::Z), 2.0e5);
         let dt = 1.0 / 72.0;
         // One frame: the yard's exposure and the hall's own pixels'.
-        let mut step = |eye: &mut EyeAdaptation, head: Vec3| {
+        let step = |eye: &mut EyeAdaptation, head: Vec3| {
             let m = eye.meter(head, Vec3::Z);
             let e = eye.update_leaning(m, eye.door_lean(head, Vec3::Z, m), dt);
             eye.see_rooms_from(head, e);
@@ -1161,7 +1158,7 @@ mod tests {
         eye.set_local_rooms(true);
         let hall_eye = exposure_for_up_to(0.2, 2.0e5);
         let dt = 1.0 / 72.0;
-        let mut step = |eye: &mut EyeAdaptation, head: Vec3| {
+        let step = |eye: &mut EyeAdaptation, head: Vec3| {
             let m = eye.meter(head, Vec3::NEG_Z);
             let e = eye.update_leaning(m, eye.door_lean(head, Vec3::NEG_Z, m), dt);
             eye.see_rooms_from(head, e);
@@ -1269,7 +1266,7 @@ mod tests {
         assert!((face - 4.0 * std::f32::consts::PI / 6.0).abs() < 1e-4, "{face}");
         let tiny = rectangle_solid_angle(10.0, (-0.05, 0.05), (-0.05, 0.05));
         assert!((tiny / (0.01 / 100.0) - 1.0).abs() < 1e-3, "{tiny}");
-        assert_eq!(rectangle_solid_angle(1.0, (2.0, 3.0), (2.0, 3.0)) > 0.0, true);
+        assert!(rectangle_solid_angle(1.0, (2.0, 3.0), (2.0, 3.0)) > 0.0);
     }
 
     #[test]

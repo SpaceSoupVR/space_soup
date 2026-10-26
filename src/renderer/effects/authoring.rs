@@ -95,7 +95,7 @@ pub fn check_json(text: &str) -> Value {
         }
         Err(e) => match templates::Template::compile(&a) {
             Ok(_) => (json!("template"), Value::Null, json!([])),
-            Err(t) => (Value::Null, json!(format!("{}; as a template: {t}", e.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; "))), json!([])),
+            Err(t) => (Value::Null, json!(format!("{}; as a template: {t}", e.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join("; "))), json!([])),
         },
     };
     json!({ "ok": ok, "name": a.name, "report": report, "issues": issues, "runs": runs, "runs_why": why, "variants": variants, "limits": limits_json() })
@@ -241,7 +241,7 @@ pub fn scene_json(items: &Value, assets: &std::collections::HashMap<String, Stri
         let p = &it["position"];
         let position = [p[0].as_f64().unwrap_or(0.0) as f32, p[1].as_f64().unwrap_or(0.0) as f32, p[2].as_f64().unwrap_or(0.0) as f32];
         let (report, density) = if let Some(name) = it["asset"].as_str().filter(|s| !s.is_empty()) {
-            match assets.get(name).map(|t| EffectAsset::parse(t).and_then(|a| a.check(books()).map_err(|i| i.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")))) {
+            match assets.get(name).map(|t| EffectAsset::parse(t).and_then(|a| a.check(books()).map_err(|i| i.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join("; ")))) {
                 Some(Ok(r)) => (r, None),
                 Some(Err(e)) => {
                     issues.push(format!("`{object}` names the effect `{name}`, which is refused: {e}"));
@@ -286,7 +286,7 @@ pub fn answer(request: &Value) -> Value {
         Some("limits") => limits_json(),
         Some("scene") => {
             let assets: std::collections::HashMap<String, String> =
-                request["assets"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect();
+                request["assets"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect();
             scene_json(&request["items"], &assets)
         }
         Some("ping") => json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }),
@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(v["runs"], "asset");
         assert_eq!(v["variants"][0]["variant"], "effects_over_sixway");
-        assert!(v["variants"][0]["instructions"].as_f64().unwrap() < LIMIT_INSTRUCTIONS as f64, "{v}");
+        assert!(v["variants"][0]["instructions"].as_f64().unwrap() < f64::from(LIMIT_INSTRUCTIONS), "{v}");
         assert_eq!(v["report"]["instances_steady"], 20);
         let typo = check_json(&vent.replace("\"drag\"", "\"drga\""));
         assert_eq!(typo["ok"], false);

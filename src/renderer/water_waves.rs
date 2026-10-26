@@ -204,7 +204,7 @@ impl WaveParams {
         }
         self.sum_over_waves(|_, kx, kz, e| {
             let k2 = kx * kx + kz * kz;
-            if k2 >= k_cut * k_cut { (k2 * e) as f64 } else { 0.0 }
+            if k2 >= k_cut * k_cut { f64::from(k2 * e) } else { 0.0 }
         })
     }
 
@@ -281,8 +281,8 @@ impl WaveSums {
                 for xi in 0..n {
                     let Some((kx, kz)) = p.wave_vector(c, xi, zi) else { continue };
                     let e = p.spectrum(kx, kz) * dk * dk;
-                    let k2e = ((kx * kx + kz * kz) * e) as f64;
-                    height += e as f64;
+                    let k2e = f64::from((kx * kx + kz * kz) * e);
+                    height += f64::from(e);
                     slope += k2e;
                     cascade[c] += k2e;
                     for (level, lane) in lost.iter_mut().enumerate() {
@@ -306,7 +306,7 @@ impl WaveSums {
 fn spread_norm(s: f32) -> f32 {
     let m = 512;
     let h = 2.0 * PI / m as f32;
-    let f = |i: usize| (0.5 * (-PI + i as f32 * h)).cos().abs().powf(2.0 * s);
+    let f = |i: usize| f32::midpoint(-PI, i as f32 * h).cos().abs().powf(2.0 * s);
     let mut sum = f(0) + f(m);
     for i in 1..m {
         sum += if i % 2 == 1 { 4.0 } else { 2.0 } * f(i);
@@ -383,7 +383,7 @@ pub fn foam_texture() -> Vec<u8> {
 fn shader() -> String {
     let (n, half, stages, cascades, pairs) = (N, N / 2, N.trailing_zeros(), CASCADES, PAIRS);
     format!(
-        r#"
+        r"
 struct Waves {{ time: vec4<f32>, foam: vec4<f32>, gain: vec4<f32> }}
 
 struct Wave {{ amp: vec4<f32>, kw: vec4<f32> }}
@@ -529,13 +529,13 @@ fn assemble(@builtin(global_invocation_id) id: vec3<u32>) {{
     textureStore(derivatives, vec2<i32>(id.xy), i32(c), vec4<f32>(p2.x, p2.y, p3.x, p3.y));
     textureStore(curvature, vec2<i32>(id.xy), i32(c), vec4<f32>(p4.x, p4.y, p5.x, foam));
 }}
-"#
+"
     )
 }
 
 fn mip_shader() -> String {
     format!(
-        r#"
+        r"
 @group(0) @binding(0) var src_a: texture_2d_array<f32>;
 @group(0) @binding(1) var src_b: texture_2d_array<f32>;
 @group(0) @binding(2) var src_c: texture_2d_array<f32>;
@@ -564,7 +564,7 @@ fn halve(@builtin(global_invocation_id) id: vec3<u32>) {{
     textureStore(dst_b, vec2<i32>(id.xy), l, b * 0.25);
     textureStore(dst_c, vec2<i32>(id.xy), l, c * 0.25);
 }}
-"#
+"
     )
 }
 
@@ -627,7 +627,7 @@ impl WaveField {
         );
         let spec = device.create_buffer(&BufferDescriptor {
             label: Some("water_waves_fields"),
-            size: CASCADES as u64 * PAIRS as u64 * (N * N) as u64 * 8,
+            size: CASCADES as u64 * u64::from(PAIRS) * u64::from(N * N) * 8,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -688,7 +688,7 @@ impl WaveField {
                 data = (0..half * half)
                     .map(|i| {
                         let (x, y) = (i % half * 2, i / half * 2);
-                        let sum: u32 = [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)].iter().map(|&(a, b)| data[b * s + a] as u32).sum();
+                        let sum: u32 = [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)].iter().map(|&(a, b)| u32::from(data[b * s + a])).sum();
                         ((sum + 2) / 4) as u8
                     })
                     .collect();
@@ -824,7 +824,7 @@ impl WaveField {
 
     pub fn update(&self, queue: &Queue, encoder: &mut CommandEncoder, seconds: f64) {
         let p = &self.params;
-        let wrapped = seconds.rem_euclid(p.loop_seconds as f64) as f32;
+        let wrapped = seconds.rem_euclid(f64::from(p.loop_seconds)) as f32;
         let first = !self.primed.swap(true, Ordering::Relaxed);
         let last = f64::from_bits(self.last_seconds.swap(seconds.to_bits(), Ordering::Relaxed));
 
@@ -886,19 +886,19 @@ mod tests {
 
     fn direct(p: &WaveParams, waves: &[[[f32; 4]; 2]], c: usize, x: u32, z: u32, t: f64) -> [C; FIELDS] {
         let n = N as usize;
-        let cell = p.tile[c] as f64 / n as f64;
-        let (px, pz) = (x as f64 * cell, z as f64 * cell);
-        let lam = p.choppiness as f64;
+        let cell = f64::from(p.tile[c]) / n as f64;
+        let (px, pz) = (f64::from(x) * cell, f64::from(z) * cell);
+        let lam = f64::from(p.choppiness);
         let mut out = [C(0.0, 0.0); FIELDS];
         for w in &waves[c * n * n..(c + 1) * n * n] {
             let [a, kw] = *w;
-            let (kx, kz, omega) = (kw[0] as f64, kw[1] as f64, kw[2] as f64);
+            let (kx, kz, omega) = (f64::from(kw[0]), f64::from(kw[1]), f64::from(kw[2]));
             let k = (kx * kx + kz * kz).sqrt();
             if k == 0.0 {
                 continue;
             }
             let turn = |phase: f64| C(phase.cos(), phase.sin());
-            let h = C(a[0] as f64, a[1] as f64) * turn(-omega * t) + C(a[2] as f64, a[3] as f64) * turn(omega * t);
+            let h = C(f64::from(a[0]), f64::from(a[1])) * turn(-omega * t) + C(f64::from(a[2]), f64::from(a[3])) * turn(omega * t);
             let i = C(0.0, 1.0);
             let dx = i * C(kx / k * lam, 0.0) * h;
             let dz = i * C(kz / k * lam, 0.0) * h;
@@ -914,8 +914,8 @@ mod tests {
 
     fn half_to_f32(h: u16) -> f32 {
         let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-        let e = ((h >> 10) & 0x1f) as i32;
-        let m = (h & 0x3ff) as f32;
+        let e = i32::from((h >> 10) & 0x1f);
+        let m = f32::from(h & 0x3ff);
         s * match e {
             0 => m * 2f32.powi(-24),
             31 => f32::INFINITY,
@@ -937,7 +937,7 @@ mod tests {
             let mut read = |tex: &Texture| {
                 let buf = device.create_buffer(&BufferDescriptor {
                     label: None,
-                    size: (row * N * CASCADES as u32) as u64,
+                    size: u64::from(row * N * CASCADES as u32),
                     usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
@@ -990,7 +990,7 @@ mod tests {
                 let want = direct(&p, &waves, c, x, z, t);
                 let got = gpu[(c as u32 * N * N + z * N + x) as usize];
                 for f in 0..FIELDS {
-                    worst[f] = worst[f].max((got[f] as f64 - want[f].0).abs());
+                    worst[f] = worst[f].max((f64::from(got[f]) - want[f].0).abs());
                     scale[f] = scale[f].max(want[f].0.abs());
                     imaginary = imaginary.max(want[f].1.abs() / want[f].0.abs().max(1e-3));
                 }
@@ -1017,12 +1017,12 @@ mod tests {
         };
         for c in 0..CASCADES {
             let cells = &gpu[c * (N * N) as usize..(c + 1) * (N * N) as usize];
-            let jacobian = |f: &[f32; FIELDS + 1]| ((1.0 + f[6]) * (1.0 + f[7]) - f[3] * f[3]) as f64;
+            let jacobian = |f: &[f32; FIELDS + 1]| f64::from((1.0 + f[6]) * (1.0 + f[7]) - f[3] * f[3]);
             let n = cells.len() as f64;
-            let (mh, mj) = (cells.iter().map(|f| f[1] as f64).sum::<f64>() / n, cells.iter().map(jacobian).sum::<f64>() / n);
+            let (mh, mj) = (cells.iter().map(|f| f64::from(f[1])).sum::<f64>() / n, cells.iter().map(jacobian).sum::<f64>() / n);
             let (mut shj, mut shh, mut sjj) = (0.0, 0.0, 0.0);
             for f in cells {
-                let (dh, dj) = (f[1] as f64 - mh, jacobian(f) - mj);
+                let (dh, dj) = (f64::from(f[1]) - mh, jacobian(f) - mj);
                 shj += dh * dj;
                 shh += dh * dh;
                 sjj += dj * dj;
@@ -1068,8 +1068,8 @@ mod tests {
         eprintln!("Hs {hs:.3} m, fetch law {law:.3} m; peak wavelength {:.2} m", 2.0 * PI * G / p.peak_omega().powi(2));
         assert!(hs > 0.7 * law && hs < 1.4 * law, "Hs {hs} against the fetch law's {law}");
 
-        let sampled: f64 = p.waves().iter().map(|w| (w[0][0] * w[0][0] + w[0][1] * w[0][1]) as f64 * 2.0).sum();
-        let ratio = sampled / p.height_variance() as f64;
+        let sampled: f64 = p.waves().iter().map(|w| f64::from(w[0][0] * w[0][0] + w[0][1] * w[0][1]) * 2.0).sum();
+        let ratio = sampled / f64::from(p.height_variance());
         eprintln!("sampled / spectrum variance {ratio:.3}");
         assert!(ratio > 0.65 && ratio < 1.5, "sampled variance / spectrum variance = {ratio}");
     }
@@ -1084,17 +1084,17 @@ mod tests {
         ] {
             let sums = WaveSums::of(&p);
             assert!(sums.height_variance > 0.0 && sums.slope_variance > 0.0, "{p:?}");
-            assert_eq!(sums.height_variance, p.sum_over_waves(|_, _, _, e| e as f64));
-            assert_eq!(sums.slope_variance, p.sum_over_waves(|_, kx, kz, e| ((kx * kx + kz * kz) * e) as f64));
+            assert_eq!(sums.height_variance, p.sum_over_waves(|_, _, _, e| f64::from(e)));
+            assert_eq!(sums.slope_variance, p.sum_over_waves(|_, kx, kz, e| f64::from((kx * kx + kz * kz) * e)));
             for c in 0..CASCADES {
-                assert_eq!(sums.cascade_slope_variance[c], p.sum_over_waves(|cc, kx, kz, e| if cc == c { ((kx * kx + kz * kz) * e) as f64 } else { 0.0 }));
+                assert_eq!(sums.cascade_slope_variance[c], p.sum_over_waves(|cc, kx, kz, e| if cc == c { f64::from((kx * kx + kz * kz) * e) } else { 0.0 }));
             }
             for level in 0..MIPS as usize {
                 for c in 0..CASCADES {
                     let texels = (N >> level).max(1) as f32;
                     let nyquist = if level + 1 == MIPS as usize { 0.0 } else { PI * texels / p.tile[c] };
                     let was = p.sum_over_waves(|cc, kx, kz, e| {
-                        if cc == c && (kx.abs() > nyquist || kz.abs() > nyquist) { ((kx * kx + kz * kz) * e) as f64 } else { 0.0 }
+                        if cc == c && (kx.abs() > nyquist || kz.abs() > nyquist) { f64::from((kx * kx + kz * kz) * e) } else { 0.0 }
                     });
                     assert_eq!(sums.lost[level][c], was, "level {level} cascade {c}");
                 }
@@ -1110,7 +1110,7 @@ mod tests {
     fn a_levels_bodies_under_one_wind_pass_over_the_spectrum_once() {
 
         let wind = WaveParams { wind_speed: 6.125, fetch: 437.5, depth: 2.25, ..WaveParams::default() };
-        let passes = || SPECTRUM_PASSES.with(|n| n.get());
+        let passes = || SPECTRUM_PASSES.with(std::cell::Cell::get);
         let before = passes();
         let load = |p: &WaveParams| (p.lost_slope_variance(), p.unresolved_slope_variance(), p.foam_gains(), p.significant_height());
         let first = load(&wind);
@@ -1151,7 +1151,7 @@ mod tests {
     fn every_wave_repeats_after_the_loop() {
         let p = WaveParams::default();
         for w in p.waves() {
-            let turns = w[1][2] as f64 * p.loop_seconds as f64 / (2.0 * std::f64::consts::PI);
+            let turns = f64::from(w[1][2]) * f64::from(p.loop_seconds) / (2.0 * std::f64::consts::PI);
             assert!((turns - turns.round()).abs() < 1e-3, "omega {} makes {turns} turns a loop", w[1][2]);
         }
     }
@@ -1160,11 +1160,11 @@ mod tests {
     fn the_foam_texture_tiles() {
         let t = foam_texture();
         let s = FOAM_SIZE as usize;
-        let at = |x: usize, y: usize| t[y * s + x] as f32;
+        let at = |x: usize, y: usize| f32::from(t[y * s + x]);
         let step = |a: &dyn Fn(usize) -> f32, b: &dyn Fn(usize) -> f32| (0..s).map(|i| (a(i) - b(i)).abs()).sum::<f32>() / s as f32;
         let seam = step(&|y| at(s - 1, y), &|y| at(0, y)).max(step(&|x| at(x, s - 1), &|x| at(x, 0)));
         let inside = step(&|y| at(s / 2, y), &|y| at(s / 2 + 1, y)).max(step(&|x| at(x, s / 2), &|x| at(x, s / 2 + 1)));
-        let mean = t.iter().map(|&v| v as f32).sum::<f32>() / t.len() as f32;
+        let mean = t.iter().map(|&v| f32::from(v)).sum::<f32>() / t.len() as f32;
         eprintln!("foam texture: mean {mean:.0}, seam step {seam:.1}, inside step {inside:.1}");
         assert!(seam < 2.0 * inside + 4.0, "the foam texture has a seam ({seam} against {inside} inside)");
         assert!(mean > 30.0 && mean < 200.0, "the foam texture is all one shade (mean {mean})");

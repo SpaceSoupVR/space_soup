@@ -16,7 +16,7 @@ fn main() {
                     Ok(request) => authoring::answer(&request),
                     Err(e) => serde_json::json!({ "error": format!("not JSON: {e}") }),
                 };
-                if writeln!(out, "{answer}").and_then(|_| out.flush()).is_err() {
+                if writeln!(out, "{answer}").and_then(|()| out.flush()).is_err() {
                     break;
                 }
             }
@@ -26,7 +26,7 @@ fn main() {
             let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
             let v = authoring::check_json(&text);
             println!("{}", serde_json::to_string_pretty(&v).unwrap());
-            std::process::exit(if v["ok"] == true { 0 } else { 1 });
+            std::process::exit(i32::from(v["ok"] != true));
         }
         Some(op @ ("books" | "templates" | "limits")) => {
             println!("{}", serde_json::to_string_pretty(&authoring::answer(&serde_json::json!({ "op": op }))).unwrap());

@@ -262,8 +262,8 @@ fn check_keys(times: impl Iterator<Item = f32>, what: &str, issues: &mut Vec<Str
 }
 
 pub fn normal_of(u: f32) -> f32 {
-    let p = (u as f64).clamp(1e-6, 1.0 - 1e-6);
-    const A: [f64; 6] = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.3577518672690, -30.66479806614716, 2.506628277459239];
+    let p = f64::from(u).clamp(1e-6, 1.0 - 1e-6);
+    const A: [f64; 6] = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.357_751_867_269, -30.66479806614716, 2.506628277459239];
     const B: [f64; 5] = [-54.47609879822406, 161.5858368580409, -155.6989798598866, 66.80131188771972, -13.28068155288572];
     const C: [f64; 6] = [-0.007784894002430293, -0.3223964580411365, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
     const D: [f64; 4] = [0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416];
@@ -861,7 +861,7 @@ impl EffectAsset {
             costs.push(cost);
         }
         let mut names: Vec<&str> = self.emitters.iter().map(|e| e.name.as_str()).collect();
-        names.sort();
+        names.sort_unstable();
         if names.windows(2).any(|w| w[0] == w[1]) {
             note(false, None, "two emitters share a name".into());
         }
@@ -869,7 +869,7 @@ impl EffectAsset {
         let extent = costs.iter().fold(Extent::default(), |a, c| a.union(c.extent));
         if !burst {
             let (lo, hi, eyes) = crate::renderer::effects::seen::stated_view(extent.lateral, extent.below, extent.above, reference);
-            for c in costs.iter_mut() {
+            for c in &mut costs {
                 let (facing, flat) = if c.flat { (0.0, c.area) } else { (c.area, 0.0) };
                 c.fill = crate::renderer::effects::seen::seen_fill(&eyes, lo, hi, facing, flat, c.points as f32, if c.volume { 1.0 } else { 0.0 });
             }
@@ -917,7 +917,7 @@ impl EffectAsset {
         if matches!(&self.over_budget, Some(r) if r.trim().is_empty()) {
             note(false, None, "over_budget needs its reason".into());
         }
-        let over_budget: Vec<String> = issues.iter().filter(|i| i.budget).map(|i| i.to_string()).collect();
+        let over_budget: Vec<String> = issues.iter().filter(|i| i.budget).map(std::string::ToString::to_string).collect();
         let fatal: Vec<Issue> = issues.iter().filter(|i| !i.budget || self.over_budget.is_none()).cloned().collect();
         if !fatal.is_empty() {
             return Err(fatal);
@@ -1044,7 +1044,7 @@ impl EffectAsset {
         for (k, m) in e.update.iter().enumerate() {
             match m {
                 UpdateModule::Ballistic { .. } | UpdateModule::Swirl { .. } | UpdateModule::AirDrift { .. } | UpdateModule::Jitter { .. } | UpdateModule::CeilingSpread {} | UpdateModule::CeilingStop {} => {
-                    last_mover = Some(k)
+                    last_mover = Some(k);
                 }
                 UpdateModule::SizeOverLife { to, value } => {
                     last_mover = Some(k);
@@ -1065,7 +1065,7 @@ impl EffectAsset {
                 }
                 UpdateModule::OpacityOverLife { value } => value.check("opacity_over_life", 0.0, &mut values),
                 UpdateModule::PuffFade { peak, rise, power } if !(*peak > 0.0 && *peak <= 1.0 && *rise > 0.0 && *rise < 1.0 && *power > 0.0) => {
-                    bad("puff_fade: peak 0-1, rise inside the life, power over 0".into())
+                    bad("puff_fade: peak 0-1, rise inside the life, power over 0".into());
                 }
                 UpdateModule::ColourOverLife { gradient } => check_keys(gradient.iter().map(|k| k[0]), "colour_over_life", &mut values),
                 UpdateModule::ByInput { input, curve, .. } => {
@@ -1131,7 +1131,7 @@ impl EffectAsset {
             }
         }
         if let Some((MotionLayer::None, reason)) = motions.first() {
-            if reason.as_deref().map_or(true, |r| r.trim().is_empty()) {
+            if reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
                 bad("motion `none` needs its reason: every moving draw writes SpaceWarp motion vectors".into());
             }
         }
@@ -1218,7 +1218,7 @@ impl EffectAsset {
             None => count,
         }
         .max(0.0) as u32;
-        let half = size.map_or(0.0, |s| s.mean());
+        let half = size.map_or(0.0, Value::mean);
         let mean_half = match grow {
 
             Some(to) if to > 0.0 => ((half * half + half * to + to * to) / 3.0).sqrt(),
@@ -1307,7 +1307,7 @@ mod tests {
     #[test]
     fn an_asset_reads_checks_and_round_trips() {
         let a = EffectAsset::parse(&flash()).unwrap();
-        let report = a.check(BOOKS).unwrap_or_else(|i| panic!("{}", i.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")));
+        let report = a.check(BOOKS).unwrap_or_else(|i| panic!("{}", i.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join("; ")));
         assert_eq!((report.instances_per_burst, report.lights, report.burst), (6, 1, true));
         assert_eq!(report.instances_steady, 6, "one-frame particles are only ever their own burst's");
         assert!(report.fill_per_burst > 0.0 && report.fill_per_burst < 0.2, "{}", report.fill_per_burst);
@@ -1354,7 +1354,7 @@ mod tests {
             assert_ne!(text, flash(), "{from}");
             let a = EffectAsset::parse(&text).unwrap_or_else(|e| panic!("{to}: {e}"));
             let issues = a.check(BOOKS).expect_err(to);
-            let all = issues.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ");
+            let all = issues.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join("; ");
             assert!(all.contains(says), "{to}: {all}");
         }
     }

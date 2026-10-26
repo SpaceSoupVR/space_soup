@@ -86,7 +86,7 @@ pub const RELIGHT_OFF_BY: f32 = 0.02;
 /// layers go round (dusk and dawn).
 pub const RELIGHTS_PER_FRAME: usize = 1;
 
-const RELIGHT_WGSL: &str = r#"
+const RELIGHT_WGSL: &str = r"
 @group(0) @binding(0) var lamps: texture_2d_array<f32>;
 @group(0) @binding(1) var sun: texture_2d_array<f32>;
 @group(0) @binding(2) var out_tex: texture_storage_2d_array<rgba16float, write>;
@@ -104,7 +104,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let s = textureLoad(sun, p, f, 0);
     textureStore(out_tex, p, f, vec4<f32>(l.rgb + k.x * s.rgb, s.a));
 }
-"#;
+";
 
 impl Relight {
     fn new(device: &wgpu::Device, out: &wgpu::Texture, res: u32, layers: u32) -> Self {
@@ -263,7 +263,7 @@ pub const PROBE_UPLOADS_PER_FRAME: usize = 2;
 pub fn probe_bytes(res: u32) -> u64 {
     let mut total = 0u64;
     for level in 0..super::uniforms::probe_mip_levels(res) {
-        let r = (res >> level).max(1) as u64;
+        let r = u64::from((res >> level).max(1));
         total += r * r * 8 * 6;
     }
     total
@@ -519,7 +519,7 @@ impl ProbeStream {
         }
         log::info!(
             "reflection probes: {count} in the level, pool of {layers} ({} MB){}",
-            probe_bytes(res) * layers as u64 / (1024 * 1024),
+            probe_bytes(res) * u64::from(layers) / (1024 * 1024),
             if everything_fits { ", all resident" } else { ", streaming" },
         );
 
@@ -621,15 +621,12 @@ impl ProbeStream {
                 }
                 continue;
             }
-            match chain {
-                Some(chain) => {
-                    self.ready.insert(i, chain);
-                }
-                None => {
+            if let Some(chain) = chain {
+                self.ready.insert(i, chain);
+            } else {
 
-                    log::warn!("reflection probe {i} could not be decoded; it is skipped");
-                    self.failed.insert(i);
-                }
+                log::warn!("reflection probe {i} could not be decoded; it is skipped");
+                self.failed.insert(i);
             }
             self.requested.remove(&i);
         }
@@ -800,7 +797,7 @@ mod tests {
         let row = (side * 8).div_ceil(256) * 256;
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: (row * side * 6) as u64,
+            size: u64::from(row * side * 6),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });

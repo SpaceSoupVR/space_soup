@@ -209,14 +209,14 @@ impl Lattice {
     }
 
     fn tri(&self, out: &mut Vec<u32>, p: [(usize, usize); 3]) {
-        let at = |q: (usize, usize)| (self.xs[q.0] as i64, self.zs[q.1] as i64);
+        let at = |q: (usize, usize)| (i64::from(self.xs[q.0]), i64::from(self.zs[q.1]));
         let (a, b, c) = (at(p[0]), at(p[1]), at(p[2]));
         let cross = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
         let v = |q: (usize, usize)| self.vertex(q.0, q.1);
 
         let t = if cross < 0 { [p[0], p[1], p[2]] } else { [p[0], p[2], p[1]] };
 
-        let even = |q: (usize, usize)| self.xs[q.0] % 2 == 0 && self.zs[q.1] % 2 == 0;
+        let even = |q: (usize, usize)| self.xs[q.0].is_multiple_of(2) && self.zs[q.1].is_multiple_of(2);
         let r = (0..3).find(|k| even(t[*k])).unwrap_or(0);
         out.extend_from_slice(&[v(t[r]), v(t[(r + 1) % 3]), v(t[(r + 2) % 3])]);
     }
@@ -478,21 +478,18 @@ impl GroundLod {
                     *l = true;
                 }
             }
-            let chunk = match cell_of(t) {
-                Some((x, z)) => {
-                    cell_drawn[(z * cx + x) as usize] = 1;
-                    (z / cc) * chunks[0] + x / cc
-                }
-                None => {
-                    let c = (pos(t[0]) + pos(t[1]) + pos(t[2])) / 3.0;
-                    let along = |p: f32, o: f32, size: f32, n: u32| {
-                        let at = if size.abs() > 1e-9 { (p - o) / (size * cc as f32) } else { 0.0 };
-                        (at.max(0.0) as u32).min(n - 1)
-                    };
-                    let chunk = along(c.z, origin.z, cell_z, chunks[1]) * chunks[0] + along(c.x, origin.x, cell_x, chunks[0]);
-                    patched[chunk as usize] = true;
-                    chunk
-                }
+            let chunk = if let Some((x, z)) = cell_of(t) {
+                cell_drawn[(z * cx + x) as usize] = 1;
+                (z / cc) * chunks[0] + x / cc
+            } else {
+                let c = (pos(t[0]) + pos(t[1]) + pos(t[2])) / 3.0;
+                let along = |p: f32, o: f32, size: f32, n: u32| {
+                    let at = if size.abs() > 1e-9 { (p - o) / (size * cc as f32) } else { 0.0 };
+                    (at.max(0.0) as u32).min(n - 1)
+                };
+                let chunk = along(c.z, origin.z, cell_z, chunks[1]) * chunks[0] + along(c.x, origin.x, cell_x, chunks[0]);
+                patched[chunk as usize] = true;
+                chunk
             };
 
             let odd = |v: u32| v < grid_vertices && ((v % stride) % 2 == 1 || (v / stride) % 2 == 1);
@@ -736,7 +733,7 @@ impl GroundLod {
             let g = self.grids[l];
             for n in g.first as usize..(g.first + g.nx * g.nz) as usize {
                 let [i, j] = self.nodes[n].at;
-                let (i, j) = (i as i64 * 2, j as i64 * 2);
+                let (i, j) = (i64::from(i) * 2, i64::from(j) * 2);
 
                 let across = [
                     (i - 1, j, true),
@@ -1054,7 +1051,7 @@ impl GroundLod {
 
                 let whole = node.whole != NONE && self.units.get(node.whole as usize).is_some_and(|w| w.first == u.first);
                 if on && whole && self.nodes.len() > 1 {
-                    ((node.level as u32) << 28) | (morton(node.at[0], node.at[1]) / (BLOCK_CHUNKS * BLOCK_CHUNKS))
+                    (u32::from(node.level) << 28) | (morton(node.at[0], node.at[1]) / (BLOCK_CHUNKS * BLOCK_CHUNKS))
                 } else {
                     u32::MAX
                 }
@@ -1230,7 +1227,7 @@ pub(crate) mod tests {
         idx.chunks_exact(3)
             .map(|t| {
                 let p = |k: usize| positions[t[k] as usize];
-                (((p(1).x - p(0).x) as f64 * (p(2).z - p(0).z) as f64 - (p(1).z - p(0).z) as f64 * (p(2).x - p(0).x) as f64) * 0.5).abs()
+                ((f64::from(p(1).x - p(0).x) * f64::from(p(2).z - p(0).z) - f64::from(p(1).z - p(0).z) * f64::from(p(2).x - p(0).x)) * 0.5).abs()
             })
             .sum()
     }
@@ -1330,7 +1327,7 @@ pub(crate) mod tests {
                 assert_eq!(node.core, NONE);
             }
         }
-        let ratio = slivered.indices.len() as f64 / slivered.level0_len() as f64;
+        let ratio = slivered.indices.len() as f64 / f64::from(slivered.level0_len());
         eprintln!("the buffer with slivers: {ratio:.3} times step 1's indices");
         assert!((1.3..1.5).contains(&ratio), "{ratio}");
         let (_, _, lod) = built_strips(1024, CHUNK_CELLS);
@@ -1355,7 +1352,7 @@ pub(crate) mod tests {
             }
         }
 
-        let ratio = lod.indices.len() as f64 / lod.level0_len() as f64;
+        let ratio = lod.indices.len() as f64 / f64::from(lod.level0_len());
         assert!((2.7..2.9).contains(&ratio), "{ratio}");
     }
 
@@ -1509,10 +1506,10 @@ pub(crate) mod tests {
                 assert!(level_of.iter().all(|l| *l != u8::MAX), "every chunk drawn");
                 for j in 0..nz {
                     for i in 0..nx {
-                        let here = level_of[(j * nx + i) as usize] as i32;
+                        let here = i32::from(level_of[(j * nx + i) as usize]);
                         for (di, dj) in [(1u32, 0u32), (0, 1)] {
                             if i + di < nx && j + dj < nz {
-                                let there = level_of[((j + dj) * nx + i + di) as usize] as i32;
+                                let there = i32::from(level_of[((j + dj) * nx + i + di) as usize]);
                                 assert!((here - there).abs() <= 1, "{cells} cells, head {head}: chunks ({i},{j}) and its neighbour at levels {here} and {there}");
                             }
                         }
@@ -1549,7 +1546,7 @@ pub(crate) mod tests {
         let g = lod.grids[1];
         let n = (g.first + g.nx * 5 + 5) as usize;
         let node = lod.nodes[n].clone();
-        let from = Vec3::new(node.hi.x, (node.lo.y + node.hi.y) * 0.5, (node.lo.z + node.hi.z) * 0.5);
+        let from = Vec3::new(node.hi.x, f32::midpoint(node.lo.y, node.hi.y), f32::midpoint(node.lo.z, node.hi.z));
         let at = |d: f32| from + Vec3::X * d;
 
         let chunk = lod.id(0, node.at[0] * 2, node.at[1] * 2).unwrap() as u32;
@@ -1562,7 +1559,7 @@ pub(crate) mod tests {
         for sway in 0..200 {
             let d = edge + 0.05 * ((sway as f32) * 0.7).sin();
             let now = whole(&mut lod, d);
-            flips += (now != was) as u32;
+            flips += u32::from(now != was);
             was = now;
         }
         assert!(flips <= 1, "{flips} flips in 200 sways of 5 cm about the split line");
@@ -1626,7 +1623,7 @@ pub(crate) mod tests {
 
             let open_now = open_edges(&positions, &idx);
             let near_hole = |v: u32| v == extra || ((508..=513).contains(&(v % stride)) && (299..=303).contains(&(v / stride)));
-            let on_outline = |v: u32| v % stride == 0 || v / stride == 0 || v % stride == cells || v / stride == cells;
+            let on_outline = |v: u32| v.is_multiple_of(stride) || v / stride == 0 || v % stride == cells || v / stride == cells;
             assert!(open_now.iter().all(|(a, b)| (near_hole(*a) && near_hole(*b)) || (on_outline(*a) && on_outline(*b))), "{d} m west: an open edge away from the hole");
             closed_a_stitched_border |= sel.nodes.iter().any(|(n, mask)| *n as usize == chunk && *mask != 0);
         }
@@ -1720,7 +1717,7 @@ pub(crate) mod tests {
         let cells = 96;
         let (positions, triangles, lod) = built(cells, 32, true);
         let stride = cells + 1;
-        let even = |v: u32| (v % stride) % 2 == 0 && (v / stride) % 2 == 0;
+        let even = |v: u32| (v % stride).is_multiple_of(2) && (v / stride).is_multiple_of(2);
         let up = |t: &[u32]| {
             let (a, b, c) = (positions[t[0] as usize], positions[t[1] as usize], positions[t[2] as usize]);
             (b - a).cross(c - a).y

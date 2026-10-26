@@ -128,8 +128,8 @@ pub struct Levers {
     /// long range stops costing the pixels its light barely reaches. 0 is
     /// off (colleague's plan part 2, item 5; A/B before turning on).
     pub light_cutoff: f32,
-    /// Native frames (no SpaceWarp synthesis) whenever the GPU time holds
-    /// under 75% of the display period for 5 s, back to SpaceWarp once over
+    /// Native frames (no `SpaceWarp` synthesis) whenever the GPU time holds
+    /// under 75% of the display period for 5 s, back to `SpaceWarp` once over
     /// 90% for a quarter second (`frame_governor`; the AAA doc's rank 11).
     /// Off by default: A/B before turning on.
     pub frame_governor: bool,
@@ -311,7 +311,7 @@ pub struct Levers {
 
     pub ab_cycle: bool,
     /// With `ab_cycle`, only these phases (labels, comma separated, e.g.
-    /// "baseline,no_smooth_shadow,light_cutoff,fovea30,fovea45").
+    /// "`baseline,no_smooth_shadow,light_cutoff,fovea30,fovea45`").
     pub ab_only: Option<String>,
 
     pub bench: Option<crate::renderer::bench::BenchPose>,
@@ -468,7 +468,7 @@ impl Levers {
             return Ok(Self::default());
         }
         let levers: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        if let Some(problem) = levers.bench.as_ref().and_then(|b| b.problem()) {
+        if let Some(problem) = levers.bench.as_ref().and_then(super::bench::BenchPose::problem) {
             return Err(problem);
         }
         Ok(levers)
@@ -891,7 +891,7 @@ mod tests {
         let mut f = LeverFile::new(&path);
         assert!(f.poll().is_none(), "no file, nothing to report");
         std::fs::write(&path, r#"{"portals": false}"#).unwrap();
-        assert_eq!(f.poll().unwrap().unwrap().portals, false);
+        assert!(!f.poll().unwrap().unwrap().portals);
         assert!(f.poll().is_none(), "unchanged, nothing to report");
         std::fs::write(&path, r#"{"portals": false, "shadows": false}"#).unwrap();
         let l = f.poll().unwrap().unwrap();

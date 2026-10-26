@@ -408,7 +408,7 @@ mod tests {
         let mut worst = 0.0f64;
         for _ in 0..2000 {
             let mut sh = [[0.0; 3]; 9];
-            for k in sh.iter_mut() {
+            for k in &mut sh {
                 for c in k.iter_mut() {
                     *c = rnd() * 4.0 - 1.0;
                 }

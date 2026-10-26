@@ -1,7 +1,7 @@
 //! HEAT, as the headset reports it (the colleague's plan part 2, item 3):
 //! the Quest throttles its CPU and GPU when hot, and a frame drop with no
 //! recorded cause cannot be fixed. Two sources, both kept per perf window:
-//! the OpenXR runtime's `XR_EXT_performance_settings` events (per domain and
+//! the `OpenXR` runtime's `XR_EXT_performance_settings` events (per domain and
 //! sub-domain, normal / warning / impaired), which Meta does not document
 //! sending, and Android's thermal status (`AThermal_getCurrentThermalStatus`,
 //! API 30), looked up at run time so a system without it loads the app the

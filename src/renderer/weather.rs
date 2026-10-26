@@ -137,7 +137,7 @@ pub fn f16_bits(v: f32) -> u16 {
         let m = (man | 0x80_0000) >> (1 - e);
         return sign | ((m + 0x1000) >> 13) as u16;
     }
-    let h = sign as u32 | ((e as u32) << 10) | (man >> 13);
+    let h = u32::from(sign) | ((e as u32) << 10) | (man >> 13);
 
     (h + ((man >> 12) & 1)) as u16
 }
@@ -258,7 +258,7 @@ pub fn particle_counts(areas: &[AreaParams], head: [f32; 3]) -> (u32, u32, u32) 
 }
 
 pub fn map_block() -> String {
-    r#"
+    r"
 struct WxUniform {
     areas: array<vec4<f32>, 12>,
     params: vec4<f32>,
@@ -355,13 +355,13 @@ fn wx_at(p: vec3<f32>) -> WxAt {
 fn wx_open(y: f32, cover: f32) -> f32 {
     return clamp((y - cover + 0.5) / 0.4, 0.0, 1.0);
 }
-"#
+"
     .to_string()
 }
 
 fn surface_block() -> String {
     format!(
-        r#"
+        r"
 fn wx_ripple_layer(q: vec2<f32>, t: f32, seed: u32) -> vec2<f32> {{
     let h = wx_cell(q + vec2<f32>(f32(seed), 0.0));
     let hx = f32(h & 0xffffu) / 65535.0;
@@ -454,7 +454,7 @@ const WX_FILM_LEVEL: f32 = {film_level:?};
 
 const WX_WATER: bool = true;
 const WX_SNOW: bool = true;
-"#,
+",
         sa = SNOW_ALBEDO[0],
         sb = SNOW_ALBEDO[1],
         sc = SNOW_ALBEDO[2],
@@ -591,7 +591,7 @@ fn particle_shader() -> String {
         "{aces}{map}{body}",
         aces = crate::renderer::tonemap::wgsl_aces_block(),
         map = map_block(),
-        body = r#"
+        body = r"
 var<private> view_slot: i32 = 0;
 struct Camera { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -786,7 +786,7 @@ const WX_GONE: vec4<f32> = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     let alpha = clamp(in.sky.a * a, 0.0, 1.0);
     return vec4<f32>(aces_fitted(lit) * alpha, alpha);
 }
-"#
+"
         .replace("WX_SUN_RANGE", &format!("{:?}", super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS))
         .replace("WX_WOBBLE_T", &snow_wobble("t")),
     )
@@ -817,7 +817,7 @@ pub fn motion_shader() -> String {
     let to = from + s[from..].find("    var sky_vis").expect("weather motion twin: the particle's cover moved");
     let cover = s[from..to].to_string();
     format!(
-        r#"{motion}
+        r"{motion}
 {s}
 var<private> wx_back: f32 = 0.0;
 var<private> wx_before: bool = false;
@@ -874,7 +874,7 @@ struct WxMotionOut {{
 {cover}    let w = layer_weight(in.sky.a * a, {bright:?});
     return vec4<f32>(motion_of(in.curr, in.prev).xyz * w, w);
 }}
-"#,
+",
         motion = crate::renderer::space_warp::motion_block(),
         wob_now = snow_wobble("t"),
         wob_before = snow_wobble("(t - wx_back)"),
@@ -910,7 +910,7 @@ fn veil_shader() -> String {
         map = map_block(),
         near = crate::renderer::brush_pipeline::probe_pass::EYE_NEAR,
         far = crate::renderer::brush_pipeline::probe_pass::EYE_FAR,
-        body = r#"
+        body = r"
 var<private> view_slot: i32 = 0;
 struct Camera { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -1096,7 +1096,7 @@ fn veil_frag(colour: vec4<f32>, depth: f32) -> VeilFrag {
     var light = wx.sky.rgb * select(0.75, 1.0, snow) + wx.sun.rgb * select(0.12, 0.5, snow) * wx.sun_dir.w;
     return veil_frag(vec4<f32>(aces_fitted(light) * alpha, alpha), begin_depth);
 }
-"#,
+",
     )
 }
 
@@ -1266,15 +1266,12 @@ impl WeatherMaps {
         p.right = [v.right[0], v.right[1], v.right[2], 0.0];
         p.up = [v.up[0], v.up[1], v.up[2], 0.0];
         p.sky = [v.sky[0] * e, v.sky[1] * e, v.sky[2] * e, e];
-        match v.sun {
-            Some((c, d)) => {
-                p.sun = [c[0] * e, c[1] * e, c[2] * e, 0.0];
-                p.sun_dir = [d[0], d[1], d[2], 1.0];
-            }
-            None => {
-                p.sun = [0.0; 4];
-                p.sun_dir = [0.0, 1.0, 0.0, 0.0];
-            }
+        if let Some((c, d)) = v.sun {
+            p.sun = [c[0] * e, c[1] * e, c[2] * e, 0.0];
+            p.sun_dir = [d[0], d[1], d[2], 1.0];
+        } else {
+            p.sun = [0.0; 4];
+            p.sun_dir = [0.0, 1.0, 0.0, 0.0];
         }
         match v.torch {
             Some((pos, dir, range, outer, inner, col)) => {
@@ -1403,7 +1400,7 @@ mod tests {
     fn weather_twin_size() {
         use wgpu::naga;
         fn reach(m: &naga::Module, block: &naga::Block, seen: &mut std::collections::HashSet<naga::Handle<naga::Function>>) {
-            for st in block.iter() {
+            for st in block {
                 match st {
                     naga::Statement::Call { function, .. } => {
                         if seen.insert(*function) {
@@ -1528,7 +1525,7 @@ mod tests {
         assert_eq!(WeatherKinds::of(true, false), WeatherKinds::Snowless);
         assert_eq!(WeatherKinds::of(false, true), WeatherKinds::Waterless);
         assert_eq!(WeatherKinds::of(true, true), WeatherKinds::Both);
-        assert_eq!(WeatherKinds::ALL.map(|k| k.index()), [0, 1, 2, 3]);
+        assert_eq!(WeatherKinds::ALL.map(super::WeatherKinds::index), [0, 1, 2, 3]);
         let kinds = |holds: &[(bool, bool)], mask: u32| {
             let (mut water, mut snow) = (false, false);
             for k in 0..CHUNK_POOLS as usize {
@@ -1693,8 +1690,8 @@ mod tests {
     fn halves_round_trip_the_maps_values() {
         let back = |h: u16| {
             let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-            let e = ((h >> 10) & 0x1f) as i32;
-            let m = (h & 0x3ff) as f32;
+            let e = i32::from((h >> 10) & 0x1f);
+            let m = f32::from(h & 0x3ff);
             s * if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) }
         };
         for v in [0.0f32, 1.0, 0.5, 0.03, 0.004, -3.4, 12.25, 0.15, -10000.0] {
@@ -1761,7 +1758,7 @@ mod tests {
             let (target_view, depth_view) = (target.create_view(&Default::default()), depth.create_view(&Default::default()));
             let readback = device.create_buffer(&BufferDescriptor {
                 label: Some("veil_test_readback"),
-                size: (256 * SIZE) as u64,
+                size: u64::from(256 * SIZE),
                 usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });

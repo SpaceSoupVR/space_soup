@@ -35,7 +35,7 @@ pub const MAX_SLOTS: u32 = 2048;
 
 pub fn motion_block() -> String {
     format!(
-        r#"
+        r"
 struct MotionCamera {{
     curr: mat4x4<f32>,
     prev: mat4x4<f32>,
@@ -60,7 +60,7 @@ fn layer_weight(share: f32, k: f32) -> f32 {{
     let behind = 1.0 - s;
     return layer * layer / max(layer * layer + behind * behind, 1e-12);
 }}
-"#,
+",
         min_w = format!("{:?}", MIN_PREV_W),
         max_d = format!("{:?}", MAX_NDC_MOTION),
     )
@@ -79,7 +79,7 @@ pub const SOFT_LAYER_CONTRAST: f32 = 1.0;
 
 pub fn shader() -> String {
     format!(
-        r#"
+        r"
 {motion}
 
 struct Joints {{
@@ -197,7 +197,7 @@ fn reflect_ratio(texel: vec2<f32>, d: f32) -> f32 {{
     }}
     return out;
 }}
-"#,
+",
         motion = motion_block(),
         joints = crate::renderer::mesh::MAX_SKIN_JOINTS,
         max_reflected = format!("{:?}", MAX_REFLECTED_DISTANCE),
@@ -665,10 +665,10 @@ pub fn record(
         if matches!(d.kind, MotionKind::Weather | MotionKind::Effects(_)) {
             continue;
         }
-        let key = (d.kind, d.slot, d.vertices as *const _, d.indices as *const _, d.joints.map(|j| j as *const _));
+        let key = (d.kind, d.slot, std::ptr::from_ref(d.vertices), std::ptr::from_ref(d.indices), d.joints.map(std::ptr::from_ref));
         if bound != Some(key) {
             pass.set_pipeline(pipelines.pipeline(d.kind));
-            pass.set_bind_group(0, cameras, &[(d.slot as u64 * SLOT_STRIDE) as u32]);
+            pass.set_bind_group(0, cameras, &[(u64::from(d.slot) * SLOT_STRIDE) as u32]);
             if let Some(j) = d.joints {
                 pass.set_bind_group(1, j, &[]);
             }
@@ -695,7 +695,7 @@ pub fn record(
             continue;
         }
         pass.set_pipeline(pipelines.pipeline(p.kind));
-        pass.set_bind_group(0, cameras, &[(p.slot as u64 * SLOT_STRIDE) as u32]);
+        pass.set_bind_group(0, cameras, &[(u64::from(p.slot) * SLOT_STRIDE) as u32]);
         for (k, g) in p.groups.iter().enumerate() {
             if let Some(g) = g {
                 pass.set_bind_group(1 + k as u32, *g, &[]);
@@ -842,7 +842,7 @@ mod tests {
         };
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let _p = MotionPipelines::new(&device, wgpu::TextureFormat::Depth32Float);
-        assert!(SLOT_STRIDE >= device.limits().min_uniform_buffer_offset_alignment as u64);
+        assert!(SLOT_STRIDE >= u64::from(device.limits().min_uniform_buffer_offset_alignment));
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "{err:?}");
     }
@@ -1173,7 +1173,7 @@ mod tests {
             );
             let readback = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("readback"),
-                size: (W * W * 8) as u64,
+                size: u64::from(W * W * 8),
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -1310,7 +1310,7 @@ mod tests {
             let readback = |label, bytes: u32| {
                 device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(label),
-                    size: (W * W * bytes) as u64,
+                    size: u64::from(W * W * bytes),
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 })
@@ -1374,8 +1374,8 @@ mod tests {
 
     fn f16_to_f32(h: u16) -> f32 {
         let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-        let exp = ((h >> 10) & 0x1f) as i32;
-        let frac = (h & 0x3ff) as f32;
+        let exp = i32::from((h >> 10) & 0x1f);
+        let frac = f32::from(h & 0x3ff);
         match exp {
             0 => sign * frac * 2f32.powi(-24),
             31 => sign * f32::INFINITY,

@@ -108,7 +108,7 @@ fn normal(a: DVec3, b: DVec3, c: DVec3) -> DVec3 {
 
 impl Mesh {
     fn new(positions: &[Vec3], indices: &[u32]) -> Self {
-        let pos: Vec<DVec3> = positions.iter().map(|p| p.as_dvec3()).collect();
+        let pos: Vec<DVec3> = positions.iter().map(glam::Vec3::as_dvec3).collect();
         let n = pos.len();
         let mut tris = Vec::with_capacity(indices.len() / 3);
         for t in indices.chunks_exact(3) {
@@ -137,7 +137,7 @@ impl Mesh {
         let mut locked = vec![false; n];
         let mut at: HashMap<[u64; 3], u32> = HashMap::new();
         for (i, p) in positions.iter().enumerate() {
-            let key = [p.x.to_bits() as u64, p.y.to_bits() as u64, p.z.to_bits() as u64];
+            let key = [u64::from(p.x.to_bits()), u64::from(p.y.to_bits()), u64::from(p.z.to_bits())];
             if let Some(&j) = at.get(&key) {
                 locked[i] = true;
                 locked[j as usize] = true;

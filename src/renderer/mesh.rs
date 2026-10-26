@@ -233,7 +233,7 @@ impl GltfMesh {
         let mesh_nodes: std::collections::BTreeSet<usize> = all_nodes
             .iter()
             .filter(|n| n.mesh().is_some())
-            .map(|n| n.index())
+            .map(gltf::Node::index)
             .collect();
 
         let mut joint_names: Vec<String> = Vec::new();
@@ -296,7 +296,7 @@ impl GltfMesh {
             "GltfMesh::load_parts: loaded {} parts from {}: {:?}",
             joint_names.len(),
             path.display(),
-            &joint_names,
+            joint_names,
         );
 
         let joint_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -565,7 +565,7 @@ impl GltfMesh {
             skinned_prims.len(),
             path.display(),
             joint_count,
-            &joint_names,
+            joint_names,
         );
 
         let mut skin_opt: Option<GltfSkin> = if joint_count == 0 {

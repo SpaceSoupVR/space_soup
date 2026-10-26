@@ -55,11 +55,11 @@ impl BakedCaveVertex {
     ) -> Self {
         let (hue, saturation) = glow.map_or((0, 0), |c| glow_hue_saturation([c[0], c[1], c[2]]));
         let [a, b, c, packed] = colour0;
-        let rest = 255u16.saturating_sub(a as u16 + b as u16 + c as u16) as u8;
+        let rest = 255u16.saturating_sub(u16::from(a) + u16::from(b) + u16::from(c)) as u8;
         let axis = (packed >> 6).min(2);
         let (own, cliff) = match planes {
             Some((own, cliff)) if own != [0, 0, 0] => (own, cliff),
-            _ => ([(axis == 0) as u8 * 255, (axis == 1) as u8 * 255, (axis == 2) as u8 * 255], [0; 4]),
+            _ => ([u8::from(axis == 0) * 255, u8::from(axis == 1) * 255, u8::from(axis == 2) * 255], [0; 4]),
         };
         Self {
             position,
@@ -76,7 +76,7 @@ impl BakedCaveVertex {
 }
 
 fn srgb_to_linear(byte: u8) -> f32 {
-    let c = byte as f32 / 255.0;
+    let c = f32::from(byte) / 255.0;
     if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
 }
 
@@ -94,8 +94,8 @@ pub fn glow_hue_saturation(rgb: [u8; 3]) -> (u8, u8) {
 
 #[cfg(test)]
 fn glow_tint(hue: u8, saturation: u8) -> [f32; 3] {
-    let h = hue as f32 / 255.0;
-    let s = saturation as f32 / 255.0;
+    let h = f32::from(hue) / 255.0;
+    let s = f32::from(saturation) / 255.0;
     [0.0f32, 2.0 / 3.0, 1.0 / 3.0].map(|k| {
         let pure = (((h + k).fract() * 6.0 - 3.0).abs() - 1.0).clamp(0.0, 1.0);
         1.0 + (pure - 1.0) * s
@@ -131,13 +131,13 @@ impl CavePlanes {
     pub fn of(corners: [&BakedCaveVertex; 3]) -> CavePlanes {
         let mut read = [false; 3];
         for v in corners {
-            let total = v.planes[0] as u32 + v.planes[1] as u32 + v.planes[2] as u32;
+            let total = u32::from(v.planes[0]) + u32::from(v.planes[1]) + u32::from(v.planes[2]);
 
             if v.planes[3] > 0 || total != 255 {
                 return CavePlanes::Cliff;
             }
             for k in 0..3 {
-                read[k] |= v.planes[k] as f32 / 255.0 > WEIGHT_EPS;
+                read[k] |= f32::from(v.planes[k]) / 255.0 > WEIGHT_EPS;
             }
         }
         match read.iter().filter(|r| **r).count() {
@@ -204,7 +204,7 @@ impl BakedCaveMeta {
                 list.iter()
                     .filter_map(|c| {
                         let c = c.as_array()?;
-                        let f = |i: usize| c.get(i).and_then(|v| v.as_f64());
+                        let f = |i: usize| c.get(i).and_then(serde_json::Value::as_f64);
                         Some(CaveChunk {
                             first: f(0)? as u32,
                             count: f(1)? as u32,
@@ -217,7 +217,7 @@ impl BakedCaveMeta {
                     .collect()
             })
             .unwrap_or_default();
-        let emissive = cave.and_then(|c| c.get("emissive")).and_then(|e| e.as_bool()).unwrap_or(false);
+        let emissive = cave.and_then(|c| c.get("emissive")).and_then(serde_json::Value::as_bool).unwrap_or(false);
         Some(Self { chunks, emissive })
     }
 }
@@ -316,7 +316,7 @@ fn emissive_line(_planes: CavePlanes) -> String {
     "    colour = colour + albedo * in.glow_rgb;\n".to_string()
 }
 
-const GLOW_FN: &str = r#"// EMISSIVE PAINT (the emissive twin only): its brightness (`misc.y`, 0 to
+const GLOW_FN: &str = r"// EMISSIVE PAINT (the emissive twin only): its brightness (`misc.y`, 0 to
 
 fn glow_light(misc: vec4<u32>, saturation: f32) -> vec3<f32> {
     let hue = f32(misc.w) / 255.0;
@@ -324,7 +324,7 @@ fn glow_light(misc: vec4<u32>, saturation: f32) -> vec3<f32> {
     return mix(vec3<f32>(1.0), pure, saturation) * (f32(misc.y) / 63.0 * EMISSIVE_GAIN);
 }
 
-"#;
+";
 const GLOW_FIELD: &str = "    @location(9) glow_rgb: vec3<f32>,\n";
 const GLOW_VERTEX: &str = "    out.glow_rgb  = glow_light(v.misc, v.cliff.w);\n";
 
@@ -367,7 +367,7 @@ fn material_struct() -> String {
     old[from..to].to_string()
 }
 
-const ONE_VERTEX: &str = r#"struct VOut {
+const ONE_VERTEX: &str = r"struct VOut {
     @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
 
@@ -402,8 +402,8 @@ const ONE_VERTEX: &str = r#"struct VOut {
     out.ground    = vec3<f32>(v.ground_uv, f32(v.misc.z) / 255.0);
     return out;
 }
-"#;
-const ONE_LAYERS: &str = r#"    // The layers, each read ONCE, on the triangle's one plane: its gradients taken
+";
+const ONE_LAYERS: &str = r"    // The layers, each read ONCE, on the triangle's one plane: its gradients taken
 
     let uv = in.uv.xy;
     let uv_dx = dpdx(uv);
@@ -451,9 +451,9 @@ const ONE_LAYERS: &str = r#"    // The layers, each read ONCE, on the triangle's
     let mr = 1.0 / max(mat.macro_repeat, 0.001);
     let macro_value = textureSampleGrad(macro_tex, layer_samp, uv * mr, uv_dx * mr, uv_dy * mr).r;
     albedo = albedo * (1.0 + (macro_value - 0.5) * 2.0 * mat.macro_strength);
-"#;
+";
 
-const OWN_VERTEX: &str = r#"struct VOut {
+const OWN_VERTEX: &str = r"struct VOut {
     @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
 
@@ -484,8 +484,8 @@ const OWN_VERTEX: &str = r#"struct VOut {
     out.ground    = vec3<f32>(v.ground_uv, f32(v.misc.z) / 255.0);
     return out;
 }
-"#;
-const OWN_LAYERS_HEAD: &str = r#"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, at the world's own
+";
+const OWN_LAYERS_HEAD: &str = r"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, at the world's own
 
     let wp = in.wpos;
     let wdx = dpdx(wp);
@@ -509,9 +509,9 @@ const OWN_LAYERS_HEAD: &str = r#"    // THE LAYERS ARE READ ON THE WORLD'S PLANE
     var rough_map = 0.0;
     var ao_map = 0.0;
     var macro_value = 0.0;
-"#;
+";
 
-const OWN_LAYERS_PLANE: &str = r#"    if (in.planes.SHARE > WEIGHT_EPS) {
+const OWN_LAYERS_PLANE: &str = r"    if (in.planes.SHARE > WEIGHT_EPS) {
 
         macro_value = macro_value
             + textureSampleGrad(macro_tex, layer_samp, wp.SWZ * mr, wdx.SWZ * mr, wdy.SWZ * mr).r * in.planes.SHARE;
@@ -537,13 +537,13 @@ const OWN_LAYERS_PLANE: &str = r#"    if (in.planes.SHARE > WEIGHT_EPS) {
             ao_map = ao_map + textureSampleGrad(ao_tex, layer_samp, at, layer, gx, gy).r * lw;
         }
     }
-"#;
-const OWN_LAYERS_TAIL: &str = r#"    bent = normalize(select(nw, bent, dot(bent, bent) > 0.00000001));
+";
+const OWN_LAYERS_TAIL: &str = r"    bent = normalize(select(nw, bent, dot(bent, bent) > 0.00000001));
     let shaded_n = to_player_direction(bent);
     albedo = albedo * (1.0 + (macro_value - 0.5) * 2.0 * mat.macro_strength);
-"#;
+";
 
-const CLIFF_VERTEX: &str = r#"struct VOut {
+const CLIFF_VERTEX: &str = r"struct VOut {
     @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
 
@@ -577,8 +577,8 @@ const CLIFF_VERTEX: &str = r#"struct VOut {
     out.ground    = vec3<f32>(v.ground_uv, f32(v.misc.z) / 255.0);
     return out;
 }
-"#;
-const CLIFF_LAYERS: &str = r#"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, at the world's own
+";
+const CLIFF_LAYERS: &str = r"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, at the world's own
 
     let wp = in.wpos;
     let wdx = dpdx(wp);
@@ -694,7 +694,7 @@ const CLIFF_LAYERS: &str = r#"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, 
     bent = normalize(select(nw, bent, dot(bent, bent) > 0.00000001));
     let shaded_n = to_player_direction(bent);
     albedo = albedo * (1.0 + (macro_value - 0.5) * 2.0 * mat.macro_strength);
-"#;
+";
 
 fn planes_text(planes: CavePlanes) -> (String, String) {
     match planes {
@@ -717,7 +717,7 @@ fn full_shader(planes: CavePlanes) -> String {
         CavePlanes::Own | CavePlanes::Cliff => ("in.uv", "wp.y"),
     };
     format!(
-        r#"
+        r"
 @group(1) @binding(0) var layer_tex: texture_2d_array<f32>;
 @group(1) @binding(1) var layer_samp: sampler;
 @group(1) @binding(2) var macro_tex: texture_2d<f32>;
@@ -825,7 +825,7 @@ struct VIn {{
     );
 {emissive}    return vec4<f32>(tonemap(colour), 1.0);
 }}
-"#,
+",
         material = material_struct(),
 
         lights_block = super::lights::wgsl_lights_block_with(
@@ -847,7 +847,7 @@ struct VIn {{
 
 fn occluder_shader() -> String {
     format!(
-        r#"
+        r"
 struct ModelUniform {{ model: mat4x4<f32> }}
 @group(2) @binding(0) var<uniform> model_u: ModelUniform;
 {lights_block}
@@ -855,7 +855,7 @@ struct ModelUniform {{ model: mat4x4<f32> }}
     return cam_view_proj() * (model_u.model * vec4<f32>(pos, 1.0));
 }}
 @fragment fn fs_depth() {{}}
-"#,
+",
         lights_block = super::lights::wgsl_lights_block(0, 1),
     )
 }
@@ -1083,7 +1083,7 @@ impl BakedCavePipelines {
     }
 
     pub fn scene_pipeline(&self, planes: CavePlanes, emissive: bool, spotless: bool) -> &RenderPipeline {
-        &self.scene[planes as usize][emissive as usize][spotless as usize]
+        &self.scene[planes as usize][usize::from(emissive)][usize::from(spotless)]
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1109,7 +1109,7 @@ impl BakedCavePipelines {
                 }
             }
 
-            let both_eyes = self.stereo.as_ref().filter(|_| stereo).map(|s| &s[d.emissive as usize]);
+            let both_eyes = self.stereo.as_ref().filter(|_| stereo).map(|s| &s[usize::from(d.emissive)]);
             let passes: Vec<(&RenderPipeline, Vec<std::ops::Range<u32>>)> = match both_eyes {
                 Some(pipeline) => vec![(pipeline, visible_ranges(d.chunks, d.placed, planes, None))],
                 None => CavePlanes::ALL
@@ -1150,7 +1150,7 @@ impl BakedCavePipelines {
         draws: impl Iterator<Item = &'a BakedCaveDraw<'a>>,
     ) {
         for d in draws {
-            pass.set_pipeline(&self.mirror[d.emissive as usize]);
+            pass.set_pipeline(&self.mirror[usize::from(d.emissive)]);
             pass.set_bind_group(0, uniform, &[]);
             pass.set_bind_group(1, material, &[]);
             pass.set_bind_group(2, d.model, &[]);
@@ -1560,7 +1560,7 @@ mod tests {
         let (target_view, depth_view) = (target.create_view(&Default::default()), depth.create_view(&Default::default()));
         let readback = device.create_buffer(&BufferDescriptor {
             label: None,
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1646,7 +1646,7 @@ mod tests {
         assert_eq!([red[3], blue[3], white[3]], [255; 3]);
 
         let none = shot!(Shot { weights: [0; 4], ..Default::default() });
-        assert!(none[0] as u32 + none[1] as u32 + none[2] as u32 > 30, "{none:?}");
+        assert!(u32::from(none[0]) + u32::from(none[1]) + u32::from(none[2]) > 30, "{none:?}");
     }
 
     #[test]
@@ -1689,7 +1689,7 @@ mod tests {
         assert!(mostly_z[0].abs_diff(z[0]) < half[0].abs_diff(z[0]), "a tenth of x is nearer z: {mostly_z:?} {half:?} {z:?}");
 
         let none = render(Shot { planes: [0; 4], world, ..Default::default() }).unwrap();
-        assert!(none[0] as u32 + none[1] as u32 > 30, "{none:?}");
+        assert!(u32::from(none[0]) + u32::from(none[1]) > 30, "{none:?}");
     }
 
     #[test]
@@ -1749,7 +1749,7 @@ mod tests {
         let plain = shot!(Shot { ..w });
         let lit = shot!(Shot { lightmap: [200, 60, 20, 255], weights: [0, 0, 0, 255], ..Default::default() });
         assert!(lit[0] > plain[0] + 20, "baked light is added: {plain:?} {lit:?}");
-        assert!(lit[0] as i32 - lit[2] as i32 > plain[0] as i32 - plain[2] as i32 + 15, "...in its colour: {plain:?} {lit:?}");
+        assert!(i32::from(lit[0]) - i32::from(lit[2]) > i32::from(plain[0]) - i32::from(plain[2]) + 15, "...in its colour: {plain:?} {lit:?}");
 
         let texel = shot!(Shot { lightmap: [0, 0, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
         let vertex = shot!(Shot { aux: [0, 255, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
@@ -1914,8 +1914,8 @@ mod tests {
 
         let mut before: Vec<[u32; 3]> = indices.chunks(3).map(|t| [t[0], t[1], t[2]]).collect();
         let mut after: Vec<[u32; 3]> = out.chunks(3).map(|t| [t[0], t[1], t[2]]).collect();
-        before.sort();
-        after.sort();
+        before.sort_unstable();
+        after.sort_unstable();
         assert_eq!(before, after);
 
         assert_eq!(visible_ranges(&table, Mat4::IDENTITY, None, Some(CavePlanes::One)), vec![0..9]);

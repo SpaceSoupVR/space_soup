@@ -97,11 +97,11 @@ fn appkit_view(window: &impl HasWindowHandle) -> Option<&NSView> {
 }
 
 /// Applies [`MacosWindowChrome`] to a window created by any windowing crate
-/// that exposes a raw AppKit handle (winit, tao, ...).
+/// that exposes a raw `AppKit` handle (winit, tao, ...).
 ///
 /// Call once after the window exists, on the main thread. For vibrancy to
 /// show, create the window transparent and configure the wgpu surface with a
-/// non-opaque alpha mode. Returns `false` when the handle is not an AppKit
+/// non-opaque alpha mode. Returns `false` when the handle is not an `AppKit`
 /// window or this is not the main thread.
 pub fn configure_macos_window(
     window: &impl HasWindowHandle,
@@ -157,7 +157,7 @@ pub fn configure_macos_window(
 /// content view's `CAMetalLayer` and the blur covers the entire render.
 ///
 /// Call once after the window exists, on the main thread, with the window
-/// created transparent. Returns `false` when the handle is not an AppKit
+/// created transparent. Returns `false` when the handle is not an `AppKit`
 /// window or this is not the main thread.
 pub fn install_window_vibrancy(
     window: &impl HasWindowHandle,

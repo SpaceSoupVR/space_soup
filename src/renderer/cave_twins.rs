@@ -143,7 +143,7 @@ pub fn keeps_vertical(m: Mat4) -> bool {
 
 pub fn placed_box(m: Mat4, b: [[f32; 3]; 2]) -> (Vec3, Vec3) {
     (0..8).fold((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(lo, hi), i| {
-        let c = Vec3::new(b[(i & 1)][0], b[(i >> 1) & 1][1], b[(i >> 2) & 1][2]);
+        let c = Vec3::new(b[i & 1][0], b[(i >> 1) & 1][1], b[(i >> 2) & 1][2]);
         let p = m.transform_point3(c);
         (lo.min(p), hi.max(p))
     })
@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(ends, [6, 9, 12, 15]);
         let tris = |i: &[u32]| {
             let mut t: Vec<[u32; 3]> = i.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();
-            t.sort();
+            t.sort_unstable();
             t
         };
         assert_eq!(tris(&out), tris(&idx));
@@ -468,9 +468,7 @@ mod tests {
                 let pos: Vec<Vec3> = r.read_positions().unwrap().map(Vec3::from).collect();
                 let nor: Vec<Vec3> = r.read_normals().unwrap().map(Vec3::from).collect();
                 let g: Vec<f32> = r
-                    .read_tex_coords(1)
-                    .map(|t| t.into_f32().map(|u| u[0]).collect())
-                    .unwrap_or_else(|| vec![0.0; pos.len()]);
+                    .read_tex_coords(1).map_or_else(|| vec![0.0; pos.len()], |t| t.into_f32().map(|u| u[0]).collect());
                 let idx: Vec<u32> = r.read_indices().unwrap().into_u32().collect();
                 for t in idx.chunks_exact(3) {
                     let [a, b, c] = [t[0], t[1], t[2]].map(|i| i as usize);
@@ -478,7 +476,7 @@ mod tests {
                     if k == 3 && [g[a], g[b], g[c]].iter().any(|&z| z > 0.0) {
                         k = 4;
                     }
-                    area[k] += 0.5 * (pos[b] - pos[a]).cross(pos[c] - pos[a]).length() as f64;
+                    area[k] += 0.5 * f64::from((pos[b] - pos[a]).cross(pos[c] - pos[a]).length());
                     count[k] += 1;
                 }
             }

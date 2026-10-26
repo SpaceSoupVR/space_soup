@@ -1,14 +1,14 @@
 //! THE MODULES AN EFFECT IS BUILT FROM, as an author sees them: by stage, with
 //! physical names and units, defaults the format accepts, and what each costs
-//! and scales with. The set is the format's (`effect_asset`: SpawnModule,
-//! InitModule, UpdateModule, RenderModule, EventModule); a module is offered
+//! and scales with. The set is the format's (`effect_asset`: `SpawnModule`,
+//! `InitModule`, `UpdateModule`, `RenderModule`, `EventModule`); a module is offered
 //! only in its own stage, and the validator (`authoring::check_json`) is the
 //! judge of the rest.
 //!
 //! An author never sees slots, periods, uniform indices or instance fields.
 //! The required modules -- a spawn, a life, a sprite, a placement and a
 //! motion -- are in every new emitter and can be changed but not removed:
-//! every effect writes SpaceWarp motion vectors, and `none` takes a reason.
+//! every effect writes `SpaceWarp` motion vectors, and `none` takes a reason.
 //!
 //! Editors work on the asset as JSON (`serde_json::Value`), so a field the
 //! format adds later survives an edit it does not understand.
@@ -61,7 +61,7 @@ pub enum Kind {
     Bool,
     Enum(&'static [&'static str]),
     /// A number, or how one is drawn: range, uniform, lognormal, squared,
-    /// log_squared, or a curve over its life or its seed.
+    /// `log_squared`, or a curve over its life or its seed.
     Value,
     /// `one_frame`, or a [`Kind::Value`] in seconds.
     Life,

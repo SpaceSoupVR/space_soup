@@ -110,8 +110,8 @@ impl MudBody {
         let (mut wading, mut prints) = (0, 0);
         for (id, p) in walkers {
             let weight = self.weight_at(splat, mud_layer, p.x, p.z);
-            wading += (weight >= spacesoup_graphics::mud::MUD_WEIGHT_FLOOR) as u32;
-            prints += self.walkers.step(&mut self.map, *id, [p.x, p.z], weight) as u32;
+            wading += u32::from(weight >= spacesoup_graphics::mud::MUD_WEIGHT_FLOOR);
+            prints += u32::from(self.walkers.step(&mut self.map, *id, [p.x, p.z], weight));
         }
         self.walkers.forget_absent(&present);
         (wading, prints)
@@ -163,7 +163,7 @@ impl MudBody {
         let ix = ((u * s.width as f32) as u32).min(s.width - 1);
         let iz = ((v * s.height as f32) as u32).min(s.height - 1);
         let k = ((iz * s.width + ix) * 4) as usize;
-        let w: [f32; 4] = std::array::from_fn(|c| s.rgba[k + c] as f32);
+        let w: [f32; 4] = std::array::from_fn(|c| f32::from(s.rgba[k + c]));
         let total: f32 = w.iter().sum();
         if total <= 0.0 {
             return 0.0;

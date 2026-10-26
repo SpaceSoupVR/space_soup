@@ -1126,7 +1126,7 @@ impl ShadowMap {
             pass.set_viewport(col as f32 * d, row as f32 * d, d, d, 0.0, 1.0);
             if self.tile_scissor.get() {
                 let t = self.spot_tile_dim;
-                pass.set_scissor_rect(col as u32 * t, row as u32 * t, t, t);
+                pass.set_scissor_rect(col * t, row * t, t, t);
             }
 
             let planes = frustum_planes(view_proj[layer]);
@@ -1454,7 +1454,7 @@ impl ShadowMap {
     }
 }
 
-const SHADOW_SHADER: &str = r#"
+const SHADOW_SHADER: &str = r"
 struct LightMatrix { view_proj: mat4x4<f32> }
 @group(0) @binding(0) var<uniform> light: LightMatrix;
 
@@ -1495,7 +1495,7 @@ fn vs_skinned(
 fn vs_posed(@location(0) skinned: vec4<f32>) -> @builtin(position) vec4<f32> {
     return light.view_proj * model_u.model * skinned;
 }
-"#;
+";
 
 #[cfg(test)]
 mod atlas_tests {
@@ -1923,8 +1923,7 @@ mod render_tests {
 
         let sun = scene.lights.iter().find(|l| l.kind == LightKind::Directional);
         let sun_view_proj = sun
-            .map(|l| directional_light_matrix(l.direction, Vec3::ZERO, 20.0))
-            .unwrap_or(Mat4::IDENTITY);
+            .map_or(Mat4::IDENTITY, |l| directional_light_matrix(l.direction, Vec3::ZERO, 20.0));
 
         let spot_matrices: Vec<SpotShadowMatrices> = spot_indices
             .iter()
@@ -2046,7 +2045,7 @@ mod render_tests {
         let depth_view = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("recv_readback"),
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -2203,16 +2202,16 @@ mod render_tests {
             character_lamp: tile,
             ..base()
         };
-        let Some(shadowed) = shade_receiver(scene(vec![lamp.clone()], Some(0))) else {
+        let Some(shadowed) = shade_receiver(scene(vec![lamp], Some(0))) else {
             eprintln!("skipping: no GPU adapter available");
             return;
         };
-        let open = shade_receiver(scene(vec![lamp.clone()], None)).unwrap();
+        let open = shade_receiver(scene(vec![lamp], None)).unwrap();
         let dark = shade_receiver(scene(Vec::new(), None)).unwrap();
         eprintln!("through the characters' tile {shadowed:?}, without it {open:?}, no lamp {dark:?}");
-        assert!(open[0] as i32 - dark[0] as i32 > 40, "the lamp does not light the receiver measurably: {open:?} vs {dark:?}");
+        assert!(i32::from(open[0]) - i32::from(dark[0]) > 40, "the lamp does not light the receiver measurably: {open:?} vs {dark:?}");
         assert!(
-            (shadowed[0] as i32 - dark[0] as i32).abs() <= 2,
+            (i32::from(shadowed[0]) - i32::from(dark[0])).abs() <= 2,
             "the characters' tile let the lamp's light through: {shadowed:?}, dark {dark:?}, open {open:?}",
         );
     }
@@ -2244,7 +2243,7 @@ mod render_tests {
             ..base()
         });
         assert!(
-            (lit[0] as i32) - (shaded[0] as i32) > 8,
+            i32::from(lit[0]) - i32::from(shaded[0]) > 8,
             "a spot cast no shadow: {lit:?} lit vs {shaded:?} with a caster between",
         );
     }
@@ -2253,14 +2252,14 @@ mod render_tests {
     fn a_second_spot_light_also_casts_a_shadow() {
 
         let dim = spot_above(-4.0, 0.0);
-        let lit = shot!(Scene { lights: vec![dim.clone(), spot_above(0.0, 4.0)], ..base() });
+        let lit = shot!(Scene { lights: vec![dim, spot_above(0.0, 4.0)], ..base() });
         let shaded = shot!(Scene {
             lights: vec![dim, spot_above(0.0, 4.0)],
             caster: Some(ground(3.0, 8.0)),
             ..base()
         });
         assert!(
-            (lit[0] as i32) - (shaded[0] as i32) > 8,
+            i32::from(lit[0]) - i32::from(shaded[0]) > 8,
             "the SECOND spot cast no shadow: {lit:?} lit vs {shaded:?} with a caster between",
         );
     }
@@ -2268,7 +2267,7 @@ mod render_tests {
     #[test]
     fn a_spot_beyond_the_budget_still_lights_without_shadowing() {
 
-        let mut lights: Vec<Light> = (0..MAX_SPOT_SHADOWS + 1)
+        let mut lights: Vec<Light> = (0..=MAX_SPOT_SHADOWS)
             .map(|i| spot_above(-8.0 + i as f32, 0.0))
             .collect();
         *lights.last_mut().unwrap() = spot_above(0.0, 4.0);
@@ -2276,7 +2275,7 @@ mod render_tests {
         let with_extra = shot!(Scene { lights: lights.clone(), ..base() });
         let alone = shot!(Scene { lights: vec![spot_above(0.0, 4.0)], ..base() });
         assert!(
-            (with_extra[0] as i32 - alone[0] as i32).abs() < 6,
+            (i32::from(with_extra[0]) - i32::from(alone[0])).abs() < 6,
             "the light past the shadow budget stopped lighting: {with_extra:?} vs {alone:?}",
         );
     }
@@ -2286,7 +2285,7 @@ mod render_tests {
         let lit = shot!(base());
         let unlit = shot!(Scene { lights: vec![], ..base() });
         assert!(
-            lit[0] as i32 - unlit[0] as i32 > 8,
+            i32::from(lit[0]) - i32::from(unlit[0]) > 8,
             "a directional light contributed nothing: {lit:?} vs ambient {unlit:?}",
         );
     }
@@ -2298,7 +2297,7 @@ mod render_tests {
         let far = shot!(Scene { receiver_at: Vec3::new(0.0, 500.0, 0.0), ..base() });
         for c in 0..3 {
             assert!(
-                (near[c] as i32 - far[c] as i32).abs() <= 2,
+                (i32::from(near[c]) - i32::from(far[c])).abs() <= 2,
                 "the sun attenuated with distance: {near:?} at the origin vs {far:?} at y=500",
             );
         }
@@ -2313,7 +2312,7 @@ mod render_tests {
             ..base()
         });
         assert!(
-            clear[0] as i32 - shaded[0] as i32 > 8,
+            i32::from(clear[0]) - i32::from(shaded[0]) > 8,
             "a slab three metres overhead cast no shadow: {clear:?} lit vs {shaded:?} shadowed",
         );
     }
@@ -2359,7 +2358,7 @@ mod render_tests {
         let ambient_only = shot!(Scene { lights: vec![], ..base() });
         for c in 0..3 {
             assert!(
-                (shaded[c] as i32 - ambient_only[c] as i32).abs() <= 3,
+                (i32::from(shaded[c]) - i32::from(ambient_only[c])).abs() <= 3,
                 "a shadowed fragment is not at ambient: {shaded:?} vs {ambient_only:?}",
             );
         }
@@ -2372,7 +2371,7 @@ mod render_tests {
         let beside = shot!(Scene { receiver_at: Vec3::new(300.0, 0.0, 0.0), ..base() });
         for c in 0..3 {
             assert!(
-                (inside[c] as i32 - beside[c] as i32).abs() <= 2,
+                (i32::from(inside[c]) - i32::from(beside[c])).abs() <= 2,
                 "off the side of the shadow map went dark: {inside:?} vs {beside:?}",
             );
         }
@@ -2405,14 +2404,11 @@ mod render_tests {
         for (intensity, distance, expected) in
             [(1.0f32, 5.0f32, 0.6399f32), (3.0, 5.0, 0.7196), (10.0, 5.0, 0.9987), (0.2, 0.85, 0.8768)]
         {
-            let px = match at(intensity, distance) {
-                Some(px) => px,
-                None => {
-                    eprintln!("skipping: no GPU adapter available");
-                    return;
-                }
+            let px = if let Some(px) = at(intensity, distance) { px } else {
+                eprintln!("skipping: no GPU adapter available");
+                return;
             };
-            let got = px[0] as f32 / 255.0;
+            let got = f32::from(px[0]) / 255.0;
             assert!(
                 (got - expected).abs() < 0.01,
                 "intensity {intensity} at {distance}m: shader gave {got:.4}, the editor \
@@ -2435,7 +2431,7 @@ mod render_tests {
         let open = shade_receiver(Scene { sky_sun_dynamic: true, ..base() }).unwrap();
         eprintln!("under a moving caster {shadowed:?}, in the open {open:?}");
         assert!(
-            (open[1] as i32) - (shadowed[1] as i32) > 20,
+            i32::from(open[1]) - i32::from(shadowed[1]) > 20,
             "a moving object cast no sun shadow: {shadowed:?} vs {open:?}",
         );
     }
@@ -2484,17 +2480,17 @@ mod render_tests {
              shadowed {dark_near:?} / {dark_wide:?}",
         );
         assert!(
-            (lit_near[1] as i32 - lit_wide[1] as i32).abs() <= 1 && (dark_near[1] as i32 - dark_wide[1] as i32).abs() <= 1,
+            (i32::from(lit_near[1]) - i32::from(lit_wide[1])).abs() <= 1 && (i32::from(dark_near[1]) - i32::from(dark_wide[1])).abs() <= 1,
             "the two places are not lit alike: lit {lit_near:?} / {lit_wide:?}, shadowed {dark_near:?} / {dark_wide:?}",
         );
-        let range = lit_wide[1] as i32 - dark_wide[1] as i32;
+        let range = i32::from(lit_wide[1]) - i32::from(dark_wide[1]);
         assert!(
             range > 40,
             "too little sun to measure a penumbra by: {range}"
         );
 
-        let lost_wide = lit_wide[1] as i32 - wide[1] as i32;
-        let lost_near = lit_near[1] as i32 - near[1] as i32;
+        let lost_wide = i32::from(lit_wide[1]) - i32::from(wide[1]);
+        let lost_near = i32::from(lit_near[1]) - i32::from(near[1]);
         assert!(
             lost_wide * 10 > range && lost_near * 4 < lost_wide,
             "the middle of the box was not read from the near tile: lost {lost_near} there and {lost_wide} \
@@ -2601,7 +2597,7 @@ mod render_tests {
             ..base()
         });
         assert!(
-            toward[0] as i32 - away[0] as i32 > 20,
+            i32::from(toward[0]) - i32::from(away[0]) > 20,
             "the ambient did not follow the normal: facing the bright half gave \
              {toward:?}, facing away gave {away:?}",
         );
@@ -2641,7 +2637,7 @@ mod render_tests {
             let want = irr.evaluate(normal);
             for c in 0..3 {
 
-                let got = px[c] as f32 / 255.0;
+                let got = f32::from(px[c]) / 255.0;
                 assert!(
                     (got - want[c]).abs() < 0.012,
                     "normal {normal:?} channel {c}: the shader rendered {got:.4} \
@@ -2661,14 +2657,14 @@ mod render_tests {
         for (a, b) in [(up, side), (up, down)] {
             for c in 0..3 {
                 assert!(
-                    (a[c] as i32 - b[c] as i32).abs() <= 1,
+                    (i32::from(a[c]) - i32::from(b[c])).abs() <= 1,
                     "flat ambient is no longer flat: {a:?} vs {b:?}",
                 );
             }
         }
         let ambient = (crate::renderer::sky::AMBIENT * 255.0).round() as i32;
         assert!(
-            (up[0] as i32 - ambient).abs() <= 2,
+            (i32::from(up[0]) - ambient).abs() <= 2,
             "ambient came out {} rather than {ambient}",
             up[0],
         );
@@ -2680,7 +2676,7 @@ mod render_tests {
         let overhead = shot!(Scene { eye_offset: Vec3::new(0.0, 5.0, 0.0), ..base() });
         let oblique = shot!(Scene { eye_offset: Vec3::new(50.0, 0.5, 0.0), ..base() });
         assert!(
-            overhead[0] as i32 - oblique[0] as i32 > 4,
+            i32::from(overhead[0]) - i32::from(oblique[0]) > 4,
             "the specular highlight did not follow the eye: {overhead:?} vs {oblique:?}",
         );
     }
@@ -2700,8 +2696,7 @@ mod render_tests {
                 let transmissive = prim
                     .material()
                     .transmission()
-                    .map(|t| t.transmission_factor())
-                    .unwrap_or(0.0)
+                    .map_or(0.0, |t| t.transmission_factor())
                     > 0.5;
                 if transmissive && !include_transmissive {
                     continue;
@@ -2784,7 +2779,7 @@ mod render_tests {
             "the rig itself does not light the floor ({open:?}); nothing below this means anything",
         );
         assert!(
-            (open[0] as i32) - (full[0] as i32) < 16,
+            i32::from(open[0]) - i32::from(full[0]) < 16,
             "the fixture is shadowing its own bulb: floor at {full:?} against {open:?} with \
              nothing casting. Check the spot shadow near plane against the size of the \
              fixture -- if the near plane has come inside the housing, every lamp in the \
@@ -2836,16 +2831,16 @@ mod render_tests {
             "TORCH HAND: unlit {unlit:?}  open {open:?}  fixture's near plane {as_a_fixture:?}  torch's {as_a_torch:?}"
         );
         assert!(
-            open[0] as i32 > unlit[0] as i32 + 20,
+            i32::from(open[0]) > i32::from(unlit[0]) + 20,
             "the torch does not light the floor ({open:?} against {unlit:?}); nothing below means anything",
         );
         assert!(
-            (as_a_fixture[0] as i32 - open[0] as i32).abs() <= 3,
+            (i32::from(as_a_fixture[0]) - i32::from(open[0])).abs() <= 3,
             "with a fixture's near plane the hand 10 cm from the glass should be clipped out of \
              the map ({as_a_fixture:?} against {open:?}) -- the reason the torch has its own",
         );
         assert!(
-            (as_a_torch[0] as i32 - unlit[0] as i32).abs() <= 3,
+            (i32::from(as_a_torch[0]) - i32::from(unlit[0])).abs() <= 3,
             "the hand before the torch does not shadow the floor: {as_a_torch:?}, unlit {unlit:?}, open {open:?}",
         );
     }
@@ -2861,14 +2856,14 @@ mod render_tests {
         eprintln!(
             "TORCH BIAS: unlit {unlit:?}  open {open:?}  plate 4 cm up {low_plate:?}  floor in its own map {itself:?}"
         );
-        assert!(open[0] as i32 > unlit[0] as i32 + 20, "the torch does not light the floor ({open:?} against {unlit:?})");
+        assert!(i32::from(open[0]) > i32::from(unlit[0]) + 20, "the torch does not light the floor ({open:?} against {unlit:?})");
         assert!(
-            (low_plate[0] as i32 - unlit[0] as i32).abs() <= 3,
+            (i32::from(low_plate[0]) - i32::from(unlit[0])).abs() <= 3,
             "a plate 4 cm off the floor casts nothing at 2.5 m: the lookup bias is not in texels \
              ({low_plate:?}, unlit {unlit:?}, open {open:?})",
         );
         assert!(
-            (open[0] as i32 - itself[0] as i32) <= 3,
+            (i32::from(open[0]) - i32::from(itself[0])) <= 3,
             "the floor shadows itself under the torch -- acne ({itself:?} against {open:?})",
         );
     }
@@ -2895,13 +2890,13 @@ mod render_tests {
         let disc = shot!(floor(patch(0.05, 1.0)));
         let point = shot!(floor(patch(0.05, 0.0)));
         eprintln!("PATCH: unlit {unlit:?}  bulb 1 m up {bulb:?}  metre-wide patch 5 cm up {disc:?}  point 5 cm up {point:?}");
-        assert!(bulb[0] as i32 > unlit[0] as i32 + 20, "the bulb does not light the floor ({bulb:?} against {unlit:?})");
+        assert!(i32::from(bulb[0]) > i32::from(unlit[0]) + 20, "the bulb does not light the floor ({bulb:?} against {unlit:?})");
         assert!(
-            (disc[0] as i32 - bulb[0] as i32).abs() <= 2,
+            (i32::from(disc[0]) - i32::from(bulb[0])).abs() <= 2,
             "a metre-wide patch 5 cm up lights the floor to {disc:?}, a bulb a metre up to {bulb:?}",
         );
         assert!(
-            point[0] as i32 > bulb[0] as i32 + 40,
+            i32::from(point[0]) > i32::from(bulb[0]) + 40,
             "a point 5 cm up lights the floor to {point:?}, no more than the bulb's {bulb:?}: \
              nothing above shows the radius doing anything",
         );
@@ -2919,11 +2914,11 @@ mod render_tests {
             let shaded = shot!(floor(lamp(), hand()));
             eprintln!("TORCH REACH {height} m: unlit {unlit:?}  open {open:?}  hand {shaded:?}");
             assert!(
-                open[0] as i32 > unlit[0] as i32 + 20,
+                i32::from(open[0]) > i32::from(unlit[0]) + 20,
                 "the torch does not light the floor {height} m below ({open:?} against {unlit:?})",
             );
             assert!(
-                (shaded[0] as i32 - unlit[0] as i32).abs() <= 3,
+                (i32::from(shaded[0]) - i32::from(unlit[0])).abs() <= 3,
                 "the hand 10 cm before the glass does not shadow the floor {height} m below: \
                  {shaded:?}, unlit {unlit:?}, open {open:?}",
             );
@@ -3033,10 +3028,10 @@ mod render_tests {
                     if shadowed { "SHADOW" } else { "lit   " },
                     unlit[0], open[0], lit[0]
                 );
-                assert!(open[0] as i32 > unlit[0] as i32 + 8, "the torch does not reach ({x}, {z}): {open:?} against {unlit:?}");
+                assert!(i32::from(open[0]) > i32::from(unlit[0]) + 8, "the torch does not reach ({x}, {z}): {open:?} against {unlit:?}");
                 let want = if shadowed { unlit } else { open };
                 assert!(
-                    (lit[0] as i32 - want[0] as i32).abs() <= 3,
+                    (i32::from(lit[0]) - i32::from(want[0])).abs() <= 3,
                     "ceiling ({x}, {z}) is {} by the rays but reads {lit:?} (open {open:?}, unlit {unlit:?})",
                     if shadowed { "in the pillar's shadow" } else { "lit" },
                 );
@@ -3166,11 +3161,11 @@ mod spot_near_plane_tests {
 
         let (mut lo, mut hi) = (0.001f32, range.max(0.2));
         for _ in 0..60 {
-            let mid = 0.5 * (lo + hi);
+            let mid = f32::midpoint(lo, hi);
             let c: Vec4 = m * Vec4::new(0.0, 0.0, -mid, 1.0);
             if c.w <= 0.0 || c.z / c.w < 0.0 { lo = mid } else { hi = mid }
         }
-        0.5 * (lo + hi)
+        f32::midpoint(lo, hi)
     }
 
     #[test]

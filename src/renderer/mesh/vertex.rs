@@ -27,7 +27,7 @@ impl MeshVertex {
     pub const WHOLE_ATLAS: [u16; 4] = [0, 0, u16::MAX, u16::MAX];
 
     pub fn uv2_rect_of(uv2: [[f32; 2]; 3]) -> [u16; 4] {
-        let s = u16::MAX as f32;
+        let s = f32::from(u16::MAX);
         let lo = |k: usize| (uv2.iter().map(|c| c[k]).fold(f32::MAX, f32::min).clamp(0.0, 1.0) * s).floor() as u16;
         let hi = |k: usize| (uv2.iter().map(|c| c[k]).fold(f32::MIN, f32::max).clamp(0.0, 1.0) * s).ceil() as u16;
         [lo(0), lo(1), hi(0), hi(1)]

@@ -91,7 +91,7 @@ pub struct TerrainPipeline {
     pub material_layout: BindGroupLayout,
 }
 
-const RELIEF_WGSL: &str = r#"
+const RELIEF_WGSL: &str = r"
 fn layers_height(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, layer: i32) -> f32 {
     let r = max(mat.repeat[layer], 0.001);
     return textureSampleGrad(ao_tex, layer_samp, uv / r, layer, ddx / r, ddy / r).g;
@@ -140,7 +140,7 @@ fn parallax_shift(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, w: vec4<f32>, e
 const PARALLAX_NEAR_M: f32 = 18.0;
 const PARALLAX_FAR_M: f32 = 30.0;
 
-"#;
+";
 
 pub fn with_relief(src: &str) -> Option<String> {
     let call = "    let f = sample_frame(in.tex_pos, n, step_x, step_y, to_player_direction(shape.face), shape.shaped);\n";
@@ -262,7 +262,7 @@ impl TerrainPipeline {
         let (edit, only) = edit.split_once('@').map_or((edit, None), |(e, c)| (e, Some(c)));
         let shipped = terrain_shader_for(TerrainRole::Read);
         let edited = crate::renderer::brush_pipeline::with_reader_edit(shipped.clone(), edit)?;
-        let class = |name: &str| if only.map_or(true, |c| c == name) { edited.clone() } else { shipped.clone() };
+        let class = |name: &str| if only.is_none_or(|c| c == name) { edited.clone() } else { shipped.clone() };
         let baked = |s: String| crate::renderer::brush_pipeline::sun_reader_shader(s, crate::renderer::brush_pipeline::FaceSun::Baked);
         let spotless = crate::renderer::lights::without_spot_shadows;
         let build = |source: String, label: &str| {
@@ -520,7 +520,7 @@ impl TerrainPipeline {
     ) -> Option<Self> {
         let (label, edits) = PROBE_PASS_REGISTER_CUTS.iter().find(|(label, _)| *label == cut)?;
         let mut src = terrain_shader_for(TerrainRole::ProbePass);
-        for (from, to) in edits.iter() {
+        for (from, to) in *edits {
             if !src.contains(from) {
                 return None;
             }
@@ -551,7 +551,7 @@ impl TerrainPipeline {
                 log::warn!("register cut {label}: `{from}` is not in the shader");
                 continue;
             }
-            for (from, to) in edits.iter() {
+            for (from, to) in *edits {
                 src = src.replacen(from, to, 1);
             }
             let _ = Self::build_from(
@@ -763,7 +763,8 @@ impl TerrainPipeline {
         let scene_target = [Some(ColorTargetState { format, blend, write_mask: ColorWrites::ALL })];
         let targets: &[Option<ColorTargetState>] =
             if role == TerrainRole::ProbePass { &probe_targets } else { &scene_target };
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        
+        device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
@@ -797,8 +798,7 @@ impl TerrainPipeline {
             multisample: MultisampleState { count: samples, ..Default::default() },
             multiview_mask: view.mask(),
             cache: None,
-        });
-        pipeline
+        })
     }
 }
 
@@ -935,7 +935,7 @@ fn half_of_int(n: i32) -> u16 {
     }
     let sign = if n < 0 { 0x8000 } else { 0 };
     let m = n.unsigned_abs();
-    let e = 31 - m.leading_zeros();
+    let e = m.ilog2();
     sign | (((e + 15) as u16) << 10) | ((if e >= 10 { m >> (e - 10) } else { m << (10 - e) } & 0x3ff) as u16)
 }
 
@@ -943,14 +943,14 @@ fn half_of_int(n: i32) -> u16 {
 /// bytes, `width` x `height` row-major.
 pub fn deform_rows(bytes: &[u8], width: u32, height: u32, from: u32, to: u32) -> Vec<u16> {
     let (w, h) = (width as usize, height as usize);
-    let at = |x: usize, z: usize| bytes[2 * (z * w + x)] as i32;
+    let at = |x: usize, z: usize| i32::from(bytes[2 * (z * w + x)]);
     let mut out = Vec::with_capacity(4 * w * (to - from) as usize);
     for z in from as usize..to as usize {
         for x in 0..w {
             let i = 2 * (z * w + x);
             let dx = at((x + 1) % w, z) - at((x + w - 1) % w, z);
             let dz = at(x, (z + 1) % h) - at(x, (z + h - 1) % h);
-            out.extend([half_of_int(bytes[i] as i32), half_of_int(bytes[i + 1] as i32), half_of_int(dx), half_of_int(dz)]);
+            out.extend([half_of_int(i32::from(bytes[i])), half_of_int(i32::from(bytes[i + 1])), half_of_int(dx), half_of_int(dz)]);
         }
     }
     out
@@ -1083,14 +1083,8 @@ pub fn terrain_shader_built(role: TerrainRole, painted: bool) -> String {
 
 pub fn terrain_shader_built_mud(role: TerrainRole, painted: bool, muddy: bool) -> String {
     let src = terrain_shader();
-    let src = match muddy {
-        true => src,
-        false => deformless(&src).expect("the ground's deform reads are not where `deformless` takes them out"),
-    };
-    let src = match painted {
-        true => painted_shader(&src).unwrap_or(src),
-        false => src,
-    };
+    let src = if muddy { src } else { deformless(&src).expect("the ground's deform reads are not where `deformless` takes them out") };
+    let src = if painted { painted_shader(&src).unwrap_or(src) } else { src };
     if role == TerrainRole::Scene {
         return src;
     }
@@ -1258,7 +1252,7 @@ pub fn material_bind_group_layout(device: &Device) -> BindGroupLayout {
 
 fn terrain_shader() -> String {
     format!(
-        r#"
+        r"
 @group(1) @binding(0) var layer_tex: texture_2d_array<f32>;
 @group(1) @binding(1) var layer_samp: sampler;
 @group(1) @binding(2) var macro_tex: texture_2d<f32>;
@@ -1691,7 +1685,7 @@ fn layer_weights(uv: vec2<f32>, world_y: f32, slope_deg: f32) -> vec4<f32> {{
     );
     return vec4<f32>(tonemap(in.col.rgb * lit), 1.0);
 }}
-"#,
+",
         lights_block = terrain_lights_block(crate::renderer::lights::LightsBlockOptions::default()),
         sea_line = SEA_LINE_WGSL,
         sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
@@ -1897,7 +1891,7 @@ pub(crate) mod tests {
             &crate::renderer::uniforms::ShadowUpload::disabled(),
             &crate::renderer::uniforms::SkyUpload::none(),
             &crate::renderer::uniforms::PostUpload::default(),
-            &crate::renderer::uniforms::PlayerUpload { yaw, offset, ..Default::default() },
+            &crate::renderer::uniforms::PlayerUpload { offset, yaw, ..Default::default() },
         );
         if lit {
 
@@ -1996,7 +1990,7 @@ pub(crate) mod tests {
 
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("test_readback"),
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -2507,7 +2501,7 @@ pub(crate) mod tests {
         let base = terrain_shader_for(TerrainRole::ProbePass);
         for (label, edits) in PROBE_PASS_REGISTER_CUTS {
             let mut src = base.clone();
-            for (from, to) in edits.iter() {
+            for (from, to) in *edits {
                 assert!(src.contains(from), "{label}: `{from}` is not in the ground's probe pass");
 
                 assert_eq!(src.matches(from).count(), 1, "{label}: `{from}` is in the ground's probe pass more than once");
@@ -2708,9 +2702,9 @@ pub fn roughness_chain_with_normal_variance(
     let mut vecs: Vec<[f32; 3]> = (0..(w * h) as usize)
         .map(|i| {
             [
-                normal[i * 4] as f32 / 255.0 * 2.0 - 1.0,
-                normal[i * 4 + 1] as f32 / 255.0 * 2.0 - 1.0,
-                normal[i * 4 + 2] as f32 / 255.0 * 2.0 - 1.0,
+                f32::from(normal[i * 4]) / 255.0 * 2.0 - 1.0,
+                f32::from(normal[i * 4 + 1]) / 255.0 * 2.0 - 1.0,
+                f32::from(normal[i * 4 + 2]) / 255.0 * 2.0 - 1.0,
             ]
         })
         .collect();
@@ -2747,7 +2741,7 @@ pub fn roughness_chain_with_normal_variance(
             let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
             let sigma2 = if len > 1e-4 { (1.0 - len) / len } else { 1.0 };
             let kernel = (2.0 * sigma2).min(TERRAIN_NORMAL_VARIANCE_CLAMP);
-            let base = data[i * 4] as f32 / 255.0;
+            let base = f32::from(data[i * 4]) / 255.0;
             let filtered = (base * base + kernel).clamp(0.0, 1.0).sqrt();
             let byte = (filtered * 255.0).round().clamp(0.0, 255.0) as u8;
             data[i * 4] = byte;
@@ -2769,7 +2763,7 @@ pub fn mip_chain_linear(rgba: &[u8], w: u32, h: u32, levels: u32) -> Vec<(Vec<u8
                 for c in 0..4 {
                     let fetch = |sx: u32, sy: u32| -> f32 {
                         let i = ((sy.min(sh - 1) * sw + sx.min(sw - 1)) * 4 + c) as usize;
-                        src[i] as f32 / 255.0
+                        f32::from(src[i]) / 255.0
                     };
                     let (x0, y0) = (x * 2, y * 2);
                     let avg = (fetch(x0, y0) + fetch(x0 + 1, y0) + fetch(x0, y0 + 1)
@@ -2787,7 +2781,7 @@ pub fn mip_chain_linear(rgba: &[u8], w: u32, h: u32, levels: u32) -> Vec<(Vec<u8
 
 pub fn mip_chain(rgba: &[u8], w: u32, h: u32, levels: u32) -> Vec<(Vec<u8>, u32, u32)> {
     fn to_linear(c: u8) -> f32 {
-        let s = c as f32 / 255.0;
+        let s = f32::from(c) / 255.0;
         if s <= 0.040_45 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
     }
     fn to_srgb(l: f32) -> u8 {
@@ -2806,7 +2800,7 @@ pub fn mip_chain(rgba: &[u8], w: u32, h: u32, levels: u32) -> Vec<(Vec<u8>, u32,
 
                     let fetch = |sx: u32, sy: u32| -> f32 {
                         let i = ((sy.min(sh - 1) * sw + sx.min(sw - 1)) * 4 + c) as usize;
-                        if c == 3 { src[i] as f32 / 255.0 } else { to_linear(src[i]) }
+                        if c == 3 { f32::from(src[i]) / 255.0 } else { to_linear(src[i]) }
                     };
                     let (x0, y0) = (x * 2, y * 2);
                     let avg = (fetch(x0, y0) + fetch(x0 + 1, y0) + fetch(x0, y0 + 1)
@@ -3086,12 +3080,9 @@ impl TerrainMaterial {
         queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&settings));
 
         let flat_deform;
-        let deform_view = match deform {
-            Some(v) => v,
-            None => {
-                flat_deform = Self::flat_deform_view(device, queue);
-                &flat_deform
-            }
+        let deform_view = if let Some(v) = deform { v } else {
+            flat_deform = Self::flat_deform_view(device, queue);
+            &flat_deform
         };
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: Some("terrain_material"),
@@ -3350,7 +3341,7 @@ mod material_tests {
         };
         let cliff = render_quad_with_fallback_material([1.0, 0.05, 0.0]).unwrap();
 
-        let greenness = |p: [u8; 4]| p[1] as i32 - p[2] as i32;
+        let greenness = |p: [u8; 4]| i32::from(p[1]) - i32::from(p[2]);
         assert!(
             greenness(flat) > greenness(cliff) + 4 && greenness(flat) > 4,
             "flat ground should read greener than a cliff: flat {flat:?} cliff {cliff:?}",
@@ -3618,13 +3609,13 @@ impl AstcArray {
     /// The bytes one level of one layer holds.
     pub fn level_bytes(block: [u8; 2], width: u32, height: u32, level: u32) -> usize {
         let (w, h) = ((width >> level).max(1), (height >> level).max(1));
-        (w.div_ceil(block[0] as u32) * h.div_ceil(block[1] as u32) * 16) as usize
+        (w.div_ceil(u32::from(block[0])) * h.div_ceil(u32::from(block[1])) * 16) as usize
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(ASTC_MAGIC);
-        out.extend_from_slice(&[self.block[0], self.block[1], self.srgb as u8, 0]);
+        out.extend_from_slice(&[self.block[0], self.block[1], u8::from(self.srgb), 0]);
         for v in [self.width, self.height, self.levels, self.data.len() as u32] {
             out.extend_from_slice(&v.to_le_bytes());
         }
@@ -3781,7 +3772,7 @@ impl TerrainLayerArrays {
                 usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            let (bw, bh) = (a.block[0] as u32, a.block[1] as u32);
+            let (bw, bh) = (u32::from(a.block[0]), u32::from(a.block[1]));
             for (slot, chain) in a.data.iter().enumerate() {
                 for (level, data) in chain.iter().enumerate() {
                     let (w, h) = ((a.width >> level).max(1), (a.height >> level).max(1));
@@ -3841,7 +3832,7 @@ pub fn load_terrain_rough(dir: &std::path::Path) -> Vec<Option<TerrainImage>> {
             if let (Some(img), Some((lo, hi))) = (img.as_mut(), terrain_roughness_range(dir, layer)) {
                 for px in img.rgba.chunks_exact_mut(4) {
                     for c in &mut px[..3] {
-                        *c = ((lo + (*c as f32 / 255.0) * (hi - lo)).clamp(0.0, 1.0) * 255.0).round() as u8;
+                        *c = ((lo + (f32::from(*c) / 255.0) * (hi - lo)).clamp(0.0, 1.0) * 255.0).round() as u8;
                     }
                 }
                 log::info!("terrain: layer {layer}'s roughness read as {lo:.2}..{hi:.2}");
@@ -3911,35 +3902,35 @@ pub fn load_terrain_settings(dir: &std::path::Path) -> TerrainMaterialUniform {
     };
     if let Some(values) = raw.get("repeat").and_then(|r| r.as_array()) {
         for (i, slot) in out.repeat.iter_mut().enumerate() {
-            if let Some(v) = values.get(i).and_then(|v| v.as_f64()) {
+            if let Some(v) = values.get(i).and_then(serde_json::Value::as_f64) {
 
                 *slot = (v as f32).max(MIN_REPEAT);
             }
         }
     }
-    if let Some(v) = raw.get("normal_strength").and_then(|v| v.as_f64()) {
+    if let Some(v) = raw.get("normal_strength").and_then(serde_json::Value::as_f64) {
         out.normal_strength = (v as f32).clamp(0.0, 4.0);
     }
-    if let Some(v) = raw.get("parallax").and_then(|v| v.as_f64()) {
+    if let Some(v) = raw.get("parallax").and_then(serde_json::Value::as_f64) {
         out.parallax = (v as f32).clamp(0.0, 0.5);
     }
 
     for (key, into) in [("porosity", &mut out.porosity), ("film", &mut out.film)] {
         if let Some(values) = raw.get(key).and_then(|r| r.as_array()) {
             for (i, slot) in into.iter_mut().enumerate() {
-                if let Some(v) = values.get(i).and_then(|v| v.as_f64()) {
+                if let Some(v) = values.get(i).and_then(serde_json::Value::as_f64) {
                     *slot = (v as f32).clamp(0.0, 1.0);
                 }
             }
         }
     }
-    if let Some(v) = raw.get("mud_layer").and_then(|v| v.as_i64()) {
+    if let Some(v) = raw.get("mud_layer").and_then(serde_json::Value::as_i64) {
         out.mud_layer = if (0..4).contains(&v) { v as f32 } else { -1.0 };
     }
-    if let Some(v) = raw.get("deform").and_then(|v| v.as_f64()) {
+    if let Some(v) = raw.get("deform").and_then(serde_json::Value::as_f64) {
         out.deform_metres = (v as f32).clamp(0.0, 0.5);
     }
-    if let Some(v) = raw.get("wet_dark").and_then(|v| v.as_f64()) {
+    if let Some(v) = raw.get("wet_dark").and_then(serde_json::Value::as_f64) {
         out.wet_dark = (v as f32).clamp(0.0, 1.0);
     }
     out
@@ -3974,9 +3965,9 @@ pub(crate) fn solid_image(rgb: [u8; 3], width: u32, height: u32) -> TerrainImage
 pub(crate) fn resample(src: &TerrainImage, width: u32, height: u32) -> TerrainImage {
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height {
-        let sy = (y as u64 * src.height as u64 / height.max(1) as u64) as u32;
+        let sy = (u64::from(y) * u64::from(src.height) / u64::from(height.max(1))) as u32;
         for x in 0..width {
-            let sx = (x as u64 * src.width as u64 / width.max(1) as u64) as u32;
+            let sx = (u64::from(x) * u64::from(src.width) / u64::from(width.max(1))) as u32;
             let at = ((sy.min(src.height - 1) * src.width + sx.min(src.width - 1)) * 4) as usize;
             rgba.extend_from_slice(&src.rgba[at..at + 4]);
         }
@@ -4170,7 +4161,7 @@ mod normal_map_tests {
     }
 
     fn brightness(px: [u8; 4]) -> u32 {
-        px[0] as u32 + px[1] as u32 + px[2] as u32
+        u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2])
     }
 
     #[test]
@@ -4322,7 +4313,7 @@ mod normal_map_tests {
     #[test]
     fn the_flat_normal_texel_unpacks_to_straight_out() {
 
-        let unpack = |v: u8| (v as f32 / 255.0) * 2.0 - 1.0;
+        let unpack = |v: u8| (f32::from(v) / 255.0) * 2.0 - 1.0;
         assert!(unpack(FLAT_NORMAL[0]).abs() < 0.01);
         assert!(unpack(FLAT_NORMAL[1]).abs() < 0.01);
         assert!((unpack(FLAT_NORMAL[2]) - 1.0).abs() < 0.01);
@@ -4447,7 +4438,7 @@ mod terrain_mip_tests {
         grey.save(dir.join("rock_r.jpg")).unwrap();
         grey.save(dir.join("ground_r.jpg")).unwrap();
         let maps = super::load_terrain_rough(&dir);
-        let read = |m: &Option<super::TerrainImage>| m.as_ref().unwrap().rgba[0] as f32 / 255.0;
+        let read = |m: &Option<super::TerrainImage>| f32::from(m.as_ref().unwrap().rgba[0]) / 255.0;
         assert!((read(&maps[1]) - 0.73).abs() < 0.02, "rock read as {}", read(&maps[1]));
         assert!((read(&maps[0]) - 0.4).abs() < 0.02, "grass read as {}", read(&maps[0]));
         let _ = std::fs::remove_dir_all(&game);
@@ -4462,7 +4453,7 @@ mod terrain_mip_tests {
         };
         let mut v: Vec<u8> = rock.rgba.chunks_exact(4).map(|p| p[0]).collect();
         v.sort_unstable();
-        let median = v[v.len() / 2] as f32 / 255.0;
+        let median = f32::from(v[v.len() / 2]) / 255.0;
         assert!(median > 0.7, "the cliffs' rock reads at a median roughness of {median}: wet stone");
     }
 
@@ -4486,7 +4477,7 @@ mod terrain_mip_tests {
             assert_eq!(data.len(), (w * h * 4) as usize);
             for b in data {
                 assert!(
-                    (*b as i32 - 128).abs() <= 1,
+                    (i32::from(*b) - 128).abs() <= 1,
                     "a flat 128 became {b}; the linear chain is bending values",
                 );
             }
@@ -4528,7 +4519,7 @@ mod steep_shapes_frame {
                 n[v] += c;
             }
         }
-        Mesh { p, n: n.into_iter().map(|v| v.normalize()).collect(), tris }
+        Mesh { p, n: n.into_iter().map(glam::Vec3::normalize).collect(), tris }
     }
 
     fn shapes() -> Vec<(&'static str, Mesh)> {
@@ -4697,7 +4688,7 @@ mod relief_tests {
             assert!(!src.contains("parallax_shift"), "{role:?} carries the relief march");
             let (plain, shaped) = twin_sources(src);
             assert!(!plain.contains("parallax_shift"));
-            assert!(shaped.map_or(true, |s| !s.contains("parallax_shift")));
+            assert!(shaped.is_none_or(|s| !s.contains("parallax_shift")));
         }
         let desktop = with_relief(&terrain_shader_for(TerrainRole::Scene)).expect("the scene reader takes the relief");
         assert_eq!(desktop.matches("fn parallax_shift(").count(), 1);
@@ -4719,8 +4710,8 @@ mod mud_build_tests {
 
     fn half_to_f32(h: u16) -> f32 {
         let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-        let e = ((h >> 10) & 0x1f) as i32;
-        let m = (h & 0x3ff) as f32;
+        let e = i32::from((h >> 10) & 0x1f);
+        let m = f32::from(h & 0x3ff);
         match e {
             0 => sign * m * 2f32.powi(-24),
             _ => sign * (1.0 + m / 1024.0) * 2f32.powi(e - 15),
@@ -4842,8 +4833,8 @@ mod mud_build_tests {
             ..Default::default()
         });
         const N: u32 = 4096;
-        let out = device.create_buffer(&BufferDescriptor { label: None, size: N as u64 * 32, usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
-        let read = device.create_buffer(&BufferDescriptor { label: None, size: N as u64 * 32, usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST, mapped_at_creation: false });
+        let out = device.create_buffer(&BufferDescriptor { label: None, size: u64::from(N) * 32, usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read = device.create_buffer(&BufferDescriptor { label: None, size: u64::from(N) * 32, usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST, mapped_at_creation: false });
         let src = format!(
             "
 @group(0) @binding(0) var old_map: texture_2d<f32>;
@@ -4891,7 +4882,7 @@ mod mud_build_tests {
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(N / 64, 1, 1);
         }
-        enc.copy_buffer_to_buffer(&out, 0, &read, 0, N as u64 * 32);
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, u64::from(N) * 32);
         queue.submit([enc.finish()]);
         let slice = read.slice(..);
         slice.map_async(MapMode::Read, |_| {});
@@ -4899,23 +4890,23 @@ mod mud_build_tests {
         let data = slice.get_mapped_range().unwrap();
         let rows: &[[f32; 4]] = bytemuck::cast_slice(&data);
         // The exact answer: bilinear heights, wrapping, a texel either side.
-        let height = |x: i64, z: i64| bytes[2 * (z.rem_euclid(h as i64) as usize * w as usize + x.rem_euclid(w as i64) as usize)] as f64 / 255.0;
+        let height = |x: i64, z: i64| f64::from(bytes[2 * (z.rem_euclid(i64::from(h)) as usize * w as usize + x.rem_euclid(i64::from(w)) as usize)]) / 255.0;
         let bilinear = |u: f64, v: f64| {
-            let (x, z) = (u * w as f64 - 0.5, v * h as f64 - 0.5);
+            let (x, z) = (u * f64::from(w) - 0.5, v * f64::from(h) - 0.5);
             let (x0, z0) = (x.floor(), z.floor());
             let (fx, fz) = (x - x0, z - z0);
             let (x0, z0) = (x0 as i64, z0 as i64);
             (height(x0, z0) * (1.0 - fx) + height(x0 + 1, z0) * fx) * (1.0 - fz) + (height(x0, z0 + 1) * (1.0 - fx) + height(x0 + 1, z0 + 1) * fx) * fz
         };
-        let (ex, ez) = (1.0 / w as f64, 1.0 / h as f64);
+        let (ex, ez) = (1.0 / f64::from(w), 1.0 / f64::from(h));
         let (mut four, mut one, mut level) = (0f64, 0f64, 0f64);
         for pair in rows.chunks_exact(2) {
             let (got, at) = (pair[0], pair[1]);
-            let (u, v) = (at[0] as f64, at[1] as f64);
+            let (u, v) = (f64::from(at[0]), f64::from(at[1]));
             let exact = [bilinear(u + ex, v) - bilinear(u - ex, v), bilinear(u, v + ez) - bilinear(u, v - ez)];
-            four = four.max((got[0] as f64 - exact[0]).abs()).max((got[1] as f64 - exact[1]).abs());
-            one = one.max((got[2] as f64 - exact[0]).abs()).max((got[3] as f64 - exact[1]).abs());
-            level = level.max((at[2] as f64).abs()).max((at[3] as f64).abs());
+            four = four.max((f64::from(got[0]) - exact[0]).abs()).max((f64::from(got[1]) - exact[1]).abs());
+            one = one.max((f64::from(got[2]) - exact[0]).abs()).max((f64::from(got[3]) - exact[1]).abs());
+            level = level.max(f64::from(at[2]).abs()).max(f64::from(at[3]).abs());
         }
         eprintln!(
             "worst slope error against exact bilinear, in 8-bit steps: four reads {:.4}, one read {:.4}; height/wet against the 8-bit map {:.4}",

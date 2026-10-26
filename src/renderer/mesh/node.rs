@@ -236,7 +236,7 @@ pub(crate) fn collect_node(
 
                             ground: {
                                 let uv = uvs.get(i).copied().unwrap_or([0.0, 0.0]);
-                                let b = uv2s.get(i).map(|u| u[0]).unwrap_or(0.0);
+                                let b = uv2s.get(i).map_or(0.0, |u| u[0]);
                                 [uv[0], uv[1], b, 0.0]
                             },
                         })
@@ -295,12 +295,11 @@ pub(crate) fn collect_node(
                 let casts_shadow = casts_shadow(
                     prim.material()
                         .transmission()
-                        .map(|t| t.transmission_factor())
-                        .unwrap_or(0.0),
+                        .map_or(0.0, |t| t.transmission_factor()),
                 );
 
                 let blended = prim.material().alpha_mode() == gltf::material::AlphaMode::Blend
-                    || prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0) > 0.0;
+                    || prim.material().transmission().map_or(0.0, |t| t.transmission_factor()) > 0.0;
 
                 let thin = if layered.is_none() && baked_cave.is_none() && !blended {
                     super::thin_parts::split_thin_parts(&vertices, &indices)
@@ -324,10 +323,10 @@ pub(crate) fn collect_node(
                 let (joint_ids, joint_weights): (Vec<[u32; 4]>, Vec<[f32; 4]>) = if real_skin {
                     let joint_ids = match reader.read_joints(0) {
                         Some(gltf::mesh::util::ReadJoints::U8(it)) => it
-                            .map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
+                            .map(|j| [u32::from(j[0]), u32::from(j[1]), u32::from(j[2]), u32::from(j[3])])
                             .collect(),
                         Some(gltf::mesh::util::ReadJoints::U16(it)) => it
-                            .map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
+                            .map(|j| [u32::from(j[0]), u32::from(j[1]), u32::from(j[2]), u32::from(j[3])])
                             .collect(),
                         None => vec![[0, 0, 0, 0]; positions.len()],
                     };
@@ -373,7 +372,7 @@ pub(crate) fn collect_node(
                     index_buffer,
 
                     blended: prim.material().alpha_mode() == gltf::material::AlphaMode::Blend
-                        || prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0) > 0.0,
+                        || prim.material().transmission().map_or(0.0, |t| t.transmission_factor()) > 0.0,
                 });
             }
         }

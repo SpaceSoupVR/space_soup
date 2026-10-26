@@ -3,7 +3,7 @@ use glam::Vec3;
 
 pub(super) fn lobe_frame(variant: u32, form: u32) -> Vec<u8> {
     let n = ATLAS_SIZE as usize;
-    let seed = 0xf1a5_0000u64 + variant as u64 * 97 + form as u64 * 13;
+    let seed = 0xf1a5_0000u64 + u64::from(variant) * 97 + u64::from(form) * 13;
     let z = 0.37 + variant as f32 * 1.9 + form as f32 * 0.7;
     let reach = if form == 2 { 0.7 } else { 1.0 };
     let mut out = vec![0u8; n * n * 4];
@@ -39,7 +39,7 @@ pub(super) fn lobe_frame(variant: u32, form: u32) -> Vec<u8> {
 
 pub(super) fn core_frame(variant: u32) -> Vec<u8> {
     let n = ATLAS_SIZE as usize;
-    let seed = 0xc0e0_0000u64 + variant as u64 * 131;
+    let seed = 0xc0e0_0000u64 + u64::from(variant) * 131;
     let mut out = vec![0u8; n * n * 4];
     for y in 0..n {
         for x in 0..n {

@@ -21,7 +21,7 @@
 //! now has to follow only what the wind cannot: shapes growing, merging and
 //! thinning, and the light. That changes slowly, so maps are drawn half as
 //! often as before, and the two blended are both where the clouds are now,
-//! so the change reads as a morph rather than a double image. SpaceWarp's
+//! so the change reads as a morph rather than a double image. `SpaceWarp`'s
 //! sky pixels move the same way (`sky_motion`).
 //!
 //! The ground's shadow map (`UniformBuffer::cloud_shadow`, read per pixel by
@@ -46,7 +46,7 @@ use wgpu::*;
 pub const MAP_WIDTH: u32 = 2048;
 pub const MAP_HEIGHT: u32 = 768;
 /// Frames to a whole map: 8 rows, 16 k rays a frame; a map every 1.3 s at
-/// 72 Hz (2.7 s under SpaceWarp's 36). Half the rays of the 48 slices
+/// 72 Hz (2.7 s under `SpaceWarp`'s 36). Half the rays of the 48 slices
 /// before the maps were carried by the wind: the drift is drawn every frame
 /// anyway, and a cumulus changes shape over minutes.
 pub const MAP_SLICES: u32 = 96;
@@ -55,7 +55,7 @@ pub const MAP_SLICES: u32 = 96;
 /// edge then blends heights, never a height with nothing (which would carry
 /// the edge on the wind of half its height).
 pub const ALT_FILL_WEIGHT: f32 = 0.02;
-/// Rows are packed toward the horizon: elevation = 90 deg * v^MAP_PACK. At
+/// Rows are packed toward the horizon: elevation = 90 deg * `v^MAP_PACK`. At
 /// 1.5 the rows near the horizon were three times finer than the map's
 /// columns there and those near the zenith three times coarser; 1.15 keeps
 /// both within about 1.5 (2026-10-21; it did not cause the overhead smear,
@@ -242,7 +242,7 @@ pub fn flow_wind(alt: f32, winds: &[[f32; 4]; LAYERS]) -> [f32; 2] {
 pub fn flow_winds(p: &space_soup_sky::clouds::CloudParams, layers: &[CloudLayer; LAYERS]) -> [[f32; 4]; LAYERS] {
     let mut w: [[f32; 4]; LAYERS] = std::array::from_fn(|k| {
         let (dir, v) = cl::layer_wind(p, k);
-        [0.5 * (layers[k].base_m + layers[k].top_m), (dir[0] * v) as f32, (dir[1] * v) as f32, k as f32]
+        [f32::midpoint(layers[k].base_m, layers[k].top_m), (dir[0] * v) as f32, (dir[1] * v) as f32, k as f32]
     });
     w.sort_by(|a, b| a[0].total_cmp(&b[0]));
     w
@@ -262,7 +262,7 @@ pub fn advected_uv(dir: [f32; 3], alt: f32, eye_alt: f32, v: [f32; 2], eye_delta
     map_uv([d[0] * t + eye_delta[0] - v[0] * age, d[1] * t + eye_delta[1], d[2] * t + eye_delta[2] - v[1] * age])
 }
 
-/// The lookup and the wind the sky shader and SpaceWarp's sky share
+/// The lookup and the wind the sky shader and `SpaceWarp`'s sky share
 /// (`map_uv`, `flow_distance`, `flow_wind`, line for line).
 pub fn cloud_flow_wgsl() -> String {
     CLOUD_FLOW_WGSL.replace("{EARTH}", &format!("{:.1}", c::EARTH_RADIUS_M)).replace("{PACK}", &format!("{MAP_PACK:?}"))
@@ -287,7 +287,7 @@ pub fn cirrus_sky_wgsl() -> String {
         .replace("{AIR_HAZE_HEIGHT}", &f(space_soup_sky::time_of_day::AIR_HAZE_HEIGHT_M))
 }
 
-const CIRRUS_SKY_WGSL: &str = r#"
+const CIRRUS_SKY_WGSL: &str = r"
 const CIRRUS_EARTH: f32 = {EARTH};
 const CIRRUS_SKY_TAU: f32 = {CIRRUS_TAU};
 const CIRRUS_SKY_STRETCH: f32 = {CIRRUS_STRETCH};
@@ -363,9 +363,9 @@ fn sky_cirrus(dir: vec3<f32>, px: f32) -> vec4<f32> {
     cirrus_clear = 1.0 - alpha;
     return vec4<f32>(light * w, w);
 }
-"#;
+";
 
-const CLOUD_FLOW_WGSL: &str = r#"
+const CLOUD_FLOW_WGSL: &str = r"
 const CLOUD_FLOW_EARTH: f32 = {EARTH};
 const CLOUD_FLOW_PACK: f32 = {PACK};
 
@@ -389,7 +389,7 @@ fn cloud_flow_wind(alt: f32, w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, w3: ve
     v = mix(v, w3.yz, clamp((alt - w2.x) / max(w3.x - w2.x, 1.0), 0.0, 1.0));
     return v;
 }
-"#;
+";
 
 /// Mips of each envelope, down to 1 texel: the march reads the one its
 /// sample's footprint spans. Read at the top level everywhere, the 2048 x 768
@@ -525,7 +525,7 @@ pub const CIRRUS_TEX: u32 = 3 * CLOUD_TILE;
 pub fn cirrus_texture(device: &Device, queue: &Queue, field: &CloudField) -> Texture {
     let n = CIRRUS_TEX;
     let mut levels = 1;
-    while (n >> (levels - 1)) % 2 == 0 && (n >> levels) >= 3 {
+    while (n >> (levels - 1)).is_multiple_of(2) && (n >> levels) >= 3 {
         levels += 1;
     }
     let t = device.create_texture(&TextureDescriptor {
@@ -1013,7 +1013,7 @@ impl CloudSky {
             times: [0.0; 3],
             eyes: [[0.0; 3]; 3],
             map_uniforms: [CloudSkyUniform::default(); 3],
-            period: MAP_SLICES as f64 / 72.0,
+            period: f64::from(MAP_SLICES) / 72.0,
             last_start: None,
         }
     }
@@ -1061,21 +1061,18 @@ impl CloudSky {
         // Packed on the worker (`CloudPopulation::frame`) when it drew them;
         // here otherwise.
         let own;
-        let data: &[[f32; 8]] = match population.packed() {
-            Some((data, ranges)) => {
-                self.splat_ranges = ranges.clone();
-                data
+        let data: &[[f32; 8]] = if let Some((data, ranges)) = population.packed() {
+            self.splat_ranges = ranges.clone();
+            data
+        } else {
+            let mut v: Vec<[f32; 8]> = Vec::new();
+            for k in 0..POPULATED {
+                let start = v.len() as u32;
+                v.extend(population.splats(k).0.iter().map(space_soup_sky::cloud_population::Splat::gpu));
+                self.splat_ranges[k] = start..v.len() as u32;
             }
-            None => {
-                let mut v: Vec<[f32; 8]> = Vec::new();
-                for k in 0..POPULATED {
-                    let start = v.len() as u32;
-                    v.extend(population.splats(k).0.iter().map(|s| s.gpu()));
-                    self.splat_ranges[k] = start..v.len() as u32;
-                }
-                own = v;
-                &own
-            }
+            own = v;
+            &own
         };
         consts[POPULATED] = [cp::ENVELOPE_TEXEL_M, cp::ENVELOPE_EXTENT_M as f32, 0.0, 0.0];
         queue.write_buffer(&self.splat_uniform, 0, bytemuck::cast_slice(&consts));
@@ -1489,7 +1486,7 @@ pub fn cloud_sky_shader() -> String {
         .replace("{FAR_PHASE}", &f(cp::FAR_PHASE))
         .replace("{FAR_BLEND0}", &f(cp::FAR_BLEND[0]))
         .replace("{FAR_BLEND1}", &f(cp::FAR_BLEND[1]))
-        .replace("{POPULATED}", &format!("{}u", POPULATED))
+        .replace("{POPULATED}", &format!("{POPULATED}u"))
         .replace("{ENVELOPE_TEXEL}", &f(cp::ENVELOPE_TEXEL_M))
         .replace("{ENVELOPE_TOP_MIP}", &f((ENVELOPE_MIPS - 1) as f32))
         .replace("{ALT_FILL_WEIGHT}", &f(ALT_FILL_WEIGHT))
@@ -1561,7 +1558,7 @@ pub fn cloud_splat_shader() -> String {
         .replace("{POPULATED}", &POPULATED.to_string())
 }
 
-const ENVELOPE_MIP_WGSL: &str = r#"
+const ENVELOPE_MIP_WGSL: &str = r"
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 
@@ -1575,9 +1572,9 @@ const ENVELOPE_MIP_WGSL: &str = r#"
     // This texel's centre is the corner its four sources share.
     return textureSampleLevel(src, samp, 2.0 * floor(pos.xy) / size + 1.0 / size, 0.0);
 }
-"#;
+";
 
-const CLOUD_SPLAT_WGSL: &str = r#"
+const CLOUD_SPLAT_WGSL: &str = r"
 struct SplatUniform {
     // Per layer: wind x, z, sqrt(stretch), gain; then texel m, extent m.
     layers: array<vec4<f32>, {POPULATED}>,
@@ -1639,7 +1636,7 @@ struct SplatOut {
     let w = in.a.w * in.c.w * bb * bb;
     return vec4<f32>(w, w * in.b.x, w * in.b.y, w * w);
 }
-"#;
+";
 
 const CLOUD_SKY_WGSL: &str = r#"
 struct Layer {
@@ -2537,7 +2534,7 @@ pub(crate) mod tests {
 
     pub(crate) fn read_back(device: &Device, queue: &Queue, texture: &Texture, layer: u32, width: u32, height: u32, bytes_per_texel: u32) -> Vec<u8> {
         let row = (width * bytes_per_texel).div_ceil(256) * 256;
-        let buf = device.create_buffer(&BufferDescriptor { label: None, size: (row * height) as u64, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
+        let buf = device.create_buffer(&BufferDescriptor { label: None, size: u64::from(row * height), usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
         let mut enc = device.create_command_encoder(&Default::default());
         enc.copy_texture_to_buffer(
             TexelCopyTextureInfo { texture, mip_level: 0, origin: Origin3d { x: 0, y: 0, z: layer }, aspect: TextureAspect::All },
@@ -2554,7 +2551,7 @@ pub(crate) mod tests {
 
     pub(crate) fn half(b: &[u8]) -> f32 {
         let h = u16::from_le_bytes([b[0], b[1]]);
-        let (s, e, m) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+        let (s, e, m) = (u32::from(h >> 15), i32::from((h >> 10) & 0x1f), f32::from(h & 0x3ff));
         let v = if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
         if s == 1 { -v } else { v }
     }
@@ -2599,11 +2596,11 @@ pub(crate) mod tests {
             for i in 1..size - 1 {
                 let xz = [centre[0] - 0.5 * extent + (i as f32 + 0.5) * step, centre[1] - 0.5 * extent + (j as f32 + 0.5) * step];
                 let cpu = space_soup_sky::cloud_layers::transmittance_penumbra(&layers, &noise, &field, xz, 2.0, dir);
-                let gpu = texels[(j * size + i) as usize] as f32 / 255.0;
+                let gpu = f32::from(texels[(j * size + i) as usize]) / 255.0;
                 worst = worst.max((cpu - gpu).abs());
                 sum += (cpu - gpu).abs();
                 n += 1;
-                shaded += (gpu < 0.5) as u32;
+                shaded += u32::from(gpu < 0.5);
             }
         }
         eprintln!("shadow vs twin: mean |diff| {:.4}, worst {worst:.3}; {shaded} of {n} shaded", sum / n as f32);
@@ -2810,11 +2807,11 @@ pub(crate) mod tests {
                     queue.submit(Some(enc.finish()));
                 }
                 device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
-                start.elapsed().as_secs_f64() * 1000.0 / n as f64
+                start.elapsed().as_secs_f64() * 1000.0 / f64::from(n)
             };
             run(&mut sky, 2);
             let ms = run(&mut sky, 10);
-            eprintln!("{name}, populated {populated}: a whole map {ms:.2} ms, a slice {:.3} ms", ms / MAP_SLICES as f64);
+            eprintln!("{name}, populated {populated}: a whole map {ms:.2} ms, a slice {:.3} ms", ms / f64::from(MAP_SLICES));
         }
     }
 
@@ -2853,11 +2850,11 @@ pub(crate) mod tests {
             for _ in 0..n {
                 frame += 1;
                 let mut enc = device.create_command_encoder(&Default::default());
-                sky.encode_at(&mut enc, &queue, &u, &u, shadow, false, frame as f64 / 36.0, frame as f64 / 36.0);
+                sky.encode_at(&mut enc, &queue, &u, &u, shadow, false, f64::from(frame) / 36.0, f64::from(frame) / 36.0);
                 queue.submit(Some(enc.finish()));
                 device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
             }
-            start.elapsed().as_secs_f64() * 1000.0 / n as f64
+            start.elapsed().as_secs_f64() * 1000.0 / f64::from(n)
         };
         run(&mut sky, None, MAP_SLICES);
         let n = 4 * MAP_SLICES;
@@ -2878,7 +2875,7 @@ pub(crate) mod tests {
                 queue.submit(Some(device.create_command_encoder(&Default::default()).finish()));
                 device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
             }
-            start.elapsed().as_secs_f64() * 1000.0 / n as f64
+            start.elapsed().as_secs_f64() * 1000.0 / f64::from(n)
         };
         eprintln!("a frame's clouds: slice {alone:.3} ms, slice + ground shadow {with:.3} ms, an empty submit {empty:.3} ms");
     }
@@ -2997,7 +2994,7 @@ pub(crate) mod tests {
         let noise = CloudNoise::shared();
         let mut params = CloudParams { coverage: 0.35, wind_speed: 16.0, time_scale: 2.5, ..Default::default() };
         params.kinds = [1.0, 1.0, 0.0, 1.0];
-        if let Some(k) = std::env::var("STEP_KINDS").ok() {
+        if let Ok(k) = std::env::var("STEP_KINDS") {
             let v: Vec<f32> = k.split(',').map(|x| x.parse().unwrap()).collect();
             params.kinds = [v[0], v[1], v[2], v[3]];
         }
@@ -3077,8 +3074,8 @@ pub(crate) mod tests {
                 }
                 shifts.push((best.1 * best.1 + best.2 * best.2).sqrt());
                 gains.push(1.0 - best.0 / zero.max(1e-6));
-                mean[0] += best.1 as f64;
-                mean[1] += best.2 as f64;
+                mean[0] += f64::from(best.1);
+                mean[1] += f64::from(best.2);
             }
         }
         let n = shifts.len();
@@ -3097,7 +3094,7 @@ pub(crate) mod tests {
     /// MAPS ACCUMULATED UNDER A MOVING, CHANGING SKY ARE THE SKY OF THEIR
     /// MOMENT: built slice by slice as `Sky::step_clouds` builds them (each
     /// map of a moment two builds ahead, the clouds churning, the winds
-    /// carrying them, test_room's 2.5x clock at SpaceWarp's 36 Hz), the
+    /// carrying them, `test_room`'s 2.5x clock at `SpaceWarp`'s 36 Hz), the
     /// newest map against one drawn fresh at its moment. A history carried
     /// to the wrong place, or kept where a cloud has gone, leaves copies of
     /// the edges beside them (user, 2026-10-22: edges "duplicated in repeats
@@ -3175,7 +3172,7 @@ pub(crate) mod tests {
             for i in 0..MAP_WIDTH {
                 let k = (j * MAP_WIDTH + i) as usize;
                 if want[k] < 0.98 || acc[k] < 0.98 {
-                    off += (acc[k] - want[k]).abs() as f64;
+                    off += f64::from((acc[k] - want[k]).abs());
                     n += 1;
                 }
                 if want[k] > 0.99 {
@@ -3192,9 +3189,9 @@ pub(crate) mod tests {
                 }
             }
         }
-        let off = off / n.max(1) as f64;
-        let ghost_share = ghosts as f64 / clear.max(1) as f64;
-        let faint_share = faint as f64 / clearest.max(1) as f64;
+        let off = off / f64::from(n.max(1));
+        let ghost_share = f64::from(ghosts) / f64::from(clear.max(1));
+        let faint_share = f64::from(faint) / f64::from(clearest.max(1));
         eprintln!("MOVING SKY faint rims: {faint} of {clearest} clear ({:.4}%)", 100.0 * faint_share);
         eprintln!("MOVING SKY after {frame} frames (moment {:.1} s on): alpha off by {off:.5} over {n} texels; ghosts {ghosts} of {clear} clear ({:.4}%)", moment - t0, 100.0 * ghost_share);
         if let Ok(dir) = std::env::var("GHOST_DUMP") {
@@ -3266,12 +3263,12 @@ pub(crate) mod tests {
                             mean += e(i + di - 1, j + dj - 1);
                         }
                     }
-                    off += e(i, j).abs() as f64;
-                    grain += (e(i, j) - mean / 9.0).abs() as f64;
+                    off += f64::from(e(i, j).abs());
+                    grain += f64::from((e(i, j) - mean / 9.0).abs());
                     n += 1;
                 }
             }
-            (off / n as f64, grain / n as f64)
+            (off / f64::from(n), grain / f64::from(n))
         };
         for (refine, bisect) in [(4, 0), (4, 2), (4, 3), (3, 3), (2, 3), (2, 2), (1, 3)] {
             let m = draw(with(refine, bisect, 1));
@@ -3326,12 +3323,12 @@ pub(crate) mod tests {
             for i in 0..MAP_WIDTH {
                 let k = (j * MAP_WIDTH + i) as usize;
                 for w in maps.windows(2) {
-                    change += (w[1][k] - w[0][k]).abs() as f64;
+                    change += f64::from((w[1][k] - w[0][k]).abs());
                     n += 1;
                 }
             }
         }
-        let change = change / n.max(1) as f64;
+        let change = change / f64::from(n.max(1));
         eprintln!("HORIZON a still sky's map to the next, within 3.4 deg of the horizon: alpha moves {change:.5}");
         assert!(change < 1e-4, "a still sky's horizon changes by {change:.5} from map to map");
     }
@@ -3383,8 +3380,8 @@ pub(crate) mod tests {
         let (mut a, mut b, mut n) = (0.0f64, 0.0f64, 0u32);
         for (d, f) in dimmed.iter().zip(&fresh) {
             if f[0] < 0.9 {
-                a += d[1] as f64;
-                b += f[1] as f64;
+                a += f64::from(d[1]);
+                b += f64::from(f[1]);
                 n += 1;
             }
         }
@@ -3456,12 +3453,12 @@ pub(crate) mod tests {
                 for i in 0..MAP_WIDTH {
                     let k = (j * MAP_WIDTH + i) as usize;
                     if reference[k][0] < 0.98 {
-                        sum += (m[k][c] - reference[k][c]).abs() as f64;
+                        sum += f64::from((m[k][c] - reference[k][c]).abs());
                         n += 1;
                     }
                 }
             }
-            sum / n.max(1) as f64
+            sum / f64::from(n.max(1))
         };
         let (once_a, settled_a, once_r, settled_r) = (off(&once, 0), off(&settled, 0), off(&once, 1), off(&settled, 1));
         eprintln!("ACCUMULATION off a march 4x finer: alpha {once_a:.5} once, {settled_a:.5} settled; red {once_r:.5} once, {settled_r:.5} settled");
@@ -3660,7 +3657,7 @@ pub(crate) mod tests {
                             worst_at = (c, cpu[c], gpu[c]);
                         }
                     }
-                    covered += (cpu[0] > 0.05) as u32;
+                    covered += u32::from(cpu[0] > 0.05);
                     seen += 1;
                 }
             }
@@ -3678,11 +3675,11 @@ pub(crate) mod tests {
             for i in (1..size - 1).step_by(2) {
                 let xz = [centre[0] - 0.5 * extent + (i as f32 + 0.5) * step, centre[1] - 0.5 * extent + (j as f32 + 0.5) * step];
                 let cpu = space_soup_sky::cloud_layers::transmittance_penumbra(&layers, &noise, weather, xz, 2.0, dir);
-                let gpu = texels[(j * size + i) as usize] as f32 / 255.0;
+                let gpu = f32::from(texels[(j * size + i) as usize]) / 255.0;
                 worst = worst.max((cpu - gpu).abs());
                 sum += (cpu - gpu).abs();
                 count += 1;
-                shaded += (gpu < 0.5) as u32;
+                shaded += u32::from(gpu < 0.5);
             }
         }
         eprintln!("populated shadow vs twin: mean |diff| {:.4}, worst {worst:.3}; {shaded} of {count} shaded", sum / count as f32);

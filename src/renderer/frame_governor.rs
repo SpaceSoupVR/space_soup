@@ -1,11 +1,11 @@
-//! Native frame rate when the GPU has room for it, SpaceWarp when it has not
+//! Native frame rate when the GPU has room for it, `SpaceWarp` when it has not
 //! (the AAA doc's rank 11: "a 72 <-> 36+ASW governor driven by GPU time").
 //!
-//! Under SpaceWarp the app renders every other display frame and the runtime
+//! Under `SpaceWarp` the app renders every other display frame and the runtime
 //! synthesises the rest from motion vectors; a frame rendered natively shows
 //! no synthesis error at all (no smear on thin or transparent things). So the
 //! frame is rendered natively whenever its GPU time fits the display's
-//! period with a margin, and handed back to SpaceWarp the moment it does not.
+//! period with a margin, and handed back to `SpaceWarp` the moment it does not.
 //! Going native is slow (held for seconds: a view must stay light), coming
 //! back is fast (a quarter of a second: a dropped native frame judders), and
 //! after a return the governor waits before trying again, so it never flaps.
@@ -13,12 +13,12 @@
 /// Go native once the smoothed GPU time is under this share of the display
 /// period (10.4 ms at 72 Hz), held for `NATIVE_HOLD_S`.
 pub const NATIVE_UNDER: f32 = 0.75;
-/// Back to SpaceWarp once it is over this share (12.5 ms at 72 Hz), held for
+/// Back to `SpaceWarp` once it is over this share (12.5 ms at 72 Hz), held for
 /// `WARP_HOLD_S`.
 pub const WARP_OVER: f32 = 0.9;
 pub const NATIVE_HOLD_S: f32 = 5.0;
 pub const WARP_HOLD_S: f32 = 0.25;
-/// After a return to SpaceWarp, no native try for this long.
+/// After a return to `SpaceWarp`, no native try for this long.
 pub const RETRY_AFTER_S: f32 = 10.0;
 /// The smoothing of the GPU time, per frame.
 const SMOOTH: f32 = 0.1;
@@ -29,7 +29,7 @@ pub struct FrameGovernor {
     smoothed: Option<f32>,
     /// Seconds the current condition has held.
     held: f32,
-    /// Seconds since the last return to SpaceWarp.
+    /// Seconds since the last return to `SpaceWarp`.
     since_return: f32,
 }
 
@@ -72,7 +72,7 @@ impl FrameGovernor {
         self.smoothed
     }
 
-    /// Back to SpaceWarp now, as when the governor is switched off.
+    /// Back to `SpaceWarp` now, as when the governor is switched off.
     pub fn reset(&mut self) {
         *self = Self { since_return: 0.0, ..Self::default() };
     }

@@ -136,7 +136,7 @@ fn emitter_seed(e: &EffectEmitter) -> u64 {
     let base = id_hash(&e.id);
     match e.variation.seed.min(65535) {
         0 => base,
-        s => base ^ hash64(s as u64),
+        s => base ^ hash64(u64::from(s)),
     }
 }
 
@@ -144,7 +144,7 @@ fn life_range(p: &Preset, v: &Variation) -> (f32, f32) {
     if v.life_variation == 1.0 {
         return p.life;
     }
-    let m = 0.5 * (p.life.0 + p.life.1);
+    let m = f32::midpoint(p.life.0, p.life.1);
     let h = 0.5 * (p.life.1 - p.life.0) * v.life_variation;
     ((m - h).max(0.05), m + h)
 }
@@ -153,7 +153,7 @@ fn speed_range(p: &Preset, v: &Variation) -> (f32, f32) {
     if v.speed_variation == 1.0 {
         return p.speed;
     }
-    let m = 0.5 * (p.speed.0 + p.speed.1);
+    let m = f32::midpoint(p.speed.0, p.speed.1);
     let h = 0.5 * (p.speed.1 - p.speed.0) * v.speed_variation;
     ((m - h).max(0.0), m + h)
 }
@@ -341,7 +341,7 @@ pub struct Surroundings<'a> {
     pub room: Option<&'a dyn Fn(Vec3) -> f32>,
 }
 
-impl<'a> Surroundings<'a> {
+impl Surroundings<'_> {
     /// These surroundings for an effect at `world`: the exposure of the room
     /// it is in.
     pub fn at_point(&self, world: Vec3) -> Self {
@@ -358,13 +358,13 @@ fn hash64(mut x: u64) -> u64 {
 }
 
 fn id_hash(id: &str) -> u64 {
-    id.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+    id.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3))
 }
 
 fn uniforms(seed: u64) -> [f32; 12] {
     let mut out = [0.0; 12];
     let mut h = seed;
-    for v in out.iter_mut() {
+    for v in &mut out {
         h = hash64(h.wrapping_add(0x9e3779b97f4a7c15));
         *v = (h >> 40) as f32 / (1u64 << 24) as f32;
     }
@@ -533,7 +533,7 @@ fn air_drift(waves: &[AirWave; 6], p: Vec3, time: f64) -> Vec3 {
 /// Each wave's phase at `time`, wrapped in f64 once a frame: `air_drift`
 /// took the f64 remainder six times for each of four reads a mote.
 fn air_clocks(waves: &[AirWave; 6], time: f64) -> [f32; 6] {
-    std::array::from_fn(|i| (waves[i].w as f64 * time).rem_euclid(std::f64::consts::TAU) as f32)
+    std::array::from_fn(|i| (f64::from(waves[i].w) * time).rem_euclid(std::f64::consts::TAU) as f32)
 }
 
 /// `air_drift` at the clocks' time less `back` seconds (a mote's age, a
@@ -614,7 +614,7 @@ fn fire_puff_hz(e: &EffectEmitter) -> f32 {
 }
 
 fn fire_phase(e: &EffectEmitter, time: f64) -> f32 {
-    let f = fire_puff_hz(e) as f64;
+    let f = f64::from(fire_puff_hz(e));
     let wander = PUFF_WANDER * noise1d(time * f * 0.25, emitter_seed(e) ^ 0x7f4a_7c15_9e37_79b9);
     ((time * f).rem_euclid(1.0) as f32 + wander).rem_euclid(1.0)
 }
@@ -657,7 +657,7 @@ fn fire_sheets(e: &EffectEmitter, time: f64) -> Vec<FlameSheet> {
     let (l0, l1) = life_range(&p, &v);
     let (l0, l1) = (l0 * tempo, l1 * tempo);
     let slots = ((rate * l1).ceil() as usize).clamp(1, MAX_SLOTS);
-    let period = (slots as f64 / rate as f64).max(l1 as f64);
+    let period = (slots as f64 / f64::from(rate)).max(f64::from(l1));
     let base = emitter_seed(e);
     let up = e.direction.try_normalize().unwrap_or(Vec3::Y);
     let side = up.any_orthonormal_vector();
@@ -667,7 +667,7 @@ fn fire_sheets(e: &EffectEmitter, time: f64) -> Vec<FlameSheet> {
     let last = (FIRE_FRAMES - 1) as f32;
     let mut out = Vec::with_capacity(slots);
     for i in 0..slots {
-        let since = time - i as f64 / rate as f64;
+        let since = time - i as f64 / f64::from(rate);
         let n = (since / period).floor();
         let age = (since - n * period) as f32;
         let u = uniforms(hash64(base ^ (i as u64).wrapping_mul(0x632be59bd9b4e019) ^ (n as i64 as u64).wrapping_mul(0x8cb92ba72f3d8dd7)));
@@ -687,7 +687,7 @@ fn fire_sheets(e: &EffectEmitter, time: f64) -> Vec<FlameSheet> {
         let pace_of = if v.speed_variation == 1.0 { 0.85 + 0.3 * u[1] } else { (1.0 + (u[1] - 0.5) * 0.3 * v.speed_variation).max(0.1) };
         let pace = FIRE_FRAMES as f32 / FLAME_SECONDS * FLAME_PACE * pace_of / tempo;
         let range = (last - life * pace).max(0.0);
-        let phase = fire_phase(e, time - age as f64 + 0.5 * life as f64);
+        let phase = fire_phase(e, time - f64::from(age) + 0.5 * f64::from(life));
         let want = (phase * per - 0.5 * life * pace).rem_euclid(per);
         let mut start = want + ((u[6] * range - want) / per).round() * per;
         if start > range {
@@ -751,7 +751,7 @@ const RISE_LEAD: f32 = 0.25;
 #[cfg(test)]
 fn flame_tables() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let frames: Vec<Vec<u8>> = (0..FIRE_FRAMES).map(fire_frame).collect();
-    let cover: Vec<f32> = frames.iter().map(|f| f.chunks(4).map(|t| t[3] as f32 / 255.0).sum::<f32>()).collect();
+    let cover: Vec<f32> = frames.iter().map(|f| f.chunks(4).map(|t| f32::from(t[3]) / 255.0).sum::<f32>()).collect();
     let mean = cover.iter().sum::<f32>() / cover.len() as f32;
     let area = cover.iter().map(|c| c / mean).collect();
     let n = ATLAS_SIZE as usize;
@@ -761,9 +761,9 @@ fn flame_tables() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
             let (mut stands, mut all) = (0.0f32, 0.0f32);
             for f in &frames {
                 for (i, t) in f.chunks(4).enumerate() {
-                    let a = t[3] as f32 / 255.0;
+                    let a = f32::from(t[3]) / 255.0;
                     let v = 1.0 - ((i / n) as f32 + 0.5) / n as f32;
-                    stands += a * smoothstep(gone - FLAME_EROSION, gone, t[1] as f32 / 255.0 * smoothstep(LIFT_FROM, LIFT_TO, v));
+                    stands += a * smoothstep(gone - FLAME_EROSION, gone, f32::from(t[1]) / 255.0 * smoothstep(LIFT_FROM, LIFT_TO, v));
                     all += a;
                 }
             }
@@ -776,9 +776,9 @@ fn flame_tables() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
             let (mut stands, mut all) = (0.0f32, 0.0f32);
             for f in &frames {
                 for (i, t) in f.chunks(4).enumerate() {
-                    let a = t[3] as f32 / 255.0;
+                    let a = f32::from(t[3]) / 255.0;
                     let v = 1.0 - ((i / n) as f32 + 0.5) / n as f32;
-                    stands += a * (1.0 - smoothstep(front - RISE_SOFT, front, v - RISE_LEAD * t[1] as f32 / 255.0));
+                    stands += a * (1.0 - smoothstep(front - RISE_SOFT, front, v - RISE_LEAD * f32::from(t[1]) / 255.0));
                     all += a;
                 }
             }
@@ -838,7 +838,7 @@ fn coals_instance(e: &EffectEmitter, time: f64, at: &Surroundings, own: &dyn Fn(
 
         light_dir: [0.0, 1.0, 0.0, v.flicker - 1.0],
         axis: [normal.x, normal.y, normal.z, 0.0],
-        params: [spin, COALS_LAYER as f32, ((time * v.flicker_rate as f64) % 3600.0) as f32, 3.0],
+        params: [spin, COALS_LAYER as f32, ((time * f64::from(v.flicker_rate)) % 3600.0) as f32, 3.0],
 
         motion: [0.0; 4],
     })
@@ -927,7 +927,7 @@ fn kind_cost(kind: EffectKind) -> &'static KindCost {
             .iter()
             .map(|k| {
                 let a = templates::asset(*k);
-                let r = a.check(books()).unwrap_or_else(|e| panic!("the built-in {} template: {}", k.template_name(), e.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")));
+                let r = a.check(books()).unwrap_or_else(|e| panic!("the built-in {} template: {}", k.template_name(), e.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join("; ")));
                 let points = *k == EffectKind::Dust;
                 let area = r.area_facing + r.area_flat;
                 let area_each = if points || r.instances_steady == 0 { 0.0 } else { area / r.instances_steady as f32 };
@@ -958,7 +958,7 @@ pub fn governor_wants(
             templates::Form::Slots(s) => {
                 let p = &tpl.preset;
                 let v = e.variation.clamped();
-                let rate = e.rate * if s.density { p.rate * e.volume() / (0.5 * (p.life.0 + p.life.1)) } else { p.rate };
+                let rate = e.rate * if s.density { p.rate * e.volume() / f32::midpoint(p.life.0, p.life.1) } else { p.rate };
                 let slots = ((rate * life_range(p, &v).1).ceil()).clamp(1.0, MAX_SLOTS as f32);
 
                 let eyes = sight.get(index);
@@ -980,7 +980,7 @@ pub fn governor_wants(
                             .filter(|n| {
                                 let p0 = e.position + e.extent[0] * at(0, n % 5) + e.extent[1] * at(1, n / 5 % 5) + e.extent[2] * at(2, n / 25);
                                 p0.distance_squared(head_world) <= DUST_SEEN_WITHIN * DUST_SEEN_WITHIN
-                                    && eyes.map_or(true, |eyes| eyes.iter().any(|v| v.holds(p0, margin)))
+                                    && eyes.is_none_or(|eyes| eyes.iter().any(|v| v.holds(p0, margin)))
                             })
                             .count();
                         let part: f32 = span.iter().map(|(a, b)| (b - a) / 2.0).product();
@@ -1085,7 +1085,7 @@ pub fn simulate_governed(
         }
         let p = &tpl.preset;
         let v = e.variation.clamped();
-        let rate = e.rate.max(0.0) * if s.density { p.rate * e.volume() / (0.5 * (p.life.0 + p.life.1)) } else { p.rate };
+        let rate = e.rate.max(0.0) * if s.density { p.rate * e.volume() / f32::midpoint(p.life.0, p.life.1) } else { p.rate };
         if !(rate > 0.0) || !(e.scale > 0.0) {
             continue;
         }
@@ -1093,7 +1093,7 @@ pub fn simulate_governed(
         let speeds = speed_range(p, &v);
         let slots = ((rate * lives.1).ceil() as usize).clamp(1, MAX_SLOTS);
 
-        let period = (slots as f64 / rate as f64).max(lives.1 as f64);
+        let period = (slots as f64 / f64::from(rate)).max(f64::from(lives.1));
         let base = emitter_seed(e);
 
         let share = shares.map_or(1.0, |sh| (sh.emitter)(e));
@@ -1113,7 +1113,7 @@ pub fn simulate_governed(
         let air = s.air.then(|| air_waves(base));
         let clocks = air.as_ref().map(|w| air_clocks(w, time));
         for i in 0..slots {
-            let since = time - i as f64 / rate as f64;
+            let since = time - i as f64 / f64::from(rate);
             let n = (since / period).floor();
             let age = (since - n * period) as f32;
             let u = uniforms(hash64(
@@ -1132,7 +1132,7 @@ pub fn simulate_governed(
                     continue;
                 }
 
-                if s.held && !sight.map_or(true, |eyes| eyes.iter().any(|v| v.holds(p0, margin))) {
+                if s.held && !sight.is_none_or(|eyes| eyes.iter().any(|v| v.holds(p0, margin))) {
                     continue;
                 }
                 p0
@@ -1230,7 +1230,7 @@ pub fn simulate_governed(
                         }
                     }
 
-                    let glint = if s.held { mote_glint(age, lerp(0.35, 1.3, u[7]), glint_seed ^ u[8].to_bits() as u64) } else { 1.0 };
+                    let glint = if s.held { mote_glint(age, lerp(0.35, 1.3, u[7]), glint_seed ^ u64::from(u[8].to_bits())) } else { 1.0 };
                     let c = scattered * p.albedo * tint * (at.exposure * glint * v.intensity);
                     let held = smoothstep(0.0, 0.2, t) * smoothstep(1.0, 0.7, t);
                     let d = (centre - at.head).length();
@@ -1290,7 +1290,7 @@ pub fn simulate_governed(
             let mut keep = |_: &EffectInstance| {
                 j += 1;
                 let kept = stack::kept(j - 1, share, phase);
-                splash_shed += !kept as u32;
+                splash_shed += u32::from(!kept);
                 kept
             };
             let tail: Vec<(f32, EffectInstance)> = over.drain(o0..).collect();
@@ -1436,7 +1436,7 @@ fn ember_pops(e: &EffectEmitter, time: f64, at: &Surroundings, screened: &mut Ve
     let tint = Vec3::from(e.tint);
     let root = e.scale.sqrt();
     let accel = up * (p.drag * EMBER_PLUME * root) + p.accel;
-    let first = ((time - lives.1 as f64) / EMBER_POP_BIN).floor() as i64;
+    let first = ((time - f64::from(lives.1)) / EMBER_POP_BIN).floor() as i64;
     let last = (time / EMBER_POP_BIN).floor() as i64;
     for bin in first..=last {
         let pop = hash64(base ^ (bin as u64).wrapping_mul(0x8cb92ba72f3d8dd7));
@@ -1444,7 +1444,7 @@ fn ember_pops(e: &EffectEmitter, time: f64, at: &Surroundings, screened: &mut Ve
         if b[0] >= chance {
             continue;
         }
-        let born = (bin as f64 + b[1] as f64) * EMBER_POP_BIN;
+        let born = (bin as f64 + f64::from(b[1])) * EMBER_POP_BIN;
         let since = (time - born) as f32;
         if since < 0.0 {
             continue;
@@ -1533,7 +1533,7 @@ pub struct Splash {
 impl Splash {
 
     pub fn new(position: Vec3, born: f64, velocity: Vec3, size: f32, mass: f32) -> Self {
-        let seed = hash64(born.to_bits() ^ hash64((position.x.to_bits() as u64) << 32 | position.z.to_bits() as u64));
+        let seed = hash64(born.to_bits() ^ hash64(u64::from(position.x.to_bits()) << 32 | u64::from(position.z.to_bits())));
         Self { position, born, velocity, size, mass, sunlit: 1.0, depth: 30.0, calm: 1.0, held: 0.0, flat: 0.0, seed, mud: 0.0, blast: 0.0 }
     }
 
@@ -1669,14 +1669,14 @@ fn aloft(up: f32, k: f32) -> f32 {
     let apex = (up * k / GRAVITY).ln_1p() / k;
     let (mut lo, mut hi) = (apex, apex + 2.0 * up / GRAVITY + 1.0 / k);
     for _ in 0..24 {
-        let mid = 0.5 * (lo + hi);
+        let mid = f32::midpoint(lo, hi);
         if thrown_height(up, k, mid) > 0.0 {
             lo = mid;
         } else {
             hi = mid;
         }
     }
-    0.5 * (lo + hi)
+    f32::midpoint(lo, hi)
 }
 
 fn apex(up: f32, k: f32) -> f32 {
@@ -1706,7 +1706,7 @@ pub fn splash_shape(s: &Splash) -> SplashShape {
     let drive = 0.5 * WATER_DENSITY * BODY_DRAG * r * r * speed * speed + pressure(r) * r * r;
     let mut cavity = r;
     for _ in 0..24 {
-        cavity = 0.5 * (cavity + (drive / pressure(cavity)).sqrt());
+        cavity = f32::midpoint(cavity, (drive / pressure(cavity)).sqrt());
     }
     let closes = |a: f32| 1.83 * a * (WATER_DENSITY / pressure(a)).sqrt();
 
@@ -1872,7 +1872,7 @@ pub fn splash_bounds(s: &Splash) -> (Vec3, Vec3) {
 
 pub fn splash_seen(s: &Splash, time: f64, views: &[[glam::Vec4; 6]]) -> bool {
     let age = (time - s.born) as f32;
-    if !(age >= 0.0 && age < SPLASH_SECONDS) {
+    if !(0.0..SPLASH_SECONDS).contains(&age) {
         return false;
     }
     let (lo, hi) = splash_bounds(s);
@@ -1922,7 +1922,7 @@ pub fn strike(live: &mut Vec<Splash>, mut new: Splash, kept: usize) {
 fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectInstance)>, screened: &mut Vec<EffectInstance>) {
     use std::f32::consts::{FRAC_PI_2, PI, TAU};
     let age = (time - s.born) as f32;
-    if !(age >= 0.0 && age < SPLASH_SECONDS) {
+    if !(0.0..SPLASH_SECONDS).contains(&age) {
         return;
     }
     if s.mud > 0.0 {
@@ -2414,7 +2414,7 @@ pub fn fire_light(e: &EffectEmitter, time: f64, offset: Vec3, yaw_inv: Quat) -> 
     }
     let v = e.variation.clamped();
     let glow = fire_glow(e, time);
-    let f = fire_puff_hz(e) as f64;
+    let f = f64::from(fire_puff_hz(e));
     let seed = emitter_seed(e);
     let flutter = 0.12 * noise1d(time * f * 2.0, seed ^ 0x51) + 0.06 * noise1d(time * f * 4.0, seed ^ 0x52);
     let flicker = 0.8 * (1.0 + v.flicker * (glow - 1.0 + flutter)).clamp(0.25, 2.0);
@@ -2558,7 +2558,7 @@ pub fn meter_samples(emitters: &[EffectEmitter], head: Vec3, descs: &[ProbeDesc]
             let area = std::f32::consts::PI * (r1 * r1 - r0 * r0) / 8.0;
             for s in 0..8 {
                 let phi = (s as f32 + 0.5) * std::f32::consts::TAU / 8.0;
-                let p = e.position + (side * phi.cos() + across * phi.sin()) * (0.5 * (r0 + r1));
+                let p = e.position + (side * phi.cos() + across * phi.sin()) * f32::midpoint(r0, r1);
                 if room.is_some_and(|d| p.cmplt(d.min).any() || p.cmpgt(d.max).any()) {
                     continue;
                 }
@@ -2612,7 +2612,7 @@ fn fbm(p: Vec3, octaves: u32, seed: u64) -> f32 {
     let mut amp = 0.5;
     let mut q = p;
     for o in 0..octaves {
-        sum += amp * noise3(q, seed.wrapping_add(o as u64 * 7919));
+        sum += amp * noise3(q, seed.wrapping_add(u64::from(o) * 7919));
         q = q * 2.03 + Vec3::new(17.1, 9.3, 3.7);
         amp *= 0.5;
     }
@@ -2624,7 +2624,7 @@ fn billows(p: Vec3, octaves: u32, seed: u64) -> f32 {
     let mut amp = 0.5;
     let mut q = p;
     for o in 0..octaves {
-        sum += amp * noise3(q, seed.wrapping_add(o as u64 * 7919)).abs();
+        sum += amp * noise3(q, seed.wrapping_add(u64::from(o) * 7919)).abs();
         q = q * 2.03 + Vec3::new(17.1, 9.3, 3.7);
         amp *= 0.5;
     }
@@ -2794,7 +2794,7 @@ fn fire_frame(k: u32) -> Vec<u8> {
         for x in 0..n {
             let px = (x as f32 + 0.5) / n as f32 * 2.0 - 1.0;
             let py = 1.0 - (y as f32 + 0.5) / n as f32 * 2.0;
-            let v = (py + 1.0) * 0.5;
+            let v = f32::midpoint(py, 1.0);
             let h = ((v - FLAME_BASE) / (1.0 - FLAME_BASE)).max(0.0);
 
             let flight = (1.0 + FLAME_W1 * h / FLAME_W0).ln() / FLAME_W1;
@@ -2901,7 +2901,7 @@ fn dot_frame(sharpness: f32) -> Vec<u8> {
 
 pub fn atlas_layers() -> Vec<Vec<u8>> {
     fn on_every_core<T: Send>(count: u32, make: impl Fn(u32) -> T + Sync) -> Vec<T> {
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, count.max(1) as usize);
+        let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get).clamp(1, count.max(1) as usize);
         let mut made: Vec<Option<T>> = (0..count).map(|_| None).collect();
         let make = &make;
         std::thread::scope(|s| {
@@ -2962,7 +2962,7 @@ pub fn books() -> &'static [super::effect_asset::BookInfo] {
     static BOOKS: std::sync::OnceLock<Vec<BookInfo>> = std::sync::OnceLock::new();
     BOOKS.get_or_init(|| {
         let shares = CUTOUT_SHARES.get_or_init(|| cutout_shares_of(&cutouts(&atlas_layers())));
-        let layer_bytes = (0..ATLAS_MIPS).map(|m| ((ATLAS_SIZE >> m).max(1) as u64).pow(2) * 4).sum::<u64>();
+        let layer_bytes = (0..ATLAS_MIPS).map(|m| u64::from((ATLAS_SIZE >> m).max(1)).pow(2) * 4).sum::<u64>();
         let book = |name, first: u32, frames: u32, variants: u32, channels, layers: u32| BookInfo {
             name,
             first_layer: first,
@@ -2970,7 +2970,7 @@ pub fn books() -> &'static [super::effect_asset::BookInfo] {
             variants,
             channels,
             cutout_share: shares[first as usize..(first + frames * variants) as usize].iter().sum::<f32>() / (frames * variants) as f32,
-            bytes: layers as u64 * layer_bytes,
+            bytes: u64::from(layers) * layer_bytes,
         };
         vec![
             book("smoke", 0, SMOKE_FRAMES, 1, Channels::Sixway, 2 * SMOKE_FRAMES),
@@ -3033,7 +3033,7 @@ impl Dabs {
 }
 
 fn crown_frame(variant: u32, stage: u32) -> Vec<u8> {
-    let seed = 0xc0ffee ^ ((variant as u64 + 1) << 20);
+    let seed = 0xc0ffee ^ ((u64::from(variant) + 1) << 20);
     let stage = stage.min(2);
     let mut d = Dabs::new();
     let base = 0.98f32;
@@ -3097,7 +3097,7 @@ fn crown_frame(variant: u32, stage: u32) -> Vec<u8> {
         d.dab(tip.0, tip.1 - 0.008, wide * 1.4, 0.97);
 
         for k in 0..2 * stage + 2 {
-            let v = uniforms(hash64(seed ^ 0xd0 ^ (f * 8 + k as u64).wrapping_mul(0x8cb92ba72f3d8dd7)));
+            let v = uniforms(hash64(seed ^ 0xd0 ^ (f * 8 + u64::from(k)).wrapping_mul(0x8cb92ba72f3d8dd7)));
             d.dab(tip.0 + (v[0] - 0.5) * 0.16, (tip.1 - 0.03 - 0.22 * v[1] * v[1]).max(0.03), lerp(0.006, 0.012, v[2]), 0.95);
         }
     }
@@ -3126,7 +3126,7 @@ fn crown_frame(variant: u32, stage: u32) -> Vec<u8> {
 }
 
 fn spray_frame(variant: u32, stage: u32) -> Vec<u8> {
-    let seed = 0x5b7a1 ^ ((variant as u64 + 1) << 20);
+    let seed = 0x5b7a1 ^ ((u64::from(variant) + 1) << 20);
     let stage = stage.min(2) as usize;
     let mut d = Dabs::new();
     let foot = (0.5f32, 0.975f32);
@@ -3161,7 +3161,7 @@ fn spray_frame(variant: u32, stage: u32) -> Vec<u8> {
 }
 
 fn froth_frame(variant: u32, stage: u32) -> Vec<u8> {
-    let seed = 0xf207 ^ ((variant as u64 + 1) << 20);
+    let seed = 0xf207 ^ ((u64::from(variant) + 1) << 20);
     let stage = stage.min(2) as usize;
     let mut d = Dabs::new();
     let base = 0.98f32;
@@ -3200,7 +3200,7 @@ fn froth_frame(variant: u32, stage: u32) -> Vec<u8> {
 }
 
 fn jet_frame(variant: u32, stage: u32) -> Vec<u8> {
-    let seed = 0x1e7 ^ ((variant as u64 + 1) << 20);
+    let seed = 0x1e7 ^ ((u64::from(variant) + 1) << 20);
     let stage = stage.min(2);
     let u = uniforms(hash64(seed));
     let mut d = Dabs::new();
@@ -3231,7 +3231,7 @@ fn jet_frame(variant: u32, stage: u32) -> Vec<u8> {
     }
 
     d.dab(bend(1.0), 0.11, lerp(0.04, 0.055, u[2]), 0.95);
-    for k in 0..(3 * stage as u64) {
+    for k in 0..(3 * u64::from(stage)) {
         let v = uniforms(hash64(seed ^ 0x5a7 ^ k.wrapping_mul(0x9e3779b97f4a7c15)));
         d.dab(0.5 + (v[0] - 0.5) * 0.16, lerp(0.15, 0.85, v[1]), lerp(0.008, 0.018, v[2]), 0.9);
     }
@@ -3315,7 +3315,7 @@ pub fn cutouts(layers: &[Vec<u8>]) -> Vec<[f32; 16]> {
             if let Some(m) = next {
                 with.push(&layers[m as usize]);
             }
-            with.extend(smeared.iter().map(|s| s.as_slice()));
+            with.extend(smeared.iter().map(std::vec::Vec::as_slice));
             let o = outline(&with);
             let mut out = [0.0f32; 16];
             for (k, c) in o.iter().enumerate() {
@@ -3336,9 +3336,9 @@ fn half_mip(src: &[u8], size: usize) -> Vec<u8> {
             let mut weight = 0.0;
             for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                 let o = ((2 * y + dy).min(size - 1) * size + (2 * x + dx).min(size - 1)) * 4;
-                let a = src[o + 3] as f32;
+                let a = f32::from(src[o + 3]);
                 for c in 0..3 {
-                    sum[c] += src[o + c] as f32 * (a + 1.0);
+                    sum[c] += f32::from(src[o + c]) * (a + 1.0);
                 }
                 sum[3] += a;
                 weight += a + 1.0;
@@ -3687,7 +3687,7 @@ pub fn effects_shader() -> String {
     format!(
         "{}{}",
         crate::renderer::tonemap::wgsl_aces_block(),
-        r#"
+        r"
 var<private> view_slot: i32 = 0;
 struct Camera { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -4085,7 +4085,7 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
     let light = select(in.colour.rgb, fx_flame(in.colour.rgb, t.r), in.layer.z > 3.5);
     return vec4<f32>(aces_fitted(light * strength), 0.0);
 }
-"#
+"
         .replace("CUT_VEC4S", &(ATLAS_LAYERS * 4).to_string())
         .replace("LAST_LAYER", &(ATLAS_LAYERS - 1).to_string())
         .replace("SMOKE_BACK", &SMOKE_BACK.to_string())
@@ -4131,7 +4131,7 @@ pub fn motion_shader_of(source: String) -> String {
     swap(&mut s, "@fragment fn fs_over(in: VOut) -> @location(0) vec4<f32>", "fn fx_over(in: VOut) -> vec4<f32>", 1);
     swap(&mut s, "@fragment fn fs_screen(in: VOut) -> @location(0) vec4<f32>", "fn fx_screen(in: VOut) -> vec4<f32>", 1);
     format!(
-        r#"{motion}
+        r"{motion}
 {s}
 var<private> fx_before: bool = false;
 var<private> fx_pixel_scale: f32 = 1.0;
@@ -4247,7 +4247,7 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
     let w = layer_weight(max(shown.r, max(shown.g, shown.b)), {bright:?});
     return vec4<f32>(motion_of(in.curr, in.prev).xyz * w, w);
 }}
-"#,
+",
         motion = crate::renderer::space_warp::motion_block(),
         soft = crate::renderer::space_warp::SOFT_LAYER_CONTRAST,
         bright = crate::renderer::space_warp::BRIGHT_LAYER_CONTRAST,
@@ -4372,8 +4372,8 @@ mod tests {
         let world = |i: &EffectInstance| Quat::from_rotation_y(yaw) * centre(i) + offset;
         let mut a: Vec<[i32; 3]> = straight.instances.iter().map(|i| (centre(i) * 1e4).round().as_ivec3().to_array()).collect();
         let mut b: Vec<[i32; 3]> = turned.instances.iter().map(|i| (world(i) * 1e4).round().as_ivec3().to_array()).collect();
-        a.sort();
-        b.sort();
+        a.sort_unstable();
+        b.sort_unstable();
         assert_eq!(a.len(), b.len());
         for (p, q) in a.iter().zip(&b) {
             assert!(p.iter().zip(q).all(|(x, y)| (x - y).abs() <= 2), "{p:?} vs {q:?}");
@@ -4385,7 +4385,7 @@ mod tests {
 
         let e = [emitter(EffectKind::Smoke)];
         let at = seen_from(Vec3::new(0.0, 1.6, 3.0));
-        let counts: Vec<f32> = (0..20).map(|k| simulate(&e, 100.0 + k as f64 * 0.37, &at).over as f32).collect();
+        let counts: Vec<f32> = (0..20).map(|k| simulate(&e, 100.0 + f64::from(k) * 0.37, &at).over as f32).collect();
         let mean = counts.iter().sum::<f32>() / counts.len() as f32;
         assert!((22.0..38.0).contains(&mean), "about 6 x 5 = 30 alive, found {mean}");
     }
@@ -4396,7 +4396,7 @@ mod tests {
         let small = EffectEmitter { extent: [Vec3::X * 0.5, Vec3::Y * 0.5, Vec3::Z * 0.5], ..emitter(EffectKind::Dust) };
         let large = emitter(EffectKind::Dust);
         let at = seen_from(Vec3::new(0.0, 1.6, 3.0));
-        let count = |e: &EffectEmitter| (0..10).map(|k| simulate(std::slice::from_ref(e), 50.0 + k as f64, &at).screened).sum::<u32>() as f32 / 10.0;
+        let count = |e: &EffectEmitter| (0..10).map(|k| simulate(std::slice::from_ref(e), 50.0 + f64::from(k), &at).screened).sum::<u32>() as f32 / 10.0;
         let (s, l) = (count(&small), count(&large));
         assert!((60.0..120.0).contains(&s), "90 a cubic metre, found {s}");
         assert!((l / s - 8.0).abs() < 1.5, "{l} vs {s}");
@@ -4435,13 +4435,13 @@ mod tests {
         let count = |t: f64| simulate_with(&[], &s, t, &at).screened;
         assert_eq!(count(9.9), 0, "nothing before it struck");
         assert!(count(10.15) >= 12, "drops in the air: {}", count(10.15));
-        assert_eq!(count(10.0 + shape.seconds as f64 + 0.01), 0, "all fallen back");
+        assert_eq!(count(10.0 + f64::from(shape.seconds) + 0.01), 0, "all fallen back");
         assert!(shape.seconds <= SPLASH_SECONDS);
 
         let f = simulate_with(&[], &s, 10.2, &at);
         let ys: Vec<f32> = f.instances[f.over as usize..].iter().map(|i| i.centre[1]).collect();
         assert!(ys.iter().all(|&y| y >= -1e-3), "{ys:?}");
-        assert!(ys.iter().cloned().fold(0.0, f32::max) > 0.05, "{ys:?}");
+        assert!(ys.iter().copied().fold(0.0, f32::max) > 0.05, "{ys:?}");
         assert!(f.over >= 5, "its crown, in pieces: {}", f.over);
     }
 
@@ -4548,11 +4548,11 @@ mod tests {
             live[1]
         };
         let shape = splash_shape(&first);
-        let into_the_hole = second(0.5 * shape.collapse as f64, 0.03);
+        let into_the_hole = second(0.5 * f64::from(shape.collapse), 0.03);
         assert!(into_the_hole.calm < 0.05, "{}", into_the_hole.calm);
-        let churned = second(shape.collapse as f64 + 0.3, 0.03);
+        let churned = second(f64::from(shape.collapse) + 0.3, 0.03);
         assert!((0.25..0.7).contains(&churned.calm), "{}", churned.calm);
-        assert!(second(0.1, 2.0).calm == 1.0 && second(shape.settle as f64 + 0.1, 0.0).calm == 1.0);
+        assert!(second(0.1, 2.0).calm == 1.0 && second(f64::from(shape.settle) + 0.1, 0.0).calm == 1.0);
 
         let (calm, rough) = (splash_shape(&first), splash_shape(&into_the_hole));
         assert_eq!(rough.jet_height, 0.0);
@@ -4575,7 +4575,7 @@ mod tests {
 
         let mut live = Vec::new();
         for k in 0..60 {
-            strike(&mut live, Splash { born: k as f64, ..pebble() }, 48);
+            strike(&mut live, Splash { born: f64::from(k), ..pebble() }, 48);
         }
         assert!(live.len() == 48 && live[0].born == 12.0);
     }
@@ -4615,7 +4615,7 @@ mod tests {
         let head = Vec3::new(0.0, 1.6, 0.0);
         let shape = splash_shape(&pistol());
 
-        let early = splash_rings::<4>(&[pistol()], 0.9 * shape.ring_release as f64, head);
+        let early = splash_rings::<4>(&[pistol()], 0.9 * f64::from(shape.ring_release), head);
         assert_eq!(early.rings[0][2], 0.0);
         assert!((0..400).all(|i| ring_drawn(early.rings[0], early.waves[0], 0.01 * i as f32) == 0.0));
         let one = splash_rings::<4>(&[pistol()], 1.0, head);
@@ -4638,8 +4638,8 @@ mod tests {
         let next = (crests[1]..3000).find(|&i| ring_drawn(later.rings[0], later.waves[0], 0.001 * i as f32) > ring_drawn(later.rings[0], later.waves[0], 0.001 * (i - 1) as f32) && ring_drawn(later.rings[0], later.waves[0], 0.001 * i as f32) >= ring_drawn(later.rings[0], later.waves[0], 0.001 * (i + 1) as f32));
         assert!(next.is_some_and(|n| n > crests[1]));
 
-        let open = splash_rings::<4>(&[pistol()], 0.5 * shape.collapse as f64, head);
-        let boil = splash_rings::<4>(&[pistol()], (shape.collapse + 0.1) as f64, head);
+        let open = splash_rings::<4>(&[pistol()], 0.5 * f64::from(shape.collapse), head);
+        let boil = splash_rings::<4>(&[pistol()], f64::from(shape.collapse + 0.1), head);
         assert!(open.waves[0][3] > 1.0 && boil.waves[0][3] < 0.0, "{open:?} {boil:?}");
 
         let big = splash_rings::<4>(&[crate_box()], 1.0, head);
@@ -4647,12 +4647,12 @@ mod tests {
         assert!(big.waves[0][2] > one.waves[0][2] && crate_shape.ring_height > shape.ring_height && shape.ring_height > small.ring_height, "{} {} {}", crate_shape.ring_height, shape.ring_height, small.ring_height);
         assert!(crate_shape.ring_wavelength > shape.ring_wavelength && crate_shape.ring_speed > shape.ring_speed);
 
-        let gone = splash_rings::<4>(&[pistol(), crate_box()], super::super::water_pipeline::RING_SECONDS as f64 + 0.1, head);
+        let gone = splash_rings::<4>(&[pistol(), crate_box()], f64::from(super::super::water_pipeline::RING_SECONDS) + 0.1, head);
         assert!(gone.rings.iter().all(|r| r[3] == 0.0));
 
         const N: usize = super::super::water_pipeline::RINGS;
         let steps: Vec<Splash> =
-            (0..10).map(|k| Splash { born: 0.5 * k as f64, position: Vec3::new(0.3 * (k % 2) as f32, 0.0, 0.65 * k as f32), seed: k as u64, ..foot() }).collect();
+            (0..10).map(|k| Splash { born: 0.5 * f64::from(k), position: Vec3::new(0.3 * (k % 2) as f32, 0.0, 0.65 * k as f32), seed: k as u64, ..foot() }).collect();
         let drawn = |t: f64| {
             let r = splash_rings::<N>(&steps, t, Vec3::new(0.0, 1.6, 3.0));
             let line: Vec<f32> = (0..160)
@@ -4663,15 +4663,15 @@ mod tests {
                 .collect();
             (line, r.pools.iter().map(|x| x[0]).sum::<f32>(), r.rings.iter().filter(|x| x[3] > 1e-9).count())
         };
-        let peak = (0..1100).map(|k| drawn(0.005 * k as f64).0.iter().fold(0.0f32, |m, h| m.max(h.abs()))).fold(0.0, f32::max);
+        let peak = (0..1100).map(|k| drawn(0.005 * f64::from(k)).0.iter().fold(0.0f32, |m, h| m.max(h.abs()))).fold(0.0, f32::max);
         assert!(peak > 1e-4, "{peak}");
-        assert!((0..1100).any(|k| drawn(0.005 * k as f64).2 == N), "the wader fills the water's rings");
+        assert!((0..1100).any(|k| drawn(0.005 * f64::from(k)).2 == N), "the wader fills the water's rings");
         for k in 0..1100 {
-            let (a, b) = (drawn(0.005 * k as f64), drawn(0.005 * (k + 1) as f64));
+            let (a, b) = (drawn(0.005 * f64::from(k)), drawn(0.005 * f64::from(k + 1)));
             let jump = a.0.iter().zip(&b.0).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
-            assert!(jump < 0.2 * peak, "heights jump at {} s: {jump} of {peak}", 0.005 * k as f64);
+            assert!(jump < 0.2 * peak, "heights jump at {} s: {jump} of {peak}", 0.005 * f64::from(k));
 
-            assert!((a.1 - b.1).abs() < 0.1, "foam jumps at {} s: {} -> {}", 0.005 * k as f64, a.1, b.1);
+            assert!((a.1 - b.1).abs() < 0.1, "foam jumps at {} s: {} -> {}", 0.005 * f64::from(k), a.1, b.1);
         }
     }
 
@@ -4693,12 +4693,12 @@ mod tests {
         };
         assert!(splash_seen(&pistol(), 0.1, &[planes(Vec3::ZERO)]));
         assert!(!splash_seen(&pistol(), 0.1, &[planes(Vec3::new(0.0, 1.6, 9.0))]));
-        assert!(!splash_seen(&pistol(), SPLASH_SECONDS as f64 + 0.1, &[planes(Vec3::ZERO)]));
+        assert!(!splash_seen(&pistol(), f64::from(SPLASH_SECONDS) + 0.1, &[planes(Vec3::ZERO)]));
 
         for s in [pebble(), pistol(), crate_box(), bullet(), foot()] {
             let (lo, hi) = splash_bounds(&s);
             for k in 1..40 {
-                let f = simulate_with(&[], &[s], 0.05 * k as f64, &near);
+                let f = simulate_with(&[], &[s], 0.05 * f64::from(k), &near);
                 for i in &f.instances {
                     let p = Vec3::from_slice(&i.centre[..3]);
                     assert!(p.cmpge(lo - Vec3::splat(0.05)).all() && p.cmple(hi + Vec3::splat(0.05)).all(), "{p:?} outside {lo:?}..{hi:?} at {} s", 0.05 * k as f32);
@@ -4730,7 +4730,7 @@ mod tests {
                     for x in 0..n {
 
                         let (sx, sy) = if on_its_side { (n - 1 - y, x) } else { (x, y) };
-                        let a = layer[(sy * n + sx) * 4 + 3] as f32 / 255.0;
+                        let a = f32::from(layer[(sy * n + sx) * 4 + 3]) / 255.0;
                         let o = ((stage as usize * n + y) * w + c as usize * n + x) * 4;
                         let over = |under: f32| ((under * (1.0 - a) + a).powf(1.0 / 2.2) * 255.0) as u8;
                         sheet[o..o + 4].copy_from_slice(&[over(0.01), over(0.03), over(0.05), 255]);
@@ -4751,7 +4751,7 @@ mod tests {
         let head = Vec3::new(0.0, 1.6, 3.0);
         let foam = |s: Splash, t: f64| splash_rings::<4>(&[s], t, head).pools[0];
 
-        let shut = c.collapse as f64 + 0.1;
+        let shut = f64::from(c.collapse) + 0.1;
         assert!(foam(crate_box(), shut)[0] > 0.5 && foam(crate_box(), 2.0)[0] < 0.4 && foam(crate_box(), 4.3)[0] == 0.0, "{:?}", foam(crate_box(), 2.0));
         assert!(foam(crate_box(), 2.0)[2] > foam(crate_box(), shut)[2]);
         assert!(foam(pebble(), 0.25)[0] > 0.2 && foam(pebble(), 1.8)[0] < 0.02, "{:?}", foam(pebble(), 0.25));
@@ -4812,7 +4812,7 @@ mod tests {
             let shape = splash_shape(&s);
             let (mut most, mut most_over, mut area, mut drawn) = (0u32, 0u32, 0.0f32, 0.0f32);
             for k in 0..600 {
-                let f = simulate_with(&[], &[s], 0.005 * k as f64, &at);
+                let f = simulate_with(&[], &[s], 0.005 * f64::from(k), &at);
                 most = most.max(f.over + f.screened);
                 most_over = most_over.max(f.over);
                 let a: f32 = f.instances[..f.over as usize].iter().map(|i| 4.0 * i.centre[3] * i.centre[3] * i.params[2].abs().max(1.0)).sum();
@@ -4839,7 +4839,7 @@ mod tests {
             let f = simulate(e, 40.0, &at);
             let ys: Vec<f32> = f.instances.iter().map(|i| i.centre[1]).collect();
             let wide = f.instances.iter().map(|i| (i.centre[0].powi(2) + (i.centre[2] - 0.0).powi(2)).sqrt()).fold(0.0, f32::max);
-            (ys.iter().cloned().fold(f32::MIN, f32::max), wide)
+            (ys.iter().copied().fold(f32::MIN, f32::max), wide)
         };
         let (free_top, free_wide) = tops(&free);
         let (roof_top, roof_wide) = tops(&roofed);
@@ -4854,7 +4854,7 @@ mod tests {
         let samples: Vec<f32> = (0..200_000).map(|k| mote_glint(k as f32 * 0.013, 1.0, 7 + (k / 5000) as u64)).collect();
         let mean = samples.iter().sum::<f32>() / samples.len() as f32;
         let dim = samples.iter().filter(|&&g| g < 0.6).count() as f32 / samples.len() as f32;
-        let peak = samples.iter().cloned().fold(0.0, f32::max);
+        let peak = samples.iter().copied().fold(0.0, f32::max);
         assert!((mean - 1.0).abs() < 0.06, "mean {mean}");
         assert!(dim > 0.3, "lost {dim} of the time");
         assert!(peak > 2.5, "brightest flash {peak}");
@@ -4869,7 +4869,7 @@ mod tests {
         for k in 0..n {
             let u = uniforms(k as u64);
             let p = Vec3::new(u[0], u[1], u[2]) * 4.0;
-            let t = 10.0 + 37.0 * u[3] as f64;
+            let t = 10.0 + 37.0 * f64::from(u[3]);
             let a = moved(p, t);
             speed += a.length();
             apart_near += (a - moved(p + Vec3::new(0.03, 0.0, 0.02), t)).length();
@@ -4901,7 +4901,7 @@ mod tests {
         let e = [EffectEmitter { rate: 0.2, ..emitter(EffectKind::Smoke) }];
         let p = preset(EffectKind::Smoke);
         let slots = ((p.rate * 0.2 * p.life.1).ceil() as usize).max(1);
-        let period = (slots as f64 / (p.rate as f64 * 0.2)).max(p.life.1 as f64);
+        let period = (slots as f64 / (f64::from(p.rate) * 0.2)).max(f64::from(p.life.1));
         let at = seen_from(Vec3::new(0.0, 1.6, 3.0));
         let a = simulate(&e, 3.0, &at);
         let b = simulate(&e, 3.0 + period, &at);
@@ -5054,7 +5054,7 @@ mod tests {
                     let r = ((x as f32 + 0.5) / n as f32 * 2.0 - 1.0).hypot((y as f32 + 0.5) / n as f32 * 2.0 - 1.0);
                     let o = (y * n + x) * 4;
                     if (r0..r1).contains(&r) && c[o + 3] > 128 {
-                        sum += c[o + channel] as f32;
+                        sum += f32::from(c[o + channel]);
                         count += 1.0;
                     }
                 }
@@ -5099,7 +5099,7 @@ mod tests {
         let at = |t: f64| fire_light(&fire, t, offset, yaw_inv).unwrap();
 
         let world = |l: &Light| Quat::from_rotation_y(0.7) * l.position + offset;
-        let samples: Vec<Light> = (0..2000).map(|k| at(1000.0 + k as f64 * 0.013)).collect();
+        let samples: Vec<Light> = (0..2000).map(|k| at(1000.0 + f64::from(k) * 0.013)).collect();
         let rest = Vec3::new(14.0, 0.525, -4.0);
         let far = samples.iter().map(|l| (world(l) - rest).length()).fold(0.0f32, f32::max);
         let moved = samples.windows(2).map(|w| (world(&w[0]) - world(&w[1])).length()).sum::<f32>();
@@ -5129,9 +5129,9 @@ mod tests {
         let at = |f: f32| {
             let (mut re, mut im) = (0.0f64, 0.0f64);
             for (i, v) in x.iter().enumerate() {
-                let a = std::f64::consts::TAU * f as f64 * i as f64 / rate as f64;
-                re += ((v - mean) * w(i)) as f64 * a.cos();
-                im += ((v - mean) * w(i)) as f64 * a.sin();
+                let a = std::f64::consts::TAU * f64::from(f) * i as f64 / f64::from(rate);
+                re += f64::from((v - mean) * w(i)) * a.cos();
+                im += f64::from((v - mean) * w(i)) * a.sin();
             }
             (re * re + im * im) as f32
         };
@@ -5146,7 +5146,7 @@ mod tests {
             let puff = 1.5 / (0.3 * scale).sqrt();
             assert!((fire_puff_hz(&fire) - puff).abs() < 0.01 * puff, "{} vs {puff}", fire_puff_hz(&fire));
             let rate = 40.0;
-            let light: Vec<f32> = (0..(rate as usize * 60)).map(|k| fire_light(&fire, 500.0 + k as f64 / rate as f64, Vec3::ZERO, Quat::IDENTITY).unwrap().intensity).collect();
+            let light: Vec<f32> = (0..(rate as usize * 60)).map(|k| fire_light(&fire, 500.0 + k as f64 / f64::from(rate), Vec3::ZERO, Quat::IDENTITY).unwrap().intensity).collect();
             let freqs: Vec<f32> = (2..=60).map(|k| k as f32 * 0.2).collect();
             let power = spectrum(&light, rate, &freqs);
             let peak = freqs[power.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0];
@@ -5164,7 +5164,7 @@ mod tests {
     #[test]
     fn a_fires_light_follows_how_much_flame_is_in_view() {
         let fire = EffectEmitter { scale: 1.5, ..emitter(EffectKind::Fire) };
-        let times: Vec<f64> = (0..3000).map(|k| 200.0 + k as f64 * 0.021).collect();
+        let times: Vec<f64> = (0..3000).map(|k| 200.0 + f64::from(k) * 0.021).collect();
         let glow: Vec<f32> = times.iter().map(|&t| fire_glow(&fire, t)).collect();
         let light: Vec<f32> = times.iter().map(|&t| fire_light(&fire, t, Vec3::ZERO, Quat::IDENTITY).unwrap().intensity).collect();
         let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
@@ -5190,7 +5190,7 @@ mod tests {
             let (mut count, mut tall, mut wide, mut pace) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
             let n = 400;
             for k in 0..n {
-                let t = 300.0 + k as f64 * 0.37;
+                let t = 300.0 + f64::from(k) * 0.37;
                 let (a, b) = (fire_sheets(e, t), fire_sheets(e, t + 0.01));
                 count += a.len() as f32;
                 tall += a.iter().map(|s| s.size * s.stretch).sum::<f32>() / a.len() as f32;
@@ -5221,7 +5221,7 @@ mod tests {
 
         let area: Vec<f32> = (0..(rate as usize * 60))
             .map(|k| {
-                let sheets = fire_sheets(&fire, 700.0 + k as f64 / rate as f64);
+                let sheets = fire_sheets(&fire, 700.0 + k as f64 / f64::from(rate));
                 let w = |s: &FlameSheet| s.size * s.size * s.stretch * erosion_cover(s.stands) * rise_cover(s.risen);
                 sheets.iter().map(|s| w(s) * flame_area(s.frame)).sum::<f32>() / sheets.iter().map(w).sum::<f32>()
             })
@@ -5260,7 +5260,7 @@ mod tests {
                 for x in 0..n {
                     let t = &f[(y * n + x) * 4..(y * n + x) * 4 + 4];
                     if t[3] > 128 {
-                        sum += t[1] as f32;
+                        sum += f32::from(t[1]);
                         count += 1.0;
                     }
                 }
@@ -5269,7 +5269,7 @@ mod tests {
         };
         assert!(depth(n / 4..n / 2) < 0.6 * depth(3 * n / 4..n), "tips shallow, root deep");
 
-        let blue = |rows: std::ops::Range<usize>| rows.flat_map(|y| (0..n).map(move |x| (y, x))).map(|(y, x)| f[(y * n + x) * 4 + 2] as f32).sum::<f32>();
+        let blue = |rows: std::ops::Range<usize>| rows.flat_map(|y| (0..n).map(move |x| (y, x))).map(|(y, x)| f32::from(f[(y * n + x) * 4 + 2])).sum::<f32>();
         assert!(blue(n - n / 12..n) > 0.0 && blue(0..n / 2) == 0.0);
     }
 
@@ -5323,7 +5323,7 @@ mod tests {
             assert_ne!(bytemuck::cast_slice::<_, u8>(&a.instances), bytemuck::cast_slice::<_, u8>(&b.instances), "{:?}", p.kind);
             if p.kind != EffectKind::Embers {
 
-                let slots = |e: &EffectEmitter| (0..20).map(|k| simulate(std::slice::from_ref(e), 40.0 + k as f64 * 0.31, &at).instances.len()).sum::<usize>() as f32;
+                let slots = |e: &EffectEmitter| (0..20).map(|k| simulate(std::slice::from_ref(e), 40.0 + f64::from(k) * 0.31, &at).instances.len()).sum::<usize>() as f32;
                 assert!((slots(p) / slots(s) - 1.0).abs() < 0.25, "{:?}", p.kind);
             }
         }
@@ -5346,7 +5346,7 @@ mod tests {
 
         let hot = simulate(&[with(EffectKind::Fire, Variation { temperature_variation: 1.0, ..d })], 20.0, &at);
         let ratios: Vec<f32> = hot.instances.iter().map(|i| i.colour[2] / i.colour[0]).collect();
-        assert!(ratios.iter().cloned().fold(0.0, f32::max) > 1.5 * ratios.iter().cloned().fold(f32::MAX, f32::min));
+        assert!(ratios.iter().copied().fold(0.0, f32::max) > 1.5 * ratios.iter().copied().fold(f32::MAX, f32::min));
 
         assert!((fire_puff_hz(&with(EffectKind::Fire, Variation { flicker_rate: 2.0, ..d })) / fire_puff_hz(&with(EffectKind::Fire, d)) - 2.0).abs() < 1e-4);
 
@@ -5354,7 +5354,7 @@ mod tests {
         let s2 = simulate(&[with(EffectKind::Smoke, Variation { intensity: 0.5, ..d })], 40.0, &at);
         assert!((s2.instances[3].colour[3] / s1.instances[3].colour[3] - 0.5).abs() < 1e-4);
 
-        let top = |v: Variation| (0..20).flat_map(|k| simulate(&[with(EffectKind::Smoke, v)], 60.0 + k as f64, &at).instances).map(|i| i.centre[1]).fold(0.0f32, f32::max);
+        let top = |v: Variation| (0..20).flat_map(|k| simulate(&[with(EffectKind::Smoke, v)], 60.0 + f64::from(k), &at).instances).map(|i| i.centre[1]).fold(0.0f32, f32::max);
         assert!(top(Variation { life_variation: 2.0, ..d }) > top(d) + 0.1);
 
         let c = simulate(&[with(EffectKind::Coals, Variation { flicker: 0.0, flicker_rate: 2.0, ..d })], 20.0, &at);
@@ -5370,7 +5370,7 @@ mod tests {
         let (mut most, mut least, mut high) = (0u32, u32::MAX, 0.0f32);
         for k in 0..600 {
             let mut pops = Vec::new();
-            ember_pops(&embers, 100.0 + k as f64 * 0.1, &at, &mut pops);
+            ember_pops(&embers, 100.0 + f64::from(k) * 0.1, &at, &mut pops);
             let n = pops.len() as u32;
             most = most.max(n);
             least = least.min(n);
@@ -5379,7 +5379,7 @@ mod tests {
 
         let stream_high = (0..200)
             .flat_map(|k| {
-                let time = 100.0 + k as f64 * 0.3;
+                let time = 100.0 + f64::from(k) * 0.3;
                 let mut pops = Vec::new();
                 ember_pops(&embers, time, &at, &mut pops);
                 let popped: Vec<[f32; 4]> = pops.iter().map(|i| i.centre).collect();
@@ -5462,7 +5462,7 @@ mod tests {
         assert_eq!(open_room[0].fill, 0.0, "nothing in sight weighs nothing");
         let mut shares = Vec::new();
         for frame in 0..14 {
-            let now = t + frame as f64 / 72.0;
+            let now = t + f64::from(frame) / 72.0;
             set.frame_with(&lib, now, &views, head, &narrowed);
             shares.push(set.share_of(emitter_key(&dust[0])));
         }
@@ -5516,11 +5516,11 @@ mod tests {
         let fire = EffectEmitter { id: "f".into(), scale: 1.5, ..emitter(EffectKind::Fire) };
         let bed = EffectEmitter { id: "c".into(), scale: 1.5, ..emitter(EffectKind::Coals) };
         let glow = |e: &[EffectEmitter], t: f64| simulate(e, t, &at).instances.iter().find(|i| i.params[3] == 3.0).unwrap().colour[0];
-        let with: Vec<f32> = (0..200).map(|k| glow(&[fire.clone(), bed.clone()], 50.0 + k as f64 * 0.05)).collect();
-        let alone = glow(&[bed.clone()], 50.0);
+        let with: Vec<f32> = (0..200).map(|k| glow(&[fire.clone(), bed.clone()], 50.0 + f64::from(k) * 0.05)).collect();
+        let alone = glow(std::slice::from_ref(&bed), 50.0);
         let (lo, hi) = with.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
         assert!(hi > 1.03 * lo && hi < 1.25 * alone && lo > 0.8 * alone, "{lo} to {hi}, alone {alone}");
-        assert!((0..50).map(|k| glow(&[bed.clone()], 50.0 + k as f64 * 0.05)).all(|g| g == alone), "alone it does not");
+        assert!((0..50).map(|k| glow(std::slice::from_ref(&bed), 50.0 + f64::from(k) * 0.05)).all(|g| g == alone), "alone it does not");
     }
 
     #[test]
@@ -5594,7 +5594,7 @@ mod tests {
         let f = &fire_frame(4);
         let n = ATLAS_SIZE as usize;
         let sum_in = |rows: std::ops::Range<usize>, channel: usize| -> f32 {
-            rows.flat_map(|y| (0..n).map(move |x| f[(y * n + x) * 4 + channel] as f32)).sum()
+            rows.flat_map(|y| (0..n).map(move |x| f32::from(f[(y * n + x) * 4 + channel]))).sum()
         };
         assert!(sum_in(n / 2..n, 3) > 1.5 * sum_in(0..n / 2, 3), "more flame below the middle");
         assert!(sum_in(n / 2..n, 0) > 2.0 * sum_in(0..n / 2, 0), "hotter below the middle");
@@ -5604,7 +5604,7 @@ mod tests {
     fn a_puff_lit_from_one_side_is_bright_on_that_side_and_glows_against_the_light() {
         let [front, back] = smoke_frame(3);
         let n = ATLAS_SIZE as usize;
-        let texel = |img: &[u8], x: usize, y: usize, c: usize| img[(y * n + x) * 4 + c] as f32;
+        let texel = |img: &[u8], x: usize, y: usize, c: usize| f32::from(img[(y * n + x) * 4 + c]);
         assert!(texel(&front, n / 2, n / 2, 3) > 200.0, "dense in the middle: {}", texel(&front, n / 2, n / 2, 3));
         assert_eq!(texel(&front, 1, 1, 3), 0.0, "nothing in the corner");
 
@@ -5658,7 +5658,7 @@ mod tests {
         let b = atlas_layers();
         assert_eq!(a.len(), ATLAS_LAYERS as usize);
         assert!(a.iter().all(|l| l.len() == (ATLAS_SIZE * ATLAS_SIZE * 4) as usize));
-        assert!(a == b);
+        assert_eq!(a, b);
     }
 
     #[test]
@@ -5819,7 +5819,7 @@ mod tests {
             "frames": frames,
         });
         std::fs::write(out.join("effects_golden.json"), serde_json::to_string(&golden).unwrap()).expect("golden");
-        eprintln!("wrote the atlas ({} layers), cutouts and {} golden frames to {}", layers.len(), golden["frames"].as_array().map_or(0, |f| f.len()), out.display());
+        eprintln!("wrote the atlas ({} layers), cutouts and {} golden frames to {}", layers.len(), golden["frames"].as_array().map_or(0, std::vec::Vec::len), out.display());
     }
 
     #[test]
@@ -5844,7 +5844,7 @@ mod tests {
                 for y in 0..n {
                     for x in 0..n {
                         let o = (y * n + x) * 4;
-                        let f = |img: &[u8], c: usize| img[o + c] as f32 / 255.0;
+                        let f = |img: &[u8], c: usize| f32::from(img[o + c]) / 255.0;
                         let toward = lp.x * lp.x * f(a, 0) + lp.y * lp.y * f(a, 1) + lp.z * lp.z * f(a, 2)
                             + ln.x * ln.x * f(b, 0) + ln.y * ln.y * f(b, 1) + ln.z * ln.z * f(b, 2);
                         let around = (f(a, 0) + f(a, 1) + f(a, 2) + f(b, 0) + f(b, 1) + f(b, 2)) / 6.0;
@@ -5861,7 +5861,7 @@ mod tests {
             for y in 0..n {
                 for x in 0..n {
                     let o = (y * n + x) * 4;
-                    let (heat, a) = (img[o] as f32 / 255.0, img[o + 3] as f32 / 255.0);
+                    let (heat, a) = (f32::from(img[o]) / 255.0, f32::from(img[o + 3]) / 255.0);
                     let c = super::super::tonemap::aces_fitted(flame_colour(heat) * FIRE_LEVEL) * a;
 
                     put((k % 16, 2 + k / 16), x, y, c.to_array());
@@ -5872,7 +5872,7 @@ mod tests {
             let img = &layers[layer as usize];
             for y in 0..n {
                 for x in 0..n {
-                    let a = img[(y * n + x) * 4 + 3] as f32 / 255.0;
+                    let a = f32::from(img[(y * n + x) * 4 + 3]) / 255.0;
                     put((cell, 2 + fire_rows), x, y, [a, a, a]);
                 }
             }
@@ -6042,7 +6042,7 @@ mod tests {
         let row = (w * 4).div_ceil(256) * 256;
         let readback = device.create_buffer(&BufferDescriptor {
             label: None,
-            size: (row * h) as u64,
+            size: u64::from(row * h),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -6076,7 +6076,7 @@ mod tests {
         let (mut sum, mut w, mut worst) = (Vec3::ZERO, 0.0f32, 0.0f32);
         for k in 0..2000 {
             let (mut s1, mut w1) = (Vec3::ZERO, 0.0f32);
-            for s in fire_sheets(&fire, 100.0 + k as f64 * 0.05) {
+            for s in fire_sheets(&fire, 100.0 + f64::from(k) * 0.05) {
                 let a = s.size * s.size * s.stretch * erosion_cover(s.stands) * rise_cover(s.risen);
                 s1 += s.base * a;
                 w1 += a;
@@ -6106,15 +6106,15 @@ mod tests {
         let mut sum = 0.0f64;
         let samples = 20000;
         for k in 0..samples {
-            let time = 100.0 + k as f64 * 0.0173;
+            let time = 100.0 + f64::from(k) * 0.0173;
             sum += fire_sheets(&fire, time)
                 .iter()
-                .map(|s| (s.size * s.size * s.stretch * lerp_at(&area, s.frame) * lerp_at(&cover, s.stands * 8.0) * lerp_at(&rise, s.risen * 8.0)) as f64)
+                .map(|s| f64::from(s.size * s.size * s.stretch * lerp_at(&area, s.frame) * lerp_at(&cover, s.stands * 8.0) * lerp_at(&rise, s.risen * 8.0)))
                 .sum::<f64>();
         }
-        eprintln!("const FLAME_AREA_MEAN: f32 = {:.6};", sum / samples as f64);
+        eprintln!("const FLAME_AREA_MEAN: f32 = {:.6};", sum / f64::from(samples));
         let g: Vec<u8> = (0..FIRE_FRAMES).flat_map(|k| fire_frame(k).chunks(4).filter(|t| t[3] > 128).map(|t| t[1]).collect::<Vec<_>>()).collect();
-        let q = |f: f32| g.iter().filter(|&&x| x as f32 >= f * 255.0).count() as f32 / g.len() as f32;
+        let q = |f: f32| g.iter().filter(|&&x| f32::from(x) >= f * 255.0).count() as f32 / g.len() as f32;
         eprintln!("depth over covered texels: >=0.25 {:.3}, >=0.5 {:.3}, >=0.75 {:.3}, >=0.9 {:.3}", q(0.25), q(0.5), q(0.75), q(0.9));
     }
 
@@ -6152,7 +6152,7 @@ mod tests {
             let start = std::time::Instant::now();
             let mut count = 0;
             for k in 0..200 {
-                count += simulate(emitters, 30.0 + k as f64 / 72.0, &at).instances.len();
+                count += simulate(emitters, 30.0 + f64::from(k) / 72.0, &at).instances.len();
             }
             (count / 200, start.elapsed().as_secs_f64() / 200.0 * 1e3)
         };
@@ -6165,7 +6165,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         for k in 0..2000 {
-            let t = 30.0 + k as f64 / 72.0;
+            let t = 30.0 + f64::from(k) / 72.0;
             std::hint::black_box(fire_light(&emitters[0], t, Vec3::ZERO, Quat::IDENTITY));
             std::hint::black_box(fire_glare(&emitters[0], t, Vec3::ZERO, Quat::IDENTITY));
         }
@@ -6187,7 +6187,7 @@ mod tests {
     fn every_particle_carries_its_velocity() {
 
         let check = |label: &str, at: f64, h: f32, frame: &dyn Fn(f64) -> EffectFrame, zeroed: bool| {
-            let (a, b) = (frame(at), frame(at + h as f64));
+            let (a, b) = (frame(at), frame(at + f64::from(h)));
             let mut moving = 0;
             let mut found = 0;
             for i in &a.instances {

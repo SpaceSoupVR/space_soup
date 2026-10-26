@@ -47,7 +47,7 @@ fn area_xz(poly: &[Vec3]) -> f32 {
     let mut twice = 0.0f64;
     for i in 0..poly.len() {
         let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
-        twice += a.x as f64 * b.z as f64 - b.x as f64 * a.z as f64;
+        twice += f64::from(a.x) * f64::from(b.z) - f64::from(b.x) * f64::from(a.z);
     }
     (twice.abs() * 0.5) as f32
 }
@@ -133,10 +133,10 @@ impl GroundOccluder {
             seen[start] = true;
             while let Some(k) = stack.pop() {
                 members.push(k);
-                let (ix, iz) = ((k as u32 % nx) as i64, (k as u32 / nx) as i64);
+                let (ix, iz) = (i64::from(k as u32 % nx), i64::from(k as u32 / nx));
                 for (dx, dz) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
                     let (jx, jz) = (ix + dx, iz + dz);
-                    if jx < 0 || jz < 0 || jx >= nx as i64 || jz >= nz as i64 {
+                    if jx < 0 || jz < 0 || jx >= i64::from(nx) || jz >= i64::from(nz) {
                         top = f32::INFINITY;
                         continue;
                     }
@@ -708,7 +708,7 @@ pub(crate) mod tests {
                 0 => Vec3::new(17.6 + rnd() * 4.8, 0.2 + rnd() * 1.6, 19.2 + rnd() * 1.6),
 
                 1 => Vec3::new(if rnd() < 0.5 { 4.0 + rnd() * 11.0 } else { 25.0 + rnd() * 11.0 }, 0.4 + rnd() * 2.0, 17.0 + rnd() * 6.0),
-                _ => Vec3::new(2.0 + rnd() * 36.0, ridge(0.0, 0.0) + 9.0 * rnd() + 8.2 * (rnd() < 0.3) as u8 as f32, 2.0 + rnd() * 36.0),
+                _ => Vec3::new(2.0 + rnd() * 36.0, ridge(0.0, 0.0) + 9.0 * rnd() + 8.2 * f32::from(u8::from(rnd() < 0.3)), 2.0 + rnd() * 36.0),
             };
             let mut h = Horizon::new(&g, eye, REACH, &[cave]);
             if !h.plugged() {
@@ -722,7 +722,7 @@ pub(crate) mod tests {
                     continue;
                 }
                 hidden += 1;
-                by_the_cave += !h.hides(&g, lo, hi) as u32;
+                by_the_cave += u32::from(!h.hides(&g, lo, hi));
                 for (corners, mid) in tris.iter().filter(|(_, m)| m.cmpge(lo).all() && m.cmple(hi).all()).step_by(3) {
                     let from = eye + (Vec3::new(rnd(), rnd(), rnd()) * 2.0 - 1.0).normalize_or_zero() * REACH * rnd();
                     let n = (corners[1] - corners[0]).cross(corners[2] - corners[0]);

@@ -1,4 +1,4 @@
-//! BRUSH_ASTC: encode the game's brush materials as ASTC, ahead, so the
+//! `BRUSH_ASTC`: encode the game's brush materials as ASTC, ahead, so the
 //! headset uploads a level's material arrays as they are -- 8 bits a texel
 //! against 32 -- instead of building every layer's mips at load
 //! (`BrushMaterials::from_astc`, `XrRenderer::set_brush_materials_from`).
@@ -49,9 +49,9 @@ fn library_sizes(library: &Path) -> Vec<(u32, u32)> {
         .flatten()
         .flatten()
         .filter_map(|e| image::image_dimensions(e.path().join("color.jpg")).ok())
-        .filter(|(w, h)| w % ASTC_BLOCK[0] as u32 == 0 && h % ASTC_BLOCK[1] as u32 == 0)
+        .filter(|(w, h)| w % u32::from(ASTC_BLOCK[0]) == 0 && h % u32::from(ASTC_BLOCK[1]) == 0)
         .collect();
-    sizes.sort();
+    sizes.sort_unstable();
     sizes.dedup();
     sizes
 }

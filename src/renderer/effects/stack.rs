@@ -481,7 +481,7 @@ impl EffectLibrary {
         let mut lib = Self::new();
         for a in &assets {
             if let Err(issues) = lib.add(a) {
-                errors.push(format!("effect `{}`: {}", a.name, issues.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")));
+                errors.push(format!("effect `{}`: {}", a.name, issues.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join("; ")));
             }
         }
         (lib, errors)
@@ -489,15 +489,12 @@ impl EffectLibrary {
 
     pub fn add(&mut self, a: &EffectAsset) -> Result<EffectId, Vec<Issue>> {
         let compiled = CompiledEffect::compile(a, books())?;
-        Ok(match self.effects.iter().position(|e| e.name == a.name) {
-            Some(i) => {
-                self.effects[i] = compiled;
-                i as EffectId
-            }
-            None => {
-                self.effects.push(compiled);
-                self.effects.len() as EffectId - 1
-            }
+        Ok(if let Some(i) = self.effects.iter().position(|e| e.name == a.name) {
+            self.effects[i] = compiled;
+            i as EffectId
+        } else {
+            self.effects.push(compiled);
+            self.effects.len() as EffectId - 1
         })
     }
 
@@ -753,7 +750,7 @@ impl BurstSet {
             if self.live[i].born.is_some() {
                 continue;
             }
-            let born = now - self.live[i].burst.age.max(0.0) as f64;
+            let born = now - f64::from(self.live[i].burst.age.max(0.0));
             self.live[i].born = Some(born);
             if self.live[i].standing.is_some() {
                 continue;
@@ -835,7 +832,7 @@ impl BurstSet {
                 let l = &mut self.live[i];
 
                 l.share = if l.frames == 0 { target[i] } else { l.share + (target[i] - l.share).clamp(-SHARE_STEP, SHARE_STEP) };
-                thinned += (l.share < 1.0) as u32;
+                thinned += u32::from(l.share < 1.0);
                 l.share
             } else {
                 let w = &others[i - bursts];
@@ -876,7 +873,7 @@ impl BurstSet {
             splashes_thinned,
             instances_wanted: count_wanted,
             instances: count,
-            frames_governed: self.stats.frames_governed + shed as u32,
+            frames_governed: self.stats.frames_governed + u32::from(shed),
             ..self.stats
         };
         drawn
@@ -895,10 +892,10 @@ impl BurstSet {
             let Some((pulse, energy)) = c.pulse_of(l) else { continue };
             let intensity = pulse.intensity * energy * brief_light_scale(exposure);
             if pulse.gate == Gate::VisibleOnly && !pulse_visible(intensity, exposure) {
-                self.stats.lights_gated += (l.frames == 0) as u32;
+                self.stats.lights_gated += u32::from(l.frames == 0);
                 continue;
             }
-            self.stats.lights += (l.frames == 0) as u32;
+            self.stats.lights += u32::from(l.frames == 0);
             out.push(pulse_light(&pulse, intensity, yaw_inv * (l.burst.position + l.burst.direction * (0.4 * c.reach.min(0.2)) - offset)));
         }
         out
@@ -1000,7 +997,7 @@ impl LiveBurst {
         if self.frames < frames {
             return f64::INFINITY;
         }
-        born + seconds as f64
+        born + f64::from(seconds)
     }
 
     fn seed(&self, c: &CompiledEffect) -> u64 {
@@ -1121,7 +1118,7 @@ impl Program {
         let (even, sun) = (even * a, sun * a);
         let x = at.yaw_inv * Vec3::X;
         let speed = (wind.x * wind.x + wind.z * wind.z).sqrt();
-        let drift = ((speed as f64 * cx.time).rem_euclid(10_000.0)) as f32;
+        let drift = ((f64::from(speed) * cx.time).rem_euclid(10_000.0)) as f32;
         let moving = at.yaw_inv * wind;
         Some(EffectInstance {
             centre: [centre.x, centre.y, centre.z, edge],
@@ -1199,7 +1196,7 @@ impl Program {
                         (f * a.cos() + radial * a.sin(), Vec3::ZERO, 3.5)
                     } else if j < lobes + 2 * side_pairs {
                         let k = j - lobes;
-                        let side = if k % 2 == 0 { 1.0 } else { -1.0 };
+                        let side = if k.is_multiple_of(2) { 1.0 } else { -1.0 };
                         let a = (90.0 - rake).to_radians();
                         (f * a.cos() + right * (side * a.sin()), f * (-0.018 * (k / 2) as f32), 5.0)
                     } else {
@@ -1241,7 +1238,7 @@ impl Program {
                     p.moving += (here - air_drift_back(air, &cx.air_clocks, p.p0, MOTION_H)) * (*strength / MOTION_H);
                 }
                 Step::Jitter { reach, pace } => {
-                    let seed = hash64(p.u[7].to_bits() as u64 ^ (p.u[9].to_bits() as u64) << 32);
+                    let seed = hash64(u64::from(p.u[7].to_bits()) ^ u64::from(p.u[9].to_bits()) << 32);
                     let wander = |x: f32| Vec3::new(noise1(x, seed), 0.6 * noise1(x, seed ^ 1), noise1(x, seed ^ 2)) * *reach;
                     let x = p.age * pace;
                     p.pos += wander(x);
@@ -1547,7 +1544,7 @@ pub(super) fn simulate_bursts(
                             count.shed += 1;
                             continue;
                         }
-                        let u = uniforms(hash64(own_seed ^ (j as u64 + 1).wrapping_mul(0x8cb9_2ba7_2f3d_8dd7)));
+                        let u = uniforms(hash64(own_seed ^ (u64::from(j) + 1).wrapping_mul(0x8cb9_2ba7_2f3d_8dd7)));
                         if let Some(inst) = p.particle(&cx, j, age, u) {
                             push(inst, &mut count);
                         }
@@ -1576,7 +1573,7 @@ pub(super) fn simulate_bursts(
                             count.shed += 1;
                             continue;
                         }
-                        let u = uniforms(hash64(own_seed ^ (j as u64 + 1).wrapping_mul(0x8cb9_2ba7_2f3d_8dd7)));
+                        let u = uniforms(hash64(own_seed ^ (u64::from(j) + 1).wrapping_mul(0x8cb9_2ba7_2f3d_8dd7)));
                         if let Some(inst) = p.particle(&cx, j, age - left, u) {
                             push(inst, &mut count);
                         }
@@ -1656,9 +1653,9 @@ pub(crate) mod tests {
         let mut overrides = Vec::new();
         let shipped = assets.len();
         for (a, origin) in assets.into_iter().map(|a| (a, "game/effects")).chain(templates::assets().into_iter().map(|a| (a, "built-in template"))) {
-            let report = a.check(books()).unwrap_or_else(|issues| panic!("{origin} `{}` is refused:\n  {}", a.name, issues.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("\n  ")));
+            let report = a.check(books()).unwrap_or_else(|issues| panic!("{origin} `{}` is refused:\n  {}", a.name, issues.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join("\n  ")));
             if origin == "game/effects" {
-                CompiledEffect::compile(&a, books()).unwrap_or_else(|issues| panic!("`{}` checks but does not compile: {}", a.name, issues.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")));
+                CompiledEffect::compile(&a, books()).unwrap_or_else(|issues| panic!("`{}` checks but does not compile: {}", a.name, issues.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join("; ")));
             }
             eprintln!(
                 "{origin:>17} {:<20} {:>4} instances, {:.3} megapixel-layers at {} m (one burst {} / {:.3}){}",
@@ -1698,7 +1695,7 @@ pub(crate) mod tests {
                 assert_eq!(first.screened_heat as usize, hot(&first));
                 assert!(second.over >= 3, "its smoke goes on: {} puffs", second.over);
                 if dt == 0.2 {
-                    flashes += (hot(&first) > 0) as u32;
+                    flashes += u32::from(hot(&first) > 0);
                     assert!(hot(&first) == 0 || hot(&first) == 6, "five jets and a core, or nothing: {}", hot(&first));
                 }
             }
@@ -1790,14 +1787,14 @@ pub(crate) mod tests {
         let (mut most, mut flashes, mut opacity_cold, mut opacity_hot) = (0u32, 0, 0.0f32, 0.0f32);
 
         for k in 0..108 {
-            let t = 50.0 + k as f64 / 36.0;
+            let t = 50.0 + f64::from(k) / 36.0;
             if k % 4 == 0 && k < 108 {
                 let heat = (k as f32 / 36.0 / 2.0).min(1.0);
                 set.add(&lib, EffectBurst { inputs: [heat, 0.0, 0.0, 0.0], ..shot(&lib, "muzzle_556_a2", 1000 + k as u64) });
             }
             let f = frame(&lib, &mut set, t, &at);
             most = most.max(f.over);
-            flashes += (f.screened_heat > 0) as u32;
+            flashes += u32::from(f.screened_heat > 0);
             let mean = f.instances[..f.over as usize].iter().map(|i| i.colour[3]).sum::<f32>() / f.over.max(1) as f32;
             if k == 12 {
                 opacity_cold = mean;
@@ -1814,7 +1811,7 @@ pub(crate) mod tests {
 
         let later = frame(&lib, &mut set, 53.0 + 2.5, &at);
         assert!(later.over >= 2 && later.over <= 14, "a thread from the hot barrel: {}", later.over);
-        let gone = frame(&lib, &mut set, 53.0 + c.seconds as f64 + 0.1, &at);
+        let gone = frame(&lib, &mut set, 53.0 + f64::from(c.seconds) + 0.1, &at);
         assert_eq!((gone.instances.len(), set.live.len()), (0, 0), "retired when its longest life has passed");
     }
 
@@ -1830,7 +1827,7 @@ pub(crate) mod tests {
                 let b = EffectBurst { inputs: [1.0, 0.0, 0.0, 0.0], ..shot(&lib, &name, seed) };
                 set.add(&lib, b);
                 for k in 0..80 {
-                    for i in &frame(&lib, &mut set, 10.0 + k as f64 * 0.07, &at).instances {
+                    for i in &frame(&lib, &mut set, 10.0 + f64::from(k) * 0.07, &at).instances {
                         let p = Vec3::from_slice(&i.centre[..3]);
                         let from = b.position.distance(p).min(b.port.unwrap().0.distance(p));
                         farthest = farthest.max(from + i.centre[3]);
@@ -1886,7 +1883,7 @@ pub(crate) mod tests {
                         moving += 1;
                         let next = Vec3::from_slice(&i.centre[..3]) + v * h as f32;
                         let nearest = later.instances.iter().map(|j| Vec3::from_slice(&j.centre[..3]).distance(next)).fold(f32::INFINITY, f32::min);
-                        found += (nearest < 0.1 * v.length() * h as f32 + 2e-5) as u32;
+                        found += u32::from(nearest < 0.1 * v.length() * h as f32 + 2e-5);
                     }
                 }
             }
@@ -2112,7 +2109,7 @@ pub(crate) mod tests {
                 2.5,
                 Vec3::new(0.3, 1.6, 0.4),
                 (0..6).map(|k| shot(k * 3, "fixture_sink", 100 + k as u64, 0.15 * k as f32)).collect(),
-                (0..24).map(|k| 9.0 + k as f64 / 36.0).collect(),
+                (0..24).map(|k| 9.0 + f64::from(k) / 36.0).collect(),
             ),
             (
                 "placed_stream",
@@ -2152,7 +2149,7 @@ pub(crate) mod tests {
             ),
         ];
         for (name, extra, exposure, head, events, times) in specs {
-            let mut texts: Vec<String> = extra.iter().map(|t| t.to_string()).collect();
+            let mut texts: Vec<String> = extra.iter().map(std::string::ToString::to_string).collect();
             texts.extend([&rifle, &pistol, &quiet, &steam, &mist, &fog].into_iter().filter(|t| t.contains(&format!("\"name\": \"{name}\""))).cloned());
             if texts.is_empty() {
                 continue;
@@ -2278,7 +2275,7 @@ pub(crate) mod tests {
         };
 
         for k in 0..12 {
-            step(&mut set, 9.7 + k as f64 / 36.0, true);
+            step(&mut set, 9.7 + f64::from(k) / 36.0, true);
         }
         let wants = governor_wants(&emitters, &|_| true, &splashes, &set.splash_measured, head, &[]);
         let all: f32 = wants.iter().map(|w| w.count).sum();
@@ -2287,7 +2284,7 @@ pub(crate) mod tests {
         let mut sizes = Vec::new();
         let mut last = EffectFrame::default();
         for k in 0..16 {
-            last = step(&mut set, 10.0 + k as f64 / 36.0, true);
+            last = step(&mut set, 10.0 + f64::from(k) / 36.0, true);
             sizes.push(last.instances.len());
         }
         let s = set.stats;
@@ -2304,7 +2301,7 @@ pub(crate) mod tests {
 
         set.budget.instances = (0.03 * all) as u32;
         for k in 16..32 {
-            last = step(&mut set, 10.0 + k as f64 / 36.0, true);
+            last = step(&mut set, 10.0 + f64::from(k) / 36.0, true);
         }
         let wet = |s: &Splash| set.share_of(splash_key(s));
         assert!(set.stats.splashes_thinned > 0 && last.bursts.splash_shed > 0, "{:?} {:?}", set.stats, last.bursts);
@@ -2322,7 +2319,7 @@ pub(crate) mod tests {
 
         set.budget = FrameBudget::default();
         for k in 32..56 {
-            last = step(&mut set, 10.0 + k as f64 / 36.0, true);
+            last = step(&mut set, 10.0 + f64::from(k) / 36.0, true);
         }
         assert_eq!((set.stats.emitters_thinned, set.stats.splashes_thinned, last.bursts.emitter_shed, last.bursts.splash_shed), (0, 0, 0, 0));
     }
@@ -2343,7 +2340,7 @@ pub(crate) mod tests {
         let mut last = EffectFrame::default();
         let mut sizes = Vec::new();
         for k in 0..14 {
-            last = frame(&lib, &mut set, 2.0 + k as f64 / 36.0, &at);
+            last = frame(&lib, &mut set, 2.0 + f64::from(k) / 36.0, &at);
             sizes.push(last.over);
         }
         let s = set.stats;
@@ -2371,7 +2368,7 @@ pub(crate) mod tests {
 
         set.budget = FrameBudget::default();
         for k in 14..30 {
-            last = frame(&lib, &mut set, 2.0 + k as f64 / 36.0, &at);
+            last = frame(&lib, &mut set, 2.0 + f64::from(k) / 36.0, &at);
         }
         assert_eq!((set.stats.thinned, last.bursts.shed), (0, 0));
     }
@@ -2395,8 +2392,7 @@ pub(crate) mod tests {
             variation: Default::default(),
         };
         println!(
-            "| scale | governor | facing | emitters seen | bursts live / seen | splashes seen | instances (worst) | over + screened | draws | est. fill wanted -> held (budget {}) | drawn fill, worst | instances wanted -> held (budget {}) | thinned: bursts / emitters / splashes | shed a frame: bursts / emitters / splashes | CPU ms a frame (median) |",
-            FRAME_FILL_BUDGET, FRAME_INSTANCE_BUDGET
+            "| scale | governor | facing | emitters seen | bursts live / seen | splashes seen | instances (worst) | over + screened | draws | est. fill wanted -> held (budget {FRAME_FILL_BUDGET}) | drawn fill, worst | instances wanted -> held (budget {FRAME_INSTANCE_BUDGET}) | thinned: bursts / emitters / splashes | shed a frame: bursts / emitters / splashes | CPU ms a frame (median) |"
         );
         println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
         let mut worst_at_16 = (0.0f32, 0usize, 0.0f32);
@@ -2433,7 +2429,7 @@ pub(crate) mod tests {
                     set.budget = FrameBudget { fill: 1e9, instances: u32::MAX };
                 }
                 for step in 0..(6 * 36) {
-                    let time = 100.0 + step as f64 / 36.0;
+                    let time = 100.0 + f64::from(step) / 36.0;
 
                     while (shots as f64) < (time - 100.0) * 12.5 {
                         for (u, post) in posts.iter().enumerate() {
@@ -2483,30 +2479,30 @@ pub(crate) mod tests {
                     if step >= 4 * 36 {
                         worst_fill = worst_fill.max(drawn_fill);
                         worst_instances = worst_instances.max(f.instances.len());
-                        shed[0] += f.bursts.shed as f64;
-                        shed[1] += f.bursts.emitter_shed as f64;
-                        shed[2] += f.bursts.splash_shed as f64;
+                        shed[0] += f64::from(f.bursts.shed);
+                        shed[1] += f64::from(f.bursts.emitter_shed);
+                        shed[2] += f64::from(f.bursts.splash_shed);
                     }
                     if step >= 4 * 36 {
                         times.push(took);
                         frames += 1;
                         for (k, v) in [
                             seen.iter().filter(|s| **s).count() as f64,
-                            set.stats.live as f64,
-                            set.stats.seen as f64,
+                            f64::from(set.stats.live),
+                            f64::from(set.stats.seen),
                             wet.len() as f64,
                             f.instances.len() as f64,
-                            f.over as f64,
-                            f.screened as f64,
-                            stats.draws as f64,
-                            set.stats.fill_wanted as f64,
-                            set.stats.fill as f64,
-                            set.stats.instances_wanted as f64,
-                            set.stats.instances as f64,
-                            set.stats.thinned as f64,
-                            set.stats.emitters_thinned as f64,
-                            set.stats.splashes_thinned as f64,
-                            drawn_fill as f64,
+                            f64::from(f.over),
+                            f64::from(f.screened),
+                            f64::from(stats.draws),
+                            f64::from(set.stats.fill_wanted),
+                            f64::from(set.stats.fill),
+                            f64::from(set.stats.instances_wanted),
+                            f64::from(set.stats.instances),
+                            f64::from(set.stats.thinned),
+                            f64::from(set.stats.emitters_thinned),
+                            f64::from(set.stats.splashes_thinned),
+                            f64::from(drawn_fill),
                         ]
                         .into_iter()
                         .enumerate()
@@ -2515,7 +2511,7 @@ pub(crate) mod tests {
                         }
                     }
                 }
-                let n = frames as f64;
+                let n = f64::from(frames);
                 times.sort_by(f64::total_cmp);
                 println!(
                     "| {units}x | {} | {facing} | {:.0} of {} | {:.0} / {:.0} | {:.0} of {} | {:.0} ({}) | {:.0} + {:.0} | {:.1} | {:.2} -> {:.2} | {:.2}, {:.2} | {:.0} -> {:.0} | {:.0} / {:.0} / {:.0} | {:.0} / {:.0} / {:.0} | {:.3} |",

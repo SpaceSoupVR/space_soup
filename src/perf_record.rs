@@ -48,7 +48,7 @@ pub struct WindowRecord {
     #[serde(default)]
     pub thermal: BTreeMap<String, String>,
     /// Frames in the window whose GPU time passed 1.5 x the app's frame
-    /// period (13.9 ms at 72 Hz, 27.8 ms under SpaceWarp).
+    /// period (13.9 ms at 72 Hz, 27.8 ms under `SpaceWarp`).
     #[serde(default)]
     pub over_budget: u64,
 }

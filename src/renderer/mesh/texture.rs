@@ -24,7 +24,7 @@ pub(crate) fn load_primitive_texture(
     let upload = |map: ModelMap, label: &str, px: &(Vec<u8>, u32, u32)| {
         let astc = dir.as_deref().and_then(|d| astc_texture(device, queue, label, &model_astc_path(d, material.index(), map), px));
         if px.1 * px.2 > 1 {
-            MODEL_ASTC_COUNT.with(|c| c.set((c.get().0 + astc.is_some() as u32, c.get().1 + 1)));
+            MODEL_ASTC_COUNT.with(|c| c.set((c.get().0 + u32::from(astc.is_some()), c.get().1 + 1)));
         }
         astc.unwrap_or_else(|| upload_mipped(device, queue, label, px))
     };
@@ -42,42 +42,38 @@ pub fn material_images(material: &gltf::Material, images: &[gltf::image::Data]) 
 
     let transmission = material
         .transmission()
-        .map(|t| t.transmission_factor())
-        .unwrap_or(0.0);
+        .map_or(0.0, |t| t.transmission_factor());
     // MASK (foliage cards, grates, fences): cut where the material says.
     // Forced opaque with the rest, each drew as its whole quad (2026-10-23).
     let mask = (material.alpha_mode() == gltf::material::AlphaMode::Mask).then(|| material.alpha_cutoff().unwrap_or(0.5));
     let force_opaque =
         mask.is_none() && material.alpha_mode() != gltf::material::AlphaMode::Blend && transmission <= 0.0;
 
-    let base = match pbr.base_color_texture() {
-        Some(info) => {
-            let mut px = decode_image(&images[info.texture().source().index()], force_opaque);
-            if let Some(cutoff) = mask {
-                px.0.chunks_exact_mut(4).for_each(|p| p[3] = mask_alpha(p[3], cutoff));
-            }
-            px
+    let base = if let Some(info) = pbr.base_color_texture() {
+        let mut px = decode_image(&images[info.texture().source().index()], force_opaque);
+        if let Some(cutoff) = mask {
+            px.0.chunks_exact_mut(4).for_each(|p| p[3] = mask_alpha(p[3], cutoff));
         }
-        None => {
-            let c = pbr.base_color_factor();
-            (
-                vec![
-                    (c[0] * 255.0) as u8,
-                    (c[1] * 255.0) as u8,
-                    (c[2] * 255.0) as u8,
-                    if let Some(cutoff) = mask {
-                        mask_alpha((c[3].clamp(0.0, 1.0) * 255.0).round() as u8, cutoff)
-                    } else if force_opaque {
-                        255
-                    } else {
+        px
+    } else {
+        let c = pbr.base_color_factor();
+        (
+            vec![
+                (c[0] * 255.0) as u8,
+                (c[1] * 255.0) as u8,
+                (c[2] * 255.0) as u8,
+                if let Some(cutoff) = mask {
+                    mask_alpha((c[3].clamp(0.0, 1.0) * 255.0).round() as u8, cutoff)
+                } else if force_opaque {
+                    255
+                } else {
 
-                        (c[3] * (1.0 - transmission) * 255.0) as u8
-                    },
-                ],
-                1,
-                1,
-            )
-        }
+                    (c[3] * (1.0 - transmission) * 255.0) as u8
+                },
+            ],
+            1,
+            1,
+        )
     };
 
     let emissive = match material.emissive_texture() {
@@ -133,7 +129,7 @@ pub fn model_image_fingerprint(map: ModelMap, px: &(Vec<u8>, u32, u32)) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (MODEL_FILTER_VERSION << 8) ^ map as u64;
     let mut fold = |word: u64| h = (h ^ word).wrapping_mul(PRIME);
-    fold(((px.1 as u64) << 32) | px.2 as u64);
+    fold((u64::from(px.1) << 32) | u64::from(px.2));
     for c in px.0.chunks(8) {
         let mut word = [0u8; 8];
         word[..c.len()].copy_from_slice(c);
@@ -180,7 +176,7 @@ impl Drop for ModelAstcScope {
 /// is an encoding of exactly `px` (its fingerprint) with every mip.
 fn astc_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, path: &std::path::Path, px: &(Vec<u8>, u32, u32)) -> Option<wgpu::Texture> {
     use crate::renderer::terrain_pipeline::mip_levels_for;
-    if !device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC) || px.1 % 4 != 0 || px.2 % 4 != 0 {
+    if !device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC) || !px.1.is_multiple_of(4) || !px.2.is_multiple_of(4) {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
@@ -208,7 +204,7 @@ fn astc_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, path: &
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let (bw, bh) = (a.block[0] as u32, a.block[1] as u32);
+    let (bw, bh) = (u32::from(a.block[0]), u32::from(a.block[1]));
     for (level, data) in a.data[0].iter().enumerate() {
         let (lw, lh) = ((a.width >> level).max(1), (a.height >> level).max(1));
         let (cols, rows) = (lw.div_ceil(bw), lh.div_ceil(bh));
@@ -226,7 +222,7 @@ fn astc_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, path: &
 /// gone, so the mesh shaders' fixed alpha test (`tex_color.a < 0.35`) cuts
 /// it where glTF says, and its mips average to the share of it kept.
 pub fn mask_alpha(a: u8, cutoff: f32) -> u8 {
-    if a as f32 >= cutoff.clamp(0.0, 1.0) * 255.0 { 255 } else { 0 }
+    if f32::from(a) >= cutoff.clamp(0.0, 1.0) * 255.0 { 255 } else { 0 }
 }
 
 static GLTF_ROUGHNESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -273,8 +269,8 @@ mod gloss_tests {
     #[test]
     fn a_half_rough_material_takes_the_shaders_material_path() {
 
-        assert!((material_gloss_alpha(0.7, true) as f32 / 255.0) < 0.996);
-        assert!((material_gloss_alpha(1.0, true) as f32 / 255.0) >= 0.996);
+        assert!((f32::from(material_gloss_alpha(0.7, true)) / 255.0) < 0.996);
+        assert!((f32::from(material_gloss_alpha(1.0, true)) / 255.0) >= 0.996);
     }
 }
 
@@ -993,14 +989,14 @@ mod sun_mask_packing_tests {
         for blue in [0u8, 1, 64, 128, 200, 255] {
             let [r, g] = pack_sun_mask_texel(&[77, 255, blue, 255]);
             assert_eq!(r, 77, "the distance must pass through untouched");
-            let g = g as f32 / 255.0;
+            let g = f32::from(g) / 255.0;
             assert!(g > 0.25, "a baked texel read as unbaked");
             let decoded = (g - 0.5).max(0.0) * 2.0 * range;
-            let written = blue as f32 / 255.0 * range;
+            let written = f32::from(blue) / 255.0 * range;
             assert!((decoded - written).abs() < 0.04, "blue {blue}: baked {written}, the shader reads {decoded}");
         }
         let [_, g] = pack_sun_mask_texel(&NEUTRAL_SUN_MASK);
-        assert!((g as f32 / 255.0) < 0.25, "the neutral mask read as baked");
+        assert!((f32::from(g) / 255.0) < 0.25, "the neutral mask read as baked");
     }
 }
 

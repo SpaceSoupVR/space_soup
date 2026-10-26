@@ -37,7 +37,7 @@ pub struct SkyFlow {
 
 pub fn shader() -> String {
     format!(
-        r#"
+        r"
 {motion}
 {flow}
 
@@ -77,7 +77,7 @@ struct SkyFlow {{
     }}
     return motion_of(cam.curr * vec4<f32>(dir, 0.0), cam.prev * vec4<f32>(back, 0.0));
 }}
-"#,
+",
         motion = motion_block(),
         flow = crate::renderer::cloud_sky::cloud_flow_wgsl(),
         contrast = BRIGHT_LAYER_CONTRAST,
@@ -236,14 +236,14 @@ mod tests {
 
     fn half(b: &[u8]) -> f32 {
         let h = u16::from_le_bytes([b[0], b[1]]);
-        let (s, e, m) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+        let (s, e, m) = (u32::from(h >> 15), i32::from((h >> 10) & 0x1f), f32::from(h & 0x3ff));
         let v = if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
         if s == 1 { -v } else { v }
     }
 
     fn read(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, layer: u32, w: u32, h: u32, bpp: u32) -> Vec<u8> {
         let row = (w * bpp).div_ceil(256) * 256;
-        let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: u64::from(row * h), usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
         let mut enc = device.create_command_encoder(&Default::default());
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
@@ -426,14 +426,14 @@ mod tests {
                 let g = got[(j * W + i) as usize];
                 if a > 0.995 {
                     gaps += 1;
-                    still += (g.length() < 1e-3) as u32;
+                    still += u32::from(g.length() < 1e-3);
                 } else if a < 0.1 && h > 0.0 {
                     let v = [texel(uv, &|k| half(&alt[k * 8 + 4..])), texel(uv, &|k| half(&alt[k * 8 + 6..]))];
                     let p = d * cs::flow_distance(eye.y, h, d.y) - Vec3::new(v[0], 0.0, v[1]) * dt;
                     let back = d.lerp(p.normalize(), layer_motion_weight(1.0 - a, crate::renderer::space_warp::BRIGHT_LAYER_CONTRAST)).normalize();
                     let want = ndc_of(curr, d) - ndc_of(curr, back);
                     moving += 1;
-                    close += ((g - want).length() < 0.15 * want.length() + 2e-3) as u32;
+                    close += u32::from((g - want).length() < 0.15 * want.length() + 2e-3);
                 }
             }
         }

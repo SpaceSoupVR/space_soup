@@ -33,7 +33,7 @@
 //! Clumps are drawn as LUMPS (`SHADE_LUMP`): one atlas read of a lumpy
 //! blob's normal, lit by the sun with a wet sheen and by the room's light,
 //! so a clump is a solid thing and not a flat dab. Every clump carries its
-//! velocity for the SpaceWarp motion pass.
+//! velocity for the `SpaceWarp` motion pass.
 //!
 //! See docs/engine/mud-and-deform.md.
 
@@ -148,14 +148,14 @@ pub fn blast_energy(radius: f32, mud: f32) -> f32 {
     }
     let (mut lo, mut hi) = (1e-6f32.ln(), 1e10f32.ln());
     for _ in 0..60 {
-        let mid = 0.5 * (lo + hi);
+        let mid = f32::midpoint(lo, hi);
         if crater_radius(mid.exp(), mud) < radius {
             lo = mid;
         } else {
             hi = mid;
         }
     }
-    (0.5 * (lo + hi)).exp()
+    f32::midpoint(lo, hi).exp()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -423,7 +423,7 @@ pub fn landings(s: &Splash) -> Vec<Landing> {
             let heading = flat.normalize_or(Vec3::X);
             let size = if c.fine { shape.speck } else { c.size * shape.cluster };
             Landing {
-                at: s.born + (c.leaves + c.flies) as f64,
+                at: s.born + f64::from(c.leaves + c.flies),
                 centre: [pos.x, pos.z],
                 radius: 0.5 * PAT_WIDTH * size,
                 heading: [heading.x, heading.z],
@@ -472,7 +472,7 @@ impl MudLandings {
 /// a domed top, and small bumps over it.
 pub fn lump_frame(variant: u32) -> Vec<u8> {
     let n = ATLAS_SIZE as usize;
-    let seed = 0x6c75_6d70u64 ^ ((variant as u64 + 1) << 24);
+    let seed = 0x6c75_6d70u64 ^ ((u64::from(variant) + 1) << 24);
     let u = uniforms(hash64(seed));
     let harmonics: [(f32, f32); 5] = std::array::from_fn(|k| (0.13 * lerp(0.4, 1.2, u[k]) / (k as f32 + 1.0).powf(0.8), u[k + 5] * std::f32::consts::TAU));
     let outline = move |a: f32| 0.72 * (1.0 + harmonics.iter().enumerate().map(|(k, (amp, ph))| amp * ((k as f32 + 2.0) * a + ph).cos()).sum::<f32>());
@@ -605,7 +605,7 @@ mod tests {
                 let (last, vel) = clump_at(c, c.leaves + c.flies - 1e-3).expect("drawn until it lands");
                 assert!((last.x - l.centre[0]).abs() < 0.05 && (last.z - l.centre[1]).abs() < 0.05, "{last} vs {:?}", l.centre);
                 assert!(last.y.abs() < 0.01 + 1.1e-3 * vel.y.abs(), "it lands on the mud: {} at {} m/s", last.y, vel.y);
-                assert!(l.at <= s.born + shape.seconds as f64 + 1e-3, "{} after {}", l.at, shape.seconds);
+                assert!(l.at <= s.born + f64::from(shape.seconds) + 1e-3, "{} after {}", l.at, shape.seconds);
             }
         }
     }
@@ -636,7 +636,7 @@ mod tests {
                 for x in n / 4..3 * n / 4 {
                     let p = at(x, y);
                     if p[3] == 255 {
-                        mean += Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32) / 127.5 - Vec3::ONE;
+                        mean += Vec3::new(f32::from(p[0]), f32::from(p[1]), f32::from(p[2])) / 127.5 - Vec3::ONE;
                     }
                 }
             }

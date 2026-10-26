@@ -74,7 +74,7 @@ fn fold_image(h: &mut u64, img: Option<&TerrainImage>) {
     match img {
         None => fold(u64::MAX),
         Some(i) => {
-            fold(((i.width as u64) << 32) | i.height as u64);
+            fold((u64::from(i.width) << 32) | u64::from(i.height));
             for c in i.rgba.chunks(8) {
                 let mut word = [0u8; 8];
                 word[..c.len()].copy_from_slice(c);
@@ -140,7 +140,7 @@ pub fn solid_block(rgba: [u8; 4]) -> [u8; 16] {
     let mut block = [0u8; 16];
     block[..8].copy_from_slice(&[0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
     for (i, c) in rgba.iter().enumerate() {
-        block[8 + 2 * i..10 + 2 * i].copy_from_slice(&(*c as u16 * 257).to_le_bytes());
+        block[8 + 2 * i..10 + 2 * i].copy_from_slice(&(u16::from(*c) * 257).to_le_bytes());
     }
     block
 }
@@ -193,7 +193,7 @@ pub(crate) fn astc_array_texture(device: &Device, queue: &Queue, map: BrushMap, 
         usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let (bw, bh) = (ASTC_BLOCK[0] as u32, ASTC_BLOCK[1] as u32);
+    let (bw, bh) = (u32::from(ASTC_BLOCK[0]), u32::from(ASTC_BLOCK[1]));
     for (slot, chain) in layers.iter().enumerate() {
         for (level, data) in chain.iter().enumerate() {
             let (lw, lh) = ((w >> level).max(1), (h >> level).max(1));
@@ -229,7 +229,7 @@ impl BrushMaterials {
             return Err("this GPU reads no ASTC".into());
         }
         let size = brush_array_size(colours);
-        if size.0 % ASTC_BLOCK[0] as u32 != 0 || size.1 % ASTC_BLOCK[1] as u32 != 0 {
+        if !size.0.is_multiple_of(u32::from(ASTC_BLOCK[0])) || !size.1.is_multiple_of(u32::from(ASTC_BLOCK[1])) {
             return Err(format!("{}x{} is not a whole number of blocks", size.0, size.1));
         }
         let images = |map: BrushMap| match map {
@@ -266,7 +266,7 @@ pub fn load_material_maps(game_dir: &Path, id: &str) -> [Option<TerrainImage>; 4
     if let (Some(img), Some((lo, hi))) = (rough.as_mut(), roughness_range(game_dir, id)) {
         for px in img.rgba.chunks_exact_mut(4) {
             for c in &mut px[..3] {
-                let r = lo + (*c as f32 / 255.0) * (hi - lo);
+                let r = lo + (f32::from(*c) / 255.0) * (hi - lo);
                 *c = (r.clamp(0.0, 1.0) * 255.0).round() as u8;
             }
         }
@@ -451,7 +451,7 @@ mod tests {
             ),
         });
         let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
-        let bytes = (w * h * 16) as u64;
+        let bytes = u64::from(w * h * 16);
         let out = device.create_buffer(&BufferDescriptor { label: None, size: bytes, usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
         let back = device.create_buffer(&BufferDescriptor { label: None, size: bytes, usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST, mapped_at_creation: false });
         let params = wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&[layer, level, w, h]), usage: BufferUsages::UNIFORM });
@@ -550,7 +550,7 @@ mod tests {
 
     /// A real material encoded by `bin/brush_astc` against its RGBA upload:
     /// the difference must be ASTC's own error, not a flipped channel, an
-    /// upside-down layer or other images. Set BRUSH_ASTC_MATERIAL to an
+    /// upside-down layer or other images. Set `BRUSH_ASTC_MATERIAL` to an
     /// encoded material's folder (`<game>/materials/<id>`); skipped without.
     #[test]
     fn an_encoded_library_material_reads_as_its_rgba_upload() {
@@ -573,7 +573,7 @@ mod tests {
             for level in [0, levels / 2, levels - 1] {
                 let (a, b) = (read_layer(&device, &queue, &astc, 0, level), read_layer(&device, &queue, &rgba, 0, level));
                 let n = (a.len() * 3) as f64;
-                let sq: f64 = a.iter().zip(&b).flat_map(|(x, y)| (0..3).map(move |c| ((x[c] - y[c]) as f64).powi(2))).sum();
+                let sq: f64 = a.iter().zip(&b).flat_map(|(x, y)| (0..3).map(move |c| f64::from(x[c] - y[c]).powi(2))).sum();
                 let psnr = 10.0 * (1.0 / (sq / n).max(1e-12)).log10();
                 eprintln!("{id} {} level {level}: PSNR {psnr:.1} dB", map.name());
                 assert!(psnr > 30.0, "{id} {} level {level}: PSNR {psnr:.1} dB is not ASTC's error", map.name());

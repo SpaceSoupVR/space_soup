@@ -115,12 +115,9 @@ pub fn relit_probe_source(
             return Some(faces);
         }
         let unlit;
-        let lamps = match lamps(i) {
-            Some(l) => l,
-            None => {
-                unlit = vec![0u8; faces.len()];
-                unlit
-            }
+        let lamps = if let Some(l) = lamps(i) { l } else {
+            unlit = vec![0u8; faces.len()];
+            unlit
         };
         Some(relight_probe_faces(&faces, &lamps, k))
     })
@@ -231,7 +228,7 @@ impl TimeOfDayRuntime {
             }
             self.forced = Some(forced);
         }
-        self.seconds += dt.max(0.0) as f64;
+        self.seconds += f64::from(dt.max(0.0));
         let hour = self.hour();
         let moved = self.requested_hour.is_none_or(|h| {
             let d = (hour - h).rem_euclid(24.0);
@@ -444,15 +441,15 @@ mod tests {
         let (k1, _) = at(&mut w, hours[1].0);
         let on = if k1.t < 0.5 { k1.a } else { k1.b };
         assert!(on == 1 && (k1.t < 0.02 || k1.t > 0.98), "{k1:?}");
-        let (k, _) = at(&mut w, 0.5 * (hours[1].0 + hours[2].0));
+        let (k, _) = at(&mut w, f32::midpoint(hours[1].0, hours[2].0));
         assert!([k.a, k.b].contains(&1) && [k.a, k.b].contains(&2) && (k.t - 0.5).abs() < 0.15, "{k:?}");
-        let prepared = w.prepare(0.5 * (hours[1].0 + hours[2].0), 0.0, true);
+        let prepared = w.prepare(f32::midpoint(hours[1].0, hours[2].0), 0.0, true);
         let lit = crate::renderer::mesh::lightmap_mips_f16(
             &w.layers.as_ref().unwrap().relit(&prepared.weights),
             2,
             2,
         );
         assert!(prepared.atlas.is_some() && !lit.is_empty());
-        assert!(w.prepare(0.5 * (hours[1].0 + hours[2].0) + 0.5, 0.0, false).atlas.is_some(), "half an hour on relights");
+        assert!(w.prepare(f32::midpoint(hours[1].0, hours[2].0) + 0.5, 0.0, false).atlas.is_some(), "half an hour on relights");
     }
 }

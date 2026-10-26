@@ -124,12 +124,12 @@ impl SlopeSplit {
 
         mix(chunks.len() as u64);
         for c in chunks.iter().step_by((chunks.len() / 997).max(1)) {
-            mix(c.first_index as u64);
-            mix(c.index_count as u64);
+            mix(u64::from(c.first_index));
+            mix(u64::from(c.index_count));
         }
         let step = (idx.len() / 997).max(1);
         for i in idx.iter().step_by(step) {
-            mix(*i as u64);
+            mix(u64::from(*i));
         }
         (verts.as_ptr() as usize, verts.len(), idx.as_ptr() as usize, idx.len(), threshold_deg.to_bits(), h)
     }
@@ -185,12 +185,12 @@ impl SlopeSplit {
             if b == crate::renderer::ground_lod::SLIVER_RUN {
 
                 let count = chunks[k].index_count;
-                self.gentle_total -= self.gentle[k] as u64;
-                self.steep_total -= self.steep[k] as u64;
+                self.gentle_total -= u64::from(self.gentle[k]);
+                self.steep_total -= u64::from(self.steep[k]);
                 for (c, n) in self.classes[k].iter().enumerate() {
-                    self.class_totals[c % 3] -= *n as u64;
+                    self.class_totals[c % 3] -= u64::from(*n);
                 }
-                self.class_totals[0] += count as u64;
+                self.class_totals[0] += u64::from(count);
                 (self.gentle[k], self.steep[k]) = (0, 0);
                 self.classes[k] = [0, 0, 0, count, 0, 0, 0, 0, 0];
                 k += 1;
@@ -316,11 +316,11 @@ impl SlopeSplit {
             let count: [u32; 9] = std::array::from_fn(|b| buckets[b].len() as u32);
             let (soft, hard) = (count[0] + count[1] + count[2], count[6] + count[7] + count[8]);
             gentle.push(soft);
-            gentle_total += soft as u64;
+            gentle_total += u64::from(soft);
             steep.push(hard);
-            steep_total += hard as u64;
+            steep_total += u64::from(hard);
             for b in 0..9 {
-                class_totals[b % 3] += count[b] as u64;
+                class_totals[b % 3] += u64::from(count[b]);
             }
             classes.push(count);
             let mut at = start;
@@ -403,7 +403,7 @@ fn blocks_key(blocks: Option<&[u32]>) -> u64 {
     let Some(blocks) = blocks.filter(|b| b.iter().any(|x| *x != u32::MAX)) else { return 0 };
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for (i, b) in blocks.iter().enumerate() {
-        h ^= (*b as u64) ^ ((i as u64) << 32);
+        h ^= u64::from(*b) ^ ((i as u64) << 32);
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     h | 1
@@ -411,7 +411,7 @@ fn blocks_key(blocks: Option<&[u32]>) -> u64 {
 
 fn lattice_key(lattice: Option<[u32; 2]>) -> u64 {
     match lattice {
-        Some([x, z]) if x > 0 && z > 0 => 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(1 + x as u64 + ((z as u64) << 32)),
+        Some([x, z]) if x > 0 && z > 0 => 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(1 + u64::from(x) + (u64::from(z) << 32)),
         _ => 0,
     }
 }
@@ -458,7 +458,7 @@ impl CellSlopes {
             for z in 0..cz {
                 let mut row = 0u32;
                 for x in 0..cx {
-                    row += hit(kinds[(z * cx + x) as usize]) as u32;
+                    row += u32::from(hit(kinds[(z * cx + x) as usize]));
                     sat[((z + 1) * (cx + 1) + x + 1) as usize] = sat[(z * (cx + 1) + x + 1) as usize] + row;
                 }
             }
@@ -876,7 +876,7 @@ mod tests {
 
         let mut posed = verts.clone();
         let split = SlopeSplit::new(&posed, &idx, &chunks, 18.0);
-        for v in posed.iter_mut() {
+        for v in &mut posed {
             v.position[1] -= 0.3;
             v.normal[1] += 1e-7;
         }
@@ -919,8 +919,8 @@ mod tests {
         assert!(plain.piece_runs.is_empty());
         assert!(split.steep_total > 0 && split.gentle_total > 0, "the hills have both kinds at {threshold} degrees");
         let tri_set = |idx: &[u32]| {
-            let mut t: Vec<[u32; 3]> = idx.chunks_exact(3).map(|t| { let mut t = [t[0], t[1], t[2]]; t.sort(); t }).collect();
-            t.sort();
+            let mut t: Vec<[u32; 3]> = idx.chunks_exact(3).map(|t| { let mut t = [t[0], t[1], t[2]]; t.sort_unstable(); t }).collect();
+            t.sort_unstable();
             t
         };
         assert_eq!(tri_set(&split.indices), tri_set(&plain.indices), "the same triangles");
@@ -936,7 +936,7 @@ mod tests {
             laid += 1;
             let mut held = Vec::new();
             assert!(n <= 9, "a chunk is at most nine pieces");
-            for [first, count, id, bucket] in &split.piece_runs[at as usize..(at + n as u32) as usize] {
+            for [first, count, id, bucket] in &split.piece_runs[at as usize..(at + u32::from(n)) as usize] {
                 let (id, slope) = (*id as usize, *bucket as usize / 3);
                 assert_eq!(split.classes[id][*bucket as usize], *count);
                 assert!(id >= real);

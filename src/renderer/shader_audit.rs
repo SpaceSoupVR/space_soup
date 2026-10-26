@@ -100,7 +100,7 @@ impl Walk<'_> {
 
     fn walk(&mut self, block: &Block, mut control: Rate, in_loop: bool, record: bool) -> (bool, bool) {
         let mut leaves = false;
-        for statement in block.iter() {
+        for statement in block {
             match statement {
                 Statement::Emit(range) => {
                     if record {
@@ -119,29 +119,26 @@ impl Walk<'_> {
                 }
                 Statement::If { condition, accept, reject } => {
                     let known = super::shader_inlining::const_bool(self.module, &self.function.expressions, *condition);
-                    match known {
-                        Some(true) | Some(false) => {
-                            let (ends, l) = self.walk(if known == Some(true) { accept } else { reject }, control, in_loop, record);
-                            leaves |= l;
-                            if l {
-                                control = Rate::Pixel;
-                            }
-                            if ends {
-                                return (true, leaves);
-                            }
+                    if let Some(true | false) = known {
+                        let (ends, l) = self.walk(if known == Some(true) { accept } else { reject }, control, in_loop, record);
+                        leaves |= l;
+                        if l {
+                            control = Rate::Pixel;
                         }
-                        None => {
-                            let inner = control.max(self.rate(*condition));
-                            let (a, la) = self.walk(accept, inner, in_loop, record);
-                            let (r, lr) = self.walk(reject, inner, in_loop, record);
-                            let exits = has_exit(accept) || has_exit(reject);
-                            if la || lr || (exits && inner == Rate::Pixel) {
-                                leaves = true;
-                                control = Rate::Pixel;
-                            }
-                            if a && r {
-                                return (true, leaves);
-                            }
+                        if ends {
+                            return (true, leaves);
+                        }
+                    } else {
+                        let inner = control.max(self.rate(*condition));
+                        let (a, la) = self.walk(accept, inner, in_loop, record);
+                        let (r, lr) = self.walk(reject, inner, in_loop, record);
+                        let exits = has_exit(accept) || has_exit(reject);
+                        if la || lr || (exits && inner == Rate::Pixel) {
+                            leaves = true;
+                            control = Rate::Pixel;
+                        }
+                        if a && r {
+                            return (true, leaves);
                         }
                     }
                 }
@@ -362,7 +359,7 @@ fn parse(src: &str) -> (Module, naga::valid::ModuleInfo) {
     (module, info)
 }
 
-fn reach<'m>(module: &'m Module, info: &naga::valid::ModuleInfo, entry: &str) -> Vec<(Option<Handle<Function>>, usize, Analysed)> {
+fn reach(module: &Module, info: &naga::valid::ModuleInfo, entry: &str) -> Vec<(Option<Handle<Function>>, usize, Analysed)> {
     let index = module.entry_points.iter().position(|e| e.name == entry).unwrap_or_else(|| panic!("no entry point {entry}"));
     INFO.with(|slot| *slot.borrow_mut() = Some(info.clone()));
     let mut rates = HashMap::new();
@@ -568,7 +565,7 @@ mod tests {
         println!("{all}");
     }
 
-    const SRC: &str = r#"
+    const SRC: &str = r"
 struct Camera { yaw: f32, tint: vec3<f32>, count: u32, lights: array<vec4<f32>, 4> }
 @group(0) @binding(0) var<uniform> camera: Camera;
 fn turn(d: vec3<f32>) -> vec3<f32> {
@@ -592,7 +589,7 @@ fn up() -> vec3<f32> {
     }
     return vec4<f32>(vec3<f32>(sum), 1.0);
 }
-"#;
+";
 
     #[test]
     fn a_uniforms_sine_and_a_lights_square_are_found_and_a_pixels_are_not() {

@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn labels_are_distinct_so_log_lines_cannot_be_confused() {
         let mut labels: Vec<&str> = Phase::ALL.iter().map(|p| p.label()).collect();
-        labels.sort();
+        labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), Phase::ALL.len());
     }

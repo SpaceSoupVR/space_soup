@@ -6,7 +6,7 @@ pub const WORLD_BRUSHES_BY_DEFAULT: bool = true;
 const SAMPLES: usize = 61;
 
 fn mix(h: u64, v: u32) -> u64 {
-    (h ^ v as u64).wrapping_mul(0x0000_0100_0000_01B3)
+    (h ^ u64::from(v)).wrapping_mul(0x0000_0100_0000_01B3)
 }
 
 fn samples(len: usize) -> impl Iterator<Item = usize> {

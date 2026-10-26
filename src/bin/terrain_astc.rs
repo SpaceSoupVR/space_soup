@@ -1,4 +1,4 @@
-//! TERRAIN_ASTC: encode a ground texture set's layer arrays as ASTC, ahead,
+//! `TERRAIN_ASTC`: encode a ground texture set's layer arrays as ASTC, ahead,
 //! so the headset uploads them as they are -- 8 bits a texel against 32 --
 //! instead of decoding and mipping 16 JPEGs at load
 //! (`TerrainLayerArrays::from_astc`).
@@ -36,13 +36,13 @@ fn stale(set: &Path) -> bool {
 
 fn encode_set(set: &Path, astcenc: &Path, quality: &str) -> Result<(), String> {
     let layers = load_terrain_layers(set);
-    if layers.iter().all(|l| l.is_none()) {
+    if layers.iter().all(std::option::Option::is_none) {
         return Err(format!("{} has no layer colours ({})", set.display(), space_soup::renderer::terrain_pipeline::TERRAIN_LAYER_FILES.join(", ")));
     }
     let (normals, rough, ao) = (load_terrain_normals(set), load_terrain_rough(set), load_terrain_ao(set));
     let filled = filled_layers(&layers);
     let (w, h) = (filled[0].width, filled[0].height);
-    if w % BLOCK[0] as u32 != 0 || h % BLOCK[1] as u32 != 0 {
+    if w % u32::from(BLOCK[0]) != 0 || h % u32::from(BLOCK[1]) != 0 {
         return Err(format!("{}: {w}x{h} is not a whole number of {}x{} blocks", set.display(), BLOCK[0], BLOCK[1]));
     }
     std::fs::create_dir_all(set.join("astc")).map_err(|e| e.to_string())?;
@@ -65,7 +65,7 @@ fn encode_set(set: &Path, astcenc: &Path, quality: &str) -> Result<(), String> {
             return Err(format!("{} does not read back", path.display()));
         }
         std::fs::write(&path, &bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-        println!("{}: {w}x{h}, 4 layers, {levels} mips, {:.1} MB ({:.1} MB as RGBA8), {:.1} s", path.display(), bytes.len() as f64 / 1e6, (w * h * 4 * 4) as f64 * 4.0 / 3.0 / 1e6, started.elapsed().as_secs_f32());
+        println!("{}: {w}x{h}, 4 layers, {levels} mips, {:.1} MB ({:.1} MB as RGBA8), {:.1} s", path.display(), bytes.len() as f64 / 1e6, f64::from(w * h * 4 * 4) * 4.0 / 3.0 / 1e6, started.elapsed().as_secs_f32());
     }
     let _ = std::fs::remove_dir_all(&scratch);
     Ok(())

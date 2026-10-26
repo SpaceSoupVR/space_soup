@@ -202,7 +202,7 @@ impl LevelGround {
         let mut key: u64 = 1469598103934665603;
         let mut mix = |v: Vec3| {
             for x in v.to_array() {
-                key = (key ^ x.to_bits() as u64).wrapping_mul(1099511628211);
+                key = (key ^ u64::from(x.to_bits())).wrapping_mul(1099511628211);
             }
         };
         for &(probe, _, lo, hi) in volumes {
@@ -384,7 +384,7 @@ mod tests {
                 let lo = Vec3::new(p.portals[i][0][0], p.portals[i][0][1], p.portals[i][0][2]);
                 let hi = Vec3::new(p.portals[i][1][0], p.portals[i][1][1], p.portals[i][1][2]);
                 let axis = p.portals[i][0][3] as usize;
-                let along = Vec3::new((axis == 0) as u8 as f32, (axis == 1) as u8 as f32, (axis == 2) as u8 as f32);
+                let along = Vec3::new(f32::from(u8::from(axis == 0)), f32::from(u8::from(axis == 1)), f32::from(u8::from(axis == 2)));
                 let side = ((lo - w).max(w - hi).max(Vec3::ZERO) * (Vec3::ONE - along)).length();
                 let t = w.dot(along);
                 let fades = !(side >= PROBE_PORTAL_SIDE_FADE || t <= lo.dot(along) - PROBE_PORTAL_FADE || t >= hi.dot(along) + PROBE_PORTAL_FADE);
@@ -479,7 +479,7 @@ mod tests {
             p.outdoor_volume = 7.0;
             let frame_nowhere = NowhereFrame::new(&p);
             let frame_outdoors = OutdoorFrame::new(&p);
-            with_twin += frame_outdoors.is_some() as u32;
+            with_twin += u32::from(frame_outdoors.is_some());
             for _ in 0..400 {
                 let lo = v(rnd() * 100.0 - 50.0, rnd() * 4.0 - 2.0, rnd() * 100.0 - 50.0);
                 let hi = lo + v(rnd() * 1.5 + 0.05, rnd() * 0.5 + 0.01, rnd() * 1.5 + 0.05);
@@ -618,7 +618,7 @@ mod tests {
                 let lo = Vec3::new(p.portals[i][0][0], p.portals[i][0][1], p.portals[i][0][2]);
                 let hi = Vec3::new(p.portals[i][1][0], p.portals[i][1][1], p.portals[i][1][2]);
                 let axis = p.portals[i][0][3] as usize;
-                let along = Vec3::new((axis == 0) as u8 as f32, (axis == 1) as u8 as f32, (axis == 2) as u8 as f32);
+                let along = Vec3::new(f32::from(u8::from(axis == 0)), f32::from(u8::from(axis == 1)), f32::from(u8::from(axis == 2)));
                 let side = ((lo - w).max(w - hi).max(Vec3::ZERO) * (Vec3::ONE - along)).length();
                 let t = w.dot(along);
                 !(side >= PROBE_PORTAL_SIDE_FADE || t <= lo.dot(along) - PROBE_PORTAL_FADE || t >= hi.dot(along) + PROBE_PORTAL_FADE)

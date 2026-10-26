@@ -104,7 +104,7 @@ impl MeshPipeline {
                 continue;
             }
             let edit = |mut src: String| {
-                for (from, to) in edits.iter() {
+                for (from, to) in *edits {
                     src = src.replacen(from, to, 1);
                 }
                 src
@@ -389,7 +389,7 @@ impl ModelUniform {
             let k = own_scale.clamp(0.0, 1.0);
             data[17] *= k;
 
-            data[18] = 2.0 + channel as f32;
+            data[18] = 2.0 + f32::from(channel);
             data[56..60].copy_from_slice(&[l.position.x, l.position.y, l.position.z, l.range]);
             data[60..64].copy_from_slice(&[l.direction.x, l.direction.y, l.direction.z, cos_outer]);
             let i = l.intensity * k;
@@ -755,7 +755,7 @@ impl SkinnedMeshPipeline {
 
 fn skinned_mesh_shader() -> String {
     format!(
-        r#"
+        r"
 struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9>, own: array<vec4<f32>, 3>, weather: vec4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
 {room_light}
@@ -877,7 +877,7 @@ fn fs_depth_opaque_texels(in: VOut) -> @location(0) vec4<f32> {{
     }}
     return vec4<f32>(0.0);
 }}
-"#,
+",
         lights_block = wgsl_lights_block(0, 1),
         max_strength = super::mesh::MeshVertex::MAX_EMISSIVE_STRENGTH,
         max_skin_joints = MAX_SKIN_JOINTS,
@@ -886,7 +886,7 @@ fn fs_depth_opaque_texels(in: VOut) -> @location(0) vec4<f32> {{
 }
 
 fn wgsl_room_irradiance() -> &'static str {
-    r#"
+    r"
 fn room_irradiance(n: vec3<f32>) -> vec3<f32> {
     let x = n.x; let y = n.y; let z = n.z;
     var e = model_u.room[0].rgb * 0.282095;
@@ -900,7 +900,7 @@ fn room_irradiance(n: vec3<f32>) -> vec3<f32> {
     e = e + model_u.room[8].rgb * (0.546274 * (x * x - y * y)) * 0.25;
     return max(e, vec3<f32>(0.0));
 }
-"#
+"
 }
 
 fn mesh_shader() -> String {
@@ -1122,7 +1122,7 @@ fn mesh_shader_variant(thin: bool) -> String {
     mesh_shader_variant_with(thin, thin)
 }
 
-const MATERIAL_SHADE: &str = r#"var colour: vec3<f32>;
+const MATERIAL_SHADE: &str = r"var colour: vec3<f32>;
     // Specular AA as the brushes and the ground have it: the roughness
     // widened by how fast the normal turns across the pixel, so a glossy
     // prop's highlight does not sparkle (2026-10-23).
@@ -1135,7 +1135,7 @@ const MATERIAL_SHADE: &str = r#"var colour: vec3<f32>;
             in.world_pos, n, rough_aa, 1.0, model_u.params.x * baked.a, env, vec4<f32>(0.5, 0.5, 0.5, 0.0),
             tex_color.rgb, in.world_pos, n,
         ) + tex_color.rgb * own_bulb_fill(in.world_pos, n);
-    }"#;
+    }";
 
 fn mesh_shader_variant_with(thin: bool, thin_mean: bool) -> String {
     let (thin_in, thin_out, thin_vs, thin_fn, thin_fade) = if thin {
@@ -1160,7 +1160,7 @@ fn mesh_shader_variant_with(thin: bool, thin_mean: bool) -> String {
         ("", "", MATERIAL_SHADE)
     };
     format!(
-        r#"
+        r"
 struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9>, bulb: array<vec4<f32>, 3>, weather: vec4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
 {room_light}
@@ -1302,7 +1302,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     }}
     return vec4<f32>(out, tex_color.a{thin_fade});
 }}
-"#,
+",
         lights_block = wgsl_lights_block(0, 1),
         max_strength = super::mesh::MeshVertex::MAX_EMISSIVE_STRENGTH,
         stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
@@ -1311,10 +1311,19 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
 }
 
 #[cfg(test)]
+pub fn mesh_shader_src() -> String {
+    mesh_shader()
+}
+#[cfg(test)]
+pub fn skinned_mesh_shader_src() -> String {
+    skinned_mesh_shader()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::renderer::lights::{Light, LightKind, LightsUniform};
-    use crate::renderer::mesh::{create_lightmap_texture, create_texture_from_rgba, MeshVertex};
+    use crate::renderer::mesh::{create_lightmap_texture, MeshVertex};
     use crate::renderer::terrain_pipeline::tests::headless_gpu;
     use crate::renderer::uniforms::test_support::{scene_uniforms, TEST_EYE};
     use crate::renderer::uniforms::ShadowUpload;
@@ -1354,7 +1363,7 @@ mod tests {
         for base in [mesh_shader(), mesh_shader_variant_with(true, true)] {
             for (label, edits) in MESH_REGISTER_CUTS {
                 let mut src = base.clone();
-                for (from, to) in edits.iter() {
+                for (from, to) in *edits {
                     assert!(src.contains(from), "{label}: `{from}` is not in the mesh shader");
                     src = src.replacen(from, to, 1);
                 }
@@ -1462,7 +1471,7 @@ mod tests {
         let lit = render(Some([255, 255, 255, 255])).unwrap();
         let hidden = render(Some([0, 0, 255, 255])).unwrap();
         assert!(plain[0] > 60, "the lamp does not light the mesh at all: {plain:?}");
-        assert!((lit[0] as i32 - plain[0] as i32).abs() <= 1, "a fully lit mask changed the light: {lit:?} vs {plain:?}");
+        assert!((i32::from(lit[0]) - i32::from(plain[0])).abs() <= 1, "a fully lit mask changed the light: {lit:?} vs {plain:?}");
         assert!(hidden[0] <= 2, "a mask that hides the bulb let its light through: {hidden:?}");
     }
 
@@ -1534,7 +1543,7 @@ mod tests {
         let by_sky = render(1.0, &[[0.0; 3]; 9]).unwrap();
         assert!(by_room[0] > 8, "the room lit nothing: {by_room:?}");
         assert!(
-            (by_room[0] as i32 - by_sky[0] as i32).abs() <= 1,
+            (i32::from(by_room[0]) - i32::from(by_sky[0])).abs() <= 1,
             "the room {by_room:?} vs the sky {by_sky:?}"
         );
 
@@ -1687,7 +1696,7 @@ mod tests {
         let pipeline = MeshPipeline::new(&device, format, &uniforms.layout);
         let model = pipeline.create_model_uniform(&device);
         model.upload_lit_bulb(&queue, glam::Mat4::IDENTITY, sky_vis, drive, room, own, 0.0);
-        model.set_highlight(&queue, TEST_HIGHLIGHT.with(|h| h.get()));
+        model.set_highlight(&queue, TEST_HIGHLIGHT.with(std::cell::Cell::get));
 
         let tex = crate::renderer::mesh::create_mesh_material_texture(
             &device,
@@ -1758,7 +1767,7 @@ mod tests {
         let dv = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("mesh_test_readback"),
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1948,7 +1957,7 @@ mod tests {
         let (mv, rv, dv) = (msaa.create_view(&Default::default()), resolve.create_view(&Default::default()), depth.create_view(&Default::default()));
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("thin_test_readback"),
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1962,7 +1971,7 @@ mod tests {
                     resolve_target: Some(&rv),
                     ops: Operations {
                         load: LoadOp::Clear(if light == WireLight::SideOnWall {
-                            let w = WALL as f64 / 255.0;
+                            let w = f64::from(WALL) / 255.0;
                             Color { r: w, g: w, b: w, a: 1.0 }
                         } else {
                             Color::BLACK
@@ -1984,23 +1993,20 @@ mod tests {
             pass.set_bind_group(2, &tex.bind_group, &[]);
             pass.set_bind_group(3, &lm.bind_group, &[]);
             pass.set_vertex_buffer(0, vb.slice(..));
-            match (&parts, thin_px) {
-                (Some(parts), Some(_)) => {
-                    if parts.solid_count > 0 {
-                        pass.set_pipeline(&pipeline.pipeline);
-                        pass.set_index_buffer(parts.solid_index_buffer.slice(..), IndexFormat::Uint32);
-                        pass.draw_indexed(0..parts.solid_count, 0, 0..1);
-                    }
-                    pass.set_pipeline(&pipeline.thin_pipeline);
-                    pass.set_vertex_buffer(1, parts.vertex_buffer.slice(..));
-                    pass.set_index_buffer(parts.thin_index_buffer.slice(..), IndexFormat::Uint32);
-                    pass.draw_indexed(0..parts.thin_count, 0, 0..1);
-                }
-                _ => {
+            if let (Some(parts), Some(_)) = (&parts, thin_px) {
+                if parts.solid_count > 0 {
                     pass.set_pipeline(&pipeline.pipeline);
-                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
-                    pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+                    pass.set_index_buffer(parts.solid_index_buffer.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..parts.solid_count, 0, 0..1);
                 }
+                pass.set_pipeline(&pipeline.thin_pipeline);
+                pass.set_vertex_buffer(1, parts.vertex_buffer.slice(..));
+                pass.set_index_buffer(parts.thin_index_buffer.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..parts.thin_count, 0, 0..1);
+            } else {
+                pass.set_pipeline(&pipeline.pipeline);
+                pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
             }
         }
         encoder.copy_texture_to_buffer(
@@ -2037,7 +2043,7 @@ mod tests {
     ) -> Option<(f32, f32)> {
         let rows: Vec<Vec<f32>> = (0..8)
             .map(|k| render_wire(radius_px, k as f32 / 8.0, thin_px, tilt, light, zoom, sampled))
-            .map(|image| Some(image?.iter().map(|row| row.iter().map(|&v| v as f32).sum()).collect()))
+            .map(|image| Some(image?.iter().map(|row| row.iter().map(|&v| f32::from(v)).sum()).collect()))
             .collect::<Option<_>>()?;
         let (mut mean_all, mut cv_all, mut n) = (0.0, 0.0, 0.0);
         for y in 16..48 {
@@ -2056,7 +2062,7 @@ mod tests {
         let Some((plain_mean, plain_cv)) = wire_light_across_shifts(0.16, None) else { return };
         let (thin_mean, thin_cv) = wire_light_across_shifts(0.16, Some(1.0)).unwrap();
 
-        let full = *render_thin_wire(3.0, 0.0, None).unwrap()[32].iter().max().unwrap() as f32;
+        let full = f32::from(*render_thin_wire(3.0, 0.0, None).unwrap()[32].iter().max().unwrap());
         let truth = 0.32 * full;
         eprintln!("THIN wire 0.32 px (truth {truth:.1}): plain mean {plain_mean:.1} varies {:.1}%, thin pass mean {thin_mean:.1} varies {:.1}%", plain_cv * 100.0, thin_cv * 100.0);
         assert!(plain_cv > 0.3, "the plain wire shimmers ({:.1}%), or this measures nothing", plain_cv * 100.0);
@@ -2079,7 +2085,7 @@ mod tests {
         let mut sum = 0.0f32;
         for y in 16..48 {
             for x in 0..64 {
-                let v = |k: usize| images[k][y][x] as f32;
+                let v = |k: usize| f32::from(images[k][y][x]);
                 for k in 1..7 {
                     let d = v(k + 1) - 2.0 * v(k) + v(k - 1);
                     sum += d * d;
@@ -2096,7 +2102,7 @@ mod tests {
         let (mut sum, mut n, mut peak) = (0.0f32, 0.0f32, 0.0f32);
         for y in 16..48 {
             for x in 0..64 {
-                let v = |k: usize| images[k][y][x] as f32 - behind;
+                let v = |k: usize| f32::from(images[k][y][x]) - behind;
                 for k in 1..7 {
                     if v(k - 1).abs() + v(k).abs() + v(k + 1).abs() > 0.0 {
                         let d = v(k + 1) - 2.0 * v(k) + v(k - 1);
@@ -2115,7 +2121,7 @@ mod tests {
         let Some(steps) = wire_steps(0.16, Some(1.0)) else { return };
         let plain = wire_steps(0.16, None).unwrap();
         let (mean, cv) = wire_light_across_shifts(0.16, Some(1.0)).unwrap();
-        let full = *render_thin_wire(3.0, 0.0, None).unwrap()[32].iter().max().unwrap() as f32;
+        let full = f32::from(*render_thin_wire(3.0, 0.0, None).unwrap()[32].iter().max().unwrap());
         let truth = 0.32 * full;
         eprintln!(
             "THIN wire 0.32 px: steps {steps:.4} (drawn as it is {plain:.4}); light {mean:.1} against {truth:.1}, varies {:.1}%",
@@ -2132,7 +2138,7 @@ mod tests {
         let mut total = 0.0;
         for k in 0..8 {
             let image = render_thin_wire_at(radius_px, k as f32 / 8.0, thin_px, tilt)?;
-            let peaks: Vec<f32> = (16..48).map(|y| *image[y].iter().max().unwrap() as f32).collect();
+            let peaks: Vec<f32> = (16..48).map(|y| f32::from(*image[y].iter().max().unwrap())).collect();
             let mean = peaks.iter().sum::<f32>() / peaks.len() as f32;
             let sd = (peaks.iter().map(|p| (p - mean).powi(2)).sum::<f32>() / peaks.len() as f32).sqrt();
             total += sd / mean.max(1e-6);
@@ -2143,7 +2149,7 @@ mod tests {
     #[test]
     fn a_slanted_wire_neither_beads_nor_swings() {
         let Some(image) = render_thin_wire(3.0, 0.0, None) else { return };
-        let full = *image[32].iter().max().unwrap() as f32;
+        let full = f32::from(*image[32].iter().max().unwrap());
 
         for degrees in [0.0f32, 22.5, 26.57, 45.0] {
             let tilt = degrees.to_radians();
@@ -2169,10 +2175,10 @@ mod tests {
         for shift in [0.0, 0.375] {
             let Some(plain) = render_thin_wire(3.0, shift, None) else { return };
             let thin = render_thin_wire(3.0, shift, Some(1.0)).unwrap();
-            let light = |image: &Vec<Vec<u8>>| (16..48).map(|y| image[y].iter().map(|&v| v as f32).sum::<f32>()).sum::<f32>();
+            let light = |image: &Vec<Vec<u8>>| (16..48).map(|y| image[y].iter().map(|&v| f32::from(v)).sum::<f32>()).sum::<f32>();
             let (a, b) = (light(&plain), light(&thin));
             assert!((b / a - 1.0).abs() < 0.03, "a 6 px part, shifted {shift} px: light {b} against {a}");
-            let middle = |image: &Vec<Vec<u8>>| *image[32].iter().max().unwrap() as i32;
+            let middle = |image: &Vec<Vec<u8>>| i32::from(*image[32].iter().max().unwrap());
             assert!((middle(&plain) - middle(&thin)).abs() <= 2, "its middle, shifted {shift} px");
         }
     }
@@ -2354,7 +2360,7 @@ mod tests {
         let skinned = skinned_mesh_shader();
         let wet_from = "    if (wet > 0.0) {";
         let i = skinned.find(wet_from).expect("the wet branch");
-        let j = i + skinned[i..].find("\n    }}\n").map(|k| k + 6).unwrap_or(0);
+        let j = i + skinned[i..].find("\n    }}\n").map_or(0, |k| k + 6);
         let _ = j;
         let dry = skinned.replacen("    if (wet > 0.0) {", "    if (false) {", 1);
         eprintln!("skinned fs_main: dry path {} (wet branch compiled out), with the wet branch {}; static mesh {}", total(&dry), total(&skinned), total(&mesh_shader()));
@@ -2462,9 +2468,9 @@ mod tests {
             return;
         };
         let red = render_mesh(RED_BULB, 2.0, false).unwrap();
-        let dr = red[0] as i32 - dark[0] as i32;
-        let dg = red[1] as i32 - dark[1] as i32;
-        let db = red[2] as i32 - dark[2] as i32;
+        let dr = i32::from(red[0]) - i32::from(dark[0]);
+        let dg = i32::from(red[1]) - i32::from(dark[1]);
+        let db = i32::from(red[2]) - i32::from(dark[2]);
         assert!(dr > dg && dr > db, "a red bulb must glow RED: deltas r{dr} g{dg} b{db}");
     }
 
@@ -2504,7 +2510,7 @@ mod tests {
             return;
         };
         assert!(
-            pale[0] as i32 - dark[0] as i32 > 24,
+            i32::from(pale[0]) - i32::from(dark[0]) > 24,
             "the same bounce rendered {dark:?} on a near-black material and {pale:?} \
              on a near-white one; it is being added outside the albedo multiply, so \
              indirect light ignores what it lands on",
@@ -2537,13 +2543,4 @@ mod tests {
         );
     }
 
-}
-
-#[cfg(test)]
-pub fn mesh_shader_src() -> String {
-    mesh_shader()
-}
-#[cfg(test)]
-pub fn skinned_mesh_shader_src() -> String {
-    skinned_mesh_shader()
 }

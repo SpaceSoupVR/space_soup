@@ -52,9 +52,9 @@ impl FpsMeter {
         if elapsed < UPDATE_EVERY {
             return None;
         }
-        let mean = |(sum, n): (f64, u32)| (n > 0).then(|| sum / n as f64);
+        let mean = |(sum, n): (f64, u32)| (n > 0).then(|| sum / f64::from(n));
         let reading = Reading {
-            fps: self.frames as f64 / elapsed.as_secs_f64(),
+            fps: f64::from(self.frames) / elapsed.as_secs_f64(),
             target_fps,
             gpu_ms: mean(self.gpu),
             cpu_ms: mean(self.cpu),
@@ -158,8 +158,8 @@ mod tests {
         let mut reading = None;
 
         for i in 1..=18 {
-            let at = t0 + Duration::from_secs_f64(i as f64 / 36.0);
-            if let Some(r) = m.frame(at, Some(20.0 + i as f64 % 2.0), Some(5.0), 36.0) {
+            let at = t0 + Duration::from_secs_f64(f64::from(i) / 36.0);
+            if let Some(r) = m.frame(at, Some(20.0 + f64::from(i) % 2.0), Some(5.0), 36.0) {
                 reading = Some(r);
             }
         }
