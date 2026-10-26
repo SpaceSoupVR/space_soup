@@ -34,22 +34,13 @@ pub const ADAPT_DARKER_TAU_S: f32 = 2.0;
 pub const ADAPT_BRIGHTER_TAU_S: f32 = 1.0;
 
 /// THE RODS KEEP THEIR DARK ADAPTATION THROUGH A SHORT LOOK AT LIGHT
-/// (2026-10-23, user, headset: walking out of the lit room "something at the
-/// threshold is forgetting how much adaptation has already happened"). With
-/// one adaptation state a few seconds in the room took the eye from x180000
-/// to x500, and out in the night it climbed back at the rods' rate, black
-/// for ~8 s. The rods' sensitivity is a pigment bleached by light over time
-/// (a dose), not reset by it: after seconds of indoor light it returns in
-/// seconds, after minutes it takes the rods' minutes. So the eye keeps the
-/// darkest adaptation the rods still hold (`rod_log2`), which rises toward a
-/// brighter adaptation at this many stops a second, and back down to it the
-/// eye goes at `ADAPT_REGAIN_TAU_S` -- the retina's gain; at 1 s a 4 s look at a lit room still left the yard x829 of x10243 1.5 s out.
-/// At 0.25 ten seconds in the lit room cost 2.5 stops and the yard went
-/// near black on the way out, though it had been seen from the doorway
-/// (headset, 2026-10-23 23:10: x32000 of the night's x177000). Indoor light
-/// bleaches little of the pigment in seconds (Rushton: ~1e-4 of it for 10 s
-/// at 300 td), so the dose is slow: half a stop for ten seconds, the whole
-/// night after four minutes.
+/// (2026-10-23, user, headset: "something at the threshold is forgetting how
+/// much adaptation has already happened"). With one adaptation state a few
+/// seconds in the lit room took the eye from x180000 to x500 and the night
+/// was black ~8 s. The rods' pigment is bleached by a dose of light over
+/// time, not reset by it, so the eye keeps the darkest adaptation the rods
+/// still hold (`rod_log2`), rising at this many stops a second and regained
+/// at `ADAPT_REGAIN_TAU_S`. The dose is slow (Rushton): half a stop for ten seconds, the night after four minutes.
 pub const ROD_BLEACH_STOPS_PER_S: f32 = 0.05;
 /// The time constant (s) of the way back down to the rods' held adaptation.
 pub const ADAPT_REGAIN_TAU_S: f32 = 0.5;
@@ -337,11 +328,10 @@ impl EyeAdaptation {
             }
             _ => seen(r),
         };
-        // Each room, then its doorways: a doorway's jamb is lit by the room
-        // and belongs to its adaptation, or it drew white round the opening.
-        // A room's box grows by the margin: its walls' outer faces lie a wall
-        // away. A doorway's does not: the outer wall round the opening lies
-        // in its front face's plane, and grew a black frame round the door.
+        // Each room, then its doorways: a doorway's jamb is lit by the room and
+        // belongs to its adaptation, or it drew white round the opening. A
+        // room's box grows by the margin (its walls' outer faces lie a wall
+        // away); a doorway's does not, or the outer wall round the opening grew a black frame.
         let m = Vec3::splat(ROOM_EXPOSURE_MARGIN);
         let mut boxes: Vec<(Vec3, Vec3, f32)> = rooms.iter().map(|r| (r.min - m, r.max + m, factor(r))).collect();
         for p in &self.portals {
@@ -457,14 +447,9 @@ impl EyeAdaptation {
     /// in (`DOOR_LEAN`); 0 in the open, or with local rooms off.
     ///
     /// OUT THROUGH THE DOOR THE LEAN IS HELD (2026-10-24, user: walking out
-    /// "still goes black for a second even if some adaptation had started").
-    /// It gave way across the handover's inner half, gone at the doorway's
-    /// plane -- where the meter still held most of the lit room, as a share
-    /// of light -- so the eye's target rose toward the room's for a few
-    /// frames and it adapted brighter, the yard black just as it was
-    /// reached. Now the lean is whole up to the plane, and the target it
-    /// gave there (`door_hold`) eases into the meter across the handover's
-    /// outer half, where the yard has the meter by its end.
+    /// "still goes black for a second"): faded over the handover's inner half
+    /// it gave way while the meter still held the lit room, and the yard was
+    /// black just as it was reached. Whole to the plane, then `door_hold` eases into the meter.
     pub fn door_lean(&self, head: Vec3, gaze: Vec3, metered: f32) -> f32 {
         if !self.local_rooms {
             self.door_hold.set(None);

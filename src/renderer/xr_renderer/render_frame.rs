@@ -1333,13 +1333,8 @@ impl XrRenderer {
 
         // The static map is drawn along the snapshot's direction, so once a
         // snapshot; the light itself glides (`Sky::sun_direct`). Under
-        // `Levers::smooth_sun_shadow` it is drawn along the gliding light
-        // instead, again each time that has moved `STATIC_SUN_REDRAW_COS`
-        // off the map's: shadows slide on with the sun rather than jumping a
-        // texel at each snapshot (user's colleague, 2026-10-22: "the light
-        // and shadow changes step").
-        // Two maps then, blended by the sun's way between redraws
-        // (`lights::SunPair`), so the shadows creep on with it.
+        // `Levers::smooth_sun_shadow` it follows the gliding light, redrawn each
+        // `STATIC_SUN_REDRAW_COS` and blended (`lights::SunPair`), so shadows creep instead of stepping (colleague, 2026-10-22).
         let glide = if self.levers.smooth_sun_shadow { self.sky.sun_direct().map(|s| -glam::Vec3::from(s.direction)) } else { None };
         let stepped = if self.levers.smooth_sun_shadow { glide } else { self.sky.sun_stepped().map(|s| -glam::Vec3::from(s.direction)) };
         // The pair's frame, and the newer and older maps (player space).

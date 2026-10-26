@@ -152,13 +152,11 @@ pub fn configure_macos_window(
 /// Puts a full-window `NSVisualEffectView` behind the window's content view.
 ///
 /// The effect view is added to the content view's *superview*, ordered below
-/// the content view. Ordering matters: added as a subview of the content view
-/// itself (what the `window-vibrancy` crate does) it sits in front of the
-/// content view's `CAMetalLayer` and the blur covers the entire render.
-///
-/// Call once after the window exists, on the main thread, with the window
-/// created transparent. Returns `false` when the handle is not an `AppKit`
-/// window or this is not the main thread.
+/// it; as a subview of the content view itself (what the `window-vibrancy`
+/// crate does) it sits in front of the `CAMetalLayer` and the blur covers the
+/// entire render. Call once after the window exists, on the main thread, with
+/// the window created transparent. Returns `false` when the handle is not an
+/// `AppKit` window or this is not the main thread.
 pub fn install_window_vibrancy(
     window: &impl HasWindowHandle,
     material: VibrancyMaterial,

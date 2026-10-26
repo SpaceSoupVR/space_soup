@@ -295,16 +295,14 @@ pub fn static_sun_bounds(
 /// is a redraw about every third of a second (every 12 frames at 36 fps).
 pub const STATIC_SUN_REDRAW_COS: f32 = 0.999_998_5;
 
-/// THE STATIC MAP TURNS ABOUT THE PLAYER (2026-10-23, user: the shadows,
-/// the terrain's too, "dancing ... in circular cycles instead of smoothly
-/// sliding"). Turned 0.1 degrees about the level's middle at each redraw
-/// (`STATIC_SUN_REDRAW_COS`), a point r metres from it moved r x 1.7 mm
-/// across the map's texels -- 10 cm, two texels, 60 m out -- so every redraw
-/// cut each shadow edge's stair at a new phase. Turned about `pivot` with the
-/// map's box snapped to whole texels around it, a point near the pivot keeps
-/// its place on the texels, and its shadow moves only as the sun does. The
-/// pivot is the player's place on a grid of `STATIC_SUN_PIVOT_CELL` metres,
-/// so walking does not move it.
+/// THE STATIC MAP TURNS ABOUT THE PLAYER (2026-10-23, user: the shadows
+/// "dancing ... in circular cycles instead of smoothly sliding"). Turned 0.1
+/// degrees about the level's middle at each redraw (`STATIC_SUN_REDRAW_COS`),
+/// a point r metres out moved r x 1.7 mm across the map's texels -- two
+/// texels at 60 m -- so every redraw cut each shadow edge's stair at a new
+/// phase. Turned about `pivot` with the map's box snapped to whole texels, a
+/// point near the pivot keeps its texels and its shadow moves only with the
+/// sun. The pivot is the player's place on a grid this coarse, so walking does not move it.
 pub const STATIC_SUN_PIVOT_CELL: f32 = 8.0;
 
 /// THE STATIC SUN'S TWO MAPS while the light glides (`Levers::smooth_sun_shadow`,
@@ -946,7 +944,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let ground_trace_readings = crate::renderer::ground_map::GROUND_TRACE_READINGS;
     let ground_trace_steps = crate::renderer::ground_map::GROUND_TRACE_MAX_STEPS;
     format!(
-        r#"
+        r"
 {precision_aliases}
 
 const HF_MAX: f32 = 60000.0;
@@ -1042,13 +1040,13 @@ fn to_player_space(w: vec3<f32>) -> vec3<f32> {{
 
 // LOCAL ADAPTATION by room: a closed room seen from outside it -- and its
 // doorways -- is drawn at the eye's exposure times its row's factor
-// (`uniforms::RoomExposure`), so a lit hall seen from the night stays
-// readable while the night stays night. Rows come in pairs, (min, factor)
-// and (max, band); a factor of 0 is an empty row. Asked per pixel, and only
-// where a vertex was near a box (`room_near`). `reach`: how far past its
-// triangle an MSAA edge sample may be shaded, which counts as inside -- a
-// sliver seen edge-on carried its samples tens of centimetres out of the
-// room and drew a white line at night (2026-10-20).
+// (`uniforms::RoomExposure`), so a lit hall seen from the night stays readable.
+// Rows are pairs, (min, factor) and (max, band); a factor of 0 is an empty row.
+
+// `reach`: how far past its triangle an MSAA edge sample may be shaded, which
+// counts as inside -- a sliver seen edge-on carried its samples tens of
+// centimetres out of the room and drew a white line at night (2026-10-20).
+// Asked per pixel, and only where a vertex was near a box (`room_near`).
 const ROOM_REACH_PIXELS: f32 = {room_reach_pixels:?};
 
 fn room_local_exposure(p: vec3<f32>, reach: f32) -> f32 {{
@@ -1607,13 +1605,12 @@ fn pcf(tex: texture_depth_2d, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>
     return sum / 9.0;
 }}
 
-// THE 3x3 BOX PCF IN FOUR TAPS. Nine compare taps a texel apart weigh the
-// four texels under them, along an axis, 1-t, 1, 1, t (t the fraction of
-// the centre, in texels from the first texel's centre). Two bilinear taps
-// placed so they weigh 1-t : 1 and 1 : t give exactly those weights, so two
-// by two taps carry the nine's filter. `pcf_box_taps` gives, for both axes
-// at once, the two taps' places in texels (`a`, `b`) and weights. Clamping
-// each tap into a tile, as `pcf_tile_at` does, stays exact for a tile of
+// THE 3x3 BOX PCF IN FOUR TAPS: nine compare taps a texel apart weigh the
+// four texels under them 1-t, 1, 1, t along each axis (t the centre's
+// fraction); two bilinear taps weighing 1-t : 1 and 1 : t give exactly those
+// weights, so two by two taps carry the nine's filter (`pcf_box_taps`: places `a`, `b`, weights).
+
+// Clamping each tap into a tile (`pcf_tile_at`) stays exact for a tile of
 // whole texels: a clamped tap reads the edge texel alone, which is what the
 // nine's taps past the edge read too.
 struct PcfBoxTaps {{
@@ -1647,12 +1644,9 @@ fn pcf_array_at(tex: texture_depth_2d_array, layer: i32, c: vec3<f32>) -> f32 {{
 }}
 
 // THE STATIC SUN MAPS (`lights::SunPair`): while the sun glides, the older
-// and the newer map, blended by how far the sun has gone past the newer.
-// One map redrawn each 0.1 degrees moved every long shadow a texel at each
-// redraw, on a light grid turned a little each time: the edges danced in a
-// cycle (user, headset, 2026-10-23: "updating in a cyclical dancing
-// pattern instead of ... a slow smooth creep"). Blended, an edge creeps
-// from the one map's place to the other's.
+// and the newer map, blended by how far the sun has gone past the newer. One
+// map redrawn each 0.1 degrees danced every long shadow edge in a cycle
+// (user, 2026-10-23); blended, an edge creeps from one map's place to the other's.
 fn sun_static_visibility(world_pos: vec3<f32>) -> f32 {{
     let b = camera.sun_blend;
     let older = pcf_array(sun_shadow_tex, i32(b.y + 0.5), world_pos, camera.sun_view_proj);
@@ -4322,7 +4316,7 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
     }}
     return vec3<f32>(lit);
 }}
-"#
+"
     )
 }
 

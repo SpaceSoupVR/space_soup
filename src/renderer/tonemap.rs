@@ -46,16 +46,14 @@ pub const SCOTOPIC_WEIGHTS: [f32; 3] = [-0.0714, 0.6447, 0.4267];
 
 pub const NIGHT_TINT: [f32; 3] = [1.04, 0.96, 1.26];
 
-/// THE RODS SEE THE NIGHT DIM, not only grey and blue (user, 2026-10-23:
-/// the night and its clouds far too bright; "yes for darkening the night like
+/// THE RODS SEE THE NIGHT DIM, not only grey and blue (user, 2026-10-23: the
+/// night and its clouds far too bright; "yes for darkening the night like
 /// what rod vision sees"). Scotopic vision reads a moonlit scene as dark,
-/// desaturated, blue-shifted and low in contrast (Jensen et al. 2000, "A
-/// Physically-Based Night Sky Model"; Thompson, Shirley & Ferwerda 2002), and
-/// the eye's partial adaptation (`NIGHT_ADAPTATION_STRENGTH`) lifted ours to
-/// a dusk. The rods' share of a pixel is drawn at this much of its light:
-/// about a stop darker at the deepest night (share `NIGHT_VISION_MAX`),
-/// two thirds of one under the moon. Folded into the tint, so it costs the
-/// shaders nothing; lever `night_vision` off draws the cones' night.
+/// desaturated, blue-shifted and low in contrast (Jensen et al. 2000;
+/// Thompson, Shirley & Ferwerda 2002), and the eye's partial adaptation
+/// (`NIGHT_ADAPTATION_STRENGTH`) lifted ours to a dusk. The rods' share of a
+/// pixel is drawn at this much of its light: a stop darker at deepest night
+/// (`NIGHT_VISION_MAX`), two thirds under the moon. Folded into the tint; lever `night_vision` off draws the cones' night.
 pub const ROD_SIGNAL: f32 = 0.4;
 
 /// `NIGHT_TINT` at the rods' signal (`ROD_SIGNAL`).

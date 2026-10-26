@@ -955,12 +955,10 @@ impl Sky {
                     light_is_moon: dot3(frame.light_dir, snap.astro.moon) > dot3(frame.light_dir, snap.astro.sun),
                     population,
                 };
-                // THE FIRST POPULATION BEFORE THE FIRST MAP (2026-10-23, user:
-                // "the sky was much less dense, and then all of the sudden it was
-                // filled"). Left to the worker, the first maps were drawn from
-                // the weather's mean, a sparser sky, and the population's own
-                // cross-faded in seconds later. At the level's load, 1.7 s on
-                // this thread costs nothing played.
+                // THE FIRST POPULATION BEFORE THE FIRST MAP (2026-10-23, user: "the
+                // sky was much less dense, and then all of the sudden it was
+                // filled"): left to the worker, the first maps drew the weather's
+                // sparser mean. At the level's load, 1.7 s on this thread costs nothing played.
                 if self.clouds_populated {
                     c.settle(self.cloud_worker.as_mut(), warm);
                 } else {
@@ -1158,11 +1156,10 @@ impl Sky {
         // builds this frame, so the shadow never stands a snap off.
         let shadow_moved = cs.centre != Some(centre);
         if light.is_some() {
-            // THE MEAN LIGHT THROUGH, ONE POINT A FRAME. All 16 rays at
-            // once took 3.0-3.6 ms of the Quest's render thread every 16th
-            // frame and whenever the centre moved (`time_the_clouds_on_the_
-            // render_thread`): a hitch five times a second. One a frame is
-            // ~0.2 ms, and the mean trails the sky by 16 frames.
+            // THE MEAN LIGHT THROUGH, ONE POINT A FRAME. All 16 rays at once
+            // took 3.0-3.6 ms of the Quest's render thread every 16th frame and
+            // when the centre moved (`time_the_clouds_on_the_render_thread`): a
+            // hitch five times a second. One a frame is ~0.2 ms; the mean trails the sky 16 frames.
             let noise = CloudNoise::shared();
             let ray = |n: usize| {
                 let at = |k: usize| (k as f32 - 1.5) / 4.0 * CLOUD_SHADOW_EXTENT_M;
@@ -1595,11 +1592,9 @@ fn sky_stars(d: vec3<f32>, px: f32) -> vec3<f32> {{
             let off = length(cross(q, at));
             let flux = sky_extra.stars.x * exp2(-1.3287712 * m) * fade;
             // A POINT, HOWEVER BRIGHT (2026-10-23, user: some stars "a bit too
-            // big"). All of a bright star in one Gaussian ran its peak far past
-            // white, and the clipped plateau widened with its brightness to a
-            // disc 3-4 pixels across. Its core is held to STAR_CORE_PEAK past
-            // white at the eye's exposure; the rest reads as the eye's glare,
-            // a glow growing with the log of how far past it was.
+            // big"): a bright star in one Gaussian clipped to a plateau that
+            // widened with brightness to a 3-4 pixel disc. The core is held to
+            // STAR_CORE_PEAK past white; the rest reads as glare, growing with the log of the excess.
             let core = min(flux, STAR_CORE_PEAK * 2.0 * SKY_PI * sigma * sigma / exposure);
             var spread = core / (2.0 * SKY_PI * sigma * sigma) * exp(-off * off / (2.0 * sigma * sigma));
             if (flux > core) {{
@@ -1734,11 +1729,10 @@ fn sky_moon(d: vec3<f32>, px: f32, k: f32) -> vec4<f32> {{
     return vec4<f32>(surface * cover * seen * k + halo, cover);
 }}
 
-// The sun: its disc -- limb-darkened per channel (Neckel and Labs: the edge
-// dimmer and redder), reddened across itself by the air mass near the
-// horizon, lifted and flattened by refraction -- and its glare.
-// `sun_radiance` is the disc's mean radiance through the air at the
-// snapshot's apparent elevation, whose sine is its `.w`.
+// The sun: its disc -- limb-darkened per channel (Neckel and Labs), reddened
+// across itself by the air mass near the horizon, lifted and flattened by
+// refraction -- and its glare. `sun_radiance` is the disc's mean radiance
+// through the air at the snapshot's apparent elevation, whose sine is its `.w`.
 fn sky_sun_disc(d: vec3<f32>, px: f32, k: f32) -> vec3<f32> {{
     let s = sky_extra.sun.xyz;
     let rho = sky_extra.sun.w;
@@ -1859,16 +1853,13 @@ fn sky_cloud_map(uv: vec2<f32>, layer: i32) -> vec4<f32> {{
 
 // The volumetric clouds (`cloud_sky.rs`): the sky map's last whole build
 // blending into its newest, rgb their light and a how much sky shows past
-// them, haze and all. Each map is read where it holds what is here now:
-// the cloud seen along `dir`, at the newest map's height for it, carried
-// back on that height's wind to the map's moment and seen from the map's
-// eye (`cloud_sky::advected_uv`).
+// them, haze and all. Each map is read where it holds what is here now: the
+// cloud seen along `dir`, carried back on its height's wind (`cloud_sky::advected_uv`).
+
 // How much of a disc behind the clouds comes through: the map's alpha is
-// haze-weighted (a far cloud fades into the air, and the air's own glow is
-// in the sky behind), but a cloud blocks the sun however far off it is.
-// Near the horizon the alpha read 1 behind thick cloud and the sun shone
-// through it (headset, 2026-10-21). Read only near a disc (`alts` .g), as
-// the share of the alpha a disc gets.
+// haze-weighted (a far cloud fades into the air) but a cloud blocks the sun
+// however far off it is -- near the horizon the alpha read 1 behind thick
+// cloud and the sun shone through (headset, 2026-10-21). Read only near a disc (`alts` .g).
 var<private> cloud_through: f32 = 1.0;
 
 fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>, px: f32) -> vec4<f32> {{
@@ -1883,11 +1874,9 @@ fn sky_clouds(dir: vec3<f32>, sky: vec3<f32>, px: f32) -> vec4<f32> {{
     var uva = uv;
     var uvb = uv;
     // Each map carried on its OWN height and wind for what it shows here
-    // (`fs_map`, alts .r and .ba). Both carried on the newest map's, the
-    // older map's carry changed at every swap, when the newest became a
-    // different map: its clouds jumped up to 0.4 degrees, back and forth,
-    // once a build (user, 2026-10-23: "a small backstep every 1 second";
-    // `the_shown_clouds_ride_their_wind_frame_by_frame`).
+    // (`fs_map`, alts .r and .ba): both on the newest map's, the older map's
+    // carry changed at every swap and its clouds jumped up to 0.4 degrees once
+    // a build (user, 2026-10-23: "a small backstep every 1 second"; `the_shown_clouds_ride_their_wind_...`).
     let here = textureSampleLevel(cloud_alts, cloud_samp, uv, i32(sky_extra.cloud_misc.y), 0.0);
     let older = textureSampleLevel(cloud_alts, cloud_samp, uv, i32(sky_extra.cloud_misc.x), 0.0);
     if (older.r > 0.0) {{
@@ -2778,13 +2767,11 @@ mod render_tests {
     /// WHAT THE SKY SHADER SHOWS, FRAME BY FRAME, against the wind: the
     /// headset's loop (the worker on, a snapshot each second, `test_room`'s
     /// clouds on its 2.5x clock at `SpaceWarp`'s 36 Hz), and after each frame
-    /// the sky shader's own lookup (`sky_clouds`: both shown maps carried,
-    /// read bicubically, blended) over a band of the sky. Per edge patch,
-    /// the shift along the wind that best lays this frame's clouds on the
-    /// last frame's carried one frame on: 0 when the shown clouds ride their
-    /// wind, below 0 where they fall back (user, 2026-10-23, after the carry
-    /// fixes: "still had the back step"). Prints `SHOWN` per frame and a
-    /// summary. Turns the worker on for the process: `--ignored --exact`.
+    /// the sky shader's own lookup (`sky_clouds`) over a band of the sky. Per
+    /// edge patch, the shift along the wind that best lays this frame's clouds
+    /// on the last frame's carried one frame on: 0 riding the wind, below 0
+    /// falling back (user, 2026-10-23: "still had the back step"). Prints
+    /// `SHOWN` per frame and a summary; turns the worker on. `--ignored --exact`.
     #[test]
     #[ignore = "slow: drives the cloud worker on a headless GPU"]
     fn the_shown_clouds_ride_their_wind_frame_by_frame() {
@@ -3248,13 +3235,10 @@ mod cloud_size_tests {
         let clear: usize = crate::renderer::shader_inlining::inlined_sizes(&super::sky_shader(), "fs_main").iter().map(|r| r.own * r.copies).sum();
         let clouded: usize = crate::renderer::shader_inlining::inlined_sizes(&super::sky_cloud_shader(), "fs_main").iter().map(|r| r.own * r.copies).sum();
         eprintln!("sky fs_main by the proxy: clear {clear}, with clouds {clouded}");
-        // A budget of ours, not the cliff: the I-cache cliff measured on this
-        // proxy is near 2424 (water), and the clouded sky is ~1316 in all.
-        // 400 -> 420 on 2026-10-21 for the discs' own cloud transmittance
-        // (+17, read only near a disc), which put the sun back behind far
-        // cloud on the horizon. 420 -> 600 on 2026-10-23 for the cirrus drawn
-        // here per pixel (+171, `sky_cirrus`), off the maps where it shared
-        // the lower clouds' carry wind; ~1490 in all, still far under 2424.
+        // A budget of ours, not the cliff: the I-cache cliff on this proxy is
+        // near 2424 (water), the clouded sky ~1490 in all. 400 -> 420 on
+        // 2026-10-21 for the discs' own cloud transmittance; 420 -> 600 on
+        // 2026-10-23 for the cirrus drawn per pixel (`sky_cirrus`), off the maps it distorted.
         assert!(clouded < clear + 600, "the cloud code adds {} (283 when written, 2026-10-19; 401 on 2026-10-21; 572 on 2026-10-23)", clouded - clear);
     }
 }

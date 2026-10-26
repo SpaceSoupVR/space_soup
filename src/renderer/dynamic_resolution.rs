@@ -102,18 +102,13 @@ mod tests {
 }
 
 /// DYNAMIC RESOLUTION (the colleague's plan part 2, item 4): the eye drawn
-/// into the top-left `scale` of its targets, allocated once at full size,
-/// and handed to the compositor as that rectangle. The scale is folded into
-/// the eye's projection (`fold`): the whole field of view lands in the
-/// rectangle's NDC corner, so every shader that maps NDC to texels over its
-/// whole texture stays right, and a scissor keeps the rest of the target
-/// unshaded. The frame is fill-bound (shading scales with pixels), so this
-/// buys GPU time back where the frame is over budget and gives it back
-/// where it is not.
-///
-/// Down fast (a step after `DOWN_FRAMES` over `DOWN_OVER` of the frame),
-/// up slowly (a step after `UP_FRAMES` under `UP_UNDER`), a step at most
-/// every `HOLD_S`, so the sharpness never pumps.
+/// into the top-left `scale` of its targets, allocated once at full size, and
+/// handed to the compositor as that rectangle. The scale is folded into the
+/// eye's projection (`fold`), so the whole field of view lands in the
+/// rectangle's NDC corner, every shader that maps NDC to texels stays right,
+/// and a scissor keeps the rest unshaded. The frame is fill-bound, so this
+/// buys GPU time back where the frame is over budget. Down fast (`DOWN_FRAMES`
+/// over `DOWN_OVER`), up slowly, a step at most every `HOLD_S`, so the sharpness never pumps.
 pub const STEP: f32 = 0.05;
 pub const DOWN_OVER: f32 = 0.9;
 pub const DOWN_FRAMES: u32 = 3;

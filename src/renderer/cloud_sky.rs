@@ -61,21 +61,14 @@ pub const ALT_FILL_WEIGHT: f32 = 0.02;
 /// both within about 1.5 (2026-10-21; it did not cause the overhead smear,
 /// the shear's lean did -- `SHEAR_LEAN_MAX`). Not yet seen on the headset.
 pub const MAP_PACK: f32 = 1.15;
-/// THE MAPS ACCUMULATE (2026-10-21). Each map's samples sit at their own
-/// fraction of the step (`HISTORY_JITTER` apart, every texel alike, so
-/// neighbouring rays still read neighbouring noise), and a map built from a
-/// slice keeps this share of its own march and the rest of the newest map,
-/// carried to its moment and eye on the winds (`advected_uv`). The fixed
-/// sample planes of one march drew a wood grain through every cloud; across
-/// maps the planes move, so the grain averages out over about 1 / share maps
-/// (a few seconds), long before a shape changes.
-///
-/// 0.3 AGAIN (2026-10-22 evening). At 1 (no history) the ghost copies of
-/// the edges went (`maps_accumulated_under_a_moving_sky_hold_no_ghost_edges`:
-/// 8.9% -> 0.8%), but with nothing averaging the sample planes, and the
-/// jitter then held at one fraction for every map, the clouds came out in
-/// flat stepped bands on the headset (user, video 21:29: "horrible"). Until
-/// the ghosts are fixed another way, the map accumulates as before.
+/// THE MAPS ACCUMULATE (2026-10-21): each map keeps this share of its own
+/// march and the rest of the newest, carried to its moment and eye on the
+/// winds (`advected_uv`). Samples sit at one fraction of the step per map
+/// (`HISTORY_JITTER`), so the fixed sample planes that drew a wood grain
+/// through every cloud move across maps and average out over ~1/share maps,
+/// long before a shape changes. At 1 (no history) the ghost edges went
+/// (8.9% -> 0.8%) but nothing averaged the planes and the clouds came out in
+/// flat stepped bands (user, video 2026-10-22 21:29); 0.3 until the ghosts go another way.
 pub const HISTORY_NEW: f32 = 0.3;
 
 /// A MAP'S HISTORY GOES WHILE ITS LIGHT CHANGES FAST (2026-10-23). Kept as a
@@ -97,16 +90,13 @@ fn light_let_go(now: &[f32; 3], then: &[f32; 3]) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 /// Where the old and new maps disagree by this much of the sky showing (a
-/// cloud born, or uncovered by the eye moving), the new march is taken
-/// alone (from the first to the second): history is for the grain, not for
-/// keeping a cloud. Before 2026-10-22 this was [0.2, 0.5]: a cloud edge
-/// whose shape had changed between the maps kept 70% of the old edge, a
-/// ghost fringe (`maps_accumulated_under_a_moving_sky_hold_no_ghost_edges`:
-/// 8.9% of the edge texels; [0.03, 0.1]: 0.94%), and the grain the history
-/// is for is under 0.008 of alpha since the refined march, so it still
-/// averages (`maps_built_one_after_another_settle_on_a_finer_march`).
-/// `HISTORY_REJECT_WIDE` is the old pair, for comparing
-/// (`Levers::cloud_history_tight`).
+/// cloud born, or uncovered by the eye moving), the new march is taken alone
+/// (ramped from the first to the second): history is for the grain, not for
+/// keeping a cloud. At the pre-2026-10-22 [0.2, 0.5] a changed edge kept 70%
+/// of the old one, a ghost fringe (8.9% of edge texels; here 0.94%), while
+/// the grain is under 0.008 of alpha and still averages
+/// (`maps_built_one_after_another_settle_on_a_finer_march`). The old pair is
+/// `HISTORY_REJECT_WIDE`, for comparing (`Levers::cloud_history_tight`).
 pub const HISTORY_REJECT: [f32; 2] = [0.03, 0.1];
 pub const HISTORY_REJECT_WIDE: [f32; 2] = [0.2, 0.5];
 /// BUT NOT AT THE HORIZON: there a step of the march spans kilometres, one
@@ -118,15 +108,13 @@ pub const HISTORY_REJECT_WIDE: [f32; 2] = [0.2, 0.5];
 /// .0 (the sine of the elevation) the wide pair holds, above .1 the tight.
 pub const HISTORY_HORIZON_UP: [f32; 2] = [0.06, 0.15];
 /// AND AS A SHARE OF THE CLOUD THERE: a ghost's soft rim over clear sky
-/// differs from the new march by under the tight pair (0.05 of the sky
-/// showing), so each older map left its cloud's outline in the clear sky,
-/// stacked like contour lines (headset video 2026-10-23 00:55). Taken over
-/// the more cloud of the two (at least `HISTORY_SHARE_FLOOR`), that rim
-/// differs by all of itself, while the grain inside a cloud (0.008 of 0.5)
-/// is under 2%. From the first share to the second the new march is taken
-/// alone; above the horizon only, as the tight pair. Faint rims (over 2% of
-/// cloud where a fresh map has none, `maps_accumulated_..._no_ghost_edges`)
-/// 6.9% -> 1.6% of the clear sky; grain and the horizon unchanged.
+/// differs from the new march by under the tight pair, so each older map left
+/// its cloud's outline stacked like contour lines in the clear sky (headset
+/// video 2026-10-23 00:55). Over the more cloud of the two (at least
+/// `HISTORY_SHARE_FLOOR`) that rim differs by all of itself, while the grain
+/// inside a cloud (0.008 of 0.5) is under 2%. Ramped like the tight pair,
+/// above the horizon only. Faint rims 6.9% -> 1.6% of the clear sky
+/// (`maps_accumulated_..._no_ghost_edges`); grain and the horizon unchanged.
 pub const HISTORY_REJECT_SHARE: [f32; 2] = [0.15, 0.35];
 pub const HISTORY_SHARE_FLOOR: f32 = 0.02;
 /// The history is carried a second time by the altitude the old map holds
@@ -512,19 +500,14 @@ fn weather_texture(device: &Device, queue: &Queue, field: &CloudField) -> Textur
 /// octave `cirrus_tau` reads at three times its scale.
 pub const CIRRUS_TEX: u32 = 3 * CLOUD_TILE;
 
-/// THE CIRRUS'S FIELD, BAKED FOR THE SKY SHADER (2026-10-23), `CIRRUS_TEX`
-/// a side over one weather tile (`sky_cirrus`):
-/// - .r the sheet: the noise `cirrus_tau` sums from three weather taps,
-///   0.45 g + 0.3 b at uv and 0.25 b at 3 uv + (0.37, 0.71) -- periodic over
-///   the tile, so baked over it;
-/// - .g the tufts: the weather's r.
-///
-/// Every sky pixel reads the sheet, and the tufts and the light only where it
-/// leaves any cirrus. Three RGBA8 taps a pixel cost the Quest +1.4 ms of the
-/// full-sky view and one RG16F tap +0.7, so it is two bytes a texel. One
-/// texture, as the desktop effects pass's fragment stage is at the 16
-/// sampled textures a stage wgpu grants by default. Mipped, as a pixel near
-/// the horizon spans many texels.
+/// THE CIRRUS'S FIELD, BAKED FOR THE SKY SHADER (2026-10-23), `CIRRUS_TEX` a
+/// side over one weather tile (`sky_cirrus`): .r the sheet (the noise
+/// `cirrus_tau` sums from three weather taps -- periodic over the tile, so
+/// baked over it), .g the tufts (the weather's r). Every sky pixel reads the
+/// sheet; the tufts and the light only where it leaves any cirrus. Three
+/// RGBA8 taps a pixel cost the Quest +1.4 ms of the full-sky view and one
+/// RG16F tap +0.7, so it is two bytes a texel. One texture, at wgpu's 16
+/// sampled textures a stage; mipped, as a horizon pixel spans many texels.
 pub fn cirrus_texture(device: &Device, queue: &Queue, field: &CloudField) -> Texture {
     let n = CIRRUS_TEX;
     let mut levels = 1;
@@ -1259,13 +1242,10 @@ impl CloudSky {
         };
         // A map keeps the scale its first slice was drawn at, and its moment.
         if from == 0 {
-            // EACH CHANNEL BY ITS OWN LIGHT (2026-10-23): one scale, the
-            // brightest channel of the sun and the sky, was the sun's red at
-            // dusk, which fell 1e3 times in seconds while the sky's blue held;
-            // a map's history, kept as a share of its own scale, then drew the
-            // sky-lit bodies far too dark and the edges the history let go
-            // at their own light -- a white rim round every cloud (user,
-            // headset at twilight). At dusk red follows the sun, blue the sky.
+            // EACH CHANNEL BY ITS OWN LIGHT (2026-10-23): scaled by the one
+            // brightest channel, the sun's red at dusk fell 1e3 times in
+            // seconds while the sky's blue held: sky-lit bodies far too dark,
+            // let-go edges a white rim round every cloud (user, headset at twilight).
             self.scales[target as usize] = std::array::from_fn(|c| 1.0 / (map.light[c] + map.amb_sky[c]).max(1e-20));
             self.times[target as usize] = map_time;
             self.eyes[target as usize] = [map.eye[0], map.eye[1], map.eye[2]];
@@ -1286,10 +1266,9 @@ impl CloudSky {
             let age = self.times[t] - self.times[h];
             let take = carry && age.abs() <= 4.0 * self.period + 1.0;
             // The sample fraction moves map to map only while the maps
-            // accumulate: unaveraged, a new fraction each map changed the far
-            // clouds at every swap, a flicker along the horizon (user,
-            // 2026-10-22; `a_still_sky_holds_still_at_the_horizon_from_map_to_map`).
-            // Held too while the light lets the history go (`HISTORY_LIGHT_LET_GO`).
+            // accumulate: unaveraged, a new fraction each map flickered the far
+            // clouds at every swap (user, 2026-10-22; also held while the light
+            // lets the history go: `a_still_sky_holds_still_...`, `HISTORY_LIGHT_LET_GO`).
             let light_go = light_let_go(&self.scales[t], &self.scales[h]);
             let jitter = if carry && HISTORY_NEW < 1.0 && light_go < 0.5 { (0.5 + self.maps_begun as f32 * HISTORY_JITTER).fract() } else { 0.5 };
             self.maps_begun = self.maps_begun.wrapping_add(1);
@@ -1301,17 +1280,10 @@ impl CloudSky {
                 w[1],
                 w[2],
                 w[3],
-                // The history carried as it is, a share of its own map's
-                // light: a cloud's light follows the light it is lit by, so
-                // that is what this map's would be. Converted to the old
-                // map's absolute light (`scales[t] / scales[h]`), each map
-                // kept 70% of the last map's radiance while the dusk dimmed
-                // the sky 1e5 times; past 1.43 times a map the sum grew, and
-                // the night's exposure drew the day's clouds blown white
-                // through the night (headset, 2026-10-23).
-                //
-                // .y: the history let go as the light it was lit by changes
-                // (`HISTORY_LIGHT_LET_GO`).
+                // The history is a share of its own map's light, the light this
+                // map would be lit by: converted to absolute (`scales[t] / scales[h]`)
+                // it kept 70% of the old radiance while dusk dimmed the sky 1e5 times,
+                // the day's clouds blown white all night (2026-10-23). .y: `HISTORY_LIGHT_LET_GO`.
                 [if take { HISTORY_NEW } else { 1.0 }, light_go, jitter, et[1]],
                 self.history_reject,
                 self.history_share,
@@ -1538,12 +1510,9 @@ const W2: f32 = {:.6};
         sum = sum + w[j] * row;
     }}
     // NO RINGING (2026-10-23): the sharpening's lobes overshot at a cloud's
-    // edge, and two texels out into clear sky they left the cloud's light
-    // over sky that showed whole -- a lit outline over nothing, unblended,
-    // brightest against the night sky (user, headset: the clouds' "entire
-    // outer wispy layer outline lit unblended") and in rings round holes.
-    // Held within its 3 x 3 neighbours a texel keeps the sharpening along
-    // smooth gradients and cannot step past either side of an edge.
+    // edge, leaving its light two texels out over clear sky -- a lit outline,
+    // brightest against the night (user: "outline lit unblended"), and rings
+    // round holes. Clamped to its 3 x 3 neighbours a texel cannot step past an edge.
     sum = clamp(sum, lo, hi);
     return vec4<f32>(max(sum.rgb, vec3<f32>(0.0)), clamp(sum.a, 0.0, 1.0));
 }}
@@ -1735,12 +1704,9 @@ const AIR_HAZE: f32 = {AIR_HAZE};
 const AIR_HAZE_HEIGHT: f32 = {AIR_HAZE_HEIGHT};
 
 // THE HAZE BETWEEN THE EYE AND A CLOUD `t` metres along a ray rising at `mu`
-// (2026-10-22): the aerosol (`u.light_dir.w` at the ground) and the air
-// thinning with height, through a flat atmosphere -- the depth of
-// sigma0 exp(-s mu / H) from 0 to t. One haze for every distance had near
-// clouds and those at the horizon equally clear, so the cumulus 30 km off
-// stood crisp and white in a carpet down to the sea where the photographed
-// sky's fade into a pale horizon.
+// (2026-10-22): the aerosol (`u.light_dir.w` at the ground) thinning with
+// height through a flat atmosphere, the depth of sigma0 exp(-s mu / H) over
+// 0..t. One haze for every distance left 30 km cumulus as crisp as near ones.
 fn haze_through(t: f32, mu: f32) -> f32 {
     let m = max(mu, 1e-3);
     let depth = u.light_dir.w * AEROSOL_HEIGHT / m * (1.0 - exp(-t * m / AEROSOL_HEIGHT))
@@ -1792,9 +1758,8 @@ const ENVELOPE_TOP_MIP: f32 = {ENVELOPE_TOP_MIP};
 const ALT_FILL_WEIGHT: f32 = {ALT_FILL_WEIGHT};
 // The clouds' transmittance over which a disc behind them fades in
 // (`fs_map`'s `through`): none below 25%, all of it from 85%. From 3% the
-// whole disc showed through a cloud's edge (headset, 2026-10-22): the sun
-// is ~1e5 the cloud, so even a third of it reads as the bare disc. Now an
-// edge that thins over the disc shows only the part of it in clear sky.
+// whole disc showed through an edge (headset, 2026-10-22) -- the sun is ~1e5
+// the cloud -- so a thinning edge now shows only the part in clear sky.
 const DISC_THROUGH0: f32 = 0.25;
 const DISC_THROUGH1: f32 = 0.85;
 
@@ -1878,12 +1843,10 @@ fn height_profile(kind: f32, h: f32, top: f32) -> f32 {
     return smoothstep(0.0, 0.2, h) * (1.0 - smoothstep(0.45, 0.9, h));
 }
 
-// The noise at `s`. For the sky map (`eased`), between texels on a
-// smoothstep rather than a straight line: a shape cut at a threshold from a
-// trilinear field keeps a corner at every texel face, and an altocumulus
-// puff a few texels wide came out as a square (2026-10-20). One tap; the
-// light and the ground's shadow keep the trilinear field their CPU twin
-// reads.
+// The noise at `s`. For the sky map (`eased`), between texels on a smoothstep:
+// a shape cut at a threshold from a trilinear field keeps a corner at every
+// texel face, and a small altocumulus puff came out square (2026-10-20). One
+// tap; the light and the ground's shadow keep the trilinear field the CPU twin reads.
 fn noise_at(s: vec3<f32>, eased: bool) -> vec4<f32> {
     if (!eased) {
         return textureSampleLevel(noise_tex, samp, s, 0.0);
@@ -1891,11 +1854,10 @@ fn noise_at(s: vec3<f32>, eased: bool) -> vec4<f32> {
     let p = s * NOISE_TEXELS + 0.5;
     let i = floor(p);
     let f = p - i;
-    // Eased across (x, z) only: up the layer (y) a smoothstep's zero slope
-    // at every texel face terraced the density into flat strata 62.5 m
-    // apart, which the boil dragged up through every cloud as lines
-    // (research 2026-10-21, cause (a)). Straight in y, the shapes keep
-    // their round puffs and lose the terraces.
+    // Eased across (x, z) only: up the layer (y) a smoothstep's zero slope at
+    // every texel face terraced the density into strata 62.5 m apart, dragged
+    // up through every cloud as lines by the boil (research 2026-10-21, cause
+    // (a)). Straight in y, the puffs stay round and the terraces go.
     let e = f * f * (3.0 - 2.0 * f);
     let g = vec3<f32>(e.x, f.y, e.z);
     return textureSampleLevel(noise_tex, samp, (i + g - 0.5) / NOISE_TEXELS, 0.0);
@@ -1912,11 +1874,10 @@ fn detile(s: vec2<f32>, ph: vec4<f32>) -> vec2<f32> {
     return 0.5 * DETILE_REACH * vec2<f32>(a + b, c + d);
 }
 
-// `foot`: the metres one sky-map texel spans where this sample is (0 for
-// the light and the ground's shadow, which keep every octave). Detail finer
-// than that cannot be drawn, only aliased -- near the horizon it came out
-// as rows of specks and stripes (headset, 2026-10-20) -- so the octaves it
-// outgrows give way to their means, which keeps the coverage as it was.
+// `foot`: the metres one sky-map texel spans where this sample is (0 for the
+// light and the ground's shadow, which keep every octave). Finer detail can
+// only alias -- rows of specks and stripes near the horizon (headset,
+// 2026-10-20) -- so outgrown octaves give way to their means, keeping the coverage.
 fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
     let a = lv(k, 0u);
     let h = (alt - a.x) / max(a.y - a.x, 1.0);
@@ -2125,11 +2086,10 @@ fn phase(c: f32) -> f32 {
 }
 
 // The light's optical depth from a point in layer k toward it: taps out
-// through the layer, nearer ones closer together. THE TAPS READ THE CLOUD
-// AS IT IS DRAWN, eroded edges and all: read without the detail they met
-// the fatter body the erosion carves, and against a path-traced reference
-// a cumulus's sunlight came out 3-10 times too dark (2026-10-21,
-// `tools/reference/cloud_reference.py`).
+// through the layer, READING THE CLOUD AS IT IS DRAWN, eroded edges and all.
+// Without the detail they met the fatter body the erosion carves: a cumulus's
+// sunlight 3-10x too dark against Cycles (2026-10-21, `tools/reference/cloud_reference.py`).
+
 // The optical depth of the first ~200 m toward the light, from the last
 // `light_tau` (a cumulus's first two taps; 0 for the two-tap layers): how
 // deep in its own lobe a sample sits, which the glow dims with (`GLOW_NEAR`).
@@ -2159,17 +2119,13 @@ fn light_tau(k: u32, xz: vec2<f32>, alt: f32, foot: f32) -> f32 {
 }
 
 // The light a sample in layer k sends toward the eye per unit extinction:
-// the sun's light scattered once (`ph`, the ray's phase toward it, worked
-// out once per ray), and the glow of all the higher orders (`glow`, the
-// same).
-//
-// THE GLOW (2026-10-21, against Cycles with every order of scattering, Mie
-// droplets): the light scattered many times is a smooth glow over a
-// cloud's body, thrown somewhat forward and hardly dimmed by the depth
-// toward the sun -- 91-95% of what is seen of a cumulus from the side or
-// with the sun behind. The octave approximation it replaces (Wrenninge)
-// kept a fraction of it and made every cumulus grey: 0.25-0.35 of the
-// reference's light where this is 0.82-0.93 (`CLOUD_GLOW`).
+// the sun's light scattered once (`ph`, the ray's phase toward it) and the
+// glow of all the higher orders (`glow`), each worked out once per ray.
+
+// THE GLOW (2026-10-21, against Cycles with every order, Mie droplets): light
+// scattered many times is a smooth glow over the body, thrown somewhat
+// forward and hardly dimmed by depth toward the sun -- 91-95% of a cumulus
+// seen side- or back-lit. The octave trick (Wrenninge) kept 0.25-0.35 and made cumulus grey (`CLOUD_GLOW`).
 fn in_scatter(k: u32, alt: f32, tau_l: f32, cv: f32, ph: f32, glow: f32, d: f32) -> vec3<f32> {
     let a = lv(k, 0u);
     let h = clamp((alt - a.x) / max(a.y - a.x, 1.0), 0.0, 1.0);
@@ -2256,11 +2212,10 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
     let alt = u.eye.y;
     let eye = u.eye.xz;
     let cv = dot(dir, u.light_dir.xyz);
-    // Every sample at one fraction of its step, the same for every texel of
-    // a map (`HISTORY_JITTER`): a jitter per texel, with nothing averaging
-    // it, was drawn as a fine hatching through every cloud on the headset
-    // (2026-10-20). One per map moves the sample planes as a whole, and the
-    // accumulation below averages the planes' grain away.
+    // Every sample at one fraction of its step, the same for every texel of a
+    // map (`HISTORY_JITTER`): per-texel jitter, with nothing averaging it,
+    // drew a fine hatching through every cloud (headset, 2026-10-20). One per
+    // map moves the planes whole, and the accumulation below averages their grain.
     let jitter = hist.misc.z;
     let ph = phase(cv);
     let glow = GLOW_GAIN * mix(hg(GLOW_G, cv), hg(GLOW_BACK_G, cv), GLOW_BACK);
@@ -2297,21 +2252,14 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
         let lw = layer_wind(k);
         let base = pick_steps(k, VIEW_STEPS);
         // STEPS OF ONE STRIDE FROM THE LAYER'S ENTRY, AND A SHORT LAST ONE.
-        // Split evenly into ceil(len / stride), every ray with the same count
-        // sampled the same heights of the layer, and where the count rose by
-        // one between rows every sample plane jumped: lines along the horizon
-        // every few rows (research 2026-10-21, cause (b)). Now the samples
-        // lie where the ray's own distance puts them, and a longer ray only
-        // grows its last step.
+        // Split evenly into ceil(len / stride), rays of one count sampled the
+        // same heights, and each +1 between rows jumped every sample plane:
+        // lines along the horizon (research 2026-10-21, cause (b)). Now a longer ray only grows its last step.
         let stride = clamp(VIEW_STEP_TEXELS / (NOISE_TEXELS * lv(k, 1u).x), len / f32(max(base, VIEW_STEPS_MOST)), len / f32(base));
         // COARSE THROUGH THE AIR, FINE THROUGH THE CLOUD (2026-10-21): the
-        // stride's sample planes showed in every cloud as ribbed stripes
-        // (offline against a path-traced reference: gone at a quarter of
-        // the stride). A coarse sample that finds cloud steps back to the
-        // last empty one and comes in again at a REFINE-th of the stride,
-        // and the march stays fine while it is in cloud and for
-        // REFINE_HOLD strides after, so the cloud is sampled four times as
-        // finely and the empty sky as before.
+        // stride's sample planes ribbed every cloud (gone offline at a quarter
+        // stride). A sample that finds cloud re-enters from the last empty one
+        // at a REFINE-th of the stride, held for REFINE_HOLD strides after the cloud ends.
         let fine_dt = stride / f32(REFINE);
         let t_end = t0 + len;
         var t = t0 + jitter * stride;
@@ -2349,15 +2297,10 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
             // cost on the Quest (1.33 -> 4.28 ms a slice, 2026-10-22).
             let at = select(t, 0.5 * (lo + hi), bis > 0u);
             var d = density(k, eye + dir.xz * at, altitude_along(alt, mu, at), true, foot);
-            // THE MARCH STEPS FROM THE CLOUD'S OWN SURFACE (2026-10-22). Its
-            // first sample in cloud lay anywhere in a fine step past the
-            // surface, set by the ray's distance alone, and at a cumulus's
-            // extinction (an optical depth near 1 a step) that sample is
-            // most of what the eye sees: the surfaces came out hatched with
-            // the sample shells (headset, user: "striation"). Found to a
-            // quarter of a step between the empty sample and this one, the
-            // march goes on from there, so neighbouring rays sample a cloud
-            // alike wherever it stands.
+            // THE MARCH STEPS FROM THE CLOUD'S OWN SURFACE (2026-10-22): the first
+            // sample in cloud lay anywhere in a fine step past it and, at optical
+            // depth ~1 a step, is most of what the eye sees -- surfaces hatched with
+            // sample shells (user: "striation"). Bisected to a quarter step, rays sample alike.
             if (bis > 0u) {
                 if (d > 0.0) {
                     hi = at;
@@ -2426,12 +2369,9 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
         rgb = rgb + (slab - 1.0) * glow_k;
     }
     // Cirrus: ice, a thin sheet, its light thrown forward. DRAWN BY THE SKY
-    // SHADER, per pixel, at its own wind (`sky::sky_cirrus`, 2026-10-23):
-    // in the map its light shared the texels of the clouds in front, whose
-    // carry wind (alts .ba) is the light-weighted sum of both, so where it
-    // crossed a cumulus both were carried 0.14-0.75 deg off their own winds
-    // over a map's life and snapped back at the next (`SHOWN_WIND_MIX`; user:
-    // "the shaders compete and make a weird distortion").
+    // SHADER, per pixel, at its own wind (`sky::sky_cirrus`, 2026-10-23): in
+    // the map it shared texels and carry wind (alts .ba) with the clouds in
+    // front, both carried 0.14-0.75 deg off their winds a map (`SHOWN_WIND_MIX`; user: "weird distortion").
     if (CIRRUS_IN_MAP && layer_on(3u) && trans > 0.01) {
         let t = shell_distance(alt, lv(3u, 0u).x, mu);
         if (t >= 0.0) {
@@ -2451,22 +2391,15 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
     // .g: the clouds' own transmittance, no haze -- what a disc behind them
     // gets (`cloud_through` in the sky shader).
     let h = (height + ALT_FILL_WEIGHT * fill) / (seen + ALT_FILL_WEIGHT);
-    // THE WIND WHAT IS SEEN RIDES, not the height's (2026-10-23). Carried on
-    // a wind blended between the layers' middles by height, a cumulus seen
-    // low in its layer rode half the stratocumulus's wind, ran ahead of or
-    // behind itself through a map and was pulled back by the next: the
-    // clouds stepped "3 forward, 1-2 back" (user, headset). Each layer's
-    // own wind, by its share of the light, is how what this texel shows moves.
+    // THE WIND WHAT IS SEEN RIDES, not the height's (2026-10-23): on a wind
+    // blended by height, a cumulus low in its layer rode half the
+    // stratocumulus's wind, ran ahead through a map and was pulled back at the
+    // next -- "3 forward, 1-2 back" (user, headset). Each layer's wind, by its share of the light.
     let hv = (wind + ALT_FILL_WEIGHT * fill_wind) / (seen + ALT_FILL_WEIGHT);
-    // The march stops once less than 1% gets through, and the 1% it left let
-    // the sun's disc -- some 1e5 times the cloud -- shine through thick
-    // cumulus as a white dot (user: the sun and moon shone "as if they are in
-    // front of the cloud", 2026-10-22). Past that point the cloud only goes
-    // on, so a disc behind it gets nothing. Nor does it through a cumulus
-    // edge of optical depth 3-4: a few per cent of the sun is still 1e3
-    // times the cloud, a hard white dot, where a real edge reads as a
-    // silver lining and no disc -- the forward scatter that swamps it is
-    // finer than this map. The disc fades in through thinner cloud.
+    // The march stops once less than 1% gets through, and that 1% let the sun's
+    // disc -- some 1e5 times the cloud -- shine through thick cumulus as a white
+    // dot (user, 2026-10-22: "as if they are in front of the cloud"). Past the
+    // stop the cloud only goes on, so the disc fades in only through thinner cloud.
     let through = trans * smoothstep(DISC_THROUGH0, DISC_THROUGH1, trans);
     var alts = vec4<f32>(h, through, hv);
     // THE NEWEST MAP, CARRIED HERE: what this texel shows, where that map
@@ -2474,12 +2407,10 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
     if (hist.misc.x < 1.0) {
         var huv = hist_carry(dir, h, hv);
         var old_alts = textureSampleLevel(hist_alt, samp, huv, 0.0);
-        // CARRIED BY ITS OWN ALTITUDE (R1, cloud research 2026-10-22): the
-        // first carry moves the old map by this march's altitude, which at an
-        // edge is the wrong cloud's (or the empty sky's fill), so the old
-        // cloud was fetched from where it no longer is and left a ghost
-        // copy beside the new edge. Carried again by the altitude the old map
-        // holds there, it lands where that cloud has moved to.
+        // CARRIED BY ITS OWN ALTITUDE (R1, cloud research 2026-10-22): the first
+        // carry moves the old map by this march's altitude, at an edge the wrong
+        // cloud's, fetching the old cloud from where it no longer is -- a ghost
+        // beside the new edge. Carried again by the old map's altitude there, it lands right.
         if (HISTORY_REFETCH) {
             let again = hist_carry(dir, old_alts.r, old_alts.ba);
             let again_alts = textureSampleLevel(hist_alt, samp, again, 0.0);
@@ -2632,14 +2563,13 @@ pub(crate) mod tests {
     }
 
     /// ONE CUMULUS LAYER FOR A PATH-TRACED REFERENCE (`--ignored`): the sky
-    /// map as the headset builds it, lit by the sun alone (irradiance 1, no
-    /// sky or ground light), and the same layer's extinction as a grid of
-    /// voxels read from the CPU twin, for `tools/reference/cloud_reference.py`
-    /// to render in Cycles under the same sun. `$OUT/cloud_map.f32` (rgb as
-    /// radiance, a = transmittance; rows from the horizon up),
-    /// `$OUT/cloud_grid.f32` ([x][y][z], per metre) and `$OUT/cloud.json`.
-    /// `SUN_EL` / `SUN_AZ` degrees (35, 0: toward +z), `VOXEL` metres (20),
-    /// `REACH` metres either side of the eye (7000).
+    /// map as the headset builds it, lit by the sun alone, and the layer's
+    /// extinction as a voxel grid from the CPU twin, for
+    /// `tools/reference/cloud_reference.py` to render in Cycles under the same
+    /// sun. `$OUT/cloud_map.f32` (rgb radiance, a transmittance; rows from the
+    /// horizon up), `$OUT/cloud_grid.f32` ([x][y][z], per metre),
+    /// `$OUT/cloud.json`. `SUN_EL` / `SUN_AZ` degrees (35, 0: toward +z),
+    /// `VOXEL` metres (20), `REACH` metres either side of the eye (7000).
     #[test]
     #[ignore = "writes reference cloud images to OUT; run by hand"]
     fn export_a_cumulus_for_a_path_traced_reference() {
@@ -2973,21 +2903,14 @@ pub(crate) mod tests {
         assert!(carried < 0.35 * left, "carrying the map does not follow the clouds: {carried} vs {left}");
     }
 
-    /// HOW FAR THE SHOWN CLOUDS STEP BACK at a map swap: a map one build
-    /// old, carried to the next map's moment as the sky shader carries it,
-    /// against that next map, patch by patch. The shift that best lays one
-    /// on the other is how far a cloud jumps while the display blends from
-    /// the old map to the new (user, 2026-10-23: "3 steps forward, 1-2 steps
-    /// back"). `STEP_DT` the build (cloud s, 6.7: a slice a frame at 36 Hz,
-    /// 2.5x clock), `STEP_WIND=height` carries on the height's wind as before,
-    /// `STEP_POP=hold` keeps one population (no drift, no growth),
-    /// `STEP_CHURN=hold` holds the churn, `STEP_KINDS=0,0,0,1` the kinds.
-    /// Carried on the height's wind with the cirrus creeping on the
-    /// weather's: median 0.71 texels, p90 4.03, the cirrus alone 2.5 (and
-    /// its best shift took 66% of the misfit). On each texel's own wind with
-    /// the cirrus on its wind: median 0.50, p90 1.50, cirrus 0; what is left
-    /// is the clouds' own drift and growth (0 with the population held).
-    /// `--ignored`.
+    /// HOW FAR THE SHOWN CLOUDS STEP BACK at a map swap: a map one build old,
+    /// carried to the next map's moment as the sky shader carries it, against
+    /// that next map, patch by patch; the best-fit shift is the jump seen while
+    /// the display blends maps (user, 2026-10-23: "3 steps forward, 1-2 back").
+    /// `STEP_DT` the build, `STEP_WIND=height` the old carry, `STEP_POP=hold` /
+    /// `STEP_CHURN=hold` / `STEP_KINDS` pin the sky. Height's wind, cirrus on
+    /// the weather's: median 0.71 texels, p90 4.03 (cirrus alone 2.5, 66% of
+    /// the misfit). Each texel's own wind: median 0.50, p90 1.50, cirrus 0. `--ignored`.
     #[test]
     #[ignore = "diagnostic: prints how far carried maps step back"]
     fn carried_maps_step_back_by() {
@@ -3204,10 +3127,9 @@ pub(crate) mod tests {
             }
         }
         // With the history (`HISTORY_NEW` 0.3) let go at 0.2 to 0.5: off by
-        // 0.0399, 8.9% ghosts; at `HISTORY_REJECT` 0.03 to 0.1, 0.0188 and
-        // 0.94%, and 0.0200 and 1.07% with the horizon kept wide. Without history, 0.0109 and 0.80% while each map sampled at
-        // its own fraction (but bands on the headset); at one fraction for
-        // every map, 0 and 0.
+        // 0.0399, 8.9% ghosts; at `HISTORY_REJECT` 0.03 to 0.1, 0.0188 and 0.94%
+        // (0.0200 and 1.07% with the horizon kept wide). No history: 0.0109 and
+        // 0.80% with a fraction per map (bands on the headset); one for all, 0 and 0.
         assert!(off < 0.025, "the accumulated map is off the sky of its moment by {off:.5}");
         assert!(ghost_share < 0.015, "{ghosts} clear texels hold a cloud the sky has not");
     }

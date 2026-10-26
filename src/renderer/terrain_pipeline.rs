@@ -3570,12 +3570,11 @@ pub fn layer_mips(map: LayerMap, slot: usize, layers: &[TerrainImage], normals: 
 /// THE GROUND'S LAYER ARRAYS on the GPU -- colour, normal, roughness, and
 /// occlusion with height -- four layers each with every mip. Built once per
 /// texture set and shared by every material rebuild
-/// ([`TerrainMaterial::with_arrays`]): rebuilding them with the material put
-/// four 2K arrays' uploads, mip work and copies on every splat, settings and
-/// mud-map change, and a 2K set's load past the Quest 3's memory (2026-10-20).
-/// From the layer images ([`Self::from_images`]), or from a set encoded ahead
-/// as ASTC ([`Self::from_astc`], `bin/terrain_astc`): 8 bits a texel against
-/// 32, and no decoding on the headset.
+/// ([`TerrainMaterial::with_arrays`]): rebuilt with the material, four 2K
+/// arrays' uploads and mip work rode every splat or settings change, and a 2K
+/// set's load passed the Quest 3's memory (2026-10-20). From the layer images
+/// ([`Self::from_images`]) or a set encoded ahead as ASTC ([`Self::from_astc`],
+/// `bin/terrain_astc`): 8 bits a texel against 32, and no decoding on the headset.
 pub struct TerrainLayerArrays {
     pub albedo: TextureView,
     pub normals: TextureView,

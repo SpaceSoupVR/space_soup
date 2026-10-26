@@ -74,10 +74,9 @@ const EARTH_RADIUS: f32 = 6.371e6;
 /// toward the eye: any point drawn at a pixel lies on that ray, lifted skirt
 /// or not, and the player frame turns only about the vertical, so `-v.y` is
 /// the ray's world elevation) and its angular size (`fwidth`): a filtered
-/// straight edge, the
-/// same at every head pose, so it neither steps nor crawls. Blended onto the
-/// sky already drawn beneath it (`Levers::sky_before_water`); from below the
-/// surface it is 1.
+/// straight edge, the same at every head pose, so it neither steps nor
+/// crawls. Blended onto the sky already drawn beneath it
+/// (`Levers::sky_before_water`); from below the surface it is 1.
 const HORIZON_IN_FS: &str = r"
     let horizon_up = cam_pos().y + camera.player_frame.y - water.extinction.w;
     let horizon_dip = -sqrt(2.0 * max(horizon_up, 0.0) / EARTH_RADIUS);
@@ -609,10 +608,9 @@ pub(crate) const WATER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("glint", &[("        glint = glint + radiance * WATER_PI * water_ggx(n, v, to_l, a2);\n", "")]),
 
     // What open sea never shows, all at once (no caustic, walk, view beyond,
-    // refraction, surf or breaker): 28 -> 20 registers, 37% -> 50%
-    // occupancy, 3430 -> 2559 instructions, and the same frame time at
-    // day_sea (23.9 vs 23.6 / 24.6 ms, 2026-10-21) -- the water is held up by
-    // neither, so a deep-water twin was not kept.
+    // refraction, surf or breaker): 28 -> 20 registers, 37% -> 50% occupancy,
+    // 3430 -> 2559 instructions, and the same frame time at day_sea (23.9 vs
+    // 23.6 / 24.6 ms, 2026-10-21) -- so a deep-water twin was not kept.
     (
         "deep",
         &[
@@ -1538,11 +1536,10 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud) * print_shade;
     let body = water.scatter.rgb * silt * (sky_n * mix(1.0, MUD_SKY_SHARE, mud) + sunlight * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0)) * (vec3<f32>(1.0) - t_view);
 
-    // THE CAUSTICS only where they can show. From CAUSTIC_DEEPEST of water
-    // down their contrast is zero (that smoothstep saturates at 1), so the
-    // sum is skipped and `caustic` keeps exactly the 1.0 it would have come
-    // to. Open sea is all of that, and it was 17% of the water draw's clocks
-    // at day_sea (2026-10-21).
+    // THE CAUSTICS only where they can show: from CAUSTIC_DEEPEST of water
+    // down their contrast is zero (that smoothstep saturates at 1), so the sum
+    // is skipped and `caustic` keeps exactly the 1.0 it would reach. Open sea
+    // is all of that, 17% of the water draw's clocks at day_sea (2026-10-21).
     var caustic = 1.0;
     if (thickness < CAUSTIC_DEEPEST) {{
         let focus = thickness * (1.0 - 1.0 / IOR_WATER);
@@ -2206,10 +2203,8 @@ mod ring_size_tests {
         assert!(ringed > ringless, "the ringed twin has the rings in it");
         // 2,424 was the cap; +89 is the four-tap box PCF (`lights::pcf_box_taps`,
         // 2026-10-23). The proxy counts a loop's body once, so the nine-tap one
-        // it replaced read as smaller, but the driver unrolls a 3x3 loop
-        // of constant bounds: on the Quest the four taps made the water views
-        // faster (beach_south 13.89 -> 13.58 ms, pond 14.80 -> 14.69), not
-        // slower as a crossed cliff would.
+        // it replaced read as smaller, but the driver unrolls a 3x3 loop of
+        // constant bounds: the four taps made the water views faster on the Quest, not slower.
         const WATER_CAP: usize = 2424 + 89;
         assert!(ringed <= WATER_CAP, "the ringed twin is past the instruction cache: {ringed} by the proxy ({WATER_CAP} at most)");
         for mud in WaterMud::ALL {
