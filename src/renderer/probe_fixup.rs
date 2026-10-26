@@ -564,6 +564,7 @@ fn fixup_pipeline(device: &Device, layout: &wgpu::PipelineLayout, label: &str, s
 
 pub struct ProbeFixups {
     buffer: Buffer,
+    #[allow(dead_code, reason = "records the buffer size for debugging")]
     capacity: u32,
     pass_layout: BindGroupLayout,
     list_bind_group: BindGroup,

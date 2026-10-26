@@ -624,7 +624,7 @@ pub struct MotionParticles<'a> {
     pub groups: [Option<&'a wgpu::BindGroup>; 2],
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
 pub fn record(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &MotionPipelines,
@@ -754,6 +754,181 @@ pub fn layer_info(
         max_depth: 1.0,
         near_z: NEAR_Z,
         far_z: FAR_Z,
+    }
+}
+
+
+#[cfg(target_os = "android")]
+pub struct Readback {
+    device: ash::Device,
+    queue: ash::vk::Queue,
+    pool: ash::vk::CommandPool,
+    buffer: ash::vk::Buffer,
+    memory: ash::vk::DeviceMemory,
+    size: (u32, u32),
+}
+
+#[cfg(target_os = "android")]
+impl Readback {
+    pub fn new(
+        instance: &ash::Instance,
+        physical: ash::vk::PhysicalDevice,
+        device: &ash::Device,
+        queue: ash::vk::Queue,
+        family: u32,
+        size: (u32, u32),
+    ) -> Result<Self, ash::vk::Result> {
+        use ash::vk;
+        let bytes = (size.0 * size.1) as u64 * (4 + 8);
+        unsafe {
+            let buffer = device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(bytes)
+                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )?;
+            let req = device.get_buffer_memory_requirements(buffer);
+            let props = instance.get_physical_device_memory_properties(physical);
+            let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let ty = (0..props.memory_type_count)
+                .find(|&i| req.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(want))
+                .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+            let memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None)?;
+            device.bind_buffer_memory(buffer, memory, 0)?;
+            let pool = device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                    .queue_family_index(family),
+                None,
+            )?;
+            Ok(Self { device: device.clone(), queue, pool, buffer, memory, size })
+        }
+    }
+
+    pub fn read(
+        &self,
+        depth: ash::vk::Image,
+        depth_has_stencil: bool,
+        motion: ash::vk::Image,
+        layer: u32,
+        save: Option<&std::path::Path>,
+    ) -> Result<String, ash::vk::Result> {
+        use ash::vk;
+        let (w, h) = self.size;
+        let d = &self.device;
+        unsafe {
+            let cmd = d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default().command_pool(self.pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+            )?[0];
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            let depth_aspects = if depth_has_stencil { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
+            let range = |aspect| vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: layer, layer_count: 1 };
+            let barrier = |image, aspect, from, to, src, dst| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(src)
+                    .dst_access_mask(dst)
+                    .old_layout(from)
+                    .new_layout(to)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range(aspect))
+            };
+            let to_copy = [
+                barrier(depth, depth_aspects, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE, vk::AccessFlags::TRANSFER_READ),
+                barrier(motion, vk::ImageAspectFlags::COLOR, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE, vk::AccessFlags::TRANSFER_READ),
+            ];
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_copy);
+            let layers = |aspect| vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: layer, layer_count: 1 };
+            let extent = vk::Extent3D { width: w, height: h, depth: 1 };
+            d.cmd_copy_image_to_buffer(cmd, depth, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, self.buffer,
+                &[vk::BufferImageCopy::default().buffer_offset(0).image_subresource(layers(vk::ImageAspectFlags::DEPTH)).image_extent(extent)]);
+            d.cmd_copy_image_to_buffer(cmd, motion, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, self.buffer,
+                &[vk::BufferImageCopy::default().buffer_offset((w * h * 4) as u64).image_subresource(layers(vk::ImageAspectFlags::COLOR)).image_extent(extent)]);
+            let back = [
+                barrier(depth, depth_aspects, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+                barrier(motion, vk::ImageAspectFlags::COLOR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+            ];
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &back);
+            d.end_command_buffer(cmd)?;
+            let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let cmds = [cmd];
+            let submitted = d.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence);
+            let waited = submitted.and_then(|()| d.wait_for_fences(&[fence], true, u64::MAX));
+            d.destroy_fence(fence, None);
+            d.free_command_buffers(self.pool, &cmds);
+            waited?;
+            let n = (w * h) as usize;
+            let ptr = d.map_memory(self.memory, 0, (n * 12) as u64, vk::MemoryMapFlags::empty())? as *const u8;
+            let bytes = std::slice::from_raw_parts(ptr, n * 12);
+            if let Some(path) = save {
+                let mut file = Vec::with_capacity(16 + n * 12);
+                for v in [w, h, layer, depth_has_stencil as u32] {
+                    file.extend_from_slice(&v.to_le_bytes());
+                }
+                file.extend_from_slice(bytes);
+                if let Err(e) = std::fs::write(path, &file) {
+                    log::warn!("SWDUMP: could not write {}: {e}", path.display());
+                }
+            }
+            let depth_word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+            let depth_value = |i: usize| {
+                if depth_has_stencil {
+                    (depth_word(i) & 0x00FF_FFFF) as f32 / 16_777_215.0
+                } else {
+                    f32::from_bits(depth_word(i))
+                }
+            };
+            let (mut dmin, mut dmax, mut dsum, mut dzero, mut done) = (f32::MAX, f32::MIN, 0.0f64, 0usize, 0usize);
+            for i in 0..n {
+                let v = depth_value(i);
+                dmin = dmin.min(v);
+                dmax = dmax.max(v);
+                dsum += v as f64;
+                dzero += (v == 0.0) as usize;
+                done += (v >= 1.0) as usize;
+            }
+            let half = |i: usize, c: usize| {
+                let at = n * 4 + i * 8 + c * 2;
+                half_to_f32(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
+            };
+            let (mut xmax, mut ymax, mut zmax, mut nan, mut moving) = (0.0f32, 0.0f32, 0.0f32, 0usize, 0usize);
+            for i in 0..n {
+                let (x, y, z) = (half(i, 0), half(i, 1), half(i, 2));
+                if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+                    nan += 1;
+                    continue;
+                }
+                xmax = xmax.max(x.abs());
+                ymax = ymax.max(y.abs());
+                zmax = zmax.max(z.abs());
+                moving += (x.abs() + y.abs() > 1e-4) as usize;
+            }
+            let centre = depth_value((h / 2 * w + w / 2) as usize);
+            d.unmap_memory(self.memory);
+            Ok(format!(
+                "layer {layer}: depth min {dmin:.6} max {dmax:.6} mean {:.6} centre {centre:.6}, {dzero} at 0, {done} at 1 of {n}; \
+                 motion |x|<={xmax:.5} |y|<={ymax:.5} |z|<={zmax:.5}, {moving} moving, {nan} not finite",
+                dsum / n as f64
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((h >> 10) & 0x1F) as i32;
+    let frac = (h & 0x3FF) as f32;
+    match exp {
+        0 => sign * frac * 2f32.powi(-24),
+        31 => if frac == 0.0 { sign * f32::INFINITY } else { f32::NAN },
+        _ => sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
     }
 }
 
@@ -1325,179 +1500,5 @@ mod tests {
         let grazing = view_proj(Vec3::new(0.0, 1.6, 0.0), 1.5);
         let mv = motion_vector(vp, grazing, Vec3::new(0.3, 1.6, -4.0));
         assert!(mv.is_finite() && mv.abs().max_element() <= MAX_NDC_MOTION, "{mv}");
-    }
-}
-
-#[cfg(target_os = "android")]
-pub struct Readback {
-    device: ash::Device,
-    queue: ash::vk::Queue,
-    pool: ash::vk::CommandPool,
-    buffer: ash::vk::Buffer,
-    memory: ash::vk::DeviceMemory,
-    size: (u32, u32),
-}
-
-#[cfg(target_os = "android")]
-impl Readback {
-    pub fn new(
-        instance: &ash::Instance,
-        physical: ash::vk::PhysicalDevice,
-        device: &ash::Device,
-        queue: ash::vk::Queue,
-        family: u32,
-        size: (u32, u32),
-    ) -> Result<Self, ash::vk::Result> {
-        use ash::vk;
-        let bytes = (size.0 * size.1) as u64 * (4 + 8);
-        unsafe {
-            let buffer = device.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(bytes)
-                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )?;
-            let req = device.get_buffer_memory_requirements(buffer);
-            let props = instance.get_physical_device_memory_properties(physical);
-            let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let ty = (0..props.memory_type_count)
-                .find(|&i| req.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(want))
-                .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
-            let memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None)?;
-            device.bind_buffer_memory(buffer, memory, 0)?;
-            let pool = device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                    .queue_family_index(family),
-                None,
-            )?;
-            Ok(Self { device: device.clone(), queue, pool, buffer, memory, size })
-        }
-    }
-
-    pub fn read(
-        &self,
-        depth: ash::vk::Image,
-        depth_has_stencil: bool,
-        motion: ash::vk::Image,
-        layer: u32,
-        save: Option<&std::path::Path>,
-    ) -> Result<String, ash::vk::Result> {
-        use ash::vk;
-        let (w, h) = self.size;
-        let d = &self.device;
-        unsafe {
-            let cmd = d.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default().command_pool(self.pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
-            )?[0];
-            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
-            let depth_aspects = if depth_has_stencil { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
-            let range = |aspect| vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: layer, layer_count: 1 };
-            let barrier = |image, aspect, from, to, src, dst| {
-                vk::ImageMemoryBarrier::default()
-                    .src_access_mask(src)
-                    .dst_access_mask(dst)
-                    .old_layout(from)
-                    .new_layout(to)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(image)
-                    .subresource_range(range(aspect))
-            };
-            let to_copy = [
-                barrier(depth, depth_aspects, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE, vk::AccessFlags::TRANSFER_READ),
-                barrier(motion, vk::ImageAspectFlags::COLOR, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE, vk::AccessFlags::TRANSFER_READ),
-            ];
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_copy);
-            let layers = |aspect| vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: layer, layer_count: 1 };
-            let extent = vk::Extent3D { width: w, height: h, depth: 1 };
-            d.cmd_copy_image_to_buffer(cmd, depth, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, self.buffer,
-                &[vk::BufferImageCopy::default().buffer_offset(0).image_subresource(layers(vk::ImageAspectFlags::DEPTH)).image_extent(extent)]);
-            d.cmd_copy_image_to_buffer(cmd, motion, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, self.buffer,
-                &[vk::BufferImageCopy::default().buffer_offset((w * h * 4) as u64).image_subresource(layers(vk::ImageAspectFlags::COLOR)).image_extent(extent)]);
-            let back = [
-                barrier(depth, depth_aspects, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
-                barrier(motion, vk::ImageAspectFlags::COLOR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-            ];
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &back);
-            d.end_command_buffer(cmd)?;
-            let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
-            let cmds = [cmd];
-            let submitted = d.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence);
-            let waited = submitted.and_then(|()| d.wait_for_fences(&[fence], true, u64::MAX));
-            d.destroy_fence(fence, None);
-            d.free_command_buffers(self.pool, &cmds);
-            waited?;
-            let n = (w * h) as usize;
-            let ptr = d.map_memory(self.memory, 0, (n * 12) as u64, vk::MemoryMapFlags::empty())? as *const u8;
-            let bytes = std::slice::from_raw_parts(ptr, n * 12);
-            if let Some(path) = save {
-                let mut file = Vec::with_capacity(16 + n * 12);
-                for v in [w, h, layer, depth_has_stencil as u32] {
-                    file.extend_from_slice(&v.to_le_bytes());
-                }
-                file.extend_from_slice(bytes);
-                if let Err(e) = std::fs::write(path, &file) {
-                    log::warn!("SWDUMP: could not write {}: {e}", path.display());
-                }
-            }
-            let depth_word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-            let depth_value = |i: usize| {
-                if depth_has_stencil {
-                    (depth_word(i) & 0x00FF_FFFF) as f32 / 16_777_215.0
-                } else {
-                    f32::from_bits(depth_word(i))
-                }
-            };
-            let (mut dmin, mut dmax, mut dsum, mut dzero, mut done) = (f32::MAX, f32::MIN, 0.0f64, 0usize, 0usize);
-            for i in 0..n {
-                let v = depth_value(i);
-                dmin = dmin.min(v);
-                dmax = dmax.max(v);
-                dsum += v as f64;
-                dzero += (v == 0.0) as usize;
-                done += (v >= 1.0) as usize;
-            }
-            let half = |i: usize, c: usize| {
-                let at = n * 4 + i * 8 + c * 2;
-                half_to_f32(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
-            };
-            let (mut xmax, mut ymax, mut zmax, mut nan, mut moving) = (0.0f32, 0.0f32, 0.0f32, 0usize, 0usize);
-            for i in 0..n {
-                let (x, y, z) = (half(i, 0), half(i, 1), half(i, 2));
-                if !(x.is_finite() && y.is_finite() && z.is_finite()) {
-                    nan += 1;
-                    continue;
-                }
-                xmax = xmax.max(x.abs());
-                ymax = ymax.max(y.abs());
-                zmax = zmax.max(z.abs());
-                moving += (x.abs() + y.abs() > 1e-4) as usize;
-            }
-            let centre = depth_value((h / 2 * w + w / 2) as usize);
-            d.unmap_memory(self.memory);
-            Ok(format!(
-                "layer {layer}: depth min {dmin:.6} max {dmax:.6} mean {:.6} centre {centre:.6}, {dzero} at 0, {done} at 1 of {n}; \
-                 motion |x|<={xmax:.5} |y|<={ymax:.5} |z|<={zmax:.5}, {moving} moving, {nan} not finite",
-                dsum / n as f64
-            ))
-        }
-    }
-}
-
-#[cfg(target_os = "android")]
-fn half_to_f32(h: u16) -> f32 {
-    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((h >> 10) & 0x1F) as i32;
-    let frac = (h & 0x3FF) as f32;
-    match exp {
-        0 => sign * frac * 2f32.powi(-24),
-        31 => if frac == 0.0 { sign * f32::INFINITY } else { f32::NAN },
-        _ => sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
     }
 }

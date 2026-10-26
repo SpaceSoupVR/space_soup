@@ -39,7 +39,7 @@ impl Renderer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn prepare(
         &mut self,
         device: &Device,

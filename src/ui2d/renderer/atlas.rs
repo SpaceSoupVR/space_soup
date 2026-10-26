@@ -121,7 +121,7 @@ impl TextAtlas {
             .collect();
     }
 
-    fn get_font(&mut self, font: &Arc<Font>) -> &mut ImageMap {
+    fn font_map(&mut self, font: &Arc<Font>) -> &mut ImageMap {
         let position = self
             .fonts
             .iter()
@@ -133,14 +133,14 @@ impl TextAtlas {
         &mut self.fonts[position].1
     }
 
-    fn get_image(
+    fn image_map(
         &mut self,
         font: &Arc<Font>,
         c: char,
         font_size: f32,
         scale_factor: f32,
     ) -> Option<Arc<RgbaImage>> {
-        let map = self.get_font(font);
+        let map = self.font_map(font);
         map.entry((c, font_size.to_bits(), scale_factor.to_bits()))
             .or_insert_with(|| rasterize_glyph_supersampled(font, c, font_size * scale_factor))
             .clone()
@@ -157,7 +157,7 @@ impl TextAtlas {
                 line.2
                     .iter()
                     .filter_map(|ch| {
-                        self.get_image(&ch.2, ch.0, ch.6, scale_factor).map(|img| {
+                        self.image_map(&ch.2, ch.0, ch.6, scale_factor).map(|img| {
                             let w = img.width() as f32 / scale_factor;
                             let h = img.height() as f32 / scale_factor;
                             let shape = ShapeType::Rectangle(0.0, (w, h), 0.0);
@@ -239,7 +239,7 @@ fn box_downsample(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: u
                     count += 1;
                 }
             }
-            out[dy * dst_w + dx] = if count > 0 { (sum / count) as u8 } else { 0 };
+            out[dy * dst_w + dx] = sum.checked_div(count).map_or(0, |mean| mean as u8);
         }
     }
     out

@@ -100,7 +100,7 @@ impl XrRenderer {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn render_frame_with_meshes(
         &mut self,
         session: &xr::Session<xr::Vulkan>,

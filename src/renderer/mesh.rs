@@ -49,10 +49,7 @@ impl GltfMesh {
     }
 
     pub fn joint_names(&self) -> &[String] {
-        self.skin
-            .as_ref()
-            .map(|s| s.joint_names.as_slice())
-            .unwrap_or(&[])
+        self.skin.as_ref().map_or(&[], |s| s.joint_names.as_slice())
     }
 
     pub fn create_skin_bind_group(

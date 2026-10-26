@@ -370,7 +370,7 @@ fn water_with_cut(device: &Device, inputs: &WaterInputs, dual_source: bool, cut:
     Some(build_water(device, layout, *format, *blend, *samples, *view, src, &format!("water_cut_{cut}")))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
 fn build_water(
     device: &Device,
     layout: &PipelineLayout,
@@ -665,6 +665,7 @@ const RING_BLOCK: &str = r"    if (water.rings[0].w > 0.0) {
     }
 ";
 
+#[cfg(test)]
 fn water_wgsl(dual: bool) -> String {
     water_wgsl_with(dual, true)
 }

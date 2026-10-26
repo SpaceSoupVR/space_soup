@@ -48,8 +48,6 @@ pub mod shader_checks;
 pub mod portal_cull;
 pub mod doors;
 pub mod shader_precision;
-#[cfg(test)]
-pub(crate) mod shader_inlining;
 pub mod skin_compute;
 pub mod water_waves;
 pub mod probe_blur;
@@ -110,3 +108,6 @@ pub struct MeshInstance<'a> {
 
     pub tile_caster: bool,
 }
+
+#[cfg(test)]
+pub(crate) mod shader_inlining;

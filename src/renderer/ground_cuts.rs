@@ -96,7 +96,7 @@ pub(crate) fn with_cut(src: &str, edits: &[(&str, &str)]) -> Option<String> {
     Some(s)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
 pub fn log_ground_cuts(
     device: &Device,
     format: TextureFormat,
@@ -152,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn ground_cut_sizes() {
         for (base, _, _, src) in ground_cut_bases() {
             let total = |s: &str| crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum::<usize>();

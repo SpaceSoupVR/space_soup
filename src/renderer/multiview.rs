@@ -80,6 +80,60 @@ fn matching_paren(src: &str, open: usize) -> Option<usize> {
     None
 }
 
+
+#[cfg(test)]
+pub fn multiview_validation_error(src: &str) -> Option<String> {
+    multiview_validation_error_of(src, true)
+}
+
+#[cfg(test)]
+pub fn multiview_validation_error_of(src: &str, transform: bool) -> Option<String> {
+    use wgpu::naga;
+    let transformed = if transform { as_multiview(src) } else { src.to_string() };
+    let module = match naga::front::wgsl::parse_str(&transformed) {
+        Ok(m) => m,
+        Err(e) => return Some(format!("parse: {}", e.emit_to_string(&transformed))),
+    };
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+
+        naga::valid::Capabilities::all(),
+    );
+    match validator.validate(&module) {
+        Ok(_) => None,
+        Err(e) => Some(format!("validate: {e:?}")),
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ViewMode {
+
+    Mono,
+
+    Stereo,
+}
+
+impl ViewMode {
+
+    pub fn mask(self) -> Option<core::num::NonZeroU32> {
+        match self {
+            Self::Mono => None,
+            Self::Stereo => STEREO_VIEW_MASK,
+        }
+    }
+
+    pub fn shader(self, src: String) -> String {
+        match self {
+            Self::Mono => src,
+            Self::Stereo => as_multiview(&src),
+        }
+    }
+
+    pub fn is_stereo(self) -> bool {
+        self == Self::Stereo
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,58 +348,5 @@ mod tests {
         let got = as_multiview(src);
         assert!(got.contains("i: Inst,\n, @builtin(view_index)") || got.contains(", @builtin(view_index) view_index_in: u32\n) -> VOut") || got.contains("@builtin(view_index) view_index_in: u32"), "{got}");
         assert_eq!(got.matches("view_slot = i32(view_index_in);").count(), 1, "{got}");
-    }
-}
-
-#[cfg(test)]
-pub fn multiview_validation_error(src: &str) -> Option<String> {
-    multiview_validation_error_of(src, true)
-}
-
-#[cfg(test)]
-pub fn multiview_validation_error_of(src: &str, transform: bool) -> Option<String> {
-    use wgpu::naga;
-    let transformed = if transform { as_multiview(src) } else { src.to_string() };
-    let module = match naga::front::wgsl::parse_str(&transformed) {
-        Ok(m) => m,
-        Err(e) => return Some(format!("parse: {}", e.emit_to_string(&transformed))),
-    };
-    let mut validator = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-
-        naga::valid::Capabilities::all(),
-    );
-    match validator.validate(&module) {
-        Ok(_) => None,
-        Err(e) => Some(format!("validate: {e:?}")),
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum ViewMode {
-
-    Mono,
-
-    Stereo,
-}
-
-impl ViewMode {
-
-    pub fn mask(self) -> Option<core::num::NonZeroU32> {
-        match self {
-            Self::Mono => None,
-            Self::Stereo => STEREO_VIEW_MASK,
-        }
-    }
-
-    pub fn shader(self, src: String) -> String {
-        match self {
-            Self::Mono => src,
-            Self::Stereo => as_multiview(&src),
-        }
-    }
-
-    pub fn is_stereo(self) -> bool {
-        self == Self::Stereo
     }
 }

@@ -604,6 +604,20 @@ pub(crate) mod tests {
     }
 }
 
+
+#[cfg(test)]
+pub fn solid_shader_src() -> String {
+    solid_shader()
+}
+#[cfg(test)]
+pub fn solid_ssr_shader_src() -> String {
+    solid_ssr_shader()
+}
+#[cfg(test)]
+pub fn wire_shader_src() -> String {
+    WIRE_SHADER.to_string()
+}
+
 #[cfg(test)]
 mod msaa_tests {
     use super::tests::headless_gpu;
@@ -834,17 +848,4 @@ mod msaa_tests {
             "the multisampled image is not the same triangle: mass {a} vs {b}",
         );
     }
-}
-
-#[cfg(test)]
-pub fn solid_shader_src() -> String {
-    solid_shader()
-}
-#[cfg(test)]
-pub fn solid_ssr_shader_src() -> String {
-    solid_ssr_shader()
-}
-#[cfg(test)]
-pub fn wire_shader_src() -> String {
-    WIRE_SHADER.to_string()
 }

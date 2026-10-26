@@ -694,6 +694,11 @@ pub fn star_count_in_cells(star_count: f32) -> f32 {
 }
 
 #[cfg(test)]
+pub fn sky_shader_src() -> String {
+    sky_shader()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1321,9 +1326,4 @@ mod render_tests {
             panic!("the sky pipeline failed validation: {e}");
         }
     }
-}
-
-#[cfg(test)]
-pub fn sky_shader_src() -> String {
-    sky_shader()
 }

@@ -91,7 +91,7 @@ pub(crate) fn report(label: &str, src: &str, entry: &str, rows: usize) -> String
         let from: Vec<String> = r.callers.iter().map(|(c, n)| format!("{c} x{n}")).collect();
         out += &format!("  {:>8}  {:>6}  {:>4}  {}  <- {}\n", r.repeated(), r.copies, r.own, r.name, from.join(", "));
     }
-    all.sort_by(|a, b| (b.own * b.copies).cmp(&(a.own * a.copies)));
+    all.sort_by_key(|r| std::cmp::Reverse(r.own * r.copies));
     out += "  largest  copies   own  function\n";
     for r in all.iter().take(rows) {
         out += &format!("  {:>7}  {:>6}  {:>4}  {}\n", r.own * r.copies, r.copies, r.own, r.name);
@@ -131,9 +131,9 @@ impl Live<'_> {
                     }
                 },
                 Statement::Switch { cases, .. } => {
-                    cases.iter().for_each(|c| {
-                        self.walk(&c.body);
-                    });
+                    for case in cases {
+                        self.walk(&case.body);
+                    }
                     false
                 }
                 Statement::Loop { body, continuing, .. } => {

@@ -58,9 +58,11 @@ pub struct WorldPanel {
     pub width_m: f32,
     pub height_m: f32,
 
+    #[allow(dead_code, reason = "owned so the GPU resource lives as long as the views and bind groups made from it")]
     texture: Texture,
     view: TextureView,
     bind_group: BindGroup,
+    #[allow(dead_code, reason = "owned so the GPU resource lives as long as the views and bind groups made from it")]
     sampler: Sampler,
 
     ui_renderer: Ui2dRenderer,

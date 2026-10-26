@@ -1,4 +1,4 @@
-#![allow(clippy::multiple_bound_locations)]
+#![allow(clippy::multiple_bound_locations, reason = "bounds are split between generics and where clause for readability")]
 
 use wgpu::{BufferAddress, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode};
 

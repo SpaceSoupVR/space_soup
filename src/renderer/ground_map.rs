@@ -855,7 +855,7 @@ mod step_census {
     use super::*;
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn shapes() {
         let map = fixtures::height_map(1024, fixtures::hills);
         let chain = levels(&map);
@@ -885,7 +885,7 @@ mod step_census {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn steps_by_elevation() {
         let map = fixtures::height_map(1024, fixtures::hills);
         let chain = levels(&map);

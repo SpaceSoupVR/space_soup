@@ -1292,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn weather_twin_size() {
         use wgpu::naga;
         fn reach(m: &naga::Module, block: &naga::Block, seen: &mut std::collections::HashSet<naga::Handle<naga::Function>>) {

@@ -30,6 +30,7 @@ pub struct SceneTarget {
     hi_z_targets: Vec<TextureView>,
 
     hi_z_sources: Vec<BindGroup>,
+    #[allow(dead_code, reason = "owned so the GPU resource lives as long as the views and bind groups made from it")]
     resolved_depth_texture: Texture,
 
     resolve_src: Option<BindGroup>,
@@ -1376,8 +1377,8 @@ mod reflection_resolve_tests {
     fn f16_bits(v: f32) -> u16 {
 
         match v {
-            x if x == 0.0 => 0x0000,
-            x if x == 1.0 => 0x3C00,
+            0.0 => 0x0000,
+            1.0 => 0x3C00,
             other => panic!("f16_bits only encodes 0.0 and 1.0, got {other}"),
         }
     }
@@ -1869,9 +1870,9 @@ mod stereo_target_tests {
 
 #[cfg(test)]
 mod depth_resolve_tests {
-    
+
     use super::*;
-    
+
 
     #[test]
     fn the_resolve_takes_the_nearest_of_every_sample() {
@@ -2401,8 +2402,6 @@ fn wgsl_ssr_block_debug(
     scene_group: u32,
     output: SsrOutput,
 ) -> String {
-    let _debug = output == SsrOutput::FalseColour;
-
     let depth_ty = "texture_2d<f32>";
 
     let max_mip = (SSR_MIPS - 1) as f32;
@@ -4291,7 +4290,7 @@ mod fade_continuity_twin {
         }
 
         let mut step = STEP_SIZE;
-        #[allow(unused_assignments)]
+        #[allow(unused_assignments, reason = "the initial value is read when the loop body takes its early exit")]
         let mut p = world_pos + n * NORMAL_BIAS + refl * step * 0.5;
         let mut prev = p;
         let origin = p;
@@ -4320,9 +4319,7 @@ mod fade_continuity_twin {
 
                 let t = clip_to_frame(c.project(prev), clip);
                 let q = prev + (p - prev) * t;
-                let Some((q_ray, q_scene)) = c.ray_and_scene(q) else {
-                    return None;
-                };
+                let (q_ray, q_scene) = c.ray_and_scene(q)?;
                 if !(q_ray - q_scene > 0.0 && prev_behind <= 0.0) {
                     return None;
                 }

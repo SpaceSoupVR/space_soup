@@ -77,7 +77,7 @@ impl GltfClip {
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "kept for the shader dump tooling and the tests that read it")]
 pub(super) fn read_clip(anim: &gltf::Animation, buffers: &[gltf::buffer::Data], joint_count: usize, joint_of: impl Fn(usize) -> Option<usize>) -> GltfClip {
     let mut joints = vec![JointTrack::default(); joint_count];
     let mut duration = 0.0f32;

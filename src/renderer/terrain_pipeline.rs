@@ -328,7 +328,7 @@ impl TerrainPipeline {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn new_weather_twins(
         device: &Device,
         format: TextureFormat,
@@ -400,7 +400,7 @@ impl TerrainPipeline {
         Self::build_from(device, format, uniform_layout, samples, view, role, group3, terrain_shader_for(role), label)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn build_from(
         device: &Device,
         format: TextureFormat,
@@ -415,7 +415,7 @@ impl TerrainPipeline {
         Self::build_from_with(device, format, uniform_layout, samples, view, role, None, group3, source, label)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub(crate) fn build_from_with(
         device: &Device,
         format: TextureFormat,
@@ -1479,8 +1479,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-
-    #[test]
     fn the_probe_pass_terrain_shaders_validate_and_build() {
         use wgpu::naga;
 
@@ -1704,6 +1702,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
     fn flat_ground_shades_from_the_ground_layer() {
         let Some(px) = render_quad_with_normal([0.0, 1.0, 0.0]) else {
             eprintln!("skipping: no GPU adapter available");
@@ -1923,7 +1922,7 @@ impl TerrainMaterial {
         tex.create_view(&TextureViewDescriptor::default())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn new_deformed(
         device: &Device,
         queue: &Queue,
@@ -2360,7 +2359,7 @@ impl TerrainMaterial {
         Self::from_layers_deformed(device, queue, layout, layers, normals, rough, ao, splat, sky_occlusion, settings, None)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn from_layers_deformed(
         device: &Device,
         queue: &Queue,
@@ -2441,6 +2440,7 @@ impl TerrainImage {
 
 #[cfg(test)]
 mod material_tests {
+    use super::*;
     use super::tests::*;
 
     #[test]
@@ -2467,8 +2467,6 @@ mod material_tests {
         let other_channel = render(&layered(0), Some(Some(1))).unwrap();
         assert_eq!(other_channel, lamp, "a lamp on another channel read this one's shadow");
     }
-    use super::*;
-
     #[test]
     fn the_fallback_material_selects_layers_the_same_way() {
         let Some(flat) = render_quad_with_fallback_material([0.0, 1.0, 0.0]) else {
@@ -2687,9 +2685,8 @@ pub fn with_height_in_green(ao: Option<TerrainImage>, disp: Option<TerrainImage>
 pub fn load_terrain_settings(dir: &std::path::Path) -> TerrainMaterialUniform {
     let mut out = TerrainMaterialUniform::default();
     let path = dir.join(TERRAIN_SETTINGS_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(_) => return out,
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return out;
     };
     let raw: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,

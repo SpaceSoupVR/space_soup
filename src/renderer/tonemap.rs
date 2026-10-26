@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn is_monotonic() {
+    fn tonemap_rises_monotonically() {
 
         let mut last = -1.0;
         let mut x = 0.0_f32;

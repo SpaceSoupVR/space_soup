@@ -45,7 +45,7 @@ pub(crate) fn ancestor_joint_and_baked_local(
     (parent_joint, t2, r2, s2)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
 pub(crate) fn collect_node(
     node: &gltf::Node,
     parent: Mat4,

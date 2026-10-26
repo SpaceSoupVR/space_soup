@@ -134,7 +134,7 @@ impl SlopeSplit {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
 pub fn gentle_readers(
     device: &Device,
     format: TextureFormat,
@@ -240,6 +240,8 @@ pub fn dedup_pass_shader(src: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn the_ground_probe_pass_takes_its_dedup_and_validates() {
         use wgpu::naga;
@@ -250,8 +252,6 @@ mod tests {
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap();
         }
     }
-
-    use super::*;
 
     fn vertex(n: [f32; 3]) -> SolidVertex {
         SolidVertex { position: [0.0; 3], normal: n, color: [1.0; 4], uv2: [0.0; 2], reflectivity: 0.0 }

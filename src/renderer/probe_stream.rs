@@ -182,7 +182,7 @@ impl ProbeStream {
         Self::new_with_extras(device, queue, resolution, count, source, depth, sky, Vec::new())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn new_with_extras(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -208,12 +208,10 @@ impl ProbeStream {
         });
 
         let first_building = layers + sky_cubes;
-        let mut written = 0u32;
-        for faces in &buildings {
+        for (written, faces) in (0u32..).zip(&buildings) {
             if let Some(chain) = super::uniforms::prefilter_probe(faces, res) {
                 write_probe_layer(queue, &texture, first_building + written, res, &chain);
             }
-            written += 1;
         }
         let building_layer = (building_cubes > 0).then_some(first_building);
         let mut pool = LayerPool::new(layers);
@@ -430,7 +428,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn prefilter_cost() {
         for res in [128u32, 256] {
             let faces: Vec<u8> = (0..res * res * 6).flat_map(|i| {

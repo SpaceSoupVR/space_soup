@@ -1016,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn cave_shader_size() {
         let src = crate::renderer::multiview::ViewMode::Mono.shader(layered_mesh_shader());
         println!("{}", crate::renderer::shader_inlining::report("layered_mesh fs_main", &src, "fs_main", 12));

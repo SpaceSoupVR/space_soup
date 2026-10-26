@@ -120,7 +120,7 @@ impl PoolCards {
         pool_row * self.resolution
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn record(
         &self,
         device: &Device,

@@ -529,6 +529,7 @@ fn air_drift(waves: &[AirWave; 6], p: Vec3, time: f64) -> Vec3 {
     })
 }
 
+#[cfg(test)]
 fn air_reach(waves: &[AirWave; 6]) -> f32 {
     2.0 * waves.iter().map(|a| a.reach).sum::<f32>()
 }
@@ -3685,7 +3686,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn export_effects_for_the_editor() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let layers = atlas_layers();
@@ -3818,7 +3819,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn save_the_effects_atlas() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let layers = atlas_layers();
@@ -3878,7 +3879,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn render_effects_alone() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let instance = wgpu::Instance::default();
@@ -4049,7 +4050,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn print_where_the_flames_stand() {
         let fire = EffectEmitter { id: "brick_fire".into(), scale: 1.5, ..emitter(EffectKind::Fire) };
         let (mut sum, mut w, mut worst) = (Vec3::ZERO, 0.0f32, 0.0f32);
@@ -4070,7 +4071,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn print_the_flame_tables() {
         let (area, cover, rise) = flame_tables();
         let fmt = |v: &[f32]| v.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(", ");
@@ -4098,7 +4099,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn print_a_fires_particles() {
         let id = std::env::var("FIRE_ID").unwrap_or_else(|_| "test".into());
         let time = std::env::var("EFFECTS_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(30.0);
@@ -4116,7 +4117,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn time_a_frames_effects() {
         let lamps: Vec<Light> = (0..6).map(|k| Light { position: Vec3::new(k as f32 - 2.5, 2.8, -1.0), ..lamp() }).collect();
         let emitters = [

@@ -513,27 +513,6 @@ impl ShadowSlot {
         }
     }
 
-    fn from_texture(
-        device: &Device,
-        light_layout: &BindGroupLayout,
-        texture: &Texture,
-        layer: u32,
-    ) -> Self {
-        let depth_view = texture.create_view(&TextureViewDescriptor {
-            dimension: Some(TextureViewDimension::D2),
-            base_array_layer: layer,
-            array_layer_count: Some(1),
-            ..Default::default()
-        });
-        let (light_buffer, light_bind_group) = Self::light_uniform(device, light_layout);
-        Self {
-            _depth_texture: Some(texture.clone()),
-            depth_view: Some(depth_view),
-            light_buffer,
-            light_bind_group,
-        }
-    }
-
     fn new_layered(
         device: &Device,
         light_layout: &BindGroupLayout,
@@ -970,7 +949,7 @@ impl ShadowMap {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn record_spots(
         &self,
         encoder: &mut CommandEncoder,
@@ -1064,7 +1043,7 @@ impl ShadowMap {
         drawn
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn record_moving(
         &self,
         encoder: &mut CommandEncoder,
@@ -1168,7 +1147,7 @@ impl ShadowMap {
         self.record_full(encoder, kind, solid, None, brushes, mesh_draws, skinned_draws, solid_chunks, light_view_proj)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn record_with_ground(
         &self,
         encoder: &mut CommandEncoder,
@@ -1182,7 +1161,7 @@ impl ShadowMap {
         self.record_full(encoder, kind, solid, ground, None, mesh_draws, skinned_draws, &[], light_view_proj)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn record_full(
         &self,
         encoder: &mut CommandEncoder,
@@ -2262,7 +2241,7 @@ mod render_tests {
         for (intensity, distance, expected) in
             [(1.0f32, 5.0f32, 0.6399f32), (3.0, 5.0, 0.7196), (10.0, 5.0, 0.9987), (0.2, 0.85, 0.8768)]
         {
-            let px = if let Some(px) = at(intensity, distance) { px } else {
+            let Some(px) = at(intensity, distance) else {
                 eprintln!("skipping: no GPU adapter available");
                 return;
             };

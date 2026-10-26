@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
     fn prefiltering_a_128px_probe() {
         let base = spot(128, Vec3::new(0.3, 0.8, 0.5), 6.0);
         let t = std::time::Instant::now();

@@ -100,10 +100,10 @@ impl Shape {
                 [offset.0 - min_x, offset.1 - min_y]
             }
         };
-        positions.iter_mut().for_each(|p| {
-            p[0] += shift[0];
-            p[1] += shift[1];
-        });
+        for point in &mut positions {
+            point[0] += shift[0];
+            point[1] += shift[1];
+        }
         positions
     }
 }

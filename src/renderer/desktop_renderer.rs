@@ -449,7 +449,7 @@ impl Renderer {
             pipeline::SolidPipeline::new_double_sided(&self.device, self.format, &self.uniform_buf.layout);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn set_terrain(
         &mut self,
         vertices: &[SolidVertex],
@@ -708,7 +708,7 @@ impl Renderer {
         self.render_internal(target_view, camera, cuboids, meshes, panels, lights, &[]);
     }
 
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, reason = "one-off callback tuple type used in a single signature")]
     fn bake_cuboids(
         &mut self,
         cuboids: &[Cuboid],
