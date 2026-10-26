@@ -42,66 +42,62 @@ impl ImageAtlas {
         sampler: &Sampler,
         image: &Arc<RgbaImage>,
     ) -> Arc<BindGroup> {
-        match self
+        if let Some(bind_group) = self
             .0
             .iter()
-            .find_map(|(i, b)| Arc::ptr_eq(i, image).then_some(b))
-        {
-            Some(bind_group) => bind_group.clone(),
-            None => {
-                let size = Extent3d {
-                    width: image.width(),
-                    height: image.height(),
-                    depth_or_array_layers: 1,
-                };
+            .find_map(|(i, b)| Arc::ptr_eq(i, image).then_some(b)) { bind_group.clone() } else {
+            let size = Extent3d {
+                width: image.width(),
+                height: image.height(),
+                depth_or_array_layers: 1,
+            };
 
-                let texture = device.create_texture(&TextureDescriptor {
-                    size,
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: TextureDimension::D2,
-                    format: TextureFormat::Rgba8UnormSrgb,
-                    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                    label: None,
-                    view_formats: &[],
-                });
+            let texture = device.create_texture(&TextureDescriptor {
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8UnormSrgb,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                label: None,
+                view_formats: &[],
+            });
 
-                queue.write_texture(
-                    TexelCopyTextureInfo {
-                        texture: &texture,
-                        mip_level: 0,
-                        origin: Origin3d::ZERO,
-                        aspect: TextureAspect::All,
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                image,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * image.width()),
+                    rows_per_image: Some(image.height()),
+                },
+                size,
+            );
+
+            let texture_view = texture.create_view(&TextureViewDescriptor::default());
+
+            let bind_group = Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
                     },
-                    image,
-                    TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(4 * image.width()),
-                        rows_per_image: Some(image.height()),
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
                     },
-                    size,
-                );
+                ],
+                label: None,
+            }));
 
-                let texture_view = texture.create_view(&TextureViewDescriptor::default());
-
-                let bind_group = Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&texture_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(sampler),
-                        },
-                    ],
-                    label: None,
-                }));
-
-                self.0.push((image.clone(), bind_group.clone()));
-                bind_group
-            }
+            self.0.push((image.clone(), bind_group.clone()));
+            bind_group
         }
     }
 }
@@ -160,7 +156,7 @@ impl TextAtlas {
             .flat_map(|line| {
                 line.2
                     .iter()
-                    .flat_map(|ch| {
+                    .filter_map(|ch| {
                         self.get_image(&ch.2, ch.0, ch.6, scale_factor).map(|img| {
                             let w = img.width() as f32 / scale_factor;
                             let h = img.height() as f32 / scale_factor;
@@ -203,7 +199,7 @@ fn rasterize_glyph_supersampled(font: &Font, c: char, px: f32) -> Option<Arc<Rgb
     let coverage: Vec<u8> = downsampled
         .iter()
         .map(|a| {
-            let t = *a as f32 / 255.0;
+            let t = f32::from(*a) / 255.0;
             (t.powf(1.4) * 255.0).round() as u8
         })
         .collect();
@@ -239,7 +235,7 @@ fn box_downsample(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: u
             for sy in sy0..sy1 {
                 let row = sy * src_w;
                 for sx in sx0..sx1 {
-                    sum += src[row + sx] as u32;
+                    sum += u32::from(src[row + sx]);
                     count += 1;
                 }
             }

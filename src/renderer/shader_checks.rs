@@ -31,6 +31,8 @@ pub fn audited_shader_module(device: &wgpu::Device, desc: wgpu::ShaderModuleDesc
     }
 }
 
+pub static PIPELINE_STATISTICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,5 +45,3 @@ mod tests {
         assert!(c.int_div_checks);
     }
 }
-
-pub static PIPELINE_STATISTICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

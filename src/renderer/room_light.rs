@@ -95,7 +95,7 @@ pub fn turned_to_player(light: &RoomLight, yaw: f32) -> RoomLight {
         out[5][k] = s * l(4) + c * l(5);
         out[6][k] = (1.5 * cc - 0.5) * l(6) + r3 * sc * l(7) + 0.5 * r3 * ss * l(8);
         out[7][k] = -r3 * sc * l(6) + (cc - ss) * l(7) + sc * l(8);
-        out[8][k] = 0.5 * r3 * ss * l(6) - sc * l(7) + 0.5 * (1.0 + cc) * l(8);
+        out[8][k] = 0.5 * r3 * ss * l(6) - sc * l(7) + f32::midpoint(1.0, cc) * l(8);
     }
     out
 }

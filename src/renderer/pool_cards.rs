@@ -30,7 +30,7 @@ const FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
 pub(crate) fn shader() -> String {
     format!(
-        r#"
+        r"
 {lights}
 @group(1) @binding(0) var pool_out: texture_storage_2d<rgba16float, write>;
 @compute @workgroup_size(8, 8)
@@ -44,7 +44,7 @@ fn pool_main(@builtin(global_invocation_id) id: vec3<u32>) {{
     let uv = (vec2<f32>(id.xy % vec2<u32>(block)) + vec2<f32>(0.5)) / f32(block);
     textureStore(pool_out, vec2<i32>(id.xy), vec4<f32>(pool_map_light(k, uv, f32(block)), 1.0));
 }}
-"#,
+",
         lights = super::lights::wgsl_lights_block_with(0, 1, super::lights::LightsBlockOptions::default()),
         across = POOL_MAPS_ACROSS,
     )

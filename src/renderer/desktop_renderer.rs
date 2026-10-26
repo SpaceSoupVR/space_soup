@@ -256,7 +256,7 @@ impl Renderer {
             self.water_pipeline = Some(made);
         }
         let pipeline = self.water_pipeline.as_ref().expect("made above");
-        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| m.map.placement()).unwrap_or([0.0; 4]);
+        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map_or([0.0; 4], |m| m.map.placement());
         let deform_view = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| &m.view);
         self.water_bodies = bodies
             .iter()
@@ -303,8 +303,8 @@ impl Renderer {
     }
 
     pub fn set_water_time(&mut self, seconds: f32) {
-        let dt = (seconds as f64 - self.water_seconds).clamp(0.0, 0.25) as f32;
-        self.water_seconds = seconds as f64;
+        let dt = (f64::from(seconds) - self.water_seconds).clamp(0.0, 0.25) as f32;
+        self.water_seconds = f64::from(seconds);
         for body in &mut self.water_bodies {
             body.uniform.set_time(self.water_seconds, body.waves.params.loop_seconds);
             self.queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
@@ -334,8 +334,8 @@ impl Renderer {
         let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) else { return };
         let (mut wading, mut prints) = (0, 0);
         for (id, p, weight) in weights {
-            wading += (weight >= spacesoup_graphics::mud::MUD_WEIGHT_FLOOR) as u32;
-            prints += m.walkers.step(&mut m.map, id, [p.x, p.z], weight) as u32;
+            wading += u32::from(weight >= spacesoup_graphics::mud::MUD_WEIGHT_FLOOR);
+            prints += u32::from(m.walkers.step(&mut m.map, id, [p.x, p.z], weight));
         }
         m.walkers.forget_absent(&present);
         if prints > 0 {
@@ -368,50 +368,45 @@ impl Renderer {
         }
         self.ground_dirty = false;
         let sea_line = self.sea_line();
-        let placement = match self.ground.as_ref() {
-            Some(g) => {
-                let started = std::time::Instant::now();
-                let (irradiance, sun) = match self.sky_dome.as_ref() {
-                    Some(s) => (s.irradiance, s.sun),
-                    None => (
-                        self.sky
-                            .as_ref()
-                            .map(|s| super::sky::SkyIrradiance { sh: s.sh.map(|v| [v[0] * s.intensity, v[1] * s.intensity, v[2] * s.intensity]) })
-                            .unwrap_or_else(|| super::sky::SkyIrradiance::flat(super::sky::AMBIENT)),
-                        None,
-                    ),
-                };
-                let map = ground_map::build(
-                    &ground_map::GroundInputs {
-                        heights: &g.heights,
-                        sky: &irradiance,
-                        sun: sun.as_ref(),
-                        sky_occlusion: None,
-                        layers: &g.layers,
-                        splat: g.splat.as_ref(),
-                        settings: &g.settings,
-                        sea_line,
-                    },
-                    DESKTOP_GROUND_MAP_SIZE,
-                );
-                let view = ground_map::upload(&self.device, &self.queue, &map);
-                let extent = map.max - map.min;
-                self.uniform_buf.set_ground_map(view);
-                log::info!(
-                    "desktop ground map: {}x{} over {:.0} x {:.0} m, sea line {:.2}, built in {} ms",
-                    map.width,
-                    map.height,
-                    extent.x,
-                    extent.y,
+        let placement = if let Some(g) = self.ground.as_ref() {
+            let started = std::time::Instant::now();
+            let (irradiance, sun) = match self.sky_dome.as_ref() {
+                Some(s) => (s.irradiance, s.sun),
+                None => (
+                    self.sky
+                        .as_ref().map_or_else(|| super::sky::SkyIrradiance::flat(super::sky::AMBIENT), |s| super::sky::SkyIrradiance { sh: s.sh.map(|v| [v[0] * s.intensity, v[1] * s.intensity, v[2] * s.intensity]) }),
+                    None,
+                ),
+            };
+            let map = ground_map::build(
+                &ground_map::GroundInputs {
+                    heights: &g.heights,
+                    sky: &irradiance,
+                    sun: sun.as_ref(),
+                    sky_occlusion: None,
+                    layers: &g.layers,
+                    splat: g.splat.as_ref(),
+                    settings: &g.settings,
                     sea_line,
-                    started.elapsed().as_millis()
-                );
-                Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top))
-            }
-            None => {
-                self.uniform_buf.set_ground_map(uniforms::default_ground_map(&self.device));
-                None
-            }
+                },
+                DESKTOP_GROUND_MAP_SIZE,
+            );
+            let view = ground_map::upload(&self.device, &self.queue, &map);
+            let extent = map.max - map.min;
+            self.uniform_buf.set_ground_map(view);
+            log::info!(
+                "desktop ground map: {}x{} over {:.0} x {:.0} m, sea line {:.2}, built in {} ms",
+                map.width,
+                map.height,
+                extent.x,
+                extent.y,
+                sea_line,
+                started.elapsed().as_millis()
+            );
+            Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top))
+        } else {
+            self.uniform_buf.set_ground_map(uniforms::default_ground_map(&self.device));
+            None
         };
         let mut probes = self.uniform_buf.probes();
         probes.set_outdoors(None, None, placement);
@@ -534,8 +529,8 @@ impl Renderer {
 
     fn rebind_water(&mut self) {
         let Some(pipeline) = self.water_pipeline.as_ref() else { return };
-        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| m.map.placement()).unwrap_or([0.0; 4]);
-        let view = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| &m.view).unwrap_or(&pipeline.default_mud);
+        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map_or([0.0; 4], |m| m.map.placement());
+        let view = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map_or(&pipeline.default_mud, |m| &m.view);
         for body in &mut self.water_bodies {
             body.uniform.prints = placement;
             self.queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
@@ -556,7 +551,7 @@ impl Renderer {
         let ix = ((u * s.width as f32) as u32).min(s.width - 1);
         let iz = ((v * s.height as f32) as u32).min(s.height - 1);
         let k = ((iz * s.width + ix) * 4) as usize;
-        let w: Vec<f32> = (0..4).map(|c| s.rgba[k + c] as f32).collect();
+        let w: Vec<f32> = (0..4).map(|c| f32::from(s.rgba[k + c])).collect();
         let total: f32 = w.iter().sum();
         if total <= 0.0 {
             return 0.0;
@@ -811,8 +806,7 @@ impl Renderer {
 
         let focus = camera.position + camera.forward() * (self.sun_shadow_radius * 0.5);
         let sun_view_proj = sun
-            .map(|l| shadow::directional_light_matrix(l.direction, focus, self.sun_shadow_radius))
-            .unwrap_or(glam::Mat4::IDENTITY);
+            .map_or(glam::Mat4::IDENTITY, |l| shadow::directional_light_matrix(l.direction, focus, self.sun_shadow_radius));
 
         let spot_matrices: Vec<shadow::SpotShadowMatrices> = spot_indices
             .iter()
@@ -919,8 +913,7 @@ impl Renderer {
                 let lightmap_bg = instance
                     .lightmap_key
                     .and_then(|k| self.mesh_lightmaps.get(k))
-                    .map(|t| &t.bind_group)
-                    .unwrap_or(&self.default_mesh_lightmap.bind_group);
+                    .map_or(&self.default_mesh_lightmap.bind_group, |t| &t.bind_group);
 
                 let model = instance.mesh.model_matrix();
                 let centre = model.transform_point3(glam::Vec3::ZERO);
@@ -1052,8 +1045,7 @@ impl Renderer {
                     let lightmap_bg = lightmap_key
                         .as_deref()
                         .and_then(|k| self.cuboid_lightmaps.get(k))
-                        .map(|t| &t.bind_group)
-                        .unwrap_or(&self.default_cuboid_lightmap.bind_group);
+                        .map_or(&self.default_cuboid_lightmap.bind_group, |t| &t.bind_group);
                     pass.set_bind_group(1, lightmap_bg, &[]);
                     pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
                 }

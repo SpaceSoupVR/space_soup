@@ -161,7 +161,7 @@ impl GltfSkin {
             buf[i] = mat.to_cols_array();
         }
 
-        let mut last = self.last_joints.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last = self.last_joints.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev: &[[f32; 16]] = last.as_deref().unwrap_or(&buf);
         queue.write_buffer(&self.prev_joint_buffer, 0, bytemuck::cast_slice(prev));
         queue.write_buffer(&self.joint_buffer, 0, bytemuck::cast_slice(&buf));
@@ -215,8 +215,7 @@ impl GltfSkin {
     pub fn generic_joint_name(name: &str) -> &str {
         name.rsplit_once("_r_")
             .or_else(|| name.rsplit_once("_l_"))
-            .map(|(_, suffix)| suffix)
-            .unwrap_or(name)
+            .map_or(name, |(_, suffix)| suffix)
     }
 
     pub fn skin_matrices_blended(&self, clip: usize, blend: f32) -> Vec<Mat4> {
@@ -244,7 +243,7 @@ impl GltfSkin {
         let mut best: Option<(usize, f32)> = None;
         for ji in 0..self.joint_names.len() {
             let d = (posed[ji].w_axis.truncate() - rest[ji].w_axis.truncate()).length();
-            if d > best.map(|(_, bd)| bd).unwrap_or(1e-4) {
+            if d > best.map_or(1e-4, |(_, bd)| bd) {
                 best = Some((ji, d));
             }
         }

@@ -48,7 +48,7 @@ pub fn direction_to_face(d: Vec3) -> (usize, f32, f32) {
     } else {
         (5, -d.x / az, d.y / az)
     };
-    (face, 0.5 * (a + 1.0), 0.5 * (1.0 - b))
+    (face, f32::midpoint(a, 1.0), 0.5 * (1.0 - b))
 }
 
 fn sample_level(level: &CubeLevel, d: Vec3) -> [f32; 4] {

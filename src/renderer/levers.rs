@@ -223,7 +223,7 @@ impl Levers {
             return Ok(Self::default());
         }
         let levers: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        if let Some(problem) = levers.bench.as_ref().and_then(|b| b.problem()) {
+        if let Some(problem) = levers.bench.as_ref().and_then(super::bench::BenchPose::problem) {
             return Err(problem);
         }
         Ok(levers)
@@ -515,7 +515,7 @@ mod tests {
         let mut f = LeverFile::new(&path);
         assert!(f.poll().is_none(), "no file, nothing to report");
         std::fs::write(&path, r#"{"portals": false}"#).unwrap();
-        assert_eq!(f.poll().unwrap().unwrap().portals, false);
+        assert!(!f.poll().unwrap().unwrap().portals);
         assert!(f.poll().is_none(), "unchanged, nothing to report");
         std::fs::write(&path, r#"{"portals": false, "shadows": false}"#).unwrap();
         let l = f.poll().unwrap().unwrap();

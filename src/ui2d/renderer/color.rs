@@ -89,7 +89,7 @@ impl ColorRenderer {
                                 corner_radius,
                             ),
                             color,
-                        ))
+                        ));
                     }
                 }
                 a

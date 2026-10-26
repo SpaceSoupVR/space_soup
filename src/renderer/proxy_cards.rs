@@ -191,7 +191,7 @@ pub fn card_frame(face: usize) -> [[f32; 3]; 3] {
         v[k] = s;
         v
     };
-    [axis((a + 1) % 3, 1.0), axis((a + 2) % 3, 1.0), axis(a, if face % 2 == 0 { 1.0 } else { -1.0 })]
+    [axis((a + 1) % 3, 1.0), axis((a + 2) % 3, 1.0), axis(a, if face.is_multiple_of(2) { 1.0 } else { -1.0 })]
 }
 
 pub fn to_card_octahedral(face: usize, n: [f32; 3]) -> [f32; 2] {
@@ -239,6 +239,21 @@ pub fn widen_ranges(texels: &mut [[f32; 4]], width: u32, height: u32, card: u32)
     }
 }
 
+pub fn none(device: &Device) -> TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("default_proxy_card_atlas"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,7 +298,7 @@ mod tests {
         }
 
         let (a, b) = (to_card_octahedral(5, [0.1, 0.0, -0.995]), to_card_octahedral(5, [-0.1, 0.0, -0.995]));
-        let mid = from_hemi_octahedral([(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0]);
+        let mid = from_hemi_octahedral([f32::midpoint(a[0], b[0]), f32::midpoint(a[1], b[1])]);
         assert!(mid[2] > 0.99, "between two directions facing the card: {mid:?}");
     }
 
@@ -305,19 +320,4 @@ mod tests {
         assert_eq!([at(3, 3)[2], at(3, 3)[3]], [1.0, 0.7], "the second card's nearest, not the first's");
         assert_eq!(at(0, 0)[3], MISS, "colour rows untouched");
     }
-}
-
-pub fn none(device: &Device) -> TextureView {
-    device
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("default_proxy_card_atlas"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        })
-        .create_view(&wgpu::TextureViewDescriptor::default())
 }

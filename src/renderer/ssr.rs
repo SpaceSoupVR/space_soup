@@ -1125,7 +1125,7 @@ impl SsrPipelines {
 
 fn reflection_resolve_shader(stride: i32) -> String {
     format!(
-        r#"
+        r"
 @group(0) @binding(0) var refl_src: texture_2d<f32>;
 
 @vertex
@@ -1175,7 +1175,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {{
     let taps = {taps:.1};
     return vec4<f32>(sum / weight, clamp(max(centre.a, weight / taps), 0.0, 1.0));
 }}
-"#,
+",
         radius = REFLECTION_FILTER_RADIUS,
         stride = stride,
         centre_weight = REFLECTION_CENTRE_WEIGHT,
@@ -1201,7 +1201,7 @@ fn reflection_filter_total_weight() -> f32 {
 }
 
 fn hi_z_reduce_shader() -> String {{
-    r#"
+    r"
 @group(0) @binding(0) var src: texture_2d<f32>;
 
 @vertex
@@ -1241,7 +1241,7 @@ fn fs_main(@builtin(position) coord: vec4<f32>) -> @location(0) f32 {{
     }}
     return m;
 }}
-"#
+"
     .to_string()
 }}
 
@@ -1252,7 +1252,7 @@ fn depth_resolve_shader(samples: u32) -> String {{
         "texture_depth_2d"
     }};
     format!(
-        r#"
+        r"
 @group(0) @binding(0) var ms_depth: {src_ty};
 
 @vertex
@@ -1274,7 +1274,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) f32 {{{{
     }}}}
     return nearest;
 }}}}
-"#
+"
     )
 }}
 
@@ -1869,9 +1869,9 @@ mod stereo_target_tests {
 
 #[cfg(test)]
 mod depth_resolve_tests {
-    use super::tests::headless_gpu;
+    
     use super::*;
-    use wgpu::*;
+    
 
     #[test]
     fn the_resolve_takes_the_nearest_of_every_sample() {
@@ -1944,7 +1944,7 @@ mod depth_resolve_tests {
         let bytes = SIZE * 4;
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("resolve_readback"),
-            size: (bytes * SIZE) as u64,
+            size: u64::from(bytes * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -2130,7 +2130,7 @@ mod hi_z_tests {
             let row = (lw * 4).div_ceil(256) * 256;
             let buf = device.create_buffer(&BufferDescriptor {
                 label: None,
-                size: (row * lh) as u64,
+                size: u64::from(row * lh),
                 usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -2251,7 +2251,7 @@ mod hi_z_tests {
 }
 
 fn downsample_shader() -> String {
-    r#"
+    r"
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 
@@ -2278,7 +2278,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     return textureSampleLevel(src, samp, in.uv, 0.0);
 }
-"#
+"
     .to_string()
 }
 
@@ -2289,7 +2289,7 @@ fn blit_shader(ms_depth: bool) -> String {
         "texture_depth_2d"
     };
     format!(
-        r#"
+        r"
 @group(0) @binding(0) var scene_color: texture_2d<f32>;
 @group(0) @binding(1) var scene_depth: {depth_ty};
 
@@ -2316,7 +2316,7 @@ fn fs_main(@builtin(position) coord: vec4<f32>) -> FOut {{
     out.depth = textureLoad(scene_depth, px, 0);
     return out;
 }}
-"#
+"
     )
 }
 
@@ -2350,8 +2350,8 @@ pub fn wgsl_ssr_block_shared_camera_debug(scene_group: u32, debug: bool) -> Stri
 
 pub fn wgsl_ssr_composite_block(scene_group: u32) -> String {
     format!(
-        r#"
-const MAX_SSR_REFLECTIVITY: f32 = {cap:?};
+        r"
+const MAX_SSR_REFLECTIVITY: f32 = {MAX_SSR_REFLECTIVITY_VALUE:?};
 
 @group({scene_group}) @binding(0) var ssr_scene_color: texture_2d<f32>;
 @group({scene_group}) @binding(1) var ssr_reflection: texture_2d<f32>;
@@ -2360,7 +2360,7 @@ const MAX_SSR_REFLECTIVITY: f32 = {cap:?};
 fn ssr_reflection_at(clip_xy: vec2<f32>) -> vec4<f32> {{
     let limit = vec2<i32>(textureDimensions(ssr_reflection)) - vec2<i32>(1);
 
-    let uv = clip_xy / {scale}.0 - vec2<f32>(0.5);
+    let uv = clip_xy / {REFLECTION_SCALE}.0 - vec2<f32>(0.5);
     let base = floor(uv);
     let f = uv - base;
     let b = vec2<i32>(base);
@@ -2382,9 +2382,7 @@ fn ssr_reflection_at(clip_xy: vec2<f32>) -> vec4<f32> {{
 
     return vec4<f32>(sum / weight, weight);
 }}
-"#,
-        scale = REFLECTION_SCALE,
-        cap = MAX_SSR_REFLECTIVITY_VALUE,
+",
     )
 }
 
@@ -2449,7 +2447,7 @@ fn wgsl_ssr_block_debug(
         _ => "vec3<f32>",
     };
     format!(
-        r#"
+        r"
 {camera_decl}
 
 @group({scene_group}) @binding(0) var ssr_scene_color: texture_2d<f32>;
@@ -2668,7 +2666,7 @@ fn ssr_reflect(
 
     {dbg_hit}
 }}
-"#
+"
     )
 }
 
@@ -3866,7 +3864,7 @@ mod fade_continuity_twin {
             if d.z < -1e-6 {
                 let t = (self.wall_z - self.eye.z) / d.z;
                 let p = self.eye + d * t;
-                if t > 0.0 && p.y > 0.0 && best.map_or(true, |(bt, _, _)| t < bt) {
+                if t > 0.0 && p.y > 0.0 && best.is_none_or(|(bt, _, _)| t < bt) {
                     best = Some((t, p, Vec3::Z));
                 }
                 let t = (self.wall_z + PANEL_STANDOFF - self.eye.z) / d.z;
@@ -3875,7 +3873,7 @@ mod fade_continuity_twin {
                     && p.x.abs() < PANEL_HALF_WIDTH
                     && p.y > PANEL_BOTTOM
                     && p.y < PANEL_BOTTOM + PANEL_HEIGHT
-                    && best.map_or(true, |(bt, _, _)| t < bt)
+                    && best.is_none_or(|(bt, _, _)| t < bt)
                 {
                     best = Some((t, p, Vec3::Z));
                 }
@@ -4199,7 +4197,7 @@ mod fade_continuity_twin {
 
                 let (mut lo, mut hi) = (t_prev, t);
                 for _ in 0..REFINE {
-                    let mid = (lo + hi) * 0.5;
+                    let mid = f32::midpoint(lo, hi);
                     let muv = (s0.lerp(s1, mid)) / res;
                     let mw = 1.0 / (k0 + (k1 - k0) * mid);
                     if mw >= scene_w_at(muv) { hi = mid } else { lo = mid }
@@ -4238,11 +4236,7 @@ mod fade_continuity_twin {
         let budget_fade = 1.0 - smoothstep(BUDGET_FADE_FROM, 1.0, x.budget_used);
         let surface = if (x.hit_pos.z - (c.wall_z + PANEL_STANDOFF)).abs() < 0.02 {
             2
-        } else if (x.hit_pos.z - c.wall_z).abs() < 0.02 {
-            1
-        } else {
-            0
-        };
+        } else { u8::from((x.hit_pos.z - c.wall_z).abs() < 0.02) };
         Marched {
             surface,
             hit_uv: x.hit_uv,
@@ -4288,7 +4282,7 @@ mod fade_continuity_twin {
             let px = pixel * Vec2::new(EYE_W, EYE_H);
 
             let jitter = if design == Design::ScreenStrideJittered {
-                (52.9829189 * (0.06711056 * px.x + 0.00583715 * px.y).fract()).fract()
+                (52.982_918 * (0.06711056 * px.x + 0.00583715 * px.y).fract()).fract()
             } else {
                 0.0
             };
@@ -4426,11 +4420,7 @@ mod fade_continuity_twin {
         let grazing_fade = smoothstep(0.15, 0.45, n.dot(-view_dir));
         let surface = if (hit_pos.z - (c.wall_z + PANEL_STANDOFF)).abs() < 0.02 {
             2
-        } else if (hit_pos.z - c.wall_z).abs() < 0.02 {
-            1
-        } else {
-            0
-        };
+        } else { u8::from((hit_pos.z - c.wall_z).abs() < 0.02) };
         Some(Marched {
             surface,
             hit_uv,
@@ -4565,7 +4555,7 @@ mod fade_continuity_twin {
                     let Some(m) = march(&c, here, Design::ScreenStride) else { continue };
                     for at in [Vec2::new(u + 1.0 / EYE_W, v), Vec2::new(u, v + 1.0 / EYE_H)] {
                         let o = march(&c, at, Design::ScreenStride);
-                        let same = o.as_ref().map_or(true, |o| o.surface == m.surface);
+                        let same = o.as_ref().is_none_or(|o| o.surface == m.surface);
                         let of = o.as_ref().map_or(0.0, |o| o.fade);
                         if same && (m.fade - of).abs() > 0.9 {
                             TRACE.with(|t| t.set(true));
@@ -4725,7 +4715,7 @@ mod fade_continuity_twin {
                 }
             }
         }
-        let (stalls, walks) = (STALLS.with(|s| s.get()), WALKS.with(|w| w.get()));
+        let (stalls, walks) = (STALLS.with(std::cell::Cell::get), WALKS.with(std::cell::Cell::get));
         println!(
             "stride: {stride_hits} probes reflected, worst read {stride_jump:.0} px\n\
              hi-z:   {hi_z_hits} probes reflected, worst read {hi_z_jump:.0} px\n\

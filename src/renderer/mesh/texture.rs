@@ -21,31 +21,27 @@ pub(crate) fn load_primitive_texture(
 
     let transmission = material
         .transmission()
-        .map(|t| t.transmission_factor())
-        .unwrap_or(0.0);
+        .map_or(0.0, |t| t.transmission_factor());
     let force_opaque =
         material.alpha_mode() != gltf::material::AlphaMode::Blend && transmission <= 0.0;
 
-    let base = match pbr.base_color_texture() {
-        Some(info) => decode_image(&images[info.texture().source().index()], force_opaque),
-        None => {
-            let c = pbr.base_color_factor();
-            (
-                vec![
-                    (c[0] * 255.0) as u8,
-                    (c[1] * 255.0) as u8,
-                    (c[2] * 255.0) as u8,
-                    if force_opaque {
-                        255
-                    } else {
+    let base = if let Some(info) = pbr.base_color_texture() { decode_image(&images[info.texture().source().index()], force_opaque) } else {
+        let c = pbr.base_color_factor();
+        (
+            vec![
+                (c[0] * 255.0) as u8,
+                (c[1] * 255.0) as u8,
+                (c[2] * 255.0) as u8,
+                if force_opaque {
+                    255
+                } else {
 
-                        (c[3] * (1.0 - transmission) * 255.0) as u8
-                    },
-                ],
-                1,
-                1,
-            )
-        }
+                    (c[3] * (1.0 - transmission) * 255.0) as u8
+                },
+            ],
+            1,
+            1,
+        )
     };
 
     let emissive = match material.emissive_texture() {
@@ -95,8 +91,8 @@ mod gloss_tests {
     #[test]
     fn a_half_rough_material_takes_the_shaders_material_path() {
 
-        assert!((material_gloss_alpha(0.7, true) as f32 / 255.0) < 0.996);
-        assert!((material_gloss_alpha(1.0, true) as f32 / 255.0) >= 0.996);
+        assert!((f32::from(material_gloss_alpha(0.7, true)) / 255.0) < 0.996);
+        assert!((f32::from(material_gloss_alpha(1.0, true)) / 255.0) >= 0.996);
     }
 }
 
@@ -814,14 +810,14 @@ mod sun_mask_packing_tests {
         for blue in [0u8, 1, 64, 128, 200, 255] {
             let [r, g] = pack_sun_mask_texel(&[77, 255, blue, 255]);
             assert_eq!(r, 77, "the distance must pass through untouched");
-            let g = g as f32 / 255.0;
+            let g = f32::from(g) / 255.0;
             assert!(g > 0.25, "a baked texel read as unbaked");
             let decoded = (g - 0.5).max(0.0) * 2.0 * range;
-            let written = blue as f32 / 255.0 * range;
+            let written = f32::from(blue) / 255.0 * range;
             assert!((decoded - written).abs() < 0.04, "blue {blue}: baked {written}, the shader reads {decoded}");
         }
         let [_, g] = pack_sun_mask_texel(&NEUTRAL_SUN_MASK);
-        assert!((g as f32 / 255.0) < 0.25, "the neutral mask read as baked");
+        assert!((f32::from(g) / 255.0) < 0.25, "the neutral mask read as baked");
     }
 }
 

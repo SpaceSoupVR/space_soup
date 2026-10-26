@@ -11,7 +11,7 @@ const GROUP: u32 = 8;
 
 pub fn compute_wgsl() -> String {
     format!(
-        r#"
+        r"
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var src_depth: texture_depth_2d;
 @group(0) @binding(2) var dst: texture_storage_2d<rgba16float, write>;
@@ -113,7 +113,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
 
     textureStore(dst, p, vec4<f32>(sum.rgb / max(sum.a, 1e-6) * c0.a, c0.a));
 }}
-{}"#,
+{}",
         probe_pass::FACE_CODE_WGSL,
     )
 }
@@ -307,8 +307,8 @@ mod tests {
     }
 
     fn from_half(h: u16) -> f32 {
-        let e = ((h >> 10) & 0x1f) as i32;
-        let m = (h & 0x3ff) as f32;
+        let e = i32::from((h >> 10) & 0x1f);
+        let m = f32::from(h & 0x3ff);
         let v = if e == 0 {
             m * 2f32.powi(-24)
         } else {
@@ -423,7 +423,7 @@ mod tests {
         let module = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("blur_test_depth"),
             source: ShaderSource::Wgsl(
-                r#"
+                r"
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     var p = array<vec4<f32>, 12>(
         vec4<f32>(-1.0, -1.0, 0.4, 1.0), vec4<f32>(0.0, -1.0, 0.6, 1.0), vec4<f32>(0.0, 1.0, 0.6, 1.0),
@@ -433,7 +433,7 @@ mod tests {
     );
     return p[i];
 }
-"#
+"
                 .into(),
             ),
         });
@@ -470,7 +470,7 @@ mod tests {
         let row = 256u32;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("blur_readback"),
-            size: (row * N) as u64,
+            size: u64::from(row * N),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });

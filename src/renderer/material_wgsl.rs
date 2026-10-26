@@ -1,5 +1,5 @@
 pub fn wgsl_biplanar_block() -> &'static str {
-    r#"
+    r"
 struct Biplanar {
     uv_major: vec2<f32>,
     uv_minor: vec2<f32>,
@@ -44,17 +44,17 @@ fn biplanar_axes(world: vec3<f32>, n: vec3<f32>, repeat: f32) -> Biplanar {
     out.w = ma / max(ma + me, 0.001);
     return out;
 }
-"#
+"
 }
 
 pub fn wgsl_whiteout_block() -> &'static str {
-    r#"
+    r"
 fn whiteout(axis: u32, tn: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     if (axis == 0u) { return vec3<f32>(abs(tn.z) * n.x, n.y - tn.y, tn.x + n.z); }
     if (axis == 1u) { return vec3<f32>(tn.x + n.x, abs(tn.z) * n.y, n.z - tn.y); }
     return vec3<f32>(tn.x + n.x, n.y - tn.y, abs(tn.z) * n.z);
 }
-"#
+"
 }
 
 #[cfg(test)]

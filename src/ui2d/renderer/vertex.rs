@@ -88,7 +88,7 @@ impl ShapeVertex {
             Self::transform_point(width, height, [bounds.0 + bounds.2, bounds.1 + bounds.3]);
         let bounds = [bx, by, bx2, by2];
 
-        let z_index = z as f32 / u16::MAX as f32;
+        let z_index = f32::from(z) / f32::from(u16::MAX);
 
         [
             ShapeVertex {
@@ -180,7 +180,7 @@ impl<V: Vertex> ColorVertex<V> {
             if f == 0 {
                 0.0
             } else {
-                (((f as f32 / u8::MAX as f32) + 0.055) / 1.055).powf(2.4)
+                (((f32::from(f) / f32::from(u8::MAX)) + 0.055) / 1.055).powf(2.4)
             }
         };
         let color = [c(color.0), c(color.1), c(color.2), c(color.3)];

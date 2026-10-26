@@ -97,11 +97,11 @@ fn main() {
         if let Some(head_ji) = idx("Head") {
             let head_world = hier[head_ji].transform_point3(Vec3::ZERO);
             println!("=== computed bind_head_height (hierarchical Head Y) = {:.5} ===", head_world.y);
-            println!("Head world position: {:?}", head_world);
+            println!("Head world position: {head_world:?}");
         }
         if let Some(hips_ji) = idx("Hips") {
             let (t, _r, s) = joint_local_bind[hips_ji];
-            println!("Hips local translation: {:?}, scale: {:?}", t, s);
+            println!("Hips local translation: {t:?}, scale: {s:?}");
         }
 
         println!("=== all joint names (with byte length, quoted) ===");

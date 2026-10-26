@@ -29,7 +29,7 @@ impl PassTimers {
             return None;
         }
         let count = (labels.len() * 2) as u32;
-        let bytes = (count as u64) * 8;
+        let bytes = u64::from(count) * 8;
         Some(Self {
             set: device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("pass_timers"),
@@ -48,7 +48,7 @@ impl PassTimers {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }),
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels: labels.iter().map(std::string::ToString::to_string).collect(),
             period_ns,
             written: std::sync::atomic::AtomicU64::new(0),
             resolved: std::sync::atomic::AtomicU64::new(0),
@@ -123,7 +123,7 @@ impl PassTimers {
         self.resolved.store(self.written.swap(0, Relaxed), Relaxed);
         let count = (self.labels.len() * 2) as u32;
         encoder.resolve_query_set(&self.set, 0..count, &self.resolve, 0);
-        encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, (count as u64) * 8);
+        encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, u64::from(count) * 8);
     }
 
     pub fn read(&self, device: &wgpu::Device) -> Option<Vec<PassTiming>> {
@@ -163,7 +163,7 @@ fn pass_ms(ran: u64, slot: usize, start: Option<u64>, end: Option<u64>, period_n
         return 0.0;
     }
     match (start, end) {
-        (Some(s), Some(e)) if e > s => ((e - s) as f64 * period_ns as f64 / 1_000_000.0) as f32,
+        (Some(s), Some(e)) if e > s => ((e - s) as f64 * f64::from(period_ns) / 1_000_000.0) as f32,
         _ => 0.0,
     }
 }
@@ -259,7 +259,7 @@ mod tests {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pass_timer_load"),
             source: wgpu::ShaderSource::Wgsl(
-                r#"
+                r"
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     var p = array<vec2<f32>, 3>(
@@ -274,7 +274,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(acc, acc, acc, 1.0);
 }
-"#
+"
                 .into(),
             ),
         });

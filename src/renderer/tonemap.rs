@@ -32,7 +32,7 @@ fn mul3(m: &[[f32; 3]; 3], v: Vec3) -> Vec3 {
 
 fn rrt_and_odt_fit(v: Vec3) -> Vec3 {
     let a = v * (v + 0.024_578_6) - Vec3::splat(0.000_090_537);
-    let b = v * (0.983_729 * v + Vec3::splat(0.432_951_0)) + Vec3::splat(0.238_081);
+    let b = v * (0.983_729 * v + Vec3::splat(0.432_951)) + Vec3::splat(0.238_081);
     a / b
 }
 
@@ -94,7 +94,7 @@ pub fn wgsl_tonemap_block() -> String {
         "{}{}",
         wgsl_aces_block(),
         format!(
-            r#"
+            r"
 fn tonemap(color: vec3<f32>) -> vec3<f32> {{
     var exposed = color * max(camera.post_params.x, 0.0);
 
@@ -105,7 +105,7 @@ fn tonemap(color: vec3<f32>) -> vec3<f32> {{
     }}
     return aces_fitted(exposed);
 }}
-"#,
+",
             w0 = SCOTOPIC_WEIGHTS[0], w1 = SCOTOPIC_WEIGHTS[1], w2 = SCOTOPIC_WEIGHTS[2],
             t0 = NIGHT_TINT[0], t1 = NIGHT_TINT[1], t2 = NIGHT_TINT[2],
         )
@@ -116,7 +116,7 @@ pub fn wgsl_aces_block() -> String {
     let i = ACES_INPUT;
     let o = ACES_OUTPUT;
     format!(
-        r#"
+        r"
 fn aces_rrt_odt_fit(v: vec3<f32>) -> vec3<f32> {{
     let a = v * (v + 0.0245786) - vec3<f32>(0.000090537);
     let b = v * (0.983729 * v + vec3<f32>(0.4329510)) + vec3<f32>(0.238081);
@@ -137,7 +137,7 @@ fn aces_fitted(color: vec3<f32>) -> vec3<f32> {{
     );
     return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
 }}
-"#,
+",
         i00 = i[0][0], i01 = i[0][1], i02 = i[0][2],
         i10 = i[1][0], i11 = i[1][1], i12 = i[1][2],
         i20 = i[2][0], i21 = i[2][1], i22 = i[2][2],
@@ -323,7 +323,7 @@ mod tests {
         let red = lum(night_vision(Vec3::new(1.0, 0.0, 0.0), 1.0));
         let blue = lum(night_vision(Vec3::new(0.0, 0.0, 1.0), 1.0));
         assert!(red < 0.01 && blue > 0.3, "{red} {blue}");
-        assert!(night_vision_for(100.0) == 0.0);
+        assert_eq!(night_vision_for(100.0), 0.0);
         assert!((night_vision_for(1e-4) - NIGHT_VISION_MAX).abs() < 1e-6);
         let moonlit = night_vision_for(0.03);
         assert!(moonlit > 0.4 && moonlit < NIGHT_VISION_MAX, "{moonlit}");

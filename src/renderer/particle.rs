@@ -200,7 +200,7 @@ impl ParticlePipeline {
 }
 
 pub(crate) fn particle_shader() -> String {
-    r#"
+    r"
 var<private> view_slot: i32 = 0;
 struct Uniforms { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -224,6 +224,6 @@ struct VOut {
     let fall = clamp(1.0 - length(in.uv), 0.0, 1.0);
     return vec4<f32>(in.col.rgb, in.col.a * fall * fall);
 }
-"#
+"
     .to_string()
 }

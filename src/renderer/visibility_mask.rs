@@ -42,7 +42,7 @@ pub fn share(vertices: &[[f32; 2]], indices: &[u32], fov: [f32; 4], width: u32, 
     for y in 0..h {
         for x in 0..w {
             let t = (((y / DENSITY_TEXEL) * map_w + x / DENSITY_TEXEL) * 2) as usize;
-            let weight = (density[t] as f64 / 255.0) * (density[t + 1] as f64 / 255.0);
+            let weight = (f64::from(density[t]) / 255.0) * (f64::from(density[t + 1]) / 255.0);
             every_fragment += weight;
             if covered[(y * w + x) as usize] {
                 pixels += 1;

@@ -65,8 +65,8 @@ mod layer_settings_tests {
         let scale = crate::renderer::RENDER_SCALE;
         let known = matches!(
             (scale < 1.0, XR_SHARPENING),
-            (true, Sharpening::Quality) | (true, Sharpening::Normal) | (true, Sharpening::Off)
-                | (false, Sharpening::Off)
+            (true, Sharpening::Quality | Sharpening::Normal | Sharpening::Off) |
+(false, Sharpening::Off)
         );
         assert!(
             known,

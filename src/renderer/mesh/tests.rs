@@ -67,8 +67,7 @@
             let ok = std::process::Command::new(&candidate)
                 .args(["-c", &probe])
                 .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+                .is_ok_and(|s| s.success());
             if ok {
                 return Some(candidate);
             }

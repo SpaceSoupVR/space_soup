@@ -31,7 +31,7 @@ impl CacheKey {
 fn checksum(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
-        h ^= b as u64;
+        h ^= u64::from(b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
@@ -90,7 +90,7 @@ pub fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> 
 }
 
 pub fn build_identity() -> u64 {
-    loaded_from().map(|path| identity_of(&path)).unwrap_or(0)
+    loaded_from().map_or(0, |path| identity_of(&path))
 }
 
 fn identity_of(path: &str) -> u64 {
@@ -125,7 +125,7 @@ fn loaded_from() -> Option<String> {
         dli_sname: std::ptr::null(),
         dli_saddr: std::ptr::null_mut(),
     };
-    let ok = unsafe { dladdr(build_identity as *const std::ffi::c_void, &mut info) };
+    let ok = unsafe { dladdr(build_identity as *const std::ffi::c_void, &raw mut info) };
     if ok == 0 || info.dli_fname.is_null() {
         return None;
     }

@@ -66,7 +66,7 @@ impl SkinCompute {
     pub fn posed_for(&self, device: &Device, source: &Buffer, vertices: u32, joints: &Buffer) -> Posed {
         let positions = device.create_buffer(&BufferDescriptor {
             label: Some("skin_posed_vb"),
-            size: (vertices as u64 * POSED_STRIDE).max(POSED_STRIDE),
+            size: (u64::from(vertices) * POSED_STRIDE).max(POSED_STRIDE),
 
             usage: BufferUsages::STORAGE | BufferUsages::VERTEX | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
@@ -118,7 +118,7 @@ impl PosedCache {
 
 fn shader() -> String {
     format!(
-        r#"
+        r"
 struct JointMatrices {{ mats: array<mat4x4<f32>, {MAX_SKIN_JOINTS}> }}
 @group(0) @binding(0) var<uniform> joints: JointMatrices;
 
@@ -145,7 +145,7 @@ fn cs_skin(@builtin(global_invocation_id) id: vec3<u32>) {{
         (joints.mats[j.z] * p) * w.z +
         (joints.mats[j.w] * p) * w.w;
 }}
-"#
+"
     )
 }
 

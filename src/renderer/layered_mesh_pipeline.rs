@@ -177,7 +177,7 @@ impl LayeredMeshPipeline {
 
 fn layered_mesh_shader() -> String {
     format!(
-        r#"
+        r"
 @group(1) @binding(0) var layer_tex: texture_2d_array<f32>;
 @group(1) @binding(1) var layer_samp: sampler;
 @group(1) @binding(2) var macro_tex: texture_2d<f32>;
@@ -364,7 +364,7 @@ fn repeat_of(layer: i32) -> f32 {{
     }}
     return vec4<f32>(tonemap(colour), 1.0);
 }}
-"#,
+",
 
         lights_block = super::lights::wgsl_lights_block_with(
             0, 1, super::lights::LightsBlockOptions { probe_from_pass: true, ..Default::default() },
@@ -373,6 +373,11 @@ fn repeat_of(layer: i32) -> f32 {{
         whiteout_block = wgsl_whiteout_block(),
         sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
     )
+}
+
+#[cfg(test)]
+pub fn layered_mesh_shader_src() -> String {
+    layered_mesh_shader()
 }
 
 #[cfg(test)]
@@ -584,7 +589,7 @@ mod tests {
         let depth_view = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("layered_test_readback"),
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -686,7 +691,7 @@ mod tests {
             (1.0, [-3.1, 0.2, 5.4]),
         ] {
             let px = at(yaw, offset).unwrap();
-            let worst = still.iter().zip(px).map(|(a, b)| (*a as i32 - b as i32).abs()).max().unwrap();
+            let worst = still.iter().zip(px).map(|(a, b)| (i32::from(*a) - i32::from(b)).abs()).max().unwrap();
             assert!(worst <= 1, "turned {yaw} rad, rig moved {offset:?}: {px:?} against {still:?}");
         }
     }
@@ -717,7 +722,7 @@ mod tests {
         let tiny = shot!(Shot { weights: [0.01, 0.0, 0.01, 0.0], ..Default::default() });
         for c in 0..3 {
             assert!(
-                (even[c] as i32 - tiny[c] as i32).abs() <= 2,
+                (i32::from(even[c]) - i32::from(tiny[c])).abs() <= 2,
                 "renormalisation failed: {even:?} vs {tiny:?}",
             );
         }
@@ -785,7 +790,7 @@ mod tests {
         let away_flipped = shot!(shot([0.0, 0.0, -1.0], true));
         for c in 0..3 {
             assert!(
-                (toward[c] as i32 - away_flipped[c] as i32).abs() <= 2,
+                (i32::from(toward[c]) - i32::from(away_flipped[c])).abs() <= 2,
                 "reversing both the winding and the normal changed the shading: \
                  {toward:?} vs {away_flipped:?}",
             );
@@ -793,7 +798,7 @@ mod tests {
 
         let away = shot!(shot([0.0, 0.0, 1.0], true));
         assert!(
-            (toward[0] as i32 - away[0] as i32).abs() > 8,
+            (i32::from(toward[0]) - i32::from(away[0])).abs() > 8,
             "both windings shade the same, so the normal is never flipped: \
              {toward:?} vs {away:?}",
         );
@@ -828,7 +833,7 @@ mod tests {
         let front = shot!(wall([0.0, 0.0, 5.0]));
         let behind = shot!(wall([0.0, 0.0, -5.0]));
         assert!(
-            (front[0] as i32 - behind[0] as i32).abs() > 8,
+            (i32::from(front[0]) - i32::from(behind[0])).abs() > 8,
             "a wall's normal map is not tilting along z, so it is using the \
              floor's swizzle: {front:?} vs {behind:?}",
         );
@@ -845,7 +850,7 @@ mod tests {
         });
         for c in 0..3 {
             assert!(
-                (none[c] as i32 - flat[c] as i32).abs() <= 2,
+                (i32::from(none[c]) - i32::from(flat[c])).abs() <= 2,
                 "a flat normal map changed the shading: {none:?} vs {flat:?}",
             );
         }
@@ -940,7 +945,7 @@ mod tests {
         assert!(size * 4 <= 256, "row padding assumption broken");
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("e2e_readback"),
-            size: (256 * size) as u64,
+            size: u64::from(256 * size),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1100,9 +1105,4 @@ mod tests {
             panic!("layered mesh pipeline failed validation: {err}");
         }
     }
-}
-
-#[cfg(test)]
-pub fn layered_mesh_shader_src() -> String {
-    layered_mesh_shader()
 }

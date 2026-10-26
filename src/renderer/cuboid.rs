@@ -11,16 +11,13 @@ pub enum CuboidStyle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum CuboidShape {
+    #[default]
     Box,
     Cylinder,
 }
 
-impl Default for CuboidShape {
-    fn default() -> Self {
-        Self::Box
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cuboid {
@@ -263,7 +260,7 @@ fn face_uv2(face_idx: usize, local_pos: [f32; 3], normal: [f32; 3]) -> [f32; 2] 
     let t = local_pos[v_axis] + 0.5;
     let col = (face_idx % 3) as f32;
     let row = (face_idx / 3) as f32;
-    [(col + s) / 3.0, (row + t) / 2.0]
+    [(col + s) / 3.0, f32::midpoint(row, t)]
 }
 
 pub fn build_solid_mesh_one(c: &Cuboid) -> Option<(Vec<SolidVertex>, Vec<u32>)> {

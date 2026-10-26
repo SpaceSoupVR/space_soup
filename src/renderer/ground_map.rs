@@ -82,7 +82,7 @@ pub struct GroundMap {
 }
 
 fn srgb_to_linear(c: u8) -> f32 {
-    let c = c as f32 / 255.0;
+    let c = f32::from(c) / 255.0;
     if c <= 0.04045 {
         c / 12.92
     } else {
@@ -108,7 +108,7 @@ fn sample_rgba(img: &TerrainImage, uv: Vec2) -> [f32; 4] {
     let (x0, y0) = ((fx.floor() as u32).min(img.width - 1), (fy.floor() as u32).min(img.height - 1));
     let (x1, y1) = ((x0 + 1).min(img.width - 1), (y0 + 1).min(img.height - 1));
     let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
-    let px = |x: u32, y: u32, c: usize| img.rgba[((y * img.width + x) * 4) as usize + c] as f32 / 255.0;
+    let px = |x: u32, y: u32, c: usize| f32::from(img.rgba[((y * img.width + x) * 4) as usize + c]) / 255.0;
     let mut out = [0.0; 4];
     for (c, o) in out.iter_mut().enumerate() {
         let a = px(x0, y0, c) + (px(x1, y0, c) - px(x0, y0, c)) * tx;
@@ -128,11 +128,11 @@ fn sample_open(img: &TerrainImage, uv: Vec2) -> Option<[f32; 4]> {
     let mut total = 0.0;
     for (x, y, w) in [(x0, y0, (1.0 - tx) * (1.0 - ty)), (x1, y0, tx * (1.0 - ty)), (x0, y1, (1.0 - tx) * ty), (x1, y1, tx * ty)] {
         let k = ((y * img.width + x) * 4) as usize;
-        if (img.rgba[k] as f32 / 255.0) < BURIED_SKY_VIS || w <= 0.0 {
+        if (f32::from(img.rgba[k]) / 255.0) < BURIED_SKY_VIS || w <= 0.0 {
             continue;
         }
         for c in 0..4 {
-            out[c] += img.rgba[k + c] as f32 / 255.0 * w;
+            out[c] += f32::from(img.rgba[k + c]) / 255.0 * w;
         }
         total += w;
     }
@@ -285,8 +285,8 @@ const GROUND_MAX_MARGIN: f32 = 0.02;
 
 pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((h >> 10) & 0x1f) as i32;
-    let mant = (h & 0x3ff) as f32;
+    let exp = i32::from((h >> 10) & 0x1f);
+    let mant = f32::from(h & 0x3ff);
     match exp {
         0 => sign * mant * 2f32.powi(-24),
         0x1f => sign * f32::INFINITY,
@@ -339,9 +339,9 @@ pub fn levels(map: &GroundMap) -> Vec<GroundLevel> {
                     if level == 1 {
 
                         highest = f32::MIN;
-                        let (bw, bh) = (base.width as i64, base.height as i64);
-                        for sy in 2 * y as i64 - 1..=2 * y as i64 + 2 {
-                            for sx in 2 * x as i64 - 1..=2 * x as i64 + 2 {
+                        let (bw, bh) = (i64::from(base.width), i64::from(base.height));
+                        for sy in 2 * i64::from(y) - 1..=2 * i64::from(y) + 2 {
+                            for sx in 2 * i64::from(x) - 1..=2 * i64::from(x) + 2 {
                                 let k = (sy.clamp(0, bh - 1) * bw + sx.clamp(0, bw - 1)) as usize;
                                 highest = highest.max(base.texels[k][3]);
                             }
@@ -727,14 +727,14 @@ mod tests {
 
                     let span = 1i64 << l;
                     let mut reachable = f32::MIN;
-                    for sy in y as i64 * span - 1..=(y as i64 + 1) * span {
-                        for sx in x as i64 * span - 1..=(x as i64 + 1) * span {
+                    for sy in i64::from(y) * span - 1..=(i64::from(y) + 1) * span {
+                        for sx in i64::from(x) * span - 1..=(i64::from(x) + 1) * span {
                             let k = (sy.clamp(0, 63) * 64 + sx.clamp(0, 63)) as usize;
                             reachable = reachable.max(base.texels[k][3]);
                         }
                     }
                     let slack = bound - reachable;
-                    assert!(slack >= GROUND_MAX_MARGIN && slack < GROUND_MAX_MARGIN + 0.01, "level {l} texel ({x}, {y}): bound {bound} over reachable {reachable}");
+                    assert!((GROUND_MAX_MARGIN..GROUND_MAX_MARGIN + 0.01).contains(&slack), "level {l} texel ({x}, {y}): bound {bound} over reachable {reachable}");
                 }
             }
         }
@@ -897,7 +897,7 @@ mod step_census {
             b.0 += 1;
             b.1 += r.steps;
             b.2 = b.2.max(r.steps);
-            b.3 += r.t.is_some() as u32;
+            b.3 += u32::from(r.t.is_some());
         }
         for (el, (n, s, m, h)) in buckets {
             eprintln!("elev {el:>4}..{:>3}: rays {n:>5}  mean steps {:>5.1}  max {m:>3}  hit {:>3.0}%", el + 5, s as f32 / n as f32, 100.0 * h as f32 / n as f32);

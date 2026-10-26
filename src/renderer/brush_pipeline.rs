@@ -94,9 +94,9 @@ fn roughness_chain_with_normal_variance(
         .map(|i| {
             let px = &normal.rgba[i * 4..i * 4 + 3];
             [
-                px[0] as f32 / 255.0 * 2.0 - 1.0,
-                px[1] as f32 / 255.0 * 2.0 - 1.0,
-                px[2] as f32 / 255.0 * 2.0 - 1.0,
+                f32::from(px[0]) / 255.0 * 2.0 - 1.0,
+                f32::from(px[1]) / 255.0 * 2.0 - 1.0,
+                f32::from(px[2]) / 255.0 * 2.0 - 1.0,
             ]
         })
         .collect();
@@ -134,7 +134,7 @@ fn roughness_chain_with_normal_variance(
             let sigma2 = if len > 1e-4 { (1.0 - len) / len } else { 1.0 };
             let kernel = (2.0 * sigma2).min(NORMAL_VARIANCE_CLAMP);
 
-            let base = lvl.rgba[i * 4] as f32 / 255.0;
+            let base = f32::from(lvl.rgba[i * 4]) / 255.0;
             let filtered = (base * base + kernel).clamp(0.0, 1.0).sqrt();
             let byte = (filtered * 255.0).round().clamp(0.0, 255.0) as u8;
             lvl.rgba[i * 4] = byte;
@@ -147,7 +147,7 @@ fn roughness_chain_with_normal_variance(
 
 pub(crate) fn mip_chain(img: &TerrainImage, srgb: bool) -> Vec<TerrainImage> {
     let to_linear = |b: u8| {
-        let c = b as f32 / 255.0;
+        let c = f32::from(b) / 255.0;
         if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
     };
     let to_srgb = |v: f32| {
@@ -173,7 +173,7 @@ pub(crate) fn mip_chain(img: &TerrainImage, srgb: bool) -> Vec<TerrainImage> {
                         let sx = (x * 2 + dx).min(prev.width - 1);
                         let sy = (y * 2 + dy).min(prev.height - 1);
                         let b = prev.rgba[((sy * prev.width + sx) * 4 + c as u32) as usize];
-                        sum += if linear { to_linear(b) } else { b as f32 / 255.0 };
+                        sum += if linear { to_linear(b) } else { f32::from(b) / 255.0 };
                     }
                     let avg = sum / 4.0;
                     rgba[((y * w + x) * 4 + c as u32) as usize] =
@@ -240,7 +240,7 @@ pub fn roughness_is_reflective(rough: Option<&crate::renderer::terrain_pipeline:
         return false;
     }
 
-    let sum: u64 = img.rgba.chunks_exact(4).map(|p| p[0] as u64).sum();
+    let sum: u64 = img.rgba.chunks_exact(4).map(|p| u64::from(p[0])).sum();
     let n = (img.rgba.len() / 4).max(1) as f64;
     let mean = (sum as f64 / n) / 255.0;
     (mean as f32) < SSR_ROUGHNESS_THRESHOLD
@@ -524,7 +524,7 @@ impl BrushMaterials {
                     .collect()
             }
         };
-        let mip_level_count = chains.first().map(|c| c.len() as u32).unwrap_or(1);
+        let mip_level_count = chains.first().map_or(1, |c| c.len() as u32);
 
         let tex = device.create_texture(&TextureDescriptor {
             label: Some(label),
@@ -866,7 +866,7 @@ impl BrushPipeline {
     ) -> Option<Self> {
         let (label, edits) = DEFERRED_REGISTER_CUTS.iter().find(|(label, _)| *label == cut)?;
         let mut src = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
-        for (from, to) in edits.iter() {
+        for (from, to) in *edits {
             if !src.contains(from) {
                 return None;
             }
@@ -977,7 +977,7 @@ impl BrushPipeline {
         let (edit, only) = edit.split_once('@').map_or((edit, None), |(e, c)| (e, Some(c)));
         let shipped = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
         let edited = with_reader_edit(shipped.clone(), edit)?;
-        let class = |name: &str| if only.map_or(true, |c| c == name) { edited.clone() } else { shipped.clone() };
+        let class = |name: &str| if only.is_none_or(|c| c == name) { edited.clone() } else { shipped.clone() };
         let spotless = crate::renderer::lights::without_spot_shadows;
         let build = |label: &str, source: String| {
             Self::from_source(
@@ -1036,7 +1036,7 @@ impl BrushPipeline {
         for (label, edits) in PROBE_PASS_REGISTER_CUTS {
             let mut src = base.clone();
             let mut missing = None;
-            for (from, to) in edits.iter() {
+            for (from, to) in *edits {
                 if !src.contains(from) {
                     missing = Some(*from);
                     break;
@@ -1073,7 +1073,7 @@ impl BrushPipeline {
     ) -> Option<Self> {
         let (label, edits) = SCENE_REGISTER_CUTS.iter().find(|(label, _)| *label == cut)?;
         let mut src = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
-        for (from, to) in edits.iter() {
+        for (from, to) in *edits {
             if !src.contains(from) {
                 return None;
             }
@@ -1104,7 +1104,7 @@ impl BrushPipeline {
         for (label, edits) in SCENE_REGISTER_CUTS {
             let mut src = base.clone();
             let mut missing = None;
-            for (from, to) in edits.iter() {
+            for (from, to) in *edits {
                 if !src.contains(from) {
                     missing = Some(*from);
                     break;
@@ -1140,7 +1140,7 @@ impl BrushPipeline {
         for (label, edits) in DEFERRED_REGISTER_CUTS {
             let mut src = base.clone();
             let mut missing = None;
-            for (from, to) in edits.iter() {
+            for (from, to) in *edits {
                 if !src.contains(from) {
                     missing = Some(*from);
                     break;
@@ -1392,7 +1392,7 @@ impl BrushSealPipeline {
 fn brush_seal_shader() -> String {
     let [r, g, b] = CRACK_SEAL_COLOUR;
     format!(
-        r#"
+        r"
 {lights_block}
 
 @vertex fn vs_main(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {{
@@ -1402,7 +1402,7 @@ fn brush_seal_shader() -> String {
 @fragment fn fs_main() -> @location(0) vec4<f32> {{
     return vec4<f32>({r:?}, {g:?}, {b:?}, 1.0);
 }}
-"#,
+",
         lights_block = wgsl_lights_block(0, 1),
     )
 }
@@ -2469,7 +2469,7 @@ const SUN_MATRIX_FIXED: (&str, &str) = (
 pub(crate) fn with_reader_edit(src: String, edit: &str) -> Option<String> {
     let (_, edits) = READER_EDITS.iter().find(|(name, _)| *name == edit)?;
     let mut src = src;
-    for (from, to) in edits.iter() {
+    for (from, to) in *edits {
         if src.matches(from).count() != 1 {
             return None;
         }
@@ -2508,7 +2508,7 @@ pub mod probe_pass {
 
     pub const REACH_FORMAT: TextureFormat = TextureFormat::Rg16Float;
 
-    pub(crate) const FACE_CODE_WGSL: &str = r#"
+    pub(crate) const FACE_CODE_WGSL: &str = r"
 fn probe_face_code(n: vec3<f32>) -> f32 {
     let a = n / max(abs(n.x) + abs(n.y) + abs(n.z), 1e-6);
     var o = a.xz;
@@ -2528,7 +2528,7 @@ fn probe_face_same(a: f32, b: f32) -> bool {
     let d = abs(vec2<i32>(ia / 32 - ib / 32, ia % 32 - ib % 32));
     return d.x <= 2 && d.y <= 2;
 }
-"#;
+";
 
     pub const MIRROR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
@@ -2544,13 +2544,13 @@ fn probe_face_same(a: f32, b: f32) -> bool {
     pub const EYE_FAR: f32 = 1000.0;
 
     pub const OUTPUT_SIGNATURE: &str = "-> ProbePassOut";
-    pub(crate) const OUTPUT_WGSL: &str = r#"
+    pub(crate) const OUTPUT_WGSL: &str = r"
 struct ProbePassOut {
     @location(0) reflection: vec4<f32>,
 
     @location(1) reach: vec2<f32>,
 }
-"#;
+";
 
     pub fn targets(reach: bool) -> [Option<wgpu::ColorTargetState>; 2] {
         [
@@ -2846,7 +2846,7 @@ struct ProbePassOut {
         for k in 1..=n {
             s += &format!("@group(0) @binding({k}) var level{k}: texture_storage_2d<rgba16float, write>;\n");
         }
-        s += r#"
+        s += r"
 var<workgroup> tile_a: array<vec4<f32>, 256>;
 var<workgroup> tile_b: array<vec4<f32>, 64>;
 
@@ -2863,9 +2863,9 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
         textureStore(level1, p1, v1);
     }
     tile_a[t.y * 16u + t.x] = v1;
-"#;
+";
         if n >= 2 {
-            s += r#"
+            s += r"
     workgroupBarrier();
     if (t.x < 8u && t.y < 8u) {
         let i = t.y * 32u + t.x * 2u;
@@ -2876,10 +2876,10 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
         }
         tile_b[t.y * 8u + t.x] = v2;
     }
-"#;
+";
         }
         if n >= 3 {
-            s += r#"
+            s += r"
     workgroupBarrier();
     if (t.x < 4u && t.y < 4u) {
         let i = t.y * 16u + t.x * 2u;
@@ -2890,10 +2890,10 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
         }
         tile_a[t.y * 4u + t.x] = v3;
     }
-"#;
+";
         }
         if n >= 4 {
-            s += r#"
+            s += r"
     workgroupBarrier();
     if (t.x < 2u && t.y < 2u) {
         let i = t.y * 8u + t.x * 2u;
@@ -2903,13 +2903,13 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
             textureStore(level4, p4, v4);
         }
     }
-"#;
+";
         }
         s += "}\n";
         s
     }
 
-    pub(super) const PASS_LIGHTING: &str = r#"
+    pub(super) const PASS_LIGHTING: &str = r"
     let rough = textureSample(mat_rough, mat_rough_samp, in.uv, i32(in.material)).r;
 
     let rough_aa = specular_aa_roughness(rough, dpdx(n_geom), dpdy(n_geom));
@@ -2929,9 +2929,9 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
         return ProbePassOut(vec4<f32>(0.0), vec2<f32>(0.0, probe_face_code(n_geom)));
     }
     let reflection = probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);
-    return ProbePassOut(reflection, vec2<f32>(probe_reach, probe_face_code(n_geom)));"#;
+    return ProbePassOut(reflection, vec2<f32>(probe_reach, probe_face_code(n_geom)));";
 
-    pub(crate) const READER_WGSL: &str = r#"
+    pub(crate) const READER_WGSL: &str = r"
 @group(3) @binding(0) var probe_pass_tex: texture_2d_array<f32>;
 @group(3) @binding(1) var probe_pass_depth: texture_depth_2d_array;
 @group(3) @binding(2) var probe_pass_linear: sampler;
@@ -2988,20 +2988,18 @@ fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32, code: f32) 
     }
     return vec4<f32>(probe_pass_expand(pre.rgb / max(pre.a, 1e-4)), pre.a);
 }
-"#;
+";
 
     pub(crate) fn eye_linear_depth_wgsl() -> String {
         format!(
-            r#"
-const FLOOR_MIRROR_NEAR: f32 = {near:?};
-const FLOOR_MIRROR_FAR: f32 = {far:?};
+            r"
+const FLOOR_MIRROR_NEAR: f32 = {EYE_NEAR:?};
+const FLOOR_MIRROR_FAR: f32 = {EYE_FAR:?};
 fn floor_mirror_linear_depth(d: f32) -> f32 {{
     let z = 2.0 * d - 1.0;
     return 2.0 * FLOOR_MIRROR_FAR * FLOOR_MIRROR_NEAR / ((FLOOR_MIRROR_FAR + FLOOR_MIRROR_NEAR) - z * (FLOOR_MIRROR_FAR - FLOOR_MIRROR_NEAR));
 }}
-"#,
-            near = EYE_NEAR,
-            far = EYE_FAR,
+",
         )
     }
 }
@@ -3052,7 +3050,7 @@ fn brush_shader_probe(ssr: bool, sources: bool, ssr_debug: bool, path: SsrPath, 
 
     if BRUSH_LIGHT_DEBUG {
         return format!(
-            r#"
+            r"
 {lights_block}
 
 struct VIn {{
@@ -3080,7 +3078,7 @@ struct VOut {{
     let d = light_debug(in.world_pos, normalize(in.normal));
     return vec4<f32>(clamp(d.x, 0.0, 1.0), clamp(d.y, 0.0, 1.0), 0.0, 1.0);
 }}
-"#,
+",
             lights_block = wgsl_lights_block(0, 1),
         );
     }
@@ -3090,17 +3088,17 @@ struct VOut {{
 
             "    @location(9) @interpolate(perspective, centroid) world_pos_centroid: vec3<f32>,\n",
             "    out.world_pos_centroid = v.pos;\n",
-            r#"
+            r"
     let edge_delta = length(in.world_pos - in.world_pos_centroid);
     let edge_pixel = length(fwidth(in.world_pos));
     let edge_out = edge_delta / max(edge_pixel, 1e-6);
-    return vec4<f32>(clamp(edge_out, 0.0, 1.0), 0.02, 0.02, 1.0);"#,
+    return vec4<f32>(clamp(edge_out, 0.0, 1.0), 0.02, 0.02, 1.0);",
         )
     } else {
         ("", "", "")
     };
     let source_debug = if sources {
-        r#"
+        r"
     let dbg_sum = dbg_direct + dbg_baked + dbg_probe;
     let dbg_total = max(dbg_sum.r + dbg_sum.g + dbg_sum.b, 1e-6);
     return vec4<f32>(
@@ -3108,13 +3106,13 @@ struct VOut {{
         (dbg_baked.r + dbg_baked.g + dbg_baked.b) / dbg_total,
         (dbg_probe.r + dbg_probe.g + dbg_probe.b) / dbg_total,
         1.0,
-    );"#
+    );"
     } else {
         ""
     };
 
     let ssr_apply = if ssr {
-        r#"
+        r"
     let ssr_rough = textureSampleLevel(mat_rough, mat_rough_samp, in.uv, i32(in.material), 4.0).r;
     let ssr_n = normalize(mix(n_geom, n, 1.0 - smoothstep(0.1, 0.4, ssr_rough)));
     let ssr_view = normalize(cam_pos() - in.world_pos);
@@ -3122,34 +3120,34 @@ struct VOut {{
     let ssr_fresnel = 0.04 + 0.96 * pow(1.0 - ssr_cos, 5.0);
 
     let reflectivity = clamp((1.0 - ssr_rough) * ssr_fresnel, 0.0, MAX_SSR_REFLECTIVITY);
-"#
+"
     } else {
-        r#"
-    return vec4<f32>(tonemap(c), albedo.a * in.tint.a);"#
+        r"
+    return vec4<f32>(tonemap(c), albedo.a * in.tint.a);"
     };
 
     let ssr_tail = if !ssr {
         ""
     } else if composite {
 
-        r#"
+        r"
     let ssr_fallback = textureLoad(ssr_scene_color, vec2<i32>(in.clip.xy), 0).rgb;
     let refl = ssr_reflection_at(in.clip.xy);
     return vec4<f32>(
         mix(ssr_fallback, refl.rgb, clamp(reflectivity, 0.0, 1.0) * refl.a),
         albedo.a * in.tint.a,
-    );"#
+    );"
     } else if trace {
 
-        r#"
-    return ssr_reflect(in.world_pos, ssr_n, vec3<f32>(0.0), reflectivity, ssr_rough);"#
+        r"
+    return ssr_reflect(in.world_pos, ssr_n, vec3<f32>(0.0), reflectivity, ssr_rough);"
     } else {
-        r#"
+        r"
     let ssr_fallback = textureLoad(ssr_scene_color, vec2<i32>(in.clip.xy), 0).rgb;
     return vec4<f32>(
         ssr_reflect(in.world_pos, ssr_n, ssr_fallback, reflectivity, ssr_rough),
         albedo.a * in.tint.a,
-    );"#
+    );"
     };
     let ssr_apply = format!("{ssr_apply}{ssr_tail}");
 
@@ -3164,7 +3162,7 @@ struct VOut {{
     let lighting = if ssr && !sources {
         ""
     } else {
-        r#"
+        r"
     let rough = textureSample(mat_rough, mat_rough_samp, in.uv, i32(in.material)).r;
 
     let rough_aa = rough;
@@ -3215,7 +3213,7 @@ struct VOut {{
     }
     set_stationary_masks(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
     let lit = shade_material_lamps(env_part, face_pos, n, baked.rgb, albedo.rgb);
-    let c = in.tint.rgb * lit;"#
+    let c = in.tint.rgb * lit;"
     };
 
     let lighting: String = match probe {
@@ -3246,7 +3244,7 @@ struct VOut {{
         }
     };
     let src = format!(
-        r#"
+        r"
 @group(2) @binding(0) var lm_tex: texture_2d<f32>;
 @group(2) @binding(2) var lm_dir_tex: texture_2d<f32>;
 @group(2) @binding(1) var lm_samp: sampler;
@@ -3340,7 +3338,7 @@ struct VOut {{
 
 {lighting}{tail}
 }}
-"#,
+",
         lights_block = crate::renderer::lights::wgsl_lights_block_with(
             0,
             1,
@@ -3389,13 +3387,13 @@ struct VOut {{
                 SourcesView::ProbeFactors => {
                     "\n    return vec4<f32>(dbg_probe_factors, 1.0);".to_string()
                 }
-                SourcesView::Absolute => r#"
+                SourcesView::Absolute => r"
     let abs_lum = vec3<f32>(
         dot(dbg_baked, vec3<f32>(0.2126, 0.7152, 0.0722)),
         dot(dbg_probe, vec3<f32>(0.2126, 0.7152, 0.0722)),
         dot(dbg_direct, vec3<f32>(0.2126, 0.7152, 0.0722)),
     );
-    return vec4<f32>(abs_lum / (abs_lum + vec3<f32>(0.05)), 1.0);"#
+    return vec4<f32>(abs_lum / (abs_lum + vec3<f32>(0.05)), 1.0);"
                     .to_string(),
             }
         } else {
@@ -3569,7 +3567,7 @@ mod tests {
         let v = 0.5029f32;
         let floats = at(crate::renderer::mesh::LightmapLight::Linear(&[v, v, v, 1.0])).unwrap();
         for c in 0..3 {
-            assert!((bytes[c] as i32 - floats[c] as i32).abs() <= 1, "{bytes:?} vs {floats:?}");
+            assert!((i32::from(bytes[c]) - i32::from(floats[c])).abs() <= 1, "{bytes:?} vs {floats:?}");
         }
         let bright = at(crate::renderer::mesh::LightmapLight::Linear(&[3.0, 3.0, 3.0, 1.0])).unwrap();
         let one = at(crate::renderer::mesh::LightmapLight::Linear(&[1.0, 1.0, 1.0, 1.0])).unwrap();
@@ -3595,7 +3593,7 @@ mod tests {
         assert!(lit[1] > dark[1] + 40, "the sun did not light an unshadowed wall: {dark:?} vs {lit:?}");
         assert!(half[1] > dark[1] && half[1] < lit[1], "half a sun is not between none and all");
         assert!(
-            (unbaked[1] as i32 - lit[1] as i32).abs() <= 2,
+            (i32::from(unbaked[1]) - i32::from(lit[1])).abs() <= 2,
             "an unbaked mask read as shadow: {unbaked:?} vs {lit:?}",
         );
     }
@@ -3707,17 +3705,14 @@ mod tests {
             lights.upload(&queue, &[]);
         }
 
-        let (_shadows, uniforms, _probe_keep) = match probe {
-            Some((colour, lo, hi)) => {
-                let (sh, u, v, samp) = crate::renderer::uniforms::test_support::scene_uniforms_with_probe(
-                    &device, &queue, &lights, colour, lo, hi,
-                );
-                (sh, u, Some((v, samp)))
-            }
-            None => {
-                let (sh, u) = scene_uniforms(&device, &lights);
-                (sh, u, None)
-            }
+        let (_shadows, uniforms, _probe_keep) = if let Some((colour, lo, hi)) = probe {
+            let (sh, u, v, samp) = crate::renderer::uniforms::test_support::scene_uniforms_with_probe(
+                &device, &queue, &lights, colour, lo, hi,
+            );
+            (sh, u, Some((v, samp)))
+        } else {
+            let (sh, u) = scene_uniforms(&device, &lights);
+            (sh, u, None)
         };
         uniforms.upload(&queue, glam::Mat4::IDENTITY, TEST_EYE, &ShadowUpload::disabled());
 
@@ -3788,7 +3783,7 @@ mod tests {
 
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("brush_test_readback"),
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -4047,7 +4042,7 @@ mod tests {
                 [1.0; 4], 1.0, false, HEAD_ON_LIGHT,
             )
             .unwrap();
-            eprintln!("{label:>16}: lit {lit:?}  unlit {unlit:?}  delta {}", lit[0] as i32 - unlit[0] as i32);
+            eprintln!("{label:>16}: lit {lit:?}  unlit {unlit:?}  delta {}", i32::from(lit[0]) - i32::from(unlit[0]));
         }
     }
 
@@ -4134,14 +4129,14 @@ mod tests {
         };
         let rough = room_lit(255).unwrap();
 
-        let room = smooth[1] as i32 - rough[1] as i32;
+        let room = i32::from(smooth[1]) - i32::from(rough[1]);
         assert!(
             room > 2,
             "a polished surface in a lit but sealed room reflected no more of \
              that room than a matte one: {smooth:?} vs {rough:?}",
         );
 
-        let total = |p: [u8; 4]| p[0] as i32 + p[1] as i32 + p[2] as i32;
+        let total = |p: [u8; 4]| i32::from(p[0]) + i32::from(p[1]) + i32::from(p[2]);
         assert!(
             total(smooth) > total(rough),
             "the polished surface is not showing more light in total: \
@@ -4171,7 +4166,7 @@ mod tests {
         };
         let below = lit_from([128, 0, 128, 255]).unwrap();
 
-        let gap = (above[0] as i32 - below[0] as i32).abs();
+        let gap = (i32::from(above[0]) - i32::from(below[0])).abs();
         assert!(
             gap > 4,
             "bounce arriving from above ({above:?}) and from below ({below:?}) \
@@ -4245,13 +4240,13 @@ mod tests {
 
         let matte = shine(255).unwrap();
         assert!(
-            px[1] as i32 > matte[1] as i32 && px[2] as i32 > matte[2] as i32,
+            i32::from(px[1]) > i32::from(matte[1]) && i32::from(px[2]) > i32::from(matte[2]),
             "a polished red surface ({px:?}) carries no more green or blue than a \
              matte one ({matte:?}), so it has no untinted highlight at all",
         );
 
-        let dg = px[1] as i32 - matte[1] as i32;
-        let db = px[2] as i32 - matte[2] as i32;
+        let dg = i32::from(px[1]) - i32::from(matte[1]);
+        let db = i32::from(px[2]) - i32::from(matte[2]);
         assert!(
             (dg - db).abs() <= 2,
             "the highlight added {dg} green and {db} blue -- it is carrying the \
@@ -4350,7 +4345,7 @@ mod tests {
         let flat_px =
             render_brush_material(0, &grey, &[Some(flat([128, 128, 255], 4))], &[], &[], [1.0; 4], 1.0, true, above)
                 .unwrap();
-        let lum = |p: [u8; 4]| p[0] as i32 + p[1] as i32 + p[2] as i32;
+        let lum = |p: [u8; 4]| i32::from(p[0]) + i32::from(p[1]) + i32::from(p[2]);
         eprintln!("faces up {faces_up:?}  flat {flat_px:?}  faces down {faces_down:?}");
         assert!(faces_up[0] < 250 && faces_up[1] < 250, "clipped, so the comparison means nothing: {faces_up:?}");
         assert!(
@@ -4414,8 +4409,8 @@ mod tests {
     mod probe_render {
         use super::*;
 
-        use super::tests::*;
-        use super::*;
+        
+        
 
         const SEALED: [u8; 4] = [0, 0, 0, 0];
 
@@ -4447,7 +4442,7 @@ mod tests {
 
             let with = polished_wall(Some(([0, 255, 0, 255], big.0, big.1))).unwrap();
             assert!(
-                with[1] as i32 - without[1] as i32 > 4,
+                i32::from(with[1]) - i32::from(without[1]) > 4,
                 "a probe covering the surface changed it from {without:?} to {with:?}; \
                  the cube is not reaching the shader",
             );
@@ -4729,7 +4724,7 @@ mod ssr_pipeline_tests {
         let read = |enc: &mut wgpu::CommandEncoder, level: u32, size: u32| {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
-                size: 256 * size as u64,
+                size: 256 * u64::from(size),
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -4751,8 +4746,8 @@ mod ssr_pipeline_tests {
         let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
 
         let half_to_f32 = |h: u16| -> f32 {
-            let exp = ((h >> 10) & 0x1f) as i32;
-            let mant = (h & 0x3ff) as f32 / 1024.0;
+            let exp = i32::from((h >> 10) & 0x1f);
+            let mant = f32::from(h & 0x3ff) / 1024.0;
             if exp == 0 { 0.0 } else { (1.0 + mant) * 2f32.powi(exp - 15) }
         };
         let half = |b: &wgpu::Buffer| -> Vec<f32> {
@@ -4802,7 +4797,7 @@ mod ssr_pipeline_tests {
                 let row = (w * 8).div_ceil(256) * 256;
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: None,
-                    size: (row * h) as u64,
+                    size: u64::from(row * h),
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
@@ -4823,8 +4818,8 @@ mod ssr_pipeline_tests {
         }
         let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         let half_to_f32 = |h: u16| -> f32 {
-            let exp = ((h >> 10) & 0x1f) as i32;
-            let mant = (h & 0x3ff) as f32 / 1024.0;
+            let exp = i32::from((h >> 10) & 0x1f);
+            let mant = f32::from(h & 0x3ff) / 1024.0;
             if exp == 0 { mant * 2f32.powi(-14) } else { (1.0 + mant) * 2f32.powi(exp - 15) }
         };
 
@@ -4860,7 +4855,7 @@ mod ssr_pipeline_tests {
         const H: u32 = 32;
         const TOLERANCE: f32 = 0.0015;
 
-        const PATTERN: &str = r#"
+        const PATTERN: &str = r"
 fn pass_colour(t: vec2<f32>) -> vec4<f32> {
     let a = 0.25 + 0.5 * fract(t.x * 0.37 + t.y * 0.11);
     return vec4<f32>(vec3<f32>(t.x / 32.0, t.y / 16.0, 0.5) * a, a);
@@ -4900,7 +4895,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
     let t = floor(pos.xy);
     return PassOut(pass_colour(t), vec2<f32>(0.0, pass_code(t)), pass_depth(t));
 }
-"#;
+";
         let layout = probe_pass::bind_group_layout(&device);
         let target = probe_pass::Target::new(&device, &layout, W, H, 1);
         let fill_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -5124,7 +5119,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         let base = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
         for (label, edits) in DEFERRED_REGISTER_CUTS {
             let mut src = base.clone();
-            for (from, to) in edits.iter() {
+            for (from, to) in *edits {
                 assert!(src.contains(from), "{label}: `{from}` is not in the deferring probe pass");
 
                 assert_eq!(src.matches(from).count(), 1, "{label}: `{from}` is in the deferring probe pass more than once");
@@ -5158,7 +5153,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         let base = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
         for (label, edits) in SCENE_REGISTER_CUTS {
             let mut src = base.clone();
-            for (from, to) in edits.iter() {
+            for (from, to) in *edits {
                 assert!(src.contains(from), "{label}: `{from}` is not in the scene shader");
                 src = src.replacen(from, to, 1);
             }
@@ -5212,7 +5207,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         let base = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Pass);
         for (label, edits) in PROBE_PASS_REGISTER_CUTS {
             let mut src = base.clone();
-            for (from, to) in edits.iter() {
+            for (from, to) in *edits {
                 assert!(src.contains(from), "{label}: `{from}` is not in the probe pass shader");
                 src = src.replacen(from, to, 1);
             }
@@ -5315,7 +5310,8 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         const LIGHTS: &str = "let lit = shade_material_lamps(";
         const READ_BACK: &str =
             "let ssr_fallback = textureLoad(ssr_scene_color, vec2<i32>(in.clip.xy), 0).rgb;";
-        for _ms in [false] {
+        {
+            let _ms = false;
             let shipped = brush_shader_variant(true, false, false);
             assert!(!shipped.contains(LIGHTS), "the reflective pass shades the surface again");
             assert!(shipped.contains(READ_BACK), "the reflective pass no longer reads the scene's colour");
@@ -5466,7 +5462,7 @@ mod mip_chain_tests {
             for (i, lv) in c.iter().enumerate() {
                 let px = &lv.rgba[0..4];
                 assert!(
-                    px.iter().zip([180u8, 90, 45, 255]).all(|(a, b)| (*a as i32 - b as i32).abs() <= 1),
+                    px.iter().zip([180u8, 90, 45, 255]).all(|(a, b)| (i32::from(*a) - i32::from(b)).abs() <= 1),
                     "srgb={srgb} level {i} drifted to {px:?}",
                 );
             }
@@ -5488,7 +5484,7 @@ mod mip_chain_tests {
         let level1 = &mip_chain(&img, true)[1];
         let got = level1.rgba[0];
         assert!(
-            (got as i32 - 188).abs() <= 3,
+            (i32::from(got) - 188).abs() <= 3,
             "half-lit sRGB averaged to {got}; 128 means it was averaged as raw bytes \
              and every mip is too dark",
         );
@@ -5503,7 +5499,7 @@ mod mip_chain_tests {
         ];
         let img = TerrainImage { width: w, height: h, rgba };
         let a = mip_chain(&img, true)[1].rgba[3];
-        assert!((a as i32 - 128).abs() <= 1, "alpha averaged to {a}, not 128");
+        assert!((i32::from(a) - 128).abs() <= 1, "alpha averaged to {a}, not 128");
     }
 }
 
@@ -5623,7 +5619,7 @@ mod crack_seal_tests {
         let depth_view = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("seal_test_readback"),
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -5673,9 +5669,9 @@ mod crack_seal_tests {
     fn is_seal(px: [u8; 4]) -> bool {
         let want = |c: f32| (c * 255.0).round() as i32;
         let [r, g, b] = CRACK_SEAL_COLOUR;
-        (px[0] as i32 - want(r)).abs() <= 2
-            && (px[1] as i32 - want(g)).abs() <= 2
-            && (px[2] as i32 - want(b)).abs() <= 2
+        (i32::from(px[0]) - want(r)).abs() <= 2
+            && (i32::from(px[1]) - want(g)).abs() <= 2
+            && (i32::from(px[2]) - want(b)).abs() <= 2
     }
 
     #[test]
@@ -5882,9 +5878,8 @@ mod normal_variance_roughness_tests {
 
             for (i, (x, y)) in a.rgba.iter().zip(b.rgba.iter()).enumerate() {
                 assert!(
-                    (*x as i32 - *y as i32).abs() <= 2,
-                    "level {lvl} byte {i}: flat normals moved roughness {} -> {}",
-                    y, x,
+                    (i32::from(*x) - i32::from(*y)).abs() <= 2,
+                    "level {lvl} byte {i}: flat normals moved roughness {y} -> {x}",
                 );
             }
         }
@@ -5918,19 +5913,19 @@ mod normal_variance_roughness_tests {
         let base_byte = 60u8;
         let rough = solid(4, 4, [base_byte, base_byte, base_byte, 255]);
         let with = roughness_chain_with_normal_variance(&rough, Some(&opposing(4, 4)));
-        let r = base_byte as f32 / 255.0;
+        let r = f32::from(base_byte) / 255.0;
 
         let expected = ((r * r + NORMAL_VARIANCE_CLAMP).min(1.0)).sqrt();
         let expected_byte = (expected * 255.0).round() as u8;
         let got = with[1].rgba[0];
         assert!(
-            (got as i32 - expected_byte as i32).abs() <= 2,
+            (i32::from(got) - i32::from(expected_byte)).abs() <= 2,
             "variance-space combine wrong: got {got}, expected ~{expected_byte}",
         );
 
         let naive = ((r + NORMAL_VARIANCE_CLAMP).min(1.0) * 255.0).round() as u8;
         assert!(
-            (got as i32 - naive as i32).abs() > 2,
+            (i32::from(got) - i32::from(naive)).abs() > 2,
             "the result matches naive addition ({naive}); the squares are not being used",
         );
     }
@@ -6173,7 +6168,7 @@ mod sun_faces_tests {
 
         let (_, edits) = DEFERRED_REGISTER_CUTS.iter().find(|(label, _)| *label == "def_dedup_all").unwrap();
         let mut source = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
-        for (from, to) in edits.iter() {
+        for (from, to) in *edits {
             source = source.replacen(from, to, 1);
         }
         println!("{}", crate::renderer::shader_inlining::report("def_dedup_all", &source, "fs_main", 12));

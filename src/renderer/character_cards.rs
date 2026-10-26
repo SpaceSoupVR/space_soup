@@ -158,7 +158,7 @@ pub fn card_matrix(k: usize, centre: Vec3, half: Vec3, yaw: f32) -> Mat4 {
 }
 
 fn square_card_matrix(k: usize, centre: Vec3, half: Vec3) -> Mat4 {
-    let (a, from_plus) = (k / 2, k % 2 == 0);
+    let (a, from_plus) = (k / 2, k.is_multiple_of(2));
     let (a1, a2) = ((a + 1) % 3, (a + 2) % 3);
     let axis = |i: usize| Vec3::AXES[i];
     let row = |v: Vec3, w: f32| Vec4::new(v.x, v.y, v.z, w);
@@ -174,7 +174,7 @@ fn square_card_matrix(k: usize, centre: Vec3, half: Vec3) -> Mat4 {
 
 fn shader() -> String {
     format!(
-        r#"
+        r"
 struct Card {{ view_proj: mat4x4<f32> }}
 @group(0) @binding(0) var<uniform> card: Card;
 
@@ -235,7 +235,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     }}
     return vec4<f32>(t.rgb, 1.0);
 }}
-"#
+"
     )
 }
 
@@ -533,7 +533,7 @@ impl CharacterCards {
         timer: Option<(&crate::renderer::pass_timers::PassTimers, usize)>,
         skin: Option<&crate::renderer::skin_compute::SkinCompute>,
     ) {
-        let mut meshes = self.meshes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut meshes = self.meshes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         meshes.retain(|source, _| parts.iter().any(|part| part.source == source));
         if parts.iter().any(|part| !meshes.contains_key(part.source)) {
 
@@ -624,17 +624,14 @@ impl CharacterCards {
                 let Some(mesh) = meshes.get(part.source) else {
                     continue;
                 };
-                match (skin, &mesh.posed) {
-                    (Some(_), Some((_, posed))) => {
-                        pass.set_pipeline(&self.posed_pipeline);
-                        pass.set_vertex_buffer(0, posed.positions.slice(..));
-                        pass.set_vertex_buffer(1, mesh.vertices.slice(..));
-                    }
-                    _ => {
-                        pass.set_pipeline(&self.pipeline);
-                        pass.set_bind_group(3, part.joints, &[]);
-                        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                    }
+                if let (Some(_), Some((_, posed))) = (skin, &mesh.posed) {
+                    pass.set_pipeline(&self.posed_pipeline);
+                    pass.set_vertex_buffer(0, posed.positions.slice(..));
+                    pass.set_vertex_buffer(1, mesh.vertices.slice(..));
+                } else {
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(3, part.joints, &[]);
+                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 }
                 pass.set_bind_group(1, part.model, &[]);
                 pass.set_bind_group(2, part.texture, &[]);
@@ -710,7 +707,7 @@ mod tests {
                 m.project_point3(turn.inverse() * on_face),
                 m.project_point3(turn.inverse() * far),
             );
-            let uv = |p: Vec3| ((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);
+            let uv = |p: Vec3| (f32::midpoint(p.x, 1.0), (1.0 - p.y) * 0.5);
             let (u, v) = uv(c);
             assert!(
                 (u - 0.25).abs() < 1e-5 && (v - 0.75).abs() < 1e-5,
@@ -979,7 +976,7 @@ mod tests {
             let code = format!(
                 "{}\n{}",
                 crate::renderer::lights::wgsl_lights_block(0, 1),
-                r#"
+                r"
     @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
     @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
     @compute @workgroup_size(1)
@@ -988,7 +985,7 @@ mod tests {
 
         out[id.x] = capsule_reflection(rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz), 0.0, vec3<f32>(3.14159265), vec4<f32>(0.0));
     }
-"#
+"
             );
             let module = device.create_shader_module(ShaderModuleDescriptor {
                 label: None,

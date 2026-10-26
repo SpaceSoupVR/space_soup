@@ -448,7 +448,7 @@ pub const SKY_CRACK_DEBUG: bool = false;
 
 fn sky_shader() -> String {
     format!(
-        r#"
+        r"
 {lights_block}
 
 @group(1) @binding(0) var sky_tex: texture_2d<f32>;
@@ -664,7 +664,7 @@ fn sky_sun_disc(d: vec3<f32>, px: f32) -> vec3<f32> {{
 
     {sky_tail}
 }}
-"#,
+",
         lights_block = wgsl_lights_block(0, 1),
         star_cells = STAR_CELLS,
         sky_tail = if SKY_CRACK_DEBUG {
@@ -687,7 +687,7 @@ pub fn star_count_in_cells(star_count: f32) -> f32 {
             let (cx, cy) = (c(x).tan(), c(y).tan());
             let r2 = 1.0 + cx * cx + cy * cy;
             let omega = cell_angle * cell_angle * (1.0 + cx * cx) * (1.0 + cy * cy) / (r2 * r2.sqrt());
-            sum += (star_count * omega / (4.0 * std::f32::consts::PI)).min(1.0) as f64;
+            sum += f64::from((star_count * omega / (4.0 * std::f32::consts::PI)).min(1.0));
         }
     }
     (sum * 6.0) as f32
@@ -706,7 +706,7 @@ mod tests {
 
         let crowded = star_count_in_cells(1.0e7);
         assert!(crowded < 6.0 * STAR_CELLS * STAR_CELLS + 1.0, "{crowded}");
-        assert!(sky_shader().contains(&format!("const STAR_CELLS: f32 = {:.1};", STAR_CELLS)));
+        assert!(sky_shader().contains(&format!("const STAR_CELLS: f32 = {STAR_CELLS:.1};")));
     }
 
     #[test]
@@ -744,7 +744,7 @@ mod tests {
             eprintln!("skipping: the lobby's sky is not installed");
             return;
         };
-        let peak = pano.rgb.iter().cloned().fold(0.0f32, f32::max);
+        let peak = pano.rgb.iter().copied().fold(0.0f32, f32::max);
         assert!(peak > 100.0, "peak radiance {peak} is too low to be HDR");
     }
 
@@ -943,9 +943,9 @@ mod tests {
         for v in [0.0f32, 0.5, 1.0, 12.5, 250.0, 6000.0] {
             let h = f32_to_f16(v);
 
-            let sign = (h >> 15) as u32;
-            let exp = ((h >> 10) & 0x1f) as i32;
-            let mant = (h & 0x3ff) as u32;
+            let sign = u32::from(h >> 15);
+            let exp = i32::from((h >> 10) & 0x1f);
+            let mant = u32::from(h & 0x3ff);
             let back = if exp == 0 {
                 0.0
             } else {
@@ -967,7 +967,7 @@ mod tests {
 mod render_tests {
     use super::*;
     use crate::renderer::lights::LightsUniform;
-    use crate::renderer::uniforms::{PlayerUpload, PostUpload, ShadowUpload, SkyUpload, UniformBuffer};
+    use crate::renderer::uniforms::{PlayerUpload, PostUpload, ShadowUpload, SkyUpload};
 
     const SIZE: u32 = 9;
 
@@ -1058,7 +1058,7 @@ mod render_tests {
         let depth_view = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: None,
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1228,7 +1228,7 @@ mod render_tests {
         let dv = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: None,
-            size: (256 * SIZE) as u64,
+            size: u64::from(256 * SIZE),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });

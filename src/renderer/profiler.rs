@@ -13,7 +13,7 @@ impl PassTiming {
 }
 
 pub fn ticks_to_ms(ticks: u64, period_ns: f32) -> f64 {
-    (ticks as f64) * (period_ns as f64) / 1_000_000.0
+    (ticks as f64) * f64::from(period_ns) / 1_000_000.0
 }
 
 #[derive(Debug, Default)]

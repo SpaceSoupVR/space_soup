@@ -64,7 +64,7 @@ pub struct Uniforms {
 pub const MAX_BUILDINGS: usize = 8;
 
 pub const MAX_PROXIES: usize = 16;
-const _: () = assert!(MAX_PROXIES % 4 == 0, "`proxy_cards` packs four proxies a vec4");
+const _: () = assert!(MAX_PROXIES.is_multiple_of(4), "`proxy_cards` packs four proxies a vec4");
 
 pub const MAX_PORTALS: usize = 8;
 
@@ -76,7 +76,7 @@ pub const PROBE_PUSH_SIZE: u64 = (MAX_PROBES * 16) as u64;
 
 pub const PROBE_SELECT_SIZE: u64 = std::mem::size_of::<[[[f32; 4]; 3]; MAX_PROBES]>() as u64;
 const _: () = assert!(
-    PROBE_SELECT_OFFSET % 256 == 0,
+    PROBE_SELECT_OFFSET.is_multiple_of(256),
     "a uniform binding's offset must meet the strictest offset alignment a device may ask (256)",
 );
 
@@ -612,7 +612,7 @@ impl UniformBuffer {
         post: &PostUpload,
         player: &PlayerUpload,
     ) {
-        self.upload_scene_with_probes(queue, view_proj, camera_pos, shadow, sky, post, player, None)
+        self.upload_scene_with_probes(queue, view_proj, camera_pos, shadow, sky, post, player, None);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -813,7 +813,7 @@ pub(crate) mod test_support {
 
         let texel: Vec<u8> = (0..4)
             .flat_map(|c| {
-                let u = colour[c] as f32 / 255.0;
+                let u = f32::from(colour[c]) / 255.0;
 
                 let linear = if c == 3 {
                     u
@@ -1027,7 +1027,7 @@ impl ProbeUpload {
     }
 
     pub fn volume(&self, slot: usize) -> u32 {
-        self.boxes.get(slot).map(|b| b[2][3] as u32).unwrap_or(0)
+        self.boxes.get(slot).map_or(0, |b| b[2][3] as u32)
     }
 
     pub fn set(&mut self, slot: usize, layer: u32, centre: Vec3, min: Vec3, max: Vec3) {
@@ -1066,7 +1066,7 @@ impl ProbeUpload {
     }
 
     pub fn layer(&self, slot: usize) -> u32 {
-        self.boxes.get(slot).map(|b| b[0][3] as u32).unwrap_or(0)
+        self.boxes.get(slot).map_or(0, |b| b[0][3] as u32)
     }
 
     pub fn dense_rooms(&self) -> (ProbeUpload, [[f32; 4]; ROOM_TABLE_ROWS]) {
@@ -1083,19 +1083,16 @@ impl ProbeUpload {
         let mut last: Vec<usize> = Vec::new();
         for slot in 0..(self.count as usize).min(MAX_PROBES) {
             let raw = self.boxes[slot][2][3];
-            let room = match rooms.iter().position(|&r| r == raw) {
-                Some(room) => {
-                    put(&mut tables, 4, last[room], slot);
-                    last[room] = slot;
-                    room
-                }
-                None => {
-                    rooms.push(raw);
-                    last.push(slot);
-                    let room = rooms.len() - 1;
-                    put(&mut tables, 0, room, slot);
-                    room
-                }
+            let room = if let Some(room) = rooms.iter().position(|&r| r == raw) {
+                put(&mut tables, 4, last[room], slot);
+                last[room] = slot;
+                room
+            } else {
+                rooms.push(raw);
+                last.push(slot);
+                let room = rooms.len() - 1;
+                put(&mut tables, 0, room, slot);
+                room
             };
             out.boxes[slot][2][3] = room as f32;
         }
@@ -1111,7 +1108,7 @@ impl ProbeUpload {
                 match last_portal[room] {
                     None => put(&mut tables, 8, room, p),
                     Some(prev) => {
-                        let side = if out.portals[prev][1][3] == room as f32 { 0 } else { 1 };
+                        let side = usize::from(out.portals[prev][1][3] != room as f32);
                         put(&mut tables, 12, 2 * prev + side, p);
                     }
                 }
@@ -1281,9 +1278,9 @@ pub fn probe_mip_levels(resolution: u32) -> u32 {
 }
 
 pub(crate) fn f16_to_f32(h: u16) -> f32 {
-    let sign = ((h >> 15) & 1) as u32;
-    let exp = ((h >> 10) & 0x1f) as i32;
-    let mant = (h & 0x3ff) as u32;
+    let sign = u32::from((h >> 15) & 1);
+    let exp = i32::from((h >> 10) & 0x1f);
+    let mant = u32::from(h & 0x3ff);
     let bits = if exp == 0 {
         if mant == 0 {
             sign << 31
@@ -1345,8 +1342,8 @@ pub fn probe_mean_radiance(faces: &[u8], res: u32) -> f32 {
     let cube = decode_probe_faces(faces, res);
     let (mut sum, mut weight) = (0.0f64, 0.0f64);
     for [r, g, b, a] in cube.texels {
-        let a = a.clamp(0.0, 1.0) as f64;
-        sum += (0.2126 * r + 0.7152 * g + 0.0722 * b) as f64 * a;
+        let a = f64::from(a.clamp(0.0, 1.0));
+        sum += f64::from(0.2126 * r + 0.7152 * g + 0.0722 * b) * a;
         weight += a;
     }
     if weight > 0.0 {
@@ -1878,10 +1875,10 @@ mod probe_mip_upload_tests {
         for level in 0..probe_mip_levels(RES) {
             let side = (RES >> level).max(1);
 
-            let row = ((side * 8 + 255) / 256) * 256;
+            let row = (side * 8).div_ceil(256) * 256;
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("probe_mip_readback"),
-                size: (row * side) as u64,
+                size: u64::from(row * side),
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -2040,7 +2037,7 @@ mod dense_room_tests {
             while p >= 0.0 {
                 let pi = p as usize;
                 out.push(pi);
-                let side = if dense.portals[pi][1][3] == room { 0 } else { 1 };
+                let side = usize::from(dense.portals[pi][1][3] != room);
                 p = at(12, 2 * pi + side);
             }
             out
@@ -2092,7 +2089,7 @@ mod building_tests {
         up.set_buildings(&[small, big], None);
         assert_eq!(up.building_count, 0);
 
-        let many: Vec<(Vec3, Vec3)> = (0..MAX_BUILDINGS + 1).map(|i| (Vec3::ZERO, Vec3::splat(1.0 + i as f32))).collect();
+        let many: Vec<(Vec3, Vec3)> = (0..=MAX_BUILDINGS).map(|i| (Vec3::ZERO, Vec3::splat(1.0 + i as f32))).collect();
         up.set_buildings(&many, Some(0));
         assert_eq!(up.building_count as usize, MAX_BUILDINGS);
         assert!((0..MAX_BUILDINGS).all(|slot| up.buildings[slot * 2][3] != 0.0), "the smallest building was kept");

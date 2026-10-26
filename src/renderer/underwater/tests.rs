@@ -9,7 +9,7 @@ use wgpu::util::DeviceExt;
 
 fn sea() -> WaterUniform {
     let lin = |c: [u8; 3]| c.map(|v| {
-        let s = v as f32 / 255.0;
+        let s = f32::from(v) / 255.0;
         if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
     });
     WaterUniform::new(
@@ -20,7 +20,7 @@ fn sea() -> WaterUniform {
 
 fn pond() -> WaterUniform {
     let lin = |c: [u8; 3]| c.map(|v| {
-        let s = v as f32 / 255.0;
+        let s = f32::from(v) / 255.0;
         if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
     });
     WaterUniform::new(
@@ -156,7 +156,7 @@ fn the_film_shows_only_for_a_moment_after_surfacing() {
     assert_eq!(s.update(EyeWater::Under, 1.0), None);
     assert_eq!(s.update(EyeWater::Above, 2.0), Some(0.0));
     assert!(s.update(EyeWater::Above, 2.5).is_some_and(|a| (a - 0.5).abs() < 1e-6));
-    assert_eq!(s.update(EyeWater::Above, 2.0 + FILM_SECONDS as f64 + 0.01), None);
+    assert_eq!(s.update(EyeWater::Above, 2.0 + f64::from(FILM_SECONDS) + 0.01), None);
 
     s.update(EyeWater::Waterline, 5.0);
     assert_eq!(s.update(EyeWater::Above, 6.0), Some(0.0));
@@ -232,7 +232,7 @@ fn frame(dual: bool, w: WaterUniform, eye: Vec3, look: Vec3, behind: [f64; 3], g
         let ib = device.create_buffer_init(&util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&[0u32, 2, 1, 1, 2, 3]), usage: BufferUsages::INDEX });
         (vb, ib)
     });
-    let readback = device.create_buffer(&BufferDescriptor { label: None, size: (256 * SIZE) as u64, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
+    let readback = device.create_buffer(&BufferDescriptor { label: None, size: u64::from(256 * SIZE), usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
 
     let mut encoder = device.create_command_encoder(&Default::default());
     waves.update(&queue, &mut encoder, 12.0);
@@ -327,7 +327,7 @@ fn the_pond_is_murky() {
     let eye = Vec3::new(-26.0, -0.7, -26.0);
     let Some(sea_px) = frame(true, sea(), Vec3::new(0.0, -4.0, 0.0), Vec3::X, [1.0; 3], depth_at(2.0), None) else { return };
     let pond_px = frame(true, pond(), eye, Vec3::X, [1.0; 3], depth_at(2.0), None).unwrap();
-    let sum = |p: [u8; 4]| p[0] as u32 + p[1] as u32 + p[2] as u32;
+    let sum = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
     assert!(sum(centre(&pond_px)) + 150 < sum(centre(&sea_px)), "{:?} vs {:?}", centre(&pond_px), centre(&sea_px));
 }
 
@@ -338,6 +338,6 @@ fn looking_up_shows_the_window_and_round_it_the_mirror() {
     let up = centre(&image);
 
     let corner = image[0];
-    let sum = |p: [u8; 4]| p[0] as u32 + p[1] as u32 + p[2] as u32;
+    let sum = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
     assert!(sum(up) > sum(corner) + 60, "window {up:?} vs mirror {corner:?}");
 }

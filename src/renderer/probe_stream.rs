@@ -64,7 +64,7 @@ pub const PROBE_UPLOADS_PER_FRAME: usize = 2;
 pub fn probe_bytes(res: u32) -> u64 {
     let mut total = 0u64;
     for level in 0..super::uniforms::probe_mip_levels(res) {
-        let r = (res >> level).max(1) as u64;
+        let r = u64::from((res >> level).max(1));
         total += r * r * 8 * 6;
     }
     total
@@ -241,7 +241,7 @@ impl ProbeStream {
         }
         log::info!(
             "reflection probes: {count} in the level, pool of {layers} ({} MB){}",
-            probe_bytes(res) * layers as u64 / (1024 * 1024),
+            probe_bytes(res) * u64::from(layers) / (1024 * 1024),
             if everything_fits { ", all resident" } else { ", streaming" },
         );
 
@@ -320,15 +320,12 @@ impl ProbeStream {
                 }
                 continue;
             }
-            match chain {
-                Some(chain) => {
-                    self.ready.insert(i, chain);
-                }
-                None => {
+            if let Some(chain) = chain {
+                self.ready.insert(i, chain);
+            } else {
 
-                    log::warn!("reflection probe {i} could not be decoded; it is skipped");
-                    self.failed.insert(i);
-                }
+                log::warn!("reflection probe {i} could not be decoded; it is skipped");
+                self.failed.insert(i);
             }
             self.requested.remove(&i);
         }

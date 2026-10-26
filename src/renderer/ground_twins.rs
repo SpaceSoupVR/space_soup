@@ -74,17 +74,17 @@ impl SlopeSplit {
             h = h.wrapping_mul(1099511628211);
         };
         for c in chunks {
-            mix(c.first_index as u64);
-            mix(c.index_count as u64);
+            mix(u64::from(c.first_index));
+            mix(u64::from(c.index_count));
         }
         let step = (verts.len() / 61).max(1);
         for v in verts.iter().step_by(step) {
-            mix(v.position[1].to_bits() as u64);
-            mix(v.normal[1].to_bits() as u64);
+            mix(u64::from(v.position[1].to_bits()));
+            mix(u64::from(v.normal[1].to_bits()));
         }
         let step = (idx.len() / 61).max(1);
         for i in idx.iter().step_by(step) {
-            mix(*i as u64);
+            mix(u64::from(*i));
         }
         (verts.as_ptr() as usize, verts.len(), idx.as_ptr() as usize, idx.len(), threshold_deg.to_bits(), h)
     }

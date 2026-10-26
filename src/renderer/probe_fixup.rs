@@ -7,7 +7,7 @@ use wgpu::{
 
 use super::brush_pipeline::probe_pass;
 
-pub const RECORD_WGSL: &str = r#"
+pub const RECORD_WGSL: &str = r"
 struct ProbeFixup {
 
     texel: vec4<u32>,
@@ -26,13 +26,13 @@ struct ProbeFixup {
 
     codes: vec4<f32>,
 }
-"#;
+";
 
 pub const RECORD_BYTES: u64 = 128;
 
 pub fn lights_block_wgsl(deferred: bool) -> String {
     if !deferred {
-        return r#"
+        return r"
 fn probe_fixup_begin(h: ProbeHit, world_pos: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, probe_lod: f32, trace_room: f32, recolour: bool) -> i32 {
     return -1;
 }
@@ -42,13 +42,13 @@ fn probe_fixup_finish(slot: i32, col: vec4<f32>) {
 fn probe_floor_mirror_pass(col: vec4<f32>, roughness: f32) -> vec4<f32> {
     return col;
 }
-"#
+"
         .to_string();
     }
     format!(
         "{RECORD_WGSL}{}{}",
         floor_mirror_blend_wgsl(),
-        r#"
+        r"
 struct ProbeFixups {
     count: atomic<u32>,
     items: array<ProbeFixup>,
@@ -90,13 +90,13 @@ fn probe_fixup_finish(slot: i32, col: vec4<f32>) {
         probe_fixups.items[slot].col = col;
     }
 }
-"#
+"
     )
 }
 
 fn floor_mirror_blend_wgsl() -> String {
     format!(
-        r#"
+        r"
 const FLOOR_MIRROR_EXPOSURE: f32 = {exposure:?};
 const FLOOR_MIRROR_REACH: f32 = 0.6;
 {linear}
@@ -128,7 +128,7 @@ fn floor_mirror_blend(
     }}
     return vec4<f32>(mix(col.rgb, m.rgb / (m.a * FLOOR_MIRROR_EXPOSURE), cover), max(col.a, cover));
 }}
-"#,
+",
         exposure = probe_pass::MIRROR_EXPOSURE,
         linear = probe_pass::eye_linear_depth_wgsl(),
     )
@@ -146,7 +146,7 @@ fn compute_wgsl_inlined() -> String {
 
 fn compute_wgsl_with_entry(entry: &str) -> String {
     format!(
-        r#"
+        r"
 {lights}
 {record}
 struct ProbeFixupList {{
@@ -165,7 +165,7 @@ struct ProbeFixupList {{
 const FIXUP_DEPTH_TOLERANCE: f32 = {tolerance:?};
 
 {entry}
-"#,
+",
 
         lights = super::lights::wgsl_lights_block_with(
             0,
@@ -179,7 +179,7 @@ const FIXUP_DEPTH_TOLERANCE: f32 = {tolerance:?};
     )
 }
 
-const FIXUP_ENTRY: &str = r#"
+const FIXUP_ENTRY: &str = r"
 const FIXUP_RIM: u32 = 4u;
 const FIXUP_FAR: u32 = 5u;
 const FIXUP_EDGE: u32 = 6u;
@@ -416,9 +416,9 @@ fn fixup(@builtin(global_invocation_id) id: vec3<u32>) {
     let a = clamp(col.a, 0.0, 1.0);
     textureStore(probe_out, texel, vec4<f32>(probe_pass_compress(col.rgb * 1.0 + capsule_glow) * a, a));
 }
-"#;
+";
 
-const FIXUP_ENTRY_INLINED: &str = r#"
+const FIXUP_ENTRY_INLINED: &str = r"
 fn probe_subsample(primary: vec4<f32>, world_pos: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, probe_lod: f32, trace_room: f32, retest: bool) -> vec4<f32> {
     if (retest) {
         let h = probe_trace(world_pos, d, trace_room, roughness);
@@ -496,7 +496,7 @@ fn fixup(@builtin(global_invocation_id) id: vec3<u32>) {
     let a = clamp(col.a, 0.0, 1.0);
     textureStore(probe_out, texel, vec4<f32>(probe_pass_compress(col.rgb * 1.0 + capsule_glow) * a, a));
 }
-"#;
+";
 
 pub const FIXUP_CUTS: &[(&str, &[(&str, &str)])] = &[
 
@@ -537,7 +537,7 @@ fn compute_wgsl_with_cut(cut: &str) -> Option<String> {
     }
     let (_, edits) = FIXUP_CUTS.iter().find(|(label, _)| *label == cut)?;
     let mut src = compute_wgsl();
-    for (from, to) in edits.iter() {
+    for (from, to) in *edits {
         if src.matches(from).count() != 1 {
             return None;
         }
@@ -578,7 +578,7 @@ pub struct ProbeFixups {
     args_bind_group: BindGroup,
 }
 
-const ARGS_WGSL: &str = r#"
+const ARGS_WGSL: &str = r"
 @group(0) @binding(0) var<storage, read> list_count: array<u32>;
 @group(0) @binding(1) var<storage, read_write> args: array<u32>;
 const CAPACITY: u32 = CAPACITY_VALUE;
@@ -589,7 +589,7 @@ fn args_main() {
     args[1] = 1u;
     args[2] = 1u;
 }
-"#;
+";
 
 impl ProbeFixups {
 
@@ -597,7 +597,7 @@ impl ProbeFixups {
         let capacity = (texels / 2).max(64);
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("probe_fixups"),
-            size: 16 + capacity as u64 * RECORD_BYTES,
+            size: 16 + u64::from(capacity) * RECORD_BYTES,
 
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             mapped_at_creation: false,

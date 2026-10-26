@@ -542,7 +542,7 @@ fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_bake
             let baked = sun_is_baked && l.kind == LightKind::Directional;
 
             let marker = match l.mask_channel {
-                Some(c) => 2.0 + c as f32,
+                Some(c) => 2.0 + f32::from(c),
                 None if baked => 1.0,
                 None if !l.in_level_bake => -1.0,
                 None => 0.0,
@@ -753,7 +753,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let ground_trace_readings = crate::renderer::ground_map::GROUND_TRACE_READINGS;
     let ground_trace_steps = crate::renderer::ground_map::GROUND_TRACE_MAX_STEPS;
     format!(
-        r#"
+        r"
 {precision_aliases}
 
 const HF_MAX: f32 = 60000.0;
@@ -3902,7 +3902,7 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
     }}
     return vec3<f32>(lit);
 }}
-"#
+"
     )
 }
 
@@ -4138,7 +4138,7 @@ mod budget_tests {
     #[test]
     fn ranking_is_stable_for_equal_lights() {
 
-        let ls: Vec<Light> = (0..MAX_LIGHTS + 4).map(|i| point(3.0, 2.0)).collect();
+        let ls: Vec<Light> = (0..MAX_LIGHTS + 4).map(|_i| point(3.0, 2.0)).collect();
         let _ = ls;
         let ls: Vec<Light> = (0..MAX_LIGHTS + 4)
             .map(|i| light(LightKind::Point, Vec3::new(3.0, 0.0, i as f32 * 0.0), 2.0))
@@ -4552,8 +4552,8 @@ mod probe_blend_tests {
     #[test]
     fn the_portal_fades_come_from_the_constants() {
         let code = shader();
-        assert!(code.contains(&format!("const PORTAL_FADE: f32 = {:?};", PROBE_PORTAL_FADE)));
-        assert!(code.contains(&format!("const PORTAL_SIDE_FADE: f32 = {:?};", PROBE_PORTAL_SIDE_FADE)));
+        assert!(code.contains(&format!("const PORTAL_FADE: f32 = {PROBE_PORTAL_FADE:?};")));
+        assert!(code.contains(&format!("const PORTAL_SIDE_FADE: f32 = {PROBE_PORTAL_SIDE_FADE:?};")));
     }
 
     fn portal_high_weight(t: f32, lo: f32, hi: f32, side: f32) -> f32 {
@@ -4570,7 +4570,7 @@ mod probe_blend_tests {
         let (lo, hi) = (2.5, 3.1);
         assert_eq!(portal_high_weight(lo - PROBE_PORTAL_FADE, lo, hi, 0.0), 0.0);
         assert_eq!(portal_high_weight(hi + PROBE_PORTAL_FADE, lo, hi, 0.0), 1.0);
-        assert!((portal_high_weight((lo + hi) * 0.5, lo, hi, 0.0) - 0.5).abs() < 1e-6);
+        assert!((portal_high_weight(f32::midpoint(lo, hi), lo, hi, 0.0) - 0.5).abs() < 1e-6);
         let mut last = 0.0;
         for i in 0..=100 {
             let t = lo - PROBE_PORTAL_FADE + (hi - lo + 2.0 * PROBE_PORTAL_FADE) * i as f32 / 100.0;
@@ -4579,7 +4579,7 @@ mod probe_blend_tests {
             last = w;
         }
 
-        assert_eq!(portal_high_weight((lo + hi) * 0.5, lo, hi, PROBE_PORTAL_SIDE_FADE), 0.0);
+        assert_eq!(portal_high_weight(f32::midpoint(lo, hi), lo, hi, PROBE_PORTAL_SIDE_FADE), 0.0);
     }
 
     fn probe_near_weight(best_dist_sq: f32, second_dist_sq: f32, band: f32) -> f32 {
@@ -5040,7 +5040,7 @@ mod baked_gloss_tests {
 
     fn terminator_aa(nl: f32, w: f32) -> (f32, f32) {
         let facing = ((nl + w) / (2.0 * w).max(1e-6)).clamp(0.0, 1.0);
-        let lambert = if nl.abs() < w { 0.5 * (nl + w) * facing } else { nl.max(0.0) };
+        let lambert = if nl.abs() < w { f32::midpoint(nl, w) * facing } else { nl.max(0.0) };
         (lambert, facing)
     }
 
@@ -5062,12 +5062,12 @@ mod baked_gloss_tests {
                 let (mut sum, mut lit) = (0.0f64, 0usize);
                 for i in 0..n {
                     let x = nl + w * (2.0 * (i as f32 + 0.5) / n as f32 - 1.0);
-                    sum += x.max(0.0) as f64;
-                    lit += (x > 0.0) as usize;
+                    sum += f64::from(x.max(0.0));
+                    lit += usize::from(x > 0.0);
                 }
                 let (lambert, facing) = terminator_aa(nl, w);
-                assert!((lambert as f64 - sum / n as f64).abs() < 1e-4, "nl {nl} w {w}: {lambert} vs {}", sum / n as f64);
-                assert!((facing as f64 - lit as f64 / n as f64).abs() < 1e-3, "nl {nl} w {w}: {facing}");
+                assert!((f64::from(lambert) - sum / f64::from(n)).abs() < 1e-4, "nl {nl} w {w}: {lambert} vs {}", sum / f64::from(n));
+                assert!((f64::from(facing) - lit as f64 / f64::from(n)).abs() < 1e-3, "nl {nl} w {w}: {facing}");
             }
         }
     }
@@ -5280,7 +5280,7 @@ mod probe_trace_gpu_tests {
         let code = format!(
             "{}\n{}",
             wgsl_lights_block(0, 1),
-            r#"
+            r"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> hits: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -5295,7 +5295,7 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
     hits[id.x * 4u + 2u] = vec4<f32>(h.rim, select(0.0, 1.0, probe_hit_rim_went_through(h)), h.t, h.rim_t);
     hits[id.x * 4u + 3u] = vec4<f32>(f32(probe_hit_edge(h)), h.edge_cover, select(0.0, 1.0, probe_hit_edge_hit(h)), h.edge_t);
 }
-"#
+"
         );
         let code = code
             .replace("PIXEL_FOOTPRINT", &format!("{footprint:?}"))
@@ -5568,14 +5568,14 @@ mod ground_trace_gpu_tests {
         let code = format!(
             "{}\n{}",
             wgsl_lights_block(0, 1),
-            r#"
+            r"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> hits: array<f32>;
 @compute @workgroup_size(1)
 fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
     hits[id.x] = ground_trace(rays[id.x * 2u].xyz, rays[id.x * 2u + 1u].xyz);
 }
-"#
+"
         );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ground_trace_test"),
@@ -5661,7 +5661,7 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
         for (i, (&(e, d), &g)) in rays.iter().zip(&gpu).enumerate() {
             let twin = ground_map::trace(&chain, map.min, map.max, map.top, e, d).t;
             let g = (g >= 0.0).then_some(g);
-            hits += g.is_some() as usize;
+            hits += usize::from(g.is_some());
             match (g, twin) {
                 (Some(a), Some(b)) if (a - b).abs() <= 0.01 + 0.001 * b => {}
                 (None, None) => {}
@@ -5718,7 +5718,7 @@ mod proxy_field_gpu_tests {
         let code = format!(
             "{}\n{}",
             wgsl_lights_block(0, 1),
-            r#"
+            r"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> hits: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -5737,7 +5737,7 @@ fn walk_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     hits[id.x] = vec4<f32>(probe_proxy_field(o, d, half, t_in, t_out, 0, 0.0), 0.0);
 }
-"#
+"
         );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -5963,7 +5963,7 @@ mod proxy_card_gpu_tests {
         u.proxy_fields[0] = slots[0];
         let relit = RELIT.with(|r| r.borrow().clone());
         let options =
-            LightsBlockOptions { card_tests_filtered: FILTERED.with(|f| f.get()), card_relit: relit.is_some(), ..Default::default() };
+            LightsBlockOptions { card_tests_filtered: FILTERED.with(std::cell::Cell::get), card_relit: relit.is_some(), ..Default::default() };
 
         let lights_uniform = LightsUniform::new(&device);
         let shadow_map = crate::renderer::shadow::ShadowMap::with_dimension(&device, 8);
@@ -5973,7 +5973,7 @@ mod proxy_card_gpu_tests {
         let code = format!(
             "{}\n{}",
             wgsl_lights_block_with(0, 1, options),
-            r#"
+            r"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -5982,7 +5982,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
     probe_eye_distance = 1.0;
     out[id.x] = probe_card_colour(0, rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz), rays[id.x * 2u + 1u].w, 0.0);
 }
-"#
+"
         );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -5999,7 +5999,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
-        let packed: Vec<[f32; 4]> = rays.iter().flat_map(|(h, d)| [[h.x, h.y, h.z, FOOTPRINT.with(|f| f.get())], [d.x, d.y, d.z, HIT_T.with(|f| f.get())]]).collect();
+        let packed: Vec<[f32; 4]> = rays.iter().flat_map(|(h, d)| [[h.x, h.y, h.z, FOOTPRINT.with(std::cell::Cell::get)], [d.x, d.y, d.z, HIT_T.with(std::cell::Cell::get)]]).collect();
         let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&packed),
@@ -6659,7 +6659,7 @@ fn edge_main(@builtin(global_invocation_id) id: vec3<u32>) {{
             eprintln!("no GPU adapter; skipping");
             return;
         };
-        let most = |v: &[f32]| v.iter().cloned().fold(0.0f32, f32::max);
+        let most = |v: &[f32]| v.iter().copied().fold(0.0f32, f32::max);
         let largest = flat_was.iter().zip(&flat_now).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         eprintln!(
             "PAST THE POOL: a bump's step lights it up to {:.3}, the plane's {:.2e}; a flat pixel's cone moves {largest:.2e} (lit {:.3} at most)",
@@ -6867,14 +6867,14 @@ mod capsule_ambient_tests {
         let code = format!(
             "{}\n{}",
             super::wgsl_lights_block(0, 1),
-            r#"
+            r"
 @group(1) @binding(0) var<storage, read> pts: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> out: array<f32>;
 @compute @workgroup_size(1)
 fn ambient_main(@builtin(global_invocation_id) id: vec3<u32>) {
     out[id.x] = capsule_ambient(pts[id.x * 2u].xyz, pts[id.x * 2u + 1u].xyz);
 }
-"#
+"
         );
         let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -6964,7 +6964,7 @@ fn ambient_main(@builtin(global_invocation_id) id: vec3<u32>) {
                     .fold((0, 0.0f32), |best, (i, s)| if s > best.1 { (i, s) } else { best });
                 assert!(step < 0.004, "arm out {arm_out}: a step of {step:.4} at {:?}", line[i].0);
 
-                let darkest = vis.iter().cloned().fold(1.0f32, f32::min);
+                let darkest = vis.iter().copied().fold(1.0f32, f32::min);
                 assert!(darkest < 0.97, "arm out {arm_out}: nothing darkened ({darkest})");
             }
         }
@@ -7055,7 +7055,7 @@ mod capsule_reflection_tests {
         let code = format!(
             "{}\n{}",
             super::wgsl_lights_block(0, 1),
-            r#"
+            r"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -7065,7 +7065,7 @@ fn reflect_main(@builtin(global_invocation_id) id: vec3<u32>) {
     out[id.x * 2u] = r;
     out[id.x * 2u + 1u] = vec4<f32>(capsule_glow * r.a, 0.0);
 }
-"#
+"
         );
         let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -7203,7 +7203,7 @@ fn reflect_main(@builtin(global_invocation_id) id: vec3<u32>) {
             let rays: Vec<(Vec3, Vec3, f32)> = (-n..=n)
                 .flat_map(|i| (-n..=n).map(move |j| (Vec3::new(i as f32 * step, 1.0 + j as f32 * step, -2.0), Vec3::Z, f)))
                 .collect();
-            let Some(got) = reflect(&[glass_only.clone()], &rays) else {
+            let Some(got) = reflect(std::slice::from_ref(&glass_only), &rays) else {
                 eprintln!("no GPU adapter; skipping");
                 return;
             };
@@ -7258,7 +7258,7 @@ fn reflect_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let code = format!(
             "{}\n{}",
             super::wgsl_lights_block(0, 1),
-            r#"
+            r"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -7267,7 +7267,7 @@ fn seen_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let r = capsule_reflection(rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz), 0.0, vec3<f32>(3.14159265), vec4<f32>(0.0));
     out[id.x] = vec4<f32>(capsule_glow * r.a, 0.0);
 }
-"#
+"
         );
         let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -7513,7 +7513,7 @@ mod surface_relit_tests {
         let code = format!(
             "{}\n{}",
             super::wgsl_lights_block(0, 1),
-            r#"
+            r"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -7522,7 +7522,7 @@ fn relit_main(@builtin(global_invocation_id) id: vec3<u32>) {
     probe_eye_distance = 2.0;
     out[id.x] = vec4<f32>(probe_surface_relit(rays[id.x * 2u].xyz, rays[id.x * 2u + 1u].xyz, 0.05, 2.0), pixel_footprint);
 }
-"#
+"
         );
         let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -7704,7 +7704,7 @@ mod tent_tests {
         };
         let code = format!(
             "{block}\n{}",
-            r#"
+            r"
 @group(1) @binding(0) var test_depth: texture_depth_2d;
 @group(1) @binding(1) var<storage, read> pts: array<vec4<f32>>;
 @group(1) @binding(2) var<storage, read_write> out: array<vec4<f32>>;
@@ -7721,7 +7721,7 @@ fn tent_main(@builtin(global_invocation_id) id: vec3<u32>) {
         pcf_tile_tent_half_at(test_depth, tile, grid, p.xyz),
     );
 }
-"#
+"
         );
         let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
@@ -7818,7 +7818,7 @@ fn tent_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     fn spread(got: &[[f32; 4]], k: usize) -> (f32, f32) {
         let d: Vec<f32> = got.iter().map(|r| (r[k] - r[0]).abs()).collect();
-        (d.iter().cloned().fold(0.0, f32::max), d.iter().sum::<f32>() / d.len() as f32)
+        (d.iter().copied().fold(0.0, f32::max), d.iter().sum::<f32>() / d.len() as f32)
     }
 
     #[test]

@@ -115,7 +115,7 @@ mod tests {
         }
         for pair in maps.windows(2) {
             let (lower, higher) = (&pair[0].2, &pair[1].2);
-            let fragments = |t: &[u8]| t.chunks(2).map(|d| d[0] as f32 * d[1] as f32).sum::<f32>();
+            let fragments = |t: &[u8]| t.chunks(2).map(|d| f32::from(d[0]) * f32::from(d[1])).sum::<f32>();
             assert!(fragments(higher) < fragments(lower), "a higher level shaded no less");
             assert!(lower.iter().zip(higher.iter()).all(|(a, b)| b <= a), "a higher level was finer somewhere");
         }

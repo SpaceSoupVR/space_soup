@@ -64,9 +64,9 @@ impl GltfClip {
             .map(|(j, &(bt, br, bs))| match self.joints.get(j) {
                 None => (bt, br, bs),
                 Some(tr) => (
-                    tr.translation.as_ref().and_then(|k| k.sample(t, |a, b, f| a.lerp(b, f))).unwrap_or(bt),
-                    tr.rotation.as_ref().and_then(|k| k.sample(t, |a, b, f| a.slerp(b, f))).unwrap_or(br),
-                    tr.scale.as_ref().and_then(|k| k.sample(t, |a, b, f| a.lerp(b, f))).unwrap_or(bs),
+                    tr.translation.as_ref().and_then(|k| k.sample(t, glam::Vec3::lerp)).unwrap_or(bt),
+                    tr.rotation.as_ref().and_then(|k| k.sample(t, glam::Quat::slerp)).unwrap_or(br),
+                    tr.scale.as_ref().and_then(|k| k.sample(t, glam::Vec3::lerp)).unwrap_or(bs),
                 ),
             })
             .collect()
@@ -84,7 +84,7 @@ pub(super) fn read_clip(anim: &gltf::Animation, buffers: &[gltf::buffer::Data], 
     for channel in anim.channels() {
         let Some(j) = joint_of(channel.target().node().index()) else { continue };
         let reader = channel.reader(|b| Some(&buffers[b.index()]));
-        let Some(times) = reader.read_inputs().map(|t| t.collect::<Vec<f32>>()) else { continue };
+        let Some(times) = reader.read_inputs().map(std::iter::Iterator::collect::<Vec<f32>>) else { continue };
         duration = duration.max(times.last().copied().unwrap_or(0.0));
         let interp = channel.sampler().interpolation();
         let cubic = interp == gltf::animation::Interpolation::CubicSpline;

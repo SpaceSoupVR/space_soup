@@ -24,7 +24,7 @@ impl DynamicBuffer {
                 mapped_at_creation: false,
             }),
             size,
-            label: descriptor.label.map(|s| s.to_string()),
+            label: descriptor.label.map(std::string::ToString::to_string),
         }
     }
 

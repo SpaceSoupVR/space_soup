@@ -61,12 +61,9 @@ pub fn relit_probe_source(
             return Some(faces);
         }
         let unlit;
-        let lamps = match lamps(i) {
-            Some(l) => l,
-            None => {
-                unlit = vec![0u8; faces.len()];
-                unlit
-            }
+        let lamps = if let Some(l) = lamps(i) { l } else {
+            unlit = vec![0u8; faces.len()];
+            unlit
         };
         Some(relight_probe_faces(&faces, &lamps, k))
     })
@@ -174,7 +171,7 @@ impl TimeOfDayRuntime {
             }
             self.forced = Some(forced);
         }
-        self.seconds += dt.max(0.0) as f64;
+        self.seconds += f64::from(dt.max(0.0));
         let hour = self.hour();
         let moved = self.requested_hour.is_none_or(|h| {
             let d = (hour - h).rem_euclid(24.0);

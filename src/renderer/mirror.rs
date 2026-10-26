@@ -268,7 +268,7 @@ impl MirrorPipeline {
 }
 
 fn mirror_shader() -> String {
-    r#"
+    r"
 struct CameraUniform { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
@@ -303,6 +303,6 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     return textureSample(mirror_tex, mirror_samp, uv);
 }
-"#
+"
     .to_string()
 }

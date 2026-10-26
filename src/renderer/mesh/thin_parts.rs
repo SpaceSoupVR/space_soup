@@ -98,7 +98,7 @@ pub fn split_thin_parts(vertices: &[MeshVertex], indices: &[u32]) -> Option<Thin
     let mut normal = vec![glam::Vec3::ZERO; points];
     let mut authored = vec![glam::Vec3::ZERO; points];
     for t in &tris {
-        let [a, b, c] = t.map(|i| pos(i));
+        let [a, b, c] = t.map(&pos);
         let n = (b - a).cross(c - a);
         for &i in t {
             normal[weld[i]] += n;
@@ -114,7 +114,7 @@ pub fn split_thin_parts(vertices: &[MeshVertex], indices: &[u32]) -> Option<Thin
     }
 
     let flat: Vec<bool> = normal.iter().map(|n| n.length_squared() < 1e-24).collect();
-    for n in normal.iter_mut() {
+    for n in &mut normal {
         *n = n.normalize_or_zero();
     }
 
@@ -301,14 +301,14 @@ mod shipped_lamps {
             let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
             if let Some(mesh) = node.mesh() {
                 for prim in mesh.primitives() {
-                    let transmission = prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0);
+                    let transmission = prim.material().transmission().map_or(0.0, |t| t.transmission_factor());
                     if transmission > 0.0 {
                         continue;
                     }
                     let r = prim.reader(|b| Some(&buffers[b.index()]));
                     let p: Vec<Vec3> = r.read_positions().unwrap().map(|v| world.transform_point3(Vec3::from(v))).collect();
                     let n: Vec<Vec3> = r.read_normals().unwrap().map(|v| world.transform_vector3(Vec3::from(v)).normalize()).collect();
-                    let idx: Vec<u32> = r.read_indices().map(|i| i.into_u32().collect()).unwrap_or_else(|| (0..p.len() as u32).collect());
+                    let idx: Vec<u32> = r.read_indices().map_or_else(|| (0..p.len() as u32).collect(), |i| i.into_u32().collect());
                     let v = p.iter().zip(&n).map(|(p, n)| MeshVertex { position: (*p).into(), normal: (*n).into(), uv: [0.0; 2], uv2: [0.0; 2], emissive: 0, uv2_rect: MeshVertex::WHOLE_ATLAS }).collect();
                     out.push((v, idx));
                 }

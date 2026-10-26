@@ -22,7 +22,7 @@ pub fn short_name(path: &str) -> String {
 
 pub fn worth_logging(short: &str) -> bool {
     let per_core =
-        short.starts_with("device/cpu") && short.as_bytes().get(10).is_some_and(|b| b.is_ascii_digit());
+        short.starts_with("device/cpu") && short.as_bytes().get(10).is_some_and(u8::is_ascii_digit);
     !per_core
 }
 

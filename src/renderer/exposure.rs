@@ -145,13 +145,10 @@ impl EyeAdaptation {
                 }
             }
         }
-        let log = match self.room_at(head) {
-            Some(room) => self.room_log(room, head, gaze, extra),
-            None => {
-                let samples: Vec<(f32, f32)> =
-                    sky_bins(&self.sky).into_iter().chain(extra.iter().copied()).map(|b| weighted(b, gaze, 1.0, self.log_floor())).collect();
-                band_log(samples)
-            }
+        let log = if let Some(room) = self.room_at(head) { self.room_log(room, head, gaze, extra) } else {
+            let samples: Vec<(f32, f32)> =
+                sky_bins(&self.sky).into_iter().chain(extra.iter().copied()).map(|b| weighted(b, gaze, 1.0, self.log_floor())).collect();
+            band_log(samples)
         };
         log.map_or(REFERENCE_LUMINANCE, f32::exp)
     }
@@ -517,7 +514,7 @@ mod tests {
         assert!((face - 4.0 * std::f32::consts::PI / 6.0).abs() < 1e-4, "{face}");
         let tiny = rectangle_solid_angle(10.0, (-0.05, 0.05), (-0.05, 0.05));
         assert!((tiny / (0.01 / 100.0) - 1.0).abs() < 1e-3, "{tiny}");
-        assert_eq!(rectangle_solid_angle(1.0, (2.0, 3.0), (2.0, 3.0)) > 0.0, true);
+        assert!(rectangle_solid_angle(1.0, (2.0, 3.0), (2.0, 3.0)) > 0.0);
     }
 
     #[test]

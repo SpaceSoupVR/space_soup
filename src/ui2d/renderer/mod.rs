@@ -58,10 +58,10 @@ impl Renderer {
                     let z = i as u16;
                     match item {
                         crate::ui2d::Item::Shape(shape) => {
-                            a.0.push((z, area, shape.shape, shape.color))
+                            a.0.push((z, area, shape.shape, shape.color));
                         }
                         crate::ui2d::Item::Image(image) => {
-                            a.1.push((z, area, image.shape, image.image, image.color, false))
+                            a.1.push((z, area, image.shape, image.image, image.color, false));
                         }
                         crate::ui2d::Item::Text(text) => {
                             a.1.extend(atlas.text.get(text, scale_factor).into_iter().map(
@@ -75,7 +75,7 @@ impl Renderer {
                                     };
                                     (z, area, shape, image, Some(color), true)
                                 },
-                            ))
+                            ));
                         }
                     }
                     a

@@ -110,8 +110,7 @@ impl Text {
             let descent = span
                 .font
                 .horizontal_line_metrics(span.font_size)
-                .map(|lm| lm.descent)
-                .unwrap_or(0.0);
+                .map_or(0.0, |lm| lm.descent);
 
             for c in span.text.chars() {
                 if c == '\n' {

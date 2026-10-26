@@ -88,14 +88,14 @@ impl Default for Color3 {
 impl Color3 {
     pub fn to_linear(&self) -> [f32; 4] {
         let c = |v: u8| {
-            let f = v as f32 / 255.0;
+            let f = f32::from(v) / 255.0;
             if f <= 0.04045 {
                 f / 12.92
             } else {
                 ((f + 0.055) / 1.055).powf(2.4)
             }
         };
-        [c(self.0), c(self.1), c(self.2), self.3 as f32 / 255.0]
+        [c(self.0), c(self.1), c(self.2), f32::from(self.3) / 255.0]
     }
 }
 

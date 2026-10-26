@@ -133,7 +133,7 @@ impl ParticlePipeline {
 
 fn particle_shader() -> String {
     format!(
-        r#"
+        r"
 struct ParticleFrame {{
     right: vec4<f32>,
     up: vec4<f32>,
@@ -212,7 +212,7 @@ struct VOut {{
     let rgb = mix(in.color.rgb * lit, in.color.rgb, in.glow) + in.color.rgb * in.glow * core * 0.8;
     return vec4<f32>(rgb, in.color.a * edge);
 }}
-"#,
+",
         lights_block = wgsl_lights_block(0, 1)
     )
 }

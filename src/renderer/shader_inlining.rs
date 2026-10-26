@@ -112,7 +112,7 @@ struct Live<'a> {
 impl Live<'_> {
 
     fn walk(&mut self, block: &Block) -> bool {
-        for statement in block.iter() {
+        for statement in block {
             let ends = match statement {
                 Statement::Emit(range) => {
                     for h in range.clone() {

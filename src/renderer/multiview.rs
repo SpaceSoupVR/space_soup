@@ -30,7 +30,7 @@ pub fn as_multiview(src: &str) -> String {
             return out;
         };
         let params = &rest[open + 1..close];
-        out.push_str(&rest[..open + 1]);
+        out.push_str(&rest[..=open]);
         out.push_str(params);
         if params.trim().is_empty() {
             out.push_str(VIEW_PARAM);
