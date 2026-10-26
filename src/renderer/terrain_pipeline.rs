@@ -936,7 +936,7 @@ fn half_of_int(n: i32) -> u16 {
     let sign = if n < 0 { 0x8000 } else { 0 };
     let m = n.unsigned_abs();
     let e = 31 - m.leading_zeros();
-    sign | (((e + 15) as u16) << 10) | (((m << (10 - e)) & 0x3ff) as u16)
+    sign | (((e + 15) as u16) << 10) | ((if e >= 10 { m >> (e - 10) } else { m << (10 - e) } & 0x3ff) as u16)
 }
 
 /// Rows `from..to` of the deform map's GPU texels from its `[height, wet]`
