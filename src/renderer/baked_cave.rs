@@ -1,0 +1,2009 @@
+use bytemuck::{Pod, Zeroable};
+use glam::{Mat4, Vec3, Vec4};
+use wgpu::*;
+
+use super::lights::LightsBlockOptions;
+use super::multiview::ViewMode;
+
+pub const SHADING: &str = "baked_cave";
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq)]
+pub struct BakedCaveVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+
+    pub planes: [u8; 4],
+
+    pub uv1: [f32; 2],
+
+    pub ground_uv: [f32; 2],
+
+    pub weights: [u8; 4],
+
+    pub aux: [u8; 4],
+
+    pub misc: [u8; 4],
+
+    pub cliff: [u8; 4],
+}
+
+impl BakedCaveVertex {
+    pub const ATTRIBS: [VertexAttribute; 9] = vertex_attr_array![
+        0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4, 3 => Float32x2, 4 => Float32x2, 5 => Unorm8x4, 6 => Unorm8x4, 7 => Uint8x4,
+        8 => Unorm8x4
+    ];
+
+    pub fn layout() -> VertexBufferLayout<'static> {
+        VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as BufferAddress,
+            step_mode: VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_file(
+        position: [f32; 3],
+        normal: [f32; 3],
+        uv1: [f32; 2],
+        colour0: [u8; 4],
+        colour1: [u8; 4],
+        ground: ([f32; 2], u8),
+        planes: Option<([u8; 3], [u8; 4])>,
+        glow: Option<[u8; 4]>,
+    ) -> Self {
+        let (hue, saturation) = glow.map_or((0, 0), |c| glow_hue_saturation([c[0], c[1], c[2]]));
+        let [a, b, c, packed] = colour0;
+        let rest = 255u16.saturating_sub(a as u16 + b as u16 + c as u16) as u8;
+        let axis = (packed >> 6).min(2);
+        let (own, cliff) = match planes {
+            Some((own, cliff)) if own != [0, 0, 0] => (own, cliff),
+            _ => ([(axis == 0) as u8 * 255, (axis == 1) as u8 * 255, (axis == 2) as u8 * 255], [0; 4]),
+        };
+        Self {
+            position,
+            normal,
+            planes: [own[0], own[1], own[2], cliff[3]],
+            cliff: [cliff[0], cliff[1], cliff[2], saturation],
+            uv1,
+            ground_uv: ground.0,
+            weights: [a, b, c, rest],
+            aux: colour1,
+            misc: [axis, packed & 63, ground.1, hue],
+        }
+    }
+}
+
+fn srgb_to_linear(byte: u8) -> f32 {
+    let c = byte as f32 / 255.0;
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+pub fn glow_hue_saturation(rgb: [u8; 3]) -> (u8, u8) {
+    let [r, g, b] = rgb.map(srgb_to_linear);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let spread = max - min;
+    if max <= 0.0 || spread <= 0.0 {
+        return (0, 0);
+    }
+    let sixth = if max == r { ((g - b) / spread).rem_euclid(6.0) } else if max == g { (b - r) / spread + 2.0 } else { (r - g) / spread + 4.0 };
+
+    (((sixth / 6.0) * 255.0).round() as u8, ((spread / max) * 255.0).round() as u8)
+}
+
+#[cfg(test)]
+fn glow_tint(hue: u8, saturation: u8) -> [f32; 3] {
+    let h = hue as f32 / 255.0;
+    let s = saturation as f32 / 255.0;
+    [0.0f32, 2.0 / 3.0, 1.0 / 3.0].map(|k| {
+        let pure = (((h + k).fract() * 6.0 - 3.0).abs() - 1.0).clamp(0.0, 1.0);
+        1.0 + (pure - 1.0) * s
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaveChunk {
+    pub first: u32,
+    pub count: u32,
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+
+    pub lip: u32,
+
+    pub planes: CavePlanes,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CavePlanes {
+
+    One,
+
+    Own,
+
+    #[default]
+    Cliff,
+}
+
+impl CavePlanes {
+    pub const ALL: [CavePlanes; 3] = [CavePlanes::One, CavePlanes::Own, CavePlanes::Cliff];
+
+    pub fn of(corners: [&BakedCaveVertex; 3]) -> CavePlanes {
+        let mut read = [false; 3];
+        for v in corners {
+            let total = v.planes[0] as u32 + v.planes[1] as u32 + v.planes[2] as u32;
+
+            if v.planes[3] > 0 || total != 255 {
+                return CavePlanes::Cliff;
+            }
+            for k in 0..3 {
+                read[k] |= v.planes[k] as f32 / 255.0 > WEIGHT_EPS;
+            }
+        }
+        match read.iter().filter(|r| **r).count() {
+            1 => CavePlanes::One,
+            _ => CavePlanes::Own,
+        }
+    }
+}
+
+pub const WEIGHT_EPS: f32 = 0.004;
+
+pub fn partition(vertices: &[BakedCaveVertex], indices: &[u32], chunks: &[CaveChunk]) -> (Vec<u32>, Vec<CaveChunk>) {
+    let mut out = Vec::with_capacity(indices.len());
+    let mut table = Vec::new();
+    let class_of = |c: &CaveChunk, at: usize| {
+        let surface_end = (c.first + c.count - c.lip.min(c.count)) as usize;
+        if at >= surface_end {
+            return CavePlanes::Cliff;
+        }
+        let corner = |k: usize| vertices.get(indices[at + k] as usize);
+        match (corner(0), corner(1), corner(2)) {
+            (Some(a), Some(b), Some(d)) => CavePlanes::of([a, b, d]),
+            _ => CavePlanes::Cliff,
+        }
+    };
+    for planes in CavePlanes::ALL {
+        for c in chunks {
+            let first = out.len() as u32;
+            let run = c.first as usize..(c.first + c.count) as usize;
+            for at in run.step_by(3) {
+                if at + 2 < indices.len() && class_of(c, at) == planes {
+                    out.extend_from_slice(&indices[at..at + 3]);
+                }
+            }
+            let count = out.len() as u32 - first;
+            if count > 0 {
+                let lip = if planes == CavePlanes::Cliff { c.lip.min(count) } else { 0 };
+                table.push(CaveChunk { first, count, min: c.min, max: c.max, lip, planes });
+            }
+        }
+    }
+    (out, table)
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BakedCaveMeta {
+    pub chunks: Vec<CaveChunk>,
+    pub emissive: bool,
+}
+
+impl BakedCaveMeta {
+
+    pub fn parse(extras: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(extras).ok()?;
+        let ss = v.get("space_soup")?;
+        if ss.get("shading").and_then(|s| s.as_str()) != Some(SHADING) {
+            return None;
+        }
+        let cave = ss.get("cave");
+        let chunks = cave
+            .and_then(|c| c.get("chunks"))
+            .and_then(|c| c.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|c| {
+                        let c = c.as_array()?;
+                        let f = |i: usize| c.get(i).and_then(|v| v.as_f64());
+                        Some(CaveChunk {
+                            first: f(0)? as u32,
+                            count: f(1)? as u32,
+                            min: [f(2)? as f32, f(3)? as f32, f(4)? as f32],
+                            max: [f(5)? as f32, f(6)? as f32, f(7)? as f32],
+                            lip: f(8).map_or(0, |l| l as u32).min(f(1)? as u32),
+                            planes: CavePlanes::Cliff,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let emissive = cave.and_then(|c| c.get("emissive")).and_then(|e| e.as_bool()).unwrap_or(false);
+        Some(Self { chunks, emissive })
+    }
+}
+
+#[derive(Clone)]
+pub struct BakedCavePrimitive {
+    pub vertices: Vec<BakedCaveVertex>,
+    pub vertex_buffer: Buffer,
+
+    pub chunks: Vec<CaveChunk>,
+    pub emissive: bool,
+
+    pub bounds: [[f32; 3]; 2],
+}
+
+impl BakedCavePrimitive {
+
+    pub fn new(device: &Device, vertices: Vec<BakedCaveVertex>, indices: &mut Vec<u32>, meta: &BakedCaveMeta) -> Self {
+        use wgpu::util::DeviceExt;
+        let bounds = vertices.iter().fold([[f32::INFINITY; 3], [f32::NEG_INFINITY; 3]], |[lo, hi], v| {
+            [
+                [lo[0].min(v.position[0]), lo[1].min(v.position[1]), lo[2].min(v.position[2])],
+                [hi[0].max(v.position[0]), hi[1].max(v.position[1]), hi[2].max(v.position[2])],
+            ]
+        });
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("baked_cave_vb"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: BufferUsages::VERTEX,
+        });
+        let (by_class, chunks) = partition(&vertices, indices, &covering_chunks(&meta.chunks, indices.len() as u32, bounds));
+        if by_class.len() == indices.len() {
+            *indices = by_class;
+            Self { chunks, vertices, vertex_buffer, emissive: meta.emissive, bounds }
+        } else {
+
+            let whole = vec![CaveChunk { first: 0, count: indices.len() as u32, min: bounds[0], max: bounds[1], lip: 0, planes: CavePlanes::Cliff }];
+            Self { chunks: whole, vertices, vertex_buffer, emissive: meta.emissive, bounds }
+        }
+    }
+}
+
+pub fn covering_chunks(chunks: &[CaveChunk], index_count: u32, bounds: [[f32; 3]; 2]) -> Vec<CaveChunk> {
+    let mut next = 0u32;
+    let tiles = !chunks.is_empty()
+        && chunks.iter().all(|c| {
+            let ok = c.first == next && c.count % 3 == 0;
+            next = next.saturating_add(c.count);
+            ok
+        })
+        && next == index_count;
+    if tiles {
+        chunks.to_vec()
+    } else {
+        vec![CaveChunk { first: 0, count: index_count, min: bounds[0], max: bounds[1], lip: 0, planes: CavePlanes::Cliff }]
+    }
+}
+
+pub fn visible_ranges(
+    chunks: &[CaveChunk],
+    model: Mat4,
+    planes: Option<&[[Vec4; 6]]>,
+    of: Option<CavePlanes>,
+) -> Vec<std::ops::Range<u32>> {
+    let mut out: Vec<std::ops::Range<u32>> = Vec::new();
+    for c in chunks {
+        if c.count == 0 || of.is_some_and(|k| c.planes != k) {
+            continue;
+        }
+        let seen = match planes {
+            None => true,
+            Some(p) => super::scene_cull::sees_box(p, super::cave_twins::placed_box(model, [c.min, c.max])),
+        };
+        if !seen {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if last.end == c.first => last.end = c.first + c.count,
+            _ => out.push(c.first..c.first + c.count),
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaveShader {
+
+    pub emissive: bool,
+
+    pub spotless: bool,
+
+    pub planes: CavePlanes,
+}
+
+fn emissive_line(_planes: CavePlanes) -> String {
+    "    colour = colour + albedo * in.glow_rgb;\n".to_string()
+}
+
+const GLOW_FN: &str = r#"// EMISSIVE PAINT (the emissive twin only): its brightness (`misc.y`, 0 to
+
+fn glow_light(misc: vec4<u32>, saturation: f32) -> vec3<f32> {
+    let hue = f32(misc.w) / 255.0;
+    let pure = clamp(abs(fract(vec3<f32>(hue) + vec3<f32>(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, vec3<f32>(0.0), vec3<f32>(1.0));
+    return mix(vec3<f32>(1.0), pure, saturation) * (f32(misc.y) / 63.0 * EMISSIVE_GAIN);
+}
+
+"#;
+const GLOW_FIELD: &str = "    @location(9) glow_rgb: vec3<f32>,\n";
+const GLOW_VERTEX: &str = "    out.glow_rgb  = glow_light(v.misc, v.cliff.w);\n";
+
+fn with_glow(vertex: &str) -> String {
+    const LAST_FIELD: &str = "    @location(8) ground: vec3<f32>,\n}";
+    const RETURN: &str = "    return out;\n";
+    assert_eq!(vertex.matches(LAST_FIELD).count(), 1, "the baked cave's last varying moved");
+    assert_eq!(vertex.matches(RETURN).count(), 1, "the baked cave's vertex stage returns once");
+    vertex
+        .replacen(LAST_FIELD, &format!("    @location(8) ground: vec3<f32>,\n{GLOW_FIELD}}}"), 1)
+        .replacen(RETURN, &format!("{GLOW_VERTEX}{RETURN}"), 1)
+}
+
+fn emissive_parts(planes: CavePlanes) -> [String; 4] {
+    [GLOW_FN.to_string(), GLOW_FIELD.to_string(), GLOW_VERTEX.to_string(), emissive_line(planes)]
+}
+
+pub const EMISSIVE_GAIN: f32 = 6.0;
+
+pub fn baked_cave_shader(which: CaveShader) -> String {
+    let mut src = full_shader(which.planes);
+    if !which.emissive {
+        for part in emissive_parts(which.planes) {
+            assert_eq!(src.matches(&part).count(), 1, "the baked cave's emissive part moved: {part}");
+            src = src.replacen(&part, "", 1);
+        }
+    }
+
+    src = super::brush_pipeline::sun_reader_shader(src, super::brush_pipeline::FaceSun::Baked);
+    if which.spotless {
+        src = super::lights::without_spot_shadows(src);
+    }
+    src
+}
+
+fn material_struct() -> String {
+    let old = super::layered_mesh_pipeline::layered_mesh_shader();
+    let from = old.find("struct Material {").expect("the cave shader declares the terrain's Material");
+    let to = old[from..].find("@group(1) @binding(3)").expect("...and binds it") + from;
+    old[from..to].to_string()
+}
+
+const ONE_VERTEX: &str = r#"struct VOut {
+    @builtin(position) @invariant clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+
+    @location(1) world_pos: vec3<f32>,
+    @location(2) weights: vec4<f32>,
+
+    @location(3) uv: vec4<f32>,
+    @location(4) aux: vec4<f32>,
+
+    @location(5) @interpolate(flat) axis: u32,
+
+    @location(6) height: f32,
+    @location(7) glow: f32,
+
+    @location(8) ground: vec3<f32>,
+}
+
+@vertex fn vs_main(v: VIn) -> VOut {
+    let world = model_u.model * vec4<f32>(v.pos, 1.0);
+    let wpos = to_world_space(world.xyz);
+    let axis = select(select(2u, 0u, v.planes.x >= v.planes.z), 1u, v.planes.y >= max(v.planes.x, v.planes.z));
+    var out: VOut;
+    out.clip      = cam_view_proj() * world;
+    out.normal    = (model_u.model * vec4<f32>(v.norm, 0.0)).xyz;
+    out.world_pos = world.xyz;
+    out.weights   = v.weights;
+    out.uv        = vec4<f32>(plane_uv(axis, wpos), v.uv1);
+    out.aux       = v.aux;
+    out.axis      = axis;
+    out.height    = wpos.y;
+    out.glow      = f32(v.misc.y) / 63.0;
+    out.ground    = vec3<f32>(v.ground_uv, f32(v.misc.z) / 255.0);
+    return out;
+}
+"#;
+const ONE_LAYERS: &str = r#"    // The layers, each read ONCE, on the triangle's one plane: its gradients taken
+
+    let uv = in.uv.xy;
+    let uv_dx = dpdx(uv);
+    let uv_dy = dpdy(uv);
+    let total = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
+    var w = select(vec4<f32>(0.0, 1.0, 0.0, 0.0), in.weights / max(total, 0.0001), total > 0.0001);
+
+    let ground = clamp(in.ground.z, 0.0, 1.0);
+    var ground_map = vec4<f32>(1.0, 1.0, 0.0, 1.0);
+    if (ground > 0.0) {
+        let paint = textureSampleLevel(splat_tex, layer_samp, in.ground.xy, 0.0);
+        let painted = paint / max(paint.r + paint.g + paint.b + paint.a, 0.001);
+        w = mix(w, painted, ground * step(0.5, mat.use_splat));
+        ground_map = textureSampleLevel(sky_occ_tex, layer_samp, in.ground.xy, 0, 0.0);
+    }
+    var albedo = vec3<f32>(0.0);
+    var bent = vec3<f32>(0.0);
+    var rough_map = 0.0;
+    var ao_map = 0.0;
+
+    var layers_left = select(0u, 1u, w.x > WEIGHT_EPS) | select(0u, 2u, w.y > WEIGHT_EPS)
+        | select(0u, 4u, w.z > WEIGHT_EPS) | select(0u, 8u, w.w > WEIGHT_EPS);
+    loop {
+        if (layers_left == 0u) {
+            break;
+        }
+        let layer = i32(countTrailingZeros(layers_left));
+        layers_left = layers_left & (layers_left - 1u);
+        let lw = select(select(select(w.x, w.y, layer == 1), w.z, layer == 2), w.w, layer == 3);
+        let r = 1.0 / max(mat.repeat[layer], 0.001);
+        let at = uv * r;
+        let gx = uv_dx * r;
+        let gy = uv_dy * r;
+        albedo = albedo + textureSampleGrad(layer_tex, layer_samp, at, layer, gx, gy).rgb * lw;
+
+        var tn = textureSampleGrad(normal_tex, layer_samp, at, layer, gx, gy).rgb * 2.0 - 1.0;
+        tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
+        bent = bent + whiteout(in.axis, tn, nw) * lw;
+        rough_map = rough_map + textureSampleGrad(rough_tex, layer_samp, at, layer, gx, gy).r * lw;
+        ao_map = ao_map + textureSampleGrad(ao_tex, layer_samp, at, layer, gx, gy).r * lw;
+    }
+    bent = normalize(select(nw, bent, dot(bent, bent) > 0.00000001));
+    let shaded_n = to_player_direction(bent);
+
+    let mr = 1.0 / max(mat.macro_repeat, 0.001);
+    let macro_value = textureSampleGrad(macro_tex, layer_samp, uv * mr, uv_dx * mr, uv_dy * mr).r;
+    albedo = albedo * (1.0 + (macro_value - 0.5) * 2.0 * mat.macro_strength);
+"#;
+
+const OWN_VERTEX: &str = r#"struct VOut {
+    @builtin(position) @invariant clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+
+    @location(1) world_pos: vec3<f32>,
+    @location(2) weights: vec4<f32>,
+
+    @location(3) uv: vec2<f32>,
+    @location(4) aux: vec4<f32>,
+
+    @location(5) planes: vec4<f32>,
+
+    @location(6) wpos: vec3<f32>,
+
+    @location(8) ground: vec3<f32>,
+}
+
+@vertex fn vs_main(v: VIn) -> VOut {
+    let world = model_u.model * vec4<f32>(v.pos, 1.0);
+    var out: VOut;
+    out.clip      = cam_view_proj() * world;
+    out.normal    = (model_u.model * vec4<f32>(v.norm, 0.0)).xyz;
+    out.world_pos = world.xyz;
+    out.weights   = v.weights;
+    out.uv        = v.uv1;
+    out.aux       = v.aux;
+    out.planes    = vec4<f32>(v.planes.xyz, f32(v.misc.y) / 63.0);
+    out.wpos      = to_world_space(world.xyz);
+    out.ground    = vec3<f32>(v.ground_uv, f32(v.misc.z) / 255.0);
+    return out;
+}
+"#;
+const OWN_LAYERS_HEAD: &str = r#"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, at the world's own
+
+    let wp = in.wpos;
+    let wdx = dpdx(wp);
+    let wdy = dpdy(wp);
+    let total = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
+    var w = select(vec4<f32>(0.0, 1.0, 0.0, 0.0), in.weights / max(total, 0.0001), total > 0.0001);
+
+    let ground = clamp(in.ground.z, 0.0, 1.0);
+    var ground_map = vec4<f32>(1.0, 1.0, 0.0, 1.0);
+    if (ground > 0.0) {
+        let paint = textureSampleLevel(splat_tex, layer_samp, in.ground.xy, 0.0);
+        let painted = paint / max(paint.r + paint.g + paint.b + paint.a, 0.001);
+        w = mix(w, painted, ground * step(0.5, mat.use_splat));
+        ground_map = textureSampleLevel(sky_occ_tex, layer_samp, in.ground.xy, 0, 0.0);
+    }
+    let mr = 1.0 / max(mat.macro_repeat, 0.001);
+    let layers = select(0u, 1u, w.x > WEIGHT_EPS) | select(0u, 2u, w.y > WEIGHT_EPS)
+        | select(0u, 4u, w.z > WEIGHT_EPS) | select(0u, 8u, w.w > WEIGHT_EPS);
+    var albedo = vec3<f32>(0.0);
+    var bent = vec3<f32>(0.0);
+    var rough_map = 0.0;
+    var ao_map = 0.0;
+    var macro_value = 0.0;
+"#;
+
+const OWN_LAYERS_PLANE: &str = r#"    if (in.planes.SHARE > WEIGHT_EPS) {
+
+        macro_value = macro_value
+            + textureSampleGrad(macro_tex, layer_samp, wp.SWZ * mr, wdx.SWZ * mr, wdy.SWZ * mr).r * in.planes.SHARE;
+
+        var layers_left = layers;
+        loop {
+            if (layers_left == 0u) {
+                break;
+            }
+            let layer = i32(countTrailingZeros(layers_left));
+            layers_left = layers_left & (layers_left - 1u);
+            let lw = select(select(select(w.x, w.y, layer == 1), w.z, layer == 2), w.w, layer == 3) * in.planes.SHARE;
+            let r = 1.0 / max(mat.repeat[layer], 0.001);
+            let at = wp.SWZ * r;
+            let gx = wdx.SWZ * r;
+            let gy = wdy.SWZ * r;
+            albedo = albedo + textureSampleGrad(layer_tex, layer_samp, at, layer, gx, gy).rgb * lw;
+
+            var tn = textureSampleGrad(normal_tex, layer_samp, at, layer, gx, gy).rgb * 2.0 - 1.0;
+            tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
+            bent = bent + whiteout(AXISu, tn, nw) * lw;
+            rough_map = rough_map + textureSampleGrad(rough_tex, layer_samp, at, layer, gx, gy).r * lw;
+            ao_map = ao_map + textureSampleGrad(ao_tex, layer_samp, at, layer, gx, gy).r * lw;
+        }
+    }
+"#;
+const OWN_LAYERS_TAIL: &str = r#"    bent = normalize(select(nw, bent, dot(bent, bent) > 0.00000001));
+    let shaded_n = to_player_direction(bent);
+    albedo = albedo * (1.0 + (macro_value - 0.5) * 2.0 * mat.macro_strength);
+"#;
+
+const CLIFF_VERTEX: &str = r#"struct VOut {
+    @builtin(position) @invariant clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+
+    @location(1) world_pos: vec3<f32>,
+    @location(2) weights: vec4<f32>,
+
+    @location(3) uv: vec2<f32>,
+    @location(4) aux: vec4<f32>,
+
+    @location(5) planes: vec4<f32>,
+
+    @location(6) wpos: vec3<f32>,
+
+    @location(7) cliff: vec4<f32>,
+
+    @location(8) ground: vec3<f32>,
+}
+
+@vertex fn vs_main(v: VIn) -> VOut {
+    let world = model_u.model * vec4<f32>(v.pos, 1.0);
+    var out: VOut;
+    out.clip      = cam_view_proj() * world;
+    out.normal    = (model_u.model * vec4<f32>(v.norm, 0.0)).xyz;
+    out.world_pos = world.xyz;
+    out.weights   = v.weights;
+    out.uv        = v.uv1;
+    out.aux       = v.aux;
+    out.planes    = v.planes;
+    out.wpos      = to_world_space(world.xyz);
+    out.cliff     = vec4<f32>(v.cliff.xyz, f32(v.misc.y) / 63.0);
+    out.ground    = vec3<f32>(v.ground_uv, f32(v.misc.z) / 255.0);
+    return out;
+}
+"#;
+const CLIFF_LAYERS: &str = r#"    // THE LAYERS ARE READ ON THE WORLD'S PLANES, at the world's own
+
+    let wp = in.wpos;
+    let wdx = dpdx(wp);
+    let wdy = dpdy(wp);
+    let total = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
+    var w = select(vec4<f32>(0.0, 1.0, 0.0, 0.0), in.weights / max(total, 0.0001), total > 0.0001);
+
+    let ground = clamp(in.ground.z, 0.0, 1.0);
+    var ground_map = vec4<f32>(1.0, 1.0, 0.0, 1.0);
+
+    let mr = 1.0 / max(mat.macro_repeat, 0.001);
+    let cliff_total = in.cliff.x + in.cliff.y + in.cliff.z;
+    let cliff = clamp(in.planes.w, 0.0, 1.0) * step(0.0001, cliff_total);
+    var cliff_major = 3u;
+    var cliff_macro = 0.5;
+    var cliff_warp = vec2<f32>(0.0);
+    if (ground > 0.0) {
+        let paint = textureSampleLevel(splat_tex, layer_samp, in.ground.xy, 0.0);
+        let painted = paint / max(paint.r + paint.g + paint.b + paint.a, 0.001);
+        w = mix(w, painted, ground * step(0.5, mat.use_splat));
+        ground_map = textureSampleLevel(sky_occ_tex, layer_samp, in.ground.xy, 0, 0.0);
+        if (cliff > 0.0) {
+            cliff_major = select(select(2u, 0u, in.cliff.x >= in.cliff.z), 1u, in.cliff.y >= max(in.cliff.x, in.cliff.z));
+            let muv = plane_uv(cliff_major, wp);
+            let mdx = plane_uv(cliff_major, wdx);
+            let mdy = plane_uv(cliff_major, wdy);
+            cliff_macro = textureSampleGrad(macro_tex, layer_samp, muv * mr, mdx * mr, mdy * mr).r;
+            let ms = 1.0 / CLIFF_BAND_SCALE_M;
+            let m2 = textureSampleGrad(macro_tex, layer_samp, muv * ms + vec2<f32>(0.31, 0.57), mdx * ms, mdy * ms).r;
+            cliff_warp = vec2<f32>(cliff_macro - 0.5, 0.4 - 0.8 * cliff_macro) * CLIFF_WARP_M
+                + vec2<f32>(0.35, 1.0) * (m2 - 0.5) * CLIFF_BAND_WARP_M;
+        }
+    }
+
+    let own_total = in.planes.x + in.planes.y + in.planes.z;
+    let ours = select(vec3<f32>(0.0, 1.0, 0.0), in.planes.xyz / max(own_total, 0.0001), own_total > 0.0001) * (1.0 - cliff);
+
+    let cliff_faces = max(in.cliff.xyz * inverseSqrt(max(dot(in.cliff.xyz, in.cliff.xyz), 0.00000001)) - vec3<f32>(0.57735), vec3<f32>(0.0));
+    let theirs = cliff_faces / max(cliff_faces.x + cliff_faces.y + cliff_faces.z, 0.0001) * cliff;
+    var entries_left = select(0u, 1u, ours.x > WEIGHT_EPS) | select(0u, 2u, ours.y > WEIGHT_EPS) | select(0u, 4u, ours.z > WEIGHT_EPS)
+        | select(0u, 8u, theirs.x > WEIGHT_EPS) | select(0u, 16u, theirs.y > WEIGHT_EPS) | select(0u, 32u, theirs.z > WEIGHT_EPS);
+    let layers = select(0u, 1u, w.x > WEIGHT_EPS) | select(0u, 2u, w.y > WEIGHT_EPS)
+        | select(0u, 4u, w.z > WEIGHT_EPS) | select(0u, 8u, w.w > WEIGHT_EPS);
+    var albedo = vec3<f32>(0.0);
+    var bent = vec3<f32>(0.0);
+    var rough_map = 0.0;
+    var ao_map = 0.0;
+    var macro_value = 0.0;
+    loop {
+        if (entries_left == 0u) {
+            break;
+        }
+        let entry = countTrailingZeros(entries_left);
+        entries_left = entries_left & (entries_left - 1u);
+        let of_cliff = entry >= 3u;
+        let axis = select(entry, entry - 3u, of_cliff);
+        let shares = select(ours, theirs, of_cliff);
+        let share = select(select(shares.x, shares.y, axis == 1u), shares.z, axis == 2u);
+        var uv = plane_uv(axis, wp);
+        let uv_dx = plane_uv(axis, wdx);
+        let uv_dy = plane_uv(axis, wdy);
+
+        var tone = cliff_macro;
+        var second = 0.0;
+        if (of_cliff) {
+
+            uv = uv + select(cliff_warp, vec2<f32>(0.0), axis == 1u);
+            second = select(
+                0.0,
+                (0.3 + 0.3 * cliff_macro) * clamp(4.0 * (share / max(theirs.x + theirs.y + theirs.z, 0.0001)) - 2.0, 0.0, 1.0),
+                axis == cliff_major && axis != 1u,
+            );
+        } else {
+            tone = textureSampleGrad(macro_tex, layer_samp, uv * mr, uv_dx * mr, uv_dy * mr).r;
+        }
+        macro_value = macro_value + tone * share;
+
+        var layers_left = layers;
+        loop {
+            if (layers_left == 0u) {
+                break;
+            }
+            let layer = i32(countTrailingZeros(layers_left));
+            layers_left = layers_left & (layers_left - 1u);
+            let lw = select(select(select(w.x, w.y, layer == 1), w.z, layer == 2), w.w, layer == 3) * share;
+            let r = 1.0 / max(mat.repeat[layer], 0.001);
+            let at = uv * r;
+            let gx = uv_dx * r;
+            let gy = uv_dy * r;
+            var c = textureSampleGrad(layer_tex, layer_samp, at, layer, gx, gy).rgb;
+
+            var tn = textureSampleGrad(normal_tex, layer_samp, at, layer, gx, gy).rgb * 2.0 - 1.0;
+            tn = vec3<f32>(tn.xy * mat.normal_strength, tn.z);
+            if (second > 0.0) {
+
+                let s2 = r / 2.3;
+                let at2 = CLIFF_ROT * uv * s2 + vec2<f32>(0.37, 0.11);
+                let g2x = CLIFF_ROT * uv_dx * s2;
+                let g2y = CLIFF_ROT * uv_dy * s2;
+                c = mix(c, textureSampleGrad(layer_tex, layer_samp, at2, layer, g2x, g2y).rgb, second);
+                if (axis != 1u) {
+                    var t2 = textureSampleGrad(normal_tex, layer_samp, at2, layer, g2x, g2y).rgb * 2.0 - 1.0;
+                    t2 = vec3<f32>(transpose(CLIFF_ROT) * (t2.xy * mat.normal_strength), t2.z);
+                    tn = vec3<f32>(mix(tn.xy, t2.xy, second) * (1.0 + 0.667 * second), mix(tn.z, t2.z, second));
+                }
+            }
+            albedo = albedo + c * lw;
+            bent = bent + whiteout(axis, tn, nw) * lw;
+            rough_map = rough_map + textureSampleGrad(rough_tex, layer_samp, at, layer, gx, gy).r * lw;
+            ao_map = ao_map + textureSampleGrad(ao_tex, layer_samp, at, layer, gx, gy).r * lw;
+        }
+    }
+    bent = normalize(select(nw, bent, dot(bent, bent) > 0.00000001));
+    let shaded_n = to_player_direction(bent);
+    albedo = albedo * (1.0 + (macro_value - 0.5) * 2.0 * mat.macro_strength);
+"#;
+
+fn planes_text(planes: CavePlanes) -> (String, String) {
+    match planes {
+        CavePlanes::One => (ONE_VERTEX.to_string(), ONE_LAYERS.to_string()),
+        CavePlanes::Own => {
+            let mut layers = OWN_LAYERS_HEAD.to_string();
+            for (axis, share, swizzle) in [("0", "x", "zy"), ("1", "y", "xz"), ("2", "z", "xy")] {
+                layers += &OWN_LAYERS_PLANE.replace("AXIS", axis).replace("SHARE", share).replace("SWZ", swizzle);
+            }
+            (OWN_VERTEX.to_string(), layers + OWN_LAYERS_TAIL)
+        }
+        CavePlanes::Cliff => (CLIFF_VERTEX.to_string(), CLIFF_LAYERS.to_string()),
+    }
+}
+
+fn full_shader(planes: CavePlanes) -> String {
+    let (vertex, layers) = planes_text(planes);
+    let (lm_uv, height) = match planes {
+        CavePlanes::One => ("in.uv.zw", "in.height"),
+        CavePlanes::Own | CavePlanes::Cliff => ("in.uv", "wp.y"),
+    };
+    format!(
+        r#"
+@group(1) @binding(0) var layer_tex: texture_2d_array<f32>;
+@group(1) @binding(1) var layer_samp: sampler;
+@group(1) @binding(2) var macro_tex: texture_2d<f32>;
+{material}@group(1) @binding(3) var<uniform> mat: Material;
+
+@group(1) @binding(4) var splat_tex: texture_2d<f32>;
+@group(1) @binding(5) var normal_tex: texture_2d_array<f32>;
+
+@group(1) @binding(6) var sky_occ_tex: texture_2d_array<f32>;
+@group(1) @binding(7) var rough_tex: texture_2d_array<f32>;
+@group(1) @binding(8) var ao_tex: texture_2d_array<f32>;
+
+struct ModelUniform {{ model: mat4x4<f32> }}
+@group(2) @binding(0) var<uniform> model_u: ModelUniform;
+
+@group(3) @binding(0) var lm_tex: texture_2d<f32>;
+@group(3) @binding(1) var lm_samp: sampler;
+@group(3) @binding(4) var lm_sun_samp: sampler;
+@group(3) @binding(5) var lm_stationary: texture_2d_array<f32>;
+const STATIONARY_MASK_DISTANCE_TEXELS: f32 = {stationary_range:?};
+const GROUND_SUN_RANGE: f32 = {sun_range:?};
+const EMISSIVE_GAIN: f32 = {emissive_gain:?};
+const WEIGHT_EPS: f32 = {weight_eps:?};
+
+const CLIFF_WARP_M: f32 = 2.5;
+const CLIFF_BAND_WARP_M: f32 = 3.0;
+const CLIFF_BAND_SCALE_M: f32 = 7.0;
+const CLIFF_ROT: mat2x2<f32> = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
+
+{lights_block}
+{whiteout_block}
+
+fn plane_uv(axis: u32, p: vec3<f32>) -> vec2<f32> {{
+    return select(select(p.zy, p.xz, axis == 1u), p.xy, axis == 2u);
+}}
+
+struct VIn {{
+    @location(0) pos: vec3<f32>,
+    @location(1) norm: vec3<f32>,
+    @location(2) planes: vec4<f32>,
+    @location(3) uv1: vec2<f32>,
+    @location(4) ground_uv: vec2<f32>,
+    @location(5) weights: vec4<f32>,
+    @location(6) aux: vec4<f32>,
+    @location(7) misc: vec4<u32>,
+    @location(8) cliff: vec4<f32>,
+}}
+
+{glow_fn}{vertex}
+@fragment fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {{
+
+    var n = normalize(in.normal);
+    n = select(-n, n, front);
+
+    let nw = to_world_direction(n);
+
+{layers}
+
+    let baked = textureSample(lm_tex, lm_samp, {lm_uv});
+
+    receiver_skips_baked = true;
+
+    let st_layers = textureNumLayers(lm_stationary);
+    let st_0 = textureSample(lm_stationary, lm_sun_samp, {lm_uv}, 0);
+    var st_1 = vec4<f32>(1.0);
+    var st_2 = vec4<f32>(1.0);
+    var st_3 = vec4<f32>(1.0);
+    if (st_layers > 1u) {{
+        st_1 = textureSample(lm_stationary, lm_sun_samp, {lm_uv}, 1);
+    }}
+    if (st_layers > 2u) {{
+        st_2 = textureSample(lm_stationary, lm_sun_samp, {lm_uv}, 2);
+    }}
+    if (st_layers > 3u) {{
+        st_3 = textureSample(lm_stationary, lm_sun_samp, {lm_uv}, 3);
+    }}
+    set_stationary_masks_exact(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
+
+    let vertex_sky = clamp(in.aux.x, 0.0, 1.0);
+    var sky = select(vertex_sky, 0.5 * (vertex_sky + baked.a), textureDimensions(lm_tex).x > 1u);
+
+    var sun = smoothstep(0.01, 0.08, sky) * clamp(in.aux.y, 0.0, 1.0);
+
+    let ground_sun_d = (ground_map.g - 0.5) * (2.0 * GROUND_SUN_RANGE);
+    let ground_sun_w = max(ground_map.b * GROUND_SUN_RANGE, 0.02);
+    let ground_sun = select(sun, smoothstep(-ground_sun_w, ground_sun_w, ground_sun_d), ground_map.a < 0.5);
+    sky = mix(sky, ground_map.r, ground);
+    sun = mix(sun, ground_sun, ground);
+    let own = 1.0 - ground;
+
+    let deep = 1.0 - smoothstep(0.08, 0.4, sky);
+    albedo = albedo * (1.0 - 0.33 * own * deep * (0.6 + 0.4 * clamp(nw.y, 0.0, 1.0)));
+
+    albedo = mix(albedo, albedo * vec3<f32>(0.30, 0.33, 0.27), 0.85 * own * clamp(in.aux.z, 0.0, 1.0));
+    albedo = albedo * (1.0 - 0.8 * clamp(in.aux.w, 0.0, 1.0));
+
+    let washed = 1.0 - smoothstep(mat.wet_line, mat.wet_line + mat.wet_band, {height});
+    albedo = albedo * (1.0 - 0.45 * washed * mix(smoothstep(0.5, 0.8, nw.y), 1.0, ground));
+
+    receiver_sun_mask = sun;
+
+    var colour = shade_material_env(
+        in.world_pos, shaded_n, clamp(rough_map, 0.0, 1.0), clamp(ao_map, 0.0, 1.0), sky,
+        baked.rgb * own, vec4<f32>(0.5, 0.5, 0.5, 0.0), albedo, in.world_pos, n,
+    );
+{emissive}    return vec4<f32>(tonemap(colour), 1.0);
+}}
+"#,
+        material = material_struct(),
+
+        lights_block = super::lights::wgsl_lights_block_with(
+            0, 1, LightsBlockOptions { probe_from_pass: true, ..Default::default() },
+        ),
+        whiteout_block = super::material_wgsl::wgsl_whiteout_block(),
+        stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
+        sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
+        emissive_gain = EMISSIVE_GAIN,
+        weight_eps = WEIGHT_EPS,
+        glow_fn = GLOW_FN,
+        vertex = with_glow(&vertex),
+        layers = layers,
+        lm_uv = lm_uv,
+        height = height,
+        emissive = emissive_line(planes),
+    )
+}
+
+fn occluder_shader() -> String {
+    format!(
+        r#"
+struct ModelUniform {{ model: mat4x4<f32> }}
+@group(2) @binding(0) var<uniform> model_u: ModelUniform;
+{lights_block}
+@vertex fn vs_main(@location(0) pos: vec3<f32>) -> @builtin(position) @invariant vec4<f32> {{
+    return cam_view_proj() * (model_u.model * vec4<f32>(pos, 1.0));
+}}
+@fragment fn fs_depth() {{}}
+"#,
+        lights_block = super::lights::wgsl_lights_block(0, 1),
+    )
+}
+
+pub struct BakedCaveDraw<'a> {
+    pub model: &'a BindGroup,
+    pub lightmap: &'a BindGroup,
+    pub vertices: &'a Buffer,
+    pub indices: &'a Buffer,
+    pub index_count: u32,
+    pub chunks: &'a [CaveChunk],
+    pub emissive: bool,
+
+    pub placed: Mat4,
+
+    pub bounds: (Vec3, Vec3),
+}
+
+impl BakedCaveDraw<'_> {
+
+    pub fn holds(&self, eye: Vec3) -> bool {
+        eye.cmpge(self.bounds.0).all() && eye.cmple(self.bounds.1).all()
+    }
+}
+
+pub struct BakedCavePipelines {
+
+    scene: [[[RenderPipeline; 2]; 2]; 3],
+
+    stereo: Option<[RenderPipeline; 2]>,
+
+    mirror: [RenderPipeline; 2],
+
+    occluder: RenderPipeline,
+    pub model_layout: BindGroupLayout,
+}
+
+const CAVE_ANSWER: &str = "    return vec4<f32>(tonemap(colour), 1.0);\n";
+
+pub const CAVE_DEBUG_VIEWS: &[(&str, &str)] = &[
+    ("sky", "vec3<f32>(sky)"),
+    ("sun", "vec3<f32>(sun)"),
+    ("vsky", "vec3<f32>(vertex_sky)"),
+    ("lmsky", "vec3<f32>(baked.a)"),
+    ("ground", "vec3<f32>(ground, ground_map.r, ground_sun)"),
+    ("albedo", "albedo"),
+    ("normal", "to_world_direction(shaded_n) * 0.5 + 0.5"),
+    ("facing", "select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), front)"),
+    ("tide", "vec3<f32>(clamp(in.aux.z, 0.0, 1.0))"),
+    ("soot", "vec3<f32>(clamp(in.aux.w, 0.0, 1.0))"),
+];
+
+pub fn cave_debug_shader(src: &str, view: &str) -> Option<String> {
+    if let Some(edits) = view.strip_prefix("edit:") {
+        let edits: Vec<(&str, &str)> = edits.split(";;").map(|e| e.split_once("=>")).collect::<Option<_>>()?;
+        return super::ground_cuts::with_cut(src, &edits);
+    }
+    let (_, colour) = CAVE_DEBUG_VIEWS.iter().find(|(name, _)| *name == view)?;
+    (src.matches(CAVE_ANSWER).count() == 1).then(|| {
+        src.replacen(
+            CAVE_ANSWER,
+            &format!("    return vec4<f32>(clamp({colour}, vec3<f32>(0.0), vec3<f32>(1.0)) + 0.0 * colour, 1.0);\n"),
+            1,
+        )
+    })
+}
+
+impl BakedCavePipelines {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        material_layout: &BindGroupLayout,
+        lightmap_layout: &BindGroupLayout,
+        samples: u32,
+        stereo: bool,
+    ) -> Self {
+        Self::new_debug(device, format, uniform_layout, material_layout, lightmap_layout, samples, stereo, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_debug(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        material_layout: &BindGroupLayout,
+        lightmap_layout: &BindGroupLayout,
+        samples: u32,
+        stereo: bool,
+        debug: Option<&str>,
+    ) -> Self {
+        let shader_text = |which: CaveShader| {
+            let src = baked_cave_shader(which);
+            match debug {
+                Some(view) => cave_debug_shader(&src, view).unwrap_or_else(|| panic!("CAVE_DEBUG={view}: not one of the cave's pictures")),
+                None => src,
+            }
+        };
+
+        let model_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("baked_cave_model_bgl"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }],
+        });
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("baked_cave_layout"),
+            bind_group_layouts: &[Some(uniform_layout), Some(material_layout), Some(&model_layout), Some(lightmap_layout)],
+            immediate_size: 0,
+        });
+        let build = |which: CaveShader, front_face: FrontFace, samples: u32, view: ViewMode, label: &str| {
+            let shader = device.create_shader_module(ShaderModuleDescriptor {
+                label: Some(label),
+                source: ShaderSource::Wgsl(view.shader(shader_text(which)).into()),
+            });
+            device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    buffers: &[Some(BakedCaveVertex::layout())],
+                },
+                fragment: Some(FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: PipelineCompilationOptions::default(),
+
+                    targets: &[Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::ALL })],
+                }),
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+
+                    cull_mode: None,
+                    front_face,
+                    polygon_mode: PolygonMode::Fill,
+                    ..Default::default()
+                },
+                depth_stencil: Some(DepthStencilState {
+                    format: TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(CompareFunction::Less),
+                    stencil: StencilState::default(),
+                    bias: DepthBiasState::default(),
+                }),
+                multisample: MultisampleState { count: samples, ..Default::default() },
+                multiview_mask: view.mask(),
+                cache: None,
+            })
+        };
+        let twin = |planes: CavePlanes, emissive: bool, spotless: bool| {
+            let label = format!(
+                "baked_cave{}{}{}",
+                match planes {
+                    CavePlanes::One => "_one",
+                    CavePlanes::Own => "_own",
+                    CavePlanes::Cliff => "",
+                },
+                if emissive { "_emissive" } else { "" },
+                if spotless { "_spotless" } else { "" },
+            );
+            build(CaveShader { emissive, spotless, planes }, FrontFace::Ccw, samples, ViewMode::Mono, &label)
+        };
+        let scene = CavePlanes::ALL
+            .map(|planes| [false, true].map(|emissive| [false, true].map(|spotless| twin(planes, emissive, spotless))));
+
+        let any = |emissive: bool| CaveShader { emissive, spotless: false, planes: CavePlanes::Cliff };
+        let stereo = stereo
+            .then(|| [false, true].map(|emissive| build(any(emissive), FrontFace::Ccw, samples, ViewMode::Stereo, "baked_cave_stereo")));
+        let mirror = [false, true].map(|emissive| build(any(emissive), FrontFace::Cw, 1, ViewMode::Mono, "baked_cave_mirror"));
+        let occluder = Self::occluder_pipeline(device, uniform_layout, &model_layout);
+        Self { scene, stereo, mirror, occluder, model_layout }
+    }
+
+    fn occluder_pipeline(device: &Device, uniform_layout: &BindGroupLayout, model_layout: &BindGroupLayout) -> RenderPipeline {
+        use crate::renderer::brush_pipeline::probe_pass::{FORMAT, REACH_FORMAT};
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("baked_cave_occluder"),
+            source: ShaderSource::Wgsl(occluder_shader().into()),
+        });
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("baked_cave_occluder_layout"),
+            bind_group_layouts: &[Some(uniform_layout), None, Some(model_layout)],
+            immediate_size: 0,
+        });
+        let nothing = |format| Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::empty() });
+        device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("baked_cave_occluder"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(BakedCaveVertex::layout())],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_depth"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[nothing(FORMAT), nothing(REACH_FORMAT)],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
+    pub fn scene_pipeline(&self, planes: CavePlanes, emissive: bool, spotless: bool) -> &RenderPipeline {
+        &self.scene[planes as usize][emissive as usize][spotless as usize]
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_scene<'a>(
+        &'a self,
+        pass: &mut RenderPass<'a>,
+        uniform: &'a BindGroup,
+        material: &'a BindGroup,
+        draws: &[BakedCaveDraw<'a>],
+        planes: Option<&[[Vec4; 6]]>,
+        spotless: bool,
+        stereo: bool,
+        only: Option<(Vec3, bool)>,
+    ) -> u32 {
+        let mut triangles = 0;
+        for d in draws {
+            if only.is_some_and(|(eye, inside)| d.holds(eye) != inside) {
+                continue;
+            }
+            if let Some(p) = planes {
+                if !super::scene_cull::sees_box(p, d.bounds) {
+                    continue;
+                }
+            }
+
+            let both_eyes = self.stereo.as_ref().filter(|_| stereo).map(|s| &s[d.emissive as usize]);
+            let passes: Vec<(&RenderPipeline, Vec<std::ops::Range<u32>>)> = match both_eyes {
+                Some(pipeline) => vec![(pipeline, visible_ranges(d.chunks, d.placed, planes, None))],
+                None => CavePlanes::ALL
+                    .iter()
+                    .map(|&k| (self.scene_pipeline(k, d.emissive, spotless), visible_ranges(d.chunks, d.placed, planes, Some(k))))
+                    .collect(),
+            };
+            let mut bound = false;
+            for (pipeline, ranges) in passes {
+                if ranges.is_empty() {
+                    continue;
+                }
+                pass.set_pipeline(pipeline);
+                if !bound {
+
+                    pass.set_bind_group(0, uniform, &[]);
+                    pass.set_bind_group(1, material, &[]);
+                    pass.set_bind_group(2, d.model, &[]);
+                    pass.set_bind_group(3, d.lightmap, &[]);
+                    pass.set_vertex_buffer(0, d.vertices.slice(..));
+                    pass.set_index_buffer(d.indices.slice(..), IndexFormat::Uint32);
+                    bound = true;
+                }
+                for r in ranges {
+                    triangles += (r.end - r.start) / 3;
+                    pass.draw_indexed(r, 0, 0..1);
+                }
+            }
+        }
+        triangles
+    }
+
+    pub fn draw_mirror<'a>(
+        &'a self,
+        pass: &mut RenderPass<'a>,
+        uniform: &'a BindGroup,
+        material: &'a BindGroup,
+        draws: impl Iterator<Item = &'a BakedCaveDraw<'a>>,
+    ) {
+        for d in draws {
+            pass.set_pipeline(&self.mirror[d.emissive as usize]);
+            pass.set_bind_group(0, uniform, &[]);
+            pass.set_bind_group(1, material, &[]);
+            pass.set_bind_group(2, d.model, &[]);
+            pass.set_bind_group(3, d.lightmap, &[]);
+            pass.set_vertex_buffer(0, d.vertices.slice(..));
+            pass.set_index_buffer(d.indices.slice(..), IndexFormat::Uint32);
+            pass.draw_indexed(0..d.index_count, 0, 0..1);
+        }
+    }
+
+    pub fn draw_occluders<'a>(
+        &'a self,
+        pass: &mut RenderPass<'a>,
+        uniform: &'a BindGroup,
+        draws: &[BakedCaveDraw<'a>],
+        eye: Vec3,
+        planes: Option<&[[Vec4; 6]]>,
+    ) {
+        let inside = |d: &BakedCaveDraw| d.holds(eye);
+        if !draws.iter().any(inside) {
+            return;
+        }
+        pass.set_pipeline(&self.occluder);
+        pass.set_bind_group(0, uniform, &[]);
+        for d in draws.iter().filter(|d| inside(d)) {
+            pass.set_bind_group(2, d.model, &[]);
+            pass.set_vertex_buffer(0, d.vertices.slice(..));
+            pass.set_index_buffer(d.indices.slice(..), IndexFormat::Uint32);
+            for r in occluder_ranges(d.chunks, d.index_count, d.placed, planes) {
+                pass.draw_indexed(r, 0, 0..1);
+            }
+        }
+    }
+}
+
+pub fn occluder_ranges(
+    chunks: &[CaveChunk],
+    index_count: u32,
+    placed: Mat4,
+    planes: Option<&[[Vec4; 6]]>,
+) -> Vec<std::ops::Range<u32>> {
+    match planes {
+        None => vec![0..index_count],
+        Some(_) => visible_ranges(chunks, placed, planes, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(first: u32, count: u32, x: f32) -> CaveChunk {
+        CaveChunk { first, count, min: [x, 0.0, -1.0], max: [x + 1.0, 1.0, 1.0], lip: 0, planes: CavePlanes::Cliff }
+    }
+
+    #[test]
+    fn a_file_vertex_unpacks_its_weights_axis_and_glow() {
+        let v = BakedCaveVertex::from_file(
+            [1.0; 3], [0.0, 1.0, 0.0], [0.25, 0.5], [100, 50, 5, (2 << 6) | 40], [255, 128, 3, 9], ([0.7, 0.2], 77),
+            Some(([200, 55, 0], [30, 0, 225, 90])),
+            None,
+        );
+        assert_eq!(v.weights, [100, 50, 5, 100], "the fourth weight is what the three leave of 255");
+        assert_eq!(v.misc, [2, 40, 77, 0]);
+        assert_eq!(v.planes, [200, 55, 0, 90], "the planes' shares, and the cliff's");
+        assert_eq!(v.cliff, [30, 0, 225, 0], "the terrain's shares at a cliff");
+
+        let old = BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0, 255, 0, 2 << 6], [0; 4], ([0.0; 2], 0), None, None);
+        assert_eq!((old.planes, old.cliff), ([0, 0, 255, 0], [0; 4]));
+        let old = BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [0, 255, 0, 0], [0; 4], ([0.0; 2], 0), None, None);
+        assert_eq!(old.planes, [255, 0, 0, 0]);
+        assert_eq!(v.ground_uv, [0.7, 0.2]);
+        assert_eq!(v.aux, [255, 128, 3, 9]);
+        assert_eq!(std::mem::size_of::<BakedCaveVertex>(), 60);
+
+        assert_eq!(BakedCaveVertex::from_file([0.0; 3], [0.0; 3], [0.0; 2], [200, 100, 0, 0], [0; 4], ([0.0; 2], 0), None, None).weights[3], 0);
+    }
+
+    #[test]
+    fn a_glows_colour_rides_in_the_two_spare_bytes_and_opens_to_the_same_colour() {
+
+        let args = ([1.0; 3], [0.0, 1.0, 0.0], [0.25, 0.5], [100, 50, 5, (2 << 6) | 40], [255, 128, 3, 9], ([0.7, 0.2], 77), Some(([200, 55, 0], [30, 0, 225, 90])));
+        let plain = BakedCaveVertex::from_file(args.0, args.1, args.2, args.3, args.4, args.5, args.6, None);
+        let teal = BakedCaveVertex::from_file(args.0, args.1, args.2, args.3, args.4, args.5, args.6, Some([60, 220, 200, 255]));
+        assert_eq!((plain.misc[3], plain.cliff[3]), (0, 0), "no colour: the rock's own");
+        assert_ne!(teal.cliff[3], 0);
+        assert_eq!(BakedCaveVertex { misc: [2, 40, 77, 0], cliff: [30, 0, 225, 0], ..teal }, plain, "the colour is in the two spare bytes and nowhere else");
+
+        for grey in [[255, 255, 255], [128, 128, 128], [0, 0, 0]] {
+            assert_eq!(glow_hue_saturation(grey), (0, 0));
+        }
+
+        for rgb in [[255u8, 0, 0], [0, 255, 0], [0, 0, 255], [255, 180, 90], [60, 220, 200], [180, 140, 255], [255, 255, 0], [255, 0, 254], [255, 200, 200]] {
+            let (hue, saturation) = glow_hue_saturation(rgb);
+            let got = glow_tint(hue, saturation);
+            let linear = rgb.map(srgb_to_linear);
+            let top = linear[0].max(linear[1]).max(linear[2]);
+            for k in 0..3 {
+                assert!((got[k] - linear[k] / top).abs() < 0.012, "{rgb:?}: opened {got:?}, painted {:?}", linear.map(|c| c / top));
+            }
+        }
+
+        assert!(GLOW_FN.contains("abs(fract(vec3<f32>(hue) + vec3<f32>(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0"));
+        assert!(GLOW_FN.contains("mix(vec3<f32>(1.0), pure, saturation) * (f32(misc.y) / 63.0 * EMISSIVE_GAIN)"));
+    }
+
+    #[test]
+    fn the_file_says_what_it_is_and_names_its_chunks() {
+        let meta = BakedCaveMeta::parse(
+            r#"{"space_soup":{"shading":"baked_cave","lightmap":{"set":1,"size":[512,512]},
+                "cave":{"version":3,"emissive":true,"chunks":[[0,6,-1,-2,-3,1,2,3],[6,3,0,0,0,4,5,6,3]]}}}"#,
+        )
+        .expect("a baked cave");
+        assert!(meta.emissive);
+        assert_eq!(meta.chunks.len(), 2);
+        assert_eq!(meta.chunks[1], CaveChunk { first: 6, count: 3, min: [0.0, 0.0, 0.0], max: [4.0, 5.0, 6.0], lip: 3, planes: CavePlanes::Cliff });
+        assert_eq!(meta.chunks[0].lip, 0, "a table from before the lip was counted: none");
+        assert!(BakedCaveMeta::parse(r#"{"space_soup":{"shading":"layered"}}"#).is_none(), "the old cave is not this one");
+        assert!(BakedCaveMeta::parse("{}").is_none());
+
+        assert_eq!(BakedCaveMeta::parse(r#"{"space_soup":{"shading":"baked_cave"}}"#).unwrap().chunks.len(), 0);
+    }
+
+    #[test]
+    fn a_chunk_table_that_does_not_cover_the_indices_is_replaced_by_one_chunk() {
+        let b = [[0.0; 3], [9.0; 3]];
+        let good = [chunk(0, 6, 0.0), chunk(6, 9, 2.0)];
+        assert_eq!(covering_chunks(&good, 15, b), good.to_vec());
+        for (bad, count) in [(vec![chunk(0, 6, 0.0), chunk(9, 6, 2.0)], 15), (good.to_vec(), 18), (vec![chunk(0, 5, 0.0)], 5), (vec![], 12)] {
+            let one = covering_chunks(&bad, count, b);
+            assert_eq!(one, vec![CaveChunk { first: 0, count, min: b[0], max: b[1], lip: 0, planes: CavePlanes::Cliff }]);
+        }
+    }
+
+    #[test]
+    fn a_long_caves_depth_is_drawn_by_the_chunks_in_view_and_none_in_view_is_lost() {
+        let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.05, 500.0);
+        let view_proj = proj * Mat4::look_to_rh(Vec3::new(0.0, 0.0, 0.0), Vec3::X, Vec3::Y);
+        let planes = [crate::renderer::shadow::frustum_planes(view_proj)];
+        let placed = Mat4::from_translation(Vec3::new(0.0, -1.0, 0.0));
+
+        let chunks: Vec<CaveChunk> = (0..400u32)
+            .map(|k| {
+                let x = 2.0 * k as f32 - 400.0;
+                CaveChunk { first: 3 * k, count: 3, min: [x, 0.0, -1.5], max: [x + 2.0, 2.5, 1.5], lip: 0, planes: CavePlanes::ALL[k as usize % 3] }
+            })
+            .collect();
+        let whole = occluder_ranges(&chunks, 1200, placed, None);
+        assert_eq!(whole, vec![0..1200]);
+        let seen = occluder_ranges(&chunks, 1200, placed, Some(&planes));
+        let drawn: u32 = seen.iter().map(|r| r.end - r.start).sum();
+        assert!(drawn < 1200 / 2 + 12, "{drawn} of 1200 indices");
+        assert!(drawn >= 3 * 190, "{drawn}: the half ahead is in view");
+
+        for c in &chunks {
+            let centre = placed.transform_point3((Vec3::from(c.min) + Vec3::from(c.max)) * 0.5);
+            let inside = planes[0].iter().all(|p| p.truncate().dot(centre) + p.w >= 0.0);
+            if inside {
+                assert!(seen.iter().any(|r| r.contains(&c.first)), "chunk at {} is in view and not drawn", c.first);
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_chunks_an_eye_can_see_into_are_drawn_and_neighbours_join() {
+
+        let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.05, 500.0);
+        let planes = [crate::renderer::shadow::frustum_planes(proj * Mat4::look_to_rh(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y))];
+        let at = |first: u32, x: f32| CaveChunk { first, count: 3, min: [x, -0.5, -6.0], max: [x + 1.0, 0.5, -4.0], lip: 0, planes: CavePlanes::Cliff };
+        let chunks = [at(0, -40.0), at(3, -1.0), at(6, 0.5), at(9, 40.0), at(12, 2.0)];
+        assert_eq!(visible_ranges(&chunks, Mat4::IDENTITY, Some(&planes), None), vec![3..9, 12..15]);
+        assert_eq!(visible_ranges(&chunks, Mat4::IDENTITY, None, None), vec![0..15]);
+
+        let moved = Mat4::from_translation(Vec3::new(40.0, 0.0, 0.0));
+        assert_eq!(visible_ranges(&chunks, moved, Some(&planes), None), vec![0..3]);
+
+        assert!(visible_ranges(&chunks, Mat4::from_translation(Vec3::new(0.0, 0.0, 20.0)), Some(&planes), None).is_empty());
+    }
+
+    #[test]
+    fn every_twin_validates_and_differs_only_as_it_says() {
+        for planes in CavePlanes::ALL {
+            let full = baked_cave_shader(CaveShader { emissive: true, spotless: false, planes });
+            let plain = baked_cave_shader(CaveShader { emissive: false, spotless: false, planes });
+
+            let mut less = full.clone();
+            for part in emissive_parts(planes) {
+                assert_eq!(full.matches(&part).count(), 1, "{planes:?}: {part}");
+                assert!(!plain.contains(&part), "{planes:?}: the plain twin carries {part}");
+                less = less.replacen(&part, "", 1);
+            }
+            assert_eq!(less, plain, "a cave with no glow has the same shader less the emissive pieces");
+            assert!(!plain.contains("glow_rgb") && !plain.contains("glow_light") && !plain.contains("@location(9)"));
+            assert!(full.contains("@location(9) glow_rgb: vec3<f32>,") && full.contains("out.glow_rgb  = glow_light(v.misc, v.cliff.w);"));
+            for emissive in [false, true] {
+                for spotless in [false, true] {
+                    for view in [ViewMode::Mono, ViewMode::Stereo] {
+                        let what = format!("baked cave ({planes:?}, emissive {emissive}, spotless {spotless}, {view:?})");
+                        let src = view.shader(baked_cave_shader(CaveShader { emissive, spotless, planes }));
+                        let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{what}: {}", e.emit_to_string(&src)));
+                        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                            .validate(&module)
+                            .unwrap_or_else(|e| panic!("{what} does not validate: {e:?}"));
+                    }
+                }
+            }
+        }
+        let occ = occluder_shader();
+        let module = naga::front::wgsl::parse_str(&occ).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&occ)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap();
+    }
+
+    #[test]
+    fn every_cave_debug_picture_validates_on_every_twin() {
+        for planes in CavePlanes::ALL {
+            for emissive in [false, true] {
+                let src = baked_cave_shader(CaveShader { emissive, spotless: false, planes });
+                for (name, _) in CAVE_DEBUG_VIEWS {
+                    let what = format!("CAVE_DEBUG={name} ({planes:?}, emissive {emissive})");
+                    let debug = ViewMode::Mono.shader(cave_debug_shader(&src, name).unwrap_or_else(|| panic!("{what}: no answer line")));
+                    let module = naga::front::wgsl::parse_str(&debug).unwrap_or_else(|e| panic!("{what}: {}", e.emit_to_string(&debug)));
+                    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                        .validate(&module)
+                        .unwrap_or_else(|e| panic!("{what} does not validate: {e:?}"));
+                }
+                assert!(cave_debug_shader(&src, "no_such_picture").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn the_shader_reads_each_layer_once_a_plane_and_takes_no_shadow_tap_of_the_levels_sun() {
+        let src = baked_cave_shader(CaveShader::default());
+        let fs = &src[src.find("@fragment fn fs_main").unwrap()..];
+
+        assert_eq!(fs.matches("textureSampleGrad(").count(), 9);
+        let second = fs.find("if (second > 0.0) {").expect("the cliff's second scale is behind a branch");
+        assert_eq!(fs[second..].matches("textureSampleGrad(").count(), 4, "two reads behind it, and roughness and occlusion after");
+        assert_eq!(fs.matches("textureSample(").count(), 5);
+        assert_eq!(fs.matches("textureSampleLevel(").count(), 2);
+        let branch = fs.find("if (ground > 0.0) {").expect("the ground's maps are read behind a branch");
+        let end = branch + fs[branch..].find("\n    }\n").unwrap();
+        for read in ["textureSampleLevel(sky_occ_tex", "textureSampleLevel(splat_tex", "m2 = textureSampleGrad(macro_tex"] {
+            let at = fs.find(read).unwrap();
+            assert!(at > branch && at < end, "{read} is inside the branch");
+        }
+        assert!(!fs.contains("biplanar_axes"));
+        assert!(src.contains("const SUN_MASK_EVERYWHERE: bool = true;"), "the level's static sun map is compiled out");
+        assert!(fs.contains("receiver_sun_mask = "));
+        assert!(fs.contains("receiver_skips_baked = true;"), "its baked lamps are in its atlas");
+        assert!(fs.trim_end().ends_with("return vec4<f32>(tonemap(colour), 1.0);\n}"), "opaque: alpha one");
+    }
+
+    use crate::renderer::terrain_pipeline::{self, material_bind_group_layout, TerrainImage, TerrainMaterial, TerrainMaterialUniform};
+    use crate::renderer::uniforms::test_support::{scene_uniforms, TEST_EYE};
+    use crate::renderer::uniforms::ShadowUpload;
+
+    fn ramp() -> TerrainImage {
+        let mut rgba = Vec::with_capacity(16 * 16 * 4);
+        for y in 0..16u8 {
+            for x in 0..16u8 {
+                rgba.extend_from_slice(&[x * 16, y * 16, 128, 255]);
+            }
+        }
+        TerrainImage { width: 16, height: 16, rgba }
+    }
+    fn sized(rgba: [u8; 4]) -> TerrainImage {
+        TerrainImage { width: 16, height: 16, rgba: rgba.repeat(16 * 16) }
+    }
+
+    struct Shot {
+        weights: [u8; 4],
+
+        planes: [u8; 4],
+
+        cliff: [u8; 3],
+
+        world: [f32; 3],
+        aux: [u8; 4],
+        glow: u8,
+
+        glow_colour: Option<[u8; 3]>,
+        emissive: bool,
+        spotless: bool,
+
+        lightmap: [u8; 4],
+        unbaked: bool,
+        mirror: bool,
+
+        any_twin: bool,
+
+        ground: u8,
+        ground_map: [u8; 4],
+
+        paint: Option<[u8; 4]>,
+
+        macro_strength: f32,
+        macro_value: u8,
+    }
+    fn copy_of(s: &Shot) -> Shot {
+        Shot {
+            weights: s.weights, planes: s.planes, cliff: s.cliff, world: s.world, aux: s.aux, glow: s.glow, glow_colour: s.glow_colour, emissive: s.emissive,
+            spotless: s.spotless, lightmap: s.lightmap, unbaked: s.unbaked, mirror: s.mirror, any_twin: s.any_twin, ground: s.ground,
+            ground_map: s.ground_map, paint: s.paint, macro_strength: s.macro_strength, macro_value: s.macro_value,
+        }
+    }
+    impl Default for Shot {
+        fn default() -> Self {
+            Self {
+                weights: [0, 255, 0, 0],
+                planes: [0, 0, 255, 0],
+                cliff: [0; 3],
+                world: [0.0; 3],
+                aux: [255, 255, 0, 0],
+                glow: 0,
+                glow_colour: None,
+                emissive: false,
+                spotless: false,
+                lightmap: [0, 0, 0, 255],
+                unbaked: false,
+                mirror: false,
+                any_twin: false,
+                ground: 0,
+                ground_map: [255, 255, 0, 0],
+                paint: None,
+                macro_strength: 0.0,
+                macro_value: 128,
+            }
+        }
+    }
+
+    fn render(shot: Shot) -> Option<[u8; 4]> {
+        use wgpu::util::DeviceExt;
+        let (device, queue) = terrain_pipeline::tests::headless_gpu()?;
+        let scope = device.push_error_scope(ErrorFilter::Validation);
+        let format = TextureFormat::Rgba8Unorm;
+        let lights = crate::renderer::lights::LightsUniform::new(&device);
+        let (_shadows, uniforms) = scene_uniforms(&device, &lights);
+        lights.upload(&queue, &[]);
+        let material_layout = material_bind_group_layout(&device);
+
+        let mesh = crate::renderer::mesh_pipeline::MeshPipeline::new_multisampled(&device, format, &uniforms.layout, 1);
+        let pipelines = BakedCavePipelines::new(&device, format, &uniforms.layout, &material_layout, &mesh.lightmap_layout, 1, false);
+        let material = TerrainMaterial::new(
+            &device,
+            &queue,
+            &material_layout,
+            &[sized([255, 0, 0, 255]), ramp(), sized([0, 0, 255, 255]), sized([255, 255, 255, 255])],
+            &TerrainImage { width: 1, height: 1, rgba: vec![shot.macro_value, shot.macro_value, shot.macro_value, 255] },
+            shot.paint.map(|p| TerrainImage { width: 1, height: 1, rgba: p.to_vec() }).as_ref(),
+            Some(&TerrainImage { width: 1, height: 1, rgba: shot.ground_map.to_vec() }),
+            &[None, None, None, None],
+            &[],
+            &[],
+            TerrainMaterialUniform { macro_strength: shot.macro_strength, macro_repeat: 1.0, repeat: [1.0; 4], ..Default::default() },
+        );
+        let lightmap = if shot.unbaked {
+            crate::renderer::mesh::create_lightmap_texture(&device, &queue, &mesh.lightmap_layout, &[0, 0, 0, 255], 1, 1, None)
+        } else {
+            crate::renderer::mesh::create_lightmap_texture(&device, &queue, &mesh.lightmap_layout, &shot.lightmap.repeat(4), 2, 2, None)
+        };
+        let world = Vec3::from(shot.world);
+        let model = mesh.create_model_uniform(&device);
+        model.upload(&queue, Mat4::from_translation(world));
+
+        uniforms.upload(&queue, Mat4::from_translation(-world), TEST_EYE + world, &ShadowUpload::disabled());
+
+        let (hue, saturation) = shot.glow_colour.map_or((0, 0), glow_hue_saturation);
+        let v = |p: [f32; 3]| BakedCaveVertex {
+            position: p,
+
+            normal: [0.0, 0.3, -0.954],
+            planes: shot.planes,
+            cliff: [shot.cliff[0], shot.cliff[1], shot.cliff[2], saturation],
+            uv1: [0.5, 0.5],
+            ground_uv: [0.5, 0.5],
+            weights: shot.weights,
+            aux: shot.aux,
+            misc: [2, shot.glow, shot.ground, hue],
+        };
+        let verts = [v([-1.0, -1.0, 0.5]), v([3.0, -1.0, 0.5]), v([-1.0, 3.0, 0.5])];
+        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&verts),
+            usage: BufferUsages::VERTEX,
+        });
+        let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[0u32, 1, 2]),
+            usage: BufferUsages::INDEX,
+        });
+        const SIZE: u32 = 8;
+        let texture = |format, usage| {
+            device.create_texture(&TextureDescriptor {
+                label: None,
+                size: Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let target = texture(format, TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC);
+        let depth = texture(TextureFormat::Depth32Float, TextureUsages::RENDER_ATTACHMENT);
+        let (target_view, depth_view) = (target.create_view(&Default::default()), depth.create_view(&Default::default()));
+        let readback = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: (256 * SIZE) as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let planes = if shot.any_twin { CavePlanes::Cliff } else { CavePlanes::of([&verts[0], &verts[1], &verts[2]]) };
+        let chunks = [CaveChunk { first: 0, count: 3, min: [-1.0, -1.0, 0.0], max: [3.0, 3.0, 1.0], lip: 0, planes }];
+        let draws = [BakedCaveDraw {
+            model: &model.bind_group,
+            lightmap: &lightmap.bind_group,
+            vertices: &vb,
+            indices: &ib,
+            index_count: 3,
+            chunks: &chunks,
+            emissive: shot.emissive,
+            placed: Mat4::from_translation(world),
+            bounds: (world + Vec3::new(-1.0, -1.0, 0.0), world + Vec3::new(3.0, 3.0, 1.0)),
+        }];
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(Operations { load: LoadOp::Clear(1.0), store: StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                multiview_mask: None,
+                occlusion_query_set: None,
+            });
+            if shot.mirror {
+                pipelines.draw_mirror(&mut pass, &uniforms.bind_group, &material.bind_group, draws.iter());
+            } else {
+                let drawn = pipelines.draw_scene(&mut pass, &uniforms.bind_group, &material.bind_group, &draws, None, shot.spotless, false, None);
+                assert_eq!(drawn, 1);
+            }
+        }
+        encoder.copy_texture_to_buffer(
+            TexelCopyTextureInfo { texture: &target, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(SIZE) },
+            },
+            Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(encoder.finish()));
+        let slice = readback.slice(..);
+        slice.map_async(MapMode::Read, |_| {});
+        device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            panic!("the baked cave's pipelines do not validate against a model's bind groups: {e}");
+        }
+        let data = slice.get_mapped_range().unwrap();
+        let at = (SIZE / 2) as usize * 256 + (SIZE / 2) as usize * 4;
+        Some([data[at], data[at + 1], data[at + 2], data[at + 3]])
+    }
+
+    macro_rules! shot {
+        ($s:expr) => {
+            match render($s) {
+                Some(p) => p,
+                None => {
+                    eprintln!("no GPU adapter: skipped");
+                    return;
+                }
+            }
+        };
+    }
+
+    #[test]
+    fn each_weight_draws_its_own_layer_and_the_pixel_is_opaque() {
+        let red = shot!(Shot { weights: [255, 0, 0, 0], ..Default::default() });
+        let blue = shot!(Shot { weights: [0, 0, 255, 0], ..Default::default() });
+        let white = shot!(Shot { weights: [0, 0, 0, 255], ..Default::default() });
+        assert!(red[0] > 40 && red[0] > red[2] * 3, "layer 0 is red: {red:?}");
+        assert!(blue[2] > 40 && blue[2] > blue[0] * 3, "layer 2 is blue: {blue:?}");
+        assert!(white[0] > 40 && white[0].abs_diff(white[2]) < 12, "layer 3 is white: {white:?}");
+        assert_eq!([red[3], blue[3], white[3]], [255; 3]);
+
+        let none = shot!(Shot { weights: [0; 4], ..Default::default() });
+        assert!(none[0] as u32 + none[1] as u32 + none[2] as u32 > 30, "{none:?}");
+    }
+
+    #[test]
+    fn a_layer_is_read_at_the_worlds_coordinate_on_its_plane() {
+
+        let at = |planes: [u8; 4], world: [f32; 3]| render(Shot { planes, world, ..Default::default() });
+
+        let z = [0, 0, 255, 0];
+        let Some(a) = at(z, [0.1, 0.1, 0.0]) else { return };
+        let b = at(z, [0.7, 0.1, 0.0]).unwrap();
+        let c = at(z, [0.1, -0.3, 0.0]).unwrap();
+        let d = at(z, [0.1, 0.1, 0.4]).unwrap();
+        assert!(b[0] > a[0] + 15 && b[1].abs_diff(a[1]) < 12, "x moves the read across: {a:?} {b:?}");
+        assert!(a[1] > c[1] + 10 && c[0].abs_diff(a[0]) < 12, "y moves it down: {a:?} {c:?}");
+        for k in 0..3 {
+            assert!(d[k].abs_diff(a[k]) <= 3, "along the plane's own axis nothing moves: {a:?} {d:?}");
+        }
+
+        let x = [255, 0, 0, 0];
+        let (xa, xb, xc) = (at(x, [0.0, 0.1, -0.4]).unwrap(), at(x, [0.0, 0.1, 0.2]).unwrap(), at(x, [0.4, 0.1, -0.4]).unwrap());
+        assert!(xb[0] > xa[0] + 15 && xb[1].abs_diff(xa[1]) < 12, "{xa:?} {xb:?}");
+        assert!((0..3).all(|k| xc[k].abs_diff(xa[k]) <= 3), "{xa:?} {xc:?}");
+        let y = [0, 255, 0, 0];
+        let (ya, yb, yc) = (at(y, [0.1, 0.0, -0.4]).unwrap(), at(y, [0.1, 0.0, 0.2]).unwrap(), at(y, [0.1, 0.4, -0.4]).unwrap());
+        assert!(yb[1] > ya[1] + 10 && yb[0].abs_diff(ya[0]) < 12, "{ya:?} {yb:?}");
+        assert!((0..3).all(|k| yc[k].abs_diff(ya[k]) <= 3), "{ya:?} {yc:?}");
+    }
+
+    #[test]
+    fn two_planes_blend_by_their_shares_and_a_plane_with_no_share_is_not_read() {
+
+        let world = [0.1, 0.3, 0.3];
+        let Some(x) = render(Shot { planes: [255, 0, 0, 0], world, ..Default::default() }) else { return };
+        let z = render(Shot { planes: [0, 0, 255, 0], world, ..Default::default() }).unwrap();
+        let half = render(Shot { planes: [128, 0, 127, 0], world, ..Default::default() }).unwrap();
+        let mostly_z = render(Shot { planes: [26, 0, 229, 0], world, ..Default::default() }).unwrap();
+        assert!(x[0].abs_diff(z[0]) > 25, "the two planes read apart here: {x:?} {z:?}");
+        let (lo, hi) = (x[0].min(z[0]), x[0].max(z[0]));
+        assert!(half[0] > lo + 6 && half[0] < hi - 6, "half and half lies between: {x:?} {half:?} {z:?}");
+        assert!(mostly_z[0].abs_diff(z[0]) < half[0].abs_diff(z[0]), "a tenth of x is nearer z: {mostly_z:?} {half:?} {z:?}");
+
+        let none = render(Shot { planes: [0; 4], world, ..Default::default() }).unwrap();
+        assert!(none[0] as u32 + none[1] as u32 > 30, "{none:?}");
+    }
+
+    #[test]
+    fn at_a_cliff_the_rock_takes_the_cliffs_reading_by_its_share() {
+
+        let ramp = |cliff_share: u8, ground: u8| {
+            render(Shot { planes: [0, 0, 255, cliff_share], cliff: [0, 0, 255], ground, macro_value: 200, ..Default::default() })
+        };
+        let Some(own) = ramp(0, 255) else { return };
+        let cliff = ramp(255, 255).unwrap();
+        let half = ramp(128, 255).unwrap();
+        let no_ground = ramp(255, 0).unwrap();
+        assert!(cliff[0].abs_diff(own[0]) > 25 || cliff[1].abs_diff(own[1]) > 25, "the warp moves the cliff's read: {own:?} {cliff:?}");
+        for k in 0..2 {
+            let (lo, hi) = (own[k].min(cliff[k]), own[k].max(cliff[k]));
+            assert!(half[k] + 4 >= lo && half[k] <= hi + 4, "half the cliff's share lies between: {own:?} {half:?} {cliff:?}");
+        }
+        assert!((0..3).all(|k| no_ground[k].abs_diff(own[k]) <= 3), "none of it away from the ground: {own:?} {no_ground:?}");
+
+        let unshared = render(Shot { planes: [0, 0, 255, 255], cliff: [0; 3], ground: 255, macro_value: 200, ..Default::default() }).unwrap();
+        assert!((0..3).all(|k| unshared[k].abs_diff(own[k]) <= 3), "{own:?} {unshared:?}");
+        let flat = |cliff_share: u8| {
+            render(Shot { weights: [255, 0, 0, 0], planes: [0, 0, 255, cliff_share], cliff: [77, 0, 178], ground: 255, macro_value: 200, ..Default::default() })
+                .unwrap()
+        };
+        let (a, b) = (flat(0), flat(255));
+        assert!((0..3).all(|k| a[k].abs_diff(b[k]) <= 3), "a flat layer is one colour however it is read: {a:?} {b:?}");
+    }
+
+    #[test]
+    fn the_cliffs_reading_is_the_terrains_text() {
+        let cave = baked_cave_shader(CaveShader::default());
+        let ground = crate::renderer::terrain_pipeline::terrain_shader_built(crate::renderer::terrain_pipeline::TerrainRole::Scene, true);
+        for both in [
+            "const CLIFF_WARP_M: f32 = 2.5;",
+            "const CLIFF_BAND_WARP_M: f32 = 3.0;",
+            "const CLIFF_BAND_SCALE_M: f32 = 7.0;",
+            "mat2x2<f32>(0.8, 0.6, -0.6, 0.8)",
+            "vec2<f32>(0.31, 0.57)",
+            "vec2<f32>(0.37, 0.11)",
+            "vec2<f32>(0.35, 1.0)",
+            "0.4 - 0.8 * ",
+            "0.3 + 0.3 * ",
+            "2.3",
+            "* (1.0 + 0.667 * ",
+            " - 2.0, 0.0, 1.0)",
+            "0.57735",
+        ] {
+            assert!(cave.contains(both), "the cave's cliff reading lost `{both}`");
+            assert!(ground.contains(both), "the terrain's cliff reading no longer has `{both}`: bring the cave's along");
+        }
+    }
+
+    #[test]
+    fn the_lightmap_adds_its_light_and_its_alpha_takes_the_sky_away() {
+        let w = Shot { weights: [0, 0, 0, 255], ..Default::default() };
+        let plain = shot!(Shot { ..w });
+        let lit = shot!(Shot { lightmap: [200, 60, 20, 255], weights: [0, 0, 0, 255], ..Default::default() });
+        assert!(lit[0] > plain[0] + 20, "baked light is added: {plain:?} {lit:?}");
+        assert!(lit[0] as i32 - lit[2] as i32 > plain[0] as i32 - plain[2] as i32 + 15, "...in its colour: {plain:?} {lit:?}");
+
+        let texel = shot!(Shot { lightmap: [0, 0, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
+        let vertex = shot!(Shot { aux: [0, 255, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
+        let both = shot!(Shot { lightmap: [0, 0, 0, 0], aux: [0, 255, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
+        assert!(texel[1] + 8 < plain[1] && vertex[1] + 8 < plain[1], "either measure alone darkens: {plain:?} {texel:?} {vertex:?}");
+        assert!(texel[1].abs_diff(vertex[1]) <= 3, "...and by the same: {texel:?} {vertex:?}");
+        assert!(both[1] + 8 < texel[1] && both[1] + 20 < plain[1], "a place neither sees sky from takes none of its light: {plain:?} {texel:?} {both:?}");
+
+        let unbaked_open = shot!(Shot { unbaked: true, weights: [0, 0, 0, 255], ..Default::default() });
+        let unbaked_shut = shot!(Shot { unbaked: true, aux: [0, 255, 0, 0], weights: [0, 0, 0, 255], ..Default::default() });
+        assert!((0..3).all(|k| unbaked_open[k].abs_diff(plain[k]) <= 2), "{plain:?} {unbaked_open:?}");
+        assert!((0..3).all(|k| unbaked_shut[k].abs_diff(both[k]) <= 2), "{both:?} {unbaked_shut:?}");
+    }
+
+    #[test]
+    fn at_the_join_the_rock_takes_the_grounds_sky_and_its_own_a_band_in() {
+        let w = [0, 0, 0, 255];
+
+        let shut = [0, 255, 0, 0];
+        let own = shot!(Shot { weights: w, ground: 0, ground_map: shut, ..Default::default() });
+        let joined = shot!(Shot { weights: w, ground: 255, ground_map: shut, ..Default::default() });
+        let half = shot!(Shot { weights: w, ground: 128, ground_map: shut, ..Default::default() });
+        assert!(joined[1] + 20 < own[1], "at the join the sky is the ground's: {own:?} {joined:?}");
+        assert!(half[1] > joined[1] && half[1] < own[1], "and between, between: {joined:?} {half:?} {own:?}");
+
+        let open = [255, 255, 0, 0];
+        let buried = shot!(Shot { weights: w, aux: [0, 0, 0, 0], lightmap: [0, 0, 0, 0], ground: 0, ground_map: open, ..Default::default() });
+        let lifted = shot!(Shot { weights: w, aux: [0, 0, 0, 0], lightmap: [0, 0, 0, 0], ground: 255, ground_map: open, ..Default::default() });
+        assert!(lifted[1] > buried[1] + 20, "{buried:?} {lifted:?}");
+
+        let lamp = shot!(Shot { weights: w, lightmap: [200, 60, 20, 255], ground: 255, ..Default::default() });
+        let plain = shot!(Shot { weights: w, ground: 255, ..Default::default() });
+        let tide = shot!(Shot { weights: w, aux: [255, 255, 255, 0], ground: 255, ..Default::default() });
+        for k in 0..3 {
+            assert!(lamp[k].abs_diff(plain[k]) <= 2 && tide[k].abs_diff(plain[k]) <= 2, "{plain:?} {lamp:?} {tide:?}");
+        }
+    }
+
+    #[test]
+    fn at_the_join_the_rock_wears_the_grounds_paint() {
+
+        let blue = Some([0, 0, 255, 0]);
+        let own = shot!(Shot { weights: [255, 0, 0, 0], ground: 0, paint: blue, ..Default::default() });
+        let joined = shot!(Shot { weights: [255, 0, 0, 0], ground: 255, paint: blue, ..Default::default() });
+        let half = shot!(Shot { weights: [255, 0, 0, 0], ground: 128, paint: blue, ..Default::default() });
+        assert!(own[0] > own[2] * 3, "a band in, the sculpt's own layer: {own:?}");
+        assert!(joined[2] > joined[0] * 3, "at the join, the terrain's paint: {joined:?}");
+        assert!(half[0] > 10 && half[2] > 10, "between, both: {half:?}");
+
+        let unpainted = shot!(Shot { weights: [255, 0, 0, 0], ground: 255, paint: None, ..Default::default() });
+        assert!(unpainted[0] > unpainted[2] * 3, "{unpainted:?}");
+    }
+
+    #[test]
+    fn the_grounds_macro_variation_reaches_the_rock() {
+        let w = [0, 0, 0, 255];
+        let flat = shot!(Shot { weights: w, macro_strength: 0.0, macro_value: 20, ..Default::default() });
+        let dark = shot!(Shot { weights: w, macro_strength: 0.35, macro_value: 20, ..Default::default() });
+        let light = shot!(Shot { weights: w, macro_strength: 0.35, macro_value: 235, ..Default::default() });
+        assert!(dark[0] + 10 < flat[0] && light[0] > flat[0] + 10, "{dark:?} {flat:?} {light:?}");
+    }
+
+    #[test]
+    fn soot_and_the_tide_band_darken_and_glow_brightens_only_in_its_twin() {
+        let w = [0, 0, 0, 255];
+        let plain = shot!(Shot { weights: w, ..Default::default() });
+        let soot = shot!(Shot { weights: w, aux: [255, 255, 0, 255], ..Default::default() });
+        let tide = shot!(Shot { weights: w, aux: [255, 255, 255, 0], ..Default::default() });
+        assert!(soot[0] + 30 < plain[0], "soot: {plain:?} {soot:?}");
+        assert!(tide[0] + 30 < plain[0], "the tide band: {plain:?} {tide:?}");
+
+        let dark = Shot { weights: w, lightmap: [0, 0, 0, 0], ..Default::default() };
+        let off = shot!(Shot { glow: 63, ..Shot { ..dark } });
+        let dark = Shot { weights: w, lightmap: [0, 0, 0, 0], ..Default::default() };
+        let on = shot!(Shot { glow: 63, emissive: true, ..dark });
+        assert!(on[0] > off[0] + 40, "emissive paint glows in the emissive twin: {off:?} {on:?}");
+    }
+
+    #[test]
+    fn a_glow_takes_its_paints_colour_in_every_class_of_triangle_and_none_in_the_plain_twin() {
+
+        let w = [0, 0, 0, 255];
+        let classes: [(&str, [u8; 4], [u8; 3]); 3] = [
+            ("one plane", [0, 0, 255, 0], [0; 3]),
+            ("its own planes", [60, 195, 0, 0], [0; 3]),
+            ("a cliff's", [0, 55, 200, 128], [0, 100, 155]),
+        ];
+        for (what, planes, cliff) in classes {
+            let dark = || Shot { weights: w, planes, cliff, world: [0.6, 0.3, 0.2], lightmap: [0, 0, 0, 0], glow: 24, ..Default::default() };
+            let none = shot!(Shot { ..dark() });
+            let white = shot!(Shot { emissive: true, ..dark() });
+            let red = shot!(Shot { emissive: true, glow_colour: Some([255, 0, 0]), ..dark() });
+            let blue = shot!(Shot { emissive: true, glow_colour: Some([0, 0, 255]), ..dark() });
+            let also_white = shot!(Shot { emissive: true, glow_colour: Some([255, 255, 255]), ..dark() });
+
+            assert_eq!(white, also_white, "{what}");
+            assert!(white[0] > none[0] + 20 && white[2] > none[2] + 20, "{what}: {none:?} {white:?}");
+
+            assert!(red[0] > none[0] + 20 && red[0] > red[1] + 60 && red[0] > red[2] + 60, "{what}: red {red:?}, none {none:?}");
+            assert!(blue[2] > none[2] + 20 && blue[2] > blue[0] + 60 && blue[2] > blue[1] + 60, "{what}: blue {blue:?}, none {none:?}");
+            assert!(red[1] + 40 < white[1] && blue[0] + 40 < white[0], "{what}: red {red:?}, blue {blue:?}, white {white:?}");
+
+            let plain_red = shot!(Shot { glow_colour: Some([255, 0, 0]), ..dark() });
+            assert_eq!(plain_red, none, "{what}");
+        }
+    }
+
+    #[test]
+    fn the_spotless_and_mirror_twins_draw_the_same_rock() {
+        let base = shot!(Shot { world: [0.3, 0.6, 0.0], ..Default::default() });
+        let spotless = shot!(Shot { world: [0.3, 0.6, 0.0], spotless: true, ..Default::default() });
+        let mirror = shot!(Shot { world: [0.3, 0.6, 0.0], mirror: true, ..Default::default() });
+        for k in 0..4 {
+            assert!(base[k].abs_diff(spotless[k]) <= 2, "{base:?} {spotless:?}");
+
+            assert!(base[k].abs_diff(mirror[k]) <= 12, "{base:?} {mirror:?}");
+        }
+        assert!(mirror[1] > 10, "the mirror twin draws: {mirror:?}");
+    }
+
+    fn corner(planes: [u8; 4]) -> BakedCaveVertex {
+        BakedCaveVertex { planes, ..Zeroable::zeroed() }
+    }
+
+    #[test]
+    fn a_triangle_goes_to_the_twin_that_reads_what_it_reads() {
+        let (x, z) = (corner([255, 0, 0, 0]), corner([0, 0, 255, 0]));
+        assert_eq!(CavePlanes::of([&x, &x, &x]), CavePlanes::One);
+        assert_eq!(CavePlanes::of([&z, &z, &z]), CavePlanes::One);
+
+        assert_eq!(CavePlanes::of([&x, &corner([254, 1, 0, 0]), &x]), CavePlanes::One);
+
+        assert_eq!(CavePlanes::of([&x, &x, &z]), CavePlanes::Own);
+        assert_eq!(CavePlanes::of([&x, &corner([128, 127, 0, 0]), &x]), CavePlanes::Own);
+        assert_eq!(CavePlanes::of([&corner([85, 85, 85, 0]), &x, &z]), CavePlanes::Own);
+
+        assert_eq!(CavePlanes::of([&x, &x, &corner([255, 0, 0, 1])]), CavePlanes::Cliff);
+        assert_eq!(CavePlanes::of([&x, &corner([200, 0, 0, 0]), &x]), CavePlanes::Cliff);
+        assert_eq!(CavePlanes::default(), CavePlanes::Cliff, "a file's own table, and a shader asked for by no class: anything");
+    }
+
+    #[test]
+    fn the_triangles_are_reordered_by_twin_and_none_is_lost() {
+
+        let vertices = [corner([255, 0, 0, 0]), corner([255, 0, 0, 0]), corner([255, 0, 0, 0]), corner([128, 127, 0, 0]), corner([255, 0, 0, 9])];
+
+        let indices = [0, 1, 3, 0, 1, 2, 0, 1, 4, 2, 1, 0, 1, 2, 0, 2, 0, 1];
+        let a = CaveChunk { first: 0, count: 12, min: [0.0; 3], max: [1.0; 3], lip: 3, planes: CavePlanes::Cliff };
+        let b = CaveChunk { first: 12, count: 6, min: [2.0; 3], max: [3.0; 3], lip: 0, planes: CavePlanes::Cliff };
+        let (out, table) = partition(&vertices, &indices, &[a, b]);
+        assert_eq!(out, vec![0, 1, 2, 1, 2, 0, 2, 0, 1, 0, 1, 3, 0, 1, 4, 2, 1, 0]);
+        let run = |first, count, of: CaveChunk, lip, planes| CaveChunk { first, count, min: of.min, max: of.max, lip, planes };
+        assert_eq!(
+            table,
+            vec![
+                run(0, 3, a, 0, CavePlanes::One),
+                run(3, 6, b, 0, CavePlanes::One),
+                run(9, 3, a, 0, CavePlanes::Own),
+                run(12, 6, a, 3, CavePlanes::Cliff),
+            ]
+        );
+
+        let mut before: Vec<[u32; 3]> = indices.chunks(3).map(|t| [t[0], t[1], t[2]]).collect();
+        let mut after: Vec<[u32; 3]> = out.chunks(3).map(|t| [t[0], t[1], t[2]]).collect();
+        before.sort();
+        after.sort();
+        assert_eq!(before, after);
+
+        assert_eq!(visible_ranges(&table, Mat4::IDENTITY, None, Some(CavePlanes::One)), vec![0..9]);
+        assert_eq!(visible_ranges(&table, Mat4::IDENTITY, None, Some(CavePlanes::Own)), vec![9..12]);
+        assert_eq!(visible_ranges(&table, Mat4::IDENTITY, None, Some(CavePlanes::Cliff)), vec![12..18]);
+        assert_eq!(visible_ranges(&table, Mat4::IDENTITY, None, None), vec![0..18]);
+
+        let (out, table) = partition(&vertices, &[0, 1, 99], &[CaveChunk { first: 0, count: 3, ..a }]);
+        assert_eq!((out, table[0].planes), (vec![0, 1, 99], CavePlanes::Cliff));
+    }
+
+    #[test]
+    fn the_one_plane_twin_reads_each_layer_once_and_the_blended_twin_once_a_plane() {
+        let fs_of = |planes| {
+            let src = baked_cave_shader(CaveShader { planes, ..Default::default() });
+            src[src.find("@fragment fn fs_main").unwrap()..].to_string()
+        };
+
+        let one = fs_of(CavePlanes::One);
+        assert_eq!(one.matches("textureSampleGrad(").count(), 5);
+        for absent in ["in.planes", "in.cliff", "in.wpos", "dpdx(wp)", "cliff_warp", "entries_left"] {
+            assert!(!one.contains(absent), "the one-plane twin has no {absent}");
+        }
+        assert!(one.contains("let uv = in.uv.xy;") && one.contains("whiteout(in.axis, tn, nw)"));
+
+        let own = fs_of(CavePlanes::Own);
+        assert_eq!(own.matches("textureSampleGrad(").count(), 15);
+        for (share, swizzle, axis) in [("x", "zy", "0u"), ("y", "xz", "1u"), ("z", "xy", "2u")] {
+            let block = own.find(&format!("if (in.planes.{share} > WEIGHT_EPS) {{")).expect("a plane is read behind its share");
+            let end = block + own[block..].find("\n    }\n").unwrap();
+            assert_eq!(own[block..end].matches("textureSampleGrad(").count(), 5);
+            assert_eq!(own[block..end].matches(&format!("wp.{swizzle} * ")).count(), 2);
+            assert!(own[block..end].contains(&format!("whiteout({axis}, tn, nw)")));
+        }
+        for absent in ["in.cliff", "cliff_warp", "entries_left", "plane_uv("] {
+            assert!(!own.contains(absent), "the blended twin has no {absent}");
+        }
+
+        let vs_of = |planes| {
+            let src = baked_cave_shader(CaveShader { planes, ..Default::default() });
+            src[src.find("struct VOut").unwrap()..src.find("@fragment fn fs_main").unwrap()].to_string()
+        };
+        assert!(vs_of(CavePlanes::One).contains("out.uv        = vec4<f32>(plane_uv(axis, wpos), v.uv1);"));
+        assert!(vs_of(CavePlanes::Own).contains("out.planes    = vec4<f32>(v.planes.xyz, f32(v.misc.y) / 63.0);"));
+    }
+
+    #[test]
+    fn each_twin_draws_what_the_twin_that_draws_anything_draws() {
+        let mixed = [100, 80, 50, 25];
+        let cases = [
+            ("one plane, along z", Shot { world: [0.3, 0.2, 0.0], ..Default::default() }),
+            ("one plane, along x", Shot { planes: [255, 0, 0, 0], world: [5.0, 0.45, 0.6], weights: mixed, ..Default::default() }),
+            ("one plane, along y", Shot { planes: [0, 255, 0, 0], world: [0.35, 2.0, 0.7], weights: mixed, macro_strength: 0.8, macro_value: 40, ..Default::default() }),
+            ("one plane at the ground", Shot { world: [0.6, 0.3, 0.0], ground: 200, ground_map: [90, 200, 60, 0], paint: Some([0, 0, 255, 0]), ..Default::default() }),
+            ("one plane, glowing", Shot { world: [0.6, 0.3, 0.0], glow: 40, emissive: true, ..Default::default() }),
+            ("two planes", Shot { planes: [128, 0, 127, 0], world: [5.2, 0.45, 0.6], weights: mixed, macro_strength: 0.8, macro_value: 200, ..Default::default() }),
+            ("three planes", Shot { planes: [100, 80, 75, 0], world: [0.35, 0.8, 0.7], ..Default::default() }),
+            ("two planes at the ground", Shot { planes: [0, 200, 55, 0], world: [0.6, 0.3, 0.2], ground: 128, ground_map: [90, 200, 60, 0], ..Default::default() }),
+            ("two planes, glowing, spotless", Shot { planes: [60, 195, 0, 0], world: [0.6, 0.3, 0.2], glow: 40, emissive: true, spotless: true, ..Default::default() }),
+        ];
+        for (what, case) in cases {
+            let class = CavePlanes::of([&corner(case.planes), &corner(case.planes), &corner(case.planes)]);
+            assert_ne!(class, CavePlanes::Cliff, "{what} is a twin's");
+            let any = shot!(Shot { any_twin: true, ..copy_of(&case) });
+            let own = shot!(case);
+            assert!(any[0] > 8 || any[1] > 8 || any[2] > 8, "{what}: something is drawn ({any:?})");
+            assert!((0..4).all(|k| any[k].abs_diff(own[k]) <= 2), "{what}: the {class:?} twin draws {own:?}, the twin that draws anything {any:?}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn baked_cave_sizes() {
+        for (name, which) in [
+            ("baked_cave", CaveShader { emissive: false, spotless: false, ..Default::default() }),
+            ("baked_cave_spotless", CaveShader { emissive: false, spotless: true, ..Default::default() }),
+            ("baked_cave_emissive", CaveShader { emissive: true, spotless: false, ..Default::default() }),
+            ("baked_cave_one", CaveShader { emissive: false, spotless: false, planes: CavePlanes::One }),
+            ("baked_cave_one_spotless", CaveShader { emissive: false, spotless: true, planes: CavePlanes::One }),
+            ("baked_cave_own", CaveShader { emissive: false, spotless: false, planes: CavePlanes::Own }),
+            ("baked_cave_own_spotless", CaveShader { emissive: false, spotless: true, planes: CavePlanes::Own }),
+            ("baked_cave_one_emissive", CaveShader { emissive: true, spotless: false, planes: CavePlanes::One }),
+            ("baked_cave_own_emissive", CaveShader { emissive: true, spotless: false, planes: CavePlanes::Own }),
+        ] {
+            let src = ViewMode::Mono.shader(baked_cave_shader(which));
+            println!("{}", crate::renderer::shader_inlining::report(name, &src, "fs_main", 8));
+        }
+        let old = ViewMode::Mono.shader(crate::renderer::layered_mesh_pipeline::layered_mesh_shader());
+        println!("{}", crate::renderer::shader_inlining::report("layered_mesh (shipped)", &old, "fs_main", 4));
+    }
+}

@@ -1,5 +1,4 @@
     use super::*;
-    use crate::renderer::mesh::skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, IDLE_BLEND};
 
     fn workspace_root() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -68,7 +67,8 @@
             let ok = std::process::Command::new(&candidate)
                 .args(["-c", &probe])
                 .status()
-                .is_ok_and(|s| s.success());
+                .map(|s| s.success())
+                .unwrap_or(false);
             if ok {
                 return Some(candidate);
             }
@@ -227,6 +227,10 @@
     }
 
     pub(crate) fn headless_gpu() -> Option<(wgpu::Device, wgpu::Queue, wgpu::BindGroupLayout)> {
+        headless_gpu_with(wgpu::Features::empty())
+    }
+
+    fn headless_gpu_with(required_features: wgpu::Features) -> Option<(wgpu::Device, wgpu::Queue, wgpu::BindGroupLayout)> {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             apply_limit_buckets: false,
@@ -235,8 +239,11 @@
             force_fallback_adapter: false,
         }))
         .ok()?;
+        if !adapter.features().contains(required_features) {
+            return None;
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: crate::renderer::uniforms::scene_limits(wgpu::Limits::default()),
             ..Default::default()
         }))
@@ -276,6 +283,67 @@
         Some((device, queue, layout))
     }
 
+    /// A model's maps encoded ahead (`bin/model_astc`) upload as ASTC, and an
+    /// encoding that no longer matches its images falls back to RGBA.
+    #[test]
+    fn model_maps_load_as_astc_and_stale_ones_fall_back() {
+        use crate::renderer::brush_astc::BrushAstc;
+        use crate::renderer::terrain_pipeline::{astcenc_level, AstcArray, ASTC_BLOCK};
+        let astcenc = workspace_root().join("../tools/astcenc-5.7.0/bin/astcenc");
+        let source = workspace_root().join("games/artytest1/models/doors/latch_door.glb");
+        if !astcenc.exists() || !source.exists() {
+            eprintln!("skipping: no astcenc or no latch_door.glb");
+            return;
+        }
+        let Some((device, queue, layout)) = headless_gpu_with(wgpu::Features::TEXTURE_COMPRESSION_ASTC) else {
+            eprintln!("skipping: this GPU reads no ASTC");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("model_astc_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let glb = dir.join("latch_door.glb");
+        std::fs::copy(&source, &glb).unwrap();
+
+        let (doc, _buffers, images) = gltf::import(&glb).unwrap();
+        let astc_dir = model_astc_dir(&glb);
+        std::fs::create_dir_all(&astc_dir).unwrap();
+        let mut files = Vec::new();
+        for material in doc.materials() {
+            let (base, _) = material_images(&material, &images);
+            if base.1 * base.2 <= 1 || base.1 % 4 != 0 || base.2 % 4 != 0 {
+                continue;
+            }
+            let chain = model_mips(&base);
+            let data: Vec<Vec<u8>> = chain.iter().map(|l| astcenc_level(&astcenc, "fast", true, &l.rgba, l.width, l.height, &dir).unwrap()).collect();
+            let file = BrushAstc {
+                source: model_image_fingerprint(ModelMap::Base, &base),
+                array: AstcArray { block: ASTC_BLOCK, srgb: true, width: base.1, height: base.2, levels: chain.len() as u32, data: vec![data] },
+            };
+            let path = model_astc_path(&astc_dir, material.index(), ModelMap::Base);
+            std::fs::write(&path, file.to_bytes()).unwrap();
+            files.push((path, file));
+        }
+        assert!(!files.is_empty(), "latch_door.glb should have a textured material");
+
+        let formats = |mesh: &GltfMesh| mesh.primitives.iter().map(|p| p.texture.texture.format()).collect::<Vec<_>>();
+        let mesh = GltfMesh::load(&device, &queue, &layout, &glb).expect("latch_door.glb should load");
+        let astc = formats(&mesh).iter().filter(|f| matches!(f, wgpu::TextureFormat::Astc { .. })).count();
+        assert!(astc > 0, "the encoded maps should upload as ASTC, got {:?}", formats(&mesh));
+
+        for (path, file) in &files {
+            let stale = BrushAstc { source: file.source ^ 1, array: file.array.clone() };
+            std::fs::write(path, stale.to_bytes()).unwrap();
+        }
+        let mesh = GltfMesh::load(&device, &queue, &layout, &glb).expect("latch_door.glb should load");
+        assert!(
+            formats(&mesh).iter().all(|f| !matches!(f, wgpu::TextureFormat::Astc { .. })),
+            "a stale encoding must not be uploaded, got {:?}",
+            formats(&mesh)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn real_skinned_fixtures_still_load_correctly() {
         let Some((device, queue, layout)) = headless_gpu() else {
@@ -306,6 +374,24 @@
         }
     }
 
+    #[test]
+    fn a_bodys_see_through_parts_are_marked_blended() {
+        let Some((device, queue, layout)) = headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available in this environment");
+            return;
+        };
+        let root = workspace_root();
+        for (rel, some_blended) in [("game/models/boy/boy.glb", true), ("game/models/left_hand.glb", false)] {
+            let mesh = GltfMesh::load(&device, &queue, &layout, &root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            let prims = &mesh.skin.as_ref().expect("skinned").primitives;
+            let blended = prims.iter().filter(|p| p.blended).count();
+            println!("{rel}: {blended} of {} skinned primitives blended", prims.len());
+            assert_eq!(blended > 0, some_blended, "{rel}");
+            assert!(blended < prims.len(), "{rel}: every part blended");
+        }
+    }
+
+    use crate::renderer::mesh::skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, IDLE_BLEND};
 
     fn pose(name: &str, entries: Vec<(usize, Vec3)>, joints: usize) -> GltfAnimationPose {
         let mut joint_transforms = vec![None; joints];

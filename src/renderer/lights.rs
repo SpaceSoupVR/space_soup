@@ -228,7 +228,11 @@ pub fn dynamic_sun_matrix(world_dir: Vec3, head_world: Vec3) -> glam::Mat4 {
     let centre = head_world - Vec3::Y * 0.9;
     let m = directional_light_matrix(world_dir, centre, SUN_DYNAMIC_RADIUS);
     let half = SUN_DYNAMIC_DIM as f32 * 0.5;
-    let o = m.project_point3(Vec3::ZERO);
+    // Snapped to hold the player's pivot on a texel corner, not the world's
+    // origin: redrawn each frame along the gliding sun, a point 30 m from
+    // the origin crept 0.12 texel a frame at a 20-minute day, and the
+    // shadows' stairs crawled (`static_sun_pivot`, 2026-10-23).
+    let o = m.project_point3(static_sun_pivot(head_world));
     let snap = |v: f32| (v * half).round() / half - v;
     glam::Mat4::from_translation(Vec3::new(snap(o.x), snap(o.y), 0.0)) * m
 }
@@ -238,6 +242,17 @@ pub struct StaticSunShadow {
     pub signature: ((usize, usize), (usize, usize), [u32; 3]),
 
     pub world_view_proj: glam::Mat4,
+
+    /// The level's world bounds the map is fitted to (`static_sun_bounds`),
+    /// kept while the geometry is: they do not depend on the sun, and
+    /// walking every vertex again at each of the clock's steps took the
+    /// render thread's time once a second.
+    pub bounds: (Vec3, Vec3),
+
+    /// While the light glides: the two maps' turn (`SunPair`) and each
+    /// layer's world view-projection.
+    pub pair: Option<SunPair>,
+    pub layers: [glam::Mat4; 2],
 }
 
 pub const STATIC_SUN_MARGIN: f32 = 0.5;
@@ -248,6 +263,15 @@ pub fn static_sun_matrix(
     ground: Option<impl Iterator<Item = [f32; 3]>>,
     player_to_world: glam::Mat4,
 ) -> glam::Mat4 {
+    static_sun_matrix_in(world_dir, static_sun_bounds(brushes, ground, player_to_world))
+}
+
+/// The world bounds `static_sun_matrix` fits its map to.
+pub fn static_sun_bounds(
+    brushes: Option<impl Iterator<Item = [f32; 3]>>,
+    ground: Option<impl Iterator<Item = [f32; 3]>>,
+    player_to_world: glam::Mat4,
+) -> (Vec3, Vec3) {
     let bounds = |points: &mut dyn Iterator<Item = [f32; 3]>| {
         let mut lo = Vec3::splat(f32::INFINITY);
         let mut hi = Vec3::splat(f32::NEG_INFINITY);
@@ -261,7 +285,117 @@ pub fn static_sun_matrix(
     let found = brushes
         .and_then(|mut b| bounds(&mut b))
         .or_else(|| ground.and_then(|mut g| bounds(&mut g)));
-    let (lo, hi) = found.unwrap_or((Vec3::splat(-10.0), Vec3::splat(10.0)));
+    found.unwrap_or((Vec3::splat(-10.0), Vec3::splat(10.0)))
+}
+
+/// How far the gliding sun moves before the static map is drawn again along
+/// it (`Levers::smooth_sun_shadow`): 0.1 degrees, which moves the shadow of a
+/// 10 m wall by 1.7 cm, under half of the map's 4.5 cm texel, so the edge
+/// slides through the filter instead of stepping. At a 20-minute day that
+/// is a redraw about every third of a second (every 12 frames at 36 fps).
+pub const STATIC_SUN_REDRAW_COS: f32 = 0.999_998_5;
+
+/// THE STATIC MAP TURNS ABOUT THE PLAYER (2026-10-23, user: the shadows,
+/// the terrain's too, "dancing ... in circular cycles instead of smoothly
+/// sliding"). Turned 0.1 degrees about the level's middle at each redraw
+/// (`STATIC_SUN_REDRAW_COS`), a point r metres from it moved r x 1.7 mm
+/// across the map's texels -- 10 cm, two texels, 60 m out -- so every redraw
+/// cut each shadow edge's stair at a new phase. Turned about `pivot` with the
+/// map's box snapped to whole texels around it, a point near the pivot keeps
+/// its place on the texels, and its shadow moves only as the sun does. The
+/// pivot is the player's place on a grid of `STATIC_SUN_PIVOT_CELL` metres,
+/// so walking does not move it.
+pub const STATIC_SUN_PIVOT_CELL: f32 = 8.0;
+
+/// THE STATIC SUN'S TWO MAPS while the light glides (`Levers::smooth_sun_shadow`,
+/// `sun_static_visibility` in the lights block). Each time the sun has
+/// gone `STATIC_SUN_REDRAW_COS` past the newer map, the older is drawn
+/// again along the sun as it is and becomes the newer. Between, the maps
+/// are blended by how far the sun has gone past the newer, so the shadows
+/// shown trail the sun by one step and creep on with it: just before a
+/// redraw they are the newer map's whole, and just after it the same map
+/// is the older at share 0.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SunPair {
+    /// Each layer's sun (the direction toward it); `newest` the newer's
+    /// layer, `alone` while only it holds a map.
+    pub dirs: [Vec3; 2],
+    pub newest: usize,
+    pub alone: bool,
+}
+
+/// What one frame of a `SunPair` does: the layer to draw along the sun now,
+/// if any; the older and newer layers shown, and the newer's share.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SunPairFrame {
+    pub record: Option<usize>,
+    pub older: usize,
+    pub newer: usize,
+    pub share: f32,
+}
+
+impl SunPair {
+    /// The angle of one redraw step, radians.
+    pub fn step_angle() -> f32 {
+        (1.0 - STATIC_SUN_REDRAW_COS * STATIC_SUN_REDRAW_COS).sqrt().asin()
+    }
+
+    /// The frame for a sun toward `sun` (unit); `pair` None (or a sun more
+    /// than two steps off, a jump of the clock) starts over with one map.
+    pub fn frame(pair: &mut Option<SunPair>, sun: Vec3) -> SunPairFrame {
+        let step = Self::step_angle();
+        // Angles this small from the cross product: 1 - cos is under 2e-6
+        // at a step, and f32's cos reads it to a few per cent.
+        let apart = |a: Vec3, b: Vec3| if a.dot(b) <= 0.0 { std::f32::consts::PI } else { a.cross(b).length().min(1.0).asin() };
+        let Some(p) = pair.as_mut().filter(|p| apart(p.dirs[p.newest], sun) <= 2.0 * step) else {
+            *pair = Some(SunPair { dirs: [sun; 2], newest: 0, alone: true });
+            return SunPairFrame { record: Some(0), older: 0, newer: 0, share: 0.0 };
+        };
+        let gone = apart(p.dirs[p.newest], sun);
+        if gone >= step {
+            let layer = 1 - p.newest;
+            p.dirs[layer] = sun;
+            p.newest = layer;
+            p.alone = false;
+            return SunPairFrame { record: Some(layer), older: 1 - layer, newer: layer, share: 0.0 };
+        }
+        if p.alone {
+            return SunPairFrame { record: None, older: p.newest, newer: p.newest, share: 0.0 };
+        }
+        SunPairFrame { record: None, older: 1 - p.newest, newer: p.newest, share: (gone / step).clamp(0.0, 1.0) }
+    }
+}
+
+/// The pivot `static_sun_matrix_about` turns about for a player at `at`.
+pub fn static_sun_pivot(at: Vec3) -> Vec3 {
+    (at / STATIC_SUN_PIVOT_CELL).floor() * STATIC_SUN_PIVOT_CELL + Vec3::splat(0.5 * STATIC_SUN_PIVOT_CELL)
+}
+
+/// `static_sun_matrix_in` turned about `pivot` on a map `dim` texels wide:
+/// the same box and depth range, shifted under a whole number of texels so
+/// the pivot sits on a texel corner.
+pub fn static_sun_matrix_about(world_dir: Vec3, (lo, hi): (Vec3, Vec3), pivot: Vec3, dim: u32) -> glam::Mat4 {
+    let centre = (lo + hi) * 0.5;
+    let radius = (hi - lo).length() * 0.5 * (1.0 + STATIC_SUN_MARGIN) + 1.0;
+    let d = match world_dir.normalize_or_zero() {
+        Vec3::ZERO => Vec3::NEG_Y,
+        n => n,
+    };
+    let up = if d.dot(Vec3::Y).abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let dist = 2.0 * (radius + (centre - pivot).length());
+    let view = glam::Mat4::look_at_rh(pivot - d * dist, pivot, up);
+    let c = view.transform_point3(centre);
+    let texel = 2.0 * radius / dim.max(1) as f32;
+    let left = ((c.x - radius) / texel).floor() * texel;
+    let bottom = ((c.y - radius) / texel).floor() * texel;
+    // The depth range `directional_light_matrix` gives: from 2 radii before
+    // the middle to one past it, so the biases mean what they did.
+    let proj = glam::Mat4::orthographic_rh(left, left + 2.0 * radius, bottom, bottom + 2.0 * radius, -c.z - 2.0 * radius, -c.z + radius);
+    proj * view
+}
+
+/// The static sun map along `world_dir` over world bounds `(lo, hi)`.
+pub fn static_sun_matrix_in(world_dir: Vec3, (lo, hi): (Vec3, Vec3)) -> glam::Mat4 {
     let centre = (lo + hi) * 0.5;
     let radius = (hi - lo).length() * 0.5 * (1.0 + STATIC_SUN_MARGIN) + 1.0;
     crate::renderer::shadow::directional_light_matrix(world_dir, centre, radius)
@@ -352,6 +486,8 @@ pub struct LitSurface {
     pub forward: Vec3,
     pub right: Vec3,
     pub tan_half: f32,
+    pub near: f32,
+    pub far: f32,
 }
 
 pub const MAX_LIT_SURFACES: usize = 6;
@@ -368,8 +504,8 @@ fn pack_lit_surfaces(surfaces: &[LitSurface], pool_row: Option<u32>) -> [[f32; 4
         out[at] = [s.normal.x, s.normal.y, s.normal.z, s.offset];
         out[at + 1] = [s.lens.x, s.lens.y, s.lens.z, s.tan_half];
         out[at + 2] = [s.forward.x, s.forward.y, s.forward.z, row as f32];
-        out[at + 3] = [s.right.x, s.right.y, s.right.z, 0.0];
-        out[at + 4] = [s.albedo.x, s.albedo.y, s.albedo.z, 0.0];
+        out[at + 3] = [s.right.x, s.right.y, s.right.z, s.near];
+        out[at + 4] = [s.albedo.x, s.albedo.y, s.albedo.z, s.far];
     }
     out
 }
@@ -400,6 +536,12 @@ pub struct LightsUniform {
     pool_row: std::cell::Cell<Option<u32>>,
 
     tile_lamps: std::cell::Cell<[usize; super::shadow::MAX_CHARACTER_SHADOWS]>,
+
+    pool_light: std::cell::RefCell<Vec<(Vec3, f32, f32)>>,
+
+    /// The radiance a lamp's reach ends at (`effective_range`); 0 keeps
+    /// every lamp's authored range.
+    cutoff: std::cell::Cell<f32>,
 }
 
 impl LightsUniform {
@@ -419,7 +561,25 @@ impl LightsUniform {
             surfaces: std::cell::Cell::new([None; MAX_LIT_SURFACES]),
             pool_row: std::cell::Cell::new(None),
             tile_lamps: std::cell::Cell::new([usize::MAX; super::shadow::MAX_CHARACTER_SHADOWS]),
+            pool_light: std::cell::RefCell::new(Vec::new()),
+            cutoff: std::cell::Cell::new(0.0),
         }
+    }
+
+    /// Lamps reach only as far as their light stays above `radiance`
+    /// (`Levers::light_cutoff` over the frame's exposure); 0 is off.
+    pub fn set_cutoff(&self, radiance: f32) {
+        self.cutoff.set(if radiance.is_finite() { radiance.max(0.0) } else { 0.0 });
+    }
+
+    pub fn set_pool_light(&self, samples: &[(Vec3, f32, f32)]) {
+        let mut held = self.pool_light.borrow_mut();
+        held.clear();
+        held.extend_from_slice(samples);
+    }
+
+    pub fn pool_light(&self) -> Vec<(Vec3, f32, f32)> {
+        self.pool_light.borrow().clone()
     }
 
     pub fn set_tile_lamps(&self, lamps: &[usize]) {
@@ -497,7 +657,7 @@ impl LightsUniform {
         spot_layers: &[usize],
         sun_is_baked: bool,
     ) {
-        let mut gpu = pack_lights(lights, live, spot_layers, sun_is_baked, self.culling.get());
+        let mut gpu = pack_lights(lights, live, spot_layers, sun_is_baked, self.culling.get(), self.cutoff.get());
         for (k, &l) in self.tile_lamps.get().iter().enumerate() {
 
             if let Some(slot) = gpu.lights.get_mut(l).filter(|s| s.params[3] == -1.0) {
@@ -520,7 +680,26 @@ pub const SURFACE_LIGHT: f32 = -2.0;
 
 pub const SURFACE_LIGHT_MIN_BAND: f32 = 0.5;
 
-fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_baked: bool, culling: bool) -> GpuLights {
+/// LIGHTS CULLED BY BRIGHTNESS, NOT ONLY RANGE (colleague's plan part 2,
+/// item 5): where a point or spot lamp's inverse-square light falls under
+/// `cutoff` radiance, clamped to its authored range. A dim lamp at the edge
+/// of a long range otherwise costs every pixel inside it the same as a bright
+/// one. The shader's window, (1 - (d/r)^4)^2, is drawn over this reach, so
+/// the light ends smoothly there. Lamps with a baked mask, surface lights and
+/// the sun keep their range.
+pub fn effective_range(l: &Light, cutoff: f32) -> f32 {
+    if cutoff <= 0.0 || l.kind == LightKind::Directional || l.mask_channel.is_some() || l.is_surface_light() {
+        return l.range;
+    }
+    let c = l.color.to_linear();
+    let peak = l.intensity.max(0.0) * c[0].max(c[1]).max(c[2]);
+    (peak / cutoff).sqrt().clamp(LAMP_RADIUS_M, l.range.max(LAMP_RADIUS_M))
+}
+
+/// The shader's `LAMP_RADIUS` floor under a lamp's distance, in metres.
+const LAMP_RADIUS_M: f32 = 0.05;
+
+fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_baked: bool, culling: bool, cutoff: f32) -> GpuLights {
     {
         let count = lights.len().min(MAX_LIGHTS);
         let surface = lights.iter().take(live.min(count)).take_while(|l| l.is_surface_light()).count();
@@ -542,7 +721,7 @@ fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_bake
             let baked = sun_is_baked && l.kind == LightKind::Directional;
 
             let marker = match l.mask_channel {
-                Some(c) => 2.0 + f32::from(c),
+                Some(c) => 2.0 + c as f32,
                 None if baked => 1.0,
                 None if !l.in_level_bake => -1.0,
                 None => 0.0,
@@ -552,7 +731,7 @@ fn pack_lights(lights: &[Light], live: usize, spot_layers: &[usize], sun_is_bake
                 direction: [l.direction.x, l.direction.y, l.direction.z, cos_inner],
                 color_intensity: [color[0], color[1], color[2], l.intensity],
                 params: [
-                    l.range,
+                    effective_range(l, cutoff),
                     cos_outer,
                     kind,
                     if l.casts_shadow() { -1.0 } else { SURFACE_LIGHT - l.source_radius.max(0.0) },
@@ -615,6 +794,8 @@ pub struct LightsBlockOptions {
     pub card_relit: bool,
 
     pub long_step_from_plane: bool,
+
+    pub open_fallback: bool,
 }
 
 pub const PROBE_EDGE_FOOTPRINTS: f32 = 1.0;
@@ -628,7 +809,14 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
         card_tests_filtered,
         card_relit,
         long_step_from_plane,
+        open_fallback,
     } = options;
+
+    let open_fallback_code = if open_fallback {
+        "            if (camera.portal_params.y < -0.5) {\n                hit.pos = world_pos;\n                hit.found = true;\n                hit.escaped = true;\n                return hit;\n            }\n"
+    } else {
+        ""
+    };
 
     let spot_long_step_fn = if long_step_from_plane {
         "var<private> pixel_long_step: f32 = 0.0;\nfn set_pixel_long_step(n_plane: vec3<f32>, view_dir: vec3<f32>) {\n    pixel_long_step = pixel_footprint * inverseSqrt(max(abs(dot(view_dir, n_plane)), SPOT_LONG_MIN_COS));\n}\nfn spot_long_step(vn: f32) -> f32 {\n    return pixel_long_step;\n}"
@@ -657,6 +845,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let proxy_field_tex = binding_index + 10;
     let proxy_card_tex = binding_index + 11;
     let probe_select_binding = binding_index + 12;
+    let cloud_shadow_binding = binding_index + 13;
     let probe_select_rows = 3 * crate::renderer::uniforms::MAX_PROBES;
     let proxy_field_rows = crate::renderer::proxy_field::MAX_PROXY_FIELDS * 3;
     let proxy_card_rows = crate::renderer::uniforms::MAX_PROXIES / 4;
@@ -666,6 +855,10 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let capsules_per_group = crate::renderer::uniforms::CAPSULES_PER_GROUP;
     let character_card_sets = super::proxy_cards::CHARACTER_CARD_SETS;
     let character_card_rows = 2 * character_card_sets;
+    let room_exposure_rooms = crate::renderer::uniforms::ROOM_EXPOSURE_ROOMS;
+    let room_reach_pixels = crate::renderer::exposure::ROOM_REACH_PIXELS;
+    let room_exposure_rows = 2 * room_exposure_rooms;
+    let room_near = 1.5f32;
     let character_card_max_lod = (super::character_cards::CARD_MIPS - 1) as f32;
     let pool_maps_across = super::pool_cards::POOL_MAPS_ACROSS;
     let reflection_contrast = format!("{:?}", crate::renderer::space_warp::REFLECTION_CONTRAST_RATIO);
@@ -753,7 +946,7 @@ pub fn wgsl_lights_block_with(group_index: u32, binding_index: u32, options: Lig
     let ground_trace_readings = crate::renderer::ground_map::GROUND_TRACE_READINGS;
     let ground_trace_steps = crate::renderer::ground_map::GROUND_TRACE_MAX_STEPS;
     format!(
-        r"
+        r#"
 {precision_aliases}
 
 const HF_MAX: f32 = 60000.0;
@@ -806,6 +999,13 @@ struct Camera {{
     capsule_params: vec4<f32>,
 
     character_cards: array<vec4<f32>, {character_card_rows}>,
+
+    room_exposure: array<vec4<f32>, {room_exposure_rows}>,
+
+    cloud_map: array<vec4<f32>, 3>,
+
+    sun_next_view_proj: mat4x4<f32>,
+    sun_blend: vec4<f32>,
 }}
 
 fn to_world_direction(d: vec3<f32>) -> vec3<f32> {{
@@ -840,6 +1040,47 @@ fn to_player_space(w: vec3<f32>) -> vec3<f32> {{
 @group({group_index}) @binding(0) var<uniform> camera: Camera;
 {tonemap_block}
 
+// LOCAL ADAPTATION by room: a closed room seen from outside it -- and its
+// doorways -- is drawn at the eye's exposure times its row's factor
+// (`uniforms::RoomExposure`), so a lit hall seen from the night stays
+// readable while the night stays night. Rows come in pairs, (min, factor)
+// and (max, band); a factor of 0 is an empty row. Asked per pixel, and only
+// where a vertex was near a box (`room_near`). `reach`: how far past its
+// triangle an MSAA edge sample may be shaded, which counts as inside -- a
+// sliver seen edge-on carried its samples tens of centimetres out of the
+// room and drew a white line at night (2026-10-20).
+const ROOM_REACH_PIXELS: f32 = {room_reach_pixels:?};
+
+fn room_local_exposure(p: vec3<f32>, reach: f32) -> f32 {{
+    var e = 1.0;
+    for (var i = 0u; i < {room_exposure_rooms}u; i = i + 1u) {{
+        let lo = camera.room_exposure[2u * i];
+        let hi = camera.room_exposure[2u * i + 1u];
+        if (lo.w <= 0.0) {{
+            break;
+        }}
+        let inside = min(min(min(p.x - lo.x, hi.x - p.x), min(p.y - lo.y, hi.y - p.y)), min(p.z - lo.z, hi.z - p.z)) + reach;
+        e = min(e, pow(lo.w, clamp((inside + hi.w) / max(hi.w, 1e-3), 0.0, 1.0)));
+    }}
+    return e;
+}}
+
+// 1 for a vertex within ROOM_NEAR of a room's box, else 0: carried to the
+// fragment, which asks `room_local_exposure` only where it is above 0.
+fn room_near(p: vec3<f32>) -> f32 {{
+    for (var i = 0u; i < {room_exposure_rooms}u; i = i + 1u) {{
+        let lo = camera.room_exposure[2u * i];
+        let hi = camera.room_exposure[2u * i + 1u];
+        if (lo.w <= 0.0) {{
+            break;
+        }}
+        if (lo.w < 1.0 && all(p > lo.xyz - vec3<f32>({room_near:?})) && all(p < hi.xyz + vec3<f32>({room_near:?}))) {{
+            return 1.0;
+        }}
+    }}
+    return 0.0;
+}}
+
 struct Light {{
     position: vec4<f32>,
     direction: vec4<f32>,
@@ -855,7 +1096,7 @@ struct Lights {{
     surfaces: array<vec4<f32>, {lit_surface_vec4s}>,
 }}
 @group({group_index}) @binding({binding_index}) var<uniform> lights: Lights;
-@group({group_index}) @binding({shadow_tex}) var sun_shadow_tex: texture_depth_2d;
+@group({group_index}) @binding({shadow_tex}) var sun_shadow_tex: texture_depth_2d_array;
 
 @group({group_index}) @binding({sun_dynamic_tex}) var sun_dynamic_shadow_tex: texture_depth_2d;
 @group({group_index}) @binding({shadow_samp}) var shadow_samp: sampler_comparison;
@@ -872,6 +1113,8 @@ struct Lights {{
 @group({group_index}) @binding({proxy_field_tex}) var proxy_field: texture_3d<f32>;
 
 @group({group_index}) @binding({proxy_card_tex}) var proxy_cards: texture_2d<f32>;
+
+@group({group_index}) @binding({cloud_shadow_binding}) var cloud_shadow_map: texture_2d<f32>;
 
 @group({group_index}) @binding({probe_select_binding}) var<uniform> probe_select: array<vec4<f32>, {probe_select_rows}>;
 
@@ -897,6 +1140,15 @@ fn sky_irradiance(n: vec3<f32>) -> vec3<f32> {{
     e = e + camera.sky_sh[6].rgb * (0.315392 * (3.0 * z * z - 1.0)) * 0.25;
     e = e + camera.sky_sh[7].rgb * (1.092548 * x * z) * 0.25;
     e = e + camera.sky_sh[8].rgb * (0.546274 * (x * x - y * y)) * 0.25;
+    return max(e, vec3<f32>(0.0));
+}}
+
+fn sky_irradiance_up() -> vec3<f32> {{
+    var e = vec3<f32>(0.0);
+    e = e + camera.sky_sh[0].rgb * 0.282095 * 1.0;
+    e = e + camera.sky_sh[1].rgb * (0.488603 * 1.0) * 0.6666667;
+    e = e + camera.sky_sh[6].rgb * (0.315392 * (3.0 * 0.0 * 0.0 - 1.0)) * 0.25;
+    e = e + camera.sky_sh[8].rgb * (0.546274 * (0.0 * 0.0 - 1.0 * 1.0)) * 0.25;
     return max(e, vec3<f32>(0.0));
 }}
 const SPEC_STRENGTH: f32 = 0.35;
@@ -1058,9 +1310,18 @@ fn character_card_look(g: i32, p: vec3<f32>, d: vec3<f32>, t: f32, lobe: f32, ey
     let lod = clamp(log2(max(2.0 * footprint / texel, 1.0)), 0.0, CHARACTER_CARD_MAX_LOD);
     let row = (centre.w - 1.0) * res;
     let k = w * w;
-    let across_x = character_card_at(select(1.0, 0.0, w.x < 0.0), uvw.yz, row, res, lod, dims);
-    let across_y = character_card_at(select(3.0, 2.0, w.y < 0.0), uvw.zx, row, res, lod, dims);
-    let across_z = character_card_at(select(5.0, 4.0, w.z < 0.0), uvw.xy, row, res, lod, dims);
+    // The three cards through one copy of the read, in the same order.
+    var across_x = vec4<f32>(0.0);
+    var across_y = vec4<f32>(0.0);
+    var across_z = vec4<f32>(0.0);
+    for (var a = 0u; a < 3u; a = a + 1u) {{
+        let side = select(select(w.z, w.y, a == 1u), w.x, a == 0u);
+        let uv = select(select(uvw.xy, uvw.zx, a == 1u), uvw.yz, a == 0u);
+        let card = character_card_at(f32(2u * a) + select(1.0, 0.0, side < 0.0), uv, row, res, lod, dims);
+        across_x = select(across_x, card, a == 0u);
+        across_y = select(across_y, card, a == 1u);
+        across_z = select(across_z, card, a == 2u);
+    }}
 
     let cover = min(across_x.a, min(across_y.a, across_z.a));
     let seen = k.x * across_x + k.y * across_y + k.z * across_z;
@@ -1181,10 +1442,17 @@ fn capsule_glass_beam(p: vec3<f32>, glass: vec3<f32>) -> f32 {{
         if (dot(apart, apart) >= GLASS_ON_ITS_BEAM * GLASS_ON_ITS_BEAM) {{
             continue;
         }}
+
+        let to_p = p - lights.lights[i].position.xyz;
+        let cos_p = dot(to_p, lights.lights[i].direction.xyz) * inverseSqrt(max(dot(to_p, to_p), 1e-12));
+        let cos_outer = lights.lights[i].params.y;
+        let s = clamp((cos_p - cos_outer) / max(lights.lights[i].direction.w - cos_outer, 1e-4), 0.0, 1.0);
+        let into = select(1.0, s * s * (3.0 - 2.0 * s), lights.lights[i].params.z > 0.5);
         let layer = i32(lights.lights[i].params.w);
         if (SPOT_SHADOWS && layer >= 0 && f32(layer) < camera.shadow_params.y) {{
-            return pcf_layer_tap(spot_shadow_tex, layer, p, spot_view_proj(layer));
+            return into * pcf_layer_tap(spot_shadow_tex, layer, p, spot_view_proj(layer));
         }}
+        return into;
     }}
     return 1.0;
 }}
@@ -1246,6 +1514,12 @@ const PROBE_ENV_FROM_PASS: bool = {probe_from_pass};
 const PROBE_FACE_ALWAYS_GIVEN: bool = {probe_face_always};
 
 const PROBE_SECONDARY_DEFERRED: bool = {defer_secondary};
+
+const PROBE_ALL_OUTDOORS: bool = false;
+
+const PROBE_NOWHERE: bool = false;
+
+const PROBE_OPEN_GROUND: bool = false;
 
 const PROBE_CARD_TESTS_FILTERED: bool = {card_tests_filtered};
 
@@ -1333,6 +1607,62 @@ fn pcf(tex: texture_depth_2d, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>
     return sum / 9.0;
 }}
 
+// THE 3x3 BOX PCF IN FOUR TAPS. Nine compare taps a texel apart weigh the
+// four texels under them, along an axis, 1-t, 1, 1, t (t the fraction of
+// the centre, in texels from the first texel's centre). Two bilinear taps
+// placed so they weigh 1-t : 1 and 1 : t give exactly those weights, so two
+// by two taps carry the nine's filter. `pcf_box_taps` gives, for both axes
+// at once, the two taps' places in texels (`a`, `b`) and weights. Clamping
+// each tap into a tile, as `pcf_tile_at` does, stays exact for a tile of
+// whole texels: a clamped tap reads the edge texel alone, which is what the
+// nine's taps past the edge read too.
+struct PcfBoxTaps {{
+    a: vec2<f32>,
+    b: vec2<f32>,
+    wa: vec2<f32>,
+    wb: vec2<f32>,
+}}
+fn pcf_box_taps(p: vec2<f32>) -> PcfBoxTaps {{
+    let i = floor(p);
+    let t = p - i;
+    return PcfBoxTaps(i - 0.5 + 1.0 / (2.0 - t), i + 1.5 + t / (1.0 + t), 2.0 - t, 1.0 + t);
+}}
+
+// `pcf` on one layer of an array.
+fn pcf_array(tex: texture_depth_2d_array, layer: i32, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
+    let c = shadow_coords(world_pos, light_view_proj);
+    if (c.w < 0.5) {{ return 1.0; }}
+    return pcf_array_at(tex, layer, c.xyz);
+}}
+
+fn pcf_array_at(tex: texture_depth_2d_array, layer: i32, c: vec3<f32>) -> f32 {{
+    let dim = vec2<f32>(textureDimensions(tex));
+    let q = pcf_box_taps(c.xy * dim - vec2<f32>(0.5));
+    var sum = 0.0;
+    for (var k = 0; k < 4; k = k + 1) {{
+        let second = vec2<bool>((k & 1) == 1, k >= 2);
+        let w = select(q.wa, q.wb, second);
+        sum += w.x * w.y * textureSampleCompareLevel(tex, shadow_samp, select(q.a, q.b, second) / dim, layer, c.z);
+    }}
+    return sum / 9.0;
+}}
+
+// THE STATIC SUN MAPS (`lights::SunPair`): while the sun glides, the older
+// and the newer map, blended by how far the sun has gone past the newer.
+// One map redrawn each 0.1 degrees moved every long shadow a texel at each
+// redraw, on a light grid turned a little each time: the edges danced in a
+// cycle (user, headset, 2026-10-23: "updating in a cyclical dancing
+// pattern instead of ... a slow smooth creep"). Blended, an edge creeps
+// from the one map's place to the other's.
+fn sun_static_visibility(world_pos: vec3<f32>) -> f32 {{
+    let b = camera.sun_blend;
+    let older = pcf_array(sun_shadow_tex, i32(b.y + 0.5), world_pos, camera.sun_view_proj);
+    if (b.x <= 0.0) {{
+        return older;
+    }}
+    return mix(older, pcf_array(sun_shadow_tex, i32(b.z + 0.5), world_pos, camera.sun_next_view_proj), b.x);
+}}
+
 fn sun_visibility(l: Light, world_pos: vec3<f32>) -> f32 {{
     var vis = sun_level_visibility(world_pos);
     if (vis > 0.0 && l.position.w > 0.5 && camera.shadow_params.z > 0.5) {{
@@ -1346,9 +1676,29 @@ fn sun_level_visibility(world_pos: vec3<f32>) -> f32 {{
     if (SUN_MASK_EVERYWHERE || receiver_sun_mask >= 0.0) {{
         vis = receiver_sun_mask;
     }} else if (camera.shadow_params.x > 0.5) {{
-        vis = pcf(sun_shadow_tex, world_pos, camera.sun_view_proj);
+        vis = sun_static_visibility(world_pos);
     }}
-    return vis;
+    return vis * cloud_sun_shadow(world_pos);
+}}
+
+// The light the clouds let through to this point (`Uniforms::cloud_map`):
+// their shadows sweep over the ground with the wind.
+fn cloud_sun_shadow(p: vec3<f32>) -> f32 {{
+    if (camera.cloud_map[2].w <= 0.0) {{
+        return 1.0;
+    }}
+    let m = camera.cloud_map[0];
+    let uv = vec2<f32>(m.x * p.x + m.y * p.z, m.z * p.x + m.w * p.z) + camera.cloud_map[1].xy;
+    return textureSampleLevel(cloud_shadow_map, probe_samp, uv, 0.0).r;
+}}
+
+// What a cloud overhead scatters down in place of the sun it hides: its
+// base glows, so ground in a cloud's shadow is lit from above, brighter
+// than by the clear sky alone and with its relief still reading
+// (`Uniforms::cloud_map`).
+fn cloud_fill(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
+    // No test for the map being off: its fill is then zero.
+    return camera.cloud_map[2].xyz * ((1.0 - cloud_sun_shadow(p)) * (0.5 + 0.5 * n.y));
 }}
 
 fn sun_moving_visibility(world_pos: vec3<f32>) -> f32 {{
@@ -1519,23 +1869,17 @@ fn pcf_tile(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, world_pos: 
     return pcf_tile_at(tex, tile, grid, c.xyz);
 }}
 
+// The 3x3 box in four taps (`pcf_box_taps`), each kept inside the tile.
 fn pcf_tile_at(tex: texture_depth_2d, tile: vec2<f32>, grid: vec2<f32>, c: vec3<f32>) -> f32 {{
-
     let tile_texel = grid / vec2<f32>(textureDimensions(tex));
-
-    let guard = tile_texel * 0.5;
-    let lo = guard;
-    let hi = vec2<f32>(1.0) - guard;
-
+    let lo = tile_texel * 0.5;
+    let hi = vec2<f32>(1.0) - lo;
+    let q = pcf_box_taps(c.xy / tile_texel - vec2<f32>(0.5));
     var sum = 0.0;
-    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
-        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
-
-            let off = vec2<f32>(f32(dx), f32(dy)) * tile_texel;
-            let local = clamp(c.xy + off, lo, hi);
-            let uv = (local + tile) / grid;
-            sum = sum + textureSampleCompareLevel(tex, shadow_samp, uv, c.z);
-        }}
+    for (var k = 0; k < 4; k = k + 1) {{
+        let second = vec2<bool>((k & 1) == 1, k >= 2);
+        let w = select(q.wa, q.wb, second);
+        sum += w.x * w.y * pcf_tent_tap(tex, tile, grid, select(q.a, q.b, second) * tile_texel, lo, hi, c.z);
     }}
     return sum / 9.0;
 }}
@@ -1579,6 +1923,13 @@ const TERMINATOR_MAX_WIDTH: f32 = 0.5;
 fn terminator_width_of(normal_length: f32) -> f32 {{
     let sigma2 = max(1.0 - normal_length - 0.01, 0.0) / max(normal_length, 1e-3);
     return min(sqrt(1.5 * sigma2), TERMINATOR_MAX_WIDTH);
+}}
+
+fn lamp_highlight_share(view_dir: vec3<f32>, h: vec3<f32>, nl: f32, facing: f32, shininess: f32, spec_strength: f32) -> f32 {{
+    let g = 1.0 - clamp(dot(view_dir, h), 0.0, 1.0);
+    let g2 = g * g;
+    let fresnel = 0.04 + 0.96 * (g2 * g2 * g);
+    return min(facing, fresnel * (shininess + 8.0) * 0.125 * nl / max(spec_strength, 1e-4));
 }}
 
 fn light_contribution_split(
@@ -1626,7 +1977,7 @@ fn light_contribution_split(
     if (aa.y > 0.0 && atten > 0.0 && l.params.w > -1.5) {{
         let h = normalize(l_dir + view_dir);
         let spec = pow(max(dot(n, h), 0.0), shininess) * spec_strength;
-        out.specular = radiance * spec * atten * aa.y;
+        out.specular = radiance * spec * atten * lamp_highlight_share(view_dir, h, ndotl, aa.y, shininess, spec_strength);
     }}
     return out;
 }}
@@ -1990,6 +2341,38 @@ fn probe_environment(
     let volume_world = select(select_world, to_world_space(probe_volume_pos.xyz), probe_volume_pos.w > 0.5);
     let world_dir = to_world_direction(dir);
     probe_brightness = 0.0;
+
+    if (PROBE_OPEN_GROUND) {{
+
+        probe_eye_distance = distance(cam_pos(), frag_pos);
+        if (roughness > PROBE_TRACE_MAX_ROUGHNESS) {{
+            let unlit = vec4<f32>(0.0);
+            return unlit;
+        }}
+        let open_dir = normalize(world_dir);
+        let open_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);
+        let open_col = probe_escape_colour(world_pos, open_dir, dir, roughness, open_lod);
+        return open_col;
+    }}
+    if (PROBE_NOWHERE) {{
+
+        probe_eye_distance = distance(cam_pos(), frag_pos);
+        let nothing = vec4<f32>(0.0);
+        return nothing;
+    }}
+    if (PROBE_ALL_OUTDOORS) {{
+
+        let away = normalize(world_dir);
+        let away_lod = clamp(roughness * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD);
+        probe_eye_distance = distance(cam_pos(), frag_pos);
+
+        if (roughness > PROBE_TRACE_MAX_ROUGHNESS) {{
+            return probe_outdoor_untraced(probe_choose(select_world, volume_world), world_pos, away, away_lod);
+        }}
+        let col = probe_escape_colour(world_pos, away, dir, roughness, away_lod);
+        probe_reach = 0.0 + probe_reach;
+        return col;
+    }}
     let face_given = PROBE_FACE_ALWAYS_GIVEN || probe_face_given.w > 0.5;
 
     var in_doorway = false;
@@ -2068,6 +2451,32 @@ fn probe_environment(
         }}
     }}
     return probe_through_portals(own, own_room, select_world, world_pos, d, probe_lod);
+}}
+
+fn probe_outdoor_untraced(pick: ProbeChoice, world_pos: vec3<f32>, away: vec3<f32>, away_lod: f32) -> vec4<f32> {{
+    var mine = vec4<f32>(0.0);
+    if (pick.best >= 0) {{
+        var share = 1.0;
+        if (pick.second >= 0) {{
+            let apart = sqrt(pick.second_dist) - sqrt(pick.best_dist);
+            share = 0.5 + 0.5 * smoothstep(0.0, PROBE_BLEND_BAND, apart);
+        }}
+        let near_dir = probe_parallax_direction(world_pos, away, pick.best);
+        let near_layer = i32(camera.probe_boxes[pick.best * 3].w);
+        let near_photo = textureSampleLevel(probe_cube, probe_samp, near_dir, near_layer, away_lod);
+        probe_brightness = camera.probe_boxes[pick.best * 3 + 1].w;
+        mine = near_photo;
+        if (pick.second >= 0) {{
+            let far_photo_dir = probe_parallax_direction(world_pos, away, pick.second);
+            let far_photo = textureSampleLevel(
+                probe_cube, probe_samp, far_photo_dir, i32(camera.probe_boxes[pick.second * 3].w), away_lod
+            );
+
+            probe_brightness = mix(camera.probe_boxes[pick.second * 3 + 1].w, camera.probe_boxes[pick.best * 3 + 1].w, share);
+            mine = mix(far_photo, near_photo, share);
+        }}
+    }}
+    return mine;
 }}
 
 const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.75;
@@ -2652,7 +3061,7 @@ fn probe_trace_skipping(world_pos: vec3<f32>, d: vec3<f32>, room: f32, roughness
 
         let p = probe_portal_holding(world_pos);
         if (p < 0) {{
-            return hit;
+{open_fallback_code}            return hit;
         }}
         let axis = i32(camera.probe_portals[p * 3].w);
         let plo = camera.probe_portals[p * 3].xyz;
@@ -2872,7 +3281,7 @@ fn ground_trace_until(e: vec3<f32>, d: vec3<f32>, t_max: f32) -> f32 {{
     let nudge = sign(dq) * 1e-3;
     var hit = -1.0;
 
-    var risen = false;
+    var risen = d.y <= 0.0;
     for (var steps = 0; steps < GROUND_TRACE_MAX_STEPS && t < t_out; steps = steps + 1) {{
         let cell = f32(1u << u32(level));
         let last = floor(size / cell) - 1.0;
@@ -2930,7 +3339,7 @@ fn outdoor_radiance(e: vec3<f32>, d: vec3<f32>, dir: vec3<f32>, roughness: f32, 
             let texel = 1.0 / max(camera.ground_params.z * f32(textureDimensions(ground_map, 0).x), 1e-6);
             let spread = max(t * probe_lobe_tan(roughness), 1e-4);
             let ground_lod = clamp(log2(spread / texel), 0.0, 12.0);
-            return textureSampleLevel(ground_map, probe_samp, ground_uv(e + d * t), ground_lod).rgb;
+            return textureSampleLevel(ground_map, probe_samp, ground_uv(e + d * t), ground_lod).rgb * exp2(camera.proxy_params.w);
         }}
     }}
     if (b.x >= 0.0) {{
@@ -3076,7 +3485,7 @@ fn probe_surface_relit(h: vec3<f32>, d: vec3<f32>, roughness: f32, t: f32) -> ve
         return vec3<f32>(0.0);
     }}
     let p = to_player_space(h);
-    let k = lit_surface_at(p);
+    let k = lit_surface_at(p, to_player_direction(d));
     let at = max(k, 0) * LIT_SURFACE_VEC4S;
     let glass = lights.surfaces[at + 1];
     let axis = lights.surfaces[at + 2];
@@ -3144,12 +3553,22 @@ fn pool_map_light(k: i32, uv: vec2<f32>, texels: f32) -> vec3<f32> {{
     return lights.surfaces[at + 4].rgb * lit;
 }}
 
-fn lit_surface_at(p: vec3<f32>) -> i32 {{
+fn lit_surface_at(p: vec3<f32>, dp: vec3<f32>) -> i32 {{
     var k = -1;
+    var best = 0.0;
     for (var j = MAX_LIT_SURFACES - 1; j >= 0; j = j - 1) {{
-        let plane = lights.surfaces[j * LIT_SURFACE_VEC4S];
-        let mapped = lights.surfaces[j * LIT_SURFACE_VEC4S + 1].w > 0.0;
-        k = select(k, j, mapped && abs(dot(plane.xyz, p) - plane.w) < LIT_SURFACE_TOLERANCE);
+        let at = j * LIT_SURFACE_VEC4S;
+        let plane = lights.surfaces[at];
+        let glass = lights.surfaces[at + 1];
+        let z = dot(p - glass.xyz, lights.surfaces[at + 2].xyz);
+        let near = lights.surfaces[at + 3].w;
+        let far = lights.surfaces[at + 4].w;
+        let bounded = far > 0.0;
+        let square = select(1.0, -dot(dp, plane.xyz), bounded);
+        let within = !bounded || (z >= near && z <= far);
+        let take = glass.w > 0.0 && abs(dot(plane.xyz, p) - plane.w) < LIT_SURFACE_TOLERANCE && within && square > 0.0 && square >= best;
+        k = select(k, j, take);
+        best = select(best, square, take);
     }}
     return k;
 }}
@@ -3261,8 +3680,9 @@ fn probe_mix_bright(a: vec4<f32>, b: vec4<f32>, k: f32) -> vec4<f32> {{
 }}
 
 fn probe_hit_colour(h: vec3<f32>, room: f32, other: f32, roughness: f32, t: f32, d: vec3<f32>) -> vec4<f32> {{
-
-    let near = probe_nearest_two(h, room, other);
+    // Unrolled: the same two nearest, 0.2-0.4 ms less in the hall views on
+    // the Quest than the loop (2026-10-23, the `def_scan_rolled` cut times it).
+    let near = probe_nearest_two_unrolled(h, room, other);
     let s0 = near.s0;
     let s1 = near.s1;
     let d0 = near.d0;
@@ -3592,6 +4012,7 @@ fn shade_material_env_part(
     if (occ > 0.0) {{
         diffuse = sky_irradiance(n) * occ;
     }}
+    diffuse = diffuse + cloud_fill(world_pos, n) * occ;
     var specular = vec3<f32>(0.0);
 
     let env_n = normalize(mix(n, geom_n, smoothstep(0.1, 0.4, r)));
@@ -3876,7 +4297,7 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
     let view_dir = normalize(cam_pos() - world_pos);
     let flash_idx = u32(camera.shadow_params.z);
 
-    var lit = hf3(min(sky_irradiance(n) * clamp(sky_vis, 0.0, 1.0) * capsule_ambient(world_pos, n), vec3<f32>(HF_MAX)));
+    var lit = hf3(min((sky_irradiance(n) + cloud_fill(world_pos, n)) * clamp(sky_vis, 0.0, 1.0) * capsule_ambient(world_pos, n), vec3<f32>(HF_MAX)));
     for (var i: u32 = 0u; i < live_light_count(); i = i + 1u) {{
         let l = lights.lights[i];
         let arriving = light_contribution(l, world_pos, n, view_dir);
@@ -3902,8 +4323,117 @@ fn shade_with_sky(world_pos: vec3<f32>, n: vec3<f32>, sky_vis: f32) -> vec3<f32>
     }}
     return vec3<f32>(lit);
 }}
-"
+"#
     )
+}
+
+#[cfg(test)]
+mod sun_pair_tests {
+    use super::*;
+
+    /// The sun the shown maps stand for (the older's and the newer's by the
+    /// newer's share) creeps on with the light, one step behind it, and
+    /// never jumps at a redraw or steps back.
+    #[test]
+    fn the_shown_sun_creeps_after_the_light_without_a_jump() {
+        let step = SunPair::step_angle();
+        let mut pair = None;
+        let mut shown_last: Option<f32> = None;
+        let (mut redraws, mut worst_jump, mut worst_lag) = (0, 0.0f32, 0.0f32);
+        let per_frame = step / 37.0;
+        for f in 0..2000 {
+            let a = 0.3 + f as f32 * per_frame;
+            let sun = Vec3::new(a.cos(), a.sin(), 0.0);
+            let fr = SunPair::frame(&mut pair, sun);
+            redraws += fr.record.is_some() as u32;
+            let p = pair.unwrap();
+            let angle = |v: Vec3| v.y.atan2(v.x);
+            let shown = angle(p.dirs[fr.older]) + (angle(p.dirs[fr.newer]) - angle(p.dirs[fr.older])) * fr.share;
+            if let Some(last) = shown_last {
+                let moved = shown - last;
+                assert!(moved >= -1e-6, "frame {f}: the shown sun stepped back by {moved}");
+                worst_jump = worst_jump.max(moved);
+            }
+            if f > 40 {
+                worst_lag = worst_lag.max(a - shown);
+            }
+            shown_last = Some(shown);
+        }
+        eprintln!("SUNPAIR {redraws} redraws; the shown sun moved at most {:.2} frames' light a frame and trailed by at most {:.2} steps", worst_jump / per_frame, worst_lag / step);
+        assert!(worst_jump < 1.6 * per_frame, "the shown sun jumped {} of a frame's {per_frame}", worst_jump);
+        assert!(worst_lag < 1.1 * step, "the shown sun trails by {} steps", worst_lag / step);
+        assert!((redraws as f32 - 2000.0 / 37.0).abs() < 3.0, "{redraws} redraws");
+    }
+
+    /// A clock that jumps starts the pair over: one map, along the sun.
+    #[test]
+    fn a_jump_of_the_clock_starts_over_with_one_map() {
+        let mut pair = None;
+        SunPair::frame(&mut pair, Vec3::Y);
+        SunPair::frame(&mut pair, Vec3::new(0.01, 1.0, 0.0).normalize());
+        let fr = SunPair::frame(&mut pair, Vec3::new(0.5, 1.0, 0.0).normalize());
+        assert_eq!(fr, SunPairFrame { record: Some(0), older: 0, newer: 0, share: 0.0 });
+    }
+}
+
+#[cfg(test)]
+mod static_sun_pivot_tests {
+    use super::*;
+
+    /// Where `p` falls within its texel of a map `dim` wide, x and y.
+    fn phase(m: glam::Mat4, p: Vec3, dim: u32) -> glam::Vec2 {
+        let n = m.project_point3(p);
+        let t = (glam::Vec2::new(n.x, n.y) * 0.5 + 0.5) * dim as f32;
+        t - t.floor()
+    }
+
+    fn worst_phase_step(at: impl Fn(Vec3) -> glam::Mat4, near: Vec3, dim: u32) -> f32 {
+        // The sun gliding 0.1 degrees a redraw, twenty redraws.
+        let dirs: Vec<Vec3> = (0..21)
+            .map(|i| {
+                let a = (35.0f32 + 0.1 * i as f32).to_radians();
+                Vec3::new(a.cos() * 0.6, -a.sin(), a.cos() * 0.8).normalize()
+            })
+            .collect();
+        let pts: Vec<Vec3> = (0..9).map(|k| near + Vec3::new((k % 3) as f32 * 3.0 - 3.0, 0.0, (k / 3) as f32 * 3.0 - 3.0)).collect();
+        let mut worst = 0.0f32;
+        for w in dirs.windows(2) {
+            let (a, b) = (at(w[0]), at(w[1]));
+            let _ = b;
+            for &p in &pts {
+                let d = phase(at(w[1]), p, dim) - phase(a, p, dim);
+                // Across a texel's wrap the step is the short way round.
+                let d = d - d.round();
+                worst = worst.max(d.abs().max_element());
+            }
+        }
+        worst
+    }
+
+    /// A SHADOW NEAR THE PLAYER HOLDS ITS TEXELS as the sun glides: from one
+    /// 0.1-degree redraw to the next, points within a few metres of the
+    /// player keep their place within a texel to a small share of one,
+    /// where the map turned about the level's middle moved them a texel
+    /// or more (the "dancing" shadows, headset 2026-10-23).
+    #[test]
+    fn the_static_map_turns_about_the_player_and_holds_its_texels() {
+        let bounds = (Vec3::new(-60.0, -5.0, -60.0), Vec3::new(60.0, 20.0, 60.0));
+        let dim = 1024;
+        let player = Vec3::new(41.0, 1.7, 33.0);
+        let pivot = static_sun_pivot(player);
+        let about = worst_phase_step(|d| static_sun_matrix_about(d, bounds, pivot, dim), player, dim);
+        let middle = worst_phase_step(|d| static_sun_matrix_in(d, bounds), player, dim);
+        eprintln!("STATIC SUN phase step near the player: {about:.4} texel turned about it, {middle:.4} about the middle");
+        assert!(about < 0.15, "turned about the player, a point near it moves {about:.3} texel a redraw");
+        assert!(middle > 2.0 * about, "the test does not see the old map's drift ({middle:.3} vs {about:.3})");
+        // The whole level stays on the map and within its depth.
+        let m = static_sun_matrix_about(Vec3::new(0.3, -0.8, 0.5).normalize(), bounds, pivot, dim);
+        for k in 0..8 {
+            let c = Vec3::new(if k & 1 == 0 { bounds.0.x } else { bounds.1.x }, if k & 2 == 0 { bounds.0.y } else { bounds.1.y }, if k & 4 == 0 { bounds.0.z } else { bounds.1.z });
+            let n = m.project_point3(c);
+            assert!(n.x.abs() <= 1.0 && n.y.abs() <= 1.0 && (0.0..=1.0).contains(&n.z), "corner {c} falls off the map at {n}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3991,6 +4521,33 @@ mod shadow_slot_tests {
     }
 
     #[test]
+    fn a_lamps_reach_ends_where_its_light_falls_under_the_cutoff() {
+        let lamp = Light {
+            position: Vec3::ZERO,
+            direction: Vec3::NEG_Y,
+            kind: LightKind::Point,
+            color: crate::renderer::Color3(255, 200, 150, 255),
+            intensity: 4.0,
+            range: 20.0,
+            cone_angle_deg: 180.0,
+            inner_cone_angle_deg: 0.0,
+            mask_channel: None,
+            shadow_near: None,
+            source_radius: 0.0,
+            in_level_bake: false,
+        };
+        assert_eq!(effective_range(&lamp, 0.0), 20.0, "off keeps the range");
+        let r = effective_range(&lamp, 0.04);
+        assert!(r < 20.0 && r > 0.0, "{r}");
+        assert!(effective_range(&Light { intensity: 1.0, ..lamp }, 0.04) < r, "a dimmer lamp reaches less far");
+        assert!(effective_range(&Light { intensity: 1e9, ..lamp }, 0.04) <= 20.0, "never past its range");
+        let c = lamp.color.to_linear();
+        let peak = 4.0 * c[0].max(c[1]).max(c[2]);
+        assert!((peak / (r * r) - 0.04).abs() < 1e-3, "the light at the reach is the cutoff");
+        assert_eq!(effective_range(&Light { mask_channel: Some(0), ..lamp }, 0.04), 20.0, "a baked mask keeps its range");
+    }
+
+    #[test]
     fn a_light_whose_shadow_begins_past_its_range_casts_none() {
         let spot = Light {
             position: Vec3::ZERO,
@@ -4012,7 +4569,7 @@ mod shadow_slot_tests {
         let surface = Light { shadow_near: Some(f32::INFINITY), ..spot };
         assert!(!surface.casts_shadow());
 
-        let gpu = pack_lights(&[spot, surface], 2, &[], false, true);
+        let gpu = pack_lights(&[spot, surface], 2, &[], false, true, 0.0);
         assert_eq!(gpu.lights[0].params[3], -1.0);
         assert_eq!(gpu.lights[1].params[3], SURFACE_LIGHT);
         assert!(SURFACE_LIGHT < -1.5, "below the shader's test");
@@ -4023,6 +4580,7 @@ mod shadow_slot_tests {
             &[],
             false,
             true,
+            0.0,
         );
         assert_eq!(wide.lights[0].params[3], SURFACE_LIGHT - 0.6);
         assert_eq!(wide.lights[1].params[3], -1.0);
@@ -4087,9 +4645,9 @@ mod budget_tests {
         assert_eq!(rank_for_budget_indices(&ls, 3), vec![1, 2, 0]);
         assert_eq!(rank_for_budget_indices(&ls, 2), vec![2, 0]);
         let ranked = rank_for_budget(&ls, MAX_LIGHTS);
-        assert_eq!(pack_lights(&ranked, 4, &[], false, true).surface_lights[0], 2);
-        assert_eq!(pack_lights(&[lamp, bounce], 2, &[], false, true).surface_lights[0], 0, "only a leading run");
-        assert_eq!(pack_lights(&[bounce, lamp], 0, &[], false, true).surface_lights[0], 0, "never a baked tail");
+        assert_eq!(pack_lights(&ranked, 4, &[], false, true, 0.0).surface_lights[0], 2);
+        assert_eq!(pack_lights(&[lamp, bounce], 2, &[], false, true, 0.0).surface_lights[0], 0, "only a leading run");
+        assert_eq!(pack_lights(&[bounce, lamp], 0, &[], false, true, 0.0).surface_lights[0], 0, "never a baked tail");
 
         let src = wgsl_lights_block(0, 1);
         assert!(src.contains(SURFACE_LIGHTS_ON));
@@ -4138,7 +4696,7 @@ mod budget_tests {
     #[test]
     fn ranking_is_stable_for_equal_lights() {
 
-        let ls: Vec<Light> = (0..MAX_LIGHTS + 4).map(|_i| point(3.0, 2.0)).collect();
+        let ls: Vec<Light> = (0..MAX_LIGHTS + 4).map(|i| point(3.0, 2.0)).collect();
         let _ = ls;
         let ls: Vec<Light> = (0..MAX_LIGHTS + 4)
             .map(|i| light(LightKind::Point, Vec3::new(3.0, 0.0, i as f32 * 0.0), 2.0))
@@ -4550,10 +5108,53 @@ mod probe_blend_tests {
     }
 
     #[test]
+    fn the_outdoor_twins_rough_answer_is_the_full_pass_s() {
+        let code = shader();
+        let bare = |text: &str| -> String {
+            text.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .flat_map(|l| l.chars())
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let at = |hay: &str, needle: &str| hay.find(needle).unwrap_or_else(|| panic!("missing: {needle}"));
+        let env = &code[at(&code, "fn probe_environment(")..at(&code, "fn probe_outdoor_untraced(")];
+        let full = &env[at(env, "    var own = vec4<f32>(0.0);")..at(env, "    return probe_through_portals(own")];
+        let full = bare(full).replace("varown_room=-1.0;", "").replace("own_room=best_room;", "");
+        let twin = &code[at(&code, "fn probe_outdoor_untraced(")..];
+        let twin = &twin[at(twin, "    var mine = vec4<f32>(0.0);")..at(twin, "    return mine;")];
+        let mut twin = bare(twin);
+        for (mine, theirs) in [
+            ("pick.second_dist", "second_dist"),
+            ("pick.best_dist", "best_dist"),
+            ("pick.second", "second"),
+            ("pick.best", "best"),
+            ("far_photo_dir", "far_dir"),
+            ("far_photo", "far"),
+            ("near_photo", "near"),
+            ("near_dir", "sample_dir"),
+            ("near_layer", "layer"),
+            ("away_lod", "probe_lod"),
+            ("away", "d"),
+            ("apart", "gap"),
+            ("share", "band"),
+            ("mine", "own"),
+        ] {
+            twin = twin.replace(mine, theirs);
+        }
+        assert_eq!(twin, full);
+
+        assert!(code.contains("if (roughness > PROBE_TRACE_MAX_ROUGHNESS || camera.portal_params.y > 0.5) {"));
+        let branch = &env[at(env, "    if (PROBE_ALL_OUTDOORS) {")..at(env, "    let face_given = ")];
+        assert!(at(branch, "if (roughness > PROBE_TRACE_MAX_ROUGHNESS) {") < at(branch, "probe_escape_colour("));
+        assert!(branch.contains("return probe_outdoor_untraced(probe_choose(select_world, volume_world), world_pos, away, away_lod);"));
+    }
+
+    #[test]
     fn the_portal_fades_come_from_the_constants() {
         let code = shader();
-        assert!(code.contains(&format!("const PORTAL_FADE: f32 = {PROBE_PORTAL_FADE:?};")));
-        assert!(code.contains(&format!("const PORTAL_SIDE_FADE: f32 = {PROBE_PORTAL_SIDE_FADE:?};")));
+        assert!(code.contains(&format!("const PORTAL_FADE: f32 = {:?};", PROBE_PORTAL_FADE)));
+        assert!(code.contains(&format!("const PORTAL_SIDE_FADE: f32 = {:?};", PROBE_PORTAL_SIDE_FADE)));
     }
 
     fn portal_high_weight(t: f32, lo: f32, hi: f32, side: f32) -> f32 {
@@ -4570,7 +5171,7 @@ mod probe_blend_tests {
         let (lo, hi) = (2.5, 3.1);
         assert_eq!(portal_high_weight(lo - PROBE_PORTAL_FADE, lo, hi, 0.0), 0.0);
         assert_eq!(portal_high_weight(hi + PROBE_PORTAL_FADE, lo, hi, 0.0), 1.0);
-        assert!((portal_high_weight(f32::midpoint(lo, hi), lo, hi, 0.0) - 0.5).abs() < 1e-6);
+        assert!((portal_high_weight((lo + hi) * 0.5, lo, hi, 0.0) - 0.5).abs() < 1e-6);
         let mut last = 0.0;
         for i in 0..=100 {
             let t = lo - PROBE_PORTAL_FADE + (hi - lo + 2.0 * PROBE_PORTAL_FADE) * i as f32 / 100.0;
@@ -4579,7 +5180,7 @@ mod probe_blend_tests {
             last = w;
         }
 
-        assert_eq!(portal_high_weight(f32::midpoint(lo, hi), lo, hi, PROBE_PORTAL_SIDE_FADE), 0.0);
+        assert_eq!(portal_high_weight((lo + hi) * 0.5, lo, hi, PROBE_PORTAL_SIDE_FADE), 0.0);
     }
 
     fn probe_near_weight(best_dist_sq: f32, second_dist_sq: f32, band: f32) -> f32 {
@@ -5040,7 +5641,7 @@ mod baked_gloss_tests {
 
     fn terminator_aa(nl: f32, w: f32) -> (f32, f32) {
         let facing = ((nl + w) / (2.0 * w).max(1e-6)).clamp(0.0, 1.0);
-        let lambert = if nl.abs() < w { f32::midpoint(nl, w) * facing } else { nl.max(0.0) };
+        let lambert = if nl.abs() < w { 0.5 * (nl + w) * facing } else { nl.max(0.0) };
         (lambert, facing)
     }
 
@@ -5062,12 +5663,12 @@ mod baked_gloss_tests {
                 let (mut sum, mut lit) = (0.0f64, 0usize);
                 for i in 0..n {
                     let x = nl + w * (2.0 * (i as f32 + 0.5) / n as f32 - 1.0);
-                    sum += f64::from(x.max(0.0));
-                    lit += usize::from(x > 0.0);
+                    sum += x.max(0.0) as f64;
+                    lit += (x > 0.0) as usize;
                 }
                 let (lambert, facing) = terminator_aa(nl, w);
-                assert!((f64::from(lambert) - sum / f64::from(n)).abs() < 1e-4, "nl {nl} w {w}: {lambert} vs {}", sum / f64::from(n));
-                assert!((f64::from(facing) - lit as f64 / f64::from(n)).abs() < 1e-3, "nl {nl} w {w}: {facing}");
+                assert!((lambert as f64 - sum / n as f64).abs() < 1e-4, "nl {nl} w {w}: {lambert} vs {}", sum / n as f64);
+                assert!((facing as f64 - lit as f64 / n as f64).abs() < 1e-3, "nl {nl} w {w}: {facing}");
             }
         }
     }
@@ -5091,7 +5692,7 @@ mod baked_gloss_tests {
             "let sigma2 = max(1.0 - normal_length - 0.01, 0.0) / max(normal_length, 1e-3);",
             "return min(sqrt(1.5 * sigma2), TERMINATOR_MAX_WIDTH);",
             "let aa = terminator_aa(dot(n, l_dir));",
-            "out.specular = radiance * spec * atten * aa.y;",
+            "out.specular = radiance * spec * atten * lamp_highlight_share(view_dir, h, ndotl, aa.y, shininess, spec_strength);",
         ] {
             assert!(code.contains(line), "the lights block no longer has `{line}`");
         }
@@ -5137,11 +5738,11 @@ mod baked_light_split_tests {
     #[test]
     fn the_upload_says_where_the_baked_tail_starts() {
         let lights: Vec<Light> = (0..5).map(|i| point(i as f32, 1.0)).collect();
-        let gpu = pack_lights(&lights, 2, &[], false, true);
+        let gpu = pack_lights(&lights, 2, &[], false, true, 0.0);
         assert_eq!(gpu.count[0], 5);
         assert_eq!(gpu.count[1], 2);
 
-        let gpu = pack_lights(&lights, 5, &[], false, true);
+        let gpu = pack_lights(&lights, 5, &[], false, true, 0.0);
         assert_eq!(gpu.count[1], 5);
     }
 
@@ -5280,7 +5881,7 @@ mod probe_trace_gpu_tests {
         let code = format!(
             "{}\n{}",
             wgsl_lights_block(0, 1),
-            r"
+            r#"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> hits: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -5295,7 +5896,7 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
     hits[id.x * 4u + 2u] = vec4<f32>(h.rim, select(0.0, 1.0, probe_hit_rim_went_through(h)), h.t, h.rim_t);
     hits[id.x * 4u + 3u] = vec4<f32>(f32(probe_hit_edge(h)), h.edge_cover, select(0.0, 1.0, probe_hit_edge_hit(h)), h.edge_t);
 }
-"
+"#
         );
         let code = code
             .replace("PIXEL_FOOTPRINT", &format!("{footprint:?}"))
@@ -5568,14 +6169,14 @@ mod ground_trace_gpu_tests {
         let code = format!(
             "{}\n{}",
             wgsl_lights_block(0, 1),
-            r"
+            r#"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> hits: array<f32>;
 @compute @workgroup_size(1)
 fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
     hits[id.x] = ground_trace(rays[id.x * 2u].xyz, rays[id.x * 2u + 1u].xyz);
 }
-"
+"#
         );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ground_trace_test"),
@@ -5661,7 +6262,7 @@ fn trace_main(@builtin(global_invocation_id) id: vec3<u32>) {
         for (i, (&(e, d), &g)) in rays.iter().zip(&gpu).enumerate() {
             let twin = ground_map::trace(&chain, map.min, map.max, map.top, e, d).t;
             let g = (g >= 0.0).then_some(g);
-            hits += usize::from(g.is_some());
+            hits += g.is_some() as usize;
             match (g, twin) {
                 (Some(a), Some(b)) if (a - b).abs() <= 0.01 + 0.001 * b => {}
                 (None, None) => {}
@@ -5718,7 +6319,7 @@ mod proxy_field_gpu_tests {
         let code = format!(
             "{}\n{}",
             wgsl_lights_block(0, 1),
-            r"
+            r#"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> hits: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -5737,7 +6338,7 @@ fn walk_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     hits[id.x] = vec4<f32>(probe_proxy_field(o, d, half, t_in, t_out, 0, 0.0), 0.0);
 }
-"
+"#
         );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -5963,7 +6564,7 @@ mod proxy_card_gpu_tests {
         u.proxy_fields[0] = slots[0];
         let relit = RELIT.with(|r| r.borrow().clone());
         let options =
-            LightsBlockOptions { card_tests_filtered: FILTERED.with(std::cell::Cell::get), card_relit: relit.is_some(), ..Default::default() };
+            LightsBlockOptions { card_tests_filtered: FILTERED.with(|f| f.get()), card_relit: relit.is_some(), ..Default::default() };
 
         let lights_uniform = LightsUniform::new(&device);
         let shadow_map = crate::renderer::shadow::ShadowMap::with_dimension(&device, 8);
@@ -5973,7 +6574,7 @@ mod proxy_card_gpu_tests {
         let code = format!(
             "{}\n{}",
             wgsl_lights_block_with(0, 1, options),
-            r"
+            r#"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -5982,7 +6583,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
     probe_eye_distance = 1.0;
     out[id.x] = probe_card_colour(0, rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz), rays[id.x * 2u + 1u].w, 0.0);
 }
-"
+"#
         );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -5999,7 +6600,7 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
-        let packed: Vec<[f32; 4]> = rays.iter().flat_map(|(h, d)| [[h.x, h.y, h.z, FOOTPRINT.with(std::cell::Cell::get)], [d.x, d.y, d.z, HIT_T.with(std::cell::Cell::get)]]).collect();
+        let packed: Vec<[f32; 4]> = rays.iter().flat_map(|(h, d)| [[h.x, h.y, h.z, FOOTPRINT.with(|f| f.get())], [d.x, d.y, d.z, HIT_T.with(|f| f.get())]]).collect();
         let ray_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&packed),
@@ -6479,6 +7080,126 @@ fn cards_main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 #[cfg(test)]
+mod highlight_cap_tests {
+    use glam::Vec3;
+    use wgpu::util::DeviceExt;
+    use wgpu::{BindGroupDescriptor, BindGroupEntry, BufferDescriptor, BufferUsages, ShaderModuleDescriptor, ShaderSource};
+
+    fn split(cases: &[(Vec3, Vec3, f32, f32)]) -> Option<Vec<(f32, f32)>> {
+        let (device, queue) = crate::renderer::terrain_pipeline::tests::headless_gpu()?;
+        let code = format!(
+            "{}\n
+@group(1) @binding(0) var<storage, read> q: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+@compute @workgroup_size(1)
+fn split_main(@builtin(global_invocation_id) id: vec3<u32>) {{
+    var l: Light;
+    l.position = vec4<f32>(q[id.x * 2u].xyz, -1.0);
+    l.direction = vec4<f32>(0.0, 0.0, -1.0, 1.0);
+    l.color_intensity = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    l.params = vec4<f32>(100.0, -1.0, 0.0, -1.0);
+    let eye = q[id.x * 2u + 1u].xyz;
+    let c = light_contribution_split(l, vec3<f32>(0.0), vec3<f32>(0.0, 0.0, 1.0), normalize(eye), q[id.x * 2u].w, q[id.x * 2u + 1u].w);
+    out[id.x] = vec4<f32>(c.diffuse.r, c.specular.r, 0.0, 0.0);
+}}
+",
+            super::wgsl_lights_block(0, 1)
+        );
+        let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("split_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let lights_uniform = super::LightsUniform::new(&device);
+        lights_uniform.upload_frame(&queue, &[], &[], false);
+        let packed: Vec<[f32; 4]> =
+            cases.iter().flat_map(|(lamp, eye, s, k)| [[lamp.x, lamp.y, lamp.z, *s], [eye.x, eye.y, eye.z, *k]]).collect();
+        let q = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&packed),
+            usage: BufferUsages::STORAGE,
+        });
+        let size = (cases.len() * 16) as u64;
+        let out = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read = device.create_buffer(&BufferDescriptor { label: None, size, usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST, mapped_at_creation: false });
+        let g0 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[BindGroupEntry { binding: 1, resource: lights_uniform.buffer().as_entire_binding() }],
+        });
+        let g1 = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(1),
+            entries: &[BindGroupEntry { binding: 0, resource: q.as_entire_binding() }, BindGroupEntry { binding: 1, resource: out.as_entire_binding() }],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &g0, &[]);
+            pass.set_bind_group(1, &g1, &[]);
+            pass.dispatch_workgroups(cases.len() as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+        queue.submit([enc.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let got: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+        Some(got.iter().map(|c| (c[0], c[1])).collect())
+    }
+
+    fn lobe(r: f32, d: f32) -> (f32, f32) {
+        const LIGHT_SOURCE_RADIUS: f32 = 0.35;
+        let alpha = r * r;
+        let widened = (alpha + LIGHT_SOURCE_RADIUS / (2.0 * d.max(0.05))).clamp(alpha, 1.0);
+        ((2.0 / (widened * widened) - 2.0).clamp(1.0, 320.0), 0.35 * (1.0 - r))
+    }
+
+    #[test]
+    fn a_highlight_is_never_more_than_physics_allows() {
+
+        let lamp = Vec3::new(0.15, 0.0, 0.6);
+        let mirror = Vec3::new(-0.15, 0.0, 0.6);
+        let aside = Vec3::new(-0.6 * 40f32.to_radians().sin(), 0.0, 0.6 * 40f32.to_radians().cos());
+        let (stone_s, stone_k) = lobe(0.6, 0.6);
+        let (marble_s, marble_k) = lobe(0.048, 3.0);
+        let (marble_near_s, marble_near_k) = lobe(0.048, 0.6);
+        let cases = [
+            (lamp, mirror, stone_s, stone_k),
+            (lamp, aside, stone_s, stone_k),
+            (lamp * 5.0, mirror * 5.0, marble_s, marble_k),
+            (lamp, mirror, marble_near_s, marble_near_k),
+        ];
+        let Some(got) = split(&cases) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        for (c, (d, s)) in cases.iter().zip(&got) {
+            eprintln!("exponent {:6.1} strength {:.3}: diffuse {d:.4} highlight {s:.4} ({:.1}% of the diffuse light)", c.2, c.3, 100.0 * s / d);
+        }
+
+        let shipped = |k: usize| {
+            let (l, e, s, st) = cases[k];
+            let h = (l.normalize() + e.normalize()).normalize();
+            let nl = l.normalize().z;
+            got[k].0 / nl * h.z.powf(s) * st
+        };
+
+        let stone = got[0].1 / got[0].0;
+        assert!(stone < 0.07, "rough stone's highlight at the torch: {stone} of its diffuse light");
+        assert!(got[0].1 < 0.5 * shipped(0), "and well under what shipped: {} against {}", got[0].1, shipped(0));
+        assert!(got[1].1 <= got[0].1, "and less off the mirror angle");
+
+        assert!((got[2].1 - shipped(2)).abs() <= 1e-4 * shipped(2).max(1e-6), "marble across the room: {} against {}", got[2].1, shipped(2));
+        assert!(got[3].1 <= shipped(3) * (1.0 + 1e-4) && got[3].1 > 0.2 * shipped(3), "marble beside a torch: {} against {}", got[3].1, shipped(3));
+    }
+}
+
+#[cfg(test)]
 mod spot_edge_gpu_tests {
     use glam::Vec3;
     use wgpu::util::DeviceExt;
@@ -6659,7 +7380,7 @@ fn edge_main(@builtin(global_invocation_id) id: vec3<u32>) {{
             eprintln!("no GPU adapter; skipping");
             return;
         };
-        let most = |v: &[f32]| v.iter().copied().fold(0.0f32, f32::max);
+        let most = |v: &[f32]| v.iter().cloned().fold(0.0f32, f32::max);
         let largest = flat_was.iter().zip(&flat_now).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         eprintln!(
             "PAST THE POOL: a bump's step lights it up to {:.3}, the plane's {:.2e}; a flat pixel's cone moves {largest:.2e} (lit {:.3} at most)",
@@ -6867,14 +7588,14 @@ mod capsule_ambient_tests {
         let code = format!(
             "{}\n{}",
             super::wgsl_lights_block(0, 1),
-            r"
+            r#"
 @group(1) @binding(0) var<storage, read> pts: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> out: array<f32>;
 @compute @workgroup_size(1)
 fn ambient_main(@builtin(global_invocation_id) id: vec3<u32>) {
     out[id.x] = capsule_ambient(pts[id.x * 2u].xyz, pts[id.x * 2u + 1u].xyz);
 }
-"
+"#
         );
         let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -6964,7 +7685,7 @@ fn ambient_main(@builtin(global_invocation_id) id: vec3<u32>) {
                     .fold((0, 0.0f32), |best, (i, s)| if s > best.1 { (i, s) } else { best });
                 assert!(step < 0.004, "arm out {arm_out}: a step of {step:.4} at {:?}", line[i].0);
 
-                let darkest = vis.iter().copied().fold(1.0f32, f32::min);
+                let darkest = vis.iter().cloned().fold(1.0f32, f32::min);
                 assert!(darkest < 0.97, "arm out {arm_out}: nothing darkened ({darkest})");
             }
         }
@@ -7003,7 +7724,7 @@ fn ambient_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 #[cfg(test)]
 mod capsule_reflection_tests {
-    use glam::Vec3;
+    use glam::{Quat, Vec3};
     use wgpu::util::DeviceExt;
     use wgpu::{
         BindGroupDescriptor, BindGroupEntry, BindingResource, BufferDescriptor, BufferUsages, ShaderModuleDescriptor,
@@ -7055,7 +7776,7 @@ mod capsule_reflection_tests {
         let code = format!(
             "{}\n{}",
             super::wgsl_lights_block(0, 1),
-            r"
+            r#"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -7065,7 +7786,7 @@ fn reflect_main(@builtin(global_invocation_id) id: vec3<u32>) {
     out[id.x * 2u] = r;
     out[id.x * 2u + 1u] = vec4<f32>(capsule_glow * r.a, 0.0);
 }
-"
+"#
         );
         let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -7203,7 +7924,7 @@ fn reflect_main(@builtin(global_invocation_id) id: vec3<u32>) {
             let rays: Vec<(Vec3, Vec3, f32)> = (-n..=n)
                 .flat_map(|i| (-n..=n).map(move |j| (Vec3::new(i as f32 * step, 1.0 + j as f32 * step, -2.0), Vec3::Z, f)))
                 .collect();
-            let Some(got) = reflect(std::slice::from_ref(&glass_only), &rays) else {
+            let Some(got) = reflect(&[glass_only.clone()], &rays) else {
                 eprintln!("no GPU adapter; skipping");
                 return;
             };
@@ -7258,7 +7979,7 @@ fn reflect_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let code = format!(
             "{}\n{}",
             super::wgsl_lights_block(0, 1),
-            r"
+            r#"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -7267,7 +7988,7 @@ fn seen_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let r = capsule_reflection(rays[id.x * 2u].xyz, normalize(rays[id.x * 2u + 1u].xyz), 0.0, vec3<f32>(3.14159265), vec4<f32>(0.0));
     out[id.x] = vec4<f32>(capsule_glow * r.a, 0.0);
 }
-"
+"#
         );
         let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -7392,16 +8113,59 @@ fn seen_main(@builtin(global_invocation_id) id: vec3<u32>) {
             "GLASS PAST ITS BEAM: whole {whole:?}\n  shadowed {shadowed:?}\n  lit {lit:?}\n  another lamp {elsewhere:?}\n  no layer {unlayered:?}"
         );
         for (i, what) in [(0, "head on"), (1, "off the axis")] {
+
+            let k = beam_toward(&lamp, rays[i].0);
+            assert!(k > 0.99, "{what}: inside the hot spot, or all but: {k}");
             assert!(whole[i][0] > 1.0, "{what}: the capsules give the glass a glow: {:?}", whole[i]);
             assert!(shadowed[i].iter().all(|g| *g < 1e-4), "{what}: the shadowed point still sees the glass: {:?}", shadowed[i]);
             for c in 0..3 {
-                assert!(near(lit[i][c], whole[i][c], 1e-3 * whole[i][c]), "{what}: a lit point sees all of it: {:?}", lit[i]);
+                assert!(near(lit[i][c], whole[i][c] * k, 1e-3 * whole[i][c]), "{what}: a lit point sees all of it: {:?}", lit[i]);
                 assert_eq!(elsewhere[i][c], whole[i][c], "{what}: a lamp elsewhere is not its beam");
-                assert_eq!(unlayered[i][c], whole[i][c], "{what}: a beam with no shadow layer");
+                assert!(near(unlayered[i][c], whole[i][c] * k, 1e-3 * whole[i][c]), "{what}: a beam with no shadow layer: {:?}", unlayered[i]);
             }
         }
-        assert!(whole[2][0] > 1.0, "off to the side the glass still shows: {:?}", whole[2]);
-        assert_eq!(shadowed[2], whole[2], "outside the beam's map nothing is known to hide it");
+
+        assert!(whole[2][0] > 1.0, "with no beam known the glass shows: {:?}", whole[2]);
+        assert!(shadowed[2].iter().all(|g| *g == 0.0), "outside its beam the glass sends nothing: {:?}", shadowed[2]);
+        assert!(unlayered[2].iter().all(|g| *g == 0.0), "outside its beam, shadow layer or not: {:?}", unlayered[2]);
+        assert_eq!(elsewhere[2], whole[2], "a lamp elsewhere is not its beam");
+    }
+
+    fn beam_toward(lamp: &super::Light, p: Vec3) -> f32 {
+        let cos_p = (p - lamp.position).normalize().dot(lamp.direction.normalize());
+        let (outer, inner) = lamp.cone_cosines();
+        let s = ((cos_p - outer) / (inner - outer).max(1e-4)).clamp(0.0, 1.0);
+        s * s * (3.0 - 2.0 * s)
+    }
+
+    #[test]
+    fn a_glass_shows_in_a_mirror_only_into_its_beam() {
+        let glass = Vec3::new(0.0, 1.0, 0.0);
+        let groups = [torch(glass, Vec3::NEG_Z)];
+        let lamp = beam(glass, Vec3::NEG_Z);
+
+        let angles = [0.0f32, 6.0, 14.0, 20.0, 26.0, 40.0, 80.0];
+        let rays: Vec<(Vec3, Vec3, f32)> = angles
+            .iter()
+            .map(|a| {
+                let p = glass + Quat::from_rotation_y(a.to_radians()) * Vec3::NEG_Z;
+                (p, (glass - p).normalize(), 0.002)
+            })
+            .collect();
+        let Some(whole) = seen_past_the_beam(&groups, &rays, &[], false, 1.0) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let seen = seen_past_the_beam(&groups, &rays, &[lamp], false, 1.0).unwrap();
+        for (k, a) in angles.iter().enumerate() {
+            let share = beam_toward(&lamp, rays[k].0);
+            eprintln!("{a:>4} deg off the beam: share {share:.4}, glow {:.3} of {:.3}", seen[k][0], whole[k][0]);
+            assert!(whole[k][0] > 1.0, "{a} deg: the capsules give the glass a glow: {:?}", whole[k]);
+            assert!(near(seen[k][0], whole[k][0] * share, 1e-3 * whole[k][0]), "{a} deg: {:?} against {} x {share}", seen[k], whole[k][0]);
+        }
+        assert!(seen[0][0] > 0.999 * whole[0][0], "on the axis the glass shows whole");
+        assert!(seen[2][0] > 0.05 * whole[2][0] && seen[2][0] < 0.95 * whole[2][0], "on the ramp, part of it");
+        assert!(seen[4..].iter().all(|g| g[0] == 0.0), "past the spill (25 degrees), none: {:?}", &seen[4..]);
     }
 
     #[test]
@@ -7458,6 +8222,8 @@ mod surface_relit_tests {
             forward: Vec3::NEG_Z,
             right: Vec3::X,
             tan_half: 26.25f32.to_radians().tan(),
+            near: 0.0,
+            far: 0.0,
         }
     }
 
@@ -7513,7 +8279,7 @@ mod surface_relit_tests {
         let code = format!(
             "{}\n{}",
             super::wgsl_lights_block(0, 1),
-            r"
+            r#"
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
 @compute @workgroup_size(1)
@@ -7522,7 +8288,7 @@ fn relit_main(@builtin(global_invocation_id) id: vec3<u32>) {
     probe_eye_distance = 2.0;
     out[id.x] = vec4<f32>(probe_surface_relit(rays[id.x * 2u].xyz, rays[id.x * 2u + 1u].xyz, 0.05, 2.0), pixel_footprint);
 }
-"
+"#
         );
         let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -7676,6 +8442,39 @@ fn relit_main(@builtin(global_invocation_id) id: vec3<u32>) {
         assert!(no_surface[0].max_element() < 1e-4, "no lit surface, no light: {:?}", no_surface[0]);
         assert!(baked[0].max_element() < 1e-4, "a lamp the bake saw is in the photographs already: {:?}", baked[0]);
     }
+
+    #[test]
+    fn a_lit_planes_far_reach_does_not_claim_the_wall_it_crosses() {
+        let glass = Vec3::new(0.0, 1.0, 0.0);
+        let lamp = beam(glass, Vec3::NEG_Z);
+
+        let side = LitSurface { normal: Vec3::NEG_X, offset: -0.3, near: 0.2, far: 1.5, ..wall() };
+        let far_wall = LitSurface { near: 2.0, far: 4.5, ..wall() };
+        let from_floor = Vec3::new(0.0, 0.5, -1.0).normalize();
+        let hits = [
+
+            (Vec3::new(0.3, 1.0, -3.0), from_floor),
+
+            (Vec3::new(0.0, 1.0, -3.0), from_floor),
+
+            (Vec3::new(0.3, 1.0, -1.0), Vec3::new(1.0, 0.0, -0.2).normalize()),
+        ];
+        let Some(bounded) = relit_at(&[lamp], true, 1.0, &[side, far_wall], &hits) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let wall_alone = relit_at(&[lamp], true, 1.0, &[far_wall], &hits).unwrap();
+        let unbounded = relit_at(&[lamp], true, 1.0, &[LitSurface { far: 0.0, ..side }, LitSurface { far: 0.0, ..far_wall }], &hits).unwrap();
+        eprintln!("CROSSING: bounded {bounded:?}\n  wall alone {wall_alone:?}\n  unbounded {unbounded:?}");
+        let full = wall_alone[0].max_element();
+        assert!(full > 0.5 * ALBEDO.max_element() * expected_scale(), "the wall is lit there: {:?}", wall_alone[0]);
+
+        assert!(unbounded[0].max_element() < 0.3 * full, "unbounded, the side claims the wall: {:?}", unbounded[0]);
+        assert!((bounded[0] - wall_alone[0]).abs().max_element() < 0.01 * full, "the wall's point is the wall's: {:?}", bounded[0]);
+        assert!((bounded[1] - wall_alone[1]).abs().max_element() < 0.01 * full, "the axis as before: {:?}", bounded[1]);
+        assert!(bounded[2].max_element() > 0.05 * full, "the side keeps its own pool: {:?}", bounded[2]);
+        assert!((bounded[2] - unbounded[2]).abs().max_element() < 0.01 * bounded[2].max_element(), "and reads it as before");
+    }
 }
 
 #[cfg(test)]
@@ -7704,7 +8503,7 @@ mod tent_tests {
         };
         let code = format!(
             "{block}\n{}",
-            r"
+            r#"
 @group(1) @binding(0) var test_depth: texture_depth_2d;
 @group(1) @binding(1) var<storage, read> pts: array<vec4<f32>>;
 @group(1) @binding(2) var<storage, read_write> out: array<vec4<f32>>;
@@ -7721,7 +8520,7 @@ fn tent_main(@builtin(global_invocation_id) id: vec3<u32>) {
         pcf_tile_tent_half_at(test_depth, tile, grid, p.xyz),
     );
 }
-"
+"#
         );
         let module = device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
         let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
@@ -7818,7 +8617,7 @@ fn tent_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     fn spread(got: &[[f32; 4]], k: usize) -> (f32, f32) {
         let d: Vec<f32> = got.iter().map(|r| (r[k] - r[0]).abs()).collect();
-        (d.iter().copied().fold(0.0, f32::max), d.iter().sum::<f32>() / d.len() as f32)
+        (d.iter().cloned().fold(0.0, f32::max), d.iter().sum::<f32>() / d.len() as f32)
     }
 
     #[test]
@@ -7848,5 +8647,174 @@ fn tent_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let (max, mean) = spread(&got, 2);
         eprintln!("lean at f16 (f32 maths): max {max:.2e}, mean {mean:.2e}");
         assert!(max <= 2e-3, "lean: max {max}");
+    }
+}
+
+#[cfg(test)]
+mod pcf_four_tap_tests {
+    use super::*;
+
+    /// One WGSL function of the lights block, by name, to its closing brace.
+    fn wgsl_fn(src: &str, name: &str) -> String {
+        let start = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("no fn {name} in the lights block"));
+        let open = start + src[start..].find('{').unwrap();
+        let mut depth = 0;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[start..=open + i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("fn {name} does not close");
+    }
+
+    /// The four-tap box (`pcf_box_taps`) gives what the nine taps a texel
+    /// apart gave, on a whole map, on a tile of an atlas (clamped at the
+    /// tile's edges) and on a layer of an array, at every place including
+    /// past the edges.
+    #[test]
+    fn four_taps_filter_as_the_nine_did() {
+        let instance = wgpu::Instance::default();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        let (w, h) = (38u32, 29u32); // tiles of whole texels, as an atlas has
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pcf_test_depth"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 2 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth16Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut seed = 0x2545_f491u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        // Blocky depths, so edges run through the map as shadow edges do.
+        let depths: Vec<u16> = (0..w * h * 2).map(|_| if next() % 3 == 0 { 20_000 } else { 45_000 }).collect();
+        queue.write_texture(
+            texture.as_image_copy(),
+            bytemuck::cast_slice(&depths),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 2), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 2 },
+        );
+        let flat = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: 0, array_layer_count: Some(1), ..Default::default() });
+        let array = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+
+        let block = wgsl_lights_block(0, 0);
+        let taps_struct = &block[block.find("struct PcfBoxTaps").unwrap()..];
+        let taps_struct = &taps_struct[..=taps_struct.find('}').unwrap()];
+        let shipped = ["pcf_box_taps", "pcf_tent_tap", "pcf_tile_at", "pcf_array_at"].map(|n| wgsl_fn(&block, n)).join("\n");
+        let shipped = format!("{taps_struct}\n{shipped}");
+        let source = format!(
+            "@group(0) @binding(0) var flat_tex: texture_depth_2d;
+             @group(0) @binding(1) var array_tex: texture_depth_2d_array;
+             @group(0) @binding(2) var shadow_samp: sampler_comparison;
+             @group(0) @binding(3) var<storage, read> places: array<vec4<f32>>;
+             @group(0) @binding(4) var<storage, read_write> out: array<vec4<f32>>;
+             {shipped}
+             fn nine_tile(tile: vec2<f32>, grid: vec2<f32>, c: vec3<f32>) -> f32 {{
+                 let tile_texel = grid / vec2<f32>(textureDimensions(flat_tex));
+                 let lo = tile_texel * 0.5;
+                 let hi = vec2<f32>(1.0) - lo;
+                 var sum = 0.0;
+                 for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
+                     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
+                         let local = clamp(c.xy + vec2<f32>(f32(dx), f32(dy)) * tile_texel, lo, hi);
+                         sum = sum + textureSampleCompareLevel(flat_tex, shadow_samp, (local + tile) / grid, c.z);
+                     }}
+                 }}
+                 return sum / 9.0;
+             }}
+             fn nine_array(c: vec3<f32>) -> f32 {{
+                 let texel = 1.0 / vec2<f32>(textureDimensions(array_tex));
+                 var sum = 0.0;
+                 for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {{
+                     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {{
+                         sum = sum + textureSampleCompareLevel(array_tex, shadow_samp, c.xy + vec2<f32>(f32(dx), f32(dy)) * texel, 1, c.z);
+                     }}
+                 }}
+                 return sum / 9.0;
+             }}
+             @compute @workgroup_size(64)
+             fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
+                 if (id.x >= arrayLength(&places)) {{ return; }}
+                 let c = places[id.x].xyz;
+                 let atlas = vec2<f32>(2.0, 1.0);
+                 out[id.x * 3u] = vec4<f32>(nine_tile(vec2<f32>(0.0), vec2<f32>(1.0), c), pcf_tile_at(flat_tex, vec2<f32>(0.0), vec2<f32>(1.0), c), 0.0, 0.0);
+                 out[id.x * 3u + 1u] = vec4<f32>(nine_tile(vec2<f32>(1.0, 0.0), atlas, c), pcf_tile_at(flat_tex, vec2<f32>(1.0, 0.0), atlas, c), 0.0, 0.0);
+                 out[id.x * 3u + 2u] = vec4<f32>(nine_array(c), pcf_array_at(array_tex, 1, c), 0.0, 0.0);
+             }}"
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pcf_four_tap"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+        // Places over the whole map and a texel and a half past every edge.
+        let places: Vec<[f32; 4]> = (0..4096)
+            .map(|_| {
+                let r = |n: u32| (n % 100_000) as f32 / 100_000.0;
+                [r(next()) * 1.2 - 0.1, r(next()) * 1.2 - 0.1, 0.3 + r(next()) * 0.4, 0.0]
+            })
+            .collect();
+        use wgpu::util::DeviceExt;
+        let places_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&places), usage: wgpu::BufferUsages::STORAGE });
+        let out_size = (places.len() * 3 * 16) as u64;
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: out_size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let read_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: out_size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&flat) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&array) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: places_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: out_buf.as_entire_binding() },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups((places.len() as u32).div_ceil(64), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, out_size);
+        queue.submit([encoder.finish()]);
+        read_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let out: Vec<[f32; 4]> = bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().unwrap()).to_vec();
+        let mut worst = [0.0f32; 3];
+        let mut partial = 0;
+        for (i, o) in out.iter().enumerate() {
+            worst[i % 3] = worst[i % 3].max((o[0] - o[1]).abs());
+            partial += (o[0] > 0.01 && o[0] < 0.99) as usize;
+        }
+        println!("four taps against nine, worst difference: whole map {:.5}, atlas tile {:.5}, array layer {:.5}; {partial} of {} filtered values partial", worst[0], worst[1], worst[2], out.len());
+        assert!(partial > out.len() / 4, "the places should fall on shadow edges, not only in light or shade");
+        // The sampler's bilinear weights are fixed point (8 fraction bits on
+        // common GPUs), so both filters are exact only to about 1/256 a tap.
+        for (what, d) in ["whole map", "atlas tile", "array layer"].iter().zip(worst) {
+            assert!(d < 1.0 / 64.0, "{what}: four taps differ from nine by {d}");
+        }
     }
 }

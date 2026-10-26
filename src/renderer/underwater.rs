@@ -80,7 +80,7 @@ pub fn fresnel(cos_i: f32, n1: f32, n2: f32) -> f32 {
     let cos_t = (1.0 - sin_t2).sqrt();
     let rs = (n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t);
     let rp = (n2 * cos_i - n1 * cos_t) / (n2 * cos_i + n1 * cos_t);
-    f32::midpoint(rs * rs, rp * rp)
+    0.5 * (rs * rs + rp * rp)
 }
 
 pub fn window_half_angle_deg(ior: f32) -> f32 {
@@ -340,13 +340,13 @@ fn header(under_group: u32, waterline: bool, dual: bool) -> String {
     ) + COMMON_WGSL
 }
 
-const COMMON_WGSL: &str = r"
+const COMMON_WGSL: &str = r#"
 fn uw_bed(at: vec3<f32>) -> vec4<f32> {
     let uv = ground_uv(at);
     let half_texel = 0.5 / vec2<f32>(textureDimensions(ground_map));
     let edge = clamp(uv, half_texel, vec2<f32>(1.0) - half_texel);
     let g = textureSampleLevel(ground_map, probe_samp, edge, 0.0);
-    return vec4<f32>(g.rgb, g.a - UW_SHELF_SLOPE * length((uv - edge) / camera.ground_params.zw));
+    return vec4<f32>(g.rgb * exp2(camera.proxy_params.w), g.a - UW_SHELF_SLOPE * length((uv - edge) / camera.ground_params.zw));
 }
 
 fn uw_has_map() -> bool {
@@ -469,7 +469,7 @@ fn uw_caustic(p: vec3<f32>, z: f32, span: f32) -> f32 {
     let murk = exp(-(k.x + k.y + k.z) * (1.0 / 3.0) * z);
     return mix(1.0, gather, UW_CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, 5.0, z)));
 }
-";
+"#;
 
 fn veil_wgsl(waterline: bool, dual: bool) -> String {
     let output = if dual {
@@ -486,7 +486,7 @@ fn veil_wgsl(waterline: bool, dual: bool) -> String {
     format!("{}{}{}", header(3, waterline, dual), output, VEIL_WGSL)
 }
 
-const VEIL_WGSL: &str = r"
+const VEIL_WGSL: &str = r#"
 @group(2) @binding(1) var probe_pass_depth: texture_depth_2d_array;
 
 struct FullOut {
@@ -643,13 +643,13 @@ fn uw_veil(in: FullOut, near: bool) -> VeilOut {
     let glow = tonemap(under.sky.rgb * 1.5);
     return uw_film_out(glow * veil + glow * (0.08 * rim * fade), vec3<f32>(1.0 - veil));
 }
-";
+"#;
 
 fn underside_wgsl() -> String {
     format!("{}{}", header(2, false, false), UNDERSIDE_WGSL)
 }
 
-const UNDERSIDE_WGSL: &str = r"
+const UNDERSIDE_WGSL: &str = r#"
 struct VIn {
     @location(0) pos: vec3<f32>,
     @location(1) depth: f32,
@@ -794,7 +794,7 @@ fn uw_smith(c: f32, a2: f32) -> f32 {
     let seen = light * exp(-k * dist) + uw_scatter(z0, d, dist, uw_shafts(eye, d, dist));
     return vec4<f32>(tonemap(seen), 1.0);
 }
-";
+"#;
 
 pub struct UnderwaterPipelines {
 

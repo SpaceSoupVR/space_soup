@@ -11,6 +11,10 @@ const CIE_AGE: f32 = 1.0 + 0.4 * 0.4 * 0.4 * 0.4;
 const CIE_SQUARE: f32 = 5.0 * CIE_AGE;
 const CIE_LINEAR: f32 = 0.1 * 0.5 * CIE_AGE;
 
+/// `cie_veil`'s 1/theta, 1/theta^2 and 1/theta^3 terms, for the sky
+/// shader's sun and moon halos (`sky::sky_shader`).
+pub const CIE_TERMS: [f32; 3] = [CIE_LINEAR, CIE_SQUARE, CIE_CUBE];
+
 const VEIL_FLOOR: f32 = 0.02;
 
 pub const HALO_CAP: f32 = 0.04;
@@ -499,7 +503,7 @@ pub fn build_glare(
 
         let seen = s.mirror.unwrap_or(at);
         let shielded =
-            f32::midpoint(capsule_visibility(seen, eyes[0], capsules), capsule_visibility(seen, eyes[1], capsules));
+            0.5 * (capsule_visibility(seen, eyes[0], capsules) + capsule_visibility(seen, eyes[1], capsules));
         let Some(q) = glare_quad(s, &lobe, eye, exposure, strength * shielded) else { continue };
 
         let to_eye = eye - at;
@@ -594,7 +598,7 @@ pub fn glare_quad(s: &GlareSource, lobe: &GlareLobe, eye: Vec3, exposure: f32, s
     } else {
         let (mut lo, mut hi) = (0.0, MAX_GLARE_DEGREES);
         for _ in 0..20 {
-            let mid = f32::midpoint(lo, hi);
+            let mid = 0.5 * (lo + hi);
             if veil(mid) >= VEIL_FLOOR {
                 lo = mid;
             } else {
@@ -612,7 +616,7 @@ pub fn glare_quad(s: &GlareSource, lobe: &GlareLobe, eye: Vec3, exposure: f32, s
     } else {
         let (mut lo, mut hi) = (0.0, degrees);
         for _ in 0..20 {
-            let mid = f32::midpoint(lo, hi);
+            let mid = 0.5 * (lo + hi);
             if veil(mid) - edge > HALO_CAP {
                 lo = mid;
             } else {
@@ -722,7 +726,7 @@ pub fn glare_shader() -> String {
         format!(
             "const CIE_CUBE: f32 = {CIE_CUBE:?};\nconst CIE_SQUARE: f32 = {CIE_SQUARE:?};\nconst CIE_LINEAR: f32 = {CIE_LINEAR:?};\nconst HALO_CAP: f32 = {HALO_CAP:?};\n"
         ),
-        r"
+        r#"
 var<private> view_slot: i32 = 0;
 struct Camera { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -822,7 +826,7 @@ fn glare_veil(in: VOut) -> f32 {
     let one = vec3<f32>(1.0);
     return vec4<f32>(max(one - (one - whole) / (one - halo), vec3<f32>(0.0)), 0.0);
 }
-"
+"#
     )
 }
 
@@ -1107,7 +1111,7 @@ mod tests {
     #[test]
     fn a_halo_alone_has_no_core_and_no_cap() {
         let torch = GlareSource { halo_only: true, ..sconce([1.0; 6]) };
-        let (verts, idx, halos) = build_glare(std::slice::from_ref(&torch), [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
+        let (verts, idx, halos) = build_glare(&[torch.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
         assert_eq!(halos as usize, idx.len(), "no core");
         assert!(halos > 0 && verts.iter().all(|v| v.test[3] == 3.0));
         let (verts, _, _) = build_glare(&[torch], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, false, &[], &[]);
@@ -1193,7 +1197,7 @@ mod tests {
 
         let (b, l) = (glare_quad(&s, &bulb, below, 3.6, 1.0).unwrap(), glare_quad(&s, &lit, below, 3.6, 1.0).unwrap());
         assert!(l.core2 > b.core2 && l.peak < b.peak, "{b:?} {l:?}");
-        let (v, i, halos) = build_glare(std::slice::from_ref(&s), [below; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
+        let (v, i, halos) = build_glare(&[s.clone()], [below; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
         assert_eq!(halos, 12, "a halo for each part");
 
         let reach = |k: usize| Vec3::from_slice(&v[i[6 * k] as usize].reach[..3]);
@@ -1289,7 +1293,7 @@ mod tests {
 
         let blinding = quad(&s, Vec3::ZERO, 3600.0).unwrap();
         assert_eq!(blinding.degrees, MAX_GLARE_DEGREES);
-        let (v, i, halos) = build_glare(std::slice::from_ref(&s), [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
+        let (v, i, halos) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
         assert_eq!((v.len(), i.len(), halos), (8, 12, 6), "a halo, then its core");
 
         let centre = Vec3::from_slice(&v[0].test[..3]);
@@ -1297,7 +1301,7 @@ mod tests {
         let half = (Vec3::from(v[0].position) - centre).x.abs();
         assert!((half - (2.0 - WALL_MARGIN) * q.degrees.to_radians().tan()).abs() < 1e-4);
         assert!((Vec3::from_slice(&v[0].reach[..3]) - Vec3::X * LAMP_RADIUS).length() < 1e-5 && v[0].test[3] > 0.0);
-        let (untested, _, _) = build_glare(std::slice::from_ref(&s), [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, false, &[], &[]);
+        let (untested, _, _) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, false, &[], &[]);
         assert!(untested.iter().all(|v| v.test[3] < 0.0), "no probe pass, no wall test");
     }
 
@@ -1308,7 +1312,7 @@ mod tests {
         let after_edge = |q: &GlareQuad, deg: f32| q.a * cie_veil(deg * deg + q.core2) - q.edge;
         assert!(q.core_degrees > 0.0 && q.core_degrees < q.degrees, "{q:?}");
         assert!((after_edge(&q, q.core_degrees) - HALO_CAP).abs() < 1e-4, "{}", after_edge(&q, q.core_degrees));
-        let (v, i, halos) = build_glare(std::slice::from_ref(&s), [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
+        let (v, i, halos) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, 3.6, 1.0, true, &[], &[]);
         let corners = |at: usize| -> Vec<Vec3> { (0..4).map(|k| Vec3::from(v[i[at] as usize + k].position)).collect() };
         let middle = |c: &[Vec3]| c.iter().copied().sum::<Vec3>() / 4.0;
         let (halo, core) = (corners(0), corners(halos as usize));
@@ -1326,7 +1330,7 @@ mod tests {
         let dim = quad(&s, Vec3::ZERO, 3.6 * (VEIL_FLOOR + 0.5 * HALO_CAP) / bright).unwrap();
         assert!(dim.peak > 0.0 && dim.peak <= HALO_CAP && dim.core_degrees == 0.0, "{dim:?}");
         let exposure = 3.6 * (VEIL_FLOOR + 0.5 * HALO_CAP) / bright;
-        let (_, i, halos) = build_glare(std::slice::from_ref(&s), [Vec3::ZERO; 2], Vec3::X, Vec3::Z, exposure, 1.0, true, &[], &[]);
+        let (_, i, halos) = build_glare(&[s.clone()], [Vec3::ZERO; 2], Vec3::X, Vec3::Z, exposure, 1.0, true, &[], &[]);
         assert_eq!(halos as usize, i.len(), "no core");
 
         let mut t = mouth_down_table();
@@ -1343,7 +1347,7 @@ mod tests {
         let s = GlareSource { table: Some((std::sync::Arc::new(t), origin)), ..sconce([0.0; 6]) };
         let below = origin - Vec3::Y * 3.0;
         let lit = glare_lobes(&s, below)[1];
-        let (v, i, halos) = build_glare(std::slice::from_ref(&s), [below; 2], Vec3::X, Vec3::Z, 36.0, 1.0, true, &[], &[]);
+        let (v, i, halos) = build_glare(&[s.clone()], [below; 2], Vec3::X, Vec3::Z, 36.0, 1.0, true, &[], &[]);
         assert_eq!(i.len() as u32, 2 * halos, "both parts have a core: {} indices, {halos} halo", i.len());
         let lit_core: Vec<Vec3> = (0..4).map(|k| Vec3::from(v[i[halos as usize + 6] as usize + k].position)).collect();
         let toward = (below - lit.centre).normalize();
@@ -1358,7 +1362,7 @@ mod tests {
 
         let on_floor = eye + (image - eye) * (eye.y / (eye.y - image.y));
         let s = GlareSource { position: image, mirror: Some(on_floor), ..sconce([1.0; 6]) };
-        let (verts, idx, halos) = build_glare(std::slice::from_ref(&s), [eye; 2], Vec3::X, Vec3::Y, 3.6, 1.0, true, &[], &[]);
+        let (verts, idx, halos) = build_glare(&[s.clone()], [eye; 2], Vec3::X, Vec3::Y, 3.6, 1.0, true, &[], &[]);
         assert_eq!(halos as usize, idx.len(), "no core: it would stand under the floor");
         assert!(!verts.is_empty() && verts.iter().all(|v| v.test[3] == 3.0));
         let tested = Vec3::new(verts[0].test[0], verts[0].test[1], verts[0].test[2]);
@@ -1375,7 +1379,7 @@ mod tests {
         assert!((span(&verts) - span(&plain)).abs() < 1e-3, "{} vs {}", span(&verts), span(&plain));
 
         let hand_at = |c: Vec3| (c - Vec3::X * 0.08, c + Vec3::X * 0.08, 0.045);
-        let veil = |caps: &[(Vec3, Vec3, f32)]| build_glare(std::slice::from_ref(&s), [eye; 2], Vec3::X, Vec3::Y, 3.6, 1.0, true, caps, &[]).0.first().map_or(0.0, |v| v.shape[0]);
+        let veil = |caps: &[(Vec3, Vec3, f32)]| build_glare(&[s.clone()], [eye; 2], Vec3::X, Vec3::Y, 3.6, 1.0, true, caps, &[]).0.first().map_or(0.0, |v| v.shape[0]);
         assert!(veil(&[hand_at(eye + (on_floor - eye) * 0.5)]) < 1e-3 * veil(&[]), "a hand over the floor point");
         assert_eq!(veil(&[hand_at(image + (on_floor - image) * 0.5)]), veil(&[]), "under the floor");
     }
@@ -1400,7 +1404,7 @@ mod tests {
 
         let s = GlareSource { position: bulb, ..sconce([1.0; 6]) };
         let eyes = [eye - across * 0.032, eye + across * 0.032];
-        let peak = |caps: &[(Vec3, Vec3, f32)]| build_glare(std::slice::from_ref(&s), eyes, across, Vec3::Y, 3.6, 1.0, false, caps, &[]).0[0].shape[0];
+        let peak = |caps: &[(Vec3, Vec3, f32)]| build_glare(&[s.clone()], eyes, across, Vec3::Y, 3.6, 1.0, false, caps, &[]).0[0].shape[0];
 
         let one_eye = (eyes[0] + to_bulb * 0.3, eyes[0] + to_bulb * 0.3 + Vec3::Y * 0.01, 0.02);
         assert!((peak(&[one_eye]) / peak(&[]) - 0.5).abs() < 0.02, "{} vs {}", peak(&[one_eye]), peak(&[]));
@@ -1595,7 +1599,7 @@ mod tests {
             }
             let read = device.create_buffer(&BufferDescriptor {
                 label: None,
-                size: u64::from(W * W * 4),
+                size: (W * W * 4) as u64,
                 usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -1632,22 +1636,22 @@ mod tests {
 
         assert!(veil_at(1.0, 1.0, W / 2 - 2) < HALO_CAP && veil_at(1.0, 1.0, W / 8) > 4.0 * HALO_CAP);
         for k in 0..W / 2 {
-            let (got, want) = (f32::from(px(&open, W / 2 + k, W / 2)), expected(1.0, 1.0, k));
+            let (got, want) = (px(&open, W / 2 + k, W / 2) as f32, expected(1.0, 1.0, k));
             assert!((got - want).abs() <= 2.0, "{k} pixels out: {got} vs {want}");
         }
 
         let nearer = render(0.25, -1.0, 1.0, 0.0);
         assert!(shown(HALO_CAP) < 3.0, "the cap is a haze: {}", shown(HALO_CAP));
         for k in 0..W / 2 {
-            let (got, want) = (f32::from(px(&nearer, W / 2 + k, W / 2)), shown(veil_at(1.0, 1.0, k).min(HALO_CAP)));
+            let (got, want) = (px(&nearer, W / 2 + k, W / 2) as f32, shown(veil_at(1.0, 1.0, k).min(HALO_CAP)));
             assert!((got - want).abs() <= 1.0, "over the nearer surface {k} pixels out: {got} vs {want}");
         }
 
         let lit = 0.8f32;
-        let over = render(1.0, -1.0, 1.0, f64::from(lit));
+        let over = render(1.0, -1.0, 1.0, lit as f64);
         for k in [0, W / 16, W / 8, W / 4] {
             let veil = crate::renderer::tonemap::aces_fitted(Vec3::splat(veil_at(1.0, 1.0, k))).x;
-            let (got, want) = (f32::from(px(&over, W / 2 + k, W / 2)), 255.0 * (1.0 - (1.0 - lit) * (1.0 - veil)));
+            let (got, want) = (px(&over, W / 2 + k, W / 2) as f32, 255.0 * (1.0 - (1.0 - lit) * (1.0 - veil)));
             assert!((got - want).abs() <= 3.0, "over the lit inside {k} pixels out: {got} vs {want}");
         }
         assert!(px(&over, W / 2 + W / 8, W / 2) < 250, "not burnt white where the veil alone shows two thirds of white");
@@ -1659,18 +1663,18 @@ mod tests {
 
         let torch = render_with(0.25, -1.0, 0.25, 1.0, 0.0, 3.0);
         for k in 0..W / 2 {
-            let (got, want) = (f32::from(px(&torch, W / 2 + k, W / 2)), expected(1.0, 1.0, k));
+            let (got, want) = (px(&torch, W / 2 + k, W / 2) as f32, expected(1.0, 1.0, k));
             assert!((got - want).abs() <= 2.0, "a halo alone {k} pixels out: {got} vs {want}");
         }
         for k in 0..W / 2 {
             let want = expected(1.0, 1.0, k);
             for (img, what) in [(&room, "the room behind"), (&ceiling, "a ceiling nearer than the core")] {
-                let got = f32::from(px(img, W / 2 + k, W / 2));
+                let got = px(img, W / 2 + k, W / 2) as f32;
                 assert!((got - want).abs() <= 2.0, "over {what} {k} pixels out: {got} vs {want}");
             }
             let haze = shown(veil_at(1.0, 1.0, k).min(HALO_CAP));
             for (img, what) in [(&fixture, "the fixture"), (&fixture_under_ceiling, "the fixture under a ceiling")] {
-                let got = f32::from(px(img, W / 2 + k, W / 2));
+                let got = px(img, W / 2 + k, W / 2) as f32;
                 assert!((got - haze).abs() <= 1.0, "over {what} {k} pixels out: {got} vs {haze}");
             }
         }
@@ -1678,8 +1682,8 @@ mod tests {
         assert_eq!(px(&walled, W / 2, W / 2), 0, "a wall in front of the bulb takes its veil");
 
         let dim = 0.01;
-        let half = f32::from(px(&render(1.0, -0.1, dim, 0.0), W / 2, W / 2));
-        let whole = f32::from(px(&render(1.0, -1.0, dim, 0.0), W / 2, W / 2));
+        let half = px(&render(1.0, -0.1, dim, 0.0), W / 2, W / 2) as f32;
+        let whole = px(&render(1.0, -1.0, dim, 0.0), W / 2, W / 2) as f32;
         assert!((whole - expected(dim, 1.0, 0)).abs() <= 2.0, "{whole} vs {}", expected(dim, 1.0, 0));
         assert!(
             (half - expected(dim, 4.0 / 7.0, 0)).abs() <= 2.0,

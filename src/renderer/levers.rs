@@ -1,5 +1,9 @@
 use serde::Deserialize;
 
+/// `Phase::LightCutoff`'s cutoff when the lever has none: displayed
+/// brightness 0.02, under a tenth of the darkest tone the eye reads.
+pub const TRIAL_LIGHT_CUTOFF: f32 = 0.02;
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Levers {
@@ -62,6 +66,8 @@ pub struct Levers {
 
     pub space_warp_debug: u32,
 
+    pub spot_caster_drop: u32,
+
     pub eye_capture: u32,
 
     pub terminator_aa: bool,
@@ -70,7 +76,90 @@ pub struct Levers {
 
     pub glare_strength: f32,
 
+    /// Closed rooms seen from outside drawn at their own adaptation
+    /// (`EyeAdaptation::room_exposure`).
+    pub room_exposure: bool,
+
+    /// The clouds' shadows drawn per pixel, sweeping over the ground with
+    /// the wind (`Sky::step_cloud_shadow`); off dims the whole level's sun
+    /// at once, by the clouds over its middle.
+    pub cloud_shadows: bool,
+
+    /// The volumetric clouds' sky map built a slice a frame
+    /// (`Sky::step_clouds`); off keeps the last map and its shadow as they
+    /// were, to price the build on the headset (2026-10-22).
+    pub clouds: bool,
+    /// The sky map's build slowed (up to a slice every fourth frame) while
+    /// the headset's GPU frame time is over budget (`cloud_pace`); off
+    /// builds a slice every frame outside closed rooms, to price it.
+    pub cloud_pace: bool,
+    /// A cloud map's history let go where it and the new march disagree by
+    /// 0.03 to 0.1 of the sky showing (`cloud_sky::HISTORY_REJECT`: no ghost
+    /// fringes at changing edges), and where it differs by 15-35% of the
+    /// cloud there (`HISTORY_REJECT_SHARE`: no ghost rims in clear sky); off
+    /// lets it go only at 0.2 to 0.5, as before 2026-10-22.
+    pub cloud_history_tight: bool,
+    /// The cirrus, drawn per pixel by the sky shader (`sky_cirrus`, 2026-10-23:
+    /// in the maps it shared the lower clouds' carry wind and warped where
+    /// they crossed). Off: no cirrus, to time it.
+    pub sky_cirrus: bool,
+    /// From a lit closed room the eye adapts part of the way toward the night
+    /// through a doorway it looks at, the room held at its own adaptation
+    /// (`exposure::DOOR_LEAN`, 2026-10-23). Off: metered on the room alone.
+    pub door_lean: bool,
+    /// The reflection probes relit on the GPU at every frame's daylight
+    /// (`ProbeStream::new_smooth`), not rebuilt on the CPU at 25% steps; off
+    /// is the stepped relight. Read when the level's probes load. Costs two
+    /// more cube arrays (2 x 51 MB at 256 px) and the probe array a storage
+    /// usage (2026-10-22).
+    pub smooth_probes: bool,
+    /// The static sun map drawn along the gliding sun, again each 0.1
+    /// degrees it moves (`STATIC_SUN_REDRAW_COS`), as two maps blended by
+    /// the sun's way between them (`lights::SunPair`, 2026-10-23); off draws
+    /// one once a snapshot along the snapshot's sun, as before 2026-10-22.
+    pub smooth_sun_shadow: bool,
+    /// The ground map's light (what reflections of the ground and the
+    /// water's bed show) read at the frame's daylight between its rebuilds,
+    /// which come at x1.5 or 3 degrees (`PostUpload::ground_stops`); off
+    /// reads it as built, stepping at each.
+    pub smooth_ground: bool,
+    /// The displayed brightness (radiance times the eye's exposure) a
+    /// lamp's reach ends at (`lights::effective_range`): a dim lamp with a
+    /// long range stops costing the pixels its light barely reaches. 0 is
+    /// off (colleague's plan part 2, item 5; A/B before turning on).
+    pub light_cutoff: f32,
+    /// Native frames (no SpaceWarp synthesis) whenever the GPU time holds
+    /// under 75% of the display period for 5 s, back to SpaceWarp once over
+    /// 90% for a quarter second (`frame_governor`; the AAA doc's rank 11).
+    /// Off by default: A/B before turning on.
+    pub frame_governor: bool,
+    /// Models drawn from their coarsest LOD whose error (x
+    /// `mesh_lod::ERROR_MARGIN`) projects under `model_lod_pixels` eye
+    /// pixels: by construction no switch is visible (part 1, model LODs).
+    pub model_lods: bool,
+    pub model_lod_pixels: f32,
+    /// Dynamic resolution: the eye drawn at a share of its targets, down a
+    /// step after three frames over 90% of the frame, up after 60 under 75%,
+    /// never under `dynres_min` (`dynamic_resolution`; part 2, item 4). Off
+    /// by default: A/B before turning on.
+    pub dynres: bool,
+    pub dynres_min: f32,
+
     pub effects: bool,
+
+    pub muzzle_test: bool,
+
+    /// THE MUD TEST, dev only: the right hand's A raises a mud splash where
+    /// its aim meets mud ground, B steps through a dropped crate, a bullet and
+    /// a blast (`space_soup_app::mud_test`). Takes A and B from the muzzle
+    /// test while on. Off.
+    pub mud_test: bool,
+
+    pub effect_variants: bool,
+
+    pub effects_overdraw: bool,
+
+    pub cave_dust: bool,
 
     pub water: bool,
 
@@ -86,9 +175,21 @@ pub struct Levers {
 
     pub torch_reflection: bool,
 
+    pub pool_bounds: bool,
+
+    pub fps_hud: bool,
+
+    pub pool_metering: bool,
+
     pub floor_mirror: bool,
 
     pub reflection_blur: bool,
+    /// The reflections carried from frame to frame and averaged
+    /// (`probe_blur::History`): from mid distance a lamp cage's wires and
+    /// other sub-pixel bright parts of a reflection came out whole or not at
+    /// all in each texel and danced as the head moved. Off: each frame's
+    /// reflections alone, as before 2026-10-23.
+    pub reflection_history: bool,
 
     pub character_cards: bool,
 
@@ -116,6 +217,82 @@ pub struct Levers {
 
     pub pass_dedup: bool,
 
+    pub draw_log: u32,
+
+    pub cave_twins: bool,
+
+    pub cave_occluder: bool,
+
+    pub scene_cull: bool,
+
+    pub outdoor_pass: bool,
+
+    pub nowhere_pass: bool,
+
+    pub open_reflections: bool,
+
+    pub wet_reflections: bool,
+
+    pub wet_steep_twins: bool,
+
+    pub puddle_reflections: bool,
+
+    pub wet_sky: bool,
+
+    pub ground_classes: bool,
+
+    pub ground_near_first: bool,
+
+    pub ground_near_chunks: u32,
+
+    pub ground_steep_first: bool,
+
+    pub ground_horizon: bool,
+
+    pub ground_horizon_caves: bool,
+
+    pub cave_first: bool,
+
+    pub opaque_models: bool,
+
+    pub body_prepass: bool,
+
+    pub sky_before_water: bool,
+
+    pub planar_water: bool,
+
+    pub water_runs: bool,
+
+    pub ground_buffers: bool,
+
+    pub brush_buffers: bool,
+    /// The brushes' material arrays uploaded as ASTC encoded ahead
+    /// (`bin/brush_astc`, `BrushMaterials::from_astc`) where every material
+    /// in the level has an encoding of the images it loaded: a quarter of
+    /// the memory and no mips built at load. Without them, or on a GPU with
+    /// no ASTC, the images are uploaded as before; off always uploads them.
+    /// Read when a level's materials load.
+    pub brush_astc: bool,
+
+    pub cave_chunk_cull: bool,
+
+    pub ground_lod: bool,
+
+    pub ground_lod_strict: bool,
+
+    pub size_reach: u32,
+
+    pub probe_prepass: bool,
+
+    pub model_rooms: bool,
+    /// The lamps a closed room's walls hide from both eyes left out of the
+    /// frame's lights, as `model_rooms` leaves out models: a lamp counts if
+    /// its reach touches the eye's room or shows through one of its open
+    /// doorways (`portal_cull::RoomView::shows`), so nothing it lights is in
+    /// view. It frees the budget (`MAX_LIGHTS`) and the meshes' and ground's
+    /// lamp loops in levels of many rooms (2026-10-23).
+    pub light_rooms: bool,
+
     pub terrain_reader: Option<String>,
 
     pub reader_edit: Option<String>,
@@ -124,6 +301,8 @@ pub struct Levers {
 
     pub ssr: Option<bool>,
 
+    pub debug_view: Option<String>,
+
     pub multiview: Option<bool>,
 
     pub half_viewport: bool,
@@ -131,6 +310,9 @@ pub struct Levers {
     pub direct_path: bool,
 
     pub ab_cycle: bool,
+    /// With `ab_cycle`, only these phases (labels, comma separated, e.g.
+    /// "baseline,no_smooth_shadow,light_cutoff,fovea30,fovea45").
+    pub ab_only: Option<String>,
 
     pub bench: Option<crate::renderer::bench::BenchPose>,
 
@@ -140,6 +322,8 @@ pub struct Levers {
 
     pub night_vision: bool,
 }
+
+pub static DRAW_LOG_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl Default for Levers {
     fn default() -> Self {
@@ -173,11 +357,33 @@ impl Default for Levers {
             foveation: crate::renderer::foveation::SHIPPED,
             space_warp: true,
             space_warp_debug: 0,
+            spot_caster_drop: 0,
             eye_capture: 0,
             terminator_aa: true,
             glare: true,
             glare_strength: 1.0,
+            room_exposure: true,
+            cloud_shadows: true,
+            clouds: true,
+            cloud_pace: true,
+            cloud_history_tight: true,
+            sky_cirrus: true,
+            door_lean: true,
+            smooth_probes: true,
+            smooth_sun_shadow: true,
+            smooth_ground: true,
+            light_cutoff: 0.0,
+            frame_governor: false,
+            model_lods: true,
+            model_lod_pixels: 0.5,
+            dynres: false,
+            dynres_min: 0.75,
             effects: true,
+            muzzle_test: true,
+            mud_test: false,
+            effect_variants: true,
+            effects_overdraw: false,
+            cave_dust: false,
             water: true,
             underwater: true,
             weather: true,
@@ -185,8 +391,12 @@ impl Default for Levers {
             flashlight_bounce: true,
             surface_light_loop: true,
             torch_reflection: true,
+            pool_bounds: true,
+            fps_hud: false,
+            pool_metering: true,
             floor_mirror: false,
             reflection_blur: true,
+            reflection_history: true,
             character_cards: true,
             thin_parts: 1.0,
             thin_shading_sampled: false,
@@ -200,14 +410,49 @@ impl Default for Levers {
             water_cut: None,
             slope_twins: true,
             pass_dedup: true,
+            draw_log: 0,
+            cave_twins: true,
+            cave_occluder: true,
+            scene_cull: true,
+            outdoor_pass: true,
+            nowhere_pass: true,
+            open_reflections: false,
+            wet_reflections: false,
+            wet_steep_twins: true,
+            puddle_reflections: false,
+            wet_sky: false,
+            ground_classes: true,
+            ground_near_first: false,
+            ground_near_chunks: 0,
+            ground_steep_first: true,
+            ground_horizon: true,
+            ground_horizon_caves: true,
+            cave_first: true,
+            opaque_models: true,
+            body_prepass: true,
+            sky_before_water: true,
+            planar_water: true,
+            water_runs: true,
+            ground_buffers: true,
+            brush_buffers: true,
+            brush_astc: true,
+            cave_chunk_cull: false,
+            ground_lod: true,
+            ground_lod_strict: true,
+            size_reach: 229,
+            probe_prepass: false,
+            model_rooms: false,
+            light_rooms: true,
             terrain_reader: None,
             reader_edit: None,
             gpu_sync: false,
             ssr: None,
+            debug_view: None,
             multiview: None,
             half_viewport: false,
             direct_path: false,
             ab_cycle: false,
+            ab_only: None,
             bench: None,
             time_of_day_hour: None,
             time_of_day_minutes: None,
@@ -223,7 +468,7 @@ impl Levers {
             return Ok(Self::default());
         }
         let levers: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        if let Some(problem) = levers.bench.as_ref().and_then(super::bench::BenchPose::problem) {
+        if let Some(problem) = levers.bench.as_ref().and_then(|b| b.problem()) {
             return Err(problem);
         }
         Ok(levers)
@@ -265,6 +510,16 @@ impl Levers {
             Phase::NoWeather => l.weather = false,
             Phase::NoDoorShadows => l.door_shadows = false,
             Phase::TimeFrozen => l.time_of_day_minutes = Some(0.0),
+            Phase::NoSmoothShadow => l.smooth_sun_shadow = false,
+            Phase::NoSmoothGround => l.smooth_ground = false,
+            Phase::LightCutoff => {
+                if l.light_cutoff <= 0.0 {
+                    l.light_cutoff = TRIAL_LIGHT_CUTOFF;
+                }
+            }
+            Phase::Fovea30 => l.pass_cut = Some("def_cut_fovea30".into()),
+            Phase::Fovea45 => l.pass_cut = Some("def_cut_fovea45".into()),
+            Phase::NoReflectionHistory => l.reflection_history = false,
         }
         l
     }
@@ -309,28 +564,56 @@ impl Levers {
         flag("ground_trace", self.ground_trace, d.ground_trace);
         flag("space_warp", self.space_warp, d.space_warp);
         flag("glare", self.glare, d.glare);
+        flag("room_exposure", self.room_exposure, d.room_exposure);
+        flag("cloud_shadows", self.cloud_shadows, d.cloud_shadows);
+        flag("clouds", self.clouds, d.clouds);
+        flag("cloud_pace", self.cloud_pace, d.cloud_pace);
+        flag("cloud_history_tight", self.cloud_history_tight, d.cloud_history_tight);
+        flag("sky_cirrus", self.sky_cirrus, d.sky_cirrus);
+        flag("door_lean", self.door_lean, d.door_lean);
+        flag("smooth_probes", self.smooth_probes, d.smooth_probes);
+        flag("smooth_sun_shadow", self.smooth_sun_shadow, d.smooth_sun_shadow);
+        flag("smooth_ground", self.smooth_ground, d.smooth_ground);
+        flag("frame_governor", self.frame_governor, d.frame_governor);
+        flag("model_lods", self.model_lods, d.model_lods);
+        flag("dynres", self.dynres, d.dynres);
         flag("effects", self.effects, d.effects);
+        flag("muzzle_test", self.muzzle_test, d.muzzle_test);
+        flag("mud_test", self.mud_test, d.mud_test);
+        flag("effect_variants", self.effect_variants, d.effect_variants);
+        flag("effects_overdraw", self.effects_overdraw, d.effects_overdraw);
+        flag("cave_dust", self.cave_dust, d.cave_dust);
         flag("water", self.water, d.water);
         flag("underwater", self.underwater, d.underwater);
         flag("weather", self.weather, d.weather);
         flag("terminator_aa", self.terminator_aa, d.terminator_aa);
         flag("floor_mirror", self.floor_mirror, d.floor_mirror);
         flag("reflection_blur", self.reflection_blur, d.reflection_blur);
+        flag("reflection_history", self.reflection_history, d.reflection_history);
         flag("character_cards", self.character_cards, d.character_cards);
         flag("flashlight_bounce", self.flashlight_bounce, d.flashlight_bounce);
         flag("surface_light_loop", self.surface_light_loop, d.surface_light_loop);
         flag("torch_reflection", self.torch_reflection, d.torch_reflection);
+        flag("pool_bounds", self.pool_bounds, d.pool_bounds);
+        flag("fps_hud", self.fps_hud, d.fps_hud);
+        flag("pool_metering", self.pool_metering, d.pool_metering);
         flag("gpu_sync", self.gpu_sync, d.gpu_sync);
         flag("same_eyes", self.same_eyes, d.same_eyes);
         flag("thin_shading_sampled", self.thin_shading_sampled, d.thin_shading_sampled);
         flag("half_viewport", self.half_viewport, d.half_viewport);
         flag("direct_path", self.direct_path, d.direct_path);
         flag("ab_cycle", self.ab_cycle, d.ab_cycle);
+        if let Some(only) = &self.ab_only {
+            out.push(format!("ab_only={only}"));
+        }
         if self.foveation != d.foveation {
             out.push(format!("foveation={}", self.foveation.label()));
         }
         if self.space_warp_debug != 0 {
             out.push(format!("swdbg={}", self.space_warp_debug));
+        }
+        if self.spot_caster_drop != 0 {
+            out.push(format!("spot_drop={}", self.spot_caster_drop));
         }
         if self.glare && self.glare_strength != d.glare_strength {
             out.push(format!("glare_strength={}", self.glare_strength));
@@ -347,11 +630,23 @@ impl Levers {
         if self.thin_parts != d.thin_parts {
             out.push(format!("thin_parts={}", self.thin_parts));
         }
+        if self.dynres_min != d.dynres_min {
+            out.push(format!("dynres_min={}", self.dynres_min));
+        }
+        if self.model_lod_pixels != d.model_lod_pixels {
+            out.push(format!("model_lod_pixels={}", self.model_lod_pixels));
+        }
+        if self.light_cutoff != d.light_cutoff {
+            out.push(format!("light_cutoff={}", self.light_cutoff));
+        }
         if self.terrain_detail_distance != d.terrain_detail_distance {
             out.push(format!("terrain_detail={}", self.terrain_detail_distance));
         }
         if let Some(on) = self.ssr {
             out.push(format!("ssr={}", if on { "on" } else { "off" }));
+        }
+        if let Some(view) = &self.debug_view {
+            out.push(format!("debug_view={view}"));
         }
         if let Some(on) = self.multiview {
             out.push(format!("multiview={}", if on { "on" } else { "off" }));
@@ -373,6 +668,56 @@ impl Levers {
         }
         if !self.pass_dedup {
             out.push("no_pass_dedup".to_string());
+        }
+        if self.draw_log != 0 {
+            out.push(format!("draw_log={}", self.draw_log));
+        }
+        if !self.cave_twins {
+            out.push("no_cave_twins".to_string());
+        }
+        if !self.cave_occluder {
+            out.push("no_cave_occluder".to_string());
+        }
+
+        for (name, on, default) in [
+            ("scene_cull", self.scene_cull, d.scene_cull),
+            ("outdoor_pass", self.outdoor_pass, d.outdoor_pass),
+            ("nowhere_pass", self.nowhere_pass, d.nowhere_pass),
+            ("open_reflections", self.open_reflections, d.open_reflections),
+            ("wet_reflections", self.wet_reflections, d.wet_reflections),
+            ("wet_steep_twins", self.wet_steep_twins, d.wet_steep_twins),
+            ("puddle_reflections", self.puddle_reflections, d.puddle_reflections),
+            ("wet_sky", self.wet_sky, d.wet_sky),
+            ("ground_classes", self.ground_classes, d.ground_classes),
+            ("ground_near_first", self.ground_near_first, d.ground_near_first),
+            ("ground_steep_first", self.ground_steep_first, d.ground_steep_first),
+            ("ground_horizon", self.ground_horizon, d.ground_horizon),
+            ("ground_horizon_caves", self.ground_horizon_caves, d.ground_horizon_caves),
+            ("cave_first", self.cave_first, d.cave_first),
+            ("opaque_models", self.opaque_models, d.opaque_models),
+            ("body_prepass", self.body_prepass, d.body_prepass),
+            ("sky_before_water", self.sky_before_water, d.sky_before_water),
+            ("planar_water", self.planar_water, d.planar_water),
+            ("water_runs", self.water_runs, d.water_runs),
+            ("ground_buffers", self.ground_buffers, d.ground_buffers),
+            ("brush_buffers", self.brush_buffers, d.brush_buffers),
+            ("brush_astc", self.brush_astc, d.brush_astc),
+            ("cave_chunk_cull", self.cave_chunk_cull, d.cave_chunk_cull),
+            ("ground_lod", self.ground_lod, d.ground_lod),
+            ("ground_lod_strict", self.ground_lod_strict, d.ground_lod_strict),
+            ("probe_prepass", self.probe_prepass, d.probe_prepass),
+            ("model_rooms", self.model_rooms, d.model_rooms),
+            ("light_rooms", self.light_rooms, d.light_rooms),
+        ] {
+            if on != default {
+                out.push(if on { name.to_string() } else { format!("no_{name}") });
+            }
+        }
+        if self.size_reach != d.size_reach {
+            out.push(format!("size_reach={}", self.size_reach));
+        }
+        if self.ground_near_chunks != d.ground_near_chunks {
+            out.push(format!("ground_near_chunks={}", self.ground_near_chunks));
         }
         if let Some(reader) = &self.terrain_reader {
             out.push(format!("terrain_reader={reader}"));
@@ -457,6 +802,37 @@ mod tests {
     }
 
     #[test]
+    fn the_debug_view_and_opaque_models_are_levers() {
+        let l = Levers::parse(r#"{"debug_view": "sources", "opaque_models": false}"#).unwrap();
+        assert_eq!(l.debug_view.as_deref(), Some("sources"));
+        assert!(!l.opaque_models && Levers::default().opaque_models && Levers::default().debug_view.is_none());
+        assert_eq!(l.summary(), "debug_view=sources,no_opaque_models");
+        let s = Levers::parse(r#"{"sky_before_water": false}"#).unwrap();
+        assert!(!s.sky_before_water && Levers::default().sky_before_water);
+        assert_eq!(s.summary(), "no_sky_before_water");
+        let m = Levers::parse(r#"{"planar_water": false}"#).unwrap();
+        assert!(!m.planar_water && Levers::default().planar_water);
+        assert_eq!(m.summary(), "no_planar_water");
+    }
+
+    #[test]
+    fn the_grounds_levers_are_named_against_their_defaults() {
+        let d = Levers::default();
+        let l = Levers { scene_cull: !d.scene_cull, ground_near_first: !d.ground_near_first, ground_near_chunks: d.ground_near_chunks + 3, ..d.clone() };
+        let name = |name: &str, default: bool| if default { format!("no_{name}") } else { name.to_string() };
+        assert_eq!(
+            l.summary(),
+            format!(
+                "{},{},ground_near_chunks={}",
+                name("scene_cull", d.scene_cull),
+                name("ground_near_first", d.ground_near_first),
+                d.ground_near_chunks + 3,
+            ),
+        );
+        assert_eq!(Levers::parse(r#"{"ground_near_chunks": 4}"#).unwrap().ground_near_chunks, 4);
+    }
+
+    #[test]
     fn a_performance_level_is_read_and_named() {
         use crate::renderer::performance_level::PerformanceLevel;
         let l = Levers::parse(r#"{"gpu_level": "sustained_high", "cpu_level": "boost"}"#).unwrap();
@@ -515,7 +891,7 @@ mod tests {
         let mut f = LeverFile::new(&path);
         assert!(f.poll().is_none(), "no file, nothing to report");
         std::fs::write(&path, r#"{"portals": false}"#).unwrap();
-        assert!(!f.poll().unwrap().unwrap().portals);
+        assert_eq!(f.poll().unwrap().unwrap().portals, false);
         assert!(f.poll().is_none(), "unchanged, nothing to report");
         std::fs::write(&path, r#"{"portals": false, "shadows": false}"#).unwrap();
         let l = f.poll().unwrap().unwrap();

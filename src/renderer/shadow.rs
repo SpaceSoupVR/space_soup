@@ -11,7 +11,7 @@ pub const QUEST_SHADOW_DIM: u32 = 1024;
 
 pub const SUN_DYNAMIC_DIM: u32 = 512;
 
-pub const SUN_DYNAMIC_RADIUS: f32 = 3.0;
+pub const SUN_DYNAMIC_RADIUS: f32 = 9.0;
 
 pub const MAX_SPOT_SHADOWS: usize = 4;
 
@@ -23,7 +23,7 @@ pub const MAX_BODY_TILES: usize = 2;
 
 pub const SUN_ATLAS_TILES: u32 = 2 + MAX_CHARACTER_SHADOWS as u32;
 
-pub const SUN_NEAR_ZOOM: f32 = 2.0;
+pub const SUN_NEAR_ZOOM: f32 = 6.0;
 
 pub const SUN_NEAR_TILE: u32 = 1 + MAX_CHARACTER_SHADOWS as u32;
 
@@ -513,6 +513,27 @@ impl ShadowSlot {
         }
     }
 
+    fn from_texture(
+        device: &Device,
+        light_layout: &BindGroupLayout,
+        texture: &Texture,
+        layer: u32,
+    ) -> Self {
+        let depth_view = texture.create_view(&TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D2),
+            base_array_layer: layer,
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
+        let (light_buffer, light_bind_group) = Self::light_uniform(device, light_layout);
+        Self {
+            _depth_texture: Some(texture.clone()),
+            depth_view: Some(depth_view),
+            light_buffer,
+            light_bind_group,
+        }
+    }
+
     fn new_layered(
         device: &Device,
         light_layout: &BindGroupLayout,
@@ -584,6 +605,12 @@ impl ShadowSlot {
 
 pub struct ShadowMap {
     sun: ShadowSlot,
+    /// The static sun's second map (layer 1 of `sun`'s texture), drawn
+    /// ahead of the first while the sun glides (`lights::SunPair`), and
+    /// which of the two `ShadowKind::Sun` draws into.
+    sun_next: ShadowSlot,
+    sun_layer: std::cell::Cell<u32>,
+    sun_array_view: TextureView,
 
     sun_dynamic: ShadowSlot,
 
@@ -597,14 +624,24 @@ pub struct ShadowMap {
     spot_array_view: TextureView,
 
     spot_tile_dim: u32,
+
+    tile_scissor: std::cell::Cell<bool>,
     sampler: Sampler,
     solid_pipeline: RenderPipeline,
+
+    solid_world_pipeline: RenderPipeline,
+
+    solid_world: std::cell::RefCell<Option<(BindGroup, bool)>>,
     mesh_pipeline: RenderPipeline,
     skinned_pipeline: RenderPipeline,
 
     posed_pipeline: RenderPipeline,
 
     brush_pipeline: RenderPipeline,
+
+    brush_world_pipeline: RenderPipeline,
+
+    brush_world: std::cell::RefCell<Option<BindGroup>>,
 }
 
 impl ShadowMap {
@@ -723,6 +760,35 @@ impl ShadowMap {
             label: Some("shadow_mesh_layout"),
             bind_group_layouts: &[Some(&light_layout), Some(&model_layout)],
             immediate_size: 0,
+        });
+
+        let solid_world_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("shadow_solid_world_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_mesh"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(SolidVertex::layout())],
+            },
+            fragment: None,
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: Some(Face::Back),
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
+                stencil: StencilState::default(),
+                bias,
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
         });
         let mesh_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("shadow_mesh_pipeline"),
@@ -847,7 +913,39 @@ impl ShadowMap {
             cache: None,
         });
 
-        let sun = ShadowSlot::new(device, &light_layout, "sun_shadow_depth", dim);
+        let brush_world_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("shadow_brush_world_pipeline"),
+            layout: Some(&mesh_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_mesh"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[Some(super::brush_pipeline::BrushVertex::layout())],
+            },
+            fragment: None,
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                cull_mode: Some(Face::Back),
+                front_face: FrontFace::Ccw,
+                polygon_mode: PolygonMode::Fill,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
+                stencil: StencilState::default(),
+                bias,
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let sun = ShadowSlot::new_layered(device, &light_layout, "sun_shadow_depth", dim, 2, 0);
+        let sun_texture = sun._depth_texture.clone().expect("the sun owns its own depth target");
+        let sun_next = ShadowSlot::from_texture(device, &light_layout, &sun_texture, 1);
+        let sun_array_view = sun_texture.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..Default::default() });
 
         let spot_texture = device.create_texture(&TextureDescriptor {
             label: Some("spot_shadow_atlas"),
@@ -875,6 +973,9 @@ impl ShadowMap {
 
         Self {
             sun,
+            sun_next,
+            sun_layer: std::cell::Cell::new(0),
+            sun_array_view,
             sun_dynamic,
             spots,
             characters,
@@ -882,12 +983,17 @@ impl ShadowMap {
             _spot_texture: spot_texture,
             spot_array_view,
             spot_tile_dim: dim,
+            tile_scissor: Default::default(),
             sampler,
             solid_pipeline,
+            solid_world_pipeline,
+            solid_world: Default::default(),
             mesh_pipeline,
             skinned_pipeline,
             posed_pipeline,
             brush_pipeline,
+            brush_world_pipeline,
+            brush_world: Default::default(),
         }
     }
 
@@ -908,8 +1014,15 @@ impl ShadowMap {
         drawn
     }
 
+    /// Both static sun maps, as the lights block binds them (`sun_shadow_tex`).
     pub fn sun_depth_view(&self) -> &TextureView {
-        self.sun.depth_view.as_ref().expect("the sun owns its own depth target")
+        &self.sun_array_view
+    }
+
+    /// Which static sun map (0 or 1) `ShadowKind::Sun` draws into and
+    /// uploads the light of (`lights::SunPair`).
+    pub fn set_sun_layer(&self, layer: u32) {
+        self.sun_layer.set(layer.min(1));
     }
 
     pub fn sun_dynamic_depth_view(&self) -> &TextureView {
@@ -920,7 +1033,16 @@ impl ShadowMap {
         &self.spot_array_view
     }
 
+    pub fn set_tile_scissor(&self, on: bool) {
+        self.tile_scissor.set(on);
+    }
+
     pub fn spot_tile_dim(&self) -> u32 {
+        self.spot_tile_dim
+    }
+
+    /// The static sun map's width in texels: the same `dim` as a spot tile.
+    pub fn sun_dim(&self) -> u32 {
         self.spot_tile_dim
     }
 
@@ -930,7 +1052,7 @@ impl ShadowMap {
 
     fn slot(&self, kind: ShadowKind) -> &ShadowSlot {
         match kind {
-            ShadowKind::Sun => &self.sun,
+            ShadowKind::Sun => if self.sun_layer.get() == 1 { &self.sun_next } else { &self.sun },
             ShadowKind::SunDynamic => &self.sun_dynamic,
             ShadowKind::SunNear => &self.sun_near,
             ShadowKind::Spot(i) => &self.spots[i.min(MAX_SPOT_SHADOWS - 1)],
@@ -949,7 +1071,29 @@ impl ShadowMap {
         }
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    pub fn set_solid_world(&self, model: Option<&BindGroup>, whole: bool) {
+        *self.solid_world.borrow_mut() = model.map(|m| (m.clone(), whole));
+    }
+
+    pub fn set_brush_world(&self, model: Option<&BindGroup>) {
+        *self.brush_world.borrow_mut() = model.cloned();
+    }
+
+    fn brush_pipeline_now(&self) -> (&RenderPipeline, Option<BindGroup>) {
+        match self.brush_world.borrow().clone() {
+            Some(model) => (&self.brush_world_pipeline, Some(model)),
+            None => (&self.brush_pipeline, None),
+        }
+    }
+
+    fn solid_pipeline_for(&self, chunks: bool) -> (&RenderPipeline, Option<BindGroup>) {
+        match self.solid_world.borrow().clone().filter(|(_, whole)| chunks || *whole) {
+            Some((model, _)) => (&self.solid_world_pipeline, Some(model)),
+            None => (&self.solid_pipeline, None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn record_spots(
         &self,
         encoder: &mut CommandEncoder,
@@ -964,6 +1108,7 @@ impl ShadowMap {
         solid_chunks: &[CasterChunk],
     ) -> u32 {
         let mut drawn = 0u32;
+        let (solid_pipeline, solid_model) = self.solid_pipeline_for(!solid_chunks.is_empty());
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("spot_shadow_atlas_pass"),
             color_attachments: &[],
@@ -979,34 +1124,46 @@ impl ShadowMap {
             let (col, row) = spot_tile(layer);
             let d = self.spot_tile_dim as f32;
             pass.set_viewport(col as f32 * d, row as f32 * d, d, d, 0.0, 1.0);
+            if self.tile_scissor.get() {
+                let t = self.spot_tile_dim;
+                pass.set_scissor_rect(col as u32 * t, row as u32 * t, t, t);
+            }
 
             let planes = frustum_planes(view_proj[layer]);
             let light_bg = &self.spots[layer].light_bind_group;
 
             if let Some((vb, ib, total)) = solid {
                 if total > 0 {
-                    pass.set_pipeline(&self.solid_pipeline);
+                    pass.set_pipeline(solid_pipeline);
                     pass.set_bind_group(0, light_bg, &[]);
+                    if let Some(model) = &solid_model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     if solid_chunks.is_empty() {
                         pass.draw_indexed(0..total, 0, 0..1);
                         drawn += total;
                     } else {
-                        for c in solid_chunks {
-                            if !aabb_in_frustum(&planes, c.min, c.max) {
-                                continue;
-                            }
-                            pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
-                            drawn += c.index_count;
+
+                        let runs = crate::renderer::ground_lod::merged(
+                            solid_chunks.iter().filter(|c| aabb_in_frustum(&planes, c.min, c.max)).map(|c| (c.first_index, c.index_count)),
+                        );
+                        for (first, count) in runs {
+                            pass.draw_indexed(first..first + count, 0, 0..1);
+                            drawn += count;
                         }
                     }
                 }
             }
             if let Some((vb, ib, total)) = brushes {
                 if total > 0 {
-                    pass.set_pipeline(&self.brush_pipeline);
+                    let (pipeline, model) = self.brush_pipeline_now();
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, light_bg, &[]);
+                    if let Some(model) = &model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(0..total, 0, 0..1);
@@ -1043,7 +1200,7 @@ impl ShadowMap {
         drawn
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     pub fn record_moving(
         &self,
         encoder: &mut CommandEncoder,
@@ -1147,7 +1304,7 @@ impl ShadowMap {
         self.record_full(encoder, kind, solid, None, brushes, mesh_draws, skinned_draws, solid_chunks, light_view_proj)
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     pub fn record_with_ground(
         &self,
         encoder: &mut CommandEncoder,
@@ -1161,7 +1318,7 @@ impl ShadowMap {
         self.record_full(encoder, kind, solid, ground, None, mesh_draws, skinned_draws, &[], light_view_proj)
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn record_full(
         &self,
         encoder: &mut CommandEncoder,
@@ -1186,6 +1343,7 @@ impl ShadowMap {
 
             ShadowKind::Character(_) | ShadowKind::SunNear => self.sun_dynamic.depth_view.as_ref().expect("the dynamic sun owns its own depth target"),
         };
+        let (solid_pipeline, solid_model) = self.solid_pipeline_for(!solid_chunks.is_empty());
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("shadow_pass"),
             color_attachments: &[],
@@ -1219,8 +1377,11 @@ impl ShadowMap {
 
             if let Some((vb, ib, count)) = solid {
                 if count > 0 {
-                    pass.set_pipeline(&self.solid_pipeline);
+                    pass.set_pipeline(solid_pipeline);
                     pass.set_bind_group(0, &slot.light_bind_group, &[]);
+                    if let Some(model) = &solid_model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     if solid_chunks.is_empty() {
@@ -1228,16 +1389,12 @@ impl ShadowMap {
                         pass.draw_indexed(0..count, 0, 0..1);
                         drawn_indices += count;
                     } else {
-                        for c in solid_chunks {
-                            if !aabb_in_frustum(&planes, c.min, c.max) {
-                                continue;
-                            }
-                            pass.draw_indexed(
-                                c.first_index..c.first_index + c.index_count,
-                                0,
-                                0..1,
-                            );
-                            drawn_indices += c.index_count;
+                        let runs = crate::renderer::ground_lod::merged(
+                            solid_chunks.iter().filter(|c| aabb_in_frustum(&planes, c.min, c.max)).map(|c| (c.first_index, c.index_count)),
+                        );
+                        for (first, count) in runs {
+                            pass.draw_indexed(first..first + count, 0, 0..1);
+                            drawn_indices += count;
                         }
                     }
                 }
@@ -1256,8 +1413,12 @@ impl ShadowMap {
 
             if let Some((vb, ib, count)) = brushes {
                 if count > 0 {
-                    pass.set_pipeline(&self.brush_pipeline);
+                    let (pipeline, model) = self.brush_pipeline_now();
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &slot.light_bind_group, &[]);
+                    if let Some(model) = &model {
+                        pass.set_bind_group(1, model, &[]);
+                    }
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
                     pass.draw_indexed(0..count, 0, 0..1);
@@ -1293,7 +1454,7 @@ impl ShadowMap {
     }
 }
 
-const SHADOW_SHADER: &str = r"
+const SHADOW_SHADER: &str = r#"
 struct LightMatrix { view_proj: mat4x4<f32> }
 @group(0) @binding(0) var<uniform> light: LightMatrix;
 
@@ -1334,7 +1495,7 @@ fn vs_skinned(
 fn vs_posed(@location(0) skinned: vec4<f32>) -> @builtin(position) vec4<f32> {
     return light.view_proj * model_u.model * skinned;
 }
-";
+"#;
 
 #[cfg(test)]
 mod atlas_tests {
@@ -1762,7 +1923,8 @@ mod render_tests {
 
         let sun = scene.lights.iter().find(|l| l.kind == LightKind::Directional);
         let sun_view_proj = sun
-            .map_or(Mat4::IDENTITY, |l| directional_light_matrix(l.direction, Vec3::ZERO, 20.0));
+            .map(|l| directional_light_matrix(l.direction, Vec3::ZERO, 20.0))
+            .unwrap_or(Mat4::IDENTITY);
 
         let spot_matrices: Vec<SpotShadowMatrices> = spot_indices
             .iter()
@@ -1793,6 +1955,8 @@ mod render_tests {
             spot_count: spot_indices.len() as u32,
             sun_dynamic_view_proj: sun_view_proj,
             sun_dynamic_enabled: scene.shadows_on && sun.is_some() && scene.sky_sun_dynamic,
+            sun_next_view_proj: Mat4::IDENTITY,
+            sun_blend: [0.0; 4],
         };
 
         let world = scene.receiver_at;
@@ -1882,7 +2046,7 @@ mod render_tests {
         let depth_view = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("recv_readback"),
-            size: u64::from(256 * SIZE),
+            size: (256 * SIZE) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -2039,16 +2203,16 @@ mod render_tests {
             character_lamp: tile,
             ..base()
         };
-        let Some(shadowed) = shade_receiver(scene(vec![lamp], Some(0))) else {
+        let Some(shadowed) = shade_receiver(scene(vec![lamp.clone()], Some(0))) else {
             eprintln!("skipping: no GPU adapter available");
             return;
         };
-        let open = shade_receiver(scene(vec![lamp], None)).unwrap();
+        let open = shade_receiver(scene(vec![lamp.clone()], None)).unwrap();
         let dark = shade_receiver(scene(Vec::new(), None)).unwrap();
         eprintln!("through the characters' tile {shadowed:?}, without it {open:?}, no lamp {dark:?}");
-        assert!(i32::from(open[0]) - i32::from(dark[0]) > 40, "the lamp does not light the receiver measurably: {open:?} vs {dark:?}");
+        assert!(open[0] as i32 - dark[0] as i32 > 40, "the lamp does not light the receiver measurably: {open:?} vs {dark:?}");
         assert!(
-            (i32::from(shadowed[0]) - i32::from(dark[0])).abs() <= 2,
+            (shadowed[0] as i32 - dark[0] as i32).abs() <= 2,
             "the characters' tile let the lamp's light through: {shadowed:?}, dark {dark:?}, open {open:?}",
         );
     }
@@ -2080,7 +2244,7 @@ mod render_tests {
             ..base()
         });
         assert!(
-            i32::from(lit[0]) - i32::from(shaded[0]) > 8,
+            (lit[0] as i32) - (shaded[0] as i32) > 8,
             "a spot cast no shadow: {lit:?} lit vs {shaded:?} with a caster between",
         );
     }
@@ -2089,14 +2253,14 @@ mod render_tests {
     fn a_second_spot_light_also_casts_a_shadow() {
 
         let dim = spot_above(-4.0, 0.0);
-        let lit = shot!(Scene { lights: vec![dim, spot_above(0.0, 4.0)], ..base() });
+        let lit = shot!(Scene { lights: vec![dim.clone(), spot_above(0.0, 4.0)], ..base() });
         let shaded = shot!(Scene {
             lights: vec![dim, spot_above(0.0, 4.0)],
             caster: Some(ground(3.0, 8.0)),
             ..base()
         });
         assert!(
-            i32::from(lit[0]) - i32::from(shaded[0]) > 8,
+            (lit[0] as i32) - (shaded[0] as i32) > 8,
             "the SECOND spot cast no shadow: {lit:?} lit vs {shaded:?} with a caster between",
         );
     }
@@ -2104,7 +2268,7 @@ mod render_tests {
     #[test]
     fn a_spot_beyond_the_budget_still_lights_without_shadowing() {
 
-        let mut lights: Vec<Light> = (0..=MAX_SPOT_SHADOWS)
+        let mut lights: Vec<Light> = (0..MAX_SPOT_SHADOWS + 1)
             .map(|i| spot_above(-8.0 + i as f32, 0.0))
             .collect();
         *lights.last_mut().unwrap() = spot_above(0.0, 4.0);
@@ -2112,7 +2276,7 @@ mod render_tests {
         let with_extra = shot!(Scene { lights: lights.clone(), ..base() });
         let alone = shot!(Scene { lights: vec![spot_above(0.0, 4.0)], ..base() });
         assert!(
-            (i32::from(with_extra[0]) - i32::from(alone[0])).abs() < 6,
+            (with_extra[0] as i32 - alone[0] as i32).abs() < 6,
             "the light past the shadow budget stopped lighting: {with_extra:?} vs {alone:?}",
         );
     }
@@ -2122,7 +2286,7 @@ mod render_tests {
         let lit = shot!(base());
         let unlit = shot!(Scene { lights: vec![], ..base() });
         assert!(
-            i32::from(lit[0]) - i32::from(unlit[0]) > 8,
+            lit[0] as i32 - unlit[0] as i32 > 8,
             "a directional light contributed nothing: {lit:?} vs ambient {unlit:?}",
         );
     }
@@ -2134,7 +2298,7 @@ mod render_tests {
         let far = shot!(Scene { receiver_at: Vec3::new(0.0, 500.0, 0.0), ..base() });
         for c in 0..3 {
             assert!(
-                (i32::from(near[c]) - i32::from(far[c])).abs() <= 2,
+                (near[c] as i32 - far[c] as i32).abs() <= 2,
                 "the sun attenuated with distance: {near:?} at the origin vs {far:?} at y=500",
             );
         }
@@ -2149,7 +2313,7 @@ mod render_tests {
             ..base()
         });
         assert!(
-            i32::from(clear[0]) - i32::from(shaded[0]) > 8,
+            clear[0] as i32 - shaded[0] as i32 > 8,
             "a slab three metres overhead cast no shadow: {clear:?} lit vs {shaded:?} shadowed",
         );
     }
@@ -2195,7 +2359,7 @@ mod render_tests {
         let ambient_only = shot!(Scene { lights: vec![], ..base() });
         for c in 0..3 {
             assert!(
-                (i32::from(shaded[c]) - i32::from(ambient_only[c])).abs() <= 3,
+                (shaded[c] as i32 - ambient_only[c] as i32).abs() <= 3,
                 "a shadowed fragment is not at ambient: {shaded:?} vs {ambient_only:?}",
             );
         }
@@ -2208,7 +2372,7 @@ mod render_tests {
         let beside = shot!(Scene { receiver_at: Vec3::new(300.0, 0.0, 0.0), ..base() });
         for c in 0..3 {
             assert!(
-                (i32::from(inside[c]) - i32::from(beside[c])).abs() <= 2,
+                (inside[c] as i32 - beside[c] as i32).abs() <= 2,
                 "off the side of the shadow map went dark: {inside:?} vs {beside:?}",
             );
         }
@@ -2241,11 +2405,14 @@ mod render_tests {
         for (intensity, distance, expected) in
             [(1.0f32, 5.0f32, 0.6399f32), (3.0, 5.0, 0.7196), (10.0, 5.0, 0.9987), (0.2, 0.85, 0.8768)]
         {
-            let Some(px) = at(intensity, distance) else {
-                eprintln!("skipping: no GPU adapter available");
-                return;
+            let px = match at(intensity, distance) {
+                Some(px) => px,
+                None => {
+                    eprintln!("skipping: no GPU adapter available");
+                    return;
+                }
             };
-            let got = f32::from(px[0]) / 255.0;
+            let got = px[0] as f32 / 255.0;
             assert!(
                 (got - expected).abs() < 0.01,
                 "intensity {intensity} at {distance}m: shader gave {got:.4}, the editor \
@@ -2268,7 +2435,7 @@ mod render_tests {
         let open = shade_receiver(Scene { sky_sun_dynamic: true, ..base() }).unwrap();
         eprintln!("under a moving caster {shadowed:?}, in the open {open:?}");
         assert!(
-            i32::from(open[1]) - i32::from(shadowed[1]) > 20,
+            (open[1] as i32) - (shadowed[1] as i32) > 20,
             "a moving object cast no sun shadow: {shadowed:?} vs {open:?}",
         );
     }
@@ -2317,17 +2484,17 @@ mod render_tests {
              shadowed {dark_near:?} / {dark_wide:?}",
         );
         assert!(
-            (i32::from(lit_near[1]) - i32::from(lit_wide[1])).abs() <= 1 && (i32::from(dark_near[1]) - i32::from(dark_wide[1])).abs() <= 1,
+            (lit_near[1] as i32 - lit_wide[1] as i32).abs() <= 1 && (dark_near[1] as i32 - dark_wide[1] as i32).abs() <= 1,
             "the two places are not lit alike: lit {lit_near:?} / {lit_wide:?}, shadowed {dark_near:?} / {dark_wide:?}",
         );
-        let range = i32::from(lit_wide[1]) - i32::from(dark_wide[1]);
+        let range = lit_wide[1] as i32 - dark_wide[1] as i32;
         assert!(
             range > 40,
             "too little sun to measure a penumbra by: {range}"
         );
 
-        let lost_wide = i32::from(lit_wide[1]) - i32::from(wide[1]);
-        let lost_near = i32::from(lit_near[1]) - i32::from(near[1]);
+        let lost_wide = lit_wide[1] as i32 - wide[1] as i32;
+        let lost_near = lit_near[1] as i32 - near[1] as i32;
         assert!(
             lost_wide * 10 > range && lost_near * 4 < lost_wide,
             "the middle of the box was not read from the near tile: lost {lost_near} there and {lost_wide} \
@@ -2350,16 +2517,17 @@ mod render_tests {
                 let c = m.project_point3(p);
                 (glam::Vec2::new(c.x, c.y) * 0.5 + glam::Vec2::splat(0.5)) * n
             };
-            let o = texel_of(near, Vec3::ZERO);
+            // The player's pivot sits on the grid (`lights::static_sun_pivot`).
+            let o = texel_of(near, crate::renderer::lights::static_sun_pivot(head));
             assert!(
                 (o - o.round()).abs().max_element() < 2e-3,
-                "the world's origin is off the near tile's grid at {o:?}, player at {head}",
+                "the player's pivot is off the near tile's grid at {o:?}, player at {head}",
             );
             let p = head + Vec3::new(0.37, -0.81, 0.52);
             let (w, nr) = (wide.project_point3(p), near.project_point3(p));
             assert!(
-                (nr.x - 2.0 * w.x).abs() < 1e-5
-                    && (nr.y - 2.0 * w.y).abs() < 1e-5
+                (nr.x - SUN_NEAR_ZOOM * w.x).abs() < 1e-5
+                    && (nr.y - SUN_NEAR_ZOOM * w.y).abs() < 1e-5
                     && (nr.z - w.z).abs() < 1e-6
             );
         }
@@ -2383,7 +2551,7 @@ mod render_tests {
         for (name, m) in tiles {
             let planes = frustum_planes(m);
             let (mut kept, mut culled) = (0, 0);
-            for _ in 0..2000 {
+            for _ in 0..3000 {
                 let centre = head + Vec3::new(rand() - 0.5, rand() - 0.5, rand() - 0.5) * 16.0;
                 let sphere = centre.extend(0.05 + rand() * 1.5);
                 let inside = sphere_in_frustum(&planes, sphere);
@@ -2433,7 +2601,7 @@ mod render_tests {
             ..base()
         });
         assert!(
-            i32::from(toward[0]) - i32::from(away[0]) > 20,
+            toward[0] as i32 - away[0] as i32 > 20,
             "the ambient did not follow the normal: facing the bright half gave \
              {toward:?}, facing away gave {away:?}",
         );
@@ -2473,7 +2641,7 @@ mod render_tests {
             let want = irr.evaluate(normal);
             for c in 0..3 {
 
-                let got = f32::from(px[c]) / 255.0;
+                let got = px[c] as f32 / 255.0;
                 assert!(
                     (got - want[c]).abs() < 0.012,
                     "normal {normal:?} channel {c}: the shader rendered {got:.4} \
@@ -2493,14 +2661,14 @@ mod render_tests {
         for (a, b) in [(up, side), (up, down)] {
             for c in 0..3 {
                 assert!(
-                    (i32::from(a[c]) - i32::from(b[c])).abs() <= 1,
+                    (a[c] as i32 - b[c] as i32).abs() <= 1,
                     "flat ambient is no longer flat: {a:?} vs {b:?}",
                 );
             }
         }
         let ambient = (crate::renderer::sky::AMBIENT * 255.0).round() as i32;
         assert!(
-            (i32::from(up[0]) - ambient).abs() <= 2,
+            (up[0] as i32 - ambient).abs() <= 2,
             "ambient came out {} rather than {ambient}",
             up[0],
         );
@@ -2512,14 +2680,13 @@ mod render_tests {
         let overhead = shot!(Scene { eye_offset: Vec3::new(0.0, 5.0, 0.0), ..base() });
         let oblique = shot!(Scene { eye_offset: Vec3::new(50.0, 0.5, 0.0), ..base() });
         assert!(
-            i32::from(overhead[0]) - i32::from(oblique[0]) > 4,
+            overhead[0] as i32 - oblique[0] as i32 > 4,
             "the specular highlight did not follow the eye: {overhead:?} vs {oblique:?}",
         );
     }
 
     fn lamp_path() -> Option<std::path::PathBuf> {
-        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../game/models/lights/hanging_industrial_lamp/hanging_industrial_lamp_1k.gltf");
+        let p = crate::test_game_dir().join("models/lights/hanging_industrial_lamp/hanging_industrial_lamp_1k.gltf");
         p.is_file().then_some(p)
     }
 
@@ -2533,7 +2700,8 @@ mod render_tests {
                 let transmissive = prim
                     .material()
                     .transmission()
-                    .map_or(0.0, |t| t.transmission_factor())
+                    .map(|t| t.transmission_factor())
+                    .unwrap_or(0.0)
                     > 0.5;
                 if transmissive && !include_transmissive {
                     continue;
@@ -2616,7 +2784,7 @@ mod render_tests {
             "the rig itself does not light the floor ({open:?}); nothing below this means anything",
         );
         assert!(
-            i32::from(open[0]) - i32::from(full[0]) < 16,
+            (open[0] as i32) - (full[0] as i32) < 16,
             "the fixture is shadowing its own bulb: floor at {full:?} against {open:?} with \
              nothing casting. Check the spot shadow near plane against the size of the \
              fixture -- if the near plane has come inside the housing, every lamp in the \
@@ -2668,16 +2836,16 @@ mod render_tests {
             "TORCH HAND: unlit {unlit:?}  open {open:?}  fixture's near plane {as_a_fixture:?}  torch's {as_a_torch:?}"
         );
         assert!(
-            i32::from(open[0]) > i32::from(unlit[0]) + 20,
+            open[0] as i32 > unlit[0] as i32 + 20,
             "the torch does not light the floor ({open:?} against {unlit:?}); nothing below means anything",
         );
         assert!(
-            (i32::from(as_a_fixture[0]) - i32::from(open[0])).abs() <= 3,
+            (as_a_fixture[0] as i32 - open[0] as i32).abs() <= 3,
             "with a fixture's near plane the hand 10 cm from the glass should be clipped out of \
              the map ({as_a_fixture:?} against {open:?}) -- the reason the torch has its own",
         );
         assert!(
-            (i32::from(as_a_torch[0]) - i32::from(unlit[0])).abs() <= 3,
+            (as_a_torch[0] as i32 - unlit[0] as i32).abs() <= 3,
             "the hand before the torch does not shadow the floor: {as_a_torch:?}, unlit {unlit:?}, open {open:?}",
         );
     }
@@ -2693,14 +2861,14 @@ mod render_tests {
         eprintln!(
             "TORCH BIAS: unlit {unlit:?}  open {open:?}  plate 4 cm up {low_plate:?}  floor in its own map {itself:?}"
         );
-        assert!(i32::from(open[0]) > i32::from(unlit[0]) + 20, "the torch does not light the floor ({open:?} against {unlit:?})");
+        assert!(open[0] as i32 > unlit[0] as i32 + 20, "the torch does not light the floor ({open:?} against {unlit:?})");
         assert!(
-            (i32::from(low_plate[0]) - i32::from(unlit[0])).abs() <= 3,
+            (low_plate[0] as i32 - unlit[0] as i32).abs() <= 3,
             "a plate 4 cm off the floor casts nothing at 2.5 m: the lookup bias is not in texels \
              ({low_plate:?}, unlit {unlit:?}, open {open:?})",
         );
         assert!(
-            (i32::from(open[0]) - i32::from(itself[0])) <= 3,
+            (open[0] as i32 - itself[0] as i32) <= 3,
             "the floor shadows itself under the torch -- acne ({itself:?} against {open:?})",
         );
     }
@@ -2727,13 +2895,13 @@ mod render_tests {
         let disc = shot!(floor(patch(0.05, 1.0)));
         let point = shot!(floor(patch(0.05, 0.0)));
         eprintln!("PATCH: unlit {unlit:?}  bulb 1 m up {bulb:?}  metre-wide patch 5 cm up {disc:?}  point 5 cm up {point:?}");
-        assert!(i32::from(bulb[0]) > i32::from(unlit[0]) + 20, "the bulb does not light the floor ({bulb:?} against {unlit:?})");
+        assert!(bulb[0] as i32 > unlit[0] as i32 + 20, "the bulb does not light the floor ({bulb:?} against {unlit:?})");
         assert!(
-            (i32::from(disc[0]) - i32::from(bulb[0])).abs() <= 2,
+            (disc[0] as i32 - bulb[0] as i32).abs() <= 2,
             "a metre-wide patch 5 cm up lights the floor to {disc:?}, a bulb a metre up to {bulb:?}",
         );
         assert!(
-            i32::from(point[0]) > i32::from(bulb[0]) + 40,
+            point[0] as i32 > bulb[0] as i32 + 40,
             "a point 5 cm up lights the floor to {point:?}, no more than the bulb's {bulb:?}: \
              nothing above shows the radius doing anything",
         );
@@ -2751,11 +2919,11 @@ mod render_tests {
             let shaded = shot!(floor(lamp(), hand()));
             eprintln!("TORCH REACH {height} m: unlit {unlit:?}  open {open:?}  hand {shaded:?}");
             assert!(
-                i32::from(open[0]) > i32::from(unlit[0]) + 20,
+                open[0] as i32 > unlit[0] as i32 + 20,
                 "the torch does not light the floor {height} m below ({open:?} against {unlit:?})",
             );
             assert!(
-                (i32::from(shaded[0]) - i32::from(unlit[0])).abs() <= 3,
+                (shaded[0] as i32 - unlit[0] as i32).abs() <= 3,
                 "the hand 10 cm before the glass does not shadow the floor {height} m below: \
                  {shaded:?}, unlit {unlit:?}, open {open:?}",
             );
@@ -2777,6 +2945,103 @@ mod render_tests {
         let m = spot_shadow_matrices(&l, 1024);
         assert_eq!(m.pass, m.lookup);
         assert_eq!(m.pass, spot_light_matrix(l.position, l.direction, l.cone_angle_deg, l.range));
+    }
+
+    fn cuboid(lo: Vec3, hi: Vec3) -> (Vec<SolidVertex>, Vec<u32>) {
+        let (mut v, mut idx) = (Vec::new(), Vec::new());
+        for axis in 0..3 {
+            for side in [0.0f32, 1.0] {
+                let mut n = Vec3::ZERO;
+                n[axis] = if side > 0.5 { 1.0 } else { -1.0 };
+                let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+                let corner = |a: f32, b: f32| {
+                    let mut p = Vec3::ZERO;
+                    p[axis] = if side > 0.5 { hi[axis] } else { lo[axis] };
+                    p[u] = if a > 0.5 { hi[u] } else { lo[u] };
+                    p[w] = if b > 0.5 { hi[w] } else { lo[w] };
+                    p
+                };
+                let q = [corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0)];
+                let base = v.len() as u32;
+                for p in q {
+                    v.push(vertex(p.into(), n.into()));
+                }
+                let flip = (q[1] - q[0]).cross(q[2] - q[0]).dot(n) < 0.0;
+                let tri: [u32; 6] = if flip { [0, 2, 1, 0, 3, 2] } else { [0, 1, 2, 0, 2, 3] };
+                idx.extend(tri.iter().map(|t| base + t));
+            }
+        }
+        (v, idx)
+    }
+
+    #[test]
+    fn a_torchs_pillar_shadow_on_the_far_ceiling_is_where_the_rays_put_it() {
+        let pos = Vec3::new(-0.8, 1.25, -4.7);
+        let aim = Vec3::new(0.0, 1.9, -9.0);
+        let lamp = |intensity: f32| Light {
+            position: pos,
+            direction: (aim - pos).normalize(),
+            intensity,
+            ..torch(1.0, Some(0.02))
+        };
+        let (pmin, pmax) = (Vec3::new(-0.45, 0.0, -7.45), Vec3::new(0.45, 3.1, -6.55));
+        let mut caster = cuboid(pmin, pmax);
+
+        for (lo, hi) in [(Vec3::new(-3.0, 3.4, -16.0), Vec3::new(3.0, 3.6, 4.0)), (Vec3::new(-3.0, 0.0, -16.2), Vec3::new(3.0, 3.4, -16.0))] {
+            let (v, i) = cuboid(lo, hi);
+            let base = caster.0.len() as u32;
+            caster.0.extend(v);
+            caster.1.extend(i.into_iter().map(|t| base + t));
+        }
+        let eye = Vec3::new(-1.0, 1.6, -4.6);
+        let blocked = |p: Vec3| {
+
+            let d = p - pos;
+            let (mut t0, mut t1) = (0.0f32, 1.0f32);
+            for k in 0..3 {
+                if d[k].abs() < 1e-6 {
+                    if pos[k] < pmin[k] || pos[k] > pmax[k] {
+                        return false;
+                    }
+                    continue;
+                }
+                let (a, b) = ((pmin[k] - pos[k]) / d[k], (pmax[k] - pos[k]) / d[k]);
+                t0 = t0.max(a.min(b));
+                t1 = t1.min(a.max(b));
+            }
+            t0 <= t1
+        };
+        for (z, xs) in [(-9.0f32, [-0.6f32, -0.3, 0.3, 0.9]), (-12.0, [-0.6, -0.3, 0.6, 1.2]), (-15.0, [-0.6, 0.0, 1.0, 1.5])] {
+            for x in xs {
+                let p = Vec3::new(x, 3.399, z);
+                let at = |light: Light, caster| Scene {
+                    lights: vec![light],
+                    caster,
+                    receiver_at: p,
+                    eye_offset: eye - p,
+                    normal: [0.0, -1.0, 0.0],
+                    shadow_dim: QUEST_SHADOW_DIM,
+                    ..floor_under_the_lamp()
+                };
+                let k = 30.0;
+                let unlit = shot!(at(lamp(0.0), None));
+                let open = shot!(at(lamp(k), None));
+                let lit = shot!(at(lamp(k), Some(caster.clone())));
+                let shadowed = blocked(p);
+                eprintln!(
+                    "CEILING z {z:5.1} x {x:5.2}: {}  unlit {:3} open {:3} with shadows {:3}",
+                    if shadowed { "SHADOW" } else { "lit   " },
+                    unlit[0], open[0], lit[0]
+                );
+                assert!(open[0] as i32 > unlit[0] as i32 + 8, "the torch does not reach ({x}, {z}): {open:?} against {unlit:?}");
+                let want = if shadowed { unlit } else { open };
+                assert!(
+                    (lit[0] as i32 - want[0] as i32).abs() <= 3,
+                    "ceiling ({x}, {z}) is {} by the rays but reads {lit:?} (open {open:?}, unlit {unlit:?})",
+                    if shadowed { "in the pillar's shadow" } else { "lit" },
+                );
+            }
+        }
     }
 
 }
@@ -2901,11 +3166,11 @@ mod spot_near_plane_tests {
 
         let (mut lo, mut hi) = (0.001f32, range.max(0.2));
         for _ in 0..60 {
-            let mid = f32::midpoint(lo, hi);
+            let mid = 0.5 * (lo + hi);
             let c: Vec4 = m * Vec4::new(0.0, 0.0, -mid, 1.0);
             if c.w <= 0.0 || c.z / c.w < 0.0 { lo = mid } else { hi = mid }
         }
-        f32::midpoint(lo, hi)
+        0.5 * (lo + hi)
     }
 
     #[test]

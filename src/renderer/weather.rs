@@ -11,6 +11,39 @@ pub const VERTICES_PER_PARTICLE: u32 = 6;
 
 pub const SNOW_ALBEDO: [f32; 3] = [0.86, 0.88, 0.92];
 
+pub const WET_BACK: f32 = 0.435;
+pub const WET_OUT: f32 = 0.554;
+
+pub const FILM_ROUGH: f32 = 0.12;
+
+pub const FILM_FROM: f32 = 0.6;
+
+pub const FILM_LEVEL: f32 = 0.875;
+
+pub const WET_SPECKLE: f32 = 0.6;
+
+pub fn wet_albedo(dry: f32) -> f32 {
+    WET_OUT * dry * (1.0 + WET_BACK * dry * (1.0 + WET_BACK * dry))
+}
+
+pub fn wet_soak(wet: f32, fine: f32) -> f32 {
+    (wet * (1.0 + WET_SPECKLE) - WET_SPECKLE * fine).clamp(0.0, 1.0)
+}
+
+pub fn wet_film(film: f32, soak: f32) -> f32 {
+    film * ((soak - FILM_FROM) / (1.0 - FILM_FROM)).clamp(0.0, 1.0)
+}
+
+pub fn film_levels(film: f32, up: f32) -> f32 {
+    film * ((up - FILM_LEVEL) / (1.0 - FILM_LEVEL)).clamp(0.0, 1.0)
+}
+
+pub fn wet_ground(albedo: [f32; 3], rough: f32, soak: f32, porosity: f32, film: f32) -> ([f32; 3], f32) {
+    let k = soak * porosity;
+    let f = wet_film(film, soak);
+    (albedo.map(|a| a + (wet_albedo(a) - a) * k), rough + (FILM_ROUGH - rough) * f)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct WeatherUniform {
@@ -55,6 +88,8 @@ pub struct AreaParams {
     pub falling: f32,
     pub wind: [f32; 2],
     pub edge: f32,
+
+    pub shore: bool,
 }
 
 pub fn bind_group_layout(device: &Device) -> BindGroupLayout {
@@ -102,7 +137,7 @@ pub fn f16_bits(v: f32) -> u16 {
         let m = (man | 0x80_0000) >> (1 - e);
         return sign | ((m + 0x1000) >> 13) as u16;
     }
-    let h = u32::from(sign) | ((e as u32) << 10) | (man >> 13);
+    let h = sign as u32 | ((e as u32) << 10) | (man >> 13);
 
     (h + ((man >> 12) & 1)) as u16
 }
@@ -189,7 +224,7 @@ impl WeatherMaps {
         self.params.areas[3 * k + 1] = [
             texels.0 as f32 / self.size.0 as f32,
             texels.1 as f32 / self.size.1 as f32,
-            if a.snow { 1.0 } else { 0.0 },
+            if a.shore { 2.0 } else if a.snow { 1.0 } else { 0.0 },
             a.falling.max(0.0),
         ];
         self.params.areas[3 * k + 2] = [a.wind[0], a.wind[1], k as f32, a.edge.max(1e-3)];
@@ -223,7 +258,7 @@ pub fn particle_counts(areas: &[AreaParams], head: [f32; 3]) -> (u32, u32, u32) 
 }
 
 pub fn map_block() -> String {
-    r"
+    r#"
 struct WxUniform {
     areas: array<vec4<f32>, 12>,
     params: vec4<f32>,
@@ -262,16 +297,21 @@ fn wx_cell(c: vec2<f32>) -> u32 {
     return wx_hash(bitcast<u32>(i.x) * 1973u + bitcast<u32>(i.y) * 9277u + 26699u);
 }
 
+fn wx_corner(key: u32) -> f32 {
+    var x = key * 0x7feb352du;
+    x = (x ^ (x >> 15u)) * 0x846ca68bu;
+    return f32(x >> 16u) / 65535.0;
+}
 fn wx_noise(q: vec2<f32>) -> f32 {
     let i = floor(q);
     let f = q - i;
     let s = f * f * (3.0 - 2.0 * f);
     let ii = vec2<i32>(i);
     let key = bitcast<u32>(ii.x) * 1973u + bitcast<u32>(ii.y) * 9277u + 26699u;
-    let a = f32(wx_hash(key) & 0xffffu) / 65535.0;
-    let b = f32(wx_hash(key + 1973u) & 0xffffu) / 65535.0;
-    let c = f32(wx_hash(key + 9277u) & 0xffffu) / 65535.0;
-    let d = f32(wx_hash(key + 11250u) & 0xffffu) / 65535.0;
+    let a = wx_corner(key);
+    let b = wx_corner(key + 1973u);
+    let c = wx_corner(key + 9277u);
+    let d = wx_corner(key + 11250u);
     return mix(mix(a, b, s.x), mix(c, d, s.x), s.y);
 }
 
@@ -315,13 +355,13 @@ fn wx_at(p: vec3<f32>) -> WxAt {
 fn wx_open(y: f32, cover: f32) -> f32 {
     return clamp((y - cover + 0.5) / 0.4, 0.0, 1.0);
 }
-"
+"#
     .to_string()
 }
 
 fn surface_block() -> String {
     format!(
-        r"
+        r#"
 fn wx_ripple_layer(q: vec2<f32>, t: f32, seed: u32) -> vec2<f32> {{
     let h = wx_cell(q + vec2<f32>(f32(seed), 0.0));
     let hx = f32(h & 0xffffu) / 65535.0;
@@ -335,7 +375,13 @@ fn wx_ripple_layer(q: vec2<f32>, t: f32, seed: u32) -> vec2<f32> {{
     return select(vec2<f32>(0.0), d / max(r, 1e-4) * wave, r > 1e-4);
 }}
 fn wx_ripples(xz: vec2<f32>, t: f32) -> vec2<f32> {{
-    return 0.35 * (wx_ripple_layer(xz / 0.35, t, 0u) + wx_ripple_layer(xz / 0.35 + vec2<f32>(0.5), t + 0.37, 17u));
+    // The two layers through one copy of the layer: the first's offsets are 0.
+    var sum = vec2<f32>(0.0);
+    for (var k = 0u; k < 2u; k = k + 1u) {{
+        let o = f32(k);
+        sum = sum + wx_ripple_layer(xz / 0.35 + vec2<f32>(0.5 * o), t + 0.37 * o, 17u * k);
+    }}
+    return 0.35 * sum;
 }}
 
 struct WxSurface {{
@@ -355,10 +401,13 @@ fn wx_surface(p: vec3<f32>, n: vec3<f32>, view: vec3<f32>, footprint: f32) -> Wx
     let open = wx_open(p.y, at.m.w);
     let up = smoothstep(0.55, 0.9, n.y);
     var fine = 0.0;
-    if (WX_WATER || WX_SNOW) {{
-        fine = 0.65 * wx_noise(p.xz * 3.1) + 0.35 * wx_noise(p.xz * 9.7);
+    for (var k = 0u; k < 2u; k = k + 1u) {{
+        fine = fine + select(0.65, 0.35, k == 1u) * wx_noise(p.xz * select(3.1, 9.7, k == 1u));
     }}
-    s.wet = at.m.x * open;
+
+    let damp = select(at.m.x, clamp((mat.sea_line + at.m.x - p.y) * {shore_fade:?}, 0.0, 1.0), at.area.y > 1.5);
+
+    s.wet = clamp(damp * open * {soak_gain:?} - {speckle:?} * fine, 0.0, 1.0);
     s.water = 0.0;
     s.snow = 0.0;
     s.ripple = vec2<f32>(0.0);
@@ -397,51 +446,67 @@ fn wx_lift(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {{
 }}
 const WX_SNOW_ALBEDO: vec3<f32> = vec3<f32>({sa:?}, {sb:?}, {sc:?});
 
+const WX_WET_BACK: f32 = {wet_back:?};
+const WX_WET_OUT: f32 = {wet_out:?};
+const WX_FILM_ROUGH: f32 = {film_rough:?};
+const WX_FILM_FROM: f32 = {film_from:?};
+const WX_FILM_LEVEL: f32 = {film_level:?};
+
 const WX_WATER: bool = true;
 const WX_SNOW: bool = true;
-",
+"#,
         sa = SNOW_ALBEDO[0],
         sb = SNOW_ALBEDO[1],
         sc = SNOW_ALBEDO[2],
+        shore_fade = 1.0 / crate::renderer::water_pipeline::SHORE_BAND,
+        soak_gain = 1.0 + WET_SPECKLE,
+        speckle = WET_SPECKLE,
+        wet_back = WET_BACK,
+        wet_out = WET_OUT,
+        film_rough = FILM_ROUGH,
+        film_from = FILM_FROM,
+        film_level = FILM_LEVEL,
     )
 }
 
 const TERRAIN_APPLY: &str = "
     let wx_s = wx_surface(in.tex_pos, to_world_direction(n), to_world_space(cam_pos()) - in.tex_pos, pixel_footprint);
-    let wx_porous = clamp((rough - 0.2) / 0.6, 0.0, 1.0);
 
+    let wx_in = wx_s.wet * dot(w, mat.porosity);
+    let wx_back = WX_WET_BACK * albedo;
+    albedo = albedo * ((1.0 - wx_in * (1.0 - WX_WET_OUT)) + (wx_in * WX_WET_OUT) * (wx_back * wx_back + wx_back));
+
+    let wx_film = dot(w, mat.film) * clamp((wx_s.wet - WX_FILM_FROM) / (1.0 - WX_FILM_FROM), 0.0, 1.0) * clamp((in.tex_pos.y - mat.sea_line) * 20.0, 0.0, 1.0);
+    rough = mix(rough, WX_FILM_ROUGH, wx_film);
+
+    var wx_n = mix(shaded_n, n, wx_film * clamp((n.y - WX_FILM_LEVEL) / (1.0 - WX_FILM_LEVEL), 0.0, 1.0));
     if (WX_WATER) {
-        albedo = albedo * (1.0 - 0.35 * wx_s.wet * wx_porous) * (1.0 - 0.3 * wx_s.water);
-    } else {
-        albedo = albedo * (1.0 - 0.35 * wx_s.wet * wx_porous) * 1.0;
-    }
-    rough = mix(rough, mix(min(rough, 0.15), max(0.85 * rough, 0.65), wx_porous), wx_s.wet);
-    if (WX_WATER) {
+        albedo = albedo * (1.0 - 0.3 * wx_s.water);
         rough = mix(rough, 0.035, wx_s.water);
-        shaded_n = normalize(mix(shaded_n, to_player_direction(normalize(vec3<f32>(-wx_s.ripple.x, 1.0, -wx_s.ripple.y))), wx_s.water));
-    } else {
-        shaded_n = normalize(shaded_n);
+        wx_n = mix(wx_n, to_player_direction(normalize(vec3<f32>(-wx_s.ripple.x, 1.0, -wx_s.ripple.y))), wx_s.water);
     }
     if (WX_SNOW) {
         let wx_snow_n = normalize(mix(normalize(n + to_player_direction(vec3<f32>(-wx_s.drift.x, 0.0, -wx_s.drift.y))), to_player_direction(wx_s.grain), wx_s.sparkle));
         albedo = mix(albedo, WX_SNOW_ALBEDO, wx_s.snow);
         rough = mix(rough, mix(0.62, 0.06, wx_s.sparkle), wx_s.snow);
-        shaded_n = normalize(mix(shaded_n, wx_snow_n, wx_s.snow));
+        wx_n = mix(wx_n, wx_snow_n, wx_s.snow);
         ao_map = mix(ao_map, 1.0, wx_s.snow);
-    } else {
-        shaded_n = normalize(shaded_n);
     }
+    shaded_n = normalize(wx_n);
 ";
 
 pub fn with_weather(src: &str) -> Option<String> {
-    let mut s = src.to_string();
-    let edits: [(&str, &str); 4] = [
+
+    let mut s = crate::renderer::ground_shape::unshaped(src)?;
+    let edits: [(&str, &str); 5] = [
+
+        (crate::renderer::terrain_pipeline::SEA_LINE_WGSL, ""),
         (
-            "    out.clip      = cam_view_proj() * vec4<f32>(v.pos, 1.0);",
-            "    let wx_pos = wx_lift(v.pos, v.norm);\n    out.clip      = cam_view_proj() * vec4<f32>(wx_pos, 1.0);",
+            "    out.clip      = cam_view_proj() * vec4<f32>(pos, 1.0);",
+            "    let wx_pos = wx_lift(pos, v.norm);\n    out.clip      = cam_view_proj() * vec4<f32>(wx_pos, 1.0);",
         ),
-        ("    out.world_pos = v.pos;", "    out.world_pos = wx_pos;"),
-        ("    out.tex_pos   = to_world_space(v.pos);", "    out.tex_pos   = to_world_space(wx_pos);"),
+        ("    out.world_pos = pos;", "    out.world_pos = wx_pos;"),
+        ("    out.tex_pos   = to_world_space(pos);", "    out.tex_pos   = to_world_space(wx_pos);"),
         ("    let rough = specular_aa_roughness(", "    var rough = specular_aa_roughness("),
     ];
     for (from, to) in edits {
@@ -467,14 +532,17 @@ pub enum WeatherKinds {
     Snowless,
 
     Waterless,
+
+    WetOnly,
 }
 
 impl WeatherKinds {
-    pub const ALL: [WeatherKinds; 3] = [WeatherKinds::Both, WeatherKinds::Snowless, WeatherKinds::Waterless];
+    pub const ALL: [WeatherKinds; 4] = [WeatherKinds::Both, WeatherKinds::Snowless, WeatherKinds::Waterless, WeatherKinds::WetOnly];
 
     pub fn of(water: bool, snow: bool) -> Self {
         match (water, snow) {
-            (_, false) => WeatherKinds::Snowless,
+            (true, false) => WeatherKinds::Snowless,
+            (false, false) => WeatherKinds::WetOnly,
             (false, true) => WeatherKinds::Waterless,
             (true, true) => WeatherKinds::Both,
         }
@@ -489,6 +557,7 @@ impl WeatherKinds {
             WeatherKinds::Both => "",
             WeatherKinds::Snowless => "_snowless",
             WeatherKinds::Waterless => "_waterless",
+            WeatherKinds::WetOnly => "_wet",
         }
     }
 }
@@ -503,6 +572,7 @@ pub fn with_weather_kinds(src: &str, kinds: WeatherKinds) -> Option<String> {
         WeatherKinds::Both => Some(s),
         WeatherKinds::Snowless => off(s, "WX_SNOW"),
         WeatherKinds::Waterless => off(s, "WX_WATER"),
+        WeatherKinds::WetOnly => off(s, "WX_WATER").and_then(|s| off(s, "WX_SNOW")),
     }
 }
 
@@ -512,12 +582,16 @@ pub fn map_holds(texels: &[[f32; 4]]) -> (bool, bool) {
     (water, snow)
 }
 
+pub fn map_is_wet(texels: &[[f32; 4]]) -> bool {
+    texels.iter().any(|t| t[0] > 0.02 || t[1] > 0.0004)
+}
+
 fn particle_shader() -> String {
     format!(
         "{aces}{map}{body}",
         aces = crate::renderer::tonemap::wgsl_aces_block(),
         map = map_block(),
-        body = r"
+        body = r#"
 var<private> view_slot: i32 = 0;
 struct Camera { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -712,7 +786,7 @@ const WX_GONE: vec4<f32> = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     let alpha = clamp(in.sky.a * a, 0.0, 1.0);
     return vec4<f32>(aces_fitted(lit) * alpha, alpha);
 }
-"
+"#
         .replace("WX_SUN_RANGE", &format!("{:?}", super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS))
         .replace("WX_WOBBLE_T", &snow_wobble("t")),
     )
@@ -743,7 +817,7 @@ pub fn motion_shader() -> String {
     let to = from + s[from..].find("    var sky_vis").expect("weather motion twin: the particle's cover moved");
     let cover = s[from..to].to_string();
     format!(
-        r"{motion}
+        r#"{motion}
 {s}
 var<private> wx_back: f32 = 0.0;
 var<private> wx_before: bool = false;
@@ -800,7 +874,7 @@ struct WxMotionOut {{
 {cover}    let w = layer_weight(in.sky.a * a, {bright:?});
     return vec4<f32>(motion_of(in.curr, in.prev).xyz * w, w);
 }}
-",
+"#,
         motion = crate::renderer::space_warp::motion_block(),
         wob_now = snow_wobble("t"),
         wob_before = snow_wobble("(t - wx_back)"),
@@ -836,7 +910,7 @@ fn veil_shader() -> String {
         map = map_block(),
         near = crate::renderer::brush_pipeline::probe_pass::EYE_NEAR,
         far = crate::renderer::brush_pipeline::probe_pass::EYE_FAR,
-        body = r"
+        body = r#"
 var<private> view_slot: i32 = 0;
 struct Camera { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -908,7 +982,18 @@ fn veil_height(snow: bool) -> f32 {
     return out;
 }
 
-@fragment fn fs_veil(in: VeilOut) -> @location(0) vec4<f32> {
+struct VeilFrag {
+    @location(0) colour: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+}
+fn veil_frag(colour: vec4<f32>, depth: f32) -> VeilFrag {
+    var f: VeilFrag;
+    f.colour = colour;
+    f.depth = depth;
+    return f;
+}
+
+@fragment fn fs_veil(in: VeilOut) -> VeilFrag {
     let k = in.area;
     let a0 = wx.areas[k * 3u];
     let a1 = wx.areas[k * 3u + 1u];
@@ -940,8 +1025,11 @@ fn veil_height(snow: bool) -> f32 {
 
     let hand = select(vec2<f32>(6.0, 11.0), vec2<f32>(3.5, 7.5), snow);
     let t0 = max(t_in, hand.x);
+
+    let begin = camera.view_proj[view_slot] * vec4<f32>(veil_to_player(eye + dir * t0), 1.0);
+    let begin_depth = clamp(begin.z / max(begin.w, 1e-6), 0.0, 1.0);
     if (t_end <= t0) {
-        return vec4<f32>(0.0);
+        return veil_frag(vec4<f32>(0.0), begin_depth);
     }
     let time = wx.params.y;
     let height = veil_height(snow);
@@ -962,7 +1050,7 @@ fn veil_height(snow: bool) -> f32 {
         depth = depth + rise * edge * near * shaft * dt;
     }
     if (depth <= 0.0) {
-        return vec4<f32>(0.0);
+        return veil_frag(vec4<f32>(0.0), begin_depth);
     }
 
     let centre = a0.xy + 0.5 / a0.zw;
@@ -1006,9 +1094,9 @@ fn veil_height(snow: bool) -> f32 {
     let sigma = select(0.016, 0.09, snow) * clamp(a1.w, 0.0, 1.5);
     let alpha = clamp(1.0 - exp(-sigma * depth * fall), 0.0, 0.7);
     var light = wx.sky.rgb * select(0.75, 1.0, snow) + wx.sun.rgb * select(0.12, 0.5, snow) * wx.sun_dir.w;
-    return vec4<f32>(aces_fitted(light) * alpha, alpha);
+    return veil_frag(vec4<f32>(aces_fitted(light) * alpha, alpha), begin_depth);
 }
-",
+"#,
     )
 }
 
@@ -1108,7 +1196,8 @@ impl WeatherPipeline {
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(CompareFunction::Always),
+
+                depth_compare: Some(CompareFunction::LessEqual),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
@@ -1177,12 +1266,15 @@ impl WeatherMaps {
         p.right = [v.right[0], v.right[1], v.right[2], 0.0];
         p.up = [v.up[0], v.up[1], v.up[2], 0.0];
         p.sky = [v.sky[0] * e, v.sky[1] * e, v.sky[2] * e, e];
-        if let Some((c, d)) = v.sun {
-            p.sun = [c[0] * e, c[1] * e, c[2] * e, 0.0];
-            p.sun_dir = [d[0], d[1], d[2], 1.0];
-        } else {
-            p.sun = [0.0; 4];
-            p.sun_dir = [0.0, 1.0, 0.0, 0.0];
+        match v.sun {
+            Some((c, d)) => {
+                p.sun = [c[0] * e, c[1] * e, c[2] * e, 0.0];
+                p.sun_dir = [d[0], d[1], d[2], 1.0];
+            }
+            None => {
+                p.sun = [0.0; 4];
+                p.sun_dir = [0.0, 1.0, 0.0, 0.0];
+            }
         }
         match v.torch {
             Some((pos, dir, range, outer, inner, col)) => {
@@ -1210,6 +1302,8 @@ pub fn particle_light(
     ([mean(0), mean(1), mean(2)], sun.map(|s| (s.light_rgb, s.direction)))
 }
 
+pub const CHUNK_POOLS: u32 = 16;
+
 pub struct WeatherScene {
     pub layout: BindGroupLayout,
     pub maps: WeatherMaps,
@@ -1220,9 +1314,13 @@ pub struct WeatherScene {
 
     pub gentle: Vec<[crate::renderer::terrain_pipeline::TerrainPipeline; 4]>,
 
+    pub wet: Option<[[crate::renderer::terrain_pipeline::TerrainPipeline; 4]; 2]>,
+
     pub dedup_passes: Option<[crate::renderer::terrain_pipeline::TerrainPipeline; 2]>,
 
     pub holds: Vec<(bool, bool)>,
+
+    pub films: Vec<bool>,
     pub areas: Vec<AreaParams>,
     pub texels: Vec<(u32, u32)>,
 
@@ -1243,13 +1341,22 @@ impl WeatherScene {
         self.chunks.binary_search_by_key(&first, |c| c.0).ok().map(|i| self.chunks[i].1)
     }
 
+    pub fn films_of(&self, first: u32) -> bool {
+        let mask = self.areas_of(first).unwrap_or(u32::MAX);
+        (0..CHUNK_POOLS as usize).filter(|k| mask & (1 << k) != 0).any(|k| {
+            self.areas.get(k).is_some_and(|a| a.shore)
+                || self.films.get(k).copied().unwrap_or(true)
+                || self.holds.get(k).is_none_or(|h| h.0)
+        })
+    }
+
     pub fn kinds_of(&self, first: u32) -> WeatherKinds {
         let mask = self.areas_of(first).unwrap_or(u32::MAX);
         let (mut water, mut snow) = (false, false);
-        for k in 0..32usize {
+        for k in 0..CHUNK_POOLS as usize {
             if mask & (1 << k) != 0 {
                 let (w, s) = self.holds.get(k).copied().unwrap_or((true, true));
-                water |= w;
+                water |= w && mask & (1 << (k + CHUNK_POOLS as usize)) != 0;
                 snow |= s;
             }
         }
@@ -1286,17 +1393,17 @@ mod tests {
             ("poolless pass", crate::renderer::lights::without_pool_maps(pass)),
         ] {
             let twin = with_weather(&src).unwrap_or_else(|| panic!("{label}: the weather twin's edits no longer match"));
-            assert!(twin.contains("wx_surface(in.tex_pos") && twin.contains("wx_lift(v.pos"), "{label}");
+            assert!(twin.contains("wx_surface(in.tex_pos") && twin.contains("wx_lift(pos"), "{label}");
             validate(label, &twin);
         }
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn weather_twin_size() {
         use wgpu::naga;
         fn reach(m: &naga::Module, block: &naga::Block, seen: &mut std::collections::HashSet<naga::Handle<naga::Function>>) {
-            for st in block {
+            for st in block.iter() {
                 match st {
                     naga::Statement::Call { function, .. } => {
                         if seen.insert(*function) {
@@ -1343,6 +1450,210 @@ mod tests {
     }
 
     #[test]
+    fn wet_ground_darkens_by_the_wet_surface_law() {
+        let closed = |a: f32| WET_OUT * a / (1.0 - WET_BACK * a);
+        for a in [0.02f32, 0.08, 0.2, 0.38, 0.6] {
+            assert!((wet_albedo(a) / closed(a) - 1.0).abs() < 0.02, "albedo {a}: {} against {}", wet_albedo(a), closed(a));
+        }
+
+        assert!((WET_BACK - (1.0 - 1.0 / (1.33f32 * 1.33))).abs() < 2e-3 && (WET_OUT - 0.98 * (1.0 - WET_BACK)).abs() < 2e-3);
+        let ratio = |a: f32| wet_albedo(a) / a;
+        assert!(ratio(0.08) < ratio(0.2) && ratio(0.2) < ratio(0.38) && ratio(0.38) < ratio(0.6));
+        assert!((0.55..0.60).contains(&ratio(0.08)) && (0.64..0.69).contains(&ratio(0.38)), "soil {}, sand {}", ratio(0.08), ratio(0.38));
+
+        let (wet, _) = wet_ground([0.10, 0.20, 0.05], 0.8, 1.0, 1.0, 0.0);
+        assert!(wet[1] / wet[0] > 2.0 && wet[1] / wet[2] > 4.0 && wet[1] < 0.2 * 0.62, "{wet:?}");
+        let line = crate::renderer::terrain_pipeline::SEA_LINE_WGSL;
+        for (written, law) in [("0.435 * albedo", WET_BACK), ("sea_in * 0.446)", 1.0 - WET_OUT), ("(sea_in * 0.554)", WET_OUT)] {
+            let n: f32 = written.trim_matches(|c: char| !c.is_ascii_digit() && c != '.').split(' ').find_map(|t| t.parse().ok()).unwrap();
+            assert!(line.contains(written) && (n - law).abs() < 1e-6, "the sea line's {written} is not the law's {law}");
+        }
+    }
+
+    #[test]
+    fn a_film_glosses_what_can_hold_one() {
+        use crate::renderer::terrain_pipeline::{WET_FILM, WET_POROSITY};
+        let soaked = |layer: usize, rough: f32| wet_ground([0.3; 3], rough, 1.0, WET_POROSITY[layer], WET_FILM[layer]).1;
+        let (lawn, rock, sand) = (soaked(0, 0.78), soaked(1, 0.7), soaked(3, 0.85));
+        assert!(lawn > 0.65 && lawn < 0.78, "a soaked lawn's roughness {lawn}");
+        assert!(rock < 0.3 && sand < 0.22 && sand > FILM_ROUGH, "rock {rock}, sand {sand}");
+
+        let (albedo, rough) = wet_ground([0.3; 3], 0.85, FILM_FROM, 1.0, 0.9);
+        assert!(rough == 0.85 && albedo[0] < 0.3);
+        assert_eq!(wet_ground([0.3; 3], 0.85, 0.0, 1.0, 0.9), ([0.3; 3], 0.85));
+
+        assert_eq!(film_levels(0.75, 1.0), 0.75);
+        assert_eq!(film_levels(0.75, 30f32.to_radians().cos()), 0.0);
+        let at_15 = film_levels(1.0, 15f32.to_radians().cos());
+        assert!(at_15 > 0.6 && at_15 < 0.85, "{at_15}");
+        let src = with_weather(&crate::renderer::terrain_pipeline::terrain_shader_for(crate::renderer::terrain_pipeline::TerrainRole::Read)).expect("the ground's weather twin");
+        assert!(src.contains("wx_film * clamp((n.y - WX_FILM_LEVEL) / (1.0 - WX_FILM_LEVEL), 0.0, 1.0)"), "the film's levelling left the ground's shader");
+        assert!(src.contains(&format!("const WX_FILM_LEVEL: f32 = {FILM_LEVEL:?};")));
+
+        let dark = |layer: usize| 0.3 - wet_ground([0.3; 3], 0.8, 1.0, WET_POROSITY[layer], 0.0).0[0];
+        assert!((dark(1) / dark(3) - 0.35).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ground_wets_in_spots_and_soaks_whole() {
+        for fine in [0.0f32, 0.3, 0.7, 1.0] {
+            assert_eq!(wet_soak(0.0, fine), 0.0);
+            assert_eq!(wet_soak(1.0, fine), 1.0);
+        }
+        assert!(wet_soak(0.2, 0.1) > 0.2 && wet_soak(0.2, 0.9) == 0.0);
+        assert!(wet_soak(0.5, 0.0) > wet_soak(0.5, 1.0) && wet_soak(0.5, 1.0) > 0.0);
+
+        assert!((0..=20).map(|k| wet_soak(k as f32 / 20.0, 0.6)).collect::<Vec<_>>().windows(2).all(|p| p[1] >= p[0]));
+    }
+
+    #[test]
+    fn a_map_is_wet_from_its_first_damp_texel() {
+        let dry = [0.0, 0.0, 0.0, 1.0];
+        assert!(!map_is_wet(&[]));
+        assert!(!map_is_wet(&[dry; 16]));
+        assert!(!map_is_wet(&[[0.0, 0.0, 0.8, 1.0]; 16]), "snow alone is not a film");
+        assert!(!map_is_wet(&[[0.01, 0.0003, 0.0, 1.0]; 16]), "under what the law shows");
+        let mut one = [dry; 16];
+        one[11] = [0.3, 0.0, 0.0, 1.0];
+        assert!(map_is_wet(&one), "one damp texel");
+        one[11] = [0.0, 0.002, 0.0, 1.0];
+        assert!(map_is_wet(&one), "one texel of standing water");
+
+        assert!(map_holds(&one).0 && map_is_wet(&one));
+    }
+
+    #[test]
+    fn a_chunk_draws_the_lightest_twin_that_shows_what_it_holds() {
+        assert_eq!(WeatherKinds::of(false, false), WeatherKinds::WetOnly);
+        assert_eq!(WeatherKinds::of(true, false), WeatherKinds::Snowless);
+        assert_eq!(WeatherKinds::of(false, true), WeatherKinds::Waterless);
+        assert_eq!(WeatherKinds::of(true, true), WeatherKinds::Both);
+        assert_eq!(WeatherKinds::ALL.map(|k| k.index()), [0, 1, 2, 3]);
+        let kinds = |holds: &[(bool, bool)], mask: u32| {
+            let (mut water, mut snow) = (false, false);
+            for k in 0..CHUNK_POOLS as usize {
+                if mask & (1 << k) != 0 {
+                    let (w, s) = holds.get(k).copied().unwrap_or((true, true));
+                    water |= w && mask & (1 << (k + CHUNK_POOLS as usize)) != 0;
+                    snow |= s;
+                }
+            }
+            WeatherKinds::of(water, snow)
+        };
+
+        let holds = [(false, false), (true, false)];
+        assert_eq!(kinds(&holds, 0b10), WeatherKinds::WetOnly, "a slope of the rain area");
+        assert_eq!(kinds(&holds, 0b10 | 0b10 << CHUNK_POOLS), WeatherKinds::Snowless, "its hollows");
+        assert_eq!(kinds(&holds, 0b01), WeatherKinds::WetOnly, "the beach");
+
+        let wet = with_weather_kinds(&terrain_shader_for(TerrainRole::Read), WeatherKinds::WetOnly).unwrap();
+        assert!(wet.contains("const WX_WATER: bool = false;") && wet.contains("const WX_SNOW: bool = false;"));
+        assert!(!wet.contains("mat.sea_line - in.tex_pos.y"), "the twin reads the sea's soaking from the map");
+        validate("wet-only read", &wet);
+
+        let size = |s: &str| crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum::<usize>();
+        let read = terrain_shader_for(TerrainRole::Read);
+        let steep = crate::renderer::ground_twins::steep_shader(&read).expect("the ground's steep twin");
+        let baked = |s: String| crate::renderer::brush_pipeline::sun_reader_shader(s, crate::renderer::brush_pipeline::FaceSun::Baked);
+        let spotless = crate::renderer::lights::without_spot_shadows;
+        for (name, src) in [("mixed", read), ("steep", steep)] {
+            for (twin, src) in [("", src.clone()), ("_spotless", spotless(src.clone())), ("_baked", baked(src.clone())), ("_baked_spotless", spotless(baked(src)))] {
+                let wet = with_weather_kinds(&src, WeatherKinds::WetOnly).unwrap_or_else(|| panic!("no wet-only twin of the {name}{twin} reader"));
+                validate(&format!("wet-only {name}{twin}"), &wet);
+                let full = with_weather(&src).unwrap();
+                // 250: the ripples' two layers now share one copy (`wx_ripples`), so
+                // the code this twin drops is ~50 smaller than when this was 300.
+                assert!(size(&wet) + 250 < size(&full), "wet-only {name}{twin}: {} against the full twin's {}", size(&wet), size(&full));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn wetness_reader_sizes() {
+        use crate::renderer::ground_twins::{gentle_shader, steep_shader};
+        use crate::renderer::terrain_pipeline::terrain_shader_built;
+        let total = |s: &str| crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum::<usize>();
+        let lit = |src: String| {
+            crate::renderer::lights::without_spot_shadows(crate::renderer::brush_pipeline::sun_reader_shader(src, crate::renderer::brush_pipeline::FaceSun::Baked))
+        };
+        let read = terrain_shader_built(TerrainRole::Read, true);
+        let gentle = lit(gentle_shader(&read).unwrap());
+        let steep = lit(steep_shader(&read).unwrap());
+        let mixed = lit(read);
+        eprintln!("dry gentle {}  dry steep {}  dry mixed {}", total(&gentle), total(&steep), total(&mixed));
+        for kinds in WeatherKinds::ALL {
+            eprintln!(
+                "weather{:<10} gentle {}  mixed {}  steep {}",
+                kinds.label(),
+                total(&with_weather_kinds(&gentle, kinds).unwrap()),
+                total(&with_weather_kinds(&mixed, kinds).unwrap()),
+                total(&with_weather_kinds(&steep, kinds).unwrap()),
+            );
+        }
+        for (label, src) in [
+            ("pass nowhere", crate::renderer::terrain_pipeline::nowhere_pass_shader().unwrap()),
+            ("pass outdoors", crate::renderer::terrain_pipeline::outdoor_pass_shader().unwrap()),
+            ("pass full", terrain_shader_for(TerrainRole::ProbePass)),
+        ] {
+            let kinds: Vec<String> = WeatherKinds::ALL.iter().map(|k| format!("{:?} {}", k, total(&with_weather_kinds(&src, *k).unwrap()))).collect();
+            eprintln!("{label}: dry {}  {}", total(&src), kinds.join("  "));
+        }
+    }
+
+    #[test]
+    fn the_torch_puddle_reader_walks_its_sky() {
+        use crate::renderer::ground_twins::gentle_shader;
+        use crate::renderer::terrain_pipeline::terrain_shader_built;
+        let total = |s: &str| crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum::<usize>();
+        let baked = |src: String| crate::renderer::brush_pipeline::sun_reader_shader(src, crate::renderer::brush_pipeline::FaceSun::Baked);
+        let gentle = baked(gentle_shader(&terrain_shader_built(TerrainRole::Read, true)).unwrap());
+        for kinds in WeatherKinds::ALL {
+            let twin = with_weather_kinds(&gentle, kinds).unwrap();
+            let walked = crate::renderer::ground_twins::torch_weather_twin(twin.clone());
+            assert_ne!(walked, twin, "{kinds:?}: the sky was not walked");
+            validate(&format!("torch walked {kinds:?}"), &walked);
+            assert!(total(&walked) + 80 < total(&twin), "{kinds:?}: {} walked against {}", total(&walked), total(&twin));
+        }
+        let puddles = crate::renderer::ground_twins::torch_weather_twin(with_weather_kinds(&gentle, WeatherKinds::ALL[1]).unwrap());
+        assert!(total(&puddles) <= 2600, "the torch's puddle reader is {} by the proxy", total(&puddles));
+    }
+
+    #[test]
+    #[ignore]
+    fn torch_wetness_reader_sizes() {
+        use crate::renderer::ground_twins::gentle_shader;
+        use crate::renderer::terrain_pipeline::terrain_shader_built;
+        let total = |s: &str| crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|f| f.own * f.copies).sum::<usize>();
+        let baked = |src: String| crate::renderer::brush_pipeline::sun_reader_shader(src, crate::renderer::brush_pipeline::FaceSun::Baked);
+        let read = terrain_shader_built(TerrainRole::Read, true);
+        let gentle = baked(gentle_shader(&read).unwrap());
+        let spotless = crate::renderer::lights::without_spot_shadows(gentle.clone());
+        eprintln!("dry gentle: spotless {}  torch {}", total(&spotless), total(&gentle));
+        for kinds in WeatherKinds::ALL {
+            eprintln!(
+                "weather{:<10} gentle: spotless {}  torch {}",
+                kinds.label(),
+                total(&with_weather_kinds(&spotless, kinds).unwrap()),
+                total(&with_weather_kinds(&gentle, kinds).unwrap()),
+            );
+        }
+        for kinds in WeatherKinds::ALL {
+            let torch = with_weather_kinds(&gentle, kinds).unwrap();
+            eprintln!(
+                "weather{:<10} gentle: torch, sky walked {}",
+                kinds.label(),
+                total(&crate::renderer::ground_twins::torch_weather_twin(torch)),
+            );
+        }
+        if std::env::var("REPORT").is_ok() {
+            let k = WeatherKinds::ALL[1];
+            eprintln!("{}", crate::renderer::shader_inlining::report("snowless torch", &with_weather_kinds(&gentle, k).unwrap(), "fs_main", 25));
+            eprintln!("{}", crate::renderer::shader_inlining::report("snowless spotless", &with_weather_kinds(&spotless, k).unwrap(), "fs_main", 25));
+        }
+    }
+
+    #[test]
     fn the_weather_motion_twin_validates_and_is_the_particle_shader() {
         validate("weather motion", &motion_shader());
         let draw = particle_shader();
@@ -1382,8 +1693,8 @@ mod tests {
     fn halves_round_trip_the_maps_values() {
         let back = |h: u16| {
             let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-            let e = i32::from((h >> 10) & 0x1f);
-            let m = f32::from(h & 0x3ff);
+            let e = ((h >> 10) & 0x1f) as i32;
+            let m = (h & 0x3ff) as f32;
             s * if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) }
         };
         for v in [0.0f32, 1.0, 0.5, 0.03, 0.004, -3.4, 12.25, 0.15, -10000.0] {
@@ -1403,6 +1714,109 @@ mod tests {
         assert!(s > 0 && s < SNOW_PARTICLES);
         let stopped = AreaParams { falling: 0.0, ..rain };
         assert_eq!(particle_counts(&[stopped], [5.0, 1.6, 5.0]), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_far_column_is_hidden_by_anything_drawn_in_front_of_it() {
+        let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        const SIZE: u32 = 16;
+        let format = TextureFormat::Rgba8Unorm;
+        let lights = crate::renderer::lights::LightsUniform::new(&device);
+        let (_shadows, uniforms) = crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
+        let eye = glam::Vec3::new(0.0, 2.0, 0.0);
+        let view_proj = glam::Mat4::perspective_rh(1.2, 1.0, 0.1, 200.0)
+            * glam::Mat4::look_at_rh(eye, glam::Vec3::new(0.0, 2.0, -40.0), glam::Vec3::Y);
+        uniforms.upload(&queue, view_proj, eye, &crate::renderer::uniforms::ShadowUpload::disabled());
+        let layout = bind_group_layout(&device);
+        let ground_layout = crate::renderer::terrain_pipeline::material_bind_group_layout(&device);
+        let material = crate::renderer::terrain_pipeline::TerrainMaterial::fallback(&device, &queue, &ground_layout);
+        let probe_layout = crate::renderer::brush_pipeline::probe_pass::bind_group_layout(&device);
+        let probe = crate::renderer::brush_pipeline::probe_pass::Target::new(&device, &probe_layout, SIZE, SIZE, 1);
+        let pipeline = WeatherPipeline::new(&device, format, &uniforms.layout, &ground_layout, &layout, 1, crate::renderer::multiview::ViewMode::Mono);
+        let mut maps = WeatherMaps::new(&device, &layout, &[(8, 8)]);
+        maps.upload_map(&queue, 0, 8, 8, &[[0.0; 4]; 64]);
+        maps.set_area(0, &AreaParams { min: [-30.0, -60.0], extent: [60.0, 30.0], snow: false, falling: 1.0, wind: [0.0, 0.0], edge: 3.0, shore: false }, (8, 8));
+        let view = ParticleView { head_world: eye.to_array(), sky: [1.0; 3], exposure: 1.0, pixel: 0.01, ..Default::default() };
+        maps.set_view(&view, (0, 0, 0), [0.0, 0.0]);
+        maps.write(&queue);
+
+        let centre_after = |frame_depth: f32| -> [u8; 4] {
+            let make = |label: &str, format: TextureFormat| {
+                device.create_texture(&TextureDescriptor {
+                    label: Some(label),
+                    size: Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format,
+                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+            };
+            let target = make("veil_test_target", format);
+            let depth = make("veil_test_depth", TextureFormat::Depth32Float);
+            let (target_view, depth_view) = (target.create_view(&Default::default()), depth.create_view(&Default::default()));
+            let readback = device.create_buffer(&BufferDescriptor {
+                label: Some("veil_test_readback"),
+                size: (256 * SIZE) as u64,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+
+            encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("veil_test_probe_depth"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &probe.depth_view,
+                    depth_ops: Some(Operations { load: LoadOp::Clear(1.0), store: StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            {
+
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("veil_test_pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &target_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(Operations { load: LoadOp::Clear(frame_depth), store: StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                pipeline.draw_veils(&mut pass, &uniforms.bind_group, &material.bind_group, &maps.bind_group, &probe.bind_group);
+            }
+            encoder.copy_texture_to_buffer(
+                TexelCopyTextureInfo { texture: &target, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+                TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(SIZE) },
+                },
+                Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            );
+            queue.submit(Some(encoder.finish()));
+            let slice = readback.slice(..);
+            slice.map_async(MapMode::Read, |_| {});
+            device.poll(PollType::Wait { submission_index: None, timeout: None }).ok();
+            let data = slice.get_mapped_range().unwrap();
+            let at = (SIZE / 2) as usize * 256 + (SIZE / 2) as usize * 4;
+            [data[at], data[at + 1], data[at + 2], data[at + 3]]
+        };
+        let open = centre_after(1.0);
+        assert!(open[3] > 0 && open[0] > 0, "the column should show with nothing in front of it: {open:?}");
+
+        let hidden = centre_after(0.2);
+        assert_eq!(hidden, [0, 0, 0, 255], "the column drew over something in front of it (the clear is opaque black)");
     }
 
     #[test]
@@ -1432,11 +1846,13 @@ mod tests {
         }
         crate::renderer::ground_twins::gentle_readers(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &probe_layout, None)
             .expect("the ground's gentle twins");
+        crate::renderer::ground_twins::wet_readers(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, 4, &probe_layout, &layout)
+            .expect("the ground's wet-only mixed and steep twins");
         let ground = crate::renderer::terrain_pipeline::material_bind_group_layout(&device);
         let _p = WeatherPipeline::new(&device, TextureFormat::Rgba8UnormSrgb, &uniforms.layout, &ground, &layout, 4, crate::renderer::multiview::ViewMode::Mono);
         let mut maps = WeatherMaps::new(&device, &layout, &[(64, 48), (32, 80)]);
         maps.upload_map(&queue, 1, 32, 80, &vec![[1.0, 0.01, 0.1, 0.0]; 32 * 80]);
-        maps.set_area(1, &AreaParams { min: [0.0, 0.0], extent: [8.0, 20.0], snow: true, falling: 1.0, wind: [1.0, 0.0], edge: 2.0 }, (32, 80));
+        maps.set_area(1, &AreaParams { min: [0.0, 0.0], extent: [8.0, 20.0], snow: true, falling: 1.0, wind: [1.0, 0.0], edge: 2.0, shore: false }, (32, 80));
         maps.write(&queue);
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "the weather pipelines failed to build: {err:?}");

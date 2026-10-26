@@ -37,12 +37,57 @@ pub fn outdoor_frusta(
     Some(out)
 }
 
+#[derive(Clone, Debug)]
+pub struct RoomView {
+
+    room: (Vec3, Vec3),
+
+    doorways: Vec<[Vec4; 6]>,
+}
+
+impl RoomView {
+
+    pub fn shows(&self, world_centre: Vec3, bound: Vec4, margin: f32) -> bool {
+        let r = bound.w + margin;
+        let nearest = world_centre.clamp(self.room.0, self.room.1);
+        nearest.distance_squared(world_centre) <= r * r
+            || self.doorways.iter().any(|p| crate::renderer::shadow::sphere_in_frustum(p, bound.truncate().extend(r)))
+    }
+
+    pub fn doorways(&self) -> usize {
+        self.doorways.len()
+    }
+}
+
+pub fn room_view(
+    eye: Vec3,
+    clip_from_world: Mat4,
+    clip_from_frame: Mat4,
+    rooms: &[CullRoom],
+    portals: &[ProbePortal],
+) -> Option<RoomView> {
+    let start = rooms
+        .iter()
+        .filter(|r| (r.min.cmplt(eye) & eye.cmplt(r.max)).all())
+        .min_by(|a, b| volume(a).total_cmp(&volume(b)))?;
+    if !start.closed {
+        return None;
+    }
+    let doorways = portals
+        .iter()
+        .filter(|p| p.low == start.id || p.high == start.id)
+        .filter_map(|p| doorway_window(p, clip_from_world))
+        .map(|w| crate::renderer::shadow::frustum_planes(window_matrix(w) * clip_from_frame))
+        .collect();
+    Some(RoomView { room: (start.min, start.max), doorways })
+}
+
 fn volume(r: &CullRoom) -> f32 {
     let d = r.max - r.min;
     d.x * d.y * d.z
 }
 
-#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+#[allow(clippy::too_many_arguments)]
 fn walk(
     room: u32,
     entered_by: Option<usize>,
@@ -187,6 +232,42 @@ mod tests {
         open[1].closed = false;
         let frusta = outdoor_frusta(eye, cam, cam, &open, &portals).unwrap();
         assert!(chunk_seen(&chunk(Vec3::new(12.0, 0.0, -3.5), Vec3::new(14.0, 1.0, -2.5)), &frusta));
+    }
+
+    #[test]
+    fn a_closed_rooms_walls_hide_the_models_behind_them() {
+        let (rooms, portals) = level();
+        let eye = Vec3::new(0.0, 1.6, -6.0);
+        let cam = camera(eye, Vec3::new(0.0, 1.6, 10.0));
+        let view = room_view(eye, cam, cam, &rooms, &portals).expect("in a closed room");
+        let shows = |c: Vec3, r: f32| view.shows(c, c.extend(r), 0.25);
+        assert!(shows(Vec3::new(1.0, 2.5, 0.0), 0.3), "a lamp in the hall");
+        assert!(shows(Vec3::new(-2.0, 1.0, -15.0), 0.3), "one behind the eye, in the hall: the frustum's to cull, not the room's");
+        assert!(shows(Vec3::new(0.0, 1.0, 4.15), 1.2), "the front door's leaf, in its doorway");
+        assert!(shows(Vec3::new(0.0, 1.0, 12.0), 0.5), "a lamp on the lawn, straight out of the door");
+        assert!(!shows(Vec3::new(8.0, 1.0, 12.0), 0.5), "one on the lawn behind the hall's front wall");
+        assert!(!shows(Vec3::new(-9.0, 2.0, 0.0), 0.5), "one behind the hall's far side wall");
+        // A lamp's bound is its reach (`Levers::light_rooms`): one behind that
+        // wall whose light reaches into the hall is kept.
+        assert!(shows(Vec3::new(-9.0, 2.0, 0.0), 6.0), "a lamp behind the wall reaching into the hall");
+
+        let in_hallway = Vec3::new(4.7, 0.9, -1.5);
+        let turned = camera(eye, Vec3::new(10.0, 1.6, -3.0));
+        let view = room_view(eye, turned, turned, &rooms, &portals).unwrap();
+        assert!(view.shows(in_hallway, in_hallway.extend(0.4), 0.25), "the hallway's lamp through the side door");
+        assert_eq!(view.doorways(), 1, "the front door is out of this view");
+
+        assert!(view.shows(Vec3::new(-3.5, 1.0, 0.0), Vec3::new(-3.5, 1.0, 0.0).extend(0.3), 0.25));
+
+        assert!(room_view(Vec3::new(0.0, 1.6, 10.0), cam, cam, &rooms, &portals).is_none());
+        assert!(room_view(Vec3::new(0.0, 1.6, 4.2), cam, cam, &rooms, &portals).is_none());
+
+        let shift = Mat4::from_translation(Vec3::new(50.0, 0.0, 0.0));
+        let view = room_view(eye, cam, cam * shift.inverse(), &rooms, &portals).unwrap();
+        let lawn = Vec3::new(0.0, 1.0, 12.0);
+        assert!(view.shows(lawn, shift.transform_point3(lawn).extend(0.5), 0.25));
+        let hidden = Vec3::new(8.0, 1.0, 12.0);
+        assert!(!view.shows(hidden, shift.transform_point3(hidden).extend(0.5), 0.25));
     }
 
     #[test]

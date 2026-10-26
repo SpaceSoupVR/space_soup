@@ -31,11 +31,11 @@ pub fn reflection_motion_weight(share: f32) -> f32 {
 
 pub const SLOT_STRIDE: u64 = 256;
 
-pub const MAX_SLOTS: u32 = 256;
+pub const MAX_SLOTS: u32 = 2048;
 
 pub fn motion_block() -> String {
     format!(
-        r"
+        r#"
 struct MotionCamera {{
     curr: mat4x4<f32>,
     prev: mat4x4<f32>,
@@ -60,7 +60,7 @@ fn layer_weight(share: f32, k: f32) -> f32 {{
     let behind = 1.0 - s;
     return layer * layer / max(layer * layer + behind * behind, 1e-12);
 }}
-",
+"#,
         min_w = format!("{:?}", MIN_PREV_W),
         max_d = format!("{:?}", MAX_NDC_MOTION),
     )
@@ -79,7 +79,7 @@ pub const SOFT_LAYER_CONTRAST: f32 = 1.0;
 
 pub fn shader() -> String {
     format!(
-        r"
+        r#"
 {motion}
 
 struct Joints {{
@@ -197,7 +197,7 @@ fn reflect_ratio(texel: vec2<f32>, d: f32) -> f32 {{
     }}
     return out;
 }}
-",
+"#,
         motion = motion_block(),
         joints = crate::renderer::mesh::MAX_SKIN_JOINTS,
         max_reflected = format!("{:?}", MAX_REFLECTED_DISTANCE),
@@ -221,6 +221,11 @@ pub const MAX_NDC_MOTION: f32 = 2.0;
 
 pub fn previous_clip(prev_view_proj: Mat4, prev_world_to_player: Mat4, world_to_player: Mat4) -> Mat4 {
     prev_view_proj * prev_world_to_player * world_to_player.inverse()
+}
+
+pub fn world_slot(curr: Mat4, prev: Option<(Mat4, Mat4)>, world_to_player: Mat4, eye: glam::Vec3) -> (Mat4, Mat4, glam::Vec3) {
+    let now = curr * world_to_player;
+    (now, prev.map_or(now, |(view_proj, w2p)| view_proj * w2p), world_to_player.inverse().transform_point3(eye))
 }
 
 pub fn motion_vector(curr: Mat4, prev: Mat4, p: glam::Vec3) -> glam::Vec3 {
@@ -268,8 +273,7 @@ pub enum MotionKind {
 
     Weather,
 
-    EffectsOver,
-    EffectsScreened,
+    Effects(crate::renderer::effects::FxVariant),
 }
 
 pub struct MotionPipelines {
@@ -286,8 +290,11 @@ pub struct MotionPipelines {
     skinned: wgpu::RenderPipeline,
     water: wgpu::RenderPipeline,
     weather: wgpu::RenderPipeline,
-    effects_over: wgpu::RenderPipeline,
-    effects_screened: wgpu::RenderPipeline,
+
+    effects: Vec<wgpu::RenderPipeline>,
+
+    /// Every pixel nothing nearer covers (`sky_motion`).
+    pub sky: crate::renderer::sky_motion::SkyMotion,
 
     stencil: bool,
 }
@@ -525,21 +532,14 @@ impl MotionPipelines {
         let effects_group = crate::renderer::effects::bind_group_layout(device);
         let effects_layouts = [Some(&camera_layout), Some(&probe_group), Some(&effects_group)];
         let instances = [Some(crate::renderer::effects::EffectInstance::motion_layout())];
-        let effects_source = crate::renderer::effects::motion_shader();
-        let effects_over = particle(
-            "space_warp_effects_over",
-            &effects_layouts,
-            effects_source.clone(),
-            ("vs_fx_motion", "fs_fx_motion_over"),
-            &instances,
-        );
-        let effects_screened = particle(
-            "space_warp_effects_screened",
-            &effects_layouts,
-            effects_source,
-            ("vs_fx_motion", "fs_fx_motion_screened"),
-            &instances,
-        );
+
+        let effects: Vec<wgpu::RenderPipeline> = crate::renderer::effects::FxVariant::ALL
+            .iter()
+            .map(|v| {
+                let (source, fragment) = v.motion_shader();
+                particle(&format!("space_warp_{}", v.label()), &effects_layouts, source, ("vs_fx_motion", fragment), &instances)
+            })
+            .collect();
         Self {
             camera_layout,
             joints_layout,
@@ -552,8 +552,8 @@ impl MotionPipelines {
             skinned,
             water,
             weather,
-            effects_over,
-            effects_screened,
+            effects,
+            sky: crate::renderer::sky_motion::SkyMotion::new(device, depth_format),
             stencil: depth_format.has_stencil_aspect(),
         }
     }
@@ -598,8 +598,7 @@ impl MotionPipelines {
             MotionKind::Skinned => &self.skinned,
             MotionKind::Water => &self.water,
             MotionKind::Weather => &self.weather,
-            MotionKind::EffectsOver => &self.effects_over,
-            MotionKind::EffectsScreened => &self.effects_screened,
+            MotionKind::Effects(variant) => &self.effects[variant as usize],
         }
     }
 }
@@ -624,7 +623,7 @@ pub struct MotionParticles<'a> {
     pub groups: [Option<&'a wgpu::BindGroup>; 2],
 }
 
-#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+#[allow(clippy::too_many_arguments)]
 pub fn record(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &MotionPipelines,
@@ -633,6 +632,7 @@ pub fn record(
     depth: &wgpu::TextureView,
     draws: &[MotionDraw],
     particles: &[MotionParticles],
+    sky: Option<crate::renderer::sky_motion::SkyDraw>,
     stencil_store: bool,
     depth_clear: f32,
 ) {
@@ -662,13 +662,13 @@ pub fn record(
         if matches!(d.kind, MotionKind::Skinned | MotionKind::BrushReflect | MotionKind::Water) && d.joints.is_none() {
             continue;
         }
-        if matches!(d.kind, MotionKind::Weather | MotionKind::EffectsOver | MotionKind::EffectsScreened) {
+        if matches!(d.kind, MotionKind::Weather | MotionKind::Effects(_)) {
             continue;
         }
-        let key = (d.kind, d.slot, std::ptr::from_ref(d.vertices), std::ptr::from_ref(d.indices), d.joints.map(std::ptr::from_ref));
+        let key = (d.kind, d.slot, d.vertices as *const _, d.indices as *const _, d.joints.map(|j| j as *const _));
         if bound != Some(key) {
             pass.set_pipeline(pipelines.pipeline(d.kind));
-            pass.set_bind_group(0, cameras, &[(u64::from(d.slot) * SLOT_STRIDE) as u32]);
+            pass.set_bind_group(0, cameras, &[(d.slot as u64 * SLOT_STRIDE) as u32]);
             if let Some(j) = d.joints {
                 pass.set_bind_group(1, j, &[]);
             }
@@ -678,17 +678,24 @@ pub fn record(
         }
         pass.draw_indexed(d.first..d.first + d.count, 0, 0..1);
     }
+    // The sky where nothing covers it, under the particles' blended motion.
+    // At the far plane, so only over a depth cleared to it.
+    if let Some(s) = sky.filter(|_| depth_clear >= 1.0) {
+        pass.set_pipeline(s.pipeline);
+        pass.set_bind_group(0, s.group, &s.offsets);
+        pass.draw(0..3, 0..1);
+    }
     for p in particles.iter().filter(|p| !p.range.is_empty() && p.vertices > 0 && p.slot < MAX_SLOTS) {
         let wants = match p.kind {
             MotionKind::Weather => p.groups[0].is_some(),
-            MotionKind::EffectsOver | MotionKind::EffectsScreened => p.groups.iter().all(Option::is_some) && p.instances.is_some(),
+            MotionKind::Effects(_) => p.groups.iter().all(Option::is_some) && p.instances.is_some(),
             _ => false,
         };
         if !wants {
             continue;
         }
         pass.set_pipeline(pipelines.pipeline(p.kind));
-        pass.set_bind_group(0, cameras, &[(u64::from(p.slot) * SLOT_STRIDE) as u32]);
+        pass.set_bind_group(0, cameras, &[(p.slot as u64 * SLOT_STRIDE) as u32]);
         for (k, g) in p.groups.iter().enumerate() {
             if let Some(g) = g {
                 pass.set_bind_group(1 + k as u32, *g, &[]);
@@ -757,184 +764,69 @@ pub fn layer_info(
     }
 }
 
-
-#[cfg(target_os = "android")]
-pub struct Readback {
-    device: ash::Device,
-    queue: ash::vk::Queue,
-    pool: ash::vk::CommandPool,
-    buffer: ash::vk::Buffer,
-    memory: ash::vk::DeviceMemory,
-    size: (u32, u32),
-}
-
-#[cfg(target_os = "android")]
-impl Readback {
-    pub fn new(
-        instance: &ash::Instance,
-        physical: ash::vk::PhysicalDevice,
-        device: &ash::Device,
-        queue: ash::vk::Queue,
-        family: u32,
-        size: (u32, u32),
-    ) -> Result<Self, ash::vk::Result> {
-        use ash::vk;
-        let bytes = (size.0 * size.1) as u64 * (4 + 8);
-        unsafe {
-            let buffer = device.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(bytes)
-                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )?;
-            let req = device.get_buffer_memory_requirements(buffer);
-            let props = instance.get_physical_device_memory_properties(physical);
-            let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let ty = (0..props.memory_type_count)
-                .find(|&i| req.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(want))
-                .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
-            let memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None)?;
-            device.bind_buffer_memory(buffer, memory, 0)?;
-            let pool = device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                    .queue_family_index(family),
-                None,
-            )?;
-            Ok(Self { device: device.clone(), queue, pool, buffer, memory, size })
-        }
-    }
-
-    pub fn read(
-        &self,
-        depth: ash::vk::Image,
-        depth_has_stencil: bool,
-        motion: ash::vk::Image,
-        layer: u32,
-        save: Option<&std::path::Path>,
-    ) -> Result<String, ash::vk::Result> {
-        use ash::vk;
-        let (w, h) = self.size;
-        let d = &self.device;
-        unsafe {
-            let cmd = d.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default().command_pool(self.pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
-            )?[0];
-            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
-            let depth_aspects = if depth_has_stencil { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
-            let range = |aspect| vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: layer, layer_count: 1 };
-            let barrier = |image, aspect, from, to, src, dst| {
-                vk::ImageMemoryBarrier::default()
-                    .src_access_mask(src)
-                    .dst_access_mask(dst)
-                    .old_layout(from)
-                    .new_layout(to)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(image)
-                    .subresource_range(range(aspect))
-            };
-            let to_copy = [
-                barrier(depth, depth_aspects, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE, vk::AccessFlags::TRANSFER_READ),
-                barrier(motion, vk::ImageAspectFlags::COLOR, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE, vk::AccessFlags::TRANSFER_READ),
-            ];
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_copy);
-            let layers = |aspect| vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: layer, layer_count: 1 };
-            let extent = vk::Extent3D { width: w, height: h, depth: 1 };
-            d.cmd_copy_image_to_buffer(cmd, depth, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, self.buffer,
-                &[vk::BufferImageCopy::default().buffer_offset(0).image_subresource(layers(vk::ImageAspectFlags::DEPTH)).image_extent(extent)]);
-            d.cmd_copy_image_to_buffer(cmd, motion, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, self.buffer,
-                &[vk::BufferImageCopy::default().buffer_offset((w * h * 4) as u64).image_subresource(layers(vk::ImageAspectFlags::COLOR)).image_extent(extent)]);
-            let back = [
-                barrier(depth, depth_aspects, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
-                barrier(motion, vk::ImageAspectFlags::COLOR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-            ];
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &back);
-            d.end_command_buffer(cmd)?;
-            let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
-            let cmds = [cmd];
-            let submitted = d.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence);
-            let waited = submitted.and_then(|()| d.wait_for_fences(&[fence], true, u64::MAX));
-            d.destroy_fence(fence, None);
-            d.free_command_buffers(self.pool, &cmds);
-            waited?;
-            let n = (w * h) as usize;
-            let ptr = d.map_memory(self.memory, 0, (n * 12) as u64, vk::MemoryMapFlags::empty())? as *const u8;
-            let bytes = std::slice::from_raw_parts(ptr, n * 12);
-            if let Some(path) = save {
-                let mut file = Vec::with_capacity(16 + n * 12);
-                for v in [w, h, layer, depth_has_stencil as u32] {
-                    file.extend_from_slice(&v.to_le_bytes());
-                }
-                file.extend_from_slice(bytes);
-                if let Err(e) = std::fs::write(path, &file) {
-                    log::warn!("SWDUMP: could not write {}: {e}", path.display());
-                }
-            }
-            let depth_word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-            let depth_value = |i: usize| {
-                if depth_has_stencil {
-                    (depth_word(i) & 0x00FF_FFFF) as f32 / 16_777_215.0
-                } else {
-                    f32::from_bits(depth_word(i))
-                }
-            };
-            let (mut dmin, mut dmax, mut dsum, mut dzero, mut done) = (f32::MAX, f32::MIN, 0.0f64, 0usize, 0usize);
-            for i in 0..n {
-                let v = depth_value(i);
-                dmin = dmin.min(v);
-                dmax = dmax.max(v);
-                dsum += v as f64;
-                dzero += (v == 0.0) as usize;
-                done += (v >= 1.0) as usize;
-            }
-            let half = |i: usize, c: usize| {
-                let at = n * 4 + i * 8 + c * 2;
-                half_to_f32(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
-            };
-            let (mut xmax, mut ymax, mut zmax, mut nan, mut moving) = (0.0f32, 0.0f32, 0.0f32, 0usize, 0usize);
-            for i in 0..n {
-                let (x, y, z) = (half(i, 0), half(i, 1), half(i, 2));
-                if !(x.is_finite() && y.is_finite() && z.is_finite()) {
-                    nan += 1;
-                    continue;
-                }
-                xmax = xmax.max(x.abs());
-                ymax = ymax.max(y.abs());
-                zmax = zmax.max(z.abs());
-                moving += (x.abs() + y.abs() > 1e-4) as usize;
-            }
-            let centre = depth_value((h / 2 * w + w / 2) as usize);
-            d.unmap_memory(self.memory);
-            Ok(format!(
-                "layer {layer}: depth min {dmin:.6} max {dmax:.6} mean {:.6} centre {centre:.6}, {dzero} at 0, {done} at 1 of {n}; \
-                 motion |x|<={xmax:.5} |y|<={ymax:.5} |z|<={zmax:.5}, {moving} moving, {nan} not finite",
-                dsum / n as f64
-            ))
-        }
-    }
-}
-
-#[cfg(target_os = "android")]
-fn half_to_f32(h: u16) -> f32 {
-    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((h >> 10) & 0x1F) as i32;
-    let frac = (h & 0x3FF) as f32;
-    match exp {
-        0 => sign * frac * 2f32.powi(-24),
-        31 => if frac == 0.0 { sign * f32::INFINITY } else { f32::NAN },
-        _ => sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_world_vertex_through_the_worlds_slot_moves_as_its_posed_copy_did() {
+        let proj = Mat4::perspective_rh(1.6, 0.93, NEAR_Z, FAR_Z);
+        let frame = |offset: Vec3, yaw: f32, head: Vec3, look: f32| {
+            let world_to_player = Mat4::from_quat(glam::Quat::from_rotation_y(yaw).inverse()) * Mat4::from_translation(-offset);
+            let view = (Mat4::from_translation(head) * Mat4::from_rotation_y(look)).inverse();
+            (proj * view, world_to_player)
+        };
+        let (prev_vp, prev_w2p) = frame(Vec3::new(3.0, 0.2, -7.0), 0.40, Vec3::new(0.02, 1.6, 0.01), 0.10);
+        let (curr_vp, w2p) = frame(Vec3::new(3.04, 0.21, -7.03), 0.43, Vec3::new(0.03, 1.61, 0.0), 0.13);
+        let mut worst = 0.0f32;
+        for k in 0..400 {
+            let a = k as f32 * 0.7;
+            let w = Vec3::new(3.0 + a.sin() * (1.0 + k as f32 * 0.2), (k % 9) as f32 * 0.5 - 1.0, -7.0 - 2.0 - a.cos().abs() * (1.0 + k as f32 * 0.3));
+
+            let posed = motion_vector(curr_vp, previous_clip(prev_vp, prev_w2p, w2p), w2p.transform_point3(w));
+
+            let world = motion_vector(curr_vp * w2p, prev_vp * prev_w2p, w);
+            worst = worst.max((posed - world).abs().max_element());
+        }
+
+        assert!(worst < 4e-5, "the two differ by {worst} of NDC");
+    }
+
+    #[test]
+    fn a_world_brush_through_its_slot_moves_as_its_posed_copy_did_reflections_too() {
+        let proj = Mat4::perspective_rh(1.6, 0.93, NEAR_Z, FAR_Z);
+        let frame = |offset: Vec3, yaw: f32, head: Vec3, look: f32| {
+            let world_to_player = Mat4::from_quat(glam::Quat::from_rotation_y(yaw).inverse()) * Mat4::from_translation(-offset);
+            let view = (Mat4::from_translation(head) * Mat4::from_rotation_y(look)).inverse();
+            (proj * view, world_to_player, head)
+        };
+        let (prev_vp, prev_w2p, _) = frame(Vec3::new(113.0, 0.2, -47.0), 0.40, Vec3::new(0.02, 1.6, 0.01), 0.10);
+        let (curr_vp, w2p, eye) = frame(Vec3::new(113.04, 0.21, -47.03), 0.43, Vec3::new(0.03, 1.61, 0.0), 0.13);
+        let (curr, prev, world_eye) = world_slot(curr_vp, Some((prev_vp, prev_w2p)), w2p, eye);
+        assert!((w2p.transform_point3(world_eye) - eye).length() < 1e-4, "the eye in the world, taken back");
+        let (mut worst, mut seen) = (0.0f32, 0);
+        for k in 0..600 {
+            let a = k as f32 * 0.7;
+
+            let w = Vec3::new(113.0 + a.sin() * (1.0 + k as f32 * 0.05), (k % 9) as f32 * 0.4 - 0.5, -47.0 - 2.0 - a.cos().abs() * (1.0 + k as f32 * 0.05));
+
+            let clip = curr * w.extend(1.0);
+            if clip.w < 0.5 || clip.x.abs() > clip.w || clip.y.abs() > clip.w {
+                continue;
+            }
+            seen += 1;
+            let (weight, reach) = ([0.0, 0.3, 1.0][k % 3], [0.0, 2.5, 40.0][(k / 3) % 3]);
+            let posed = motion_vector(curr_vp, previous_clip(prev_vp, prev_w2p, w2p), reflected_point(eye, w2p.transform_point3(w), weight, reach));
+            let world = motion_vector(curr, prev, reflected_point(world_eye, w, weight, reach));
+            worst = worst.max((posed - world).abs().max_element());
+        }
+        assert!(seen > 150, "{seen} points on screen");
+
+        assert!(worst < 1e-4, "the two differ by {worst} of NDC");
+
+        let (curr, prev, _) = world_slot(curr_vp, None, w2p, eye);
+        assert_eq!(motion_vector(curr, prev, Vec3::new(113.0, 1.0, -50.0)), Vec3::ZERO);
+    }
     use glam::{Quat, Vec3};
 
     fn view_proj(eye: Vec3, yaw: f32) -> Mat4 {
@@ -950,7 +842,7 @@ mod tests {
         };
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let _p = MotionPipelines::new(&device, wgpu::TextureFormat::Depth32Float);
-        assert!(SLOT_STRIDE >= u64::from(device.limits().min_uniform_buffer_offset_alignment));
+        assert!(SLOT_STRIDE >= device.limits().min_uniform_buffer_offset_alignment as u64);
         let err = pollster::block_on(scope.pop());
         assert!(err.is_none(), "{err:?}");
     }
@@ -1281,7 +1173,7 @@ mod tests {
             );
             let readback = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("readback"),
-                size: u64::from(W * W * 8),
+                size: (W * W * 8) as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -1295,7 +1187,7 @@ mod tests {
                 slot,
                 joints: Some(&reflect),
             };
-            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], &[], false, 1.0);
+            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], &[], None, false, 1.0);
             encoder.copy_texture_to_buffer(
                 motion.as_image_copy(),
                 wgpu::TexelCopyBufferInfo {
@@ -1418,7 +1310,7 @@ mod tests {
             let readback = |label, bytes: u32| {
                 device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(label),
-                    size: u64::from(W * W * bytes),
+                    size: (W * W * bytes) as u64,
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 })
@@ -1435,7 +1327,7 @@ mod tests {
                 joints: Some(&groups[waves.current()]),
             };
             let depth_view = depth.create_view(&Default::default());
-            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], &[], false, 1.0);
+            record(&mut encoder, &pipelines, &cameras, &motion.create_view(&Default::default()), &depth_view, &[draw], &[], None, false, 1.0);
             for (texture, back, bytes, aspect) in
                 [(&motion, &motion_back, 8, wgpu::TextureAspect::All), (&depth, &depth_back, 4, wgpu::TextureAspect::DepthOnly)]
             {
@@ -1482,8 +1374,8 @@ mod tests {
 
     fn f16_to_f32(h: u16) -> f32 {
         let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-        let exp = i32::from((h >> 10) & 0x1f);
-        let frac = f32::from(h & 0x3ff);
+        let exp = ((h >> 10) & 0x1f) as i32;
+        let frac = (h & 0x3ff) as f32;
         match exp {
             0 => sign * frac * 2f32.powi(-24),
             31 => sign * f32::INFINITY,
@@ -1500,5 +1392,179 @@ mod tests {
         let grazing = view_proj(Vec3::new(0.0, 1.6, 0.0), 1.5);
         let mv = motion_vector(vp, grazing, Vec3::new(0.3, 1.6, -4.0));
         assert!(mv.is_finite() && mv.abs().max_element() <= MAX_NDC_MOTION, "{mv}");
+    }
+}
+
+#[cfg(target_os = "android")]
+pub struct Readback {
+    device: ash::Device,
+    queue: ash::vk::Queue,
+    pool: ash::vk::CommandPool,
+    buffer: ash::vk::Buffer,
+    memory: ash::vk::DeviceMemory,
+    size: (u32, u32),
+}
+
+#[cfg(target_os = "android")]
+impl Readback {
+    pub fn new(
+        instance: &ash::Instance,
+        physical: ash::vk::PhysicalDevice,
+        device: &ash::Device,
+        queue: ash::vk::Queue,
+        family: u32,
+        size: (u32, u32),
+    ) -> Result<Self, ash::vk::Result> {
+        use ash::vk;
+        let bytes = (size.0 * size.1) as u64 * (4 + 8);
+        unsafe {
+            let buffer = device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(bytes)
+                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )?;
+            let req = device.get_buffer_memory_requirements(buffer);
+            let props = instance.get_physical_device_memory_properties(physical);
+            let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let ty = (0..props.memory_type_count)
+                .find(|&i| req.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(want))
+                .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+            let memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None)?;
+            device.bind_buffer_memory(buffer, memory, 0)?;
+            let pool = device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                    .queue_family_index(family),
+                None,
+            )?;
+            Ok(Self { device: device.clone(), queue, pool, buffer, memory, size })
+        }
+    }
+
+    pub fn read(
+        &self,
+        depth: ash::vk::Image,
+        depth_has_stencil: bool,
+        motion: ash::vk::Image,
+        layer: u32,
+        save: Option<&std::path::Path>,
+    ) -> Result<String, ash::vk::Result> {
+        use ash::vk;
+        let (w, h) = self.size;
+        let d = &self.device;
+        unsafe {
+            let cmd = d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default().command_pool(self.pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+            )?[0];
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            let depth_aspects = if depth_has_stencil { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
+            let range = |aspect| vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: layer, layer_count: 1 };
+            let barrier = |image, aspect, from, to, src, dst| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(src)
+                    .dst_access_mask(dst)
+                    .old_layout(from)
+                    .new_layout(to)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range(aspect))
+            };
+            let to_copy = [
+                barrier(depth, depth_aspects, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE, vk::AccessFlags::TRANSFER_READ),
+                barrier(motion, vk::ImageAspectFlags::COLOR, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE, vk::AccessFlags::TRANSFER_READ),
+            ];
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_copy);
+            let layers = |aspect| vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: layer, layer_count: 1 };
+            let extent = vk::Extent3D { width: w, height: h, depth: 1 };
+            d.cmd_copy_image_to_buffer(cmd, depth, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, self.buffer,
+                &[vk::BufferImageCopy::default().buffer_offset(0).image_subresource(layers(vk::ImageAspectFlags::DEPTH)).image_extent(extent)]);
+            d.cmd_copy_image_to_buffer(cmd, motion, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, self.buffer,
+                &[vk::BufferImageCopy::default().buffer_offset((w * h * 4) as u64).image_subresource(layers(vk::ImageAspectFlags::COLOR)).image_extent(extent)]);
+            let back = [
+                barrier(depth, depth_aspects, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+                barrier(motion, vk::ImageAspectFlags::COLOR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+            ];
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &back);
+            d.end_command_buffer(cmd)?;
+            let fence = d.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let cmds = [cmd];
+            let submitted = d.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence);
+            let waited = submitted.and_then(|()| d.wait_for_fences(&[fence], true, u64::MAX));
+            d.destroy_fence(fence, None);
+            d.free_command_buffers(self.pool, &cmds);
+            waited?;
+            let n = (w * h) as usize;
+            let ptr = d.map_memory(self.memory, 0, (n * 12) as u64, vk::MemoryMapFlags::empty())? as *const u8;
+            let bytes = std::slice::from_raw_parts(ptr, n * 12);
+            if let Some(path) = save {
+                let mut file = Vec::with_capacity(16 + n * 12);
+                for v in [w, h, layer, depth_has_stencil as u32] {
+                    file.extend_from_slice(&v.to_le_bytes());
+                }
+                file.extend_from_slice(bytes);
+                if let Err(e) = std::fs::write(path, &file) {
+                    log::warn!("SWDUMP: could not write {}: {e}", path.display());
+                }
+            }
+            let depth_word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+            let depth_value = |i: usize| {
+                if depth_has_stencil {
+                    (depth_word(i) & 0x00FF_FFFF) as f32 / 16_777_215.0
+                } else {
+                    f32::from_bits(depth_word(i))
+                }
+            };
+            let (mut dmin, mut dmax, mut dsum, mut dzero, mut done) = (f32::MAX, f32::MIN, 0.0f64, 0usize, 0usize);
+            for i in 0..n {
+                let v = depth_value(i);
+                dmin = dmin.min(v);
+                dmax = dmax.max(v);
+                dsum += v as f64;
+                dzero += (v == 0.0) as usize;
+                done += (v >= 1.0) as usize;
+            }
+            let half = |i: usize, c: usize| {
+                let at = n * 4 + i * 8 + c * 2;
+                half_to_f32(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
+            };
+            let (mut xmax, mut ymax, mut zmax, mut nan, mut moving) = (0.0f32, 0.0f32, 0.0f32, 0usize, 0usize);
+            for i in 0..n {
+                let (x, y, z) = (half(i, 0), half(i, 1), half(i, 2));
+                if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+                    nan += 1;
+                    continue;
+                }
+                xmax = xmax.max(x.abs());
+                ymax = ymax.max(y.abs());
+                zmax = zmax.max(z.abs());
+                moving += (x.abs() + y.abs() > 1e-4) as usize;
+            }
+            let centre = depth_value((h / 2 * w + w / 2) as usize);
+            d.unmap_memory(self.memory);
+            Ok(format!(
+                "layer {layer}: depth min {dmin:.6} max {dmax:.6} mean {:.6} centre {centre:.6}, {dzero} at 0, {done} at 1 of {n}; \
+                 motion |x|<={xmax:.5} |y|<={ymax:.5} |z|<={zmax:.5}, {moving} moving, {nan} not finite",
+                dsum / n as f64
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((h >> 10) & 0x1F) as i32;
+    let frac = (h & 0x3FF) as f32;
+    match exp {
+        0 => sign * frac * 2f32.powi(-24),
+        31 => if frac == 0.0 { sign * f32::INFINITY } else { f32::NAN },
+        _ => sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
     }
 }

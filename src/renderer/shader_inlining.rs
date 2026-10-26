@@ -91,7 +91,7 @@ pub(crate) fn report(label: &str, src: &str, entry: &str, rows: usize) -> String
         let from: Vec<String> = r.callers.iter().map(|(c, n)| format!("{c} x{n}")).collect();
         out += &format!("  {:>8}  {:>6}  {:>4}  {}  <- {}\n", r.repeated(), r.copies, r.own, r.name, from.join(", "));
     }
-    all.sort_by_key(|r| std::cmp::Reverse(r.own * r.copies));
+    all.sort_by(|a, b| (b.own * b.copies).cmp(&(a.own * a.copies)));
     out += "  largest  copies   own  function\n";
     for r in all.iter().take(rows) {
         out += &format!("  {:>7}  {:>6}  {:>4}  {}\n", r.own * r.copies, r.copies, r.own, r.name);
@@ -112,7 +112,7 @@ struct Live<'a> {
 impl Live<'_> {
 
     fn walk(&mut self, block: &Block) -> bool {
-        for statement in block {
+        for statement in block.iter() {
             let ends = match statement {
                 Statement::Emit(range) => {
                     for h in range.clone() {
@@ -131,9 +131,9 @@ impl Live<'_> {
                     }
                 },
                 Statement::Switch { cases, .. } => {
-                    for case in cases {
-                        self.walk(&case.body);
-                    }
+                    cases.iter().for_each(|c| {
+                        self.walk(&c.body);
+                    });
                     false
                 }
                 Statement::Loop { body, continuing, .. } => {
@@ -212,7 +212,7 @@ impl Live<'_> {
     }
 }
 
-fn const_bool(module: &Module, arena: &Arena<Expression>, h: Handle<Expression>) -> Option<bool> {
+pub(super) fn const_bool(module: &Module, arena: &Arena<Expression>, h: Handle<Expression>) -> Option<bool> {
     match arena[h] {
         Expression::Literal(Literal::Bool(b)) => Some(b),
         Expression::Constant(c) => const_bool(module, &module.global_expressions, module.constants[c].init),

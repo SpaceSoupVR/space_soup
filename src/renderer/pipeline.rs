@@ -68,6 +68,8 @@ pub fn lightmap_bind_group_layout(device: &Device) -> BindGroupLayout {
 
 pub struct SolidPipeline {
     pub pipeline: RenderPipeline,
+
+    pub opaque: Option<RenderPipeline>,
     pub lightmap_layout: BindGroupLayout,
 }
 pub struct WirePipeline {
@@ -88,9 +90,10 @@ impl SolidPipeline {
         uniform_layout: &BindGroupLayout,
         samples: u32,
     ) -> Self {
-        Self::new_with_front_face(
+
+        Self::build(
             device, format, uniform_layout, FrontFace::Ccw, samples,
-            crate::renderer::multiview::ViewMode::Mono,
+            crate::renderer::multiview::ViewMode::Mono, solid_shader(), true,
         )
     }
 
@@ -185,8 +188,14 @@ impl SolidPipeline {
         });
         Self {
             pipeline,
+            opaque: None,
             lightmap_layout,
         }
+    }
+
+    pub fn new_mirror_world(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout) -> Option<Self> {
+        let source = crate::renderer::terrain_pipeline::world_vertices(&solid_shader())?;
+        Some(Self::build(device, format, uniform_layout, FrontFace::Cw, 1, crate::renderer::multiview::ViewMode::Mono, source, false))
     }
 
     fn new_with_front_face(
@@ -197,9 +206,22 @@ impl SolidPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
+        Self::build(device, format, uniform_layout, front_face, samples, view, solid_shader(), false)
+    }
+
+    fn build(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        front_face: FrontFace,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        source: String,
+        opaque_twin: bool,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("solid_shader"),
-            source: ShaderSource::Wgsl(view.shader(solid_shader()).into()),
+            source: ShaderSource::Wgsl(view.shader(source).into()),
         });
         let lightmap_layout = lightmap_bind_group_layout(device);
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -207,8 +229,8 @@ impl SolidPipeline {
             bind_group_layouts: &[Some(uniform_layout), Some(&lightmap_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("solid_pipeline"),
+        let build = |label: &str, targets: &[Option<ColorTargetState>]| device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -220,11 +242,7 @@ impl SolidPipeline {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState {
-                    format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets,
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
@@ -244,8 +262,14 @@ impl SolidPipeline {
             multiview_mask: view.mask(),
             cache: None,
         });
+        let pipeline = build(
+            "solid_pipeline",
+            &[Some(ColorTargetState { format, blend: Some(BlendState::ALPHA_BLENDING), write_mask: ColorWrites::ALL })],
+        );
+        let opaque = opaque_twin.then(|| build("solid_pipeline_opaque", &crate::renderer::mesh_pipeline::opaque_target(format)));
         Self {
             pipeline,
+            opaque,
             lightmap_layout,
         }
     }
@@ -307,6 +331,7 @@ impl SolidPipeline {
         });
         Self {
             pipeline,
+            opaque: None,
             lightmap_layout,
         }
     }
@@ -395,7 +420,7 @@ impl WirePipeline {
 
 fn solid_shader() -> String {
     format!(
-        r"
+        r#"
 @group(1) @binding(0) var lm_tex: texture_2d<f32>;
 @group(1) @binding(1) var lm_samp: sampler;
 
@@ -428,14 +453,14 @@ struct VOut {{
     let lightmap = textureSample(lm_tex, lm_samp, in.uv2).rgb;
     return vec4<f32>(in.col.rgb * lit * lightmap, in.col.a);
 }}
-",
+"#,
         lights_block = wgsl_lights_block(0, 1)
     )
 }
 
 fn solid_ssr_shader() -> String {
     format!(
-        r"
+        r#"
 @group(1) @binding(0) var lm_tex: texture_2d<f32>;
 @group(1) @binding(1) var lm_samp: sampler;
 
@@ -481,13 +506,13 @@ struct VOut {{
     let reflected = ssr_reflect(in.world_pos, n, base, in.reflectivity, 0.0);
     return vec4<f32>(reflected, in.col.a);
 }}
-",
+"#,
         lights_block = wgsl_lights_block(0, 1),
         ssr_block = wgsl_ssr_block(2, 3)
     )
 }
 
-const WIRE_SHADER: &str = r"
+const WIRE_SHADER: &str = r#"
 struct Uniforms { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -502,7 +527,7 @@ struct VOut { @builtin(position) clip: vec4<f32>, @location(0) col: vec4<f32> }
     return VOut(p, v.col);
 }
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> { return in.col; }
-";
+"#;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -561,8 +586,7 @@ pub(crate) mod tests {
             crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights_uniform);
 
         let err_scope_1 = device.push_error_scope(ErrorFilter::Validation);
-        {
-            let samples = 4u32;
+        for samples in [4u32] {
             let _solid = SolidPipeline::new_multisampled(&device, format, &u.layout, samples);
             let _wire = WirePipeline::new_multisampled(&device, format, &u.layout, samples);
             let _mesh = crate::renderer::mesh_pipeline::MeshPipeline::new_multisampled(
@@ -602,20 +626,6 @@ pub(crate) mod tests {
             panic!("a multisampled pipeline failed validation: {err}");
         }
     }
-}
-
-
-#[cfg(test)]
-pub fn solid_shader_src() -> String {
-    solid_shader()
-}
-#[cfg(test)]
-pub fn solid_ssr_shader_src() -> String {
-    solid_ssr_shader()
-}
-#[cfg(test)]
-pub fn wire_shader_src() -> String {
-    WIRE_SHADER.to_string()
 }
 
 #[cfg(test)]
@@ -709,7 +719,7 @@ mod msaa_tests {
 
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("msaa_readback"),
-            size: u64::from(256 * SIZE),
+            size: (256 * SIZE) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -789,7 +799,7 @@ mod msaa_tests {
     }
 
     fn mass(img: &[[u8; 4]]) -> u64 {
-        img.iter().map(|p| u64::from(p[0])).sum()
+        img.iter().map(|p| p[0] as u64).sum()
     }
 
     fn centroid(img: &[[u8; 4]]) -> (f64, f64) {
@@ -797,7 +807,7 @@ mod msaa_tests {
         let mut sy = 0.0;
         let mut w = 0.0;
         for (i, p) in img.iter().enumerate() {
-            let v = f64::from(p[0]);
+            let v = p[0] as f64;
             sx += (i % SIZE as usize) as f64 * v;
             sy += (i / SIZE as usize) as f64 * v;
             w += v;
@@ -848,4 +858,17 @@ mod msaa_tests {
             "the multisampled image is not the same triangle: mass {a} vs {b}",
         );
     }
+}
+
+#[cfg(test)]
+pub fn solid_shader_src() -> String {
+    solid_shader()
+}
+#[cfg(test)]
+pub fn solid_ssr_shader_src() -> String {
+    solid_ssr_shader()
+}
+#[cfg(test)]
+pub fn wire_shader_src() -> String {
+    WIRE_SHADER.to_string()
 }

@@ -44,6 +44,33 @@ impl BrushVertex {
 
 pub const MAX_BRUSH_MATERIALS: usize = 24;
 
+pub static WORLD_BRUSHES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const POSED_BRUSH_VERTEX: &str = "@vertex fn vs_main(v: VIn) -> VOut {\n    var out: VOut;\n";
+const WORLD_BRUSH_VERTEX: &str = "@vertex fn vs_main(w: VIn) -> VOut {\n    var out: VOut;\n    var v = w;\n    v.pos = to_player_space(w.pos);\n    v.norm = to_player_direction(w.norm);\n    v.tangent = vec4<f32>(to_player_direction(w.tangent.xyz), w.tangent.w);\n    v.face_centre = to_player_space(w.face_centre);\n";
+
+const POSED_SEAL_VERTEX: &str = "return cam_view_proj() * vec4<f32>(pos, 1.0);";
+const WORLD_SEAL_VERTEX: &str = "return cam_view_proj() * vec4<f32>(to_player_space(pos), 1.0);";
+
+pub fn world_brush_vertices(src: &str) -> Option<String> {
+    (src.matches(POSED_BRUSH_VERTEX).count() == 1 && src.contains("@location(7) face_centre: vec3<f32>"))
+        .then(|| src.replacen(POSED_BRUSH_VERTEX, WORLD_BRUSH_VERTEX, 1))
+}
+
+fn in_the_brushes_frame(src: String) -> String {
+    if !WORLD_BRUSHES.load(std::sync::atomic::Ordering::Relaxed) {
+        return src;
+    }
+    match world_brush_vertices(&src) {
+        Some(world) => world,
+        None => {
+
+            log::error!("WORLD BRUSHES: a brush shader does not open as expected; it reads its vertices as posed");
+            src
+        }
+    }
+}
+
 pub struct BrushPipeline {
     pub pipeline: RenderPipeline,
     pub material_layout: BindGroupLayout,
@@ -94,9 +121,9 @@ fn roughness_chain_with_normal_variance(
         .map(|i| {
             let px = &normal.rgba[i * 4..i * 4 + 3];
             [
-                f32::from(px[0]) / 255.0 * 2.0 - 1.0,
-                f32::from(px[1]) / 255.0 * 2.0 - 1.0,
-                f32::from(px[2]) / 255.0 * 2.0 - 1.0,
+                px[0] as f32 / 255.0 * 2.0 - 1.0,
+                px[1] as f32 / 255.0 * 2.0 - 1.0,
+                px[2] as f32 / 255.0 * 2.0 - 1.0,
             ]
         })
         .collect();
@@ -134,7 +161,7 @@ fn roughness_chain_with_normal_variance(
             let sigma2 = if len > 1e-4 { (1.0 - len) / len } else { 1.0 };
             let kernel = (2.0 * sigma2).min(NORMAL_VARIANCE_CLAMP);
 
-            let base = f32::from(lvl.rgba[i * 4]) / 255.0;
+            let base = lvl.rgba[i * 4] as f32 / 255.0;
             let filtered = (base * base + kernel).clamp(0.0, 1.0).sqrt();
             let byte = (filtered * 255.0).round().clamp(0.0, 255.0) as u8;
             lvl.rgba[i * 4] = byte;
@@ -147,7 +174,7 @@ fn roughness_chain_with_normal_variance(
 
 pub(crate) fn mip_chain(img: &TerrainImage, srgb: bool) -> Vec<TerrainImage> {
     let to_linear = |b: u8| {
-        let c = f32::from(b) / 255.0;
+        let c = b as f32 / 255.0;
         if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
     };
     let to_srgb = |v: f32| {
@@ -173,7 +200,7 @@ pub(crate) fn mip_chain(img: &TerrainImage, srgb: bool) -> Vec<TerrainImage> {
                         let sx = (x * 2 + dx).min(prev.width - 1);
                         let sy = (y * 2 + dy).min(prev.height - 1);
                         let b = prev.rgba[((sy * prev.width + sx) * 4 + c as u32) as usize];
-                        sum += if linear { to_linear(b) } else { f32::from(b) / 255.0 };
+                        sum += if linear { to_linear(b) } else { b as f32 / 255.0 };
                     }
                     let avg = sum / 4.0;
                     rgba[((y * w + x) * 4 + c as u32) as usize] =
@@ -240,7 +267,7 @@ pub fn roughness_is_reflective(rough: Option<&crate::renderer::terrain_pipeline:
         return false;
     }
 
-    let sum: u64 = img.rgba.chunks_exact(4).map(|p| u64::from(p[0])).sum();
+    let sum: u64 = img.rgba.chunks_exact(4).map(|p| p[0] as u64).sum();
     let n = (img.rgba.len() / 4).max(1) as f64;
     let mean = (sum as f64 / n) / 255.0;
     (mean as f32) < SSR_ROUGHNESS_THRESHOLD
@@ -329,6 +356,75 @@ pub fn material_uv_scales(colours: &[Option<TerrainImage>]) -> [[f32; 4]; MAX_BR
     out
 }
 
+/// One of the four maps a brush material binds, in the bind group's order.
+/// Its name is the source file's stem in a material's folder
+/// (`materials/<id>/color.jpg`) and the encoded file's (`bin/brush_astc`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrushMap {
+    Colour,
+    Normal,
+    Rough,
+    Ao,
+}
+
+impl BrushMap {
+    pub const ALL: [Self; 4] = [Self::Colour, Self::Normal, Self::Rough, Self::Ao];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Colour => "color",
+            Self::Normal => "normal",
+            Self::Rough => "rough",
+            Self::Ao => "ao",
+        }
+    }
+
+    /// Colour is stored in sRGB; everything else is data.
+    pub fn srgb(self) -> bool {
+        self == Self::Colour
+    }
+
+    /// What a material with no map of this kind holds: white, a flat normal,
+    /// the default roughness, no occlusion.
+    pub fn fallback(self) -> [u8; 3] {
+        match self {
+            Self::Colour | Self::Ao => [255, 255, 255],
+            Self::Normal => [128, 128, 255],
+            Self::Rough => [DEFAULT_ROUGHNESS; 3],
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Colour => "brush_colour_array",
+            Self::Normal => "brush_normal_array",
+            Self::Rough => "brush_rough_array",
+            Self::Ao => "brush_ao_array",
+        }
+    }
+}
+
+/// The size every layer of a scene's material arrays has: its first colour
+/// map's. The others are resampled to it.
+pub fn brush_array_size(colours: &[Option<TerrainImage>]) -> (u32, u32) {
+    colours.iter().flatten().map(|i| (i.width, i.height)).next().unwrap_or((1, 1))
+}
+
+/// Every mip of one material's map as its array layer holds it at `w`x`h`:
+/// the map fitted to that size (resampled, or the map's fallback where the
+/// material has none), then filtered -- sRGB-correct for colour, roughness
+/// widened by its normal map's variance. The one filtering both the RGBA
+/// upload and the ASTC encoder (`bin/brush_astc`) use, so an encoded
+/// material is that upload, compressed. `normal` is read for roughness only.
+pub fn brush_layer_mips(map: BrushMap, image: Option<&TerrainImage>, normal: Option<&TerrainImage>, w: u32, h: u32) -> Vec<TerrainImage> {
+    let fit = |img: &TerrainImage| if img.width == w && img.height == h { img.clone() } else { resample(img, w, h) };
+    let filled = image.map(fit).unwrap_or_else(|| solid_image(map.fallback(), w, h));
+    match map {
+        BrushMap::Rough => roughness_chain_with_normal_variance(&filled, normal.map(fit).as_ref()),
+        _ => mip_chain(&filled, map.srgb()),
+    }
+}
+
 impl BrushMaterials {
 
     pub fn new(
@@ -340,47 +436,26 @@ impl BrushMaterials {
         roughs: &[Option<TerrainImage>],
         aos: &[Option<TerrainImage>],
     ) -> Self {
+        let (w, h) = brush_array_size(colours);
+        let textures = BrushMap::ALL.map(|map| {
+            let images = match map {
+                BrushMap::Colour => colours,
+                BrushMap::Normal => normals,
+                BrushMap::Rough => roughs,
+                BrushMap::Ao => aos,
+            };
+            Self::array_texture(device, queue, map, images, normals, w, h)
+        });
+        Self::with_arrays(device, layout, &textures, colours, roughs)
+    }
 
-        let (w, h) = colours
-            .iter()
-            .flatten()
-            .map(|i| (i.width, i.height))
-            .next()
-            .unwrap_or((1, 1));
-
-        let colour_tex = Self::array_texture(
-            device,
-            queue,
-            "brush_colour_array",
-            TextureFormat::Rgba8UnormSrgb,
-            colours,
-            [255, 255, 255],
-            w,
-            h,
-            None,
-        );
-
-        let normal_tex = Self::array_texture(
-            device,
-            queue,
-            "brush_normal_array",
-            TextureFormat::Rgba8Unorm,
-            normals,
-            [128, 128, 255],
-            w,
-            h,
-            None,
-        );
-
-        let rough_tex = Self::array_texture(
-            device, queue, "brush_rough_array", TextureFormat::Rgba8Unorm,
-            roughs, [DEFAULT_ROUGHNESS, DEFAULT_ROUGHNESS, DEFAULT_ROUGHNESS], w, h,
-            Some(normals),
-        );
-        let ao_tex = Self::array_texture(
-            device, queue, "brush_ao_array", TextureFormat::Rgba8Unorm,
-            aos, [255, 255, 255], w, h, None,
-        );
+    /// The bind group over finished arrays (colour, normal, roughness,
+    /// occlusion), from images ([`Self::new`]) or encoded blocks
+    /// (`brush_astc::BrushMaterials::from_astc`). `colours` and `roughs` are
+    /// the images either way: each material's tiling aspect and whether any
+    /// is polished enough to reflect are read from them.
+    pub(crate) fn with_arrays(device: &Device, layout: &BindGroupLayout, textures: &[Texture; 4], colours: &[Option<TerrainImage>], roughs: &[Option<TerrainImage>]) -> Self {
+        let [colour_tex, normal_tex, rough_tex, ao_tex] = textures;
 
         let sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("brush_sampler"),
@@ -476,58 +551,25 @@ impl BrushMaterials {
         Self::new(device, queue, layout, &[], &[], &[], &[])
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
-    fn array_texture(
+    /// One map's array, every layer's mips made by [`brush_layer_mips`].
+    /// `normals` widen the roughness map's mips.
+    pub(crate) fn array_texture(
         device: &Device,
         queue: &Queue,
-        label: &str,
-        format: TextureFormat,
+        map: BrushMap,
         images: &[Option<TerrainImage>],
-        fallback: [u8; 3],
+        normals: &[Option<TerrainImage>],
         w: u32,
         h: u32,
-
-        normals_for_variance: Option<&[Option<TerrainImage>]>,
     ) -> Texture {
-        let filled: Vec<TerrainImage> = (0..MAX_BRUSH_MATERIALS)
-            .map(|i| match images.get(i).and_then(|x| x.as_ref()) {
-                Some(img) if img.width == w && img.height == h => TerrainImage {
-                    width: img.width,
-                    height: img.height,
-                    rgba: img.rgba.clone(),
-                },
-                Some(img) => resample(img, w, h),
-                None => solid_image(fallback, w, h),
-            })
+        let chains: Vec<Vec<TerrainImage>> = (0..MAX_BRUSH_MATERIALS)
+            .map(|i| brush_layer_mips(map, images.get(i).and_then(|x| x.as_ref()), normals.get(i).and_then(|x| x.as_ref()), w, h))
             .collect();
-
-        let chains: Vec<Vec<TerrainImage>> = match normals_for_variance {
-            None => filled.iter().map(|img| mip_chain(img, format.is_srgb())).collect(),
-            Some(normals) => {
-
-                let normals_filled: Vec<Option<TerrainImage>> = (0..MAX_BRUSH_MATERIALS)
-                    .map(|i| match normals.get(i).and_then(|x| x.as_ref()) {
-                        Some(img) if img.width == w && img.height == h => Some(TerrainImage {
-                            width: img.width,
-                            height: img.height,
-                            rgba: img.rgba.clone(),
-                        }),
-                        Some(img) => Some(resample(img, w, h)),
-
-                        None => None,
-                    })
-                    .collect();
-                filled
-                    .iter()
-                    .zip(normals_filled.iter())
-                    .map(|(r, n)| roughness_chain_with_normal_variance(r, n.as_ref()))
-                    .collect()
-            }
-        };
-        let mip_level_count = chains.first().map_or(1, |c| c.len() as u32);
+        let mip_level_count = chains.first().map(|c| c.len() as u32).unwrap_or(1);
+        let format = if map.srgb() { TextureFormat::Rgba8UnormSrgb } else { TextureFormat::Rgba8Unorm };
 
         let tex = device.create_texture(&TextureDescriptor {
-            label: Some(label),
+            label: Some(map.label()),
             size: Extent3d {
                 width: w,
                 height: h,
@@ -706,7 +748,7 @@ impl BrushPipeline {
         )
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn new_ssr_modes(
         device: &Device,
         format: TextureFormat,
@@ -786,7 +828,7 @@ impl BrushPipeline {
         )
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn new_blended(
         device: &Device,
         format: TextureFormat,
@@ -866,7 +908,7 @@ impl BrushPipeline {
     ) -> Option<Self> {
         let (label, edits) = DEFERRED_REGISTER_CUTS.iter().find(|(label, _)| *label == cut)?;
         let mut src = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
-        for (from, to) in *edits {
+        for (from, to) in edits.iter() {
             if !src.contains(from) {
                 return None;
             }
@@ -977,7 +1019,7 @@ impl BrushPipeline {
         let (edit, only) = edit.split_once('@').map_or((edit, None), |(e, c)| (e, Some(c)));
         let shipped = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
         let edited = with_reader_edit(shipped.clone(), edit)?;
-        let class = |name: &str| if only.is_none_or(|c| c == name) { edited.clone() } else { shipped.clone() };
+        let class = |name: &str| if only.map_or(true, |c| c == name) { edited.clone() } else { shipped.clone() };
         let spotless = crate::renderer::lights::without_spot_shadows;
         let build = |label: &str, source: String| {
             Self::from_source(
@@ -1003,7 +1045,7 @@ impl BrushPipeline {
         ])
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn new_variant(
         device: &Device,
         format: TextureFormat,
@@ -1036,7 +1078,7 @@ impl BrushPipeline {
         for (label, edits) in PROBE_PASS_REGISTER_CUTS {
             let mut src = base.clone();
             let mut missing = None;
-            for (from, to) in *edits {
+            for (from, to) in edits.iter() {
                 if !src.contains(from) {
                     missing = Some(*from);
                     break;
@@ -1073,7 +1115,7 @@ impl BrushPipeline {
     ) -> Option<Self> {
         let (label, edits) = SCENE_REGISTER_CUTS.iter().find(|(label, _)| *label == cut)?;
         let mut src = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
-        for (from, to) in *edits {
+        for (from, to) in edits.iter() {
             if !src.contains(from) {
                 return None;
             }
@@ -1104,7 +1146,7 @@ impl BrushPipeline {
         for (label, edits) in SCENE_REGISTER_CUTS {
             let mut src = base.clone();
             let mut missing = None;
-            for (from, to) in *edits {
+            for (from, to) in edits.iter() {
                 if !src.contains(from) {
                     missing = Some(*from);
                     break;
@@ -1140,7 +1182,7 @@ impl BrushPipeline {
         for (label, edits) in DEFERRED_REGISTER_CUTS {
             let mut src = base.clone();
             let mut missing = None;
-            for (from, to) in *edits {
+            for (from, to) in edits.iter() {
                 if !src.contains(from) {
                     missing = Some(*from);
                     break;
@@ -1170,7 +1212,41 @@ impl BrushPipeline {
         }
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
+
+    pub fn log_opts(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        probe_layout: &BindGroupLayout,
+        fixups: &crate::renderer::probe_fixup::ProbeFixups,
+    ) {
+        for (base, pass, src) in opt_bases() {
+            for opt in crate::renderer::shader_opt::OPTS {
+                let Some(mut source) = (opt.edit)(&src) else {
+                    continue;
+                };
+                if pass {
+                    source = with_push_scan(device, source);
+                }
+                let label = format!("opt_{base}_{}", opt.label);
+                let _ = Self::from_source(
+                    device,
+                    if pass { probe_pass::FORMAT } else { format },
+                    uniform_layout,
+                    FrontFace::Ccw,
+                    if pass { 1 } else { samples },
+                    None,
+                    crate::renderer::multiview::ViewMode::Mono,
+                    Some(if pass { fixups.pass_layout() } else { probe_layout }),
+                    &label,
+                    source,
+                );
+            }
+        }
+    }
+
     fn from_source(
         device: &Device,
         format: TextureFormat,
@@ -1253,6 +1329,32 @@ impl BrushPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
+        let targets = [Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::empty() })];
+        Self::depth_prepass_into(device, uniform_layout, samples, view, &targets, DepthBiasState::default(), "brush_depth_prepass")
+    }
+
+    pub fn new_probe_depth_prepass(device: &Device, uniform_layout: &BindGroupLayout) -> Self {
+        let targets = probe_pass::targets(true).map(|t| t.map(|t| ColorTargetState { write_mask: ColorWrites::empty(), ..t }));
+        Self::depth_prepass_into(
+            device,
+            uniform_layout,
+            1,
+            crate::renderer::multiview::ViewMode::Mono,
+            &targets,
+            PROBE_PREPASS_BIAS,
+            "brush_probe_depth_prepass",
+        )
+    }
+
+    fn depth_prepass_into(
+        device: &Device,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        targets: &[Option<ColorTargetState>],
+        bias: DepthBiasState,
+        label: &str,
+    ) -> Self {
 
         let shader = crate::renderer::shader_checks::audited_shader_module(device, ShaderModuleDescriptor {
             label: Some("brush_depth_prepass"),
@@ -1269,7 +1371,7 @@ impl BrushPipeline {
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("brush_depth_prepass"),
+            label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -1281,7 +1383,7 @@ impl BrushPipeline {
                 module: &shader,
                 entry_point: Some("fs_depth"),
                 compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::empty() })],
+                targets,
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
@@ -1295,7 +1397,7 @@ impl BrushPipeline {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(CompareFunction::Less),
                 stencil: StencilState::default(),
-                bias: DepthBiasState::default(),
+                bias,
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
             multiview_mask: view.mask(),
@@ -1305,9 +1407,19 @@ impl BrushPipeline {
     }
 }
 
+pub const PROBE_PREPASS_BIAS: DepthBiasState = DepthBiasState { constant: 16, slope_scale: 2.0, clamp: 0.0 };
+
 pub const SEAL_BRUSH_CRACKS: bool = true;
 
 pub const CRACK_SEAL_COLOUR: [f32; 3] = [0.02, 0.02, 0.05];
+
+/// THE SEAL NEVER TIES A FACE. Behind a convex edge whose other face is turned
+/// away, the seal draws that face's back over the same pixels at all but the
+/// front face's depth, and rounding let it win in dots along the edge: grey
+/// specks down door jambs and building corners, more on the headset than on a
+/// desktop GPU (2026-10-20). Pushed back, it still fills a real crack, where
+/// only open space lies in front of it.
+pub const SEAL_DEPTH_BIAS: DepthBiasState = DepthBiasState { constant: 16, slope_scale: 2.0, clamp: 0.0 };
 
 pub struct BrushSealPipeline {
     pub pipeline: RenderPipeline,
@@ -1334,6 +1446,13 @@ impl BrushSealPipeline {
         Self::new_with_view(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Stereo)
     }
 
+    /// The seal in `colour` instead of `CRACK_SEAL_COLOUR`: one no shading
+    /// can produce (magenta) makes every crack in the brushes countable in a
+    /// frame, since only a hole in the surface shows the seal (2026-10-20).
+    pub fn new_coloured(device: &Device, format: TextureFormat, uniform_layout: &BindGroupLayout, samples: u32, colour: [f32; 3]) -> Self {
+        Self::build(device, format, uniform_layout, samples, crate::renderer::multiview::ViewMode::Mono, brush_seal_shader_in(colour))
+    }
+
     fn new_with_view(
         device: &Device,
         format: TextureFormat,
@@ -1341,9 +1460,20 @@ impl BrushSealPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
+        Self::build(device, format, uniform_layout, samples, view, brush_seal_shader())
+    }
+
+    fn build(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        source: String,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("brush_seal_shader"),
-            source: ShaderSource::Wgsl(view.shader(brush_seal_shader()).into()),
+            source: ShaderSource::Wgsl(view.shader(source).into()),
         });
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("brush_seal_layout"),
@@ -1379,7 +1509,7 @@ impl BrushSealPipeline {
                 depth_write_enabled: Some(true),
                 depth_compare: Some(CompareFunction::Less),
                 stencil: StencilState::default(),
-                bias: DepthBiasState::default(),
+                bias: SEAL_DEPTH_BIAS,
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
             multiview_mask: view.mask(),
@@ -1390,24 +1520,35 @@ impl BrushSealPipeline {
 }
 
 fn brush_seal_shader() -> String {
-    let [r, g, b] = CRACK_SEAL_COLOUR;
+    brush_seal_shader_in(CRACK_SEAL_COLOUR)
+}
+
+fn brush_seal_shader_in([r, g, b]: [f32; 3]) -> String {
+    let src = brush_seal_shader_posed(r, g, b);
+    if WORLD_BRUSHES.load(std::sync::atomic::Ordering::Relaxed) {
+        debug_assert_eq!(src.matches(POSED_SEAL_VERTEX).count(), 1);
+        return src.replacen(POSED_SEAL_VERTEX, WORLD_SEAL_VERTEX, 1);
+    }
+    src
+}
+
+fn brush_seal_shader_posed(r: f32, g: f32, b: f32) -> String {
     format!(
-        r"
+        r#"
 {lights_block}
 
-@vertex fn vs_main(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {{
+@vertex fn vs_main(@location(0) pos: vec3<f32>) -> @builtin(position) @invariant vec4<f32> {{
     return cam_view_proj() * vec4<f32>(pos, 1.0);
 }}
 
 @fragment fn fs_main() -> @location(0) vec4<f32> {{
     return vec4<f32>({r:?}, {g:?}, {b:?}, 1.0);
 }}
-",
+"#,
         lights_block = wgsl_lights_block(0, 1),
     )
 }
 
-#[cfg(test)]
 fn brush_shader() -> String {
     brush_shader_with(false)
 }
@@ -1422,6 +1563,8 @@ pub struct SunFaces {
     unbaked: Vec<u32>,
     width: u32,
     height: u32,
+
+    serial: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1457,7 +1600,12 @@ impl SunFaces {
                 unbaked[here] = unbaked[above] + unbaked_row;
             }
         }
-        Some(Self { reachable, unbaked, width, height })
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Some(Self { reachable, unbaked, width, height, serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) })
+    }
+
+    pub fn serial(&self) -> u64 {
+        self.serial
     }
 
     pub fn class_of(&self, uv2_rect: [f32; 4]) -> FaceSun {
@@ -1591,6 +1739,24 @@ pub fn dilate_sun_mask(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     px
 }
 
+#[cfg(test)]
+pub(crate) fn audit_sources() -> Vec<(&'static str, String)> {
+    let read = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+    vec![
+        ("brush_read_baked_spotless", crate::renderer::lights::without_spot_shadows(sun_reader_shader(read, FaceSun::Baked))),
+        ("brush_probe_pass_deferred", brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred)),
+    ]
+}
+
+pub(crate) fn opt_bases() -> Vec<(&'static str, bool, String)> {
+    let read = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
+    vec![
+        ("bread", false, crate::renderer::lights::without_spot_shadows(sun_reader_shader(read.clone(), FaceSun::Baked))),
+        ("bfull", false, read),
+        ("bpass", true, brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred)),
+    ]
+}
+
 pub(crate) fn sun_reader_shader(source: String, class: FaceSun) -> String {
     let switch = match class {
         FaceSun::Never => "SKY_SUN_NEVER_REACHES",
@@ -1602,7 +1768,6 @@ pub(crate) fn sun_reader_shader(source: String, class: FaceSun) -> String {
     source.replacen(&off, &format!("const {switch}: bool = true;"), 1)
 }
 
-#[cfg(test)]
 fn brush_shader_with(ssr: bool) -> String {
     brush_shader_variant(ssr, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG)
 }
@@ -1634,8 +1799,17 @@ fn with_push_scan(device: &Device, src: String) -> String {
 
 const SCAN_FROM_UNIFORMS: &str = "def_scan_uniform";
 
+const PROBE_TRACE_CALL: &str = "    return probe_trace_skipping(world_pos, d, room, roughness, -1);";
+const FOVEA_30: &str = "    let fwd = normalize(vec3<f32>(cam_view_proj()[0].w, cam_view_proj()[1].w, cam_view_proj()[2].w));\n    let fovea = dot(normalize(to_player_space(world_pos) - cam_pos()), fwd) > 0.866;\n    return probe_trace_skipping(world_pos, d, room, select(2.0, roughness, fovea), -1);";
+const FOVEA_45: &str = "    let fwd = normalize(vec3<f32>(cam_view_proj()[0].w, cam_view_proj()[1].w, cam_view_proj()[2].w));\n    let fovea = dot(normalize(to_player_space(world_pos) - cam_pos()), fwd) > 0.707;\n    return probe_trace_skipping(world_pos, d, room, select(2.0, roughness, fovea), -1);";
+
 const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("def_cut_none", &[]),
+
+    (
+        "def_glass_any_way",
+        &[("let into = select(1.0, s * s * (3.0 - 2.0 * s), lights.lights[i].params.z > 0.5);", "let into = 1.0;")],
+    ),
     ("def_cut_rim_detect", &[("        if (hit.rim < 0.0 && spread > PROBE_RIM_MIN_SPREAD) {", "        if (false) {")]),
     ("def_cut_edge_detect", &[("        if (hit.edge_code < 0 && proxy.edge >= 0) {", "        if (false) {")]),
     (
@@ -1705,6 +1879,17 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ),
 
     ("def_cut_trace", &[("    let hit = probe_trace(world_pos, d, trace_room, roughness);", STAGE_CUT_HIT)]),
+    // FOVEATED TRACE LOD (the AAA doc's rank 5): no trace past 30 or 45
+    // degrees off the eye's axis, where the density map already shades
+    // coarsely; those pixels take the probe cube as rough ones do. The
+    // trace's position is in the world; the eye's in the player's frame.
+    ("def_cut_fovea30", &[(PROBE_TRACE_CALL, FOVEA_30)]),
+    ("def_cut_fovea45", &[(PROBE_TRACE_CALL, FOVEA_45)]),
+    // THE TRACE ONLY ON SMOOTH SURFACES (the AAA doc's rank 2, from
+    // Frostbite's < 0.2): past these roughnesses a surface reads the probe
+    // cube through its box instead of walking the rooms.
+    ("def_cut_trace_max05", &[("const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.75;", "const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.5;")]),
+    ("def_cut_trace_max03", &[("const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.75;", "const PROBE_TRACE_MAX_ROUGHNESS: f32 = 0.3;")]),
     (
         "def_cut_colour",
         &[(
@@ -1749,7 +1934,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "def_hit_walk",
         &[(
-            "    let near = probe_nearest_two(h, room, other);
+            "    let near = probe_nearest_two_unrolled(h, room, other);
     let s0 = near.s0;
     let s1 = near.s1;
     let d0 = near.d0;
@@ -1787,18 +1972,18 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ),
 
     (
-        "def_scan_unrolled",
-        &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_unrolled(h, room, other);")],
+        "def_scan_rolled",
+        &[("    let near = probe_nearest_two_unrolled(h, room, other);", "    let near = probe_nearest_two(h, room, other);")],
     ),
 
     (
         "def_scan_const",
-        &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_const(h, room, other);")],
+        &[("    let near = probe_nearest_two_unrolled(h, room, other);", "    let near = probe_nearest_two_const(h, room, other);")],
     ),
 
     (
         "def_scan_const_unrolled",
-        &[("    let near = probe_nearest_two(h, room, other);", "    let near = probe_nearest_two_const_unrolled(h, room, other);")],
+        &[("    let near = probe_nearest_two_unrolled(h, room, other);", "    let near = probe_nearest_two_const_unrolled(h, room, other);")],
     ),
 
     (SCAN_FROM_UNIFORMS, &[]),
@@ -1830,7 +2015,7 @@ const DEFERRED_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     (
         "def_cut_slot_walk",
         &[(
-            "    let near = probe_nearest_two(h, room, other);",
+            "    let near = probe_nearest_two_unrolled(h, room, other);",
             "    var near: ProbeNearest;
     near.s0 = probe_room_slot(room);
     near.s1 = select(-1, probe_slot_next(near.s0), near.s0 >= 0);
@@ -2307,18 +2492,62 @@ const SHADOW_TENT_OPAQUE: (&str, &str) = (
 );
 
 const SHADOW_BOX_OPAQUE: (&str, &str) = (
-    "    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {",
-    "    for (var dx: i32 = -1; dx <= select(1, i32(camera.shadow_params.w), camera.shadow_params.w > 0.5); dx = dx + 1) {",
+    "    for (var k = 0; k < 4; k = k + 1) {\n        let second",
+    "    for (var k = 0; k < select(4, i32(camera.shadow_params.w), camera.shadow_params.w > 0.5); k = k + 1) {\n        let second",
 );
 
-const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
+/// PER-FACE LAMP LISTS (the AAA doc's rank 3, without splitting the draw):
+/// the vertex stage marks, per face, the lamps whose range reaches the
+/// face's rectangle (its centre plus the length of its half extent, which
+/// bounds every shading point: `face_pos` is clamped to the rectangle), and
+/// the lamp loop walks only those. Per-pixel range culling still runs on
+/// the ones walked, so nothing a pixel receives changes, save the highlight
+/// widening's nearest-lamp distance, which now ignores lamps out of reach.
+pub(crate) const FACE_LAMPS: &[(&str, &str)] = &[
+    (
+        "struct VOut {\n",
+        "var<private> face_lamp_mask: u32 = 0xffffffffu;\nstruct VOut {\n",
+    ),
+    (
+        "    @location(11) room_near: f32,\n",
+        "    @location(11) room_near: f32,\n    @location(12) @interpolate(flat) face_lamps: u32,\n",
+    ),
+    (
+        "    out.room_near = room_near(to_world_space(v.pos));\n",
+        "    out.room_near = room_near(to_world_space(v.pos));\n    var face_lamps = 0u;\n    let face_r = length(v.face_half_extent);\n    for (var k: u32 = 0u; k < lights.count.x; k = k + 1u) {\n        let reach = lights.lights[k].params.x + face_r;\n        let off = lights.lights[k].position.xyz - v.face_centre;\n        if (lights.lights[k].params.z > 1.5 || dot(off, off) < reach * reach) {\n            face_lamps = face_lamps | (1u << k);\n        }\n    }\n    out.face_lamps = face_lamps;\n",
+    ),
+    (
+        "    probe_volume_pos = vec4<f32>(in.face_centre, 1.0);\n    let env_part = shade_material_env_part(",
+        "    probe_volume_pos = vec4<f32>(in.face_centre, 1.0);\n    face_lamp_mask = in.face_lamps;\n    let env_part = shade_material_env_part(",
+    ),
+    (
+        "    for (var i: u32 = surface_light_count(); i < live_light_count(); i = i + 1u) {\n        let kind = lights.lights[i].params.z;\n        let to_lamp",
+        "    var face_todo = face_lamp_mask & ((1u << live_light_count()) - 1u) & ~((1u << surface_light_count()) - 1u);\n    loop {\n        if (face_todo == 0u) {\n            break;\n        }\n        let i = countTrailingZeros(face_todo);\n        face_todo = face_todo & (face_todo - 1u);\n        let kind = lights.lights[i].params.z;\n        let to_lamp",
+    ),
+];
+
+/// The scene readers walk each face's lamps (`FACE_LAMPS`). Measured on the
+/// Quest 3 offline (2026-10-23, hall_back, one eye): the scene pass fell
+/// 8.04 -> 7.83 ms, with the image the same as the full walk's to within
+/// run-to-run noise.
+pub const FACE_LAMP_LISTS: bool = true;
+
+fn with_face_lamps(mut src: String) -> String {
+    for (from, to) in FACE_LAMPS {
+        assert!(src.contains(from), "the face lamp lists no longer find `{from}`");
+        src = src.replacen(from, to, 1);
+    }
+    src
+}
+
+pub(crate) const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("scene_cut_none", &[]),
     ("scene_cut_lamp_loop", &[("    var todo = reaching;\n", "    var todo = 0u;\n")]),
     (
         "scene_cut_lamps",
         &[(
-            "i < live_light_count(); i = i + 1u) {\n        let kind = lights.lights[i].params.z;\n        let to_lamp",
-            "i < 0u; i = i + 1u) {\n        let kind = lights.lights[i].params.z;\n        let to_lamp",
+            "    var face_todo = face_lamp_mask & ",
+            "    var face_todo = 0u & face_lamp_mask & ",
         )],
     ),
     ("scene_cut_stationary", &[("    set_stationary_masks(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);\n", "")]),
@@ -2405,6 +2634,18 @@ const SCENE_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("scene_tent_half", &[("    return pcf_tile_tent_lean_at(\n        tex,", "    return pcf_tile_tent_half_at(\n        tex,")]),
 
     ("scene_all_f32", &[("alias hf = f32;\n", "alias hf = f32; // scene_all_f32\n")]),
+
+    (
+        "scene_highlight_uncapped",
+        &[("    out.specular = radiance * spec * atten * lamp_highlight_share(view_dir, h, ndotl, aa.y, shininess, spec_strength);", "    out.specular = radiance * spec * atten * aa.y;")],
+    ),
+    (
+        "scene_census_trace",
+        &[(
+            "    return vec4<f32>(tonemap(c), reflection_alpha(lit));",
+            "    let census = clamp(textureSampleBias(mat_rough, mat_rough_samp, in.uv, i32(in.material), 1.0).r, 0.04, 1.0) < PROBE_LOBE_HEMISPHERICAL;\n    return vec4<f32>(select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), census), 1.0);",
+        )],
+    ),
 ];
 
 pub(crate) const READER_EDITS: &[(&str, &[(&str, &str)])] = &[
@@ -2469,9 +2710,13 @@ const SUN_MATRIX_FIXED: (&str, &str) = (
 );
 
 pub(crate) fn with_reader_edit(src: String, edit: &str) -> Option<String> {
+
+    if edit.starts_with("opt_") {
+        return crate::renderer::shader_opt::edit_named(&src, edit);
+    }
     let (_, edits) = READER_EDITS.iter().find(|(name, _)| *name == edit)?;
     let mut src = src;
-    for (from, to) in *edits {
+    for (from, to) in edits.iter() {
         if src.matches(from).count() != 1 {
             return None;
         }
@@ -2510,7 +2755,7 @@ pub mod probe_pass {
 
     pub const REACH_FORMAT: TextureFormat = TextureFormat::Rg16Float;
 
-    pub(crate) const FACE_CODE_WGSL: &str = r"
+    pub(crate) const FACE_CODE_WGSL: &str = r#"
 fn probe_face_code(n: vec3<f32>) -> f32 {
     let a = n / max(abs(n.x) + abs(n.y) + abs(n.z), 1e-6);
     var o = a.xz;
@@ -2530,7 +2775,7 @@ fn probe_face_same(a: f32, b: f32) -> bool {
     let d = abs(vec2<i32>(ia / 32 - ib / 32, ia % 32 - ib % 32));
     return d.x <= 2 && d.y <= 2;
 }
-";
+"#;
 
     pub const MIRROR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
@@ -2546,13 +2791,13 @@ fn probe_face_same(a: f32, b: f32) -> bool {
     pub const EYE_FAR: f32 = 1000.0;
 
     pub const OUTPUT_SIGNATURE: &str = "-> ProbePassOut";
-    pub(crate) const OUTPUT_WGSL: &str = r"
+    pub(crate) const OUTPUT_WGSL: &str = r#"
 struct ProbePassOut {
     @location(0) reflection: vec4<f32>,
 
     @location(1) reach: vec2<f32>,
 }
-";
+"#;
 
     pub fn targets(reach: bool) -> [Option<wgpu::ColorTargetState>; 2] {
         [
@@ -2848,7 +3093,7 @@ struct ProbePassOut {
         for k in 1..=n {
             s += &format!("@group(0) @binding({k}) var level{k}: texture_storage_2d<rgba16float, write>;\n");
         }
-        s += r"
+        s += r#"
 var<workgroup> tile_a: array<vec4<f32>, 256>;
 var<workgroup> tile_b: array<vec4<f32>, 64>;
 
@@ -2865,9 +3110,9 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
         textureStore(level1, p1, v1);
     }
     tile_a[t.y * 16u + t.x] = v1;
-";
+"#;
         if n >= 2 {
-            s += r"
+            s += r#"
     workgroupBarrier();
     if (t.x < 8u && t.y < 8u) {
         let i = t.y * 32u + t.x * 2u;
@@ -2878,10 +3123,10 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
         }
         tile_b[t.y * 8u + t.x] = v2;
     }
-";
+"#;
         }
         if n >= 3 {
-            s += r"
+            s += r#"
     workgroupBarrier();
     if (t.x < 4u && t.y < 4u) {
         let i = t.y * 16u + t.x * 2u;
@@ -2892,10 +3137,10 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
         }
         tile_a[t.y * 4u + t.x] = v3;
     }
-";
+"#;
         }
         if n >= 4 {
-            s += r"
+            s += r#"
     workgroupBarrier();
     if (t.x < 2u && t.y < 2u) {
         let i = t.y * 8u + t.x * 2u;
@@ -2905,19 +3150,19 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
             textureStore(level4, p4, v4);
         }
     }
-";
+"#;
         }
         s += "}\n";
         s
     }
 
-    pub(super) const PASS_LIGHTING: &str = r"
+    pub(super) const PASS_LIGHTING: &str = r#"
     let rough = textureSample(mat_rough, mat_rough_samp, in.uv, i32(in.material)).r;
 
     let rough_aa = specular_aa_roughness(rough, dpdx(n_geom), dpdy(n_geom));
     let ao = textureSample(mat_ao, mat_samp, in.uv, i32(in.material)).r;
     let lm_uv = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
-    let baked = textureSample(lm_tex, lm_samp, lm_uv);
+    let baked = textureSample(lm_tex, lm_samp, lm_uv) * vec4<f32>(vec3<f32>(exp2(-camera.proxy_params.z)), 1.0);
     let face_t = normalize(in.tangent.xyz - n_geom * dot(n_geom, in.tangent.xyz));
     let face_b = cross(n_geom, face_t) * in.tangent.w;
     let face_d = in.world_pos - in.face_centre;
@@ -2931,9 +3176,9 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_id) t: ve
         return ProbePassOut(vec4<f32>(0.0), vec2<f32>(0.0, probe_face_code(n_geom)));
     }
     let reflection = probe_env_for_pass(face_pos, n, rough_aa, ao, baked.a, baked.rgb, face_pos, n_geom);
-    return ProbePassOut(reflection, vec2<f32>(probe_reach, probe_face_code(n_geom)));";
+    return ProbePassOut(reflection, vec2<f32>(probe_reach, probe_face_code(n_geom)));"#;
 
-    pub(crate) const READER_WGSL: &str = r"
+    pub(crate) const READER_WGSL: &str = r#"
 @group(3) @binding(0) var probe_pass_tex: texture_2d_array<f32>;
 @group(3) @binding(1) var probe_pass_depth: texture_depth_2d_array;
 @group(3) @binding(2) var probe_pass_linear: sampler;
@@ -2990,23 +3235,24 @@ fn probe_pass_upsample(pixel: vec2<f32>, depth: f32, tolerance: f32, code: f32) 
     }
     return vec4<f32>(probe_pass_expand(pre.rgb / max(pre.a, 1e-4)), pre.a);
 }
-";
+"#;
 
     pub(crate) fn eye_linear_depth_wgsl() -> String {
         format!(
-            r"
-const FLOOR_MIRROR_NEAR: f32 = {EYE_NEAR:?};
-const FLOOR_MIRROR_FAR: f32 = {EYE_FAR:?};
+            r#"
+const FLOOR_MIRROR_NEAR: f32 = {near:?};
+const FLOOR_MIRROR_FAR: f32 = {far:?};
 fn floor_mirror_linear_depth(d: f32) -> f32 {{
     let z = 2.0 * d - 1.0;
     return 2.0 * FLOOR_MIRROR_FAR * FLOOR_MIRROR_NEAR / ((FLOOR_MIRROR_FAR + FLOOR_MIRROR_NEAR) - z * (FLOOR_MIRROR_FAR - FLOOR_MIRROR_NEAR));
 }}
-",
+"#,
+            near = EYE_NEAR,
+            far = EYE_FAR,
         )
     }
 }
 
-#[cfg(test)]
 fn brush_shader_variant(ssr: bool, sources: bool, ssr_debug: bool) -> String {
     brush_shader_modes(ssr, sources, ssr_debug, SsrPath::Inline)
 }
@@ -3053,7 +3299,7 @@ fn brush_shader_probe(ssr: bool, sources: bool, ssr_debug: bool, path: SsrPath, 
 
     if BRUSH_LIGHT_DEBUG {
         return format!(
-            r"
+            r#"
 {lights_block}
 
 struct VIn {{
@@ -3066,7 +3312,7 @@ struct VIn {{
     @location(6) uv2: vec2<f32>,
 }}
 struct VOut {{
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) world_pos: vec3<f32>,
 }}
@@ -3081,7 +3327,7 @@ struct VOut {{
     let d = light_debug(in.world_pos, normalize(in.normal));
     return vec4<f32>(clamp(d.x, 0.0, 1.0), clamp(d.y, 0.0, 1.0), 0.0, 1.0);
 }}
-",
+"#,
             lights_block = wgsl_lights_block(0, 1),
         );
     }
@@ -3091,17 +3337,17 @@ struct VOut {{
 
             "    @location(9) @interpolate(perspective, centroid) world_pos_centroid: vec3<f32>,\n",
             "    out.world_pos_centroid = v.pos;\n",
-            r"
+            r#"
     let edge_delta = length(in.world_pos - in.world_pos_centroid);
     let edge_pixel = length(fwidth(in.world_pos));
     let edge_out = edge_delta / max(edge_pixel, 1e-6);
-    return vec4<f32>(clamp(edge_out, 0.0, 1.0), 0.02, 0.02, 1.0);",
+    return vec4<f32>(clamp(edge_out, 0.0, 1.0), 0.02, 0.02, 1.0);"#,
         )
     } else {
         ("", "", "")
     };
     let source_debug = if sources {
-        r"
+        r#"
     let dbg_sum = dbg_direct + dbg_baked + dbg_probe;
     let dbg_total = max(dbg_sum.r + dbg_sum.g + dbg_sum.b, 1e-6);
     return vec4<f32>(
@@ -3109,13 +3355,13 @@ struct VOut {{
         (dbg_baked.r + dbg_baked.g + dbg_baked.b) / dbg_total,
         (dbg_probe.r + dbg_probe.g + dbg_probe.b) / dbg_total,
         1.0,
-    );"
+    );"#
     } else {
         ""
     };
 
     let ssr_apply = if ssr {
-        r"
+        r#"
     let ssr_rough = textureSampleLevel(mat_rough, mat_rough_samp, in.uv, i32(in.material), 4.0).r;
     let ssr_n = normalize(mix(n_geom, n, 1.0 - smoothstep(0.1, 0.4, ssr_rough)));
     let ssr_view = normalize(cam_pos() - in.world_pos);
@@ -3123,34 +3369,34 @@ struct VOut {{
     let ssr_fresnel = 0.04 + 0.96 * pow(1.0 - ssr_cos, 5.0);
 
     let reflectivity = clamp((1.0 - ssr_rough) * ssr_fresnel, 0.0, MAX_SSR_REFLECTIVITY);
-"
+"#
     } else {
-        r"
-    return vec4<f32>(tonemap(c), albedo.a * in.tint.a);"
+        r#"
+    return vec4<f32>(tonemap(c), albedo.a * in.tint.a);"#
     };
 
     let ssr_tail = if !ssr {
         ""
     } else if composite {
 
-        r"
+        r#"
     let ssr_fallback = textureLoad(ssr_scene_color, vec2<i32>(in.clip.xy), 0).rgb;
     let refl = ssr_reflection_at(in.clip.xy);
     return vec4<f32>(
         mix(ssr_fallback, refl.rgb, clamp(reflectivity, 0.0, 1.0) * refl.a),
         albedo.a * in.tint.a,
-    );"
+    );"#
     } else if trace {
 
-        r"
-    return ssr_reflect(in.world_pos, ssr_n, vec3<f32>(0.0), reflectivity, ssr_rough);"
+        r#"
+    return ssr_reflect(in.world_pos, ssr_n, vec3<f32>(0.0), reflectivity, ssr_rough);"#
     } else {
-        r"
+        r#"
     let ssr_fallback = textureLoad(ssr_scene_color, vec2<i32>(in.clip.xy), 0).rgb;
     return vec4<f32>(
         ssr_reflect(in.world_pos, ssr_n, ssr_fallback, reflectivity, ssr_rough),
         albedo.a * in.tint.a,
-    );"
+    );"#
     };
     let ssr_apply = format!("{ssr_apply}{ssr_tail}");
 
@@ -3165,7 +3411,7 @@ struct VOut {{
     let lighting = if ssr && !sources {
         ""
     } else {
-        r"
+        r#"
     let rough = textureSample(mat_rough, mat_rough_samp, in.uv, i32(in.material)).r;
 
     let rough_aa = rough;
@@ -3174,7 +3420,7 @@ struct VOut {{
     let ao = textureSample(mat_ao, mat_samp, in.uv, i32(in.material)).r;
 
     let lm_uv = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
-    let baked = textureSample(lm_tex, lm_samp, lm_uv);
+    let baked = textureSample(lm_tex, lm_samp, lm_uv) * vec4<f32>(vec3<f32>(exp2(-camera.proxy_params.z)), 1.0);
 
     let bdir = textureSample(lm_dir_tex, lm_samp, lm_uv);
 
@@ -3216,7 +3462,7 @@ struct VOut {{
     }
     set_stationary_masks(st_0, st_1, st_2, st_3, STATIONARY_MASK_DISTANCE_TEXELS);
     let lit = shade_material_lamps(env_part, face_pos, n, baked.rgb, albedo.rgb);
-    let c = in.tint.rgb * lit;"
+    let c = in.tint.rgb * lit;"#
     };
 
     let lighting: String = match probe {
@@ -3247,7 +3493,7 @@ struct VOut {{
         }
     };
     let src = format!(
-        r"
+        r#"
 @group(2) @binding(0) var lm_tex: texture_2d<f32>;
 @group(2) @binding(2) var lm_dir_tex: texture_2d<f32>;
 @group(2) @binding(1) var lm_samp: sampler;
@@ -3302,6 +3548,8 @@ struct VOut {{
     @location(8) @interpolate(flat) uv2_rect: vec4<f32>,
 
     @location(9) @interpolate(flat) face_half_extent: vec2<f32>,
+
+    @location(11) room_near: f32,
 {probe_face_varying}{edge_varying}}}
 
 @vertex fn vs_main(v: VIn) -> VOut {{
@@ -3318,6 +3566,7 @@ struct VOut {{
     out.uv2       = v.uv2;
     out.material  = v.material;
     out.tint      = v.tint;
+    out.room_near = room_near(to_world_space(v.pos));
 {probe_face_vs}{edge_vs}    return out;
 }}
 
@@ -3327,6 +3576,10 @@ struct VOut {{
 
 @fragment fn fs_main(in: VOut) -> {fs_return} {{
 
+    let room_reach = ROOM_REACH_PIXELS * max(length(dpdx(in.world_pos)), length(dpdy(in.world_pos)));
+    if (in.room_near > 0.0) {{
+        local_exposure = room_local_exposure(to_world_space(in.world_pos), room_reach);
+    }}
     pixel_footprint = sqrt(length(dpdx(in.world_pos)) * length(dpdy(in.world_pos)));
     let albedo = textureSample(mat_color, mat_samp, in.uv, i32(in.material));
 
@@ -3341,7 +3594,7 @@ struct VOut {{
 
 {lighting}{tail}
 }}
-",
+"#,
         lights_block = crate::renderer::lights::wgsl_lights_block_with(
             0,
             1,
@@ -3353,6 +3606,7 @@ struct VOut {{
                 card_tests_filtered: false,
                 card_relit: false,
                 long_step_from_plane: true,
+                open_fallback: false,
             },
         ),
         ssr_block = ssr_block,
@@ -3390,21 +3644,26 @@ struct VOut {{
                 SourcesView::ProbeFactors => {
                     "\n    return vec4<f32>(dbg_probe_factors, 1.0);".to_string()
                 }
-                SourcesView::Absolute => r"
+                SourcesView::Absolute => r#"
     let abs_lum = vec3<f32>(
         dot(dbg_baked, vec3<f32>(0.2126, 0.7152, 0.0722)),
         dot(dbg_probe, vec3<f32>(0.2126, 0.7152, 0.0722)),
         dot(dbg_direct, vec3<f32>(0.2126, 0.7152, 0.0722)),
     );
-    return vec4<f32>(abs_lum / (abs_lum + vec3<f32>(0.05)), 1.0);"
+    return vec4<f32>(abs_lum / (abs_lum + vec3<f32>(0.05)), 1.0);"#
                     .to_string(),
             }
         } else {
             ssr_apply
         }
     );
+
+    let src = in_the_brushes_frame(src);
     match probe {
-        BrushProbe::Read => format!("{src}{}{}", probe_pass::READER_WGSL, probe_pass::FACE_CODE_WGSL),
+        BrushProbe::Read => {
+            let src = if FACE_LAMP_LISTS { with_face_lamps(src) } else { src };
+            format!("{src}{}{}", probe_pass::READER_WGSL, probe_pass::FACE_CODE_WGSL)
+        }
         BrushProbe::Pass | BrushProbe::PassDeferred => {
             format!("{src}{}{}", probe_pass::OUTPUT_WGSL, probe_pass::FACE_CODE_WGSL)
         }
@@ -3497,7 +3756,7 @@ mod tests {
 
     const NEUTRAL_LM: [u8; 4] = [0, 0, 0, 255];
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn render_brush_material(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -3514,7 +3773,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn render_brush_baked(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -3534,7 +3793,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn render_brush_baked_dir(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -3570,7 +3829,7 @@ mod tests {
         let v = 0.5029f32;
         let floats = at(crate::renderer::mesh::LightmapLight::Linear(&[v, v, v, 1.0])).unwrap();
         for c in 0..3 {
-            assert!((i32::from(bytes[c]) - i32::from(floats[c])).abs() <= 1, "{bytes:?} vs {floats:?}");
+            assert!((bytes[c] as i32 - floats[c] as i32).abs() <= 1, "{bytes:?} vs {floats:?}");
         }
         let bright = at(crate::renderer::mesh::LightmapLight::Linear(&[3.0, 3.0, 3.0, 1.0])).unwrap();
         let one = at(crate::renderer::mesh::LightmapLight::Linear(&[1.0, 1.0, 1.0, 1.0])).unwrap();
@@ -3596,12 +3855,12 @@ mod tests {
         assert!(lit[1] > dark[1] + 40, "the sun did not light an unshadowed wall: {dark:?} vs {lit:?}");
         assert!(half[1] > dark[1] && half[1] < lit[1], "half a sun is not between none and all");
         assert!(
-            (i32::from(unbaked[1]) - i32::from(lit[1])).abs() <= 2,
+            (unbaked[1] as i32 - lit[1] as i32).abs() <= 2,
             "an unbaked mask read as shadow: {unbaked:?} vs {lit:?}",
         );
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn render_brush_probed(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -3622,7 +3881,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn render_brush_full(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -3644,7 +3903,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn render_brush_lit_by(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -3708,14 +3967,17 @@ mod tests {
             lights.upload(&queue, &[]);
         }
 
-        let (_shadows, uniforms, _probe_keep) = if let Some((colour, lo, hi)) = probe {
-            let (sh, u, v, samp) = crate::renderer::uniforms::test_support::scene_uniforms_with_probe(
-                &device, &queue, &lights, colour, lo, hi,
-            );
-            (sh, u, Some((v, samp)))
-        } else {
-            let (sh, u) = scene_uniforms(&device, &lights);
-            (sh, u, None)
+        let (_shadows, uniforms, _probe_keep) = match probe {
+            Some((colour, lo, hi)) => {
+                let (sh, u, v, samp) = crate::renderer::uniforms::test_support::scene_uniforms_with_probe(
+                    &device, &queue, &lights, colour, lo, hi,
+                );
+                (sh, u, Some((v, samp)))
+            }
+            None => {
+                let (sh, u) = scene_uniforms(&device, &lights);
+                (sh, u, None)
+            }
         };
         uniforms.upload(&queue, glam::Mat4::IDENTITY, TEST_EYE, &ShadowUpload::disabled());
 
@@ -3786,7 +4048,7 @@ mod tests {
 
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("brush_test_readback"),
-            size: u64::from(256 * SIZE),
+            size: (256 * SIZE) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -4045,7 +4307,7 @@ mod tests {
                 [1.0; 4], 1.0, false, HEAD_ON_LIGHT,
             )
             .unwrap();
-            eprintln!("{label:>16}: lit {lit:?}  unlit {unlit:?}  delta {}", i32::from(lit[0]) - i32::from(unlit[0]));
+            eprintln!("{label:>16}: lit {lit:?}  unlit {unlit:?}  delta {}", lit[0] as i32 - unlit[0] as i32);
         }
     }
 
@@ -4132,14 +4394,14 @@ mod tests {
         };
         let rough = room_lit(255).unwrap();
 
-        let room = i32::from(smooth[1]) - i32::from(rough[1]);
+        let room = smooth[1] as i32 - rough[1] as i32;
         assert!(
             room > 2,
             "a polished surface in a lit but sealed room reflected no more of \
              that room than a matte one: {smooth:?} vs {rough:?}",
         );
 
-        let total = |p: [u8; 4]| i32::from(p[0]) + i32::from(p[1]) + i32::from(p[2]);
+        let total = |p: [u8; 4]| p[0] as i32 + p[1] as i32 + p[2] as i32;
         assert!(
             total(smooth) > total(rough),
             "the polished surface is not showing more light in total: \
@@ -4169,7 +4431,7 @@ mod tests {
         };
         let below = lit_from([128, 0, 128, 255]).unwrap();
 
-        let gap = (i32::from(above[0]) - i32::from(below[0])).abs();
+        let gap = (above[0] as i32 - below[0] as i32).abs();
         assert!(
             gap > 4,
             "bounce arriving from above ({above:?}) and from below ({below:?}) \
@@ -4243,13 +4505,13 @@ mod tests {
 
         let matte = shine(255).unwrap();
         assert!(
-            i32::from(px[1]) > i32::from(matte[1]) && i32::from(px[2]) > i32::from(matte[2]),
+            px[1] as i32 > matte[1] as i32 && px[2] as i32 > matte[2] as i32,
             "a polished red surface ({px:?}) carries no more green or blue than a \
              matte one ({matte:?}), so it has no untinted highlight at all",
         );
 
-        let dg = i32::from(px[1]) - i32::from(matte[1]);
-        let db = i32::from(px[2]) - i32::from(matte[2]);
+        let dg = px[1] as i32 - matte[1] as i32;
+        let db = px[2] as i32 - matte[2] as i32;
         assert!(
             (dg - db).abs() <= 2,
             "the highlight added {dg} green and {db} blue -- it is carrying the \
@@ -4348,7 +4610,7 @@ mod tests {
         let flat_px =
             render_brush_material(0, &grey, &[Some(flat([128, 128, 255], 4))], &[], &[], [1.0; 4], 1.0, true, above)
                 .unwrap();
-        let lum = |p: [u8; 4]| i32::from(p[0]) + i32::from(p[1]) + i32::from(p[2]);
+        let lum = |p: [u8; 4]| p[0] as i32 + p[1] as i32 + p[2] as i32;
         eprintln!("faces up {faces_up:?}  flat {flat_px:?}  faces down {faces_down:?}");
         assert!(faces_up[0] < 250 && faces_up[1] < 250, "clipped, so the comparison means nothing: {faces_up:?}");
         assert!(
@@ -4412,6 +4674,8 @@ mod tests {
     mod probe_render {
         use super::*;
 
+        use super::tests::*;
+        use super::*;
 
         const SEALED: [u8; 4] = [0, 0, 0, 0];
 
@@ -4443,7 +4707,7 @@ mod tests {
 
             let with = polished_wall(Some(([0, 255, 0, 255], big.0, big.1))).unwrap();
             assert!(
-                i32::from(with[1]) - i32::from(without[1]) > 4,
+                with[1] as i32 - without[1] as i32 > 4,
                 "a probe covering the surface changed it from {without:?} to {with:?}; \
                  the cube is not reaching the shader",
             );
@@ -4725,7 +4989,7 @@ mod ssr_pipeline_tests {
         let read = |enc: &mut wgpu::CommandEncoder, level: u32, size: u32| {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
-                size: 256 * u64::from(size),
+                size: 256 * size as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -4747,8 +5011,8 @@ mod ssr_pipeline_tests {
         let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
 
         let half_to_f32 = |h: u16| -> f32 {
-            let exp = i32::from((h >> 10) & 0x1f);
-            let mant = f32::from(h & 0x3ff) / 1024.0;
+            let exp = ((h >> 10) & 0x1f) as i32;
+            let mant = (h & 0x3ff) as f32 / 1024.0;
             if exp == 0 { 0.0 } else { (1.0 + mant) * 2f32.powi(exp - 15) }
         };
         let half = |b: &wgpu::Buffer| -> Vec<f32> {
@@ -4798,7 +5062,7 @@ mod ssr_pipeline_tests {
                 let row = (w * 8).div_ceil(256) * 256;
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: None,
-                    size: u64::from(row * h),
+                    size: (row * h) as u64,
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
@@ -4819,8 +5083,8 @@ mod ssr_pipeline_tests {
         }
         let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         let half_to_f32 = |h: u16| -> f32 {
-            let exp = i32::from((h >> 10) & 0x1f);
-            let mant = f32::from(h & 0x3ff) / 1024.0;
+            let exp = ((h >> 10) & 0x1f) as i32;
+            let mant = (h & 0x3ff) as f32 / 1024.0;
             if exp == 0 { mant * 2f32.powi(-14) } else { (1.0 + mant) * 2f32.powi(exp - 15) }
         };
 
@@ -4847,6 +5111,41 @@ mod ssr_pipeline_tests {
     }
 
     #[test]
+    fn every_brush_shader_takes_its_vertices_in_the_world() {
+        let variants: Vec<(&str, String)> = vec![
+            ("trace", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Trace)),
+            ("sources", brush_shader_probe(false, true, false, SsrPath::Inline, BrushProbe::Trace)),
+            ("ssr", brush_shader_probe(true, false, false, SsrPath::Inline, BrushProbe::Trace)),
+            ("ssr trace", brush_shader_probe(true, false, false, SsrPath::Trace, BrushProbe::Trace)),
+            ("ssr composite", brush_shader_probe(true, false, false, SsrPath::Composite, BrushProbe::Trace)),
+            ("probe pass", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Pass)),
+            ("probe pass deferred", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::PassDeferred)),
+            ("probe reader", brush_shader_probe(false, false, false, SsrPath::Inline, BrushProbe::Read)),
+        ];
+        for (name, posed) in variants {
+            if BRUSH_LIGHT_DEBUG {
+                assert!(world_brush_vertices(&posed).is_none());
+                continue;
+            }
+            let world = world_brush_vertices(&posed).unwrap_or_else(|| panic!("{name}: does not open as a brush shader"));
+            for line in ["v.pos = to_player_space(w.pos);", "v.norm = to_player_direction(w.norm);", "to_player_direction(w.tangent.xyz), w.tangent.w", "v.face_centre = to_player_space(w.face_centre);"] {
+                assert_eq!(world.matches(line).count(), 1, "{name}: {line}");
+            }
+
+            assert_eq!(world.replacen(WORLD_BRUSH_VERTEX, POSED_BRUSH_VERTEX, 1), posed, "{name}");
+            let from = posed.find("@fragment fn fs_main(").expect("a fragment stage");
+            assert!(world.ends_with(&posed[from..]), "{name}: the fragment stage changed");
+            naga::front::wgsl::parse_str(&world).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&world)));
+        }
+
+        let [r, g, b] = CRACK_SEAL_COLOUR;
+        let seal = brush_seal_shader_posed(r, g, b);
+        assert_eq!(seal.matches(POSED_SEAL_VERTEX).count(), 1);
+        let world = seal.replacen(POSED_SEAL_VERTEX, WORLD_SEAL_VERTEX, 1);
+        naga::front::wgsl::parse_str(&world).unwrap_or_else(|e| panic!("seal: {}", e.emit_to_string(&world)));
+    }
+
+    #[test]
     fn the_probe_upsample_is_the_depth_aware_bilinear_filter() {
         let Some((device, queue)) = headless_gpu() else {
             eprintln!("skipping: no GPU adapter available");
@@ -4856,7 +5155,7 @@ mod ssr_pipeline_tests {
         const H: u32 = 32;
         const TOLERANCE: f32 = 0.0015;
 
-        const PATTERN: &str = r"
+        const PATTERN: &str = r#"
 fn pass_colour(t: vec2<f32>) -> vec4<f32> {
     let a = 0.25 + 0.5 * fract(t.x * 0.37 + t.y * 0.11);
     return vec4<f32>(vec3<f32>(t.x / 32.0, t.y / 16.0, 0.5) * a, a);
@@ -4896,7 +5195,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
     let t = floor(pos.xy);
     return PassOut(pass_colour(t), vec2<f32>(0.0, pass_code(t)), pass_depth(t));
 }
-";
+"#;
         let layout = probe_pass::bind_group_layout(&device);
         let target = probe_pass::Target::new(&device, &layout, W, H, 1);
         let fill_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -5120,7 +5419,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         let base = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
         for (label, edits) in DEFERRED_REGISTER_CUTS {
             let mut src = base.clone();
-            for (from, to) in *edits {
+            for (from, to) in edits.iter() {
                 assert!(src.contains(from), "{label}: `{from}` is not in the deferring probe pass");
 
                 assert_eq!(src.matches(from).count(), 1, "{label}: `{from}` is in the deferring probe pass more than once");
@@ -5154,7 +5453,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         let base = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
         for (label, edits) in SCENE_REGISTER_CUTS {
             let mut src = base.clone();
-            for (from, to) in *edits {
+            for (from, to) in edits.iter() {
                 assert!(src.contains(from), "{label}: `{from}` is not in the scene shader");
                 src = src.replacen(from, to, 1);
             }
@@ -5208,7 +5507,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         let base = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Pass);
         for (label, edits) in PROBE_PASS_REGISTER_CUTS {
             let mut src = base.clone();
-            for (from, to) in *edits {
+            for (from, to) in edits.iter() {
                 assert!(src.contains(from), "{label}: `{from}` is not in the probe pass shader");
                 src = src.replacen(from, to, 1);
             }
@@ -5311,7 +5610,7 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         const LIGHTS: &str = "let lit = shade_material_lamps(";
         const READ_BACK: &str =
             "let ssr_fallback = textureLoad(ssr_scene_color, vec2<i32>(in.clip.xy), 0).rgb;";
-        {
+        for _ms in [false] {
             let shipped = brush_shader_variant(true, false, false);
             assert!(!shipped.contains(LIGHTS), "the reflective pass shades the surface again");
             assert!(shipped.contains(READ_BACK), "the reflective pass no longer reads the scene's colour");
@@ -5462,7 +5761,7 @@ mod mip_chain_tests {
             for (i, lv) in c.iter().enumerate() {
                 let px = &lv.rgba[0..4];
                 assert!(
-                    px.iter().zip([180u8, 90, 45, 255]).all(|(a, b)| (i32::from(*a) - i32::from(b)).abs() <= 1),
+                    px.iter().zip([180u8, 90, 45, 255]).all(|(a, b)| (*a as i32 - b as i32).abs() <= 1),
                     "srgb={srgb} level {i} drifted to {px:?}",
                 );
             }
@@ -5484,7 +5783,7 @@ mod mip_chain_tests {
         let level1 = &mip_chain(&img, true)[1];
         let got = level1.rgba[0];
         assert!(
-            (i32::from(got) - 188).abs() <= 3,
+            (got as i32 - 188).abs() <= 3,
             "half-lit sRGB averaged to {got}; 128 means it was averaged as raw bytes \
              and every mip is too dark",
         );
@@ -5499,7 +5798,7 @@ mod mip_chain_tests {
         ];
         let img = TerrainImage { width: w, height: h, rgba };
         let a = mip_chain(&img, true)[1].rgba[3];
-        assert!((i32::from(a) - 128).abs() <= 1, "alpha averaged to {a}, not 128");
+        assert!((a as i32 - 128).abs() <= 1, "alpha averaged to {a}, not 128");
     }
 }
 
@@ -5619,7 +5918,7 @@ mod crack_seal_tests {
         let depth_view = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("seal_test_readback"),
-            size: u64::from(256 * SIZE),
+            size: (256 * SIZE) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -5669,9 +5968,9 @@ mod crack_seal_tests {
     fn is_seal(px: [u8; 4]) -> bool {
         let want = |c: f32| (c * 255.0).round() as i32;
         let [r, g, b] = CRACK_SEAL_COLOUR;
-        (i32::from(px[0]) - want(r)).abs() <= 2
-            && (i32::from(px[1]) - want(g)).abs() <= 2
-            && (i32::from(px[2]) - want(b)).abs() <= 2
+        (px[0] as i32 - want(r)).abs() <= 2
+            && (px[1] as i32 - want(g)).abs() <= 2
+            && (px[2] as i32 - want(b)).abs() <= 2
     }
 
     #[test]
@@ -5699,6 +5998,19 @@ mod crack_seal_tests {
             return;
         };
         assert_eq!(px, [255, 255, 255, 255], "a back face behind the wall showed through: {px:?}");
+    }
+
+    /// A BACK FACE A HAIR IN FRONT OF THE WALL STILL LOSES: where a face meets
+    /// its turned-away neighbour, the two depths differ only by rounding, and
+    /// the unbiased seal won in dots down every such edge (`SEAL_DEPTH_BIAS`,
+    /// 2026-10-20). Fails with the bias at zero.
+    #[test]
+    fn a_back_face_within_rounding_of_the_wall_stays_hidden() {
+        let Some(px) = render_seal(true, 0.5, 0.5 + 4e-7) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        assert_eq!(px, [255, 255, 255, 255], "the seal won a tie with the wall: {px:?}");
     }
 }
 
@@ -5878,8 +6190,9 @@ mod normal_variance_roughness_tests {
 
             for (i, (x, y)) in a.rgba.iter().zip(b.rgba.iter()).enumerate() {
                 assert!(
-                    (i32::from(*x) - i32::from(*y)).abs() <= 2,
-                    "level {lvl} byte {i}: flat normals moved roughness {y} -> {x}",
+                    (*x as i32 - *y as i32).abs() <= 2,
+                    "level {lvl} byte {i}: flat normals moved roughness {} -> {}",
+                    y, x,
                 );
             }
         }
@@ -5913,19 +6226,19 @@ mod normal_variance_roughness_tests {
         let base_byte = 60u8;
         let rough = solid(4, 4, [base_byte, base_byte, base_byte, 255]);
         let with = roughness_chain_with_normal_variance(&rough, Some(&opposing(4, 4)));
-        let r = f32::from(base_byte) / 255.0;
+        let r = base_byte as f32 / 255.0;
 
         let expected = ((r * r + NORMAL_VARIANCE_CLAMP).min(1.0)).sqrt();
         let expected_byte = (expected * 255.0).round() as u8;
         let got = with[1].rgba[0];
         assert!(
-            (i32::from(got) - i32::from(expected_byte)).abs() <= 2,
+            (got as i32 - expected_byte as i32).abs() <= 2,
             "variance-space combine wrong: got {got}, expected ~{expected_byte}",
         );
 
         let naive = ((r + NORMAL_VARIANCE_CLAMP).min(1.0) * 255.0).round() as u8;
         assert!(
-            (i32::from(got) - i32::from(naive)).abs() > 2,
+            (got as i32 - naive as i32).abs() > 2,
             "the result matches naive addition ({naive}); the squares are not being used",
         );
     }
@@ -6138,7 +6451,7 @@ mod sun_faces_tests {
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn where_the_readers_instructions_come_from() {
         use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainRole};
         let read = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
@@ -6155,7 +6468,7 @@ mod sun_faces_tests {
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn where_the_probe_passes_instructions_come_from() {
         use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainRole};
         let passes = [
@@ -6168,7 +6481,7 @@ mod sun_faces_tests {
 
         let (_, edits) = DEFERRED_REGISTER_CUTS.iter().find(|(label, _)| *label == "def_dedup_all").unwrap();
         let mut source = brush_shader_probe(false, false, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::PassDeferred);
-        for (from, to) in *edits {
+        for (from, to) in edits.iter() {
             source = source.replacen(from, to, 1);
         }
         println!("{}", crate::renderer::shader_inlining::report("def_dedup_all", &source, "fs_main", 12));

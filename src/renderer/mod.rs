@@ -1,11 +1,19 @@
+pub mod brush_astc;
 pub mod brush_pipeline;
 pub mod camera;
 pub mod character_cards;
 pub mod cuboid;
+mod desktop_effects;
 mod desktop_renderer;
+pub mod mud_map;
 pub mod icon;
 pub mod layer_settings;
 pub mod layered_mesh_pipeline;
+pub mod cave_twins;
+pub mod baked_cave;
+pub mod outdoor_pass;
+pub mod scene_cull;
+pub mod shader_opt;
 pub mod lights;
 pub mod material_wgsl;
 pub mod mesh;
@@ -16,6 +24,7 @@ pub mod dynamic_resolution;
 pub mod panel;
 pub mod glare;
 pub mod effects;
+pub mod effect_asset;
 pub mod particle;
 pub mod pipeline;
 pub mod particle_pipeline;
@@ -26,7 +35,13 @@ pub mod tonemap;
 pub mod exposure;
 pub mod probe_stream;
 pub mod room_light;
+pub mod cloud_pace;
+pub mod frame_governor;
+pub mod mesh_lod;
+pub mod cloud_sky;
+pub mod cloud_worker;
 pub mod sky;
+pub mod sky_motion;
 pub mod time_of_day;
 pub mod ssr;
 pub mod terrain_pipeline;
@@ -34,6 +49,14 @@ pub mod water_pipeline;
 pub mod underwater;
 pub mod weather;
 pub mod ground_cuts;
+pub mod ground_horizon;
+pub mod ground_lod;
+pub mod ground_shape;
+pub mod water_runs;
+pub mod water_wake;
+pub mod planar_water;
+pub mod static_brush;
+pub mod static_solid;
 pub mod ground_twins;
 pub mod uniforms;
 pub mod probe_prefilter;
@@ -48,12 +71,17 @@ pub mod shader_checks;
 pub mod portal_cull;
 pub mod doors;
 pub mod shader_precision;
+#[cfg(test)]
+pub(crate) mod shader_inlining;
+#[cfg(test)]
+pub(crate) mod shader_audit;
 pub mod skin_compute;
 pub mod water_waves;
 pub mod probe_blur;
 pub mod probe_fixup;
 pub mod pool_cards;
 pub mod foveation;
+pub mod fps_hud;
 pub mod visibility_mask;
 pub mod ground_map;
 pub mod proxy_cards;
@@ -66,7 +94,7 @@ pub const RENDER_SCALE: f32 = 0.7;
 
 pub use camera::Camera;
 pub use cuboid::{Cuboid, CuboidShape, CuboidStyle};
-pub use desktop_renderer::{DesktopGround, Renderer};
+pub use desktop_renderer::{DayLight, DesktopGround, Renderer};
 pub use icon::{billboard_rotation, IconAssets, IconKind};
 pub use lights::{Light, LightKind};
 pub use mesh::{load_clips_for, GltfClip, GltfMesh, MeshLightmapUv};
@@ -86,14 +114,14 @@ impl Default for Color3 {
 impl Color3 {
     pub fn to_linear(&self) -> [f32; 4] {
         let c = |v: u8| {
-            let f = f32::from(v) / 255.0;
+            let f = v as f32 / 255.0;
             if f <= 0.04045 {
                 f / 12.92
             } else {
                 ((f + 0.055) / 1.055).powf(2.4)
             }
         };
-        [c(self.0), c(self.1), c(self.2), f32::from(self.3) / 255.0]
+        [c(self.0), c(self.1), c(self.2), self.3 as f32 / 255.0]
     }
 }
 
@@ -107,7 +135,6 @@ pub struct MeshInstance<'a> {
     pub own_light: Option<Light>,
 
     pub tile_caster: bool,
-}
 
-#[cfg(test)]
-pub(crate) mod shader_inlining;
+    pub moves: bool,
+}

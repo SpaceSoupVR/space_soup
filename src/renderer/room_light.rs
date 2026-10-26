@@ -8,7 +8,20 @@ pub const ROOM_EDGE: f32 = 0.5;
 
 const NEAR: f32 = 0.25;
 
+/// The room light at `p`, a point past every room's box taking the outdoor
+/// photographs' (see the fallback below).
 pub fn room_light_at(descs: &[ProbeDesc], p: Vec3) -> RoomLight {
+    room_light_with(descs, p, true)
+}
+
+/// As `room_light_at`, but a point past every box takes the NEAREST
+/// photograph's light: for callers that decide outdoors themselves, as the
+/// effects do by whether the ground buries the point (`effects::room_ambient_now`).
+pub fn room_light_at_or_nearest(descs: &[ProbeDesc], p: Vec3) -> RoomLight {
+    room_light_with(descs, p, false)
+}
+
+fn room_light_with(descs: &[ProbeDesc], p: Vec3, outside_is_outdoors: bool) -> RoomLight {
 
     let mut rooms: Vec<(u32, Vec3, Vec3)> = Vec::new();
     for d in descs.iter().filter(|d| d.room_light.is_some()) {
@@ -36,16 +49,27 @@ pub fn room_light_at(descs: &[ProbeDesc], p: Vec3) -> RoomLight {
     }
 
     if remaining > 0.5 {
-        if let Some(d) = descs
-            .iter()
-            .filter(|d| d.room_light.is_some())
-            .min_by(|a, b| {
-                (a.centre - p)
-                    .length_squared()
-                    .total_cmp(&(b.centre - p).length_squared())
-            })
-        {
-            add(&mut out, &d.room_light.unwrap_or_default(), remaining);
+        // Past every room's box is outdoors: the outdoor photographs' light.
+        // The nearest photograph instead lit test_room's beach rocks, 14 m
+        // past the outdoor box, by the hall's lamps -- white under the night
+        // eye (headset, 2026-10-20). Nearest only for a level with no outdoors.
+        let outdoors = super::probe_stream::outdoor_volume(descs)
+            .filter(|v| outside_is_outdoors && descs.iter().any(|d| d.volume == *v && d.room_light.is_some()));
+        match outdoors {
+            Some(v) => add(&mut out, &photographs_at(descs, v, p), remaining),
+            None => {
+                if let Some(d) = descs
+                    .iter()
+                    .filter(|d| d.room_light.is_some())
+                    .min_by(|a, b| {
+                        (a.centre - p)
+                            .length_squared()
+                            .total_cmp(&(b.centre - p).length_squared())
+                    })
+                {
+                    add(&mut out, &d.room_light.unwrap_or_default(), remaining);
+                }
+            }
         }
     }
     out
@@ -81,6 +105,17 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// A room's light at the time of day: its lamps' share as baked, plus the
+/// daylight share (`full - lamps`, both baked in the bake's daylight) times
+/// `daylight` -- the probes' own relight (`time_of_day::relight_probe_faces`).
+/// With no lamps-only bake every bit of it is daylight. Left as baked, a crate
+/// outdoors kept the day's bounce at night and glowed under the night eye.
+pub fn relit(full: &RoomLight, lamps: Option<&RoomLight>, daylight: f32) -> RoomLight {
+    let zero = [[0.0f32; 3]; 9];
+    let lamps = lamps.unwrap_or(&zero);
+    std::array::from_fn(|i| std::array::from_fn(|c| lamps[i][c] + daylight * (full[i][c] - lamps[i][c])))
+}
+
 pub fn turned_to_player(light: &RoomLight, yaw: f32) -> RoomLight {
     let (s, c) = yaw.sin_cos();
     let (r3, sc, ss, cc) = (3.0f32.sqrt(), s * c, s * s, c * c);
@@ -95,7 +130,7 @@ pub fn turned_to_player(light: &RoomLight, yaw: f32) -> RoomLight {
         out[5][k] = s * l(4) + c * l(5);
         out[6][k] = (1.5 * cc - 0.5) * l(6) + r3 * sc * l(7) + 0.5 * r3 * ss * l(8);
         out[7][k] = -r3 * sc * l(6) + (cc - ss) * l(7) + sc * l(8);
-        out[8][k] = 0.5 * r3 * ss * l(6) - sc * l(7) + f32::midpoint(1.0, cc) * l(8);
+        out[8][k] = 0.5 * r3 * ss * l(6) - sc * l(7) + 0.5 * (1.0 + cc) * l(8);
     }
     out
 }
@@ -197,6 +232,18 @@ mod tests {
     }
 
     #[test]
+    fn a_rooms_light_keeps_its_lamps_and_scales_its_daylight() {
+        let full = sample_light(3);
+        let lamps = sample_light(4);
+        let near = |a: &RoomLight, b: &RoomLight| a.iter().flatten().zip(b.iter().flatten()).all(|(x, y)| (x - y).abs() < 1e-6);
+        assert!(near(&relit(&full, Some(&lamps), 1.0), &full), "in the bake's daylight the light is as baked");
+        assert!(near(&relit(&full, Some(&lamps), 0.0), &lamps), "at night only the lamps are left");
+        let half = relit(&full, Some(&lamps), 0.5);
+        assert!((half[2][1] - 0.5 * (full[2][1] + lamps[2][1])).abs() < 1e-6);
+        assert_eq!(relit(&full, None, 0.0), [[0.0; 3]; 9], "no lamps-only bake: it is all daylight");
+    }
+
+    #[test]
     fn a_model_takes_the_light_of_the_room_it_stands_in() {
         let outdoors = room(
             0,
@@ -250,6 +297,19 @@ mod tests {
             mid > 0.08 && mid < 0.17,
             "a quarter metre short of the doorway, some of each: {mid}"
         );
+    }
+
+    #[test]
+    fn a_model_past_every_rooms_box_takes_the_outdoor_light_not_the_nearest_rooms() {
+        let outdoors = ProbeDesc {
+            has_depth: false,
+            ..room(0, Vec3::splat(-20.0), Vec3::splat(20.0), Vec3::new(0.0, 7.0, -6.0), 0.01)
+        };
+        let hall = room(1, Vec3::new(-3.0, 0.0, -15.0), Vec3::new(3.0, 3.0, 4.0), Vec3::new(0.0, 1.5, 1.3), 0.12);
+        let beach = Vec3::new(-1.2, -1.0, 30.0);
+        assert!((hall.centre - beach).length() < (outdoors.centre - beach).length(), "the hall's photograph is the nearer");
+        let got = even(&room_light_at(&[outdoors, hall], beach));
+        assert!((got - 0.01).abs() < 1e-4, "the beach takes the outdoors' light, not the hall's lamps: {got}");
     }
 
     #[test]

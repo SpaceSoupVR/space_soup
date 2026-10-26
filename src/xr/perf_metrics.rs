@@ -67,10 +67,18 @@ impl PerfMetrics {
         Some(Self { fp, session: raw_session, counters })
     }
 
+    /// One counter's value by its short name (`app/gpu_frametime`).
+    pub fn value(&self, short: &str) -> Option<f64> {
+        self.counters.iter().find(|c| c.short == short).and_then(|c| self.read(c)).map(|s| s.value)
+    }
+
     pub fn sample(&self) -> Vec<Sample> {
-        self.counters
-            .iter()
-            .filter_map(|c| {
+        self.counters.iter().filter_map(|c| self.read(c)).collect()
+    }
+
+    fn read(&self, c: &Counter) -> Option<Sample> {
+        {
+            {
                 let mut counter = xr::sys::PerformanceMetricsCounterMETA {
                     ty: xr::sys::PerformanceMetricsCounterMETA::TYPE,
                     next: ptr::null(),
@@ -101,7 +109,7 @@ impl PerfMetrics {
                     _ => Unit::Generic,
                 };
                 Some(Sample { short: c.short.clone(), value, unit })
-            })
-            .collect()
+            }
+        }
     }
 }

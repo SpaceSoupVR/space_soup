@@ -12,7 +12,10 @@ use super::water_pipeline::{WaterPipeline, WaterUniform, WaterVertex};
 use super::water_waves::{WaveField, WaveParams};
 use super::{ground_map, icon, lights, mesh_pipeline, pipeline, uniforms};
 use super::{Camera, Cuboid, MeshInstance, WorldPanel};
-use spacesoup_graphics::mud::{MudMap, Walkers as MudWalkers};
+use super::mud_map::MudBody;
+
+mod day;
+pub use day::DayLight;
 
 struct CuboidCacheEntry {
     snapshot: CuboidSnapshot,
@@ -40,51 +43,6 @@ struct DesktopWater {
     uniform: WaterUniform,
     waves: WaveField,
     bounds: (glam::Vec3, glam::Vec3),
-}
-
-struct MudBody {
-    map: MudMap,
-    texture: Texture,
-    view: TextureView,
-    walkers: MudWalkers,
-}
-
-impl MudBody {
-    fn new(device: &Device, queue: &Queue, min: [f32; 2], max: [f32; 2]) -> Self {
-        let map = MudMap::new(min, max, spacesoup_graphics::mud::DEFAULT_TEXEL, spacesoup_graphics::mud::MAX_SIDE);
-        let texture = device.create_texture(&TextureDescriptor {
-            label: Some("terrain_deform"),
-            size: Extent3d { width: map.width(), height: map.height(), depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rg8Unorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
-            map.bytes(),
-            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(map.width() * 2), rows_per_image: Some(map.height()) },
-            Extent3d { width: map.width(), height: map.height(), depth_or_array_layers: 1 },
-        );
-        let view = texture.create_view(&TextureViewDescriptor::default());
-        Self { map, texture, view, walkers: MudWalkers::default() }
-    }
-
-    fn flush(&mut self, queue: &Queue) {
-        let Some([_, y0, _, y1]) = self.map.take_dirty() else { return };
-        if y1 <= y0 {
-            return;
-        }
-        let width = self.map.width();
-        queue.write_texture(
-            TexelCopyTextureInfo { texture: &self.texture, mip_level: 0, origin: Origin3d { x: 0, y: y0, z: 0 }, aspect: TextureAspect::All },
-            self.map.rows(y0, y1),
-            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 2), rows_per_image: Some(y1 - y0) },
-            Extent3d { width, height: y1 - y0, depth_or_array_layers: 1 },
-        );
-    }
 }
 
 pub struct DesktopGround {
@@ -146,6 +104,9 @@ pub struct Renderer {
     water_seconds: f64,
     ground: Option<DesktopGround>,
     ground_dirty: bool,
+    effects: Option<super::desktop_effects::DesktopEffects>,
+    /// The time of day on the sky dome (`set_time_of_day`).
+    day: Option<day::DesktopDay>,
 }
 
 impl Renderer {
@@ -224,6 +185,8 @@ impl Renderer {
             water_seconds: 0.0,
             ground: None,
             ground_dirty: false,
+            effects: None,
+            day: None,
         }
     }
 
@@ -231,9 +194,79 @@ impl Renderer {
         self.particles = items;
     }
 
+    fn effects_made(&mut self) -> &mut super::desktop_effects::DesktopEffects {
+        let (device, queue, format, layout) = (&self.device, &self.queue, self.format, &self.uniform_buf.layout);
+        self.effects.get_or_insert_with(|| super::desktop_effects::DesktopEffects::new(device, queue, format, layout))
+    }
+
+    /// The scene's effect emitters, in world space, as the headset is given
+    /// them. The effects pipelines are made on the first that is not empty.
+    pub fn set_effects(&mut self, emitters: Vec<super::effects::EffectEmitter>) {
+        if emitters.is_empty() && self.effects.is_none() {
+            return;
+        }
+        self.effects_made().set_emitters(emitters);
+    }
+
+    pub fn set_effect_library(&mut self, library: super::effects::stack::EffectLibrary) {
+        if library.is_empty() && self.effects.is_none() {
+            return;
+        }
+        self.effects_made().set_library(library);
+    }
+
+    /// The scene's placed effect assets; call after `set_effect_library`.
+    pub fn place_effects(&mut self, placed: &[super::effects::stack::PlacedEffect]) {
+        if placed.is_empty() && self.effects.is_none() {
+            return;
+        }
+        self.effects_made().place(placed);
+    }
+
+    /// Adds an effect asset to the library, or replaces the one of its name
+    /// (an editor's unsaved version): what places or fires it takes the new
+    /// version on its next frame.
+    pub fn put_effect(&mut self, asset: &super::effect_asset::EffectAsset) -> Result<super::effects::stack::EffectId, Vec<super::effect_asset::Issue>> {
+        self.effects_made().put(asset)
+    }
+
+    pub fn effect_id(&self, name: &str) -> Option<super::effects::stack::EffectId> {
+        self.effects.as_ref().and_then(|fx| fx.id(name))
+    }
+
+    pub fn add_burst(&mut self, burst: super::effects::stack::EffectBurst) {
+        self.effects_made().add_burst(burst);
+    }
+
+    /// The effect particles drawn last frame: over, and screened.
+    pub fn effects_counts(&self) -> (u32, u32) {
+        self.effects.as_ref().map_or((0, 0), |fx| fx.counts())
+    }
+
+    pub fn set_effects_overdraw(&mut self, on: bool) {
+        if let Some(fx) = self.effects.as_mut() {
+            fx.set_overdraw(on);
+        }
+    }
+
+    /// The effects' clock in seconds, and the hour of day the mist reads.
+    pub fn set_effects_time(&mut self, seconds: f64, hour: Option<f32>) {
+        if let Some(fx) = self.effects.as_mut() {
+            (fx.seconds, fx.hour) = (seconds, hour);
+        }
+    }
+
     pub fn set_ground(&mut self, ground: Option<DesktopGround>) {
         self.ground = ground;
         self.ground_dirty = true;
+    }
+
+    /// The ground's heights alone, after a sculpt: its look stays as it was.
+    pub fn set_ground_heights(&mut self, heights: ground_map::HeightGrid) {
+        if let Some(g) = self.ground.as_mut() {
+            g.heights = heights;
+            self.ground_dirty = true;
+        }
     }
 
     pub fn set_water(&mut self, bodies: &[(Vec<WaterVertex>, Vec<u32>, WaterUniform, WaveParams)]) {
@@ -256,7 +289,7 @@ impl Renderer {
             self.water_pipeline = Some(made);
         }
         let pipeline = self.water_pipeline.as_ref().expect("made above");
-        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map_or([0.0; 4], |m| m.map.placement());
+        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| m.map.placement()).unwrap_or([0.0; 4]);
         let deform_view = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| &m.view);
         self.water_bodies = bodies
             .iter()
@@ -303,8 +336,8 @@ impl Renderer {
     }
 
     pub fn set_water_time(&mut self, seconds: f32) {
-        let dt = (f64::from(seconds) - self.water_seconds).clamp(0.0, 0.25) as f32;
-        self.water_seconds = f64::from(seconds);
+        let dt = (seconds as f64 - self.water_seconds).clamp(0.0, 0.25) as f32;
+        self.water_seconds = seconds as f64;
         for body in &mut self.water_bodies {
             body.uniform.set_time(self.water_seconds, body.waves.params.loop_seconds);
             self.queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
@@ -319,25 +352,15 @@ impl Renderer {
     /// scar soaked dark. Returns that mud weight so the caller can size the
     /// thrown-up mist.
     pub fn blast_on_mud(&mut self, at: glam::Vec3, radius: f32, depth: f32) -> f32 {
-        let weight = self.mud_weight_at(at.x, at.z);
-        if weight > 0.0 {
-            if let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) {
-                m.map.crater([at.x, at.z], radius, depth * weight);
-            }
-        }
-        weight
+        let Some(t) = self.terrain.as_mut() else { return 0.0 };
+        let Some(m) = t.mud.as_mut() else { return 0.0 };
+        m.blast(t.splat.as_ref(), t.mud_layer, at, radius, depth)
     }
 
     pub fn walkers_on_mud(&mut self, walkers: &[(usize, glam::Vec3)]) {
-        let present: Vec<usize> = walkers.iter().map(|w| w.0).collect();
-        let weights: Vec<(usize, glam::Vec3, f32)> = walkers.iter().map(|(id, p)| (*id, *p, self.mud_weight_at(p.x, p.z))).collect();
-        let Some(m) = self.terrain.as_mut().and_then(|t| t.mud.as_mut()) else { return };
-        let (mut wading, mut prints) = (0, 0);
-        for (id, p, weight) in weights {
-            wading += u32::from(weight >= spacesoup_graphics::mud::MUD_WEIGHT_FLOOR);
-            prints += u32::from(m.walkers.step(&mut m.map, id, [p.x, p.z], weight));
-        }
-        m.walkers.forget_absent(&present);
+        let Some(t) = self.terrain.as_mut() else { return };
+        let Some(m) = t.mud.as_mut() else { return };
+        let (wading, prints) = m.walk(walkers, t.splat.as_ref(), t.mud_layer);
         if prints > 0 {
             log::info!("mud: {wading} on mud, {prints} new print(s) on a {}x{} map", m.map.width(), m.map.height());
         }
@@ -368,45 +391,50 @@ impl Renderer {
         }
         self.ground_dirty = false;
         let sea_line = self.sea_line();
-        let placement = if let Some(g) = self.ground.as_ref() {
-            let started = std::time::Instant::now();
-            let (irradiance, sun) = match self.sky_dome.as_ref() {
-                Some(s) => (s.irradiance, s.sun),
-                None => (
-                    self.sky
-                        .as_ref().map_or_else(|| super::sky::SkyIrradiance::flat(super::sky::AMBIENT), |s| super::sky::SkyIrradiance { sh: s.sh.map(|v| [v[0] * s.intensity, v[1] * s.intensity, v[2] * s.intensity]) }),
-                    None,
-                ),
-            };
-            let map = ground_map::build(
-                &ground_map::GroundInputs {
-                    heights: &g.heights,
-                    sky: &irradiance,
-                    sun: sun.as_ref(),
-                    sky_occlusion: None,
-                    layers: &g.layers,
-                    splat: g.splat.as_ref(),
-                    settings: &g.settings,
+        let placement = match self.ground.as_ref() {
+            Some(g) => {
+                let started = std::time::Instant::now();
+                let (irradiance, sun) = match self.sky_dome.as_ref() {
+                    Some(s) => (s.irradiance, s.sun),
+                    None => (
+                        self.sky
+                            .as_ref()
+                            .map(|s| super::sky::SkyIrradiance { sh: s.sh.map(|v| [v[0] * s.intensity, v[1] * s.intensity, v[2] * s.intensity]) })
+                            .unwrap_or_else(|| super::sky::SkyIrradiance::flat(super::sky::AMBIENT)),
+                        None,
+                    ),
+                };
+                let map = ground_map::build(
+                    &ground_map::GroundInputs {
+                        heights: &g.heights,
+                        sky: &irradiance,
+                        sun: sun.as_ref(),
+                        sky_occlusion: None,
+                        layers: &g.layers,
+                        splat: g.splat.as_ref(),
+                        settings: &g.settings,
+                        sea_line,
+                    },
+                    DESKTOP_GROUND_MAP_SIZE,
+                );
+                let view = ground_map::upload(&self.device, &self.queue, &map);
+                let extent = map.max - map.min;
+                self.uniform_buf.set_ground_map(view);
+                log::info!(
+                    "desktop ground map: {}x{} over {:.0} x {:.0} m, sea line {:.2}, built in {} ms",
+                    map.width,
+                    map.height,
+                    extent.x,
+                    extent.y,
                     sea_line,
-                },
-                DESKTOP_GROUND_MAP_SIZE,
-            );
-            let view = ground_map::upload(&self.device, &self.queue, &map);
-            let extent = map.max - map.min;
-            self.uniform_buf.set_ground_map(view);
-            log::info!(
-                "desktop ground map: {}x{} over {:.0} x {:.0} m, sea line {:.2}, built in {} ms",
-                map.width,
-                map.height,
-                extent.x,
-                extent.y,
-                sea_line,
-                started.elapsed().as_millis()
-            );
-            Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top))
-        } else {
-            self.uniform_buf.set_ground_map(uniforms::default_ground_map(&self.device));
-            None
+                    started.elapsed().as_millis()
+                );
+                Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top))
+            }
+            None => {
+                self.uniform_buf.set_ground_map(uniforms::default_ground_map(&self.device));
+                None
+            }
         };
         let mut probes = self.uniform_buf.probes();
         probes.set_outdoors(None, None, placement);
@@ -430,6 +458,9 @@ impl Renderer {
         rotation_deg: f32,
         intensity: f32,
     ) -> Option<(super::sky::SkyIrradiance, Option<super::sky::SkySun>)> {
+        // A new photograph: a day running on the old one starts again from it.
+        self.day = None;
+        self.post.cloud_map = [[0.0; 4]; 3];
         self.sky_dome = pano.map(|p| {
             super::sky::Sky::new(&self.device, &self.queue, &self.sky_pipeline.layout, p, rotation_deg, intensity)
         });
@@ -449,7 +480,7 @@ impl Renderer {
             pipeline::SolidPipeline::new_double_sided(&self.device, self.format, &self.uniform_buf.layout);
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     pub fn set_terrain(
         &mut self,
         vertices: &[SolidVertex],
@@ -482,8 +513,7 @@ impl Renderer {
         });
         let mut settings = settings;
         if let Some(m) = mud.as_ref() {
-            let [tx, tz] = m.map.texel_metres();
-            settings.deform_texel = tx.max(tz);
+            settings.deform_texel = m.texel_metres();
             log::info!("terrain deform map: {}x{} at {:.3} m, mud layer {mud_layer}", m.map.width(), m.map.height(), settings.deform_texel);
         }
         let material = super::terrain_pipeline::TerrainMaterial::from_layers_deformed(
@@ -529,34 +559,13 @@ impl Renderer {
 
     fn rebind_water(&mut self) {
         let Some(pipeline) = self.water_pipeline.as_ref() else { return };
-        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map_or([0.0; 4], |m| m.map.placement());
-        let view = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map_or(&pipeline.default_mud, |m| &m.view);
+        let placement = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| m.map.placement()).unwrap_or([0.0; 4]);
+        let view = self.terrain.as_ref().and_then(|t| t.mud.as_ref()).map(|m| &m.view).unwrap_or(&pipeline.default_mud);
         for body in &mut self.water_bodies {
             body.uniform.prints = placement;
             self.queue.write_buffer(&body.uniform_buffer, 0, bytemuck::bytes_of(&body.uniform));
             body.bind_groups = pipeline.bind_groups_with(&self.device, &body.uniform_buffer, &body.waves, view);
         }
-    }
-
-    fn mud_weight_at(&self, x: f32, z: f32) -> f32 {
-        let Some(t) = self.terrain.as_ref() else { return 0.0 };
-        let Some(m) = t.mud.as_ref() else { return 0.0 };
-        if t.mud_layer < 0 || !m.map.contains(x, z) {
-            return 0.0;
-        }
-        let Some(s) = t.splat.as_ref() else { return if t.mud_layer == 0 { 1.0 } else { 0.0 } };
-        let p = m.map.placement();
-        let u = ((x - p[0]) * p[2]).clamp(0.0, 1.0);
-        let v = ((z - p[1]) * p[3]).clamp(0.0, 1.0);
-        let ix = ((u * s.width as f32) as u32).min(s.width - 1);
-        let iz = ((v * s.height as f32) as u32).min(s.height - 1);
-        let k = ((iz * s.width + ix) * 4) as usize;
-        let w: Vec<f32> = (0..4).map(|c| f32::from(s.rgba[k + c])).collect();
-        let total: f32 = w.iter().sum();
-        if total <= 0.0 {
-            return 0.0;
-        }
-        w[t.mud_layer as usize] / total
     }
 
     pub fn update_terrain_splat(&mut self, image: &super::terrain_pipeline::TerrainImage) -> bool {
@@ -658,6 +667,9 @@ impl Renderer {
         let (t, v) = Self::make_depth(&self.device, width, height);
         self.depth_texture = t;
         self.depth_view = v;
+        if let Some(fx) = self.effects.as_mut() {
+            fx.depth_moved();
+        }
     }
 
     pub fn render(&mut self, target_view: &TextureView, camera: &Camera, cuboids: &[Cuboid]) {
@@ -708,7 +720,7 @@ impl Renderer {
         self.render_internal(target_view, camera, cuboids, meshes, panels, lights, &[]);
     }
 
-    #[allow(clippy::type_complexity, reason = "one-off callback tuple type used in a single signature")]
+    #[allow(clippy::type_complexity)]
     fn bake_cuboids(
         &mut self,
         cuboids: &[Cuboid],
@@ -806,7 +818,8 @@ impl Renderer {
 
         let focus = camera.position + camera.forward() * (self.sun_shadow_radius * 0.5);
         let sun_view_proj = sun
-            .map_or(glam::Mat4::IDENTITY, |l| shadow::directional_light_matrix(l.direction, focus, self.sun_shadow_radius));
+            .map(|l| shadow::directional_light_matrix(l.direction, focus, self.sun_shadow_radius))
+            .unwrap_or(glam::Mat4::IDENTITY);
 
         let spot_matrices: Vec<shadow::SpotShadowMatrices> = spot_indices
             .iter()
@@ -827,11 +840,23 @@ impl Renderer {
             spot_count: spot_indices.len() as u32,
             sun_dynamic_view_proj: glam::Mat4::IDENTITY,
             sun_dynamic_enabled: false,
+            sun_next_view_proj: glam::Mat4::IDENTITY,
+            sun_blend: [0.0; 4],
         };
         let sky = self.sky.clone().unwrap_or_else(uniforms::SkyUpload::none);
         self.uniform_buf.upload_scene(
             &self.queue, vp, camera.position, &shadow, &sky, &self.post, &uniforms::PlayerUpload::default(),
         );
+
+        let effects_drawn = match self.effects.as_mut() {
+            Some(fx) => {
+                // The open sky's light, as the headset's effects take it outdoors.
+                let dc = sky.sh[0];
+                let ambient = glam::Vec3::new(dc[0], dc[1], dc[2]) * (0.282_095 * sky.intensity);
+                fx.simulate(&self.device, &self.queue, camera, self.height, lights, ambient, self.post.exposure)
+            }
+            None => false,
+        };
 
         let ((solid_verts, solid_indices, solid_ranges), (mut wire_verts, mut wire_indices)) =
             self.bake_cuboids(cuboids);
@@ -913,7 +938,8 @@ impl Renderer {
                 let lightmap_bg = instance
                     .lightmap_key
                     .and_then(|k| self.mesh_lightmaps.get(k))
-                    .map_or(&self.default_mesh_lightmap.bind_group, |t| &t.bind_group);
+                    .map(|t| &t.bind_group)
+                    .unwrap_or(&self.default_mesh_lightmap.bind_group);
 
                 let model = instance.mesh.model_matrix();
                 let centre = model.transform_point3(glam::Vec3::ZERO);
@@ -1045,7 +1071,8 @@ impl Renderer {
                     let lightmap_bg = lightmap_key
                         .as_deref()
                         .and_then(|k| self.cuboid_lightmaps.get(k))
-                        .map_or(&self.default_cuboid_lightmap.bind_group, |t| &t.bind_group);
+                        .map(|t| &t.bind_group)
+                        .unwrap_or(&self.default_cuboid_lightmap.bind_group);
                     pass.set_bind_group(1, lightmap_bg, &[]);
                     pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
                 }
@@ -1106,12 +1133,50 @@ impl Renderer {
             }
 
             if let Some(sky) = self.sky_dome.as_ref().filter(|_| self.sky_visible) {
-                pass.set_pipeline(&self.sky_pipeline.pipeline);
+                pass.set_pipeline(self.sky_pipeline.pick(sky));
                 pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                 pass.set_bind_group(1, &sky.bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
             self.particle_pipeline.draw(&mut pass, &self.uniform_buf.bind_group);
+        }
+
+        if let (true, Some(fx)) = (effects_drawn, self.effects.as_mut()) {
+            // Depth is held read-only so the shader can read it for soft edges.
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("effects_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            fx.draw(&self.device, &mut pass, &self.uniform_buf.bind_group, &self.depth_texture);
+        }
+
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("overlay_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(Operations { load: LoadOp::Load, store: StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
 
             if !overlay_verts.is_empty() {
                 pass.set_pipeline(&self.overlay_pipeline.pipeline);

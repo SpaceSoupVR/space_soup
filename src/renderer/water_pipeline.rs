@@ -57,6 +57,33 @@ fn breaker_front(amp: f32) -> f32 {
 
 const HORIZON_LIFT: (f32, f32) = (4000.0, 15000.0);
 
+/// How far above the eye the far skirt is lifted, as a slope (rise over
+/// distance): 3 mrad, about three eye-buffer pixels above the horizon, so the
+/// mesh's own edge always falls where the sea is already fully transparent
+/// (`HORIZON_IN_FS`). Lifted only to the eye, its edge sat within a pixel of
+/// the true horizon and its triangles drew it, stair-stepped and crawling
+/// (headset sunset, 2026-10-20).
+const HORIZON_CLEAR: f32 = 0.003;
+
+/// The Earth's radius, for the sea's horizon: below the eye by
+/// sqrt(2 h / R) radians from a height h (0.8 mrad from 2 m).
+const EARTH_RADIUS: f32 = 6.371e6;
+
+/// THE SEA'S HORIZON, DRAWN PER PIXEL. The water's coverage of its pixel
+/// against the true horizon of a curved sea, from the pixel's own ray (`v`,
+/// toward the eye: any point drawn at a pixel lies on that ray, lifted skirt
+/// or not, and the player frame turns only about the vertical, so `-v.y` is
+/// the ray's world elevation) and its angular size (`fwidth`): a filtered
+/// straight edge, the
+/// same at every head pose, so it neither steps nor crawls. Blended onto the
+/// sky already drawn beneath it (`Levers::sky_before_water`); from below the
+/// surface it is 1.
+const HORIZON_IN_FS: &str = r#"
+    let horizon_up = cam_pos().y + camera.player_frame.y - water.extinction.w;
+    let horizon_dip = -sqrt(2.0 * max(horizon_up, 0.0) / EARTH_RADIUS);
+    let horizon = select(1.0, saturate(0.5 + (horizon_dip + v.y) / max(fwidth(v.y), 1e-6)), horizon_up > 0.0);
+"#;
+
 fn paws_calm(wind_speed: f32) -> f32 {
     let t = ((wind_speed - 2.0) / 4.0).clamp(0.0, 1.0);
     0.15 + 0.85 * t * t * (3.0 - 2.0 * t)
@@ -78,11 +105,9 @@ const BED_ALBEDO: f32 = 0.45;
 
 pub const WAVE_REACH: f32 = 40.0;
 
-pub const RINGS: usize = 4;
-pub const RING_SECONDS: f32 = 3.0;
-const RING_SPEED: f32 = 0.3;
-const RING_WAVELENGTH: f32 = 0.08;
-const RING_HEIGHT: f32 = 0.006;
+pub const RINGS: usize = 6;
+
+pub const RING_SECONDS: f32 = 8.0;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -100,8 +125,17 @@ pub struct WaterUniform {
 
     pub rings: [[f32; 4]; RINGS],
 
+    pub ring_waves: [[f32; 4]; RINGS],
+
+    pub ring_pools: [[f32; 4]; RINGS],
+
+    pub ring_drops: [[f32; 4]; RINGS],
+
     pub air: [f32; 4],
 
+    pub wake: [f32; 4],
+
+    pub mirror: [f32; 4],
     pub look: [f32; 4],
 
     pub prints: [f32; 4],
@@ -138,14 +172,26 @@ impl WaterUniform {
             waves: [waves.unresolved_slope_variance(), o.swash.max(0.0), WAVE_REACH, SWASH_PERIOD],
             lost: waves.lost_slope_variance(),
             rings: [[0.0; 4]; RINGS],
+            ring_waves: [[0.0; 4]; RINGS],
+            ring_pools: [[0.0; 4]; RINGS],
+            ring_drops: [[0.0; 4]; RINGS],
             air: [paws_calm(waves.wind_speed), o.swell.max(0.0), waves.wind_dir.cos(), waves.wind_dir.sin()],
+            wake: [0.0; 4],
+            mirror: [0.0; 4],
             look: [o.gloss.clamp(0.0, 1.0), o.mud.clamp(0.0, 1.0), 0.0, 0.0],
             prints: [0.0; 4],
         }
     }
 
+    pub fn set_rings(&mut self, r: &crate::renderer::effects::SplashRings<RINGS>) {
+        self.rings = r.rings;
+        self.ring_waves = r.waves;
+        self.ring_pools = r.pools;
+        self.ring_drops = r.drops;
+    }
+
     pub fn set_time(&mut self, seconds: f64, loop_seconds: f32) {
-        self.tiles[3] = seconds.rem_euclid(f64::from(loop_seconds.max(1.0))) as f32;
+        self.tiles[3] = seconds.rem_euclid(loop_seconds.max(1.0) as f64) as f32;
     }
 }
 
@@ -154,7 +200,13 @@ pub struct WaterPipeline {
 
     pub ringless: RenderPipeline,
 
+    pub raining: RenderPipeline,
+
     pub waterline: RenderPipeline,
+
+    pub mirrored: [RenderPipeline; 3],
+    pub mirror_layout: BindGroupLayout,
+    mirror_sampler: Sampler,
     pub material_layout: BindGroupLayout,
     pub default_mud: TextureView,
 
@@ -162,7 +214,25 @@ pub struct WaterPipeline {
 
     pub dual_source: bool,
 
+    pub wake_texture: Texture,
+    wake_view: TextureView,
+
     inputs: WaterInputs,
+    mirror_pipeline_layout: PipelineLayout,
+
+    /// The [`WaterMud::None`] and [`WaterMud::NoPrints`] twins of the
+    /// pipelines above (which are the [`WaterMud::Prints`] set, right for any
+    /// body), built by [`WaterPipeline::ensure_mud`] for the kinds a level has.
+    lean: [Option<WaterSet>; 2],
+}
+
+/// One mud kind's water pipelines, as [`WaterPipeline`] holds the full set.
+pub struct WaterSet {
+    pub pipeline: RenderPipeline,
+    pub ringless: RenderPipeline,
+    pub raining: RenderPipeline,
+    pub waterline: RenderPipeline,
+    pub mirrored: [RenderPipeline; 3],
 }
 
 impl WaterPipeline {
@@ -233,6 +303,7 @@ impl WaterPipeline {
                     count: None,
                 },
                 texture(6, ShaderStages::FRAGMENT, TextureViewDimension::D2),
+                texture(7, ShaderStages::FRAGMENT, TextureViewDimension::D2),
             ],
         });
         let default_mud = device
@@ -242,7 +313,7 @@ impl WaterPipeline {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: TextureDimension::D2,
-                format: TextureFormat::Rg8Unorm,
+                format: crate::renderer::terrain_pipeline::DEFORM_FORMAT,
                 usage: TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             })
@@ -280,9 +351,42 @@ impl WaterPipeline {
         };
 
         let pipeline = build_water(device, &layout, format, blend, samples, view, water_wgsl_with(dual_source, true), "water_pipeline");
+        let raining = build_water(device, &layout, format, blend, samples, view, water_wgsl_raining(dual_source), "water_pipeline_raining");
         let ringless = build_water(device, &layout, format, blend, samples, view, water_wgsl_with(dual_source, false), "water_pipeline_ringless");
         let waterline = build_water(device, &layout, format, blend, samples, view, water_line_wgsl(dual_source), "water_pipeline_waterline");
+        let mirror_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("water_mirror_bgl"),
+            entries: &[
+                texture(0, ShaderStages::FRAGMENT, TextureViewDimension::D2),
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let mirror_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("water_mirror_sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+        let mirror_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("water_mirror_pipeline_layout"),
+            bind_group_layouts: &[Some(camera_layout), Some(&material_layout), Some(&mirror_layout)],
+            immediate_size: 0,
+        });
+        let mirrored = [
+            (water_wgsl_with(dual_source, false), "water_pipeline_mirror_ringless"),
+            (water_wgsl_with(dual_source, true), "water_pipeline_mirror"),
+            (water_wgsl_raining(dual_source), "water_pipeline_mirror_raining"),
+        ]
+        .map(|(src, label)| build_water(device, &mirror_pipeline_layout, format, blend, samples, view, mirrored_wgsl(&src), label));
         let inputs = (layout, format, blend, samples, view);
+        let lean = [None, None];
         if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
 
             for (cut, _) in WATER_CUTS {
@@ -290,7 +394,115 @@ impl WaterPipeline {
             }
         }
 
-        Self { pipeline, ringless, waterline, material_layout, default_mud, sampler, dual_source, inputs }
+        let n = crate::renderer::water_wake::WAKE_N as u32;
+        let wake_texture = device.create_texture(&TextureDescriptor {
+            label: Some("water_wake"),
+            size: Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba16Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let wake_view = wake_texture.create_view(&TextureViewDescriptor::default());
+        Self { pipeline, raining, ringless, waterline, mirrored, mirror_layout, mirror_sampler, material_layout, sampler, dual_source, wake_texture, wake_view, inputs, default_mud, mirror_pipeline_layout, lean }
+    }
+
+    pub fn write_wake(&self, queue: &Queue, texels: &[u16]) {
+        let n = crate::renderer::water_wake::WAKE_N as u32;
+        queue.write_texture(
+            TexelCopyTextureInfo { texture: &self.wake_texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            bytemuck::cast_slice(texels),
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 8), rows_per_image: Some(n) },
+            Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+        );
+    }
+
+    /// Build the pipelines for bodies of `mud`, once; until they are built
+    /// (or if their edits no longer match) such a body draws with the full set.
+    pub fn ensure_mud(&mut self, device: &Device, mud: WaterMud) {
+        if mud == WaterMud::Prints || self.lean[mud.index()].is_some() {
+            return;
+        }
+        let (layout, format, blend, samples, view) = &self.inputs;
+        let dual = self.dual_source;
+        let build = |src: String, mirrored: bool, label: &str| -> Option<RenderPipeline> {
+            let src = water_for_mud(&src, mud)?;
+            Some(match mirrored {
+                true => build_water(device, &self.mirror_pipeline_layout, *format, *blend, *samples, *view, mirrored_wgsl(&src), label),
+                false => build_water(device, layout, *format, *blend, *samples, *view, src, label),
+            })
+        };
+        let set = (|| {
+            Some(WaterSet {
+                pipeline: build(water_wgsl_with(dual, true), false, "water_pipeline_lean")?,
+                ringless: build(water_wgsl_with(dual, false), false, "water_pipeline_lean_ringless")?,
+                raining: build(water_wgsl_raining(dual), false, "water_pipeline_lean_raining")?,
+                waterline: build(water_line_wgsl(dual), false, "water_pipeline_lean_waterline")?,
+                mirrored: [
+                    build(water_wgsl_with(dual, false), true, "water_pipeline_lean_mirror_ringless")?,
+                    build(water_wgsl_with(dual, true), true, "water_pipeline_lean_mirror")?,
+                    build(water_wgsl_raining(dual), true, "water_pipeline_lean_mirror_raining")?,
+                ],
+            })
+        })();
+        if set.is_none() {
+            log::warn!("water: the {mud:?} twin's edits no longer match the shader; those bodies draw with the full one");
+        }
+        self.lean[mud.index()] = set;
+    }
+
+    fn set_for(&self, mud: WaterMud) -> Option<&WaterSet> {
+        match mud {
+            WaterMud::Prints => None,
+            _ => self.lean[mud.index()].as_ref(),
+        }
+    }
+
+    pub fn pipeline_for(&self, mud: WaterMud) -> &RenderPipeline {
+        self.set_for(mud).map_or(&self.pipeline, |s| &s.pipeline)
+    }
+
+    pub fn ringless_for(&self, mud: WaterMud) -> &RenderPipeline {
+        self.set_for(mud).map_or(&self.ringless, |s| &s.ringless)
+    }
+
+    pub fn waterline_for(&self, mud: WaterMud) -> &RenderPipeline {
+        self.set_for(mud).map_or(&self.waterline, |s| &s.waterline)
+    }
+
+    pub fn for_rings(&self, rings: &[f32; 4], drops: &[[f32; 4]; RINGS], mud: WaterMud) -> &RenderPipeline {
+        let set = self.set_for(mud);
+        if drops.iter().any(|d| d[3] > 0.0) {
+            set.map_or(&self.raining, |s| &s.raining)
+        } else if rings[3] > 0.0 {
+            set.map_or(&self.pipeline, |s| &s.pipeline)
+        } else {
+            set.map_or(&self.ringless, |s| &s.ringless)
+        }
+    }
+
+    pub fn mirrored_for_rings(&self, rings: &[f32; 4], drops: &[[f32; 4]; RINGS], mud: WaterMud) -> &RenderPipeline {
+        let mirrored = self.set_for(mud).map_or(&self.mirrored, |s| &s.mirrored);
+        if drops.iter().any(|d| d[3] > 0.0) {
+            &mirrored[2]
+        } else if rings[3] > 0.0 {
+            &mirrored[1]
+        } else {
+            &mirrored[0]
+        }
+    }
+
+    pub fn mirror_group(&self, device: &Device, view: &TextureView) -> BindGroup {
+        device.create_bind_group(&BindGroupDescriptor {
+            label: Some("water_mirror"),
+            layout: &self.mirror_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&self.mirror_sampler) },
+            ],
+        })
     }
 
     pub fn with_cut(&self, device: &Device, cut: &str) -> Option<RenderPipeline> {
@@ -313,11 +525,38 @@ impl WaterPipeline {
                     BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&waves.curvature_views[set]) },
                     BindGroupEntry { binding: 4, resource: BindingResource::TextureView(&waves.foam_view) },
                     BindGroupEntry { binding: 5, resource: BindingResource::Sampler(&self.sampler) },
-                    BindGroupEntry { binding: 6, resource: BindingResource::TextureView(mud) },
+                    BindGroupEntry { binding: 6, resource: BindingResource::TextureView(&self.wake_view) },
+                    BindGroupEntry { binding: 7, resource: BindingResource::TextureView(mud) },
                 ],
             })
         })
     }
+}
+
+const MIRROR_JUMP: f32 = 2.0;
+
+const ENV_LINE: &str = "    let env = outdoor_radiance(p, normalize(to_world_direction(r)), r, rough, clamp(rough * PROBE_ROUGHNESS_MIPS, PROBE_MIN_LOD, PROBE_MAX_LOD));";
+
+pub(crate) fn mirrored_wgsl(src: &str) -> String {
+    assert_eq!(src.matches(ENV_LINE).count(), 1, "the water's reflection line moved");
+    let planar = "    let reach = r * clamp(distance(cam_pos(), in.world_pos), 1.0, 30.0);
+    let image = cam_view_proj() * vec4<f32>(in.world_pos.x + reach.x, in.world_pos.y - reach.y, in.world_pos.z + reach.z, 1.0);
+    let here = cam_view_proj() * vec4<f32>(in.world_pos, 1.0);
+    let flat_uv = vec2<f32>(0.5, -0.5) * here.xy / max(here.w, 1e-4) + vec2<f32>(0.5);
+    var shift = vec2<f32>(0.5, -0.5) * image.xy / max(image.w, 1e-4) + vec2<f32>(0.5) - flat_uv;
+    let jump = length(fwidth(shift) * vec2<f32>(textureDimensions(mirror_tex)));
+    shift = shift * min(MIRROR_JUMP / max(jump, 1e-4), 1.0);
+    var mirror_uv = flat_uv + shift;
+    mirror_uv.x = select(mirror_uv.x, 1.0 - mirror_uv.x, water.mirror.w > 0.5);
+    let env = textureSampleLevel(mirror_tex, mirror_samp, mirror_uv, 0.0).rgb * water.mirror.z;";
+    let decl = "@group(1) @binding(6) var wake_tex: texture_2d<f32>;\n";
+    assert_eq!(src.matches(decl).count(), 1, "the water's bindings moved");
+    let planar = planar.replace("MIRROR_JUMP", &format!("{MIRROR_JUMP:?}"));
+    src.replacen(ENV_LINE, &planar, 1).replacen(
+        decl,
+        &format!("{decl}@group(2) @binding(0) var mirror_tex: texture_2d<f32>;\n@group(2) @binding(1) var mirror_samp: sampler;\n"),
+        1,
+    )
 }
 
 type WaterInputs = (PipelineLayout, TextureFormat, BlendState, u32, crate::renderer::multiview::ViewMode);
@@ -336,22 +575,64 @@ pub(crate) const WATER_CUTS: &[(&str, &[(&str, &str)])] = &[
 
     ("c2", &[("    let c2 = textureSampleBias(wave_curve, wave_samp, q / water.tiles.z, 2, 2.0) * paws;", "    let c2 = vec4<f32>(0.0);")]),
 
-    ("caustics", &[("    let caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, 5.0, thickness)));", "    let caustic = 1.0;")]),
+    // The caustic sum everywhere, deep water too: the shader as it was before
+// the sum was skipped from CAUSTIC_DEEPEST down (the test that the skip
+// changes no pixel draws with it).
+("caustics_everywhere", &[("    if (thickness < CAUSTIC_DEEPEST) {", "    if (true) {")]),
+("caustics", &[("        caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, CAUSTIC_DEEPEST, thickness)));", "        caustic = 1.0;")]),
 
-    ("surf", &[("    if (water.waves.y > 0.0) {\n        let count = swash_count(still_depth, q, water.tiles.w);", "    if (false) {\n        let count = swash_count(still_depth, q, water.tiles.w);")]),
+    ("surf", &[("    if (water.waves.y > 0.0) {\n        let count = swash;", "    if (false) {\n        let count = swash;")]),
 
     ("walk", &[("    if (on_map && bed_shows) {\n        let flat", "    if (false) {\n        let flat")]),
 
     ("no_deep_skip", &[("    let bed_shows = max(max(t_view.x * t_light.x, t_view.y * t_light.y), t_view.z * t_light.z) >= DEEP_SKIP
         || smoothstep(0.0, water.scatter.w, thickness) < 1.0;", "    let bed_shows = true;")]),
 
-    ("beyond", &[("    if (drawn < 1.0 && bed_shows) {\n        beyond", "    if (false) {\n        beyond")]),
+    ("beyond", &[("    if (drawn < 1.0 && bed_shows) {\n        bed_seen", "    if (false) {\n        bed_seen")]),
 
     ("refract", &[("    if (has_map) {\n        let closing", "    if (false) {\n        let closing")]),
 
     ("env", &[("    let env = outdoor_radiance(", "    let env = vec3<f32>(0.0);\n    let env_unused = outdoor_radiance(")]),
 
+    (
+        "env_only",
+        &[
+            ("    let shade = (env_seen * fresnel + glint * wet_gloss + (body + brighter) * (1.0 - fresnel)) * edge;", "    let shade = env_seen;"),
+            ("    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge) * print_shade;", "    let under = vec3<f32>(0.0);"),
+        ],
+    ),
+    (
+        "fresnel_only",
+        &[
+            ("    let shade = (env_seen * fresnel + glint * wet_gloss + (body + brighter) * (1.0 - fresnel)) * edge;", "    let shade = vec3<f32>(fresnel);"),
+            ("    let under = mix(vec3<f32>(1.0), t_view * t_light * dimmer * (1.0 - fresnel), edge) * print_shade;", "    let under = vec3<f32>(0.0);"),
+        ],
+    ),
+
     ("glint", &[("        glint = glint + radiance * WATER_PI * water_ggx(n, v, to_l, a2);\n", "")]),
+
+    // What open sea never shows, all at once (no caustic, walk, view beyond,
+    // refraction, surf or breaker): 28 -> 20 registers, 37% -> 50%
+    // occupancy, 3430 -> 2559 instructions, and the same frame time at
+    // day_sea (23.9 vs 23.6 / 24.6 ms, 2026-10-21) -- the water is held up by
+    // neither, so a deep-water twin was not kept.
+    (
+        "deep",
+        &[
+            ("        caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, CAUSTIC_DEEPEST, thickness)));", "        caustic = 1.0;"),
+            ("    if (on_map && bed_shows) {\n        let flat", "    if (false) {\n        let flat"),
+            ("    if (drawn < 1.0 && bed_shows) {\n        bed_seen", "    if (false) {\n        bed_seen"),
+            ("    if (has_map) {\n        let closing", "    if (false) {\n        let closing"),
+            ("    if (water.waves.y > 0.0) {\n        let count = swash;", "    if (false) {\n        let count = swash;"),
+            ("    if (water.waves.y > 0.0 && still_depth > 0.0 && still_depth < 2.8) {\n        let breaker_count", "    if (false) {\n        let breaker_count"),
+        ],
+    ),
+
+    // Nothing shaded: what the water's mesh, raster and blend cost alone
+    // (the driver strips everything after a constant return). day_sea:
+    // 14.3-16.0 ms against 11.9-12.3 with no water and 23.6-27.2 shipped
+    // (2026-10-21): the water's cost is its fragment shading.
+    ("flat", &[("    let q = in.rest;\n    let span = ", "    if (true) {\n        var flat: FsOut;\n        return flat;\n    }\n    let q = in.rest;\n    let span = ")]),
 
     ("prints", &[("    let colour = mix(shade, foam_light, froth_cover);", "    let colour = vec3<f32>(print.x, print.y, 0.15);")]),
 ];
@@ -359,7 +640,7 @@ pub(crate) const WATER_CUTS: &[(&str, &[(&str, &str)])] = &[
 fn water_with_cut(device: &Device, inputs: &WaterInputs, dual_source: bool, cut: &str) -> Option<RenderPipeline> {
     let (_, edits) = WATER_CUTS.iter().find(|(name, _)| *name == cut)?;
     let mut src = water_wgsl_with(dual_source, false);
-    for (from, to) in *edits {
+    for (from, to) in edits.iter() {
         if src.matches(from).count() != 1 {
             log::warn!("water cut {cut}: `{from}` is not in the shader once");
             return None;
@@ -370,7 +651,7 @@ fn water_with_cut(device: &Device, inputs: &WaterInputs, dual_source: bool, cut:
     Some(build_water(device, layout, *format, *blend, *samples, *view, src, &format!("water_cut_{cut}")))
 }
 
-#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+#[allow(clippy::too_many_arguments)]
 fn build_water(
     device: &Device,
     layout: &PipelineLayout,
@@ -448,7 +729,7 @@ pub fn water_seen(
         unbounded[5] = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
         crate::renderer::shadow::aabb_in_frustum(&unbounded, bounds.0, bounds.1)
     };
-    views.iter().any(meets) && doorways.is_none_or(|d| d.iter().any(meets))
+    views.iter().any(meets) && doorways.map_or(true, |d| d.iter().any(meets))
 }
 
 pub fn swash_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
@@ -472,6 +753,42 @@ pub fn swash_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
     let front = breaker_front(amp);
     let profile = if s > 0.0 { (1.0 + b) * (-b).exp() } else { (-(s * s) / (front * front)).exp() };
     swash * (1.0 - smooth(0.3, 1.5, still_depth)) * rise * (0.5 + 0.5 * amp) + height * profile + swell_lift(u, still_depth, xz)
+}
+
+pub const SHORE_RUN_UP: f32 = 1.3;
+
+pub const SHORE_BAND: f32 = 0.2;
+
+pub const SHORE_CREEP: f32 = 0.007;
+
+const SHORE_WAVES: usize = 4;
+
+pub fn shore_wet_line_most(swash: f32) -> f32 {
+    SHORE_RUN_UP * swash.max(0.0) + SHORE_BAND
+}
+
+pub fn shore_wet_line(t: f32, swash: f32, xz: glam::Vec2) -> f32 {
+    if swash <= 0.0 {
+        return SHORE_BAND;
+    }
+    let smooth = |e0: f32, e1: f32, x: f32| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+
+    const PEAK: f32 = 0.16;
+    let count = swash_count(t, 0.0, xz);
+    let phase = count.rem_euclid(1.0);
+    let mut line = 0.0f32;
+    for back in 0..SHORE_WAVES {
+
+        let since = phase - PEAK + back as f32;
+        let amp = breaker_amp(t - since * SWASH_PERIOD, xz, count - since);
+        let ran = SHORE_RUN_UP * swash * (0.5 + 0.5 * amp);
+        let reach = if since < 0.0 { ran * smooth(0.0, PEAK, phase) } else { ran - SHORE_CREEP * since * SWASH_PERIOD };
+        line = line.max(reach);
+    }
+    line + SHORE_BAND
 }
 
 fn swell_lift(u: &WaterUniform, still_depth: f32, xz: glam::Vec2) -> f32 {
@@ -507,7 +824,7 @@ fn along_wgsl(i: usize) -> String {
 
 pub fn surface_wgsl() -> String {
     format!(
-        r"
+        r#"
 const SWASH_LEAD: f32 = {swash_lead};
 const BREAKER_PER_SWASH: f32 = {breaker_per_swash};
 const BREAK_RATIO: f32 = {break_ratio};
@@ -523,7 +840,12 @@ struct WaterMat {{
     waves: vec4<f32>,
     lost: array<vec4<f32>, {mips}>,
     rings: array<vec4<f32>, {rings}>,
+    ring_waves: array<vec4<f32>, {rings}>,
+    ring_pools: array<vec4<f32>, {rings}>,
+    ring_drops: array<vec4<f32>, {rings}>,
     air: vec4<f32>,
+    wake: vec4<f32>,
+    mirror: vec4<f32>,
     look: vec4<f32>,
     prints: vec4<f32>,
 }}
@@ -579,7 +901,7 @@ fn swell_wave(w: vec4<f32>, xz: vec2<f32>, t: f32, offset: f32) -> vec3<f32> {{
 fn swell_at(xz: vec2<f32>, t: f32) -> vec3<f32> {{
     return swell_wave({swell0}, xz, t, 0.0) + swell_wave({swell1}, xz, t, 2.1) + swell_wave({swell2}, xz, t, 4.2);
 }}
-",
+"#,
         swash_lead = format!("{SWASH_LEAD:?}"),
         along0 = along_wgsl(0),
         along1 = along_wgsl(1),
@@ -607,7 +929,7 @@ fn swell_at(xz: vec2<f32>, t: f32) -> vec3<f32> {{
 
 pub fn surface_fn_wgsl(name: &str, disp: &str) -> String {
     format!(
-        r"
+        r#"
 fn {name}(pos: vec3<f32>, depth: f32, eye: vec3<f32>, t: f32) -> vec3<f32> {{
     var p = pos;
 
@@ -631,41 +953,84 @@ fn {name}(pos: vec3<f32>, depth: f32, eye: vec3<f32>, t: f32) -> vec3<f32> {{
     }}
 
     let far = distance(pos.xz, eye.xz);
-    p.y = mix(p.y, max(p.y, eye.y), smoothstep({lift0}, {lift1}, far));
+    p.y = mix(p.y, max(p.y, eye.y + {clear} * far), smoothstep({lift0}, {lift1}, far));
     return p;
 }}
-",
+"#,
         lift0 = format!("{:?}", HORIZON_LIFT.0),
         lift1 = format!("{:?}", HORIZON_LIFT.1),
+        clear = format!("{HORIZON_CLEAR:?}"),
     )
 }
 
-const RING_BLOCK: &str = r"    if (water.rings[0].w > 0.0) {
-        let resolved = 1.0 - smoothstep(0.25, 0.5, span / RING_WAVELENGTH);
+const RING_BLOCK: &str = r#"    var ring_curve = vec3<f32>(0.0);
+    if (water.rings[0].w > 0.0) {
         for (var i = 0; i < RINGS_N; i = i + 1) {
             let r = water.rings[i];
             if (r.w <= 0.0) {
                 break;
             }
+            let wv = water.ring_waves[i];
+            let pool = water.ring_pools[i];
             let d = q - r.xy;
-            let dist = length(d);
-            let age = r.z;
-            let spread = 0.03 + 0.08 * age;
-            let x = dist - RING_SPEED * age;
-            let k = 2.0 * WATER_PI / RING_WAVELENGTH;
-            let amp = RING_HEIGHT * sqrt(r.w) * exp(-age / 1.1) / sqrt(1.0 + dist * 10.0);
-            let train = exp(-x * x / (2.0 * spread * spread));
-            let rise = amp * resolved * train * -k * sin(k * x);
-            tilt = tilt + d / max(dist, 1e-4) * rise;
+            let dist = max(length(d), 1e-4);
+            let outward = d / dist;
 
-            ring_rough = ring_rough + 0.5 * (amp * k) * (amp * k) * train * (1.0 - resolved);
-            let foam_reach = 0.12 + 0.1 * sqrt(r.w) + 0.15 * age;
-            ring_foam = ring_foam + min(0.35 * sqrt(r.w), 0.6) * exp(-dist * dist / (foam_reach * foam_reach)) * (1.0 - smoothstep(0.4, RING_SECONDS, age));
-        }
+            let from_rim = max(dist - wv.z, 1e-4);
+            let ph = wv.x * r.z * r.z / from_rim;
+            let k = ph / from_rim;
+            let resolved = 1.0 - smoothstep(0.25, 0.5, span * k * (0.5 / WATER_PI));
+            let steep = r.w * k * k * k * k * exp(-k * (wv.y + k * r.z * RING_FILM_DAMPING)) * min(from_rim / wv.z, 1.0) / dist;
+            let s = sin(ph);
+            tilt = tilt - outward * (steep * resolved * s);
+
+            ring_curve = ring_curve - (k * steep * resolved * cos(ph)) * vec3<f32>(outward.x * outward.x, outward.y * outward.y, outward.x * outward.y);
+
+            ring_rough = ring_rough + 0.5 * steep * steep * (1.0 - resolved);
+
+            let bowl = exp(-dist * dist * pool.y);
+            tilt = tilt + d * (wv.w * bowl);
+
+            ring_foam = ring_foam + pool.x * bowl;
+DROPS_FALLING_BACK        }
     }
-";
+"#;
 
-#[cfg(test)]
+const DROPS_BLOCK: &str = r#"            // THE DROPS FALLING BACK round it, each making its own small ring
+
+            let dr = water.ring_drops[i];
+            if (dr.w > 0.0) {
+                let cells = floor(dr.w);
+                let cell = floor(q * cells);
+                let h = fract(sin(dot(cell, vec2<f32>(12.9898, 78.233)) + f32(i) * 1.7) * vec3<f32>(43758.547, 28001.83, 50849.41));
+                let pd = q - (cell + 0.3 + 0.4 * h.xy) / cells;
+                let pr = max(length(pd), 1e-4);
+                let since = dr.z - h.z * pool.w;
+                let band = dist - dr.x;
+                let x = pr - DROP_RING_SPEED * since;
+                let lands = select(0.0, 1.0, since > 0.0 && since < DROP_RING_SECONDS && fract(h.x + h.y * 7.13) < fract(dr.w));
+                let pock = lands * exp(-band * band * dr.y - max(since, 0.0) * DROP_RING_FADE * cells - x * x * DROP_RING_WIDTH);
+                let sharp = 1.0 - smoothstep(0.25, 0.5, span * DROP_RING_K * (0.5 / WATER_PI));
+                tilt = tilt + pd * (DROP_RING_SLOPE * pock * sharp * sin(DROP_RING_K * x) / pr);
+                ring_rough = ring_rough + 0.5 * DROP_RING_SLOPE * DROP_RING_SLOPE * pock * (1.0 - sharp);
+            }
+"#;
+
+const RING_COVER: &str = r#"    let ring_grain = textureSampleBias(foam_tex, wave_samp, q * RING_FOAM_TILES, 1.7).r;
+    cover = max(cover, clamp(min(ring_foam, 1.2) * (0.75 + RING_FOAM_CONTRAST * (ring_grain - RING_FOAM_MEAN)) - 0.2, 0.0, 1.0));
+"#;
+
+const DROP_RING_SPEED: f32 = 0.3;
+const DROP_RING_FADE: f32 = 1.4;
+const DROP_RING_WIDTH: f32 = 7800.0;
+const DROP_RING_K: f32 = 420.0;
+const DROP_RING_SLOPE: f32 = 3.0;
+
+const RING_FOAM_TILES: f32 = 4.0;
+
+const RING_FOAM_MEAN: f32 = 0.35;
+const RING_FOAM_CONTRAST: f32 = 1.6;
+
 fn water_wgsl(dual: bool) -> String {
     water_wgsl_with(dual, true)
 }
@@ -674,7 +1039,7 @@ const WATER_LINE_VIEW: &str = "    let t_view = exp(-k * path);";
 const WATER_LINE_RISING: &str = "    let t_view = select(exp(-k * path), vec3<f32>(0.0), down.y > 0.0);";
 
 fn water_line_wgsl(dual: bool) -> String {
-    const TEST: &str = r"
+    const TEST: &str = r#"
 fn water_line_y(xz: vec2<f32>, eye: vec3<f32>) -> f32 {
     let surface = water.extinction.w;
     var depth = 30.0;
@@ -697,7 +1062,7 @@ fn water_line_under(player: vec3<f32>) -> bool {
     let plane = vec3<f32>(h0, (hx - h0) * 10.0, (hz - h0) * 10.0);
     return plane.x + dot(start.xz - eye.xz, plane.yz) - start.y > 0.0;
 }
-";
+"#;
     let src = water_wgsl_with(dual, true);
     assert_eq!(src.matches("@fragment fn fs_main").count(), 1);
     assert_eq!(src.matches("    return FsOut(").count(), 1);
@@ -708,21 +1073,131 @@ fn water_line_under(player: vec3<f32>) -> bool {
         .replacen("    return FsOut(", "    if (water_line_under(in.world_pos)) {\n        discard;\n    }\n    return FsOut(", 1)
 }
 
+fn water_wgsl_raining(dual: bool) -> String {
+    water_wgsl_parts(dual, true, true)
+}
+
 fn water_wgsl_with(dual: bool, rings: bool) -> String {
-    let ring_block = if rings { RING_BLOCK.replace("RINGS_N", &RINGS.to_string()) } else { String::new() };
+    water_wgsl_parts(dual, rings, false)
+}
+
+/// How much of the mud code a water body's shader carries. Every mud term is
+/// multiplied by `look.y` (the mud), and every print term by the print map,
+/// so a body without them draws the same pixels with that code taken out:
+/// the code would cost by its presence alone (`shader-code-size-costs-when-skipped`).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum WaterMud {
+    /// `look.y == 0`: no mud, so no prints either.
+    None,
+    /// Mud, but no print map (`prints.z == 0`).
+    NoPrints,
+    /// Mud and a print map.
+    Prints,
+}
+
+impl WaterMud {
+    pub const ALL: [WaterMud; 3] = [WaterMud::None, WaterMud::NoPrints, WaterMud::Prints];
+
+    pub fn of(u: &WaterUniform) -> Self {
+        if u.look[1] <= 0.0 {
+            WaterMud::None
+        } else if u.prints[2] <= 0.0 {
+            WaterMud::NoPrints
+        } else {
+            WaterMud::Prints
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+const MUD_PRINTS_FROM: &str = "    var print = vec2<f32>(128.0 / 255.0, 0.0);\n";
+const MUD_PRINTS_TO: &str = "    let sunk_p = max(128.0 / 255.0 - print.x, 0.0) * 2.0;\n";
+const MUD_TILT: &str = "    tilt = wave_tilt * (1.0 - MUD_FLATTEN * mud * (1.0 - wet * MUD_SLUSH_RIPPLE)) + vec2<f32>(grain, grain_b) * MUD_GRAIN_TILT * mud * (1.0 - wet) + print_tilt * MUD_PRINT_TILT * mud;\n";
+const MUD_FROM: &str = "    let mud = water.look.y * (1.0 - smoothstep(MUD_POOL_FROM, MUD_POOL_TO, thickness));\n";
+const MUD_ROUGHNESS: &str = "    let a2 = clamp(max((lost0 + lost1) * shoal * shoal + (lost2 + water.waves.x) * paws * paws + ring_rough, MUD_ROUGH * mud), 4e-4, 1.0);\n";
+const MUD_SHADE: &str = "    let print_shade = (1.0 - MUD_PRINT_DARK * sunk_p * mud) * (1.0 + MUD_PRINT_RIM * print_rim * mud) * (1.0 - MUD_WET_DARK * fresh);\n";
+const MUD_SILT: &str = "    let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud) * print_shade;\n";
+const MUD_BODY: &str = "    let body = water.scatter.rgb * silt * (sky_n * mix(1.0, MUD_SKY_SHARE, mud) + ";
+const MUD_UNDER: &str = ", edge) * print_shade;\n";
+
+/// The water's shader for a body of `mud`: [`WaterMud::Prints`] is the source
+/// as written; the others take out what is zero for them, term by term, so
+/// what remains is the same arithmetic on the same values.
+pub(crate) fn water_for_mud(src: &str, mud: WaterMud) -> Option<String> {
+    let once = |s: &str, from: &str| s.matches(from).count() == 1;
+    if mud == WaterMud::Prints {
+        return Some(src.to_string());
+    }
+    for from in [MUD_PRINTS_FROM, MUD_PRINTS_TO, MUD_TILT, MUD_FROM, MUD_ROUGHNESS, MUD_SHADE, MUD_SILT, MUD_BODY, MUD_UNDER] {
+        if !once(src, from) {
+            return None;
+        }
+    }
+    let (start, end) = (src.find(MUD_PRINTS_FROM)?, src.find(MUD_TILT)? + MUD_TILT.len());
+    let mut s = src.to_string();
+    match mud {
+        WaterMud::None => {
+            let from = src.find(MUD_FROM)?;
+            s.replace_range(from..end, "    let wet_gloss = water.look.x;\n");
+            s = s
+                .replacen(MUD_ROUGHNESS, "    let a2 = clamp((lost0 + lost1) * shoal * shoal + (lost2 + water.waves.x) * paws * paws + ring_rough, 4e-4, 1.0);\n", 1)
+                .replacen(MUD_SHADE, "", 1)
+                .replacen(MUD_SILT, "", 1)
+                .replacen(MUD_BODY, "    let body = water.scatter.rgb * (sky_n + ", 1);
+        }
+        WaterMud::NoPrints => {
+            s.replace_range(
+                start..end,
+                "    let wet_gloss = water.look.x;\n    tilt = tilt * (1.0 - MUD_FLATTEN * mud) + vec2<f32>(grain, grain_b) * MUD_GRAIN_TILT * mud;\n",
+            );
+            s = s
+                .replacen(MUD_SHADE, "", 1)
+                .replacen(MUD_SILT, "    let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud);\n", 1);
+        }
+        WaterMud::Prints => unreachable!(),
+    }
+    Some(s.replacen(MUD_UNDER, ", edge);\n", 1))
+}
+
+fn water_wgsl_parts(dual: bool, rings: bool, drops: bool) -> String {
+    let ring_block = if rings {
+        RING_BLOCK
+            .replace("DROPS_FALLING_BACK", if drops { DROPS_BLOCK } else { "" })
+            .replace("RINGS_N", &RINGS.to_string())
+            .replace("RING_FILM_DAMPING", &format!("{:?}", 2.0 * crate::renderer::effects::RING_FILM_VISCOSITY))
+            .replace("DROP_RING_SECONDS", &format!("{:?}", crate::renderer::effects::DROP_RING_SECONDS))
+            .replace("DROP_RING_SPEED", &format!("{DROP_RING_SPEED:?}"))
+            .replace("DROP_RING_FADE", &format!("{DROP_RING_FADE:?}"))
+            .replace("DROP_RING_WIDTH", &format!("{DROP_RING_WIDTH:?}"))
+            .replace("DROP_RING_K", &format!("{DROP_RING_K:?}"))
+            .replace("DROP_RING_SLOPE", &format!("{DROP_RING_SLOPE:?}"))
+    } else {
+        String::new()
+    };
+    let ring_cover = if rings {
+        RING_COVER
+            .replace("RING_FOAM_TILES", &format!("{RING_FOAM_TILES:?}"))
+            .replace("RING_FOAM_MEAN", &format!("{RING_FOAM_MEAN:?}"))
+            .replace("RING_FOAM_CONTRAST", &format!("{RING_FOAM_CONTRAST:?}"))
+    } else {
+        String::new()
+    };
     let output = if dual {
         "struct FsOut {\n    @location(0) @blend_src(0) colour: vec4<f32>,\n    @location(0) @blend_src(1) through: vec4<f32>,\n}"
     } else {
         "struct FsOut {\n    @location(0) colour: vec4<f32>,\n}"
     };
     let ret = if dual {
-        "return FsOut(vec4<f32>(tonemap(colour) + beyond, 1.0), vec4<f32>(through, 1.0));"
+        "return FsOut(vec4<f32>((mapped + beyond) * horizon, 1.0), vec4<f32>(through * horizon + vec3<f32>(1.0 - horizon), 1.0));"
     } else {
 
-        "return FsOut(vec4<f32>(tonemap(colour) + beyond, 1.0 - dot(through, vec3<f32>(1.0 / 3.0))));"
+        "return FsOut(vec4<f32>((mapped + beyond) * horizon, (1.0 - dot(through, vec3<f32>(1.0 / 3.0))) * horizon));"
     };
-    format!(
-        r"{enable}
+    let src = format!(
+        r#"{enable}
 {lights_block}
 
 const WATER_PI: f32 = 3.14159265;
@@ -743,6 +1218,7 @@ const MUD_GRAIN_TILES: f32 = 2.5;
 const MUD_GRAIN_TILT: f32 = 0.15;
 const MUD_GRAIN_SHADE: f32 = 0.6;
 const MUD_ROUGH: f32 = 0.35;
+const MUD_UNIT: f32 = 1.0 / 255.0;
 const MUD_SKY_SHARE: f32 = 0.5;
 const MUD_PRINT_STEP: f32 = 1.0;
 const MUD_PRINT_TILT: f32 = 0.6;
@@ -755,19 +1231,18 @@ const MUD_WET_DARK: f32 = 0.35;
 const MUD_POOL_FROM: f32 = 0.05;
 const MUD_POOL_TO: f32 = 0.12;
 
+
 const SHELF_SLOPE: f32 = 0.15;
 const FOAM_TILES: f32 = {foam_tiles};
 const BED_ALBEDO: f32 = {bed_albedo};
-const RING_SPEED: f32 = {ring_speed};
 const WATER_TRACE_COARSEN: i32 = 2;
 
 const DEEP_SKIP: f32 = {deep_skip:?};
 const CAUSTIC_CONTRAST: f32 = 0.6;
 const CAUSTIC_MURK: f32 = 1.0;
+// The thickness of water from which no caustic shows.
+const CAUSTIC_DEEPEST: f32 = 5.0;
 const PAWS_RATE: vec2<f32> = vec2<f32>(0.1308997, 0.0785398);
-const RING_WAVELENGTH: f32 = {ring_wavelength};
-const RING_HEIGHT: f32 = {ring_height};
-const RING_SECONDS: f32 = {ring_seconds};
 {surface}
 @group(1) @binding(0) var<uniform> water: WaterMat;
 @group(1) @binding(1) var wave_disp: texture_2d_array<f32>;
@@ -775,14 +1250,15 @@ const RING_SECONDS: f32 = {ring_seconds};
 @group(1) @binding(3) var wave_curve: texture_2d_array<f32>;
 @group(1) @binding(4) var foam_tex: texture_2d<f32>;
 @group(1) @binding(5) var wave_samp: sampler;
-@group(1) @binding(6) var mud_tex: texture_2d<f32>;
+@group(1) @binding(6) var wake_tex: texture_2d<f32>;
+@group(1) @binding(7) var mud_tex: texture_2d<f32>;
 
 struct VIn {{
     @location(0) pos: vec3<f32>,
     @location(1) depth: f32,
 }}
 struct VOut {{
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position) @invariant clip: vec4<f32>,
 
     @location(0) world_pos: vec3<f32>,
 
@@ -815,7 +1291,7 @@ fn bed_at(at: vec3<f32>) -> vec4<f32> {{
     let half_texel = 0.5 / vec2<f32>(textureDimensions(ground_map));
     let edge = clamp(uv, half_texel, vec2<f32>(1.0) - half_texel);
     let g = textureSampleLevel(ground_map, probe_samp, edge, 0.0);
-    return vec4<f32>(g.rgb, g.a - SHELF_SLOPE * length((uv - edge) / camera.ground_params.zw));
+    return vec4<f32>(g.rgb * exp2(camera.proxy_params.w), g.a - SHELF_SLOPE * length((uv - edge) / camera.ground_params.zw));
 }}
 
 fn water_lost(lod: f32) -> vec4<f32> {{
@@ -873,9 +1349,15 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     if (water.air.y > 0.0) {{
         tilt = tilt + water.air.y * smoothstep(0.15, 0.6, still_depth) * swell_at(q, water.tiles.w).yz;
     }}
+    var swash = 0.0;
+    var swash_amp = 0.0;
+    if (water.waves.y > 0.0) {{
+        swash = swash_count(still_depth, q, water.tiles.w);
+        swash_amp = breaker_amp(q, water.tiles.w, swash);
+    }}
     var breaker_phase = 0.0;
     if (water.waves.y > 0.0 && still_depth > 0.0 && still_depth < 2.8) {{
-        let breaker_count = swash_count(still_depth, q, water.tiles.w);
+        let breaker_count = swash;
         breaker_phase = fract(breaker_count);
         let ax = p + vec3<f32>(0.5, 0.0, 0.0);
         let az = p + vec3<f32>(0.0, 0.0, 0.5);
@@ -884,9 +1366,14 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         let dx = px - breaker_phase;
         let dz = pz - breaker_phase;
         let across = vec2<f32>(dx - round(dx), dz - round(dz)) / 0.5;
-        let breaker_size = breaker_amp(q, water.tiles.w, breaker_count);
+        let breaker_size = swash_amp;
         tilt = tilt + breaker_height(still_depth, breaker_size) * breaker_profile_slope(breaker_phase, breaker_size) * across;
     }}
+
+    let wake_uv = (q - water.wake.xy) * water.wake.z;
+    let wake = textureSample(wake_tex, wave_samp, wake_uv);
+    let wake_in = select(0.0, water.wake.w, all(abs(wake_uv - vec2<f32>(0.5)) < vec2<f32>(0.47)));
+    tilt = tilt + wake.xy * wake_in;
 
     var ring_foam = 0.0;
     var ring_rough = 0.0;
@@ -899,10 +1386,10 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     var print_tilt = vec2<f32>(0.0);
     let print_uv = (q - water.prints.xy) * water.prints.zw;
     if (water.prints.z > 0.0 && all(print_uv > vec2<f32>(0.0)) && all(print_uv < vec2<f32>(1.0))) {{
-        print = textureSampleLevel(mud_tex, wave_samp, print_uv, 0.0).rg;
+        print = textureSampleLevel(mud_tex, wave_samp, print_uv, 0.0).rg * MUD_UNIT;
         let e = water.prints.zw * MUD_PRINT_STEP;
-        let dx = textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(e.x, 0.0), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(e.x, 0.0), 0.0).r;
-        let dz = textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(0.0, e.y), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(0.0, e.y), 0.0).r;
+        let dx = (textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(e.x, 0.0), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(e.x, 0.0), 0.0).r) * MUD_UNIT;
+        let dz = (textureSampleLevel(mud_tex, wave_samp, print_uv + vec2<f32>(0.0, e.y), 0.0).r - textureSampleLevel(mud_tex, wave_samp, print_uv - vec2<f32>(0.0, e.y), 0.0).r) * MUD_UNIT;
         print_tilt = -vec2<f32>(dx, dz);
         print_rim = smoothstep(0.05, 0.5, length(vec2<f32>(dx, dz))) * max(print.x - 128.0 / 255.0, 0.0) * 2.0;
     }}
@@ -913,7 +1400,41 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let wet_gloss = mix(water.look.x, 1.0, wet);
     tilt = wave_tilt * (1.0 - MUD_FLATTEN * mud * (1.0 - wet * MUD_SLUSH_RIPPLE)) + vec2<f32>(grain, grain_b) * MUD_GRAIN_TILT * mud * (1.0 - wet) + print_tilt * MUD_PRINT_TILT * mud;
     let n = normalize(to_player_direction(vec3<f32>(-tilt.x, 1.0, -tilt.y)));
+    // The waves' curvature and whitecaps, folded as soon as the normal is
+    // built: the three curvature texels then die here, not at the caustics
+    // near the end, and the shading between carries one vec3 for them
+    // instead of three vec4s (the caustics' registers were 17% of the draw).
+    let fine = 0.5 * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N * 0.25 / water.tiles.z));
+    let mid = max(shoal, 0.6) * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N / water.tiles.y));
+    let curve = c0.xyz * (0.5 * shoal) + c1.xyz * mid + c2.xyz * fine + vec3<f32>(wake.zw * wake_in, 0.0){ring_curve};
+    let caps = max(c0.w, c1.w) * shoal;
+    // The surf and the foam's cover, from the same early values: the swash and
+    // the bubbles die here too, before the reflection and the lights.
+    var surf = 0.0;
+    if (water.waves.y > 0.0) {{
+        let count = swash;
+        let phase = fract(count);
 
+        let patchy = 0.5 + 0.5 * sin(dot(q, vec2<f32>(0.41, 0.17)) + 1.3 * sin(dot(q, vec2<f32>(-0.23, 0.37)) + water.tiles.w * 0.0785398));
+
+        let s = phase - round(phase);
+        let amp = swash_amp;
+        let grown = BREAKER_PER_SWASH * water.waves.y * amp * (1.0 - smoothstep(1.2, 2.8, still_depth));
+        let holds = grown / max(BREAK_RATIO * still_depth, 1e-3);
+        let spilling = smoothstep(0.75, 1.0, holds) * exp(-(s - 0.008) * (s - 0.008) / (0.012 * 0.012));
+        let broken = smoothstep(1.0, 1.4, holds) * smoothstep(-0.02, 0.1, still_depth);
+        let face = exp(-(s + 0.012) * (s + 0.012) / (0.03 * 0.03));
+        let trail = select(0.0, exp(-s / 0.05), s > 0.0);
+        let breaker = max(spilling, broken * max(face, 0.65 * trail)) * mix(0.3, 1.0, patchy);
+        let wash = smoothstep(0.0, 0.04, phase) * (1.0 - smoothstep(0.08, 0.4, phase))
+            * (1.0 - smoothstep(0.0, 0.25, thickness)) * (1.0 - smoothstep(0.0, 0.6, still_depth))
+
+            * smoothstep(0.1, 0.75, amp);
+        surf = max(breaker, wash) + 0.18 * patchy * (1.0 - smoothstep(0.0, 0.2, thickness));
+    }}
+    let froth = clamp(caps + surf, 0.0, 1.0);
+    var cover = clamp((bubbles - (1.0 - froth)) * 4.0, 0.0, 1.0) * smoothstep(0.0, 0.05, froth);
+{ring_cover}
     let lost0 = water_lost(log2(max(span * WAVE_N / water.tiles.x, 1e-6))).x;
     let lost1 = water_lost(log2(max(span * WAVE_N / water.tiles.y, 1e-6))).y;
     let lost2 = water_lost(log2(max(span * WAVE_N / water.tiles.z, 1e-6))).z;
@@ -921,7 +1442,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let rough = sqrt(sqrt(a2));
 
     let v = normalize(cam_pos() - in.world_pos);
-    let fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+{horizon}    let fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
 
     var r = reflect(-v, n);
     r.y = max(r.y, 0.002);
@@ -1013,56 +1534,37 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         drawn = (1.0 - lip) * (1.0 - smoothstep(2.0, 4.0, seen / max(flat, 1e-4))) * smoothstep(rim_in, rim_out, from_edge);
     }}
 
-    let sky_down = sky_irradiance(vec3<f32>(0.0, 1.0, 0.0));
+    let sky_down = sky_irradiance_up();
+    let sky_n = sky_irradiance(n);
     let print_shade = (1.0 - MUD_PRINT_DARK * sunk_p * mud) * (1.0 + MUD_PRINT_RIM * print_rim * mud) * (1.0 - MUD_WET_DARK * fresh);
     let silt = mix(1.0, 1.0 + MUD_GRAIN_SHADE * (grain + 0.5 * grain_b), mud) * print_shade;
-    let body = water.scatter.rgb * silt * (sky_irradiance(n) * mix(1.0, MUD_SKY_SHARE, mud) + sunlight * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0)) * (vec3<f32>(1.0) - t_view);
+    let body = water.scatter.rgb * silt * (sky_n * mix(1.0, MUD_SKY_SHARE, mud) + sunlight * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0)) * (vec3<f32>(1.0) - t_view);
 
-    let fine = 0.5 * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N * 0.25 / water.tiles.z));
-    let mid = max(shoal, 0.6) * (1.0 - smoothstep(0.08, 0.3, span * WAVE_N / water.tiles.y));
-    let curve = c0.xyz * (0.5 * shoal) + c1.xyz * mid + c2.xyz * fine;
-    let focus = thickness * (1.0 - 1.0 / IOR_WATER);
-    let jx = 1.0 - focus * curve.x;
-    let jz = 1.0 - focus * curve.y;
-    let jxz = focus * curve.z;
+    // THE CAUSTICS only where they can show. From CAUSTIC_DEEPEST of water
+    // down their contrast is zero (the smoothstep below is 1 there), so the
+    // sum is skipped and `caustic` keeps exactly the 1.0 it would have come
+    // to. Open sea is all of that, and it was 17% of the water draw's clocks
+    // at day_sea (2026-10-21).
+    var caustic = 1.0;
+    if (thickness < CAUSTIC_DEEPEST) {{
+        let focus = thickness * (1.0 - 1.0 / IOR_WATER);
+        let jx = 1.0 - focus * curve.x;
+        let jz = 1.0 - focus * curve.y;
+        let jxz = focus * curve.z;
 
-    let det = jx * jz - jxz * jxz;
-    let gather = inverseSqrt(det * det + 0.0625);
+        let det = jx * jz - jxz * jxz;
+        let gather = inverseSqrt(det * det + 0.0625);
 
-    let murk = exp(-(water.extinction.x + water.extinction.y + water.extinction.z) * (1.0 / 3.0) * thickness * CAUSTIC_MURK);
-    let caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, 5.0, thickness)));
+        let murk = exp(-(water.extinction.x + water.extinction.y + water.extinction.z) * (1.0 / 3.0) * thickness * CAUSTIC_MURK);
+        caustic = mix(1.0, gather, CAUSTIC_CONTRAST * murk * (1.0 - smoothstep(1.5, CAUSTIC_DEEPEST, thickness)));
+    }}
     let sun_on_bed = BED_ALBEDO * sunlight * t_light;
     let sky_on_bed = BED_ALBEDO * sky_down * t_light;
     let sun_share = dot(sun_on_bed, vec3<f32>(1.0)) / max(dot(sun_on_bed + sky_on_bed, vec3<f32>(1.0)), 1e-4);
     let brighter = max(caustic - 1.0, 0.0) * sun_on_bed * t_view;
     let dimmer = 1.0 + min(caustic - 1.0, 0.0) * sun_share;
 
-    let caps = max(c0.w, c1.w) * shoal;
-    var surf = 0.0;
-    if (water.waves.y > 0.0) {{
-        let count = swash_count(still_depth, q, water.tiles.w);
-        let phase = fract(count);
-
-        let patchy = 0.5 + 0.5 * sin(dot(q, vec2<f32>(0.41, 0.17)) + 1.3 * sin(dot(q, vec2<f32>(-0.23, 0.37)) + water.tiles.w * 0.0785398));
-
-        let s = phase - round(phase);
-        let amp = breaker_amp(q, water.tiles.w, count);
-        let grown = BREAKER_PER_SWASH * water.waves.y * amp * (1.0 - smoothstep(1.2, 2.8, still_depth));
-        let holds = grown / max(BREAK_RATIO * still_depth, 1e-3);
-        let spilling = smoothstep(0.75, 1.0, holds) * exp(-(s - 0.008) * (s - 0.008) / (0.012 * 0.012));
-        let broken = smoothstep(1.0, 1.4, holds) * smoothstep(-0.02, 0.1, still_depth);
-        let face = exp(-(s + 0.012) * (s + 0.012) / (0.03 * 0.03));
-        let trail = select(0.0, exp(-s / 0.05), s > 0.0);
-        let breaker = max(spilling, broken * max(face, 0.65 * trail)) * mix(0.3, 1.0, patchy);
-        let wash = smoothstep(0.0, 0.04, phase) * (1.0 - smoothstep(0.08, 0.4, phase))
-            * (1.0 - smoothstep(0.0, 0.25, thickness)) * (1.0 - smoothstep(0.0, 0.6, still_depth))
-
-            * smoothstep(0.1, 0.75, amp);
-        surf = max(breaker, wash) + 0.18 * patchy * (1.0 - smoothstep(0.0, 0.2, thickness));
-    }}
-    let froth = clamp(caps + surf + ring_foam, 0.0, 1.0);
-    let cover = clamp((bubbles - (1.0 - froth)) * 4.0, 0.0, 1.0) * smoothstep(0.0, 0.05, froth);
-    let foam_light = 0.8 * (sky_irradiance(n) + sunlight);
+    let foam_light = 0.8 * (sky_n + sunlight);
 
     let edge = smoothstep(0.0, water.scatter.w, thickness);
     let lip = smoothstep(0.0, 0.015, thickness);
@@ -1072,14 +1574,27 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let colour = mix(shade, foam_light, froth_cover);
 
     var beyond = vec3<f32>(0.0);
+    var bed_seen = vec3<f32>(0.0);
+    var bed_beyond = false;
     if (drawn < 1.0 && bed_shows) {{
-        beyond = under * tonemap(bed_at(p + refracted * path).xyz) * ((1.0 - drawn) * (1.0 - froth_cover));
+        bed_seen = bed_at(p + refracted * path).xyz;
+        bed_beyond = true;
+    }}
+    var mapped = vec3<f32>(0.0);
+    for (var k = 0u; k < select(1u, 2u, bed_beyond); k = k + 1u) {{
+        let toned = tonemap(select(colour, bed_seen, k == 1u));
+        if (k == 0u) {{
+            mapped = toned;
+        }} else {{
+            beyond = under * toned * ((1.0 - drawn) * (1.0 - froth_cover));
+        }}
     }}
     let through = under * (drawn * (1.0 - froth_cover));
     {ret}
 }}
-",
+"#,
         enable = if dual { "enable dual_source_blending;" } else { "" },
+        horizon = HORIZON_IN_FS.replace("EARTH_RADIUS", &format!("{EARTH_RADIUS:?}")),
         lights_block = wgsl_lights_block(0, 1),
         mips = MIPS,
         wave_n = format!("{:.1}", WAVE_N as f32),
@@ -1089,16 +1604,21 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
         lip_buried = format!("{:?}", spacesoup_graphics::ground::LIP_BURIED),
         lip_ramp = format!("{:?}", spacesoup_graphics::ground::LIP_RAMP),
         ring_block = ring_block,
-        ring_speed = format!("{RING_SPEED:?}"),
+        ring_curve = if rings { " + ring_curve" } else { "" },
+        ring_cover = ring_cover,
         deep_skip = 0.5f32 / 255.0,
-        ring_wavelength = format!("{RING_WAVELENGTH:?}"),
-        ring_height = format!("{RING_HEIGHT:?}"),
-        ring_seconds = format!("{RING_SECONDS:?}"),
         output = output,
         ret = ret,
         surface = surface_wgsl(),
         surface_fn = surface_fn_wgsl("water_surface", "wave_disp"),
-    )
+    );
+    // The sky reflection once, not in both of `outdoor_radiance`'s ways out:
+    // the ground's outdoor pass ships with the same edit. Bought the room the
+    // sea's horizon needed under the instruction cache (2,442 -> 2,323 by the
+    // proxy, 2026-10-21).
+    let (from, to) = crate::renderer::brush_pipeline::DEDUP_OUTDOOR_SKY;
+    assert_eq!(src.matches(from).count(), 1, "the water lost outdoor_radiance's two ways out");
+    src.replacen(from, to, 1)
 }
 
 #[cfg(test)]
@@ -1146,6 +1666,12 @@ mod tests {
         sun: Option<Vec3>,
         shallow: [f32; 3],
         deep: [f32; 3],
+
+        mud: f32,
+        lean: Option<WaterMud>,
+        lopsided_sky: bool,
+        /// A `WATER_CUTS` variant drawn in place of the shader.
+        cut: Option<&'static str>,
     }
 
     fn case(dual: bool) -> Case {
@@ -1159,6 +1685,10 @@ mod tests {
             sun: None,
             shallow: [0.30, 0.70, 0.75],
             deep: [0.01, 0.04, 0.07],
+            mud: 0.0,
+            lean: None,
+            lopsided_sky: false,
+            cut: None,
         }
     }
 
@@ -1202,12 +1732,18 @@ mod tests {
             glam::Mat4::IDENTITY,
             c.eye,
             &ShadowUpload::disabled(),
-            &crate::renderer::uniforms::SkyUpload::none(),
+            &match c.lopsided_sky {
+                true => crate::renderer::uniforms::SkyUpload {
+                    intensity: 1.0,
+                    sh: std::array::from_fn(|i| [0.4 - 0.03 * i as f32, 0.1 + 0.05 * i as f32, 0.25 * (i % 3) as f32, 0.0]),
+                },
+                false => crate::renderer::uniforms::SkyUpload::none(),
+            },
             &crate::renderer::uniforms::PostUpload::default(),
             &PlayerUpload { offset: c.walked, yaw: 0.0, ..Default::default() },
         );
 
-        let pipeline = WaterPipeline::new_with(
+        let mut pipeline = WaterPipeline::new_with(
             &device,
             format,
             &uniforms.layout,
@@ -1218,10 +1754,15 @@ mod tests {
         let params = WaveParams { wind_speed: c.wind, fetch: 2000.0, ..Default::default() };
         let waves = WaveField::new(&device, &queue, params);
         let mut u = WaterUniform::new(
-            &WaterOptics { height: 0.0, shallow: c.shallow, deep: c.deep, depth_scale: 1.0, shore_fade: 0.25, swash: 0.0, swell: 0.0, gloss: 1.0, mud: 0.0 },
+            &WaterOptics { height: 0.0, shallow: c.shallow, deep: c.deep, depth_scale: 1.0, shore_fade: 0.25, swash: 0.0, swell: 0.0, gloss: 1.0, mud: c.mud },
             &params,
         );
         u.waves[2] = 0.0;
+        if let Some(mud) = c.lean {
+            pipeline.ensure_mud(&device, mud);
+            assert!(mud == WaterMud::Prints || pipeline.lean[mud.index()].is_some(), "{mud:?}: the twin did not build");
+            assert_eq!(WaterMud::of(&u), mud, "the case's water is not a {mud:?} body");
+        }
         let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("water_test_uniform"),
             contents: bytemuck::bytes_of(&u),
@@ -1262,7 +1803,7 @@ mod tests {
         let dv = depth_tex.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("water_test_readback"),
-            size: u64::from(256 * SIZE),
+            size: (256 * SIZE) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1290,7 +1831,8 @@ mod tests {
                 multiview_mask: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&pipeline.pipeline);
+            let cut = c.cut.map(|name| pipeline.with_cut(&device, name).expect("the cut builds"));
+            pass.set_pipeline(cut.as_ref().unwrap_or_else(|| c.lean.map_or(&pipeline.pipeline, |mud| pipeline.pipeline_for(mud))));
             pass.set_bind_group(0, &uniforms.bind_group, &[]);
             pass.set_bind_group(1, &groups[waves.current()], &[]);
             pass.set_vertex_buffer(0, vb.slice(..));
@@ -1322,7 +1864,7 @@ mod tests {
     fn shows_through(c: Case) -> Option<[i32; 3]> {
         let white = render(&Case { bed: [1.0; 3], ..c })?;
         let black = render(&Case { bed: [0.0; 3], ..c })?;
-        Some([0, 1, 2].map(|i| i32::from(white[i]) - i32::from(black[i])))
+        Some([0, 1, 2].map(|i| white[i] as i32 - black[i] as i32))
     }
 
     fn sum(c: [i32; 3]) -> i32 {
@@ -1340,11 +1882,73 @@ mod tests {
     }
 
     #[test]
+    fn the_mud_twins_draw_the_waters_own_pixels() {
+        let mut drawn = 0;
+        for dual in [false, true] {
+            for (eye, wind, depth, sun) in [
+                (OVERHEAD, 0.0, 1.0, None),
+                (OVERHEAD, 9.0, 0.4, Some(Vec3::new(0.3, -1.0, 0.2))),
+                (GRAZING, 6.0, 3.0, Some(Vec3::new(-0.2, -0.4, -1.0))),
+                (DOWN_THE_SLOPE, 12.0, 0.05, Some(Vec3::new(0.0, -1.0, 0.6))),
+            ] {
+                for (mud, lean) in [(0.0, WaterMud::None), (0.6, WaterMud::NoPrints)] {
+                    let c = Case { eye, wind, depth, sun, mud, lopsided_sky: true, ..case(dual) };
+                    let Some(full) = render_image(&c) else { return };
+                    let twin = render_image(&Case { lean: Some(lean), ..c }).unwrap();
+                    assert_eq!(full, twin, "{lean:?} twin, dual {dual}, eye {eye}, wind {wind}, depth {depth}");
+                    drawn += 1;
+                }
+            }
+        }
+        eprintln!("{drawn} views byte-identical");
+    }
+
+
+    #[test]
+    fn deep_water_skips_the_caustic_sum_and_draws_the_same_pixels() {
+        let mut drawn = 0;
+        for dual in [false, true] {
+            for (eye, wind, depth) in [(OVERHEAD, 9.0, 4.0), (OVERHEAD, 9.0, 5.0), (OVERHEAD, 6.0, 7.5), (GRAZING, 6.0, 12.0), (DOWN_THE_SLOPE, 12.0, 6.0)] {
+                let c = Case { eye, wind, depth, sun: Some(Vec3::new(0.3, -1.0, 0.2)), lopsided_sky: true, ..case(dual) };
+                let Some(skipped) = render_image(&c) else { return };
+                let summed = render_image(&Case { cut: Some("caustics_everywhere"), ..c }).unwrap();
+                assert_eq!(skipped, summed, "dual {dual}, eye {eye}, wind {wind}, depth {depth}");
+                drawn += 1;
+            }
+            // The control: in shallow water the caustics show, so taking them
+            // out must change the picture -- these views can see them.
+            let shallow = Case { eye: OVERHEAD, wind: 9.0, depth: 1.0, sun: Some(Vec3::new(0.3, -1.0, 0.2)), lopsided_sky: true, ..case(dual) };
+            assert_ne!(render_image(&shallow).unwrap(), render_image(&Case { cut: Some("caustics"), ..shallow }).unwrap(), "dual {dual}: no caustic to see");
+        }
+        eprintln!("{drawn} views byte-identical");
+    }
+
+    /// Writes a set of views to `$WATER_DUMP` (one file per path), for
+    /// comparing a rewrite of the shader with the shader before it.
+    #[test]
+    #[ignore]
+    fn dump_water_views() {
+        let Ok(out) = std::env::var("WATER_DUMP") else { return };
+        for dual in [false, true] {
+            let mut bytes = Vec::new();
+            for (eye, wind, depth, mud) in [
+                (OVERHEAD, 9.0, 0.3, 0.0), (OVERHEAD, 9.0, 1.0, 0.0), (OVERHEAD, 6.0, 3.0, 0.0), (OVERHEAD, 6.0, 7.0, 0.0),
+                (GRAZING, 6.0, 2.0, 0.0), (GRAZING, 12.0, 12.0, 0.0), (DOWN_THE_SLOPE, 12.0, 0.05, 0.0), (DOWN_THE_SLOPE, 4.0, 1.5, 0.6),
+            ] {
+                let c = Case { eye, wind, depth, mud, sun: Some(Vec3::new(0.3, -1.0, 0.2)), lopsided_sky: true, ..case(dual) };
+                let Some(img) = render_image(&c) else { return };
+                bytes.extend(img.iter().flatten());
+            }
+            std::fs::write(format!("{out}.{dual}"), bytes).unwrap();
+        }
+    }
+
+    #[test]
     fn the_water_shader_compiles_and_draws() {
 
         each_path(|dual| {
             let px = render(&Case { eye: GRAZING, ..case(dual) }).unwrap();
-            assert!(u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2]) > 0, "water drew nothing over a black bed ({dual}): {px:?}");
+            assert!(px[0] as u32 + px[1] as u32 + px[2] as u32 > 0, "water drew nothing over a black bed ({dual}): {px:?}");
         });
     }
 
@@ -1387,7 +1991,7 @@ mod tests {
         each_path(|dual| {
             let brink = render(&Case { depth: 0.001, bed: [0.6; 3], ..case(dual) }).unwrap();
             let body = render(&Case { depth: 2.0, bed: [0.6; 3], ..case(dual) }).unwrap();
-            let off = |px: [u8; 4]| (0..3).map(|i| (i32::from(px[i]) - 153).abs()).max().unwrap();
+            let off = |px: [u8; 4]| (0..3).map(|i| (px[i] as i32 - 153).abs()).max().unwrap();
             assert!(off(brink) <= 3, "the shoreline must leave the bed untouched ({dual}): {brink:?}");
             assert!(off(body) > 20, "two metres of water must change what is under it ({dual}): {body:?}");
         });
@@ -1422,7 +2026,7 @@ mod tests {
             let c = Case { depth: 20.0, ..case(dual) };
             let mirrored = render(&Case { sun: Some(Vec3::NEG_Y), ..c }).unwrap();
             let aside = render(&Case { sun: Some(Vec3::new(1.0, -0.3, 0.0)), ..c }).unwrap();
-            let lum = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
+            let lum = |p: [u8; 4]| p[0] as u32 + p[1] as u32 + p[2] as u32;
             assert!(lum(mirrored) > lum(aside) + 60, "no glint from a mirrored sun ({dual}): {mirrored:?} vs {aside:?}");
         });
     }
@@ -1463,7 +2067,7 @@ mod tests {
         for (cut, edits) in WATER_CUTS {
             for dual in [false, true] {
                 let mut src = water_wgsl_with(dual, false);
-                for (from, to) in *edits {
+                for (from, to) in edits.iter() {
                     assert_eq!(src.matches(from).count(), 1, "water cut {cut}: {from}");
                     src = src.replacen(from, to, 1);
                 }
@@ -1473,6 +2077,57 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{cut}: {}", e.emit_to_string(&src)));
             }
         }
+    }
+
+    #[test]
+    fn every_water_twin_validates_and_fits_the_quest_3s_inter_stage_limit() {
+        const QUEST3_MAX_INTER_STAGE_LOCATIONS: u32 = 15;
+        for dual in [false, true] {
+            let twins = [
+                ("ringless", water_wgsl_with(dual, false)),
+                ("ringed", water_wgsl_with(dual, true)),
+                ("raining", water_wgsl_raining(dual)),
+                ("waterline", water_line_wgsl(dual)),
+                ("mirror ringless", mirrored_wgsl(&water_wgsl_with(dual, false))),
+                ("mirror ringed", mirrored_wgsl(&water_wgsl_with(dual, true))),
+                ("mirror raining", mirrored_wgsl(&water_wgsl_raining(dual))),
+            ];
+            for (what, src) in twins {
+                let module = wgpu::naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{what}: {}", e.emit_to_string(&src)));
+                wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
+                    .validate(&module)
+                    .unwrap_or_else(|e| panic!("{what}: {}", e.emit_to_string(&src)));
+                for ep in module.entry_points.iter().filter(|e| e.stage == wgpu::naga::ShaderStage::Vertex) {
+                    let Some(result) = &ep.function.result else { continue };
+                    let mut locs = Vec::new();
+                    if let Some(wgpu::naga::Binding::Location { location, .. }) = &result.binding {
+                        locs.push(*location);
+                    }
+                    if let wgpu::naga::TypeInner::Struct { members, .. } = &module.types[result.ty].inner {
+                        for m in members {
+                            if let Some(wgpu::naga::Binding::Location { location, .. }) = &m.binding {
+                                locs.push(*location);
+                            }
+                        }
+                    }
+                    let top = locs.iter().max().copied().unwrap_or(0);
+                    assert!(
+                        top < QUEST3_MAX_INTER_STAGE_LOCATIONS,
+                        "water {what} `{}` writes location {top}; the Quest 3 stops at {}",
+                        ep.name, QUEST3_MAX_INTER_STAGE_LOCATIONS - 1,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_mirror_twin_reads_the_image_in_place_of_the_ground_map() {
+        let plain = water_wgsl_with(false, true);
+        let mirror = mirrored_wgsl(&plain);
+        assert!(plain.contains(ENV_LINE) && !mirror.contains(ENV_LINE));
+        assert!(mirror.contains("textureSampleLevel(mirror_tex, mirror_samp, mirror_uv, 0.0)"));
+        assert!(!plain.contains("mirror_tex"));
     }
 
     #[test]
@@ -1488,6 +2143,31 @@ mod tests {
             let end = without.find("@fragment fn fs_main").unwrap();
             assert_eq!(format!("{}{}", &without[..start], &without[end..]), plain);
         }
+    }
+
+    #[test]
+    fn the_wet_line_follows_the_waves_up_and_creeps_back() {
+        let swash = 0.22;
+        let xz = glam::Vec2::new(12.0, 31.0);
+        let most = shore_wet_line_most(swash);
+        let line = |t: f32| shore_wet_line(t, swash, xz);
+        let samples: Vec<f32> = (0..2400).map(|k| line(k as f32 * 0.1)).collect();
+        assert!(samples.iter().all(|&l| l >= SHORE_BAND && l <= most + 1e-5), "outside {SHORE_BAND}..{most}");
+        let (lo, hi) = samples.iter().fold((f32::MAX, f32::MIN), |(a, b), &l| (a.min(l), b.max(l)));
+        assert!(hi - lo > 0.3 * swash, "the line hardly moves: {lo}..{hi}");
+
+        let fall = samples.windows(2).map(|p| p[0] - p[1]).fold(f32::MIN, f32::max);
+        assert!(fall <= SHORE_CREEP * 0.1 * 1.5 + 2e-3, "the line dropped {fall} m in a tenth of a second");
+        let rise = samples.windows(2).map(|p| p[1] - p[0]).fold(f32::MIN, f32::max);
+        assert!(rise > 10.0 * SHORE_CREEP * 0.1, "no wave ever lifts it");
+
+        let along: Vec<f32> = (0..40).map(|k| shore_wet_line(57.0, swash, glam::Vec2::new(k as f32 * 2.0, 31.0))).collect();
+        let (a, b) = along.iter().fold((f32::MAX, f32::MIN), |(a, b), &l| (a.min(l), b.max(l)));
+        assert!(b - a > 0.1 * swash, "level along 80 m of shore: {a}..{b}");
+        let loop_s = crate::renderer::water_waves::WaveParams::default().loop_seconds;
+        assert!((line(17.0) - line(17.0 + loop_s)).abs() < 2e-3);
+        assert_eq!(shore_wet_line(17.0, 0.0, xz), SHORE_BAND);
+        assert!((shore_wet_line_most(swash) - (SHORE_RUN_UP * swash + SHORE_BAND)).abs() < 1e-6);
     }
 
     #[test]
@@ -1516,6 +2196,78 @@ mod tests {
 #[cfg(test)]
 pub fn water_shader_src() -> String {
     water_wgsl(false)
+}
+
+#[cfg(test)]
+mod ring_size_tests {
+    use super::*;
+    use crate::renderer::shader_inlining::inlined_sizes;
+
+    #[test]
+    fn the_rings_add_less_to_the_water_than_they_did() {
+        let total = |rings: bool| -> usize { inlined_sizes(&water_wgsl_with(false, rings), "fs_main").iter().map(|r| r.own * r.copies).sum() };
+        let (ringed, ringless) = (total(true), total(false));
+        eprintln!("water by the proxy: ringed {ringed}, ringless {ringless}, the rings {}", ringed - ringless);
+        assert!(ringed > ringless, "the ringed twin has the rings in it");
+        // 2,424 was the cap; +89 is the four-tap box PCF (`lights::pcf_box_taps`,
+        // 2026-10-23). The proxy counts a loop's body once, so the nine-tap
+        // loop it replaced read as smaller, but the driver unrolls a 3x3 loop
+        // of constant bounds: on the Quest the four taps made the water views
+        // faster (beach_south 13.89 -> 13.58 ms, pond 14.80 -> 14.69), not
+        // slower as a crossed cliff would.
+        const WATER_CAP: usize = 2424 + 89;
+        assert!(ringed <= WATER_CAP, "the ringed twin is past the instruction cache: {ringed} by the proxy ({WATER_CAP} at most)");
+        for mud in WaterMud::ALL {
+            let twin = water_for_mud(&water_wgsl_with(false, true), mud).unwrap_or_else(|| panic!("{mud:?}: the mud edits moved"));
+            let size: usize = inlined_sizes(&twin, "fs_main").iter().map(|r| r.own * r.copies).sum();
+            eprintln!("ringed {mud:?}: {size}");
+            assert!(size <= WATER_CAP, "the ringed {mud:?} twin is past the instruction cache: {size} by the proxy");
+        }
+        assert!(ringed - ringless <= 110, "the rings' loop grew: {} by the proxy", ringed - ringless);
+        let raining: usize = inlined_sizes(&water_wgsl_raining(false), "fs_main").iter().map(|r| r.own * r.copies).sum();
+        eprintln!("raining twin {raining}: the drops {}", raining - ringed);
+        assert!(raining > ringed && raining - ringed <= 90, "the drops' rings: {} by the proxy", raining - ringed);
+    }
+
+    #[test]
+    #[ignore]
+    fn what_the_mud_costs() {
+        let total = |src: &str| -> usize { inlined_sizes(src, "fs_main").iter().map(|r| r.own * r.copies).sum() };
+        for (name, src) in [("ringless", water_wgsl_with(false, false)), ("ringed", water_wgsl_with(false, true)), ("raining", water_wgsl_raining(false))] {
+            let sizes: Vec<String> = WaterMud::ALL.iter().map(|m| format!("{m:?} {}", total(&water_for_mud(&src, *m).unwrap()))).collect();
+            eprintln!("{name}: {}", sizes.join(", "));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn what_each_part_of_the_rings_costs() {
+        let total = |src: &str| -> usize { inlined_sizes(src, "fs_main").iter().map(|r| r.own * r.copies).sum() };
+        let full = water_wgsl_raining(false);
+        let ringless = total(&water_wgsl_with(false, false));
+        let cut = |from: &str, to: &str| -> String {
+            let a = full.find(from).unwrap_or_else(|| panic!("no {from}"));
+            let b = a + full[a..].find(to).unwrap_or_else(|| panic!("no {to}")) + to.len();
+            format!("{}{}", &full[..a], &full[b..])
+        };
+        eprintln!("ringless {ringless}, ringed {} (+{})", total(&full), total(&full) - ringless);
+        eprintln!(
+            "mirror twins: ringless {}, ringed {}, raining {}",
+            total(&mirrored_wgsl(&water_wgsl_with(false, false))),
+            total(&mirrored_wgsl(&water_wgsl_with(false, true))),
+            total(&mirrored_wgsl(&full)),
+        );
+        for (name, src) in [
+            ("drops", cut("            let dr = water.ring_drops[i];", "            }\n")),
+            ("caustic", cut("            ring_curve = ring_curve -", ";\n")),
+            ("rough", cut("            ring_rough = ring_rough + 0.5 * steep", ";\n")),
+            ("inner fade", full.replace(" * min(from_rim / wv.z, 1.0)", "")),
+            ("wake", full.replace("    tilt = tilt + wake.xy * wake_in;\n", "").replace(" + vec3<f32>(wake.zw * wake_in, 0.0)", "")),
+        ] {
+            let t = total(&src);
+            eprintln!("without {name}: {t} ({} for it)", total(&full) - t);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1581,3 +2333,4 @@ mod seen_tests {
         assert!(shi.y - slo.y > hi.y - lo.y + 1.0, "a storm's waves reach further: {slo} {shi} vs {lo} {hi}");
     }
 }
+

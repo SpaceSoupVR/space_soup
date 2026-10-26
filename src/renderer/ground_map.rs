@@ -70,6 +70,8 @@ pub struct GroundInputs<'a> {
     pub sea_line: f32,
 }
 
+pub const RIM_FADE_METRES: f32 = 4.0;
+
 pub struct GroundMap {
     pub width: u32,
     pub height: u32,
@@ -82,7 +84,7 @@ pub struct GroundMap {
 }
 
 fn srgb_to_linear(c: u8) -> f32 {
-    let c = f32::from(c) / 255.0;
+    let c = c as f32 / 255.0;
     if c <= 0.04045 {
         c / 12.92
     } else {
@@ -102,13 +104,67 @@ fn layer_mean(layer: Option<&TerrainImage>, fallback: [u8; 3]) -> Vec3 {
     sum / n.max(1) as f32
 }
 
+struct LayerDetail {
+    size: u32,
+    texels: Vec<Vec3>,
+}
+
+impl LayerDetail {
+    fn of(img: &TerrainImage, repeat: f32, texel: f32) -> Option<Self> {
+        if img.width == 0 || img.height == 0 || img.rgba.len() < (img.width * img.height * 4) as usize || repeat <= 0.0 || texel <= 0.0 {
+            return None;
+        }
+        let size = ((repeat / texel).round() as u32).clamp(1, img.width.min(img.height));
+        let mut texels = Vec::with_capacity((size * size) as usize);
+        for j in 0..size {
+            let (y0, y1) = (j * img.height / size, ((j + 1) * img.height / size).max(j * img.height / size + 1));
+            for i in 0..size {
+                let (x0, x1) = (i * img.width / size, ((i + 1) * img.width / size).max(i * img.width / size + 1));
+                let mut sum = Vec3::ZERO;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let k = ((y * img.width + x) * 4) as usize;
+                        sum += Vec3::new(srgb_to_linear(img.rgba[k]), srgb_to_linear(img.rgba[k + 1]), srgb_to_linear(img.rgba[k + 2]));
+                    }
+                }
+                texels.push(sum / ((y1 - y0) * (x1 - x0)) as f32);
+            }
+        }
+        Some(Self { size, texels })
+    }
+
+    fn at(&self, uv: Vec2) -> Vec3 {
+        let n = self.size as f32;
+        let f = (uv - uv.floor()) * n - Vec2::splat(0.5);
+        let (fx, fy) = (f.x.rem_euclid(n), f.y.rem_euclid(n));
+        let (x0, y0) = (fx.floor() as u32 % self.size, fy.floor() as u32 % self.size);
+        let (x1, y1) = ((x0 + 1) % self.size, (y0 + 1) % self.size);
+        let (tx, ty) = (fx - fx.floor(), fy - fy.floor());
+        let p = |x: u32, y: u32| self.texels[(y * self.size + x) as usize];
+        let a = p(x0, y0).lerp(p(x1, y0), tx);
+        let b = p(x0, y1).lerp(p(x1, y1), tx);
+        a.lerp(b, ty)
+    }
+
+    fn colour(&self, world: Vec3, n: Vec3, repeat: f32, steep: bool) -> Vec3 {
+        let r = repeat.max(1e-3);
+        if !steep {
+            return self.at(Vec2::new(world.x, world.z) / r);
+        }
+        let a = n.abs();
+        let w = Vec3::new(a.x.powi(4), a.y.powi(4), a.z.powi(4));
+        let w = w / (w.x + w.y + w.z).max(1e-6);
+        self.at(Vec2::new(world.z, world.y) / r) * w.x + self.at(Vec2::new(world.x, world.z) / r) * w.y + self.at(Vec2::new(world.x, world.y) / r) * w.z
+    }
+}
+
 fn sample_rgba(img: &TerrainImage, uv: Vec2) -> [f32; 4] {
     let fx = (uv.x.clamp(0.0, 1.0) * img.width as f32 - 0.5).max(0.0);
     let fy = (uv.y.clamp(0.0, 1.0) * img.height as f32 - 0.5).max(0.0);
     let (x0, y0) = ((fx.floor() as u32).min(img.width - 1), (fy.floor() as u32).min(img.height - 1));
     let (x1, y1) = ((x0 + 1).min(img.width - 1), (y0 + 1).min(img.height - 1));
     let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
-    let px = |x: u32, y: u32, c: usize| f32::from(img.rgba[((y * img.width + x) * 4) as usize + c]) / 255.0;
+    let px = |x: u32, y: u32, c: usize| img.rgba[((y * img.width + x) * 4) as usize + c] as f32 / 255.0;
     let mut out = [0.0; 4];
     for (c, o) in out.iter_mut().enumerate() {
         let a = px(x0, y0, c) + (px(x1, y0, c) - px(x0, y0, c)) * tx;
@@ -128,11 +184,11 @@ fn sample_open(img: &TerrainImage, uv: Vec2) -> Option<[f32; 4]> {
     let mut total = 0.0;
     for (x, y, w) in [(x0, y0, (1.0 - tx) * (1.0 - ty)), (x1, y0, tx * (1.0 - ty)), (x0, y1, (1.0 - tx) * ty), (x1, y1, tx * ty)] {
         let k = ((y * img.width + x) * 4) as usize;
-        if (f32::from(img.rgba[k]) / 255.0) < BURIED_SKY_VIS || w <= 0.0 {
+        if (img.rgba[k] as f32 / 255.0) < BURIED_SKY_VIS || w <= 0.0 {
             continue;
         }
         for c in 0..4 {
-            out[c] += f32::from(img.rgba[k + c]) / 255.0 * w;
+            out[c] += img.rgba[k + c] as f32 / 255.0 * w;
         }
         total += w;
     }
@@ -179,6 +235,12 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
     let means: Vec<Vec3> = (0..4)
         .map(|i| layer_mean(inputs.layers.get(i).and_then(|l| l.as_ref()), FALLBACK_LAYER_COLOURS[i]))
         .collect();
+
+    let texel = (extent.x / size as f32).max(extent.y / size as f32);
+    let details: Vec<Option<LayerDetail>> = (0..4)
+        .map(|i| inputs.layers.get(i).and_then(|l| l.as_ref()).and_then(|img| LayerDetail::of(img, inputs.settings.repeat[i], texel)))
+        .collect();
+    let steep_cos = inputs.settings.biplanar_start_deg.to_radians().cos();
     let sun = inputs.sun.map(|s| (Vec3::from(s.direction).normalize_or_zero(), Vec3::from(s.light_rgb)));
     let texel = (extent.x / size as f32).max(extent.y / size as f32);
     let open_light = {
@@ -200,10 +262,18 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
             let n = g.normal(x, z);
             let slope_deg = n.y.clamp(-1.0, 1.0).acos().to_degrees();
             let w = layer_weights(inputs.settings, inputs.splat, uv, y, slope_deg);
-            let albedo = means[0] * w[0] + means[1] * w[1] + means[2] * w[2] + means[3] * w[3];
+            let world = Vec3::new(x, y, z);
+            let albedo: Vec3 = (0..4)
+                .filter(|&k| w[k] > 1e-3)
+                .map(|k| match &details[k] {
+                    Some(d) => d.colour(world, n, inputs.settings.repeat[k], n.y < steep_cos) * w[k],
+                    None => means[k] * w[k],
+                })
+                .sum();
 
             let s = inputs.settings;
-            let albedo = albedo * (1.0 - 0.45 * (1.0 - smoothstep(s.wet_line, s.wet_line + s.wet_band, y)));
+            let soaked = (0..4).map(|k| w[k] * s.porosity[k]).sum::<f32>() * ((s.sea_line - y) * 20.0).clamp(0.0, 1.0);
+            let albedo = albedo + (albedo.map(crate::renderer::weather::wet_albedo) - albedo) * soaked;
             let (sky_vis, sun_vis, under_a_floor) = sky_and_sun(inputs.sky_occlusion, uv);
             buried.push(under_a_floor);
             let e = inputs.sky.evaluate([n.x, n.y, n.z]);
@@ -217,7 +287,8 @@ pub fn build(inputs: &GroundInputs, size: u32) -> GroundMap {
             if rim > 0.0 {
                 let level = layer_weights(inputs.settings, inputs.splat, uv, y, 0.0);
                 let mean: Vec3 = (0..4).map(|k| means[k] * level[k]).sum();
-                let mean = mean * (1.0 - 0.45 * (1.0 - smoothstep(s.wet_line, s.wet_line + s.wet_band, y)));
+                let soaked = (0..4).map(|k| level[k] * s.porosity[k]).sum::<f32>() * ((s.sea_line - y) * 20.0).clamp(0.0, 1.0);
+                let mean = mean + (mean.map(crate::renderer::weather::wet_albedo) - mean) * soaked;
                 rims.push(ground::Rim { texel: texels.len(), weight: rim, level: mean * open_light * (1.0 - F0) });
             }
             top = top.max(y);
@@ -285,8 +356,8 @@ const GROUND_MAX_MARGIN: f32 = 0.02;
 
 pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = i32::from((h >> 10) & 0x1f);
-    let mant = f32::from(h & 0x3ff);
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let mant = (h & 0x3ff) as f32;
     match exp {
         0 => sign * mant * 2f32.powi(-24),
         0x1f => sign * f32::INFINITY,
@@ -339,9 +410,9 @@ pub fn levels(map: &GroundMap) -> Vec<GroundLevel> {
                     if level == 1 {
 
                         highest = f32::MIN;
-                        let (bw, bh) = (i64::from(base.width), i64::from(base.height));
-                        for sy in 2 * i64::from(y) - 1..=2 * i64::from(y) + 2 {
-                            for sx in 2 * i64::from(x) - 1..=2 * i64::from(x) + 2 {
+                        let (bw, bh) = (base.width as i64, base.height as i64);
+                        for sy in 2 * y as i64 - 1..=2 * y as i64 + 2 {
+                            for sx in 2 * x as i64 - 1..=2 * x as i64 + 2 {
                                 let k = (sy.clamp(0, bh - 1) * bw + sx.clamp(0, bw - 1)) as usize;
                                 highest = highest.max(base.texels[k][3]);
                             }
@@ -433,7 +504,7 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
     let mut steps = 0;
     let mut reads = 0;
 
-    let mut risen = false;
+    let mut risen = d.y <= 0.0;
     while steps < shape.max_steps && t < t_out {
         steps += 1;
         reads += 1;
@@ -483,25 +554,48 @@ pub fn trace_with(levels: &[GroundLevel], min: Vec2, max: Vec2, top: f32, e: Vec
     GroundTrace { t: None, steps, reads }
 }
 
+/// A ground map's texture bytes, every mip already in f16: what the worker
+/// hands the render thread. Building the chain there took 80-130 ms of the
+/// headset's render thread at every relight, felt as a hang every few
+/// seconds while the clock ran (2026-10-20). `map` keeps the placement; its
+/// texels are dropped.
+pub struct PreparedGround {
+    pub map: GroundMap,
+    pub mips: Vec<(u32, u32, Vec<u16>)>,
+}
+
+pub fn prepare(mut map: GroundMap) -> PreparedGround {
+    let mips = levels(&map)
+        .iter()
+        .map(|level| (level.width, level.height, level.texels.iter().flat_map(|t| t.map(crate::renderer::sky::f32_to_f16)).collect()))
+        .collect();
+    map.texels = Vec::new();
+    PreparedGround { map, mips }
+}
+
 pub fn upload(device: &Device, queue: &Queue, map: &GroundMap) -> TextureView {
-    let chain = levels(map);
+    let map = GroundMap { texels: map.texels.clone(), ..*map };
+    upload_prepared(device, queue, &prepare(map))
+}
+
+pub fn upload_prepared(device: &Device, queue: &Queue, ground: &PreparedGround) -> TextureView {
+    let map = &ground.map;
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("ground_map"),
         size: wgpu::Extent3d { width: map.width, height: map.height, depth_or_array_layers: 1 },
-        mip_level_count: chain.len() as u32,
+        mip_level_count: ground.mips.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    for (mip, level) in chain.iter().enumerate() {
-        let bytes: Vec<u16> = level.texels.iter().flat_map(|t| t.map(crate::renderer::sky::f32_to_f16)).collect();
+    for (mip, (width, height, bytes)) in ground.mips.iter().enumerate() {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: mip as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            bytemuck::cast_slice(&bytes),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(level.width * 8), rows_per_image: Some(level.height) },
-            wgpu::Extent3d { width: level.width, height: level.height, depth_or_array_layers: 1 },
+            bytemuck::cast_slice(bytes),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 8), rows_per_image: Some(*height) },
+            wgpu::Extent3d { width: *width, height: *height, depth_or_array_layers: 1 },
         );
     }
     tex.create_view(&wgpu::TextureViewDescriptor::default())
@@ -727,14 +821,14 @@ mod tests {
 
                     let span = 1i64 << l;
                     let mut reachable = f32::MIN;
-                    for sy in i64::from(y) * span - 1..=(i64::from(y) + 1) * span {
-                        for sx in i64::from(x) * span - 1..=(i64::from(x) + 1) * span {
+                    for sy in y as i64 * span - 1..=(y as i64 + 1) * span {
+                        for sx in x as i64 * span - 1..=(x as i64 + 1) * span {
                             let k = (sy.clamp(0, 63) * 64 + sx.clamp(0, 63)) as usize;
                             reachable = reachable.max(base.texels[k][3]);
                         }
                     }
                     let slack = bound - reachable;
-                    assert!((GROUND_MAX_MARGIN..GROUND_MAX_MARGIN + 0.01).contains(&slack), "level {l} texel ({x}, {y}): bound {bound} over reachable {reachable}");
+                    assert!(slack >= GROUND_MAX_MARGIN && slack < GROUND_MAX_MARGIN + 0.01, "level {l} texel ({x}, {y}): bound {bound} over reachable {reachable}");
                 }
             }
         }
@@ -762,6 +856,24 @@ mod tests {
             }
         }
         assert!(checked > 0, "no level ray met a hill");
+    }
+
+    #[test]
+    fn a_ray_heading_down_from_under_the_ground_meets_it_where_it_starts() {
+        let map = fixtures::height_map(1024, fixtures::hills);
+        let chain = levels(&map);
+        let size = map.max - map.min;
+        for i in 0..400 {
+            let x = map.min.x + size.x * (0.1 + 0.8 * ((i * 37 % 400) as f32 / 400.0));
+            let z = map.min.y + size.y * (0.1 + 0.8 * ((i * 91 % 400) as f32 / 400.0));
+            let under = height_at(&chain[0], (Vec2::new(x, z) - map.min) * (chain[0].width as f32 / size)) - 0.05;
+            let e = Vec3::new(x, under, z);
+            for d in [Vec3::new(0.7, -0.05, 0.7).normalize(), Vec3::new(-0.3, -0.6, 0.2).normalize(), Vec3::new(1.0, 0.0, 0.0)] {
+                let r = trace(&chain, map.min, map.max, map.top, e, d);
+                assert!(r.t.is_some_and(|t| t < 1e-3), "from under the ground at {e} along {d}: {:?}", r.t);
+                assert!(r.steps <= 4, "from under the ground at {e} along {d}: {} steps", r.steps);
+            }
+        }
     }
 
     #[test]
@@ -828,6 +940,66 @@ mod tests {
     }
 
     #[test]
+    fn the_sea_floor_at_the_maps_edge_is_one_colour_along_it() {
+
+        let g = HeightGrid::sample(Vec2::new(-10.0, -10.0), Vec2::new(10.0, 10.0), 81, 81, |x, _| -10.0 + 0.6 * (x * 1.7).sin());
+        let sun = SkySun { direction: [0.6, 0.8, 0.0], light_rgb: [4.0, 4.0, 4.0], texels: 1, energy_fraction: 0.5 };
+
+        let checker: Vec<u8> = (0..16).flat_map(|i| if (i % 4 + i / 4) % 2 == 0 { [40, 40, 40, 255] } else { [220, 220, 220, 255] }).collect();
+        let layers = [Some(TerrainImage { width: 4, height: 4, rgba: checker }), Some(TerrainImage { width: 1, height: 1, rgba: vec![60, 50, 30, 255] })];
+
+        let splat = TerrainImage {
+            width: 4,
+            height: 4,
+            rgba: (0..16).flat_map(|i| if i == 1 { [0u8, 255, 0, 0] } else { [255u8, 0, 0, 0] }).collect(),
+        };
+
+        let occ_w = 16;
+        let occ = TerrainImage {
+            width: occ_w,
+            height: 1,
+            rgba: (0..occ_w).flat_map(|i| if i % 2 == 0 { [255u8, 255, 0, 0] } else { [255, 0, 0, 0] }).collect(),
+        };
+        let size = 64u32;
+        let built = |sea_line: f32| {
+            let mut s = TerrainMaterialUniform::default();
+            s.repeat = [1.5; 4];
+            s.sea_line = sea_line;
+            build(
+                &GroundInputs { heights: &g, sky: &sky(), sun: Some(&sun), sky_occlusion: Some(&occ), layers: &layers, splat: Some(&splat), settings: &s, sea_line },
+                size,
+            )
+        };
+        let spread = |map: &GroundMap, row: u32| {
+            let r: Vec<f32> = (0..size).map(|i| map.texels[(row * size + i) as usize][0]).collect();
+            let (lo, hi) = r.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            (hi - lo) / hi.max(1e-6)
+        };
+        let sea = built(-1.4);
+        let dry = built(-1e9);
+
+        assert!(spread(&sea, 0) < 1e-4, "the near edge's row varies by {:.3} of its brightest", spread(&sea, 0));
+        assert!(spread(&sea, size - 1) < 1e-4, "the far edge's row varies by {:.3}", spread(&sea, size - 1));
+
+        let side: Vec<f32> = (0..size).map(|j| sea.texels[(j * size) as usize][0]).collect();
+        let (lo, hi) = side.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        assert!(hi - lo < 1e-4 * hi, "a side edge varies by {:.3}", (hi - lo) / hi);
+
+        let far = sea.texels[(size * size - 1) as usize][0];
+        assert!((side[0] - sea.texels[0][0]).abs() < 1e-6 && (far - side[0]).abs() < 1e-4 * hi, "the edges differ: {} {far}", side[0]);
+
+        let mid = size / 2;
+        let inner_spread = {
+            let r: Vec<f32> = (size / 4..size - size / 4).map(|i| sea.texels[(mid * size + i) as usize][0]).collect();
+            let (lo, hi) = r.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            (hi - lo) / hi
+        };
+        assert!(inner_spread > 0.3, "the floor's own shadows inside the rim: {inner_spread:.3}");
+
+        assert!(spread(&dry, 0) > 0.3, "a dry rim is left as it is: {:.3}", spread(&dry, 0));
+    }
+
+    #[test]
     fn a_painted_splat_is_the_ground_maps_colour() {
         let g = HeightGrid::sample(Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0), 11, 11, |_, _| 0.0);
         let s = TerrainMaterialUniform::default();
@@ -855,7 +1027,7 @@ mod step_census {
     use super::*;
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn shapes() {
         let map = fixtures::height_map(1024, fixtures::hills);
         let chain = levels(&map);
@@ -885,7 +1057,7 @@ mod step_census {
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn steps_by_elevation() {
         let map = fixtures::height_map(1024, fixtures::hills);
         let chain = levels(&map);
@@ -897,7 +1069,7 @@ mod step_census {
             b.0 += 1;
             b.1 += r.steps;
             b.2 = b.2.max(r.steps);
-            b.3 += u32::from(r.t.is_some());
+            b.3 += r.t.is_some() as u32;
         }
         for (el, (n, s, m, h)) in buckets {
             eprintln!("elev {el:>4}..{:>3}: rays {n:>5}  mean steps {:>5.1}  max {m:>3}  hit {:>3.0}%", el + 5, s as f32 / n as f32, 100.0 * h as f32 / n as f32);
@@ -954,5 +1126,34 @@ mod step_census {
         };
         assert!(inner_spread > 0.3, "the floor's own shadows inside the rim: {inner_spread:.3}");
         assert!(spread(&dry, 0) > 0.3, "a dry rim is left as it is: {:.3}", spread(&dry, 0));
+    }
+}
+
+#[cfg(test)]
+mod under_ground_census {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn steps_from_under_the_ground() {
+        let map = fixtures::height_map(1024, fixtures::hills);
+        let chain = levels(&map);
+        for under in [0.0f32, 0.03] {
+            let mut buckets = std::collections::BTreeMap::<i32, (u32, u32, u32, u32)>::new();
+            for (e, d) in fixtures::rays(20000, 5) {
+                let q = (Vec2::new(e.x, e.z) - map.min) / (map.max - map.min) * Vec2::new(chain[0].width as f32, chain[0].height as f32);
+                let e = Vec3::new(e.x, height_at(&chain[0], q) - under, e.z);
+                let r = trace(&chain, map.min, map.max, map.top, e, d);
+                let el = (d.y.asin().to_degrees() / 5.0).floor() as i32 * 5;
+                let b = buckets.entry(el).or_default();
+                b.0 += 1;
+                b.1 += r.steps;
+                b.2 = b.2.max(r.steps);
+                b.3 += r.t.is_some() as u32;
+            }
+            for (el, (n, s, m, h)) in buckets {
+                eprintln!("under {under}: elev {el:>4}..{:>3}: rays {n:>5}  mean steps {:>5.1}  max {m:>3}  hit {:>3.0}%", el + 5, s as f32 / n as f32, 100.0 * h as f32 / n as f32);
+            }
+        }
     }
 }

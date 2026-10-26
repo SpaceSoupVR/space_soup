@@ -61,6 +61,12 @@ pub(super) unsafe fn build_wgpu_from_vulkan(
     if exposed.features.contains(wgpu::Features::IMMEDIATES) {
         features |= wgpu::Features::IMMEDIATES;
     }
+    // The ground's layers are encoded ahead as ASTC where the game ships them
+    // so (`TerrainLayerArrays::from_astc`): a quarter of the memory.
+    if exposed.features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC) {
+        features |= wgpu::Features::TEXTURE_COMPRESSION_ASTC;
+    }
+    log::info!("wgpu: ASTC {}", if features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC) { "yes" } else { "NO" });
     {
         use wgpu::hal::Adapter as _;
         let rgba16 = exposed.adapter.texture_format_capabilities(wgpu::TextureFormat::Rgba16Unorm);
@@ -174,6 +180,51 @@ unsafe fn log_driver_offer(vk: &VkContext) {
     for chunk in names.chunks(8) {
         log::info!("vulkan ext: {}", chunk.join(" "));
     }
+    // What the deferred optimizations wait on (docs/deferred-optimizations-2026-10-23.md):
+    // an extension offered is not a feature on, so the features themselves.
+    let has = |n: &str| names.iter().any(|e| e == n);
+    let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
+    let mut fsr = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default();
+    let mut rq = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+    let mut feats2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13);
+    if has("VK_KHR_fragment_shading_rate") {
+        feats2 = feats2.push_next(&mut fsr);
+    }
+    if has("VK_KHR_ray_query") {
+        feats2 = feats2.push_next(&mut rq);
+    }
+    unsafe { vk.instance.get_physical_device_features2(vk.physical_device, &mut feats2) };
+    let f = feats2.features;
+    let mut fsr_props = vk::PhysicalDeviceFragmentShadingRatePropertiesKHR::default();
+    let mut md_props = vk::PhysicalDeviceMultiDrawPropertiesEXT::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default();
+    if has("VK_KHR_fragment_shading_rate") {
+        props2 = props2.push_next(&mut fsr_props);
+    }
+    if has("VK_EXT_multi_draw") {
+        props2 = props2.push_next(&mut md_props);
+    }
+    unsafe { vk.instance.get_physical_device_properties2(vk.physical_device, &mut props2) };
+    let astc_hdr = unsafe { vk.instance.get_physical_device_format_properties(vk.physical_device, vk::Format::ASTC_4X4_SFLOAT_BLOCK) };
+    log::info!(
+        "vulkan offer: multiDrawIndirect {}, drawIndirectFirstInstance {}, maxDrawIndirectCount {}, maxMultiDrawCount {}; \
+         ASTC HDR feature {}, 4x4 sfloat sampled-linear {}; shading rate pipeline {} primitive {} attachment {}, \
+         max fragment {}x{}, with sample mask {}, with depth writes {}; ray query {}",
+        f.multi_draw_indirect,
+        f.draw_indirect_first_instance,
+        l.max_draw_indirect_count,
+        md_props.max_multi_draw_count,
+        v13.texture_compression_astc_hdr,
+        astc_hdr.optimal_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR),
+        fsr.pipeline_fragment_shading_rate,
+        fsr.primitive_fragment_shading_rate,
+        fsr.attachment_fragment_shading_rate,
+        fsr_props.max_fragment_size.width,
+        fsr_props.max_fragment_size.height,
+        fsr_props.fragment_shading_rate_with_sample_mask,
+        fsr_props.fragment_shading_rate_with_shader_depth_stencil_writes,
+        rq.ray_query,
+    );
 }
 
 pub(super) unsafe fn import_vk_image_as_wgpu(

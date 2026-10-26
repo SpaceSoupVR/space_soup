@@ -8,9 +8,43 @@ pub const REFRESH_HOURS: f32 = 0.02;
 
 pub const RELIGHT_STEP: f32 = 0.03;
 
-pub const NIGHT_MAX_EXPOSURE: f32 = 2.0e5;
+/// The night eye's widest opening: past what starlight alone asks
+/// (`exposure::DEEP_NIGHT_LUMINANCE`, about x1.4e7), so the adaptation curve
+/// decides it, not the cap. At 1e6 a moonless night drew black (2026-10-22).
+pub const NIGHT_MAX_EXPOSURE: f32 = 1.0e8;
 
 pub const PROBE_RELIGHT_RATIO: f32 = 1.25;
+
+/// The brightest texel a relit atlas is stored at, in half floats: room
+/// below f16's 65504 for the mips' averages to stay finite.
+pub const ATLAS_PEAK: f32 = 16384.0;
+
+/// HOW MANY STOPS BRIGHTER A RELIT ATLAS IS STORED, so its brightest texel
+/// sits near `ATLAS_PEAK`: whole stops, so the scale moves no mantissa bit.
+/// Under a new moon the daylight layers are x4e-9 of the bake's, below f16's
+/// smallest (6e-8), and the atlas stored exactly zero however far the eye
+/// opened (2026-10-22); stored brighter, starlight keeps its texels. Never
+/// dimmer than as baked. Alpha (sky visibility) is not light, and is left.
+pub fn atlas_stops(rgba: &[f32]) -> f32 {
+    let peak = rgba.chunks_exact(4).map(|p| p[0].max(p[1]).max(p[2])).fold(0.0f32, f32::max);
+    if !(peak > 0.0) {
+        return 0.0;
+    }
+    (ATLAS_PEAK / peak).log2().floor().clamp(0.0, 100.0)
+}
+
+/// `rgba`'s light (not its alpha) `stops` brighter.
+pub fn scale_atlas(rgba: &mut [f32], stops: f32) {
+    if stops == 0.0 {
+        return;
+    }
+    let k = stops.exp2();
+    for p in rgba.chunks_exact_mut(4) {
+        for v in &mut p[..3] {
+            *v *= k;
+        }
+    }
+}
 
 pub const PROBE_RELIGHT_ANGLE_COS: f32 = 0.9986;
 
@@ -25,6 +59,26 @@ pub fn relight_probe_faces(full: &[u8], lamps: &[u8], daylight: f32) -> Vec<u8> 
             let a = f16_to_f32(u16::from_le_bytes([f[2 * c], f[2 * c + 1]]));
             let b = f16_to_f32(u16::from_le_bytes([l[2 * c], l[2 * c + 1]]));
             let v = if c == 3 { a } else { b + (a - b).max(0.0) * daylight };
+            out.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// A BUILDING'S OUTSIDE under the hour, from its daylight alone: `(full -
+/// lamps) * daylight`, alpha kept. Its lamps-only photograph is the inside
+/// (lit through doorways, and the hallway's through its walls), which every
+/// wall reflecting a neighbour showed at night as a lit stone face
+/// (2026-10-20). A building's outside takes almost none of its lamps' light.
+pub fn building_daylight_faces(full: &[u8], lamps: &[u8], daylight: f32) -> Vec<u8> {
+    use super::uniforms::{f16_to_f32, f32_to_f16};
+    let mut out = Vec::with_capacity(full.len());
+    for (k, f) in full.chunks_exact(8).enumerate() {
+        let l = lamps.get(k * 8..k * 8 + 8);
+        for c in 0..4 {
+            let a = f16_to_f32(u16::from_le_bytes([f[2 * c], f[2 * c + 1]]));
+            let b = l.map_or(0.0, |l| f16_to_f32(u16::from_le_bytes([l[2 * c], l[2 * c + 1]])));
+            let v = if c == 3 { a } else { (a - b).max(0.0) * daylight };
             out.extend_from_slice(&f32_to_f16(v).to_le_bytes());
         }
     }
@@ -61,9 +115,12 @@ pub fn relit_probe_source(
             return Some(faces);
         }
         let unlit;
-        let lamps = if let Some(l) = lamps(i) { l } else {
-            unlit = vec![0u8; faces.len()];
-            unlit
+        let lamps = match lamps(i) {
+            Some(l) => l,
+            None => {
+                unlit = vec![0u8; faces.len()];
+                unlit
+            }
         };
         Some(relight_probe_faces(&faces, &lamps, k))
     })
@@ -76,6 +133,9 @@ pub struct Prepared {
     pub daylight: f32,
 
     pub atlas: Option<Vec<(Vec<u8>, u32, u32)>>,
+    /// The stops `atlas` was stored brighter by (`atlas_stops`); the brushes
+    /// read it back down by as many (`PostUpload::atlas_stops`).
+    pub atlas_stops: f32,
 }
 
 struct Request {
@@ -171,7 +231,7 @@ impl TimeOfDayRuntime {
             }
             self.forced = Some(forced);
         }
-        self.seconds += f64::from(dt.max(0.0));
+        self.seconds += dt.max(0.0) as f64;
         let hour = self.hour();
         let moved = self.requested_hour.is_none_or(|h| {
             let d = (hour - h).rem_euclid(24.0);
@@ -205,22 +265,38 @@ impl Worker {
     fn prepare(&mut self, hour: f32, days: f64, force: bool) -> Prepared {
         let snapshot = self.sky.snapshot(hour, days);
         let weights = LayerWeights::between(&self.baked_sky, self.baked_sun.as_ref(), &snapshot.irradiance, snapshot.light.as_ref());
+        let weights = match &self.layers {
+            Some(layers) => weights.with_keys(layers, snapshot.light.as_ref()),
+            None => weights,
+        };
         let daylight = daylight_share(&self.baked_sky, self.baked_sun.as_ref(), &snapshot);
         let moved = |a: &LayerWeights, b: &LayerWeights| {
             let far = |x: f32, y: f32| {
                 let (x, y) = (x.max(1e-9), y.max(1e-9));
                 (x / y).max(y / x) > 1.0 + RELIGHT_STEP && (x - y).abs() > 1e-7
             };
-            (0..3).any(|c| far(a.sky[c], b.sky[c]) || far(a.sun[c], b.sun[c]))
+            // Between keyframes, a step along the arc moves the bounce too.
+            let keyed = match (a.key, b.key) {
+                (Some(x), Some(y)) => {
+                    (x.a, x.b) != (y.a, y.b) && (x.a, x.b) != (y.b, y.a)
+                        || (x.t - y.t).abs() > RELIGHT_STEP
+                        || (0..3).any(|c| far(x.light[c], y.light[c]))
+                }
+                (x, y) => x.is_some() != y.is_some(),
+            };
+            keyed || (0..3).any(|c| far(a.sky[c], b.sky[c]) || far(a.sun[c], b.sun[c]))
         };
-        let atlas = match &self.layers {
+        let (atlas, atlas_stops) = match &self.layers {
             Some(layers) if force || self.sent.as_ref().is_none_or(|s| moved(s, &weights)) => {
                 self.sent = Some(weights);
-                Some(crate::renderer::mesh::lightmap_mips_f16(&layers.combine(weights.sky, weights.sun), layers.width, layers.height))
+                let mut relit = layers.relit(&weights);
+                let stops = atlas_stops(&relit);
+                scale_atlas(&mut relit, stops);
+                (Some(crate::renderer::mesh::lightmap_mips_f16(&relit, layers.width, layers.height)), stops)
             }
-            _ => None,
+            _ => (None, 0.0),
         };
-        Prepared { snapshot, weights, daylight, atlas }
+        Prepared { snapshot, weights, daylight, atlas, atlas_stops }
     }
 }
 
@@ -258,6 +334,20 @@ mod tests {
         assert_eq!(source(0).unwrap(), full);
         daylight.set(0.0);
         assert_eq!(read(&source(0).unwrap()), read(&lamps));
+    }
+
+    /// A building's outside keeps only its daylight: dark at night however
+    /// its lamps light the inside, and with no lamps photograph the whole.
+    #[test]
+    fn a_buildings_outside_is_dark_at_night_whatever_its_lamps() {
+        use crate::renderer::uniforms::{f16_to_f32, f32_to_f16};
+        let texel = |v: [f32; 4]| v.iter().flat_map(|x| f32_to_f16(*x).to_le_bytes()).collect::<Vec<u8>>();
+        let read = |b: &[u8]| -> Vec<f32> { b.chunks_exact(2).map(|p| f16_to_f32(u16::from_le_bytes([p[0], p[1]]))).collect() };
+        let full = texel([1.0, 0.5, 0.25, 0.75]);
+        let lamps = texel([0.25, 0.25, 0.25, 0.75]);
+        assert_eq!(read(&building_daylight_faces(&full, &lamps, 0.0)), vec![0.0, 0.0, 0.0, 0.75]);
+        assert_eq!(read(&building_daylight_faces(&full, &lamps, 0.5)), vec![0.375, 0.125, 0.0, 0.75]);
+        assert_eq!(read(&building_daylight_faces(&full, &[], 0.5)), vec![0.5, 0.25, 0.125, 0.75]);
     }
 
     fn hdri_like() -> (SkyIrradiance, SkySun) {
@@ -324,5 +414,45 @@ mod tests {
         assert!(w.prepare(15.0, 0.0, true).atlas.is_some());
         assert!(w.prepare(15.0, 0.0, false).atlas.is_none(), "same light, no upload");
         assert!(w.prepare(3.0, 0.0, false).atlas.is_some(), "night relights");
+    }
+
+    /// With sun keyframes the bounce follows the sun along the day: at a key
+    /// the atlas holds that key's bounce, and walking on to the next relights
+    /// toward it.
+    #[test]
+    fn the_sun_bounce_walks_its_keyframes() {
+        use space_soup_sky::time_of_day::{sun_key_hours, SunKey};
+        let (sky, sun) = hdri_like();
+        let params = TimeOfDayParams::default();
+        let hours = sun_key_hours(&params, 4);
+        let flat = |v: f32| vec![v, v, v, 1.0, v, v, v, 1.0, v, v, v, 1.0, v, v, v, 1.0];
+        let layers = Arc::new(AtlasLayers {
+            width: 2,
+            height: 2,
+            lamps: vec![0.0; 16],
+            sky: vec![0.0; 16],
+            sun: flat(0.5),
+            sun_keys: hours.iter().enumerate().map(|(i, (h, d))| SunKey::from_rgba(*h, *d, &flat(1.0 + i as f32))).collect(),
+        });
+        let ts = Arc::new(TimeOfDaySky::new(params));
+        let mut w = Worker { sky: ts.clone(), baked_sky: sky, baked_sun: Some(sun), layers: Some(layers), sent: None };
+        let at = |w: &mut Worker, h: f32| {
+            let p = w.prepare(h, 0.0, true);
+            let light = p.snapshot.light.unwrap().light_rgb;
+            (p.weights.key.unwrap(), light)
+        };
+        let (k1, _) = at(&mut w, hours[1].0);
+        let on = if k1.t < 0.5 { k1.a } else { k1.b };
+        assert!(on == 1 && (k1.t < 0.02 || k1.t > 0.98), "{k1:?}");
+        let (k, _) = at(&mut w, 0.5 * (hours[1].0 + hours[2].0));
+        assert!([k.a, k.b].contains(&1) && [k.a, k.b].contains(&2) && (k.t - 0.5).abs() < 0.15, "{k:?}");
+        let prepared = w.prepare(0.5 * (hours[1].0 + hours[2].0), 0.0, true);
+        let lit = crate::renderer::mesh::lightmap_mips_f16(
+            &w.layers.as_ref().unwrap().relit(&prepared.weights),
+            2,
+            2,
+        );
+        assert!(prepared.atlas.is_some() && !lit.is_empty());
+        assert!(w.prepare(0.5 * (hours[1].0 + hours[2].0) + 0.5, 0.0, false).atlas.is_some(), "half an hour on relights");
     }
 }

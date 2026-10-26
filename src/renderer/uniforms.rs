@@ -59,12 +59,38 @@ pub struct Uniforms {
     pub capsule_params: [f32; 4],
 
     pub character_cards: [[f32; 4]; 2 * super::proxy_cards::CHARACTER_CARD_SETS],
+
+    pub room_exposure: RoomExposure,
+
+    /// The clouds' shadow map for a player-space point p:
+    /// uv = (a px + b pz, c px + d pz) + (u0, v0) from `[a, b, c, d]`,
+    /// `[u0, v0, 0, 0]`, then `[fill rgb, on]`; read only when `on` > 0.
+    /// `fill` is the light a cloud's base gives the ground under it where
+    /// it hides the sun whole (`cloud_fill` in the lights block).
+    pub cloud_map: [[f32; 4]; 3],
+
+    /// The static sun's newer map (layer `sun_blend.z`) while the sun glides,
+    /// and [its share, the older map's layer, its layer, 0]; the older map
+    /// is `sun_view_proj` (`lights::SunPair`, `sun_static_visibility`).
+    pub sun_next_view_proj: [[f32; 4]; 4],
+    pub sun_blend: [f32; 4],
 }
+
+/// Texels a side of the clouds' shadow map (`UniformBuffer::write_cloud_shadow`).
+pub const CLOUD_SHADOW_SIZE: u32 = 64;
+
+/// Boxes -- closed rooms and their doorways -- drawn at the room's own local
+/// adaptation (`room_local_exposure` in the lights block): at most this many,
+/// a pair of rows each.
+pub const ROOM_EXPOSURE_ROOMS: usize = 8;
+/// Per room: `[min.x, min.y, min.z, factor]`, `[max.x, max.y, max.z, band]`,
+/// world space; factor 0 is an empty row.
+pub type RoomExposure = [[f32; 4]; 2 * ROOM_EXPOSURE_ROOMS];
 
 pub const MAX_BUILDINGS: usize = 8;
 
 pub const MAX_PROXIES: usize = 16;
-const _: () = assert!(MAX_PROXIES.is_multiple_of(4), "`proxy_cards` packs four proxies a vec4");
+const _: () = assert!(MAX_PROXIES % 4 == 0, "`proxy_cards` packs four proxies a vec4");
 
 pub const MAX_PORTALS: usize = 8;
 
@@ -76,7 +102,7 @@ pub const PROBE_PUSH_SIZE: u64 = (MAX_PROBES * 16) as u64;
 
 pub const PROBE_SELECT_SIZE: u64 = std::mem::size_of::<[[[f32; 4]; 3]; MAX_PROBES]>() as u64;
 const _: () = assert!(
-    PROBE_SELECT_OFFSET.is_multiple_of(256),
+    PROBE_SELECT_OFFSET % 256 == 0,
     "a uniform binding's offset must meet the strictest offset alignment a device may ask (256)",
 );
 
@@ -194,6 +220,21 @@ pub struct PostUpload {
     pub reflection_share: bool,
 
     pub night_vision: f32,
+
+    /// The rooms seen at their own adaptation; see `RoomExposure`.
+    pub rooms: RoomExposure,
+
+    /// Where the clouds' shadow map lies; see `Uniforms::cloud_map`.
+    pub cloud_map: [[f32; 4]; 3],
+
+    /// The stops the brush atlas is stored brighter by
+    /// (`time_of_day::atlas_stops`); the brushes read it this much down.
+    pub atlas_stops: f32,
+    /// The stops the ground map's light is read brighter by: from the
+    /// daylight it was built at to the frame's (`Levers::smooth_ground`),
+    /// so reflections of the ground follow the hour between its rebuilds
+    /// rather than stepping x1.5 at each. 0 reads it as built.
+    pub ground_stops: f32,
 }
 
 impl Default for PostUpload {
@@ -205,6 +246,10 @@ impl Default for PostUpload {
             terrain_detail_distance: 0.0,
             reflection_share: false,
             night_vision: 0.0,
+            rooms: [[0.0; 4]; 2 * ROOM_EXPOSURE_ROOMS],
+            cloud_map: [[0.0; 4]; 3],
+            atlas_stops: 0.0,
+            ground_stops: 0.0,
         }
     }
 }
@@ -233,6 +278,11 @@ impl SkyUpload {
 pub struct ShadowUpload {
     pub sun_view_proj: Mat4,
 
+    /// The newer static map and [its share, older layer, its layer, 0]
+    /// (`Uniforms::sun_blend`); share 0 reads the older alone.
+    pub sun_next_view_proj: Mat4,
+    pub sun_blend: [f32; 4],
+
     pub sun_dynamic_view_proj: Mat4,
 
     pub sun_dynamic_enabled: bool,
@@ -248,6 +298,8 @@ impl ShadowUpload {
     pub fn disabled() -> Self {
         Self {
             sun_view_proj: Mat4::IDENTITY,
+            sun_next_view_proj: Mat4::IDENTITY,
+            sun_blend: [0.0; 4],
             sun_dynamic_view_proj: Mat4::IDENTITY,
             sun_dynamic_enabled: false,
             spot_view_proj: [Mat4::IDENTITY; SHADOW_MATRICES],
@@ -265,6 +317,9 @@ pub struct UniformBuffer {
     pub twin_buffer: Buffer,
     pub twin_bind_group: BindGroup,
 
+    pub planar_buffer: Buffer,
+    pub planar_bind_group: BindGroup,
+
     probes: ProbeUpload,
 
     probe_depth_view: TextureView,
@@ -275,6 +330,9 @@ pub struct UniformBuffer {
     proxy_field_view: TextureView,
 
     proxy_card_view: TextureView,
+
+    cloud_shadow: Texture,
+    cloud_shadow_view: TextureView,
 }
 
 impl UniformBuffer {
@@ -303,12 +361,16 @@ impl UniformBuffer {
         push_slots(probes.unwrap_or(&self.probes))
     }
 
+    pub fn probes_or_level<'a>(&'a self, probes: Option<&'a ProbeUpload>) -> &'a ProbeUpload {
+        probes.unwrap_or(&self.probes)
+    }
+
     pub fn probes(&self) -> ProbeUpload {
         self.probes
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+#[allow(clippy::too_many_arguments)]
 fn scene_bind_group(
     device: &Device,
     layout: &BindGroupLayout,
@@ -326,6 +388,7 @@ fn scene_bind_group(
     ground_view: &TextureView,
     proxy_field_view: &TextureView,
     proxy_card_view: &TextureView,
+    cloud_shadow_view: &TextureView,
 ) -> BindGroup {
     device.create_bind_group(&BindGroupDescriptor {
         label: Some(label),
@@ -344,6 +407,7 @@ fn scene_bind_group(
             BindGroupEntry { binding: 10, resource: BindingResource::TextureView(ground_view) },
             BindGroupEntry { binding: 11, resource: BindingResource::TextureView(proxy_field_view) },
             BindGroupEntry { binding: 12, resource: BindingResource::TextureView(proxy_card_view) },
+            BindGroupEntry { binding: 14, resource: BindingResource::TextureView(cloud_shadow_view) },
             BindGroupEntry {
                 binding: 13,
                 resource: BindingResource::Buffer(BufferBinding {
@@ -406,7 +470,9 @@ impl UniformBuffer {
                 },
                 BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+                    // The vertex stage too: a face's lamp list
+                    // (`brush_pipeline::FACE_LAMPS`).
+                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -419,7 +485,7 @@ impl UniformBuffer {
                     visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Texture {
                         sample_type: TextureSampleType::Depth,
-                        view_dimension: TextureViewDimension::D2,
+                        view_dimension: TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -532,15 +598,43 @@ impl UniformBuffer {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let (probe_depth_view, probe_depth_sampler) = default_probe_depth(device);
         let ground_view = default_ground_map(device);
         let proxy_field_view = super::proxy_field::none(device);
         let proxy_card_view = super::proxy_cards::none(device);
+        // Read only once written and switched on (`Uniforms::cloud_map`).
+        let cloud_shadow = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cloud_shadow_map"),
+            size: wgpu::Extent3d { width: CLOUD_SHADOW_SIZE, height: CLOUD_SHADOW_SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let cloud_shadow_view = cloud_shadow.create_view(&wgpu::TextureViewDescriptor::default());
 
         let twin_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("uniform_buf_twin"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let planar_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("uniform_buf_planar"),
             size: std::mem::size_of::<Uniforms>() as u64,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -563,10 +657,12 @@ impl UniformBuffer {
                 &ground_view,
                 &proxy_field_view,
                 &proxy_card_view,
+                &cloud_shadow_view,
             )
         };
         let bind_group = group(&buffer, "uniform_bg");
         let twin_bind_group = group(&twin_buffer, "uniform_bg_twin");
+        let planar_bind_group = group(&planar_buffer, "uniform_bg_planar");
 
         Self {
             buffer,
@@ -574,13 +670,33 @@ impl UniformBuffer {
             bind_group,
             twin_buffer,
             twin_bind_group,
+            planar_buffer,
+            planar_bind_group,
             probes: ProbeUpload::default(),
             probe_depth_view,
             probe_depth_sampler,
             ground_view,
             proxy_field_view,
             proxy_card_view,
+            cloud_shadow,
+            cloud_shadow_view,
         }
+    }
+
+    /// Where the clouds draw their shadow (`Sky::step_clouds`).
+    pub fn cloud_shadow_view(&self) -> &TextureView {
+        &self.cloud_shadow_view
+    }
+
+    /// The clouds' shadow map, `CLOUD_SHADOW_SIZE` squared, row by row (z),
+    /// 0 = no light through.
+    pub fn write_cloud_shadow(&self, queue: &Queue, texels: &[u8]) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.cloud_shadow, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            texels,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(CLOUD_SHADOW_SIZE), rows_per_image: Some(CLOUD_SHADOW_SIZE) },
+            wgpu::Extent3d { width: CLOUD_SHADOW_SIZE, height: CLOUD_SHADOW_SIZE, depth_or_array_layers: 1 },
+        );
     }
 
     pub fn upload(&self, queue: &Queue, view_proj: Mat4, camera_pos: Vec3, shadow: &ShadowUpload) {
@@ -601,7 +717,7 @@ impl UniformBuffer {
         );
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_scene(
         &self,
         queue: &Queue,
@@ -612,10 +728,10 @@ impl UniformBuffer {
         post: &PostUpload,
         player: &PlayerUpload,
     ) {
-        self.upload_scene_with_probes(queue, view_proj, camera_pos, shadow, sky, post, player, None);
+        self.upload_scene_with_probes(queue, view_proj, camera_pos, shadow, sky, post, player, None)
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_scene_with_probes(
         &self,
         queue: &Queue,
@@ -639,7 +755,7 @@ impl UniformBuffer {
         );
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_scene_stereo(
         &self,
         queue: &Queue,
@@ -654,7 +770,7 @@ impl UniformBuffer {
         self.write_scene_stereo_to(queue, &self.buffer, view_proj, camera_pos, shadow, sky, post, player, probes);
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     pub fn write_scene_stereo_to(
         &self,
         queue: &Queue,
@@ -714,13 +830,14 @@ impl UniformBuffer {
 
             portal_params: [
                 probes.portal_count as f32,
-                if probes.no_trace { 1.0 } else { 0.0 },
+
+                probes.trace_word(),
                 dense.outdoor_volume + 1.0,
                 probes.building_count as f32,
             ],
             probe_portals: dense.portals,
 
-            proxy_params: [probes.proxy_count as f32, post.night_vision, 0.0, 0.0],
+            proxy_params: [probes.proxy_count as f32, post.night_vision, post.atlas_stops, post.ground_stops],
             probe_proxies: dense.proxies,
             probe_rooms: room_tables,
             ground_params: dense.ground,
@@ -740,6 +857,10 @@ impl UniformBuffer {
                 },
             ],
             character_cards: player.capsules.cards,
+            room_exposure: post.rooms,
+            cloud_map: post.cloud_map,
+            sun_next_view_proj: shadow.sun_next_view_proj.to_cols_array_2d(),
+            sun_blend: shadow.sun_blend,
             post_params: [
                 post.exposure,
                 match post.tonemap {
@@ -813,7 +934,7 @@ pub(crate) mod test_support {
 
         let texel: Vec<u8> = (0..4)
             .flat_map(|c| {
-                let u = f32::from(colour[c]) / 255.0;
+                let u = colour[c] as f32 / 255.0;
 
                 let linear = if c == 3 {
                     u
@@ -885,6 +1006,8 @@ pub struct ProbeUpload {
     pub portals: [[[f32; 4]; 3]; MAX_PORTALS],
 
     pub no_trace: bool,
+
+    pub open_ground: bool,
 
     pub proxy_count: u32,
 
@@ -1027,7 +1150,7 @@ impl ProbeUpload {
     }
 
     pub fn volume(&self, slot: usize) -> u32 {
-        self.boxes.get(slot).map_or(0, |b| b[2][3] as u32)
+        self.boxes.get(slot).map(|b| b[2][3] as u32).unwrap_or(0)
     }
 
     pub fn set(&mut self, slot: usize, layer: u32, centre: Vec3, min: Vec3, max: Vec3) {
@@ -1066,7 +1189,7 @@ impl ProbeUpload {
     }
 
     pub fn layer(&self, slot: usize) -> u32 {
-        self.boxes.get(slot).map_or(0, |b| b[0][3] as u32)
+        self.boxes.get(slot).map(|b| b[0][3] as u32).unwrap_or(0)
     }
 
     pub fn dense_rooms(&self) -> (ProbeUpload, [[f32; 4]; ROOM_TABLE_ROWS]) {
@@ -1083,16 +1206,19 @@ impl ProbeUpload {
         let mut last: Vec<usize> = Vec::new();
         for slot in 0..(self.count as usize).min(MAX_PROBES) {
             let raw = self.boxes[slot][2][3];
-            let room = if let Some(room) = rooms.iter().position(|&r| r == raw) {
-                put(&mut tables, 4, last[room], slot);
-                last[room] = slot;
-                room
-            } else {
-                rooms.push(raw);
-                last.push(slot);
-                let room = rooms.len() - 1;
-                put(&mut tables, 0, room, slot);
-                room
+            let room = match rooms.iter().position(|&r| r == raw) {
+                Some(room) => {
+                    put(&mut tables, 4, last[room], slot);
+                    last[room] = slot;
+                    room
+                }
+                None => {
+                    rooms.push(raw);
+                    last.push(slot);
+                    let room = rooms.len() - 1;
+                    put(&mut tables, 0, room, slot);
+                    room
+                }
             };
             out.boxes[slot][2][3] = room as f32;
         }
@@ -1108,7 +1234,7 @@ impl ProbeUpload {
                 match last_portal[room] {
                     None => put(&mut tables, 8, room, p),
                     Some(prev) => {
-                        let side = usize::from(out.portals[prev][1][3] != room as f32);
+                        let side = if out.portals[prev][1][3] == room as f32 { 0 } else { 1 };
                         put(&mut tables, 12, 2 * prev + side, p);
                     }
                 }
@@ -1141,6 +1267,19 @@ pub const NO_RESIDENT_ROOM: f32 = 1_000_000.0;
 
 pub const ROOM_TABLE_ROWS: usize = 24;
 
+impl ProbeUpload {
+
+    pub fn trace_word(&self) -> f32 {
+        if self.no_trace {
+            1.0
+        } else if self.open_ground {
+            -1.0
+        } else {
+            0.0
+        }
+    }
+}
+
 impl Default for ProbeUpload {
     fn default() -> Self {
         Self {
@@ -1149,6 +1288,7 @@ impl Default for ProbeUpload {
             portal_count: 0,
             portals: [[[0.0; 4]; 3]; MAX_PORTALS],
             no_trace: false,
+            open_ground: false,
             proxy_count: 0,
             proxies: [[[0.0; 4]; 3]; MAX_PROXIES],
             outdoor_volume: -1.0,
@@ -1278,9 +1418,9 @@ pub fn probe_mip_levels(resolution: u32) -> u32 {
 }
 
 pub(crate) fn f16_to_f32(h: u16) -> f32 {
-    let sign = u32::from((h >> 15) & 1);
-    let exp = i32::from((h >> 10) & 0x1f);
-    let mant = u32::from(h & 0x3ff);
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let mant = (h & 0x3ff) as u32;
     let bits = if exp == 0 {
         if mant == 0 {
             sign << 31
@@ -1342,8 +1482,8 @@ pub fn probe_mean_radiance(faces: &[u8], res: u32) -> f32 {
     let cube = decode_probe_faces(faces, res);
     let (mut sum, mut weight) = (0.0f64, 0.0f64);
     for [r, g, b, a] in cube.texels {
-        let a = f64::from(a.clamp(0.0, 1.0));
-        sum += f64::from(0.2126 * r + 0.7152 * g + 0.0722 * b) * a;
+        let a = a.clamp(0.0, 1.0) as f64;
+        sum += (0.2126 * r + 0.7152 * g + 0.0722 * b) as f64 * a;
         weight += a;
     }
     if weight > 0.0 {
@@ -1466,7 +1606,7 @@ pub fn write_probe_layer(queue: &Queue, tex: &wgpu::Texture, layer: u32, res: u3
 
 impl UniformBuffer {
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     pub fn rebind_probes(
         &mut self,
         device: &Device,
@@ -1497,10 +1637,12 @@ impl UniformBuffer {
                 &self.ground_view,
                 &self.proxy_field_view,
                 &self.proxy_card_view,
+                &self.cloud_shadow_view,
             )
         };
         self.bind_group = group(&self.buffer, "uniform_bg");
         self.twin_bind_group = group(&self.twin_buffer, "uniform_bg_twin");
+        self.planar_bind_group = group(&self.planar_buffer, "uniform_bg_planar");
         self.probes = probes;
     }
 }
@@ -1875,10 +2017,10 @@ mod probe_mip_upload_tests {
         for level in 0..probe_mip_levels(RES) {
             let side = (RES >> level).max(1);
 
-            let row = (side * 8).div_ceil(256) * 256;
+            let row = ((side * 8 + 255) / 256) * 256;
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("probe_mip_readback"),
-                size: u64::from(row * side),
+                size: (row * side) as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -2037,7 +2179,7 @@ mod dense_room_tests {
             while p >= 0.0 {
                 let pi = p as usize;
                 out.push(pi);
-                let side = usize::from(dense.portals[pi][1][3] != room);
+                let side = if dense.portals[pi][1][3] == room { 0 } else { 1 };
                 p = at(12, 2 * pi + side);
             }
             out
@@ -2089,7 +2231,7 @@ mod building_tests {
         up.set_buildings(&[small, big], None);
         assert_eq!(up.building_count, 0);
 
-        let many: Vec<(Vec3, Vec3)> = (0..=MAX_BUILDINGS).map(|i| (Vec3::ZERO, Vec3::splat(1.0 + i as f32))).collect();
+        let many: Vec<(Vec3, Vec3)> = (0..MAX_BUILDINGS + 1).map(|i| (Vec3::ZERO, Vec3::splat(1.0 + i as f32))).collect();
         up.set_buildings(&many, Some(0));
         assert_eq!(up.building_count as usize, MAX_BUILDINGS);
         assert!((0..MAX_BUILDINGS).all(|slot| up.buildings[slot * 2][3] != 0.0), "the smallest building was kept");

@@ -7,9 +7,15 @@ pub struct MeshPipeline {
     pub pipeline: RenderPipeline,
 
     pub thin_pipeline: RenderPipeline,
+
+    pub opaque: Option<RenderPipeline>,
     pub texture_layout: BindGroupLayout,
     pub model_layout: BindGroupLayout,
     pub lightmap_layout: BindGroupLayout,
+}
+
+pub fn opaque_target(format: TextureFormat) -> [Option<ColorTargetState>; 1] {
+    [Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::ALL })]
 }
 
 impl MeshPipeline {
@@ -32,7 +38,11 @@ impl MeshPipeline {
         camera_layout: &BindGroupLayout,
         samples: u32,
     ) -> Self {
-        Self::new_with_front_face(device, format, camera_layout, FrontFace::Ccw, samples, crate::renderer::multiview::ViewMode::Mono)
+
+        Self::new_edited(
+            device, format, camera_layout, FrontFace::Ccw, samples, crate::renderer::multiview::ViewMode::Mono, true,
+            &|src| src, ("mesh_pipeline", "mesh_thin_pipeline"), true,
+        )
     }
 
     pub fn new_mirror(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
@@ -68,7 +78,7 @@ impl MeshPipeline {
         view: crate::renderer::multiview::ViewMode,
         thin_mean: bool,
 ) -> Self {
-        Self::new_edited(device, format, camera_layout, front_face, samples, view, thin_mean, &|src| src, ("mesh_pipeline", "mesh_thin_pipeline"))
+        Self::new_edited(device, format, camera_layout, front_face, samples, view, thin_mean, &|src| src, ("mesh_pipeline", "mesh_thin_pipeline"), false)
     }
 
     pub fn new_multisampled_spotless(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout, samples: u32) -> Self {
@@ -82,6 +92,7 @@ impl MeshPipeline {
             true,
             &crate::renderer::lights::without_spot_shadows,
             ("mesh_pipeline_spotless", "mesh_thin_pipeline_spotless"),
+            true,
         )
     }
 
@@ -93,7 +104,7 @@ impl MeshPipeline {
                 continue;
             }
             let edit = |mut src: String| {
-                for (from, to) in *edits {
+                for (from, to) in edits.iter() {
                     src = src.replacen(from, to, 1);
                 }
                 src
@@ -109,11 +120,12 @@ impl MeshPipeline {
                 true,
                 &edit,
                 (label, &thin_label),
+                false,
             );
         }
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn new_edited(
         device: &Device,
         format: TextureFormat,
@@ -124,6 +136,7 @@ impl MeshPipeline {
         thin_mean: bool,
         edit: &dyn Fn(String) -> String,
         (label, thin_label): (&str, &str),
+        opaque_twin: bool,
     ) -> Self {
 
         let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -187,7 +200,7 @@ impl MeshPipeline {
             immediate_size: 0,
         });
 
-        let build = |label: &str, shader: &ShaderModule, buffers: &[Option<VertexBufferLayout>]| device.create_render_pipeline(&RenderPipelineDescriptor {
+        let build_with = |label: &str, shader: &ShaderModule, buffers: &[Option<VertexBufferLayout>], blend: Option<BlendState>| device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
@@ -202,7 +215,7 @@ impl MeshPipeline {
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    blend,
                     write_mask: ColorWrites::ALL,
                 })],
             }),
@@ -224,7 +237,11 @@ impl MeshPipeline {
             multiview_mask: view.mask(),
             cache: None,
         });
+        let build = |label: &str, shader: &ShaderModule, buffers: &[Option<VertexBufferLayout>]| {
+            build_with(label, shader, buffers, Some(BlendState::ALPHA_BLENDING))
+        };
         let pipeline = build(label, &shader, &[Some(MeshVertex::layout())]);
+        let opaque = opaque_twin.then(|| build_with(&format!("{label}_opaque"), &shader, &[Some(MeshVertex::layout())], None));
         let thin_shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("mesh_thin_shader"),
             source: ShaderSource::Wgsl(
@@ -240,6 +257,7 @@ impl MeshPipeline {
         Self {
             pipeline,
             thin_pipeline,
+            opaque,
             texture_layout,
             model_layout,
             lightmap_layout,
@@ -282,7 +300,11 @@ pub struct ModelUniform {
 impl ModelUniform {
 
     pub fn set_wetness(&self, queue: &Queue, wet: f32) {
-        queue.write_buffer(&self.buffer, MODEL_WEATHER_OFFSET, bytemuck::cast_slice(&[wet.clamp(0.0, 1.0), 0.0, 0.0, 0.0]));
+        queue.write_buffer(&self.buffer, MODEL_WEATHER_OFFSET, bytemuck::cast_slice(&[wet.clamp(0.0, 1.0)]));
+    }
+
+    pub fn set_highlight(&self, queue: &Queue, level: f32) {
+        queue.write_buffer(&self.buffer, MODEL_WEATHER_OFFSET + 4, bytemuck::cast_slice(&[level.clamp(0.0, 1.0)]));
     }
 
     pub fn upload(&self, queue: &Queue, model: glam::Mat4) {
@@ -323,7 +345,7 @@ impl ModelUniform {
         self.upload_lit_bulb(queue, model, sky_vis, emissive_drive, room, None, 0.0);
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_lit_bulb(
         &self,
         queue: &Queue,
@@ -337,7 +359,7 @@ impl ModelUniform {
         self.upload_lit_bulb_scaled(queue, model, sky_vis, emissive_drive, room, own, thin_width, 1.0);
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_lit_bulb_scaled(
         &self,
         queue: &Queue,
@@ -367,7 +389,7 @@ impl ModelUniform {
             let k = own_scale.clamp(0.0, 1.0);
             data[17] *= k;
 
-            data[18] = 2.0 + f32::from(channel);
+            data[18] = 2.0 + channel as f32;
             data[56..60].copy_from_slice(&[l.position.x, l.position.y, l.position.z, l.range]);
             data[60..64].copy_from_slice(&[l.direction.x, l.direction.y, l.direction.z, cos_outer]);
             let i = l.intensity * k;
@@ -412,8 +434,14 @@ const VOLUME_WALK: &str = "    var pick = -1;
         }
     }";
 
+const GRAB_GLOW_BRANCH: &str = "    if (grab_glow > 0.0) {
+        out = grab_highlight(out, n, in.world_pos, grab_glow);
+    }";
+
 const MESH_REGISTER_CUTS: &[(&str, &[(&str, &str)])] = &[
     ("mesh_cut_none", &[]),
+
+    ("mesh_no_grab_glow", &[(GRAB_GLOW_BRANCH, "")]),
     ("mesh_box_spots", &[(TENT_CALL, "    return pcf_tile_at(\n        tex,")]),
 
     ("mesh_tent_loop", &[(TENT_CALL, "    return pcf_tile_tent_at(\n        tex,")]),
@@ -434,7 +462,31 @@ pub struct SkinnedMeshPipeline {
     pub texture_layout: BindGroupLayout,
     pub model_layout: BindGroupLayout,
     pub skin_joint_layout: BindGroupLayout,
+
+    layout: PipelineLayout,
+    format: TextureFormat,
+    samples: u32,
+    view: crate::renderer::multiview::ViewMode,
+
+    pub body_twins: Option<[RenderPipeline; 2]>,
+
+    pub opaque_twins: Option<[RenderPipeline; 2]>,
+
+    pub prepass: Option<[RenderPipeline; 2]>,
 }
+
+pub(crate) fn skinned_body_twin(src: &str, wet: bool) -> Option<String> {
+    let edit = if wet {
+        ("const PROBE_NOWHERE: bool = false;", "const PROBE_NOWHERE: bool = true;")
+    } else {
+        ("    if (wet > 0.0) {", "    if (false) {")
+    };
+    let classic = ("    if (rough >= 0.996) {", "    if (true) {");
+    (src.matches(edit.0).count() == 1 && src.matches(classic.0).count() == 1)
+        .then(|| src.replacen(edit.0, edit.1, 1).replacen(classic.0, classic.1, 1))
+}
+
+pub static SKINNED_FILM_TRACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl SkinnedMeshPipeline {
     pub fn new(device: &Device, format: TextureFormat, camera_layout: &BindGroupLayout) -> Self {
@@ -545,23 +597,119 @@ impl SkinnedMeshPipeline {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("skinned_mesh_pipeline"),
-            layout: Some(&layout),
+        let pipeline = Self::build(device, &layout, &shader, "skinned_mesh_pipeline", format, samples, view, Some(BlendState::ALPHA_BLENDING));
+
+        Self {
+            pipeline,
+            texture_layout,
+            model_layout,
+            skin_joint_layout,
+            layout,
+            format,
+            samples,
+            view,
+            body_twins: None,
+            opaque_twins: None,
+            prepass: None,
+        }
+    }
+
+    pub fn with_body_twins(mut self, device: &Device) -> Self {
+        let src = skinned_mesh_shader();
+
+        let twin = |wet: bool, label: &str| {
+            let edited = skinned_body_twin(&src, wet)?;
+            let shader = device.create_shader_module(ShaderModuleDescriptor {
+                label: Some(label),
+                source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, self.view.shader(edited)).into()),
+            });
+            let blended = Self::build(device, &self.layout, &shader, label, self.format, self.samples, self.view, Some(BlendState::ALPHA_BLENDING));
+            let opaque = Self::build(device, &self.layout, &shader, &format!("{label}_opaque"), self.format, self.samples, self.view, None);
+            Some((blended, opaque))
+        };
+        match (twin(false, "skinned_mesh_dry"), twin(true, "skinned_mesh_wet_lean")) {
+            (Some((dry, dry_opaque)), Some((wet, wet_opaque))) => {
+                self.body_twins = Some([dry, wet]);
+                self.opaque_twins = Some([dry_opaque, wet_opaque]);
+            }
+            _ => log::warn!("skinned body twins: the shader's edits no longer match; the body draws with the one shader"),
+        }
+
+        if let Some(dry) = skinned_body_twin(&src, false) {
+            let shader = device.create_shader_module(ShaderModuleDescriptor {
+                label: Some("skinned_body_prepass"),
+                source: ShaderSource::Wgsl(crate::renderer::shader_precision::for_device(device, self.view.shader(dry)).into()),
+            });
+            let depth = |label: &str, entry: &str| {
+                Self::build_entry(device, &self.layout, &shader, label, self.format, self.samples, self.view, None, entry, ColorWrites::empty())
+            };
+            self.prepass = Some([
+                depth("skinned_body_prepass", "fs_depth"),
+                depth("skinned_body_prepass_texels", "fs_depth_opaque_texels"),
+            ]);
+        }
+        self
+    }
+
+    pub fn for_opaque_body(&self, wet: bool) -> Option<&RenderPipeline> {
+        match &self.opaque_twins {
+            Some([dry, _]) if !wet => Some(dry),
+            Some([_, lean]) if !SKINNED_FILM_TRACED.load(std::sync::atomic::Ordering::Relaxed) => Some(lean),
+            _ => None,
+        }
+    }
+
+    pub fn for_body(&self, wet: bool) -> &RenderPipeline {
+        match &self.body_twins {
+            Some([dry, _]) if !wet => dry,
+            Some([_, lean]) if !SKINNED_FILM_TRACED.load(std::sync::atomic::Ordering::Relaxed) => lean,
+            _ => &self.pipeline,
+        }
+    }
+
+    fn build(
+        device: &Device,
+        layout: &PipelineLayout,
+        shader: &ShaderModule,
+        label: &str,
+        format: TextureFormat,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        blend: Option<BlendState>,
+    ) -> RenderPipeline {
+        Self::build_entry(device, layout, shader, label, format, samples, view, blend, "fs_main", ColorWrites::ALL)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_entry(
+        device: &Device,
+        layout: &PipelineLayout,
+        shader: &ShaderModule,
+        label: &str,
+        format: TextureFormat,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        blend: Option<BlendState>,
+        fragment_entry: &str,
+        write_mask: ColorWrites,
+    ) -> RenderPipeline {
+        device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
             vertex: VertexState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("vs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
                 buffers: &[Some(SkinnedMeshVertex::layout())],
             },
             fragment: Some(FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
+                module: shader,
+                entry_point: Some(fragment_entry),
                 compilation_options: PipelineCompilationOptions::default(),
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
+                    blend,
+                    write_mask,
                 })],
             }),
             primitive: PrimitiveState {
@@ -574,21 +722,15 @@ impl SkinnedMeshPipeline {
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(CompareFunction::Less),
+
+                depth_compare: Some(CompareFunction::LessEqual),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
             multisample: MultisampleState { count: samples, ..Default::default() },
             multiview_mask: view.mask(),
             cache: None,
-        });
-
-        Self {
-            pipeline,
-            texture_layout,
-            model_layout,
-            skin_joint_layout,
-        }
+        })
     }
 
     pub fn create_model_uniform(&self, device: &Device) -> ModelUniform {
@@ -613,7 +755,7 @@ impl SkinnedMeshPipeline {
 
 fn skinned_mesh_shader() -> String {
     format!(
-        r"
+        r#"
 struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9>, own: array<vec4<f32>, 3>, weather: vec4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
 {room_light}
@@ -649,10 +791,12 @@ struct VIn {{
 }}
 
 struct VOut {{
-    @builtin(position) clip: vec4<f32>,
+
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) uv:     vec2<f32>,
     @location(2) world_pos: vec3<f32>,
+    @location(3) room_near: f32,
 }}
 
 @vertex
@@ -678,12 +822,17 @@ fn vs_main(v: VIn) -> VOut {{
     out.normal    = (model_u.model * skinned_n).xyz;
     out.uv        = v.uv;
     out.world_pos = world_pos.xyz;
+    out.room_near = room_near(to_world_space(world_pos.xyz));
     return out;
 }}
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let n = normalize(in.normal);
+    let room_reach = ROOM_REACH_PIXELS * max(length(dpdx(in.world_pos)), length(dpdy(in.world_pos)));
+    if (in.room_near > 0.0) {{
+        local_exposure = room_local_exposure(to_world_space(in.world_pos), room_reach);
+    }}
 
     capsule_receiver = false;
 
@@ -694,12 +843,13 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         discard;
     }}
 
+    let rough_aa = specular_aa_roughness(rough, dpdx(n), dpdy(n));
     var shaded: vec3<f32>;
     if (rough >= 0.996) {{
         shaded = tex_color.rgb * (shade_with_sky(in.world_pos, n, model_u.params.x) + room_irradiance(n));
     }} else {{
         shaded = shade_material_env(
-            in.world_pos, n, rough, 1.0, model_u.params.x, room_irradiance(n), vec4<f32>(0.5, 0.5, 0.5, 0.0),
+            in.world_pos, n, rough_aa, 1.0, model_u.params.x, room_irradiance(n), vec4<f32>(0.5, 0.5, 0.5, 0.0),
             tex_color.rgb, in.world_pos, n,
         );
     }}
@@ -714,7 +864,20 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     }}
     return vec4<f32>(tonemap(rgb), tex_color.a);
 }}
-",
+
+@fragment
+fn fs_depth() -> @location(0) vec4<f32> {{
+    return vec4<f32>(0.0);
+}}
+
+@fragment
+fn fs_depth_opaque_texels(in: VOut) -> @location(0) vec4<f32> {{
+    if (textureSample(tex, samp, in.uv).a < 0.999) {{
+        discard;
+    }}
+    return vec4<f32>(0.0);
+}}
+"#,
         lights_block = wgsl_lights_block(0, 1),
         max_strength = super::mesh::MeshVertex::MAX_EMISSIVE_STRENGTH,
         max_skin_joints = MAX_SKIN_JOINTS,
@@ -723,7 +886,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
 }
 
 fn wgsl_room_irradiance() -> &'static str {
-    r"
+    r#"
 fn room_irradiance(n: vec3<f32>) -> vec3<f32> {
     let x = n.x; let y = n.y; let z = n.z;
     var e = model_u.room[0].rgb * 0.282095;
@@ -737,7 +900,7 @@ fn room_irradiance(n: vec3<f32>) -> vec3<f32> {
     e = e + model_u.room[8].rgb * (0.546274 * (x * x - y * y)) * 0.25;
     return max(e, vec3<f32>(0.0));
 }
-"
+"#
 }
 
 fn mesh_shader() -> String {
@@ -959,16 +1122,20 @@ fn mesh_shader_variant(thin: bool) -> String {
     mesh_shader_variant_with(thin, thin)
 }
 
-const MATERIAL_SHADE: &str = r"var colour: vec3<f32>;
+const MATERIAL_SHADE: &str = r#"var colour: vec3<f32>;
+    // Specular AA as the brushes and the ground have it: the roughness
+    // widened by how fast the normal turns across the pixel, so a glossy
+    // prop's highlight does not sparkle (2026-10-23).
+    let rough_aa = specular_aa_roughness(mask.a, dpdx(n), dpdy(n));
     if (mask.a >= 0.996) {
         colour = tex_color.rgb * (shade_with_sky(in.world_pos, n, model_u.params.x * baked.a) + own_bulb_fill(in.world_pos, n) + baked.rgb + room_irradiance(n));
     } else {
         let env = baked.rgb + room_irradiance(n);
         colour = shade_material_env(
-            in.world_pos, n, mask.a, 1.0, model_u.params.x * baked.a, env, vec4<f32>(0.5, 0.5, 0.5, 0.0),
+            in.world_pos, n, rough_aa, 1.0, model_u.params.x * baked.a, env, vec4<f32>(0.5, 0.5, 0.5, 0.0),
             tex_color.rgb, in.world_pos, n,
         ) + tex_color.rgb * own_bulb_fill(in.world_pos, n);
-    }";
+    }"#;
 
 fn mesh_shader_variant_with(thin: bool, thin_mean: bool) -> String {
     let (thin_in, thin_out, thin_vs, thin_fn, thin_fade) = if thin {
@@ -993,8 +1160,8 @@ fn mesh_shader_variant_with(thin: bool, thin_mean: bool) -> String {
         ("", "", MATERIAL_SHADE)
     };
     format!(
-        r"
-struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9>, bulb: array<vec4<f32>, 3> }}
+        r#"
+struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f32>, 9>, bulb: array<vec4<f32>, 3>, weather: vec4<f32> }}
 @group(1) @binding(0) var<uniform> model_u: ModelUniform;
 {room_light}
 
@@ -1060,6 +1227,7 @@ struct VOut {{
     @location(4) @interpolate(flat) emissive: vec3<f32>,
     {thin_out}
     @location(6) @interpolate(flat) uv2_rect: vec4<f32>,
+    @location(8) room_near: f32,
 }}
 
 @vertex
@@ -1074,12 +1242,25 @@ fn vs_main(v: VIn) -> VOut {{
     out.uv2       = v.uv2;
     out.emissive  = unpack_emissive(v.emissive);
     out.uv2_rect  = v.uv2_rect;
+    out.room_near = room_near(to_world_space(world_pos.xyz));
     return out;
 }}
 
 {thin_fn}{thin_shade}
+
+const GRAB_GLOW_COLOUR: vec3<f32> = vec3<f32>(0.62, 0.86, 1.0);
+fn grab_highlight(c: vec3<f32>, n: vec3<f32>, world_pos: vec3<f32>, k: f32) -> vec3<f32> {{
+    let f = 1.0 - abs(dot(n, normalize(cam_pos() - world_pos)));
+    let rim = f * f * f;
+    return mix(c, GRAB_GLOW_COLOUR, k * (0.16 + 0.64 * rim));
+}}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
+    let room_reach = ROOM_REACH_PIXELS * max(length(dpdx(in.world_pos)), length(dpdy(in.world_pos)));
+    if (in.room_near > 0.0) {{
+        local_exposure = room_local_exposure(to_world_space(in.world_pos), room_reach);
+    }}
     let n = normalize(in.normal);{thin_span}
 
     let uv2 = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
@@ -1113,9 +1294,15 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     let glow = in.emissive * mask.rgb * model_u.params.y;
 
     {shaded}
-    return vec4<f32>(tonemap(colour + glow), tex_color.a{thin_fade});
+    var out = tonemap(colour + glow);
+
+    let grab_glow = model_u.weather.y;
+    if (grab_glow > 0.0) {{
+        out = grab_highlight(out, n, in.world_pos, grab_glow);
+    }}
+    return vec4<f32>(out, tex_color.a{thin_fade});
 }}
-",
+"#,
         lights_block = wgsl_lights_block(0, 1),
         max_strength = super::mesh::MeshVertex::MAX_EMISSIVE_STRENGTH,
         stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
@@ -1124,19 +1311,10 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
 }
 
 #[cfg(test)]
-pub fn mesh_shader_src() -> String {
-    mesh_shader()
-}
-#[cfg(test)]
-pub fn skinned_mesh_shader_src() -> String {
-    skinned_mesh_shader()
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::renderer::lights::{Light, LightKind, LightsUniform};
-    use crate::renderer::mesh::{create_lightmap_texture, MeshVertex};
+    use crate::renderer::mesh::{create_lightmap_texture, create_texture_from_rgba, MeshVertex};
     use crate::renderer::terrain_pipeline::tests::headless_gpu;
     use crate::renderer::uniforms::test_support::{scene_uniforms, TEST_EYE};
     use crate::renderer::uniforms::ShadowUpload;
@@ -1176,7 +1354,7 @@ mod tests {
         for base in [mesh_shader(), mesh_shader_variant_with(true, true)] {
             for (label, edits) in MESH_REGISTER_CUTS {
                 let mut src = base.clone();
-                for (from, to) in *edits {
+                for (from, to) in edits.iter() {
                     assert!(src.contains(from), "{label}: `{from}` is not in the mesh shader");
                     src = src.replacen(from, to, 1);
                 }
@@ -1284,7 +1462,7 @@ mod tests {
         let lit = render(Some([255, 255, 255, 255])).unwrap();
         let hidden = render(Some([0, 0, 255, 255])).unwrap();
         assert!(plain[0] > 60, "the lamp does not light the mesh at all: {plain:?}");
-        assert!((i32::from(lit[0]) - i32::from(plain[0])).abs() <= 1, "a fully lit mask changed the light: {lit:?} vs {plain:?}");
+        assert!((lit[0] as i32 - plain[0] as i32).abs() <= 1, "a fully lit mask changed the light: {lit:?} vs {plain:?}");
         assert!(hidden[0] <= 2, "a mask that hides the bulb let its light through: {hidden:?}");
     }
 
@@ -1356,7 +1534,7 @@ mod tests {
         let by_sky = render(1.0, &[[0.0; 3]; 9]).unwrap();
         assert!(by_room[0] > 8, "the room lit nothing: {by_room:?}");
         assert!(
-            (i32::from(by_room[0]) - i32::from(by_sky[0])).abs() <= 1,
+            (by_room[0] as i32 - by_sky[0] as i32).abs() <= 1,
             "the room {by_room:?} vs the sky {by_sky:?}"
         );
 
@@ -1391,7 +1569,7 @@ mod tests {
         render_mesh_inner(emissive, drive, lit, sky_vis, mask, lightmap_texel, [128, 128, 128, 255])
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn render_mesh_inner(
         emissive: [f32; 3],
         drive: f32,
@@ -1404,7 +1582,7 @@ mod tests {
         render_mesh_stationary(emissive, drive, lit, sky_vis, mask, lightmap_texel, base, None, 4.0)
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn render_mesh_stationary(
         emissive: [f32; 3],
         drive: f32,
@@ -1431,7 +1609,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn render_mesh_room(
         emissive: [f32; 3],
         drive: f32,
@@ -1462,7 +1640,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn render_mesh_room_with(
         emissive: [f32; 3],
         drive: f32,
@@ -1509,6 +1687,7 @@ mod tests {
         let pipeline = MeshPipeline::new(&device, format, &uniforms.layout);
         let model = pipeline.create_model_uniform(&device);
         model.upload_lit_bulb(&queue, glam::Mat4::IDENTITY, sky_vis, drive, room, own, 0.0);
+        model.set_highlight(&queue, TEST_HIGHLIGHT.with(|h| h.get()));
 
         let tex = crate::renderer::mesh::create_mesh_material_texture(
             &device,
@@ -1579,7 +1758,7 @@ mod tests {
         let dv = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("mesh_test_readback"),
-            size: u64::from(256 * SIZE),
+            size: (256 * SIZE) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1661,7 +1840,7 @@ mod tests {
     const SIDE_LAMP_DISTANCE: f32 = 60.0;
     const SIDE_LAMP_LIGHT: f32 = 6.0;
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     fn render_wire(
         radius_px: f32,
         shift_px: f32,
@@ -1769,7 +1948,7 @@ mod tests {
         let (mv, rv, dv) = (msaa.create_view(&Default::default()), resolve.create_view(&Default::default()), depth.create_view(&Default::default()));
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("thin_test_readback"),
-            size: u64::from(256 * SIZE),
+            size: (256 * SIZE) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1783,7 +1962,7 @@ mod tests {
                     resolve_target: Some(&rv),
                     ops: Operations {
                         load: LoadOp::Clear(if light == WireLight::SideOnWall {
-                            let w = f64::from(WALL) / 255.0;
+                            let w = WALL as f64 / 255.0;
                             Color { r: w, g: w, b: w, a: 1.0 }
                         } else {
                             Color::BLACK
@@ -1805,20 +1984,23 @@ mod tests {
             pass.set_bind_group(2, &tex.bind_group, &[]);
             pass.set_bind_group(3, &lm.bind_group, &[]);
             pass.set_vertex_buffer(0, vb.slice(..));
-            if let (Some(parts), Some(_)) = (&parts, thin_px) {
-                if parts.solid_count > 0 {
-                    pass.set_pipeline(&pipeline.pipeline);
-                    pass.set_index_buffer(parts.solid_index_buffer.slice(..), IndexFormat::Uint32);
-                    pass.draw_indexed(0..parts.solid_count, 0, 0..1);
+            match (&parts, thin_px) {
+                (Some(parts), Some(_)) => {
+                    if parts.solid_count > 0 {
+                        pass.set_pipeline(&pipeline.pipeline);
+                        pass.set_index_buffer(parts.solid_index_buffer.slice(..), IndexFormat::Uint32);
+                        pass.draw_indexed(0..parts.solid_count, 0, 0..1);
+                    }
+                    pass.set_pipeline(&pipeline.thin_pipeline);
+                    pass.set_vertex_buffer(1, parts.vertex_buffer.slice(..));
+                    pass.set_index_buffer(parts.thin_index_buffer.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..parts.thin_count, 0, 0..1);
                 }
-                pass.set_pipeline(&pipeline.thin_pipeline);
-                pass.set_vertex_buffer(1, parts.vertex_buffer.slice(..));
-                pass.set_index_buffer(parts.thin_index_buffer.slice(..), IndexFormat::Uint32);
-                pass.draw_indexed(0..parts.thin_count, 0, 0..1);
-            } else {
-                pass.set_pipeline(&pipeline.pipeline);
-                pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
-                pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+                _ => {
+                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+                    pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+                }
             }
         }
         encoder.copy_texture_to_buffer(
@@ -1855,7 +2037,7 @@ mod tests {
     ) -> Option<(f32, f32)> {
         let rows: Vec<Vec<f32>> = (0..8)
             .map(|k| render_wire(radius_px, k as f32 / 8.0, thin_px, tilt, light, zoom, sampled))
-            .map(|image| Some(image?.iter().map(|row| row.iter().map(|&v| f32::from(v)).sum()).collect()))
+            .map(|image| Some(image?.iter().map(|row| row.iter().map(|&v| v as f32).sum()).collect()))
             .collect::<Option<_>>()?;
         let (mut mean_all, mut cv_all, mut n) = (0.0, 0.0, 0.0);
         for y in 16..48 {
@@ -1874,7 +2056,7 @@ mod tests {
         let Some((plain_mean, plain_cv)) = wire_light_across_shifts(0.16, None) else { return };
         let (thin_mean, thin_cv) = wire_light_across_shifts(0.16, Some(1.0)).unwrap();
 
-        let full = f32::from(*render_thin_wire(3.0, 0.0, None).unwrap()[32].iter().max().unwrap());
+        let full = *render_thin_wire(3.0, 0.0, None).unwrap()[32].iter().max().unwrap() as f32;
         let truth = 0.32 * full;
         eprintln!("THIN wire 0.32 px (truth {truth:.1}): plain mean {plain_mean:.1} varies {:.1}%, thin pass mean {thin_mean:.1} varies {:.1}%", plain_cv * 100.0, thin_cv * 100.0);
         assert!(plain_cv > 0.3, "the plain wire shimmers ({:.1}%), or this measures nothing", plain_cv * 100.0);
@@ -1897,7 +2079,7 @@ mod tests {
         let mut sum = 0.0f32;
         for y in 16..48 {
             for x in 0..64 {
-                let v = |k: usize| f32::from(images[k][y][x]);
+                let v = |k: usize| images[k][y][x] as f32;
                 for k in 1..7 {
                     let d = v(k + 1) - 2.0 * v(k) + v(k - 1);
                     sum += d * d;
@@ -1914,7 +2096,7 @@ mod tests {
         let (mut sum, mut n, mut peak) = (0.0f32, 0.0f32, 0.0f32);
         for y in 16..48 {
             for x in 0..64 {
-                let v = |k: usize| f32::from(images[k][y][x]) - behind;
+                let v = |k: usize| images[k][y][x] as f32 - behind;
                 for k in 1..7 {
                     if v(k - 1).abs() + v(k).abs() + v(k + 1).abs() > 0.0 {
                         let d = v(k + 1) - 2.0 * v(k) + v(k - 1);
@@ -1933,7 +2115,7 @@ mod tests {
         let Some(steps) = wire_steps(0.16, Some(1.0)) else { return };
         let plain = wire_steps(0.16, None).unwrap();
         let (mean, cv) = wire_light_across_shifts(0.16, Some(1.0)).unwrap();
-        let full = f32::from(*render_thin_wire(3.0, 0.0, None).unwrap()[32].iter().max().unwrap());
+        let full = *render_thin_wire(3.0, 0.0, None).unwrap()[32].iter().max().unwrap() as f32;
         let truth = 0.32 * full;
         eprintln!(
             "THIN wire 0.32 px: steps {steps:.4} (drawn as it is {plain:.4}); light {mean:.1} against {truth:.1}, varies {:.1}%",
@@ -1950,7 +2132,7 @@ mod tests {
         let mut total = 0.0;
         for k in 0..8 {
             let image = render_thin_wire_at(radius_px, k as f32 / 8.0, thin_px, tilt)?;
-            let peaks: Vec<f32> = (16..48).map(|y| f32::from(*image[y].iter().max().unwrap())).collect();
+            let peaks: Vec<f32> = (16..48).map(|y| *image[y].iter().max().unwrap() as f32).collect();
             let mean = peaks.iter().sum::<f32>() / peaks.len() as f32;
             let sd = (peaks.iter().map(|p| (p - mean).powi(2)).sum::<f32>() / peaks.len() as f32).sqrt();
             total += sd / mean.max(1e-6);
@@ -1961,7 +2143,7 @@ mod tests {
     #[test]
     fn a_slanted_wire_neither_beads_nor_swings() {
         let Some(image) = render_thin_wire(3.0, 0.0, None) else { return };
-        let full = f32::from(*image[32].iter().max().unwrap());
+        let full = *image[32].iter().max().unwrap() as f32;
 
         for degrees in [0.0f32, 22.5, 26.57, 45.0] {
             let tilt = degrees.to_radians();
@@ -1987,10 +2169,10 @@ mod tests {
         for shift in [0.0, 0.375] {
             let Some(plain) = render_thin_wire(3.0, shift, None) else { return };
             let thin = render_thin_wire(3.0, shift, Some(1.0)).unwrap();
-            let light = |image: &Vec<Vec<u8>>| (16..48).map(|y| image[y].iter().map(|&v| f32::from(v)).sum::<f32>()).sum::<f32>();
+            let light = |image: &Vec<Vec<u8>>| (16..48).map(|y| image[y].iter().map(|&v| v as f32).sum::<f32>()).sum::<f32>();
             let (a, b) = (light(&plain), light(&thin));
             assert!((b / a - 1.0).abs() < 0.03, "a 6 px part, shifted {shift} px: light {b} against {a}");
-            let middle = |image: &Vec<Vec<u8>>| i32::from(*image[32].iter().max().unwrap());
+            let middle = |image: &Vec<Vec<u8>>| *image[32].iter().max().unwrap() as i32;
             assert!((middle(&plain) - middle(&thin)).abs() <= 2, "its middle, shifted {shift} px");
         }
     }
@@ -2081,6 +2263,119 @@ mod tests {
     }
 
     const NONE: [f32; 3] = [0.0, 0.0, 0.0];
+
+    thread_local! {
+
+        static TEST_HIGHLIGHT: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    }
+
+    #[test]
+    fn the_grab_glow_reads_in_the_dark_and_in_daylight() {
+        let bright = |glow: f32| {
+            TEST_HIGHLIGHT.with(|h| h.set(glow));
+            let px = render_mesh_stationary(NONE, 0.0, true, 1.0, [255; 4], [0, 0, 0, 255], [200, 200, 200, 255], None, 60.0);
+            TEST_HIGHLIGHT.with(|h| h.set(0.0));
+            px
+        };
+        let dark = |glow: f32| {
+            TEST_HIGHLIGHT.with(|h| h.set(glow));
+            let px = render_mesh_sky(NONE, 0.0, false, 0.0);
+            TEST_HIGHLIGHT.with(|h| h.set(0.0));
+            px
+        };
+        let Some(dark_plain) = dark(0.0) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let (dark_lit, day_plain, day_lit) = (dark(1.0).unwrap(), bright(0.0).unwrap(), bright(1.0).unwrap());
+        eprintln!("dark {dark_plain:?} -> {dark_lit:?}; daylight {day_plain:?} -> {day_lit:?}");
+
+        assert!(dark_lit[2] >= dark_plain[2] + 24 && dark_lit[2] > dark_lit[0], "dark: {dark_plain:?} -> {dark_lit:?}");
+
+        assert!(day_plain[0] > 200, "the daylight case is not bright: {day_plain:?}");
+        assert!(day_lit[0] + 6 <= day_plain[0] && day_lit[2] >= day_lit[0], "daylight: {day_plain:?} -> {day_lit:?}");
+
+        assert_eq!(dark(0.0).unwrap(), dark_plain);
+    }
+
+    #[test]
+    fn the_bodys_dry_and_wet_twins_validate_and_are_lean() {
+        let total = |s: &str| -> usize { crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|r| r.own * r.copies).sum() };
+        let src = skinned_mesh_shader();
+        let (dry, wet) = (skinned_body_twin(&src, false).expect("dry"), skinned_body_twin(&src, true).expect("wet"));
+        for (label, s) in [("dry", &dry), ("wet", &wet)] {
+            let module = wgpu::naga::front::wgsl::parse_str(s).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(s)));
+            wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+        let (d, w, full) = (total(&dry), total(&wet), total(&src));
+        eprintln!("skinned fs_main by the proxy: dry {d}, wet {w}, traced {full}");
+        assert!(d < 1200 && w * 5 < full, "dry {d}, wet {w}, traced {full}");
+    }
+
+    #[test]
+    fn the_scene_passs_opaque_twins_build_beside_the_blended_pipelines() {
+        assert!(mesh_shader().contains("return vec4<f32>(out, tex_color.a);"), "the mesh shader's alpha moved");
+        assert!(crate::renderer::pipeline::solid_shader_src().contains("return vec4<f32>(in.col.rgb * lit * lightmap, in.col.a);"));
+        let Some((device, _queue)) = crate::renderer::pipeline::tests::headless_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let lights = crate::renderer::lights::LightsUniform::new(&device);
+        let (_shadows, uniforms) = crate::renderer::uniforms::test_support::scene_uniforms(&device, &lights);
+        let format = TextureFormat::Rgba8UnormSrgb;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mesh = MeshPipeline::new_multisampled(&device, format, &uniforms.layout, 4);
+        let spotless = MeshPipeline::new_multisampled_spotless(&device, format, &uniforms.layout, 4);
+        let mirror = MeshPipeline::new_mirror(&device, format, &uniforms.layout);
+        let body = SkinnedMeshPipeline::new_multisampled(&device, format, &uniforms.layout, 4).with_body_twins(&device);
+        let solid = crate::renderer::pipeline::SolidPipeline::new_multisampled(&device, format, &uniforms.layout, 4);
+        let mirror_solid = crate::renderer::pipeline::SolidPipeline::new_mirror(&device, format, &uniforms.layout);
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "an opaque twin failed to build: {err:?}");
+        assert!(mesh.opaque.is_some() && spotless.opaque.is_some() && solid.opaque.is_some());
+        assert!(mirror.opaque.is_none() && mirror_solid.opaque.is_none());
+        assert!(body.for_opaque_body(false).is_some() && body.for_opaque_body(true).is_some());
+
+        assert!(body.prepass.is_some(), "the body's depth prepass was not built");
+        let src = skinned_mesh_shader();
+        assert!(src.contains("@builtin(position) @invariant clip"));
+        for twin in [skinned_body_twin(&src, false).unwrap(), skinned_body_twin(&src, true).unwrap()] {
+            let vs = |s: &str| s[s.find("fn vs_main").unwrap()..s.find("@fragment").unwrap()].to_string();
+            assert_eq!(vs(&twin), vs(&src), "a twin's vertex stage differs from the prepass's");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn skinned_shader_sizes() {
+        let total = |s: &str| -> usize { crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|r| r.own * r.copies).sum() };
+        let skinned = skinned_mesh_shader();
+        let wet_from = "    if (wet > 0.0) {";
+        let i = skinned.find(wet_from).expect("the wet branch");
+        let j = i + skinned[i..].find("\n    }}\n").map(|k| k + 6).unwrap_or(0);
+        let _ = j;
+        let dry = skinned.replacen("    if (wet > 0.0) {", "    if (false) {", 1);
+        eprintln!("skinned fs_main: dry path {} (wet branch compiled out), with the wet branch {}; static mesh {}", total(&dry), total(&skinned), total(&mesh_shader()));
+        let lean = skinned.replacen("const PROBE_NOWHERE: bool = false;", "const PROBE_NOWHERE: bool = true;", 1);
+        eprintln!("skinned fs_main, the wet film with no rooms' reflection machinery (PROBE_NOWHERE): {}", total(&lean));
+        eprintln!("{}", crate::renderer::shader_inlining::report("skinned lean", &lean, "fs_main", 12));
+    }
+
+    #[test]
+    fn the_grab_glow_is_behind_a_uniform_branch_and_small() {
+        for (label, src) in [("mesh", mesh_shader()), ("thin", mesh_shader_variant_with(true, true))] {
+            assert!(src.contains(GRAB_GLOW_BRANCH), "{label}: the glow is not behind its branch");
+            assert!(src.contains("let grab_glow = model_u.weather.y;"), "{label}");
+            let total = |s: &str| -> usize {
+                crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|r| r.own * r.copies).sum()
+            };
+            let (with, without) = (total(&src), total(&src.replacen(GRAB_GLOW_BRANCH, "", 1)));
+            eprintln!("{label} fs_main by the proxy: {without} without the grab glow, {with} with it (+{})", with - without);
+            assert!(with - without <= 40, "{label}: the glow grew the shader by {}", with - without);
+        }
+    }
     const RED_BULB: [f32; 3] = [0.9, 0.1, 0.05];
 
     #[test]
@@ -2167,9 +2462,9 @@ mod tests {
             return;
         };
         let red = render_mesh(RED_BULB, 2.0, false).unwrap();
-        let dr = i32::from(red[0]) - i32::from(dark[0]);
-        let dg = i32::from(red[1]) - i32::from(dark[1]);
-        let db = i32::from(red[2]) - i32::from(dark[2]);
+        let dr = red[0] as i32 - dark[0] as i32;
+        let dg = red[1] as i32 - dark[1] as i32;
+        let db = red[2] as i32 - dark[2] as i32;
         assert!(dr > dg && dr > db, "a red bulb must glow RED: deltas r{dr} g{dg} b{db}");
     }
 
@@ -2209,7 +2504,7 @@ mod tests {
             return;
         };
         assert!(
-            i32::from(pale[0]) - i32::from(dark[0]) > 24,
+            pale[0] as i32 - dark[0] as i32 > 24,
             "the same bounce rendered {dark:?} on a near-black material and {pale:?} \
              on a near-white one; it is being added outside the albedo multiply, so \
              indirect light ignores what it lands on",
@@ -2242,4 +2537,13 @@ mod tests {
         );
     }
 
+}
+
+#[cfg(test)]
+pub fn mesh_shader_src() -> String {
+    mesh_shader()
+}
+#[cfg(test)]
+pub fn skinned_mesh_shader_src() -> String {
+    skinned_mesh_shader()
 }

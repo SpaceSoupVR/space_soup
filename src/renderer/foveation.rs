@@ -49,6 +49,14 @@ pub fn centre_of_view(angle_left: f32, angle_right: f32, angle_up: f32, angle_do
 }
 
 pub fn density_pattern(width: u32, height: u32, centre: (f32, f32), level: FoveationLevel) -> (u32, u32, Vec<u8>) {
+    density_pattern_scaled(width, height, centre, level, 1.0)
+}
+
+/// The map for an eye drawn into the top-left `scale` of its target
+/// (`dynamic_resolution`): the same rings over the drawn rectangle, and the
+/// least density outside it, where nothing is shaded.
+pub fn density_pattern_scaled(width: u32, height: u32, centre: (f32, f32), level: FoveationLevel, scale: f32) -> (u32, u32, Vec<u8>) {
+    let s = scale.clamp(0.05, 1.0);
     let (w, h) = (width.div_ceil(DENSITY_TEXEL).max(1), height.div_ceil(DENSITY_TEXEL).max(1));
     let rings = level.rings();
     let mut texels = Vec::with_capacity((w * h * 2) as usize);
@@ -57,8 +65,10 @@ pub fn density_pattern(width: u32, height: u32, centre: (f32, f32), level: Fovea
 
             let x = ((i as f32 + 0.5) * DENSITY_TEXEL as f32 / width as f32).min(1.0);
             let y = ((j as f32 + 0.5) * DENSITY_TEXEL as f32 / height as f32).min(1.0);
-            let r = ((x - centre.0) / 0.5).hypot((y - centre.1) / 0.5);
-            let density = rings.iter().find(|(reach, _)| r < *reach).map_or(rings[rings.len() - 1].1, |(_, d)| *d);
+            let r = ((x - centre.0 * s) / (0.5 * s)).hypot((y - centre.1 * s) / (0.5 * s));
+            let outside = s < 1.0 && (x > s || y > s);
+            let least = rings[rings.len() - 1].1;
+            let density = if outside { least } else { rings.iter().find(|(reach, _)| r < *reach).map_or(least, |(_, d)| *d) };
             texels.extend_from_slice(&density);
         }
     }
@@ -92,6 +102,19 @@ mod tests {
     }
 
     #[test]
+    fn a_scaled_eye_keeps_its_rings_inside_its_rectangle() {
+        let (w, h, full) = density_pattern(1024, 1024, (0.5, 0.5), FoveationLevel::High);
+        let (_, _, half) = density_pattern_scaled(1024, 1024, (0.5, 0.5), FoveationLevel::High, 0.5);
+        let at = |m: &[u8], i: u32, j: u32| m[((j * w + i) * 2) as usize];
+        // The middle of the full map is the middle of the half map's rectangle.
+        assert_eq!(at(&full, w / 2, h / 2), at(&half, w / 4, h / 4));
+        assert_eq!(at(&half, w / 4, h / 4), 255);
+        // Outside the drawn rectangle, the least density.
+        assert!(at(&half, w - 1, h - 1) < 255);
+        assert_eq!(density_pattern_scaled(1024, 1024, (0.5, 0.5), FoveationLevel::High, 1.0).2, full);
+    }
+
+    #[test]
     fn off_is_full_density_everywhere() {
         let (_, _, texels) = density_pattern(640, 480, (0.3, 0.6), FoveationLevel::Off);
         assert!(texels.iter().all(|&b| b == 255));
@@ -115,7 +138,7 @@ mod tests {
         }
         for pair in maps.windows(2) {
             let (lower, higher) = (&pair[0].2, &pair[1].2);
-            let fragments = |t: &[u8]| t.chunks(2).map(|d| f32::from(d[0]) * f32::from(d[1])).sum::<f32>();
+            let fragments = |t: &[u8]| t.chunks(2).map(|d| d[0] as f32 * d[1] as f32).sum::<f32>();
             assert!(fragments(higher) < fragments(lower), "a higher level shaded no less");
             assert!(lower.iter().zip(higher.iter()).all(|(a, b)| b <= a), "a higher level was finer somewhere");
         }

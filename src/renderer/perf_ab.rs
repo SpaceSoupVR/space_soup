@@ -66,10 +66,22 @@ pub enum Phase {
     NoDoorShadows,
 
     TimeFrozen,
+    /// The trial levers of 2026-10-22, each against the baseline: smooth sun
+    /// shadow off, smooth ground light off (`smooth_probes` is read at load,
+    /// so it stays), the brightness cutoff on, the foveated trace at 30 and
+    /// 45 deg.
+    NoSmoothShadow,
+    NoSmoothGround,
+    LightCutoff,
+    Fovea30,
+    Fovea45,
+    /// The reflections' history off (`Levers::reflection_history`), against
+    /// the floor's warp by the marble room's doorway (user, 2026-10-23).
+    NoReflectionHistory,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 32] = [
+    pub const ALL: [Phase; 38] = [
         Phase::Baseline,
         Phase::HalfViewport,
         Phase::DirectPath,
@@ -102,6 +114,12 @@ impl Phase {
         Phase::NoWeather,
         Phase::NoDoorShadows,
         Phase::TimeFrozen,
+        Phase::NoSmoothShadow,
+        Phase::NoSmoothGround,
+        Phase::LightCutoff,
+        Phase::Fovea30,
+        Phase::Fovea45,
+        Phase::NoReflectionHistory,
     ];
 
     pub fn for_window(window: u64) -> Phase {
@@ -113,6 +131,20 @@ impl Phase {
 
     pub fn cycle_phase(window: u64) -> Phase {
         Self::ALL[(window % Self::ALL.len() as u64) as usize]
+    }
+
+    /// The cycle through only the phases `only` names (labels, comma
+    /// separated: `Levers::ab_only`), in `ALL`'s order; every phase when it
+    /// names none.
+    pub fn cycle_phase_among(window: u64, only: Option<&str>) -> Phase {
+        let named: Vec<Phase> = match only {
+            Some(list) => Self::ALL.iter().copied().filter(|p| list.split(',').any(|l| l.trim() == p.label())).collect(),
+            None => Vec::new(),
+        };
+        if named.is_empty() {
+            return Self::cycle_phase(window);
+        }
+        named[(window % named.len() as u64) as usize]
     }
 
     pub fn label(self) -> &'static str {
@@ -149,6 +181,12 @@ impl Phase {
             Phase::NoWeather => "no_weather",
             Phase::NoDoorShadows => "no_door_shadows",
             Phase::TimeFrozen => "time_frozen",
+            Phase::NoSmoothShadow => "no_smooth_shadow",
+            Phase::NoSmoothGround => "no_smooth_ground",
+            Phase::LightCutoff => "light_cutoff",
+            Phase::Fovea30 => "fovea30",
+            Phase::Fovea45 => "fovea45",
+            Phase::NoReflectionHistory => "no_reflection_history",
         }
     }
 }
@@ -181,9 +219,18 @@ mod tests {
     }
 
     #[test]
+    fn a_named_cycle_visits_only_its_phases_in_order() {
+        let only = Some("baseline, fovea30,light_cutoff,nonsense");
+        let got: Vec<Phase> = (0..6).map(|w| Phase::cycle_phase_among(w, only)).collect();
+        assert_eq!(got, vec![Phase::Baseline, Phase::LightCutoff, Phase::Fovea30, Phase::Baseline, Phase::LightCutoff, Phase::Fovea30]);
+        assert_eq!(Phase::cycle_phase_among(5, None), Phase::cycle_phase(5));
+        assert_eq!(Phase::cycle_phase_among(5, Some("nonsense")), Phase::cycle_phase(5));
+    }
+
+    #[test]
     fn labels_are_distinct_so_log_lines_cannot_be_confused() {
         let mut labels: Vec<&str> = Phase::ALL.iter().map(|p| p.label()).collect();
-        labels.sort_unstable();
+        labels.sort();
         labels.dedup();
         assert_eq!(labels.len(), Phase::ALL.len());
     }

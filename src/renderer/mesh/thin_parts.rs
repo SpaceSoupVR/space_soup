@@ -98,7 +98,7 @@ pub fn split_thin_parts(vertices: &[MeshVertex], indices: &[u32]) -> Option<Thin
     let mut normal = vec![glam::Vec3::ZERO; points];
     let mut authored = vec![glam::Vec3::ZERO; points];
     for t in &tris {
-        let [a, b, c] = t.map(&pos);
+        let [a, b, c] = t.map(|i| pos(i));
         let n = (b - a).cross(c - a);
         for &i in t {
             normal[weld[i]] += n;
@@ -114,7 +114,7 @@ pub fn split_thin_parts(vertices: &[MeshVertex], indices: &[u32]) -> Option<Thin
     }
 
     let flat: Vec<bool> = normal.iter().map(|n| n.length_squared() < 1e-24).collect();
-    for n in &mut normal {
+    for n in normal.iter_mut() {
         *n = n.normalize_or_zero();
     }
 
@@ -301,14 +301,14 @@ mod shipped_lamps {
             let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
             if let Some(mesh) = node.mesh() {
                 for prim in mesh.primitives() {
-                    let transmission = prim.material().transmission().map_or(0.0, |t| t.transmission_factor());
+                    let transmission = prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0);
                     if transmission > 0.0 {
                         continue;
                     }
                     let r = prim.reader(|b| Some(&buffers[b.index()]));
                     let p: Vec<Vec3> = r.read_positions().unwrap().map(|v| world.transform_point3(Vec3::from(v))).collect();
                     let n: Vec<Vec3> = r.read_normals().unwrap().map(|v| world.transform_vector3(Vec3::from(v)).normalize()).collect();
-                    let idx: Vec<u32> = r.read_indices().map_or_else(|| (0..p.len() as u32).collect(), |i| i.into_u32().collect());
+                    let idx: Vec<u32> = r.read_indices().map(|i| i.into_u32().collect()).unwrap_or_else(|| (0..p.len() as u32).collect());
                     let v = p.iter().zip(&n).map(|(p, n)| MeshVertex { position: (*p).into(), normal: (*n).into(), uv: [0.0; 2], uv2: [0.0; 2], emissive: 0, uv2_rect: MeshVertex::WHOLE_ATLAS }).collect();
                     out.push((v, idx));
                 }
@@ -336,7 +336,7 @@ mod shipped_lamps {
 
     #[test]
     fn the_lamps_thin_parts_are_a_small_share_of_them() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../game/models/lights");
+        let root = crate::test_game_dir().join("models/lights");
         for name in ["hanging_industrial_lamp/hanging_industrial_lamp_1k.gltf", "industrial_wall_sconce/industrial_wall_sconce_1k.gltf"] {
             let path = root.join(name);
             if !path.exists() {

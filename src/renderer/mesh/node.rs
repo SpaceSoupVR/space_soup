@@ -45,7 +45,7 @@ pub(crate) fn ancestor_joint_and_baked_local(
     (parent_joint, t2, r2, s2)
 }
 
-#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_node(
     node: &gltf::Node,
     parent: Mat4,
@@ -130,6 +130,33 @@ pub(crate) fn collect_node(
                 Vec::new()
             };
 
+            let baked_cave_meta = mesh
+                .extras()
+                .as_ref()
+                .and_then(|raw| crate::renderer::baked_cave::BakedCaveMeta::parse(raw.get()));
+            let baked_cave_colours: Option<(Vec<[u8; 4]>, Vec<[u8; 4]>)> = baked_cave_meta.as_ref().and_then(|_| {
+                let c0: Vec<[u8; 4]> = reader.read_colors(0)?.into_rgba_u8().collect();
+                let c1: Vec<[u8; 4]> = reader.read_colors(1).map(|c| c.into_rgba_u8().collect()).unwrap_or_default();
+                Some((c0, c1))
+            });
+
+            let baked_cave_ground: (Vec<[f32; 2]>, Vec<[u8; 4]>) = if baked_cave_colours.is_some() {
+                (
+                    reader.read_tex_coords(2).map(|t| t.into_f32().collect()).unwrap_or_default(),
+                    reader.read_colors(2).map(|c| c.into_rgba_u8().collect()).unwrap_or_default(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+            let baked_cave_planes: Option<Vec<[u8; 4]>> =
+                if baked_cave_colours.is_some() { reader.read_colors(3).map(|c| c.into_rgba_u8().collect()) } else { None };
+
+            let baked_cave_glow: Option<Vec<[u8; 4]>> =
+                if baked_cave_colours.is_some() { reader.read_colors(4).map(|c| c.into_rgba_u8().collect()) } else { None };
+
+            let lightmap = if baked_cave_colours.is_some() { None } else { lightmap };
+
             let emissive = {
                 let m = prim.material();
                 let f = m.emissive_factor();
@@ -191,11 +218,6 @@ pub(crate) fn collect_node(
                     contents: bytemuck::cast_slice(&vertices),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh_ib"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
                 let layered = layered_weights.map(|weights| {
 
                     let source: Vec<usize> = if split_corners.is_empty() {
@@ -214,7 +236,7 @@ pub(crate) fn collect_node(
 
                             ground: {
                                 let uv = uvs.get(i).copied().unwrap_or([0.0, 0.0]);
-                                let b = uv2s.get(i).map_or(0.0, |u| u[0]);
+                                let b = uv2s.get(i).map(|u| u[0]).unwrap_or(0.0);
                                 [uv[0], uv[1], b, 0.0]
                             },
                         })
@@ -225,19 +247,62 @@ pub(crate) fn collect_node(
                             contents: bytemuck::cast_slice(&lv),
                             usage: wgpu::BufferUsages::VERTEX,
                         });
-                    LayeredPrimitive { vertices: lv, vertex_buffer }
+
+                    let (by_class, twin_ends) = crate::renderer::cave_twins::partition(&lv, &indices);
+                    let bounds = lv.iter().fold([[f32::INFINITY; 3], [f32::NEG_INFINITY; 3]], |[lo, hi], v| {
+                        [
+                            [lo[0].min(v.position[0]), lo[1].min(v.position[1]), lo[2].min(v.position[2])],
+                            [hi[0].max(v.position[0]), hi[1].max(v.position[1]), hi[2].max(v.position[2])],
+                        ]
+                    });
+                    (LayeredPrimitive { vertices: lv, vertex_buffer, twin_ends, bounds }, by_class)
+                });
+                let (layered, mut indices) = match layered {
+                    Some((layered, by_class)) => (Some(layered), by_class),
+                    None => (None, indices),
+                };
+                let baked_cave = baked_cave_meta.as_ref().zip(baked_cave_colours.as_ref()).map(|(meta, (c0, c1))| {
+                    let cv: Vec<crate::renderer::baked_cave::BakedCaveVertex> = (0..positions.len())
+                        .map(|i| {
+                            crate::renderer::baked_cave::BakedCaveVertex::from_file(
+                                positions[i].into(),
+                                normals.get(i).copied().unwrap_or(Vec3::Y).into(),
+                                uv2s.get(i).copied().unwrap_or([0.0, 0.0]),
+
+                                c0.get(i).copied().unwrap_or([0, 255, 0, 1 << 6]),
+
+                                c1.get(i).copied().unwrap_or([255, 255, 0, 0]),
+                                (
+                                    baked_cave_ground.0.get(i).copied().unwrap_or([0.0, 0.0]),
+                                    baked_cave_ground.1.get(i).map_or(0, |c| c[0]),
+                                ),
+                                baked_cave_planes.as_ref().and_then(|c3| {
+                                    let c2 = baked_cave_ground.1.get(i)?;
+                                    Some(([c2[1], c2[2], c2[3]], *c3.get(i)?))
+                                }),
+                                baked_cave_glow.as_ref().and_then(|g| g.get(i).copied()),
+                            )
+                        })
+                        .collect();
+                    crate::renderer::baked_cave::BakedCavePrimitive::new(device, cv, &mut indices, meta)
+                });
+                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mesh_ib"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
                 });
 
                 let casts_shadow = casts_shadow(
                     prim.material()
                         .transmission()
-                        .map_or(0.0, |t| t.transmission_factor()),
+                        .map(|t| t.transmission_factor())
+                        .unwrap_or(0.0),
                 );
 
                 let blended = prim.material().alpha_mode() == gltf::material::AlphaMode::Blend
-                    || prim.material().transmission().map_or(0.0, |t| t.transmission_factor()) > 0.0;
+                    || prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0) > 0.0;
 
-                let thin = if layered.is_none() && !blended {
+                let thin = if layered.is_none() && baked_cave.is_none() && !blended {
                     super::thin_parts::split_thin_parts(&vertices, &indices)
                         .map(|split| super::thin_parts::ThinParts::upload(device, &split))
                 } else {
@@ -250,6 +315,7 @@ pub(crate) fn collect_node(
                     vertex_buffer,
                     index_buffer,
                     layered,
+                    baked_cave,
                     casts_shadow,
                     blended,
                     thin,
@@ -258,10 +324,10 @@ pub(crate) fn collect_node(
                 let (joint_ids, joint_weights): (Vec<[u32; 4]>, Vec<[f32; 4]>) = if real_skin {
                     let joint_ids = match reader.read_joints(0) {
                         Some(gltf::mesh::util::ReadJoints::U8(it)) => it
-                            .map(|j| [u32::from(j[0]), u32::from(j[1]), u32::from(j[2]), u32::from(j[3])])
+                            .map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
                             .collect(),
                         Some(gltf::mesh::util::ReadJoints::U16(it)) => it
-                            .map(|j| [u32::from(j[0]), u32::from(j[1]), u32::from(j[2]), u32::from(j[3])])
+                            .map(|j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
                             .collect(),
                         None => vec![[0, 0, 0, 0]; positions.len()],
                     };
@@ -305,6 +371,9 @@ pub(crate) fn collect_node(
                     texture,
                     vertex_buffer,
                     index_buffer,
+
+                    blended: prim.material().alpha_mode() == gltf::material::AlphaMode::Blend
+                        || prim.material().transmission().map(|t| t.transmission_factor()).unwrap_or(0.0) > 0.0,
                 });
             }
         }

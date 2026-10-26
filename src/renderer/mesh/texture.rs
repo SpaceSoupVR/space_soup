@@ -17,31 +17,67 @@ pub(crate) fn load_primitive_texture(
     layout: &wgpu::BindGroupLayout,
 ) -> LoadedTexture {
     let material = prim.material();
+    let (base, emissive) = material_images(&material, images);
+    // Encoded ahead (`bin/model_astc`) where the encoding is of these very
+    // images; the RGBA upload, with its mips built here, otherwise.
+    let dir = MODEL_ASTC.with(|d| d.borrow().clone());
+    let upload = |map: ModelMap, label: &str, px: &(Vec<u8>, u32, u32)| {
+        let astc = dir.as_deref().and_then(|d| astc_texture(device, queue, label, &model_astc_path(d, material.index(), map), px));
+        if px.1 * px.2 > 1 {
+            MODEL_ASTC_COUNT.with(|c| c.set((c.get().0 + astc.is_some() as u32, c.get().1 + 1)));
+        }
+        astc.unwrap_or_else(|| upload_mipped(device, queue, label, px))
+    };
+    let base_tex = upload(ModelMap::Base, "gltf_base_color", &base);
+    let emissive_tex = upload(ModelMap::Emissive, "gltf_emissive", &emissive);
+    material_bind(device, layout, base_tex, emissive_tex)
+}
+
+/// A material's two maps as the mesh shaders read them, RGBA8 sRGB: the
+/// base colour (alpha forced opaque, cut for MASK, kept for BLEND) and the
+/// emissive mask with the roughness in its alpha. What `load_primitive_texture`
+/// uploads and `bin/model_astc` encodes.
+pub fn material_images(material: &gltf::Material, images: &[gltf::image::Data]) -> ((Vec<u8>, u32, u32), (Vec<u8>, u32, u32)) {
     let pbr = material.pbr_metallic_roughness();
 
     let transmission = material
         .transmission()
-        .map_or(0.0, |t| t.transmission_factor());
+        .map(|t| t.transmission_factor())
+        .unwrap_or(0.0);
+    // MASK (foliage cards, grates, fences): cut where the material says.
+    // Forced opaque with the rest, each drew as its whole quad (2026-10-23).
+    let mask = (material.alpha_mode() == gltf::material::AlphaMode::Mask).then(|| material.alpha_cutoff().unwrap_or(0.5));
     let force_opaque =
-        material.alpha_mode() != gltf::material::AlphaMode::Blend && transmission <= 0.0;
+        mask.is_none() && material.alpha_mode() != gltf::material::AlphaMode::Blend && transmission <= 0.0;
 
-    let base = if let Some(info) = pbr.base_color_texture() { decode_image(&images[info.texture().source().index()], force_opaque) } else {
-        let c = pbr.base_color_factor();
-        (
-            vec![
-                (c[0] * 255.0) as u8,
-                (c[1] * 255.0) as u8,
-                (c[2] * 255.0) as u8,
-                if force_opaque {
-                    255
-                } else {
+    let base = match pbr.base_color_texture() {
+        Some(info) => {
+            let mut px = decode_image(&images[info.texture().source().index()], force_opaque);
+            if let Some(cutoff) = mask {
+                px.0.chunks_exact_mut(4).for_each(|p| p[3] = mask_alpha(p[3], cutoff));
+            }
+            px
+        }
+        None => {
+            let c = pbr.base_color_factor();
+            (
+                vec![
+                    (c[0] * 255.0) as u8,
+                    (c[1] * 255.0) as u8,
+                    (c[2] * 255.0) as u8,
+                    if let Some(cutoff) = mask {
+                        mask_alpha((c[3].clamp(0.0, 1.0) * 255.0).round() as u8, cutoff)
+                    } else if force_opaque {
+                        255
+                    } else {
 
-                    (c[3] * (1.0 - transmission) * 255.0) as u8
-                },
-            ],
-            1,
-            1,
-        )
+                        (c[3] * (1.0 - transmission) * 255.0) as u8
+                    },
+                ],
+                1,
+                1,
+            )
+        }
     };
 
     let emissive = match material.emissive_texture() {
@@ -53,8 +89,144 @@ pub(crate) fn load_primitive_texture(
 
         None => (vec![255u8, 255, 255, material_gloss_alpha(pbr.roughness_factor(), gltf_roughness())], 1, 1),
     };
+    (base, emissive)
+}
 
-    create_mesh_material_texture(device, queue, layout, &base, &emissive)
+/// The two maps of a model's material (`material_images`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelMap {
+    Base,
+    Emissive,
+}
+
+impl ModelMap {
+    pub const ALL: [ModelMap; 2] = [ModelMap::Base, ModelMap::Emissive];
+    pub fn name(self) -> &'static str {
+        match self {
+            ModelMap::Base => "base",
+            ModelMap::Emissive => "emissive",
+        }
+    }
+}
+
+/// MODELS' MAPS AS ASTC (2026-10-23): 8 bits a texel against 32, and no
+/// mips built on the headset, as the brushes' and the ground's are. A model
+/// `models/x.glb` keeps them in `models/x.astc/`, one file a material and
+/// map (`m<index>` or `default` for a primitive with none).
+pub fn model_astc_dir(glb: &std::path::Path) -> std::path::PathBuf {
+    glb.with_extension("astc")
+}
+
+pub fn model_astc_path(dir: &std::path::Path, material: Option<usize>, map: ModelMap) -> std::path::PathBuf {
+    let m = material.map_or_else(|| "default".to_string(), |i| format!("m{i}"));
+    dir.join(format!("{m}_{}.ssastc", map.name()))
+}
+
+/// Bump when `material_images` or `upload_mipped`'s mips change: every
+/// encoding made before then is stale.
+const MODEL_FILTER_VERSION: u64 = 1;
+
+/// What one map is made from, as one number (FNV-1a over 8-byte words, as
+/// `brush_astc::source_fingerprint`): the loader recomputes it from the
+/// images it loaded, so an encoding is used only for its own content.
+pub fn model_image_fingerprint(map: ModelMap, px: &(Vec<u8>, u32, u32)) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (MODEL_FILTER_VERSION << 8) ^ map as u64;
+    let mut fold = |word: u64| h = (h ^ word).wrapping_mul(PRIME);
+    fold(((px.1 as u64) << 32) | px.2 as u64);
+    for c in px.0.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..c.len()].copy_from_slice(c);
+        fold(u64::from_le_bytes(word));
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^ (h >> 33)
+}
+
+/// Every mip `upload_mipped` uploads of `px`: what the encoder encodes.
+pub fn model_mips(px: &(Vec<u8>, u32, u32)) -> Vec<crate::renderer::terrain_pipeline::TerrainImage> {
+    crate::renderer::brush_pipeline::mip_chain(&crate::renderer::terrain_pipeline::TerrainImage { width: px.1, height: px.2, rgba: px.0.clone() }, true)
+}
+
+thread_local! {
+    /// The `.astc` folder of the model this thread is loading (`model_astc_scope`).
+    static MODEL_ASTC: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// The scope's maps of more than one texel: (uploaded as ASTC, all).
+    static MODEL_ASTC_COUNT: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// While it lives, the materials this thread loads look for their
+/// encodings beside `glb` (`model_astc_dir`).
+pub struct ModelAstcScope(Option<std::path::PathBuf>, (u32, u32), std::path::PathBuf);
+
+pub fn model_astc_scope(glb: &std::path::Path) -> ModelAstcScope {
+    let counts = MODEL_ASTC_COUNT.with(|c| c.replace((0, 0)));
+    ModelAstcScope(MODEL_ASTC.with(|d| d.replace(Some(model_astc_dir(glb)))), counts, glb.to_path_buf())
+}
+
+impl Drop for ModelAstcScope {
+    fn drop(&mut self) {
+        let was = self.0.take();
+        MODEL_ASTC.with(|d| *d.borrow_mut() = was);
+        let (astc, all) = MODEL_ASTC_COUNT.with(|c| c.replace(self.1));
+        if all > 0 {
+            log::info!("model ASTC {}: {astc} of {all} map(s) as ASTC", self.2.file_name().unwrap_or_default().to_string_lossy());
+        }
+    }
+}
+
+/// `px` as the encoding at `path`, when the device reads ASTC and the file
+/// is an encoding of exactly `px` (its fingerprint) with every mip.
+fn astc_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, path: &std::path::Path, px: &(Vec<u8>, u32, u32)) -> Option<wgpu::Texture> {
+    use crate::renderer::terrain_pipeline::mip_levels_for;
+    if !device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC) || px.1 % 4 != 0 || px.2 % 4 != 0 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let map = if path.to_string_lossy().ends_with("_base.ssastc") { ModelMap::Base } else { ModelMap::Emissive };
+    let enc = match crate::renderer::brush_astc::BrushAstc::from_bytes(&bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("model ASTC {}: {e}", path.display());
+            return None;
+        }
+    };
+    let a = &enc.array;
+    if enc.source != model_image_fingerprint(map, px) || (a.width, a.height) != (px.1, px.2) || !a.srgb || a.levels != mip_levels_for(px.1, px.2) {
+        log::info!("model ASTC {}: stale, the RGBA path instead", path.display());
+        return None;
+    }
+    let format = a.format()?;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: a.width, height: a.height, depth_or_array_layers: 1 },
+        mip_level_count: a.levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let (bw, bh) = (a.block[0] as u32, a.block[1] as u32);
+    for (level, data) in a.data[0].iter().enumerate() {
+        let (lw, lh) = ((a.width >> level).max(1), (a.height >> level).max(1));
+        let (cols, rows) = (lw.div_ceil(bw), lh.div_ceil(bh));
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: level as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(cols * 16), rows_per_image: Some(rows) },
+            wgpu::Extent3d { width: cols * bw, height: rows * bh, depth_or_array_layers: 1 },
+        );
+    }
+    Some(texture)
+}
+
+/// A MASK material's texel alpha, cut at its `cutoff` (0..1): kept whole or
+/// gone, so the mesh shaders' fixed alpha test (`tex_color.a < 0.35`) cuts
+/// it where glTF says, and its mips average to the share of it kept.
+pub fn mask_alpha(a: u8, cutoff: f32) -> u8 {
+    if a as f32 >= cutoff.clamp(0.0, 1.0) * 255.0 { 255 } else { 0 }
 }
 
 static GLTF_ROUGHNESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -89,10 +261,20 @@ mod gloss_tests {
     }
 
     #[test]
+    fn a_mask_material_is_cut_at_its_own_cutoff() {
+        use super::mask_alpha;
+        assert_eq!(mask_alpha(128, 0.5), 255);
+        assert_eq!(mask_alpha(127, 0.5), 0);
+        assert_eq!(mask_alpha(60, 0.2), 255, "a low cutoff keeps what the shader's 0.35 alone would cut");
+        assert_eq!(mask_alpha(200, 0.9), 0, "a high one cuts what it would keep");
+        assert_eq!(mask_alpha(0, 0.0), 255);
+    }
+
+    #[test]
     fn a_half_rough_material_takes_the_shaders_material_path() {
 
-        assert!((f32::from(material_gloss_alpha(0.7, true)) / 255.0) < 0.996);
-        assert!((f32::from(material_gloss_alpha(1.0, true)) / 255.0) >= 0.996);
+        assert!((material_gloss_alpha(0.7, true) as f32 / 255.0) < 0.996);
+        assert!((material_gloss_alpha(1.0, true) as f32 / 255.0) >= 0.996);
     }
 }
 
@@ -186,9 +368,10 @@ pub fn create_mesh_material_texture(
     emissive: &(Vec<u8>, u32, u32),
 ) -> LoadedTexture {
     let make = |label: &str, px: &(Vec<u8>, u32, u32)| upload_mipped(device, queue, label, px);
+    material_bind(device, layout, make("gltf_base_color", base), make("gltf_emissive", emissive))
+}
 
-    let base_tex = make("gltf_base_color", base);
-    let emissive_tex = make("gltf_emissive", emissive);
+fn material_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, base_tex: wgpu::Texture, emissive_tex: wgpu::Texture) -> LoadedTexture {
     let view = base_tex.create_view(&Default::default());
     let emissive_view = emissive_tex.create_view(&Default::default());
 
@@ -305,7 +488,7 @@ pub enum LightmapLight<'a> {
     Linear(&'a [f32]),
 }
 
-#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+#[allow(clippy::too_many_arguments)]
 pub fn create_lightmap_texture_with_sun(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -319,7 +502,7 @@ pub fn create_lightmap_texture_with_sun(
     create_lightmap_texture_full(device, queue, layout, light, width, height, direction, sun_mask, None)
 }
 
-#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+#[allow(clippy::too_many_arguments)]
 pub fn create_lightmap_texture_full(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -810,14 +993,14 @@ mod sun_mask_packing_tests {
         for blue in [0u8, 1, 64, 128, 200, 255] {
             let [r, g] = pack_sun_mask_texel(&[77, 255, blue, 255]);
             assert_eq!(r, 77, "the distance must pass through untouched");
-            let g = f32::from(g) / 255.0;
+            let g = g as f32 / 255.0;
             assert!(g > 0.25, "a baked texel read as unbaked");
             let decoded = (g - 0.5).max(0.0) * 2.0 * range;
-            let written = f32::from(blue) / 255.0 * range;
+            let written = blue as f32 / 255.0 * range;
             assert!((decoded - written).abs() < 0.04, "blue {blue}: baked {written}, the shader reads {decoded}");
         }
         let [_, g] = pack_sun_mask_texel(&NEUTRAL_SUN_MASK);
-        assert!((f32::from(g) / 255.0) < 0.25, "the neutral mask read as baked");
+        assert!((g as f32 / 255.0) < 0.25, "the neutral mask read as baked");
     }
 }
 

@@ -183,6 +183,62 @@ impl VkContext {
 
             && system_property(c"debug.spacesoup.nof16") != "1";
 
+        match system_property(c"debug.spacesoup.painted").as_str() {
+            "0" => crate::renderer::terrain_pipeline::pin_ground_build(false),
+            "1" => crate::renderer::terrain_pipeline::pin_ground_build(true),
+            "expect0" => crate::renderer::terrain_pipeline::expect_painted_ground(false),
+            _ => {}
+        }
+
+        if let Ok(n) = system_property(c"debug.spacesoup.chunks").parse::<u32>() {
+            crate::renderer::ground_horizon::CHUNKS_A_SIDE.store(n.min(64), std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if let Ok(mrad) = system_property(c"debug.spacesoup.groundlodmrad").parse::<f32>() {
+            if mrad > 0.0 {
+                crate::renderer::ground_lod::TOLERANCE.store((mrad * 1e-3).to_bits(), std::sync::atomic::Ordering::Relaxed);
+                log::info!("GROUNDLOD: a coarser ground may stand {mrad} mrad from step 1");
+            }
+        }
+
+        if system_property(c"debug.spacesoup.groundshape") == "0" {
+            crate::renderer::ground_shape::ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("GROUNDSHAPE: off -- the ground shaded by its vertices");
+        }
+
+        if system_property(c"debug.spacesoup.groundblocks") == "0" {
+            crate::renderer::ground_lod::BLOCK_ORDER.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("GROUNDBLOCKS: off -- each chunk its own runs");
+        }
+        if system_property(c"debug.spacesoup.groundlod") == "0" {
+            crate::renderer::ground_lod::LISTS.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("GROUNDLOD: off -- no coarser lists built; the ground is step 1 everywhere");
+        }
+
+        if system_property(c"debug.spacesoup.opaque") == "0" {
+            crate::renderer::terrain_pipeline::OPAQUE_GROUND.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("OPAQUE: off -- the scene's ground is drawn with blending");
+        }
+
+        let world_ground = system_property(c"debug.spacesoup.worldground") != "0";
+
+        if system_property(c"debug.spacesoup.bodyfilmtraced") == "1" {
+            crate::renderer::mesh_pipeline::SKINNED_FILM_TRACED.store(true, std::sync::atomic::Ordering::Relaxed);
+            log::info!("BODYFILMTRACED: on -- the wet body traces the rooms' reflections");
+        }
+        if system_property(c"debug.spacesoup.torchskywalk") == "0" {
+            crate::renderer::ground_twins::TORCH_WEATHER_SKY_WALK.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::info!("TORCHSKYWALK: off -- the torch-lit weather twins read the sky twice");
+        }
+        crate::renderer::terrain_pipeline::WORLD_GROUND.store(world_ground, std::sync::atomic::Ordering::Relaxed);
+
+        let world_brushes = match system_property(c"debug.spacesoup.worldbrushes").as_str() {
+            "0" => false,
+            "1" => true,
+            _ => crate::renderer::static_brush::WORLD_BRUSHES_BY_DEFAULT,
+        };
+        crate::renderer::brush_pipeline::WORLD_BRUSHES.store(world_brushes, std::sync::atomic::Ordering::Relaxed);
+
         let statistics_extension_available = unsafe {
             vk_instance
                 .enumerate_device_extension_properties(physical_device)
@@ -239,6 +295,9 @@ impl VkContext {
             info!("vulkan: pipeline statistics ON -- every pipeline logs PIPESTATS");
         }
         crate::renderer::shader_checks::PIPELINE_STATISTICS.store(capture_statistics, std::sync::atomic::Ordering::Relaxed);
+        if let Some(checks) = crate::renderer::shader_checks::set_checks_override(&system_property(c"debug.spacesoup.shaderchecks")) {
+            info!("vulkan: shader checks overridden to {checks:?} (debug.spacesoup.shaderchecks)");
+        }
         info!(
             "vulkan: shaderFloat16 {}",
             if f16_supported { "supported -- enabling" } else { "NOT supported" },

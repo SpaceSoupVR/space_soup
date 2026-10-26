@@ -5,6 +5,16 @@ use wgpu::*;
 use super::lights::{Light, LightKind};
 use super::probe_stream::ProbeDesc;
 
+mod flash;
+pub mod mud_splash;
+pub mod authoring;
+pub mod catalog;
+pub mod seen;
+pub mod stack;
+pub mod templates;
+pub mod variants;
+pub use variants::FxVariant;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EffectKind {
 
@@ -126,7 +136,7 @@ fn emitter_seed(e: &EffectEmitter) -> u64 {
     let base = id_hash(&e.id);
     match e.variation.seed.min(65535) {
         0 => base,
-        s => base ^ hash64(u64::from(s)),
+        s => base ^ hash64(s as u64),
     }
 }
 
@@ -134,7 +144,7 @@ fn life_range(p: &Preset, v: &Variation) -> (f32, f32) {
     if v.life_variation == 1.0 {
         return p.life;
     }
-    let m = f32::midpoint(p.life.0, p.life.1);
+    let m = 0.5 * (p.life.0 + p.life.1);
     let h = 0.5 * (p.life.1 - p.life.0) * v.life_variation;
     ((m - h).max(0.05), m + h)
 }
@@ -143,7 +153,7 @@ fn speed_range(p: &Preset, v: &Variation) -> (f32, f32) {
     if v.speed_variation == 1.0 {
         return p.speed;
     }
-    let m = f32::midpoint(p.speed.0, p.speed.1);
+    let m = 0.5 * (p.speed.0 + p.speed.1);
     let h = 0.5 * (p.speed.1 - p.speed.0) * v.speed_variation;
     ((m - h).max(0.0), m + h)
 }
@@ -164,6 +174,7 @@ fn temperature(u: f32, v: &Variation) -> Vec3 {
     Vec3::new(1.0, 2f32.powf(0.8 * k), 2f32.powf(1.6 * k))
 }
 
+#[derive(Clone, Debug, PartialEq)]
 struct Preset {
 
     rate: f32,
@@ -199,9 +210,36 @@ pub const FLAME_SECONDS: f32 = 2.4;
 pub const EMBER_LAYER: u32 = FIRE_FIRST + FIRE_FRAMES;
 pub const MOTE_LAYER: u32 = EMBER_LAYER + 1;
 pub const COALS_LAYER: u32 = MOTE_LAYER + 1;
+
 pub const CROWN_LAYER: u32 = COALS_LAYER + 1;
-pub const ATLAS_LAYERS: u32 = CROWN_LAYER + 1;
+pub const CROWN_VARIANTS: u32 = 4;
+pub const CROWN_FRAMES: u32 = 3;
+
+pub const JET_LAYER: u32 = CROWN_LAYER + CROWN_VARIANTS * CROWN_FRAMES;
+pub const JET_VARIANTS: u32 = 2;
+pub const JET_FRAMES: u32 = 3;
+
+pub const SPRAY_LAYER: u32 = JET_LAYER + JET_VARIANTS * JET_FRAMES;
+pub const SPRAY_VARIANTS: u32 = 2;
+pub const SPRAY_FRAMES: u32 = 3;
+pub const FROTH_LAYER: u32 = SPRAY_LAYER + SPRAY_VARIANTS * SPRAY_FRAMES;
+pub const FROTH_VARIANTS: u32 = 2;
+pub const FROTH_FRAMES: u32 = 3;
+
+pub const FLASH_LAYER: u32 = FROTH_LAYER + FROTH_VARIANTS * FROTH_FRAMES;
+pub const FLASH_VARIANTS: u32 = 4;
+pub const FLASH_FRAMES: u32 = 3;
+pub const CORE_LAYER: u32 = FLASH_LAYER + FLASH_VARIANTS * FLASH_FRAMES;
+pub const CORE_VARIANTS: u32 = 2;
+/// Mud clumps: each a clod's normal and cover (`mud_splash::lump_frame`).
+pub const MUD_LAYER: u32 = CORE_LAYER + CORE_VARIANTS;
+pub const MUD_VARIANTS: u32 = 4;
+pub const ATLAS_LAYERS: u32 = MUD_LAYER + MUD_VARIANTS;
 pub const ATLAS_SIZE: u32 = 128;
+/// A mud lump's wet sheen: its peak (over the mud's albedo, so a thin water
+/// film's 3% reflectance against an albedo of about 0.1) and its sharpness.
+const LUMP_SHEEN: f32 = 1.0;
+const LUMP_GLOSS: f32 = 40.0;
 const ATLAS_MIPS: u32 = 8;
 
 const MAX_SLOTS: usize = 2048;
@@ -222,96 +260,7 @@ pub const VERTICES_PER_PARTICLE: u32 = 24;
 const CONVEX: f32 = 0.35;
 
 fn preset(kind: EffectKind) -> Preset {
-    match kind {
-        EffectKind::Fire => Preset {
-
-            rate: 9.0,
-            life: (0.9, 1.3),
-            speed: (0.0, 0.0),
-            spread_deg: 0.0,
-            bed: 0.15,
-            size: (0.145, 0.13),
-            drag: 0.0,
-            accel: Vec3::ZERO,
-            swirl: (0.0, 0.0),
-            spin: (0.0, 0.07),
-            streak: 0.0,
-            soft: 0.05,
-            frames: (FIRE_FIRST, FIRE_FRAMES),
-            phase_g: 0.0,
-            albedo: 0.0,
-        },
-        EffectKind::Smoke => Preset {
-            rate: 6.0,
-            life: (4.0, 6.0),
-            speed: (0.15, 0.28),
-            spread_deg: 10.0,
-            bed: 0.06,
-            size: (0.1, 0.55),
-            drag: 0.6,
-            accel: Vec3::new(0.0, 0.3, 0.0),
-            swirl: (0.14, 0.7),
-            spin: (0.2, std::f32::consts::PI),
-            streak: 0.0,
-            soft: 0.3,
-            frames: (0, SMOKE_FRAMES),
-            phase_g: 0.35,
-            albedo: 0.3,
-        },
-        EffectKind::Embers => Preset {
-            rate: 5.0,
-            life: (1.2, 2.4),
-            speed: (0.9, 1.8),
-            spread_deg: 28.0,
-            bed: 0.06,
-            size: (0.005, 0.003),
-            drag: 1.3,
-            accel: Vec3::new(0.0, -1.1, 0.0),
-            swirl: (0.06, 3.0),
-            spin: (0.0, 0.0),
-            streak: 0.035,
-            soft: 0.02,
-            frames: (EMBER_LAYER, 1),
-            phase_g: 0.0,
-            albedo: 0.0,
-        },
-
-        EffectKind::Coals => Preset {
-            rate: 0.0,
-            life: (1.0, 1.0),
-            speed: (0.0, 0.0),
-            spread_deg: 0.0,
-            bed: 0.0,
-            size: (COALS_HALF, COALS_HALF),
-            drag: 0.0,
-            accel: Vec3::ZERO,
-            swirl: (0.0, 0.0),
-            spin: (0.0, 0.0),
-            streak: 0.0,
-            soft: 0.0,
-            frames: (COALS_LAYER, 1),
-            phase_g: 0.0,
-            albedo: 0.0,
-        },
-
-        EffectKind::Dust => Preset {
-            rate: 90.0,
-            life: (3.5, 6.5),
-            speed: (0.0, 0.004),
-            spread_deg: 180.0,
-            bed: 0.0,
-            size: DUST_LIGHT_SIZE,
-            drag: 0.4,
-            accel: Vec3::new(0.0, -0.0012, 0.0),
-            swirl: (0.006, 0.8),
-            spin: (0.0, 0.0),
-            streak: 0.0,
-            soft: 0.02,
-            frames: (MOTE_LAYER, 1),
-            phase_g: 0.7,
-            albedo: 0.8,
-        },
-    }
+    templates::template(kind).preset.clone()
 }
 
 #[repr(C)]
@@ -364,8 +313,15 @@ pub struct EffectFrame {
     pub instances: Vec<EffectInstance>,
     pub over: u32,
     pub screened: u32,
+
+    pub screened_heat: u32,
+
+    pub bursts: stack::BurstCount,
+
+    pub splash_costs: Vec<(u64, f32, f32)>,
 }
 
+#[derive(Clone, Copy)]
 pub struct Surroundings<'a> {
 
     pub head: Vec3,
@@ -379,6 +335,18 @@ pub struct Surroundings<'a> {
 
     pub ambient: &'a dyn Fn(Vec3) -> Vec3,
     pub exposure: f32,
+    /// The room-local adaptation at a world point (`exposure::room_factor_at`):
+    /// an effect in a closed room is drawn at the room's adaptation, as its
+    /// walls are. None: every effect at `exposure`.
+    pub room: Option<&'a dyn Fn(Vec3) -> f32>,
+}
+
+impl<'a> Surroundings<'a> {
+    /// These surroundings for an effect at `world`: the exposure of the room
+    /// it is in.
+    pub fn at_point(&self, world: Vec3) -> Self {
+        Self { exposure: self.exposure * self.room.map_or(1.0, |r| r(world)), ..*self }
+    }
 }
 
 fn hash64(mut x: u64) -> u64 {
@@ -390,13 +358,13 @@ fn hash64(mut x: u64) -> u64 {
 }
 
 fn id_hash(id: &str) -> u64 {
-    id.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3))
+    id.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
 fn uniforms(seed: u64) -> [f32; 12] {
     let mut out = [0.0; 12];
     let mut h = seed;
-    for v in &mut out {
+    for v in out.iter_mut() {
         h = hash64(h.wrapping_add(0x9e3779b97f4a7c15));
         *v = (h >> 40) as f32 / (1u64 << 24) as f32;
     }
@@ -441,9 +409,38 @@ fn swirl_motion(growth: f32, radius: f32, turn: f32, angle: f32) -> Vec3 {
 }
 
 fn lamp_at(l: &Light, p: Vec3) -> Option<(Vec3, Vec3)> {
+    lamp_seen_at(&lamp_seen(l, 1.0)?, p)
+}
+
+/// A lamp as the motes read it, worked out once a frame instead of once a
+/// mote: its linear colour (three `powf`), its cone's cosines and the fire
+/// adaptation share `own` (`simulate_governed`). Dust spent 0.94 ms of the
+/// Quest's CPU a frame on 893 motes, ~1 us a mote, most of it here and in
+/// `air_drift`'s clocks (`time_a_frames_effects`).
+struct LampSeen {
+    position: Vec3,
+    range: f32,
+    colour: Vec3,
+    intensity: f32,
+    source_radius: f32,
+    /// A spot's (cos outer, cos inner, unit direction).
+    spot: Option<(f32, f32, Vec3)>,
+    own: f32,
+}
+
+fn lamp_seen(l: &Light, own: f32) -> Option<LampSeen> {
     if matches!(l.kind, LightKind::Directional) || l.intensity <= 0.0 {
         return None;
     }
+    let c = l.color.to_linear();
+    let spot = matches!(l.kind, LightKind::Spot).then(|| {
+        let (cos_outer, cos_inner) = l.cone_cosines();
+        (cos_outer, cos_inner, l.direction.normalize_or_zero())
+    });
+    Some(LampSeen { position: l.position, range: l.range, colour: Vec3::new(c[0], c[1], c[2]), intensity: l.intensity, source_radius: l.source_radius, spot, own })
+}
+
+fn lamp_seen_at(l: &LampSeen, p: Vec3) -> Option<(Vec3, Vec3)> {
     let to = l.position - p;
     let d = to.length();
     if d >= l.range || d < 1e-5 {
@@ -454,17 +451,14 @@ fn lamp_at(l: &Light, p: Vec3) -> Option<(Vec3, Vec3)> {
     let window = (1.0 - x * x * x * x).clamp(0.0, 1.0);
     let near = super::glare::LAMP_RADIUS;
     let atten = window * window / (d * d + l.source_radius * l.source_radius).max(near * near);
-    let cone = if matches!(l.kind, LightKind::Spot) {
-        let (cos_outer, cos_inner) = l.cone_cosines();
-        smoothstep(cos_outer, cos_inner, (-dir).dot(l.direction.normalize_or_zero()))
-    } else {
-        1.0
+    let cone = match l.spot {
+        Some((cos_outer, cos_inner, axis)) => smoothstep(cos_outer, cos_inner, (-dir).dot(axis)),
+        None => 1.0,
     };
     if cone <= 0.0 {
         return None;
     }
-    let c = l.color.to_linear();
-    Some((Vec3::new(c[0], c[1], c[2]) * (l.intensity * atten * cone), dir))
+    Some((l.colour * (l.intensity * atten * cone), dir))
 }
 
 fn luminance(c: Vec3) -> f32 {
@@ -476,6 +470,15 @@ fn henyey_greenstein(g: f32, travel: Vec3, to_eye: Vec3) -> f32 {
     let g2 = g * g;
     let d = (1.0 + g2 - 2.0 * g * cos_t).max(1e-4);
     ((1.0 - g2) / (d * d.sqrt())).min(12.0)
+}
+
+pub fn mist_conditions(hour: f32) -> f32 {
+    const AT: [(f32, f32); 7] = [(0.0, 0.85), (5.0, 1.0), (7.5, 1.0), (10.5, 0.05), (17.0, 0.05), (21.0, 0.8), (24.0, 0.85)];
+    let h = hour.rem_euclid(24.0);
+    let i = AT.iter().rposition(|&(t, _)| t <= h).unwrap_or(0).min(AT.len() - 2);
+    let ((t0, a), (t1, b)) = (AT[i], AT[i + 1]);
+    let x = ((h - t0) / (t1 - t0)).clamp(0.0, 1.0);
+    a + (b - a) * x * x * (3.0 - 2.0 * x)
 }
 
 fn noise1(x: f32, seed: u64) -> f32 {
@@ -522,14 +525,23 @@ fn air_waves(seed: u64) -> [AirWave; 6] {
     })
 }
 
+#[cfg(test)]
 fn air_drift(waves: &[AirWave; 6], p: Vec3, time: f64) -> Vec3 {
-    waves.iter().fold(Vec3::ZERO, |sum, a| {
-        let clock = (f64::from(a.w) * time).rem_euclid(std::f64::consts::TAU) as f32;
-        sum + a.across * (a.reach * (a.k.dot(p) + clock + a.phase).sin())
-    })
+    air_drift_back(waves, &air_clocks(waves, time), p, 0.0)
 }
 
-#[cfg(test)]
+/// Each wave's phase at `time`, wrapped in f64 once a frame: `air_drift`
+/// took the f64 remainder six times for each of four reads a mote.
+fn air_clocks(waves: &[AirWave; 6], time: f64) -> [f32; 6] {
+    std::array::from_fn(|i| (waves[i].w as f64 * time).rem_euclid(std::f64::consts::TAU) as f32)
+}
+
+/// `air_drift` at the clocks' time less `back` seconds (a mote's age, a
+/// motion step: seconds, small enough for f32).
+fn air_drift_back(waves: &[AirWave; 6], clocks: &[f32; 6], p: Vec3, back: f32) -> Vec3 {
+    waves.iter().zip(clocks).fold(Vec3::ZERO, |sum, (a, clock)| sum + a.across * (a.reach * (a.k.dot(p) + (clock - a.w * back) + a.phase).sin()))
+}
+
 fn air_reach(waves: &[AirWave; 6]) -> f32 {
     2.0 * waves.iter().map(|a| a.reach).sum::<f32>()
 }
@@ -602,7 +614,7 @@ fn fire_puff_hz(e: &EffectEmitter) -> f32 {
 }
 
 fn fire_phase(e: &EffectEmitter, time: f64) -> f32 {
-    let f = f64::from(fire_puff_hz(e));
+    let f = fire_puff_hz(e) as f64;
     let wander = PUFF_WANDER * noise1d(time * f * 0.25, emitter_seed(e) ^ 0x7f4a_7c15_9e37_79b9);
     ((time * f).rem_euclid(1.0) as f32 + wander).rem_euclid(1.0)
 }
@@ -645,7 +657,7 @@ fn fire_sheets(e: &EffectEmitter, time: f64) -> Vec<FlameSheet> {
     let (l0, l1) = life_range(&p, &v);
     let (l0, l1) = (l0 * tempo, l1 * tempo);
     let slots = ((rate * l1).ceil() as usize).clamp(1, MAX_SLOTS);
-    let period = (slots as f64 / f64::from(rate)).max(f64::from(l1));
+    let period = (slots as f64 / rate as f64).max(l1 as f64);
     let base = emitter_seed(e);
     let up = e.direction.try_normalize().unwrap_or(Vec3::Y);
     let side = up.any_orthonormal_vector();
@@ -655,7 +667,7 @@ fn fire_sheets(e: &EffectEmitter, time: f64) -> Vec<FlameSheet> {
     let last = (FIRE_FRAMES - 1) as f32;
     let mut out = Vec::with_capacity(slots);
     for i in 0..slots {
-        let since = time - i as f64 / f64::from(rate);
+        let since = time - i as f64 / rate as f64;
         let n = (since / period).floor();
         let age = (since - n * period) as f32;
         let u = uniforms(hash64(base ^ (i as u64).wrapping_mul(0x632be59bd9b4e019) ^ (n as i64 as u64).wrapping_mul(0x8cb92ba72f3d8dd7)));
@@ -675,7 +687,7 @@ fn fire_sheets(e: &EffectEmitter, time: f64) -> Vec<FlameSheet> {
         let pace_of = if v.speed_variation == 1.0 { 0.85 + 0.3 * u[1] } else { (1.0 + (u[1] - 0.5) * 0.3 * v.speed_variation).max(0.1) };
         let pace = FIRE_FRAMES as f32 / FLAME_SECONDS * FLAME_PACE * pace_of / tempo;
         let range = (last - life * pace).max(0.0);
-        let phase = fire_phase(e, time - f64::from(age) + 0.5 * f64::from(life));
+        let phase = fire_phase(e, time - age as f64 + 0.5 * life as f64);
         let want = (phase * per - 0.5 * life * pace).rem_euclid(per);
         let mut start = want + ((u[6] * range - want) / per).round() * per;
         if start > range {
@@ -739,7 +751,7 @@ const RISE_LEAD: f32 = 0.25;
 #[cfg(test)]
 fn flame_tables() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let frames: Vec<Vec<u8>> = (0..FIRE_FRAMES).map(fire_frame).collect();
-    let cover: Vec<f32> = frames.iter().map(|f| f.chunks(4).map(|t| f32::from(t[3]) / 255.0).sum::<f32>()).collect();
+    let cover: Vec<f32> = frames.iter().map(|f| f.chunks(4).map(|t| t[3] as f32 / 255.0).sum::<f32>()).collect();
     let mean = cover.iter().sum::<f32>() / cover.len() as f32;
     let area = cover.iter().map(|c| c / mean).collect();
     let n = ATLAS_SIZE as usize;
@@ -749,9 +761,9 @@ fn flame_tables() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
             let (mut stands, mut all) = (0.0f32, 0.0f32);
             for f in &frames {
                 for (i, t) in f.chunks(4).enumerate() {
-                    let a = f32::from(t[3]) / 255.0;
+                    let a = t[3] as f32 / 255.0;
                     let v = 1.0 - ((i / n) as f32 + 0.5) / n as f32;
-                    stands += a * smoothstep(gone - FLAME_EROSION, gone, f32::from(t[1]) / 255.0 * smoothstep(LIFT_FROM, LIFT_TO, v));
+                    stands += a * smoothstep(gone - FLAME_EROSION, gone, t[1] as f32 / 255.0 * smoothstep(LIFT_FROM, LIFT_TO, v));
                     all += a;
                 }
             }
@@ -764,9 +776,9 @@ fn flame_tables() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
             let (mut stands, mut all) = (0.0f32, 0.0f32);
             for f in &frames {
                 for (i, t) in f.chunks(4).enumerate() {
-                    let a = f32::from(t[3]) / 255.0;
+                    let a = t[3] as f32 / 255.0;
                     let v = 1.0 - ((i / n) as f32 + 0.5) / n as f32;
-                    stands += a * (1.0 - smoothstep(front - RISE_SOFT, front, v - RISE_LEAD * f32::from(t[1]) / 255.0));
+                    stands += a * (1.0 - smoothstep(front - RISE_SOFT, front, v - RISE_LEAD * t[1] as f32 / 255.0));
                     all += a;
                 }
             }
@@ -826,7 +838,7 @@ fn coals_instance(e: &EffectEmitter, time: f64, at: &Surroundings, own: &dyn Fn(
 
         light_dir: [0.0, 1.0, 0.0, v.flicker - 1.0],
         axis: [normal.x, normal.y, normal.z, 0.0],
-        params: [spin, COALS_LAYER as f32, ((time * f64::from(v.flicker_rate)) % 3600.0) as f32, 3.0],
+        params: [spin, COALS_LAYER as f32, ((time * v.flicker_rate as f64) % 3600.0) as f32, 3.0],
 
         motion: [0.0; 4],
     })
@@ -860,6 +872,177 @@ pub fn simulate_with(emitters: &[EffectEmitter], splashes: &[Splash], time: f64,
 }
 
 pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, splashes: &[Splash], time: f64, at: &Surroundings) -> EffectFrame {
+    simulate_all(emitters, seen, splashes, None, time, at)
+}
+
+pub fn simulate_all(
+    emitters: &[EffectEmitter],
+    seen: &dyn Fn(usize) -> bool,
+    splashes: &[Splash],
+    bursts: Option<&stack::BurstFrame>,
+    time: f64,
+    at: &Surroundings,
+) -> EffectFrame {
+    simulate_governed(emitters, seen, splashes, bursts, None, time, at)
+}
+
+pub struct Shares<'a> {
+    pub emitter: &'a dyn Fn(&EffectEmitter) -> f32,
+    pub splash: &'a dyn Fn(&Splash) -> f32,
+
+    pub sight: &'a [Vec<seen::Eye>],
+}
+
+pub fn emitter_key(e: &EffectEmitter) -> u64 {
+    hash64(id_hash(&e.id) ^ 0x51ac_ed00_e1u64)
+}
+
+pub fn splash_key(s: &Splash) -> u64 {
+    hash64(s.seed ^ 0x5b1a_54u64)
+}
+
+const CUTOUT_MEAN: f32 = 0.6;
+
+pub fn instance_fill(i: &EffectInstance, head: Vec3) -> f32 {
+    use super::effect_asset::{REFERENCE_EYES, REFERENCE_FOCAL_PIXELS};
+    let d = (Vec3::from_slice(&i.centre[..3]) - head).length().max(0.05);
+    let across = (2.0 * i.centre[3] / d * REFERENCE_FOCAL_PIXELS).max(1.5);
+    let along = (i.light_dir[3] / d * REFERENCE_FOCAL_PIXELS).max(across);
+    across * along * CUTOUT_MEAN * REFERENCE_EYES / 1e6
+}
+
+struct KindCost {
+
+    area_each: f32,
+    flat: bool,
+    importance: f32,
+    points: bool,
+    instances: f32,
+}
+
+fn kind_cost(kind: EffectKind) -> &'static KindCost {
+    static COSTS: std::sync::OnceLock<Vec<KindCost>> = std::sync::OnceLock::new();
+    let all = COSTS.get_or_init(|| {
+        EffectKind::ALL
+            .iter()
+            .map(|k| {
+                let a = templates::asset(*k);
+                let r = a.check(books()).unwrap_or_else(|e| panic!("the built-in {} template: {}", k.template_name(), e.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("; ")));
+                let points = *k == EffectKind::Dust;
+                let area = r.area_facing + r.area_flat;
+                let area_each = if points || r.instances_steady == 0 { 0.0 } else { area / r.instances_steady as f32 };
+                KindCost { area_each, flat: r.area_flat > r.area_facing, importance: a.scalability.importance, points, instances: r.instances_steady as f32 }
+            })
+            .collect()
+    });
+    &all[EffectKind::ALL.iter().position(|k| *k == kind).expect("every kind is listed")]
+}
+
+pub fn governor_wants(
+    emitters: &[EffectEmitter],
+    seen: &dyn Fn(usize) -> bool,
+    splashes: &[Splash],
+    measured: &std::collections::HashMap<u64, (f32, f32)>,
+    head_world: Vec3,
+    sight: &[Vec<seen::Eye>],
+) -> Vec<stack::Want> {
+    use super::effect_asset::REFERENCE_FOCAL_PIXELS;
+    let mut out = Vec::new();
+    for (index, e) in emitters.iter().enumerate() {
+        if !seen(index) || !(e.scale > 0.0) || !(e.rate > 0.0) {
+            continue;
+        }
+        let cost = kind_cost(e.kind);
+        let tpl = templates::template(e.kind);
+        let (count, sheddable) = match tpl.form {
+            templates::Form::Slots(s) => {
+                let p = &tpl.preset;
+                let v = e.variation.clamped();
+                let rate = e.rate * if s.density { p.rate * e.volume() / (0.5 * (p.life.0 + p.life.1)) } else { p.rate };
+                let slots = ((rate * life_range(p, &v).1).ceil()).clamp(1.0, MAX_SLOTS as f32);
+
+                let eyes = sight.get(index);
+                let margin = mote_margin(e);
+                let within = if s.boxed && s.held {
+
+                    let ext = e.extent.map(|v| v.length().max(1e-4));
+                    let rel = head_world - e.position;
+                    let span: [(f32, f32); 3] = std::array::from_fn(|k| {
+                        let u = rel.dot(e.extent[k]) / (ext[k] * ext[k]);
+                        let r = DUST_SEEN_WITHIN / ext[k];
+                        ((u - r).max(-1.0), (u + r).min(1.0))
+                    });
+                    if span.iter().any(|(a, b)| a >= b) {
+                        0.0
+                    } else {
+                        let at = |k: usize, i: usize| span[k].0 + (span[k].1 - span[k].0) * (i as f32 + 0.5) / 5.0;
+                        let near = (0..125)
+                            .filter(|n| {
+                                let p0 = e.position + e.extent[0] * at(0, n % 5) + e.extent[1] * at(1, n / 5 % 5) + e.extent[2] * at(2, n / 25);
+                                p0.distance_squared(head_world) <= DUST_SEEN_WITHIN * DUST_SEEN_WITHIN
+                                    && eyes.map_or(true, |eyes| eyes.iter().any(|v| v.holds(p0, margin)))
+                            })
+                            .count();
+                        let part: f32 = span.iter().map(|(a, b)| (b - a) / 2.0).product();
+                        near as f32 / 125.0 * part
+                    }
+                } else {
+                    1.0
+                };
+                ((slots * within).ceil(), true)
+            }
+            _ => (cost.instances, false),
+        };
+        let (lo, hi) = emitter_bounds(e);
+        let d = (0.5 * (lo + hi)).distance(head_world).max(0.3);
+        let pixels = (hi - lo).length() / d * REFERENCE_FOCAL_PIXELS;
+
+        let looking = [seen::Eye::looking(head_world, 0.5 * (lo + hi)); 2];
+        let eyes: &[seen::Eye] = match sight.get(index) {
+            Some(v) => v,
+            None => &looking,
+        };
+        let area = if cost.points { 0.0 } else { count * cost.area_each * e.scale * e.scale };
+        let (facing, flat) = if cost.flat { (0.0, area) } else { (area, 0.0) };
+        let fill = seen::seen_fill(eyes, lo, hi, facing, flat, if cost.points { count } else { 0.0 }, 0.0);
+        out.push(stack::Want {
+            key: emitter_key(e),
+            score: cost.importance * 100.0 + pixels.max(1.0).log2(),
+            fill,
+            count,
+            sheddable,
+            kind: stack::WantKind::Emitter,
+        });
+    }
+    for s in splashes {
+        let (lo, hi) = splash_bounds(s);
+        let d = (0.5 * (lo + hi)).distance(head_world).max(0.3);
+        let pixels = (hi - lo).length() / d * REFERENCE_FOCAL_PIXELS;
+        let (fill, count) = measured.get(&splash_key(s)).copied().unwrap_or((0.0, 0.0));
+        out.push(stack::Want {
+            key: splash_key(s),
+            score: templates::water_entry_asset().scalability.importance * 100.0 + pixels.max(1.0).log2(),
+            fill,
+            count,
+            sheddable: true,
+            kind: stack::WantKind::Splash,
+        });
+    }
+    out
+}
+
+pub fn simulate_governed(
+    emitters: &[EffectEmitter],
+    seen: &dyn Fn(usize) -> bool,
+    splashes: &[Splash],
+    bursts: Option<&stack::BurstFrame>,
+    shares: Option<&Shares>,
+    time: f64,
+    at: &Surroundings,
+) -> EffectFrame {
+    let mut emitter_shed = 0u32;
+    let mut splash_shed = 0u32;
+    let mut splash_costs: Vec<(u64, f32, f32)> = Vec::new();
     let mut over: Vec<(f32, EffectInstance)> = Vec::new();
     let mut screened: Vec<EffectInstance> = Vec::new();
     let player = |p: Vec3| at.yaw_inv * (p - at.offset);
@@ -880,45 +1063,57 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
         if !seen(index) {
             continue;
         }
-        match e.kind {
-            EffectKind::Coals => {
+        let at = &at.at_point(e.position);
+
+        let tpl = templates::template(e.kind);
+        let s = match tpl.form {
+            templates::Form::Bed => {
 
                 let breath = coals_breath(e, emitters, time);
                 over.extend(coals_instance(e, time, at, &own, breath).map(|i| (f32::INFINITY, i)));
                 continue;
             }
-            EffectKind::Fire => {
+            templates::Form::Sheets => {
                 fire_instances(e, time, at, &mut over);
                 continue;
             }
-            EffectKind::Embers => ember_pops(e, time, at, &mut screened),
-            _ => {}
+            templates::Form::WaterEntry => continue,
+            templates::Form::Slots(s) => s,
+        };
+        if s.pops {
+            ember_pops(e, time, at, &mut screened);
         }
-        let p = preset(e.kind);
+        let p = &tpl.preset;
         let v = e.variation.clamped();
-        let rate = e.rate.max(0.0)
-            * match e.kind {
-                EffectKind::Dust => p.rate * e.volume() / f32::midpoint(p.life.0, p.life.1),
-                _ => p.rate,
-            };
+        let rate = e.rate.max(0.0) * if s.density { p.rate * e.volume() / (0.5 * (p.life.0 + p.life.1)) } else { p.rate };
         if !(rate > 0.0) || !(e.scale > 0.0) {
             continue;
         }
-        let lives = life_range(&p, &v);
-        let speeds = speed_range(&p, &v);
+        let lives = life_range(p, &v);
+        let speeds = speed_range(p, &v);
         let slots = ((rate * lives.1).ceil() as usize).clamp(1, MAX_SLOTS);
 
-        let period = (slots as f64 / f64::from(rate)).max(f64::from(lives.1));
+        let period = (slots as f64 / rate as f64).max(lives.1 as f64);
         let base = emitter_seed(e);
+
+        let share = shares.map_or(1.0, |sh| (sh.emitter)(e));
+        let sight = shares.and_then(|sh| sh.sight.get(index));
+        let margin = mote_margin(e);
+        let shed_phase = (hash64(base ^ 0x0de5_ead) >> 40) as f32 / (1u64 << 24) as f32;
         let tint = Vec3::from(e.tint);
         let ambient = (at.ambient)(e.position);
-        let lamps: Vec<usize> = (0..at.lights.len()).filter(|&i| (at.reaches)(e, i)).collect();
+        let lamps: Vec<LampSeen> = (0..at.lights.len())
+            .filter(|&i| (at.reaches)(e, i))
+            .filter_map(|i| lamp_seen(&at.lights[i], own(&at.lights[i])))
+            .collect();
+        let glint_seed = id_hash("glint");
 
-        let glow = if e.kind == EffectKind::Embers { at.exposure * fire_adaptation(e, at) } else { at.exposure };
+        let glow = if s.own_light { at.exposure * fire_adaptation(e, at) } else { at.exposure };
         let up = e.direction.try_normalize().unwrap_or(Vec3::Y);
-        let air = (e.kind == EffectKind::Dust).then(|| air_waves(base));
+        let air = s.air.then(|| air_waves(base));
+        let clocks = air.as_ref().map(|w| air_clocks(w, time));
         for i in 0..slots {
-            let since = time - i as f64 / f64::from(rate);
+            let since = time - i as f64 / rate as f64;
             let n = (since / period).floor();
             let age = (since - n * period) as f32;
             let u = uniforms(hash64(
@@ -930,9 +1125,14 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
             }
             let t = age / life;
             let speed = lerp(speeds.0, speeds.1, u[1]) * e.scale.sqrt();
-            let p0 = if e.kind == EffectKind::Dust {
+            let p0 = if s.boxed {
                 let p0 = e.position + e.extent[0] * (2.0 * u[4] - 1.0) + e.extent[1] * (2.0 * u[5] - 1.0) + e.extent[2] * (2.0 * u[6] - 1.0);
-                if p0.distance_squared(head_world) > DUST_SEEN_WITHIN * DUST_SEEN_WITHIN {
+
+                if s.held && p0.distance_squared(head_world) > DUST_SEEN_WITHIN * DUST_SEEN_WITHIN {
+                    continue;
+                }
+
+                if s.held && !sight.map_or(true, |eyes| eyes.iter().any(|v| v.holds(p0, margin))) {
                     continue;
                 }
                 p0
@@ -943,18 +1143,23 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                 let phi = u[5] * std::f32::consts::TAU;
                 e.position + (side * phi.cos() + up.cross(side) * phi.sin()) * r
             };
+
+            if share < 1.0 && !stack::kept(i as u32, share, shed_phase) {
+                emitter_shed += 1;
+                continue;
+            }
             let dir = cone_direction(up, p.spread_deg, u[2], u[3]);
             let (mut pos, vel) = ballistic(p0, dir * speed, p.accel, p.drag, age);
 
             let mut moving = vel;
-            if let Some(air) = &air {
-
-                pos += (air_drift(air, p0, time) - air_drift(air, p0, time - f64::from(age))) * v.turbulence;
+            if let (Some(air), Some(clocks)) = (&air, &clocks) {
+                let now = air_drift_back(air, clocks, p0, 0.0);
+                pos += (now - air_drift_back(air, clocks, p0, age)) * v.turbulence;
                 let seed = base ^ (i as u64).wrapping_mul(0x632be59bd9b4e019) ^ (n as i64 as u64);
                 let wander = |jitter: f32| Vec3::new(noise1(jitter, seed), 0.6 * noise1(jitter, seed ^ 1), noise1(jitter, seed ^ 2)) * (p.swirl.0 * v.turbulence);
                 let jitter = age * p.swirl.1;
                 pos += wander(jitter);
-                moving += (air_drift(air, p0, time) - air_drift(air, p0, time - f64::from(MOTION_H))) * (v.turbulence / MOTION_H)
+                moving += (now - air_drift_back(air, clocks, p0, MOTION_H)) * (v.turbulence / MOTION_H)
                     + (wander(jitter) - wander((age - MOTION_H) * p.swirl.1)) / MOTION_H;
             } else {
                 let swirl_r = p.swirl.0 * v.turbulence * t * e.scale;
@@ -962,7 +1167,7 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                 pos += Vec3::new(swirl_a.cos(), 0.0, swirl_a.sin()) * swirl_r;
                 moving += swirl_motion(p.swirl.0 * v.turbulence * e.scale / life, swirl_r, p.swirl.1, swirl_a);
             }
-            let mut size = if e.kind == EffectKind::Dust {
+            let mut size = if s.log_size {
 
                 let k = if v.size_variation == 1.0 { u[11] * u[11] } else { 1.0 / 3.0 + (u[11] * u[11] - 1.0 / 3.0) * v.size_variation };
                 p.size.0 * (p.size.1 / p.size.0).powf(k) * e.scale
@@ -971,8 +1176,8 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
             };
 
             if let Some(top) = e.ceiling {
-                match e.kind {
-                    EffectKind::Smoke => {
+                match s.ceiling {
+                    templates::Ceiling::Spread => {
                         let under = top - 0.6 * size;
                         let excess = pos.y - under;
                         if excess > 0.0 {
@@ -986,12 +1191,13 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                             moving += Vec3::new(a.cos(), 0.0, a.sin()) * (0.9 * rise);
                         }
                     }
-                    EffectKind::Embers
-                        if pos.y >= top - 0.02 => {
+                    templates::Ceiling::Stop => {
+                        if pos.y >= top - 0.02 {
                             pos.y = top - 0.02;
                             moving.y = moving.y.min(0.0);
                         }
-                    _ => {}
+                    }
+                    templates::Ceiling::Open => {}
                 }
             }
             let spin_dir = if u[10] < 0.5 { -1.0 } else { 1.0 };
@@ -1011,33 +1217,33 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                 params: [rotation, frame, 0.0, 0.0],
                 motion: [moving.x, moving.y, moving.z, 0.0],
             };
-            match e.kind {
-                EffectKind::Embers => {
+            match s.shade {
+                templates::SlotShade::Ember => {
                     inst.colour = ember_colour(&v, tint, glow, age, t, u[11]);
                 }
-                EffectKind::Dust => {
+                templates::SlotShade::Scatter { ambient: seen } => {
 
-                    let mut scattered = ambient * DUST_AMBIENT_SEEN;
-                    for &li in &lamps {
-                        if let Some((c, d)) = lamp_at(&at.lights[li], centre) {
-                            scattered += c * (own(&at.lights[li]) * henyey_greenstein(p.phase_g, -d, to_eye));
+                    let mut scattered = ambient * seen;
+                    for l in &lamps {
+                        if let Some((c, d)) = lamp_seen_at(l, centre) {
+                            scattered += c * (l.own * henyey_greenstein(p.phase_g, -d, to_eye));
                         }
                     }
 
-                    let glint = mote_glint(age, lerp(0.35, 1.3, u[7]), id_hash("glint") ^ u64::from(u[8].to_bits()));
+                    let glint = if s.held { mote_glint(age, lerp(0.35, 1.3, u[7]), glint_seed ^ u[8].to_bits() as u64) } else { 1.0 };
                     let c = scattered * p.albedo * tint * (at.exposure * glint * v.intensity);
                     let held = smoothstep(0.0, 0.2, t) * smoothstep(1.0, 0.7, t);
                     let d = (centre - at.head).length();
-                    let focus = smoothstep(DUST_NEAREST.0, DUST_NEAREST.1, d) * smoothstep(DUST_SEEN_WITHIN, 0.75 * DUST_SEEN_WITHIN, d);
+                    let focus = if s.held { smoothstep(DUST_NEAREST.0, DUST_NEAREST.1, d) * smoothstep(DUST_SEEN_WITHIN, 0.75 * DUST_SEEN_WITHIN, d) } else { 1.0 };
                     inst.colour = [c.x, c.y, c.z, held * focus];
                     inst.params[3] = -1.0;
                 }
-                EffectKind::Smoke => {
+                templates::SlotShade::Sixway { peak, rise, power } => {
                     let mut strongest: Option<(f32, Vec3, Vec3)> = None;
                     let mut rest = ambient;
-                    for &li in &lamps {
-                        let Some((c, d)) = lamp_at(&at.lights[li], centre) else { continue };
-                        let c = c * own(&at.lights[li]);
+                    for l in &lamps {
+                        let Some((c, d)) = lamp_seen_at(l, centre) else { continue };
+                        let c = c * l.own;
                         let y = luminance(c);
                         match strongest {
                             Some((sy, _, _)) if sy >= y => rest += c,
@@ -1050,7 +1256,7 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                     }
                     let a = Vec3::splat(p.albedo) * tint * at.exposure;
                     let base = rest * a;
-                    let opacity = 0.55 * smoothstep(0.0, 0.1, t) * (1.0 - t).powf(1.4) * v.intensity;
+                    let opacity = peak * smoothstep(0.0, rise, t) * (1.0 - t).powf(power) * v.intensity;
                     inst.colour = [base.x, base.y, base.z, opacity];
                     if let Some((_, c, d)) = strongest {
                         let lit = c * a * henyey_greenstein(p.phase_g, -d, to_eye);
@@ -1059,13 +1265,11 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
                     }
                     inst.params[3] = 1.0;
                 }
-
-                EffectKind::Coals | EffectKind::Fire => unreachable!("coals and flames are drawn apart"),
             }
             if inst.colour[3] <= 0.0 {
                 continue;
             }
-            if e.kind.screened() {
+            if s.screened {
                 screened.push(inst);
             } else {
                 over.push(((centre - at.head).length_squared(), inst));
@@ -1073,7 +1277,36 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
         }
     }
     for s in splashes {
-        splash(s, time, at, &mut over, &mut screened);
+        let (o0, s0) = (over.len(), screened.len());
+        splash(s, time, &at.at_point(s.position), &mut over, &mut screened);
+
+        let key = splash_key(s);
+        let fill: f32 = over[o0..].iter().map(|(_, i)| i).chain(screened[s0..].iter()).map(|i| instance_fill(i, at.head)).sum();
+        splash_costs.push((key, fill, (over.len() - o0 + screened.len() - s0) as f32));
+        let share = shares.map_or(1.0, |sh| (sh.splash)(s));
+        if share < 1.0 {
+            let phase = uniforms(key)[0];
+            let mut j = 0u32;
+            let mut keep = |_: &EffectInstance| {
+                j += 1;
+                let kept = stack::kept(j - 1, share, phase);
+                splash_shed += !kept as u32;
+                kept
+            };
+            let tail: Vec<(f32, EffectInstance)> = over.drain(o0..).collect();
+            over.extend(tail.into_iter().filter(|(_, i)| keep(i)));
+            let tail: Vec<EffectInstance> = screened.drain(s0..).collect();
+            screened.extend(tail.into_iter().filter(|i| keep(i)));
+        }
+    }
+    let mut burst_count = bursts.map_or_else(Default::default, |b| stack::simulate_bursts(b, time, at, &own, &mut over, &mut screened));
+    burst_count.emitter_shed = emitter_shed;
+    burst_count.splash_shed = splash_shed;
+
+    let hot = |i: &EffectInstance| i.params[3] == stack::SHADE_SCREEN_HEAT;
+    let screened_heat = screened.iter().filter(|i| hot(i)).count() as u32;
+    if screened_heat > 0 {
+        screened.sort_by_key(|i| hot(i));
     }
 
     over.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -1081,6 +1314,9 @@ pub fn simulate_seen(emitters: &[EffectEmitter], seen: &dyn Fn(usize) -> bool, s
         instances: Vec::with_capacity(over.len() + screened.len()),
         over: over.len() as u32,
         screened: screened.len() as u32,
+        screened_heat,
+        bursts: burst_count,
+        splash_costs,
     };
     frame.instances.extend(over.into_iter().map(|(_, i)| i));
     frame.instances.extend(screened);
@@ -1122,51 +1358,22 @@ pub fn emitter_seen(
     rooms: &[super::portal_cull::CullRoom],
     portals: &[super::uniforms::ProbePortal],
 ) -> bool {
+    !emitter_sight(e, views, head, rooms, portals).is_empty()
+}
+
+pub fn emitter_sight(
+    e: &EffectEmitter,
+    views: &[[glam::Vec4; 6]],
+    head: Vec3,
+    rooms: &[super::portal_cull::CullRoom],
+    portals: &[super::uniforms::ProbePortal],
+) -> Vec<seen::Eye> {
     let (lo, hi) = emitter_bounds(e);
-    let in_view = views.iter().any(|planes| {
-        let mut unbounded = *planes;
-        unbounded[5] = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
-        super::shadow::aabb_in_frustum(&unbounded, lo, hi)
-    });
-    if !in_view {
-        return false;
-    }
-    let room_of = |p: Vec3| {
-        rooms
-            .iter()
-            .filter(|r| (r.min.cmplt(p) & p.cmplt(r.max)).all())
-            .min_by(|a, b| (a.max - a.min).element_product().total_cmp(&(b.max - b.min).element_product()))
-    };
-    let Some(start) = room_of(head).filter(|r| r.closed) else { return true };
-    let goal = room_of(e.position);
-    if goal.is_some_and(|g| g.id == start.id) {
-        return true;
-    }
+    seen::sight(views, head, lo, hi, e.position, rooms, portals)
+}
 
-    let mut reached = vec![start.id];
-    let mut frontier = vec![start.id];
-    for _ in 0..super::portal_cull::MAX_DOORWAYS {
-        let mut next = Vec::new();
-        for p in portals {
-            for (from, to) in [(p.low, p.high), (p.high, p.low)] {
-                if frontier.contains(&from) && !reached.contains(&to) {
-                    reached.push(to);
-                    next.push(to);
-                }
-            }
-        }
-        match goal {
-            Some(g) if reached.contains(&g.id) => return true,
-
-            None if reached.iter().any(|id| rooms.iter().any(|r| r.id == *id && !r.closed)) => return true,
-            _ => {}
-        }
-        if next.is_empty() {
-            return false;
-        }
-        frontier = next;
-    }
-    false
+fn mote_margin(e: &EffectEmitter) -> f32 {
+    0.25 * e.variation.clamped().turbulence + 0.05
 }
 
 fn fire_instances(e: &EffectEmitter, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectInstance)>) {
@@ -1229,7 +1436,7 @@ fn ember_pops(e: &EffectEmitter, time: f64, at: &Surroundings, screened: &mut Ve
     let tint = Vec3::from(e.tint);
     let root = e.scale.sqrt();
     let accel = up * (p.drag * EMBER_PLUME * root) + p.accel;
-    let first = ((time - f64::from(lives.1)) / EMBER_POP_BIN).floor() as i64;
+    let first = ((time - lives.1 as f64) / EMBER_POP_BIN).floor() as i64;
     let last = (time / EMBER_POP_BIN).floor() as i64;
     for bin in first..=last {
         let pop = hash64(base ^ (bin as u64).wrapping_mul(0x8cb92ba72f3d8dd7));
@@ -1237,7 +1444,7 @@ fn ember_pops(e: &EffectEmitter, time: f64, at: &Surroundings, screened: &mut Ve
         if b[0] >= chance {
             continue;
         }
-        let born = (bin as f64 + f64::from(b[1])) * EMBER_POP_BIN;
+        let born = (bin as f64 + b[1] as f64) * EMBER_POP_BIN;
         let since = (time - born) as f32;
         if since < 0.0 {
             continue;
@@ -1296,35 +1503,442 @@ pub struct Splash {
 
     pub born: f64,
 
-    pub speed: f32,
+    pub velocity: Vec3,
 
     pub size: f32,
+
+    pub mass: f32,
 
     pub sunlit: f32,
 
     pub depth: f32,
+
+    pub calm: f32,
+
+    pub held: f32,
+
+    pub flat: f32,
     pub seed: u64,
+
+    /// MUD, not water: how wet the mud struck is, 0 (water, every splash
+    /// before mud had them) to 1 (slurry). A mud splash throws clumps and
+    /// spray and leaves a crater and spatter in the mud map
+    /// (`mud_splash`, docs/engine/mud-and-deform.md).
+    pub mud: f32,
+    /// A BLAST in the mud, not a strike: the energy that went into the
+    /// ground, joules (`Splash::mud_blast`). 0 for anything thrown or shot.
+    pub blast: f32,
 }
 
-pub const SPLASH_SECONDS: f32 = 1.6;
+impl Splash {
+
+    pub fn new(position: Vec3, born: f64, velocity: Vec3, size: f32, mass: f32) -> Self {
+        let seed = hash64(born.to_bits() ^ hash64((position.x.to_bits() as u64) << 32 | position.z.to_bits() as u64));
+        Self { position, born, velocity, size, mass, sunlit: 1.0, depth: 30.0, calm: 1.0, held: 0.0, flat: 0.0, seed, mud: 0.0, blast: 0.0 }
+    }
+
+    pub fn projectile(position: Vec3, born: f64, velocity: Vec3, diameter: f32, mass: f32) -> Self {
+        Self::new(position, born, velocity, 0.5 * diameter, mass)
+    }
+}
+
+pub const SPLASH_SECONDS: f32 = 3.0;
 
 const DROP_ALBEDO: f32 = 1.0;
 const DROP_PHASE_G: f32 = 0.55;
 
 const DROP_STREAK: f32 = 0.012;
 
-pub fn splash_strength(speed: f32, size: f32) -> f32 {
-    let v = (speed / 1.3).max(0.0);
-    (v * v * (size / 0.08).max(0.0)).min(12.0)
+const WATER_DENSITY: f32 = 1000.0;
+const GRAVITY: f32 = 9.81;
+const SURFACE_TENSION: f32 = 0.072;
+const ATMOSPHERE: f32 = 101_325.0;
+
+const BODY_DRAG: f32 = 0.8;
+
+const DROP_DRAG: f32 = 4.5e-4;
+
+const SEAL_SPEED: (f32, f32) = (8.0, 40.0);
+
+const SPLASH_DROPS: usize = 110;
+
+const SPLASH_PETALS: usize = 14;
+
+const SHEET_THICKNESS: f32 = 0.01;
+
+const SPLASH_H: f32 = 1.0 / 256.0;
+
+const RING_ENERGY_SHARE: f32 = 0.10;
+
+const RING_STEEPEST: f32 = 0.6;
+
+const RING_EDGE: f32 = 0.5;
+
+const RING_PEAK: f32 = 0.4;
+
+pub const RING_FILM_VISCOSITY: f32 = 1.0e-5;
+
+pub const DROP_CELLS: (f32, f32) = (4.0, 24.0);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SplashShape {
+
+    pub cavity: f32,
+
+    pub depth: f32,
+
+    pub collapse: f32,
+
+    pub sealed: f32,
+
+    pub fine: f32,
+
+    pub sheet_speed: f32,
+    pub sheet_angle: f32,
+    pub crown_height: f32,
+    pub crown_seconds: f32,
+    pub petals: usize,
+
+    pub drop: f32,
+    pub drops: usize,
+    pub spray_speed: f32,
+
+    pub jet_height: f32,
+    pub jet_width: f32,
+
+    pub broken: f32,
+
+    pub white: f32,
+
+    pub spray: usize,
+    pub froth: usize,
+
+    pub plow: f32,
+
+    pub struck: f32,
+
+    pub mist: usize,
+
+    pub ring_wavelength: f32,
+    pub ring_speed: f32,
+    pub ring_height: f32,
+
+    pub wave_source: f32,
+
+    pub ring_gravity: f32,
+
+    pub ring_release: f32,
+
+    pub drops_land: f32,
+    pub drops_band: f32,
+    pub drops_from: f32,
+    pub drops_over: f32,
+    pub drops_density: f32,
+
+    pub foam: f32,
+
+    pub foam_seconds: f32,
+    pub settle: f32,
+
+    pub forward: Vec3,
+
+    pub carry: Vec3,
+
+    pub seconds: f32,
+}
+
+fn thrown_height(up: f32, k: f32, t: f32) -> f32 {
+    let x = k * t;
+
+    let (a1, phi) = if x < 0.05 {
+        (t * (1.0 - x * (0.5 - x * (1.0 / 6.0 - x / 24.0))), 0.5 - x * (1.0 / 6.0 - x * (1.0 / 24.0 - x / 120.0)))
+    } else {
+        let e = (-x).exp_m1();
+        (-e / k, (x + e) / (x * x))
+    };
+    up * a1 - GRAVITY * t * t * phi
+}
+
+fn aloft(up: f32, k: f32) -> f32 {
+    if up <= 0.0 {
+        return 0.0;
+    }
+    if k < 1e-3 {
+        return 2.0 * up / GRAVITY;
+    }
+    let apex = (up * k / GRAVITY).ln_1p() / k;
+    let (mut lo, mut hi) = (apex, apex + 2.0 * up / GRAVITY + 1.0 / k);
+    for _ in 0..24 {
+        let mid = 0.5 * (lo + hi);
+        if thrown_height(up, k, mid) > 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+fn apex(up: f32, k: f32) -> f32 {
+    if up <= 0.0 {
+        return 0.0;
+    }
+
+    let y = up * k / GRAVITY;
+    if y < 0.1 {
+        return up * up / GRAVITY * (0.5 - y * (1.0 / 3.0 - y * (0.25 - y * (0.2 - y / 6.0))));
+    }
+    up / k - GRAVITY / (k * k) * y.ln_1p()
+}
+
+pub fn splash_shape(s: &Splash) -> SplashShape {
+    use std::f32::consts::{PI, TAU};
+    let speed = s.velocity.length();
+    let r = s.size.max(1e-3);
+    let calm = s.calm.clamp(0.0, 1.0);
+    let normal = s.velocity.y.abs();
+    let sin_entry = if speed > 1e-4 { (normal / speed).clamp(0.0, 1.0) } else { 1.0 };
+    let flat = Vec3::new(s.velocity.x, 0.0, s.velocity.z);
+    let forward = if speed > 1e-4 { flat / speed } else { Vec3::ZERO };
+    let sealed = smoothstep(SEAL_SPEED.0, SEAL_SPEED.1, speed);
+
+    let pressure = |a: f32| WATER_DENSITY * GRAVITY * a + ATMOSPHERE * sealed;
+    let drive = 0.5 * WATER_DENSITY * BODY_DRAG * r * r * speed * speed + pressure(r) * r * r;
+    let mut cavity = r;
+    for _ in 0..24 {
+        cavity = 0.5 * (cavity + (drive / pressure(cavity)).sqrt());
+    }
+    let closes = |a: f32| 1.83 * a * (WATER_DENSITY / pressure(a)).sqrt();
+
+    let stops = 2.0 * s.mass.max(1e-5) / (WATER_DENSITY * BODY_DRAG * PI * r * r);
+    let travel = stops * (1.0 + speed * closes(cavity) / stops).ln();
+
+    cavity = r + (cavity - r).min(travel);
+
+    let flat_hit = s.flat.clamp(0.0, 1.0);
+    let mut depth = (travel * sin_entry).min(s.depth.max(0.0)).max(0.0) * (1.0 - 0.6 * flat_hit);
+
+    let energy = 0.5 * s.mass.max(0.0) * speed * speed;
+    let dug = PI * cavity * cavity * depth * (WATER_DENSITY * GRAVITY * depth / 12.0 + ATMOSPHERE * sealed / 3.0);
+    if dug > energy && dug > 0.0 {
+        let k = (energy / dug).powf(0.25);
+        cavity = (cavity * k).max(r);
+        depth *= k;
+    }
+    let collapse = closes(cavity).max(1e-3);
+
+    let deep = smoothstep(0.5, 2.0, s.depth / cavity);
+    let passes = smoothstep(1.0, 2.5, depth / cavity);
+
+    let shoulder = (WATER_DENSITY * normal * normal * r / SURFACE_TENSION).sqrt();
+    let thrown = 0.8 * shoulder / (shoulder + 150.0) * normal * (1.0 - sealed) * (travel / r).min(1.0);
+
+    let sheet_speed = (3.5 * (cavity - r) / collapse).max(thrown).max(1.3 * normal * flat_hit);
+
+    let steep = smoothstep(0.3, 1.5, s.depth / r);
+    let sheet_angle = lerp(lerp(28.0f32, 68.0, steep), 14.0, flat_hit).to_radians();
+    let plow = 0.9 * flat.length() * (1.0 - sealed);
+    let weber = WATER_DENSITY * sheet_speed * sheet_speed * cavity / SURFACE_TENSION;
+    let drop = (cavity / weber.max(1.0).sqrt()).clamp(1.5e-4, 4e-3);
+    let fine = 1.0 - smoothstep(3e-4, 1e-3, drop);
+    let up = sheet_speed * sheet_angle.sin();
+    let air = DROP_DRAG * up / drop;
+    let crown_height = apex(up, air);
+    let crown_seconds = aloft(up, air);
+
+    let rim = 1.2 * cavity;
+    let petals = if crown_height > 0.004 && fine < 0.75 && flat_hit < 0.5 { ((TAU * rim / (1.6 * crown_height)).round() as usize).clamp(10, SPLASH_PETALS) } else { 0 };
+
+    let fingers = TAU * cavity / (9.0 * drop.max(1.5e-3));
+
+    let drops = if sheet_speed > 0.15 { ((1.5 * fingers * (0.15 + 0.85 * (1.0 - fine)) * (0.4 + 0.6 * calm) * (1.0 + flat_hit)).round() as usize).clamp(4, SPLASH_DROPS) } else { 0 };
+
+    let spray_speed = (0.5 + 0.75 * shoulder / (shoulder + 150.0)) * normal;
+
+    let jet_height = 1.4 * depth * passes * deep * calm * calm * (1.0 - s.held.clamp(0.0, 1.0));
+    let jet_width = (0.3 * cavity * (cavity / depth.max(1e-3)).sqrt()).clamp(0.08 * cavity, 0.45 * cavity);
+    let jet_seconds = 2.0 * (2.0 * jet_height / GRAVITY).sqrt();
+
+    let retracts = (2.0 * SURFACE_TENSION / (WATER_DENSITY * SHEET_THICKNESS * cavity)).sqrt();
+    let broken = smoothstep(0.6, 2.5, crown_height / (retracts * crown_seconds.max(1e-3))) * (1.0 - fine);
+    let white = broken.max(0.85 * (1.0 - calm)) * (1.0 - fine);
+    let throws = sheet_speed > 0.15;
+    let spray = if throws { ((1.5 + 9.0 * cavity.sqrt() * (1.0 - sealed) + 2.5 * sealed).round() as usize).clamp(3, 6) } else { 0 };
+
+    let froth = if throws && white > 0.4 && (cavity > 0.1 || broken > 0.5) { ((white * (6.0 + 4.0 * cavity.sqrt())).round() as usize).clamp(6, 9) } else { 0 };
+    let mist = if sealed > 0.05 { (2.0 + 6.0 * sealed).round() as usize } else { 0 };
+
+    let into = 0.5 * s.mass.max(0.0) * (normal * normal + 0.1 * flat.length_squared());
+    let a = cavity.max(0.01);
+    let wave_source = ((8.0 * RING_ENERGY_SHARE * into / (WATER_DENSITY * GRAVITY * PI * a * a)).sqrt()).min(RING_STEEPEST * a)
+        * (0.3 + 0.7 * calm)
+        * (1.0 - 0.5 * sealed);
+    let k = 3.0 / (RING_EDGE * a);
+    let ring_wavelength = TAU / k;
+    let bond = SURFACE_TENSION * k * k / (WATER_DENSITY * GRAVITY);
+    let ring_gravity = GRAVITY * (1.0 + bond);
+    let ring_speed = 0.5 * (ring_gravity / k).sqrt();
+
+    let ring_height = 0.5 * RING_PEAK * wave_source;
+    let ring_release = 0.5 * collapse;
+
+    let foam = ((0.35 + 1.2 * smoothstep(0.03, 0.5, cavity) + 0.4 * sealed + 0.4 * (1.0 - calm)) * smoothstep(0.1, 0.6, sheet_speed) * (1.0 - 0.5 * flat_hit)).min(0.65 + 0.3 * (1.0 - calm));
+    let foam_seconds = 1.2 + 3.0 * cavity.sqrt();
+    let settle = (1.5 + 4.0 * cavity.sqrt()).min(6.0);
+
+    let carry = (flat * 0.4).clamp_length_max(sheet_speed) * (1.0 - 0.8 * sealed);
+
+    let fastest = sheet_speed + spray_speed + plow;
+    let finest = (drop * (sheet_speed / fastest.max(1e-3)).clamp(0.08, 1.0)).max(1.5e-4);
+
+    let fan = 1.25 * sheet_speed + 0.45 * spray_speed + plow;
+    let fan_seconds = if spray > 0 { aloft(fan * sheet_angle.sin(), DROP_DRAG * fan / (0.6 * drop)).min(2.5) + 0.25 * collapse } else { 0.0 };
+    let seconds = (0.5 * collapse + aloft(fastest * sheet_angle.sin(), DROP_DRAG * fastest / finest).min(2.5) * (1.0 - fine))
+        .max(collapse + jet_seconds + 0.1)
+        .max(if petals > 0 { 1.3 * crown_seconds + 0.2 * collapse } else { 0.0 })
+        .max(fan_seconds * (1.0 - sealed))
+        .max(0.6 * collapse + 0.5 + 1.2 * cavity.sqrt() + 0.4 * sealed)
+        .min(SPLASH_SECONDS);
+
+    let fly_k = DROP_DRAG * sheet_speed / drop;
+    let flight = aloft(up, fly_k);
+    let reach = sheet_speed * sheet_angle.cos() * if fly_k < 1e-4 { flight } else { (1.0 - (-fly_k * flight).exp()) / fly_k };
+    let drops_land = 1.1 * cavity + 0.7 * reach;
+    let drops_band = 0.3 * cavity + 0.5 * reach;
+    let drops_from = 0.25 * collapse + 0.6 * flight;
+    let drops_over = (0.8 * flight).max(0.15);
+    let falling = if throws { (drops as f32 * 3.0 + spray as f32 * 25.0) * (1.0 - fine) } else { 0.0 };
+    let drops_density = falling / (TAU * drops_land * 2.0 * drops_band).max(1e-3);
+    SplashShape {
+        cavity,
+        depth,
+        collapse,
+        sealed,
+        fine,
+        sheet_speed,
+        sheet_angle,
+        crown_height,
+        crown_seconds,
+        petals,
+        drop,
+        drops,
+        spray_speed,
+        jet_height,
+        jet_width,
+        broken,
+        white,
+        spray,
+        froth,
+        plow,
+        struck: speed,
+        mist,
+        ring_wavelength,
+        ring_speed,
+        ring_height,
+        wave_source,
+        ring_gravity,
+        ring_release,
+        drops_land,
+        drops_band,
+        drops_from,
+        drops_over,
+        drops_density,
+        foam,
+        foam_seconds,
+        settle,
+        forward,
+        carry,
+        seconds,
+    }
+}
+
+pub fn splash_range(shape: &SplashShape) -> f32 {
+    (250.0 * (shape.cavity + shape.crown_height + shape.jet_height)).max(15.0)
+}
+
+pub fn splash_bounds(s: &Splash) -> (Vec3, Vec3) {
+    if s.mud > 0.0 {
+        return mud_splash::bounds(s);
+    }
+    let shape = splash_shape(s);
+    let fastest = shape.sheet_speed + shape.spray_speed + shape.plow;
+
+    let (up, out) = (fastest * shape.sheet_angle.sin(), fastest * shape.sheet_angle.cos() + shape.carry.length());
+    let slowed = DROP_DRAG / (1.6 * shape.drop);
+    let high = 1.3 * shape.crown_height.max(shape.jet_height).max(apex(up, slowed * fastest)).max(shape.sheet_speed / 3.0) + 2.0 * shape.cavity + 0.1;
+    let wide = 2.5 * shape.cavity + (out * shape.seconds).min(if slowed * out > 1e-3 { 1.0 / slowed } else { f32::MAX }).max(shape.sheet_speed / 3.0) + 0.1;
+    (s.position - Vec3::new(wide, 0.05, wide), s.position + Vec3::new(wide, high, wide))
+}
+
+pub fn splash_seen(s: &Splash, time: f64, views: &[[glam::Vec4; 6]]) -> bool {
+    let age = (time - s.born) as f32;
+    if !(age >= 0.0 && age < SPLASH_SECONDS) {
+        return false;
+    }
+    let (lo, hi) = splash_bounds(s);
+    views.iter().any(|planes| {
+        let mut unbounded = *planes;
+        unbounded[5] = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+        super::shadow::aabb_in_frustum(&unbounded, lo, hi)
+    })
+}
+
+pub fn strike(live: &mut Vec<Splash>, mut new: Splash, kept: usize) {
+    new.calm = 1.0;
+    if new.mud > 0.0 {
+        // Mud keeps no churned surface for the next strike to land in.
+        if live.len() >= kept.max(1) {
+            live.remove(0);
+        }
+        live.push(new);
+        return;
+    }
+    let own = splash_shape(&new);
+    let mut calm = 1.0f32;
+    for old in live.iter() {
+        let age = (new.born - old.born) as f32;
+        if age < 0.0 || old.mud > 0.0 {
+            continue;
+        }
+        let was = splash_shape(old);
+        if age > was.settle {
+            continue;
+        }
+        let apart = Vec3::new(new.position.x - old.position.x, 0.0, new.position.z - old.position.z).length();
+        let reach = 1.2 * was.cavity + own.cavity;
+        let within = 1.0 - smoothstep(0.5 * reach, reach, apart);
+
+        let churned = if age < was.collapse { 1.0 } else { 0.7 * (1.0 - smoothstep(0.0, was.settle - was.collapse, age - was.collapse)) };
+        let outweighs = (was.cavity / own.cavity).powi(2).min(1.0);
+        calm *= 1.0 - within * churned * outweighs;
+    }
+    new.calm = calm.clamp(0.0, 1.0);
+    if live.len() >= kept.max(1) {
+        live.remove(0);
+    }
+    live.push(new);
 }
 
 fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectInstance)>, screened: &mut Vec<EffectInstance>) {
+    use std::f32::consts::{FRAC_PI_2, PI, TAU};
     let age = (time - s.born) as f32;
-    let strength = splash_strength(s.speed, s.size);
-    if !(0.0..SPLASH_SECONDS).contains(&age) || strength <= 0.01 {
+    if !(age >= 0.0 && age < SPLASH_SECONDS) {
+        return;
+    }
+    if s.mud > 0.0 {
+        mud_splash::draw(s, time, at, over);
+        return;
+    }
+    let shape = splash_shape(s);
+    if age >= shape.seconds || shape.sheet_speed <= 0.02 {
         return;
     }
     let player = |p: Vec3| at.yaw_inv * (p - at.offset);
+    let head_world = at.yaw_inv.inverse() * at.head + at.offset;
+    let away = head_world.distance(s.position);
+    if away > splash_range(&shape) {
+        return;
+    }
     let ambient = (at.ambient)(s.position);
     let sun = at.lights.iter().find(|l| matches!(l.kind, LightKind::Directional) && l.intensity > 0.0).map(|l| {
         let c = l.color.to_linear();
@@ -1338,23 +1952,62 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         }
         c * at.exposure
     };
-    let gravity = Vec3::new(0.0, -9.81, 0.0);
-    let drops = ((40.0 * strength.sqrt()) as usize).clamp(6, 200);
-    for i in 0..drops {
-        let u = uniforms(hash64(s.seed ^ (i as u64).wrapping_mul(0x632be59bd9b4e019)));
-        let azimuth = u[0] * std::f32::consts::TAU;
-        let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
-        let elevation = lerp(40.0f32, 85.0, u[1]).to_radians();
 
-        let launch = (s.speed * lerp(0.4, 1.6, u[2] * u[2])).clamp(0.3, 8.0);
-        let v0 = (out * elevation.cos() + Vec3::Y * elevation.sin()) * launch;
-        let p0 = s.position + out * (s.size * lerp(0.5, 1.1, u[3]));
-        let born_late = 0.06 * u[4];
-        let a = age - born_late;
+    let glassy = |centre: Vec3, face: Vec3, opacity: f32| -> Vec3 {
+        let to_eye = (at.head - centre).normalize_or_zero();
+        let f = at.yaw_inv * face.normalize_or(Vec3::Y);
+        let n = if f.dot(to_eye) < 0.0 { -f } else { f };
+        let cos_v = n.dot(to_eye).clamp(0.05, 1.0);
+        let fresnel = 0.02 + 0.98 * (1.0 - cos_v).powi(5);
+        let mut c = ambient * (0.15 + fresnel);
+        if let Some((to_sun, rgb)) = sun {
+
+            let h = (to_sun + to_eye).normalize_or_zero();
+            let nh = n.dot(h).abs();
+            let a2 = 0.09f32;
+            let d = a2 / (PI * (nh * nh * (a2 - 1.0) + 1.0).powi(2));
+            let glint = d * (0.02 + 0.98 * (1.0 - h.dot(to_eye).clamp(0.0, 1.0)).powi(5)) / (4.0 * cos_v);
+            c += rgb * (glint * n.dot(to_sun).abs() + 0.08 * henyey_greenstein(0.8, -to_sun, to_eye));
+        }
+        c * (at.exposure / opacity.max(0.05))
+    };
+    let gravity = Vec3::new(0.0, -GRAVITY, 0.0);
+    let calm = s.calm.clamp(0.0, 1.0);
+    let lean = shape.forward.length();
+    let toward = shape.forward.normalize_or_zero();
+
+    let middle = s.position + shape.forward * (0.4 * shape.cavity);
+
+    let seen_along = |p: Vec3, axis: Vec3| -> (f32, f32) {
+        let to_eye = (head_world - p).normalize_or(Vec3::Z);
+        let up_seen = Vec3::Y - to_eye * to_eye.y;
+        if up_seen.length_squared() < 1e-4 {
+            return (0.0, 1.0);
+        }
+        let u = up_seen.normalize();
+        let r = u.cross(to_eye);
+        let (ar, au) = (axis.dot(r), axis.dot(u));
+        (-ar.atan2(au), (ar * ar + au * au).sqrt())
+    };
+
+    let shown = ((shape.drops as f32 * (8.0 / away.max(0.1)).min(1.0)).ceil() as usize).min(shape.drops);
+    for i in 0..shown {
+        let u = uniforms(hash64(s.seed ^ (i as u64 + 1).wrapping_mul(0x632be59bd9b4e019)));
+        let azimuth = u[0] * TAU;
+        let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
+        let down_range = out.dot(toward) * lean;
+
+        let ahead = down_range.max(0.0);
+        let launch = shape.sheet_speed * lerp(0.6, 1.0, u[6]) + shape.spray_speed * u[2] * u[2] * (1.0 + 0.8 * down_range).max(0.2) + shape.plow * ahead * ahead * u[6];
+        let width = (shape.drop * lerp(0.6, 1.6, u[5]) * (shape.sheet_speed / launch.max(1e-3)).clamp(0.08, 1.0)).max(1.5e-4);
+        let elevation = shape.sheet_angle * (1.0 - 0.45 * ahead) + (u[1] - 0.5) * 0.42;
+        let v0 = out * (elevation.cos() * launch) + Vec3::Y * (elevation.sin() * launch) + shape.carry * (u[7] * (0.5 + 0.5 * down_range));
+        let p0 = middle + out * (shape.cavity * lerp(0.8, 1.1, u[3]));
+        let a = age - 0.5 * shape.collapse * u[4];
         if a <= 0.0 {
             continue;
         }
-        let (pos, vel) = ballistic(p0, v0, gravity, 0.4, a);
+        let (pos, vel) = ballistic(p0, v0, gravity, DROP_DRAG * launch / width, a);
         if pos.y < s.position.y && vel.y < 0.0 {
             continue;
         }
@@ -1362,10 +2015,9 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         let axis = at.yaw_inv * vel.normalize_or(Vec3::Y);
         let moving = at.yaw_inv * vel;
         let c = lit(centre, DROP_ALBEDO, DROP_PHASE_G);
-        let radius = lerp(0.0015, 0.004, u[5]);
         screened.push(EffectInstance {
-            centre: [centre.x, centre.y, centre.z, radius],
-            colour: [c.x, c.y, c.z, 1.0 - smoothstep(0.75, 1.0, a / SPLASH_SECONDS)],
+            centre: [centre.x, centre.y, centre.z, 0.5 * width],
+            colour: [c.x, c.y, c.z, 1.0 - smoothstep(0.85, 1.0, age / shape.seconds)],
             light: [0.0; 4],
             light_dir: [0.0, 1.0, 0.0, vel.length() * DROP_STREAK],
             axis: [axis.x, axis.y, axis.z, 0.01],
@@ -1374,83 +2026,373 @@ fn splash(s: &Splash, time: f64, at: &Surroundings, over: &mut Vec<(f32, EffectI
         });
     }
 
-    let rise = ((1.2 * s.speed).powi(2) / (2.0 * 9.81)).clamp(0.04, 2.0);
-    let crown_life = (2.0 * (2.0 * rise / 9.81).sqrt()).clamp(0.3, 1.4);
-    let t = age / crown_life;
-    if t < 1.0 {
-        let u = uniforms(hash64(s.seed ^ 0xc80));
-        let half_at = |t: f32| 0.5 * (rise * smoothstep(0.0, 0.3, t) * (1.0 - 0.45 * smoothstep(0.45, 1.0, t))).max(s.size);
-        let half = half_at(t);
-        let centre = player(s.position + Vec3::Y * (half * 0.92));
+    let whole = (1.0 - shape.fine) * calm * (1.0 - 0.85 * shape.broken);
+    let crown_opacity = lerp(0.55, 0.92, shape.broken) * whole;
 
-        let lift = 0.92 * (half - half_at(t - MOTION_H / crown_life)) / MOTION_H;
-        let c = lit(centre, 0.95, 0.0);
-        let opacity = 0.85 * smoothstep(0.0, 0.04, t) * (1.0 - smoothstep(0.5, 1.0, t)) * strength.sqrt().clamp(0.35, 1.0);
-        over.push((
-            (centre - at.head).length_squared(),
-            EffectInstance {
-                centre: [centre.x, centre.y, centre.z, half],
-                colour: [c.x, c.y, c.z, opacity],
-                light: [0.0, 0.0, 0.0, 1.0],
-                light_dir: [0.0, 1.0, 0.0, 0.0],
-                axis: [0.0, 1.0, 0.0, 0.03],
-                params: [(2.0 * u[0] - 1.0) * 0.15, CROWN_LAYER as f32, if u[1] < 0.5 { -1.0 } else { 1.0 }, 0.0],
-                motion: [0.0, lift, 0.0, 0.0],
-            },
-        ));
+    if shape.petals > 0 && crown_opacity > 0.2 {
+        let turn = uniforms(hash64(s.seed ^ 0xc80))[0] * TAU;
+        for k in 0..shape.petals {
+            let u = uniforms(hash64(s.seed ^ 0xc80 ^ (k as u64 + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
+            let azimuth = turn + TAU * (k as f32 + 0.5 * (u[0] - 0.5)) / shape.petals as f32;
+            let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
+            let down_range = out.dot(toward) * lean;
+            let ahead = down_range.max(0.0);
+            let angle = shape.sheet_angle * (1.0 - 0.45 * ahead);
+            let up = (shape.sheet_speed + shape.plow * ahead * ahead) * angle.sin() * lerp(0.8, 1.25, u[1]) * (1.0 + 0.6 * down_range.min(0.0)).max(0.3);
+            let air = DROP_DRAG * up / shape.drop;
+            let life = aloft(up, air).max(0.04);
+            let start = 0.2 * shape.collapse * u[2];
+            let t = (age - start) / life;
+            if !(t > 0.0 && t < 1.0) {
+                continue;
+            }
+
+            let axis = (Vec3::Y * angle.sin() + out * angle.cos()).normalize();
+            let tangent = Vec3::new(-out.z, 0.0, out.x);
+            let place = |since: f32| -> (Vec3, f32, f32, f32) {
+                let since = since.clamp(0.0, life);
+                let high = thrown_height(up, air, since).max(0.0);
+                let long = high / angle.sin();
+                let rim = shape.cavity * (0.8 + 0.45 * smoothstep(0.0, 0.5 * shape.collapse, since)) + (0.3 * shape.carry.length() + 0.5 * shape.plow * angle.cos()) * since * ahead;
+                let centre = middle + out * rim + axis * (0.5 * long);
+                let (spin, shows) = seen_along(centre, axis);
+                let (_, across) = seen_along(centre, tangent);
+                let half = (0.5 * long * shows.max(0.2)).max(1e-4);
+
+                let wide = (2.0 * PI * rim / shape.petals as f32 * across.max(0.45)).min(6.0 * half).max(half);
+                (centre, half, wide / half, spin)
+            };
+            let since = age - start;
+            let (centre_w, half, aspect, spin) = place(since);
+            let moving = (place(since + 0.5 * SPLASH_H).0 - place(since - 0.5 * SPLASH_H).0) / SPLASH_H;
+            let centre = player(centre_w);
+            let moving = at.yaw_inv * moving;
+
+            let face = out * angle.sin() - Vec3::Y * angle.cos();
+            let c = glassy(centre, face, crown_opacity).lerp(lit(centre, 0.95, 0.15), shape.broken);
+
+            let stage = 1.999 * smoothstep(0.3 - 0.3 * shape.broken, 0.95 - 0.35 * shape.broken, t);
+            let variant = (u[3] * CROWN_VARIANTS as f32) as u32 % CROWN_VARIANTS;
+            let opacity = crown_opacity * smoothstep(0.0, 0.06, t) * (1.0 - smoothstep(0.8, 1.0, t));
+            over.push((
+                (centre - at.head).length_squared(),
+                EffectInstance {
+                    centre: [centre.x, centre.y, centre.z, half],
+                    colour: [c.x, c.y, c.z, opacity],
+                    light: [0.0, 0.0, 0.0, 1.0],
+                    light_dir: [0.0, 1.0, 0.0, 0.0],
+                    axis: [0.0, 1.0, 0.0, (0.25 * half).clamp(0.005, 0.03)],
+
+                    params: [FRAC_PI_2 + spin, (CROWN_LAYER + variant * CROWN_FRAMES) as f32 + stage, aspect, 0.0],
+                    motion: [moving.x, moving.y, moving.z, 0.0],
+                },
+            ));
+        }
     }
 
-    let puffs = ((2.0 + 2.0 * strength.sqrt()) as usize).min(10);
-    for i in 0..puffs {
-        let u = uniforms(hash64(s.seed ^ 0x5bd1e995 ^ (i as u64).wrapping_mul(0x8cb92ba72f3d8dd7)));
-        let life = lerp(0.45, 0.9, u[0]) * strength.sqrt().clamp(0.7, 1.6);
-        if age >= life {
+    struct Fan {
+        count: usize,
+        layer: u32,
+        variants: u32,
+        salt: u64,
+
+        fast: (f32, f32),
+        coarse: f32,
+
+        tall: (f32, f32),
+
+        stand: f32,
+        opacity: f32,
+        phase_g: f32,
+    }
+    let plume = shape.sealed;
+    let fans = [
+        Fan { count: shape.froth, layer: FROTH_LAYER, variants: FROTH_VARIANTS, salt: 0xf207, fast: (0.0, 0.05), coarse: 1.5, tall: (1.0, 1.15), stand: 1.0, opacity: 0.95 * shape.white, phase_g: 0.0 },
+
+        Fan { count: shape.spray, layer: SPRAY_LAYER, variants: SPRAY_VARIANTS, salt: 0x5b7a, fast: (0.15, 0.45), coarse: 0.6, tall: (1.0, 1.5), stand: 0.0, opacity: 0.8 * (shape.drops as f32 / 60.0).clamp(0.45, 1.0).max(plume), phase_g: 0.55 },
+    ];
+    for fan in &fans {
+        if fan.opacity < 0.02 {
             continue;
         }
-        let t = age / life;
-        let azimuth = u[1] * std::f32::consts::TAU;
+        let turn = uniforms(hash64(s.seed ^ fan.salt))[0] * TAU;
+        for j in 0..fan.count {
+            let u = uniforms(hash64(s.seed ^ fan.salt ^ (j as u64 + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
+            let azimuth = turn + TAU * (j as f32 + 0.7 * (u[0] - 0.5)) / fan.count as f32;
+            let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
+            let down_range = out.dot(toward) * lean;
+            let ahead = down_range.max(0.0);
+            let open_launch = ((shape.sheet_speed * lerp(0.9, 1.25, u[1]) + shape.spray_speed * lerp(fan.fast.0, fan.fast.1, u[2]) + shape.plow * ahead * ahead) * (1.0 + 0.5 * down_range.min(0.0)).max(0.4)).min(0.9 * shape.struck);
+
+            let launch = lerp(open_launch, (2.0 * GRAVITY * shape.jet_height.max(0.3 * shape.depth)).sqrt() * lerp(0.6, 1.1, u[1]), plume);
+            let angle = lerp(shape.sheet_angle * (1.0 - 0.45 * ahead), 1.5, plume);
+            let up = launch * angle.sin();
+
+            let air = DROP_DRAG * launch / (fan.coarse * shape.drop) * (1.0 - plume) / 2.2;
+            let life = aloft(up, air).max(0.1);
+            let rises = if air < 1e-3 { up / GRAVITY } else { (up * air / GRAVITY).ln_1p() / air };
+            let start = 0.25 * shape.collapse * u[3] * (1.0 - plume) + 0.3 * shape.collapse * plume * u[3];
+            let since = age - start;
+            let t = since / life;
+            if !(t > 0.0 && t < 1.0) {
+                continue;
+            }
+            let leans = lerp(angle, FRAC_PI_2, fan.stand);
+            let axis = (Vec3::Y * leans.sin() + out * leans.cos()).normalize();
+
+            let tall_by = lerp(fan.tall.0, fan.tall.1, u[4]) * (1.0 + 1.2 * plume) * (1.0 + 0.35 * (1.0 - fan.stand) * smoothstep(0.2, 0.7, shape.cavity));
+            let place = |since: f32| -> (Vec3, f32, f32) {
+                let since = since.clamp(0.0, life);
+
+                let top = thrown_height(up, air, since.min(rises)).max(0.0);
+                let high = top * (1.0 - 0.4 * smoothstep(0.55, 1.0, since / life));
+                let long = high / leans.sin();
+                let rim = shape.cavity * (0.85 + 0.35 * smoothstep(0.0, 0.5 * shape.collapse, since)) * (1.0 - plume) * lerp(0.6 + 0.4 * u[5], 1.0, fan.stand);
+                let foot = middle + out * rim + (shape.carry * 0.3 + toward * (0.5 * shape.plow * angle.cos())) * (since * ahead * (1.0 - plume));
+                let centre = foot + axis * (0.5 * long);
+                let (spin, shows) = seen_along(centre, axis);
+                ((centre), (0.5 * long * shows.max(0.25)).max(1e-4), spin)
+            };
+            let (centre_w, tall, spin) = place(since);
+            let moving = at.yaw_inv * ((place(since + 0.5 * SPLASH_H).0 - place(since - 0.5 * SPLASH_H).0) / SPLASH_H);
+            let centre = player(centre_w);
+            let half = tall / tall_by;
+            let c = lit(centre, 0.97, fan.phase_g);
+
+            let stage = 1.999 * smoothstep(lerp(0.12, 0.4, fan.stand), lerp(0.8, 0.97, fan.stand), t);
+            let variant = (u[6] * fan.variants as f32) as u32 % fan.variants;
+            let opacity = fan.opacity * lerp(0.8, 1.0, u[7]) * smoothstep(0.0, 0.05, t) * (1.0 - smoothstep(0.7, 1.0, t));
+            over.push((
+                (centre - at.head).length_squared(),
+                EffectInstance {
+                    centre: [centre.x, centre.y, centre.z, half],
+                    colour: [c.x, c.y, c.z, opacity],
+                    light: [0.0, 0.0, 0.0, 1.0],
+                    light_dir: [0.0, 1.0, 0.0, 0.0],
+                    axis: [0.0, 1.0, 0.0, (0.25 * half).clamp(0.005, 0.05)],
+                    params: [spin, (fan.layer + variant * 3) as f32 + stage, if u[8] < 0.5 { -tall_by } else { tall_by }, 0.0],
+                    motion: [moving.x, moving.y, moving.z, 0.0],
+                },
+            ));
+        }
+    }
+
+    let since_close = age - shape.collapse;
+    if shape.jet_height > 0.01 && since_close > 0.0 {
+        let throw = (2.0 * GRAVITY * shape.jet_height).sqrt();
+        let life = 2.0 * throw / GRAVITY;
+        let u = uniforms(hash64(s.seed ^ 0x6e7));
+        let axis = (Vec3::Y + shape.forward * 0.35 + Vec3::new(u[0] - 0.5, 0.0, u[1] - 0.5) * 0.12).normalize();
+        if since_close < life {
+            let place = |since: f32| -> (Vec3, f32, f32, f32) {
+                let since = since.clamp(0.0, life);
+                let high = (throw * since - 0.5 * GRAVITY * since * since).max(0.0);
+                let centre = middle + axis * (0.5 * high);
+                let (spin, shows) = seen_along(centre, axis);
+                let tall = (0.5 * high * shows.max(0.2)).max(1e-4);
+
+                let half = (2.0 * shape.jet_width * (1.0 - 0.4 * since / life)).min(tall).max(1e-4);
+                (centre, half, tall / half, spin)
+            };
+            let t = since_close / life;
+            let (centre_w, half, aspect, spin) = place(since_close);
+            let moving = at.yaw_inv * ((place(since_close + 0.5 * SPLASH_H).0 - place(since_close - 0.5 * SPLASH_H).0) / SPLASH_H);
+            let centre = player(centre_w);
+            let stage = 1.999 * smoothstep(0.3, 0.85, t);
+            let variant = (u[2] * JET_VARIANTS as f32) as u32 % JET_VARIANTS;
+
+            let opacity = lerp(0.6, 0.9, shape.fine.max(0.5 * t)) * smoothstep(0.0, 0.05, t) * (1.0 - smoothstep(0.85, 1.0, t));
+
+            let face = (head_world - centre_w) * Vec3::new(1.0, 0.0, 1.0);
+            let c = glassy(centre, face, opacity).lerp(lit(centre, 0.95, 0.0), shape.fine.max(0.5 * t));
+            over.push((
+                (centre - at.head).length_squared(),
+                EffectInstance {
+                    centre: [centre.x, centre.y, centre.z, half],
+                    colour: [c.x, c.y, c.z, opacity],
+                    light: [0.0, 0.0, 0.0, 1.0],
+                    light_dir: [0.0, 1.0, 0.0, 0.0],
+                    axis: [0.0, 1.0, 0.0, (0.25 * half).clamp(0.005, 0.03)],
+                    params: [spin, (JET_LAYER + variant * JET_FRAMES) as f32 + stage, if u[3] < 0.5 { -aspect } else { aspect }, 0.0],
+                    motion: [moving.x, moving.y, moving.z, 0.0],
+                },
+            ));
+        }
+
+        let release = 0.35 * throw / GRAVITY;
+        for i in 0..3u64 {
+            let u = uniforms(hash64(s.seed ^ 0x6e7 ^ (i + 1).wrapping_mul(0x9e3779b97f4a7c15)));
+            let width = (shape.jet_width * lerp(0.5, 1.0, u[1])).clamp(0.002, 0.012) * (1.0 - 0.7 * shape.fine);
+            let v0 = axis * (throw * lerp(0.8, 1.12, u[0])) + Vec3::new(u[2] - 0.5, 0.0, u[3] - 0.5) * (0.12 * throw) + shape.carry * 0.2;
+            let (pos, vel) = ballistic(middle, v0, gravity, DROP_DRAG * throw / width, since_close);
+            if since_close < release || (pos.y < s.position.y && vel.y < 0.0) {
+                continue;
+            }
+            let centre = player(pos);
+            let dir = at.yaw_inv * vel.normalize_or(Vec3::Y);
+            let moving = at.yaw_inv * vel;
+            let c = lit(centre, DROP_ALBEDO, DROP_PHASE_G);
+            screened.push(EffectInstance {
+                centre: [centre.x, centre.y, centre.z, 0.5 * width],
+                colour: [c.x, c.y, c.z, 1.0],
+                light: [0.0; 4],
+                light_dir: [0.0, 1.0, 0.0, vel.length() * DROP_STREAK],
+                axis: [dir.x, dir.y, dir.z, 0.01],
+                params: [0.0, EMBER_LAYER as f32, 0.0, 0.0],
+                motion: [moving.x, moving.y, moving.z, 0.0],
+            });
+        }
+    }
+
+    let mist_turn = uniforms(hash64(s.seed ^ 0x5bd1e995))[0] * TAU;
+    for i in 0..shape.mist {
+        let u = uniforms(hash64(s.seed ^ 0x5bd1e995 ^ (i as u64 + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
+        let begins = 0.6 * shape.collapse * u[6];
+        let life = (lerp(0.5, 1.0, u[0]) * (0.5 + 1.2 * shape.cavity.sqrt() + 0.4 * shape.sealed)).min(shape.seconds - begins);
+        let since = age - begins;
+        if !(since > 0.0 && since < life) {
+            continue;
+        }
+        let t = since / life;
+
+        let azimuth = mist_turn + TAU * (i as f32 + 0.8 * (u[1] - 0.5)) / shape.mist as f32;
         let out = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());
-        let v0 = out * lerp(0.2, 0.7, u[2]) * s.speed.sqrt() + Vec3::Y * lerp(0.3, 1.0, u[3]) * s.speed.sqrt();
-        let (pos, vel) = ballistic(s.position + out * s.size * 0.6, v0, Vec3::new(0.0, -2.0, 0.0), 3.0, age);
+
+        let share = ((i as f32 + 1.0) * 0.618_034 + u[2] / shape.mist as f32).fract();
+        let launch = shape.sheet_speed * lerp(0.35, 1.0, share);
+        let width = shape.drop * lerp(0.35, 1.2, share);
+        let v0 = out * (launch * shape.sheet_angle.cos() * (1.0 - 0.9 * plume)) + Vec3::Y * (launch * lerp(shape.sheet_angle.sin() * 0.6, 1.0, plume)) + shape.carry * 0.3;
+
+        let drag = (DROP_DRAG * launch / (2.2 * width)).max(3.0);
+        let (pos, vel) = ballistic(middle + out * (shape.cavity * 0.6 * (1.0 - plume)), v0, gravity, drag, since);
+
+        let size = lerp(0.3 * shape.cavity + shape.crown_height, 0.45 * shape.cavity, plume) * lerp(0.7, 1.3, u[4]) * (0.5 + 1.7 * t);
         let floor = s.position.y + 0.02;
         let centre = player(pos.max(Vec3::new(f32::MIN, floor, f32::MIN)));
         let moving = at.yaw_inv * if pos.y < floor { vel * Vec3::new(1.0, 0.0, 1.0) } else { vel };
-        let size = s.size * lerp(0.7, 1.2, u[4]) * (0.6 + 1.6 * t) * strength.sqrt().clamp(0.6, 1.8);
 
         let c = lit(centre, 0.95, 0.0);
-        let opacity = 0.3 * smoothstep(0.0, 0.06, t) * (1.0 - t).powf(1.4) * strength.sqrt().min(1.3).max(0.4);
-        let frame = SMOKE_FRAMES as f32 * (0.2 + 0.6 * t);
+        let opacity = (0.05 + 0.7 * shape.fine) * plume * smoothstep(0.0, 0.08, t) * (1.0 - t).powf(1.4);
+        let frame = SMOKE_FRAMES as f32 * (0.35 + 0.55 * t);
         over.push((
             (centre - at.head).length_squared(),
             EffectInstance {
                 centre: [centre.x, centre.y, centre.z, size],
                 colour: [c.x, c.y, c.z, opacity],
-                light: [0.0; 4],
+                light: [0.0, 0.0, 0.0, if plume > 0.5 { 1.0 } else { 0.0 }],
                 light_dir: [0.0, 1.0, 0.0, 0.0],
                 axis: [0.0, 1.0, 0.0, 0.05],
-                params: [(2.0 * u[5] - 1.0) * std::f32::consts::PI, frame.min((SMOKE_FRAMES - 1) as f32), 0.0, 0.0],
+                params: [if plume > 0.5 { 0.0 } else { (2.0 * u[5] - 1.0) * PI }, frame.min((SMOKE_FRAMES - 1) as f32), 1.0 + 1.3 * plume, 0.0],
                 motion: [moving.x, moving.y, moving.z, 0.0],
             },
         ));
     }
 }
 
-pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: Vec3) -> [[f32; 4]; N] {
-    let mut live: Vec<(f32, [f32; 4])> = splashes
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SplashRings<const N: usize> {
+
+    pub rings: [[f32; 4]; N],
+
+    pub waves: [[f32; 4]; N],
+
+    pub pools: [[f32; 4]; N],
+
+    pub drops: [[f32; 4]; N],
+}
+
+pub fn splash_rings<const N: usize>(splashes: &[Splash], time: f64, head_world: Vec3) -> SplashRings<N> {
+    use std::f32::consts::PI;
+    let mut live: Vec<(f32, [[f32; 4]; 4])> = splashes
         .iter()
         .filter_map(|s| {
             let age = (time - s.born) as f32;
-            (0.0..super::water_pipeline::RING_SECONDS).contains(&age).then(|| {
-                ((s.position - head_world).length_squared(), [s.position.x, s.position.z, age, splash_strength(s.speed, s.size)])
-            })
+            // Mud makes no rings.
+            if age < 0.0 || s.mud > 0.0 {
+                return None;
+            }
+            let shape = splash_shape(s);
+            let lasts = ring_seconds(&shape);
+            if age >= lasts.max(shape.foam_seconds + shape.collapse) || shape.wave_source <= 0.0 && shape.foam <= 0.0 {
+                return None;
+            }
+            let a = shape.cavity.max(0.01);
+            let run = (age - shape.ring_release).max(0.0);
+            let fade = 1.0 - smoothstep(0.6 * lasts, lasts, age);
+
+            let c = RING_EDGE * a;
+            let size = RING_PEAK * shape.wave_source * a * c.powi(3) * (3.0f32).exp() / 27.0 * fade;
+
+            let g4 = 0.25 * shape.ring_gravity;
+            let steep = [1.5f32, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0]
+                .iter()
+                .map(|m| {
+                    let k = m / c;
+                    let from_rim = run * (g4 / k).sqrt();
+                    size * k.powi(4) * (-k * (c + 2.0 * RING_FILM_VISCOSITY * k * run)).exp() * smoothstep(0.0, a, from_rim) / (a + from_rim)
+                })
+                .fold(0.0, f32::max);
+
+            let bowl = if age < shape.collapse {
+                0.5 * shape.depth.min(shape.cavity) * (PI * age / shape.collapse).sin().max(0.0)
+            } else {
+                let x = (age - shape.collapse) / (0.3 * shape.collapse + 0.15);
+                -0.25 * shape.depth.min(shape.cavity) * x * (1.0 - x).exp()
+            };
+
+            let foamed = (age - 0.3 * shape.collapse) / shape.foam_seconds;
+            let reach = shape.cavity * (1.0 + 0.9 * smoothstep(0.0, 1.0, foamed));
+            let foam = shape.foam * smoothstep(0.3 * shape.collapse, 0.9 * shape.collapse, age) * (1.0 - smoothstep(0.0, 1.0, foamed)).powf(1.5);
+            let streaked = 0.2 * smoothstep(0.1, 0.6, foamed);
+
+            let landed = age - shape.drops_from;
+            let raining = landed < shape.drops_over + DROP_RING_SECONDS;
+            let cells = (3.0 / shape.drops_band.max(1e-3)).clamp(DROP_CELLS.0, DROP_CELLS.1).round();
+            let share = if raining { (shape.drops_density / (cells * cells)).min(1.0) } else { 0.0 };
+            let apart = (s.position - head_world).length();
+
+            let rain = share * smoothstep(0.0, 0.05, landed) * (1.0 - smoothstep(shape.drops_over, shape.drops_over + DROP_RING_SECONDS, landed));
+
+            let weight = ring_weight(steep + 2.0 * bowl.abs() / reach + 0.05 * rain, foam, apart) * (age / 0.5).min(1.0).powi(3);
+            (weight > 0.0).then_some((
+                weight,
+                [
+                    [s.position.x, s.position.z, run, size.max(1e-12)],
+                    [0.25 * shape.ring_gravity, c, a, 2.0 * bowl / (reach * reach)],
+                    [foam, 1.0 / (reach * reach), streaked, shape.drops_over],
+                    [shape.drops_land, 1.0 / (shape.drops_band * shape.drops_band).max(1e-6), landed, if share > 0.0 { cells + 0.999 * share } else { 0.0 }],
+                ],
+            ))
         })
         .collect();
-    live.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut out = [[0.0; 4]; N];
-    for (o, (_, r)) in out.iter_mut().zip(live) {
-        *o = r;
+    live.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    let cut = live.get(N).map_or(0.0, |l| l.0);
+    let mut out = SplashRings { rings: [[0.0; 4]; N], waves: [[0.0; 4]; N], pools: [[0.0; 4]; N], drops: [[0.0; 4]; N] };
+    for (i, (weight, [ring, wave, pool, drop])) in live.into_iter().take(N).enumerate() {
+
+        let keep = if cut > 0.0 { (0.5 * (weight / cut - 1.0)).clamp(0.0, 1.0) } else { 1.0 };
+        out.rings[i] = [ring[0], ring[1], ring[2], (ring[3] * keep).max(1e-12)];
+        out.waves[i] = [wave[0], wave[1], wave[2], wave[3] * keep];
+        out.pools[i] = [pool[0] * keep, pool[1], pool[2], pool[3]];
+
+        out.drops[i] = [drop[0], drop[1], drop[2], if drop[3] > 0.0 { drop[3].floor() + drop[3].fract() * keep } else { 0.0 }];
     }
     out
+}
+
+fn ring_weight(slope: f32, foam: f32, apart: f32) -> f32 {
+    (slope + 0.3 * foam) / (1.0 + apart / 4.0).powi(2)
+}
+
+pub const DROP_RING_SECONDS: f32 = 0.45;
+
+pub fn ring_seconds(shape: &SplashShape) -> f32 {
+    let a = shape.cavity.max(0.01);
+    let k = 3.0 / (RING_EDGE * a);
+
+    let reach = 300.0 * RING_PEAK * shape.wave_source * a * k;
+    (shape.ring_release + reach / shape.ring_speed.max(1e-3)).clamp(1.0, super::water_pipeline::RING_SECONDS)
 }
 
 pub const FIRE_LIGHT_INTENSITY: f32 = 0.6;
@@ -1472,7 +2414,7 @@ pub fn fire_light(e: &EffectEmitter, time: f64, offset: Vec3, yaw_inv: Quat) -> 
     }
     let v = e.variation.clamped();
     let glow = fire_glow(e, time);
-    let f = f64::from(fire_puff_hz(e));
+    let f = fire_puff_hz(e) as f64;
     let seed = emitter_seed(e);
     let flutter = 0.12 * noise1d(time * f * 2.0, seed ^ 0x51) + 0.06 * noise1d(time * f * 4.0, seed ^ 0x52);
     let flicker = 0.8 * (1.0 + v.flicker * (glow - 1.0 + flutter)).clamp(0.25, 2.0);
@@ -1530,8 +2472,36 @@ pub fn fire_glare(e: &EffectEmitter, time: f64, offset: Vec3, yaw_inv: Quat) -> 
 }
 
 pub fn room_ambient(descs: &[ProbeDesc], world: Vec3) -> Vec3 {
-    let l = super::room_light::room_light_at(descs, world);
+    let l = super::room_light::room_light_at_or_nearest(descs, world);
     Vec3::new(l[0][0], l[0][1], l[0][2]) * 0.282_095
+}
+
+pub const UNDER_GROUND: (f32, f32) = (0.5, 2.0);
+
+pub fn room_ambient_now(descs: &[ProbeDesc], world: Vec3, relit: &[f32], ground: Option<&super::ground_map::HeightGrid>) -> Vec3 {
+    let ratio = |i: usize| if relit.is_empty() { 1.0 } else { relit.get(i).copied().filter(|k| k.is_finite()).unwrap_or(1.0).max(0.0) };
+    let baked = room_ambient(descs, world);
+    let lit = || descs.iter().enumerate().filter(|(_, d)| d.room_light.is_some());
+    let size = |d: &ProbeDesc| (d.max - d.min).max(Vec3::ZERO).element_product();
+    let near = |a: &(usize, &ProbeDesc), b: &(usize, &ProbeDesc)| (a.1.centre - world).length_squared().total_cmp(&(b.1.centre - world).length_squared());
+    let inside = lit().filter(|(_, d)| (world - d.min).min(d.max - world).min_element() >= 0.0).min_by(|a, b| size(a.1).total_cmp(&size(b.1)));
+    let now = match inside.or_else(|| lit().min_by(near)) {
+        Some((i, _)) if !relit.is_empty() => baked * ratio(i),
+        _ => baked,
+    };
+
+    let held = lit().map(|(_, d)| smoothstep(-super::room_light::ROOM_EDGE, 0.0, (world - d.min).min(d.max - world).min_element())).fold(0.0, f32::max);
+    let buried = ground.map_or(0.0, |g| smoothstep(UNDER_GROUND.0, UNDER_GROUND.1, g.at(world.x, world.z) - world.y));
+    let open_share = (1.0 - held) * (1.0 - buried);
+    let outdoor = |v: u32| descs.iter().filter(|d| d.volume == v).all(|d| !d.has_depth);
+    match lit().filter(|(_, d)| outdoor(d.volume)).min_by(near) {
+        Some((i, d)) if open_share > 0.0 => {
+            let l = d.room_light.unwrap_or_default();
+            let open = Vec3::new(l[0][0], l[0][1], l[0][2]) * (0.282_095 * ratio(i));
+            now.lerp(open, open_share)
+        }
+        _ => now,
+    }
 }
 
 pub fn lamp_in_room(descs: &[ProbeDesc], emitter: Vec3, lamp: Vec3) -> bool {
@@ -1588,7 +2558,7 @@ pub fn meter_samples(emitters: &[EffectEmitter], head: Vec3, descs: &[ProbeDesc]
             let area = std::f32::consts::PI * (r1 * r1 - r0 * r0) / 8.0;
             for s in 0..8 {
                 let phi = (s as f32 + 0.5) * std::f32::consts::TAU / 8.0;
-                let p = e.position + (side * phi.cos() + across * phi.sin()) * f32::midpoint(r0, r1);
+                let p = e.position + (side * phi.cos() + across * phi.sin()) * (0.5 * (r0 + r1));
                 if room.is_some_and(|d| p.cmplt(d.min).any() || p.cmpgt(d.max).any()) {
                     continue;
                 }
@@ -1642,7 +2612,7 @@ fn fbm(p: Vec3, octaves: u32, seed: u64) -> f32 {
     let mut amp = 0.5;
     let mut q = p;
     for o in 0..octaves {
-        sum += amp * noise3(q, seed.wrapping_add(u64::from(o) * 7919));
+        sum += amp * noise3(q, seed.wrapping_add(o as u64 * 7919));
         q = q * 2.03 + Vec3::new(17.1, 9.3, 3.7);
         amp *= 0.5;
     }
@@ -1654,7 +2624,7 @@ fn billows(p: Vec3, octaves: u32, seed: u64) -> f32 {
     let mut amp = 0.5;
     let mut q = p;
     for o in 0..octaves {
-        sum += amp * noise3(q, seed.wrapping_add(u64::from(o) * 7919)).abs();
+        sum += amp * noise3(q, seed.wrapping_add(o as u64 * 7919)).abs();
         q = q * 2.03 + Vec3::new(17.1, 9.3, 3.7);
         amp *= 0.5;
     }
@@ -1824,7 +2794,7 @@ fn fire_frame(k: u32) -> Vec<u8> {
         for x in 0..n {
             let px = (x as f32 + 0.5) / n as f32 * 2.0 - 1.0;
             let py = 1.0 - (y as f32 + 0.5) / n as f32 * 2.0;
-            let v = f32::midpoint(py, 1.0);
+            let v = (py + 1.0) * 0.5;
             let h = ((v - FLAME_BASE) / (1.0 - FLAME_BASE)).max(0.0);
 
             let flight = (1.0 + FLAME_W1 * h / FLAME_W0).ln() / FLAME_W1;
@@ -1931,7 +2901,7 @@ fn dot_frame(sharpness: f32) -> Vec<u8> {
 
 pub fn atlas_layers() -> Vec<Vec<u8>> {
     fn on_every_core<T: Send>(count: u32, make: impl Fn(u32) -> T + Sync) -> Vec<T> {
-        let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get).clamp(1, count.max(1) as usize);
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, count.max(1) as usize);
         let mut made: Vec<Option<T>> = (0..count).map(|_| None).collect();
         let make = &make;
         std::thread::scope(|s| {
@@ -1955,54 +2925,317 @@ pub fn atlas_layers() -> Vec<Vec<u8>> {
     layers.push(dot_frame(6.0));
     layers.push(dot_frame(3.0));
     layers.push(coals_frame());
-    layers.push(crown_frame());
+    for variant in 0..CROWN_VARIANTS {
+        layers.extend((0..CROWN_FRAMES).map(|stage| crown_frame(variant, stage)));
+    }
+    for variant in 0..JET_VARIANTS {
+        layers.extend((0..JET_FRAMES).map(|stage| jet_frame(variant, stage)));
+    }
+    for variant in 0..SPRAY_VARIANTS {
+        layers.extend((0..SPRAY_FRAMES).map(|stage| spray_frame(variant, stage)));
+    }
+    for variant in 0..FROTH_VARIANTS {
+        layers.extend((0..FROTH_FRAMES).map(|stage| froth_frame(variant, stage)));
+    }
+    for variant in 0..FLASH_VARIANTS {
+        layers.extend((0..FLASH_FRAMES).map(|form| flash::lobe_frame(variant, form)));
+    }
+    layers.extend((0..CORE_VARIANTS).map(flash::core_frame));
+    layers.extend((0..MUD_VARIANTS).map(mud_splash::lump_frame));
     layers
 }
 
-fn crown_frame() -> Vec<u8> {
-    let n = ATLAS_SIZE as usize;
-    let mut clear = vec![1.0f32; n * n];
-    let mut splat = |cx: f32, cy: f32, r: f32, a: f32| {
-        let (x0, x1) = (((cx - 3.0 * r) * n as f32).floor().max(0.0) as usize, ((cx + 3.0 * r) * n as f32).ceil().min(n as f32) as usize);
-        let (y0, y1) = (((cy - 3.0 * r) * n as f32).floor().max(0.0) as usize, ((cy + 3.0 * r) * n as f32).ceil().min(n as f32) as usize);
+static CUTOUT_SHARES: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+
+fn cutout_shares_of(cut: &[[f32; 16]]) -> Vec<f32> {
+    cut.iter()
+        .map(|c| {
+
+            let area: f32 = (0..8).map(|k| (c[2 * k] * c[2 * ((k + 1) % 8) + 1] - c[2 * ((k + 1) % 8)] * c[2 * k + 1]) * 0.5).sum();
+            (area.abs() / 4.0).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+pub fn books() -> &'static [super::effect_asset::BookInfo] {
+    use super::effect_asset::{BookInfo, Channels};
+    static BOOKS: std::sync::OnceLock<Vec<BookInfo>> = std::sync::OnceLock::new();
+    BOOKS.get_or_init(|| {
+        let shares = CUTOUT_SHARES.get_or_init(|| cutout_shares_of(&cutouts(&atlas_layers())));
+        let layer_bytes = (0..ATLAS_MIPS).map(|m| ((ATLAS_SIZE >> m).max(1) as u64).pow(2) * 4).sum::<u64>();
+        let book = |name, first: u32, frames: u32, variants: u32, channels, layers: u32| BookInfo {
+            name,
+            first_layer: first,
+            frames,
+            variants,
+            channels,
+            cutout_share: shares[first as usize..(first + frames * variants) as usize].iter().sum::<f32>() / (frames * variants) as f32,
+            bytes: layers as u64 * layer_bytes,
+        };
+        vec![
+            book("smoke", 0, SMOKE_FRAMES, 1, Channels::Sixway, 2 * SMOKE_FRAMES),
+            book("flame", FIRE_FIRST, FIRE_FRAMES, 1, Channels::HeatCover, FIRE_FRAMES),
+            book("ember", EMBER_LAYER, 1, 1, Channels::Alpha, 1),
+            book("mote", MOTE_LAYER, 1, 1, Channels::Alpha, 1),
+            book("coals", COALS_LAYER, 1, 1, Channels::Bed, 1),
+            book("crown", CROWN_LAYER, CROWN_FRAMES, CROWN_VARIANTS, Channels::Alpha, CROWN_FRAMES * CROWN_VARIANTS),
+            book("jet", JET_LAYER, JET_FRAMES, JET_VARIANTS, Channels::Alpha, JET_FRAMES * JET_VARIANTS),
+            book("spray", SPRAY_LAYER, SPRAY_FRAMES, SPRAY_VARIANTS, Channels::Alpha, SPRAY_FRAMES * SPRAY_VARIANTS),
+            book("froth", FROTH_LAYER, FROTH_FRAMES, FROTH_VARIANTS, Channels::Alpha, FROTH_FRAMES * FROTH_VARIANTS),
+            book("muzzle_flash", FLASH_LAYER, FLASH_FRAMES, FLASH_VARIANTS, Channels::HeatCover, FLASH_FRAMES * FLASH_VARIANTS),
+            book("muzzle_core", CORE_LAYER, 1, CORE_VARIANTS, Channels::HeatCover, CORE_VARIANTS),
+        ]
+    })
+}
+
+struct Dabs {
+    clear: Vec<f32>,
+}
+
+impl Dabs {
+    fn new() -> Self {
+        Self { clear: vec![1.0; (ATLAS_SIZE * ATLAS_SIZE) as usize] }
+    }
+
+    fn dab(&mut self, cx: f32, cy: f32, r: f32, a: f32) {
+        let n = ATLAS_SIZE as usize;
+        let soft = 1.0 / n as f32;
+        let r = r.max(0.5 * soft);
+        let reach = r + soft;
+        let (x0, x1) = (((cx - reach) * n as f32).floor().max(0.0) as usize, ((cx + reach) * n as f32).ceil().clamp(0.0, n as f32) as usize);
+        let (y0, y1) = (((cy - reach) * n as f32).floor().max(0.0) as usize, ((cy + reach) * n as f32).ceil().clamp(0.0, n as f32) as usize);
         for y in y0..y1 {
             for x in x0..x1 {
                 let (px, py) = ((x as f32 + 0.5) / n as f32, (y as f32 + 0.5) / n as f32);
-                let d2 = ((px - cx) * (px - cx) + (py - cy) * (py - cy)) / (r * r);
-                clear[y * n + x] *= 1.0 - a * (-d2 * 2.0).exp();
+                let d = ((px - cx) * (px - cx) + (py - cy) * (py - cy)).sqrt();
+
+                let cover = a * (1.0 - smoothstep(r - soft, r + soft, d));
+                let c = &mut self.clear[y * n + x];
+                *c = c.min(1.0 - cover);
             }
         }
-    };
-    let base = (0.5f32, 0.95f32);
-    for j in 0..26u64 {
-        let u = uniforms(hash64(0xc0ffee ^ j.wrapping_mul(0x9e3779b97f4a7c15)));
+    }
 
-        let lean = (2.0 * u[0] - 1.0) * (0.25 + 0.75 * u[1] * u[1]) * 1.1;
-        let len = lerp(0.4, 0.88, u[2]) * (1.0 - 0.3 * lean.abs());
-        let w0 = lerp(0.016, 0.03, u[3]);
-        let droop = 0.12 * u[4];
-        let mut tip = base;
-        for k in 0..48 {
-            let t = k as f32 / 47.0;
-            let x = base.0 + 0.8 * (lean.sin() * len * t + lean.signum() * droop * t * t);
-            let y = base.1 - lean.cos() * len * t * (1.0 - 0.25 * t * t);
-            splat(x, y, w0 * (1.0 - 0.65 * t), 0.55 * (1.0 - 0.35 * t));
-            tip = (x, y);
+    fn finish(self, film: impl Fn(f32, f32) -> f32, edge: impl Fn(f32, f32) -> f32, on_its_side: bool) -> Vec<u8> {
+        let n = ATLAS_SIZE as usize;
+        let mut out = vec![0u8; n * n * 4];
+        for y in 0..n {
+            for x in 0..n {
+
+                let (ux, uy) = if on_its_side { (y, n - 1 - x) } else { (x, y) };
+                let (px, py) = ((ux as f32 + 0.5) / n as f32, (uy as f32 + 0.5) / n as f32);
+                let a = (1.0 - self.clear[uy * n + ux] * (1.0 - film(px, py).clamp(0.0, 1.0))) * edge(px, py);
+                out[(y * n + x) * 4..(y * n + x) * 4 + 4].copy_from_slice(&[255, 255, 255, (a.clamp(0.0, 1.0) * 255.0).round() as u8]);
+            }
         }
-        splat(tip.0, tip.1 - 0.02, w0 * 1.1, 0.8);
+        out
     }
-    for k in 0..40u64 {
-        let u = uniforms(hash64(0xd06e ^ k.wrapping_mul(0x632be59bd9b4e019)));
-        splat(base.0 + (2.0 * u[0] - 1.0) * 0.3, base.1 - 0.06 * u[1], lerp(0.03, 0.06, u[2]), 0.25);
-    }
-    let mut out = vec![0u8; n * n * 4];
-    for (i, c) in clear.iter().enumerate() {
-        let (x, y) = ((i % n) as f32 / n as f32, (i / n) as f32 / n as f32);
+}
 
-        let edge = smoothstep(0.0, 0.04, x) * smoothstep(1.0, 0.96, x) * smoothstep(0.0, 0.04, y);
-        out[i * 4..i * 4 + 4].copy_from_slice(&[255, 255, 255, ((1.0 - c) * edge * 255.0).round() as u8]);
+fn crown_frame(variant: u32, stage: u32) -> Vec<u8> {
+    let seed = 0xc0ffee ^ ((variant as u64 + 1) << 20);
+    let stage = stage.min(2);
+    let mut d = Dabs::new();
+    let base = 0.98f32;
+
+    let rim = move |x: f32| {
+        let side = (2.0 * x - 1.0) * (2.0 * x - 1.0);
+        0.38 + 0.1 * noise1(x * 3.3, seed) + 0.045 * noise1(x * 9.0, seed ^ 7) + 0.07 * side
+    };
+
+    for c in 0..110 {
+        let x = 0.01 + 0.98 * (c as f32 + 0.5) / 110.0;
+        let u = uniforms(hash64(seed ^ 0x71 ^ (c as u64).wrapping_mul(0x9e3779b97f4a7c15)));
+
+        let thick = 0.024 + 0.011 * noise1(x * 9.0, seed ^ 0x33);
+        match stage {
+            0 => d.dab(x, rim(x), thick, 0.95),
+
+            1 => {
+                if noise1(x * 9.0, seed ^ 0x33) > -0.4 {
+                    d.dab(x, rim(x) + 0.012, 0.9 * thick, 0.95);
+                }
+            }
+
+            _ => {
+                if c % 4 == 0 {
+                    d.dab(x + 0.012 * (u[0] - 0.5), rim(x) + 0.03 + 0.05 * u[1], lerp(0.011, 0.02, u[2]), 0.95);
+                }
+            }
+        }
     }
-    out
+
+    for f in 0..7u64 {
+        let u = uniforms(hash64(seed ^ 0xf1 ^ f.wrapping_mul(0x632be59bd9b4e019)));
+        let x0 = 0.06 + 0.88 * (f as f32 + 0.15 + 0.7 * u[0]) / 7.0;
+        let lean = (u[1] - 0.5) * 0.7;
+        let long = lerp(0.07, 0.2, u[2] * u[2]) * [1.0f32, 1.35, 1.6][stage as usize];
+        let wide = lerp(0.012, 0.02, u[3]);
+        let y0 = rim(x0);
+        let steps = 28;
+        for k in 0..=steps {
+            let t = k as f32 / steps as f32;
+            let (x, y) = (x0 + lean * long * t, y0 - long * t * (1.0 - 0.25 * t));
+            let neck = match stage {
+                0 => 1.0,
+
+                1 => 0.35 + 0.65 * (t * std::f32::consts::TAU + 6.0 * u[4]).cos().abs(),
+
+                _ => {
+                    if (t * 2.0 + u[4]).fract() < 0.22 {
+                        1.4
+                    } else {
+                        0.0
+                    }
+                }
+            };
+            if neck > 0.0 {
+                d.dab(x, y, wide * (1.0 - 0.45 * t) * neck, 0.95);
+            }
+        }
+        let tip = (x0 + lean * long, y0 - long * 0.75);
+        d.dab(tip.0, tip.1 - 0.008, wide * 1.4, 0.97);
+
+        for k in 0..2 * stage + 2 {
+            let v = uniforms(hash64(seed ^ 0xd0 ^ (f * 8 + k as u64).wrapping_mul(0x8cb92ba72f3d8dd7)));
+            d.dab(tip.0 + (v[0] - 0.5) * 0.16, (tip.1 - 0.03 - 0.22 * v[1] * v[1]).max(0.03), lerp(0.006, 0.012, v[2]), 0.95);
+        }
+    }
+
+    let film = move |x: f32, y: f32| -> f32 {
+        if y < rim(x) || y > base {
+            return 0.0;
+        }
+        let up = 1.0 - (y - rim(x)) / (base - rim(x));
+        let warp = 0.5 * noise1(y * 4.0, seed ^ 0x52);
+        let streak = 0.5 + 0.5 * noise1(x * 21.0 + warp, seed ^ 0x51);
+        let fine = 0.5 + 0.5 * noise1(x * 55.0 + 2.0 * warp, seed ^ 0x53);
+        let under_rim = smoothstep(0.75, 1.0, up);
+
+        let body = (0.13 + 0.42 * streak * streak * streak + 0.16 * fine * fine + 0.22 * under_rim) * (0.12 + 0.88 * smoothstep(0.0, 0.65, up));
+        match stage {
+            0 => body,
+
+            1 => 0.8 * body * smoothstep(-0.25, 0.2, noise3(Vec3::new(x * 8.0, y * 6.0, 3.7), seed ^ 0x40) + 0.6 * (1.0 - up) - 0.25),
+
+            _ => 0.55 * body * smoothstep(0.05, 0.4, noise3(Vec3::new(x * 12.0, y * 5.0, 9.1), seed ^ 0x41) + 0.35 * (1.0 - up) - 0.2),
+        }
+    };
+
+    d.finish(film, |x, y| smoothstep(0.0, 0.24, x) * smoothstep(1.0, 0.76, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.96, y), true)
+}
+
+fn spray_frame(variant: u32, stage: u32) -> Vec<u8> {
+    let seed = 0x5b7a1 ^ ((variant as u64 + 1) << 20);
+    let stage = stage.min(2) as usize;
+    let mut d = Dabs::new();
+    let foot = (0.5f32, 0.975f32);
+    let count = [340u64, 340, 170][stage];
+    for i in 0..count {
+        let u = uniforms(hash64(seed ^ (i + 1).wrapping_mul(0x8cb92ba72f3d8dd7)));
+
+        let angle = (u[0] + u[1] - 1.0) * 0.8;
+        let far = [0.8f32, 0.93, 0.95][stage] * u[2].powf(0.55) * (1.0 - 0.3 * angle * angle);
+        let (sx, sy) = (angle.sin(), -angle.cos());
+        let (x, y) = (foot.0 + sx * far, foot.1 + sy * far);
+
+        let r = lerp(0.0035, 0.012, u[3] * u[3] * u[3]) * (1.15 - 0.4 * far) * [1.0f32, 1.0, 0.8][stage];
+        if stage == 0 {
+            let long = lerp(0.03, 0.09, u[4]) * (0.4 + 0.6 * far);
+            for k in 0..6 {
+                let t = k as f32 / 5.0;
+                d.dab(x - sx * long * t, y - sy * long * t, r * (1.0 - 0.55 * t), 0.92);
+            }
+        } else {
+            d.dab(x, y + 0.03 * u[5] * (stage as f32 - 1.0), r, 0.92);
+        }
+    }
+    let haze = move |x: f32, y: f32| -> f32 {
+        let (dx, dy) = (x - foot.0, foot.1 - y);
+        let far = (dx * dx + dy * dy).sqrt();
+        let angle = dx.atan2(dy.max(1e-4));
+        let cone = (1.0 - (angle / 0.75) * (angle / 0.75)).max(0.0) * smoothstep(0.0, 0.08, far) * (1.0 - smoothstep(0.25, 0.8, far));
+        [0.2f32, 0.1, 0.0][stage] * cone * (0.55 + 0.45 * noise3(Vec3::new(x * 9.0, y * 9.0, 0.7), seed ^ 0x11))
+    };
+    d.finish(haze, |x, y| smoothstep(0.0, 0.04, x) * smoothstep(1.0, 0.96, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.985, y), false)
+}
+
+fn froth_frame(variant: u32, stage: u32) -> Vec<u8> {
+    let seed = 0xf207 ^ ((variant as u64 + 1) << 20);
+    let stage = stage.min(2) as usize;
+    let mut d = Dabs::new();
+    let base = 0.98f32;
+
+    let top = move |x: f32| {
+        let side = (2.0 * x - 1.0) * (2.0 * x - 1.0);
+        (0.34 + 0.26 * noise1(x * 3.7, seed) + 0.12 * noise1(x * 10.0, seed ^ 3) + 0.16 * side).clamp(0.06, 0.85)
+    };
+
+    for i in 0..[60u64, 120, 150][stage] {
+        let u = uniforms(hash64(seed ^ 0xbead ^ (i + 1).wrapping_mul(0x632be59bd9b4e019)));
+        let x = 0.08 + 0.84 * u[0];
+        let reach = base - top(x);
+        let h = reach * lerp([0.85f32, 0.5, 0.15][stage], 1.25, u[2]);
+        d.dab(x, (base - h).max(0.02), lerp(0.005, 0.014, u[3] * u[3]), 0.92);
+    }
+    let body = move |x: f32, y: f32| -> f32 {
+        if y > base {
+            return 0.0;
+        }
+        let up = (base - y) / (base - top(x));
+        let lives = 1.0 - smoothstep(0.65, 1.0, up);
+        let warp = 0.6 * noise1(y * 3.0, seed ^ 0x21);
+        let streak = 0.5 + 0.5 * noise3(Vec3::new(x * 22.0 + warp, y * 4.0, 1.9), seed ^ 0x22);
+        let lumps = 0.5 + 0.5 * noise3(Vec3::new(x * 6.0, y * 6.0, 4.3), seed ^ 0x23);
+        let dense = [0.85f32 - 0.3 * up, 0.72 - 0.3 * up, 0.5 - 0.2 * up][stage];
+
+        let a = lives * dense * (0.25 + 0.4 * streak + 0.5 * lumps) * smoothstep(0.0, 0.3, up);
+        match stage {
+            0 => a,
+            1 => a * smoothstep(-0.3, 0.2, noise3(Vec3::new(x * 7.0, y * 6.0, 7.7), seed ^ 0x24) + 0.5 - 0.8 * up),
+            _ => a * smoothstep(0.0, 0.35, noise3(Vec3::new(x * 9.0 + warp, y * 4.0, 2.2), seed ^ 0x25) + 0.25 - 0.35 * up),
+        }
+    };
+    d.finish(body, |x, y| smoothstep(0.0, 0.4, x) * smoothstep(1.0, 0.6, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.97, y), false)
+}
+
+fn jet_frame(variant: u32, stage: u32) -> Vec<u8> {
+    let seed = 0x1e7 ^ ((variant as u64 + 1) << 20);
+    let stage = stage.min(2);
+    let u = uniforms(hash64(seed));
+    let mut d = Dabs::new();
+    let swell = [0.12f32, 0.5, 1.0][stage as usize];
+    let waves = lerp(3.0, 4.5, u[0]);
+    let bend = |t: f32| 0.5 + 0.04 * noise1(t * 3.0, seed ^ 3) * t;
+    let steps = 180;
+    for k in 0..=steps {
+        let t = k as f32 / steps as f32;
+        let y = 0.97 - 0.84 * t;
+        let wave = (t * waves * std::f32::consts::TAU + 6.0 * u[1]).cos();
+
+        let body = 0.085 * (1.0 - 0.6 * t) * (1.0 + 0.7 * (1.0 - smoothstep(0.0, 0.1, t)));
+        let wide = match stage {
+            0 | 1 => body * (1.0 + swell * 0.8 * wave).max(0.15),
+
+            _ => {
+                if t > 0.1 {
+                    body * (0.2 + 1.3 * wave).max(0.0)
+                } else {
+                    body * (1.0 - 7.0 * t).max(0.0)
+                }
+            }
+        };
+        if wide > 0.004 {
+            d.dab(bend(t), y, wide, 0.93);
+        }
+    }
+
+    d.dab(bend(1.0), 0.11, lerp(0.04, 0.055, u[2]), 0.95);
+    for k in 0..(3 * stage as u64) {
+        let v = uniforms(hash64(seed ^ 0x5a7 ^ k.wrapping_mul(0x9e3779b97f4a7c15)));
+        d.dab(0.5 + (v[0] - 0.5) * 0.16, lerp(0.15, 0.85, v[1]), lerp(0.008, 0.018, v[2]), 0.9);
+    }
+    d.finish(|_, _| 0.0, |x, y| smoothstep(0.0, 0.05, x) * smoothstep(1.0, 0.95, x) * smoothstep(0.0, 0.03, y) * smoothstep(1.0, 0.94, y), false)
 }
 
 fn outline(alpha: &[&[u8]]) -> [[f32; 2]; 8] {
@@ -2070,17 +3303,19 @@ pub fn cutouts(layers: &[Vec<u8>]) -> Vec<[f32; 16]> {
             let next = match l {
                 l if l < SMOKE_FRAMES - 1 => Some(l + 1),
                 l if (FIRE_FIRST..FIRE_FIRST + FIRE_FRAMES - 1).contains(&l) => Some(l + 1),
+
+                l if (CROWN_LAYER..FLASH_LAYER).contains(&l) && (l - CROWN_LAYER) % CROWN_FRAMES < CROWN_FRAMES - 1 => Some(l + 1),
                 _ => None,
             };
             let smeared: Vec<Vec<u8>> = match next {
-                Some(m) if l >= FIRE_FIRST => vec![flame_smear(&layers[l as usize], dt), flame_smear(&layers[m as usize], -dt)],
+                Some(m) if (FIRE_FIRST..FIRE_FIRST + FIRE_FRAMES).contains(&l) => vec![flame_smear(&layers[l as usize], dt), flame_smear(&layers[m as usize], -dt)],
                 _ => Vec::new(),
             };
             let mut with: Vec<&[u8]> = vec![&layers[l as usize]];
             if let Some(m) = next {
                 with.push(&layers[m as usize]);
             }
-            with.extend(smeared.iter().map(std::vec::Vec::as_slice));
+            with.extend(smeared.iter().map(|s| s.as_slice()));
             let o = outline(&with);
             let mut out = [0.0f32; 16];
             for (k, c) in o.iter().enumerate() {
@@ -2101,9 +3336,9 @@ fn half_mip(src: &[u8], size: usize) -> Vec<u8> {
             let mut weight = 0.0;
             for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                 let o = ((2 * y + dy).min(size - 1) * size + (2 * x + dx).min(size - 1)) * 4;
-                let a = f32::from(src[o + 3]);
+                let a = src[o + 3] as f32;
                 for c in 0..3 {
-                    sum[c] += f32::from(src[o + c]) * (a + 1.0);
+                    sum[c] += src[o + c] as f32 * (a + 1.0);
                 }
                 sum[3] += a;
                 weight += a + 1.0;
@@ -2204,6 +3439,14 @@ pub struct EffectsGpu {
     capacity: u64,
     over: u32,
     screened: u32,
+
+    runs: Vec<variants::Run>,
+
+    pub run_stats: variants::RunStats,
+
+    pub use_variants: bool,
+
+    pub overdraw: bool,
 }
 
 impl EffectsGpu {
@@ -2231,6 +3474,7 @@ impl EffectsGpu {
             mapped_at_creation: false,
         });
         let cut: Vec<[f32; 16]> = cutouts(&layers);
+        let _ = CUTOUT_SHARES.set(cutout_shares_of(&cut));
         let cutouts = device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("effects_cutouts"),
             contents: bytemuck::cast_slice(&cut),
@@ -2248,7 +3492,20 @@ impl EffectsGpu {
         });
         let capacity = 256;
         let instances = Self::instance_buffer(device, capacity);
-        Self { _atlas: atlas, uniform, _cutouts: cutouts, bind_group, instances, capacity, over: 0, screened: 0 }
+        Self {
+            _atlas: atlas,
+            uniform,
+            _cutouts: cutouts,
+            bind_group,
+            instances,
+            capacity,
+            over: 0,
+            screened: 0,
+            runs: Vec::new(),
+            run_stats: Default::default(),
+            use_variants: true,
+            overdraw: false,
+        }
     }
 
     fn instance_buffer(device: &Device, capacity: u64) -> Buffer {
@@ -2271,18 +3528,24 @@ impl EffectsGpu {
         }
         self.over = frame.over;
         self.screened = frame.screened;
+        (self.runs, self.run_stats) = variants::runs(frame, self.use_variants);
     }
 
     pub fn set_view(&self, queue: &Queue, uniform: &EffectsUniform) {
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(uniform));
     }
 
-    pub fn motion_parts(&self) -> (&Buffer, &BindGroup, u32, u32) {
-        (&self.instances, &self.bind_group, self.over, self.screened)
+    pub fn motion_parts(&self) -> (&Buffer, &BindGroup, &[variants::Run]) {
+        (&self.instances, &self.bind_group, &self.runs)
     }
 
     pub fn any(&self) -> bool {
         self.over + self.screened > 0
+    }
+
+    /// The particles uploaded last: drawn over, and screened.
+    pub fn counts(&self) -> (u32, u32) {
+        (self.over, self.screened)
     }
 
     pub fn draw(&self, pass: &mut RenderPass<'_>, pipelines: &EffectsPipeline, camera: &BindGroup, probe: &BindGroup) {
@@ -2293,20 +3556,23 @@ impl EffectsGpu {
         pass.set_bind_group(1, probe, &[]);
         pass.set_bind_group(2, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
-        if self.over > 0 {
-            pass.set_pipeline(&pipelines.over);
-            pass.draw(0..VERTICES_PER_PARTICLE, 0..self.over);
+        if self.overdraw {
+            pass.set_pipeline(&pipelines.overdraw);
+            pass.draw(0..VERTICES_PER_PARTICLE, 0..self.over + self.screened);
+            return;
         }
-        if self.screened > 0 {
-            pass.set_pipeline(&pipelines.screened);
-            pass.draw(0..VERTICES_PER_PARTICLE, self.over..self.over + self.screened);
+        for run in &self.runs {
+            pass.set_pipeline(&pipelines.variants[run.variant as usize]);
+            pass.draw(0..VERTICES_PER_PARTICLE, run.first..run.first + run.count);
         }
     }
 }
 
 pub struct EffectsPipeline {
-    pub over: RenderPipeline,
-    pub screened: RenderPipeline,
+
+    pub variants: Vec<RenderPipeline>,
+
+    pub overdraw: RenderPipeline,
 }
 
 impl EffectsPipeline {
@@ -2341,10 +3607,9 @@ impl EffectsPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
     ) -> Self {
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("effects_shader"),
-            source: ShaderSource::Wgsl(view.shader(effects_shader()).into()),
-        });
+        let module = |label: &str, source: String| {
+            device.create_shader_module(ShaderModuleDescriptor { label: Some(label), source: ShaderSource::Wgsl(view.shader(source).into()) })
+        };
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("effects_layout"),
             bind_group_layouts: &[Some(uniform_layout), Some(probe_layout), Some(effects_layout)],
@@ -2353,18 +3618,18 @@ impl EffectsPipeline {
 
         let over = BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::OneMinusSrcAlpha, operation: BlendOperation::Add };
         let screen = BlendComponent { src_factor: BlendFactor::OneMinusDst, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
-        let build = |label: &str, fragment: &str, color: BlendComponent| {
+        let build = |label: &str, shader: &ShaderModule, fragment: &str, color: BlendComponent| {
             device.create_render_pipeline(&RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
                 vertex: VertexState {
-                    module: &shader,
+                    module: shader,
                     entry_point: Some("vs_main"),
                     compilation_options: PipelineCompilationOptions::default(),
                     buffers: &[Some(EffectInstance::layout())],
                 },
                 fragment: Some(FragmentState {
-                    module: &shader,
+                    module: shader,
                     entry_point: Some(fragment),
                     compilation_options: PipelineCompilationOptions::default(),
                     targets: &[Some(ColorTargetState {
@@ -2393,7 +3658,28 @@ impl EffectsPipeline {
                 cache: None,
             })
         };
-        Self { over: build("effects_over", "fs_over", over), screened: build("effects_screened", "fs_screen", screen) }
+        let added = BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::One, operation: BlendOperation::Add };
+        let variants = FxVariant::ALL
+            .iter()
+            .map(|v| {
+                let shader = module(v.label(), v.shader());
+                if v.screened() {
+                    build(v.label(), &shader, "fs_screen", screen)
+                } else {
+                    build(v.label(), &shader, "fs_over", over)
+                }
+            })
+            .collect();
+        if crate::renderer::shader_checks::PIPELINE_STATISTICS.load(std::sync::atomic::Ordering::Relaxed) {
+
+            for (name, entry, _) in variants::EFFECT_MODULE_CUTS {
+                let Some(source) = variants::module_cut(name) else { continue };
+                let label = format!("effects_cut_{name}");
+                let _ = build(&label, &module(&label, source), entry, if *entry == "fs_screen" { screen } else { over });
+            }
+        }
+        let overdraw = build("effects_overdraw", &module("effects_overdraw", variants::overdraw_shader()), "fs_overdraw", added);
+        Self { variants, overdraw }
     }
 }
 
@@ -2401,7 +3687,7 @@ pub fn effects_shader() -> String {
     format!(
         "{}{}",
         crate::renderer::tonemap::wgsl_aces_block(),
-        r"
+        r#"
 var<private> view_slot: i32 = 0;
 struct Camera { view_proj: array<mat4x4<f32>, 2> }
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -2417,6 +3703,19 @@ struct Fx {
 @group(2) @binding(2) var fx_samp: sampler;
 struct Cutouts { corners: array<vec4<f32>, CUT_VEC4S> }
 @group(2) @binding(3) var<uniform> fx_cut: Cutouts;
+
+fn fx_eye() -> vec3<f32> {
+    let m = camera.view_proj[view_slot];
+    let r0 = vec4<f32>(m[0].x, m[1].x, m[2].x, m[3].x);
+    let r1 = vec4<f32>(m[0].y, m[1].y, m[2].y, m[3].y);
+    let r3 = vec4<f32>(m[0].w, m[1].w, m[2].w, m[3].w);
+    let c13 = cross(r1.xyz, r3.xyz);
+    let c30 = cross(r3.xyz, r0.xyz);
+    let c01 = cross(r0.xyz, r1.xyz);
+    return -(r0.w * c13 + r1.w * c30 + r3.w * c01) / dot(r0.xyz, c13);
+}
+
+var<private> fx_fog_point: vec3<f32> = vec3<f32>(0.0);
 
 struct IIn {
     @location(0) centre: vec4<f32>,
@@ -2441,9 +3740,60 @@ struct VOut {
 
     @location(7) @interpolate(flat) time: f32,
     @location(8) @interpolate(flat) flicker: f32,
+
+    @location(9) world: vec3<f32>,
+    @location(10) @interpolate(flat) fog_a: vec4<f32>,
+    @location(11) @interpolate(flat) fog_b: vec4<f32>,
+}
+
+fn fx_fog_vertex(vi: u32, inst: IIn) -> VOut {
+    var out: VOut;
+    let tri = vi / 3u;
+    let k = vi % 3u;
+    var corner = vec2<f32>(0.0);
+    if (k != 0u) {
+        let a = f32((tri + k - 1u) % 8u) * 0.78539816;
+        corner = vec2<f32>(cos(a), sin(a)) * 1.0824;
+    }
+    let c = inst.centre.xyz;
+    let r = length(inst.axis.xyz);
+    let eye = fx_eye();
+    let d = length(c - eye);
+    var mid = eye;
+    var across = fx.right.xyz;
+    var along = fx.up.xyz;
+    var reach = 1.0;
+    if (d > r * 1.02) {
+        let f = (c - eye) / d;
+        let s = d - r;
+        mid = eye + f * s;
+        reach = s * r / sqrt(d * d - r * r);
+        across = normalize(select(cross(f, vec3<f32>(0.0, 1.0, 0.0)), cross(f, vec3<f32>(1.0, 0.0, 0.0)), abs(f.y) > 0.99));
+        along = cross(across, f);
+    } else {
+        mid = eye + normalize(cross(fx.up.xyz, fx.right.xyz)) * 0.25;
+    }
+    let world = mid + (across * corner.x + along * corner.y) * reach;
+    out.clip = camera.view_proj[view_slot] * vec4<f32>(world, 1.0);
+    out.at = out.clip;
+    out.world = world;
+    out.uv = corner;
+    out.colour = inst.colour;
+    out.light = inst.light.xyz;
+    out.light_q = inst.light_dir.xyz;
+    out.layer = vec3<f32>(0.0, inst.params.y, inst.params.w);
+    out.soft = inst.light.w;
+    out.time = inst.params.x;
+    out.flicker = inst.params.z;
+    out.fog_a = inst.centre;
+    out.fog_b = inst.axis;
+    return out;
 }
 
 @vertex fn vs_main(@builtin(vertex_index) vi: u32, inst: IIn) -> VOut {
+    if (inst.params.w < -1.5) {
+        return fx_fog_vertex(vi, inst);
+    }
     var out: VOut;
 
     let tri = vi / 3u;
@@ -2549,6 +3899,93 @@ fn fx_depth_fade(in: VOut) -> f32 {
     return clamp((scene - in.at.w) / in.soft, 0.0, 1.0);
 }
 
+const FOG_TILE: f32 = 0.42;
+const FOG_STEPS: i32 = 10;
+
+fn fx_fog_gyroid(p: vec3<f32>) -> f32 {
+    return dot(sin(p), cos(p.yzx));
+}
+
+const FOG_TURN: mat3x3<f32> = mat3x3<f32>(vec3<f32>(0.8, -0.6, 0.0), vec3<f32>(0.36, 0.48, 0.8), vec3<f32>(-0.48, -0.64, 0.6));
+fn fx_fog_tuft(m: vec3<f32>, tall: f32, half: f32, wind: vec2<f32>, drift: f32, blur: f32) -> f32 {
+    let t = 1.2 * drift;
+    let at = vec3<f32>(m.x - wind.x * drift, m.y, m.z - wind.y * drift);
+    let c = fx_fog_gyroid(FOG_TURN * vec3<f32>(at.x / (2.6 * FOG_TILE) + 1.0, at.y / (5.0 * FOG_TILE) + 0.2 * t, at.z / (2.6 * FOG_TILE) - 2.0));
+    var p = FOG_TURN * vec3<f32>(at.x / FOG_TILE, at.y / FOG_TILE + 0.3 * t, at.z / FOG_TILE);
+    p += 0.45 * sin(vec3<f32>(0.9 * p.y + 0.5 * t, 0.8 * p.z + 1.0, 0.7 * p.x - 0.4 * t));
+    let n1 = fx_fog_gyroid(p);
+    let n2 = fx_fog_gyroid(FOG_TURN * (2.3 * p.zxy + vec3<f32>(5.0, 0.6 * t, 3.0)));
+    let band = (m.y - 0.375 * tall) / max(half, 1e-3);
+    let n = 0.5 * n1 + 0.3 * n2 * (1.0 - smoothstep(0.3, 0.8, blur)) + 0.45 * c - band * band;
+    let guard = smoothstep(0.025 * tall, 0.125 * tall, m.y) * (1.0 - smoothstep(0.8 * tall, tall, m.y));
+    return guard * smoothstep(0.1, 0.95, n);
+}
+
+fn fx_fog(in: VOut) -> vec4<f32> {
+    let eye = fx_eye();
+    let ray = in.world - eye;
+    let t_quad = max(length(ray), 1e-6);
+    let d = ray / t_quad;
+    var t_far = 1e6;
+    if (fx.depth.z > 0.5 && in.at.w > 0.0) {
+        let ndc = in.at.xyz / in.at.w;
+        let size = vec2<f32>(textureDimensions(probe_pass_depth));
+        let texel = clamp(vec2<i32>(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
+        let z = textureLoad(probe_pass_depth, texel, view_slot, 0);
+        if (z < 1.0) {
+            let n = fx.depth.x;
+            let f = fx.depth.y;
+            t_far = t_quad * (n * f / (f - z * (f - n))) / in.at.w;
+        }
+    }
+
+    let bx = vec3<f32>(cos(in.time), 0.0, sin(in.time));
+    let bz = vec3<f32>(-bx.z, 0.0, bx.x);
+    let o = eye - in.fog_a.xyz;
+    let lo = vec3<f32>(dot(o, bx), o.y, dot(o, bz));
+    let ld = vec3<f32>(dot(d, bx), d.y, dot(d, bz));
+    let h = in.fog_b.xyz;
+    let inv = 1.0 / select(ld, vec3<f32>(1e-6), abs(ld) < vec3<f32>(1e-6));
+    let ta = (-h - lo) * inv;
+    let tb = (h - lo) * inv;
+    let t0 = max(max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z)), 0.0);
+    let t1 = min(min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z)), t_far);
+    if (t1 <= t0) {
+        return vec4<f32>(0.0);
+    }
+    let half = max(in.fog_b.w, 0.01);
+    let wind = vec2<f32>(cos(in.soft), sin(in.soft));
+    let rim = in.fog_a.w / max(min(h.x, h.z), 1e-3);
+    let span = (t1 - t0) / f32(FOG_STEPS);
+    let blur = span / FOG_TILE;
+    var depth = 0.0;
+    var top = 0.0;
+    var at_t = 0.0;
+    for (var i = 0; i < FOG_STEPS; i++) {
+        let t = t0 + (f32(i) + 0.5) * span;
+        let m = lo + ld * t;
+        let lies = 1.0 - smoothstep(1.0 - rim, 1.0, length(m.xz / max(h.xz, vec2<f32>(1e-3))));
+        let up = m.y + h.y;
+        let k = span * lies * fx_fog_tuft(vec3<f32>(m.x, up, m.z), 2.0 * h.y, half, wind, in.flicker, blur);
+        depth += k;
+        top += k * clamp(up / (1.5 * h.y), 0.0, 1.0);
+        at_t += k * t;
+    }
+    fx_fog_point = eye + d * select(0.5 * (t0 + t1), at_t / depth, depth > 1e-6);
+
+    let lit = 0.7 + 0.45 * top / max(depth, 1e-6);
+    depth *= in.colour.a;
+    let alpha = 1.0 - exp(-depth);
+    let g = in.layer.y;
+    let cosine = dot(d, in.light_q);
+
+    let hg = min((1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * cosine, 1e-4), 1.5), 12.0);
+    let g4 = 0.25 * g;
+    let hg4 = (1.0 - g4 * g4) / pow(max(1.0 + g4 * g4 - 2.0 * g4 * cosine, 1e-4), 1.5);
+    let shown = aces_fitted(lit * (in.colour.rgb + in.light * mix(hg, hg4, alpha)));
+    return vec4<f32>(shown * alpha, alpha);
+}
+
 fn fx_flame(hottest: vec3<f32>, heat: f32) -> vec3<f32> {
     let t = clamp(heat, 0.0, 1.0);
     let t2 = t * t;
@@ -2569,6 +4006,19 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
     let fade = fx_depth_fade(in);
     let layer = i32(in.layer.x);
     let next = select(layer, layer + 1, in.layer.y > 0.0);
+    // <fx:lump>
+    if (in.layer.z > 4.5) {
+        let m = textureSampleGrad(fx_atlas, fx_samp, in.uv, layer, gx, gy);
+        let n = normalize(m.rgb * 2.0 - vec3<f32>(1.0));
+        let ndl = max(dot(n, in.light_q), 0.0);
+        let h = normalize(in.light_q + vec3<f32>(0.0, 0.0, 1.0));
+        let sheen = LUMP_SHEEN * pow(max(dot(n, h), 0.0), LUMP_GLOSS) * ndl;
+        let cover = clamp(in.colour.a * m.a * fade, 0.0, 1.0);
+        let mud = aces_fitted(in.colour.rgb * (0.6 + 0.4 * n.z) + in.light * (ndl + sheen));
+        return vec4<f32>(mud * cover, cover);
+    }
+    // </fx:lump>
+    // <fx:coals>
     if (in.layer.z > 2.5) {
 
         let b = textureSampleGrad(fx_atlas, fx_samp, in.uv, layer, gx, gy);
@@ -2578,6 +4028,8 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
         let shown = aces_fitted(fx_flame(in.colour.rgb, b.r * flicker) + in.light * b.g);
         return vec4<f32>(shown * alpha, alpha);
     }
+    // </fx:coals>
+    // <fx:flame>
     if (in.layer.z > 1.5) {
         let v = 1.0 - in.uv.y;
         let was = vec2<f32>(in.uv.x, 1.0 - fx_flame_v(v, in.layer.y * FLAME_DT));
@@ -2604,6 +4056,12 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
         let covers = alpha * FLAME_COVER * clamp(max(shown.r, max(shown.g, shown.b)), 0.0, 1.0);
         return vec4<f32>(shown * alpha + root, covers);
     }
+    // </fx:flame>
+    // <fx:fog>
+    if (in.layer.z < -1.5) {
+        return fx_fog(in);
+    }
+    // </fx:fog>
     let six = in.layer.z > 0.5;
     let back = select(layer, layer + SMOKE_BACK, six);
     let back_next = select(next, next + SMOKE_BACK, six);
@@ -2623,9 +4081,11 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
     let next = select(layer, layer + 1, in.layer.y > 0.0);
     let t = mix(textureSample(fx_atlas, fx_samp, in.uv, layer), textureSample(fx_atlas, fx_samp, in.uv, next), in.layer.y);
     let strength = in.colour.a * t.a * fx_depth_fade(in);
-    return vec4<f32>(aces_fitted(in.colour.rgb * strength), 0.0);
+
+    let light = select(in.colour.rgb, fx_flame(in.colour.rgb, t.r), in.layer.z > 3.5);
+    return vec4<f32>(aces_fitted(light * strength), 0.0);
 }
-"
+"#
         .replace("CUT_VEC4S", &(ATLAS_LAYERS * 4).to_string())
         .replace("LAST_LAYER", &(ATLAS_LAYERS - 1).to_string())
         .replace("SMOKE_BACK", &SMOKE_BACK.to_string())
@@ -2633,6 +4093,8 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
         .replace("FLAME_EROSION", &format!("{FLAME_EROSION:?}"))
         .replace("BLUE_ROOT", &format!("{BLUE_ROOT:?}"))
         .replace("CONVEX", &format!("{CONVEX:?}"))
+        .replace("LUMP_SHEEN", &format!("{LUMP_SHEEN:?}"))
+        .replace("LUMP_GLOSS", &format!("{LUMP_GLOSS:?}"))
         .replace("LIFT_FROM", &format!("{LIFT_FROM:?}"))
         .replace("LIFT_TO", &format!("{LIFT_TO:?}"))
         .replace("BURN_OUT", &format!("{BURN_OUT:?}"))
@@ -2648,7 +4110,11 @@ fn fx_flame_v(v: f32, dt: f32) -> f32 {
 }
 
 pub fn motion_shader() -> String {
-    let mut s = effects_shader();
+    motion_shader_of(effects_shader())
+}
+
+pub fn motion_shader_of(source: String) -> String {
+    let mut s = source;
     let swap = |s: &mut String, from: &str, to: &str, n: usize| {
         assert_eq!(s.matches(from).count(), n, "effects motion twin: `{from}` moved in the effects' shader");
         *s = s.replace(from, to);
@@ -2659,13 +4125,13 @@ pub fn motion_shader() -> String {
     let to = from + s[from..].find(end).expect("effects motion twin: the upright axes moved") + end.len();
     let upright = s[from..to].to_string();
     swap(&mut s, "@group(0) @binding(0) var<uniform> camera: Camera;", "", 1);
-    swap(&mut s, "camera.view_proj[view_slot]", "fx_motion_view()", 2);
+    swap(&mut s, "camera.view_proj[view_slot]", "fx_motion_view()", 4);
     swap(&mut s, "0.75 * fx.depth.w * ", "0.75 * fx.depth.w * fx_pixel_scale * ", 1);
     swap(&mut s, "@vertex fn vs_main(@builtin(vertex_index) vi: u32, inst: IIn) -> VOut", "fn fx_vertex(vi: u32, inst: IIn) -> VOut", 1);
     swap(&mut s, "@fragment fn fs_over(in: VOut) -> @location(0) vec4<f32>", "fn fx_over(in: VOut) -> vec4<f32>", 1);
     swap(&mut s, "@fragment fn fs_screen(in: VOut) -> @location(0) vec4<f32>", "fn fx_screen(in: VOut) -> vec4<f32>", 1);
     format!(
-        r"{motion}
+        r#"{motion}
 {s}
 var<private> fx_before: bool = false;
 var<private> fx_pixel_scale: f32 = 1.0;
@@ -2692,14 +4158,15 @@ struct FxMotionOut {{
     @location(3) @interpolate(flat) light_q: vec3<f32>,
     @location(4) @interpolate(flat) layer: vec3<f32>,
     @location(5) at: vec4<f32>,
-    @location(6) @interpolate(flat) soft: f32,
-    @location(7) @interpolate(flat) time: f32,
-    @location(8) @interpolate(flat) flicker: f32,
-    @location(9) curr: vec4<f32>,
-    @location(10) prev: vec4<f32>,
 
-    @location(11) @interpolate(flat) gas: vec4<f32>,
-    @location(12) @interpolate(flat) book: f32,
+    @location(6) @interpolate(flat) stfb: vec4<f32>,
+    @location(7) curr: vec4<f32>,
+    @location(8) prev: vec4<f32>,
+
+    @location(9) @interpolate(flat) gas: vec4<f32>,
+    @location(10) world: vec3<f32>,
+    @location(11) @interpolate(flat) fog_a: vec4<f32>,
+    @location(12) @interpolate(flat) fog_b: vec4<f32>,
 }}
 
 @vertex fn vs_fx_motion(@builtin(vertex_index) vi: u32, inst: IIn, @location(6) motion: vec4<f32>) -> FxMotionOut {{
@@ -2719,17 +4186,21 @@ struct FxMotionOut {{
     out.light_q = n.light_q;
     out.layer = n.layer;
     out.at = n.at;
-    out.soft = n.soft;
-    out.time = n.time;
-    out.flicker = n.flicker;
+    out.stfb = vec4<f32>(n.soft, n.time, n.flicker, 0.0);
     out.curr = n.clip;
     out.prev = b.clip;
+    out.world = n.world;
+    out.fog_a = n.fog_a;
+    out.fog_b = n.fog_b;
     out.gas = vec4<f32>(0.0);
-    out.book = 0.0;
+
+    if (inst.params.w < -1.5) {{
+        out.gas = vec4<f32>(motion.xyz * step, 0.0);
+    }}
     if (inst.params.w > 1.5 && inst.params.w < 2.5 && motion.w > 0.0) {{
         let height = 2.0 * inst.centre.w * max(abs(inst.params.z), 1.0);
         out.gas = cam.prev * vec4<f32>(fx_flame_along(inst) * height, 0.0);
-        out.book = motion.w * step;
+        out.stfb.w = motion.w * step;
     }}
     return out;
 }}
@@ -2743,23 +4214,32 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
     v.light_q = in.light_q;
     v.layer = in.layer;
     v.at = in.at;
-    v.soft = in.soft;
-    v.time = in.time;
-    v.flicker = in.flicker;
+    v.soft = in.stfb.x;
+    v.time = in.stfb.y;
+    v.flicker = in.stfb.z;
+    v.world = in.world;
+    v.fog_a = in.fog_a;
+    v.fog_b = in.fog_b;
     return v;
 }}
 
 @fragment fn fs_fx_motion_over(in: FxMotionOut) -> @location(0) vec4<f32> {{
     let shown = fx_over(fx_vout(in));
     var prev = in.prev;
-    if (in.book > 0.0) {{
+    if (in.stfb.w > 0.0) {{
 
         let v = 1.0 - in.uv.y;
-        prev = prev - in.gas * (v - fx_flame_v(v, in.book));
+        prev = prev - in.gas * (v - fx_flame_v(v, in.stfb.w));
+    }}
+    var curr = in.curr;
+    if (in.layer.z < -1.5) {{
+
+        curr = cam.curr * vec4<f32>(fx_fog_point, 1.0);
+        prev = cam.prev * vec4<f32>(fx_fog_point - in.gas.xyz, 1.0);
     }}
     let flame = in.layer.z > 1.5 && in.layer.z < 2.5;
     let w = layer_weight(shown.a, select({soft:?}, {bright:?}, flame));
-    return vec4<f32>(motion_of(in.curr, prev).xyz * w, w);
+    return vec4<f32>(motion_of(curr, prev).xyz * w, w);
 }}
 
 @fragment fn fs_fx_motion_screened(in: FxMotionOut) -> @location(0) vec4<f32> {{
@@ -2767,7 +4247,7 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
     let w = layer_weight(max(shown.r, max(shown.g, shown.b)), {bright:?});
     return vec4<f32>(motion_of(in.curr, in.prev).xyz * w, w);
 }}
-",
+"#,
         motion = crate::renderer::space_warp::motion_block(),
         soft = crate::renderer::space_warp::SOFT_LAYER_CONTRAST,
         bright = crate::renderer::space_warp::BRIGHT_LAYER_CONTRAST,
@@ -2777,6 +4257,51 @@ fn fx_vout(in: FxMotionOut) -> VOut {{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fog_slab_integrates_from_each_eye_not_their_middle() {
+        let eye_of = |m: glam::Mat4| {
+            let r = |i: usize| m.row(i);
+            let (r0, r1, r3) = (r(0), r(1), r(3));
+            let c13 = r1.truncate().cross(r3.truncate());
+            let c30 = r3.truncate().cross(r0.truncate());
+            let c01 = r0.truncate().cross(r1.truncate());
+            -(r0.w * c13 + r1.w * c30 + r3.w * c01) / r0.truncate().dot(c13)
+        };
+        let proj = glam::Mat4::from_cols_array(&[0.9, 0.0, 0.0, 0.0, 0.0, 1.1, 0.0, 0.0, 0.08, -0.05, 0.0, -1.0, 0.0, 0.0, 0.03, 0.0]);
+        for (eye, at) in [(Vec3::new(-14.032, 1.6, -24.0), Vec3::new(-26.0, -0.4, -27.0)), (Vec3::new(-13.968, 1.6, -24.0), Vec3::new(-26.0, -0.4, -27.0)), (Vec3::new(3.0, -2.0, 7.5), Vec3::new(3.0, 5.0, 7.6))] {
+            let vp = proj * glam::Mat4::look_at_rh(eye, at, Vec3::Y);
+            assert!((eye_of(vp) - eye).length() < 1e-3, "{eye} came back as {}", eye_of(vp));
+        }
+        let src = effects_shader();
+        let body = |name: &str| {
+            let from = src.find(&format!("fn {name}(")).unwrap();
+            let to = from + src[from..].find("\n}\n").unwrap();
+            src[from..to].to_string()
+        };
+        for f in ["fx_fog_vertex", "fx_fog"] {
+            let b = body(f);
+            assert!(b.contains("fx_eye()") && !b.contains("fx.head"), "{f} must start its rays at this eye");
+        }
+        assert!(motion_shader().contains("curr = cam.curr * vec4<f32>(fx_fog_point, 1.0);"), "a fog slab's motion is its mist's");
+    }
+
+    #[test]
+    fn mist_follows_the_hour_thick_at_dawn_gone_by_midday() {
+        assert_eq!(mist_conditions(6.0), 1.0);
+        assert!(mist_conditions(10.5) <= 0.05 + 1e-6);
+        assert!(mist_conditions(14.0) < 0.06);
+        assert!((mist_conditions(21.0) - 0.8).abs() < 1e-6);
+        assert!(mist_conditions(2.0) > 0.85 && mist_conditions(23.0) > 0.8);
+        assert!(mist_conditions(9.0) < 0.6 && mist_conditions(9.0) > 0.3, "burning off: {}", mist_conditions(9.0));
+        assert!((mist_conditions(24.0) - mist_conditions(0.0)).abs() < 1e-6 && (mist_conditions(-1.0) - mist_conditions(23.0)).abs() < 1e-6);
+        let mut last = mist_conditions(0.0);
+        for k in 1..=2400 {
+            let m = mist_conditions(k as f32 * 0.01);
+            assert!((m - last).abs() < 0.01, "a step at {}: {last} -> {m}", k as f32 * 0.01);
+            last = m;
+        }
+    }
 
     fn emitter(kind: EffectKind) -> EffectEmitter {
         EffectEmitter {
@@ -2802,7 +4327,7 @@ mod tests {
     }
 
     fn seen_from(head: Vec3) -> Surroundings<'static> {
-        Surroundings { head, offset: Vec3::ZERO, yaw_inv: Quat::IDENTITY, lights: &[], reaches: &every, ambient: &dim, exposure: 1.0 }
+        Surroundings { head, offset: Vec3::ZERO, yaw_inv: Quat::IDENTITY, lights: &[], reaches: &every, ambient: &dim, exposure: 1.0, room: None }
     }
 
     fn lamp() -> Light {
@@ -2847,8 +4372,8 @@ mod tests {
         let world = |i: &EffectInstance| Quat::from_rotation_y(yaw) * centre(i) + offset;
         let mut a: Vec<[i32; 3]> = straight.instances.iter().map(|i| (centre(i) * 1e4).round().as_ivec3().to_array()).collect();
         let mut b: Vec<[i32; 3]> = turned.instances.iter().map(|i| (world(i) * 1e4).round().as_ivec3().to_array()).collect();
-        a.sort_unstable();
-        b.sort_unstable();
+        a.sort();
+        b.sort();
         assert_eq!(a.len(), b.len());
         for (p, q) in a.iter().zip(&b) {
             assert!(p.iter().zip(q).all(|(x, y)| (x - y).abs() <= 2), "{p:?} vs {q:?}");
@@ -2860,7 +4385,7 @@ mod tests {
 
         let e = [emitter(EffectKind::Smoke)];
         let at = seen_from(Vec3::new(0.0, 1.6, 3.0));
-        let counts: Vec<f32> = (0..20).map(|k| simulate(&e, 100.0 + f64::from(k) * 0.37, &at).over as f32).collect();
+        let counts: Vec<f32> = (0..20).map(|k| simulate(&e, 100.0 + k as f64 * 0.37, &at).over as f32).collect();
         let mean = counts.iter().sum::<f32>() / counts.len() as f32;
         assert!((22.0..38.0).contains(&mean), "about 6 x 5 = 30 alive, found {mean}");
     }
@@ -2871,7 +4396,7 @@ mod tests {
         let small = EffectEmitter { extent: [Vec3::X * 0.5, Vec3::Y * 0.5, Vec3::Z * 0.5], ..emitter(EffectKind::Dust) };
         let large = emitter(EffectKind::Dust);
         let at = seen_from(Vec3::new(0.0, 1.6, 3.0));
-        let count = |e: &EffectEmitter| (0..10).map(|k| simulate(std::slice::from_ref(e), 50.0 + f64::from(k), &at).screened).sum::<u32>() as f32 / 10.0;
+        let count = |e: &EffectEmitter| (0..10).map(|k| simulate(std::slice::from_ref(e), 50.0 + k as f64, &at).screened).sum::<u32>() as f32 / 10.0;
         let (s, l) = (count(&small), count(&large));
         assert!((60.0..120.0).contains(&s), "90 a cubic metre, found {s}");
         assert!((l / s - 8.0).abs() < 1.5, "{l} vs {s}");
@@ -2882,34 +4407,177 @@ mod tests {
     }
 
     fn step_splash(born: f64) -> Splash {
-        Splash { position: Vec3::new(0.0, 0.0, 0.0), born, speed: 1.3, size: 0.08, sunlit: 1.0, depth: 0.3, seed: 11 }
+        Splash { depth: 0.3, seed: 11, ..Splash::new(Vec3::ZERO, born, Vec3::new(0.0, -2.2, 0.0), 0.05, 3.0) }
+    }
+
+    fn pebble() -> Splash {
+        Splash { depth: 2.0, seed: 3, ..Splash::new(Vec3::ZERO, 0.0, Vec3::new(0.0, -4.4, 0.0), 0.015, 0.035) }
+    }
+    fn pistol() -> Splash {
+        Splash { size: 0.07, mass: 0.9, ..pebble() }
+    }
+    fn crate_box() -> Splash {
+        Splash { velocity: Vec3::new(0.0, -6.3, 0.0), size: 0.4, mass: 30.0, ..pebble() }
+    }
+    fn bullet() -> Splash {
+        Splash { depth: 2.0, seed: 5, ..Splash::projectile(Vec3::ZERO, 0.0, Vec3::new(247.0, -247.0, 0.0), 0.009, 0.008) }
+    }
+    fn foot() -> Splash {
+        Splash { depth: 0.2, seed: 9, ..Splash::new(Vec3::ZERO, 0.0, Vec3::new(-2.3, -1.1, 0.0), 0.05, 3.0) }
     }
 
     #[test]
     fn a_splash_throws_drops_that_rise_fall_back_and_are_gone() {
         let at = seen_from(Vec3::new(0.0, 1.6, 2.0));
-        let s = [step_splash(10.0)];
+        let s = [pistol()];
+        let s = [Splash { born: 10.0, ..s[0] }];
+        let shape = splash_shape(&s[0]);
         let count = |t: f64| simulate_with(&[], &s, t, &at).screened;
         assert_eq!(count(9.9), 0, "nothing before it struck");
         assert!(count(10.15) >= 12, "drops in the air: {}", count(10.15));
-        assert_eq!(count(10.0 + f64::from(SPLASH_SECONDS) + 0.01), 0, "all fallen back");
+        assert_eq!(count(10.0 + shape.seconds as f64 + 0.01), 0, "all fallen back");
+        assert!(shape.seconds <= SPLASH_SECONDS);
 
         let f = simulate_with(&[], &s, 10.2, &at);
         let ys: Vec<f32> = f.instances[f.over as usize..].iter().map(|i| i.centre[1]).collect();
         assert!(ys.iter().all(|&y| y >= -1e-3), "{ys:?}");
-        assert!(ys.iter().copied().fold(0.0, f32::max) > 0.05, "{ys:?}");
-        assert!(f.over >= 2, "spray where it struck");
+        assert!(ys.iter().cloned().fold(0.0, f32::max) > 0.05, "{ys:?}");
+        assert!(f.over >= 5, "its crown, in pieces: {}", f.over);
+    }
+
+    #[test]
+    fn a_cavity_grows_as_its_froude_number_and_a_bigger_splash_is_slower() {
+
+        let heavy = |speed: f32, size: f32| Splash { velocity: Vec3::new(0.0, -speed, 0.0), size, mass: 1e4 * size.powi(3), ..pebble() };
+        let (a, b) = (splash_shape(&heavy(3.0, 0.05)), splash_shape(&heavy(6.0, 0.05)));
+
+        let grows = (b.cavity - 0.02) / (a.cavity - 0.02);
+        assert!((1.45..1.75).contains(&grows), "cavity {} -> {} ({grows})", a.cavity, b.cavity);
+
+        let (small, big) = (splash_shape(&heavy(3.0, 0.03)), splash_shape(&heavy(6.0, 0.12)));
+        assert!((big.cavity / small.cavity - 4.0).abs() < 0.2, "{} vs {}", big.cavity, small.cavity);
+        assert!((big.collapse / small.collapse - 2.0).abs() < 0.1, "{} vs {}", big.collapse, small.collapse);
+        assert!((1.9..5.0).contains(&(big.sheet_speed / small.sheet_speed)), "{} vs {}", big.sheet_speed, small.sheet_speed);
+        assert!((3.4..25.0).contains(&(big.crown_height / small.crown_height)), "{} vs {}", big.crown_height, small.crown_height);
+
+        let (p, c) = (splash_shape(&pebble()), splash_shape(&crate_box()));
+        assert!((0.18..0.32).contains(&(p.sheet_speed / 4.4)) && (0.5..0.8).contains(&(c.sheet_speed / 6.3)), "{} {}", p.sheet_speed, c.sheet_speed);
+        assert!(big.ring_wavelength > 3.5 * small.ring_wavelength && big.ring_speed > 1.5 * small.ring_speed);
+
+        let lowered = splash_shape(&heavy(0.05, 0.05));
+
+        assert!(lowered.sheet_speed < 0.02 && lowered.cavity < 0.0501 && lowered.ring_height < 1e-3, "{lowered:?}");
+        let at = seen_from(Vec3::new(0.0, 1.6, 2.0));
+        assert_eq!(simulate_with(&[], &[heavy(0.05, 0.05)], 0.1, &at).instances.len(), 0);
+    }
+
+    #[test]
+    fn a_pebble_a_crate_a_bullet_and_a_foot_each_splash_as_what_they_are() {
+        let (p, g, c, b, f) = (splash_shape(&pebble()), splash_shape(&pistol()), splash_shape(&crate_box()), splash_shape(&bullet()), splash_shape(&foot()));
+
+        assert!(p.cavity < g.cavity && g.cavity < c.cavity, "{} {} {}", p.cavity, g.cavity, c.cavity);
+        assert!(p.collapse < g.collapse && g.collapse < c.collapse);
+        assert!(p.crown_height < g.crown_height && g.crown_height < c.crown_height);
+        assert!(p.ring_wavelength < g.ring_wavelength && g.ring_wavelength < c.ring_wavelength);
+        assert!((0.02..0.08).contains(&p.cavity) && (0.1..0.25).contains(&g.cavity) && (0.5..1.0).contains(&c.cavity));
+
+        assert!(p.jet_height > 0.08 && p.jet_width < 0.012, "{p:?}");
+        assert!(g.jet_height > 0.1 && g.jet_width > p.jet_width);
+        assert_eq!(c.jet_height, 0.0, "{c:?}");
+
+        assert!(b.sealed > 0.99 && b.cavity < 0.1 && b.collapse < 0.02, "{b:?}");
+        assert!(b.fine > 0.95 && b.drop < 5e-4 && b.petals == 0);
+        assert!(b.jet_height > 0.5 && b.jet_width < 0.015 && b.mist >= 4, "{b:?}");
+        assert!(p.sealed == 0.0 && p.fine == 0.0 && p.drop > 1.5e-3);
+
+        assert!(f.crown_height < 0.1 && f.jet_height < 0.15, "{f:?}");
+        assert!(f.forward.x < -0.8 && f.carry.x < -0.5);
+
+        let ankle = splash_shape(&Splash { depth: 0.03, ..pistol() });
+        assert!(ankle.jet_height < 0.01 && ankle.sheet_angle < g.sheet_angle - 0.4, "{ankle:?}");
+
+        let cork = splash_shape(&Splash { mass: 0.02, ..pistol() });
+        assert!(cork.cavity < 0.8 * g.cavity && cork.crown_height < 0.5 * g.crown_height, "{} vs {}", cork.cavity, g.cavity);
     }
 
     #[test]
     fn a_harder_strike_throws_more_and_higher() {
         let at = seen_from(Vec3::new(0.0, 1.6, 2.0));
-        let soft = [step_splash(0.0)];
-        let hard = [Splash { speed: 4.0, size: 0.15, ..step_splash(0.0) }];
-        let (a, b) = (simulate_with(&[], &soft, 0.25, &at), simulate_with(&[], &hard, 0.25, &at));
-        let top = |f: &EffectFrame| f.instances[f.over as usize..].iter().map(|i| i.centre[1]).fold(0.0, f32::max);
+        let soft = [pebble()];
+        let hard = [pistol()];
+        let (a, b) = (simulate_with(&[], &soft, 0.12, &at), simulate_with(&[], &hard, 0.12, &at));
+        let top = |f: &EffectFrame| f.instances[..f.over as usize].iter().map(|i| i.centre[1] + i.centre[3]).fold(0.0, f32::max);
         assert!(b.screened > 2 * a.screened, "{} vs {}", b.screened, a.screened);
-        assert!(top(&b) > 2.0 * top(&a), "{} vs {}", top(&b), top(&a));
+        assert!(top(&b) > 1.3 * top(&a), "{} vs {}", top(&b), top(&a));
+        let (p, g) = (splash_shape(&pebble()), splash_shape(&pistol()));
+        assert!(g.crown_height > 1.8 * p.crown_height && g.spray >= p.spray, "{} vs {}", g.crown_height, p.crown_height);
+    }
+
+    #[test]
+    fn a_glancing_strike_throws_its_water_ahead() {
+        let at = seen_from(Vec3::new(0.0, 1.6, 2.0));
+        let f = simulate_with(&[], &[foot()], 0.12, &at);
+        let drops = &f.instances[f.over as usize..];
+        assert!(drops.len() >= 8, "{}", drops.len());
+        let ahead = drops.iter().map(|d| d.motion[0]).sum::<f32>() / drops.len() as f32;
+        assert!(ahead < -0.15, "the drops' mean speed along its way: {ahead}");
+    }
+
+    #[test]
+    fn a_splash_is_the_same_every_time_and_no_two_are_alike() {
+        let at = seen_from(Vec3::new(0.0, 1.6, 2.0));
+        let a = simulate_with(&[], &[pistol()], 0.1, &at);
+        let b = simulate_with(&[], &[pistol()], 0.1, &at);
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&a.instances), bytemuck::cast_slice::<_, u8>(&b.instances));
+        let other = simulate_with(&[], &[Splash { seed: 4, ..pistol() }], 0.1, &at);
+        assert_eq!(a.over, other.over);
+        let crown = |f: &EffectFrame| -> Vec<[f32; 4]> { f.instances[..f.over as usize].iter().filter(|i| i.params[1] >= CROWN_LAYER as f32).map(|i| i.params).collect() };
+        let (ca, cb) = (crown(&a), crown(&other));
+        assert!(ca.len() >= 5 && ca != cb, "another seed's crown is other pieces, turned otherwise");
+        let moved = a.instances.iter().zip(&other.instances).filter(|(x, y)| (Vec3::from_slice(&x.centre[..3]) - Vec3::from_slice(&y.centre[..3])).length() > 0.01).count();
+        assert!(moved * 2 > a.instances.len(), "{moved} of {} moved", a.instances.len());
+    }
+
+    #[test]
+    fn a_strike_into_disturbed_water_raises_no_second_crown() {
+        let at = seen_from(Vec3::new(0.0, 1.6, 2.5));
+        let first = pistol();
+        let second = |after: f64, apart: f32| {
+            let mut live = vec![first];
+            strike(&mut live, Splash { born: after, position: Vec3::new(apart, 0.0, 0.0), seed: 21, ..pistol() }, 48);
+            live[1]
+        };
+        let shape = splash_shape(&first);
+        let into_the_hole = second(0.5 * shape.collapse as f64, 0.03);
+        assert!(into_the_hole.calm < 0.05, "{}", into_the_hole.calm);
+        let churned = second(shape.collapse as f64 + 0.3, 0.03);
+        assert!((0.25..0.7).contains(&churned.calm), "{}", churned.calm);
+        assert!(second(0.1, 2.0).calm == 1.0 && second(shape.settle as f64 + 0.1, 0.0).calm == 1.0);
+
+        let (calm, rough) = (splash_shape(&first), splash_shape(&into_the_hole));
+        assert_eq!(rough.jet_height, 0.0);
+        assert!(rough.drops < calm.drops && rough.ring_height < 0.5 * calm.ring_height);
+        assert!(calm.froth == 0 && rough.froth >= 6 && rough.white > 0.8 && rough.spray >= 3 && rough.foam > calm.foam, "{rough:?}");
+        let pieces = |s: Splash, layers: std::ops::Range<u32>| {
+            let f = simulate_with(&[], &[Splash { born: 0.0, ..s }], 0.08, &at);
+            f.instances[..f.over as usize].iter().filter(|i| layers.contains(&(i.params[1] as u32)) && i.colour[3] > 0.02).count()
+        };
+        assert!(pieces(first, CROWN_LAYER..JET_LAYER) >= 5 && pieces(into_the_hole, CROWN_LAYER..JET_LAYER) == 0);
+        assert!(pieces(first, FROTH_LAYER..ATLAS_LAYERS) == 0 && pieces(into_the_hole, FROTH_LAYER..ATLAS_LAYERS) >= 4);
+        assert!(pieces(into_the_hole, SPRAY_LAYER..FROTH_LAYER) >= 2);
+
+        let mut live = vec![crate_box()];
+        strike(&mut live, Splash { born: 0.2, ..pebble() }, 48);
+        assert!(live[1].calm < 0.05);
+        let mut live = vec![pebble()];
+        strike(&mut live, Splash { born: 0.05, ..crate_box() }, 48);
+        assert!(live[1].calm > 0.95, "{}", live[1].calm);
+
+        let mut live = Vec::new();
+        for k in 0..60 {
+            strike(&mut live, Splash { born: k as f64, ..pebble() }, 48);
+        }
+        assert!(live.len() == 48 && live[0].born == 12.0);
     }
 
     #[test]
@@ -2919,25 +4587,247 @@ mod tests {
         let dark = |_: Vec3| Vec3::ZERO;
         let s = [step_splash(0.0)];
         let mean = |head: Vec3| {
-            let f = simulate_with(&[], &s, 0.2, &Surroundings { lights: &sun, ambient: &dark, ..seen_from(head) });
+            let f = simulate_with(&[], &s, 0.1, &Surroundings { lights: &sun, ambient: &dark, ..seen_from(head) });
             let drops = &f.instances[f.over as usize..];
+            assert!(drops.len() >= 6);
             drops.iter().map(|i| i.colour[0]).sum::<f32>() / drops.len().max(1) as f32
         };
         let (into, away) = (mean(Vec3::new(0.0, 0.6, 3.0)), mean(Vec3::new(0.0, 0.6, -3.0)));
         assert!(into > 3.0 * away, "into the sun {into}, with it behind {away}");
         let shaded = [Splash { sunlit: 0.0, ..step_splash(0.0) }];
-        let f = simulate_with(&[], &shaded, 0.2, &Surroundings { lights: &sun, ambient: &dark, ..seen_from(Vec3::new(0.0, 0.6, 3.0)) });
+        let f = simulate_with(&[], &shaded, 0.1, &Surroundings { lights: &sun, ambient: &dark, ..seen_from(Vec3::new(0.0, 0.6, 3.0)) });
         assert!(f.instances.iter().all(|i| i.colour[0] < 1e-6), "a shaded splash has no sun in it");
     }
 
+    fn ring_drawn(r: [f32; 4], w: [f32; 4], dist: f32) -> f32 {
+        let from_rim = (dist - w[2]).max(1e-4);
+        let ph = w[0] * r[2] * r[2] / from_rim;
+        let k = ph / from_rim;
+        if r[3] <= 0.0 || k <= 0.0 {
+            return 0.0;
+        }
+        let t = (from_rim / w[2].max(1e-6)).min(1.0);
+        -r[3] * k * k * k * (-k * (w[1] + k * r[2] * 2.0 * RING_FILM_VISCOSITY)).exp() * t / dist * ph.cos()
+    }
+
     #[test]
-    fn the_nearest_live_rings_go_to_the_water() {
-        let s: Vec<Splash> = (0..6).map(|k| Splash { position: Vec3::new(k as f32, 0.0, 0.0), ..step_splash(1.0) }).collect();
-        let r = splash_rings::<4>(&s, 2.0, Vec3::new(5.0, 1.6, 0.0));
-        assert_eq!(r.map(|r| r[0]), [5.0, 4.0, 3.0, 2.0]);
-        assert!((r[0][2] - 1.0).abs() < 1e-6 && r[0][3] > 0.5);
-        let gone = splash_rings::<4>(&s, 1.0 + f64::from(super::super::water_pipeline::RING_SECONDS) + 0.1, Vec3::ZERO);
-        assert!(gone.iter().all(|r| r[3] == 0.0));
+    fn the_rings_that_matter_most_go_to_the_water_and_none_pops() {
+        let head = Vec3::new(0.0, 1.6, 0.0);
+        let shape = splash_shape(&pistol());
+
+        let early = splash_rings::<4>(&[pistol()], 0.9 * shape.ring_release as f64, head);
+        assert_eq!(early.rings[0][2], 0.0);
+        assert!((0..400).all(|i| ring_drawn(early.rings[0], early.waves[0], 0.01 * i as f32) == 0.0));
+        let one = splash_rings::<4>(&[pistol()], 1.0, head);
+        assert!(one.rings[0][3] > 0.0 && one.rings[1][3] == 0.0, "{one:?}");
+        assert!((one.rings[0][2] - (1.0 - shape.ring_release)).abs() < 1e-5);
+        assert!((one.waves[0][0] - 0.25 * shape.ring_gravity).abs() < 1e-5 && one.waves[0][2] == shape.cavity);
+        assert!(one.pools[0][0] > 0.05, "foam where it struck: {one:?}");
+
+        let three = splash_rings::<4>(&[pistol()], 3.0, head);
+        let profile: Vec<f32> = (0..3000).map(|i| ring_drawn(three.rings[0], three.waves[0], 0.001 * i as f32)).collect();
+        let most = profile.iter().fold(0.0f32, |m, h| m.max(h.abs()));
+        let crests: Vec<usize> = (1..2999).filter(|&i| profile[i] > profile[i - 1] && profile[i] >= profile[i + 1] && profile[i] > 0.01 * most).collect();
+        assert!(crests.len() >= 4, "a train of crests, not one: {crests:?}");
+        let gaps: Vec<usize> = crests.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|g| g[1] >= g[0]), "crests further apart outward: {gaps:?}");
+        let highest = crests.iter().copied().max_by(|a, b| profile[*a].total_cmp(&profile[*b])).unwrap();
+        assert!(profile[*crests.last().unwrap()] < profile[highest] && highest > crests[0], "{crests:?}");
+
+        let later = splash_rings::<4>(&[pistol()], 3.02, head);
+        let next = (crests[1]..3000).find(|&i| ring_drawn(later.rings[0], later.waves[0], 0.001 * i as f32) > ring_drawn(later.rings[0], later.waves[0], 0.001 * (i - 1) as f32) && ring_drawn(later.rings[0], later.waves[0], 0.001 * i as f32) >= ring_drawn(later.rings[0], later.waves[0], 0.001 * (i + 1) as f32));
+        assert!(next.is_some_and(|n| n > crests[1]));
+
+        let open = splash_rings::<4>(&[pistol()], 0.5 * shape.collapse as f64, head);
+        let boil = splash_rings::<4>(&[pistol()], (shape.collapse + 0.1) as f64, head);
+        assert!(open.waves[0][3] > 1.0 && boil.waves[0][3] < 0.0, "{open:?} {boil:?}");
+
+        let big = splash_rings::<4>(&[crate_box()], 1.0, head);
+        let (crate_shape, small) = (splash_shape(&crate_box()), splash_shape(&pebble()));
+        assert!(big.waves[0][2] > one.waves[0][2] && crate_shape.ring_height > shape.ring_height && shape.ring_height > small.ring_height, "{} {} {}", crate_shape.ring_height, shape.ring_height, small.ring_height);
+        assert!(crate_shape.ring_wavelength > shape.ring_wavelength && crate_shape.ring_speed > shape.ring_speed);
+
+        let gone = splash_rings::<4>(&[pistol(), crate_box()], super::super::water_pipeline::RING_SECONDS as f64 + 0.1, head);
+        assert!(gone.rings.iter().all(|r| r[3] == 0.0));
+
+        const N: usize = super::super::water_pipeline::RINGS;
+        let steps: Vec<Splash> =
+            (0..10).map(|k| Splash { born: 0.5 * k as f64, position: Vec3::new(0.3 * (k % 2) as f32, 0.0, 0.65 * k as f32), seed: k as u64, ..foot() }).collect();
+        let drawn = |t: f64| {
+            let r = splash_rings::<N>(&steps, t, Vec3::new(0.0, 1.6, 3.0));
+            let line: Vec<f32> = (0..160)
+                .map(|j| {
+                    let p = glam::Vec2::new(0.6, -0.5 + 0.045 * j as f32);
+                    (0..N).map(|i| ring_drawn(r.rings[i], r.waves[i], (p - glam::Vec2::new(r.rings[i][0], r.rings[i][1])).length())).sum::<f32>()
+                })
+                .collect();
+            (line, r.pools.iter().map(|x| x[0]).sum::<f32>(), r.rings.iter().filter(|x| x[3] > 1e-9).count())
+        };
+        let peak = (0..1100).map(|k| drawn(0.005 * k as f64).0.iter().fold(0.0f32, |m, h| m.max(h.abs()))).fold(0.0, f32::max);
+        assert!(peak > 1e-4, "{peak}");
+        assert!((0..1100).any(|k| drawn(0.005 * k as f64).2 == N), "the wader fills the water's rings");
+        for k in 0..1100 {
+            let (a, b) = (drawn(0.005 * k as f64), drawn(0.005 * (k + 1) as f64));
+            let jump = a.0.iter().zip(&b.0).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+            assert!(jump < 0.2 * peak, "heights jump at {} s: {jump} of {peak}", 0.005 * k as f64);
+
+            assert!((a.1 - b.1).abs() < 0.1, "foam jumps at {} s: {} -> {}", 0.005 * k as f64, a.1, b.1);
+        }
+    }
+
+    #[test]
+    fn a_splash_out_of_range_or_out_of_sight_is_not_drawn() {
+        let near = seen_from(Vec3::new(0.0, 1.6, 3.0));
+        assert!(simulate_with(&[], &[pebble()], 0.1, &near).instances.len() > 5);
+        let far = seen_from(Vec3::new(0.0, 1.6, 200.0));
+        assert_eq!(simulate_with(&[], &[pebble()], 0.1, &far).instances.len(), 0);
+
+        assert!(simulate_with(&[], &[crate_box()], 0.2, &far).instances.len() > 5);
+
+        let mid = seen_from(Vec3::new(0.0, 1.6, 30.0));
+        assert!(simulate_with(&[], &[pistol()], 0.1, &mid).screened * 2 < simulate_with(&[], &[pistol()], 0.1, &near).screened);
+
+        let planes = |at: Vec3| {
+            let vp = glam::Mat4::perspective_rh(1.5, 1.0, 0.03, 1000.0) * glam::Mat4::look_at_rh(Vec3::new(0.0, 1.6, 3.0), at, Vec3::Y);
+            super::super::shadow::frustum_planes(vp)
+        };
+        assert!(splash_seen(&pistol(), 0.1, &[planes(Vec3::ZERO)]));
+        assert!(!splash_seen(&pistol(), 0.1, &[planes(Vec3::new(0.0, 1.6, 9.0))]));
+        assert!(!splash_seen(&pistol(), SPLASH_SECONDS as f64 + 0.1, &[planes(Vec3::ZERO)]));
+
+        for s in [pebble(), pistol(), crate_box(), bullet(), foot()] {
+            let (lo, hi) = splash_bounds(&s);
+            for k in 1..40 {
+                let f = simulate_with(&[], &[s], 0.05 * k as f64, &near);
+                for i in &f.instances {
+                    let p = Vec3::from_slice(&i.centre[..3]);
+                    assert!(p.cmpge(lo - Vec3::splat(0.05)).all() && p.cmple(hi + Vec3::splat(0.05)).all(), "{p:?} outside {lo:?}..{hi:?} at {} s", 0.05 * k as f32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn save_the_splash_textures() {
+        let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
+        let n = ATLAS_SIZE as usize;
+        let cols = (CROWN_VARIANTS + JET_VARIANTS + SPRAY_VARIANTS + FROTH_VARIANTS) as usize;
+        let (w, h) = (cols * n, 3 * n);
+        let mut sheet = vec![0u8; w * h * 4];
+        for stage in 0..3u32 {
+            for c in 0..cols as u32 {
+                let (layer, on_its_side) = if c < CROWN_VARIANTS {
+                    (crown_frame(c, stage), true)
+                } else if c < CROWN_VARIANTS + JET_VARIANTS {
+                    (jet_frame(c - CROWN_VARIANTS, stage), false)
+                } else if c < CROWN_VARIANTS + JET_VARIANTS + SPRAY_VARIANTS {
+                    (spray_frame(c - CROWN_VARIANTS - JET_VARIANTS, stage), false)
+                } else {
+                    (froth_frame(c - CROWN_VARIANTS - JET_VARIANTS - SPRAY_VARIANTS, stage), false)
+                };
+                for y in 0..n {
+                    for x in 0..n {
+
+                        let (sx, sy) = if on_its_side { (n - 1 - y, x) } else { (x, y) };
+                        let a = layer[(sy * n + sx) * 4 + 3] as f32 / 255.0;
+                        let o = ((stage as usize * n + y) * w + c as usize * n + x) * 4;
+                        let over = |under: f32| ((under * (1.0 - a) + a).powf(1.0 / 2.2) * 255.0) as u8;
+                        sheet[o..o + 4].copy_from_slice(&[over(0.01), over(0.03), over(0.05), 255]);
+                    }
+                }
+            }
+        }
+        image::save_buffer(out.join("splash_textures.png"), &sheet, w as u32, h as u32, image::ExtendedColorType::Rgba8).expect("textures");
+    }
+
+    #[test]
+    fn a_crate_throws_white_water_and_foam_dissolves() {
+        let (p, g, c) = (splash_shape(&pebble()), splash_shape(&pistol()), splash_shape(&crate_box()));
+        assert!(p.broken == 0.0 && p.froth == 0 && g.froth == 0, "{} {}", p.froth, g.froth);
+        assert!(c.broken > 0.6 && c.froth >= 6 && c.white > 0.6, "{c:?}");
+        assert!(p.foam_seconds < g.foam_seconds && g.foam_seconds < c.foam_seconds);
+        assert!((1.2..2.2).contains(&p.foam_seconds) && (3.0..4.5).contains(&c.foam_seconds));
+        let head = Vec3::new(0.0, 1.6, 3.0);
+        let foam = |s: Splash, t: f64| splash_rings::<4>(&[s], t, head).pools[0];
+
+        let shut = c.collapse as f64 + 0.1;
+        assert!(foam(crate_box(), shut)[0] > 0.5 && foam(crate_box(), 2.0)[0] < 0.4 && foam(crate_box(), 4.3)[0] == 0.0, "{:?}", foam(crate_box(), 2.0));
+        assert!(foam(crate_box(), 2.0)[2] > foam(crate_box(), shut)[2]);
+        assert!(foam(pebble(), 0.25)[0] > 0.2 && foam(pebble(), 1.8)[0] < 0.02, "{:?}", foam(pebble(), 0.25));
+
+        assert!(foam(crate_box(), 2.0)[1] < foam(crate_box(), shut)[1]);
+    }
+
+    #[test]
+    fn what_is_held_in_its_cavity_throws_no_jet() {
+        let free = Splash { depth: 0.6, ..foot() };
+        let held = Splash { held: 1.0, ..free };
+        let (a, b) = (splash_shape(&free), splash_shape(&held));
+        assert!(a.jet_height > 0.05 && b.jet_height == 0.0, "{} {}", a.jet_height, b.jet_height);
+        assert!(a.cavity == b.cavity && a.sheet_speed == b.sheet_speed && a.spray == b.spray);
+    }
+
+    pub(crate) fn user_strikes() -> [(&'static str, Splash); 6] {
+        let at = |v: Vec3, r: f32, m: f32, depth: f32| Splash { depth, seed: 11, ..Splash::new(Vec3::ZERO, 0.0, v, r, m) };
+        [
+            ("pebble 0.1 kg dropped 1 m", at(Vec3::new(0.0, -4.43, 0.0), 0.021, 0.1, 1.5)),
+            ("fist rock 1 kg thrown", at(Vec3::new(6.0, -6.0, 0.0), 0.045, 1.0, 1.5)),
+            ("boulder 8 kg dropped 1.5 m", at(Vec3::new(0.0, -5.4, 0.0), 0.09, 8.0, 1.5)),
+            ("boulder 8 kg thrown", at(Vec3::new(4.0, -6.0, 0.0), 0.09, 8.0, 1.5)),
+            ("crate 5 kg thrown", at(Vec3::new(3.0, -4.0, 0.0), 0.22, 5.0, 1.5)),
+            ("crate 5 kg bobbing", Splash { held: 1.0, ..at(Vec3::new(0.0, -0.25, 0.0), 0.22, 5.0, 1.5) }),
+        ]
+    }
+
+    #[test]
+    #[ignore]
+    fn print_the_causal_chain() {
+        for (name, s) in user_strikes() {
+            let c = splash_shape(&s);
+            eprintln!(
+                "{name}: cavity {:.3} m wide x {:.3} deep, open {:.0} ms; crown {:.2} m/s at {:.0} deg, {:.3} m high for {:.2} s, broken {:.2}; jet {:.3} m at {:.0} ms; \
+                 RINGS leave at {:.0} ms from a {:.1} mm deep source: middle {:.3} m long at {:.2} m/s, first crest {:.1} mm, seen {:.1} s; \
+                 drops land {:.2} m out (band {:.2}) from {:.0} ms over {:.0} ms, {:.0} a m2; foam {:.2} for {:.1} s",
+                c.cavity, c.depth, c.collapse * 1e3, c.sheet_speed, c.sheet_angle.to_degrees(), c.crown_height, c.crown_seconds, c.broken,
+                c.jet_height, c.collapse * 1e3, c.ring_release * 1e3, c.wave_source * 1e3, c.ring_wavelength, c.ring_speed, c.ring_height * 1e3,
+                ring_seconds(&c), c.drops_land, c.drops_band, c.drops_from * 1e3, c.drops_over * 1e3, c.drops_density, c.foam, c.foam_seconds,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn print_the_splashes() {
+        let at = seen_from(Vec3::new(0.0, 1.6, 3.0));
+
+        let share: Vec<f32> = cutouts(&atlas_layers())
+            .iter()
+            .map(|c| {
+                let p: Vec<[f32; 2]> = (0..8).map(|k| [c[2 * k], c[2 * k + 1]]).collect();
+                (0..8).map(|k| p[k][0] * p[(k + 1) % 8][1] - p[(k + 1) % 8][0] * p[k][1]).sum::<f32>().abs() / 8.0
+            })
+            .collect();
+        for (name, s) in [("pebble", pebble()), ("pistol", pistol()), ("bullet", bullet()), ("foot", foot()), ("crate", crate_box())] {
+            let shape = splash_shape(&s);
+            let (mut most, mut most_over, mut area, mut drawn) = (0u32, 0u32, 0.0f32, 0.0f32);
+            for k in 0..600 {
+                let f = simulate_with(&[], &[s], 0.005 * k as f64, &at);
+                most = most.max(f.over + f.screened);
+                most_over = most_over.max(f.over);
+                let a: f32 = f.instances[..f.over as usize].iter().map(|i| 4.0 * i.centre[3] * i.centre[3] * i.params[2].abs().max(1.0)).sum();
+                area = area.max(a);
+
+                let d: f32 = f.instances[..f.over as usize].iter().map(|i| 4.0 * i.centre[3] * i.centre[3] * i.params[2].abs().max(1.0) * share[(i.params[1] as usize).min(share.len() - 1)]).sum();
+                drawn = drawn.max(d);
+            }
+            eprintln!(
+                "{name:7} cavity {:.3} m x {:.3} deep, closes in {:.3} s, sealed {:.2}; sheet {:.2} m/s at {:.0} deg, crown {:.3} m for {:.2} s in {} pieces, broken {:.2}; drops {} of {:.2} mm (fine {:.2}), spray +{:.1} m/s; jet {:.3} m high, {:.3} wide; mist {}; rings {:.2} m long at {:.2} m/s, {:.1} mm high; foam {:.2}, settles {:.1} s; lasts {:.2} s | most instances {most} ({most_over} over), quads {area:.3} m2, drawn within their cutouts {drawn:.3} m2",
+                shape.cavity, shape.depth, shape.collapse, shape.sealed, shape.sheet_speed, shape.sheet_angle.to_degrees(), shape.crown_height,
+                shape.crown_seconds, shape.petals, shape.broken, shape.drops, shape.drop * 1e3, shape.fine, shape.spray_speed, shape.jet_height, shape.jet_width,
+                shape.mist, shape.ring_wavelength, shape.ring_speed, shape.ring_height * 1e3, shape.foam, shape.settle, shape.seconds,
+            );
+        }
     }
 
     #[test]
@@ -2949,7 +4839,7 @@ mod tests {
             let f = simulate(e, 40.0, &at);
             let ys: Vec<f32> = f.instances.iter().map(|i| i.centre[1]).collect();
             let wide = f.instances.iter().map(|i| (i.centre[0].powi(2) + (i.centre[2] - 0.0).powi(2)).sqrt()).fold(0.0, f32::max);
-            (ys.iter().copied().fold(f32::MIN, f32::max), wide)
+            (ys.iter().cloned().fold(f32::MIN, f32::max), wide)
         };
         let (free_top, free_wide) = tops(&free);
         let (roof_top, roof_wide) = tops(&roofed);
@@ -2964,7 +4854,7 @@ mod tests {
         let samples: Vec<f32> = (0..200_000).map(|k| mote_glint(k as f32 * 0.013, 1.0, 7 + (k / 5000) as u64)).collect();
         let mean = samples.iter().sum::<f32>() / samples.len() as f32;
         let dim = samples.iter().filter(|&&g| g < 0.6).count() as f32 / samples.len() as f32;
-        let peak = samples.iter().copied().fold(0.0, f32::max);
+        let peak = samples.iter().cloned().fold(0.0, f32::max);
         assert!((mean - 1.0).abs() < 0.06, "mean {mean}");
         assert!(dim > 0.3, "lost {dim} of the time");
         assert!(peak > 2.5, "brightest flash {peak}");
@@ -2979,7 +4869,7 @@ mod tests {
         for k in 0..n {
             let u = uniforms(k as u64);
             let p = Vec3::new(u[0], u[1], u[2]) * 4.0;
-            let t = 10.0 + 37.0 * f64::from(u[3]);
+            let t = 10.0 + 37.0 * u[3] as f64;
             let a = moved(p, t);
             speed += a.length();
             apart_near += (a - moved(p + Vec3::new(0.03, 0.0, 0.02), t)).length();
@@ -3011,7 +4901,7 @@ mod tests {
         let e = [EffectEmitter { rate: 0.2, ..emitter(EffectKind::Smoke) }];
         let p = preset(EffectKind::Smoke);
         let slots = ((p.rate * 0.2 * p.life.1).ceil() as usize).max(1);
-        let period = (slots as f64 / (f64::from(p.rate) * 0.2)).max(f64::from(p.life.1));
+        let period = (slots as f64 / (p.rate as f64 * 0.2)).max(p.life.1 as f64);
         let at = seen_from(Vec3::new(0.0, 1.6, 3.0));
         let a = simulate(&e, 3.0, &at);
         let b = simulate(&e, 3.0 + period, &at);
@@ -3164,7 +5054,7 @@ mod tests {
                     let r = ((x as f32 + 0.5) / n as f32 * 2.0 - 1.0).hypot((y as f32 + 0.5) / n as f32 * 2.0 - 1.0);
                     let o = (y * n + x) * 4;
                     if (r0..r1).contains(&r) && c[o + 3] > 128 {
-                        sum += f32::from(c[o + channel]);
+                        sum += c[o + channel] as f32;
                         count += 1.0;
                     }
                 }
@@ -3209,7 +5099,7 @@ mod tests {
         let at = |t: f64| fire_light(&fire, t, offset, yaw_inv).unwrap();
 
         let world = |l: &Light| Quat::from_rotation_y(0.7) * l.position + offset;
-        let samples: Vec<Light> = (0..2000).map(|k| at(1000.0 + f64::from(k) * 0.013)).collect();
+        let samples: Vec<Light> = (0..2000).map(|k| at(1000.0 + k as f64 * 0.013)).collect();
         let rest = Vec3::new(14.0, 0.525, -4.0);
         let far = samples.iter().map(|l| (world(l) - rest).length()).fold(0.0f32, f32::max);
         let moved = samples.windows(2).map(|w| (world(&w[0]) - world(&w[1])).length()).sum::<f32>();
@@ -3239,9 +5129,9 @@ mod tests {
         let at = |f: f32| {
             let (mut re, mut im) = (0.0f64, 0.0f64);
             for (i, v) in x.iter().enumerate() {
-                let a = std::f64::consts::TAU * f64::from(f) * i as f64 / f64::from(rate);
-                re += f64::from((v - mean) * w(i)) * a.cos();
-                im += f64::from((v - mean) * w(i)) * a.sin();
+                let a = std::f64::consts::TAU * f as f64 * i as f64 / rate as f64;
+                re += ((v - mean) * w(i)) as f64 * a.cos();
+                im += ((v - mean) * w(i)) as f64 * a.sin();
             }
             (re * re + im * im) as f32
         };
@@ -3256,7 +5146,7 @@ mod tests {
             let puff = 1.5 / (0.3 * scale).sqrt();
             assert!((fire_puff_hz(&fire) - puff).abs() < 0.01 * puff, "{} vs {puff}", fire_puff_hz(&fire));
             let rate = 40.0;
-            let light: Vec<f32> = (0..(rate as usize * 60)).map(|k| fire_light(&fire, 500.0 + k as f64 / f64::from(rate), Vec3::ZERO, Quat::IDENTITY).unwrap().intensity).collect();
+            let light: Vec<f32> = (0..(rate as usize * 60)).map(|k| fire_light(&fire, 500.0 + k as f64 / rate as f64, Vec3::ZERO, Quat::IDENTITY).unwrap().intensity).collect();
             let freqs: Vec<f32> = (2..=60).map(|k| k as f32 * 0.2).collect();
             let power = spectrum(&light, rate, &freqs);
             let peak = freqs[power.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0];
@@ -3274,7 +5164,7 @@ mod tests {
     #[test]
     fn a_fires_light_follows_how_much_flame_is_in_view() {
         let fire = EffectEmitter { scale: 1.5, ..emitter(EffectKind::Fire) };
-        let times: Vec<f64> = (0..3000).map(|k| 200.0 + f64::from(k) * 0.021).collect();
+        let times: Vec<f64> = (0..3000).map(|k| 200.0 + k as f64 * 0.021).collect();
         let glow: Vec<f32> = times.iter().map(|&t| fire_glow(&fire, t)).collect();
         let light: Vec<f32> = times.iter().map(|&t| fire_light(&fire, t, Vec3::ZERO, Quat::IDENTITY).unwrap().intensity).collect();
         let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
@@ -3300,7 +5190,7 @@ mod tests {
             let (mut count, mut tall, mut wide, mut pace) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
             let n = 400;
             for k in 0..n {
-                let t = 300.0 + f64::from(k) * 0.37;
+                let t = 300.0 + k as f64 * 0.37;
                 let (a, b) = (fire_sheets(e, t), fire_sheets(e, t + 0.01));
                 count += a.len() as f32;
                 tall += a.iter().map(|s| s.size * s.stretch).sum::<f32>() / a.len() as f32;
@@ -3331,7 +5221,7 @@ mod tests {
 
         let area: Vec<f32> = (0..(rate as usize * 60))
             .map(|k| {
-                let sheets = fire_sheets(&fire, 700.0 + k as f64 / f64::from(rate));
+                let sheets = fire_sheets(&fire, 700.0 + k as f64 / rate as f64);
                 let w = |s: &FlameSheet| s.size * s.size * s.stretch * erosion_cover(s.stands) * rise_cover(s.risen);
                 sheets.iter().map(|s| w(s) * flame_area(s.frame)).sum::<f32>() / sheets.iter().map(w).sum::<f32>()
             })
@@ -3370,7 +5260,7 @@ mod tests {
                 for x in 0..n {
                     let t = &f[(y * n + x) * 4..(y * n + x) * 4 + 4];
                     if t[3] > 128 {
-                        sum += f32::from(t[1]);
+                        sum += t[1] as f32;
                         count += 1.0;
                     }
                 }
@@ -3379,7 +5269,7 @@ mod tests {
         };
         assert!(depth(n / 4..n / 2) < 0.6 * depth(3 * n / 4..n), "tips shallow, root deep");
 
-        let blue = |rows: std::ops::Range<usize>| rows.flat_map(|y| (0..n).map(move |x| (y, x))).map(|(y, x)| f32::from(f[(y * n + x) * 4 + 2])).sum::<f32>();
+        let blue = |rows: std::ops::Range<usize>| rows.flat_map(|y| (0..n).map(move |x| (y, x))).map(|(y, x)| f[(y * n + x) * 4 + 2] as f32).sum::<f32>();
         assert!(blue(n - n / 12..n) > 0.0 && blue(0..n / 2) == 0.0);
     }
 
@@ -3433,7 +5323,7 @@ mod tests {
             assert_ne!(bytemuck::cast_slice::<_, u8>(&a.instances), bytemuck::cast_slice::<_, u8>(&b.instances), "{:?}", p.kind);
             if p.kind != EffectKind::Embers {
 
-                let slots = |e: &EffectEmitter| (0..20).map(|k| simulate(std::slice::from_ref(e), 40.0 + f64::from(k) * 0.31, &at).instances.len()).sum::<usize>() as f32;
+                let slots = |e: &EffectEmitter| (0..20).map(|k| simulate(std::slice::from_ref(e), 40.0 + k as f64 * 0.31, &at).instances.len()).sum::<usize>() as f32;
                 assert!((slots(p) / slots(s) - 1.0).abs() < 0.25, "{:?}", p.kind);
             }
         }
@@ -3456,7 +5346,7 @@ mod tests {
 
         let hot = simulate(&[with(EffectKind::Fire, Variation { temperature_variation: 1.0, ..d })], 20.0, &at);
         let ratios: Vec<f32> = hot.instances.iter().map(|i| i.colour[2] / i.colour[0]).collect();
-        assert!(ratios.iter().copied().fold(0.0, f32::max) > 1.5 * ratios.iter().copied().fold(f32::MAX, f32::min));
+        assert!(ratios.iter().cloned().fold(0.0, f32::max) > 1.5 * ratios.iter().cloned().fold(f32::MAX, f32::min));
 
         assert!((fire_puff_hz(&with(EffectKind::Fire, Variation { flicker_rate: 2.0, ..d })) / fire_puff_hz(&with(EffectKind::Fire, d)) - 2.0).abs() < 1e-4);
 
@@ -3464,7 +5354,7 @@ mod tests {
         let s2 = simulate(&[with(EffectKind::Smoke, Variation { intensity: 0.5, ..d })], 40.0, &at);
         assert!((s2.instances[3].colour[3] / s1.instances[3].colour[3] - 0.5).abs() < 1e-4);
 
-        let top = |v: Variation| (0..20).flat_map(|k| simulate(&[with(EffectKind::Smoke, v)], 60.0 + f64::from(k), &at).instances).map(|i| i.centre[1]).fold(0.0f32, f32::max);
+        let top = |v: Variation| (0..20).flat_map(|k| simulate(&[with(EffectKind::Smoke, v)], 60.0 + k as f64, &at).instances).map(|i| i.centre[1]).fold(0.0f32, f32::max);
         assert!(top(Variation { life_variation: 2.0, ..d }) > top(d) + 0.1);
 
         let c = simulate(&[with(EffectKind::Coals, Variation { flicker: 0.0, flicker_rate: 2.0, ..d })], 20.0, &at);
@@ -3480,7 +5370,7 @@ mod tests {
         let (mut most, mut least, mut high) = (0u32, u32::MAX, 0.0f32);
         for k in 0..600 {
             let mut pops = Vec::new();
-            ember_pops(&embers, 100.0 + f64::from(k) * 0.1, &at, &mut pops);
+            ember_pops(&embers, 100.0 + k as f64 * 0.1, &at, &mut pops);
             let n = pops.len() as u32;
             most = most.max(n);
             least = least.min(n);
@@ -3489,7 +5379,7 @@ mod tests {
 
         let stream_high = (0..200)
             .flat_map(|k| {
-                let time = 100.0 + f64::from(k) * 0.3;
+                let time = 100.0 + k as f64 * 0.3;
                 let mut pops = Vec::new();
                 ember_pops(&embers, time, &at, &mut pops);
                 let popped: Vec<[f32; 4]> = pops.iter().map(|i| i.centre).collect();
@@ -3523,6 +5413,66 @@ mod tests {
         assert!(q.peak > 0.02 && q.peak < 0.5, "{}", q.peak);
         assert!(super::super::glare::glare_quad(&s, &lobes[0], eye, 4.0, 1.0).is_none());
         assert!(fire_glare(&emitter(EffectKind::Smoke), 30.0, Vec3::ZERO, Quat::IDENTITY).is_none());
+    }
+
+    #[test]
+    fn a_door_opening_onto_dust_works_out_only_what_its_doorway_shows_ramped_in() {
+        use super::super::portal_cull::CullRoom;
+        use super::super::uniforms::ProbePortal;
+        let head = Vec3::new(0.0, 1.6, 2.5);
+        let view = glam::Mat4::perspective_rh(1.6, 1.0, 0.05, 100.0) * glam::Mat4::look_at_rh(head, Vec3::new(0.0, 1.4, -3.0), Vec3::Y);
+        let views = [super::super::shadow::frustum_planes(view)];
+        let rooms = [
+            CullRoom { id: 1, min: Vec3::new(-1.5, -0.5, -0.5), max: Vec3::new(1.5, 3.5, 5.0), closed: true },
+            CullRoom { id: 2, min: Vec3::new(-8.0, -0.5, -14.0), max: Vec3::new(8.0, 6.0, -0.5), closed: true },
+        ];
+        let door = ProbePortal { min: Vec3::new(-0.6, 0.0, -0.7), max: Vec3::new(0.6, 2.1, -0.3), axis: 2, low: 2, high: 1, wall: None };
+        let dust = [EffectEmitter {
+            id: "hall_dust".into(),
+            position: Vec3::new(0.0, 1.5, -5.0),
+            extent: [Vec3::X * 7.5, Vec3::Y * 1.5, Vec3::Z * 4.4],
+            ..emitter(EffectKind::Dust)
+        }];
+        assert!(emitter_sight(&dust[0], &views, head, &rooms, &[]).is_empty(), "the door shut: out of sight");
+        let sight = vec![emitter_sight(&dust[0], &views, head, &rooms, &[door])];
+        assert!(!sight[0].is_empty(), "the door open: seen through it");
+        let at = seen_from(head);
+        let t = 50.0;
+        let run = |share: &dyn Fn(&EffectEmitter) -> f32, sight: &[Vec<seen::Eye>]| {
+            let shares = Shares { emitter: share, splash: &|_| 1.0, sight };
+            simulate_governed(&dust, &|_| true, &[], None, Some(&shares), t, &at)
+        };
+        let whole = run(&|_| 1.0, &[]);
+        let through = run(&|_| 1.0, &sight);
+        assert!(through.screened > 0 && (through.screened as f32) < 0.4 * whole.screened as f32, "{} of {} motes", through.screened, whole.screened);
+        let same = |a: &EffectInstance, b: &EffectInstance| bytemuck::bytes_of(a) == bytemuck::bytes_of(b);
+        for i in &through.instances {
+            assert!(whole.instances.iter().any(|w| same(w, i)), "a mote through the doorway is the mote drawn whole");
+        }
+
+        let shown = whole.instances.iter().filter(|w| sight[0].iter().any(|e| e.holds(centre(w), 0.0))).count();
+        let kept = through.instances.iter().filter(|w| sight[0].iter().any(|e| e.holds(centre(w), 0.0))).count();
+        assert_eq!(kept, shown, "every mote in the doorway's view is drawn");
+
+        let lib = stack::EffectLibrary::default();
+        let mut set = stack::BurstSet::default();
+        let narrowed = governor_wants(&dust, &|_| true, &[], &set.splash_measured, head, &sight);
+        let open_room = governor_wants(&dust, &|_| true, &[], &set.splash_measured, head, &[vec![]]);
+        assert!(narrowed[0].count < 0.4 * governor_wants(&dust, &|_| true, &[], &set.splash_measured, head, &[])[0].count, "weighed through the doorway");
+        assert_eq!(open_room[0].fill, 0.0, "nothing in sight weighs nothing");
+        let mut shares = Vec::new();
+        for frame in 0..14 {
+            let now = t + frame as f64 / 72.0;
+            set.frame_with(&lib, now, &views, head, &narrowed);
+            shares.push(set.share_of(emitter_key(&dust[0])));
+        }
+        assert!((shares[0] - 0.1).abs() < 1e-6, "the opening frame works out a tenth: {shares:?}");
+        assert!(shares.windows(2).all(|w| w[1] >= w[0]) && shares[13] == 1.0, "{shares:?}");
+        let first = run(&|_| shares[0], &sight);
+        assert!(first.screened as f32 <= 0.2 * through.screened as f32 + 1.0, "{} of {}", first.screened, through.screened);
+        for i in &first.instances {
+            assert!(through.instances.iter().any(|w| same(w, i)), "the motes ramping in are the same motes");
+        }
     }
 
     #[test]
@@ -3566,11 +5516,54 @@ mod tests {
         let fire = EffectEmitter { id: "f".into(), scale: 1.5, ..emitter(EffectKind::Fire) };
         let bed = EffectEmitter { id: "c".into(), scale: 1.5, ..emitter(EffectKind::Coals) };
         let glow = |e: &[EffectEmitter], t: f64| simulate(e, t, &at).instances.iter().find(|i| i.params[3] == 3.0).unwrap().colour[0];
-        let with: Vec<f32> = (0..200).map(|k| glow(&[fire.clone(), bed.clone()], 50.0 + f64::from(k) * 0.05)).collect();
-        let alone = glow(std::slice::from_ref(&bed), 50.0);
+        let with: Vec<f32> = (0..200).map(|k| glow(&[fire.clone(), bed.clone()], 50.0 + k as f64 * 0.05)).collect();
+        let alone = glow(&[bed.clone()], 50.0);
         let (lo, hi) = with.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
         assert!(hi > 1.03 * lo && hi < 1.25 * alone && lo > 0.8 * alone, "{lo} to {hi}, alone {alone}");
-        assert!((0..50).map(|k| glow(std::slice::from_ref(&bed), 50.0 + f64::from(k) * 0.05)).all(|g| g == alone), "alone it does not");
+        assert!((0..50).map(|k| glow(&[bed.clone()], 50.0 + k as f64 * 0.05)).all(|g| g == alone), "alone it does not");
+    }
+
+    #[test]
+    fn the_rooms_ambient_follows_the_time_of_day() {
+        let level = [[1.0f32; 3]; 9];
+        let room = |volume: u32, lo: Vec3, hi: Vec3| ProbeDesc { centre: 0.5 * (lo + hi), min: lo, max: hi, volume, has_depth: true, room_light: Some(level) };
+        let descs = [room(0, Vec3::splat(-50.0), Vec3::splat(50.0)), room(1, Vec3::ZERO, Vec3::splat(4.0))];
+        let (outdoors, indoors) = (Vec3::new(20.0, 1.0, 20.0), Vec3::splat(2.0));
+        let baked = room_ambient(&descs, outdoors);
+        assert!(baked.x > 0.0);
+        assert_eq!(room_ambient_now(&descs, outdoors, &[], None), baked);
+
+        let relit = [0.01, 0.8];
+        assert!((room_ambient_now(&descs, outdoors, &relit, None).x / baked.x - 0.01).abs() < 1e-4);
+        let hall = room_ambient(&descs, indoors);
+        assert!((room_ambient_now(&descs, indoors, &relit, None).x / hall.x - 0.8).abs() < 1e-4, "the smallest room that holds the point is its room");
+
+        let far = Vec3::new(-200.0, 0.0, -200.0);
+        assert!((room_ambient_now(&descs, far, &relit, None).x / room_ambient(&descs, far).x - 0.01).abs() < 1e-4);
+        assert_eq!(room_ambient_now(&descs, outdoors, &[f32::NAN, 1.0], None), baked);
+    }
+
+    #[test]
+    fn out_in_the_open_past_every_box_the_light_is_the_outdoors() {
+        let photo = |volume: u32, lo: Vec3, hi: Vec3, depth: bool, v: f32| ProbeDesc { centre: 0.5 * (lo + hi), min: lo, max: hi, volume, has_depth: depth, room_light: Some([[v; 3]; 9]) };
+
+        let descs = [photo(0, Vec3::new(0.0, -5.0, 0.0), Vec3::new(40.0, 20.0, 40.0), false, 2.0), photo(1, Vec3::new(-12.0, 0.0, -12.0), Vec3::new(-4.0, 4.0, -4.0), true, 0.05)];
+        let pond = Vec3::new(-20.0, 0.0, -20.0);
+        let open = 2.0 * 0.282_095;
+        assert!((room_ambient_now(&descs, pond, &[], None).x - open).abs() < 1e-4, "{:?}", room_ambient_now(&descs, pond, &[], None));
+        assert!((room_ambient_now(&descs, pond, &[0.5, 1.0], None).x - 0.5 * open).abs() < 1e-4);
+
+        assert!((room_ambient_now(&descs, Vec3::new(-8.0, 2.0, -8.0), &[], None).x - 0.05 * 0.282_095).abs() < 1e-4);
+        assert!((room_ambient_now(&descs, Vec3::new(20.0, 1.0, 20.0), &[], None).x - open).abs() < 1e-4);
+
+        let hill = super::super::ground_map::HeightGrid::sample(glam::Vec2::splat(-60.0), glam::Vec2::splat(60.0), 121, 121, |x, _| if x < -25.0 { 14.0 } else { 0.0 });
+        let in_cave = Vec3::new(-30.0, 0.5, -20.0);
+        let dim = room_ambient(&descs, in_cave).x;
+        assert!((room_ambient_now(&descs, in_cave, &[], Some(&hill)).x - dim).abs() < 1e-4, "the cave keeps its nearest room's light");
+        assert!(dim < 0.2 * open);
+
+        assert!((room_ambient_now(&descs, pond, &[], Some(&hill)).x - open).abs() < 1e-4);
+        assert!((room_ambient_now(&descs, Vec3::new(-30.0, 14.3, -20.0), &[], Some(&hill)).x - open).abs() < 1e-4);
     }
 
     #[test]
@@ -3601,7 +5594,7 @@ mod tests {
         let f = &fire_frame(4);
         let n = ATLAS_SIZE as usize;
         let sum_in = |rows: std::ops::Range<usize>, channel: usize| -> f32 {
-            rows.flat_map(|y| (0..n).map(move |x| f32::from(f[(y * n + x) * 4 + channel]))).sum()
+            rows.flat_map(|y| (0..n).map(move |x| f[(y * n + x) * 4 + channel] as f32)).sum()
         };
         assert!(sum_in(n / 2..n, 3) > 1.5 * sum_in(0..n / 2, 3), "more flame below the middle");
         assert!(sum_in(n / 2..n, 0) > 2.0 * sum_in(0..n / 2, 0), "hotter below the middle");
@@ -3611,7 +5604,7 @@ mod tests {
     fn a_puff_lit_from_one_side_is_bright_on_that_side_and_glows_against_the_light() {
         let [front, back] = smoke_frame(3);
         let n = ATLAS_SIZE as usize;
-        let texel = |img: &[u8], x: usize, y: usize, c: usize| f32::from(img[(y * n + x) * 4 + c]);
+        let texel = |img: &[u8], x: usize, y: usize, c: usize| img[(y * n + x) * 4 + c] as f32;
         assert!(texel(&front, n / 2, n / 2, 3) > 200.0, "dense in the middle: {}", texel(&front, n / 2, n / 2, 3));
         assert_eq!(texel(&front, 1, 1, 3), 0.0, "nothing in the corner");
 
@@ -3665,7 +5658,7 @@ mod tests {
         let b = atlas_layers();
         assert_eq!(a.len(), ATLAS_LAYERS as usize);
         assert!(a.iter().all(|l| l.len() == (ATLAS_SIZE * ATLAS_SIZE * 4) as usize));
-        assert_eq!(a, b);
+        assert!(a == b);
     }
 
     #[test]
@@ -3686,7 +5679,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn export_effects_for_the_editor() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let layers = atlas_layers();
@@ -3775,9 +5768,19 @@ mod tests {
                 ..emitter(EffectKind::Dust)
             },
         ];
-        let splashes = [Splash { position: Vec3::new(-1.0, 0.0, 1.0), born: 9.8, speed: 2.5, size: 0.08, sunlit: 1.0, depth: 0.3, seed: 7 }];
+
+        let splashes = [
+            Splash { depth: 0.3, seed: 7, ..Splash::new(Vec3::new(-1.0, 0.0, 1.0), 9.8, Vec3::new(0.0, -2.5, 0.0), 0.08, 3.0) },
+            Splash { depth: 2.0, seed: 3, ..Splash::new(Vec3::new(1.5, 0.0, 1.5), 9.85, Vec3::new(0.0, -4.4, 0.0), 0.015, 0.035) },
+            Splash { depth: 2.0, seed: 5, ..Splash::projectile(Vec3::new(-2.5, 0.0, 0.5), 9.9, Vec3::new(247.0, -247.0, 0.0), 0.009, 0.008) },
+            Splash { depth: 0.2, held: 1.0, seed: 9, ..Splash::new(Vec3::new(0.5, 0.0, 2.0), 9.85, Vec3::new(-2.3, -1.1, 0.4), 0.07, 3.0) },
+            Splash { depth: 0.5, seed: 13, ..Splash::new(Vec3::new(-3.0, 0.0, -1.0), 9.7, Vec3::new(0.0, -6.3, 0.0), 0.4, 30.0) },
+            Splash { depth: 1.0, calm: 0.15, sunlit: 0.4, seed: 21, ..Splash::new(Vec3::new(2.5, 0.0, -0.5), 9.9, Vec3::new(0.0, -4.4, 0.0), 0.07, 0.9) },
+        ];
         let mut frames = Vec::new();
-        for (time, yaw, offset) in [(10.0f64, 0.0f32, Vec3::ZERO), (10.35, 0.0, Vec3::ZERO), (23.7, 0.9, Vec3::new(1.0, 0.0, -2.0))] {
+        for (time, yaw, offset) in
+            [(10.0f64, 0.0f32, Vec3::ZERO), (10.35, 0.0, Vec3::ZERO), (10.2, 0.9, Vec3::new(1.0, 0.0, -2.0)), (23.7, 0.9, Vec3::new(1.0, 0.0, -2.0))]
+        {
             let head = Vec3::new(0.3, 1.6, 3.0);
             let at = Surroundings { head, offset, yaw_inv: Quat::from_rotation_y(-yaw), lights: &lights, ambient: &ambient, exposure: 1.3, ..seen_from(head) };
             let f = simulate_with(&emitters, &splashes, time, &at);
@@ -3810,16 +5813,17 @@ mod tests {
                 },
             })).collect::<Vec<_>>(),
             "splashes": splashes.iter().map(|s| serde_json::json!({
-                "position": s.position.to_array(), "born": s.born, "speed": s.speed, "size": s.size, "sunlit": s.sunlit, "depth": s.depth, "seed": s.seed.to_string(),
+                "position": s.position.to_array(), "born": s.born, "velocity": s.velocity.to_array(), "size": s.size, "mass": s.mass,
+                "sunlit": s.sunlit, "depth": s.depth, "calm": s.calm, "held": s.held, "seed": s.seed.to_string(),
             })).collect::<Vec<_>>(),
             "frames": frames,
         });
         std::fs::write(out.join("effects_golden.json"), serde_json::to_string(&golden).unwrap()).expect("golden");
-        eprintln!("wrote the atlas ({} layers), cutouts and {} golden frames to {}", layers.len(), 3, out.display());
+        eprintln!("wrote the atlas ({} layers), cutouts and {} golden frames to {}", layers.len(), golden["frames"].as_array().map_or(0, |f| f.len()), out.display());
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn save_the_effects_atlas() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let layers = atlas_layers();
@@ -3840,7 +5844,7 @@ mod tests {
                 for y in 0..n {
                     for x in 0..n {
                         let o = (y * n + x) * 4;
-                        let f = |img: &[u8], c: usize| f32::from(img[o + c]) / 255.0;
+                        let f = |img: &[u8], c: usize| img[o + c] as f32 / 255.0;
                         let toward = lp.x * lp.x * f(a, 0) + lp.y * lp.y * f(a, 1) + lp.z * lp.z * f(a, 2)
                             + ln.x * ln.x * f(b, 0) + ln.y * ln.y * f(b, 1) + ln.z * ln.z * f(b, 2);
                         let around = (f(a, 0) + f(a, 1) + f(a, 2) + f(b, 0) + f(b, 1) + f(b, 2)) / 6.0;
@@ -3857,7 +5861,7 @@ mod tests {
             for y in 0..n {
                 for x in 0..n {
                     let o = (y * n + x) * 4;
-                    let (heat, a) = (f32::from(img[o]) / 255.0, f32::from(img[o + 3]) / 255.0);
+                    let (heat, a) = (img[o] as f32 / 255.0, img[o + 3] as f32 / 255.0);
                     let c = super::super::tonemap::aces_fitted(flame_colour(heat) * FIRE_LEVEL) * a;
 
                     put((k % 16, 2 + k / 16), x, y, c.to_array());
@@ -3868,7 +5872,7 @@ mod tests {
             let img = &layers[layer as usize];
             for y in 0..n {
                 for x in 0..n {
-                    let a = f32::from(img[(y * n + x) * 4 + 3]) / 255.0;
+                    let a = img[(y * n + x) * 4 + 3] as f32 / 255.0;
                     put((cell, 2 + fire_rows), x, y, [a, a, a]);
                 }
             }
@@ -3879,7 +5883,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn render_effects_alone() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let instance = wgpu::Instance::default();
@@ -3969,8 +5973,24 @@ mod tests {
         ];
         let fire_lights: Vec<Light> = emitters.iter().filter_map(|e| fire_light(e, time, Vec3::ZERO, Quat::IDENTITY)).collect();
         let faint = |_: Vec3| Vec3::splat(0.02);
-        let at = Surroundings { head: eye, lights: &fire_lights, ambient: &faint, exposure: 4.0, ..seen_from(eye) };
-        let frame = simulate(&emitters, time, &at);
+        // MUD=crate|rock|bullet|blast draws that mud splash alone, in
+        // daylight, EFFECTS_TIME seconds after the strike.
+        let mud = std::env::var("MUD").ok().map(|kind| match kind.as_str() {
+            "rock" => Splash { seed: 5, ..Splash::mud(Vec3::ZERO, 0.0, Vec3::new(0.0, -6.3, 0.0), 0.05, 1.0, 1.0) },
+            "bullet" => Splash { seed: 7, ..Splash::mud_projectile(Vec3::ZERO, 0.0, Vec3::new(280.0, -280.0, 0.0), 0.009, 0.008, 1.0) },
+            "blast" => Splash { seed: 9, ..Splash::mud_blast(Vec3::ZERO, 0.0, 1.0, 1.0) },
+            _ => Splash { seed: 3, ..Splash::mud(Vec3::ZERO, 0.0, Vec3::new(0.0, -6.3, 0.0), 0.25, 30.0, 1.0) },
+        });
+        let sun = [Light { kind: LightKind::Directional, direction: Vec3::new(0.4, -0.7, -0.6).normalize(), intensity: 3.0, ..lamp() }];
+        let sky = |_: Vec3| Vec3::new(0.35, 0.4, 0.5);
+        let at = match mud {
+            Some(_) => Surroundings { head: eye, lights: &sun, ambient: &sky, exposure: 1.0, ..seen_from(eye) },
+            None => Surroundings { head: eye, lights: &fire_lights, ambient: &faint, exposure: 4.0, ..seen_from(eye) },
+        };
+        let frame = match &mud {
+            Some(s) => simulate_with(&[], std::slice::from_ref(s), time, &at),
+            None => simulate(&emitters, time, &at),
+        };
         eprintln!("{} over, {} screened", frame.over, frame.screened);
         gpu.upload(&device, &queue, &frame);
         let forward = (at_point - eye).normalize();
@@ -4008,7 +6028,7 @@ mod tests {
                     view: &colour_view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: Operations { load: LoadOp::Clear(Color { r: 0.015, g: 0.015, b: 0.018, a: 1.0 }), store: StoreOp::Store },
+                    ops: Operations { load: LoadOp::Clear(if mud.is_some() { Color { r: 0.25, g: 0.3, b: 0.36, a: 1.0 } } else { Color { r: 0.015, g: 0.015, b: 0.018, a: 1.0 } }), store: StoreOp::Store },
                 })],
                 depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                     view: &depth_view,
@@ -4022,7 +6042,7 @@ mod tests {
         let row = (w * 4).div_ceil(256) * 256;
         let readback = device.create_buffer(&BufferDescriptor {
             label: None,
-            size: u64::from(row * h),
+            size: (row * h) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -4050,13 +6070,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn print_where_the_flames_stand() {
         let fire = EffectEmitter { id: "brick_fire".into(), scale: 1.5, ..emitter(EffectKind::Fire) };
         let (mut sum, mut w, mut worst) = (Vec3::ZERO, 0.0f32, 0.0f32);
         for k in 0..2000 {
             let (mut s1, mut w1) = (Vec3::ZERO, 0.0f32);
-            for s in fire_sheets(&fire, 100.0 + f64::from(k) * 0.05) {
+            for s in fire_sheets(&fire, 100.0 + k as f64 * 0.05) {
                 let a = s.size * s.size * s.stretch * erosion_cover(s.stands) * rise_cover(s.risen);
                 s1 += s.base * a;
                 w1 += a;
@@ -4071,7 +6091,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn print_the_flame_tables() {
         let (area, cover, rise) = flame_tables();
         let fmt = |v: &[f32]| v.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(", ");
@@ -4086,20 +6106,20 @@ mod tests {
         let mut sum = 0.0f64;
         let samples = 20000;
         for k in 0..samples {
-            let time = 100.0 + f64::from(k) * 0.0173;
+            let time = 100.0 + k as f64 * 0.0173;
             sum += fire_sheets(&fire, time)
                 .iter()
-                .map(|s| f64::from(s.size * s.size * s.stretch * lerp_at(&area, s.frame) * lerp_at(&cover, s.stands * 8.0) * lerp_at(&rise, s.risen * 8.0)))
+                .map(|s| (s.size * s.size * s.stretch * lerp_at(&area, s.frame) * lerp_at(&cover, s.stands * 8.0) * lerp_at(&rise, s.risen * 8.0)) as f64)
                 .sum::<f64>();
         }
-        eprintln!("const FLAME_AREA_MEAN: f32 = {:.6};", sum / f64::from(samples));
+        eprintln!("const FLAME_AREA_MEAN: f32 = {:.6};", sum / samples as f64);
         let g: Vec<u8> = (0..FIRE_FRAMES).flat_map(|k| fire_frame(k).chunks(4).filter(|t| t[3] > 128).map(|t| t[1]).collect::<Vec<_>>()).collect();
-        let q = |f: f32| g.iter().filter(|&&x| f32::from(x) >= f * 255.0).count() as f32 / g.len() as f32;
+        let q = |f: f32| g.iter().filter(|&&x| x as f32 >= f * 255.0).count() as f32 / g.len() as f32;
         eprintln!("depth over covered texels: >=0.25 {:.3}, >=0.5 {:.3}, >=0.75 {:.3}, >=0.9 {:.3}", q(0.25), q(0.5), q(0.75), q(0.9));
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn print_a_fires_particles() {
         let id = std::env::var("FIRE_ID").unwrap_or_else(|_| "test".into());
         let time = std::env::var("EFFECTS_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(30.0);
@@ -4117,7 +6137,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn time_a_frames_effects() {
         let lamps: Vec<Light> = (0..6).map(|k| Light { position: Vec3::new(k as f32 - 2.5, 2.8, -1.0), ..lamp() }).collect();
         let emitters = [
@@ -4132,7 +6152,7 @@ mod tests {
             let start = std::time::Instant::now();
             let mut count = 0;
             for k in 0..200 {
-                count += simulate(emitters, 30.0 + f64::from(k) / 72.0, &at).instances.len();
+                count += simulate(emitters, 30.0 + k as f64 / 72.0, &at).instances.len();
             }
             (count / 200, start.elapsed().as_secs_f64() / 200.0 * 1e3)
         };
@@ -4145,7 +6165,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         for k in 0..2000 {
-            let t = 30.0 + f64::from(k) / 72.0;
+            let t = 30.0 + k as f64 / 72.0;
             std::hint::black_box(fire_light(&emitters[0], t, Vec3::ZERO, Quat::IDENTITY));
             std::hint::black_box(fire_glare(&emitters[0], t, Vec3::ZERO, Quat::IDENTITY));
         }
@@ -4167,7 +6187,7 @@ mod tests {
     fn every_particle_carries_its_velocity() {
 
         let check = |label: &str, at: f64, h: f32, frame: &dyn Fn(f64) -> EffectFrame, zeroed: bool| {
-            let (a, b) = (frame(at), frame(at + f64::from(h)));
+            let (a, b) = (frame(at), frame(at + h as f64));
             let mut moving = 0;
             let mut found = 0;
             for i in &a.instances {
@@ -4200,7 +6220,9 @@ mod tests {
             ("embers", 7.3, 1e-3, Box::new(|t| simulate(std::slice::from_ref(&embers), t, &at))),
             ("dust", 20.0, 0.01, Box::new(|t| simulate(std::slice::from_ref(&dust), t, &at))),
             ("smoke", 9.0, 1e-3, Box::new(|t| simulate(std::slice::from_ref(&smoke), t, &at))),
-            ("splash", 0.25, 1e-3, Box::new(|t| simulate_with(&[], &[step_splash(0.0)], t, &at))),
+            ("splash", 0.1, 1e-3, Box::new(|t| simulate_with(&[], &[pistol()], t, &at))),
+            ("splash's jet", 0.33, 1e-3, Box::new(|t| simulate_with(&[], &[pistol()], t, &at))),
+            ("bullet's splash", 0.2, 1e-3, Box::new(|t| simulate_with(&[], &[bullet()], t, &at))),
         ];
         for (label, t, h, frame) in &cases {
             let (found, moving) = check(label, *t, *h, frame.as_ref(), false);

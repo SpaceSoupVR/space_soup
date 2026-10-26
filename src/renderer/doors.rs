@@ -53,6 +53,28 @@ pub fn light_point(doors: &[DoorView], centre: Vec3, eye: Vec3) -> Vec3 {
     centre + normal * (side * LIGHT_READ_OUT)
 }
 
+const DOORWAY_DEPTH: f32 = 0.3;
+const DOORWAY_REACH: f32 = 1.2;
+
+pub fn doorway_light_point(doors: &[DoorView], centre: Vec3, eye: Vec3) -> Vec3 {
+    for d in doors {
+        let c = d.corners;
+        let now = [c[1] - c[0], c[2] - c[0], c[4] - c[0]]
+            .into_iter()
+            .min_by(|a, b| a.length_squared().total_cmp(&b.length_squared()))
+            .unwrap_or(Vec3::X)
+            .normalize_or_zero();
+        let normal = (d.closed_rotation * d.rotation.inverse() * now).normalize_or_zero();
+        let off = centre - d.closed_centre;
+        let depth = off.dot(normal);
+        if depth.abs() < DOORWAY_DEPTH && (off - normal * depth).length() < DOORWAY_REACH {
+            let side = if normal.dot(eye - centre) >= 0.0 { 1.0 } else { -1.0 };
+            return centre + normal * (side * LIGHT_READ_OUT);
+        }
+    }
+    centre
+}
+
 pub fn posed_proxies(rest: &[ProbeProxy], doors: &[DoorView]) -> Vec<ProbeProxy> {
     rest.iter()
         .map(|p| {
@@ -133,6 +155,36 @@ mod tests {
         assert!((hallway - (centre + Vec3::X * LIGHT_READ_OUT)).length() < 1e-5, "{hallway}");
         let elsewhere = Vec3::new(0.0, 1.0, 0.0);
         assert_eq!(light_point(&d, elsewhere, Vec3::ZERO), elsewhere);
+    }
+
+    #[test]
+    fn a_frame_in_a_doorway_reads_the_light_of_the_room_the_eye_is_in() {
+        let centre = Vec3::new(2.85, 1.1, -3.39);
+        let half = Vec3::new(0.02, 1.09, 0.38);
+        let shut: [Vec3; 8] = std::array::from_fn(|i| {
+            centre
+                + Vec3::new(
+                    if i & 1 == 0 { -half.x } else { half.x },
+                    if i & 2 == 0 { -half.y } else { half.y },
+                    if i & 4 == 0 { -half.z } else { half.z },
+                )
+        });
+        let frame = Vec3::new(2.85, 1.1, -3.0);
+        let hall_eye = Vec3::new(-1.0, 1.6, -3.0);
+        let hallway_eye = Vec3::new(6.0, 1.6, -3.0);
+
+        let turn = Quat::from_rotation_y(60f32.to_radians());
+        let pin = Vec3::new(2.85, 0.0, -3.77);
+        let open = shut.map(|p| pin + turn * (p - pin));
+        for (corners, rotation) in [(shut, Quat::IDENTITY), (open, turn)] {
+            let d = [DoorView { corners, closed_centre: centre, shut: rotation == Quat::IDENTITY, rotation, closed_rotation: Quat::IDENTITY }];
+            let hall = doorway_light_point(&d, frame, hall_eye);
+            assert!((hall - (frame - Vec3::X * LIGHT_READ_OUT)).length() < 1e-4, "{hall}");
+            let hallway = doorway_light_point(&d, frame, hallway_eye);
+            assert!((hallway - (frame + Vec3::X * LIGHT_READ_OUT)).length() < 1e-4, "{hallway}");
+            let elsewhere = Vec3::new(0.0, 1.0, -3.0);
+            assert_eq!(doorway_light_point(&d, elsewhere, hall_eye), elsewhere);
+        }
     }
 
     #[test]

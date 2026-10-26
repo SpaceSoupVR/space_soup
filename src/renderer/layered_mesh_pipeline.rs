@@ -88,9 +88,25 @@ impl LayeredMeshPipeline {
         samples: u32,
         view: crate::renderer::multiview::ViewMode,
 ) -> Self {
+        Self::build(device, format, uniform_layout, material_layout, front_face, samples, view, layered_mesh_shader(), None, "layered_mesh_pipeline")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build(
+        device: &Device,
+        format: TextureFormat,
+        uniform_layout: &BindGroupLayout,
+        material_layout: &BindGroupLayout,
+        front_face: FrontFace,
+        samples: u32,
+        view: crate::renderer::multiview::ViewMode,
+        source: String,
+        cull_mode: Option<Face>,
+        label: &str,
+    ) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("layered_mesh_shader"),
-            source: ShaderSource::Wgsl(view.shader(layered_mesh_shader()).into()),
+            source: ShaderSource::Wgsl(view.shader(source).into()),
         });
 
         let model_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -114,7 +130,7 @@ impl LayeredMeshPipeline {
         });
 
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("layered_mesh_pipeline"),
+            label: Some(label),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -126,16 +142,17 @@ impl LayeredMeshPipeline {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
+
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    blend: None,
                     write_mask: ColorWrites::ALL,
                 })],
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
 
-                cull_mode: None,
+                cull_mode,
                 front_face,
                 polygon_mode: PolygonMode::Fill,
                 ..Default::default()
@@ -175,9 +192,9 @@ impl LayeredMeshPipeline {
     }
 }
 
-fn layered_mesh_shader() -> String {
+pub(crate) fn layered_mesh_shader() -> String {
     format!(
-        r"
+        r#"
 @group(1) @binding(0) var layer_tex: texture_2d_array<f32>;
 @group(1) @binding(1) var layer_samp: sampler;
 @group(1) @binding(2) var macro_tex: texture_2d<f32>;
@@ -220,7 +237,7 @@ struct VIn {{
 }}
 
 struct VOut {{
-    @builtin(position) clip: vec4<f32>,
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
 
     @location(1) world_pos: vec3<f32>,
@@ -335,7 +352,7 @@ fn repeat_of(layer: i32) -> f32 {{
 
     var sun_map = 1.0;
     if (camera.shadow_params.x > 0.5) {{
-        sun_map = pcf(sun_shadow_tex, in.world_pos, camera.sun_view_proj);
+        sun_map = sun_static_visibility(in.world_pos);
     }}
 
     let cave_sun = smoothstep(0.01, 0.08, sky) * min(sun_map, clamp(in.aux.w, 0.0, 1.0));
@@ -364,7 +381,7 @@ fn repeat_of(layer: i32) -> f32 {{
     }}
     return vec4<f32>(tonemap(colour), 1.0);
 }}
-",
+"#,
 
         lights_block = super::lights::wgsl_lights_block_with(
             0, 1, super::lights::LightsBlockOptions { probe_from_pass: true, ..Default::default() },
@@ -373,11 +390,6 @@ fn repeat_of(layer: i32) -> f32 {{
         whiteout_block = wgsl_whiteout_block(),
         sun_range = super::brush_pipeline::SUN_MASK_DISTANCE_TEXELS,
     )
-}
-
-#[cfg(test)]
-pub fn layered_mesh_shader_src() -> String {
-    layered_mesh_shader()
 }
 
 #[cfg(test)]
@@ -589,7 +601,7 @@ mod tests {
         let depth_view = depth.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("layered_test_readback"),
-            size: u64::from(256 * SIZE),
+            size: (256 * SIZE) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -691,7 +703,7 @@ mod tests {
             (1.0, [-3.1, 0.2, 5.4]),
         ] {
             let px = at(yaw, offset).unwrap();
-            let worst = still.iter().zip(px).map(|(a, b)| (i32::from(*a) - i32::from(b)).abs()).max().unwrap();
+            let worst = still.iter().zip(px).map(|(a, b)| (*a as i32 - b as i32).abs()).max().unwrap();
             assert!(worst <= 1, "turned {yaw} rad, rig moved {offset:?}: {px:?} against {still:?}");
         }
     }
@@ -722,7 +734,7 @@ mod tests {
         let tiny = shot!(Shot { weights: [0.01, 0.0, 0.01, 0.0], ..Default::default() });
         for c in 0..3 {
             assert!(
-                (i32::from(even[c]) - i32::from(tiny[c])).abs() <= 2,
+                (even[c] as i32 - tiny[c] as i32).abs() <= 2,
                 "renormalisation failed: {even:?} vs {tiny:?}",
             );
         }
@@ -790,7 +802,7 @@ mod tests {
         let away_flipped = shot!(shot([0.0, 0.0, -1.0], true));
         for c in 0..3 {
             assert!(
-                (i32::from(toward[c]) - i32::from(away_flipped[c])).abs() <= 2,
+                (toward[c] as i32 - away_flipped[c] as i32).abs() <= 2,
                 "reversing both the winding and the normal changed the shading: \
                  {toward:?} vs {away_flipped:?}",
             );
@@ -798,7 +810,7 @@ mod tests {
 
         let away = shot!(shot([0.0, 0.0, 1.0], true));
         assert!(
-            (i32::from(toward[0]) - i32::from(away[0])).abs() > 8,
+            (toward[0] as i32 - away[0] as i32).abs() > 8,
             "both windings shade the same, so the normal is never flipped: \
              {toward:?} vs {away:?}",
         );
@@ -833,7 +845,7 @@ mod tests {
         let front = shot!(wall([0.0, 0.0, 5.0]));
         let behind = shot!(wall([0.0, 0.0, -5.0]));
         assert!(
-            (i32::from(front[0]) - i32::from(behind[0])).abs() > 8,
+            (front[0] as i32 - behind[0] as i32).abs() > 8,
             "a wall's normal map is not tilting along z, so it is using the \
              floor's swizzle: {front:?} vs {behind:?}",
         );
@@ -850,7 +862,7 @@ mod tests {
         });
         for c in 0..3 {
             assert!(
-                (i32::from(none[c]) - i32::from(flat[c])).abs() <= 2,
+                (none[c] as i32 - flat[c] as i32).abs() <= 2,
                 "a flat normal map changed the shading: {none:?} vs {flat:?}",
             );
         }
@@ -945,7 +957,7 @@ mod tests {
         assert!(size * 4 <= 256, "row padding assumption broken");
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("e2e_readback"),
-            size: u64::from(256 * size),
+            size: (256 * size) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1016,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "diagnostic that prints sizes or timings or writes files; run by hand with --ignored"]
+    #[ignore]
     fn cave_shader_size() {
         let src = crate::renderer::multiview::ViewMode::Mono.shader(layered_mesh_shader());
         println!("{}", crate::renderer::shader_inlining::report("layered_mesh fs_main", &src, "fs_main", 12));
@@ -1105,4 +1117,9 @@ mod tests {
             panic!("layered mesh pipeline failed validation: {err}");
         }
     }
+}
+
+#[cfg(test)]
+pub fn layered_mesh_shader_src() -> String {
+    layered_mesh_shader()
 }

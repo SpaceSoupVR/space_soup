@@ -34,6 +34,23 @@ pub struct WindowRecord {
     pub pass: BTreeMap<String, f32>,
 
     pub xr: BTreeMap<String, f64>,
+
+    #[serde(default)]
+    pub cpu: BTreeMap<String, f64>,
+
+    /// The time of day's clock at the window's end (hours), when it runs: a
+    /// sweep through sunset is read window by window against it.
+    #[serde(default)]
+    pub hour: Option<f32>,
+
+    /// The heat state at the window's end, by source (`thermal::Thermal`):
+    /// `android` and `xr/<domain>/<sub-domain>`.
+    #[serde(default)]
+    pub thermal: BTreeMap<String, String>,
+    /// Frames in the window whose GPU time passed 1.5 x the app's frame
+    /// period (13.9 ms at 72 Hz, 27.8 ms under SpaceWarp).
+    #[serde(default)]
+    pub over_budget: u64,
 }
 
 impl WindowRecord {
@@ -117,6 +134,10 @@ mod tests {
             fps: 24.0,
             pass: [("scene0".to_string(), 12.0f32)].into_iter().collect(),
             xr: [("app/gpu_frametime".to_string(), 31.2)].into_iter().collect(),
+            cpu: [("pose_ms".to_string(), 1.5)].into_iter().collect(),
+            hour: Some(18.5),
+            thermal: [("android".to_string(), "light".to_string())].into_iter().collect(),
+            over_budget: 3,
         }
     }
 
@@ -125,7 +146,7 @@ mod tests {
         let line = record(7).to_line();
         assert!(!line.contains('\n'));
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        for key in ["window", "phase", "cycle_pass", "cycle_len", "warmup", "bench", "levers", "gpu_avg", "frame_ms", "pass", "xr"] {
+        for key in ["window", "phase", "cycle_pass", "cycle_len", "warmup", "bench", "levers", "gpu_avg", "frame_ms", "pass", "xr", "thermal", "over_budget"] {
             assert!(v.get(key).is_some(), "{key} missing from {line}");
         }
         assert_eq!(v["xr"]["app/gpu_frametime"], 31.2);

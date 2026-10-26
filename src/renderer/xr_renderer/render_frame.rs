@@ -22,6 +22,8 @@ struct MeshDraw<'a> {
     count: u32,
     thin: Option<&'a crate::renderer::mesh::ThinParts>,
     blended: bool,
+
+    bound: glam::Vec4,
 }
 
 type LayeredDraw<'a> = (
@@ -29,6 +31,10 @@ type LayeredDraw<'a> = (
     &'a wgpu::Buffer,
     &'a wgpu::Buffer,
     u32,
+
+    Option<[u32; 4]>,
+
+    (glam::Vec3, glam::Vec3),
 );
 
 type SkinnedDraw<'a> = (
@@ -38,14 +44,44 @@ type SkinnedDraw<'a> = (
     &'a wgpu::Buffer,
     &'a wgpu::Buffer,
     u32,
+
+    bool,
 );
+
+struct DrawLogFrame(bool);
+
+impl DrawLogFrame {
+    fn begin() -> Self {
+        let on = crate::renderer::levers::DRAW_LOG_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if on {
+            log::warn!("DRAWLOG frame start");
+            wgpu::hal::vulkan::DRAW_LOG.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Self(on)
+    }
+}
+
+impl Drop for DrawLogFrame {
+    fn drop(&mut self) {
+        if self.0 {
+            wgpu::hal::vulkan::DRAW_LOG.store(false, std::sync::atomic::Ordering::Relaxed);
+            log::warn!("DRAWLOG frame end");
+        }
+    }
+}
+
+/// A primitive's LOD for this frame: its index buffer and count, or None
+/// for the full mesh (`mesh_lod`).
+type LodPick = Option<(wgpu::Buffer, u32)>;
 
 fn push_mesh_draws<'a>(
     instance: &'a MeshInstance,
+    picks: &'a [LodPick],
     lightmap_bg: &'a wgpu::BindGroup,
     mesh_draws: &mut Vec<MeshDraw<'a>>,
     skinned_draws: &mut Vec<SkinnedDraw<'a>>,
     layered_draws: &mut Vec<LayeredDraw<'a>>,
+    baked_cave_draws: &mut Vec<crate::renderer::baked_cave::BakedCaveDraw<'a>>,
 ) {
     if let Some(skin) = &instance.mesh.skin {
         if let Some(joint_bg) = &skin.joint_bind_group {
@@ -57,11 +93,13 @@ fn push_mesh_draws<'a>(
                     &prim.vertex_buffer,
                     &prim.index_buffer,
                     prim.indices.len() as u32,
+                    prim.blended,
                 ));
             }
         }
     } else {
-        for prim in &instance.mesh.primitives {
+        for (k, prim) in instance.mesh.primitives.iter().enumerate() {
+            let pick = picks.get(k).and_then(Option::as_ref);
 
             if let Some(layered) = &prim.layered {
                 layered_draws.push((
@@ -69,7 +107,26 @@ fn push_mesh_draws<'a>(
                     &layered.vertex_buffer,
                     &prim.index_buffer,
                     prim.indices.len() as u32,
+                    crate::renderer::cave_twins::keeps_vertical(instance.mesh.model_matrix())
+                        .then_some(layered.twin_ends),
+                    crate::renderer::cave_twins::placed_box(instance.mesh.model_matrix(), layered.bounds),
                 ));
+                continue;
+            }
+
+            if let Some(cave) = &prim.baked_cave {
+                let placed = instance.mesh.model_matrix();
+                baked_cave_draws.push(crate::renderer::baked_cave::BakedCaveDraw {
+                    model: &instance.model.bind_group,
+                    lightmap: lightmap_bg,
+                    vertices: &cave.vertex_buffer,
+                    indices: &prim.index_buffer,
+                    index_count: prim.indices.len() as u32,
+                    chunks: &cave.chunks,
+                    emissive: cave.emissive,
+                    placed,
+                    bounds: crate::renderer::cave_twins::placed_box(placed, cave.bounds),
+                });
                 continue;
             }
             mesh_draws.push(MeshDraw {
@@ -77,14 +134,20 @@ fn push_mesh_draws<'a>(
                 texture: &prim.texture.bind_group,
                 lightmap: lightmap_bg,
                 vertices: &prim.vertex_buffer,
-                indices: &prim.index_buffer,
-                count: prim.indices.len() as u32,
+                indices: pick.map_or(&prim.index_buffer, |p| &p.0),
+                count: pick.map_or(prim.indices.len() as u32, |p| p.1),
                 thin: prim.thin.as_ref(),
                 blended: prim.blended,
+                bound: crate::renderer::shadow::mesh_caster_bound(&instance.mesh),
             });
         }
     }
 }
+
+/// A room whose open-sky share is under this (`EyeAdaptation::sky_open_at`)
+/// builds its sky map every `CLOSED_ROOM_CLOUD_EVERY`th frame.
+const CLOSED_ROOM_SKY: f32 = 0.25;
+const CLOSED_ROOM_CLOUD_EVERY: u32 = 4;
 
 impl XrRenderer {
     pub fn render_frame(
@@ -100,7 +163,7 @@ impl XrRenderer {
         )
     }
 
-    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
+    #[allow(clippy::too_many_arguments)]
     pub fn render_frame_with_meshes(
         &mut self,
         session: &xr::Session<xr::Vulkan>,
@@ -122,12 +185,17 @@ impl XrRenderer {
     ) -> Result<Vec<xr::CompositionLayerProjectionView<xr::Vulkan>>, Box<dyn std::error::Error>>
     {
 
+        let _draw_log = DrawLogFrame::begin();
+
         self.update_time_of_day();
 
         self.ensure_ground_map();
         let image_index = self.swapchain.acquire_image()? as usize;
         self.swapchain.wait_image(xr::Duration::INFINITE)?;
         let cpu_start = std::time::Instant::now();
+        // Each submit's time, logged for a frame far over budget: the window
+        // averages hid the hangs the headset showed (user, 2026-10-20).
+        let mut laps: Vec<(u32, std::time::Instant)> = Vec::with_capacity(16);
 
         let (view_flags, mut eye_views) =
             session.locate_views(xr::ViewConfigurationType::PRIMARY_STEREO, time, stage)?;
@@ -138,6 +206,26 @@ impl XrRenderer {
         }
 
         let foveation = self.frame_levers().foveation;
+        // DYNAMIC RESOLUTION (`dynamic_resolution`): this frame's share of the
+        // eye targets, from the GPU time against the app's frame period.
+        let dyn_scale = if self.levers.dynres {
+            let now = std::time::Instant::now();
+            let dt = self.dynres_tick.replace(now).map_or(0.0, |t| now.duration_since(t).as_secs_f32().min(0.25));
+            let gpu_ms = self.perf_metrics.as_ref().and_then(|m| m.value("app/gpu_frametime")).map(|v| v as f32);
+            let hz = if self.space_warp_running() && self.display_hz > 60.0 { self.display_hz / 2.0 } else { self.display_hz };
+            let was = self.frame_scale;
+            let scale = self.dynres.step(gpu_ms, (1000.0 / hz) as f32, dt, self.levers.dynres_min);
+            if scale != was {
+                log::info!("DYNRES scale {scale:.2} (gpu {:.1} ms in a {:.1} ms frame)", gpu_ms.unwrap_or(0.0), 1000.0 / hz);
+            }
+            scale
+        } else {
+            self.dynres.reset();
+            1.0
+        };
+        self.frame_scale = dyn_scale;
+        let fold = crate::renderer::dynamic_resolution::fold(dyn_scale);
+        let scaled = |w: u32, h: u32| crate::renderer::dynamic_resolution::rect(w, h, dyn_scale);
         self.apply_foveation(foveation);
 
         let tracked_poses: Option<Vec<xr::Posef>> = located.then(|| eye_views.iter().map(|v| v.pose).collect());
@@ -186,9 +274,44 @@ impl XrRenderer {
             Camera::gl_to_wgpu_ndc(Camera::xr_projection(v.fov, crate::renderer::space_warp::NEAR_Z, crate::renderer::space_warp::FAR_Z))
                 * Camera::xr_view(v.pose)
         });
+        // Native frames while the GPU has room for them (`frame_governor`).
+        if self.levers.frame_governor && self.space_warp.is_some() && self.levers.space_warp {
+            let now = std::time::Instant::now();
+            let dt = self.governor_tick.replace(now).map_or(0.0, |t| now.duration_since(t).as_secs_f32().min(0.25));
+            let gpu_ms = self.perf_metrics.as_ref().and_then(|m| m.value("app/gpu_frametime")).map(|v| v as f32);
+            // The panel's own rate: under SpaceWarp the runtime may predict
+            // the app's half rate instead.
+            let panel_hz = if self.display_hz <= 60.0 && !self.frame_governor.native() { self.display_hz * 2.0 } else { self.display_hz };
+            let was = self.frame_governor.native();
+            let native = self.frame_governor.step(gpu_ms, (1000.0 / panel_hz) as f32, dt);
+            if native != was {
+                log::info!(
+                    "FRAMEGOVERNOR {}: gpu {:.1} ms smoothed, panel {:.0} Hz",
+                    if native { "native frames" } else { "back to SpaceWarp" },
+                    self.frame_governor.smoothed().unwrap_or(0.0),
+                    panel_hz
+                );
+            }
+        } else if self.frame_governor.native() {
+            self.frame_governor.reset();
+        }
+        let warp_on = self.space_warp_running();
+        // Frames over budget, and a line for each GPU spike (2x the app's
+        // period, once a second at most): the colleague's plan part 2, item 3.
+        if let Some(gpu) = self.perf_metrics.as_ref().and_then(|m| m.value("app/gpu_frametime")).map(|v| v as f32) {
+            let hz = if warp_on && self.display_hz > 60.0 { self.display_hz / 2.0 } else { self.display_hz };
+            let period = (1000.0 / hz) as f32;
+            if gpu > 1.5 * period {
+                self.over_budget += 1;
+            }
+            if gpu > 2.0 * period && self.gpu_spike_logged.is_none_or(|t| t.elapsed().as_secs_f32() >= 1.0) {
+                self.gpu_spike_logged = Some(std::time::Instant::now());
+                log::info!("GPUSPIKE gpu {gpu:.1} ms in a {period:.1} ms frame, heat {:?}, levers {}", self.thermal.state(), self.levers.summary());
+            }
+        }
         if let Some(sw) = self.space_warp.as_mut() {
             sw.acquired = None;
-            if self.levers.space_warp {
+            if warp_on {
                 let m = sw.motion.acquire_image()? as usize;
                 sw.motion.wait_image(xr::Duration::INFINITE)?;
                 let d = sw.depth.acquire_image()? as usize;
@@ -205,98 +328,132 @@ impl XrRenderer {
         let cam_up = head_rot * glam::Vec3::Y;
         let view_dir = head_rot * glam::Vec3::NEG_Z;
 
+        let geometry_clock = std::time::Instant::now();
         let (mut solid_verts, mut solid_idx, mut solid_ranges) =
             build_solid_mesh_with_ranges(cuboids);
+
+        let mut kept_ground: Option<(&[SolidVertex], &[u32])> = None;
 
         let mut terrain_range: Option<(u32, u32)> = None;
         if let Some((terrain_verts, terrain_idx)) = terrain {
             if !terrain_verts.is_empty() && !terrain_idx.is_empty() {
 
-                let threshold = self.terrain_settings.biplanar_start_deg;
-                if self.terrain_gentle.is_some()
-                    && !self.slope_split.as_ref().is_some_and(|s| s.is_for(terrain_verts, terrain_idx, terrain_chunks, threshold))
-                {
-                    let started = std::time::Instant::now();
-                    let split = crate::renderer::ground_twins::SlopeSplit::new(terrain_verts, terrain_idx, terrain_chunks, threshold);
-                    log::info!(
-                        "SLOPES: {:.1}% of the ground's triangles are gentle (under {:.0} degrees), {:.1}% steep (over {:.0}) over {} chunk(s), {:.1} ms",
-                        100.0 * split.gentle_total as f64 / terrain_idx.len().max(1) as f64,
-                        threshold - crate::renderer::ground_twins::GENTLE_MARGIN_DEG,
-                        100.0 * split.steep_total as f64 / terrain_idx.len().max(1) as f64,
-                        threshold + crate::renderer::ground_twins::GENTLE_MARGIN_DEG,
-                        split.gentle.len(),
-                        started.elapsed().as_secs_f64() * 1000.0,
-                    );
-                    self.slope_split = Some(split);
-                }
+                self.prepare_ground(terrain_verts, terrain_idx, terrain_chunks, "in a frame");
                 let terrain_idx: &[u32] = match &self.slope_split {
                     Some(split) if self.terrain_gentle.is_some() => &split.indices,
                     _ => terrain_idx,
                 };
-                let base = solid_verts.len() as u32;
-                let index_start = solid_idx.len() as u32;
-                solid_verts.extend_from_slice(terrain_verts);
-                solid_idx.extend(terrain_idx.iter().map(|i| i + base));
-                solid_ranges.push((None, index_start, terrain_idx.len() as u32, 0.0));
-                terrain_range = Some((index_start, terrain_idx.len() as u32));
+                if self.levers.ground_buffers {
+
+                    terrain_range = crate::renderer::static_solid::ranges_after_ground(&mut solid_ranges, terrain_idx.len() as u32);
+                    kept_ground = Some((terrain_verts, terrain_idx));
+                } else {
+                    let base = solid_verts.len() as u32;
+                    let index_start = solid_idx.len() as u32;
+                    solid_verts.extend_from_slice(terrain_verts);
+                    solid_idx.extend(terrain_idx.iter().map(|i| i + base));
+                    solid_ranges.push((None, index_start, terrain_idx.len() as u32, 0.0));
+                    terrain_range = Some((index_start, terrain_idx.len() as u32));
+                }
             }
         }
 
-        let solid_chunks: Vec<crate::renderer::shadow::CasterChunk> = match terrain_range {
-            Some((index_start, _)) => terrain_chunks
-                .iter()
-                .map(|c| crate::renderer::shadow::CasterChunk {
-                    first_index: c.first_index + index_start,
-                    ..*c
-                })
-                .collect(),
-            None => Vec::new(),
+        let mut uploaded: u64 = 0;
+        let (solid_vb, solid_ib, solid_index_count, solid_any) = if self.levers.ground_buffers {
+            let (gv, gi) = kept_ground.unwrap_or((&[], &[]));
+            let written = crate::renderer::static_solid::StaticSolid::update(
+                &mut self.static_solid,
+                &self.wgpu_device,
+                &self.wgpu_queue,
+                kept_ground,
+
+                if self.ground_world { (glam::Vec3::ZERO, 0.0) } else { (self.player.offset, self.player.yaw) },
+                &solid_verts,
+                &solid_idx,
+            );
+            uploaded += written.bytes();
+            let kept = self.static_solid.as_ref().expect("update leaves the buffers");
+            (
+                kept.vertices.clone(),
+                kept.indices.clone(),
+                (gi.len() + solid_idx.len()) as u32,
+                gv.len() + solid_verts.len() > 0,
+            )
+        } else {
+            self.static_solid = None;
+            uploaded += std::mem::size_of_val(solid_verts.as_slice()) as u64 + std::mem::size_of_val(solid_idx.as_slice()) as u64;
+            (
+                self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("solid_vb"),
+                    contents: bytemuck::cast_slice(&solid_verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("solid_ib"),
+                    contents: bytemuck::cast_slice(&solid_idx),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+                solid_idx.len() as u32,
+                !solid_verts.is_empty(),
+            )
         };
-        let (solid_verts, solid_idx, solid_ranges) = (solid_verts, solid_idx, solid_ranges);
+
+        let ground_partitioned = terrain_range.is_some() && !terrain_chunks.is_empty();
+        let solid_ranges = solid_ranges;
 
         let brush_geometry = brushes.filter(|(v, i)| !v.is_empty() && !i.is_empty());
 
         let partitioned = match (&self.sun_faces, brush_geometry) {
-            (Some(faces), Some((v, i))) => Some(faces.partition(v, i)),
+            (Some(faces), Some((v, i))) if !self.levers.brush_buffers => Some(faces.partition(v, i)),
             _ => None,
         };
-        let brush_sun_ends = partitioned.as_ref().map_or([0, 0], |(_, ends)| *ends);
-        let brush_buffers = brush_geometry.map(|(v, i)| {
-            let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
-            (
-                self.wgpu_device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("brush_vb"),
-                        contents: bytemuck::cast_slice(v),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                self.wgpu_device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("brush_ib"),
-                        contents: bytemuck::cast_slice(i),
-                        usage: wgpu::BufferUsages::INDEX,
-                    }),
-                i.len() as u32,
-            )
-        });
+        let mut brush_sun_ends = partitioned.as_ref().map_or([0, 0], |(_, ends)| *ends);
+        let brush_buffers = match brush_geometry {
+            Some((v, i)) if self.levers.brush_buffers => {
+
+                let pose = if self.brush_world { (glam::Vec3::ZERO, 0.0) } else { (self.player.offset, self.player.yaw) };
+                uploaded += crate::renderer::static_brush::StaticBrushes::update(
+                    &mut self.static_brushes,
+                    &self.wgpu_device,
+                    v,
+                    i,
+                    pose,
+                    self.sun_faces.as_ref(),
+                );
+                let kept = self.static_brushes.as_ref().expect("update leaves the buffers");
+                brush_sun_ends = kept.sun_ends;
+                Some((kept.vertices.clone(), kept.indices.clone(), kept.index_count))
+            }
+            Some((v, i)) => {
+                self.static_brushes = None;
+                let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
+                uploaded += std::mem::size_of_val(v) as u64 + std::mem::size_of_val(i) as u64;
+                Some((
+                    self.wgpu_device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("brush_vb"),
+                            contents: bytemuck::cast_slice(v),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        }),
+                    self.wgpu_device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("brush_ib"),
+                            contents: bytemuck::cast_slice(i),
+                            usage: wgpu::BufferUsages::INDEX,
+                        }),
+                    i.len() as u32,
+                ))
+            }
+            None => {
+                self.static_brushes = None;
+                None
+            }
+        };
+        let brush_sun_ends = brush_sun_ends;
         let (wire_verts, wire_idx) = build_wire_mesh(cuboids);
         let (particle_verts, particle_idx) =
             particle::build_particle_mesh(particles, beams, cam_right, cam_up, view_dir);
 
-        let solid_vb = self
-            .wgpu_device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("solid_vb"),
-                contents: bytemuck::cast_slice(&solid_verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let solid_ib = self
-            .wgpu_device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("solid_ib"),
-                contents: bytemuck::cast_slice(&solid_idx),
-                usage: wgpu::BufferUsages::INDEX,
-            });
         let wire_vb = self
             .wgpu_device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -325,6 +482,12 @@ impl XrRenderer {
                 contents: bytemuck::cast_slice(&particle_idx),
                 usage: wgpu::BufferUsages::INDEX,
             });
+        uploaded += std::mem::size_of_val(wire_verts.as_slice()) as u64
+            + std::mem::size_of_val(wire_idx.as_slice()) as u64
+            + std::mem::size_of_val(particle_verts.as_slice()) as u64
+            + std::mem::size_of_val(particle_idx.as_slice()) as u64;
+        self.note_cpu("geometry_ms", geometry_clock.elapsed().as_secs_f64() * 1e3);
+        self.note_cpu("upload_mb", uploaded as f64 / 1_048_576.0);
 
         let head = glam::Vec3::new(
             eye_views[0].pose.position.x,
@@ -332,6 +495,7 @@ impl XrRenderer {
             eye_views[0].pose.position.z,
         );
 
+        laps.push((line!(), std::time::Instant::now()));
         let effects_on = self.frame_levers().effects;
 
         use crate::renderer::underwater::EyeWater;
@@ -394,24 +558,94 @@ impl XrRenderer {
             } else {
                 Vec::new()
             };
+
+            // The torch's pool, which the eye adapts to as it looks into it
+            // (`EyeAdaptation::meter_with_pool`).
+            let pool = self.lights_uniform.pool_light();
             let mut eye = self.eye.borrow_mut();
-            let mut metered = eye.meter_with(head_world, gaze, &fires);
+            eye.set_local_rooms(self.auto_exposure && self.levers.room_exposure);
+            let mut metered = eye.meter_with_pool(head_world, gaze, &fires, &pool);
 
             if let Some((b, state)) = eyes_in_water[0].or(eyes_in_water[1]) {
                 let u = &self.water_bodies[b].uniform;
                 let water = crate::renderer::underwater::in_water_luminance(u, &under_base, u.extinction[3] - head_world.y);
                 metered = crate::renderer::underwater::meter_in_water(metered, water, crate::renderer::underwater::eye_share(state));
             }
-            let auto = eye.update(metered, dt);
+            // Leaning toward a doorway's night from a lit closed room
+            // (`EyeAdaptation::door_lean`, lever `door_lean`).
+            let lean = if self.auto_exposure && self.levers.door_lean { eye.door_lean(head_world, gaze, metered) } else { 0.0 };
+            let auto = eye.update_leaning(metered, lean, dt);
+            eye.see_rooms_from(head_world, auto);
             if self.shadow_diag_frames.get() % 120 == 0 {
                 log::info!("EXPOSURE meter {metered:.4} -> x{auto:.2} (auto {})", self.auto_exposure);
             }
 
             let night_vision = self.tod_night_vision(eye.adapted_luminance());
+            // Closed rooms seen from outside at their own adaptation (lever
+            // `room_exposure` off draws every room at the eye's).
+            let rooms = if self.auto_exposure && self.levers.room_exposure {
+                eye.room_exposure(head_world, auto)
+            } else {
+                [[0.0; 4]; 2 * crate::renderer::uniforms::ROOM_EXPOSURE_ROOMS]
+            };
+            // In a closed room the sky map is built at a quarter of the rate
+            // (`Sky::set_cloud_build_every`).
+            let sky_open = eye.sky_open_at(head_world);
+            drop(eye);
+            // The clouds: a slice of their sky map, and their shadow.
+            let clouds_at = std::time::Instant::now();
+            if self.levers.clouds {
+                // And slower while the frame is over budget (`cloud_pace`).
+                let room = if sky_open < CLOSED_ROOM_SKY { CLOSED_ROOM_CLOUD_EVERY } else { 1 };
+                let gpu_ms = self.perf_metrics.as_ref().and_then(|m| m.value("app/gpu_frametime")).map(|v| v as f32);
+                // The app's own frame: under SpaceWarp every other display
+                // frame -- unless the runtime already predicts the app's period,
+                // which it does as SpaceWarp runs (CLOUDPACE read a 55.6 ms
+                // frame, 2026-10-22), so a rate under 60 Hz is taken as it is.
+                let hz = if self.space_warp_running() && self.display_hz > 60.0 { self.display_hz / 2.0 } else { self.display_hz };
+                let was = self.cloud_pace.every();
+                let paced = self.cloud_pace.step(gpu_ms, (1000.0 / hz) as f32);
+                if paced != was {
+                    log::info!(
+                        "CLOUDPACE every {paced} frame(s): gpu {:.1} ms smoothed in a {:.1} ms frame",
+                        self.cloud_pace.smoothed().unwrap_or(0.0),
+                        1000.0 / hz
+                    );
+                }
+                let paced = if self.levers.cloud_pace { paced } else { 1 };
+                self.sky.set_cloud_build_every(room.max(paced));
+                {
+                    use crate::renderer::cloud_sky::{HISTORY_REJECT, HISTORY_REJECT_WIDE};
+                    let above = if self.levers.cloud_history_tight { HISTORY_REJECT } else { HISTORY_REJECT_WIDE };
+                    self.sky.set_cloud_history_reject(above, HISTORY_REJECT_WIDE, self.levers.cloud_history_tight);
+                }
+                self.sky.step_clouds(
+                &self.wgpu_device,
+                &self.wgpu_queue,
+                head_world.to_array(),
+                self.levers.cloud_shadows,
+                Some(self.uniform_buf.cloud_shadow_view()),
+                false,
+            );
+                if !self.levers.sky_cirrus {
+                    self.sky.hide_cirrus(&self.wgpu_queue);
+                }
+            }
+            let clouds_ms = clouds_at.elapsed().as_secs_f32() * 1000.0;
+            if clouds_ms > 3.0 {
+                log::info!("CLOUDTIME {clouds_ms:.1} ms: {}", self.sky.cloud_step_laps());
+            }
             crate::renderer::uniforms::PostUpload {
                 exposure: self.post.exposure * if self.auto_exposure { auto } else { 1.0 },
                 terrain_detail_distance: self.levers.terrain_detail_distance,
                 night_vision,
+                rooms,
+                cloud_map: self.sky.cloud_map(self.player.yaw, self.player.offset.to_array()),
+                atlas_stops: self.tod.atlas_stops,
+                ground_stops: match (self.levers.smooth_ground, self.tod.ground_lit) {
+                    (true, Some(built)) if built > 0.0 && self.tod.daylight_now > 0.0 => (self.tod.daylight_now / built).log2().clamp(-30.0, 30.0),
+                    _ => 0.0,
+                },
                 ..self.post
             }
         };
@@ -421,7 +655,10 @@ impl XrRenderer {
             0.5 * (at(&eye_views[0]) + at(&eye_views[eye_views.len() - 1]))
         };
 
-        let mut effects_drawn = effects_on && !(self.effect_emitters.is_empty() && self.splashes.is_empty()) && self.effects_gpu.is_some();
+        laps.push((line!(), std::time::Instant::now()));
+        let mut effects_drawn =
+            effects_on && !(self.effect_emitters.is_empty() && self.splashes.is_empty() && self.bursts.live.is_empty()) && self.effects_gpu.is_some();
+        self.last_exposure = post.exposure;
         if effects_drawn {
             let yaw = glam::Quat::from_rotation_y(self.player.yaw);
             let (offset, descs) = (self.player.offset, &self.room_descs);
@@ -435,7 +672,19 @@ impl XrRenderer {
             let reaches = |e: &crate::renderer::effects::EffectEmitter, i: usize| {
                 crate::renderer::effects::lamp_in_room(descs, e.position, yaw * lights[i].position + offset)
             };
-            let ambient = |world: glam::Vec3| crate::renderer::effects::room_ambient(descs, world);
+
+            let relit: Vec<f32> = match self.tod.runtime {
+                Some(_) => self.tod.probe_means.iter().zip(&self.probe_brightness).map(|(m, now)| if m.0 > 0.0 { now / m.0 } else { 1.0 }).collect(),
+                None => Vec::new(),
+            };
+            let ground = self.ground_heights.as_ref();
+            let ambient = |world: glam::Vec3| crate::renderer::effects::room_ambient_now(descs, world, &relit, ground);
+            // An effect in a closed room at the room's adaptation, as its walls
+            // and its lamps' glare are: the eye's alone blew out a lit room's
+            // fire and dust seen from the night (and from inside it, once the
+            // eye leans toward the doorway's night).
+            let room_rows = post.rooms;
+            let room = move |world: glam::Vec3| crate::renderer::exposure::room_factor_at(&room_rows, world);
             let at = crate::renderer::effects::Surroundings {
                 head: mid_eye,
                 offset,
@@ -444,6 +693,7 @@ impl XrRenderer {
                 reaches: &reaches,
                 ambient: &ambient,
                 exposure: post.exposure,
+                room: Some(&room),
             };
 
             let now = time.as_nanos() as f64 * 1e-9;
@@ -469,24 +719,55 @@ impl XrRenderer {
             };
             let rooms: &[crate::renderer::portal_cull::CullRoom] = if lv.portal_culling { &self.cull_rooms } else { &[] };
             let head_world = yaw * mid_eye + offset;
+
+            let splashes: Vec<crate::renderer::effects::Splash> =
+                splashes.into_iter().filter(|s| crate::renderer::effects::splash_seen(s, now, &views)).collect();
             self.effect_seen_until.resize(self.effect_emitters.len(), f64::NEG_INFINITY);
+
+            let mut sight: Vec<Vec<crate::renderer::effects::seen::Eye>> = Vec::with_capacity(self.effect_emitters.len());
             for (e, until) in self.effect_emitters.iter().zip(self.effect_seen_until.iter_mut()) {
-                if crate::renderer::effects::emitter_seen(e, &views, head_world, rooms, &portals) {
+                let eyes = crate::renderer::effects::emitter_sight(e, &views, head_world, rooms, &portals);
+                if !eyes.is_empty() {
                     *until = now + crate::renderer::effects::EMITTER_HOLD;
                 }
+                sight.push(eyes);
             }
             let held = &self.effect_seen_until;
             let seen = |i: usize| held.get(i).map_or(true, |&t| now <= t);
-            if (0..self.effect_emitters.len()).any(|i| seen(i)) || !splashes.is_empty() {
-                let frame = crate::renderer::effects::simulate_seen(&self.effect_emitters, &seen, &splashes, now, &at);
+
+            let wants = crate::renderer::effects::governor_wants(&self.effect_emitters, &seen, &splashes, &self.bursts.splash_measured, head_world, &sight);
+
+            self.bursts.mist_hour = self.time_of_day_hour();
+            let bursts_drawn = self.bursts.frame_with(&self.effect_library, now, &views, head_world, &wants);
+            if (0..self.effect_emitters.len()).any(|i| seen(i)) || !splashes.is_empty() || bursts_drawn.contains(&true) {
+                let bursts = crate::renderer::effects::stack::BurstFrame { lib: &self.effect_library, set: &self.bursts, drawn: &bursts_drawn };
+                let set = &self.bursts;
+                let shares = crate::renderer::effects::Shares {
+                    emitter: &|e| set.share_of(crate::renderer::effects::emitter_key(e)),
+                    splash: &|s| set.share_of(crate::renderer::effects::splash_key(s)),
+                    sight: &sight,
+                };
+                let frame = crate::renderer::effects::simulate_governed(&self.effect_emitters, &seen, &splashes, Some(&bursts), Some(&shares), now, &at);
+                self.burst_count = frame.bursts;
+                self.bursts.measured(&frame.splash_costs);
+                let (s, c) = (&self.bursts.stats, &frame.bursts);
+                if self.shadow_diag_frames.get() % 180 == 0 && (s.fill_wanted > s.fill + 1e-4 || s.instances_wanted > s.instances + 0.5) {
+                    log::info!(
+                        "EFFECTS GOVERNOR fill {:.2} of {:.2} wanted, instances {:.0} of {:.0} | thinned bursts {} emitters {} splashes {} | shed bursts {} emitters {} splashes {} | frames governed {}",
+                        s.fill, s.fill_wanted, s.instances, s.instances_wanted, s.thinned, s.emitters_thinned, s.splashes_thinned, c.shed, c.emitter_shed, c.splash_shed, s.frames_governed
+                    );
+                }
                 if let Some(gpu) = self.effects_gpu.as_mut() {
+                    (gpu.use_variants, gpu.overdraw) = (lv.effect_variants, lv.effects_overdraw);
                     gpu.upload(&self.wgpu_device, &self.wgpu_queue, &frame);
                 }
             } else {
                 effects_drawn = false;
             }
+            self.bursts.end_frame();
         }
 
+        laps.push((line!(), std::time::Instant::now()));
         let weather_on = self.frame_levers().weather && self.weather.is_some();
         if weather_on {
             let pixel = eye_views.first().map_or(0.0, |v| {
@@ -495,7 +776,9 @@ impl XrRenderer {
             });
             let yaw = glam::Quat::from_rotation_y(self.player.yaw);
             let head_world = yaw * mid_eye + self.player.offset;
-            let (sky, sun) = crate::renderer::weather::particle_light(&self.sky.irradiance, self.sky.sun.as_ref());
+            let head_w = glam::Quat::from_rotation_y(self.player.yaw) * mid_eye + self.player.offset;
+            let weather_sun = self.sky.sun_at([head_w.x, head_w.z]);
+            let (sky, sun) = crate::renderer::weather::particle_light(&self.sky.irradiance, weather_sun.as_ref());
             let ground = self.terrain_footprint.map(|(lo, hi)| ([lo.x, lo.z], [hi.x, hi.z]));
             let frame = [self.player.offset.x, self.player.offset.y, self.player.offset.z, self.player.yaw];
             if let Some(w) = self.weather.as_mut() {
@@ -535,6 +818,7 @@ impl XrRenderer {
             }
         }
 
+        laps.push((line!(), std::time::Instant::now()));
         let thin_width = match eye_views.first() {
             Some(v) if self.levers.thin_parts > 0.0 => {
                 let f = v.fov;
@@ -545,29 +829,65 @@ impl XrRenderer {
             _ => 0.0,
         };
         let thin_pass = thin_width > 0.0;
+        // Each model's LOD for this frame, from the middle of the eyes: the
+        // coarsest whose error stays under `model_lod_pixels` (`mesh_lod`).
+        self.mesh_lods.poll(&self.wgpu_device);
+        let pixels_per_radian = {
+            let f = eye_views[0].fov;
+            dyn_scale * self.width.max(1) as f32 / (f.angle_right.tan() - f.angle_left.tan()).max(1e-3)
+        };
+        let lod_on = self.levers.model_lods;
+        let lod_pixels = self.levers.model_lod_pixels;
+        let mut pick_lods = |instance: &MeshInstance| -> Vec<LodPick> {
+            if !lod_on || instance.mesh.skin.is_some() {
+                return Vec::new();
+            }
+            let m = &instance.mesh;
+            let scale = m.scale.abs().max_element();
+            let distance = ((m.position - mid_eye).length() - m.bounding_radius * scale).max(0.05);
+            m.primitives
+                .iter()
+                .map(|p| {
+                    if p.layered.is_some() || p.baked_cave.is_some() || p.thin.is_some() || p.blended {
+                        return None;
+                    }
+                    let lods = self.mesh_lods.lods(&p.index_buffer, || p.vertices.iter().map(|v| glam::Vec3::from(v.position)).collect(), &p.indices);
+                    let errors: Vec<f32> = lods.iter().map(|l| l.error * crate::renderer::mesh_lod::ERROR_MARGIN).collect();
+                    crate::renderer::mesh_lod::pick(&errors, scale, distance, pixels_per_radian, lod_pixels).map(|k| (lods[k].buffer.clone(), lods[k].count))
+                })
+                .collect()
+        };
+        let lod_picks: Vec<Vec<LodPick>> = meshes.iter().map(&mut pick_lods).collect();
+        let mirror_lod_picks: Vec<Vec<LodPick>> = mirror_only_meshes.iter().map(&mut pick_lods).collect();
         let mut mesh_draws: Vec<MeshDraw> = Vec::new();
         let mut skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut layered_draws: Vec<LayeredDraw> = Vec::new();
+        let mut baked_cave_draws: Vec<crate::renderer::baked_cave::BakedCaveDraw> = Vec::new();
 
         let mut shadow_casters: Vec<crate::renderer::shadow::ShadowMeshDraw> = Vec::new();
 
         let mut shadow_bounds: Vec<crate::renderer::shadow::ShadowMeshBound> = Vec::new();
 
+        let mut level_casters: Vec<bool> = Vec::new();
+
+        let mut caster_solid_only: Vec<Option<(&wgpu::Buffer, u32)>> = Vec::new();
+
         let mut tile_meshes: Vec<usize> = Vec::new();
 
         let mut glare_adapted = vec![false; self.glare_sources.len()];
-        for instance in meshes {
+        for (mi, instance) in meshes.iter().enumerate() {
 
             let world = glam::Quat::from_rotation_y(self.player.yaw)
                 * instance.mesh.position
                 + self.player.offset;
             let sky_vis = self.sky_visibility_at(world.x, world.z);
 
+            let eye_world = glam::Quat::from_rotation_y(self.player.yaw) * mid_eye + self.player.offset;
             let light_at = if instance.tile_caster {
-                let eye_world = glam::Quat::from_rotation_y(self.player.yaw) * mid_eye + self.player.offset;
                 crate::renderer::doors::light_point(&self.doors, world, eye_world)
             } else {
-                world
+
+                crate::renderer::doors::doorway_light_point(&self.doors, world, eye_world)
             };
             let room = crate::renderer::room_light::turned_to_player(
                 &crate::renderer::room_light::room_light_at(&self.room_descs, light_at),
@@ -605,21 +925,25 @@ impl XrRenderer {
             );
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(
-                instance, lightmap_bg, &mut mesh_draws, &mut skinned_draws, &mut layered_draws,
+                instance, &lod_picks[mi], lightmap_bg, &mut mesh_draws, &mut skinned_draws, &mut layered_draws,
+                &mut baked_cave_draws,
             );
             if instance.mesh.skin.is_none() {
                 let bound = crate::renderer::shadow::mesh_caster_bound(&instance.mesh);
-                for prim in instance.mesh.primitives.iter().filter(|p| p.casts_shadow) {
+                for (k, prim) in instance.mesh.primitives.iter().enumerate().filter(|(_, p)| p.casts_shadow) {
                     if instance.tile_caster {
                         tile_meshes.push(shadow_casters.len());
                     }
+                    let pick = lod_picks[mi].get(k).and_then(Option::as_ref);
                     shadow_casters.push((
                         &prim.vertex_buffer,
-                        &prim.index_buffer,
-                        prim.indices.len() as u32,
+                        pick.map_or(&prim.index_buffer, |p| &p.0),
+                        pick.map_or(prim.indices.len() as u32, |p| p.1),
                         &instance.model.bind_group,
                     ));
+                    caster_solid_only.push(prim.thin.as_ref().map(|t| (&t.solid_index_buffer, t.solid_count)));
                     shadow_bounds.push(bound);
+                    level_casters.push(!instance.moves);
                 }
             }
         }
@@ -628,14 +952,16 @@ impl XrRenderer {
 
         let mut skinned_casters: Vec<crate::renderer::shadow::ShadowSkinnedDraw> = skinned_draws
             .iter()
-            .map(|(model_bg, _tex, joint_bg, vb, ib, count)| {
+            .map(|(model_bg, _tex, joint_bg, vb, ib, count, _)| {
                 (*vb, *ib, *count, *model_bg, *joint_bg)
             })
             .collect();
 
+        let skinned_mirror_from = skinned_casters.len();
         let mut mirror_only_skinned_draws: Vec<SkinnedDraw> = Vec::new();
         let mut mirror_only_layered_draws: Vec<LayeredDraw> = Vec::new();
-        for instance in mirror_only_meshes {
+        let mut mirror_only_baked_caves: Vec<crate::renderer::baked_cave::BakedCaveDraw> = Vec::new();
+        for (mi, instance) in mirror_only_meshes.iter().enumerate() {
 
             let world = glam::Quat::from_rotation_y(self.player.yaw) * instance
                 .mesh.position
@@ -655,36 +981,45 @@ impl XrRenderer {
             let lightmap_bg = self.mesh_lightmap_bg(instance.lightmap_key);
             push_mesh_draws(
                 instance,
+                &mirror_lod_picks[mi],
                 lightmap_bg,
                 &mut mirror_only_mesh_draws,
                 &mut mirror_only_skinned_draws,
                 &mut mirror_only_layered_draws,
+                &mut mirror_only_baked_caves,
             );
 
             if instance.mesh.skin.is_none() {
                 let bound = crate::renderer::shadow::mesh_caster_bound(&instance.mesh);
-                for prim in instance.mesh.primitives.iter().filter(|p| p.casts_shadow) {
+                for (k, prim) in instance.mesh.primitives.iter().enumerate().filter(|(_, p)| p.casts_shadow) {
+                    let pick = mirror_lod_picks[mi].get(k).and_then(Option::as_ref);
                     shadow_casters.push((
                         &prim.vertex_buffer,
-                        &prim.index_buffer,
-                        prim.indices.len() as u32,
+                        pick.map_or(&prim.index_buffer, |p| &p.0),
+                        pick.map_or(prim.indices.len() as u32, |p| p.1),
                         &instance.model.bind_group,
                     ));
+                    caster_solid_only.push(prim.thin.as_ref().map(|t| (&t.solid_index_buffer, t.solid_count)));
                     shadow_bounds.push(bound);
+                    level_casters.push(false);
                 }
             }
         }
         skinned_casters.extend(
             mirror_only_skinned_draws
                 .iter()
-                .map(|(model_bg, _tex, joint_bg, vb, ib, count)| (*vb, *ib, *count, *model_bg, *joint_bg)),
+                .map(|(model_bg, _tex, joint_bg, vb, ib, count, _)| (*vb, *ib, *count, *model_bg, *joint_bg)),
         );
 
         let mut posed_live: Vec<(wgpu::Buffer, wgpu::Buffer)> = Vec::new();
         let mut posed: Vec<(crate::renderer::skin_compute::Posed, &wgpu::Buffer, u32, &wgpu::BindGroup)> = Vec::new();
         let mut posed_cache = self.posed_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut posed_mirror_from = usize::MAX;
         if self.levers.skin_once {
-            for instance in meshes.iter().chain(mirror_only_meshes.iter()) {
+            for (k, instance) in meshes.iter().chain(mirror_only_meshes.iter()).enumerate() {
+                if k == meshes.len() {
+                    posed_mirror_from = posed.len();
+                }
                 let Some(skin) = &instance.mesh.skin else {
                     continue;
                 };
@@ -704,6 +1039,7 @@ impl XrRenderer {
                 }
             }
         }
+        let posed_mirror_from = posed_mirror_from.min(posed.len());
         posed_cache.keep_only(&posed_live);
         drop(posed_cache);
         let posed_casters: Vec<crate::renderer::shadow::ShadowMeshDraw> =
@@ -733,6 +1069,7 @@ impl XrRenderer {
             (vb, ib, idx.len() as u32)
         });
 
+        laps.push((line!(), std::time::Instant::now()));
         let sky_upload =
             crate::renderer::uniforms::SkyUpload::from(&self.sky.irradiance);
 
@@ -783,8 +1120,18 @@ impl XrRenderer {
                     }
                 }
             }
+            // A lamp in a room drawn at the room's adaptation glares at it too.
+            let yaw = glam::Quat::from_rotation_y(self.player.yaw);
+            let glare_sources: Vec<crate::renderer::glare::GlareSource> = self
+                .glare_sources
+                .iter()
+                .map(|s| crate::renderer::glare::GlareSource {
+                    radiance: s.radiance * crate::renderer::exposure::room_factor_at(&post.rooms, yaw * s.position + self.player.offset),
+                    ..s.clone()
+                })
+                .collect();
             crate::renderer::glare::build_glare(
-                &self.glare_sources,
+                &glare_sources,
                 [eye_at(&eye_views[0]), eye_at(&eye_views[1])],
                 cam_right,
                 cam_up,
@@ -833,6 +1180,7 @@ impl XrRenderer {
                 },
             );
         }
+        laps.push((line!(), std::time::Instant::now()));
         let no_shadow_phase = !fx.shadows;
         let want_sun = self.shadow_quality != ShadowQuality::Off && !no_shadow_phase;
         let want_spot = self.shadow_quality == ShadowQuality::SunAndSpot && !no_shadow_phase;
@@ -841,8 +1189,9 @@ impl XrRenderer {
             glam::Quat::from_rotation_y(self.player.yaw),
             self.player.offset,
         );
+        let sky_direct = self.sky.sun_direct();
         let sky_sun = crate::renderer::lights::sky_sun_light(
-            self.sky.sun.as_ref(),
+            sky_direct.as_ref(),
             lights,
             glam::Quat::from_rotation_y(self.player.yaw).inverse(),
         );
@@ -875,11 +1224,38 @@ impl XrRenderer {
                     planes
                 })
                 .collect();
+            // What each eye sees past a closed room's walls (`Levers::light_rooms`):
+            // none when either eye stands in no closed room.
+            let rooms: Option<Vec<crate::renderer::portal_cull::RoomView>> = if self.levers.light_rooms && fx.portal_culling && !self.cull_rooms.is_empty() {
+                let portals = if fx.door_culling { crate::renderer::doors::open_portals(&self.probe_portals, &self.shut_portals) } else { self.probe_portals.clone() };
+                let world_to_player = player_to_world.inverse();
+                eye_views
+                    .iter()
+                    .map(|ev| {
+                        let vp = Camera::gl_to_wgpu_ndc(Camera::xr_projection(ev.fov, crate::renderer::space_warp::NEAR_Z, crate::renderer::space_warp::FAR_Z)) * Camera::xr_view(ev.pose);
+                        let pos = glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
+                        crate::renderer::portal_cull::room_view(player_to_world.transform_point3(pos), vp * world_to_player, vp, &self.cull_rooms, &portals)
+                    })
+                    .collect()
+            } else {
+                None
+            };
             let seen = |l: &Light| {
                 l.in_level_bake
                     || l.kind == crate::renderer::LightKind::Directional
-                    || views.iter().any(|v| crate::renderer::shadow::sphere_in_frustum(v, l.position.extend(l.range.max(0.0))))
+                    || (views.iter().any(|v| crate::renderer::shadow::sphere_in_frustum(v, l.position.extend(l.range.max(0.0))))
+                        && rooms.as_ref().is_none_or(|rs| {
+                            let reach = l.position.extend(l.range.max(0.0));
+                            rs.iter().any(|r| r.shows(player_to_world.transform_point3(l.position), reach, crate::renderer::scene_cull::MARGIN))
+                        }))
             };
+            let walled = rooms.as_ref().map_or(0, |_| {
+                lights.iter().filter(|l| !seen(l) && views.iter().any(|v| crate::renderer::shadow::sphere_in_frustum(v, l.position.extend(l.range.max(0.0))))).count()
+            });
+            if walled != self.light_rooms_log.get() {
+                log::info!("LIGHTROOMS {walled} lamp(s) behind the room's walls left out of {}", lights.len());
+                self.light_rooms_log.set(walled);
+            }
             if lights.iter().all(seen) {
                 lights
             } else {
@@ -944,6 +1320,7 @@ impl XrRenderer {
             crate::renderer::lights::append_baked(lights, &self.baked_lights, crate::renderer::lights::MAX_LIGHTS)
         };
         self.lights_uniform.set_culling(fx.light_culling);
+        self.lights_uniform.set_cutoff(if self.levers.light_cutoff > 0.0 { self.levers.light_cutoff / post.exposure.max(1e-12) } else { 0.0 });
         self.lights_uniform.set_terminator_aa(fx.terminator_aa);
         self.lights_uniform.set_surface_lights_apart(fx.surface_light_loop);
         self.lights_uniform.upload_frame_split(
@@ -954,25 +1331,83 @@ impl XrRenderer {
             sky_sun.is_some(),
         );
 
+        // The static map is drawn along the snapshot's direction, so once a
+        // snapshot; the light itself glides (`Sky::sun_direct`). Under
+        // `Levers::smooth_sun_shadow` it is drawn along the gliding light
+        // instead, again each time that has moved `STATIC_SUN_REDRAW_COS`
+        // off the map's: shadows slide on with the sun rather than jumping a
+        // texel at each snapshot (user's colleague, 2026-10-22: "the light
+        // and shadow changes step").
+        // Two maps then, blended by the sun's way between redraws
+        // (`lights::SunPair`), so the shadows creep on with it.
+        let glide = if self.levers.smooth_sun_shadow { self.sky.sun_direct().map(|s| -glam::Vec3::from(s.direction)) } else { None };
+        let stepped = if self.levers.smooth_sun_shadow { glide } else { self.sky.sun_stepped().map(|s| -glam::Vec3::from(s.direction)) };
+        // The pair's frame, and the newer and older maps (player space).
+        let mut sun_pair: Option<(crate::renderer::lights::SunPairFrame, glam::Mat4)> = None;
         let static_sun = sun.filter(|_| sky_sun.is_some()).map(|l| {
-            let world_dir = glam::Quat::from_rotation_y(self.player.yaw) * l.direction;
-            let signature = (
+            let mut cache = self.static_sun_shadow.borrow_mut();
+            let geometry = (
                 brushes.map(|(v, i)| (v.len(), i.len())).unwrap_or((0, 0)),
                 terrain.map(|(v, i)| (v.len(), i.len())).unwrap_or((0, 0)),
-                world_dir.to_array().map(f32::to_bits),
             );
-            let mut cache = self.static_sun_shadow.borrow_mut();
+            let pair_frame = glide.map(|g| {
+                let mut pair = cache.as_ref().filter(|c| (c.signature.0, c.signature.1) == geometry).and_then(|c| c.pair);
+                let fr = crate::renderer::lights::SunPair::frame(&mut pair, g);
+                (fr, pair.expect("a pair's frame leaves a pair"))
+            });
+            let world_dir = match pair_frame {
+                Some((_, p)) => p.dirs[p.newest],
+                None => stepped.unwrap_or(glam::Quat::from_rotation_y(self.player.yaw) * l.direction),
+            };
+            let signature = (geometry.0, geometry.1, world_dir.to_array().map(f32::to_bits));
+            let (pair_was, layers_were) = cache.as_ref().map_or((None, [glam::Mat4::IDENTITY; 2]), |c| (c.pair, c.layers));
             let stale = cache.as_ref().is_none_or(|c| c.signature != signature);
-            if stale {
-                let world_view_proj = crate::renderer::lights::static_sun_matrix(
-                    world_dir,
-                    brushes.map(|(v, _)| v.iter().map(|b| b.position)),
-                    terrain.map(|(v, _)| v.iter().map(|t| t.position)),
+            let kept = cache.as_ref().filter(|c| (c.signature.0, c.signature.1) == (signature.0, signature.1)).map(|c| c.bounds);
+            // Turned about the player (`lights::static_sun_matrix_about`) when
+            // it glides; a snapshot's map keeps the level's middle.
+            let pivot = crate::renderer::lights::static_sun_pivot(player_to_world.transform_point3(head));
+            let sun_dim = self.shadow_map.sun_dim();
+            let fit = |bounds| if self.levers.smooth_sun_shadow {
+                crate::renderer::lights::static_sun_matrix_about(world_dir, bounds, pivot, sun_dim)
+            } else {
+                crate::renderer::lights::static_sun_matrix_in(world_dir, bounds)
+            };
+            if let (true, Some(bounds)) = (stale, kept) {
+                let world_view_proj = fit(bounds);
+                *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj, bounds, pair: pair_was, layers: layers_were });
+            } else if stale {
+                let bounds = crate::renderer::lights::static_sun_bounds(
+
+                    brushes.map(|(v, _)| {
+                        let world = self.brush_world;
+                        v.iter().map(move |b| if world { warp_world_to_player.transform_point3(glam::Vec3::from(b.position)).to_array() } else { b.position })
+                    }),
+
+                    terrain.map(|(v, _)| {
+                        let world = self.ground_world;
+                        v.iter().map(move |t| if world { warp_world_to_player.transform_point3(glam::Vec3::from(t.position)).to_array() } else { t.position })
+                    }),
                     player_to_world,
                 );
-                *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj });
+                let world_view_proj = fit(bounds);
+                *cache = Some(crate::renderer::lights::StaticSunShadow { signature, world_view_proj, bounds, pair: pair_was, layers: layers_were });
             }
-            (cache.as_ref().unwrap().world_view_proj * player_to_world, stale)
+            let c = cache.as_mut().unwrap();
+            if let Some((mut fr, p)) = pair_frame {
+                // A map is drawn whenever the newer's sun changed; the pair
+                // says into which layer.
+                if stale && fr.record.is_none() {
+                    fr.record = Some(p.newest);
+                }
+                if let Some(layer) = fr.record {
+                    c.layers[layer] = c.world_view_proj;
+                }
+                c.pair = Some(p);
+                sun_pair = Some((fr, c.layers[fr.newer] * player_to_world));
+                return (c.layers[fr.older] * player_to_world, stale);
+            }
+            c.pair = None;
+            (c.world_view_proj * player_to_world, stale)
         });
 
         let dynamic_sun = static_sun.and(sun).filter(|_| fx.sun_dynamic).map(|l| {
@@ -990,7 +1425,11 @@ impl XrRenderer {
             Vec::new()
         };
         let has_body = fx.capsules && self.player.capsules.group_count > 0;
-        let character_tiles: Vec<(usize, glam::Mat4)> = if fx.shadows && fx.character_shadows && (has_body || !door_casters.is_empty()) {
+        let character_tiles: Vec<(usize, glam::Mat4)> = if fx.shadows
+            && fx.character_shadows
+            && self.levers.spot_caster_drop & 64 == 0
+            && (has_body || !door_casters.is_empty())
+        {
             let b = self.player.capsules.groups[0];
             let (centre, radius) = (glam::Vec3::new(b[0], b[1], b[2]), b[3]);
             let lamps: Vec<crate::renderer::shadow::CharacterLamp> = lights
@@ -1123,6 +1562,7 @@ impl XrRenderer {
             frame_player.capsules.cards[1] = [half.x, half.y, half.z, 0.0];
         }
 
+        laps.push((line!(), std::time::Instant::now()));
         let spot_matrices: Vec<crate::renderer::shadow::SpotShadowMatrices> = spot_indices
             .iter()
             .map(|&i| crate::renderer::shadow::spot_shadow_matrices(&lights[i], self.shadow_map.spot_tile_dim()))
@@ -1150,6 +1590,60 @@ impl XrRenderer {
             spot_count: spot_indices.len() as u32,
             sun_dynamic_view_proj: dynamic_sun.unwrap_or(glam::Mat4::IDENTITY),
             sun_dynamic_enabled: dynamic_sun.is_some(),
+            sun_next_view_proj: sun_pair.map_or(glam::Mat4::IDENTITY, |(_, newer)| newer),
+            sun_blend: sun_pair.map_or([0.0; 4], |(fr, _)| [fr.share, fr.older as f32, fr.newer as f32, 0.0]),
+        };
+        // The static map drawn this frame and the layer it goes to: the
+        // pair's newer while the light glides, else the one map.
+        let (sun_record_view_proj, sun_record_layer) = match sun_pair {
+            Some((fr, newer)) => (newer, fr.record.unwrap_or(fr.newer) as u32),
+            None => (shadow.sun_view_proj, 0),
+        };
+
+        laps.push((line!(), std::time::Instant::now()));
+        let ground_head = {
+            let n = eye_views.len().max(1) as f32;
+            let mid = eye_views.iter().fold(glam::Vec3::ZERO, |sum, v| sum + glam::Vec3::new(v.pose.position.x, v.pose.position.y, v.pose.position.z)) / n;
+            glam::Quat::from_rotation_y(self.player.yaw) * mid + self.player.offset
+        };
+        let ground_frame: Option<crate::renderer::ground_lod::FrameGround> = match (terrain_range, self.ground_lod.borrow_mut().as_mut()) {
+            (Some((index_start, _)), Some(lod)) if ground_partitioned && lod.units.len() == terrain_chunks.len() => {
+                let world_planes = |m: glam::Mat4| crate::renderer::shadow::frustum_planes(m * warp_world_to_player);
+                let frusta: Vec<[glam::Vec4; 6]> = eye_views
+                    .iter()
+                    .map(|v| world_planes(Camera::gl_to_wgpu_ndc(Camera::xr_projection(v.fov, 0.03, 1000.0)) * Camera::xr_view(v.pose)))
+                    .chain(spot_matrices.iter().map(|m| world_planes(m.pass)))
+                    .chain((shadow.sun_enabled && static_sun.is_none()).then(|| world_planes(shadow.sun_view_proj)))
+                    .collect();
+                lod.set_strict(self.levers.ground_lod_strict);
+                Some(lod.frame(ground_head, &frusta, self.levers.ground_lod, self.player.offset, self.player.yaw, index_start))
+            }
+            _ => None,
+        };
+
+        let ground_selected = ground_frame.is_some();
+
+        let ground_wholes: crate::renderer::ground_lod::Wholes = ground_frame.as_ref().map(|f| f.wholes.clone()).unwrap_or_default();
+
+        let (solid_chunks, ground_units, ground_boxes, ground_error): (Vec<crate::renderer::shadow::CasterChunk>, Vec<u32>, Vec<(glam::Vec3, glam::Vec3)>, f32) =
+            match (ground_frame, terrain_range) {
+                (Some(f), _) => (f.chunks, f.units, f.world, f.error_rad),
+
+                (None, Some((index_start, _))) => (
+                    terrain_chunks.iter().map(|c| crate::renderer::shadow::CasterChunk { first_index: c.first_index + index_start, ..*c }).collect(),
+                    Vec::new(),
+                    Vec::new(),
+                    0.0,
+                ),
+                (None, None) => (Vec::new(), Vec::new(), Vec::new(), 0.0),
+            };
+        let unit_of = |k: usize| ground_units.get(k).map_or(k, |u| *u as usize);
+
+        let ground_step1 = self.ground_lod.borrow().as_ref().map(|l| l.level0_len()).filter(|n| *n > 0);
+
+        let ground_coarse_from: u32 = match (terrain_range, ground_step1) {
+            (Some((start, _)), Some(n)) => start + n,
+            _ => u32::MAX,
         };
 
         self.spotless_frame.store(
@@ -1161,8 +1655,17 @@ impl XrRenderer {
 
         let record_sun = shadow.sun_enabled && static_sun.is_none_or(|(_, stale)| stale);
         if record_sun || shadow.sun_dynamic_enabled || shadow.spot_count > 0 || !character_tiles.is_empty() {
-            let solid_caster = (!solid_idx.is_empty())
-                .then_some((&solid_vb, &solid_ib, solid_idx.len() as u32));
+
+            let solid_caster = (solid_index_count > 0 && !(ground_partitioned && solid_chunks.is_empty()))
+                .then_some((&solid_vb, &solid_ib, solid_index_count));
+
+            let world_ground_cast = self.ground_world && terrain_range.is_some();
+            let world_brush_cast = self.brush_world && brush_buffers.is_some();
+            if world_ground_cast || world_brush_cast {
+                self.ground_model.upload(&self.wgpu_queue, warp_world_to_player);
+            }
+            self.shadow_map.set_solid_world(world_ground_cast.then_some(&self.ground_model.bind_group), false);
+            self.shadow_map.set_brush_world(world_brush_cast.then_some(&self.ground_model.bind_group));
             let brush_caster = brush_buffers
                 .as_ref()
                 .map(|(vb, ib, count)| (vb, ib, *count));
@@ -1205,12 +1708,28 @@ impl XrRenderer {
 
             let cull_bounds: &[crate::renderer::shadow::ShadowMeshBound] =
                 if self.levers.shadow_mesh_cull { &shadow_bounds } else { &[] };
+            let record_t0 = std::time::Instant::now();
             if record_sun {
 
-                let solid_caster = if static_sun.is_some() && solid_chunks.is_empty() {
+                let sun_chunks: Option<Vec<crate::renderer::shadow::CasterChunk>> = match (static_sun.is_some() && ground_selected, terrain_range, self.ground_lod.borrow_mut().as_mut()) {
+                    (true, Some((index_start, _)), Some(lod)) => Some(
+                        lod.frame(
+                            ground_head,
+                            &[crate::renderer::shadow::frustum_planes(sun_record_view_proj * warp_world_to_player)],
+                            false,
+                            self.player.offset,
+                            self.player.yaw,
+                            index_start,
+                        )
+                        .chunks,
+                    ),
+                    _ => None,
+                };
+                let sun_ground: &[crate::renderer::shadow::CasterChunk] = sun_chunks.as_deref().unwrap_or(&solid_chunks);
+                let solid_caster = if sun_ground.is_empty() && (static_sun.is_some() || ground_partitioned) {
                     None
                 } else {
-                    solid_caster
+                    (solid_index_count > 0).then_some((&solid_vb, &solid_ib, solid_index_count))
                 };
                 let no_meshes: [crate::renderer::shadow::ShadowMeshDraw; 0] = [];
                 let no_skinned: [crate::renderer::shadow::ShadowSkinnedDraw; 0] = [];
@@ -1219,10 +1738,11 @@ impl XrRenderer {
                 } else {
                     (&shadow_casters[..], &skinned_casters[..])
                 };
+                self.shadow_map.set_sun_layer(sun_record_layer);
                 self.shadow_map.upload_light(
                     &self.wgpu_queue,
                     crate::renderer::shadow::ShadowKind::Sun,
-                    shadow.sun_view_proj,
+                    sun_record_view_proj,
                 );
                 drawn += self.shadow_map.record(
                     &mut encoder,
@@ -1231,11 +1751,21 @@ impl XrRenderer {
                     brush_caster,
                     mesh_casters,
                     skinned,
-                    &solid_chunks,
-                    shadow.sun_view_proj,
+                    sun_ground,
+                    sun_record_view_proj,
                 );
-                if static_sun.is_some() {
-                    log::info!("SUNSHADOW static map recorded ({drawn} indices)");
+                // Drawn every 0.1 degrees when smooth: logged with the diagnostics.
+                if static_sun.is_some() && (!self.levers.smooth_sun_shadow || diag) {
+                    let ms = record_t0.elapsed().as_secs_f32() * 1000.0;
+                    // Along which sun, by elevation and azimuth, against the
+                    // light's own this frame: a map ever recorded behind the
+                    // one before shows as shadows stepping back.
+                    let ang = |d: Option<glam::Vec3>| d.map_or([0.0, 0.0], |d| [d.y.clamp(-1.0, 1.0).asin().to_degrees(), d.x.atan2(d.z).to_degrees()]);
+                    let (rec, glide) = (ang(stepped.map(|v| -v)), ang(self.sky.sun_direct().map(|s| glam::Vec3::from(s.direction))));
+                    log::info!(
+                        "SUNSHADOW static map recorded ({drawn} indices, {ms:.1} ms cpu) along sun {:.3}/{:.3} deg, light {:.3}/{:.3} deg",
+                        rec[0], rec[1], glide[0], glide[1]
+                    );
                 }
             }
 
@@ -1250,13 +1780,25 @@ impl XrRenderer {
                 for (k, (_, tile)) in character_tiles.iter().enumerate() {
                     self.shadow_map.upload_light(&self.wgpu_queue, crate::renderer::shadow::ShadowKind::Character(k), *tile);
                 }
+
+                let moving_bounds: Vec<crate::renderer::shadow::ShadowMeshBound> = level_casters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &level)| {
+                        if level {
+                            glam::Vec4::new(0.0, -1.0e9, 0.0, 0.0)
+                        } else {
+                            cull_bounds.get(i).copied().unwrap_or(glam::Vec4::new(0.0, 0.0, 0.0, f32::INFINITY))
+                        }
+                    })
+                    .collect();
                 drawn += self.shadow_map.record_moving(
                     &mut encoder,
                     shadow.sun_dynamic_enabled,
                     shadow.sun_dynamic_view_proj,
                     &character_tiles.iter().map(|(_, m)| *m).collect::<Vec<_>>(),
                     &shadow_casters,
-                    cull_bounds,
+                    &moving_bounds,
                     frame_skinned_casters,
                     &posed_casters,
                     &tile_meshes,
@@ -1272,17 +1814,63 @@ impl XrRenderer {
                 );
             }
             if shadow.spot_count > 0 {
+
+                let drop = self.levers.spot_caster_drop;
+                let keep = |bit: u32| drop & bit == 0;
+                self.shadow_map.set_tile_scissor(!keep(128));
+                let spot_posed: Vec<crate::renderer::shadow::ShadowMeshDraw> = posed_casters
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| if *i < posed_mirror_from { keep(8) } else { keep(16) })
+                    .map(|(_, d)| *d)
+                    .collect();
+                let spot_skinned: Vec<crate::renderer::shadow::ShadowSkinnedDraw> = frame_skinned_casters
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| if *i < skinned_mirror_from { keep(8) } else { keep(16) })
+                    .map(|(_, d)| *d)
+                    .collect();
+                let no_meshes: [crate::renderer::shadow::ShadowMeshDraw; 0] = [];
+                let spot_meshes: Vec<crate::renderer::shadow::ShadowMeshDraw> = shadow_casters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(vb, ib, n, model))| match caster_solid_only.get(i).copied().flatten() {
+                        Some((solid, count)) if !keep(32) => (vb, solid, count, model),
+                        _ => (vb, ib, n, model),
+                    })
+                    .collect();
+
+                let pillarless: Option<(wgpu::Buffer, u32)> = brush_geometry.filter(|_| !keep(256)).map(|(v, i)| {
+                    let to_world = if self.brush_world { glam::Mat4::IDENTITY } else { warp_world_to_player.inverse() };
+                    let (lo, hi) = (glam::Vec3::new(-0.46, -0.01, -7.46), glam::Vec3::new(0.46, 3.11, -6.54));
+                    let inside = |k: u32| {
+                        let p = to_world.transform_point3(glam::Vec3::from(v[k as usize].position));
+                        p.cmpge(lo).all() && p.cmple(hi).all()
+                    };
+                    let kept: Vec<u32> =
+                        i.chunks_exact(3).filter(|t| !t.iter().all(|&k| inside(k))).flatten().copied().collect();
+                    let ib = self.wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("brush_ib_pillarless"),
+                        contents: bytemuck::cast_slice(&kept),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                    (ib, kept.len() as u32)
+                });
+                let spot_brushes = match (&pillarless, brush_caster) {
+                    (Some((ib, n)), Some((vb, _, _))) => Some((vb, ib, *n)),
+                    _ => brush_caster,
+                };
                 drawn += self.shadow_map.record_spots(
                     &mut encoder,
                     shadow.spot_count as usize,
                     &spot_pass,
-                    solid_caster,
-                    brush_caster,
-                    &shadow_casters,
-                    cull_bounds,
-                    frame_skinned_casters,
-                    &posed_casters,
-                    &solid_chunks,
+                    solid_caster.filter(|_| keep(1)),
+                    spot_brushes.filter(|_| keep(2)),
+                    if keep(4) { &spot_meshes } else { &no_meshes },
+                    if keep(4) { cull_bounds } else { &[] },
+                    &spot_skinned,
+                    &spot_posed,
+                    if keep(1) { &solid_chunks } else { &[] },
                 );
             }
             if diag {
@@ -1324,6 +1912,7 @@ impl XrRenderer {
                 );
             }
             self.wgpu_queue.submit(Some(encoder.finish()));
+            laps.push((line!(), std::time::Instant::now()));
         }
 
         let reflective_brushes = self.brush_materials.reflective && brush_geometry.is_some();
@@ -1344,10 +1933,19 @@ impl XrRenderer {
             stream.begin_frame();
         }
 
+        let warp_mesh_room = crate::renderer::space_warp::MAX_SLOTS as usize / 2 - 3;
+        if meshes.len() > warp_mesh_room && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some()) && self.shadow_diag_frames.get() % 36 == 0 {
+            log::error!(
+                "SPACEWARP: {} meshes drawn and {warp_mesh_room} motion slots an eye: {} mesh(es) write no motion vectors this frame",
+                meshes.len(),
+                meshes.len() - warp_mesh_room,
+            );
+        }
         let warp_meshes: Vec<(&MeshInstance, glam::Mat4, glam::Mat4)> = match self.space_warp.as_ref() {
             Some(sw) if sw.acquired.is_some() => meshes
                 .iter()
-                .take(crate::renderer::space_warp::MAX_SLOTS as usize / 2 - 2)
+
+                .take(warp_mesh_room)
                 .map(|m| {
                     let model = m.mesh.model_matrix();
                     let prev = sw.prev_models.get(&m.model.buffer).copied().unwrap_or(model);
@@ -1363,9 +1961,20 @@ impl XrRenderer {
         let brush_motion_ranges: Option<[Vec<(u32, u32)>; 2]> =
             match (warp_cull && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some()), brush_geometry) {
                 (true, Some((v, i))) => {
-                    let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
-                    let runs = crate::renderer::space_warp::index_runs(i, |k| glam::Vec3::from(v[k as usize].position));
-                    Some(std::array::from_fn(|e| crate::renderer::space_warp::visible_ranges(&runs, &warp_planes[e])))
+
+                    let planes = |e: usize| match self.brush_world {
+                        true => crate::renderer::shadow::frustum_planes(warp_view_proj[e] * warp_world_to_player),
+                        false => warp_planes[e],
+                    };
+                    match self.static_brushes.as_ref().filter(|_| self.levers.brush_buffers) {
+
+                        Some(kept) => Some(std::array::from_fn(|e| crate::renderer::space_warp::visible_ranges(&kept.runs, &planes(e)))),
+                        None => {
+                            let i: &[u32] = partitioned.as_ref().map_or(i, |(p, _)| p.as_slice());
+                            let runs = crate::renderer::space_warp::index_runs(i, |k| glam::Vec3::from(v[k as usize].position));
+                            Some(std::array::from_fn(|e| crate::renderer::space_warp::visible_ranges(&runs, &planes(e))))
+                        }
+                    }
                 }
                 _ => None,
             };
@@ -1375,6 +1984,94 @@ impl XrRenderer {
             (((warp_clocks.0 - w).clamp(0.0, 0.1)) as f32, ((warp_clocks.1 - f).clamp(0.0, 0.1)) as f32)
         });
 
+        let mut horizon_runs: Vec<Vec<bool>> = Vec::new();
+
+        let horizon_boxes: Option<Vec<(glam::Vec3, glam::Vec3)>> = match (&self.ground_occluder, terrain_range) {
+            _ if !self.levers.ground_horizon => None,
+            (Some(_), Some(_)) if ground_selected => Some(ground_boxes.clone()),
+            (Some((_, bounds)), Some((index_start, _)))
+                if bounds.len() == solid_chunks.len() && bounds.iter().zip(&solid_chunks).all(|((first, _), c)| first + index_start == c.first_index) =>
+            {
+                Some(bounds.iter().map(|(_, b)| *b).collect())
+            }
+            _ => None,
+        };
+        let (horizon_hidden, horizon_water): (Vec<bool>, Vec<bool>) = match (&self.ground_occluder, horizon_boxes) {
+            (Some((ground, _)), Some(boxes)) => {
+                let yaw = glam::Quat::from_rotation_y(self.player.yaw);
+                let to_world = |p: glam::Vec3| yaw * p + self.player.offset;
+                let eyes: Vec<glam::Vec3> = eye_views
+                    .iter()
+                    .map(|ev| to_world(glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z)))
+                    .collect();
+                let caves: Vec<(glam::Vec3, glam::Vec3)> = if self.levers.ground_horizon_caves && layered_draws.is_empty() {
+                    baked_cave_draws
+                        .iter()
+                        .map(|d| {
+                            let corners = (0..8).map(|i| {
+                                to_world(glam::Vec3::new(
+                                    if i & 1 == 0 { d.bounds.0.x } else { d.bounds.1.x },
+                                    if i & 2 == 0 { d.bounds.0.y } else { d.bounds.1.y },
+                                    if i & 4 == 0 { d.bounds.0.z } else { d.bounds.1.z },
+                                ))
+                            });
+                            corners.fold(
+                                (glam::Vec3::splat(f32::INFINITY), glam::Vec3::splat(f32::NEG_INFINITY)),
+                                |(lo, hi), p| (lo.min(p), hi.max(p)),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                let lift_eye = eyes.first().copied().unwrap_or(glam::Vec3::ZERO);
+                let lift = |lo: glam::Vec3, hi: glam::Vec3| crate::renderer::ground_lod::lifted(ground_error, lift_eye, lo, hi);
+
+                let mut held = self.ground_horizon.borrow_mut();
+                *held = crate::renderer::ground_horizon::for_eyes(held.take(), ground, &eyes, &caves);
+                match held.as_mut() {
+                    Some(h) => {
+                        if self.levers.water_runs && fx.water {
+                            const CLEAR: f32 = 2.0;
+                            horizon_runs = self
+                                .water_bodies
+                                .iter()
+                                .map(|b| {
+                                    b.runs
+                                        .iter()
+                                        .map(|r| {
+                                            let (lo, hi) = crate::renderer::water_runs::bounds_for(r, &eyes);
+                                            let in_a_caves_box = caves.iter().any(|(clo, chi)| {
+                                                lo.cmple(*chi + CLEAR).all() && hi.cmpge(*clo - CLEAR).all()
+                                            });
+                                            let hi = lift(lo, hi);
+                                            if in_a_caves_box { h.hides(ground, lo, hi) } else { h.hides_ground(ground, lo, hi) }
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+                        }
+                        (
+                            boxes.iter().map(|(lo, hi)| h.hides_ground(ground, *lo, lift(*lo, *hi))).collect(),
+
+                            self.water_bodies
+                                .iter()
+                                .map(|b| {
+                                    let (lo, hi) = crate::renderer::water_runs::lifted(b.bounds, &eyes);
+                                    h.hides(ground, lo, lift(lo, hi))
+                                })
+                                .collect(),
+                        )
+                    }
+                    None => (Vec::new(), Vec::new()),
+                }
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+
+        let mut planar_shares: Vec<Option<f32>> = Vec::new();
+        let mut planar_rects_all: Vec<[Option<[f32; 4]>; 2]> = Vec::new();
         if fx.water && !self.water_bodies.is_empty() {
             let yaw = glam::Quat::from_rotation_y(self.player.yaw);
             let world_to_player =
@@ -1412,13 +2109,46 @@ impl XrRenderer {
             } else {
                 None
             };
-            for body in &self.water_bodies {
-                let seen = crate::renderer::water_pipeline::water_seen(body.bounds, &views, doorways.as_deref());
+            let world_eyes: Vec<glam::Vec3> = eyes.iter().map(|(pos, _)| yaw * *pos + self.player.offset).collect();
+            for (i, body) in self.water_bodies.iter().enumerate() {
+                let seen = crate::renderer::water_pipeline::water_seen(body.bounds, &views, doorways.as_deref())
+                    && !horizon_water.get(i).copied().unwrap_or(false);
+
+                let ranges = if !seen {
+                    Vec::new()
+                } else if self.levers.water_runs {
+                    let behind = horizon_runs.get(i);
+                    crate::renderer::water_runs::seen_ranges(&body.runs, |k, r| {
+                        !behind.and_then(|b| b.get(k)).copied().unwrap_or(false)
+                            && crate::renderer::water_pipeline::water_seen(
+                                crate::renderer::water_runs::bounds_for(r, &world_eyes),
+                                &views,
+                                doorways.as_deref(),
+                            )
+                    })
+                } else {
+                    vec![0..body.index_count]
+                };
+                let seen = seen && !ranges.is_empty();
+                *body.ranges.borrow_mut() = ranges;
 
                 if seen && !body.seen.get() {
                     body.waves.reprime();
                 }
                 body.seen.set(seen);
+            }
+
+            if self.levers.planar_water {
+                for body in &self.water_bodies {
+                    let (lo, hi) = crate::renderer::planar_water::surface_box(body.bounds, body.uniform.extinction[3]);
+                    let rects: [Option<[f32; 4]>; 2] =
+                        std::array::from_fn(|i| eyes.get(i).and_then(|(_, clip)| crate::renderer::planar_water::screen_rect(*clip, lo, hi)));
+                    let above = world_eyes.iter().all(|e| e.y > body.uniform.extinction[3]);
+                    let share = (body.uniform.mirror[0] > 0.5 && body.seen.get() && above)
+                        .then(|| rects.iter().flatten().map(|r| crate::renderer::planar_water::share(*r)).fold(0.0, f32::max));
+                    planar_shares.push(share);
+                    planar_rects_all.push(rects);
+                }
             }
         } else {
             for body in &self.water_bodies {
@@ -1426,10 +2156,31 @@ impl XrRenderer {
             }
         }
 
+        let planar_allowed = self.levers.planar_water
+            && fx.water
+            && !self.stereo_scene()
+            && self.water_cut_pipeline.is_none()
+            && eyes_in_water.iter().all(Option::is_none);
+        let planar_body = {
+            let mut choice = self.planar_choice.get();
+            let body = choice.choose(if planar_allowed { &planar_shares } else { &[] });
+            self.planar_choice.set(choice);
+            body
+        };
+        let planar_rects: [Option<[f32; 4]>; 2] =
+            planar_body.and_then(|b| planar_rects_all.get(b).copied()).unwrap_or([None; 2]);
+
         let warp_water = fx.water
             && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some())
             && self.water_bodies.iter().any(|b| b.seen.get() && b.motion_groups.is_some());
-        let warp_per_eye = 1 + warp_meshes.len() as u32 + warp_water as u32;
+
+        let warp_world = warp_water || (self.ground_world && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some()));
+
+        let warp_brush_world = self.brush_world
+            && brush_buffers.is_some()
+            && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some());
+        let warp_brush_slot = 1 + warp_meshes.len() as u32;
+        let warp_per_eye = 1 + warp_meshes.len() as u32 + warp_brush_world as u32 + warp_world as u32;
 
         let warp_reflections = plan == crate::renderer::scene_pass_plan::ScenePassPlan::Direct
             && fx.half_res_reflections
@@ -1439,6 +2190,33 @@ impl XrRenderer {
             && self.levers.space_warp_debug & 16384 == 0;
 
         post.reflection_share = warp_reflections && self.space_warp.as_ref().is_some_and(|sw| sw.acquired.is_some());
+        // The sky's motion (`sky_motion`); lever space_warp_debug 131072 leaves
+        // the sky at zero motion as before, for a desk A/B.
+        let mut warp_sky_group: Option<wgpu::BindGroup> = None;
+        if let Some(sw) = self.space_warp.as_ref().filter(|sw| sw.acquired.is_some() && self.levers.space_warp_debug & 131072 == 0) {
+            let src = self.sky.motion_source();
+            for eye in 0..2usize {
+                let (c, p, world_eye) = crate::renderer::space_warp::world_slot(
+                    warp_view_proj[eye],
+                    sw.prev.map(|(vps, w2p)| (vps[eye], w2p)),
+                    warp_world_to_player,
+                    {
+                        let e = eye_views[eye.min(eye_views.len() - 1)].pose.position;
+                        glam::Vec3::new(e.x, e.y, e.z)
+                    },
+                );
+                let dbg = self.levers.space_warp_debug;
+                let cam = crate::renderer::space_warp::MotionCamera {
+                    curr: c.to_cols_array_2d(),
+                    prev: p.to_cols_array_2d(),
+                    params: [if dbg & 2 != 0 { -1.0 } else { 1.0 }, if dbg & 4 != 0 { 0.0 } else { 1.0 }, warp_steps.0, warp_steps.1],
+                    eye: [world_eye.x, world_eye.y, world_eye.z, 1.0],
+                    reflect: [0.0; 4],
+                };
+                sw.pipelines.sky.write(&self.wgpu_queue, eye, &cam, &crate::renderer::sky_motion::flow_for(c, sw.size, &src));
+            }
+            warp_sky_group = Some(sw.pipelines.sky.group(&self.wgpu_device, &src));
+        }
         if let Some(sw) = self.space_warp.as_ref().filter(|sw| sw.acquired.is_some()) {
             use crate::renderer::space_warp::{previous_clip, MotionCamera, SLOT_STRIDE};
             let stride = SLOT_STRIDE as usize;
@@ -1464,8 +2242,8 @@ impl XrRenderer {
 
                 let e = eye_views[eye.min(eye_views.len() - 1)].pose.position;
                 let reflect = [
-                    self.width as f32 / sw.size.0.max(1) as f32,
-                    self.height as f32 / sw.size.1.max(1) as f32,
+                    dyn_scale * self.width as f32 / sw.size.0.max(1) as f32,
+                    dyn_scale * self.height as f32 / sw.size.1.max(1) as f32,
                     if warp_reflections { 1.0 } else { 0.0 },
                     if dbg & 32768 != 0 { 1.0 } else { 0.0 },
                 ];
@@ -1473,7 +2251,11 @@ impl XrRenderer {
                 for (i, (_, model, prev)) in warp_meshes.iter().enumerate() {
                     put(base + 1 + i, curr * *model, prev_view_proj * *prev, [0.0; 4], [0.0; 4]);
                 }
-                if warp_water {
+                if warp_brush_world {
+                    let (c, p, world_eye) = crate::renderer::space_warp::world_slot(curr, sw.prev.map(|(vps, w2p)| (vps[eye], w2p)), warp_world_to_player, glam::Vec3::new(e.x, e.y, e.z));
+                    put(base + warp_brush_slot as usize, c, p, [world_eye.x, world_eye.y, world_eye.z, 1.0], reflect);
+                }
+                if warp_world {
                     let prev_water = sw.prev.map_or(curr * warp_world_to_player, |(vps, w2p)| vps[eye] * w2p);
                     let world_eye = warp_world_to_player.inverse().transform_point3(glam::Vec3::new(e.x, e.y, e.z));
                     put(
@@ -1488,6 +2270,10 @@ impl XrRenderer {
             self.wgpu_queue.write_buffer(&sw.cameras, 0, &bytes);
         }
 
+        // The reflection history's state, carried through the eyes here and
+        // stored after them: the draw lists borrow `self` until then.
+        let mut reflection_parity = self.reflection_parity;
+        let mut reflection_prev = self.reflection_prev;
         for eye in 0..2usize {
             let ev = &eye_views[eye];
             let view = Camera::xr_view(ev.pose);
@@ -1500,7 +2286,7 @@ impl XrRenderer {
                 let world_plane = mirror::world_plane_equation(m.position, m.normal());
                 let eye_plane = mirror::plane_to_eye_space(mirror_view.inverse(), world_plane);
                 let mirror_proj = mirror::oblique_near_clip(proj, eye_plane);
-                let mirror_view_proj = Camera::gl_to_wgpu_ndc(mirror_proj) * mirror_view;
+                let mirror_view_proj = fold * Camera::gl_to_wgpu_ndc(mirror_proj) * mirror_view;
 
                 let mirror_eye = mirror_view.inverse().transform_point3(glam::Vec3::ZERO);
                 self.uniform_buf.upload_scene(
@@ -1539,15 +2325,36 @@ impl XrRenderer {
                         }),
                         ..Default::default()
                     });
+                    if dyn_scale < 1.0 { let (w, h) = scaled(self.width, self.height); pass.set_scissor_rect(0, 0, w, h); }
 
-                    if !solid_verts.is_empty() {
+                    if solid_any {
                         pass.set_pipeline(&self.mirror_solid_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_vertex_buffer(0, solid_vb.slice(..));
                         pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
                         for (lightmap_key, index_start, count, _reflectivity) in &solid_ranges {
+
+                            let world = (self.ground_world && terrain_range == Some((*index_start, *count)))
+                                .then_some(self.mirror_solid_world.as_ref())
+                                .flatten();
+                            if self.ground_world && terrain_range == Some((*index_start, *count)) && world.is_none() {
+                                continue;
+                            }
+                            if let Some(world) = world {
+                                pass.set_pipeline(&world.pipeline);
+                                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                            }
                             pass.set_bind_group(1, self.cuboid_lightmap_bg(lightmap_key.as_deref()), &[]);
-                            pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
+
+                            let count = match ground_step1 {
+                                Some(step1) if terrain_range == Some((*index_start, *count)) => step1.min(*count),
+                                _ => *count,
+                            };
+                            pass.draw_indexed(*index_start..*index_start + count, 0, 0..1);
+                            if world.is_some() {
+                                pass.set_pipeline(&self.mirror_solid_pipeline.pipeline);
+                                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                            }
                         }
                     }
                     if let Some((vb, ib, count)) = &brush_buffers {
@@ -1565,7 +2372,7 @@ impl XrRenderer {
                         pass.set_pipeline(&self.layered_mesh_mirror_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
-                        for (model_bg, vb, ib, count) in
+                        for (model_bg, vb, ib, count, _, _) in
                             layered_draws.iter().chain(mirror_only_layered_draws.iter())
                         {
                             pass.set_bind_group(2, *model_bg, &[]);
@@ -1574,6 +2381,12 @@ impl XrRenderer {
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
                     }
+                    self.baked_cave_pipelines.draw_mirror(
+                        &mut pass,
+                        &self.uniform_buf.bind_group,
+                        &self.terrain_material.bind_group,
+                        baked_cave_draws.iter().chain(mirror_only_baked_caves.iter()),
+                    );
                     let all_mesh_draws = mesh_draws.iter().chain(mirror_only_mesh_draws.iter());
                     let all_skinned_draws =
                         skinned_draws.iter().chain(mirror_only_skinned_draws.iter());
@@ -1595,7 +2408,7 @@ impl XrRenderer {
 
                         pass.set_pipeline(&self.skinned_mesh_mirror_pipeline.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in all_skinned_draws {
+                        for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in all_skinned_draws {
                             pass.set_bind_group(1, *model_bg, &[]);
                             pass.set_bind_group(2, *tex_bg, &[]);
                             pass.set_bind_group(3, *joint_bg, &[]);
@@ -1606,21 +2419,53 @@ impl XrRenderer {
                     }
 
                     {
-                        pass.set_pipeline(&self.sky_mirror_pipeline.pipeline);
+                        pass.set_pipeline(self.sky_mirror_pipeline.pick(&self.sky));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.sky.bind_group, &[]);
                         pass.draw(0..3, 0..1);
                     }
                 }
                 self.wgpu_queue.submit(Some(encoder.finish()));
+                laps.push((line!(), std::time::Instant::now()));
             }
+
+            let planar_eye = planar_body.zip(planar_rects[eye]).map(|(b, rect)| {
+                let body = &self.water_bodies[b];
+                let surface = body.uniform.extinction[3] - self.player.offset.y;
+                let (mirror_vp, mirror_eye) = crate::renderer::planar_water::mirror_camera(view, proj, surface);
+                let mirror_vp = fold * mirror_vp;
+                let planar_post = crate::renderer::uniforms::PostUpload {
+                    exposure: post.exposure * crate::renderer::planar_water::HEADROOM,
+                    tonemap: crate::renderer::tonemap::ToneMapping::None,
+                    night_vision: 0.0,
+                    ..post
+                };
+                self.uniform_buf.write_scene_stereo_to(
+                    &self.wgpu_queue,
+                    &self.uniform_buf.planar_buffer,
+                    [mirror_vp; 2],
+                    [mirror_eye; 2],
+                    &shadow,
+                    &sky_upload,
+                    &planar_post,
+                    &frame_player,
+                    None,
+                );
+                let lane = crate::renderer::planar_water::uniform_lane(true, true, post.exposure, false);
+                self.wgpu_queue.write_buffer(
+                    &body.uniform_buffer,
+                    std::mem::offset_of!(crate::renderer::water_pipeline::WaterUniform, mirror) as u64,
+                    bytemuck::cast_slice(&lane),
+                );
+                (b, mirror_vp, mirror_eye, rect)
+            });
 
             if frame_player.capsules.floor_mirror {
                 use crate::renderer::brush_pipeline::probe_pass;
                 let floor_view = view
                     * mirror::reflection_matrix(glam::Vec3::new(0.0, probe_pass::FLOOR_MIRROR_PLANE, 0.0), glam::Vec3::Y);
                 let floor_proj = Camera::xr_projection(ev.fov, probe_pass::EYE_NEAR, probe_pass::EYE_FAR);
-                let floor_view_proj = Camera::gl_to_wgpu_ndc(floor_proj) * floor_view;
+                let floor_view_proj = fold * Camera::gl_to_wgpu_ndc(floor_proj) * floor_view;
                 let floor_eye = floor_view.inverse().transform_point3(glam::Vec3::ZERO);
 
                 let floor_post = crate::renderer::uniforms::PostUpload {
@@ -1641,12 +2486,12 @@ impl XrRenderer {
                 );
             }
 
-            let eye_view_proj = Camera::gl_to_wgpu_ndc(proj) * view;
+            let eye_view_proj = fold * Camera::gl_to_wgpu_ndc(proj) * view;
             let cam_pos = glam::Vec3::new(ev.pose.position.x, ev.pose.position.y, ev.pose.position.z);
 
             let both_view_proj: [glam::Mat4; 2] = std::array::from_fn(|i| {
                 let v = &eye_views[i];
-                Camera::gl_to_wgpu_ndc(Camera::xr_projection(v.fov, 0.03, 1000.0))
+                fold * Camera::gl_to_wgpu_ndc(Camera::xr_projection(v.fov, 0.03, 1000.0))
                     * Camera::xr_view(v.pose)
             });
             let both_cam_pos: [glam::Vec3; 2] = std::array::from_fn(|i| {
@@ -1691,6 +2536,8 @@ impl XrRenderer {
                     upload.portal_count = 0;
                 }
                 upload.no_trace = !fx.probe_trace;
+
+                upload.open_ground = self.levers.open_reflections;
                 if !fx.reflection_proxies {
                     upload.proxy_count = 0;
                 }
@@ -1698,7 +2545,15 @@ impl XrRenderer {
             };
             let resident = match (resident, self.probe_stream.borrow_mut().as_mut()) {
                 (Some(mut upload), Some(stream)) => {
+                    // Relit probe cubes land here every two seconds; timed for the
+                    // hangs the headset showed while the clock ran (2026-10-20).
+                    let t0 = std::time::Instant::now();
                     stream.resolve(&self.wgpu_queue, &mut upload);
+                    stream.relight(&self.wgpu_device, &self.wgpu_queue, self.tod.probe_daylight.get());
+                    let ms = t0.elapsed().as_secs_f32() * 1000.0;
+                    if ms > 2.0 {
+                        log::info!("TODTIME probe uploads {ms:.1} ms");
+                    }
                     Some(upload)
                 }
                 (resident, _) => resident,
@@ -1753,6 +2608,35 @@ impl XrRenderer {
 
             let player_to_world = glam::Mat4::from_translation(self.player.offset)
                 * glam::Mat4::from_quat(glam::Quat::from_rotation_y(self.player.yaw));
+
+            let model_rooms: Option<Vec<crate::renderer::portal_cull::RoomView>> =
+                if self.levers.model_rooms && fx.portal_culling && !self.cull_rooms.is_empty() {
+                    let world_to_player = player_to_world.inverse();
+                    let eyes: Vec<(glam::Vec3, glam::Mat4)> = if stereo {
+                        both_cam_pos.iter().copied().zip(both_view_proj.iter().copied()).collect()
+                    } else {
+                        vec![(cam_pos, eye_view_proj)]
+                    };
+                    eyes.into_iter()
+                        .map(|(pos, vp)| {
+                            crate::renderer::portal_cull::room_view(
+                                player_to_world.transform_point3(pos),
+                                vp * world_to_player,
+                                vp,
+                                &self.cull_rooms,
+                                &open_portals,
+                            )
+                        })
+                        .collect()
+                } else {
+                    None
+                };
+            let room_shows = |bound: glam::Vec4| {
+                model_rooms.as_ref().map_or(true, |views| {
+                    let world = player_to_world.transform_point3(bound.truncate());
+                    views.iter().any(|v| v.shows(world, bound, crate::renderer::scene_cull::MARGIN))
+                })
+            };
             let in_closed_room = |c: &crate::renderer::shadow::CasterChunk| {
                 let corners = (0..8).map(|i| {
                     player_to_world.transform_point3(glam::Vec3::new(
@@ -1768,13 +2652,30 @@ impl XrRenderer {
                 self.cull_rooms.iter().any(|r| r.closed && lo.cmplt(r.max).all() && r.min.cmplt(hi).all())
             };
 
-            let terrain_chunk_visible = |c: &crate::renderer::shadow::CasterChunk| {
+            let chunk_order: Vec<usize> = {
+                let mut order: Vec<usize> = (0..solid_chunks.len()).collect();
+                if self.levers.ground_near_first || self.levers.ground_near_chunks > 0 {
+                    let near = |k: usize| crate::renderer::scene_cull::distance_squared_to_box(cam_pos, solid_chunks[k].min, solid_chunks[k].max);
+                    order.sort_by(|&a, &b| near(a).total_cmp(&near(b)));
+                }
+                order
+            };
+            let ordered_chunks = || chunk_order.iter().map(|&k| (k, &solid_chunks[k]));
 
-                let through_a_doorway = match &outdoor_frusta {
-                    None => true,
-                    Some(f) => crate::renderer::shadow::chunk_seen(c, f) || in_closed_room(c),
-                };
-                crate::renderer::shadow::chunk_seen(c, &cull_planes) && through_a_doorway
+            let chunk_visible: Vec<bool> = solid_chunks
+                .iter()
+                .enumerate()
+                .map(|(k, c)| {
+
+                    let through_a_doorway = match &outdoor_frusta {
+                        None => true,
+                        Some(f) => crate::renderer::shadow::chunk_seen(c, f) || in_closed_room(c),
+                    };
+                    crate::renderer::shadow::chunk_seen(c, &cull_planes) && through_a_doorway && !horizon_hidden.get(k).copied().unwrap_or(false)
+                })
+                .collect();
+            let terrain_chunk_visible = |c: &crate::renderer::shadow::CasterChunk| {
+                solid_chunks.binary_search_by_key(&c.first_index, |s| s.first_index).is_ok_and(|k| chunk_visible[k])
             };
             let probes_arg =
                 if !fx.probes { Some(&no_probes) } else { resident.as_ref() };
@@ -1913,6 +2814,141 @@ impl XrRenderer {
                     }
                 }
 
+                if let Some((_, mirror_vp, _, rect)) = planar_eye {
+                    use crate::renderer::planar_water;
+                    let target = &self.planar_targets[eye];
+                    let planes = [crate::renderer::shadow::frustum_planes(mirror_vp)];
+                    let s = dyn_scale;
+                    let rect = [s * rect[0] + s - 1.0, s * rect[1] + 1.0 - s, s * rect[2] + s - 1.0, s * rect[3] + 1.0 - s];
+                    let (sx, sy, sw, sh) = planar_water::scissor(rect, self.planar_size.0, self.planar_size.1);
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("planar_water"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &target.color_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &target.depth_view,
+                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+                    if sw > 0 && sh > 0 {
+                        pass.set_scissor_rect(sx, sy, sw, sh);
+                        let group = &self.uniform_buf.planar_bind_group;
+
+                        if let Some((index_start, count)) = terrain_range {
+                            pass.set_pipeline(&self.terrain_mirror.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                            pass.set_vertex_buffer(0, solid_vb.slice(..));
+                            pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                            if ground_partitioned {
+
+                                let mut shaped_bound = false;
+                                for c in solid_chunks.iter().filter(|c| crate::renderer::shadow::chunk_seen(c, &planes)) {
+                                    let coarse = c.first_index >= ground_coarse_from;
+                                    if coarse != shaped_bound {
+                                        pass.set_pipeline(self.terrain_mirror.at(coarse));
+                                        shaped_bound = coarse;
+                                    }
+                                    pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+                                }
+                            } else {
+                                let count = ground_step1.map_or(count, |step1| step1.min(count));
+                                pass.draw_indexed(index_start..index_start + count, 0, 0..1);
+                            }
+                        }
+
+                        if solid_any {
+                            pass.set_pipeline(&self.mirror_solid_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_vertex_buffer(0, solid_vb.slice(..));
+                            pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
+                            for (lightmap_key, index_start, count, _) in &solid_ranges {
+                                if terrain_range == Some((*index_start, *count)) {
+                                    continue;
+                                }
+                                pass.set_bind_group(1, self.cuboid_lightmap_bg(lightmap_key.as_deref()), &[]);
+                                pass.draw_indexed(*index_start..*index_start + *count, 0, 0..1);
+                            }
+                        }
+                        if let Some((vb, ib, count)) = &brush_buffers {
+                            pass.set_pipeline(&self.brush_mirror_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
+                            pass.set_bind_group(2, self.brush_lightmap_bg(), &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
+
+                        let layered: Vec<&LayeredDraw> = layered_draws
+                            .iter()
+                            .chain(mirror_only_layered_draws.iter())
+                            .filter(|d| crate::renderer::scene_cull::sees_box(&planes, d.5))
+                            .collect();
+                        if !layered.is_empty() {
+                            pass.set_pipeline(&self.layered_mesh_mirror_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                            for (model_bg, vb, ib, count, _, _) in layered {
+                                pass.set_bind_group(2, *model_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
+                        }
+                        self.baked_cave_pipelines.draw_mirror(
+                            &mut pass,
+                            group,
+                            &self.terrain_material.bind_group,
+                            baked_cave_draws
+                                .iter()
+                                .chain(mirror_only_baked_caves.iter())
+                                .filter(|d| crate::renderer::scene_cull::sees_box(&planes, d.bounds)),
+                        );
+
+                        let near_model = |d: &&MeshDraw| {
+                            crate::renderer::scene_cull::sees(&planes, d.bound)
+                                && (d.bound.truncate() - cam_pos).length() - d.bound.w < planar_water::MODEL_REACH
+                        };
+                        let models: Vec<&MeshDraw> = mesh_draws.iter().chain(mirror_only_mesh_draws.iter()).filter(near_model).collect();
+                        if !models.is_empty() {
+                            pass.set_pipeline(&self.mirror_mesh_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            for d in models {
+                                pass.set_bind_group(1, d.model, &[]);
+                                pass.set_bind_group(2, d.texture, &[]);
+                                pass.set_bind_group(3, d.lightmap, &[]);
+                                pass.set_vertex_buffer(0, d.vertices.slice(..));
+                                pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..d.count, 0, 0..1);
+                            }
+                        }
+                        if !skinned_draws.is_empty() || !mirror_only_skinned_draws.is_empty() {
+                            pass.set_pipeline(&self.skinned_mesh_mirror_pipeline.pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in skinned_draws.iter().chain(mirror_only_skinned_draws.iter()) {
+                                pass.set_bind_group(1, *model_bg, &[]);
+                                pass.set_bind_group(2, *tex_bg, &[]);
+                                pass.set_bind_group(3, *joint_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
+                        }
+
+                        pass.set_pipeline(self.sky_mirror_pipeline.pick(&self.sky));
+                        pass.set_bind_group(0, group, &[]);
+                        pass.set_bind_group(1, &self.sky.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                }
+
                 if frame_player.capsules.floor_mirror {
                     let target = &self.probe_pass_targets[eye];
                     {
@@ -1933,9 +2969,10 @@ impl XrRenderer {
                             timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(12 + eye)),
                             ..Default::default()
                         });
+                        if dyn_scale < 1.0 { let (w, h) = scaled(target.width, target.height); pass.set_scissor_rect(0, 0, w, h); }
                         pass.set_pipeline(&self.floor_mirror_skinned.pipeline);
                         pass.set_bind_group(0, &self.uniform_buf.twin_bind_group, &[]);
-                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in skinned_draws.iter().chain(mirror_only_skinned_draws.iter()) {
+                        for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in skinned_draws.iter().chain(mirror_only_skinned_draws.iter()) {
                             pass.set_bind_group(1, *model_bg, &[]);
                             pass.set_bind_group(2, *tex_bg, &[]);
                             pass.set_bind_group(3, *joint_bg, &[]);
@@ -2001,6 +3038,39 @@ impl XrRenderer {
                             timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(8 + eye)),
                             ..Default::default()
                         });
+                        if dyn_scale < 1.0 { let (w, h) = scaled(t.width, t.height); pass.set_scissor_rect(0, 0, w, h); }
+
+                        if let (Some(t), false, true) = (&self.cave_twins, stereo, self.levers.cave_occluder) {
+                            let inside = |(lo, hi): &(glam::Vec3, glam::Vec3)| cam_pos.cmpge(*lo).all() && cam_pos.cmple(*hi).all();
+                            if layered_draws.iter().any(|d| inside(&d.5)) {
+                                pass.set_pipeline(&t.occluder);
+                                pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                                pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
+                                for (model_bg, vb, ib, count, _, _) in layered_draws.iter().filter(|d| inside(&d.5)) {
+                                    pass.set_bind_group(2, *model_bg, &[]);
+                                    pass.set_vertex_buffer(0, vb.slice(..));
+                                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                    pass.draw_indexed(0..*count, 0, 0..1);
+                                }
+                            }
+                        }
+
+                        if !stereo && self.levers.cave_occluder {
+                            self.baked_cave_pipelines.draw_occluders(
+                                &mut pass, &self.uniform_buf.bind_group, &baked_cave_draws, cam_pos,
+
+                                (self.levers.cave_chunk_cull && self.levers.scene_cull).then_some(&cull_planes[..]),
+                            );
+                        }
+
+                        if !stereo && self.levers.probe_prepass {
+                            pass.set_pipeline(&self.brush_probe_depth_prepass.pipeline);
+                            pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                            pass.set_bind_group(1, &self.brush_materials.bind_group, &[]);
+                            pass.set_vertex_buffer(0, vb.slice(..));
+                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
                         pass.set_pipeline(&probe_pipeline.pipeline);
 
                         if probe_pipeline.reads_immediates {
@@ -2042,23 +3112,151 @@ impl XrRenderer {
                                     && self.terrain_inlined.is_none()
                                     && self.weather.as_ref().is_some_and(|w| w.weathered(c.first_index - index_start))
                             };
-                            if solid_chunks.is_empty() {
+
+                            let outdoor_twins = self
+                                .terrain_outdoor_passes
+                                .as_ref()
+                                .filter(|_| self.levers.outdoor_pass && self.terrain_cut_pipeline.is_none() && self.terrain_inlined.is_none());
+                            let outdoor_frame = outdoor_twins.and_then(|_| {
+                                crate::renderer::outdoor_pass::OutdoorFrame::new(self.uniform_buf.probes_or_level(probes_arg))
+                            });
+
+                            let nowhere_twins = self
+                                .terrain_nowhere_passes
+                                .as_ref()
+                                .filter(|_| self.levers.nowhere_pass && self.terrain_cut_pipeline.is_none() && self.terrain_inlined.is_none());
+
+                            let open_ground = {
+                                let table = self.uniform_buf.probes_or_level(probes_arg);
+                                table.open_ground && !table.no_trace
+                            };
+                            let nowhere_twins = match self.terrain_open_passes.as_ref() {
+                                Some(open) if open_ground && self.terrain_cut_pipeline.is_none() && self.terrain_inlined.is_none() => Some(open),
+
+                                None if open_ground => None,
+                                _ => nowhere_twins,
+                            };
+                            let nowhere_frame = nowhere_twins
+                                .map(|_| crate::renderer::outdoor_pass::NowhereFrame::new(self.uniform_buf.probes_or_level(probes_arg)));
+                            let nowhere = |c: &crate::renderer::shadow::CasterChunk| {
+                                nowhere_frame.as_ref().is_some_and(|f| {
+                                    let (lo, hi) =
+                                        crate::renderer::outdoor_pass::world_box(self.player.offset, self.player.yaw, c.min, c.max);
+                                    f.holds(lo, hi)
+                                })
+                            };
+
+                            let outdoors = |c: &crate::renderer::shadow::CasterChunk| {
+                                outdoor_frame.as_ref().is_some_and(|f| {
+                                    let (lo, hi) =
+                                        crate::renderer::outdoor_pass::world_box(self.player.offset, self.player.yaw, c.min, c.max);
+                                    f.holds(lo, hi)
+                                })
+                            };
+
+                            let class_split = self.slope_split.as_ref().filter(|s| {
+                                self.levers.ground_classes
+                                    && self.terrain_gentle.is_some()
+                                    && s.has_classes()
+                                    && self.terrain_cut_pipeline.is_none()
+                                    && self.terrain_inlined.is_none()
+                            });
+                            let outdoor_twins = outdoor_twins.filter(|_| outdoor_frame.is_some());
+                            let (outdoors_drawn, nowhere_drawn) = (outdoor_twins.is_some(), nowhere_twins.is_some());
+                            use crate::renderer::outdoor_pass::{GROUND_FULL, GROUND_NOWHERE, GROUND_OUTDOORS};
+                            let runs = |k: usize, c: &crate::renderer::shadow::CasterChunk, class: usize| -> ([(u32, u32); 4], usize) {
+                                let whole = ([(c.first_index, c.index_count), (0, 0), (0, 0), (0, 0)], 1);
+                                let none = ([(0, 0); 4], 0);
+                                let chunks_class = if nowhere(c) {
+                                    GROUND_NOWHERE
+                                } else if outdoors(c) {
+                                    GROUND_OUTDOORS
+                                } else {
+                                    GROUND_FULL
+                                };
+                                match (chunks_class, class_split) {
+                                    (GROUND_FULL, Some(split)) => {
+                                        let pick = [
+                                            class == GROUND_FULL,
+                                            if outdoors_drawn { class == GROUND_OUTDOORS } else { class == GROUND_FULL },
+                                            if nowhere_drawn { class == GROUND_NOWHERE } else { class == GROUND_FULL },
+                                        ];
+                                        let (mut r, n) = split.class_ranges(unit_of(k), pick);
+                                        r[..n].iter_mut().for_each(|run| run.0 += c.first_index);
+                                        (r, n)
+                                    }
+                                    (found, _) if found == class => whole,
+                                    _ => none,
+                                }
+                            };
+                            if !ground_partitioned {
                                 pass.draw_indexed(index_start..index_start + count, 0, 0..1);
                             } else {
-                                for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && !weathered(c)) {
-                                    pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
-                                }
-                                if let Some(w) = self.weather.as_ref().filter(|_| solid_chunks.iter().any(|c| weathered(c))) {
-                                    let dedup = w.dedup_passes.as_ref().filter(|_| self.levers.pass_dedup);
-                                    pass.set_pipeline(match (dedup, poolless) {
-                                        (Some([_, p]), true) => &p.pipeline,
-                                        (Some([p, _]), false) => &p.pipeline,
-                                        (None, true) => &w.twins.pass_poolless.pipeline,
-                                        (None, false) => &w.twins.pass.pipeline,
-                                    });
-                                    pass.set_bind_group(2, &w.maps.bind_group, &[]);
-                                    for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c) && weathered(c)) {
-                                        pass.draw_indexed(c.first_index..c.first_index + c.index_count, 0, 0..1);
+
+                                for wet in [false, true] {
+                                    let weather = self.weather.as_ref().filter(|_| wet && solid_chunks.iter().any(|c| weathered(c)));
+                                    if wet {
+                                        let Some(w) = weather else { continue };
+                                        let dedup = w.dedup_passes.as_ref().filter(|_| self.levers.pass_dedup);
+                                        pass.set_pipeline(match (dedup, poolless) {
+                                            (Some([_, p]), true) => &p.pipeline,
+                                            (Some([p, _]), false) => &p.pipeline,
+                                            (None, true) => &w.twins.pass_poolless.pipeline,
+                                            (None, false) => &w.twins.pass.pipeline,
+                                        });
+                                        pass.set_bind_group(2, &w.maps.bind_group, &[]);
+                                    }
+                                    let which = wet as usize;
+
+                                    let wet_open = self.terrain_open_passes.as_ref().filter(|_| wet && self.levers.wet_reflections && nowhere_twins.is_some());
+
+                                    let wet_sky = self.terrain_puddle_pass.as_ref().filter(|_| wet && self.levers.wet_sky && nowhere_twins.is_some());
+
+                                    let mirror = wet_sky.or(wet_open.map(|t| &t[1]));
+                                    let pick: Option<u8> = match (mirror.is_some(), self.levers.puddle_reflections, wet_sky.is_some()) {
+                                        (true, true, _) => Some(0),
+                                        (true, false, true) => Some(1),
+                                        _ => None,
+                                    };
+                                    let mirrors = |c: &crate::renderer::shadow::CasterChunk| {
+                                        use crate::renderer::weather::WeatherKinds::{Both, Snowless};
+                                        let first = c.first_index - index_start;
+                                        self.weather.as_ref().is_some_and(|w| match pick {
+                                            Some(0) => matches!(w.kinds_of(first), Both | Snowless),
+                                            _ => w.films_of(first),
+                                        })
+                                    };
+                                    let nowhere = nowhere_twins.map(|t| &t[which]);
+                                    for (class, twin, only) in [
+                                        (GROUND_FULL, None, None),
+                                        (GROUND_NOWHERE, mirror.or(nowhere), pick.map(|_| true)),
+                                        (GROUND_NOWHERE, nowhere.filter(|_| pick.is_some()), Some(false)),
+                                        (GROUND_OUTDOORS, outdoor_twins.map(|t| &t[which]), None),
+                                    ] {
+                                        if class != GROUND_FULL && twin.is_none() {
+                                            continue;
+                                        }
+
+                                        let drawn_by = twin.or(if wet { None } else { Some(terrain) });
+                                        let mut bound: Option<bool> = if twin.is_none() { Some(false) } else { None };
+
+                                        let class_runs = crate::renderer::ground_lod::merged(
+                                            ordered_chunks()
+                                                .filter(|(_, c)| terrain_chunk_visible(c) && weathered(c) == wet && !only.is_some_and(|want| mirrors(c) != want))
+                                                .flat_map(|(k, c)| {
+                                                    let (r, n) = runs(k, c, class);
+                                                    r.into_iter().take(n)
+                                                }),
+                                        );
+                                        for (first, len) in class_runs {
+                                            for (first, len, coarse) in crate::renderer::terrain_pipeline::by_step(first, len, ground_coarse_from) {
+                                                if let (true, Some(p)) = (bound != Some(coarse), drawn_by) {
+                                                    pass.set_pipeline(p.at(coarse));
+                                                    bound = Some(coarse);
+                                                }
+                                                pass.draw_indexed(first..first + len, 0, 0..1);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2073,16 +3271,23 @@ impl XrRenderer {
                                 self.pass_timers.as_ref().and_then(|t| t.compute_writes(10 + eye)),
                             );
                         }
-                        if let Some((group, _)) = blur {
-
+                        if let Some((groups, _)) = blur {
+                            let prev = reflection_prev[eye].filter(|_| self.levers.reflection_history);
+                            let history = crate::renderer::probe_blur::HistoryUniform::new(eye_view_proj, warp_world_to_player, prev, cam_pos);
+                            self.probe_blur.write_history(&self.wgpu_queue, groups, &history);
+                            let k = reflection_parity[eye];
                             self.probe_blur.dispatch(
                                 &mut encoder,
-                                group,
+                                &groups.groups[k],
                                 (t.width, t.height),
                                 self.pass_timers
                                     .as_ref()
                                     .and_then(|t| t.compute_writes(16 + eye)),
                             );
+                            reflection_parity[eye] = 1 - k;
+                            reflection_prev[eye] = Some((eye_view_proj, warp_world_to_player, dyn_scale));
+                        } else {
+                            reflection_prev[eye] = None;
                         }
                 }
                 }
@@ -2167,6 +3372,7 @@ impl XrRenderer {
                         timestamp_writes: self.pass_timers.as_ref().and_then(|t| t.writes(eye * 2)),
                         ..Default::default()
                     });
+                    if dyn_scale < 1.0 { let (w, h) = scaled(self.width, self.height); pass.set_scissor_rect(0, 0, w, h); }
 
                     if fx.half_viewport {
                         pass.set_viewport(0.0, 0.0, (self.width / 2) as f32, (self.height / 2) as f32, 0.0, 1.0);
@@ -2186,8 +3392,40 @@ impl XrRenderer {
                         pass.draw_indexed(0..*count, 0, 0..1);
                     }
 
-                    if !solid_verts.is_empty() {
-                        pass.set_pipeline(self.sp_solid(stereo));
+                    if let (Some([plain, texels]), false) = (self.sp_body_prepass(stereo), skinned_draws.is_empty()) {
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        for see_through in [false, true] {
+                            pass.set_pipeline(if see_through { texels } else { plain });
+                            for (model_bg, tex_bg, joint_bg, vb, ib, count, _) in skinned_draws.iter().filter(|d| d.6 == see_through) {
+                                pass.set_bind_group(1, *model_bg, &[]);
+                                pass.set_bind_group(2, *tex_bg, &[]);
+                                pass.set_bind_group(3, *joint_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
+                        }
+                    }
+
+                    if self.levers.cave_first && baked_cave_draws.iter().any(|d| d.holds(cam_pos)) {
+                        self.baked_cave_pipelines.draw_scene(
+                            &mut pass,
+                            &self.uniform_buf.bind_group,
+                            &self.terrain_material.bind_group,
+                            &baked_cave_draws,
+                            self.levers.scene_cull.then_some(&cull_planes[..]),
+                            self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed),
+                            stereo,
+                            Some((cam_pos, true)),
+                        );
+                    }
+                    if solid_any {
+
+                        let cuboids_opaque = cuboids
+                            .iter()
+                            .all(|c| matches!(c.style, crate::renderer::cuboid::CuboidStyle::Wireframe) || c.color.3 == 255);
+                        let solid_opaque = self.sp_solid_opaque(stereo).filter(|_| cuboids_opaque);
+                        pass.set_pipeline(solid_opaque.unwrap_or(self.sp_solid(stereo)));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_vertex_buffer(0, solid_vb.slice(..));
                         pass.set_index_buffer(solid_ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -2225,71 +3463,172 @@ impl XrRenderer {
                             (Some(split), Some(_)) if terrain_in_probe_pass && self.slope_twins_on() => Some(&split.gentle),
                             _ => None,
                         };
-                        let gentle_of = |k: usize| gentle_split.and_then(|g| g.get(k).copied()).unwrap_or(0);
+                        let gentle_of = |k: usize| gentle_split.and_then(|g| g.get(unit_of(k)).copied()).unwrap_or(0);
 
                         let steep_split: Option<&[u32]> = match (&self.slope_split, &self.terrain_steep) {
                             (Some(split), Some(_)) if gentle_split.is_some() => Some(&split.steep),
                             _ => None,
                         };
-                        let steep_of = |k: usize| steep_split.and_then(|g| g.get(k).copied()).unwrap_or(0);
+                        let steep_of = |k: usize| steep_split.and_then(|g| g.get(unit_of(k)).copied()).unwrap_or(0);
                         let twin = self.terrain_twin();
-                        if solid_chunks.is_empty() {
+                        if !ground_partitioned {
                             pass.draw_indexed(index_start..index_start + count, 0, 0..1);
                         } else {
-                            for (k, c) in solid_chunks.iter().enumerate() {
-                                if terrain_chunk_visible(c) && !weathered(c) {
-                                    let g = gentle_of(k).min(c.index_count);
-                                    let end = c.index_count - steep_of(k).min(c.index_count - g);
-                                    if g < end {
-                                        pass.draw_indexed(c.first_index + g..c.first_index + end, 0, 0..1);
+
+                            let near_walk = if self.levers.ground_near_first { usize::MAX } else { self.levers.ground_near_chunks as usize };
+                            if near_walk > 0 || self.levers.ground_steep_first {
+
+                                let mixed = if terrain_in_probe_pass { self.terrain_reader() } else { self.sp_terrain_twins(stereo) };
+                                let gentle = self.terrain_gentle.as_ref().filter(|_| gentle_split.is_some());
+                                let steep = self.terrain_steep.as_ref().filter(|_| steep_split.is_some());
+
+                                let mut bound = (0usize, false);
+                                let reader = |which: usize, coarse: bool| match (which, gentle, steep) {
+                                    (1, Some(gentle), _) => gentle[twin].at(coarse),
+                                    (2, _, Some(steep)) => steep[twin].at(coarse),
+                                    _ => mixed.at(coarse),
+                                };
+
+                                let ranges = |k: usize, c: &crate::renderer::shadow::CasterChunk| {
+                                    let g = if gentle.is_some() { gentle_of(k).min(c.index_count) } else { 0 };
+                                    let st = if steep.is_some() { steep_of(k).min(c.index_count - g) } else { 0 };
+                                    let end = c.index_count - st;
+                                    [(1usize, 0..g), (0, g..end), (2, end..c.index_count)]
+                                };
+                                let mut far: Vec<(usize, &crate::renderer::shadow::CasterChunk)> = Vec::new();
+                                let mut walked = 0usize;
+                                for (k, c) in ordered_chunks() {
+                                    if !terrain_chunk_visible(c) {
+                                        terrain_culled += c.index_count;
+                                        continue;
+                                    }
+                                    if weathered(c) {
+                                        continue;
                                     }
                                     terrain_drawn += c.index_count;
-                                } else if !terrain_chunk_visible(c) {
-                                    terrain_culled += c.index_count;
-                                }
-                            }
-                            if let Some(gentle) = self.terrain_gentle.as_ref().filter(|_| gentle_split.is_some()) {
-                                let mut bound = false;
-                                for (k, c) in solid_chunks.iter().enumerate() {
-                                    let g = gentle_of(k).min(c.index_count);
-                                    if g > 0 && terrain_chunk_visible(c) && !weathered(c) {
-                                        if !bound {
-                                            pass.set_pipeline(&gentle[twin].pipeline);
-                                            bound = true;
+                                    if walked >= near_walk {
+                                        far.push((k, c));
+                                        continue;
+                                    }
+                                    walked += 1;
+                                    let coarse = c.first_index >= ground_coarse_from;
+                                    for (which, range) in ranges(k, c) {
+                                        if range.is_empty() {
+                                            continue;
                                         }
-                                        pass.draw_indexed(c.first_index..c.first_index + g, 0, 0..1);
+                                        if bound != (which, coarse) {
+                                            pass.set_pipeline(reader(which, coarse));
+                                            bound = (which, coarse);
+                                        }
+                                        pass.draw_indexed(c.first_index + range.start..c.first_index + range.end, 0, 0..1);
                                     }
                                 }
-                            }
-                            if let Some(steep) = self.terrain_steep.as_ref().filter(|_| steep_split.is_some()) {
-                                let mut bound = false;
-                                for (k, c) in solid_chunks.iter().enumerate() {
-                                    let g = gentle_of(k).min(c.index_count);
-                                    let st = steep_of(k).min(c.index_count - g);
-                                    if st > 0 && terrain_chunk_visible(c) && !weathered(c) {
-                                        if !bound {
-                                            pass.set_pipeline(&steep[twin].pipeline);
-                                            bound = true;
+
+                                for which in crate::renderer::ground_twins::reader_order(self.levers.ground_steep_first) {
+                                    let reader_runs = crate::renderer::ground_lod::merged(far.iter().map(|(k, c)| {
+                                        let range = ranges(*k, c)[match which { 1 => 0, 0 => 1, _ => 2 }].1.clone();
+                                        (c.first_index + range.start, range.end - range.start)
+                                    }));
+                                    for (first, len) in reader_runs {
+                                        for (first, len, coarse) in crate::renderer::terrain_pipeline::by_step(first, len, ground_coarse_from) {
+                                            if bound != (which, coarse) {
+                                                pass.set_pipeline(reader(which, coarse));
+                                                bound = (which, coarse);
+                                            }
+                                            pass.draw_indexed(first..first + len, 0, 0..1);
                                         }
-                                        pass.draw_indexed(c.first_index + c.index_count - st..c.first_index + c.index_count, 0, 0..1);
+                                    }
+                                }
+                            } else {
+
+                                let mixed = if terrain_in_probe_pass { self.terrain_reader() } else { self.sp_terrain_twins(stereo) };
+                                let mut shaped_bound = false;
+                                for (k, c) in solid_chunks.iter().enumerate() {
+                                    if terrain_chunk_visible(c) && !weathered(c) {
+                                        let g = gentle_of(k).min(c.index_count);
+                                        let end = c.index_count - steep_of(k).min(c.index_count - g);
+                                        if g < end {
+                                            let coarse = c.first_index >= ground_coarse_from;
+                                            if coarse != shaped_bound {
+                                                pass.set_pipeline(mixed.at(coarse));
+                                                shaped_bound = coarse;
+                                            }
+                                            pass.draw_indexed(c.first_index + g..c.first_index + end, 0, 0..1);
+                                        }
+                                        terrain_drawn += c.index_count;
+                                    } else if !terrain_chunk_visible(c) {
+                                        terrain_culled += c.index_count;
+                                    }
+                                }
+                                if let Some(gentle) = self.terrain_gentle.as_ref().filter(|_| gentle_split.is_some()) {
+                                    let mut bound: Option<bool> = None;
+                                    for (k, c) in solid_chunks.iter().enumerate() {
+                                        let g = gentle_of(k).min(c.index_count);
+                                        if g > 0 && terrain_chunk_visible(c) && !weathered(c) {
+                                            let coarse = c.first_index >= ground_coarse_from;
+                                            if bound != Some(coarse) {
+                                                pass.set_pipeline(gentle[twin].at(coarse));
+                                                bound = Some(coarse);
+                                            }
+                                            pass.draw_indexed(c.first_index..c.first_index + g, 0, 0..1);
+                                        }
+                                    }
+                                }
+                                if let Some(steep) = self.terrain_steep.as_ref().filter(|_| steep_split.is_some()) {
+                                    let mut bound: Option<bool> = None;
+                                    for (k, c) in solid_chunks.iter().enumerate() {
+                                        let g = gentle_of(k).min(c.index_count);
+                                        let st = steep_of(k).min(c.index_count - g);
+                                        if st > 0 && terrain_chunk_visible(c) && !weathered(c) {
+                                            let coarse = c.first_index >= ground_coarse_from;
+                                            if bound != Some(coarse) {
+                                                pass.set_pipeline(steep[twin].at(coarse));
+                                                bound = Some(coarse);
+                                            }
+                                            pass.draw_indexed(c.first_index + c.index_count - st..c.first_index + c.index_count, 0, 0..1);
+                                        }
                                     }
                                 }
                             }
                             if let Some(w) = self.weather.as_ref().filter(|_| solid_chunks.iter().any(|c| weathered(c))) {
 
                                 let gentle_w = |k: usize| if w.gentle.is_empty() { 0 } else { gentle_of(k) };
+
+                                let wet = w.wet.as_ref().filter(|_| self.levers.wet_steep_twins && !w.gentle.is_empty());
+                                let wet_only = |c: &crate::renderer::shadow::CasterChunk| {
+                                    wet.is_some() && w.kinds_of(c.first_index - index_start) == crate::renderer::weather::WeatherKinds::WetOnly
+                                };
                                 pass.set_pipeline(&self.terrain_weather_reader(w).pipeline);
                                 pass.set_bind_group(2, &w.maps.bind_group, &[]);
-                                for (k, c) in solid_chunks.iter().enumerate().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
+                                for (k, c) in ordered_chunks().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
                                     let g = gentle_w(k).min(c.index_count);
-                                    if g < c.index_count {
+                                    if g < c.index_count && !wet_only(c) {
                                         pass.draw_indexed(c.first_index + g..c.first_index + c.index_count, 0, 0..1);
                                     }
                                     terrain_drawn += c.index_count;
                                 }
+                                if let Some(wet) = wet {
+
+                                    for which in 0..2 {
+                                        let mut bound = false;
+                                        for (k, c) in ordered_chunks().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c) && wet_only(c)) {
+                                            let g = gentle_w(k).min(c.index_count);
+                                            let end = c.index_count - steep_of(k).min(c.index_count - g);
+                                            let range = if which == 0 { g..end } else { end..c.index_count };
+                                            if range.is_empty() {
+                                                continue;
+                                            }
+                                            if !bound {
+                                                pass.set_pipeline(&wet[which][twin].pipeline);
+                                                bound = true;
+                                            }
+                                            pass.draw_indexed(c.first_index + range.start..c.first_index + range.end, 0, 0..1);
+                                        }
+                                    }
+                                }
                                 for kinds in crate::renderer::weather::WeatherKinds::ALL {
                                     let mut bound = false;
-                                    for (k, c) in solid_chunks.iter().enumerate().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
+                                    for (k, c) in ordered_chunks().filter(|(_, c)| terrain_chunk_visible(c) && weathered(c)) {
                                         let g = gentle_w(k).min(c.index_count);
                                         if g == 0 || w.kinds_of(c.first_index - index_start) != kinds {
                                             continue;
@@ -2312,9 +3651,11 @@ impl XrRenderer {
                             };
                             log::info!(
                                 "TERRAINCULL: drew {terrain_drawn} of {total} indices \
-                                 ({pct:.1}% culled) over {} chunks, {} frustum(s)",
+                                 ({pct:.1}% culled) over {} chunks, {} frustum(s); {} chunk(s) and {} water behind the ground",
                                 solid_chunks.len(),
                                 cull_planes.len(),
+                                horizon_hidden.iter().filter(|h| **h).count(),
+                                horizon_water.iter().filter(|h| **h).count(),
                             );
                         }
                     }
@@ -2352,17 +3693,47 @@ impl XrRenderer {
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
                     }
+
+                    let scene_cull = self.levers.scene_cull;
+                    let mesh_seen =
+                        |d: &MeshDraw| !scene_cull || (crate::renderer::scene_cull::sees(&cull_planes, d.bound) && room_shows(d.bound));
                     if !layered_draws.is_empty() {
 
                         pass.set_pipeline(self.sp_layered(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.terrain_material.bind_group, &[]);
-                        for (model_bg, vb, ib, count) in &layered_draws {
+
+                        let twins = self.cave_twins.as_ref().filter(|_| !stereo && self.levers.cave_twins);
+                        for (model_bg, vb, ib, count, ends, bounds) in &layered_draws {
+                            if self.levers.scene_cull && !crate::renderer::scene_cull::sees_box(&cull_planes, *bounds) {
+                                continue;
+                            }
                             pass.set_bind_group(2, *model_bg, &[]);
                             pass.set_vertex_buffer(0, vb.slice(..));
                             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..*count, 0, 0..1);
+                            match (twins, ends) {
+                                (Some(t), Some(ends)) if ends[3] == *count => {
+                                    t.draw(&mut pass, self.sp_layered(stereo), *ends)
+                                }
+                                _ => {
+                                    pass.set_pipeline(self.sp_layered(stereo));
+                                    pass.draw_indexed(0..*count, 0, 0..1);
+                                }
+                            }
                         }
+                    }
+
+                    if !baked_cave_draws.is_empty() {
+                        self.baked_cave_pipelines.draw_scene(
+                            &mut pass,
+                            &self.uniform_buf.bind_group,
+                            &self.terrain_material.bind_group,
+                            &baked_cave_draws,
+                            self.levers.scene_cull.then_some(&cull_planes[..]),
+                            self.spotless_frame.load(std::sync::atomic::Ordering::Relaxed),
+                            stereo,
+                            self.levers.cave_first.then_some((cam_pos, false)),
+                        );
                     }
                     if !wire_verts.is_empty() {
                         pass.set_pipeline(self.sp_wire(stereo));
@@ -2372,10 +3743,11 @@ impl XrRenderer {
                         pass.draw_indexed(0..wire_idx.len() as u32, 0, 0..1);
                     }
                     if !mesh_draws.is_empty() {
-                        pass.set_pipeline(self.sp_mesh(stereo));
+
+                        pass.set_pipeline(self.sp_mesh_opaque(stereo).unwrap_or(self.sp_mesh(stereo)));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
 
-                        for d in mesh_draws.iter().filter(|d| !d.blended) {
+                        for d in mesh_draws.iter().filter(|d| !d.blended && mesh_seen(d)) {
                             let (ib, count) = match (d.thin, thin_pass) {
                                 (Some(t), true) => (&t.solid_index_buffer, t.solid_count),
                                 _ => (d.indices, d.count),
@@ -2392,16 +3764,39 @@ impl XrRenderer {
                         }
                     }
                     if !skinned_draws.is_empty() {
-                        pass.set_pipeline(self.sp_skinned(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for (model_bg, tex_bg, joint_bg, vb, ib, count) in &skinned_draws {
-                            pass.set_bind_group(1, *model_bg, &[]);
-                            pass.set_bind_group(2, *tex_bg, &[]);
-                            pass.set_bind_group(3, *joint_bg, &[]);
-                            pass.set_vertex_buffer(0, vb.slice(..));
-                            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..*count, 0, 0..1);
+
+                        let blended_body = self.sp_skinned(stereo);
+                        let runs: [Option<(Option<bool>, &wgpu::RenderPipeline)>; 2] = match self.sp_skinned_opaque(stereo) {
+                            Some(opaque) => [Some((Some(false), opaque)), Some((Some(true), blended_body))],
+                            None => [Some((None, blended_body)), None],
+                        };
+                        for (which, pipeline) in runs.into_iter().flatten() {
+                            let mut set = false;
+                            for (model_bg, tex_bg, joint_bg, vb, ib, count, blended) in &skinned_draws {
+                                if which.is_some_and(|w| w != *blended) {
+                                    continue;
+                                }
+                                if !set {
+                                    pass.set_pipeline(pipeline);
+                                    set = true;
+                                }
+                                pass.set_bind_group(1, *model_bg, &[]);
+                                pass.set_bind_group(2, *tex_bg, &[]);
+                                pass.set_bind_group(3, *joint_bg, &[]);
+                                pass.set_vertex_buffer(0, vb.slice(..));
+                                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
                         }
+                    }
+
+                    let sky_first = self.levers.sky_before_water && eye_in_water.is_none();
+                    if sky_first {
+                        pass.set_pipeline(self.sp_sky(stereo));
+                        pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
+                        pass.set_bind_group(1, &self.sky.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
                     }
 
                     if let Some((b, state)) = eye_in_water {
@@ -2419,7 +3814,7 @@ impl XrRenderer {
                     }
                     let wholly_under = matches!(eye_in_water, Some((_, EyeWater::Under)));
                     if fx.water && self.water_bodies.iter().any(|b| b.seen.get()) {
-                        pass.set_pipeline(self.sp_water(stereo));
+                        pass.set_pipeline(self.sp_water(stereo, crate::renderer::water_pipeline::WaterMud::Prints));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         for (i, body) in self.water_bodies.iter().enumerate().filter(|(_, b)| b.seen.get()) {
                             let eyes_body = eye_in_water.is_some_and(|(b, _)| b == i);
@@ -2427,15 +3822,28 @@ impl XrRenderer {
                                 continue;
                             }
 
-                            pass.set_pipeline(if eyes_body { &self.water_pipeline.waterline } else { self.sp_water(stereo) });
+                            if planar_eye.is_some_and(|p| p.0 == i) {
+                                pass.set_pipeline(self.water_pipeline.mirrored_for_rings(&body.uniform.rings[0], &body.uniform.ring_drops, crate::renderer::water_pipeline::WaterMud::of(&body.uniform)));
+                                pass.set_bind_group(2, &self.planar_groups[eye], &[]);
+                            } else {
+                                let mud = crate::renderer::water_pipeline::WaterMud::of(&body.uniform);
+                                pass.set_pipeline(if eyes_body { self.water_pipeline.waterline_for(mud) } else { self.sp_water(stereo, mud) });
+                            }
                             pass.set_bind_group(1, &body.bind_groups[body.waves.current()], &[]);
                             pass.set_vertex_buffer(0, body.vertex_buffer.slice(..));
                             pass.set_index_buffer(body.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..body.index_count, 0, 0..1);
+
+                            if eyes_body {
+                                pass.draw_indexed(0..body.index_count, 0, 0..1);
+                            } else {
+                                for range in body.ranges.borrow().iter() {
+                                    pass.draw_indexed(range.clone(), 0, 0..1);
+                                }
+                            }
                         }
                     }
 
-                    if !wholly_under {
+                    if !wholly_under && !sky_first {
                         pass.set_pipeline(self.sp_sky(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
                         pass.set_bind_group(1, &self.sky.bind_group, &[]);
@@ -2456,7 +3864,7 @@ impl XrRenderer {
                     if thin_pass {
                         pass.set_pipeline(self.sp_mesh_thin(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for d in mesh_draws.iter().filter(|d| !d.blended) {
+                        for d in mesh_draws.iter().filter(|d| !d.blended && mesh_seen(d)) {
                             let Some(t) = d.thin else { continue };
                             pass.set_bind_group(1, d.model, &[]);
                             pass.set_bind_group(2, d.texture, &[]);
@@ -2471,7 +3879,7 @@ impl XrRenderer {
                     if mesh_draws.iter().any(|d| d.blended) {
                         pass.set_pipeline(self.sp_mesh(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);
-                        for d in mesh_draws.iter().filter(|d| d.blended) {
+                        for d in mesh_draws.iter().filter(|d| d.blended && mesh_seen(d)) {
                             pass.set_bind_group(1, d.model, &[]);
                             pass.set_bind_group(2, d.texture, &[]);
                             pass.set_bind_group(3, d.lightmap, &[]);
@@ -2519,6 +3927,7 @@ impl XrRenderer {
 
                 if stereo && eye == 0 {
                     self.wgpu_queue.submit(Some(encoder.finish()));
+                    laps.push((line!(), std::time::Instant::now()));
                     encoder = self.wgpu_device.create_command_encoder(
                         &wgpu::CommandEncoderDescriptor { label: Some("ssr_eye_after_stereo") },
                     );
@@ -2600,6 +4009,7 @@ impl XrRenderer {
                 }
                 }
                 self.wgpu_queue.submit(Some(encoder.finish()));
+                laps.push((line!(), std::time::Instant::now()));
             }
 
             if let Some(sw) = self.space_warp.as_ref() {
@@ -2610,7 +4020,9 @@ impl XrRenderer {
                     let reflect_group = sw.reflect_groups.get(image_index).map(|g| &g[eye]).filter(|_| warp_reflections);
                     if let Some((vb, ib, n)) = brush_buffers.as_ref() {
                         let kind = if reflect_group.is_some() { MotionKind::BrushReflect } else { MotionKind::Brush };
-                        let brush = |first: u32, count: u32| MotionDraw { kind, vertices: vb, indices: ib, first, count, slot: base, joints: reflect_group };
+
+                        let slot = if warp_brush_world { base + warp_brush_slot } else { base };
+                        let brush = |first: u32, count: u32| MotionDraw { kind, vertices: vb, indices: ib, first, count, slot, joints: reflect_group };
                         match brush_motion_ranges.as_ref() {
                             Some(ranges) => draws.extend(ranges[eye].iter().map(|&(first, count)| brush(first, count))),
                             None => draws.push(brush(0, *n)),
@@ -2627,13 +4039,22 @@ impl XrRenderer {
                         joints: None,
                     };
                     match terrain_range {
-                        Some((start, _)) if !solid_chunks.is_empty() => {
-                            draws.push(solid(0, start));
-                            for c in solid_chunks.iter().filter(|c| terrain_chunk_visible(c)) {
-                                draws.push(solid(c.first_index, c.index_count));
+                        Some((start, count)) if ground_partitioned => {
+
+                            for (first, n) in [(0, start), (start + count, solid_index_count.saturating_sub(start + count))] {
+                                if n > 0 {
+                                    draws.push(solid(first, n));
+                                }
+                            }
+
+                            let slot = if self.ground_world { base + warp_per_eye - 1 } else { base };
+
+                            let seen = ground_wholes.runs(&solid_chunks, |k| terrain_chunk_visible(&solid_chunks[k]));
+                            for (first, count) in seen {
+                                draws.push(MotionDraw { slot, ..solid(first, count) });
                             }
                         }
-                        _ => draws.push(solid(0, solid_idx.len() as u32)),
+                        _ => draws.push(solid(0, solid_index_count)),
                     }
                     for (i, (inst, _, _)) in warp_meshes.iter().enumerate() {
                         let slot = base + 1 + i as u32;
@@ -2644,6 +4065,10 @@ impl XrRenderer {
                                 crate::renderer::shadow::mesh_caster_bound(&inst.mesh),
                             )
                         {
+                            continue;
+                        }
+
+                        if inst.mesh.skin.is_none() && !room_shows(crate::renderer::shadow::mesh_caster_bound(&inst.mesh)) {
                             continue;
                         }
                         if let Some(skin) = &inst.mesh.skin {
@@ -2662,30 +4087,47 @@ impl XrRenderer {
                         } else {
 
                             for prim in inst.mesh.primitives.iter() {
-                                draws.push(MotionDraw {
-                                    kind: MotionKind::Mesh,
-                                    vertices: &prim.vertex_buffer,
-                                    indices: &prim.index_buffer,
-                                    first: 0,
-                                    count: prim.indices.len() as u32,
-                                    slot,
-                                    joints: None,
-                                });
+
+                                let runs = match &prim.baked_cave {
+                                    Some(cave) if warp_cull && self.levers.cave_chunk_cull => {
+                                        crate::renderer::baked_cave::visible_ranges(
+                                            &cave.chunks,
+                                            inst.mesh.model_matrix(),
+                                            Some(std::slice::from_ref(&warp_planes[eye])),
+                                            None,
+                                        )
+                                    }
+                                    _ => vec![0..prim.indices.len() as u32],
+                                };
+                                for run in runs {
+                                    draws.push(MotionDraw {
+                                        kind: MotionKind::Mesh,
+                                        vertices: &prim.vertex_buffer,
+                                        indices: &prim.index_buffer,
+                                        first: run.start,
+                                        count: run.end - run.start,
+                                        slot,
+                                        joints: None,
+                                    });
+                                }
                             }
                         }
                     }
                     if warp_water {
                         for body in self.water_bodies.iter().filter(|b| b.seen.get()) {
                             let Some(groups) = &body.motion_groups else { continue };
-                            draws.push(MotionDraw {
-                                kind: MotionKind::Water,
-                                vertices: &body.vertex_buffer,
-                                indices: &body.index_buffer,
-                                first: 0,
-                                count: body.index_count,
-                                slot: base + warp_per_eye - 1,
-                                joints: Some(&groups[body.waves.current()]),
-                            });
+
+                            for range in body.ranges.borrow().iter() {
+                                draws.push(MotionDraw {
+                                    kind: MotionKind::Water,
+                                    vertices: &body.vertex_buffer,
+                                    indices: &body.index_buffer,
+                                    first: range.start,
+                                    count: range.end - range.start,
+                                    slot: base + warp_per_eye - 1,
+                                    joints: Some(&groups[body.waves.current()]),
+                                });
+                            }
                         }
                     }
 
@@ -2693,16 +4135,13 @@ impl XrRenderer {
                     let mut particles: Vec<MotionParticles> = Vec::new();
                     if self.levers.space_warp_debug & 262144 == 0 {
                         if let (true, Some(gpu)) = (effects_drawn, self.effects_gpu.as_ref()) {
-                            let (instances, group, over, screened) = gpu.motion_parts();
-                            for (kind, range) in [
-                                (MotionKind::EffectsOver, 0..over),
-                                (MotionKind::EffectsScreened, over..over + screened),
-                            ] {
+                            let (instances, group, runs) = gpu.motion_parts();
+                            for run in runs {
                                 particles.push(MotionParticles {
-                                    kind,
+                                    kind: MotionKind::Effects(run.variant),
                                     instances: Some(instances),
                                     vertices: crate::renderer::effects::VERTICES_PER_PARTICLE,
-                                    range,
+                                    range: run.first..run.first + run.count,
                                     slot: base,
                                     groups: [Some(probe_read_group), Some(group)],
                                 });
@@ -2734,6 +4173,7 @@ impl XrRenderer {
                         &sw.depth_targets[d][eye].view,
                         &draws,
                         &particles,
+                        warp_sky_group.as_ref().filter(|_| self.levers.space_warp_debug & 1 == 0).map(|g| sw.pipelines.sky.draw(g, eye)),
                         self.levers.space_warp_debug & 2048 != 0,
                         if self.levers.space_warp_debug & 4096 != 0 { 0.0 } else { 1.0 },
                     );
@@ -2749,6 +4189,7 @@ impl XrRenderer {
                         );
                     }
                     self.wgpu_queue.submit(Some(encoder.finish()));
+                    laps.push((line!(), std::time::Instant::now()));
 
                     if self.levers.space_warp_debug & 8192 != 0 && eye == 0 {
                         if let Some(rb) = sw.readback.as_ref() {
@@ -2861,8 +4302,11 @@ impl XrRenderer {
             }
 
             self.wgpu_queue.submit(Some(encoder.finish()));
+            laps.push((line!(), std::time::Instant::now()));
 
         }
+        self.reflection_parity = reflection_parity;
+        self.reflection_prev = reflection_prev;
 
         if let Some(sw) = self.space_warp.as_mut() {
             if sw.acquired.is_some() {
@@ -2919,6 +4363,15 @@ impl XrRenderer {
         }
 
         let cpu_time = cpu_start.elapsed();
+        if cpu_time.as_secs_f32() > 0.025 {
+            let mut at = cpu_start;
+            let parts: Vec<String> = laps.iter().map(|&(line, t)| {
+                let s = format!("{line}:{:.1}", t.duration_since(at).as_secs_f32() * 1000.0);
+                at = t;
+                s
+            }).collect();
+            log::info!("FRAMESPIKE cpu {:.1} ms, ms up to each submit: {} rest:{:.1}", cpu_time.as_secs_f32() * 1000.0, parts.join(" "), at.elapsed().as_secs_f32() * 1000.0);
+        }
         let gpu_wait_start = std::time::Instant::now();
 
         let wait = if self.levers.gpu_sync {
@@ -2931,12 +4384,23 @@ impl XrRenderer {
         let outcome = self.frame_stats.record(cpu_time, gpu_time, std::time::Instant::now());
 
         if outcome.measured {
+            for (part, value) in &self.cpu_frame {
+                *self.cpu_window.entry(part).or_default() += value;
+            }
+        }
+        self.cpu_frame.clear();
+
+        if outcome.measured {
             if let Some(metrics) = &self.perf_metrics {
                 self.perf_metric_window.add(&metrics.sample());
             }
         }
 
         if let Some(stats) = outcome.closed {
+            let cpu_parts: std::collections::BTreeMap<String, f64> = std::mem::take(&mut self.cpu_window)
+                .into_iter()
+                .map(|(part, sum)| (part.to_string(), sum / stats.frames.max(1) as f64))
+                .collect();
             let cycling = crate::renderer::perf_ab::ENABLED || self.levers.ab_cycle;
 
             let ab = if self.perf_warmup {
@@ -2981,6 +4445,11 @@ impl XrRenderer {
                     self.debug_view
                 );
             }
+            let heat_was = self.thermal.state().clone();
+            self.thermal.poll();
+            if *self.thermal.state() != heat_was {
+                log::info!("THERMAL {:?}", self.thermal.state());
+            }
             if let Some(log) = &self.perf_log {
                 let cycle_len = crate::renderer::perf_ab::Phase::ALL.len() as u64;
                 let record = crate::perf_record::WindowRecord {
@@ -3003,10 +4472,15 @@ impl XrRenderer {
                     fps: stats.fps,
                     pass: breakdown.iter().flatten().map(|t| (t.label.clone(), t.ms)).collect(),
                     xr: counters.iter().map(|c| (c.short.clone(), c.value)).collect(),
+                    cpu: cpu_parts,
+                    hour: self.time_of_day_hour(),
+                    thermal: self.thermal.state().clone(),
+                    over_budget: self.over_budget,
                 };
                 log.write(record.to_line());
             }
             self.perf_window_index += 1;
+            self.over_budget = 0;
             if self.perf_warmup {
                 self.perf_warmup = false;
             } else {
@@ -3050,9 +4524,9 @@ impl XrRenderer {
                             .image_array_index(i as u32)
                             .image_rect(xr::Rect2Di {
                                 offset: xr::Offset2Di { x: 0, y: 0 },
-                                extent: xr::Extent2Di {
-                                    width: self.width as i32,
-                                    height: self.height as i32,
+                                extent: {
+                                    let (w, h) = crate::renderer::dynamic_resolution::rect(self.width, self.height, self.frame_scale);
+                                    xr::Extent2Di { width: w as i32, height: h as i32 }
                                 },
                             }),
                     );

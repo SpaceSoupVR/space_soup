@@ -15,6 +15,7 @@ pub use texture::{
     create_lightmap_texture, create_lightmap_texture_full, create_lightmap_texture_with_sun, create_mesh_material_texture, LightmapLight,
     create_texture_from_rgba, LoadedTexture, lightmap_mips_f16, write_lightmap_mips,
     LIGHTMAP_MIP_LEVELS, NEUTRAL_BOUNCE_DIRECTION, NEUTRAL_SUN_MASK, SUN_MASK_MIP_LEVELS, set_gltf_roughness, gltf_roughness, material_gloss_alpha,
+    material_images, model_astc_dir, model_astc_path, model_astc_scope, model_image_fingerprint, model_mips, ModelMap,
 };
 pub use clip::{load_clips_for, GltfClip};
 pub use vertex::{MeshPrimitive, MeshVertex, SkinnedMeshVertex};
@@ -49,7 +50,10 @@ impl GltfMesh {
     }
 
     pub fn joint_names(&self) -> &[String] {
-        self.skin.as_ref().map_or(&[], |s| s.joint_names.as_slice())
+        self.skin
+            .as_ref()
+            .map(|s| s.joint_names.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn create_skin_bind_group(
@@ -198,6 +202,7 @@ impl GltfMesh {
                 casts_shadow: false,
                 blended: false,
                 thin: None,
+                baked_cave: None,
             }],
             skin: None,
             position: glam::Vec3::ZERO,
@@ -215,6 +220,7 @@ impl GltfMesh {
     ) -> Result<(Self, Vec<(String, Mat4)>)> {
         let (doc, buffers, images) =
             gltf::import(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let _astc = model_astc_scope(path);
 
         let all_nodes: Vec<gltf::Node> = doc.nodes().collect();
         let mut parent_of_node: HashMap<usize, usize> = HashMap::new();
@@ -227,7 +233,7 @@ impl GltfMesh {
         let mesh_nodes: std::collections::BTreeSet<usize> = all_nodes
             .iter()
             .filter(|n| n.mesh().is_some())
-            .map(gltf::Node::index)
+            .map(|n| n.index())
             .collect();
 
         let mut joint_names: Vec<String> = Vec::new();
@@ -290,7 +296,7 @@ impl GltfMesh {
             "GltfMesh::load_parts: loaded {} parts from {}: {:?}",
             joint_names.len(),
             path.display(),
-            joint_names,
+            &joint_names,
         );
 
         let joint_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -366,6 +372,7 @@ impl GltfMesh {
     ) -> Result<Self> {
         let (doc, buffers, images) =
             gltf::import(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let _astc = model_astc_scope(path);
 
         let all_nodes: Vec<gltf::Node> = doc.nodes().collect();
         let mut parent_of_node: HashMap<usize, usize> = HashMap::new();
@@ -381,7 +388,7 @@ impl GltfMesh {
         let mut joint_local_bind: Vec<(Vec3, Quat, Vec3)> = Vec::new();
         let mut node_index_to_joint: HashMap<usize, usize> = HashMap::new();
 
-        if let Some(skin) = doc.skins().next() {
+        for skin in doc.skins() {
             let joint_nodes: Vec<gltf::Node> = skin.joints().collect();
             let start = joint_names.len();
             joint_names.extend(joint_nodes.iter().map(|j| j.name().unwrap_or("").to_string()));
@@ -412,6 +419,7 @@ impl GltfMesh {
                 joint_parents.push(parent_joint);
                 joint_local_bind.push((t, r, s));
             }
+            break;
         }
 
         let mut orphan_target_nodes: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
@@ -557,7 +565,7 @@ impl GltfMesh {
             skinned_prims.len(),
             path.display(),
             joint_count,
-            joint_names,
+            &joint_names,
         );
 
         let mut skin_opt: Option<GltfSkin> = if joint_count == 0 {
@@ -648,6 +656,7 @@ impl GltfMesh {
     ) -> Result<Self> {
         let (doc, buffers, images) =
             gltf::import(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let _astc = model_astc_scope(path);
 
         let mut static_prims: Vec<MeshPrimitive> = Vec::new();
         let mut skinned_prims: Vec<SkinnedMeshPrimitive> = Vec::new();

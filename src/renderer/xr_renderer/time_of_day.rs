@@ -3,7 +3,7 @@ use std::sync::{mpsc, Arc};
 use super::XrRenderer;
 use crate::renderer::probe_stream::{FixedFaces, ProbeDesc, ProbeSource};
 use crate::renderer::time_of_day::{
-    relight_probe_faces, relit_probe_source, ClockOverride, Prepared, ProbeDaylight, TimeOfDayRuntime, NIGHT_MAX_EXPOSURE,
+    building_daylight_faces, relit_probe_source, ClockOverride, Prepared, ProbeDaylight, TimeOfDayRuntime, NIGHT_MAX_EXPOSURE,
     PROBE_RELIGHT_ANGLE_COS, PROBE_RELIGHT_RATIO,
 };
 use space_soup_sky::time_of_day::{AtlasLayers, TimeOfDayParams};
@@ -36,7 +36,7 @@ pub(super) struct TodState {
     pub last_tick: Option<std::time::Instant>,
 
     pub ground_from: Option<(f32, [f32; 3])>,
-    pub ground_build: Option<mpsc::Receiver<crate::renderer::ground_map::GroundMap>>,
+    pub ground_build: Option<mpsc::Receiver<crate::renderer::ground_map::PreparedGround>>,
 
     pub daylight: f32,
 
@@ -51,6 +51,27 @@ pub(super) struct TodState {
     pub probe_resolution: u32,
 
     pub probe_from: Option<(f32, [f32; 3])>,
+
+    /// The photographs as baked; `room_descs` is them with each room's
+    /// light relit to the time of day (`room_light::relit`).
+    pub room_full: Vec<ProbeDesc>,
+    /// Each photograph's room light by the lamps alone, beside `room_full`.
+    pub room_lamps: Vec<Option<crate::renderer::room_light::RoomLight>>,
+
+    /// When the last snapshot was applied: the next one blends in over the
+    /// time between them (`Sky::apply_snapshot_blended`).
+    pub last_apply: Option<std::time::Instant>,
+    /// The daylight the blend starts from, beside `daylight` it goes to.
+    pub daylight_from: f32,
+    /// The stops the brush atlas on the GPU is stored brighter by
+    /// (`time_of_day::atlas_stops`); 0 for the shipped atlas.
+    pub atlas_stops: f32,
+    /// The daylight the ground map on the GPU was built at (None: not built
+    /// under the clock), and the one the build under way is.
+    pub ground_lit: Option<f32>,
+    pub ground_pending: f32,
+    /// The daylight of this frame, blended between snapshots.
+    pub daylight_now: f32,
 }
 
 const GROUND_RATIO: f32 = 1.5;
@@ -122,6 +143,7 @@ impl XrRenderer {
 
     fn stop_time_of_day(&mut self) {
         self.tod.runtime = None;
+        self.tod.last_apply = None;
         if let Some((pano, rotation, intensity)) = self.tod.photographed.take() {
             let keep = (pano.clone(), rotation, intensity);
             self.sky = crate::renderer::sky::Sky::new(&self.wgpu_device, &self.wgpu_queue, &self.sky_pipeline.layout, &pano, rotation, intensity);
@@ -130,15 +152,18 @@ impl XrRenderer {
         if let (Some((atlas, w, h)), Some(lm)) = (self.tod.shipped_atlas.as_ref(), self.brush_lightmap.as_ref()) {
             crate::renderer::mesh::write_lightmap_mips(&self.wgpu_queue, &lm.texture, &crate::renderer::mesh::lightmap_mips_f16(atlas, *w, *h));
         }
+        self.tod.atlas_stops = 0.0;
         {
             let mut eye = self.eye.borrow_mut();
             eye.set_max_exposure(crate::renderer::exposure::MAX_EXPOSURE);
             eye.relight(self.sky.irradiance, 1.0);
         }
         self.relight_probes(1.0, None);
+        self.tod_relight_rooms(1.0);
         self.set_sun_off_bake(false);
         self.ground_dirty = true;
         self.tod.ground_from = None;
+        self.tod.ground_lit = None;
         log::info!("TIMEOFDAY off: the photographed sky again");
     }
 
@@ -170,6 +195,7 @@ impl XrRenderer {
 
     pub(super) fn tod_brush_atlas_changed(&mut self, shipped: Option<(Vec<f32>, u32, u32)>) {
         self.tod.shipped_atlas = shipped;
+        self.tod.atlas_stops = 0.0;
         self.tod.sunless = None;
         if self.tod.off_bake {
             self.tod.sun_faces_baked = self.sun_faces.take();
@@ -211,23 +237,81 @@ impl XrRenderer {
         let Some(rt) = self.tod.runtime.as_mut() else { return };
         let prepared = rt.advance(dt, lever);
         let seconds = rt.seconds() as f32;
+        // Where the sun, moon and stars are THIS frame (cheap trig): they
+        // glide rather than stepping at each snapshot.
+        let astro = space_soup_sky::time_of_day::Astronomy::at(&rt.params, rt.hour(), rt.params.days_at(rt.seconds()));
+        let t0 = std::time::Instant::now();
+        let applied = prepared.is_some();
         if let Some(p) = prepared {
             self.apply_time_of_day(p);
-        } else {
-            self.sky.set_clock(&self.wgpu_queue, seconds);
         }
+        let t1 = std::time::Instant::now();
+        self.sky.tick(&self.wgpu_queue, seconds, dt, Some(&astro));
+        // The models' room light follows the blend too (`room_light::relit`).
+        let t = self.sky.blend_progress();
+        let daylight_now = self.tod.daylight_from + (self.tod.daylight - self.tod.daylight_from) * t;
+        self.tod_relight_rooms(daylight_now);
+        self.tod.daylight_now = daylight_now;
+        // Relit on the GPU, the probes follow the same blend
+        // (`ProbeStream::relight`, at the frame's `probe_daylight`), and so
+        // does the brightness the reflections are matched by.
+        if self.probe_stream.get_mut().as_ref().is_some_and(|s| s.smooth()) {
+            self.tod.probe_daylight.set(daylight_now);
+            self.tod_probe_brightness();
+        }
+        let t2 = std::time::Instant::now();
+        let ground = self.tod.ground_build.is_some();
         self.poll_ground_rebuild();
+        let t3 = std::time::Instant::now();
+        // The time of day's share of the render thread, where it is felt:
+        // the headset hung for a tenth of a second every few seconds while
+        // the clock ran (user, 2026-10-20).
+        let ms = |a: std::time::Instant, b: std::time::Instant| b.duration_since(a).as_secs_f32() * 1000.0;
+        if ms(t0, t3) > 3.0 {
+            log::info!(
+                "TODTIME {:.1} ms: apply {:.1}{} tick {:.1} ground {:.1}{}",
+                ms(t0, t3),
+                ms(t0, t1),
+                if applied { "" } else { " (none)" },
+                ms(t1, t2),
+                ms(t2, t3),
+                if ground && self.tod.ground_build.is_none() { " (uploaded)" } else { "" },
+            );
+        }
     }
 
     fn apply_time_of_day(&mut self, p: Prepared) {
         let Some(rt) = self.tod.runtime.as_ref() else { return };
         let (seconds, zenith) = (rt.seconds() as f32, rt.zenith_depth);
-        self.sky.apply_snapshot(&self.wgpu_device, &self.wgpu_queue, &self.sky_pipeline.layout, &p.snapshot, seconds, zenith);
+        // Blended in over the time since the last snapshot (none for the first).
+        let now = std::time::Instant::now();
+        let blend = self.tod.last_apply.replace(now).map_or(0.0, |t| now.duration_since(t).as_secs_f32().clamp(0.25, 4.0));
+        self.tod.daylight_from = if blend > 0.0 {
+            let t = self.sky.blend_progress();
+            self.tod.daylight_from + (self.tod.daylight - self.tod.daylight_from) * t
+        } else {
+            p.daylight
+        };
+        let a0 = std::time::Instant::now();
+        self.sky.apply_snapshot_blended(&self.wgpu_device, &self.wgpu_queue, &self.sky_pipeline.layout, &p.snapshot, seconds, zenith, blend);
         self.tod.daylight = p.daylight;
+        let a1 = std::time::Instant::now();
         self.eye.borrow_mut().relight(self.sky.irradiance, p.daylight);
+        let a2 = std::time::Instant::now();
+        let atlas_bytes: usize = p.atlas.as_ref().map_or(0, |c| c.iter().map(|m| m.0.len()).sum());
         if let (Some(chain), Some(lm)) = (p.atlas.as_ref(), self.brush_lightmap.as_ref()) {
             crate::renderer::mesh::write_lightmap_mips(&self.wgpu_queue, &lm.texture, chain);
+            self.tod.atlas_stops = p.atlas_stops;
         }
+        let a3 = std::time::Instant::now();
+        let ms = |a: std::time::Instant, b: std::time::Instant| b.duration_since(a).as_secs_f32() * 1000.0;
+        log::info!(
+            "TODTIME apply: sky {:.1} eye {:.1} atlas {:.1} ms ({} kB)",
+            ms(a0, a1),
+            ms(a1, a2),
+            ms(a2, a3),
+            atlas_bytes / 1024,
+        );
         if self.shadow_diag_frames.get() % 120 == 0 || p.atlas.is_some() {
             log::info!(
                 "TIMEOFDAY {:.3} h: {} up {:.1} deg, daylight x{:.3e}, sky x{:.3e} sun x{:.3e}{}",
@@ -262,7 +346,14 @@ impl XrRenderer {
     }
 
     fn start_ground_rebuild(&mut self, daylight: f32, dir: [f32; 3]) {
-        let Some(h) = self.ground_heights.as_ref() else { return };
+        let Some(rx) = self.ground_map_worker("tod_ground_map") else { return };
+        self.tod.ground_from = Some((daylight, dir));
+        self.tod.ground_pending = daylight;
+        self.tod.ground_build = Some(rx);
+    }
+
+    pub(super) fn ground_map_worker(&self, name: &str) -> Option<mpsc::Receiver<crate::renderer::ground_map::PreparedGround>> {
+        let h = self.ground_heights.as_ref()?;
         let copy = |i: &crate::renderer::terrain_pipeline::TerrainImage| crate::renderer::terrain_pipeline::TerrainImage {
             width: i.width,
             height: i.height,
@@ -277,10 +368,8 @@ impl XrRenderer {
         let settings = self.terrain_settings;
         let sea_line = self.sea_line();
         let (tx, rx) = mpsc::channel();
-        self.tod.ground_from = Some((daylight, dir));
-        self.tod.ground_build = Some(rx);
         std::thread::Builder::new()
-            .name("tod_ground_map".into())
+            .name(name.into())
             .spawn(move || {
                 let map = crate::renderer::ground_map::build(
                     &crate::renderer::ground_map::GroundInputs {
@@ -295,31 +384,74 @@ impl XrRenderer {
                     },
                     crate::renderer::ground_map::GROUND_MAP_SIZE,
                 );
-                let _ = tx.send(map);
+                let _ = tx.send(crate::renderer::ground_map::prepare(map));
             })
-            .ok();
+            .ok()?;
+        Some(rx)
     }
 
     fn poll_ground_rebuild(&mut self) {
         let Some(rx) = self.tod.ground_build.as_ref() else { return };
         match rx.try_recv() {
-            Ok(map) => {
+            Ok(ground) => {
                 self.tod.ground_build = None;
-                let view = crate::renderer::ground_map::upload(&self.wgpu_device, &self.wgpu_queue, &map);
+                self.tod.ground_lit = Some(self.tod.ground_pending);
+                let view = crate::renderer::ground_map::upload_prepared(&self.wgpu_device, &self.wgpu_queue, &ground);
+                let map = &ground.map;
                 let extent = map.max - map.min;
                 self.ground_placement = Some(([map.min.x, map.min.y, 1.0 / extent.x, 1.0 / extent.y], map.top));
                 self.uniform_buf.set_ground_map(view);
                 self.rebind_scene_group();
-                log::info!("TIMEOFDAY ground map relit");
+                // The sun it was lit along, against the static map's
+                // (`SUNSHADOW`): what reflections of the ground show.
+                let d = self.tod.ground_from.map_or([0.0, -1.0, 0.0], |(_, d)| d);
+                log::info!(
+                    "TIMEOFDAY ground map relit along sun {:.3}/{:.3} deg",
+                    d[1].clamp(-1.0, 1.0).asin().to_degrees(),
+                    d[0].atan2(d[2]).to_degrees()
+                );
             }
             Err(mpsc::TryRecvError::Disconnected) => self.tod.ground_build = None,
             Err(mpsc::TryRecvError::Empty) => {}
         }
     }
 
-    pub fn set_probe_lamps(&mut self, lamps: Option<ProbeSource>, building_lamps: Vec<Vec<u8>>) {
+    /// The probes by the lamps alone: their photographs, the buildings' and
+    /// each photograph's room light (`room_lamps`, one per probe, in order).
+    pub fn set_probe_lamps(
+        &mut self,
+        lamps: Option<ProbeSource>,
+        building_lamps: Vec<Vec<u8>>,
+        room_lamps: Vec<Option<crate::renderer::room_light::RoomLight>>,
+    ) {
         self.tod.probe_lamps = lamps;
         self.tod.building_lamps = building_lamps;
+        self.tod.room_lamps = room_lamps;
+    }
+
+    /// The photographs the models take their room light from, baked.
+    pub(super) fn tod_set_room_photographs(&mut self, descs: Vec<ProbeDesc>) {
+        self.tod.room_full = descs;
+        let k = if self.tod.runtime.is_some() { self.tod.daylight } else { 1.0 };
+        self.tod_relight_rooms(k);
+    }
+
+    /// Every room's light for the models at `daylight` (`room_light::relit`):
+    /// cheap (27 floats a photograph), so it follows each snapshot.
+    pub(super) fn tod_relight_rooms(&mut self, daylight: f32) {
+        let lamps = (self.tod.room_lamps.len() == self.tod.room_full.len()).then_some(&self.tod.room_lamps);
+        self.room_descs = self
+            .tod
+            .room_full
+            .iter()
+            .enumerate()
+            .map(|(i, d)| ProbeDesc {
+                room_light: d.room_light.map(|full| {
+                    crate::renderer::room_light::relit(&full, lamps.and_then(|l| l[i].as_ref()), daylight)
+                }),
+                ..*d
+            })
+            .collect();
     }
 
     pub(super) fn tod_probe_source(&self, full: ProbeSource) -> ProbeSource {
@@ -368,8 +500,7 @@ impl XrRenderer {
                 let lamp = lamps.get(i).filter(|l| l.len() == faces.len()).cloned().map(Arc::new);
                 let relit = match (&lamp, k == 1.0) {
                     (_, true) => faces.clone(),
-                    (Some(l), false) => relight_probe_faces(&faces, l, k),
-                    (None, false) => relight_probe_faces(&faces, &vec![0u8; faces.len()], k),
+                    (l, false) => building_daylight_faces(&faces, l.as_deref().map_or(&[][..], |l| l.as_slice()), k),
                 };
                 self.tod.buildings.push((Arc::new(faces), lamp));
                 (lo, hi, relit)
@@ -406,8 +537,7 @@ impl XrRenderer {
                 Box::new(move || {
                     Some(match (&lamps, daylight == 1.0) {
                         (_, true) => full.to_vec(),
-                        (Some(l), false) => relight_probe_faces(&full, l, daylight),
-                        (None, false) => relight_probe_faces(&full, &vec![0u8; full.len()], daylight),
+                        (l, false) => building_daylight_faces(&full, l.as_deref().map_or(&[][..], |l| l.as_slice()), daylight),
                     })
                 })
             })
