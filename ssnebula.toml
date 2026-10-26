@@ -1,0 +1,63 @@
+# SSNebula configuration. Lint levels: allow, warn, deny.
+# [lints]
+# floating_function = "deny"
+
+[lints]
+
+[limits]
+function_lines = 60
+file_lines = 800
+parameters = 5
+nesting = 4
+struct_fields = 12
+enum_variants = 24
+doc_lines = 8
+comment_run = 4
+comment_percent = 50
+
+[names]
+short_allowed = [
+    "x",
+    "y",
+    "z",
+    "w",
+    "i",
+    "j",
+    "k",
+    "n",
+    "t",
+    "u",
+    "v",
+]
+free_functions = ["main"]
+banned = []
+
+[clippy]
+enabled = true
+warn = [
+    "clippy::all",
+    "clippy::pedantic",
+    "clippy::dbg_macro",
+]
+allow = [
+    "clippy::module_name_repetitions",
+    "clippy::must_use_candidate",
+    "clippy::missing_errors_doc",
+    "clippy::missing_panics_doc",
+    "clippy::too_many_lines",
+    "clippy::too_many_arguments",
+    "clippy::wildcard_imports",
+    "clippy::cast_precision_loss",
+    "clippy::cast_possible_truncation",
+    "clippy::cast_sign_loss",
+    "clippy::cast_possible_wrap",
+    # Project-wide exemptions: shader and GPU maths compares exact floats in tests and writes
+    # long numeric constants and wgpu descriptor structs the pedantic suggestions only obscure.
+    "clippy::float_cmp",
+    "clippy::default_trait_access",
+    "clippy::unreadable_literal",
+    "clippy::items_after_statements",
+    "clippy::many_single_char_names",
+    "clippy::similar_names",
+    "clippy::chunks_exact_to_as_chunks",
+]
