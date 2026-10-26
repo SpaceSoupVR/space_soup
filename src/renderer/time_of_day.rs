@@ -319,6 +319,7 @@ mod tests {
             lamps: vec![0.01; 16],
             sky: vec![0.2; 16],
             sun: vec![0.5; 16],
+            sun_keys: Vec::new(),
         });
         let params = TimeOfDayParams::default();
         let ts = Arc::new(TimeOfDaySky::new(params));
