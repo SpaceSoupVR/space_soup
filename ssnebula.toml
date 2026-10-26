@@ -12,6 +12,10 @@ deep_nesting = "allow"
 # GPU pipeline setup takes many explicit resources; bundling them would change public signatures.
 too_many_parameters = "allow"
 wide_type = "allow"
+# 548 vague names remain: ~464 single-letter bindings in colour, vector and shader maths (h, c, a, b,
+# lerp factors), the rest `holds`/`it` locals and numbered values like `sigma2`. Renaming them by hand
+# across 99 files is a separate pass; no letter table is used to fake it.
+vague_name = "allow"
 # `use super::*` in test modules is the standard way to reach the code under test.
 wildcard_import = "allow"
 # Interior-mutable renderer handles: setters take &self on a shared handle that other repos call.
