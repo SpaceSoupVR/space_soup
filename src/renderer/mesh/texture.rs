@@ -484,7 +484,7 @@ pub enum LightmapLight<'a> {
     Linear(&'a [f32]),
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
 pub fn create_lightmap_texture_with_sun(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -498,7 +498,7 @@ pub fn create_lightmap_texture_with_sun(
     create_lightmap_texture_full(device, queue, layout, light, width, height, direction, sun_mask, None)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
 pub fn create_lightmap_texture_full(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

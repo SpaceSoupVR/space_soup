@@ -331,7 +331,7 @@ mod twins {
 mod sizes {
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints shader sizes"]
     fn shape_read_sizes() {
         use crate::renderer::terrain_pipeline::{terrain_shader_built, TerrainRole};
         let read = terrain_shader_built(TerrainRole::Read, true);

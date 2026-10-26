@@ -15,6 +15,9 @@
 
 use serde_json::{json, Value};
 
+use Kind::{Book, Bool, Colour, Curve, Enum, Gradient, Input, Int, Life, Number, Text, Vec3};
+use Stage::{Events, Initialize, Render, Spawn, Update};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stage {
     Spawn,
@@ -196,9 +199,6 @@ impl Module {
     }
 }
 
-use Kind::*;
-use Stage::*;
-
 pub const MODULES: &[Module] = &[
     // SPAWN
     m("rate", Spawn, "Rate", &[
@@ -209,7 +209,7 @@ pub const MODULES: &[Module] = &[
     .text("Particles a second. In a burst's effect, for so many seconds after the event (a smoking barrel); placed, for as long as the level is loaded.")
     .cost("CPU", "instances = rate \u{d7} longest life"),
     m("burst", Spawn, "Burst", &[
-        p("count", Value, "4").range(0.0, 200.0, 1.0).couples(Couples::Instances),
+        p("count", Kind::Value, "4").range(0.0, 200.0, 1.0).couples(Couples::Instances),
         p("chance", Number, "1").range(0.0, 1.0, 0.01).optional(),
     ])
     .source()
@@ -229,10 +229,10 @@ pub const MODULES: &[Module] = &[
         .required()
         .text("How long each particle lasts: seconds (a number or a range), or the one app frame of its event (a muzzle flash).")
         .cost("CPU", "instances of a rate = rate \u{d7} the longest life"),
-    m("size", Initialize, "Size", &[p("value", Value, "0.05").unit("m").range(0.001, 2.0, 0.005).couples(Couples::Fill)])
+    m("size", Initialize, "Size", &[p("value", Kind::Value, "0.05").unit("m").range(0.001, 2.0, 0.005).couples(Couples::Fill)])
         .text("The sprite's half size at birth.")
         .cost("fill", "fill \u{d7} size\u{b2}"),
-    m("speed", Initialize, "Speed", &[p("value", Value, "{\"range\": [0.3, 0.6]}").unit("m/s").range(0.0, 60.0, 0.05)])
+    m("speed", Initialize, "Speed", &[p("value", Kind::Value, "{\"range\": [0.3, 0.6]}").unit("m/s").range(0.0, 60.0, 0.05)])
         .text("Launch speed along its direction.")
         .cost("CPU", "how far it travels (its cull bound)"),
     m("spin", Initialize, "Spin", &[
@@ -258,7 +258,7 @@ pub const MODULES: &[Module] = &[
         p("rake_deg", Number, "0").unit("\u{b0}").range(-45.0, 45.0, 1.0).optional(),
         p("skip_down", Bool, "false").optional(),
         p("side_pairs", Int, "0").range(0.0, 4.0, 1.0).optional(),
-        p("length", Value, "{\"lognormal\": [0.08, 0.45]}").unit("m").range(0.001, 1.0, 0.005),
+        p("length", Kind::Value, "{\"lognormal\": [0.08, 0.45]}").unit("m").range(0.001, 1.0, 0.005),
     ])
     .text("A muzzle device's ports: jets round the bore, opened from it; none downward for a closed bottom; side pairs for a brake. Each particle is one lobe; past the last, the core."),
     m("delay", Initialize, "Delay", &[p("frames", Int, "1").range(0.0, 8.0, 1.0)])
@@ -290,11 +290,11 @@ pub const MODULES: &[Module] = &[
     m("ceiling_stop", Update, "Ceiling stop", &[]).text("Stops against that ceiling.").cost("CPU, one ray at load", "-"),
     m("size_over_life", Update, "Size over life", &[
         p("to", Number, "0.3").unit("m").range(0.001, 5.0, 0.01).optional().one_of().couples(Couples::Fill),
-        p("value", Value, "{\"curve\": [[0, 1], [1, 3]]}").unit("\u{d7}").range(0.0, 10.0, 0.05).optional().one_of(),
+        p("value", Kind::Value, "{\"curve\": [[0, 1], [1, 3]]}").unit("\u{d7}").range(0.0, 10.0, 0.05).optional().one_of(),
     ])
     .text("Grows (eased) to `to` metres, or is multiplied by a value (a curve over its life).")
     .cost("fill", "fill \u{d7} mean size\u{b2}"),
-    m("opacity_over_life", Update, "Opacity over life", &[p("value", Value, "{\"curve\": [[0, 0], [0.15, 0.3], [1, 0]]}").range(0.0, 1.0, 0.01)])
+    m("opacity_over_life", Update, "Opacity over life", &[p("value", Kind::Value, "{\"curve\": [[0, 0], [0.15, 0.3], [1, 0]]}").range(0.0, 1.0, 0.01)])
         .text("Opacity (drawn over) or strength (screened), 0\u{2013}1, usually a curve over its life."),
     m("puff_fade", Update, "Puff fade", &[
         p("peak", Number, "0.3").range(0.01, 1.0, 0.01),

@@ -894,11 +894,11 @@ pub struct Shares<'a> {
 }
 
 pub fn emitter_key(e: &EffectEmitter) -> u64 {
-    hash64(id_hash(&e.id) ^ 0x51ac_ed00_e1u64)
+    hash64(id_hash(&e.id) ^ 0x51_aced_00e1_u64)
 }
 
 pub fn splash_key(s: &Splash) -> u64 {
-    hash64(s.seed ^ 0x5b1a_54u64)
+    hash64(s.seed ^ 0x5b_1a54_u64)
 }
 
 const CUTOUT_MEAN: f32 = 0.6;
@@ -938,6 +938,7 @@ fn kind_cost(kind: EffectKind) -> &'static KindCost {
     &all[EffectKind::ALL.iter().position(|k| *k == kind).expect("every kind is listed")]
 }
 
+#[allow(clippy::implicit_hasher, reason = "public signature other repos call; generalizing the hasher would change it")]
 pub fn governor_wants(
     emitters: &[EffectEmitter],
     seen: &dyn Fn(usize) -> bool,
@@ -1099,7 +1100,7 @@ pub fn simulate_governed(
         let share = shares.map_or(1.0, |sh| (sh.emitter)(e));
         let sight = shares.and_then(|sh| sh.sight.get(index));
         let margin = mote_margin(e);
-        let shed_phase = (hash64(base ^ 0x0de5_ead) >> 40) as f32 / (1u64 << 24) as f32;
+        let shed_phase = (hash64(base ^ 0xde5_ead) >> 40) as f32 / (1u64 << 24) as f32;
         let tint = Vec3::from(e.tint);
         let ambient = (at.ambient)(e.position);
         let lamps: Vec<LampSeen> = (0..at.lights.len())
@@ -4708,7 +4709,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "writes the splash texture sheet to OUT; run by hand"]
     fn save_the_splash_textures() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let n = ATLAS_SIZE as usize;
@@ -4781,7 +4782,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: prints the splash causal chain"]
     fn print_the_causal_chain() {
         for (name, s) in user_strikes() {
             let c = splash_shape(&s);
@@ -4797,7 +4798,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: prints the splash shapes and atlas shares"]
     fn print_the_splashes() {
         let at = seen_from(Vec3::new(0.0, 1.6, 3.0));
 
@@ -5679,7 +5680,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "writes editor effect exports to OUT; run by hand"]
     fn export_effects_for_the_editor() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let layers = atlas_layers();
@@ -5823,7 +5824,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "writes the effects atlas to OUT; run by hand"]
     fn save_the_effects_atlas() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let layers = atlas_layers();
@@ -5883,7 +5884,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "writes rendered effect frames to OUT; run by hand"]
     fn render_effects_alone() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         let instance = wgpu::Instance::default();
@@ -6070,7 +6071,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: prints where the flames stand"]
     fn print_where_the_flames_stand() {
         let fire = EffectEmitter { id: "brick_fire".into(), scale: 1.5, ..emitter(EffectKind::Fire) };
         let (mut sum, mut w, mut worst) = (Vec3::ZERO, 0.0f32, 0.0f32);
@@ -6091,7 +6092,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: prints the flame tables as Rust constants"]
     fn print_the_flame_tables() {
         let (area, cover, rise) = flame_tables();
         let fmt = |v: &[f32]| v.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(", ");
@@ -6119,7 +6120,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: prints one fire's particles"]
     fn print_a_fires_particles() {
         let id = std::env::var("FIRE_ID").unwrap_or_else(|_| "test".into());
         let time = std::env::var("EFFECTS_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(30.0);
@@ -6137,7 +6138,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "slow timing measurement; run by hand with --ignored"]
     fn time_a_frames_effects() {
         let lamps: Vec<Light> = (0..6).map(|k| Light { position: Vec3::new(k as f32 - 2.5, 2.8, -1.0), ..lamp() }).collect();
         let emitters = [

@@ -27,8 +27,8 @@ pub fn runtime_checks(checks: AuditedChecks) -> wgpu::ShaderRuntimeChecks {
 /// Quest's `debug.spacesoup.shaderchecks` property (`all` / `none`), read
 /// when the device is made, to A/B naga's injected bounds checks in the hot
 /// loops (the AAA doc's M4 / rank 9). `none` trusts every index in the
-/// brush, terrain and fix-up shaders, and robust access is off on the
-/// headset, so an out-of-range read is undefined: an A/B only.
+/// brush, terrain and fix-up shaders; the headset has no hardware bounds
+/// guard, so an out-of-range read is undefined: an A/B only.
 pub static CHECKS_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// `all` or `none` from a property's text; anything else keeps the audit.

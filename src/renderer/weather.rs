@@ -1396,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints shader sizes"]
     fn weather_twin_size() {
         use wgpu::naga;
         fn reach(m: &naga::Module, block: &naga::Block, seen: &mut std::collections::HashSet<naga::Handle<naga::Function>>) {
@@ -1566,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints shader sizes"]
     fn wetness_reader_sizes() {
         use crate::renderer::ground_twins::{gentle_shader, steep_shader};
         use crate::renderer::terrain_pipeline::terrain_shader_built;
@@ -1617,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints shader sizes"]
     fn torch_wetness_reader_sizes() {
         use crate::renderer::ground_twins::gentle_shader;
         use crate::renderer::terrain_pipeline::terrain_shader_built;

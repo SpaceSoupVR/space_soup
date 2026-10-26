@@ -206,6 +206,7 @@ pub(crate) const OPTS: &[Opt] = &[
     Opt { label: "frame_was", picture: Picture::Near, edit: frame_was },
 ];
 
+#[cfg(test)]
 pub(crate) const OPT_ALL: &str = "opt_all";
 
 pub(crate) fn edit_named(src: &str, name: &str) -> Option<String> {
@@ -426,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints shader sizes"]
     fn opt_sizes() {
         for (base, src) in all_bases() {
             let size = |s: &str| {

@@ -91,7 +91,7 @@ impl LayeredMeshPipeline {
         Self::build(device, format, uniform_layout, material_layout, front_face, samples, view, layered_mesh_shader(), None, "layered_mesh_pipeline")
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub(crate) fn build(
         device: &Device,
         format: TextureFormat,
@@ -1033,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints shader sizes"]
     fn cave_shader_size() {
         let src = crate::renderer::multiview::ViewMode::Mono.shader(layered_mesh_shader());
         println!("{}", crate::renderer::shader_inlining::report("layered_mesh fs_main", &src, "fs_main", 12));

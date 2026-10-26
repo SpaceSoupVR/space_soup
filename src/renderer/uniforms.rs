@@ -370,7 +370,7 @@ impl UniformBuffer {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
 fn scene_bind_group(
     device: &Device,
     layout: &BindGroupLayout,
@@ -717,7 +717,7 @@ impl UniformBuffer {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn upload_scene(
         &self,
         queue: &Queue,
@@ -731,7 +731,7 @@ impl UniformBuffer {
         self.upload_scene_with_probes(queue, view_proj, camera_pos, shadow, sky, post, player, None);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn upload_scene_with_probes(
         &self,
         queue: &Queue,
@@ -755,7 +755,7 @@ impl UniformBuffer {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn upload_scene_stereo(
         &self,
         queue: &Queue,
@@ -770,7 +770,7 @@ impl UniformBuffer {
         self.write_scene_stereo_to(queue, &self.buffer, view_proj, camera_pos, shadow, sky, post, player, probes);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn write_scene_stereo_to(
         &self,
         queue: &Queue,
@@ -1603,7 +1603,7 @@ pub fn write_probe_layer(queue: &Queue, tex: &wgpu::Texture, layer: u32, res: u3
 
 impl UniformBuffer {
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn rebind_probes(
         &mut self,
         device: &Device,

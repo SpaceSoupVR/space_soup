@@ -287,7 +287,7 @@ pub fn clumps(s: &Splash, shape: &MudShape) -> Vec<Clump> {
     for i in 0..shape.clumps + shape.spray {
         let fine = i >= shape.clumps;
         let (k, n) = if fine { (i - shape.clumps, shape.spray) } else { (i, shape.clumps) };
-        let u = uniforms(hash64(s.seed ^ 0x6d75_64 ^ (i as u64 + 1).wrapping_mul(0x632be59bd9b4e019)));
+        let u = uniforms(hash64(s.seed ^ 0x6d_7564 ^ (i as u64 + 1).wrapping_mul(0x632be59bd9b4e019)));
         // Stratified round the rim, so any seed surrounds it.
         let azimuth = TAU * (k as f32 + u[0]) / n.max(1) as f32 + if fine { 0.37 } else { 0.0 };
         let out_dir = Vec3::new(azimuth.cos(), 0.0, azimuth.sin());

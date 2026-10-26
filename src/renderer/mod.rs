@@ -73,10 +73,6 @@ pub mod shader_checks;
 pub mod portal_cull;
 pub mod doors;
 pub mod shader_precision;
-#[cfg(test)]
-pub(crate) mod shader_inlining;
-#[cfg(test)]
-pub(crate) mod shader_audit;
 pub mod skin_compute;
 pub mod water_waves;
 pub mod probe_blur;
@@ -145,3 +141,8 @@ pub struct MeshInstance<'a> {
 
     pub moves: bool,
 }
+
+#[cfg(test)]
+pub(crate) mod shader_inlining;
+#[cfg(test)]
+pub(crate) mod shader_audit;

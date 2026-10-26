@@ -406,7 +406,7 @@ impl ProbeBlur {
         queue.write_buffer(&groups.history.uniform, 0, bytemuck::bytes_of(u));
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn bind_views(
         &self,
         device: &Device,

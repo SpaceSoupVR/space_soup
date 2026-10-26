@@ -214,7 +214,7 @@ impl BrushMaterials {
     /// [`Self::new`] takes (and `materials`, each layer's folder). Every map
     /// is read and checked before any texture is made, so a refusal leaves
     /// nothing half built; Err says why, and the caller uploads the images.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn from_astc(
         device: &Device,
         queue: &Queue,

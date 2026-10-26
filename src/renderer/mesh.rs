@@ -52,8 +52,7 @@ impl GltfMesh {
     pub fn joint_names(&self) -> &[String] {
         self.skin
             .as_ref()
-            .map(|s| s.joint_names.as_slice())
-            .unwrap_or(&[])
+            .map_or(&[], |s| s.joint_names.as_slice())
     }
 
     pub fn create_skin_bind_group(
@@ -388,7 +387,7 @@ impl GltfMesh {
         let mut joint_local_bind: Vec<(Vec3, Quat, Vec3)> = Vec::new();
         let mut node_index_to_joint: HashMap<usize, usize> = HashMap::new();
 
-        for skin in doc.skins() {
+        if let Some(skin) = doc.skins().next() {
             let joint_nodes: Vec<gltf::Node> = skin.joints().collect();
             let start = joint_names.len();
             joint_names.extend(joint_nodes.iter().map(|j| j.name().unwrap_or("").to_string()));
@@ -419,7 +418,6 @@ impl GltfMesh {
                 joint_parents.push(parent_joint);
                 joint_local_bind.push((t, r, s));
             }
-            break;
         }
 
         let mut orphan_target_nodes: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();

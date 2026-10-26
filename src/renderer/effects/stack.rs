@@ -722,7 +722,7 @@ impl BurstSet {
         if lib.get(asset).is_none() {
             return;
         }
-        let burst = EffectBurst::new(asset, position, direction, source, hash64(source ^ 0x5eed_0f_91ace));
+        let burst = EffectBurst::new(asset, position, direction, source, hash64(source ^ 0x5ee_d0f9_1ace));
         self.live.push(LiveBurst { burst, born: None, frames: 0, lasting: true, superseded: None, share: 1.0, standing: Some(placed) });
     }
 
@@ -2374,7 +2374,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "slow stress of many effects at once; run by hand"]
     fn stress_many_effects_at_once() {
         use crate::renderer::effects::{emitter_seen, splash_seen, strike, variants, EffectKind, Splash};
         let Some(lib) = shipped() else { return };

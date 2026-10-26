@@ -232,6 +232,7 @@ pub fn kind_report(kind: EffectKind) -> (Report, Option<f32>) {
     (a.check(books()).expect("the built-in templates check"), density)
 }
 
+#[allow(clippy::implicit_hasher, reason = "public signature other repos call; generalizing the hasher would change it")]
 pub fn scene_json(items: &Value, assets: &std::collections::HashMap<String, String>) -> Value {
     let mut placed = Vec::new();
     let mut issues = Vec::new();

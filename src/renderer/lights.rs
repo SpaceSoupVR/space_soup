@@ -1628,7 +1628,6 @@ fn pcf_box_taps(p: vec2<f32>) -> PcfBoxTaps {{
     return PcfBoxTaps(i - 0.5 + 1.0 / (2.0 - t), i + 1.5 + t / (1.0 + t), 2.0 - t, 1.0 + t);
 }}
 
-// `pcf` on one layer of an array.
 fn pcf_array(tex: texture_depth_2d_array, layer: i32, world_pos: vec3<f32>, light_view_proj: mat4x4<f32>) -> f32 {{
     let c = shadow_coords(world_pos, light_view_proj);
     if (c.w < 0.5) {{ return 1.0; }}

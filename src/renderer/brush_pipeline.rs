@@ -745,7 +745,7 @@ impl BrushPipeline {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn new_ssr_modes(
         device: &Device,
         format: TextureFormat,
@@ -825,7 +825,7 @@ impl BrushPipeline {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn new_blended(
         device: &Device,
         format: TextureFormat,
@@ -1042,7 +1042,7 @@ impl BrushPipeline {
         ])
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn new_variant(
         device: &Device,
         format: TextureFormat,
@@ -1209,8 +1209,7 @@ impl BrushPipeline {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn log_opts(
         device: &Device,
         format: TextureFormat,
@@ -1546,6 +1545,7 @@ fn brush_seal_shader_posed(r: f32, g: f32, b: f32) -> String {
     )
 }
 
+#[cfg(test)]
 fn brush_shader() -> String {
     brush_shader_with(false)
 }
@@ -1765,6 +1765,7 @@ pub(crate) fn sun_reader_shader(source: String, class: FaceSun) -> String {
     source.replacen(&off, &format!("const {switch}: bool = true;"), 1)
 }
 
+#[cfg(test)]
 fn brush_shader_with(ssr: bool) -> String {
     brush_shader_variant(ssr, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG)
 }
@@ -3248,6 +3249,7 @@ fn floor_mirror_linear_depth(d: f32) -> f32 {{
     }
 }
 
+#[cfg(test)]
 fn brush_shader_variant(ssr: bool, sources: bool, ssr_debug: bool) -> String {
     brush_shader_modes(ssr, sources, ssr_debug, SsrPath::Inline)
 }
@@ -3751,7 +3753,7 @@ mod tests {
 
     const NEUTRAL_LM: [u8; 4] = [0, 0, 0, 255];
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn render_brush_material(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -3768,7 +3770,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn render_brush_baked(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -3788,7 +3790,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn render_brush_baked_dir(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -3855,7 +3857,7 @@ mod tests {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn render_brush_probed(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -3876,7 +3878,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn render_brush_full(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -3898,7 +3900,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn render_brush_lit_by(
         material: u32,
         colours: &[Option<TerrainImage>],
@@ -4665,9 +4667,6 @@ mod tests {
 
     mod probe_render {
         use super::*;
-
-        
-        
 
         const SEALED: [u8; 4] = [0, 0, 0, 0];
 
@@ -5603,7 +5602,6 @@ fn fill(@builtin(position) pos: vec4<f32>) -> PassOut {
         const READ_BACK: &str =
             "let ssr_fallback = textureLoad(ssr_scene_color, vec2<i32>(in.clip.xy), 0).rgb;";
         {
-            let _ms = false;
             let shipped = brush_shader_variant(true, false, false);
             assert!(!shipped.contains(LIGHTS), "the reflective pass shades the surface again");
             assert!(shipped.contains(READ_BACK), "the reflective pass no longer reads the scene's colour");
@@ -6443,7 +6441,7 @@ mod sun_faces_tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints where the readers' instructions come from"]
     fn where_the_readers_instructions_come_from() {
         use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainRole};
         let read = brush_shader_probe(false, BRUSH_SOURCE_DEBUG, crate::renderer::ssr::SSR_DEBUG, SsrPath::Inline, BrushProbe::Read);
@@ -6460,7 +6458,7 @@ mod sun_faces_tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints where the probe passes' instructions come from"]
     fn where_the_probe_passes_instructions_come_from() {
         use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainRole};
         let passes = [

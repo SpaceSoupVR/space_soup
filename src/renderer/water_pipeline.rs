@@ -648,7 +648,7 @@ fn water_with_cut(device: &Device, inputs: &WaterInputs, dual_source: bool, cut:
     Some(build_water(device, layout, *format, *blend, *samples, *view, src, &format!("water_cut_{cut}")))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
 fn build_water(
     device: &Device,
     layout: &PipelineLayout,
@@ -1028,6 +1028,7 @@ const RING_FOAM_TILES: f32 = 4.0;
 const RING_FOAM_MEAN: f32 = 0.35;
 const RING_FOAM_CONTRAST: f32 = 1.6;
 
+#[cfg(test)]
 fn water_wgsl(dual: bool) -> String {
     water_wgsl_with(dual, true)
 }
@@ -1538,7 +1539,7 @@ fn water_ggx(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, a2: f32) -> f32 {{
     let body = water.scatter.rgb * silt * (sky_n * mix(1.0, MUD_SKY_SHARE, mud) + sunlight * max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0)) * (vec3<f32>(1.0) - t_view);
 
     // THE CAUSTICS only where they can show. From CAUSTIC_DEEPEST of water
-    // down their contrast is zero (the smoothstep below is 1 there), so the
+    // down their contrast is zero (that smoothstep saturates at 1), so the
     // sum is skipped and `caustic` keeps exactly the 1.0 it would have come
     // to. Open sea is all of that, and it was 17% of the water draw's clocks
     // at day_sea (2026-10-21).
@@ -1920,7 +1921,7 @@ mod tests {
     /// Writes a set of views to `$WATER_DUMP` (one file per path), for
     /// comparing a rewrite of the shader with the shader before it.
     #[test]
-    #[ignore]
+    #[ignore = "writes water view images to WATER_DUMP; run by hand"]
     fn dump_water_views() {
         let Ok(out) = std::env::var("WATER_DUMP") else { return };
         for dual in [false, true] {
@@ -2204,8 +2205,8 @@ mod ring_size_tests {
         eprintln!("water by the proxy: ringed {ringed}, ringless {ringless}, the rings {}", ringed - ringless);
         assert!(ringed > ringless, "the ringed twin has the rings in it");
         // 2,424 was the cap; +89 is the four-tap box PCF (`lights::pcf_box_taps`,
-        // 2026-10-23). The proxy counts a loop's body once, so the nine-tap
-        // loop it replaced read as smaller, but the driver unrolls a 3x3 loop
+        // 2026-10-23). The proxy counts a loop's body once, so the nine-tap one
+        // it replaced read as smaller, but the driver unrolls a 3x3 loop
         // of constant bounds: on the Quest the four taps made the water views
         // faster (beach_south 13.89 -> 13.58 ms, pond 14.80 -> 14.69), not
         // slower as a crossed cliff would.
@@ -2224,7 +2225,7 @@ mod ring_size_tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints shader sizes"]
     fn what_the_mud_costs() {
         let total = |src: &str| -> usize { inlined_sizes(src, "fs_main").iter().map(|r| r.own * r.copies).sum() };
         for (name, src) in [("ringless", water_wgsl_with(false, false)), ("ringed", water_wgsl_with(false, true)), ("raining", water_wgsl_raining(false))] {
@@ -2234,7 +2235,7 @@ mod ring_size_tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints shader sizes"]
     fn what_each_part_of_the_rings_costs() {
         let total = |src: &str| -> usize { inlined_sizes(src, "fs_main").iter().map(|r| r.own * r.copies).sum() };
         let full = water_wgsl_raining(false);

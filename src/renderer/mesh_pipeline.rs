@@ -125,7 +125,7 @@ impl MeshPipeline {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn new_edited(
         device: &Device,
         format: TextureFormat,
@@ -345,7 +345,7 @@ impl ModelUniform {
         self.upload_lit_bulb(queue, model, sky_vis, emissive_drive, room, None, 0.0);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn upload_lit_bulb(
         &self,
         queue: &Queue,
@@ -359,7 +359,7 @@ impl ModelUniform {
         self.upload_lit_bulb_scaled(queue, model, sky_vis, emissive_drive, room, own, thin_width, 1.0);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn upload_lit_bulb_scaled(
         &self,
         queue: &Queue,
@@ -680,7 +680,7 @@ impl SkinnedMeshPipeline {
         Self::build_entry(device, layout, shader, label, format, samples, view, blend, "fs_main", ColorWrites::ALL)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn build_entry(
         device: &Device,
         layout: &PipelineLayout,
@@ -1578,7 +1578,7 @@ mod tests {
         render_mesh_inner(emissive, drive, lit, sky_vis, mask, lightmap_texel, [128, 128, 128, 255])
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn render_mesh_inner(
         emissive: [f32; 3],
         drive: f32,
@@ -1591,7 +1591,7 @@ mod tests {
         render_mesh_stationary(emissive, drive, lit, sky_vis, mask, lightmap_texel, base, None, 4.0)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn render_mesh_stationary(
         emissive: [f32; 3],
         drive: f32,
@@ -1618,7 +1618,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn render_mesh_room(
         emissive: [f32; 3],
         drive: f32,
@@ -1649,7 +1649,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn render_mesh_room_with(
         emissive: [f32; 3],
         drive: f32,
@@ -1849,7 +1849,7 @@ mod tests {
     const SIDE_LAMP_DISTANCE: f32 = 60.0;
     const SIDE_LAMP_LIGHT: f32 = 6.0;
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn render_wire(
         radius_px: f32,
         shift_px: f32,
@@ -2354,7 +2354,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints shader sizes"]
     fn skinned_shader_sizes() {
         let total = |s: &str| -> usize { crate::renderer::shader_inlining::inlined_sizes(s, "fs_main").iter().map(|r| r.own * r.copies).sum() };
         let skinned = skinned_mesh_shader();

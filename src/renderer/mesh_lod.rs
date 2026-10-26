@@ -468,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "slow timing measurement; run by hand with --ignored"]
     fn lod_cost() {
         let (pos, idx) = sphere(160, 320);
         let t = std::time::Instant::now();

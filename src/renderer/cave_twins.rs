@@ -456,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: prints the shipped cave's class areas"]
     fn shipped_cave_classes() {
         let path = &crate::test_game_dir().join("models/caves/cave.glb");
         let (doc, buffers, _) = gltf::import(path).expect("the shipped cave");
@@ -488,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints shader sizes"]
     fn cave_twin_sizes() {
         for (name, src) in [
             ("full", layered_mesh_shader()),

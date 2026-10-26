@@ -395,7 +395,7 @@ impl ProbeStream {
         Self::new_with_extras(device, queue, resolution, count, source, depth, sky, Vec::new())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn new_with_extras(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -413,7 +413,7 @@ impl ProbeStream {
     /// As `new_with_extras`, the probes and buildings relit on the GPU at
     /// every frame's daylight (`relight`) from `source`'s full photographs
     /// and `smooth`'s lamps-only ones. The sky's layer is written lit.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn new_smooth(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -431,7 +431,7 @@ impl ProbeStream {
         stream
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn build(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -466,9 +466,8 @@ impl ProbeStream {
         }
 
         let first_building = layers + sky_cubes;
-        let mut written = 0u32;
-        for (faces, lamps) in &buildings {
-            let layer = first_building + written;
+        for (written, (faces, lamps)) in buildings.iter().enumerate() {
+            let layer = first_building + written as u32;
             match relight.as_mut() {
                 Some(r) => {
                     let (l, s) = split_probe_faces(faces, lamps.as_deref(), true);
@@ -482,7 +481,6 @@ impl ProbeStream {
                     }
                 }
             }
-            written += 1;
         }
         let building_layer = (building_cubes > 0).then_some(first_building);
         let mut pool = LayerPool::new(layers);
@@ -867,7 +865,7 @@ mod tests {
     /// The relight's cost on this GPU at 256 px: `RELIGHTS_PER_FRAME`
     /// layers a frame, 60 frames, wall clock to the GPU's finish.
     #[test]
-    #[ignore]
+    #[ignore = "slow timing measurement; run by hand with --ignored"]
     fn relight_cost() {
         use super::super::uniforms::scene_limits;
         let instance = wgpu::Instance::default();
@@ -906,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "slow timing measurement; run by hand with --ignored"]
     fn prefilter_cost() {
         for res in [128u32, 256] {
             let faces: Vec<u8> = (0..res * res * 6).flat_map(|i| {

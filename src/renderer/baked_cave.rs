@@ -42,7 +42,7 @@ impl BakedCaveVertex {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn from_file(
         position: [f32; 3],
         normal: [f32; 3],
@@ -924,7 +924,7 @@ pub fn cave_debug_shader(src: &str, view: &str) -> Option<String> {
 }
 
 impl BakedCavePipelines {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn new(
         device: &Device,
         format: TextureFormat,
@@ -937,7 +937,7 @@ impl BakedCavePipelines {
         Self::new_debug(device, format, uniform_layout, material_layout, lightmap_layout, samples, stereo, None)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn new_debug(
         device: &Device,
         format: TextureFormat,
@@ -1086,7 +1086,7 @@ impl BakedCavePipelines {
         &self.scene[planes as usize][usize::from(emissive)][usize::from(spotless)]
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn draw_scene<'a>(
         &'a self,
         pass: &mut RenderPass<'a>,
@@ -1193,7 +1193,10 @@ pub fn occluder_ranges(
     planes: Option<&[[Vec4; 6]]>,
 ) -> Vec<std::ops::Range<u32>> {
     match planes {
-        None => vec![0..index_count],
+        None => {
+            let whole = 0..index_count;
+            vec![whole]
+        }
         Some(_) => visible_ranges(chunks, placed, planes, None),
     }
 }
@@ -1201,6 +1204,9 @@ pub fn occluder_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::renderer::terrain_pipeline::{self, material_bind_group_layout, TerrainImage, TerrainMaterial, TerrainMaterialUniform};
+    use crate::renderer::uniforms::test_support::{scene_uniforms, TEST_EYE};
+    use crate::renderer::uniforms::ShadowUpload;
 
     fn chunk(first: u32, count: u32, x: f32) -> CaveChunk {
         CaveChunk { first, count, min: [x, 0.0, -1.0], max: [x + 1.0, 1.0, 1.0], lip: 0, planes: CavePlanes::Cliff }
@@ -1209,7 +1215,7 @@ mod tests {
     #[test]
     fn a_file_vertex_unpacks_its_weights_axis_and_glow() {
         let v = BakedCaveVertex::from_file(
-            [1.0; 3], [0.0, 1.0, 0.0], [0.25, 0.5], [100, 50, 5, (2 << 6) | 40], [255, 128, 3, 9], ([0.7, 0.2], 77),
+            [1.0; 3], [0.0, 1.0, 0.0], [0.25, 0.5], [100, 50, 5, (0x2 << 6) | 0x28], [255, 128, 3, 9], ([0.7, 0.2], 77),
             Some(([200, 55, 0], [30, 0, 225, 90])),
             None,
         );
@@ -1232,7 +1238,7 @@ mod tests {
     #[test]
     fn a_glows_colour_rides_in_the_two_spare_bytes_and_opens_to_the_same_colour() {
 
-        let args = ([1.0; 3], [0.0, 1.0, 0.0], [0.25, 0.5], [100, 50, 5, (2 << 6) | 40], [255, 128, 3, 9], ([0.7, 0.2], 77), Some(([200, 55, 0], [30, 0, 225, 90])));
+        let args = ([1.0; 3], [0.0, 1.0, 0.0], [0.25, 0.5], [100, 50, 5, (0x2 << 6) | 0x28], [255, 128, 3, 9], ([0.7, 0.2], 77), Some(([200, 55, 0], [30, 0, 225, 90])));
         let plain = BakedCaveVertex::from_file(args.0, args.1, args.2, args.3, args.4, args.5, args.6, None);
         let teal = BakedCaveVertex::from_file(args.0, args.1, args.2, args.3, args.4, args.5, args.6, Some([60, 220, 200, 255]));
         assert_eq!((plain.misc[3], plain.cliff[3]), (0, 0), "no colour: the rock's own");
@@ -1403,10 +1409,6 @@ mod tests {
         assert!(fs.contains("receiver_skips_baked = true;"), "its baked lamps are in its atlas");
         assert!(fs.trim_end().ends_with("return vec4<f32>(tonemap(colour), 1.0);\n}"), "opaque: alpha one");
     }
-
-    use crate::renderer::terrain_pipeline::{self, material_bind_group_layout, TerrainImage, TerrainMaterial, TerrainMaterialUniform};
-    use crate::renderer::uniforms::test_support::{scene_uniforms, TEST_EYE};
-    use crate::renderer::uniforms::ShadowUpload;
 
     fn ramp() -> TerrainImage {
         let mut rgba = Vec::with_capacity(16 * 16 * 4);
@@ -1987,7 +1989,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints shader sizes"]
     fn baked_cave_sizes() {
         for (name, which) in [
             ("baked_cave", CaveShader { emissive: false, spotless: false, ..Default::default() }),

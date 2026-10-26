@@ -116,7 +116,7 @@ pub struct SlopeSplit {
 impl SlopeSplit {
     fn key_of(verts: &[SolidVertex], idx: &[u32], chunks: &[CasterChunk], threshold_deg: f32, class_key: u64) -> (usize, usize, usize, usize, u32, u64) {
 
-        let mut h: u64 = 1469598103934665603 ^ class_key;
+        let mut h: u64 = 0x1465_0fb0_739d_0383 ^ class_key;
         let mut mix = |v: u64| {
             h ^= v;
             h = h.wrapping_mul(1099511628211);
@@ -152,9 +152,7 @@ impl SlopeSplit {
         Self::classed(verts, idx, chunks, threshold_deg, 0, &|_| 0)
     }
 
-    #[allow(clippy::too_many_arguments)]
-
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn classed_on(
         verts: &[SolidVertex],
         idx: &[u32],
@@ -345,7 +343,7 @@ impl SlopeSplit {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn ensure(
         kept: &mut Option<SlopeSplit>,
         verts: &[SolidVertex],
@@ -514,7 +512,7 @@ pub(crate) fn torch_weather_twin(src: String) -> String {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
 pub fn gentle_readers(
     device: &Device,
     format: TextureFormat,
@@ -659,6 +657,8 @@ pub fn dedup_pass_shader(src: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn the_ground_probe_pass_takes_its_dedup_and_validates() {
         use wgpu::naga;
@@ -669,8 +669,6 @@ mod tests {
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap();
         }
     }
-
-    use super::*;
 
     fn vertex(n: [f32; 3]) -> SolidVertex {
         SolidVertex { position: [0.0; 3], normal: n, color: [1.0; 4], uv2: [0.0; 2], reflectivity: 0.0 }
@@ -903,7 +901,9 @@ mod tests {
         let mut normals = vec![glam::Vec3::ZERO; positions.len()];
         for t in triangles.chunks_exact(3) {
             let f = (positions[t[1] as usize] - positions[t[0] as usize]).cross(positions[t[2] as usize] - positions[t[0] as usize]);
-            t.iter().for_each(|v| normals[*v as usize] += f);
+            for v in t {
+                normals[*v as usize] += f;
+            }
         }
         let verts: Vec<SolidVertex> = positions
             .iter()

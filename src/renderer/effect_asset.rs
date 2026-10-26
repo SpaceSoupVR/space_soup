@@ -48,6 +48,7 @@ pub struct EffectAsset {
     pub seed_policy: SeedPolicy,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if calls these helpers with a reference")]
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -63,6 +64,7 @@ pub enum SeedPolicy {
 }
 
 impl SeedPolicy {
+    #[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if calls these helpers with a reference")]
     fn is_default(&self) -> bool {
         *self == Self::PerSpawn
     }
@@ -96,6 +98,7 @@ pub enum At {
 }
 
 impl At {
+    #[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if calls these helpers with a reference")]
     fn is_origin(&self) -> bool {
         *self == Self::Origin
     }
@@ -430,6 +433,7 @@ pub enum About {
 }
 
 impl About {
+    #[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if calls these helpers with a reference")]
     fn is_direction(&self) -> bool {
         *self == Self::Direction
     }
@@ -657,12 +661,14 @@ pub enum Gate {
 fn one() -> f32 {
     1.0
 }
+#[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if calls these helpers with a reference")]
 fn is_one(v: &f32) -> bool {
     *v == 1.0
 }
 fn one_frame() -> u32 {
     1
 }
+#[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if calls these helpers with a reference")]
 fn is_one_frame(v: &u32) -> bool {
     *v == 1
 }
@@ -987,7 +993,7 @@ impl EffectAsset {
                         SpawnTarget::Chance => {}
                     }
                 }
-                _ => {}
+                SpawnModule::Density { .. } => {}
             }
         }
 

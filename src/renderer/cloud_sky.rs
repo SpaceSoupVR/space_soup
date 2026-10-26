@@ -167,7 +167,7 @@ pub struct CloudSkyUniform {
 }
 
 impl CloudSkyUniform {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn new(
         layers: &[CloudLayer; LAYERS],
         eye: [f32; 3],
@@ -423,16 +423,19 @@ pub struct CloudSky {
     envelope_pending: bool,
     /// Whether the last `encode_at` splatted the envelopes (`CLOUDSUBMIT`).
     splatted: bool,
+    #[allow(dead_code, reason = "owned so the GPU resource lives as long as the views made from it")]
     maps: Texture,
     map_layers: [TextureView; 3],
     array_view: TextureView,
     /// The march's own texels, before the prefilter (`PREFILTER`).
+    #[allow(dead_code, reason = "owned so the GPU resource lives as long as the views made from it")]
     raw: Texture,
     raw_view: TextureView,
     prefilter_pipeline: RenderPipeline,
     prefilter_group: BindGroup,
     /// Beside each map, the height of what it shows (R16F, metres): what
     /// the wind it is carried on is read by.
+    #[allow(dead_code, reason = "owned so the GPU resource lives as long as the views made from it")]
     alts: Texture,
     alt_layers: [TextureView; 3],
     alt_view: TextureView,
@@ -1018,7 +1021,7 @@ impl CloudSky {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn bind(device: &Device, layout: &BindGroupLayout, uniform: &Buffer, noise: &Texture, weather: &Texture, sampler: &Sampler, envelope: &Texture, envelope_sampler: &Sampler) -> BindGroup {
         let nv = noise.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D3), ..Default::default() });
         let wv = weather.create_view(&Default::default());
@@ -1062,7 +1065,7 @@ impl CloudSky {
         // here otherwise.
         let own;
         let data: &[[f32; 8]] = if let Some((data, ranges)) = population.packed() {
-            self.splat_ranges = ranges.clone();
+            self.splat_ranges.clone_from(ranges);
             data
         } else {
             let mut v: Vec<[f32; 8]> = Vec::new();
@@ -1196,7 +1199,7 @@ impl CloudSky {
     /// `map_time`, seen from its eye, the same for every slice of one map --
     /// and the ground's shadow into `shadow` when given, from `now_u`: the
     /// clouds at `now`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn encode_at(&mut self, encoder: &mut CommandEncoder, queue: &Queue, map: &CloudSkyUniform, now_u: &CloudSkyUniform, shadow: Option<&TextureView>, whole: bool, now: f64, map_time: f64) {
         // A new population is splatted only as a map begins, so one map is
         // built from one population top to bottom; re-splatted mid-build it
@@ -2455,8 +2458,8 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
     // clouds stepped "3 forward, 1-2 back" (user, headset). Each layer's
     // own wind, by its share of the light, is how what this texel shows moves.
     let hv = (wind + ALT_FILL_WEIGHT * fill_wind) / (seen + ALT_FILL_WEIGHT);
-    // The march stops once less than 1% gets through, and the 1% it left
-    // let the sun's disc -- some 1e5 times the cloud -- shine through thick
+    // The march stops once less than 1% gets through, and the 1% it left let
+    // the sun's disc -- some 1e5 times the cloud -- shine through thick
     // cumulus as a white dot (user: the sun and moon shone "as if they are in
     // front of the cloud", 2026-10-22). Past that point the cloud only goes
     // on, so a disc behind it gets nothing. Nor does it through a cumulus
@@ -2502,8 +2505,8 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
 }
 
 // THE GROUND'S SHADOW: the light every layer lets through toward the light
-// from this texel's patch of ground. The outer ring holds the map's mean,
-// for the ground past it (`sky::cloud_map_border`).
+// from this texel's patch of ground. The outer ring holds the map's mean, read
+// by the ground past it (`sky::cloud_map_border`).
 @fragment fn fs_shadow(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let size = {SHADOW_SIZE};
     if (pos.x < 1.0 || pos.y < 1.0 || pos.x > size - 1.0 || pos.y > size - 1.0) {
@@ -2638,7 +2641,7 @@ pub(crate) mod tests {
     /// `SUN_EL` / `SUN_AZ` degrees (35, 0: toward +z), `VOXEL` metres (20),
     /// `REACH` metres either side of the eye (7000).
     #[test]
-    #[ignore]
+    #[ignore = "writes reference cloud images to OUT; run by hand"]
     fn export_a_cumulus_for_a_path_traced_reference() {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
@@ -2736,7 +2739,6 @@ pub(crate) mod tests {
         let started = std::time::Instant::now();
         std::thread::scope(|s| {
             for (ix, slab) in grid.chunks_mut(ny * nx).enumerate() {
-                let weather = weather;
                 let noise = &noise;
                 s.spawn(move || {
                     let x = -reach + (ix as f32 + 0.5) * voxel;
@@ -2767,7 +2769,7 @@ pub(crate) mod tests {
     /// What a whole sky map costs on this machine's GPU, with the layers'
     /// populations and with the weather's mean alone (`--ignored`).
     #[test]
-    #[ignore]
+    #[ignore = "slow timing measurement; run by hand with --ignored"]
     fn time_the_sky_map() {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         let field = CloudField::build(7);
@@ -2818,7 +2820,7 @@ pub(crate) mod tests {
     /// What one headset frame's clouds cost: the next slice as `step_clouds`
     /// draws it, alone and with the ground's shadow (`--ignored`).
     #[test]
-    #[ignore]
+    #[ignore = "slow timing measurement; run by hand with --ignored"]
     fn time_a_frames_clouds() {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         let field = CloudField::build(7);
@@ -2987,7 +2989,7 @@ pub(crate) mod tests {
     /// is the clouds' own drift and growth (0 with the population held).
     /// `--ignored`.
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: prints how far carried maps step back"]
     fn carried_maps_step_back_by() {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         let field = CloudField::build(7);
@@ -3214,7 +3216,7 @@ pub(crate) mod tests {
     /// finer, and how much of its error is fine-grained (the hatching): the
     /// error's own detail, |e - blur(e)|, a texel's 3x3 mean (`--ignored`).
     #[test]
-    #[ignore]
+    #[ignore = "slow: marches every variant against a finer march and prints the error"]
     fn march_variants_against_a_finer_march() {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         let field = CloudField::build(7);

@@ -87,7 +87,7 @@ fn volume(r: &CullRoom) -> f32 {
     d.x * d.y * d.z
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
 fn walk(
     room: u32,
     entered_by: Option<usize>,

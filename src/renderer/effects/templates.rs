@@ -1055,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "writes template JSON to OUT; run by hand"]
     fn export_the_templates() {
         let out = std::path::PathBuf::from(std::env::var("OUT").unwrap_or_else(|_| "/tmp".into()));
         std::fs::create_dir_all(&out).unwrap();

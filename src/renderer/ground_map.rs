@@ -1027,7 +1027,7 @@ mod step_census {
     use super::*;
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: prints march accuracy per level choice"]
     fn shapes() {
         let map = fixtures::height_map(1024, fixtures::hills);
         let chain = levels(&map);
@@ -1057,7 +1057,7 @@ mod step_census {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: prints march step counts by elevation"]
     fn steps_by_elevation() {
         let map = fixtures::height_map(1024, fixtures::hills);
         let chain = levels(&map);
@@ -1134,7 +1134,7 @@ mod under_ground_census {
     use super::*;
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: prints march step counts from under the ground"]
     fn steps_from_under_the_ground() {
         let map = fixtures::height_map(1024, fixtures::hills);
         let chain = levels(&map);

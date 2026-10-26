@@ -125,7 +125,7 @@ impl DesktopEffects {
 
     /// Simulates the frame and uploads it, as the headset's frame does
     /// before its scene pass. Returns whether anything is to be drawn.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     pub fn simulate(
         &mut self,
         device: &Device,

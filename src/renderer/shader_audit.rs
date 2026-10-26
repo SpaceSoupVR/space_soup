@@ -454,7 +454,7 @@ pub(crate) fn hoistable(src: &str, entry: &str) -> Vec<Hoistable> {
         }
     }
     let mut out: Vec<Hoistable> = merged.into_values().collect();
-    out.sort_by(|a, b| (b.ops * b.copies + 4 * b.special * b.copies).cmp(&(a.ops * a.copies + 4 * a.special * a.copies)));
+    out.sort_by_key(|e| std::cmp::Reverse(e.ops * e.copies + 4 * e.special * e.copies));
     out
 }
 
@@ -527,7 +527,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not an assertion: prints the hot shaders' audit"]
     fn audit_the_hot_shaders() {
         use crate::renderer::terrain_pipeline::{terrain_shader_for, TerrainRole};
         use crate::renderer::{cave_twins, ground_twins, weather};

@@ -26,6 +26,8 @@ split_impl = "allow"
 vague_verb = "allow"
 # Renderer pipelines keep one pass per file; splitting 6000-line pipelines is a separate refactor.
 long_file = "allow"
+# `CaveClass` is public API other repos name; renaming it would break them.
+type_suffix = "allow"
 
 [limits]
 function_lines = 60

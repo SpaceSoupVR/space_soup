@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn is_monotonic() {
+    fn the_curve_is_monotonic() {
 
         let mut last = -1.0;
         let mut x = 0.0_f32;

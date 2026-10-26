@@ -1,4 +1,5 @@
     use super::*;
+    use crate::renderer::mesh::skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, IDLE_BLEND};
 
     fn workspace_root() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -389,8 +390,6 @@
             assert!(blended < prims.len(), "{rel}: every part blended");
         }
     }
-
-    use crate::renderer::mesh::skin::{blend_joint_local, ClipBlendMode, GltfAnimationPose, IDLE_BLEND};
 
     fn pose(name: &str, entries: Vec<(usize, Vec3)>, joints: usize) -> GltfAnimationPose {
         let mut joint_transforms = vec![None; joints];

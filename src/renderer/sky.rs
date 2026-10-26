@@ -6,6 +6,11 @@ pub use space_soup_sky::time_of_day::{AtlasLayers, LayerWeights, SkySnapshot, Ti
 
 use wgpu::*;
 
+use space_soup_sky::clouds::{CloudField, CloudFrame};
+use space_soup_sky::cloud_layers::{self as cloud_layers, CloudLayer, CloudModel, CloudNoise, CloudWeather, LAYERS};
+use space_soup_sky::cloud_population::CloudPopulation;
+
+use super::cloud_sky::{CloudSky, CloudSkyUniform};
 use super::lights::wgsl_lights_block;
 
 pub const AMBIENT: f32 = 0.6;
@@ -151,11 +156,6 @@ pub fn apparent_sine(true_sine: f32) -> f32 {
     let r = (1.0 / 60.0f32).to_radians() / (h + 7.31 / (h + 4.4)).to_radians().tan();
     (el + r).sin()
 }
-
-use space_soup_sky::clouds::{CloudField, CloudFrame};
-use space_soup_sky::cloud_layers::{self as cloud_layers, CloudLayer, CloudModel, CloudNoise, CloudWeather, LAYERS};
-use space_soup_sky::cloud_population::CloudPopulation;
-use crate::renderer::cloud_sky::{CloudSky, CloudSkyUniform};
 
 pub struct SkyClouds {
     pub field: std::sync::Arc<CloudField>,
@@ -645,7 +645,7 @@ fn cloud_dummy(device: &Device, queue: &Queue) -> Texture {
     texture
 }
 
-fn clouds_view(cloud_sky: &Option<CloudSky>, dummy: &Texture) -> TextureView {
+fn clouds_view(cloud_sky: Option<&CloudSky>, dummy: &Texture) -> TextureView {
     match cloud_sky {
         Some(c) => c.maps_view().clone(),
         None => dummy.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..Default::default() }),
@@ -674,14 +674,14 @@ fn alt_dummy(device: &Device, queue: &Queue) -> Texture {
     texture
 }
 
-fn cirrus_view(cloud_sky: &Option<CloudSky>, dummy: &Texture) -> TextureView {
+fn cirrus_view(cloud_sky: Option<&CloudSky>, dummy: &Texture) -> TextureView {
     match cloud_sky {
         Some(c) => c.cirrus_view(),
         None => dummy.create_view(&TextureViewDescriptor::default()),
     }
 }
 
-fn alts_view(cloud_sky: &Option<CloudSky>, dummy: &Texture) -> TextureView {
+fn alts_view(cloud_sky: Option<&CloudSky>, dummy: &Texture) -> TextureView {
     match cloud_sky {
         Some(c) => c.alts_view().clone(),
         None => dummy.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..Default::default() }),
@@ -772,7 +772,7 @@ impl Sky {
             mipmap_filter: MipmapFilterMode::Linear,
             ..Default::default()
         });
-        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer, &clouds_view(&None, &cloud_texture), &alts_view(&None, &alt_texture), &cloud_sampler, &night, (&cirrus_view(&None, &cloud_texture), &cirrus_sampler));
+        let bind_group = Self::bind(device, layout, &texture, &sampler, &extra_buffer, &clouds_view(None, &cloud_texture), &alts_view(None, &alt_texture), &cloud_sampler, &night, (&cirrus_view(None, &cloud_texture), &cirrus_sampler));
 
         Self {
             bind_group,
@@ -821,14 +821,14 @@ impl Sky {
     pub fn motion_source(&self) -> SkyMotionSource {
         SkyMotionSource {
             key: self.bind_serial,
-            maps: clouds_view(&self.cloud_sky, &self.cloud_texture),
-            alts: alts_view(&self.cloud_sky, &self.alt_texture),
+            maps: clouds_view(self.cloud_sky.as_ref(), &self.cloud_texture),
+            alts: alts_view(self.cloud_sky.as_ref(), &self.alt_texture),
             misc: [self.extra.cloud_misc[1], self.cloud_dt, self.extra.cloud_eye[0], if self.has_clouds() { 1.0 } else { 0.0 }],
             winds: self.extra.cloud_winds,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "GPU setup passes each resource explicitly; bundling them is a separate refactor")]
     fn bind(device: &Device, layout: &BindGroupLayout, texture: &Texture, sampler: &Sampler, extra: &Buffer, cloud_view: &TextureView, alt_view: &TextureView, cloud_sampler: &Sampler, night: &NightMaps, cirrus: (&TextureView, &Sampler)) -> BindGroup {
         let view = texture.create_view(&TextureViewDescriptor::default());
         device.create_bind_group(&BindGroupDescriptor {
@@ -905,7 +905,7 @@ impl Sky {
                 usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &alts_view(&self.cloud_sky, &self.alt_texture), &self.cloud_sampler, &self.night, (&cirrus_view(&self.cloud_sky, &self.cloud_texture), &self.cirrus_sampler));
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(self.cloud_sky.as_ref(), &self.cloud_texture), &alts_view(self.cloud_sky.as_ref(), &self.alt_texture), &self.cloud_sampler, &self.night, (&cirrus_view(self.cloud_sky.as_ref(), &self.cloud_texture), &self.cirrus_sampler));
             self.bind_serial += 1;
         }
         write_panorama(queue, &self.texture, pano);
@@ -922,7 +922,7 @@ impl Sky {
                 }
                 self.cloud_build = None;
             }
-            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(&self.cloud_sky, &self.cloud_texture), &alts_view(&self.cloud_sky, &self.alt_texture), &self.cloud_sampler, &self.night, (&cirrus_view(&self.cloud_sky, &self.cloud_texture), &self.cirrus_sampler));
+            self.bind_group = Self::bind(device, layout, &self.texture, &self.sampler, &self.extra_buffer, &clouds_view(self.cloud_sky.as_ref(), &self.cloud_texture), &alts_view(self.cloud_sky.as_ref(), &self.alt_texture), &self.cloud_sampler, &self.night, (&cirrus_view(self.cloud_sky.as_ref(), &self.cloud_texture), &self.cirrus_sampler));
             self.bind_serial += 1;
         }
         // A new weather field starts the worker's births over.
@@ -959,8 +959,8 @@ impl Sky {
                 // "the sky was much less dense, and then all of the sudden it was
                 // filled"). Left to the worker, the first maps were drawn from
                 // the weather's mean, a sparser sky, and the population's own
-                // cross-faded in seconds later. This is the level's load, where
-                // its 1.7 s on this thread cost nothing played.
+                // cross-faded in seconds later. At the level's load, 1.7 s on
+                // this thread costs nothing played.
                 if self.clouds_populated {
                     c.settle(self.cloud_worker.as_mut(), warm);
                 } else {
@@ -1951,7 +1951,7 @@ mod tests {
     /// ms now and then (TODTIME, 2026-10-21): a dropped frame each second.
     /// `--ignored`.
     #[test]
-    #[ignore]
+    #[ignore = "slow timing measurement; run by hand with --ignored"]
     fn time_the_clouds_on_the_render_thread() {
         use space_soup_sky::cloud_layers::CloudModel;
         use space_soup_sky::cloud_population::CloudPopulation;
@@ -2657,7 +2657,7 @@ mod render_tests {
     /// whole at that moment, its share of cloud above 10 deg printed (the
     /// offline frames lost every cumulus past ~200 s, 2026-10-22).
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: prints the sky map's cloud over ten minutes"]
     fn print_the_sky_maps_cloud_through_ten_minutes() {
         use crate::renderer::cloud_sky::tests::{half, read_back};
         use crate::renderer::cloud_sky::{MAP_HEIGHT, MAP_WIDTH};
@@ -2724,7 +2724,7 @@ mod render_tests {
     /// to move at all"). Turns the worker on for the whole process, so run it
     /// alone: `--ignored --exact`.
     #[test]
-    #[ignore]
+    #[ignore = "slow: drives the cloud worker on a headless GPU"]
     fn the_headsets_clouds_move_with_the_worker() {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         crate::renderer::cloud_worker::enable();
@@ -2786,7 +2786,7 @@ mod render_tests {
     /// fixes: "still had the back step"). Prints `SHOWN` per frame and a
     /// summary. Turns the worker on for the process: `--ignored --exact`.
     #[test]
-    #[ignore]
+    #[ignore = "slow: drives the cloud worker on a headless GPU"]
     fn the_shown_clouds_ride_their_wind_frame_by_frame() {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         crate::renderer::cloud_worker::enable();

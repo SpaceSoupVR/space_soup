@@ -39,7 +39,7 @@ pub enum VibrancyMaterial {
 }
 
 impl VibrancyMaterial {
-    fn to_ns(self) -> NSVisualEffectMaterial {
+    fn ns_material(self) -> NSVisualEffectMaterial {
         match self {
             Self::HudWindow => NSVisualEffectMaterial::HUDWindow,
             Self::UnderWindowBackground => NSVisualEffectMaterial::UnderWindowBackground,
@@ -131,7 +131,7 @@ pub fn configure_macos_window(
         ns_window.setStyleMask(ns_window.styleMask() | NSWindowStyleMask::FullSizeContentView);
         unsafe {
             let toolbar = NSToolbar::init(mtm.alloc());
-            #[allow(deprecated)]
+            #[allow(deprecated, reason = "AppKit deprecated the setter but it is still the only way to hide the baseline separator")]
             toolbar.setShowsBaselineSeparator(false);
             ns_window.setToolbar(Some(&toolbar));
             ns_window.setToolbarStyle(NSWindowToolbarStyle::Unified);
@@ -174,7 +174,7 @@ pub fn install_window_vibrancy(
         };
 
         let blur = NSVisualEffectView::initWithFrame(mtm.alloc(), content.frame());
-        blur.setMaterial(material.to_ns());
+        blur.setMaterial(material.ns_material());
         blur.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
         blur.setState(NSVisualEffectState::FollowsWindowActiveState);
         blur.setAutoresizingMask(
