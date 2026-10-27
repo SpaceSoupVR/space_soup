@@ -275,7 +275,7 @@ impl Worker {
             // Between keyframes, a step along the arc moves the bounce too.
             let keyed = match (a.key, b.key) {
                 (Some(x), Some(y)) => {
-                    (x.a, x.b) != (y.a, y.b) && (x.a, x.b) != (y.b, y.a)
+                    (x.nearest, x.neighbour) != (y.nearest, y.neighbour) && (x.nearest, x.neighbour) != (y.neighbour, y.nearest)
                         || (x.t - y.t).abs() > RELIGHT_STEP
                         || (0..3).any(|c| far(x.light[c], y.light[c]))
                 }
@@ -418,10 +418,10 @@ mod tests {
     /// toward it.
     #[test]
     fn the_sun_bounce_walks_its_keyframes() {
-        use space_soup_sky::time_of_day::{sun_key_hours, SunKey};
+        use space_soup_sky::time_of_day::SunKey;
         let (sky, sun) = hdri_like();
         let params = TimeOfDayParams::default();
-        let hours = sun_key_hours(&params, 4);
+        let hours = params.sun_key_hours(4);
         let flat = |v: f32| vec![v, v, v, 1.0, v, v, v, 1.0, v, v, v, 1.0, v, v, v, 1.0];
         let layers = Arc::new(AtlasLayers {
             width: 2,
@@ -439,10 +439,10 @@ mod tests {
             (p.weights.key.unwrap(), light)
         };
         let (k1, _) = at(&mut w, hours[1].0);
-        let on = if k1.t < 0.5 { k1.a } else { k1.b };
+        let on = if k1.t < 0.5 { k1.nearest } else { k1.neighbour };
         assert!(on == 1 && (k1.t < 0.02 || k1.t > 0.98), "{k1:?}");
         let (k, _) = at(&mut w, f32::midpoint(hours[1].0, hours[2].0));
-        assert!([k.a, k.b].contains(&1) && [k.a, k.b].contains(&2) && (k.t - 0.5).abs() < 0.15, "{k:?}");
+        assert!([k.nearest, k.neighbour].contains(&1) && [k.nearest, k.neighbour].contains(&2) && (k.t - 0.5).abs() < 0.15, "{k:?}");
         let prepared = w.prepare(f32::midpoint(hours[1].0, hours[2].0), 0.0, true);
         let lit = crate::renderer::mesh::lightmap_mips_f16(
             &w.layers.as_ref().unwrap().relit(&prepared.weights),

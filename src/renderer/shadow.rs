@@ -2577,7 +2577,7 @@ mod render_tests {
                     pano.rgb[i + 2] = 3.0;
                 }
             }
-            SkyUpload::from(&crate::renderer::sky::project_irradiance(&pano, 0.0, 1.0))
+            SkyUpload::from(&crate::renderer::sky::SkyIrradiance::from_panorama(&pano, 0.0, 1.0))
         };
 
         let toward = shot!(Scene {
@@ -2615,7 +2615,7 @@ mod render_tests {
             }
             p
         };
-        let irr = crate::renderer::sky::project_irradiance(&pano, 0.0, 1.0);
+        let irr = crate::renderer::sky::SkyIrradiance::from_panorama(&pano, 0.0, 1.0);
         let sky = SkyUpload::from(&irr);
 
         for normal in [

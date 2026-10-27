@@ -18,7 +18,7 @@
 //! The headset turns it on (`enable`); tests and the offline harness keep the
 //! synchronous update, so a still frame is the same every time.
 
-use space_soup_sky::cloud_layers::{transmittance_toward, CloudModel, CloudNoise, CloudWeather};
+use space_soup_sky::cloud_layers::{CloudModel, CloudNoise, CloudVolume, CloudWeather};
 use space_soup_sky::cloud_population::{CloudPopulation, UPDATE_S};
 use space_soup_sky::clouds::{CloudField, CloudParams};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,7 +74,7 @@ impl CloudWorker {
                     frame.place(&mut layers, r.seconds);
                     let w = CloudWeather::new(&r.field, Some(&frame));
                     for (xz, alt, dir) in &r.warm {
-                        transmittance_toward(&layers, &noise, w, *xz, *alt, *dir);
+                        CloudVolume::new(&layers, &noise, w).transmittance_toward(*xz, *alt, *dir);
                     }
                     if res_tx.send(frame).is_err() {
                         break;

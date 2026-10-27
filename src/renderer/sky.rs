@@ -1,7 +1,4 @@
-pub use space_soup_sky::{
-    decode_radiance, project_irradiance, sky_lighting, uv_to_direction, Panorama, SkyIrradiance,
-    SkySun,
-};
+pub use space_soup_sky::{Panorama, SkyIrradiance, SkySun};
 pub use space_soup_sky::time_of_day::{AtlasLayers, LayerWeights, SkySnapshot, TimeOfDayParams, TimeOfDaySky};
 
 use wgpu::*;
@@ -93,11 +90,11 @@ impl SkyExtra {
         self.set_cloud_offsets(f);
         self.cloud_misc[2] = f.sigma_column;
         self.cloud_misc[3] = p.altitude_m + 0.5 * p.thickness_m;
-        self.cloud_light_dir = [f.light_dir[0], f.light_dir[1], f.light_dir[2], p.thickness_m];
+        self.cloud_light_dir = [f.light.dir[0], f.light.dir[1], f.light.dir[2], p.thickness_m];
         let v4 = |v: [f32; 3]| [v[0], v[1], v[2], 0.0];
-        self.cloud_light = v4(f.light_irradiance);
-        self.cloud_sky = v4(f.ambient_sky);
-        self.cloud_ground = v4(f.ambient_ground);
+        self.cloud_light = v4(f.light.irradiance);
+        self.cloud_sky = v4(f.light.ambient_sky);
+        self.cloud_ground = v4(f.light.ambient_ground);
     }
 
     pub fn set_cloud_offsets(&mut self, f: &CloudFrame) {
@@ -110,11 +107,11 @@ impl SkyExtra {
 
     pub fn from_snapshot(snap: &SkySnapshot, seconds: f32, zenith_depth: [f32; 3]) -> Self {
         use space_soup_sky::time_of_day as tod;
-        let d = &snap.discs;
+        let d = &snap.bodies.discs;
         let v4 = |v: [f32; 3], w: f32| [v[0], v[1], v[2], w];
         // The moon's illuminance at the eye per unit of `moon_radiance` (the
         // full disc's): its solid angle times its phase's share (the halo).
-        let moon_halo = std::f32::consts::PI * tod::MOON_ANGULAR_RADIUS.powi(2) * tod::moon_phase_brightness(snap.astro.moon_phase_angle);
+        let moon_halo = std::f32::consts::PI * tod::MOON_ANGULAR_RADIUS.powi(2) * tod::Astronomy::moon_phase_brightness(snap.astro.moon_phase_angle);
 
         let mean_sky = 1.0 / snap.panorama_scale.max(1e-30);
         let px = (0.05f32).to_radians();
@@ -181,7 +178,7 @@ pub struct SkyClouds {
 /// and every snapshot's frame was set back to real time at the next tick
 /// (user: the clouds "do not noticeably move").
 fn cloud_clock(frame: &CloudFrame, real: f64) -> f64 {
-    real * f64::from(frame.params.clamped().time_scale)
+    real * f64::from(frame.params.clamped().clock.time_scale)
 }
 
 impl SkyClouds {
@@ -223,7 +220,7 @@ pub fn level_transmittance(layers: &[CloudLayer; LAYERS], weather: CloudWeather,
     for j in 0..3 {
         for i in 0..3 {
             let xz = [(i as f32 - 1.0) * h, (j as f32 - 1.0) * h];
-            sum += cloud_layers::transmittance_toward(layers, &noise, weather, xz, 0.0, d);
+            sum += cloud_layers::CloudVolume::new(layers, &noise, weather).transmittance_toward(xz, 0.0, d);
         }
     }
     sum / 9.0
@@ -430,7 +427,7 @@ pub struct ReflectionSky {
 impl ReflectionSky {
 
     pub fn new(pano: &Panorama, rotation_deg: f32, intensity: f32) -> Self {
-        let pano = match space_soup_sky::extract_sun(pano, rotation_deg, intensity) {
+        let pano = match pano.extract_sun(rotation_deg, intensity) {
             Some((_, rest)) => rest,
             None => pano.clone(),
         };
@@ -592,7 +589,7 @@ impl NightMaps {
         use space_soup_sky::night_sky as ns;
         static CELLS: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
         static MILKY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-        let cells = CELLS.get_or_init(|| ns::star_cells(STAR_CELLS as u32).into_iter().flatten().collect());
+        let cells = CELLS.get_or_init(|| (ns::StarCells { cells: STAR_CELLS as u32 }).texels().into_iter().flatten().collect());
         let milky = MILKY.get_or_init(|| ns::MILKY_WAY_MAP.chunks_exact(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect());
         let n = STAR_CELLS as u32;
         let make = |label: &str, w: u32, h: u32, bytes: &[u8]| {
@@ -738,9 +735,9 @@ impl Sky {
         });
 
         let light_pano = pano.for_lighting(1024);
-        let (irradiance, sun, without_sun) = match space_soup_sky::extract_sun(&light_pano, rotation_deg, intensity) {
-            Some((sun, rest)) => (project_irradiance(&rest, rotation_deg, intensity), Some(sun), rest),
-            None => (project_irradiance(&light_pano, rotation_deg, intensity), None, light_pano.clone()),
+        let (irradiance, sun, without_sun) = match light_pano.extract_sun(rotation_deg, intensity) {
+            Some((sun, rest)) => (SkyIrradiance::from_panorama(&rest, rotation_deg, intensity), Some(sun), rest),
+            None => (SkyIrradiance::from_panorama(&light_pano, rotation_deg, intensity), None, light_pano.clone()),
         };
         let extra = SkyExtra::default();
         let extra_buffer = device.create_buffer(&BufferDescriptor {
@@ -875,7 +872,7 @@ impl Sky {
         });
         let (from_pano, from_scale, from_irradiance, from_sun) = match from {
             Some(f) => f,
-            None => (to_pano.clone(), snap.panorama_scale, snap.irradiance, snap.light_clear.map(|l| l.light_rgb)),
+            None => (to_pano.clone(), snap.panorama_scale, snap.irradiance, snap.cloud_sky.light_clear.map(|l| l.light_rgb)),
         };
         self.blend = Some(SkyBlend {
             width: snap.panorama.width,
@@ -887,7 +884,7 @@ impl Sky {
             from_irradiance,
             to_irradiance: snap.irradiance,
             from_sun,
-            to_sun: snap.light_clear,
+            to_sun: snap.cloud_sky.light_clear,
             t: if blend_seconds > 0.0 { 0.0 } else { 1.0 },
             seconds: blend_seconds,
         });
@@ -909,13 +906,13 @@ impl Sky {
             self.bind_serial += 1;
         }
         write_panorama(queue, &self.texture, pano);
-        let new_field = match (&snap.cloud_field, &self.clouds) {
+        let new_field = match (&snap.cloud_sky.field, &self.clouds) {
             (Some(f), Some(c)) => !std::sync::Arc::ptr_eq(f, &c.field),
             (Some(_), None) => true,
             _ => false,
         };
         if new_field {
-            if let Some(field) = snap.cloud_field.as_deref() {
+            if let Some(field) = snap.cloud_sky.field.as_deref() {
                 match self.cloud_sky.as_mut() {
                     Some(c) => c.set_weather(device, queue, field),
                     None => self.cloud_sky = Some(CloudSky::new(device, queue, field, &CloudNoise::shared())),
@@ -935,7 +932,7 @@ impl Sky {
         let warm = self.cloud_warm_rays();
         let kept = self.clouds.as_ref().map(|c| c.model.clone());
         let population = self.clouds.as_mut().filter(|_| !new_field).map(|c| std::mem::take(&mut c.population)).unwrap_or_default();
-        self.clouds = match (snap.clouds, &snap.cloud_field) {
+        self.clouds = match (snap.cloud_sky.frame, &snap.cloud_sky.field) {
             (Some(frame), Some(field)) => {
                 let model = kept
                     .filter(|m| m.params == frame.params)
@@ -944,7 +941,7 @@ impl Sky {
                 let mut c = SkyClouds {
                     field: field.clone(),
                     frame: frame.at(secs),
-                    sun_clear: snap.light_clear,
+                    sun_clear: snap.cloud_sky.light_clear,
                     layers: model.layers(secs),
                     model,
                     seconds: secs,
@@ -952,7 +949,7 @@ impl Sky {
                     // after the ground's has become the moon
                     // (`TimeOfDaySky::snapshot`, the clouds' light at their
                     // height): its direction glides on with this one.
-                    light_is_moon: dot3(frame.light_dir, snap.astro.moon) > dot3(frame.light_dir, snap.astro.sun),
+                    light_is_moon: dot3(frame.light.dir, snap.astro.moon) > dot3(frame.light.dir, snap.astro.sun),
                     population,
                 };
                 // THE FIRST POPULATION BEFORE THE FIRST MAP (2026-10-23, user: "the
@@ -1008,7 +1005,7 @@ impl Sky {
         let warm = self.cloud_warm_rays();
         if let Some(c) = self.clouds.as_mut() {
             let now = cloud_clock(&c.frame, f64::from(seconds));
-            self.cloud_dt = (now - c.seconds).clamp(0.0, 0.25 * f64::from(c.frame.params.clamped().time_scale.max(1.0))) as f32;
+            self.cloud_dt = (now - c.seconds).clamp(0.0, 0.25 * f64::from(c.frame.params.clamped().clock.time_scale.max(1.0))) as f32;
             let before = c.seconds;
             c.seconds = now;
             c.frame = c.frame.at(c.seconds);
@@ -1026,7 +1023,7 @@ impl Sky {
                     c.population.generation(),
                     n,
                     self.cloud_worker.is_some(),
-                    c.layers.get(1).map(|l| l.offset),
+                    c.layers.get(1).map(|l| l.motion.offset),
                 );
             }
             self.extra.set_cloud_offsets(&c.frame);
@@ -1065,7 +1062,7 @@ impl Sky {
         // from the eye (`sky_halo_through` in the cloud shader).
         let noise = CloudNoise::shared();
         let eye = self.eye_xz;
-        let toward = |v: [f32; 4]| cloud_layers::transmittance_toward(&c.layers, &noise, c.weather(), eye, 0.0, unit3([v[0], v[1], v[2]]));
+        let toward = |v: [f32; 4]| cloud_layers::CloudVolume::new(&c.layers, &noise, c.weather()).transmittance_toward(eye, 0.0, unit3([v[0], v[1], v[2]]));
         self.extra.cloud_sky[3] = toward(self.extra.sun);
         self.extra.cloud_ground[3] = toward(self.extra.moon);
     }
@@ -1093,7 +1090,7 @@ impl Sky {
 
     pub fn cloud_light_dir(&self) -> Option<[f32; 3]> {
         let c = self.clouds.as_ref()?;
-        Some(unit3(self.light_now.unwrap_or(c.frame.light_dir)))
+        Some(unit3(self.light_now.unwrap_or(c.frame.light.dir)))
     }
 
     /// The last `step_clouds`' CPU stages, for the headset's log.
@@ -1163,7 +1160,7 @@ impl Sky {
             let noise = CloudNoise::shared();
             let ray = |n: usize| {
                 let at = |k: usize| (k as f32 - 1.5) / 4.0 * CLOUD_SHADOW_EXTENT_M;
-                cloud_layers::transmittance_toward(&c.layers, &noise, c.weather(), [centre[0] + at(n % 4), centre[1] + at(n / 4)], eye[1], dir)
+                cloud_layers::CloudVolume::new(&c.layers, &noise, c.weather()).transmittance_toward([centre[0] + at(n % 4), centre[1] + at(n / 4)], eye[1], dir)
             };
             let samples = cs.samples.get_or_insert_with(|| std::array::from_fn(ray));
             let n = cs.frames as usize % CLOUD_SHADOW_MEAN_FRAMES as usize;
@@ -1176,7 +1173,7 @@ impl Sky {
         cs.active = light.is_some() && shadow.is_some();
         mark(0);
         let f = &c.frame;
-        let u = CloudSkyUniform::new(&c.layers, eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean).with_aerosol(self.aerosol_per_m);
+        let u = CloudSkyUniform::new(&c.layers, eye, dir, f.light.irradiance, f.light.ambient_sky, f.light.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean).with_aerosol(self.aerosol_per_m);
         // A map holds the sky at one moment, seen from one eye, through all
         // its slices; the sky shader carries it on from there. A map begun
         // now is shown most two builds from now, so it is of then.
@@ -1197,7 +1194,7 @@ impl Sky {
             // they are now (their origin can move at any update).
             let mut layers = c.model.layers(at);
             c.population.place(&mut layers, at);
-            let m = CloudSkyUniform::new(&layers, build_eye, dir, f.light_irradiance, f.ambient_sky, f.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean).with_aerosol(self.aerosol_per_m);
+            let m = CloudSkyUniform::new(&layers, build_eye, dir, f.light.irradiance, f.light.ambient_sky, f.light.ambient_ground, centre, CLOUD_SHADOW_EXTENT_M, cs.mean).with_aerosol(self.aerosol_per_m);
             mark(1);
             gpu.set_population(device, queue, &c.population);
             mark(2);
@@ -1247,7 +1244,7 @@ impl Sky {
     /// How hard the clouds over `xz` (world) rain, 0..1
     /// (`space_soup_sky::precipitation`); None with no clouds in the sky.
     pub fn precipitation_at(&self, xz: [f32; 2]) -> Option<f32> {
-        self.clouds.as_ref().map(|c| space_soup_sky::precipitation::precipitation_at(&c.layers, c.weather(), xz))
+        self.clouds.as_ref().map(|c| c.weather().precipitation_at(&c.layers, xz))
     }
 
     /// Where the shown map lies (`Uniforms::cloud_map`) for the player's
@@ -1268,7 +1265,7 @@ impl Sky {
         let clear = self.clouds.as_ref().filter(|_| self.cloud_shadow.active).and_then(|c| c.sun_clear.map(|s| (c, s)));
         let Some((c, s)) = clear else { return self.sun };
         let dir = self.cloud_light_dir().unwrap_or(s.direction);
-        let t = cloud_layers::transmittance_penumbra(&c.layers, &CloudNoise::shared(), c.weather(), xz, 0.0, dir);
+        let t = cloud_layers::CloudVolume::new(&c.layers, &CloudNoise::shared(), c.weather()).transmittance_penumbra(xz, 0.0, dir);
         Some(SkySun { light_rgb: s.light_rgb.map(|v| v * t), ..s })
     }
 
@@ -1785,7 +1782,7 @@ fn sky_sun_disc(d: vec3<f32>, px: f32, k: f32) -> vec3<f32> {{
 "#,
         lights_block = wgsl_lights_block(0, 1),
         star_cells = STAR_CELLS,
-        milky_way_scale = space_soup_sky::night_sky::milky_way_scale(),
+        milky_way_scale = space_soup_sky::night_sky::MilkyWay::scale(),
         limb_r = SUN_LIMB_U[0],
         limb_g = SUN_LIMB_U[1],
         limb_b = SUN_LIMB_U[2],
@@ -1946,7 +1943,7 @@ mod tests {
         use space_soup_sky::cloud_population::CloudPopulation;
         let field = CloudField::build(7);
         let noise = CloudNoise::shared();
-        let params = space_soup_sky::clouds::CloudParams { coverage: 0.45, wind_speed: 12.0, ..Default::default() };
+        let params = space_soup_sky::clouds::CloudParams { coverage: 0.45, wind: space_soup_sky::clouds::CloudWind { speed: 12.0, ..space_soup_sky::clouds::CloudWind::default() }, ..Default::default() };
         let model = CloudModel::new(&params, &noise);
         let built = std::time::Instant::now();
         let _again = CloudModel::new(&params, &noise);
@@ -1972,14 +1969,14 @@ mod tests {
             let l0 = std::time::Instant::now();
             let _ = level_transmittance(&layers, w, dir);
             let l1 = std::time::Instant::now();
-            let _ = cloud_layers::transmittance_toward(&layers, &noise, w, [3.0, 4.0], 0.0, unit3(dir));
-            let _ = cloud_layers::transmittance_toward(&layers, &noise, w, [3.0, 4.0], 0.0, unit3([-0.4, 0.5, -0.3]));
+            let _ = cloud_layers::CloudVolume::new(&layers, &noise, w).transmittance_toward([3.0, 4.0], 0.0, unit3(dir));
+            let _ = cloud_layers::CloudVolume::new(&layers, &noise, w).transmittance_toward([3.0, 4.0], 0.0, unit3([-0.4, 0.5, -0.3]));
             sum_level += (l1 - l0).as_secs_f64() * 1000.0;
             sum_halo += l1.elapsed().as_secs_f64() * 1000.0;
             // The shadow's mean, one of its 16 points a frame (`step_clouds`).
             let m = std::time::Instant::now();
             let k = f % CLOUD_SHADOW_MEAN_FRAMES as usize;
-            let _ = cloud_layers::transmittance_toward(&layers, &noise, w, [(k % 4) as f32 * 1000.0, (k / 4) as f32 * 1000.0], 0.0, unit3(dir));
+            let _ = cloud_layers::CloudVolume::new(&layers, &noise, w).transmittance_toward([(k % 4) as f32 * 1000.0, (k / 4) as f32 * 1000.0], 0.0, unit3(dir));
             worst_mean = worst_mean.max(m.elapsed().as_secs_f64() * 1000.0);
             let c = std::time::Instant::now();
             let (u, r, all) = ((b - a).as_secs_f64() * 1000.0, (c - b).as_secs_f64() * 1000.0, (c - a).as_secs_f64() * 1000.0);
@@ -2043,7 +2040,7 @@ mod tests {
         let p = workspace_root()
             .join("game/skies/kloofendal_48d_partly_cloudy_puresky/sky.hdr");
         let bytes = std::fs::read(p).ok()?;
-        decode_radiance(&bytes).ok()
+        Panorama::from_radiance(&bytes).ok()
     }
 
     #[test]
@@ -2113,7 +2110,7 @@ mod tests {
             eprintln!("skipping: the lobby's sky is not installed");
             return;
         };
-        let sh = project_irradiance(&pano, 0.0, 1.0);
+        let sh = SkyIrradiance::from_panorama(&pano, 0.0, 1.0);
 
         let up = sh.evaluate([0.0, 1.0, 0.0]);
         let down = sh.evaluate([0.0, -1.0, 0.0]);
@@ -2147,7 +2144,7 @@ mod tests {
             [0.3, 0.5, -0.8],
         ] {
             let uv = direction_to_uv(d);
-            let back = uv_to_direction(uv[0], uv[1]);
+            let back = Panorama::direction_at(uv[0], uv[1]);
             let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
             for c in 0..3 {
                 assert!(
@@ -2162,7 +2159,7 @@ mod tests {
     fn a_uniform_sky_gives_uniform_irradiance() {
 
         let pano = Panorama::solid([0.5, 0.5, 0.5], 64, 32);
-        let sh = project_irradiance(&pano, 0.0, 1.0);
+        let sh = SkyIrradiance::from_panorama(&pano, 0.0, 1.0);
         for n in [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.3, -0.4, 0.9]] {
             let e = sh.evaluate(n);
             for c in 0..3 {
@@ -2186,7 +2183,7 @@ mod tests {
                 pano.rgb[i + 2] = 10.0;
             }
         }
-        let up = project_irradiance(&pano, 0.0, 1.0).evaluate([0.0, 1.0, 0.0]);
+        let up = SkyIrradiance::from_panorama(&pano, 0.0, 1.0).evaluate([0.0, 1.0, 0.0]);
         assert!(
             up[0] < 1.0,
             "a thin cap at the pole contributed {up:?}, so it is not being \
@@ -2207,7 +2204,7 @@ mod tests {
                 pano.rgb[i + 2] = 4.0;
             }
         }
-        let sh = project_irradiance(&pano, 0.0, 1.0);
+        let sh = SkyIrradiance::from_panorama(&pano, 0.0, 1.0);
 
         let lit = sh.evaluate([-1.0, 0.0, 0.0]);
         let dark = sh.evaluate([1.0, 0.0, 0.0]);
@@ -2230,8 +2227,8 @@ mod tests {
             }
         }
         let probe = [-1.0, 0.0, 0.0];
-        let straight = project_irradiance(&pano, 0.0, 1.0).evaluate(probe);
-        let turned = project_irradiance(&pano, 180.0, 1.0).evaluate(probe);
+        let straight = SkyIrradiance::from_panorama(&pano, 0.0, 1.0).evaluate(probe);
+        let turned = SkyIrradiance::from_panorama(&pano, 180.0, 1.0).evaluate(probe);
         assert!(
             (straight[0] - turned[0]).abs() > straight[0] * 0.3,
             "turning the sky by 180 degrees barely changed the light: \
@@ -2242,8 +2239,8 @@ mod tests {
     #[test]
     fn intensity_scales_the_light_it_casts() {
         let pano = Panorama::solid([0.4, 0.4, 0.4], 32, 16);
-        let one = project_irradiance(&pano, 0.0, 1.0).evaluate([0.0, 1.0, 0.0]);
-        let two = project_irradiance(&pano, 0.0, 2.0).evaluate([0.0, 1.0, 0.0]);
+        let one = SkyIrradiance::from_panorama(&pano, 0.0, 1.0).evaluate([0.0, 1.0, 0.0]);
+        let two = SkyIrradiance::from_panorama(&pano, 0.0, 2.0).evaluate([0.0, 1.0, 0.0]);
         assert!((two[0] - one[0] * 2.0).abs() < 0.01, "{one:?} vs {two:?}");
     }
 
@@ -2279,8 +2276,8 @@ mod tests {
 
     #[test]
     fn a_malformed_file_is_refused_rather_than_guessed_at() {
-        assert!(decode_radiance(b"not an hdr at all").is_err());
-        assert!(decode_radiance(b"#?RADIANCE\n\n+Y 4 +X 4\n").is_err());
+        assert!(Panorama::from_radiance(b"not an hdr at all").is_err());
+        assert!(Panorama::from_radiance(b"#?RADIANCE\n\n+Y 4 +X 4\n").is_err());
     }
 }
 
@@ -2624,7 +2621,7 @@ mod render_tests {
         let px = shot!(look_at_snapshot([0.0, 1.0, 0.0], &noon, zenith, 0.5, 4.0));
         assert!(px[2] > px[0] + 30 && px[2] > px[1] && px[2] > 60, "noon's zenith is not blue: {px:?}");
         let night = tod.snapshot(23.5, 0.0);
-        let moon = night.moon.direction;
+        let moon = night.bodies.moon.direction;
         assert!(moon[1] > 0.2, "the moon should be up at 23:30 in the defaults: {moon:?}");
 
         let disc = shot!(look_at_snapshot(moon, &night, zenith, 0.02, 4.0));
@@ -2652,7 +2649,7 @@ mod render_tests {
         use crate::renderer::cloud_sky::{MAP_HEIGHT, MAP_WIDTH};
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         let layout = sky_bind_group_layout(&device);
-        let clouds = space_soup_sky::clouds::CloudParams { coverage: 0.45, altitude_m: 1200.0, wind_speed: 16.0, weather_minutes: 15.0, storms: 0.35, time_scale: 2.5, kinds: [1.0, 1.0, 0.0, 1.0], ..Default::default() };
+        let clouds = space_soup_sky::clouds::CloudParams { coverage: 0.45, altitude_m: 1200.0, wind: space_soup_sky::clouds::CloudWind { speed: 16.0, ..space_soup_sky::clouds::CloudWind::default() }, change: space_soup_sky::clouds::WeatherChange { minutes: 15.0, storms: 0.35 }, clock: space_soup_sky::clouds::CloudClock { time_scale: 2.5, ..space_soup_sky::clouds::CloudClock::default() }, kinds: [1.0, 1.0, 0.0, 1.0], ..Default::default() };
         let params = TimeOfDayParams { start_hour: 15.0, day_minutes: 0.0, clouds, ..Default::default() };
         let tod = TimeOfDaySky::new(params);
         let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
@@ -2690,7 +2687,7 @@ mod render_tests {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         let layout = sky_bind_group_layout(&device);
         let run = |time_scale: f32| {
-            let clouds = space_soup_sky::clouds::CloudParams { coverage: 0.45, time_scale, ..Default::default() };
+            let clouds = space_soup_sky::clouds::CloudParams { coverage: 0.45, clock: space_soup_sky::clouds::CloudClock { time_scale, ..space_soup_sky::clouds::CloudClock::default() }, ..Default::default() };
             let params = TimeOfDayParams { start_hour: 13.0, day_minutes: 20.0, clouds, ..Default::default() };
             let tod = TimeOfDaySky::new(params);
             let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
@@ -2718,7 +2715,7 @@ mod render_tests {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         crate::renderer::cloud_worker::enable();
         let layout = sky_bind_group_layout(&device);
-        let clouds = space_soup_sky::clouds::CloudParams { coverage: 0.45, wind_speed: 12.0, weather_minutes: 15.0, storms: 0.35, ..Default::default() };
+        let clouds = space_soup_sky::clouds::CloudParams { coverage: 0.45, wind: space_soup_sky::clouds::CloudWind { speed: 12.0, ..space_soup_sky::clouds::CloudWind::default() }, change: space_soup_sky::clouds::WeatherChange { minutes: 15.0, storms: 0.35 }, ..Default::default() };
         let params = TimeOfDayParams { start_hour: 16.5, day_minutes: 20.0, clouds, ..Default::default() };
         let tod = TimeOfDaySky::new(params);
         let zenith = tod.atmosphere.eye_transmittance([0.0, 1.0, 0.0]).map(|t| -t.max(1e-6).ln());
@@ -2778,7 +2775,7 @@ mod render_tests {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         crate::renderer::cloud_worker::enable();
         let layout = sky_bind_group_layout(&device);
-        let mut clouds = space_soup_sky::clouds::CloudParams { coverage: 0.35, wind_speed: 16.0, weather_minutes: 15.0, storms: 0.35, time_scale: 2.5, altitude_m: 1200.0, ..Default::default() };
+        let mut clouds = space_soup_sky::clouds::CloudParams { coverage: 0.35, wind: space_soup_sky::clouds::CloudWind { speed: 16.0, ..space_soup_sky::clouds::CloudWind::default() }, change: space_soup_sky::clouds::WeatherChange { minutes: 15.0, storms: 0.35 }, clock: space_soup_sky::clouds::CloudClock { time_scale: 2.5, ..space_soup_sky::clouds::CloudClock::default() }, altitude_m: 1200.0, ..Default::default() };
         clouds.kinds = [1.0, 1.0, 0.0, 1.0];
         // `SHOWN_KINDS=0,0,0,1`: one layer alone (the cirrus).
         if let Ok(k) = std::env::var("SHOWN_KINDS") {
@@ -3123,7 +3120,7 @@ mod render_tests {
             let direct = sky.sun_direct().map_or(0.0, |s| s.light_rgb[1]);
             let level = sky.sun.map_or(0.0, |s| s.light_rgb[1]);
             let c = sky.clouds.as_ref().unwrap();
-            let t = space_soup_sky::cloud_layers::transmittance_penumbra(&c.layers, &CloudNoise::shared(), c.weather(), [eye[0], eye[2]], eye[1], sky.cloud_light_dir().unwrap());
+            let t = space_soup_sky::cloud_layers::CloudVolume::new(&c.layers, &CloudNoise::shared(), c.weather()).transmittance_penumbra([eye[0], eye[2]], eye[1], sky.cloud_light_dir().unwrap());
             seen.push((secs, direct, level, t));
         }
         // The change in the light reaching the eye as a share of the clear
@@ -3167,8 +3164,8 @@ mod render_tests {
     fn the_cloud_shader_shows_cloud_where_the_map_has_it_and_sky_between() {
         let (snap, zenith) = cloud_snapshot(0.5);
         let mut clear_snap = snap.clone();
-        clear_snap.clouds = None;
-        clear_snap.cloud_field = None;
+        clear_snap.cloud_sky.frame = None;
+        clear_snap.cloud_sky.field = None;
         let post = PostUpload { exposure: 4.0, ..Default::default() };
         let (mut gaps, mut clouds) = (0, 0);
         for i in 0..24 {
@@ -3176,7 +3173,7 @@ mod render_tests {
             let up = 0.35 + 0.6 * ((i * 7) % 11) as f32 / 11.0;
             let h = (1.0 - up * up).sqrt();
             let d = glam::Vec3::new(h * a.cos(), up, h * a.sin()).normalize();
-            if d.dot(glam::Vec3::from(snap.discs.sun_dir)) > 0.99 {
+            if d.dot(glam::Vec3::from(snap.bodies.discs.sun_dir)) > 0.99 {
                 continue;
             }
             let sky = shot!(snap_px(d.to_array(), &clear_snap, zenith, 0.01, post, false));

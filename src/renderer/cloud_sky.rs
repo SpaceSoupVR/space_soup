@@ -229,7 +229,7 @@ pub fn flow_wind(alt: f32, winds: &[[f32; 4]; LAYERS]) -> [f32; 2] {
 /// only the CPU twin's fallback.
 pub fn flow_winds(p: &space_soup_sky::clouds::CloudParams, layers: &[CloudLayer; LAYERS]) -> [[f32; 4]; LAYERS] {
     let mut w: [[f32; 4]; LAYERS] = std::array::from_fn(|k| {
-        let (dir, v) = cl::layer_wind(p, k);
+        let (dir, v) = p.layer_wind(k);
         [f32::midpoint(layers[k].base_m, layers[k].top_m), (dir[0] * v) as f32, (dir[1] * v) as f32, k as f32]
     });
     w.sort_by(|a, b| a[0].total_cmp(&b[0]));
@@ -1381,7 +1381,7 @@ pub fn cloud_sky_shader() -> String {
     let f = |v: f32| format!("{v:?}");
     let means = CloudNoise::shared().channel_means();
     let steps = |s: [u32; 3]| format!("vec3<u32>({}u, {}u, {}u)", s[0], s[1], s[2]);
-    let mie = c::mie_phase_fit(c::CLOUD_DROPLET_UM);
+    let mie = c::MiePhase::from_diameter(c::CLOUD_DROPLET_UM).fit;
     CLOUD_SKY_WGSL
         .replace("{EARTH}", &format!("{:.1}", c::EARTH_RADIUS_M))
         .replace("{DETAIL_RATIO}", &f(cl::DETAIL_RATIO))
@@ -1473,7 +1473,7 @@ pub fn cloud_sky_shader() -> String {
 }
 
 /// The envelope pass: each live cloud a square around its profile, added
-/// into its layer's map (`cloud_population::splat_value`, line for line).
+/// into its layer's map (`cloud_population::Splat::value`, line for line).
 /// The prefilter (`PREFILTER`): the march's texels, 5 x 5, into a map row
 /// band, wrapping round the sky and clamped at its rows' ends.
 pub fn prefilter_shader() -> String {
@@ -1808,7 +1808,7 @@ fn envelope_of(e: vec4<f32>) -> vec4<f32> {
 }
 
 // THE LAYER'S ENVELOPE at xz: its population's map, giving way to the
-// weather's mean toward the map's edge (`cloud_layers::envelope`).
+// weather's mean toward the map's edge (`CloudLayer::envelope`).
 fn envelope(k: u32, xz: vec2<f32>, foot: f32) -> vec4<f32> {
     let m = lv(k, 8u);
     if (k >= POPULATED || m.z <= 0.0) {
@@ -1864,7 +1864,7 @@ fn noise_at(s: vec3<f32>, eased: bool) -> vec4<f32> {
 }
 
 // The shape noise's lookup shifted off its tile's lattice, `s` world x, z
-// in tiles, `ph` the layer's phases (`cloud_layers::detile`, line for line).
+// in tiles, `ph` the layer's phases (`CloudShape::detile`, line for line).
 fn detile(s: vec2<f32>, ph: vec4<f32>) -> vec2<f32> {
     let w = 6.28318531 / DETILE_WAVES;
     let a = sin(dot(s, DETILE_DIRS[0]) * w.x + ph.x);
@@ -1884,7 +1884,7 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
     if (h < 0.0 || h > 1.0) {
         return 0.0;
     }
-    // The column leans downwind with height (`cloud_layers::shear_tilt`).
+    // The column leans downwind with height (`CloudLayer::shear_tilt`).
     let sh = lv(k, 9u);
     var xz = xz_in;
     if (sh.w > 0.0 && sh.z > 0.0) {
@@ -1910,13 +1910,13 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
     var shape = base;
     var tc = cover;
     if (lv(k, 1u).y == KIND_CUMULUS) {
-        // A dome on the clouds' summed strength, lobed (`cloud_layers::cumulus_column`).
+        // A dome on the clouds' summed strength, lobed (`CloudShape::cumulus_column`).
         let lob = 0.5 * n.g + 0.3 * n.b + 0.2 * n.a - CU_LOBE_MEAN;
         let q = clamp(env.w * (1.0 + CU_LOBE * lob) / CU_CORE_FULL, 0.0, 1.0);
         let t = env.y * sqrt(q) * (1.0 + CU_TURRET * lob);
         let b = CU_BASE_CURL * t * (1.0 - q) + CU_BASE_LUMP * lob;
         shape = shape * smoothstep(b, b + 0.04, h) * (1.0 - smoothstep(t - CU_TOP_FADE, t, h));
-        // Filled in as the core rises (`cloud_layers::cumulus_cover`).
+        // Filled in as the core rises (`CloudShape::cumulus_cover`).
         let lo = min(cover, CU_SOLID0);
         let solid = lo + (cover - lo) * smoothstep(CU_SOLID0, CU_SOLID1, env.w);
         tc = solid + (cover - solid) * clamp((cover - CUMULUS_COVER_CEIL) / max(1.0 - CUMULUS_COVER_CEIL, 1e-3), 0.0, 1.0);
@@ -1932,7 +1932,7 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
         // The erosion noise is DETAIL_RATIO times finer still.
         let gone = smoothstep(0.25, 0.5, r * DETAIL_RATIO);
         var fine = MEAN_FINE;
-        // Each cloud's own thermals (`cloud_layers::convection`): its age
+        // Each cloud's own thermals (`CloudLayer::convection`): its age
         // from its phase, the detail rising through one thermal and starting
         // again where its weight is 0.
         let age = env.z * lv(k, 8u).w;
@@ -1943,7 +1943,7 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
         let sw = sin(3.14159265 * cf);
         let window = sw * sw;
         if (gone < 1.0) {
-            // The churn (`cloud_layers::churn_warp`): the shape noise's lower
+            // The churn (`CloudShape::churn_warp`): the shape noise's lower
             // octaves as a vector field, turned with the layer's churn, its
             // reach growing as the cloud decays.
             let turn = 6.28318531 * lv(k, 2u).w;
@@ -1971,7 +1971,7 @@ fn density(k: u32, xz_in: vec2<f32>, alt: f32, detail: bool, foot: f32) -> f32 {
         let cut = min(DETAIL_EROSION * (0.8 + 0.5 * env.z) * e * pulse, 0.95) * (1.0 - smoothstep(0.0, ERODE_DEPTH, d));
         d = clamp((d - cut) / (1.0 - cut), 0.0, 1.0);
     }
-    // Frayed at the fringe, and at its margins with age (`cloud_layers::edge_gain`).
+    // Frayed at the fringe, and at its margins with age (`CloudShape::edge_gain`).
     let fringe = EDGE_FRINGE + (1.0 - EDGE_FRINGE) * smoothstep(0.0, EDGE_FRINGE_D, d);
     let ageing = 1.0 - EDGE_AGEING * smoothstep(0.6, 1.0, env.z) * (1.0 - smoothstep(0.0, EDGE_AGEING_DEPTH, d));
     return min(d * EDGE_GAIN * fringe * ageing, 1.0) * a.w;
@@ -2020,7 +2020,7 @@ fn layer_on(k: u32) -> bool {
 }
 
 // A high thin layer's depth toward the light as the ground feels it: its
-// coverage, not its cells (`cloud_layers::high_layer_tau`).
+// coverage, not its cells (`CloudLayer::high_layer_tau`).
 fn high_layer_tau(k: u32, xz: vec2<f32>, slant: f32) -> f32 {
     let a = lv(k, 0u);
     if (lv(k, 1u).y == KIND_CIRRUS) {
@@ -2030,7 +2030,7 @@ fn high_layer_tau(k: u32, xz: vec2<f32>, slant: f32) -> f32 {
 }
 
 // The column's direct transmittance toward dir from xz at alt, every layer
-// (`cloud_layers::transmittance_toward`).
+// (`CloudVolume::transmittance_toward`).
 fn transmittance_toward(xz: vec2<f32>, alt: f32, dir: vec3<f32>) -> f32 {
     let mu = dir.y;
     if (mu <= 0.02) {
@@ -2079,7 +2079,7 @@ fn hg(g: f32, c: f32) -> f32 {
 }
 
 // Water droplets' single scattering: a diffraction lobe and a Draine lobe
-// (`clouds::mie_phase`, `CLOUD_DROPLET_UM`).
+// (`clouds::MiePhase`, `CLOUD_DROPLET_UM`).
 fn phase(c: f32) -> f32 {
     let draine = hg(MIE_D_G, c) * (1.0 + MIE_D_ALPHA * c * c) / (1.0 + MIE_D_ALPHA * (1.0 + 2.0 * MIE_D_G * MIE_D_G) / 3.0);
     return (1.0 - MIE_D_W) * hg(MIE_HG_G, c) + MIE_D_W * draine;
@@ -2446,7 +2446,7 @@ fn hist_carry(dir: vec3<f32>, h: f32, wv: vec2<f32>) -> vec2<f32> {
     let step = u.shadow.z / size;
     let xz = u.shadow.xy - 0.5 * u.shadow.z + pos.xy * step;
     // Four rays across the light's disc: the penumbra
-    // (`cloud_layers::transmittance_penumbra`).
+    // (`CloudVolume::transmittance_penumbra`).
     let l = u.light_dir.xyz;
     let up = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(l.y) < 0.9);
     let a = normalize(cross(l, up));
@@ -2529,7 +2529,7 @@ pub(crate) mod tests {
         for j in 1..size - 1 {
             for i in 1..size - 1 {
                 let xz = [centre[0] - 0.5 * extent + (i as f32 + 0.5) * step, centre[1] - 0.5 * extent + (j as f32 + 0.5) * step];
-                let cpu = space_soup_sky::cloud_layers::transmittance_penumbra(&layers, &noise, &field, xz, 2.0, dir);
+                let cpu = space_soup_sky::cloud_layers::CloudVolume::new(&layers, &noise, &field).transmittance_penumbra(xz, 2.0, dir);
                 let gpu = f32::from(texels[(j * size + i) as usize]) / 255.0;
                 worst = worst.max((cpu - gpu).abs());
                 sum += (cpu - gpu).abs();
@@ -2580,7 +2580,7 @@ pub(crate) mod tests {
         let sun = [az.sin() * el.cos(), el.sin(), az.cos() * el.cos()];
         let field = CloudField::build(7);
         let noise = CloudNoise::shared();
-        let params = CloudParams { coverage: 0.45, altitude_m: 1200.0, wind_speed: 16.0, time_scale: 2.5, ..Default::default() };
+        let params = CloudParams { coverage: 0.45, altitude_m: 1200.0, wind: space_soup_sky::clouds::CloudWind { speed: 16.0, ..space_soup_sky::clouds::CloudWind::default() }, clock: space_soup_sky::clouds::CloudClock { time_scale: 2.5, ..space_soup_sky::clouds::CloudClock::default() }, ..Default::default() };
         let t = 20_000.0;
         let mut population = CloudPopulation::new();
         let mut layers = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise).layers(t);
@@ -2676,7 +2676,7 @@ pub(crate) mod tests {
                         let y = l.base_m + iy as f32 * voxel;
                         for iz in 0..nx {
                             let z = -reach + (iz as f32 + 0.5) * voxel;
-                            slab[iy * nx + iz] = space_soup_sky::cloud_layers::density(l, noise, weather, [x, z], y, detail);
+                            slab[iy * nx + iz] = l.density(noise, weather, [x, z], y, detail);
                         }
                     }
                 });
@@ -2848,7 +2848,7 @@ pub(crate) mod tests {
             // The churn held at the first map's turn: this measures the
             // carrying, not the shapes' own change (`churn_warp`).
             for (l, held) in layers.iter_mut().zip(model.layers(20_000.0)) {
-                l.churn = held.churn;
+                l.motion.churn = held.motion.churn;
             }
             let mut sky = CloudSky::new(&device, &queue, &field, &noise);
             sky.set_population(&device, &queue, &population);
@@ -2917,7 +2917,7 @@ pub(crate) mod tests {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         let field = CloudField::build(7);
         let noise = CloudNoise::shared();
-        let mut params = CloudParams { coverage: 0.35, wind_speed: 16.0, time_scale: 2.5, ..Default::default() };
+        let mut params = CloudParams { coverage: 0.35, wind: space_soup_sky::clouds::CloudWind { speed: 16.0, ..space_soup_sky::clouds::CloudWind::default() }, clock: space_soup_sky::clouds::CloudClock { time_scale: 2.5, ..space_soup_sky::clouds::CloudClock::default() }, ..Default::default() };
         params.kinds = [1.0, 1.0, 0.0, 1.0];
         if let Ok(k) = std::env::var("STEP_KINDS") {
             let v: Vec<f32> = k.split(',').map(|x| x.parse().unwrap()).collect();
@@ -2940,7 +2940,7 @@ pub(crate) mod tests {
             population.place(&mut layers, t);
             if hold_churn {
                 for (l, held) in layers.iter_mut().zip(model.layers(t0)) {
-                    l.churn = held.churn;
+                    l.motion.churn = held.motion.churn;
                 }
             }
             let mut sky = CloudSky::new(&device, &queue, &field, &noise);
@@ -3029,7 +3029,7 @@ pub(crate) mod tests {
         let Some((device, queue)) = crate::renderer::terrain_pipeline::tests::headless_gpu() else { return };
         let field = CloudField::build(7);
         let noise = CloudNoise::shared();
-        let params = CloudParams { coverage: 0.45, time_scale: 2.5, ..Default::default() };
+        let params = CloudParams { coverage: 0.45, clock: space_soup_sky::clouds::CloudClock { time_scale: 2.5, ..space_soup_sky::clouds::CloudClock::default() }, ..Default::default() };
         let model = space_soup_sky::cloud_layers::CloudModel::new(&params, &noise);
         let mut population = CloudPopulation::new();
         let eye = [10.0f32, 2.0, 5.0];
@@ -3394,7 +3394,7 @@ pub(crate) mod tests {
             off(&third_settled, 1)
         );
         // (0.0157 settled when set; 0.0163 once the shape noise was untiled,
-        // `cloud_layers::detile`, its stretch a little finer than the march.)
+        // `CloudShape::detile`, its stretch a little finer than the march.)
         assert!(once_a < 0.018 && settled_a < 0.018, "alpha: once {once_a:.5}, settled {settled_a:.5}");
         // Or under half the settled error this was set at: vapour-soft edges
         // (`cloud_layers::EDGE_GAIN`, 2026-10-23) shrank the single map's error
@@ -3598,7 +3598,7 @@ pub(crate) mod tests {
         for j in (1..size - 1).step_by(2) {
             for i in (1..size - 1).step_by(2) {
                 let xz = [centre[0] - 0.5 * extent + (i as f32 + 0.5) * step, centre[1] - 0.5 * extent + (j as f32 + 0.5) * step];
-                let cpu = space_soup_sky::cloud_layers::transmittance_penumbra(&layers, &noise, weather, xz, 2.0, dir);
+                let cpu = space_soup_sky::cloud_layers::CloudVolume::new(&layers, &noise, weather).transmittance_penumbra(xz, 2.0, dir);
                 let gpu = f32::from(texels[(j * size + i) as usize]) / 255.0;
                 worst = worst.max((cpu - gpu).abs());
                 sum += (cpu - gpu).abs();
