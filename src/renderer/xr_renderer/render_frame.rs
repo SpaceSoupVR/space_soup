@@ -13,20 +13,20 @@ use crate::renderer::{
 
 use super::{ShadowQuality, XrRenderer};
 
-struct MeshDraw<'a> {
-    model: &'a wgpu::BindGroup,
-    texture: &'a wgpu::BindGroup,
-    lightmap: &'a wgpu::BindGroup,
-    vertices: &'a wgpu::Buffer,
-    indices: &'a wgpu::Buffer,
-    count: u32,
+pub(super) struct MeshDraw<'a> {
+    pub(super) model: &'a wgpu::BindGroup,
+    pub(super) texture: &'a wgpu::BindGroup,
+    pub(super) lightmap: &'a wgpu::BindGroup,
+    pub(super) vertices: &'a wgpu::Buffer,
+    pub(super) indices: &'a wgpu::Buffer,
+    pub(super) count: u32,
     thin: Option<&'a crate::renderer::mesh::ThinParts>,
-    blended: bool,
+    pub(super) blended: bool,
 
-    bound: glam::Vec4,
+    pub(super) bound: glam::Vec4,
 }
 
-type LayeredDraw<'a> = (
+pub(super) type LayeredDraw<'a> = (
     &'a wgpu::BindGroup,
     &'a wgpu::Buffer,
     &'a wgpu::Buffer,
@@ -37,7 +37,7 @@ type LayeredDraw<'a> = (
     (glam::Vec3, glam::Vec3),
 );
 
-type SkinnedDraw<'a> = (
+pub(super) type SkinnedDraw<'a> = (
     &'a wgpu::BindGroup,
     &'a wgpu::BindGroup,
     &'a wgpu::BindGroup,
@@ -266,6 +266,8 @@ impl XrRenderer {
                 v.pose.position.x += dx;
             }
         }
+
+        self.prepare_scopes(&eye_views);
 
         let warp_world_to_player = glam::Mat4::from_quat(glam::Quat::from_rotation_y(self.player.yaw).inverse())
             * glam::Mat4::from_translation(-self.player.offset);
@@ -2674,6 +2676,27 @@ impl XrRenderer {
             };
             let probes_arg =
                 if !fx.probes { Some(&no_probes) } else { resident.as_ref() };
+            if eye == 0 && !self.scopes.is_empty() {
+                let world = super::scope_pass::ScopeWorld {
+                    solid: solid_any.then_some(super::scope_pass::SolidWorld {
+                        vertices: &solid_vb,
+                        indices: &solid_ib,
+                        ranges: &solid_ranges,
+                        terrain: terrain_range,
+                        ground_step1,
+                    }),
+                    brushes: brush_buffers.as_ref(),
+                    layered: &layered_draws,
+                    baked_caves: &baked_cave_draws,
+                    meshes: &mesh_draws,
+                    skinned: &skinned_draws,
+                    particles: Some((&particle_vb, &particle_ib, particle_idx.len() as u32)),
+                    water: fx.water,
+                };
+                let light = super::scope_pass::ScopeLight { shadow: &shadow, sky: &sky_upload, post: &post, player: &frame_player, probes: probes_arg };
+                self.render_scope_views(&world, &light);
+                laps.push((line!(), std::time::Instant::now()));
+            }
             if stereo && eye == 0 {
                 self.uniform_buf.upload_scene_stereo(
                     &self.wgpu_queue, both_view_proj, both_cam_pos, &shadow, &sky_upload,
@@ -3883,6 +3906,8 @@ impl XrRenderer {
                             pass.draw_indexed(0..d.count, 0, 0..1);
                         }
                     }
+                    // The optics' lenses, over the weapon and any blended glass on it.
+                    self.scopes.draw_lenses(&mut pass, &self.uniform_buf.bind_group, stereo, eye);
                     if !particle_verts.is_empty() {
                         pass.set_pipeline(self.sp_particle(stereo));
                         pass.set_bind_group(0, &self.uniform_buf.bind_group, &[]);

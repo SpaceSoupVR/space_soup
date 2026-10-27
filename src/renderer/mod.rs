@@ -19,6 +19,7 @@ pub mod material_wgsl;
 pub mod mesh;
 pub mod mesh_pipeline;
 pub mod mirror;
+pub mod scope;
 pub mod performance_level;
 pub mod dynamic_resolution;
 pub mod panel;

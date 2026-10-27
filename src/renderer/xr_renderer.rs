@@ -20,6 +20,7 @@ use std::collections::HashMap;
 mod fps_layer;
 mod ground_build;
 mod render_frame;
+mod scope_pass;
 mod time_of_day;
 mod vulkan_interop;
 
@@ -487,6 +488,8 @@ pub struct XrRenderer {
     mirror_mesh_pipeline: MeshPipeline,
     mirror_pipeline: MirrorPipeline,
     mirror_targets: [MirrorTarget; 2],
+    /// The held optics' world views and lenses (`set_scopes`).
+    scopes: crate::renderer::scope::ScopeStage,
 
     planar_targets: [MirrorTarget; 2],
     planar_size: (u32, u32),
@@ -1427,6 +1430,7 @@ impl XrRenderer {
         );
 
         let skin_compute = crate::renderer::skin_compute::SkinCompute::new(&wgpu_device);
+        let scopes = crate::renderer::scope::ScopeStage::new(&wgpu_device, wgpu_format, &uniform_buf.layout, samples, can_multiview);
         Ok(Self {
             swapchain,
             width,
@@ -1543,6 +1547,7 @@ impl XrRenderer {
             mirror_mesh_pipeline,
             mirror_pipeline,
             mirror_targets,
+            scopes,
             planar_targets,
             planar_size: (planar_size(width), planar_size(height)),
             planar_groups,
@@ -2579,6 +2584,11 @@ impl XrRenderer {
 
     pub fn set_glare_sources(&mut self, sources: Vec<crate::renderer::glare::GlareSource>) {
         self.glare_sources = sources;
+    }
+
+    /// The optical paths of the optics held this frame, in render space.
+    pub fn set_scopes(&mut self, renders: Vec<crate::renderer::scope::ScopeRender>) {
+        self.scopes.set_renders(renders);
     }
 
     pub fn set_weather(&mut self, texels: &[(u32, u32)], mut chunks: Vec<(u32, u32)>) {
