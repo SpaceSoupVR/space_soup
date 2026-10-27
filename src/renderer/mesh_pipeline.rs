@@ -14,6 +14,35 @@ pub struct MeshPipeline {
     pub lightmap_layout: BindGroupLayout,
 }
 
+/// The mesh material bind group (group 2): base colour, its sampler, the
+/// emissive map (occlusion in its alpha) and the packed PBR map (normal xy,
+/// gloss, metallic), as `mesh::texture::material_bind` fills it and both mesh
+/// shaders read it. Three textures: with the camera and lightmap groups the
+/// pipeline then binds exactly the 16 sampled textures a headset allows.
+pub fn material_texture_layout_entries() -> [BindGroupLayoutEntry; 4] {
+    let map = |binding: u32| BindGroupLayoutEntry {
+        binding,
+        visibility: ShaderStages::FRAGMENT,
+        ty: BindingType::Texture {
+            sample_type: TextureSampleType::Float { filterable: true },
+            view_dimension: TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    [
+        map(0),
+        BindGroupLayoutEntry {
+            binding: 1,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Sampler(SamplerBindingType::Filtering),
+            count: None,
+        },
+        map(2),
+        map(3),
+    ]
+}
+
 pub fn opaque_target(format: TextureFormat) -> [Option<ColorTargetState>; 1] {
     [Some(ColorTargetState { format, blend: None, write_mask: ColorWrites::ALL })]
 }
@@ -146,35 +175,7 @@ impl MeshPipeline {
 
         let texture_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("mesh_texture_bgl"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
+            entries: &material_texture_layout_entries(),
         });
 
         let model_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -527,35 +528,7 @@ impl SkinnedMeshPipeline {
 
         let texture_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("skinned_mesh_texture_bgl"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
+            entries: &material_texture_layout_entries(),
         });
 
         let model_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -763,6 +736,7 @@ struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f
 @group(2) @binding(0) var tex: texture_2d<f32>;
 @group(2) @binding(1) var samp: sampler;
 @group(2) @binding(2) var emissive_tex: texture_2d<f32>;
+{pbr_maps}
 
 struct JointMatrices {{ mats: array<mat4x4<f32>, {max_skin_joints}> }}
 @group(3) @binding(0) var<uniform> joints: JointMatrices;
@@ -828,7 +802,8 @@ fn vs_main(v: VIn) -> VOut {{
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
-    let n = normalize(in.normal);
+    let geom_n = normalize(in.normal);
+    let n = pbr_perturbed_normal(geom_n, in.world_pos, in.uv);
     let room_reach = ROOM_REACH_PIXELS * max(length(dpdx(in.world_pos)), length(dpdy(in.world_pos)));
     if (in.room_near > 0.0) {{
         local_exposure = room_local_exposure(to_world_space(in.world_pos), room_reach);
@@ -836,22 +811,32 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
 
     capsule_receiver = false;
 
-    let rough = textureSample(emissive_tex, samp, in.uv).a;
+    let orm = pbr_params(in.uv, textureSample(emissive_tex, samp, in.uv).a);
+    let rough = orm.g;
+    let ao = orm.r;
     let tex_color = textureSample(tex, samp, in.uv);
 
     if (tex_color.a < 0.35) {{
         discard;
     }}
 
-    let rough_aa = specular_aa_roughness(rough, dpdx(n), dpdy(n));
+    let rough_aa = specular_aa_roughness(rough, dpdx(geom_n), dpdy(geom_n));
     var shaded: vec3<f32>;
     if (rough >= 0.996) {{
-        shaded = tex_color.rgb * (shade_with_sky(in.world_pos, n, model_u.params.x) + room_irradiance(n));
+        shaded = tex_color.rgb * (shade_with_sky(in.world_pos, n, model_u.params.x) + room_irradiance(n) * ao);
     }} else {{
+        let metal = orm.b;
         shaded = shade_material_env(
-            in.world_pos, n, rough_aa, 1.0, model_u.params.x, room_irradiance(n), vec4<f32>(0.5, 0.5, 0.5, 0.0),
-            tex_color.rgb, in.world_pos, n,
+            in.world_pos, n, rough_aa, ao, model_u.params.x, room_irradiance(n) * ao, vec4<f32>(0.5, 0.5, 0.5, 0.0),
+            tex_color.rgb * (1.0 - metal), in.world_pos, geom_n,
         );
+        if (metal > 0.002) {{
+            let spec_only = shade_material_env(
+                in.world_pos, n, rough_aa, ao, model_u.params.x, room_irradiance(n) * ao, vec4<f32>(0.5, 0.5, 0.5, 0.0),
+                vec3<f32>(0.0), in.world_pos, geom_n,
+            );
+            shaded = shaded + metal * pbr_metal_specular(spec_only, tex_color.rgb, n, in.world_pos, rough_aa);
+        }}
     }}
 
     let wet = model_u.weather.x;
@@ -882,8 +867,69 @@ fn fs_depth_opaque_texels(in: VOut) -> @location(0) vec4<f32> {{
         max_strength = super::mesh::MeshVertex::MAX_EMISSIVE_STRENGTH,
         max_skin_joints = MAX_SKIN_JOINTS,
         room_light = wgsl_room_irradiance(),
+        pbr_maps = PBR_MAPS_WGSL,
     )
 }
+
+/// The material's packed PBR map, read by both mesh shaders: R, G the normal's
+/// x, y; B the gloss (1 - roughness); A the metallic. An all-zero texel (a
+/// placeholder bind group made without a queue) reads as a plain material.
+const PBR_MAPS_WGSL: &str = r"
+@group(2) @binding(3) var pbr_tex: texture_2d<f32>;
+
+// Occlusion (from the emissive map's alpha), roughness, metallic.
+fn pbr_params(uv: vec2<f32>, occlusion: f32) -> vec3<f32> {
+    let s = textureSample(pbr_tex, samp, uv);
+    return vec3<f32>(1.0 - occlusion, 1.0 - s.b, s.a);
+}
+
+// The tangent frame from the screen-space derivatives of position and uv, so
+// no model needs vertex tangents. The map is OpenGL convention: green is up
+// the picture, which is toward smaller v, hence the minus.
+fn pbr_perturbed_normal(n: vec3<f32>, p: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let s = textureSample(pbr_tex, samp, uv);
+    if (s.r + s.g <= 0.0) {
+        return n;
+    }
+    let xy = s.rg * 2.0 - 1.0;
+    let tn = vec3<f32>(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+    if (tn.z <= 0.0 && dot(xy, xy) < 1e-6) {
+        return n;
+    }
+    let dp1 = dpdx(p);
+    let dp2 = dpdy(p);
+    let duv1 = dpdx(uv);
+    let duv2 = dpdy(uv);
+    let dp2perp = cross(dp2, n);
+    let dp1perp = cross(n, dp1);
+    let t = dp2perp * duv1.x + dp1perp * duv2.x;
+    let b = dp2perp * duv1.y + dp1perp * duv2.y;
+    let m2 = max(dot(t, t), dot(b, b));
+    if (m2 < 1e-18) {
+        return n;
+    }
+    let inv = inverseSqrt(m2);
+    let r = t * (inv * tn.x) - b * (inv * tn.y) + n * tn.z;
+    let len2 = dot(r, r);
+    if (len2 < 1e-8) {
+        return n;
+    }
+    return r * inverseSqrt(len2);
+}
+
+// Metals reflect in their own colour: the dielectric specular `spec_only`
+// re-weighted from the 0.04 Fresnel the material path assumes to the metal's.
+fn pbr_metal_specular(spec_only: vec3<f32>, albedo: vec3<f32>, n: vec3<f32>, world_pos: vec3<f32>, rough: f32) -> vec3<f32> {
+    let v = normalize(cam_pos() - world_pos);
+    let g1 = 1.0 - clamp(dot(n, v), 0.0, 1.0);
+    let g2 = g1 * g1;
+    let g = g2 * g2 * g1;
+    let f_max = max(1.0 - clamp(rough, 0.04, 1.0), 0.04);
+    let f_d = 0.04 + (f_max - 0.04) * g;
+    let f_m = albedo + (vec3<f32>(1.0) - albedo) * g;
+    return spec_only * (f_m / max(f_d, 1e-4) - vec3<f32>(1.0));
+}
+";
 
 fn wgsl_room_irradiance() -> &'static str {
     r"
@@ -1123,18 +1169,29 @@ fn mesh_shader_variant(thin: bool) -> String {
 }
 
 const MATERIAL_SHADE: &str = r"var colour: vec3<f32>;
-    // Specular AA as the brushes and the ground have it: the roughness
-    // widened by how fast the normal turns across the pixel, so a glossy
-    // prop's highlight does not sparkle (2026-10-23).
-    let rough_aa = specular_aa_roughness(mask.a, dpdx(n), dpdy(n));
-    if (mask.a >= 0.996) {
-        colour = tex_color.rgb * (shade_with_sky(in.world_pos, n, model_u.params.x * baked.a) + own_bulb_fill(in.world_pos, n) + baked.rgb + room_irradiance(n));
+    // The material's own maps: roughness and metallic from the ORM map (its
+    // roughness is the emissive alpha's successor), occlusion darkening what
+    // arrives indirectly. Specular AA as the brushes and the ground have it:
+    // the roughness widened by how fast the normal turns across the pixel, so
+    // a glossy prop's highlight does not sparkle (2026-10-23).
+    let rough_aa = specular_aa_roughness(orm.g, dpdx(geom_n), dpdy(geom_n));
+    let ao = orm.r;
+    if (orm.g >= 0.996) {
+        colour = tex_color.rgb * (shade_with_sky(in.world_pos, n, model_u.params.x * baked.a) + own_bulb_fill(in.world_pos, n) + (baked.rgb + room_irradiance(n)) * ao);
     } else {
-        let env = baked.rgb + room_irradiance(n);
+        let env = (baked.rgb + room_irradiance(n)) * ao;
+        let metal = orm.b;
         colour = shade_material_env(
-            in.world_pos, n, rough_aa, 1.0, model_u.params.x * baked.a, env, vec4<f32>(0.5, 0.5, 0.5, 0.0),
-            tex_color.rgb, in.world_pos, n,
-        ) + tex_color.rgb * own_bulb_fill(in.world_pos, n);
+            in.world_pos, n, rough_aa, ao, model_u.params.x * baked.a, env, vec4<f32>(0.5, 0.5, 0.5, 0.0),
+            tex_color.rgb * (1.0 - metal), in.world_pos, geom_n,
+        ) + tex_color.rgb * (1.0 - metal) * own_bulb_fill(in.world_pos, n);
+        if (metal > 0.002) {
+            let spec_only = shade_material_env(
+                in.world_pos, n, rough_aa, ao, model_u.params.x * baked.a, env, vec4<f32>(0.5, 0.5, 0.5, 0.0),
+                vec3<f32>(0.0), in.world_pos, geom_n,
+            );
+            colour = colour + metal * pbr_metal_specular(spec_only, tex_color.rgb, n, in.world_pos, rough_aa);
+        }
     }";
 
 fn mesh_shader_variant_with(thin: bool, thin_mean: bool) -> String {
@@ -1168,6 +1225,7 @@ struct ModelUniform {{ model: mat4x4<f32>, params: vec4<f32>, room: array<vec4<f
 @group(2) @binding(0) var tex: texture_2d<f32>;
 @group(2) @binding(1) var samp: sampler;
 @group(2) @binding(2) var emissive_tex: texture_2d<f32>;
+{pbr_maps}
 
 @group(3) @binding(0) var lm_tex: texture_2d<f32>;
 @group(3) @binding(1) var lm_samp: sampler;
@@ -1261,7 +1319,10 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
     if (in.room_near > 0.0) {{
         local_exposure = room_local_exposure(to_world_space(in.world_pos), room_reach);
     }}
-    let n = normalize(in.normal);{thin_span}
+    let geom_n = normalize(in.normal);
+    let n = pbr_perturbed_normal(geom_n, in.world_pos, in.uv);
+    let mask = textureSample(emissive_tex, samp, in.uv);
+    let orm = pbr_params(in.uv, mask.a);{thin_span}
 
     let uv2 = clamp(in.uv2, in.uv2_rect.xy, in.uv2_rect.zw);
 
@@ -1290,7 +1351,6 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         discard;
     }}
 
-    let mask = textureSample(emissive_tex, samp, in.uv);
     let glow = in.emissive * mask.rgb * model_u.params.y;
 
     {shaded}
@@ -1307,6 +1367,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {{
         max_strength = super::mesh::MeshVertex::MAX_EMISSIVE_STRENGTH,
         stationary_range = super::brush_pipeline::STATIONARY_MASK_DISTANCE_TEXELS,
         room_light = wgsl_room_irradiance(),
+        pbr_maps = PBR_MAPS_WGSL,
     )
 }
 
@@ -2317,7 +2378,9 @@ mod tests {
         }
         let (d, w, full) = (total(&dry), total(&wet), total(&src));
         eprintln!("skinned fs_main by the proxy: dry {d}, wet {w}, traced {full}");
-        assert!(d < 1200 && w * 5 < full, "dry {d}, wet {w}, traced {full}");
+        // 1300: the body's own normal map (`pbr_perturbed_normal`, a tangent
+        // frame from derivatives) and its ORM read cost ~70 over the old 1200.
+        assert!(d < 1300 && w * 5 < full, "dry {d}, wet {w}, traced {full}");
     }
 
     #[test]

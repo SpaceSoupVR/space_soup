@@ -47,8 +47,8 @@ fn encode_model(glb: &Path, astcenc: &Path, quality: &str, force: bool) -> Resul
                 continue;
             }
             seen.push(material.index());
-            let (base, emissive) = material_images(&material, &images);
-            for (map, px) in [(ModelMap::Base, &base), (ModelMap::Emissive, &emissive)] {
+            let maps = material_images(&material, &images);
+            for (map, px) in [(ModelMap::Base, &maps.base), (ModelMap::Emissive, &maps.emissive)] {
                 let (w, h) = (px.1, px.2);
                 if w * h <= 1 || w % u32::from(ASTC_BLOCK[0]) != 0 || h % u32::from(ASTC_BLOCK[1]) != 0 {
                     continue;

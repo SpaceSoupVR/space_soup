@@ -250,35 +250,7 @@
         .ok()?;
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("test_mesh_texture_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
+            entries: &crate::renderer::mesh_pipeline::material_texture_layout_entries(),
         });
         Some((device, queue, layout))
     }
@@ -310,7 +282,7 @@
         std::fs::create_dir_all(&astc_dir).unwrap();
         let mut files = Vec::new();
         for material in doc.materials() {
-            let (base, _) = material_images(&material, &images);
+            let base = material_images(&material, &images).base;
             if base.1 * base.2 <= 1 || base.1 % 4 != 0 || base.2 % 4 != 0 {
                 continue;
             }

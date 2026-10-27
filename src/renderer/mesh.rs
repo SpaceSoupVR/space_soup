@@ -15,7 +15,7 @@ pub use texture::{
     create_lightmap_texture, create_lightmap_texture_full, create_lightmap_texture_with_sun, create_mesh_material_texture, LightmapLight,
     create_texture_from_rgba, LoadedTexture, lightmap_mips_f16, write_lightmap_mips,
     LIGHTMAP_MIP_LEVELS, NEUTRAL_BOUNCE_DIRECTION, NEUTRAL_SUN_MASK, SUN_MASK_MIP_LEVELS, set_gltf_roughness, gltf_roughness, material_gloss_alpha,
-    material_images, model_astc_dir, model_astc_path, model_astc_scope, model_image_fingerprint, model_mips, ModelMap,
+    material_images, MaterialMaps, MapPixels, PLAIN_PBR_TEXEL, model_astc_dir, model_astc_path, model_astc_scope, model_image_fingerprint, model_mips, ModelMap,
 };
 pub use clip::{load_clips_for, GltfClip};
 pub use vertex::{MeshPrimitive, MeshVertex, SkinnedMeshVertex};

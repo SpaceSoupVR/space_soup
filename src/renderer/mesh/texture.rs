@@ -7,6 +7,9 @@ pub struct LoadedTexture {
     _direction: Option<wgpu::Texture>,
 
     _sun_mask: Option<(wgpu::Texture, wgpu::Sampler, wgpu::Texture)>,
+
+    /// The material's other maps (emissive, normal, ORM) this bind group reads.
+    _maps: Vec<wgpu::Texture>,
 }
 
 pub(crate) fn load_primitive_texture(
@@ -17,7 +20,7 @@ pub(crate) fn load_primitive_texture(
     layout: &wgpu::BindGroupLayout,
 ) -> LoadedTexture {
     let material = prim.material();
-    let (base, emissive) = material_images(&material, images);
+    let maps = material_images(&material, images);
     // Encoded ahead (`bin/model_astc`) where the encoding is of these very
     // images; the RGBA upload, with its mips built here, otherwise.
     let dir = MODEL_ASTC.with(|d| d.borrow().clone());
@@ -26,18 +29,111 @@ pub(crate) fn load_primitive_texture(
         if px.1 * px.2 > 1 {
             MODEL_ASTC_COUNT.with(|c| c.set((c.get().0 + u32::from(astc.is_some()), c.get().1 + 1)));
         }
-        astc.unwrap_or_else(|| upload_mipped(device, queue, label, px))
+        astc.unwrap_or_else(|| upload_mipped(device, queue, label, px, true))
     };
-    let base_tex = upload(ModelMap::Base, "gltf_base_color", &base);
-    let emissive_tex = upload(ModelMap::Emissive, "gltf_emissive", &emissive);
-    material_bind(device, layout, base_tex, emissive_tex)
+    let base_tex = upload(ModelMap::Base, "gltf_base_color", &maps.base);
+    let emissive_tex = upload(ModelMap::Emissive, "gltf_emissive", &maps.emissive);
+    // The packed PBR map is data, not colour: linear, never ASTC-encoded as sRGB.
+    let pbr_tex = upload_mipped(device, queue, "gltf_pbr", &maps.pbr, false);
+    material_bind(device, layout, base_tex, emissive_tex, pbr_tex)
 }
 
-/// A material's two maps as the mesh shaders read them, RGBA8 sRGB: the
-/// base colour (alpha forced opaque, cut for MASK, kept for BLEND) and the
-/// emissive mask with the roughness in its alpha. What `load_primitive_texture`
-/// uploads and `bin/model_astc` encodes.
-pub fn material_images(material: &gltf::Material, images: &[gltf::image::Data]) -> ((Vec<u8>, u32, u32), (Vec<u8>, u32, u32)) {
+/// One RGBA8 image: (pixels, width, height).
+pub type MapPixels = (Vec<u8>, u32, u32);
+
+/// A glTF material's maps as the mesh shaders read them, three textures so
+/// the mesh pipeline stays within a headset's 16 sampled textures a stage:
+/// `base` (sRGB), `emissive` (sRGB; its alpha is how much the occlusion map
+/// darkens, 0 = none) and `pbr`, linear: R, G the tangent-space normal's x, y
+/// (OpenGL convention, +Y up the picture, the material's scale baked in; z is
+/// rebuilt in the shader), B the gloss (1 - roughness, so 0 is the classic
+/// fully-rough shading) and A the metallic, each already multiplied by the
+/// material's factor. A material without a map gets one texel; an all-zero
+/// texel (a placeholder texture never written) reads as a plain material.
+pub struct MaterialMaps {
+    pub base: MapPixels,
+    pub emissive: MapPixels,
+    pub pbr: MapPixels,
+}
+
+/// The `pbr` texel of a material with no maps: flat normal, fully rough, dielectric.
+pub const PLAIN_PBR_TEXEL: [u8; 4] = [128, 128, 0, 0];
+
+/// `src` resampled (nearest) to `w` x `h`, for packing two maps of different sizes.
+fn resample_nearest(src: &MapPixels, w: u32, h: u32) -> Vec<u8> {
+    if (src.1, src.2) == (w, h) {
+        return src.0.clone();
+    }
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        let sy = (u64::from(y) * u64::from(src.2) / u64::from(h)) as u32;
+        for x in 0..w {
+            let sx = (u64::from(x) * u64::from(src.1) / u64::from(w)) as u32;
+            let s = ((sy * src.1 + sx) * 4) as usize;
+            let d = ((y * w + x) * 4) as usize;
+            out[d..d + 4].copy_from_slice(&src.0[s..s + 4]);
+        }
+    }
+    out
+}
+
+/// The material's packed PBR map (`MaterialMaps::pbr`): normal xy, gloss, metallic.
+/// Gloss follows the "Real materials" setting (`gltf_roughness`): off, every
+/// texel is fully rough and dielectric, the classic sheen the models always had.
+fn pbr_map(material: &gltf::Material, images: &[gltf::image::Data]) -> MapPixels {
+    let pbr = material.pbr_metallic_roughness();
+    let honour = gltf_roughness();
+    let normal = material.normal_texture().map(|i| (decode_image(&images[i.texture().source().index()], true), i.scale()));
+    let mr = pbr.metallic_roughness_texture().map(|i| decode_image(&images[i.texture().source().index()], true));
+    let (w, h) = match (&normal, &mr) {
+        (Some((n, _)), Some(m)) => (n.1.max(m.1), n.2.max(m.2)),
+        (Some((n, _)), None) => (n.1, n.2),
+        (None, Some(m)) => (m.1, m.2),
+        (None, None) => (1, 1),
+    };
+    let normal_px = normal.as_ref().map(|(n, s)| (resample_nearest(n, w, h), *s));
+    let mr_px = mr.as_ref().map(|m| resample_nearest(m, w, h));
+    let rough_f = pbr.roughness_factor().clamp(0.0, 1.0);
+    let metal_f = pbr.metallic_factor().clamp(0.0, 1.0);
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for i in 0..(w * h) as usize {
+        let (nx, ny) = normal_px.as_ref().map_or((0.0, 0.0), |(p, scale)| {
+            let d = |c: u8| (f32::from(c) / 255.0 * 2.0 - 1.0) * scale;
+            (d(p[i * 4]).clamp(-1.0, 1.0), d(p[i * 4 + 1]).clamp(-1.0, 1.0))
+        });
+        let (tr, tm) = mr_px.as_ref().map_or((1.0, 1.0), |p| (f32::from(p[i * 4 + 1]) / 255.0, f32::from(p[i * 4 + 2]) / 255.0));
+        let gloss = if honour { 1.0 - (tr * rough_f).clamp(0.0, 1.0) } else { 0.0 };
+        let metal = if honour { (tm * metal_f).clamp(0.0, 1.0) } else { 0.0 };
+        out[i * 4] = ((nx * 0.5 + 0.5) * 255.0).round() as u8;
+        out[i * 4 + 1] = ((ny * 0.5 + 0.5) * 255.0).round() as u8;
+        out[i * 4 + 2] = (gloss * 255.0).round() as u8;
+        out[i * 4 + 3] = (metal * 255.0).round() as u8;
+    }
+    (out, w, h)
+}
+
+/// How much the material's occlusion map darkens each texel (0..255, 0 = none),
+/// at the map's own size, for the emissive map's alpha.
+fn occlusion_amount(material: &gltf::Material, images: &[gltf::image::Data]) -> Option<MapPixels> {
+    let info = material.occlusion_texture()?;
+    let (px, w, h) = decode_image(&images[info.texture().source().index()], true);
+    let strength = info.strength().clamp(0.0, 1.0);
+    let amount: Vec<u8> = px
+        .chunks_exact(4)
+        .flat_map(|p| {
+            let a = (strength * (1.0 - f32::from(p[0]) / 255.0) * 255.0).round() as u8;
+            [a, a, a, a]
+        })
+        .collect();
+    Some((amount, w, h))
+}
+
+/// A material's maps as the mesh shaders read them (`MaterialMaps`): the
+/// RGBA8 sRGB base colour (alpha forced opaque, cut for MASK, kept for BLEND),
+/// the emissive mask with the occlusion in its alpha, and the packed PBR map.
+/// What `load_primitive_texture` uploads and `bin/model_astc` encodes (the
+/// first two).
+pub fn material_images(material: &gltf::Material, images: &[gltf::image::Data]) -> MaterialMaps {
     let pbr = material.pbr_metallic_roughness();
 
     let transmission = material
@@ -83,9 +179,28 @@ pub fn material_images(material: &gltf::Material, images: &[gltf::image::Data]) 
             (rgba, w, h)
         }
 
-        None => (vec![255u8, 255, 255, material_gloss_alpha(pbr.roughness_factor(), gltf_roughness())], 1, 1),
+        None => (vec![255u8, 255, 255, 0], 1, 1),
     };
-    (base, emissive)
+    // The emissive alpha carries the occlusion map; without one, no darkening.
+    // The two are sized to the larger, so a one-texel emissive factor does not
+    // shrink a whole occlusion map to one value.
+    let emissive = match occlusion_amount(material, images) {
+        Some(occ) => {
+            let (w, h) = (emissive.1.max(occ.1), emissive.2.max(occ.2));
+            let mut px = resample_nearest(&emissive, w, h);
+            let amount = resample_nearest(&occ, w, h);
+            for (p, o) in px.chunks_exact_mut(4).zip(amount.chunks_exact(4)) {
+                p[3] = o[0];
+            }
+            (px, w, h)
+        }
+        None => {
+            let mut px = emissive.0;
+            px.chunks_exact_mut(4).for_each(|p| p[3] = 0);
+            (px, emissive.1, emissive.2)
+        }
+    };
+    MaterialMaps { base, emissive, pbr: pbr_map(material, images) }
 }
 
 /// The two maps of a model's material (`material_images`).
@@ -319,10 +434,10 @@ fn decode_image(image: &gltf::image::Data, force_opaque: bool) -> (Vec<u8>, u32,
     (rgba, width, height)
 }
 
-fn upload_mipped(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, px: &(Vec<u8>, u32, u32)) -> wgpu::Texture {
+fn upload_mipped(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, px: &(Vec<u8>, u32, u32), srgb: bool) -> wgpu::Texture {
     let chain = crate::renderer::brush_pipeline::mip_chain(
         &crate::renderer::terrain_pipeline::TerrainImage { width: px.1, height: px.2, rgba: px.0.clone() },
-        true,
+        srgb,
     );
     let size = wgpu::Extent3d { width: px.1, height: px.2, depth_or_array_layers: 1 };
     let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -331,7 +446,7 @@ fn upload_mipped(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, px: &(
         mip_level_count: chain.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        format: if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm },
 
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
@@ -363,13 +478,61 @@ pub fn create_mesh_material_texture(
     base: &(Vec<u8>, u32, u32),
     emissive: &(Vec<u8>, u32, u32),
 ) -> LoadedTexture {
-    let make = |label: &str, px: &(Vec<u8>, u32, u32)| upload_mipped(device, queue, label, px);
-    material_bind(device, layout, make("gltf_base_color", base), make("gltf_emissive", emissive))
+    let make = |label: &str, px: &(Vec<u8>, u32, u32)| upload_mipped(device, queue, label, px, true);
+    // A caller's emissive alpha was the roughness once; gloss is 1 - that.
+    let gloss = 255 - emissive.0.get(3).copied().unwrap_or(255);
+    let pbr = upload_mipped(device, queue, "gltf_pbr", &(vec![128, 128, gloss, 0], 1, 1), false);
+    let mut emissive = emissive.clone();
+    emissive.0.chunks_exact_mut(4).for_each(|p| p[3] = 0);
+    material_bind(device, layout, make("gltf_base_color", base), make("gltf_emissive", &emissive), pbr)
 }
 
-fn material_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, base_tex: wgpu::Texture, emissive_tex: wgpu::Texture) -> LoadedTexture {
+/// A 1x1 map left zero: the shaders read an all-zero PBR texel as a plain
+/// material and a zero emissive alpha as no occlusion, so a bind group made
+/// without a queue still shades as before.
+fn placeholder_map(device: &wgpu::Device, label: &str, srgb: bool) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm },
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+/// The mesh material bind group: base colour, its sampler, emissive, normal, ORM.
+fn material_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    label: &str,
+    sampler: &wgpu::Sampler,
+    views: [&wgpu::TextureView; 3],
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(views[0]) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(views[1]) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(views[2]) },
+        ],
+    })
+}
+
+fn material_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    base_tex: wgpu::Texture,
+    emissive_tex: wgpu::Texture,
+    pbr_tex: wgpu::Texture,
+) -> LoadedTexture {
     let view = base_tex.create_view(&Default::default());
     let emissive_view = emissive_tex.create_view(&Default::default());
+    let pbr_view = pbr_tex.create_view(&Default::default());
 
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         address_mode_u: wgpu::AddressMode::Repeat,
@@ -380,19 +543,8 @@ fn material_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, base_tex
         anisotropy_clamp: 8,
         ..Default::default()
     });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("gltf_material_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(&emissive_view),
-            },
-        ],
-    });
-    LoadedTexture { texture: base_tex, view, _sampler: sampler, bind_group, _direction: None, _sun_mask: None }
+    let bind_group = material_bind_group(device, layout, "gltf_material_bg", &sampler, [&view, &emissive_view, &pbr_view]);
+    LoadedTexture { texture: base_tex, view, _sampler: sampler, bind_group, _direction: None, _sun_mask: None, _maps: vec![emissive_tex, pbr_tex] }
 }
 
 pub const LIGHTMAP_MIP_LEVELS: u32 = 3;
@@ -605,6 +757,7 @@ pub fn create_lightmap_texture_full(
         bind_group,
         _direction: Some(dir_tex),
         _sun_mask: Some((sun_tex, sun_sampler, st_tex)),
+        _maps: Vec::new(),
     }
 }
 
@@ -714,24 +867,9 @@ impl LoadedTexture {
             view_formats: &[],
         });
         let emissive_view = emissive_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("panel_quad_texture_bg"),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&emissive_view),
-                },
-            ],
-        });
+        let pbr_tex = placeholder_map(device, "panel_quad_pbr", false);
+        let pbr_view = pbr_tex.create_view(&Default::default());
+        let bind_group = material_bind_group(device, layout, "panel_quad_texture_bg", &sampler, [&view, &emissive_view, &pbr_view]);
         Self {
             texture,
             view,
@@ -740,6 +878,7 @@ impl LoadedTexture {
 
             _direction: Some(emissive_tex),
             _sun_mask: None,
+            _maps: vec![pbr_tex],
         }
     }
 
@@ -922,20 +1061,9 @@ pub fn create_texture_from_rgba(
         ..Default::default()
     });
 
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("gltf_texture_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
-    });
+    let maps = [placeholder_map(device, "gltf_texture_emissive", true), placeholder_map(device, "gltf_texture_pbr", false)];
+    let views: Vec<wgpu::TextureView> = maps.iter().map(|t| t.create_view(&Default::default())).collect();
+    let bind_group = material_bind_group(device, layout, "gltf_texture_bg", &sampler, [&view, &views[0], &views[1]]);
 
     LoadedTexture {
         texture,
@@ -944,6 +1072,7 @@ pub fn create_texture_from_rgba(
         bind_group,
         _direction: None,
         _sun_mask: None,
+        _maps: maps.into(),
     }
 }
 
@@ -1093,7 +1222,7 @@ mod model_texture_tests {
                 rgba.extend_from_slice(&[v, v, v, 255]);
             }
         }
-        let tex = upload_mipped(&device, &queue, "test", &(rgba, 4, 4));
+        let tex = upload_mipped(&device, &queue, "test", &(rgba, 4, 4), true);
         assert_eq!(tex.mip_level_count(), 3);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
