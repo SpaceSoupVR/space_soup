@@ -187,6 +187,14 @@ pub fn rank_for_budget(lights: &[Light], max: usize) -> Vec<Light> {
         .collect()
 }
 
+/// `rank_for_budget` scored from `eye` instead of the origin. The desktop view's lights come in
+/// world space, so ranked from the origin a level that stretches far from it keeps the budget
+/// for the lamps nearest the origin wherever the camera is, and every other room goes dark.
+pub fn rank_for_budget_around(lights: &[Light], eye: Vec3, max: usize) -> Vec<Light> {
+    let local: Vec<Light> = lights.iter().map(|l| Light { position: l.position - eye, ..*l }).collect();
+    rank_for_budget_indices(&local, max).into_iter().map(|i| lights[i]).collect()
+}
+
 pub fn sky_sun_light(
     sun: Option<&crate::renderer::sky::SkySun>,
     lights: &[Light],
@@ -4634,6 +4642,13 @@ mod budget_tests {
         assert!(!narrow.casts_shadow() && !narrow.is_surface_light(), "a narrow edge keeps the lamp loop's averaging");
         let ls = [lamp, bounce, Light { intensity: 2.0, ..lamp }, Light { source_radius: 0.5, ..bounce }];
         assert_eq!(rank_for_budget_indices(&ls, MAX_LIGHTS), vec![1, 3, 0, 2]);
+
+        // Ranked from an eye far from the origin, the lamp beside the eye wins over the lamps
+        // at the origin, which `rank_for_budget` would keep instead.
+        let far = Light { position: Vec3::new(100.0, 0.0, 0.0), ..lamp };
+        let crowd: Vec<Light> = (0..MAX_LIGHTS).map(|i| Light { position: Vec3::new(i as f32 * 0.1, 0.0, 0.0), ..lamp }).chain([far]).collect();
+        assert!(rank_for_budget(&crowd, MAX_LIGHTS).iter().all(|l| l.position.x < 50.0));
+        assert!(rank_for_budget_around(&crowd, Vec3::new(100.0, 0.0, 0.0), MAX_LIGHTS).iter().any(|l| l.position.x > 50.0));
 
         assert_eq!(rank_for_budget_indices(&ls, 3), vec![1, 2, 0]);
         assert_eq!(rank_for_budget_indices(&ls, 2), vec![2, 0]);

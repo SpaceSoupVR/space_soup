@@ -799,7 +799,7 @@ impl Renderer {
         }
         let vp = camera.projection() * camera.view();
 
-        let ranked = lights::rank_for_budget(lights, lights::MAX_LIGHTS);
+        let ranked = lights::rank_for_budget_around(lights, camera.position, lights::MAX_LIGHTS);
         let lights: &[lights::Light] = &ranked;
 
         let sun = lights.iter().find(|l| l.kind == lights::LightKind::Directional);
